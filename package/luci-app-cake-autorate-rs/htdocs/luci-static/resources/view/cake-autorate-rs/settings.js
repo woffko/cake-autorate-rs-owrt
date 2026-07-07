@@ -96,7 +96,7 @@ var optionDescriptions = {
 	high_load_thr: 'Fraction of current shaper rate that counts as high load.',
 	bufferbloat_refractory_period_ms: 'Minimum time after a bufferbloat response before another backoff may happen.',
 	decay_refractory_period_ms: 'Minimum time between low-load decay adjustments.',
-	pinger_method: 'Probe backend used to measure reflector latency. fping supports concurrent reflectors; ping is a basic fallback using the first reflector.',
+	pinger_method: 'Probe backend used to measure reflector latency. fping supports concurrent RTT reflectors; fping-ts uses ICMP timestamp OWD probes; ping is a basic fallback using the first reflector.',
 	reflector: 'Hosts to probe for latency. Use stable anycast or nearby IP addresses.',
 	reflectors_url: 'Optional URL to fetch reflector candidates from at daemon startup. Falls back to the configured list if the URL is unavailable.',
 	reflectors_url_skip_lines: 'Number of header lines to skip when parsing reflector URL data.',
@@ -418,7 +418,7 @@ function validatePingerCount(section, section_id) {
 	if (method !== 'ping' || isNaN(count) || count <= 1)
 		return true;
 
-	return _('The ping fallback uses only the first reflector. Set Pingers to 1 or choose fping.');
+	return _('The ping fallback uses only the first reflector. Set Pingers to 1 or choose fping/fping-ts.');
 }
 
 function selectedSqmSection(section, section_id) {
@@ -1723,6 +1723,7 @@ function addReflectorOptions(section) {
 	modal(o);
 	describe(o, 'pinger_method');
 	o.value('fping', 'fping');
+	o.value('fping-ts', 'fping-ts');
 	o.value('ping', _('ping fallback'));
 	o.rmempty = false;
 	o.validate = function(section_id) {

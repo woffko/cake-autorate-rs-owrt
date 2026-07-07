@@ -564,9 +564,12 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), String> {
-        if self.pinger_method != "fping" && self.pinger_method != "ping" {
+        if self.pinger_method != "fping"
+            && self.pinger_method != "fping-ts"
+            && self.pinger_method != "ping"
+        {
             return Err(format!(
-                "pinger_method={} is configured, but this Rust package currently supports fping and ping",
+                "pinger_method={} is configured, but this Rust package currently supports fping, fping-ts, and ping",
                 self.pinger_method
             ));
         }
@@ -664,6 +667,9 @@ struct Sample {
     seq: String,
     timestamp: f64,
     rtt_ms: f64,
+    dl_owd_us: f64,
+    ul_owd_us: f64,
+    timestamped_owd: bool,
 }
 
 #[derive(Debug)]
@@ -804,13 +810,24 @@ impl ReflectorHealth {
 
         let mut stats = Vec::new();
         for reflector in active.iter() {
-            let Some(baseline) = controller.baseline_us.get(reflector).copied() else {
+            let Some(dl_baseline) = controller.dl_baseline_us.get(reflector).copied() else {
                 return false;
             };
-            let Some(ewma) = controller.ewma_us.get(reflector).copied() else {
+            let Some(ul_baseline) = controller.ul_baseline_us.get(reflector).copied() else {
                 return false;
             };
-            stats.push((reflector.clone(), baseline * 2.0, ewma, ewma));
+            let Some(dl_ewma) = controller.dl_ewma_us.get(reflector).copied() else {
+                return false;
+            };
+            let Some(ul_ewma) = controller.ul_ewma_us.get(reflector).copied() else {
+                return false;
+            };
+            stats.push((
+                reflector.clone(),
+                dl_baseline + ul_baseline,
+                dl_ewma,
+                ul_ewma,
+            ));
         }
 
         if stats.is_empty() {
@@ -974,8 +991,10 @@ impl ReflectorHealth {
         self.last_replacement = Instant::now();
 
         if !cfg.retain_reflector_stats {
-            controller.baseline_us.remove(&old);
-            controller.ewma_us.remove(&old);
+            controller.dl_baseline_us.remove(&old);
+            controller.ul_baseline_us.remove(&old);
+            controller.dl_ewma_us.remove(&old);
+            controller.ul_ewma_us.remove(&old);
             self.states.remove(&old);
         }
 
@@ -1186,8 +1205,10 @@ struct Controller {
     log: Option<LogFile>,
     rate_monitor: RateMonitor,
     cpu_monitor: Option<CpuMonitor>,
-    baseline_us: HashMap<String, f64>,
-    ewma_us: HashMap<String, f64>,
+    dl_baseline_us: HashMap<String, f64>,
+    ul_baseline_us: HashMap<String, f64>,
+    dl_ewma_us: HashMap<String, f64>,
+    ul_ewma_us: HashMap<String, f64>,
     dl_delays: VecDeque<bool>,
     ul_delays: VecDeque<bool>,
     dl_delta_us: VecDeque<f64>,
@@ -1248,8 +1269,10 @@ impl Controller {
             last_cpu_sample: now,
             cpu_total_percent: None,
             cpu_core_percentages: Vec::new(),
-            baseline_us: HashMap::new(),
-            ewma_us: HashMap::new(),
+            dl_baseline_us: HashMap::new(),
+            ul_baseline_us: HashMap::new(),
+            dl_ewma_us: HashMap::new(),
+            ul_ewma_us: HashMap::new(),
             dl_delays: filled_bool_window(cfg.bufferbloat_detection_window),
             ul_delays: filled_bool_window(cfg.bufferbloat_detection_window),
             dl_delta_us: filled_f64_window(cfg.bufferbloat_detection_window),
@@ -1274,37 +1297,67 @@ impl Controller {
         let dl_load_pct = percent(dl_rate, self.shaper_dl);
         let ul_load_pct = percent(ul_rate, self.shaper_ul);
 
-        let owd_us = sample.rtt_ms * 500.0;
-        let baseline = self
-            .baseline_us
+        let dl_baseline = self
+            .dl_baseline_us
             .entry(sample.reflector.clone())
             .or_insert(100_000.0);
-        let alpha = if owd_us >= *baseline {
-            self.cfg.alpha_baseline_increase
+        let ul_baseline = self
+            .ul_baseline_us
+            .entry(sample.reflector.clone())
+            .or_insert(100_000.0);
+        let mut dl_delta_us = sample.dl_owd_us - *dl_baseline;
+        let mut ul_delta_us = sample.ul_owd_us - *ul_baseline;
+
+        if sample.timestamped_owd && (dl_delta_us.abs() + ul_delta_us.abs()) >= 3_000_000_000.0 {
+            *dl_baseline = sample.dl_owd_us;
+            *ul_baseline = sample.ul_owd_us;
+            dl_delta_us = 0.0;
+            ul_delta_us = 0.0;
         } else {
-            self.cfg.alpha_baseline_decrease
-        };
-        *baseline = alpha * owd_us + (1.0 - alpha) * *baseline;
-        let delta_us = owd_us - *baseline;
+            let dl_alpha = if sample.dl_owd_us >= *dl_baseline {
+                self.cfg.alpha_baseline_increase
+            } else {
+                self.cfg.alpha_baseline_decrease
+            };
+            let ul_alpha = if sample.ul_owd_us >= *ul_baseline {
+                self.cfg.alpha_baseline_increase
+            } else {
+                self.cfg.alpha_baseline_decrease
+            };
+
+            *dl_baseline = dl_alpha * sample.dl_owd_us + (1.0 - dl_alpha) * *dl_baseline;
+            *ul_baseline = ul_alpha * sample.ul_owd_us + (1.0 - ul_alpha) * *ul_baseline;
+            dl_delta_us = sample.dl_owd_us - *dl_baseline;
+            ul_delta_us = sample.ul_owd_us - *ul_baseline;
+        }
 
         if dl_load_pct < self.cfg.high_load_thr * 100.0
             && ul_load_pct < self.cfg.high_load_thr * 100.0
         {
-            let ewma = self.ewma_us.entry(sample.reflector.clone()).or_insert(0.0);
-            *ewma =
-                self.cfg.alpha_delta_ewma * delta_us + (1.0 - self.cfg.alpha_delta_ewma) * *ewma;
+            let dl_ewma = self
+                .dl_ewma_us
+                .entry(sample.reflector.clone())
+                .or_insert(0.0);
+            *dl_ewma = self.cfg.alpha_delta_ewma * dl_delta_us
+                + (1.0 - self.cfg.alpha_delta_ewma) * *dl_ewma;
+            let ul_ewma = self
+                .ul_ewma_us
+                .entry(sample.reflector.clone())
+                .or_insert(0.0);
+            *ul_ewma = self.cfg.alpha_delta_ewma * ul_delta_us
+                + (1.0 - self.cfg.alpha_delta_ewma) * *ul_ewma;
         }
 
         push_window(
             &mut self.dl_delays,
-            delta_us > self.cfg.dl_owd_delta_delay_thr_ms * 1000.0,
+            dl_delta_us > self.cfg.dl_owd_delta_delay_thr_ms * 1000.0,
         );
         push_window(
             &mut self.ul_delays,
-            delta_us > self.cfg.ul_owd_delta_delay_thr_ms * 1000.0,
+            ul_delta_us > self.cfg.ul_owd_delta_delay_thr_ms * 1000.0,
         );
-        push_window(&mut self.dl_delta_us, delta_us);
-        push_window(&mut self.ul_delta_us, delta_us);
+        push_window(&mut self.dl_delta_us, dl_delta_us);
+        push_window(&mut self.ul_delta_us, ul_delta_us);
 
         let dl_delay_count = self.dl_delays.iter().filter(|v| **v).count();
         let ul_delay_count = self.ul_delays.iter().filter(|v| **v).count();
@@ -1610,7 +1663,7 @@ impl Controller {
         let mut file = File::create(&tmp)?;
         writeln!(
             file,
-            "{{\"instance\":\"{}\",\"version\":\"0.1.0\",\"started_at\":{:.6},\"updated_at\":{:.6},\"dl_if\":\"{}\",\"ul_if\":\"{}\",\"reflector\":\"{}\",\"seq\":\"{}\",\"probe_timestamp\":{:.6},\"rtt_ms\":{:.3},\"dl_achieved_rate_kbps\":{:.1},\"ul_achieved_rate_kbps\":{:.1},\"dl_load_percent\":{:.1},\"ul_load_percent\":{:.1},\"dl_sum_delays\":{},\"ul_sum_delays\":{},\"dl_avg_owd_delta_us\":{:.1},\"ul_avg_owd_delta_us\":{:.1},\"cake_dl_rate_kbps\":{:.0},\"cake_ul_rate_kbps\":{:.0},\"cpu_total_percent\":{},\"cpu_core_percentages\":{}}}",
+            "{{\"instance\":\"{}\",\"version\":\"0.1.0\",\"started_at\":{:.6},\"updated_at\":{:.6},\"dl_if\":\"{}\",\"ul_if\":\"{}\",\"reflector\":\"{}\",\"seq\":\"{}\",\"probe_timestamp\":{:.6},\"rtt_ms\":{:.3},\"dl_owd_us\":{:.1},\"ul_owd_us\":{:.1},\"dl_achieved_rate_kbps\":{:.1},\"ul_achieved_rate_kbps\":{:.1},\"dl_load_percent\":{:.1},\"ul_load_percent\":{:.1},\"dl_sum_delays\":{},\"ul_sum_delays\":{},\"dl_avg_owd_delta_us\":{:.1},\"ul_avg_owd_delta_us\":{:.1},\"cake_dl_rate_kbps\":{:.0},\"cake_ul_rate_kbps\":{:.0},\"cpu_total_percent\":{},\"cpu_core_percentages\":{}}}",
             json_escape(&self.cfg.instance),
             self.started_at,
             epoch_secs(),
@@ -1620,6 +1673,8 @@ impl Controller {
             json_escape(&sample.seq),
             sample.timestamp,
             sample.rtt_ms,
+            sample.dl_owd_us,
+            sample.ul_owd_us,
             dl_rate,
             ul_rate,
             dl_load_pct,
@@ -1642,6 +1697,9 @@ impl Controller {
             seq: String::new(),
             timestamp: epoch_secs(),
             rtt_ms: 0.0,
+            dl_owd_us: 0.0,
+            ul_owd_us: 0.0,
+            timestamped_owd: false,
         };
         self.write_status(0.0, 0.0, 0.0, 0.0, 0, 0, 0.0, 0.0, &sample)
     }
@@ -1778,13 +1836,18 @@ impl PingerRuntime {
 
 fn spawn_pinger(cfg: &Config, active_reflectors: &[String]) -> Result<Child, String> {
     match cfg.pinger_method.as_str() {
-        "fping" => spawn_fping(cfg, active_reflectors),
+        "fping" => spawn_fping(cfg, active_reflectors, false),
+        "fping-ts" => spawn_fping(cfg, active_reflectors, true),
         "ping" => spawn_ping(cfg, active_reflectors),
         other => Err(format!("unsupported pinger_method={other}")),
     }
 }
 
-fn spawn_fping(cfg: &Config, active_reflectors: &[String]) -> Result<Child, String> {
+fn spawn_fping(
+    cfg: &Config,
+    active_reflectors: &[String],
+    icmp_timestamp: bool,
+) -> Result<Child, String> {
     let period_ms = (cfg.reflector_ping_interval_s * 1000.0).round().max(1.0) as u64;
     let interval_ms = (period_ms / active_reflectors.len().max(1) as u64).max(1);
     let targets: Vec<&str> = active_reflectors.iter().map(String::as_str).collect();
@@ -1793,16 +1856,23 @@ fn spawn_fping(cfg: &Config, active_reflectors: &[String]) -> Result<Child, Stri
         return Err("at least one reflector is required".to_string());
     }
 
-    Command::new("fping")
-        .arg("--timestamp")
+    let mut cmd = Command::new("fping");
+    for arg in safe_extra_args(&cfg.ping_extra_args) {
+        cmd.arg(arg);
+    }
+    cmd.arg("--timestamp")
         .arg("--loop")
         .arg("--period")
         .arg(period_ms.to_string())
         .arg("--interval")
         .arg(interval_ms.to_string())
         .arg("--timeout")
-        .arg("10000")
-        .args(targets)
+        .arg("10000");
+    if icmp_timestamp {
+        cmd.arg("--icmp-timestamp");
+    }
+
+    cmd.args(targets)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -1841,6 +1911,7 @@ fn stop_child(child: &mut Child) {
 fn parse_sample_line(cfg: &Config, line: &str, ping_reflector: &str) -> Option<Sample> {
     match cfg.pinger_method.as_str() {
         "ping" => parse_ping_line(line, ping_reflector),
+        "fping-ts" => parse_fping_ts_line(line),
         _ => parse_fping_line(line),
     }
 }
@@ -1861,10 +1932,45 @@ fn parse_fping_line(line: &str) -> Option<Sample> {
             seq,
             timestamp,
             rtt_ms,
+            dl_owd_us: rtt_ms * 500.0,
+            ul_owd_us: rtt_ms * 500.0,
+            timestamped_owd: false,
         });
     }
 
     None
+}
+
+fn parse_fping_ts_line(line: &str) -> Option<Sample> {
+    let tokens: Vec<&str> = line
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|v| !v.is_empty())
+        .collect();
+
+    if tokens.len() < 17 || !tokens.iter().any(|token| *token == "timestamps:") {
+        return None;
+    }
+
+    let timestamp = tokens[0].trim_matches(['[', ']']).parse::<f64>().ok()?;
+    let reflector = tokens[1].trim_end_matches(':').to_string();
+    let seq = tokens[3].trim_matches(['[', ']']).to_string();
+    let rtt_ms = tokens[6].parse::<f64>().ok()?;
+    let originate = parse_prefixed_f64(tokens[13], "Originate=")?;
+    let received = parse_prefixed_f64(tokens[14], "Receive=")?;
+    let transmit = parse_prefixed_f64(tokens[15], "Transmit=")?;
+    let finished = parse_prefixed_f64(tokens[16], "Localreceive=")?;
+    let dl_owd_us = (finished - transmit) * 1000.0;
+    let ul_owd_us = (received - originate) * 1000.0;
+
+    Some(Sample {
+        reflector,
+        seq,
+        timestamp,
+        rtt_ms,
+        dl_owd_us,
+        ul_owd_us,
+        timestamped_owd: true,
+    })
 }
 
 fn parse_ping_line(line: &str, reflector: &str) -> Option<Sample> {
@@ -1883,7 +1989,14 @@ fn parse_ping_line(line: &str, reflector: &str) -> Option<Sample> {
         seq,
         timestamp: epoch_secs(),
         rtt_ms,
+        dl_owd_us: rtt_ms * 500.0,
+        ul_owd_us: rtt_ms * 500.0,
+        timestamped_owd: false,
     })
+}
+
+fn parse_prefixed_f64(value: &str, prefix: &str) -> Option<f64> {
+    value.strip_prefix(prefix)?.parse::<f64>().ok()
 }
 
 fn parse_ping_number_after(line: &str, marker: &str) -> Option<f64> {
@@ -2346,7 +2459,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        next_spare_reflector, parse_reflector_candidates, parse_uci_values, ReflectorState,
+        next_spare_reflector, parse_fping_ts_line, parse_reflector_candidates, parse_uci_values,
+        ReflectorState,
     };
     use std::time::Instant;
 
@@ -2375,6 +2489,25 @@ mod tests {
             parse_reflector_candidates(data, 1),
             vec!["1.1.1.1", "9.9.9.9"]
         );
+    }
+
+    #[test]
+    fn parses_fping_ts_success_line() {
+        let line = "[1783449038.70892] 127.0.0.1 : [0], 20 bytes, 0.080 ms (0.080 avg, 0% loss), timestamps: Originate=66638708 Receive=66638708 Transmit=66638708 Localreceive=66638709";
+        let sample = parse_fping_ts_line(line).expect("expected fping-ts sample");
+
+        assert_eq!(sample.reflector, "127.0.0.1");
+        assert_eq!(sample.seq, "0");
+        assert_eq!(sample.rtt_ms, 0.080);
+        assert_eq!(sample.dl_owd_us, 1000.0);
+        assert_eq!(sample.ul_owd_us, 0.0);
+        assert!(sample.timestamped_owd);
+    }
+
+    #[test]
+    fn ignores_fping_ts_timeout_line() {
+        let line = "[1783449025.44098] 8.8.8.8 : [0], timed out (NaN avg, 100% loss)";
+        assert!(parse_fping_ts_line(line).is_none());
     }
 
     #[test]
