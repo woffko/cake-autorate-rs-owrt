@@ -3,6 +3,7 @@
 'require form';
 'require network';
 'require uci';
+'require ui';
 'require tools.widgets as widgets';
 
 function modal(option) {
@@ -19,6 +20,8 @@ var optionDescriptions = {
 	sqm_enabled: 'Enable the matching SQM queue managed by this instance.',
 	sqm_download: 'SQM download bandwidth in kbit/s. This also seeds the autorate base and max download rates.',
 	sqm_upload: 'SQM upload bandwidth in kbit/s. This also seeds the autorate base and max upload rates.',
+	speedtest_apply_percent: 'Percentage of measured throughput to write into SQM and autorate limits. 90 leaves headroom for CAKE.',
+	_speedtest: 'Run a router-side speed test and fill SQM plus autorate limits from the measured throughput.',
 	manual_rate_limits: 'Show explicit min, base, and max autorate limits. Leave off to derive them from download and upload speeds.',
 	advanced_settings: 'Show detailed SQM, reflector, controller, logging, and daemon tuning settings.',
 	min_dl_shaper_rate_kbps: 'Lowest download shaper rate autorate may apply, in kbit/s.',
@@ -332,6 +335,36 @@ function rateValue(value, fallback) {
 	return fallback;
 }
 
+function optionByName(section, key) {
+	if (!section || !section.children)
+		return null;
+
+	for (var i = 0; i < section.children.length; i++)
+		if (section.children[i].option === key)
+			return section.children[i];
+
+	return null;
+}
+
+function setFormOptionValue(section, section_id, key, value) {
+	var option = optionByName(section, key);
+	var element;
+
+	if (!option || typeof option.getUIElement != 'function')
+		return;
+
+	element = option.getUIElement(section_id);
+	if (element && typeof element.setValue == 'function')
+		element.setValue(String(value));
+}
+
+function setCakeOption(section, section_id, key, value) {
+	value = String(value);
+
+	uci.set('cake-autorate', section_id, key, value);
+	setFormOptionValue(section, section_id, key, value);
+}
+
 function halfRate(value) {
 	var parsed = parseInt(value, 10);
 
@@ -341,7 +374,7 @@ function halfRate(value) {
 	return value;
 }
 
-function applyRatePreset(section_id, wan_if, replaceExisting) {
+function applyRatePreset(section_id, wan_if, replaceExisting, section) {
 	var queue = findSqmQueueForInterface(wan_if);
 	var currentDl = uci.get('cake-autorate', section_id, 'sqm_download');
 	var currentUl = uci.get('cake-autorate', section_id, 'sqm_upload');
@@ -353,43 +386,102 @@ function applyRatePreset(section_id, wan_if, replaceExisting) {
 			rateValue(uci.get('cake-autorate', section_id, 'base_ul_shaper_rate_kbps'), '20000')));
 
 	if (replaceExisting || !currentDl)
-		uci.set('cake-autorate', section_id, 'sqm_download', dl);
+		setCakeOption(section, section_id, 'sqm_download', dl);
 
 	if (replaceExisting || !currentUl)
-		uci.set('cake-autorate', section_id, 'sqm_upload', ul);
+		setCakeOption(section, section_id, 'sqm_upload', ul);
 
 	if (replaceExisting || !uci.get('cake-autorate', section_id, 'base_dl_shaper_rate_kbps'))
-		uci.set('cake-autorate', section_id, 'base_dl_shaper_rate_kbps', dl);
+		setCakeOption(section, section_id, 'base_dl_shaper_rate_kbps', dl);
 
 	if (replaceExisting || !uci.get('cake-autorate', section_id, 'base_ul_shaper_rate_kbps'))
-		uci.set('cake-autorate', section_id, 'base_ul_shaper_rate_kbps', ul);
+		setCakeOption(section, section_id, 'base_ul_shaper_rate_kbps', ul);
 
 	if (replaceExisting || !uci.get('cake-autorate', section_id, 'max_dl_shaper_rate_kbps'))
-		uci.set('cake-autorate', section_id, 'max_dl_shaper_rate_kbps', dl);
+		setCakeOption(section, section_id, 'max_dl_shaper_rate_kbps', dl);
 
 	if (replaceExisting || !uci.get('cake-autorate', section_id, 'max_ul_shaper_rate_kbps'))
-		uci.set('cake-autorate', section_id, 'max_ul_shaper_rate_kbps', ul);
+		setCakeOption(section, section_id, 'max_ul_shaper_rate_kbps', ul);
 
 	if (replaceExisting || !uci.get('cake-autorate', section_id, 'min_dl_shaper_rate_kbps'))
-		uci.set('cake-autorate', section_id, 'min_dl_shaper_rate_kbps', halfRate(dl));
+		setCakeOption(section, section_id, 'min_dl_shaper_rate_kbps', halfRate(dl));
 
 	if (replaceExisting || !uci.get('cake-autorate', section_id, 'min_ul_shaper_rate_kbps'))
-		uci.set('cake-autorate', section_id, 'min_ul_shaper_rate_kbps', halfRate(ul));
+		setCakeOption(section, section_id, 'min_ul_shaper_rate_kbps', halfRate(ul));
 }
 
-function applyWanPreset(section_id, wan_if, importRates) {
+function applyWanPreset(section_id, wan_if, importRates, section) {
 	wan_if = normalizeInterfaceName(wan_if);
 
 	if (!wan_if)
 		return;
 
-	uci.set('cake-autorate', section_id, 'wan_if', wan_if);
-	uci.set('cake-autorate', section_id, 'sqm_interface', wan_if);
-	uci.set('cake-autorate', section_id, 'ul_if', wan_if);
-	uci.set('cake-autorate', section_id, 'dl_if', ifbForWan(wan_if));
+	setCakeOption(section, section_id, 'wan_if', wan_if);
+	setCakeOption(section, section_id, 'sqm_interface', wan_if);
+	setCakeOption(section, section_id, 'ul_if', wan_if);
+	setCakeOption(section, section_id, 'dl_if', ifbForWan(wan_if));
 
 	if (importRates)
-		applyRatePreset(section_id, wan_if, true);
+		applyRatePreset(section_id, wan_if, true, section);
+}
+
+function speedtestApplyPercent(section, section_id) {
+	var value;
+	var percent;
+
+	if (section && typeof section.formvalue == 'function')
+		value = section.formvalue(section_id, 'speedtest_apply_percent');
+
+	if (value == null || value === '')
+		value = uci.get('cake-autorate', section_id, 'speedtest_apply_percent');
+
+	percent = parseInt(value || '90', 10);
+	if (isNaN(percent) || percent < 1 || percent > 100)
+		percent = 90;
+
+	return percent;
+}
+
+function measuredRate(value, percent) {
+	value = parseInt(value, 10);
+
+	if (isNaN(value) || value <= 0)
+		return null;
+
+	return String(Math.max(1, Math.round(value * percent / 100)));
+}
+
+function parseSpeedtestResult(stdout) {
+	var result = JSON.parse((stdout || '').trim());
+
+	if (!result || (!result.download_kbps && !result.upload_kbps))
+		throw new Error(_('Speed test returned no usable rate.'));
+
+	return result;
+}
+
+function applySpeedtestRates(section, section_id, result, percent) {
+	var dl = measuredRate(result.download_kbps, percent);
+	var ul = measuredRate(result.upload_kbps, percent);
+
+	if (dl) {
+		setCakeOption(section, section_id, 'sqm_download', dl);
+		setCakeOption(section, section_id, 'base_dl_shaper_rate_kbps', dl);
+		setCakeOption(section, section_id, 'max_dl_shaper_rate_kbps', dl);
+		setCakeOption(section, section_id, 'min_dl_shaper_rate_kbps', halfRate(dl));
+	}
+
+	if (ul) {
+		setCakeOption(section, section_id, 'sqm_upload', ul);
+		setCakeOption(section, section_id, 'base_ul_shaper_rate_kbps', ul);
+		setCakeOption(section, section_id, 'max_ul_shaper_rate_kbps', ul);
+		setCakeOption(section, section_id, 'min_ul_shaper_rate_kbps', halfRate(ul));
+	}
+
+	return {
+		dl: dl,
+		ul: ul
+	};
 }
 
 function addUniqueValue(option, seen, value, title) {
@@ -440,7 +532,7 @@ function addSetupOptions(section) {
 	};
 	o.onchange = function(ev, section_id, value) {
 		if (autoInterfacePresetEnabled(this.section, section_id))
-			applyWanPreset(section_id, value, true);
+			applyWanPreset(section_id, value, true, this.section);
 	};
 	o.write = function(section_id, formvalue) {
 		formvalue = normalizeInterfaceName(formvalue);
@@ -462,7 +554,7 @@ function addSetupOptions(section) {
 		uci.set('cake-autorate', section_id, 'auto_interface_preset', formvalue);
 
 		if (formvalue === '1')
-			applyWanPreset(section_id, selectedWan(this.section, section_id, null, true), false);
+			applyWanPreset(section_id, selectedWan(this.section, section_id, null, true), false, this.section);
 	};
 
 	o = flag(section, 'setup', 'sqm_enabled', _('Enable SQM'));
@@ -480,12 +572,12 @@ function addSetupOptions(section) {
 	o.write = function(section_id, formvalue) {
 		var manualRateLimits = manualRateLimitsEnabled(this.section, section_id);
 
-		uci.set('cake-autorate', section_id, 'sqm_download', formvalue);
-		uci.set('cake-autorate', section_id, 'base_dl_shaper_rate_kbps', formvalue);
-		uci.set('cake-autorate', section_id, 'max_dl_shaper_rate_kbps', formvalue);
+		setCakeOption(null, section_id, 'sqm_download', formvalue);
+		setCakeOption(null, section_id, 'base_dl_shaper_rate_kbps', formvalue);
+		setCakeOption(null, section_id, 'max_dl_shaper_rate_kbps', formvalue);
 
 		if (!manualRateLimits || !uci.get('cake-autorate', section_id, 'min_dl_shaper_rate_kbps'))
-			uci.set('cake-autorate', section_id, 'min_dl_shaper_rate_kbps', halfRate(formvalue));
+			setCakeOption(null, section_id, 'min_dl_shaper_rate_kbps', halfRate(formvalue));
 	};
 
 	o = value(section, 'setup', 'sqm_upload', _('Upload speed'), 'and(uinteger,min(0))', '20000');
@@ -500,12 +592,54 @@ function addSetupOptions(section) {
 	o.write = function(section_id, formvalue) {
 		var manualRateLimits = manualRateLimitsEnabled(this.section, section_id);
 
-		uci.set('cake-autorate', section_id, 'sqm_upload', formvalue);
-		uci.set('cake-autorate', section_id, 'base_ul_shaper_rate_kbps', formvalue);
-		uci.set('cake-autorate', section_id, 'max_ul_shaper_rate_kbps', formvalue);
+		setCakeOption(null, section_id, 'sqm_upload', formvalue);
+		setCakeOption(null, section_id, 'base_ul_shaper_rate_kbps', formvalue);
+		setCakeOption(null, section_id, 'max_ul_shaper_rate_kbps', formvalue);
 
 		if (!manualRateLimits || !uci.get('cake-autorate', section_id, 'min_ul_shaper_rate_kbps'))
-			uci.set('cake-autorate', section_id, 'min_ul_shaper_rate_kbps', halfRate(formvalue));
+			setCakeOption(null, section_id, 'min_ul_shaper_rate_kbps', halfRate(formvalue));
+	};
+
+	o = value(section, 'setup', 'speedtest_apply_percent', _('Speed test apply percent'), 'and(uinteger,min(1),max(100))', '90');
+	o.default = '90';
+	o.forcewrite = true;
+
+	o = section.taboption('setup', form.Button, '_speedtest', _('Run speed test'));
+	modal(o);
+	describe(o, '_speedtest');
+	o.inputtitle = _('Run speed test');
+	o.inputstyle = 'action';
+	o.rmempty = true;
+	o.write = function() {};
+	o.remove = function() {};
+	o.onclick = function(ev, section_id) {
+		var button = ev.currentTarget;
+		var activeSection = this.section;
+		var percent = speedtestApplyPercent(activeSection, section_id);
+		var wan = selectedWan(activeSection, section_id, null, true);
+
+		if (autoInterfacePresetEnabled(activeSection, section_id))
+			applyWanPreset(section_id, wan, false, activeSection);
+
+		button.disabled = true;
+
+		return fs.exec('/usr/libexec/cake-autorate-rs/speedtest', [ section_id ]).then(function(res) {
+			var result = parseSpeedtestResult(res.stdout);
+			var applied = applySpeedtestRates(activeSection, section_id, result, percent);
+			var message = _('Speed test applied at %d%%: download %s kbit/s, upload %s kbit/s.').format(
+				percent,
+				applied.dl || _('unchanged'),
+				applied.ul || _('unchanged'));
+
+			if (result.warning)
+				message += ' ' + result.warning;
+
+			ui.addNotification(null, E('p', message), result.warning ? 'warning' : 'info');
+		}).catch(function(err) {
+			ui.addNotification(null, E('p', _('Speed test failed: %s').format(err.message || err)), 'error');
+		}).then(function() {
+			button.disabled = false;
+		});
 	};
 
 	o = flag(section, 'setup', 'manual_rate_limits', _('Manual rate limits'), '0');

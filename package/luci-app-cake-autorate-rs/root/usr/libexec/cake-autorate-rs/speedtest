@@ -1,0 +1,123 @@
+#!/bin/sh
+
+section="$1"
+
+download_bytes_default="25000000"
+upload_bytes_default="4000000"
+timeout_default="45"
+
+uci_get() {
+	[ -n "$section" ] || return 0
+	uci -q get "cake-autorate.$section.$1" 2>/dev/null
+}
+
+json_error() {
+	printf '{"error":"%s"}\n' "$1"
+	exit 1
+}
+
+now_s() {
+	awk '{ print $1 }' /proc/uptime
+}
+
+elapsed_s() {
+	awk -v start="$1" -v stop="$2" 'BEGIN { delta = stop - start; if (delta < 0.01) delta = 0.01; printf "%.2f", delta }'
+}
+
+kbps_for() {
+	awk -v bytes="$1" -v elapsed="$2" 'BEGIN { printf "%.0f", bytes * 8 / elapsed / 1000 }'
+}
+
+num_or_default() {
+	case "$1" in
+		''|*[!0-9]*)
+			printf '%s' "$2"
+			;;
+		*)
+			printf '%s' "$1"
+			;;
+	esac
+}
+
+fetch="$(command -v uclient-fetch 2>/dev/null || command -v wget 2>/dev/null || true)"
+[ -n "$fetch" ] || json_error "uclient-fetch or wget is required"
+
+download_bytes="$(num_or_default "$(uci_get speedtest_download_bytes)" "$download_bytes_default")"
+upload_bytes="$(num_or_default "$(uci_get speedtest_upload_bytes)" "$upload_bytes_default")"
+timeout_s="$(num_or_default "$(uci_get speedtest_timeout_s)" "$timeout_default")"
+download_url="$(uci_get speedtest_download_url)"
+upload_url="$(uci_get speedtest_upload_url)"
+
+[ -n "$download_url" ] || download_url="https://speed.cloudflare.com/__down?bytes=$download_bytes"
+[ -n "$upload_url" ] || upload_url="https://speed.cloudflare.com/__up"
+
+tmp_download="/tmp/cake-autorate-speedtest-download.$$"
+tmp_upload="/tmp/cake-autorate-speedtest-upload.$$"
+tmp_response="/tmp/cake-autorate-speedtest-response.$$"
+
+cleanup() {
+	rm -f "$tmp_download" "$tmp_upload" "$tmp_response"
+}
+trap cleanup EXIT INT TERM
+
+download_start="$(now_s)"
+if ! "$fetch" -q -O "$tmp_download" --timeout="$timeout_s" "$download_url" >/dev/null 2>&1; then
+	json_error "download test failed"
+fi
+download_stop="$(now_s)"
+download_elapsed="$(elapsed_s "$download_start" "$download_stop")"
+download_size="$(wc -c < "$tmp_download" | tr -d ' ')"
+download_kbps="$(kbps_for "$download_size" "$download_elapsed")"
+
+upload_kbps="null"
+upload_elapsed="0.00"
+upload_size="0"
+warning=""
+
+if [ "$upload_bytes" -gt 0 ] && [ -n "$upload_url" ]; then
+	upload_done="0"
+	upload_last_try=""
+
+	for upload_try in "$upload_bytes" 1000000 262144; do
+		[ "$upload_try" -gt 0 ] || continue
+		[ "$upload_try" = "$upload_last_try" ] && continue
+
+		upload_last_try="$upload_try"
+		upload_blocks="$(( (upload_try + 1023) / 1024 ))"
+		rm -f "$tmp_upload" "$tmp_response"
+
+		if ! dd if=/dev/zero of="$tmp_upload" bs=1024 count="$upload_blocks" >/dev/null 2>&1; then
+			continue
+		fi
+
+		upload_size="$(wc -c < "$tmp_upload" | tr -d ' ')"
+		upload_start="$(now_s)"
+		if "$fetch" -q -O "$tmp_response" --timeout="$timeout_s" --post-file="$tmp_upload" "$upload_url" >/dev/null 2>&1; then
+			upload_stop="$(now_s)"
+			upload_elapsed="$(elapsed_s "$upload_start" "$upload_stop")"
+			upload_kbps="$(kbps_for "$upload_size" "$upload_elapsed")"
+			upload_done="1"
+
+			if [ "$upload_try" != "$upload_bytes" ]; then
+				warning="Upload test used a smaller retry payload."
+			fi
+
+			break
+		fi
+	done
+
+	if [ "$upload_done" != "1" ]; then
+		upload_size="0"
+		warning="Upload test failed; upload rate was left unchanged."
+	fi
+fi
+
+printf '{"download_kbps":%s,"upload_kbps":%s,"download_bytes":%s,"upload_bytes":%s,"download_elapsed_s":%s,"upload_elapsed_s":%s,"source":"%s","warning":"%s"}\n' \
+	"$download_kbps" \
+	"$upload_kbps" \
+	"$download_size" \
+	"$upload_size" \
+	"$download_elapsed" \
+	"$upload_elapsed" \
+	"$(basename "$fetch")" \
+	"$warning"
