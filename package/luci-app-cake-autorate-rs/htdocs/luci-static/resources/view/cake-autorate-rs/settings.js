@@ -1,18 +1,39 @@
 'use strict';
+'require fs';
 'require form';
 'require network';
 'require uci';
 'require tools.widgets as widgets';
 
-function flag(section, tab, key, title) {
+function modal(option) {
+	option.modalonly = true;
+	return option;
+}
+
+function flag(section, tab, key, title, defaultValue) {
 	var o = section.taboption(tab, form.Flag, key, title);
+	modal(o);
 	o.rmempty = false;
+	if (defaultValue != null)
+		o.default = defaultValue;
 	return o;
 }
 
 function value(section, tab, key, title, datatype, placeholder) {
 	var o = section.taboption(tab, form.Value, key, title);
+	modal(o);
 	o.rmempty = false;
+	if (datatype)
+		o.datatype = datatype;
+	if (placeholder != null)
+		o.placeholder = placeholder;
+	return o;
+}
+
+function optionalValue(section, tab, key, title, datatype, placeholder) {
+	var o = section.taboption(tab, form.Value, key, title);
+	modal(o);
+	o.rmempty = true;
 	if (datatype)
 		o.datatype = datatype;
 	if (placeholder != null)
@@ -22,19 +43,245 @@ function value(section, tab, key, title, datatype, placeholder) {
 
 function iface(section, tab, key, title) {
 	var o = section.taboption(tab, widgets.DeviceSelect, key, title);
+	modal(o);
 	o.noaliases = true;
 	o.rmempty = false;
 	return o;
 }
 
+function listValue(section, tab, key, title, values, defaultValue) {
+	var o = section.taboption(tab, form.ListValue, key, title);
+	modal(o);
+	for (var i = 0; i < values.length; i++) {
+		if (Array.isArray(values[i]))
+			o.value(values[i][0], values[i][1]);
+		else
+			o.value(values[i]);
+	}
+	if (defaultValue != null)
+		o.default = defaultValue;
+	o.rmempty = false;
+	return o;
+}
+
+function selectedWan(section, section_id, fallback) {
+	if (fallback)
+		return fallback;
+
+	if (section && typeof section.formvalue == 'function') {
+		var formValue = section.formvalue(section_id, 'wan_if');
+		if (formValue)
+			return formValue;
+	}
+
+	return uci.get('cake-autorate', section_id, 'wan_if') ||
+		uci.get('cake-autorate', section_id, 'sqm_interface') ||
+		uci.get('cake-autorate', section_id, 'ul_if') ||
+		'wan';
+}
+
+function autoInterfacePresetEnabled(section, section_id) {
+	var value;
+
+	if (section && typeof section.formvalue == 'function')
+		value = section.formvalue(section_id, 'auto_interface_preset');
+
+	if (value == null)
+		value = uci.get('cake-autorate', section_id, 'auto_interface_preset');
+
+	return value !== '0';
+}
+
+function ifbForWan(wan_if) {
+	return wan_if ? 'ifb4' + wan_if : '';
+}
+
+function findSqmQueueForInterface(iface) {
+	var queues;
+
+	if (!iface)
+		return null;
+
+	queues = uci.sections('sqm', 'queue') || [];
+	for (var i = 0; i < queues.length; i++)
+		if (queues[i].interface === iface)
+			return queues[i];
+
+	return null;
+}
+
+function rateValue(value, fallback) {
+	if (value != null && value !== '')
+		return String(value);
+
+	return fallback;
+}
+
+function halfRate(value) {
+	var parsed = parseInt(value, 10);
+
+	if (!isNaN(parsed) && parsed > 0)
+		return String(Math.max(1, Math.round(parsed / 2)));
+
+	return value;
+}
+
+function applyRatePreset(section_id, wan_if, replaceExisting) {
+	var queue = findSqmQueueForInterface(wan_if);
+	var currentDl = uci.get('cake-autorate', section_id, 'sqm_download');
+	var currentUl = uci.get('cake-autorate', section_id, 'sqm_upload');
+	var dl = rateValue(queue ? queue.download : null,
+		rateValue(currentDl,
+			rateValue(uci.get('cake-autorate', section_id, 'base_dl_shaper_rate_kbps'), '20000')));
+	var ul = rateValue(queue ? queue.upload : null,
+		rateValue(currentUl,
+			rateValue(uci.get('cake-autorate', section_id, 'base_ul_shaper_rate_kbps'), '20000')));
+
+	if (replaceExisting || !currentDl)
+		uci.set('cake-autorate', section_id, 'sqm_download', dl);
+
+	if (replaceExisting || !currentUl)
+		uci.set('cake-autorate', section_id, 'sqm_upload', ul);
+
+	if (replaceExisting || !uci.get('cake-autorate', section_id, 'base_dl_shaper_rate_kbps'))
+		uci.set('cake-autorate', section_id, 'base_dl_shaper_rate_kbps', dl);
+
+	if (replaceExisting || !uci.get('cake-autorate', section_id, 'base_ul_shaper_rate_kbps'))
+		uci.set('cake-autorate', section_id, 'base_ul_shaper_rate_kbps', ul);
+
+	if (replaceExisting || !uci.get('cake-autorate', section_id, 'max_dl_shaper_rate_kbps'))
+		uci.set('cake-autorate', section_id, 'max_dl_shaper_rate_kbps', dl);
+
+	if (replaceExisting || !uci.get('cake-autorate', section_id, 'max_ul_shaper_rate_kbps'))
+		uci.set('cake-autorate', section_id, 'max_ul_shaper_rate_kbps', ul);
+
+	if (replaceExisting || !uci.get('cake-autorate', section_id, 'min_dl_shaper_rate_kbps'))
+		uci.set('cake-autorate', section_id, 'min_dl_shaper_rate_kbps', halfRate(dl));
+
+	if (replaceExisting || !uci.get('cake-autorate', section_id, 'min_ul_shaper_rate_kbps'))
+		uci.set('cake-autorate', section_id, 'min_ul_shaper_rate_kbps', halfRate(ul));
+}
+
+function applyWanPreset(section_id, wan_if, importRates) {
+	if (!wan_if)
+		return;
+
+	uci.set('cake-autorate', section_id, 'wan_if', wan_if);
+	uci.set('cake-autorate', section_id, 'sqm_interface', wan_if);
+	uci.set('cake-autorate', section_id, 'ul_if', wan_if);
+	uci.set('cake-autorate', section_id, 'dl_if', ifbForWan(wan_if));
+
+	if (importRates)
+		applyRatePreset(section_id, wan_if, true);
+}
+
+function addUniqueValue(option, seen, value, title) {
+	if (!value || seen[value])
+		return;
+
+	if (title != null)
+		option.value(value, title);
+	else
+		option.value(value);
+
+	seen[value] = true;
+}
+
 function addRateOptions(section) {
-	value(section, 'rates', 'min_dl_shaper_rate_kbps', _('Min DL rate'), 'uinteger', '5000');
-	value(section, 'rates', 'base_dl_shaper_rate_kbps', _('Base DL rate'), 'uinteger', '20000');
-	value(section, 'rates', 'max_dl_shaper_rate_kbps', _('Max DL rate'), 'uinteger', '80000');
-	value(section, 'rates', 'min_ul_shaper_rate_kbps', _('Min UL rate'), 'uinteger', '5000');
-	value(section, 'rates', 'base_ul_shaper_rate_kbps', _('Base UL rate'), 'uinteger', '20000');
-	value(section, 'rates', 'max_ul_shaper_rate_kbps', _('Max UL rate'), 'uinteger', '35000');
 	value(section, 'rates', 'connection_active_thr_kbps', _('Active threshold'), 'uinteger', '2000');
+}
+
+function addSetupOptions(section) {
+	var o;
+
+	flag(section, 'setup', 'enabled', _('Enable autorate'));
+
+	o = iface(section, 'setup', 'wan_if', _('Target interface'));
+	o.default = 'wan';
+	o.forcewrite = true;
+	o.cfgvalue = function(section_id) {
+		return selectedWan(this.section, section_id);
+	};
+	o.onchange = function(ev, section_id, value) {
+		if (autoInterfacePresetEnabled(this.section, section_id))
+			applyWanPreset(section_id, value, true);
+	};
+	o.write = function(section_id, formvalue) {
+		var previous = selectedWan(null, section_id);
+		var importRates = previous !== formvalue ||
+			!uci.get('cake-autorate', section_id, 'sqm_download') ||
+			!uci.get('cake-autorate', section_id, 'sqm_upload');
+
+		uci.set('cake-autorate', section_id, 'wan_if', formvalue);
+
+		if (autoInterfacePresetEnabled(this.section, section_id))
+			applyWanPreset(section_id, formvalue, importRates);
+	};
+
+	o = flag(section, 'setup', 'auto_interface_preset', _('Auto SQM preset'), '1');
+	o.forcewrite = true;
+	o.write = function(section_id, formvalue) {
+		uci.set('cake-autorate', section_id, 'auto_interface_preset', formvalue);
+
+		if (formvalue === '1')
+			applyWanPreset(section_id, selectedWan(this.section, section_id), false);
+	};
+
+	o = flag(section, 'setup', 'sqm_enabled', _('Enable SQM'));
+	o.forcewrite = true;
+
+	o = value(section, 'setup', 'sqm_download', _('Download speed'), 'and(uinteger,min(0))', '20000');
+	o.forcewrite = true;
+	o.cfgvalue = function(section_id) {
+		var queue = findSqmQueueForInterface(selectedWan(this.section, section_id));
+
+		return rateValue(uci.get('cake-autorate', section_id, 'sqm_download'),
+			rateValue(queue ? queue.download : null,
+				rateValue(uci.get('cake-autorate', section_id, 'base_dl_shaper_rate_kbps'), '20000')));
+	};
+	o.write = function(section_id, formvalue) {
+		uci.set('cake-autorate', section_id, 'sqm_download', formvalue);
+		uci.set('cake-autorate', section_id, 'base_dl_shaper_rate_kbps', formvalue);
+		uci.set('cake-autorate', section_id, 'max_dl_shaper_rate_kbps', formvalue);
+
+		if (!uci.get('cake-autorate', section_id, 'min_dl_shaper_rate_kbps'))
+			uci.set('cake-autorate', section_id, 'min_dl_shaper_rate_kbps', halfRate(formvalue));
+	};
+
+	o = value(section, 'setup', 'sqm_upload', _('Upload speed'), 'and(uinteger,min(0))', '20000');
+	o.forcewrite = true;
+	o.cfgvalue = function(section_id) {
+		var queue = findSqmQueueForInterface(selectedWan(this.section, section_id));
+
+		return rateValue(uci.get('cake-autorate', section_id, 'sqm_upload'),
+			rateValue(queue ? queue.upload : null,
+				rateValue(uci.get('cake-autorate', section_id, 'base_ul_shaper_rate_kbps'), '20000')));
+	};
+	o.write = function(section_id, formvalue) {
+		uci.set('cake-autorate', section_id, 'sqm_upload', formvalue);
+		uci.set('cake-autorate', section_id, 'base_ul_shaper_rate_kbps', formvalue);
+		uci.set('cake-autorate', section_id, 'max_ul_shaper_rate_kbps', formvalue);
+
+		if (!uci.get('cake-autorate', section_id, 'min_ul_shaper_rate_kbps'))
+			uci.set('cake-autorate', section_id, 'min_ul_shaper_rate_kbps', halfRate(formvalue));
+	};
+
+	value(section, 'setup', 'min_dl_shaper_rate_kbps', _('Min DL rate'), 'uinteger', '5000');
+	value(section, 'setup', 'base_dl_shaper_rate_kbps', _('Base DL rate'), 'uinteger', '20000');
+	value(section, 'setup', 'max_dl_shaper_rate_kbps', _('Max DL rate'), 'uinteger', '80000');
+	value(section, 'setup', 'min_ul_shaper_rate_kbps', _('Min UL rate'), 'uinteger', '5000');
+	value(section, 'setup', 'base_ul_shaper_rate_kbps', _('Base UL rate'), 'uinteger', '20000');
+	value(section, 'setup', 'max_ul_shaper_rate_kbps', _('Max UL rate'), 'uinteger', '35000');
+}
+
+function addInterfaceOptions(section) {
+	var o;
+
+	o = iface(section, 'interfaces', 'dl_if', _('Download interface'));
+	o.depends('auto_interface_preset', '0');
+
+	o = iface(section, 'interfaces', 'ul_if', _('Upload interface'));
+	o.depends('auto_interface_preset', '0');
 }
 
 function addLatencyOptions(section) {
@@ -65,6 +312,7 @@ function addControllerOptions(section) {
 
 function addReflectorOptions(section) {
 	var o = section.taboption('reflectors', form.ListValue, 'pinger_method', _('Pinger'));
+	modal(o);
 	o.value('fping', 'fping');
 	o.value('fping-ts', 'fping-ts');
 	o.value('tsping', 'tsping');
@@ -73,6 +321,7 @@ function addReflectorOptions(section) {
 	o.rmempty = false;
 
 	o = section.taboption('reflectors', form.DynamicList, 'reflector', _('Reflectors'));
+	modal(o);
 	o.datatype = 'host';
 	o.rmempty = false;
 
@@ -129,16 +378,179 @@ function addAdvancedOptions(section) {
 	value(section, 'advanced', 'tx_bytes_path', _('TX bytes path'), 'file', '');
 }
 
+function addSqmOptions(section, qdiscs, scripts) {
+	var o, seen;
+
+	flag(section, 'sqm_basic', 'manage_sqm', _('Manage SQM'));
+	value(section, 'sqm_basic', 'sqm_section', _('SQM section'), 'uciname', '');
+	o = iface(section, 'sqm_basic', 'sqm_interface', _('SQM interface'));
+	o.depends('auto_interface_preset', '0');
+	flag(section, 'sqm_basic', 'sqm_debug_logging', _('SQM debug logging'));
+	listValue(section, 'sqm_basic', 'sqm_verbosity', _('SQM log verbosity'), [
+		[ '0', 'silent' ],
+		[ '1', 'error' ],
+		[ '2', 'warning' ],
+		[ '5', 'info' ],
+		[ '8', 'debug' ],
+		[ '10', 'trace' ]
+	], '5');
+
+	o = section.taboption('sqm_qdisc', form.ListValue, 'sqm_qdisc', _('Queueing discipline'));
+	modal(o);
+	seen = {};
+	addUniqueValue(o, seen, 'cake');
+	for (var i = 0; i < qdiscs.length; i++)
+		addUniqueValue(o, seen, qdiscs[i].name);
+	o.default = 'cake';
+	o.rmempty = false;
+
+	o = section.taboption('sqm_qdisc', form.ListValue, 'sqm_script', _('Queue setup script'));
+	modal(o);
+	seen = {};
+	addUniqueValue(o, seen, 'piece_of_cake.qos');
+	addUniqueValue(o, seen, 'cake.qos');
+	for (i = 0; i < scripts.length; i++)
+		addUniqueValue(o, seen, scripts[i]);
+	o.default = 'piece_of_cake.qos';
+	o.rmempty = false;
+
+	o = flag(section, 'sqm_qdisc', 'sqm_qdisc_advanced', _('Advanced qdisc'));
+
+	o = listValue(section, 'sqm_qdisc', 'sqm_squash_dscp', _('Squash DSCP'), [
+		[ '1', 'SQUASH' ],
+		[ '0', 'DO NOT SQUASH' ]
+	], '1');
+	o.depends('sqm_qdisc_advanced', '1');
+
+	o = listValue(section, 'sqm_qdisc', 'sqm_squash_ingress', _('Ignore DSCP'), [
+		[ '1', 'Ignore' ],
+		[ '0', 'Allow' ]
+	], '1');
+	o.depends('sqm_qdisc_advanced', '1');
+
+	o = listValue(section, 'sqm_qdisc', 'sqm_ingress_ecn', _('ECN ingress'), [ 'ECN', 'NOECN' ], 'ECN');
+	o.depends('sqm_qdisc_advanced', '1');
+
+	o = listValue(section, 'sqm_qdisc', 'sqm_egress_ecn', _('ECN egress'), [ 'NOECN', 'ECN' ], 'NOECN');
+	o.depends('sqm_qdisc_advanced', '1');
+
+	o = flag(section, 'sqm_qdisc', 'sqm_qdisc_really_really_advanced', _('Dangerous qdisc'));
+	o.depends('sqm_qdisc_advanced', '1');
+
+	o = optionalValue(section, 'sqm_qdisc', 'sqm_ilimit', _('Hard queue limit ingress'), 'and(uinteger,min(0))', '');
+	o.depends('sqm_qdisc_really_really_advanced', '1');
+
+	o = optionalValue(section, 'sqm_qdisc', 'sqm_elimit', _('Hard queue limit egress'), 'and(uinteger,min(0))', '');
+	o.depends('sqm_qdisc_really_really_advanced', '1');
+
+	o = optionalValue(section, 'sqm_qdisc', 'sqm_itarget', _('Latency target ingress'), 'string', '');
+	o.depends('sqm_qdisc_really_really_advanced', '1');
+
+	o = optionalValue(section, 'sqm_qdisc', 'sqm_etarget', _('Latency target egress'), 'string', '');
+	o.depends('sqm_qdisc_really_really_advanced', '1');
+
+	o = optionalValue(section, 'sqm_qdisc', 'sqm_iqdisc_opts', _('Qdisc options ingress'), 'string', '');
+	o.depends('sqm_qdisc_really_really_advanced', '1');
+
+	o = optionalValue(section, 'sqm_qdisc', 'sqm_eqdisc_opts', _('Qdisc options egress'), 'string', '');
+	o.depends('sqm_qdisc_really_really_advanced', '1');
+
+	listValue(section, 'sqm_linklayer', 'sqm_linklayer', _('Link layer'), [
+		[ 'none', 'none' ],
+		[ 'ethernet', 'ethernet' ],
+		[ 'atm', 'atm' ]
+	], 'none');
+
+	o = value(section, 'sqm_linklayer', 'sqm_overhead', _('Per packet overhead'), 'and(integer,min(-1500))', '0');
+	o.depends('sqm_linklayer', 'ethernet');
+	o.depends('sqm_linklayer', 'atm');
+
+	o = flag(section, 'sqm_linklayer', 'sqm_linklayer_advanced', _('Advanced link layer'));
+	o.depends('sqm_linklayer', 'ethernet');
+	o.depends('sqm_linklayer', 'atm');
+
+	o = value(section, 'sqm_linklayer', 'sqm_tcMTU', _('Maximum packet size'), 'and(uinteger,min(0))', '2047');
+	o.depends('sqm_linklayer_advanced', '1');
+
+	o = value(section, 'sqm_linklayer', 'sqm_tcTSIZE', _('Rate table size'), 'and(uinteger,min(0))', '128');
+	o.depends('sqm_linklayer_advanced', '1');
+
+	o = value(section, 'sqm_linklayer', 'sqm_tcMPU', _('Minimum packet size'), 'and(uinteger,min(0))', '0');
+	o.depends('sqm_linklayer_advanced', '1');
+
+	o = listValue(section, 'sqm_linklayer', 'sqm_linklayer_adaptation_mechanism', _('Link layer mechanism'), [
+		'default',
+		'cake',
+		'htb_private',
+		'tc_stab'
+	], 'default');
+	o.depends('sqm_linklayer_advanced', '1');
+}
+
+function addSummaryColumns(section) {
+	var o;
+
+	o = section.option(form.DummyValue, '_enabled', _('Enabled'));
+	o.cfgvalue = function(section_id) {
+		return uci.get('cake-autorate', section_id, 'enabled') === '1' ? _('yes') : _('no');
+	};
+
+	o = section.option(form.DummyValue, '_wan', _('WAN'));
+	o.cfgvalue = function(section_id) {
+		return selectedWan(null, section_id);
+	};
+
+	o = section.option(form.DummyValue, '_sqm', _('SQM'));
+	o.cfgvalue = function(section_id) {
+		if (uci.get('cake-autorate', section_id, 'manage_sqm') === '0')
+			return _('off');
+
+		var wan = selectedWan(null, section_id);
+		var enabled = uci.get('cake-autorate', section_id, 'sqm_enabled') === '1';
+
+		return '%s %s'.format(enabled ? _('on') : _('off'), wan);
+	};
+
+	o = section.option(form.DummyValue, '_rates', _('Rate'));
+	o.cfgvalue = function(section_id) {
+		var dl = uci.get('cake-autorate', section_id, 'sqm_download') ||
+			uci.get('cake-autorate', section_id, 'base_dl_shaper_rate_kbps') ||
+			'0';
+		var ul = uci.get('cake-autorate', section_id, 'sqm_upload') ||
+			uci.get('cake-autorate', section_id, 'base_ul_shaper_rate_kbps') ||
+			'0';
+
+		return '%s/%s'.format(dl, ul);
+	};
+}
+
+function loadSqmScripts() {
+	return L.resolveDefault(fs.list('/usr/lib/sqm'), []).then(function(entries) {
+		var scripts = [];
+
+		for (var i = 0; i < entries.length; i++)
+			if (entries[i].name.match(/\.qos$/))
+				scripts.push(entries[i].name);
+
+		return scripts;
+	});
+}
+
 return L.view.extend({
 	load: function() {
 		return Promise.all([
 			network.getDevices(),
-			uci.load('cake-autorate')
+			L.resolveDefault(fs.list('/var/run/sqm/available_qdiscs'), []),
+			loadSqmScripts(),
+			uci.load('cake-autorate'),
+			L.resolveDefault(uci.load('sqm'), null)
 		]);
 	},
 
-	render: function() {
+	render: function(data) {
 		var m, s;
+		var qdiscs = data[1];
+		var scripts = data[2];
 
 		m = new form.Map('cake-autorate', _('CAKE Autorate'));
 		s = m.section(form.GridSection, 'cake_autorate', _('Instances'));
@@ -146,8 +558,14 @@ return L.view.extend({
 		s.addremove = true;
 		s.nodescriptions = true;
 
+		addSummaryColumns(s);
+
+		s.tab('setup', _('Setup'));
 		s.tab('general', _('General'));
 		s.tab('interfaces', _('Interfaces'));
+		s.tab('sqm_basic', _('SQM Basic'));
+		s.tab('sqm_qdisc', _('SQM Queue'));
+		s.tab('sqm_linklayer', _('SQM Link Layer'));
 		s.tab('rates', _('Rates'));
 		s.tab('reflectors', _('Reflectors'));
 		s.tab('latency', _('Latency'));
@@ -155,13 +573,12 @@ return L.view.extend({
 		s.tab('logging', _('Logging'));
 		s.tab('advanced', _('Advanced'));
 
-		flag(s, 'general', 'enabled', _('Enabled'));
 		flag(s, 'general', 'adjust_dl_shaper_rate', _('Adjust DL'));
 		flag(s, 'general', 'adjust_ul_shaper_rate', _('Adjust UL'));
 
-		iface(s, 'interfaces', 'dl_if', _('Download interface'));
-		iface(s, 'interfaces', 'ul_if', _('Upload interface'));
-
+		addSetupOptions(s);
+		addInterfaceOptions(s);
+		addSqmOptions(s, qdiscs, scripts);
 		addRateOptions(s);
 		addReflectorOptions(s);
 		addLatencyOptions(s);

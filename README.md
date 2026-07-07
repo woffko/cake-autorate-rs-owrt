@@ -37,15 +37,43 @@ Implemented:
 - adaptive rate calculations using delay/load windows.
 - `tc qdisc change ... cake bandwidth ...` shaper updates.
 - JSON status file under `/var/run/cake-autorate/<instance>/status.json`.
-- LuCI settings page with the same main knobs exposed from the UCI config.
+- LuCI settings page with compact instance rows and modal tabs for detailed settings.
+- LuCI setup tab with the minimum recommended autorate fields from upstream:
+  target interface, SQM download/upload, and min/base/max rates per direction.
+- Integrated SQM backend sync: each `cake-autorate` UCI section can own a matching
+  `sqm` queue section.
+- Automatic interface preset: selecting the target interface fills
+  `sqm_interface`, `ul_if`, and `dl_if=ifb4<target>`.
+- Automatic SQM rate import from an existing `/etc/config/sqm` queue for the
+  selected interface when available.
 - LuCI status page with start, restart, stop actions.
 
 Known limits:
 
 - Only `pinger_method=fping` is implemented.
 - `fping-ts`, `tsping`, `irtt`, and plain `ping` backends are not implemented.
-- reflector replacement, health scoring, CPU stats, log export/compression, and MQTT integration are placeholders or not implemented.
-- `tc` is treated as a runtime prerequisite when shaper adjustment is enabled, but is not a hard package dependency in this prototype to avoid pulling kernel scheduling packages during SDK-only builds.
+- advanced multi-WAN policy, reflector replacement, health scoring, CPU stats,
+  log export/compression, and MQTT integration are placeholders or not implemented.
+
+SQM integration:
+
+- `luci-app-cake-autorate-rs` is intended to be the single LuCI UI for SQM setup
+  plus autorate control.
+- Installing the LuCI package automatically installs `sqm-scripts`, which pulls
+  the normal OpenWrt CAKE/IFB shaping stack.
+- The LuCI package declares `PROVIDES:=luci-app-sqm` and `CONFLICTS:=luci-app-sqm`
+  as the replacement intent. OpenWrt 25.12 APK package generation currently emits
+  the provide metadata, but conflict metadata still needs verification in final
+  packages.
+- The UI includes the required `luci-app-sqm` settings: enable flag, interface,
+  download/upload rates, debug logging, verbosity, qdisc, queue setup script,
+  DSCP/ECN options, queue limits, latency targets, raw qdisc options, link layer
+  mode, overhead, and advanced link layer parameters.
+- `cake-autorate` UCI sections are the user-facing source of truth; the init
+  script synchronizes matching `sqm` queue sections before starting SQM and
+  autorate.
+- Multiple interface/queue pairs are represented as multiple `cake_autorate`
+  sections and shown in one compact LuCI grid.
 
 ## Runtime Dependencies
 
@@ -54,17 +82,14 @@ Required package dependencies:
 - `uci`
 - `fping`
 
-Runtime tools needed for real shaping:
-
-- `tc` from `tc-tiny`, `tc-full`, or an equivalent OpenWrt package.
-- a configured CAKE qdisc on the configured download/upload interfaces.
-
 LuCI package dependencies:
 
 - `cake-autorate-rs`
 - `luci-base`
-- `rpcd`
-- UCI RPC support on the target image.
+- `sqm-scripts`
+
+`sqm-scripts` pulls the required `tc`, CAKE, IFB, iptables, and related shaping
+packages on OpenWrt.
 
 ## Build In OpenWrt SDK
 
@@ -109,10 +134,10 @@ Copy the generated `.apk` files to the router and install them:
 apk add --allow-untrusted /tmp/cake-autorate-rs-*.apk /tmp/luci-app-cake-autorate-rs-*.apk
 ```
 
-Install `fping` and `tc` if they are not already present:
+Install backend dependencies if they are not already present:
 
 ```sh
-apk add fping tc-tiny
+apk add fping sqm-scripts
 ```
 
 Then edit `/etc/config/cake-autorate` or use LuCI:

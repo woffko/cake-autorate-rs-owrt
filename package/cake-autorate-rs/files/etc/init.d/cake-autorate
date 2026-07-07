@@ -5,7 +5,164 @@ STOP=4
 USE_PROCD=1
 
 CONFIG="cake-autorate"
+SQM_CONFIG="sqm"
 DAEMON="/usr/sbin/cake-autorated"
+SQM_MANAGED=0
+CAKE_CONFIG_CHANGED=0
+
+set_cake_option_if_changed() {
+	local section="$1"
+	local option="$2"
+	local value="$3"
+	local current
+
+	config_get current "$section" "$option"
+	[ "$current" = "$value" ] && return 0
+
+	uci set "$CONFIG.$section.$option=$value"
+	CAKE_CONFIG_CHANGED=1
+}
+
+sync_interface_preset_instance() {
+	local section="$1"
+	local auto wan
+
+	config_get_bool auto "$section" auto_interface_preset 1
+	[ "$auto" -eq 1 ] || return 0
+
+	config_get wan "$section" wan_if
+	[ -n "$wan" ] || config_get wan "$section" sqm_interface
+	[ -n "$wan" ] || config_get wan "$section" ul_if
+	[ -n "$wan" ] || return 0
+
+	set_cake_option_if_changed "$section" wan_if "$wan"
+	set_cake_option_if_changed "$section" sqm_interface "$wan"
+	set_cake_option_if_changed "$section" ul_if "$wan"
+	set_cake_option_if_changed "$section" dl_if "ifb4$wan"
+}
+
+sync_interface_presets() {
+	CAKE_CONFIG_CHANGED=0
+	config_foreach sync_interface_preset_instance cake_autorate
+	[ "$CAKE_CONFIG_CHANGED" -eq 1 ] || return 0
+
+	uci commit "$CONFIG"
+	config_load "$CONFIG"
+}
+
+set_sqm_option() {
+	local section="$1"
+	local option="$2"
+	local value="$3"
+
+	uci set "$SQM_CONFIG.$section.$option=$value"
+}
+
+set_sqm_optional_option() {
+	local section="$1"
+	local option="$2"
+	local value="$3"
+
+	if [ -n "$value" ]; then
+		set_sqm_option "$section" "$option" "$value"
+	else
+		uci -q delete "$SQM_CONFIG.$section.$option"
+	fi
+}
+
+sync_sqm_instance() {
+	local section="$1"
+	local manage_sqm enabled sqm_enabled sqm_section value
+
+	config_get_bool manage_sqm "$section" manage_sqm 1
+	[ "$manage_sqm" -eq 1 ] || return 0
+
+	config_get sqm_section "$section" sqm_section "cake_$section"
+	uci -q get "$SQM_CONFIG.$sqm_section" >/dev/null || uci set "$SQM_CONFIG.$sqm_section=queue"
+	set_sqm_option "$sqm_section" "_cake_autorate_managed" "$section"
+
+	config_get_bool enabled "$section" enabled 0
+	config_get_bool sqm_enabled "$section" sqm_enabled "$enabled"
+	set_sqm_option "$sqm_section" enabled "$sqm_enabled"
+
+	config_get value "$section" sqm_interface
+	[ -n "$value" ] || config_get value "$section" ul_if
+	set_sqm_option "$sqm_section" interface "$value"
+
+	config_get value "$section" sqm_download
+	[ -n "$value" ] || config_get value "$section" base_dl_shaper_rate_kbps
+	set_sqm_option "$sqm_section" download "$value"
+
+	config_get value "$section" sqm_upload
+	[ -n "$value" ] || config_get value "$section" base_ul_shaper_rate_kbps
+	set_sqm_option "$sqm_section" upload "$value"
+
+	config_get value "$section" sqm_debug_logging 0
+	set_sqm_option "$sqm_section" debug_logging "$value"
+	config_get value "$section" sqm_verbosity 5
+	set_sqm_option "$sqm_section" verbosity "$value"
+	config_get value "$section" sqm_qdisc cake
+	set_sqm_option "$sqm_section" qdisc "$value"
+	config_get value "$section" sqm_script piece_of_cake.qos
+	set_sqm_option "$sqm_section" script "$value"
+	config_get value "$section" sqm_qdisc_advanced 0
+	set_sqm_option "$sqm_section" qdisc_advanced "$value"
+	config_get value "$section" sqm_squash_dscp 1
+	set_sqm_option "$sqm_section" squash_dscp "$value"
+	config_get value "$section" sqm_squash_ingress 1
+	set_sqm_option "$sqm_section" squash_ingress "$value"
+	config_get value "$section" sqm_ingress_ecn ECN
+	set_sqm_option "$sqm_section" ingress_ecn "$value"
+	config_get value "$section" sqm_egress_ecn NOECN
+	set_sqm_option "$sqm_section" egress_ecn "$value"
+	config_get value "$section" sqm_qdisc_really_really_advanced 0
+	set_sqm_option "$sqm_section" qdisc_really_really_advanced "$value"
+
+	config_get value "$section" sqm_ilimit
+	set_sqm_optional_option "$sqm_section" ilimit "$value"
+	config_get value "$section" sqm_elimit
+	set_sqm_optional_option "$sqm_section" elimit "$value"
+	config_get value "$section" sqm_itarget
+	set_sqm_optional_option "$sqm_section" itarget "$value"
+	config_get value "$section" sqm_etarget
+	set_sqm_optional_option "$sqm_section" etarget "$value"
+	config_get value "$section" sqm_iqdisc_opts
+	set_sqm_optional_option "$sqm_section" iqdisc_opts "$value"
+	config_get value "$section" sqm_eqdisc_opts
+	set_sqm_optional_option "$sqm_section" eqdisc_opts "$value"
+
+	config_get value "$section" sqm_linklayer none
+	set_sqm_option "$sqm_section" linklayer "$value"
+	config_get value "$section" sqm_overhead 0
+	set_sqm_option "$sqm_section" overhead "$value"
+	config_get value "$section" sqm_linklayer_advanced 0
+	set_sqm_option "$sqm_section" linklayer_advanced "$value"
+	config_get value "$section" sqm_tcMTU 2047
+	set_sqm_option "$sqm_section" tcMTU "$value"
+	config_get value "$section" sqm_tcTSIZE 128
+	set_sqm_option "$sqm_section" tcTSIZE "$value"
+	config_get value "$section" sqm_tcMPU 0
+	set_sqm_option "$sqm_section" tcMPU "$value"
+	config_get value "$section" sqm_linklayer_adaptation_mechanism default
+	set_sqm_option "$sqm_section" linklayer_adaptation_mechanism "$value"
+
+	SQM_MANAGED=1
+}
+
+sync_sqm_config() {
+	SQM_MANAGED=0
+	config_foreach sync_sqm_instance cake_autorate
+	[ "$SQM_MANAGED" -eq 1 ] || return 0
+	uci commit "$SQM_CONFIG"
+}
+
+start_sqm_backend() {
+	[ "$SQM_MANAGED" -eq 1 ] || return 0
+	[ -x /etc/init.d/sqm ] || return 0
+
+	/etc/init.d/sqm enable >/dev/null 2>&1 || true
+	/etc/init.d/sqm restart >/dev/null 2>&1 || /etc/init.d/sqm start >/dev/null 2>&1 || true
+}
 
 start_instance() {
 	local section="$1"
@@ -24,6 +181,9 @@ start_instance() {
 
 start_service() {
 	config_load "$CONFIG"
+	sync_interface_presets
+	sync_sqm_config
+	start_sqm_backend
 	config_foreach start_instance cake_autorate
 }
 
@@ -34,4 +194,5 @@ reload_service() {
 
 service_triggers() {
 	procd_add_reload_trigger "$CONFIG"
+	procd_add_reload_trigger "$SQM_CONFIG"
 }

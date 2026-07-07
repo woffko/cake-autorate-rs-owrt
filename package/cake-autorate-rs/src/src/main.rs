@@ -162,14 +162,32 @@ impl Config {
             if parts.next().is_some() {
                 continue;
             }
-            let value = unquote_uci_value(raw_value);
-            single.insert(key.to_string(), value.clone());
-            lists.entry(key.to_string()).or_default().push(value);
+            let values = parse_uci_values(raw_value);
+            if let Some(value) = values.first() {
+                single.insert(key.to_string(), value.clone());
+                lists.entry(key.to_string()).or_default().extend(values);
+            }
         }
 
         set_bool(&single, "enabled", &mut cfg.enabled)?;
         set_string(&single, "dl_if", &mut cfg.dl_if);
         set_string(&single, "ul_if", &mut cfg.ul_if);
+        if single
+            .get("auto_interface_preset")
+            .map(|value| parse_bool(value).map_err(|e| format!("auto_interface_preset: {e}")))
+            .transpose()?
+            .unwrap_or(true)
+        {
+            if let Some(wan_if) = single
+                .get("wan_if")
+                .or_else(|| single.get("sqm_interface"))
+                .or_else(|| single.get("ul_if"))
+                .filter(|value| !value.is_empty())
+            {
+                cfg.ul_if = wan_if.clone();
+                cfg.dl_if = format!("ifb4{wan_if}");
+            }
+        }
         set_string(&single, "rx_bytes_path", &mut cfg.rx_bytes_path);
         set_string(&single, "tx_bytes_path", &mut cfg.tx_bytes_path);
         set_bool(
@@ -1067,13 +1085,50 @@ fn percent(value: f64, base: f64) -> f64 {
     }
 }
 
-fn unquote_uci_value(value: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
-        trimmed[1..trimmed.len() - 1].to_string()
-    } else {
-        trimmed.to_string()
+fn parse_uci_values(value: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+    let mut token_started = false;
+    let mut chars = value.trim().chars();
+
+    while let Some(ch) = chars.next() {
+        if in_quote {
+            match ch {
+                '\'' => in_quote = false,
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                }
+                _ => current.push(ch),
+            }
+            token_started = true;
+        } else {
+            match ch {
+                '\'' => {
+                    in_quote = true;
+                    token_started = true;
+                }
+                c if c.is_whitespace() => {
+                    if token_started {
+                        values.push(std::mem::take(&mut current));
+                        token_started = false;
+                    }
+                }
+                _ => {
+                    current.push(ch);
+                    token_started = true;
+                }
+            }
+        }
     }
+
+    if token_started {
+        values.push(current);
+    }
+
+    values
 }
 
 fn parse_bool(value: &str) -> Result<bool, String> {
@@ -1194,5 +1249,28 @@ fn main() {
     if let Err(e) = run(cfg, once) {
         eprintln!("ERROR: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_uci_values;
+
+    #[test]
+    fn parses_single_quoted_value() {
+        assert_eq!(parse_uci_values("'eth1'"), vec!["eth1"]);
+    }
+
+    #[test]
+    fn parses_uci_list_values() {
+        assert_eq!(
+            parse_uci_values("'1.1.1.1' '1.0.0.1' '8.8.8.8'"),
+            vec!["1.1.1.1", "1.0.0.1", "8.8.8.8"]
+        );
+    }
+
+    #[test]
+    fn preserves_spaces_inside_quotes() {
+        assert_eq!(parse_uci_values("'foo bar' baz"), vec!["foo bar", "baz"]);
     }
 }

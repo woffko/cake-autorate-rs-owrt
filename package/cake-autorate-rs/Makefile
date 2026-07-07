@@ -4,7 +4,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=cake-autorate-rs
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=1
+PKG_RELEASE:=3
 
 PKG_MAINTAINER:=woffko
 PKG_LICENSE:=GPL-2.0-or-later
@@ -19,7 +19,7 @@ define Package/cake-autorate-rs
   SECTION:=net
   CATEGORY:=Network
   TITLE:=Rust daemon for adaptive CAKE bandwidth control
-  URL:=https://github.com/woffko/cake-autorate-rs
+  URL:=https://github.com/woffko/cake-autorate-rs-owrt
   MAINTAINER:=woffko
   DEPENDS:=$(RUST_ARCH_DEPENDS) +uci +fping
 endef
