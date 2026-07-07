@@ -40,6 +40,9 @@ Implemented:
 - daemon log rotation by age/size with best-effort gzip compression.
 - JSON status file under `/var/run/cake-autorate/<instance>/status.json`.
 - LuCI settings page with compact instance rows and modal tabs for detailed settings.
+- LuCI cross-field validation for manual min/base/max rates, explicit
+  download/upload interface conflicts, `ping` fallback pinger count, and
+  duplicate managed SQM section ownership.
 - LuCI setup wizard for creating instances, importing SQM rates, checking speed
   test backends, running a router-side speed test, and writing derived limits.
 - LuCI setup tab with the minimum recommended autorate fields from upstream:

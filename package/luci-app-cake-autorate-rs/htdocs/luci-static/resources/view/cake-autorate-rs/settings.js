@@ -325,8 +325,163 @@ function manualRateLimitsEnabled(section, section_id) {
 	return value === '1';
 }
 
+function formOrUci(section, section_id, key) {
+	var element, value;
+
+	if (section && typeof section.getUIElement == 'function') {
+		element = section.getUIElement(section_id, key);
+
+		if (element && typeof element.getValue == 'function')
+			value = element.getValue();
+
+		if (value == null && element && typeof element.isChecked == 'function')
+			value = element.isChecked() ? '1' : '0';
+	}
+
+	if ((value == null || value === '') && section && typeof section.formvalue == 'function')
+		value = section.formvalue(section_id, key);
+
+	if (value == null || value === '')
+		value = uci.get('cake-autorate', section_id, key);
+
+	return value;
+}
+
+function validationSection(option) {
+	if (option && option.section)
+		return option.section;
+
+	if (option && option.map && option.map.children) {
+		for (var i = 0; i < option.map.children.length; i++)
+			if (typeof option.map.children[i].formvalue == 'function')
+				return option.map.children[i];
+	}
+
+	return null;
+}
+
+function checkedFormOrUci(section, section_id, key, fallback) {
+	var value = formOrUci(section, section_id, key);
+
+	if (value == null || value === '')
+		return fallback;
+
+	return value === '1';
+}
+
 function ifbForWan(wan_if) {
 	return wan_if ? 'ifb4' + wan_if : '';
+}
+
+function parsePositiveRate(value) {
+	var parsed;
+
+	if (value == null || value === '')
+		return null;
+
+	parsed = parseInt(value, 10);
+	return isNaN(parsed) || parsed < 0 ? null : parsed;
+}
+
+function validateRateOrder(section, section_id, direction) {
+	var min = parsePositiveRate(formOrUci(section, section_id, 'min_' + direction + '_shaper_rate_kbps'));
+	var base = parsePositiveRate(formOrUci(section, section_id, 'base_' + direction + '_shaper_rate_kbps'));
+	var max = parsePositiveRate(formOrUci(section, section_id, 'max_' + direction + '_shaper_rate_kbps'));
+	var label = direction === 'dl' ? _('download') : _('upload');
+
+	if (min == null || base == null || max == null)
+		return true;
+
+	if (min > base)
+		return _('Minimum %s rate must not exceed the base rate.').format(label);
+
+	if (base > max)
+		return _('Base %s rate must not exceed the maximum rate.').format(label);
+
+	return true;
+}
+
+function validateDifferentInterfaces(section, section_id) {
+	var dl = normalizeInterfaceName(formOrUci(section, section_id, 'dl_if'));
+	var ul = normalizeInterfaceName(formOrUci(section, section_id, 'ul_if'));
+
+	if (!dl || !ul || dl !== ul)
+		return true;
+
+	return _('Download and upload interfaces must be different.');
+}
+
+function validatePingerCount(section, section_id) {
+	var method = formOrUci(section, section_id, 'pinger_method') || 'fping';
+	var count = parseInt(formOrUci(section, section_id, 'no_pingers') || '6', 10);
+
+	if (method !== 'ping' || isNaN(count) || count <= 1)
+		return true;
+
+	return _('The ping fallback uses only the first reflector. Set Pingers to 1 or choose fping.');
+}
+
+function selectedSqmSection(section, section_id) {
+	return formOrUci(section, section_id, 'sqm_section') || managedSqmSectionName(section_id);
+}
+
+function validateSqmSectionUnique(section, section_id) {
+	var manage = checkedFormOrUci(section, section_id, 'manage_sqm', true);
+	var target = selectedSqmSection(section, section_id);
+	var sections;
+
+	if (!manage || !target)
+		return true;
+
+	sections = uci.sections('cake-autorate', 'cake_autorate') || [];
+	for (var i = 0; i < sections.length; i++) {
+		var other = sections[i]['.name'];
+		var otherManage;
+		var otherTarget;
+
+		if (!other || other === section_id)
+			continue;
+
+		otherManage = sections[i].manage_sqm !== '0';
+		if (!otherManage)
+			continue;
+
+		otherTarget = sections[i].sqm_section || managedSqmSectionName(other);
+		if (otherTarget === target)
+			return _('SQM section "%s" is already managed by instance "%s".').format(target, other);
+	}
+
+	return true;
+}
+
+function validateInstanceSection(section, section_id) {
+	var result;
+
+	if (checkedFormOrUci(section, section_id, 'manual_rate_limits', false)) {
+		result = validateRateOrder(section, section_id, 'dl');
+		if (result !== true)
+			return result;
+
+		result = validateRateOrder(section, section_id, 'ul');
+		if (result !== true)
+			return result;
+	}
+
+	if (!checkedFormOrUci(section, section_id, 'auto_interface_preset', true)) {
+		result = validateDifferentInterfaces(section, section_id);
+		if (result !== true)
+			return result;
+	}
+
+	result = validatePingerCount(section, section_id);
+	if (result !== true)
+		return result;
+
+	result = validateSqmSectionUnique(section, section_id);
+	if (result !== true)
+		return result;
+
+	return true;
 }
 
 function findSqmQueueForInterface(iface) {
@@ -1481,26 +1636,44 @@ function addSetupOptions(section) {
 	o = value(section, 'setup', 'min_dl_shaper_rate_kbps', _('Min DL rate'), 'uinteger', '5000');
 	o.depends('manual_rate_limits', '1');
 	o.retain = true;
+	o.validate = function(section_id) {
+		return validateRateOrder(validationSection(this), section_id, 'dl');
+	};
 
 	o = value(section, 'setup', 'base_dl_shaper_rate_kbps', _('Base DL rate'), 'uinteger', '20000');
 	o.depends('manual_rate_limits', '1');
 	o.retain = true;
+	o.validate = function(section_id) {
+		return validateRateOrder(validationSection(this), section_id, 'dl');
+	};
 
 	o = value(section, 'setup', 'max_dl_shaper_rate_kbps', _('Max DL rate'), 'uinteger', '80000');
 	o.depends('manual_rate_limits', '1');
 	o.retain = true;
+	o.validate = function(section_id) {
+		return validateRateOrder(validationSection(this), section_id, 'dl');
+	};
 
 	o = value(section, 'setup', 'min_ul_shaper_rate_kbps', _('Min UL rate'), 'uinteger', '5000');
 	o.depends('manual_rate_limits', '1');
 	o.retain = true;
+	o.validate = function(section_id) {
+		return validateRateOrder(validationSection(this), section_id, 'ul');
+	};
 
 	o = value(section, 'setup', 'base_ul_shaper_rate_kbps', _('Base UL rate'), 'uinteger', '20000');
 	o.depends('manual_rate_limits', '1');
 	o.retain = true;
+	o.validate = function(section_id) {
+		return validateRateOrder(validationSection(this), section_id, 'ul');
+	};
 
 	o = value(section, 'setup', 'max_ul_shaper_rate_kbps', _('Max UL rate'), 'uinteger', '35000');
 	o.depends('manual_rate_limits', '1');
 	o.retain = true;
+	o.validate = function(section_id) {
+		return validateRateOrder(validationSection(this), section_id, 'ul');
+	};
 }
 
 function addInterfaceOptions(section) {
@@ -1508,9 +1681,15 @@ function addInterfaceOptions(section) {
 
 	o = iface(section, 'interfaces', 'dl_if', _('Download interface'));
 	o.depends('auto_interface_preset', '0');
+	o.validate = function(section_id) {
+		return validateDifferentInterfaces(validationSection(this), section_id);
+	};
 
 	o = iface(section, 'interfaces', 'ul_if', _('Upload interface'));
 	o.depends('auto_interface_preset', '0');
+	o.validate = function(section_id) {
+		return validateDifferentInterfaces(validationSection(this), section_id);
+	};
 }
 
 function addLatencyOptions(section) {
@@ -1546,6 +1725,9 @@ function addReflectorOptions(section) {
 	o.value('fping', 'fping');
 	o.value('ping', _('ping fallback'));
 	o.rmempty = false;
+	o.validate = function(section_id) {
+		return validatePingerCount(validationSection(this), section_id);
+	};
 
 	o = section.taboption('reflectors', form.DynamicList, 'reflector', _('Reflectors'));
 	modal(o);
@@ -1557,7 +1739,10 @@ function addReflectorOptions(section) {
 	value(section, 'reflectors', 'reflectors_url_skip_lines', _('URL skip lines'), 'uinteger', '1');
 	flag(section, 'reflectors', 'randomize_reflectors', _('Randomize reflectors'));
 	flag(section, 'reflectors', 'retain_reflector_stats', _('Retain reflector stats'));
-	value(section, 'reflectors', 'no_pingers', _('Pingers'), 'uinteger', '6');
+	o = value(section, 'reflectors', 'no_pingers', _('Pingers'), 'uinteger', '6');
+	o.validate = function(section_id) {
+		return validatePingerCount(validationSection(this), section_id);
+	};
 	value(section, 'reflectors', 'reflector_ping_interval_s', _('Ping interval'), 'ufloat', '0.3');
 	optionalValue(section, 'reflectors', 'ping_extra_args', _('Extra ping args'), null, '');
 	optionalValue(section, 'reflectors', 'ping_prefix_string', _('Ping prefix'), null, '');
@@ -1609,8 +1794,16 @@ function addAdvancedOptions(section) {
 function addSqmOptions(section, qdiscs, scripts) {
 	var o, seen;
 
-	flag(section, 'sqm_basic', 'manage_sqm', _('Manage SQM'));
-	optionalValue(section, 'sqm_basic', 'sqm_section', _('SQM section'), 'uciname', '');
+	o = flag(section, 'sqm_basic', 'manage_sqm', _('Manage SQM'));
+	o.validate = function(section_id) {
+		return validateSqmSectionUnique(validationSection(this), section_id);
+	};
+
+	o = optionalValue(section, 'sqm_basic', 'sqm_section', _('SQM section'), 'uciname', '');
+	o.validate = function(section_id) {
+		return validateSqmSectionUnique(validationSection(this), section_id);
+	};
+
 	o = iface(section, 'sqm_basic', 'sqm_interface', _('SQM interface'));
 	o.depends('auto_interface_preset', '0');
 	flag(section, 'sqm_basic', 'sqm_debug_logging', _('SQM debug logging'));
@@ -1793,6 +1986,20 @@ return L.view.extend({
 		s.nodescriptions = true;
 		s.handleAdd = function(ev, name) {
 			showCreateWizard(this, name);
+		};
+		s.addModalOptions = function(modalSection, section_id) {
+			var parse = modalSection.parse;
+
+			modalSection.parse = function() {
+				var validation = validateInstanceSection(this, section_id);
+
+				if (validation !== true) {
+					ui.addNotification(null, E('p', validation), 'error');
+					return Promise.reject(new TypeError(validation));
+				}
+
+				return parse.apply(this, arguments);
+			};
 		};
 
 		addSummaryColumns(s);
