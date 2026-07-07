@@ -484,6 +484,448 @@ function applySpeedtestRates(section, section_id, result, percent) {
 	};
 }
 
+function sectionNameExists(name) {
+	var sections = uci.sections('cake-autorate', 'cake_autorate') || [];
+
+	for (var i = 0; i < sections.length; i++)
+		if (sections[i]['.name'] === name)
+			return true;
+
+	return false;
+}
+
+function targetInterfaceChoices() {
+	var choices = [];
+	var seen = {};
+
+	function add(name) {
+		name = normalizeInterfaceName(name);
+		if (!name || seen[name])
+			return;
+
+		choices.push(name);
+		seen[name] = true;
+	}
+
+	add(defaultTargetInterface());
+
+	for (var name in interfaceContext.deviceNames)
+		add(name);
+
+	choices.sort(function(a, b) {
+		if (a === defaultTargetInterface())
+			return -1;
+		if (b === defaultTargetInterface())
+			return 1;
+
+		return a.localeCompare(b);
+	});
+
+	return choices;
+}
+
+function defaultRatesForInterface(wan_if) {
+	var queue = findSqmQueueForInterface(wan_if);
+
+	return {
+		dl: rateValue(queue ? queue.download : null, '20000'),
+		ul: rateValue(queue ? queue.upload : null, '20000')
+	};
+}
+
+function writeWizardConfig(section_id, state) {
+	var wan = normalizeInterfaceName(state.wan_if);
+	var dl = rateValue(state.sqm_download, '20000');
+	var ul = rateValue(state.sqm_upload, '20000');
+
+	uci.set('cake-autorate', section_id, 'enabled', state.enabled ? '1' : '0');
+	uci.set('cake-autorate', section_id, 'wan_if', wan);
+	uci.set('cake-autorate', section_id, 'auto_interface_preset', '1');
+	uci.set('cake-autorate', section_id, 'adjust_dl_shaper_rate', '1');
+	uci.set('cake-autorate', section_id, 'adjust_ul_shaper_rate', '1');
+	uci.set('cake-autorate', section_id, 'manage_sqm', '1');
+	uci.set('cake-autorate', section_id, 'sqm_section', 'cake_' + section_id);
+	uci.set('cake-autorate', section_id, 'sqm_enabled', state.sqm_enabled ? '1' : '0');
+	uci.set('cake-autorate', section_id, 'speedtest_apply_percent', String(state.speedtest_apply_percent || '90'));
+	uci.set('cake-autorate', section_id, 'manual_rate_limits', '0');
+	uci.set('cake-autorate', section_id, 'advanced_settings', '0');
+	uci.set('cake-autorate', section_id, 'sqm_interface', wan);
+	uci.set('cake-autorate', section_id, 'ul_if', wan);
+	uci.set('cake-autorate', section_id, 'dl_if', ifbForWan(wan));
+	uci.set('cake-autorate', section_id, 'sqm_download', dl);
+	uci.set('cake-autorate', section_id, 'sqm_upload', ul);
+	uci.set('cake-autorate', section_id, 'base_dl_shaper_rate_kbps', dl);
+	uci.set('cake-autorate', section_id, 'base_ul_shaper_rate_kbps', ul);
+	uci.set('cake-autorate', section_id, 'max_dl_shaper_rate_kbps', dl);
+	uci.set('cake-autorate', section_id, 'max_ul_shaper_rate_kbps', ul);
+	uci.set('cake-autorate', section_id, 'min_dl_shaper_rate_kbps', halfRate(dl));
+	uci.set('cake-autorate', section_id, 'min_ul_shaper_rate_kbps', halfRate(ul));
+}
+
+function wizardField(label, control, description) {
+	var field = E('div', { 'class': 'cbi-value' }, [
+		E('label', { 'class': 'cbi-value-title' }, label),
+		E('div', { 'class': 'cbi-value-field' }, control)
+	]);
+
+	if (description)
+		field.lastChild.appendChild(E('div', { 'class': 'cbi-value-description' }, description));
+
+	return field;
+}
+
+function wizardTextInput(value, datatype) {
+	return E('input', {
+		'type': 'text',
+		'class': 'cbi-input-text',
+		'value': value || '',
+		'data-datatype': datatype || null
+	});
+}
+
+function wizardCheckbox(checked) {
+	return E('input', {
+		'type': 'checkbox',
+		'class': 'cbi-input-checkbox',
+		'checked': checked ? 'checked' : null
+	});
+}
+
+function wizardSelect(values, selected) {
+	var options = [];
+
+	for (var i = 0; i < values.length; i++)
+		options.push(E('option', {
+			'value': values[i],
+			'selected': values[i] === selected ? 'selected' : null
+		}, values[i]));
+
+	return E('select', { 'class': 'cbi-input-select' }, options);
+}
+
+function validatePositiveInteger(value) {
+	value = parseInt(value, 10);
+
+	return !isNaN(value) && value > 0;
+}
+
+function replaceNodeContent(node, children) {
+	while (node.firstChild)
+		node.removeChild(node.firstChild);
+
+	if (Array.isArray(children)) {
+		for (var i = 0; i < children.length; i++)
+			node.appendChild(children[i]);
+	}
+	else if (children) {
+		node.appendChild(children);
+	}
+}
+
+function showCreateWizard(grid, name) {
+	var choices = targetInterfaceChoices();
+	var defaultWan = defaultTargetInterface();
+	var defaultRates = defaultRatesForInterface(defaultWan);
+	var state = {
+		name: name,
+		step: 0,
+		wan_if: defaultWan,
+		enabled: false,
+		sqm_enabled: false,
+		speedtest_apply_percent: '90',
+		sqm_download: defaultRates.dl,
+		sqm_upload: defaultRates.ul
+	};
+	var body = E('div', { 'class': 'cake-autorate-create-wizard' });
+	var errorNode = E('div', {
+		'class': 'alert-message error',
+		'style': 'display:none'
+	});
+
+	function showError(message) {
+		errorNode.textContent = message || '';
+		errorNode.style.display = message ? '' : 'none';
+	}
+
+	function syncRatesForInterface() {
+		var rates = defaultRatesForInterface(state.wan_if);
+
+		state.sqm_download = rates.dl;
+		state.sqm_upload = rates.ul;
+	}
+
+	function stepTitle() {
+		return [
+			_('Interface'),
+			_('Speed test'),
+			_('Review')
+		][state.step];
+	}
+
+	function renderSteps() {
+		var steps = [];
+
+		for (var i = 0; i < 3; i++)
+			steps.push(E('span', {
+				'class': 'badge %s'.format(i === state.step ? 'primary' : 'secondary'),
+				'style': 'margin-right:6px'
+			}, String(i + 1)));
+
+		return E('div', { 'style': 'margin-bottom:12px' }, steps);
+	}
+
+	function renderInterfaceStep() {
+		var target = wizardSelect(choices, state.wan_if);
+		var enabled = wizardCheckbox(state.enabled);
+		var sqmEnabled = wizardCheckbox(state.sqm_enabled);
+
+		target.addEventListener('change', function() {
+			state.wan_if = normalizeInterfaceName(target.value);
+			syncRatesForInterface();
+		});
+
+		enabled.addEventListener('change', function() {
+			state.enabled = enabled.checked;
+		});
+
+		sqmEnabled.addEventListener('change', function() {
+			state.sqm_enabled = sqmEnabled.checked;
+		});
+
+		return [
+			wizardField(_('Target interface'), target, optionDescriptions.wan_if),
+			wizardField(_('Enable autorate'), enabled, optionDescriptions.enabled),
+			wizardField(_('Enable SQM'), sqmEnabled, optionDescriptions.sqm_enabled)
+		];
+	}
+
+	function renderSpeedStep() {
+		var percent = wizardTextInput(state.speedtest_apply_percent, 'and(uinteger,min(1),max(100))');
+		var download = wizardTextInput(state.sqm_download, 'uinteger');
+		var upload = wizardTextInput(state.sqm_upload, 'uinteger');
+		var status = E('div', { 'class': 'cake-autorate-speedtest-status' }, '');
+		var syncInputs = function() {
+			state.speedtest_apply_percent = percent.value || '90';
+			state.sqm_download = download.value;
+			state.sqm_upload = upload.value;
+		};
+		var runButton = E('button', {
+			'class': 'btn cbi-button cbi-button-action',
+			'click': function() {
+				var pct = parseInt(percent.value || '90', 10);
+
+				if (isNaN(pct) || pct < 1 || pct > 100) {
+					showError(_('Speed test apply percent must be between 1 and 100.'));
+					return;
+				}
+
+				showError(null);
+				runButton.disabled = true;
+				status.textContent = _('Running speed test...');
+
+				fs.exec('/usr/libexec/cake-autorate-rs/speedtest', [ state.name ]).then(function(res) {
+					var result = parseSpeedtestResult(res.stdout);
+					var dl = measuredRate(result.download_kbps, pct);
+					var ul = measuredRate(result.upload_kbps, pct);
+
+					if (dl) {
+						state.sqm_download = dl;
+						download.value = dl;
+					}
+
+					if (ul) {
+						state.sqm_upload = ul;
+						upload.value = ul;
+					}
+
+					status.textContent = result.warning || _('Speed test completed.');
+				}).catch(function(err) {
+					showError(_('Speed test failed: %s').format(err.message || err));
+					status.textContent = '';
+				}).then(function() {
+					runButton.disabled = false;
+				});
+			}
+		}, _('Run speed test'));
+
+		percent.addEventListener('input', syncInputs);
+		percent.addEventListener('change', syncInputs);
+		download.addEventListener('input', syncInputs);
+		download.addEventListener('change', syncInputs);
+		upload.addEventListener('input', syncInputs);
+		upload.addEventListener('change', syncInputs);
+
+		return [
+			wizardField(_('Speed test apply percent'), percent, optionDescriptions.speedtest_apply_percent),
+			wizardField(_('Download speed'), download, optionDescriptions.sqm_download),
+			wizardField(_('Upload speed'), upload, optionDescriptions.sqm_upload),
+			wizardField(_('Run speed test'), E('div', {}, [ runButton, status ]), optionDescriptions._speedtest)
+		];
+	}
+
+	function renderReviewStep() {
+		var wan = normalizeInterfaceName(state.wan_if);
+		var rows = [
+			[ _('Target interface'), wan ],
+			[ _('Download interface'), ifbForWan(wan) ],
+			[ _('Upload interface'), wan ],
+			[ _('Download speed'), state.sqm_download + ' kbit/s' ],
+			[ _('Upload speed'), state.sqm_upload + ' kbit/s' ],
+			[ _('Min DL rate'), halfRate(state.sqm_download) + ' kbit/s' ],
+			[ _('Min UL rate'), halfRate(state.sqm_upload) + ' kbit/s' ]
+		];
+
+		return [
+			E('table', { 'class': 'table' }, rows.map(function(row) {
+				return E('tr', { 'class': 'tr' }, [
+					E('td', { 'class': 'td' }, row[0]),
+					E('td', { 'class': 'td' }, row[1])
+				]);
+			}))
+		];
+	}
+
+	function validateStep() {
+		showError(null);
+
+		if (state.step === 0 && !state.wan_if) {
+			showError(_('Target interface is required.'));
+			return false;
+		}
+
+		if (state.step === 1) {
+			if (!validatePositiveInteger(state.speedtest_apply_percent) ||
+			    parseInt(state.speedtest_apply_percent, 10) > 100) {
+				showError(_('Speed test apply percent must be between 1 and 100.'));
+				return false;
+			}
+
+			if (!validatePositiveInteger(state.sqm_download) ||
+			    !validatePositiveInteger(state.sqm_upload)) {
+				showError(_('Download and upload speeds must be positive integers.'));
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	function validateWizard() {
+		showError(null);
+
+		if (!state.name) {
+			showError(_('Instance name is required.'));
+			return false;
+		}
+
+		if (!state.wan_if) {
+			showError(_('Target interface is required.'));
+			return false;
+		}
+
+		if (!validatePositiveInteger(state.speedtest_apply_percent) ||
+		    parseInt(state.speedtest_apply_percent, 10) > 100) {
+			showError(_('Speed test apply percent must be between 1 and 100.'));
+			return false;
+		}
+
+		if (!validatePositiveInteger(state.sqm_download) ||
+		    !validatePositiveInteger(state.sqm_upload)) {
+			showError(_('Download and upload speeds must be positive integers.'));
+			return false;
+		}
+
+		return true;
+	}
+
+	function finish() {
+		var config_name = grid.uciconfig || grid.map.config;
+		var section_id;
+
+		if (sectionNameExists(state.name)) {
+			showError(_('Instance "%s" already exists.').format(state.name));
+			return;
+		}
+
+		if (!validateWizard())
+			return;
+
+		section_id = grid.map.data.add(config_name, grid.sectiontype, state.name);
+		writeWizardConfig(section_id, state);
+
+		return grid.map.save(null, true)
+			.then(L.bind(grid.map.load, grid.map))
+			.then(L.bind(grid.map.reset, grid.map))
+			.then(function() {
+				ui.hideModal();
+				ui.addNotification(null, E('p', _('Instance "%s" created. Review pending changes, then Save & Apply.').format(section_id)), 'info');
+			})
+			.catch(function(err) {
+				showError(err.message || err);
+			});
+	}
+
+	function render() {
+		var content = [
+			renderSteps(),
+			E('h5', {}, stepTitle()),
+			errorNode
+		];
+		var buttons = [
+			E('button', {
+				'class': 'btn cbi-button',
+				'click': function() {
+					ui.hideModal();
+				}
+			}, _('Cancel')),
+			' '
+		];
+		var stepFields = state.step === 0 ? renderInterfaceStep() :
+			state.step === 1 ? renderSpeedStep() :
+			renderReviewStep();
+
+		for (var i = 0; i < stepFields.length; i++)
+			content.push(stepFields[i]);
+
+		if (state.step > 0) {
+			buttons.push(E('button', {
+				'class': 'btn cbi-button',
+				'click': function() {
+					state.step--;
+					render();
+				}
+			}, _('Back')));
+			buttons.push(' ');
+		}
+
+		if (state.step < 2) {
+			buttons.push(E('button', {
+				'class': 'btn cbi-button cbi-button-positive',
+				'click': function() {
+					if (!validateStep())
+						return;
+
+					state.step++;
+					render();
+				}
+			}, _('Next')));
+		}
+		else {
+			buttons.push(E('button', {
+				'class': 'btn cbi-button cbi-button-positive important',
+				'click': finish
+			}, _('Create')));
+		}
+
+		content.push(E('div', { 'class': 'button-row' }, buttons));
+
+		replaceNodeContent(body, content);
+	}
+
+	ui.showModal(_('Create CAKE Autorate - %s').format(name), body, 'cbi-modal');
+	render();
+}
+
 function addUniqueValue(option, seen, value, title) {
 	if (!value || seen[value])
 		return;
@@ -958,7 +1400,11 @@ return L.view.extend({
 		s = m.section(form.GridSection, 'cake_autorate', _('Instances'));
 		s.anonymous = false;
 		s.addremove = true;
+		s.addbtntitle = _('Create instance');
 		s.nodescriptions = true;
+		s.handleAdd = function(ev, name) {
+			showCreateWizard(this, name);
+		};
 
 		addSummaryColumns(s);
 
