@@ -10,9 +10,132 @@ function modal(option) {
 	return option;
 }
 
+var optionDescriptions = {
+	enabled: 'Start the autorate daemon for this instance when the service runs.',
+	adjust_dl_shaper_rate: 'Allow autorate to change the download CAKE bandwidth.',
+	adjust_ul_shaper_rate: 'Allow autorate to change the upload CAKE bandwidth.',
+	wan_if: 'Main WAN interface for this instance. Auto preset also uses it for SQM and IFB setup.',
+	auto_interface_preset: 'Automatically derive SQM interface, upload interface, and download IFB from the target interface.',
+	sqm_enabled: 'Enable the matching SQM queue managed by this instance.',
+	sqm_download: 'SQM download bandwidth in kbit/s. This also seeds the autorate base and max download rates.',
+	sqm_upload: 'SQM upload bandwidth in kbit/s. This also seeds the autorate base and max upload rates.',
+	min_dl_shaper_rate_kbps: 'Lowest download shaper rate autorate may apply, in kbit/s.',
+	base_dl_shaper_rate_kbps: 'Starting download shaper rate before autorate adjusts it, in kbit/s.',
+	max_dl_shaper_rate_kbps: 'Highest download shaper rate autorate may apply, in kbit/s.',
+	min_ul_shaper_rate_kbps: 'Lowest upload shaper rate autorate may apply, in kbit/s.',
+	base_ul_shaper_rate_kbps: 'Starting upload shaper rate before autorate adjusts it, in kbit/s.',
+	max_ul_shaper_rate_kbps: 'Highest upload shaper rate autorate may apply, in kbit/s.',
+	dl_if: 'Interface whose RX byte counter represents shaped download traffic, usually the IFB created by SQM.',
+	ul_if: 'Interface whose TX byte counter represents upload traffic, usually the WAN device.',
+	manage_sqm: 'Mirror this instance into /etc/config/sqm and restart SQM before autorate starts.',
+	sqm_section: 'Name of the managed SQM queue section. Leave empty to use cake_<instance>.',
+	sqm_interface: 'Network device where SQM should attach the CAKE queue.',
+	sqm_debug_logging: 'Enable SQM script debug logging for this queue.',
+	sqm_verbosity: 'Verbosity level passed to SQM scripts.',
+	sqm_qdisc: 'Queueing discipline used by SQM. CAKE is the recommended default.',
+	sqm_script: 'SQM setup script that builds the traffic control rules.',
+	sqm_qdisc_advanced: 'Show DSCP and ECN queueing options from luci-app-sqm.',
+	sqm_squash_dscp: 'Rewrite DSCP markings before packets enter the shaper.',
+	sqm_squash_ingress: 'Ignore DSCP markings on ingress traffic.',
+	sqm_ingress_ecn: 'Enable or disable ECN handling for ingress traffic.',
+	sqm_egress_ecn: 'Enable or disable ECN handling for egress traffic.',
+	sqm_qdisc_really_really_advanced: 'Show raw qdisc limits and options. Use only when you know the SQM script expects them.',
+	sqm_ilimit: 'Optional hard queue limit for ingress, passed through to SQM.',
+	sqm_elimit: 'Optional hard queue limit for egress, passed through to SQM.',
+	sqm_itarget: 'Optional ingress latency target passed through to SQM.',
+	sqm_etarget: 'Optional egress latency target passed through to SQM.',
+	sqm_iqdisc_opts: 'Extra raw qdisc options for ingress. Invalid options can break SQM startup.',
+	sqm_eqdisc_opts: 'Extra raw qdisc options for egress. Invalid options can break SQM startup.',
+	sqm_linklayer: 'Link layer model used by SQM to account for packet overhead.',
+	sqm_overhead: 'Per-packet overhead in bytes for the selected link layer.',
+	sqm_linklayer_advanced: 'Show advanced link layer table and minimum packet size controls.',
+	sqm_tcMTU: 'Maximum packet size used when SQM builds link layer rate tables.',
+	sqm_tcTSIZE: 'Rate table size used by SQM link layer compensation.',
+	sqm_tcMPU: 'Minimum packet unit in bytes for link layer compensation.',
+	sqm_linklayer_adaptation_mechanism: 'Mechanism SQM uses to apply link layer overhead compensation.',
+	connection_active_thr_kbps: 'Traffic rate above which the connection is treated as active, in kbit/s.',
+	dl_avg_owd_delta_max_adjust_up_thr_ms: 'Download delay delta below which autorate may increase the download shaper.',
+	ul_avg_owd_delta_max_adjust_up_thr_ms: 'Upload delay delta below which autorate may increase the upload shaper.',
+	dl_owd_delta_delay_thr_ms: 'Download delay delta considered bufferbloat for detection.',
+	ul_owd_delta_delay_thr_ms: 'Upload delay delta considered bufferbloat for detection.',
+	dl_avg_owd_delta_max_adjust_down_thr_ms: 'Download delay delta at which autorate backs off more aggressively.',
+	ul_avg_owd_delta_max_adjust_down_thr_ms: 'Upload delay delta at which autorate backs off more aggressively.',
+	bufferbloat_detection_window: 'Number of recent samples considered for bufferbloat detection.',
+	bufferbloat_detection_thr: 'Samples within the detection window that must exceed delay thresholds.',
+	alpha_baseline_increase: 'EWMA factor for slowly increasing the delay baseline.',
+	alpha_baseline_decrease: 'EWMA factor for lowering the delay baseline after better samples.',
+	alpha_delta_ewma: 'EWMA factor for smoothing delay deltas from reflectors.',
+	shaper_rate_min_adjust_down_bufferbloat: 'Smallest multiplicative backoff used when bufferbloat is detected.',
+	shaper_rate_max_adjust_down_bufferbloat: 'Largest multiplicative backoff used when bufferbloat is severe.',
+	shaper_rate_min_adjust_up_load_high: 'Minimum multiplicative increase while load is high and delay is acceptable.',
+	shaper_rate_max_adjust_up_load_high: 'Maximum multiplicative increase while load is high and delay is acceptable.',
+	shaper_rate_adjust_down_load_low: 'Multiplicative decay used while load is low.',
+	shaper_rate_adjust_up_load_low: 'Multiplicative increase used while load is low and delay is clean.',
+	high_load_thr: 'Fraction of current shaper rate that counts as high load.',
+	bufferbloat_refractory_period_ms: 'Minimum time after a bufferbloat response before another backoff may happen.',
+	decay_refractory_period_ms: 'Minimum time between low-load decay adjustments.',
+	pinger_method: 'Probe backend used to measure reflector latency. Only fping is implemented in the Rust MVP.',
+	reflector: 'Hosts to probe for latency. Use stable anycast or nearby IP addresses.',
+	reflectors_url: 'Optional URL to fetch reflector candidates from. Not implemented in the Rust MVP yet.',
+	reflectors_url_skip_lines: 'Number of header lines to skip when parsing reflector URL data.',
+	randomize_reflectors: 'Shuffle reflector order before selecting active probes.',
+	retain_reflector_stats: 'Keep reflector statistics when replacing or restarting probes.',
+	no_pingers: 'Number of concurrent reflector probes to run.',
+	reflector_ping_interval_s: 'Seconds between pings sent by each reflector probe.',
+	ping_extra_args: 'Additional arguments passed to the pinger backend.',
+	ping_prefix_string: 'Optional command prefix for launching pingers, for example a namespace wrapper.',
+	irtt_session_duration_m: 'Duration of each IRTT session in minutes. IRTT is not implemented in the Rust MVP yet.',
+	output_processing_stats: 'Log detailed controller processing statistics.',
+	output_load_stats: 'Log achieved load and traffic rate statistics.',
+	output_reflector_stats: 'Log per-reflector latency statistics.',
+	output_summary_stats: 'Log compact periodic summaries.',
+	output_cake_changes: 'Log every CAKE bandwidth change command.',
+	output_cpu_stats: 'Log CPU usage summaries when CPU monitoring is implemented.',
+	output_cpu_raw_stats: 'Log raw CPU counters when CPU monitoring is implemented.',
+	debug: 'Enable extra debug output from the daemon.',
+	log_DEBUG_messages_to_syslog: 'Send debug messages to syslog instead of only the normal log path.',
+	log_to_file: 'Write daemon logs to files in addition to stdout/syslog.',
+	log_file_max_time_mins: 'Maximum age of a log file before rotation, in minutes.',
+	log_file_max_size_KB: 'Maximum log file size before rotation, in KiB.',
+	log_file_path_override: 'Directory for daemon log files. Leave empty for the default path.',
+	log_file_buffer_size_B: 'Buffered log write size in bytes.',
+	log_file_buffer_timeout_ms: 'Maximum time before flushing buffered log output.',
+	log_file_export_compress: 'Compress exported log bundles when log export is implemented.',
+	enable_sleep_function: 'Allow the controller to sleep during sustained idle periods.',
+	sustained_idle_sleep_thr_s: 'Idle duration before sleep behavior may engage.',
+	min_shaper_rates_enforcement: 'Prevent shaper rates from dropping below configured minimums.',
+	startup_wait_s: 'Delay after service start before probing and adjusting rates.',
+	monitor_achieved_rates_interval_ms: 'Interval for sampling interface byte counters.',
+	monitor_cpu_usage_interval_ms: 'Interval for CPU usage sampling when implemented.',
+	reflector_health_check_interval_s: 'Interval between reflector health checks.',
+	reflector_response_deadline_s: 'Maximum acceptable reflector response time before it is considered late.',
+	reflector_misbehaving_detection_window: 'Number of recent health samples used to detect bad reflectors.',
+	reflector_misbehaving_detection_thr: 'Bad samples required before a reflector is treated as misbehaving.',
+	reflector_replacement_interval_mins: 'How often eligible reflectors may be replaced.',
+	reflector_comparison_interval_mins: 'How often active reflectors are compared against alternatives.',
+	reflector_sum_owd_baselines_delta_thr_ms: 'Baseline delay difference threshold for reflector comparison.',
+	reflector_owd_delta_ewma_delta_thr_ms: 'EWMA delay delta threshold for reflector comparison.',
+	stall_detection_thr: 'Consecutive failed or stalled samples required to detect a stall.',
+	connection_stall_thr_kbps: 'Traffic rate below which the connection may be considered stalled.',
+	global_ping_response_timeout_s: 'Global timeout for ping responses before a probe is considered failed.',
+	if_up_check_interval_s: 'Interval for checking whether configured interfaces are up.',
+	rx_bytes_path: 'Override path for the download RX byte counter. Leave empty to use /sys/class/net.',
+	tx_bytes_path: 'Override path for the upload TX byte counter. Leave empty to use /sys/class/net.'
+};
+
+function describe(option, key) {
+	var description = optionDescriptions[key];
+
+	if (description)
+		option.description = _(description);
+
+	return option;
+}
+
 function flag(section, tab, key, title, defaultValue) {
 	var o = section.taboption(tab, form.Flag, key, title);
 	modal(o);
+	describe(o, key);
 	o.rmempty = false;
 	if (defaultValue != null)
 		o.default = defaultValue;
@@ -22,6 +145,7 @@ function flag(section, tab, key, title, defaultValue) {
 function value(section, tab, key, title, datatype, placeholder) {
 	var o = section.taboption(tab, form.Value, key, title);
 	modal(o);
+	describe(o, key);
 	o.rmempty = false;
 	if (datatype)
 		o.datatype = datatype;
@@ -33,6 +157,7 @@ function value(section, tab, key, title, datatype, placeholder) {
 function optionalValue(section, tab, key, title, datatype, placeholder) {
 	var o = section.taboption(tab, form.Value, key, title);
 	modal(o);
+	describe(o, key);
 	o.rmempty = true;
 	if (datatype)
 		o.datatype = datatype;
@@ -44,6 +169,7 @@ function optionalValue(section, tab, key, title, datatype, placeholder) {
 function iface(section, tab, key, title) {
 	var o = section.taboption(tab, widgets.DeviceSelect, key, title);
 	modal(o);
+	describe(o, key);
 	o.noaliases = true;
 	o.rmempty = false;
 	return o;
@@ -52,6 +178,7 @@ function iface(section, tab, key, title) {
 function listValue(section, tab, key, title, values, defaultValue) {
 	var o = section.taboption(tab, form.ListValue, key, title);
 	modal(o);
+	describe(o, key);
 	for (var i = 0; i < values.length; i++) {
 		if (Array.isArray(values[i]))
 			o.value(values[i][0], values[i][1]);
@@ -313,6 +440,7 @@ function addControllerOptions(section) {
 function addReflectorOptions(section) {
 	var o = section.taboption('reflectors', form.ListValue, 'pinger_method', _('Pinger'));
 	modal(o);
+	describe(o, 'pinger_method');
 	o.value('fping', 'fping');
 	o.value('fping-ts', 'fping-ts');
 	o.value('tsping', 'tsping');
@@ -322,6 +450,7 @@ function addReflectorOptions(section) {
 
 	o = section.taboption('reflectors', form.DynamicList, 'reflector', _('Reflectors'));
 	modal(o);
+	describe(o, 'reflector');
 	o.datatype = 'host';
 	o.rmempty = false;
 
@@ -397,6 +526,7 @@ function addSqmOptions(section, qdiscs, scripts) {
 
 	o = section.taboption('sqm_qdisc', form.ListValue, 'sqm_qdisc', _('Queueing discipline'));
 	modal(o);
+	describe(o, 'sqm_qdisc');
 	seen = {};
 	addUniqueValue(o, seen, 'cake');
 	for (var i = 0; i < qdiscs.length; i++)
@@ -406,6 +536,7 @@ function addSqmOptions(section, qdiscs, scripts) {
 
 	o = section.taboption('sqm_qdisc', form.ListValue, 'sqm_script', _('Queue setup script'));
 	modal(o);
+	describe(o, 'sqm_script');
 	seen = {};
 	addUniqueValue(o, seen, 'piece_of_cake.qos');
 	addUniqueValue(o, seen, 'cake.qos');
