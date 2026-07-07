@@ -2,11 +2,24 @@
 
 section="$1"
 target_if_override="$2"
+mode="$3"
+
+if [ "$section" = "--status" ] || [ "$section" = "status" ]; then
+	section=""
+	target_if_override=""
+	mode="status"
+fi
+
+if [ "$target_if_override" = "--status" ] || [ "$target_if_override" = "status" ]; then
+	target_if_override=""
+	mode="status"
+fi
 
 download_bytes_default="25000000"
 upload_bytes_default="4000000"
 upload_retry_bytes_default="1000000 262144"
 timeout_default="45"
+duration_default="15"
 route_probe_default="1.1.1.1"
 
 uci_get() {
@@ -43,6 +56,18 @@ elapsed_s() {
 
 kbps_for() {
 	awk -v bytes="$1" -v elapsed="$2" 'BEGIN { printf "%.0f", bytes * 8 / elapsed / 1000 }'
+}
+
+bits_to_kbps() {
+	awk -v value="$1" 'BEGIN { if (value + 0 > 0) printf "%.0f", value / 1000 }'
+}
+
+bytes_per_second_to_kbps() {
+	awk -v value="$1" 'BEGIN { if (value + 0 > 0) printf "%.0f", value * 8 / 1000 }'
+}
+
+mbps_to_kbps() {
+	awk -v value="$1" 'BEGIN { if (value + 0 > 0) printf "%.0f", value * 1000 }'
 }
 
 is_uint() {
@@ -85,6 +110,10 @@ bool_enabled() {
 	return 1
 }
 
+command_path() {
+	command -v "$1" 2>/dev/null || true
+}
+
 resolve_interface_device() {
 	local name="$1"
 	local status dev
@@ -97,9 +126,9 @@ resolve_interface_device() {
 	fi
 
 	status="$(ubus call network.interface."$name" status 2>/dev/null)"
-	if [ -n "$status" ] && command -v jsonfilter >/dev/null 2>&1; then
-		dev="$(printf '%s\n' "$status" | jsonfilter -e '@.l3_device' 2>/dev/null)"
-		[ -n "$dev" ] || dev="$(printf '%s\n' "$status" | jsonfilter -e '@.device' 2>/dev/null)"
+	if [ -n "$status" ] && [ -n "$jsonfilter_bin" ]; then
+		dev="$(printf '%s\n' "$status" | "$jsonfilter_bin" -e '@.l3_device' 2>/dev/null)"
+		[ -n "$dev" ] || dev="$(printf '%s\n' "$status" | "$jsonfilter_bin" -e '@.device' 2>/dev/null)"
 
 		if [ -n "$dev" ] && [ -e "/sys/class/net/$dev" ]; then
 			printf '%s\n' "$dev"
@@ -114,6 +143,11 @@ route_device_for() {
 	ip route get "$1" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1
 }
 
+source_ip_for_interface() {
+	[ -n "$1" ] || return 1
+	ip -4 -o addr show dev "$1" scope global 2>/dev/null | awk '{ split($4, a, "/"); print a[1]; exit }'
+}
+
 selected_target_interface() {
 	local iface
 
@@ -122,6 +156,164 @@ selected_target_interface() {
 	[ -n "$iface" ] || iface="$(uci_get sqm_interface)"
 	[ -n "$iface" ] || iface="$(uci_get ul_if)"
 	resolve_interface_device "$iface"
+}
+
+json_first_file() {
+	local file="$1"
+	local expr value
+
+	shift
+	[ -n "$jsonfilter_bin" ] || return 1
+
+	for expr in "$@"; do
+		value="$("$jsonfilter_bin" -i "$file" -e "$expr" 2>/dev/null | sed -n '/./{p;q;}')"
+		if [ -n "$value" ]; then
+			printf '%s\n' "$value"
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+backend_title() {
+	case "$1" in
+		librespeed-cli)
+			printf '%s' "LibreSpeed CLI"
+			;;
+		speedtest-go)
+			printf '%s' "speedtest-go"
+			;;
+		iperf3)
+			printf '%s' "configured iperf3"
+			;;
+		builtin-http)
+			printf '%s' "built-in HTTP"
+			;;
+		*)
+			printf '%s' "$1"
+			;;
+	esac
+}
+
+backend_available() {
+	case "$1" in
+		librespeed-cli)
+			[ -n "$librespeed_bin" ] && [ -n "$jsonfilter_bin" ]
+			;;
+		speedtest-go)
+			[ -n "$speedtest_go_bin" ] && [ -n "$jsonfilter_bin" ]
+			;;
+		iperf3)
+			[ -n "$iperf3_bin" ] && [ -n "$iperf3_server" ] && [ -n "$jsonfilter_bin" ]
+			;;
+		builtin-http)
+			[ -n "$curl_fetch" ] || [ -n "$fallback_fetch" ]
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+backend_reason() {
+	case "$1" in
+		librespeed-cli)
+			[ -n "$librespeed_bin" ] || { printf '%s' "not installed"; return; }
+			[ -n "$jsonfilter_bin" ] || { printf '%s' "jsonfilter is required"; return; }
+			printf '%s' "available"
+			;;
+		speedtest-go)
+			[ -n "$speedtest_go_bin" ] || { printf '%s' "not installed"; return; }
+			[ -n "$jsonfilter_bin" ] || { printf '%s' "jsonfilter is required"; return; }
+			printf '%s' "available"
+			;;
+		iperf3)
+			[ -n "$iperf3_server" ] || { printf '%s' "server not configured"; return; }
+			[ -n "$iperf3_bin" ] || { printf '%s' "not installed"; return; }
+			[ -n "$jsonfilter_bin" ] || { printf '%s' "jsonfilter is required"; return; }
+			printf '%s' "available"
+			;;
+		builtin-http)
+			if [ -n "$curl_fetch" ] || [ -n "$fallback_fetch" ]; then
+				printf '%s' "available"
+			else
+				printf '%s' "curl, uclient-fetch, or wget is required"
+			fi
+			;;
+		*)
+			printf '%s' "unknown backend"
+			;;
+	esac
+}
+
+first_available_backend() {
+	local backend
+
+	for backend in librespeed-cli speedtest-go iperf3 builtin-http; do
+		if backend_available "$backend"; then
+			printf '%s' "$backend"
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+backend_status_json() {
+	local selected backend first available selected_bool
+
+	selected="$(first_available_backend)"
+	first="1"
+
+	if [ -n "$selected" ]; then
+		available="true"
+	else
+		available="false"
+	fi
+
+	printf '{"available":%s,"selected_backend":"%s","selected_title":"%s","backends":[' \
+		"$available" \
+		"$(json_escape "$selected")" \
+		"$(json_escape "$(backend_title "$selected")")"
+
+	for backend in librespeed-cli speedtest-go iperf3 builtin-http; do
+		[ "$first" = "1" ] || printf ','
+		first="0"
+
+		if backend_available "$backend"; then
+			available="true"
+		else
+			available="false"
+		fi
+
+		if [ "$backend" = "$selected" ]; then
+			selected_bool="true"
+		else
+			selected_bool="false"
+		fi
+
+		printf '{"name":"%s","title":"%s","available":%s,"selected":%s,"reason":"%s"}' \
+			"$(json_escape "$backend")" \
+			"$(json_escape "$(backend_title "$backend")")" \
+			"$available" \
+			"$selected_bool" \
+			"$(json_escape "$(backend_reason "$backend")")"
+	done
+
+	printf '],"warning":"%s"}\n' "$(json_escape "$warning")"
+}
+
+reset_result() {
+	download_kbps=""
+	upload_kbps="null"
+	download_size="0"
+	upload_size="0"
+	download_elapsed="0.00"
+	upload_elapsed="0.00"
+	source=""
+	backend=""
+	bind_mode="none"
 }
 
 fetch_download() {
@@ -148,17 +340,320 @@ fetch_upload() {
 	fi
 }
 
+run_builtin_http() {
+	local download_start download_stop upload_done upload_last_try upload_try upload_blocks upload_start upload_stop
+
+	reset_result
+	backend="builtin-http"
+
+	if bool_enabled "$bind_interface_enabled" && [ -n "$target_if" ] && [ -n "$curl_fetch" ]; then
+		fetch="$curl_fetch"
+		fetch_kind="curl"
+		bind_interface="$target_if"
+		bind_mode="curl-interface"
+	else
+		fetch="$fallback_fetch"
+		fetch_kind="uclient-fetch"
+
+		if [ -n "$fetch" ]; then
+			fetch_kind="$(basename "$fetch")"
+		fi
+
+		if bool_enabled "$bind_interface_enabled" && [ -n "$target_if" ]; then
+			bind_mode="route-check"
+
+			if [ -n "$route_if" ] && [ "$route_if" != "$target_if" ]; then
+				append_warning "Speed test could not bind to $target_if because curl is not installed; route probe uses $route_if."
+			fi
+		fi
+	fi
+
+	[ -n "$fetch" ] || return 1
+	source="$fetch_kind"
+
+	download_start="$(now_s)"
+	if ! fetch_download >/dev/null 2>&1; then
+		return 1
+	fi
+	download_stop="$(now_s)"
+	download_elapsed="$(elapsed_s "$download_start" "$download_stop")"
+	download_size="$(wc -c < "$tmp_download" | tr -d ' ')"
+	download_kbps="$(kbps_for "$download_size" "$download_elapsed")"
+
+	if is_uint "$upload_bytes" && [ "$upload_bytes" -gt 0 ] && [ -n "$upload_url" ]; then
+		upload_done="0"
+		upload_last_try=""
+
+		for upload_try in "$upload_bytes" $upload_retry_bytes; do
+			is_positive_uint "$upload_try" || continue
+			[ "$upload_try" = "$upload_last_try" ] && continue
+
+			upload_last_try="$upload_try"
+			upload_blocks="$(( (upload_try + 1023) / 1024 ))"
+			rm -f "$tmp_upload" "$tmp_response"
+
+			if ! dd if=/dev/zero of="$tmp_upload" bs=1024 count="$upload_blocks" >/dev/null 2>&1; then
+				continue
+			fi
+
+			upload_size="$(wc -c < "$tmp_upload" | tr -d ' ')"
+			upload_start="$(now_s)"
+			if fetch_upload >/dev/null 2>&1; then
+				upload_stop="$(now_s)"
+				upload_elapsed="$(elapsed_s "$upload_start" "$upload_stop")"
+				upload_kbps="$(kbps_for "$upload_size" "$upload_elapsed")"
+				upload_done="1"
+
+				if [ "$upload_try" != "$upload_bytes" ]; then
+					append_warning "Upload test used a smaller retry payload."
+				fi
+
+				break
+			fi
+		done
+
+		if [ "$upload_done" != "1" ]; then
+			upload_size="0"
+			append_warning "Upload test failed; upload rate was left unchanged."
+		fi
+	fi
+
+	[ -n "$download_kbps" ]
+}
+
+run_librespeed_cli() {
+	local start stop dl_mbps ul_mbps upload_arg upload_kib ipv4_arg interface_arg
+
+	backend_available "librespeed-cli" || return 1
+	reset_result
+	backend="librespeed-cli"
+	source="librespeed-cli"
+
+	ipv4_arg=""
+	interface_arg=""
+	if bool_enabled "$force_ipv4_enabled"; then
+		ipv4_arg="--ipv4"
+	fi
+
+	if bool_enabled "$bind_interface_enabled" && [ -n "$target_if" ]; then
+		interface_arg="--interface $target_if"
+		bind_mode="librespeed-interface"
+	fi
+
+	upload_arg=""
+	if is_uint "$upload_bytes" && [ "$upload_bytes" -eq 0 ]; then
+		upload_arg="--no-upload"
+	elif is_positive_uint "$upload_bytes"; then
+		upload_kib="$(( (upload_bytes + 1023) / 1024 ))"
+		upload_arg="--upload-size $upload_kib --no-pre-allocate"
+	fi
+
+	rm -f "$tmp_response"
+	start="$(now_s)"
+	if ! "$librespeed_bin" --json --timeout "$timeout_s" --duration "$duration_s" $ipv4_arg $interface_arg $upload_arg > "$tmp_response" 2>/dev/null; then
+		return 1
+	fi
+	stop="$(now_s)"
+
+	download_elapsed="$(elapsed_s "$start" "$stop")"
+	upload_elapsed="$download_elapsed"
+	dl_mbps="$(json_first_file "$tmp_response" '@[0].download' '@.download' '@.result.download' '@.servers[0].download')"
+	ul_mbps="$(json_first_file "$tmp_response" '@[0].upload' '@.upload' '@.result.upload' '@.servers[0].upload')"
+
+	download_kbps="$(mbps_to_kbps "$dl_mbps")"
+	if [ -n "$ul_mbps" ]; then
+		upload_kbps="$(mbps_to_kbps "$ul_mbps")"
+	fi
+
+	download_size="$(json_first_file "$tmp_response" '@[0].bytes_received' '@.bytes_received' '@.result.bytes_received' '@.servers[0].bytes_received')"
+	upload_size="$(json_first_file "$tmp_response" '@[0].bytes_sent' '@.bytes_sent' '@.result.bytes_sent' '@.servers[0].bytes_sent')"
+	[ -n "$download_size" ] || download_size="0"
+	[ -n "$upload_size" ] || upload_size="0"
+
+	[ -n "$download_kbps" ]
+}
+
+run_speedtest_go() {
+	local start stop dl_bytes_per_s ul_bytes_per_s source_ip
+
+	backend_available "speedtest-go" || return 1
+	reset_result
+	backend="speedtest-go"
+	source="speedtest-go"
+
+	set -- "$speedtest_go_bin" --json --ping-mode http
+
+	if is_uint "$upload_bytes" && [ "$upload_bytes" -eq 0 ]; then
+		set -- "$@" --no-upload
+	fi
+
+	if bool_enabled "$bind_interface_enabled" && [ -n "$target_if" ]; then
+		source_ip="$(source_ip_for_interface "$target_if")"
+		if [ -n "$source_ip" ]; then
+			set -- "$@" --source "$source_ip" --dns-bind-source
+			bind_mode="source-ip"
+		else
+			bind_mode="route-check"
+			if [ -n "$route_if" ] && [ "$route_if" != "$target_if" ]; then
+				append_warning "speedtest-go could not bind to $target_if because no IPv4 source address was found; route probe uses $route_if."
+			fi
+		fi
+	fi
+
+	rm -f "$tmp_response"
+	start="$(now_s)"
+	if ! "$@" > "$tmp_response" 2>/dev/null; then
+		return 1
+	fi
+	stop="$(now_s)"
+
+	download_elapsed="$(elapsed_s "$start" "$stop")"
+	upload_elapsed="$download_elapsed"
+	dl_bytes_per_s="$(json_first_file "$tmp_response" '@.servers[0].dl_speed' '@.servers[*].dl_speed' '@.server.dl_speed' '@.dl_speed')"
+	ul_bytes_per_s="$(json_first_file "$tmp_response" '@.servers[0].ul_speed' '@.servers[*].ul_speed' '@.server.ul_speed' '@.ul_speed')"
+
+	download_kbps="$(bytes_per_second_to_kbps "$dl_bytes_per_s")"
+	if [ -n "$ul_bytes_per_s" ]; then
+		upload_kbps="$(bytes_per_second_to_kbps "$ul_bytes_per_s")"
+	fi
+
+	download_size="0"
+	upload_size="0"
+
+	[ -n "$download_kbps" ]
+}
+
+run_iperf3_one() {
+	local reverse="$1"
+	local output="$2"
+	local source_ip
+
+	set -- "$iperf3_bin" -J -t "$duration_s" -c "$iperf3_server"
+
+	if [ "$reverse" = "1" ]; then
+		set -- "$@" -R
+	fi
+
+	if is_positive_uint "$iperf3_port"; then
+		set -- "$@" -p "$iperf3_port"
+	fi
+
+	if bool_enabled "$bind_interface_enabled" && [ -n "$target_if" ]; then
+		source_ip="$(source_ip_for_interface "$target_if")"
+		if [ -n "$source_ip" ]; then
+			set -- "$@" -B "$source_ip"
+			bind_mode="source-ip"
+		else
+			bind_mode="route-check"
+			if [ -n "$route_if" ] && [ "$route_if" != "$target_if" ]; then
+				append_warning "iperf3 could not bind to $target_if because no IPv4 source address was found; route probe uses $route_if."
+			fi
+		fi
+	fi
+
+	"$@" > "$output" 2>/dev/null
+}
+
+run_iperf3() {
+	local start stop dl_bits ul_bits
+
+	backend_available "iperf3" || return 1
+	reset_result
+	backend="iperf3"
+	source="iperf3"
+
+	rm -f "$tmp_download" "$tmp_upload"
+	start="$(now_s)"
+	if ! run_iperf3_one 1 "$tmp_download"; then
+		return 1
+	fi
+	stop="$(now_s)"
+
+	download_elapsed="$(elapsed_s "$start" "$stop")"
+	dl_bits="$(json_first_file "$tmp_download" '@.end.sum_received.bits_per_second' '@.end.sum.bits_per_second')"
+	download_size="$(json_first_file "$tmp_download" '@.end.sum_received.bytes' '@.end.sum.bytes')"
+	download_kbps="$(bits_to_kbps "$dl_bits")"
+	[ -n "$download_size" ] || download_size="0"
+
+	if is_uint "$upload_bytes" && [ "$upload_bytes" -gt 0 ]; then
+		start="$(now_s)"
+		if run_iperf3_one 0 "$tmp_upload"; then
+			stop="$(now_s)"
+			upload_elapsed="$(elapsed_s "$start" "$stop")"
+			ul_bits="$(json_first_file "$tmp_upload" '@.end.sum_sent.bits_per_second' '@.end.sum.bits_per_second')"
+			upload_size="$(json_first_file "$tmp_upload" '@.end.sum_sent.bytes' '@.end.sum.bytes')"
+			upload_kbps="$(bits_to_kbps "$ul_bits")"
+			[ -n "$upload_size" ] || upload_size="0"
+		else
+			append_warning "iperf3 upload test failed; upload rate was left unchanged."
+		fi
+	fi
+
+	[ -n "$download_kbps" ]
+}
+
+emit_result() {
+	printf '{"download_kbps":%s,"upload_kbps":%s,"download_bytes":%s,"upload_bytes":%s,"download_elapsed_s":%s,"upload_elapsed_s":%s,"source":"%s","backend":"%s","backend_title":"%s","bind_mode":"%s","target_interface":"%s","route_interface":"%s","warning":"%s"}\n' \
+		"$download_kbps" \
+		"$upload_kbps" \
+		"$download_size" \
+		"$upload_size" \
+		"$download_elapsed" \
+		"$upload_elapsed" \
+		"$(json_escape "$source")" \
+		"$(json_escape "$backend")" \
+		"$(json_escape "$(backend_title "$backend")")" \
+		"$(json_escape "$bind_mode")" \
+		"$(json_escape "$target_if")" \
+		"$(json_escape "$route_if")" \
+		"$(json_escape "$warning")"
+}
+
+run_available_backends() {
+	local candidate
+
+	for candidate in librespeed-cli speedtest-go iperf3 builtin-http; do
+		backend_available "$candidate" || continue
+
+		case "$candidate" in
+			librespeed-cli)
+				run_librespeed_cli && return 0
+				;;
+			speedtest-go)
+				run_speedtest_go && return 0
+				;;
+			iperf3)
+				run_iperf3 && return 0
+				;;
+			builtin-http)
+				run_builtin_http && return 0
+				;;
+		esac
+
+		append_warning "$(backend_title "$candidate") backend failed; trying next backend."
+	done
+
+	return 1
+}
+
 warning=""
+jsonfilter_bin="$(command_path jsonfilter)"
+librespeed_bin="$(command_path librespeed-cli)"
+speedtest_go_bin="$(command_path speedtest-go)"
+iperf3_bin="$(command_path iperf3)"
 
 download_bytes="$(positive_num_or_default "$(uci_get speedtest_download_bytes)" "$download_bytes_default")"
 upload_bytes="$(num_or_default "$(uci_get speedtest_upload_bytes)" "$upload_bytes_default")"
 upload_retry_bytes="$(uci_get speedtest_upload_retry_bytes)"
 timeout_s="$(positive_num_or_default "$(uci_get speedtest_timeout_s)" "$timeout_default")"
+duration_s="$(positive_num_or_default "$(uci_get speedtest_duration_s)" "$duration_default")"
 download_url="$(uci_get speedtest_download_url)"
 upload_url="$(uci_get speedtest_upload_url)"
 bind_interface_enabled="$(uci_get speedtest_bind_interface)"
 force_ipv4_enabled="$(uci_get speedtest_force_ipv4)"
 route_probe="$(uci_get speedtest_route_probe)"
+iperf3_server="$(uci_get speedtest_iperf3_server)"
+iperf3_port="$(uci_get speedtest_iperf3_port)"
 
 [ -n "$upload_retry_bytes" ] || upload_retry_bytes="$upload_retry_bytes_default"
 [ -n "$download_url" ] || download_url="https://speed.cloudflare.com/__down?bytes=$download_bytes"
@@ -175,34 +670,18 @@ fi
 
 target_if="$(selected_target_interface)"
 route_if="$(route_device_for "$route_probe")"
-curl_fetch="$(command -v curl 2>/dev/null || true)"
-fallback_fetch="$(command -v uclient-fetch 2>/dev/null || command -v wget 2>/dev/null || true)"
+curl_fetch="$(command_path curl)"
+fallback_fetch="$(command_path uclient-fetch)"
+[ -n "$fallback_fetch" ] || fallback_fetch="$(command_path wget)"
 bind_interface=""
 bind_mode="none"
+fetch=""
+fetch_kind=""
 
-if bool_enabled "$bind_interface_enabled" && [ -n "$target_if" ] && [ -n "$curl_fetch" ]; then
-	fetch="$curl_fetch"
-	fetch_kind="curl"
-	bind_interface="$target_if"
-	bind_mode="curl-interface"
-else
-	fetch="$fallback_fetch"
-	fetch_kind="uclient-fetch"
-
-	if [ -n "$fetch" ]; then
-		fetch_kind="$(basename "$fetch")"
-	fi
-
-	if bool_enabled "$bind_interface_enabled" && [ -n "$target_if" ]; then
-		bind_mode="route-check"
-
-		if [ -n "$route_if" ] && [ "$route_if" != "$target_if" ]; then
-			append_warning "Speed test could not bind to $target_if because curl is not installed; route probe uses $route_if."
-		fi
-	fi
+if [ "$mode" = "status" ]; then
+	backend_status_json
+	exit 0
 fi
-
-[ -n "$fetch" ] || json_error "curl, uclient-fetch, or wget is required"
 
 tmp_download="/tmp/cake-autorate-speedtest-download.$$"
 tmp_upload="/tmp/cake-autorate-speedtest-upload.$$"
@@ -213,66 +692,9 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-download_start="$(now_s)"
-if ! fetch_download >/dev/null 2>&1; then
-	json_error "download test failed"
-fi
-download_stop="$(now_s)"
-download_elapsed="$(elapsed_s "$download_start" "$download_stop")"
-download_size="$(wc -c < "$tmp_download" | tr -d ' ')"
-download_kbps="$(kbps_for "$download_size" "$download_elapsed")"
-
-upload_kbps="null"
-upload_elapsed="0.00"
-upload_size="0"
-
-if is_uint "$upload_bytes" && [ "$upload_bytes" -gt 0 ] && [ -n "$upload_url" ]; then
-	upload_done="0"
-	upload_last_try=""
-
-	for upload_try in "$upload_bytes" $upload_retry_bytes; do
-		is_positive_uint "$upload_try" || continue
-		[ "$upload_try" = "$upload_last_try" ] && continue
-
-		upload_last_try="$upload_try"
-		upload_blocks="$(( (upload_try + 1023) / 1024 ))"
-		rm -f "$tmp_upload" "$tmp_response"
-
-		if ! dd if=/dev/zero of="$tmp_upload" bs=1024 count="$upload_blocks" >/dev/null 2>&1; then
-			continue
-		fi
-
-		upload_size="$(wc -c < "$tmp_upload" | tr -d ' ')"
-		upload_start="$(now_s)"
-		if fetch_upload >/dev/null 2>&1; then
-			upload_stop="$(now_s)"
-			upload_elapsed="$(elapsed_s "$upload_start" "$upload_stop")"
-			upload_kbps="$(kbps_for "$upload_size" "$upload_elapsed")"
-			upload_done="1"
-
-			if [ "$upload_try" != "$upload_bytes" ]; then
-				append_warning "Upload test used a smaller retry payload."
-			fi
-
-			break
-		fi
-	done
-
-	if [ "$upload_done" != "1" ]; then
-		upload_size="0"
-		append_warning "Upload test failed; upload rate was left unchanged."
-	fi
+if run_available_backends; then
+	emit_result
+	exit 0
 fi
 
-printf '{"download_kbps":%s,"upload_kbps":%s,"download_bytes":%s,"upload_bytes":%s,"download_elapsed_s":%s,"upload_elapsed_s":%s,"source":"%s","backend":"builtin-http","bind_mode":"%s","target_interface":"%s","route_interface":"%s","warning":"%s"}\n' \
-	"$download_kbps" \
-	"$upload_kbps" \
-	"$download_size" \
-	"$upload_size" \
-	"$download_elapsed" \
-	"$upload_elapsed" \
-	"$(json_escape "$fetch_kind")" \
-	"$(json_escape "$bind_mode")" \
-	"$(json_escape "$target_if")" \
-	"$(json_escape "$route_if")" \
-	"$(json_escape "$warning")"
+json_error "no speed test backend is available"

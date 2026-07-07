@@ -31,6 +31,11 @@ var optionDescriptions = {
 	speedtest_upload_bytes: 'Initial upload payload size sent by the built-in HTTP speed test. Set to 0 to skip upload testing.',
 	speedtest_upload_retry_bytes: 'Space-separated smaller upload payload sizes to try if the initial upload test fails.',
 	speedtest_timeout_s: 'Per-request timeout for built-in speed test download and upload requests.',
+	speedtest_duration_s: 'Test duration in seconds for optional CLI backends that support a duration setting.',
+	speedtest_iperf3_server: 'Optional iperf3 server host or address. iperf3 is only used when this is set and the iperf3 package is installed.',
+	speedtest_iperf3_port: 'Optional iperf3 server port. Leave empty to use the iperf3 default.',
+	_speedtest_backend_order: 'Backend autodetect order used by the speed test helper.',
+	_speedtest_backend_status: 'Check which optional speed test backends are currently installed or configured on this router.',
 	_wizard_sqm_queue: 'Existing unmanaged SQM queues on the selected interface are reused to avoid duplicate shapers.',
 	manual_rate_limits: 'Show explicit min, base, and max autorate limits. Leave off to derive them from download and upload speeds.',
 	advanced_settings: 'Show detailed SQM, reflector, controller, logging, and daemon tuning settings.',
@@ -478,6 +483,34 @@ function parseSpeedtestResult(stdout) {
 	return result;
 }
 
+function speedtestBackendTitle(result) {
+	return result.backend_title || result.backend || result.source || _('selected backend');
+}
+
+function formatSpeedtestBackendStatus(result) {
+	var backends = result.backends || [];
+	var lines = [];
+
+	if (result.selected_title)
+		lines.push(_('Selected backend: %s').format(result.selected_title));
+	else
+		lines.push(_('No speed test backend is currently available.'));
+
+	for (var i = 0; i < backends.length; i++) {
+		var backend = backends[i];
+		var state = backend.available ? _('available') : _('unavailable');
+		var reason = backend.reason ? ' - ' + backend.reason : '';
+		var marker = backend.selected ? ' *' : '';
+
+		lines.push('%s: %s%s%s'.format(backend.title || backend.name, state, marker, reason));
+	}
+
+	if (result.warning)
+		lines.push(result.warning);
+
+	return lines.join('\n');
+}
+
 function applySpeedtestRates(section, section_id, result, percent) {
 	var dl = measuredRate(result.download_kbps, percent);
 	var ul = measuredRate(result.upload_kbps, percent);
@@ -862,7 +895,8 @@ function showCreateWizard(grid, name) {
 						upload.value = ul;
 					}
 
-					status.textContent = result.warning || _('Speed test completed.');
+					status.textContent = result.warning ||
+						_('Speed test completed using %s.').format(speedtestBackendTitle(result));
 				}).catch(function(err) {
 					showError(_('Speed test failed: %s').format(err.message || err));
 					status.textContent = '';
@@ -1089,6 +1123,42 @@ function addRateOptions(section) {
 }
 
 function addSpeedtestOptions(section) {
+	var o;
+
+	o = section.taboption('speedtest', form.DummyValue, '_speedtest_backend_order', _('Backend order'));
+	modal(o);
+	describe(o, '_speedtest_backend_order');
+	o.cfgvalue = function() {
+		return _('LibreSpeed CLI -> speedtest-go -> configured iperf3 -> built-in HTTP fallback');
+	};
+
+	o = section.taboption('speedtest', form.Button, '_speedtest_backend_status', _('Check backends'));
+	modal(o);
+	describe(o, '_speedtest_backend_status');
+	o.inputtitle = _('Check backends');
+	o.inputstyle = 'action';
+	o.rmempty = true;
+	o.write = function() {};
+	o.remove = function() {};
+	o.onclick = function(ev, section_id) {
+		var activeSection = this.section;
+		var wan = selectedWan(activeSection, section_id, null, true);
+		var button = ev.currentTarget;
+
+		button.disabled = true;
+
+		return fs.exec('/usr/libexec/cake-autorate-rs/speedtest', [ section_id, wan, 'status' ]).then(function(res) {
+			var result = JSON.parse((res.stdout || '').trim());
+			var message = formatSpeedtestBackendStatus(result);
+
+			ui.addNotification(null, E('pre', { 'style': 'white-space:pre-wrap' }, message), result.available ? 'info' : 'warning');
+		}).catch(function(err) {
+			ui.addNotification(null, E('p', _('Speed test backend check failed: %s').format(err.message || err)), 'error');
+		}).then(function() {
+			button.disabled = false;
+		});
+	};
+
 	flag(section, 'speedtest', 'speedtest_bind_interface', _('Bind to target interface'), '1');
 	flag(section, 'speedtest', 'speedtest_force_ipv4', _('Force IPv4'), '1');
 	optionalValue(section, 'speedtest', 'speedtest_route_probe', _('Route probe'), 'host', '1.1.1.1');
@@ -1098,6 +1168,9 @@ function addSpeedtestOptions(section) {
 	optionalValue(section, 'speedtest', 'speedtest_upload_bytes', _('Upload bytes'), 'and(uinteger,min(0))', '4000000');
 	optionalValue(section, 'speedtest', 'speedtest_upload_retry_bytes', _('Upload retry bytes'), null, '1000000 262144');
 	optionalValue(section, 'speedtest', 'speedtest_timeout_s', _('Request timeout'), 'and(uinteger,min(1))', '45');
+	optionalValue(section, 'speedtest', 'speedtest_duration_s', _('Test duration'), 'and(uinteger,min(1))', '15');
+	optionalValue(section, 'speedtest', 'speedtest_iperf3_server', _('iperf3 server'), null, '');
+	optionalValue(section, 'speedtest', 'speedtest_iperf3_port', _('iperf3 port'), 'port', '');
 }
 
 function addSetupOptions(section) {
@@ -1211,6 +1284,8 @@ function addSetupOptions(section) {
 				percent,
 				applied.dl || _('unchanged'),
 				applied.ul || _('unchanged'));
+
+			message += ' ' + _('Backend: %s.').format(speedtestBackendTitle(result));
 
 			if (result.warning)
 				message += ' ' + result.warning;
