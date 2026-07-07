@@ -97,7 +97,7 @@ var optionDescriptions = {
 	decay_refractory_period_ms: 'Minimum time between low-load decay adjustments.',
 	pinger_method: 'Probe backend used to measure reflector latency. Only fping is currently available in this package.',
 	reflector: 'Hosts to probe for latency. Use stable anycast or nearby IP addresses.',
-	reflectors_url: 'Optional URL to fetch reflector candidates from. Not implemented in the Rust MVP yet.',
+	reflectors_url: 'Optional URL to fetch reflector candidates from at daemon startup. Falls back to the configured list if the URL is unavailable.',
 	reflectors_url_skip_lines: 'Number of header lines to skip when parsing reflector URL data.',
 	randomize_reflectors: 'Shuffle reflector order before selecting active probes.',
 	retain_reflector_stats: 'Keep reflector statistics when replacing or restarting probes.',
@@ -488,6 +488,26 @@ function speedtestBackendTitle(result) {
 	return result.backend_title || result.backend || result.source || _('selected backend');
 }
 
+function speedtestBackendChoices() {
+	return [
+		[ 'auto', _('Auto') ],
+		[ 'librespeed-cli', _('LibreSpeed CLI (package: librespeed-cli)') ],
+		[ 'speedtest-go', _('speedtest-go (package: speedtest-go)') ],
+		[ 'iperf3', _('configured iperf3 (package: iperf3)') ],
+		[ 'builtin-http', _('built-in HTTP') ]
+	];
+}
+
+function speedtestBackendChoiceTitle(value) {
+	var choices = speedtestBackendChoices();
+
+	for (var i = 0; i < choices.length; i++)
+		if (choices[i][0] === value)
+			return choices[i][1];
+
+	return value || _('Auto');
+}
+
 function formatSpeedtestBackendStatus(result) {
 	var backends = result.backends || [];
 	var lines = [];
@@ -697,6 +717,7 @@ function writeWizardConfig(section_id, state) {
 	uci.set('cake-autorate', section_id, 'manage_sqm', '1');
 	uci.set('cake-autorate', section_id, 'sqm_section', sqmSection);
 	uci.set('cake-autorate', section_id, 'sqm_enabled', state.sqm_enabled ? '1' : '0');
+	uci.set('cake-autorate', section_id, 'speedtest_backend', state.speedtest_backend || 'auto');
 	uci.set('cake-autorate', section_id, 'speedtest_apply_percent', String(state.speedtest_apply_percent || '90'));
 	uci.set('cake-autorate', section_id, 'manual_rate_limits', '0');
 	uci.set('cake-autorate', section_id, 'advanced_settings', '0');
@@ -763,6 +784,18 @@ function wizardSelect(values, selected) {
 	return E('select', { 'class': 'cbi-input-select' }, options);
 }
 
+function wizardSelectOptions(values, selected) {
+	var options = [];
+
+	for (var i = 0; i < values.length; i++)
+		options.push(E('option', {
+			'value': values[i][0],
+			'selected': values[i][0] === selected ? 'selected' : null
+		}, values[i][1]));
+
+	return E('select', { 'class': 'cbi-input-select' }, options);
+}
+
 function validatePositiveInteger(value) {
 	value = parseInt(value, 10);
 
@@ -791,6 +824,7 @@ function showCreateWizard(grid, name) {
 		wan_if: defaultWan,
 		enabled: false,
 		sqm_enabled: false,
+		speedtest_backend: 'auto',
 		speedtest_apply_percent: '90',
 		sqm_download: '20000',
 		sqm_upload: '20000'
@@ -862,15 +896,41 @@ function showCreateWizard(grid, name) {
 	}
 
 	function renderSpeedStep() {
+		var backend = wizardSelectOptions(speedtestBackendChoices(), state.speedtest_backend);
 		var percent = wizardTextInput(state.speedtest_apply_percent, 'and(uinteger,min(1),max(100))');
 		var download = wizardTextInput(state.sqm_download, 'uinteger');
 		var upload = wizardTextInput(state.sqm_upload, 'uinteger');
+		var backendStatus = E('pre', { 'style': 'white-space:pre-wrap;margin:6px 0 0 0' }, '');
 		var status = E('div', { 'class': 'cake-autorate-speedtest-status' }, '');
 		var syncInputs = function() {
+			state.speedtest_backend = backend.value || 'auto';
 			state.speedtest_apply_percent = percent.value || '90';
 			state.sqm_download = download.value;
 			state.sqm_upload = upload.value;
 		};
+		var checkButton = E('button', {
+			'class': 'btn cbi-button',
+			'click': function() {
+				syncInputs();
+				showError(null);
+				checkButton.disabled = true;
+				backendStatus.textContent = _('Checking backends...');
+
+				fs.exec('/usr/libexec/cake-autorate-rs/speedtest', [
+					state.name,
+					state.wan_if,
+					'status',
+					state.speedtest_backend
+				]).then(function(res) {
+					backendStatus.textContent = formatSpeedtestBackendStatus(JSON.parse((res.stdout || '').trim()));
+				}).catch(function(err) {
+					showError(_('Speed test backend check failed: %s').format(err.message || err));
+					backendStatus.textContent = '';
+				}).then(function() {
+					checkButton.disabled = false;
+				});
+			}
+		}, _('Check backends'));
 		var runButton = E('button', {
 			'class': 'btn cbi-button cbi-button-action',
 			'click': function() {
@@ -881,11 +941,17 @@ function showCreateWizard(grid, name) {
 					return;
 				}
 
+				syncInputs();
 				showError(null);
 				runButton.disabled = true;
 				status.textContent = _('Running speed test...');
 
-				fs.exec('/usr/libexec/cake-autorate-rs/speedtest', [ state.name, state.wan_if ]).then(function(res) {
+				fs.exec('/usr/libexec/cake-autorate-rs/speedtest', [
+					state.name,
+					state.wan_if,
+					'run',
+					state.speedtest_backend
+				]).then(function(res) {
 					var result = parseSpeedtestResult(res.stdout);
 					var dl = measuredRate(result.download_kbps, pct);
 					var ul = measuredRate(result.upload_kbps, pct);
@@ -911,6 +977,7 @@ function showCreateWizard(grid, name) {
 			}
 		}, _('Run speed test'));
 
+		backend.addEventListener('change', syncInputs);
 		percent.addEventListener('input', syncInputs);
 		percent.addEventListener('change', syncInputs);
 		download.addEventListener('input', syncInputs);
@@ -919,6 +986,8 @@ function showCreateWizard(grid, name) {
 		upload.addEventListener('change', syncInputs);
 
 		return [
+			wizardField(_('Preferred backend'), backend, optionDescriptions.speedtest_backend),
+			wizardField(_('Check backends'), E('div', {}, [ checkButton, backendStatus ]), optionDescriptions._speedtest_backend_status),
 			wizardField(_('Speed test apply percent'), percent, optionDescriptions.speedtest_apply_percent),
 			wizardField(_('Download speed'), download, optionDescriptions.sqm_download),
 			wizardField(_('Upload speed'), upload, optionDescriptions.sqm_upload),
@@ -935,6 +1004,7 @@ function showCreateWizard(grid, name) {
 			[ _('Upload interface'), wan ],
 			[ _('Queueing discipline'), state.sqm_qdisc || 'cake' ],
 			[ _('Queue setup script'), state.sqm_script || 'piece_of_cake.qos' ],
+			[ _('Preferred backend'), speedtestBackendChoiceTitle(state.speedtest_backend) ],
 			[ _('Download speed'), state.sqm_download + ' kbit/s' ],
 			[ _('Upload speed'), state.sqm_upload + ' kbit/s' ],
 			[ _('Min DL rate'), halfRate(state.sqm_download) + ' kbit/s' ],

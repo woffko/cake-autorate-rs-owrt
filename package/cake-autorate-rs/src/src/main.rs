@@ -37,6 +37,9 @@ struct Config {
     connection_active_thr_kbps: f64,
     pinger_method: String,
     reflectors: Vec<String>,
+    reflectors_url: String,
+    reflectors_url_skip_lines: usize,
+    randomize_reflectors: bool,
     no_pingers: usize,
     reflector_ping_interval_s: f64,
     monitor_achieved_rates_interval_ms: u64,
@@ -97,6 +100,9 @@ impl Config {
                 "9.9.9.9".to_string(),
                 "9.9.9.10".to_string(),
             ],
+            reflectors_url: String::new(),
+            reflectors_url_skip_lines: 1,
+            randomize_reflectors: true,
             no_pingers: 6,
             reflector_ping_interval_s: 0.3,
             monitor_achieved_rates_interval_ms: 200,
@@ -236,6 +242,17 @@ impl Config {
             &mut cfg.connection_active_thr_kbps,
         )?;
         set_string(&single, "pinger_method", &mut cfg.pinger_method);
+        set_string(&single, "reflectors_url", &mut cfg.reflectors_url);
+        set_usize(
+            &single,
+            "reflectors_url_skip_lines",
+            &mut cfg.reflectors_url_skip_lines,
+        )?;
+        set_bool(
+            &single,
+            "randomize_reflectors",
+            &mut cfg.randomize_reflectors,
+        )?;
         set_usize(&single, "no_pingers", &mut cfg.no_pingers)?;
         set_f64(
             &single,
@@ -369,10 +386,54 @@ impl Config {
                 .map(str::to_string)
                 .collect();
         }
+        cfg.load_reflectors_url();
+        cfg.deduplicate_reflectors();
+        if cfg.randomize_reflectors {
+            randomize_reflectors(&mut cfg.reflectors);
+        }
 
         cfg.normalize_paths();
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    fn load_reflectors_url(&mut self) {
+        if self.reflectors_url.is_empty() {
+            return;
+        }
+
+        let configured_reflectors = self.reflectors.clone();
+        match fetch_url_text(&self.reflectors_url) {
+            Ok(data) => {
+                let mut reflectors =
+                    parse_reflector_candidates(&data, self.reflectors_url_skip_lines);
+                if reflectors.is_empty() {
+                    eprintln!(
+                        "WARNING: reflectors_url {} returned no usable reflectors; using configured list",
+                        self.reflectors_url
+                    );
+                } else {
+                    reflectors.extend(configured_reflectors);
+                    self.reflectors = reflectors;
+                }
+            }
+            Err(e) => eprintln!(
+                "WARNING: failed to fetch reflectors_url {}: {e}; using configured list",
+                self.reflectors_url
+            ),
+        }
+    }
+
+    fn deduplicate_reflectors(&mut self) {
+        let mut seen: Vec<String> = Vec::new();
+        self.reflectors.retain(|reflector| {
+            if seen.iter().any(|value| value == reflector) {
+                false
+            } else {
+                seen.push(reflector.clone());
+                true
+            }
+        });
     }
 
     fn normalize_paths(&mut self) {
@@ -993,6 +1054,86 @@ fn parse_fping_line(line: &str) -> Option<Sample> {
     None
 }
 
+fn fetch_url_text(url: &str) -> Result<String, String> {
+    let commands: &[(&str, &[&str])] = &[
+        ("curl", &["-fsSL", "--max-time", "20"]),
+        ("uclient-fetch", &["-q", "-O", "-", "--timeout=20"]),
+        ("wget", &["-q", "-O", "-"]),
+    ];
+
+    let mut last_error = String::new();
+    for (bin, args) in commands {
+        let mut cmd = Command::new(bin);
+        cmd.args(*args).arg(url);
+
+        match cmd.output() {
+            Ok(output) if output.status.success() => {
+                return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+            }
+            Ok(output) => {
+                last_error = format!("{bin} exited with {}", output.status);
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => last_error = format!("{bin}: {e}"),
+        }
+    }
+
+    if last_error.is_empty() {
+        Err("no curl, uclient-fetch, or wget binary found".to_string())
+    } else {
+        Err(last_error)
+    }
+}
+
+fn parse_reflector_candidates(data: &str, skip_lines: usize) -> Vec<String> {
+    let mut reflectors = Vec::new();
+
+    for line in data.lines().skip(skip_lines) {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        for token in line.split(|c: char| c == ',' || c == ';' || c.is_whitespace()) {
+            let token = token.trim_matches(['"', '\'']).trim();
+            if is_valid_reflector_candidate(token) {
+                reflectors.push(token.to_string());
+                break;
+            }
+        }
+    }
+
+    reflectors
+}
+
+fn is_valid_reflector_candidate(value: &str) -> bool {
+    if value.is_empty() || value.len() > 253 || value.contains("://") {
+        return false;
+    }
+
+    value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | ':'))
+}
+
+fn randomize_reflectors(reflectors: &mut [String]) {
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+
+    reflectors.sort_by_key(|reflector| stable_hash(reflector) ^ seed);
+}
+
+fn stable_hash(value: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in value.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 fn ensure_run_dir(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
@@ -1254,7 +1395,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_uci_values;
+    use super::{parse_reflector_candidates, parse_uci_values};
 
     #[test]
     fn parses_single_quoted_value() {
@@ -1272,5 +1413,14 @@ mod tests {
     #[test]
     fn preserves_spaces_inside_quotes() {
         assert_eq!(parse_uci_values("'foo bar' baz"), vec!["foo bar", "baz"]);
+    }
+
+    #[test]
+    fn parses_reflector_candidates_from_text() {
+        let data = "host,notes\n# comment\n1.1.1.1,cloudflare\nbad://url\n9.9.9.9 quad9\n";
+        assert_eq!(
+            parse_reflector_candidates(data, 1),
+            vec!["1.1.1.1", "9.9.9.9"]
+        );
     }
 }

@@ -3,6 +3,7 @@
 section="$1"
 target_if_override="$2"
 mode="$3"
+backend_override="$4"
 
 if [ "$section" = "--status" ] || [ "$section" = "status" ]; then
 	section=""
@@ -13,6 +14,11 @@ fi
 if [ "$target_if_override" = "--status" ] || [ "$target_if_override" = "status" ]; then
 	target_if_override=""
 	mode="status"
+fi
+
+if [ "$mode" != "status" ] && [ -n "$mode" ] && [ -z "$backend_override" ]; then
+	backend_override="$mode"
+	mode=""
 fi
 
 download_bytes_default="25000000"
@@ -464,7 +470,7 @@ run_builtin_http() {
 }
 
 run_librespeed_cli() {
-	local start stop dl_mbps ul_mbps upload_arg upload_kib ipv4_arg interface_arg
+	local start stop dl_mbps ul_mbps upload_arg upload_kib ipv4_arg interface_arg value
 
 	backend_available "librespeed-cli" || return 1
 	reset_result
@@ -504,7 +510,8 @@ run_librespeed_cli() {
 
 	download_kbps="$(mbps_to_kbps "$dl_mbps")"
 	if [ -n "$ul_mbps" ]; then
-		upload_kbps="$(mbps_to_kbps "$ul_mbps")"
+		value="$(mbps_to_kbps "$ul_mbps")"
+		[ -n "$value" ] && upload_kbps="$value"
 	fi
 
 	download_size="$(json_first_file "$tmp_response" '@[0].bytes_received' '@.bytes_received' '@.result.bytes_received' '@.servers[0].bytes_received')"
@@ -516,7 +523,7 @@ run_librespeed_cli() {
 }
 
 run_speedtest_go() {
-	local start stop dl_bytes_per_s ul_bytes_per_s source_ip
+	local start stop dl_bytes_per_s ul_bytes_per_s source_ip value
 
 	backend_available "speedtest-go" || return 1
 	reset_result
@@ -556,7 +563,8 @@ run_speedtest_go() {
 
 	download_kbps="$(bytes_per_second_to_kbps "$dl_bytes_per_s")"
 	if [ -n "$ul_bytes_per_s" ]; then
-		upload_kbps="$(bytes_per_second_to_kbps "$ul_bytes_per_s")"
+		value="$(bytes_per_second_to_kbps "$ul_bytes_per_s")"
+		[ -n "$value" ] && upload_kbps="$value"
 	fi
 
 	download_size="0"
@@ -597,7 +605,7 @@ run_iperf3_one() {
 }
 
 run_iperf3() {
-	local start stop dl_bits ul_bits
+	local start stop dl_bits ul_bits value
 
 	backend_available "iperf3" || return 1
 	reset_result
@@ -624,7 +632,8 @@ run_iperf3() {
 			upload_elapsed="$(elapsed_s "$start" "$stop")"
 			ul_bits="$(json_first_file "$tmp_upload" '@.end.sum_sent.bits_per_second' '@.end.sum.bits_per_second')"
 			upload_size="$(json_first_file "$tmp_upload" '@.end.sum_sent.bytes' '@.end.sum.bytes')"
-			upload_kbps="$(bits_to_kbps "$ul_bits")"
+			value="$(bits_to_kbps "$ul_bits")"
+			[ -n "$value" ] && upload_kbps="$value"
 			[ -n "$upload_size" ] || upload_size="0"
 		else
 			append_warning "iperf3 upload test failed; upload rate was left unchanged."
@@ -741,6 +750,7 @@ preferred_backend="$(uci_get speedtest_backend)"
 [ -n "$bind_interface_enabled" ] || bind_interface_enabled="1"
 [ -n "$force_ipv4_enabled" ] || force_ipv4_enabled="1"
 [ -n "$route_probe" ] || route_probe="$route_probe_default"
+[ -n "$backend_override" ] && preferred_backend="$backend_override"
 valid_backend "$preferred_backend" || preferred_backend="auto"
 
 if bool_enabled "$force_ipv4_enabled"; then
