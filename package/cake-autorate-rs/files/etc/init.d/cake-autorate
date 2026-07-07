@@ -153,20 +153,22 @@ cleanup_stale_sqm_sections() {
 	local owner="$1"
 	local keep="$2"
 	local managed_section="cake_$owner"
-	local section
+	local changed=0 section
 
-	uci -q show "$SQM_CONFIG" |
-		sed -n "s/^$SQM_CONFIG\\.\\([^.]*\\)\\._cake_autorate_managed='$owner'$/\\1/p" |
-		while IFS= read -r section; do
-			[ -n "$section" ] || continue
-			[ "$section" = "$keep" ] && continue
+	for section in $(uci -q show "$SQM_CONFIG" | sed -n "s/^$SQM_CONFIG\\.\\([^.]*\\)\\._cake_autorate_managed='$owner'$/\\1/p"); do
+		[ -n "$section" ] || continue
+		[ "$section" = "$keep" ] && continue
 
-			if [ "$section" = "$managed_section" ]; then
-				uci -q delete "$SQM_CONFIG.$section"
-			else
-				uci -q delete "$SQM_CONFIG.$section._cake_autorate_managed"
-			fi
-		done
+		if [ "$section" = "$managed_section" ]; then
+			uci -q delete "$SQM_CONFIG.$section"
+		else
+			uci -q delete "$SQM_CONFIG.$section._cake_autorate_managed"
+		fi
+
+		changed=1
+	done
+
+	[ "$changed" -eq 1 ]
 }
 
 sync_sqm_instance() {
@@ -176,13 +178,20 @@ sync_sqm_instance() {
 	config_get_bool manage_sqm "$section" manage_sqm 1
 	[ "$manage_sqm" -eq 1 ] || return 0
 
+	config_get_bool enabled "$section" enabled 0
+	config_get_bool sqm_enabled "$section" sqm_enabled "$enabled"
+	if [ "$enabled" -ne 1 ] || [ "$sqm_enabled" -ne 1 ]; then
+		if cleanup_stale_sqm_sections "$section" ""; then
+			SQM_MANAGED=1
+		fi
+
+		return 0
+	fi
+
 	config_get sqm_section "$section" sqm_section "cake_$section"
 	cleanup_stale_sqm_sections "$section" "$sqm_section"
 	uci -q get "$SQM_CONFIG.$sqm_section" >/dev/null || uci set "$SQM_CONFIG.$sqm_section=queue"
 	set_sqm_option "$sqm_section" "_cake_autorate_managed" "$section"
-
-	config_get_bool enabled "$section" enabled 0
-	config_get_bool sqm_enabled "$section" sqm_enabled "$enabled"
 	set_sqm_option "$sqm_section" enabled "$sqm_enabled"
 
 	config_get value "$section" sqm_interface

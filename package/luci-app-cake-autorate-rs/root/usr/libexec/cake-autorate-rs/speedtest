@@ -178,6 +178,9 @@ json_first_file() {
 
 backend_title() {
 	case "$1" in
+		auto)
+			printf '%s' "Auto"
+			;;
 		librespeed-cli)
 			printf '%s' "LibreSpeed CLI"
 			;;
@@ -196,6 +199,16 @@ backend_title() {
 	esac
 }
 
+valid_backend() {
+	case "$1" in
+		auto|librespeed-cli|speedtest-go|iperf3|builtin-http)
+			return 0
+			;;
+	esac
+
+	return 1
+}
+
 backend_available() {
 	case "$1" in
 		librespeed-cli)
@@ -212,6 +225,23 @@ backend_available() {
 			;;
 		*)
 			return 1
+			;;
+	esac
+}
+
+backend_install_hint() {
+	case "$1" in
+		librespeed-cli)
+			printf '%s' "apk add librespeed-cli"
+			;;
+		speedtest-go)
+			printf '%s' "apk add speedtest-go"
+			;;
+		iperf3)
+			printf '%s' "apk add iperf3; set iperf3 server below"
+			;;
+		builtin-http)
+			printf '%s' "built in; no extra package"
 			;;
 	esac
 }
@@ -260,20 +290,31 @@ first_available_backend() {
 	return 1
 }
 
+selected_status_backend() {
+	if [ "$preferred_backend" != "auto" ]; then
+		printf '%s' "$preferred_backend"
+		return 0
+	fi
+
+	first_available_backend
+}
+
 backend_status_json() {
 	local selected backend first available selected_bool
 
-	selected="$(first_available_backend)"
+	selected="$(selected_status_backend)"
 	first="1"
 
-	if [ -n "$selected" ]; then
+	if [ -n "$selected" ] && backend_available "$selected"; then
 		available="true"
 	else
 		available="false"
 	fi
 
-	printf '{"available":%s,"selected_backend":"%s","selected_title":"%s","backends":[' \
+	printf '{"available":%s,"preferred_backend":"%s","preferred_title":"%s","selected_backend":"%s","selected_title":"%s","backends":[' \
 		"$available" \
+		"$(json_escape "$preferred_backend")" \
+		"$(json_escape "$(backend_title "$preferred_backend")")" \
 		"$(json_escape "$selected")" \
 		"$(json_escape "$(backend_title "$selected")")"
 
@@ -293,12 +334,13 @@ backend_status_json() {
 			selected_bool="false"
 		fi
 
-		printf '{"name":"%s","title":"%s","available":%s,"selected":%s,"reason":"%s"}' \
+		printf '{"name":"%s","title":"%s","available":%s,"selected":%s,"reason":"%s","install_hint":"%s"}' \
 			"$(json_escape "$backend")" \
 			"$(json_escape "$(backend_title "$backend")")" \
 			"$available" \
 			"$selected_bool" \
-			"$(json_escape "$(backend_reason "$backend")")"
+			"$(json_escape "$(backend_reason "$backend")")" \
+			"$(json_escape "$(backend_install_hint "$backend")")"
 	done
 
 	printf '],"warning":"%s"}\n' "$(json_escape "$warning")"
@@ -636,6 +678,43 @@ run_available_backends() {
 	return 1
 }
 
+run_backend() {
+	case "$1" in
+		librespeed-cli)
+			run_librespeed_cli
+			;;
+		speedtest-go)
+			run_speedtest_go
+			;;
+		iperf3)
+			run_iperf3
+			;;
+		builtin-http)
+			run_builtin_http
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+run_preferred_backend() {
+	if [ "$preferred_backend" = "auto" ]; then
+		run_available_backends
+		return $?
+	fi
+
+	if ! backend_available "$preferred_backend"; then
+		json_error "$(backend_title "$preferred_backend") backend is not available: $(backend_reason "$preferred_backend"). $(backend_install_hint "$preferred_backend")"
+	fi
+
+	if run_backend "$preferred_backend"; then
+		return 0
+	fi
+
+	json_error "$(backend_title "$preferred_backend") backend failed"
+}
+
 warning=""
 jsonfilter_bin="$(command_path jsonfilter)"
 librespeed_bin="$(command_path librespeed-cli)"
@@ -654,6 +733,7 @@ force_ipv4_enabled="$(uci_get speedtest_force_ipv4)"
 route_probe="$(uci_get speedtest_route_probe)"
 iperf3_server="$(uci_get speedtest_iperf3_server)"
 iperf3_port="$(uci_get speedtest_iperf3_port)"
+preferred_backend="$(uci_get speedtest_backend)"
 
 [ -n "$upload_retry_bytes" ] || upload_retry_bytes="$upload_retry_bytes_default"
 [ -n "$download_url" ] || download_url="https://speed.cloudflare.com/__down?bytes=$download_bytes"
@@ -661,6 +741,7 @@ iperf3_port="$(uci_get speedtest_iperf3_port)"
 [ -n "$bind_interface_enabled" ] || bind_interface_enabled="1"
 [ -n "$force_ipv4_enabled" ] || force_ipv4_enabled="1"
 [ -n "$route_probe" ] || route_probe="$route_probe_default"
+valid_backend "$preferred_backend" || preferred_backend="auto"
 
 if bool_enabled "$force_ipv4_enabled"; then
 	force_ipv4_arg="1"
@@ -692,7 +773,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-if run_available_backends; then
+if run_preferred_backend; then
 	emit_result
 	exit 0
 fi

@@ -31,6 +31,7 @@ var optionDescriptions = {
 	speedtest_upload_bytes: 'Initial upload payload size sent by the built-in HTTP speed test. Set to 0 to skip upload testing.',
 	speedtest_upload_retry_bytes: 'Space-separated smaller upload payload sizes to try if the initial upload test fails.',
 	speedtest_timeout_s: 'Per-request timeout for built-in speed test download and upload requests.',
+	speedtest_backend: 'Speed test backend preference. Auto tries optional CLI backends first and falls back to the built-in HTTP test. A forced backend must be installed and configured.',
 	speedtest_duration_s: 'Test duration in seconds for optional CLI backends that support a duration setting.',
 	speedtest_iperf3_server: 'Optional iperf3 server host or address. iperf3 is only used when this is set and the iperf3 package is installed.',
 	speedtest_iperf3_port: 'Optional iperf3 server port. Leave empty to use the iperf3 default.',
@@ -491,6 +492,9 @@ function formatSpeedtestBackendStatus(result) {
 	var backends = result.backends || [];
 	var lines = [];
 
+	if (result.preferred_title)
+		lines.push(_('Preferred backend: %s').format(result.preferred_title));
+
 	if (result.selected_title)
 		lines.push(_('Selected backend: %s').format(result.selected_title));
 	else
@@ -500,9 +504,10 @@ function formatSpeedtestBackendStatus(result) {
 		var backend = backends[i];
 		var state = backend.available ? _('available') : _('unavailable');
 		var reason = backend.reason ? ' - ' + backend.reason : '';
+		var install = (!backend.available && backend.install_hint) ? ' - ' + backend.install_hint : '';
 		var marker = backend.selected ? ' *' : '';
 
-		lines.push('%s: %s%s%s'.format(backend.title || backend.name, state, marker, reason));
+		lines.push('%s: %s%s%s%s'.format(backend.title || backend.name, state, marker, reason, install));
 	}
 
 	if (result.warning)
@@ -1124,6 +1129,17 @@ function addRateOptions(section) {
 
 function addSpeedtestOptions(section) {
 	var o;
+
+	o = section.taboption('speedtest', form.ListValue, 'speedtest_backend', _('Preferred backend'));
+	modal(o);
+	describe(o, 'speedtest_backend');
+	o.rmempty = false;
+	o.default = 'auto';
+	o.value('auto', _('Auto'));
+	o.value('librespeed-cli', _('LibreSpeed CLI (package: librespeed-cli)'));
+	o.value('speedtest-go', _('speedtest-go (package: speedtest-go)'));
+	o.value('iperf3', _('configured iperf3 (package: iperf3)'));
+	o.value('builtin-http', _('built-in HTTP'));
 
 	o = section.taboption('speedtest', form.DummyValue, '_speedtest_backend_order', _('Backend order'));
 	modal(o);
