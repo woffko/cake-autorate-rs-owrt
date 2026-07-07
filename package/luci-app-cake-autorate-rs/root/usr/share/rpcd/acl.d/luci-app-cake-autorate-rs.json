@@ -1,0 +1,31 @@
+{
+	"luci-app-cake-autorate-rs": {
+		"description": "Grant access to CAKE Autorate RS LuCI app",
+		"read": {
+			"cgi-io": [ "exec" ],
+			"file": {
+				"/var/run/cake-autorate/*/status.json": [ "read" ],
+				"/etc/init.d/cake-autorate status": [ "exec" ]
+			},
+			"ubus": {
+				"luci": [ "getInitList" ]
+			},
+			"uci": [ "cake-autorate" ]
+		},
+		"write": {
+			"cgi-io": [ "exec" ],
+			"file": {
+				"/etc/init.d/cake-autorate enable": [ "exec" ],
+				"/etc/init.d/cake-autorate disable": [ "exec" ],
+				"/etc/init.d/cake-autorate start": [ "exec" ],
+				"/etc/init.d/cake-autorate stop": [ "exec" ],
+				"/etc/init.d/cake-autorate restart": [ "exec" ],
+				"/etc/init.d/cake-autorate reload": [ "exec" ]
+			},
+			"ubus": {
+				"luci": [ "setInitAction" ]
+			},
+			"uci": [ "cake-autorate" ]
+		}
+	}
+}

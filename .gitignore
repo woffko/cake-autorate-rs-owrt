@@ -1,0 +1,24 @@
+handoff.md
+
+# Local OpenWrt SDK/build output
+openwrt-*/
+openwrt-sdk-*/
+build_dir/
+bin/
+dl/
+staging_dir/
+tmp/
+logs/
+
+# Rust local build artifacts
+target/
+**/target/
+
+# Local downloads/tools used during experiments
+downloads/
+tools/
+
+# Editor and OS noise
+.DS_Store
+*.swp
+*.swo
