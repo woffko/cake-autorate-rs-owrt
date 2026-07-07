@@ -19,6 +19,8 @@ define Package/cake-autorate-rs
   SECTION:=net
   CATEGORY:=Network
   TITLE:=Rust daemon for adaptive CAKE bandwidth control
+  URL:=https://github.com/woffko/cake-autorate-rs
+  MAINTAINER:=woffko
   DEPENDS:=$(RUST_ARCH_DEPENDS) +uci +fping
 endef
 
