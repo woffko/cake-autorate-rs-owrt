@@ -32,11 +32,12 @@ Implemented:
 
 - UCI-based config loading.
 - Multiple enabled UCI sections via procd instances.
-- `fping` reflector probing plus a basic `pinger_method=ping` fallback.
-- Active reflector health tracking and replacement for running `fping`/`ping`
-  probes: response-deadline offences, baseline/EWMA comparison, periodic
-  replacement, optional reflector stats logging, and pinger restart with the
-  next spare candidate.
+- `fping` RTT reflector probing, `fping-ts` ICMP timestamp OWD probing, plus a
+  basic `pinger_method=ping` fallback.
+- Active reflector health tracking and replacement for running `fping`,
+  `fping-ts`, and `ping` probes: response-deadline offences, baseline/EWMA
+  comparison, periodic replacement, optional reflector stats logging, and
+  pinger restart with the next spare candidate.
 - sysfs RX/TX byte counter sampling.
 - optional CPU usage sampling from `/proc/stat`, exposed in logs and status JSON.
 - adaptive rate calculations using delay/load windows.
@@ -66,9 +67,11 @@ Known limits:
 
 - `pinger_method=ping` probes only the first selected reflector; use `fping` for
   concurrent reflector probing.
-- `fping-ts`, `tsping`, and `irtt` pinger backends are not implemented.
-- reflector health/replacement is implemented as an MVP using RTT/2 OWD
-  estimates; timestamp-aware scoring still depends on future pinger backends.
+- `tsping` and `irtt` pinger backends are not implemented.
+- `fping-ts` depends on reflectors that answer ICMP timestamp probes; many
+  public DNS anycast reflectors do not.
+- reflector health/replacement is implemented as an MVP; `fping-ts` uses
+  separate DL/UL OWD samples while RTT backends still use RTT/2 estimates.
 - advanced multi-WAN policy, log bundle export, and MQTT integration are
   placeholders or not implemented.
 
