@@ -36,6 +36,7 @@ struct Config {
     max_ul_shaper_rate_kbps: f64,
     connection_active_thr_kbps: f64,
     pinger_method: String,
+    ping_extra_args: String,
     reflectors: Vec<String>,
     reflectors_url: String,
     reflectors_url_skip_lines: usize,
@@ -66,11 +67,17 @@ struct Config {
     output_summary_stats: bool,
     output_load_stats: bool,
     output_cake_changes: bool,
+    output_cpu_stats: bool,
+    output_cpu_raw_stats: bool,
     log_to_file: bool,
     debug: bool,
+    log_file_max_time_mins: u64,
+    log_file_max_size_kb: u64,
     log_file_path_override: String,
+    log_file_export_compress: bool,
     startup_wait_s: f64,
     if_up_check_interval_s: f64,
+    monitor_cpu_usage_interval_ms: u64,
 }
 
 impl Config {
@@ -92,6 +99,7 @@ impl Config {
             max_ul_shaper_rate_kbps: 35000.0,
             connection_active_thr_kbps: 2000.0,
             pinger_method: "fping".to_string(),
+            ping_extra_args: String::new(),
             reflectors: vec![
                 "1.1.1.1".to_string(),
                 "1.0.0.1".to_string(),
@@ -129,11 +137,17 @@ impl Config {
             output_summary_stats: true,
             output_load_stats: false,
             output_cake_changes: false,
+            output_cpu_stats: false,
+            output_cpu_raw_stats: false,
             log_to_file: true,
             debug: true,
+            log_file_max_time_mins: 10,
+            log_file_max_size_kb: 2000,
             log_file_path_override: String::new(),
+            log_file_export_compress: true,
             startup_wait_s: 0.0,
             if_up_check_interval_s: 10.0,
+            monitor_cpu_usage_interval_ms: 2000,
         }
     }
 
@@ -242,6 +256,7 @@ impl Config {
             &mut cfg.connection_active_thr_kbps,
         )?;
         set_string(&single, "pinger_method", &mut cfg.pinger_method);
+        set_string(&single, "ping_extra_args", &mut cfg.ping_extra_args);
         set_string(&single, "reflectors_url", &mut cfg.reflectors_url);
         set_usize(
             &single,
@@ -363,18 +378,44 @@ impl Config {
         )?;
         set_bool(&single, "output_load_stats", &mut cfg.output_load_stats)?;
         set_bool(&single, "output_cake_changes", &mut cfg.output_cake_changes)?;
+        set_bool(&single, "output_cpu_stats", &mut cfg.output_cpu_stats)?;
+        set_bool(
+            &single,
+            "output_cpu_raw_stats",
+            &mut cfg.output_cpu_raw_stats,
+        )?;
         set_bool(&single, "log_to_file", &mut cfg.log_to_file)?;
         set_bool(&single, "debug", &mut cfg.debug)?;
+        set_u64(
+            &single,
+            "log_file_max_time_mins",
+            &mut cfg.log_file_max_time_mins,
+        )?;
+        set_u64(
+            &single,
+            "log_file_max_size_KB",
+            &mut cfg.log_file_max_size_kb,
+        )?;
         set_string(
             &single,
             "log_file_path_override",
             &mut cfg.log_file_path_override,
         );
+        set_bool(
+            &single,
+            "log_file_export_compress",
+            &mut cfg.log_file_export_compress,
+        )?;
         set_f64(&single, "startup_wait_s", &mut cfg.startup_wait_s)?;
         set_f64(
             &single,
             "if_up_check_interval_s",
             &mut cfg.if_up_check_interval_s,
+        )?;
+        set_u64(
+            &single,
+            "monitor_cpu_usage_interval_ms",
+            &mut cfg.monitor_cpu_usage_interval_ms,
         )?;
 
         if let Some(values) = lists.get("reflector") {
@@ -451,14 +492,23 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), String> {
-        if self.pinger_method != "fping" {
+        if self.pinger_method != "fping" && self.pinger_method != "ping" {
             return Err(format!(
-                "pinger_method={} is configured, but this Rust MVP currently supports only fping",
+                "pinger_method={} is configured, but this Rust package currently supports fping and ping",
                 self.pinger_method
             ));
         }
         if self.reflectors.is_empty() {
             return Err("at least one reflector is required".to_string());
+        }
+        if self
+            .reflectors
+            .iter()
+            .any(|reflector| !is_valid_reflector_candidate(reflector))
+        {
+            return Err(
+                "reflectors may contain only host, IPv4, or IPv6 address characters".to_string(),
+            );
         }
         if self.no_pingers == 0 {
             return Err("no_pingers must be greater than zero".to_string());
@@ -539,10 +589,140 @@ impl RateMonitor {
     }
 }
 
+#[derive(Clone, Debug)]
+struct CpuCounters {
+    total: u64,
+    idle: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CpuSnapshot {
+    counters: Vec<CpuCounters>,
+    raw_lines: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct CpuStats {
+    total_percent: f64,
+    core_percentages: Vec<f64>,
+    raw_lines: Vec<String>,
+}
+
+struct CpuMonitor {
+    previous: CpuSnapshot,
+}
+
+impl CpuMonitor {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            previous: read_cpu_snapshot()?,
+        })
+    }
+
+    fn sample(&mut self) -> io::Result<Option<CpuStats>> {
+        let current = read_cpu_snapshot()?;
+        let mut percentages = Vec::new();
+
+        for (prev, next) in self.previous.counters.iter().zip(current.counters.iter()) {
+            let total_delta = next.total.saturating_sub(prev.total);
+            let idle_delta = next.idle.saturating_sub(prev.idle);
+
+            if total_delta == 0 {
+                percentages.push(0.0);
+            } else {
+                let busy = total_delta.saturating_sub(idle_delta) as f64;
+                percentages.push((busy * 100.0 / total_delta as f64).clamp(0.0, 100.0));
+            }
+        }
+
+        self.previous = current.clone();
+
+        if percentages.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(CpuStats {
+            total_percent: percentages[0],
+            core_percentages: percentages.iter().skip(1).copied().collect(),
+            raw_lines: current.raw_lines,
+        }))
+    }
+}
+
+struct LogFile {
+    path: PathBuf,
+    file: File,
+    opened_at: Instant,
+    bytes_written: u64,
+}
+
+impl LogFile {
+    fn open(path: PathBuf) -> io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let bytes_written = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+
+        Ok(Self {
+            path,
+            file,
+            opened_at: Instant::now(),
+            bytes_written,
+        })
+    }
+
+    fn write_line(
+        &mut self,
+        line: &str,
+        max_age: Duration,
+        max_size_bytes: u64,
+        compress: bool,
+    ) -> io::Result<()> {
+        let pending = line.len() as u64 + 1;
+        let age_exceeded = max_age > Duration::ZERO && self.opened_at.elapsed() >= max_age;
+        let size_exceeded =
+            max_size_bytes > 0 && self.bytes_written.saturating_add(pending) > max_size_bytes;
+
+        if age_exceeded || size_exceeded {
+            self.rotate(compress)?;
+        }
+
+        writeln!(self.file, "{line}")?;
+        self.bytes_written = self.bytes_written.saturating_add(pending);
+        Ok(())
+    }
+
+    fn rotate(&mut self, compress: bool) -> io::Result<()> {
+        let _ = self.file.flush();
+
+        let rotated = rotated_log_path(&self.path);
+        match fs::rename(&self.path, &rotated) {
+            Ok(()) => {
+                if compress {
+                    let _ = Command::new("gzip").arg("-f").arg(&rotated).status();
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+
+        self.file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        self.opened_at = Instant::now();
+        self.bytes_written = 0;
+        Ok(())
+    }
+}
+
 struct Controller {
     cfg: Config,
-    log: Option<File>,
+    log: Option<LogFile>,
     rate_monitor: RateMonitor,
+    cpu_monitor: Option<CpuMonitor>,
     baseline_us: HashMap<String, f64>,
     ewma_us: HashMap<String, f64>,
     dl_delays: VecDeque<bool>,
@@ -557,6 +737,9 @@ struct Controller {
     last_bb_ul: Instant,
     last_decay_dl: Instant,
     last_decay_ul: Instant,
+    last_cpu_sample: Instant,
+    cpu_total_percent: Option<f64>,
+    cpu_core_percentages: Vec<f64>,
     started_at: f64,
 }
 
@@ -568,25 +751,26 @@ impl Controller {
         wait_for_path(&cfg.tx_bytes_path, cfg.if_up_check_interval_s)?;
 
         let log = if cfg.log_to_file {
-            let path = cfg.log_path();
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|e| {
-                    format!("failed to create log directory {}: {e}", parent.display())
-                })?;
-            }
-            Some(
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                    .map_err(|e| format!("failed to open log file {}: {e}", path.display()))?,
-            )
+            Some(LogFile::open(cfg.log_path()).map_err(|e| {
+                format!("failed to open log file {}: {e}", cfg.log_path().display())
+            })?)
         } else {
             None
         };
 
         let rate_monitor = RateMonitor::new(&cfg.rx_bytes_path, &cfg.tx_bytes_path)
             .map_err(|e| format!("failed to create rate monitor: {e}"))?;
+        let cpu_monitor = if cfg.output_cpu_stats || cfg.output_cpu_raw_stats {
+            match CpuMonitor::new() {
+                Ok(monitor) => Some(monitor),
+                Err(e) => {
+                    eprintln!("WARNING: failed to initialize CPU monitor: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let now = Instant::now();
 
         Ok(Self {
@@ -598,6 +782,9 @@ impl Controller {
             last_bb_ul: now,
             last_decay_dl: now,
             last_decay_ul: now,
+            last_cpu_sample: now,
+            cpu_total_percent: None,
+            cpu_core_percentages: Vec::new(),
             baseline_us: HashMap::new(),
             ewma_us: HashMap::new(),
             dl_delays: filled_bool_window(cfg.bufferbloat_detection_window),
@@ -608,6 +795,7 @@ impl Controller {
             cfg,
             log,
             rate_monitor,
+            cpu_monitor,
         })
     }
 
@@ -714,6 +902,8 @@ impl Controller {
             );
         }
 
+        self.maybe_sample_cpu();
+
         let _ = self.write_status(
             dl_rate,
             ul_rate,
@@ -725,6 +915,54 @@ impl Controller {
             avg_ul_delta,
             &sample,
         );
+    }
+
+    fn maybe_sample_cpu(&mut self) {
+        if !self.cfg.output_cpu_stats && !self.cfg.output_cpu_raw_stats {
+            return;
+        }
+
+        let interval = Duration::from_millis(self.cfg.monitor_cpu_usage_interval_ms.max(1));
+        if self.last_cpu_sample.elapsed() < interval {
+            return;
+        }
+
+        self.last_cpu_sample = Instant::now();
+
+        let sample = match self.cpu_monitor.as_mut() {
+            Some(monitor) => match monitor.sample() {
+                Ok(sample) => sample,
+                Err(e) => {
+                    self.log("ERROR", &format!("failed to sample CPU usage: {e}"));
+                    None
+                }
+            },
+            None => None,
+        };
+
+        let Some(stats) = sample else {
+            return;
+        };
+
+        self.cpu_total_percent = Some(stats.total_percent);
+        self.cpu_core_percentages = stats.core_percentages.clone();
+
+        if self.cfg.output_cpu_raw_stats {
+            for raw_line in stats.raw_lines {
+                self.log("CPU_RAW", &raw_line);
+            }
+        }
+
+        if self.cfg.output_cpu_stats {
+            let mut values = vec![format!("{:.1}", stats.total_percent)];
+            values.extend(
+                stats
+                    .core_percentages
+                    .iter()
+                    .map(|percent| format!("{percent:.1}")),
+            );
+            self.log("CPU", &values.join("; "));
+        }
     }
 
     fn update_direction(
@@ -909,7 +1147,7 @@ impl Controller {
         let mut file = File::create(&tmp)?;
         writeln!(
             file,
-            "{{\"instance\":\"{}\",\"version\":\"0.1.0\",\"started_at\":{:.6},\"updated_at\":{:.6},\"dl_if\":\"{}\",\"ul_if\":\"{}\",\"reflector\":\"{}\",\"seq\":\"{}\",\"probe_timestamp\":{:.6},\"rtt_ms\":{:.3},\"dl_achieved_rate_kbps\":{:.1},\"ul_achieved_rate_kbps\":{:.1},\"dl_load_percent\":{:.1},\"ul_load_percent\":{:.1},\"dl_sum_delays\":{},\"ul_sum_delays\":{},\"dl_avg_owd_delta_us\":{:.1},\"ul_avg_owd_delta_us\":{:.1},\"cake_dl_rate_kbps\":{:.0},\"cake_ul_rate_kbps\":{:.0}}}",
+            "{{\"instance\":\"{}\",\"version\":\"0.1.0\",\"started_at\":{:.6},\"updated_at\":{:.6},\"dl_if\":\"{}\",\"ul_if\":\"{}\",\"reflector\":\"{}\",\"seq\":\"{}\",\"probe_timestamp\":{:.6},\"rtt_ms\":{:.3},\"dl_achieved_rate_kbps\":{:.1},\"ul_achieved_rate_kbps\":{:.1},\"dl_load_percent\":{:.1},\"ul_load_percent\":{:.1},\"dl_sum_delays\":{},\"ul_sum_delays\":{},\"dl_avg_owd_delta_us\":{:.1},\"ul_avg_owd_delta_us\":{:.1},\"cake_dl_rate_kbps\":{:.0},\"cake_ul_rate_kbps\":{:.0},\"cpu_total_percent\":{},\"cpu_core_percentages\":{}}}",
             json_escape(&self.cfg.instance),
             self.started_at,
             epoch_secs(),
@@ -928,7 +1166,9 @@ impl Controller {
             avg_dl_delta,
             avg_ul_delta,
             self.shaper_dl,
-            self.shaper_ul
+            self.shaper_ul,
+            json_f64_or_null(self.cpu_total_percent, 1),
+            json_f64_array(&self.cpu_core_percentages, 1)
         )?;
         fs::rename(tmp, path)
     }
@@ -949,7 +1189,13 @@ impl Controller {
         }
         let line = format!("{kind}; {:.6}; {msg}", epoch_secs());
         if let Some(file) = &mut self.log {
-            let _ = writeln!(file, "{line}");
+            let max_age = Duration::from_secs(self.cfg.log_file_max_time_mins.saturating_mul(60));
+            let max_size = self.cfg.log_file_max_size_kb.saturating_mul(1024);
+            if let Err(e) =
+                file.write_line(&line, max_age, max_size, self.cfg.log_file_export_compress)
+            {
+                eprintln!("failed to write log file: {e}");
+            }
         } else {
             eprintln!("{line}");
         }
@@ -980,25 +1226,34 @@ fn run(cfg: Config, once: bool) -> Result<(), String> {
         return Ok(());
     }
 
-    let mut child = spawn_fping(&cfg)?;
+    let mut child = spawn_pinger(&cfg)?;
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| "failed to capture fping stdout".to_string())?;
+        .ok_or_else(|| format!("failed to capture {} stdout", cfg.pinger_method))?;
     let reader = BufReader::new(stdout);
+    let ping_reflector = cfg.reflectors.first().cloned().unwrap_or_default();
 
     for line in reader.lines() {
         if TERMINATE.load(Ordering::SeqCst) {
             break;
         }
-        let line = line.map_err(|e| format!("failed to read fping output: {e}"))?;
-        if let Some(sample) = parse_fping_line(&line) {
+        let line = line.map_err(|e| format!("failed to read {} output: {e}", cfg.pinger_method))?;
+        if let Some(sample) = parse_sample_line(&cfg, &line, &ping_reflector) {
             controller.on_sample(sample);
         }
     }
 
     stop_child(&mut child);
     Ok(())
+}
+
+fn spawn_pinger(cfg: &Config) -> Result<Child, String> {
+    match cfg.pinger_method.as_str() {
+        "fping" => spawn_fping(cfg),
+        "ping" => spawn_ping(cfg),
+        other => Err(format!("unsupported pinger_method={other}")),
+    }
 }
 
 fn spawn_fping(cfg: &Config) -> Result<Child, String> {
@@ -1027,9 +1282,41 @@ fn spawn_fping(cfg: &Config) -> Result<Child, String> {
         .map_err(|e| format!("failed to start fping: {e}"))
 }
 
+fn spawn_ping(cfg: &Config) -> Result<Child, String> {
+    let target = cfg
+        .reflectors
+        .first()
+        .ok_or_else(|| "at least one reflector is required".to_string())?;
+    let interval_s = cfg.reflector_ping_interval_s.ceil().max(1.0) as u64;
+
+    let mut cmd = Command::new("ping");
+    cmd.arg("-n")
+        .arg("-i")
+        .arg(interval_s.to_string())
+        .arg("-W")
+        .arg("10");
+
+    for arg in safe_extra_args(&cfg.ping_extra_args) {
+        cmd.arg(arg);
+    }
+
+    cmd.arg(target)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to start ping: {e}"))
+}
+
 fn stop_child(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+fn parse_sample_line(cfg: &Config, line: &str, ping_reflector: &str) -> Option<Sample> {
+    match cfg.pinger_method.as_str() {
+        "ping" => parse_ping_line(line, ping_reflector),
+        _ => parse_fping_line(line),
+    }
 }
 
 fn parse_fping_line(line: &str) -> Option<Sample> {
@@ -1052,6 +1339,67 @@ fn parse_fping_line(line: &str) -> Option<Sample> {
     }
 
     None
+}
+
+fn parse_ping_line(line: &str, reflector: &str) -> Option<Sample> {
+    if reflector.is_empty() {
+        return None;
+    }
+
+    let rtt_ms = parse_ping_number_after(line, "time=")
+        .or_else(|| parse_ping_number_after(line, "time<"))?;
+    let seq = parse_ping_token_after(line, "icmp_seq=")
+        .or_else(|| parse_ping_token_after(line, "seq="))
+        .unwrap_or_else(|| "0".to_string());
+
+    Some(Sample {
+        reflector: reflector.to_string(),
+        seq,
+        timestamp: epoch_secs(),
+        rtt_ms,
+    })
+}
+
+fn parse_ping_number_after(line: &str, marker: &str) -> Option<f64> {
+    let start = line.find(marker)? + marker.len();
+    let value: String = line[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
+        .collect();
+
+    if value.is_empty() {
+        None
+    } else {
+        value.parse::<f64>().ok()
+    }
+}
+
+fn parse_ping_token_after(line: &str, marker: &str) -> Option<String> {
+    let start = line.find(marker)? + marker.len();
+    let value: String = line[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        .collect();
+
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn safe_extra_args(value: &str) -> Vec<String> {
+    value
+        .split_whitespace()
+        .filter(|arg| {
+            !arg.is_empty()
+                && arg.len() <= 64
+                && arg.chars().all(|ch| {
+                    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '/' | '=')
+                })
+        })
+        .map(str::to_string)
+        .collect()
 }
 
 fn fetch_url_text(url: &str) -> Result<String, String> {
@@ -1132,6 +1480,61 @@ fn stable_hash(value: &str) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+fn read_cpu_snapshot() -> io::Result<CpuSnapshot> {
+    let data = fs::read_to_string("/proc/stat")?;
+    let mut counters = Vec::new();
+    let mut raw_lines = Vec::new();
+
+    for line in data.lines() {
+        if !line.starts_with("cpu") {
+            continue;
+        }
+
+        let mut parts = line.split_whitespace();
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        if name != "cpu" && !name[3..].chars().all(|ch| ch.is_ascii_digit()) {
+            continue;
+        }
+
+        let values: Vec<u64> = parts
+            .filter_map(|value| value.parse::<u64>().ok())
+            .collect();
+        if values.len() < 4 {
+            continue;
+        }
+
+        let idle = values
+            .get(3)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(values.get(4).copied().unwrap_or(0));
+        let total = values.iter().copied().sum();
+
+        counters.push(CpuCounters { total, idle });
+        raw_lines.push(line.to_string());
+    }
+
+    Ok(CpuSnapshot {
+        counters,
+        raw_lines,
+    })
+}
+
+fn rotated_log_path(path: &Path) -> PathBuf {
+    let timestamp = epoch_secs().round().max(0.0) as u64;
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("cake-autorate.log");
+    let rotated = format!("{name}.{timestamp}");
+
+    path.parent()
+        .map(|parent| parent.join(&rotated))
+        .unwrap_or_else(|| PathBuf::from(rotated))
 }
 
 fn ensure_run_dir(path: &Path) -> io::Result<()> {
@@ -1335,6 +1738,27 @@ fn json_escape(input: &str) -> String {
         }
     }
     out
+}
+
+fn json_f64_or_null(value: Option<f64>, precision: usize) -> String {
+    match value {
+        Some(value) if value.is_finite() => format!("{:.*}", precision, value),
+        _ => "null".to_string(),
+    }
+}
+
+fn json_f64_array(values: &[f64], precision: usize) -> String {
+    let out: Vec<String> = values
+        .iter()
+        .map(|value| {
+            if value.is_finite() {
+                format!("{:.*}", precision, value)
+            } else {
+                "null".to_string()
+            }
+        })
+        .collect();
+    format!("[{}]", out.join(","))
 }
 
 fn print_usage() {

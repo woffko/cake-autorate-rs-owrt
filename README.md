@@ -32,14 +32,21 @@ Implemented:
 
 - UCI-based config loading.
 - Multiple enabled UCI sections via procd instances.
-- `fping` reflector probing.
+- `fping` reflector probing plus a basic `pinger_method=ping` fallback.
 - sysfs RX/TX byte counter sampling.
+- optional CPU usage sampling from `/proc/stat`, exposed in logs and status JSON.
 - adaptive rate calculations using delay/load windows.
 - `tc qdisc change ... cake bandwidth ...` shaper updates.
+- daemon log rotation by age/size with best-effort gzip compression.
 - JSON status file under `/var/run/cake-autorate/<instance>/status.json`.
 - LuCI settings page with compact instance rows and modal tabs for detailed settings.
+- LuCI setup wizard for creating instances, importing SQM rates, checking speed
+  test backends, running a router-side speed test, and writing derived limits.
 - LuCI setup tab with the minimum recommended autorate fields from upstream:
   target interface, SQM download/upload, and min/base/max rates per direction.
+- Router-side speed test helper with optional backend autodetection:
+  `librespeed-cli`, `speedtest-go`, configured `iperf3`, then built-in HTTP
+  fallback. Optional backend packages are not hard dependencies.
 - Integrated SQM backend sync: each `cake-autorate` UCI section can own a matching
   `sqm` queue section.
 - Automatic interface preset: selecting the target interface fills
@@ -50,10 +57,11 @@ Implemented:
 
 Known limits:
 
-- Only `pinger_method=fping` is implemented.
-- `fping-ts`, `tsping`, `irtt`, and plain `ping` backends are not implemented.
-- advanced multi-WAN policy, reflector replacement, health scoring, CPU stats,
-  log export/compression, and MQTT integration are placeholders or not implemented.
+- `pinger_method=ping` probes only the first selected reflector; use `fping` for
+  concurrent reflector probing.
+- `fping-ts`, `tsping`, and `irtt` pinger backends are not implemented.
+- active reflector replacement/health scoring, advanced multi-WAN policy, log
+  bundle export, and MQTT integration are placeholders or not implemented.
 
 SQM integration:
 
@@ -72,6 +80,8 @@ SQM integration:
 - `cake-autorate` UCI sections are the user-facing source of truth; the init
   script synchronizes matching `sqm` queue sections before starting SQM and
   autorate.
+- Disabled `cake-autorate` sections do not mirror into SQM even when
+  `manage_sqm=1`; stale owned SQM sections are cleaned up instead.
 - Multiple interface/queue pairs are represented as multiple `cake_autorate`
   sections and shown in one compact LuCI grid.
 
@@ -90,6 +100,19 @@ LuCI package dependencies:
 
 `sqm-scripts` pulls the required `tc`, CAKE, IFB, iptables, and related shaping
 packages on OpenWrt.
+
+Optional speed test backend packages:
+
+- `librespeed-cli`
+- `speedtest-go`
+- `iperf3`
+- `jsonfilter` is required to parse CLI backend JSON and is installed by the
+  LuCI helper when installing an optional backend.
+
+The LuCI Speed Test tab and setup wizard show backend availability and can run
+`apk add` for the selected optional backend. The built-in HTTP backend requires
+`curl`, `uclient-fetch`, or `wget`; it does not require an extra speed test
+package.
 
 ## Build In OpenWrt SDK
 
@@ -140,6 +163,12 @@ Install backend dependencies if they are not already present:
 apk add fping sqm-scripts
 ```
 
+Optional speed test backends can be installed from LuCI or manually:
+
+```sh
+apk add librespeed-cli speedtest-go iperf3 jsonfilter
+```
+
 Then edit `/etc/config/cake-autorate` or use LuCI:
 
 ```sh
@@ -155,6 +184,7 @@ uci commit cake-autorate
 cake-autorated --instance primary --dump-config
 cake-autorated --instance primary --once
 cat /var/run/cake-autorate/primary/status.json
+/usr/libexec/cake-autorate-rs/speedtest primary "" status auto
 ```
 
 For a no-shaper smoke test, disable both shaper adjustment flags:
@@ -165,6 +195,11 @@ uci set cake-autorate.primary.adjust_ul_shaper_rate='0'
 uci commit cake-autorate
 cake-autorated --instance primary --once
 ```
+
+For `ping` fallback and CPU/log smoke tests, use a temporary disabled-rate
+instance with explicit counter paths, `adjust_dl_shaper_rate='0'`,
+`adjust_ul_shaper_rate='0'`, `pinger_method='ping'`, `output_cpu_stats='1'`,
+and a temporary `log_file_path_override`.
 
 ## Development Notes
 

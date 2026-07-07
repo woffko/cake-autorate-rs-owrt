@@ -23,6 +23,14 @@ function formatRate(value) {
 	return value.toFixed(0) + ' kbps';
 }
 
+function formatPercent(value) {
+	if (value == null)
+		return '-';
+
+	value = Number(value);
+	return isNaN(value) ? '-' : value.toFixed(1) + '%';
+}
+
 function renderTable(sections, statuses) {
 	var rows = [];
 	var children;
@@ -39,7 +47,8 @@ function renderTable(sections, statuses) {
 			formatRate(st.dl_achieved_rate_kbps),
 			formatRate(st.ul_achieved_rate_kbps),
 			formatRate(st.cake_dl_rate_kbps),
-			formatRate(st.cake_ul_rate_kbps)
+			formatRate(st.cake_ul_rate_kbps),
+			formatPercent(st.cpu_total_percent)
 		]);
 	}
 
@@ -52,7 +61,8 @@ function renderTable(sections, statuses) {
 			E('th', { 'class': 'th' }, _('DL achieved')),
 			E('th', { 'class': 'th' }, _('UL achieved')),
 			E('th', { 'class': 'th' }, _('CAKE DL')),
-			E('th', { 'class': 'th' }, _('CAKE UL'))
+			E('th', { 'class': 'th' }, _('CAKE UL')),
+			E('th', { 'class': 'th' }, _('CPU'))
 		])
 	];
 
@@ -63,7 +73,7 @@ function renderTable(sections, statuses) {
 			})));
 	} else {
 		children.push(E('tr', { 'class': 'tr' }, [
-			E('td', { 'class': 'td', 'colspan': '8' }, _('No instances configured.'))
+			E('td', { 'class': 'td', 'colspan': '9' }, _('No instances configured.'))
 		]));
 	}
 
