@@ -22,6 +22,7 @@ var optionDescriptions = {
 	sqm_upload: 'SQM upload bandwidth in kbit/s. This also seeds the autorate base and max upload rates.',
 	speedtest_apply_percent: 'Percentage of measured throughput to write into SQM and autorate limits. 90 leaves headroom for CAKE.',
 	_speedtest: 'Run a router-side speed test and fill SQM plus autorate limits from the measured throughput.',
+	_wizard_sqm_queue: 'Existing unmanaged SQM queues on the selected interface are reused to avoid duplicate shapers.',
 	manual_rate_limits: 'Show explicit min, base, and max autorate limits. Leave off to derive them from download and upload speeds.',
 	advanced_settings: 'Show detailed SQM, reflector, controller, logging, and daemon tuning settings.',
 	min_dl_shaper_rate_kbps: 'Lowest download shaper rate autorate may apply, in kbit/s.',
@@ -313,7 +314,7 @@ function ifbForWan(wan_if) {
 }
 
 function findSqmQueueForInterface(iface) {
-	var queues;
+	var queues, fallback = null;
 
 	if (!iface)
 		return null;
@@ -321,11 +322,18 @@ function findSqmQueueForInterface(iface) {
 	iface = normalizeInterfaceName(iface);
 
 	queues = uci.sections('sqm', 'queue') || [];
-	for (var i = 0; i < queues.length; i++)
-		if (normalizeInterfaceName(queues[i].interface) === iface)
+	for (var i = 0; i < queues.length; i++) {
+		if (normalizeInterfaceName(queues[i].interface) !== iface)
+			continue;
+
+		if (!queues[i]._cake_autorate_managed)
 			return queues[i];
 
-	return null;
+		if (!fallback)
+			fallback = queues[i];
+	}
+
+	return fallback;
 }
 
 function rateValue(value, fallback) {
@@ -420,6 +428,7 @@ function applyWanPreset(section_id, wan_if, importRates, section) {
 	setCakeOption(section, section_id, 'sqm_interface', wan_if);
 	setCakeOption(section, section_id, 'ul_if', wan_if);
 	setCakeOption(section, section_id, 'dl_if', ifbForWan(wan_if));
+	applySqmSectionPreset(section_id, wan_if, importRates, section);
 
 	if (importRates)
 		applyRatePreset(section_id, wan_if, true, section);
@@ -524,19 +533,114 @@ function targetInterfaceChoices() {
 	return choices;
 }
 
-function defaultRatesForInterface(wan_if) {
-	var queue = findSqmQueueForInterface(wan_if);
+function managedSqmSectionName(section_id) {
+	return 'cake_' + section_id;
+}
 
-	return {
-		dl: rateValue(queue ? queue.download : null, '20000'),
-		ul: rateValue(queue ? queue.upload : null, '20000')
-	};
+var sqmImportOptionMap = [
+	[ 'sqm_debug_logging', 'debug_logging', '0' ],
+	[ 'sqm_verbosity', 'verbosity', '5' ],
+	[ 'sqm_qdisc', 'qdisc', 'cake' ],
+	[ 'sqm_script', 'script', 'piece_of_cake.qos' ],
+	[ 'sqm_qdisc_advanced', 'qdisc_advanced', '0' ],
+	[ 'sqm_squash_dscp', 'squash_dscp', '1' ],
+	[ 'sqm_squash_ingress', 'squash_ingress', '1' ],
+	[ 'sqm_ingress_ecn', 'ingress_ecn', 'ECN' ],
+	[ 'sqm_egress_ecn', 'egress_ecn', 'NOECN' ],
+	[ 'sqm_qdisc_really_really_advanced', 'qdisc_really_really_advanced', '0' ],
+	[ 'sqm_ilimit', 'ilimit', '' ],
+	[ 'sqm_elimit', 'elimit', '' ],
+	[ 'sqm_itarget', 'itarget', '' ],
+	[ 'sqm_etarget', 'etarget', '' ],
+	[ 'sqm_iqdisc_opts', 'iqdisc_opts', '' ],
+	[ 'sqm_eqdisc_opts', 'eqdisc_opts', '' ],
+	[ 'sqm_linklayer', 'linklayer', 'none' ],
+	[ 'sqm_overhead', 'overhead', '0' ],
+	[ 'sqm_linklayer_advanced', 'linklayer_advanced', '0' ],
+	[ 'sqm_tcMTU', 'tcMTU', '2047' ],
+	[ 'sqm_tcTSIZE', 'tcTSIZE', '128' ],
+	[ 'sqm_tcMPU', 'tcMPU', '0' ],
+	[ 'sqm_linklayer_adaptation_mechanism', 'linklayer_adaptation_mechanism', 'default' ]
+];
+
+function queueSectionName(queue) {
+	return queue ? queue['.name'] : null;
+}
+
+function findImportableSqmQueueForInterface(iface) {
+	var queues;
+
+	if (!iface)
+		return null;
+
+	iface = normalizeInterfaceName(iface);
+	queues = uci.sections('sqm', 'queue') || [];
+
+	for (var i = 0; i < queues.length; i++) {
+		if (normalizeInterfaceName(queues[i].interface) !== iface)
+			continue;
+
+		if (!queues[i]._cake_autorate_managed)
+			return queues[i];
+	}
+
+	return null;
+}
+
+function applySqmSectionPreset(section_id, wan_if, replaceExisting, section) {
+	var queue = findImportableSqmQueueForInterface(wan_if);
+	var sectionName = queueSectionName(queue) || managedSqmSectionName(section_id);
+
+	if (replaceExisting || !uci.get('cake-autorate', section_id, 'sqm_section'))
+		setCakeOption(section, section_id, 'sqm_section', sectionName);
+
+	if (!queue)
+		return;
+
+	if (replaceExisting || !uci.get('cake-autorate', section_id, 'sqm_enabled'))
+		setCakeOption(section, section_id, 'sqm_enabled', queue.enabled === '1' ? '1' : '0');
+
+	for (var i = 0; i < sqmImportOptionMap.length; i++) {
+		var target = sqmImportOptionMap[i][0];
+		var source = sqmImportOptionMap[i][1];
+		var fallback = sqmImportOptionMap[i][2];
+		var value = rateValue(queue[source], fallback);
+
+		if (value !== '' && (replaceExisting || !uci.get('cake-autorate', section_id, target)))
+			setCakeOption(section, section_id, target, value);
+	}
+}
+
+function importSqmQueueIntoState(state) {
+	var queue = findImportableSqmQueueForInterface(state.wan_if);
+
+	state.imported_sqm_queue = queueSectionName(queue) || '';
+	state.sqm_section = state.imported_sqm_queue || managedSqmSectionName(state.name);
+	state.sqm_enabled = queue ? queue.enabled === '1' : false;
+	state.sqm_download = rateValue(queue ? queue.download : null, '20000');
+	state.sqm_upload = rateValue(queue ? queue.upload : null, '20000');
+
+	for (var i = 0; i < sqmImportOptionMap.length; i++) {
+		var target = sqmImportOptionMap[i][0];
+		var source = sqmImportOptionMap[i][1];
+		var fallback = sqmImportOptionMap[i][2];
+
+		state[target] = rateValue(queue ? queue[source] : null, fallback);
+	}
+}
+
+function wizardSqmQueueText(state) {
+	if (state.imported_sqm_queue)
+		return _('Use existing SQM queue "%s"').format(state.imported_sqm_queue);
+
+	return _('Create managed SQM queue "%s"').format(state.sqm_section);
 }
 
 function writeWizardConfig(section_id, state) {
 	var wan = normalizeInterfaceName(state.wan_if);
 	var dl = rateValue(state.sqm_download, '20000');
 	var ul = rateValue(state.sqm_upload, '20000');
+	var sqmSection = state.sqm_section || managedSqmSectionName(section_id);
 
 	uci.set('cake-autorate', section_id, 'enabled', state.enabled ? '1' : '0');
 	uci.set('cake-autorate', section_id, 'wan_if', wan);
@@ -544,7 +648,7 @@ function writeWizardConfig(section_id, state) {
 	uci.set('cake-autorate', section_id, 'adjust_dl_shaper_rate', '1');
 	uci.set('cake-autorate', section_id, 'adjust_ul_shaper_rate', '1');
 	uci.set('cake-autorate', section_id, 'manage_sqm', '1');
-	uci.set('cake-autorate', section_id, 'sqm_section', 'cake_' + section_id);
+	uci.set('cake-autorate', section_id, 'sqm_section', sqmSection);
 	uci.set('cake-autorate', section_id, 'sqm_enabled', state.sqm_enabled ? '1' : '0');
 	uci.set('cake-autorate', section_id, 'speedtest_apply_percent', String(state.speedtest_apply_percent || '90'));
 	uci.set('cake-autorate', section_id, 'manual_rate_limits', '0');
@@ -560,6 +664,15 @@ function writeWizardConfig(section_id, state) {
 	uci.set('cake-autorate', section_id, 'max_ul_shaper_rate_kbps', ul);
 	uci.set('cake-autorate', section_id, 'min_dl_shaper_rate_kbps', halfRate(dl));
 	uci.set('cake-autorate', section_id, 'min_ul_shaper_rate_kbps', halfRate(ul));
+
+	for (var i = 0; i < sqmImportOptionMap.length; i++) {
+		var key = sqmImportOptionMap[i][0];
+		var fallback = sqmImportOptionMap[i][2];
+		var value = state[key] != null ? state[key] : fallback;
+
+		if (value !== '')
+			uci.set('cake-autorate', section_id, key, String(value));
+	}
 }
 
 function wizardField(label, control, description) {
@@ -625,7 +738,6 @@ function replaceNodeContent(node, children) {
 function showCreateWizard(grid, name) {
 	var choices = targetInterfaceChoices();
 	var defaultWan = defaultTargetInterface();
-	var defaultRates = defaultRatesForInterface(defaultWan);
 	var state = {
 		name: name,
 		step: 0,
@@ -633,8 +745,8 @@ function showCreateWizard(grid, name) {
 		enabled: false,
 		sqm_enabled: false,
 		speedtest_apply_percent: '90',
-		sqm_download: defaultRates.dl,
-		sqm_upload: defaultRates.ul
+		sqm_download: '20000',
+		sqm_upload: '20000'
 	};
 	var body = E('div', { 'class': 'cake-autorate-create-wizard' });
 	var errorNode = E('div', {
@@ -647,11 +759,10 @@ function showCreateWizard(grid, name) {
 		errorNode.style.display = message ? '' : 'none';
 	}
 
-	function syncRatesForInterface() {
-		var rates = defaultRatesForInterface(state.wan_if);
+	importSqmQueueIntoState(state);
 
-		state.sqm_download = rates.dl;
-		state.sqm_upload = rates.ul;
+	function syncSqmForInterface() {
+		importSqmQueueIntoState(state);
 	}
 
 	function stepTitle() {
@@ -678,10 +789,13 @@ function showCreateWizard(grid, name) {
 		var target = wizardSelect(choices, state.wan_if);
 		var enabled = wizardCheckbox(state.enabled);
 		var sqmEnabled = wizardCheckbox(state.sqm_enabled);
+		var queueInfo = E('div', { 'class': 'cbi-value-dummy' }, wizardSqmQueueText(state));
 
 		target.addEventListener('change', function() {
 			state.wan_if = normalizeInterfaceName(target.value);
-			syncRatesForInterface();
+			syncSqmForInterface();
+			queueInfo.textContent = wizardSqmQueueText(state);
+			sqmEnabled.checked = state.sqm_enabled;
 		});
 
 		enabled.addEventListener('change', function() {
@@ -694,6 +808,7 @@ function showCreateWizard(grid, name) {
 
 		return [
 			wizardField(_('Target interface'), target, optionDescriptions.wan_if),
+			wizardField(_('SQM queue'), queueInfo, optionDescriptions._wizard_sqm_queue),
 			wizardField(_('Enable autorate'), enabled, optionDescriptions.enabled),
 			wizardField(_('Enable SQM'), sqmEnabled, optionDescriptions.sqm_enabled)
 		];
@@ -767,8 +882,11 @@ function showCreateWizard(grid, name) {
 		var wan = normalizeInterfaceName(state.wan_if);
 		var rows = [
 			[ _('Target interface'), wan ],
+			[ _('SQM queue'), wizardSqmQueueText(state) ],
 			[ _('Download interface'), ifbForWan(wan) ],
 			[ _('Upload interface'), wan ],
+			[ _('Queueing discipline'), state.sqm_qdisc || 'cake' ],
+			[ _('Queue setup script'), state.sqm_script || 'piece_of_cake.qos' ],
 			[ _('Download speed'), state.sqm_download + ' kbit/s' ],
 			[ _('Upload speed'), state.sqm_upload + ' kbit/s' ],
 			[ _('Min DL rate'), halfRate(state.sqm_download) + ' kbit/s' ],

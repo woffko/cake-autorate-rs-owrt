@@ -149,6 +149,26 @@ set_sqm_optional_option() {
 	fi
 }
 
+cleanup_stale_sqm_sections() {
+	local owner="$1"
+	local keep="$2"
+	local managed_section="cake_$owner"
+	local section
+
+	uci -q show "$SQM_CONFIG" |
+		sed -n "s/^$SQM_CONFIG\\.\\([^.]*\\)\\._cake_autorate_managed='$owner'$/\\1/p" |
+		while IFS= read -r section; do
+			[ -n "$section" ] || continue
+			[ "$section" = "$keep" ] && continue
+
+			if [ "$section" = "$managed_section" ]; then
+				uci -q delete "$SQM_CONFIG.$section"
+			else
+				uci -q delete "$SQM_CONFIG.$section._cake_autorate_managed"
+			fi
+		done
+}
+
 sync_sqm_instance() {
 	local section="$1"
 	local manage_sqm enabled sqm_enabled sqm_section value
@@ -157,6 +177,7 @@ sync_sqm_instance() {
 	[ "$manage_sqm" -eq 1 ] || return 0
 
 	config_get sqm_section "$section" sqm_section "cake_$section"
+	cleanup_stale_sqm_sections "$section" "$sqm_section"
 	uci -q get "$SQM_CONFIG.$sqm_section" >/dev/null || uci set "$SQM_CONFIG.$sqm_section=queue"
 	set_sqm_option "$sqm_section" "_cake_autorate_managed" "$section"
 
