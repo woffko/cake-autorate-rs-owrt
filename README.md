@@ -32,12 +32,12 @@ Implemented:
 
 - UCI-based config loading.
 - Multiple enabled UCI sections via procd instances.
-- `fping` RTT reflector probing, `fping-ts` ICMP timestamp OWD probing, plus a
-  basic `pinger_method=ping` fallback.
+- `fping` RTT reflector probing, `fping-ts` and `tsping` ICMP timestamp OWD
+  probing, plus a basic `pinger_method=ping` fallback.
 - Active reflector health tracking and replacement for running `fping`,
-  `fping-ts`, and `ping` probes: response-deadline offences, baseline/EWMA
-  comparison, periodic replacement, optional reflector stats logging, and
-  pinger restart with the next spare candidate.
+  `fping-ts`, `tsping`, and `ping` probes: response-deadline offences,
+  baseline/EWMA comparison, periodic replacement, optional reflector stats
+  logging, and pinger restart with the next spare candidate.
 - sysfs RX/TX byte counter sampling.
 - optional CPU usage sampling from `/proc/stat`, exposed in logs and status JSON.
 - adaptive rate calculations using delay/load windows.
@@ -65,13 +65,27 @@ Implemented:
 
 Known limits:
 
-- `pinger_method=ping` probes only the first selected reflector; use `fping` for
-  concurrent reflector probing.
-- `tsping` and `irtt` pinger backends are not implemented.
-- `fping-ts` depends on reflectors that answer ICMP timestamp probes; many
-  public DNS anycast reflectors do not.
+- `pinger_method=ping` probes only the first selected reflector; use `fping`,
+  `fping-ts`, or `tsping` for concurrent reflector probing.
+- `irtt` pinger backend is not implemented.
+- `fping-ts` and `tsping` depend on reflectors that answer ICMP timestamp
+  probes; many public DNS anycast reflectors do not.
+- `tsping` is runtime-detected and not a hard package dependency; install a
+  compatible `tsping` binary manually where available before selecting it.
 - reflector health/replacement is implemented as an MVP; `fping-ts` uses
   separate DL/UL OWD samples while RTT backends still use RTT/2 estimates.
+- Planned pinger/reflector wizard work: scan a candidate reflector pool,
+  classify backend availability, choose an upstream-style active set plus spare
+  pool, and keep showing backend/reflector health in LuCI.
+- Use the external LibreQoS Internet Quality Test at https://test.libreqos.com/
+  as a manual browser-side validation tool after configuring autorate. It is
+  intentionally documented only, not integrated into the wizard or router-side
+  speed test backend.
+- Planned pinger install policy: automatically use/install the best viable
+  backend for the detected environment. Prefer `irtt` only when configured IRTT
+  servers are available; otherwise prefer timestamp-capable `fping-ts`/`tsping`
+  when enough reflectors pass the scan; fall back to concurrent `fping`, then
+  single-reflector `ping`.
 - advanced multi-WAN policy, log bundle export, and MQTT integration are
   placeholders or not implemented.
 
@@ -125,6 +139,14 @@ The LuCI Speed Test tab and setup wizard show backend availability and can run
 `apk add` for the selected optional backend. The built-in HTTP backend requires
 `curl`, `uclient-fetch`, or `wget`; it does not require an extra speed test
 package.
+
+Optional pinger backend binaries:
+
+- `tsping`
+
+The daemon accepts `pinger_method=tsping` when the binary is present in PATH.
+It remains optional because no supported OpenWrt package was available on the
+current test router.
 
 ## Build In OpenWrt SDK
 

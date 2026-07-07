@@ -47,7 +47,7 @@ config cake_autorate 'primary'
 	option sqm_tcMPU '0'
 	option sqm_linklayer_adaptation_mechanism 'default'
 
-	# Pinger backend. fping-ts uses ICMP timestamp probes when reflectors support them.
+	# Pinger backend. fping-ts/tsping use ICMP timestamp probes when reflectors support them.
 	option pinger_method 'fping'
 	list reflector '1.1.1.1'
 	list reflector '1.0.0.1'

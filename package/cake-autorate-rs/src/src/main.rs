@@ -566,10 +566,11 @@ impl Config {
     fn validate(&self) -> Result<(), String> {
         if self.pinger_method != "fping"
             && self.pinger_method != "fping-ts"
+            && self.pinger_method != "tsping"
             && self.pinger_method != "ping"
         {
             return Err(format!(
-                "pinger_method={} is configured, but this Rust package currently supports fping, fping-ts, and ping",
+                "pinger_method={} is configured, but this Rust package currently supports fping, fping-ts, tsping, and ping",
                 self.pinger_method
             ));
         }
@@ -1838,6 +1839,7 @@ fn spawn_pinger(cfg: &Config, active_reflectors: &[String]) -> Result<Child, Str
     match cfg.pinger_method.as_str() {
         "fping" => spawn_fping(cfg, active_reflectors, false),
         "fping-ts" => spawn_fping(cfg, active_reflectors, true),
+        "tsping" => spawn_tsping(cfg, active_reflectors),
         "ping" => spawn_ping(cfg, active_reflectors),
         other => Err(format!("unsupported pinger_method={other}")),
     }
@@ -1879,6 +1881,37 @@ fn spawn_fping(
         .map_err(|e| format!("failed to start fping: {e}"))
 }
 
+fn spawn_tsping(cfg: &Config, active_reflectors: &[String]) -> Result<Child, String> {
+    let period_ms = (cfg.reflector_ping_interval_s * 1000.0).round().max(1.0) as u64;
+    let spacing_ms = (period_ms / active_reflectors.len().max(1) as u64).max(1);
+    let sleep_ms = if active_reflectors.len() == 1 {
+        spacing_ms
+    } else {
+        0
+    };
+    let targets: Vec<&str> = active_reflectors.iter().map(String::as_str).collect();
+
+    if targets.is_empty() {
+        return Err("at least one reflector is required".to_string());
+    }
+
+    let mut cmd = Command::new("tsping");
+    for arg in safe_extra_args(&cfg.ping_extra_args) {
+        cmd.arg(arg);
+    }
+    cmd.arg("--print-timestamps")
+        .arg("--machine-readable=,")
+        .arg("--sleep-time")
+        .arg(sleep_ms.to_string())
+        .arg("--target-spacing")
+        .arg(spacing_ms.to_string())
+        .args(targets)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to start tsping: {e}"))
+}
+
 fn spawn_ping(cfg: &Config, active_reflectors: &[String]) -> Result<Child, String> {
     let target = active_reflectors
         .first()
@@ -1912,6 +1945,7 @@ fn parse_sample_line(cfg: &Config, line: &str, ping_reflector: &str) -> Option<S
     match cfg.pinger_method.as_str() {
         "ping" => parse_ping_line(line, ping_reflector),
         "fping-ts" => parse_fping_ts_line(line),
+        "tsping" => parse_tsping_line(line),
         _ => parse_fping_line(line),
     }
 }
@@ -1967,6 +2001,36 @@ fn parse_fping_ts_line(line: &str) -> Option<Sample> {
         seq,
         timestamp,
         rtt_ms,
+        dl_owd_us,
+        ul_owd_us,
+        timestamped_owd: true,
+    })
+}
+
+fn parse_tsping_line(line: &str) -> Option<Sample> {
+    let tokens: Vec<&str> = line
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect();
+
+    if tokens.len() != 10 {
+        return None;
+    }
+
+    let timestamp = tokens[0].parse::<f64>().ok()?;
+    let reflector = tokens[1].trim_end_matches(':').to_string();
+    let seq = tokens[2].to_string();
+    let dl_owd_ms = tokens[8].parse::<f64>().ok()?;
+    let ul_owd_ms = tokens[9].parse::<f64>().ok()?;
+    let dl_owd_us = dl_owd_ms * 1000.0;
+    let ul_owd_us = ul_owd_ms * 1000.0;
+
+    Some(Sample {
+        reflector,
+        seq,
+        timestamp,
+        rtt_ms: dl_owd_ms + ul_owd_ms,
         dl_owd_us,
         ul_owd_us,
         timestamped_owd: true,
@@ -2459,8 +2523,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        next_spare_reflector, parse_fping_ts_line, parse_reflector_candidates, parse_uci_values,
-        ReflectorState,
+        next_spare_reflector, parse_fping_ts_line, parse_reflector_candidates, parse_tsping_line,
+        parse_uci_values, ReflectorState,
     };
     use std::time::Instant;
 
@@ -2508,6 +2572,24 @@ mod tests {
     fn ignores_fping_ts_timeout_line() {
         let line = "[1783449025.44098] 8.8.8.8 : [0], timed out (NaN avg, 100% loss)";
         assert!(parse_fping_ts_line(line).is_none());
+    }
+
+    #[test]
+    fn parses_tsping_machine_readable_line() {
+        let line = "1783449500.123456,127.0.0.1,42,0,0,0,0,0,1.25,2.75";
+        let sample = parse_tsping_line(line).expect("expected tsping sample");
+
+        assert_eq!(sample.reflector, "127.0.0.1");
+        assert_eq!(sample.seq, "42");
+        assert_eq!(sample.rtt_ms, 4.0);
+        assert_eq!(sample.dl_owd_us, 1250.0);
+        assert_eq!(sample.ul_owd_us, 2750.0);
+        assert!(sample.timestamped_owd);
+    }
+
+    #[test]
+    fn ignores_incomplete_tsping_line() {
+        assert!(parse_tsping_line("1783449500.123456,127.0.0.1,42").is_none());
     }
 
     #[test]

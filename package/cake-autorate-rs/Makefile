@@ -4,7 +4,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=cake-autorate-rs
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=11
+PKG_RELEASE:=12
 
 PKG_MAINTAINER:=woffko
 PKG_LICENSE:=GPL-2.0-or-later
@@ -26,8 +26,9 @@ endef
 
 define Package/cake-autorate-rs/description
   Rust daemon prototype for cake-autorate on OpenWrt. The first backend
-  supports UCI configuration, fping/fping-ts/ping probing, sysfs byte counters,
-  tc-based CAKE shaper updates, procd service integration, and LuCI status.
+  supports UCI configuration, fping/fping-ts/tsping/ping probing, sysfs byte
+  counters, tc-based CAKE shaper updates, procd service integration, and LuCI
+  status.
 endef
 
 define Package/cake-autorate-rs/conffiles
