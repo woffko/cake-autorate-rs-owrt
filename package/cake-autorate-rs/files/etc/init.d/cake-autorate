@@ -23,6 +23,59 @@ set_cake_option_if_changed() {
 	CAKE_CONFIG_CHANGED=1
 }
 
+set_cake_option_if_empty() {
+	local section="$1"
+	local option="$2"
+	local value="$3"
+	local current
+
+	[ -n "$value" ] || return 0
+
+	config_get current "$section" "$option"
+	[ -n "$current" ] && return 0
+
+	uci set "$CONFIG.$section.$option=$value"
+	CAKE_CONFIG_CHANGED=1
+}
+
+half_rate_kbps() {
+	local value="$1"
+
+	case "$value" in
+		''|*[!0-9]*)
+			printf '%s\n' "$value"
+			;;
+		*)
+			printf '%s\n' $(( (value + 1) / 2 ))
+			;;
+	esac
+}
+
+resolve_interface_device() {
+	local name="$1"
+	local status dev
+
+	[ -n "$name" ] || return 1
+
+	if [ -e "/sys/class/net/$name" ]; then
+		printf '%s\n' "$name"
+		return 0
+	fi
+
+	status="$(ubus call network.interface."$name" status 2>/dev/null)"
+	if [ -n "$status" ] && command -v jsonfilter >/dev/null 2>&1; then
+		dev="$(printf '%s\n' "$status" | jsonfilter -e '@.l3_device' 2>/dev/null)"
+		[ -n "$dev" ] || dev="$(printf '%s\n' "$status" | jsonfilter -e '@.device' 2>/dev/null)"
+
+		if [ -n "$dev" ] && [ -e "/sys/class/net/$dev" ]; then
+			printf '%s\n' "$dev"
+			return 0
+		fi
+	fi
+
+	printf '%s\n' "$name"
+}
+
 sync_interface_preset_instance() {
 	local section="$1"
 	local auto wan
@@ -34,6 +87,7 @@ sync_interface_preset_instance() {
 	[ -n "$wan" ] || config_get wan "$section" sqm_interface
 	[ -n "$wan" ] || config_get wan "$section" ul_if
 	[ -n "$wan" ] || return 0
+	wan="$(resolve_interface_device "$wan")"
 
 	set_cake_option_if_changed "$section" wan_if "$wan"
 	set_cake_option_if_changed "$section" sqm_interface "$wan"
@@ -41,9 +95,34 @@ sync_interface_preset_instance() {
 	set_cake_option_if_changed "$section" dl_if "ifb4$wan"
 }
 
+sync_rate_preset_instance() {
+	local section="$1"
+	local manual dl ul
+
+	config_get_bool manual "$section" manual_rate_limits 0
+	[ "$manual" -eq 0 ] || return 0
+
+	config_get dl "$section" sqm_download
+	[ -n "$dl" ] || config_get dl "$section" base_dl_shaper_rate_kbps
+	if [ -n "$dl" ]; then
+		set_cake_option_if_empty "$section" base_dl_shaper_rate_kbps "$dl"
+		set_cake_option_if_empty "$section" max_dl_shaper_rate_kbps "$dl"
+		set_cake_option_if_empty "$section" min_dl_shaper_rate_kbps "$(half_rate_kbps "$dl")"
+	fi
+
+	config_get ul "$section" sqm_upload
+	[ -n "$ul" ] || config_get ul "$section" base_ul_shaper_rate_kbps
+	if [ -n "$ul" ]; then
+		set_cake_option_if_empty "$section" base_ul_shaper_rate_kbps "$ul"
+		set_cake_option_if_empty "$section" max_ul_shaper_rate_kbps "$ul"
+		set_cake_option_if_empty "$section" min_ul_shaper_rate_kbps "$(half_rate_kbps "$ul")"
+	fi
+}
+
 sync_interface_presets() {
 	CAKE_CONFIG_CHANGED=0
 	config_foreach sync_interface_preset_instance cake_autorate
+	config_foreach sync_rate_preset_instance cake_autorate
 	[ "$CAKE_CONFIG_CHANGED" -eq 1 ] || return 0
 
 	uci commit "$CONFIG"
@@ -87,6 +166,7 @@ sync_sqm_instance() {
 
 	config_get value "$section" sqm_interface
 	[ -n "$value" ] || config_get value "$section" ul_if
+	value="$(resolve_interface_device "$value")"
 	set_sqm_option "$sqm_section" interface "$value"
 
 	config_get value "$section" sqm_download

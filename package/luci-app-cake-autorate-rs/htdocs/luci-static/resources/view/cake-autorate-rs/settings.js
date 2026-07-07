@@ -125,6 +125,12 @@ var optionDescriptions = {
 	tx_bytes_path: 'Override path for the upload TX byte counter. Leave empty to use /sys/class/net.'
 };
 
+var interfaceContext = {
+	deviceNames: {},
+	networkDevices: {},
+	defaultDevice: 'wan'
+};
+
 function describe(option, key) {
 	var description = optionDescriptions[key];
 
@@ -177,6 +183,72 @@ function iface(section, tab, key, title) {
 	return o;
 }
 
+function buildInterfaceContext(devices, networks) {
+	var ctx = {
+		deviceNames: {},
+		networkDevices: {},
+		defaultDevice: null
+	};
+
+	for (var i = 0; i < devices.length; i++) {
+		var devName = devices[i].getName();
+		var devType = devices[i].getType();
+
+		if (!devName || devName === 'lo' || devType === 'alias')
+			continue;
+
+		ctx.deviceNames[devName] = true;
+
+		if (!ctx.defaultDevice)
+			ctx.defaultDevice = devName;
+
+		if (devices[i].isUp && devices[i].isUp() && !ctx.firstUpDevice)
+			ctx.firstUpDevice = devName;
+	}
+
+	for (i = 0; i < networks.length; i++) {
+		var netName = networks[i].getName();
+		var ifName = networks[i].getIfname();
+
+		if (!netName || !ifName)
+			continue;
+
+		if (ifName.charAt(0) === '@')
+			ifName = ifName.substring(1);
+
+		ctx.networkDevices[netName] = ifName;
+	}
+
+	ctx.defaultDevice = ctx.networkDevices.wan ||
+		ctx.networkDevices.wwan ||
+		ctx.networkDevices.wan6 ||
+		ctx.firstUpDevice ||
+		ctx.defaultDevice ||
+		'wan';
+
+	return ctx;
+}
+
+function normalizeInterfaceName(name) {
+	var mapped;
+
+	if (!name)
+		return name;
+
+	if (name.charAt(0) === '@')
+		name = name.substring(1);
+
+	mapped = interfaceContext.networkDevices[name];
+	if (mapped && mapped !== name)
+		return normalizeInterfaceName(mapped);
+
+	return name;
+}
+
+function defaultTargetInterface() {
+	return normalizeInterfaceName(interfaceContext.defaultDevice || 'wan');
+}
+
 function listValue(section, tab, key, title, values, defaultValue) {
 	var o = section.taboption(tab, form.ListValue, key, title);
 	modal(o);
@@ -195,18 +267,18 @@ function listValue(section, tab, key, title, values, defaultValue) {
 
 function selectedWan(section, section_id, fallback, useFormValue) {
 	if (fallback)
-		return fallback;
+		return normalizeInterfaceName(fallback);
 
 	if (useFormValue && section && typeof section.formvalue == 'function') {
 		var formValue = section.formvalue(section_id, 'wan_if');
 		if (formValue)
-			return formValue;
+			return normalizeInterfaceName(formValue);
 	}
 
-	return uci.get('cake-autorate', section_id, 'wan_if') ||
+	return normalizeInterfaceName(uci.get('cake-autorate', section_id, 'wan_if') ||
 		uci.get('cake-autorate', section_id, 'sqm_interface') ||
 		uci.get('cake-autorate', section_id, 'ul_if') ||
-		'wan';
+		defaultTargetInterface());
 }
 
 function autoInterfacePresetEnabled(section, section_id) {
@@ -243,9 +315,11 @@ function findSqmQueueForInterface(iface) {
 	if (!iface)
 		return null;
 
+	iface = normalizeInterfaceName(iface);
+
 	queues = uci.sections('sqm', 'queue') || [];
 	for (var i = 0; i < queues.length; i++)
-		if (queues[i].interface === iface)
+		if (normalizeInterfaceName(queues[i].interface) === iface)
 			return queues[i];
 
 	return null;
@@ -304,6 +378,8 @@ function applyRatePreset(section_id, wan_if, replaceExisting) {
 }
 
 function applyWanPreset(section_id, wan_if, importRates) {
+	wan_if = normalizeInterfaceName(wan_if);
+
 	if (!wan_if)
 		return;
 
@@ -335,6 +411,8 @@ function requireAdvancedSettings(section) {
 		if (!option.modalonly || !option.tab || option.tab === 'setup')
 			continue;
 
+		option.retain = true;
+
 		if (option.deps && option.deps.length) {
 			for (var j = 0; j < option.deps.length; j++)
 				option.deps[j].advanced_settings = '1';
@@ -355,7 +433,7 @@ function addSetupOptions(section) {
 	flag(section, 'setup', 'enabled', _('Enable autorate'));
 
 	o = iface(section, 'setup', 'wan_if', _('Target interface'));
-	o.default = 'wan';
+	o.default = defaultTargetInterface();
 	o.forcewrite = true;
 	o.cfgvalue = function(section_id) {
 		return selectedWan(null, section_id);
@@ -365,6 +443,8 @@ function addSetupOptions(section) {
 			applyWanPreset(section_id, value, true);
 	};
 	o.write = function(section_id, formvalue) {
+		formvalue = normalizeInterfaceName(formvalue);
+
 		var previous = selectedWan(null, section_id);
 		var importRates = previous !== formvalue ||
 			!uci.get('cake-autorate', section_id, 'sqm_download') ||
@@ -436,21 +516,27 @@ function addSetupOptions(section) {
 
 	o = value(section, 'setup', 'min_dl_shaper_rate_kbps', _('Min DL rate'), 'uinteger', '5000');
 	o.depends('manual_rate_limits', '1');
+	o.retain = true;
 
 	o = value(section, 'setup', 'base_dl_shaper_rate_kbps', _('Base DL rate'), 'uinteger', '20000');
 	o.depends('manual_rate_limits', '1');
+	o.retain = true;
 
 	o = value(section, 'setup', 'max_dl_shaper_rate_kbps', _('Max DL rate'), 'uinteger', '80000');
 	o.depends('manual_rate_limits', '1');
+	o.retain = true;
 
 	o = value(section, 'setup', 'min_ul_shaper_rate_kbps', _('Min UL rate'), 'uinteger', '5000');
 	o.depends('manual_rate_limits', '1');
+	o.retain = true;
 
 	o = value(section, 'setup', 'base_ul_shaper_rate_kbps', _('Base UL rate'), 'uinteger', '20000');
 	o.depends('manual_rate_limits', '1');
+	o.retain = true;
 
 	o = value(section, 'setup', 'max_ul_shaper_rate_kbps', _('Max UL rate'), 'uinteger', '35000');
 	o.depends('manual_rate_limits', '1');
+	o.retain = true;
 }
 
 function addInterfaceOptions(section) {
@@ -719,6 +805,7 @@ return L.view.extend({
 	load: function() {
 		return Promise.all([
 			network.getDevices(),
+			network.getNetworks(),
 			L.resolveDefault(fs.list('/var/run/sqm/available_qdiscs'), []),
 			loadSqmScripts(),
 			uci.load('cake-autorate'),
@@ -728,8 +815,10 @@ return L.view.extend({
 
 	render: function(data) {
 		var m, s;
-		var qdiscs = data[1];
-		var scripts = data[2];
+		var qdiscs = data[2];
+		var scripts = data[3];
+
+		interfaceContext = buildInterfaceContext(data[0], data[1]);
 
 		m = new form.Map('cake-autorate', _('CAKE Autorate'));
 		s = m.section(form.GridSection, 'cake_autorate', _('Instances'));
