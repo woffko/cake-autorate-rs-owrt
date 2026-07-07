@@ -4,6 +4,18 @@ OpenWrt package bundle for a Rust prototype of `cake-autorate` with a LuCI UI an
 
 The current target is OpenWrt 25.12.5 on `x86/64`. The daemon is intentionally kept small and currently uses only the Rust standard library plus OpenWrt userland tools.
 
+## Repository Layout
+
+This repository is organized as an OpenWrt package feed/SDK overlay. Each package directory follows the OpenWrt package documentation layout:
+
+```text
+package/<package-name>/Makefile
+package/<package-name>/files/
+package/<package-name>/src/
+```
+
+`files/` contains installed default config, init scripts, LuCI menu/ACL files, and LuCI views. `src/` contains bundled application source; OpenWrt explicitly supports bundled source code inside a package directory, commonly under `src/`.
+
 ## Contents
 
 - `package/cake-autorate-rs` - Rust daemon package.
@@ -58,17 +70,26 @@ LuCI package dependencies:
 
 Use a clean OpenWrt 25.12.5 x86_64 SDK. The Rust feed builds a large host Rust/LLVM toolchain on first use, so cache the SDK or use a prepared build image for normal iteration.
 
-Example layout:
+Recommended feed workflow:
+
+```sh
+cd /path/to/openwrt-sdk
+cp feeds.conf.default feeds.conf
+cat /path/to/cake-autorate-rs/feeds.conf.example >> feeds.conf
+./scripts/feeds update packages luci
+./scripts/feeds update cake_autorate_rs
+./scripts/feeds install rust fping luci-base
+./scripts/feeds install cake-autorate-rs luci-app-cake-autorate-rs
+make defconfig
+make package/cake-autorate-rs/compile V=s -j1
+make package/luci-app-cake-autorate-rs/compile V=s -j1
+```
+
+Overlay workflow during local development:
 
 ```sh
 cp -a package/cake-autorate-rs /path/to/openwrt-sdk/package/
 cp -a package/luci-app-cake-autorate-rs /path/to/openwrt-sdk/package/
-cd /path/to/openwrt-sdk
-./scripts/feeds update packages luci
-./scripts/feeds install rust fping luci-base
-make defconfig
-make package/cake-autorate-rs/compile V=s -j1
-make package/luci-app-cake-autorate-rs/compile V=s -j1
 ```
 
 Enable packages in `.config` when building as modules:
