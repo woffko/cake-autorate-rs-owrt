@@ -6,6 +6,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static TERMINATE: AtomicBool = AtomicBool::new(false);
@@ -41,8 +43,17 @@ struct Config {
     reflectors_url: String,
     reflectors_url_skip_lines: usize,
     randomize_reflectors: bool,
+    retain_reflector_stats: bool,
     no_pingers: usize,
     reflector_ping_interval_s: f64,
+    reflector_health_check_interval_s: f64,
+    reflector_response_deadline_s: f64,
+    reflector_misbehaving_detection_window: usize,
+    reflector_misbehaving_detection_thr: usize,
+    reflector_replacement_interval_mins: f64,
+    reflector_comparison_interval_mins: f64,
+    reflector_sum_owd_baselines_delta_thr_ms: f64,
+    reflector_owd_delta_ewma_delta_thr_ms: f64,
     monitor_achieved_rates_interval_ms: u64,
     bufferbloat_detection_window: usize,
     bufferbloat_detection_thr: usize,
@@ -66,6 +77,7 @@ struct Config {
     decay_refractory_period_ms: u64,
     output_summary_stats: bool,
     output_load_stats: bool,
+    output_reflector_stats: bool,
     output_cake_changes: bool,
     output_cpu_stats: bool,
     output_cpu_raw_stats: bool,
@@ -111,8 +123,17 @@ impl Config {
             reflectors_url: String::new(),
             reflectors_url_skip_lines: 1,
             randomize_reflectors: true,
+            retain_reflector_stats: true,
             no_pingers: 6,
             reflector_ping_interval_s: 0.3,
+            reflector_health_check_interval_s: 1.0,
+            reflector_response_deadline_s: 1.0,
+            reflector_misbehaving_detection_window: 60,
+            reflector_misbehaving_detection_thr: 3,
+            reflector_replacement_interval_mins: 60.0,
+            reflector_comparison_interval_mins: 1.0,
+            reflector_sum_owd_baselines_delta_thr_ms: 20.0,
+            reflector_owd_delta_ewma_delta_thr_ms: 10.0,
             monitor_achieved_rates_interval_ms: 200,
             bufferbloat_detection_window: 6,
             bufferbloat_detection_thr: 3,
@@ -136,6 +157,7 @@ impl Config {
             decay_refractory_period_ms: 1000,
             output_summary_stats: true,
             output_load_stats: false,
+            output_reflector_stats: false,
             output_cake_changes: false,
             output_cpu_stats: false,
             output_cpu_raw_stats: false,
@@ -268,11 +290,56 @@ impl Config {
             "randomize_reflectors",
             &mut cfg.randomize_reflectors,
         )?;
+        set_bool(
+            &single,
+            "retain_reflector_stats",
+            &mut cfg.retain_reflector_stats,
+        )?;
         set_usize(&single, "no_pingers", &mut cfg.no_pingers)?;
         set_f64(
             &single,
             "reflector_ping_interval_s",
             &mut cfg.reflector_ping_interval_s,
+        )?;
+        set_f64(
+            &single,
+            "reflector_health_check_interval_s",
+            &mut cfg.reflector_health_check_interval_s,
+        )?;
+        set_f64(
+            &single,
+            "reflector_response_deadline_s",
+            &mut cfg.reflector_response_deadline_s,
+        )?;
+        set_usize(
+            &single,
+            "reflector_misbehaving_detection_window",
+            &mut cfg.reflector_misbehaving_detection_window,
+        )?;
+        set_usize(
+            &single,
+            "reflector_misbehaving_detection_thr",
+            &mut cfg.reflector_misbehaving_detection_thr,
+        )?;
+        set_f64(
+            &single,
+            "reflector_replacement_interval_mins",
+            &mut cfg.reflector_replacement_interval_mins,
+        )?;
+        set_f64(
+            &single,
+            "reflector_comparison_interval_mins",
+            &mut cfg.reflector_comparison_interval_mins,
+        )?;
+        set_f64(
+            &single,
+            "reflector_sum_owd_baselines_delta_thr_ms",
+            &mut cfg.reflector_sum_owd_baselines_delta_thr_ms,
+        )?;
+        set_f64(
+            &single,
+            "reflector_owd_delta_ewma_delta_thr_ms",
+            &mut cfg.reflector_owd_delta_ewma_delta_thr_ms,
         )?;
         set_u64(
             &single,
@@ -377,6 +444,11 @@ impl Config {
             &mut cfg.output_summary_stats,
         )?;
         set_bool(&single, "output_load_stats", &mut cfg.output_load_stats)?;
+        set_bool(
+            &single,
+            "output_reflector_stats",
+            &mut cfg.output_reflector_stats,
+        )?;
         set_bool(&single, "output_cake_changes", &mut cfg.output_cake_changes)?;
         set_bool(&single, "output_cpu_stats", &mut cfg.output_cpu_stats)?;
         set_bool(
@@ -513,6 +585,9 @@ impl Config {
         if self.no_pingers == 0 {
             return Err("no_pingers must be greater than zero".to_string());
         }
+        if self.pinger_method == "ping" && self.no_pingers > 1 {
+            return Err("pinger_method=ping supports only no_pingers=1".to_string());
+        }
         if self.no_pingers > self.reflectors.len() {
             return Err("no_pingers cannot exceed reflector count".to_string());
         }
@@ -520,6 +595,48 @@ impl Config {
             return Err(
                 "bufferbloat_detection_thr cannot exceed bufferbloat_detection_window".to_string(),
             );
+        }
+        if self.reflector_health_check_interval_s <= 0.0 {
+            return Err("reflector_health_check_interval_s must be greater than zero".to_string());
+        }
+        if self.reflector_response_deadline_s <= 0.0 {
+            return Err("reflector_response_deadline_s must be greater than zero".to_string());
+        }
+        if self.reflector_response_deadline_s < self.reflector_ping_interval_s {
+            return Err(
+                "reflector_response_deadline_s cannot be lower than reflector_ping_interval_s"
+                    .to_string(),
+            );
+        }
+        if self.reflector_misbehaving_detection_window == 0 {
+            return Err(
+                "reflector_misbehaving_detection_window must be greater than zero".to_string(),
+            );
+        }
+        if self.reflector_misbehaving_detection_thr == 0 {
+            return Err(
+                "reflector_misbehaving_detection_thr must be greater than zero".to_string(),
+            );
+        }
+        if self.reflector_misbehaving_detection_thr > self.reflector_misbehaving_detection_window {
+            return Err(
+                "reflector_misbehaving_detection_thr cannot exceed reflector_misbehaving_detection_window"
+                    .to_string(),
+            );
+        }
+        if self.reflector_replacement_interval_mins < 0.0 {
+            return Err("reflector_replacement_interval_mins must not be negative".to_string());
+        }
+        if self.reflector_comparison_interval_mins < 0.0 {
+            return Err("reflector_comparison_interval_mins must not be negative".to_string());
+        }
+        if self.reflector_sum_owd_baselines_delta_thr_ms < 0.0 {
+            return Err(
+                "reflector_sum_owd_baselines_delta_thr_ms must not be negative".to_string(),
+            );
+        }
+        if self.reflector_owd_delta_ewma_delta_thr_ms < 0.0 {
+            return Err("reflector_owd_delta_ewma_delta_thr_ms must not be negative".to_string());
         }
         if self.dl_if == self.ul_if {
             return Err("dl_if and ul_if must be different".to_string());
@@ -541,12 +658,358 @@ impl Config {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Sample {
     reflector: String,
     seq: String,
     timestamp: f64,
     rtt_ms: f64,
+}
+
+#[derive(Debug)]
+struct ReflectorState {
+    last_seen: Instant,
+    offences: VecDeque<bool>,
+    offence_sum: usize,
+    samples: u64,
+    last_rtt_ms: f64,
+}
+
+impl ReflectorState {
+    fn new(now: Instant, window: usize) -> Self {
+        Self {
+            last_seen: now,
+            offences: filled_bool_window(window),
+            offence_sum: 0,
+            samples: 0,
+            last_rtt_ms: 0.0,
+        }
+    }
+
+    fn push_offence(&mut self, offence: bool) {
+        if self.offences.len() == self.offences.capacity() {
+            if self.offences.pop_front().unwrap_or(false) {
+                self.offence_sum = self.offence_sum.saturating_sub(1);
+            }
+        }
+
+        self.offences.push_back(offence);
+        if offence {
+            self.offence_sum = self.offence_sum.saturating_add(1);
+        }
+    }
+}
+
+struct ReflectorHealth {
+    states: HashMap<String, ReflectorState>,
+    last_health_check: Instant,
+    last_replacement: Instant,
+    last_comparison: Instant,
+    next_candidate_idx: usize,
+    replacement_slot: usize,
+}
+
+impl ReflectorHealth {
+    fn new(cfg: &Config, active: &[String]) -> Self {
+        let now = Instant::now();
+        let mut states = HashMap::new();
+
+        for reflector in active {
+            states.insert(
+                reflector.clone(),
+                ReflectorState::new(now, cfg.reflector_misbehaving_detection_window),
+            );
+        }
+
+        Self {
+            states,
+            last_health_check: now,
+            last_replacement: now,
+            last_comparison: now,
+            next_candidate_idx: active.len(),
+            replacement_slot: 0,
+        }
+    }
+
+    fn observe_sample(&mut self, cfg: &Config, sample: &Sample) {
+        let now = Instant::now();
+        let state = self
+            .states
+            .entry(sample.reflector.clone())
+            .or_insert_with(|| {
+                ReflectorState::new(now, cfg.reflector_misbehaving_detection_window)
+            });
+        state.last_seen = now;
+        state.samples = state.samples.saturating_add(1);
+        state.last_rtt_ms = sample.rtt_ms;
+
+        let late = sample.rtt_ms > cfg.reflector_response_deadline_s * 1000.0;
+        if late {
+            state.push_offence(true);
+        }
+    }
+
+    fn timeout(&self, cfg: &Config) -> Duration {
+        let interval = Duration::from_secs_f64(cfg.reflector_health_check_interval_s.max(0.1));
+        interval
+            .checked_sub(self.last_health_check.elapsed())
+            .unwrap_or_else(|| Duration::from_millis(1))
+            .min(Duration::from_secs(1))
+    }
+
+    fn check(&mut self, cfg: &Config, active: &mut [String], controller: &mut Controller) -> bool {
+        let now = Instant::now();
+        let health_interval =
+            Duration::from_secs_f64(cfg.reflector_health_check_interval_s.max(0.1));
+
+        if now.duration_since(self.last_health_check) < health_interval {
+            return false;
+        }
+
+        self.last_health_check = now;
+        self.ensure_active_states(cfg, active, now);
+
+        if self.maybe_compare_reflectors(cfg, active, controller) {
+            return true;
+        }
+
+        if self.maybe_periodic_refresh(cfg, active, controller) {
+            return true;
+        }
+
+        self.check_response_deadlines(cfg, active, controller)
+    }
+
+    fn ensure_active_states(&mut self, cfg: &Config, active: &[String], now: Instant) {
+        for reflector in active {
+            self.states.entry(reflector.clone()).or_insert_with(|| {
+                ReflectorState::new(now, cfg.reflector_misbehaving_detection_window)
+            });
+        }
+    }
+
+    fn maybe_compare_reflectors(
+        &mut self,
+        cfg: &Config,
+        active: &mut [String],
+        controller: &mut Controller,
+    ) -> bool {
+        let interval =
+            Duration::from_secs_f64((cfg.reflector_comparison_interval_mins * 60.0).max(0.0));
+        if interval == Duration::ZERO || self.last_comparison.elapsed() < interval {
+            return false;
+        }
+
+        self.last_comparison = Instant::now();
+
+        let mut stats = Vec::new();
+        for reflector in active.iter() {
+            let Some(baseline) = controller.baseline_us.get(reflector).copied() else {
+                return false;
+            };
+            let Some(ewma) = controller.ewma_us.get(reflector).copied() else {
+                return false;
+            };
+            stats.push((reflector.clone(), baseline * 2.0, ewma, ewma));
+        }
+
+        if stats.is_empty() {
+            return false;
+        }
+
+        let min_sum = stats
+            .iter()
+            .map(|(_, sum, _, _)| *sum)
+            .fold(f64::INFINITY, f64::min);
+        let min_dl_ewma = stats
+            .iter()
+            .map(|(_, _, dl, _)| *dl)
+            .fold(f64::INFINITY, f64::min);
+        let min_ul_ewma = stats
+            .iter()
+            .map(|(_, _, _, ul)| *ul)
+            .fold(f64::INFINITY, f64::min);
+        let sum_thr_us = cfg.reflector_sum_owd_baselines_delta_thr_ms * 1000.0;
+        let ewma_thr_us = cfg.reflector_owd_delta_ewma_delta_thr_ms * 1000.0;
+
+        for (idx, (reflector, sum, dl_ewma, ul_ewma)) in stats.iter().enumerate() {
+            let sum_delta = sum - min_sum;
+            let dl_delta = dl_ewma - min_dl_ewma;
+            let ul_delta = ul_ewma - min_ul_ewma;
+
+            if cfg.output_reflector_stats {
+                controller.log(
+                    "REFLECTOR",
+                    &format!(
+                        "{}; {:.0}; {:.0}; {:.0}; {:.0}; {:.0}; {:.0}; {:.0}; {:.0}; {:.0}; {:.0}; {:.0}; {:.0}",
+                        reflector,
+                        min_sum,
+                        sum,
+                        sum_delta,
+                        sum_thr_us,
+                        min_dl_ewma,
+                        dl_ewma,
+                        dl_delta,
+                        ewma_thr_us,
+                        min_ul_ewma,
+                        ul_ewma,
+                        ul_delta,
+                        ewma_thr_us
+                    ),
+                );
+            }
+
+            if sum_delta > sum_thr_us {
+                return self.replace_active_reflector(
+                    cfg,
+                    active,
+                    idx,
+                    "baseline delta above threshold",
+                    controller,
+                );
+            }
+
+            if dl_delta > ewma_thr_us || ul_delta > ewma_thr_us {
+                return self.replace_active_reflector(
+                    cfg,
+                    active,
+                    idx,
+                    "EWMA delta above threshold",
+                    controller,
+                );
+            }
+        }
+
+        false
+    }
+
+    fn maybe_periodic_refresh(
+        &mut self,
+        cfg: &Config,
+        active: &mut [String],
+        controller: &mut Controller,
+    ) -> bool {
+        let interval =
+            Duration::from_secs_f64((cfg.reflector_replacement_interval_mins * 60.0).max(0.0));
+        if interval == Duration::ZERO || self.last_replacement.elapsed() < interval {
+            return false;
+        }
+
+        if active.is_empty() || cfg.reflectors.len() <= active.len() {
+            self.last_replacement = Instant::now();
+            return false;
+        }
+
+        let slot = self.replacement_slot % active.len();
+        self.replacement_slot = self.replacement_slot.wrapping_add(1);
+        self.replace_active_reflector(cfg, active, slot, "periodic refresh", controller)
+    }
+
+    fn check_response_deadlines(
+        &mut self,
+        cfg: &Config,
+        active: &mut [String],
+        controller: &mut Controller,
+    ) -> bool {
+        let deadline = Duration::from_secs_f64(cfg.reflector_response_deadline_s.max(0.1));
+        let now = Instant::now();
+
+        for idx in 0..active.len() {
+            let reflector = active[idx].clone();
+            let state = self.states.entry(reflector.clone()).or_insert_with(|| {
+                ReflectorState::new(now, cfg.reflector_misbehaving_detection_window)
+            });
+            let offence = now.duration_since(state.last_seen) > deadline;
+            state.push_offence(offence);
+
+            if offence {
+                controller.log(
+                    "DEBUG",
+                    &format!(
+                        "no ping response from reflector {reflector} within reflector_response_deadline_s={}",
+                        cfg.reflector_response_deadline_s
+                    ),
+                );
+            }
+
+            if state.offence_sum >= cfg.reflector_misbehaving_detection_thr {
+                return self.replace_active_reflector(
+                    cfg,
+                    active,
+                    idx,
+                    "response deadline offences",
+                    controller,
+                );
+            }
+        }
+
+        false
+    }
+
+    fn replace_active_reflector(
+        &mut self,
+        cfg: &Config,
+        active: &mut [String],
+        index: usize,
+        reason: &str,
+        controller: &mut Controller,
+    ) -> bool {
+        let Some(next) = next_spare_reflector(&cfg.reflectors, active, self.next_candidate_idx)
+        else {
+            let reflector = active.get(index).cloned().unwrap_or_default();
+            controller.log(
+                "DEBUG",
+                &format!("reflector {reflector} needs replacement ({reason}) but no spare reflector is configured"),
+            );
+            if let Some(state) = self.states.get_mut(&reflector) {
+                state.offences.clear();
+                state.offence_sum = 0;
+            }
+            return false;
+        };
+
+        self.next_candidate_idx = next.0.wrapping_add(1);
+        let old = active[index].clone();
+        active[index] = next.1.clone();
+        self.last_replacement = Instant::now();
+
+        if !cfg.retain_reflector_stats {
+            controller.baseline_us.remove(&old);
+            controller.ewma_us.remove(&old);
+            self.states.remove(&old);
+        }
+
+        self.states.insert(
+            next.1.clone(),
+            ReflectorState::new(Instant::now(), cfg.reflector_misbehaving_detection_window),
+        );
+
+        controller.log(
+            "DEBUG",
+            &format!("replacing reflector {old} with {}: {reason}", next.1),
+        );
+        true
+    }
+}
+
+fn next_spare_reflector(
+    candidates: &[String],
+    active: &[String],
+    start: usize,
+) -> Option<(usize, String)> {
+    if candidates.len() <= active.len() {
+        return None;
+    }
+
+    for offset in 0..candidates.len() {
+        let idx = (start + offset) % candidates.len();
+        let candidate = &candidates[idx];
+        if !active.iter().any(|reflector| reflector == candidate) {
+            return Some((idx, candidate.clone()));
+        }
+    }
+
+    None
 }
 
 #[derive(Clone, Copy)]
@@ -1226,45 +1689,109 @@ fn run(cfg: Config, once: bool) -> Result<(), String> {
         return Ok(());
     }
 
-    let mut child = spawn_pinger(&cfg)?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| format!("failed to capture {} stdout", cfg.pinger_method))?;
-    let reader = BufReader::new(stdout);
-    let ping_reflector = cfg.reflectors.first().cloned().unwrap_or_default();
+    let mut active_reflectors: Vec<String> = cfg
+        .reflectors
+        .iter()
+        .take(cfg.no_pingers)
+        .cloned()
+        .collect();
+    let mut health = ReflectorHealth::new(&cfg, &active_reflectors);
+    let mut pinger = PingerRuntime::spawn(&cfg, &active_reflectors)?;
 
-    for line in reader.lines() {
-        if TERMINATE.load(Ordering::SeqCst) {
-            break;
+    while !TERMINATE.load(Ordering::SeqCst) {
+        match pinger.lines.recv_timeout(health.timeout(&cfg)) {
+            Ok(Ok(line)) => {
+                if let Some(sample) = parse_sample_line(&cfg, &line, &pinger.ping_reflector) {
+                    health.observe_sample(&cfg, &sample);
+                    controller.on_sample(sample);
+                }
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                if TERMINATE.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                return Err(format!("{} output closed unexpectedly", cfg.pinger_method));
+            }
         }
-        let line = line.map_err(|e| format!("failed to read {} output: {e}", cfg.pinger_method))?;
-        if let Some(sample) = parse_sample_line(&cfg, &line, &ping_reflector) {
-            controller.on_sample(sample);
+
+        if health.check(&cfg, &mut active_reflectors, &mut controller) {
+            pinger.stop();
+            pinger = PingerRuntime::spawn(&cfg, &active_reflectors)?;
         }
     }
 
-    stop_child(&mut child);
+    pinger.stop();
     Ok(())
 }
 
-fn spawn_pinger(cfg: &Config) -> Result<Child, String> {
+struct PingerRuntime {
+    child: Child,
+    reader: Option<JoinHandle<()>>,
+    lines: Receiver<Result<String, String>>,
+    ping_reflector: String,
+}
+
+impl PingerRuntime {
+    fn spawn(cfg: &Config, active_reflectors: &[String]) -> Result<Self, String> {
+        let mut child = spawn_pinger(cfg, active_reflectors)?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| format!("failed to capture {} stdout", cfg.pinger_method))?;
+        let (tx, lines) = mpsc::channel();
+        let method = cfg.pinger_method.clone();
+        let reader = thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => {
+                        if tx.send(Ok(line)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("failed to read {method} output: {e}")));
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            child,
+            reader: Some(reader),
+            lines,
+            ping_reflector: active_reflectors.first().cloned().unwrap_or_default(),
+        })
+    }
+
+    fn stop(&mut self) {
+        stop_child(&mut self.child);
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn spawn_pinger(cfg: &Config, active_reflectors: &[String]) -> Result<Child, String> {
     match cfg.pinger_method.as_str() {
-        "fping" => spawn_fping(cfg),
-        "ping" => spawn_ping(cfg),
+        "fping" => spawn_fping(cfg, active_reflectors),
+        "ping" => spawn_ping(cfg, active_reflectors),
         other => Err(format!("unsupported pinger_method={other}")),
     }
 }
 
-fn spawn_fping(cfg: &Config) -> Result<Child, String> {
+fn spawn_fping(cfg: &Config, active_reflectors: &[String]) -> Result<Child, String> {
     let period_ms = (cfg.reflector_ping_interval_s * 1000.0).round().max(1.0) as u64;
-    let interval_ms = (period_ms / cfg.no_pingers.max(1) as u64).max(1);
-    let targets: Vec<&str> = cfg
-        .reflectors
-        .iter()
-        .take(cfg.no_pingers)
-        .map(String::as_str)
-        .collect();
+    let interval_ms = (period_ms / active_reflectors.len().max(1) as u64).max(1);
+    let targets: Vec<&str> = active_reflectors.iter().map(String::as_str).collect();
+
+    if targets.is_empty() {
+        return Err("at least one reflector is required".to_string());
+    }
 
     Command::new("fping")
         .arg("--timestamp")
@@ -1282,9 +1809,8 @@ fn spawn_fping(cfg: &Config) -> Result<Child, String> {
         .map_err(|e| format!("failed to start fping: {e}"))
 }
 
-fn spawn_ping(cfg: &Config) -> Result<Child, String> {
-    let target = cfg
-        .reflectors
+fn spawn_ping(cfg: &Config, active_reflectors: &[String]) -> Result<Child, String> {
+    let target = active_reflectors
         .first()
         .ok_or_else(|| "at least one reflector is required".to_string())?;
     let interval_s = cfg.reflector_ping_interval_s.ceil().max(1.0) as u64;
@@ -1819,7 +2345,10 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_reflector_candidates, parse_uci_values};
+    use super::{
+        next_spare_reflector, parse_reflector_candidates, parse_uci_values, ReflectorState,
+    };
+    use std::time::Instant;
 
     #[test]
     fn parses_single_quoted_value() {
@@ -1846,5 +2375,38 @@ mod tests {
             parse_reflector_candidates(data, 1),
             vec!["1.1.1.1", "9.9.9.9"]
         );
+    }
+
+    #[test]
+    fn finds_next_spare_reflector_from_rotating_index() {
+        let candidates = vec![
+            "1.1.1.1".to_string(),
+            "1.0.0.1".to_string(),
+            "8.8.8.8".to_string(),
+            "9.9.9.9".to_string(),
+        ];
+        let active = vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()];
+
+        assert_eq!(
+            next_spare_reflector(&candidates, &active, 2),
+            Some((3, "9.9.9.9".to_string()))
+        );
+        assert_eq!(
+            next_spare_reflector(&candidates, &active, 4),
+            Some((1, "1.0.0.1".to_string()))
+        );
+    }
+
+    #[test]
+    fn tracks_reflector_offences_as_rolling_window() {
+        let mut state = ReflectorState::new(Instant::now(), 3);
+
+        state.push_offence(true);
+        state.push_offence(false);
+        state.push_offence(true);
+        assert_eq!(state.offence_sum, 2);
+
+        state.push_offence(false);
+        assert_eq!(state.offence_sum, 1);
     }
 }
