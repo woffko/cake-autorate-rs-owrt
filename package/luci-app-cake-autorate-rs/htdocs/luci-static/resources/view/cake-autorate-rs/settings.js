@@ -19,6 +19,8 @@ var optionDescriptions = {
 	sqm_enabled: 'Enable the matching SQM queue managed by this instance.',
 	sqm_download: 'SQM download bandwidth in kbit/s. This also seeds the autorate base and max download rates.',
 	sqm_upload: 'SQM upload bandwidth in kbit/s. This also seeds the autorate base and max upload rates.',
+	manual_rate_limits: 'Show explicit min, base, and max autorate limits. Leave off to derive them from download and upload speeds.',
+	advanced_settings: 'Show detailed SQM, reflector, controller, logging, and daemon tuning settings.',
 	min_dl_shaper_rate_kbps: 'Lowest download shaper rate autorate may apply, in kbit/s.',
 	base_dl_shaper_rate_kbps: 'Starting download shaper rate before autorate adjusts it, in kbit/s.',
 	max_dl_shaper_rate_kbps: 'Highest download shaper rate autorate may apply, in kbit/s.',
@@ -74,7 +76,7 @@ var optionDescriptions = {
 	high_load_thr: 'Fraction of current shaper rate that counts as high load.',
 	bufferbloat_refractory_period_ms: 'Minimum time after a bufferbloat response before another backoff may happen.',
 	decay_refractory_period_ms: 'Minimum time between low-load decay adjustments.',
-	pinger_method: 'Probe backend used to measure reflector latency. Only fping is implemented in the Rust MVP.',
+	pinger_method: 'Probe backend used to measure reflector latency. Only fping is currently available in this package.',
 	reflector: 'Hosts to probe for latency. Use stable anycast or nearby IP addresses.',
 	reflectors_url: 'Optional URL to fetch reflector candidates from. Not implemented in the Rust MVP yet.',
 	reflectors_url_skip_lines: 'Number of header lines to skip when parsing reflector URL data.',
@@ -219,6 +221,18 @@ function autoInterfacePresetEnabled(section, section_id) {
 	return value !== '0';
 }
 
+function manualRateLimitsEnabled(section, section_id) {
+	var value;
+
+	if (section && typeof section.formvalue == 'function')
+		value = section.formvalue(section_id, 'manual_rate_limits');
+
+	if (value == null)
+		value = uci.get('cake-autorate', section_id, 'manual_rate_limits');
+
+	return value === '1';
+}
+
 function ifbForWan(wan_if) {
 	return wan_if ? 'ifb4' + wan_if : '';
 }
@@ -314,6 +328,23 @@ function addUniqueValue(option, seen, value, title) {
 	seen[value] = true;
 }
 
+function requireAdvancedSettings(section) {
+	for (var i = 0; i < section.children.length; i++) {
+		var option = section.children[i];
+
+		if (!option.modalonly || !option.tab || option.tab === 'setup')
+			continue;
+
+		if (option.deps && option.deps.length) {
+			for (var j = 0; j < option.deps.length; j++)
+				option.deps[j].advanced_settings = '1';
+		}
+		else {
+			option.depends('advanced_settings', '1');
+		}
+	}
+}
+
 function addRateOptions(section) {
 	value(section, 'rates', 'connection_active_thr_kbps', _('Active threshold'), 'uinteger', '2000');
 }
@@ -367,11 +398,13 @@ function addSetupOptions(section) {
 				rateValue(uci.get('cake-autorate', section_id, 'base_dl_shaper_rate_kbps'), '20000')));
 	};
 	o.write = function(section_id, formvalue) {
+		var manualRateLimits = manualRateLimitsEnabled(this.section, section_id);
+
 		uci.set('cake-autorate', section_id, 'sqm_download', formvalue);
 		uci.set('cake-autorate', section_id, 'base_dl_shaper_rate_kbps', formvalue);
 		uci.set('cake-autorate', section_id, 'max_dl_shaper_rate_kbps', formvalue);
 
-		if (!uci.get('cake-autorate', section_id, 'min_dl_shaper_rate_kbps'))
+		if (!manualRateLimits || !uci.get('cake-autorate', section_id, 'min_dl_shaper_rate_kbps'))
 			uci.set('cake-autorate', section_id, 'min_dl_shaper_rate_kbps', halfRate(formvalue));
 	};
 
@@ -385,20 +418,39 @@ function addSetupOptions(section) {
 				rateValue(uci.get('cake-autorate', section_id, 'base_ul_shaper_rate_kbps'), '20000')));
 	};
 	o.write = function(section_id, formvalue) {
+		var manualRateLimits = manualRateLimitsEnabled(this.section, section_id);
+
 		uci.set('cake-autorate', section_id, 'sqm_upload', formvalue);
 		uci.set('cake-autorate', section_id, 'base_ul_shaper_rate_kbps', formvalue);
 		uci.set('cake-autorate', section_id, 'max_ul_shaper_rate_kbps', formvalue);
 
-		if (!uci.get('cake-autorate', section_id, 'min_ul_shaper_rate_kbps'))
+		if (!manualRateLimits || !uci.get('cake-autorate', section_id, 'min_ul_shaper_rate_kbps'))
 			uci.set('cake-autorate', section_id, 'min_ul_shaper_rate_kbps', halfRate(formvalue));
 	};
 
-	value(section, 'setup', 'min_dl_shaper_rate_kbps', _('Min DL rate'), 'uinteger', '5000');
-	value(section, 'setup', 'base_dl_shaper_rate_kbps', _('Base DL rate'), 'uinteger', '20000');
-	value(section, 'setup', 'max_dl_shaper_rate_kbps', _('Max DL rate'), 'uinteger', '80000');
-	value(section, 'setup', 'min_ul_shaper_rate_kbps', _('Min UL rate'), 'uinteger', '5000');
-	value(section, 'setup', 'base_ul_shaper_rate_kbps', _('Base UL rate'), 'uinteger', '20000');
-	value(section, 'setup', 'max_ul_shaper_rate_kbps', _('Max UL rate'), 'uinteger', '35000');
+	o = flag(section, 'setup', 'manual_rate_limits', _('Manual rate limits'), '0');
+	o.forcewrite = true;
+
+	o = flag(section, 'setup', 'advanced_settings', _('Show advanced settings'), '0');
+	o.forcewrite = true;
+
+	o = value(section, 'setup', 'min_dl_shaper_rate_kbps', _('Min DL rate'), 'uinteger', '5000');
+	o.depends('manual_rate_limits', '1');
+
+	o = value(section, 'setup', 'base_dl_shaper_rate_kbps', _('Base DL rate'), 'uinteger', '20000');
+	o.depends('manual_rate_limits', '1');
+
+	o = value(section, 'setup', 'max_dl_shaper_rate_kbps', _('Max DL rate'), 'uinteger', '80000');
+	o.depends('manual_rate_limits', '1');
+
+	o = value(section, 'setup', 'min_ul_shaper_rate_kbps', _('Min UL rate'), 'uinteger', '5000');
+	o.depends('manual_rate_limits', '1');
+
+	o = value(section, 'setup', 'base_ul_shaper_rate_kbps', _('Base UL rate'), 'uinteger', '20000');
+	o.depends('manual_rate_limits', '1');
+
+	o = value(section, 'setup', 'max_ul_shaper_rate_kbps', _('Max UL rate'), 'uinteger', '35000');
+	o.depends('manual_rate_limits', '1');
 }
 
 function addInterfaceOptions(section) {
@@ -442,10 +494,6 @@ function addReflectorOptions(section) {
 	modal(o);
 	describe(o, 'pinger_method');
 	o.value('fping', 'fping');
-	o.value('fping-ts', 'fping-ts');
-	o.value('tsping', 'tsping');
-	o.value('irtt', 'irtt');
-	o.value('ping', 'ping');
 	o.rmempty = false;
 
 	o = section.taboption('reflectors', form.DynamicList, 'reflector', _('Reflectors'));
@@ -454,14 +502,14 @@ function addReflectorOptions(section) {
 	o.datatype = 'host';
 	o.rmempty = false;
 
-	value(section, 'reflectors', 'reflectors_url', _('Reflectors URL'), 'string', '');
+	optionalValue(section, 'reflectors', 'reflectors_url', _('Reflectors URL'), null, '');
 	value(section, 'reflectors', 'reflectors_url_skip_lines', _('URL skip lines'), 'uinteger', '1');
 	flag(section, 'reflectors', 'randomize_reflectors', _('Randomize reflectors'));
 	flag(section, 'reflectors', 'retain_reflector_stats', _('Retain reflector stats'));
 	value(section, 'reflectors', 'no_pingers', _('Pingers'), 'uinteger', '6');
 	value(section, 'reflectors', 'reflector_ping_interval_s', _('Ping interval'), 'ufloat', '0.3');
-	value(section, 'reflectors', 'ping_extra_args', _('Extra ping args'), 'string', '');
-	value(section, 'reflectors', 'ping_prefix_string', _('Ping prefix'), 'string', '');
+	optionalValue(section, 'reflectors', 'ping_extra_args', _('Extra ping args'), null, '');
+	optionalValue(section, 'reflectors', 'ping_prefix_string', _('Ping prefix'), null, '');
 	value(section, 'reflectors', 'irtt_session_duration_m', _('IRTT session minutes'), 'uinteger', '10');
 }
 
@@ -478,7 +526,7 @@ function addLoggingOptions(section) {
 	flag(section, 'logging', 'log_to_file', _('Log to file'));
 	value(section, 'logging', 'log_file_max_time_mins', _('Log max minutes'), 'uinteger', '10');
 	value(section, 'logging', 'log_file_max_size_KB', _('Log max KB'), 'uinteger', '2000');
-	value(section, 'logging', 'log_file_path_override', _('Log directory'), 'directory', '');
+	optionalValue(section, 'logging', 'log_file_path_override', _('Log directory'), null, '');
 	value(section, 'logging', 'log_file_buffer_size_B', _('Log buffer bytes'), 'uinteger', '512');
 	value(section, 'logging', 'log_file_buffer_timeout_ms', _('Log buffer timeout'), 'uinteger', '500');
 	flag(section, 'logging', 'log_file_export_compress', _('Compress exports'));
@@ -503,15 +551,15 @@ function addAdvancedOptions(section) {
 	value(section, 'advanced', 'connection_stall_thr_kbps', _('Stall rate threshold'), 'uinteger', '10');
 	value(section, 'advanced', 'global_ping_response_timeout_s', _('Global ping timeout'), 'ufloat', '10.0');
 	value(section, 'advanced', 'if_up_check_interval_s', _('Interface check interval'), 'ufloat', '10.0');
-	value(section, 'advanced', 'rx_bytes_path', _('RX bytes path'), 'file', '');
-	value(section, 'advanced', 'tx_bytes_path', _('TX bytes path'), 'file', '');
+	optionalValue(section, 'advanced', 'rx_bytes_path', _('RX bytes path'), null, '');
+	optionalValue(section, 'advanced', 'tx_bytes_path', _('TX bytes path'), null, '');
 }
 
 function addSqmOptions(section, qdiscs, scripts) {
 	var o, seen;
 
 	flag(section, 'sqm_basic', 'manage_sqm', _('Manage SQM'));
-	value(section, 'sqm_basic', 'sqm_section', _('SQM section'), 'uciname', '');
+	optionalValue(section, 'sqm_basic', 'sqm_section', _('SQM section'), 'uciname', '');
 	o = iface(section, 'sqm_basic', 'sqm_interface', _('SQM interface'));
 	o.depends('auto_interface_preset', '0');
 	flag(section, 'sqm_basic', 'sqm_debug_logging', _('SQM debug logging'));
@@ -716,6 +764,7 @@ return L.view.extend({
 		addControllerOptions(s);
 		addLoggingOptions(s);
 		addAdvancedOptions(s);
+		requireAdvancedSettings(s);
 
 		return m.render();
 	}
