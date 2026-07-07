@@ -64,11 +64,11 @@ function listValue(section, tab, key, title, values, defaultValue) {
 	return o;
 }
 
-function selectedWan(section, section_id, fallback) {
+function selectedWan(section, section_id, fallback, useFormValue) {
 	if (fallback)
 		return fallback;
 
-	if (section && typeof section.formvalue == 'function') {
+	if (useFormValue && section && typeof section.formvalue == 'function') {
 		var formValue = section.formvalue(section_id, 'wan_if');
 		if (formValue)
 			return formValue;
@@ -200,7 +200,7 @@ function addSetupOptions(section) {
 	o.default = 'wan';
 	o.forcewrite = true;
 	o.cfgvalue = function(section_id) {
-		return selectedWan(this.section, section_id);
+		return selectedWan(null, section_id);
 	};
 	o.onchange = function(ev, section_id, value) {
 		if (autoInterfacePresetEnabled(this.section, section_id))
@@ -224,7 +224,7 @@ function addSetupOptions(section) {
 		uci.set('cake-autorate', section_id, 'auto_interface_preset', formvalue);
 
 		if (formvalue === '1')
-			applyWanPreset(section_id, selectedWan(this.section, section_id), false);
+			applyWanPreset(section_id, selectedWan(this.section, section_id, null, true), false);
 	};
 
 	o = flag(section, 'setup', 'sqm_enabled', _('Enable SQM'));
@@ -233,7 +233,7 @@ function addSetupOptions(section) {
 	o = value(section, 'setup', 'sqm_download', _('Download speed'), 'and(uinteger,min(0))', '20000');
 	o.forcewrite = true;
 	o.cfgvalue = function(section_id) {
-		var queue = findSqmQueueForInterface(selectedWan(this.section, section_id));
+		var queue = findSqmQueueForInterface(selectedWan(null, section_id));
 
 		return rateValue(uci.get('cake-autorate', section_id, 'sqm_download'),
 			rateValue(queue ? queue.download : null,
@@ -251,7 +251,7 @@ function addSetupOptions(section) {
 	o = value(section, 'setup', 'sqm_upload', _('Upload speed'), 'and(uinteger,min(0))', '20000');
 	o.forcewrite = true;
 	o.cfgvalue = function(section_id) {
-		var queue = findSqmQueueForInterface(selectedWan(this.section, section_id));
+		var queue = findSqmQueueForInterface(selectedWan(null, section_id));
 
 		return rateValue(uci.get('cake-autorate', section_id, 'sqm_upload'),
 			rateValue(queue ? queue.upload : null,

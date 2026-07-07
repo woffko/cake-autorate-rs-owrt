@@ -25,6 +25,7 @@ function formatRate(value) {
 
 function renderTable(sections, statuses) {
 	var rows = [];
+	var children;
 
 	for (var i = 0; i < sections.length; i++) {
 		var section = sections[i]['.name'];
@@ -42,7 +43,7 @@ function renderTable(sections, statuses) {
 		]);
 	}
 
-	return E('table', { 'class': 'table' }, [
+	children = [
 		E('tr', { 'class': 'tr table-titles' }, [
 			E('th', { 'class': 'th' }, _('Instance')),
 			E('th', { 'class': 'th' }, _('Updated')),
@@ -52,15 +53,21 @@ function renderTable(sections, statuses) {
 			E('th', { 'class': 'th' }, _('UL achieved')),
 			E('th', { 'class': 'th' }, _('CAKE DL')),
 			E('th', { 'class': 'th' }, _('CAKE UL'))
-		]),
-		rows.length ? rows.map(function(row) {
-			return E('tr', { 'class': 'tr' }, row.map(function(cell) {
-				return E('td', { 'class': 'td' }, cell);
-			}));
-		}) : E('tr', { 'class': 'tr' }, [
-			E('td', { 'class': 'td', 'colspan': '8' }, _('No instances configured.'))
 		])
-	]);
+	];
+
+	if (rows.length) {
+		for (var i = 0; i < rows.length; i++)
+			children.push(E('tr', { 'class': 'tr' }, rows[i].map(function(cell) {
+				return E('td', { 'class': 'td' }, cell);
+			})));
+	} else {
+		children.push(E('tr', { 'class': 'tr' }, [
+			E('td', { 'class': 'td', 'colspan': '8' }, _('No instances configured.'))
+		]));
+	}
+
+	return E('table', { 'class': 'table' }, children);
 }
 
 return L.view.extend({
