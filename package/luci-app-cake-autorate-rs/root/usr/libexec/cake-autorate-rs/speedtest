@@ -1,19 +1,36 @@
 #!/bin/sh
 
 section="$1"
+target_if_override="$2"
 
 download_bytes_default="25000000"
 upload_bytes_default="4000000"
+upload_retry_bytes_default="1000000 262144"
 timeout_default="45"
+route_probe_default="1.1.1.1"
 
 uci_get() {
 	[ -n "$section" ] || return 0
 	uci -q get "cake-autorate.$section.$1" 2>/dev/null
 }
 
+json_escape() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
 json_error() {
-	printf '{"error":"%s"}\n' "$1"
+	printf '{"error":"%s"}\n' "$(json_escape "$1")"
 	exit 1
+}
+
+append_warning() {
+	[ -n "$1" ] || return 0
+
+	if [ -n "$warning" ]; then
+		warning="$warning $1"
+	else
+		warning="$1"
+	fi
 }
 
 now_s() {
@@ -28,28 +45,164 @@ kbps_for() {
 	awk -v bytes="$1" -v elapsed="$2" 'BEGIN { printf "%.0f", bytes * 8 / elapsed / 1000 }'
 }
 
-num_or_default() {
+is_uint() {
 	case "$1" in
 		''|*[!0-9]*)
-			printf '%s' "$2"
-			;;
-		*)
-			printf '%s' "$1"
+			return 1
 			;;
 	esac
+
+	[ "$1" -ge 0 ] 2>/dev/null
 }
 
-fetch="$(command -v uclient-fetch 2>/dev/null || command -v wget 2>/dev/null || true)"
-[ -n "$fetch" ] || json_error "uclient-fetch or wget is required"
+is_positive_uint() {
+	is_uint "$1" && [ "$1" -gt 0 ] 2>/dev/null
+}
 
-download_bytes="$(num_or_default "$(uci_get speedtest_download_bytes)" "$download_bytes_default")"
+num_or_default() {
+	if is_uint "$1"; then
+		printf '%s' "$1"
+	else
+		printf '%s' "$2"
+	fi
+}
+
+positive_num_or_default() {
+	if is_positive_uint "$1"; then
+		printf '%s' "$1"
+	else
+		printf '%s' "$2"
+	fi
+}
+
+bool_enabled() {
+	case "$1" in
+		1|on|true|yes|enabled)
+			return 0
+			;;
+	esac
+
+	return 1
+}
+
+resolve_interface_device() {
+	local name="$1"
+	local status dev
+
+	[ -n "$name" ] || return 1
+
+	if [ -e "/sys/class/net/$name" ]; then
+		printf '%s\n' "$name"
+		return 0
+	fi
+
+	status="$(ubus call network.interface."$name" status 2>/dev/null)"
+	if [ -n "$status" ] && command -v jsonfilter >/dev/null 2>&1; then
+		dev="$(printf '%s\n' "$status" | jsonfilter -e '@.l3_device' 2>/dev/null)"
+		[ -n "$dev" ] || dev="$(printf '%s\n' "$status" | jsonfilter -e '@.device' 2>/dev/null)"
+
+		if [ -n "$dev" ] && [ -e "/sys/class/net/$dev" ]; then
+			printf '%s\n' "$dev"
+			return 0
+		fi
+	fi
+
+	printf '%s\n' "$name"
+}
+
+route_device_for() {
+	ip route get "$1" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1
+}
+
+selected_target_interface() {
+	local iface
+
+	iface="$target_if_override"
+	[ -n "$iface" ] || iface="$(uci_get wan_if)"
+	[ -n "$iface" ] || iface="$(uci_get sqm_interface)"
+	[ -n "$iface" ] || iface="$(uci_get ul_if)"
+	resolve_interface_device "$iface"
+}
+
+fetch_download() {
+	if [ "$fetch_kind" = "curl" ]; then
+		if [ -n "$bind_interface" ]; then
+			"$fetch" ${force_ipv4_arg:+-4} -f -L -sS --max-time "$timeout_s" --interface "$bind_interface" -o "$tmp_download" "$download_url"
+		else
+			"$fetch" ${force_ipv4_arg:+-4} -f -L -sS --max-time "$timeout_s" -o "$tmp_download" "$download_url"
+		fi
+	else
+		"$fetch" -q ${force_ipv4_arg:+-4} -O "$tmp_download" --timeout="$timeout_s" "$download_url"
+	fi
+}
+
+fetch_upload() {
+	if [ "$fetch_kind" = "curl" ]; then
+		if [ -n "$bind_interface" ]; then
+			"$fetch" ${force_ipv4_arg:+-4} -f -L -sS --max-time "$timeout_s" --interface "$bind_interface" --request POST --data-binary "@$tmp_upload" -o "$tmp_response" "$upload_url"
+		else
+			"$fetch" ${force_ipv4_arg:+-4} -f -L -sS --max-time "$timeout_s" --request POST --data-binary "@$tmp_upload" -o "$tmp_response" "$upload_url"
+		fi
+	else
+		"$fetch" -q ${force_ipv4_arg:+-4} -O "$tmp_response" --timeout="$timeout_s" --post-file="$tmp_upload" "$upload_url"
+	fi
+}
+
+warning=""
+
+download_bytes="$(positive_num_or_default "$(uci_get speedtest_download_bytes)" "$download_bytes_default")"
 upload_bytes="$(num_or_default "$(uci_get speedtest_upload_bytes)" "$upload_bytes_default")"
-timeout_s="$(num_or_default "$(uci_get speedtest_timeout_s)" "$timeout_default")"
+upload_retry_bytes="$(uci_get speedtest_upload_retry_bytes)"
+timeout_s="$(positive_num_or_default "$(uci_get speedtest_timeout_s)" "$timeout_default")"
 download_url="$(uci_get speedtest_download_url)"
 upload_url="$(uci_get speedtest_upload_url)"
+bind_interface_enabled="$(uci_get speedtest_bind_interface)"
+force_ipv4_enabled="$(uci_get speedtest_force_ipv4)"
+route_probe="$(uci_get speedtest_route_probe)"
 
+[ -n "$upload_retry_bytes" ] || upload_retry_bytes="$upload_retry_bytes_default"
 [ -n "$download_url" ] || download_url="https://speed.cloudflare.com/__down?bytes=$download_bytes"
 [ -n "$upload_url" ] || upload_url="https://speed.cloudflare.com/__up"
+[ -n "$bind_interface_enabled" ] || bind_interface_enabled="1"
+[ -n "$force_ipv4_enabled" ] || force_ipv4_enabled="1"
+[ -n "$route_probe" ] || route_probe="$route_probe_default"
+
+if bool_enabled "$force_ipv4_enabled"; then
+	force_ipv4_arg="1"
+else
+	force_ipv4_arg=""
+fi
+
+target_if="$(selected_target_interface)"
+route_if="$(route_device_for "$route_probe")"
+curl_fetch="$(command -v curl 2>/dev/null || true)"
+fallback_fetch="$(command -v uclient-fetch 2>/dev/null || command -v wget 2>/dev/null || true)"
+bind_interface=""
+bind_mode="none"
+
+if bool_enabled "$bind_interface_enabled" && [ -n "$target_if" ] && [ -n "$curl_fetch" ]; then
+	fetch="$curl_fetch"
+	fetch_kind="curl"
+	bind_interface="$target_if"
+	bind_mode="curl-interface"
+else
+	fetch="$fallback_fetch"
+	fetch_kind="uclient-fetch"
+
+	if [ -n "$fetch" ]; then
+		fetch_kind="$(basename "$fetch")"
+	fi
+
+	if bool_enabled "$bind_interface_enabled" && [ -n "$target_if" ]; then
+		bind_mode="route-check"
+
+		if [ -n "$route_if" ] && [ "$route_if" != "$target_if" ]; then
+			append_warning "Speed test could not bind to $target_if because curl is not installed; route probe uses $route_if."
+		fi
+	fi
+fi
+
+[ -n "$fetch" ] || json_error "curl, uclient-fetch, or wget is required"
 
 tmp_download="/tmp/cake-autorate-speedtest-download.$$"
 tmp_upload="/tmp/cake-autorate-speedtest-upload.$$"
@@ -61,7 +214,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 download_start="$(now_s)"
-if ! "$fetch" -q -O "$tmp_download" --timeout="$timeout_s" "$download_url" >/dev/null 2>&1; then
+if ! fetch_download >/dev/null 2>&1; then
 	json_error "download test failed"
 fi
 download_stop="$(now_s)"
@@ -72,14 +225,13 @@ download_kbps="$(kbps_for "$download_size" "$download_elapsed")"
 upload_kbps="null"
 upload_elapsed="0.00"
 upload_size="0"
-warning=""
 
-if [ "$upload_bytes" -gt 0 ] && [ -n "$upload_url" ]; then
+if is_uint "$upload_bytes" && [ "$upload_bytes" -gt 0 ] && [ -n "$upload_url" ]; then
 	upload_done="0"
 	upload_last_try=""
 
-	for upload_try in "$upload_bytes" 1000000 262144; do
-		[ "$upload_try" -gt 0 ] || continue
+	for upload_try in "$upload_bytes" $upload_retry_bytes; do
+		is_positive_uint "$upload_try" || continue
 		[ "$upload_try" = "$upload_last_try" ] && continue
 
 		upload_last_try="$upload_try"
@@ -92,14 +244,14 @@ if [ "$upload_bytes" -gt 0 ] && [ -n "$upload_url" ]; then
 
 		upload_size="$(wc -c < "$tmp_upload" | tr -d ' ')"
 		upload_start="$(now_s)"
-		if "$fetch" -q -O "$tmp_response" --timeout="$timeout_s" --post-file="$tmp_upload" "$upload_url" >/dev/null 2>&1; then
+		if fetch_upload >/dev/null 2>&1; then
 			upload_stop="$(now_s)"
 			upload_elapsed="$(elapsed_s "$upload_start" "$upload_stop")"
 			upload_kbps="$(kbps_for "$upload_size" "$upload_elapsed")"
 			upload_done="1"
 
 			if [ "$upload_try" != "$upload_bytes" ]; then
-				warning="Upload test used a smaller retry payload."
+				append_warning "Upload test used a smaller retry payload."
 			fi
 
 			break
@@ -108,16 +260,19 @@ if [ "$upload_bytes" -gt 0 ] && [ -n "$upload_url" ]; then
 
 	if [ "$upload_done" != "1" ]; then
 		upload_size="0"
-		warning="Upload test failed; upload rate was left unchanged."
+		append_warning "Upload test failed; upload rate was left unchanged."
 	fi
 fi
 
-printf '{"download_kbps":%s,"upload_kbps":%s,"download_bytes":%s,"upload_bytes":%s,"download_elapsed_s":%s,"upload_elapsed_s":%s,"source":"%s","warning":"%s"}\n' \
+printf '{"download_kbps":%s,"upload_kbps":%s,"download_bytes":%s,"upload_bytes":%s,"download_elapsed_s":%s,"upload_elapsed_s":%s,"source":"%s","backend":"builtin-http","bind_mode":"%s","target_interface":"%s","route_interface":"%s","warning":"%s"}\n' \
 	"$download_kbps" \
 	"$upload_kbps" \
 	"$download_size" \
 	"$upload_size" \
 	"$download_elapsed" \
 	"$upload_elapsed" \
-	"$(basename "$fetch")" \
-	"$warning"
+	"$(json_escape "$fetch_kind")" \
+	"$(json_escape "$bind_mode")" \
+	"$(json_escape "$target_if")" \
+	"$(json_escape "$route_if")" \
+	"$(json_escape "$warning")"

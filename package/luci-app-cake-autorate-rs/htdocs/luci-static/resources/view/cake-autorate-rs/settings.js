@@ -22,6 +22,15 @@ var optionDescriptions = {
 	sqm_upload: 'SQM upload bandwidth in kbit/s. This also seeds the autorate base and max upload rates.',
 	speedtest_apply_percent: 'Percentage of measured throughput to write into SQM and autorate limits. 90 leaves headroom for CAKE.',
 	_speedtest: 'Run a router-side speed test and fill SQM plus autorate limits from the measured throughput.',
+	speedtest_bind_interface: 'Try to run the speed test through the selected target interface. Uses curl --interface when curl is installed, otherwise checks the route used by the built-in fetcher.',
+	speedtest_force_ipv4: 'Force IPv4 for the built-in HTTP speed test. This keeps route checks predictable on simple WAN setups.',
+	speedtest_route_probe: 'Address used to check which interface the router would use for the speed test when hard binding is unavailable.',
+	speedtest_download_url: 'Optional download URL for the built-in HTTP speed test. Leave empty to use Cloudflare speed test.',
+	speedtest_upload_url: 'Optional upload URL for the built-in HTTP speed test. Leave empty to use Cloudflare speed test.',
+	speedtest_download_bytes: 'Download payload size requested by the built-in HTTP speed test.',
+	speedtest_upload_bytes: 'Initial upload payload size sent by the built-in HTTP speed test. Set to 0 to skip upload testing.',
+	speedtest_upload_retry_bytes: 'Space-separated smaller upload payload sizes to try if the initial upload test fails.',
+	speedtest_timeout_s: 'Per-request timeout for built-in speed test download and upload requests.',
 	_wizard_sqm_queue: 'Existing unmanaged SQM queues on the selected interface are reused to avoid duplicate shapers.',
 	manual_rate_limits: 'Show explicit min, base, and max autorate limits. Leave off to derive them from download and upload speeds.',
 	advanced_settings: 'Show detailed SQM, reflector, controller, logging, and daemon tuning settings.',
@@ -838,7 +847,7 @@ function showCreateWizard(grid, name) {
 				runButton.disabled = true;
 				status.textContent = _('Running speed test...');
 
-				fs.exec('/usr/libexec/cake-autorate-rs/speedtest', [ state.name ]).then(function(res) {
+				fs.exec('/usr/libexec/cake-autorate-rs/speedtest', [ state.name, state.wan_if ]).then(function(res) {
 					var result = parseSpeedtestResult(res.stdout);
 					var dl = measuredRate(result.download_kbps, pct);
 					var ul = measuredRate(result.upload_kbps, pct);
@@ -1077,6 +1086,18 @@ function requireAdvancedSettings(section) {
 
 function addRateOptions(section) {
 	value(section, 'rates', 'connection_active_thr_kbps', _('Active threshold'), 'uinteger', '2000');
+}
+
+function addSpeedtestOptions(section) {
+	flag(section, 'speedtest', 'speedtest_bind_interface', _('Bind to target interface'), '1');
+	flag(section, 'speedtest', 'speedtest_force_ipv4', _('Force IPv4'), '1');
+	optionalValue(section, 'speedtest', 'speedtest_route_probe', _('Route probe'), 'host', '1.1.1.1');
+	optionalValue(section, 'speedtest', 'speedtest_download_url', _('Download URL'), null, '');
+	optionalValue(section, 'speedtest', 'speedtest_upload_url', _('Upload URL'), null, '');
+	optionalValue(section, 'speedtest', 'speedtest_download_bytes', _('Download bytes'), 'and(uinteger,min(1))', '25000000');
+	optionalValue(section, 'speedtest', 'speedtest_upload_bytes', _('Upload bytes'), 'and(uinteger,min(0))', '4000000');
+	optionalValue(section, 'speedtest', 'speedtest_upload_retry_bytes', _('Upload retry bytes'), null, '1000000 262144');
+	optionalValue(section, 'speedtest', 'speedtest_timeout_s', _('Request timeout'), 'and(uinteger,min(1))', '45');
 }
 
 function addSetupOptions(section) {
@@ -1533,6 +1554,7 @@ return L.view.extend({
 		s.tab('sqm_qdisc', _('SQM Queue'));
 		s.tab('sqm_linklayer', _('SQM Link Layer'));
 		s.tab('rates', _('Rates'));
+		s.tab('speedtest', _('Speed Test'));
 		s.tab('reflectors', _('Reflectors'));
 		s.tab('latency', _('Latency'));
 		s.tab('controller', _('Controller'));
@@ -1546,6 +1568,7 @@ return L.view.extend({
 		addInterfaceOptions(s);
 		addSqmOptions(s, qdiscs, scripts);
 		addRateOptions(s);
+		addSpeedtestOptions(s);
 		addReflectorOptions(s);
 		addLatencyOptions(s);
 		addControllerOptions(s);
