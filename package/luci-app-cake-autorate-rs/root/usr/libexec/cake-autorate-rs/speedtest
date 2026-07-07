@@ -34,7 +34,7 @@ uci_get() {
 }
 
 json_escape() {
-	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+	printf '%s' "$1" | tr '\n\r\t' '   ' | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
 json_error() {
@@ -252,6 +252,20 @@ backend_install_hint() {
 	esac
 }
 
+backend_package() {
+	case "$1" in
+		librespeed-cli)
+			printf '%s' "librespeed-cli"
+			;;
+		speedtest-go)
+			printf '%s' "speedtest-go"
+			;;
+		iperf3)
+			printf '%s' "iperf3"
+			;;
+	esac
+}
+
 backend_reason() {
 	case "$1" in
 		librespeed-cli)
@@ -350,6 +364,68 @@ backend_status_json() {
 	done
 
 	printf '],"warning":"%s"}\n' "$(json_escape "$warning")"
+}
+
+refresh_backend_bins() {
+	jsonfilter_bin="$(command_path jsonfilter)"
+	librespeed_bin="$(command_path librespeed-cli)"
+	speedtest_go_bin="$(command_path speedtest-go)"
+	iperf3_bin="$(command_path iperf3)"
+}
+
+backend_install_json() {
+	local selected="$1"
+	local package packages output available
+
+	valid_backend "$selected" || json_error "Unknown speed test backend: $selected"
+
+	case "$selected" in
+		auto)
+			json_error "Select LibreSpeed CLI, speedtest-go, or configured iperf3 before installing an optional backend."
+			;;
+		builtin-http)
+			printf '{"backend":"builtin-http","backend_title":"%s","package":"","installed":true,"available":%s,"reason":"%s"}\n' \
+				"$(json_escape "$(backend_title builtin-http)")" \
+				"$(backend_available builtin-http && printf true || printf false)" \
+				"$(json_escape "$(backend_reason builtin-http)")"
+			exit 0
+			;;
+	esac
+
+	package="$(backend_package "$selected")"
+	[ -n "$package" ] || json_error "$(backend_title "$selected") cannot be installed automatically."
+
+	if backend_available "$selected"; then
+		printf '{"backend":"%s","backend_title":"%s","package":"%s","installed":true,"available":true,"reason":"%s"}\n' \
+			"$(json_escape "$selected")" \
+			"$(json_escape "$(backend_title "$selected")")" \
+			"$(json_escape "$package")" \
+			"$(json_escape "$(backend_reason "$selected")")"
+		exit 0
+	fi
+
+	command -v apk >/dev/null 2>&1 || json_error "apk was not found on this router."
+
+	packages="$package jsonfilter"
+	output="$(apk add $packages 2>&1)"
+	if [ "$?" -ne 0 ]; then
+		json_error "Failed to install $packages: $output"
+	fi
+
+	refresh_backend_bins
+
+	if backend_available "$selected"; then
+		available="true"
+	else
+		available="false"
+	fi
+
+	printf '{"backend":"%s","backend_title":"%s","package":"%s","installed":true,"available":%s,"reason":"%s"}\n' \
+		"$(json_escape "$selected")" \
+		"$(json_escape "$(backend_title "$selected")")" \
+		"$(json_escape "$package")" \
+		"$available" \
+		"$(json_escape "$(backend_reason "$selected")")"
 }
 
 reset_result() {
@@ -725,10 +801,7 @@ run_preferred_backend() {
 }
 
 warning=""
-jsonfilter_bin="$(command_path jsonfilter)"
-librespeed_bin="$(command_path librespeed-cli)"
-speedtest_go_bin="$(command_path speedtest-go)"
-iperf3_bin="$(command_path iperf3)"
+refresh_backend_bins
 
 download_bytes="$(positive_num_or_default "$(uci_get speedtest_download_bytes)" "$download_bytes_default")"
 upload_bytes="$(num_or_default "$(uci_get speedtest_upload_bytes)" "$upload_bytes_default")"
@@ -771,6 +844,11 @@ fetch_kind=""
 
 if [ "$mode" = "status" ]; then
 	backend_status_json
+	exit 0
+fi
+
+if [ "$mode" = "install" ]; then
+	backend_install_json "$preferred_backend"
 	exit 0
 fi
 

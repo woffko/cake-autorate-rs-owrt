@@ -37,6 +37,7 @@ var optionDescriptions = {
 	speedtest_iperf3_port: 'Optional iperf3 server port. Leave empty to use the iperf3 default.',
 	_speedtest_backend_order: 'Backend autodetect order used by the speed test helper.',
 	_speedtest_backend_status: 'Check which optional speed test backends are currently installed or configured on this router.',
+	_speedtest_backend_install: 'Install the selected optional backend package on this router. Auto and built-in HTTP do not need installation.',
 	_wizard_sqm_queue: 'Existing unmanaged SQM queues on the selected interface are reused to avoid duplicate shapers.',
 	manual_rate_limits: 'Show explicit min, base, and max autorate limits. Leave off to derive them from download and upload speeds.',
 	advanced_settings: 'Show detailed SQM, reflector, controller, logging, and daemon tuning settings.',
@@ -95,7 +96,7 @@ var optionDescriptions = {
 	high_load_thr: 'Fraction of current shaper rate that counts as high load.',
 	bufferbloat_refractory_period_ms: 'Minimum time after a bufferbloat response before another backoff may happen.',
 	decay_refractory_period_ms: 'Minimum time between low-load decay adjustments.',
-	pinger_method: 'Probe backend used to measure reflector latency. Only fping is currently available in this package.',
+	pinger_method: 'Probe backend used to measure reflector latency. fping supports concurrent reflectors; ping is a basic fallback using the first reflector.',
 	reflector: 'Hosts to probe for latency. Use stable anycast or nearby IP addresses.',
 	reflectors_url: 'Optional URL to fetch reflector candidates from at daemon startup. Falls back to the configured list if the URL is unavailable.',
 	reflectors_url_skip_lines: 'Number of header lines to skip when parsing reflector URL data.',
@@ -103,7 +104,7 @@ var optionDescriptions = {
 	retain_reflector_stats: 'Keep reflector statistics when replacing or restarting probes.',
 	no_pingers: 'Number of concurrent reflector probes to run.',
 	reflector_ping_interval_s: 'Seconds between pings sent by each reflector probe.',
-	ping_extra_args: 'Additional arguments passed to the pinger backend.',
+	ping_extra_args: 'Additional safe arguments passed to the ping backend. Shell metacharacters are ignored.',
 	ping_prefix_string: 'Optional command prefix for launching pingers, for example a namespace wrapper.',
 	irtt_session_duration_m: 'Duration of each IRTT session in minutes. IRTT is not implemented in the Rust MVP yet.',
 	output_processing_stats: 'Log detailed controller processing statistics.',
@@ -111,8 +112,8 @@ var optionDescriptions = {
 	output_reflector_stats: 'Log per-reflector latency statistics.',
 	output_summary_stats: 'Log compact periodic summaries.',
 	output_cake_changes: 'Log every CAKE bandwidth change command.',
-	output_cpu_stats: 'Log CPU usage summaries when CPU monitoring is implemented.',
-	output_cpu_raw_stats: 'Log raw CPU counters when CPU monitoring is implemented.',
+	output_cpu_stats: 'Log CPU usage summaries and expose the latest total CPU percentage in status.',
+	output_cpu_raw_stats: 'Log raw /proc/stat CPU counter lines for diagnostics.',
 	debug: 'Enable extra debug output from the daemon.',
 	log_DEBUG_messages_to_syslog: 'Send debug messages to syslog instead of only the normal log path.',
 	log_to_file: 'Write daemon logs to files in addition to stdout/syslog.',
@@ -121,13 +122,13 @@ var optionDescriptions = {
 	log_file_path_override: 'Directory for daemon log files. Leave empty for the default path.',
 	log_file_buffer_size_B: 'Buffered log write size in bytes.',
 	log_file_buffer_timeout_ms: 'Maximum time before flushing buffered log output.',
-	log_file_export_compress: 'Compress exported log bundles when log export is implemented.',
+	log_file_export_compress: 'Compress rotated daemon logs with gzip when available.',
 	enable_sleep_function: 'Allow the controller to sleep during sustained idle periods.',
 	sustained_idle_sleep_thr_s: 'Idle duration before sleep behavior may engage.',
 	min_shaper_rates_enforcement: 'Prevent shaper rates from dropping below configured minimums.',
 	startup_wait_s: 'Delay after service start before probing and adjusting rates.',
 	monitor_achieved_rates_interval_ms: 'Interval for sampling interface byte counters.',
-	monitor_cpu_usage_interval_ms: 'Interval for CPU usage sampling when implemented.',
+	monitor_cpu_usage_interval_ms: 'Interval for CPU usage sampling.',
 	reflector_health_check_interval_s: 'Interval between reflector health checks.',
 	reflector_response_deadline_s: 'Maximum acceptable reflector response time before it is considered late.',
 	reflector_misbehaving_detection_window: 'Number of recent health samples used to detect bad reflectors.',
@@ -506,6 +507,37 @@ function speedtestBackendChoiceTitle(value) {
 			return choices[i][1];
 
 	return value || _('Auto');
+}
+
+function speedtestBackendInstallable(value) {
+	return value && value !== 'auto' && value !== 'builtin-http';
+}
+
+function formatSpeedtestBackendInstall(result) {
+	var title = result.backend_title || speedtestBackendChoiceTitle(result.backend);
+	var pkg = result.package ? ' (' + result.package + ')' : '';
+	var reason = result.reason ? ' ' + result.reason : '';
+
+	if (result.available)
+		return _('Backend ready: %s%s.').format(title, pkg) + reason;
+
+	return _('Backend installed but not ready: %s%s.').format(title, pkg) + reason;
+}
+
+function parseExecJson(res) {
+	return JSON.parse((res.stdout || '').trim());
+}
+
+function installSpeedtestBackend(section_id, wan, backend) {
+	if (!speedtestBackendInstallable(backend))
+		return Promise.reject(new Error(_('Select LibreSpeed CLI, speedtest-go, or configured iperf3 before installing.')));
+
+	return fs.exec('/usr/libexec/cake-autorate-rs/speedtest', [
+		section_id,
+		wan,
+		'install',
+		backend
+	]).then(parseExecJson);
 }
 
 function formatSpeedtestBackendStatus(result) {
@@ -931,6 +963,30 @@ function showCreateWizard(grid, name) {
 				});
 			}
 		}, _('Check backends'));
+		var installButton = E('button', {
+			'class': 'btn cbi-button',
+			'click': function() {
+				syncInputs();
+				showError(null);
+
+				if (!speedtestBackendInstallable(state.speedtest_backend)) {
+					showError(_('Select LibreSpeed CLI, speedtest-go, or configured iperf3 before installing.'));
+					return;
+				}
+
+				installButton.disabled = true;
+				backendStatus.textContent = _('Installing backend...');
+
+				installSpeedtestBackend(state.name, state.wan_if, state.speedtest_backend).then(function(result) {
+					backendStatus.textContent = formatSpeedtestBackendInstall(result);
+				}).catch(function(err) {
+					showError(_('Speed test backend install failed: %s').format(err.message || err));
+					backendStatus.textContent = '';
+				}).then(function() {
+					installButton.disabled = false;
+				});
+			}
+		}, _('Install backend'));
 		var runButton = E('button', {
 			'class': 'btn cbi-button cbi-button-action',
 			'click': function() {
@@ -987,7 +1043,7 @@ function showCreateWizard(grid, name) {
 
 		return [
 			wizardField(_('Preferred backend'), backend, optionDescriptions.speedtest_backend),
-			wizardField(_('Check backends'), E('div', {}, [ checkButton, backendStatus ]), optionDescriptions._speedtest_backend_status),
+			wizardField(_('Check backends'), E('div', {}, [ checkButton, ' ', installButton, backendStatus ]), optionDescriptions._speedtest_backend_install),
 			wizardField(_('Speed test apply percent'), percent, optionDescriptions.speedtest_apply_percent),
 			wizardField(_('Download speed'), download, optionDescriptions.sqm_download),
 			wizardField(_('Upload speed'), upload, optionDescriptions.sqm_upload),
@@ -1245,6 +1301,38 @@ function addSpeedtestOptions(section) {
 		});
 	};
 
+	o = section.taboption('speedtest', form.Button, '_speedtest_backend_install', _('Install backend'));
+	modal(o);
+	describe(o, '_speedtest_backend_install');
+	o.inputtitle = _('Install backend');
+	o.inputstyle = 'action';
+	o.rmempty = true;
+	o.write = function() {};
+	o.remove = function() {};
+	o.onclick = function(ev, section_id) {
+		var activeSection = this.section;
+		var wan = selectedWan(activeSection, section_id, null, true);
+		var backend = null;
+		var backendOption = optionByName(activeSection, 'speedtest_backend');
+		var button = ev.currentTarget;
+
+		if (backendOption && typeof backendOption.formvalue == 'function')
+			backend = backendOption.formvalue(section_id);
+
+		if (!backend)
+			backend = uci.get('cake-autorate', section_id, 'speedtest_backend') || 'auto';
+
+		button.disabled = true;
+
+		return installSpeedtestBackend(section_id, wan, backend).then(function(result) {
+			ui.addNotification(null, E('p', formatSpeedtestBackendInstall(result)), result.available ? 'info' : 'warning');
+		}).catch(function(err) {
+			ui.addNotification(null, E('p', _('Speed test backend install failed: %s').format(err.message || err)), 'error');
+		}).then(function() {
+			button.disabled = false;
+		});
+	};
+
 	flag(section, 'speedtest', 'speedtest_bind_interface', _('Bind to target interface'), '1');
 	flag(section, 'speedtest', 'speedtest_force_ipv4', _('Force IPv4'), '1');
 	optionalValue(section, 'speedtest', 'speedtest_route_probe', _('Route probe'), 'host', '1.1.1.1');
@@ -1456,6 +1544,7 @@ function addReflectorOptions(section) {
 	modal(o);
 	describe(o, 'pinger_method');
 	o.value('fping', 'fping');
+	o.value('ping', _('ping fallback'));
 	o.rmempty = false;
 
 	o = section.taboption('reflectors', form.DynamicList, 'reflector', _('Reflectors'));
