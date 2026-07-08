@@ -96,13 +96,14 @@ var optionDescriptions = {
 	high_load_thr: 'Fraction of current shaper rate that counts as high load.',
 	bufferbloat_refractory_period_ms: 'Minimum time after a bufferbloat response before another backoff may happen.',
 	decay_refractory_period_ms: 'Minimum time between low-load decay adjustments.',
-	pinger_method: 'Probe backend used to measure reflector latency. fping supports concurrent RTT reflectors; fping-ts and tsping use ICMP timestamp OWD probes; ping is a basic fallback using the first reflector.',
+	pinger_method: 'Probe backend used to measure reflector latency. fping supports concurrent RTT reflectors; fping-ts and tsping use ICMP timestamp OWD probes; irtt uses explicit IRTT servers; ping is a basic fallback using the first reflector.',
 	_pinger_backend_status: 'Show which pinger binaries are available and which backend the planner would prefer.',
-	_pinger_backend_install: 'Install the package for the selected pinger when automatic installation is supported. tsping remains a manual binary install and irtt support is pending.',
+	_pinger_backend_install: 'Install the package for the selected pinger when automatic installation is supported. tsping remains a manual binary install; irtt also needs explicit IRTT servers.',
 	_reflector_scan: 'Probe configured reflectors plus the upstream default pool, classify timestamp support, and suggest an active set plus spare pool.',
 	_reflector_apply: 'Scan configured reflectors plus upstream defaults, then write the recommended pinger, active count, and ordered active plus spare reflector list into pending changes.',
 	_wizard_reflector_plan: 'Scan the upstream default reflector pool and fill the new instance with the recommended pinger and active/spare reflector set.',
 	reflector: 'Hosts to probe for latency. Defaults match the upstream cake-autorate anycast reflector pool.',
+	irtt_server: 'Explicit IRTT server hosts or addresses. These are used only when Pinger is set to irtt.',
 	reflectors_url: 'Optional URL to fetch reflector candidates from at daemon startup. Falls back to the configured list if the URL is unavailable.',
 	reflectors_url_skip_lines: 'Number of header lines to skip when parsing reflector URL data.',
 	randomize_reflectors: 'Shuffle reflector order before selecting active probes.',
@@ -111,7 +112,7 @@ var optionDescriptions = {
 	reflector_ping_interval_s: 'Seconds between pings sent by each reflector probe.',
 	ping_extra_args: 'Additional safe arguments passed to the ping backend. Shell metacharacters are ignored.',
 	ping_prefix_string: 'Optional command prefix for launching pingers, for example a namespace wrapper.',
-	irtt_session_duration_m: 'Duration of each IRTT session in minutes. IRTT is not implemented in the Rust MVP yet.',
+	irtt_session_duration_m: 'Duration of each IRTT client session in minutes. Longer sessions reduce restart gaps but use more memory inside irtt.',
 	output_processing_stats: 'Log detailed controller processing statistics.',
 	output_load_stats: 'Log achieved load and traffic rate statistics.',
 	output_reflector_stats: 'Log per-reflector latency statistics.',
@@ -352,6 +353,22 @@ function formOrUci(section, section_id, key) {
 	return value;
 }
 
+function listFormOrUci(section, section_id, key) {
+	var value = formOrUci(section, section_id, key);
+
+	if (Array.isArray(value))
+		return value.filter(function(item) {
+			return item != null && item !== '';
+		}).map(String);
+
+	if (value == null || value === '')
+		return [];
+
+	return String(value).split(/\s+/).filter(function(item) {
+		return item !== '';
+	});
+}
+
 function validationSection(option) {
 	if (option && option.section)
 		return option.section;
@@ -419,11 +436,40 @@ function validateDifferentInterfaces(section, section_id) {
 function validatePingerCount(section, section_id) {
 	var method = formOrUci(section, section_id, 'pinger_method') || 'fping';
 	var count = parseInt(formOrUci(section, section_id, 'no_pingers') || '6', 10);
+	var irttServers;
 
-	if (method !== 'ping' || isNaN(count) || count <= 1)
+	if (method === 'irtt') {
+		irttServers = listFormOrUci(section, section_id, 'irtt_server');
+
+		if (!irttServers.length)
+			return _('IRTT requires at least one explicit IRTT server.');
+
+		if (!isNaN(count) && count > irttServers.length)
+			return _('IRTT Pingers cannot exceed the configured IRTT server count.');
+
 		return true;
+	}
 
-	return _('The ping fallback uses only the first reflector. Set Pingers to 1 or choose fping/fping-ts/tsping.');
+	if (method === 'ping' && !isNaN(count) && count > 1)
+		return _('The ping fallback uses only the first reflector. Set Pingers to 1 or choose fping/fping-ts/tsping/irtt.');
+
+	return true;
+}
+
+function validateIrttServerValue(value) {
+	var values = Array.isArray(value) ? value : [ value ];
+
+	for (var i = 0; i < values.length; i++) {
+		var item = values[i];
+
+		if (item == null || item === '')
+			continue;
+
+		if (!/^[0-9A-Za-z:._\[\]-]+$/.test(String(item)))
+			return _('IRTT servers may contain only host, IPv4, IPv6, and optional port characters.');
+	}
+
+	return true;
 }
 
 function selectedSqmSection(section, section_id) {
@@ -745,12 +791,12 @@ function runPingerPlan(section_id, mode) {
 }
 
 function pingerBackendInstallable(value) {
-	return value === 'fping' || value === 'fping-ts';
+	return value === 'fping' || value === 'fping-ts' || value === 'irtt';
 }
 
 function installPingerBackend(section_id, backend) {
 	if (!pingerBackendInstallable(backend))
-		return Promise.reject(new Error(_('Only fping/fping-ts can be installed automatically. tsping is a manual binary install; irtt daemon support is pending.')));
+		return Promise.reject(new Error(_('Only fping/fping-ts/irtt can be installed automatically. tsping is a manual binary install.')));
 
 	return fs.exec('/usr/libexec/cake-autorate-rs/pinger-plan', [
 		section_id,
@@ -776,6 +822,8 @@ function formatPingerPlan(result) {
 	var lines = [];
 
 	lines.push(_('Configured pinger: %s').format(result.configured_method || '-'));
+	if (result.configured_irtt_server_count != null)
+		lines.push(_('Configured IRTT servers: %d').format(result.configured_irtt_server_count || 0));
 	lines.push(_('Recommended pinger: %s').format(result.recommended_method || '-'));
 	lines.push(_('Recommended active pingers: %s').format(result.recommended_no_pingers || '-'));
 
@@ -1977,7 +2025,7 @@ function addReflectorOptions(section) {
 
 		if (!pingerBackendInstallable(method)) {
 			ui.addNotification(null, E('p',
-				_('Only fping/fping-ts can be installed automatically. tsping is a manual binary install; irtt daemon support is pending.')), 'warning');
+				_('Only fping/fping-ts/irtt can be installed automatically. tsping is a manual binary install.')), 'warning');
 			return Promise.resolve();
 		}
 
@@ -2045,6 +2093,7 @@ function addReflectorOptions(section) {
 	o.value('fping', 'fping');
 	o.value('fping-ts', 'fping-ts');
 	o.value('tsping', _('tsping'));
+	o.value('irtt', _('irtt'));
 	o.value('ping', _('ping fallback'));
 	o.rmempty = false;
 	o.validate = function(section_id) {
@@ -2057,6 +2106,16 @@ function addReflectorOptions(section) {
 	o.datatype = 'host';
 	o.rmempty = false;
 
+	o = section.taboption('reflectors', form.DynamicList, 'irtt_server', _('IRTT servers'));
+	modal(o);
+	describe(o, 'irtt_server');
+	o.rmempty = true;
+	o.depends('pinger_method', 'irtt');
+	o.validate = function(section_id, value) {
+		var valid = validateIrttServerValue(value);
+		return valid === true ? validatePingerCount(validationSection(this), section_id) : valid;
+	};
+
 	optionalValue(section, 'reflectors', 'reflectors_url', _('Reflectors URL'), null, '');
 	value(section, 'reflectors', 'reflectors_url_skip_lines', _('URL skip lines'), 'uinteger', '1');
 	flag(section, 'reflectors', 'randomize_reflectors', _('Randomize reflectors'));
@@ -2068,7 +2127,8 @@ function addReflectorOptions(section) {
 	value(section, 'reflectors', 'reflector_ping_interval_s', _('Ping interval'), 'ufloat', '0.3');
 	optionalValue(section, 'reflectors', 'ping_extra_args', _('Extra ping args'), null, '');
 	optionalValue(section, 'reflectors', 'ping_prefix_string', _('Ping prefix'), null, '');
-	value(section, 'reflectors', 'irtt_session_duration_m', _('IRTT session minutes'), 'uinteger', '10');
+	o = value(section, 'reflectors', 'irtt_session_duration_m', _('IRTT session minutes'), 'uinteger', '10');
+	o.depends('pinger_method', 'irtt');
 }
 
 function addLoggingOptions(section) {

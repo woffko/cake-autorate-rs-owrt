@@ -61,6 +61,18 @@ valid_reflector() {
 	return 0
 }
 
+valid_irtt_server() {
+	valid_reflector "$1" && return 0
+
+	case "$1" in
+		''|*://*)
+			return 1
+			;;
+	esac
+
+	printf '%s' "$1" | grep -Eq '^\[[0-9A-Fa-f:.]+\](:[0-9]+)?$'
+}
+
 num_or_default() {
 	case "$1" in
 		''|*[!0-9]*)
@@ -102,6 +114,10 @@ append_line_var() {
 			;;
 		scan_candidates)
 			scan_candidates="${scan_candidates}${scan_candidates:+
+}$2"
+			;;
+		irtt_servers)
+			irtt_servers="${irtt_servers}${irtt_servers:+
 }$2"
 			;;
 	esac
@@ -232,7 +248,7 @@ pinger_target_mode() {
 
 pinger_supported() {
 	case "$1" in
-		fping|fping-ts|tsping|ping)
+		fping|fping-ts|tsping|irtt|ping)
 			return 0
 			;;
 	esac
@@ -252,7 +268,7 @@ pinger_available() {
 			[ -n "$tsping_bin" ]
 			;;
 		irtt)
-			[ -n "$irtt_bin" ]
+			[ -n "$irtt_bin" ] && [ "$irtt_server_count" -gt 0 ] 2>/dev/null
 			;;
 		ping)
 			[ -n "$ping_bin" ]
@@ -275,7 +291,13 @@ pinger_reason() {
 			[ -n "$tsping_bin" ] && printf '%s' "available" || printf '%s' "not installed"
 			;;
 		irtt)
-			[ -n "$irtt_bin" ] && printf '%s' "installed; daemon support pending" || printf '%s' "not installed; daemon support pending"
+			if [ -z "$irtt_bin" ]; then
+				printf '%s' "not installed"
+			elif [ "$irtt_server_count" -lt 1 ] 2>/dev/null; then
+				printf '%s' "installed; configure at least one irtt_server"
+			else
+				printf 'available with %s configured server(s)' "$irtt_server_count"
+			fi
 			;;
 		ping)
 			[ -n "$ping_bin" ] && printf '%s' "available" || printf '%s' "not installed"
@@ -295,7 +317,7 @@ pinger_install_hint() {
 			printf '%s' "install a compatible tsping binary manually"
 			;;
 		irtt)
-			printf '%s' "daemon support pending; will require irtt server configuration"
+			printf '%s' "apk add irtt, then configure at least one irtt_server"
 			;;
 		ping)
 			printf '%s' "provided by the base system"
@@ -308,12 +330,15 @@ pinger_package() {
 		fping|fping-ts)
 			printf '%s' "fping"
 			;;
+		irtt)
+			printf '%s' "irtt"
+			;;
 	esac
 }
 
 pinger_installable() {
 	case "$1" in
-		fping|fping-ts)
+		fping|fping-ts|irtt)
 			return 0
 			;;
 	esac
@@ -461,7 +486,10 @@ reflector_ping_interval_s="$(uci_get reflector_ping_interval_s)"
 [ -n "$reflector_ping_interval_s" ] || reflector_ping_interval_s="0.3"
 
 configured_reflectors="$(uci_get reflector)"
+configured_irtt_servers="$(uci_get irtt_server)"
 reflectors=""
+irtt_servers=""
+irtt_server_count=0
 candidate_source="configured"
 
 if [ -n "$configured_reflectors" ]; then
@@ -482,18 +510,31 @@ if [ -z "$configured_reflectors" ] || [ "$mode" = "scan" ]; then
 	done
 fi
 
+if [ -n "$configured_irtt_servers" ]; then
+	for irtt_server in $configured_irtt_servers; do
+		if valid_irtt_server "$irtt_server"; then
+			append_line_var irtt_servers "$irtt_server"
+			irtt_server_count=$((irtt_server_count + 1))
+		else
+			append_warning "Ignoring invalid irtt_server candidate: $irtt_server"
+		fi
+	done
+fi
+
 refresh_pinger_bins
 
 [ -n "$fping_bin" ] || append_warning "fping is not installed; concurrent RTT probing is unavailable."
 [ "$fping_ts_supported" = "1" ] || append_warning "Installed fping does not expose --icmp-timestamp; fping-ts is unavailable."
 [ -n "$tsping_bin" ] || append_warning "tsping binary is not installed; tsping remains a manual optional backend."
-[ -n "$irtt_bin" ] || append_warning "irtt package is not installed. irtt daemon support is pending and will also require configured IRTT servers."
-if [ -n "$irtt_bin" ]; then
-	append_warning "irtt binary is installed, but this daemon build does not support pinger_method=irtt yet."
+if [ -z "$irtt_bin" ]; then
+	append_warning "irtt package is not installed; pinger_method=irtt is unavailable until irtt is installed and irtt_server is configured."
+elif [ "$irtt_server_count" -lt 1 ] 2>/dev/null; then
+	append_warning "irtt binary is installed, but no irtt_server is configured; pinger_method=irtt is unavailable until at least one explicit IRTT server is set."
 fi
 
 if [ "$mode" = "install" ]; then
 	pinger_install_json "$install_backend"
+	exit 0
 fi
 
 candidate_count=0
@@ -600,7 +641,10 @@ if [ "$mode" = "scan" ]; then
 		recommended_reason="No usable pinger backend is available."
 	fi
 else
-	if [ "$configured_method" = "ping" ]; then
+	if [ "$configured_method" = "irtt" ]; then
+		recommended_method="irtt"
+		recommended_reason="Current configuration requests explicit IRTT servers."
+	elif [ "$configured_method" = "ping" ]; then
 		recommended_method="ping"
 		recommended_reason="Current configuration uses the single-reflector ping fallback; run a scan before changing it."
 	elif [ "$configured_method" = "fping-ts" ] || [ "$configured_method" = "tsping" ]; then
@@ -609,53 +653,85 @@ else
 	fi
 fi
 
+if [ "$configured_method" = "irtt" ]; then
+	recommended_method="irtt"
+	recommended_reason="Current configuration requests explicit IRTT servers."
+fi
+
+if [ "$recommended_method" = "irtt" ]; then
+	target_pingers="$configured_no_pingers"
+	if [ -z "$irtt_bin" ]; then
+		recommended_reason="Current configuration requests irtt, but the irtt package is not installed."
+	elif [ "$irtt_server_count" -lt 1 ] 2>/dev/null; then
+		recommended_reason="Current configuration requests irtt, but no irtt_server is configured."
+	elif [ "$target_pingers" -gt "$irtt_server_count" ] 2>/dev/null; then
+		target_pingers="$irtt_server_count"
+	fi
+fi
+
 active=""
 spare=""
 selected_count=0
-OLDIFS="$IFS"
-IFS='
-'
-for row in $scan_rows; do
-	IFS='|'
-	set -- $row
+if [ "$recommended_method" = "irtt" ]; then
+	OLDIFS="$IFS"
 	IFS='
 '
-	reflector="$1"
-	rtt_ok="$2"
-	ts_ok="$3"
-	[ -n "$reflector" ] || continue
-	ok=0
-	case "$recommended_method" in
-		fping-ts|tsping)
-			[ "$mode" = "scan" ] && [ "$ts_ok" = "1" ] && ok=1
-			;;
-		fping)
-			if [ "$mode" = "scan" ]; then
-				[ "$rtt_ok" = "1" ] && ok=1
-			else
-				ok=1
-			fi
-			;;
-		ping)
-			if [ "$mode" = "scan" ]; then
-				[ "$rtt_ok" = "1" ] && ok=1
-			else
-				ok=1
-			fi
-			;;
-	esac
-	if [ "$ok" = "1" ]; then
+	for irtt_server in $irtt_servers; do
+		[ -n "$irtt_server" ] || continue
 		if [ "$selected_count" -lt "$target_pingers" ] 2>/dev/null; then
-			append_line_var active "$reflector"
+			append_line_var active "$irtt_server"
 			selected_count=$((selected_count + 1))
 		else
-			append_line_var spare "$reflector"
+			append_line_var spare "$irtt_server"
 		fi
-	elif [ "$mode" = "scan" ]; then
-		append_line_var bad "$reflector"
-	fi
-done
-IFS="$OLDIFS"
+	done
+	IFS="$OLDIFS"
+else
+	OLDIFS="$IFS"
+	IFS='
+'
+	for row in $scan_rows; do
+		IFS='|'
+		set -- $row
+		IFS='
+'
+		reflector="$1"
+		rtt_ok="$2"
+		ts_ok="$3"
+		[ -n "$reflector" ] || continue
+		ok=0
+		case "$recommended_method" in
+			fping-ts|tsping)
+				[ "$mode" = "scan" ] && [ "$ts_ok" = "1" ] && ok=1
+				;;
+			fping)
+				if [ "$mode" = "scan" ]; then
+					[ "$rtt_ok" = "1" ] && ok=1
+				else
+					ok=1
+				fi
+				;;
+			ping)
+				if [ "$mode" = "scan" ]; then
+					[ "$rtt_ok" = "1" ] && ok=1
+				else
+					ok=1
+				fi
+				;;
+		esac
+		if [ "$ok" = "1" ]; then
+			if [ "$selected_count" -lt "$target_pingers" ] 2>/dev/null; then
+				append_line_var active "$reflector"
+				selected_count=$((selected_count + 1))
+			else
+				append_line_var spare "$reflector"
+			fi
+		elif [ "$mode" = "scan" ]; then
+			append_line_var bad "$reflector"
+		fi
+	done
+	IFS="$OLDIFS"
+fi
 
 if [ "$mode" = "scan" ] && [ "$selected_count" -lt "$target_pingers" ] 2>/dev/null; then
 	append_warning "Fewer usable reflectors than desired active pingers; reduce Pingers or add better reflectors."
@@ -666,6 +742,7 @@ printf '"section":"%s",' "$(json_escape "$section")"
 printf '"mode":"%s",' "$(json_escape "$mode")"
 printf '"configured_method":"%s",' "$(json_escape "$configured_method")"
 printf '"configured_no_pingers":%s,' "$configured_no_pingers"
+printf '"configured_irtt_server_count":%s,' "$irtt_server_count"
 printf '"reflector_ping_interval_s":"%s",' "$(json_escape "$reflector_ping_interval_s")"
 printf '"candidate_source":"%s",' "$(json_escape "$candidate_source")"
 printf '"default_pool_count":%s,' "$default_pool_count"

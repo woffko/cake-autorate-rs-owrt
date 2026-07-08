@@ -73,6 +73,8 @@ struct Config {
     pinger_method: String,
     ping_extra_args: String,
     reflectors: Vec<String>,
+    irtt_servers: Vec<String>,
+    irtt_session_duration_m: f64,
     reflectors_url: String,
     reflectors_url_skip_lines: usize,
     randomize_reflectors: bool,
@@ -146,6 +148,8 @@ impl Config {
             pinger_method: "fping".to_string(),
             ping_extra_args: String::new(),
             reflectors: default_reflectors(),
+            irtt_servers: Vec::new(),
+            irtt_session_duration_m: 10.0,
             reflectors_url: String::new(),
             reflectors_url_skip_lines: 1,
             randomize_reflectors: true,
@@ -305,6 +309,11 @@ impl Config {
         )?;
         set_string(&single, "pinger_method", &mut cfg.pinger_method);
         set_string(&single, "ping_extra_args", &mut cfg.ping_extra_args);
+        set_f64(
+            &single,
+            "irtt_session_duration_m",
+            &mut cfg.irtt_session_duration_m,
+        )?;
         set_string(&single, "reflectors_url", &mut cfg.reflectors_url);
         set_usize(
             &single,
@@ -525,10 +534,27 @@ impl Config {
                 .map(str::to_string)
                 .collect();
         }
+        if let Some(values) = lists.get("irtt_server") {
+            cfg.irtt_servers = values.iter().filter(|v| !v.is_empty()).cloned().collect();
+        } else if let Some(value) = single
+            .get("irtt_servers")
+            .or_else(|| single.get("irtt_server"))
+        {
+            cfg.irtt_servers = value
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+        deduplicate_list(&mut cfg.irtt_servers);
         cfg.load_reflectors_url();
         cfg.deduplicate_reflectors();
         if cfg.randomize_reflectors {
             randomize_reflectors(&mut cfg.reflectors);
+            randomize_reflectors(&mut cfg.irtt_servers);
+        }
+        if cfg.pinger_method == "irtt" {
+            cfg.reflectors = cfg.irtt_servers.clone();
         }
 
         cfg.normalize_paths();
@@ -564,15 +590,7 @@ impl Config {
     }
 
     fn deduplicate_reflectors(&mut self) {
-        let mut seen: Vec<String> = Vec::new();
-        self.reflectors.retain(|reflector| {
-            if seen.iter().any(|value| value == reflector) {
-                false
-            } else {
-                seen.push(reflector.clone());
-                true
-            }
-        });
+        deduplicate_list(&mut self.reflectors);
     }
 
     fn normalize_paths(&mut self) {
@@ -593,17 +611,32 @@ impl Config {
         if self.pinger_method != "fping"
             && self.pinger_method != "fping-ts"
             && self.pinger_method != "tsping"
+            && self.pinger_method != "irtt"
             && self.pinger_method != "ping"
         {
             return Err(format!(
-                "pinger_method={} is configured, but this Rust package currently supports fping, fping-ts, tsping, and ping",
+                "pinger_method={} is configured, but this Rust package currently supports fping, fping-ts, tsping, irtt, and ping",
                 self.pinger_method
             ));
+        }
+        if self.pinger_method == "irtt" && self.irtt_servers.is_empty() {
+            return Err("pinger_method=irtt requires at least one irtt_server".to_string());
         }
         if self.reflectors.is_empty() {
             return Err("at least one reflector is required".to_string());
         }
-        if self
+        if self.pinger_method == "irtt" {
+            if self
+                .reflectors
+                .iter()
+                .any(|server| !is_valid_irtt_server_candidate(server))
+            {
+                return Err(
+                    "irtt_server may contain only host, IPv4, IPv6, and optional port characters"
+                        .to_string(),
+                );
+            }
+        } else if self
             .reflectors
             .iter()
             .any(|reflector| !is_valid_reflector_candidate(reflector))
@@ -620,6 +653,9 @@ impl Config {
         }
         if self.no_pingers > self.reflectors.len() {
             return Err("no_pingers cannot exceed reflector count".to_string());
+        }
+        if self.pinger_method == "irtt" && self.irtt_session_duration_m <= 0.0 {
+            return Err("irtt_session_duration_m must be greater than zero".to_string());
         }
         if self.bufferbloat_detection_thr > self.bufferbloat_detection_window {
             return Err(
@@ -1818,7 +1854,7 @@ fn run(cfg: Config, once: bool) -> Result<(), String> {
     while !TERMINATE.load(Ordering::SeqCst) {
         match pinger.lines.recv_timeout(health.timeout(&cfg)) {
             Ok(Ok(line)) => {
-                if let Some(sample) = parse_sample_line(&cfg, &line, &pinger.ping_reflector) {
+                if let Some(sample) = parse_sample_line(&cfg, &line.line, &line.reflector) {
                     health.observe_sample(&cfg, &sample);
                     controller.on_sample(sample, &active_reflectors, &health);
                 }
@@ -1828,6 +1864,16 @@ fn run(cfg: Config, once: bool) -> Result<(), String> {
             Err(RecvTimeoutError::Disconnected) => {
                 if TERMINATE.load(Ordering::SeqCst) {
                     break;
+                }
+
+                if cfg.pinger_method == "irtt" {
+                    controller.log(
+                        "DEBUG",
+                        "irtt session ended; restarting irtt clients for active servers",
+                    );
+                    pinger.stop();
+                    pinger = PingerRuntime::spawn(&cfg, &active_reflectors)?;
+                    continue;
                 }
 
                 return Err(format!("{} output closed unexpectedly", cfg.pinger_method));
@@ -1844,61 +1890,86 @@ fn run(cfg: Config, once: bool) -> Result<(), String> {
     Ok(())
 }
 
+struct PingerLine {
+    line: String,
+    reflector: String,
+}
+
 struct PingerRuntime {
-    child: Child,
-    reader: Option<JoinHandle<()>>,
-    lines: Receiver<Result<String, String>>,
-    ping_reflector: String,
+    children: Vec<Child>,
+    readers: Vec<JoinHandle<()>>,
+    lines: Receiver<Result<PingerLine, String>>,
 }
 
 impl PingerRuntime {
     fn spawn(cfg: &Config, active_reflectors: &[String]) -> Result<Self, String> {
-        let mut child = spawn_pinger(cfg, active_reflectors)?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| format!("failed to capture {} stdout", cfg.pinger_method))?;
+        let mut children = spawn_pingers(cfg, active_reflectors)?;
         let (tx, lines) = mpsc::channel();
-        let method = cfg.pinger_method.clone();
-        let reader = thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                match line {
-                    Ok(line) => {
-                        if tx.send(Ok(line)).is_err() {
+        let mut readers = Vec::new();
+
+        for idx in 0..children.len() {
+            let stdout = match children[idx].stdout.take() {
+                Some(stdout) => stdout,
+                None => {
+                    for child in &mut children {
+                        stop_child(child);
+                    }
+                    return Err(format!("failed to capture {} stdout", cfg.pinger_method));
+                }
+            };
+            let tx = tx.clone();
+            let method = cfg.pinger_method.clone();
+            let reflector = if method == "ping" || method == "irtt" {
+                active_reflectors.get(idx).cloned().unwrap_or_default()
+            } else {
+                String::new()
+            };
+            readers.push(thread::spawn(move || {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines() {
+                    match line {
+                        Ok(line) => {
+                            let event = PingerLine {
+                                line,
+                                reflector: reflector.clone(),
+                            };
+                            if tx.send(Ok(event)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(format!("failed to read {method} output: {e}")));
                             break;
                         }
                     }
-                    Err(e) => {
-                        let _ = tx.send(Err(format!("failed to read {method} output: {e}")));
-                        break;
-                    }
                 }
-            }
-        });
+            }));
+        }
 
         Ok(Self {
-            child,
-            reader: Some(reader),
+            children,
+            readers,
             lines,
-            ping_reflector: active_reflectors.first().cloned().unwrap_or_default(),
         })
     }
 
     fn stop(&mut self) {
-        stop_child(&mut self.child);
-        if let Some(reader) = self.reader.take() {
+        for child in &mut self.children {
+            stop_child(child);
+        }
+        for reader in self.readers.drain(..) {
             let _ = reader.join();
         }
     }
 }
 
-fn spawn_pinger(cfg: &Config, active_reflectors: &[String]) -> Result<Child, String> {
+fn spawn_pingers(cfg: &Config, active_reflectors: &[String]) -> Result<Vec<Child>, String> {
     match cfg.pinger_method.as_str() {
-        "fping" => spawn_fping(cfg, active_reflectors, false),
-        "fping-ts" => spawn_fping(cfg, active_reflectors, true),
-        "tsping" => spawn_tsping(cfg, active_reflectors),
-        "ping" => spawn_ping(cfg, active_reflectors),
+        "fping" => Ok(vec![spawn_fping(cfg, active_reflectors, false)?]),
+        "fping-ts" => Ok(vec![spawn_fping(cfg, active_reflectors, true)?]),
+        "tsping" => Ok(vec![spawn_tsping(cfg, active_reflectors)?]),
+        "irtt" => spawn_irtt(cfg, active_reflectors),
+        "ping" => Ok(vec![spawn_ping(cfg, active_reflectors)?]),
         other => Err(format!("unsupported pinger_method={other}")),
     }
 }
@@ -1994,6 +2065,43 @@ fn spawn_ping(cfg: &Config, active_reflectors: &[String]) -> Result<Child, Strin
         .map_err(|e| format!("failed to start ping: {e}"))
 }
 
+fn spawn_irtt(cfg: &Config, active_reflectors: &[String]) -> Result<Vec<Child>, String> {
+    if active_reflectors.is_empty() {
+        return Err("at least one irtt_server is required".to_string());
+    }
+
+    let interval = format!("{}s", cfg.reflector_ping_interval_s);
+    let duration = format!("{}m", cfg.irtt_session_duration_m);
+    let mut children = Vec::new();
+
+    for target in active_reflectors {
+        let mut cmd = Command::new("irtt");
+        cmd.arg("client");
+        for arg in safe_extra_args(&cfg.ping_extra_args) {
+            cmd.arg(arg);
+        }
+        cmd.arg("-i")
+            .arg(&interval)
+            .arg("-d")
+            .arg(&duration)
+            .arg(irtt_target_arg(target))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        match cmd.spawn() {
+            Ok(child) => children.push(child),
+            Err(e) => {
+                for child in &mut children {
+                    stop_child(child);
+                }
+                return Err(format!("failed to start irtt for {target}: {e}"));
+            }
+        }
+    }
+
+    Ok(children)
+}
+
 fn stop_child(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
@@ -2002,6 +2110,7 @@ fn stop_child(child: &mut Child) {
 fn parse_sample_line(cfg: &Config, line: &str, ping_reflector: &str) -> Option<Sample> {
     match cfg.pinger_method.as_str() {
         "ping" => parse_ping_line(line, ping_reflector),
+        "irtt" => parse_irtt_line(line, ping_reflector),
         "fping-ts" => parse_fping_ts_line(line),
         "tsping" => parse_tsping_line(line),
         _ => parse_fping_line(line),
@@ -2095,6 +2204,30 @@ fn parse_tsping_line(line: &str) -> Option<Sample> {
     })
 }
 
+fn parse_irtt_line(line: &str, reflector: &str) -> Option<Sample> {
+    if reflector.is_empty()
+        || !line.contains("seq=")
+        || !line.contains("rd=")
+        || !line.contains("sd=")
+    {
+        return None;
+    }
+
+    let seq = parse_irtt_token(line, "seq=")?.to_string();
+    let dl_owd_us = parse_irtt_duration_us(parse_irtt_token(line, "rd=")?)?;
+    let ul_owd_us = parse_irtt_duration_us(parse_irtt_token(line, "sd=")?)?;
+
+    Some(Sample {
+        reflector: reflector.to_string(),
+        seq,
+        timestamp: epoch_secs(),
+        rtt_ms: (dl_owd_us + ul_owd_us) / 1000.0,
+        dl_owd_us,
+        ul_owd_us,
+        timestamped_owd: true,
+    })
+}
+
 fn parse_ping_line(line: &str, reflector: &str) -> Option<Sample> {
     if reflector.is_empty() {
         return None;
@@ -2147,6 +2280,37 @@ fn parse_ping_token_after(line: &str, marker: &str) -> Option<String> {
     } else {
         Some(value)
     }
+}
+
+fn parse_irtt_token<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    line.split_whitespace()
+        .map(|token| token.trim_matches(|ch| matches!(ch, ',' | ';' | ')' | '(')))
+        .find_map(|token| token.strip_prefix(prefix))
+        .map(|value| value.trim_matches(|ch| matches!(ch, ',' | ';' | ')' | '(')))
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_irtt_duration_us(value: &str) -> Option<f64> {
+    if value.starts_with('-') {
+        return None;
+    }
+
+    let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
+        (number, 1000.0)
+    } else if let Some(number) = value
+        .strip_suffix("us")
+        .or_else(|| value.strip_suffix("\u{00b5}s"))
+    {
+        (number, 1.0)
+    } else if let Some(number) = value.strip_suffix("ns") {
+        (number, 0.001)
+    } else if let Some(number) = value.strip_suffix('s') {
+        (number, 1_000_000.0)
+    } else {
+        return None;
+    };
+
+    Some(number.parse::<f64>().ok()? * multiplier)
 }
 
 fn safe_extra_args(value: &str) -> Vec<String> {
@@ -2223,6 +2387,41 @@ fn is_valid_reflector_candidate(value: &str) -> bool {
     value
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | ':'))
+}
+
+fn is_valid_irtt_server_candidate(value: &str) -> bool {
+    if value.is_empty() || value.len() > 253 || value.contains("://") {
+        return false;
+    }
+
+    value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | ':' | '[' | ']'))
+}
+
+fn deduplicate_list(values: &mut Vec<String>) {
+    let mut seen: Vec<String> = Vec::new();
+    values.retain(|value| {
+        if seen.iter().any(|existing| existing == value) {
+            false
+        } else {
+            seen.push(value.clone());
+            true
+        }
+    });
+}
+
+fn irtt_target_arg(target: &str) -> String {
+    let colon_count = target
+        .as_bytes()
+        .iter()
+        .filter(|byte| **byte == b':')
+        .count();
+    if colon_count > 1 && !target.starts_with('[') {
+        format!("[{target}]")
+    } else {
+        target.to_string()
+    }
 }
 
 fn randomize_reflectors(reflectors: &mut [String]) {
@@ -2696,8 +2895,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_reflectors, next_spare_reflector, parse_fping_ts_line, parse_reflector_candidates,
-        parse_tsping_line, parse_uci_values, reflector_bad_reflectors, reflector_health_json,
+        default_reflectors, irtt_target_arg, next_spare_reflector, parse_fping_ts_line,
+        parse_irtt_duration_us, parse_irtt_line, parse_reflector_candidates, parse_tsping_line,
+        parse_uci_values, reflector_bad_reflectors, reflector_health_json,
         reflector_spare_reflectors, Config, ReflectorHealth, ReflectorState,
     };
     use std::time::Instant;
@@ -2777,6 +2977,39 @@ mod tests {
     #[test]
     fn ignores_incomplete_tsping_line() {
         assert!(parse_tsping_line("1783449500.123456,127.0.0.1,42").is_none());
+    }
+
+    #[test]
+    fn parses_irtt_client_line() {
+        let line = "[0] seq=7 send=1.2ms delay=2.3ms rd=450us sd=1.25ms ipdv=20us";
+        let sample = parse_irtt_line(line, "irtt.example.net").expect("expected irtt sample");
+
+        assert_eq!(sample.reflector, "irtt.example.net");
+        assert_eq!(sample.seq, "7");
+        assert_eq!(sample.rtt_ms, 1.7);
+        assert_eq!(sample.dl_owd_us, 450.0);
+        assert_eq!(sample.ul_owd_us, 1250.0);
+        assert!(sample.timestamped_owd);
+    }
+
+    #[test]
+    fn parses_irtt_duration_units() {
+        assert_eq!(parse_irtt_duration_us("2s"), Some(2_000_000.0));
+        assert_eq!(parse_irtt_duration_us("3.5ms"), Some(3500.0));
+        assert_eq!(parse_irtt_duration_us("450us"), Some(450.0));
+        assert_eq!(parse_irtt_duration_us("900ns"), Some(0.9));
+        assert!(parse_irtt_duration_us("-1ms").is_none());
+        assert!(parse_irtt_duration_us("10m").is_none());
+    }
+
+    #[test]
+    fn formats_irtt_target_for_ipv6_only() {
+        assert_eq!(irtt_target_arg("2001:db8::1"), "[2001:db8::1]");
+        assert_eq!(irtt_target_arg("[2001:db8::1]:2112"), "[2001:db8::1]:2112");
+        assert_eq!(
+            irtt_target_arg("irtt.example.net:2112"),
+            "irtt.example.net:2112"
+        );
     }
 
     #[test]

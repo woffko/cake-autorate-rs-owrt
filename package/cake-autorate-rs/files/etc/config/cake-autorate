@@ -48,6 +48,7 @@ config cake_autorate 'primary'
 	option sqm_linklayer_adaptation_mechanism 'default'
 
 	# Pinger backend. fping-ts/tsping use ICMP timestamp probes when reflectors support them.
+	# irtt requires explicit IRTT servers; generic DNS reflectors are not used for it.
 	option pinger_method 'fping'
 	list reflector '1.1.1.1'
 	list reflector '1.0.0.1'
@@ -85,6 +86,7 @@ config cake_autorate 'primary'
 	option retain_reflector_stats '1'
 	option no_pingers '6'
 	option reflector_ping_interval_s '0.3'
+	# list irtt_server 'irtt.example.net:2112'
 
 	# Delay thresholds
 	option dl_avg_owd_delta_max_adjust_up_thr_ms '10.0'
@@ -124,6 +126,7 @@ config cake_autorate 'primary'
 	# Advanced pinger options
 	option ping_extra_args ''
 	option ping_prefix_string ''
+	# IRTT stores results in memory during each client session.
 	option irtt_session_duration_m '10'
 
 	# Monitoring intervals and detector windows
