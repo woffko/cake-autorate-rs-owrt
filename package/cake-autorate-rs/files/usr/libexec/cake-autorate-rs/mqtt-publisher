@@ -1,0 +1,279 @@
+#!/bin/sh
+
+CONFIG="cake-autorate"
+SECTION="$1"
+
+[ -n "$SECTION" ] || {
+	echo "usage: mqtt-publisher <cake-autorate-section>" >&2
+	exit 2
+}
+
+[ -r /lib/functions.sh ] || {
+	echo "ERROR: /lib/functions.sh is not available" >&2
+	exit 1
+}
+
+. /lib/functions.sh
+
+json_escape() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+sanitize_id() {
+	printf '%s' "$1" | tr -c 'A-Za-z0-9_' '_'
+}
+
+publish_message() {
+	local topic="$1"
+	local payload="$2"
+	local retain="${3:-0}"
+	local retain_arg=""
+
+	[ "$retain" = "1" ] && retain_arg="-r"
+
+	if [ -n "$mqtt_user" ]; then
+		mosquitto_pub -h "$mqtt_host" -p "$mqtt_port" -u "$mqtt_user" -P "$mqtt_pass" \
+			$retain_arg -q 1 -t "$topic" -m "$payload"
+	else
+		mosquitto_pub -h "$mqtt_host" -p "$mqtt_port" \
+			$retain_arg -q 1 -t "$topic" -m "$payload"
+	fi
+}
+
+publish_config() {
+	local object_id="$1"
+	local payload="$2"
+
+	publish_message "$discovery_prefix/sensor/$device_id/$object_id/config" "$payload" 1
+}
+
+sensor_payload() {
+	local name="$1"
+	local value_template="$2"
+	local unit="$3"
+	local unique="$4"
+	local unit_part=""
+
+	[ -n "$unit" ] && unit_part=",\"unit_of_measurement\":\"$(json_escape "$unit")\""
+
+	printf '{"name":"%s","state_topic":"%s","value_template":"%s"%s,"unique_id":"%s","availability_topic":"%s","device":{"identifiers":["%s"],"name":"%s"}}' \
+		"$(json_escape "$name")" \
+		"$(json_escape "$mqtt_topic")" \
+		"$(json_escape "$value_template")" \
+		"$unit_part" \
+		"$(json_escape "${device_id}_${unique}")" \
+		"$(json_escape "$availability_topic")" \
+		"$(json_escape "$device_id")" \
+		"$(json_escape "$device_name")"
+}
+
+publish_discovery() {
+	local c
+
+	publish_config "dl_achieved_rate_kbps" "$(sensor_payload "DL Achieved Rate" "{{ value_json.dl_achieved_rate_kbps }}" "kbps" "dl_achieved_rate")"
+	publish_config "ul_achieved_rate_kbps" "$(sensor_payload "UL Achieved Rate" "{{ value_json.ul_achieved_rate_kbps }}" "kbps" "ul_achieved_rate")"
+	publish_config "cake_dl_rate_kbps" "$(sensor_payload "CAKE DL Rate" "{{ value_json.cake_dl_rate_kbps }}" "kbps" "cake_dl_rate")"
+	publish_config "cake_ul_rate_kbps" "$(sensor_payload "CAKE UL Rate" "{{ value_json.cake_ul_rate_kbps }}" "kbps" "cake_ul_rate")"
+	publish_config "dl_sum_delays" "$(sensor_payload "DL Delay Sum" "{{ value_json.dl_sum_delays }}" "us" "dl_delay")"
+	publish_config "ul_sum_delays" "$(sensor_payload "UL Delay Sum" "{{ value_json.ul_sum_delays }}" "us" "ul_delay")"
+	publish_config "dl_avg_owd_delta_us" "$(sensor_payload "DL OWD Delta" "{{ value_json.dl_avg_owd_delta_us }}" "us" "dl_owd")"
+	publish_config "ul_avg_owd_delta_us" "$(sensor_payload "UL OWD Delta" "{{ value_json.ul_avg_owd_delta_us }}" "us" "ul_owd")"
+	publish_config "dl_load_condition" "$(sensor_payload "DL Load Condition" "{{ value_json.dl_load_condition }}" "" "dl_condition")"
+	publish_config "ul_load_condition" "$(sensor_payload "UL Load Condition" "{{ value_json.ul_load_condition }}" "" "ul_condition")"
+
+	if [ "$mqtt_publish_cpu_stats" -eq 1 ]; then
+		publish_config "cpu_total" "$(sensor_payload "CPU Total" "{{ value_json.cpu_total }}" "%" "cpu_total")"
+		c=0
+		while [ "$c" -lt "$cpu_cores" ]; do
+			publish_config "cpu_core$c" "$(sensor_payload "CPU Core $c" "{{ value_json.cpu_core$c }}" "%" "cpu_core$c")"
+			c=$((c + 1))
+		done
+	fi
+}
+
+publish_availability() {
+	publish_message "$availability_topic" "$1" 1 2>/dev/null || true
+}
+
+publish_stream() {
+	if [ -n "$mqtt_user" ]; then
+		mosquitto_pub -h "$mqtt_host" -p "$mqtt_port" -u "$mqtt_user" -P "$mqtt_pass" \
+			-t "$mqtt_topic" -l -q 1 \
+			--will-topic "$availability_topic" \
+			--will-payload "offline" \
+			--will-qos 1 \
+			--will-retain
+	else
+		mosquitto_pub -h "$mqtt_host" -p "$mqtt_port" \
+			-t "$mqtt_topic" -l -q 1 \
+			--will-topic "$availability_topic" \
+			--will-payload "offline" \
+			--will-qos 1 \
+			--will-retain
+	fi
+}
+
+tail_log() {
+	if tail --help 2>&1 | grep -q -- '-F'; then
+		tail -n 0 -F "$log_file" 2>/dev/null
+	else
+		tail -n 0 -f "$log_file" 2>/dev/null
+	fi
+}
+
+cleanup() {
+	trap - INT TERM EXIT
+	publish_availability "offline"
+	exit 0
+}
+
+config_load "$CONFIG"
+config_get_bool mqtt_enabled "$SECTION" mqtt_enabled 0
+[ "$mqtt_enabled" -eq 1 ] || exit 0
+
+command -v mosquitto_pub >/dev/null 2>&1 || {
+	echo "ERROR: mosquitto_pub is not installed; install mosquitto-client-nossl or mosquitto-client-ssl" >&2
+	exit 1
+}
+
+config_get mqtt_host "$SECTION" mqtt_host
+config_get mqtt_port "$SECTION" mqtt_port 1883
+config_get mqtt_user "$SECTION" mqtt_username
+config_get mqtt_pass "$SECTION" mqtt_password
+config_get discovery_prefix "$SECTION" mqtt_discovery_prefix homeassistant
+config_get base_topic "$SECTION" mqtt_base_topic cake-autorate
+config_get base_device_id "$SECTION" mqtt_device_id cake_autorate
+config_get base_device_name "$SECTION" mqtt_device_name cake-autorate
+config_get min_interval_s "$SECTION" mqtt_min_interval_s 1
+config_get_bool mqtt_publish_cpu_stats "$SECTION" mqtt_publish_cpu_stats 0
+config_get_bool output_summary_stats "$SECTION" output_summary_stats 1
+config_get_bool output_cpu_stats "$SECTION" output_cpu_stats 0
+config_get_bool log_to_file "$SECTION" log_to_file 1
+config_get log_dir "$SECTION" log_file_path_override
+
+[ -n "$mqtt_host" ] || {
+	echo "ERROR: mqtt_host is required when mqtt_enabled=1" >&2
+	exit 1
+}
+
+[ "$log_to_file" -eq 1 ] || {
+	echo "WARNING: log_to_file=0; MQTT publisher needs daemon log files to read SUMMARY/CPU records" >&2
+}
+
+[ "$output_summary_stats" -eq 1 ] || {
+	echo "WARNING: output_summary_stats=0; MQTT publisher will not receive SUMMARY records" >&2
+}
+
+if [ "$mqtt_publish_cpu_stats" -eq 1 ] && [ "$output_cpu_stats" -ne 1 ]; then
+	echo "WARNING: mqtt_publish_cpu_stats=1 but output_cpu_stats=0; CPU sensors will stay empty" >&2
+fi
+
+[ -n "$log_dir" ] || log_dir="/var/log"
+log_file="$log_dir/cake-autorate.$SECTION.log"
+mkdir -p "$log_dir" 2>/dev/null || true
+touch "$log_file" 2>/dev/null || true
+
+cpu_cores="$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || printf '1')"
+case "$cpu_cores" in
+	''|0|*[!0-9]*)
+		cpu_cores=1
+		;;
+esac
+
+safe_instance="$(sanitize_id "$SECTION")"
+device_id="${base_device_id}_${safe_instance}"
+device_name="${base_device_name} (${SECTION})"
+mqtt_topic="${base_topic}/${SECTION}"
+availability_topic="${mqtt_topic}/availability"
+
+trap cleanup INT TERM EXIT
+
+publish_discovery
+
+while true; do
+	publish_availability "online"
+	tail_log | awk -F'; ' \
+		-v min_int="$min_interval_s" \
+		-v default_cores="$cpu_cores" \
+		-v publish_cpu="$mqtt_publish_cpu_stats" '
+	BEGIN {
+		last_emit = 0
+		s_dl_rate = s_ul_rate = 0
+		s_dl_delays = s_ul_delays = 0
+		s_dl_owd = s_ul_owd = 0
+		s_cpu_total = 0
+		sn = cn = 0
+		dl_load = ul_load = "unknown"
+		cake_dl = cake_ul = 0
+		prev_cpu_total = 0
+		num_cores = default_cores + 0
+		for (i = 0; i < num_cores; i++) {
+			s_cpu_core[i] = 0
+			prev_cpu_core[i] = 0
+		}
+		summary_epoch = cpu_epoch = 0
+	}
+
+	$1 == "SUMMARY" && NF >= 12 {
+		summary_epoch = $2 + 0
+		s_dl_rate += $3 + 0
+		s_ul_rate += $4 + 0
+		s_dl_delays += $5 + 0
+		s_ul_delays += $6 + 0
+		s_dl_owd += $7 + 0
+		s_ul_owd += $8 + 0
+		dl_load = $9
+		ul_load = $10
+		cake_dl = $11 + 0
+		cake_ul = $12 + 0
+		sn++
+	}
+
+	publish_cpu == 1 && $1 == "CPU" && NF >= 3 {
+		cpu_epoch = $2 + 0
+		s_cpu_total += $3 + 0
+		if (num_cores == 0)
+			num_cores = NF - 3
+		for (i = 0; i < num_cores; i++)
+			s_cpu_core[i] += $(4 + i) + 0
+		cn++
+	}
+
+		{
+			event_epoch = summary_epoch
+			if (sn > 0 && event_epoch > 0 && event_epoch - last_emit >= min_int) {
+			last_emit = event_epoch
+			sd = (sn > 0) ? sn : 1
+			cpu_json = ""
+			if (publish_cpu == 1) {
+				if (cn > 0) {
+					prev_cpu_total = s_cpu_total / cn
+					for (i = 0; i < num_cores; i++)
+						prev_cpu_core[i] = s_cpu_core[i] / cn
+				}
+				for (i = 0; i < num_cores; i++)
+					cpu_json = cpu_json sprintf(",\"cpu_core%d\":%.1f", i, prev_cpu_core[i])
+				cpu_json = sprintf(",\"cpu_total\":%.1f%s", prev_cpu_total, cpu_json)
+			}
+			printf "{\"event_epoch\":%.6f,\"dl_achieved_rate_kbps\":%.1f,\"ul_achieved_rate_kbps\":%.1f,\"dl_sum_delays\":%.1f,\"ul_sum_delays\":%.1f,\"dl_avg_owd_delta_us\":%.1f,\"ul_avg_owd_delta_us\":%.1f,\"dl_load_condition\":\"%s\",\"ul_load_condition\":\"%s\",\"cake_dl_rate_kbps\":%.0f,\"cake_ul_rate_kbps\":%.0f%s,\"samples\":%d}\n",
+				event_epoch,
+				s_dl_rate / sd, s_ul_rate / sd,
+				s_dl_delays / sd, s_ul_delays / sd,
+				s_dl_owd / sd, s_ul_owd / sd,
+				dl_load, ul_load,
+				cake_dl, cake_ul,
+				cpu_json,
+				sn
+			s_dl_rate = s_ul_rate = 0
+			s_dl_delays = s_ul_delays = 0
+			s_dl_owd = s_ul_owd = 0
+			s_cpu_total = 0
+			for (i = 0; i < num_cores; i++)
+				s_cpu_core[i] = 0
+			sn = cn = 0
+			fflush("")
+		}
+	}
+	' | publish_stream
+	sleep 5
+done

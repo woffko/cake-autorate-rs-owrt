@@ -122,6 +122,19 @@ config cake_autorate 'primary'
 	option log_file_buffer_size_B '512'
 	option log_file_buffer_timeout_ms '500'
 	option log_file_export_compress '1'
+	# Optional MQTT publisher. Requires mosquitto_pub from mosquitto-client-nossl
+	# or mosquitto-client-ssl, and reads SUMMARY/CPU records from daemon log files.
+	option mqtt_enabled '0'
+	option mqtt_host ''
+	option mqtt_port '1883'
+	option mqtt_username ''
+	option mqtt_password ''
+	option mqtt_discovery_prefix 'homeassistant'
+	option mqtt_base_topic 'cake-autorate'
+	option mqtt_device_id 'cake_autorate'
+	option mqtt_device_name 'cake-autorate'
+	option mqtt_min_interval_s '1'
+	option mqtt_publish_cpu_stats '0'
 
 	# Advanced pinger options
 	option ping_extra_args ''

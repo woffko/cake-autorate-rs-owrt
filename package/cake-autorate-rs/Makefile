@@ -4,7 +4,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=cake-autorate-rs
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=17
+PKG_RELEASE:=19
 
 PKG_MAINTAINER:=woffko
 PKG_LICENSE:=GPL-2.0-or-later
@@ -27,8 +27,8 @@ endef
 define Package/cake-autorate-rs/description
   Rust daemon prototype for cake-autorate on OpenWrt. The first backend
   supports UCI configuration, fping/fping-ts/tsping/irtt/ping probing, sysfs byte
-  counters, tc-based CAKE shaper updates, procd service integration, and LuCI
-  status.
+  counters, tc-based CAKE shaper updates, optional MQTT publishing, procd
+  service integration, and LuCI status.
 endef
 
 define Package/cake-autorate-rs/conffiles
@@ -47,6 +47,10 @@ define Package/cake-autorate-rs/install
 	$(INSTALL_CONF) ./files/etc/config/cake-autorate $(1)/etc/config/cake-autorate
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/etc/init.d/cake-autorate $(1)/etc/init.d/cake-autorate
+	$(INSTALL_BIN) ./files/etc/init.d/cake-autorate-mqtt $(1)/etc/init.d/cake-autorate-mqtt
+	$(INSTALL_DIR) $(1)/usr/libexec/cake-autorate-rs
+	$(INSTALL_BIN) ./files/usr/libexec/cake-autorate-rs/mqtt-publisher $(1)/usr/libexec/cake-autorate-rs/mqtt-publisher
+	$(INSTALL_BIN) ./files/usr/libexec/cake-autorate-rs/mqtt-status $(1)/usr/libexec/cake-autorate-rs/mqtt-status
 endef
 
 $(eval $(call BuildPackage,cake-autorate-rs))
