@@ -31,6 +31,44 @@ function formatPercent(value) {
 	return isNaN(value) ? '-' : value.toFixed(1) + '%';
 }
 
+function reflectorList(values) {
+	if (!Array.isArray(values))
+		return [];
+
+	return values.filter(function(value) {
+		return value != null && value !== '';
+	}).map(String);
+}
+
+function previewList(values, limit) {
+	values = reflectorList(values);
+
+	if (!values.length)
+		return '-';
+
+	if (values.length <= limit)
+		return values.join(', ');
+
+	return '%s +%d'.format(values.slice(0, limit).join(', '), values.length - limit);
+}
+
+function reflectorSummary(status) {
+	var active = reflectorList(status.active_reflectors);
+	var spare = reflectorList(status.spare_reflectors);
+	var bad = reflectorList(status.bad_reflectors);
+	var title = [
+		'Active: ' + (active.length ? active.join(', ') : '-'),
+		'Spare: ' + (spare.length ? spare.join(', ') : '-'),
+		'Bad: ' + (bad.length ? bad.join(', ') : '-')
+	].join('\n');
+
+	return E('div', { 'class': 'cake-reflector-summary', 'title': title }, [
+		E('div', {}, _('Active: %s').format(previewList(active, 3))),
+		E('div', {}, _('Spare: %s').format(previewList(spare, 2))),
+		E('div', { 'class': bad.length ? 'cake-reflector-bad' : '' }, _('Bad: %s').format(previewList(bad, 2)))
+	]);
+}
+
 function renderTable(sections, statuses) {
 	var rows = [];
 	var children;
@@ -43,6 +81,7 @@ function renderTable(sections, statuses) {
 			section,
 			st.updated_at ? new Date(st.updated_at * 1000).toLocaleString() : '-',
 			st.reflector || '-',
+			reflectorSummary(st),
 			st.rtt_ms != null ? Number(st.rtt_ms).toFixed(2) + ' ms' : '-',
 			formatRate(st.dl_achieved_rate_kbps),
 			formatRate(st.ul_achieved_rate_kbps),
@@ -57,6 +96,7 @@ function renderTable(sections, statuses) {
 			E('th', { 'class': 'th' }, _('Instance')),
 			E('th', { 'class': 'th' }, _('Updated')),
 			E('th', { 'class': 'th' }, _('Reflector')),
+			E('th', { 'class': 'th' }, _('Runtime reflectors')),
 			E('th', { 'class': 'th' }, _('RTT')),
 			E('th', { 'class': 'th' }, _('DL achieved')),
 			E('th', { 'class': 'th' }, _('UL achieved')),
@@ -73,7 +113,7 @@ function renderTable(sections, statuses) {
 			})));
 	} else {
 		children.push(E('tr', { 'class': 'tr' }, [
-			E('td', { 'class': 'td', 'colspan': '9' }, _('No instances configured.'))
+			E('td', { 'class': 'td', 'colspan': '10' }, _('No instances configured.'))
 		]));
 	}
 

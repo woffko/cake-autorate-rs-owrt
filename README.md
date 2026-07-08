@@ -38,6 +38,8 @@ Implemented:
   `fping-ts`, `tsping`, and `ping` probes: response-deadline offences,
   baseline/EWMA comparison, periodic replacement, optional reflector stats
   logging, and pinger restart with the next spare candidate.
+- Runtime status JSON and LuCI status page expose active, spare, and bad
+  reflector sets plus per-reflector samples, offence counters, and last RTT.
 - sysfs RX/TX byte counter sampling.
 - optional CPU usage sampling from `/proc/stat`, exposed in logs and status JSON.
 - adaptive rate calculations using delay/load windows.
@@ -80,8 +82,7 @@ Known limits:
   compatible `tsping` binary manually where available before selecting it.
 - reflector health/replacement is implemented as an MVP; `fping-ts` uses
   separate DL/UL OWD samples while RTT backends still use RTT/2 estimates.
-- Runtime active/spare reflector health display is still future work; the LuCI
-  planner can already scan a broader upstream default candidate pool and apply
+- The LuCI planner can scan a broader upstream default candidate pool and apply
   the recommended pinger method, active count, and ordered reflector list.
 - Use the external LibreQoS Internet Quality Test at https://test.libreqos.com/
   as a manual browser-side validation tool after configuring autorate. It is
