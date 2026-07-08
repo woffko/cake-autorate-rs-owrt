@@ -12,6 +12,39 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static TERMINATE: AtomicBool = AtomicBool::new(false);
 
+const UPSTREAM_DEFAULT_REFLECTORS: &[&str] = &[
+    "1.1.1.1",
+    "1.0.0.1",
+    "8.8.8.8",
+    "8.8.4.4",
+    "9.9.9.9",
+    "9.9.9.10",
+    "9.9.9.11",
+    "94.140.14.15",
+    "94.140.14.140",
+    "94.140.14.141",
+    "94.140.15.15",
+    "94.140.15.16",
+    "64.6.65.6",
+    "156.154.70.1",
+    "156.154.70.2",
+    "156.154.70.3",
+    "156.154.70.4",
+    "156.154.70.5",
+    "156.154.71.1",
+    "156.154.71.2",
+    "156.154.71.3",
+    "156.154.71.4",
+    "156.154.71.5",
+    "208.67.220.2",
+    "208.67.220.123",
+    "208.67.220.220",
+    "208.67.222.2",
+    "208.67.222.123",
+    "185.228.168.9",
+    "185.228.168.10",
+];
+
 extern "C" fn handle_signal(_: i32) {
     TERMINATE.store(true, Ordering::SeqCst);
 }
@@ -112,14 +145,7 @@ impl Config {
             connection_active_thr_kbps: 2000.0,
             pinger_method: "fping".to_string(),
             ping_extra_args: String::new(),
-            reflectors: vec![
-                "1.1.1.1".to_string(),
-                "1.0.0.1".to_string(),
-                "8.8.8.8".to_string(),
-                "8.8.4.4".to_string(),
-                "9.9.9.9".to_string(),
-                "9.9.9.10".to_string(),
-            ],
+            reflectors: default_reflectors(),
             reflectors_url: String::new(),
             reflectors_url_skip_lines: 1,
             randomize_reflectors: true,
@@ -518,16 +544,16 @@ impl Config {
         let configured_reflectors = self.reflectors.clone();
         match fetch_url_text(&self.reflectors_url) {
             Ok(data) => {
-                let mut reflectors =
-                    parse_reflector_candidates(&data, self.reflectors_url_skip_lines);
+                let reflectors = parse_reflector_candidates(&data, self.reflectors_url_skip_lines);
                 if reflectors.is_empty() {
                     eprintln!(
                         "WARNING: reflectors_url {} returned no usable reflectors; using configured list",
                         self.reflectors_url
                     );
                 } else {
-                    reflectors.extend(configured_reflectors);
-                    self.reflectors = reflectors;
+                    let mut merged = configured_reflectors;
+                    merged.extend(reflectors);
+                    self.reflectors = merged;
                 }
             }
             Err(e) => eprintln!(
@@ -1292,7 +1318,12 @@ impl Controller {
         self.apply_shaper("ul");
     }
 
-    fn on_sample(&mut self, sample: Sample) {
+    fn on_sample(
+        &mut self,
+        sample: Sample,
+        active_reflectors: &[String],
+        health: &ReflectorHealth,
+    ) {
         let now = Instant::now();
         let (dl_rate, ul_rate) = self.rate_monitor.sample();
         let dl_load_pct = percent(dl_rate, self.shaper_dl);
@@ -1431,6 +1462,8 @@ impl Controller {
             avg_dl_delta,
             avg_ul_delta,
             &sample,
+            active_reflectors,
+            Some(health),
         );
     }
 
@@ -1658,13 +1691,18 @@ impl Controller {
         avg_dl_delta: f64,
         avg_ul_delta: f64,
         sample: &Sample,
+        active_reflectors: &[String],
+        health: Option<&ReflectorHealth>,
     ) -> io::Result<()> {
         let path = self.cfg.run_dir().join("status.json");
         let tmp = self.cfg.run_dir().join("status.json.tmp");
+        let spare_reflectors = reflector_spare_reflectors(&self.cfg, active_reflectors);
+        let bad_reflectors = reflector_bad_reflectors(&self.cfg, health);
+        let reflector_health = reflector_health_json(&self.cfg, active_reflectors, health);
         let mut file = File::create(&tmp)?;
         writeln!(
             file,
-            "{{\"instance\":\"{}\",\"version\":\"0.1.0\",\"started_at\":{:.6},\"updated_at\":{:.6},\"dl_if\":\"{}\",\"ul_if\":\"{}\",\"reflector\":\"{}\",\"seq\":\"{}\",\"probe_timestamp\":{:.6},\"rtt_ms\":{:.3},\"dl_owd_us\":{:.1},\"ul_owd_us\":{:.1},\"dl_achieved_rate_kbps\":{:.1},\"ul_achieved_rate_kbps\":{:.1},\"dl_load_percent\":{:.1},\"ul_load_percent\":{:.1},\"dl_sum_delays\":{},\"ul_sum_delays\":{},\"dl_avg_owd_delta_us\":{:.1},\"ul_avg_owd_delta_us\":{:.1},\"cake_dl_rate_kbps\":{:.0},\"cake_ul_rate_kbps\":{:.0},\"cpu_total_percent\":{},\"cpu_core_percentages\":{}}}",
+            "{{\"instance\":\"{}\",\"version\":\"0.1.0\",\"started_at\":{:.6},\"updated_at\":{:.6},\"dl_if\":\"{}\",\"ul_if\":\"{}\",\"reflector\":\"{}\",\"seq\":\"{}\",\"probe_timestamp\":{:.6},\"rtt_ms\":{:.3},\"dl_owd_us\":{:.1},\"ul_owd_us\":{:.1},\"dl_achieved_rate_kbps\":{:.1},\"ul_achieved_rate_kbps\":{:.1},\"dl_load_percent\":{:.1},\"ul_load_percent\":{:.1},\"dl_sum_delays\":{},\"ul_sum_delays\":{},\"dl_avg_owd_delta_us\":{:.1},\"ul_avg_owd_delta_us\":{:.1},\"cake_dl_rate_kbps\":{:.0},\"cake_ul_rate_kbps\":{:.0},\"cpu_total_percent\":{},\"cpu_core_percentages\":{},\"active_reflectors\":{},\"spare_reflectors\":{},\"bad_reflectors\":{},\"reflector_health\":{}}}",
             json_escape(&self.cfg.instance),
             self.started_at,
             epoch_secs(),
@@ -1687,12 +1725,20 @@ impl Controller {
             self.shaper_dl,
             self.shaper_ul,
             json_f64_or_null(self.cpu_total_percent, 1),
-            json_f64_array(&self.cpu_core_percentages, 1)
+            json_f64_array(&self.cpu_core_percentages, 1),
+            json_string_array(active_reflectors),
+            json_string_array(&spare_reflectors),
+            json_string_array(&bad_reflectors),
+            reflector_health
         )?;
         fs::rename(tmp, path)
     }
 
-    fn write_initial_status(&mut self) -> io::Result<()> {
+    fn write_initial_status(
+        &mut self,
+        active_reflectors: &[String],
+        health: Option<&ReflectorHealth>,
+    ) -> io::Result<()> {
         let sample = Sample {
             reflector: String::new(),
             seq: String::new(),
@@ -1702,7 +1748,19 @@ impl Controller {
             ul_owd_us: 0.0,
             timestamped_owd: false,
         };
-        self.write_status(0.0, 0.0, 0.0, 0.0, 0, 0, 0.0, 0.0, &sample)
+        self.write_status(
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0,
+            0,
+            0.0,
+            0.0,
+            &sample,
+            active_reflectors,
+            health,
+        )
     }
 
     fn log(&mut self, kind: &str, msg: &str) {
@@ -1736,8 +1794,15 @@ fn run(cfg: Config, once: bool) -> Result<(), String> {
 
     let mut controller = Controller::new(cfg.clone())?;
     controller.start();
+    let mut active_reflectors: Vec<String> = cfg
+        .reflectors
+        .iter()
+        .take(cfg.no_pingers)
+        .cloned()
+        .collect();
+    let mut health = ReflectorHealth::new(&cfg, &active_reflectors);
     controller
-        .write_initial_status()
+        .write_initial_status(&active_reflectors, Some(&health))
         .map_err(|e| format!("failed to write status: {e}"))?;
 
     if once {
@@ -1748,13 +1813,6 @@ fn run(cfg: Config, once: bool) -> Result<(), String> {
         return Ok(());
     }
 
-    let mut active_reflectors: Vec<String> = cfg
-        .reflectors
-        .iter()
-        .take(cfg.no_pingers)
-        .cloned()
-        .collect();
-    let mut health = ReflectorHealth::new(&cfg, &active_reflectors);
     let mut pinger = PingerRuntime::spawn(&cfg, &active_reflectors)?;
 
     while !TERMINATE.load(Ordering::SeqCst) {
@@ -1762,7 +1820,7 @@ fn run(cfg: Config, once: bool) -> Result<(), String> {
             Ok(Ok(line)) => {
                 if let Some(sample) = parse_sample_line(&cfg, &line, &pinger.ping_reflector) {
                     health.observe_sample(&cfg, &sample);
-                    controller.on_sample(sample);
+                    controller.on_sample(sample, &active_reflectors, &health);
                 }
             }
             Ok(Err(e)) => return Err(e),
@@ -2464,6 +2522,121 @@ fn json_f64_array(values: &[f64], precision: usize) -> String {
     format!("[{}]", out.join(","))
 }
 
+fn default_reflectors() -> Vec<String> {
+    UPSTREAM_DEFAULT_REFLECTORS
+        .iter()
+        .map(|reflector| (*reflector).to_string())
+        .collect()
+}
+
+fn json_bool(value: bool) -> &'static str {
+    if value {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+fn json_string_array(values: &[String]) -> String {
+    let out: Vec<String> = values
+        .iter()
+        .map(|value| format!("\"{}\"", json_escape(value)))
+        .collect();
+    format!("[{}]", out.join(","))
+}
+
+fn reflector_spare_reflectors(cfg: &Config, active: &[String]) -> Vec<String> {
+    cfg.reflectors
+        .iter()
+        .filter(|reflector| !active.iter().any(|active| active == *reflector))
+        .cloned()
+        .collect()
+}
+
+fn reflector_bad_reflectors(cfg: &Config, health: Option<&ReflectorHealth>) -> Vec<String> {
+    let Some(health) = health else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for reflector in &cfg.reflectors {
+        if health
+            .states
+            .get(reflector)
+            .map(|state| state.offence_sum >= cfg.reflector_misbehaving_detection_thr)
+            .unwrap_or(false)
+        {
+            out.push(reflector.clone());
+        }
+    }
+
+    for (reflector, state) in &health.states {
+        if state.offence_sum >= cfg.reflector_misbehaving_detection_thr
+            && !out.iter().any(|value| value == reflector)
+        {
+            out.push(reflector.clone());
+        }
+    }
+
+    out
+}
+
+fn reflector_health_json(
+    cfg: &Config,
+    active: &[String],
+    health: Option<&ReflectorHealth>,
+) -> String {
+    let now = Instant::now();
+    let mut reflectors = cfg.reflectors.clone();
+    for reflector in active {
+        if !reflectors.iter().any(|value| value == reflector) {
+            reflectors.push(reflector.clone());
+        }
+    }
+
+    if let Some(health) = health {
+        for reflector in health.states.keys() {
+            if !reflectors.iter().any(|value| value == reflector) {
+                reflectors.push(reflector.clone());
+            }
+        }
+    }
+
+    let out: Vec<String> = reflectors
+        .iter()
+        .map(|reflector| {
+            let state = health.and_then(|health| health.states.get(reflector));
+            let active = active.iter().any(|value| value == reflector);
+            let bad = state
+                .map(|state| state.offence_sum >= cfg.reflector_misbehaving_detection_thr)
+                .unwrap_or(false);
+            let last_seen_age_s = state.map(|state| now.duration_since(state.last_seen).as_secs_f64());
+            let last_rtt_ms = state.and_then(|state| {
+                if state.samples > 0 {
+                    Some(state.last_rtt_ms)
+                } else {
+                    None
+                }
+            });
+
+            format!(
+                "{{\"host\":\"{}\",\"active\":{},\"spare\":{},\"bad\":{},\"samples\":{},\"offence_sum\":{},\"offence_threshold\":{},\"last_rtt_ms\":{},\"last_seen_age_s\":{}}}",
+                json_escape(reflector),
+                json_bool(active),
+                json_bool(!active),
+                json_bool(bad),
+                state.map(|state| state.samples).unwrap_or(0),
+                state.map(|state| state.offence_sum).unwrap_or(0),
+                cfg.reflector_misbehaving_detection_thr,
+                json_f64_or_null(last_rtt_ms, 3),
+                json_f64_or_null(last_seen_age_s, 3)
+            )
+        })
+        .collect();
+
+    format!("[{}]", out.join(","))
+}
+
 fn print_usage() {
     eprintln!("usage: cake-autorated [--instance NAME] [--once] [--dump-config]");
 }
@@ -2523,8 +2696,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        next_spare_reflector, parse_fping_ts_line, parse_reflector_candidates, parse_tsping_line,
-        parse_uci_values, ReflectorState,
+        default_reflectors, next_spare_reflector, parse_fping_ts_line, parse_reflector_candidates,
+        parse_tsping_line, parse_uci_values, reflector_bad_reflectors, reflector_health_json,
+        reflector_spare_reflectors, Config, ReflectorHealth, ReflectorState,
     };
     use std::time::Instant;
 
@@ -2552,6 +2726,19 @@ mod tests {
         assert_eq!(
             parse_reflector_candidates(data, 1),
             vec!["1.1.1.1", "9.9.9.9"]
+        );
+    }
+
+    #[test]
+    fn default_reflectors_match_upstream_pool() {
+        let reflectors = default_reflectors();
+
+        assert_eq!(reflectors.len(), 30);
+        assert_eq!(reflectors.first().map(String::as_str), Some("1.1.1.1"));
+        assert!(reflectors.iter().any(|reflector| reflector == "9.9.9.11"));
+        assert_eq!(
+            reflectors.last().map(String::as_str),
+            Some("185.228.168.10")
         );
     }
 
@@ -2623,5 +2810,38 @@ mod tests {
 
         state.push_offence(false);
         assert_eq!(state.offence_sum, 1);
+    }
+
+    #[test]
+    fn reports_runtime_reflector_sets() {
+        let mut cfg = Config::defaults("test".to_string());
+        cfg.reflectors = vec![
+            "1.1.1.1".to_string(),
+            "1.0.0.1".to_string(),
+            "8.8.8.8".to_string(),
+        ];
+        cfg.reflector_misbehaving_detection_thr = 2;
+        let active = vec!["1.1.1.1".to_string(), "1.0.0.1".to_string()];
+        let mut health = ReflectorHealth::new(&cfg, &active);
+        let state = health.states.get_mut("1.0.0.1").unwrap();
+        state.samples = 3;
+        state.last_rtt_ms = 12.5;
+        state.offence_sum = 2;
+
+        assert_eq!(
+            reflector_spare_reflectors(&cfg, &active),
+            vec!["8.8.8.8".to_string()]
+        );
+        assert_eq!(
+            reflector_bad_reflectors(&cfg, Some(&health)),
+            vec!["1.0.0.1".to_string()]
+        );
+
+        let json = reflector_health_json(&cfg, &active, Some(&health));
+        assert!(json.contains("\"host\":\"1.0.0.1\""));
+        assert!(json.contains("\"active\":true"));
+        assert!(json.contains("\"bad\":true"));
+        assert!(json.contains("\"spare\":true"));
+        assert!(json.contains("\"last_rtt_ms\":12.500"));
     }
 }
