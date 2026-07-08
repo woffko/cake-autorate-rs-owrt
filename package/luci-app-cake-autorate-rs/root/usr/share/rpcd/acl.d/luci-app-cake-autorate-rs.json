@@ -25,11 +25,18 @@
 				"/etc/init.d/cake-autorate stop": [ "exec" ],
 				"/etc/init.d/cake-autorate restart": [ "exec" ],
 				"/etc/init.d/cake-autorate reload": [ "exec" ],
+				"/etc/init.d/cake-autorate-mqtt enable": [ "exec" ],
+				"/etc/init.d/cake-autorate-mqtt disable": [ "exec" ],
+				"/etc/init.d/cake-autorate-mqtt start": [ "exec" ],
+				"/etc/init.d/cake-autorate-mqtt stop": [ "exec" ],
+				"/etc/init.d/cake-autorate-mqtt restart": [ "exec" ],
+				"/etc/init.d/cake-autorate-mqtt reload": [ "exec" ],
 				"/etc/init.d/sqm enable": [ "exec" ],
 				"/etc/init.d/sqm start": [ "exec" ],
 				"/etc/init.d/sqm restart": [ "exec" ],
 				"/usr/libexec/cake-autorate-rs/speedtest *": [ "exec" ],
-				"/usr/libexec/cake-autorate-rs/pinger-plan *": [ "exec" ]
+				"/usr/libexec/cake-autorate-rs/pinger-plan *": [ "exec" ],
+				"/usr/libexec/cake-autorate-rs/mqtt-status *": [ "exec" ]
 			},
 			"ubus": {
 				"luci": [ "setInitAction" ]

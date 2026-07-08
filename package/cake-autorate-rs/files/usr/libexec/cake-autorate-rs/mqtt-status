@@ -1,0 +1,93 @@
+#!/bin/sh
+
+CONFIG="cake-autorate"
+section="$1"
+mode="${2:-status}"
+pkg="${3:-mosquitto-client-nossl}"
+
+[ -n "$section" ] || {
+	echo '{"error":"usage: mqtt-status <section> [status|install] [package]"}'
+	exit 2
+}
+
+json_escape() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+uci_get() {
+	uci -q get "$CONFIG.$section.$1" 2>/dev/null
+}
+
+uci_get_default() {
+	local value
+
+	value="$(uci_get "$1")"
+	[ -n "$value" ] || value="$2"
+	printf '%s\n' "$value"
+}
+
+bool_json() {
+	[ "$1" = "1" ] && printf 'true' || printf 'false'
+}
+
+emit_status() {
+	local installed enabled host configured_host log_to_file summary cpu publish_cpu available reason
+
+	command -v mosquitto_pub >/dev/null 2>&1 && installed=1 || installed=0
+	enabled="$(uci_get_default mqtt_enabled 0)"
+	host="$(uci_get mqtt_host)"
+	[ -n "$host" ] && configured_host=1 || configured_host=0
+	log_to_file="$(uci_get_default log_to_file 1)"
+	summary="$(uci_get_default output_summary_stats 1)"
+	cpu="$(uci_get_default output_cpu_stats 0)"
+	publish_cpu="$(uci_get_default mqtt_publish_cpu_stats 0)"
+
+	available=0
+	if [ "$installed" -ne 1 ]; then
+		reason="mosquitto_pub not installed"
+	elif [ "$configured_host" -ne 1 ]; then
+		reason="configure mqtt_host"
+	elif [ "$summary" -ne 1 ]; then
+		reason="enable output_summary_stats"
+	elif [ "$publish_cpu" -eq 1 ] && [ "$cpu" -ne 1 ]; then
+		reason="enable output_cpu_stats or disable MQTT CPU sensors"
+	elif [ "$log_to_file" -ne 1 ]; then
+		reason="enable log_to_file"
+	else
+		available=1
+		reason="available"
+	fi
+
+	printf '{"section":"%s","mode":"%s","package":"%s","installed":%s,"enabled":%s,"configured_host":%s,"available":%s,"summary_enabled":%s,"cpu_enabled":%s,"publish_cpu":%s,"log_to_file":%s,"reason":"%s","install_hint":"apk add %s"}\n' \
+		"$(json_escape "$section")" \
+		"$(json_escape "$mode")" \
+		"$(json_escape "$pkg")" \
+		"$(bool_json "$installed")" \
+		"$(bool_json "$enabled")" \
+		"$(bool_json "$configured_host")" \
+		"$(bool_json "$available")" \
+		"$(bool_json "$summary")" \
+		"$(bool_json "$cpu")" \
+		"$(bool_json "$publish_cpu")" \
+		"$(bool_json "$log_to_file")" \
+		"$(json_escape "$reason")" \
+		"$(json_escape "$pkg")"
+}
+
+case "$mode" in
+	status)
+		emit_status
+		;;
+	install)
+		if ! command -v apk >/dev/null 2>&1; then
+			echo '{"error":"apk is not available on this system"}'
+			exit 1
+		fi
+		apk add "$pkg" >/dev/null
+		emit_status
+		;;
+	*)
+		echo '{"error":"mode must be status or install"}'
+		exit 2
+		;;
+esac

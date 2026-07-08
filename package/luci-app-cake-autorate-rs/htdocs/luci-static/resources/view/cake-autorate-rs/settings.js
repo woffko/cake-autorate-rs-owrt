@@ -129,6 +129,19 @@ var optionDescriptions = {
 	log_file_buffer_size_B: 'Buffered log write size in bytes.',
 	log_file_buffer_timeout_ms: 'Maximum time before flushing buffered log output.',
 	log_file_export_compress: 'Compress rotated daemon logs with gzip when available.',
+	mqtt_enabled: 'Start a separate MQTT publisher for this instance. It reads daemon log files and publishes Home Assistant discovery and status through mosquitto_pub.',
+	mqtt_host: 'MQTT broker host or address. Required only when the MQTT publisher is enabled.',
+	mqtt_port: 'MQTT broker port. Leave empty to use 1883.',
+	mqtt_username: 'Optional MQTT broker username.',
+	mqtt_password: 'Optional MQTT broker password.',
+	mqtt_discovery_prefix: 'Home Assistant MQTT discovery prefix.',
+	mqtt_base_topic: 'Base MQTT topic used for instance state and availability.',
+	mqtt_device_id: 'Home Assistant device identifier prefix. The instance name is appended automatically.',
+	mqtt_device_name: 'Home Assistant device display name prefix. The instance name is appended automatically.',
+	mqtt_min_interval_s: 'Minimum seconds between MQTT state publications.',
+	mqtt_publish_cpu_stats: 'Publish CPU sensors through MQTT. Requires CPU stats logging.',
+	_mqtt_status: 'Check whether the MQTT client package and required saved log settings are ready for this instance. Save pending MQTT edits before relying on this status.',
+	_mqtt_install: 'Install the default MQTT client package. The publisher needs mosquitto_pub from mosquitto-client-nossl or mosquitto-client-ssl.',
 	enable_sleep_function: 'Allow the controller to sleep during sustained idle periods.',
 	sustained_idle_sleep_thr_s: 'Idle duration before sleep behavior may engage.',
 	min_shaper_rates_enforcement: 'Prevent shaper rates from dropping below configured minimums.',
@@ -505,6 +518,26 @@ function validateSqmSectionUnique(section, section_id) {
 	return true;
 }
 
+function validateMqttConfig(section, section_id) {
+	if (!checkedFormOrUci(section, section_id, 'mqtt_enabled', false))
+		return true;
+
+	if (!formOrUci(section, section_id, 'mqtt_host'))
+		return _('MQTT broker host is required when MQTT publisher is enabled.');
+
+	if (!checkedFormOrUci(section, section_id, 'log_to_file', true))
+		return _('MQTT publisher needs Log to file enabled because it reads SUMMARY/CPU records from daemon log files.');
+
+	if (!checkedFormOrUci(section, section_id, 'output_summary_stats', true))
+		return _('MQTT publisher needs Summary stats enabled.');
+
+	if (checkedFormOrUci(section, section_id, 'mqtt_publish_cpu_stats', false) &&
+	    !checkedFormOrUci(section, section_id, 'output_cpu_stats', false))
+		return _('MQTT CPU sensors need CPU stats enabled.');
+
+	return true;
+}
+
 function validateInstanceSection(section, section_id) {
 	var result;
 
@@ -529,6 +562,10 @@ function validateInstanceSection(section, section_id) {
 		return result;
 
 	result = validateSqmSectionUnique(section, section_id);
+	if (result !== true)
+		return result;
+
+	result = validateMqttConfig(section, section_id);
 	if (result !== true)
 		return result;
 
@@ -887,6 +924,39 @@ function formatPingerPlan(result) {
 		for (i = 0; i < warnings.length; i++)
 			lines.push(warnings[i]);
 	}
+
+	return lines.join('\n');
+}
+
+function runMqttStatus(section_id, mode) {
+	return fs.exec('/usr/libexec/cake-autorate-rs/mqtt-status', [
+		section_id,
+		mode || 'status'
+	]).then(parseExecJson);
+}
+
+function yesNo(value) {
+	return value ? _('yes') : _('no');
+}
+
+function formatMqttStatus(result) {
+	var lines = [];
+
+	lines.push(_('Instance: %s').format(result.section || '-'));
+	lines.push(_('MQTT publisher enabled: %s').format(yesNo(result.enabled)));
+	lines.push(_('MQTT client installed: %s').format(yesNo(result.installed)));
+	lines.push(_('Broker host configured: %s').format(yesNo(result.configured_host)));
+	lines.push(_('Log to file: %s').format(yesNo(result.log_to_file)));
+	lines.push(_('Summary stats: %s').format(yesNo(result.summary_enabled)));
+	lines.push(_('CPU stats: %s').format(yesNo(result.cpu_enabled)));
+	lines.push(_('Publish CPU sensors: %s').format(yesNo(result.publish_cpu)));
+	lines.push(_('Ready: %s').format(yesNo(result.available)));
+
+	if (result.reason)
+		lines.push(_('Status: %s').format(result.reason));
+
+	if (!result.installed && result.install_hint)
+		lines.push(_('Install hint: %s').format(result.install_hint));
 
 	return lines.join('\n');
 }
@@ -2132,6 +2202,8 @@ function addReflectorOptions(section) {
 }
 
 function addLoggingOptions(section) {
+	var o;
+
 	flag(section, 'logging', 'output_processing_stats', _('Processing stats'));
 	flag(section, 'logging', 'output_load_stats', _('Load stats'));
 	flag(section, 'logging', 'output_reflector_stats', _('Reflector stats'));
@@ -2148,6 +2220,91 @@ function addLoggingOptions(section) {
 	value(section, 'logging', 'log_file_buffer_size_B', _('Log buffer bytes'), 'uinteger', '512');
 	value(section, 'logging', 'log_file_buffer_timeout_ms', _('Log buffer timeout'), 'uinteger', '500');
 	flag(section, 'logging', 'log_file_export_compress', _('Compress exports'));
+
+	flag(section, 'logging', 'mqtt_enabled', _('MQTT publisher'), '0');
+
+	o = optionalValue(section, 'logging', 'mqtt_host', _('MQTT host'), 'host', '');
+	o.depends('mqtt_enabled', '1');
+	o.validate = function(section_id, value) {
+		if (checkedFormOrUci(validationSection(this), section_id, 'mqtt_enabled', false) && !value)
+			return _('MQTT broker host is required when MQTT publisher is enabled.');
+
+		return true;
+	};
+
+	o = optionalValue(section, 'logging', 'mqtt_port', _('MQTT port'), 'port', '1883');
+	o.depends('mqtt_enabled', '1');
+
+	o = optionalValue(section, 'logging', 'mqtt_username', _('MQTT username'), null, '');
+	o.depends('mqtt_enabled', '1');
+
+	o = optionalValue(section, 'logging', 'mqtt_password', _('MQTT password'), null, '');
+	o.depends('mqtt_enabled', '1');
+	o.password = true;
+
+	o = optionalValue(section, 'logging', 'mqtt_discovery_prefix', _('MQTT discovery prefix'), null, 'homeassistant');
+	o.depends('mqtt_enabled', '1');
+
+	o = optionalValue(section, 'logging', 'mqtt_base_topic', _('MQTT base topic'), null, 'cake-autorate');
+	o.depends('mqtt_enabled', '1');
+
+	o = optionalValue(section, 'logging', 'mqtt_device_id', _('MQTT device ID'), null, 'cake_autorate');
+	o.depends('mqtt_enabled', '1');
+
+	o = optionalValue(section, 'logging', 'mqtt_device_name', _('MQTT device name'), null, 'cake-autorate');
+	o.depends('mqtt_enabled', '1');
+
+	o = optionalValue(section, 'logging', 'mqtt_min_interval_s', _('MQTT interval'), 'and(uinteger,min(1))', '1');
+	o.depends('mqtt_enabled', '1');
+
+	o = flag(section, 'logging', 'mqtt_publish_cpu_stats', _('MQTT CPU sensors'), '0');
+	o.depends('mqtt_enabled', '1');
+
+	o = section.taboption('logging', form.Button, '_mqtt_status', _('Check MQTT'));
+	modal(o);
+	describe(o, '_mqtt_status');
+	o.inputtitle = _('Check MQTT');
+	o.inputstyle = 'action';
+	o.rmempty = true;
+	o.depends('mqtt_enabled', '1');
+	o.write = function() {};
+	o.remove = function() {};
+	o.onclick = function(ev, section_id) {
+		var button = ev.currentTarget;
+
+		button.disabled = true;
+
+		return runMqttStatus(section_id, 'status').then(function(result) {
+			ui.addNotification(null, E('pre', { 'style': 'white-space:pre-wrap' }, formatMqttStatus(result)), result.available ? 'info' : 'warning');
+		}).catch(function(err) {
+			ui.addNotification(null, E('p', _('MQTT status check failed: %s').format(err.message || err)), 'error');
+		}).then(function() {
+			button.disabled = false;
+		});
+	};
+
+	o = section.taboption('logging', form.Button, '_mqtt_install', _('Install MQTT client'));
+	modal(o);
+	describe(o, '_mqtt_install');
+	o.inputtitle = _('Install MQTT client');
+	o.inputstyle = 'action';
+	o.rmempty = true;
+	o.depends('mqtt_enabled', '1');
+	o.write = function() {};
+	o.remove = function() {};
+	o.onclick = function(ev, section_id) {
+		var button = ev.currentTarget;
+
+		button.disabled = true;
+
+		return runMqttStatus(section_id, 'install').then(function(result) {
+			ui.addNotification(null, E('pre', { 'style': 'white-space:pre-wrap' }, formatMqttStatus(result)), result.available ? 'info' : 'warning');
+		}).catch(function(err) {
+			ui.addNotification(null, E('p', _('MQTT client install failed: %s').format(err.message || err)), 'error');
+		}).then(function() {
+			button.disabled = false;
+		});
+	};
 }
 
 function addAdvancedOptions(section) {

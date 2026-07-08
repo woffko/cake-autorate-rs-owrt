@@ -68,6 +68,9 @@ Implemented:
   fallback. Optional backend packages are not hard dependencies.
 - Integrated SQM backend sync: each `cake-autorate` UCI section can own a matching
   `sqm` queue section.
+- Optional MQTT publisher service: per-instance MQTT export reads daemon
+  SUMMARY/CPU log records, publishes state via `mosquitto_pub`, and registers
+  Home Assistant discovery sensors when enabled.
 - Automatic interface preset: selecting the target interface fills
   `sqm_interface`, `ul_if`, and `dl_if=ifb4<target>`.
 - Automatic SQM rate import from an existing `/etc/config/sqm` queue for the
@@ -97,9 +100,12 @@ Known limits:
   supported `fping` package used by `fping`/`fping-ts` and the optional `irtt`
   package. `tsping` remains a manual binary install, and `irtt` is only ready
   when explicit IRTT servers are configured.
-- advanced multi-WAN policy, log bundle export, and MQTT integration are not
-  implemented. Upstream MQTT is a separate optional publisher over SUMMARY/CPU
-  logs, so this should be added as an optional service rather than daemon core.
+- advanced multi-WAN policy and log bundle export are not implemented.
+- MQTT is an optional sidecar service rather than daemon core. It requires a
+  configured broker, `log_to_file=1`, `output_summary_stats=1`, and
+  `mosquitto_pub` from either `mosquitto-client-nossl` or
+  `mosquitto-client-ssl`. CPU sensors additionally require
+  `output_cpu_stats=1`.
 
 SQM integration:
 
@@ -169,6 +175,17 @@ installed, the planner can use it as the timestamp probe path when
 `fping --icmp-timestamp` is unavailable. The create wizard writes pinger
 defaults and can run the same scan before creating a new instance.
 
+Optional MQTT client packages:
+
+- `mosquitto-client-nossl`
+- `mosquitto-client-ssl`
+
+The LuCI Logging tab shows MQTT availability and can install the default
+`mosquitto-client-nossl` package. After setting `mqtt_enabled=1` and
+`mqtt_host`, enable and start `/etc/init.d/cake-autorate-mqtt`; the publisher
+creates Home Assistant discovery sensors and publishes instance state under the
+configured base topic.
+
 ## Build In OpenWrt SDK
 
 Use a clean OpenWrt 25.12.5 x86_64 SDK. The Rust feed builds a large host Rust/LLVM toolchain on first use, so cache the SDK or use a prepared build image for normal iteration.
@@ -224,6 +241,12 @@ Optional speed test backends can be installed from LuCI or manually:
 apk add librespeed-cli speedtest-go iperf3 jsonfilter
 ```
 
+Optional MQTT support can be installed from LuCI or manually:
+
+```sh
+apk add mosquitto-client-nossl
+```
+
 Then edit `/etc/config/cake-autorate` or use LuCI:
 
 ```sh
@@ -240,6 +263,7 @@ cake-autorated --instance primary --dump-config
 cake-autorated --instance primary --once
 cat /var/run/cake-autorate/primary/status.json
 /usr/libexec/cake-autorate-rs/speedtest primary "" status auto
+/usr/libexec/cake-autorate-rs/mqtt-status primary status
 ```
 
 For a no-shaper smoke test, disable both shaper adjustment flags:
