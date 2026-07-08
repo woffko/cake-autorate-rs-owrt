@@ -54,7 +54,9 @@ Implemented:
   test backends, running a router-side speed test, and writing derived limits.
 - LuCI Reflectors tab can check pinger backend availability and scan configured
   reflectors plus the upstream default anycast reflector pool, including RTT and
-  ICMP timestamp capability, without adding hard dependencies.
+  ICMP timestamp capability, without adding hard dependencies. It shows RTT/OWD
+  backend mode, install/manual-action hints, and can run `apk add fping` for
+  the selected `fping`/`fping-ts` backend if it is missing.
 - LuCI can apply the pinger planner recommendation into pending changes for an
   existing instance, and the create wizard writes pinger method, active pinger
   count, and reflector list for new instances.
@@ -88,11 +90,10 @@ Known limits:
   as a manual browser-side validation tool after configuring autorate. It is
   intentionally documented only, not integrated into the wizard or router-side
   speed test backend.
-- Planned pinger install policy: automatically use/install the best viable
-  backend for the detected environment. Prefer `irtt` only when configured IRTT
-  servers are available; otherwise prefer timestamp-capable `fping-ts`/`tsping`
-  when enough reflectors pass the scan; fall back to concurrent `fping`, then
-  single-reflector `ping`.
+- Pinger auto-install is intentionally limited: the GUI can install/repair the
+  supported `fping` package used by `fping` and `fping-ts`. `tsping` remains a
+  manual binary install, and `irtt` stays pending until explicit server
+  configuration and daemon support are added.
 - advanced multi-WAN policy, log bundle export, and MQTT integration are not
   implemented. Upstream MQTT is a separate optional publisher over SUMMARY/CPU
   logs, so this should be added as an optional service rather than daemon core.
@@ -150,14 +151,16 @@ package.
 
 Optional pinger backend binaries:
 
+- `fping` with `--icmp-timestamp` support for `pinger_method=fping-ts`
 - `tsping`
 
 The daemon accepts `pinger_method=tsping` when the binary is present in PATH.
 It remains optional because no supported OpenWrt package was available on the
 current test router. The advanced LuCI Reflectors tab can check pinger backend
-availability, scan reflectors, and apply the recommendation into pending
-changes. The create wizard writes pinger defaults and can run the same scan
-before creating a new instance.
+availability, show RTT/OWD and round-robin/individual mode, install the
+supported `fping` package when needed, scan reflectors, and apply the
+recommendation into pending changes. The create wizard writes pinger defaults
+and can run the same scan before creating a new instance.
 
 ## Build In OpenWrt SDK
 

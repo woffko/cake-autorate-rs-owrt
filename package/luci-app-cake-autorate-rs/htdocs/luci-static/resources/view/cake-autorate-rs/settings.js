@@ -98,6 +98,7 @@ var optionDescriptions = {
 	decay_refractory_period_ms: 'Minimum time between low-load decay adjustments.',
 	pinger_method: 'Probe backend used to measure reflector latency. fping supports concurrent RTT reflectors; fping-ts and tsping use ICMP timestamp OWD probes; ping is a basic fallback using the first reflector.',
 	_pinger_backend_status: 'Show which pinger binaries are available and which backend the planner would prefer.',
+	_pinger_backend_install: 'Install the package for the selected pinger when automatic installation is supported. tsping remains a manual binary install and irtt support is pending.',
 	_reflector_scan: 'Probe configured reflectors plus the upstream default pool, classify timestamp support, and suggest an active set plus spare pool.',
 	_reflector_apply: 'Scan configured reflectors plus upstream defaults, then write the recommended pinger, active count, and ordered active plus spare reflector list into pending changes.',
 	_wizard_reflector_plan: 'Scan the upstream default reflector pool and fill the new instance with the recommended pinger and active/spare reflector set.',
@@ -743,11 +744,38 @@ function runPingerPlan(section_id, mode) {
 	]).then(parseExecJson);
 }
 
+function pingerBackendInstallable(value) {
+	return value === 'fping' || value === 'fping-ts';
+}
+
+function installPingerBackend(section_id, backend) {
+	if (!pingerBackendInstallable(backend))
+		return Promise.reject(new Error(_('Only fping/fping-ts can be installed automatically. tsping is a manual binary install; irtt daemon support is pending.')));
+
+	return fs.exec('/usr/libexec/cake-autorate-rs/pinger-plan', [
+		section_id,
+		'install',
+		backend
+	]).then(parseExecJson);
+}
+
+function formatPingerInstall(result) {
+	var title = result.backend_title || result.backend || _('pinger');
+	var pkg = result.package ? ' (' + result.package + ')' : '';
+	var reason = result.reason ? ' ' + result.reason : '';
+
+	if (result.available)
+		return _('Pinger ready: %s%s.').format(title, pkg) + reason;
+
+	return _('Pinger package installed but backend is not ready: %s%s.').format(title, pkg) + reason;
+}
+
 function formatPingerPlan(result) {
 	var backends = result.backends || [];
 	var warnings = result.warnings || [];
 	var lines = [];
 
+	lines.push(_('Configured pinger: %s').format(result.configured_method || '-'));
 	lines.push(_('Recommended pinger: %s').format(result.recommended_method || '-'));
 	lines.push(_('Recommended active pingers: %s').format(result.recommended_no_pingers || '-'));
 
@@ -774,12 +802,33 @@ function formatPingerPlan(result) {
 	lines.push(_('Pinger backends:'));
 	for (var i = 0; i < backends.length; i++) {
 		var backend = backends[i];
-		var state = backend.available ? _('available') : _('unavailable');
+		var state = backend.supported ? (backend.available ? _('available') : _('unavailable')) : _('pending');
+		var meta = [];
+		var markers = [];
 		var support = backend.supported ? '' : ' - ' + _('daemon support pending');
 		var reason = backend.reason ? ' - ' + backend.reason : '';
-		var install = (!backend.available && backend.install_hint) ? ' - ' + backend.install_hint : '';
+		var install = '';
 
-		lines.push('%s: %s%s%s%s'.format(backend.title || backend.name, state, support, reason, install));
+		if (backend.delay_type)
+			meta.push(backend.delay_type);
+		if (backend.target_mode)
+			meta.push(backend.target_mode);
+		if (backend.configured)
+			markers.push(_('configured'));
+		if (backend.recommended)
+			markers.push(_('recommended'));
+		if (!backend.available && backend.install_hint)
+			install = ' - ' + (backend.installable ? _('install: %s').format(backend.install_hint) : _('action: %s').format(backend.install_hint));
+
+		lines.push('%s%s%s: %s%s%s%s'.format(
+			backend.title || backend.name,
+			meta.length ? ' [' + meta.join(', ') + ']' : '',
+			markers.length ? ' (' + markers.join(', ') + ')' : '',
+			state,
+			support,
+			reason,
+			install
+		));
 	}
 
 	if (warnings.length) {
@@ -1907,6 +1956,35 @@ function addReflectorOptions(section) {
 			ui.addNotification(null, E('pre', { 'style': 'white-space:pre-wrap' }, formatPingerPlan(result)), 'info');
 		}).catch(function(err) {
 			ui.addNotification(null, E('p', _('Pinger status check failed: %s').format(err.message || err)), 'error');
+		}).then(function() {
+			button.disabled = false;
+		});
+	};
+
+	o = section.taboption('reflectors', form.Button, '_pinger_backend_install', _('Install selected pinger'));
+	modal(o);
+	describe(o, '_pinger_backend_install');
+	o.inputtitle = _('Install selected pinger');
+	o.inputstyle = 'action';
+	o.rmempty = true;
+	o.write = function() {};
+	o.remove = function() {};
+	o.onclick = function(ev, section_id) {
+		var button = ev.currentTarget;
+		var method = formOrUci(section, section_id, 'pinger_method') || 'fping';
+
+		if (!pingerBackendInstallable(method)) {
+			ui.addNotification(null, E('p',
+				_('Only fping/fping-ts can be installed automatically. tsping is a manual binary install; irtt daemon support is pending.')), 'warning');
+			return Promise.resolve();
+		}
+
+		button.disabled = true;
+
+		return installPingerBackend(section_id, method).then(function(result) {
+			ui.addNotification(null, E('p', formatPingerInstall(result)), result.available ? 'info' : 'warning');
+		}).catch(function(err) {
+			ui.addNotification(null, E('p', _('Pinger install failed: %s').format(err.message || err)), 'error');
 		}).then(function() {
 			button.disabled = false;
 		});
