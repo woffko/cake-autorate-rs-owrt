@@ -295,6 +295,7 @@ start_service() {
 	sync_sqm_config
 	start_sqm_backend
 	config_foreach start_instance cake_autorate
+	[ -x /etc/init.d/cake-autorate-mqtt ] && /etc/init.d/cake-autorate-mqtt restart >/dev/null 2>&1 || true
 }
 
 reload_service() {

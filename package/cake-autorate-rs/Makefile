@@ -4,7 +4,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=cake-autorate-rs
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=19
+PKG_RELEASE:=20
 
 PKG_MAINTAINER:=woffko
 PKG_LICENSE:=GPL-2.0-or-later
@@ -33,6 +33,13 @@ endef
 
 define Package/cake-autorate-rs/conffiles
 /etc/config/cake-autorate
+endef
+
+define Package/cake-autorate-rs/postinst
+[ -n "$${IPKG_INSTROOT}" ] || { \
+	/etc/init.d/cake-autorate-mqtt enable >/dev/null 2>&1 || true; \
+	exit 0; \
+}
 endef
 
 define Build/Prepare

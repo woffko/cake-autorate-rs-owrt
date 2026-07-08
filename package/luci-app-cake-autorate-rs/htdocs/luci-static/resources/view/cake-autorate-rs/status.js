@@ -13,7 +13,20 @@ function readStatus(section) {
 }
 
 function serviceAction(action) {
-	return fs.exec('/etc/init.d/cake-autorate', [ action ]).then(function() {
+	var mqttAction = function() {
+		if (action === 'start' || action === 'restart')
+			return L.resolveDefault(fs.exec('/etc/init.d/cake-autorate-mqtt', [ 'enable' ]), null)
+				.then(function() {
+					return L.resolveDefault(fs.exec('/etc/init.d/cake-autorate-mqtt', [ action ]), null);
+				});
+
+		if (action === 'stop')
+			return L.resolveDefault(fs.exec('/etc/init.d/cake-autorate-mqtt', [ action ]), null);
+
+		return Promise.resolve();
+	};
+
+	return fs.exec('/etc/init.d/cake-autorate', [ action ]).then(mqttAction).then(function() {
 		ui.addNotification(null, E('p', _('Service action completed.')));
 	});
 }
