@@ -352,6 +352,9 @@ printf '"active":'
 print_string_array "$active"
 printf ',"spare":'
 print_string_array "$spare"
+printf ',"recommended_reflectors":'
+print_string_array "${active}${active:+
+}$spare"
 printf ',"bad":'
 print_string_array "$bad"
 printf ',"warnings":'

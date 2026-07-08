@@ -53,6 +53,9 @@ Implemented:
 - LuCI Reflectors tab can check pinger backend availability and scan the
   configured/default reflector pool, including RTT and ICMP timestamp
   capability, without adding hard dependencies.
+- LuCI can apply the pinger planner recommendation into pending changes for an
+  existing instance, and the create wizard writes pinger method, active pinger
+  count, and reflector list for new instances.
 - LuCI setup tab with the minimum recommended autorate fields from upstream:
   target interface, SQM download/upload, and min/base/max rates per direction.
 - Router-side speed test helper with optional backend autodetection:
@@ -77,10 +80,10 @@ Known limits:
   compatible `tsping` binary manually where available before selecting it.
 - reflector health/replacement is implemented as an MVP; `fping-ts` uses
   separate DL/UL OWD samples while RTT backends still use RTT/2 estimates.
-- Pinger/reflector planner is currently status-only: it detects available
-  pinger backends and scans configured/default reflectors from the advanced
-  Reflectors tab, but it does not yet write the recommended method/reflector
-  set back into UCI or the setup wizard.
+- Pinger/reflector planner currently uses the configured/default reflector list.
+  It can apply the recommended pinger method, active count, and ordered
+  reflector list, but broader candidate-pool discovery and runtime active/spare
+  health display are still future work.
 - Use the external LibreQoS Internet Quality Test at https://test.libreqos.com/
   as a manual browser-side validation tool after configuring autorate. It is
   intentionally documented only, not integrated into the wizard or router-side
@@ -152,9 +155,9 @@ Optional pinger backend binaries:
 The daemon accepts `pinger_method=tsping` when the binary is present in PATH.
 It remains optional because no supported OpenWrt package was available on the
 current test router. The advanced LuCI Reflectors tab can check pinger backend
-availability and scan reflectors. The current planner recommends a method and
-active/spare sets in the GUI, but still leaves applying those recommendations
-to a future wizard/autofill step.
+availability, scan reflectors, and apply the recommendation into pending
+changes. The create wizard writes pinger defaults and can run the same scan
+before creating a new instance.
 
 ## Build In OpenWrt SDK
 

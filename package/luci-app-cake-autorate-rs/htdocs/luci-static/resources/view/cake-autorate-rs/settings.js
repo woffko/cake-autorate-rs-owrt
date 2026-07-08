@@ -99,6 +99,8 @@ var optionDescriptions = {
 	pinger_method: 'Probe backend used to measure reflector latency. fping supports concurrent RTT reflectors; fping-ts and tsping use ICMP timestamp OWD probes; ping is a basic fallback using the first reflector.',
 	_pinger_backend_status: 'Show which pinger binaries are available and which backend the planner would prefer.',
 	_reflector_scan: 'Probe configured reflectors, classify timestamp support, and suggest an upstream-style active set plus spare pool.',
+	_reflector_apply: 'Scan reflectors and write the recommended pinger, active count, and ordered active plus spare reflector list into pending changes.',
+	_wizard_reflector_plan: 'Scan the default reflector pool and fill the new instance with the recommended pinger and active/spare reflector set.',
 	reflector: 'Hosts to probe for latency. Use stable anycast or nearby IP addresses.',
 	reflectors_url: 'Optional URL to fetch reflector candidates from at daemon startup. Falls back to the configured list if the URL is unavailable.',
 	reflectors_url_skip_lines: 'Number of header lines to skip when parsing reflector URL data.',
@@ -536,7 +538,7 @@ function setFormOptionValue(section, section_id, key, value) {
 
 	element = option.getUIElement(section_id);
 	if (element && typeof element.setValue == 'function')
-		element.setValue(String(value));
+		element.setValue(Array.isArray(value) ? value : String(value));
 }
 
 function setCakeOption(section, section_id, key, value) {
@@ -544,6 +546,15 @@ function setCakeOption(section, section_id, key, value) {
 
 	uci.set('cake-autorate', section_id, key, value);
 	setFormOptionValue(section, section_id, key, value);
+}
+
+function setCakeListOption(section, section_id, key, values) {
+	values = (values || []).filter(function(value) {
+		return value != null && value !== '';
+	}).map(String);
+
+	uci.set('cake-autorate', section_id, key, values);
+	setFormOptionValue(section, section_id, key, values);
 }
 
 function halfRate(value) {
@@ -779,6 +790,44 @@ function formatPingerPlan(result) {
 	return lines.join('\n');
 }
 
+function defaultReflectors() {
+	return [ '1.1.1.1', '1.0.0.1', '8.8.8.8', '8.8.4.4', '9.9.9.9', '9.9.9.10' ];
+}
+
+function pingerPlanReflectors(result) {
+	var reflectors = result.recommended_reflectors || [];
+
+	if (!reflectors.length)
+		reflectors = (result.active || []).concat(result.spare || []);
+
+	return reflectors.filter(function(reflector) {
+		return reflector != null && reflector !== '';
+	}).map(String);
+}
+
+function applyPingerPlanToState(state, result) {
+	var reflectors = pingerPlanReflectors(result);
+
+	if (!result || !result.recommended_method || !result.recommended_no_pingers || !reflectors.length)
+		throw new Error(_('Pinger planner did not return a usable recommendation.'));
+
+	state.pinger_method = result.recommended_method;
+	state.no_pingers = String(result.recommended_no_pingers);
+	state.reflectors = reflectors;
+	state.pinger_plan = result;
+}
+
+function applyPingerPlanToSection(section, section_id, result) {
+	var reflectors = pingerPlanReflectors(result);
+
+	if (!result || !result.recommended_method || !result.recommended_no_pingers || !reflectors.length)
+		throw new Error(_('Pinger planner did not return a usable recommendation.'));
+
+	setCakeOption(section, section_id, 'pinger_method', result.recommended_method);
+	setCakeOption(section, section_id, 'no_pingers', result.recommended_no_pingers);
+	setCakeListOption(section, section_id, 'reflector', reflectors);
+}
+
 function applySpeedtestRates(section, section_id, result, percent) {
 	var dl = measuredRate(result.download_kbps, percent);
 	var ul = measuredRate(result.upload_kbps, percent);
@@ -962,6 +1011,9 @@ function writeWizardConfig(section_id, state) {
 	uci.set('cake-autorate', section_id, 'sqm_enabled', state.sqm_enabled ? '1' : '0');
 	uci.set('cake-autorate', section_id, 'speedtest_backend', state.speedtest_backend || 'auto');
 	uci.set('cake-autorate', section_id, 'speedtest_apply_percent', String(state.speedtest_apply_percent || '90'));
+	uci.set('cake-autorate', section_id, 'pinger_method', state.pinger_method || 'fping');
+	uci.set('cake-autorate', section_id, 'no_pingers', String(state.no_pingers || '6'));
+	uci.set('cake-autorate', section_id, 'reflector', (state.reflectors && state.reflectors.length) ? state.reflectors : defaultReflectors());
 	uci.set('cake-autorate', section_id, 'manual_rate_limits', '0');
 	uci.set('cake-autorate', section_id, 'advanced_settings', '0');
 	uci.set('cake-autorate', section_id, 'sqm_interface', wan);
@@ -1069,6 +1121,9 @@ function showCreateWizard(grid, name) {
 		sqm_enabled: false,
 		speedtest_backend: 'auto',
 		speedtest_apply_percent: '90',
+		pinger_method: 'fping',
+		no_pingers: '6',
+		reflectors: defaultReflectors(),
 		sqm_download: '20000',
 		sqm_upload: '20000'
 	};
@@ -1145,6 +1200,7 @@ function showCreateWizard(grid, name) {
 		var upload = wizardTextInput(state.sqm_upload, 'uinteger');
 		var backendStatus = E('pre', { 'style': 'white-space:pre-wrap;margin:6px 0 0 0' }, '');
 		var status = E('div', { 'class': 'cake-autorate-speedtest-status' }, '');
+		var pingerStatus = E('pre', { 'style': 'white-space:pre-wrap;margin:6px 0 0 0' }, '');
 		var syncInputs = function() {
 			state.speedtest_backend = backend.value || 'auto';
 			state.speedtest_apply_percent = percent.value || '90';
@@ -1243,6 +1299,25 @@ function showCreateWizard(grid, name) {
 				});
 			}
 		}, _('Run speed test'));
+		var scanReflectorsButton = E('button', {
+			'class': 'btn cbi-button',
+			'click': function() {
+				syncInputs();
+				showError(null);
+				scanReflectorsButton.disabled = true;
+				pingerStatus.textContent = _('Scanning reflectors...');
+
+				runPingerPlan(state.name, 'scan').then(function(result) {
+					applyPingerPlanToState(state, result);
+					pingerStatus.textContent = formatPingerPlan(result);
+				}).catch(function(err) {
+					showError(_('Reflector scan failed: %s').format(err.message || err));
+					pingerStatus.textContent = '';
+				}).then(function() {
+					scanReflectorsButton.disabled = false;
+				});
+			}
+		}, _('Scan reflectors'));
 
 		backend.addEventListener('change', syncInputs);
 		percent.addEventListener('input', syncInputs);
@@ -1258,7 +1333,8 @@ function showCreateWizard(grid, name) {
 			wizardField(_('Speed test apply percent'), percent, optionDescriptions.speedtest_apply_percent),
 			wizardField(_('Download speed'), download, optionDescriptions.sqm_download),
 			wizardField(_('Upload speed'), upload, optionDescriptions.sqm_upload),
-			wizardField(_('Run speed test'), E('div', {}, [ runButton, status ]), optionDescriptions._speedtest)
+			wizardField(_('Run speed test'), E('div', {}, [ runButton, status ]), optionDescriptions._speedtest),
+			wizardField(_('Reflector plan'), E('div', {}, [ scanReflectorsButton, pingerStatus ]), optionDescriptions._wizard_reflector_plan)
 		];
 	}
 
@@ -1272,6 +1348,9 @@ function showCreateWizard(grid, name) {
 			[ _('Queueing discipline'), state.sqm_qdisc || 'cake' ],
 			[ _('Queue setup script'), state.sqm_script || 'piece_of_cake.qos' ],
 			[ _('Preferred backend'), speedtestBackendChoiceTitle(state.speedtest_backend) ],
+			[ _('Pinger'), state.pinger_method || 'fping' ],
+			[ _('Pingers'), String(state.no_pingers || '6') ],
+			[ _('Reflectors'), ((state.reflectors && state.reflectors.length) ? state.reflectors : defaultReflectors()).join(', ') ],
 			[ _('Download speed'), state.sqm_download + ' kbit/s' ],
 			[ _('Upload speed'), state.sqm_upload + ' kbit/s' ],
 			[ _('Min DL rate'), halfRate(state.sqm_download) + ' kbit/s' ],
@@ -1308,6 +1387,12 @@ function showCreateWizard(grid, name) {
 				showError(_('Download and upload speeds must be positive integers.'));
 				return false;
 			}
+
+			if ((state.pinger_method || 'fping') === 'ping' &&
+			    parseInt(state.no_pingers || '1', 10) > 1) {
+				showError(_('The ping fallback can use only one pinger.'));
+				return false;
+			}
 		}
 
 		return true;
@@ -1335,6 +1420,23 @@ function showCreateWizard(grid, name) {
 		if (!validatePositiveInteger(state.sqm_download) ||
 		    !validatePositiveInteger(state.sqm_upload)) {
 			showError(_('Download and upload speeds must be positive integers.'));
+			return false;
+		}
+
+		if (!validatePositiveInteger(state.no_pingers)) {
+			showError(_('Pingers must be a positive integer.'));
+			return false;
+		}
+
+		if ((state.pinger_method || 'fping') === 'ping' &&
+		    parseInt(state.no_pingers || '1', 10) > 1) {
+			showError(_('The ping fallback can use only one pinger.'));
+			return false;
+		}
+
+		if (parseInt(state.no_pingers || '1', 10) >
+		    ((state.reflectors && state.reflectors.length) ? state.reflectors.length : defaultReflectors().length)) {
+			showError(_('Pingers cannot exceed reflector count.'));
 			return false;
 		}
 
@@ -1817,6 +1919,30 @@ function addReflectorOptions(section) {
 			ui.addNotification(null, E('pre', { 'style': 'white-space:pre-wrap' }, formatPingerPlan(result)), level);
 		}).catch(function(err) {
 			ui.addNotification(null, E('p', _('Reflector scan failed: %s').format(err.message || err)), 'error');
+		}).then(function() {
+			button.disabled = false;
+		});
+	};
+
+	o = section.taboption('reflectors', form.Button, '_reflector_apply', _('Apply recommendation'));
+	modal(o);
+	describe(o, '_reflector_apply');
+	o.inputtitle = _('Apply recommendation');
+	o.inputstyle = 'action';
+	o.rmempty = true;
+	o.write = function() {};
+	o.remove = function() {};
+	o.onclick = function(ev, section_id) {
+		var button = ev.currentTarget;
+
+		button.disabled = true;
+
+		return runPingerPlan(section_id, 'scan').then(function(result) {
+			applyPingerPlanToSection(section, section_id, result);
+			ui.addNotification(null, E('pre', { 'style': 'white-space:pre-wrap' },
+				formatPingerPlan(result) + '\n\n' + _('Recommendation applied to pending changes. Use Save & Apply to commit it.')), 'info');
+		}).catch(function(err) {
+			ui.addNotification(null, E('p', _('Applying reflector recommendation failed: %s').format(err.message || err)), 'error');
 		}).then(function() {
 			button.disabled = false;
 		});
