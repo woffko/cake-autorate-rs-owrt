@@ -787,6 +787,8 @@ function formatPingerPlan(result) {
 			lines.push(_('Candidate pool: %d reflectors (%s, upstream defaults: %d)').format(result.valid_count || 0, result.candidate_source || '-', result.default_pool_count || 0));
 		lines.push(_('RTT-capable reflectors: %d/%d').format(result.rtt_ok_count || 0, result.valid_count || 0));
 		lines.push(_('Timestamp-capable reflectors: %d/%d').format(result.timestamp_ok_count || 0, result.valid_count || 0));
+		if (result.timestamp_probe_backend)
+			lines.push(_('Timestamp probe: %s').format(result.timestamp_probe_backend));
 	}
 
 	if (result.active && result.active.length)

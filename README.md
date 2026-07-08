@@ -159,8 +159,10 @@ It remains optional because no supported OpenWrt package was available on the
 current test router. The advanced LuCI Reflectors tab can check pinger backend
 availability, show RTT/OWD and round-robin/individual mode, install the
 supported `fping` package when needed, scan reflectors, and apply the
-recommendation into pending changes. The create wizard writes pinger defaults
-and can run the same scan before creating a new instance.
+recommendation into pending changes. If `tsping` is manually installed, the
+planner can use it as the timestamp probe path when `fping --icmp-timestamp`
+is unavailable. The create wizard writes pinger defaults and can run the same
+scan before creating a new instance.
 
 ## Build In OpenWrt SDK
 
