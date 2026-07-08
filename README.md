@@ -50,6 +50,9 @@ Implemented:
   duplicate managed SQM section ownership.
 - LuCI setup wizard for creating instances, importing SQM rates, checking speed
   test backends, running a router-side speed test, and writing derived limits.
+- LuCI Reflectors tab can check pinger backend availability and scan the
+  configured/default reflector pool, including RTT and ICMP timestamp
+  capability, without adding hard dependencies.
 - LuCI setup tab with the minimum recommended autorate fields from upstream:
   target interface, SQM download/upload, and min/base/max rates per direction.
 - Router-side speed test helper with optional backend autodetection:
@@ -74,9 +77,10 @@ Known limits:
   compatible `tsping` binary manually where available before selecting it.
 - reflector health/replacement is implemented as an MVP; `fping-ts` uses
   separate DL/UL OWD samples while RTT backends still use RTT/2 estimates.
-- Planned pinger/reflector wizard work: scan a candidate reflector pool,
-  classify backend availability, choose an upstream-style active set plus spare
-  pool, and keep showing backend/reflector health in LuCI.
+- Pinger/reflector planner is currently status-only: it detects available
+  pinger backends and scans configured/default reflectors from the advanced
+  Reflectors tab, but it does not yet write the recommended method/reflector
+  set back into UCI or the setup wizard.
 - Use the external LibreQoS Internet Quality Test at https://test.libreqos.com/
   as a manual browser-side validation tool after configuring autorate. It is
   intentionally documented only, not integrated into the wizard or router-side
@@ -86,8 +90,9 @@ Known limits:
   servers are available; otherwise prefer timestamp-capable `fping-ts`/`tsping`
   when enough reflectors pass the scan; fall back to concurrent `fping`, then
   single-reflector `ping`.
-- advanced multi-WAN policy, log bundle export, and MQTT integration are
-  placeholders or not implemented.
+- advanced multi-WAN policy, log bundle export, and MQTT integration are not
+  implemented. Upstream MQTT is a separate optional publisher over SUMMARY/CPU
+  logs, so this should be added as an optional service rather than daemon core.
 
 SQM integration:
 
@@ -146,7 +151,10 @@ Optional pinger backend binaries:
 
 The daemon accepts `pinger_method=tsping` when the binary is present in PATH.
 It remains optional because no supported OpenWrt package was available on the
-current test router.
+current test router. The advanced LuCI Reflectors tab can check pinger backend
+availability and scan reflectors. The current planner recommends a method and
+active/spare sets in the GUI, but still leaves applying those recommendations
+to a future wizard/autofill step.
 
 ## Build In OpenWrt SDK
 
