@@ -2,6 +2,7 @@
 
 section="$1"
 mode="$2"
+install_backend="$3"
 
 if [ "$section" = "--status" ] || [ "$section" = "status" ]; then
 	section="primary"
@@ -17,7 +18,7 @@ if [ -z "$mode" ]; then
 fi
 
 case "$mode" in
-	status|scan)
+	status|scan|install)
 		;;
 	*)
 		printf '{"error":"unsupported mode"}\n'
@@ -35,6 +36,11 @@ json_bool() {
 	else
 		printf 'false'
 	fi
+}
+
+json_error() {
+	printf '{"error":"%s"}\n' "$(json_escape "$1")"
+	exit 1
 }
 
 command_path() {
@@ -146,23 +152,245 @@ lookup_probe_result() {
 	printf '%s\n' "$results" | awk -F '|' -v host="$host" '$1 == host { print $2; exit }'
 }
 
+pinger_title() {
+	case "$1" in
+		fping)
+			printf '%s' "fping"
+			;;
+		fping-ts)
+			printf '%s' "fping-ts"
+			;;
+		tsping)
+			printf '%s' "tsping"
+			;;
+		irtt)
+			printf '%s' "irtt"
+			;;
+		ping)
+			printf '%s' "ping fallback"
+			;;
+		*)
+			printf '%s' "$1"
+			;;
+	esac
+}
+
+pinger_delay_type() {
+	case "$1" in
+		fping|ping)
+			printf '%s' "RTT"
+			;;
+		fping-ts|tsping|irtt)
+			printf '%s' "OWD"
+			;;
+	esac
+}
+
+pinger_target_mode() {
+	case "$1" in
+		fping|fping-ts|tsping)
+			printf '%s' "round-robin"
+			;;
+		ping|irtt)
+			printf '%s' "individual"
+			;;
+	esac
+}
+
+pinger_supported() {
+	case "$1" in
+		fping|fping-ts|tsping|ping)
+			return 0
+			;;
+	esac
+
+	return 1
+}
+
+pinger_available() {
+	case "$1" in
+		fping)
+			[ -n "$fping_bin" ]
+			;;
+		fping-ts)
+			[ "$fping_ts_supported" = "1" ]
+			;;
+		tsping)
+			[ -n "$tsping_bin" ]
+			;;
+		irtt)
+			[ -n "$irtt_bin" ]
+			;;
+		ping)
+			[ -n "$ping_bin" ]
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+pinger_reason() {
+	case "$1" in
+		fping)
+			[ -n "$fping_bin" ] && printf '%s' "available" || printf '%s' "not installed"
+			;;
+		fping-ts)
+			[ "$fping_ts_supported" = "1" ] && printf '%s' "available" || printf '%s' "requires fping with --icmp-timestamp"
+			;;
+		tsping)
+			[ -n "$tsping_bin" ] && printf '%s' "available" || printf '%s' "not installed"
+			;;
+		irtt)
+			[ -n "$irtt_bin" ] && printf '%s' "installed; daemon support pending" || printf '%s' "not installed; daemon support pending"
+			;;
+		ping)
+			[ -n "$ping_bin" ] && printf '%s' "available" || printf '%s' "not installed"
+			;;
+		*)
+			printf '%s' "unknown pinger"
+			;;
+	esac
+}
+
+pinger_install_hint() {
+	case "$1" in
+		fping|fping-ts)
+			printf '%s' "apk add fping"
+			;;
+		tsping)
+			printf '%s' "install a compatible tsping binary manually"
+			;;
+		irtt)
+			printf '%s' "daemon support pending; will require irtt server configuration"
+			;;
+		ping)
+			printf '%s' "provided by the base system"
+			;;
+	esac
+}
+
+pinger_package() {
+	case "$1" in
+		fping|fping-ts)
+			printf '%s' "fping"
+			;;
+	esac
+}
+
+pinger_installable() {
+	case "$1" in
+		fping|fping-ts)
+			return 0
+			;;
+	esac
+
+	return 1
+}
+
+refresh_pinger_bins() {
+	fping_bin="$(command_path fping)"
+	ping_bin="$(command_path ping)"
+	tsping_bin="$(command_path tsping)"
+	irtt_bin="$(command_path irtt)"
+	fping_ts_supported=0
+
+	if [ -n "$fping_bin" ] && "$fping_bin" --help 2>&1 | grep -q -- '--icmp-timestamp'; then
+		fping_ts_supported=1
+	fi
+}
+
 backend_json() {
 	local name="$1"
-	local title="$2"
-	local available="$3"
-	local supported="$4"
-	local quality="$5"
-	local reason="$6"
-	local install_hint="$7"
+	local available supported installable package
+	local quality="${2:-0}"
+	local recommended=0
+	local configured=0
 
-	printf '{"name":"%s","title":"%s","available":%s,"supported":%s,"quality":%s,"reason":"%s","install_hint":"%s"}' \
+	pinger_available "$name" && available=1 || available=0
+	pinger_supported "$name" && supported=1 || supported=0
+	pinger_installable "$name" && installable=1 || installable=0
+	package="$(pinger_package "$name")"
+	[ "$name" = "$recommended_method" ] && recommended=1
+	[ "$name" = "$configured_method" ] && configured=1
+
+	printf '{"name":"%s","title":"%s","delay_type":"%s","target_mode":"%s","available":%s,"supported":%s,"installable":%s,"package":"%s","quality":%s,"recommended":%s,"configured":%s,"reason":"%s","install_hint":"%s"}' \
 		"$(json_escape "$name")" \
-		"$(json_escape "$title")" \
+		"$(json_escape "$(pinger_title "$name")")" \
+		"$(json_escape "$(pinger_delay_type "$name")")" \
+		"$(json_escape "$(pinger_target_mode "$name")")" \
 		"$(json_bool "$available")" \
 		"$(json_bool "$supported")" \
+		"$(json_bool "$installable")" \
+		"$(json_escape "$package")" \
 		"$quality" \
-		"$(json_escape "$reason")" \
-		"$(json_escape "$install_hint")"
+		"$(json_bool "$recommended")" \
+		"$(json_bool "$configured")" \
+		"$(json_escape "$(pinger_reason "$name")")" \
+		"$(json_escape "$(pinger_install_hint "$name")")"
+}
+
+valid_pinger_backend() {
+	case "$1" in
+		fping|fping-ts|tsping|irtt|ping)
+			return 0
+			;;
+	esac
+
+	return 1
+}
+
+pinger_install_json() {
+	local selected="$1"
+	local package output available
+
+	[ -n "$selected" ] || selected="$configured_method"
+	valid_pinger_backend "$selected" || json_error "Unknown pinger backend: $selected"
+
+	if ! pinger_supported "$selected"; then
+		json_error "$(pinger_title "$selected") is visible for upstream parity, but daemon support is pending."
+	fi
+
+	if ! pinger_installable "$selected"; then
+		if pinger_available "$selected"; then
+			printf '{"backend":"%s","backend_title":"%s","package":"","installed":true,"available":true,"supported":true,"reason":"%s"}\n' \
+				"$(json_escape "$selected")" \
+				"$(json_escape "$(pinger_title "$selected")")" \
+				"$(json_escape "$(pinger_reason "$selected")")"
+			exit 0
+		fi
+
+		json_error "$(pinger_title "$selected") cannot be installed automatically: $(pinger_install_hint "$selected")."
+	fi
+
+	package="$(pinger_package "$selected")"
+	[ -n "$package" ] || json_error "$(pinger_title "$selected") cannot be installed automatically."
+
+	if pinger_available "$selected"; then
+		printf '{"backend":"%s","backend_title":"%s","package":"%s","installed":true,"available":true,"supported":true,"reason":"%s"}\n' \
+			"$(json_escape "$selected")" \
+			"$(json_escape "$(pinger_title "$selected")")" \
+			"$(json_escape "$package")" \
+			"$(json_escape "$(pinger_reason "$selected")")"
+		exit 0
+	fi
+
+	command -v apk >/dev/null 2>&1 || json_error "apk was not found on this router."
+
+	output="$(apk add "$package" 2>&1)"
+	if [ "$?" -ne 0 ]; then
+		json_error "Failed to install $package: $output"
+	fi
+
+	refresh_pinger_bins
+	pinger_available "$selected" && available=true || available=false
+
+	printf '{"backend":"%s","backend_title":"%s","package":"%s","installed":true,"available":%s,"supported":true,"reason":"%s"}\n' \
+		"$(json_escape "$selected")" \
+		"$(json_escape "$(pinger_title "$selected")")" \
+		"$(json_escape "$package")" \
+		"$available" \
+		"$(json_escape "$(pinger_reason "$selected")")"
 }
 
 print_string_array() {
@@ -221,15 +449,7 @@ if [ -z "$configured_reflectors" ] || [ "$mode" = "scan" ]; then
 	done
 fi
 
-fping_bin="$(command_path fping)"
-ping_bin="$(command_path ping)"
-tsping_bin="$(command_path tsping)"
-irtt_bin="$(command_path irtt)"
-fping_ts_supported=0
-
-if [ -n "$fping_bin" ] && "$fping_bin" --help 2>&1 | grep -q -- '--icmp-timestamp'; then
-	fping_ts_supported=1
-fi
+refresh_pinger_bins
 
 [ -n "$fping_bin" ] || append_warning "fping is not installed; concurrent RTT probing is unavailable."
 [ "$fping_ts_supported" = "1" ] || append_warning "Installed fping does not expose --icmp-timestamp; fping-ts is unavailable."
@@ -237,6 +457,10 @@ fi
 [ -n "$irtt_bin" ] || append_warning "irtt package is not installed. irtt daemon support is pending and will also require configured IRTT servers."
 if [ -n "$irtt_bin" ]; then
 	append_warning "irtt binary is installed, but this daemon build does not support pinger_method=irtt yet."
+fi
+
+if [ "$mode" = "install" ]; then
+	pinger_install_json "$install_backend"
 fi
 
 candidate_count=0
@@ -316,6 +540,9 @@ if [ "$mode" = "scan" ]; then
 	if [ "$fping_ts_supported" = "1" ] && [ "$timestamp_ok_count" -ge "$target_pingers" ] 2>/dev/null; then
 		recommended_method="fping-ts"
 		recommended_reason="Enough reflectors answered ICMP timestamp probes; fping-ts can provide directional OWD."
+	elif [ -n "$tsping_bin" ] && [ "$timestamp_ok_count" -ge "$target_pingers" ] 2>/dev/null; then
+		recommended_method="tsping"
+		recommended_reason="Enough reflectors answered ICMP timestamp probes; tsping can provide directional OWD."
 	elif [ -n "$fping_bin" ] && [ "$rtt_ok_count" -ge 1 ] 2>/dev/null; then
 		recommended_method="fping"
 		recommended_reason="Timestamp-capable reflectors were insufficient; use concurrent RTT probing."
@@ -404,15 +631,15 @@ printf '"recommended_method":"%s",' "$(json_escape "$recommended_method")"
 printf '"recommended_no_pingers":%s,' "$target_pingers"
 printf '"recommended_reason":"%s",' "$(json_escape "$recommended_reason")"
 printf '"backends":['
-backend_json "fping" "fping" "$([ -n "$fping_bin" ] && printf 1 || printf 0)" 1 70 "$([ -n "$fping_bin" ] && printf available || printf 'not installed')" "apk add fping"
+backend_json "fping" 70
 printf ','
-backend_json "fping-ts" "fping-ts" "$fping_ts_supported" 1 90 "$([ "$fping_ts_supported" = 1 ] && printf available || printf 'requires fping with --icmp-timestamp')" "apk add fping"
+backend_json "fping-ts" 90
 printf ','
-backend_json "tsping" "tsping" "$([ -n "$tsping_bin" ] && printf 1 || printf 0)" 1 90 "$([ -n "$tsping_bin" ] && printf available || printf 'not installed')" "manual tsping binary"
+backend_json "tsping" 90
 printf ','
-backend_json "irtt" "irtt" "$([ -n "$irtt_bin" ] && printf 1 || printf 0)" 0 100 "$([ -n "$irtt_bin" ] && printf 'installed; daemon support pending' || printf 'not installed; daemon support pending')" "apk add irtt after daemon support lands"
+backend_json "irtt" 100
 printf ','
-backend_json "ping" "ping fallback" "$([ -n "$ping_bin" ] && printf 1 || printf 0)" 1 30 "$([ -n "$ping_bin" ] && printf available || printf 'not installed')" "built in"
+backend_json "ping" 30
 printf '],'
 printf '"active":'
 print_string_array "$active"
