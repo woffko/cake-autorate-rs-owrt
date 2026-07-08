@@ -28,7 +28,8 @@
 				"/etc/init.d/sqm enable": [ "exec" ],
 				"/etc/init.d/sqm start": [ "exec" ],
 				"/etc/init.d/sqm restart": [ "exec" ],
-				"/usr/libexec/cake-autorate-rs/speedtest *": [ "exec" ]
+				"/usr/libexec/cake-autorate-rs/speedtest *": [ "exec" ],
+				"/usr/libexec/cake-autorate-rs/pinger-plan *": [ "exec" ]
 			},
 			"ubus": {
 				"luci": [ "setInitAction" ]

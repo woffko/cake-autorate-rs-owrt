@@ -1,0 +1,393 @@
+#!/bin/sh
+
+section="$1"
+mode="$2"
+
+if [ "$section" = "--status" ] || [ "$section" = "status" ]; then
+	section="primary"
+	mode="status"
+fi
+
+if [ -z "$section" ]; then
+	section="primary"
+fi
+
+if [ -z "$mode" ]; then
+	mode="status"
+fi
+
+case "$mode" in
+	status|scan)
+		;;
+	*)
+		printf '{"error":"unsupported mode"}\n'
+		exit 1
+		;;
+esac
+
+json_escape() {
+	printf '%s' "$1" | tr '\n\r\t' '   ' | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+json_bool() {
+	if [ "$1" = "1" ]; then
+		printf 'true'
+	else
+		printf 'false'
+	fi
+}
+
+command_path() {
+	command -v "$1" 2>/dev/null || true
+}
+
+uci_get() {
+	uci -q get "cake-autorate.$section.$1" 2>/dev/null
+}
+
+valid_reflector() {
+	case "$1" in
+		''|*[!0-9A-Za-z:._-]*)
+			return 1
+			;;
+	esac
+
+	return 0
+}
+
+num_or_default() {
+	case "$1" in
+		''|*[!0-9]*)
+			printf '%s' "$2"
+			;;
+		*)
+			if [ "$1" -gt 0 ] 2>/dev/null; then
+				printf '%s' "$1"
+			else
+				printf '%s' "$2"
+			fi
+			;;
+	esac
+}
+
+append_warning() {
+	[ -n "$1" ] || return 0
+	warnings="${warnings}${warnings:+
+}$1"
+}
+
+append_line_var() {
+	case "$1" in
+		active)
+			active="${active}${active:+
+}$2"
+			;;
+		spare)
+			spare="${spare}${spare:+
+}$2"
+			;;
+		bad)
+			bad="${bad}${bad:+
+}$2"
+			;;
+		scan_rows)
+			scan_rows="${scan_rows}${scan_rows:+
+}$2"
+			;;
+	esac
+}
+
+extract_avg_ms() {
+	sed -n 's/.*min\/avg\/max = [^\/]*\/\([0-9.][0-9.]*\)\/.*/\1/p' | tail -n 1
+}
+
+probe_fping() {
+	local host="$1"
+	local extra="$2"
+	local output status avg
+
+	if [ -z "$fping_bin" ]; then
+		return 1
+	fi
+
+	output="$("$fping_bin" $extra -c 1 -t 1000 "$host" 2>&1)"
+	status="$?"
+	avg="$(printf '%s\n' "$output" | extract_avg_ms)"
+
+	if [ "$status" -eq 0 ]; then
+		printf '%s\n' "${avg:-0}"
+		return 0
+	fi
+
+	return 1
+}
+
+backend_json() {
+	local name="$1"
+	local title="$2"
+	local available="$3"
+	local supported="$4"
+	local quality="$5"
+	local reason="$6"
+	local install_hint="$7"
+
+	printf '{"name":"%s","title":"%s","available":%s,"supported":%s,"quality":%s,"reason":"%s","install_hint":"%s"}' \
+		"$(json_escape "$name")" \
+		"$(json_escape "$title")" \
+		"$(json_bool "$available")" \
+		"$(json_bool "$supported")" \
+		"$quality" \
+		"$(json_escape "$reason")" \
+		"$(json_escape "$install_hint")"
+}
+
+print_string_array() {
+	local values="$1"
+	local first=1
+	local value
+
+	printf '['
+	printf '%s\n' "$values" | while IFS= read -r value; do
+		[ -n "$value" ] || continue
+		if [ "$first" = "1" ]; then
+			first=0
+		else
+			printf ','
+		fi
+		printf '"%s"' "$(json_escape "$value")"
+	done
+	printf ']'
+}
+
+print_warnings_array() {
+	print_string_array "$warnings"
+}
+
+configured_method="$(uci_get pinger_method)"
+[ -n "$configured_method" ] || configured_method="fping"
+configured_no_pingers="$(num_or_default "$(uci_get no_pingers)" 6)"
+reflector_ping_interval_s="$(uci_get reflector_ping_interval_s)"
+[ -n "$reflector_ping_interval_s" ] || reflector_ping_interval_s="0.3"
+
+reflectors="$(uci_get reflector)"
+if [ -z "$reflectors" ]; then
+	reflectors="1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 9.9.9.9 9.9.9.10"
+fi
+
+fping_bin="$(command_path fping)"
+ping_bin="$(command_path ping)"
+tsping_bin="$(command_path tsping)"
+irtt_bin="$(command_path irtt)"
+fping_ts_supported=0
+
+if [ -n "$fping_bin" ] && "$fping_bin" --help 2>&1 | grep -q -- '--icmp-timestamp'; then
+	fping_ts_supported=1
+fi
+
+[ -n "$fping_bin" ] || append_warning "fping is not installed; concurrent RTT probing is unavailable."
+[ "$fping_ts_supported" = "1" ] || append_warning "Installed fping does not expose --icmp-timestamp; fping-ts is unavailable."
+[ -n "$tsping_bin" ] || append_warning "tsping binary is not installed; tsping remains a manual optional backend."
+[ -n "$irtt_bin" ] || append_warning "irtt package is not installed. irtt daemon support is pending and will also require configured IRTT servers."
+if [ -n "$irtt_bin" ]; then
+	append_warning "irtt binary is installed, but this daemon build does not support pinger_method=irtt yet."
+fi
+
+candidate_count=0
+valid_count=0
+rtt_ok_count=0
+timestamp_ok_count=0
+scan_rows=""
+active=""
+spare=""
+bad=""
+
+for reflector in $reflectors; do
+	candidate_count=$((candidate_count + 1))
+
+	if ! valid_reflector "$reflector"; then
+		append_line_var bad "$reflector"
+		append_warning "Ignoring invalid reflector candidate: $reflector"
+		continue
+	fi
+
+	valid_count=$((valid_count + 1))
+
+	if [ "$mode" = "scan" ]; then
+		rtt_ms=""
+		ts_ms=""
+		rtt_ok=0
+		ts_ok=0
+
+		if rtt_ms="$(probe_fping "$reflector" "")"; then
+			rtt_ok=1
+			rtt_ok_count=$((rtt_ok_count + 1))
+		fi
+
+		if [ "$fping_ts_supported" = "1" ] && ts_ms="$(probe_fping "$reflector" "--icmp-timestamp")"; then
+			ts_ok=1
+			timestamp_ok_count=$((timestamp_ok_count + 1))
+		fi
+
+		append_line_var scan_rows "$reflector|$rtt_ok|$ts_ok|$rtt_ms|$ts_ms"
+	else
+		append_line_var scan_rows "$reflector|0|0||"
+	fi
+done
+
+target_pingers="$configured_no_pingers"
+if [ "$target_pingers" -gt 6 ] 2>/dev/null; then
+	target_pingers=6
+fi
+if [ "$target_pingers" -gt "$valid_count" ] 2>/dev/null; then
+	target_pingers="$valid_count"
+fi
+if [ "$target_pingers" -lt 1 ] 2>/dev/null; then
+	target_pingers=1
+fi
+
+recommended_method="fping"
+recommended_reason="fping is the upstream default and the most reliable concurrent RTT backend."
+
+if [ "$mode" = "scan" ]; then
+	if [ "$fping_ts_supported" = "1" ] && [ "$timestamp_ok_count" -ge "$target_pingers" ] 2>/dev/null; then
+		recommended_method="fping-ts"
+		recommended_reason="Enough reflectors answered ICMP timestamp probes; fping-ts can provide directional OWD."
+	elif [ -n "$fping_bin" ] && [ "$rtt_ok_count" -ge 1 ] 2>/dev/null; then
+		recommended_method="fping"
+		recommended_reason="Timestamp-capable reflectors were insufficient; use concurrent RTT probing."
+	elif [ -n "$ping_bin" ]; then
+		recommended_method="ping"
+		recommended_reason="fping probing did not find usable reflectors; ping is an emergency single-reflector fallback."
+		target_pingers=1
+	else
+		recommended_reason="No usable pinger backend is available."
+	fi
+else
+	if [ "$configured_method" = "ping" ]; then
+		recommended_method="ping"
+		recommended_reason="Current configuration uses the single-reflector ping fallback; run a scan before changing it."
+	elif [ "$configured_method" = "fping-ts" ] || [ "$configured_method" = "tsping" ]; then
+		recommended_method="$configured_method"
+		recommended_reason="Current configuration requests a timestamp-aware backend; run a scan to verify reflector support."
+	fi
+fi
+
+active=""
+spare=""
+selected_count=0
+OLDIFS="$IFS"
+IFS='
+'
+for row in $scan_rows; do
+	IFS='|'
+	set -- $row
+	IFS='
+'
+	reflector="$1"
+	rtt_ok="$2"
+	ts_ok="$3"
+	[ -n "$reflector" ] || continue
+	ok=0
+	case "$recommended_method" in
+		fping-ts|tsping)
+			[ "$mode" = "scan" ] && [ "$ts_ok" = "1" ] && ok=1
+			;;
+		fping)
+			if [ "$mode" = "scan" ]; then
+				[ "$rtt_ok" = "1" ] && ok=1
+			else
+				ok=1
+			fi
+			;;
+		ping)
+			if [ "$mode" = "scan" ]; then
+				[ "$rtt_ok" = "1" ] && ok=1
+			else
+				ok=1
+			fi
+			;;
+	esac
+	if [ "$ok" = "1" ]; then
+		if [ "$selected_count" -lt "$target_pingers" ] 2>/dev/null; then
+			append_line_var active "$reflector"
+			selected_count=$((selected_count + 1))
+		else
+			append_line_var spare "$reflector"
+		fi
+	elif [ "$mode" = "scan" ]; then
+		append_line_var bad "$reflector"
+	fi
+done
+IFS="$OLDIFS"
+
+if [ "$mode" = "scan" ] && [ "$selected_count" -lt "$target_pingers" ] 2>/dev/null; then
+	append_warning "Fewer usable reflectors than desired active pingers; reduce Pingers or add better reflectors."
+fi
+
+printf '{'
+printf '"section":"%s",' "$(json_escape "$section")"
+printf '"mode":"%s",' "$(json_escape "$mode")"
+printf '"configured_method":"%s",' "$(json_escape "$configured_method")"
+printf '"configured_no_pingers":%s,' "$configured_no_pingers"
+printf '"reflector_ping_interval_s":"%s",' "$(json_escape "$reflector_ping_interval_s")"
+printf '"candidate_count":%s,' "$candidate_count"
+printf '"valid_count":%s,' "$valid_count"
+printf '"rtt_ok_count":%s,' "$rtt_ok_count"
+printf '"timestamp_ok_count":%s,' "$timestamp_ok_count"
+printf '"recommended_method":"%s",' "$(json_escape "$recommended_method")"
+printf '"recommended_no_pingers":%s,' "$target_pingers"
+printf '"recommended_reason":"%s",' "$(json_escape "$recommended_reason")"
+printf '"backends":['
+backend_json "fping" "fping" "$([ -n "$fping_bin" ] && printf 1 || printf 0)" 1 70 "$([ -n "$fping_bin" ] && printf available || printf 'not installed')" "apk add fping"
+printf ','
+backend_json "fping-ts" "fping-ts" "$fping_ts_supported" 1 90 "$([ "$fping_ts_supported" = 1 ] && printf available || printf 'requires fping with --icmp-timestamp')" "apk add fping"
+printf ','
+backend_json "tsping" "tsping" "$([ -n "$tsping_bin" ] && printf 1 || printf 0)" 1 90 "$([ -n "$tsping_bin" ] && printf available || printf 'not installed')" "manual tsping binary"
+printf ','
+backend_json "irtt" "irtt" "$([ -n "$irtt_bin" ] && printf 1 || printf 0)" 0 100 "$([ -n "$irtt_bin" ] && printf 'installed; daemon support pending' || printf 'not installed; daemon support pending')" "apk add irtt after daemon support lands"
+printf ','
+backend_json "ping" "ping fallback" "$([ -n "$ping_bin" ] && printf 1 || printf 0)" 1 30 "$([ -n "$ping_bin" ] && printf available || printf 'not installed')" "built in"
+printf '],'
+printf '"active":'
+print_string_array "$active"
+printf ',"spare":'
+print_string_array "$spare"
+printf ',"bad":'
+print_string_array "$bad"
+printf ',"warnings":'
+print_warnings_array
+
+if [ "$mode" = "scan" ]; then
+	printf ',"reflectors":['
+	first=1
+	OLDIFS="$IFS"
+	IFS='
+'
+	for row in $scan_rows; do
+		IFS='|'
+		set -- $row
+		IFS='
+'
+		reflector="$1"
+		rtt_ok="$2"
+		ts_ok="$3"
+		rtt_ms="$4"
+		ts_ms="$5"
+		[ -n "$reflector" ] || continue
+		if [ "$first" = 1 ]; then
+			first=0
+		else
+			printf ','
+		fi
+		printf '{"host":"%s","rtt_ok":%s,"timestamp_ok":%s,"rtt_ms":%s,"timestamp_rtt_ms":%s}' \
+			"$(json_escape "$reflector")" \
+			"$(json_bool "$rtt_ok")" \
+			"$(json_bool "$ts_ok")" \
+			"${rtt_ms:-null}" \
+			"${ts_ms:-null}"
+	done
+	IFS="$OLDIFS"
+	printf ']'
+fi
+
+printf '}\n'

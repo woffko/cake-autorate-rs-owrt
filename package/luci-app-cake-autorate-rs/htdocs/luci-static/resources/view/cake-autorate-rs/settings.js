@@ -97,6 +97,8 @@ var optionDescriptions = {
 	bufferbloat_refractory_period_ms: 'Minimum time after a bufferbloat response before another backoff may happen.',
 	decay_refractory_period_ms: 'Minimum time between low-load decay adjustments.',
 	pinger_method: 'Probe backend used to measure reflector latency. fping supports concurrent RTT reflectors; fping-ts and tsping use ICMP timestamp OWD probes; ping is a basic fallback using the first reflector.',
+	_pinger_backend_status: 'Show which pinger binaries are available and which backend the planner would prefer.',
+	_reflector_scan: 'Probe configured reflectors, classify timestamp support, and suggest an upstream-style active set plus spare pool.',
 	reflector: 'Hosts to probe for latency. Use stable anycast or nearby IP addresses.',
 	reflectors_url: 'Optional URL to fetch reflector candidates from at daemon startup. Falls back to the configured list if the URL is unavailable.',
 	reflectors_url_skip_lines: 'Number of header lines to skip when parsing reflector URL data.',
@@ -719,6 +721,60 @@ function formatSpeedtestBackendStatus(result) {
 
 	if (result.warning)
 		lines.push(result.warning);
+
+	return lines.join('\n');
+}
+
+function runPingerPlan(section_id, mode) {
+	return fs.exec('/usr/libexec/cake-autorate-rs/pinger-plan', [
+		section_id,
+		mode || 'status'
+	]).then(parseExecJson);
+}
+
+function formatPingerPlan(result) {
+	var backends = result.backends || [];
+	var warnings = result.warnings || [];
+	var lines = [];
+
+	lines.push(_('Recommended pinger: %s').format(result.recommended_method || '-'));
+	lines.push(_('Recommended active pingers: %s').format(result.recommended_no_pingers || '-'));
+
+	if (result.recommended_reason)
+		lines.push(result.recommended_reason);
+
+	if (result.mode === 'scan') {
+		lines.push(_('RTT-capable reflectors: %d/%d').format(result.rtt_ok_count || 0, result.valid_count || 0));
+		lines.push(_('Timestamp-capable reflectors: %d/%d').format(result.timestamp_ok_count || 0, result.valid_count || 0));
+	}
+
+	if (result.active && result.active.length)
+		lines.push(_('Active set: %s').format(result.active.join(', ')));
+
+	if (result.spare && result.spare.length)
+		lines.push(_('Spare pool: %s').format(result.spare.join(', ')));
+
+	if (result.bad && result.bad.length)
+		lines.push(_('Bad or unsuitable: %s').format(result.bad.join(', ')));
+
+	lines.push('');
+	lines.push(_('Pinger backends:'));
+	for (var i = 0; i < backends.length; i++) {
+		var backend = backends[i];
+		var state = backend.available ? _('available') : _('unavailable');
+		var support = backend.supported ? '' : ' - ' + _('daemon support pending');
+		var reason = backend.reason ? ' - ' + backend.reason : '';
+		var install = (!backend.available && backend.install_hint) ? ' - ' + backend.install_hint : '';
+
+		lines.push('%s: %s%s%s%s'.format(backend.title || backend.name, state, support, reason, install));
+	}
+
+	if (warnings.length) {
+		lines.push('');
+		lines.push(_('Warnings:'));
+		for (i = 0; i < warnings.length; i++)
+			lines.push(warnings[i]);
+	}
 
 	return lines.join('\n');
 }
@@ -1719,7 +1775,54 @@ function addControllerOptions(section) {
 }
 
 function addReflectorOptions(section) {
-	var o = section.taboption('reflectors', form.ListValue, 'pinger_method', _('Pinger'));
+	var o;
+
+	o = section.taboption('reflectors', form.Button, '_pinger_backend_status', _('Check pingers'));
+	modal(o);
+	describe(o, '_pinger_backend_status');
+	o.inputtitle = _('Check pingers');
+	o.inputstyle = 'action';
+	o.rmempty = true;
+	o.write = function() {};
+	o.remove = function() {};
+	o.onclick = function(ev, section_id) {
+		var button = ev.currentTarget;
+
+		button.disabled = true;
+
+		return runPingerPlan(section_id, 'status').then(function(result) {
+			ui.addNotification(null, E('pre', { 'style': 'white-space:pre-wrap' }, formatPingerPlan(result)), 'info');
+		}).catch(function(err) {
+			ui.addNotification(null, E('p', _('Pinger status check failed: %s').format(err.message || err)), 'error');
+		}).then(function() {
+			button.disabled = false;
+		});
+	};
+
+	o = section.taboption('reflectors', form.Button, '_reflector_scan', _('Scan reflectors'));
+	modal(o);
+	describe(o, '_reflector_scan');
+	o.inputtitle = _('Scan reflectors');
+	o.inputstyle = 'action';
+	o.rmempty = true;
+	o.write = function() {};
+	o.remove = function() {};
+	o.onclick = function(ev, section_id) {
+		var button = ev.currentTarget;
+
+		button.disabled = true;
+
+		return runPingerPlan(section_id, 'scan').then(function(result) {
+			var level = (result.warnings && result.warnings.length) ? 'warning' : 'info';
+			ui.addNotification(null, E('pre', { 'style': 'white-space:pre-wrap' }, formatPingerPlan(result)), level);
+		}).catch(function(err) {
+			ui.addNotification(null, E('p', _('Reflector scan failed: %s').format(err.message || err)), 'error');
+		}).then(function() {
+			button.disabled = false;
+		});
+	};
+
+	o = section.taboption('reflectors', form.ListValue, 'pinger_method', _('Pinger'));
 	modal(o);
 	describe(o, 'pinger_method');
 	o.value('fping', 'fping');
