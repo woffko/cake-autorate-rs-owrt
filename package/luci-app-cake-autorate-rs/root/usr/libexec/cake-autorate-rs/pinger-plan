@@ -152,6 +152,39 @@ lookup_probe_result() {
 	printf '%s\n' "$results" | awk -F '|' -v host="$host" '$1 == host { print $2; exit }'
 }
 
+probe_tsping_batch() {
+	local targets="$1"
+	local tmp pid
+
+	if [ -z "$tsping_bin" ] || [ -z "$targets" ]; then
+		return 1
+	fi
+
+	tmp="${TMPDIR:-/tmp}/cake-autorate-rs-tsping-scan.$$"
+	rm -f "$tmp"
+	"$tsping_bin" --print-timestamps --machine-readable=, --sleep-time 0 --target-spacing 50 $targets >"$tmp" 2>/dev/null &
+	pid="$!"
+	sleep 4
+	kill "$pid" 2>/dev/null || true
+	wait "$pid" 2>/dev/null || true
+
+	awk -F ',' '
+		NF == 10 {
+			host = $2
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", host)
+			dl = $9
+			ul = $10
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", dl)
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", ul)
+			if (host != "" && dl ~ /^[0-9.]+$/ && ul ~ /^[0-9.]+$/ && !(host in seen)) {
+				seen[host] = 1
+				print host "|" (dl + ul)
+			}
+		}
+	' "$tmp"
+	rm -f "$tmp"
+}
+
 pinger_title() {
 	case "$1" in
 		fping)
@@ -467,6 +500,7 @@ candidate_count=0
 valid_count=0
 rtt_ok_count=0
 timestamp_ok_count=0
+timestamp_probe_backend=""
 scan_rows=""
 scan_candidates=""
 active=""
@@ -494,8 +528,20 @@ if [ "$mode" = "scan" ]; then
 	rtt_results="$(probe_fping_batch "$scan_candidates" "")"
 	if [ "$fping_ts_supported" = "1" ]; then
 		ts_results="$(probe_fping_batch "$scan_candidates" "--icmp-timestamp")"
+		timestamp_probe_backend="fping-ts"
+	elif [ -n "$tsping_bin" ]; then
+		ts_results="$(probe_tsping_batch "$scan_candidates")"
+		timestamp_probe_backend="tsping"
 	else
 		ts_results=""
+	fi
+
+	if [ -z "$ts_results" ] && [ -n "$tsping_bin" ] && [ "$timestamp_probe_backend" != "tsping" ]; then
+		tsping_results="$(probe_tsping_batch "$scan_candidates")"
+		if [ -n "$tsping_results" ]; then
+			ts_results="$tsping_results"
+			timestamp_probe_backend="tsping"
+		fi
 	fi
 
 	OLDIFS="$IFS"
@@ -627,6 +673,7 @@ printf '"candidate_count":%s,' "$candidate_count"
 printf '"valid_count":%s,' "$valid_count"
 printf '"rtt_ok_count":%s,' "$rtt_ok_count"
 printf '"timestamp_ok_count":%s,' "$timestamp_ok_count"
+printf '"timestamp_probe_backend":"%s",' "$(json_escape "$timestamp_probe_backend")"
 printf '"recommended_method":"%s",' "$(json_escape "$recommended_method")"
 printf '"recommended_no_pingers":%s,' "$target_pingers"
 printf '"recommended_reason":"%s",' "$(json_escape "$recommended_reason")"
