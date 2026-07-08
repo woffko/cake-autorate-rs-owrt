@@ -94,32 +94,56 @@ append_line_var() {
 			scan_rows="${scan_rows}${scan_rows:+
 }$2"
 			;;
+		scan_candidates)
+			scan_candidates="${scan_candidates}${scan_candidates:+
+}$2"
+			;;
 	esac
 }
 
-extract_avg_ms() {
-	sed -n 's/.*min\/avg\/max = [^\/]*\/\([0-9.][0-9.]*\)\/.*/\1/p' | tail -n 1
+append_candidate() {
+	local candidate="$1"
+	local existing
+
+	[ -n "$candidate" ] || return 0
+
+	for existing in $reflectors; do
+		[ "$existing" = "$candidate" ] && return 0
+	done
+
+	reflectors="${reflectors}${reflectors:+ }$candidate"
 }
 
-probe_fping() {
-	local host="$1"
+probe_fping_batch() {
+	local targets="$1"
 	local extra="$2"
-	local output status avg
+	local output
 
-	if [ -z "$fping_bin" ]; then
+	if [ -z "$fping_bin" ] || [ -z "$targets" ]; then
 		return 1
 	fi
 
-	output="$("$fping_bin" $extra -c 1 -t 1000 "$host" 2>&1)"
-	status="$?"
-	avg="$(printf '%s\n' "$output" | extract_avg_ms)"
+	output="$("$fping_bin" $extra -c 1 -t 1000 $targets 2>&1)"
 
-	if [ "$status" -eq 0 ]; then
-		printf '%s\n' "${avg:-0}"
-		return 0
-	fi
+	printf '%s\n' "$output" | awk '
+		/: xmt\/rcv\/%loss = / && /min\/avg\/max =/ {
+			host = $0
+			sub(/[[:space:]]*: xmt\/rcv\/%loss = .*/, "", host)
+			sub(/[[:space:]]+$/, "", host)
+			avg = $0
+			sub(/^.*min\/avg\/max = [^\/]*\//, "", avg)
+			sub(/\/.*$/, "", avg)
+			if (host != "" && avg ~ /^[0-9.]+$/)
+				print host "|" avg
+		}
+	'
+}
 
-	return 1
+lookup_probe_result() {
+	local results="$1"
+	local host="$2"
+
+	printf '%s\n' "$results" | awk -F '|' -v host="$host" '$1 == host { print $2; exit }'
 }
 
 backend_json() {
@@ -163,15 +187,38 @@ print_warnings_array() {
 	print_string_array "$warnings"
 }
 
+UPSTREAM_DEFAULT_REFLECTORS="1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 9.9.9.9 9.9.9.10 9.9.9.11 94.140.14.15 94.140.14.140 94.140.14.141 94.140.15.15 94.140.15.16 64.6.65.6 156.154.70.1 156.154.70.2 156.154.70.3 156.154.70.4 156.154.70.5 156.154.71.1 156.154.71.2 156.154.71.3 156.154.71.4 156.154.71.5 208.67.220.2 208.67.220.123 208.67.220.220 208.67.222.2 208.67.222.123 185.228.168.9 185.228.168.10"
+default_pool_count=0
+for reflector in $UPSTREAM_DEFAULT_REFLECTORS; do
+	default_pool_count=$((default_pool_count + 1))
+done
+
 configured_method="$(uci_get pinger_method)"
 [ -n "$configured_method" ] || configured_method="fping"
 configured_no_pingers="$(num_or_default "$(uci_get no_pingers)" 6)"
 reflector_ping_interval_s="$(uci_get reflector_ping_interval_s)"
 [ -n "$reflector_ping_interval_s" ] || reflector_ping_interval_s="0.3"
 
-reflectors="$(uci_get reflector)"
-if [ -z "$reflectors" ]; then
-	reflectors="1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 9.9.9.9 9.9.9.10"
+configured_reflectors="$(uci_get reflector)"
+reflectors=""
+candidate_source="configured"
+
+if [ -n "$configured_reflectors" ]; then
+	for reflector in $configured_reflectors; do
+		append_candidate "$reflector"
+	done
+else
+	candidate_source="upstream-default"
+fi
+
+if [ -z "$configured_reflectors" ] || [ "$mode" = "scan" ]; then
+	if [ -n "$configured_reflectors" ]; then
+		candidate_source="configured-plus-upstream-default"
+	fi
+
+	for reflector in $UPSTREAM_DEFAULT_REFLECTORS; do
+		append_candidate "$reflector"
+	done
 fi
 
 fping_bin="$(command_path fping)"
@@ -197,6 +244,7 @@ valid_count=0
 rtt_ok_count=0
 timestamp_ok_count=0
 scan_rows=""
+scan_candidates=""
 active=""
 spare=""
 bad=""
@@ -211,28 +259,44 @@ for reflector in $reflectors; do
 	fi
 
 	valid_count=$((valid_count + 1))
+	append_line_var scan_candidates "$reflector"
 
-	if [ "$mode" = "scan" ]; then
-		rtt_ms=""
-		ts_ms=""
+	if [ "$mode" != "scan" ]; then
+		append_line_var scan_rows "$reflector|0|0||"
+	fi
+done
+
+if [ "$mode" = "scan" ]; then
+	rtt_results="$(probe_fping_batch "$scan_candidates" "")"
+	if [ "$fping_ts_supported" = "1" ]; then
+		ts_results="$(probe_fping_batch "$scan_candidates" "--icmp-timestamp")"
+	else
+		ts_results=""
+	fi
+
+	OLDIFS="$IFS"
+	IFS='
+'
+	for reflector in $scan_candidates; do
+		rtt_ms="$(lookup_probe_result "$rtt_results" "$reflector")"
+		ts_ms="$(lookup_probe_result "$ts_results" "$reflector")"
 		rtt_ok=0
 		ts_ok=0
 
-		if rtt_ms="$(probe_fping "$reflector" "")"; then
+		if [ -n "$rtt_ms" ]; then
 			rtt_ok=1
 			rtt_ok_count=$((rtt_ok_count + 1))
 		fi
 
-		if [ "$fping_ts_supported" = "1" ] && ts_ms="$(probe_fping "$reflector" "--icmp-timestamp")"; then
+		if [ -n "$ts_ms" ]; then
 			ts_ok=1
 			timestamp_ok_count=$((timestamp_ok_count + 1))
 		fi
 
 		append_line_var scan_rows "$reflector|$rtt_ok|$ts_ok|$rtt_ms|$ts_ms"
-	else
-		append_line_var scan_rows "$reflector|0|0||"
-	fi
-done
+	done
+	IFS="$OLDIFS"
+fi
 
 target_pingers="$configured_no_pingers"
 if [ "$target_pingers" -gt 6 ] 2>/dev/null; then
@@ -330,6 +394,8 @@ printf '"mode":"%s",' "$(json_escape "$mode")"
 printf '"configured_method":"%s",' "$(json_escape "$configured_method")"
 printf '"configured_no_pingers":%s,' "$configured_no_pingers"
 printf '"reflector_ping_interval_s":"%s",' "$(json_escape "$reflector_ping_interval_s")"
+printf '"candidate_source":"%s",' "$(json_escape "$candidate_source")"
+printf '"default_pool_count":%s,' "$default_pool_count"
 printf '"candidate_count":%s,' "$candidate_count"
 printf '"valid_count":%s,' "$valid_count"
 printf '"rtt_ok_count":%s,' "$rtt_ok_count"

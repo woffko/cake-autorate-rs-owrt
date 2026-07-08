@@ -98,10 +98,10 @@ var optionDescriptions = {
 	decay_refractory_period_ms: 'Minimum time between low-load decay adjustments.',
 	pinger_method: 'Probe backend used to measure reflector latency. fping supports concurrent RTT reflectors; fping-ts and tsping use ICMP timestamp OWD probes; ping is a basic fallback using the first reflector.',
 	_pinger_backend_status: 'Show which pinger binaries are available and which backend the planner would prefer.',
-	_reflector_scan: 'Probe configured reflectors, classify timestamp support, and suggest an upstream-style active set plus spare pool.',
-	_reflector_apply: 'Scan reflectors and write the recommended pinger, active count, and ordered active plus spare reflector list into pending changes.',
-	_wizard_reflector_plan: 'Scan the default reflector pool and fill the new instance with the recommended pinger and active/spare reflector set.',
-	reflector: 'Hosts to probe for latency. Use stable anycast or nearby IP addresses.',
+	_reflector_scan: 'Probe configured reflectors plus the upstream default pool, classify timestamp support, and suggest an active set plus spare pool.',
+	_reflector_apply: 'Scan configured reflectors plus upstream defaults, then write the recommended pinger, active count, and ordered active plus spare reflector list into pending changes.',
+	_wizard_reflector_plan: 'Scan the upstream default reflector pool and fill the new instance with the recommended pinger and active/spare reflector set.',
+	reflector: 'Hosts to probe for latency. Defaults match the upstream cake-autorate anycast reflector pool.',
 	reflectors_url: 'Optional URL to fetch reflector candidates from at daemon startup. Falls back to the configured list if the URL is unavailable.',
 	reflectors_url_skip_lines: 'Number of header lines to skip when parsing reflector URL data.',
 	randomize_reflectors: 'Shuffle reflector order before selecting active probes.',
@@ -755,6 +755,8 @@ function formatPingerPlan(result) {
 		lines.push(result.recommended_reason);
 
 	if (result.mode === 'scan') {
+		if (result.candidate_source || result.default_pool_count)
+			lines.push(_('Candidate pool: %d reflectors (%s, upstream defaults: %d)').format(result.valid_count || 0, result.candidate_source || '-', result.default_pool_count || 0));
 		lines.push(_('RTT-capable reflectors: %d/%d').format(result.rtt_ok_count || 0, result.valid_count || 0));
 		lines.push(_('Timestamp-capable reflectors: %d/%d').format(result.timestamp_ok_count || 0, result.valid_count || 0));
 	}
@@ -791,7 +793,16 @@ function formatPingerPlan(result) {
 }
 
 function defaultReflectors() {
-	return [ '1.1.1.1', '1.0.0.1', '8.8.8.8', '8.8.4.4', '9.9.9.9', '9.9.9.10' ];
+	return [
+		'1.1.1.1', '1.0.0.1',
+		'8.8.8.8', '8.8.4.4',
+		'9.9.9.9', '9.9.9.10', '9.9.9.11',
+		'94.140.14.15', '94.140.14.140', '94.140.14.141', '94.140.15.15', '94.140.15.16',
+		'64.6.65.6', '156.154.70.1', '156.154.70.2', '156.154.70.3', '156.154.70.4', '156.154.70.5',
+		'156.154.71.1', '156.154.71.2', '156.154.71.3', '156.154.71.4', '156.154.71.5',
+		'208.67.220.2', '208.67.220.123', '208.67.220.220', '208.67.222.2', '208.67.222.123',
+		'185.228.168.9', '185.228.168.10'
+	];
 }
 
 function pingerPlanReflectors(result) {

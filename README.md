@@ -50,9 +50,9 @@ Implemented:
   duplicate managed SQM section ownership.
 - LuCI setup wizard for creating instances, importing SQM rates, checking speed
   test backends, running a router-side speed test, and writing derived limits.
-- LuCI Reflectors tab can check pinger backend availability and scan the
-  configured/default reflector pool, including RTT and ICMP timestamp
-  capability, without adding hard dependencies.
+- LuCI Reflectors tab can check pinger backend availability and scan configured
+  reflectors plus the upstream default anycast reflector pool, including RTT and
+  ICMP timestamp capability, without adding hard dependencies.
 - LuCI can apply the pinger planner recommendation into pending changes for an
   existing instance, and the create wizard writes pinger method, active pinger
   count, and reflector list for new instances.
@@ -80,10 +80,9 @@ Known limits:
   compatible `tsping` binary manually where available before selecting it.
 - reflector health/replacement is implemented as an MVP; `fping-ts` uses
   separate DL/UL OWD samples while RTT backends still use RTT/2 estimates.
-- Pinger/reflector planner currently uses the configured/default reflector list.
-  It can apply the recommended pinger method, active count, and ordered
-  reflector list, but broader candidate-pool discovery and runtime active/spare
-  health display are still future work.
+- Runtime active/spare reflector health display is still future work; the LuCI
+  planner can already scan a broader upstream default candidate pool and apply
+  the recommended pinger method, active count, and ordered reflector list.
 - Use the external LibreQoS Internet Quality Test at https://test.libreqos.com/
   as a manual browser-side validation tool after configuring autorate. It is
   intentionally documented only, not integrated into the wizard or router-side
