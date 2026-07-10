@@ -89,7 +89,9 @@ Known limits:
   `fping-ts`, `tsping`, or explicit-server `irtt` for concurrent probing.
 - `pinger_method=irtt` requires the optional `irtt` package and at least one
   explicit `list irtt_server ...` entry. Generic DNS reflector pools are not
-  used as IRTT servers.
+  used as IRTT servers. The router and IRTT servers also need synchronized
+  clocks; upstream-compatible parsing ignores negative one-way delays from
+  unsynchronized hosts.
 - `fping-ts` and `tsping` depend on reflectors that answer ICMP timestamp
   probes; many public DNS anycast reflectors do not.
 - `tsping` is runtime-detected and not a hard package dependency; install a
@@ -105,7 +107,7 @@ Known limits:
 - Pinger auto-install is intentionally limited: the GUI can install/repair the
   supported `fping` package used by `fping`/`fping-ts` and the optional `irtt`
   package. `tsping` remains a manual binary install, and `irtt` is only ready
-  when explicit IRTT servers are configured.
+  when explicit IRTT servers are configured and clocks are synchronized.
 - advanced multi-WAN policy is not implemented.
 - MQTT is an optional sidecar service rather than daemon core. It requires a
   configured broker, `log_to_file=1`, `output_summary_stats=1`, and
@@ -172,14 +174,16 @@ Optional pinger backend binaries:
 
 The daemon accepts `pinger_method=tsping` when the binary is present in PATH and
 `pinger_method=irtt` when `irtt` is installed and explicit IRTT servers are
-configured. `tsping` remains optional because no supported OpenWrt package was
-available on the current test router. The advanced LuCI Reflectors tab can
-check pinger backend availability, show RTT/OWD and round-robin/individual
-mode, install supported `fping`/`irtt` packages when needed, scan reflectors,
-and apply the recommendation into pending changes. If `tsping` is manually
-installed, the planner can use it as the timestamp probe path when
-`fping --icmp-timestamp` is unavailable. The create wizard writes pinger
-defaults and can run the same scan before creating a new instance.
+configured. IRTT OWD samples require the router and IRTT server clocks to be
+synchronized; negative one-way delays are ignored to match upstream behavior.
+`tsping` remains optional because no supported OpenWrt package was available on
+the current test router. The advanced LuCI Reflectors tab can check pinger
+backend availability, show RTT/OWD and round-robin/individual mode, install
+supported `fping`/`irtt` packages when needed, scan reflectors, and apply the
+recommendation into pending changes. If `tsping` is manually installed, the
+planner can use it as the timestamp probe path when `fping --icmp-timestamp` is
+unavailable. The create wizard writes pinger defaults and can run the same scan
+before creating a new instance.
 
 Optional MQTT client packages:
 
