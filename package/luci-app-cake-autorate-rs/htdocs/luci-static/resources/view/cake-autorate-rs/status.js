@@ -31,6 +31,42 @@ function serviceAction(action) {
 	});
 }
 
+function downloadText(filename, text) {
+	var blob = new Blob([ text ], { type: 'text/plain;charset=utf-8' });
+	var url = URL.createObjectURL(blob);
+	var link = document.createElement('a');
+
+	link.href = url;
+	link.download = filename;
+	document.body.appendChild(link);
+	link.click();
+	document.body.removeChild(link);
+	window.setTimeout(function() {
+		URL.revokeObjectURL(url);
+	}, 1000);
+}
+
+function exportLogs(ev) {
+	var button = ev.currentTarget;
+
+	button.disabled = true;
+
+	return fs.exec('/usr/libexec/cake-autorate-rs/log-bundle', [ 'all' ]).then(function(res) {
+		var stdout = res && res.stdout ? res.stdout : '';
+		var stamp = new Date().toISOString().replace(/[:.]/g, '-');
+
+		if (!stdout)
+			throw new Error(_('Log bundle helper returned no data.'));
+
+		downloadText('cake-autorate-rs-log-bundle-' + stamp + '.txt', stdout);
+		ui.addNotification(null, E('p', _('Log bundle exported.')));
+	}).catch(function(err) {
+		ui.addNotification(null, E('p', _('Log bundle export failed: %s').format(err.message || err)), 'error');
+	}).then(function() {
+		button.disabled = false;
+	});
+}
+
 function formatRate(value) {
 	value = Number(value || 0);
 	return value.toFixed(0) + ' kbps';
@@ -177,7 +213,12 @@ return L.view.extend({
 				E('button', {
 					'class': 'btn cbi-button cbi-button-remove',
 					'click': ui.createHandlerFn(this, function() { return serviceAction('stop'); })
-				}, _('Stop'))
+				}, _('Stop')),
+				' ',
+				E('button', {
+					'class': 'btn cbi-button cbi-button-action',
+					'click': ui.createHandlerFn(this, exportLogs)
+				}, _('Export logs'))
 			]),
 			table
 		]);

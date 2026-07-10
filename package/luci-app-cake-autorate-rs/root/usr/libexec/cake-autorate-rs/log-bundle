@@ -1,0 +1,142 @@
+#!/bin/sh
+
+SECTION="${1:-all}"
+
+if [ "$SECTION" = "--help" ] || [ "$SECTION" = "-h" ]; then
+	echo "usage: log-bundle [all|section]"
+	exit 0
+fi
+
+case "$SECTION" in
+	*[!A-Za-z0-9_.:-]*)
+		echo "ERROR: invalid section name" >&2
+		exit 1
+		;;
+esac
+
+. /lib/functions.sh
+
+sections=""
+
+append_section() {
+	local section="$1"
+	sections="${sections}${sections:+ }$section"
+}
+
+redact_secrets() {
+	sed -E \
+		-e "s/(mqtt_password[[:space:]]+')[^']*(')/\1<redacted>\2/g" \
+		-e "s/(mqtt_password=')[^']*(')/\1<redacted>\2/g" \
+		-e "s/((^|[.[:space:]])password[[:space:]]+')[^']*(')/\1<redacted>\3/g" \
+		-e "s/((^|[.[:space:]])password=')[^']*(')/\1<redacted>\3/g"
+}
+
+section_title() {
+	printf '\n===== %s =====\n' "$1"
+}
+
+run_command() {
+	local title="$1"
+	shift
+
+	section_title "$title"
+	"$@" 2>&1 || true
+}
+
+print_file() {
+	local path="$1"
+
+	[ -f "$path" ] || return 0
+
+	section_title "$path"
+	case "$path" in
+		*.gz)
+			if command -v gzip >/dev/null 2>&1; then
+				gzip -dc "$path" 2>&1 || true
+			else
+				echo "Compressed log omitted: gzip is not installed."
+			fi
+			;;
+		*)
+			cat "$path" 2>&1 || true
+			;;
+	esac
+}
+
+print_section_logs() {
+	local section="$1"
+	local log_dir log_path path
+
+	config_get log_dir "$section" log_file_path_override
+	[ -n "$log_dir" ] || log_dir="/var/log"
+	log_path="$log_dir/cake-autorate.$section.log"
+
+	section_title "instance $section status"
+	if [ -f "/var/run/cake-autorate/$section/status.json" ]; then
+		cat "/var/run/cake-autorate/$section/status.json" 2>&1 || true
+	else
+		echo "No runtime status found at /var/run/cake-autorate/$section/status.json"
+	fi
+
+	for path in "$log_path" "$log_path".*; do
+		[ -e "$path" ] || continue
+		print_file "$path"
+	done
+}
+
+config_load cake-autorate
+
+if [ "$SECTION" = "all" ]; then
+	config_foreach append_section cake_autorate
+else
+	config_get type "$SECTION" TYPE
+	if [ "$type" != "cake_autorate" ]; then
+		echo "ERROR: unknown cake-autorate section: $SECTION" >&2
+		exit 1
+	fi
+	sections="$SECTION"
+fi
+
+section_title "cake-autorate-rs diagnostic bundle"
+echo "generated_at_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)"
+echo "requested_section=$SECTION"
+echo "included_sections=${sections:-none}"
+
+run_command "system" uname -a
+[ -f /etc/openwrt_release ] && print_file /etc/openwrt_release
+
+if command -v apk >/dev/null 2>&1; then
+	run_command "apk cake-autorate packages" apk info cake-autorate-rs luci-app-cake-autorate-rs
+fi
+
+if [ -x /etc/init.d/cake-autorate ]; then
+	run_command "cake-autorate service status" /etc/init.d/cake-autorate status
+fi
+
+if [ -x /etc/init.d/cake-autorate-mqtt ]; then
+	run_command "cake-autorate-mqtt service status" /etc/init.d/cake-autorate-mqtt status
+fi
+
+section_title "uci show cake-autorate"
+uci -q show cake-autorate 2>&1 | redact_secrets || true
+
+[ -f /etc/config/cake-autorate ] && {
+	section_title "/etc/config/cake-autorate"
+	redact_secrets < /etc/config/cake-autorate
+}
+
+[ -f /etc/config/sqm ] && {
+	section_title "/etc/config/sqm"
+	cat /etc/config/sqm 2>&1 || true
+}
+
+if [ -n "$sections" ]; then
+	for section in $sections; do
+		print_section_logs "$section"
+	done
+fi
+
+if command -v logread >/dev/null 2>&1; then
+	section_title "logread cake-autorate tail"
+	logread -e cake-autorate 2>&1 | tail -n 200 || true
+fi
