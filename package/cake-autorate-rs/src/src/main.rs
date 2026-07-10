@@ -72,6 +72,7 @@ struct Config {
     connection_active_thr_kbps: f64,
     pinger_method: String,
     ping_extra_args: String,
+    ping_prefix_string: String,
     reflectors: Vec<String>,
     irtt_servers: Vec<String>,
     irtt_session_duration_m: f64,
@@ -147,6 +148,7 @@ impl Config {
             connection_active_thr_kbps: 2000.0,
             pinger_method: "fping".to_string(),
             ping_extra_args: String::new(),
+            ping_prefix_string: String::new(),
             reflectors: default_reflectors(),
             irtt_servers: Vec::new(),
             irtt_session_duration_m: 10.0,
@@ -309,6 +311,7 @@ impl Config {
         )?;
         set_string(&single, "pinger_method", &mut cfg.pinger_method);
         set_string(&single, "ping_extra_args", &mut cfg.ping_extra_args);
+        set_string(&single, "ping_prefix_string", &mut cfg.ping_prefix_string);
         set_f64(
             &single,
             "irtt_session_duration_m",
@@ -1987,7 +1990,7 @@ fn spawn_fping(
         return Err("at least one reflector is required".to_string());
     }
 
-    let mut cmd = Command::new("fping");
+    let mut cmd = pinger_command(cfg, "fping")?;
     for arg in safe_extra_args(&cfg.ping_extra_args) {
         cmd.arg(arg);
     }
@@ -2024,7 +2027,7 @@ fn spawn_tsping(cfg: &Config, active_reflectors: &[String]) -> Result<Child, Str
         return Err("at least one reflector is required".to_string());
     }
 
-    let mut cmd = Command::new("tsping");
+    let mut cmd = pinger_command(cfg, "tsping")?;
     for arg in safe_extra_args(&cfg.ping_extra_args) {
         cmd.arg(arg);
     }
@@ -2047,7 +2050,7 @@ fn spawn_ping(cfg: &Config, active_reflectors: &[String]) -> Result<Child, Strin
         .ok_or_else(|| "at least one reflector is required".to_string())?;
     let interval_s = cfg.reflector_ping_interval_s.ceil().max(1.0) as u64;
 
-    let mut cmd = Command::new("ping");
+    let mut cmd = pinger_command(cfg, "ping")?;
     cmd.arg("-n")
         .arg("-i")
         .arg(interval_s.to_string())
@@ -2075,7 +2078,7 @@ fn spawn_irtt(cfg: &Config, active_reflectors: &[String]) -> Result<Vec<Child>, 
     let mut children = Vec::new();
 
     for target in active_reflectors {
-        let mut cmd = Command::new("irtt");
+        let mut cmd = pinger_command(cfg, "irtt")?;
         cmd.arg("client");
         for arg in safe_extra_args(&cfg.ping_extra_args) {
             cmd.arg(arg);
@@ -2100,6 +2103,17 @@ fn spawn_irtt(cfg: &Config, active_reflectors: &[String]) -> Result<Vec<Child>, 
     }
 
     Ok(children)
+}
+
+fn pinger_command(cfg: &Config, binary: &str) -> Result<Command, String> {
+    let prefix = safe_command_words(&cfg.ping_prefix_string)?;
+    if prefix.is_empty() {
+        return Ok(Command::new(binary));
+    }
+
+    let mut cmd = Command::new(&prefix[0]);
+    cmd.args(&prefix[1..]).arg(binary);
+    Ok(cmd)
 }
 
 fn stop_child(child: &mut Child) {
@@ -2325,6 +2339,31 @@ fn safe_extra_args(value: &str) -> Vec<String> {
         })
         .map(str::to_string)
         .collect()
+}
+
+fn safe_command_words(value: &str) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+
+    for word in value.split_whitespace() {
+        if word.is_empty() {
+            continue;
+        }
+
+        let safe = word.len() <= 128
+            && word.chars().all(|ch| {
+                ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '/' | '=')
+            });
+
+        if !safe {
+            return Err(format!(
+                "ping_prefix_string contains unsupported argument token: {word}"
+            ));
+        }
+
+        words.push(word.to_string());
+    }
+
+    Ok(words)
 }
 
 fn fetch_url_text(url: &str) -> Result<String, String> {
@@ -2897,7 +2936,7 @@ mod tests {
     use super::{
         default_reflectors, irtt_target_arg, next_spare_reflector, parse_fping_ts_line,
         parse_irtt_duration_us, parse_irtt_line, parse_reflector_candidates, parse_tsping_line,
-        parse_uci_values, reflector_bad_reflectors, reflector_health_json,
+        parse_uci_values, pinger_command, reflector_bad_reflectors, reflector_health_json,
         reflector_spare_reflectors, Config, ReflectorHealth, ReflectorState,
     };
     use std::time::Instant;
@@ -3010,6 +3049,29 @@ mod tests {
             irtt_target_arg("irtt.example.net:2112"),
             "irtt.example.net:2112"
         );
+    }
+
+    #[test]
+    fn prefixes_pinger_commands_without_shell() {
+        let mut cfg = Config::defaults("test".to_string());
+        cfg.ping_prefix_string = "mwan3 use gpon exec".to_string();
+
+        let cmd = pinger_command(&cfg, "fping").expect("expected prefixed command");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(cmd.get_program().to_string_lossy(), "mwan3");
+        assert_eq!(args, vec!["use", "gpon", "exec", "fping"]);
+    }
+
+    #[test]
+    fn rejects_unsafe_pinger_prefix_tokens() {
+        let mut cfg = Config::defaults("test".to_string());
+        cfg.ping_prefix_string = "mwan3 use wan; reboot".to_string();
+
+        assert!(pinger_command(&cfg, "fping").is_err());
     }
 
     #[test]

@@ -36,7 +36,7 @@ Implemented:
   probing, explicit-server `irtt` OWD probing, plus a basic
   `pinger_method=ping` fallback.
 - Active reflector health tracking and replacement for running `fping`,
-  `fping-ts`, `tsping`, and `ping` probes: response-deadline offences,
+  `fping-ts`, `tsping`, `irtt`, and `ping` probes: response-deadline offences,
   baseline/EWMA comparison, periodic replacement, optional reflector stats
   logging, and pinger restart with the next spare candidate.
 - Runtime status JSON and LuCI status page expose active, spare, and bad
@@ -92,6 +92,9 @@ Known limits:
   used as IRTT servers. The router and IRTT servers also need synchronized
   clocks; upstream-compatible parsing ignores negative one-way delays from
   unsynchronized hosts.
+- `ping_prefix_string` is applied without a shell as a command argv prefix for
+  all pinger backends, for example `mwan3 use gpon exec fping ...`. This matches
+  the upstream policy-routing wrapper model while rejecting shell metacharacters.
 - `fping-ts` and `tsping` depend on reflectors that answer ICMP timestamp
   probes; many public DNS anycast reflectors do not.
 - `tsping` is runtime-detected and not a hard package dependency; install a
