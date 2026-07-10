@@ -538,6 +538,33 @@ function validateMqttConfig(section, section_id) {
 	return true;
 }
 
+function hasEnabledSqmBacking(section, section_id) {
+	var manage = checkedFormOrUci(section, section_id, 'manage_sqm', true);
+	var enabled = checkedFormOrUci(section, section_id, 'enabled', false);
+	var sqmEnabled = checkedFormOrUci(section, section_id, 'sqm_enabled', enabled);
+	var queue;
+
+	if (manage)
+		return sqmEnabled;
+
+	queue = uci.get('sqm', selectedSqmSection(section, section_id), 'enabled') === '1' ?
+		{ enabled: '1' } : findSqmQueueForInterface(selectedWan(section, section_id, null, true));
+
+	return Boolean(queue && queue.enabled === '1');
+}
+
+function validateInterfaceBacking(section, section_id) {
+	var enabled = checkedFormOrUci(section, section_id, 'enabled', false);
+
+	if (!enabled || !checkedFormOrUci(section, section_id, 'auto_interface_preset', true))
+		return true;
+
+	if (hasEnabledSqmBacking(section, section_id))
+		return true;
+
+	return _('Auto SQM preset uses an IFB download interface. Enable SQM for this instance or use an already enabled SQM queue before enabling autorate.');
+}
+
 function validateInstanceSection(section, section_id) {
 	var result;
 
@@ -562,6 +589,10 @@ function validateInstanceSection(section, section_id) {
 		return result;
 
 	result = validateSqmSectionUnique(section, section_id);
+	if (result !== true)
+		return result;
+
+	result = validateInterfaceBacking(section, section_id);
 	if (result !== true)
 		return result;
 
@@ -1359,6 +1390,10 @@ function showCreateWizard(grid, name) {
 
 		enabled.addEventListener('change', function() {
 			state.enabled = enabled.checked;
+			if (state.enabled && !state.sqm_enabled) {
+				state.sqm_enabled = true;
+				sqmEnabled.checked = true;
+			}
 		});
 
 		sqmEnabled.addEventListener('change', function() {
@@ -1611,6 +1646,11 @@ function showCreateWizard(grid, name) {
 		if ((state.pinger_method || 'fping') === 'ping' &&
 		    parseInt(state.no_pingers || '1', 10) > 1) {
 			showError(_('The ping fallback can use only one pinger.'));
+			return false;
+		}
+
+		if (state.enabled && !state.sqm_enabled) {
+			showError(_('Enable SQM before enabling autorate. The automatic preset uses an IFB download interface created by SQM.'));
 			return false;
 		}
 

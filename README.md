@@ -54,6 +54,8 @@ Implemented:
 - LuCI cross-field validation for manual min/base/max rates, explicit
   download/upload interface conflicts, `ping` fallback pinger count, and
   duplicate managed SQM section ownership.
+- LuCI and init guard against enabling an automatic IFB download interface
+  without an enabled SQM backing queue.
 - LuCI setup wizard for creating instances, importing SQM rates, checking speed
   test backends, running a router-side speed test, and writing derived limits.
 - LuCI Reflectors tab can check pinger backend availability and scan configured
