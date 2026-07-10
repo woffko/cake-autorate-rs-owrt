@@ -274,6 +274,23 @@ start_sqm_backend() {
 	/etc/init.d/sqm restart >/dev/null 2>&1 || /etc/init.d/sqm start >/dev/null 2>&1 || true
 }
 
+managed_sqm_sections() {
+	uci -q show "$SQM_CONFIG" | sed -n "s/^$SQM_CONFIG\\.\\([^.]*\\)\\._cake_autorate_managed=.*$/\\1/p" | sort -u
+}
+
+stop_managed_sqm_backend() {
+	local sqm_section iface
+
+	[ -x /usr/lib/sqm/run.sh ] || return 0
+
+	for sqm_section in $(managed_sqm_sections); do
+		iface="$(uci -q get "$SQM_CONFIG.$sqm_section.interface" 2>/dev/null)"
+		[ -n "$iface" ] || continue
+		iface="$(resolve_interface_device "$iface")"
+		/usr/lib/sqm/run.sh stop "$iface" >/dev/null 2>&1 || true
+	done
+}
+
 sqm_section_enabled_for_device() {
 	local sqm_section="$1"
 	local expected_if="$2"
@@ -381,6 +398,10 @@ start_service() {
 reload_service() {
 	stop
 	start
+}
+
+service_stopped() {
+	stop_managed_sqm_backend
 }
 
 service_triggers() {

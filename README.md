@@ -144,6 +144,8 @@ SQM integration:
 - `cake-autorate` UCI sections are the user-facing source of truth; the init
   script synchronizes matching `sqm` queue sections before starting SQM and
   autorate.
+- Stopping `cake-autorate` also stops SQM runtime state for sections marked as
+  managed by cake-autorate, leaving unrelated SQM queues alone.
 - Disabled `cake-autorate` sections do not mirror into SQM even when
   `manage_sqm=1`; stale owned SQM sections are cleaned up instead.
 - Multiple interface/queue pairs are represented as multiple `cake_autorate`
