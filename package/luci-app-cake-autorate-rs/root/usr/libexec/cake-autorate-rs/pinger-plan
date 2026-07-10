@@ -294,9 +294,9 @@ pinger_reason() {
 			if [ -z "$irtt_bin" ]; then
 				printf '%s' "not installed"
 			elif [ "$irtt_server_count" -lt 1 ] 2>/dev/null; then
-				printf '%s' "installed; configure at least one irtt_server"
+				printf '%s' "installed; configure at least one irtt_server and keep clocks synchronized"
 			else
-				printf 'available with %s configured server(s)' "$irtt_server_count"
+				printf 'available with %s configured server(s); requires synchronized clocks' "$irtt_server_count"
 			fi
 			;;
 		ping)
@@ -317,7 +317,7 @@ pinger_install_hint() {
 			printf '%s' "install a compatible tsping binary manually"
 			;;
 		irtt)
-			printf '%s' "apk add irtt, then configure at least one irtt_server"
+			printf '%s' "apk add irtt, then configure at least one irtt_server and keep router/server clocks synchronized"
 			;;
 		ping)
 			printf '%s' "provided by the base system"
@@ -529,7 +529,9 @@ refresh_pinger_bins
 if [ -z "$irtt_bin" ]; then
 	append_warning "irtt package is not installed; pinger_method=irtt is unavailable until irtt is installed and irtt_server is configured."
 elif [ "$irtt_server_count" -lt 1 ] 2>/dev/null; then
-	append_warning "irtt binary is installed, but no irtt_server is configured; pinger_method=irtt is unavailable until at least one explicit IRTT server is set."
+	append_warning "irtt binary is installed, but no irtt_server is configured; pinger_method=irtt is unavailable until at least one explicit IRTT server is set and clocks are synchronized."
+else
+	append_warning "irtt OWD probing requires router and IRTT server clocks to be synchronized; unsynchronized clocks can produce negative one-way delays that are ignored."
 fi
 
 if [ "$mode" = "install" ]; then
