@@ -81,7 +81,9 @@ Implemented:
   SUMMARY/CPU log records, publishes state via `mosquitto_pub`, and registers
   Home Assistant discovery sensors when enabled.
 - Automatic interface preset: selecting the target interface fills
-  `sqm_interface`, `ul_if`, and `dl_if=ifb4<target>`.
+  `sqm_interface`, `ul_if`, `dl_if=ifb4<target>`, and empty/generated
+  `ping_extra_args=-I <target>` for non-IRTT pingers so reflector probes are
+  bound to the selected uplink by default.
 - Automatic SQM rate import from an existing `/etc/config/sqm` queue for the
   selected interface when available.
 - LuCI status page with start, restart, stop actions.
@@ -98,6 +100,9 @@ Known limits:
 - `ping_prefix_string` is applied without a shell as a command argv prefix for
   all pinger backends, for example `mwan3 use gpon exec fping ...`. This matches
   the upstream policy-routing wrapper model while rejecting shell metacharacters.
+- The LuCI wizard and interface preset fill `ping_extra_args=-I <target>` when
+  the field is empty or still contains a generated `-I ...` value. Manual
+  multi-argument ping args and `ping_prefix_string` are preserved.
 - `fping-ts` and `tsping` depend on reflectors that answer ICMP timestamp
   probes; many public DNS anycast reflectors do not.
 - `tsping` is runtime-detected and not a hard package dependency; install a
@@ -114,7 +119,8 @@ Known limits:
   supported `fping` package used by `fping`/`fping-ts` and the optional `irtt`
   package. `tsping` remains a manual binary install, and `irtt` is only ready
   when explicit IRTT servers are configured and clocks are synchronized.
-- advanced multi-WAN policy is not implemented.
+- advanced multi-WAN policy routing is still router/network configuration; the
+  GUI only applies the upstream-style pinger binding/default hints above.
 - MQTT is an optional sidecar service rather than daemon core. It requires a
   configured broker, `log_to_file=1`, `output_summary_stats=1`, and
   `mosquitto_pub` from either `mosquitto-client-nossl` or

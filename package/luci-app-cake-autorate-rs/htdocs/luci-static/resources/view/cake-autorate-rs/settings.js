@@ -110,8 +110,8 @@ var optionDescriptions = {
 	retain_reflector_stats: 'Keep reflector statistics when replacing or restarting probes.',
 	no_pingers: 'Number of concurrent reflector probes to run.',
 	reflector_ping_interval_s: 'Seconds between pings sent by each reflector probe.',
-	ping_extra_args: 'Additional safe arguments passed to the ping backend. Shell metacharacters are ignored.',
-	ping_prefix_string: 'Optional command prefix for launching pingers, for example a namespace wrapper.',
+	ping_extra_args: 'Additional safe arguments passed to pingers. In multi-WAN setups, upstream cake-autorate requires using this or Ping prefix so probes leave through the target interface, for example -I eth2.',
+	ping_prefix_string: 'Optional command prefix for launching pingers, for example mwan3 use wan2 exec. Use this instead of Extra ping args when policy-routing wrappers should select the uplink.',
 	irtt_session_duration_m: 'Duration of each IRTT client session in minutes. Longer sessions reduce restart gaps but use more memory inside irtt.',
 	output_processing_stats: 'Log detailed controller processing statistics.',
 	output_load_stats: 'Log achieved load and traffic rate statistics.',
@@ -406,6 +406,38 @@ function checkedFormOrUci(section, section_id, key, fallback) {
 
 function ifbForWan(wan_if) {
 	return wan_if ? 'ifb4' + wan_if : '';
+}
+
+function pingerSupportsInterfaceArg(method) {
+	return method !== 'irtt';
+}
+
+function pingerInterfaceArgs(wan_if, method) {
+	wan_if = normalizeInterfaceName(wan_if);
+	method = method || 'fping';
+
+	if (!wan_if || !pingerSupportsInterfaceArg(method))
+		return '';
+
+	return '-I ' + wan_if;
+}
+
+function generatedPingerInterfaceArgs(value) {
+	return /^-I [A-Za-z0-9_.:-]+$/.test(value || '');
+}
+
+function maybeSetPingerInterfaceArgs(section, section_id, wan_if, method) {
+	var currentArgs = formOrUci(section, section_id, 'ping_extra_args');
+	var currentPrefix = formOrUci(section, section_id, 'ping_prefix_string');
+	var args;
+
+	if (currentPrefix || (currentArgs && !generatedPingerInterfaceArgs(currentArgs)))
+		return;
+
+	args = pingerInterfaceArgs(wan_if, method || formOrUci(section, section_id, 'pinger_method') || 'fping');
+
+	if (args)
+		setCakeOption(section, section_id, 'ping_extra_args', args);
 }
 
 function parsePositiveRate(value) {
@@ -730,6 +762,7 @@ function applyWanPreset(section_id, wan_if, importRates, section) {
 	setCakeOption(section, section_id, 'sqm_interface', wan_if);
 	setCakeOption(section, section_id, 'ul_if', wan_if);
 	setCakeOption(section, section_id, 'dl_if', ifbForWan(wan_if));
+	maybeSetPingerInterfaceArgs(section, section_id, wan_if);
 	applySqmSectionPreset(section_id, wan_if, importRates, section);
 
 	if (importRates)
@@ -1028,6 +1061,7 @@ function applyPingerPlanToState(state, result) {
 	state.pinger_method = result.recommended_method;
 	state.no_pingers = String(result.recommended_no_pingers);
 	state.reflectors = reflectors;
+	state.ping_extra_args = pingerInterfaceArgs(state.wan_if, state.pinger_method);
 	state.pinger_plan = result;
 }
 
@@ -1039,6 +1073,7 @@ function applyPingerPlanToSection(section, section_id, result) {
 
 	setCakeOption(section, section_id, 'pinger_method', result.recommended_method);
 	setCakeOption(section, section_id, 'no_pingers', result.recommended_no_pingers);
+	maybeSetPingerInterfaceArgs(section, section_id, selectedWan(section, section_id, null, true), result.recommended_method);
 	setCakeListOption(section, section_id, 'reflector', reflectors);
 }
 
@@ -1214,6 +1249,7 @@ function writeWizardConfig(section_id, state) {
 	var dl = rateValue(state.sqm_download, '20000');
 	var ul = rateValue(state.sqm_upload, '20000');
 	var sqmSection = state.sqm_section || managedSqmSectionName(section_id);
+	var pingExtraArgs = state.ping_extra_args || pingerInterfaceArgs(wan, state.pinger_method || 'fping');
 
 	uci.set('cake-autorate', section_id, 'enabled', state.enabled ? '1' : '0');
 	uci.set('cake-autorate', section_id, 'wan_if', wan);
@@ -1227,6 +1263,8 @@ function writeWizardConfig(section_id, state) {
 	uci.set('cake-autorate', section_id, 'speedtest_apply_percent', String(state.speedtest_apply_percent || '90'));
 	uci.set('cake-autorate', section_id, 'pinger_method', state.pinger_method || 'fping');
 	uci.set('cake-autorate', section_id, 'no_pingers', String(state.no_pingers || '6'));
+	if (pingExtraArgs)
+		uci.set('cake-autorate', section_id, 'ping_extra_args', pingExtraArgs);
 	uci.set('cake-autorate', section_id, 'reflector', (state.reflectors && state.reflectors.length) ? state.reflectors : defaultReflectors());
 	uci.set('cake-autorate', section_id, 'manual_rate_limits', '0');
 	uci.set('cake-autorate', section_id, 'advanced_settings', '0');
@@ -1337,6 +1375,7 @@ function showCreateWizard(grid, name) {
 		speedtest_apply_percent: '90',
 		pinger_method: 'fping',
 		no_pingers: '6',
+		ping_extra_args: pingerInterfaceArgs(defaultWan, 'fping'),
 		reflectors: defaultReflectors(),
 		sqm_download: '20000',
 		sqm_upload: '20000'
@@ -1386,6 +1425,7 @@ function showCreateWizard(grid, name) {
 
 		target.addEventListener('change', function() {
 			state.wan_if = normalizeInterfaceName(target.value);
+			state.ping_extra_args = pingerInterfaceArgs(state.wan_if, state.pinger_method || 'fping');
 			syncSqmForInterface();
 			queueInfo.textContent = wizardSqmQueueText(state);
 			sqmEnabled.checked = state.sqm_enabled;
@@ -1567,6 +1607,7 @@ function showCreateWizard(grid, name) {
 			[ _('Queue setup script'), state.sqm_script || 'piece_of_cake.qos' ],
 			[ _('Preferred backend'), speedtestBackendChoiceTitle(state.speedtest_backend) ],
 			[ _('Pinger'), state.pinger_method || 'fping' ],
+			[ _('Extra ping args'), state.ping_extra_args || '-' ],
 			[ _('Pingers'), String(state.no_pingers || '6') ],
 			[ _('Reflectors'), ((state.reflectors && state.reflectors.length) ? state.reflectors : defaultReflectors()).join(', ') ],
 			[ _('Download speed'), state.sqm_download + ' kbit/s' ],
