@@ -45,6 +45,9 @@ Implemented:
 - optional CPU usage sampling from `/proc/stat`, exposed in logs and status JSON.
 - adaptive rate calculations using delay/load windows.
 - `tc qdisc change ... cake bandwidth ...` shaper updates.
+- Upstream-style idle/stall handling: sustained idle can stop pingers, activity
+  restarts them, and optional minimum-rate enforcement applies on sustained idle
+  or global no-response timeout.
 - daemon log rotation by age/size with best-effort gzip compression.
 - JSON status file under `/var/run/cake-autorate/<instance>/status.json`.
 - LuCI Status can export a diagnostic text bundle containing redacted

@@ -70,6 +70,12 @@ struct Config {
     base_ul_shaper_rate_kbps: f64,
     max_ul_shaper_rate_kbps: f64,
     connection_active_thr_kbps: f64,
+    enable_sleep_function: bool,
+    sustained_idle_sleep_thr_s: f64,
+    min_shaper_rates_enforcement: bool,
+    stall_detection_thr: usize,
+    connection_stall_thr_kbps: f64,
+    global_ping_response_timeout_s: f64,
     pinger_method: String,
     ping_extra_args: String,
     ping_prefix_string: String,
@@ -146,6 +152,12 @@ impl Config {
             base_ul_shaper_rate_kbps: 20000.0,
             max_ul_shaper_rate_kbps: 35000.0,
             connection_active_thr_kbps: 2000.0,
+            enable_sleep_function: true,
+            sustained_idle_sleep_thr_s: 60.0,
+            min_shaper_rates_enforcement: false,
+            stall_detection_thr: 5,
+            connection_stall_thr_kbps: 10.0,
+            global_ping_response_timeout_s: 10.0,
             pinger_method: "fping".to_string(),
             ping_extra_args: String::new(),
             ping_prefix_string: String::new(),
@@ -308,6 +320,32 @@ impl Config {
             &single,
             "connection_active_thr_kbps",
             &mut cfg.connection_active_thr_kbps,
+        )?;
+        set_bool(
+            &single,
+            "enable_sleep_function",
+            &mut cfg.enable_sleep_function,
+        )?;
+        set_f64(
+            &single,
+            "sustained_idle_sleep_thr_s",
+            &mut cfg.sustained_idle_sleep_thr_s,
+        )?;
+        set_bool(
+            &single,
+            "min_shaper_rates_enforcement",
+            &mut cfg.min_shaper_rates_enforcement,
+        )?;
+        set_usize(&single, "stall_detection_thr", &mut cfg.stall_detection_thr)?;
+        set_f64(
+            &single,
+            "connection_stall_thr_kbps",
+            &mut cfg.connection_stall_thr_kbps,
+        )?;
+        set_f64(
+            &single,
+            "global_ping_response_timeout_s",
+            &mut cfg.global_ping_response_timeout_s,
         )?;
         set_string(&single, "pinger_method", &mut cfg.pinger_method);
         set_string(&single, "ping_extra_args", &mut cfg.ping_extra_args);
@@ -656,6 +694,30 @@ impl Config {
         }
         if self.no_pingers > self.reflectors.len() {
             return Err("no_pingers cannot exceed reflector count".to_string());
+        }
+        if self.connection_active_thr_kbps > self.min_dl_shaper_rate_kbps {
+            return Err(
+                "connection_active_thr_kbps cannot be greater than min_dl_shaper_rate_kbps"
+                    .to_string(),
+            );
+        }
+        if self.connection_active_thr_kbps > self.min_ul_shaper_rate_kbps {
+            return Err(
+                "connection_active_thr_kbps cannot be greater than min_ul_shaper_rate_kbps"
+                    .to_string(),
+            );
+        }
+        if self.sustained_idle_sleep_thr_s < 0.0 {
+            return Err("sustained_idle_sleep_thr_s must not be negative".to_string());
+        }
+        if self.stall_detection_thr == 0 {
+            return Err("stall_detection_thr must be greater than zero".to_string());
+        }
+        if self.connection_stall_thr_kbps < 0.0 {
+            return Err("connection_stall_thr_kbps must not be negative".to_string());
+        }
+        if self.global_ping_response_timeout_s <= 0.0 {
+            return Err("global_ping_response_timeout_s must be greater than zero".to_string());
         }
         if self.pinger_method == "irtt" && self.irtt_session_duration_m <= 0.0 {
             return Err("irtt_session_duration_m must be greater than zero".to_string());
@@ -1357,6 +1419,21 @@ impl Controller {
         self.apply_shaper("ul");
     }
 
+    fn sample_rates(&mut self) -> (f64, f64) {
+        self.rate_monitor.sample()
+    }
+
+    fn set_min_shaper_rates(&mut self, reason: &str) {
+        self.log(
+            "DEBUG",
+            &format!("Enforcing minimum shaper rates: {reason}"),
+        );
+        self.shaper_dl = self.cfg.min_dl_shaper_rate_kbps;
+        self.shaper_ul = self.cfg.min_ul_shaper_rate_kbps;
+        self.apply_shaper("dl");
+        self.apply_shaper("ul");
+    }
+
     fn on_sample(
         &mut self,
         sample: Sample,
@@ -1821,6 +1898,27 @@ impl Controller {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MainState {
+    Running,
+    Idle,
+    Stall,
+}
+
+fn pinger_response_interval_s(cfg: &Config) -> f64 {
+    cfg.reflector_ping_interval_s / cfg.no_pingers.max(1) as f64
+}
+
+fn stall_detection_timeout(cfg: &Config) -> Duration {
+    Duration::from_secs_f64(
+        (cfg.stall_detection_thr as f64 * pinger_response_interval_s(cfg)).max(0.1),
+    )
+}
+
+fn monitor_tick_timeout(cfg: &Config) -> Duration {
+    Duration::from_millis(cfg.monitor_achieved_rates_interval_ms.max(100))
+}
+
 fn run(cfg: Config, once: bool) -> Result<(), String> {
     if !cfg.enabled {
         println!("cake-autorate-rs instance '{}' is disabled", cfg.instance);
@@ -1852,44 +1950,207 @@ fn run(cfg: Config, once: bool) -> Result<(), String> {
         return Ok(());
     }
 
-    let mut pinger = PingerRuntime::spawn(&cfg, &active_reflectors)?;
+    let mut pinger = Some(PingerRuntime::spawn(&cfg, &active_reflectors)?);
+    let mut main_state = MainState::Running;
+    let mut idle_since: Option<Instant> = None;
+    let mut last_reflector_response = Instant::now();
+    let mut stall_started: Option<Instant> = None;
+    let mut global_timeout_fired = false;
+    let stall_timeout = stall_detection_timeout(&cfg);
+    let global_timeout = Duration::from_secs_f64(cfg.global_ping_response_timeout_s.max(0.1));
+    let idle_timeout = Duration::from_secs_f64(cfg.sustained_idle_sleep_thr_s.max(0.0));
 
     while !TERMINATE.load(Ordering::SeqCst) {
-        match pinger.lines.recv_timeout(health.timeout(&cfg)) {
-            Ok(Ok(line)) => {
-                if let Some(sample) = parse_sample_line(&cfg, &line.line, &line.reflector) {
-                    health.observe_sample(&cfg, &sample);
-                    controller.on_sample(sample, &active_reflectors, &health);
+        if pinger.is_some() {
+            let timeout = if main_state == MainState::Running {
+                health.timeout(&cfg)
+            } else {
+                monitor_tick_timeout(&cfg)
+            };
+            let result = pinger.as_ref().unwrap().lines.recv_timeout(timeout);
+
+            match result {
+                Ok(Ok(line)) => {
+                    if let Some(sample) = parse_sample_line(&cfg, &line.line, &line.reflector) {
+                        last_reflector_response = Instant::now();
+                        if main_state == MainState::Stall {
+                            controller.log("DEBUG", "Reflector response detected.");
+                            controller.log(
+                                "DEBUG",
+                                "Connection stall ended. Resuming normal operation.",
+                            );
+                            main_state = MainState::Running;
+                            stall_started = None;
+                            global_timeout_fired = false;
+                        }
+                        health.observe_sample(&cfg, &sample);
+                        controller.on_sample(sample, &active_reflectors, &health);
+                    }
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    if TERMINATE.load(Ordering::SeqCst) {
+                        break;
+                    }
+
+                    if cfg.pinger_method == "irtt" {
+                        controller.log(
+                            "DEBUG",
+                            "irtt session ended; restarting irtt clients for active servers",
+                        );
+                        if let Some(mut old) = pinger.take() {
+                            old.stop();
+                        }
+                        pinger = Some(PingerRuntime::spawn(&cfg, &active_reflectors)?);
+                        continue;
+                    }
+
+                    return Err(format!("{} output closed unexpectedly", cfg.pinger_method));
                 }
             }
-            Ok(Err(e)) => return Err(e),
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                if TERMINATE.load(Ordering::SeqCst) {
-                    break;
-                }
-
-                if cfg.pinger_method == "irtt" {
-                    controller.log(
-                        "DEBUG",
-                        "irtt session ended; restarting irtt clients for active servers",
-                    );
-                    pinger.stop();
-                    pinger = PingerRuntime::spawn(&cfg, &active_reflectors)?;
-                    continue;
-                }
-
-                return Err(format!("{} output closed unexpectedly", cfg.pinger_method));
-            }
+        } else {
+            thread::sleep(monitor_tick_timeout(&cfg));
         }
 
-        if health.check(&cfg, &mut active_reflectors, &mut controller) {
-            pinger.stop();
-            pinger = PingerRuntime::spawn(&cfg, &active_reflectors)?;
+        let now = Instant::now();
+        let (dl_rate, ul_rate) = controller.sample_rates();
+        let connection_active =
+            dl_rate > cfg.connection_active_thr_kbps || ul_rate > cfg.connection_active_thr_kbps;
+        let stall_load_active =
+            dl_rate > cfg.connection_stall_thr_kbps && ul_rate > cfg.connection_stall_thr_kbps;
+
+        match main_state {
+            MainState::Running => {
+                if cfg.enable_sleep_function {
+                    if connection_active {
+                        idle_since = None;
+                    } else {
+                        let idle_start = *idle_since.get_or_insert(now);
+                        if now.duration_since(idle_start) >= idle_timeout {
+                            controller.log("DEBUG", "Connection idle. Waiting for minimum load.");
+                            if cfg.min_shaper_rates_enforcement {
+                                controller.set_min_shaper_rates("sustained idle");
+                            }
+                            if let Some(mut old) = pinger.take() {
+                                old.stop();
+                            }
+                            main_state = MainState::Idle;
+                            idle_since = None;
+                            continue;
+                        }
+                    }
+                }
+
+                if now.duration_since(last_reflector_response) > stall_timeout {
+                    controller.log(
+                        "DEBUG",
+                        &format!(
+                            "Warning: no reflector response within: {:.2} seconds. Checking loads.",
+                            stall_timeout.as_secs_f64()
+                        ),
+                    );
+                    controller.log(
+                        "DEBUG",
+                        &format!(
+                            "load check is: (( {:.0} kbps > {:.0} kbps for download && {:.0} kbps > {:.0} kbps for upload ))",
+                            dl_rate,
+                            cfg.connection_stall_thr_kbps,
+                            ul_rate,
+                            cfg.connection_stall_thr_kbps
+                        ),
+                    );
+
+                    if stall_load_active {
+                        controller.log(
+                            "DEBUG",
+                            "load above connection stall threshold so resuming normal operation.",
+                        );
+                        last_reflector_response = now;
+                    } else {
+                        controller.log("DEBUG", "Connection stall detected.");
+                        main_state = MainState::Stall;
+                        stall_started = Some(now);
+                        global_timeout_fired = false;
+                    }
+                }
+
+                if main_state == MainState::Running
+                    && health.check(&cfg, &mut active_reflectors, &mut controller)
+                {
+                    if let Some(mut old) = pinger.take() {
+                        old.stop();
+                    }
+                    pinger = Some(PingerRuntime::spawn(&cfg, &active_reflectors)?);
+                }
+            }
+            MainState::Idle => {
+                if connection_active {
+                    controller.log(
+                        "DEBUG",
+                        &format!(
+                            "dl achieved rate: {:.0} kbps or ul achieved rate: {:.0} kbps exceeded connection active threshold: {:.0} kbps. Resuming normal operation.",
+                            dl_rate,
+                            ul_rate,
+                            cfg.connection_active_thr_kbps
+                        ),
+                    );
+                    main_state = MainState::Running;
+                    last_reflector_response = Instant::now();
+                    health = ReflectorHealth::new(&cfg, &active_reflectors);
+                    pinger = Some(PingerRuntime::spawn(&cfg, &active_reflectors)?);
+                }
+            }
+            MainState::Stall => {
+                if stall_load_active {
+                    controller.log(
+                        "DEBUG",
+                        &format!(
+                            "dl achieved rate: {:.0} kbps and ul achieved rate: {:.0} kbps exceeded connection stall threshold: {:.0} kbps.",
+                            dl_rate,
+                            ul_rate,
+                            cfg.connection_stall_thr_kbps
+                        ),
+                    );
+                    controller.log(
+                        "DEBUG",
+                        "Connection stall ended. Resuming normal operation.",
+                    );
+                    main_state = MainState::Running;
+                    stall_started = None;
+                    global_timeout_fired = false;
+                    last_reflector_response = now;
+                } else if !global_timeout_fired
+                    && now.duration_since(last_reflector_response) > global_timeout
+                {
+                    global_timeout_fired = true;
+                    controller.log(
+                        "SYSLOG",
+                        &format!(
+                            "Warning: Configured global ping response timeout: {} seconds exceeded.",
+                            cfg.global_ping_response_timeout_s
+                        ),
+                    );
+                    if cfg.min_shaper_rates_enforcement {
+                        controller.set_min_shaper_rates("global ping response timeout");
+                    }
+                    controller.log("DEBUG", "Restarting pingers.");
+                    if let Some(mut old) = pinger.take() {
+                        old.stop();
+                    }
+                    pinger = Some(PingerRuntime::spawn(&cfg, &active_reflectors)?);
+                    last_reflector_response = now;
+                    stall_started = Some(now);
+                } else if stall_started.is_none() {
+                    stall_started = Some(now);
+                }
+            }
         }
     }
 
-    pinger.stop();
+    if let Some(mut pinger) = pinger {
+        pinger.stop();
+    }
     Ok(())
 }
 
@@ -2936,8 +3197,9 @@ mod tests {
     use super::{
         default_reflectors, irtt_target_arg, next_spare_reflector, parse_fping_ts_line,
         parse_irtt_duration_us, parse_irtt_line, parse_reflector_candidates, parse_tsping_line,
-        parse_uci_values, pinger_command, reflector_bad_reflectors, reflector_health_json,
-        reflector_spare_reflectors, Config, ReflectorHealth, ReflectorState,
+        parse_uci_values, pinger_command, pinger_response_interval_s, reflector_bad_reflectors,
+        reflector_health_json, reflector_spare_reflectors, stall_detection_timeout, Config,
+        ReflectorHealth, ReflectorState,
     };
     use std::time::Instant;
 
@@ -3049,6 +3311,29 @@ mod tests {
             irtt_target_arg("irtt.example.net:2112"),
             "irtt.example.net:2112"
         );
+    }
+
+    #[test]
+    fn upstream_sleep_and_stall_defaults_are_loaded() {
+        let cfg = Config::defaults("test".to_string());
+
+        assert!(cfg.enable_sleep_function);
+        assert_eq!(cfg.sustained_idle_sleep_thr_s, 60.0);
+        assert!(!cfg.min_shaper_rates_enforcement);
+        assert_eq!(cfg.stall_detection_thr, 5);
+        assert_eq!(cfg.connection_stall_thr_kbps, 10.0);
+        assert_eq!(cfg.global_ping_response_timeout_s, 10.0);
+        assert!((pinger_response_interval_s(&cfg) - 0.05).abs() < 0.000001);
+        assert!((stall_detection_timeout(&cfg).as_secs_f64() - 0.25).abs() < 0.000001);
+    }
+
+    #[test]
+    fn rejects_active_threshold_above_minimum_rates() {
+        let mut cfg = Config::defaults("test".to_string());
+        cfg.connection_active_thr_kbps = 6000.0;
+
+        let err = cfg.validate().expect_err("expected active threshold guard");
+        assert!(err.contains("connection_active_thr_kbps"));
     }
 
     #[test]
