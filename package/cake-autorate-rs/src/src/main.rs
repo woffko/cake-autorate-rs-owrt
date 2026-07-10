@@ -800,7 +800,7 @@ struct Sample {
     timestamped_owd: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ReflectorState {
     last_seen: Instant,
     offences: VecDeque<bool>,
@@ -834,6 +834,7 @@ impl ReflectorState {
     }
 }
 
+#[derive(Clone, Debug)]
 struct ReflectorHealth {
     states: HashMap<String, ReflectorState>,
     last_health_check: Instant,
@@ -1259,6 +1260,21 @@ impl CpuMonitor {
     }
 }
 
+#[derive(Clone, Debug)]
+struct StatusSnapshot {
+    dl_rate: f64,
+    ul_rate: f64,
+    dl_load_pct: f64,
+    ul_load_pct: f64,
+    dl_delay_count: usize,
+    ul_delay_count: usize,
+    avg_dl_delta: f64,
+    avg_ul_delta: f64,
+    sample: Sample,
+    active_reflectors: Vec<String>,
+    health: Option<ReflectorHealth>,
+}
+
 struct LogFile {
     path: PathBuf,
     file: File,
@@ -1353,6 +1369,7 @@ struct Controller {
     cpu_total_percent: Option<f64>,
     cpu_core_percentages: Vec<f64>,
     started_at: f64,
+    last_status: Option<StatusSnapshot>,
 }
 
 impl Controller {
@@ -1397,6 +1414,7 @@ impl Controller {
             last_cpu_sample: now,
             cpu_total_percent: None,
             cpu_core_percentages: Vec::new(),
+            last_status: None,
             dl_baseline_us: HashMap::new(),
             ul_baseline_us: HashMap::new(),
             dl_ewma_us: HashMap::new(),
@@ -1432,6 +1450,7 @@ impl Controller {
         self.shaper_ul = self.cfg.min_ul_shaper_rate_kbps;
         self.apply_shaper("dl");
         self.apply_shaper("ul");
+        let _ = self.refresh_status_from_last_sample();
     }
 
     fn on_sample(
@@ -1810,6 +1829,49 @@ impl Controller {
         active_reflectors: &[String],
         health: Option<&ReflectorHealth>,
     ) -> io::Result<()> {
+        self.last_status = Some(StatusSnapshot {
+            dl_rate,
+            ul_rate,
+            dl_load_pct,
+            ul_load_pct,
+            dl_delay_count,
+            ul_delay_count,
+            avg_dl_delta,
+            avg_ul_delta,
+            sample: sample.clone(),
+            active_reflectors: active_reflectors.to_vec(),
+            health: health.cloned(),
+        });
+
+        self.write_status_file(
+            dl_rate,
+            ul_rate,
+            dl_load_pct,
+            ul_load_pct,
+            dl_delay_count,
+            ul_delay_count,
+            avg_dl_delta,
+            avg_ul_delta,
+            sample,
+            active_reflectors,
+            health,
+        )
+    }
+
+    fn write_status_file(
+        &mut self,
+        dl_rate: f64,
+        ul_rate: f64,
+        dl_load_pct: f64,
+        ul_load_pct: f64,
+        dl_delay_count: usize,
+        ul_delay_count: usize,
+        avg_dl_delta: f64,
+        avg_ul_delta: f64,
+        sample: &Sample,
+        active_reflectors: &[String],
+        health: Option<&ReflectorHealth>,
+    ) -> io::Result<()> {
         let path = self.cfg.run_dir().join("status.json");
         let tmp = self.cfg.run_dir().join("status.json.tmp");
         let spare_reflectors = reflector_spare_reflectors(&self.cfg, active_reflectors);
@@ -1848,6 +1910,26 @@ impl Controller {
             reflector_health
         )?;
         fs::rename(tmp, path)
+    }
+
+    fn refresh_status_from_last_sample(&mut self) -> io::Result<()> {
+        let Some(snapshot) = self.last_status.clone() else {
+            return Ok(());
+        };
+
+        self.write_status_file(
+            snapshot.dl_rate,
+            snapshot.ul_rate,
+            snapshot.dl_load_pct,
+            snapshot.ul_load_pct,
+            snapshot.dl_delay_count,
+            snapshot.ul_delay_count,
+            snapshot.avg_dl_delta,
+            snapshot.avg_ul_delta,
+            &snapshot.sample,
+            &snapshot.active_reflectors,
+            snapshot.health.as_ref(),
+        )
     }
 
     fn write_initial_status(
