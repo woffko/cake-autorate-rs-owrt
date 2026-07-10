@@ -47,6 +47,9 @@ Implemented:
 - `tc qdisc change ... cake bandwidth ...` shaper updates.
 - daemon log rotation by age/size with best-effort gzip compression.
 - JSON status file under `/var/run/cake-autorate/<instance>/status.json`.
+- LuCI Status can export a diagnostic text bundle containing redacted
+  cake-autorate config, SQM config, runtime status, daemon logs, package
+  versions, and recent syslog lines.
 - LuCI settings page with compact instance rows and modal tabs for detailed settings.
 - LuCI cross-field validation for manual min/base/max rates, explicit
   download/upload interface conflicts, `ping` fallback pinger count, and
@@ -100,7 +103,7 @@ Known limits:
   supported `fping` package used by `fping`/`fping-ts` and the optional `irtt`
   package. `tsping` remains a manual binary install, and `irtt` is only ready
   when explicit IRTT servers are configured.
-- advanced multi-WAN policy and log bundle export are not implemented.
+- advanced multi-WAN policy is not implemented.
 - MQTT is an optional sidecar service rather than daemon core. It requires a
   configured broker, `log_to_file=1`, `output_summary_stats=1`, and
   `mosquitto_pub` from either `mosquitto-client-nossl` or
