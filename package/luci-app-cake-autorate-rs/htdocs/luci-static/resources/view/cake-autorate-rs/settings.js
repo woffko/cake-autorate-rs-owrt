@@ -528,7 +528,7 @@ function validateMqttConfig(section, section_id) {
 	if (!checkedFormOrUci(section, section_id, 'log_to_file', true))
 		return _('MQTT publisher needs Log to file enabled because it reads SUMMARY/CPU records from daemon log files.');
 
-	if (!checkedFormOrUci(section, section_id, 'output_summary_stats', true))
+	if (!checkedFormOrUci(section, section_id, 'output_summary_stats', false))
 		return _('MQTT publisher needs Summary stats enabled.');
 
 	if (checkedFormOrUci(section, section_id, 'mqtt_publish_cpu_stats', false) &&

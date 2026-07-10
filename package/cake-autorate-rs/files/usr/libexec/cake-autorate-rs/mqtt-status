@@ -38,7 +38,7 @@ emit_status() {
 	host="$(uci_get mqtt_host)"
 	[ -n "$host" ] && configured_host=1 || configured_host=0
 	log_to_file="$(uci_get_default log_to_file 1)"
-	summary="$(uci_get_default output_summary_stats 1)"
+	summary="$(uci_get_default output_summary_stats 0)"
 	cpu="$(uci_get_default output_cpu_stats 0)"
 	publish_cpu="$(uci_get_default mqtt_publish_cpu_stats 0)"
 

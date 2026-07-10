@@ -262,7 +262,7 @@ config_get base_device_id "$SECTION" mqtt_device_id cake_autorate
 config_get base_device_name "$SECTION" mqtt_device_name cake-autorate
 config_get min_interval_s "$SECTION" mqtt_min_interval_s 1
 config_get_bool mqtt_publish_cpu_stats "$SECTION" mqtt_publish_cpu_stats 0
-config_get_bool output_summary_stats "$SECTION" output_summary_stats 1
+config_get_bool output_summary_stats "$SECTION" output_summary_stats 0
 config_get_bool output_cpu_stats "$SECTION" output_cpu_stats 0
 config_get_bool log_to_file "$SECTION" log_to_file 1
 config_get log_dir "$SECTION" log_file_path_override

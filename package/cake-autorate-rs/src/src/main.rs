@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -117,6 +117,7 @@ struct Config {
     shaper_rate_adjust_up_load_low: f64,
     bufferbloat_refractory_period_ms: u64,
     decay_refractory_period_ms: u64,
+    output_processing_stats: bool,
     output_summary_stats: bool,
     output_load_stats: bool,
     output_reflector_stats: bool,
@@ -125,9 +126,12 @@ struct Config {
     output_cpu_raw_stats: bool,
     log_to_file: bool,
     debug: bool,
+    log_debug_messages_to_syslog: bool,
     log_file_max_time_mins: u64,
     log_file_max_size_kb: u64,
     log_file_path_override: String,
+    log_file_buffer_size_b: u64,
+    log_file_buffer_timeout_ms: u64,
     log_file_export_compress: bool,
     startup_wait_s: f64,
     if_up_check_interval_s: f64,
@@ -199,7 +203,8 @@ impl Config {
             shaper_rate_adjust_up_load_low: 1.01,
             bufferbloat_refractory_period_ms: 300,
             decay_refractory_period_ms: 1000,
-            output_summary_stats: true,
+            output_processing_stats: false,
+            output_summary_stats: false,
             output_load_stats: false,
             output_reflector_stats: false,
             output_cake_changes: false,
@@ -207,9 +212,12 @@ impl Config {
             output_cpu_raw_stats: false,
             log_to_file: true,
             debug: true,
+            log_debug_messages_to_syslog: false,
             log_file_max_time_mins: 10,
             log_file_max_size_kb: 2000,
             log_file_path_override: String::new(),
+            log_file_buffer_size_b: 512,
+            log_file_buffer_timeout_ms: 500,
             log_file_export_compress: true,
             startup_wait_s: 0.0,
             if_up_check_interval_s: 10.0,
@@ -516,6 +524,11 @@ impl Config {
         )?;
         set_bool(
             &single,
+            "output_processing_stats",
+            &mut cfg.output_processing_stats,
+        )?;
+        set_bool(
+            &single,
             "output_summary_stats",
             &mut cfg.output_summary_stats,
         )?;
@@ -534,6 +547,11 @@ impl Config {
         )?;
         set_bool(&single, "log_to_file", &mut cfg.log_to_file)?;
         set_bool(&single, "debug", &mut cfg.debug)?;
+        set_bool(
+            &single,
+            "log_DEBUG_messages_to_syslog",
+            &mut cfg.log_debug_messages_to_syslog,
+        )?;
         set_u64(
             &single,
             "log_file_max_time_mins",
@@ -549,6 +567,16 @@ impl Config {
             "log_file_path_override",
             &mut cfg.log_file_path_override,
         );
+        set_u64(
+            &single,
+            "log_file_buffer_size_B",
+            &mut cfg.log_file_buffer_size_b,
+        )?;
+        set_u64(
+            &single,
+            "log_file_buffer_timeout_ms",
+            &mut cfg.log_file_buffer_timeout_ms,
+        )?;
         set_bool(
             &single,
             "log_file_export_compress",
@@ -1277,9 +1305,11 @@ struct StatusSnapshot {
 
 struct LogFile {
     path: PathBuf,
-    file: File,
+    file: BufWriter<File>,
     opened_at: Instant,
     bytes_written: u64,
+    bytes_pending: u64,
+    last_flush: Instant,
 }
 
 impl LogFile {
@@ -1289,13 +1319,15 @@ impl LogFile {
         }
 
         let bytes_written = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let file = BufWriter::new(OpenOptions::new().create(true).append(true).open(&path)?);
 
         Ok(Self {
             path,
             file,
             opened_at: Instant::now(),
             bytes_written,
+            bytes_pending: 0,
+            last_flush: Instant::now(),
         })
     }
 
@@ -1304,6 +1336,8 @@ impl LogFile {
         line: &str,
         max_age: Duration,
         max_size_bytes: u64,
+        buffer_size_bytes: u64,
+        buffer_timeout: Duration,
         compress: bool,
     ) -> io::Result<()> {
         let pending = line.len() as u64 + 1;
@@ -1317,11 +1351,27 @@ impl LogFile {
 
         writeln!(self.file, "{line}")?;
         self.bytes_written = self.bytes_written.saturating_add(pending);
+        self.bytes_pending = self.bytes_pending.saturating_add(pending);
+
+        let flush_by_size = buffer_size_bytes == 0 || self.bytes_pending >= buffer_size_bytes;
+        let flush_by_time =
+            buffer_timeout == Duration::ZERO || self.last_flush.elapsed() >= buffer_timeout;
+
+        if flush_by_size || flush_by_time {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()?;
+        self.bytes_pending = 0;
+        self.last_flush = Instant::now();
         Ok(())
     }
 
     fn rotate(&mut self, compress: bool) -> io::Result<()> {
-        let _ = self.file.flush();
+        let _ = self.flush();
 
         let rotated = rotated_log_path(&self.path);
         match fs::rename(&self.path, &rotated) {
@@ -1334,12 +1384,16 @@ impl LogFile {
             Err(e) => return Err(e),
         }
 
-        self.file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        self.file = BufWriter::new(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)?,
+        );
         self.opened_at = Instant::now();
         self.bytes_written = 0;
+        self.bytes_pending = 0;
+        self.last_flush = Instant::now();
         Ok(())
     }
 }
@@ -1530,6 +1584,9 @@ impl Controller {
                 + (1.0 - self.cfg.alpha_delta_ewma) * *ul_ewma;
         }
 
+        let dl_baseline_current_us = *dl_baseline;
+        let ul_baseline_current_us = *ul_baseline;
+
         push_window(
             &mut self.dl_delays,
             dl_delta_us > self.cfg.dl_owd_delta_delay_thr_ms * 1000.0,
@@ -1566,6 +1623,54 @@ impl Controller {
         self.clamp_rates();
         self.apply_shaper("dl");
         self.apply_shaper("ul");
+
+        if self.cfg.output_processing_stats {
+            let dl_ewma_us = self
+                .dl_ewma_us
+                .get(&sample.reflector)
+                .copied()
+                .unwrap_or(0.0);
+            let ul_ewma_us = self
+                .ul_ewma_us
+                .get(&sample.reflector)
+                .copied()
+                .unwrap_or(0.0);
+            self.log(
+                "DATA",
+                &format!(
+                    "{:.0}; {:.0}; {:.1}; {:.1}; {:.6}; {}; {}; {:.0}; {:.0}; {:.0}; {:.0}; {:.0}; {:.0}; {:.0}; {:.0}; {:.0}; {:.0}; {}; {:.0}; {:.0}; {:.0}; {}; {:.0}; {:.0}; {:.0}; {}; {}; {:.0}; {:.0}",
+                    dl_rate,
+                    ul_rate,
+                    dl_load_pct,
+                    ul_load_pct,
+                    sample.timestamp,
+                    sample.reflector,
+                    sample.seq,
+                    dl_baseline_current_us,
+                    sample.dl_owd_us,
+                    dl_ewma_us,
+                    dl_delta_us,
+                    self.cfg.dl_owd_delta_delay_thr_ms * 1000.0,
+                    ul_baseline_current_us,
+                    sample.ul_owd_us,
+                    ul_ewma_us,
+                    ul_delta_us,
+                    self.cfg.ul_owd_delta_delay_thr_ms * 1000.0,
+                    dl_delay_count,
+                    avg_dl_delta,
+                    self.cfg.dl_avg_owd_delta_max_adjust_up_thr_ms * 1000.0,
+                    self.cfg.dl_avg_owd_delta_max_adjust_down_thr_ms * 1000.0,
+                    ul_delay_count,
+                    avg_ul_delta,
+                    self.cfg.ul_avg_owd_delta_max_adjust_up_thr_ms * 1000.0,
+                    self.cfg.ul_avg_owd_delta_max_adjust_down_thr_ms * 1000.0,
+                    load_label(dl_kind, dl_bb, "dl"),
+                    load_label(ul_kind, ul_bb, "ul"),
+                    self.shaper_dl,
+                    self.shaper_ul
+                ),
+            );
+        }
 
         if self.cfg.output_load_stats {
             self.log(
@@ -1982,12 +2087,25 @@ impl Controller {
             return;
         }
         let line = format!("{kind}; {:.6}; {msg}", epoch_secs());
+        if kind == "DEBUG" && self.cfg.log_debug_messages_to_syslog {
+            let _ = Command::new("logger")
+                .arg("-t")
+                .arg("cake-autorate-rs")
+                .arg(&line)
+                .status();
+        }
         if let Some(file) = &mut self.log {
             let max_age = Duration::from_secs(self.cfg.log_file_max_time_mins.saturating_mul(60));
             let max_size = self.cfg.log_file_max_size_kb.saturating_mul(1024);
-            if let Err(e) =
-                file.write_line(&line, max_age, max_size, self.cfg.log_file_export_compress)
-            {
+            let buffer_timeout = Duration::from_millis(self.cfg.log_file_buffer_timeout_ms);
+            if let Err(e) = file.write_line(
+                &line,
+                max_age,
+                max_size,
+                self.cfg.log_file_buffer_size_b,
+                buffer_timeout,
+                self.cfg.log_file_export_compress,
+            ) {
                 eprintln!("failed to write log file: {e}");
             }
         } else {
@@ -3428,6 +3546,27 @@ mod tests {
         assert_eq!(cfg.global_ping_response_timeout_s, 10.0);
         assert!((pinger_response_interval_s(&cfg) - 0.05).abs() < 0.000001);
         assert!((stall_detection_timeout(&cfg).as_secs_f64() - 0.25).abs() < 0.000001);
+    }
+
+    #[test]
+    fn upstream_logging_defaults_are_loaded() {
+        let cfg = Config::defaults("test".to_string());
+
+        assert!(!cfg.output_processing_stats);
+        assert!(!cfg.output_load_stats);
+        assert!(!cfg.output_reflector_stats);
+        assert!(!cfg.output_summary_stats);
+        assert!(!cfg.output_cake_changes);
+        assert!(!cfg.output_cpu_stats);
+        assert!(!cfg.output_cpu_raw_stats);
+        assert!(cfg.debug);
+        assert!(!cfg.log_debug_messages_to_syslog);
+        assert!(cfg.log_to_file);
+        assert_eq!(cfg.log_file_max_time_mins, 10);
+        assert_eq!(cfg.log_file_max_size_kb, 2000);
+        assert_eq!(cfg.log_file_buffer_size_b, 512);
+        assert_eq!(cfg.log_file_buffer_timeout_ms, 500);
+        assert!(cfg.log_file_export_compress);
     }
 
     #[test]
