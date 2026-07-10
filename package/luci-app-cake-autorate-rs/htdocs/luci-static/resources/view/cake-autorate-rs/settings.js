@@ -542,13 +542,16 @@ function hasEnabledSqmBacking(section, section_id) {
 	var manage = checkedFormOrUci(section, section_id, 'manage_sqm', true);
 	var enabled = checkedFormOrUci(section, section_id, 'enabled', false);
 	var sqmEnabled = checkedFormOrUci(section, section_id, 'sqm_enabled', enabled);
+	var selected = formOrUci(section, section_id, 'sqm_section');
 	var queue;
 
 	if (manage)
 		return sqmEnabled;
 
-	queue = uci.get('sqm', selectedSqmSection(section, section_id), 'enabled') === '1' ?
-		{ enabled: '1' } : findSqmQueueForInterface(selectedWan(section, section_id, null, true));
+	if (selected)
+		return uci.get('sqm', selected, 'enabled') === '1';
+
+	queue = findSqmQueueForInterface(selectedWan(section, section_id, null, true));
 
 	return Boolean(queue && queue.enabled === '1');
 }
