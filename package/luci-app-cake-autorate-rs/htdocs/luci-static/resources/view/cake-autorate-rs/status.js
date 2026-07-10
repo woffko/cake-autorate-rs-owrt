@@ -80,6 +80,13 @@ function formatPercent(value) {
 	return isNaN(value) ? '-' : value.toFixed(1) + '%';
 }
 
+function formatState(value) {
+	if (!value)
+		return '-';
+
+	return String(value).toUpperCase();
+}
+
 function reflectorList(values) {
 	if (!Array.isArray(values))
 		return [];
@@ -128,6 +135,7 @@ function renderTable(sections, statuses) {
 
 		rows.push([
 			section,
+			formatState(st.state),
 			st.updated_at ? new Date(st.updated_at * 1000).toLocaleString() : '-',
 			st.reflector || '-',
 			reflectorSummary(st),
@@ -143,6 +151,7 @@ function renderTable(sections, statuses) {
 	children = [
 		E('tr', { 'class': 'tr table-titles' }, [
 			E('th', { 'class': 'th' }, _('Instance')),
+			E('th', { 'class': 'th' }, _('State')),
 			E('th', { 'class': 'th' }, _('Updated')),
 			E('th', { 'class': 'th' }, _('Reflector')),
 			E('th', { 'class': 'th' }, _('Runtime reflectors')),
@@ -162,7 +171,7 @@ function renderTable(sections, statuses) {
 			})));
 	} else {
 		children.push(E('tr', { 'class': 'tr' }, [
-			E('td', { 'class': 'td', 'colspan': '10' }, _('No instances configured.'))
+			E('td', { 'class': 'td', 'colspan': '11' }, _('No instances configured.'))
 		]));
 	}
 

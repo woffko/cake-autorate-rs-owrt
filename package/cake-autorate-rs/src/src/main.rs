@@ -1369,6 +1369,7 @@ struct Controller {
     cpu_total_percent: Option<f64>,
     cpu_core_percentages: Vec<f64>,
     started_at: f64,
+    run_state: String,
     last_status: Option<StatusSnapshot>,
 }
 
@@ -1414,6 +1415,7 @@ impl Controller {
             last_cpu_sample: now,
             cpu_total_percent: None,
             cpu_core_percentages: Vec::new(),
+            run_state: "RUNNING".to_string(),
             last_status: None,
             dl_baseline_us: HashMap::new(),
             ul_baseline_us: HashMap::new(),
@@ -1450,6 +1452,19 @@ impl Controller {
         self.shaper_ul = self.cfg.min_ul_shaper_rate_kbps;
         self.apply_shaper("dl");
         self.apply_shaper("ul");
+        let _ = self.refresh_status_from_last_sample();
+    }
+
+    fn set_run_state(&mut self, state: &str) {
+        if self.run_state == state {
+            return;
+        }
+
+        self.log(
+            "DEBUG",
+            &format!("Changing main state from: {} to: {state}", self.run_state),
+        );
+        self.run_state = state.to_string();
         let _ = self.refresh_status_from_last_sample();
     }
 
@@ -1880,8 +1895,9 @@ impl Controller {
         let mut file = File::create(&tmp)?;
         writeln!(
             file,
-            "{{\"instance\":\"{}\",\"version\":\"0.1.0\",\"started_at\":{:.6},\"updated_at\":{:.6},\"dl_if\":\"{}\",\"ul_if\":\"{}\",\"reflector\":\"{}\",\"seq\":\"{}\",\"probe_timestamp\":{:.6},\"rtt_ms\":{:.3},\"dl_owd_us\":{:.1},\"ul_owd_us\":{:.1},\"dl_achieved_rate_kbps\":{:.1},\"ul_achieved_rate_kbps\":{:.1},\"dl_load_percent\":{:.1},\"ul_load_percent\":{:.1},\"dl_sum_delays\":{},\"ul_sum_delays\":{},\"dl_avg_owd_delta_us\":{:.1},\"ul_avg_owd_delta_us\":{:.1},\"cake_dl_rate_kbps\":{:.0},\"cake_ul_rate_kbps\":{:.0},\"cpu_total_percent\":{},\"cpu_core_percentages\":{},\"active_reflectors\":{},\"spare_reflectors\":{},\"bad_reflectors\":{},\"reflector_health\":{}}}",
+            "{{\"instance\":\"{}\",\"version\":\"0.1.0\",\"state\":\"{}\",\"started_at\":{:.6},\"updated_at\":{:.6},\"dl_if\":\"{}\",\"ul_if\":\"{}\",\"reflector\":\"{}\",\"seq\":\"{}\",\"probe_timestamp\":{:.6},\"rtt_ms\":{:.3},\"dl_owd_us\":{:.1},\"ul_owd_us\":{:.1},\"dl_achieved_rate_kbps\":{:.1},\"ul_achieved_rate_kbps\":{:.1},\"dl_load_percent\":{:.1},\"ul_load_percent\":{:.1},\"dl_sum_delays\":{},\"ul_sum_delays\":{},\"dl_avg_owd_delta_us\":{:.1},\"ul_avg_owd_delta_us\":{:.1},\"cake_dl_rate_kbps\":{:.0},\"cake_ul_rate_kbps\":{:.0},\"cpu_total_percent\":{},\"cpu_core_percentages\":{},\"active_reflectors\":{},\"spare_reflectors\":{},\"bad_reflectors\":{},\"reflector_health\":{}}}",
             json_escape(&self.cfg.instance),
+            json_escape(&self.run_state),
             self.started_at,
             epoch_secs(),
             json_escape(&self.cfg.dl_if),
@@ -2062,6 +2078,7 @@ fn run(cfg: Config, once: bool) -> Result<(), String> {
                                 "Connection stall ended. Resuming normal operation.",
                             );
                             main_state = MainState::Running;
+                            controller.set_run_state("RUNNING");
                             stall_started = None;
                             global_timeout_fired = false;
                         }
@@ -2118,6 +2135,7 @@ fn run(cfg: Config, once: bool) -> Result<(), String> {
                                 old.stop();
                             }
                             main_state = MainState::Idle;
+                            controller.set_run_state("IDLE");
                             idle_since = None;
                             continue;
                         }
@@ -2152,6 +2170,7 @@ fn run(cfg: Config, once: bool) -> Result<(), String> {
                     } else {
                         controller.log("DEBUG", "Connection stall detected.");
                         main_state = MainState::Stall;
+                        controller.set_run_state("STALL");
                         stall_started = Some(now);
                         global_timeout_fired = false;
                     }
@@ -2178,6 +2197,7 @@ fn run(cfg: Config, once: bool) -> Result<(), String> {
                         ),
                     );
                     main_state = MainState::Running;
+                    controller.set_run_state("RUNNING");
                     last_reflector_response = Instant::now();
                     health = ReflectorHealth::new(&cfg, &active_reflectors);
                     pinger = Some(PingerRuntime::spawn(&cfg, &active_reflectors)?);
@@ -2199,6 +2219,7 @@ fn run(cfg: Config, once: bool) -> Result<(), String> {
                         "Connection stall ended. Resuming normal operation.",
                     );
                     main_state = MainState::Running;
+                    controller.set_run_state("RUNNING");
                     stall_started = None;
                     global_timeout_fired = false;
                     last_reflector_response = now;
