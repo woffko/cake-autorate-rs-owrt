@@ -146,7 +146,14 @@ resolve_interface_device() {
 }
 
 route_device_for() {
-	ip route get "$1" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1
+	local probe="$1"
+	local source_ip="$2"
+
+	if [ -n "$source_ip" ]; then
+		ip route get "$probe" from "$source_ip" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1
+	else
+		ip route get "$probe" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1
+	fi
 }
 
 source_ip_for_interface() {
@@ -833,7 +840,8 @@ else
 fi
 
 target_if="$(selected_target_interface)"
-route_if="$(route_device_for "$route_probe")"
+target_source_ip="$(source_ip_for_interface "$target_if")"
+route_if="$(route_device_for "$route_probe" "$target_source_ip")"
 curl_fetch="$(command_path curl)"
 fallback_fetch="$(command_path uclient-fetch)"
 [ -n "$fallback_fetch" ] || fallback_fetch="$(command_path wget)"
