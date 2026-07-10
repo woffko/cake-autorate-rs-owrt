@@ -97,14 +97,14 @@ publish_availability() {
 
 publish_stream() {
 	if [ -n "$mqtt_user" ]; then
-		mosquitto_pub -h "$mqtt_host" -p "$mqtt_port" -u "$mqtt_user" -P "$mqtt_pass" \
+		exec mosquitto_pub -h "$mqtt_host" -p "$mqtt_port" -u "$mqtt_user" -P "$mqtt_pass" \
 			-t "$mqtt_topic" -l -q 1 \
 			--will-topic "$availability_topic" \
 			--will-payload "offline" \
 			--will-qos 1 \
 			--will-retain
 	else
-		mosquitto_pub -h "$mqtt_host" -p "$mqtt_port" \
+		exec mosquitto_pub -h "$mqtt_host" -p "$mqtt_port" \
 			-t "$mqtt_topic" -l -q 1 \
 			--will-topic "$availability_topic" \
 			--will-payload "offline" \
@@ -115,84 +115,50 @@ publish_stream() {
 
 tail_log() {
 	if tail --help 2>&1 | grep -q -- '-F'; then
-		tail -n 0 -F "$log_file" 2>/dev/null
+		exec tail -n 0 -F "$log_file" 2>/dev/null
 	else
-		tail -n 0 -f "$log_file" 2>/dev/null
+		exec tail -n 0 -f "$log_file" 2>/dev/null
 	fi
+}
+
+raw_fifo=""
+json_fifo=""
+tail_pid=""
+awk_pid=""
+pub_pid=""
+
+stop_pipeline() {
+	local pid
+
+	for pid in "$tail_pid" "$awk_pid" "$pub_pid"; do
+		[ -n "$pid" ] || continue
+		kill "$pid" 2>/dev/null || true
+	done
+
+	for pid in "$tail_pid" "$awk_pid" "$pub_pid"; do
+		[ -n "$pid" ] || continue
+		wait "$pid" 2>/dev/null || true
+	done
+
+	[ -n "$raw_fifo" ] && rm -f "$raw_fifo"
+	[ -n "$json_fifo" ] && rm -f "$json_fifo"
+
+	raw_fifo=""
+	json_fifo=""
+	tail_pid=""
+	awk_pid=""
+	pub_pid=""
 }
 
 cleanup() {
 	trap - INT TERM EXIT
+	stop_pipeline
 	publish_availability "offline"
 	exit 0
 }
 
-config_load "$CONFIG"
-config_get_bool mqtt_enabled "$SECTION" mqtt_enabled 0
-[ "$mqtt_enabled" -eq 1 ] || exit 0
-
-command -v mosquitto_pub >/dev/null 2>&1 || {
-	echo "ERROR: mosquitto_pub is not installed; install mosquitto-client-nossl or mosquitto-client-ssl" >&2
-	exit 1
-}
-
-config_get mqtt_host "$SECTION" mqtt_host
-config_get mqtt_port "$SECTION" mqtt_port 1883
-config_get mqtt_user "$SECTION" mqtt_username
-config_get mqtt_pass "$SECTION" mqtt_password
-config_get discovery_prefix "$SECTION" mqtt_discovery_prefix homeassistant
-config_get base_topic "$SECTION" mqtt_base_topic cake-autorate
-config_get base_device_id "$SECTION" mqtt_device_id cake_autorate
-config_get base_device_name "$SECTION" mqtt_device_name cake-autorate
-config_get min_interval_s "$SECTION" mqtt_min_interval_s 1
-config_get_bool mqtt_publish_cpu_stats "$SECTION" mqtt_publish_cpu_stats 0
-config_get_bool output_summary_stats "$SECTION" output_summary_stats 1
-config_get_bool output_cpu_stats "$SECTION" output_cpu_stats 0
-config_get_bool log_to_file "$SECTION" log_to_file 1
-config_get log_dir "$SECTION" log_file_path_override
-
-[ -n "$mqtt_host" ] || {
-	echo "ERROR: mqtt_host is required when mqtt_enabled=1" >&2
-	exit 1
-}
-
-[ "$log_to_file" -eq 1 ] || {
-	echo "WARNING: log_to_file=0; MQTT publisher needs daemon log files to read SUMMARY/CPU records" >&2
-}
-
-[ "$output_summary_stats" -eq 1 ] || {
-	echo "WARNING: output_summary_stats=0; MQTT publisher will not receive SUMMARY records" >&2
-}
-
-if [ "$mqtt_publish_cpu_stats" -eq 1 ] && [ "$output_cpu_stats" -ne 1 ]; then
-	echo "WARNING: mqtt_publish_cpu_stats=1 but output_cpu_stats=0; CPU sensors will stay empty" >&2
-fi
-
-[ -n "$log_dir" ] || log_dir="/var/log"
-log_file="$log_dir/cake-autorate.$SECTION.log"
-mkdir -p "$log_dir" 2>/dev/null || true
-touch "$log_file" 2>/dev/null || true
-
-cpu_cores="$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || printf '1')"
-case "$cpu_cores" in
-	''|0|*[!0-9]*)
-		cpu_cores=1
-		;;
-esac
-
-safe_instance="$(sanitize_id "$SECTION")"
-device_id="${base_device_id}_${safe_instance}"
-device_name="${base_device_name} (${SECTION})"
-mqtt_topic="${base_topic}/${SECTION}"
-availability_topic="${mqtt_topic}/availability"
-
-trap cleanup INT TERM EXIT
-
-publish_discovery
-
-while true; do
-	publish_availability "online"
-	tail_log | awk -F'; ' \
+process_log() {
+	exec awk -F'; ' \
 		-v min_int="$min_interval_s" \
 		-v default_cores="$cpu_cores" \
 		-v publish_cpu="$mqtt_publish_cpu_stats" '
@@ -274,6 +240,92 @@ while true; do
 			fflush("")
 		}
 	}
-	' | publish_stream
+	'
+}
+
+config_load "$CONFIG"
+config_get_bool mqtt_enabled "$SECTION" mqtt_enabled 0
+[ "$mqtt_enabled" -eq 1 ] || exit 0
+
+command -v mosquitto_pub >/dev/null 2>&1 || {
+	echo "ERROR: mosquitto_pub is not installed; install mosquitto-client-nossl or mosquitto-client-ssl" >&2
+	exit 1
+}
+
+config_get mqtt_host "$SECTION" mqtt_host
+config_get mqtt_port "$SECTION" mqtt_port 1883
+config_get mqtt_user "$SECTION" mqtt_username
+config_get mqtt_pass "$SECTION" mqtt_password
+config_get discovery_prefix "$SECTION" mqtt_discovery_prefix homeassistant
+config_get base_topic "$SECTION" mqtt_base_topic cake-autorate
+config_get base_device_id "$SECTION" mqtt_device_id cake_autorate
+config_get base_device_name "$SECTION" mqtt_device_name cake-autorate
+config_get min_interval_s "$SECTION" mqtt_min_interval_s 1
+config_get_bool mqtt_publish_cpu_stats "$SECTION" mqtt_publish_cpu_stats 0
+config_get_bool output_summary_stats "$SECTION" output_summary_stats 1
+config_get_bool output_cpu_stats "$SECTION" output_cpu_stats 0
+config_get_bool log_to_file "$SECTION" log_to_file 1
+config_get log_dir "$SECTION" log_file_path_override
+
+[ -n "$mqtt_host" ] || {
+	echo "ERROR: mqtt_host is required when mqtt_enabled=1" >&2
+	exit 1
+}
+
+[ "$log_to_file" -eq 1 ] || {
+	echo "WARNING: log_to_file=0; MQTT publisher needs daemon log files to read SUMMARY/CPU records" >&2
+}
+
+[ "$output_summary_stats" -eq 1 ] || {
+	echo "WARNING: output_summary_stats=0; MQTT publisher will not receive SUMMARY records" >&2
+}
+
+if [ "$mqtt_publish_cpu_stats" -eq 1 ] && [ "$output_cpu_stats" -ne 1 ]; then
+	echo "WARNING: mqtt_publish_cpu_stats=1 but output_cpu_stats=0; CPU sensors will stay empty" >&2
+fi
+
+[ -n "$log_dir" ] || log_dir="/var/log"
+log_file="$log_dir/cake-autorate.$SECTION.log"
+mkdir -p "$log_dir" 2>/dev/null || true
+touch "$log_file" 2>/dev/null || true
+
+cpu_cores="$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || printf '1')"
+case "$cpu_cores" in
+	''|0|*[!0-9]*)
+		cpu_cores=1
+		;;
+esac
+
+safe_instance="$(sanitize_id "$SECTION")"
+device_id="${base_device_id}_${safe_instance}"
+device_name="${base_device_name} (${SECTION})"
+mqtt_topic="${base_topic}/${SECTION}"
+availability_topic="${mqtt_topic}/availability"
+
+trap cleanup INT TERM EXIT
+
+publish_discovery
+
+while true; do
+	publish_availability "online"
+	raw_fifo="/tmp/cake-autorate-mqtt.${safe_instance}.$$.raw"
+	json_fifo="/tmp/cake-autorate-mqtt.${safe_instance}.$$.json"
+	rm -f "$raw_fifo" "$json_fifo"
+
+	if ! mkfifo "$raw_fifo" "$json_fifo"; then
+		echo "ERROR: failed to create MQTT publisher FIFOs" >&2
+		sleep 5
+		continue
+	fi
+
+	publish_stream < "$json_fifo" &
+	pub_pid="$!"
+	process_log < "$raw_fifo" > "$json_fifo" &
+	awk_pid="$!"
+	tail_log > "$raw_fifo" &
+	tail_pid="$!"
+
+	wait "$pub_pid" 2>/dev/null || true
+	stop_pipeline
 	sleep 5
 done
