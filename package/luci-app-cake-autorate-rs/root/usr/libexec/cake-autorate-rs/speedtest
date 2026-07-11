@@ -171,6 +171,86 @@ selected_target_interface() {
 	resolve_interface_device "$iface"
 }
 
+safe_uci_name() {
+	case "$1" in
+		''|*[!A-Za-z0-9_]*)
+			return 1
+			;;
+	esac
+
+	return 0
+}
+
+speedtest_unshaped_enabled() {
+	local value
+
+	value="$(uci_get speedtest_unshaped)"
+	[ -n "$value" ] || value="1"
+	bool_enabled "$value"
+}
+
+sqm_state_dir() {
+	local dir
+
+	dir="$(
+		. /etc/sqm/sqm.conf 2>/dev/null
+		printf '%s' "${SQM_STATE_DIR:-/var/run/sqm}"
+	)"
+	[ -n "$dir" ] || dir="/var/run/sqm"
+	printf '%s' "$dir"
+}
+
+sqm_active_for_device() {
+	local dir
+
+	[ -n "$1" ] || return 1
+	dir="$(sqm_state_dir)"
+	[ -f "$dir/$1.state" ]
+}
+
+autorate_instance_running() {
+	safe_uci_name "$section" || return 1
+	pgrep -f "^/usr/sbin/cake-autorated --instance $section\$" >/dev/null 2>&1
+}
+
+prepare_speedtest_calibration() {
+	[ -n "$section" ] || return 0
+	[ -n "$target_if" ] || return 0
+	speedtest_unshaped_enabled || return 0
+
+	calibration_shaper_bypassed="true"
+
+	if autorate_instance_running; then
+		if ubus call service delete "{\"name\":\"cake-autorate\",\"instance\":\"$section\"}" >/dev/null 2>&1; then
+			calibration_autorate_was_running=1
+			calibration_autorate_paused="true"
+			append_warning "Paused autorate instance $section during unshaped speed test."
+		fi
+	fi
+
+	if [ -x /usr/lib/sqm/run.sh ] && sqm_active_for_device "$target_if"; then
+		if /usr/lib/sqm/run.sh stop "$target_if" >/dev/null 2>&1; then
+			calibration_sqm_was_running=1
+			calibration_sqm_paused="true"
+			append_warning "Temporarily disabled SQM on $target_if during unshaped speed test."
+		fi
+	fi
+}
+
+restore_speedtest_calibration() {
+	if [ "$calibration_autorate_was_running" = "1" ]; then
+		/etc/init.d/cake-autorate start >/dev/null 2>&1 || true
+		calibration_autorate_was_running=0
+		calibration_sqm_was_running=0
+		return
+	fi
+
+	if [ "$calibration_sqm_was_running" = "1" ]; then
+		/usr/lib/sqm/run.sh start "$target_if" >/dev/null 2>&1 || true
+		calibration_sqm_was_running=0
+	fi
+}
+
 json_first_file() {
 	local file="$1"
 	local expr value
@@ -727,7 +807,7 @@ run_iperf3() {
 }
 
 emit_result() {
-	printf '{"download_kbps":%s,"upload_kbps":%s,"download_bytes":%s,"upload_bytes":%s,"download_elapsed_s":%s,"upload_elapsed_s":%s,"source":"%s","backend":"%s","backend_title":"%s","bind_mode":"%s","target_interface":"%s","route_interface":"%s","warning":"%s"}\n' \
+	printf '{"download_kbps":%s,"upload_kbps":%s,"download_bytes":%s,"upload_bytes":%s,"download_elapsed_s":%s,"upload_elapsed_s":%s,"source":"%s","backend":"%s","backend_title":"%s","bind_mode":"%s","target_interface":"%s","route_interface":"%s","shaper_bypassed":%s,"autorate_paused":%s,"sqm_paused":%s,"warning":"%s"}\n' \
 		"$download_kbps" \
 		"$upload_kbps" \
 		"$download_size" \
@@ -740,6 +820,9 @@ emit_result() {
 		"$(json_escape "$bind_mode")" \
 		"$(json_escape "$target_if")" \
 		"$(json_escape "$route_if")" \
+		"$calibration_shaper_bypassed" \
+		"$calibration_autorate_paused" \
+		"$calibration_sqm_paused" \
 		"$(json_escape "$warning")"
 }
 
@@ -849,6 +932,11 @@ bind_interface=""
 bind_mode="none"
 fetch=""
 fetch_kind=""
+calibration_autorate_was_running=0
+calibration_sqm_was_running=0
+calibration_shaper_bypassed="false"
+calibration_autorate_paused="false"
+calibration_sqm_paused="false"
 
 if [ "$mode" = "status" ]; then
 	backend_status_json
@@ -865,11 +953,15 @@ tmp_upload="/tmp/cake-autorate-speedtest-upload.$$"
 tmp_response="/tmp/cake-autorate-speedtest-response.$$"
 
 cleanup() {
+	restore_speedtest_calibration
 	rm -f "$tmp_download" "$tmp_upload" "$tmp_response"
 }
 trap cleanup EXIT INT TERM
 
+prepare_speedtest_calibration
+
 if run_preferred_backend; then
+	restore_speedtest_calibration
 	emit_result
 	exit 0
 fi

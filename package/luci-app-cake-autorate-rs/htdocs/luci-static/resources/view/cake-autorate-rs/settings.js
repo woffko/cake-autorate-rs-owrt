@@ -227,6 +227,23 @@ function dependsManagedSqm(option, extra) {
 	return option;
 }
 
+function dependsAny(option, key, values, extra) {
+	var extraDeps = extra || {};
+
+	for (var i = 0; i < values.length; i++) {
+		var deps = {};
+
+		deps[key] = values[i];
+		for (var extraKey in extraDeps)
+			if (extraDeps.hasOwnProperty(extraKey))
+				deps[extraKey] = extraDeps[extraKey];
+
+		option.depends(deps);
+	}
+
+	return option;
+}
+
 function iface(section, tab, key, title) {
 	var o = section.taboption(tab, widgets.DeviceSelect, key, title);
 	modal(o);
@@ -416,6 +433,22 @@ function checkedFormOrUci(section, section_id, key, fallback) {
 		return fallback;
 
 	return value === '1';
+}
+
+function checkedFromEvent(ev, value) {
+	if (value === true || value === '1' || value === 1 || value === 'on')
+		return true;
+
+	if (value === false || value === '0' || value === 0 || value === 'off')
+		return false;
+
+	if (ev && ev.target && typeof ev.target.checked == 'boolean')
+		return ev.target.checked;
+
+	if (ev && ev.currentTarget && typeof ev.currentTarget.checked == 'boolean')
+		return ev.currentTarget.checked;
+
+	return false;
 }
 
 function ifbForWan(wan_if) {
@@ -780,6 +813,20 @@ function applyWanPreset(section_id, wan_if, importRates, section) {
 		applyRatePreset(section_id, wan_if, true, section);
 }
 
+function maybeEnableSqmForAutoPreset(section, section_id, enabledOverride) {
+	var enabled = enabledOverride != null ?
+		(enabledOverride === true || enabledOverride === '1') :
+		checkedFormOrUci(section, section_id, 'enabled', false);
+
+	if (!enabled ||
+	    !autoInterfacePresetEnabled(section, section_id) ||
+	    !checkedFormOrUci(section, section_id, 'manage_sqm', true))
+		return;
+
+	setCakeOption(section, section_id, 'manage_sqm', '1');
+	setCakeOption(section, section_id, 'sqm_enabled', '1');
+}
+
 function speedtestApplyPercent(section, section_id) {
 	var value;
 	var percent;
@@ -858,16 +905,34 @@ function parseExecJson(res) {
 	return JSON.parse((res.stdout || '').trim());
 }
 
+function withSpeedtestRpcTimeout(callback) {
+	var previous = L.env.rpctimeout;
+	var timeout = parseInt(previous, 10);
+
+	if (isNaN(timeout) || timeout < 180)
+		L.env.rpctimeout = 180;
+
+	return Promise.resolve().then(callback).then(function(result) {
+		L.env.rpctimeout = previous;
+		return result;
+	}, function(err) {
+		L.env.rpctimeout = previous;
+		throw err;
+	});
+}
+
 function installSpeedtestBackend(section_id, wan, backend) {
 	if (!speedtestBackendInstallable(backend))
 		return Promise.reject(new Error(_('Select LibreSpeed CLI, speedtest-go, or configured iperf3 before installing.')));
 
-	return fs.exec('/usr/libexec/cake-autorate-rs/speedtest', [
-		section_id,
-		wan,
-		'install',
-		backend
-	]).then(parseExecJson);
+	return withSpeedtestRpcTimeout(function() {
+		return fs.exec('/usr/libexec/cake-autorate-rs/speedtest', [
+			section_id,
+			wan,
+			'install',
+			backend
+		]);
+	}).then(parseExecJson);
 }
 
 function formatSpeedtestBackendStatus(result) {
@@ -1484,12 +1549,14 @@ function showCreateWizard(grid, name) {
 				checkButton.disabled = true;
 				backendStatus.textContent = _('Checking backends...');
 
-				fs.exec('/usr/libexec/cake-autorate-rs/speedtest', [
-					state.name,
-					state.wan_if,
-					'status',
-					state.speedtest_backend
-				]).then(function(res) {
+				withSpeedtestRpcTimeout(function() {
+					return fs.exec('/usr/libexec/cake-autorate-rs/speedtest', [
+						state.name,
+						state.wan_if,
+						'status',
+						state.speedtest_backend
+					]);
+				}).then(function(res) {
 					backendStatus.textContent = formatSpeedtestBackendStatus(JSON.parse((res.stdout || '').trim()));
 				}).catch(function(err) {
 					showError(_('Speed test backend check failed: %s').format(err.message || err));
@@ -1538,12 +1605,14 @@ function showCreateWizard(grid, name) {
 				runButton.disabled = true;
 				status.textContent = _('Running speed test...');
 
-				fs.exec('/usr/libexec/cake-autorate-rs/speedtest', [
-					state.name,
-					state.wan_if,
-					'run',
-					state.speedtest_backend
-				]).then(function(res) {
+				withSpeedtestRpcTimeout(function() {
+					return fs.exec('/usr/libexec/cake-autorate-rs/speedtest', [
+						state.name,
+						state.wan_if,
+						'run',
+						state.speedtest_backend
+					]);
+				}).then(function(res) {
 					var result = parseSpeedtestResult(res.stdout);
 					var dl = measuredRate(result.download_kbps, pct);
 					var ul = measuredRate(result.upload_kbps, pct);
@@ -1871,7 +1940,9 @@ function addSpeedtestOptions(section) {
 
 		button.disabled = true;
 
-		return fs.exec('/usr/libexec/cake-autorate-rs/speedtest', [ section_id, wan, 'status', backend ]).then(function(res) {
+		return withSpeedtestRpcTimeout(function() {
+			return fs.exec('/usr/libexec/cake-autorate-rs/speedtest', [ section_id, wan, 'status', backend ]);
+		}).then(function(res) {
 			var result = JSON.parse((res.stdout || '').trim());
 			var message = formatSpeedtestBackendStatus(result);
 
@@ -1886,6 +1957,7 @@ function addSpeedtestOptions(section) {
 	o = section.taboption('speedtest', form.Button, '_speedtest_backend_install', _('Install backend'));
 	modal(o);
 	describe(o, '_speedtest_backend_install');
+	dependsAny(o, 'speedtest_backend', [ 'librespeed-cli', 'speedtest-go', 'iperf3' ]);
 	o.inputtitle = _('Install backend');
 	o.inputstyle = 'action';
 	o.rmempty = true;
@@ -1916,23 +1988,43 @@ function addSpeedtestOptions(section) {
 	};
 
 	flag(section, 'speedtest', 'speedtest_bind_interface', _('Bind to target interface'), '1');
-	flag(section, 'speedtest', 'speedtest_force_ipv4', _('Force IPv4'), '1');
-	optionalValue(section, 'speedtest', 'speedtest_route_probe', _('Route probe'), 'host', '1.1.1.1');
-	optionalValue(section, 'speedtest', 'speedtest_download_url', _('Download URL'), null, '');
-	optionalValue(section, 'speedtest', 'speedtest_upload_url', _('Upload URL'), null, '');
-	optionalValue(section, 'speedtest', 'speedtest_download_bytes', _('Download bytes'), 'and(uinteger,min(1))', '25000000');
+	o = flag(section, 'speedtest', 'speedtest_force_ipv4', _('Force IPv4'), '1');
+	dependsAny(o, 'speedtest_backend', [ 'auto', 'librespeed-cli', 'builtin-http' ]);
+	o = optionalValue(section, 'speedtest', 'speedtest_route_probe', _('Route probe'), 'host', '1.1.1.1');
+	o.depends('speedtest_bind_interface', '1');
+	o = optionalValue(section, 'speedtest', 'speedtest_download_url', _('Download URL'), null, '');
+	dependsAny(o, 'speedtest_backend', [ 'auto', 'builtin-http' ]);
+	o = optionalValue(section, 'speedtest', 'speedtest_upload_url', _('Upload URL'), null, '');
+	dependsAny(o, 'speedtest_backend', [ 'auto', 'builtin-http' ]);
+	o = optionalValue(section, 'speedtest', 'speedtest_download_bytes', _('Download bytes'), 'and(uinteger,min(1))', '25000000');
+	dependsAny(o, 'speedtest_backend', [ 'auto', 'builtin-http' ]);
 	optionalValue(section, 'speedtest', 'speedtest_upload_bytes', _('Upload bytes'), 'and(uinteger,min(0))', '4000000');
-	optionalValue(section, 'speedtest', 'speedtest_upload_retry_bytes', _('Upload retry bytes'), null, '1000000 262144');
+	o = optionalValue(section, 'speedtest', 'speedtest_upload_retry_bytes', _('Upload retry bytes'), null, '1000000 262144');
+	dependsAny(o, 'speedtest_backend', [ 'auto', 'builtin-http' ]);
 	optionalValue(section, 'speedtest', 'speedtest_timeout_s', _('Request timeout'), 'and(uinteger,min(1))', '45');
-	optionalValue(section, 'speedtest', 'speedtest_duration_s', _('Test duration'), 'and(uinteger,min(1))', '15');
-	optionalValue(section, 'speedtest', 'speedtest_iperf3_server', _('iperf3 server'), null, '');
-	optionalValue(section, 'speedtest', 'speedtest_iperf3_port', _('iperf3 port'), 'port', '');
+	o = optionalValue(section, 'speedtest', 'speedtest_duration_s', _('Test duration'), 'and(uinteger,min(1))', '15');
+	dependsAny(o, 'speedtest_backend', [ 'auto', 'librespeed-cli', 'iperf3' ]);
+	o = optionalValue(section, 'speedtest', 'speedtest_iperf3_server', _('iperf3 server'), null, '');
+	o.depends('speedtest_backend', 'iperf3');
+	o = optionalValue(section, 'speedtest', 'speedtest_iperf3_port', _('iperf3 port'), 'port', '');
+	o.depends('speedtest_backend', 'iperf3');
 }
 
 function addSetupOptions(section) {
 	var o;
 
-	flag(section, 'setup', 'enabled', _('Enable autorate'));
+	o = flag(section, 'setup', 'enabled', _('Enable autorate'));
+	o.forcewrite = true;
+	o.onchange = function(ev, section_id, value) {
+		var enabled = checkedFromEvent(ev, value);
+
+		uci.set('cake-autorate', section_id, 'enabled', enabled ? '1' : '0');
+		maybeEnableSqmForAutoPreset(this.section, section_id, enabled);
+	};
+	o.write = function(section_id, formvalue) {
+		uci.set('cake-autorate', section_id, 'enabled', formvalue);
+		maybeEnableSqmForAutoPreset(this.section, section_id, formvalue);
+	};
 
 	o = iface(section, 'setup', 'wan_if', _('Target interface'));
 	o.default = defaultTargetInterface();
@@ -1943,6 +2035,8 @@ function addSetupOptions(section) {
 	o.onchange = function(ev, section_id, value) {
 		if (autoInterfacePresetEnabled(this.section, section_id))
 			applyWanPreset(section_id, value, true, this.section);
+
+		maybeEnableSqmForAutoPreset(this.section, section_id);
 	};
 	o.write = function(section_id, formvalue) {
 		formvalue = normalizeInterfaceName(formvalue);
@@ -1956,6 +2050,8 @@ function addSetupOptions(section) {
 
 		if (autoInterfacePresetEnabled(this.section, section_id))
 			applyWanPreset(section_id, formvalue, importRates);
+
+		maybeEnableSqmForAutoPreset(this.section, section_id);
 	};
 
 	o = flag(section, 'setup', 'auto_interface_preset', _('Auto SQM preset'), '1');
@@ -1965,23 +2061,29 @@ function addSetupOptions(section) {
 
 		if (formvalue === '1')
 			applyWanPreset(section_id, selectedWan(this.section, section_id, null, true), false, this.section);
+
+		maybeEnableSqmForAutoPreset(this.section, section_id);
 	};
 
 	o = flag(section, 'setup', 'sqm_enabled', _('Enable SQM'));
 	o.forcewrite = true;
 	o.onchange = function(ev, section_id, value) {
-		var enabled = value === '1' || value === true;
+		var enabled = checkedFromEvent(ev, value);
 
 		uci.set('cake-autorate', section_id, 'sqm_enabled', enabled ? '1' : '0');
 
 		if (enabled)
 			setCakeOption(this.section, section_id, 'manage_sqm', '1');
+		else
+			maybeEnableSqmForAutoPreset(this.section, section_id);
 	};
 	o.write = function(section_id, formvalue) {
 		uci.set('cake-autorate', section_id, 'sqm_enabled', formvalue);
 
 		if (formvalue === '1')
 			setCakeOption(this.section, section_id, 'manage_sqm', '1');
+		else
+			maybeEnableSqmForAutoPreset(this.section, section_id);
 	};
 
 	o = value(section, 'setup', 'sqm_download', _('Download speed'), 'and(uinteger,min(0))', '20000');
@@ -2048,7 +2150,9 @@ function addSetupOptions(section) {
 
 		button.disabled = true;
 
-		return fs.exec('/usr/libexec/cake-autorate-rs/speedtest', [ section_id, wan, backend ]).then(function(res) {
+		return withSpeedtestRpcTimeout(function() {
+			return fs.exec('/usr/libexec/cake-autorate-rs/speedtest', [ section_id, wan, backend ]);
+		}).then(function(res) {
 			var result = parseSpeedtestResult(res.stdout);
 			var applied = applySpeedtestRates(activeSection, section_id, result, percent);
 			var message = _('Speed test applied at %d%%: download %s kbit/s, upload %s kbit/s.').format(
@@ -2188,6 +2292,7 @@ function addReflectorOptions(section) {
 	o = section.taboption('reflectors', form.Button, '_pinger_backend_install', _('Install selected pinger'));
 	modal(o);
 	describe(o, '_pinger_backend_install');
+	dependsAny(o, 'pinger_method', [ 'fping', 'fping-ts', 'irtt' ]);
 	o.inputtitle = _('Install selected pinger');
 	o.inputstyle = 'action';
 	o.rmempty = true;
@@ -2269,6 +2374,7 @@ function addReflectorOptions(section) {
 	o.value('tsping', _('tsping'));
 	o.value('irtt', _('irtt'));
 	o.value('ping', _('ping fallback'));
+	o.default = 'fping';
 	o.rmempty = false;
 	o.validate = function(section_id) {
 		return validatePingerCount(validationSection(this), section_id);
@@ -2277,6 +2383,7 @@ function addReflectorOptions(section) {
 	o = section.taboption('reflectors', form.DynamicList, 'reflector', _('Reflectors'));
 	modal(o);
 	describe(o, 'reflector');
+	dependsAny(o, 'pinger_method', [ 'fping', 'fping-ts', 'tsping', 'ping' ]);
 	o.datatype = 'host';
 	o.default = defaultReflectors();
 	o.rmempty = false;
@@ -2291,8 +2398,10 @@ function addReflectorOptions(section) {
 		return valid === true ? validatePingerCount(validationSection(this), section_id) : valid;
 	};
 
-	optionalValue(section, 'reflectors', 'reflectors_url', _('Reflectors URL'), null, '');
-	value(section, 'reflectors', 'reflectors_url_skip_lines', _('URL skip lines'), 'uinteger', '1');
+	o = optionalValue(section, 'reflectors', 'reflectors_url', _('Reflectors URL'), null, '');
+	dependsAny(o, 'pinger_method', [ 'fping', 'fping-ts', 'tsping', 'ping' ]);
+	o = value(section, 'reflectors', 'reflectors_url_skip_lines', _('URL skip lines'), 'uinteger', '1');
+	dependsAny(o, 'pinger_method', [ 'fping', 'fping-ts', 'tsping', 'ping' ]);
 	flag(section, 'reflectors', 'randomize_reflectors', _('Randomize reflectors'));
 	flag(section, 'reflectors', 'retain_reflector_stats', _('Retain reflector stats'));
 	o = value(section, 'reflectors', 'no_pingers', _('Pingers'), 'uinteger', '6');
