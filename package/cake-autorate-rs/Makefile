@@ -4,7 +4,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=cake-autorate-rs
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=30
+PKG_RELEASE:=31
 
 PKG_MAINTAINER:=woffko
 PKG_LICENSE:=GPL-2.0-or-later

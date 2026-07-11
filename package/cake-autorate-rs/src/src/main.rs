@@ -11,6 +11,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static TERMINATE: AtomicBool = AtomicBool::new(false);
+const STALE_REFLECTOR_RESPONSE_MAX_AGE_S: f64 = 0.5;
 
 const UPSTREAM_DEFAULT_REFLECTORS: &[&str] = &[
     "1.1.1.1",
@@ -2235,6 +2236,16 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
             match result {
                 Ok(Ok(line)) => {
                     if let Some(sample) = parse_sample_line(&cfg, &line.line, &line.reflector) {
+                        if sample_is_stale(&sample, epoch_secs()) {
+                            controller.log(
+                                "DEBUG",
+                                &format!(
+                                    "processed response from [{}] that is > 500ms old. Skipping.",
+                                    sample.reflector
+                                ),
+                            );
+                            continue;
+                        }
                         last_reflector_response = Instant::now();
                         if main_state == MainState::Stall {
                             controller.log("DEBUG", "Reflector response detected.");
@@ -2791,6 +2802,12 @@ fn parse_ping_line(line: &str, reflector: &str) -> Option<Sample> {
         ul_owd_us: rtt_ms * 500.0,
         timestamped_owd: false,
     })
+}
+
+fn sample_is_stale(sample: &Sample, now_secs: f64) -> bool {
+    sample.timestamp.is_finite()
+        && now_secs.is_finite()
+        && now_secs - sample.timestamp > STALE_REFLECTOR_RESPONSE_MAX_AGE_S
 }
 
 fn parse_prefixed_f64(value: &str, prefix: &str) -> Option<f64> {
@@ -3521,8 +3538,8 @@ mod tests {
         parse_irtt_duration_us, parse_irtt_line, parse_reflector_candidates,
         parse_tc_linklayer_overhead, parse_tsping_line, parse_uci_values, pinger_command,
         pinger_response_interval_s, reflector_bad_reflectors, reflector_health_json,
-        reflector_spare_reflectors, stall_detection_timeout, Config, ReflectorHealth,
-        ReflectorState,
+        reflector_spare_reflectors, sample_is_stale, stall_detection_timeout, Config,
+        ReflectorHealth, ReflectorState, Sample,
     };
     use std::time::Instant;
 
@@ -3624,6 +3641,24 @@ mod tests {
         assert_eq!(parse_irtt_duration_us("900ns"), Some(0.9));
         assert!(parse_irtt_duration_us("-1ms").is_none());
         assert!(parse_irtt_duration_us("10m").is_none());
+    }
+
+    #[test]
+    fn stale_reflector_response_guard_matches_upstream_age() {
+        let mut sample = Sample {
+            reflector: "1.1.1.1".to_string(),
+            seq: "1".to_string(),
+            timestamp: 100.0,
+            rtt_ms: 1.0,
+            dl_owd_us: 500.0,
+            ul_owd_us: 500.0,
+            timestamped_owd: false,
+        };
+
+        assert!(!sample_is_stale(&sample, 100.500));
+        assert!(sample_is_stale(&sample, 100.501));
+        sample.timestamp = 101.0;
+        assert!(!sample_is_stale(&sample, 100.0));
     }
 
     #[test]
