@@ -39,6 +39,7 @@ var optionDescriptions = {
 	_speedtest_backend_status: 'Check which optional speed test backends are currently installed or configured on this router.',
 	_speedtest_backend_install: 'Install the selected optional backend package on this router. Auto and built-in HTTP do not need installation.',
 	_wizard_sqm_queue: 'Existing unmanaged SQM queues on the selected interface are reused to avoid duplicate shapers.',
+	_wizard_advanced_test_options: 'Show backend selection, speed test headroom, package checks, and reflector planning. Auto defaults are suitable for normal setup.',
 	manual_rate_limits: 'Show explicit min, base, and max autorate limits. Leave off to derive them from download and upload speeds.',
 	advanced_settings: 'Show detailed SQM, reflector, controller, logging, and daemon tuning settings.',
 	min_dl_shaper_rate_kbps: 'Lowest download shaper rate autorate may apply, in kbit/s.',
@@ -1515,6 +1516,7 @@ function showCreateWizard(grid, name) {
 		sqm_enabled: false,
 		speedtest_backend: 'auto',
 		speedtest_apply_percent: '90',
+		advanced_test_options: false,
 		pinger_method: 'fping',
 		no_pingers: '6',
 		ping_extra_args: pingerInterfaceArgs(defaultWan, 'fping'),
@@ -1548,15 +1550,37 @@ function showCreateWizard(grid, name) {
 	}
 
 	function renderSteps() {
+		var labels = [ _('Interface'), _('Speed test'), _('Review') ];
 		var steps = [];
 
-		for (var i = 0; i < 3; i++)
-			steps.push(E('span', {
-				'class': 'badge %s'.format(i === state.step ? 'primary' : 'secondary'),
-				'style': 'margin-right:6px'
-			}, String(i + 1)));
+		for (var i = 0; i < labels.length; i++) {
+			var active = i === state.step;
+			var completed = i < state.step;
 
-		return E('div', { 'style': 'margin-bottom:12px' }, steps);
+			steps.push(E('button', {
+				'type': 'button',
+				'class': 'btn cbi-button cake-autorate-wizard-step %s'.format(
+					active ? 'cbi-button-positive' : (completed ? 'cbi-button-action' : '')),
+				'data-step': String(i),
+				'aria-current': active ? 'step' : null,
+				'title': _('Go to step %d: %s').format(i + 1, labels[i]),
+				'style': 'display:inline-flex;align-items:center;justify-content:flex-start;gap:8px;flex:1 1 150px;min-height:42px;text-align:left',
+				'click': function(ev) {
+					ev.preventDefault();
+					navigateWizardStep(parseInt(ev.currentTarget.getAttribute('data-step'), 10));
+				}
+			}, [
+				E('span', {
+					'style': 'display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:2px solid currentColor;border-radius:50%;font-weight:700;flex:0 0 24px'
+				}, String(i + 1)),
+				E('span', { 'style': 'font-weight:600' }, labels[i])
+			]));
+		}
+
+		return E('div', {
+			'class': 'cake-autorate-wizard-steps',
+			'style': 'display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px'
+		}, steps);
 	}
 
 	function renderInterfaceStep() {
@@ -1598,6 +1622,8 @@ function showCreateWizard(grid, name) {
 		var percent = wizardTextInput(state.speedtest_apply_percent, 'and(uinteger,min(1),max(100))');
 		var download = wizardTextInput(state.sqm_download, 'uinteger');
 		var upload = wizardTextInput(state.sqm_upload, 'uinteger');
+		var advancedOptions = wizardCheckbox(state.advanced_test_options);
+		var advancedFields = [];
 		var backendStatus = E('pre', { 'style': 'white-space:pre-wrap;margin:6px 0 0 0' }, '');
 		var status = E('div', { 'class': 'cake-autorate-speedtest-status' }, '');
 		var summary = E('div', {
@@ -1608,6 +1634,7 @@ function showCreateWizard(grid, name) {
 		var syncInputs = function() {
 			state.speedtest_backend = backend.value || 'auto';
 			state.speedtest_apply_percent = percent.value || '90';
+			state.advanced_test_options = advancedOptions.checked;
 			state.sqm_download = download.value;
 			state.sqm_upload = upload.value;
 		};
@@ -1752,46 +1779,73 @@ function showCreateWizard(grid, name) {
 			}
 		}, _('Scan reflectors'));
 
-		backend.addEventListener('change', syncInputs);
-		backend.addEventListener('change', updateSummary);
+		var updateAdvancedVisibility = function() {
+			state.advanced_test_options = advancedOptions.checked;
+
+			for (var i = 0; i < advancedFields.length; i++)
+				advancedFields[i].style.display = state.advanced_test_options ? '' : 'none';
+
+			installButton.style.display = state.advanced_test_options &&
+				speedtestBackendInstallable(backend.value || 'auto') ? '' : 'none';
+		};
+
+		backend.addEventListener('change', function() {
+			syncInputs();
+			updateSummary();
+			updateAdvancedVisibility();
+		});
+		advancedOptions.addEventListener('change', updateAdvancedVisibility);
 		percent.addEventListener('input', function() { syncInputs(); updateSummary(); });
 		percent.addEventListener('change', function() { syncInputs(); updateSummary(); });
 		download.addEventListener('input', function() { syncInputs(); updateSummary(); });
 		download.addEventListener('change', function() { syncInputs(); updateSummary(); });
 		upload.addEventListener('input', function() { syncInputs(); updateSummary(); });
 		upload.addEventListener('change', function() { syncInputs(); updateSummary(); });
+		advancedFields = [
+			wizardField(_('Preferred backend'), backend, optionDescriptions.speedtest_backend),
+			wizardField(_('Check backends'), E('div', {}, [ checkButton, ' ', installButton, backendStatus ]), optionDescriptions._speedtest_backend_status),
+			wizardField(_('Speed test apply percent'), percent, optionDescriptions.speedtest_apply_percent),
+			wizardField(_('Reflector plan'), E('div', {}, [ scanReflectorsButton, pingerStatus ]), optionDescriptions._wizard_reflector_plan)
+		];
+
 		updateSummary();
+		updateAdvancedVisibility();
 
 		return [
-			wizardField(_('Preferred backend'), backend, optionDescriptions.speedtest_backend),
-			wizardField(_('Check backends'), E('div', {}, [ checkButton, ' ', installButton, backendStatus ]), optionDescriptions._speedtest_backend_install),
-			wizardField(_('Speed test apply percent'), percent, optionDescriptions.speedtest_apply_percent),
 			wizardField(_('Download speed'), download, optionDescriptions.sqm_download),
 			wizardField(_('Upload speed'), upload, optionDescriptions.sqm_upload),
 			wizardField(_('Run speed test'), E('div', {}, [ runButton, summary, status ]), optionDescriptions._speedtest),
-			wizardField(_('Reflector plan'), E('div', {}, [ scanReflectorsButton, pingerStatus ]), optionDescriptions._wizard_reflector_plan)
-		];
+			wizardField(_('Advanced test options'), advancedOptions, optionDescriptions._wizard_advanced_test_options)
+		].concat(advancedFields);
 	}
 
 	function renderReviewStep() {
 		var wan = normalizeInterfaceName(state.wan_if);
+		var reflectors = (state.reflectors && state.reflectors.length) ? state.reflectors : defaultReflectors();
+		var activeCount = Math.min(parseInt(state.no_pingers || '6', 10), reflectors.length);
 		var rows = [
 			[ _('Target interface'), wan ],
+			[ _('Autorate'), state.enabled ? _('enabled') : _('disabled') ],
+			[ _('SQM'), state.sqm_enabled ? _('enabled') : _('disabled') ],
 			[ _('SQM queue'), wizardSqmQueueText(state) ],
-			[ _('Download interface'), ifbForWan(wan) ],
-			[ _('Upload interface'), wan ],
-			[ _('Queueing discipline'), state.sqm_qdisc || 'cake' ],
-			[ _('Queue setup script'), state.sqm_script || 'piece_of_cake.qos' ],
-			[ _('Preferred backend'), speedtestBackendChoiceTitle(state.speedtest_backend) ],
-			[ _('Pinger'), state.pinger_method || 'fping' ],
-			[ _('Extra ping args'), state.ping_extra_args || '-' ],
-			[ _('Pingers'), String(state.no_pingers || '6') ],
-			[ _('Reflectors'), ((state.reflectors && state.reflectors.length) ? state.reflectors : defaultReflectors()).join(', ') ],
 			[ _('Download speed'), state.sqm_download + ' kbit/s' ],
 			[ _('Upload speed'), state.sqm_upload + ' kbit/s' ],
-			[ _('Min DL rate'), halfRate(state.sqm_download) + ' kbit/s' ],
-			[ _('Min UL rate'), halfRate(state.sqm_upload) + ' kbit/s' ]
+			[ _('Preferred backend'), speedtestBackendChoiceTitle(state.speedtest_backend) ],
+			[ _('Pinger plan'), _('%s, %d active / %d candidates').format(state.pinger_method || 'fping', activeCount, reflectors.length) ]
 		];
+
+		if (state.advanced_test_options) {
+			rows.push(
+				[ _('Download interface'), ifbForWan(wan) ],
+				[ _('Upload interface'), wan ],
+				[ _('Queueing discipline'), state.sqm_qdisc || 'cake' ],
+				[ _('Queue setup script'), state.sqm_script || 'piece_of_cake.qos' ],
+				[ _('Speed test apply percent'), String(state.speedtest_apply_percent || '90') + '%' ],
+				[ _('Extra ping args'), state.ping_extra_args || '-' ],
+				[ _('Active reflectors'), reflectors.slice(0, activeCount).join(', ') ],
+				[ _('Derived minimum rates'), '%s / %s kbit/s'.format(halfRate(state.sqm_download), halfRate(state.sqm_upload)) ]
+			);
+		}
 
 		return [
 			E('table', { 'class': 'table' }, rows.map(function(row) {
@@ -1803,15 +1857,16 @@ function showCreateWizard(grid, name) {
 		];
 	}
 
-	function validateStep() {
+	function validateStep(step) {
 		showError(null);
+		step = step == null ? state.step : step;
 
-		if (state.step === 0 && !state.wan_if) {
+		if (step === 0 && !state.wan_if) {
 			showError(_('Target interface is required.'));
 			return false;
 		}
 
-		if (state.step === 1) {
+		if (step === 1) {
 			if (!validatePositiveInteger(state.speedtest_apply_percent) ||
 			    parseInt(state.speedtest_apply_percent, 10) > 100) {
 				showError(_('Speed test apply percent must be between 1 and 100.'));
@@ -1827,6 +1882,22 @@ function showCreateWizard(grid, name) {
 		}
 
 		return true;
+	}
+
+	function navigateWizardStep(target) {
+		if (isNaN(target) || target < 0 || target > 2 || target === state.step)
+			return;
+
+		if (target > state.step) {
+			if (!validateStep(state.step))
+				return;
+
+			if (state.step === 0 && target === 2 && !validateStep(1))
+				return;
+		}
+
+		state.step = target;
+		render();
 	}
 
 	function validateWizard() {
@@ -1926,8 +1997,7 @@ function showCreateWizard(grid, name) {
 			buttons.push(E('button', {
 				'class': 'btn cbi-button',
 				'click': function() {
-					state.step--;
-					render();
+					navigateWizardStep(state.step - 1);
 				}
 			}, _('Back')));
 			buttons.push(' ');
@@ -1937,11 +2007,7 @@ function showCreateWizard(grid, name) {
 			buttons.push(E('button', {
 				'class': 'btn cbi-button cbi-button-positive',
 				'click': function() {
-					if (!validateStep())
-						return;
-
-					state.step++;
-					render();
+					navigateWizardStep(state.step + 1);
 				}
 			}, _('Next')));
 		}
@@ -2159,6 +2225,8 @@ function addSetupOptions(section) {
 
 	o = flag(section, 'setup', 'auto_interface_preset', _('Auto SQM preset'), '1');
 	o.forcewrite = true;
+	o.retain = true;
+	o.depends('advanced_settings', '1');
 	o.write = function(section_id, formvalue) {
 		uci.set('cake-autorate', section_id, 'auto_interface_preset', formvalue);
 
@@ -2205,11 +2273,11 @@ function addSetupOptions(section) {
 		var manualRateLimits = manualRateLimitsEnabled(this.section, section_id);
 
 		setCakeOption(null, section_id, 'sqm_download', formvalue);
-		setCakeOption(null, section_id, 'base_dl_shaper_rate_kbps', formvalue);
-		setCakeOption(null, section_id, 'max_dl_shaper_rate_kbps', formvalue);
-
-		if (!manualRateLimits || !uci.get('cake-autorate', section_id, 'min_dl_shaper_rate_kbps'))
+		if (!manualRateLimits) {
+			setCakeOption(null, section_id, 'base_dl_shaper_rate_kbps', formvalue);
+			setCakeOption(null, section_id, 'max_dl_shaper_rate_kbps', formvalue);
 			setCakeOption(null, section_id, 'min_dl_shaper_rate_kbps', halfRate(formvalue));
+		}
 	};
 
 	o = value(section, 'setup', 'sqm_upload', _('Upload speed'), 'and(uinteger,min(0))', '20000');
@@ -2228,16 +2296,18 @@ function addSetupOptions(section) {
 		var manualRateLimits = manualRateLimitsEnabled(this.section, section_id);
 
 		setCakeOption(null, section_id, 'sqm_upload', formvalue);
-		setCakeOption(null, section_id, 'base_ul_shaper_rate_kbps', formvalue);
-		setCakeOption(null, section_id, 'max_ul_shaper_rate_kbps', formvalue);
-
-		if (!manualRateLimits || !uci.get('cake-autorate', section_id, 'min_ul_shaper_rate_kbps'))
+		if (!manualRateLimits) {
+			setCakeOption(null, section_id, 'base_ul_shaper_rate_kbps', formvalue);
+			setCakeOption(null, section_id, 'max_ul_shaper_rate_kbps', formvalue);
 			setCakeOption(null, section_id, 'min_ul_shaper_rate_kbps', halfRate(formvalue));
+		}
 	};
 
 	o = value(section, 'setup', 'speedtest_apply_percent', _('Speed test apply percent'), 'and(uinteger,min(1),max(100))', '90');
 	o.default = '90';
 	o.forcewrite = true;
+	o.retain = true;
+	o.depends('advanced_settings', '1');
 	o.onchange = function(ev, section_id) {
 		refreshSpeedtestSummaries(this.section, section_id);
 	};
@@ -2314,47 +2384,49 @@ function addSetupOptions(section) {
 
 	o = flag(section, 'setup', 'manual_rate_limits', _('Manual rate limits'), '0');
 	o.forcewrite = true;
+	o.retain = true;
+	o.depends('advanced_settings', '1');
 
 	o = flag(section, 'setup', 'advanced_settings', _('Show advanced settings'), '0');
 	o.forcewrite = true;
 
 	o = value(section, 'setup', 'min_dl_shaper_rate_kbps', _('Min DL rate'), 'uinteger', '5000');
-	o.depends('manual_rate_limits', '1');
+	o.depends({ advanced_settings: '1', manual_rate_limits: '1' });
 	o.retain = true;
 	o.validate = function(section_id) {
 		return validateRateOrder(validationSection(this), section_id, 'dl');
 	};
 
 	o = value(section, 'setup', 'base_dl_shaper_rate_kbps', _('Base DL rate'), 'uinteger', '20000');
-	o.depends('manual_rate_limits', '1');
+	o.depends({ advanced_settings: '1', manual_rate_limits: '1' });
 	o.retain = true;
 	o.validate = function(section_id) {
 		return validateRateOrder(validationSection(this), section_id, 'dl');
 	};
 
 	o = value(section, 'setup', 'max_dl_shaper_rate_kbps', _('Max DL rate'), 'uinteger', '80000');
-	o.depends('manual_rate_limits', '1');
+	o.depends({ advanced_settings: '1', manual_rate_limits: '1' });
 	o.retain = true;
 	o.validate = function(section_id) {
 		return validateRateOrder(validationSection(this), section_id, 'dl');
 	};
 
 	o = value(section, 'setup', 'min_ul_shaper_rate_kbps', _('Min UL rate'), 'uinteger', '5000');
-	o.depends('manual_rate_limits', '1');
+	o.depends({ advanced_settings: '1', manual_rate_limits: '1' });
 	o.retain = true;
 	o.validate = function(section_id) {
 		return validateRateOrder(validationSection(this), section_id, 'ul');
 	};
 
 	o = value(section, 'setup', 'base_ul_shaper_rate_kbps', _('Base UL rate'), 'uinteger', '20000');
-	o.depends('manual_rate_limits', '1');
+	o.depends({ advanced_settings: '1', manual_rate_limits: '1' });
 	o.retain = true;
 	o.validate = function(section_id) {
 		return validateRateOrder(validationSection(this), section_id, 'ul');
 	};
 
 	o = value(section, 'setup', 'max_ul_shaper_rate_kbps', _('Max UL rate'), 'uinteger', '35000');
-	o.depends('manual_rate_limits', '1');
+	o.depends({ advanced_settings: '1', manual_rate_limits: '1' });
 	o.retain = true;
 	o.validate = function(section_id) {
 		return validateRateOrder(validationSection(this), section_id, 'ul');

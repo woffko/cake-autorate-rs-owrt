@@ -60,12 +60,21 @@ Implemented:
 - LuCI and init guard against enabling an automatic IFB download interface
   without an enabled SQM backing queue for that instance. A stray IFB created by
   another SQM section does not satisfy the guard.
-- LuCI setup wizard for creating instances, importing SQM rates, checking speed
-  test backends, running a router-side speed test, and writing derived limits.
+- LuCI setup wizard for creating instances, importing SQM rates, running a
+  router-side speed test, and writing derived limits. Its normal speed-test step
+  shows only rates and the test action; backend/package/headroom controls and
+  reflector scanning are available behind `Advanced test options`. A visual
+  three-step navigator (`Interface`, `Speed test`, `Review`) also supports
+  direct validated navigation by clicking any numbered step.
 - LuCI instance editing keeps advanced speed test backend controls and
-  pinger/reflector planning behind the advanced settings toggle. Basic setup
-  speed test actions still use the current unsaved interface and backend
-  selections from the edit modal when those controls are available.
+  pinger/reflector planning behind the advanced settings toggle. The automatic
+  interface preset, speed-test headroom, and manual min/base/max escape hatches
+  are also hidden from basic setup. Basic speed test actions still use the
+  current unsaved interface and backend selections when those controls are
+  available.
+- When `Manual rate limits` is enabled, editing the SQM download/upload rates
+  does not overwrite the explicit autorate min/base/max values. Automatic mode
+  continues to derive base/max from SQM rates and minimums at half-rate.
 - In the LuCI edit modal, enabling the basic `Enable SQM` toggle also enables
   `Manage SQM` for that instance so the setup page can recover disabled
   external/imported SQM queues without visiting advanced settings.
@@ -81,8 +90,9 @@ Implemented:
 - LuCI can apply the pinger planner recommendation into pending changes for an
   existing instance, and the create wizard writes pinger method, active pinger
   count, and reflector list for new instances.
-- LuCI setup tab with the minimum recommended autorate fields from upstream:
-  target interface, SQM download/upload, and min/base/max rates per direction.
+- LuCI setup tab keeps the normal path to target interface, SQM enable,
+  download/upload rates, and one-click speed testing. Explicit upstream
+  min/base/max controls remain available in advanced manual-rate mode.
 - Router-side speed test helper with optional backend autodetection:
   `librespeed-cli`, `speedtest-go`, configured `iperf3`, then built-in HTTP
   fallback. Optional backend packages are not hard dependencies.
