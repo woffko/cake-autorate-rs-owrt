@@ -2098,10 +2098,12 @@ function addSpeedtestOptions(section) {
 	dependsAny(o, 'speedtest_backend', [ 'auto', 'builtin-http' ]);
 	o = optionalValue(section, 'speedtest', 'speedtest_download_bytes', _('Download bytes'), 'and(uinteger,min(1))', '25000000');
 	dependsAny(o, 'speedtest_backend', [ 'auto', 'builtin-http' ]);
-	optionalValue(section, 'speedtest', 'speedtest_upload_bytes', _('Upload bytes'), 'and(uinteger,min(0))', '4000000');
+	o = optionalValue(section, 'speedtest', 'speedtest_upload_bytes', _('Upload bytes'), 'and(uinteger,min(0))', '4000000');
+	dependsAny(o, 'speedtest_backend', [ 'auto', 'librespeed-cli', 'speedtest-go', 'builtin-http' ]);
 	o = optionalValue(section, 'speedtest', 'speedtest_upload_retry_bytes', _('Upload retry bytes'), null, '1000000 262144');
 	dependsAny(o, 'speedtest_backend', [ 'auto', 'builtin-http' ]);
-	optionalValue(section, 'speedtest', 'speedtest_timeout_s', _('Request timeout'), 'and(uinteger,min(1))', '45');
+	o = optionalValue(section, 'speedtest', 'speedtest_timeout_s', _('Request timeout'), 'and(uinteger,min(1))', '45');
+	dependsAny(o, 'speedtest_backend', [ 'auto', 'librespeed-cli', 'builtin-http' ]);
 	o = optionalValue(section, 'speedtest', 'speedtest_duration_s', _('Test duration'), 'and(uinteger,min(1))', '15');
 	dependsAny(o, 'speedtest_backend', [ 'auto', 'librespeed-cli', 'iperf3' ]);
 	o = optionalValue(section, 'speedtest', 'speedtest_iperf3_server', _('iperf3 server'), null, '');
