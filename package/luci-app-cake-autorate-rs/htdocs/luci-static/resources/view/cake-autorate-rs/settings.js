@@ -170,6 +170,8 @@ var interfaceContext = {
 	defaultDevice: 'wan'
 };
 
+var speedtestLastResults = {};
+
 function describe(option, key) {
 	var description = optionDescriptions[key];
 
@@ -890,6 +892,70 @@ function speedtestBackendInstallable(value) {
 	return value && value !== 'auto' && value !== 'builtin-http';
 }
 
+function speedtestRateText(dl, ul) {
+	return '%s / %s kbit/s'.format(dl || '-', ul || '-');
+}
+
+function speedtestSummaryText(backend, percent, dl, ul, last) {
+	var backendTitle = speedtestBackendChoiceTitle(backend || 'auto');
+	var lines = [
+		_('Backend: %s.').format(backendTitle),
+		_('Apply: %d%%. Current limits: %s.').format(percent, speedtestRateText(dl, ul))
+	];
+
+	if (last && last.result) {
+		lines.push(_('Last measured: %s using %s.').format(
+			speedtestRateText(last.result.download_kbps, last.result.upload_kbps),
+			speedtestBackendTitle(last.result)));
+		lines.push(_('Last applied: %s.').format(speedtestRateText(last.applied && last.applied.dl, last.applied && last.applied.ul)));
+
+		if (last.result.shaper_bypassed)
+			lines.push(_('Calibration: unshaped.'));
+
+		if (last.result.warning)
+			lines.push(_('Warning: %s').format(last.result.warning));
+	}
+	else {
+		lines.push(_('Last result: none yet.'));
+	}
+
+	return lines.join(' ');
+}
+
+function speedtestFormSummaryText(section, section_id) {
+	return speedtestSummaryText(
+		formOrUci(section, section_id, 'speedtest_backend') || 'auto',
+		speedtestApplyPercent(section, section_id),
+		formOrUci(section, section_id, 'sqm_download') || uci.get('cake-autorate', section_id, 'base_dl_shaper_rate_kbps'),
+		formOrUci(section, section_id, 'sqm_upload') || uci.get('cake-autorate', section_id, 'base_ul_shaper_rate_kbps'),
+		speedtestLastResults[section_id]);
+}
+
+function setSpeedtestSummaryNode(node, section, section_id) {
+	if (node)
+		node.textContent = speedtestFormSummaryText(section, section_id);
+}
+
+function speedtestSummaryElement(section, section_id) {
+	var node = E('div', {
+		'class': 'cake-autorate-speedtest-summary',
+		'data-section': section_id,
+		'style': 'display:inline-block;vertical-align:middle;margin-left:10px;max-width:680px;white-space:normal;color:#555;font-size:12px;line-height:1.35'
+	});
+
+	setSpeedtestSummaryNode(node, section, section_id);
+
+	return node;
+}
+
+function refreshSpeedtestSummaries(section, section_id) {
+	var nodes = document.querySelectorAll('.cake-autorate-speedtest-summary');
+
+	for (var i = 0; i < nodes.length; i++)
+		if (!section_id || nodes[i].getAttribute('data-section') === section_id)
+			setSpeedtestSummaryNode(nodes[i], section, nodes[i].getAttribute('data-section'));
+}
+
 function formatSpeedtestBackendInstall(result) {
 	var title = result.backend_title || speedtestBackendChoiceTitle(result.backend);
 	var pkg = result.package ? ' (' + result.package + ')' : '';
@@ -1534,6 +1600,10 @@ function showCreateWizard(grid, name) {
 		var upload = wizardTextInput(state.sqm_upload, 'uinteger');
 		var backendStatus = E('pre', { 'style': 'white-space:pre-wrap;margin:6px 0 0 0' }, '');
 		var status = E('div', { 'class': 'cake-autorate-speedtest-status' }, '');
+		var summary = E('div', {
+			'class': 'cake-autorate-speedtest-summary',
+			'style': 'display:inline-block;vertical-align:middle;margin-left:10px;max-width:680px;white-space:normal;color:#555;font-size:12px;line-height:1.35'
+		});
 		var pingerStatus = E('pre', { 'style': 'white-space:pre-wrap;margin:6px 0 0 0' }, '');
 		var syncInputs = function() {
 			state.speedtest_backend = backend.value || 'auto';
@@ -1541,10 +1611,24 @@ function showCreateWizard(grid, name) {
 			state.sqm_download = download.value;
 			state.sqm_upload = upload.value;
 		};
+		var updateSummary = function() {
+			var pct = parseInt(state.speedtest_apply_percent || '90', 10);
+
+			if (isNaN(pct) || pct < 1 || pct > 100)
+				pct = 90;
+
+			summary.textContent = speedtestSummaryText(
+				state.speedtest_backend || 'auto',
+				pct,
+				state.sqm_download,
+				state.sqm_upload,
+				state.speedtest_last);
+		};
 		var checkButton = E('button', {
 			'class': 'btn cbi-button',
 			'click': function() {
 				syncInputs();
+				updateSummary();
 				showError(null);
 				checkButton.disabled = true;
 				backendStatus.textContent = _('Checking backends...');
@@ -1570,6 +1654,7 @@ function showCreateWizard(grid, name) {
 			'class': 'btn cbi-button',
 			'click': function() {
 				syncInputs();
+				updateSummary();
 				showError(null);
 
 				if (!speedtestBackendInstallable(state.speedtest_backend)) {
@@ -1601,6 +1686,7 @@ function showCreateWizard(grid, name) {
 				}
 
 				syncInputs();
+				updateSummary();
 				showError(null);
 				runButton.disabled = true;
 				status.textContent = _('Running speed test...');
@@ -1626,6 +1712,15 @@ function showCreateWizard(grid, name) {
 						state.sqm_upload = ul;
 						upload.value = ul;
 					}
+
+					state.speedtest_last = {
+						result: result,
+						applied: {
+							dl: dl,
+							ul: ul
+						}
+					};
+					updateSummary();
 
 					status.textContent = result.warning ||
 						_('Speed test completed using %s.').format(speedtestBackendTitle(result));
@@ -1658,12 +1753,14 @@ function showCreateWizard(grid, name) {
 		}, _('Scan reflectors'));
 
 		backend.addEventListener('change', syncInputs);
-		percent.addEventListener('input', syncInputs);
-		percent.addEventListener('change', syncInputs);
-		download.addEventListener('input', syncInputs);
-		download.addEventListener('change', syncInputs);
-		upload.addEventListener('input', syncInputs);
-		upload.addEventListener('change', syncInputs);
+		backend.addEventListener('change', updateSummary);
+		percent.addEventListener('input', function() { syncInputs(); updateSummary(); });
+		percent.addEventListener('change', function() { syncInputs(); updateSummary(); });
+		download.addEventListener('input', function() { syncInputs(); updateSummary(); });
+		download.addEventListener('change', function() { syncInputs(); updateSummary(); });
+		upload.addEventListener('input', function() { syncInputs(); updateSummary(); });
+		upload.addEventListener('change', function() { syncInputs(); updateSummary(); });
+		updateSummary();
 
 		return [
 			wizardField(_('Preferred backend'), backend, optionDescriptions.speedtest_backend),
@@ -1671,7 +1768,7 @@ function showCreateWizard(grid, name) {
 			wizardField(_('Speed test apply percent'), percent, optionDescriptions.speedtest_apply_percent),
 			wizardField(_('Download speed'), download, optionDescriptions.sqm_download),
 			wizardField(_('Upload speed'), upload, optionDescriptions.sqm_upload),
-			wizardField(_('Run speed test'), E('div', {}, [ runButton, status ]), optionDescriptions._speedtest),
+			wizardField(_('Run speed test'), E('div', {}, [ runButton, summary, status ]), optionDescriptions._speedtest),
 			wizardField(_('Reflector plan'), E('div', {}, [ scanReflectorsButton, pingerStatus ]), optionDescriptions._wizard_reflector_plan)
 		];
 	}
@@ -1916,6 +2013,9 @@ function addSpeedtestOptions(section) {
 	o.value('speedtest-go', _('speedtest-go (package: speedtest-go)'));
 	o.value('iperf3', _('configured iperf3 (package: iperf3)'));
 	o.value('builtin-http', _('built-in HTTP'));
+	o.onchange = function(ev, section_id) {
+		refreshSpeedtestSummaries(this.section, section_id);
+	};
 
 	o = section.taboption('speedtest', form.DummyValue, '_speedtest_backend_order', _('Backend order'));
 	modal(o);
@@ -2037,6 +2137,7 @@ function addSetupOptions(section) {
 			applyWanPreset(section_id, value, true, this.section);
 
 		maybeEnableSqmForAutoPreset(this.section, section_id);
+		refreshSpeedtestSummaries(this.section, section_id);
 	};
 	o.write = function(section_id, formvalue) {
 		formvalue = normalizeInterfaceName(formvalue);
@@ -2088,6 +2189,9 @@ function addSetupOptions(section) {
 
 	o = value(section, 'setup', 'sqm_download', _('Download speed'), 'and(uinteger,min(0))', '20000');
 	o.forcewrite = true;
+	o.onchange = function(ev, section_id) {
+		refreshSpeedtestSummaries(this.section, section_id);
+	};
 	o.cfgvalue = function(section_id) {
 		var queue = findSqmQueueForInterface(selectedWan(null, section_id));
 
@@ -2108,6 +2212,9 @@ function addSetupOptions(section) {
 
 	o = value(section, 'setup', 'sqm_upload', _('Upload speed'), 'and(uinteger,min(0))', '20000');
 	o.forcewrite = true;
+	o.onchange = function(ev, section_id) {
+		refreshSpeedtestSummaries(this.section, section_id);
+	};
 	o.cfgvalue = function(section_id) {
 		var queue = findSqmQueueForInterface(selectedWan(null, section_id));
 
@@ -2129,6 +2236,9 @@ function addSetupOptions(section) {
 	o = value(section, 'setup', 'speedtest_apply_percent', _('Speed test apply percent'), 'and(uinteger,min(1),max(100))', '90');
 	o.default = '90';
 	o.forcewrite = true;
+	o.onchange = function(ev, section_id) {
+		refreshSpeedtestSummaries(this.section, section_id);
+	};
 
 	o = section.taboption('setup', form.Button, '_speedtest', _('Run speed test'));
 	modal(o);
@@ -2138,6 +2248,26 @@ function addSetupOptions(section) {
 	o.rmempty = true;
 	o.write = function() {};
 	o.remove = function() {};
+	o.renderWidget = function(section_id) {
+		var self = this;
+		var title = this.titleFn('inputtitle', section_id) || this.titleFn('title', section_id);
+
+		return E('div', {}, [
+			E('button', {
+				'class': 'cbi-button cbi-button-%s'.format(this.inputstyle || 'button'),
+				'click': function(ev) {
+					return self.onclick(ev, section_id);
+				},
+				'disabled': (this.readonly || this.map.readonly) || null
+			}, [ title ]),
+			speedtestSummaryElement(this.section, section_id),
+			E('input', {
+				'id': this.cbid(section_id),
+				'type': 'hidden',
+				'value': ''
+			})
+		]);
+	};
 	o.onclick = function(ev, section_id) {
 		var button = ev.currentTarget;
 		var activeSection = this.section;
@@ -2148,6 +2278,7 @@ function addSetupOptions(section) {
 		if (autoInterfacePresetEnabled(activeSection, section_id))
 			applyWanPreset(section_id, wan, false, activeSection);
 
+		refreshSpeedtestSummaries(activeSection, section_id);
 		button.disabled = true;
 
 		return withSpeedtestRpcTimeout(function() {
@@ -2159,6 +2290,12 @@ function addSetupOptions(section) {
 				percent,
 				applied.dl || _('unchanged'),
 				applied.ul || _('unchanged'));
+
+			speedtestLastResults[section_id] = {
+				result: result,
+				applied: applied
+			};
+			refreshSpeedtestSummaries(activeSection, section_id);
 
 			message += ' ' + _('Backend: %s.').format(speedtestBackendTitle(result));
 
