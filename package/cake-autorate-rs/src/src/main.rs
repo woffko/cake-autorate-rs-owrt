@@ -136,6 +136,8 @@ struct Config {
     startup_wait_s: f64,
     if_up_check_interval_s: f64,
     monitor_cpu_usage_interval_ms: u64,
+    dl_max_wire_packet_size_bits: u64,
+    ul_max_wire_packet_size_bits: u64,
 }
 
 impl Config {
@@ -222,6 +224,8 @@ impl Config {
             startup_wait_s: 0.0,
             if_up_check_interval_s: 10.0,
             monitor_cpu_usage_interval_ms: 2000,
+            dl_max_wire_packet_size_bits: 0,
+            ul_max_wire_packet_size_bits: 0,
         }
     }
 
@@ -627,6 +631,7 @@ impl Config {
         }
 
         cfg.normalize_paths();
+        cfg.refresh_wire_packet_sizes();
         cfg.validate()?;
         Ok(cfg)
     }
@@ -674,6 +679,11 @@ impl Config {
             };
             self.tx_bytes_path = format!("/sys/class/net/{}/statistics/{counter}", self.ul_if);
         }
+    }
+
+    fn refresh_wire_packet_sizes(&mut self) {
+        self.dl_max_wire_packet_size_bits = interface_max_wire_packet_size_bits(&self.dl_if);
+        self.ul_max_wire_packet_size_bits = interface_max_wire_packet_size_bits(&self.ul_if);
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -1428,11 +1438,12 @@ struct Controller {
 }
 
 impl Controller {
-    fn new(cfg: Config) -> Result<Self, String> {
+    fn new(mut cfg: Config) -> Result<Self, String> {
         ensure_run_dir(&cfg.run_dir())
             .map_err(|e| format!("failed to create run directory: {e}"))?;
         wait_for_path(&cfg.rx_bytes_path, cfg.if_up_check_interval_s)?;
         wait_for_path(&cfg.tx_bytes_path, cfg.if_up_check_interval_s)?;
+        cfg.refresh_wire_packet_sizes();
 
         let log = if cfg.log_to_file {
             Some(LogFile::open(cfg.log_path()).map_err(|e| {
@@ -1586,15 +1597,15 @@ impl Controller {
 
         let dl_baseline_current_us = *dl_baseline;
         let ul_baseline_current_us = *ul_baseline;
+        let dl_delay_thr_us = self.delay_thr_us(true);
+        let ul_delay_thr_us = self.delay_thr_us(false);
+        let dl_up_thr_us = self.avg_adjust_up_thr_us(true);
+        let ul_up_thr_us = self.avg_adjust_up_thr_us(false);
+        let dl_down_thr_us = self.avg_adjust_down_thr_us(true);
+        let ul_down_thr_us = self.avg_adjust_down_thr_us(false);
 
-        push_window(
-            &mut self.dl_delays,
-            dl_delta_us > self.cfg.dl_owd_delta_delay_thr_ms * 1000.0,
-        );
-        push_window(
-            &mut self.ul_delays,
-            ul_delta_us > self.cfg.ul_owd_delta_delay_thr_ms * 1000.0,
-        );
+        push_window(&mut self.dl_delays, dl_delta_us > dl_delay_thr_us);
+        push_window(&mut self.ul_delays, ul_delta_us > ul_delay_thr_us);
         push_window(&mut self.dl_delta_us, dl_delta_us);
         push_window(&mut self.ul_delta_us, ul_delta_us);
 
@@ -1650,20 +1661,20 @@ impl Controller {
                     sample.dl_owd_us,
                     dl_ewma_us,
                     dl_delta_us,
-                    self.cfg.dl_owd_delta_delay_thr_ms * 1000.0,
+                    dl_delay_thr_us,
                     ul_baseline_current_us,
                     sample.ul_owd_us,
                     ul_ewma_us,
                     ul_delta_us,
-                    self.cfg.ul_owd_delta_delay_thr_ms * 1000.0,
+                    ul_delay_thr_us,
                     dl_delay_count,
                     avg_dl_delta,
-                    self.cfg.dl_avg_owd_delta_max_adjust_up_thr_ms * 1000.0,
-                    self.cfg.dl_avg_owd_delta_max_adjust_down_thr_ms * 1000.0,
+                    dl_up_thr_us,
+                    dl_down_thr_us,
                     ul_delay_count,
                     avg_ul_delta,
-                    self.cfg.ul_avg_owd_delta_max_adjust_up_thr_ms * 1000.0,
-                    self.cfg.ul_avg_owd_delta_max_adjust_down_thr_ms * 1000.0,
+                    ul_up_thr_us,
+                    ul_down_thr_us,
                     load_label(dl_kind, dl_bb, "dl"),
                     load_label(ul_kind, ul_bb, "ul"),
                     self.shaper_dl,
@@ -1770,6 +1781,41 @@ impl Controller {
         }
     }
 
+    fn direction_compensation_us(&self, is_dl: bool) -> f64 {
+        if is_dl {
+            packet_compensation_us(self.cfg.dl_max_wire_packet_size_bits, self.shaper_dl)
+        } else {
+            packet_compensation_us(self.cfg.ul_max_wire_packet_size_bits, self.shaper_ul)
+        }
+    }
+
+    fn delay_thr_us(&self, is_dl: bool) -> f64 {
+        let base = if is_dl {
+            self.cfg.dl_owd_delta_delay_thr_ms
+        } else {
+            self.cfg.ul_owd_delta_delay_thr_ms
+        };
+        base * 1000.0 + self.direction_compensation_us(is_dl)
+    }
+
+    fn avg_adjust_up_thr_us(&self, is_dl: bool) -> f64 {
+        let base = if is_dl {
+            self.cfg.dl_avg_owd_delta_max_adjust_up_thr_ms
+        } else {
+            self.cfg.ul_avg_owd_delta_max_adjust_up_thr_ms
+        };
+        base * 1000.0 + self.direction_compensation_us(is_dl)
+    }
+
+    fn avg_adjust_down_thr_us(&self, is_dl: bool) -> f64 {
+        let base = if is_dl {
+            self.cfg.dl_avg_owd_delta_max_adjust_down_thr_ms
+        } else {
+            self.cfg.ul_avg_owd_delta_max_adjust_down_thr_ms
+        };
+        base * 1000.0 + self.direction_compensation_us(is_dl)
+    }
+
     fn update_direction(
         &mut self,
         is_dl: bool,
@@ -1788,21 +1834,9 @@ impl Controller {
         } else {
             self.cfg.base_ul_shaper_rate_kbps
         };
-        let delay_thr_us = if is_dl {
-            self.cfg.dl_owd_delta_delay_thr_ms * 1000.0
-        } else {
-            self.cfg.ul_owd_delta_delay_thr_ms * 1000.0
-        };
-        let up_thr_us = if is_dl {
-            self.cfg.dl_avg_owd_delta_max_adjust_up_thr_ms * 1000.0
-        } else {
-            self.cfg.ul_avg_owd_delta_max_adjust_up_thr_ms * 1000.0
-        };
-        let down_thr_us = if is_dl {
-            self.cfg.dl_avg_owd_delta_max_adjust_down_thr_ms * 1000.0
-        } else {
-            self.cfg.ul_avg_owd_delta_max_adjust_down_thr_ms * 1000.0
-        };
+        let delay_thr_us = self.delay_thr_us(is_dl);
+        let up_thr_us = self.avg_adjust_up_thr_us(is_dl);
+        let down_thr_us = self.avg_adjust_down_thr_us(is_dl);
         let mut last_bb = if is_dl {
             self.last_bb_dl
         } else {
@@ -2132,10 +2166,22 @@ fn stall_detection_timeout(cfg: &Config) -> Duration {
 }
 
 fn monitor_tick_timeout(cfg: &Config) -> Duration {
-    Duration::from_millis(cfg.monitor_achieved_rates_interval_ms.max(100))
+    let configured_us = cfg
+        .monitor_achieved_rates_interval_ms
+        .max(100)
+        .saturating_mul(1000);
+    let compensated_us = (10.0
+        * max_wire_packet_rtt_us(
+            cfg,
+            cfg.min_dl_shaper_rate_kbps,
+            cfg.min_ul_shaper_rate_kbps,
+        ))
+    .ceil() as u64;
+
+    Duration::from_micros(configured_us.max(compensated_us))
 }
 
-fn run(cfg: Config, once: bool) -> Result<(), String> {
+fn run(mut cfg: Config, once: bool) -> Result<(), String> {
     if !cfg.enabled {
         println!("cake-autorate-rs instance '{}' is disabled", cfg.instance);
         return Ok(());
@@ -2144,6 +2190,7 @@ fn run(cfg: Config, once: bool) -> Result<(), String> {
     if cfg.startup_wait_s > 0.0 {
         std::thread::sleep(Duration::from_secs_f64(cfg.startup_wait_s));
     }
+    cfg.refresh_wire_packet_sizes();
 
     let mut controller = Controller::new(cfg.clone())?;
     controller.start();
@@ -3043,6 +3090,59 @@ fn read_u64_file<P: AsRef<Path>>(path: P) -> io::Result<u64> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+fn interface_max_wire_packet_size_bits(interface: &str) -> u64 {
+    let mtu_path = format!("/sys/class/net/{interface}/mtu");
+    let mtu_bytes = read_u64_file(&mtu_path).unwrap_or(1500);
+    let tc_output = Command::new("tc")
+        .arg("qdisc")
+        .arg("show")
+        .arg("dev")
+        .arg(interface)
+        .output()
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default();
+    let (atm, overhead_bytes) = parse_tc_linklayer_overhead(&tc_output);
+
+    max_wire_packet_size_bits_from_mtu(mtu_bytes, overhead_bytes, atm)
+}
+
+fn parse_tc_linklayer_overhead(output: &str) -> (bool, u64) {
+    let tokens: Vec<&str> = output.split_whitespace().collect();
+
+    for window in tokens.windows(3) {
+        if (window[0] == "atm" || window[0] == "noatm") && window[1] == "overhead" {
+            if let Ok(overhead) = window[2].parse::<u64>() {
+                return (window[0] == "atm", overhead);
+            }
+        }
+    }
+
+    (false, 0)
+}
+
+fn max_wire_packet_size_bits_from_mtu(mtu_bytes: u64, overhead_bytes: u64, atm: bool) -> u64 {
+    let bits = mtu_bytes.saturating_add(overhead_bytes).saturating_mul(8);
+    if atm {
+        424_u64.saturating_mul(bits.saturating_add(376) / 384)
+    } else {
+        bits
+    }
+}
+
+fn packet_compensation_us(packet_size_bits: u64, shaper_rate_kbps: f64) -> f64 {
+    if packet_size_bits == 0 || shaper_rate_kbps <= 0.0 {
+        0.0
+    } else {
+        1000.0 * packet_size_bits as f64 / shaper_rate_kbps
+    }
+}
+
+fn max_wire_packet_rtt_us(cfg: &Config, dl_rate_kbps: f64, ul_rate_kbps: f64) -> f64 {
+    packet_compensation_us(cfg.dl_max_wire_packet_size_bits, dl_rate_kbps)
+        + packet_compensation_us(cfg.ul_max_wire_packet_size_bits, ul_rate_kbps)
+}
+
 fn filled_bool_window(len: usize) -> VecDeque<bool> {
     let mut out = VecDeque::with_capacity(len);
     for _ in 0..len {
@@ -3416,11 +3516,13 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_reflectors, irtt_target_arg, next_spare_reflector, parse_fping_ts_line,
-        parse_irtt_duration_us, parse_irtt_line, parse_reflector_candidates, parse_tsping_line,
-        parse_uci_values, pinger_command, pinger_response_interval_s, reflector_bad_reflectors,
-        reflector_health_json, reflector_spare_reflectors, stall_detection_timeout, Config,
-        ReflectorHealth, ReflectorState,
+        default_reflectors, irtt_target_arg, max_wire_packet_size_bits_from_mtu,
+        monitor_tick_timeout, next_spare_reflector, packet_compensation_us, parse_fping_ts_line,
+        parse_irtt_duration_us, parse_irtt_line, parse_reflector_candidates,
+        parse_tc_linklayer_overhead, parse_tsping_line, parse_uci_values, pinger_command,
+        pinger_response_interval_s, reflector_bad_reflectors, reflector_health_json,
+        reflector_spare_reflectors, stall_detection_timeout, Config, ReflectorHealth,
+        ReflectorState,
     };
     use std::time::Instant;
 
@@ -3546,6 +3648,38 @@ mod tests {
         assert_eq!(cfg.global_ping_response_timeout_s, 10.0);
         assert!((pinger_response_interval_s(&cfg) - 0.05).abs() < 0.000001);
         assert!((stall_detection_timeout(&cfg).as_secs_f64() - 0.25).abs() < 0.000001);
+    }
+
+    #[test]
+    fn parses_live_cake_linklayer_overhead() {
+        let noatm = "qdisc cake 8001: root refcnt 2 bandwidth 10Mbit diffserv3 noatm overhead 44";
+        let atm = "qdisc cake 8002: root refcnt 2 bandwidth 2Mbit besteffort atm overhead 18";
+
+        assert_eq!(parse_tc_linklayer_overhead(noatm), (false, 44));
+        assert_eq!(parse_tc_linklayer_overhead(atm), (true, 18));
+        assert_eq!(
+            parse_tc_linklayer_overhead("qdisc fq_codel 0: root"),
+            (false, 0)
+        );
+    }
+
+    #[test]
+    fn wire_packet_compensation_matches_upstream_units() {
+        assert_eq!(max_wire_packet_size_bits_from_mtu(1500, 44, false), 12_352);
+        assert_eq!(max_wire_packet_size_bits_from_mtu(1500, 44, true), 13_992);
+        assert_eq!(packet_compensation_us(12_000, 1_000.0), 12_000.0);
+    }
+
+    #[test]
+    fn monitor_tick_timeout_is_compensated_at_low_rates() {
+        let mut cfg = Config::defaults("test".to_string());
+        cfg.monitor_achieved_rates_interval_ms = 100;
+        cfg.min_dl_shaper_rate_kbps = 100.0;
+        cfg.min_ul_shaper_rate_kbps = 100.0;
+        cfg.dl_max_wire_packet_size_bits = 12_000;
+        cfg.ul_max_wire_packet_size_bits = 12_000;
+
+        assert_eq!(monitor_tick_timeout(&cfg).as_micros(), 2_400_000);
     }
 
     #[test]
