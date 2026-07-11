@@ -120,7 +120,9 @@ Implemented:
   from `tc qdisc show`.
 - Upstream-style stale reflector response guard: pinger samples processed more
   than 500 ms after their timestamp are logged and skipped.
-- LuCI status page with start, restart, stop actions.
+- LuCI status page with start, restart, stop actions. An enabled instance that
+  has received no valid probe sample after ten seconds shows a compact
+  `No probe replies` warning with pinger/multi-WAN routing guidance.
 
 Known limits:
 
@@ -158,8 +160,10 @@ Known limits:
   supported `fping` package used by `fping`/`fping-ts` and the optional `irtt`
   package. `tsping` remains a manual binary install, and `irtt` is only ready
   when explicit IRTT servers are configured and clocks are synchronized.
-- advanced multi-WAN policy routing is still router/network configuration; the
-  GUI only applies the upstream-style pinger binding/default hints above.
+- Advanced multi-WAN policy routing is still router/network configuration; the
+  GUI applies the upstream-style pinger binding/default hints above, but
+  `-I <target>` cannot create a missing route for that uplink. Status explicitly
+  warns when an enabled instance receives no probe replies.
 - MQTT is an optional sidecar service rather than daemon core. It requires a
   configured broker, `log_to_file=1`, `output_summary_stats=1`, and
   `mosquitto_pub` from either `mosquitto-client-nossl` or

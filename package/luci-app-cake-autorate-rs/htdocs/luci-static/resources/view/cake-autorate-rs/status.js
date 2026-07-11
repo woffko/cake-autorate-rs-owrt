@@ -99,11 +99,51 @@ function formatPercent(value) {
 	return isNaN(value) ? '-' : value.toFixed(1) + '%';
 }
 
-function formatState(value) {
+function hasProbeSample(status) {
+	if (status.reflector)
+		return true;
+
+	return Array.isArray(status.reflector_health) && status.reflector_health.some(function(item) {
+		return Number(item && item.samples || 0) > 0;
+	});
+}
+
+function probeWarning(status, enabled) {
+	var started, runtime;
+
+	if (!enabled || !status || !status.state || hasProbeSample(status))
+		return null;
+
+	started = Number(status.started_at || 0);
+	if (!isFinite(started) || started <= 0)
+		return null;
+
+	runtime = Date.now() / 1000 - started;
+	if (!isFinite(runtime) || runtime < 10)
+		return null;
+
+	return _('No probe replies. Check the pinger and multi-WAN policy routing.');
+}
+
+function formatState(status, enabled) {
+	var value = status && status.state;
+	var warning;
+
 	if (!value)
 		return '-';
 
-	return String(value).toUpperCase();
+	value = String(value).toUpperCase();
+	warning = probeWarning(status, enabled);
+
+	if (!warning)
+		return value;
+
+	return E('div', { 'title': warning }, [
+		E('div', {}, value),
+		E('small', {
+			'style': 'display:block;color:#b00;white-space:nowrap'
+		}, [ '⚠ ', _('No probe replies') ])
+	]);
 }
 
 function reflectorList(values) {
@@ -149,12 +189,14 @@ function renderTable(sections, statuses) {
 	var children;
 
 	for (var i = 0; i < sections.length; i++) {
-		var section = sections[i]['.name'];
+		var sectionData = sections[i];
+		var section = sectionData['.name'];
 		var st = statuses[i] || {};
+		var enabled = String(sectionData.enabled || '0') === '1';
 
 		rows.push([
 			section,
-			formatState(st.state),
+			formatState(st, enabled),
 			st.updated_at ? new Date(st.updated_at * 1000).toLocaleString() : '-',
 			st.reflector || '-',
 			reflectorSummary(st),
