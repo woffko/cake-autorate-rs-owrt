@@ -337,6 +337,11 @@ tar -xzf cake-autorate-rs-1.0-rc1-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
 The installer resolves its own location, so it also works when the extracted
 bundle is kept in another directory.
 
+The archive is about 26 MiB and needs roughly 55 MiB of free space while both
+the archive and its extracted contents are present. If `/root/` is too small,
+use another writable filesystem (for example `/tmp/` when its tmpfs has enough
+RAM) for both commands instead.
+
 Optional speed test backends can be installed from LuCI or manually:
 
 ```sh
