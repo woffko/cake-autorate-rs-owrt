@@ -86,6 +86,9 @@ Implemented:
   bound to the selected uplink by default.
 - Automatic SQM rate import from an existing `/etc/config/sqm` queue for the
   selected interface when available.
+- Upstream-style max-wire packet compensation for OWD thresholds and achieved
+  rate monitor timing, using live interface MTU plus CAKE `atm/noatm overhead`
+  from `tc qdisc show`.
 - LuCI status page with start, restart, stop actions.
 
 Known limits:
