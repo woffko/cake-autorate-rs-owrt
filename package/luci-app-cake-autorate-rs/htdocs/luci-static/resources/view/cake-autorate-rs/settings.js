@@ -196,8 +196,10 @@ function value(section, tab, key, title, datatype, placeholder) {
 	o.rmempty = false;
 	if (datatype)
 		o.datatype = datatype;
-	if (placeholder != null)
+	if (placeholder != null) {
+		o.default = placeholder;
 		o.placeholder = placeholder;
+	}
 	return o;
 }
 
@@ -1955,6 +1957,20 @@ function addSetupOptions(section) {
 
 	o = flag(section, 'setup', 'sqm_enabled', _('Enable SQM'));
 	o.forcewrite = true;
+	o.onchange = function(ev, section_id, value) {
+		var enabled = value === '1' || value === true;
+
+		uci.set('cake-autorate', section_id, 'sqm_enabled', enabled ? '1' : '0');
+
+		if (enabled)
+			setCakeOption(this.section, section_id, 'manage_sqm', '1');
+	};
+	o.write = function(section_id, formvalue) {
+		uci.set('cake-autorate', section_id, 'sqm_enabled', formvalue);
+
+		if (formvalue === '1')
+			setCakeOption(this.section, section_id, 'manage_sqm', '1');
+	};
 
 	o = value(section, 'setup', 'sqm_download', _('Download speed'), 'and(uinteger,min(0))', '20000');
 	o.forcewrite = true;
@@ -2250,6 +2266,7 @@ function addReflectorOptions(section) {
 	modal(o);
 	describe(o, 'reflector');
 	o.datatype = 'host';
+	o.default = defaultReflectors();
 	o.rmempty = false;
 
 	o = section.taboption('reflectors', form.DynamicList, 'irtt_server', _('IRTT servers'));

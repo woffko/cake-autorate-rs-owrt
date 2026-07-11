@@ -66,6 +66,11 @@ Implemented:
   pinger/reflector planning behind the advanced settings toggle. Basic setup
   speed test actions still use the current unsaved interface and backend
   selections from the edit modal when those controls are available.
+- In the LuCI edit modal, enabling the basic `Enable SQM` toggle also enables
+  `Manage SQM` for that instance so the setup page can recover disabled
+  external/imported SQM queues without visiting advanced settings.
+- Required LuCI value/list fields use packaged defaults when older/incomplete
+  sections lack a key, while optional fields remain optional and empty.
 - LuCI Reflectors tab can check pinger backend availability and scan configured
   reflectors plus the upstream default anycast reflector pool, including RTT and
   ICMP timestamp capability, without adding hard dependencies. It shows RTT/OWD
