@@ -172,6 +172,7 @@ var optionDescriptions = {
 
 var interfaceContext = {
 	deviceNames: {},
+	deviceNetworks: {},
 	networkDevices: {},
 	defaultDevice: 'wan'
 };
@@ -264,6 +265,7 @@ function iface(section, tab, key, title) {
 function buildInterfaceContext(devices, networks) {
 	var ctx = {
 		deviceNames: {},
+		deviceNetworks: {},
 		networkDevices: {},
 		defaultDevice: null
 	};
@@ -296,6 +298,39 @@ function buildInterfaceContext(devices, networks) {
 
 		ctx.networkDevices[netName] = ifName;
 	}
+
+	function resolveNetworkDevice(name, seen) {
+		var mapped;
+
+		if (!name)
+			return name;
+
+		if (name.charAt(0) === '@')
+			name = name.substring(1);
+
+		seen = seen || {};
+		if (seen[name])
+			return name;
+		seen[name] = true;
+
+		mapped = ctx.networkDevices[name];
+		return mapped && mapped !== name ? resolveNetworkDevice(mapped, seen) : name;
+	}
+
+	for (var networkName in ctx.networkDevices) {
+		var deviceName = resolveNetworkDevice(ctx.networkDevices[networkName]);
+
+		if (!ctx.deviceNames[deviceName])
+			continue;
+
+		if (!ctx.deviceNetworks[deviceName])
+			ctx.deviceNetworks[deviceName] = [];
+
+		ctx.deviceNetworks[deviceName].push(networkName);
+	}
+
+	for (var device in ctx.deviceNetworks)
+		ctx.deviceNetworks[device].sort();
 
 	ctx.defaultDevice = ctx.networkDevices.wan ||
 		ctx.networkDevices.wwan ||
@@ -1330,6 +1365,18 @@ function targetInterfaceChoices() {
 	return choices;
 }
 
+function targetInterfaceLabel(name) {
+	var networks = interfaceContext.deviceNetworks[name] || [];
+
+	return networks.length ? '%s \u2014 %s'.format(name, networks.join(', ')) : name;
+}
+
+function targetInterfaceChoiceOptions() {
+	return targetInterfaceChoices().map(function(name) {
+		return [ name, targetInterfaceLabel(name) ];
+	});
+}
+
 function managedSqmSectionName(section_id) {
 	return 'cake_' + section_id;
 }
@@ -1552,7 +1599,6 @@ function replaceNodeContent(node, children) {
 }
 
 function showCreateWizard(grid, name) {
-	var choices = targetInterfaceChoices();
 	var defaultWan = defaultTargetInterface();
 	var state = {
 		name: name,
@@ -1630,7 +1676,7 @@ function showCreateWizard(grid, name) {
 	}
 
 	function renderInterfaceStep() {
-		var target = wizardSelect(choices, state.wan_if);
+		var target = wizardSelectOptions(targetInterfaceChoiceOptions(), state.wan_if);
 		var enabled = wizardCheckbox(state.enabled);
 		var sqmEnabled = wizardCheckbox(state.sqm_enabled);
 		var queueInfo = E('div', { 'class': 'cbi-value-dummy' }, wizardSqmQueueText(state));
@@ -1870,7 +1916,7 @@ function showCreateWizard(grid, name) {
 		var reflectors = (state.reflectors && state.reflectors.length) ? state.reflectors : defaultReflectors();
 		var activeCount = Math.min(parseInt(state.no_pingers || '6', 10), reflectors.length);
 		var rows = [
-			[ _('Target interface'), wan ],
+			[ _('Target interface'), targetInterfaceLabel(wan) ],
 			[ _('Autorate'), state.enabled ? _('enabled') : _('disabled') ],
 			[ _('SQM'), state.sqm_enabled ? _('enabled') : _('disabled') ],
 			[ _('SQM queue'), wizardSqmQueueText(state) ],

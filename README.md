@@ -4,6 +4,23 @@ OpenWrt package bundle for a Rust prototype of `cake-autorate` with a LuCI UI an
 
 The current target is OpenWrt 25.12.5 on `x86/64`. The daemon is intentionally kept small and currently uses only the Rust standard library plus OpenWrt userland tools.
 
+## Release 1.0 RC1
+
+`v1.0-rc1` provides these x86_64 OpenWrt 25.12.5 APKs:
+
+- `cake-autorate-rs-1.0_rc1-r1.apk` — the autorate daemon.
+- `luci-app-cake-autorate-rs-1.0_rc1-r1.apk` — the LuCI interface and SQM integration.
+
+The daemon package installs `uci` and `fping` as dependencies. The LuCI package
+installs the daemon, `luci-base`, and `sqm-scripts`; the latter brings the CAKE,
+IFB, `tc`, and `ip` runtime pieces. The wizard now labels a device with its
+logical OpenWrt networks, for example `eth1 — wan, wan6`, while continuing to
+save and use the physical device name.
+
+The release also includes an x86_64 offline bundle. Extract it under `/root/`
+and run its included installer; it installs the two project APKs together with
+their bundled dependencies from the local APK repository in `/root/packages/`.
+
 ## Repository Layout
 
 This repository is organized as an OpenWrt package feed/SDK overlay. Each package directory follows the OpenWrt package documentation layout:
@@ -290,17 +307,35 @@ CONFIG_PACKAGE_rust=m
 
 ## Install
 
-Copy the generated `.apk` files to the router and install them:
+Copy both generated x86_64 `.apk` files to the router and install them together:
 
 ```sh
-apk add --allow-untrusted /tmp/cake-autorate-rs-*.apk /tmp/luci-app-cake-autorate-rs-*.apk
+apk add --allow-untrusted \
+  /tmp/cake-autorate-rs-1.0_rc1-r1.apk \
+  /tmp/luci-app-cake-autorate-rs-1.0_rc1-r1.apk
 ```
 
-Install backend dependencies if they are not already present:
+`fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:
 
 ```sh
-apk add fping sqm-scripts
+# fping-ts uses the installed fping binary; no extra package is required
+apk add irtt  # also configure explicit IRTT servers and synchronized clocks
+# tsping is a compatible binary installed manually; ping is supplied by the base system
 ```
+
+### Offline install bundle
+
+For a router without access to the package feeds, copy the release bundle to
+`/root/`, then run:
+
+```sh
+cd /root
+tar -xzf cake-autorate-rs-1.0-rc1-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc1-x86_64.sh
+```
+
+The installer resolves its own location, so it also works when the extracted
+bundle is kept in another directory.
 
 Optional speed test backends can be installed from LuCI or manually:
 
