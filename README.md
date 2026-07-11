@@ -152,8 +152,8 @@ SQM integration:
   autorate.
 - Stopping `cake-autorate` also stops SQM runtime state for sections marked as
   managed by cake-autorate, leaving unrelated SQM queues alone.
-- Disabled `cake-autorate` sections do not mirror into SQM even when
-  `manage_sqm=1`; stale owned SQM sections are cleaned up instead.
+- Disabled sections and sections with `manage_sqm=0` do not mirror into SQM;
+  stale owned SQM sections are cleaned up instead.
 - Multiple interface/queue pairs are represented as multiple `cake_autorate`
   sections and shown in one compact LuCI grid.
 
