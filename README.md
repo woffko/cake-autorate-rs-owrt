@@ -69,6 +69,8 @@ Implemented:
 - In the LuCI edit modal, enabling the basic `Enable SQM` toggle also enables
   `Manage SQM` for that instance so the setup page can recover disabled
   external/imported SQM queues without visiting advanced settings.
+- `Manage SQM` defaults on to match the init-script default, and detailed SQM
+  queue/link-layer fields are hidden when the instance is not managing SQM.
 - Required LuCI value/list fields use packaged defaults when older/incomplete
   sections lack a key, while optional fields remain optional and empty.
 - LuCI Reflectors tab can check pinger backend availability and scan configured

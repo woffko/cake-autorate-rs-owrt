@@ -215,6 +215,18 @@ function optionalValue(section, tab, key, title, datatype, placeholder) {
 	return o;
 }
 
+function dependsManagedSqm(option, extra) {
+	var deps = { manage_sqm: '1' };
+	var extraDeps = extra || {};
+
+	for (var key in extraDeps)
+		if (extraDeps.hasOwnProperty(key))
+			deps[key] = extraDeps[key];
+
+	option.depends(deps);
+	return option;
+}
+
 function iface(section, tab, key, title) {
 	var o = section.taboption(tab, widgets.DeviceSelect, key, title);
 	modal(o);
@@ -2426,31 +2438,33 @@ function addAdvancedOptions(section) {
 function addSqmOptions(section, qdiscs, scripts) {
 	var o, seen;
 
-	o = flag(section, 'sqm_basic', 'manage_sqm', _('Manage SQM'));
+	o = flag(section, 'sqm_basic', 'manage_sqm', _('Manage SQM'), '1');
 	o.validate = function(section_id) {
 		return validateSqmSectionUnique(validationSection(this), section_id);
 	};
 
 	o = optionalValue(section, 'sqm_basic', 'sqm_section', _('SQM section'), 'uciname', '');
+	dependsManagedSqm(o);
 	o.validate = function(section_id) {
 		return validateSqmSectionUnique(validationSection(this), section_id);
 	};
 
 	o = iface(section, 'sqm_basic', 'sqm_interface', _('SQM interface'));
-	o.depends('auto_interface_preset', '0');
-	flag(section, 'sqm_basic', 'sqm_debug_logging', _('SQM debug logging'));
-	listValue(section, 'sqm_basic', 'sqm_verbosity', _('SQM log verbosity'), [
+	dependsManagedSqm(o, { auto_interface_preset: '0' });
+	dependsManagedSqm(flag(section, 'sqm_basic', 'sqm_debug_logging', _('SQM debug logging')));
+	dependsManagedSqm(listValue(section, 'sqm_basic', 'sqm_verbosity', _('SQM log verbosity'), [
 		[ '0', 'silent' ],
 		[ '1', 'error' ],
 		[ '2', 'warning' ],
 		[ '5', 'info' ],
 		[ '8', 'debug' ],
 		[ '10', 'trace' ]
-	], '5');
+	], '5'));
 
 	o = section.taboption('sqm_qdisc', form.ListValue, 'sqm_qdisc', _('Queueing discipline'));
 	modal(o);
 	describe(o, 'sqm_qdisc');
+	dependsManagedSqm(o);
 	seen = {};
 	addUniqueValue(o, seen, 'cake');
 	for (var i = 0; i < qdiscs.length; i++)
@@ -2461,6 +2475,7 @@ function addSqmOptions(section, qdiscs, scripts) {
 	o = section.taboption('sqm_qdisc', form.ListValue, 'sqm_script', _('Queue setup script'));
 	modal(o);
 	describe(o, 'sqm_script');
+	dependsManagedSqm(o);
 	seen = {};
 	addUniqueValue(o, seen, 'piece_of_cake.qos');
 	addUniqueValue(o, seen, 'cake.qos');
@@ -2470,68 +2485,72 @@ function addSqmOptions(section, qdiscs, scripts) {
 	o.rmempty = false;
 
 	o = flag(section, 'sqm_qdisc', 'sqm_qdisc_advanced', _('Advanced qdisc'));
+	dependsManagedSqm(o);
 
 	o = listValue(section, 'sqm_qdisc', 'sqm_squash_dscp', _('Squash DSCP'), [
 		[ '1', 'SQUASH' ],
 		[ '0', 'DO NOT SQUASH' ]
 	], '1');
-	o.depends('sqm_qdisc_advanced', '1');
+	dependsManagedSqm(o, { sqm_qdisc_advanced: '1' });
 
 	o = listValue(section, 'sqm_qdisc', 'sqm_squash_ingress', _('Ignore DSCP'), [
 		[ '1', 'Ignore' ],
 		[ '0', 'Allow' ]
 	], '1');
-	o.depends('sqm_qdisc_advanced', '1');
+	dependsManagedSqm(o, { sqm_qdisc_advanced: '1' });
 
 	o = listValue(section, 'sqm_qdisc', 'sqm_ingress_ecn', _('ECN ingress'), [ 'ECN', 'NOECN' ], 'ECN');
-	o.depends('sqm_qdisc_advanced', '1');
+	dependsManagedSqm(o, { sqm_qdisc_advanced: '1' });
 
 	o = listValue(section, 'sqm_qdisc', 'sqm_egress_ecn', _('ECN egress'), [ 'NOECN', 'ECN' ], 'NOECN');
-	o.depends('sqm_qdisc_advanced', '1');
+	dependsManagedSqm(o, { sqm_qdisc_advanced: '1' });
 
 	o = flag(section, 'sqm_qdisc', 'sqm_qdisc_really_really_advanced', _('Dangerous qdisc'));
-	o.depends('sqm_qdisc_advanced', '1');
+	dependsManagedSqm(o, { sqm_qdisc_advanced: '1' });
 
 	o = optionalValue(section, 'sqm_qdisc', 'sqm_ilimit', _('Hard queue limit ingress'), 'and(uinteger,min(0))', '');
-	o.depends('sqm_qdisc_really_really_advanced', '1');
+	dependsManagedSqm(o, { sqm_qdisc_advanced: '1', sqm_qdisc_really_really_advanced: '1' });
 
 	o = optionalValue(section, 'sqm_qdisc', 'sqm_elimit', _('Hard queue limit egress'), 'and(uinteger,min(0))', '');
-	o.depends('sqm_qdisc_really_really_advanced', '1');
+	dependsManagedSqm(o, { sqm_qdisc_advanced: '1', sqm_qdisc_really_really_advanced: '1' });
 
 	o = optionalValue(section, 'sqm_qdisc', 'sqm_itarget', _('Latency target ingress'), 'string', '');
-	o.depends('sqm_qdisc_really_really_advanced', '1');
+	dependsManagedSqm(o, { sqm_qdisc_advanced: '1', sqm_qdisc_really_really_advanced: '1' });
 
 	o = optionalValue(section, 'sqm_qdisc', 'sqm_etarget', _('Latency target egress'), 'string', '');
-	o.depends('sqm_qdisc_really_really_advanced', '1');
+	dependsManagedSqm(o, { sqm_qdisc_advanced: '1', sqm_qdisc_really_really_advanced: '1' });
 
 	o = optionalValue(section, 'sqm_qdisc', 'sqm_iqdisc_opts', _('Qdisc options ingress'), 'string', '');
-	o.depends('sqm_qdisc_really_really_advanced', '1');
+	dependsManagedSqm(o, { sqm_qdisc_advanced: '1', sqm_qdisc_really_really_advanced: '1' });
 
 	o = optionalValue(section, 'sqm_qdisc', 'sqm_eqdisc_opts', _('Qdisc options egress'), 'string', '');
-	o.depends('sqm_qdisc_really_really_advanced', '1');
+	dependsManagedSqm(o, { sqm_qdisc_advanced: '1', sqm_qdisc_really_really_advanced: '1' });
 
-	listValue(section, 'sqm_linklayer', 'sqm_linklayer', _('Link layer'), [
+	dependsManagedSqm(listValue(section, 'sqm_linklayer', 'sqm_linklayer', _('Link layer'), [
 		[ 'none', 'none' ],
 		[ 'ethernet', 'ethernet' ],
 		[ 'atm', 'atm' ]
-	], 'none');
+	], 'none'));
 
 	o = value(section, 'sqm_linklayer', 'sqm_overhead', _('Per packet overhead'), 'and(integer,min(-1500))', '0');
-	o.depends('sqm_linklayer', 'ethernet');
-	o.depends('sqm_linklayer', 'atm');
+	dependsManagedSqm(o, { sqm_linklayer: 'ethernet' });
+	dependsManagedSqm(o, { sqm_linklayer: 'atm' });
 
 	o = flag(section, 'sqm_linklayer', 'sqm_linklayer_advanced', _('Advanced link layer'));
-	o.depends('sqm_linklayer', 'ethernet');
-	o.depends('sqm_linklayer', 'atm');
+	dependsManagedSqm(o, { sqm_linklayer: 'ethernet' });
+	dependsManagedSqm(o, { sqm_linklayer: 'atm' });
 
 	o = value(section, 'sqm_linklayer', 'sqm_tcMTU', _('Maximum packet size'), 'and(uinteger,min(0))', '2047');
-	o.depends('sqm_linklayer_advanced', '1');
+	dependsManagedSqm(o, { sqm_linklayer: 'ethernet', sqm_linklayer_advanced: '1' });
+	dependsManagedSqm(o, { sqm_linklayer: 'atm', sqm_linklayer_advanced: '1' });
 
 	o = value(section, 'sqm_linklayer', 'sqm_tcTSIZE', _('Rate table size'), 'and(uinteger,min(0))', '128');
-	o.depends('sqm_linklayer_advanced', '1');
+	dependsManagedSqm(o, { sqm_linklayer: 'ethernet', sqm_linklayer_advanced: '1' });
+	dependsManagedSqm(o, { sqm_linklayer: 'atm', sqm_linklayer_advanced: '1' });
 
 	o = value(section, 'sqm_linklayer', 'sqm_tcMPU', _('Minimum packet size'), 'and(uinteger,min(0))', '0');
-	o.depends('sqm_linklayer_advanced', '1');
+	dependsManagedSqm(o, { sqm_linklayer: 'ethernet', sqm_linklayer_advanced: '1' });
+	dependsManagedSqm(o, { sqm_linklayer: 'atm', sqm_linklayer_advanced: '1' });
 
 	o = listValue(section, 'sqm_linklayer', 'sqm_linklayer_adaptation_mechanism', _('Link layer mechanism'), [
 		'default',
@@ -2539,7 +2558,8 @@ function addSqmOptions(section, qdiscs, scripts) {
 		'htb_private',
 		'tc_stab'
 	], 'default');
-	o.depends('sqm_linklayer_advanced', '1');
+	dependsManagedSqm(o, { sqm_linklayer: 'ethernet', sqm_linklayer_advanced: '1' });
+	dependsManagedSqm(o, { sqm_linklayer: 'atm', sqm_linklayer_advanced: '1' });
 }
 
 function addSummaryColumns(section) {
