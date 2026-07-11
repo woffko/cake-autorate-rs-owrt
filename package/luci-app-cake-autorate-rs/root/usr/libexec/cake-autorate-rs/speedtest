@@ -4,6 +4,7 @@ section="$1"
 target_if_override="$2"
 mode="$3"
 backend_override="$4"
+job_key_override="$5"
 
 if [ "$section" = "--status" ] || [ "$section" = "status" ]; then
 	section=""
@@ -70,6 +71,10 @@ bits_to_kbps() {
 
 bytes_per_second_to_kbps() {
 	awk -v value="$1" 'BEGIN { if (value + 0 > 0) printf "%.0f", value * 8 / 1000 }'
+}
+
+upload_exceeds_download_sanity_ratio() {
+	awk -v download="$1" -v upload="$2" 'BEGIN { exit !(download > 0 && upload > download * 1.5) }'
 }
 
 mbps_to_kbps() {
@@ -524,6 +529,9 @@ reset_result() {
 	upload_elapsed="0.00"
 	source=""
 	backend=""
+	test_server_id=""
+	test_server_name=""
+	test_server_sponsor=""
 	bind_mode="none"
 }
 
@@ -685,15 +693,101 @@ run_librespeed_cli() {
 	[ -n "$download_kbps" ]
 }
 
-run_speedtest_go() {
-	local start stop dl_bytes_per_s ul_bytes_per_s source_ip value
+speedtest_go_cache_file() {
+	[ -n "$section" ] && safe_uci_name "$section" || return 1
+	printf '%s/%s.speedtest-go-server\n' "$speedtest_job_dir" "$section"
+}
 
-	backend_available "speedtest-go" || return 1
+speedtest_go_cached_server() {
+	local cache_file cached_server
+
+	cache_file="$(speedtest_go_cache_file)" || return 0
+	cached_server="$(sed -n '1p' "$cache_file" 2>/dev/null)"
+	is_positive_uint "$cached_server" && printf '%s\n' "$cached_server"
+}
+
+speedtest_go_cache_server() {
+	local server_id="$1" cache_file
+
+	is_positive_uint "$server_id" || return 0
+	cache_file="$(speedtest_go_cache_file)" || return 0
+	mkdir -p "$speedtest_job_dir" 2>/dev/null || return 0
+	chmod 700 "$speedtest_job_dir" 2>/dev/null || true
+	printf '%s\n' "$server_id" > "$cache_file"
+}
+
+speedtest_go_clear_cached_server() {
+	local cache_file
+
+	cache_file="$(speedtest_go_cache_file)" || return 0
+	rm -f "$cache_file"
+}
+
+speedtest_go_result_is_plausible() {
+	is_positive_uint "$download_kbps" || return 1
+
+	if is_positive_uint "$upload_kbps" &&
+		upload_exceeds_download_sanity_ratio "$download_kbps" "$upload_kbps"; then
+		return 1
+	fi
+
+	return 0
+}
+
+speedtest_go_save_bad_result() {
+	speedtest_go_bad_download_kbps="$download_kbps"
+	speedtest_go_bad_upload_kbps="$upload_kbps"
+	speedtest_go_bad_download_elapsed="$download_elapsed"
+	speedtest_go_bad_upload_elapsed="$upload_elapsed"
+	speedtest_go_bad_server_id="$test_server_id"
+	speedtest_go_bad_server_name="$test_server_name"
+	speedtest_go_bad_server_sponsor="$test_server_sponsor"
+}
+
+speedtest_go_restore_bad_result() {
+	download_kbps="$speedtest_go_bad_download_kbps"
+	upload_kbps="$speedtest_go_bad_upload_kbps"
+	download_elapsed="$speedtest_go_bad_download_elapsed"
+	upload_elapsed="$speedtest_go_bad_upload_elapsed"
+	test_server_id="$speedtest_go_bad_server_id"
+	test_server_name="$speedtest_go_bad_server_name"
+	test_server_sponsor="$speedtest_go_bad_server_sponsor"
+	download_size="0"
+	upload_size="0"
+}
+
+speedtest_go_candidate_ids() {
+	local list_file source_ip
+
+	list_file="/tmp/cake-autorate-speedtest-go-servers.$$"
+	set -- "$speedtest_go_bin" --list --ping-mode http
+
+	if bool_enabled "$bind_interface_enabled" && [ -n "$target_if" ]; then
+		source_ip="$(source_ip_for_interface "$target_if")"
+		[ -n "$source_ip" ] && set -- "$@" --source "$source_ip" --dns-bind-source
+	fi
+
+	if ! "$@" > "$list_file" 2>/dev/null; then
+		rm -f "$list_file"
+		return 1
+	fi
+
+	sed -n 's/^\[[[:space:]]*\([0-9][0-9]*\)\][[:space:]]*[0-9.][0-9.]*km[[:space:]]*\([0-9][0-9]*\)ms.*/\2 \1/p' "$list_file" |
+		sort -n | awk '{ print $2 }'
+	rm -f "$list_file"
+}
+
+run_speedtest_go_once() {
+	local server_id="$1" start stop dl_bytes_per_s ul_bytes_per_s source_ip value
+
 	reset_result
 	backend="speedtest-go"
 	source="speedtest-go"
 
 	set -- "$speedtest_go_bin" --json --ping-mode http
+	if is_positive_uint "$server_id"; then
+		set -- "$@" --server "$server_id"
+	fi
 
 	if is_uint "$upload_bytes" && [ "$upload_bytes" -eq 0 ]; then
 		set -- "$@" --no-upload
@@ -723,6 +817,9 @@ run_speedtest_go() {
 	upload_elapsed="$download_elapsed"
 	dl_bytes_per_s="$(json_first_file "$tmp_response" '@.servers[0].dl_speed' '@.servers[*].dl_speed' '@.server.dl_speed' '@.dl_speed')"
 	ul_bytes_per_s="$(json_first_file "$tmp_response" '@.servers[0].ul_speed' '@.servers[*].ul_speed' '@.server.ul_speed' '@.ul_speed')"
+	test_server_id="$(json_first_file "$tmp_response" '@.servers[0].id' '@.server.id')"
+	test_server_name="$(json_first_file "$tmp_response" '@.servers[0].name' '@.server.name')"
+	test_server_sponsor="$(json_first_file "$tmp_response" '@.servers[0].sponsor' '@.server.sponsor')"
 
 	download_kbps="$(bytes_per_second_to_kbps "$dl_bytes_per_s")"
 	if [ -n "$ul_bytes_per_s" ]; then
@@ -734,6 +831,79 @@ run_speedtest_go() {
 	upload_size="0"
 
 	[ -n "$download_kbps" ]
+}
+
+run_speedtest_go() {
+	local cached_server candidate_ids candidate_id attempts rejected_server max_attempts
+
+	backend_available "speedtest-go" || return 1
+
+	if is_positive_uint "$speedtest_go_server_id"; then
+		run_speedtest_go_once "$speedtest_go_server_id"
+		return $?
+	fi
+
+	speedtest_go_bad_download_kbps=""
+	speedtest_go_bad_upload_kbps=""
+	speedtest_go_bad_download_elapsed=""
+	speedtest_go_bad_upload_elapsed=""
+	speedtest_go_bad_server_id=""
+	speedtest_go_bad_server_name=""
+	speedtest_go_bad_server_sponsor=""
+	max_attempts=3
+	cached_server="$(speedtest_go_cached_server)"
+
+	if is_positive_uint "$cached_server"; then
+		if run_speedtest_go_once "$cached_server" && speedtest_go_result_is_plausible; then
+			return 0
+		fi
+
+		append_warning "speedtest-go cached server ID $cached_server failed validation; automatic selection will retry."
+		speedtest_go_clear_cached_server
+	fi
+
+	candidate_ids="$(speedtest_go_candidate_ids)"
+	if [ -z "$candidate_ids" ]; then
+		append_warning "speedtest-go could not list nearby servers; using its default automatic selection."
+		if run_speedtest_go_once ""; then
+			if speedtest_go_result_is_plausible; then
+				speedtest_go_cache_server "$test_server_id"
+				return 0
+			fi
+			speedtest_go_save_bad_result
+		fi
+	else
+		attempts=0
+		for candidate_id in $candidate_ids; do
+			[ "$attempts" -lt "$max_attempts" ] || break
+			[ "$candidate_id" = "$cached_server" ] && continue
+			attempts=$((attempts + 1))
+
+			if ! run_speedtest_go_once "$candidate_id"; then
+				continue
+			fi
+
+			if speedtest_go_result_is_plausible; then
+				speedtest_go_cache_server "$test_server_id"
+				if [ -n "$rejected_server" ]; then
+					append_warning "speedtest-go rejected automatic server $rejected_server after an implausible upload result and selected ${test_server_sponsor:-server} (ID ${test_server_id:-$candidate_id}); this server will be reused while it validates."
+				fi
+				return 0
+			fi
+
+			rejected_server="${test_server_sponsor:-server} (ID ${test_server_id:-$candidate_id})"
+			speedtest_go_save_bad_result
+		done
+	fi
+
+	if is_positive_uint "$speedtest_go_bad_download_kbps"; then
+		speedtest_go_restore_bad_result
+		upload_kbps="null"
+		append_warning "speedtest-go automatic server selection reported upload more than 150% of download; upload rate was left unchanged. Pin a server ID if this persists."
+		return 0
+	fi
+
+	return 1
 }
 
 run_iperf3_one() {
@@ -807,7 +977,7 @@ run_iperf3() {
 }
 
 emit_result() {
-	printf '{"download_kbps":%s,"upload_kbps":%s,"download_bytes":%s,"upload_bytes":%s,"download_elapsed_s":%s,"upload_elapsed_s":%s,"source":"%s","backend":"%s","backend_title":"%s","bind_mode":"%s","target_interface":"%s","route_interface":"%s","shaper_bypassed":%s,"autorate_paused":%s,"sqm_paused":%s,"warning":"%s"}\n' \
+	printf '{"download_kbps":%s,"upload_kbps":%s,"download_bytes":%s,"upload_bytes":%s,"download_elapsed_s":%s,"upload_elapsed_s":%s,"source":"%s","backend":"%s","backend_title":"%s","server_id":"%s","server_name":"%s","server_sponsor":"%s","bind_mode":"%s","target_interface":"%s","route_interface":"%s","shaper_bypassed":%s,"autorate_paused":%s,"sqm_paused":%s,"warning":"%s"}\n' \
 		"$download_kbps" \
 		"$upload_kbps" \
 		"$download_size" \
@@ -817,6 +987,9 @@ emit_result() {
 		"$(json_escape "$source")" \
 		"$(json_escape "$backend")" \
 		"$(json_escape "$(backend_title "$backend")")" \
+		"$(json_escape "$test_server_id")" \
+		"$(json_escape "$test_server_name")" \
+		"$(json_escape "$test_server_sponsor")" \
 		"$(json_escape "$bind_mode")" \
 		"$(json_escape "$target_if")" \
 		"$(json_escape "$route_if")" \
@@ -890,6 +1063,97 @@ run_preferred_backend() {
 	json_error "$(backend_title "$preferred_backend") backend failed"
 }
 
+speedtest_job_dir="/tmp/cake-autorate-speedtest"
+
+speedtest_job_paths() {
+	job_key="$1"
+	job_pid_file="$speedtest_job_dir/$job_key.pid"
+	job_result_file="$speedtest_job_dir/$job_key.result"
+	job_error_file="$speedtest_job_dir/$job_key.error"
+	job_work_file="$speedtest_job_dir/$job_key.work"
+	job_stderr_file="$speedtest_job_dir/$job_key.stderr"
+	job_log_file="$speedtest_job_dir/$job_key.log"
+}
+
+speedtest_job_start() {
+	local setsid_bin
+
+	job_key="$section"
+	safe_uci_name "$job_key" || json_error "Invalid speed test job name."
+	setsid_bin="$(command_path setsid)"
+	[ -n "$setsid_bin" ] || json_error "The setsid command is required to run speed tests safely."
+	mkdir -p "$speedtest_job_dir" || json_error "Unable to create speed test job directory."
+	chmod 700 "$speedtest_job_dir" 2>/dev/null || true
+	speedtest_job_paths "$job_key"
+
+	if [ -f "$job_pid_file" ]; then
+		job_pid="$(cat "$job_pid_file" 2>/dev/null)"
+		if is_positive_uint "$job_pid" && kill -0 "$job_pid" 2>/dev/null; then
+			printf '{"state":"running","job_id":"%s"}\n' "$(json_escape "$job_key")"
+			return 0
+		fi
+	fi
+
+	rm -f "$job_pid_file" "$job_result_file" "$job_error_file" "$job_work_file" "$job_stderr_file" "$job_log_file"
+	"$setsid_bin" "$0" "$section" "$target_if_override" job-run "$preferred_backend" "$job_key" \
+		</dev/null >"$job_log_file" 2>&1 &
+	job_pid="$!"
+	printf '%s\n' "$job_pid" > "$job_pid_file"
+	printf '{"state":"running","job_id":"%s"}\n' "$(json_escape "$job_key")"
+}
+
+speedtest_job_run() {
+	job_key="$1"
+	safe_uci_name "$job_key" || exit 1
+	mkdir -p "$speedtest_job_dir" || exit 1
+	speedtest_job_paths "$job_key"
+
+	"$0" "$section" "$target_if_override" run "$preferred_backend" >"$job_work_file" 2>"$job_stderr_file"
+	job_rc="$?"
+
+	if [ "$job_rc" -eq 0 ] && [ -s "$job_work_file" ]; then
+		mv "$job_work_file" "$job_result_file"
+		rm -f "$job_stderr_file"
+	else
+		if [ -s "$job_work_file" ]; then
+			mv "$job_work_file" "$job_error_file"
+		elif [ -s "$job_stderr_file" ]; then
+			printf '{"error":"%s"}\n' "$(json_escape "$(sed -n '1p' "$job_stderr_file")")" > "$job_error_file"
+		else
+			printf '{"error":"Speed test job failed."}\n' > "$job_error_file"
+		fi
+		rm -f "$job_work_file"
+	fi
+
+	rm -f "$job_pid_file"
+}
+
+speedtest_job_status() {
+	job_key="$section"
+	safe_uci_name "$job_key" || json_error "Invalid speed test job name."
+	speedtest_job_paths "$job_key"
+
+	if [ -s "$job_result_file" ]; then
+		cat "$job_result_file"
+		return 0
+	fi
+
+	if [ -s "$job_error_file" ]; then
+		cat "$job_error_file"
+		return 0
+	fi
+
+	if [ -f "$job_pid_file" ]; then
+		job_pid="$(cat "$job_pid_file" 2>/dev/null)"
+		if is_positive_uint "$job_pid" && kill -0 "$job_pid" 2>/dev/null; then
+			printf '{"state":"running","job_id":"%s"}\n' "$(json_escape "$job_key")"
+			return 0
+		fi
+	fi
+
+	printf '{"error":"Speed test job is not running."}\n'
+}
+
 warning=""
 refresh_backend_bins
 
@@ -905,6 +1169,7 @@ force_ipv4_enabled="$(uci_get speedtest_force_ipv4)"
 route_probe="$(uci_get speedtest_route_probe)"
 iperf3_server="$(uci_get speedtest_iperf3_server)"
 iperf3_port="$(uci_get speedtest_iperf3_port)"
+speedtest_go_server_id="$(uci_get speedtest_go_server_id)"
 preferred_backend="$(uci_get speedtest_backend)"
 
 [ -n "$upload_retry_bytes" ] || upload_retry_bytes="$upload_retry_bytes_default"
@@ -946,6 +1211,21 @@ fi
 if [ "$mode" = "install" ]; then
 	backend_install_json "$preferred_backend"
 	exit 0
+fi
+
+if [ "$mode" = "job-start" ]; then
+	speedtest_job_start
+	exit $?
+fi
+
+if [ "$mode" = "job-status" ]; then
+	speedtest_job_status
+	exit $?
+fi
+
+if [ "$mode" = "job-run" ]; then
+	speedtest_job_run "$job_key_override"
+	exit $?
 fi
 
 tmp_download="/tmp/cake-autorate-speedtest-download.$$"

@@ -193,6 +193,17 @@ function renderTable(sections, statuses) {
 		var section = sectionData['.name'];
 		var st = statuses[i] || {};
 		var enabled = String(sectionData.enabled || '0') === '1';
+		var disabledRow;
+
+		if (!enabled) {
+			disabledRow = [
+				section,
+				_('DISABLED'),
+				'-', '-', '-', '-', '-', '-', '-', '-', '-'
+			];
+			rows.push(disabledRow);
+			continue;
+		}
 
 		rows.push([
 			section,

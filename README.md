@@ -118,9 +118,20 @@ Implemented:
 - LuCI setup tab keeps the normal path to target interface, SQM enable,
   download/upload rates, and one-click speed testing. Explicit upstream
   min/base/max controls remain available in advanced manual-rate mode.
+- Basic setup uses one `Enable autorate` control for both autorate and its
+  managed SQM queue. Advanced users can disable `Manage SQM` only when they
+  maintain a separate enabled SQM queue themselves.
 - Router-side speed test helper with optional backend autodetection:
   `librespeed-cli`, `speedtest-go`, configured `iperf3`, then built-in HTTP
-  fallback. Optional backend packages are not hard dependencies.
+  fallback. Long-running tests are executed as a short-lived LuCI job and
+  polled by the browser, so they are not killed by rpcd's command timeout.
+  `speedtest-go` automatically tries nearby servers, rejects an implausibly
+  asymmetric automatic result, and caches the first validated server per
+  instance; entering a server ID pins the test to that Ookla server. Optional
+  backend packages are not hard dependencies.
+- Disabled instances are shown as `DISABLED` in LuCI and do not display stale
+  runtime counters; the init script removes stale status samples after a
+  service stop.
 - Integrated SQM backend sync: each `cake-autorate` UCI section can own a matching
   `sqm` queue section.
 - Optional MQTT publisher service: per-instance MQTT export reads daemon

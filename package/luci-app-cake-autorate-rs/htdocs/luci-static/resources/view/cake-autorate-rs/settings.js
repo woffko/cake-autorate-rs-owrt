@@ -12,12 +12,11 @@ function modal(option) {
 }
 
 var optionDescriptions = {
-	enabled: 'Start the autorate daemon for this instance when the service runs.',
+	enabled: 'Start autorate and its managed SQM queue together for this instance.',
 	adjust_dl_shaper_rate: 'Allow autorate to change the download CAKE bandwidth.',
 	adjust_ul_shaper_rate: 'Allow autorate to change the upload CAKE bandwidth.',
 	wan_if: 'Main WAN interface for this instance. Auto preset also uses it for SQM and IFB setup.',
 	auto_interface_preset: 'Automatically derive SQM interface, upload interface, and download IFB from the target interface.',
-	sqm_enabled: 'Enable the matching SQM queue managed by this instance.',
 	sqm_download: 'SQM download bandwidth in kbit/s. This also seeds the autorate base and max download rates.',
 	sqm_upload: 'SQM upload bandwidth in kbit/s. This also seeds the autorate base and max upload rates.',
 	speedtest_apply_percent: 'Percentage of measured throughput to write into SQM and autorate limits. 90 leaves headroom for CAKE.',
@@ -32,6 +31,7 @@ var optionDescriptions = {
 	speedtest_upload_retry_bytes: 'Space-separated smaller upload payload sizes to try if the initial upload test fails.',
 	speedtest_timeout_s: 'Per-request timeout for built-in speed test download and upload requests.',
 	speedtest_backend: 'Speed test backend preference. Auto tries optional CLI backends first and falls back to the built-in HTTP test. A forced backend must be installed and configured.',
+	speedtest_go_server_id: 'Optional speedtest-go server ID. Leave empty to automatically validate nearby servers and reuse the first good one; set an ID to pin a known-good server.',
 	speedtest_duration_s: 'Test duration in seconds for optional CLI backends that support a duration setting.',
 	speedtest_iperf3_server: 'Optional iperf3 server host or address. iperf3 is only used when this is set and the iperf3 package is installed.',
 	speedtest_iperf3_port: 'Optional iperf3 server port. Leave empty to use the iperf3 default.',
@@ -721,7 +721,7 @@ function validateInterfaceBacking(section, section_id) {
 	if (hasEnabledSqmBacking(section, section_id))
 		return true;
 
-	return _('Auto SQM preset uses an IFB download interface. Enable SQM for this instance or use an already enabled SQM queue before enabling autorate.');
+	return _('Autorate requires an enabled external SQM queue when Manage SQM is disabled.');
 }
 
 function validateInstanceSection(section, section_id) {
@@ -897,18 +897,15 @@ function applyWanPreset(section_id, wan_if, importRates, section) {
 		applyRatePreset(section_id, wan_if, true, section);
 }
 
-function maybeEnableSqmForAutoPreset(section, section_id, enabledOverride) {
+function syncManagedSqmEnabled(section, section_id, enabledOverride) {
 	var enabled = enabledOverride != null ?
 		(enabledOverride === true || enabledOverride === '1') :
 		checkedFormOrUci(section, section_id, 'enabled', false);
 
-	if (!enabled ||
-	    !autoInterfacePresetEnabled(section, section_id) ||
-	    !checkedFormOrUci(section, section_id, 'manage_sqm', true))
+	if (!checkedFormOrUci(section, section_id, 'manage_sqm', true))
 		return;
 
-	setCakeOption(section, section_id, 'manage_sqm', '1');
-	setCakeOption(section, section_id, 'sqm_enabled', '1');
+	setCakeOption(section, section_id, 'sqm_enabled', enabled ? '1' : '0');
 }
 
 function speedtestApplyPercent(section, section_id) {
@@ -950,6 +947,23 @@ function speedtestBackendTitle(result) {
 	return result.backend_title || result.backend || result.source || _('selected backend');
 }
 
+function speedtestServerTitle(result) {
+	var parts = [];
+
+	if (!result)
+		return '';
+
+	if (result.server_sponsor)
+		parts.push(result.server_sponsor);
+	else if (result.server_name)
+		parts.push(result.server_name);
+
+	if (result.server_id)
+		parts.push('#' + result.server_id);
+
+	return parts.join(' ');
+}
+
 function speedtestBackendChoices() {
 	return [
 		[ 'auto', _('Auto') ],
@@ -989,6 +1003,8 @@ function speedtestSummaryText(backend, percent, dl, ul, last) {
 		lines.push(_('Last measured: %s using %s.').format(
 			speedtestRateText(last.result.download_kbps, last.result.upload_kbps),
 			speedtestBackendTitle(last.result)));
+		if (speedtestServerTitle(last.result))
+			lines.push(_('Test server: %s.').format(speedtestServerTitle(last.result)));
 		lines.push(_('Last applied: %s.').format(speedtestRateText(last.applied && last.applied.dl, last.applied && last.applied.ul)));
 
 		if (last.result.shaper_bypassed)
@@ -1066,6 +1082,47 @@ function withSpeedtestRpcTimeout(callback) {
 	}, function(err) {
 		L.env.rpctimeout = previous;
 		throw err;
+	});
+}
+
+function speedtestJobDelay() {
+	return new Promise(function(resolve) {
+		window.setTimeout(resolve, 1000);
+	});
+}
+
+function runSpeedtestJob(section_id, wan, backend, onProgress) {
+	var command = '/usr/libexec/cake-autorate-rs/speedtest';
+
+	return fs.exec(command, [ section_id, wan, 'job-start', backend ]).then(function(res) {
+		var started = parseExecJson(res);
+
+		if (started.error)
+			throw new Error(started.error);
+
+		if (started.state !== 'running')
+			throw new Error(_('Unable to start the speed test job.'));
+
+		var poll = function() {
+			return speedtestJobDelay().then(function() {
+				return fs.exec(command, [ section_id, wan, 'job-status', backend ]);
+			}).then(function(status) {
+				var result = parseExecJson(status);
+
+				if (result.state === 'running') {
+					if (onProgress)
+						onProgress(result);
+					return poll();
+				}
+
+				if (result.error)
+					throw new Error(result.error);
+
+				return { stdout: JSON.stringify(result) };
+			});
+		};
+
+		return poll();
 	});
 }
 
@@ -1494,8 +1551,12 @@ function writeWizardConfig(section_id, state) {
 	uci.set('cake-autorate', section_id, 'adjust_ul_shaper_rate', '1');
 	uci.set('cake-autorate', section_id, 'manage_sqm', '1');
 	uci.set('cake-autorate', section_id, 'sqm_section', sqmSection);
-	uci.set('cake-autorate', section_id, 'sqm_enabled', state.sqm_enabled ? '1' : '0');
+	uci.set('cake-autorate', section_id, 'sqm_enabled', state.enabled ? '1' : '0');
 	uci.set('cake-autorate', section_id, 'speedtest_backend', state.speedtest_backend || 'auto');
+	if (state.speedtest_go_server_id)
+		uci.set('cake-autorate', section_id, 'speedtest_go_server_id', state.speedtest_go_server_id);
+	else
+		uci.unset('cake-autorate', section_id, 'speedtest_go_server_id');
 	uci.set('cake-autorate', section_id, 'speedtest_apply_percent', String(state.speedtest_apply_percent || '90'));
 	uci.set('cake-autorate', section_id, 'pinger_method', state.pinger_method || 'fping');
 	uci.set('cake-autorate', section_id, 'no_pingers', String(state.no_pingers || '6'));
@@ -1607,6 +1668,7 @@ function showCreateWizard(grid, name) {
 		enabled: false,
 		sqm_enabled: false,
 		speedtest_backend: 'auto',
+		speedtest_go_server_id: '',
 		speedtest_apply_percent: '90',
 		advanced_test_options: false,
 		pinger_method: 'fping',
@@ -1678,7 +1740,6 @@ function showCreateWizard(grid, name) {
 	function renderInterfaceStep() {
 		var target = wizardSelectOptions(targetInterfaceChoiceOptions(), state.wan_if);
 		var enabled = wizardCheckbox(state.enabled);
-		var sqmEnabled = wizardCheckbox(state.sqm_enabled);
 		var queueInfo = E('div', { 'class': 'cbi-value-dummy' }, wizardSqmQueueText(state));
 
 		target.addEventListener('change', function() {
@@ -1686,31 +1747,23 @@ function showCreateWizard(grid, name) {
 			state.ping_extra_args = pingerInterfaceArgs(state.wan_if, state.pinger_method || 'fping');
 			syncSqmForInterface();
 			queueInfo.textContent = wizardSqmQueueText(state);
-			sqmEnabled.checked = state.sqm_enabled;
 		});
 
 		enabled.addEventListener('change', function() {
 			state.enabled = enabled.checked;
-			if (state.enabled && !state.sqm_enabled) {
-				state.sqm_enabled = true;
-				sqmEnabled.checked = true;
-			}
-		});
-
-		sqmEnabled.addEventListener('change', function() {
-			state.sqm_enabled = sqmEnabled.checked;
+			state.sqm_enabled = state.enabled;
 		});
 
 		return [
 			wizardField(_('Target interface'), target, optionDescriptions.wan_if),
 			wizardField(_('SQM queue'), queueInfo, optionDescriptions._wizard_sqm_queue),
-			wizardField(_('Enable autorate'), enabled, optionDescriptions.enabled),
-			wizardField(_('Enable SQM'), sqmEnabled, optionDescriptions.sqm_enabled)
+			wizardField(_('Enable autorate'), enabled, optionDescriptions.enabled)
 		];
 	}
 
 	function renderSpeedStep() {
 		var backend = wizardSelectOptions(speedtestBackendChoices(), state.speedtest_backend);
+		var speedtestGoServerId = wizardTextInput(state.speedtest_go_server_id, 'uinteger');
 		var percent = wizardTextInput(state.speedtest_apply_percent, 'and(uinteger,min(1),max(100))');
 		var download = wizardTextInput(state.sqm_download, 'uinteger');
 		var upload = wizardTextInput(state.sqm_upload, 'uinteger');
@@ -1725,6 +1778,7 @@ function showCreateWizard(grid, name) {
 		var pingerStatus = E('pre', { 'style': 'white-space:pre-wrap;margin:6px 0 0 0' }, '');
 		var syncInputs = function() {
 			state.speedtest_backend = backend.value || 'auto';
+			state.speedtest_go_server_id = speedtestGoServerId.value.trim();
 			state.speedtest_apply_percent = percent.value || '90';
 			state.advanced_test_options = advancedOptions.checked;
 			state.sqm_download = download.value;
@@ -1810,13 +1864,8 @@ function showCreateWizard(grid, name) {
 				runButton.disabled = true;
 				status.textContent = _('Running speed test...');
 
-				withSpeedtestRpcTimeout(function() {
-					return fs.exec('/usr/libexec/cake-autorate-rs/speedtest', [
-						state.name,
-						state.wan_if,
-						'run',
-						state.speedtest_backend
-					]);
+				runSpeedtestJob(state.name, state.wan_if, state.speedtest_backend, function() {
+					status.textContent = _('Running speed test...');
 				}).then(function(res) {
 					var result = parseSpeedtestResult(res.stdout);
 					var dl = measuredRate(result.download_kbps, pct);
@@ -1886,6 +1935,8 @@ function showCreateWizard(grid, name) {
 			updateSummary();
 			updateAdvancedVisibility();
 		});
+		speedtestGoServerId.addEventListener('input', syncInputs);
+		speedtestGoServerId.addEventListener('change', syncInputs);
 		advancedOptions.addEventListener('change', updateAdvancedVisibility);
 		percent.addEventListener('input', function() { syncInputs(); updateSummary(); });
 		percent.addEventListener('change', function() { syncInputs(); updateSummary(); });
@@ -1895,6 +1946,7 @@ function showCreateWizard(grid, name) {
 		upload.addEventListener('change', function() { syncInputs(); updateSummary(); });
 		advancedFields = [
 			wizardField(_('Preferred backend'), backend, optionDescriptions.speedtest_backend),
+			wizardField(_('speedtest-go server ID'), speedtestGoServerId, optionDescriptions.speedtest_go_server_id),
 			wizardField(_('Check backends'), E('div', {}, [ checkButton, ' ', installButton, backendStatus ]), optionDescriptions._speedtest_backend_status),
 			wizardField(_('Speed test apply percent'), percent, optionDescriptions.speedtest_apply_percent),
 			wizardField(_('Reflector plan'), E('div', {}, [ scanReflectorsButton, pingerStatus ]), optionDescriptions._wizard_reflector_plan)
@@ -1917,8 +1969,7 @@ function showCreateWizard(grid, name) {
 		var activeCount = Math.min(parseInt(state.no_pingers || '6', 10), reflectors.length);
 		var rows = [
 			[ _('Target interface'), targetInterfaceLabel(wan) ],
-			[ _('Autorate'), state.enabled ? _('enabled') : _('disabled') ],
-			[ _('SQM'), state.sqm_enabled ? _('enabled') : _('disabled') ],
+			[ _('Autorate + SQM'), state.enabled ? _('enabled') : _('disabled') ],
 			[ _('SQM queue'), wizardSqmQueueText(state) ],
 			[ _('Download speed'), state.sqm_download + ' kbit/s' ],
 			[ _('Upload speed'), state.sqm_upload + ' kbit/s' ],
@@ -1933,6 +1984,7 @@ function showCreateWizard(grid, name) {
 				[ _('Queueing discipline'), state.sqm_qdisc || 'cake' ],
 				[ _('Queue setup script'), state.sqm_script || 'piece_of_cake.qos' ],
 				[ _('Speed test apply percent'), String(state.speedtest_apply_percent || '90') + '%' ],
+				[ _('speedtest-go server ID'), state.speedtest_go_server_id || _('automatic') ],
 				[ _('Extra ping args'), state.ping_extra_args || '-' ],
 				[ _('Active reflectors'), reflectors.slice(0, activeCount).join(', ') ],
 				[ _('Derived minimum rates'), '%s / %s kbit/s'.format(halfRate(state.sqm_download), halfRate(state.sqm_upload)) ]
@@ -1959,6 +2011,11 @@ function showCreateWizard(grid, name) {
 		}
 
 		if (step === 1) {
+			if (state.speedtest_go_server_id && !validatePositiveInteger(state.speedtest_go_server_id)) {
+				showError(_('speedtest-go server ID must be a positive integer.'));
+				return false;
+			}
+
 			if (!validatePositiveInteger(state.speedtest_apply_percent) ||
 			    parseInt(state.speedtest_apply_percent, 10) > 100) {
 				showError(_('Speed test apply percent must be between 1 and 100.'));
@@ -2011,6 +2068,11 @@ function showCreateWizard(grid, name) {
 			return false;
 		}
 
+		if (state.speedtest_go_server_id && !validatePositiveInteger(state.speedtest_go_server_id)) {
+			showError(_('speedtest-go server ID must be a positive integer.'));
+			return false;
+		}
+
 		if (!validatePositiveInteger(state.sqm_download) ||
 		    !validatePositiveInteger(state.sqm_upload)) {
 			showError(_('Download and upload speeds must be positive integers.'));
@@ -2019,11 +2081,6 @@ function showCreateWizard(grid, name) {
 
 		if (!validatePositiveInteger(state.no_pingers)) {
 			showError(_('Pingers must be a positive integer.'));
-			return false;
-		}
-
-		if (state.enabled && !state.sqm_enabled) {
-			showError(_('Enable SQM before enabling autorate. The automatic preset uses an IFB download interface created by SQM.'));
 			return false;
 		}
 
@@ -2297,6 +2354,9 @@ function addSpeedtestOptions(section) {
 	dependsAny(o, 'speedtest_backend', [ 'auto', 'librespeed-cli', 'builtin-http' ]);
 	o = optionalValue(section, 'speedtest', 'speedtest_duration_s', _('Test duration'), 'and(uinteger,min(1))', '15');
 	dependsAny(o, 'speedtest_backend', [ 'auto', 'librespeed-cli', 'iperf3' ]);
+	o = optionalValue(section, 'speedtest', 'speedtest_go_server_id', _('speedtest-go server ID'), 'uinteger', '');
+	describe(o, 'speedtest_go_server_id');
+	dependsAny(o, 'speedtest_backend', [ 'auto', 'speedtest-go' ]);
 	o = optionalValue(section, 'speedtest', 'speedtest_iperf3_server', _('iperf3 server'), null, '');
 	o.depends('speedtest_backend', 'iperf3');
 	o = optionalValue(section, 'speedtest', 'speedtest_iperf3_port', _('iperf3 port'), 'port', '');
@@ -2312,11 +2372,11 @@ function addSetupOptions(section) {
 		var enabled = checkedFromEvent(ev, value);
 
 		uci.set('cake-autorate', section_id, 'enabled', enabled ? '1' : '0');
-		maybeEnableSqmForAutoPreset(this.section, section_id, enabled);
+		syncManagedSqmEnabled(this.section, section_id, enabled);
 	};
 	o.write = function(section_id, formvalue) {
 		uci.set('cake-autorate', section_id, 'enabled', formvalue);
-		maybeEnableSqmForAutoPreset(this.section, section_id, formvalue);
+		syncManagedSqmEnabled(this.section, section_id, formvalue);
 	};
 
 	o = iface(section, 'setup', 'wan_if', _('Target interface'));
@@ -2329,7 +2389,7 @@ function addSetupOptions(section) {
 		if (autoInterfacePresetEnabled(this.section, section_id))
 			applyWanPreset(section_id, value, true, this.section);
 
-		maybeEnableSqmForAutoPreset(this.section, section_id);
+		syncManagedSqmEnabled(this.section, section_id);
 		refreshSpeedtestSummaries(this.section, section_id);
 	};
 	o.write = function(section_id, formvalue) {
@@ -2345,7 +2405,7 @@ function addSetupOptions(section) {
 		if (autoInterfacePresetEnabled(this.section, section_id))
 			applyWanPreset(section_id, formvalue, importRates);
 
-		maybeEnableSqmForAutoPreset(this.section, section_id);
+		syncManagedSqmEnabled(this.section, section_id);
 	};
 
 	o = flag(section, 'setup', 'auto_interface_preset', _('Auto SQM preset'), '1');
@@ -2358,28 +2418,7 @@ function addSetupOptions(section) {
 		if (formvalue === '1')
 			applyWanPreset(section_id, selectedWan(this.section, section_id, null, true), false, this.section);
 
-		maybeEnableSqmForAutoPreset(this.section, section_id);
-	};
-
-	o = flag(section, 'setup', 'sqm_enabled', _('Enable SQM'));
-	o.forcewrite = true;
-	o.onchange = function(ev, section_id, value) {
-		var enabled = checkedFromEvent(ev, value);
-
-		uci.set('cake-autorate', section_id, 'sqm_enabled', enabled ? '1' : '0');
-
-		if (enabled)
-			setCakeOption(this.section, section_id, 'manage_sqm', '1');
-		else
-			maybeEnableSqmForAutoPreset(this.section, section_id);
-	};
-	o.write = function(section_id, formvalue) {
-		uci.set('cake-autorate', section_id, 'sqm_enabled', formvalue);
-
-		if (formvalue === '1')
-			setCakeOption(this.section, section_id, 'manage_sqm', '1');
-		else
-			maybeEnableSqmForAutoPreset(this.section, section_id);
+		syncManagedSqmEnabled(this.section, section_id);
 	};
 
 	o = value(section, 'setup', 'sqm_download', _('Download speed'), 'and(uinteger,min(0))', '20000');
@@ -2478,9 +2517,7 @@ function addSetupOptions(section) {
 		refreshSpeedtestSummaries(activeSection, section_id);
 		button.disabled = true;
 
-		return withSpeedtestRpcTimeout(function() {
-			return fs.exec('/usr/libexec/cake-autorate-rs/speedtest', [ section_id, wan, backend ]);
-		}).then(function(res) {
+		return runSpeedtestJob(section_id, wan, backend).then(function(res) {
 			var result = parseSpeedtestResult(res.stdout);
 			var applied = applySpeedtestRates(activeSection, section_id, result, percent);
 			var message = _('Speed test applied at %d%%: download %s kbit/s, upload %s kbit/s.').format(
@@ -2887,6 +2924,12 @@ function addSqmOptions(section, qdiscs, scripts) {
 	o.validate = function(section_id) {
 		return validateSqmSectionUnique(validationSection(this), section_id);
 	};
+	o.write = function(section_id, formvalue) {
+		uci.set('cake-autorate', section_id, 'manage_sqm', formvalue);
+
+		if (formvalue === '1')
+			syncManagedSqmEnabled(this.section, section_id);
+	};
 
 	o = optionalValue(section, 'sqm_basic', 'sqm_section', _('SQM section'), 'uciname', '');
 	dependsManagedSqm(o);
@@ -3057,6 +3100,22 @@ function loadSqmScripts() {
 }
 
 return L.view.extend({
+	handleSaveApply: function(ev) {
+		var self = this;
+
+		return this.handleSave(ev).then(function() {
+			return uci.apply(30);
+		}).then(function() {
+			return fs.exec('/etc/init.d/cake-autorate', [ 'restart' ]);
+		}).then(function(result) {
+			if (result.code !== 0)
+				throw new Error(result.stderr || _('Unable to restart CAKE Autorate.'));
+
+			window.location = window.location.href.split('#')[0];
+			return self;
+		});
+	},
+
 	load: function() {
 		return Promise.all([
 			network.getDevices(),
