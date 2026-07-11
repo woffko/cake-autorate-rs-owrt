@@ -15,6 +15,15 @@ config cake_autorate 'primary'
 	option base_ul_shaper_rate_kbps '20000'
 	option max_ul_shaper_rate_kbps '35000'
 
+	# Optional Rust extension. Disabled keeps the upstream hard max behavior.
+	# When enabled, configured max is the starting ceiling and these two values
+	# are absolute safety caps. A missing cap falls back to configured max.
+	option adaptive_ceiling_enabled '0'
+	option adaptive_ceiling_dl_cap_kbps '80000'
+	option adaptive_ceiling_ul_cap_kbps '35000'
+	option adaptive_ceiling_hold_time_s '60.0'
+	option adaptive_ceiling_growth_percent '1.0'
+
 	# SQM backend managed by this package. The LuCI package depends on
 	# sqm-scripts and the init script mirrors these values to /etc/config/sqm.
 	option manage_sqm '1'

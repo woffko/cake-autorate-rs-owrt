@@ -44,6 +44,14 @@ Implemented:
 - sysfs RX/TX byte counter sampling.
 - optional CPU usage sampling from `/proc/stat`, exposed in logs and status JSON.
 - adaptive rate calculations using delay/load windows.
+- Optional Rust-only adaptive ceiling extension, disabled by default so the
+  upstream configured maximum remains a hard limit. When explicitly enabled,
+  each direction can raise its runtime ceiling by 1% only after 60 seconds of
+  uninterrupted high load at the current ceiling with no delay offence and a
+  low average delay delta. Separate absolute DL/UL caps bound growth; probe
+  gaps restart qualification, bufferbloat lowers a learned ceiling, and a stall
+  resets it to the configured maximum. Learned ceilings are runtime-only and do
+  not rewrite UCI.
 - `tc qdisc change ... cake bandwidth ...` shaper updates.
 - Upstream-style idle/stall handling: sustained idle can stop pingers, activity
   restarts them, and optional minimum-rate enforcement applies on sustained idle
@@ -116,6 +124,10 @@ Implemented:
 
 Known limits:
 
+- Adaptive ceiling is intentionally not part of upstream `cake-autorate` and is
+  an explicit opt-in. Configure absolute caps deliberately; leaving it off
+  preserves exact upstream hard-max semantics. Runtime status/logs expose every
+  effective-ceiling change.
 - `pinger_method=ping` starts one basic ping process per active reflector, but
   it remains a fallback; use `fping`, `fping-ts`, `tsping`, or explicit-server
   `irtt` where those backends are available.

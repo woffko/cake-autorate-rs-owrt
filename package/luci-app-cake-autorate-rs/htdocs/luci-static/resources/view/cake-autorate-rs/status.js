@@ -72,6 +72,25 @@ function formatRate(value) {
 	return value.toFixed(0) + ' kbps';
 }
 
+function formatShaperRate(status, direction) {
+	var rateKey = direction === 'dl' ? 'cake_dl_rate_kbps' : 'cake_ul_rate_kbps';
+	var configuredKey = direction === 'dl' ? 'configured_max_dl_shaper_rate_kbps' : 'configured_max_ul_shaper_rate_kbps';
+	var effectiveKey = direction === 'dl' ? 'effective_max_dl_shaper_rate_kbps' : 'effective_max_ul_shaper_rate_kbps';
+	var capKey = direction === 'dl' ? 'adaptive_ceiling_dl_cap_kbps' : 'adaptive_ceiling_ul_cap_kbps';
+	var rate = formatRate(status[rateKey]);
+
+	if (!status.adaptive_ceiling_enabled)
+		return rate;
+
+	return E('div', {
+		'title': _('Configured max: %s').format(formatRate(status[configuredKey]))
+	}, [
+		E('div', {}, rate),
+		E('small', { 'style': 'white-space:nowrap' },
+			_('Ceiling: %s / %s').format(formatRate(status[effectiveKey]), formatRate(status[capKey])))
+	]);
+}
+
 function formatPercent(value) {
 	if (value == null)
 		return '-';
@@ -142,8 +161,8 @@ function renderTable(sections, statuses) {
 			st.rtt_ms != null ? Number(st.rtt_ms).toFixed(2) + ' ms' : '-',
 			formatRate(st.dl_achieved_rate_kbps),
 			formatRate(st.ul_achieved_rate_kbps),
-			formatRate(st.cake_dl_rate_kbps),
-			formatRate(st.cake_ul_rate_kbps),
+			formatShaperRate(st, 'dl'),
+			formatShaperRate(st, 'ul'),
 			formatPercent(st.cpu_total_percent)
 		]);
 	}

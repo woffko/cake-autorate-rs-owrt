@@ -48,6 +48,11 @@ var optionDescriptions = {
 	min_ul_shaper_rate_kbps: 'Lowest upload shaper rate autorate may apply, in kbit/s.',
 	base_ul_shaper_rate_kbps: 'Starting upload shaper rate before autorate adjusts it, in kbit/s.',
 	max_ul_shaper_rate_kbps: 'Highest upload shaper rate autorate may apply, in kbit/s.',
+	adaptive_ceiling_enabled: 'Optional Rust extension. Keep off for the upstream hard-max behavior. When enabled, the configured maximum is only the starting ceiling and may rise slowly under sustained clean high load.',
+	adaptive_ceiling_dl_cap_kbps: 'Absolute download safety cap for adaptive ceiling growth, in kbit/s. It must not be below the configured download maximum.',
+	adaptive_ceiling_ul_cap_kbps: 'Absolute upload safety cap for adaptive ceiling growth, in kbit/s. It must not be below the configured upload maximum.',
+	adaptive_ceiling_hold_time_s: 'Continuous clean high-load time required at the current ceiling before one growth step. Any probe gap, delay offence, idle/low load, or stall restarts the hold.',
+	adaptive_ceiling_growth_percent: 'Percentage added to the runtime ceiling after each clean hold interval. Growth is runtime-only and never rewrites UCI.',
 	dl_if: 'Interface whose RX byte counter represents shaped download traffic, usually the IFB created by SQM.',
 	ul_if: 'Interface whose TX byte counter represents upload traffic, usually the WAN device.',
 	manage_sqm: 'Mirror this instance into /etc/config/sqm and restart SQM before autorate starts.',
@@ -518,6 +523,43 @@ function validateRateOrder(section, section_id, direction) {
 	return true;
 }
 
+function adaptiveConfiguredMax(section, section_id, direction) {
+	var key;
+
+	if (manualRateLimitsEnabled(section, section_id))
+		key = 'max_' + direction + '_shaper_rate_kbps';
+	else
+		key = direction === 'dl' ? 'sqm_download' : 'sqm_upload';
+
+	return parsePositiveRate(formOrUci(section, section_id, key));
+}
+
+function validateAdaptiveCeiling(section, section_id) {
+	var dlMax, ulMax, dlCap, ulCap;
+
+	if (!checkedFormOrUci(section, section_id, 'adaptive_ceiling_enabled', false))
+		return true;
+
+	dlMax = adaptiveConfiguredMax(section, section_id, 'dl');
+	ulMax = adaptiveConfiguredMax(section, section_id, 'ul');
+	dlCap = parsePositiveRate(formOrUci(section, section_id, 'adaptive_ceiling_dl_cap_kbps'));
+	ulCap = parsePositiveRate(formOrUci(section, section_id, 'adaptive_ceiling_ul_cap_kbps'));
+
+	if (dlCap == null)
+		return _('Adaptive download safety cap is required when adaptive ceiling is enabled.');
+
+	if (ulCap == null)
+		return _('Adaptive upload safety cap is required when adaptive ceiling is enabled.');
+
+	if (dlMax != null && dlCap < dlMax)
+		return _('Adaptive download safety cap must be at least the configured maximum (%d kbit/s).').format(dlMax);
+
+	if (ulMax != null && ulCap < ulMax)
+		return _('Adaptive upload safety cap must be at least the configured maximum (%d kbit/s).').format(ulMax);
+
+	return true;
+}
+
 function validateDifferentInterfaces(section, section_id) {
 	var dl = normalizeInterfaceName(formOrUci(section, section_id, 'dl_if'));
 	var ul = normalizeInterfaceName(formOrUci(section, section_id, 'ul_if'));
@@ -659,6 +701,10 @@ function validateInstanceSection(section, section_id) {
 		if (result !== true)
 			return result;
 	}
+
+	result = validateAdaptiveCeiling(section, section_id);
+	if (result !== true)
+		return result;
 
 	if (!checkedFormOrUci(section, section_id, 'auto_interface_preset', true)) {
 		result = validateDifferentInterfaces(section, section_id);
@@ -2063,7 +2109,40 @@ function requireAdvancedSettings(section) {
 }
 
 function addRateOptions(section) {
+	var o;
+
 	value(section, 'rates', 'connection_active_thr_kbps', _('Active threshold'), 'uinteger', '2000');
+
+	o = flag(section, 'rates', 'adaptive_ceiling_enabled', _('Adaptive ceiling'), '0');
+	o.validate = function(section_id) {
+		return validateAdaptiveCeiling(validationSection(this), section_id);
+	};
+
+	o = value(section, 'rates', 'adaptive_ceiling_dl_cap_kbps', _('DL absolute cap'), 'and(uinteger,min(1))', '80000');
+	o.depends('adaptive_ceiling_enabled', '1');
+	o.cfgvalue = function(section_id) {
+		return rateValue(uci.get('cake-autorate', section_id, 'adaptive_ceiling_dl_cap_kbps'),
+			rateValue(uci.get('cake-autorate', section_id, 'max_dl_shaper_rate_kbps'), '80000'));
+	};
+	o.validate = function(section_id) {
+		return validateAdaptiveCeiling(validationSection(this), section_id);
+	};
+
+	o = value(section, 'rates', 'adaptive_ceiling_ul_cap_kbps', _('UL absolute cap'), 'and(uinteger,min(1))', '35000');
+	o.depends('adaptive_ceiling_enabled', '1');
+	o.cfgvalue = function(section_id) {
+		return rateValue(uci.get('cake-autorate', section_id, 'adaptive_ceiling_ul_cap_kbps'),
+			rateValue(uci.get('cake-autorate', section_id, 'max_ul_shaper_rate_kbps'), '35000'));
+	};
+	o.validate = function(section_id) {
+		return validateAdaptiveCeiling(validationSection(this), section_id);
+	};
+
+	o = value(section, 'rates', 'adaptive_ceiling_hold_time_s', _('Clean-load hold'), 'and(ufloat,min(1))', '60.0');
+	o.depends('adaptive_ceiling_enabled', '1');
+
+	o = value(section, 'rates', 'adaptive_ceiling_growth_percent', _('Growth per hold'), 'and(ufloat,min(0.1),max(10))', '1.0');
+	o.depends('adaptive_ceiling_enabled', '1');
 }
 
 function addSpeedtestOptions(section) {

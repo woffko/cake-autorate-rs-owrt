@@ -67,6 +67,11 @@ struct Config {
     min_dl_shaper_rate_kbps: f64,
     base_dl_shaper_rate_kbps: f64,
     max_dl_shaper_rate_kbps: f64,
+    adaptive_ceiling_enabled: bool,
+    adaptive_ceiling_dl_cap_kbps: f64,
+    adaptive_ceiling_ul_cap_kbps: f64,
+    adaptive_ceiling_hold_time_s: f64,
+    adaptive_ceiling_growth_percent: f64,
     min_ul_shaper_rate_kbps: f64,
     base_ul_shaper_rate_kbps: f64,
     max_ul_shaper_rate_kbps: f64,
@@ -155,6 +160,11 @@ impl Config {
             min_dl_shaper_rate_kbps: 5000.0,
             base_dl_shaper_rate_kbps: 20000.0,
             max_dl_shaper_rate_kbps: 80000.0,
+            adaptive_ceiling_enabled: false,
+            adaptive_ceiling_dl_cap_kbps: 80000.0,
+            adaptive_ceiling_ul_cap_kbps: 35000.0,
+            adaptive_ceiling_hold_time_s: 60.0,
+            adaptive_ceiling_growth_percent: 1.0,
             min_ul_shaper_rate_kbps: 5000.0,
             base_ul_shaper_rate_kbps: 20000.0,
             max_ul_shaper_rate_kbps: 35000.0,
@@ -329,6 +339,39 @@ impl Config {
             "max_ul_shaper_rate_kbps",
             &mut cfg.max_ul_shaper_rate_kbps,
         )?;
+        set_bool(
+            &single,
+            "adaptive_ceiling_enabled",
+            &mut cfg.adaptive_ceiling_enabled,
+        )?;
+        let adaptive_dl_cap_configured = single.contains_key("adaptive_ceiling_dl_cap_kbps");
+        let adaptive_ul_cap_configured = single.contains_key("adaptive_ceiling_ul_cap_kbps");
+        set_f64(
+            &single,
+            "adaptive_ceiling_dl_cap_kbps",
+            &mut cfg.adaptive_ceiling_dl_cap_kbps,
+        )?;
+        set_f64(
+            &single,
+            "adaptive_ceiling_ul_cap_kbps",
+            &mut cfg.adaptive_ceiling_ul_cap_kbps,
+        )?;
+        set_f64(
+            &single,
+            "adaptive_ceiling_hold_time_s",
+            &mut cfg.adaptive_ceiling_hold_time_s,
+        )?;
+        set_f64(
+            &single,
+            "adaptive_ceiling_growth_percent",
+            &mut cfg.adaptive_ceiling_growth_percent,
+        )?;
+        if !adaptive_dl_cap_configured {
+            cfg.adaptive_ceiling_dl_cap_kbps = cfg.max_dl_shaper_rate_kbps;
+        }
+        if !adaptive_ul_cap_configured {
+            cfg.adaptive_ceiling_ul_cap_kbps = cfg.max_ul_shaper_rate_kbps;
+        }
         set_f64(
             &single,
             "connection_active_thr_kbps",
@@ -743,6 +786,38 @@ impl Config {
                     .to_string(),
             );
         }
+        if self.adaptive_ceiling_enabled {
+            if !self.adaptive_ceiling_dl_cap_kbps.is_finite()
+                || self.adaptive_ceiling_dl_cap_kbps < self.max_dl_shaper_rate_kbps
+            {
+                return Err(
+                    "adaptive_ceiling_dl_cap_kbps cannot be lower than max_dl_shaper_rate_kbps"
+                        .to_string(),
+                );
+            }
+            if !self.adaptive_ceiling_ul_cap_kbps.is_finite()
+                || self.adaptive_ceiling_ul_cap_kbps < self.max_ul_shaper_rate_kbps
+            {
+                return Err(
+                    "adaptive_ceiling_ul_cap_kbps cannot be lower than max_ul_shaper_rate_kbps"
+                        .to_string(),
+                );
+            }
+            if !self.adaptive_ceiling_hold_time_s.is_finite()
+                || self.adaptive_ceiling_hold_time_s <= 0.0
+            {
+                return Err("adaptive_ceiling_hold_time_s must be greater than zero".to_string());
+            }
+            if !self.adaptive_ceiling_growth_percent.is_finite()
+                || self.adaptive_ceiling_growth_percent <= 0.0
+                || self.adaptive_ceiling_growth_percent > 10.0
+            {
+                return Err(
+                    "adaptive_ceiling_growth_percent must be greater than zero and no more than 10"
+                        .to_string(),
+                );
+            }
+        }
         if self.sustained_idle_sleep_thr_s < 0.0 {
             return Err("sustained_idle_sleep_thr_s must not be negative".to_string());
         }
@@ -857,10 +932,10 @@ impl ReflectorState {
     }
 
     fn push_offence(&mut self, offence: bool) {
-        if self.offences.len() == self.offences.capacity() {
-            if self.offences.pop_front().unwrap_or(false) {
-                self.offence_sum = self.offence_sum.saturating_sub(1);
-            }
+        if self.offences.len() == self.offences.capacity()
+            && self.offences.pop_front().unwrap_or(false)
+        {
+            self.offence_sum = self.offence_sum.saturating_sub(1);
         }
 
         self.offences.push_back(offence);
@@ -1203,6 +1278,108 @@ enum LoadKind {
     Idle,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum AdaptiveCeilingChange {
+    Raised { from_kbps: f64, to_kbps: f64 },
+    Lowered { from_kbps: f64, to_kbps: f64 },
+}
+
+#[derive(Clone, Debug)]
+struct AdaptiveCeilingDirection {
+    configured_max_kbps: f64,
+    effective_max_kbps: f64,
+    absolute_cap_kbps: f64,
+    qualified_since: Option<Instant>,
+}
+
+impl AdaptiveCeilingDirection {
+    fn new(configured_max_kbps: f64, absolute_cap_kbps: f64) -> Self {
+        Self {
+            configured_max_kbps,
+            effective_max_kbps: configured_max_kbps,
+            absolute_cap_kbps: absolute_cap_kbps.max(configured_max_kbps),
+            qualified_since: None,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        now: Instant,
+        eligible: bool,
+        bufferbloat: bool,
+        shaper_rate_kbps: f64,
+        hold_time: Duration,
+        growth_percent: f64,
+    ) -> Option<AdaptiveCeilingChange> {
+        if bufferbloat {
+            self.qualified_since = None;
+            let reduced = self
+                .effective_max_kbps
+                .min(shaper_rate_kbps.max(self.configured_max_kbps));
+
+            if reduced + f64::EPSILON < self.effective_max_kbps {
+                let previous = self.effective_max_kbps;
+                self.effective_max_kbps = reduced;
+                return Some(AdaptiveCeilingChange::Lowered {
+                    from_kbps: previous,
+                    to_kbps: reduced,
+                });
+            }
+
+            return None;
+        }
+
+        if !eligible || self.effective_max_kbps >= self.absolute_cap_kbps {
+            self.qualified_since = None;
+            return None;
+        }
+
+        let Some(since) = self.qualified_since else {
+            self.qualified_since = Some(now);
+            return None;
+        };
+
+        if now.duration_since(since) < hold_time {
+            return None;
+        }
+
+        let previous = self.effective_max_kbps;
+        let factor = 1.0 + growth_percent / 100.0;
+        self.effective_max_kbps = (previous * factor)
+            .max(previous + 1.0)
+            .min(self.absolute_cap_kbps);
+        self.qualified_since = Some(now);
+
+        if self.effective_max_kbps > previous {
+            Some(AdaptiveCeilingChange::Raised {
+                from_kbps: previous,
+                to_kbps: self.effective_max_kbps,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn reset_probe(&mut self) {
+        self.qualified_since = None;
+    }
+
+    fn reset_to_configured(&mut self) -> Option<AdaptiveCeilingChange> {
+        self.qualified_since = None;
+
+        if self.effective_max_kbps <= self.configured_max_kbps {
+            return None;
+        }
+
+        let previous = self.effective_max_kbps;
+        self.effective_max_kbps = self.configured_max_kbps;
+        Some(AdaptiveCeilingChange::Lowered {
+            from_kbps: previous,
+            to_kbps: self.configured_max_kbps,
+        })
+    }
+}
+
 struct RateMonitor {
     rx_path: PathBuf,
     tx_path: PathBuf,
@@ -1421,6 +1598,8 @@ struct Controller {
     ul_delta_us: VecDeque<f64>,
     shaper_dl: f64,
     shaper_ul: f64,
+    adaptive_dl: AdaptiveCeilingDirection,
+    adaptive_ul: AdaptiveCeilingDirection,
     last_set_dl: u64,
     last_set_ul: u64,
     last_bb_dl: Instant,
@@ -1465,10 +1644,20 @@ impl Controller {
             None
         };
         let now = Instant::now();
+        let adaptive_dl = AdaptiveCeilingDirection::new(
+            cfg.max_dl_shaper_rate_kbps,
+            cfg.adaptive_ceiling_dl_cap_kbps,
+        );
+        let adaptive_ul = AdaptiveCeilingDirection::new(
+            cfg.max_ul_shaper_rate_kbps,
+            cfg.adaptive_ceiling_ul_cap_kbps,
+        );
 
         Ok(Self {
             shaper_dl: cfg.base_dl_shaper_rate_kbps,
             shaper_ul: cfg.base_ul_shaper_rate_kbps,
+            adaptive_dl,
+            adaptive_ul,
             last_set_dl: 0,
             last_set_ul: 0,
             last_bb_dl: now,
@@ -1528,7 +1717,67 @@ impl Controller {
             &format!("Changing main state from: {} to: {state}", self.run_state),
         );
         self.run_state = state.to_string();
+
+        if self.cfg.adaptive_ceiling_enabled && state != "RUNNING" {
+            self.reset_adaptive_probes();
+
+            if state == "STALL" {
+                let dl_change = self.adaptive_dl.reset_to_configured();
+                let ul_change = self.adaptive_ul.reset_to_configured();
+                let ceiling_changed = dl_change.is_some() || ul_change.is_some();
+
+                if let Some(change) = dl_change {
+                    self.log_adaptive_change("DL", change, "stall reset");
+                }
+                if let Some(change) = ul_change {
+                    self.log_adaptive_change("UL", change, "stall reset");
+                }
+                if ceiling_changed {
+                    self.clamp_rates();
+                    self.apply_shaper("dl");
+                    self.apply_shaper("ul");
+                }
+            }
+        }
+
         let _ = self.refresh_status_from_last_sample();
+    }
+
+    fn reset_adaptive_probes(&mut self) {
+        self.adaptive_dl.reset_probe();
+        self.adaptive_ul.reset_probe();
+    }
+
+    fn note_probe_gap(&mut self) {
+        if self.cfg.adaptive_ceiling_enabled {
+            self.reset_adaptive_probes();
+        }
+    }
+
+    fn log_adaptive_change(
+        &mut self,
+        direction: &str,
+        change: AdaptiveCeilingChange,
+        reason: &str,
+    ) {
+        let cap = if direction == "DL" {
+            self.adaptive_dl.absolute_cap_kbps
+        } else {
+            self.adaptive_ul.absolute_cap_kbps
+        };
+        let (action, from_kbps, to_kbps) = match change {
+            AdaptiveCeilingChange::Raised { from_kbps, to_kbps } => ("raised", from_kbps, to_kbps),
+            AdaptiveCeilingChange::Lowered { from_kbps, to_kbps } => {
+                ("lowered", from_kbps, to_kbps)
+            }
+        };
+
+        self.log(
+            "INFO",
+            &format!(
+                "Adaptive {direction} ceiling {action}: {from_kbps:.0} -> {to_kbps:.0} kbit/s ({reason}; absolute cap {cap:.0} kbit/s)"
+            ),
+        );
     }
 
     fn on_sample(
@@ -1629,6 +1878,17 @@ impl Controller {
 
         self.update_direction(true, dl_kind, dl_bb, avg_dl_delta, now);
         self.update_direction(false, ul_kind, ul_bb, avg_ul_delta, now);
+        self.update_adaptive_ceilings(
+            dl_kind,
+            ul_kind,
+            dl_bb,
+            ul_bb,
+            dl_delay_count,
+            ul_delay_count,
+            avg_dl_delta,
+            avg_ul_delta,
+            now,
+        );
         self.clamp_rates();
         self.apply_shaper("dl");
         self.apply_shaper("ul");
@@ -1899,15 +2159,81 @@ impl Controller {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn update_adaptive_ceilings(
+        &mut self,
+        dl_kind: LoadKind,
+        ul_kind: LoadKind,
+        dl_bufferbloat: bool,
+        ul_bufferbloat: bool,
+        dl_delay_count: usize,
+        ul_delay_count: usize,
+        avg_dl_delta_us: f64,
+        avg_ul_delta_us: f64,
+        now: Instant,
+    ) {
+        if !self.cfg.adaptive_ceiling_enabled {
+            return;
+        }
+
+        let hold_time = Duration::from_secs_f64(self.cfg.adaptive_ceiling_hold_time_s);
+        let dl_eligible = self.cfg.adjust_dl_shaper_rate
+            && matches!(dl_kind, LoadKind::High)
+            && !dl_bufferbloat
+            && dl_delay_count == 0
+            && avg_dl_delta_us <= self.avg_adjust_up_thr_us(true)
+            && self.shaper_dl >= self.adaptive_dl.effective_max_kbps * 0.99;
+        let ul_eligible = self.cfg.adjust_ul_shaper_rate
+            && matches!(ul_kind, LoadKind::High)
+            && !ul_bufferbloat
+            && ul_delay_count == 0
+            && avg_ul_delta_us <= self.avg_adjust_up_thr_us(false)
+            && self.shaper_ul >= self.adaptive_ul.effective_max_kbps * 0.99;
+
+        let dl_change = self.adaptive_dl.observe(
+            now,
+            dl_eligible,
+            dl_bufferbloat,
+            self.shaper_dl,
+            hold_time,
+            self.cfg.adaptive_ceiling_growth_percent,
+        );
+        let ul_change = self.adaptive_ul.observe(
+            now,
+            ul_eligible,
+            ul_bufferbloat,
+            self.shaper_ul,
+            hold_time,
+            self.cfg.adaptive_ceiling_growth_percent,
+        );
+
+        if let Some(change) = dl_change {
+            let reason = if matches!(change, AdaptiveCeilingChange::Raised { .. }) {
+                "sustained clean high load"
+            } else {
+                "bufferbloat backoff"
+            };
+            self.log_adaptive_change("DL", change, reason);
+        }
+        if let Some(change) = ul_change {
+            let reason = if matches!(change, AdaptiveCeilingChange::Raised { .. }) {
+                "sustained clean high load"
+            } else {
+                "bufferbloat backoff"
+            };
+            self.log_adaptive_change("UL", change, reason);
+        }
+    }
+
     fn clamp_rates(&mut self) {
         self.shaper_dl = self
             .shaper_dl
             .max(self.cfg.min_dl_shaper_rate_kbps)
-            .min(self.cfg.max_dl_shaper_rate_kbps);
+            .min(self.adaptive_dl.effective_max_kbps);
         self.shaper_ul = self
             .shaper_ul
             .max(self.cfg.min_ul_shaper_rate_kbps)
-            .min(self.cfg.max_ul_shaper_rate_kbps);
+            .min(self.adaptive_ul.effective_max_kbps);
     }
 
     fn apply_shaper(&mut self, direction: &str) {
@@ -1967,6 +2293,7 @@ impl Controller {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_status(
         &mut self,
         dl_rate: f64,
@@ -2010,6 +2337,7 @@ impl Controller {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_status_file(
         &mut self,
         dl_rate: f64,
@@ -2032,7 +2360,7 @@ impl Controller {
         let mut file = File::create(&tmp)?;
         writeln!(
             file,
-            "{{\"instance\":\"{}\",\"version\":\"0.1.0\",\"state\":\"{}\",\"started_at\":{:.6},\"updated_at\":{:.6},\"dl_if\":\"{}\",\"ul_if\":\"{}\",\"reflector\":\"{}\",\"seq\":\"{}\",\"probe_timestamp\":{:.6},\"rtt_ms\":{:.3},\"dl_owd_us\":{:.1},\"ul_owd_us\":{:.1},\"dl_achieved_rate_kbps\":{:.1},\"ul_achieved_rate_kbps\":{:.1},\"dl_load_percent\":{:.1},\"ul_load_percent\":{:.1},\"dl_sum_delays\":{},\"ul_sum_delays\":{},\"dl_avg_owd_delta_us\":{:.1},\"ul_avg_owd_delta_us\":{:.1},\"cake_dl_rate_kbps\":{:.0},\"cake_ul_rate_kbps\":{:.0},\"cpu_total_percent\":{},\"cpu_core_percentages\":{},\"active_reflectors\":{},\"spare_reflectors\":{},\"bad_reflectors\":{},\"reflector_health\":{}}}",
+            "{{\"instance\":\"{}\",\"version\":\"0.1.0\",\"state\":\"{}\",\"started_at\":{:.6},\"updated_at\":{:.6},\"dl_if\":\"{}\",\"ul_if\":\"{}\",\"reflector\":\"{}\",\"seq\":\"{}\",\"probe_timestamp\":{:.6},\"rtt_ms\":{:.3},\"dl_owd_us\":{:.1},\"ul_owd_us\":{:.1},\"dl_achieved_rate_kbps\":{:.1},\"ul_achieved_rate_kbps\":{:.1},\"dl_load_percent\":{:.1},\"ul_load_percent\":{:.1},\"dl_sum_delays\":{},\"ul_sum_delays\":{},\"dl_avg_owd_delta_us\":{:.1},\"ul_avg_owd_delta_us\":{:.1},\"cake_dl_rate_kbps\":{:.0},\"cake_ul_rate_kbps\":{:.0},\"adaptive_ceiling_enabled\":{},\"configured_max_dl_shaper_rate_kbps\":{:.0},\"configured_max_ul_shaper_rate_kbps\":{:.0},\"effective_max_dl_shaper_rate_kbps\":{:.0},\"effective_max_ul_shaper_rate_kbps\":{:.0},\"adaptive_ceiling_dl_cap_kbps\":{:.0},\"adaptive_ceiling_ul_cap_kbps\":{:.0},\"cpu_total_percent\":{},\"cpu_core_percentages\":{},\"active_reflectors\":{},\"spare_reflectors\":{},\"bad_reflectors\":{},\"reflector_health\":{}}}",
             json_escape(&self.cfg.instance),
             json_escape(&self.run_state),
             self.started_at,
@@ -2055,6 +2383,13 @@ impl Controller {
             avg_ul_delta,
             self.shaper_dl,
             self.shaper_ul,
+            self.cfg.adaptive_ceiling_enabled,
+            self.cfg.max_dl_shaper_rate_kbps,
+            self.cfg.max_ul_shaper_rate_kbps,
+            self.adaptive_dl.effective_max_kbps,
+            self.adaptive_ul.effective_max_kbps,
+            self.adaptive_dl.absolute_cap_kbps,
+            self.adaptive_ul.absolute_cap_kbps,
             json_f64_or_null(self.cpu_total_percent, 1),
             json_f64_array(&self.cpu_core_percentages, 1),
             json_string_array(active_reflectors),
@@ -2234,6 +2569,7 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                 Ok(Ok(line)) => {
                     if let Some(sample) = parse_sample_line(&cfg, &line.line, &line.reflector) {
                         if sample_is_stale(&sample, epoch_secs()) {
+                            controller.note_probe_gap();
                             controller.log(
                                 "DEBUG",
                                 &format!(
@@ -2257,6 +2593,8 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                         }
                         health.observe_sample(&cfg, &sample);
                         controller.on_sample(sample, &active_reflectors, &health);
+                    } else {
+                        controller.note_probe_gap();
                     }
                 }
                 Ok(Err(e)) => return Err(e),
@@ -2267,6 +2605,7 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                     }
 
                     if cfg.pinger_method == "irtt" {
+                        controller.note_probe_gap();
                         controller.log(
                             "DEBUG",
                             "irtt session ended; restarting irtt clients for active servers",
@@ -2286,6 +2625,11 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
         }
 
         let now = Instant::now();
+        if now.duration_since(last_reflector_response)
+            > Duration::from_secs_f64(cfg.reflector_response_deadline_s.max(0.1))
+        {
+            controller.note_probe_gap();
+        }
         let (dl_rate, ul_rate) = controller.sample_rates();
         let connection_active =
             dl_rate > cfg.connection_active_thr_kbps || ul_rate > cfg.connection_active_thr_kbps;
@@ -2352,6 +2696,7 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                 if main_state == MainState::Running
                     && health.check(&cfg, &mut active_reflectors, &mut controller)
                 {
+                    controller.note_probe_gap();
                     if let Some(mut old) = pinger.take() {
                         old.stop();
                     }
@@ -2717,7 +3062,7 @@ fn parse_fping_ts_line(line: &str) -> Option<Sample> {
         .filter(|v| !v.is_empty())
         .collect();
 
-    if tokens.len() < 17 || !tokens.iter().any(|token| *token == "timestamps:") {
+    if tokens.len() < 17 || !tokens.contains(&"timestamps:") {
         return None;
     }
 
@@ -3553,10 +3898,11 @@ mod tests {
         parse_fping_ts_line, parse_irtt_duration_us, parse_irtt_line, parse_reflector_candidates,
         parse_tc_linklayer_overhead, parse_tsping_line, parse_uci_values, pinger_command,
         pinger_response_interval_s, reflector_bad_reflectors, reflector_health_json,
-        reflector_spare_reflectors, sample_is_stale, stall_detection_timeout, Config,
-        ReflectorHealth, ReflectorState, Sample,
+        reflector_spare_reflectors, sample_is_stale, stall_detection_timeout,
+        AdaptiveCeilingChange, AdaptiveCeilingDirection, Config, ReflectorHealth, ReflectorState,
+        Sample,
     };
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn parses_single_quoted_value() {
@@ -3721,6 +4067,134 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_ceiling_defaults_preserve_upstream_hard_max() {
+        let cfg = Config::defaults("test".to_string());
+
+        assert!(!cfg.adaptive_ceiling_enabled);
+        assert_eq!(
+            cfg.adaptive_ceiling_dl_cap_kbps,
+            cfg.max_dl_shaper_rate_kbps
+        );
+        assert_eq!(
+            cfg.adaptive_ceiling_ul_cap_kbps,
+            cfg.max_ul_shaper_rate_kbps
+        );
+        assert_eq!(cfg.adaptive_ceiling_hold_time_s, 60.0);
+        assert_eq!(cfg.adaptive_ceiling_growth_percent, 1.0);
+    }
+
+    #[test]
+    fn adaptive_ceiling_requires_sustained_clean_load() {
+        let start = Instant::now();
+        let hold = Duration::from_secs(60);
+        let mut ceiling = AdaptiveCeilingDirection::new(80_000.0, 100_000.0);
+
+        assert_eq!(
+            ceiling.observe(start, true, false, 80_000.0, hold, 1.0),
+            None
+        );
+        assert_eq!(
+            ceiling.observe(
+                start + Duration::from_secs(59),
+                true,
+                false,
+                80_000.0,
+                hold,
+                1.0,
+            ),
+            None
+        );
+        assert_eq!(
+            ceiling.observe(
+                start + Duration::from_secs(60),
+                true,
+                false,
+                80_000.0,
+                hold,
+                1.0,
+            ),
+            Some(AdaptiveCeilingChange::Raised {
+                from_kbps: 80_000.0,
+                to_kbps: 80_800.0,
+            })
+        );
+    }
+
+    #[test]
+    fn adaptive_ceiling_probe_gap_restarts_hold_time() {
+        let start = Instant::now();
+        let hold = Duration::from_secs(60);
+        let mut ceiling = AdaptiveCeilingDirection::new(80_000.0, 100_000.0);
+
+        assert_eq!(
+            ceiling.observe(start, true, false, 80_000.0, hold, 1.0),
+            None
+        );
+        ceiling.reset_probe();
+        assert_eq!(
+            ceiling.observe(
+                start + Duration::from_secs(120),
+                true,
+                false,
+                80_000.0,
+                hold,
+                1.0,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn adaptive_ceiling_clamps_growth_and_backs_off_on_bufferbloat() {
+        let start = Instant::now();
+        let hold = Duration::from_secs(60);
+        let mut ceiling = AdaptiveCeilingDirection::new(80_000.0, 80_500.0);
+
+        assert_eq!(
+            ceiling.observe(start, true, false, 80_000.0, hold, 1.0),
+            None
+        );
+        assert_eq!(
+            ceiling.observe(start + hold, true, false, 80_000.0, hold, 1.0,),
+            Some(AdaptiveCeilingChange::Raised {
+                from_kbps: 80_000.0,
+                to_kbps: 80_500.0,
+            })
+        );
+        assert_eq!(
+            ceiling.observe(
+                start + hold + Duration::from_secs(1),
+                false,
+                true,
+                75_000.0,
+                hold,
+                1.0,
+            ),
+            Some(AdaptiveCeilingChange::Lowered {
+                from_kbps: 80_500.0,
+                to_kbps: 80_000.0,
+            })
+        );
+    }
+
+    #[test]
+    fn adaptive_ceiling_stall_reset_restores_configured_max() {
+        let start = Instant::now();
+        let hold = Duration::from_secs(1);
+        let mut ceiling = AdaptiveCeilingDirection::new(80_000.0, 100_000.0);
+
+        ceiling.observe(start, true, false, 80_000.0, hold, 1.0);
+        ceiling.observe(start + hold, true, false, 80_000.0, hold, 1.0);
+        assert_eq!(
+            ceiling.reset_to_configured(),
+            Some(AdaptiveCeilingChange::Lowered {
+                from_kbps: 80_800.0,
+                to_kbps: 80_000.0,
+            })
+        );
+    }
+
+    #[test]
     fn parses_live_cake_linklayer_overhead() {
         let noatm = "qdisc cake 8001: root refcnt 2 bandwidth 10Mbit diffserv3 noatm overhead 44";
         let atm = "qdisc cake 8002: root refcnt 2 bandwidth 2Mbit besteffort atm overhead 18";
@@ -3780,6 +4254,22 @@ mod tests {
 
         let err = cfg.validate().expect_err("expected active threshold guard");
         assert!(err.contains("connection_active_thr_kbps"));
+    }
+
+    #[test]
+    fn adaptive_ceiling_validation_is_strict_only_when_enabled() {
+        let mut cfg = Config::defaults("test".to_string());
+        cfg.adaptive_ceiling_dl_cap_kbps = 1.0;
+        cfg.adaptive_ceiling_growth_percent = 99.0;
+        assert!(cfg.validate().is_ok());
+
+        cfg.adaptive_ceiling_enabled = true;
+        let err = cfg.validate().expect_err("expected adaptive DL cap guard");
+        assert!(err.contains("adaptive_ceiling_dl_cap_kbps"));
+
+        cfg.adaptive_ceiling_dl_cap_kbps = cfg.max_dl_shaper_rate_kbps;
+        cfg.adaptive_ceiling_growth_percent = 1.0;
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
