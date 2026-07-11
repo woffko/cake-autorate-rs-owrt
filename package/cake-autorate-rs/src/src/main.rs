@@ -728,9 +728,6 @@ impl Config {
         if self.no_pingers == 0 {
             return Err("no_pingers must be greater than zero".to_string());
         }
-        if self.pinger_method == "ping" && self.no_pingers > 1 {
-            return Err("pinger_method=ping supports only no_pingers=1".to_string());
-        }
         if self.no_pingers > self.reflectors.len() {
             return Err("no_pingers cannot exceed reflector count".to_string());
         }
@@ -2512,7 +2509,7 @@ fn spawn_pingers(cfg: &Config, active_reflectors: &[String]) -> Result<Vec<Child
         "fping-ts" => Ok(vec![spawn_fping(cfg, active_reflectors, true)?]),
         "tsping" => Ok(vec![spawn_tsping(cfg, active_reflectors)?]),
         "irtt" => spawn_irtt(cfg, active_reflectors),
-        "ping" => Ok(vec![spawn_ping(cfg, active_reflectors)?]),
+        "ping" => spawn_ping(cfg, active_reflectors),
         other => Err(format!("unsupported pinger_method={other}")),
     }
 }
@@ -2584,10 +2581,28 @@ fn spawn_tsping(cfg: &Config, active_reflectors: &[String]) -> Result<Child, Str
         .map_err(|e| format!("failed to start tsping: {e}"))
 }
 
-fn spawn_ping(cfg: &Config, active_reflectors: &[String]) -> Result<Child, String> {
-    let target = active_reflectors
-        .first()
-        .ok_or_else(|| "at least one reflector is required".to_string())?;
+fn spawn_ping(cfg: &Config, active_reflectors: &[String]) -> Result<Vec<Child>, String> {
+    if active_reflectors.is_empty() {
+        return Err("at least one reflector is required".to_string());
+    }
+
+    let mut children = Vec::new();
+    for target in active_reflectors {
+        match spawn_ping_child(cfg, target) {
+            Ok(child) => children.push(child),
+            Err(e) => {
+                for child in &mut children {
+                    stop_child(child);
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    Ok(children)
+}
+
+fn spawn_ping_child(cfg: &Config, target: &str) -> Result<Child, String> {
     let interval_s = cfg.reflector_ping_interval_s.ceil().max(1.0) as u64;
 
     let mut cmd = pinger_command(cfg, "ping")?;
@@ -3745,6 +3760,16 @@ mod tests {
 
         let err = cfg.validate().expect_err("expected active threshold guard");
         assert!(err.contains("connection_active_thr_kbps"));
+    }
+
+    #[test]
+    fn ping_fallback_allows_multiple_active_reflectors_like_upstream() {
+        let mut cfg = Config::defaults("test".to_string());
+        cfg.pinger_method = "ping".to_string();
+        cfg.no_pingers = 2;
+        cfg.reflectors = vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()];
+
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

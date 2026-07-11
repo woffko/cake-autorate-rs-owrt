@@ -637,8 +637,7 @@ if [ "$mode" = "scan" ]; then
 		recommended_reason="Timestamp-capable reflectors were insufficient; use concurrent RTT probing."
 	elif [ -n "$ping_bin" ]; then
 		recommended_method="ping"
-		recommended_reason="fping probing did not find usable reflectors; ping is an emergency single-reflector fallback."
-		target_pingers=1
+		recommended_reason="fping probing did not find usable reflectors; ping is an emergency per-reflector fallback."
 	else
 		recommended_reason="No usable pinger backend is available."
 	fi
@@ -648,7 +647,7 @@ else
 		recommended_reason="Current configuration requests explicit IRTT servers."
 	elif [ "$configured_method" = "ping" ]; then
 		recommended_method="ping"
-		recommended_reason="Current configuration uses the single-reflector ping fallback; run a scan before changing it."
+		recommended_reason="Current configuration uses the per-reflector ping fallback; run a scan before changing it."
 	elif [ "$configured_method" = "fping-ts" ] || [ "$configured_method" = "tsping" ]; then
 		recommended_method="$configured_method"
 		recommended_reason="Current configuration requests a timestamp-aware backend; run a scan to verify reflector support."

@@ -96,7 +96,7 @@ var optionDescriptions = {
 	high_load_thr: 'Fraction of current shaper rate that counts as high load.',
 	bufferbloat_refractory_period_ms: 'Minimum time after a bufferbloat response before another backoff may happen.',
 	decay_refractory_period_ms: 'Minimum time between low-load decay adjustments.',
-	pinger_method: 'Probe backend used to measure reflector latency. fping supports concurrent RTT reflectors; fping-ts and tsping use ICMP timestamp OWD probes; irtt uses explicit IRTT servers with synchronized clocks; ping is a basic fallback using the first reflector.',
+	pinger_method: 'Probe backend used to measure reflector latency. fping supports concurrent RTT reflectors; fping-ts and tsping use ICMP timestamp OWD probes; irtt uses explicit IRTT servers with synchronized clocks; ping is a basic fallback using one ping process per active reflector.',
 	_pinger_backend_status: 'Show which pinger binaries are available and which backend the planner would prefer.',
 	_pinger_backend_install: 'Install the package for the selected pinger when automatic installation is supported. tsping remains a manual binary install; irtt also needs explicit IRTT servers and NTP-synchronized clocks.',
 	_reflector_scan: 'Probe configured reflectors plus the upstream default pool, classify timestamp support, and suggest an active set plus spare pool.',
@@ -494,9 +494,6 @@ function validatePingerCount(section, section_id) {
 
 		return true;
 	}
-
-	if (method === 'ping' && !isNaN(count) && count > 1)
-		return _('The ping fallback uses only the first reflector. Set Pingers to 1 or choose fping/fping-ts/tsping/irtt.');
 
 	return true;
 }
@@ -1647,11 +1644,6 @@ function showCreateWizard(grid, name) {
 				return false;
 			}
 
-			if ((state.pinger_method || 'fping') === 'ping' &&
-			    parseInt(state.no_pingers || '1', 10) > 1) {
-				showError(_('The ping fallback can use only one pinger.'));
-				return false;
-			}
 		}
 
 		return true;
@@ -1684,12 +1676,6 @@ function showCreateWizard(grid, name) {
 
 		if (!validatePositiveInteger(state.no_pingers)) {
 			showError(_('Pingers must be a positive integer.'));
-			return false;
-		}
-
-		if ((state.pinger_method || 'fping') === 'ping' &&
-		    parseInt(state.no_pingers || '1', 10) > 1) {
-			showError(_('The ping fallback can use only one pinger.'));
 			return false;
 		}
 

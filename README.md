@@ -34,7 +34,7 @@ Implemented:
 - Multiple enabled UCI sections via procd instances.
 - `fping` RTT reflector probing, `fping-ts` and `tsping` ICMP timestamp OWD
   probing, explicit-server `irtt` OWD probing, plus a basic
-  `pinger_method=ping` fallback.
+  per-reflector `pinger_method=ping` fallback.
 - Active reflector health tracking and replacement for running `fping`,
   `fping-ts`, `tsping`, `irtt`, and `ping` probes: response-deadline offences,
   baseline/EWMA comparison, periodic replacement, optional reflector stats
@@ -95,8 +95,9 @@ Implemented:
 
 Known limits:
 
-- `pinger_method=ping` probes only the first selected reflector; use `fping`,
-  `fping-ts`, `tsping`, or explicit-server `irtt` for concurrent probing.
+- `pinger_method=ping` starts one basic ping process per active reflector, but
+  it remains a fallback; use `fping`, `fping-ts`, `tsping`, or explicit-server
+  `irtt` where those backends are available.
 - `pinger_method=irtt` requires the optional `irtt` package and at least one
   explicit `list irtt_server ...` entry. Generic DNS reflector pools are not
   used as IRTT servers. The router and IRTT servers also need synchronized
