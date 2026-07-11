@@ -1794,10 +1794,14 @@ function addUniqueValue(option, seen, value, title) {
 }
 
 function requireAdvancedSettings(section) {
+	var basicEditTabs = {
+		setup: true
+	};
+
 	for (var i = 0; i < section.children.length; i++) {
 		var option = section.children[i];
 
-		if (!option.modalonly || !option.tab || option.tab === 'setup')
+		if (!option.modalonly || !option.tab || basicEditTabs[option.tab])
 			continue;
 
 		option.retain = true;
@@ -1848,11 +1852,12 @@ function addSpeedtestOptions(section) {
 	o.onclick = function(ev, section_id) {
 		var activeSection = this.section;
 		var wan = selectedWan(activeSection, section_id, null, true);
+		var backend = formOrUci(activeSection, section_id, 'speedtest_backend') || 'auto';
 		var button = ev.currentTarget;
 
 		button.disabled = true;
 
-		return fs.exec('/usr/libexec/cake-autorate-rs/speedtest', [ section_id, wan, 'status' ]).then(function(res) {
+		return fs.exec('/usr/libexec/cake-autorate-rs/speedtest', [ section_id, wan, 'status', backend ]).then(function(res) {
 			var result = JSON.parse((res.stdout || '').trim());
 			var message = formatSpeedtestBackendStatus(result);
 
@@ -2008,13 +2013,14 @@ function addSetupOptions(section) {
 		var activeSection = this.section;
 		var percent = speedtestApplyPercent(activeSection, section_id);
 		var wan = selectedWan(activeSection, section_id, null, true);
+		var backend = formOrUci(activeSection, section_id, 'speedtest_backend') || 'auto';
 
 		if (autoInterfacePresetEnabled(activeSection, section_id))
 			applyWanPreset(section_id, wan, false, activeSection);
 
 		button.disabled = true;
 
-		return fs.exec('/usr/libexec/cake-autorate-rs/speedtest', [ section_id ]).then(function(res) {
+		return fs.exec('/usr/libexec/cake-autorate-rs/speedtest', [ section_id, wan, backend ]).then(function(res) {
 			var result = parseSpeedtestResult(res.stdout);
 			var applied = applySpeedtestRates(activeSection, section_id, result, percent);
 			var message = _('Speed test applied at %d%%: download %s kbit/s, upload %s kbit/s.').format(

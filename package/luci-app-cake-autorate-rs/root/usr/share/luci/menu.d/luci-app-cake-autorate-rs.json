@@ -1,6 +1,6 @@
 {
 	"admin/network/cake-autorate-rs": {
-		"title": "CAKE Autorate",
+		"title": "CAKE Autorate SQM",
 		"order": 80,
 		"action": {
 			"type": "firstchild"

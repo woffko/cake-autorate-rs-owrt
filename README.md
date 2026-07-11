@@ -62,6 +62,10 @@ Implemented:
   another SQM section does not satisfy the guard.
 - LuCI setup wizard for creating instances, importing SQM rates, checking speed
   test backends, running a router-side speed test, and writing derived limits.
+- LuCI instance editing keeps advanced speed test backend controls and
+  pinger/reflector planning behind the advanced settings toggle. Basic setup
+  speed test actions still use the current unsaved interface and backend
+  selections from the edit modal when those controls are available.
 - LuCI Reflectors tab can check pinger backend availability and scan configured
   reflectors plus the upstream default anycast reflector pool, including RTT and
   ICMP timestamp capability, without adding hard dependencies. It shows RTT/OWD
