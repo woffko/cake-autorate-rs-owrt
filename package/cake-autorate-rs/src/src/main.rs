@@ -3549,8 +3549,8 @@ fn main() {
 mod tests {
     use super::{
         default_reflectors, irtt_target_arg, max_wire_packet_size_bits_from_mtu,
-        monitor_tick_timeout, next_spare_reflector, packet_compensation_us, parse_fping_ts_line,
-        parse_irtt_duration_us, parse_irtt_line, parse_reflector_candidates,
+        monitor_tick_timeout, next_spare_reflector, packet_compensation_us, parse_fping_line,
+        parse_fping_ts_line, parse_irtt_duration_us, parse_irtt_line, parse_reflector_candidates,
         parse_tc_linklayer_overhead, parse_tsping_line, parse_uci_values, pinger_command,
         pinger_response_interval_s, reflector_bad_reflectors, reflector_health_json,
         reflector_spare_reflectors, sample_is_stale, stall_detection_timeout, Config,
@@ -3596,6 +3596,26 @@ mod tests {
             reflectors.last().map(String::as_str),
             Some("185.228.168.10")
         );
+    }
+
+    #[test]
+    fn parses_openwrt_fping_success_line() {
+        let line = "[1783743970.24147] 1.1.1.1 : [0], 64 bytes, 3.80 ms (3.80 avg, 0% loss)";
+        let sample = parse_fping_line(line).expect("expected fping sample");
+
+        assert_eq!(sample.reflector, "1.1.1.1");
+        assert_eq!(sample.seq, "0");
+        assert_eq!(sample.timestamp, 1783743970.24147);
+        assert_eq!(sample.rtt_ms, 3.80);
+        assert_eq!(sample.dl_owd_us, 1900.0);
+        assert_eq!(sample.ul_owd_us, 1900.0);
+        assert!(!sample.timestamped_owd);
+    }
+
+    #[test]
+    fn ignores_fping_timeout_line() {
+        let line = "[1783743970.24147] 1.1.1.1 : [0], timed out (NaN avg, 100% loss)";
+        assert!(parse_fping_line(line).is_none());
     }
 
     #[test]
