@@ -89,6 +89,8 @@ Implemented:
 - Upstream-style max-wire packet compensation for OWD thresholds and achieved
   rate monitor timing, using live interface MTU plus CAKE `atm/noatm overhead`
   from `tc qdisc show`.
+- Upstream-style stale reflector response guard: pinger samples processed more
+  than 500 ms after their timestamp are logged and skipped.
 - LuCI status page with start, restart, stop actions.
 
 Known limits:
