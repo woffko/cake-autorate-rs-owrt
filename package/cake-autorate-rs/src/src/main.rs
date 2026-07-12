@@ -12,6 +12,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static TERMINATE: AtomicBool = AtomicBool::new(false);
 const STALE_REFLECTOR_RESPONSE_MAX_AGE_S: f64 = 0.5;
+const GRAPH_HISTORY_INTERVAL_S: u64 = 10;
+const GRAPH_HISTORY_MAX_BYTES: u64 = 128 * 1024;
+const GRAPH_HISTORY_COMPACT_BYTES: usize = 96 * 1024;
 
 const UPSTREAM_DEFAULT_REFLECTORS: &[&str] = &[
     "1.1.1.1",
@@ -130,6 +133,7 @@ struct Config {
     output_cake_changes: bool,
     output_cpu_stats: bool,
     output_cpu_raw_stats: bool,
+    graph_history_enabled: bool,
     log_to_file: bool,
     debug: bool,
     log_debug_messages_to_syslog: bool,
@@ -223,6 +227,7 @@ impl Config {
             output_cake_changes: false,
             output_cpu_stats: false,
             output_cpu_raw_stats: false,
+            graph_history_enabled: false,
             log_to_file: true,
             debug: true,
             log_debug_messages_to_syslog: false,
@@ -593,6 +598,11 @@ impl Config {
             "output_cpu_raw_stats",
             &mut cfg.output_cpu_raw_stats,
         )?;
+        set_bool(
+            &single,
+            "graph_history_enabled",
+            &mut cfg.graph_history_enabled,
+        )?;
         set_bool(&single, "log_to_file", &mut cfg.log_to_file)?;
         set_bool(&single, "debug", &mut cfg.debug)?;
         set_bool(
@@ -897,6 +907,10 @@ impl Config {
         } else {
             PathBuf::from(&self.log_file_path_override).join(name)
         }
+    }
+
+    fn graph_history_path(&self) -> PathBuf {
+        self.run_dir().join("history.csv")
     }
 }
 
@@ -1607,6 +1621,7 @@ struct Controller {
     last_decay_dl: Instant,
     last_decay_ul: Instant,
     last_cpu_sample: Instant,
+    last_graph_history_sample: Instant,
     cpu_total_percent: Option<f64>,
     cpu_core_percentages: Vec<f64>,
     started_at: f64,
@@ -1618,6 +1633,13 @@ impl Controller {
     fn new(mut cfg: Config) -> Result<Self, String> {
         ensure_run_dir(&cfg.run_dir())
             .map_err(|e| format!("failed to create run directory: {e}"))?;
+        if cfg.graph_history_enabled {
+            if let Err(e) = File::create(cfg.graph_history_path()) {
+                eprintln!("WARNING: failed to initialize graph history: {e}");
+            }
+        } else {
+            let _ = fs::remove_file(cfg.graph_history_path());
+        }
         wait_for_path(&cfg.rx_bytes_path, cfg.if_up_check_interval_s)?;
         wait_for_path(&cfg.tx_bytes_path, cfg.if_up_check_interval_s)?;
         cfg.refresh_wire_packet_sizes();
@@ -1632,16 +1654,12 @@ impl Controller {
 
         let rate_monitor = RateMonitor::new(&cfg.rx_bytes_path, &cfg.tx_bytes_path)
             .map_err(|e| format!("failed to create rate monitor: {e}"))?;
-        let cpu_monitor = if cfg.output_cpu_stats || cfg.output_cpu_raw_stats {
-            match CpuMonitor::new() {
-                Ok(monitor) => Some(monitor),
-                Err(e) => {
-                    eprintln!("WARNING: failed to initialize CPU monitor: {e}");
-                    None
-                }
+        let cpu_monitor = match CpuMonitor::new() {
+            Ok(monitor) => Some(monitor),
+            Err(e) => {
+                eprintln!("WARNING: failed to initialize CPU monitor: {e}");
+                None
             }
-        } else {
-            None
         };
         let now = Instant::now();
         let adaptive_dl = AdaptiveCeilingDirection::new(
@@ -1665,6 +1683,7 @@ impl Controller {
             last_decay_dl: now,
             last_decay_ul: now,
             last_cpu_sample: now,
+            last_graph_history_sample: now,
             cpu_total_percent: None,
             cpu_core_percentages: Vec::new(),
             run_state: "RUNNING".to_string(),
@@ -1991,14 +2010,10 @@ impl Controller {
         );
     }
 
-    fn maybe_sample_cpu(&mut self) {
-        if !self.cfg.output_cpu_stats && !self.cfg.output_cpu_raw_stats {
-            return;
-        }
-
+    fn maybe_sample_cpu(&mut self) -> bool {
         let interval = Duration::from_millis(self.cfg.monitor_cpu_usage_interval_ms.max(1));
         if self.last_cpu_sample.elapsed() < interval {
-            return;
+            return false;
         }
 
         self.last_cpu_sample = Instant::now();
@@ -2015,7 +2030,7 @@ impl Controller {
         };
 
         let Some(stats) = sample else {
-            return;
+            return false;
         };
 
         self.cpu_total_percent = Some(stats.total_percent);
@@ -2036,6 +2051,55 @@ impl Controller {
                     .map(|percent| format!("{percent:.1}")),
             );
             self.log("CPU", &values.join("; "));
+        }
+
+        true
+    }
+
+    fn maybe_record_graph_history(&mut self) {
+        if !self.cfg.graph_history_enabled
+            || self.last_graph_history_sample.elapsed()
+                < Duration::from_secs(GRAPH_HISTORY_INTERVAL_S)
+        {
+            return;
+        }
+
+        self.last_graph_history_sample = Instant::now();
+        let now = epoch_secs();
+        let rtt_ms = self.last_status.as_ref().and_then(|snapshot| {
+            let age_s = now - snapshot.sample.timestamp;
+            if self.run_state == "RUNNING" && (-1.0..=5.0).contains(&age_s) {
+                Some(snapshot.sample.rtt_ms)
+            } else {
+                None
+            }
+        });
+        let line = format!(
+            "{:.0},{},{}\n",
+            now,
+            json_f64_or_empty(rtt_ms, 3),
+            json_f64_or_empty(self.cpu_total_percent, 1)
+        );
+        let path = self.cfg.graph_history_path();
+
+        if fs::metadata(&path)
+            .map(|metadata| metadata.len().saturating_add(line.len() as u64))
+            .unwrap_or(0)
+            > GRAPH_HISTORY_MAX_BYTES
+        {
+            if let Err(e) = compact_graph_history_file(&path) {
+                self.log("ERROR", &format!("failed to compact graph history: {e}"));
+                return;
+            }
+        }
+
+        let result = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| file.write_all(line.as_bytes()));
+        if let Err(e) = result {
+            self.log("ERROR", &format!("failed to append graph history: {e}"));
         }
     }
 
@@ -2631,6 +2695,10 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
             controller.note_probe_gap();
         }
         let (dl_rate, ul_rate) = controller.sample_rates();
+        if controller.maybe_sample_cpu() {
+            let _ = controller.refresh_status_from_last_sample();
+        }
+        controller.maybe_record_graph_history();
         let connection_active =
             dl_rate > cfg.connection_active_thr_kbps || ul_rate > cfg.connection_active_thr_kbps;
         let stall_load_active =
@@ -3705,6 +3773,42 @@ fn json_f64_or_null(value: Option<f64>, precision: usize) -> String {
     }
 }
 
+fn json_f64_or_empty(value: Option<f64>, precision: usize) -> String {
+    match value {
+        Some(value) if value.is_finite() => format!("{:.*}", precision, value),
+        _ => String::new(),
+    }
+}
+
+fn compact_graph_history_data(data: &str, max_bytes: usize) -> String {
+    let mut newest = Vec::new();
+    let mut bytes = 0usize;
+
+    for line in data.lines().rev() {
+        let line_bytes = line.len().saturating_add(1);
+        if !newest.is_empty() && bytes.saturating_add(line_bytes) > max_bytes {
+            break;
+        }
+        newest.push(line);
+        bytes = bytes.saturating_add(line_bytes);
+    }
+
+    newest.reverse();
+    if newest.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", newest.join("\n"))
+    }
+}
+
+fn compact_graph_history_file(path: &Path) -> io::Result<()> {
+    let data = fs::read_to_string(path).unwrap_or_default();
+    let compacted = compact_graph_history_data(&data, GRAPH_HISTORY_COMPACT_BYTES);
+    let tmp = path.with_extension("csv.tmp");
+    fs::write(&tmp, compacted)?;
+    fs::rename(tmp, path)
+}
+
 fn json_f64_array(values: &[f64], precision: usize) -> String {
     let out: Vec<String> = values
         .iter()
@@ -3893,14 +3997,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_reflectors, irtt_target_arg, max_wire_packet_size_bits_from_mtu,
-        monitor_tick_timeout, next_spare_reflector, packet_compensation_us, parse_fping_line,
-        parse_fping_ts_line, parse_irtt_duration_us, parse_irtt_line, parse_reflector_candidates,
-        parse_tc_linklayer_overhead, parse_tsping_line, parse_uci_values, pinger_command,
-        pinger_response_interval_s, reflector_bad_reflectors, reflector_health_json,
-        reflector_spare_reflectors, sample_is_stale, stall_detection_timeout,
-        AdaptiveCeilingChange, AdaptiveCeilingDirection, Config, ReflectorHealth, ReflectorState,
-        Sample,
+        compact_graph_history_data, default_reflectors, irtt_target_arg,
+        max_wire_packet_size_bits_from_mtu, monitor_tick_timeout, next_spare_reflector,
+        packet_compensation_us, parse_fping_line, parse_fping_ts_line, parse_irtt_duration_us,
+        parse_irtt_line, parse_reflector_candidates, parse_tc_linklayer_overhead,
+        parse_tsping_line, parse_uci_values, pinger_command, pinger_response_interval_s,
+        reflector_bad_reflectors, reflector_health_json, reflector_spare_reflectors,
+        sample_is_stale, stall_detection_timeout, AdaptiveCeilingChange, AdaptiveCeilingDirection,
+        Config, ReflectorHealth, ReflectorState, Sample,
     };
     use std::time::{Duration, Instant};
 
@@ -4245,6 +4349,15 @@ mod tests {
         assert_eq!(cfg.log_file_buffer_size_b, 512);
         assert_eq!(cfg.log_file_buffer_timeout_ms, 500);
         assert!(cfg.log_file_export_compress);
+    }
+
+    #[test]
+    fn graph_history_is_opt_in_and_compaction_keeps_newest_samples() {
+        let cfg = Config::defaults("test".to_string());
+        assert!(!cfg.graph_history_enabled);
+
+        let data = "1,1,1\n2,2,2\n3,3,3\n";
+        assert_eq!(compact_graph_history_data(data, 12), "2,2,2\n3,3,3\n");
     }
 
     #[test]

@@ -412,11 +412,24 @@ reload_service() {
 	start
 }
 
-service_stopped() {
-	# Daemons write status.json themselves. Remove the last sample after procd
-	# has stopped them so LuCI cannot mistake it for a live instance.
-	rm -f /var/run/cake-autorate/*/status.json 2>/dev/null || true
+cleanup_runtime_files() {
+	# Runtime status and graph history live only in tmpfs. Remove them whenever
+	# the service is explicitly stopped so LuCI cannot show inactive instances.
+	rm -f /var/run/cake-autorate/*/status.json \
+		/var/run/cake-autorate/*/history.csv \
+		/var/run/cake-autorate/*/history.csv.tmp 2>/dev/null || true
+}
+
+stop_service() {
 	stop_managed_sqm_backend
+}
+
+service_stopped() {
+	# procd_kill() returns before the terminated process is fully reaped. Give
+	# the daemon a moment to stop so it cannot recreate status.json after the
+	# cleanup, then remove all volatile runtime files synchronously.
+	sleep 1
+	cleanup_runtime_files
 }
 
 service_triggers() {

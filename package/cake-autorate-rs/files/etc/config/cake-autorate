@@ -159,6 +159,8 @@ config cake_autorate 'primary'
 	# Monitoring intervals and detector windows
 	option monitor_achieved_rates_interval_ms '200'
 	option monitor_cpu_usage_interval_ms '2000'
+	# Optional Graphs-tab history lives only in /var/run (RAM/tmpfs), never flash.
+	option graph_history_enabled '0'
 	option bufferbloat_detection_window '6'
 	option bufferbloat_detection_thr '3'
 	option alpha_baseline_increase '0.001'

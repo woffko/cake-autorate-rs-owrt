@@ -34,5 +34,17 @@
 		"depends": {
 			"acl": [ "luci-app-cake-autorate-rs" ]
 		}
+	},
+
+	"admin/network/cake-autorate-rs/graphs": {
+		"title": "Graphs",
+		"order": 15,
+		"action": {
+			"type": "view",
+			"path": "cake-autorate-rs/graphs"
+		},
+		"depends": {
+			"acl": [ "luci-app-cake-autorate-rs" ]
+		}
 	}
 }

@@ -59,7 +59,8 @@ Implemented:
 - Runtime status JSON and LuCI status page expose active, spare, and bad
   reflector sets plus per-reflector samples, offence counters, and last RTT.
 - sysfs RX/TX byte counter sampling.
-- optional CPU usage sampling from `/proc/stat`, exposed in logs and status JSON.
+- CPU usage sampling from `/proc/stat` is always exposed in runtime status;
+  `output_cpu_stats` and `output_cpu_raw_stats` control log records only.
 - adaptive rate calculations using delay/load windows.
 - Optional Rust-only adaptive ceiling extension, disabled by default so the
   upstream configured maximum remains a hard limit. When explicitly enabled,
@@ -75,6 +76,11 @@ Implemented:
   or global no-response timeout.
 - daemon log rotation by age/size with best-effort gzip compression.
 - JSON status file under `/var/run/cake-autorate/<instance>/status.json`.
+- Optional per-instance LuCI `Graphs` history for RTT and total CPU. It is
+  disabled by default and enabled directly on each active instance card. Samples
+  are kept only in `/var/run` tmpfs every 10 seconds, the chart shows the last
+  three hours, and a hard 128 KiB per-instance cap prevents unbounded RAM use.
+  History is removed when the service stops and never writes router flash.
 - LuCI Status can export a diagnostic text bundle containing redacted
   cake-autorate config, SQM config, runtime status, daemon logs, package
   versions, and recent syslog lines.
@@ -373,6 +379,19 @@ uci commit cake-autorate
 /etc/init.d/cake-autorate enable
 /etc/init.d/cake-autorate restart
 ```
+
+Graph history is opt-in per instance. The same switch is available on the
+LuCI `Graphs` page; from the shell it can be changed with:
+
+```sh
+uci set cake-autorate.primary.graph_history_enabled='1'  # use '0' to disable
+uci commit cake-autorate
+/etc/init.d/cake-autorate restart
+```
+
+When enabled, `history.csv` is sampled every 10 seconds under
+`/var/run/cake-autorate/<instance>/`. It has a hard 128 KiB per-instance limit,
+is removed on service stop/reboot, and is never stored in flash.
 
 ## Quick Checks
 
