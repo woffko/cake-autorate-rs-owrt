@@ -275,6 +275,16 @@ impl AdaptiveCeilingDirection {
     }
 
     fn handle_bufferbloat(&mut self, now: Instant, shaper_rate_kbps: f64) -> AdaptiveCeilingUpdate {
+        // Backoff is already the adaptive controller's response to a confirmed
+        // bufferbloat event.  The fast inner rate controller must remain free
+        // to keep lowering the live shaper while congestion persists, but the
+        // adaptive ceiling must not re-enter Backoff on every sample.  Doing so
+        // resets the cooldown indefinitely and emits a noisy Backoff -> Backoff
+        // transition without learning any new bound.
+        if self.phase == AdaptiveCeilingPhase::Backoff {
+            return AdaptiveCeilingUpdate::default();
+        }
+
         let previous = self.effective_max_kbps;
         let failed = self
             .probe_target_kbps
@@ -501,6 +511,60 @@ mod tests {
     }
 
     #[test]
+    fn repeated_bufferbloat_during_backoff_is_a_noop() {
+        let start = Instant::now();
+        let mut ceiling = AdaptiveCeilingDirection::new_at(100_000.0, 150_000.0, start);
+
+        ceiling.observe(start, clean(100_000.0), policy());
+        ceiling.observe(start + Duration::from_secs(10), clean(100_000.0), policy());
+        ceiling.observe(
+            start + Duration::from_secs(11),
+            AdaptiveCeilingObservation {
+                eligible: false,
+                bufferbloat: true,
+                shaper_rate_kbps: 95_000.0,
+            },
+            policy(),
+        );
+
+        let phase_since = ceiling.phase_since();
+        let safe = ceiling.safe_ceiling_kbps();
+        let failed = ceiling.failed_ceiling_kbps();
+        let target = ceiling.probe_target_kbps();
+        let repeated = ceiling.observe(
+            start + Duration::from_secs(12),
+            AdaptiveCeilingObservation {
+                eligible: false,
+                bufferbloat: true,
+                shaper_rate_kbps: 80_000.0,
+            },
+            policy(),
+        );
+
+        assert_eq!(repeated, AdaptiveCeilingUpdate::default());
+        assert_eq!(ceiling.phase(), AdaptiveCeilingPhase::Backoff);
+        assert_eq!(ceiling.phase_since(), phase_since);
+        assert_eq!(ceiling.safe_ceiling_kbps(), safe);
+        assert_eq!(ceiling.failed_ceiling_kbps(), failed);
+        assert_eq!(ceiling.probe_target_kbps(), target);
+
+        let cooldown = ceiling.observe(
+            start + Duration::from_secs(21),
+            AdaptiveCeilingObservation {
+                eligible: false,
+                bufferbloat: false,
+                shaper_rate_kbps: 80_000.0,
+            },
+            policy(),
+        );
+        assert_eq!(ceiling.phase(), AdaptiveCeilingPhase::Cruise);
+        assert_eq!(
+            cooldown.transition.map(|transition| transition.reason),
+            Some("probe cooldown complete")
+        );
+    }
+
+    #[test]
     fn failed_bound_causes_midpoint_probe() {
         let start = Instant::now();
         let mut ceiling = AdaptiveCeilingDirection::new_at(100_000.0, 150_000.0, start);
@@ -647,7 +711,8 @@ mod tests {
     #[derive(Debug)]
     struct SimulationMetrics {
         average_utilization: f64,
-        confirmed_bloat_events: usize,
+        bufferbloat_samples: usize,
+        confirmed_bufferbloat_transitions: usize,
         first_95_percent_safe_s: Option<u64>,
         final_ceiling_kbps: f64,
     }
@@ -672,7 +737,8 @@ mod tests {
         let mut ceiling = AdaptiveCeilingDirection::new_at(800_000.0, 1_000_000.0, start);
         let mut shaper = 800_000.0;
         let mut utilization_sum = 0.0;
-        let mut bloat_events = 0;
+        let mut bloat_samples = 0;
+        let mut confirmed_bufferbloat_transitions = 0;
         let mut first_95 = None;
 
         for second in 0..duration_s {
@@ -687,14 +753,14 @@ mod tests {
 
             let bufferbloat = shaper > available;
             if bufferbloat {
-                bloat_events += 1;
+                bloat_samples += 1;
                 shaper = (shaper * 0.90).max(400_000.0);
             }
             let achieved = shaper.min(available);
             utilization_sum += achieved / available;
             let eligible = !bufferbloat && !noise(second) && achieved >= shaper * 0.95;
 
-            ceiling.observe(
+            let update = ceiling.observe(
                 now,
                 AdaptiveCeilingObservation {
                     eligible,
@@ -703,6 +769,16 @@ mod tests {
                 },
                 simulation_policy(),
             );
+            if matches!(
+                update.transition,
+                Some(AdaptiveCeilingTransition {
+                    from,
+                    to: AdaptiveCeilingPhase::Backoff,
+                    reason: "confirmed bufferbloat",
+                }) if from != AdaptiveCeilingPhase::Backoff
+            ) {
+                confirmed_bufferbloat_transitions += 1;
+            }
 
             if first_95.is_none() && ceiling.safe_ceiling_kbps() >= available * 0.95 {
                 first_95 = Some(second);
@@ -711,7 +787,8 @@ mod tests {
 
         SimulationMetrics {
             average_utilization: utilization_sum / duration_s as f64,
-            confirmed_bloat_events: bloat_events,
+            bufferbloat_samples: bloat_samples,
+            confirmed_bufferbloat_transitions,
             first_95_percent_safe_s: first_95,
             final_ceiling_kbps: ceiling.safe_ceiling_kbps(),
         }
@@ -770,7 +847,8 @@ mod tests {
 
         SimulationMetrics {
             average_utilization: utilization_sum / duration_s as f64,
-            confirmed_bloat_events: bloat_events,
+            bufferbloat_samples: bloat_events,
+            confirmed_bufferbloat_transitions: bloat_events,
             first_95_percent_safe_s: first_95,
             final_ceiling_kbps: ceiling,
         }
@@ -786,7 +864,8 @@ mod tests {
             bounded.first_95_percent_safe_s.unwrap() < legacy.first_95_percent_safe_s.unwrap() / 2
         );
         assert!(bounded.average_utilization > legacy.average_utilization);
-        assert!(bounded.confirmed_bloat_events <= 2);
+        assert!(bounded.bufferbloat_samples <= 2);
+        assert!(bounded.confirmed_bufferbloat_transitions <= 2);
         assert!(bounded.final_ceiling_kbps >= 900_000.0);
     }
 
@@ -806,7 +885,11 @@ mod tests {
 
         eprintln!("variable bounded={bounded:?} legacy={legacy:?}");
         assert!(bounded.average_utilization >= legacy.average_utilization);
-        assert!(bounded.confirmed_bloat_events <= 5);
+        // A capacity step can produce several fast-controller delay samples,
+        // but they must collapse into a single adaptive Backoff transition
+        // instead of resetting the adaptive cooldown for every sample.
+        assert!(bounded.bufferbloat_samples <= 10);
+        assert!(bounded.confirmed_bufferbloat_transitions <= 5);
         assert!(bounded.final_ceiling_kbps > 850_000.0);
     }
 
@@ -818,7 +901,8 @@ mod tests {
 
         eprintln!("noise bounded={bounded:?} legacy={legacy:?}");
         assert!(bounded.final_ceiling_kbps >= legacy.final_ceiling_kbps);
-        assert!(bounded.confirmed_bloat_events <= 2);
+        assert!(bounded.bufferbloat_samples <= 2);
+        assert!(bounded.confirmed_bufferbloat_transitions <= 2);
     }
 
     #[test]
@@ -829,7 +913,9 @@ mod tests {
         eprintln!("asymmetric download={download:?} upload={upload:?}");
         assert!(download.final_ceiling_kbps >= 900_000.0);
         assert!((850_000.0..=885_000.0).contains(&upload.final_ceiling_kbps));
-        assert!(download.confirmed_bloat_events <= 2);
-        assert!(upload.confirmed_bloat_events <= 5);
+        assert!(download.bufferbloat_samples <= 2);
+        assert!(upload.bufferbloat_samples <= 5);
+        assert!(download.confirmed_bufferbloat_transitions <= 2);
+        assert!(upload.confirmed_bufferbloat_transitions <= 5);
     }
 }
