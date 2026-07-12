@@ -5,6 +5,10 @@ of the upstream-compatible CAKE autorate loop. The normal loop remains
 responsible for reacting quickly to load and delay. The bounded controller only
 decides how far that loop may search above the configured maximum.
 
+For the complete implemented formulas, rate-clamp ordering, and a numerical
+probe example, see [ALGORITHM_MATH.md](ALGORITHM_MATH.md). An anonymized
+fixed-SQM/autorate/unshaped comparison is recorded in [TESTING.md](TESTING.md).
+
 This separation is deliberate: upstream
 [`cake-autorate`](https://github.com/lynxthecat/cake-autorate) already supplies
 the fast independent DL/UL load-and-delay feedback loop, while CAKE's
