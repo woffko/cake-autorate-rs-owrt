@@ -3,6 +3,7 @@
 'require poll';
 'require uci';
 'require ui';
+'require cake-autorate-rs.ui as cakeUi';
 
 function statusPath(section) {
 	return '/var/run/cake-autorate/' + section + '/status.json';
@@ -291,6 +292,7 @@ return L.view.extend({
 	},
 
 	render: function(data) {
+		cakeUi.ensureAppHeader();
 		var sections = data[0];
 		var statuses = data[1];
 		var versions = data[2] || {};

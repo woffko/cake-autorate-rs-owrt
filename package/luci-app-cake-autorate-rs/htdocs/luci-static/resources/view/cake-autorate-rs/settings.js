@@ -5,6 +5,7 @@
 'require uci';
 'require ui';
 'require tools.widgets as widgets';
+'require cake-autorate-rs.ui as cakeUi';
 
 function modal(option) {
 	option.modalonly = true;
@@ -3128,6 +3129,7 @@ return L.view.extend({
 	},
 
 	render: function(data) {
+		cakeUi.ensureAppHeader();
 		var m, s;
 		var qdiscs = data[2];
 		var scripts = data[3];
