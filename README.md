@@ -2,12 +2,39 @@
 
 OpenWrt package bundle for a Rust prototype of `cake-autorate` with a LuCI UI and UCI configuration.
 
+## Project roots and acknowledgements
+
+This project is a Rust/OpenWrt adaptation of
+[`cake-autorate`](https://github.com/lynxthecat/cake-autorate), which was
+created by [lynxthecat](https://github.com/lynxthecat) in 2021 and subsequently
+developed by its community. The fast load-and-delay controller, terminology,
+configuration model, and many defaults here deliberately follow that original
+work. Development of this port started from the maintained
+[`woffko/cake-autorate`](https://github.com/woffko/cake-autorate) fork.
+
+Our sincere thanks go to lynxthecat for founding `cake-autorate`, to all of its
+contributors for refining the algorithm in real networks, and to the CAKE,
+OpenWrt, and `sqm-scripts` developers whose work provides the queueing and
+shaping foundation. This port adds a Rust daemon, UCI/procd integration, a
+combined LuCI/SQM interface, bounded ceiling probes, and RAM-only graphs; it
+does not claim authorship of the original cake-autorate concept.
+
+## Documentation
+
+- [Controller mathematics](ALGORITHM_MATH.md) describes rate measurement,
+  delay baselines, bufferbloat detection, the fast rate controller, and the
+  bounded adaptive-ceiling state machine with formulas and examples.
+- [Testing and observed results](TESTING.md) documents repeatable validation
+  procedures and anonymized fixed-SQM, autorate, and unshaped measurements.
+- [Bounded probe ceiling](ADAPTIVE_CEILING.md) is the concise state-machine and
+  safety-invariant reference for the optional outer controller.
+
 The current targets are OpenWrt 25.12.5 on `x86/64` and
 `rockchip/armv8` (`aarch64_generic`, including the Banana Pi R2 Pro). The daemon
 is intentionally kept small and currently uses only the Rust standard library
 plus OpenWrt userland tools.
 
-## Development packages after 1.0 RC4
+## 1.0 RC5 packages
 
 The current tree builds these OpenWrt 25.12.5 APKs:
 
@@ -23,7 +50,7 @@ IFB, `tc`, and `ip` runtime pieces. The wizard now labels a device with its
 logical OpenWrt networks, for example `eth1 — wan, wan6`, while continuing to
 save and use the physical device name.
 
-RC4 extends the optional RAM-only history to synchronized RTT/CPU and DL/UL
+RC5 includes the optional RAM-only history introduced in RC4 for synchronized RTT/CPU and DL/UL
 traffic charts. Each active instance has a 1, 2, 5, 10, 15, 30, or 60 second
 sampling dropdown, a horizontally scrolling timeline that follows the latest
 sample until the user scrolls back, and exact values on hover. The hard 128 KiB
@@ -31,13 +58,15 @@ cap remains per instance. CPU load remains available in live Status even when
 CPU log records are disabled, and Status now shows the exact installed daemon
 and LuCI package versions.
 
-The post-RC4 daemon/LuCI revisions prevent duplicate SQM and `bridger` `clsact`
+RC5 daemon/LuCI revisions prevent duplicate SQM and `bridger` `clsact`
 state from silently breaking the IFB download path. They also add a compact
 `CAKE Autorate SQM` title and description above the application tabs. The
 optional adaptive ceiling now uses bounded probes: it remembers proven-safe
 and failed bounds independently for download and upload, rolls back immediately
 after confirmed bufferbloat, and converges with midpoint probes instead of
-repeatedly growing through a known bottleneck.
+repeatedly growing through a known bottleneck. RC5 also adds a source-backed
+mathematical description, an anonymized test report, and explicit credit to the
+original `cake-autorate` project and its founder.
 
 The release includes separate minimal x86_64 and rockchip/armv8 offline
 bundles. Extract the matching archive under `/root/` and run its included
