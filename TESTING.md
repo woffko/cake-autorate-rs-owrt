@@ -124,3 +124,90 @@ Deterministic tests cover:
 
 See [ALGORITHM_MATH.md](ALGORITHM_MATH.md) for the equations and
 [ADAPTIVE_CEILING.md](ADAPTIVE_CEILING.md) for safety invariants.
+
+## Full Auto-Tune x86 safety gate (2026-07-12)
+
+The r12 daemon and LuCI packages were installed on a disposable two-vCPU
+OpenWrt 25.12.5 x86_64 VM without changing its existing UCI files. Full
+Auto-Tune first refused the active WAN because an enabled instance already
+owned it. After that owner was disabled through a temporary, uncommitted UCI
+delta, the job created and later removed its CAKE/IFB validation shaper.
+
+Two same-server raw samples were about 716-777/177-181 Mbit/s. Shaped attempts
+retained only 53.5%/42.1% and 55.5%/72.5%, despite low ICMP latency and adequate
+total CPU. The job therefore failed closed after its single correction. This
+exposed two real portability details that are now covered by the lifecycle
+test: BusyBox fping may omit its final summary when terminated, and public DNS
+reflectors may individually rate-limit rapid ICMP. The parser now derives
+reply/timeout loss when necessary, probes once per second, and uses median
+per-reflector loss.
+
+The original instance, 85/10 Mbit/s queues, configuration hashes, and empty UCI
+delta state were restored. Playwright then opened the installed Full Auto-Tune
+and Manual wizard paths, confirmed all three visual steps and safety notices,
+and reported no TypeError or invalid-constructor failure.
+
+## Variable-WWAN LibreQoS regression (2026-07-12)
+
+This regression was added after a client-side run appeared to move from grade
+C with autorate disabled to D with autorate enabled. The router was an ARMv8
+OpenWrt 25.12.5 system on a genuinely variable WWAN link. A headless Chromium
+client entered through an SSH SOCKS tunnel, so every browser request exited the
+tested WWAN interface. Identifying addresses, carrier, and hostnames are
+omitted.
+
+| Mode | Grade | DL / UL | Scored loaded increase | Bidirectional increase |
+|---|---:|---:|---:|---:|
+| Autorate + CAKE, run 1 | C | 100.5 / 13.1 Mbit/s | +157 ms | +45 ms |
+| Fixed CAKE at 114.5 / 15.8 Mbit/s | C | 103.6 / 12.7 Mbit/s | +166 ms | +85 ms |
+| SQM fully disabled | D | 138.5 / 19.7 Mbit/s | +234 ms | +398 ms |
+| Autorate + CAKE, repeated | C | 105.6 / 12.5 Mbit/s | +192 ms | +60 ms |
+| Autorate with a temporary 90 / 12 Mbit/s start | D | 81.4 / 10.3 Mbit/s | +203 ms | +62 ms |
+| Autorate + CAKE with diagnostic HTTPS probe | C | 104.3 / 14.1 Mbit/s | +179 ms | +58 ms |
+
+The reported C-to-D direction was not reproducible as a deterministic autorate
+regression. Completely unshaped service was clearly worse, while autorate and
+fixed CAKE were close. The repeated autorate results ranged from +157 to
++192 ms, and merely lowering the rate produced +203 ms. A single C or D close
+to the 200 ms boundary is therefore not a sufficient tuning signal on this
+link.
+
+The synchronized daemon trace exposed the actionable issue. During the
++192 ms browser run, the controller's six ICMP reflectors saw only 11.3-54.2 ms
+RTT and at most 22.4 ms EWMA delay growth. CAKE download ranged from 86.8 to
+114.5 Mbit/s and upload from 12.3 to 15.8 Mbit/s; CPU peaked at 38.6%. The
+controller was functioning and classified bufferbloat, but its ICMP signal was
+far more optimistic than loaded TCP.
+
+A small HTTPS request to the same Cloudflare path provided the missing signal:
+idle requests were normally 230-350 ms including process, DNS, TCP, and TLS
+overhead, then rose repeatedly to 450-610 ms during the download phase while
+ICMP remained comparatively clean. This is consistent with carrier/path ICMP
+prioritization, not duplicate byte accounting or reversed directions.
+
+Consequences:
+
+1. Do not solve this case by blindly reducing the starting rate; the controlled
+   90/12 Mbit/s trial lost throughput without improving the grade.
+2. Full Auto-Tune now requires an idle and loaded TCP/HTTPS latency signal in
+   addition to fping. The larger latency delta drives its score, and either
+   delta above 100 ms fails closed. `uclient-fetch` is an explicit dependency.
+3. Runtime autorate still needs a source-bindable TCP/HTTP (or equivalent
+   non-prioritized transport) probe before it can react perfectly on this type
+   of carrier. Until that backend exists, use repeated client-side evidence and
+   a conservative proven starting range; retain adaptive ceiling rather than
+   treating a single grade as a new hard maximum.
+
+The updated Full Auto-Tune gate was then exercised on the same ARM router. Two
+raw samples proposed a variable-link base of 93.2/18.7 Mbit/s. Shaped attempt 1
+saw only +31.5 ms ICMP growth but +240 ms TCP/HTTPS growth and failed. Its sole
+bounded correction proposed 88.5/17.8 Mbit/s; attempt 2 still saw only +25.9 ms
+ICMP growth versus +200 ms TCP/HTTPS growth and failed. Throughput retention was
+67.6%/72.3%, loss 0%, and CPU 41%. The job returned
+`configuration_written=false`, removed its temporary IFB/qdiscs, and preserved
+the original UCI files. This is the intended fail-closed behavior for the exact
+carrier asymmetry that motivated the regression.
+
+The router was restored byte-for-byte to its saved cake-autorate and SQM
+configuration after the tests, with the original instance running and no UCI
+deltas left behind.

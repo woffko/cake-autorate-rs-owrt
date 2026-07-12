@@ -11,6 +11,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod adaptive_ceiling;
+mod autotune;
 
 use adaptive_ceiling::{
     AdaptiveCeilingChange, AdaptiveCeilingDirection, AdaptiveCeilingObservation,
@@ -3967,9 +3968,110 @@ fn reflector_health_json(
 
 fn print_usage() {
     eprintln!("usage: cake-autorated [--instance NAME] [--once] [--dump-config]");
+    eprintln!(
+        "       cake-autorated --autotune-proposal --dl-samples LIST --ul-samples LIST \\\n         --idle-median-ms N --idle-p95-ms N --idle-samples N [--link-kind KIND]"
+    );
+}
+
+fn parse_rate_samples(value: &str) -> Result<Vec<f64>, String> {
+    value
+        .split(',')
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            value
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| format!("invalid rate sample: {value}"))
+        })
+        .collect()
+}
+
+fn run_autotune_proposal_cli<I>(args: I) -> Result<(), String>
+where
+    I: Iterator<Item = String>,
+{
+    use autotune::{build_proposal, LatencyBaseline, LinkKind};
+
+    let mut download = None;
+    let mut upload = None;
+    let mut idle_median_ms = None;
+    let mut idle_p95_ms = None;
+    let mut idle_samples = None;
+    let mut base_scale = 1.0;
+    let mut link_kind = LinkKind::Unknown;
+    let mut args = args;
+
+    while let Some(arg) = args.next() {
+        let value = args
+            .next()
+            .ok_or_else(|| format!("missing value for {arg}"))?;
+        match arg.as_str() {
+            "--dl-samples" => download = Some(parse_rate_samples(&value)?),
+            "--ul-samples" => upload = Some(parse_rate_samples(&value)?),
+            "--idle-median-ms" => {
+                idle_median_ms = Some(
+                    value
+                        .parse::<f64>()
+                        .map_err(|_| "invalid idle median".to_string())?,
+                )
+            }
+            "--idle-p95-ms" => {
+                idle_p95_ms = Some(
+                    value
+                        .parse::<f64>()
+                        .map_err(|_| "invalid idle p95".to_string())?,
+                )
+            }
+            "--idle-samples" => {
+                idle_samples = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| "invalid idle sample count".to_string())?,
+                )
+            }
+            "--base-scale" => {
+                base_scale = value
+                    .parse::<f64>()
+                    .map_err(|_| "invalid base-rate scale".to_string())?
+            }
+            "--link-kind" => {
+                link_kind = LinkKind::parse(&value)
+                    .ok_or_else(|| format!("unsupported link kind: {value}"))?
+            }
+            _ => return Err(format!("unsupported autotune option: {arg}")),
+        }
+    }
+
+    let mut proposal = build_proposal(
+        download
+            .as_deref()
+            .ok_or_else(|| "--dl-samples is required".to_string())?,
+        upload
+            .as_deref()
+            .ok_or_else(|| "--ul-samples is required".to_string())?,
+        LatencyBaseline {
+            median_ms: idle_median_ms.ok_or_else(|| "--idle-median-ms is required".to_string())?,
+            p95_ms: idle_p95_ms.ok_or_else(|| "--idle-p95-ms is required".to_string())?,
+            samples: idle_samples.ok_or_else(|| "--idle-samples is required".to_string())?,
+        },
+        link_kind,
+    )?;
+    proposal.revise_base_rates(base_scale)?;
+    println!("{}", proposal.to_json());
+    Ok(())
 }
 
 fn main() {
+    let mut initial_args = env::args();
+    let _program = initial_args.next();
+    if matches!(initial_args.next().as_deref(), Some("--autotune-proposal")) {
+        if let Err(error) = run_autotune_proposal_cli(initial_args) {
+            eprintln!("ERROR: {error}");
+            std::process::exit(2);
+        }
+        return;
+    }
+
     unsafe {
         signal(2, handle_signal);
         signal(15, handle_signal);

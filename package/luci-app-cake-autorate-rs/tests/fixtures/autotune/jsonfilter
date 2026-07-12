@@ -1,0 +1,38 @@
+#!/bin/sh
+
+[ "$1" = "-e" ] || exit 1
+expression="$2"
+input="$(sed -n '1p')"
+
+case "$expression" in
+	'@.available')
+		printf '%s\n' true
+		;;
+	'@.recommended_reflectors[*]')
+		printf '%s\n' 1.1.1.1 9.9.9.9 8.8.8.8
+		;;
+	'@.download_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"download_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.upload_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"upload_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.download.base_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"download":{[^}]*"base_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.upload.base_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"upload":{[^}]*"base_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.download.observed_low_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"download":{[^}]*"observed_low_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.upload.observed_low_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"upload":{[^}]*"observed_low_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.server_id')
+		printf '%s\n' "$input" | sed -n 's/.*"server_id":"\([^"]*\)".*/\1/p'
+		;;
+	*)
+		exit 1
+		;;
+esac

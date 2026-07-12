@@ -28,6 +28,9 @@ does not claim authorship of the original cake-autorate concept.
   procedures and anonymized fixed-SQM, autorate, and unshaped measurements.
 - [Bounded probe ceiling](ADAPTIVE_CEILING.md) is the concise state-machine and
   safety-invariant reference for the optional outer controller.
+- [Full Auto-Tune](AUTOTUNE.md) documents the experimental calibration job,
+  proposal formulas, safety contract, confidence score, and remaining shaped
+  validation gate.
 
 The current targets are OpenWrt 25.12.5 on `x86/64` and
 `rockchip/armv8` (`aarch64_generic`, including the Banana Pi R2 Pro). The daemon
@@ -165,6 +168,21 @@ Implemented:
   reflector scanning are available behind `Advanced test options`. A visual
   three-step navigator (`Interface`, `Speed test`, `Review`) also supports
   direct validated navigation by clicking any numbered step.
+- Experimental `Full Auto-Tune` creation mode alongside the manual wizard. It
+  performs interface/route/backend preflight, reflector selection, idle ICMP
+  and TCP/HTTPS latency baselines, and two unshaped throughput samples on a
+  reused validated server. A pure Rust calculator derives explicit DL/UL min/base/max, activity
+  and delay thresholds, link-layer overhead, and bounded adaptive-ceiling
+  limits. LuCI shows the raw evidence and complete proposal before creating the
+  instance; job state stays under `/tmp`, cancellation terminates the process
+  group, and UCI is not written before confirmation. The job also temporarily
+  validates the proposed base rates with CAKE on the same server while sampling
+  independent loaded ICMP RTT/loss, TCP/HTTPS request latency, and CPU, then
+  restores the previous qdisc/SQM state. The TCP signal prevents prioritized
+  ICMP on mobile networks from hiding real loaded latency. Server, address,
+  route, telemetry, and score failures stop without a proposal. A borderline
+  score receives one bounded base-rate correction and retest; a second failure
+  stops. It remains experimental until both target-router gates are complete.
 - LuCI instance editing keeps advanced speed test backend controls and
   pinger/reflector planning behind the advanced settings toggle. The automatic
   interface preset, speed-test headroom, and manual min/base/max escape hatches
@@ -278,8 +296,9 @@ SQM integration:
 
 - `luci-app-cake-autorate-rs` is intended to be the single LuCI UI for SQM setup
   plus autorate control.
-- Installing the LuCI package automatically installs `sqm-scripts`, which pulls
-  the normal OpenWrt CAKE/IFB shaping stack.
+- Installing the LuCI package automatically installs `sqm-scripts` and
+  `uclient-fetch`, which provide the normal OpenWrt CAKE/IFB shaping stack and
+  the Full Auto-Tune TCP/HTTPS latency gate.
 - The LuCI package declares `PROVIDES:=luci-app-sqm` and `CONFLICTS:=luci-app-sqm`
   as the replacement intent. OpenWrt 25.12 APK package generation currently emits
   the provide metadata, but conflict metadata still needs verification in final

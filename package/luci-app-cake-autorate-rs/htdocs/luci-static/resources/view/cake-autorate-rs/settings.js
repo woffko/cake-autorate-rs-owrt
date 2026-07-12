@@ -1130,6 +1130,49 @@ function runSpeedtestJob(section_id, wan, backend, onProgress) {
 	});
 }
 
+function runAutotuneJob(section_id, wan, backend, onProgress) {
+	var command = '/usr/libexec/cake-autorate-rs/autotune';
+
+	return fs.exec(command, [ section_id, wan, 'start', backend ]).then(function(res) {
+		var started = parseExecJson(res);
+
+		if (started.error)
+			throw new Error(started.error);
+
+		var poll = function() {
+			return speedtestJobDelay().then(function() {
+				return fs.exec(command, [ section_id, wan, 'status', backend ]);
+			}).then(function(status) {
+				var result = parseExecJson(status);
+
+				if (result.state === 'running' || result.state === 'cancelling') {
+					if (onProgress)
+						onProgress(result);
+					return poll();
+				}
+
+				if (result.error)
+					throw new Error(result.error);
+				if (result.state !== 'complete' || !result.proposal)
+					throw new Error(_('Full Auto-Tune ended without a usable proposal.'));
+
+				return result;
+			});
+		};
+
+		return poll();
+	});
+}
+
+function cancelAutotuneJob(section_id, wan, backend) {
+	return fs.exec('/usr/libexec/cake-autorate-rs/autotune', [
+		section_id,
+		wan,
+		'cancel',
+		backend || 'auto'
+	]).then(parseExecJson);
+}
+
 function installSpeedtestBackend(section_id, wan, backend) {
 	if (!speedtestBackendInstallable(backend))
 		return Promise.reject(new Error(_('Select LibreSpeed CLI, speedtest-go, or configured iperf3 before installing.')));
@@ -1567,7 +1610,7 @@ function writeWizardConfig(section_id, state) {
 	if (pingExtraArgs)
 		uci.set('cake-autorate', section_id, 'ping_extra_args', pingExtraArgs);
 	uci.set('cake-autorate', section_id, 'reflector', (state.reflectors && state.reflectors.length) ? state.reflectors : defaultReflectors());
-	uci.set('cake-autorate', section_id, 'manual_rate_limits', '0');
+	uci.set('cake-autorate', section_id, 'manual_rate_limits', state.autotune_proposal ? '1' : '0');
 	uci.set('cake-autorate', section_id, 'advanced_settings', '0');
 	uci.set('cake-autorate', section_id, 'sqm_interface', wan);
 	uci.set('cake-autorate', section_id, 'ul_if', wan);
@@ -1580,6 +1623,36 @@ function writeWizardConfig(section_id, state) {
 	uci.set('cake-autorate', section_id, 'max_ul_shaper_rate_kbps', ul);
 	uci.set('cake-autorate', section_id, 'min_dl_shaper_rate_kbps', halfRate(dl));
 	uci.set('cake-autorate', section_id, 'min_ul_shaper_rate_kbps', halfRate(ul));
+
+	if (state.autotune_proposal) {
+		var proposal = state.autotune_proposal;
+		var dlProposal = proposal.download;
+		var ulProposal = proposal.upload;
+		var thresholds = proposal.thresholds_ms;
+		var adaptive = proposal.adaptive_ceiling;
+
+		uci.set('cake-autorate', section_id, 'min_dl_shaper_rate_kbps', String(dlProposal.minimum_kbps));
+		uci.set('cake-autorate', section_id, 'base_dl_shaper_rate_kbps', String(dlProposal.base_kbps));
+		uci.set('cake-autorate', section_id, 'max_dl_shaper_rate_kbps', String(dlProposal.maximum_kbps));
+		uci.set('cake-autorate', section_id, 'min_ul_shaper_rate_kbps', String(ulProposal.minimum_kbps));
+		uci.set('cake-autorate', section_id, 'base_ul_shaper_rate_kbps', String(ulProposal.base_kbps));
+		uci.set('cake-autorate', section_id, 'max_ul_shaper_rate_kbps', String(ulProposal.maximum_kbps));
+		uci.set('cake-autorate', section_id, 'connection_active_thr_kbps', String(proposal.active_threshold_kbps));
+		uci.set('cake-autorate', section_id, 'dl_avg_owd_delta_max_adjust_up_thr_ms', String(thresholds.adjust_up));
+		uci.set('cake-autorate', section_id, 'ul_avg_owd_delta_max_adjust_up_thr_ms', String(thresholds.adjust_up));
+		uci.set('cake-autorate', section_id, 'dl_owd_delta_delay_thr_ms', String(thresholds.delay));
+		uci.set('cake-autorate', section_id, 'ul_owd_delta_delay_thr_ms', String(thresholds.delay));
+		uci.set('cake-autorate', section_id, 'dl_avg_owd_delta_max_adjust_down_thr_ms', String(thresholds.adjust_down));
+		uci.set('cake-autorate', section_id, 'ul_avg_owd_delta_max_adjust_down_thr_ms', String(thresholds.adjust_down));
+		uci.set('cake-autorate', section_id, 'adaptive_ceiling_enabled', adaptive.enabled ? '1' : '0');
+		uci.set('cake-autorate', section_id, 'adaptive_ceiling_dl_cap_kbps', String(dlProposal.absolute_cap_kbps));
+		uci.set('cake-autorate', section_id, 'adaptive_ceiling_ul_cap_kbps', String(ulProposal.absolute_cap_kbps));
+		uci.set('cake-autorate', section_id, 'adaptive_ceiling_hold_time_s', String(adaptive.hold_s));
+		uci.set('cake-autorate', section_id, 'adaptive_ceiling_growth_percent', String(adaptive.growth_percent));
+		uci.set('cake-autorate', section_id, 'adaptive_ceiling_probe_duration_s', String(adaptive.probe_s));
+		uci.set('cake-autorate', section_id, 'adaptive_ceiling_cooldown_s', String(adaptive.cooldown_s));
+		uci.set('cake-autorate', section_id, 'adaptive_ceiling_failed_bound_ttl_s', String(adaptive.failed_bound_ttl_s));
+	}
 
 	for (var i = 0; i < sqmImportOptionMap.length; i++) {
 		var key = sqmImportOptionMap[i][0];
@@ -1668,9 +1741,10 @@ function showCreateWizard(grid, name) {
 	var state = {
 		name: name,
 		step: 0,
+		mode: 'autotune',
 		wan_if: defaultWan,
-		enabled: false,
-		sqm_enabled: false,
+		enabled: true,
+		sqm_enabled: true,
 		speedtest_backend: 'auto',
 		speedtest_go_server_id: '',
 		speedtest_apply_percent: '90',
@@ -1702,13 +1776,17 @@ function showCreateWizard(grid, name) {
 	function stepTitle() {
 		return [
 			_('Interface'),
-			_('Speed test'),
+			state.mode === 'autotune' ? _('Full Auto-Tune') : _('Speed test'),
 			_('Review')
 		][state.step];
 	}
 
 	function renderSteps() {
-		var labels = [ _('Interface'), _('Speed test'), _('Review') ];
+		var labels = [
+			_('Interface'),
+			state.mode === 'autotune' ? _('Full Auto-Tune') : _('Speed test'),
+			_('Review')
+		];
 		var steps = [];
 
 		for (var i = 0; i < labels.length; i++) {
@@ -1745,9 +1823,38 @@ function showCreateWizard(grid, name) {
 		var target = wizardSelectOptions(targetInterfaceChoiceOptions(), state.wan_if);
 		var enabled = wizardCheckbox(state.enabled);
 		var queueInfo = E('div', { 'class': 'cbi-value-dummy' }, wizardSqmQueueText(state));
+		var modeButtons = [
+			[ 'autotune', _('Full Auto-Tune'), _('Measures the link, calculates limits and presents a complete proposal. Uses significant traffic.') ],
+			[ 'manual', _('Manual wizard'), _('Keep full control over speed testing and all derived values.') ]
+		].map(function(mode) {
+			return E('button', {
+				'type': 'button',
+				'class': 'btn cbi-button %s'.format(state.mode === mode[0] ? 'cbi-button-positive' : ''),
+				'data-mode': mode[0],
+				'style': 'display:flex;flex-direction:column;align-items:flex-start;gap:3px;flex:1 1 260px;min-height:68px;padding:10px;text-align:left',
+				'click': function(ev) {
+					state.mode = ev.currentTarget.getAttribute('data-mode');
+					state.autotune_result = null;
+					state.autotune_proposal = null;
+					if (state.mode === 'autotune') {
+						state.enabled = true;
+						state.sqm_enabled = true;
+					}
+					render();
+				}
+			}, [
+				E('strong', {}, mode[1]),
+				E('span', { 'style': 'font-size:12px;white-space:normal' }, mode[2])
+			]);
+		});
 
 		target.addEventListener('change', function() {
-			state.wan_if = normalizeInterfaceName(target.value);
+			var newWan = normalizeInterfaceName(target.value);
+			if (newWan !== state.wan_if) {
+				state.autotune_result = null;
+				state.autotune_proposal = null;
+			}
+			state.wan_if = newWan;
 			state.ping_extra_args = pingerInterfaceArgs(state.wan_if, state.pinger_method || 'fping');
 			syncSqmForInterface();
 			queueInfo.textContent = wizardSqmQueueText(state);
@@ -1759,9 +1866,86 @@ function showCreateWizard(grid, name) {
 		});
 
 		return [
+			wizardField(_('Setup mode'), E('div', { 'style': 'display:flex;flex-wrap:wrap;gap:8px' }, modeButtons)),
 			wizardField(_('Target interface'), target, optionDescriptions.wan_if),
 			wizardField(_('SQM queue'), queueInfo, optionDescriptions._wizard_sqm_queue),
 			wizardField(_('Enable autorate'), enabled, optionDescriptions.enabled)
+		];
+	}
+
+	function applyAutotuneResult(result) {
+		var proposal = result.proposal;
+		var firstRun = result.runs && result.runs.length ? result.runs[0] : {};
+
+		state.autotune_result = result;
+		state.autotune_proposal = proposal;
+		state.enabled = true;
+		state.sqm_enabled = true;
+		state.sqm_download = String(proposal.download.base_kbps);
+		state.sqm_upload = String(proposal.upload.base_kbps);
+		state.sqm_linklayer = proposal.link.layer;
+		state.sqm_overhead = String(proposal.link.overhead);
+		state.sqm_tcMPU = String(proposal.link.mpu);
+		state.sqm_linklayer_advanced = proposal.link.layer === 'none' ? '0' : '1';
+		state.speedtest_backend = firstRun.backend || state.speedtest_backend || 'auto';
+		state.speedtest_go_server_id = firstRun.server_id || '';
+		applyPingerPlanToState(state, result.pinger_plan);
+	}
+
+	function renderAutotuneStep() {
+		var status = E('div', { 'style': 'margin-top:8px;white-space:normal' },
+			state.autotune_result ? _('Calibration complete. Review the proposed parameters before creating the instance.') : '');
+		var progress = E('progress', {
+			'max': '100',
+			'value': state.autotune_progress || '0',
+			'style': 'width:min(620px,100%);display:block;margin-top:8px'
+		});
+		var runButton = E('button', {
+			'class': 'btn cbi-button cbi-button-action',
+			'disabled': state.autotune_running ? 'disabled' : null,
+			'click': function() {
+				showError(null);
+				state.autotune_running = true;
+				state.autotune_progress = 0;
+				runButton.disabled = true;
+				cancelButton.disabled = false;
+				status.textContent = _('Starting Full Auto-Tune...');
+
+				runAutotuneJob(state.name, state.wan_if, state.speedtest_backend, function(job) {
+					state.autotune_progress = job.progress || 0;
+					progress.value = state.autotune_progress;
+					status.textContent = job.message || job.phase || _('Full Auto-Tune is running...');
+				}).then(function(result) {
+					applyAutotuneResult(result);
+					state.autotune_running = false;
+					state.step = 2;
+					render();
+				}).catch(function(err) {
+					state.autotune_running = false;
+					runButton.disabled = false;
+					cancelButton.disabled = true;
+					showError(_('Full Auto-Tune failed: %s').format(err.message || err));
+					status.textContent = '';
+				});
+			}
+		}, state.autotune_result ? _('Run again') : _('Start Full Auto-Tune'));
+		var cancelButton = E('button', {
+			'class': 'btn cbi-button cbi-button-negative',
+			'disabled': state.autotune_running ? null : 'disabled',
+			'click': function() {
+				cancelButton.disabled = true;
+				status.textContent = _('Cancelling and restoring the previous SQM state...');
+				cancelAutotuneJob(state.name, state.wan_if, state.speedtest_backend);
+			}
+		}, _('Cancel test'));
+
+		return [
+			E('div', { 'class': 'alert-message warning' }, [
+				E('strong', {}, _('Traffic warning: ')),
+				_('Full Auto-Tune runs two unshaped and at least one shaped router-side download/upload test; a borderline result is tested once more. Other WAN traffic can reduce confidence, but is never counted as test throughput.')
+			]),
+			wizardField(_('Calibration'), E('div', {}, [ runButton, ' ', cancelButton, progress, status ]),
+				_('All intermediate state stays in RAM. No UCI configuration is written until you confirm the Review step.'))
 		];
 	}
 
@@ -1980,6 +2164,59 @@ function showCreateWizard(grid, name) {
 			[ _('Preferred backend'), speedtestBackendChoiceTitle(state.speedtest_backend) ],
 			[ _('Pinger plan'), _('%s, %d active / %d candidates').format(state.pinger_method || 'fping', activeCount, reflectors.length) ]
 		];
+		var autotune = state.autotune_result;
+		if (autotune) {
+			var proposal = autotune.proposal;
+			var validation = autotune.validation;
+			var dl = proposal.download;
+			var ul = proposal.upload;
+			var adaptive = proposal.adaptive_ceiling;
+			var thresholds = proposal.thresholds_ms;
+			var firstRun = autotune.runs && autotune.runs.length ? autotune.runs[0] : {};
+			rows.push(
+				[ _('Calibration confidence'), String(proposal.confidence) + '%' ],
+				[ _('Idle latency'), _('%s ms median / %s ms p95').format(autotune.baseline.median_ms, autotune.baseline.p95_ms) ],
+				[ _('Observed download'), _('%d / %d / %d kbit/s low / median / high').format(dl.observed_low_kbps, dl.observed_median_kbps, dl.observed_high_kbps) ],
+				[ _('Observed upload'), _('%d / %d / %d kbit/s low / median / high').format(ul.observed_low_kbps, ul.observed_median_kbps, ul.observed_high_kbps) ],
+				[ _('Proposed DL min / base / max'), _('%d / %d / %d kbit/s').format(dl.minimum_kbps, dl.base_kbps, dl.maximum_kbps) ],
+				[ _('Proposed UL min / base / max'), _('%d / %d / %d kbit/s').format(ul.minimum_kbps, ul.base_kbps, ul.maximum_kbps) ],
+				[ _('Delay thresholds'), _('%d / %d / %d ms adjust-up / delay / adjust-down').format(thresholds.adjust_up, thresholds.delay, thresholds.adjust_down) ],
+				[ _('Adaptive ceiling'), adaptive.enabled ? _('enabled; caps %d / %d kbit/s').format(dl.absolute_cap_kbps, ul.absolute_cap_kbps) : _('not needed for the measured stable link') ],
+				[ _('Detected link layer'), _('%s; overhead %d, MPU %d').format(proposal.link.kind, proposal.link.overhead, proposal.link.mpu) ],
+				[ _('Test server'), firstRun.server_sponsor ? _('%s #%s').format(firstRun.server_sponsor, firstRun.server_id || '-') : _('automatic') ]
+			);
+			if (autotune.baseline.http_median_ms != null) {
+				rows.push([ _('Idle TCP/HTTPS latency'), _('%s ms median / %s ms p95').format(
+					autotune.baseline.http_median_ms,
+					autotune.baseline.http_p95_ms) ]);
+			}
+			if (validation) {
+				rows.push(
+					[ _('Shaped validation'), _('%s/100, %s').format(validation.score, validation.pass ? _('passed') : _('failed')) ],
+					[ _('Validation attempts'), String((autotune.validation_attempts || [ validation ]).length) ],
+					[ _('Shaped throughput'), _('%d / %d kbit/s DL / UL; %s%% / %s%% of observed low').format(
+						validation.throughput.download_kbps,
+						validation.throughput.upload_kbps,
+						validation.throughput.download_retention_percent,
+						validation.throughput.upload_retention_percent) ],
+					[ _('Loaded latency'), _('%s ms median / %s ms p95 / %s ms max; %s%% loss').format(
+						validation.latency.median_ms,
+						validation.latency.p95_ms,
+						validation.latency.max_ms,
+						validation.latency.loss_percent) ],
+					[ _('Validation CPU peak'), String(validation.cpu_peak_percent) + '%' ]
+				);
+				if (validation.http_latency) {
+					rows.push([ _('Loaded TCP/HTTPS latency'), _('%s ms median / %s ms p95 / +%s ms; %d samples').format(
+						validation.http_latency.median_ms,
+						validation.http_latency.p95_ms,
+						validation.http_latency.delta_p95_ms,
+						validation.http_latency.samples) ]);
+				}
+			}
+			if (proposal.warnings && proposal.warnings.length)
+				rows.push([ _('Auto-Tune warnings'), proposal.warnings.join(' ') ]);
+		}
 
 		if (state.advanced_test_options) {
 			rows.push(
@@ -2015,6 +2252,14 @@ function showCreateWizard(grid, name) {
 		}
 
 		if (step === 1) {
+			if (state.mode === 'autotune' && !state.autotune_proposal) {
+				showError(_('Run Full Auto-Tune successfully before continuing to Review.'));
+				return false;
+			}
+
+			if (state.mode === 'autotune')
+				return true;
+
 			if (state.speedtest_go_server_id && !validatePositiveInteger(state.speedtest_go_server_id)) {
 				showError(_('speedtest-go server ID must be a positive integer.'));
 				return false;
@@ -2134,13 +2379,15 @@ function showCreateWizard(grid, name) {
 			E('button', {
 				'class': 'btn cbi-button',
 				'click': function() {
+					if (state.autotune_running)
+						cancelAutotuneJob(state.name, state.wan_if, state.speedtest_backend);
 					ui.hideModal();
 				}
 			}, _('Cancel')),
 			' '
 		];
 		var stepFields = state.step === 0 ? renderInterfaceStep() :
-			state.step === 1 ? renderSpeedStep() :
+			state.step === 1 ? (state.mode === 'autotune' ? renderAutotuneStep() : renderSpeedStep()) :
 			renderReviewStep();
 
 		for (var i = 0; i < stepFields.length; i++)

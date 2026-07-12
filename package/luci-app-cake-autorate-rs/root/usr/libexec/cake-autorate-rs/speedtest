@@ -189,6 +189,13 @@ safe_uci_name() {
 speedtest_unshaped_enabled() {
 	local value
 
+	# Internal Full Auto-Tune validation mode. The fifth argument is otherwise
+	# only used as the worker key for job-run, so normal/manual invocations keep
+	# their existing unshaped calibration behavior.
+	if [ "$mode" = "run" ] && [ "$job_key_override" = "shaped" ]; then
+		return 1
+	fi
+
 	value="$(uci_get speedtest_unshaped)"
 	[ -n "$value" ] || value="1"
 	bool_enabled "$value"

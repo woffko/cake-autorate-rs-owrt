@@ -4,7 +4,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-cake-autorate-rs
 PKG_VERSION:=1.0_rc1
-PKG_RELEASE:=11
+PKG_RELEASE:=12
 
 PKG_MAINTAINER:=woffko
 PKG_LICENSE:=Apache-2.0
@@ -17,7 +17,7 @@ define Package/luci-app-cake-autorate-rs
   SUBMENU:=3. Applications
   TITLE:=LuCI support for CAKE Autorate RS
   URL:=https://github.com/woffko/cake-autorate-rs-owrt
-  DEPENDS:=+cake-autorate-rs +luci-base +sqm-scripts
+  DEPENDS:=+cake-autorate-rs +luci-base +sqm-scripts +uclient-fetch
   PROVIDES:=luci-app-sqm
   CONFLICTS:=luci-app-sqm
   PKGARCH:=all

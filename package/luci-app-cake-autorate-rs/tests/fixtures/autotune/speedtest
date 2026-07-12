@@ -1,0 +1,31 @@
+#!/bin/sh
+
+case "$3" in
+	status)
+		printf '%s\n' '{"available":true,"selected_backend":"speedtest-go"}'
+		;;
+	run)
+		if [ "${AUTOTUNE_MOCK_BLOCK:-0}" = 1 ]; then
+			trap 'touch "$AUTOTUNE_MOCK_RESTORE_MARKER"; exit 130' INT TERM
+			sleep 30
+			exit 1
+		fi
+		counter_file="${AUTOTUNE_MOCK_COUNTER:?}"
+		count="$(sed -n '1p' "$counter_file" 2>/dev/null)"
+		count="${count:-0}"
+		count=$((count + 1))
+		printf '%s\n' "$count" > "$counter_file"
+		if [ "$count" -eq 1 ]; then
+			printf '%s\n' '{"download_kbps":50000,"upload_kbps":10000,"backend":"speedtest-go","server_id":"17372","server_sponsor":"Test Server","shaper_bypassed":true}'
+		elif [ "$count" -eq 2 ]; then
+			printf '%s\n' '{"download_kbps":110000,"upload_kbps":20000,"backend":"speedtest-go","server_id":"17372","server_sponsor":"Test Server","shaper_bypassed":true}'
+		elif [ "${AUTOTUNE_MOCK_CORRECT:-0}" = 1 ] && [ "$count" -eq 3 ]; then
+			printf '%s\n' '{"download_kbps":20000,"upload_kbps":4000,"backend":"speedtest-go","server_id":"17372","server_sponsor":"Test Server","shaper_bypassed":false}'
+		else
+			printf '%s\n' '{"download_kbps":50000,"upload_kbps":10000,"backend":"speedtest-go","server_id":"17372","server_sponsor":"Test Server","shaper_bypassed":false}'
+		fi
+		;;
+	*)
+		exit 1
+		;;
+esac

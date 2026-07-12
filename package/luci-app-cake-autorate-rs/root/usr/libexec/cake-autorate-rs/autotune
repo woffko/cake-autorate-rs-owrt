@@ -1,0 +1,804 @@
+#!/bin/sh
+
+job_name="$1"
+target_if_input="$2"
+mode="${3:-status}"
+backend="${4:-auto}"
+
+job_root="${CAKE_AUTORATE_AUTOTUNE_DIR:-/tmp/cake-autorate-autotune}"
+speedtest_bin="${CAKE_AUTORATE_SPEEDTEST:-/usr/libexec/cake-autorate-rs/speedtest}"
+pinger_plan_bin="${CAKE_AUTORATE_PINGER_PLAN:-/usr/libexec/cake-autorate-rs/pinger-plan}"
+daemon_bin="${CAKE_AUTORATE_DAEMON:-/usr/sbin/cake-autorated}"
+jsonfilter_bin="${CAKE_AUTORATE_JSONFILTER:-$(command -v jsonfilter 2>/dev/null)}"
+fping_bin="${CAKE_AUTORATE_FPING:-$(command -v fping 2>/dev/null)}"
+http_fetch_bin="${CAKE_AUTORATE_HTTP_FETCH:-$(command -v uclient-fetch 2>/dev/null)}"
+http_probe_url="${CAKE_AUTORATE_HTTP_PROBE_URL:-https://speed.cloudflare.com/__down?bytes=0}"
+
+json_escape() {
+	printf '%s' "$1" | tr '\n\r\t' '   ' | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+json_error() {
+	printf '{"error":"%s"}\n' "$(json_escape "$1")"
+	exit 1
+}
+
+safe_job_name() {
+	case "$1" in
+		''|*[!A-Za-z0-9_]*) return 1 ;;
+	esac
+}
+
+safe_interface_name() {
+	case "$1" in
+		''|*[!A-Za-z0-9_.:@-]*) return 1 ;;
+	esac
+}
+
+is_positive_uint() {
+	case "$1" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	[ "$1" -gt 0 ] 2>/dev/null
+}
+
+job_paths() {
+	job_dir="$job_root/$job_name"
+	pid_file="$job_dir/pid"
+	status_file="$job_dir/status.json"
+	result_file="$job_dir/result.json"
+	error_file="$job_dir/error.json"
+	cancel_file="$job_dir/cancelled"
+	log_file="$job_dir/job.log"
+}
+
+atomic_write() {
+	file="$1"
+	tmp="$file.$$"
+	shift
+	printf '%s\n' "$*" > "$tmp" && mv "$tmp" "$file"
+}
+
+write_status() {
+	phase="$1"
+	progress="$2"
+	message="$3"
+	atomic_write "$status_file" "{\"state\":\"running\",\"phase\":\"$(json_escape "$phase")\",\"progress\":$progress,\"message\":\"$(json_escape "$message")\"}"
+}
+
+resolve_interface_device() {
+	name="$1"
+	status=""
+	device=""
+
+	if [ -e "/sys/class/net/$name" ]; then
+		printf '%s\n' "$name"
+		return 0
+	fi
+
+	if [ -n "$jsonfilter_bin" ]; then
+		status="$(ubus call "network.interface.$name" status 2>/dev/null)"
+		device="$(printf '%s\n' "$status" | "$jsonfilter_bin" -e '@.l3_device' 2>/dev/null)"
+		[ -n "$device" ] || device="$(printf '%s\n' "$status" | "$jsonfilter_bin" -e '@.device' 2>/dev/null)"
+	fi
+
+	[ -n "$device" ] && [ -e "/sys/class/net/$device" ] || return 1
+	printf '%s\n' "$device"
+}
+
+source_ip_for() {
+	ip -4 -o addr show dev "$1" scope global 2>/dev/null |
+		awk '{ split($4, address, "/"); print address[1]; exit }'
+}
+
+route_device_for() {
+	source_ip="$1"
+	if [ -n "$source_ip" ]; then
+		ip route get 1.1.1.1 from "$source_ip" 2>/dev/null |
+			sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1
+	else
+		ip route get 1.1.1.1 2>/dev/null |
+			sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1
+	fi
+}
+
+detect_link_kind() {
+	device="$1"
+	logical="$2"
+	type="$(sed -n '1p' "/sys/class/net/$device/type" 2>/dev/null)"
+	proto=""
+
+	if [ -n "$jsonfilter_bin" ]; then
+		proto="$(ubus call "network.interface.$logical" status 2>/dev/null |
+			"$jsonfilter_bin" -e '@.proto' 2>/dev/null)"
+	fi
+
+	case "$proto:$device" in
+		pppoe:*|*:pppoe-*) printf '%s' pppoe ;;
+		qmi:*|mbim:*|ncm:*|3g:*|modemmanager:*|*:wwan*|*:rmnet*|*:lte*|*:modem*)
+			printf '%s' cellular
+			;;
+		*)
+			case "$type" in
+				512) printf '%s' pppoe ;;
+				1) printf '%s' ethernet ;;
+				*) printf '%s' unknown ;;
+			esac
+			;;
+	esac
+}
+
+autorate_conflict_for_target() {
+	command -v uci >/dev/null 2>&1 || return 1
+	sections="$(uci -q show cake-autorate 2>/dev/null |
+		sed -n 's/^cake-autorate\.\([^.=]*\)=cake_autorate$/\1/p')"
+	for section in $sections; do
+		[ "$section" = "$job_name" ] && continue
+		[ "$(uci -q get "cake-autorate.$section.enabled" 2>/dev/null)" = 1 ] || continue
+		candidate="$(uci -q get "cake-autorate.$section.wan_if" 2>/dev/null)"
+		[ -n "$candidate" ] || candidate="$(uci -q get "cake-autorate.$section.sqm_interface" 2>/dev/null)"
+		candidate="$(resolve_interface_device "$candidate" 2>/dev/null)"
+		if [ "$candidate" = "$target_if" ]; then
+			printf '%s\n' "$section"
+			return 0
+		fi
+	done
+	return 1
+}
+
+sqm_state_dir() {
+	(
+		. /etc/sqm/sqm.conf 2>/dev/null
+		printf '%s' "${SQM_STATE_DIR:-/var/run/sqm}"
+	)
+}
+
+cake_link_args() {
+	case "$link_kind" in
+		pppoe) printf '%s' 'ethernet overhead 44 mpu 84' ;;
+		ethernet) printf '%s' 'ethernet overhead 18 mpu 64' ;;
+		*) printf '%s' 'raw' ;;
+	esac
+}
+
+restore_temp_shaper() {
+	if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_SHAPER:-0}" = 1 ]; then
+		[ -n "${AUTOTUNE_MOCK_SHAPER_RESTORE_MARKER:-}" ] &&
+			touch "$AUTOTUNE_MOCK_SHAPER_RESTORE_MARKER"
+		temp_shaper_active=0
+		return 0
+	fi
+
+	if [ "${temp_shaper_active:-0}" = 1 ]; then
+		tc qdisc del dev "$target_if" ingress >/dev/null 2>&1 || true
+		tc qdisc del dev "$target_if" root >/dev/null 2>&1 || true
+		tc qdisc del dev "$temp_ifb" root >/dev/null 2>&1 || true
+		if [ "${temp_ifb_created:-0}" = 1 ]; then
+			ip link set dev "$temp_ifb" down >/dev/null 2>&1 || true
+			ip link delete dev "$temp_ifb" type ifb >/dev/null 2>&1 || true
+		fi
+		temp_shaper_active=0
+	fi
+
+	if [ "${sqm_was_active:-0}" = 1 ]; then
+		/usr/lib/sqm/run.sh start "$target_if" >/dev/null 2>&1 || true
+		sqm_was_active=0
+	fi
+}
+
+prepare_temp_shaper() {
+	download_kbps="$1"
+	upload_kbps="$2"
+
+	if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_SHAPER:-0}" = 1 ]; then
+		temp_shaper_active=1
+		return 0
+	fi
+
+	command -v tc >/dev/null 2>&1 || fail "tc is required for shaped validation."
+	command -v ip >/dev/null 2>&1 || fail "ip is required for shaped validation."
+	[ -x /usr/lib/sqm/run.sh ] || fail "sqm-scripts is required for shaped validation."
+	temp_ifb="ifb4$target_if"
+	[ "${#temp_ifb}" -le 15 ] || fail "Derived IFB name $temp_ifb exceeds the Linux interface-name limit."
+
+	state_dir="$(sqm_state_dir)"
+	if [ -f "$state_dir/$target_if.state" ]; then
+		sqm_was_active=1
+		/usr/lib/sqm/run.sh stop "$target_if" >/dev/null 2>&1 ||
+			fail "Unable to pause existing SQM before shaped validation."
+	fi
+
+	root_kind="$(tc qdisc show dev "$target_if" 2>/dev/null | awk '$4 == "root" { print $2; exit }')"
+	case "$root_kind" in
+		''|noqueue|mq|fq_codel|pfifo_fast) ;;
+		*) fail "Refusing to replace unmanaged root qdisc $root_kind on $target_if." ;;
+	esac
+	if tc qdisc show dev "$target_if" 2>/dev/null | grep -Eq ' ingress | clsact '; then
+		fail "Refusing to replace unmanaged ingress/clsact state on $target_if."
+	fi
+	[ ! -e "/sys/class/net/$temp_ifb" ] || fail "Refusing to reuse existing IFB $temp_ifb."
+
+	ip link add name "$temp_ifb" type ifb >/dev/null 2>&1 || fail "Unable to create temporary IFB $temp_ifb."
+	temp_ifb_created=1
+	temp_shaper_active=1
+	ip link set dev "$temp_ifb" up >/dev/null 2>&1 || fail "Unable to bring up temporary IFB $temp_ifb."
+	link_args="$(cake_link_args)"
+	# shellcheck disable=SC2086
+	tc qdisc replace dev "$target_if" root cake bandwidth "${upload_kbps}kbit" besteffort wash $link_args >/dev/null 2>&1 ||
+		fail "Unable to attach temporary upload CAKE qdisc."
+	# shellcheck disable=SC2086
+	tc qdisc replace dev "$temp_ifb" root cake bandwidth "${download_kbps}kbit" besteffort wash ingress $link_args >/dev/null 2>&1 ||
+		fail "Unable to attach temporary download CAKE qdisc."
+	tc qdisc add dev "$target_if" handle ffff: ingress >/dev/null 2>&1 ||
+		fail "Unable to attach temporary ingress qdisc."
+	tc filter add dev "$target_if" parent ffff: protocol all u32 match u32 0 0 \
+		action mirred egress redirect dev "$temp_ifb" >/dev/null 2>&1 ||
+		fail "Unable to redirect ingress traffic into temporary IFB."
+}
+
+cpu_monitor() {
+	output="$1"
+	marker="$2"
+	previous=""
+	while [ -e "$marker" ]; do
+		current="$(awk '/^cpu / { total=0; for (i=2; i<=NF; i++) total += $i; print total, $5 + $6; exit }' /proc/stat)"
+		if [ -n "$previous" ]; then
+			awk -v previous="$previous" -v current="$current" 'BEGIN {
+				split(previous, p, " "); split(current, c, " ");
+				total = c[1] - p[1]; idle = c[2] - p[2];
+				if (total > 0) printf "%.1f\n", (total - idle) * 100 / total;
+			}' >> "$output"
+		fi
+		previous="$current"
+		sleep 1
+	done
+}
+
+numeric_latency_stats() {
+	input="$1"
+	sorted="$2"
+	[ -s "$input" ] || return 1
+	sort -n "$input" > "$sorted"
+	awk '
+		{ value[NR] = $1 }
+		END {
+			if (NR < 1) exit 1
+			if (NR % 2) median = value[(NR + 1) / 2]
+			else median = (value[NR / 2] + value[NR / 2 + 1]) / 2
+			p95_index = int((NR * 95 + 99) / 100)
+			if (p95_index < 1) p95_index = 1
+			printf "%.3f %.3f %.3f %d", median, value[p95_index], value[NR], NR
+		}
+	' "$sorted"
+}
+
+http_latency_once() {
+	start="$(cut -d ' ' -f 1 /proc/uptime 2>/dev/null)"
+	[ -n "$start" ] || return 1
+	"$http_fetch_bin" -4 -q -T 5 -O /dev/null "$http_probe_url" >/dev/null 2>&1 || return 1
+	finish="$(cut -d ' ' -f 1 /proc/uptime 2>/dev/null)"
+	[ -n "$finish" ] || return 1
+	awk -v start="$start" -v finish="$finish" 'BEGIN {
+		elapsed = (finish - start) * 1000
+		if (elapsed < 0) exit 1
+		printf "%.1f\n", elapsed
+	}'
+}
+
+baseline_http_latency() {
+	values="$job_dir/http-baseline.values"
+	sorted="$job_dir/http-baseline.sorted"
+	: > "$values"
+	for sample in 1 2 3 4 5; do
+		http_latency_once >> "$values" || true
+	done
+	numeric_latency_stats "$values" "$sorted"
+}
+
+http_latency_monitor() {
+	output="$1"
+	marker="$2"
+	while [ -e "$marker" ]; do
+		http_latency_once >> "$output" || true
+		sleep 1
+	done
+}
+
+latency_stats() {
+	input="$1"
+	values="$job_dir/loaded.values"
+	sorted="$job_dir/loaded.sorted"
+	awk '
+		{
+			for (i = 2; i <= NF; i++)
+				if ($i == "ms" && $(i - 1) ~ /^[0-9]+([.][0-9]+)?$/)
+					print $(i - 1)
+		}
+	' "$input" > "$values"
+	[ -s "$values" ] || return 1
+	sort -n "$values" > "$sorted"
+	awk '
+		{ value[NR] = $1 }
+		END {
+			if (NR < 1) exit 1
+			if (NR % 2) median = value[(NR + 1) / 2]
+			else median = (value[NR / 2] + value[NR / 2 + 1]) / 2
+			p95_index = int((NR * 95 + 99) / 100)
+			printf "%.3f %.3f %.3f %d", median, value[p95_index], value[NR], NR
+		}
+	' "$sorted"
+}
+
+packet_loss_percent() {
+	input="$1"
+	probe_loss="$(awk '
+		index($0, "timed out") {
+			host = $2; sent[host]++; next
+		}
+		index($0, " bytes,") && index($0, " ms") {
+			host = $2; sent[host]++; received[host]++
+		}
+		END {
+			for (host in sent) {
+				if (host == "") continue
+				n++
+				loss[n] = 100 * (sent[host] - received[host]) / sent[host]
+			}
+			if (n < 1) exit 1
+			for (i = 1; i <= n; i++)
+				for (j = i + 1; j <= n; j++)
+					if (loss[j] < loss[i]) {
+						tmp = loss[i]; loss[i] = loss[j]; loss[j] = tmp
+					}
+			if (n % 2) median = loss[(n + 1) / 2]
+			else median = (loss[n / 2] + loss[n / 2 + 1]) / 2
+			printf "%.2f\n", median
+		}
+	' "$input" 2>/dev/null)" || probe_loss=""
+	if [ -n "$probe_loss" ]; then
+		printf '%s\n' "$probe_loss"
+		return 0
+	fi
+
+	# Some fping variants only expose per-host summaries.  Use their median so
+	# one public reflector's ICMP rate limiting does not masquerade as link loss.
+	sed -n 's/.*%loss = [0-9][0-9]*\/[0-9][0-9]*\/\([0-9.][0-9.]*\)%.*/\1/p' "$input" |
+		sort -n |
+	awk '
+		{ value[NR] = $1 }
+		END {
+			if (NR < 1) exit 1
+			if (NR % 2) median = value[(NR + 1) / 2]
+			else median = (value[NR / 2] + value[NR / 2 + 1]) / 2
+			printf "%.2f\n", median
+		}
+	'
+}
+
+score_validation() {
+	raw_dl_low="$1"
+	raw_ul_low="$2"
+	shaped_dl="$3"
+	shaped_ul="$4"
+	loaded_p95="$5"
+	idle_median="$6"
+	loss="$7"
+	cpu_peak="$8"
+	http_delta="$9"
+	awk -v rdl="$raw_dl_low" -v rul="$raw_ul_low" -v sdl="$shaped_dl" -v sul="$shaped_ul" \
+		-v loaded="$loaded_p95" -v idle="$idle_median" -v loss="$loss" -v cpu="$cpu_peak" -v http="$http_delta" 'BEGIN {
+		dlr = rdl > 0 ? sdl * 100 / rdl : 0; ulr = rul > 0 ? sul * 100 / rul : 0;
+		delta = loaded - idle; if (delta < 0) delta = 0;
+		effective = delta > http ? delta : http; score = 100;
+		if (dlr < 90) score -= (90 - dlr) * 1.5;
+		if (ulr < 90) score -= (90 - ulr) * 1.5;
+		if (effective > 40) score -= (effective - 40) * 0.5;
+		if (loss > 1) score -= (loss - 1) * 5;
+		if (cpu > 80) score -= (cpu - 80) * 2;
+		if (score < 0) score = 0; if (score > 100) score = 100;
+		pass = dlr >= 80 && ulr >= 80 && delta <= 100 && http <= 100 && loss <= 5 && cpu <= 95;
+		printf "%.1f %.1f %.1f %.1f %.1f %.1f %s", dlr, ulr, delta, http, effective, score, pass ? "true" : "false";
+	}'
+}
+
+extract_json() {
+	json="$1"
+	expression="$2"
+	[ -n "$jsonfilter_bin" ] || return 1
+	printf '%s\n' "$json" | "$jsonfilter_bin" -e "$expression" 2>/dev/null
+}
+
+run_speedtest_with_timeout() {
+	"$speedtest_bin" "$@" &
+	test_pid="$!"
+	(
+		sleep 90
+		kill -TERM "$test_pid" 2>/dev/null || true
+	) >/dev/null 2>&1 &
+	watchdog_pid="$!"
+	wait "$test_pid"
+	test_rc="$?"
+	kill "$watchdog_pid" 2>/dev/null || true
+	wait "$watchdog_pid" 2>/dev/null || true
+	return "$test_rc"
+}
+
+baseline_latency() {
+	reflectors="$1"
+	values="$job_dir/baseline.values"
+	sorted="$job_dir/baseline.sorted"
+	output="$job_dir/baseline.raw"
+	: > "$values"
+
+	[ -n "$fping_bin" ] || return 1
+	[ -n "$reflectors" ] || reflectors="1.1.1.1 9.9.9.9"
+	# fping writes summary output to stderr.  -C gives each individual RTT,
+	# which is preferable to estimating p95 from only min/avg/max.
+	"$fping_bin" -I "$target_if" -C 5 -q $reflectors > /dev/null 2> "$output" || true
+	awk -F ':' '
+		{
+			for (i = 2; i <= NF; i++) {
+				n = split($i, fields, /[[:space:]]+/)
+				for (j = 1; j <= n; j++)
+					if (fields[j] ~ /^[0-9]+([.][0-9]+)?$/)
+						print fields[j]
+			}
+		}
+	' "$output" > "$values"
+	[ -s "$values" ] || return 1
+	sort -n "$values" > "$sorted"
+	awk '
+		{ value[NR] = $1 }
+		END {
+			if (NR < 1) exit 1
+			if (NR % 2) median = value[(NR + 1) / 2]
+			else median = (value[NR / 2] + value[NR / 2 + 1]) / 2
+			p95_index = int((NR * 95 + 99) / 100)
+			if (p95_index < 1) p95_index = 1
+			printf "%.3f %.3f %d", median, value[p95_index], NR
+		}
+	' "$sorted"
+}
+
+preflight() {
+	write_status preflight 5 "Checking interface, route, test backend, and helper availability"
+	[ -x "$speedtest_bin" ] || fail "Speed test helper is not installed."
+	[ -x "$pinger_plan_bin" ] || fail "Reflector planner is not installed."
+	[ -x "$daemon_bin" ] || fail "cake-autorated is not installed."
+	[ -n "$jsonfilter_bin" ] || fail "jsonfilter is required for Full Auto-Tune."
+	[ -n "$fping_bin" ] || fail "fping is required for Full Auto-Tune latency validation."
+	[ -x "$http_fetch_bin" ] || fail "uclient-fetch is required for Full Auto-Tune TCP/HTTPS latency validation."
+
+	if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_PREFLIGHT:-0}" = 1 ]; then
+		# Test-only injection: LuCI/rpcd does not pass caller-controlled
+		# environment variables, so production cannot bypass these gates.
+		target_if="$target_if_input"
+		source_ip="192.0.2.1"
+		route_if="$target_if"
+		link_kind="${CAKE_AUTORATE_AUTOTUNE_TEST_LINK_KIND:-cellular}"
+	else
+		target_if="$(resolve_interface_device "$target_if_input")" ||
+			fail "Target interface $target_if_input does not resolve to an active device."
+		operstate="$(sed -n '1p' "/sys/class/net/$target_if/operstate" 2>/dev/null)"
+		case "$operstate" in
+			up|unknown) ;;
+			*) fail "Target interface $target_if is not up (state: ${operstate:-missing})." ;;
+		esac
+		source_ip="$(source_ip_for "$target_if")"
+		[ -n "$source_ip" ] || fail "Target interface $target_if has no global IPv4 address."
+		route_if="$(route_device_for "$source_ip")"
+		[ "$route_if" = "$target_if" ] ||
+			fail "Source route for $source_ip uses ${route_if:-no device}, not $target_if."
+		default_route_if="$(ip -4 route show default 2>/dev/null | sed -n '1{s/.* dev \([^ ]*\).*/\1/p}')"
+		[ "$default_route_if" = "$target_if" ] ||
+			fail "TCP/HTTPS validation cannot bind uclient-fetch to $target_if; select the active default WAN."
+		link_kind="$(detect_link_kind "$target_if" "$target_if_input")"
+	fi
+
+	backend_status="$($speedtest_bin "$job_name" "$target_if" status "$backend" 2>/dev/null)"
+	backend_available="$(extract_json "$backend_status" '@.available')"
+	[ "$backend_available" = true ] || fail "No usable speed test backend is available."
+	conflicting_instance="$(autorate_conflict_for_target 2>/dev/null || true)"
+	[ -z "$conflicting_instance" ] ||
+		fail "Enabled autorate instance $conflicting_instance already owns $target_if. Tune that instance instead of creating a duplicate."
+}
+
+fail() {
+	message="$1"
+	if [ -e "$cancel_file" ]; then
+		exit 130
+	fi
+	atomic_write "$error_file" "{\"state\":\"failed\",\"error\":\"$(json_escape "$message")\"}"
+	exit 1
+}
+
+run_measurement() {
+	index="$1"
+	write_status throughput "$((30 + index * 20))" "Running unshaped throughput sample $index of 2"
+	result="$(run_speedtest_with_timeout "$job_name" "$target_if" run "$backend")" ||
+		fail "Throughput sample $index failed."
+	download="$(extract_json "$result" '@.download_kbps')"
+	upload="$(extract_json "$result" '@.upload_kbps')"
+	is_positive_uint "$download" || fail "Throughput sample $index returned no download rate."
+	is_positive_uint "$upload" || fail "Throughput sample $index returned no upload rate."
+	server_id="$(extract_json "$result" '@.server_id')"
+	if [ "$index" -eq 1 ]; then
+		selected_server_id="$server_id"
+	elif [ -n "$selected_server_id" ] && [ -n "$server_id" ] && [ "$server_id" != "$selected_server_id" ]; then
+		fail "Speed test server changed during raw calibration; retry for comparable samples."
+	fi
+	if [ -n "$download_samples" ]; then
+		download_samples="$download_samples,$download"
+		upload_samples="$upload_samples,$upload"
+		runs_json="$runs_json,$result"
+	else
+		download_samples="$download"
+		upload_samples="$upload"
+		runs_json="$result"
+	fi
+}
+
+calculate_proposal() {
+	base_scale="${1:-1.0}"
+	"$daemon_bin" --autotune-proposal \
+		--dl-samples "$download_samples" \
+		--ul-samples "$upload_samples" \
+		--idle-median-ms "$idle_median_ms" \
+		--idle-p95-ms "$idle_p95_ms" \
+		--idle-samples "$baseline_samples" \
+		--link-kind "$link_kind" \
+		--base-scale "$base_scale"
+}
+
+revision_scale_for_validation() {
+	awk -v dl="$dl_retention" -v ul="$ul_retention" -v delta="$effective_loaded_delta_ms" \
+		-v loss="$loss_percent" -v cpu="$cpu_peak" 'BEGIN {
+		if (delta > 60 || loss > 1) print "0.95";
+		else if (cpu > 80) print "0.95";
+		else if ((dl < 80 || ul < 80) && delta <= 40 && loss <= 1) print "1.05";
+		else print "0.95";
+	}'
+}
+
+run_shaped_validation() {
+	attempt="${1:-1}"
+	cpu_pid=""
+	latency_pid=""
+	http_pid=""
+	dl_base="$(extract_json "$proposal" '@.download.base_kbps')"
+	ul_base="$(extract_json "$proposal" '@.upload.base_kbps')"
+	raw_dl_low="$(extract_json "$proposal" '@.download.observed_low_kbps')"
+	raw_ul_low="$(extract_json "$proposal" '@.upload.observed_low_kbps')"
+	is_positive_uint "$dl_base" || fail "Proposal returned no download base rate."
+	is_positive_uint "$ul_base" || fail "Proposal returned no upload base rate."
+
+	write_status shaped 84 "Temporarily applying candidate CAKE rates for validation attempt $attempt"
+	prepare_temp_shaper "$dl_base" "$ul_base"
+
+	loaded_raw="$job_dir/loaded.raw"
+	http_values="$job_dir/http-loaded.values"
+	http_sorted="$job_dir/http-loaded.sorted"
+	http_marker="$job_dir/http.running"
+	cpu_values="$job_dir/cpu.values"
+	cpu_marker="$job_dir/cpu.running"
+	: > "$loaded_raw"
+	: > "$http_values"
+	: > "$cpu_values"
+	: > "$cpu_marker"
+	: > "$http_marker"
+
+	if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_SHAPER:-0}" = 1 ]; then
+		printf '%s\n' \
+			'[1.00000] 1.1.1.1 : [0], 64 bytes, 20.0 ms (20.0 avg, 0% loss)' \
+			'[1.20000] 1.1.1.1 : [1], 64 bytes, 22.0 ms (21.0 avg, 0% loss)' \
+			'[1.40000] 1.1.1.1 : [2], 64 bytes, 24.0 ms (22.0 avg, 0% loss)' \
+			'[1.60000] 1.1.1.1 : [3], 64 bytes, 26.0 ms (23.0 avg, 0% loss)' \
+			'[1.80000] 1.1.1.1 : [4], 64 bytes, 28.0 ms (24.0 avg, 0% loss)' > "$loaded_raw"
+		printf '%s\n' 12.0 > "$cpu_values"
+		printf '%s\n' 20.0 22.0 24.0 26.0 28.0 > "$http_values"
+	else
+		cpu_monitor "$cpu_values" "$cpu_marker" &
+		cpu_pid="$!"
+		http_latency_monitor "$http_values" "$http_marker" &
+		http_pid="$!"
+		# One probe per second and reflector avoids public DNS ICMP rate limits;
+		# the concurrent speed test is long enough for a useful sample set.
+		"$fping_bin" -I "$target_if" -D -l -s -p 1000 $reflectors > "$loaded_raw" 2>&1 &
+		latency_pid="$!"
+	fi
+
+	write_status shaped 87 "Running shaped validation attempt $attempt on the same test server"
+	shaped_result="$(run_speedtest_with_timeout "$job_name" "$target_if" run "$backend" shaped)" || {
+		rm -f "$cpu_marker" "$http_marker"
+		[ -n "${latency_pid:-}" ] && kill "$latency_pid" 2>/dev/null || true
+		[ -n "${cpu_pid:-}" ] && wait "$cpu_pid" 2>/dev/null || true
+		[ -n "${http_pid:-}" ] && wait "$http_pid" 2>/dev/null || true
+		restore_temp_shaper
+		fail "Shaped validation speed test failed."
+	}
+	rm -f "$cpu_marker" "$http_marker"
+	if [ -n "${latency_pid:-}" ]; then
+		kill "$latency_pid" 2>/dev/null || true
+		wait "$latency_pid" 2>/dev/null || true
+	fi
+	if [ -n "${cpu_pid:-}" ]; then
+		wait "$cpu_pid" 2>/dev/null || true
+	fi
+	if [ -n "${http_pid:-}" ]; then
+		wait "$http_pid" 2>/dev/null || true
+	fi
+	restore_temp_shaper
+
+	shaped_dl="$(extract_json "$shaped_result" '@.download_kbps')"
+	shaped_ul="$(extract_json "$shaped_result" '@.upload_kbps')"
+	is_positive_uint "$shaped_dl" || fail "Shaped validation returned no download rate."
+	is_positive_uint "$shaped_ul" || fail "Shaped validation returned no upload rate."
+	shaped_server_id="$(extract_json "$shaped_result" '@.server_id')"
+	if [ -n "$selected_server_id" ] && [ -n "$shaped_server_id" ] && [ "$shaped_server_id" != "$selected_server_id" ]; then
+		fail "Speed test server changed during shaped validation; retry for comparable results."
+	fi
+	loaded="$(latency_stats "$loaded_raw")" || fail "Shaped validation returned no independent latency samples."
+	set -- $loaded
+	loaded_median_ms="$1"
+	loaded_p95_ms="$2"
+	loaded_max_ms="$3"
+	loaded_samples="$4"
+	[ "$loaded_samples" -ge 5 ] 2>/dev/null || fail "Too few independent latency samples during shaped validation."
+	loss_percent="$(packet_loss_percent "$loaded_raw")"
+	[ -n "$loss_percent" ] || fail "Unable to determine packet loss during shaped validation."
+	cpu_peak="$(sort -n "$cpu_values" 2>/dev/null | tail -n 1)"
+	[ -n "$cpu_peak" ] || fail "Unable to sample CPU during shaped validation."
+	http_loaded="$(numeric_latency_stats "$http_values" "$http_sorted")" || fail "Unable to sample TCP/HTTPS latency during shaped validation."
+	set -- $http_loaded
+	http_loaded_median_ms="$1"
+	http_loaded_p95_ms="$2"
+	http_loaded_max_ms="$3"
+	http_loaded_samples="$4"
+	[ "$http_loaded_samples" -ge 3 ] 2>/dev/null || fail "Too few TCP/HTTPS latency samples during shaped validation."
+	http_loaded_delta_ms="$(awk -v loaded="$http_loaded_p95_ms" -v idle="$http_idle_median_ms" 'BEGIN {
+		delta = loaded - idle; if (delta < 0) delta = 0; printf "%.1f", delta
+	}')"
+
+	if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_PREFLIGHT:-0}" != 1 ]; then
+		current_source_ip="$(source_ip_for "$target_if")"
+		current_route_if="$(route_device_for "$source_ip")"
+		[ "$current_source_ip" = "$source_ip" ] || fail "WAN address changed during calibration; retry on a stable connection."
+		[ "$current_route_if" = "$target_if" ] || fail "WAN route changed during calibration; no configuration was written."
+	fi
+
+	validation_score="$(score_validation "$raw_dl_low" "$raw_ul_low" "$shaped_dl" "$shaped_ul" "$loaded_p95_ms" "$idle_median_ms" "$loss_percent" "$cpu_peak" "$http_loaded_delta_ms")"
+	set -- $validation_score
+	dl_retention="$1"
+	ul_retention="$2"
+	loaded_delta_ms="$3"
+	http_loaded_delta_ms="$4"
+	effective_loaded_delta_ms="$5"
+	score="$6"
+	validation_pass="$7"
+	validation_json="{\"pass\":$validation_pass,\"score\":$score,\"candidate_base\":{\"download_kbps\":$dl_base,\"upload_kbps\":$ul_base},\"throughput\":{\"download_kbps\":$shaped_dl,\"upload_kbps\":$shaped_ul,\"download_retention_percent\":$dl_retention,\"upload_retention_percent\":$ul_retention,\"comparison\":\"observed-low\"},\"latency\":{\"median_ms\":$loaded_median_ms,\"p95_ms\":$loaded_p95_ms,\"max_ms\":$loaded_max_ms,\"delta_p95_ms\":$loaded_delta_ms,\"samples\":$loaded_samples,\"loss_percent\":$loss_percent},\"http_latency\":{\"url\":\"$(json_escape "$http_probe_url")\",\"median_ms\":$http_loaded_median_ms,\"p95_ms\":$http_loaded_p95_ms,\"max_ms\":$http_loaded_max_ms,\"delta_p95_ms\":$http_loaded_delta_ms,\"samples\":$http_loaded_samples},\"effective_delta_ms\":$effective_loaded_delta_ms,\"cpu_peak_percent\":$cpu_peak,\"server_id\":\"$(json_escape "$(extract_json "$shaped_result" '@.server_id')")\"}"
+}
+
+run_job() {
+	job_paths
+	cancelled=0
+	temp_shaper_active=0
+	temp_ifb_created=0
+	sqm_was_active=0
+	temp_ifb=""
+	trap 'cancelled=1; exit 130' INT TERM
+	trap 'rc=$?; rm -f "${cpu_marker:-}" "${http_marker:-}"; restore_temp_shaper; rm -f "$pid_file"; if [ "$rc" -eq 130 ] && [ ! -s "$result_file" ]; then atomic_write "$error_file" "{\"state\":\"cancelled\",\"error\":\"Full Auto-Tune was cancelled; temporary speed-test state was restored.\"}"; fi' EXIT
+
+	preflight
+	write_status reflectors 15 "Selecting healthy latency reflectors"
+	pinger_plan="$($pinger_plan_bin "$job_name" scan 2>/dev/null)" ||
+		fail "Reflector scan failed."
+	reflectors="$(extract_json "$pinger_plan" '@.recommended_reflectors[*]' | head -n 3 | tr '\n' ' ')"
+
+	write_status baseline 22 "Measuring idle latency baseline"
+	baseline="$(baseline_latency "$reflectors")" || baseline="20.000 25.000 0"
+	set -- $baseline
+	idle_median_ms="$1"
+	idle_p95_ms="$2"
+	baseline_samples="$3"
+	http_baseline="$(baseline_http_latency)" || fail "Unable to establish an idle TCP/HTTPS latency baseline."
+	set -- $http_baseline
+	http_idle_median_ms="$1"
+	http_idle_p95_ms="$2"
+	http_idle_max_ms="$3"
+	http_idle_samples="$4"
+	[ "$http_idle_samples" -ge 3 ] 2>/dev/null || fail "Too few idle TCP/HTTPS latency samples."
+
+	download_samples=""
+	upload_samples=""
+	runs_json=""
+	selected_server_id=""
+	run_measurement 1
+	run_measurement 2
+
+	write_status proposal 80 "Calculating safe initial limits and adaptive ceiling bounds"
+	proposal="$(calculate_proposal 1.0)" || fail "Autotune proposal calculation failed."
+	run_shaped_validation 1
+	validation_attempts_json="$validation_json"
+	if [ "$validation_pass" != true ]; then
+		revision_scale="$(revision_scale_for_validation)"
+		write_status correction 91 "Revising base rates once after a borderline validation result"
+		proposal="$(calculate_proposal "$revision_scale")" || fail "Autotune correction calculation failed."
+		run_shaped_validation 2
+		validation_attempts_json="$validation_attempts_json,$validation_json"
+	fi
+	if [ "$validation_pass" != true ]; then
+		validation_error="Candidate failed shaped validation after one bounded correction (DL ${dl_retention}%, UL ${ul_retention}%, ICMP +${loaded_delta_ms} ms, TCP/HTTPS +${http_loaded_delta_ms} ms, loss ${loss_percent}%, CPU ${cpu_peak}%); no configuration was written."
+		atomic_write "$error_file" "{\"state\":\"failed\",\"error\":\"$(json_escape "$validation_error")\",\"validation_attempts\":[$validation_attempts_json],\"proposal\":$proposal,\"configuration_written\":false}"
+		exit 1
+	fi
+
+	write_status review 96 "Preparing validated review; no configuration has been written"
+	atomic_write "$result_file" "{\"state\":\"complete\",\"schema_version\":1,\"job_id\":\"$(json_escape "$job_name")\",\"target_interface\":\"$(json_escape "$target_if_input")\",\"resolved_interface\":\"$(json_escape "$target_if")\",\"source_ip\":\"$(json_escape "$source_ip")\",\"route_interface\":\"$(json_escape "$route_if")\",\"link_kind\":\"$(json_escape "$link_kind")\",\"baseline\":{\"median_ms\":$idle_median_ms,\"p95_ms\":$idle_p95_ms,\"samples\":$baseline_samples,\"http_median_ms\":$http_idle_median_ms,\"http_p95_ms\":$http_idle_p95_ms,\"http_samples\":$http_idle_samples,\"http_url\":\"$(json_escape "$http_probe_url")\"},\"runs\":[$runs_json],\"validation_attempts\":[$validation_attempts_json],\"validation\":$validation_json,\"pinger_plan\":$pinger_plan,\"proposal\":$proposal,\"configuration_written\":false}"
+	rm -f "$status_file" "$error_file"
+}
+
+start_job() {
+	setsid_bin="$(command -v setsid 2>/dev/null)"
+	[ -n "$setsid_bin" ] || json_error "setsid is required for Full Auto-Tune."
+	mkdir -p "$job_dir" || json_error "Unable to create autotune job directory."
+	chmod 700 "$job_dir" 2>/dev/null || true
+
+	if [ -s "$pid_file" ]; then
+		pid="$(sed -n '1p' "$pid_file" 2>/dev/null)"
+		if is_positive_uint "$pid" && kill -0 "$pid" 2>/dev/null; then
+			cat "$status_file" 2>/dev/null || printf '{"state":"running","phase":"starting","progress":0}\n'
+			return 0
+		fi
+	fi
+
+	rm -f "$pid_file" "$status_file" "$result_file" "$error_file" "$cancel_file" "$log_file"
+	write_status starting 0 "Starting Full Auto-Tune"
+	"$setsid_bin" "$0" "$job_name" "$target_if_input" job-run "$backend" \
+		</dev/null > "$log_file" 2>&1 &
+	pid="$!"
+	printf '%s\n' "$pid" > "$pid_file"
+	cat "$status_file"
+}
+
+status_job() {
+	if [ -s "$result_file" ]; then
+		cat "$result_file"
+	elif [ -s "$error_file" ]; then
+		cat "$error_file"
+	elif [ -s "$pid_file" ]; then
+		pid="$(sed -n '1p' "$pid_file" 2>/dev/null)"
+		if is_positive_uint "$pid" && kill -0 "$pid" 2>/dev/null; then
+			cat "$status_file" 2>/dev/null || printf '{"state":"running","phase":"starting","progress":0}\n'
+		else
+			printf '{"state":"failed","error":"Autotune worker exited without a result."}\n'
+		fi
+	else
+		printf '{"state":"idle"}\n'
+	fi
+}
+
+cancel_job() {
+	if [ -s "$pid_file" ]; then
+		pid="$(sed -n '1p' "$pid_file" 2>/dev/null)"
+		if is_positive_uint "$pid" && kill -0 "$pid" 2>/dev/null; then
+			: > "$cancel_file"
+			write_status cancelling 0 "Cancelling Full Auto-Tune and restoring temporary speed-test/SQM state"
+			kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+			cat "$status_file"
+			return 0
+		fi
+	fi
+	printf '{"state":"idle"}\n'
+}
+
+safe_job_name "$job_name" || json_error "Invalid autotune job name."
+safe_interface_name "$target_if_input" || json_error "Invalid target interface."
+job_paths
+
+case "$mode" in
+	start) start_job ;;
+	status) status_job ;;
+	cancel) cancel_job ;;
+	job-run) run_job ;;
+	*) json_error "Unsupported autotune mode." ;;
+esac
