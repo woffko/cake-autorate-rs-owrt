@@ -9,6 +9,8 @@ SQM_CONFIG="sqm"
 DAEMON="/usr/sbin/cake-autorated"
 SQM_MANAGED=0
 CAKE_CONFIG_CHANGED=0
+SQM_INTERFACES=""
+BRIDGER_CONFIG_CHANGED=0
 
 set_cake_option_if_changed() {
 	local section="$1"
@@ -149,6 +151,108 @@ set_sqm_optional_option() {
 	fi
 }
 
+append_sqm_interface() {
+	local iface="$1"
+
+	[ -n "$iface" ] || return 0
+	case " $SQM_INTERFACES " in
+		*" $iface "*) return 0 ;;
+	esac
+
+	SQM_INTERFACES="${SQM_INTERFACES:+$SQM_INTERFACES }$iface"
+}
+
+disable_unmanaged_sqm_conflicts() {
+	local keep="$1"
+	local target="$2"
+	local candidate enabled iface owner
+
+	for candidate in $(uci -q show "$SQM_CONFIG" | sed -n "s/^$SQM_CONFIG\.\([^.]*\)=queue$/\1/p"); do
+		[ "$candidate" != "$keep" ] || continue
+
+		enabled="$(uci -q get "$SQM_CONFIG.$candidate.enabled" 2>/dev/null)"
+		[ "$enabled" = "1" ] || continue
+		iface="$(uci -q get "$SQM_CONFIG.$candidate.interface" 2>/dev/null)"
+		[ -n "$iface" ] || continue
+		iface="$(resolve_interface_device "$iface")"
+		[ "$iface" = "$target" ] || continue
+
+		owner="$(uci -q get "$SQM_CONFIG.$candidate._cake_autorate_managed" 2>/dev/null)"
+		if [ -n "$owner" ]; then
+			logger -t cake-autorate "SQM conflict on '$target': managed queues '$keep' and '$candidate' cannot run on the same interface"
+			continue
+		fi
+
+		uci set "$SQM_CONFIG.$candidate.enabled=0"
+		logger -t cake-autorate "disabled conflicting unmanaged SQM queue '$candidate' on '$target'; CAKE Autorate manages '$keep'"
+		SQM_MANAGED=1
+	done
+}
+
+bridger_blacklist_contains() {
+	local iface="$1"
+	local current
+
+	current="$(uci -q get bridger.@defaults[0].blacklist 2>/dev/null)"
+	case " $current " in
+		*" $iface "*) return 0 ;;
+	esac
+
+	return 1
+}
+
+sync_bridger_blacklist() {
+	local iface
+
+	BRIDGER_CONFIG_CHANGED=0
+	[ -n "$SQM_INTERFACES" ] || return 0
+	[ -x /etc/init.d/bridger ] || return 0
+	uci -q get bridger.@defaults[0] >/dev/null || return 0
+
+	for iface in $SQM_INTERFACES; do
+		bridger_blacklist_contains "$iface" && continue
+		uci add_list "bridger.@defaults[0].blacklist=$iface"
+		logger -t cake-autorate "added SQM interface '$iface' to bridger blacklist"
+		BRIDGER_CONFIG_CHANGED=1
+	done
+
+	[ "$BRIDGER_CONFIG_CHANGED" -eq 1 ] || return 0
+	uci commit bridger
+	/etc/init.d/bridger reload >/dev/null 2>&1 || true
+}
+
+remove_empty_clsact() {
+	local iface="$1"
+	local ingress_filters egress_filters
+
+	command -v tc >/dev/null 2>&1 || return 0
+	tc qdisc show dev "$iface" 2>/dev/null | grep -q '^qdisc clsact ' || return 0
+
+	ingress_filters="$(tc filter show dev "$iface" ingress 2>/dev/null)"
+	egress_filters="$(tc filter show dev "$iface" egress 2>/dev/null)"
+	if [ -n "$ingress_filters$egress_filters" ]; then
+		logger -t cake-autorate "cannot replace clsact on SQM interface '$iface': non-SQM tc filters are still attached"
+		return 1
+	fi
+
+	if tc qdisc del dev "$iface" clsact >/dev/null 2>&1; then
+		logger -t cake-autorate "removed empty clsact from SQM interface '$iface' before ingress setup"
+		return 0
+	fi
+
+	logger -t cake-autorate "failed to remove empty clsact from SQM interface '$iface'"
+	return 1
+}
+
+prepare_sqm_ingress_interfaces() {
+	local iface
+
+	sync_bridger_blacklist
+	for iface in $SQM_INTERFACES; do
+		remove_empty_clsact "$iface" || true
+	done
+}
+
 cleanup_stale_sqm_sections() {
 	local owner="$1"
 	local keep="$2"
@@ -210,6 +314,8 @@ sync_sqm_instance() {
 	[ -n "$value" ] || config_get value "$section" ul_if
 	value="$(resolve_interface_device "$value")"
 	set_sqm_option "$sqm_section" interface "$value"
+	append_sqm_interface "$value"
+	disable_unmanaged_sqm_conflicts "$sqm_section" "$value"
 
 	config_get value "$section" sqm_download
 	[ -n "$value" ] || config_get value "$section" base_dl_shaper_rate_kbps
@@ -273,6 +379,7 @@ sync_sqm_instance() {
 
 sync_sqm_config() {
 	SQM_MANAGED=0
+	SQM_INTERFACES=""
 	config_foreach sync_sqm_instance cake_autorate
 	[ "$SQM_MANAGED" -eq 1 ] || return 0
 	uci commit "$SQM_CONFIG"
@@ -346,7 +453,7 @@ instance_has_enabled_sqm_backing() {
 
 instance_has_interface_backing() {
 	local section="$1"
-	local dl rx enabled auto manage_sqm sqm_enabled
+	local dl rx enabled auto manage_sqm sqm_enabled target
 
 	config_get rx "$section" rx_bytes_path
 	[ -n "$rx" ] && return 0
@@ -379,6 +486,16 @@ instance_has_interface_backing() {
 		return 1
 	fi
 
+	config_get target "$section" sqm_interface
+	[ -n "$target" ] || config_get target "$section" ul_if
+	[ -n "$target" ] || config_get target "$section" wan_if
+	target="$(resolve_interface_device "$target")"
+	if command -v tc >/dev/null 2>&1 &&
+	   ! tc filter show dev "$target" ingress 2>/dev/null | grep -Fq "$dl"; then
+		logger -t cake-autorate "not starting instance '$section': IFB '$dl' exists but '$target' has no active ingress redirect to it (check duplicate SQM queues or bridger clsact)"
+		return 1
+	fi
+
 	return 0
 }
 
@@ -402,6 +519,7 @@ start_service() {
 	config_load "$CONFIG"
 	sync_interface_presets
 	sync_sqm_config
+	prepare_sqm_ingress_interfaces
 	start_sqm_backend
 	config_foreach start_instance cake_autorate
 	[ -x /etc/init.d/cake-autorate-mqtt ] && /etc/init.d/cake-autorate-mqtt restart >/dev/null 2>&1 || true

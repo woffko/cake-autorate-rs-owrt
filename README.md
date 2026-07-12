@@ -7,14 +7,14 @@ The current targets are OpenWrt 25.12.5 on `x86/64` and
 is intentionally kept small and currently uses only the Rust standard library
 plus OpenWrt userland tools.
 
-## Release 1.0 RC4
+## Development packages after 1.0 RC4
 
-`v1.0-rc4` provides these OpenWrt 25.12.5 APKs:
+The current tree builds these OpenWrt 25.12.5 APKs:
 
-- `cake-autorate-rs-1.0_rc1-r7-x86_64.apk` — x86_64 autorate daemon.
-- `cake-autorate-rs-1.0_rc1-r7-aarch64_generic.apk` — rockchip/armv8
+- `cake-autorate-rs-1.0_rc1-r8-x86_64.apk` — x86_64 autorate daemon.
+- `cake-autorate-rs-1.0_rc1-r8-aarch64_generic.apk` — rockchip/armv8
   autorate daemon.
-- `luci-app-cake-autorate-rs-1.0_rc1-r6.apk` — architecture-independent LuCI
+- `luci-app-cake-autorate-rs-1.0_rc1-r7.apk` — architecture-independent LuCI
   interface and SQM integration.
 
 The daemon package installs `uci` and `fping` as dependencies. The LuCI package
@@ -30,6 +30,10 @@ sample until the user scrolls back, and exact values on hover. The hard 128 KiB
 cap remains per instance. CPU load remains available in live Status even when
 CPU log records are disabled, and Status now shows the exact installed daemon
 and LuCI package versions.
+
+The post-RC4 daemon/LuCI revisions prevent duplicate SQM and `bridger` `clsact`
+state from silently breaking the IFB download path. They also add a compact
+`CAKE Autorate SQM` title and description above the application tabs.
 
 The release includes separate minimal x86_64 and rockchip/armv8 offline
 bundles. Extract the matching archive under `/root/` and run its included
@@ -112,6 +116,12 @@ Implemented:
 - LuCI and init guard against enabling an automatic IFB download interface
   without an enabled SQM backing queue for that instance. A stray IFB created by
   another SQM section does not satisfy the guard.
+- Managed SQM owns its target interface exclusively: the init script disables
+  conflicting unmanaged SQM queues on the same device. On systems running the
+  OpenWrt `bridger` accelerator, managed SQM devices are added to its blacklist
+  and an empty conflicting `clsact` is removed before SQM starts. Autorate now
+  also requires a real ingress redirect to its IFB, so a failed download shaper
+  cannot silently report all visible traffic in the upload direction.
 - LuCI setup wizard for creating instances, importing SQM rates, running a
   router-side speed test, and writing derived limits. Its normal speed-test step
   shows only rates and the test action; backend/package/headroom controls and
@@ -352,16 +362,16 @@ them together. For x86_64:
 
 ```sh
 apk add --allow-untrusted \
-  /tmp/cake-autorate-rs-1.0_rc1-r7-x86_64.apk \
-  /tmp/luci-app-cake-autorate-rs-1.0_rc1-r6.apk
+  /tmp/cake-autorate-rs-1.0_rc1-r8-x86_64.apk \
+  /tmp/luci-app-cake-autorate-rs-1.0_rc1-r7.apk
 ```
 
 For rockchip/armv8 (`aarch64_generic`):
 
 ```sh
 apk add --allow-untrusted \
-  /tmp/cake-autorate-rs-1.0_rc1-r7-aarch64_generic.apk \
-  /tmp/luci-app-cake-autorate-rs-1.0_rc1-r6.apk
+  /tmp/cake-autorate-rs-1.0_rc1-r8-aarch64_generic.apk \
+  /tmp/luci-app-cake-autorate-rs-1.0_rc1-r7.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:

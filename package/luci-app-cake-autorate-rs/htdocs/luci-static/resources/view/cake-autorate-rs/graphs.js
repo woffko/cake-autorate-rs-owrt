@@ -3,6 +3,7 @@
 'require poll';
 'require uci';
 'require ui';
+'require cake-autorate-rs.ui as cakeUi';
 
 var HISTORY_MAX_KIB = 128;
 var HISTORY_INTERVALS = [ 1, 2, 5, 10, 15, 30, 60 ];
@@ -585,6 +586,7 @@ return L.view.extend({
 	},
 
 	render: function(data) {
+		cakeUi.ensureAppHeader();
 		var sections = data[0];
 		var content = renderInstances(data[1]);
 		var root = E('div', {}, [
