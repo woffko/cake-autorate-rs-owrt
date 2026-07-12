@@ -11,10 +11,10 @@ plus OpenWrt userland tools.
 
 The current tree builds these OpenWrt 25.12.5 APKs:
 
-- `cake-autorate-rs-1.0_rc1-r8-x86_64.apk` — x86_64 autorate daemon.
-- `cake-autorate-rs-1.0_rc1-r8-aarch64_generic.apk` — rockchip/armv8
+- `cake-autorate-rs-1.0_rc1-r11-x86_64.apk` — x86_64 autorate daemon.
+- `cake-autorate-rs-1.0_rc1-r11-aarch64_generic.apk` — rockchip/armv8
   autorate daemon.
-- `luci-app-cake-autorate-rs-1.0_rc1-r8.apk` — architecture-independent LuCI
+- `luci-app-cake-autorate-rs-1.0_rc1-r11.apk` — architecture-independent LuCI
   interface and SQM integration.
 
 The daemon package installs `uci` and `fping` as dependencies. The LuCI package
@@ -33,7 +33,11 @@ and LuCI package versions.
 
 The post-RC4 daemon/LuCI revisions prevent duplicate SQM and `bridger` `clsact`
 state from silently breaking the IFB download path. They also add a compact
-`CAKE Autorate SQM` title and description above the application tabs.
+`CAKE Autorate SQM` title and description above the application tabs. The
+optional adaptive ceiling now uses bounded probes: it remembers proven-safe
+and failed bounds independently for download and upload, rolls back immediately
+after confirmed bufferbloat, and converges with midpoint probes instead of
+repeatedly growing through a known bottleneck.
 
 The release includes separate minimal x86_64 and rockchip/armv8 offline
 bundles. Extract the matching archive under `/root/` and run its included
@@ -82,14 +86,18 @@ Implemented:
 - CPU usage sampling from `/proc/stat` is always exposed in runtime status;
   `output_cpu_stats` and `output_cpu_raw_stats` control log records only.
 - adaptive rate calculations using delay/load windows.
-- Optional Rust-only adaptive ceiling extension, disabled by default so the
-  upstream configured maximum remains a hard limit. When explicitly enabled,
-  each direction can raise its runtime ceiling by 1% only after 60 seconds of
-  uninterrupted high load at the current ceiling with no delay offence and a
-  low average delay delta. Separate absolute DL/UL caps bound growth; probe
-  gaps restart qualification, bufferbloat lowers a learned ceiling, and a stall
-  resets it to the configured maximum. Learned ceilings are runtime-only and do
-  not rewrite UCI.
+- Optional Rust-only bounded-probe ceiling extension, disabled by default so
+  the upstream configured maximum remains a hard limit. When enabled, each
+  direction independently qualifies clean high load, briefly tests a higher
+  ceiling, promotes a clean target to its learned-safe bound, and remembers the
+  lowest target that caused confirmed bufferbloat. Later probes use the midpoint
+  between safe and failed bounds. Short load/delay-classification fluctuations
+  are tolerated, while sustained loss or a global probe-response gap rolls back
+  without poisoning the safe/failed bounds; a stall resets runtime learning.
+  Absolute DL/UL caps remain hard safety limits, and UCI is never rewritten.
+  Status exposes the phase, safe ceiling, failed bound, probe target, and last
+  transition reason. See [ADAPTIVE_CEILING.md](ADAPTIVE_CEILING.md) for the
+  state machine and acceptance tests.
 - `tc qdisc change ... cake bandwidth ...` shaper updates.
 - Upstream-style idle/stall handling: sustained idle can stop pingers, activity
   restarts them, and optional minimum-rate enforcement applies on sustained idle
@@ -193,8 +201,10 @@ Known limits:
 
 - Adaptive ceiling is intentionally not part of upstream `cake-autorate` and is
   an explicit opt-in. Configure absolute caps deliberately; leaving it off
-  preserves exact upstream hard-max semantics. Runtime status/logs expose every
-  effective-ceiling change.
+  preserves exact upstream hard-max semantics. The recommended initial tuning
+  is 20 seconds qualification, a 3% open probe, 8 seconds observation, 30
+  seconds cooldown, and 900 seconds failed-bound memory. Runtime status/logs
+  expose all phase transitions and effective-ceiling changes.
 - `pinger_method=ping` starts one basic ping process per active reflector, but
   it remains a fallback; use `fping`, `fping-ts`, `tsping`, or explicit-server
   `irtt` where those backends are available.
@@ -362,16 +372,16 @@ them together. For x86_64:
 
 ```sh
 apk add --allow-untrusted \
-  /tmp/cake-autorate-rs-1.0_rc1-r8-x86_64.apk \
-  /tmp/luci-app-cake-autorate-rs-1.0_rc1-r8.apk
+  /tmp/cake-autorate-rs-1.0_rc1-r11-x86_64.apk \
+  /tmp/luci-app-cake-autorate-rs-1.0_rc1-r11.apk
 ```
 
 For rockchip/armv8 (`aarch64_generic`):
 
 ```sh
 apk add --allow-untrusted \
-  /tmp/cake-autorate-rs-1.0_rc1-r8-aarch64_generic.apk \
-  /tmp/luci-app-cake-autorate-rs-1.0_rc1-r8.apk
+  /tmp/cake-autorate-rs-1.0_rc1-r11-aarch64_generic.apk \
+  /tmp/luci-app-cake-autorate-rs-1.0_rc1-r11.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:

@@ -4,7 +4,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-cake-autorate-rs
 PKG_VERSION:=1.0_rc1
-PKG_RELEASE:=8
+PKG_RELEASE:=11
 
 PKG_MAINTAINER:=woffko
 PKG_LICENSE:=Apache-2.0

@@ -49,11 +49,14 @@ var optionDescriptions = {
 	min_ul_shaper_rate_kbps: 'Lowest upload shaper rate autorate may apply, in kbit/s.',
 	base_ul_shaper_rate_kbps: 'Starting upload shaper rate before autorate adjusts it, in kbit/s.',
 	max_ul_shaper_rate_kbps: 'Highest upload shaper rate autorate may apply, in kbit/s.',
-	adaptive_ceiling_enabled: 'Optional Rust extension. Keep off for the upstream hard-max behavior. When enabled, the configured maximum is only the starting ceiling and may rise slowly under sustained clean high load.',
+	adaptive_ceiling_enabled: 'Bounded probe mode. The configured maximum becomes a learned-safe starting ceiling. Under sustained clean high load the daemon briefly tests a higher ceiling, keeps successful values, and rolls back while remembering failed values when latency rises.',
 	adaptive_ceiling_dl_cap_kbps: 'Absolute download safety cap for adaptive ceiling growth, in kbit/s. It must not be below the configured download maximum.',
 	adaptive_ceiling_ul_cap_kbps: 'Absolute upload safety cap for adaptive ceiling growth, in kbit/s. It must not be below the configured upload maximum.',
-	adaptive_ceiling_hold_time_s: 'Continuous clean high-load time required at the current ceiling before one growth step. Any probe gap, delay offence, idle/low load, or stall restarts the hold.',
-	adaptive_ceiling_growth_percent: 'Percentage added to the runtime ceiling after each clean hold interval. Growth is runtime-only and never rewrites UCI.',
+	adaptive_ceiling_hold_time_s: 'Clean high-load qualification time before a probe starts. Brief load or delay-classification fluctuations are tolerated; a sustained interruption, global probe gap, or stall cancels qualification.',
+	adaptive_ceiling_growth_percent: 'Open-ended probe step as a percentage of the learned-safe ceiling. Once a failed upper bound is known, probes use the midpoint instead.',
+	adaptive_ceiling_probe_duration_s: 'Time a candidate ceiling must carry clean high load before it is accepted as the new learned-safe ceiling.',
+	adaptive_ceiling_cooldown_s: 'Recovery pause after a successful or failed probe before qualification may start again.',
+	adaptive_ceiling_failed_bound_ttl_s: 'How long a failed upper ceiling remains remembered. It prevents repeatedly testing a known-bad value, but expires so the link can be relearned after conditions change.',
 	dl_if: 'Interface whose RX byte counter represents shaped download traffic, usually the IFB created by SQM.',
 	ul_if: 'Interface whose TX byte counter represents upload traffic, usually the WAN device.',
 	manage_sqm: 'Mirror this instance into /etc/config/sqm and restart SQM before autorate starts.',
@@ -2242,10 +2245,19 @@ function addRateOptions(section) {
 		return validateAdaptiveCeiling(validationSection(this), section_id);
 	};
 
-	o = value(section, 'rates', 'adaptive_ceiling_hold_time_s', _('Clean-load hold'), 'and(ufloat,min(1))', '60.0');
+	o = value(section, 'rates', 'adaptive_ceiling_hold_time_s', _('Qualification time'), 'and(ufloat,min(1))', '20.0');
 	o.depends('adaptive_ceiling_enabled', '1');
 
-	o = value(section, 'rates', 'adaptive_ceiling_growth_percent', _('Growth per hold'), 'and(ufloat,min(0.1),max(10))', '1.0');
+	o = value(section, 'rates', 'adaptive_ceiling_growth_percent', _('Open probe step'), 'and(ufloat,min(0.1),max(10))', '3.0');
+	o.depends('adaptive_ceiling_enabled', '1');
+
+	o = value(section, 'rates', 'adaptive_ceiling_probe_duration_s', _('Probe observation'), 'and(ufloat,min(1))', '8.0');
+	o.depends('adaptive_ceiling_enabled', '1');
+
+	o = value(section, 'rates', 'adaptive_ceiling_cooldown_s', _('Probe cooldown'), 'and(ufloat,min(0))', '30.0');
+	o.depends('adaptive_ceiling_enabled', '1');
+
+	o = value(section, 'rates', 'adaptive_ceiling_failed_bound_ttl_s', _('Failed-bound memory'), 'and(ufloat,min(1))', '900.0');
 	o.depends('adaptive_ceiling_enabled', '1');
 }
 

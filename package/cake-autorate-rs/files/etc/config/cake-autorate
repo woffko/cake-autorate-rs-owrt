@@ -21,8 +21,11 @@ config cake_autorate 'primary'
 	option adaptive_ceiling_enabled '0'
 	option adaptive_ceiling_dl_cap_kbps '80000'
 	option adaptive_ceiling_ul_cap_kbps '35000'
-	option adaptive_ceiling_hold_time_s '60.0'
-	option adaptive_ceiling_growth_percent '1.0'
+	option adaptive_ceiling_hold_time_s '20.0'
+	option adaptive_ceiling_growth_percent '3.0'
+	option adaptive_ceiling_probe_duration_s '8.0'
+	option adaptive_ceiling_cooldown_s '30.0'
+	option adaptive_ceiling_failed_bound_ttl_s '900.0'
 
 	# SQM backend managed by this package. The LuCI package depends on
 	# sqm-scripts and the init script mirrors these values to /etc/config/sqm.
