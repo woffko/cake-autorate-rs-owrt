@@ -103,17 +103,36 @@ function formatShaperRate(status, direction) {
 	var configuredKey = direction === 'dl' ? 'configured_max_dl_shaper_rate_kbps' : 'configured_max_ul_shaper_rate_kbps';
 	var effectiveKey = direction === 'dl' ? 'effective_max_dl_shaper_rate_kbps' : 'effective_max_ul_shaper_rate_kbps';
 	var capKey = direction === 'dl' ? 'adaptive_ceiling_dl_cap_kbps' : 'adaptive_ceiling_ul_cap_kbps';
+	var phaseKey = 'adaptive_ceiling_' + direction + '_phase';
+	var safeKey = direction === 'dl' ? 'adaptive_ceiling_safe_dl_kbps' : 'adaptive_ceiling_safe_ul_kbps';
+	var failedKey = direction === 'dl' ? 'adaptive_ceiling_failed_dl_kbps' : 'adaptive_ceiling_failed_ul_kbps';
+	var probeKey = direction === 'dl' ? 'adaptive_ceiling_probe_dl_kbps' : 'adaptive_ceiling_probe_ul_kbps';
+	var reasonKey = 'adaptive_ceiling_' + direction + '_last_reason';
 	var rate = formatRate(status[rateKey]);
+	var phase, failed, probe, detail, title;
 
 	if (!status.adaptive_ceiling_enabled)
 		return rate;
 
+	phase = String(status[phaseKey] || 'cruise').replace(/_/g, ' ');
+	failed = status[failedKey] == null ? '-' : formatRate(status[failedKey]);
+	probe = status[probeKey] == null ? '-' : formatRate(status[probeKey]);
+	detail = _('Phase: %s · safe: %s').format(phase, formatRate(status[safeKey]));
+	title = [
+		_('Configured max: %s').format(formatRate(status[configuredKey])),
+		_('Effective ceiling: %s').format(formatRate(status[effectiveKey])),
+		_('Absolute cap: %s').format(formatRate(status[capKey])),
+		_('Failed bound: %s').format(failed),
+		_('Probe target: %s').format(probe),
+		_('Last transition: %s').format(status[reasonKey] || '-')
+	].join('\n');
+
 	return E('div', {
-		'title': _('Configured max: %s').format(formatRate(status[configuredKey]))
+		'title': title
 	}, [
 		E('div', {}, rate),
 		E('small', { 'style': 'white-space:nowrap' },
-			_('Ceiling: %s / %s').format(formatRate(status[effectiveKey]), formatRate(status[capKey])))
+			detail)
 	]);
 }
 
