@@ -14,7 +14,7 @@ The current tree builds these OpenWrt 25.12.5 APKs:
 - `cake-autorate-rs-1.0_rc1-r8-x86_64.apk` — x86_64 autorate daemon.
 - `cake-autorate-rs-1.0_rc1-r8-aarch64_generic.apk` — rockchip/armv8
   autorate daemon.
-- `luci-app-cake-autorate-rs-1.0_rc1-r7.apk` — architecture-independent LuCI
+- `luci-app-cake-autorate-rs-1.0_rc1-r8.apk` — architecture-independent LuCI
   interface and SQM integration.
 
 The daemon package installs `uci` and `fping` as dependencies. The LuCI package
@@ -363,7 +363,7 @@ them together. For x86_64:
 ```sh
 apk add --allow-untrusted \
   /tmp/cake-autorate-rs-1.0_rc1-r8-x86_64.apk \
-  /tmp/luci-app-cake-autorate-rs-1.0_rc1-r7.apk
+  /tmp/luci-app-cake-autorate-rs-1.0_rc1-r8.apk
 ```
 
 For rockchip/armv8 (`aarch64_generic`):
@@ -371,7 +371,7 @@ For rockchip/armv8 (`aarch64_generic`):
 ```sh
 apk add --allow-untrusted \
   /tmp/cake-autorate-rs-1.0_rc1-r8-aarch64_generic.apk \
-  /tmp/luci-app-cake-autorate-rs-1.0_rc1-r7.apk
+  /tmp/luci-app-cake-autorate-rs-1.0_rc1-r8.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:

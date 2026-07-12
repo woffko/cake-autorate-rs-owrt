@@ -2,7 +2,7 @@
 
 function ensureAppHeader() {
 	window.requestAnimationFrame(function insertHeader() {
-		var tabs = document.querySelector('.cbi-tabmenu');
+		var tabs = document.querySelector('.cbi-tabmenu, ul.tabs');
 
 		if (!tabs || !tabs.parentNode) {
 			window.setTimeout(insertHeader, 50);
@@ -23,6 +23,6 @@ function ensureAppHeader() {
 	});
 }
 
-return {
+return L.Class.extend({
 	ensureAppHeader: ensureAppHeader
-};
+});
