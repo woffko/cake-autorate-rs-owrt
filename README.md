@@ -2,14 +2,20 @@
 
 OpenWrt package bundle for a Rust prototype of `cake-autorate` with a LuCI UI and UCI configuration.
 
-The current target is OpenWrt 25.12.5 on `x86/64`. The daemon is intentionally kept small and currently uses only the Rust standard library plus OpenWrt userland tools.
+The current targets are OpenWrt 25.12.5 on `x86/64` and
+`rockchip/armv8` (`aarch64_generic`, including the Banana Pi R2 Pro). The daemon
+is intentionally kept small and currently uses only the Rust standard library
+plus OpenWrt userland tools.
 
-## Release 1.0 RC3
+## Release 1.0 RC4
 
-`v1.0-rc3` provides these x86_64 OpenWrt 25.12.5 APKs:
+`v1.0-rc4` provides these OpenWrt 25.12.5 APKs:
 
-- `cake-autorate-rs-1.0_rc1-r6.apk` — the autorate daemon.
-- `luci-app-cake-autorate-rs-1.0_rc1-r5.apk` — the LuCI interface and SQM integration.
+- `cake-autorate-rs-1.0_rc1-r7-x86_64.apk` — x86_64 autorate daemon.
+- `cake-autorate-rs-1.0_rc1-r7-aarch64_generic.apk` — rockchip/armv8
+  autorate daemon.
+- `luci-app-cake-autorate-rs-1.0_rc1-r6.apk` — architecture-independent LuCI
+  interface and SQM integration.
 
 The daemon package installs `uci` and `fping` as dependencies. The LuCI package
 installs the daemon, `luci-base`, and `sqm-scripts`; the latter brings the CAKE,
@@ -17,14 +23,19 @@ IFB, `tc`, and `ip` runtime pieces. The wizard now labels a device with its
 logical OpenWrt networks, for example `eth1 — wan, wan6`, while continuing to
 save and use the physical device name.
 
-RC3 adds optional, RAM-only RTT/CPU graphs with a hard 128 KiB history cap per
-active instance. CPU load remains available in live Status even when CPU log
-records are disabled.
+RC4 extends the optional RAM-only history to synchronized RTT/CPU and DL/UL
+traffic charts. Each active instance has a 1, 2, 5, 10, 15, 30, or 60 second
+sampling dropdown, a horizontally scrolling timeline that follows the latest
+sample until the user scrolls back, and exact values on hover. The hard 128 KiB
+cap remains per instance. CPU load remains available in live Status even when
+CPU log records are disabled, and Status now shows the exact installed daemon
+and LuCI package versions.
 
-The release also includes a minimal x86_64 offline bundle. Extract it under
-`/root/` and run its included installer; it installs the two project APKs
-together with all 60 transitive packages from the local APK repository in
-`/root/packages/`, without network access.
+The release includes separate minimal x86_64 and rockchip/armv8 offline
+bundles. Extract the matching archive under `/root/` and run its included
+installer; it validates the OpenWrt release and APK architecture, backs up the
+existing UCI configuration, and installs the two project APKs together with all
+60 transitive packages from the local repository without network access.
 
 ## Repository Layout
 
@@ -81,14 +92,19 @@ Implemented:
   or global no-response timeout.
 - daemon log rotation by age/size with best-effort gzip compression.
 - JSON status file under `/var/run/cake-autorate/<instance>/status.json`.
-- Optional per-instance LuCI `Graphs` history for RTT and total CPU. It is
-  disabled by default and enabled directly on each active instance card. Samples
-  are kept only in `/var/run` tmpfs every 10 seconds, the chart shows the last
-  three hours, and a hard 128 KiB per-instance cap prevents unbounded RAM use.
+- Optional per-instance LuCI `Graphs` history for RTT, total CPU, download, and
+  upload traffic. It is disabled by default and enabled directly on each active
+  instance card. A per-instance dropdown selects 1, 2, 5, 10, 15, 30, or 60
+  second sampling. Both charts share a horizontally scrollable timeline,
+  auto-follow new samples until the user scrolls back, and expose exact values
+  on hover. Samples stay only in `/var/run` tmpfs, and a hard 128 KiB
+  per-instance cap removes the oldest rows before RAM use can grow unbounded.
   History is removed when the service stops and never writes router flash.
 - LuCI Status can export a diagnostic text bundle containing redacted
   cake-autorate config, SQM config, runtime status, daemon logs, package
   versions, and recent syslog lines.
+- LuCI Status shows the exact installed daemon and LuCI package versions at the
+  top of the page.
 - LuCI settings page with compact instance rows and modal tabs for detailed settings.
 - LuCI cross-field validation for manual min/base/max rates, explicit
   download/upload interface conflicts, `ping` fallback pinger count, and
@@ -294,7 +310,9 @@ configured base topic.
 
 ## Build In OpenWrt SDK
 
-Use a clean OpenWrt 25.12.5 x86_64 SDK. The Rust feed builds a large host Rust/LLVM toolchain on first use, so cache the SDK or use a prepared build image for normal iteration.
+Use a clean OpenWrt 25.12.5 SDK for either `x86/64` or `rockchip/armv8`. The
+Rust feed builds a large host Rust/LLVM toolchain on first use, so cache the SDK
+or use a prepared build image for normal iteration.
 
 Recommended feed workflow:
 
@@ -329,12 +347,21 @@ CONFIG_PACKAGE_rust=m
 
 ## Install
 
-Copy both generated x86_64 `.apk` files to the router and install them together:
+Copy the matching daemon APK plus the noarch LuCI APK to the router and install
+them together. For x86_64:
 
 ```sh
 apk add --allow-untrusted \
-  /tmp/cake-autorate-rs-1.0_rc1-r6.apk \
-  /tmp/luci-app-cake-autorate-rs-1.0_rc1-r5.apk
+  /tmp/cake-autorate-rs-1.0_rc1-r7-x86_64.apk \
+  /tmp/luci-app-cake-autorate-rs-1.0_rc1-r6.apk
+```
+
+For rockchip/armv8 (`aarch64_generic`):
+
+```sh
+apk add --allow-untrusted \
+  /tmp/cake-autorate-rs-1.0_rc1-r7-aarch64_generic.apk \
+  /tmp/luci-app-cake-autorate-rs-1.0_rc1-r6.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:
@@ -347,22 +374,32 @@ apk add irtt  # also configure explicit IRTT servers and synchronized clocks
 
 ### Offline install bundle
 
-For a router without access to the package feeds, copy the release bundle to
-`/root/`, then run:
+For a router without access to the package feeds, copy the matching release
+bundle to `/root/`, then run one of these platform-specific pairs.
+
+x86_64:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc3-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc3-x86_64.sh
+tar -xzf cake-autorate-rs-1.0-rc4-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc4-x86_64.sh
+```
+
+Banana Pi R2 Pro and other OpenWrt 25.12.5 rockchip/armv8 devices:
+
+```sh
+cd /root
+tar -xzf cake-autorate-rs-1.0-rc4-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc4-aarch64_generic.sh
 ```
 
 The installer resolves its own location, so it also works when the extracted
 bundle is kept in another directory.
 
-The archive is about 2.1 MiB and needs roughly 5 MiB of free space while both
-the archive and its extracted contents are present. If `/root/` is too small,
-use another writable filesystem (for example `/tmp/` when its tmpfs has enough
-RAM) for both commands instead.
+Each archive is about 2.1–2.2 MiB and needs roughly 5 MiB of free space while
+both the archive and its extracted contents are present. If `/root/` is too
+small, use another writable filesystem (for example `/tmp/` when its tmpfs has
+enough RAM) for both commands instead.
 
 Optional speed test backends can be installed from LuCI or manually:
 
@@ -390,13 +427,15 @@ LuCI `Graphs` page; from the shell it can be changed with:
 
 ```sh
 uci set cake-autorate.primary.graph_history_enabled='1'  # use '0' to disable
+uci set cake-autorate.primary.graph_history_interval_s='10'  # accepted: 1-60
 uci commit cake-autorate
 /etc/init.d/cake-autorate restart
 ```
 
-When enabled, `history.csv` is sampled every 10 seconds under
-`/var/run/cake-autorate/<instance>/`. It has a hard 128 KiB per-instance limit,
-is removed on service stop/reboot, and is never stored in flash.
+When enabled, `history.csv` is sampled at the selected interval under
+`/var/run/cake-autorate/<instance>/`. Each row contains timestamp, RTT, total
+CPU, download kbit/s, and upload kbit/s. It has a hard 128 KiB per-instance
+limit, is removed on service stop/reboot, and is never stored in flash.
 
 ## Quick Checks
 

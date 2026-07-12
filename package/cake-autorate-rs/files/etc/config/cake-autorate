@@ -161,6 +161,8 @@ config cake_autorate 'primary'
 	option monitor_cpu_usage_interval_ms '2000'
 	# Optional Graphs-tab history lives only in /var/run (RAM/tmpfs), never flash.
 	option graph_history_enabled '0'
+	# Per-instance graph sample interval, accepted range 1-60 seconds.
+	option graph_history_interval_s '10'
 	option bufferbloat_detection_window '6'
 	option bufferbloat_detection_thr '3'
 	option alpha_baseline_increase '0.001'

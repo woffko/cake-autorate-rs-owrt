@@ -1,0 +1,8 @@
+#!/bin/sh
+
+set -eu
+
+exec /usr/bin/apk query --installed \
+	--fields name,version \
+	--format json \
+	cake-autorate-rs luci-app-cake-autorate-rs

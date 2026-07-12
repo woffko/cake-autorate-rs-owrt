@@ -12,7 +12,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static TERMINATE: AtomicBool = AtomicBool::new(false);
 const STALE_REFLECTOR_RESPONSE_MAX_AGE_S: f64 = 0.5;
-const GRAPH_HISTORY_INTERVAL_S: u64 = 10;
 const GRAPH_HISTORY_MAX_BYTES: u64 = 128 * 1024;
 const GRAPH_HISTORY_COMPACT_BYTES: usize = 96 * 1024;
 
@@ -134,6 +133,7 @@ struct Config {
     output_cpu_stats: bool,
     output_cpu_raw_stats: bool,
     graph_history_enabled: bool,
+    graph_history_interval_s: u64,
     log_to_file: bool,
     debug: bool,
     log_debug_messages_to_syslog: bool,
@@ -228,6 +228,7 @@ impl Config {
             output_cpu_stats: false,
             output_cpu_raw_stats: false,
             graph_history_enabled: false,
+            graph_history_interval_s: 10,
             log_to_file: true,
             debug: true,
             log_debug_messages_to_syslog: false,
@@ -603,6 +604,11 @@ impl Config {
             "graph_history_enabled",
             &mut cfg.graph_history_enabled,
         )?;
+        set_u64(
+            &single,
+            "graph_history_interval_s",
+            &mut cfg.graph_history_interval_s,
+        )?;
         set_bool(&single, "log_to_file", &mut cfg.log_to_file)?;
         set_bool(&single, "debug", &mut cfg.debug)?;
         set_bool(
@@ -847,6 +853,9 @@ impl Config {
             return Err(
                 "bufferbloat_detection_thr cannot exceed bufferbloat_detection_window".to_string(),
             );
+        }
+        if !(1..=60).contains(&self.graph_history_interval_s) {
+            return Err("graph_history_interval_s must be between 1 and 60".to_string());
         }
         if self.reflector_health_check_interval_s <= 0.0 {
             return Err("reflector_health_check_interval_s must be greater than zero".to_string());
@@ -2056,10 +2065,10 @@ impl Controller {
         true
     }
 
-    fn maybe_record_graph_history(&mut self) {
+    fn maybe_record_graph_history(&mut self, dl_rate_kbps: f64, ul_rate_kbps: f64) {
         if !self.cfg.graph_history_enabled
             || self.last_graph_history_sample.elapsed()
-                < Duration::from_secs(GRAPH_HISTORY_INTERVAL_S)
+                < Duration::from_secs(self.cfg.graph_history_interval_s)
         {
             return;
         }
@@ -2074,11 +2083,12 @@ impl Controller {
                 None
             }
         });
-        let line = format!(
-            "{:.0},{},{}\n",
+        let line = graph_history_line(
             now,
-            json_f64_or_empty(rtt_ms, 3),
-            json_f64_or_empty(self.cpu_total_percent, 1)
+            rtt_ms,
+            self.cpu_total_percent,
+            dl_rate_kbps,
+            ul_rate_kbps,
         );
         let path = self.cfg.graph_history_path();
 
@@ -2698,7 +2708,7 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
         if controller.maybe_sample_cpu() {
             let _ = controller.refresh_status_from_last_sample();
         }
-        controller.maybe_record_graph_history();
+        controller.maybe_record_graph_history(dl_rate, ul_rate);
         let connection_active =
             dl_rate > cfg.connection_active_thr_kbps || ul_rate > cfg.connection_active_thr_kbps;
         let stall_load_active =
@@ -3780,6 +3790,23 @@ fn json_f64_or_empty(value: Option<f64>, precision: usize) -> String {
     }
 }
 
+fn graph_history_line(
+    timestamp: f64,
+    rtt_ms: Option<f64>,
+    cpu_percent: Option<f64>,
+    dl_rate_kbps: f64,
+    ul_rate_kbps: f64,
+) -> String {
+    format!(
+        "{:.0},{},{},{},{}\n",
+        timestamp,
+        json_f64_or_empty(rtt_ms, 3),
+        json_f64_or_empty(cpu_percent, 1),
+        json_f64_or_empty(Some(dl_rate_kbps), 1),
+        json_f64_or_empty(Some(ul_rate_kbps), 1)
+    )
+}
+
 fn compact_graph_history_data(data: &str, max_bytes: usize) -> String {
     let mut newest = Vec::new();
     let mut bytes = 0usize;
@@ -3997,7 +4024,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_graph_history_data, default_reflectors, irtt_target_arg,
+        compact_graph_history_data, default_reflectors, graph_history_line, irtt_target_arg,
         max_wire_packet_size_bits_from_mtu, monitor_tick_timeout, next_spare_reflector,
         packet_compensation_us, parse_fping_line, parse_fping_ts_line, parse_irtt_duration_us,
         parse_irtt_line, parse_reflector_candidates, parse_tc_linklayer_overhead,
@@ -4353,8 +4380,23 @@ mod tests {
 
     #[test]
     fn graph_history_is_opt_in_and_compaction_keeps_newest_samples() {
-        let cfg = Config::defaults("test".to_string());
+        let mut cfg = Config::defaults("test".to_string());
         assert!(!cfg.graph_history_enabled);
+        assert_eq!(cfg.graph_history_interval_s, 10);
+
+        cfg.graph_history_interval_s = 1;
+        assert!(cfg.validate().is_ok());
+        cfg.graph_history_interval_s = 60;
+        assert!(cfg.validate().is_ok());
+        cfg.graph_history_interval_s = 0;
+        assert!(cfg.validate().is_err());
+        cfg.graph_history_interval_s = 61;
+        assert!(cfg.validate().is_err());
+
+        assert_eq!(
+            graph_history_line(123.4, Some(1.23456), Some(2.34), 1000.04, 50.54),
+            "123,1.235,2.3,1000.0,50.5\n"
+        );
 
         let data = "1,1,1\n2,2,2\n3,3,3\n";
         assert_eq!(compact_graph_history_data(data, 12), "2,2,2\n3,3,3\n");

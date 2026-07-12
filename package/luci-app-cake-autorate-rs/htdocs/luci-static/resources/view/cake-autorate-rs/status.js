@@ -12,6 +12,31 @@ function readStatus(section) {
 	return L.resolveDefault(fs.read_direct(statusPath(section)).then(JSON.parse), null);
 }
 
+function readPackageVersions() {
+	return L.resolveDefault(
+		fs.exec('/usr/libexec/cake-autorate-rs/package-versions', []).then(function(result) {
+			var rows = JSON.parse(result && result.stdout || '[]');
+			var versions = {};
+
+			rows.forEach(function(row) {
+				if (row && row.name)
+					versions[row.name] = String(row.version || '-');
+			});
+			return versions;
+		}),
+		{}
+	);
+}
+
+function renderVersions(versions) {
+	return E('div', { 'class': 'alert-message notice cake-package-versions' }, [
+		E('strong', {}, _('Installed versions: ')),
+		_('daemon %s · LuCI %s').format(
+			versions['cake-autorate-rs'] || '-',
+			versions['luci-app-cake-autorate-rs'] || '-')
+	]);
+}
+
 function serviceAction(action) {
 	var mqttAction = function() {
 		if (action === 'start' || action === 'restart')
@@ -254,10 +279,13 @@ return L.view.extend({
 	load: function() {
 		return uci.load('cake-autorate').then(function() {
 			var sections = uci.sections('cake-autorate', 'cake_autorate');
-			return Promise.all(sections.map(function(section) {
-				return readStatus(section['.name']);
-			})).then(function(statuses) {
-				return [ sections, statuses ];
+			return Promise.all([
+				Promise.all(sections.map(function(section) {
+					return readStatus(section['.name']);
+				})),
+				readPackageVersions()
+			]).then(function(result) {
+				return [ sections, result[0], result[1] ];
 			});
 		});
 	},
@@ -265,6 +293,7 @@ return L.view.extend({
 	render: function(data) {
 		var sections = data[0];
 		var statuses = data[1];
+		var versions = data[2] || {};
 		var table = renderTable(sections, statuses);
 
 		poll.add(function() {
@@ -280,6 +309,7 @@ return L.view.extend({
 		}, 5);
 
 		return E('div', {}, [
+			renderVersions(versions),
 			E('div', { 'class': 'cbi-page-actions' }, [
 				E('button', {
 					'class': 'btn cbi-button cbi-button-action',
