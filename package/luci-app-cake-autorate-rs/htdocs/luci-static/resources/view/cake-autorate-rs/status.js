@@ -151,12 +151,16 @@ function formatQuality(status) {
 	var value = status.quality_class || 'LEARNING';
 	var confidence = Number(status.quality_confidence || 0);
 	var limited = !!status.quality_limited;
+	var baselineReady = status.transport_status === 'baseline_ready';
+	if (baselineReady)
+		value = _('BASELINE READY');
 	var title = [
 		_('Estimated from ICMP and HTTP/TCP latency; this is not an external benchmark grade.'),
 		_('DL: %s · UL: %s').format(status.quality_dl_class || 'LEARNING', status.quality_ul_class || 'LEARNING'),
 		_('Confidence: %d%%').format(confidence),
 		_('Transport delta: %s ms').format(status.transport_delta_ms == null ? '-' : Number(status.transport_delta_ms).toFixed(1)),
 		_('Effective delta: %s ms').format(status.effective_latency_delta_ms == null ? '-' : Number(status.effective_latency_delta_ms).toFixed(1)),
+		_('Transport error code: %s').format(status.transport_error_code || '-'),
 		_('Reason: %s').format(status.quality_reason || '-'),
 		_('Safe floors: DL %s · UL %s').format(formatRate(status.throughput_floor_dl_kbps), formatRate(status.throughput_floor_ul_kbps))
 	].join('\n');
@@ -164,7 +168,8 @@ function formatQuality(status) {
 	return E('div', { 'title': title }, [
 		E('strong', { 'style': limited ? 'color:#d66' : '' }, value),
 		E('small', { 'style': 'display:block;white-space:nowrap' },
-			limited ? _('Estimated · safety floor') : _('Estimated · %d%%').format(confidence))
+			limited ? _('Estimated · safety floor') :
+				(baselineReady ? _('Waiting for loaded traffic · %d%%').format(confidence) : _('Estimated · %d%%').format(confidence)))
 	]);
 }
 
@@ -182,6 +187,8 @@ function probeWarning(status, enabled) {
 
 	if (!enabled || !status || !status.state || hasProbeSample(status))
 		return null;
+	if (status.uplink_state === 'OFFLINE' || status.uplink_state === 'LEARNING')
+		return null;
 
 	started = Number(status.started_at || 0);
 	if (!isFinite(started) || started <= 0)
@@ -195,7 +202,7 @@ function probeWarning(status, enabled) {
 }
 
 function formatState(status, enabled) {
-	var value = status && status.state;
+	var value = status && (status.uplink_state || status.state);
 	var warning;
 
 	if (!value)
@@ -205,13 +212,44 @@ function formatState(status, enabled) {
 	warning = probeWarning(status, enabled);
 
 	if (!warning)
-		return value;
+		return E('div', { 'title': status.uplink_reason || '' }, [
+			E('strong', {}, value),
+			E('small', { 'style': 'display:block;white-space:nowrap' },
+				_('Controller: %s').format(String(status.state || '-').toUpperCase()))
+		]);
 
 	return E('div', { 'title': warning }, [
 		E('div', {}, value),
 		E('small', {
 			'style': 'display:block;color:#b00;white-space:nowrap'
 		}, [ '⚠ ', _('No probe replies') ])
+	]);
+}
+
+function formatRoute(status) {
+	if (!status || !status.route_mode)
+		return '-';
+
+	var member = status.mwan3_member || _('main');
+	var device = status.route_device || status.ul_if || '-';
+	var external = status.route_external_ip || '-';
+	var title = [
+		_('Mode: %s').format(status.route_mode),
+		_('Member: %s (%s)').format(member, status.mwan3_member_status || '-'),
+		_('Device: %s').format(device),
+		_('Source IP: %s').format(status.route_source_ip || '-'),
+		_('External IP: %s').format(external),
+		_('fwmark: %s').format(status.route_fwmark || '-'),
+		_('Routing table: %s').format(status.route_table || '-'),
+		_('Default-active: %s').format(status.route_active ? _('yes') : _('no')),
+		_('Uplink error code: %s').format(status.uplink_error_code || '-'),
+		_('Reason: %s').format(status.uplink_reason || '-')
+	].join('\n');
+
+	return E('div', { 'title': title }, [
+		E('strong', {}, '%s → %s'.format(member, device)),
+		E('small', { 'style': 'display:block;white-space:nowrap' },
+			_('External: %s').format(external))
 	]);
 }
 
@@ -265,10 +303,10 @@ function renderTable(sections, statuses) {
 		var disabledRow;
 
 		if (!enabled) {
-			disabledRow = [
-				section,
-				_('DISABLED'),
-				'-', '-', '-', '-', '-', '-', '-', '-', '-', '-'
+				disabledRow = [
+					section,
+					_('DISABLED'),
+					'-', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-'
 			];
 			rows.push(disabledRow);
 			continue;
@@ -277,6 +315,7 @@ function renderTable(sections, statuses) {
 		rows.push([
 			section,
 			formatState(st, enabled),
+			formatRoute(st),
 			st.updated_at ? new Date(st.updated_at * 1000).toLocaleString() : '-',
 			st.reflector || '-',
 			reflectorSummary(st),
@@ -293,7 +332,8 @@ function renderTable(sections, statuses) {
 	children = [
 		E('tr', { 'class': 'tr table-titles' }, [
 			E('th', { 'class': 'th' }, _('Instance')),
-			E('th', { 'class': 'th' }, _('State')),
+			E('th', { 'class': 'th' }, _('Uplink')),
+			E('th', { 'class': 'th' }, _('Route')),
 			E('th', { 'class': 'th' }, _('Updated')),
 			E('th', { 'class': 'th' }, _('Reflector')),
 			E('th', { 'class': 'th' }, _('Runtime reflectors')),
@@ -314,7 +354,7 @@ function renderTable(sections, statuses) {
 			})));
 	} else {
 		children.push(E('tr', { 'class': 'tr' }, [
-			E('td', { 'class': 'td', 'colspan': '12' }, _('No instances configured.'))
+			E('td', { 'class': 'td', 'colspan': '13' }, _('No instances configured.'))
 		]));
 	}
 

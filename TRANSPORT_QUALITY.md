@@ -103,11 +103,16 @@ committed and the service restarted only after shaped validation returns
 `complete`. Failure, timeout, a busy link, an unsuitable time window, or an
 exhausted daily budget leaves the running configuration unchanged.
 
-## Routing limitation
+## Per-uplink routing and baselines
 
-This implementation deliberately supports a single active/default WAN path.
-`curl` probes bind the selected device. The `uclient-fetch` fallback is allowed
-only when the selected device is the current default route, because that tool
-cannot bind an interface consistently across supported OpenWrt releases.
-Multi-WAN transport probing, per-policy baselines, and failover behavior are a
-separate test and implementation phase.
+Main-route instances require the selected device to be the active default WAN.
+Structured Multi-WAN instances instead execute the HTTP client directly as
+`mwan3 use <member> exec ...`, so `uclient-fetch` follows the same selected
+member as ICMP and speed-test traffic without requiring `curl`.
+
+Every transport sample carries the complete uplink route identity. Samples are
+discarded if member, L3 device, source address, fwmark, routing table, or
+external address no longer matches. Each instance owns independent endpoint
+baselines and loaded windows; they are cleared on failover, PPPoE address
+change, route change, and offline recovery. No sample or baseline may cross
+from one WAN to another. See [MULTIWAN.md](MULTIWAN.md) for lifecycle details.

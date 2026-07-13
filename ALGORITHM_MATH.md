@@ -45,6 +45,48 @@ For one direction, let:
 All rate-control state is separate for download and upload. The formulas below
 are therefore applied twice with direction-specific values.
 
+## Uplink partition and route lifecycle
+
+In Multi-WAN mode, controller state is partitioned by instance and route
+identity. For uplink `u`:
+
+```text
+I_u = (route_mode, member, L3_device, source_IP, fwmark, routing_table)
+S_u = (delay_baselines, transport_baselines, throughput_reference,
+       quality_state, DL_ceiling_state, UL_ceiling_state)
+```
+
+There is no transition that copies `S_u` to another uplink. When `I_u` changes,
+or the member goes offline and later recovers:
+
+```text
+S_u := initial_learning_state
+lifecycle_u := LEARNING
+```
+
+Other `S_v`, where `v != u`, are unchanged. After the configured route
+stability interval and sufficient fresh samples, lifecycle becomes `ACTIVE` if
+the member has a non-zero share in the default mwan3 policy, otherwise
+`STANDBY`. An unavailable or mismatched member is `OFFLINE`; its pingers are
+stopped and it cannot accumulate reflector offences or promote a ceiling.
+
+The quality confidence is intentionally staged. A learned idle transport
+baseline contributes half of the evidence, so the UI may report
+`BASELINE READY` at 50% while waiting for natural loaded samples. That is a
+stable waiting state, not a stalled learning loop. A grade is emitted only
+after the loaded evidence required by the quality classifier exists.
+
+All ICMP, transport, speed-test, and Auto-Tune observations are accepted only
+when their route identity equals the instance identity:
+
+```text
+accept(sample) iff sample.route_identity == I_u
+```
+
+For calibration, external IPv4 and speed-test server ID are also held constant
+between phases. See [MULTIWAN.md](MULTIWAN.md) for the operational state
+machine.
+
 ## Achieved rate and load
 
 The daemon samples Linux interface byte counters. Over an elapsed interval

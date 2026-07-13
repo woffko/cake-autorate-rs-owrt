@@ -28,6 +28,7 @@ export CAKE_AUTORATE_AUTOTUNE_TEST_LINK_KIND=cellular
 export CAKE_AUTORATE_AUTOTUNE_TEST_SHAPER=1
 export AUTOTUNE_MOCK_SHAPER_RESTORE_MARKER="$work/shaper-restored"
 export AUTOTUNE_MOCK_COUNTER="$work/counter"
+export AUTOTUNE_MOCK_PIN_LOG="$work/server-pins"
 
 "$autotune" fullauto lo start speedtest-go > "$work/start.json"
 
@@ -53,6 +54,9 @@ grep -q '"http_latency":{' "$work/status.json"
 grep -q '"validation":{"pass":true' "$work/status.json"
 grep -q '"comparison":"observed-low"' "$work/status.json"
 test -f "$work/shaper-restored"
+test "$(sed -n '1p' "$work/server-pins")" = automatic
+test "$(sed -n '2p' "$work/server-pins")" = 17372
+test "$(sed -n '3p' "$work/server-pins")" = 17372
 
 : > "$work/counter"
 export AUTOTUNE_MOCK_CORRECT=1
@@ -68,6 +72,20 @@ grep -q '"validation_attempts":\[{"pass":false' "$work/correct-status.json"
 grep -q '},{"pass":true' "$work/correct-status.json"
 grep -q '"validation":{"pass":true' "$work/correct-status.json"
 unset AUTOTUNE_MOCK_CORRECT
+
+: > "$work/counter"
+export AUTOTUNE_MOCK_ROUTE_MISMATCH=1
+"$autotune" routebad lo start speedtest-go > "$work/routebad-start.json"
+attempt=0
+while [ "$attempt" -lt 100 ]; do
+	"$autotune" routebad lo status speedtest-go > "$work/routebad-status.json"
+	grep -q '"state":"failed"' "$work/routebad-status.json" && break
+	attempt=$((attempt + 1))
+	sleep 0.05
+done
+grep -q '"state":"failed"' "$work/routebad-status.json"
+grep -q 'route identity changed' "$work/routebad-status.json"
+unset AUTOTUNE_MOCK_ROUTE_MISMATCH
 
 export AUTOTUNE_MOCK_BLOCK=1
 export AUTOTUNE_MOCK_RESTORE_MARKER="$work/restored"

@@ -5,6 +5,8 @@ target_if_override="$2"
 mode="$3"
 backend_override="$4"
 job_key_override="$5"
+route_mode_override="$6"
+mwan3_member_override="$7"
 
 if [ "$section" = "--status" ] || [ "$section" = "status" ]; then
 	section=""
@@ -186,6 +188,146 @@ safe_uci_name() {
 	return 0
 }
 
+safe_route_name() {
+	case "$1" in
+		''|*[!A-Za-z0-9_.:@-]*)
+			return 1
+			;;
+	esac
+
+	return 0
+}
+
+effective_route_mode() {
+	case "$route_mode_configured" in
+		main)
+			printf '%s' main
+			;;
+		mwan3)
+			printf '%s' mwan3
+			;;
+		auto|'')
+			if [ -n "$mwan3_member" ]; then
+				printf '%s' mwan3
+			else
+				printf '%s' main
+			fi
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+route_exec() {
+	if [ "$route_mode" = "mwan3" ]; then
+		mwan3 use "$mwan3_member" exec "$@"
+	else
+		"$@"
+	fi
+}
+
+route_rule_for_device() {
+	local device="$1" rules table mark
+
+	[ -n "$device" ] || return 0
+	rules="$(ip -4 rule show 2>/dev/null)"
+	table="$(printf '%s\n' "$rules" | awk -v device="$device" '
+		{ for (i = 1; i <= NF; i++) if ($i == "iif" && $(i + 1) == device)
+			for (j = 1; j <= NF; j++) if ($j == "lookup") { print $(j + 1); exit } }')"
+	[ -n "$table" ] || return 0
+	mark="$(printf '%s\n' "$rules" | awk -v table="$table" '
+		{ found = 0; for (i = 1; i <= NF; i++) if ($i == "lookup" && $(i + 1) == table) found = 1;
+		  if (found) for (i = 1; i <= NF; i++) if ($i == "fwmark") { split($(i + 1), value, "/"); print value[1]; exit } }')"
+	printf '%s|%s\n' "$mark" "$table"
+}
+
+inspect_selected_route() {
+	local status network_status environment default_if member_enabled member_running member_up network_up network_device env_device route_rule
+
+	route_device=""
+	route_source_ip=""
+	route_fwmark=""
+	route_table=""
+	route_member_status="unknown"
+	route_active="false"
+	route_error=""
+
+	if [ "$route_mode" = "mwan3" ]; then
+		command -v mwan3 >/dev/null 2>&1 || { route_error="mwan3 is not installed"; return 1; }
+		command -v nft >/dev/null 2>&1 && nft list table inet mwan3 >/dev/null 2>&1 || { route_error="nftables table inet mwan3 is unavailable"; return 1; }
+		[ -n "$jsonfilter_bin" ] || { route_error="jsonfilter is required for mwan3 route validation"; return 1; }
+		safe_route_name "$mwan3_member" || { route_error="invalid mwan3 member"; return 1; }
+
+		status="$(ubus call mwan3 status "{\"interface\":\"$mwan3_member\"}" 2>/dev/null)" || {
+			route_error="mwan3 member $mwan3_member was not found"
+			return 1
+		}
+		route_member_status="$(printf '%s\n' "$status" | "$jsonfilter_bin" -e '@.interfaces.*.status' 2>/dev/null | sed -n '1p')"
+		member_enabled="$(printf '%s\n' "$status" | "$jsonfilter_bin" -e '@.interfaces.*.enabled' 2>/dev/null | sed -n '1p')"
+		member_running="$(printf '%s\n' "$status" | "$jsonfilter_bin" -e '@.interfaces.*.running' 2>/dev/null | sed -n '1p')"
+		member_up="$(printf '%s\n' "$status" | "$jsonfilter_bin" -e '@.interfaces.*.up' 2>/dev/null | sed -n '1p')"
+
+		network_status="$(ubus call "network.interface.$mwan3_member" status 2>/dev/null)" || {
+			route_error="network interface $mwan3_member was not found"
+			return 1
+		}
+		network_up="$(printf '%s\n' "$network_status" | "$jsonfilter_bin" -e '@.up' 2>/dev/null)"
+		network_device="$(printf '%s\n' "$network_status" | "$jsonfilter_bin" -e '@.l3_device' 2>/dev/null)"
+		[ -n "$network_device" ] || network_device="$(printf '%s\n' "$network_status" | "$jsonfilter_bin" -e '@.device' 2>/dev/null)"
+
+		environment="$(mwan3 use "$mwan3_member" exec env 2>/dev/null)" || {
+			route_error="mwan3 could not resolve member $mwan3_member"
+			return 1
+		}
+		env_device="$(printf '%s\n' "$environment" | sed -n 's/^DEVICE=//p' | sed -n '1p')"
+		route_device="${env_device:-$network_device}"
+		route_source_ip="$(printf '%s\n' "$environment" | sed -n 's/^SRCIP=//p' | sed -n '1p')"
+		route_fwmark="$(printf '%s\n' "$environment" | sed -n 's/^FWMARK=//p' | sed -n '1p')"
+		route_rule="$(route_rule_for_device "$route_device")"
+		if [ -n "$route_rule" ]; then
+			route_fwmark="${route_rule%%|*}"
+			route_table="${route_rule#*|}"
+		fi
+
+		if [ "$route_device" != "$target_if" ]; then
+			route_error="route mismatch: mwan3 member $mwan3_member uses $route_device, expected $target_if"
+			return 1
+		fi
+		if [ "$member_enabled" != "true" ] || [ "$member_running" != "true" ] ||
+		   [ "$member_up" != "true" ] || [ "$network_up" != "true" ] ||
+		   [ "$route_member_status" != "online" ]; then
+			route_error="mwan3 member $mwan3_member is ${route_member_status:-offline}"
+			return 1
+		fi
+	else
+		route_device="$route_if"
+		route_source_ip="$target_source_ip"
+		route_table="main"
+		route_member_status="online"
+		if [ "$route_device" != "$target_if" ]; then
+			route_error="main route uses ${route_device:-no device}, expected $target_if"
+			return 1
+		fi
+	fi
+
+	default_if="$(route_device_for "$route_probe" "")"
+	[ "$default_if" = "$route_device" ] && route_active="true"
+	route_identity="$route_mode|$mwan3_member|$route_device|$route_source_ip|$route_fwmark|$route_table"
+	return 0
+}
+
+fetch_external_ip() {
+	local output
+
+	if [ -n "$fallback_fetch" ]; then
+		output="$(route_exec "$fallback_fetch" -q -4 -O - --timeout="$timeout_s" "$external_ip_url" 2>/dev/null)" || output=""
+	elif [ -n "$curl_fetch" ]; then
+		output="$(route_exec "$curl_fetch" -4 -fsS --max-time "$timeout_s" "$external_ip_url" 2>/dev/null)" || output=""
+	fi
+	printf '%s\n' "$output" | tr -cd '0-9A-Fa-f:.\n' | sed -n '/./{p;q;}'
+}
+
 speedtest_unshaped_enabled() {
 	local value
 
@@ -225,7 +367,13 @@ autorate_instance_running() {
 	pgrep -f "^/usr/sbin/cake-autorated --instance $section\$" >/dev/null 2>&1
 }
 
+process_is_stopped() {
+	[ -n "$1" ] || return 1
+	grep -q '^State:[[:space:]]*[Tt]' "/proc/$1/status" 2>/dev/null
+}
+
 prepare_speedtest_calibration() {
+	local autorate_pid
 	[ -n "$section" ] || return 0
 	[ -n "$target_if" ] || return 0
 	speedtest_unshaped_enabled || return 0
@@ -233,7 +381,11 @@ prepare_speedtest_calibration() {
 	calibration_shaper_bypassed="true"
 
 	if autorate_instance_running; then
-		if ubus call service delete "{\"name\":\"cake-autorate\",\"instance\":\"$section\"}" >/dev/null 2>&1; then
+		autorate_pid="$(pgrep -f "^/usr/sbin/cake-autorated --instance $section\$" | sed -n '1p')"
+		if is_positive_uint "$autorate_pid" && process_is_stopped "$autorate_pid"; then
+			append_warning "Autorate instance $section was already paused by its owning maintenance job."
+		elif is_positive_uint "$autorate_pid" && kill -STOP "$autorate_pid" 2>/dev/null; then
+			calibration_autorate_pid="$autorate_pid"
 			calibration_autorate_was_running=1
 			calibration_autorate_paused="true"
 			append_warning "Paused autorate instance $section during unshaped speed test."
@@ -250,16 +402,17 @@ prepare_speedtest_calibration() {
 }
 
 restore_speedtest_calibration() {
-	if [ "$calibration_autorate_was_running" = "1" ]; then
-		/etc/init.d/cake-autorate start >/dev/null 2>&1 || true
-		calibration_autorate_was_running=0
-		calibration_sqm_was_running=0
-		return
-	fi
-
 	if [ "$calibration_sqm_was_running" = "1" ]; then
 		/usr/lib/sqm/run.sh start "$target_if" >/dev/null 2>&1 || true
 		calibration_sqm_was_running=0
+	fi
+
+	if [ "$calibration_autorate_was_running" = "1" ]; then
+		if is_positive_uint "$calibration_autorate_pid"; then
+			kill -CONT "$calibration_autorate_pid" >/dev/null 2>&1 || true
+		fi
+		calibration_autorate_was_running=0
+		calibration_autorate_pid=""
 	fi
 }
 
@@ -545,24 +698,24 @@ reset_result() {
 fetch_download() {
 	if [ "$fetch_kind" = "curl" ]; then
 		if [ -n "$bind_interface" ]; then
-			"$fetch" ${force_ipv4_arg:+-4} -f -L -sS --max-time "$timeout_s" --interface "$bind_interface" -o "$tmp_download" "$download_url"
+			route_exec "$fetch" ${force_ipv4_arg:+-4} -f -L -sS --max-time "$timeout_s" --interface "$bind_interface" -o "$tmp_download" "$download_url"
 		else
-			"$fetch" ${force_ipv4_arg:+-4} -f -L -sS --max-time "$timeout_s" -o "$tmp_download" "$download_url"
+			route_exec "$fetch" ${force_ipv4_arg:+-4} -f -L -sS --max-time "$timeout_s" -o "$tmp_download" "$download_url"
 		fi
 	else
-		"$fetch" -q ${force_ipv4_arg:+-4} -O "$tmp_download" --timeout="$timeout_s" "$download_url"
+		route_exec "$fetch" -q ${force_ipv4_arg:+-4} -O "$tmp_download" --timeout="$timeout_s" "$download_url"
 	fi
 }
 
 fetch_upload() {
 	if [ "$fetch_kind" = "curl" ]; then
 		if [ -n "$bind_interface" ]; then
-			"$fetch" ${force_ipv4_arg:+-4} -f -L -sS --max-time "$timeout_s" --interface "$bind_interface" --request POST --data-binary "@$tmp_upload" -o "$tmp_response" "$upload_url"
+			route_exec "$fetch" ${force_ipv4_arg:+-4} -f -L -sS --max-time "$timeout_s" --interface "$bind_interface" --request POST --data-binary "@$tmp_upload" -o "$tmp_response" "$upload_url"
 		else
-			"$fetch" ${force_ipv4_arg:+-4} -f -L -sS --max-time "$timeout_s" --request POST --data-binary "@$tmp_upload" -o "$tmp_response" "$upload_url"
+			route_exec "$fetch" ${force_ipv4_arg:+-4} -f -L -sS --max-time "$timeout_s" --request POST --data-binary "@$tmp_upload" -o "$tmp_response" "$upload_url"
 		fi
 	else
-		"$fetch" -q ${force_ipv4_arg:+-4} -O "$tmp_response" --timeout="$timeout_s" --post-file="$tmp_upload" "$upload_url"
+		route_exec "$fetch" -q ${force_ipv4_arg:+-4} -O "$tmp_response" --timeout="$timeout_s" --post-file="$tmp_upload" "$upload_url"
 	fi
 }
 
@@ -586,9 +739,13 @@ run_builtin_http() {
 		fi
 
 		if bool_enabled "$bind_interface_enabled" && [ -n "$target_if" ]; then
-			bind_mode="route-check"
+			if [ "$route_mode" = mwan3 ]; then
+				bind_mode="mwan3-member"
+			else
+				bind_mode="route-check"
+			fi
 
-			if [ -n "$route_if" ] && [ "$route_if" != "$target_if" ]; then
+			if [ "$route_mode" != mwan3 ] && [ -n "$route_if" ] && [ "$route_if" != "$target_if" ]; then
 				append_warning "Speed test could not bind to $target_if because curl is not installed; route probe uses $route_if."
 			fi
 		fi
@@ -676,7 +833,7 @@ run_librespeed_cli() {
 
 	rm -f "$tmp_response"
 	start="$(now_s)"
-	if ! "$librespeed_bin" --json --timeout "$timeout_s" --duration "$duration_s" $ipv4_arg $interface_arg $upload_arg > "$tmp_response" 2>/dev/null; then
+	if ! route_exec "$librespeed_bin" --json --timeout "$timeout_s" --duration "$duration_s" $ipv4_arg $interface_arg $upload_arg > "$tmp_response" 2>/dev/null; then
 		return 1
 	fi
 	stop="$(now_s)"
@@ -770,11 +927,11 @@ speedtest_go_candidate_ids() {
 	set -- "$speedtest_go_bin" --list --ping-mode http
 
 	if bool_enabled "$bind_interface_enabled" && [ -n "$target_if" ]; then
-		source_ip="$(source_ip_for_interface "$target_if")"
+		source_ip="${route_source_ip:-$(source_ip_for_interface "$target_if")}"
 		[ -n "$source_ip" ] && set -- "$@" --source "$source_ip" --dns-bind-source
 	fi
 
-	if ! "$@" > "$list_file" 2>/dev/null; then
+	if ! route_exec "$@" > "$list_file" 2>/dev/null; then
 		rm -f "$list_file"
 		return 1
 	fi
@@ -801,7 +958,7 @@ run_speedtest_go_once() {
 	fi
 
 	if bool_enabled "$bind_interface_enabled" && [ -n "$target_if" ]; then
-		source_ip="$(source_ip_for_interface "$target_if")"
+		source_ip="${route_source_ip:-$(source_ip_for_interface "$target_if")}"
 		if [ -n "$source_ip" ]; then
 			set -- "$@" --source "$source_ip" --dns-bind-source
 			bind_mode="source-ip"
@@ -815,7 +972,7 @@ run_speedtest_go_once() {
 
 	rm -f "$tmp_response"
 	start="$(now_s)"
-	if ! "$@" > "$tmp_response" 2>/dev/null; then
+	if ! route_exec "$@" > "$tmp_response" 2>/dev/null; then
 		return 1
 	fi
 	stop="$(now_s)"
@@ -929,7 +1086,7 @@ run_iperf3_one() {
 	fi
 
 	if bool_enabled "$bind_interface_enabled" && [ -n "$target_if" ]; then
-		source_ip="$(source_ip_for_interface "$target_if")"
+		source_ip="${route_source_ip:-$(source_ip_for_interface "$target_if")}"
 		if [ -n "$source_ip" ]; then
 			set -- "$@" -B "$source_ip"
 			bind_mode="source-ip"
@@ -941,7 +1098,7 @@ run_iperf3_one() {
 		fi
 	fi
 
-	"$@" > "$output" 2>/dev/null
+	route_exec "$@" > "$output" 2>/dev/null
 }
 
 run_iperf3() {
@@ -984,7 +1141,7 @@ run_iperf3() {
 }
 
 emit_result() {
-	printf '{"download_kbps":%s,"upload_kbps":%s,"download_bytes":%s,"upload_bytes":%s,"download_elapsed_s":%s,"upload_elapsed_s":%s,"source":"%s","backend":"%s","backend_title":"%s","server_id":"%s","server_name":"%s","server_sponsor":"%s","bind_mode":"%s","target_interface":"%s","route_interface":"%s","shaper_bypassed":%s,"autorate_paused":%s,"sqm_paused":%s,"warning":"%s"}\n' \
+	printf '{"download_kbps":%s,"upload_kbps":%s,"download_bytes":%s,"upload_bytes":%s,"download_elapsed_s":%s,"upload_elapsed_s":%s,"source":"%s","backend":"%s","backend_title":"%s","server_id":"%s","server_name":"%s","server_sponsor":"%s","bind_mode":"%s","target_interface":"%s","route_interface":"%s","route_mode":"%s","mwan3_member":"%s","route_source_ip":"%s","route_fwmark":"%s","route_table":"%s","external_ip_before":"%s","external_ip_after":"%s","shaper_bypassed":%s,"autorate_paused":%s,"sqm_paused":%s,"warning":"%s"}\n' \
 		"$download_kbps" \
 		"$upload_kbps" \
 		"$download_size" \
@@ -999,7 +1156,14 @@ emit_result() {
 		"$(json_escape "$test_server_sponsor")" \
 		"$(json_escape "$bind_mode")" \
 		"$(json_escape "$target_if")" \
-		"$(json_escape "$route_if")" \
+		"$(json_escape "$route_device")" \
+		"$(json_escape "$route_mode")" \
+		"$(json_escape "$mwan3_member")" \
+		"$(json_escape "$route_source_ip")" \
+		"$(json_escape "$route_fwmark")" \
+		"$(json_escape "$route_table")" \
+		"$(json_escape "$external_ip_before")" \
+		"$(json_escape "$external_ip_after")" \
 		"$calibration_shaper_bypassed" \
 		"$calibration_autorate_paused" \
 		"$calibration_sqm_paused" \
@@ -1072,6 +1236,50 @@ run_preferred_backend() {
 
 speedtest_job_dir="/tmp/cake-autorate-speedtest"
 
+acquire_interface_lock() {
+	local owner lock_name requested_owner
+
+	safe_route_name "$target_if" || json_error "Invalid target interface for speed test lock."
+	lock_name="$(printf '%s' "$target_if" | tr ':@.' '___')"
+	interface_lock_dir="$speedtest_job_dir/interface-$lock_name.lock"
+	mkdir -p "$speedtest_job_dir" || json_error "Unable to create speed test lock directory."
+	chmod 700 "$speedtest_job_dir" 2>/dev/null || true
+
+	if mkdir "$interface_lock_dir" 2>/dev/null; then
+		printf '%s\n' "$$" > "$interface_lock_dir/pid"
+		return 0
+	fi
+
+	owner="$(sed -n '1p' "$interface_lock_dir/pid" 2>/dev/null)"
+	requested_owner="${CAKE_AUTORATE_INTERFACE_LOCK_OWNER:-}"
+	if is_positive_uint "$requested_owner" && [ "$owner" = "$requested_owner" ] && kill -0 "$owner" 2>/dev/null; then
+		# Full Auto-Tune owns this per-interface lock for its entire workflow.
+		# Child speed tests borrow, but never release, the parent lock.
+		interface_lock_shared=1
+		return 0
+	fi
+	if is_positive_uint "$owner" && kill -0 "$owner" 2>/dev/null; then
+		json_error "Another heavy speed test is already using $target_if."
+	fi
+	rm -f "$interface_lock_dir/pid" 2>/dev/null
+	rmdir "$interface_lock_dir" 2>/dev/null || json_error "Speed test lock for $target_if is busy."
+	mkdir "$interface_lock_dir" 2>/dev/null || json_error "Unable to lock $target_if for speed testing."
+	printf '%s\n' "$$" > "$interface_lock_dir/pid"
+}
+
+release_interface_lock() {
+	local owner
+
+	[ -n "$interface_lock_dir" ] || return 0
+	[ "${interface_lock_shared:-0}" = 1 ] && return 0
+	owner="$(sed -n '1p' "$interface_lock_dir/pid" 2>/dev/null)"
+	[ "$owner" = "$$" ] || return 0
+	rm -f "$interface_lock_dir/pid" 2>/dev/null
+	rmdir "$interface_lock_dir" 2>/dev/null || true
+	interface_lock_dir=""
+	interface_lock_shared=0
+}
+
 speedtest_job_paths() {
 	job_key="$1"
 	job_pid_file="$speedtest_job_dir/$job_key.pid"
@@ -1102,7 +1310,7 @@ speedtest_job_start() {
 	fi
 
 	rm -f "$job_pid_file" "$job_result_file" "$job_error_file" "$job_work_file" "$job_stderr_file" "$job_log_file"
-	"$setsid_bin" "$0" "$section" "$target_if_override" job-run "$preferred_backend" "$job_key" \
+	"$setsid_bin" "$0" "$section" "$target_if_override" job-run "$preferred_backend" "$job_key" "$route_mode_override" "$mwan3_member_override" \
 		</dev/null >"$job_log_file" 2>&1 &
 	job_pid="$!"
 	printf '%s\n' "$job_pid" > "$job_pid_file"
@@ -1115,7 +1323,7 @@ speedtest_job_run() {
 	mkdir -p "$speedtest_job_dir" || exit 1
 	speedtest_job_paths "$job_key"
 
-	"$0" "$section" "$target_if_override" run "$preferred_backend" >"$job_work_file" 2>"$job_stderr_file"
+	"$0" "$section" "$target_if_override" run "$preferred_backend" "" "$route_mode_override" "$mwan3_member_override" >"$job_work_file" 2>"$job_stderr_file"
 	job_rc="$?"
 
 	if [ "$job_rc" -eq 0 ] && [ -s "$job_work_file" ]; then
@@ -1161,6 +1369,10 @@ speedtest_job_status() {
 	printf '{"error":"Speed test job is not running."}\n'
 }
 
+if [ "${CAKE_AUTORATE_SPEEDTEST_SOURCE_ONLY:-0}" = "1" ]; then
+	return 0 2>/dev/null || exit 0
+fi
+
 warning=""
 refresh_backend_bins
 
@@ -1176,8 +1388,11 @@ force_ipv4_enabled="$(uci_get speedtest_force_ipv4)"
 route_probe="$(uci_get speedtest_route_probe)"
 iperf3_server="$(uci_get speedtest_iperf3_server)"
 iperf3_port="$(uci_get speedtest_iperf3_port)"
-speedtest_go_server_id="$(uci_get speedtest_go_server_id)"
+speedtest_go_server_id="${CAKE_AUTORATE_SPEEDTEST_GO_SERVER_ID:-$(uci_get speedtest_go_server_id)}"
 preferred_backend="$(uci_get speedtest_backend)"
+route_mode_configured="$(uci_get route_mode)"
+mwan3_member="$(uci_get mwan3_member)"
+external_ip_url="$(uci_get speedtest_external_ip_url)"
 
 [ -n "$upload_retry_bytes" ] || upload_retry_bytes="$upload_retry_bytes_default"
 [ -n "$download_url" ] || download_url="https://speed.cloudflare.com/__down?bytes=$download_bytes"
@@ -1185,6 +1400,10 @@ preferred_backend="$(uci_get speedtest_backend)"
 [ -n "$bind_interface_enabled" ] || bind_interface_enabled="1"
 [ -n "$force_ipv4_enabled" ] || force_ipv4_enabled="1"
 [ -n "$route_probe" ] || route_probe="$route_probe_default"
+[ -n "$route_mode_configured" ] || route_mode_configured="auto"
+[ -n "$route_mode_override" ] && route_mode_configured="$route_mode_override"
+[ -n "$mwan3_member_override" ] && mwan3_member="$mwan3_member_override"
+[ -n "$external_ip_url" ] || external_ip_url="https://api.ipify.org"
 [ -n "$backend_override" ] && preferred_backend="$backend_override"
 valid_backend "$preferred_backend" || preferred_backend="auto"
 
@@ -1205,10 +1424,15 @@ bind_mode="none"
 fetch=""
 fetch_kind=""
 calibration_autorate_was_running=0
+calibration_autorate_pid=""
 calibration_sqm_was_running=0
 calibration_shaper_bypassed="false"
 calibration_autorate_paused="false"
 calibration_sqm_paused="false"
+interface_lock_dir=""
+interface_lock_shared=0
+external_ip_before=""
+external_ip_after=""
 
 if [ "$mode" = "status" ]; then
 	backend_status_json
@@ -1235,20 +1459,45 @@ if [ "$mode" = "job-run" ]; then
 	exit $?
 fi
 
+route_mode="$(effective_route_mode)" || json_error "Invalid route_mode: $route_mode_configured"
+if [ "$route_mode" = "mwan3" ] && [ -z "$mwan3_member" ]; then
+	json_error "route_mode=mwan3 requires mwan3_member."
+fi
+
 tmp_download="/tmp/cake-autorate-speedtest-download.$$"
 tmp_upload="/tmp/cake-autorate-speedtest-upload.$$"
 tmp_response="/tmp/cake-autorate-speedtest-response.$$"
 
 cleanup() {
 	restore_speedtest_calibration
+	release_interface_lock
 	rm -f "$tmp_download" "$tmp_upload" "$tmp_response"
 }
 trap cleanup EXIT INT TERM
 
+acquire_interface_lock
+if ! inspect_selected_route; then
+	json_error "${route_error:-selected route is unavailable}"
+fi
+route_identity_before="$route_identity"
+external_ip_before="$(fetch_external_ip)"
+if [ -z "$external_ip_before" ]; then
+	json_error "Unable to determine the external IPv4 address through the selected route."
+fi
 prepare_speedtest_calibration
 
 if run_preferred_backend; then
 	restore_speedtest_calibration
+	if ! inspect_selected_route; then
+		json_error "Selected route failed after speed test: ${route_error:-unavailable}."
+	fi
+	if [ "$route_identity" != "$route_identity_before" ]; then
+		json_error "Selected route identity changed during speed test."
+	fi
+	external_ip_after="$(fetch_external_ip)"
+	if [ -z "$external_ip_after" ] || [ "$external_ip_after" != "$external_ip_before" ]; then
+		json_error "External IP changed or could not be verified after speed test."
+	fi
 	emit_result
 	exit 0
 fi

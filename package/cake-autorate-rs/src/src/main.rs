@@ -12,12 +12,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod adaptive_ceiling;
 mod autotune;
+mod routing;
 mod transport_quality;
 
 use adaptive_ceiling::{
     AdaptiveCeilingChange, AdaptiveCeilingDirection, AdaptiveCeilingObservation,
     AdaptiveCeilingPolicy, AdaptiveCeilingUpdate,
 };
+use routing::{RouteMode, RouteSnapshot, RouteSpec, UplinkLifecycle, UplinkState};
 use transport_quality::{
     classify_quality, effective_latency_delta_ms, throughput_floor, transport_allows_growth,
     QualityClass, QualitySearchDirection, QualitySearchPolicy, ThroughputGuardInput,
@@ -76,6 +78,10 @@ struct Config {
     enabled: bool,
     dl_if: String,
     ul_if: String,
+    route_mode: String,
+    mwan3_member: String,
+    route_stability_s: f64,
+    route_check_interval_s: f64,
     rx_bytes_path: String,
     tx_bytes_path: String,
     adjust_dl_shaper_rate: bool,
@@ -191,6 +197,10 @@ impl Config {
             enabled: false,
             dl_if: "ifb-wan".to_string(),
             ul_if: "wan".to_string(),
+            route_mode: "auto".to_string(),
+            mwan3_member: String::new(),
+            route_stability_s: 5.0,
+            route_check_interval_s: 2.0,
             rx_bytes_path: String::new(),
             tx_bytes_path: String::new(),
             adjust_dl_shaper_rate: true,
@@ -345,6 +355,14 @@ impl Config {
         set_bool(&single, "enabled", &mut cfg.enabled)?;
         set_string(&single, "dl_if", &mut cfg.dl_if);
         set_string(&single, "ul_if", &mut cfg.ul_if);
+        set_string(&single, "route_mode", &mut cfg.route_mode);
+        set_string(&single, "mwan3_member", &mut cfg.mwan3_member);
+        set_f64(&single, "route_stability_s", &mut cfg.route_stability_s)?;
+        set_f64(
+            &single,
+            "route_check_interval_s",
+            &mut cfg.route_check_interval_s,
+        )?;
         if single
             .get("auto_interface_preset")
             .map(|value| parse_bool(value).map_err(|e| format!("auto_interface_preset: {e}")))
@@ -913,6 +931,13 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), String> {
+        self.route_spec().validate()?;
+        if !(1.0..=300.0).contains(&self.route_stability_s) {
+            return Err("route_stability_s must be between 1 and 300".to_string());
+        }
+        if !(1.0..=60.0).contains(&self.route_check_interval_s) {
+            return Err("route_check_interval_s must be between 1 and 60".to_string());
+        }
         if self.pinger_method != "fping"
             && self.pinger_method != "fping-ts"
             && self.pinger_method != "tsping"
@@ -1175,6 +1200,10 @@ impl Config {
             return Err("dl_if and ul_if must be different".to_string());
         }
         Ok(())
+    }
+
+    fn route_spec(&self) -> RouteSpec {
+        RouteSpec::new(&self.route_mode, &self.mwan3_member, &self.ul_if)
     }
 
     fn run_dir(&self) -> PathBuf {
@@ -1622,6 +1651,7 @@ struct TransportProbeResult {
     ul_loaded: bool,
     latency_ms: Option<f64>,
     error: Option<String>,
+    route_identity: Option<String>,
 }
 
 struct TransportProbeRuntime {
@@ -1632,20 +1662,71 @@ struct TransportProbeRuntime {
     last_started: Instant,
 }
 
+#[derive(Clone, Debug)]
+struct ExternalIpResult {
+    value: Option<String>,
+    error: Option<String>,
+    route_identity: Option<String>,
+}
+
+struct ExternalIpRuntime {
+    requests: SyncSender<()>,
+    results: Receiver<ExternalIpResult>,
+    in_flight: bool,
+    last_started: Instant,
+}
+
+fn transport_result_matches_route(
+    result_identity: Option<&str>,
+    current_identity: Option<&str>,
+) -> bool {
+    result_identity.is_some() && result_identity == current_identity
+}
+
+fn uplink_error_code(state: UplinkState, reason: &str) -> Option<&'static str> {
+    if state != UplinkState::Offline {
+        return None;
+    }
+    let reason = reason.to_ascii_lowercase();
+    if reason.contains("route mismatch") || reason.contains("default route uses") {
+        Some("route_mismatch")
+    } else if reason.contains("disabled")
+        || reason.contains("offline")
+        || reason.contains("interface is down")
+    {
+        Some("member_offline")
+    } else if reason.contains("unavailable") || reason.contains("not found") {
+        Some("interface_unavailable")
+    } else {
+        Some("route_unavailable")
+    }
+}
+
+fn transport_error_code(error: Option<&str>) -> Option<&'static str> {
+    let error = error?.to_ascii_lowercase();
+    if error.contains("timeout") || error.contains("timed out") {
+        Some("transport_timeout")
+    } else if error.contains("route changed") || error.contains("different uplink") {
+        Some("route_mismatch")
+    } else {
+        Some("transport_error")
+    }
+}
+
 impl TransportProbeRuntime {
     fn spawn(cfg: &Config) -> Self {
         let (request_tx, request_rx) = mpsc::sync_channel::<TransportProbeRequest>(1);
         let (result_tx, result_rx) = mpsc::channel::<TransportProbeResult>();
-        let interface = cfg.ul_if.clone();
+        let route_spec = cfg.route_spec();
         let timeout_s = cfg.transport_probe_timeout_s;
         thread::spawn(move || {
             while let Ok(request) = request_rx.recv() {
                 let started = Instant::now();
-                let result = run_transport_probe(&interface, timeout_s, &request.endpoint);
+                let result = run_transport_probe(&route_spec, timeout_s, &request.endpoint);
                 let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-                let (latency_ms, error) = match result {
-                    Ok(()) => (Some(elapsed_ms), None),
-                    Err(error) => (None, Some(error)),
+                let (latency_ms, error, route_identity) = match result {
+                    Ok(snapshot) => (Some(elapsed_ms), None, Some(snapshot.stable_key())),
+                    Err(error) => (None, Some(error), None),
                 };
                 if result_tx
                     .send(TransportProbeResult {
@@ -1655,6 +1736,7 @@ impl TransportProbeRuntime {
                         ul_loaded: request.ul_loaded,
                         latency_ms,
                         error,
+                        route_identity,
                     })
                     .is_err()
                 {
@@ -1723,41 +1805,147 @@ impl TransportProbeRuntime {
     }
 }
 
-fn run_transport_probe(interface: &str, timeout_s: u64, endpoint: &str) -> Result<(), String> {
-    let curl = Command::new("curl")
-        .arg("-4")
-        .arg("-fsS")
-        .arg("--max-time")
-        .arg(timeout_s.to_string())
-        .arg("--interface")
-        .arg(interface)
-        .arg("-o")
-        .arg("/dev/null")
-        .arg(endpoint)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    match curl {
-        Ok(status) if status.success() => return Ok(()),
-        Ok(status) => return Err(format!("curl exited with {status}")),
-        Err(error) if error.kind() != io::ErrorKind::NotFound => {
-            return Err(format!("failed to execute curl: {error}"));
+impl ExternalIpRuntime {
+    fn spawn(route_spec: RouteSpec) -> Self {
+        let (request_tx, request_rx) = mpsc::sync_channel::<()>(1);
+        let (result_tx, result_rx) = mpsc::channel::<ExternalIpResult>();
+        thread::spawn(move || {
+            while request_rx.recv().is_ok() {
+                let result = run_external_ip_probe(&route_spec, 5);
+                let (value, error, route_identity) = match result {
+                    Ok((value, snapshot)) => (Some(value), None, Some(snapshot.stable_key())),
+                    Err(error) => (None, Some(error), None),
+                };
+                if result_tx
+                    .send(ExternalIpResult {
+                        value,
+                        error,
+                        route_identity,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        Self {
+            requests: request_tx,
+            results: result_rx,
+            in_flight: false,
+            last_started: Instant::now()
+                .checked_sub(Duration::from_secs(60))
+                .unwrap_or_else(Instant::now),
         }
-        Err(_) => {}
     }
 
-    // uclient-fetch cannot bind an interface on every supported OpenWrt release.
-    // Use it only when the selected interface is the default route, so a future
-    // Multi-WAN implementation cannot silently measure another uplink.
-    let route = Command::new("ip")
-        .args(["-4", "route", "get", "1.1.1.1"])
-        .output()
-        .map_err(|error| format!("failed to inspect transport route: {error}"))?;
-    let route_text = String::from_utf8_lossy(&route.stdout);
-    if !route.status.success() || !route_text.split_whitespace().any(|word| word == interface) {
-        return Err(format!("transport route does not use {interface}"));
+    fn drain(&mut self, controller: &mut Controller) {
+        while let Ok(result) = self.results.try_recv() {
+            self.in_flight = false;
+            match (result.value, result.error) {
+                (Some(value), _) => {
+                    if transport_result_matches_route(
+                        result.route_identity.as_deref(),
+                        controller.route_identity.as_deref(),
+                    ) {
+                        controller.set_route_external_ip(value);
+                    } else {
+                        controller.log(
+                            "DEBUG",
+                            "discarded external IP result from a stale or different uplink route",
+                        );
+                    }
+                }
+                (_, Some(error)) => controller.log(
+                    "DEBUG",
+                    &format!("failed to refresh routed external IP: {error}"),
+                ),
+                _ => {}
+            }
+        }
     }
-    let status = Command::new("uclient-fetch")
+
+    fn maybe_start(&mut self, allowed: bool) {
+        if !allowed || self.in_flight || self.last_started.elapsed() < Duration::from_secs(60) {
+            return;
+        }
+        if self.requests.try_send(()).is_ok() {
+            self.in_flight = true;
+            self.last_started = Instant::now();
+        }
+    }
+}
+
+fn run_external_ip_probe(
+    route_spec: &RouteSpec,
+    timeout_s: u64,
+) -> Result<(String, RouteSnapshot), String> {
+    let before = routing::inspect_route(route_spec)?;
+    if !before.online {
+        return Err(if before.reason.is_empty() {
+            "uplink route is offline".to_string()
+        } else {
+            before.reason
+        });
+    }
+    let value = routing::external_ipv4(route_spec, timeout_s)?;
+    let after = routing::inspect_route(route_spec)?;
+    if !after.online || before.stable_key() != after.stable_key() {
+        return Err("route changed during external IP query".to_string());
+    }
+    Ok((value, after))
+}
+
+fn run_transport_probe(
+    route_spec: &RouteSpec,
+    timeout_s: u64,
+    endpoint: &str,
+) -> Result<RouteSnapshot, String> {
+    let before = routing::inspect_route(route_spec)?;
+    if !before.online {
+        return Err(if before.reason.is_empty() {
+            format!("route {} is offline", before.identity.mode)
+        } else {
+            before.reason
+        });
+    }
+    if route_spec.effective_mode()? == RouteMode::Main && !before.active {
+        return Err(if before.reason.is_empty() {
+            format!("main route does not use {}", before.identity.device)
+        } else {
+            before.reason
+        });
+    }
+
+    let mut command = if route_spec.effective_mode()? == RouteMode::Main {
+        let mut curl = Command::new("curl");
+        curl.arg("-4")
+            .arg("-fsS")
+            .arg("--max-time")
+            .arg(timeout_s.to_string())
+            .arg("--interface")
+            .arg(&route_spec.expected_device)
+            .arg("-o")
+            .arg("/dev/null")
+            .arg(endpoint);
+        match curl.stdout(Stdio::null()).stderr(Stdio::null()).status() {
+            Ok(status) if status.success() => {
+                let after = routing::inspect_route(route_spec)?;
+                if before.stable_key() != after.stable_key() || !after.online {
+                    return Err("route changed during transport probe".to_string());
+                }
+                return Ok(after);
+            }
+            Ok(status) => return Err(format!("curl exited with {status}")),
+            Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                return Err(format!("failed to execute curl: {error}"));
+            }
+            Err(_) => routing::routed_command(route_spec, "", "uclient-fetch")?,
+        }
+    } else {
+        routing::routed_command(route_spec, "", "uclient-fetch")?
+    };
+    let status = command
         .arg("-4")
         .arg("-q")
         .arg("-T")
@@ -1768,12 +1956,16 @@ fn run_transport_probe(interface: &str, timeout_s: u64, endpoint: &str) -> Resul
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map_err(|error| format!("failed to execute uclient-fetch: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("uclient-fetch exited with {status}"))
+        .map_err(|error| format!("failed to execute routed uclient-fetch: {error}"))?;
+    if !status.success() {
+        return Err(format!("routed uclient-fetch exited with {status}"));
     }
+
+    let after = routing::inspect_route(route_spec)?;
+    if before.stable_key() != after.stable_key() || !after.online {
+        return Err("route changed during transport probe".to_string());
+    }
+    Ok(after)
 }
 
 #[derive(Clone, Debug)]
@@ -1982,6 +2174,11 @@ struct Controller {
     cpu_core_percentages: Vec<f64>,
     started_at: f64,
     run_state: String,
+    uplink_state: UplinkState,
+    uplink_reason: String,
+    route_snapshot: Option<RouteSnapshot>,
+    route_identity: Option<String>,
+    route_external_ip: String,
     last_status: Option<StatusSnapshot>,
 }
 
@@ -2070,6 +2267,11 @@ impl Controller {
             cpu_total_percent: None,
             cpu_core_percentages: Vec::new(),
             run_state: "RUNNING".to_string(),
+            uplink_state: UplinkState::Offline,
+            uplink_reason: "route not checked".to_string(),
+            route_snapshot: None,
+            route_identity: None,
+            route_external_ip: String::new(),
             last_status: None,
             dl_baseline_us: HashMap::new(),
             ul_baseline_us: HashMap::new(),
@@ -2141,6 +2343,21 @@ impl Controller {
 
     fn on_transport_probe(&mut self, result: TransportProbeResult) {
         let now = Instant::now();
+        if result.latency_ms.is_some()
+            && !transport_result_matches_route(
+                result.route_identity.as_deref(),
+                self.route_identity.as_deref(),
+            )
+        {
+            self.transport_latency
+                .observe_failure("route changed before transport result was accepted");
+            self.log(
+                "DEBUG",
+                "discarded transport probe from a stale or different uplink route",
+            );
+            let _ = self.refresh_status_from_last_sample();
+            return;
+        }
         let confirmed_delta = match (result.latency_ms, result.error.as_deref()) {
             (Some(latency_ms), _) => self.transport_latency.observe_success(
                 &result.endpoint,
@@ -2289,6 +2506,70 @@ impl Controller {
             self.apply_adaptive_updates(dl_update, ul_update);
         }
 
+        let _ = self.refresh_status_from_last_sample();
+    }
+
+    fn set_uplink_route(
+        &mut self,
+        snapshot: Option<RouteSnapshot>,
+        state: UplinkState,
+        reason: &str,
+        reset_learning: bool,
+    ) {
+        let previous_state = self.uplink_state;
+        self.uplink_state = state;
+        self.uplink_reason = reason.to_string();
+        self.route_identity = snapshot.as_ref().map(RouteSnapshot::stable_key);
+        self.route_snapshot = snapshot;
+
+        if reset_learning {
+            self.reset_uplink_learning("uplink route identity changed");
+        }
+        if previous_state != state {
+            self.log(
+                "INFO",
+                &format!(
+                    "Uplink state changed from {} to {}: {}",
+                    previous_state.as_str(),
+                    state.as_str(),
+                    if reason.is_empty() {
+                        "route ready"
+                    } else {
+                        reason
+                    }
+                ),
+            );
+        }
+        let _ = self.refresh_status_from_last_sample();
+    }
+
+    fn reset_uplink_learning(&mut self, reason: &str) {
+        self.dl_baseline_us.clear();
+        self.ul_baseline_us.clear();
+        self.dl_ewma_us.clear();
+        self.ul_ewma_us.clear();
+        self.dl_delays = filled_bool_window(self.cfg.bufferbloat_detection_window);
+        self.ul_delays = filled_bool_window(self.cfg.bufferbloat_detection_window);
+        self.dl_delta_us = filled_f64_window(self.cfg.bufferbloat_detection_window);
+        self.ul_delta_us = filled_f64_window(self.cfg.bufferbloat_detection_window);
+        self.transport_latency.reset();
+        self.quality_search_dl.reset();
+        self.quality_search_ul.reset();
+        self.quality_dl_class = QualityClass::Learning;
+        self.quality_ul_class = QualityClass::Learning;
+        let now = Instant::now();
+        let dl_update = self.adaptive_dl.reset_to_configured(now);
+        let ul_update = self.adaptive_ul.reset_to_configured(now);
+        self.log_adaptive_update("DL", dl_update);
+        self.log_adaptive_update("UL", ul_update);
+        self.log("INFO", &format!("Reset uplink latency learning: {reason}"));
+    }
+
+    fn set_route_external_ip(&mut self, value: String) {
+        if self.route_external_ip == value {
+            return;
+        }
+        self.route_external_ip = value;
         let _ = self.refresh_status_from_last_sample();
     }
 
@@ -2684,6 +2965,8 @@ impl Controller {
             effective_delta_ms,
             Some(self.throughput_floor_dl),
             Some(self.throughput_floor_ul),
+            self.uplink_state.as_str(),
+            self.route_identity.as_deref().unwrap_or(""),
         );
         let path = self.cfg.graph_history_path();
 
@@ -2843,7 +3126,12 @@ impl Controller {
         transport_clean: bool,
         now: Instant,
     ) {
-        if !self.cfg.adaptive_ceiling_enabled {
+        if !self.cfg.adaptive_ceiling_enabled
+            || matches!(
+                self.uplink_state,
+                UplinkState::Offline | UplinkState::Learning
+            )
+        {
             return;
         }
 
@@ -3053,8 +3341,9 @@ impl Controller {
         let mut file = File::create(&tmp)?;
         writeln!(
             file,
-            "{{\"instance\":\"{}\",\"version\":\"0.1.0\",\"state\":\"{}\",\"started_at\":{:.6},\"updated_at\":{:.6},\"dl_if\":\"{}\",\"ul_if\":\"{}\",\"reflector\":\"{}\",\"seq\":\"{}\",\"probe_timestamp\":{:.6},\"rtt_ms\":{:.3},\"dl_owd_us\":{:.1},\"ul_owd_us\":{:.1},\"dl_achieved_rate_kbps\":{:.1},\"ul_achieved_rate_kbps\":{:.1},\"dl_load_percent\":{:.1},\"ul_load_percent\":{:.1},\"dl_sum_delays\":{},\"ul_sum_delays\":{},\"dl_avg_owd_delta_us\":{:.1},\"ul_avg_owd_delta_us\":{:.1},\"cake_dl_rate_kbps\":{:.0},\"cake_ul_rate_kbps\":{:.0},\"adaptive_ceiling_enabled\":{},\"configured_max_dl_shaper_rate_kbps\":{:.0},\"configured_max_ul_shaper_rate_kbps\":{:.0},\"effective_max_dl_shaper_rate_kbps\":{:.0},\"effective_max_ul_shaper_rate_kbps\":{:.0},\"adaptive_ceiling_dl_cap_kbps\":{:.0},\"adaptive_ceiling_ul_cap_kbps\":{:.0},\"adaptive_ceiling_dl_phase\":\"{}\",\"adaptive_ceiling_ul_phase\":\"{}\",\"adaptive_ceiling_safe_dl_kbps\":{:.0},\"adaptive_ceiling_safe_ul_kbps\":{:.0},\"adaptive_ceiling_failed_dl_kbps\":{},\"adaptive_ceiling_failed_ul_kbps\":{},\"adaptive_ceiling_probe_dl_kbps\":{},\"adaptive_ceiling_probe_ul_kbps\":{},\"adaptive_ceiling_dl_phase_elapsed_s\":{:.3},\"adaptive_ceiling_ul_phase_elapsed_s\":{:.3},\"adaptive_ceiling_dl_last_reason\":\"{}\",\"adaptive_ceiling_ul_last_reason\":\"{}\",\"cpu_total_percent\":{},\"cpu_core_percentages\":{},\"active_reflectors\":{},\"spare_reflectors\":{},\"bad_reflectors\":{},\"reflector_health\":{}}}",
+            "{{\"instance\":\"{}\",\"version\":\"{}\",\"state\":\"{}\",\"started_at\":{:.6},\"updated_at\":{:.6},\"dl_if\":\"{}\",\"ul_if\":\"{}\",\"reflector\":\"{}\",\"seq\":\"{}\",\"probe_timestamp\":{:.6},\"rtt_ms\":{:.3},\"dl_owd_us\":{:.1},\"ul_owd_us\":{:.1},\"dl_achieved_rate_kbps\":{:.1},\"ul_achieved_rate_kbps\":{:.1},\"dl_load_percent\":{:.1},\"ul_load_percent\":{:.1},\"dl_sum_delays\":{},\"ul_sum_delays\":{},\"dl_avg_owd_delta_us\":{:.1},\"ul_avg_owd_delta_us\":{:.1},\"cake_dl_rate_kbps\":{:.0},\"cake_ul_rate_kbps\":{:.0},\"adaptive_ceiling_enabled\":{},\"configured_max_dl_shaper_rate_kbps\":{:.0},\"configured_max_ul_shaper_rate_kbps\":{:.0},\"effective_max_dl_shaper_rate_kbps\":{:.0},\"effective_max_ul_shaper_rate_kbps\":{:.0},\"adaptive_ceiling_dl_cap_kbps\":{:.0},\"adaptive_ceiling_ul_cap_kbps\":{:.0},\"adaptive_ceiling_dl_phase\":\"{}\",\"adaptive_ceiling_ul_phase\":\"{}\",\"adaptive_ceiling_safe_dl_kbps\":{:.0},\"adaptive_ceiling_safe_ul_kbps\":{:.0},\"adaptive_ceiling_failed_dl_kbps\":{},\"adaptive_ceiling_failed_ul_kbps\":{},\"adaptive_ceiling_probe_dl_kbps\":{},\"adaptive_ceiling_probe_ul_kbps\":{},\"adaptive_ceiling_dl_phase_elapsed_s\":{:.3},\"adaptive_ceiling_ul_phase_elapsed_s\":{:.3},\"adaptive_ceiling_dl_last_reason\":\"{}\",\"adaptive_ceiling_ul_last_reason\":\"{}\",\"cpu_total_percent\":{},\"cpu_core_percentages\":{},\"active_reflectors\":{},\"spare_reflectors\":{},\"bad_reflectors\":{},\"reflector_health\":{}}}",
             json_escape(&self.cfg.instance),
+            env!("CARGO_PKG_VERSION"),
             json_escape(&self.run_state),
             self.started_at,
             epoch_secs(),
@@ -3129,6 +3418,68 @@ impl Controller {
             self.quality_search_dl.limited() || self.quality_search_ul.limited(),
             self.quality_search_dl.limited(),
             self.quality_search_ul.limited(),
+        )?;
+        let route_mode = self
+            .route_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.identity.mode.as_str())
+            .unwrap_or(self.cfg.route_mode.as_str());
+        let route_member = self
+            .route_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.identity.member.as_str())
+            .unwrap_or(self.cfg.mwan3_member.as_str());
+        let route_device = self
+            .route_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.identity.device.as_str())
+            .unwrap_or(self.cfg.ul_if.as_str());
+        let route_source_ip = self
+            .route_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.identity.source_ip.as_str())
+            .unwrap_or("");
+        let route_fwmark = self
+            .route_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.identity.fwmark.as_str())
+            .unwrap_or("");
+        let route_table = self
+            .route_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.identity.table.as_str())
+            .unwrap_or("");
+        let member_status = self
+            .route_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.member_status.as_str())
+            .unwrap_or("unknown");
+        let route_active = self
+            .route_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.active)
+            .unwrap_or(false);
+        let uplink_error = uplink_error_code(self.uplink_state, &self.uplink_reason);
+        let transport_error = transport_error_code(transport.last_error.as_deref());
+        file.seek(SeekFrom::End(-2))?;
+        writeln!(
+            file,
+            ",\"uplink_state\":\"{}\",\"uplink_reason\":\"{}\",\"uplink_error_code\":{},\"transport_error_code\":{},\"route_mode_configured\":\"{}\",\"route_mode\":\"{}\",\"mwan3_member\":\"{}\",\"route_device\":\"{}\",\"route_source_ip\":\"{}\",\"route_external_ip\":\"{}\",\"route_fwmark\":\"{}\",\"route_table\":\"{}\",\"mwan3_member_status\":\"{}\",\"route_active\":{},\"route_identity\":{}}}",
+            self.uplink_state.as_str(),
+            json_escape(&self.uplink_reason),
+            json_string_or_null(uplink_error),
+            json_string_or_null(transport_error),
+            json_escape(&self.cfg.route_mode),
+            json_escape(route_mode),
+            json_escape(route_member),
+            json_escape(route_device),
+            json_escape(route_source_ip),
+            json_escape(&self.route_external_ip),
+            json_escape(route_fwmark),
+            json_escape(route_table),
+            json_escape(member_status),
+            route_active,
+            json_string_or_null(self.route_identity.as_deref()),
         )?;
         fs::rename(tmp, path)
     }
@@ -3259,6 +3610,28 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
     cfg.refresh_wire_packet_sizes();
 
     let mut controller = Controller::new(cfg.clone())?;
+    let route_spec = cfg.route_spec();
+    let mut uplink_lifecycle = UplinkLifecycle::new();
+    let initial_inspected = routing::inspect_route(&route_spec);
+    let (mut current_route_snapshot, initial_route_error) = match initial_inspected {
+        Ok(snapshot) => (Some(snapshot), None),
+        Err(error) => (None, Some(error)),
+    };
+    let initial_transition = uplink_lifecycle.observe(
+        current_route_snapshot.as_ref().map(Ok).unwrap_or_else(|| {
+            Err(initial_route_error
+                .as_deref()
+                .unwrap_or("route unavailable"))
+        }),
+        Instant::now(),
+        Duration::from_secs_f64(cfg.route_stability_s),
+    );
+    controller.set_uplink_route(
+        current_route_snapshot.clone(),
+        initial_transition.state,
+        &initial_transition.reason,
+        initial_transition.reset_learning,
+    );
     controller.start();
     let mut active_reflectors: Vec<String> = cfg
         .reflectors
@@ -3279,10 +3652,11 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
         return Ok(());
     }
 
-    let mut pinger = Some(PingerRuntime::spawn(&cfg, &active_reflectors)?);
+    let mut pinger: Option<PingerRuntime> = None;
     let mut transport_probe = cfg
         .transport_latency_enabled
         .then(|| TransportProbeRuntime::spawn(&cfg));
+    let mut external_ip_probe = ExternalIpRuntime::spawn(route_spec.clone());
     let mut main_state = MainState::Running;
     let mut idle_since: Option<Instant> = None;
     let mut last_reflector_response = Instant::now();
@@ -3291,8 +3665,56 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
     let stall_timeout = stall_detection_timeout(&cfg);
     let global_timeout = Duration::from_secs_f64(cfg.global_ping_response_timeout_s.max(0.1));
     let idle_timeout = Duration::from_secs_f64(cfg.sustained_idle_sleep_thr_s.max(0.0));
+    let route_check_interval = Duration::from_secs_f64(cfg.route_check_interval_s);
+    let route_stability = Duration::from_secs_f64(cfg.route_stability_s);
+    let mut last_route_check = Instant::now();
+    let mut route_probes_allowed = initial_transition.probes_allowed;
+    external_ip_probe.maybe_start(route_probes_allowed);
 
     while !TERMINATE.load(Ordering::SeqCst) {
+        external_ip_probe.drain(&mut controller);
+        if last_route_check.elapsed() >= route_check_interval {
+            last_route_check = Instant::now();
+            let inspected = routing::inspect_route(&route_spec);
+            let transition = uplink_lifecycle.observe(
+                inspected.as_ref().map_err(|error| error.as_str()),
+                last_route_check,
+                route_stability,
+            );
+            let must_stop = transition.became_offline || transition.identity_changed;
+            if must_stop {
+                if let Some(mut old) = pinger.take() {
+                    old.stop();
+                }
+                controller.note_probe_gap();
+            }
+            current_route_snapshot = inspected.ok();
+            if transition.identity_changed || transition.state == UplinkState::Offline {
+                controller.set_route_external_ip(String::new());
+            }
+            route_probes_allowed = transition.probes_allowed;
+            controller.set_uplink_route(
+                current_route_snapshot.clone(),
+                transition.state,
+                &transition.reason,
+                transition.reset_learning,
+            );
+            external_ip_probe.maybe_start(route_probes_allowed);
+            if route_probes_allowed
+                && pinger.is_none()
+                && current_route_snapshot.is_some()
+                && (main_state != MainState::Idle || transition.state == UplinkState::Learning)
+            {
+                if main_state == MainState::Idle {
+                    main_state = MainState::Running;
+                    controller.set_run_state("RUNNING");
+                    idle_since = None;
+                }
+                health = ReflectorHealth::new(&cfg, &active_reflectors);
+                pinger = Some(PingerRuntime::spawn(&cfg, &active_reflectors)?);
+                last_reflector_response = Instant::now();
+            }
+        }
         if let Some(runtime) = transport_probe.as_mut() {
             runtime.drain(&mut controller);
         }
@@ -3332,9 +3754,45 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                         }
                         health.observe_sample(&cfg, &sample);
                         controller.on_sample(sample, &active_reflectors, &health);
+                        if uplink_lifecycle
+                            .record_learning_sample(cfg.no_pingers.max(1).saturating_mul(3))
+                        {
+                            controller.set_uplink_route(
+                                current_route_snapshot.clone(),
+                                uplink_lifecycle.state(),
+                                uplink_lifecycle.reason(),
+                                false,
+                            );
+                        }
                     }
                 }
-                Ok(Err(e)) => return Err(e),
+                Ok(Err(e)) => {
+                    let inspected = routing::inspect_route(&route_spec);
+                    let route_is_online = inspected
+                        .as_ref()
+                        .map(|snapshot| snapshot.online)
+                        .unwrap_or(false);
+                    if route_is_online {
+                        return Err(e);
+                    }
+                    if let Some(mut old) = pinger.take() {
+                        old.stop();
+                    }
+                    let transition = uplink_lifecycle.observe(
+                        inspected.as_ref().map_err(|error| error.as_str()),
+                        Instant::now(),
+                        route_stability,
+                    );
+                    current_route_snapshot = inspected.ok();
+                    route_probes_allowed = false;
+                    controller.set_uplink_route(
+                        current_route_snapshot.clone(),
+                        transition.state,
+                        &transition.reason,
+                        transition.reset_learning,
+                    );
+                    continue;
+                }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
                     if TERMINATE.load(Ordering::SeqCst) {
@@ -3350,11 +3808,37 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                         if let Some(mut old) = pinger.take() {
                             old.stop();
                         }
-                        pinger = Some(PingerRuntime::spawn(&cfg, &active_reflectors)?);
+                        if route_probes_allowed {
+                            pinger = Some(PingerRuntime::spawn(&cfg, &active_reflectors)?);
+                        }
                         continue;
                     }
 
-                    return Err(format!("{} output closed unexpectedly", cfg.pinger_method));
+                    let inspected = routing::inspect_route(&route_spec);
+                    let route_is_online = inspected
+                        .as_ref()
+                        .map(|snapshot| snapshot.online)
+                        .unwrap_or(false);
+                    if route_is_online {
+                        return Err(format!("{} output closed unexpectedly", cfg.pinger_method));
+                    }
+                    if let Some(mut old) = pinger.take() {
+                        old.stop();
+                    }
+                    let transition = uplink_lifecycle.observe(
+                        inspected.as_ref().map_err(|error| error.as_str()),
+                        Instant::now(),
+                        route_stability,
+                    );
+                    current_route_snapshot = inspected.ok();
+                    route_probes_allowed = false;
+                    controller.set_uplink_route(
+                        current_route_snapshot.clone(),
+                        transition.state,
+                        &transition.reason,
+                        transition.reset_learning,
+                    );
+                    continue;
                 }
             }
         } else {
@@ -3368,10 +3852,12 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
             controller.note_probe_gap();
         }
         let (dl_rate, ul_rate) = controller.sample_rates();
-        if let Some(runtime) = transport_probe.as_mut() {
-            runtime.drain(&mut controller);
-            let (dl_shaper, ul_shaper) = controller.shaper_rates();
-            runtime.maybe_start(&cfg, dl_rate, ul_rate, dl_shaper, ul_shaper);
+        if route_probes_allowed {
+            if let Some(runtime) = transport_probe.as_mut() {
+                runtime.drain(&mut controller);
+                let (dl_shaper, ul_shaper) = controller.shaper_rates();
+                runtime.maybe_start(&cfg, dl_rate, ul_rate, dl_shaper, ul_shaper);
+            }
         }
         if controller.maybe_sample_cpu() {
             let _ = controller.refresh_status_from_last_sample();
@@ -3384,7 +3870,7 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
 
         match main_state {
             MainState::Running => {
-                if cfg.enable_sleep_function {
+                if cfg.enable_sleep_function && uplink_lifecycle.state() != UplinkState::Learning {
                     if connection_active {
                         idle_since = None;
                     } else {
@@ -3439,7 +3925,8 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                     }
                 }
 
-                if main_state == MainState::Running
+                if route_probes_allowed
+                    && main_state == MainState::Running
                     && health.check(&cfg, &mut active_reflectors, &mut controller)
                 {
                     controller.note_probe_gap();
@@ -3450,7 +3937,7 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                 }
             }
             MainState::Idle => {
-                if connection_active {
+                if connection_active && route_probes_allowed {
                     controller.log(
                         "DEBUG",
                         &format!(
@@ -3487,7 +3974,8 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                     stall_started = None;
                     global_timeout_fired = false;
                     last_reflector_response = now;
-                } else if !global_timeout_fired
+                } else if route_probes_allowed
+                    && !global_timeout_fired
                     && now.duration_since(last_reflector_response) > global_timeout
                 {
                     global_timeout_fired = true;
@@ -3752,14 +4240,7 @@ fn spawn_irtt(cfg: &Config, active_reflectors: &[String]) -> Result<Vec<Child>, 
 }
 
 fn pinger_command(cfg: &Config, binary: &str) -> Result<Command, String> {
-    let prefix = safe_command_words(&cfg.ping_prefix_string)?;
-    if prefix.is_empty() {
-        return Ok(Command::new(binary));
-    }
-
-    let mut cmd = Command::new(&prefix[0]);
-    cmd.args(&prefix[1..]).arg(binary);
-    Ok(cmd)
+    routing::routed_command(&cfg.route_spec(), &cfg.ping_prefix_string, binary)
 }
 
 fn stop_child(child: &mut Child) {
@@ -3991,31 +4472,6 @@ fn safe_extra_args(value: &str) -> Vec<String> {
         })
         .map(str::to_string)
         .collect()
-}
-
-fn safe_command_words(value: &str) -> Result<Vec<String>, String> {
-    let mut words = Vec::new();
-
-    for word in value.split_whitespace() {
-        if word.is_empty() {
-            continue;
-        }
-
-        let safe = word.len() <= 128
-            && word.chars().all(|ch| {
-                ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '/' | '=')
-            });
-
-        if !safe {
-            return Err(format!(
-                "ping_prefix_string contains unsupported argument token: {word}"
-            ));
-        }
-
-        words.push(word.to_string());
-    }
-
-    Ok(words)
 }
 
 fn fetch_url_text(url: &str) -> Result<String, String> {
@@ -4475,9 +4931,11 @@ fn graph_history_line(
     effective_delta_ms: Option<f64>,
     dl_floor_kbps: Option<f64>,
     ul_floor_kbps: Option<f64>,
+    uplink_state: &str,
+    route_identity: &str,
 ) -> String {
     format!(
-        "{:.0},{},{},{},{},{},{},{},{}\n",
+        "{:.0},{},{},{},{},{},{},{},{},{},{}\n",
         timestamp,
         json_f64_or_empty(rtt_ms, 3),
         json_f64_or_empty(cpu_percent, 1),
@@ -4486,7 +4944,9 @@ fn graph_history_line(
         json_f64_or_empty(transport_delta_ms, 3),
         json_f64_or_empty(effective_delta_ms, 3),
         json_f64_or_empty(dl_floor_kbps, 1),
-        json_f64_or_empty(ul_floor_kbps, 1)
+        json_f64_or_empty(ul_floor_kbps, 1),
+        uplink_state.replace(',', ""),
+        route_identity.replace(',', "")
     )
 }
 
@@ -4814,8 +5274,9 @@ mod tests {
         parse_irtt_line, parse_reflector_candidates, parse_tc_linklayer_overhead,
         parse_tsping_line, parse_uci_values, pinger_command, pinger_response_interval_s,
         reflector_bad_reflectors, reflector_health_json, reflector_spare_reflectors,
-        sample_is_stale, stall_detection_timeout, throughput_floor, Config, ReflectorHealth,
-        ReflectorState, Sample, ThroughputGuardInput,
+        sample_is_stale, stall_detection_timeout, throughput_floor, transport_error_code,
+        transport_result_matches_route, uplink_error_code, Config, ReflectorHealth, ReflectorState,
+        Sample, ThroughputGuardInput, UplinkState,
     };
     use std::time::Instant;
 
@@ -5116,8 +5577,10 @@ mod tests {
                 Some(11.9876),
                 Some(600.0),
                 Some(30.0),
+                "ACTIVE",
+                "mwan3|wan|pppoe-wan|84.1.1.1|0x100|1",
             ),
-            "123,1.235,2.3,1000.0,50.5,10.123,11.988,600.0,30.0\n"
+            "123,1.235,2.3,1000.0,50.5,10.123,11.988,600.0,30.0,ACTIVE,mwan3|wan|pppoe-wan|84.1.1.1|0x100|1\n"
         );
 
         let data = "1,1,1\n2,2,2\n3,3,3\n";
@@ -5200,6 +5663,40 @@ mod tests {
         cfg.ping_prefix_string = "mwan3 use wan; reboot".to_string();
 
         assert!(pinger_command(&cfg, "fping").is_err());
+    }
+
+    #[test]
+    fn transport_samples_cannot_cross_uplink_route_identities() {
+        assert!(transport_result_matches_route(
+            Some("mwan3|wan|pppoe-wan|84.1.1.1|0x100|1"),
+            Some("mwan3|wan|pppoe-wan|84.1.1.1|0x100|1")
+        ));
+        assert!(!transport_result_matches_route(
+            Some("mwan3|wan|pppoe-wan|84.1.1.1|0x100|1"),
+            Some("mwan3|wanb|eth0|10.0.100.101|0x200|2")
+        ));
+        assert!(!transport_result_matches_route(None, Some("main|||")));
+    }
+
+    #[test]
+    fn route_and_transport_failures_have_stable_codes() {
+        assert_eq!(
+            uplink_error_code(UplinkState::Offline, "route mismatch: expected eth0"),
+            Some("route_mismatch")
+        );
+        assert_eq!(
+            uplink_error_code(UplinkState::Offline, "member wanb is offline"),
+            Some("member_offline")
+        );
+        assert_eq!(uplink_error_code(UplinkState::Active, ""), None);
+        assert_eq!(
+            transport_error_code(Some("transport probe timed out")),
+            Some("transport_timeout")
+        );
+        assert_eq!(
+            transport_error_code(Some("route changed during transport probe")),
+            Some("route_mismatch")
+        );
     }
 
     #[test]

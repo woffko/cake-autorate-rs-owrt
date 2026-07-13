@@ -84,6 +84,21 @@ print_section_logs() {
 	done
 }
 
+print_route_topology() {
+	local section="$1" member
+
+	config_get member "$section" mwan3_member
+	[ -n "$member" ] || return 0
+	case "$member" in
+		*[!A-Za-z0-9_.:@-]*)
+			echo "Skipped invalid member name for $section"
+			return 0
+			;;
+	esac
+	run_command "instance $section mwan3 member" ubus call mwan3 status "{\"interface\":\"$member\"}"
+	run_command "instance $section network interface" ubus call "network.interface.$member" status
+}
+
 config_load cake-autorate
 
 if [ "$SECTION" = "all" ]; then
@@ -130,8 +145,18 @@ uci -q show cake-autorate 2>&1 | redact_secrets || true
 	cat /etc/config/sqm 2>&1 || true
 }
 
+if command -v mwan3 >/dev/null 2>&1; then
+	run_command "mwan3 version" mwan3 --version
+	run_command "mwan3 status" ubus call mwan3 status
+	run_command "IPv4 policy rules" ip -4 rule show
+	run_command "IPv4 routing tables" ip -4 route show table all
+	section_title "uci show mwan3"
+	uci -q show mwan3 2>&1 | redact_secrets || true
+fi
+
 if [ -n "$sections" ]; then
 	for section in $sections; do
+		print_route_topology "$section"
 		print_section_logs "$section"
 	done
 fi

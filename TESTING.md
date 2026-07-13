@@ -23,10 +23,11 @@ the calculated floor, `quality_limited` appears when the safe floor prevents the
 target, old five-column graph history remains readable, and all new history
 stays in `/var/run`.
 
-The first rollout gate is the disposable x86_64 router using its primary
-single-WAN path only. Multi-WAN routing, failover, and per-uplink transport
-baselines are explicitly deferred to a separate test plan; they must not be
-inferred from this gate.
+RC6 adds a second disposable-router gate: two nftables mwan3 members, distinct
+CAKE/IFB pairs, per-member ICMP and HTTP/TCP probes, router-side speed tests,
+Full Auto-Tune isolation, failover/failback, and route relearning. Production
+deployment is permitted only after both the original single-WAN safety gate
+and this Multi-WAN gate pass.
 
 Release offline bundles must be installed with networking disabled into an
 empty APK root. Published assets must then be downloaded again and validated
@@ -203,11 +204,10 @@ Consequences:
 2. Full Auto-Tune now requires an idle and loaded TCP/HTTPS latency signal in
    addition to fping. The larger latency delta drives its score, and either
    delta above 100 ms fails closed. `uclient-fetch` is an explicit dependency.
-3. Runtime autorate still needs a source-bindable TCP/HTTP (or equivalent
-   non-prioritized transport) probe before it can react perfectly on this type
-   of carrier. Until that backend exists, use repeated client-side evidence and
-   a conservative proven starting range; retain adaptive ceiling rather than
-   treating a single grade as a new hard maximum.
+3. Runtime autorate therefore uses a non-prioritized HTTP/TCP signal in addition
+   to ICMP. In structured Multi-WAN mode the HTTP client is executed through the
+   selected nftables mwan3 member; main-route mode still verifies that the
+   target is the active default route.
 
 The updated Full Auto-Tune gate was then exercised on the same ARM router. Two
 raw samples proposed a variable-link base of 93.2/18.7 Mbit/s. Shaped attempt 1
@@ -222,3 +222,54 @@ carrier asymmetry that motivated the regression.
 The router was restored byte-for-byte to its saved cake-autorate and SQM
 configuration after the tests, with the original instance running and no UCI
 deltas left behind.
+
+## RC6 Multi-WAN acceptance gate (2026-07-13)
+
+The RC6 x86_64 packages were installed on a disposable OpenWrt 25.12.5 router
+with two native nftables mwan3 members. Identifying addresses, names, and ISP
+details are omitted. The primary and backup resolved to separate Ethernet
+devices and policy tables, but both happened to share one upstream public NAT
+address. This deliberately verified that public IP is supporting evidence, not
+the sole route discriminator.
+
+Two enabled autorate instances owned distinct SQM sections, CAKE root qdiscs,
+download IFBs, source addresses, fwmarks, tables, reflector pools, transport
+baselines, quality state, and adaptive ceilings. The normal policy produced
+`ACTIVE` for the primary and `STANDBY` for the backup. Disabling only the
+primary mwan3 member produced `OFFLINE` for that instance and `ACTIVE` with a
+100% policy share for the backup. The offline pinger remained stopped and did
+not add reflector offences. Restoring the member produced a bounded
+`LEARNING` interval, rebuilt its baseline even though the controller had been
+idle, and returned to `ACTIVE`; the backup returned independently to
+`STANDBY`.
+
+Forced ICMP, HTTP/HTTPS, built-in HTTP throughput, and speedtest-go checks used
+the expected member/device/source/fwmark/table for each instance. A backup
+speedtest-go sample reported approximately 51.8/5.7 Mbit/s and paused only the
+backup daemon/SQM. The primary process and qdiscs remained present. Aggregate
+WAN counters were never used to calculate the test rate.
+
+Full Auto-Tune was then run on the backup. The first raw sample selected one
+speedtest-go server; the second raw sample and both shaped validation attempts
+reported the same server ID after the RC6 job-local pin fix. The candidate
+failed closed for real quality evidence—about 28.3% median reflector loss and
+120 ms loaded HTTP/TCP increase—rather than route/server mismatch. It returned
+`configuration_written=false` and restored both autorate processes and both
+original qdisc pairs.
+
+The automated release gate passed 72 Rust tests, init/SQM conflict tests,
+scheduler and Auto-Tune lifecycle tests, speed-test route tests, four LuCI
+JavaScript suites, shell syntax, ACL JSON parsing, and `git diff --check`.
+Playwright then exercised installed Status, Settings, and Graphs without a
+constructor/page exception. It confirmed member labels (`logical -> device`),
+both package versions, `BASELINE READY / Waiting for loaded traffic` at the
+intentional 50% evidence stage, exact hover values, and fixed chart axes:
+
+| Viewport | Left Y label, start/end | Right Y label, start/end |
+|---:|---:|---:|
+| 1440 px | 146 / 146 px | 612.47 / 612.47 px |
+| 480 px | 21 / 21 px | 375.47 / 375.47 px |
+
+The data/timeline scrolled over more than 2,000 px in both layouts while these
+coordinates remained fixed. This is the acceptance condition for the RC6
+graph-scale regression.

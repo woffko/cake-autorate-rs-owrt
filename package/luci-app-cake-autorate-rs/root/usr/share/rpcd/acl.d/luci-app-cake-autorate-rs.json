@@ -11,13 +11,14 @@
 				"/etc/init.d/cake-autorate status": [ "exec" ],
 				"/etc/init.d/sqm status": [ "exec" ],
 				"/usr/libexec/cake-autorate-rs/package-versions": [ "exec" ],
+				"/usr/libexec/cake-autorate-rs/mwan3-info": [ "exec" ],
 				"/usr/libexec/cake-autorate-rs/log-bundle *": [ "exec" ]
 			},
 			"ubus": {
 				"file": [ "read", "list" ],
 				"luci": [ "getInitList" ]
 			},
-			"uci": [ "cake-autorate", "sqm" ]
+			"uci": [ "cake-autorate", "sqm", "mwan3" ]
 		},
 		"write": {
 			"cgi-io": [ "exec" ],

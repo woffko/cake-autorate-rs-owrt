@@ -32,9 +32,14 @@ function assert(condition, message) {
 		throw new Error(message);
 }
 
+assert(source.includes('.cake-graph-fixed-axis{position:sticky;left:0'),
+	'Y-axis labels must stay fixed while the data timeline scrolls');
+assert(source.includes('.cake-graph-chart-title{position:sticky;left:0'),
+	'chart titles must stay fixed while the data timeline scrolls');
+
 const now = Math.floor(Date.now() / 1000);
 const points = helpers.parseHistory([
-	`${now - 2},10.125,1.5,1000.0,500.0,20.5,22.0,600.0,300.0`,
+	`${now - 2},10.125,1.5,1000.0,500.0,20.5,22.0,600.0,300.0,ACTIVE,mwan3|wan|pppoe-wan|198.51.100.1|0x100|1`,
 	`${now - 1},,2.5,2000.0,750.0`,
 	`${now},12.500,3.5,3000.0,1000.0`,
 ].join('\n'));
@@ -44,6 +49,8 @@ assert(points[0].transport === 20.5 && points[0].effective === 22.0,
 	'nine-column transport latency parsing failed');
 assert(points[0].dlFloor === 600 && points[0].ulFloor === 300,
 	'nine-column throughput floor parsing failed');
+assert(points[0].uplinkState === 'ACTIVE' && points[0].routeIdentity.includes('0x100'),
+	'Multi-WAN state and route identity parsing failed');
 
 const legacy = helpers.parseHistory(`${now},9.5,4.0`);
 assert(legacy.length === 1 && legacy[0].dl === null && legacy[0].ul === null,

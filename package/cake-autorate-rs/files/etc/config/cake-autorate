@@ -6,6 +6,12 @@ config cake_autorate 'primary'
 	option auto_interface_preset '1'
 	option dl_if 'ifb4wan'
 	option ul_if 'wan'
+	# Probe routing is structured and never evaluated by a shell. Use 'main' for
+	# the main table, or 'mwan3' plus a logical mwan3 interface/member per uplink.
+	option route_mode 'auto'
+	option mwan3_member ''
+	option route_stability_s '5.0'
+	option route_check_interval_s '2.0'
 	option adjust_dl_shaper_rate '1'
 	option adjust_ul_shaper_rate '1'
 	option min_dl_shaper_rate_kbps '5000'

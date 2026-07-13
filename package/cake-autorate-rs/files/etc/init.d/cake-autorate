@@ -3,6 +3,8 @@
 START=97
 STOP=4
 USE_PROCD=1
+EXTRA_COMMANDS="recover_interface"
+EXTRA_HELP="\trecover_interface <mwan3-member>\tStart a member instance that was unavailable at boot"
 
 CONFIG="cake-autorate"
 SQM_CONFIG="sqm"
@@ -10,6 +12,7 @@ DAEMON="/usr/sbin/cake-autorated"
 SQM_MANAGED=0
 CAKE_CONFIG_CHANGED=0
 SQM_INTERFACES=""
+SQM_CONFLICT_FILE="${CAKE_AUTORATE_SQM_CONFLICT_FILE:-/var/run/cake-autorate/sqm-conflicts}"
 BRIDGER_CONFIG_CHANGED=0
 
 set_cake_option_if_changed() {
@@ -121,14 +124,80 @@ sync_rate_preset_instance() {
 	fi
 }
 
+migrate_legacy_route_instance() {
+	local section="$1"
+	local mode member prefix parsed
+
+	config_get mode "$section" route_mode auto
+	config_get member "$section" mwan3_member
+	config_get prefix "$section" ping_prefix_string
+	[ -n "$prefix" ] || return 0
+
+	parsed="$(printf '%s\n' "$prefix" | awk '
+		NF == 4 && $1 == "mwan3" && $2 == "use" && $4 == "exec" &&
+		$3 ~ /^[A-Za-z0-9_.:@-]+$/ { print $3 }')"
+	[ -n "$parsed" ] || return 0
+
+	if [ "$mode" = auto ] && [ -z "$member" ]; then
+		set_cake_option_if_changed "$section" route_mode mwan3
+		set_cake_option_if_changed "$section" mwan3_member "$parsed"
+		uci -q delete "$CONFIG.$section.ping_prefix_string"
+		CAKE_CONFIG_CHANGED=1
+		logger -t cake-autorate "migrated legacy mwan3 ping prefix for instance '$section' to structured member '$parsed'"
+	elif [ "$mode" = mwan3 ] && [ "$member" = "$parsed" ]; then
+		uci -q delete "$CONFIG.$section.ping_prefix_string"
+		CAKE_CONFIG_CHANGED=1
+	fi
+}
+
 sync_interface_presets() {
 	CAKE_CONFIG_CHANGED=0
+	config_foreach migrate_legacy_route_instance cake_autorate
 	config_foreach sync_interface_preset_instance cake_autorate
 	config_foreach sync_rate_preset_instance cake_autorate
 	[ "$CAKE_CONFIG_CHANGED" -eq 1 ] || return 0
 
 	uci commit "$CONFIG"
 	config_load "$CONFIG"
+}
+
+append_sqm_conflict() {
+	local section="$1"
+
+	grep -Fxq "$section" "$SQM_CONFLICT_FILE" 2>/dev/null || printf '%s\n' "$section" >> "$SQM_CONFLICT_FILE"
+}
+
+detect_managed_sqm_conflicts() {
+	local section enabled manage_sqm sqm_enabled target pair previous_target previous_section seen=""
+
+	mkdir -p "$(dirname "$SQM_CONFLICT_FILE")"
+	: > "$SQM_CONFLICT_FILE"
+	for section in $(uci -q show "$CONFIG" | sed -n "s/^$CONFIG\.\([^.]*\)=cake_autorate$/\1/p"); do
+		config_get_bool enabled "$section" enabled 0
+		config_get_bool manage_sqm "$section" manage_sqm 1
+		config_get_bool sqm_enabled "$section" sqm_enabled "$enabled"
+		[ "$enabled" -eq 1 ] && [ "$manage_sqm" -eq 1 ] && [ "$sqm_enabled" -eq 1 ] || continue
+
+		config_get target "$section" sqm_interface
+		[ -n "$target" ] || config_get target "$section" ul_if
+		[ -n "$target" ] || config_get target "$section" wan_if
+		[ -n "$target" ] || continue
+		target="$(resolve_interface_device "$target")"
+
+		for pair in $seen; do
+			previous_target="${pair%%|*}"
+			previous_section="${pair#*|}"
+			[ "$previous_target" = "$target" ] || continue
+			append_sqm_conflict "$previous_section"
+			append_sqm_conflict "$section"
+			logger -t cake-autorate "refusing duplicate managed shapers: instances '$previous_section' and '$section' both target '$target'"
+		done
+		seen="${seen:+$seen }$target|$section"
+	done
+}
+
+section_has_sqm_conflict() {
+	grep -Fxq "$1" "$SQM_CONFLICT_FILE" 2>/dev/null
 }
 
 set_sqm_option() {
@@ -290,6 +359,15 @@ sync_sqm_instance() {
 
 	config_get_bool enabled "$section" enabled 0
 	config_get_bool sqm_enabled "$section" sqm_enabled "$enabled"
+	if section_has_sqm_conflict "$section"; then
+		config_get sqm_section "$section" sqm_section "cake_$section"
+		if uci -q get "$SQM_CONFIG.$sqm_section" >/dev/null; then
+			set_sqm_option "$sqm_section" enabled 0
+			SQM_MANAGED=1
+		fi
+		cleanup_stale_sqm_sections "$section" ""
+		return 0
+	fi
 	if [ "$enabled" -ne 1 ] || [ "$sqm_enabled" -ne 1 ]; then
 		config_get sqm_section "$section" sqm_section "cake_$section"
 		if uci -q get "$SQM_CONFIG.$sqm_section" >/dev/null; then
@@ -505,6 +583,10 @@ start_instance() {
 
 	config_get_bool enabled "$section" enabled 0
 	[ "$enabled" -eq 1 ] || return 0
+	if section_has_sqm_conflict "$section"; then
+		logger -t cake-autorate "not starting instance '$section': duplicate managed CAKE queue target"
+		return 0
+	fi
 	instance_has_interface_backing "$section" || return 0
 
 	procd_open_instance "$section"
@@ -518,11 +600,30 @@ start_instance() {
 start_service() {
 	config_load "$CONFIG"
 	sync_interface_presets
+	detect_managed_sqm_conflicts
 	sync_sqm_config
 	prepare_sqm_ingress_interfaces
 	start_sqm_backend
 	config_foreach start_instance cake_autorate
 	[ -x /etc/init.d/cake-autorate-mqtt ] && /etc/init.d/cake-autorate-mqtt restart >/dev/null 2>&1 || true
+}
+
+recover_interface() {
+	local member="$1"
+	local section configured enabled
+
+	[ -n "$member" ] || return 0
+	config_load "$CONFIG"
+	for section in $(uci -q show "$CONFIG" | sed -n "s/^$CONFIG\.\([^.]*\)=cake_autorate$/\1/p"); do
+		config_get configured "$section" mwan3_member
+		[ "$configured" = "$member" ] || continue
+		config_get_bool enabled "$section" enabled 0
+		[ "$enabled" -eq 1 ] || continue
+		pgrep -f "^$DAEMON --instance $section\$" >/dev/null 2>&1 && continue
+		logger -t cake-autorate "mwan3 member '$member' recovered while instance '$section' was absent; reloading managed SQM and instances"
+		reload_service
+		return 0
+	done
 }
 
 reload_service() {
@@ -551,6 +652,18 @@ service_stopped() {
 }
 
 service_triggers() {
+	local section member seen=""
+
 	procd_add_reload_trigger "$CONFIG"
 	procd_add_reload_trigger "$SQM_CONFIG"
+	config_load "$CONFIG"
+	for section in $(uci -q show "$CONFIG" | sed -n "s/^$CONFIG\.\([^.]*\)=cake_autorate$/\1/p"); do
+		config_get member "$section" mwan3_member
+		[ -n "$member" ] || continue
+		case " $seen " in
+			*" $member "*) continue ;;
+		esac
+		seen="${seen:+$seen }$member"
+		procd_add_interface_trigger "interface.*.up" "$member" /etc/init.d/cake-autorate recover_interface "$member"
+	done
 }

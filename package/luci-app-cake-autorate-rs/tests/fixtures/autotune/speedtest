@@ -5,6 +5,9 @@ case "$3" in
 		printf '%s\n' '{"available":true,"selected_backend":"speedtest-go"}'
 		;;
 	run)
+		if [ -n "${AUTOTUNE_MOCK_PIN_LOG:-}" ]; then
+			printf '%s\n' "${CAKE_AUTORATE_SPEEDTEST_GO_SERVER_ID:-automatic}" >> "$AUTOTUNE_MOCK_PIN_LOG"
+		fi
 		if [ "${AUTOTUNE_MOCK_BLOCK:-0}" = 1 ]; then
 			trap 'touch "$AUTOTUNE_MOCK_RESTORE_MARKER"; exit 130' INT TERM
 			sleep 30
@@ -15,14 +18,16 @@ case "$3" in
 		count="${count:-0}"
 		count=$((count + 1))
 		printf '%s\n' "$count" > "$counter_file"
-		if [ "$count" -eq 1 ]; then
-			printf '%s\n' '{"download_kbps":50000,"upload_kbps":10000,"backend":"speedtest-go","server_id":"17372","server_sponsor":"Test Server","shaper_bypassed":true}'
+		if [ "${AUTOTUNE_MOCK_ROUTE_MISMATCH:-0}" = 1 ] && [ "$count" -eq 2 ]; then
+			printf '%s\n' '{"download_kbps":110000,"upload_kbps":20000,"backend":"speedtest-go","server_id":"17372","server_sponsor":"Test Server","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"0x200","route_table":"2","external_ip_after":"203.0.113.1","shaper_bypassed":true}'
+		elif [ "$count" -eq 1 ]; then
+			printf '%s\n' '{"download_kbps":50000,"upload_kbps":10000,"backend":"speedtest-go","server_id":"17372","server_sponsor":"Test Server","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.1","shaper_bypassed":true}'
 		elif [ "$count" -eq 2 ]; then
-			printf '%s\n' '{"download_kbps":110000,"upload_kbps":20000,"backend":"speedtest-go","server_id":"17372","server_sponsor":"Test Server","shaper_bypassed":true}'
+			printf '%s\n' '{"download_kbps":110000,"upload_kbps":20000,"backend":"speedtest-go","server_id":"17372","server_sponsor":"Test Server","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.1","shaper_bypassed":true}'
 		elif [ "${AUTOTUNE_MOCK_CORRECT:-0}" = 1 ] && [ "$count" -eq 3 ]; then
-			printf '%s\n' '{"download_kbps":20000,"upload_kbps":4000,"backend":"speedtest-go","server_id":"17372","server_sponsor":"Test Server","shaper_bypassed":false}'
+			printf '%s\n' '{"download_kbps":20000,"upload_kbps":4000,"backend":"speedtest-go","server_id":"17372","server_sponsor":"Test Server","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.1","shaper_bypassed":false}'
 		else
-			printf '%s\n' '{"download_kbps":50000,"upload_kbps":10000,"backend":"speedtest-go","server_id":"17372","server_sponsor":"Test Server","shaper_bypassed":false}'
+			printf '%s\n' '{"download_kbps":50000,"upload_kbps":10000,"backend":"speedtest-go","server_id":"17372","server_sponsor":"Test Server","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.1","shaper_bypassed":false}'
 		fi
 		;;
 	*)

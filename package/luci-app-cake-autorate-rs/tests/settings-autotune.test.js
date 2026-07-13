@@ -9,6 +9,14 @@ const sourcePath = path.join(__dirname, '..', 'htdocs', 'luci-static', 'resource
 const source = fs.readFileSync(sourcePath, 'utf8');
 const prefix = source.slice(0, source.indexOf('return L.view.extend'));
 const written = {};
+const fixtureSections = { 'cake-autorate': [], mwan3: [] };
+if (typeof String.prototype.format !== 'function') {
+	String.prototype.format = function() {
+		let index = 0;
+		const args = arguments;
+		return this.replace(/%[sd]/g, () => String(args[index++]));
+	};
+}
 const uci = {
 	set(config, section, key, value) {
 		assert.equal(config, 'cake-autorate');
@@ -21,14 +29,17 @@ const uci = {
 	get() {
 		return null;
 	},
-	sections() {
-		return [];
+	sections(config) {
+		return fixtureSections[config] || [];
 	},
 };
 const helpers = new Function(
 	'fs', 'form', 'network', 'uci', 'ui', 'widgets', 'cakeUi', 'L', 'E', '_',
 	`${prefix}\ninterfaceContext = { deviceNames: { eth1: true }, deviceNetworks: {}, ` +
-		`networkDevices: {}, defaultDevice: 'eth1' };\nreturn { writeWizardConfig, validateTransportProbeUrl };`
+		`networkDevices: {}, defaultDevice: 'eth1' };\nreturn { writeWizardConfig, validateTransportProbeUrl, ` +
+		`buildMwan3Context, uniqueMwan3Uplinks, multiwanInstancePlans, wizardPlanConflicts, ` +
+		`setInterfaceContext: function(value) { interfaceContext = value; }, ` +
+		`setMwan3Context: function(value) { mwan3Context = value; } };`
 )({}, {}, {}, uci, {}, {}, {}, {}, () => ({}), value => value);
 
 const proposal = {
@@ -109,6 +120,7 @@ assert.equal(written.sqm_linklayer, 'none');
 assert.equal(written.sqm_overhead, '0');
 assert.equal(written.sqm_tcMPU, '0');
 assert.equal(written.speedtest_go_server_id, '17372');
+assert.equal(written.route_mode, 'main');
 
 assert.equal(helpers.validateTransportProbeUrl(''), true);
 assert.equal(helpers.validateTransportProbeUrl(null), true);
@@ -116,5 +128,38 @@ assert.equal(helpers.validateTransportProbeUrl('https://www.google.com/generate_
 assert.equal(helpers.validateTransportProbeUrl('http://example.test/probe?bytes=0'), true);
 assert.equal(helpers.validateTransportProbeUrl('ftp://example.test/probe'), 'Enter an HTTP or HTTPS URL without spaces.');
 assert.equal(helpers.validateTransportProbeUrl('https://example.test/has space'), 'Enter an HTTP or HTTPS URL without spaces.');
+
+helpers.setInterfaceContext({
+	deviceNames: { 'pppoe-wan': true, eth0: true },
+	deviceNetworks: { 'pppoe-wan': [ 'wan', 'wan6' ], eth0: [ 'wanb', 'wanb6' ] },
+	devicePhysical: { 'pppoe-wan': 'eth2' },
+	networkDevices: { wan: 'pppoe-wan', wan6: 'pppoe-wan', wanb: 'eth0', wanb6: 'eth0' },
+	defaultDevice: 'pppoe-wan',
+});
+fixtureSections.mwan3 = [
+	{ '.name': 'wan', enabled: '1', family: 'ipv4' },
+	{ '.name': 'wan_6', enabled: '1', family: 'ipv6' },
+	{ '.name': 'wanb', enabled: '1', family: 'ipv4' },
+];
+const mwan3 = helpers.buildMwan3Context();
+helpers.setMwan3Context(mwan3);
+assert.deepEqual(mwan3.members.map(member => [ member.name, member.device ]), [
+	[ 'wan', 'pppoe-wan' ], [ 'wanb', 'eth0' ],
+]);
+assert.equal(mwan3.byName.wan.label, 'wan — pppoe-wan — eth2');
+assert.equal(mwan3.byName.wanb.label, 'wanb — eth0');
+assert.equal(helpers.uniqueMwan3Uplinks().length, 2);
+const plans = helpers.multiwanInstancePlans({ name: 'primary_sqm', wan_if: 'pppoe-wan' });
+assert.deepEqual(plans.map(plan => [ plan.name, plan.member, plan.device, plan.sqmSection ]), [
+	[ 'primary_sqm', 'wan', 'pppoe-wan', 'cake_primary_sqm' ],
+	[ 'wanb_sqm', 'wanb', 'eth0', 'cake_wanb_sqm' ],
+]);
+assert.deepEqual(helpers.wizardPlanConflicts(plans, true), []);
+fixtureSections['cake-autorate'] = [
+	{ '.name': 'old_wanb', enabled: '1', manage_sqm: '1', wan_if: 'eth0' },
+];
+assert.match(helpers.wizardPlanConflicts(plans, true).join(' '), /old_wanb.*eth0/);
+const duplicatePlans = [ plans[0], { ...plans[1], name: 'primary_sqm' } ];
+assert.match(helpers.wizardPlanConflicts(duplicatePlans, false).join(' '), /duplicated/);
 
 console.log('settings autotune tests passed');
