@@ -1,21 +1,27 @@
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod adaptive_ceiling;
 mod autotune;
+mod transport_quality;
 
 use adaptive_ceiling::{
     AdaptiveCeilingChange, AdaptiveCeilingDirection, AdaptiveCeilingObservation,
     AdaptiveCeilingPolicy, AdaptiveCeilingUpdate,
+};
+use transport_quality::{
+    classify_quality, effective_latency_delta_ms, throughput_floor, transport_allows_growth,
+    QualityClass, QualitySearchDirection, QualitySearchPolicy, ThroughputGuardInput,
+    TransportLatencyTracker,
 };
 
 static TERMINATE: AtomicBool = AtomicBool::new(false);
@@ -85,6 +91,23 @@ struct Config {
     adaptive_ceiling_probe_duration_s: f64,
     adaptive_ceiling_cooldown_s: f64,
     adaptive_ceiling_failed_bound_ttl_s: f64,
+    transport_latency_enabled: bool,
+    transport_probe_urls: Vec<String>,
+    transport_probe_idle_interval_s: f64,
+    transport_probe_loaded_interval_s: f64,
+    transport_probe_timeout_s: u64,
+    quality_target_delay_ms: f64,
+    quality_search_max_steps: usize,
+    quality_search_observe_s: f64,
+    quality_search_cooldown_s: f64,
+    throughput_guard_enabled: bool,
+    throughput_guard_retention_percent: f64,
+    throughput_guard_dl_floor_kbps: f64,
+    throughput_guard_ul_floor_kbps: f64,
+    throughput_reference_dl_p20_kbps: f64,
+    throughput_reference_dl_p50_kbps: f64,
+    throughput_reference_ul_p20_kbps: f64,
+    throughput_reference_ul_p50_kbps: f64,
     min_ul_shaper_rate_kbps: f64,
     base_ul_shaper_rate_kbps: f64,
     max_ul_shaper_rate_kbps: f64,
@@ -183,6 +206,27 @@ impl Config {
             adaptive_ceiling_probe_duration_s: 8.0,
             adaptive_ceiling_cooldown_s: 30.0,
             adaptive_ceiling_failed_bound_ttl_s: 900.0,
+            transport_latency_enabled: false,
+            transport_probe_urls: vec![
+                "https://speed.cloudflare.com/__down?bytes=0".to_string(),
+                "https://www.google.com/generate_204".to_string(),
+                "https://connectivitycheck.gstatic.com/generate_204".to_string(),
+            ],
+            transport_probe_idle_interval_s: 15.0,
+            transport_probe_loaded_interval_s: 1.0,
+            transport_probe_timeout_s: 5,
+            quality_target_delay_ms: 30.0,
+            quality_search_max_steps: 3,
+            quality_search_observe_s: 6.0,
+            quality_search_cooldown_s: 900.0,
+            throughput_guard_enabled: true,
+            throughput_guard_retention_percent: 80.0,
+            throughput_guard_dl_floor_kbps: 0.0,
+            throughput_guard_ul_floor_kbps: 0.0,
+            throughput_reference_dl_p20_kbps: 0.0,
+            throughput_reference_dl_p50_kbps: 0.0,
+            throughput_reference_ul_p20_kbps: 0.0,
+            throughput_reference_ul_p50_kbps: 0.0,
             min_ul_shaper_rate_kbps: 5000.0,
             base_ul_shaper_rate_kbps: 20000.0,
             max_ul_shaper_rate_kbps: 35000.0,
@@ -400,6 +444,86 @@ impl Config {
             &single,
             "adaptive_ceiling_failed_bound_ttl_s",
             &mut cfg.adaptive_ceiling_failed_bound_ttl_s,
+        )?;
+        set_bool(
+            &single,
+            "transport_latency_enabled",
+            &mut cfg.transport_latency_enabled,
+        )?;
+        set_f64(
+            &single,
+            "transport_probe_idle_interval_s",
+            &mut cfg.transport_probe_idle_interval_s,
+        )?;
+        set_f64(
+            &single,
+            "transport_probe_loaded_interval_s",
+            &mut cfg.transport_probe_loaded_interval_s,
+        )?;
+        set_u64(
+            &single,
+            "transport_probe_timeout_s",
+            &mut cfg.transport_probe_timeout_s,
+        )?;
+        set_f64(
+            &single,
+            "quality_target_delay_ms",
+            &mut cfg.quality_target_delay_ms,
+        )?;
+        set_usize(
+            &single,
+            "quality_search_max_steps",
+            &mut cfg.quality_search_max_steps,
+        )?;
+        set_f64(
+            &single,
+            "quality_search_observe_s",
+            &mut cfg.quality_search_observe_s,
+        )?;
+        set_f64(
+            &single,
+            "quality_search_cooldown_s",
+            &mut cfg.quality_search_cooldown_s,
+        )?;
+        set_bool(
+            &single,
+            "throughput_guard_enabled",
+            &mut cfg.throughput_guard_enabled,
+        )?;
+        set_f64(
+            &single,
+            "throughput_guard_retention_percent",
+            &mut cfg.throughput_guard_retention_percent,
+        )?;
+        set_f64(
+            &single,
+            "throughput_guard_dl_floor_kbps",
+            &mut cfg.throughput_guard_dl_floor_kbps,
+        )?;
+        set_f64(
+            &single,
+            "throughput_guard_ul_floor_kbps",
+            &mut cfg.throughput_guard_ul_floor_kbps,
+        )?;
+        set_f64(
+            &single,
+            "throughput_reference_dl_p20_kbps",
+            &mut cfg.throughput_reference_dl_p20_kbps,
+        )?;
+        set_f64(
+            &single,
+            "throughput_reference_dl_p50_kbps",
+            &mut cfg.throughput_reference_dl_p50_kbps,
+        )?;
+        set_f64(
+            &single,
+            "throughput_reference_ul_p20_kbps",
+            &mut cfg.throughput_reference_ul_p20_kbps,
+        )?;
+        set_f64(
+            &single,
+            "throughput_reference_ul_p50_kbps",
+            &mut cfg.throughput_reference_ul_p50_kbps,
         )?;
         if !adaptive_dl_cap_configured {
             cfg.adaptive_ceiling_dl_cap_kbps = cfg.max_dl_shaper_rate_kbps;
@@ -696,6 +820,19 @@ impl Config {
                 .map(str::to_string)
                 .collect();
         }
+        if let Some(values) = lists.get("transport_probe_url") {
+            cfg.transport_probe_urls = values
+                .iter()
+                .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
+                .cloned()
+                .collect();
+        } else if let Some(value) = single.get("transport_probe_urls") {
+            cfg.transport_probe_urls = value
+                .split_whitespace()
+                .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+                .map(str::to_string)
+                .collect();
+        }
         if let Some(values) = lists.get("irtt_server") {
             cfg.irtt_servers = values.iter().filter(|v| !v.is_empty()).cloned().collect();
         } else if let Some(value) = single
@@ -880,6 +1017,93 @@ impl Config {
                 return Err(
                     "adaptive_ceiling_failed_bound_ttl_s must be greater than zero".to_string(),
                 );
+            }
+        }
+        if self.transport_latency_enabled {
+            if self.transport_probe_urls.is_empty() {
+                return Err(
+                    "transport_latency_enabled requires at least one transport_probe_url"
+                        .to_string(),
+                );
+            }
+            if self.transport_probe_urls.iter().any(|url| {
+                !(url.starts_with("http://") || url.starts_with("https://"))
+                    || url.len() > 512
+                    || url.chars().any(char::is_whitespace)
+            }) {
+                return Err("transport_probe_url must be a safe HTTP(S) URL".to_string());
+            }
+            if !self.transport_probe_idle_interval_s.is_finite()
+                || self.transport_probe_idle_interval_s < 5.0
+                || self.transport_probe_idle_interval_s > 3600.0
+            {
+                return Err(
+                    "transport_probe_idle_interval_s must be between 5 and 3600".to_string()
+                );
+            }
+            if !self.transport_probe_loaded_interval_s.is_finite()
+                || self.transport_probe_loaded_interval_s < 0.5
+                || self.transport_probe_loaded_interval_s > 60.0
+            {
+                return Err(
+                    "transport_probe_loaded_interval_s must be between 0.5 and 60".to_string(),
+                );
+            }
+            if !(1..=30).contains(&self.transport_probe_timeout_s) {
+                return Err("transport_probe_timeout_s must be between 1 and 30".to_string());
+            }
+            if !self.quality_target_delay_ms.is_finite()
+                || !(5.0..=200.0).contains(&self.quality_target_delay_ms)
+            {
+                return Err("quality_target_delay_ms must be between 5 and 200".to_string());
+            }
+            if !(1..=10).contains(&self.quality_search_max_steps) {
+                return Err("quality_search_max_steps must be between 1 and 10".to_string());
+            }
+            if !self.quality_search_observe_s.is_finite()
+                || !(2.0..=120.0).contains(&self.quality_search_observe_s)
+            {
+                return Err("quality_search_observe_s must be between 2 and 120".to_string());
+            }
+            if !self.quality_search_cooldown_s.is_finite()
+                || !(30.0..=86400.0).contains(&self.quality_search_cooldown_s)
+            {
+                return Err("quality_search_cooldown_s must be between 30 and 86400".to_string());
+            }
+        }
+        if !(50.0..=100.0).contains(&self.throughput_guard_retention_percent) {
+            return Err(
+                "throughput_guard_retention_percent must be between 50 and 100".to_string(),
+            );
+        }
+        for (name, value) in [
+            (
+                "throughput_guard_dl_floor_kbps",
+                self.throughput_guard_dl_floor_kbps,
+            ),
+            (
+                "throughput_guard_ul_floor_kbps",
+                self.throughput_guard_ul_floor_kbps,
+            ),
+            (
+                "throughput_reference_dl_p20_kbps",
+                self.throughput_reference_dl_p20_kbps,
+            ),
+            (
+                "throughput_reference_dl_p50_kbps",
+                self.throughput_reference_dl_p50_kbps,
+            ),
+            (
+                "throughput_reference_ul_p20_kbps",
+                self.throughput_reference_ul_p20_kbps,
+            ),
+            (
+                "throughput_reference_ul_p50_kbps",
+                self.throughput_reference_ul_p50_kbps,
+            ),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(format!("{name} must not be negative"));
             }
         }
         if self.sustained_idle_sleep_thr_s < 0.0 {
@@ -1383,6 +1607,176 @@ impl RateMonitor {
 }
 
 #[derive(Clone, Debug)]
+struct TransportProbeRequest {
+    endpoint: String,
+    loaded: bool,
+    dl_loaded: bool,
+    ul_loaded: bool,
+}
+
+#[derive(Clone, Debug)]
+struct TransportProbeResult {
+    endpoint: String,
+    loaded: bool,
+    dl_loaded: bool,
+    ul_loaded: bool,
+    latency_ms: Option<f64>,
+    error: Option<String>,
+}
+
+struct TransportProbeRuntime {
+    requests: SyncSender<TransportProbeRequest>,
+    results: Receiver<TransportProbeResult>,
+    in_flight: bool,
+    next_endpoint: usize,
+    last_started: Instant,
+}
+
+impl TransportProbeRuntime {
+    fn spawn(cfg: &Config) -> Self {
+        let (request_tx, request_rx) = mpsc::sync_channel::<TransportProbeRequest>(1);
+        let (result_tx, result_rx) = mpsc::channel::<TransportProbeResult>();
+        let interface = cfg.ul_if.clone();
+        let timeout_s = cfg.transport_probe_timeout_s;
+        thread::spawn(move || {
+            while let Ok(request) = request_rx.recv() {
+                let started = Instant::now();
+                let result = run_transport_probe(&interface, timeout_s, &request.endpoint);
+                let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+                let (latency_ms, error) = match result {
+                    Ok(()) => (Some(elapsed_ms), None),
+                    Err(error) => (None, Some(error)),
+                };
+                if result_tx
+                    .send(TransportProbeResult {
+                        endpoint: request.endpoint,
+                        loaded: request.loaded,
+                        dl_loaded: request.dl_loaded,
+                        ul_loaded: request.ul_loaded,
+                        latency_ms,
+                        error,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        Self {
+            requests: request_tx,
+            results: result_rx,
+            in_flight: false,
+            next_endpoint: 0,
+            last_started: Instant::now()
+                .checked_sub(Duration::from_secs_f64(cfg.transport_probe_idle_interval_s))
+                .unwrap_or_else(Instant::now),
+        }
+    }
+
+    fn drain(&mut self, controller: &mut Controller) {
+        while let Ok(result) = self.results.try_recv() {
+            self.in_flight = false;
+            controller.on_transport_probe(result);
+        }
+    }
+
+    fn maybe_start(
+        &mut self,
+        cfg: &Config,
+        dl_rate: f64,
+        ul_rate: f64,
+        dl_shaper: f64,
+        ul_shaper: f64,
+    ) {
+        if self.in_flight || cfg.transport_probe_urls.is_empty() {
+            return;
+        }
+        let dl_loaded = percent(dl_rate, dl_shaper) >= cfg.high_load_thr * 100.0;
+        let ul_loaded = percent(ul_rate, ul_shaper) >= cfg.high_load_thr * 100.0;
+        let loaded = dl_loaded || ul_loaded;
+        let interval = if loaded {
+            cfg.transport_probe_loaded_interval_s
+        } else {
+            cfg.transport_probe_idle_interval_s
+        };
+        if self.last_started.elapsed() < Duration::from_secs_f64(interval) {
+            return;
+        }
+
+        let endpoint =
+            cfg.transport_probe_urls[self.next_endpoint % cfg.transport_probe_urls.len()].clone();
+        self.next_endpoint = self.next_endpoint.wrapping_add(1);
+        if self
+            .requests
+            .try_send(TransportProbeRequest {
+                endpoint,
+                loaded,
+                dl_loaded,
+                ul_loaded,
+            })
+            .is_ok()
+        {
+            self.in_flight = true;
+            self.last_started = Instant::now();
+        }
+    }
+}
+
+fn run_transport_probe(interface: &str, timeout_s: u64, endpoint: &str) -> Result<(), String> {
+    let curl = Command::new("curl")
+        .arg("-4")
+        .arg("-fsS")
+        .arg("--max-time")
+        .arg(timeout_s.to_string())
+        .arg("--interface")
+        .arg(interface)
+        .arg("-o")
+        .arg("/dev/null")
+        .arg(endpoint)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match curl {
+        Ok(status) if status.success() => return Ok(()),
+        Ok(status) => return Err(format!("curl exited with {status}")),
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            return Err(format!("failed to execute curl: {error}"));
+        }
+        Err(_) => {}
+    }
+
+    // uclient-fetch cannot bind an interface on every supported OpenWrt release.
+    // Use it only when the selected interface is the default route, so a future
+    // Multi-WAN implementation cannot silently measure another uplink.
+    let route = Command::new("ip")
+        .args(["-4", "route", "get", "1.1.1.1"])
+        .output()
+        .map_err(|error| format!("failed to inspect transport route: {error}"))?;
+    let route_text = String::from_utf8_lossy(&route.stdout);
+    if !route.status.success() || !route_text.split_whitespace().any(|word| word == interface) {
+        return Err(format!("transport route does not use {interface}"));
+    }
+    let status = Command::new("uclient-fetch")
+        .arg("-4")
+        .arg("-q")
+        .arg("-T")
+        .arg(timeout_s.to_string())
+        .arg("-O")
+        .arg("/dev/null")
+        .arg(endpoint)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("failed to execute uclient-fetch: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("uclient-fetch exited with {status}"))
+    }
+}
+
+#[derive(Clone, Debug)]
 struct CpuCounters {
     total: u64,
     idle: u64,
@@ -1569,6 +1963,13 @@ struct Controller {
     shaper_ul: f64,
     adaptive_dl: AdaptiveCeilingDirection,
     adaptive_ul: AdaptiveCeilingDirection,
+    transport_latency: TransportLatencyTracker,
+    quality_search_dl: QualitySearchDirection,
+    quality_search_ul: QualitySearchDirection,
+    quality_dl_class: QualityClass,
+    quality_ul_class: QualityClass,
+    throughput_floor_dl: f64,
+    throughput_floor_ul: f64,
     last_set_dl: u64,
     last_set_ul: u64,
     last_bb_dl: Instant,
@@ -1625,12 +2026,39 @@ impl Controller {
             cfg.max_ul_shaper_rate_kbps,
             cfg.adaptive_ceiling_ul_cap_kbps,
         );
+        let throughput_floor_dl = throughput_floor(ThroughputGuardInput {
+            enabled: cfg.transport_latency_enabled && cfg.throughput_guard_enabled,
+            configured_min_kbps: cfg.min_dl_shaper_rate_kbps,
+            configured_base_kbps: cfg.base_dl_shaper_rate_kbps,
+            observed_p20_kbps: cfg.throughput_reference_dl_p20_kbps,
+            observed_p50_kbps: cfg.throughput_reference_dl_p50_kbps,
+            absolute_floor_kbps: cfg.throughput_guard_dl_floor_kbps,
+            retention_percent: cfg.throughput_guard_retention_percent,
+        })
+        .min(adaptive_dl.absolute_cap_kbps());
+        let throughput_floor_ul = throughput_floor(ThroughputGuardInput {
+            enabled: cfg.transport_latency_enabled && cfg.throughput_guard_enabled,
+            configured_min_kbps: cfg.min_ul_shaper_rate_kbps,
+            configured_base_kbps: cfg.base_ul_shaper_rate_kbps,
+            observed_p20_kbps: cfg.throughput_reference_ul_p20_kbps,
+            observed_p50_kbps: cfg.throughput_reference_ul_p50_kbps,
+            absolute_floor_kbps: cfg.throughput_guard_ul_floor_kbps,
+            retention_percent: cfg.throughput_guard_retention_percent,
+        })
+        .min(adaptive_ul.absolute_cap_kbps());
 
         Ok(Self {
             shaper_dl: cfg.base_dl_shaper_rate_kbps,
             shaper_ul: cfg.base_ul_shaper_rate_kbps,
             adaptive_dl,
             adaptive_ul,
+            transport_latency: TransportLatencyTracker::new(),
+            quality_search_dl: QualitySearchDirection::new(),
+            quality_search_ul: QualitySearchDirection::new(),
+            quality_dl_class: QualityClass::Learning,
+            quality_ul_class: QualityClass::Learning,
+            throughput_floor_dl,
+            throughput_floor_ul,
             last_set_dl: 0,
             last_set_ul: 0,
             last_bb_dl: now,
@@ -1669,13 +2097,166 @@ impl Controller {
         self.rate_monitor.sample()
     }
 
+    fn shaper_rates(&self) -> (f64, f64) {
+        (self.shaper_dl, self.shaper_ul)
+    }
+
+    fn transport_max_age(&self) -> Duration {
+        Duration::from_secs_f64(
+            self.cfg.transport_probe_loaded_interval_s * 3.0
+                + self.cfg.transport_probe_timeout_s as f64,
+        )
+    }
+
+    fn transport_clean_for_growth(&mut self, now: Instant) -> bool {
+        if !self.cfg.transport_latency_enabled {
+            return true;
+        }
+        let max_age = self.transport_max_age();
+        self.transport_latency.expire_loaded(now, max_age);
+        let snapshot = self.transport_latency.snapshot(now, true);
+        transport_allows_growth(
+            true,
+            snapshot.confirmed,
+            snapshot.sample_age_s,
+            max_age.as_secs_f64(),
+            snapshot.delta_ms,
+            self.cfg.quality_target_delay_ms,
+        )
+    }
+
+    fn quality_policy(&self, is_dl: bool) -> QualitySearchPolicy {
+        QualitySearchPolicy {
+            target_delay_ms: self.cfg.quality_target_delay_ms,
+            floor_kbps: if is_dl {
+                self.throughput_floor_dl
+            } else {
+                self.throughput_floor_ul
+            },
+            max_steps: self.cfg.quality_search_max_steps.min(u8::MAX as usize) as u8,
+            observe_duration: Duration::from_secs_f64(self.cfg.quality_search_observe_s),
+            cooldown: Duration::from_secs_f64(self.cfg.quality_search_cooldown_s),
+        }
+    }
+
+    fn on_transport_probe(&mut self, result: TransportProbeResult) {
+        let now = Instant::now();
+        let confirmed_delta = match (result.latency_ms, result.error.as_deref()) {
+            (Some(latency_ms), _) => self.transport_latency.observe_success(
+                &result.endpoint,
+                latency_ms,
+                result.loaded,
+                now,
+            ),
+            (_, Some(error)) => {
+                self.transport_latency.observe_failure(error);
+                self.log("DEBUG", &format!("transport latency probe failed: {error}"));
+                None
+            }
+            _ => {
+                self.transport_latency
+                    .observe_failure("transport probe returned no result");
+                None
+            }
+        };
+
+        let Some(delta_ms) = confirmed_delta else {
+            let _ = self.refresh_status_from_last_sample();
+            return;
+        };
+        let class = classify_quality(Some(delta_ms));
+        let (icmp_dl_delta_us, icmp_ul_delta_us) = self
+            .last_status
+            .as_ref()
+            .map(|status| (status.avg_dl_delta, status.avg_ul_delta))
+            .unwrap_or((0.0, 0.0));
+        let dl_class = classify_quality(Some(effective_latency_delta_ms(
+            icmp_dl_delta_us,
+            0.0,
+            Some(delta_ms),
+        )));
+        let ul_class = classify_quality(Some(effective_latency_delta_ms(
+            0.0,
+            icmp_ul_delta_us,
+            Some(delta_ms),
+        )));
+        let dl_policy = self.quality_policy(true);
+        let ul_policy = self.quality_policy(false);
+        let dl_update = if result.dl_loaded {
+            self.quality_dl_class = dl_class;
+            Some(
+                self.quality_search_dl
+                    .observe(now, self.shaper_dl, delta_ms, true, dl_policy),
+            )
+        } else {
+            None
+        };
+        let ul_update = if result.ul_loaded {
+            self.quality_ul_class = ul_class;
+            Some(
+                self.quality_search_ul
+                    .observe(now, self.shaper_ul, delta_ms, true, ul_policy),
+            )
+        } else {
+            None
+        };
+
+        let mut changed = false;
+        if let Some(update) = dl_update {
+            if let Some(rate) = update.requested_rate_kbps {
+                if self.cfg.adjust_dl_shaper_rate {
+                    self.shaper_dl = rate;
+                    changed = true;
+                }
+            }
+            if update.requested_rate_kbps.is_some() || update.limited {
+                self.log(
+                    "INFO",
+                    &format!(
+                        "Transport DL quality {} at {:.1} ms: {} (floor {:.0} kbit/s)",
+                        class.as_str(),
+                        delta_ms,
+                        update.reason,
+                        self.throughput_floor_dl
+                    ),
+                );
+            }
+        }
+        if let Some(update) = ul_update {
+            if let Some(rate) = update.requested_rate_kbps {
+                if self.cfg.adjust_ul_shaper_rate {
+                    self.shaper_ul = rate;
+                    changed = true;
+                }
+            }
+            if update.requested_rate_kbps.is_some() || update.limited {
+                self.log(
+                    "INFO",
+                    &format!(
+                        "Transport UL quality {} at {:.1} ms: {} (floor {:.0} kbit/s)",
+                        class.as_str(),
+                        delta_ms,
+                        update.reason,
+                        self.throughput_floor_ul
+                    ),
+                );
+            }
+        }
+        if changed {
+            self.clamp_rates();
+            self.apply_shaper("dl");
+            self.apply_shaper("ul");
+        }
+        let _ = self.refresh_status_from_last_sample();
+    }
+
     fn set_min_shaper_rates(&mut self, reason: &str) {
         self.log(
             "DEBUG",
             &format!("Enforcing minimum shaper rates: {reason}"),
         );
-        self.shaper_dl = self.cfg.min_dl_shaper_rate_kbps;
-        self.shaper_ul = self.cfg.min_ul_shaper_rate_kbps;
+        self.shaper_dl = self.throughput_floor_dl;
+        self.shaper_ul = self.throughput_floor_ul;
         self.apply_shaper("dl");
         self.apply_shaper("ul");
         let _ = self.refresh_status_from_last_sample();
@@ -1894,17 +2475,27 @@ impl Controller {
             high_load_pct,
         );
 
-        self.update_direction(true, dl_kind, dl_bb, avg_dl_delta, now);
-        self.update_direction(false, ul_kind, ul_bb, avg_ul_delta, now);
+        let transport_clean = self.transport_clean_for_growth(now);
+        let transport_delta_ms = self
+            .transport_latency
+            .snapshot(now, self.cfg.transport_latency_enabled)
+            .delta_ms;
+        let transport_bloat = self.cfg.transport_latency_enabled
+            && transport_delta_ms
+                .map(|delta| delta > self.cfg.quality_target_delay_ms)
+                .unwrap_or(false);
+        self.update_direction(true, dl_kind, dl_bb, avg_dl_delta, transport_clean, now);
+        self.update_direction(false, ul_kind, ul_bb, avg_ul_delta, transport_clean, now);
         self.update_adaptive_ceilings(
             dl_kind,
             ul_kind,
-            dl_bb,
-            ul_bb,
+            dl_bb || (matches!(dl_kind, LoadKind::High) && transport_bloat),
+            ul_bb || (matches!(ul_kind, LoadKind::High) && transport_bloat),
             dl_delay_count,
             ul_delay_count,
             avg_dl_delta,
             avg_ul_delta,
+            transport_clean,
             now,
         );
         self.clamp_rates();
@@ -2073,12 +2664,26 @@ impl Controller {
                 None
             }
         });
+        let transport = self
+            .transport_latency
+            .snapshot(Instant::now(), self.cfg.transport_latency_enabled);
+        let effective_delta_ms = self.last_status.as_ref().map(|snapshot| {
+            effective_latency_delta_ms(
+                snapshot.avg_dl_delta,
+                snapshot.avg_ul_delta,
+                transport.delta_ms,
+            )
+        });
         let line = graph_history_line(
             now,
             rtt_ms,
             self.cpu_total_percent,
             dl_rate_kbps,
             ul_rate_kbps,
+            transport.delta_ms,
+            effective_delta_ms,
+            Some(self.throughput_floor_dl),
+            Some(self.throughput_floor_ul),
         );
         let path = self.cfg.graph_history_path();
 
@@ -2144,6 +2749,7 @@ impl Controller {
         kind: LoadKind,
         bufferbloat: bool,
         avg_delta_us: f64,
+        allow_growth: bool,
         now: Instant,
     ) {
         let mut shaper = if is_dl {
@@ -2189,7 +2795,7 @@ impl Controller {
             shaper *= adjust;
             last_bb = now;
             last_decay = now;
-        } else if matches!(kind, LoadKind::High) && bb_ready {
+        } else if matches!(kind, LoadKind::High) && bb_ready && allow_growth {
             let factor = if delay_thr_us <= up_thr_us {
                 1.0
             } else if delay_thr_us > avg_delta_us {
@@ -2234,6 +2840,7 @@ impl Controller {
         ul_delay_count: usize,
         avg_dl_delta_us: f64,
         avg_ul_delta_us: f64,
+        transport_clean: bool,
         now: Instant,
     ) {
         if !self.cfg.adaptive_ceiling_enabled {
@@ -2254,12 +2861,14 @@ impl Controller {
             && matches!(dl_kind, LoadKind::High)
             && !dl_bufferbloat
             && dl_delay_count < self.cfg.bufferbloat_detection_thr
-            && avg_dl_delta_us <= self.avg_adjust_up_thr_us(true);
+            && avg_dl_delta_us <= self.avg_adjust_up_thr_us(true)
+            && transport_clean;
         let ul_eligible = self.cfg.adjust_ul_shaper_rate
             && matches!(ul_kind, LoadKind::High)
             && !ul_bufferbloat
             && ul_delay_count < self.cfg.bufferbloat_detection_thr
-            && avg_ul_delta_us <= self.avg_adjust_up_thr_us(false);
+            && avg_ul_delta_us <= self.avg_adjust_up_thr_us(false)
+            && transport_clean;
 
         let dl_update = self.adaptive_dl.observe(
             now,
@@ -2286,11 +2895,11 @@ impl Controller {
     fn clamp_rates(&mut self) {
         self.shaper_dl = self
             .shaper_dl
-            .max(self.cfg.min_dl_shaper_rate_kbps)
+            .max(self.throughput_floor_dl)
             .min(self.adaptive_dl.effective_max_kbps());
         self.shaper_ul = self
             .shaper_ul
-            .max(self.cfg.min_ul_shaper_rate_kbps)
+            .max(self.throughput_floor_ul)
             .min(self.adaptive_ul.effective_max_kbps());
     }
 
@@ -2422,6 +3031,25 @@ impl Controller {
         let ul_phase_elapsed_s = adaptive_now
             .saturating_duration_since(self.adaptive_ul.phase_since())
             .as_secs_f64();
+        let transport = self
+            .transport_latency
+            .snapshot(adaptive_now, self.cfg.transport_latency_enabled);
+        let effective_delta_ms =
+            effective_latency_delta_ms(avg_dl_delta, avg_ul_delta, transport.delta_ms);
+        let quality_class = if transport.confirmed {
+            classify_quality(Some(effective_delta_ms))
+        } else {
+            QualityClass::Learning
+        };
+        let quality_reason = if self.quality_search_dl.limited() {
+            self.quality_search_dl.last_reason()
+        } else if self.quality_search_ul.limited() {
+            self.quality_search_ul.last_reason()
+        } else if transport.confirmed {
+            "estimated_from_icmp_and_transport_latency"
+        } else {
+            transport.status
+        };
         let mut file = File::create(&tmp)?;
         writeln!(
             file,
@@ -2473,6 +3101,34 @@ impl Controller {
             json_string_array(&spare_reflectors),
             json_string_array(&bad_reflectors),
             reflector_health
+        )?;
+        file.seek(SeekFrom::End(-2))?;
+        writeln!(
+            file,
+            ",\"transport_latency_enabled\":{},\"transport_status\":\"{}\",\"transport_endpoint\":{},\"transport_latency_ms\":{},\"transport_baseline_ms\":{},\"transport_delta_ms\":{},\"transport_sample_age_s\":{},\"transport_confidence\":{},\"transport_successful_samples\":{},\"transport_failed_samples\":{},\"transport_last_error\":{},\"effective_latency_delta_ms\":{:.3},\"quality_estimated\":true,\"quality_class\":\"{}\",\"quality_dl_class\":\"{}\",\"quality_ul_class\":\"{}\",\"quality_confidence\":{},\"quality_reason\":\"{}\",\"throughput_guard_enabled\":{},\"throughput_floor_dl_kbps\":{:.0},\"throughput_floor_ul_kbps\":{:.0},\"quality_limited\":{},\"quality_limited_dl\":{},\"quality_limited_ul\":{}}}",
+            self.cfg.transport_latency_enabled,
+            json_escape(transport.status),
+            json_string_or_null(transport.endpoint.as_deref()),
+            json_f64_or_null(transport.latency_ms, 3),
+            json_f64_or_null(transport.baseline_ms, 3),
+            json_f64_or_null(transport.delta_ms, 3),
+            json_f64_or_null(transport.sample_age_s, 3),
+            transport.confidence,
+            transport.successful_samples,
+            transport.failed_samples,
+            json_string_or_null(transport.last_error.as_deref()),
+            effective_delta_ms,
+            quality_class.as_str(),
+            self.quality_dl_class.as_str(),
+            self.quality_ul_class.as_str(),
+            transport.confidence,
+            json_escape(quality_reason),
+            self.cfg.throughput_guard_enabled,
+            self.throughput_floor_dl,
+            self.throughput_floor_ul,
+            self.quality_search_dl.limited() || self.quality_search_ul.limited(),
+            self.quality_search_dl.limited(),
+            self.quality_search_ul.limited(),
         )?;
         fs::rename(tmp, path)
     }
@@ -2624,6 +3280,9 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
     }
 
     let mut pinger = Some(PingerRuntime::spawn(&cfg, &active_reflectors)?);
+    let mut transport_probe = cfg
+        .transport_latency_enabled
+        .then(|| TransportProbeRuntime::spawn(&cfg));
     let mut main_state = MainState::Running;
     let mut idle_since: Option<Instant> = None;
     let mut last_reflector_response = Instant::now();
@@ -2634,6 +3293,9 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
     let idle_timeout = Duration::from_secs_f64(cfg.sustained_idle_sleep_thr_s.max(0.0));
 
     while !TERMINATE.load(Ordering::SeqCst) {
+        if let Some(runtime) = transport_probe.as_mut() {
+            runtime.drain(&mut controller);
+        }
         if pinger.is_some() {
             let timeout = if main_state == MainState::Running {
                 health.timeout(&cfg)
@@ -2706,6 +3368,11 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
             controller.note_probe_gap();
         }
         let (dl_rate, ul_rate) = controller.sample_rates();
+        if let Some(runtime) = transport_probe.as_mut() {
+            runtime.drain(&mut controller);
+            let (dl_shaper, ul_shaper) = controller.shaper_rates();
+            runtime.maybe_start(&cfg, dl_rate, ul_rate, dl_shaper, ul_shaper);
+        }
         if controller.maybe_sample_cpu() {
             let _ = controller.refresh_status_from_last_sample();
         }
@@ -3784,6 +4451,12 @@ fn json_f64_or_null(value: Option<f64>, precision: usize) -> String {
     }
 }
 
+fn json_string_or_null(value: Option<&str>) -> String {
+    value
+        .map(|value| format!("\"{}\"", json_escape(value)))
+        .unwrap_or_else(|| "null".to_string())
+}
+
 fn json_f64_or_empty(value: Option<f64>, precision: usize) -> String {
     match value {
         Some(value) if value.is_finite() => format!("{:.*}", precision, value),
@@ -3791,20 +4464,29 @@ fn json_f64_or_empty(value: Option<f64>, precision: usize) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn graph_history_line(
     timestamp: f64,
     rtt_ms: Option<f64>,
     cpu_percent: Option<f64>,
     dl_rate_kbps: f64,
     ul_rate_kbps: f64,
+    transport_delta_ms: Option<f64>,
+    effective_delta_ms: Option<f64>,
+    dl_floor_kbps: Option<f64>,
+    ul_floor_kbps: Option<f64>,
 ) -> String {
     format!(
-        "{:.0},{},{},{},{}\n",
+        "{:.0},{},{},{},{},{},{},{},{}\n",
         timestamp,
         json_f64_or_empty(rtt_ms, 3),
         json_f64_or_empty(cpu_percent, 1),
         json_f64_or_empty(Some(dl_rate_kbps), 1),
-        json_f64_or_empty(Some(ul_rate_kbps), 1)
+        json_f64_or_empty(Some(ul_rate_kbps), 1),
+        json_f64_or_empty(transport_delta_ms, 3),
+        json_f64_or_empty(effective_delta_ms, 3),
+        json_f64_or_empty(dl_floor_kbps, 1),
+        json_f64_or_empty(ul_floor_kbps, 1)
     )
 }
 
@@ -4132,7 +4814,8 @@ mod tests {
         parse_irtt_line, parse_reflector_candidates, parse_tc_linklayer_overhead,
         parse_tsping_line, parse_uci_values, pinger_command, pinger_response_interval_s,
         reflector_bad_reflectors, reflector_health_json, reflector_spare_reflectors,
-        sample_is_stale, stall_detection_timeout, Config, ReflectorHealth, ReflectorState, Sample,
+        sample_is_stale, stall_detection_timeout, throughput_floor, Config, ReflectorHealth,
+        ReflectorState, Sample, ThroughputGuardInput,
     };
     use std::time::Instant;
 
@@ -4319,6 +5002,42 @@ mod tests {
     }
 
     #[test]
+    fn transport_quality_defaults_are_safe_and_opt_in() {
+        let cfg = Config::defaults("test".to_string());
+        assert!(!cfg.transport_latency_enabled);
+        assert!(cfg.throughput_guard_enabled);
+        assert_eq!(cfg.throughput_guard_retention_percent, 80.0);
+        assert_eq!(cfg.quality_target_delay_ms, 30.0);
+
+        let dl_floor = throughput_floor(ThroughputGuardInput {
+            enabled: true,
+            configured_min_kbps: cfg.min_dl_shaper_rate_kbps,
+            configured_base_kbps: cfg.base_dl_shaper_rate_kbps,
+            observed_p20_kbps: 0.0,
+            observed_p50_kbps: 0.0,
+            absolute_floor_kbps: 0.0,
+            retention_percent: cfg.throughput_guard_retention_percent,
+        });
+        assert_eq!(dl_floor, cfg.base_dl_shaper_rate_kbps * 0.60);
+    }
+
+    #[test]
+    fn transport_quality_validation_rejects_unsafe_values() {
+        let mut cfg = Config::defaults("test".to_string());
+        cfg.transport_latency_enabled = true;
+        cfg.transport_probe_urls.clear();
+        assert!(cfg.validate().is_err());
+
+        cfg.transport_probe_urls = vec!["https://example.com/204".to_string()];
+        cfg.quality_search_max_steps = 0;
+        assert!(cfg.validate().is_err());
+
+        cfg.quality_search_max_steps = 3;
+        cfg.throughput_guard_retention_percent = 49.0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
     fn parses_live_cake_linklayer_overhead() {
         let noatm = "qdisc cake 8001: root refcnt 2 bandwidth 10Mbit diffserv3 noatm overhead 44";
         let atm = "qdisc cake 8002: root refcnt 2 bandwidth 2Mbit besteffort atm overhead 18";
@@ -4387,8 +5106,18 @@ mod tests {
         assert!(cfg.validate().is_err());
 
         assert_eq!(
-            graph_history_line(123.4, Some(1.23456), Some(2.34), 1000.04, 50.54),
-            "123,1.235,2.3,1000.0,50.5\n"
+            graph_history_line(
+                123.4,
+                Some(1.23456),
+                Some(2.34),
+                1000.04,
+                50.54,
+                Some(10.1234),
+                Some(11.9876),
+                Some(600.0),
+                Some(30.0),
+            ),
+            "123,1.235,2.3,1000.0,50.5,10.123,11.988,600.0,30.0\n"
         );
 
         let data = "1,1,1\n2,2,2\n3,3,3\n";

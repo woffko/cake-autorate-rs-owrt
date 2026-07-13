@@ -37,12 +37,16 @@ const proposal = {
 		base_kbps: 35500,
 		maximum_kbps: 141800,
 		absolute_cap_kbps: 204200,
+		observed_low_kbps: 41700,
+		observed_median_kbps: 95000,
 	},
 	upload: {
 		minimum_kbps: 6500,
 		base_kbps: 14300,
 		maximum_kbps: 17200,
 		absolute_cap_kbps: 19000,
+		observed_low_kbps: 16200,
+		observed_median_kbps: 16800,
 	},
 	active_threshold_kbps: 1600,
 	thresholds_ms: { adjust_up: 6, delay: 15, adjust_down: 40 },
@@ -95,6 +99,12 @@ assert.equal(written.adaptive_ceiling_enabled, '1');
 assert.equal(written.adaptive_ceiling_dl_cap_kbps, '204200');
 assert.equal(written.adaptive_ceiling_ul_cap_kbps, '19000');
 assert.equal(written.adaptive_ceiling_cooldown_s, '45');
+assert.equal(written.transport_latency_enabled, '1');
+assert.equal(written.throughput_guard_enabled, '1');
+assert.equal(written.throughput_reference_dl_p20_kbps, '41700');
+assert.equal(written.throughput_reference_dl_p50_kbps, '95000');
+assert.equal(written.throughput_reference_ul_p20_kbps, '16200');
+assert.equal(written.throughput_reference_ul_p50_kbps, '16800');
 assert.equal(written.sqm_linklayer, 'none');
 assert.equal(written.sqm_overhead, '0');
 assert.equal(written.sqm_tcMPU, '0');

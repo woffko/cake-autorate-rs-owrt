@@ -1,0 +1,310 @@
+#!/bin/sh
+
+state_root="${CAKE_AUTOTUNE_SCHEDULER_STATE_ROOT:-/var/run/cake-autorate-autotune-scheduler}"
+helper="${CAKE_AUTOTUNE_HELPER:-/usr/libexec/cake-autorate-rs/autotune}"
+service="${CAKE_AUTOTUNE_SERVICE:-/etc/init.d/cake-autorate}"
+sleep_s=60
+
+mkdir -p "$state_root"
+
+json_escape() {
+	printf '%s' "$1" | tr '\n\r\t' '   ' | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+write_state() {
+	section="$1"
+	state="$2"
+	message="$3"
+	tmp="$state_root/$section.json.$$"
+	printf '{"state":"%s","message":"%s","updated_at":%s}\n' \
+		"$(json_escape "$state")" "$(json_escape "$message")" "$(date +%s)" > "$tmp" &&
+		mv "$tmp" "$state_root/$section.json"
+}
+
+get_uint() {
+	value="$(uci -q get "cake-autorate.$1.$2" 2>/dev/null)"
+	case "$value" in ''|*[!0-9]*) value="$3" ;; esac
+	printf '%s' "$value"
+}
+
+within_window() {
+	start="$1"
+	end="$2"
+	hour="$(date +%H)"
+	hour="${hour#0}"
+	[ -n "$hour" ] || hour=0
+	if [ "$start" -eq "$end" ]; then
+		return 0
+	elif [ "$start" -lt "$end" ]; then
+		[ "$hour" -ge "$start" ] && [ "$hour" -lt "$end" ]
+	else
+		[ "$hour" -ge "$start" ] || [ "$hour" -lt "$end" ]
+	fi
+}
+
+interface_bytes() {
+	interface="$1"
+	rx="$(sed -n '1p' "/sys/class/net/$interface/statistics/rx_bytes" 2>/dev/null)"
+	tx="$(sed -n '1p' "/sys/class/net/$interface/statistics/tx_bytes" 2>/dev/null)"
+	case "$rx:$tx" in *[!0-9:]*) return 1 ;; esac
+	printf '%s' "$((rx + tx))"
+}
+
+resolve_interface() {
+	name="$1"
+	if [ -e "/sys/class/net/$name" ]; then
+		printf '%s' "$name"
+		return 0
+	fi
+	status="$(ubus call "network.interface.$name" status 2>/dev/null)"
+	device="$(printf '%s' "$status" | jsonfilter -e '@.l3_device' 2>/dev/null)"
+	[ -n "$device" ] || device="$(printf '%s' "$status" | jsonfilter -e '@.device' 2>/dev/null)"
+	[ -e "/sys/class/net/$device" ] || return 1
+	printf '%s' "$device"
+}
+
+idle_ready() {
+	section="$1"
+	interface="$2"
+	now="$3"
+	bytes="$4"
+	window="$(get_uint "$section" scheduled_autotune_idle_window_s 60)"
+	threshold="$(get_uint "$section" connection_active_thr_kbps 2000)"
+	sample="$state_root/$section.idle"
+	if [ ! -s "$sample" ]; then
+		printf '%s %s\n' "$now" "$bytes" > "$sample"
+		return 1
+	fi
+	read -r previous_at previous_bytes < "$sample"
+	case "$previous_at:$previous_bytes" in *[!0-9:]*) previous_at=0; previous_bytes="$bytes" ;; esac
+	elapsed="$((now - previous_at))"
+	[ "$elapsed" -ge "$window" ] || return 1
+	printf '%s %s\n' "$now" "$bytes" > "$sample"
+	[ "$bytes" -ge "$previous_bytes" ] || return 1
+	rate_kbps="$(((bytes - previous_bytes) * 8 / elapsed / 1000))"
+	[ "$rate_kbps" -le "$threshold" ]
+}
+
+budget_ready() {
+	section="$1"
+	limit_mb="$(get_uint "$section" scheduled_autotune_max_traffic_mb_day 4096)"
+	day="$(date +%Y%m%d)"
+	file="$state_root/$section.budget"
+	used=0
+	if [ -s "$file" ]; then
+		read -r saved_day used < "$file"
+		[ "$saved_day" = "$day" ] || used=0
+	fi
+	case "$used" in ''|*[!0-9]*) used=0 ;; esac
+	[ "$used" -lt "$((limit_mb * 1024 * 1024))" ]
+}
+
+record_budget() {
+	section="$1"
+	consumed="$2"
+	day="$(date +%Y%m%d)"
+	file="$state_root/$section.budget"
+	used=0
+	if [ -s "$file" ]; then
+		read -r saved_day used < "$file"
+		[ "$saved_day" = "$day" ] || used=0
+	fi
+	case "$used:$consumed" in *[!0-9:]*) return ;; esac
+	printf '%s %s\n' "$day" "$((used + consumed))" > "$file"
+}
+
+extract() {
+	jsonfilter -s "$1" -e "$2" 2>/dev/null
+}
+
+apply_result() {
+	section="$1"
+	result="$2"
+	# Never mix scheduler-owned deltas with an administrator's uncommitted edit.
+	[ -z "$(uci -q changes cake-autorate 2>/dev/null)" ] || return 1
+	rollback_apply() {
+		uci -q revert "cake-autorate.$section" >/dev/null 2>&1 || true
+		"$service" restart >/dev/null 2>&1 || true
+	}
+	dl_min="$(extract "$result" '@.proposal.download.minimum_kbps')"
+	dl_base="$(extract "$result" '@.proposal.download.base_kbps')"
+	dl_max="$(extract "$result" '@.proposal.download.maximum_kbps')"
+	dl_cap="$(extract "$result" '@.proposal.download.absolute_cap_kbps')"
+	dl_low="$(extract "$result" '@.proposal.download.observed_low_kbps')"
+	dl_median="$(extract "$result" '@.proposal.download.observed_median_kbps')"
+	ul_min="$(extract "$result" '@.proposal.upload.minimum_kbps')"
+	ul_base="$(extract "$result" '@.proposal.upload.base_kbps')"
+	ul_max="$(extract "$result" '@.proposal.upload.maximum_kbps')"
+	ul_cap="$(extract "$result" '@.proposal.upload.absolute_cap_kbps')"
+	ul_low="$(extract "$result" '@.proposal.upload.observed_low_kbps')"
+	ul_median="$(extract "$result" '@.proposal.upload.observed_median_kbps')"
+	case "$dl_min:$dl_base:$dl_max:$dl_cap:$dl_low:$dl_median:$ul_min:$ul_base:$ul_max:$ul_cap:$ul_low:$ul_median" in
+		*[!0-9:]*) return 1 ;;
+	esac
+
+	uci -q batch <<-EOF || {
+		set cake-autorate.$section.min_dl_shaper_rate_kbps='$dl_min'
+		set cake-autorate.$section.base_dl_shaper_rate_kbps='$dl_base'
+		set cake-autorate.$section.max_dl_shaper_rate_kbps='$dl_max'
+		set cake-autorate.$section.min_ul_shaper_rate_kbps='$ul_min'
+		set cake-autorate.$section.base_ul_shaper_rate_kbps='$ul_base'
+		set cake-autorate.$section.max_ul_shaper_rate_kbps='$ul_max'
+		set cake-autorate.$section.sqm_download='$dl_base'
+		set cake-autorate.$section.sqm_upload='$ul_base'
+		set cake-autorate.$section.adaptive_ceiling_dl_cap_kbps='$dl_cap'
+		set cake-autorate.$section.adaptive_ceiling_ul_cap_kbps='$ul_cap'
+		set cake-autorate.$section.transport_latency_enabled='1'
+		set cake-autorate.$section.throughput_guard_enabled='1'
+		set cake-autorate.$section.throughput_reference_dl_p20_kbps='$dl_low'
+		set cake-autorate.$section.throughput_reference_dl_p50_kbps='$dl_median'
+		set cake-autorate.$section.throughput_reference_ul_p20_kbps='$ul_low'
+		set cake-autorate.$section.throughput_reference_ul_p50_kbps='$ul_median'
+	EOF
+		rollback_apply
+		return 1
+	}
+
+	for pair in \
+		"connection_active_thr_kbps @.proposal.active_threshold_kbps" \
+		"dl_avg_owd_delta_max_adjust_up_thr_ms @.proposal.thresholds_ms.adjust_up" \
+		"ul_avg_owd_delta_max_adjust_up_thr_ms @.proposal.thresholds_ms.adjust_up" \
+		"dl_owd_delta_delay_thr_ms @.proposal.thresholds_ms.delay" \
+		"ul_owd_delta_delay_thr_ms @.proposal.thresholds_ms.delay" \
+		"dl_avg_owd_delta_max_adjust_down_thr_ms @.proposal.thresholds_ms.adjust_down" \
+		"ul_avg_owd_delta_max_adjust_down_thr_ms @.proposal.thresholds_ms.adjust_down" \
+		"adaptive_ceiling_hold_time_s @.proposal.adaptive_ceiling.hold_s" \
+		"adaptive_ceiling_growth_percent @.proposal.adaptive_ceiling.growth_percent" \
+		"adaptive_ceiling_probe_duration_s @.proposal.adaptive_ceiling.probe_s" \
+		"adaptive_ceiling_cooldown_s @.proposal.adaptive_ceiling.cooldown_s" \
+		"adaptive_ceiling_failed_bound_ttl_s @.proposal.adaptive_ceiling.failed_bound_ttl_s" \
+		"sqm_overhead @.proposal.link.overhead" \
+		"sqm_tcMPU @.proposal.link.mpu"
+	do
+		set -- $pair
+		value="$(extract "$result" "$2")"
+		case "$value" in
+			''|*[!0-9.]*) rollback_apply; return 1 ;;
+		esac
+		uci -q set "cake-autorate.$section.$1=$value" || {
+			rollback_apply
+			return 1
+		}
+	done
+
+	adaptive="$(extract "$result" '@.proposal.adaptive_ceiling.enabled')"
+	[ "$adaptive" = true ] && adaptive=1 || adaptive=0
+	link_layer="$(extract "$result" '@.proposal.link.layer')"
+	uci -q set "cake-autorate.$section.adaptive_ceiling_enabled=$adaptive" || {
+		rollback_apply
+		return 1
+	}
+	uci -q set "cake-autorate.$section.sqm_linklayer=$link_layer" || {
+		rollback_apply
+		return 1
+	}
+
+	# Validate the staged UCI delta by restarting before it is committed. If the
+	# candidate cannot run, revert it and return the previous instance to service.
+	"$service" restart >/dev/null 2>&1 || {
+		rollback_apply
+		return 1
+	}
+	uci commit cake-autorate || {
+		rollback_apply
+		return 1
+	}
+}
+
+run_section() {
+	section="$1"
+	interface="$2"
+	now="$3"
+	bytes_before="$4"
+	backend="$(uci -q get "cake-autorate.$section.speedtest_backend" 2>/dev/null)"
+	[ -n "$backend" ] || backend=auto
+	write_state "$section" running "Scheduled Full Auto-Tune is running"
+	"$helper" "$section" "$interface" start "$backend" >/dev/null 2>&1 || {
+		write_state "$section" failed "Unable to start scheduled Full Auto-Tune"
+		return
+	}
+
+	deadline="$((now + 1800))"
+	while [ "$(date +%s)" -lt "$deadline" ]; do
+		result="$("$helper" "$section" "$interface" status "$backend" 2>/dev/null)"
+		state="$(extract "$result" '@.state')"
+		case "$state" in
+			complete) break ;;
+			failed|cancelled|'')
+				write_state "$section" failed "Scheduled Full Auto-Tune failed; no configuration was written"
+				return
+				;;
+		esac
+		sleep 5
+	done
+	[ "$state" = complete ] || {
+		"$helper" "$section" "$interface" cancel "$backend" >/dev/null 2>&1 || true
+		write_state "$section" failed "Scheduled Full Auto-Tune timed out"
+		return
+	}
+
+	bytes_after="$(interface_bytes "$interface" 2>/dev/null || printf '%s' "$bytes_before")"
+	[ "$bytes_after" -ge "$bytes_before" ] 2>/dev/null &&
+		record_budget "$section" "$((bytes_after - bytes_before))"
+	printf '%s\n' "$(date +%s)" > "$state_root/$section.last"
+	if [ "$(uci -q get "cake-autorate.$section.scheduled_autotune_auto_apply" 2>/dev/null)" = 1 ]; then
+		if apply_result "$section" "$result"; then
+			write_state "$section" applied "Validated Full Auto-Tune proposal was applied"
+		else
+			uci -q revert "cake-autorate.$section" >/dev/null 2>&1 || true
+			write_state "$section" failed "Validated result could not be applied"
+		fi
+	else
+		write_state "$section" proposal_ready "Validated proposal is ready for manual review"
+	fi
+}
+
+check_section() {
+	section="$1"
+	[ "$(uci -q get "cake-autorate.$section.scheduled_autotune_enabled" 2>/dev/null)" = 1 ] || return
+	[ -z "$(uci -q changes cake-autorate 2>/dev/null)" ] || {
+		write_state "$section" deferred "Uncommitted CAKE Autorate settings are pending"
+		return
+	}
+	interval_h="$(get_uint "$section" scheduled_autotune_interval_hours 24)"
+	start_h="$(get_uint "$section" scheduled_autotune_window_start_hour 2)"
+	end_h="$(get_uint "$section" scheduled_autotune_window_end_hour 5)"
+	within_window "$start_h" "$end_h" || return
+	now="$(date +%s)"
+	last=0
+	[ -s "$state_root/$section.last" ] && last="$(sed -n '1p' "$state_root/$section.last")"
+	case "$last" in ''|*[!0-9]*) last=0 ;; esac
+	[ "$((now - last))" -ge "$((interval_h * 3600))" ] || return
+	budget_ready "$section" || {
+		write_state "$section" deferred "Daily traffic budget reached"
+		return
+	}
+	interface="$(uci -q get "cake-autorate.$section.wan_if" 2>/dev/null)"
+	[ -n "$interface" ] || interface="$(uci -q get "cake-autorate.$section.sqm_interface" 2>/dev/null)"
+	interface="$(resolve_interface "$interface")" || return
+	bytes="$(interface_bytes "$interface")" || return
+	idle_ready "$section" "$interface" "$now" "$bytes" || return
+	run_section "$section" "$interface" "$now" "$bytes"
+}
+
+run_loop() {
+	while true; do
+		sections="$(uci -q show cake-autorate 2>/dev/null | sed -n 's/^cake-autorate\.\([^.=]*\)=cake_autorate$/\1/p')"
+		for section in $sections; do
+			check_section "$section"
+		done
+		sleep "$sleep_s"
+	done
+}
+
+[ "${CAKE_AUTOTUNE_SCHEDULER_SOURCE_ONLY:-0}" = 1 ] && return 0 2>/dev/null
+
+case "${1:-run}" in
+	run) run_loop ;;
+	check) check_section "$2" ;;
+	*) printf 'usage: %s [run|check INSTANCE]\n' "$0" >&2; exit 2 ;;
+esac

@@ -17,6 +17,17 @@ Changes should be checked at four layers:
    redirection, daemon state, reflector responses, and connectivity before and
    after load.
 
+Transport-aware acceptance additionally verifies that clean ICMP cannot approve
+growth while loaded HTTP/TCP delay is above target, no search candidate crosses
+the calculated floor, `quality_limited` appears when the safe floor prevents the
+target, old five-column graph history remains readable, and all new history
+stays in `/var/run`.
+
+The first rollout gate is the disposable x86_64 router using its primary
+single-WAN path only. Multi-WAN routing, failover, and per-uplink transport
+baselines are explicitly deferred to a separate test plan; they must not be
+inferred from this gate.
+
 Release offline bundles must be installed with networking disabled into an
 empty APK root. Published assets must then be downloaded again and validated
 against the published `SHA256SUMS`.

@@ -34,12 +34,16 @@ function assert(condition, message) {
 
 const now = Math.floor(Date.now() / 1000);
 const points = helpers.parseHistory([
-	`${now - 2},10.125,1.5,1000.0,500.0`,
+	`${now - 2},10.125,1.5,1000.0,500.0,20.5,22.0,600.0,300.0`,
 	`${now - 1},,2.5,2000.0,750.0`,
 	`${now},12.500,3.5,3000.0,1000.0`,
 ].join('\n'));
 assert(points.length === 3, 'five-column history parsing failed');
 assert(points[1].rtt === null && points[1].dl === 2000, 'nullable RTT/rate parsing failed');
+assert(points[0].transport === 20.5 && points[0].effective === 22.0,
+	'nine-column transport latency parsing failed');
+assert(points[0].dlFloor === 600 && points[0].ulFloor === 300,
+	'nine-column throughput floor parsing failed');
 
 const legacy = helpers.parseHistory(`${now},9.5,4.0`);
 assert(legacy.length === 1 && legacy[0].dl === null && legacy[0].ul === null,
@@ -81,7 +85,7 @@ const canvas = eventTarget({
 });
 helpers.bindHover(canvas, geometry, hoverInfo);
 canvas.emit('mousemove', { clientX: geometry.width - geometry.right });
-for (const label of ['RTT', 'CPU', 'DL', 'UL'])
+for (const label of ['RTT', 'transport', 'effective', 'CPU', 'DL', 'UL', 'floors'])
 	assert(hoverInfo.textContent.includes(label), `hover output is missing ${label}`);
 assert(hoverInfo.style.visibility === 'visible', 'hover output should be visible');
 canvas.emit('mouseleave');

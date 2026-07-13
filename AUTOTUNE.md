@@ -6,6 +6,11 @@ measures the selected link, calculates a complete balanced proposal, displays
 the evidence and parameters, and writes UCI only after the user confirms the
 Review step.
 
+Full Auto-Tune also seeds transport-aware runtime control: observed-low and
+median throughput become P20/P50 capacity references, the 80% throughput guard
+is enabled, and HTTP/TCP latency monitoring is enabled for the created
+instance.
+
 ## Safety contract
 
 - The job state and raw measurements live under
@@ -179,3 +184,14 @@ test uses isolated mock helpers to verify progress/result output, shaped score,
 RAM-only state, process-group cancellation, and both speed-test and temporary
 shaper cleanup traps. Real-router
 acceptance must cover x86_64 and rockchip/armv8 before a release.
+
+## Optional scheduler
+
+`cake-autorate-autotune` is a lightweight procd service. Per-instance
+`scheduled_autotune_*` options select interval, local hour window, required
+quiet time, RAM-only daily traffic budget, and whether a validated result is
+automatically applied. The feature defaults off, and auto-apply defaults off.
+The scheduler reuses the exact preflight, two raw samples, shaped validation,
+single correction, cleanup, and fail-closed result described above. See
+[TRANSPORT_QUALITY.md](TRANSPORT_QUALITY.md) for the runtime safeguards and
+routing limitation.

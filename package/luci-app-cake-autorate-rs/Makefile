@@ -4,7 +4,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-cake-autorate-rs
 PKG_VERSION:=1.0_rc1
-PKG_RELEASE:=12
+PKG_RELEASE:=13
 
 PKG_MAINTAINER:=woffko
 PKG_LICENSE:=Apache-2.0
@@ -32,6 +32,8 @@ define Package/luci-app-cake-autorate-rs/postinst
 	rm -f /tmp/luci-indexcache.*; \
 	rm -rf /tmp/luci-modulecache/; \
 	/etc/init.d/rpcd reload 2>/dev/null; \
+	/etc/init.d/cake-autorate-autotune enable >/dev/null 2>&1 || true; \
+	/etc/init.d/cake-autorate-autotune start >/dev/null 2>&1 || true; \
 	exit 0; \
 }
 endef

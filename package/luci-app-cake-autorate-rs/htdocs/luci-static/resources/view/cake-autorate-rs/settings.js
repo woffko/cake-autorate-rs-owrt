@@ -57,6 +57,30 @@ var optionDescriptions = {
 	adaptive_ceiling_probe_duration_s: 'Time a candidate ceiling must carry clean high load before it is accepted as the new learned-safe ceiling.',
 	adaptive_ceiling_cooldown_s: 'Recovery pause after a successful or failed probe before qualification may start again.',
 	adaptive_ceiling_failed_bound_ttl_s: 'How long a failed upper ceiling remains remembered. It prevents repeatedly testing a known-bad value, but expires so the link can be relearned after conditions change.',
+	transport_latency_enabled: 'Add small asynchronous HTTP/TCP probes to ICMP. This detects loaded latency even when a provider prioritizes ICMP; no samples are written to flash.',
+	transport_probe_url: 'Small HTTP(S) endpoints used in rotation. Each endpoint learns its own idle baseline.',
+	transport_probe_idle_interval_s: 'Seconds between baseline probes while traffic is below the high-load threshold.',
+	transport_probe_loaded_interval_s: 'Seconds between probes while download or upload is highly loaded.',
+	transport_probe_timeout_s: 'Maximum seconds allowed for one asynchronous transport probe.',
+	quality_target_delay_ms: 'Target loaded transport-delay increase. The default 30 ms corresponds to an estimated A-like target.',
+	quality_search_max_steps: 'Maximum bounded rate reductions in one search before cooldown and rollback to the best useful candidate.',
+	quality_search_observe_s: 'Observation time after each candidate rate change.',
+	quality_search_cooldown_s: 'Pause after the target cannot be reached safely or a candidate does not improve latency.',
+	throughput_guard_enabled: 'Never let transport-driven search reduce a direction below its robust throughput floor.',
+	throughput_guard_retention_percent: 'Percentage of the robust capacity reference retained as the safety floor.',
+	throughput_guard_dl_floor_kbps: 'Optional absolute download floor. Zero uses the calculated floor.',
+	throughput_guard_ul_floor_kbps: 'Optional absolute upload floor. Zero uses the calculated floor.',
+	throughput_reference_dl_p20_kbps: 'Optional download 20th-percentile capacity from Full Auto-Tune.',
+	throughput_reference_dl_p50_kbps: 'Optional download median capacity from Full Auto-Tune.',
+	throughput_reference_ul_p20_kbps: 'Optional upload 20th-percentile capacity from Full Auto-Tune.',
+	throughput_reference_ul_p50_kbps: 'Optional upload median capacity from Full Auto-Tune.',
+	scheduled_autotune_enabled: 'Periodically run the validated Full Auto-Tune workflow only inside the configured quiet window. Disabled by default.',
+	scheduled_autotune_interval_hours: 'Minimum hours between successful scheduled calibrations.',
+	scheduled_autotune_idle_window_s: 'Traffic must remain below the active threshold for this long before a scheduled test may start.',
+	scheduled_autotune_window_start_hour: 'Local hour when the permitted maintenance window begins (0-23).',
+	scheduled_autotune_window_end_hour: 'Local hour when the permitted maintenance window ends (0-23). Equal start and end permits the whole day.',
+	scheduled_autotune_max_traffic_mb_day: 'Maximum interface traffic attributed to scheduled calibration per local day. Accounting lives only in RAM.',
+	scheduled_autotune_auto_apply: 'Automatically commit and restart with a proposal only after shaped validation passes. Leave off to keep a review-only proposal.',
 	dl_if: 'Interface whose RX byte counter represents shaped download traffic, usually the IFB created by SQM.',
 	ul_if: 'Interface whose TX byte counter represents upload traffic, usually the WAN device.',
 	manage_sqm: 'Mirror this instance into /etc/config/sqm and restart SQM before autorate starts.',
@@ -1652,6 +1676,13 @@ function writeWizardConfig(section_id, state) {
 		uci.set('cake-autorate', section_id, 'adaptive_ceiling_probe_duration_s', String(adaptive.probe_s));
 		uci.set('cake-autorate', section_id, 'adaptive_ceiling_cooldown_s', String(adaptive.cooldown_s));
 		uci.set('cake-autorate', section_id, 'adaptive_ceiling_failed_bound_ttl_s', String(adaptive.failed_bound_ttl_s));
+		uci.set('cake-autorate', section_id, 'transport_latency_enabled', '1');
+		uci.set('cake-autorate', section_id, 'throughput_guard_enabled', '1');
+		uci.set('cake-autorate', section_id, 'throughput_guard_retention_percent', '80');
+		uci.set('cake-autorate', section_id, 'throughput_reference_dl_p20_kbps', String(dlProposal.observed_low_kbps));
+		uci.set('cake-autorate', section_id, 'throughput_reference_dl_p50_kbps', String(dlProposal.observed_median_kbps));
+		uci.set('cake-autorate', section_id, 'throughput_reference_ul_p20_kbps', String(ulProposal.observed_low_kbps));
+		uci.set('cake-autorate', section_id, 'throughput_reference_ul_p50_kbps', String(ulProposal.observed_median_kbps));
 	}
 
 	for (var i = 0; i < sqmImportOptionMap.length; i++) {
@@ -2506,6 +2537,74 @@ function addRateOptions(section) {
 
 	o = value(section, 'rates', 'adaptive_ceiling_failed_bound_ttl_s', _('Failed-bound memory'), 'and(ufloat,min(1))', '900.0');
 	o.depends('adaptive_ceiling_enabled', '1');
+}
+
+function addQualityOptions(section) {
+	var o;
+
+	o = flag(section, 'quality', 'transport_latency_enabled', _('Transport-aware latency'), '0');
+
+	o = section.taboption('quality', form.DynamicList, 'transport_probe_url', _('HTTP/TCP endpoints'));
+	modal(o);
+	describe(o, 'transport_probe_url');
+	o.depends('transport_latency_enabled', '1');
+	o.rmempty = false;
+	o.default = [
+		'https://speed.cloudflare.com/__down?bytes=0',
+		'https://www.google.com/generate_204',
+		'https://connectivitycheck.gstatic.com/generate_204'
+	];
+	o.validate = function(section_id, value) {
+		if (!value || !/^https?:\/\/\S+$/.test(String(value)))
+			return _('Enter an HTTP or HTTPS URL without spaces.');
+		return true;
+	};
+
+	o = value(section, 'quality', 'transport_probe_idle_interval_s', _('Idle probe interval'), 'and(ufloat,min(5),max(3600))', '15.0');
+	o.depends('transport_latency_enabled', '1');
+	o = value(section, 'quality', 'transport_probe_loaded_interval_s', _('Loaded probe interval'), 'and(ufloat,min(0.5),max(60))', '1.0');
+	o.depends('transport_latency_enabled', '1');
+	o = value(section, 'quality', 'transport_probe_timeout_s', _('Probe timeout'), 'and(uinteger,min(1),max(30))', '5');
+	o.depends('transport_latency_enabled', '1');
+	o = value(section, 'quality', 'quality_target_delay_ms', _('Target loaded delay'), 'and(ufloat,min(5),max(200))', '30.0');
+	o.depends('transport_latency_enabled', '1');
+	o = value(section, 'quality', 'quality_search_max_steps', _('Maximum search steps'), 'and(uinteger,min(1),max(10))', '3');
+	o.depends('transport_latency_enabled', '1');
+	o = value(section, 'quality', 'quality_search_observe_s', _('Candidate observation'), 'and(ufloat,min(2),max(120))', '6.0');
+	o.depends('transport_latency_enabled', '1');
+	o = value(section, 'quality', 'quality_search_cooldown_s', _('Limited cooldown'), 'and(ufloat,min(30),max(86400))', '900.0');
+	o.depends('transport_latency_enabled', '1');
+
+	o = flag(section, 'quality', 'throughput_guard_enabled', _('Protect throughput floor'), '1');
+	o.depends('transport_latency_enabled', '1');
+	o = value(section, 'quality', 'throughput_guard_retention_percent', _('Capacity retained'), 'and(ufloat,min(50),max(100))', '80.0');
+	o.depends({ transport_latency_enabled: '1', throughput_guard_enabled: '1' });
+	o = value(section, 'quality', 'throughput_guard_dl_floor_kbps', _('Absolute DL floor'), 'uinteger', '0');
+	o.depends({ transport_latency_enabled: '1', throughput_guard_enabled: '1' });
+	o = value(section, 'quality', 'throughput_guard_ul_floor_kbps', _('Absolute UL floor'), 'uinteger', '0');
+	o.depends({ transport_latency_enabled: '1', throughput_guard_enabled: '1' });
+	o = value(section, 'quality', 'throughput_reference_dl_p20_kbps', _('DL capacity P20'), 'uinteger', '0');
+	o.depends({ transport_latency_enabled: '1', throughput_guard_enabled: '1' });
+	o = value(section, 'quality', 'throughput_reference_dl_p50_kbps', _('DL capacity P50'), 'uinteger', '0');
+	o.depends({ transport_latency_enabled: '1', throughput_guard_enabled: '1' });
+	o = value(section, 'quality', 'throughput_reference_ul_p20_kbps', _('UL capacity P20'), 'uinteger', '0');
+	o.depends({ transport_latency_enabled: '1', throughput_guard_enabled: '1' });
+	o = value(section, 'quality', 'throughput_reference_ul_p50_kbps', _('UL capacity P50'), 'uinteger', '0');
+	o.depends({ transport_latency_enabled: '1', throughput_guard_enabled: '1' });
+
+	o = flag(section, 'quality', 'scheduled_autotune_enabled', _('Scheduled Full Auto-Tune'), '0');
+	o = value(section, 'quality', 'scheduled_autotune_interval_hours', _('Retune interval'), 'and(uinteger,min(1),max(8760))', '24');
+	o.depends('scheduled_autotune_enabled', '1');
+	o = value(section, 'quality', 'scheduled_autotune_idle_window_s', _('Required quiet time'), 'and(uinteger,min(30),max(3600))', '60');
+	o.depends('scheduled_autotune_enabled', '1');
+	o = value(section, 'quality', 'scheduled_autotune_window_start_hour', _('Window starts'), 'and(uinteger,min(0),max(23))', '2');
+	o.depends('scheduled_autotune_enabled', '1');
+	o = value(section, 'quality', 'scheduled_autotune_window_end_hour', _('Window ends'), 'and(uinteger,min(0),max(23))', '5');
+	o.depends('scheduled_autotune_enabled', '1');
+	o = value(section, 'quality', 'scheduled_autotune_max_traffic_mb_day', _('Daily traffic budget'), 'and(uinteger,min(100),max(1048576))', '4096');
+	o.depends('scheduled_autotune_enabled', '1');
+	o = flag(section, 'quality', 'scheduled_autotune_auto_apply', _('Apply validated proposal automatically'), '0');
+	o.depends('scheduled_autotune_enabled', '1');
 }
 
 function addSpeedtestOptions(section) {
@@ -3428,6 +3527,7 @@ return L.view.extend({
 		s.tab('sqm_qdisc', _('SQM Queue'));
 		s.tab('sqm_linklayer', _('SQM Link Layer'));
 		s.tab('rates', _('Rates'));
+		s.tab('quality', _('Quality'));
 		s.tab('speedtest', _('Speed Test'));
 		s.tab('reflectors', _('Reflectors'));
 		s.tab('latency', _('Latency'));
@@ -3442,6 +3542,7 @@ return L.view.extend({
 		addInterfaceOptions(s);
 		addSqmOptions(s, qdiscs, scripts);
 		addRateOptions(s);
+		addQualityOptions(s);
 		addSpeedtestOptions(s);
 		addReflectorOptions(s);
 		addLatencyOptions(s);

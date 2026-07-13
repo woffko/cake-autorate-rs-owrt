@@ -12,6 +12,18 @@ independent layers for download and upload:
 The second layer is a Rust extension. With `adaptive_ceiling_enabled=0`, the
 configured maximum remains a hard limit, matching upstream behavior.
 
+An additional optional transport-aware safety layer is documented in
+[TRANSPORT_QUALITY.md](TRANSPORT_QUALITY.md). Its effective delay is the maximum
+of directional ICMP/OWD growth and confirmed HTTP/TCP growth. Missing transport
+evidence blocks growth but never fabricates bufferbloat or cuts the rate. A
+confirmed high transport delta uses a bounded square-root correction and may
+not cross the robust throughput floor:
+
+```text
+factor    = clamp(sqrt(target_delay / measured_delay), 0.70, 0.97)
+candidate = max(throughput_floor, current_rate * factor)
+```
+
 ## Notation
 
 For one direction, let:

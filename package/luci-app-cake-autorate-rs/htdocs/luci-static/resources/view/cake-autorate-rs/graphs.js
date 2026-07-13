@@ -27,7 +27,7 @@ function parseHistory(data) {
 	var points = [];
 
 	String(data || '').split(/\n/).forEach(function(line) {
-		var fields, timestamp, rtt, cpu, dl, ul;
+		var fields, timestamp, rtt, cpu, dl, ul, transport, effective, dlFloor, ulFloor;
 
 		if (!line)
 			return;
@@ -41,6 +41,10 @@ function parseHistory(data) {
 		cpu = fields[2] === '' ? null : Number(fields[2]);
 		dl = fields.length < 4 || fields[3] === '' ? null : Number(fields[3]);
 		ul = fields.length < 5 || fields[4] === '' ? null : Number(fields[4]);
+		transport = fields.length < 6 || fields[5] === '' ? null : Number(fields[5]);
+		effective = fields.length < 7 || fields[6] === '' ? null : Number(fields[6]);
+		dlFloor = fields.length < 8 || fields[7] === '' ? null : Number(fields[7]);
+		ulFloor = fields.length < 9 || fields[8] === '' ? null : Number(fields[8]);
 		if (!isFinite(timestamp) || timestamp <= 0)
 			return;
 
@@ -49,7 +53,11 @@ function parseHistory(data) {
 			rtt: rtt == null || !isFinite(rtt) ? null : rtt,
 			cpu: cpu == null || !isFinite(cpu) ? null : cpu,
 			dl: dl == null || !isFinite(dl) ? null : dl,
-			ul: ul == null || !isFinite(ul) ? null : ul
+			ul: ul == null || !isFinite(ul) ? null : ul,
+			transport: transport == null || !isFinite(transport) ? null : transport,
+			effective: effective == null || !isFinite(effective) ? null : effective,
+			dlFloor: dlFloor == null || !isFinite(dlFloor) ? null : dlFloor,
+			ulFloor: ulFloor == null || !isFinite(ulFloor) ? null : ulFloor
 		});
 	});
 
@@ -285,6 +293,10 @@ function drawLatencyChart(canvas, geometry) {
 	geometry.points.forEach(function(point) {
 		if (point.rtt != null && isFinite(point.rtt))
 			rttMax = Math.max(rttMax, point.rtt);
+		if (point.transport != null && isFinite(point.transport))
+			rttMax = Math.max(rttMax, point.transport);
+		if (point.effective != null && isFinite(point.effective))
+			rttMax = Math.max(rttMax, point.effective);
 	});
 	rttMax = Math.ceil(rttMax / 10) * 10;
 	drawChartGrid(ctx, geometry);
@@ -315,6 +327,12 @@ function drawLatencyChart(canvas, geometry) {
 	drawLine(ctx, geometry.points, 'rtt', function(timestamp) {
 		return chartX(geometry, timestamp);
 	}, rttY, '#22a06b');
+	drawLine(ctx, geometry.points, 'transport', function(timestamp) {
+		return chartX(geometry, timestamp);
+	}, rttY, '#d35400');
+	drawLine(ctx, geometry.points, 'effective', function(timestamp) {
+		return chartX(geometry, timestamp);
+	}, rttY, '#c0398f');
 	drawLine(ctx, geometry.points, 'cpu', function(timestamp) {
 		return chartX(geometry, timestamp);
 	}, cpuY, '#6c5ce7');
@@ -346,6 +364,10 @@ function drawTrafficChart(canvas, geometry) {
 			rateMax = Math.max(rateMax, point.dl);
 		if (point.ul != null && isFinite(point.ul))
 			rateMax = Math.max(rateMax, point.ul);
+		if (point.dlFloor != null && isFinite(point.dlFloor))
+			rateMax = Math.max(rateMax, point.dlFloor);
+		if (point.ulFloor != null && isFinite(point.ulFloor))
+			rateMax = Math.max(rateMax, point.ulFloor);
 	});
 	rateMax = niceRateCeiling(rateMax);
 	drawChartGrid(ctx, geometry);
@@ -370,6 +392,12 @@ function drawTrafficChart(canvas, geometry) {
 	drawLine(ctx, geometry.points, 'ul', function(timestamp) {
 		return chartX(geometry, timestamp);
 	}, rateY, '#e67e22');
+	drawLine(ctx, geometry.points, 'dlFloor', function(timestamp) {
+		return chartX(geometry, timestamp);
+	}, rateY, '#74a9cf');
+	drawLine(ctx, geometry.points, 'ulFloor', function(timestamp) {
+		return chartX(geometry, timestamp);
+	}, rateY, '#f6b26b');
 }
 
 function nearestPoint(points, timestamp) {
@@ -408,12 +436,16 @@ function bindHover(canvas, geometry, hoverInfo) {
 			(geometry.lastTimestamp - geometry.firstTimestamp) * ratio;
 		var point = nearestPoint(geometry.points, timestamp);
 
-		hoverInfo.textContent = '%s · RTT %s · CPU %s · DL %s · UL %s'.format(
+		hoverInfo.textContent = '%s · RTT %s · transport Δ %s · effective Δ %s · CPU %s · DL %s · UL %s · floors %s/%s'.format(
 			new Date(point.timestamp * 1000).toLocaleString(),
 			formatMetric(point.rtt, ' ms', 3),
+			formatMetric(point.transport, ' ms', 3),
+			formatMetric(point.effective, ' ms', 3),
 			formatMetric(point.cpu, '%', 1),
 			formatTrafficRate(point.dl),
-			formatTrafficRate(point.ul));
+			formatTrafficRate(point.ul),
+			formatTrafficRate(point.dlFloor),
+			formatTrafficRate(point.ulFloor));
 		hoverInfo.style.visibility = 'visible';
 	});
 
@@ -522,6 +554,10 @@ function renderCard(instance) {
 			E('div', { 'class': 'cake-graph-legend' }, [
 				E('span', { 'class': 'cake-graph-rtt' },
 					_('RTT: %s').format(formatMetric(status.rtt_ms, ' ms', 2))),
+				E('span', { 'class': 'cake-graph-transport' },
+					_('Transport Δ: %s').format(formatMetric(status.transport_delta_ms, ' ms', 2))),
+				E('span', { 'class': 'cake-graph-effective' },
+					_('Effective Δ: %s').format(formatMetric(status.effective_latency_delta_ms, ' ms', 2))),
 				E('span', { 'class': 'cake-graph-cpu' },
 					_('CPU: %s').format(formatMetric(status.cpu_total_percent, '%', 1))),
 				E('span', { 'class': 'cake-graph-dl' },
@@ -600,7 +636,7 @@ return L.view.extend({
 				'.cake-graph-interval-label{display:flex;flex-direction:column;gap:3px;font-size:12px}',
 				'.cake-graph-interval{min-width:120px}',
 				'.cake-graph-legend{display:flex;align-items:center;gap:18px;margin-bottom:5px;font-weight:600;flex-wrap:wrap}',
-				'.cake-graph-rtt{color:#22a06b}.cake-graph-cpu{color:#6c5ce7}.cake-graph-dl{color:#2980b9}.cake-graph-ul{color:#e67e22}.cake-graph-samples{color:#777;font-weight:400}',
+				'.cake-graph-rtt{color:#22a06b}.cake-graph-transport{color:#d35400}.cake-graph-effective{color:#c0398f}.cake-graph-cpu{color:#6c5ce7}.cake-graph-dl{color:#2980b9}.cake-graph-ul{color:#e67e22}.cake-graph-samples{color:#777;font-weight:400}',
 				'.cake-graph-latest{margin-left:auto}',
 				'.cake-graph-hover{min-height:1.5em;margin:3px 0 6px;padding:4px 7px;border-radius:4px;background:rgba(127,127,127,.12);font-variant-numeric:tabular-nums}',
 				'.cake-graph-scroll{display:block;width:100%;overflow-x:auto;overflow-y:hidden;scrollbar-gutter:stable}',
@@ -612,7 +648,7 @@ return L.view.extend({
 			].join('')),
 			E('div', { 'class': 'alert-message warning cake-graphs-warning' }, [
 				E('strong', {}, _('Optional RAM history. ')),
-				_('Enabling graphs stores RTT, CPU, download, and upload samples only in /var/run (RAM), never in flash. Each active instance can use up to %d KiB. Choose a per-instance interval from 1 second to 1 minute; shorter intervals fill the limit sooner. Oldest samples are discarded automatically. Both charts share one horizontal timeline and follow the newest data until you scroll back. Hover over either chart for exact values. Data is cleared when the service stops or the router reboots.')
+				_('Enabling graphs stores RTT, transport/effective latency, CPU, download/upload, and safety-floor samples only in /var/run (RAM), never in flash. Each active instance can use up to %d KiB. Choose a per-instance interval from 1 second to 1 minute; shorter intervals fill the limit sooner. Oldest samples are discarded automatically. Both charts share one horizontal timeline and follow the newest data until you scroll back. Hover over either chart for exact values. Data is cleared when the service stops or the router reboots.')
 					.format(HISTORY_MAX_KIB)
 			]),
 			content

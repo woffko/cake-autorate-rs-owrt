@@ -27,6 +27,42 @@ config cake_autorate 'primary'
 	option adaptive_ceiling_cooldown_s '30.0'
 	option adaptive_ceiling_failed_bound_ttl_s '900.0'
 
+	# Optional transport-aware latency. HTTP/TCP samples complement ICMP so a
+	# provider that prioritizes ICMP cannot hide loaded latency. Disabled by
+	# default; probes and graph history are RAM/runtime-only and never hit flash.
+	option transport_latency_enabled '0'
+	list transport_probe_url 'https://speed.cloudflare.com/__down?bytes=0'
+	list transport_probe_url 'https://www.google.com/generate_204'
+	list transport_probe_url 'https://connectivitycheck.gstatic.com/generate_204'
+	option transport_probe_idle_interval_s '15.0'
+	option transport_probe_loaded_interval_s '1.0'
+	option transport_probe_timeout_s '5'
+	option quality_target_delay_ms '30.0'
+	option quality_search_max_steps '3'
+	option quality_search_observe_s '6.0'
+	option quality_search_cooldown_s '900.0'
+
+	# Safe throughput floor for transport-driven quality search. With no measured
+	# history the default keeps 60% of base (0.75 reference * 80% retention).
+	option throughput_guard_enabled '1'
+	option throughput_guard_retention_percent '80.0'
+	option throughput_guard_dl_floor_kbps '0'
+	option throughput_guard_ul_floor_kbps '0'
+	option throughput_reference_dl_p20_kbps '0'
+	option throughput_reference_dl_p50_kbps '0'
+	option throughput_reference_ul_p20_kbps '0'
+	option throughput_reference_ul_p50_kbps '0'
+
+	# Optional periodic Full Auto-Tune. Disabled by default. State, daily byte
+	# accounting, and pending proposals live under /var/run only.
+	option scheduled_autotune_enabled '0'
+	option scheduled_autotune_interval_hours '24'
+	option scheduled_autotune_idle_window_s '60'
+	option scheduled_autotune_window_start_hour '2'
+	option scheduled_autotune_window_end_hour '5'
+	option scheduled_autotune_max_traffic_mb_day '4096'
+	option scheduled_autotune_auto_apply '0'
+
 	# SQM backend managed by this package. The LuCI package depends on
 	# sqm-scripts and the init script mirrors these values to /etc/config/sqm.
 	option manage_sqm '1'

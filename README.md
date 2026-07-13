@@ -31,23 +31,26 @@ does not claim authorship of the original cake-autorate concept.
 - [Full Auto-Tune](AUTOTUNE.md) documents the experimental calibration job,
   proposal formulas, safety contract, confidence score, and remaining shaped
   validation gate.
+- [Transport-aware quality control](TRANSPORT_QUALITY.md) documents HTTP/TCP
+  latency fusion, estimated grades, the throughput floor, bounded natural-load
+  search, and scheduled Full Auto-Tune.
 
 The current targets are OpenWrt 25.12.5 on `x86/64` and
 `rockchip/armv8` (`aarch64_generic`, including the Banana Pi R2 Pro). The daemon
 is intentionally kept small and currently uses only the Rust standard library
 plus OpenWrt userland tools.
 
-## 1.0 RC5 packages
+## Current package tree
 
 The current tree builds these OpenWrt 25.12.5 APKs:
 
-- `cake-autorate-rs-1.0_rc1-r11-x86_64.apk` — x86_64 autorate daemon.
-- `cake-autorate-rs-1.0_rc1-r11-aarch64_generic.apk` — rockchip/armv8
+- `cake-autorate-rs-1.0_rc1-r13-x86_64.apk` — x86_64 autorate daemon.
+- `cake-autorate-rs-1.0_rc1-r13-aarch64_generic.apk` — rockchip/armv8
   autorate daemon.
-- `luci-app-cake-autorate-rs-1.0_rc1-r11.apk` — architecture-independent LuCI
+- `luci-app-cake-autorate-rs-1.0_rc1-r13.apk` — architecture-independent LuCI
   interface and SQM integration.
 
-The daemon package installs `uci` and `fping` as dependencies. The LuCI package
+The daemon package installs `uci`, `fping`, and `uclient-fetch` as dependencies. The LuCI package
 installs the daemon, `luci-base`, and `sqm-scripts`; the latter brings the CAKE,
 IFB, `tc`, and `ip` runtime pieces. The wizard now labels a device with its
 logical OpenWrt networks, for example `eth1 — wan, wan6`, while continuing to
@@ -130,14 +133,20 @@ Implemented:
   Status exposes the phase, safe ceiling, failed bound, probe target, and last
   transition reason. See [ADAPTIVE_CEILING.md](ADAPTIVE_CEILING.md) for the
   state machine and acceptance tests.
+- Optional transport-aware HTTP/TCP latency, also disabled by default. It
+  complements ICMP, blocks unsafe upward growth when ordinary transport is
+  delayed, drives a bounded natural-traffic search above a protected throughput
+  floor, and exposes an explicitly estimated A+/A/B/C/D/F class plus
+  `quality_limited` reason. See [TRANSPORT_QUALITY.md](TRANSPORT_QUALITY.md).
 - `tc qdisc change ... cake bandwidth ...` shaper updates.
 - Upstream-style idle/stall handling: sustained idle can stop pingers, activity
   restarts them, and optional minimum-rate enforcement applies on sustained idle
   or global no-response timeout.
 - daemon log rotation by age/size with best-effort gzip compression.
 - JSON status file under `/var/run/cake-autorate/<instance>/status.json`.
-- Optional per-instance LuCI `Graphs` history for RTT, total CPU, download, and
-  upload traffic. It is disabled by default and enabled directly on each active
+- Optional per-instance LuCI `Graphs` history for RTT, transport/effective
+  latency, total CPU, download/upload traffic, and DL/UL safety floors. It is
+  disabled by default and enabled directly on each active
   instance card. A per-instance dropdown selects 1, 2, 5, 10, 15, 30, or 60
   second sampling. Both charts share a horizontally scrollable timeline,
   auto-follow new samples until the user scrolls back, and expose exact values
@@ -183,6 +192,9 @@ Implemented:
   route, telemetry, and score failures stop without a proposal. A borderline
   score receives one bounded base-rate correction and retest; a second failure
   stops. It remains experimental until both target-router gates are complete.
+- Optional scheduled Full Auto-Tune, disabled by default, adds a quiet-time
+  gate, maintenance window, interval, RAM-only daily byte budget, and explicit
+  review-only versus validated auto-apply mode.
 - LuCI instance editing keeps advanced speed test backend controls and
   pinger/reflector planning behind the advanced settings toggle. The automatic
   interface preset, speed-test headroom, and manual min/base/max escape hatches

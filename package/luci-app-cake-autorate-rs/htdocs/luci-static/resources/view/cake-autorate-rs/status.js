@@ -144,6 +144,30 @@ function formatPercent(value) {
 	return isNaN(value) ? '-' : value.toFixed(1) + '%';
 }
 
+function formatQuality(status) {
+	if (!status || !status.transport_latency_enabled)
+		return E('span', { 'title': _('Transport-aware estimation is disabled.') }, '-');
+
+	var value = status.quality_class || 'LEARNING';
+	var confidence = Number(status.quality_confidence || 0);
+	var limited = !!status.quality_limited;
+	var title = [
+		_('Estimated from ICMP and HTTP/TCP latency; this is not an external benchmark grade.'),
+		_('DL: %s · UL: %s').format(status.quality_dl_class || 'LEARNING', status.quality_ul_class || 'LEARNING'),
+		_('Confidence: %d%%').format(confidence),
+		_('Transport delta: %s ms').format(status.transport_delta_ms == null ? '-' : Number(status.transport_delta_ms).toFixed(1)),
+		_('Effective delta: %s ms').format(status.effective_latency_delta_ms == null ? '-' : Number(status.effective_latency_delta_ms).toFixed(1)),
+		_('Reason: %s').format(status.quality_reason || '-'),
+		_('Safe floors: DL %s · UL %s').format(formatRate(status.throughput_floor_dl_kbps), formatRate(status.throughput_floor_ul_kbps))
+	].join('\n');
+
+	return E('div', { 'title': title }, [
+		E('strong', { 'style': limited ? 'color:#d66' : '' }, value),
+		E('small', { 'style': 'display:block;white-space:nowrap' },
+			limited ? _('Estimated · safety floor') : _('Estimated · %d%%').format(confidence))
+	]);
+}
+
 function hasProbeSample(status) {
 	if (status.reflector)
 		return true;
@@ -244,7 +268,7 @@ function renderTable(sections, statuses) {
 			disabledRow = [
 				section,
 				_('DISABLED'),
-				'-', '-', '-', '-', '-', '-', '-', '-', '-'
+				'-', '-', '-', '-', '-', '-', '-', '-', '-', '-'
 			];
 			rows.push(disabledRow);
 			continue;
@@ -257,6 +281,7 @@ function renderTable(sections, statuses) {
 			st.reflector || '-',
 			reflectorSummary(st),
 			st.rtt_ms != null ? Number(st.rtt_ms).toFixed(2) + ' ms' : '-',
+			formatQuality(st),
 			formatRate(st.dl_achieved_rate_kbps),
 			formatRate(st.ul_achieved_rate_kbps),
 			formatShaperRate(st, 'dl'),
@@ -273,6 +298,7 @@ function renderTable(sections, statuses) {
 			E('th', { 'class': 'th' }, _('Reflector')),
 			E('th', { 'class': 'th' }, _('Runtime reflectors')),
 			E('th', { 'class': 'th' }, _('RTT')),
+			E('th', { 'class': 'th' }, _('Quality')),
 			E('th', { 'class': 'th' }, _('DL achieved')),
 			E('th', { 'class': 'th' }, _('UL achieved')),
 			E('th', { 'class': 'th' }, _('CAKE DL')),
@@ -288,7 +314,7 @@ function renderTable(sections, statuses) {
 			})));
 	} else {
 		children.push(E('tr', { 'class': 'tr' }, [
-			E('td', { 'class': 'td', 'colspan': '11' }, _('No instances configured.'))
+			E('td', { 'class': 'td', 'colspan': '12' }, _('No instances configured.'))
 		]));
 	}
 
