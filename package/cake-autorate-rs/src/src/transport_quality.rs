@@ -81,6 +81,10 @@ impl TransportLatencyTracker {
         }
     }
 
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
     pub fn observe_success(
         &mut self,
         endpoint: &str,
@@ -165,6 +169,8 @@ impl TransportLatencyTracker {
             "error"
         } else if delta_ms.is_some() {
             "ready"
+        } else if baseline_count > 0 && self.loaded_deltas.is_empty() {
+            "baseline_ready"
         } else if baseline_count > 0 {
             "learning_loaded"
         } else {
@@ -420,6 +426,10 @@ impl QualitySearchDirection {
         self.last_reason
     }
 
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
     fn note_candidate(&mut self, rate_kbps: f64, delta_ms: f64) {
         let replace = self
             .best_delta_ms
@@ -539,14 +549,39 @@ mod tests {
         let now = Instant::now();
         let mut tracker = TransportLatencyTracker::new();
         assert_eq!(tracker.observe_success("a", 20.0, false, now), None);
+        assert_eq!(tracker.snapshot(now, true).status, "baseline_ready");
         assert_eq!(
             tracker.observe_success("a", 120.0, true, now + Duration::from_secs(1)),
             None
         );
         assert_eq!(
+            tracker.snapshot(now + Duration::from_secs(1), true).status,
+            "learning_loaded"
+        );
+        assert_eq!(
             tracker.observe_success("a", 100.0, true, now + Duration::from_secs(2)),
             Some(90.0)
         );
+        assert_eq!(
+            tracker.snapshot(now + Duration::from_secs(2), true).status,
+            "ready"
+        );
+    }
+
+    #[test]
+    fn route_reset_discards_transport_baseline_and_loaded_samples() {
+        let now = Instant::now();
+        let mut tracker = TransportLatencyTracker::new();
+        tracker.observe_success("wan-endpoint", 20.0, false, now);
+        tracker.observe_success("wan-endpoint", 120.0, true, now + Duration::from_secs(1));
+        tracker.observe_success("wan-endpoint", 100.0, true, now + Duration::from_secs(2));
+        assert!(tracker.confirmed_delta_ms().is_some());
+
+        tracker.reset();
+        let snapshot = tracker.snapshot(now + Duration::from_secs(3), true);
+        assert_eq!(snapshot.status, "learning_baseline");
+        assert_eq!(snapshot.successful_samples, 0);
+        assert!(snapshot.delta_ms.is_none());
     }
 
     #[test]

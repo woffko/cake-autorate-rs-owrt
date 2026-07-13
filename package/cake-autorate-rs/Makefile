@@ -3,8 +3,8 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=cake-autorate-rs
-PKG_VERSION:=1.0_rc1
-PKG_RELEASE:=13
+PKG_VERSION:=1.0_rc6
+PKG_RELEASE:=1
 
 PKG_MAINTAINER:=woffko
 PKG_LICENSE:=GPL-2.0-or-later

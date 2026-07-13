@@ -21,7 +21,8 @@ instance.
   helper owns temporary SQM/autorate suspension and restores it from its signal
   trap.
 - Preflight requires a resolved, up interface, a global IPv4 address, and a
-  source route whose output device is the selected interface.
+  validated route identity. This may be the active main/default WAN or a
+  specific online nftables mwan3 member whose L3 device matches the target.
 - The test's own reported bytes/rate are authoritative. Aggregate WAN counters
   are deliberately not used for throughput because unrelated clients may be
   using the link.
@@ -31,6 +32,8 @@ instance.
   the proposed base rates. It refuses an interface owned by another enabled
   autorate instance or an unknown unmanaged qdisc. An existing sqm-scripts
   queue is stopped and restored through `/usr/lib/sqm/run.sh`.
+- A per-interface lock prevents overlapping heavy jobs. Only the selected
+  instance and selected SQM queue are paused; other WAN instances continue.
 
 The job runs a shaped test on the same server, independently samples ICMP
 latency/loss, TCP/HTTPS latency to Cloudflare, and total CPU, rechecks the WAN
@@ -43,14 +46,14 @@ x86_64 and ARM router gates pass.
 ## Job phases
 
 1. `preflight`: check helpers (including `uclient-fetch`), backend, interface,
-   address, route, active-default-WAN binding, and link encapsulation.
+   address, structured `main`/`mwan3` route identity, and link encapsulation.
 2. `reflectors`: run the existing reflector planner and keep its recommended
    method and active/spare set.
 3. `baseline`: collect individual RTT samples from up to three selected
    reflectors plus five small TCP/HTTPS requests and calculate both baselines.
 4. `throughput`: run two unshaped download/upload samples. `speedtest-go`
-   validates and caches the first good automatically selected server, so the
-   second run uses the same server.
+   validates the first good automatically selected server. Its ID is passed as
+   a job-local hard pin to the second raw run and every shaped run.
 5. `proposal`: call the Rust daemon's pure `--autotune-proposal` mode.
 6. `shaped`: temporarily apply CAKE at proposed base rates, run the same test
    server with SQM bypass disabled, and concurrently collect RTT/loss,
@@ -162,11 +165,13 @@ At least five independent loaded-latency samples are required. Validation uses
 one probe per reflector per second and the median per-reflector loss, which
 prevents one public DNS service's ICMP rate limiter from masquerading as link
 loss. It accepts either explicit fping summaries or complete reply/timeout
-lines. At least three TCP/HTTPS loaded samples are also required. Since
-`uclient-fetch` cannot source-bind, Full Auto-Tune currently requires the
-selected device to be the active default WAN; this prevents a multi-WAN test
-from silently validating the wrong path. Missing telemetry, a changed server
-ID, WAN address, or route fails closed and leaves UCI untouched.
+lines. At least three TCP/HTTPS loaded samples are also required. Main-route
+jobs require the target to be the active default device. Structured Multi-WAN
+jobs run fping, `uclient-fetch`, and the selected speed-test backend through
+direct `mwan3 use <member> exec ...` argv routing. Every phase compares member,
+L3 device, source IPv4, fwmark, routing table, external IPv4, and speed-test
+server with the first accepted identity. Missing telemetry or any change fails
+closed and leaves UCI untouched.
 
 The sole correction scales both base rates by 0.95 for excessive latency,
 loss, CPU, or a mixed failure, or by 1.05 for clean latency with less than 80%
@@ -181,9 +186,10 @@ the job; there is no unbounded search loop.
 Rust unit tests cover stable fibre, variable cellular, asymmetric directions,
 invalid samples, JSON output, and rate-order invariants. The shell lifecycle
 test uses isolated mock helpers to verify progress/result output, shaped score,
-RAM-only state, process-group cancellation, and both speed-test and temporary
-shaper cleanup traps. Real-router
-acceptance must cover x86_64 and rockchip/armv8 before a release.
+job-local server pinning, RAM-only state, process-group cancellation, and both
+speed-test and temporary shaper cleanup traps. Real-router acceptance also
+checks per-member route identity and that the unselected autorate/SQM instance
+continues running.
 
 ## Optional scheduler
 
@@ -191,7 +197,7 @@ acceptance must cover x86_64 and rockchip/armv8 before a release.
 `scheduled_autotune_*` options select interval, local hour window, required
 quiet time, RAM-only daily traffic budget, and whether a validated result is
 automatically applied. The feature defaults off, and auto-apply defaults off.
-The scheduler reuses the exact preflight, two raw samples, shaped validation,
-single correction, cleanup, and fail-closed result described above. See
-[TRANSPORT_QUALITY.md](TRANSPORT_QUALITY.md) for the runtime safeguards and
-routing limitation.
+The scheduler reuses the exact preflight, route identity, two raw samples,
+same-server shaped validation, single correction, cleanup, and fail-closed
+result described above. See [TRANSPORT_QUALITY.md](TRANSPORT_QUALITY.md) for
+the runtime safeguards and [MULTIWAN.md](MULTIWAN.md) for routing behavior.

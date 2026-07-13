@@ -32,6 +32,27 @@ case "$expression" in
 	'@.server_id')
 		printf '%s\n' "$input" | sed -n 's/.*"server_id":"\([^"]*\)".*/\1/p'
 		;;
+	'@.route_mode')
+		printf '%s\n' "$input" | sed -n 's/.*"route_mode":"\([^"]*\)".*/\1/p'
+		;;
+	'@.mwan3_member')
+		printf '%s\n' "$input" | sed -n 's/.*"mwan3_member":"\([^"]*\)".*/\1/p'
+		;;
+	'@.route_interface')
+		printf '%s\n' "$input" | sed -n 's/.*"route_interface":"\([^"]*\)".*/\1/p'
+		;;
+	'@.route_source_ip')
+		printf '%s\n' "$input" | sed -n 's/.*"route_source_ip":"\([^"]*\)".*/\1/p'
+		;;
+	'@.route_fwmark')
+		printf '%s\n' "$input" | sed -n 's/.*"route_fwmark":"\([^"]*\)".*/\1/p'
+		;;
+	'@.route_table')
+		printf '%s\n' "$input" | sed -n 's/.*"route_table":"\([^"]*\)".*/\1/p'
+		;;
+	'@.external_ip_after')
+		printf '%s\n' "$input" | sed -n 's/.*"external_ip_after":"\([^"]*\)".*/\1/p'
+		;;
 	*)
 		exit 1
 		;;

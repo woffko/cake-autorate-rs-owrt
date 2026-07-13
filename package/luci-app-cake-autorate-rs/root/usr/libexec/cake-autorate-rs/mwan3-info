@@ -1,0 +1,40 @@
+#!/bin/sh
+
+json_escape() {
+	printf '%s' "$1" | tr '\n\r\t' '   ' | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+if ! command -v mwan3 >/dev/null 2>&1; then
+	printf '%s\n' '{"available":false,"nft":false,"scoped_status_api":false,"version":"","reason":"mwan3 is not installed"}'
+	exit 0
+fi
+
+version=""
+if command -v apk >/dev/null 2>&1; then
+	version="$(apk list --installed mwan3 2>/dev/null | sed -n 's/^mwan3-\([^ ]*\).*/\1/p' | sed -n '1p')"
+elif command -v opkg >/dev/null 2>&1; then
+	version="$(opkg list-installed mwan3 2>/dev/null | sed -n 's/^mwan3 - //p' | sed -n '1p')"
+fi
+
+if command -v nft >/dev/null 2>&1 && nft list table inet mwan3 >/dev/null 2>&1; then
+	nft_backend=true
+else
+	nft_backend=false
+fi
+
+if ubus -v list mwan3 2>/dev/null | grep -q '"status".*"interface"'; then
+	scoped_api=true
+else
+	scoped_api=false
+fi
+
+if [ "$nft_backend" = true ] && [ "$scoped_api" = true ]; then
+	reason="native nftables mwan3 and member-scoped status API detected"
+elif [ "$nft_backend" != true ]; then
+	reason="mwan3 is installed, but the nftables table inet mwan3 is unavailable"
+else
+	reason="mwan3 is installed, but the member-scoped ubus status API is unavailable"
+fi
+
+printf '{"available":true,"nft":%s,"scoped_status_api":%s,"version":"%s","reason":"%s"}\n' \
+	"$nft_backend" "$scoped_api" "$(json_escape "$version")" "$(json_escape "$reason")"

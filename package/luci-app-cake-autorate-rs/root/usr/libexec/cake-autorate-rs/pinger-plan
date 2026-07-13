@@ -3,6 +3,8 @@
 section="$1"
 mode="$2"
 install_backend="$3"
+route_mode_override="$4"
+mwan3_member_override="$5"
 
 if [ "$section" = "--status" ] || [ "$section" = "status" ]; then
 	section="primary"
@@ -49,6 +51,14 @@ command_path() {
 
 uci_get() {
 	uci -q get "cake-autorate.$section.$1" 2>/dev/null
+}
+
+route_exec() {
+	if [ "${route_mode:-main}" = mwan3 ]; then
+		mwan3 use "$mwan3_member" exec "$@"
+	else
+		"$@"
+	fi
 }
 
 valid_reflector() {
@@ -145,7 +155,7 @@ probe_fping_batch() {
 		return 1
 	fi
 
-	output="$("$fping_bin" $extra -c 1 -t 1000 $targets 2>&1)"
+	output="$(route_exec "$fping_bin" $extra -c 1 -t 1000 $targets 2>&1)"
 
 	printf '%s\n' "$output" | awk '
 		/: xmt\/rcv\/%loss = / && /min\/avg\/max =/ {
@@ -178,11 +188,16 @@ probe_tsping_batch() {
 
 	tmp="${TMPDIR:-/tmp}/cake-autorate-rs-tsping-scan.$$"
 	rm -f "$tmp"
-	"$tsping_bin" --print-timestamps --machine-readable=, --sleep-time 0 --target-spacing 50 $targets >"$tmp" 2>/dev/null &
-	pid="$!"
-	sleep 4
-	kill "$pid" 2>/dev/null || true
-	wait "$pid" 2>/dev/null || true
+	if [ "${route_mode:-main}" = mwan3 ]; then
+		command -v timeout >/dev/null 2>&1 || return 1
+		timeout 4 mwan3 use "$mwan3_member" exec "$tsping_bin" --print-timestamps --machine-readable=, --sleep-time 0 --target-spacing 50 $targets >"$tmp" 2>/dev/null || true
+	else
+		"$tsping_bin" --print-timestamps --machine-readable=, --sleep-time 0 --target-spacing 50 $targets >"$tmp" 2>/dev/null &
+		pid="$!"
+		sleep 4
+		kill "$pid" 2>/dev/null || true
+		wait "$pid" 2>/dev/null || true
+	fi
 
 	awk -F ',' '
 		NF == 10 {
@@ -484,6 +499,28 @@ configured_method="$(uci_get pinger_method)"
 configured_no_pingers="$(num_or_default "$(uci_get no_pingers)" 6)"
 reflector_ping_interval_s="$(uci_get reflector_ping_interval_s)"
 [ -n "$reflector_ping_interval_s" ] || reflector_ping_interval_s="0.3"
+route_mode_configured="$(uci_get route_mode)"
+mwan3_member="$(uci_get mwan3_member)"
+[ -n "$route_mode_override" ] && route_mode_configured="$route_mode_override"
+[ -n "$mwan3_member_override" ] && mwan3_member="$mwan3_member_override"
+[ -n "$route_mode_configured" ] || route_mode_configured=auto
+case "$route_mode_configured" in
+	main) route_mode=main ;;
+	mwan3) route_mode=mwan3 ;;
+	auto) [ -n "$mwan3_member" ] && route_mode=mwan3 || route_mode=main ;;
+	*) json_error "Invalid route_mode: $route_mode_configured" ;;
+esac
+if [ "$route_mode" = mwan3 ]; then
+	case "$mwan3_member" in ''|*[!A-Za-z0-9_.:@-]*) json_error "Invalid mwan3_member" ;; esac
+	command -v mwan3 >/dev/null 2>&1 || json_error "mwan3 routing is selected but mwan3 is unavailable"
+	command -v nft >/dev/null 2>&1 && nft list table inet mwan3 >/dev/null 2>&1 ||
+		json_error "nftables table inet mwan3 is unavailable"
+	if [ "$mode" = scan ]; then
+		ubus call mwan3 status "{\"interface\":\"$mwan3_member\"}" 2>/dev/null |
+			grep -Eq '"status"[[:space:]]*:[[:space:]]*"online"' ||
+			json_error "mwan3 member $mwan3_member is offline or unavailable"
+	fi
+fi
 
 configured_reflectors="$(uci_get reflector)"
 configured_irtt_servers="$(uci_get irtt_server)"
@@ -741,6 +778,8 @@ fi
 printf '{'
 printf '"section":"%s",' "$(json_escape "$section")"
 printf '"mode":"%s",' "$(json_escape "$mode")"
+printf '"route_mode":"%s",' "$(json_escape "$route_mode")"
+printf '"mwan3_member":"%s",' "$(json_escape "$mwan3_member")"
 printf '"configured_method":"%s",' "$(json_escape "$configured_method")"
 printf '"configured_no_pingers":%s,' "$configured_no_pingers"
 printf '"configured_irtt_server_count":%s,' "$irtt_server_count"

@@ -17,6 +17,10 @@ var optionDescriptions = {
 	adjust_dl_shaper_rate: 'Allow autorate to change the download CAKE bandwidth.',
 	adjust_ul_shaper_rate: 'Allow autorate to change the upload CAKE bandwidth.',
 	wan_if: 'Main WAN interface for this instance. Auto preset also uses it for SQM and IFB setup.',
+	route_mode: 'Select the main routing table or force every ICMP, HTTP, speed test, and Auto-Tune probe through one mwan3 member.',
+	mwan3_member: 'Logical mwan3 interface/member used for this uplink. Its resolved L3 device must match the target interface.',
+	route_stability_s: 'Time the selected route must stay online with the same device and source address before probes restart.',
+	route_check_interval_s: 'Interval for checking mwan3 state, L3 device, source address, fwmark, and route identity.',
 	auto_interface_preset: 'Automatically derive SQM interface, upload interface, and download IFB from the target interface.',
 	sqm_download: 'SQM download bandwidth in kbit/s. This also seeds the autorate base and max download rates.',
 	sqm_upload: 'SQM upload bandwidth in kbit/s. This also seeds the autorate base and max upload rates.',
@@ -201,9 +205,17 @@ var optionDescriptions = {
 var interfaceContext = {
 	deviceNames: {},
 	deviceNetworks: {},
+	devicePhysical: {},
 	networkDevices: {},
 	defaultDevice: 'wan'
 };
+
+var mwan3Context = {
+	members: [],
+	byName: {}
+};
+
+var mwan3Capability = {};
 
 var speedtestLastResults = {};
 
@@ -294,6 +306,7 @@ function buildInterfaceContext(devices, networks) {
 	var ctx = {
 		deviceNames: {},
 		deviceNetworks: {},
+		devicePhysical: {},
 		networkDevices: {},
 		defaultDevice: null
 	};
@@ -317,6 +330,8 @@ function buildInterfaceContext(devices, networks) {
 	for (i = 0; i < networks.length; i++) {
 		var netName = networks[i].getName();
 		var ifName = networks[i].getIfname();
+		var l2Device = networks[i].getL2Device ? networks[i].getL2Device() : null;
+		var l2Name = l2Device && l2Device.getName ? l2Device.getName() : null;
 
 		if (!netName || !ifName)
 			continue;
@@ -325,6 +340,8 @@ function buildInterfaceContext(devices, networks) {
 			ifName = ifName.substring(1);
 
 		ctx.networkDevices[netName] = ifName;
+		if (l2Name && l2Name !== ifName)
+			ctx.devicePhysical[ifName] = l2Name;
 	}
 
 	function resolveNetworkDevice(name, seen) {
@@ -388,6 +405,108 @@ function normalizeInterfaceName(name) {
 
 function defaultTargetInterface() {
 	return normalizeInterfaceName(interfaceContext.defaultDevice || 'wan');
+}
+
+function buildMwan3Context() {
+	var ctx = { members: [], byName: {} };
+	var sections = uci.sections('mwan3', 'interface') || [];
+
+	for (var i = 0; i < sections.length; i++) {
+		var name = sections[i]['.name'];
+		var device = normalizeInterfaceName(name);
+
+		if (!name || !device || sections[i].enabled === '0' || sections[i].family === 'ipv6')
+			continue;
+
+		var member = {
+			name: name,
+			device: device,
+			label: interfacePathLabel(name, device)
+		};
+		ctx.members.push(member);
+		ctx.byName[name] = member;
+	}
+
+	ctx.members.sort(function(a, b) { return a.name.localeCompare(b.name); });
+	return ctx;
+}
+
+function mwan3MembersForDevice(device) {
+	device = normalizeInterfaceName(device);
+	return mwan3Context.members.filter(function(member) {
+		return member.device === device;
+	});
+}
+
+function wizardRouteChoices() {
+	var choices = [ [ 'main', _('Main routing table') ] ];
+
+	for (var i = 0; i < mwan3Context.members.length; i++) {
+		var member = mwan3Context.members[i];
+		choices.push([ 'mwan3:' + member.name, _('mwan3: %s').format(member.label) ]);
+	}
+	return choices;
+}
+
+function uniqueMwan3Uplinks() {
+	var byDevice = {};
+	var uplinks = [];
+
+	for (var i = 0; i < mwan3Context.members.length; i++) {
+		var member = mwan3Context.members[i];
+		var current = byDevice[member.device];
+		if (!current || (/6$/.test(current.name) && !/6$/.test(member.name)))
+			byDevice[member.device] = member;
+	}
+	for (var device in byDevice)
+		uplinks.push(byDevice[device]);
+	uplinks.sort(function(a, b) { return a.name.localeCompare(b.name); });
+	return uplinks;
+}
+
+function multiwanInstancePlans(state) {
+	var uplinks = uniqueMwan3Uplinks();
+	return uplinks.map(function(member) {
+		var instanceName = member.device === normalizeInterfaceName(state.wan_if) ?
+			state.name : member.name.replace(/[^A-Za-z0-9_]/g, '_') + '_sqm';
+		return {
+			name: instanceName,
+			member: member.name,
+			device: member.device,
+			sqmSection: managedSqmSectionName(instanceName)
+		};
+	});
+}
+
+function wizardPlanConflicts(plans, enabled) {
+	var conflicts = [];
+	var names = {};
+	var devices = {};
+	var existing = uci.sections('cake-autorate', 'cake_autorate') || [];
+
+	for (var planIndex = 0; planIndex < plans.length; planIndex++) {
+		var plan = plans[planIndex];
+		if (names[plan.name])
+			conflicts.push(_('Generated instance name "%s" is duplicated.').format(plan.name));
+		if (devices[plan.device])
+			conflicts.push(_('Two generated instances would manage the same CAKE target %s.').format(plan.device));
+		names[plan.name] = true;
+		devices[plan.device] = true;
+
+		for (var existingIndex = 0; existingIndex < existing.length; existingIndex++) {
+			var section = existing[existingIndex];
+			var existingName = section['.name'];
+			var existingTarget = normalizeInterfaceName(section.sqm_interface || section.ul_if || section.wan_if);
+			if (existingName === plan.name)
+				conflicts.push(_('Instance "%s" already exists.').format(plan.name));
+			if (enabled && section.enabled === '1' && section.manage_sqm !== '0' && existingTarget === plan.device)
+				conflicts.push(_('Instance "%s" already manages a CAKE queue on %s.').format(existingName, existingTarget));
+		}
+	}
+
+	return conflicts.filter(function(message, index, all) {
+		return all.indexOf(message) === index;
+	});
 }
 
 function listValue(section, tab, key, title, values, defaultValue) {
@@ -713,6 +832,53 @@ function validateSqmSectionUnique(section, section_id) {
 	return true;
 }
 
+function validateManagedSqmTargetUnique(section, section_id) {
+	var enabled = checkedFormOrUci(section, section_id, 'enabled', false);
+	var manage = checkedFormOrUci(section, section_id, 'manage_sqm', true);
+	var target = selectedWan(section, section_id, null, true);
+	var sections;
+
+	if (!enabled || !manage || !target)
+		return true;
+
+	sections = uci.sections('cake-autorate', 'cake_autorate') || [];
+	for (var i = 0; i < sections.length; i++) {
+		var other = sections[i];
+		var otherName = other['.name'];
+		if (!otherName || otherName === section_id || other.enabled !== '1' || other.manage_sqm === '0')
+			continue;
+		var otherTarget = normalizeInterfaceName(other.sqm_interface || other.ul_if || other.wan_if);
+		if (otherTarget === target)
+			return _('Instance "%s" already has an active managed CAKE queue on %s.').format(otherName, target);
+	}
+	return true;
+}
+
+function validateRouteSelection(section, section_id) {
+	var mode = formOrUci(section, section_id, 'route_mode') || 'auto';
+	var memberName = formOrUci(section, section_id, 'mwan3_member') || '';
+	var target = selectedWan(section, section_id, null, true);
+	var member;
+
+	if ([ 'auto', 'main', 'mwan3' ].indexOf(mode) < 0)
+		return _('Route mode must be Auto, Main routing, or mwan3.');
+	if (mode === 'main' && memberName)
+		return _('Main routing must not define an mwan3 member.');
+	if (mode === 'mwan3' && !memberName)
+		return _('Select an mwan3 member.');
+	if (!memberName)
+		return true;
+	if (!mwan3Capability.available || !mwan3Capability.nft || !mwan3Capability.scoped_status_api)
+		return _('Structured routing requires the nftables mwan3 backend and member-scoped status API.');
+
+	member = mwan3Context.byName[memberName];
+	if (!member)
+		return _('mwan3 member "%s" is not present or enabled.').format(memberName);
+	if (member.device !== target)
+		return _('mwan3 member "%s" resolves to %s, but this instance targets %s.').format(memberName, member.device, target);
+	return true;
+}
+
 function validateMqttConfig(section, section_id) {
 	if (!checkedFormOrUci(section, section_id, 'mqtt_enabled', false))
 		return true;
@@ -791,6 +957,14 @@ function validateInstanceSection(section, section_id) {
 		return result;
 
 	result = validateSqmSectionUnique(section, section_id);
+	if (result !== true)
+		return result;
+
+	result = validateManagedSqmTargetUnique(section, section_id);
+	if (result !== true)
+		return result;
+
+	result = validateRouteSelection(section, section_id);
 	if (result !== true)
 		return result;
 
@@ -1130,10 +1304,10 @@ function speedtestJobDelay() {
 	});
 }
 
-function runSpeedtestJob(section_id, wan, backend, onProgress) {
+function runSpeedtestJob(section_id, wan, backend, onProgress, routeMode, mwan3Member) {
 	var command = '/usr/libexec/cake-autorate-rs/speedtest';
 
-	return fs.exec(command, [ section_id, wan, 'job-start', backend ]).then(function(res) {
+	return fs.exec(command, [ section_id, wan, 'job-start', backend, '', routeMode || '', mwan3Member || '' ]).then(function(res) {
 		var started = parseExecJson(res);
 
 		if (started.error)
@@ -1165,10 +1339,10 @@ function runSpeedtestJob(section_id, wan, backend, onProgress) {
 	});
 }
 
-function runAutotuneJob(section_id, wan, backend, onProgress) {
+function runAutotuneJob(section_id, wan, backend, onProgress, routeMode, mwan3Member) {
 	var command = '/usr/libexec/cake-autorate-rs/autotune';
 
-	return fs.exec(command, [ section_id, wan, 'start', backend ]).then(function(res) {
+	return fs.exec(command, [ section_id, wan, 'start', backend, routeMode || '', mwan3Member || '' ]).then(function(res) {
 		var started = parseExecJson(res);
 
 		if (started.error)
@@ -1250,10 +1424,13 @@ function formatSpeedtestBackendStatus(result) {
 	return lines.join('\n');
 }
 
-function runPingerPlan(section_id, mode) {
+function runPingerPlan(section_id, mode, routeMode, mwan3Member) {
 	return fs.exec('/usr/libexec/cake-autorate-rs/pinger-plan', [
 		section_id,
-		mode || 'status'
+		mode || 'status',
+		'',
+		routeMode || '',
+		mwan3Member || ''
 	]).then(parseExecJson);
 }
 
@@ -1464,16 +1641,6 @@ function applySpeedtestRates(section, section_id, result, percent) {
 	};
 }
 
-function sectionNameExists(name) {
-	var sections = uci.sections('cake-autorate', 'cake_autorate') || [];
-
-	for (var i = 0; i < sections.length; i++)
-		if (sections[i]['.name'] === name)
-			return true;
-
-	return false;
-}
-
 function targetInterfaceChoices() {
 	var choices = [];
 	var seen = {};
@@ -1506,8 +1673,27 @@ function targetInterfaceChoices() {
 
 function targetInterfaceLabel(name) {
 	var networks = interfaceContext.deviceNetworks[name] || [];
+	var logical = networks.filter(function(networkName) { return !/(?:_?6)$/.test(networkName); })[0] || networks[0];
+	var physical = interfaceContext.devicePhysical && interfaceContext.devicePhysical[name];
+	var parts = [];
 
-	return networks.length ? '%s \u2014 %s'.format(name, networks.join(', ')) : name;
+	if (logical)
+		parts.push(logical);
+	parts.push(name);
+	if (physical && physical !== name)
+		parts.push(physical);
+	return parts.join(' \u2014 ');
+}
+
+function interfacePathLabel(logical, device) {
+	var physical = interfaceContext.devicePhysical && interfaceContext.devicePhysical[device];
+	var parts = [ logical ];
+
+	if (device && device !== logical)
+		parts.push(device);
+	if (physical && physical !== device)
+		parts.push(physical);
+	return parts.join(' \u2014 ');
 }
 
 function targetInterfaceChoiceOptions() {
@@ -1628,6 +1814,12 @@ function writeWizardConfig(section_id, state) {
 
 	uci.set('cake-autorate', section_id, 'enabled', state.enabled ? '1' : '0');
 	uci.set('cake-autorate', section_id, 'wan_if', wan);
+	uci.set('cake-autorate', section_id, 'route_mode', state.route_mode || 'main');
+	if (state.mwan3_member)
+		uci.set('cake-autorate', section_id, 'mwan3_member', state.mwan3_member);
+	else
+		uci.unset('cake-autorate', section_id, 'mwan3_member');
+	uci.unset('cake-autorate', section_id, 'ping_prefix_string');
 	uci.set('cake-autorate', section_id, 'auto_interface_preset', '1');
 	uci.set('cake-autorate', section_id, 'adjust_dl_shaper_rate', '1');
 	uci.set('cake-autorate', section_id, 'adjust_ul_shaper_rate', '1');
@@ -1780,11 +1972,17 @@ function replaceNodeContent(node, children) {
 
 function showCreateWizard(grid, name) {
 	var defaultWan = defaultTargetInterface();
+	var defaultMembers = mwan3MembersForDevice(defaultWan);
+	var defaultMember = defaultMembers.length ? defaultMembers[0].name : '';
 	var state = {
 		name: name,
 		step: 0,
 		mode: 'autotune',
 		wan_if: defaultWan,
+		route_mode: defaultMember ? 'mwan3' : 'main',
+		mwan3_member: defaultMember,
+		route_selection: defaultMember ? 'mwan3:' + defaultMember : 'main',
+		multiwan_set: false,
 		enabled: true,
 		sqm_enabled: true,
 		speedtest_backend: 'auto',
@@ -1862,8 +2060,11 @@ function showCreateWizard(grid, name) {
 	}
 
 	function renderInterfaceStep() {
+		var detectedUplinks = uniqueMwan3Uplinks();
 		var target = wizardSelectOptions(targetInterfaceChoiceOptions(), state.wan_if);
+		var route = wizardSelectOptions(wizardRouteChoices(), state.route_selection);
 		var enabled = wizardCheckbox(state.enabled);
+		var multiwan = wizardCheckbox(state.multiwan_set);
 		var queueInfo = E('div', { 'class': 'cbi-value-dummy' }, wizardSqmQueueText(state));
 		var modeButtons = [
 			[ 'autotune', _('Full Auto-Tune'), _('Measures the link, calculates limits and presents a complete proposal. Uses significant traffic.') ],
@@ -1897,9 +2098,35 @@ function showCreateWizard(grid, name) {
 				state.autotune_proposal = null;
 			}
 			state.wan_if = newWan;
+			var matchingMembers = mwan3MembersForDevice(newWan);
+			if (state.route_mode === 'mwan3') {
+				state.mwan3_member = matchingMembers.length ? matchingMembers[0].name : '';
+				state.route_selection = state.mwan3_member ? 'mwan3:' + state.mwan3_member : 'main';
+				state.route_mode = state.mwan3_member ? 'mwan3' : 'main';
+				render();
+				return;
+			}
 			state.ping_extra_args = pingerInterfaceArgs(state.wan_if, state.pinger_method || 'fping');
 			syncSqmForInterface();
 			queueInfo.textContent = wizardSqmQueueText(state);
+		});
+
+		route.addEventListener('change', function() {
+			state.route_selection = route.value;
+			if (route.value.indexOf('mwan3:') === 0) {
+				state.route_mode = 'mwan3';
+				state.mwan3_member = route.value.substring(6);
+				var member = mwan3Context.byName[state.mwan3_member];
+				if (member && member.device !== state.wan_if) {
+					state.wan_if = member.device;
+					state.ping_extra_args = pingerInterfaceArgs(state.wan_if, state.pinger_method || 'fping');
+					syncSqmForInterface();
+				}
+			} else {
+				state.route_mode = 'main';
+				state.mwan3_member = '';
+			}
+			render();
 		});
 
 		enabled.addEventListener('change', function() {
@@ -1907,12 +2134,35 @@ function showCreateWizard(grid, name) {
 			state.sqm_enabled = state.enabled;
 		});
 
-		return [
+		multiwan.addEventListener('change', function() {
+			state.multiwan_set = multiwan.checked;
+			if (state.multiwan_set) {
+				state.mode = 'manual';
+				state.enabled = true;
+				state.sqm_enabled = true;
+			}
+			render();
+		});
+
+		var fields = [
 			wizardField(_('Setup mode'), E('div', { 'style': 'display:flex;flex-wrap:wrap;gap:8px' }, modeButtons)),
 			wizardField(_('Target interface'), target, optionDescriptions.wan_if),
+			wizardField(_('Probe routing'), route, optionDescriptions.route_mode),
 			wizardField(_('SQM queue'), queueInfo, optionDescriptions._wizard_sqm_queue),
 			wizardField(_('Enable autorate'), enabled, optionDescriptions.enabled)
 		];
+		if (detectedUplinks.length > 1) {
+			var plan = multiwanInstancePlans(state).map(function(item) {
+				return '%s: %s → %s → %s'.format(item.name, item.member, item.device, item.sqmSection);
+			}).join('\n');
+			fields.push(wizardField(
+				_('Multi-WAN set'),
+				E('div', {}, [ multiwan, ' ', _('Create one isolated instance per detected uplink.'),
+					E('pre', { 'style': 'white-space:pre-wrap;margin-top:6px' }, plan) ]),
+				_('mwan3 IPv4/IPv6 entries resolving to the same L3 device are grouped into one uplink so duplicate CAKE queues cannot be created. Each instance keeps independent probes, baselines, limits, and schedules.')));
+		}
+
+		return fields;
 	}
 
 	function applyAutotuneResult(result) {
@@ -1957,7 +2207,7 @@ function showCreateWizard(grid, name) {
 					state.autotune_progress = job.progress || 0;
 					progress.value = state.autotune_progress;
 					status.textContent = job.message || job.phase || _('Full Auto-Tune is running...');
-				}).then(function(result) {
+				}, state.route_mode, state.mwan3_member).then(function(result) {
 					applyAutotuneResult(result);
 					state.autotune_running = false;
 					state.step = 2;
@@ -2096,7 +2346,7 @@ function showCreateWizard(grid, name) {
 
 				runSpeedtestJob(state.name, state.wan_if, state.speedtest_backend, function() {
 					status.textContent = _('Running speed test...');
-				}).then(function(res) {
+				}, state.route_mode, state.mwan3_member).then(function(res) {
 					var result = parseSpeedtestResult(res.stdout);
 					var dl = measuredRate(result.download_kbps, pct);
 					var ul = measuredRate(result.upload_kbps, pct);
@@ -2138,7 +2388,7 @@ function showCreateWizard(grid, name) {
 				scanReflectorsButton.disabled = true;
 				pingerStatus.textContent = _('Scanning reflectors...');
 
-				runPingerPlan(state.name, 'scan').then(function(result) {
+				runPingerPlan(state.name, 'scan', state.route_mode, state.mwan3_member).then(function(result) {
 					applyPingerPlanToState(state, result);
 					pingerStatus.textContent = formatPingerPlan(result);
 				}).catch(function(err) {
@@ -2199,6 +2449,7 @@ function showCreateWizard(grid, name) {
 		var activeCount = Math.min(parseInt(state.no_pingers || '6', 10), reflectors.length);
 		var rows = [
 			[ _('Target interface'), targetInterfaceLabel(wan) ],
+			[ _('Probe routing'), state.route_mode === 'mwan3' ? _('mwan3 member %s').format(state.mwan3_member) : _('Main routing table') ],
 			[ _('Autorate + SQM'), state.enabled ? _('enabled') : _('disabled') ],
 			[ _('SQM queue'), wizardSqmQueueText(state) ],
 			[ _('Download speed'), state.sqm_download + ' kbit/s' ],
@@ -2206,6 +2457,14 @@ function showCreateWizard(grid, name) {
 			[ _('Preferred backend'), speedtestBackendChoiceTitle(state.speedtest_backend) ],
 			[ _('Pinger plan'), _('%s, %d active / %d candidates').format(state.pinger_method || 'fping', activeCount, reflectors.length) ]
 		];
+		if (state.multiwan_set) {
+			var multiwanPlans = multiwanInstancePlans(state);
+			var multiwanConflicts = wizardPlanConflicts(multiwanPlans, state.enabled);
+			rows.push([ _('Multi-WAN instances'), multiwanPlans.map(function(item) {
+				return '%s: %s → %s; %s'.format(item.name, item.member, item.device, item.sqmSection);
+			}).join('\n') ]);
+			rows.push([ _('Detected conflicts'), multiwanConflicts.length ? multiwanConflicts.join('\n') : _('None') ]);
+		}
 		var autotune = state.autotune_result;
 		if (autotune) {
 			var proposal = autotune.proposal;
@@ -2292,6 +2551,17 @@ function showCreateWizard(grid, name) {
 			showError(_('Target interface is required.'));
 			return false;
 		}
+		if (step === 0 && state.route_mode === 'mwan3') {
+			if (!mwan3Capability.available || !mwan3Capability.nft || !mwan3Capability.scoped_status_api) {
+				showError(_('This router does not provide the required nftables mwan3 member API.'));
+				return false;
+			}
+			var selectedMember = mwan3Context.byName[state.mwan3_member];
+			if (!selectedMember || selectedMember.device !== normalizeInterfaceName(state.wan_if)) {
+				showError(_('The selected mwan3 member does not match the target interface.'));
+				return false;
+			}
+		}
 
 		if (step === 1) {
 			if (state.mode === 'autotune' && !state.autotune_proposal) {
@@ -2353,6 +2623,28 @@ function showCreateWizard(grid, name) {
 			return false;
 		}
 
+		if (state.route_mode === 'mwan3') {
+			if (!mwan3Capability.available || !mwan3Capability.nft || !mwan3Capability.scoped_status_api) {
+				showError(_('This router does not provide the required nftables mwan3 member API.'));
+				return false;
+			}
+			var member = mwan3Context.byName[state.mwan3_member];
+			if (!member || member.device !== normalizeInterfaceName(state.wan_if)) {
+				showError(_('Select an online-configured mwan3 member matching the target interface.'));
+				return false;
+			}
+		}
+
+		var plans = state.multiwan_set ? multiwanInstancePlans(state) : [ {
+			name: state.name,
+			device: normalizeInterfaceName(state.wan_if)
+		} ];
+		var planConflicts = wizardPlanConflicts(plans, state.enabled);
+		if (planConflicts.length) {
+			showError(planConflicts.join(' '));
+			return false;
+		}
+
 		if (!validatePositiveInteger(state.speedtest_apply_percent) ||
 		    parseInt(state.speedtest_apply_percent, 10) > 100) {
 			showError(_('Speed test apply percent must be between 1 and 100.'));
@@ -2386,25 +2678,48 @@ function showCreateWizard(grid, name) {
 
 	function finish() {
 		var config_name = grid.uciconfig || grid.map.config;
-		var section_id;
-
-		if (sectionNameExists(state.name)) {
-			showError(_('Instance "%s" already exists.').format(state.name));
-			return;
-		}
+		var section_id, created = [];
 
 		if (!validateWizard())
 			return;
 
-		section_id = grid.map.data.add(config_name, grid.sectiontype, state.name);
-		writeWizardConfig(section_id, state);
+		var plans = state.multiwan_set ? multiwanInstancePlans(state) : [ {
+			name: state.name,
+			member: state.mwan3_member,
+			device: state.wan_if,
+			sqmSection: state.sqm_section || managedSqmSectionName(state.name)
+		} ];
+		for (var planIndex = 0; planIndex < plans.length; planIndex++) {
+			var plan = plans[planIndex];
+			var instanceState = {};
+			for (var key in state)
+				if (state.hasOwnProperty(key))
+					instanceState[key] = state[key];
+			instanceState.name = plan.name;
+			instanceState.wan_if = plan.device;
+			instanceState.route_mode = plan.member ? 'mwan3' : state.route_mode;
+			instanceState.mwan3_member = plan.member || '';
+			instanceState.route_selection = plan.member ? 'mwan3:' + plan.member : 'main';
+			instanceState.sqm_section = plan.sqmSection;
+			instanceState.ping_extra_args = pingerInterfaceArgs(plan.device, instanceState.pinger_method || 'fping');
+			var existingQueue = findImportableSqmQueueForInterface(plan.device);
+			if (existingQueue) {
+				instanceState.sqm_section = queueSectionName(existingQueue);
+				instanceState.sqm_download = rateValue(existingQueue.download, instanceState.sqm_download);
+				instanceState.sqm_upload = rateValue(existingQueue.upload, instanceState.sqm_upload);
+			}
+
+			section_id = grid.map.data.add(config_name, grid.sectiontype, plan.name);
+			writeWizardConfig(section_id, instanceState);
+			created.push(section_id);
+		}
 
 		return grid.map.save(null, true)
 			.then(L.bind(grid.map.load, grid.map))
 			.then(L.bind(grid.map.reset, grid.map))
 			.then(function() {
 				ui.hideModal();
-				ui.addNotification(null, E('p', _('Instance "%s" created. Review pending changes, then Save & Apply.').format(section_id)), 'info');
+				ui.addNotification(null, E('p', _('%d instance(s) created: %s. Review pending changes, then Save & Apply.').format(created.length, created.join(', '))), 'info');
 			})
 			.catch(function(err) {
 				showError(err.message || err);
@@ -2734,6 +3049,23 @@ function addSpeedtestOptions(section) {
 function addSetupOptions(section) {
 	var o;
 
+	o = section.taboption('setup', form.DummyValue, '_mwan3_capability', _('mwan3 routing backend'));
+	modal(o);
+	o.rawhtml = true;
+	o.cfgvalue = function() {
+		if (!mwan3Capability.available)
+			return E('span', { 'style': 'color:#b00' }, _('Unavailable; use Main routing.'));
+		var safe = mwan3Capability.nft && mwan3Capability.scoped_status_api;
+		return E('span', { 'style': safe ? 'color:#198754' : 'color:#b00' },
+			_('%s · nftables: %s · member API: %s · %s').format(
+				mwan3Capability.version || 'mwan3',
+				mwan3Capability.nft ? _('yes') : _('no'),
+				mwan3Capability.scoped_status_api ? _('yes') : _('no'),
+				mwan3Capability.reason || '-'));
+	};
+	o.write = function() {};
+	o.remove = function() {};
+
 	o = flag(section, 'setup', 'enabled', _('Enable autorate'));
 	o.forcewrite = true;
 	o.onchange = function(ev, section_id, value) {
@@ -2774,6 +3106,47 @@ function addSetupOptions(section) {
 			applyWanPreset(section_id, formvalue, importRates);
 
 		syncManagedSqmEnabled(this.section, section_id);
+	};
+
+	o = listValue(section, 'setup', 'route_mode', _('Probe routing'), [
+		[ 'auto', _('Auto (main unless a member is selected)') ],
+		[ 'main', _('Main routing table') ],
+		[ 'mwan3', _('Specific mwan3 member') ]
+	], 'auto');
+	o.forcewrite = true;
+	o.write = function(section_id, formvalue) {
+		uci.set('cake-autorate', section_id, 'route_mode', formvalue);
+		if (formvalue === 'main') {
+			uci.unset('cake-autorate', section_id, 'mwan3_member');
+			uci.unset('cake-autorate', section_id, 'ping_prefix_string');
+		}
+	};
+
+	o = section.taboption('setup', form.ListValue, 'mwan3_member', _('mwan3 member'));
+	modal(o);
+	describe(o, 'mwan3_member');
+	o.rmempty = true;
+	o.value('', _('Select member'));
+	for (var memberIndex = 0; memberIndex < mwan3Context.members.length; memberIndex++)
+		o.value(mwan3Context.members[memberIndex].name, mwan3Context.members[memberIndex].label);
+	o.depends('route_mode', 'auto');
+	o.depends('route_mode', 'mwan3');
+	o.validate = function(section_id, formvalue) {
+		var mode = this.section.formvalue(section_id, 'route_mode') || 'auto';
+		var target = selectedWan(this.section, section_id, null, true);
+		if (mode === 'mwan3' && !formvalue)
+			return _('Select an mwan3 member.');
+		if (formvalue && (!mwan3Context.byName[formvalue] || mwan3Context.byName[formvalue].device !== target))
+			return _('The selected member must resolve to the target interface.');
+		return true;
+	};
+	o.write = function(section_id, formvalue) {
+		if (formvalue) {
+			uci.set('cake-autorate', section_id, 'mwan3_member', formvalue);
+			uci.unset('cake-autorate', section_id, 'ping_prefix_string');
+		} else {
+			uci.unset('cake-autorate', section_id, 'mwan3_member');
+		}
 	};
 
 	o = flag(section, 'setup', 'auto_interface_preset', _('Auto SQM preset'), '1');
@@ -3281,6 +3654,8 @@ function addAdvancedOptions(section) {
 	value(section, 'advanced', 'connection_stall_thr_kbps', _('Stall rate threshold'), 'uinteger', '10');
 	value(section, 'advanced', 'global_ping_response_timeout_s', _('Global ping timeout'), 'ufloat', '10.0');
 	value(section, 'advanced', 'if_up_check_interval_s', _('Interface check interval'), 'ufloat', '10.0');
+	value(section, 'advanced', 'route_stability_s', _('Route stability wait'), 'and(ufloat,min(1),max(300))', '5.0');
+	value(section, 'advanced', 'route_check_interval_s', _('Route check interval'), 'and(ufloat,min(1),max(60))', '2.0');
 	optionalValue(section, 'advanced', 'rx_bytes_path', _('RX bytes path'), null, '');
 	optionalValue(section, 'advanced', 'tx_bytes_path', _('TX bytes path'), null, '');
 }
@@ -3491,7 +3866,11 @@ return L.view.extend({
 			L.resolveDefault(fs.list('/var/run/sqm/available_qdiscs'), []),
 			loadSqmScripts(),
 			uci.load('cake-autorate'),
-			L.resolveDefault(uci.load('sqm'), null)
+			L.resolveDefault(uci.load('sqm'), null),
+			L.resolveDefault(uci.load('mwan3'), null),
+			L.resolveDefault(fs.exec('/usr/libexec/cake-autorate-rs/mwan3-info', []).then(function(result) {
+				return JSON.parse(result.stdout || '{}');
+			}), {})
 		]);
 	},
 
@@ -3502,6 +3881,8 @@ return L.view.extend({
 		var scripts = data[3];
 
 		interfaceContext = buildInterfaceContext(data[0], data[1]);
+		mwan3Context = buildMwan3Context();
+		mwan3Capability = data[7] || {};
 
 		m = new form.Map('cake-autorate', _('CAKE Autorate'));
 		s = m.section(form.GridSection, 'cake_autorate', _('Instances'));

@@ -34,6 +34,9 @@ does not claim authorship of the original cake-autorate concept.
 - [Transport-aware quality control](TRANSPORT_QUALITY.md) documents HTTP/TCP
   latency fusion, estimated grades, the throughput floor, bounded natural-load
   search, and scheduled Full Auto-Tune.
+- [Multi-WAN routing and lifecycle](MULTIWAN.md) describes the structured
+  `main`/`mwan3` route model, per-uplink state isolation, failover/recovery,
+  route identity checks, SQM ownership, and operational diagnostics.
 
 The current targets are OpenWrt 25.12.5 on `x86/64` and
 `rockchip/armv8` (`aarch64_generic`, including the Banana Pi R2 Pro). The daemon
@@ -44,41 +47,49 @@ plus OpenWrt userland tools.
 
 The current tree builds these OpenWrt 25.12.5 APKs:
 
-- `cake-autorate-rs-1.0_rc1-r13-x86_64.apk` — x86_64 autorate daemon.
-- `cake-autorate-rs-1.0_rc1-r13-aarch64_generic.apk` — rockchip/armv8
+- `cake-autorate-rs-1.0_rc6-r1-x86_64.apk` — x86_64 autorate daemon.
+- `cake-autorate-rs-1.0_rc6-r1-aarch64_generic.apk` — rockchip/armv8
   autorate daemon.
-- `luci-app-cake-autorate-rs-1.0_rc1-r13.apk` — architecture-independent LuCI
+- `luci-app-cake-autorate-rs-1.0_rc6-r1.apk` — architecture-independent LuCI
   interface and SQM integration.
 
-The daemon package installs `uci`, `fping`, and `uclient-fetch` as dependencies. The LuCI package
-installs the daemon, `luci-base`, and `sqm-scripts`; the latter brings the CAKE,
-IFB, `tc`, and `ip` runtime pieces. The wizard now labels a device with its
-logical OpenWrt networks, for example `eth1 — wan, wan6`, while continuing to
-save and use the physical device name.
+The daemon package installs `uci`, `fping`, and `uclient-fetch` as dependencies.
+The LuCI package installs the daemon, `luci-base`, and `sqm-scripts`; the latter
+brings the CAKE, IFB, `tc`, and `ip` runtime pieces. HTTPS probes additionally
+use the router's selected `libustream` TLS provider and CA bundle; the offline
+installer includes the standard mbedTLS provider when none is already present.
+The wizard now labels a device with its logical OpenWrt networks, for example
+`eth1 — wan, wan6`, while continuing to save and use the physical device name.
 
-RC5 includes the optional RAM-only history introduced in RC4 for synchronized RTT/CPU and DL/UL
-traffic charts. Each active instance has a 1, 2, 5, 10, 15, 30, or 60 second
-sampling dropdown, a horizontally scrolling timeline that follows the latest
-sample until the user scrolls back, and exact values on hover. The hard 128 KiB
-cap remains per instance. CPU load remains available in live Status even when
-CPU log records are disabled, and Status now shows the exact installed daemon
-and LuCI package versions.
+RC6 adds structured nftables `mwan3` support. One autorate instance owns one
+uplink, one CAKE/IFB pair, one route identity, and independent latency,
+transport, quality, throughput-reference, and adaptive-ceiling state. ICMP,
+HTTP/TCP, speed tests, and Full Auto-Tune all use the same `main` route or a
+validated `mwan3 use <member> exec ...` argv path without shell evaluation.
+Status exposes `ACTIVE`, `STANDBY`, `OFFLINE`, or `LEARNING`, member/device,
+source address, external address, fwmark, routing table, and a stable error
+reason. Route/address changes discard only that uplink's learned baselines.
 
-RC5 daemon/LuCI revisions prevent duplicate SQM and `bridger` `clsact`
-state from silently breaking the IFB download path. They also add a compact
-`CAKE Autorate SQM` title and description above the application tabs. The
-optional adaptive ceiling now uses bounded probes: it remembers proven-safe
-and failed bounds independently for download and upload, rolls back immediately
-after confirmed bufferbloat, and converges with midpoint probes instead of
-repeatedly growing through a known bottleneck. RC5 also adds a source-backed
-mathematical description, an anonymized test report, and explicit credit to the
-original `cake-autorate` project and its founder.
+The Multi-WAN wizard discovers nftables mwan3 members and labels each logical,
+L3, and physical path, for example `wan → pppoe-wan → eth2`. It can create one
+isolated instance and SQM queue per member and rejects duplicate shaper
+ownership. A speed test or Full Auto-Tune pauses only the selected daemon and
+queue, verifies route identity/external IP before accepting evidence, and pins
+all speedtest-go calibration phases to the first selected server.
+
+RC6 retains optional RAM-only synchronized RTT/CPU and DL/UL charts with a
+1–60 second per-instance interval, a 128 KiB cap, shared scroll/follow state,
+exact hover values, and fixed Y-axis labels that remain visible while the data
+timeline scrolls. CPU remains available in live Status without CPU log output.
+The Quality cell distinguishes an untrained link from a learned baseline that
+is merely waiting for loaded traffic, avoiding an indefinite-looking
+`LEARNING 50%` state.
 
 The release includes separate minimal x86_64 and rockchip/armv8 offline
 bundles. Extract the matching archive under `/root/` and run its included
 installer; it validates the OpenWrt release and APK architecture, backs up the
 existing UCI configuration, and installs the two project APKs together with all
-60 transitive packages from the local repository without network access.
+65 project/runtime packages from the local repository without network access.
 
 ## Repository Layout
 
@@ -108,6 +119,12 @@ Implemented:
 
 - UCI-based config loading.
 - Multiple enabled UCI sections via procd instances.
+- Structured `route_mode=auto|main|mwan3` and `mwan3_member` routing. Native
+  nftables mwan3 state is validated before a member is used; each instance
+  publishes its resolved member, L3 device, source address, external address,
+  fwmark and routing table. Policy failover produces independent
+  `ACTIVE`/`STANDBY`/`OFFLINE`/`LEARNING` lifecycle transitions without sharing
+  learned state between uplinks.
 - `fping` RTT reflector probing, `fping-ts` and `tsping` ICMP timestamp OWD
   probing, explicit-server `irtt` OWD probing, plus a basic
   per-reflector `pinger_method=ping` fallback.
@@ -272,9 +289,10 @@ Known limits:
   used as IRTT servers. The router and IRTT servers also need synchronized
   clocks; upstream-compatible parsing ignores negative one-way delays from
   unsynchronized hosts.
-- `ping_prefix_string` is applied without a shell as a command argv prefix for
-  all pinger backends, for example `mwan3 use gpon exec fping ...`. This matches
-  the upstream policy-routing wrapper model while rejecting shell metacharacters.
+- `ping_prefix_string` remains available only for compatible legacy/main-route
+  setups and is always tokenized without a shell. The init script migrates the
+  exact legacy form `mwan3 use <member> exec` to structured `route_mode=mwan3`;
+  structured Multi-WAN never accepts a free-form shell prefix.
 - The LuCI wizard and interface preset fill `ping_extra_args=-I <target>` when
   the field is empty or still contains a generated `-I ...` value. Manual
   multi-argument ping args and `ping_prefix_string` are preserved.
@@ -294,10 +312,11 @@ Known limits:
   supported `fping` package used by `fping`/`fping-ts` and the optional `irtt`
   package. `tsping` remains a manual binary install, and `irtt` is only ready
   when explicit IRTT servers are configured and clocks are synchronized.
-- Advanced multi-WAN policy routing is still router/network configuration; the
-  GUI applies the upstream-style pinger binding/default hints above, but
-  `-I <target>` cannot create a missing route for that uplink. Status explicitly
-  warns when an enabled instance receives no probe replies.
+- Multi-WAN policy definitions, tracking targets, weights, metrics, and the
+  underlying network interfaces remain router/network configuration. Full
+  per-uplink integration requires the native nftables mwan3 backend and its
+  member-scoped status API. The application validates and consumes that state;
+  it does not invent a missing uplink or repair an invalid mwan3 policy.
 - MQTT is an optional sidecar service rather than daemon core. It requires a
   configured broker, `log_to_file=1`, `output_summary_stats=1`, and
   `mosquitto_pub` from either `mosquitto-client-nossl` or
@@ -335,12 +354,18 @@ Required package dependencies:
 
 - `uci`
 - `fping`
+- `uclient-fetch`
 
 LuCI package dependencies:
 
 - `cake-autorate-rs`
 - `luci-base`
 - `sqm-scripts`
+
+HTTPS transport probes also require one `libustream` TLS provider and trusted
+CA certificates. Normal LuCI images already provide these. The offline bundle
+contains `ca-bundle` and the default `libustream-mbedtls20201210`, but its
+installer preserves an already installed OpenSSL or wolfSSL provider.
 
 `sqm-scripts` pulls the required `tc`, CAKE, IFB, iptables, and related shaping
 packages on OpenWrt.
@@ -432,16 +457,16 @@ them together. For x86_64:
 
 ```sh
 apk add --allow-untrusted \
-  /tmp/cake-autorate-rs-1.0_rc1-r11-x86_64.apk \
-  /tmp/luci-app-cake-autorate-rs-1.0_rc1-r11.apk
+  /root/cake-autorate-rs-1.0_rc6-r1-x86_64.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc6-r1.apk
 ```
 
 For rockchip/armv8 (`aarch64_generic`):
 
 ```sh
 apk add --allow-untrusted \
-  /tmp/cake-autorate-rs-1.0_rc1-r11-aarch64_generic.apk \
-  /tmp/luci-app-cake-autorate-rs-1.0_rc1-r11.apk
+  /root/cake-autorate-rs-1.0_rc6-r1-aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc6-r1.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:
@@ -461,22 +486,22 @@ x86_64:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc4-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc4-x86_64.sh
+tar -xzf cake-autorate-rs-1.0-rc6-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc6-x86_64.sh
 ```
 
 Banana Pi R2 Pro and other OpenWrt 25.12.5 rockchip/armv8 devices:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc4-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc4-aarch64_generic.sh
+tar -xzf cake-autorate-rs-1.0-rc6-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc6-aarch64_generic.sh
 ```
 
 The installer resolves its own location, so it also works when the extracted
 bundle is kept in another directory.
 
-Each archive is about 2.1–2.2 MiB and needs roughly 5 MiB of free space while
+Each archive is about 2.7 MiB and needs roughly 6 MiB of free space while
 both the archive and its extracted contents are present. If `/root/` is too
 small, use another writable filesystem (for example `/tmp/` when its tmpfs has
 enough RAM) for both commands instead.

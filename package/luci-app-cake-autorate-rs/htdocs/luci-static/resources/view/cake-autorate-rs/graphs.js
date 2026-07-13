@@ -27,7 +27,7 @@ function parseHistory(data) {
 	var points = [];
 
 	String(data || '').split(/\n/).forEach(function(line) {
-		var fields, timestamp, rtt, cpu, dl, ul, transport, effective, dlFloor, ulFloor;
+		var fields, timestamp, rtt, cpu, dl, ul, transport, effective, dlFloor, ulFloor, uplinkState, routeIdentity;
 
 		if (!line)
 			return;
@@ -45,6 +45,8 @@ function parseHistory(data) {
 		effective = fields.length < 7 || fields[6] === '' ? null : Number(fields[6]);
 		dlFloor = fields.length < 8 || fields[7] === '' ? null : Number(fields[7]);
 		ulFloor = fields.length < 9 || fields[8] === '' ? null : Number(fields[8]);
+		uplinkState = fields.length < 10 ? '' : fields[9];
+		routeIdentity = fields.length < 11 ? '' : fields[10];
 		if (!isFinite(timestamp) || timestamp <= 0)
 			return;
 
@@ -57,7 +59,9 @@ function parseHistory(data) {
 			transport: transport == null || !isFinite(transport) ? null : transport,
 			effective: effective == null || !isFinite(effective) ? null : effective,
 			dlFloor: dlFloor == null || !isFinite(dlFloor) ? null : dlFloor,
-			ulFloor: ulFloor == null || !isFinite(ulFloor) ? null : ulFloor
+			ulFloor: ulFloor == null || !isFinite(ulFloor) ? null : ulFloor,
+			uplinkState: uplinkState,
+			routeIdentity: routeIdentity
 		});
 	});
 
@@ -286,6 +290,41 @@ function drawChartGrid(ctx, geometry) {
 	ctx.textAlign = 'left';
 }
 
+function drawRouteEvents(ctx, geometry) {
+	var previous = null;
+
+	for (var i = 0; i < geometry.points.length; i++) {
+		var point = geometry.points[i];
+		if (!previous) {
+			previous = point;
+			continue;
+		}
+		var stateChanged = point.uplinkState && point.uplinkState !== previous.uplinkState;
+		var identityChanged = point.routeIdentity && previous.routeIdentity &&
+			point.routeIdentity !== previous.routeIdentity;
+		if (!stateChanged && !identityChanged) {
+			previous = point;
+			continue;
+		}
+
+		var x = chartX(geometry, point.timestamp);
+		ctx.save();
+		ctx.strokeStyle = point.uplinkState === 'OFFLINE' ? '#c0392b' :
+			(point.uplinkState === 'LEARNING' ? '#d4a017' : '#2471a3');
+		ctx.setLineDash([ 4, 3 ]);
+		ctx.beginPath();
+		ctx.moveTo(x, geometry.top);
+		ctx.lineTo(x, geometry.top + geometry.plotHeight);
+		ctx.stroke();
+		ctx.setLineDash([]);
+		ctx.fillStyle = ctx.strokeStyle;
+		ctx.textAlign = 'left';
+		ctx.fillText(identityChanged ? _('route change') : point.uplinkState, x + 3, geometry.top + 12);
+		ctx.restore();
+		previous = point;
+	}
+}
+
 function drawLatencyChart(canvas, geometry) {
 	var ctx = prepareCanvas(canvas, geometry);
 	var rttMax = 10;
@@ -311,17 +350,10 @@ function drawLatencyChart(canvas, geometry) {
 			Math.max(0, Math.min(1, value / 100)) * geometry.plotHeight;
 	}
 
-	ctx.fillText(_('RTT %d ms').format(rttMax), 4, geometry.top + 4);
-	ctx.fillText('0', 32, geometry.top + geometry.plotHeight + 4);
-	ctx.textAlign = 'right';
-	ctx.fillText('CPU 100%', geometry.width - 4, geometry.top + 4);
-	ctx.fillText('0%', geometry.width - 4, geometry.top + geometry.plotHeight + 4);
-	ctx.textAlign = 'left';
-
 	if (!geometry.points.length) {
 		ctx.textAlign = 'center';
 		ctx.fillText(_('Waiting for history samples…'), geometry.width / 2, geometry.height / 2);
-		return;
+		return rttMax;
 	}
 
 	drawLine(ctx, geometry.points, 'rtt', function(timestamp) {
@@ -336,6 +368,8 @@ function drawLatencyChart(canvas, geometry) {
 	drawLine(ctx, geometry.points, 'cpu', function(timestamp) {
 		return chartX(geometry, timestamp);
 	}, cpuY, '#6c5ce7');
+	drawRouteEvents(ctx, geometry);
+	return rttMax;
 }
 
 function niceRateCeiling(value) {
@@ -377,13 +411,10 @@ function drawTrafficChart(canvas, geometry) {
 			Math.max(0, Math.min(1, value / rateMax)) * geometry.plotHeight;
 	}
 
-	ctx.fillText(_('Traffic %s').format(formatTrafficRate(rateMax)), 4, geometry.top + 4);
-	ctx.fillText('0', 32, geometry.top + geometry.plotHeight + 4);
-
 	if (!geometry.points.length) {
 		ctx.textAlign = 'center';
 		ctx.fillText(_('Waiting for history samples…'), geometry.width / 2, geometry.height / 2);
-		return;
+		return rateMax;
 	}
 
 	drawLine(ctx, geometry.points, 'dl', function(timestamp) {
@@ -398,6 +429,21 @@ function drawTrafficChart(canvas, geometry) {
 	drawLine(ctx, geometry.points, 'ulFloor', function(timestamp) {
 		return chartX(geometry, timestamp);
 	}, rateY, '#f6b26b');
+	drawRouteEvents(ctx, geometry);
+	return rateMax;
+}
+
+function fixedAxis(labels) {
+	var nodes = {
+		leftTop: E('span', { 'class': 'cake-graph-axis-left cake-graph-axis-top' }, labels.leftTop || ''),
+		leftBottom: E('span', { 'class': 'cake-graph-axis-left cake-graph-axis-bottom' }, labels.leftBottom || '0'),
+		rightTop: E('span', { 'class': 'cake-graph-axis-right cake-graph-axis-top' }, labels.rightTop || ''),
+		rightBottom: E('span', { 'class': 'cake-graph-axis-right cake-graph-axis-bottom' }, labels.rightBottom || '')
+	};
+	nodes.root = E('div', { 'class': 'cake-graph-fixed-axis', 'aria-hidden': 'true' }, [
+		nodes.leftTop, nodes.leftBottom, nodes.rightTop, nodes.rightBottom
+	]);
+	return nodes;
 }
 
 function nearestPoint(points, timestamp) {
@@ -436,8 +482,9 @@ function bindHover(canvas, geometry, hoverInfo) {
 			(geometry.lastTimestamp - geometry.firstTimestamp) * ratio;
 		var point = nearestPoint(geometry.points, timestamp);
 
-		hoverInfo.textContent = '%s · RTT %s · transport Δ %s · effective Δ %s · CPU %s · DL %s · UL %s · floors %s/%s'.format(
+		hoverInfo.textContent = '%s · %s · RTT %s · transport Δ %s · effective Δ %s · CPU %s · DL %s · UL %s · floors %s/%s'.format(
 			new Date(point.timestamp * 1000).toLocaleString(),
+			point.uplinkState || '-',
 			formatMetric(point.rtt, ' ms', 3),
 			formatMetric(point.transport, ' ms', 3),
 			formatMetric(point.effective, ' ms', 3),
@@ -535,10 +582,14 @@ function renderCard(instance) {
 			'role': 'img',
 			'aria-label': _('Download and upload traffic history for instance %s').format(sectionName)
 		});
+		var latencyAxis = fixedAxis({ leftBottom: '0', rightTop: 'CPU 100%', rightBottom: '0%' });
+		var trafficAxis = fixedAxis({ leftBottom: '0' });
 		var track = E('div', { 'class': 'cake-graph-track' }, [
 			E('div', { 'class': 'cake-graph-chart-title' }, _('Latency and CPU')),
+			latencyAxis.root,
 			latencyCanvas,
 			E('div', { 'class': 'cake-graph-chart-title' }, _('Download and upload traffic')),
+			trafficAxis.root,
 			trafficCanvas
 		]);
 		var viewport = E('div', { 'class': 'cake-graph-scroll' }, track);
@@ -574,8 +625,10 @@ function renderCard(instance) {
 		window.requestAnimationFrame(function() {
 			var geometry = buildChartGeometry(instance.history || [], interval, viewport);
 			track.style.width = geometry.width + 'px';
-			drawLatencyChart(latencyCanvas, geometry);
-			drawTrafficChart(trafficCanvas, geometry);
+			latencyAxis.root.style.width = Math.max(320, viewport.clientWidth || 720) + 'px';
+			trafficAxis.root.style.width = Math.max(320, viewport.clientWidth || 720) + 'px';
+			latencyAxis.leftTop.textContent = _('RTT %d ms').format(drawLatencyChart(latencyCanvas, geometry));
+			trafficAxis.leftTop.textContent = _('Traffic %s').format(formatTrafficRate(drawTrafficChart(trafficCanvas, geometry)));
 			bindHover(latencyCanvas, geometry, hoverInfo);
 			bindHover(trafficCanvas, geometry, hoverInfo);
 			bindScroll(viewport, latestButton, sectionName);
@@ -589,7 +642,9 @@ function renderCard(instance) {
 		E('div', { 'class': 'cake-graph-header' }, [
 			E('div', {}, [
 				E('h3', {}, sectionName),
-				E('small', {}, _('State: %s').format(String(status.state || '-').toUpperCase()))
+				E('small', {}, _('Uplink: %s · Controller: %s').format(
+					String(status.uplink_state || '-').toUpperCase(),
+					String(status.state || '-').toUpperCase()))
 			]),
 			E('div', { 'class': 'cake-graph-actions' }, [
 				renderIntervalSelect(sectionName, interval),
@@ -642,6 +697,10 @@ return L.view.extend({
 				'.cake-graph-scroll{display:block;width:100%;overflow-x:auto;overflow-y:hidden;scrollbar-gutter:stable}',
 				'.cake-graph-track{display:block;max-width:none}',
 				'.cake-graph-chart-title{position:sticky;left:0;z-index:1;display:inline-block;margin:5px 0 1px;padding:2px 6px;border-radius:3px;background:var(--background-color-high,#fff);font-weight:600}',
+				'.cake-graph-fixed-axis{position:sticky;left:0;z-index:2;height:0;pointer-events:none;font-size:12px;color:#777}',
+				'.cake-graph-fixed-axis span{position:absolute;padding:1px 3px;border-radius:2px;background:var(--background-color-high,rgba(255,255,255,.82));white-space:nowrap}',
+				'.cake-graph-axis-left{left:1px}.cake-graph-axis-right{right:1px;text-align:right}',
+				'.cake-graph-axis-top{top:27px}.cake-graph-axis-bottom{top:181px}',
 				'.cake-graph-canvas{display:block;max-width:none;height:220px}',
 				'.cake-graph-disabled{min-height:80px;display:flex;align-items:center;color:#777}',
 				'@media(max-width:600px){.cake-graphs-grid{grid-template-columns:1fr}.cake-graph-header{align-items:flex-start;flex-direction:column}.cake-graph-actions{width:100%;justify-content:space-between}.cake-graph-canvas{height:200px}.cake-graph-latest{margin-left:0}}'
