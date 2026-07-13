@@ -28,7 +28,7 @@ const uci = {
 const helpers = new Function(
 	'fs', 'form', 'network', 'uci', 'ui', 'widgets', 'cakeUi', 'L', 'E', '_',
 	`${prefix}\ninterfaceContext = { deviceNames: { eth1: true }, deviceNetworks: {}, ` +
-		`networkDevices: {}, defaultDevice: 'eth1' };\nreturn { writeWizardConfig };`
+		`networkDevices: {}, defaultDevice: 'eth1' };\nreturn { writeWizardConfig, validateTransportProbeUrl };`
 )({}, {}, {}, uci, {}, {}, {}, {}, () => ({}), value => value);
 
 const proposal = {
@@ -109,5 +109,12 @@ assert.equal(written.sqm_linklayer, 'none');
 assert.equal(written.sqm_overhead, '0');
 assert.equal(written.sqm_tcMPU, '0');
 assert.equal(written.speedtest_go_server_id, '17372');
+
+assert.equal(helpers.validateTransportProbeUrl(''), true);
+assert.equal(helpers.validateTransportProbeUrl(null), true);
+assert.equal(helpers.validateTransportProbeUrl('https://www.google.com/generate_204'), true);
+assert.equal(helpers.validateTransportProbeUrl('http://example.test/probe?bytes=0'), true);
+assert.equal(helpers.validateTransportProbeUrl('ftp://example.test/probe'), 'Enter an HTTP or HTTPS URL without spaces.');
+assert.equal(helpers.validateTransportProbeUrl('https://example.test/has space'), 'Enter an HTTP or HTTPS URL without spaces.');
 
 console.log('settings autotune tests passed');

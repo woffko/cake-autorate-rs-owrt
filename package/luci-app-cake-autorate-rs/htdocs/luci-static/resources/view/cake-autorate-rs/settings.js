@@ -669,6 +669,17 @@ function validateIrttServerValue(value) {
 	return true;
 }
 
+function validateTransportProbeUrl(value) {
+	/* DynamicList validates its empty add-item control as well as saved items. */
+	if (value == null || value === '')
+		return true;
+
+	if (!/^https?:\/\/\S+$/.test(String(value)))
+		return _('Enter an HTTP or HTTPS URL without spaces.');
+
+	return true;
+}
+
 function selectedSqmSection(section, section_id) {
 	return formOrUci(section, section_id, 'sqm_section') || managedSqmSectionName(section_id);
 }
@@ -2555,9 +2566,7 @@ function addQualityOptions(section) {
 		'https://connectivitycheck.gstatic.com/generate_204'
 	];
 	o.validate = function(section_id, value) {
-		if (!value || !/^https?:\/\/\S+$/.test(String(value)))
-			return _('Enter an HTTP or HTTPS URL without spaces.');
-		return true;
+		return validateTransportProbeUrl(value);
 	};
 
 	o = value(section, 'quality', 'transport_probe_idle_interval_s', _('Idle probe interval'), 'and(ufloat,min(5),max(3600))', '15.0');
