@@ -23,10 +23,15 @@ the calculated floor, `quality_limited` appears when the safe floor prevents the
 target, old five-column graph history remains readable, and all new history
 stays in `/var/run`.
 
-RC7 also requires deterministic coverage for the separate detected rating:
-endpoint-specific p5 idle baselines, p90 loaded percentiles, the 2 ms noise
-clamp, worse-of-download/upload selection, bidirectional exclusion, route-change
-staleness, and `CURRENT`/`PREVIOUS` lifecycle. Graph acceptance checks the
+RC8 requires deterministic coverage for the native transport RTT contract:
+DNS/handshake warm-up exclusion, route-bound sockets, persistent connection
+reuse, symmetric outlier removal, trusted/untrusted backends, 20-sample p5
+idle and per-direction p90 loaded windows, CPU/load-phase rejection, and two
+confirmed bad windows before optional control. Measurement-only mode must leave
+all CAKE rates unchanged. Detected-grade tests cover the 2 ms noise clamp,
+worse-of-download/upload selection, `PARTIAL` one-direction evidence,
+bidirectional exclusion, route-change staleness, and `CURRENT`/`PREVIOUS`
+lifecycle. Graph acceptance checks the
 proportional RAM tiers, critical-memory suspension, shared per-instance budget,
 streaming compaction, bounded history paging, vertical WAN cards, grade-event
 hover details, and fixed non-scrolling axis labels.
@@ -284,6 +289,11 @@ graph-scale regression.
 
 ## RC7 detected-grade and RAM-history acceptance gate (2026-07-14)
 
+This is retained as a historical UI/RAM-history gate. It did not establish
+browser-rating parity: RC7 still timed whole `uclient-fetch` executions. The
+network-RTT defect and its RC8 replacement are documented in the next section
+and in [TRANSPORT_QUALITY.md](TRANSPORT_QUALITY.md).
+
 RC7 was first installed on a disposable OpenWrt 25.12.5 x86_64 router, then on
 an x86_64 two-uplink nftables-mwan3 router and an ARMv8 variable-WWAN router.
 The existing `cake-autorate`, SQM, network, and (where present) mwan3 files were
@@ -332,3 +342,86 @@ The local release gate passed 78 Rust tests, strict Clippy, Rust formatting,
 init/SQM conflict tests, scheduler and Auto-Tune lifecycle tests, speed-test
 routing tests, the graph-history helper test, four LuCI JavaScript suites,
 shell and JavaScript syntax checks, ACL JSON parsing, and `git diff --check`.
+
+## RC8 native transport RTT acceptance gate (2026-07-14)
+
+RC8 was installed first on the disposable x86_64 router, then on the same
+two-uplink x86_64 nftables-mwan3 system and ARMv8 variable-WWAN system used by
+the earlier gates. The final artifacts were rebuilt after the outlier-removal
+regression test was added:
+
+| Artifact | SHA-256 |
+|---|---|
+| x86_64 daemon APK | `9b880ab804ee73f949248ba3097892ab8257a3794d93393820d60bbda6fb4145` |
+| aarch64_generic daemon APK | `4d6064c24cdb1b71d5df15fba605a2f7e1135e92d87f8ff31de34851ad37a1c0` |
+| noarch LuCI APK | `e8dbd3402a8398bc3666138c435c25740616401f80617f6b2650a9b9d90e5375` |
+
+Each offline repository indexed 65 APKs. With networking and package scripts
+disabled, all 65 installed into a fresh architecture-specific root. Bundle
+SHA-256 values are
+`9ebfa2f6a36f33a7f55714ae3386dd68d4142e28f1f837a1f122647e3462a6bb`
+for x86_64 and
+`a53966c4358430ae4f41043b9ed2a4c0ffc3e2a850f306f00ed64b7f2c44e5f7`
+for rockchip/armv8. The x86 installer was then run from its extracted bundle on
+the disposable router; it used only `packages.adb`, created a dated RC8 backup,
+left the final binary installed/running, and preserved all four UCI hashes.
+
+Before RC8, process-timed HTTP baselines on the real routers were roughly
+229-389 ms. One retained result called a link C from a 296 ms idle baseline,
+despite a simultaneous browser-side test reporting A+. The number included
+process, DNS, TCP/TLS, and remote HTTP time; it was not comparable to browser
+network RTT.
+
+The final RC8 persistent WebSocket probes instead measured these anonymized
+paths:
+
+| Path | WebSocket network RTT | TCP-connect comparison | Learned idle p5 |
+|---|---:|---:|---:|
+| primary PPPoE | about 0.8-1.5 ms | about 0.7-0.9 ms | about 0.8 ms |
+| standby Ethernet uplink | about 19-31 ms | about 17-24 ms | about 19 ms |
+| variable WWAN | about 17-28 ms | about 16-24 ms | about 19 ms |
+
+Every native batch used four sequential observations and reported connection
+reuse on its second invocation. A deliberately isolated observation was
+removed symmetrically: status/CLI reported `discarded=1`, and only the three
+accepted raw RTT values reached the p5/p90 trackers. DNS and a simulated
+120 ms initial handshake were excluded by deterministic tests.
+
+The primary and standby instances retained separate device, source address,
+fwmark, routing table, public-address evidence, baseline, and persistent
+connection. Both reached `baseline_ready` after at least 20 accepted idle RTT
+samples. The ARM main-route instance did the same. Status reported
+`network_rtt_v2`, trusted `websocket`, connection reuse, and
+`transport_rtt_p90_loaded_minus_p5_idle_v2` throughout.
+
+`transport_controller_enabled` remained false on all upgraded instances.
+Primary CAKE stayed at 900000/860000 kbit/s, backup CAKE at 108000/14500
+kbit/s, and WWAN CAKE at 114515/15773 kbit/s. Saved cake-autorate, SQM,
+network, and mwan3 hashes were identical before and after every install; the
+disposable router's temporary acceptance settings were restored byte-for-byte.
+The production mwan3 service was never restarted.
+
+During the final observation window, the physical PPPoE interface remained up
+while the router's pre-existing mwan3 ICMP tracker intermittently lost two of
+its three primary-member targets. A route-bound native TCP probe still
+succeeded, and the standby member remained online. RC8 consequently moved only
+the affected instance through `OFFLINE`, `LEARNING`, and `ACTIVE`, invalidated
+its stale baseline after each route-state change, and left the standby
+instance's baseline intact. This is expected failover/relearning behavior and
+also explains why a live primary instance may temporarily show zero learning
+progress during real tracker churn; it is not a return of the RC7 process-time
+measurement defect. No mwan3 configuration or service state was changed for
+this observation.
+
+Authenticated read-only Playwright acceptance passed on both production
+routers. The disposable run additionally changed one Quality field, used the
+modal `Save`, applied it, reopened the modal to prove persistence, restored the
+old value, and applied again. Status tooltips showed backend/trust/reuse,
+controller state, raw/discarded samples, and rejection reason. Graph cards were
+vertical per WAN, both canvases shared one timeline, and fixed Y labels did not
+move with horizontal scrolling. No LuCI application page exception remained.
+
+The final local gate passed 82 Rust tests, strict Clippy and formatting, five
+shell lifecycle/routing suites, four LuCI JavaScript suites, package builds for
+x86_64 and aarch64_generic, shell/JSON/diff validation, and the three live
+router checks above.

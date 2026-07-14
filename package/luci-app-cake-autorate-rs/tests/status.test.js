@@ -53,7 +53,7 @@ const detected = helpers.formatQuality({
 assert.equal(detected.attrs.class, 'cake-quality-stack');
 assert.equal(detected.children[0].children[1].children, 'B');
 assert.match(detected.children[0].children[2].children, /DL A\+.*UL B/);
-assert.equal(detected.children[1].children[1].children, 'A+');
+assert.equal(detected.children[1].children[1].children, 'PARTIAL');
 
 const collecting = helpers.formatQuality({
 	transport_latency_enabled: true,

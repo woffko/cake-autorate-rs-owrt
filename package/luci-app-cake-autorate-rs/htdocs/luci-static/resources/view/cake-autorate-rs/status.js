@@ -195,12 +195,13 @@ function renderDetectedGrade(label, result, state, collected, required) {
 			detail = _('Collecting idle baseline');
 		}
 	} else {
-		value = result.grade || '-';
+		value = result.partial ? _('PARTIAL') : (result.grade || '-');
 		detail = _('+%s ms · %s · %s').format(
 			Number(result.increase_ms || 0).toFixed(1),
 			qualityDirectionSummary(result),
 			qualityAge(result));
-		classes += ' ' + qualityGradeClass(value);
+		if (!result.partial)
+			classes += ' ' + qualityGradeClass(value);
 		if (result.stale)
 			classes += ' cake-quality-stale';
 	}
@@ -222,12 +223,23 @@ function formatQuality(status) {
 		var previous = status.quality_grade_previous || null;
 		var state = String(status.quality_grade_state || 'learning_baseline');
 		var title = [
-			_('Detected rating uses loaded p90 minus the preceding idle p5 on one HTTP/TCP endpoint.'),
+			_('Detected rating uses network RTT loaded p90 minus the preceding idle p5. DNS, process startup, and connection handshake time are excluded.'),
 			_('Download and upload are scored independently; the worse grade is shown.'),
+			_('A one-direction result is labeled PARTIAL and is never presented as the final connection rating.'),
 			_('Bidirectional latency is diagnostic and does not affect the total grade.'),
-			_('Controller signal: %s · effective delta: %s ms').format(
+			_('Backend: %s · trusted: %s · reused connection: %s').format(
+				status.transport_probe_backend || '-',
+				status.transport_probe_trusted ? _('yes') : _('no'),
+				status.transport_probe_connection_reused ? _('yes') : _('no')),
+			_('Accepted raw samples: %d · discarded: %d · confidence: %d%%').format(
+				Number(status.transport_probe_raw_samples || 0),
+				Number(status.transport_probe_discarded_samples || 0),
+				Number(status.transport_confidence || 0)),
+			_('Controller: %s · signal: %s · effective delta: %s ms').format(
+				status.transport_controller_enabled ? _('enabled') : _('disabled'),
 				status.quality_class || 'LEARNING',
 				status.effective_latency_delta_ms == null ? '-' : Number(status.effective_latency_delta_ms).toFixed(1)),
+			_('Rejected sample: %s').format(status.transport_probe_rejected_reason || '-'),
 			_('Transport error code: %s').format(status.transport_error_code || '-'),
 			_('Safe floors: DL %s · UL %s').format(formatRate(status.throughput_floor_dl_kbps), formatRate(status.throughput_floor_ul_kbps))
 		].join('\n');

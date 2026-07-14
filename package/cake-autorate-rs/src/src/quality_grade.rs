@@ -2,9 +2,10 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::transport_quality::{classify_quality, QualityClass};
 
-pub const MIN_BASELINE_SAMPLES: usize = 3;
-pub const MIN_LOADED_SAMPLES: usize = 3;
-const BASELINE_WINDOW: usize = 40;
+pub const MIN_BASELINE_SAMPLES: usize = 20;
+pub const MIN_LOADED_SAMPLES: usize = 20;
+const BASELINE_WINDOW: usize = 120;
+const LOAD_SESSION_GRACE_S: f64 = 20.0;
 
 #[derive(Clone, Debug)]
 pub struct QualityGradeMetric {
@@ -58,6 +59,7 @@ struct ActiveWindow {
     endpoint: Option<String>,
     baseline_p5_ms: Option<f64>,
     started_at: f64,
+    last_loaded_at: f64,
     route_identity: String,
     dl: Vec<f64>,
     ul: Vec<f64>,
@@ -70,6 +72,7 @@ impl ActiveWindow {
             endpoint: None,
             baseline_p5_ms: None,
             started_at,
+            last_loaded_at: started_at,
             route_identity: route_identity.to_string(),
             dl: Vec::new(),
             ul: Vec::new(),
@@ -161,13 +164,29 @@ impl QualityGradeTracker {
         self.set_route(route_identity);
 
         if !dl_loaded && !ul_loaded {
-            self.finish_active(timestamp);
             let samples = self.baselines.entry(endpoint.to_string()).or_default();
             samples.push_back(latency_ms);
             while samples.len() > BASELINE_WINDOW {
                 samples.pop_front();
             }
+            if self
+                .active
+                .as_ref()
+                .map(|active| timestamp - active.last_loaded_at >= LOAD_SESSION_GRACE_S)
+                .unwrap_or(false)
+            {
+                self.finish_active(timestamp);
+            }
             return;
+        }
+
+        if self
+            .active
+            .as_ref()
+            .map(|active| timestamp - active.last_loaded_at >= LOAD_SESSION_GRACE_S)
+            .unwrap_or(false)
+        {
+            self.finish_active(timestamp);
         }
 
         let baseline = self.baseline_p5(endpoint);
@@ -183,6 +202,7 @@ impl QualityGradeTracker {
         if active.endpoint.as_deref() != Some(endpoint) {
             return;
         }
+        active.last_loaded_at = timestamp;
 
         if dl_loaded && ul_loaded {
             active.bidirectional.push(latency_ms);
@@ -311,22 +331,29 @@ mod tests {
     use super::*;
 
     fn seed_baseline(tracker: &mut QualityGradeTracker, endpoint: &str, route: &str) {
-        tracker.observe(endpoint, 10.0, false, false, 1.0, route);
-        tracker.observe(endpoint, 12.0, false, false, 2.0, route);
-        tracker.observe(endpoint, 14.0, false, false, 3.0, route);
+        for index in 0..MIN_BASELINE_SAMPLES {
+            tracker.observe(
+                endpoint,
+                10.0 + (index % 3) as f64,
+                false,
+                false,
+                1.0 + index as f64,
+                route,
+            );
+        }
     }
 
     #[test]
     fn current_and_previous_survive_the_next_collection_window() {
         let mut tracker = QualityGradeTracker::new();
         seed_baseline(&mut tracker, "endpoint", "route-a");
-        for (index, latency) in [12.0, 13.0, 14.0].into_iter().enumerate() {
+        for index in 0..MIN_LOADED_SAMPLES {
             tracker.observe(
                 "endpoint",
-                latency,
+                12.0 + (index % 3) as f64,
                 true,
                 false,
-                10.0 + index as f64,
+                30.0 + index as f64,
                 "route-a",
             );
         }
@@ -335,12 +362,12 @@ mod tests {
         assert_eq!(live.current.as_ref().unwrap().class, QualityClass::APlus);
         assert!(live.previous.is_none());
 
-        tracker.observe("endpoint", 11.0, false, false, 20.0, "route-a");
+        tracker.observe("endpoint", 11.0, false, false, 70.0, "route-a");
         let finished = tracker.snapshot();
         assert_eq!(finished.state, "final");
         assert!(finished.current.as_ref().unwrap().completed_at.is_some());
 
-        tracker.observe("endpoint", 80.0, false, true, 30.0, "route-a");
+        tracker.observe("endpoint", 80.0, false, true, 80.0, "route-a");
         let collecting = tracker.snapshot();
         assert_eq!(collecting.state, "collecting");
         assert!(collecting.current.is_none());
@@ -354,13 +381,13 @@ mod tests {
     fn bidirectional_is_diagnostic_and_does_not_set_overall_grade() {
         let mut tracker = QualityGradeTracker::new();
         seed_baseline(&mut tracker, "endpoint", "route-a");
-        for index in 0..4 {
+        for index in 0..MIN_LOADED_SAMPLES {
             tracker.observe(
                 "endpoint",
                 500.0,
                 true,
                 true,
-                10.0 + index as f64,
+                30.0 + index as f64,
                 "route-a",
             );
         }
@@ -375,9 +402,10 @@ mod tests {
             endpoint: Some("endpoint".to_string()),
             baseline_p5_ms: Some(10.0),
             started_at: 1.0,
+            last_loaded_at: 20.0,
             route_identity: "route-a".to_string(),
-            dl: vec![12.0, 13.0, 14.0],
-            ul: vec![100.0, 110.0, 120.0],
+            dl: vec![12.0; MIN_LOADED_SAMPLES],
+            ul: vec![100.0; MIN_LOADED_SAMPLES],
             bidirectional: Vec::new(),
         };
         let result = active.result(Some(20.0)).unwrap();
@@ -391,17 +419,17 @@ mod tests {
     fn route_change_keeps_last_result_but_marks_it_stale() {
         let mut tracker = QualityGradeTracker::new();
         seed_baseline(&mut tracker, "endpoint", "route-a");
-        for index in 0..3 {
+        for index in 0..MIN_LOADED_SAMPLES {
             tracker.observe(
                 "endpoint",
                 12.0,
                 true,
                 false,
-                10.0 + index as f64,
+                30.0 + index as f64,
                 "route-a",
             );
         }
-        tracker.observe("endpoint", 11.0, false, false, 20.0, "route-a");
+        tracker.observe("endpoint", 11.0, false, false, 70.0, "route-a");
         tracker.set_route("route-b");
         let snapshot = tracker.snapshot();
         assert!(snapshot.current_stale);
@@ -410,7 +438,7 @@ mod tests {
 
     #[test]
     fn tiny_delta_is_clamped_and_percentiles_are_interpolated() {
-        let metric = metric(&[10.0, 11.0, 12.0], 11.0).unwrap();
+        let metric = metric(&[11.0; MIN_LOADED_SAMPLES], 11.0).unwrap();
         assert_eq!(metric.increase_ms, 0.0);
         assert_eq!(metric.class, QualityClass::APlus);
         assert_eq!(percentile([0.0, 10.0], 90.0), Some(9.0));

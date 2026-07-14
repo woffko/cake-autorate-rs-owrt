@@ -14,6 +14,7 @@ mod adaptive_ceiling;
 mod autotune;
 mod quality_grade;
 mod routing;
+mod transport_probe;
 mod transport_quality;
 
 use adaptive_ceiling::{
@@ -22,6 +23,7 @@ use adaptive_ceiling::{
 };
 use quality_grade::{QualityGradeMetric, QualityGradeResult, QualityGradeTracker};
 use routing::{RouteMode, RouteSnapshot, RouteSpec, UplinkLifecycle, UplinkState};
+use transport_probe::{RouteBinding, TransportProbeBackend, TransportProbeEngine};
 use transport_quality::{
     classify_quality, effective_latency_delta_ms, throughput_floor, transport_allows_growth,
     QualityClass, QualitySearchDirection, QualitySearchPolicy, ThroughputGuardInput,
@@ -102,10 +104,15 @@ struct Config {
     adaptive_ceiling_cooldown_s: f64,
     adaptive_ceiling_failed_bound_ttl_s: f64,
     transport_latency_enabled: bool,
+    transport_controller_enabled: bool,
+    transport_probe_backend: String,
+    transport_probe_endpoint: String,
     transport_probe_urls: Vec<String>,
     transport_probe_idle_interval_s: f64,
     transport_probe_loaded_interval_s: f64,
     transport_probe_timeout_s: u64,
+    transport_load_hold_s: f64,
+    transport_cpu_max_percent: f64,
     quality_target_delay_ms: f64,
     quality_search_max_steps: usize,
     quality_search_observe_s: f64,
@@ -223,6 +230,9 @@ impl Config {
             adaptive_ceiling_cooldown_s: 30.0,
             adaptive_ceiling_failed_bound_ttl_s: 900.0,
             transport_latency_enabled: false,
+            transport_controller_enabled: false,
+            transport_probe_backend: "websocket".to_string(),
+            transport_probe_endpoint: "wss://ping-bufferbloat.libreqos.com/ws".to_string(),
             transport_probe_urls: vec![
                 "https://speed.cloudflare.com/__down?bytes=0".to_string(),
                 "https://www.google.com/generate_204".to_string(),
@@ -231,6 +241,8 @@ impl Config {
             transport_probe_idle_interval_s: 15.0,
             transport_probe_loaded_interval_s: 1.0,
             transport_probe_timeout_s: 5,
+            transport_load_hold_s: 3.0,
+            transport_cpu_max_percent: 85.0,
             quality_target_delay_ms: 30.0,
             quality_search_max_steps: 3,
             quality_search_observe_s: 6.0,
@@ -476,6 +488,21 @@ impl Config {
             "transport_latency_enabled",
             &mut cfg.transport_latency_enabled,
         )?;
+        set_bool(
+            &single,
+            "transport_controller_enabled",
+            &mut cfg.transport_controller_enabled,
+        )?;
+        set_string(
+            &single,
+            "transport_probe_backend",
+            &mut cfg.transport_probe_backend,
+        );
+        set_string(
+            &single,
+            "transport_probe_endpoint",
+            &mut cfg.transport_probe_endpoint,
+        );
         set_f64(
             &single,
             "transport_probe_idle_interval_s",
@@ -490,6 +517,16 @@ impl Config {
             &single,
             "transport_probe_timeout_s",
             &mut cfg.transport_probe_timeout_s,
+        )?;
+        set_f64(
+            &single,
+            "transport_load_hold_s",
+            &mut cfg.transport_load_hold_s,
+        )?;
+        set_f64(
+            &single,
+            "transport_cpu_max_percent",
+            &mut cfg.transport_cpu_max_percent,
         )?;
         set_f64(
             &single,
@@ -1056,19 +1093,47 @@ impl Config {
                 );
             }
         }
+        if self.transport_controller_enabled && !self.transport_latency_enabled {
+            return Err(
+                "transport_controller_enabled requires transport_latency_enabled".to_string(),
+            );
+        }
         if self.transport_latency_enabled {
-            if self.transport_probe_urls.is_empty() {
+            let backend = TransportProbeBackend::parse(&self.transport_probe_backend)
+                .ok_or_else(|| "transport_probe_backend is unsupported".to_string())?;
+            if self.transport_probe_endpoint.is_empty()
+                || self.transport_probe_endpoint.len() > 512
+                || self
+                    .transport_probe_endpoint
+                    .chars()
+                    .any(char::is_whitespace)
+            {
+                return Err("transport_probe_endpoint is invalid".to_string());
+            }
+            let endpoint_matches = match backend {
+                TransportProbeBackend::WebSocket => {
+                    self.transport_probe_endpoint.starts_with("ws://")
+                        || self.transport_probe_endpoint.starts_with("wss://")
+                }
+                TransportProbeBackend::TcpConnect => {
+                    self.transport_probe_endpoint.starts_with("tcp://")
+                }
+                TransportProbeBackend::PersistentHttp | TransportProbeBackend::LegacyHttp => {
+                    self.transport_probe_endpoint.starts_with("http://")
+                        || self.transport_probe_endpoint.starts_with("https://")
+                }
+            };
+            if !endpoint_matches {
                 return Err(
-                    "transport_latency_enabled requires at least one transport_probe_url"
+                    "transport_probe_endpoint scheme does not match transport_probe_backend"
                         .to_string(),
                 );
             }
-            if self.transport_probe_urls.iter().any(|url| {
-                !(url.starts_with("http://") || url.starts_with("https://"))
-                    || url.len() > 512
-                    || url.chars().any(char::is_whitespace)
-            }) {
-                return Err("transport_probe_url must be a safe HTTP(S) URL".to_string());
+            if self.transport_controller_enabled && !backend.trusted() {
+                return Err(
+                    "transport_controller_enabled requires a trusted native transport backend"
+                        .to_string(),
+                );
             }
             if !self.transport_probe_idle_interval_s.is_finite()
                 || self.transport_probe_idle_interval_s < 5.0
@@ -1088,6 +1153,16 @@ impl Config {
             }
             if !(1..=30).contains(&self.transport_probe_timeout_s) {
                 return Err("transport_probe_timeout_s must be between 1 and 30".to_string());
+            }
+            if !self.transport_load_hold_s.is_finite()
+                || !(1.0..=30.0).contains(&self.transport_load_hold_s)
+            {
+                return Err("transport_load_hold_s must be between 1 and 30".to_string());
+            }
+            if !self.transport_cpu_max_percent.is_finite()
+                || !(50.0..=100.0).contains(&self.transport_cpu_max_percent)
+            {
+                return Err("transport_cpu_max_percent must be between 50 and 100".to_string());
             }
             if !self.quality_target_delay_ms.is_finite()
                 || !(5.0..=200.0).contains(&self.quality_target_delay_ms)
@@ -1657,7 +1732,6 @@ impl RateMonitor {
 
 #[derive(Clone, Debug)]
 struct TransportProbeRequest {
-    endpoint: String,
     loaded: bool,
     dl_loaded: bool,
     ul_loaded: bool,
@@ -1672,14 +1746,21 @@ struct TransportProbeResult {
     latency_ms: Option<f64>,
     error: Option<String>,
     route_identity: Option<String>,
+    backend: String,
+    trusted: bool,
+    raw_samples_ms: Vec<f64>,
+    discarded_samples: usize,
+    server_processing_ms: f64,
+    connection_reused: bool,
 }
 
 struct TransportProbeRuntime {
     requests: SyncSender<TransportProbeRequest>,
     results: Receiver<TransportProbeResult>,
     in_flight: bool,
-    next_endpoint: usize,
     last_started: Instant,
+    load_candidate: (bool, bool),
+    load_candidate_since: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -1739,24 +1820,140 @@ impl TransportProbeRuntime {
         let (result_tx, result_rx) = mpsc::channel::<TransportProbeResult>();
         let route_spec = cfg.route_spec();
         let timeout_s = cfg.transport_probe_timeout_s;
+        let backend = TransportProbeBackend::parse(&cfg.transport_probe_backend)
+            .unwrap_or(TransportProbeBackend::LegacyHttp);
+        let endpoint = cfg.transport_probe_endpoint.clone();
         thread::spawn(move || {
+            let mut engine: Option<(String, TransportProbeEngine)> = None;
             while let Ok(request) = request_rx.recv() {
-                let started = Instant::now();
-                let result = run_transport_probe(&route_spec, timeout_s, &request.endpoint);
-                let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-                let (latency_ms, error, route_identity) = match result {
-                    Ok(snapshot) => (Some(elapsed_ms), None, Some(snapshot.stable_key())),
-                    Err(error) => (None, Some(error), None),
+                let before = routing::inspect_route(&route_spec);
+                let measurement = match before.as_ref() {
+                    Ok(snapshot) if snapshot.online => {
+                        let identity = snapshot.stable_key();
+                        if backend == TransportProbeBackend::LegacyHttp {
+                            let started = Instant::now();
+                            match run_transport_probe(&route_spec, timeout_s, &endpoint) {
+                                Ok(after) if after.stable_key() == identity => {
+                                    Ok(transport_probe::TransportProbeSample {
+                                        backend,
+                                        endpoint: endpoint.clone(),
+                                        rtt_ms: started.elapsed().as_secs_f64() * 1000.0,
+                                        raw_samples_ms: Vec::new(),
+                                        discarded_samples: 0,
+                                        server_processing_ms: 0.0,
+                                        trusted: false,
+                                        connection_reused: false,
+                                    })
+                                }
+                                Ok(_) => {
+                                    Err("route changed during legacy transport probe".to_string())
+                                }
+                                Err(error) => Err(error),
+                            }
+                        } else {
+                            (|| -> Result<transport_probe::TransportProbeSample, String> {
+                                let replace = engine
+                                    .as_ref()
+                                    .map(|(key, _)| key != &identity)
+                                    .unwrap_or(true);
+                                if replace {
+                                    let binding = RouteBinding {
+                                        device: snapshot.identity.device.clone(),
+                                        source_ip: snapshot.identity.source_ip.clone(),
+                                        fwmark: snapshot.identity.fwmark.clone(),
+                                    };
+                                    engine = Some((
+                                        identity.clone(),
+                                        TransportProbeEngine::new(
+                                            backend,
+                                            endpoint.clone(),
+                                            binding,
+                                            Duration::from_secs(timeout_s),
+                                        )?,
+                                    ));
+                                }
+                                engine
+                                    .as_mut()
+                                    .ok_or_else(|| "transport engine is unavailable".to_string())?
+                                    .1
+                                    .probe()
+                            })()
+                        }
+                    }
+                    Ok(snapshot) => Err(if snapshot.reason.is_empty() {
+                        "transport route is offline".to_string()
+                    } else {
+                        snapshot.reason.clone()
+                    }),
+                    Err(error) => Err(error.clone()),
+                };
+                let after = routing::inspect_route(&route_spec);
+                let stable_identity = match (&before, &after) {
+                    (Ok(before), Ok(after))
+                        if before.online
+                            && after.online
+                            && before.stable_key() == after.stable_key() =>
+                    {
+                        Some(after.stable_key())
+                    }
+                    _ => None,
+                };
+                let (
+                    latency_ms,
+                    error,
+                    backend_name,
+                    trusted,
+                    raw_samples_ms,
+                    discarded_samples,
+                    server_processing_ms,
+                    connection_reused,
+                ) = match measurement {
+                    Ok(sample) if stable_identity.is_some() => (
+                        Some(sample.rtt_ms),
+                        None,
+                        sample.backend.as_str().to_string(),
+                        sample.trusted,
+                        sample.raw_samples_ms,
+                        sample.discarded_samples,
+                        sample.server_processing_ms,
+                        sample.connection_reused,
+                    ),
+                    Ok(_) => (
+                        None,
+                        Some("route changed during native transport probe".to_string()),
+                        backend.as_str().to_string(),
+                        false,
+                        Vec::new(),
+                        0,
+                        0.0,
+                        false,
+                    ),
+                    Err(error) => (
+                        None,
+                        Some(error),
+                        backend.as_str().to_string(),
+                        false,
+                        Vec::new(),
+                        0,
+                        0.0,
+                        false,
+                    ),
                 };
                 if result_tx
                     .send(TransportProbeResult {
-                        endpoint: request.endpoint,
+                        endpoint: endpoint.clone(),
                         loaded: request.loaded,
                         dl_loaded: request.dl_loaded,
                         ul_loaded: request.ul_loaded,
                         latency_ms,
                         error,
-                        route_identity,
+                        route_identity: stable_identity,
+                        backend: backend_name,
+                        trusted,
+                        raw_samples_ms,
+                        discarded_samples,
+                        server_processing_ms,
+                        connection_reused,
                     })
                     .is_err()
                 {
@@ -1769,10 +1966,11 @@ impl TransportProbeRuntime {
             requests: request_tx,
             results: result_rx,
             in_flight: false,
-            next_endpoint: 0,
             last_started: Instant::now()
                 .checked_sub(Duration::from_secs_f64(cfg.transport_probe_idle_interval_s))
                 .unwrap_or_else(Instant::now),
+            load_candidate: (false, false),
+            load_candidate_since: Instant::now(),
         }
     }
 
@@ -1791,12 +1989,21 @@ impl TransportProbeRuntime {
         dl_shaper: f64,
         ul_shaper: f64,
     ) {
-        if self.in_flight || cfg.transport_probe_urls.is_empty() {
-            return;
-        }
         let dl_loaded = percent(dl_rate, dl_shaper) >= cfg.high_load_thr * 100.0;
         let ul_loaded = percent(ul_rate, ul_shaper) >= cfg.high_load_thr * 100.0;
+        let phase = (dl_loaded, ul_loaded);
+        if phase != self.load_candidate {
+            self.load_candidate = phase;
+            self.load_candidate_since = Instant::now();
+        }
         let loaded = dl_loaded || ul_loaded;
+        if self.in_flight
+            || (loaded
+                && self.load_candidate_since.elapsed()
+                    < Duration::from_secs_f64(cfg.transport_load_hold_s))
+        {
+            return;
+        }
         let interval = if loaded {
             cfg.transport_probe_loaded_interval_s
         } else {
@@ -1806,13 +2013,9 @@ impl TransportProbeRuntime {
             return;
         }
 
-        let endpoint =
-            cfg.transport_probe_urls[self.next_endpoint % cfg.transport_probe_urls.len()].clone();
-        self.next_endpoint = self.next_endpoint.wrapping_add(1);
         if self
             .requests
             .try_send(TransportProbeRequest {
-                endpoint,
                 loaded,
                 dl_loaded,
                 ul_loaded,
@@ -2327,11 +2530,22 @@ struct Controller {
     adaptive_dl: AdaptiveCeilingDirection,
     adaptive_ul: AdaptiveCeilingDirection,
     transport_latency: TransportLatencyTracker,
+    transport_latency_dl: TransportLatencyTracker,
+    transport_latency_ul: TransportLatencyTracker,
     quality_grade: QualityGradeTracker,
     quality_search_dl: QualitySearchDirection,
     quality_search_ul: QualitySearchDirection,
     quality_dl_class: QualityClass,
     quality_ul_class: QualityClass,
+    transport_backend: String,
+    transport_trusted: bool,
+    transport_raw_samples: usize,
+    transport_discarded_samples: usize,
+    transport_server_processing_ms: f64,
+    transport_connection_reused: bool,
+    transport_rejected_reason: Option<String>,
+    transport_bad_windows_dl: u8,
+    transport_bad_windows_ul: u8,
     throughput_floor_dl: f64,
     throughput_floor_ul: f64,
     last_set_dl: u64,
@@ -2400,7 +2614,7 @@ impl Controller {
             cfg.adaptive_ceiling_ul_cap_kbps,
         );
         let throughput_floor_dl = throughput_floor(ThroughputGuardInput {
-            enabled: cfg.transport_latency_enabled && cfg.throughput_guard_enabled,
+            enabled: cfg.transport_controller_enabled && cfg.throughput_guard_enabled,
             configured_min_kbps: cfg.min_dl_shaper_rate_kbps,
             configured_base_kbps: cfg.base_dl_shaper_rate_kbps,
             observed_p20_kbps: cfg.throughput_reference_dl_p20_kbps,
@@ -2410,7 +2624,7 @@ impl Controller {
         })
         .min(adaptive_dl.absolute_cap_kbps());
         let throughput_floor_ul = throughput_floor(ThroughputGuardInput {
-            enabled: cfg.transport_latency_enabled && cfg.throughput_guard_enabled,
+            enabled: cfg.transport_controller_enabled && cfg.throughput_guard_enabled,
             configured_min_kbps: cfg.min_ul_shaper_rate_kbps,
             configured_base_kbps: cfg.base_ul_shaper_rate_kbps,
             observed_p20_kbps: cfg.throughput_reference_ul_p20_kbps,
@@ -2426,11 +2640,22 @@ impl Controller {
             adaptive_dl,
             adaptive_ul,
             transport_latency: TransportLatencyTracker::new(),
+            transport_latency_dl: TransportLatencyTracker::new(),
+            transport_latency_ul: TransportLatencyTracker::new(),
             quality_grade: QualityGradeTracker::new(),
             quality_search_dl: QualitySearchDirection::new(),
             quality_search_ul: QualitySearchDirection::new(),
             quality_dl_class: QualityClass::Learning,
             quality_ul_class: QualityClass::Learning,
+            transport_backend: cfg.transport_probe_backend.clone(),
+            transport_trusted: false,
+            transport_raw_samples: 0,
+            transport_discarded_samples: 0,
+            transport_server_processing_ms: 0.0,
+            transport_connection_reused: false,
+            transport_rejected_reason: None,
+            transport_bad_windows_dl: 0,
+            transport_bad_windows_ul: 0,
             throughput_floor_dl,
             throughput_floor_ul,
             last_set_dl: 0,
@@ -2491,7 +2716,7 @@ impl Controller {
     }
 
     fn transport_clean_for_growth(&mut self, now: Instant) -> bool {
-        if !self.cfg.transport_latency_enabled {
+        if !self.cfg.transport_controller_enabled {
             return true;
         }
         let max_age = self.transport_max_age();
@@ -2523,12 +2748,28 @@ impl Controller {
 
     fn on_transport_probe(&mut self, result: TransportProbeResult) {
         let now = Instant::now();
+        self.transport_backend = result.backend.clone();
+        self.transport_trusted = result.trusted;
+        self.transport_raw_samples = result.raw_samples_ms.len();
+        self.transport_discarded_samples = result.discarded_samples;
+        self.transport_server_processing_ms = result.server_processing_ms;
+        self.transport_connection_reused = result.connection_reused;
+        self.transport_rejected_reason = None;
+
+        if let Some(error) = result.error.as_deref() {
+            self.transport_rejected_reason = Some("probe_error".to_string());
+            self.transport_latency.observe_failure(error);
+            self.log("DEBUG", &format!("transport latency probe failed: {error}"));
+            let _ = self.refresh_status_from_last_sample();
+            return;
+        }
         if result.latency_ms.is_some()
             && !transport_result_matches_route(
                 result.route_identity.as_deref(),
                 self.route_identity.as_deref(),
             )
         {
+            self.transport_rejected_reason = Some("route_changed".to_string());
             self.transport_latency
                 .observe_failure("route changed before transport result was accepted");
             self.log(
@@ -2538,73 +2779,173 @@ impl Controller {
             let _ = self.refresh_status_from_last_sample();
             return;
         }
-        let confirmed_delta = match (result.latency_ms, result.error.as_deref()) {
-            (Some(latency_ms), _) => {
-                let grade_route = self.quality_grade_route_key();
-                self.quality_grade.observe(
-                    &result.endpoint,
-                    latency_ms,
-                    result.dl_loaded,
-                    result.ul_loaded,
-                    epoch_secs(),
-                    &grade_route,
-                );
-                self.transport_latency.observe_success(
-                    &result.endpoint,
-                    latency_ms,
-                    result.loaded,
-                    now,
-                )
-            }
-            (_, Some(error)) => {
-                self.transport_latency.observe_failure(error);
-                self.log("DEBUG", &format!("transport latency probe failed: {error}"));
-                None
-            }
-            _ => {
-                self.transport_latency
-                    .observe_failure("transport probe returned no result");
-                None
-            }
+        if !result.trusted {
+            self.transport_rejected_reason = Some("untrusted_backend".to_string());
+            self.transport_latency
+                .observe_failure("untrusted transport backend is diagnostic-only");
+            self.log("DEBUG", "discarded untrusted legacy transport measurement");
+            let _ = self.refresh_status_from_last_sample();
+            return;
+        }
+        let Some(latency_ms) = result.latency_ms else {
+            self.transport_rejected_reason = Some("empty_result".to_string());
+            self.transport_latency
+                .observe_failure("transport probe returned no result");
+            let _ = self.refresh_status_from_last_sample();
+            return;
         };
+        if self
+            .cpu_total_percent
+            .map(|cpu| cpu > self.cfg.transport_cpu_max_percent)
+            .unwrap_or(false)
+        {
+            self.transport_rejected_reason = Some("cpu_pressure".to_string());
+            self.log(
+                "DEBUG",
+                "discarded transport probe while router CPU was above the configured limit",
+            );
+            let _ = self.refresh_status_from_last_sample();
+            return;
+        }
+        let current_phase = self.last_status.as_ref().map(|status| {
+            (
+                status.dl_load_pct >= self.cfg.high_load_thr * 100.0,
+                status.ul_load_pct >= self.cfg.high_load_thr * 100.0,
+            )
+        });
+        if current_phase != Some((result.dl_loaded, result.ul_loaded)) {
+            self.transport_rejected_reason = Some("load_phase_changed".to_string());
+            self.log(
+                "DEBUG",
+                "discarded transport probe because the load phase changed during measurement",
+            );
+            let _ = self.refresh_status_from_last_sample();
+            return;
+        }
+
+        let samples = if result.raw_samples_ms.is_empty() {
+            vec![latency_ms]
+        } else {
+            result.raw_samples_ms.clone()
+        };
+        let grade_route = self.quality_grade_route_key();
+        let mut confirmed_delta = None;
+        let mut confirmed_dl_delta = None;
+        let mut confirmed_ul_delta = None;
+        for sample_ms in samples {
+            self.quality_grade.observe(
+                &result.endpoint,
+                sample_ms,
+                result.dl_loaded,
+                result.ul_loaded,
+                epoch_secs(),
+                &grade_route,
+            );
+            if let Some(delta_ms) = self.transport_latency.observe_success(
+                &result.endpoint,
+                sample_ms,
+                result.loaded,
+                now,
+            ) {
+                confirmed_delta = Some(delta_ms);
+            }
+            if !result.loaded {
+                self.transport_latency_dl
+                    .observe_success(&result.endpoint, sample_ms, false, now);
+                self.transport_latency_ul
+                    .observe_success(&result.endpoint, sample_ms, false, now);
+            } else {
+                if result.dl_loaded {
+                    if let Some(delta_ms) = self.transport_latency_dl.observe_success(
+                        &result.endpoint,
+                        sample_ms,
+                        true,
+                        now,
+                    ) {
+                        confirmed_dl_delta = Some(delta_ms);
+                    }
+                }
+                if result.ul_loaded {
+                    if let Some(delta_ms) = self.transport_latency_ul.observe_success(
+                        &result.endpoint,
+                        sample_ms,
+                        true,
+                        now,
+                    ) {
+                        confirmed_ul_delta = Some(delta_ms);
+                    }
+                }
+            }
+        }
 
         let Some(delta_ms) = confirmed_delta else {
             let _ = self.refresh_status_from_last_sample();
             return;
         };
-        let class = classify_quality(Some(delta_ms));
         let (icmp_dl_delta_us, icmp_ul_delta_us) = self
             .last_status
             .as_ref()
             .map(|status| (status.avg_dl_delta, status.avg_ul_delta))
             .unwrap_or((0.0, 0.0));
-        let dl_class = classify_quality(Some(effective_latency_delta_ms(
-            icmp_dl_delta_us,
-            0.0,
-            Some(delta_ms),
-        )));
-        let ul_class = classify_quality(Some(effective_latency_delta_ms(
-            0.0,
-            icmp_ul_delta_us,
-            Some(delta_ms),
-        )));
+        let controller_enabled = self.cfg.transport_controller_enabled;
+        let target_ms = self.cfg.quality_target_delay_ms;
+        if let Some(dl_delta_ms) = confirmed_dl_delta {
+            self.quality_dl_class = classify_quality(Some(effective_latency_delta_ms(
+                icmp_dl_delta_us,
+                0.0,
+                Some(dl_delta_ms),
+            )));
+            self.transport_bad_windows_dl = if dl_delta_ms > target_ms {
+                self.transport_bad_windows_dl.saturating_add(1)
+            } else {
+                0
+            };
+        }
+        if let Some(ul_delta_ms) = confirmed_ul_delta {
+            self.quality_ul_class = classify_quality(Some(effective_latency_delta_ms(
+                0.0,
+                icmp_ul_delta_us,
+                Some(ul_delta_ms),
+            )));
+            self.transport_bad_windows_ul = if ul_delta_ms > target_ms {
+                self.transport_bad_windows_ul.saturating_add(1)
+            } else {
+                0
+            };
+        }
         let dl_policy = self.quality_policy(true);
         let ul_policy = self.quality_policy(false);
-        let dl_update = if result.dl_loaded {
-            self.quality_dl_class = dl_class;
-            Some(
-                self.quality_search_dl
-                    .observe(now, self.shaper_dl, delta_ms, true, dl_policy),
-            )
+        let dl_update = if let Some(dl_delta_ms) = confirmed_dl_delta {
+            if controller_enabled
+                && (dl_delta_ms <= target_ms || self.transport_bad_windows_dl >= 2)
+            {
+                Some(self.quality_search_dl.observe(
+                    now,
+                    self.shaper_dl,
+                    dl_delta_ms,
+                    true,
+                    dl_policy,
+                ))
+            } else {
+                None
+            }
         } else {
             None
         };
-        let ul_update = if result.ul_loaded {
-            self.quality_ul_class = ul_class;
-            Some(
-                self.quality_search_ul
-                    .observe(now, self.shaper_ul, delta_ms, true, ul_policy),
-            )
+        let ul_update = if let Some(ul_delta_ms) = confirmed_ul_delta {
+            if controller_enabled
+                && (ul_delta_ms <= target_ms || self.transport_bad_windows_ul >= 2)
+            {
+                Some(self.quality_search_ul.observe(
+                    now,
+                    self.shaper_ul,
+                    ul_delta_ms,
+                    true,
+                    ul_policy,
+                ))
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -2622,8 +2963,8 @@ impl Controller {
                     "INFO",
                     &format!(
                         "Transport DL quality {} at {:.1} ms: {} (floor {:.0} kbit/s)",
-                        class.as_str(),
-                        delta_ms,
+                        self.quality_dl_class.as_str(),
+                        confirmed_dl_delta.unwrap_or(delta_ms),
                         update.reason,
                         self.throughput_floor_dl
                     ),
@@ -2642,8 +2983,8 @@ impl Controller {
                     "INFO",
                     &format!(
                         "Transport UL quality {} at {:.1} ms: {} (floor {:.0} kbit/s)",
-                        class.as_str(),
-                        delta_ms,
+                        self.quality_ul_class.as_str(),
+                        confirmed_ul_delta.unwrap_or(delta_ms),
                         update.reason,
                         self.throughput_floor_ul
                     ),
@@ -2747,10 +3088,14 @@ impl Controller {
         self.dl_delta_us = filled_f64_window(self.cfg.bufferbloat_detection_window);
         self.ul_delta_us = filled_f64_window(self.cfg.bufferbloat_detection_window);
         self.transport_latency.reset();
+        self.transport_latency_dl.reset();
+        self.transport_latency_ul.reset();
         let grade_route = self.quality_grade_route_key();
         self.quality_grade.set_route(&grade_route);
         self.quality_search_dl.reset();
         self.quality_search_ul.reset();
+        self.transport_bad_windows_dl = 0;
+        self.transport_bad_windows_ul = 0;
         self.quality_dl_class = QualityClass::Learning;
         self.quality_ul_class = QualityClass::Learning;
         let now = Instant::now();
@@ -2769,8 +3114,12 @@ impl Controller {
         self.route_external_ip = value;
         if changed_existing {
             self.transport_latency.reset();
+            self.transport_latency_dl.reset();
+            self.transport_latency_ul.reset();
             self.quality_search_dl.reset();
             self.quality_search_ul.reset();
+            self.transport_bad_windows_dl = 0;
+            self.transport_bad_windows_ul = 0;
             self.quality_dl_class = QualityClass::Learning;
             self.quality_ul_class = QualityClass::Learning;
             self.log(
@@ -3593,7 +3942,9 @@ impl Controller {
         } else {
             QualityClass::Learning
         };
-        let quality_reason = if self.quality_search_dl.limited() {
+        let quality_reason = if !self.cfg.transport_controller_enabled {
+            "detected_only_controller_disabled"
+        } else if self.quality_search_dl.limited() {
             self.quality_search_dl.last_reason()
         } else if self.quality_search_ul.limited() {
             self.quality_search_ul.last_reason()
@@ -3659,8 +4010,16 @@ impl Controller {
         file.seek(SeekFrom::End(-2))?;
         writeln!(
             file,
-            ",\"transport_latency_enabled\":{},\"transport_status\":\"{}\",\"transport_endpoint\":{},\"transport_latency_ms\":{},\"transport_baseline_ms\":{},\"transport_delta_ms\":{},\"transport_sample_age_s\":{},\"transport_confidence\":{},\"transport_successful_samples\":{},\"transport_failed_samples\":{},\"transport_last_error\":{},\"effective_latency_delta_ms\":{:.3},\"quality_estimated\":true,\"quality_class\":\"{}\",\"quality_dl_class\":\"{}\",\"quality_ul_class\":\"{}\",\"quality_confidence\":{},\"quality_reason\":\"{}\",\"throughput_guard_enabled\":{},\"throughput_floor_dl_kbps\":{:.0},\"throughput_floor_ul_kbps\":{:.0},\"quality_limited\":{},\"quality_limited_dl\":{},\"quality_limited_ul\":{}}}",
+            ",\"transport_latency_enabled\":{},\"transport_controller_enabled\":{},\"transport_probe_method\":\"network_rtt_v2\",\"transport_probe_backend\":\"{}\",\"transport_probe_trusted\":{},\"transport_probe_raw_samples\":{},\"transport_probe_discarded_samples\":{},\"transport_probe_server_processing_ms\":{:.3},\"transport_probe_connection_reused\":{},\"transport_probe_rejected_reason\":{},\"transport_status\":\"{}\",\"transport_endpoint\":{},\"transport_latency_ms\":{},\"transport_baseline_ms\":{},\"transport_delta_ms\":{},\"transport_sample_age_s\":{},\"transport_confidence\":{},\"transport_successful_samples\":{},\"transport_failed_samples\":{},\"transport_last_error\":{},\"effective_latency_delta_ms\":{:.3},\"quality_estimated\":true,\"quality_class\":\"{}\",\"quality_dl_class\":\"{}\",\"quality_ul_class\":\"{}\",\"quality_confidence\":{},\"quality_reason\":\"{}\",\"throughput_guard_enabled\":{},\"throughput_floor_dl_kbps\":{:.0},\"throughput_floor_ul_kbps\":{:.0},\"quality_limited\":{},\"quality_limited_dl\":{},\"quality_limited_ul\":{}}}",
             self.cfg.transport_latency_enabled,
+            self.cfg.transport_controller_enabled,
+            json_escape(&self.transport_backend),
+            self.transport_trusted,
+            self.transport_raw_samples,
+            self.transport_discarded_samples,
+            self.transport_server_processing_ms,
+            self.transport_connection_reused,
+            json_string_or_null(self.transport_rejected_reason.as_deref()),
             json_escape(transport.status),
             json_string_or_null(transport.endpoint.as_deref()),
             json_f64_or_null(transport.latency_ms, 3),
@@ -3677,7 +4036,7 @@ impl Controller {
             self.quality_ul_class.as_str(),
             transport.confidence,
             json_escape(quality_reason),
-            self.cfg.throughput_guard_enabled,
+            self.cfg.transport_controller_enabled && self.cfg.throughput_guard_enabled,
             self.throughput_floor_dl,
             self.throughput_floor_ul,
             self.quality_search_dl.limited() || self.quality_search_ul.limited(),
@@ -3687,7 +4046,7 @@ impl Controller {
         file.seek(SeekFrom::End(-2))?;
         write!(
             file,
-            ",\"quality_grade_method\":\"p90_loaded_minus_p5_idle\",\"quality_grade_state\":\"{}\",\"quality_grade_collected_samples\":{},\"quality_grade_required_samples\":{},\"quality_grade_baseline_ready\":{},\"quality_grade_current\":{},\"quality_grade_previous\":{},\"graph_history_enabled\":{},\"graph_history_budget_mode\":\"{}\",\"graph_history_configured_budget_kib\":{},\"graph_history_safe_max_kib\":{},\"graph_history_effective_total_kib\":{},\"graph_history_instance_budget_kib\":{},\"graph_history_used_total_kib\":{},\"graph_history_used_instance_kib\":{},\"graph_history_stored_samples\":{},\"graph_history_instances\":{},\"graph_history_mem_total_kib\":{},\"graph_history_mem_available_kib\":{},\"graph_history_paused_low_memory\":{}",
+            ",\"quality_grade_method\":\"transport_rtt_p90_loaded_minus_p5_idle_v2\",\"quality_grade_state\":\"{}\",\"quality_grade_collected_samples\":{},\"quality_grade_required_samples\":{},\"quality_grade_baseline_ready\":{},\"quality_grade_current\":{},\"quality_grade_previous\":{},\"graph_history_enabled\":{},\"graph_history_budget_mode\":\"{}\",\"graph_history_configured_budget_kib\":{},\"graph_history_safe_max_kib\":{},\"graph_history_effective_total_kib\":{},\"graph_history_instance_budget_kib\":{},\"graph_history_used_total_kib\":{},\"graph_history_used_instance_kib\":{},\"graph_history_stored_samples\":{},\"graph_history_instances\":{},\"graph_history_mem_total_kib\":{},\"graph_history_mem_available_kib\":{},\"graph_history_paused_low_memory\":{}",
             json_escape(quality_grade.state),
             quality_grade.collected_samples,
             quality_grade.required_samples,
@@ -5570,6 +5929,7 @@ fn print_usage() {
     eprintln!(
         "       cake-autorated --autotune-proposal --dl-samples LIST --ul-samples LIST \\\n         --idle-median-ms N --idle-p95-ms N --idle-samples N [--link-kind KIND]"
     );
+    eprintln!("       cake-autorated --transport-probe --backend websocket|tcp|http|legacy-http [--endpoint URL] [--device IFACE] [--source-ip IPv4] [--fwmark HEX] [--count N] [--timeout SEC] [--interval-ms N]");
 }
 
 fn parse_rate_samples(value: &str) -> Result<Vec<f64>, String> {
@@ -5660,15 +6020,141 @@ where
     Ok(())
 }
 
+fn run_transport_probe_cli<I>(args: I) -> Result<(), String>
+where
+    I: Iterator<Item = String>,
+{
+    let mut backend = TransportProbeBackend::WebSocket;
+    let mut endpoint = None;
+    let mut binding = RouteBinding::default();
+    let mut count = 5usize;
+    let mut timeout_s = 5u64;
+    let mut interval_ms = 250u64;
+    let mut args = args;
+
+    while let Some(arg) = args.next() {
+        let value = args
+            .next()
+            .ok_or_else(|| format!("missing value for {arg}"))?;
+        match arg.as_str() {
+            "--backend" => {
+                backend = TransportProbeBackend::parse(&value)
+                    .ok_or_else(|| format!("unsupported transport backend: {value}"))?
+            }
+            "--endpoint" => endpoint = Some(value),
+            "--device" => binding.device = value,
+            "--source-ip" => binding.source_ip = value,
+            "--fwmark" => binding.fwmark = value,
+            "--count" => {
+                count = value
+                    .parse::<usize>()
+                    .map_err(|_| "invalid transport probe count".to_string())?
+            }
+            "--timeout" => {
+                timeout_s = value
+                    .parse::<u64>()
+                    .map_err(|_| "invalid transport probe timeout".to_string())?
+            }
+            "--interval-ms" => {
+                interval_ms = value
+                    .parse::<u64>()
+                    .map_err(|_| "invalid transport probe interval".to_string())?
+            }
+            _ => return Err(format!("unsupported transport probe option: {arg}")),
+        }
+    }
+    if !(1..=100).contains(&count) {
+        return Err("transport probe count must be between 1 and 100".to_string());
+    }
+    if !(1..=30).contains(&timeout_s) {
+        return Err("transport probe timeout must be between 1 and 30 seconds".to_string());
+    }
+    if interval_ms > 60_000 {
+        return Err("transport probe interval must not exceed 60000 ms".to_string());
+    }
+    let endpoint = endpoint.unwrap_or_else(|| match backend {
+        TransportProbeBackend::WebSocket => "wss://ping-bufferbloat.libreqos.com/ws".to_string(),
+        TransportProbeBackend::TcpConnect => "tcp://ping-bufferbloat.libreqos.com:443".to_string(),
+        TransportProbeBackend::PersistentHttp => {
+            "https://ping-bufferbloat.libreqos.com/ping".to_string()
+        }
+        TransportProbeBackend::LegacyHttp => {
+            "https://speed.cloudflare.com/__down?bytes=0".to_string()
+        }
+    });
+    let mut engine =
+        TransportProbeEngine::new(backend, endpoint, binding, Duration::from_secs(timeout_s))?;
+    let mut accepted = 0usize;
+    let mut failed = 0usize;
+    for index in 0..count {
+        match engine.probe() {
+            Ok(sample) => {
+                accepted += 1;
+                let raw = sample
+                    .raw_samples_ms
+                    .iter()
+                    .map(|value| format!("{value:.3}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                println!(
+                    "{{\"index\":{},\"backend\":\"{}\",\"endpoint\":\"{}\",\"rtt_ms\":{:.3},\"raw_ms\":[{}],\"discarded\":{},\"server_processing_ms\":{:.3},\"trusted\":{},\"connection_reused\":{}}}",
+                    index + 1,
+                    sample.backend.as_str(),
+                    json_escape(&sample.endpoint),
+                    sample.rtt_ms,
+                    raw,
+                    sample.discarded_samples,
+                    sample.server_processing_ms,
+                    json_bool(sample.trusted),
+                    json_bool(sample.connection_reused)
+                );
+            }
+            Err(error) => {
+                failed += 1;
+                println!(
+                    "{{\"index\":{},\"backend\":\"{}\",\"error\":\"{}\"}}",
+                    index + 1,
+                    backend.as_str(),
+                    json_escape(&error)
+                );
+            }
+        }
+        if index + 1 < count && interval_ms > 0 {
+            thread::sleep(Duration::from_millis(interval_ms));
+        }
+    }
+    eprintln!(
+        "transport-probe backend={} accepted={} failed={} trusted={}",
+        backend.as_str(),
+        accepted,
+        failed,
+        backend.trusted()
+    );
+    if accepted == 0 {
+        return Err("transport probe produced no accepted sample".to_string());
+    }
+    Ok(())
+}
+
 fn main() {
     let mut initial_args = env::args();
     let _program = initial_args.next();
-    if matches!(initial_args.next().as_deref(), Some("--autotune-proposal")) {
-        if let Err(error) = run_autotune_proposal_cli(initial_args) {
-            eprintln!("ERROR: {error}");
-            std::process::exit(2);
+    match initial_args.next().as_deref() {
+        Some("--autotune-proposal") => {
+            if let Err(error) = run_autotune_proposal_cli(initial_args) {
+                eprintln!("ERROR: {error}");
+                std::process::exit(2);
+            }
+            return;
         }
-        return;
+        Some("--transport-probe") => {
+            if let Err(error) = run_transport_probe_cli(initial_args) {
+                eprintln!("ERROR: {error}");
+                std::process::exit(2);
+            }
+            return;
+        }
+        _ => {}
     }
 
     unsafe {
@@ -5925,6 +6411,8 @@ mod tests {
     fn transport_quality_defaults_are_safe_and_opt_in() {
         let cfg = Config::defaults("test".to_string());
         assert!(!cfg.transport_latency_enabled);
+        assert!(!cfg.transport_controller_enabled);
+        assert_eq!(cfg.transport_probe_backend, "websocket");
         assert!(cfg.throughput_guard_enabled);
         assert_eq!(cfg.throughput_guard_retention_percent, 80.0);
         assert_eq!(cfg.quality_target_delay_ms, 30.0);
@@ -5945,10 +6433,10 @@ mod tests {
     fn transport_quality_validation_rejects_unsafe_values() {
         let mut cfg = Config::defaults("test".to_string());
         cfg.transport_latency_enabled = true;
-        cfg.transport_probe_urls.clear();
+        cfg.transport_probe_endpoint = "https://wrong-scheme.example/".to_string();
         assert!(cfg.validate().is_err());
 
-        cfg.transport_probe_urls = vec!["https://example.com/204".to_string()];
+        cfg.transport_probe_endpoint = "wss://ping-bufferbloat.libreqos.com/ws".to_string();
         cfg.quality_search_max_steps = 0;
         assert!(cfg.validate().is_err());
 

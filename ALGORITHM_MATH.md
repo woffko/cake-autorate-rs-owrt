@@ -12,12 +12,15 @@ independent layers for download and upload:
 The second layer is a Rust extension. With `adaptive_ceiling_enabled=0`, the
 configured maximum remains a hard limit, matching upstream behavior.
 
-An additional optional transport-aware safety layer is documented in
-[TRANSPORT_QUALITY.md](TRANSPORT_QUALITY.md). Its effective delay is the maximum
-of directional ICMP/OWD growth and confirmed HTTP/TCP growth. Missing transport
-evidence blocks growth but never fabricates bufferbloat or cuts the rate. A
-confirmed high transport delta uses a bounded square-root correction and may
-not cross the robust throughput floor:
+An additional optional transport RTT layer is documented in
+[TRANSPORT_QUALITY.md](TRANSPORT_QUALITY.md). Measurement and detected grading
+are observational; only the separate default-off
+`transport_controller_enabled` option permits transport evidence to influence
+CAKE. When enabled, its effective delay is the maximum of directional ICMP/OWD
+growth and confirmed native network RTT growth. Missing evidence blocks that
+optional controller's growth but never fabricates bufferbloat or cuts the rate.
+A twice-confirmed high directional transport delta uses a bounded square-root
+correction and may not cross the robust throughput floor:
 
 ```text
 factor    = clamp(sqrt(target_delay / measured_delay), 0.70, 0.97)
@@ -70,14 +73,17 @@ the member has a non-zero share in the default mwan3 policy, otherwise
 `STANDBY`. An unavailable or mismatched member is `OFFLINE`; its pingers are
 stopped and it cannot accumulate reflector offences or promote a ceiling.
 
-The strict controller quality confidence is intentionally staged. A learned
-idle transport baseline contributes half of that controller evidence, so the
-UI may report `BASELINE READY` while waiting for natural loaded samples. That
-is a stable waiting state, not a stalled learning loop.
+Transport confidence is intentionally staged. Twenty accepted idle network RTT
+samples contribute the first half, so the UI reports `BASELINE READY` while
+waiting for natural loaded samples. Twenty accepted loaded samples in a
+direction complete that half. This is a stable waiting state, not a stalled
+learning loop.
 
 The separately displayed detected rating follows the current LibreQoS browser
-test statistics. For selected endpoint `e`, direction `d`, idle samples `I_e`,
-and loaded samples `J_d`:
+test statistics. The native backend resolves DNS and warms its TCP/TLS/
+WebSocket or HTTP session before timing; legacy whole-process HTTP is untrusted.
+For selected endpoint `e`, direction `d`, idle network RTT samples `I_e`, and
+loaded network RTT samples `J_d`:
 
 ```text
 B_e       = percentile(I_e, 0.05)
@@ -91,11 +97,12 @@ grade     = max_severity(grade(delta_DL), grade(delta_UL))
 Percentiles are linearly interpolated between adjacent sorted observations.
 Bidirectional samples are reported but excluded from `grade`. The boundaries
 are A+ for `delta < 5`, A for `< 30`, B for `< 60`, C for `< 200`, D for
-`< 400`, and F otherwise. At least three idle samples and three loaded samples
-are required. `CURRENT` is the active provisional/final result; `PREVIOUS` is
-the last completed episode and remains visible while another episode collects.
-All these samples are scoped to `I_u`; after a route change the retained result
-is explicitly stale and cannot be combined with new samples.
+`< 400`, and F otherwise. At least 20 idle samples and 20 loaded samples per
+scored direction are required. A one-direction result is `PARTIAL` and is never
+shown as a final grade. `CURRENT` is the active/latest result; `PREVIOUS` is the
+last completed episode and remains visible while another episode collects. All
+these samples are scoped to `I_u`; after a route change the retained result is
+explicitly stale and cannot be combined with new samples.
 
 All ICMP, transport, speed-test, and Auto-Tune observations are accepted only
 when their route identity equals the instance identity:

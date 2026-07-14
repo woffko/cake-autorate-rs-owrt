@@ -39,10 +39,16 @@ config cake_autorate 'primary'
 	option adaptive_ceiling_cooldown_s '30.0'
 	option adaptive_ceiling_failed_bound_ttl_s '900.0'
 
-	# Optional transport-aware latency. HTTP/TCP samples complement ICMP so a
-	# provider that prioritizes ICMP cannot hide loaded latency. Disabled by
-	# default; probes and graph history are RAM/runtime-only and never hit flash.
+	# Optional native transport RTT measurement. A persistent route-bound
+	# WebSocket excludes DNS, process startup and TLS handshake time from RTT.
+	# Rating is passive by default; the controller must be enabled separately.
 	option transport_latency_enabled '0'
+	option transport_controller_enabled '0'
+	option transport_probe_backend 'websocket'
+	option transport_probe_endpoint 'wss://ping-bufferbloat.libreqos.com/ws'
+	option transport_load_hold_s '3.0'
+	option transport_cpu_max_percent '85.0'
+	# Retained for migration and the diagnostic-only legacy-http backend.
 	list transport_probe_url 'https://speed.cloudflare.com/__down?bytes=0'
 	list transport_probe_url 'https://www.google.com/generate_204'
 	list transport_probe_url 'https://connectivitycheck.gstatic.com/generate_204'

@@ -1,8 +1,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-const IDLE_WINDOW: usize = 20;
-const LOADED_WINDOW: usize = 4;
+const IDLE_WINDOW: usize = 120;
+const LOADED_WINDOW: usize = 40;
+const MIN_IDLE_SAMPLES: usize = 20;
+const MIN_LOADED_SAMPLES: usize = 20;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ThroughputGuardInput {
@@ -141,37 +143,41 @@ impl TransportLatencyTracker {
     }
 
     pub fn confirmed_delta_ms(&self) -> Option<f64> {
-        if self.loaded_deltas.len() < 2 {
+        if self.loaded_deltas.len() < MIN_LOADED_SAMPLES {
             return None;
         }
-        Some(median(
+        percentile(
             &self
                 .loaded_deltas
                 .iter()
                 .map(|(_, value)| *value)
                 .collect::<Vec<_>>(),
-        ))
+            90.0,
+        )
     }
 
     pub fn snapshot(&self, now: Instant, enabled: bool) -> TransportSnapshot {
         let delta_ms = self.confirmed_delta_ms();
-        let baseline_count = self.idle_samples.values().filter(|v| !v.is_empty()).count();
-        let confidence = if delta_ms.is_some() {
-            (40 + self.loaded_deltas.len() as u8 * 10 + baseline_count.min(2) as u8 * 10).min(100)
-        } else if baseline_count > 0 {
-            20 + baseline_count.min(3) as u8 * 10
-        } else {
-            0
-        };
+        let baseline_count = self
+            .last_endpoint
+            .as_ref()
+            .and_then(|endpoint| self.idle_samples.get(endpoint))
+            .map(VecDeque::len)
+            .unwrap_or(0);
+        let baseline_progress =
+            (baseline_count.min(MIN_IDLE_SAMPLES) * 50 / MIN_IDLE_SAMPLES) as u8;
+        let loaded_progress =
+            (self.loaded_deltas.len().min(MIN_LOADED_SAMPLES) * 50 / MIN_LOADED_SAMPLES) as u8;
+        let confidence = baseline_progress.saturating_add(loaded_progress);
         let status = if !enabled {
             "disabled"
         } else if self.last_error.is_some() && self.last_success_at.is_none() {
             "error"
         } else if delta_ms.is_some() {
             "ready"
-        } else if baseline_count > 0 && self.loaded_deltas.is_empty() {
+        } else if baseline_count >= MIN_IDLE_SAMPLES && self.loaded_deltas.is_empty() {
             "baseline_ready"
-        } else if baseline_count > 0 {
+        } else if baseline_count >= MIN_IDLE_SAMPLES {
             "learning_loaded"
         } else {
             "learning_baseline"
@@ -196,12 +202,12 @@ impl TransportLatencyTracker {
 
     fn baseline(&self, endpoint: &str) -> Option<f64> {
         let samples = self.idle_samples.get(endpoint)?;
-        if samples.is_empty() {
+        if samples.len() < MIN_IDLE_SAMPLES {
             return None;
         }
         let mut sorted = samples.iter().copied().collect::<Vec<_>>();
         sorted.sort_by(f64::total_cmp);
-        let index = ((sorted.len() - 1) as f64 * 0.20).floor() as usize;
+        let index = ((sorted.len() - 1) as f64 * 0.05).floor() as usize;
         sorted.get(index).copied()
     }
 }
@@ -494,22 +500,24 @@ impl QualitySearchDirection {
     }
 }
 
-fn median(values: &[f64]) -> f64 {
+fn percentile(values: &[f64], percentile: f64) -> Option<f64> {
     let mut sorted = values
         .iter()
         .copied()
         .filter(|value| value.is_finite())
         .collect::<Vec<_>>();
     if sorted.is_empty() {
-        return 0.0;
+        return None;
     }
     sorted.sort_by(f64::total_cmp);
-    let middle = sorted.len() / 2;
-    if sorted.len() % 2 == 0 {
-        (sorted[middle - 1] + sorted[middle]) / 2.0
-    } else {
-        sorted[middle]
+    let index = (percentile.clamp(0.0, 100.0) / 100.0) * (sorted.len() - 1) as f64;
+    let lower = index.floor() as usize;
+    let upper = index.ceil() as usize;
+    if lower == upper {
+        return sorted.get(lower).copied();
     }
+    let weight = index - lower as f64;
+    Some(sorted[lower] * (1.0 - weight) + sorted[upper] * weight)
 }
 
 #[cfg(test)]
@@ -545,23 +553,40 @@ mod tests {
     }
 
     #[test]
-    fn transport_requires_idle_baseline_and_two_loaded_samples() {
+    fn transport_requires_twenty_idle_and_loaded_samples() {
         let now = Instant::now();
         let mut tracker = TransportLatencyTracker::new();
-        assert_eq!(tracker.observe_success("a", 20.0, false, now), None);
+        for index in 0..MIN_IDLE_SAMPLES {
+            assert_eq!(
+                tracker.observe_success(
+                    "a",
+                    20.0 + (index % 2) as f64,
+                    false,
+                    now + Duration::from_millis(index as u64),
+                ),
+                None
+            );
+        }
         assert_eq!(tracker.snapshot(now, true).status, "baseline_ready");
-        assert_eq!(
-            tracker.observe_success("a", 120.0, true, now + Duration::from_secs(1)),
-            None
-        );
+        for index in 0..MIN_LOADED_SAMPLES - 1 {
+            assert_eq!(
+                tracker.observe_success(
+                    "a",
+                    120.0,
+                    true,
+                    now + Duration::from_secs(1) + Duration::from_millis(index as u64),
+                ),
+                None
+            );
+        }
         assert_eq!(
             tracker.snapshot(now + Duration::from_secs(1), true).status,
             "learning_loaded"
         );
-        assert_eq!(
-            tracker.observe_success("a", 100.0, true, now + Duration::from_secs(2)),
-            Some(90.0)
-        );
+        let delta = tracker
+            .observe_success("a", 100.0, true, now + Duration::from_secs(2))
+            .unwrap();
+        assert!((99.0..=100.0).contains(&delta));
         assert_eq!(
             tracker.snapshot(now + Duration::from_secs(2), true).status,
             "ready"
@@ -572,9 +597,22 @@ mod tests {
     fn route_reset_discards_transport_baseline_and_loaded_samples() {
         let now = Instant::now();
         let mut tracker = TransportLatencyTracker::new();
-        tracker.observe_success("wan-endpoint", 20.0, false, now);
-        tracker.observe_success("wan-endpoint", 120.0, true, now + Duration::from_secs(1));
-        tracker.observe_success("wan-endpoint", 100.0, true, now + Duration::from_secs(2));
+        for index in 0..MIN_IDLE_SAMPLES {
+            tracker.observe_success(
+                "wan-endpoint",
+                20.0,
+                false,
+                now + Duration::from_millis(index as u64),
+            );
+        }
+        for index in 0..MIN_LOADED_SAMPLES {
+            tracker.observe_success(
+                "wan-endpoint",
+                100.0,
+                true,
+                now + Duration::from_secs(1) + Duration::from_millis(index as u64),
+            );
+        }
         assert!(tracker.confirmed_delta_ms().is_some());
 
         tracker.reset();

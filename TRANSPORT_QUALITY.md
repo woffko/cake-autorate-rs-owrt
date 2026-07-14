@@ -1,37 +1,101 @@
-# Transport-aware quality control
+# Transport RTT, detected quality, and optional control
 
-The optional transport-aware controller complements the normal ICMP/OWD loop
-with small HTTP/TCP requests. It addresses links where ICMP remains clean while
-ordinary TCP traffic queues badly. It is disabled by default and does not write
-samples to flash.
+RC8 separates three things that earlier releases mixed together:
 
-## Strict controller signal
+1. a route-bound network RTT measurement;
+2. an observational A+/A/B/C/D/F connection rating; and
+3. optional CAKE-rate control from confirmed transport delay.
 
-Each configured HTTP(S) endpoint keeps its own 20-sample idle-latency window.
-The endpoint baseline is the 20th percentile of that window. A sample taken
-while either direction is above `high_load_thr` produces:
+Measurement is enabled with `transport_latency_enabled`. The detected rating
+is then always observational. Rate control requires the separate
+`transport_controller_enabled=1` opt-in and is disabled by default, including
+after an upgrade from RC7. Samples and state live in RAM and never in flash.
+
+## Why RC8 replaced the RC7 measurement
+
+RC7 timed an external `uclient-fetch` process. Its number included process
+startup, DNS lookup, TCP connect, TLS handshake, and remote HTTP work. On one
+real path that produced a roughly 230-390 ms "idle RTT" while ICMP was
+7-25 ms and a browser LibreQoS test reported A+. It was not a network RTT and
+could also feed an unsafe control decision.
+
+RC8 removes that value from both rating and control. Status identifies the new
+contract as:
 
 ```text
-transport_delta = max(loaded_request_ms - endpoint_idle_p20_ms, 0)
+transport_probe_method=network_rtt_v2
+quality_grade_method=transport_rtt_p90_loaded_minus_p5_idle_v2
 ```
 
-Two loaded samples are required before the signal is confirmed; the controller
-uses the median of the newest four. A stale, failed, or still-learning signal
-never causes a rate reduction. It only blocks high-load growth and adaptive
-ceiling promotion until clean transport evidence returns. ICMP continues to
-run independently, and the value exposed to Status and Graphs is:
+The legacy process-timed mode remains selectable only for diagnosis. It is
+marked untrusted and is rejected by the controller.
+
+## Probe backends
+
+All native backends resolve DNS before timing and create route-bound sockets.
+The binding can include the selected L3 device, source IPv4, and mwan3 fwmark.
+Route identity is checked again before the result is accepted.
+
+| Backend | What is timed | Persistence | Control trust |
+|---|---|---:|---:|
+| `websocket` (recommended) | WebSocket ping to matching pong, minus reported server processing | One warmed TLS/WebSocket session per route | trusted |
+| `tcp` | TCP connect RTT only | New connection for each raw observation | trusted |
+| `http` | Request/response on a warmed HTTP/1.1 TLS session, minus `Server-Timing` when supplied | Reused keep-alive session | trusted |
+| `legacy-http` | Whole `uclient-fetch` process | none | untrusted, diagnostic only |
+
+The default endpoint is the same persistent RTT service used by the live
+LibreQoS test:
 
 ```text
-effective_delta_ms = max(ICMP_DL_delta_ms,
-                         ICMP_UL_delta_ms,
-                         confirmed_transport_delta_ms)
+wss://ping-bufferbloat.libreqos.com/ws
 ```
 
-The strict controller class uses the effective confirmed signal above. Its
-threshold labels match LibreQoS grade boundaries, but its sampling deliberately
-remains conservative and stateful for shaper control:
+The WebSocket and persistent-HTTP backends perform an unscored warm-up, so DNS,
+TCP/TLS, and protocol handshakes are excluded. A normal measurement contains
+four sequential raw RTT observations. The displayed batch value is a robust
+median; the controller and rating consume the accepted raw RTTs rather than
+duplicating that median four times. A broken persistent connection is discarded
+and recreated on the next probe.
 
-| Effective loaded increase | Controller class |
+`transport_probe_backend`, trust, connection reuse, raw/discarded counts,
+server-processing time, and the last rejection reason are exposed in Status.
+
+## Sample acceptance
+
+A native result is accepted only when all of these remain true:
+
+- the configured uplink route identity is unchanged;
+- member, device, source address, fwmark, and table still match;
+- the backend is trusted and returns non-empty positive RTT data;
+- total router CPU is not above `transport_cpu_max_percent` (85% by default);
+- download/upload load classification did not change while the batch ran; and
+- loaded traffic had stayed in the same phase for at least
+  `transport_load_hold_s` (3 seconds by default).
+
+Rejected evidence is reported but never treated as bufferbloat. A route or
+source/external-address change clears only that uplink's learned windows.
+
+## Detected LibreQoS-compatible rating
+
+For endpoint `e` and direction `d`:
+
+```text
+idle_baseline(e) = p5(last 120 accepted idle RTT samples for e)
+loaded_rtt(d)    = p90(last 40 accepted loaded RTT samples for d)
+raw_delta(d)     = loaded_rtt(d) - idle_baseline(e)
+scored_delta(d)  = 0, when abs(raw_delta(d)) < 2 ms
+                   max(raw_delta(d), 0), otherwise
+overall_grade    = worse(grade(download), grade(upload))
+```
+
+At least 20 idle samples are required before `BASELINE READY`, and at least 20
+loaded samples are required for each scored direction. Download and upload use
+separate windows; download evidence can never lower the upload shaper or vice
+versa. Adjacent directional phases belong to one test episode when less than
+20 seconds apart. Bidirectional observations remain diagnostic and do not
+lower the overall grade.
+
+| Loaded RTT increase | Grade |
 |---:|:---|
 | less than 5 ms | A+ |
 | less than 30 ms | A |
@@ -40,58 +104,57 @@ remains conservative and stateful for shaper control:
 | less than 400 ms | D |
 | 400 ms or more | F |
 
-Before enough endpoint and loaded samples exist this signal is `LEARNING` or
-`BASELINE READY`. It continues to drive the throughput floor and bounded search
-described below. It is not the user-facing connection test and is never
-weakened merely to make a displayed grade look better.
-
-## Detected LibreQoS-like rating
-
-RC7 adds a second, observational tracker for the Status and Graphs pages. Its
-statistics follow the method used by the live LibreQoS Internet Quality Test in
-July 2026:
-
-```text
-idle_baseline(endpoint) = p5(idle HTTP/TCP samples for that endpoint)
-loaded_delta(direction) = p90(loaded HTTP/TCP samples for that direction)
-                          - idle_baseline(the selected endpoint)
-scored_delta(direction) = 0, when abs(loaded_delta) < 2 ms
-                          max(loaded_delta, 0), otherwise
-overall_grade = worse(grade(download), grade(upload))
-```
-
-The bidirectional phase is retained as a diagnostic but, matching the live
-test, does not affect the overall grade. The same exact `<5`, `<30`, `<60`,
-`<200`, `<400`, otherwise-F boundaries are used. This is described as
-*LibreQoS-like* rather than an official LibreQoS result because the daemon uses
-natural routed traffic and small rotating HTTP probes rather than LibreQoS's
-browser traffic generator.
-
-Each endpoint owns a 40-sample idle window. At least three clean idle samples
-are required before its baseline can score a load episode, and at least three
-loaded samples are required before that direction is final. One endpoint is
-selected for an episode so different DNS/TCP/TLS paths are never subtracted
-from one another. During an active episode Status publishes a partial
-`CURRENT` value and its sample progress. When the episode ends, the completed
-result becomes `PREVIOUS`; while the next episode is still `COLLECTING`, that
-previous result remains visible instead of being replaced by an empty grade.
-
-Every result records its endpoint, baseline p5, loaded p90, direction, sample
-count, completion time, and route identity. A route, source/external address,
-or member change clears the affected endpoint learning and marks the retained
-previous result `STALE`. Results and baselines never cross uplinks.
+One-direction evidence is shown as `PARTIAL`, never as a final connection
+grade. `CURRENT` shows the active/latest episode and `PREVIOUS` retains the
+last completed episode while a new one is collecting. Results record p5, p90,
+sample counts, direction, completion time, endpoint, and route identity. A
+route change marks retained results stale rather than combining old and new
+paths.
 
 The compatibility reference is the live
 [LibreQoS Internet Quality Test](https://test.libreqos.com/advanced/) and its
-published browser implementation. LibreQoS may evolve independently; this
-document and the daemon status field
-`quality_grade_method=p90_loaded_minus_p5_idle` identify the implemented
-snapshot explicitly.
+published browser implementation. RC8 measures natural routed traffic instead
+of generating the browser test's saturation load, so its Status rating is a
+compatible detector, not a claim that an official browser test was run.
+
+## Optional strict controller
+
+With `transport_controller_enabled=0`, transport evidence cannot change CAKE
+rates, the throughput guard is inactive, and adaptive-ceiling growth is not
+blocked by missing transport data. This is the RC8 safe default.
+
+When explicitly enabled, the controller uses the same p5 idle and p90 loaded
+statistics, but maintains independent download and upload trackers. A loaded
+window above `quality_target_delay_ms` must be confirmed in two consecutive
+windows before it may request a reduction. Missing, stale, rejected, or still
+learning evidence never fabricates delay and never cuts a rate.
+
+For target `T`, confirmed directional transport increase `D`, and current CAKE
+rate `C`, a bounded search candidate is:
+
+```text
+factor    = clamp(sqrt(T / D), 0.70, 0.97)
+candidate = max(throughput_floor, C * factor)
+```
+
+The normal ICMP/OWD loop continues independently. Once transport evidence is
+confirmed, the strict effective signal is:
+
+```text
+effective_delta_ms = max(ICMP_DL_delta_ms,
+                         ICMP_UL_delta_ms,
+                         confirmed_transport_delta_ms)
+```
+
+The default search observes a candidate for six seconds and permits at most
+three steps. It rolls back when the candidate does not materially improve the
+starting delay. Reaching the safety floor or step limit sets `quality_limited`
+and starts the configured cooldown.
 
 ## Throughput safety floor
 
-Transport-driven rate search cannot cross a per-direction safety floor. With
-capacity history:
+The floor exists only when both transport control and throughput protection
+are enabled. With capacity history:
 
 ```text
 reference = max(observed_p20, 0.75 * observed_p50)
@@ -99,67 +162,28 @@ floor = max(configured_min, absolute_user_floor,
             retention_percent / 100 * reference)
 ```
 
-When no Full Auto-Tune history exists, `reference = 0.75 * configured_base`.
-The default 80% retention therefore preserves 60% of base. Full Auto-Tune
-writes its observed low and median values as the P20/P50 references. The floor
-is still bounded by the absolute adaptive cap.
+Without a Full Auto-Tune reference, `reference = 0.75 * configured_base`. The
+default 80% retention therefore preserves 60% of base. No transport search may
+cross this per-direction floor or the configured absolute caps.
 
-## Bounded natural-traffic search
+## Adaptive ceiling and scheduled Auto-Tune
 
-Confirmed transport delay during natural high load may start a short search.
-For target `T`, measured delta `D`, and current CAKE rate `C`:
+When transport control is enabled, a bounded adaptive-ceiling probe may
+promote only while confirmed transport evidence is fresh and clean. Confirmed
+delay above target rolls the probe back. With transport control disabled, the
+ordinary ICMP/OWD adaptive-ceiling rules remain unchanged.
 
-```text
-factor = clamp(sqrt(T / D), 0.70, 0.97)
-candidate = max(floor, C * factor)
-```
+Periodic Full Auto-Tune is a separate opt-in facility. It keeps its own
+maintenance window, quiet-time, budget, validation, and review/auto-apply
+policy. Failure, timeout, route mismatch, CPU saturation, or insufficient
+throughput retention leaves UCI unchanged.
 
-The default policy observes each candidate for six seconds and permits at most
-three steps. A candidate must improve latency by at least 10 ms to continue.
-Worsening or no meaningful gain stops the search and rolls back to the best
-candidate only when it improved the starting delay by at least 30 ms or 25%;
-otherwise it restores the starting rate. Reaching the floor or step limit sets
-`quality_limited` and starts a 15-minute cooldown. This is the explicit
-safe-limit outcome when an A-like target cannot be achieved without destroying
-throughput.
+## Multi-WAN isolation
 
-The normal fast ICMP controller remains responsible for its existing quick
-bufferbloat response. Transport-aware search does not count a missing HTTP
-sample as bufferbloat and cannot bypass configured CAKE caps.
-
-## Adaptive ceiling interaction
-
-A bounded adaptive-ceiling probe may qualify or promote only while both the
-normal ICMP detector and a fresh confirmed transport signal are clean. A loaded
-transport delta above the target makes an in-progress ceiling probe fail and
-roll back. This prevents prioritized ICMP from approving a ceiling that is bad
-for ordinary traffic.
-
-## Scheduled Full Auto-Tune
-
-Periodic calibration is independently optional and disabled by default. Its
-per-instance controls include interval, local maintenance window, required
-quiet time, daily traffic budget, and auto-apply. State, last-run time, and byte
-accounting live under `/var/run/cake-autorate-autotune-scheduler` and disappear
-on reboot.
-
-The scheduler invokes the same fail-closed Full Auto-Tune job used by the
-wizard. The default is review-only: a validated proposal is retained in `/tmp`
-but UCI is unchanged. Auto-apply must be selected explicitly; even then, UCI is
-committed and the service restarted only after shaped validation returns
-`complete`. Failure, timeout, a busy link, an unsuitable time window, or an
-exhausted daily budget leaves the running configuration unchanged.
-
-## Per-uplink routing and baselines
-
-Main-route instances require the selected device to be the active default WAN.
-Structured Multi-WAN instances instead execute the HTTP client directly as
-`mwan3 use <member> exec ...`, so `uclient-fetch` follows the same selected
-member as ICMP and speed-test traffic without requiring `curl`.
-
-Every transport sample carries the complete uplink route identity. Samples are
-discarded if member, L3 device, source address, fwmark, routing table, or
-external address no longer matches. Each instance owns independent endpoint
-baselines and loaded windows; they are cleared on failover, PPPoE address
-change, route change, and offline recovery. No sample or baseline may cross
-from one WAN to another. See [MULTIWAN.md](MULTIWAN.md) for lifecycle details.
+The native socket receives `SO_BINDTODEVICE`, source-address binding, and
+`SO_MARK` where supplied by the resolved route. DNS is outside the RTT clock;
+the route identity is verified before and after a probe. Each instance owns a
+separate persistent connection, idle baseline, loaded windows, detected grade,
+controller state, and throughput reference. Nothing is copied between WANs,
+even when both exit through the same public NAT. See [MULTIWAN.md](MULTIWAN.md)
+for the complete lifecycle.
