@@ -49,11 +49,28 @@ const detected = helpers.formatQuality({
 	},
 	quality_class: 'C',
 	effective_latency_delta_ms: 80,
+	rating_load_phase: 'DL',
+	rating_capture_requested_phase: 'DL',
+	rating_load_reference_dl_kbps: 900000,
+	rating_load_reference_ul_kbps: 860000,
+	rating_load_enter_dl_kbps: 135000,
+	rating_load_enter_ul_kbps: 129000,
+	rating_load_enter_dl_percent: 15,
+	rating_load_enter_ul_percent: 15,
+	rating_load_aggregate_dl_kbps: 400000,
+	rating_load_aggregate_ul_kbps: 10000,
+	rating_load_effective_dl_kbps: 398000,
+	rating_load_effective_ul_kbps: 8000,
+	rating_capture_background_dl_kbps: 2000,
+	rating_capture_background_ul_kbps: 2000,
+	rating_capture_contaminated: false,
 });
 assert.equal(detected.attrs.class, 'cake-quality-stack');
 assert.equal(detected.children[0].children[1].children, 'B');
 assert.match(detected.children[0].children[2].children, /DL A\+.*UL B/);
 assert.equal(detected.children[1].children[1].children, 'PARTIAL');
+assert.match(detected.attrs.title, /Current CAKE reference: DL 900000 kbps · UL 860000 kbps/);
+assert.match(detected.attrs.title, /Current triggers: DL 135000 kbps \(15\.0%\)/);
 
 const collecting = helpers.formatQuality({
 	transport_latency_enabled: true,
@@ -116,7 +133,16 @@ assert.match(helpers.qualityProgressText({
 	baseline_samples: 20, baseline_required: 20,
 	dl_samples: 12, ul_samples: 9, required_samples: 20,
 	phase: 'DL', smoothed_dl_percent: 81, smoothed_ul_percent: 3,
-}), /DL 12\/20.*UL 9\/20.*Phase DL/);
+	requested_phase: 'DL', effective_dl_kbps: 730000, effective_ul_kbps: 1000,
+	enter_dl_kbps: 135000, enter_ul_kbps: 129000,
+	reference_dl_kbps: 900000, reference_ul_kbps: 860000,
+	background_dl_kbps: 2000, background_ul_kbps: 1000,
+}), /DL 12\/20.*UL 9\/20.*Phase DL.*Requested DL.*Effective DL 730000 kbps.*Trigger DL 135000 kbps.*CAKE reference DL 900000 kbps.*Background DL 2000 kbps/);
+
+assert.match(helpers.qualityProgressText({
+	contaminated: true,
+	contamination_reason: 'unexpected_upload_during_download',
+}), /CONTAMINATED: unexpected_upload_during_download/);
 
 assert.match(source, /cake-status-table td\{vertical-align:top!important/);
 assert.match(source, /cake-status-table th\{vertical-align:bottom!important/);

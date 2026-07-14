@@ -77,6 +77,14 @@ var optionDescriptions = {
 	rating_load_dropout_s: 'How long a short traffic gap is tolerated without losing the latched download or upload phase.',
 	rating_load_min_kbps: 'Absolute minimum traffic rate required for passive rating detection, independent of the percentage threshold.',
 	rating_load_dominance_ratio: 'When both directions are active, one direction must exceed the other by this ratio to avoid classifying the sample as bidirectional.',
+	rating_capture_min_enter_ratio: 'Lowest per-direction trigger allowed during Get rating. It is measured against the current CAKE rate and prevents an irregular browser phase from being missed.',
+	rating_capture_peak_factor: 'Fraction of each direction\'s own learned peak used by Get rating. DL and UL learn independently, and the threshold is frozen while a candidate is being confirmed.',
+	rating_capture_contamination_ratio: 'Unexpected opposite-direction traffic above this share of its current CAKE rate marks an automatic rating phase as contaminated instead of silently mixing it into the result.',
+	rating_capture_ack_ratio: 'Maximum reverse traffic treated as expected TCP acknowledgements, as a share of the requested direction. Contamination must exceed both this allowance and the opposite-direction CAKE limit.',
+	rating_capture_quiet_s: 'Consecutive quiet seconds required before Get rating records its background baseline.',
+	rating_capture_quiet_timeout_s: 'Maximum time Get rating waits for a quiet window before refusing a contaminated test.',
+	rating_capture_quiet_ratio: 'Maximum background share of the current CAKE rate accepted during the pre-test quiet window.',
+	rating_capture_quiet_min_kbps: 'Absolute background allowance used when the percentage allowance would be too small.',
 	rating_episode_gap_s: 'Idle time after loaded traffic before the current rating episode is finalized. This keeps short browser-test gaps inside one result.',
 	quality_target_delay_ms: 'Target loaded transport-delay increase. The default 30 ms corresponds to an estimated A-like target.',
 	quality_search_max_steps: 'Maximum bounded rate reductions in one search before cooldown and rollback to the best useful candidate.',
@@ -2932,6 +2940,21 @@ function addQualityOptions(section) {
 	o = value(section, 'quality', 'rating_load_min_kbps', _('Rating minimum traffic'), 'and(ufloat,min(0))', '2000');
 	o.depends('transport_latency_enabled', '1');
 	o = value(section, 'quality', 'rating_load_dominance_ratio', _('Direction dominance ratio'), 'and(ufloat,min(1.1),max(10))', '1.5');
+	o.depends('transport_latency_enabled', '1');
+	o = value(section, 'quality', 'rating_capture_min_enter_ratio', _('Capture minimum trigger'), 'and(ufloat,min(0.05),max(0.5))', '0.15');
+	o.depends('transport_latency_enabled', '1');
+	o = value(section, 'quality', 'rating_capture_peak_factor', _('Capture peak fraction'), 'and(ufloat,min(0.2),max(0.8))', '0.35');
+	o.depends('transport_latency_enabled', '1');
+	o = value(section, 'quality', 'rating_capture_contamination_ratio', _('Opposite traffic limit'), 'and(ufloat,min(0.05),max(0.5))', '0.10');
+	o = value(section, 'quality', 'rating_capture_ack_ratio', _('TCP acknowledgement allowance'), 'and(ufloat,min(0.01),max(0.25))', '0.08');
+	o.depends('transport_latency_enabled', '1');
+	o = value(section, 'quality', 'rating_capture_quiet_s', _('Pre-test quiet window'), 'and(uinteger,min(2),max(30))', '5');
+	o.depends('transport_latency_enabled', '1');
+	o = value(section, 'quality', 'rating_capture_quiet_timeout_s', _('Quiet-window timeout'), 'and(uinteger,min(5),max(120))', '30');
+	o.depends('transport_latency_enabled', '1');
+	o = value(section, 'quality', 'rating_capture_quiet_ratio', _('Allowed background ratio'), 'and(ufloat,min(0.01),max(0.25))', '0.05');
+	o.depends('transport_latency_enabled', '1');
+	o = value(section, 'quality', 'rating_capture_quiet_min_kbps', _('Allowed background minimum'), 'and(ufloat,min(0))', '1000');
 	o.depends('transport_latency_enabled', '1');
 	o = value(section, 'quality', 'rating_episode_gap_s', _('Rating finalize gap'), 'and(ufloat,min(5),max(120))', '30.0');
 	o.depends('transport_latency_enabled', '1');

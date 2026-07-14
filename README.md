@@ -48,15 +48,15 @@ socket libraries; ordinary OpenWrt runtime dependencies remain explicit below.
 
 The current tree builds these OpenWrt 25.12.5 APKs:
 
-- `cake-autorate-rs-1.0_rc9-r1-x86_64.apk` — x86_64 autorate daemon.
-- `cake-autorate-rs-1.0_rc9-r1-aarch64_generic.apk` — rockchip/armv8
+- `cake-autorate-rs-1.0_rc10-r1-x86_64.apk` — x86_64 autorate daemon.
+- `cake-autorate-rs-1.0_rc10-r1-aarch64_generic.apk` — rockchip/armv8
   autorate daemon.
-- `luci-app-cake-autorate-rs-1.0_rc9-r1.apk` — architecture-independent LuCI
+- `luci-app-cake-autorate-rs-1.0_rc10-r1.apk` — architecture-independent LuCI
   interface and SQM integration.
 
 The daemon package installs `uci`, `fping`, and `uclient-fetch` as dependencies.
 The LuCI package installs the daemon, `luci-base`, and `sqm-scripts`; the latter
-brings the CAKE, IFB, `tc`, and `ip` runtime pieces. Native RC9 transport probes
+brings the CAKE, IFB, `tc`, and `ip` runtime pieces. Native RC10 transport probes
 use the daemon's statically linked rustls/webpki stack. Full Auto-Tune and the
 diagnostic legacy HTTP backend still use OpenWrt `uclient-fetch`, so the offline
 installer includes the standard mbedTLS provider when none is already present.
@@ -97,6 +97,18 @@ raw/smoothed load, directional counts, finalization countdown, `CURRENT`, and
 retained `PREVIOUS`. A per-instance `Get rating` action can either generate
 shaped router-side load or wait for a sequential client test; neither mode
 disables SQM/autorate, changes CAKE limits, or stores samples in flash.
+
+RC10 makes the load detector robust to burst-shaped browser downloads: entry
+uses the independent DL/UL peak inside the bounded window while exit still uses
+the smoothed hysteresis signal. `Get rating` waits for a quiet link, measures
+and subtracts the background baseline, resets old episode counters, and drives
+explicit download-only then upload-only phases. Their adaptive triggers learn
+from each direction independently and are measured against the current CAKE
+rates. Unexpected opposite-direction traffic rejects the automatic result
+instead of silently mixing it into the grade, while bounded reverse TCP ACK
+traffic is explicitly allowed. Status shows the CAKE references,
+effective traffic, per-direction triggers, background, requested phase, and any
+contamination reason.
 
 Transport measurement/rating and transport-driven CAKE control are now separate
 options. Measurement can remain enabled for Status and Graphs while
@@ -191,11 +203,14 @@ Implemented:
   protected per-direction floor. See
   [TRANSPORT_QUALITY.md](TRANSPORT_QUALITY.md).
 - Passive detected-rating load classification is independent of controller
-  high/low/idle state. A bounded rolling average, enter/exit hysteresis,
+  high/low/idle state. A bounded rolling peak for entry, average for exit,
+  enter/exit hysteresis,
   direction latch, and dropout grace turn real forwarded traffic into stable
   `DL`, `UL`, or `BIDIRECTIONAL` rating phases without double-counting byte
   counters. Optional `Get rating` automatic/client capture uses the same
-  detector and only supplies a bounded trigger; it never bypasses shaping.
+  detector and supplies a bounded per-direction trigger; it never bypasses
+  shaping. Automatic capture first enforces a quiet window and runs separate
+  download-only and upload-only load phases.
 - `tc qdisc change ... cake bandwidth ...` shaper updates.
 - Upstream-style idle/stall handling: sustained idle can stop pingers, activity
   restarts them, and optional minimum-rate enforcement applies on sustained idle
@@ -502,16 +517,16 @@ them together. For x86_64:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc9-r1-x86_64.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc9-r1.apk
+  /root/cake-autorate-rs-1.0_rc10-r1-x86_64.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc10-r1.apk
 ```
 
 For rockchip/armv8 (`aarch64_generic`):
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc9-r1-aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc9-r1.apk
+  /root/cake-autorate-rs-1.0_rc10-r1-aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc10-r1.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:

@@ -13,6 +13,13 @@ uci_bin="${CAKE_AUTORATE_UCI:-uci}"
 setsid_bin="${CAKE_AUTORATE_SETSID:-$(command -v setsid 2>/dev/null)}"
 timeout_s="${CAKE_AUTORATE_QUALITY_TIMEOUT_S:-180}"
 max_automatic_runs="${CAKE_AUTORATE_QUALITY_MAX_RUNS:-3}"
+capture_phase="AUTO"
+background_dl_kbps="0"
+background_ul_kbps="0"
+quiet_window_s="5"
+quiet_timeout_s="30"
+quiet_ratio="0.05"
+quiet_min_kbps="1000"
 
 json_escape() {
 	printf '%s' "$1" | tr '\n\r\t' '   ' | sed 's/\\/\\\\/g; s/"/\\"/g'
@@ -50,6 +57,21 @@ now_epoch() {
 	date +%s
 }
 
+numeric_or_default() {
+	value="$1"
+	fallback="$2"
+	awk -v value="$value" -v fallback="$fallback" 'BEGIN {
+		if (value ~ /^[0-9]+([.][0-9]+)?$/) print value; else print fallback
+	}'
+}
+
+uci_default() {
+	name="$1"
+	fallback="$2"
+	value="$("$uci_bin" -q get "cake-autorate.$section.$name" 2>/dev/null)"
+	numeric_or_default "$value" "$fallback"
+}
+
 job_paths() {
 	job_dir="$job_root/$section"
 	pid_file="$job_dir/pid"
@@ -83,7 +105,7 @@ write_running_status() {
 write_capture() {
 	mkdir -p "$runtime_dir" || return 1
 	chmod 700 "$runtime_dir" 2>/dev/null || true
-	atomic_write "$capture_file" "$token|$capture_mode|$deadline"
+	atomic_write "$capture_file" "$token|$capture_mode|$deadline|$capture_phase|$background_dl_kbps|$background_ul_kbps"
 }
 
 clear_capture() {
@@ -144,6 +166,67 @@ preflight() {
 	return 0
 }
 
+load_capture_policy() {
+	quiet_window_s="$(uci_default rating_capture_quiet_s 5)"
+	quiet_timeout_s="$(uci_default rating_capture_quiet_timeout_s 30)"
+	quiet_ratio="$(uci_default rating_capture_quiet_ratio 0.05)"
+	quiet_min_kbps="$(uci_default rating_capture_quiet_min_kbps 1000)"
+}
+
+quiet_limit_for() {
+	reference="$1"
+	awk -v reference="$reference" -v ratio="$quiet_ratio" -v minimum="$quiet_min_kbps" 'BEGIN {
+		limit = reference * ratio
+		if (limit < minimum) limit = minimum
+		printf "%.3f", limit
+	}'
+}
+
+measure_quiet_background() {
+	load_capture_policy
+	reference_dl="$(status_value '.cake_dl_rate_kbps')"
+	reference_ul="$(status_value '.cake_ul_rate_kbps')"
+	reference_dl="$(numeric_or_default "$reference_dl" 0)"
+	reference_ul="$(numeric_or_default "$reference_ul" 0)"
+	awk -v dl="$reference_dl" -v ul="$reference_ul" 'BEGIN { exit !(dl > 0 && ul > 0) }' || {
+		failure="Current CAKE rate references are unavailable."
+		return 1
+	}
+	limit_dl="$(quiet_limit_for "$reference_dl")"
+	limit_ul="$(quiet_limit_for "$reference_ul")"
+	quiet_needed="$(awk -v value="$quiet_window_s" 'BEGIN { value = int(value + 0); if (value < 2) value = 2; print value }')"
+	wait_limit="$(awk -v value="$quiet_timeout_s" 'BEGIN { value = int(value + 0); if (value < 5) value = 5; print value }')"
+	quiet_count=0
+	sum_dl="0"
+	sum_ul="0"
+	start_wait="$(now_epoch)"
+
+	while [ "$(( $(now_epoch) - start_wait ))" -lt "$wait_limit" ]; do
+		current_dl="$(numeric_or_default "$(status_value '.dl_achieved_rate_kbps')" 0)"
+		current_ul="$(numeric_or_default "$(status_value '.ul_achieved_rate_kbps')" 0)"
+		if awk -v dl="$current_dl" -v ul="$current_ul" -v dlmax="$limit_dl" -v ulmax="$limit_ul" \
+			'BEGIN { exit !(dl <= dlmax && ul <= ulmax) }'; then
+			quiet_count=$((quiet_count + 1))
+			sum_dl="$(awk -v sum="$sum_dl" -v value="$current_dl" 'BEGIN { printf "%.3f", sum + value }')"
+			sum_ul="$(awk -v sum="$sum_ul" -v value="$current_ul" 'BEGIN { printf "%.3f", sum + value }')"
+			if [ "$quiet_count" -ge "$quiet_needed" ]; then
+				background_dl_kbps="$(awk -v sum="$sum_dl" -v count="$quiet_count" 'BEGIN { printf "%.3f", sum / count }')"
+				background_ul_kbps="$(awk -v sum="$sum_ul" -v count="$quiet_count" 'BEGIN { printf "%.3f", sum / count }')"
+				return 0
+			fi
+		else
+			quiet_count=0
+			sum_dl="0"
+			sum_ul="0"
+		fi
+		write_running_status "Waiting for a quiet link ($quiet_count/$quiet_needed s; DL ${current_dl}/${limit_dl}, UL ${current_ul}/${limit_ul} kbit/s)."
+		sleep 1
+	done
+
+	failure="Background traffic stayed above the quiet limits (DL $limit_dl, UL $limit_ul kbit/s). Stop heavy traffic or use passive rating."
+	return 1
+}
+
 lock_path_for_target() {
 	lock_name="$(printf '%s' "$target_if" | tr ':@.' '___')"
 	interface_lock="/tmp/cake-autorate-speedtest/interface-$lock_name.lock"
@@ -192,13 +275,30 @@ emit_live_status() {
 	finalize="$(status_value '.quality_grade_finalize_remaining_s')"
 	dl_load="$(status_value '.rating_load_smoothed_dl_percent')"
 	ul_load="$(status_value '.rating_load_smoothed_ul_percent')"
+	aggregate_dl="$(status_value '.rating_load_aggregate_dl_kbps')"
+	aggregate_ul="$(status_value '.rating_load_aggregate_ul_kbps')"
+	effective_dl="$(status_value '.rating_load_effective_dl_kbps')"
+	effective_ul="$(status_value '.rating_load_effective_ul_kbps')"
+	reference_dl="$(status_value '.rating_load_reference_dl_kbps')"
+	reference_ul="$(status_value '.rating_load_reference_ul_kbps')"
+	enter_dl="$(status_value '.rating_load_enter_dl_kbps')"
+	enter_ul="$(status_value '.rating_load_enter_ul_kbps')"
+	requested_phase="$(status_value '.rating_capture_requested_phase')"
+	background_dl="$(status_value '.rating_capture_background_dl_kbps')"
+	background_ul="$(status_value '.rating_capture_background_ul_kbps')"
+	contaminated="$(status_value '.rating_capture_contaminated')"
+	contamination_reason="$(status_value '.rating_capture_contamination_reason')"
 	last_reject="$(status_value '.transport_probe_last_rejected_reason')"
 	message="$(status_value '.quality_grade_state')"
-	printf '{"state":"%s","mode":"%s","phase":"%s","candidate":"%s","message":"%s","baseline_samples":%s,"baseline_required":%s,"dl_samples":%s,"ul_samples":%s,"required_samples":%s,"finalize_remaining_s":%s,"smoothed_dl_percent":%s,"smoothed_ul_percent":%s,"last_rejected_reason":"%s"}\n' \
+	printf '{"state":"%s","mode":"%s","phase":"%s","candidate":"%s","requested_phase":"%s","message":"%s","baseline_samples":%s,"baseline_required":%s,"dl_samples":%s,"ul_samples":%s,"required_samples":%s,"finalize_remaining_s":%s,"smoothed_dl_percent":%s,"smoothed_ul_percent":%s,"aggregate_dl_kbps":%s,"aggregate_ul_kbps":%s,"effective_dl_kbps":%s,"effective_ul_kbps":%s,"reference_dl_kbps":%s,"reference_ul_kbps":%s,"enter_dl_kbps":%s,"enter_ul_kbps":%s,"background_dl_kbps":%s,"background_ul_kbps":%s,"contaminated":%s,"contamination_reason":"%s","last_rejected_reason":"%s"}\n' \
 		"$state" "$(json_escape "$job_mode")" "$(json_escape "${phase:-IDLE}")" \
-		"$(json_escape "${candidate:-IDLE}")" "$(json_escape "${message:-waiting}")" \
+		"$(json_escape "${candidate:-IDLE}")" "$(json_escape "${requested_phase:-AUTO}")" "$(json_escape "${message:-waiting}")" \
 		"${baseline:-0}" "${baseline_required:-20}" "${dl:-0}" "${ul:-0}" \
 		"${required:-20}" "${finalize:-null}" "${dl_load:-0}" "${ul_load:-0}" \
+		"${aggregate_dl:-0}" "${aggregate_ul:-0}" "${effective_dl:-0}" "${effective_ul:-0}" \
+		"${reference_dl:-0}" "${reference_ul:-0}" "${enter_dl:-0}" "${enter_ul:-0}" \
+		"${background_dl:-0}" "${background_ul:-0}" "${contaminated:-false}" \
+		"$(json_escape "$contamination_reason")" \
 		"$(json_escape "$last_reject")"
 }
 
@@ -235,12 +335,75 @@ worker_signal() {
 	exit 0
 }
 
-automatic_samples_ready() {
-	dl="$(status_value '.quality_grade_dl_samples')"
-	ul="$(status_value '.quality_grade_ul_samples')"
+direction_samples_ready() {
+	direction="$1"
 	required="$(status_value '.quality_grade_required_samples')"
-	awk -v dl="${dl:-0}" -v ul="${ul:-0}" -v required="${required:-20}" \
-		'BEGIN { exit !(dl + 0 >= required + 0 && ul + 0 >= required + 0) }'
+	case "$direction" in
+		download) samples="$(status_value '.quality_grade_dl_samples')" ;;
+		upload) samples="$(status_value '.quality_grade_ul_samples')" ;;
+		*) return 1 ;;
+	esac
+	awk -v samples="${samples:-0}" -v required="${required:-20}" \
+		'BEGIN { exit !(samples + 0 >= required + 0) }'
+}
+
+capture_is_contaminated() {
+	[ "$(status_value '.rating_capture_contaminated')" = true ]
+}
+
+set_capture_phase() {
+	capture_phase="$1"
+	write_capture
+}
+
+wait_capture_phase() {
+	expected="$1"
+	attempt=0
+	while [ "$attempt" -lt 10 ]; do
+		active="$(status_value '.rating_capture_active')"
+		observed="$(status_value '.rating_capture_requested_phase')"
+		# Older daemons and the isolated shell fixtures do not expose the
+		# handshake fields. Keep one short compatibility delay in that case.
+		if [ -z "$active" ]; then
+			sleep 1
+			return 0
+		fi
+		if [ "$active" = true ] && [ "${observed:-AUTO}" = "$expected" ]; then
+			return 0
+		fi
+		attempt=$((attempt + 1))
+		sleep 1
+	done
+	return 1
+}
+
+run_automatic_direction() {
+	direction="$1"
+	case "$direction" in
+		download) phase_name="DL" ;;
+		upload) phase_name="UL" ;;
+		*) return 1 ;;
+	esac
+	run=1
+	while [ "$run" -le "$max_automatic_runs" ]; do
+		direction_samples_ready "$direction" && return 0
+		write_running_status "Generating shaped $direction load (pass $run/$max_automatic_runs)."
+		set_capture_phase "$phase_name" || worker_fail "Unable to arm the $direction rating phase."
+		wait_capture_phase "$phase_name" || worker_fail "The daemon did not acknowledge the $direction rating phase."
+		if ! "$speedtest_bin" "$section" "$target_if" run "$backend" shaped "$route_mode" "$mwan3_member" "$direction" >> "$log_file" 2>&1; then
+			set_capture_phase IDLE 2>/dev/null || true
+			worker_fail "Automatic $direction load generator failed; SQM and rates were left unchanged."
+		fi
+		set_capture_phase IDLE || worker_fail "Unable to close the $direction rating phase."
+		sleep 3
+		if capture_is_contaminated; then
+			reason="$(status_value '.rating_capture_contamination_reason')"
+			worker_fail "Automatic rating was contaminated by background traffic: ${reason:-opposite direction active}."
+		fi
+		direction_samples_ready "$direction" && return 0
+		run=$((run + 1))
+	done
+	return 1
 }
 
 worker() {
@@ -251,24 +414,27 @@ worker() {
 	trap worker_signal INT TERM
 	preflight || worker_fail "$failure"
 	acquire_interface_lock || worker_fail "${failure:-Unable to lock the selected interface.}"
+	write_running_status "Waiting for a quiet link before measuring background traffic."
+	measure_quiet_background || worker_fail "$failure"
+	if [ "$capture_mode" = automatic ]; then
+		capture_phase="IDLE"
+	else
+		capture_phase="AUTO"
+	fi
 	write_capture || worker_fail "Unable to arm rating capture."
-	write_running_status "Rating capture armed."
+	wait_capture_phase "$capture_phase" || worker_fail "The daemon did not acknowledge the rating capture."
+	write_running_status "Rating capture armed; background is DL $background_dl_kbps / UL $background_ul_kbps kbit/s."
 
 	if [ "$capture_mode" = automatic ]; then
 		route_mode="$("$uci_bin" -q get "cake-autorate.$section.route_mode" 2>/dev/null)"
 		mwan3_member="$("$uci_bin" -q get "cake-autorate.$section.mwan3_member" 2>/dev/null)"
-		run=1
-		while [ "$run" -le "$max_automatic_runs" ]; do
-			write_running_status "Generating shaped download and upload load (pass $run/$max_automatic_runs)."
-			if ! "$speedtest_bin" "$section" "$target_if" run "$backend" shaped "$route_mode" "$mwan3_member" >> "$log_file" 2>&1; then
-				worker_fail "Automatic load generator failed; SQM and rates were left unchanged."
-			fi
-			sleep 2
-			automatic_samples_ready && break
-			run=$((run + 1))
-		done
+		run_automatic_direction download || worker_fail "Automatic download did not collect enough clean samples."
+		run_automatic_direction upload || worker_fail "Automatic upload did not collect enough clean samples."
+		set_capture_phase IDLE || worker_fail "Unable to close the automatic rating phases."
 		write_running_status "Load generation finished; waiting for the rating window to finalize."
 	else
+		capture_phase="AUTO"
+		write_capture || worker_fail "Unable to arm guided direction detection."
 		write_running_status "Run a sequential download/upload test from a LAN client."
 	fi
 

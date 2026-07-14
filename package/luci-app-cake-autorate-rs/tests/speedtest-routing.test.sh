@@ -77,6 +77,44 @@ release_interface_lock
 }
 unset CAKE_AUTORATE_INTERFACE_LOCK_OWNER
 
+cat > "$work/bin/speedtest-go" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@" > "$CAKE_TEST_SPEEDTEST_ARGV"
+printf '%s\n' '{"dl_speed":100000000,"ul_speed":80000000,"server":{"id":"1","name":"test","sponsor":"test"}}'
+EOF
+chmod +x "$work/bin/speedtest-go"
+route_exec() {
+	"$@"
+}
+speedtest_go_bin="$work/bin/speedtest-go"
+jsonfilter_bin="$base/tests/fixtures/quality-test/jsonfilter"
+speedtest_go_server_id=1
+upload_bytes=4000000
+bind_interface_enabled=0
+target_if=""
+route_if=""
+route_source_ip=""
+tmp_response="$work/speedtest.json"
+warning=""
+CAKE_TEST_SPEEDTEST_ARGV="$work/speedtest-argv"
+export CAKE_TEST_SPEEDTEST_ARGV
+
+direction_override=download
+run_speedtest_go_once 1
+grep -qx -- '--no-upload' "$work/speedtest-argv"
+if grep -qx -- '--no-download' "$work/speedtest-argv"; then
+	echo "download-only speedtest incorrectly disabled download" >&2
+	exit 1
+fi
+
+direction_override=upload
+run_speedtest_go_once 1
+grep -qx -- '--no-download' "$work/speedtest-argv"
+if grep -qx -- '--no-upload' "$work/speedtest-argv"; then
+	echo "upload-only speedtest incorrectly disabled upload" >&2
+	exit 1
+fi
+
 download_kbps=900000
 upload_kbps=700000
 download_size=100
@@ -100,6 +138,7 @@ calibration_shaper_bypassed=false
 calibration_autorate_paused=false
 calibration_sqm_paused=false
 warning=
+direction_override=both
 emit_result > "$work/result.json"
 
 node -e '
@@ -107,6 +146,8 @@ const fs = require("fs");
 const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
 if (value.download_kbps !== 900000 || value.upload_kbps !== 700000)
   throw new Error("DL/UL fields were crossed");
+if (value.test_direction !== "both")
+  throw new Error("test direction missing from speedtest result");
 if (value.route_mode !== "mwan3" || value.mwan3_member !== "wanb" || value.route_fwmark !== "0x200" || value.route_table !== "2")
   throw new Error("route metadata missing from speedtest result");
 ' "$work/result.json"

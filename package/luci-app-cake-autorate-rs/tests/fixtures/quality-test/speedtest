@@ -1,21 +1,33 @@
 #!/bin/sh
 
 section="$1"
+direction="${8:-both}"
 runtime="${CAKE_AUTORATE_RUNTIME_DIR:?}/$section/status.json"
 counter="${CAKE_AUTORATE_QUALITY_DIR:?}/speedtest-runs"
+directions="${CAKE_AUTORATE_QUALITY_DIR:?}/speedtest-directions"
 runs="$(sed -n '1p' "$counter" 2>/dev/null)"
 runs="${runs:-0}"
 runs=$((runs + 1))
 printf '%s\n' "$runs" > "$counter"
+previous="$(sed -n '1p' "$directions" 2>/dev/null)"
+printf '%s%s%s\n' "$previous" "${previous:+ }" "$direction" > "$directions"
 
-if [ "$runs" -eq 1 ]; then
+if [ "${CAKE_TEST_CONTAMINATED:-0}" = 1 ]; then
 	cat > "$runtime" <<'EOF'
-{"route_active":true,"route_device":"lo","transport_probe_trusted":true,"quality_grade_baseline_ready":true,"quality_grade_baseline_samples":20,"quality_grade_baseline_required_samples":20,"quality_grade_dl_samples":10,"quality_grade_ul_samples":10,"quality_grade_required_samples":20,"quality_grade_state":"collecting","rating_load_phase":"UL","rating_load_candidate":"UL","rating_load_smoothed_dl_percent":5,"rating_load_smoothed_ul_percent":85}
+{"route_active":true,"route_device":"lo","transport_probe_trusted":true,"quality_grade_baseline_ready":true,"quality_grade_baseline_samples":20,"quality_grade_baseline_required_samples":20,"quality_grade_dl_samples":0,"quality_grade_ul_samples":0,"quality_grade_required_samples":20,"quality_grade_state":"baseline_ready","rating_load_phase":"IDLE","rating_load_candidate":"IDLE","rating_load_smoothed_dl_percent":75,"rating_load_smoothed_ul_percent":25,"dl_achieved_rate_kbps":75000,"ul_achieved_rate_kbps":12500,"cake_dl_rate_kbps":100000,"cake_ul_rate_kbps":50000,"rating_capture_contaminated":true,"rating_capture_contamination_reason":"unexpected_upload_during_download"}
+EOF
+	printf '{"download_kbps":800000,"upload_kbps":null,"test_direction":"%s","shaper_bypassed":false}\n' "$direction"
+	exit 0
+fi
+
+if [ "$direction" = download ]; then
+	cat > "$runtime" <<'EOF'
+{"route_active":true,"route_device":"lo","transport_probe_trusted":true,"quality_grade_baseline_ready":true,"quality_grade_baseline_samples":20,"quality_grade_baseline_required_samples":20,"quality_grade_dl_samples":20,"quality_grade_ul_samples":0,"quality_grade_required_samples":20,"quality_grade_state":"collecting","rating_load_phase":"DL","rating_load_candidate":"DL","rating_load_smoothed_dl_percent":85,"rating_load_smoothed_ul_percent":2,"dl_achieved_rate_kbps":85000,"ul_achieved_rate_kbps":1000,"cake_dl_rate_kbps":100000,"cake_ul_rate_kbps":50000,"rating_capture_contaminated":false}
 EOF
 else
 	cat > "$runtime" <<'EOF'
-{"route_active":true,"route_device":"lo","transport_probe_trusted":true,"quality_grade_baseline_ready":true,"quality_grade_baseline_samples":20,"quality_grade_baseline_required_samples":20,"quality_grade_dl_samples":20,"quality_grade_ul_samples":20,"quality_grade_required_samples":20,"quality_grade_state":"final","rating_load_phase":"IDLE","rating_load_candidate":"IDLE","rating_load_smoothed_dl_percent":0,"rating_load_smoothed_ul_percent":0,"quality_grade_current":{"grade":"A","increase_ms":8.5,"started_at":9999999999,"completed_at":9999999999,"partial":false,"incomplete":false,"dl_samples":20,"ul_samples":20,"dl":{"grade":"A+"},"ul":{"grade":"A"}}}
+{"route_active":true,"route_device":"lo","transport_probe_trusted":true,"quality_grade_baseline_ready":true,"quality_grade_baseline_samples":20,"quality_grade_baseline_required_samples":20,"quality_grade_dl_samples":20,"quality_grade_ul_samples":20,"quality_grade_required_samples":20,"quality_grade_state":"final","rating_load_phase":"UL","rating_load_candidate":"UL","rating_load_smoothed_dl_percent":2,"rating_load_smoothed_ul_percent":85,"dl_achieved_rate_kbps":1000,"ul_achieved_rate_kbps":42500,"cake_dl_rate_kbps":100000,"cake_ul_rate_kbps":50000,"rating_capture_contaminated":false,"quality_grade_current":{"grade":"A","increase_ms":8.5,"started_at":9999999999,"completed_at":9999999999,"partial":false,"incomplete":false,"dl_samples":20,"ul_samples":20,"dl":{"grade":"A+"},"ul":{"grade":"A"}}}
 EOF
 fi
 
-printf '{"download_kbps":800000,"upload_kbps":700000,"shaper_bypassed":false}\n'
+printf '{"download_kbps":800000,"upload_kbps":700000,"test_direction":"%s","shaper_bypassed":false}\n' "$direction"

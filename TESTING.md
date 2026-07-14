@@ -514,3 +514,72 @@ architecture and completed without a feed lookup. The release installers pass
 The release `SHA256SUMS` covers these four files plus both daemon APKs and the
 shared noarch LuCI APK. Published-asset verification is performed again from a
 fresh directory after GitHub upload.
+
+## RC10 background-aware rating acceptance gate (2026-07-14)
+
+RC10 separates generated download and upload load, measures the idle traffic
+already present on the link, and resets the directional counters for every new
+`Get rating` job. The final project APKs used by the live gate are:
+
+| Artifact | SHA-256 |
+|---|---|
+| x86_64 daemon APK | `aa4632f835b91e84814664f6ff44d54c51a6fe6defe52f2aac79c1ca61a75d74` |
+| aarch64_generic daemon APK | `062062363d03cc3295d1701db072c855892e9211762253d25be44ce14bf35405` |
+| noarch LuCI APK | `439e95d15f2b33803faf38342b53bd480b696316efd7868a577314d39d46ce86` |
+
+The disposable x86 router first exposed the RC9 failure mode: during a shaped
+download the reverse TCP acknowledgements occupied about 25% of a much smaller
+upload CAKE rate and were incorrectly called background contamination. The
+final detector waits until the requested direction is loaded, requires the
+opposite direction to exceed its own CAKE-based boundary, and then permits a
+bounded ACK ratio relative to the requested-direction traffic. Unit coverage
+retains a real asymmetric 85/10 Mbit/s trace and a separate genuinely
+contaminated trace.
+
+The final automatic live run observed about 82.6 Mbit/s effective DL together
+with 2.5 Mbit/s reverse ACK traffic without contamination. The download phase
+collected 90 samples, the later upload-only phase collected 66, and the result
+finalized as `A+` for both directions with a 2.128 ms loaded increase. The
+helper did not change CAKE: root/IFB rates remained exactly 10/85 Mbit/s. Its
+temporary transport settings and job files were removed, and the original
+cake-autorate and SQM hashes were restored byte-for-byte.
+
+The same packages were then installed on the two-uplink x86 nftables-mwan3
+router and the ARMv8 variable-WWAN router. Their cake-autorate, SQM, and (where
+present) mwan3 hashes were unchanged. The x86 primary/backup instances retained
+`ACTIVE`/`STANDBY`, their distinct route identities, and 900000/860000 plus
+108000/14500 kbit/s CAKE pairs. The ARM instance retained `ACTIVE`, its WWAN
+route identity, and 114515/15773 kbit/s. Only cake-autorate was restarted;
+mwan3 was never restarted.
+
+Authenticated Playwright checks passed on the disposable and both production
+routers. They opened Status and the expanded rating dialog, verified the RC10
+daemon/LuCI versions and readiness messaging, and checked one vertically
+stacked graph card per uplink. Every card retained two synchronized canvases,
+fixed Y-axis overlays, exact rating phase/DL/UL data on hover, and a valid
+390 px mobile layout. The disposable graph also showed the completed `A+`
+episode. No LuCI application exception occurred.
+
+The final local gate passed 96 Rust tests, strict Clippy and formatting, six
+shell lifecycle/routing/helper suites, four LuCI JavaScript suites, both SDK
+package builds, shell/JavaScript syntax, `git diff --check`, and all three live
+router checks. The quiet-link timeout, background subtraction, independent
+DL/UL capture thresholds, frozen candidate threshold, explicit phase
+acknowledgement, ACK allowance, and true opposite-direction contamination all
+have deterministic regression coverage.
+
+Each RC10 offline repository contains 65 APKs and a newly generated
+`packages.adb`. With networking and package scripts disabled, APK selected and
+installed all 62 required packages into fresh x86_64 and aarch64_generic roots.
+Both installers pass `sh -n`; both archives contain the platform installer,
+index, and all 65 APKs. The remaining release payload hashes are:
+
+| Artifact | SHA-256 |
+|---|---|
+| x86_64 installer | `a682a53b56cee3341b6d5eb9318fadf92060b442419c5576eae8009642d29df8` |
+| aarch64_generic installer | `41835aff3c4fddf02ae18a78f7d5df8af7997e3cf8cb8482d61da7044cd111c1` |
+| x86_64 offline bundle | `8955e6144d8ce6261e8a8392e89ba7d9382ceddd9be06fc16de47256dd669004` |
+| rockchip/armv8 offline bundle | `113af86b542ed6e5e37b22c258584f206a7e34b63c118d84aa70204e0243b11b` |
+
+The release checksum manifest covers these four files plus both daemon APKs
+and the shared noarch LuCI APK.

@@ -144,12 +144,14 @@ rate.
 ## Independent rating-load state machine
 
 Detected grading must recognize sustained routed client tests without inheriting
-the fast controller's instantaneous transitions. For each direction, RC9 keeps
+the fast controller's instantaneous transitions. For each direction, RC10 keeps
 all `(R, R/C)` observations in a window of length `W` and calculates:
 
 ```text
 Rbar_d = mean(R_d)
 Lbar_d = mean(clamp(R_d / C_d, 0, 10))
+Rpeak_d = max(R_d)
+Lpeak_d = max(clamp(R_d / C_d, 0, 10))
 ```
 
 Let `E` be the enter ratio, `X` the exit ratio, `K` the minimum absolute rate,
@@ -157,33 +159,50 @@ and `D` the direction-dominance ratio. With defaults `W=2 s`, `E=0.60`,
 `X=0.40`, `K=2000 kbit/s`, and `D=1.5`:
 
 ```text
-loaded_d(E) = (Lbar_d >= E) and (Rbar_d >= K)
+enter_d(E) = (Lpeak_d >= E) and (Rpeak_d >= K)
+stay_d(X)  = (Lbar_d >= X) and (Rbar_d >= K/2)
 
 phase = IDLE          if neither direction is loaded
         DL            if only DL is loaded
         UL            if only UL is loaded
-        DL            if both and Lbar_DL >= D * Lbar_UL
-        UL            if both and Lbar_UL >= D * Lbar_DL
+        DL            if both and Lpeak_DL >= D * Lpeak_UL
+        UL            if both and Lpeak_UL >= D * Lpeak_DL
         BIDIRECTIONAL otherwise
 ```
 
-A new candidate must persist for one second before the phase changes. A loaded
-phase remains supported using `X` and `K/2`; only 1.5 seconds continuously below
-that lower boundary returns it to idle. Thus the enter/exit gap is true
-hysteresis, not two independent labels. A transport batch is admitted to a
-directional grade window only when its route identity and rating phase still
-match at completion.
+A new candidate must persist for one second before the phase changes. Using the
+bounded peak only for entry preserves burst-shaped browser downloads which can
+exceed 60% for one counter interval but average below it over two seconds. A
+loaded phase remains supported by the smoothed `stay_d(X)` signal; only 1.5
+seconds continuously below that lower boundary returns it to idle. Thus the
+enter/exit gap is true hysteresis, not two independent labels. A transport batch
+is admitted to a directional grade window only when its route identity and
+rating phase still match at completion.
 
 The optional bounded capture marker used by `Get rating` does not inject
-samples. It learns the highest smoothed ratio `P` seen during that job and uses:
+samples. After a quiet window it records background `B_d`, and the detector uses
+`R'_d=max(0,R_d-B_d)`. DL and UL independently learn their highest smoothed
+ratios `P_d` and use:
 
 ```text
-E_capture = min(E, max(0.15, 0.55 * P))
-X_capture = min(X, max(0.10, 0.67 * E_capture))
+E_capture_d = min(E, max(0.15, 0.35 * P_d))
+X_capture_d = min(X, max(0.1005, 0.67 * E_capture_d))
 ```
 
-Removing the marker immediately restores normal passive thresholds. Controller
-classification and all CAKE update equations remain unchanged.
+The threshold is frozen while its candidate is being confirmed, so a later peak
+cannot chase and invalidate an already detected phase. Automatic capture marks
+explicit `DL`, `IDLE`, and `UL` intervals. Before starting it requires five
+consecutive quiet seconds where each aggregate direction is at most
+`max(0.05*C_d, 1000 kbit/s)`, with a 30-second timeout. Unexpected traffic in
+the opposite direction at or above `0.10*C_d` contaminates and rejects the run,
+but only after the requested direction is loaded and after allowing reverse TCP
+ACK traffic up to 8% of the requested-direction rate.
+The initial background is subtracted, but traffic which begins in the same
+direction during a generated phase cannot be distinguished from the generator;
+the explicit phase boundary prevents it from extending collection, and the
+test should still be run on an otherwise quiet link. Removing the marker
+immediately restores normal passive thresholds. Controller classification and
+all CAKE update equations remain unchanged.
 
 ## Delay samples and moving baseline
 

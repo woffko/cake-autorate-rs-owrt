@@ -122,6 +122,10 @@ struct Config {
     rating_load_dropout_s: f64,
     rating_load_min_kbps: f64,
     rating_load_dominance_ratio: f64,
+    rating_capture_min_enter_ratio: f64,
+    rating_capture_peak_factor: f64,
+    rating_capture_contamination_ratio: f64,
+    rating_capture_ack_ratio: f64,
     rating_episode_gap_s: f64,
     quality_target_delay_ms: f64,
     quality_search_max_steps: usize,
@@ -260,6 +264,10 @@ impl Config {
             rating_load_dropout_s: 1.5,
             rating_load_min_kbps: 2000.0,
             rating_load_dominance_ratio: 1.5,
+            rating_capture_min_enter_ratio: 0.15,
+            rating_capture_peak_factor: 0.35,
+            rating_capture_contamination_ratio: 0.10,
+            rating_capture_ack_ratio: 0.08,
             rating_episode_gap_s: 30.0,
             quality_target_delay_ms: 30.0,
             quality_search_max_steps: 3,
@@ -576,6 +584,26 @@ impl Config {
             &single,
             "rating_load_dominance_ratio",
             &mut cfg.rating_load_dominance_ratio,
+        )?;
+        set_f64(
+            &single,
+            "rating_capture_min_enter_ratio",
+            &mut cfg.rating_capture_min_enter_ratio,
+        )?;
+        set_f64(
+            &single,
+            "rating_capture_peak_factor",
+            &mut cfg.rating_capture_peak_factor,
+        )?;
+        set_f64(
+            &single,
+            "rating_capture_contamination_ratio",
+            &mut cfg.rating_capture_contamination_ratio,
+        )?;
+        set_f64(
+            &single,
+            "rating_capture_ack_ratio",
+            &mut cfg.rating_capture_ack_ratio,
         )?;
         set_f64(
             &single,
@@ -1254,6 +1282,30 @@ impl Config {
             {
                 return Err("rating_load_dominance_ratio must be between 1.1 and 10".to_string());
             }
+            if !self.rating_capture_min_enter_ratio.is_finite()
+                || !(0.05..=0.50).contains(&self.rating_capture_min_enter_ratio)
+            {
+                return Err(
+                    "rating_capture_min_enter_ratio must be between 0.05 and 0.50".to_string(),
+                );
+            }
+            if !self.rating_capture_peak_factor.is_finite()
+                || !(0.20..=0.80).contains(&self.rating_capture_peak_factor)
+            {
+                return Err("rating_capture_peak_factor must be between 0.20 and 0.80".to_string());
+            }
+            if !self.rating_capture_contamination_ratio.is_finite()
+                || !(0.05..=0.50).contains(&self.rating_capture_contamination_ratio)
+            {
+                return Err(
+                    "rating_capture_contamination_ratio must be between 0.05 and 0.50".to_string(),
+                );
+            }
+            if !self.rating_capture_ack_ratio.is_finite()
+                || !(0.01..=0.25).contains(&self.rating_capture_ack_ratio)
+            {
+                return Err("rating_capture_ack_ratio must be between 0.01 and 0.25".to_string());
+            }
             if !self.rating_episode_gap_s.is_finite()
                 || !(5.0..=120.0).contains(&self.rating_episode_gap_s)
             {
@@ -1405,6 +1457,10 @@ impl Config {
             dropout: Duration::from_secs_f64(self.rating_load_dropout_s),
             min_rate_kbps: self.rating_load_min_kbps,
             dominance_ratio: self.rating_load_dominance_ratio,
+            capture_min_enter_ratio: self.rating_capture_min_enter_ratio,
+            capture_peak_factor: self.rating_capture_peak_factor,
+            capture_contamination_ratio: self.rating_capture_contamination_ratio,
+            capture_ack_ratio: self.rating_capture_ack_ratio,
         }
     }
 
@@ -2729,7 +2785,12 @@ impl Controller {
         };
         let now = Instant::now();
         let rating_load = RatingLoadDetector::new(now);
-        let rating_load_snapshot = rating_load.snapshot(now, cfg.rating_load_config());
+        let rating_load_snapshot = rating_load.snapshot(
+            now,
+            cfg.rating_load_config(),
+            cfg.base_dl_shaper_rate_kbps,
+            cfg.base_ul_shaper_rate_kbps,
+        );
         let adaptive_dl = AdaptiveCeilingDirection::new(
             cfg.max_dl_shaper_rate_kbps,
             cfg.adaptive_ceiling_dl_cap_kbps,
@@ -2857,13 +2918,33 @@ impl Controller {
         let token = fields.next().unwrap_or("");
         let mode = fields.next().unwrap_or("");
         let deadline = fields.next().and_then(|value| value.parse::<f64>().ok());
+        let requested_phase = fields.next().and_then(RatingPhase::from_capture);
+        let background_dl_kbps = fields
+            .next()
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let background_ul_kbps = fields
+            .next()
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or(0.0);
         if !token.is_empty()
             && matches!(mode, "automatic" | "client")
             && deadline.map(|value| value > epoch_secs()).unwrap_or(false)
         {
-            self.rating_load.set_capture(Some(token), Some(mode), now);
+            let capture_started = self.rating_load.set_capture(
+                Some(token),
+                Some(mode),
+                requested_phase,
+                background_dl_kbps,
+                background_ul_kbps,
+                now,
+            );
+            if capture_started {
+                self.quality_grade.begin_capture(epoch_secs());
+            }
         } else {
-            self.rating_load.set_capture(None, None, now);
+            self.rating_load
+                .set_capture(None, None, None, 0.0, 0.0, now);
             if !content.is_empty() {
                 let _ = fs::remove_file(self.cfg.rating_capture_path());
             }
@@ -3294,9 +3375,12 @@ impl Controller {
         self.quality_ul_class = QualityClass::Learning;
         let now = Instant::now();
         self.rating_load = RatingLoadDetector::new(now);
-        self.rating_load_snapshot = self
-            .rating_load
-            .snapshot(now, self.cfg.rating_load_config());
+        self.rating_load_snapshot = self.rating_load.snapshot(
+            now,
+            self.cfg.rating_load_config(),
+            self.shaper_dl,
+            self.shaper_ul,
+        );
         let dl_update = self.adaptive_dl.reset_to_configured(now);
         let ul_update = self.adaptive_ul.reset_to_configured(now);
         self.log_adaptive_update("DL", dl_update);
@@ -4252,7 +4336,7 @@ impl Controller {
         file.seek(SeekFrom::End(-2))?;
         write!(
             file,
-            ",\"quality_grade_method\":\"transport_rtt_p90_loaded_minus_p5_idle_v3\",\"quality_grade_state\":\"{}\",\"quality_grade_collected_samples\":{},\"quality_grade_required_samples\":{},\"quality_grade_baseline_ready\":{},\"quality_grade_baseline_samples\":{},\"quality_grade_baseline_required_samples\":{},\"quality_grade_dl_samples\":{},\"quality_grade_ul_samples\":{},\"quality_grade_bidirectional_samples\":{},\"quality_grade_finalize_remaining_s\":{},\"quality_grade_current\":{},\"quality_grade_previous\":{},\"rating_load_phase\":\"{}\",\"rating_load_candidate\":\"{}\",\"rating_load_raw_dl_percent\":{:.3},\"rating_load_raw_ul_percent\":{:.3},\"rating_load_smoothed_dl_percent\":{:.3},\"rating_load_smoothed_ul_percent\":{:.3},\"rating_load_enter_percent\":{:.3},\"rating_load_exit_percent\":{:.3},\"rating_load_phase_age_s\":{:.3},\"rating_capture_active\":{},\"rating_capture_mode\":\"{}\",\"rating_capture_peak_dl_percent\":{:.3},\"rating_capture_peak_ul_percent\":{:.3},\"graph_history_enabled\":{},\"graph_history_budget_mode\":\"{}\",\"graph_history_configured_budget_kib\":{},\"graph_history_safe_max_kib\":{},\"graph_history_effective_total_kib\":{},\"graph_history_instance_budget_kib\":{},\"graph_history_used_total_kib\":{},\"graph_history_used_instance_kib\":{},\"graph_history_stored_samples\":{},\"graph_history_instances\":{},\"graph_history_mem_total_kib\":{},\"graph_history_mem_available_kib\":{},\"graph_history_paused_low_memory\":{}",
+            ",\"quality_grade_method\":\"transport_rtt_p90_loaded_minus_p5_idle_v4\",\"quality_grade_state\":\"{}\",\"quality_grade_collected_samples\":{},\"quality_grade_required_samples\":{},\"quality_grade_baseline_ready\":{},\"quality_grade_baseline_samples\":{},\"quality_grade_baseline_required_samples\":{},\"quality_grade_dl_samples\":{},\"quality_grade_ul_samples\":{},\"quality_grade_bidirectional_samples\":{},\"quality_grade_finalize_remaining_s\":{},\"quality_grade_current\":{},\"quality_grade_previous\":{},\"rating_load_phase\":\"{}\",\"rating_load_candidate\":\"{}\",\"rating_load_raw_dl_percent\":{:.3},\"rating_load_raw_ul_percent\":{:.3},\"rating_load_smoothed_dl_percent\":{:.3},\"rating_load_smoothed_ul_percent\":{:.3},\"rating_load_aggregate_dl_kbps\":{:.3},\"rating_load_aggregate_ul_kbps\":{:.3},\"rating_load_effective_dl_kbps\":{:.3},\"rating_load_effective_ul_kbps\":{:.3},\"rating_load_reference_dl_kbps\":{:.3},\"rating_load_reference_ul_kbps\":{:.3},\"rating_load_enter_percent\":{:.3},\"rating_load_exit_percent\":{:.3},\"rating_load_enter_dl_percent\":{:.3},\"rating_load_enter_ul_percent\":{:.3},\"rating_load_exit_dl_percent\":{:.3},\"rating_load_exit_ul_percent\":{:.3},\"rating_load_enter_dl_kbps\":{:.3},\"rating_load_enter_ul_kbps\":{:.3},\"rating_load_phase_age_s\":{:.3},\"rating_capture_active\":{},\"rating_capture_mode\":\"{}\",\"rating_capture_requested_phase\":\"{}\",\"rating_capture_background_dl_kbps\":{:.3},\"rating_capture_background_ul_kbps\":{:.3},\"rating_capture_peak_dl_percent\":{:.3},\"rating_capture_peak_ul_percent\":{:.3},\"rating_capture_contaminated\":{},\"rating_capture_contamination_reason\":\"{}\",\"graph_history_enabled\":{},\"graph_history_budget_mode\":\"{}\",\"graph_history_configured_budget_kib\":{},\"graph_history_safe_max_kib\":{},\"graph_history_effective_total_kib\":{},\"graph_history_instance_budget_kib\":{},\"graph_history_used_total_kib\":{},\"graph_history_used_instance_kib\":{},\"graph_history_stored_samples\":{},\"graph_history_instances\":{},\"graph_history_mem_total_kib\":{},\"graph_history_mem_available_kib\":{},\"graph_history_paused_low_memory\":{}",
             json_escape(quality_grade.state),
             quality_grade.collected_samples,
             quality_grade.required_samples,
@@ -4277,13 +4361,30 @@ impl Controller {
             self.rating_load_snapshot.raw_ul_percent,
             self.rating_load_snapshot.smoothed_dl_percent,
             self.rating_load_snapshot.smoothed_ul_percent,
-            self.rating_load_snapshot.enter_percent,
-            self.rating_load_snapshot.exit_percent,
+            self.rating_load_snapshot.aggregate_dl_rate_kbps,
+            self.rating_load_snapshot.aggregate_ul_rate_kbps,
+            self.rating_load_snapshot.effective_dl_rate_kbps,
+            self.rating_load_snapshot.effective_ul_rate_kbps,
+            self.rating_load_snapshot.reference_dl_kbps,
+            self.rating_load_snapshot.reference_ul_kbps,
+            self.rating_load_snapshot.enter_dl_percent.max(self.rating_load_snapshot.enter_ul_percent),
+            self.rating_load_snapshot.exit_dl_percent.max(self.rating_load_snapshot.exit_ul_percent),
+            self.rating_load_snapshot.enter_dl_percent,
+            self.rating_load_snapshot.enter_ul_percent,
+            self.rating_load_snapshot.exit_dl_percent,
+            self.rating_load_snapshot.exit_ul_percent,
+            self.rating_load_snapshot.enter_dl_kbps,
+            self.rating_load_snapshot.enter_ul_kbps,
             self.rating_load_snapshot.phase_age_s,
             self.rating_load_snapshot.capture_active,
             self.rating_load_snapshot.capture_mode,
+            self.rating_load_snapshot.capture_requested_phase,
+            self.rating_load_snapshot.capture_background_dl_kbps,
+            self.rating_load_snapshot.capture_background_ul_kbps,
             self.rating_load_snapshot.capture_peak_dl_percent,
             self.rating_load_snapshot.capture_peak_ul_percent,
+            self.rating_load_snapshot.capture_contaminated,
+            json_escape(self.rating_load_snapshot.capture_contamination_reason),
             self.cfg.graph_history_enabled,
             if self.history_budget.configured_kib.is_some() {
                 "manual"

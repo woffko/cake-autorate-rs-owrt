@@ -78,15 +78,30 @@ function qualityProgressText(job) {
 		_('DL %d/%d').format(Number(job.dl_samples || 0), required),
 		_('UL %d/%d').format(Number(job.ul_samples || 0), required),
 		_('Phase %s').format(job.phase || 'IDLE'),
+		_('Requested %s').format(job.requested_phase || 'AUTO'),
 		_('Load DL %s / UL %s').format(
 			formatPercent(job.smoothed_dl_percent),
-			formatPercent(job.smoothed_ul_percent))
+			formatPercent(job.smoothed_ul_percent)),
+		_('Effective DL %s / UL %s').format(
+			formatRate(job.effective_dl_kbps),
+			formatRate(job.effective_ul_kbps)),
+		_('Trigger DL %s / UL %s').format(
+			formatRate(job.enter_dl_kbps),
+			formatRate(job.enter_ul_kbps)),
+		_('CAKE reference DL %s / UL %s').format(
+			formatRate(job.reference_dl_kbps),
+			formatRate(job.reference_ul_kbps)),
+		_('Background DL %s / UL %s').format(
+			formatRate(job.background_dl_kbps),
+			formatRate(job.background_ul_kbps))
 	];
 
 	if (job.finalize_remaining_s != null)
 		parts.push(_('Finalize in about %d s').format(Math.ceil(Number(job.finalize_remaining_s || 0))));
 	if (job.last_rejected_reason)
 		parts.push(_('Last rejected: %s').format(job.last_rejected_reason));
+	if (job.contaminated)
+		parts.push(_('CONTAMINATED: %s').format(job.contamination_reason || _('unexpected opposite-direction traffic')));
 	return parts.join(' · ');
 }
 
@@ -99,7 +114,7 @@ function showQualityTest(section, status) {
 	]);
 	var state = E('div', { 'class': 'alert-message notice cake-quality-job-state' }, readiness.reason);
 	var detail = E('div', { 'class': 'cake-quality-job-detail' },
-		_('Automatic mode generates shaped download and upload traffic through this uplink. It may take 1–3 passes and transfer several gigabytes on a fast line. Guided mode waits up to three minutes while you run a sequential download and upload test from a LAN client. Neither mode disables SQM or autorate, changes CAKE limits, or writes samples to flash.'));
+		_('Automatic mode first waits for a quiet link, measures background traffic, then runs explicit download-only and upload-only phases through this uplink. Unexpected opposite-direction traffic rejects a contaminated phase. It may take 1–3 passes and transfer several gigabytes on a fast line. Guided mode uses independent download and upload triggers while you run a sequential test from a LAN client. Triggers are percentages of the current CAKE rates, not the physical link or adaptive ceiling caps. Neither mode disables SQM or autorate, changes CAKE limits, or writes samples to flash.'));
 	var running = false;
 	var closed = false;
 	var startButton;
@@ -407,6 +422,27 @@ function formatQuality(status) {
 			_('Download and upload are scored independently; the worse grade is shown.'),
 			_('A one-direction result is labeled PARTIAL and is never presented as the final connection rating.'),
 			_('Bidirectional latency is diagnostic and does not affect the total grade.'),
+			_('Load detector: %s · requested phase: %s').format(
+				status.rating_load_phase || 'IDLE',
+				status.rating_capture_requested_phase || 'AUTO'),
+			_('Current CAKE reference: DL %s · UL %s').format(
+				formatRate(status.rating_load_reference_dl_kbps),
+				formatRate(status.rating_load_reference_ul_kbps)),
+			_('Current triggers: DL %s (%s) · UL %s (%s)').format(
+				formatRate(status.rating_load_enter_dl_kbps),
+				formatPercent(status.rating_load_enter_dl_percent),
+				formatRate(status.rating_load_enter_ul_kbps),
+				formatPercent(status.rating_load_enter_ul_percent)),
+			_('Aggregate traffic: DL %s · UL %s; effective after background subtraction: DL %s · UL %s').format(
+				formatRate(status.rating_load_aggregate_dl_kbps),
+				formatRate(status.rating_load_aggregate_ul_kbps),
+				formatRate(status.rating_load_effective_dl_kbps),
+				formatRate(status.rating_load_effective_ul_kbps)),
+			_('Capture background: DL %s · UL %s; contaminated: %s (%s)').format(
+				formatRate(status.rating_capture_background_dl_kbps),
+				formatRate(status.rating_capture_background_ul_kbps),
+				status.rating_capture_contaminated ? _('yes') : _('no'),
+				status.rating_capture_contamination_reason || '-'),
 			_('Backend: %s · trusted: %s · reused connection: %s').format(
 				status.transport_probe_backend || '-',
 				status.transport_probe_trusted ? _('yes') : _('no'),

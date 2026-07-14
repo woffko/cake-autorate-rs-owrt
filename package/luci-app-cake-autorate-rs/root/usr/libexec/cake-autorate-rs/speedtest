@@ -7,6 +7,12 @@ backend_override="$4"
 job_key_override="$5"
 route_mode_override="$6"
 mwan3_member_override="$7"
+direction_override="${8:-}"
+
+case "$direction_override" in
+	''|both|download|upload) ;;
+	*) direction_override="" ;;
+esac
 
 if [ "$section" = "--status" ] || [ "$section" = "status" ]; then
 	section=""
@@ -681,7 +687,7 @@ backend_install_json() {
 }
 
 reset_result() {
-	download_kbps=""
+	download_kbps="null"
 	upload_kbps="null"
 	download_size="0"
 	upload_size="0"
@@ -693,6 +699,14 @@ reset_result() {
 	test_server_name=""
 	test_server_sponsor=""
 	bind_mode="none"
+}
+
+direction_result_available() {
+	case "$direction_override" in
+		download) is_positive_uint "$download_kbps" ;;
+		upload) is_positive_uint "$upload_kbps" ;;
+		*) is_positive_uint "$download_kbps" ;;
+	esac
 }
 
 fetch_download() {
@@ -754,16 +768,18 @@ run_builtin_http() {
 	[ -n "$fetch" ] || return 1
 	source="$fetch_kind"
 
-	download_start="$(now_s)"
-	if ! fetch_download >/dev/null 2>&1; then
-		return 1
+	if [ "$direction_override" != upload ]; then
+		download_start="$(now_s)"
+		if ! fetch_download >/dev/null 2>&1; then
+			return 1
+		fi
+		download_stop="$(now_s)"
+		download_elapsed="$(elapsed_s "$download_start" "$download_stop")"
+		download_size="$(wc -c < "$tmp_download" | tr -d ' ')"
+		download_kbps="$(kbps_for "$download_size" "$download_elapsed")"
 	fi
-	download_stop="$(now_s)"
-	download_elapsed="$(elapsed_s "$download_start" "$download_stop")"
-	download_size="$(wc -c < "$tmp_download" | tr -d ' ')"
-	download_kbps="$(kbps_for "$download_size" "$download_elapsed")"
 
-	if is_uint "$upload_bytes" && [ "$upload_bytes" -gt 0 ] && [ -n "$upload_url" ]; then
+	if [ "$direction_override" != download ] && is_uint "$upload_bytes" && [ "$upload_bytes" -gt 0 ] && [ -n "$upload_url" ]; then
 		upload_done="0"
 		upload_last_try=""
 
@@ -801,11 +817,11 @@ run_builtin_http() {
 		fi
 	fi
 
-	[ -n "$download_kbps" ]
+	direction_result_available
 }
 
 run_librespeed_cli() {
-	local start stop dl_mbps ul_mbps upload_arg upload_kib ipv4_arg interface_arg value
+	local start stop dl_mbps ul_mbps download_arg upload_arg upload_kib ipv4_arg interface_arg value
 
 	backend_available "librespeed-cli" || return 1
 	reset_result
@@ -824,7 +840,11 @@ run_librespeed_cli() {
 	fi
 
 	upload_arg=""
-	if is_uint "$upload_bytes" && [ "$upload_bytes" -eq 0 ]; then
+	download_arg=""
+	if [ "$direction_override" = upload ]; then
+		download_arg="--no-download"
+	fi
+	if [ "$direction_override" = download ] || { is_uint "$upload_bytes" && [ "$upload_bytes" -eq 0 ]; }; then
 		upload_arg="--no-upload"
 	elif is_positive_uint "$upload_bytes"; then
 		upload_kib="$(( (upload_bytes + 1023) / 1024 ))"
@@ -833,7 +853,7 @@ run_librespeed_cli() {
 
 	rm -f "$tmp_response"
 	start="$(now_s)"
-	if ! route_exec "$librespeed_bin" --json --timeout "$timeout_s" --duration "$duration_s" $ipv4_arg $interface_arg $upload_arg > "$tmp_response" 2>/dev/null; then
+	if ! route_exec "$librespeed_bin" --json --timeout "$timeout_s" --duration "$duration_s" $ipv4_arg $interface_arg $download_arg $upload_arg > "$tmp_response" 2>/dev/null; then
 		return 1
 	fi
 	stop="$(now_s)"
@@ -843,7 +863,8 @@ run_librespeed_cli() {
 	dl_mbps="$(json_first_file "$tmp_response" '@[0].download' '@.download' '@.result.download' '@.servers[0].download')"
 	ul_mbps="$(json_first_file "$tmp_response" '@[0].upload' '@.upload' '@.result.upload' '@.servers[0].upload')"
 
-	download_kbps="$(mbps_to_kbps "$dl_mbps")"
+	value="$(mbps_to_kbps "$dl_mbps")"
+	[ -n "$value" ] && download_kbps="$value"
 	if [ -n "$ul_mbps" ]; then
 		value="$(mbps_to_kbps "$ul_mbps")"
 		[ -n "$value" ] && upload_kbps="$value"
@@ -854,7 +875,7 @@ run_librespeed_cli() {
 	[ -n "$download_size" ] || download_size="0"
 	[ -n "$upload_size" ] || upload_size="0"
 
-	[ -n "$download_kbps" ]
+	direction_result_available
 }
 
 speedtest_go_cache_file() {
@@ -888,9 +909,9 @@ speedtest_go_clear_cached_server() {
 }
 
 speedtest_go_result_is_plausible() {
-	is_positive_uint "$download_kbps" || return 1
+	direction_result_available || return 1
 
-	if is_positive_uint "$upload_kbps" &&
+	if [ "$direction_override" != download ] && [ "$direction_override" != upload ] && is_positive_uint "$upload_kbps" &&
 		upload_exceeds_download_sanity_ratio "$download_kbps" "$upload_kbps"; then
 		return 1
 	fi
@@ -953,7 +974,10 @@ run_speedtest_go_once() {
 		set -- "$@" --server "$server_id"
 	fi
 
-	if is_uint "$upload_bytes" && [ "$upload_bytes" -eq 0 ]; then
+	if [ "$direction_override" = upload ]; then
+		set -- "$@" --no-download
+	fi
+	if [ "$direction_override" = download ] || { is_uint "$upload_bytes" && [ "$upload_bytes" -eq 0 ]; }; then
 		set -- "$@" --no-upload
 	fi
 
@@ -985,7 +1009,8 @@ run_speedtest_go_once() {
 	test_server_name="$(json_first_file "$tmp_response" '@.servers[0].name' '@.server.name')"
 	test_server_sponsor="$(json_first_file "$tmp_response" '@.servers[0].sponsor' '@.server.sponsor')"
 
-	download_kbps="$(bytes_per_second_to_kbps "$dl_bytes_per_s")"
+	value="$(bytes_per_second_to_kbps "$dl_bytes_per_s")"
+	[ -n "$value" ] && download_kbps="$value"
 	if [ -n "$ul_bytes_per_s" ]; then
 		value="$(bytes_per_second_to_kbps "$ul_bytes_per_s")"
 		[ -n "$value" ] && upload_kbps="$value"
@@ -994,7 +1019,7 @@ run_speedtest_go_once() {
 	download_size="0"
 	upload_size="0"
 
-	[ -n "$download_kbps" ]
+	direction_result_available
 }
 
 run_speedtest_go() {
@@ -1110,19 +1135,22 @@ run_iperf3() {
 	source="iperf3"
 
 	rm -f "$tmp_download" "$tmp_upload"
-	start="$(now_s)"
-	if ! run_iperf3_one 1 "$tmp_download"; then
-		return 1
+	if [ "$direction_override" != upload ]; then
+		start="$(now_s)"
+		if ! run_iperf3_one 1 "$tmp_download"; then
+			return 1
+		fi
+		stop="$(now_s)"
+
+		download_elapsed="$(elapsed_s "$start" "$stop")"
+		dl_bits="$(json_first_file "$tmp_download" '@.end.sum_received.bits_per_second' '@.end.sum.bits_per_second')"
+		download_size="$(json_first_file "$tmp_download" '@.end.sum_received.bytes' '@.end.sum.bytes')"
+		value="$(bits_to_kbps "$dl_bits")"
+		[ -n "$value" ] && download_kbps="$value"
+		[ -n "$download_size" ] || download_size="0"
 	fi
-	stop="$(now_s)"
 
-	download_elapsed="$(elapsed_s "$start" "$stop")"
-	dl_bits="$(json_first_file "$tmp_download" '@.end.sum_received.bits_per_second' '@.end.sum.bits_per_second')"
-	download_size="$(json_first_file "$tmp_download" '@.end.sum_received.bytes' '@.end.sum.bytes')"
-	download_kbps="$(bits_to_kbps "$dl_bits")"
-	[ -n "$download_size" ] || download_size="0"
-
-	if is_uint "$upload_bytes" && [ "$upload_bytes" -gt 0 ]; then
+	if [ "$direction_override" != download ] && is_uint "$upload_bytes" && [ "$upload_bytes" -gt 0 ]; then
 		start="$(now_s)"
 		if run_iperf3_one 0 "$tmp_upload"; then
 			stop="$(now_s)"
@@ -1137,17 +1165,18 @@ run_iperf3() {
 		fi
 	fi
 
-	[ -n "$download_kbps" ]
+	direction_result_available
 }
 
 emit_result() {
-	printf '{"download_kbps":%s,"upload_kbps":%s,"download_bytes":%s,"upload_bytes":%s,"download_elapsed_s":%s,"upload_elapsed_s":%s,"source":"%s","backend":"%s","backend_title":"%s","server_id":"%s","server_name":"%s","server_sponsor":"%s","bind_mode":"%s","target_interface":"%s","route_interface":"%s","route_mode":"%s","mwan3_member":"%s","route_source_ip":"%s","route_fwmark":"%s","route_table":"%s","external_ip_before":"%s","external_ip_after":"%s","shaper_bypassed":%s,"autorate_paused":%s,"sqm_paused":%s,"warning":"%s"}\n' \
+	printf '{"download_kbps":%s,"upload_kbps":%s,"download_bytes":%s,"upload_bytes":%s,"download_elapsed_s":%s,"upload_elapsed_s":%s,"test_direction":"%s","source":"%s","backend":"%s","backend_title":"%s","server_id":"%s","server_name":"%s","server_sponsor":"%s","bind_mode":"%s","target_interface":"%s","route_interface":"%s","route_mode":"%s","mwan3_member":"%s","route_source_ip":"%s","route_fwmark":"%s","route_table":"%s","external_ip_before":"%s","external_ip_after":"%s","shaper_bypassed":%s,"autorate_paused":%s,"sqm_paused":%s,"warning":"%s"}\n' \
 		"$download_kbps" \
 		"$upload_kbps" \
 		"$download_size" \
 		"$upload_size" \
 		"$download_elapsed" \
 		"$upload_elapsed" \
+		"$(json_escape "${direction_override:-both}")" \
 		"$(json_escape "$source")" \
 		"$(json_escape "$backend")" \
 		"$(json_escape "$(backend_title "$backend")")" \

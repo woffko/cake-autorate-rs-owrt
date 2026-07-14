@@ -178,6 +178,10 @@ impl QualityGradeTracker {
         self.active = None;
     }
 
+    pub fn begin_capture(&mut self, timestamp: f64) {
+        self.finish_active(timestamp);
+    }
+
     pub fn observe(
         &mut self,
         endpoint: &str,
@@ -431,6 +435,35 @@ mod tests {
             collecting.previous.as_ref().unwrap().class,
             QualityClass::APlus
         );
+    }
+
+    #[test]
+    fn new_capture_finishes_the_old_episode_and_resets_direction_counts() {
+        let mut tracker = QualityGradeTracker::new(30.0);
+        seed_baseline(&mut tracker, "endpoint", "route-a");
+        for index in 0..8 {
+            tracker.observe(
+                "endpoint",
+                18.0,
+                true,
+                false,
+                30.0 + index as f64,
+                "route-a",
+            );
+        }
+        assert_eq!(tracker.snapshot(40.0).dl_samples, 8);
+
+        tracker.begin_capture(41.0);
+        let snapshot = tracker.snapshot(41.0);
+        assert_eq!(snapshot.dl_samples, 0);
+        assert_eq!(snapshot.ul_samples, 0);
+        assert_eq!(snapshot.state, "final");
+        assert!(snapshot.current.as_ref().unwrap().incomplete);
+
+        tracker.observe("endpoint", 20.0, false, true, 42.0, "route-a");
+        let next = tracker.snapshot(42.0);
+        assert_eq!(next.dl_samples, 0);
+        assert_eq!(next.ul_samples, 1);
     }
 
     #[test]

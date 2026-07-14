@@ -77,27 +77,30 @@ A native result is accepted only when all of these remain true:
 Rejected evidence is reported but never treated as bufferbloat. A route or
 source/external-address change clears only that uplink's learned windows.
 
-## RC9 passive rating load detector
+## RC10 rating load detector
 
 The controller's `high_load_thr` answers a different question: whether the fast
-rate controller should grow or reduce CAKE now. RC9 therefore does not reuse it
-to label rating samples. For direction `d`, achieved rate `R_d`, current CAKE
-rate `C_d`, and the samples in the last `W` seconds:
+rate controller should grow or reduce CAKE now. The rating detector therefore
+does not reuse it to label rating samples. For direction `d`, achieved rate
+`R_d`, current CAKE rate `C_d`, and the samples in the last `W` seconds:
 
 ```text
 ratio_d(i) = clamp(R_d(i) / C_d(i), 0, 10)
 smooth_d   = mean(ratio_d(i), i inside W)
 rate_d     = mean(R_d(i), i inside W)
+peak_d     = max(ratio_d(i), i inside W)
+peak_rate_d = max(R_d(i), i inside W)
 ```
 
 Packaged defaults are `W=2 s`, enter ratio `0.60`, exit ratio `0.40`, minimum
 rate `2000 kbit/s`, one-second candidate hold, and 1.5-second dropout grace. A
-direction enters a loaded phase only when both its smoothed ratio and absolute
-rate pass the enter thresholds. When both pass, a 1.5:1 dominance ratio selects
-DL or UL; otherwise the sample is `BIDIRECTIONAL`. Leaving a loaded phase uses
-the lower exit threshold and half the minimum rate, then requires the dropout
-grace. This hysteresis prevents short counter bursts, direction flips, and
-small gaps inside one speed-test phase from fragmenting an episode.
+direction enters a loaded phase when both its per-direction window peak and peak
+rate pass the enter thresholds. This catches burst-shaped browser downloads
+whose two-second average never reaches 60%. When both pass, a 1.5:1 peak-ratio
+dominance test selects DL or UL; otherwise the sample is `BIDIRECTIONAL`.
+Leaving a loaded phase still uses the smoothed lower exit threshold and half the
+minimum rate, then requires the dropout grace. This asymmetry preserves bursty
+entry without letting one counter spike immediately end or fragment an episode.
 
 The detector consumes the same per-interface RX/TX deltas already calculated
 by the daemon exactly once; no WAN aggregate is added to an IFB/device counter.
@@ -142,31 +145,41 @@ paths.
 
 The compatibility reference is the live
 [LibreQoS Internet Quality Test](https://test.libreqos.com/advanced/) and its
-published browser implementation. RC9 measures natural routed traffic instead
-of generating the browser test's saturation load, so its Status rating is a
-compatible detector, not a claim that an official browser test was run.
+published browser implementation. Passive mode measures natural routed traffic
+instead of generating the browser test's saturation load, so its Status rating
+is a compatible detector, not a claim that an official browser test was run.
 
 ## `Get rating` helper
 
 Status offers `Get rating` after the instance, managed SQM, trusted transport
 backend, active route, and 20-sample idle baseline are ready. `Automatic`
-invokes the existing route-bound speed-test backend in shaped mode and stops as
-soon as both directions have enough evidence, with a maximum of three passes.
+invokes the existing route-bound speed-test backend in shaped mode as separate
+download-only and upload-only phases, and stops each direction as soon as it has
+enough evidence, with a maximum of three passes.
 `Guided client capture` waits while the user runs sequential download and
-upload load through the router. Both modes arm a RAM-only bounded marker which
-lets the same detector learn a conservative threshold from that test's peak:
+upload load through the router. Before either mode starts, the helper requires a
+quiet window, records the per-direction background, and starts a fresh rating
+episode without discarding the previous result. Both modes arm a RAM-only
+bounded marker which subtracts that background and lets the same detector learn
+separate conservative thresholds from the DL and UL peaks:
 
 ```text
-capture_enter = min(configured_enter, max(0.15, 0.55 * learned_peak))
-capture_exit  = min(configured_exit,  max(0.10, 0.67 * capture_enter))
+capture_enter_d = min(configured_enter, max(0.15, 0.35 * learned_peak_d))
+capture_exit_d  = min(configured_exit,  max(0.1005, 0.67 * capture_enter_d))
 ```
 
 This helps variable links reach a stable phase without weakening normal
-passive thresholds. The helper never disables SQM or autorate, never applies a
-speed-test result to CAKE, uses the existing per-interface heavy-job lock, and
-removes its marker on completion, cancellation, error, or timeout. LuCI reports
-baseline, DL/UL counts, phase, smoothed load, finalization time, and the last
-rejection reason while it runs.
+passive thresholds. Automatic mode explicitly closes the marker between
+directions and rejects unexpected opposite-direction traffic above 10% of its
+current CAKE rate. Expected reverse TCP acknowledgements up to 8% of the
+requested-direction rate are exempt, and contamination is considered only
+after the requested direction is loaded. The helper never disables SQM or
+autorate, never applies a speed-test result to CAKE, uses the existing
+per-interface heavy-job lock, and removes its marker on completion,
+cancellation, error, or timeout. LuCI reports baseline, DL/UL counts,
+requested/observed phase, aggregate and background-subtracted traffic, current
+CAKE references, independent thresholds, finalization time, and any
+contamination/rejection reason while it runs.
 
 ## Optional strict controller
 

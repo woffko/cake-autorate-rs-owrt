@@ -8,5 +8,9 @@ case "$key" in
 	*.sqm_interface|*.ul_if) printf 'lo\n' ;;
 	*.route_mode) printf 'main\n' ;;
 	*.mwan3_member) printf '\n' ;;
+	*.rating_capture_quiet_s) printf '2\n' ;;
+	*.rating_capture_quiet_timeout_s) printf '5\n' ;;
+	*.rating_capture_quiet_ratio) printf '0.05\n' ;;
+	*.rating_capture_quiet_min_kbps) printf '1000\n' ;;
 	*) exit 1 ;;
 esac
