@@ -61,11 +61,15 @@ var optionDescriptions = {
 	adaptive_ceiling_probe_duration_s: 'Time a candidate ceiling must carry clean high load before it is accepted as the new learned-safe ceiling.',
 	adaptive_ceiling_cooldown_s: 'Recovery pause after a successful or failed probe before qualification may start again.',
 	adaptive_ceiling_failed_bound_ttl_s: 'How long a failed upper ceiling remains remembered. It prevents repeatedly testing a known-bad value, but expires so the link can be relearned after conditions change.',
-	transport_latency_enabled: 'Add small asynchronous HTTP/TCP probes to ICMP. This detects loaded latency even when a provider prioritizes ICMP; no samples are written to flash.',
-	transport_probe_url: 'Small HTTP(S) endpoints used in rotation. Each endpoint learns its own idle baseline.',
+	transport_latency_enabled: 'Measure real network RTT with a persistent native transport connection. DNS, process startup, and the TLS/WebSocket handshake are excluded. Rating is passive unless the controller is enabled separately.',
+	transport_controller_enabled: 'Allow confirmed transport RTT windows to reduce CAKE rates. Disabled by default for safe upgrades. A bad direction must be confirmed twice and can never cross the configured throughput floor.',
+	transport_probe_backend: 'WebSocket is the recommended LibreQoS-compatible persistent RTT method. TCP connect and persistent HTTP are comparison fallbacks. Legacy HTTP includes process and handshake overhead, is diagnostic-only, and cannot drive the controller.',
+	transport_probe_endpoint: 'Endpoint for the selected native backend. Probes are bound to this instance route, source address, device, and mwan3 mark.',
 	transport_probe_idle_interval_s: 'Seconds between baseline probes while traffic is below the high-load threshold.',
 	transport_probe_loaded_interval_s: 'Seconds between probes while download or upload is highly loaded.',
 	transport_probe_timeout_s: 'Maximum seconds allowed for one asynchronous transport probe.',
+	transport_load_hold_s: 'High load must remain in the same download/upload phase for this long before a loaded RTT probe starts.',
+	transport_cpu_max_percent: 'Discard a transport sample when total router CPU is above this percentage so local saturation is not mistaken for WAN latency.',
 	quality_target_delay_ms: 'Target loaded transport-delay increase. The default 30 ms corresponds to an estimated A-like target.',
 	quality_search_max_steps: 'Maximum bounded rate reductions in one search before cooldown and rollback to the best useful candidate.',
 	quality_search_observe_s: 'Observation time after each candidate rate change.',
@@ -789,12 +793,8 @@ function validateIrttServerValue(value) {
 }
 
 function validateTransportProbeUrl(value) {
-	/* DynamicList validates its empty add-item control as well as saved items. */
-	if (value == null || value === '')
-		return true;
-
-	if (!/^https?:\/\/\S+$/.test(String(value)))
-		return _('Enter an HTTP or HTTPS URL without spaces.');
+	if (!/^(wss?|https?|tcp):\/\/\S+$/.test(String(value || '')))
+		return _('Enter a ws://, wss://, http://, https://, or tcp:// endpoint without spaces.');
 
 	return true;
 }
@@ -2870,16 +2870,18 @@ function addQualityOptions(section) {
 
 	o = flag(section, 'quality', 'transport_latency_enabled', _('Transport-aware latency'), '0');
 
-	o = section.taboption('quality', form.DynamicList, 'transport_probe_url', _('HTTP/TCP endpoints'));
-	modal(o);
-	describe(o, 'transport_probe_url');
+	o = listValue(section, 'quality', 'transport_probe_backend', _('Probe backend'), [
+		['websocket', _('Persistent WebSocket (recommended)')],
+		['tcp', _('TCP connect RTT')],
+		['http', _('Persistent HTTP')],
+		['legacy-http', _('Legacy HTTP (diagnostic only)')]
+	], 'websocket');
+	o.depends('transport_latency_enabled', '1');
+
+	o = value(section, 'quality', 'transport_probe_endpoint', _('Probe endpoint'), null,
+		'wss://ping-bufferbloat.libreqos.com/ws');
 	o.depends('transport_latency_enabled', '1');
 	o.rmempty = false;
-	o.default = [
-		'https://speed.cloudflare.com/__down?bytes=0',
-		'https://www.google.com/generate_204',
-		'https://connectivitycheck.gstatic.com/generate_204'
-	];
 	o.validate = function(section_id, value) {
 		return validateTransportProbeUrl(value);
 	};
@@ -2890,31 +2892,38 @@ function addQualityOptions(section) {
 	o.depends('transport_latency_enabled', '1');
 	o = value(section, 'quality', 'transport_probe_timeout_s', _('Probe timeout'), 'and(uinteger,min(1),max(30))', '5');
 	o.depends('transport_latency_enabled', '1');
-	o = value(section, 'quality', 'quality_target_delay_ms', _('Target loaded delay'), 'and(ufloat,min(5),max(200))', '30.0');
+	o = value(section, 'quality', 'transport_load_hold_s', _('Stable load hold'), 'and(ufloat,min(1),max(30))', '3.0');
 	o.depends('transport_latency_enabled', '1');
-	o = value(section, 'quality', 'quality_search_max_steps', _('Maximum search steps'), 'and(uinteger,min(1),max(10))', '3');
-	o.depends('transport_latency_enabled', '1');
-	o = value(section, 'quality', 'quality_search_observe_s', _('Candidate observation'), 'and(ufloat,min(2),max(120))', '6.0');
-	o.depends('transport_latency_enabled', '1');
-	o = value(section, 'quality', 'quality_search_cooldown_s', _('Limited cooldown'), 'and(ufloat,min(30),max(86400))', '900.0');
+	o = value(section, 'quality', 'transport_cpu_max_percent', _('CPU rejection threshold'), 'and(ufloat,min(50),max(100))', '85.0');
 	o.depends('transport_latency_enabled', '1');
 
-	o = flag(section, 'quality', 'throughput_guard_enabled', _('Protect throughput floor'), '1');
+	o = flag(section, 'quality', 'transport_controller_enabled', _('Allow transport control'), '0');
 	o.depends('transport_latency_enabled', '1');
+	o = value(section, 'quality', 'quality_target_delay_ms', _('Target loaded delay'), 'and(ufloat,min(5),max(200))', '30.0');
+	o.depends({ transport_latency_enabled: '1', transport_controller_enabled: '1' });
+	o = value(section, 'quality', 'quality_search_max_steps', _('Maximum search steps'), 'and(uinteger,min(1),max(10))', '3');
+	o.depends({ transport_latency_enabled: '1', transport_controller_enabled: '1' });
+	o = value(section, 'quality', 'quality_search_observe_s', _('Candidate observation'), 'and(ufloat,min(2),max(120))', '6.0');
+	o.depends({ transport_latency_enabled: '1', transport_controller_enabled: '1' });
+	o = value(section, 'quality', 'quality_search_cooldown_s', _('Limited cooldown'), 'and(ufloat,min(30),max(86400))', '900.0');
+	o.depends({ transport_latency_enabled: '1', transport_controller_enabled: '1' });
+
+	o = flag(section, 'quality', 'throughput_guard_enabled', _('Protect throughput floor'), '1');
+	o.depends({ transport_latency_enabled: '1', transport_controller_enabled: '1' });
 	o = value(section, 'quality', 'throughput_guard_retention_percent', _('Capacity retained'), 'and(ufloat,min(50),max(100))', '80.0');
-	o.depends({ transport_latency_enabled: '1', throughput_guard_enabled: '1' });
+	o.depends({ transport_latency_enabled: '1', transport_controller_enabled: '1', throughput_guard_enabled: '1' });
 	o = value(section, 'quality', 'throughput_guard_dl_floor_kbps', _('Absolute DL floor'), 'uinteger', '0');
-	o.depends({ transport_latency_enabled: '1', throughput_guard_enabled: '1' });
+	o.depends({ transport_latency_enabled: '1', transport_controller_enabled: '1', throughput_guard_enabled: '1' });
 	o = value(section, 'quality', 'throughput_guard_ul_floor_kbps', _('Absolute UL floor'), 'uinteger', '0');
-	o.depends({ transport_latency_enabled: '1', throughput_guard_enabled: '1' });
+	o.depends({ transport_latency_enabled: '1', transport_controller_enabled: '1', throughput_guard_enabled: '1' });
 	o = value(section, 'quality', 'throughput_reference_dl_p20_kbps', _('DL capacity P20'), 'uinteger', '0');
-	o.depends({ transport_latency_enabled: '1', throughput_guard_enabled: '1' });
+	o.depends({ transport_latency_enabled: '1', transport_controller_enabled: '1', throughput_guard_enabled: '1' });
 	o = value(section, 'quality', 'throughput_reference_dl_p50_kbps', _('DL capacity P50'), 'uinteger', '0');
-	o.depends({ transport_latency_enabled: '1', throughput_guard_enabled: '1' });
+	o.depends({ transport_latency_enabled: '1', transport_controller_enabled: '1', throughput_guard_enabled: '1' });
 	o = value(section, 'quality', 'throughput_reference_ul_p20_kbps', _('UL capacity P20'), 'uinteger', '0');
-	o.depends({ transport_latency_enabled: '1', throughput_guard_enabled: '1' });
+	o.depends({ transport_latency_enabled: '1', transport_controller_enabled: '1', throughput_guard_enabled: '1' });
 	o = value(section, 'quality', 'throughput_reference_ul_p50_kbps', _('UL capacity P50'), 'uinteger', '0');
-	o.depends({ transport_latency_enabled: '1', throughput_guard_enabled: '1' });
+	o.depends({ transport_latency_enabled: '1', transport_controller_enabled: '1', throughput_guard_enabled: '1' });
 
 	o = flag(section, 'quality', 'scheduled_autotune_enabled', _('Scheduled Full Auto-Tune'), '0');
 	o = value(section, 'quality', 'scheduled_autotune_interval_hours', _('Retune interval'), 'and(uinteger,min(1),max(8760))', '24');

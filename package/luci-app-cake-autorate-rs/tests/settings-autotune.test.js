@@ -122,12 +122,12 @@ assert.equal(written.sqm_tcMPU, '0');
 assert.equal(written.speedtest_go_server_id, '17372');
 assert.equal(written.route_mode, 'main');
 
-assert.equal(helpers.validateTransportProbeUrl(''), true);
-assert.equal(helpers.validateTransportProbeUrl(null), true);
+assert.equal(helpers.validateTransportProbeUrl('wss://ping-bufferbloat.libreqos.com/ws'), true);
+assert.equal(helpers.validateTransportProbeUrl('tcp://example.test:443'), true);
 assert.equal(helpers.validateTransportProbeUrl('https://www.google.com/generate_204'), true);
 assert.equal(helpers.validateTransportProbeUrl('http://example.test/probe?bytes=0'), true);
-assert.equal(helpers.validateTransportProbeUrl('ftp://example.test/probe'), 'Enter an HTTP or HTTPS URL without spaces.');
-assert.equal(helpers.validateTransportProbeUrl('https://example.test/has space'), 'Enter an HTTP or HTTPS URL without spaces.');
+assert.equal(helpers.validateTransportProbeUrl('ftp://example.test/probe'), 'Enter a ws://, wss://, http://, https://, or tcp:// endpoint without spaces.');
+assert.equal(helpers.validateTransportProbeUrl('https://example.test/has space'), 'Enter a ws://, wss://, http://, https://, or tcp:// endpoint without spaces.');
 
 helpers.setInterfaceContext({
 	deviceNames: { 'pppoe-wan': true, eth0: true },

@@ -40,24 +40,25 @@ does not claim authorship of the original cake-autorate concept.
   route identity checks, SQM ownership, and operational diagnostics.
 
 The current targets are OpenWrt 25.12.5 on `x86/64` and
-`rockchip/armv8` (`aarch64_generic`, including the Banana Pi R2 Pro). The daemon
-is intentionally kept small and currently uses only the Rust standard library
-plus OpenWrt userland tools.
+`rockchip/armv8` (`aarch64_generic`, including the Banana Pi R2 Pro). Native
+route-bound WebSocket/TCP/HTTP probing uses statically linked Rust TLS and
+socket libraries; ordinary OpenWrt runtime dependencies remain explicit below.
 
 ## Current package tree
 
 The current tree builds these OpenWrt 25.12.5 APKs:
 
-- `cake-autorate-rs-1.0_rc7-r1-x86_64.apk` — x86_64 autorate daemon.
-- `cake-autorate-rs-1.0_rc7-r1-aarch64_generic.apk` — rockchip/armv8
+- `cake-autorate-rs-1.0_rc8-r1-x86_64.apk` — x86_64 autorate daemon.
+- `cake-autorate-rs-1.0_rc8-r1-aarch64_generic.apk` — rockchip/armv8
   autorate daemon.
-- `luci-app-cake-autorate-rs-1.0_rc7-r1.apk` — architecture-independent LuCI
+- `luci-app-cake-autorate-rs-1.0_rc8-r1.apk` — architecture-independent LuCI
   interface and SQM integration.
 
 The daemon package installs `uci`, `fping`, and `uclient-fetch` as dependencies.
 The LuCI package installs the daemon, `luci-base`, and `sqm-scripts`; the latter
-brings the CAKE, IFB, `tc`, and `ip` runtime pieces. HTTPS probes additionally
-use the router's selected `libustream` TLS provider and CA bundle; the offline
+brings the CAKE, IFB, `tc`, and `ip` runtime pieces. Native RC8 transport probes
+use the daemon's statically linked rustls/webpki stack. Full Auto-Tune and the
+diagnostic legacy HTTP backend still use OpenWrt `uclient-fetch`, so the offline
 installer includes the standard mbedTLS provider when none is already present.
 The wizard now labels a device with its logical OpenWrt networks, for example
 `eth1 — wan, wan6`, while continuing to save and use the physical device name.
@@ -78,14 +79,23 @@ ownership. A speed test or Full Auto-Tune pauses only the selected daemon and
 queue, verifies route identity/external IP before accepting evidence, and pins
 all speedtest-go calibration phases to the first selected server.
 
-RC7 adds a user-facing detected connection rating that follows the current
-LibreQoS browser-test method: per-endpoint idle p5, per-direction loaded p90,
-sub-2 ms noise clamping, and the worse of download/upload A+/A/B/C/D/F grades.
-Status displays `CURRENT` while a test is collecting and retains `PREVIOUS`
-until the new result completes, so the last useful grade never disappears.
-Bidirectional latency remains visible as a diagnostic but does not lower the
-overall grade. A route or external-address change marks the previous result
-stale and starts isolated baseline learning for that uplink.
+RC8 replaces process-timed HTTP latency with a native route-bound network RTT
+engine. Persistent WebSocket is the default and LibreQoS-compatible method;
+TCP-connect and persistent HTTP are comparison fallbacks. DNS, process startup,
+TCP/TLS, and protocol handshakes are outside the scored clock. Four raw RTT
+observations are filtered per batch, every rating needs at least 20 idle and 20
+loaded samples, and download/upload have independent windows. Status displays
+`CURRENT` plus the retained `PREVIOUS` result; a one-direction result is labeled
+`PARTIAL`, never presented as a final connection grade.
+
+Transport measurement/rating and transport-driven CAKE control are now separate
+options. Measurement can remain enabled for Status and Graphs while
+`transport_controller_enabled=0` guarantees it cannot change a shaper. The
+controller is disabled by default, requires a trusted native backend, rejects
+route/load-phase/CPU-contaminated evidence, and needs two confirmed bad windows
+before a bounded directional response. See
+[TRANSPORT_QUALITY.md](TRANSPORT_QUALITY.md) for the exact contract and the RC7
+measurement failure that RC8 removes.
 
 Optional RAM-only graphs now use one configurable global budget shared across
 enabled instances. LuCI derives a safe upper bound from `MemAvailable`, offers
@@ -161,11 +171,13 @@ Implemented:
   Status exposes the phase, safe ceiling, failed bound, probe target, and last
   transition reason. See [ADAPTIVE_CEILING.md](ADAPTIVE_CEILING.md) for the
   state machine and acceptance tests.
-- Optional transport-aware HTTP/TCP latency, also disabled by default. It
-  complements ICMP, blocks unsafe upward growth when ordinary transport is
-  delayed, drives a bounded natural-traffic search above a protected throughput
-  floor, and exposes a strict controller signal plus a separately sampled
-  LibreQoS-like detected A+/A/B/C/D/F rating and `quality_limited` reason. See
+- Optional native transport RTT measurement, disabled by default. Persistent
+  WebSocket, TCP-connect, and persistent HTTP resolve DNS outside the timer and
+  bind sockets to the selected device/source/fwmark. Measurement supplies the
+  observational LibreQoS-compatible detected rating. A separate, default-off
+  controller toggle may use only trusted, route-verified, CPU-clean evidence to
+  block unsafe ceiling growth or run a bounded natural-traffic search above a
+  protected per-direction floor. See
   [TRANSPORT_QUALITY.md](TRANSPORT_QUALITY.md).
 - `tc qdisc change ... cake bandwidth ...` shaper updates.
 - Upstream-style idle/stall handling: sustained idle can stop pingers, activity
@@ -376,10 +388,12 @@ LuCI package dependencies:
 - `luci-base`
 - `sqm-scripts`
 
-HTTPS transport probes also require one `libustream` TLS provider and trusted
-CA certificates. Normal LuCI images already provide these. The offline bundle
-contains `ca-bundle` and the default `libustream-mbedtls20201210`, but its
-installer preserves an already installed OpenSSL or wolfSSL provider.
+Native WebSocket and persistent-HTTP probes use statically linked rustls and
+webpki roots and add no dynamic APK dependency. Full Auto-Tune and
+`legacy-http` use `uclient-fetch`; normal LuCI images already provide a
+`libustream` TLS provider and CA certificates. The offline bundle contains
+`ca-bundle` and the default `libustream-mbedtls20201210`, while preserving an
+already installed OpenSSL or wolfSSL provider.
 
 `sqm-scripts` pulls the required `tc`, CAKE, IFB, iptables, and related shaping
 packages on OpenWrt.
@@ -471,16 +485,16 @@ them together. For x86_64:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc7-r1-x86_64.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc7-r1.apk
+  /root/cake-autorate-rs-1.0_rc8-r1-x86_64.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc8-r1.apk
 ```
 
 For rockchip/armv8 (`aarch64_generic`):
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc7-r1-aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc7-r1.apk
+  /root/cake-autorate-rs-1.0_rc8-r1-aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc8-r1.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:
@@ -500,22 +514,22 @@ x86_64:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc7-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc7-x86_64.sh
+tar -xzf cake-autorate-rs-1.0-rc8-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc8-x86_64.sh
 ```
 
 Banana Pi R2 Pro and other OpenWrt 25.12.5 rockchip/armv8 devices:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc7-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc7-aarch64_generic.sh
+tar -xzf cake-autorate-rs-1.0-rc8-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc8-aarch64_generic.sh
 ```
 
 The installer resolves its own location, so it also works when the extracted
 bundle is kept in another directory.
 
-Each archive is about 2.7 MiB and needs roughly 6 MiB of free space while
+Each archive is about 3.3 MiB and needs roughly 8 MiB of free space while
 both the archive and its extracted contents are present. If `/root/` is too
 small, use another writable filesystem (for example `/tmp/` when its tmpfs has
 enough RAM) for both commands instead.

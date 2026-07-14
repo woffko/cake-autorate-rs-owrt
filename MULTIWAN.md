@@ -52,12 +52,17 @@ config cake_autorate 'wan_sqm'
   `mwan3_member`; or
 - `auto`: use structured mwan3 when a member is set, otherwise use `main`.
 
-Member and device names are validated as data, never evaluated by a shell. The
-executed form is a direct argv vector:
+Member and device names are validated as data, never evaluated by a shell.
+External helpers use a direct argv vector:
 
 ```text
 mwan3 use <member> exec <program> <arguments...>
 ```
+
+RC8 native transport RTT sockets do not spawn a helper. They apply the resolved
+L3 device (`SO_BINDTODEVICE`), source IPv4 bind, and mwan3 `SO_MARK` directly;
+DNS resolution happens before the RTT clock starts. Persistent connections are
+owned by one route identity and discarded when that identity changes.
 
 The legacy exact prefix `ping_prefix_string='mwan3 use <member> exec'` is
 migrated by the init script to these structured fields. Arbitrary free-form
@@ -72,11 +77,12 @@ route_mode | member | L3 device | source IPv4 | fwmark | routing table
 ```
 
 Runtime Status additionally reports member status, public IPv4, policy share,
-and a stable error code/reason. ICMP, HTTP/TCP, router-side speed tests, and
-Full Auto-Tune all verify the same identity. A result is rejected if the
-member is offline, the device differs, the source address changes during a
-test, the forced command does not use the expected member, or the public
-address changes between calibration phases.
+and a stable error code/reason. ICMP, native WebSocket/TCP/HTTP RTT,
+router-side speed tests, and Full Auto-Tune all verify the same identity. A
+result is rejected if the member is offline, the device differs, the source
+address changes during a test, the route mark/table no longer matches, a
+forced helper does not use the expected member, or the public address changes
+between calibration phases.
 
 External address alone is not considered proof of route identity. Device,
 source address, fwmark, and table remain authoritative when both WANs are
