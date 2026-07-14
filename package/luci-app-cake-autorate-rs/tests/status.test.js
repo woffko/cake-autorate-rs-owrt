@@ -18,8 +18,16 @@ const source = fs.readFileSync(sourcePath, 'utf8');
 const prefix = source.slice(0, source.indexOf('return L.view.extend'));
 const E = (tag, attrs, children) => ({ tag, attrs: attrs || {}, children: children || [] });
 const helpers = new Function('fs', 'poll', 'uci', 'ui', 'cakeUi', 'L', 'E', '_',
-	`${prefix}\nreturn { formatQuality, formatRoute, formatState, qualityReadiness, qualityProgressText };`
+	`${prefix}\nreturn { formatQuality, formatRoute, formatState, qualityReadiness, qualityProgressText, ` +
+		`statusColumnSelection, selectedStatusColumns };`
 )({}, {}, {}, {}, {}, {}, E, value => value);
+
+assert.deepEqual(helpers.statusColumnSelection({}), [ 'instance', 'uplink', 'quality', 'rating' ]);
+assert.deepEqual(helpers.statusColumnSelection({ status_columns: [ 'cpu', 'route' ] }),
+	[ 'instance', 'uplink', 'quality', 'rating', 'route', 'cpu' ]);
+assert.deepEqual(helpers.selectedStatusColumns([ 'cpu' ]).map(column => column.key),
+	[ 'instance', 'uplink', 'quality', 'rating', 'cpu' ],
+	'mandatory columns must remain visible even when omitted by saved preferences');
 
 const quality = helpers.formatQuality({
 	transport_latency_enabled: true,
@@ -186,6 +194,19 @@ assert.match(source, /cake-status-table td\{vertical-align:top!important/);
 assert.match(source, /cake-status-table th\{vertical-align:bottom!important/);
 assert.match(source, /quality-test/);
 assert.match(source, /Get rating/);
+assert.match(source, /List columns/);
+assert.match(source, /Reset default/);
+assert.match(source, /\/usr\/libexec\/cake-autorate-rs\/status-columns/,
+	'column preferences must use the isolated persistence helper');
+assert.doesNotMatch(source, /return uci\.save\(\)/,
+	'Status preferences must not leave an uncommitted LuCI UCI transaction');
+assert.match(source, /column\.mandatory \? '' : null/,
+	'mandatory column checkboxes must be checked and disabled');
+assert.match(source, /cake-status-cards\{display:none\}/);
+assert.match(source, /@media\(max-width:900px\).*cake-status-cards\{display:grid/,
+	'narrow Status pages must switch to instance cards');
+assert.match(source, /width:calc\(100vw - 48px\)/,
+	'Status must use the available desktop viewport width');
 assert.doesNotMatch(source, /'disabled':\s*!/,
 	'Boolean false must not be serialized as an HTML disabled attribute');
 

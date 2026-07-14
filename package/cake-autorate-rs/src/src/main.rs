@@ -6563,6 +6563,50 @@ fn parse_rate_samples(value: &str) -> Result<Vec<f64>, String> {
         .collect()
 }
 
+fn parse_optional_rate(value: &str) -> Result<Option<u64>, String> {
+    let rate = value
+        .parse::<u64>()
+        .map_err(|_| format!("invalid current rate: {value}"))?;
+    Ok((rate > 0).then_some(rate))
+}
+
+fn subtract_background_samples(samples: &mut [f64], background_kbps: f64) {
+    let safety_background = background_kbps.max(0.0) * 1.25;
+    for sample in samples {
+        *sample = (*sample - safety_background).max(100.0);
+    }
+}
+
+fn current_direction(
+    minimum: Option<u64>,
+    base: Option<u64>,
+    maximum: Option<u64>,
+    cap: Option<u64>,
+    observed: &autotune::DirectionProposal,
+) -> Result<autotune::DirectionProposal, String> {
+    let minimum =
+        minimum.ok_or_else(|| "retained direction has no confirmed minimum".to_string())?;
+    let base = base.ok_or_else(|| "retained direction has no confirmed base".to_string())?;
+    let maximum =
+        maximum.ok_or_else(|| "retained direction has no confirmed maximum".to_string())?;
+    let cap = cap.unwrap_or(maximum);
+    if minimum > base || base > maximum || maximum > cap {
+        return Err(
+            "retained direction limits are not ordered min <= base <= max <= cap".to_string(),
+        );
+    }
+    Ok(autotune::DirectionProposal {
+        minimum_kbps: minimum,
+        base_kbps: base,
+        maximum_kbps: maximum,
+        absolute_cap_kbps: cap,
+        observed_low_kbps: observed.observed_low_kbps,
+        observed_median_kbps: observed.observed_median_kbps,
+        observed_high_kbps: observed.observed_high_kbps,
+        variability: observed.variability,
+    })
+}
+
 fn run_autotune_proposal_cli<I>(args: I) -> Result<(), String>
 where
     I: Iterator<Item = String>,
@@ -6576,6 +6620,18 @@ where
     let mut idle_samples = None;
     let mut base_scale = 1.0;
     let mut link_kind = LinkKind::Unknown;
+    let mut conservative_background_dl_kbps = None;
+    let mut conservative_background_ul_kbps = None;
+    let mut retain_dl = false;
+    let mut retain_ul = false;
+    let mut current_dl_min = None;
+    let mut current_dl_base = None;
+    let mut current_dl_max = None;
+    let mut current_dl_cap = None;
+    let mut current_ul_min = None;
+    let mut current_ul_base = None;
+    let mut current_ul_max = None;
+    let mut current_ul_cap = None;
     let mut args = args;
 
     while let Some(arg) = args.next() {
@@ -6611,6 +6667,30 @@ where
                     .parse::<f64>()
                     .map_err(|_| "invalid base-rate scale".to_string())?
             }
+            "--conservative-background-dl-kbps" => {
+                conservative_background_dl_kbps = Some(
+                    value
+                        .parse::<f64>()
+                        .map_err(|_| "invalid conservative download background".to_string())?,
+                )
+            }
+            "--conservative-background-ul-kbps" => {
+                conservative_background_ul_kbps = Some(
+                    value
+                        .parse::<f64>()
+                        .map_err(|_| "invalid conservative upload background".to_string())?,
+                )
+            }
+            "--retain-dl" => retain_dl = value == "1",
+            "--retain-ul" => retain_ul = value == "1",
+            "--current-dl-min-kbps" => current_dl_min = parse_optional_rate(&value)?,
+            "--current-dl-base-kbps" => current_dl_base = parse_optional_rate(&value)?,
+            "--current-dl-max-kbps" => current_dl_max = parse_optional_rate(&value)?,
+            "--current-dl-cap-kbps" => current_dl_cap = parse_optional_rate(&value)?,
+            "--current-ul-min-kbps" => current_ul_min = parse_optional_rate(&value)?,
+            "--current-ul-base-kbps" => current_ul_base = parse_optional_rate(&value)?,
+            "--current-ul-max-kbps" => current_ul_max = parse_optional_rate(&value)?,
+            "--current-ul-cap-kbps" => current_ul_cap = parse_optional_rate(&value)?,
             "--link-kind" => {
                 link_kind = LinkKind::parse(&value)
                     .ok_or_else(|| format!("unsupported link kind: {value}"))?
@@ -6619,13 +6699,21 @@ where
         }
     }
 
+    let mut download = download.ok_or_else(|| "--dl-samples is required".to_string())?;
+    let mut upload = upload.ok_or_else(|| "--ul-samples is required".to_string())?;
+    let conservative =
+        conservative_background_dl_kbps.is_some() || conservative_background_ul_kbps.is_some();
+    if conservative {
+        subtract_background_samples(
+            &mut download,
+            conservative_background_dl_kbps.unwrap_or(0.0),
+        );
+        subtract_background_samples(&mut upload, conservative_background_ul_kbps.unwrap_or(0.0));
+    }
+
     let mut proposal = build_proposal(
-        download
-            .as_deref()
-            .ok_or_else(|| "--dl-samples is required".to_string())?,
-        upload
-            .as_deref()
-            .ok_or_else(|| "--ul-samples is required".to_string())?,
+        &download,
+        &upload,
         LatencyBaseline {
             median_ms: idle_median_ms.ok_or_else(|| "--idle-median-ms is required".to_string())?,
             p95_ms: idle_p95_ms.ok_or_else(|| "--idle-p95-ms is required".to_string())?,
@@ -6634,6 +6722,38 @@ where
         link_kind,
     )?;
     proposal.revise_base_rates(base_scale)?;
+    if conservative {
+        let retained_download = if retain_dl {
+            Some(current_direction(
+                current_dl_min,
+                current_dl_base,
+                current_dl_max,
+                current_dl_cap,
+                &proposal.download,
+            )?)
+        } else {
+            None
+        };
+        let retained_upload = if retain_ul {
+            Some(current_direction(
+                current_ul_min,
+                current_ul_base,
+                current_ul_max,
+                current_ul_cap,
+                &proposal.upload,
+            )?)
+        } else {
+            None
+        };
+        proposal.apply_conservative_constraints(
+            retained_download,
+            retained_upload,
+            current_dl_max,
+            current_dl_cap,
+            current_ul_max,
+            current_ul_cap,
+        );
+    }
     println!("{}", proposal.to_json());
     Ok(())
 }

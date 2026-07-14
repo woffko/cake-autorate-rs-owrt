@@ -24,7 +24,8 @@ const windowStub = {
 };
 const loadHelpers = new Function('fs', 'poll', 'uci', 'ui', 'L', 'E', '_', 'window',
 	`${prefix}\nreturn { parseHistory, historyInterval, buildChartGeometry, nearestPoint, ` +
-		'bindHover, bindScroll, scrollState, scrollMaximum, formatMemoryKib, lineConnected, niceRateCeiling };');
+		'bindHover, bindScroll, scrollState, scrollMaximum, formatMemoryKib, lineConnected, niceRateCeiling, ' +
+		'collectChartEvents, layoutEventLabels };');
 const helpers = loadHelpers({}, {}, {}, {}, {}, () => {}, value => value, windowStub);
 
 function assert(condition, message) {
@@ -36,6 +37,11 @@ assert(source.includes('.cake-graph-fixed-axis{position:absolute;left:0;right:0'
 	'Y-axis labels must stay fixed while the data timeline scrolls');
 assert(source.includes('.cake-graph-chart-title{position:sticky;left:0'),
 	'chart titles must stay fixed while the data timeline scrolls');
+assert(source.includes('laneEnds = [ geometry.left - 8, geometry.left - 8 ]'),
+	'event labels must use a two-lane collision layout');
+assert(source.includes('drawChartEvents(ctx, geometry)') &&
+	source.match(/drawChartEvents\(ctx, geometry\)/g).length >= 3,
+	'latency and traffic charts must draw one synchronized event model');
 assert(source.includes('viewport.offsetWidth'),
 	'follow-latest must account for the stable scrollbar gutter');
 assert(source.includes('.cake-graphs-grid{display:grid;grid-template-columns:minmax(0,1fr)'),
@@ -101,6 +107,19 @@ assert(!helpers.lineConnected(
 	{ timestamp: 1, routeIdentity: 'route-a', uplinkState: 'ACTIVE' },
 	{ timestamp: 20, routeIdentity: 'route-a', uplinkState: 'ACTIVE' }, 1),
 	'lines must break across missing sample gaps');
+
+const eventGeometry = helpers.buildChartGeometry([
+	{ timestamp: now - 3, uplinkState: 'ACTIVE', routeIdentity: 'a', ratingPhase: 'IDLE' },
+	{ timestamp: now - 2, uplinkState: 'LEARNING', routeIdentity: 'a', ratingPhase: 'DL', ratingDlSamples: 1, ratingUlSamples: 0, grade: 'B', gradeState: 'provisional' },
+	{ timestamp: now - 1.99, uplinkState: 'ACTIVE', routeIdentity: 'b', ratingPhase: 'UL', ratingDlSamples: 2, ratingUlSamples: 1, grade: 'A', gradeState: 'final' },
+], 1, { clientWidth: 390 });
+const events = helpers.collectChartEvents(eventGeometry);
+const layouts = helpers.layoutEventLabels({ measureText: text => ({ width: text.length * 7 }) }, eventGeometry, events);
+assert(events.length >= 5, 'route, state, grade and rating events must share one model');
+assert(layouts.every(layout => layout.lane === 0 || layout.lane === 1),
+	'close graph events must be stacked into two event lanes');
+assert(layouts.some(layout => layout.label === 'DL' || layout.label === 'UL' || layout.label === 'ROUTE'),
+	'crowded event labels must abbreviate while hover retains full data');
 
 function eventTarget(properties) {
 	const listeners = {};

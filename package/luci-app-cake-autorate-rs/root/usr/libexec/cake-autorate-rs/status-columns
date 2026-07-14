@@ -1,0 +1,36 @@
+#!/bin/sh
+set -eu
+
+mode="${1:-}"
+uci_bin="${CAKE_AUTORATE_UCI_BIN:-uci}"
+
+case "$mode" in
+	set)
+		shift
+		for key in "$@"; do
+			case "$key" in
+				route|updated|reflector|runtime_reflectors|rtt|dl_achieved|ul_achieved|cake_dl|cake_ul|cpu) ;;
+				*) echo "invalid Status column: $key" >&2; exit 2 ;;
+			esac
+		done
+		"$uci_bin" -q get cake-autorate.globals >/dev/null 2>&1 ||
+			"$uci_bin" set cake-autorate.globals=globals
+		"$uci_bin" -q delete cake-autorate.globals.status_columns >/dev/null 2>&1 || true
+		seen=' '
+		for key in "$@"; do
+			case "$seen" in *" $key "*) continue ;; esac
+			"$uci_bin" add_list "cake-autorate.globals.status_columns=$key"
+			seen="$seen$key "
+		done
+		"$uci_bin" commit cake-autorate
+		;;
+	reset)
+		"$uci_bin" -q get cake-autorate.globals >/dev/null 2>&1 || exit 0
+		"$uci_bin" -q delete cake-autorate.globals.status_columns >/dev/null 2>&1 || true
+		"$uci_bin" commit cake-autorate
+		;;
+	*)
+		echo "usage: status-columns set [COLUMN ...] | reset" >&2
+		exit 2
+		;;
+esac

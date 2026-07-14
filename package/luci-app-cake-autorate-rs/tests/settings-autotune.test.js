@@ -38,9 +38,16 @@ const helpers = new Function(
 	`${prefix}\ninterfaceContext = { deviceNames: { eth1: true }, deviceNetworks: {}, ` +
 		`networkDevices: {}, defaultDevice: 'eth1' };\nreturn { writeWizardConfig, validateTransportProbeUrl, ` +
 		`buildMwan3Context, uniqueMwan3Uplinks, multiwanInstancePlans, wizardPlanConflicts, ` +
+		`topicTab, ` +
 		`setInterfaceContext: function(value) { interfaceContext = value; }, ` +
 		`setMwan3Context: function(value) { mwan3Context = value; } };`
 )({}, {}, {}, uci, {}, {}, {}, {}, () => ({}), value => value);
+
+assert.equal(helpers.topicTab('setup'), 'autorate');
+assert.equal(helpers.topicTab('general'), 'autorate');
+assert.equal(helpers.topicTab('sqm_qdisc'), 'sqm');
+assert.equal(helpers.topicTab('speedtest'), 'testing');
+assert.equal(helpers.topicTab('logging'), 'monitoring');
 
 const proposal = {
 	download: {
@@ -161,5 +168,15 @@ fixtureSections['cake-autorate'] = [
 assert.match(helpers.wizardPlanConflicts(plans, true).join(' '), /old_wanb.*eth0/);
 const duplicatePlans = [ plans[0], { ...plans[1], name: 'primary_sqm' } ];
 assert.match(helpers.wizardPlanConflicts(duplicatePlans, false).join(' '), /duplicated/);
+
+assert.match(source, /Re-run Auto-Tune/);
+assert.match(source, /start-conservative/);
+assert.match(source, /Continue conservatively/);
+assert.match(source, /confidence_mode === 'low'/);
+assert.match(source, /s\.tab\('autorate', _\('Autorate setup'\)\)/);
+assert.match(source, /s\.tab\('sqm', _\('SQM setup'\)\)/);
+assert.match(source, /s\.tab\('testing', _\('Testing & Auto-Tune'\)\)/);
+assert.doesNotMatch(source, /s\.tab\('general'/,
+	'General must be merged into the Autorate setup category');
 
 console.log('settings autotune tests passed');
