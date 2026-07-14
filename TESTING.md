@@ -117,6 +117,33 @@ Use several signals together:
    physical interface rate. The controller can then reduce rates quickly under
    delay and explore upward only during sustained clean load.
 
+## RC12 synchronized router/client rating check (2026-07-14)
+
+An x86_64 Multi-WAN router and a browser client behind its active backup uplink
+were measured during the same LibreQoS test. Names, addresses, and provider
+identity are omitted. The guided capture measured background traffic first and
+used the current 108/14.5 Mbit/s CAKE limits as its directional references.
+
+| Observer | Overall | Download | Upload | Throughput |
+|---|---|---|---|---|
+| LibreQoS browser | C | C, +117.5 ms | B, +43.7 ms | 87.9/3.8 Mbit/s |
+| Router native WebSocket RTT | C | C, +112.43 ms, 135 samples | B, +42.12 ms, 22 samples | observed from the same routed test |
+
+The two observers use different probe streams, so exact RTT percentiles are
+not expected to be identical. Their overall class, per-direction classes, and
+delay magnitude agreed. The daemon committed the clean router result as
+`LAST KNOWN C`; a later incomplete passive window remained `CURRENT` and did
+not replace it. A separate automatic attempt encountered simultaneous
+opposite-direction background traffic, returned an explicit contamination
+error, and did not publish a rating.
+
+Before RC12, clustered reflector output could consume the same counter delta
+twice or divide a small burst by a sub-millisecond interval, which often
+classified only upload. RC12 shares one rate sample and coalesces reads closer
+than 25 ms. A busy link that had remained at 0/20 idle baseline samples then
+reached 20/20 in about ten seconds using the bounded one-second warm-up probe
+interval and returned to its configured 15-second idle interval.
+
 ## Reproduction outline
 
 Use a client behind the router and keep the test server constant:

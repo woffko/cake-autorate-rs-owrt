@@ -169,6 +169,14 @@ impl QualityGradeTracker {
         }
     }
 
+    pub fn reset(&mut self) {
+        self.baselines.clear();
+        self.active = None;
+        self.latest = None;
+        self.last_known = None;
+        self.route_identity.clear();
+    }
+
     pub fn set_route(&mut self, route_identity: &str) {
         if self.route_identity == route_identity {
             return;
@@ -179,6 +187,14 @@ impl QualityGradeTracker {
     }
 
     pub fn begin_capture(&mut self, timestamp: f64) {
+        self.finish_active(timestamp);
+    }
+
+    pub fn cancel_capture(&mut self) {
+        self.active = None;
+    }
+
+    pub fn end_capture(&mut self, timestamp: f64) {
         self.finish_active(timestamp);
     }
 
@@ -513,6 +529,78 @@ mod tests {
     }
 
     #[test]
+    fn contaminated_capture_can_be_discarded_without_replacing_last_known() {
+        let mut tracker = QualityGradeTracker::new(30.0);
+        seed_baseline(&mut tracker, "endpoint", "route-a");
+        complete_result(&mut tracker, "endpoint", "route-a", 30.0, 12.0, 40.0);
+        assert_eq!(
+            tracker.snapshot(115.0).last_known.as_ref().unwrap().class,
+            QualityClass::B
+        );
+
+        tracker.begin_capture(120.0);
+        for index in 0..MIN_LOADED_SAMPLES {
+            tracker.observe(
+                "endpoint",
+                100.0,
+                true,
+                false,
+                121.0 + index as f64,
+                "route-a",
+            );
+            tracker.observe(
+                "endpoint",
+                100.0,
+                false,
+                true,
+                141.0 + index as f64,
+                "route-a",
+            );
+        }
+        assert_eq!(
+            tracker.snapshot(165.0).current.as_ref().unwrap().class,
+            QualityClass::C
+        );
+
+        tracker.cancel_capture();
+        let restored = tracker.snapshot(166.0);
+        assert_eq!(restored.current.as_ref().unwrap().class, QualityClass::B);
+        assert_eq!(restored.last_known.as_ref().unwrap().class, QualityClass::B);
+    }
+
+    #[test]
+    fn clean_capture_end_commits_a_complete_result() {
+        let mut tracker = QualityGradeTracker::new(30.0);
+        seed_baseline(&mut tracker, "endpoint", "route-a");
+        tracker.begin_capture(30.0);
+        for index in 0..MIN_LOADED_SAMPLES {
+            tracker.observe(
+                "endpoint",
+                20.0,
+                true,
+                false,
+                31.0 + index as f64,
+                "route-a",
+            );
+            tracker.observe(
+                "endpoint",
+                40.0,
+                false,
+                true,
+                51.0 + index as f64,
+                "route-a",
+            );
+        }
+
+        tracker.end_capture(75.0);
+        let snapshot = tracker.snapshot(75.0);
+        assert_eq!(snapshot.state, "final");
+        assert!(!snapshot.current.as_ref().unwrap().partial);
+        assert!(!snapshot.current.as_ref().unwrap().incomplete);
+        assert_eq!(snapshot.last_known.as_ref().unwrap().class, QualityClass::B);
+    }
+
+    #[test]
     fn bidirectional_is_diagnostic_and_does_not_set_overall_grade() {
         let mut tracker = QualityGradeTracker::new(30.0);
         seed_baseline(&mut tracker, "endpoint", "route-a");
@@ -561,6 +649,21 @@ mod tests {
         assert!(snapshot.current_stale);
         assert!(snapshot.last_known_stale);
         assert!(!snapshot.baseline_ready);
+    }
+
+    #[test]
+    fn runtime_reset_discards_baseline_and_all_results() {
+        let mut tracker = QualityGradeTracker::new(30.0);
+        seed_baseline(&mut tracker, "endpoint", "route-a");
+        complete_result(&mut tracker, "endpoint", "route-a", 30.0, 12.0, 40.0);
+        assert!(tracker.snapshot(115.0).last_known.is_some());
+
+        tracker.reset();
+        let snapshot = tracker.snapshot(116.0);
+        assert_eq!(snapshot.state, "learning_baseline");
+        assert!(!snapshot.baseline_ready);
+        assert!(snapshot.current.is_none());
+        assert!(snapshot.last_known.is_none());
     }
 
     #[test]

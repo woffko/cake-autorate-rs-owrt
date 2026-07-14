@@ -102,8 +102,10 @@ scored direction are required. A one-direction result is `PARTIAL` and is never
 shown as a final grade. `CURRENT` is the active/latest attempt and can therefore
 be collecting, partial, or incomplete. `LAST KNOWN` is the most recent complete
 DL+UL result and remains unchanged by partial/incomplete attempts. An episode
-finalizes after 30 seconds without accepted directional loaded samples by
-default. All
+normally finalizes after 30 seconds without accepted directional loaded samples.
+A guided capture is bounded more tightly: a clean complete DL+UL result is
+committed when the helper closes the capture, while a contaminated capture is
+discarded and cannot replace `LAST KNOWN`. All
 these samples are scoped to `I_u`; after a route change the retained result is
 explicitly stale and cannot be combined with new samples.
 
@@ -129,7 +131,11 @@ L = 100 * R / C
 ```
 
 Download uses the configured RX counter and upload uses TX. Counter rollback
-is saturated at zero. An interval is never treated as shorter than 1 ms.
+is saturated at zero. All consumers share this single `(DL, UL)` observation.
+Reads less than 25 ms after the previous accepted counter sample reuse the
+cached rate without advancing the counters; the next accepted read includes
+the entire accumulated byte delta. This coalesces clustered reflector replies
+and prevents a tiny scheduling interval from creating a false high-load peak.
 
 The fast rate controller classifies load as:
 

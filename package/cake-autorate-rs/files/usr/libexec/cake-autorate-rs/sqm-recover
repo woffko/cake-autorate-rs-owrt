@@ -1,0 +1,127 @@
+#!/bin/sh
+
+section="$1"
+uci_bin="${CAKE_AUTORATE_UCI:-uci}"
+tc_bin="${CAKE_AUTORATE_TC:-tc}"
+sqm_run="${CAKE_AUTORATE_SQM_RUN:-/usr/lib/sqm/run.sh}"
+sys_class_net="${CAKE_AUTORATE_SYS_CLASS_NET:-/sys/class/net}"
+sqm_state_dir="${CAKE_AUTORATE_SQM_STATE_DIR:-/var/run/sqm}"
+lock_root="${CAKE_AUTORATE_SQM_RECOVERY_LOCK_DIR:-/tmp/cake-autorate-sqm-recovery}"
+speedtest_lock_root="${CAKE_AUTORATE_SPEEDTEST_LOCK_DIR:-/tmp/cake-autorate-speedtest}"
+
+fail() {
+	printf '%s\n' "$*" >&2
+	exit 1
+}
+
+safe_name() {
+	case "$1" in
+		''|*[!A-Za-z0-9_]*) return 1 ;;
+	esac
+}
+
+safe_interface() {
+	case "$1" in
+		''|*[!A-Za-z0-9_.:@-]*) return 1 ;;
+	esac
+}
+
+is_pid() {
+	case "$1" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$1" -gt 1 ] 2>/dev/null
+}
+
+uci_get() {
+	"$uci_bin" -q get "cake-autorate.$section.$1" 2>/dev/null
+}
+
+lock_name_for() {
+	printf '%s' "$1" | tr ':@.' '___'
+}
+
+cake_present() {
+	"$tc_bin" qdisc show dev "$1" 2>/dev/null | awk '$1 == "qdisc" && ($2 == "cake" || $2 == "cake_mq") { found = 1 } END { exit !found }'
+}
+
+redirect_present() {
+	"$tc_bin" filter show dev "$target" ingress 2>/dev/null | grep -Fq "$dl_if"
+}
+
+healthy() {
+	case "$dl_if" in
+		ifb*|veth*) dl_counter=tx_bytes ;;
+		*) dl_counter=rx_bytes ;;
+	esac
+	case "$ul_if" in
+		ifb*|veth*) ul_counter=rx_bytes ;;
+		*) ul_counter=tx_bytes ;;
+	esac
+	[ -f "$sys_class_net/$dl_if/statistics/$dl_counter" ] || return 1
+	[ -f "$sys_class_net/$ul_if/statistics/$ul_counter" ] || return 1
+	cake_present "$dl_if" || return 1
+	cake_present "$ul_if" || return 1
+	case "$dl_if" in ifb*) redirect_present || return 1 ;; esac
+	return 0
+}
+
+release_lock() {
+	owner="$(sed -n '1p' "$lock_dir/pid" 2>/dev/null)"
+	if [ "$owner" = "$$" ]; then
+		rm -f "$lock_dir/pid" 2>/dev/null
+		rmdir "$lock_dir" 2>/dev/null || true
+	fi
+}
+
+safe_name "$section" || fail "Invalid CAKE Autorate instance name."
+[ "$(uci_get enabled)" = 1 ] || fail "Autorate instance $section is disabled."
+[ "$(uci_get manage_sqm)" != 0 ] || fail "Managed SQM is disabled for $section."
+[ "$(uci_get sqm_enabled)" = 1 ] || fail "Managed SQM queue is disabled for $section."
+
+target="$(uci_get sqm_interface)"
+[ -n "$target" ] || target="$(uci_get ul_if)"
+ul_if="$(uci_get ul_if)"
+[ -n "$ul_if" ] || ul_if="$target"
+dl_if="$(uci_get dl_if)"
+[ -n "$dl_if" ] || dl_if="ifb4$target"
+safe_interface "$target" || fail "Invalid SQM target interface."
+safe_interface "$ul_if" || fail "Invalid SQM upload interface."
+safe_interface "$dl_if" || fail "Invalid SQM download interface."
+[ -x "$sqm_run" ] || fail "SQM runner is unavailable."
+
+lock_name="$(lock_name_for "$target")"
+speedtest_lock="$speedtest_lock_root/interface-$lock_name.lock"
+speedtest_pid="$(sed -n '1p' "$speedtest_lock/pid" 2>/dev/null)"
+if is_pid "$speedtest_pid" && kill -0 "$speedtest_pid" 2>/dev/null; then
+	printf '%s\n' "SQM recovery deferred: a speed test is using $target." >&2
+	exit 75
+fi
+
+mkdir -p "$lock_root" || fail "Unable to create the SQM recovery lock root."
+lock_dir="$lock_root/interface-$lock_name.lock"
+if ! mkdir "$lock_dir" 2>/dev/null; then
+	owner="$(sed -n '1p' "$lock_dir/pid" 2>/dev/null)"
+	if is_pid "$owner" && kill -0 "$owner" 2>/dev/null; then
+		printf '%s\n' "SQM recovery is already running for $target." >&2
+		exit 75
+	fi
+	rm -f "$lock_dir/pid" 2>/dev/null
+	rmdir "$lock_dir" 2>/dev/null || fail "Unable to clear a stale SQM recovery lock."
+	mkdir "$lock_dir" 2>/dev/null || fail "Unable to acquire the SQM recovery lock."
+fi
+printf '%s\n' "$$" > "$lock_dir/pid" || fail "Unable to write the SQM recovery lock."
+trap release_lock EXIT INT TERM
+
+healthy && exit 0
+
+"$sqm_run" stop "$target" >/dev/null 2>&1 || true
+rm -f "$sqm_state_dir/$target.state" 2>/dev/null
+"$sqm_run" start "$target" >/dev/null 2>&1 || fail "Failed to start managed SQM on $target."
+
+attempt=0
+while [ "$attempt" -lt 10 ]; do
+	healthy && exit 0
+	attempt=$((attempt + 1))
+	sleep 1
+done
+
+fail "Managed SQM on $target did not restore CAKE, IFB, and ingress redirect."

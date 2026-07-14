@@ -147,6 +147,11 @@ preflight() {
 		failure="Selected uplink route is not active."
 		return 1
 	}
+	if [ "$(status_value '.sqm_runtime_managed')" = true ] && \
+	   [ "$(status_value '.sqm_runtime_healthy')" != true ]; then
+		failure="Managed SQM runtime is unhealthy: $(status_value '.sqm_runtime_reason')"
+		return 1
+	fi
 	[ "$(status_value '.transport_probe_trusted')" = true ] || {
 		failure="A trusted native transport backend is required."
 		return 1
@@ -307,10 +312,8 @@ result_is_complete() {
 	partial="$(status_value '.quality_grade_current.partial')"
 	incomplete="$(status_value '.quality_grade_current.incomplete')"
 	started="$(status_value '.quality_grade_current.started_at')"
-	completed="$(status_value '.quality_grade_current.completed_at')"
-	grade_state="$(status_value '.quality_grade_state')"
 	awk -v started="${started:-0}" -v job="$job_started" 'BEGIN { exit !(started + 0 >= job + 0) }' || return 1
-	[ "$grade_state" = final ] && [ -n "$completed" ] && [ -n "$grade" ] && \
+	[ -n "$grade" ] && \
 		[ "$grade" != LEARNING ] && [ "$partial" != true ] && [ "$incomplete" != true ]
 }
 

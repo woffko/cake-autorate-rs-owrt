@@ -1,0 +1,11 @@
+#!/bin/sh
+
+printf '%s %s\n' "$1" "$2" >> "$CAKE_TEST_ROOT/actions"
+if [ "$1" = start ]; then
+	mkdir -p "$CAKE_AUTORATE_SYS_CLASS_NET/ifb4eth0/statistics" \
+		"$CAKE_AUTORATE_SYS_CLASS_NET/eth0/statistics"
+	: > "$CAKE_AUTORATE_SYS_CLASS_NET/ifb4eth0/statistics/tx_bytes"
+	: > "$CAKE_AUTORATE_SYS_CLASS_NET/eth0/statistics/rx_bytes"
+	: > "$CAKE_AUTORATE_SYS_CLASS_NET/eth0/statistics/tx_bytes"
+	: > "$CAKE_TEST_ROOT/healthy"
+fi

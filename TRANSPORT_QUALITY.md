@@ -127,6 +127,12 @@ versa. Adjacent directional phases belong to one test episode when less than
 30 seconds apart by default. Bidirectional observations remain diagnostic and do not
 lower the overall grade.
 
+Until the first idle baseline is ready, the native probe scheduler temporarily
+uses a one-second interval. This does not generate a throughput load; it lets a
+busy uplink accept short route-stable idle gaps instead of waiting indefinitely
+for a 15-second window with no phase transition. Once 20 samples are accepted,
+the configured idle interval is restored automatically.
+
 | Loaded RTT increase | Grade |
 |---:|:---|
 | less than 5 ms | A+ |
@@ -142,6 +148,10 @@ incomplete result. `LAST KNOWN` retains only the most recent complete DL+UL
 grade; partial/incomplete attempts never overwrite it. Results record p5, p90,
 sample counts, direction, completion time, endpoint, and route identity. A route
 change marks retained results stale rather than combining old and new paths.
+A clean guided capture is explicitly finalized as soon as both directions have
+enough evidence. If opposite-direction contamination is detected, the active
+capture is discarded; even a mathematically complete provisional value cannot
+replace `LAST KNOWN`.
 
 The compatibility reference is the live
 [LibreQoS Internet Quality Test](https://test.libreqos.com/advanced/) and its

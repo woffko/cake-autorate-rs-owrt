@@ -136,6 +136,27 @@ const ready = helpers.qualityReadiness({ enabled: '1', sqm_enabled: '1' }, {
 	quality_grade_baseline_ready: true,
 });
 assert.equal(ready.ready, true);
+const unhealthySqm = helpers.qualityReadiness({ enabled: '1', sqm_enabled: '1' }, {
+	sqm_runtime_managed: true,
+	sqm_runtime_healthy: false,
+	sqm_runtime_reason: 'CAKE qdisc is missing on ifb4eth0',
+	transport_latency_enabled: true,
+	route_active: true,
+	transport_probe_trusted: true,
+	quality_grade_baseline_ready: true,
+});
+assert.equal(unhealthySqm.ready, false);
+assert.match(unhealthySqm.reason, /CAKE qdisc is missing on ifb4eth0/);
+const unhealthyState = helpers.formatState({
+	state: 'RUNNING',
+	sqm_runtime_managed: true,
+	sqm_runtime_healthy: false,
+	sqm_runtime_state: 'ERROR',
+	sqm_runtime_reason: 'download counter is missing for ifb4eth0',
+}, true);
+assert.equal(unhealthyState.children[0].children, 'ERROR');
+assert.equal(unhealthyState.children[1].children, 'CAKE/IFB unavailable');
+assert.match(unhealthyState.attrs.title, /download counter is missing/);
 const learning = helpers.qualityReadiness({ enabled: '1', sqm_enabled: '1' }, {
 	transport_latency_enabled: true,
 	route_active: true,

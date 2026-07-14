@@ -1,0 +1,14 @@
+#!/bin/sh
+
+case "$1 $2 $3 $4 $5 $6" in
+	"qdisc show dev ifb4eth0  ")
+		[ -f "$CAKE_TEST_ROOT/healthy" ] && printf 'qdisc cake 8001: root bandwidth 100Mbit\n'
+		;;
+	"qdisc show dev eth0  ")
+		[ -f "$CAKE_TEST_ROOT/healthy" ] && printf 'qdisc cake 8002: root bandwidth 20Mbit\n'
+		;;
+	"filter show dev eth0 ingress ")
+		[ -f "$CAKE_TEST_ROOT/healthy" ] && printf 'action order 1: mirred (Egress Redirect to device ifb4eth0)\n'
+		;;
+	*) exit 1 ;;
+esac

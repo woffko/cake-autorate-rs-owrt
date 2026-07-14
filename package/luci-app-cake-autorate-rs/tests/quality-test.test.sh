@@ -16,13 +16,15 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-mkdir -p "$work/runtime/automatic" "$work/runtime/client" "$work/runtime/contaminated" "$work/runtime/busy" "$work/jobs"
+mkdir -p "$work/runtime/automatic" "$work/runtime/client" "$work/runtime/contaminated" "$work/runtime/busy" "$work/runtime/unhealthy" "$work/jobs"
 baseline='{"route_active":true,"route_device":"lo","transport_probe_trusted":true,"quality_grade_baseline_ready":true,"quality_grade_baseline_samples":20,"quality_grade_baseline_required_samples":20,"quality_grade_dl_samples":0,"quality_grade_ul_samples":0,"quality_grade_required_samples":20,"quality_grade_state":"baseline_ready","rating_load_phase":"IDLE","rating_load_candidate":"IDLE","rating_load_smoothed_dl_percent":0,"rating_load_smoothed_ul_percent":0,"dl_achieved_rate_kbps":0,"ul_achieved_rate_kbps":0,"cake_dl_rate_kbps":100000,"cake_ul_rate_kbps":50000,"rating_capture_contaminated":false}'
 printf '%s\n' "$baseline" > "$work/runtime/automatic/status.json"
 printf '%s\n' "$baseline" > "$work/runtime/client/status.json"
 printf '%s\n' "$baseline" > "$work/runtime/contaminated/status.json"
 busy='{"route_active":true,"route_device":"lo","transport_probe_trusted":true,"quality_grade_baseline_ready":true,"quality_grade_baseline_samples":20,"quality_grade_baseline_required_samples":20,"quality_grade_dl_samples":0,"quality_grade_ul_samples":0,"quality_grade_required_samples":20,"quality_grade_state":"baseline_ready","rating_load_phase":"IDLE","rating_load_candidate":"IDLE","rating_load_smoothed_dl_percent":9,"rating_load_smoothed_ul_percent":0,"dl_achieved_rate_kbps":9000,"ul_achieved_rate_kbps":0,"cake_dl_rate_kbps":100000,"cake_ul_rate_kbps":50000,"rating_capture_contaminated":false}'
 printf '%s\n' "$busy" > "$work/runtime/busy/status.json"
+unhealthy='{"route_active":true,"route_device":"lo","sqm_runtime_managed":true,"sqm_runtime_healthy":false,"sqm_runtime_reason":"download counter is missing","transport_probe_trusted":true,"quality_grade_baseline_ready":true}'
+printf '%s\n' "$unhealthy" > "$work/runtime/unhealthy/status.json"
 
 export CAKE_AUTORATE_QUALITY_DIR="$work/jobs"
 export CAKE_AUTORATE_RUNTIME_DIR="$work/runtime"
@@ -83,5 +85,11 @@ if CAKE_TEST_DISABLED=1 "$helper" disabled start client > "$work/disabled.json" 
 	exit 1
 fi
 grep -q 'Autorate instance is disabled' "$work/disabled.json"
+
+if "$helper" unhealthy start client > "$work/unhealthy.json" 2>/dev/null; then
+	echo "unhealthy SQM runtime unexpectedly passed preflight" >&2
+	exit 1
+fi
+grep -q 'Managed SQM runtime is unhealthy: download counter is missing' "$work/unhealthy.json"
 
 echo "quality-test helper tests passed"

@@ -38,6 +38,10 @@ const GRAPH_HISTORY_MIN_BUDGET_KIB: u64 = 256;
 const GRAPH_HISTORY_HARD_MAX_KIB: u64 = 100 * 1024;
 const GRAPH_HISTORY_BUDGET_REFRESH_S: u64 = 30;
 const GRAPH_HISTORY_CRITICAL_AVAILABLE_KIB: u64 = 16 * 1024;
+const SQM_RUNTIME_HEALTH_CHECK_S: u64 = 3;
+const SQM_RUNTIME_RECOVERY_COOLDOWN_S: u64 = 30;
+const RATE_SAMPLE_MIN_INTERVAL: Duration = Duration::from_millis(25);
+const TRANSPORT_BASELINE_LEARNING_INTERVAL_S: f64 = 1.0;
 
 const UPSTREAM_DEFAULT_REFLECTORS: &[&str] = &[
     "1.1.1.1",
@@ -84,6 +88,9 @@ extern "C" {
 struct Config {
     instance: String,
     enabled: bool,
+    manage_sqm: bool,
+    sqm_enabled: bool,
+    sqm_interface: String,
     dl_if: String,
     ul_if: String,
     route_mode: String,
@@ -222,6 +229,9 @@ impl Config {
         Self {
             instance,
             enabled: false,
+            manage_sqm: true,
+            sqm_enabled: false,
+            sqm_interface: String::new(),
             dl_if: "ifb-wan".to_string(),
             ul_if: "wan".to_string(),
             route_mode: "auto".to_string(),
@@ -399,6 +409,10 @@ impl Config {
         }
 
         set_bool(&single, "enabled", &mut cfg.enabled)?;
+        set_bool(&single, "manage_sqm", &mut cfg.manage_sqm)?;
+        cfg.sqm_enabled = cfg.enabled;
+        set_bool(&single, "sqm_enabled", &mut cfg.sqm_enabled)?;
+        set_string(&single, "sqm_interface", &mut cfg.sqm_interface);
         set_string(&single, "dl_if", &mut cfg.dl_if);
         set_string(&single, "ul_if", &mut cfg.ul_if);
         set_string(&single, "route_mode", &mut cfg.route_mode);
@@ -423,7 +437,13 @@ impl Config {
             {
                 cfg.ul_if = wan_if.clone();
                 cfg.dl_if = format!("ifb4{wan_if}");
+                if cfg.sqm_interface.is_empty() {
+                    cfg.sqm_interface = wan_if.clone();
+                }
             }
+        }
+        if cfg.sqm_interface.is_empty() {
+            cfg.sqm_interface = cfg.ul_if.clone();
         }
         set_string(&single, "rx_bytes_path", &mut cfg.rx_bytes_path);
         set_string(&single, "tx_bytes_path", &mut cfg.tx_bytes_path);
@@ -1870,6 +1890,8 @@ struct RateMonitor {
     prev_rx: u64,
     prev_tx: u64,
     last: Instant,
+    last_dl_kbps: f64,
+    last_ul_kbps: f64,
 }
 
 impl RateMonitor {
@@ -1880,12 +1902,18 @@ impl RateMonitor {
             prev_rx: read_u64_file(rx_path).unwrap_or(0),
             prev_tx: read_u64_file(tx_path).unwrap_or(0),
             last: Instant::now(),
+            last_dl_kbps: 0.0,
+            last_ul_kbps: 0.0,
         })
     }
 
     fn sample(&mut self) -> (f64, f64) {
         let now = Instant::now();
-        let elapsed = now.duration_since(self.last).as_secs_f64().max(0.001);
+        let interval = now.duration_since(self.last);
+        if interval < RATE_SAMPLE_MIN_INTERVAL {
+            return (self.last_dl_kbps, self.last_ul_kbps);
+        }
+        let elapsed = interval.as_secs_f64();
         let rx = read_u64_file(&self.rx_path).unwrap_or(self.prev_rx);
         let tx = read_u64_file(&self.tx_path).unwrap_or(self.prev_tx);
         let dl = rx.saturating_sub(self.prev_rx) as f64 * 8.0 / elapsed / 1000.0;
@@ -1893,8 +1921,90 @@ impl RateMonitor {
         self.prev_rx = rx;
         self.prev_tx = tx;
         self.last = now;
+        self.last_dl_kbps = dl;
+        self.last_ul_kbps = ul;
         (dl, ul)
     }
+}
+
+fn qdisc_output_has_cake(output: &str) -> bool {
+    output.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next() == Some("qdisc")
+            && fields
+                .next()
+                .map(|kind| kind == "cake" || kind == "cake_mq")
+                .unwrap_or(false)
+    })
+}
+
+fn ingress_output_targets_ifb(output: &str, ifb: &str) -> bool {
+    !ifb.is_empty() && output.lines().any(|line| line.contains(ifb))
+}
+
+fn tc_output(args: &[&str]) -> Result<String, String> {
+    let output = Command::new("tc")
+        .args(args)
+        .output()
+        .map_err(|error| format!("failed to execute tc: {error}"))?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if error.is_empty() {
+            format!("tc {} failed with {}", args.join(" "), output.status)
+        } else {
+            error
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn inspect_managed_sqm(cfg: &Config) -> Result<(), String> {
+    if !cfg.manage_sqm || !cfg.sqm_enabled {
+        return Ok(());
+    }
+    if !Path::new(&cfg.rx_bytes_path).is_file() {
+        return Err(format!("download counter is missing for {}", cfg.dl_if));
+    }
+    if !Path::new(&cfg.tx_bytes_path).is_file() {
+        return Err(format!("upload counter is missing for {}", cfg.ul_if));
+    }
+
+    let dl_qdisc = tc_output(&["qdisc", "show", "dev", &cfg.dl_if])?;
+    if !qdisc_output_has_cake(&dl_qdisc) {
+        return Err(format!("CAKE qdisc is missing on {}", cfg.dl_if));
+    }
+    let ul_qdisc = tc_output(&["qdisc", "show", "dev", &cfg.ul_if])?;
+    if !qdisc_output_has_cake(&ul_qdisc) {
+        return Err(format!("CAKE qdisc is missing on {}", cfg.ul_if));
+    }
+    if cfg.dl_if.starts_with("ifb") {
+        let ingress = tc_output(&["filter", "show", "dev", &cfg.sqm_interface, "ingress"])?;
+        if !ingress_output_targets_ifb(&ingress, &cfg.dl_if) {
+            return Err(format!(
+                "ingress redirect from {} to {} is missing",
+                cfg.sqm_interface, cfg.dl_if
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn recover_managed_sqm(cfg: &Config) -> Result<(), String> {
+    let helper = env::var("CAKE_AUTORATE_SQM_RECOVER")
+        .unwrap_or_else(|_| "/usr/libexec/cake-autorate-rs/sqm-recover".to_string());
+    let output = Command::new(&helper)
+        .arg(&cfg.instance)
+        .output()
+        .map_err(|error| format!("failed to execute {helper}: {error}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            format!("SQM recovery helper failed with {}", output.status)
+        } else {
+            detail
+        });
+    }
+    inspect_managed_sqm(cfg)
 }
 
 #[derive(Clone, Debug)]
@@ -2156,10 +2266,11 @@ impl TransportProbeRuntime {
         cfg: &Config,
         dl_rate: f64,
         ul_rate: f64,
-        dl_shaper: f64,
-        ul_shaper: f64,
+        shaper_rates: (f64, f64),
         rating: &RatingLoadSnapshot,
+        quality_baseline_ready: bool,
     ) {
+        let (dl_shaper, ul_shaper) = shaper_rates;
         let raw_dl_loaded = percent(dl_rate, dl_shaper) >= cfg.high_load_thr * 100.0;
         let raw_ul_loaded = percent(ul_rate, ul_shaper) >= cfg.high_load_thr * 100.0;
         let phase = (raw_dl_loaded, raw_ul_loaded);
@@ -2178,11 +2289,7 @@ impl TransportProbeRuntime {
         let ul_loaded = control_valid && raw_ul_loaded;
         let loaded = dl_loaded || ul_loaded;
         let any_loaded = loaded || rating.phase.loaded();
-        let interval = if any_loaded {
-            cfg.transport_probe_loaded_interval_s
-        } else {
-            cfg.transport_probe_idle_interval_s
-        };
+        let interval = transport_probe_interval_s(cfg, any_loaded, quality_baseline_ready);
         if self.last_started.elapsed() < Duration::from_secs_f64(interval) {
             return;
         }
@@ -2200,6 +2307,17 @@ impl TransportProbeRuntime {
             self.in_flight = true;
             self.last_started = Instant::now();
         }
+    }
+}
+
+fn transport_probe_interval_s(cfg: &Config, any_loaded: bool, baseline_ready: bool) -> f64 {
+    if any_loaded {
+        cfg.transport_probe_loaded_interval_s
+    } else if !baseline_ready {
+        cfg.transport_probe_idle_interval_s
+            .min(TRANSPORT_BASELINE_LEARNING_INTERVAL_S)
+    } else {
+        cfg.transport_probe_idle_interval_s
     }
 }
 
@@ -2747,6 +2865,12 @@ struct Controller {
     route_snapshot: Option<RouteSnapshot>,
     route_identity: Option<String>,
     route_external_ip: String,
+    sqm_runtime_state: String,
+    sqm_runtime_healthy: bool,
+    sqm_runtime_reason: String,
+    sqm_recovery_attempts: u64,
+    sqm_last_recovery_attempt: Option<Instant>,
+    sqm_last_recovery_at: Option<f64>,
     last_status: Option<StatusSnapshot>,
 }
 
@@ -2867,6 +2991,16 @@ impl Controller {
             route_snapshot: None,
             route_identity: None,
             route_external_ip: String::new(),
+            sqm_runtime_state: if cfg.manage_sqm && cfg.sqm_enabled {
+                "HEALTHY".to_string()
+            } else {
+                "UNMANAGED".to_string()
+            },
+            sqm_runtime_healthy: true,
+            sqm_runtime_reason: String::new(),
+            sqm_recovery_attempts: 0,
+            sqm_last_recovery_attempt: None,
+            sqm_last_recovery_at: None,
             last_status: None,
             dl_baseline_us: HashMap::new(),
             ul_baseline_us: HashMap::new(),
@@ -2892,6 +3026,97 @@ impl Controller {
 
     fn sample_rates(&mut self) -> (f64, f64) {
         self.rate_monitor.sample()
+    }
+
+    fn set_sqm_runtime_status(&mut self, state: &str, healthy: bool, reason: &str) {
+        let changed = self.sqm_runtime_state != state
+            || self.sqm_runtime_healthy != healthy
+            || self.sqm_runtime_reason != reason;
+        self.sqm_runtime_state = state.to_string();
+        self.sqm_runtime_healthy = healthy;
+        self.sqm_runtime_reason = reason.to_string();
+        if changed {
+            self.log(
+                if healthy { "INFO" } else { "ERROR" },
+                &format!(
+                    "Managed SQM runtime {}{}",
+                    state.to_ascii_lowercase(),
+                    if reason.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {reason}")
+                    }
+                ),
+            );
+        }
+        let _ = self.refresh_status_from_last_sample();
+    }
+
+    fn accept_recovered_sqm(&mut self, reason: &str) -> Result<(), String> {
+        self.rate_monitor = RateMonitor::new(&self.cfg.rx_bytes_path, &self.cfg.tx_bytes_path)
+            .map_err(|error| format!("failed to reset interface counters: {error}"))?;
+        self.last_set_dl = 0;
+        self.last_set_ul = 0;
+        self.quality_grade.reset();
+        self.reset_uplink_learning(reason);
+        self.sqm_last_recovery_at = Some(epoch_secs());
+        self.set_sqm_runtime_status("HEALTHY", true, reason);
+        self.set_run_state("RUNNING");
+        self.apply_shaper("dl");
+        self.apply_shaper("ul");
+        Ok(())
+    }
+
+    fn ensure_managed_sqm(&mut self) -> (bool, bool) {
+        if !self.cfg.manage_sqm || !self.cfg.sqm_enabled {
+            self.set_sqm_runtime_status("UNMANAGED", true, "");
+            return (true, false);
+        }
+
+        match inspect_managed_sqm(&self.cfg) {
+            Ok(()) if self.sqm_runtime_healthy => (true, false),
+            Ok(()) => match self.accept_recovered_sqm("runtime recovered externally") {
+                Ok(()) => (true, true),
+                Err(error) => {
+                    self.set_sqm_runtime_status("ERROR", false, &error);
+                    self.set_run_state("ERROR");
+                    (false, false)
+                }
+            },
+            Err(initial_reason) => {
+                if self
+                    .sqm_last_recovery_attempt
+                    .map(|attempt| {
+                        attempt.elapsed() < Duration::from_secs(SQM_RUNTIME_RECOVERY_COOLDOWN_S)
+                    })
+                    .unwrap_or(false)
+                {
+                    self.set_sqm_runtime_status("ERROR", false, &initial_reason);
+                    self.set_run_state("ERROR");
+                    return (false, false);
+                }
+                self.sqm_last_recovery_attempt = Some(Instant::now());
+                self.sqm_recovery_attempts = self.sqm_recovery_attempts.saturating_add(1);
+                self.set_sqm_runtime_status("RECOVERING", false, &initial_reason);
+                self.set_run_state("RECOVERING");
+                match recover_managed_sqm(&self.cfg) {
+                    Ok(()) => match self.accept_recovered_sqm("automatic SQM recovery completed") {
+                        Ok(()) => (true, true),
+                        Err(error) => {
+                            self.set_sqm_runtime_status("ERROR", false, &error);
+                            self.set_run_state("ERROR");
+                            (false, false)
+                        }
+                    },
+                    Err(error) => {
+                        let reason = format!("{initial_reason}; recovery failed: {error}");
+                        self.set_sqm_runtime_status("ERROR", false, &reason);
+                        self.set_run_state("ERROR");
+                        (false, false)
+                    }
+                }
+            }
+        }
     }
 
     fn update_rating_load(
@@ -2943,6 +3168,13 @@ impl Controller {
                 self.quality_grade.begin_capture(epoch_secs());
             }
         } else {
+            if self.rating_load_snapshot.capture_active {
+                if self.rating_load_snapshot.capture_contaminated {
+                    self.quality_grade.cancel_capture();
+                } else {
+                    self.quality_grade.end_capture(epoch_secs());
+                }
+            }
             self.rating_load
                 .set_capture(None, None, None, 0.0, 0.0, now);
             if !content.is_empty() {
@@ -3514,7 +3746,7 @@ impl Controller {
         sample: Sample,
         active_reflectors: &[String],
         health: &ReflectorHealth,
-    ) {
+    ) -> (f64, f64) {
         let now = Instant::now();
         let (dl_rate, ul_rate) = self.rate_monitor.sample();
         let dl_load_pct = percent(dl_rate, self.shaper_dl);
@@ -3728,6 +3960,7 @@ impl Controller {
             active_reflectors,
             Some(health),
         );
+        (dl_rate, ul_rate)
     }
 
     fn maybe_sample_cpu(&mut self) -> bool {
@@ -4242,10 +4475,16 @@ impl Controller {
         let mut file = File::create(&tmp)?;
         writeln!(
             file,
-            "{{\"instance\":\"{}\",\"version\":\"{}\",\"state\":\"{}\",\"started_at\":{:.6},\"updated_at\":{:.6},\"dl_if\":\"{}\",\"ul_if\":\"{}\",\"reflector\":\"{}\",\"seq\":\"{}\",\"probe_timestamp\":{:.6},\"rtt_ms\":{:.3},\"dl_owd_us\":{:.1},\"ul_owd_us\":{:.1},\"dl_achieved_rate_kbps\":{:.1},\"ul_achieved_rate_kbps\":{:.1},\"dl_load_percent\":{:.1},\"ul_load_percent\":{:.1},\"dl_sum_delays\":{},\"ul_sum_delays\":{},\"dl_avg_owd_delta_us\":{:.1},\"ul_avg_owd_delta_us\":{:.1},\"cake_dl_rate_kbps\":{:.0},\"cake_ul_rate_kbps\":{:.0},\"adaptive_ceiling_enabled\":{},\"configured_max_dl_shaper_rate_kbps\":{:.0},\"configured_max_ul_shaper_rate_kbps\":{:.0},\"effective_max_dl_shaper_rate_kbps\":{:.0},\"effective_max_ul_shaper_rate_kbps\":{:.0},\"adaptive_ceiling_dl_cap_kbps\":{:.0},\"adaptive_ceiling_ul_cap_kbps\":{:.0},\"adaptive_ceiling_dl_phase\":\"{}\",\"adaptive_ceiling_ul_phase\":\"{}\",\"adaptive_ceiling_safe_dl_kbps\":{:.0},\"adaptive_ceiling_safe_ul_kbps\":{:.0},\"adaptive_ceiling_failed_dl_kbps\":{},\"adaptive_ceiling_failed_ul_kbps\":{},\"adaptive_ceiling_probe_dl_kbps\":{},\"adaptive_ceiling_probe_ul_kbps\":{},\"adaptive_ceiling_dl_phase_elapsed_s\":{:.3},\"adaptive_ceiling_ul_phase_elapsed_s\":{:.3},\"adaptive_ceiling_dl_last_reason\":\"{}\",\"adaptive_ceiling_ul_last_reason\":\"{}\",\"cpu_total_percent\":{},\"cpu_core_percentages\":{},\"active_reflectors\":{},\"spare_reflectors\":{},\"bad_reflectors\":{},\"reflector_health\":{}}}",
+            "{{\"instance\":\"{}\",\"version\":\"{}\",\"state\":\"{}\",\"sqm_runtime_managed\":{},\"sqm_runtime_state\":\"{}\",\"sqm_runtime_healthy\":{},\"sqm_runtime_reason\":\"{}\",\"sqm_recovery_attempts\":{},\"sqm_last_recovery_at\":{},\"started_at\":{:.6},\"updated_at\":{:.6},\"dl_if\":\"{}\",\"ul_if\":\"{}\",\"reflector\":\"{}\",\"seq\":\"{}\",\"probe_timestamp\":{:.6},\"rtt_ms\":{:.3},\"dl_owd_us\":{:.1},\"ul_owd_us\":{:.1},\"dl_achieved_rate_kbps\":{:.1},\"ul_achieved_rate_kbps\":{:.1},\"dl_load_percent\":{:.1},\"ul_load_percent\":{:.1},\"dl_sum_delays\":{},\"ul_sum_delays\":{},\"dl_avg_owd_delta_us\":{:.1},\"ul_avg_owd_delta_us\":{:.1},\"cake_dl_rate_kbps\":{:.0},\"cake_ul_rate_kbps\":{:.0},\"adaptive_ceiling_enabled\":{},\"configured_max_dl_shaper_rate_kbps\":{:.0},\"configured_max_ul_shaper_rate_kbps\":{:.0},\"effective_max_dl_shaper_rate_kbps\":{:.0},\"effective_max_ul_shaper_rate_kbps\":{:.0},\"adaptive_ceiling_dl_cap_kbps\":{:.0},\"adaptive_ceiling_ul_cap_kbps\":{:.0},\"adaptive_ceiling_dl_phase\":\"{}\",\"adaptive_ceiling_ul_phase\":\"{}\",\"adaptive_ceiling_safe_dl_kbps\":{:.0},\"adaptive_ceiling_safe_ul_kbps\":{:.0},\"adaptive_ceiling_failed_dl_kbps\":{},\"adaptive_ceiling_failed_ul_kbps\":{},\"adaptive_ceiling_probe_dl_kbps\":{},\"adaptive_ceiling_probe_ul_kbps\":{},\"adaptive_ceiling_dl_phase_elapsed_s\":{:.3},\"adaptive_ceiling_ul_phase_elapsed_s\":{:.3},\"adaptive_ceiling_dl_last_reason\":\"{}\",\"adaptive_ceiling_ul_last_reason\":\"{}\",\"cpu_total_percent\":{},\"cpu_core_percentages\":{},\"active_reflectors\":{},\"spare_reflectors\":{},\"bad_reflectors\":{},\"reflector_health\":{}}}",
             json_escape(&self.cfg.instance),
             env!("CARGO_PKG_VERSION"),
             json_escape(&self.run_state),
+            self.cfg.manage_sqm && self.cfg.sqm_enabled,
+            json_escape(&self.sqm_runtime_state),
+            self.sqm_runtime_healthy,
+            json_escape(&self.sqm_runtime_reason),
+            self.sqm_recovery_attempts,
+            json_f64_or_null(self.sqm_last_recovery_at, 3),
             self.started_at,
             epoch_secs(),
             json_escape(&self.cfg.dl_if),
@@ -4653,10 +4892,41 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
     let route_check_interval = Duration::from_secs_f64(cfg.route_check_interval_s);
     let route_stability = Duration::from_secs_f64(cfg.route_stability_s);
     let mut last_route_check = Instant::now();
+    let sqm_health_interval = Duration::from_secs(SQM_RUNTIME_HEALTH_CHECK_S);
+    let mut last_sqm_health_check = Instant::now()
+        .checked_sub(sqm_health_interval)
+        .unwrap_or_else(Instant::now);
     let mut route_probes_allowed = initial_transition.probes_allowed;
     external_ip_probe.maybe_start(route_probes_allowed);
 
     while !TERMINATE.load(Ordering::SeqCst) {
+        if last_sqm_health_check.elapsed() >= sqm_health_interval {
+            last_sqm_health_check = Instant::now();
+            let (sqm_ready, sqm_recovered) = controller.ensure_managed_sqm();
+            if sqm_recovered {
+                if let Some(mut old) = pinger.take() {
+                    old.stop();
+                }
+                controller.note_probe_gap();
+                main_state = MainState::Running;
+                idle_since = None;
+                stall_started = None;
+                global_timeout_fired = false;
+                health = ReflectorHealth::new(&cfg, &active_reflectors);
+                if route_probes_allowed {
+                    pinger = Some(PingerRuntime::spawn(&cfg, &active_reflectors)?);
+                    last_reflector_response = Instant::now();
+                }
+            }
+            if !sqm_ready {
+                if let Some(mut old) = pinger.take() {
+                    old.stop();
+                }
+                controller.note_probe_gap();
+                thread::sleep(monitor_tick_timeout(&cfg));
+                continue;
+            }
+        }
         external_ip_probe.drain(&mut controller);
         if last_route_check.elapsed() >= route_check_interval {
             last_route_check = Instant::now();
@@ -4703,6 +4973,7 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
         if let Some(runtime) = transport_probe.as_mut() {
             runtime.drain(&mut controller);
         }
+        let mut sampled_rates = None;
         if pinger.is_some() {
             let timeout = if main_state == MainState::Running {
                 health.timeout(&cfg)
@@ -4738,7 +5009,8 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                             global_timeout_fired = false;
                         }
                         health.observe_sample(&cfg, &sample);
-                        controller.on_sample(sample, &active_reflectors, &health);
+                        sampled_rates =
+                            Some(controller.on_sample(sample, &active_reflectors, &health));
                         if uplink_lifecycle
                             .record_learning_sample(cfg.no_pingers.max(1).saturating_mul(3))
                         {
@@ -4836,13 +5108,24 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
         {
             controller.note_probe_gap();
         }
-        let (dl_rate, ul_rate) = controller.sample_rates();
+        let (dl_rate, ul_rate) = sampled_rates.unwrap_or_else(|| controller.sample_rates());
         let rating_load = controller.update_rating_load(now, dl_rate, ul_rate);
         if route_probes_allowed {
             if let Some(runtime) = transport_probe.as_mut() {
                 runtime.drain(&mut controller);
                 let (dl_shaper, ul_shaper) = controller.shaper_rates();
-                runtime.maybe_start(&cfg, dl_rate, ul_rate, dl_shaper, ul_shaper, &rating_load);
+                let quality_baseline_ready = controller
+                    .quality_grade
+                    .snapshot(epoch_secs())
+                    .baseline_ready;
+                runtime.maybe_start(
+                    &cfg,
+                    dl_rate,
+                    ul_rate,
+                    (dl_shaper, ul_shaper),
+                    &rating_load,
+                    quality_baseline_ready,
+                );
             }
         }
         if controller.maybe_sample_cpu() {
@@ -6547,18 +6830,21 @@ fn main() {
 mod tests {
     use super::{
         compact_graph_history_data, compact_graph_history_file, compute_history_budget,
-        default_reflectors, graph_history_line, history_safe_max_kib, irtt_target_arg,
-        max_wire_packet_size_bits_from_mtu, monitor_tick_timeout, next_spare_reflector,
-        packet_compensation_us, parse_fping_line, parse_fping_ts_line, parse_irtt_duration_us,
-        parse_irtt_line, parse_reflector_candidates, parse_tc_linklayer_overhead,
-        parse_tsping_line, parse_uci_values, pinger_command, pinger_response_interval_s,
-        reflector_bad_reflectors, reflector_health_json, reflector_spare_reflectors,
-        sample_is_stale, stall_detection_timeout, throughput_floor, transport_error_code,
-        transport_result_matches_route, uplink_error_code, Config, MemoryInfo, ReflectorHealth,
-        ReflectorState, Sample, ThroughputGuardInput, UplinkState,
+        default_reflectors, graph_history_line, history_safe_max_kib, ingress_output_targets_ifb,
+        irtt_target_arg, max_wire_packet_size_bits_from_mtu, monitor_tick_timeout,
+        next_spare_reflector, packet_compensation_us, parse_fping_line, parse_fping_ts_line,
+        parse_irtt_duration_us, parse_irtt_line, parse_reflector_candidates,
+        parse_tc_linklayer_overhead, parse_tsping_line, parse_uci_values, pinger_command,
+        pinger_response_interval_s, qdisc_output_has_cake, reflector_bad_reflectors,
+        reflector_health_json, reflector_spare_reflectors, sample_is_stale,
+        stall_detection_timeout, throughput_floor, transport_error_code,
+        transport_probe_interval_s, transport_result_matches_route, uplink_error_code, Config,
+        MemoryInfo, RateMonitor, ReflectorHealth, ReflectorState, Sample, ThroughputGuardInput,
+        UplinkState, TRANSPORT_BASELINE_LEARNING_INTERVAL_S,
     };
     use std::fs;
-    use std::time::Instant;
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn parses_single_quoted_value() {
@@ -6762,6 +7048,24 @@ mod tests {
             retention_percent: cfg.throughput_guard_retention_percent,
         });
         assert_eq!(dl_floor, cfg.base_dl_shaper_rate_kbps * 0.60);
+    }
+
+    #[test]
+    fn transport_baseline_learning_uses_a_short_temporary_interval() {
+        let cfg = Config::defaults("test".to_string());
+
+        assert_eq!(
+            transport_probe_interval_s(&cfg, false, false),
+            TRANSPORT_BASELINE_LEARNING_INTERVAL_S
+        );
+        assert_eq!(
+            transport_probe_interval_s(&cfg, false, true),
+            cfg.transport_probe_idle_interval_s
+        );
+        assert_eq!(
+            transport_probe_interval_s(&cfg, true, false),
+            cfg.transport_probe_loaded_interval_s
+        );
     }
 
     #[test]
@@ -7107,5 +7411,52 @@ mod tests {
         assert!(json.contains("\"bad\":true"));
         assert!(json.contains("\"spare\":true"));
         assert!(json.contains("\"last_rtt_ms\":12.500"));
+    }
+
+    #[test]
+    fn recognizes_cake_and_exact_ifb_redirects() {
+        assert!(qdisc_output_has_cake(
+            "qdisc cake 8001: root bandwidth 100Mbit\nqdisc ingress ffff: parent ffff:fff1"
+        ));
+        assert!(qdisc_output_has_cake(
+            "qdisc cake_mq 8002: root bandwidth 1Gbit"
+        ));
+        assert!(!qdisc_output_has_cake(
+            "qdisc mq 0: root\nqdisc fq_codel 0: parent :1"
+        ));
+
+        let redirect = "action order 1: mirred (Egress Redirect to device ifb4eth0)";
+        assert!(ingress_output_targets_ifb(redirect, "ifb4eth0"));
+        assert!(!ingress_output_targets_ifb(redirect, "ifb4eth1"));
+    }
+
+    #[test]
+    fn rate_monitor_coalesces_sub_interval_counter_bursts() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cake-autorate-rate-monitor-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let rx = root.join("rx_bytes");
+        let tx = root.join("tx_bytes");
+        fs::write(&rx, "0\n").unwrap();
+        fs::write(&tx, "0\n").unwrap();
+        let mut monitor = RateMonitor::new(rx.to_str().unwrap(), tx.to_str().unwrap()).unwrap();
+
+        fs::write(&rx, "1000000\n").unwrap();
+        fs::write(&tx, "500000\n").unwrap();
+        monitor.last = Instant::now();
+        assert_eq!(monitor.sample(), (0.0, 0.0));
+
+        thread::sleep(Duration::from_millis(30));
+        let (dl, ul) = monitor.sample();
+        assert!(dl > 200_000.0, "download delta was not retained: {dl}");
+        assert!(ul > 100_000.0, "upload delta was not retained: {ul}");
+        assert!((dl / ul - 2.0).abs() < 0.01);
+        fs::remove_dir_all(root).unwrap();
     }
 }

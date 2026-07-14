@@ -48,15 +48,15 @@ socket libraries; ordinary OpenWrt runtime dependencies remain explicit below.
 
 The current tree builds these OpenWrt 25.12.5 APKs:
 
-- `cake-autorate-rs-1.0_rc11-r1-x86_64.apk` — x86_64 autorate daemon.
-- `cake-autorate-rs-1.0_rc11-r1-aarch64_generic.apk` — rockchip/armv8
+- `cake-autorate-rs-1.0_rc12-r5-x86_64.apk` — x86_64 autorate daemon.
+- `cake-autorate-rs-1.0_rc12-r5-aarch64_generic.apk` — rockchip/armv8
   autorate daemon.
-- `luci-app-cake-autorate-rs-1.0_rc11-r1.apk` — architecture-independent LuCI
+- `luci-app-cake-autorate-rs-1.0_rc12-r5.apk` — architecture-independent LuCI
   interface and SQM integration.
 
-The daemon package installs `uci`, `fping`, and `uclient-fetch` as dependencies.
-The LuCI package installs the daemon, `luci-base`, and `sqm-scripts`; the latter
-brings the CAKE, IFB, `tc`, and `ip` runtime pieces. Native transport probes
+The daemon package installs `uci`, `fping`, `uclient-fetch`, and `sqm-scripts`
+as dependencies; the latter brings the CAKE, IFB, `tc`, and `ip` runtime
+pieces. The LuCI package installs the daemon and `luci-base`. Native transport probes
 use the daemon's statically linked rustls/webpki stack. Full Auto-Tune and the
 diagnostic legacy HTTP backend still use OpenWrt `uclient-fetch`, so the offline
 installer includes the standard mbedTLS provider when none is already present.
@@ -110,6 +110,24 @@ instead of silently mixing it into the grade, while bounded reverse TCP ACK
 traffic is explicitly allowed. Status shows the CAKE references,
 effective traffic, per-direction triggers, background, requested phase, and any
 contamination reason.
+
+RC12 fixes a directional measurement race found on a floating backup WAN. The
+fast controller, detected-rating classifier, transport trigger, and graph
+history now share the same per-interval RX/TX sample instead of consuming the
+counter delta twice. Counter bursts closer than 25 ms are coalesced so clustered
+reflector replies cannot create a false high-load peak. Managed instances also verify the real CAKE qdiscs, IFB
+counter, and ingress redirect every three seconds. A missing runtime is shown
+as an error, blocks `Get rating`, and is repaired only for that managed SQM
+target with a 30-second retry cooldown; successful recovery resets stale
+baselines and counter state before measurement resumes. Until the transport
+baseline is ready, tiny native probes temporarily run once per second instead
+of using the normal idle interval; this lets a busy WAN find short clean gaps
+and then automatically returns to the configured interval.
+If a guided run detects opposite-direction contamination, its provisional
+episode is discarded and cannot replace the last known complete rating.
+A clean guided run closes as soon as both directions have enough samples; the
+daemon commits that exact episode as the new last known result instead of
+waiting indefinitely for a completely traffic-free 30-second gap.
 
 Transport measurement/rating and transport-driven CAKE control are now separate
 options. Measurement can remain enabled for Status and Graphs while
@@ -212,6 +230,10 @@ Implemented:
   detector and supplies a bounded per-direction trigger; it never bypasses
   shaping. Automatic capture first enforces a quiet window and runs separate
   download-only and upload-only load phases.
+- The controller, rating detector, transport scheduler, and RAM graph history
+  reuse one atomic per-interval RX/TX counter sample. This prevents either
+  direction from disappearing because another consumer already advanced the
+  counter baseline.
 - `tc qdisc change ... cake bandwidth ...` shaper updates.
 - Upstream-style idle/stall handling: sustained idle can stop pingers, activity
   restarts them, and optional minimum-rate enforcement applies on sustained idle
@@ -247,6 +269,11 @@ Implemented:
   and an empty conflicting `clsact` is removed before SQM starts. Autorate now
   also requires a real ingress redirect to its IFB, so a failed download shaper
   cannot silently report all visible traffic in the upload direction.
+- While running, each managed instance checks the actual CAKE/IFB/ingress state.
+  If it disappears, probing and rating stop, Status reports the concrete
+  runtime error, and a per-interface helper performs a targeted SQM restart.
+  Attempts are serialized, deferred during a speed test, and rate-limited to
+  avoid a recovery loop.
 - LuCI setup wizard for creating instances, importing SQM rates, running a
   router-side speed test, and writing derived limits. Its normal speed-test step
   shows only rates and the test action; backend/package/headroom controls and
@@ -518,16 +545,16 @@ them together. For x86_64:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc11-r1-x86_64.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc11-r1.apk
+  /root/cake-autorate-rs-1.0_rc12-r5-x86_64.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc12-r5.apk
 ```
 
 For rockchip/armv8 (`aarch64_generic`):
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc11-r1-aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc11-r1.apk
+  /root/cake-autorate-rs-1.0_rc12-r5-aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc12-r5.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:
@@ -547,16 +574,16 @@ x86_64:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc11-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc11-x86_64.sh
+tar -xzf cake-autorate-rs-1.0-rc12-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc12-x86_64.sh
 ```
 
 Banana Pi R2 Pro and other OpenWrt 25.12.5 rockchip/armv8 devices:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc11-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc11-aarch64_generic.sh
+tar -xzf cake-autorate-rs-1.0-rc12-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc12-aarch64_generic.sh
 ```
 
 The installer resolves its own location, so it also works when the extracted

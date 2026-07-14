@@ -54,6 +54,11 @@ function qualityReadiness(section, status) {
 		return { ready: false, reason: _('Autorate instance is disabled.') };
 	if (String(section.sqm_enabled || '0') !== '1')
 		return { ready: false, reason: _('Managed SQM must be enabled.') };
+	if (status && status.sqm_runtime_managed && !status.sqm_runtime_healthy)
+		return {
+			ready: false,
+			reason: _('Managed SQM runtime is unhealthy: %s').format(status.sqm_runtime_reason || '-')
+		};
 	if (!status || !status.transport_latency_enabled)
 		return { ready: false, reason: _('Transport-aware latency must be enabled.') };
 	if (!status.route_active)
@@ -530,6 +535,13 @@ function formatState(status, enabled) {
 
 	if (!value)
 		return '-';
+	if (status.sqm_runtime_managed && !status.sqm_runtime_healthy)
+		return E('div', {
+			'title': status.sqm_runtime_reason || _('Managed SQM runtime is unhealthy.')
+		}, [
+			E('strong', { 'style': 'color:#f44' }, status.sqm_runtime_state || _('ERROR')),
+			E('small', { 'style': 'display:block;color:#f66' }, _('CAKE/IFB unavailable'))
+		]);
 
 	value = String(value).toUpperCase();
 	warning = probeWarning(status, enabled);

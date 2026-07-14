@@ -1,0 +1,9 @@
+#!/bin/sh
+
+key="$3"
+case "$key" in
+	*.enabled|*.sqm_enabled|*.manage_sqm) printf '1\n' ;;
+	*.sqm_interface|*.ul_if) printf 'eth0\n' ;;
+	*.dl_if) printf 'ifb4eth0\n' ;;
+	*) exit 1 ;;
+esac
