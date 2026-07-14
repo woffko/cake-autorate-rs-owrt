@@ -43,9 +43,9 @@ const detected = helpers.formatQuality({
 		grade: 'B', increase_ms: 45.5, started_at: Date.now() / 1000 - 10,
 		dl: { grade: 'A+' }, ul: { grade: 'B' }, partial: false, stale: false,
 	},
-	quality_grade_previous: {
+	quality_grade_last_known: {
 		grade: 'A+', increase_ms: 2.5, completed_at: Date.now() / 1000 - 60,
-		dl: { grade: 'A+' }, partial: true, stale: false,
+		dl: { grade: 'A+' }, ul: { grade: 'A+' }, partial: false, incomplete: false, stale: false,
 	},
 	quality_class: 'C',
 	effective_latency_delta_ms: 80,
@@ -68,7 +68,8 @@ const detected = helpers.formatQuality({
 assert.equal(detected.attrs.class, 'cake-quality-stack');
 assert.equal(detected.children[0].children[1].children, 'B');
 assert.match(detected.children[0].children[2].children, /DL A\+.*UL B/);
-assert.equal(detected.children[1].children[1].children, 'PARTIAL');
+assert.equal(detected.children[1].children[0].children, 'LAST KNOWN');
+assert.equal(detected.children[1].children[1].children, 'A+');
 assert.match(detected.attrs.title, /Current CAKE reference: DL 900000 kbps · UL 860000 kbps/);
 assert.match(detected.attrs.title, /Current triggers: DL 135000 kbps \(15\.0%\)/);
 
@@ -80,26 +81,27 @@ const collecting = helpers.formatQuality({
 	quality_grade_dl_samples: 2,
 	quality_grade_ul_samples: 0,
 	quality_grade_current: null,
-	quality_grade_previous: detected.children ? {
+	quality_grade_last_known: detected.children ? {
 		grade: 'A', increase_ms: 10, completed_at: Date.now() / 1000 - 30,
-		dl: { grade: 'A' }, stale: false,
+		dl: { grade: 'A' }, ul: { grade: 'A' }, partial: false, incomplete: false, stale: false,
 	} : null,
 });
 assert.equal(collecting.children[0].children[1].children, 'COLLECTING');
 assert.match(collecting.children[0].children[2].children, /DL 2\/3.*UL 0\/3/);
 assert.equal(collecting.children[1].children[1].children, 'A');
 
-const noPrevious = helpers.formatQuality({
+const noLastKnown = helpers.formatQuality({
 	transport_latency_enabled: true,
 	quality_grade_state: 'learning_baseline',
 	quality_grade_collected_samples: 0,
 	quality_grade_required_samples: 3,
 	quality_grade_current: null,
-	quality_grade_previous: null,
+	quality_grade_last_known: null,
 });
-assert.equal(noPrevious.children[0].children[1].children, 'LEARNING');
-assert.equal(noPrevious.children[1].children[1].children, '-');
-assert.equal(noPrevious.children[1].children[2].children, 'No completed rating yet');
+assert.equal(noLastKnown.children[0].children[1].children, 'LEARNING');
+assert.equal(noLastKnown.children[1].children[0].children, 'LAST KNOWN');
+assert.equal(noLastKnown.children[1].children[1].children, '-');
+assert.equal(noLastKnown.children[1].children[2].children, 'No complete rating known yet');
 
 const incomplete = helpers.formatQuality({
 	transport_latency_enabled: true,
@@ -108,9 +110,24 @@ const incomplete = helpers.formatQuality({
 		grade: 'LEARNING', increase_ms: 0, completed_at: Date.now() / 1000,
 		partial: false, incomplete: true, dl_samples: 4, ul_samples: 0,
 	},
-	quality_grade_previous: null,
+	quality_grade_last_known: {
+		grade: 'A', increase_ms: 10, completed_at: Date.now() / 1000 - 30,
+		dl: { grade: 'A' }, ul: { grade: 'A' }, partial: false, incomplete: false,
+	},
 });
 assert.equal(incomplete.children[0].children[1].children, 'INCOMPLETE');
+assert.equal(incomplete.children[1].children[1].children, 'A');
+
+const rejectedLastKnown = helpers.formatQuality({
+	transport_latency_enabled: true,
+	quality_grade_state: 'final',
+	quality_grade_current: null,
+	quality_grade_last_known: {
+		grade: 'B', increase_ms: 50, completed_at: Date.now() / 1000 - 30,
+		partial: true, incomplete: false,
+	},
+});
+assert.equal(rejectedLastKnown.children[1].children[1].children, '-');
 
 const ready = helpers.qualityReadiness({ enabled: '1', sqm_enabled: '1' }, {
 	transport_latency_enabled: true,

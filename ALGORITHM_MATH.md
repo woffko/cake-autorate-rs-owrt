@@ -99,10 +99,11 @@ Bidirectional samples are reported but excluded from `grade`. The boundaries
 are A+ for `delta < 5`, A for `< 30`, B for `< 60`, C for `< 200`, D for
 `< 400`, and F otherwise. At least 20 idle samples and 20 loaded samples per
 scored direction are required. A one-direction result is `PARTIAL` and is never
-shown as a final grade. `CURRENT` is the active/latest result; `PREVIOUS` is the
-last completed episode and remains visible while another episode collects. An
-episode finalizes after 30 seconds without accepted directional loaded samples
-by default. All
+shown as a final grade. `CURRENT` is the active/latest attempt and can therefore
+be collecting, partial, or incomplete. `LAST KNOWN` is the most recent complete
+DL+UL result and remains unchanged by partial/incomplete attempts. An episode
+finalizes after 30 seconds without accepted directional loaded samples by
+default. All
 these samples are scoped to `I_u`; after a route change the retained result is
 explicitly stale and cannot be combined with new samples.
 

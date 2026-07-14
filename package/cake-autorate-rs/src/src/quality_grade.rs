@@ -44,7 +44,7 @@ impl QualityGradeResult {
 pub struct QualityGradeSnapshot {
     pub state: &'static str,
     pub current: Option<QualityGradeResult>,
-    pub previous: Option<QualityGradeResult>,
+    pub last_known: Option<QualityGradeResult>,
     pub collected_samples: usize,
     pub required_samples: usize,
     pub baseline_samples: usize,
@@ -55,7 +55,7 @@ pub struct QualityGradeSnapshot {
     pub finalize_remaining_s: Option<f64>,
     pub baseline_ready: bool,
     pub current_stale: bool,
-    pub previous_stale: bool,
+    pub last_known_stale: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -152,7 +152,7 @@ pub struct QualityGradeTracker {
     baselines: HashMap<String, VecDeque<f64>>,
     active: Option<ActiveWindow>,
     latest: Option<QualityGradeResult>,
-    previous: Option<QualityGradeResult>,
+    last_known: Option<QualityGradeResult>,
     route_identity: String,
     session_grace_s: f64,
 }
@@ -163,7 +163,7 @@ impl QualityGradeTracker {
             baselines: HashMap::new(),
             active: None,
             latest: None,
-            previous: None,
+            last_known: None,
             route_identity: String::new(),
             session_grace_s: session_grace_s.max(1.0),
         }
@@ -257,26 +257,27 @@ impl QualityGradeTracker {
             .baselines
             .values()
             .any(|samples| samples.len() >= MIN_BASELINE_SAMPLES);
-        let (state, current, previous, collected_samples) = if let Some(active) = &self.active {
+        let (state, current, collected_samples) = if let Some(active) = &self.active {
             let current = active.result(None);
             let state = if current.is_some() {
                 "provisional"
             } else {
                 "collecting"
             };
-            (state, current, self.latest.clone(), active.samples())
+            (state, current, active.samples())
         } else if let Some(latest) = &self.latest {
-            ("final", Some(latest.clone()), self.previous.clone(), 0)
+            ("final", Some(latest.clone()), 0)
         } else if baseline_ready {
-            ("baseline_ready", None, None, 0)
+            ("baseline_ready", None, 0)
         } else {
-            ("learning_baseline", None, None, 0)
+            ("learning_baseline", None, 0)
         };
+        let last_known = self.last_known.clone();
         let current_stale = current
             .as_ref()
             .map(|result| result.route_identity != self.route_identity)
             .unwrap_or(false);
-        let previous_stale = previous
+        let last_known_stale = last_known
             .as_ref()
             .map(|result| result.route_identity != self.route_identity)
             .unwrap_or(false);
@@ -296,7 +297,7 @@ impl QualityGradeTracker {
         QualityGradeSnapshot {
             state,
             current,
-            previous,
+            last_known,
             collected_samples,
             required_samples: MIN_LOADED_SAMPLES,
             baseline_samples,
@@ -307,7 +308,7 @@ impl QualityGradeTracker {
             finalize_remaining_s,
             baseline_ready,
             current_stale,
-            previous_stale,
+            last_known_stale,
         }
     }
 
@@ -321,7 +322,11 @@ impl QualityGradeTracker {
         let Some(result) = active.result(Some(timestamp)) else {
             return;
         };
-        self.previous = self.latest.replace(result);
+        let is_complete = !result.partial && !result.incomplete;
+        self.latest = Some(result.clone());
+        if is_complete {
+            self.last_known = Some(result);
+        }
     }
 
     fn baseline_p5(&self, endpoint: &str) -> Option<f64> {
@@ -403,37 +408,77 @@ mod tests {
         }
     }
 
+    fn complete_result(
+        tracker: &mut QualityGradeTracker,
+        endpoint: &str,
+        route: &str,
+        started_at: f64,
+        dl_latency_ms: f64,
+        ul_latency_ms: f64,
+    ) {
+        for index in 0..MIN_LOADED_SAMPLES {
+            tracker.observe(
+                endpoint,
+                dl_latency_ms,
+                true,
+                false,
+                started_at + index as f64,
+                route,
+            );
+        }
+        for index in 0..MIN_LOADED_SAMPLES {
+            tracker.observe(
+                endpoint,
+                ul_latency_ms,
+                false,
+                true,
+                started_at + MIN_LOADED_SAMPLES as f64 + index as f64,
+                route,
+            );
+        }
+        tracker.observe(endpoint, 11.0, false, false, started_at + 80.0, route);
+    }
+
     #[test]
-    fn current_and_previous_survive_the_next_collection_window() {
+    fn last_known_changes_only_after_a_complete_result() {
         let mut tracker = QualityGradeTracker::new(30.0);
         seed_baseline(&mut tracker, "endpoint", "route-a");
+        complete_result(&mut tracker, "endpoint", "route-a", 30.0, 12.0, 40.0);
+        let accepted = tracker.snapshot(115.0);
+        assert_eq!(accepted.state, "final");
+        assert_eq!(accepted.current.as_ref().unwrap().class, QualityClass::B);
+        assert_eq!(accepted.last_known.as_ref().unwrap().class, QualityClass::B);
+
+        tracker.observe("endpoint", 80.0, false, true, 120.0, "route-a");
+        tracker.observe("endpoint", 11.0, false, false, 160.0, "route-a");
+        let incomplete = tracker.snapshot(165.0);
+        assert!(incomplete.current.as_ref().unwrap().incomplete);
+        assert_eq!(
+            incomplete.last_known.as_ref().unwrap().class,
+            QualityClass::B
+        );
+
         for index in 0..MIN_LOADED_SAMPLES {
             tracker.observe(
                 "endpoint",
-                12.0 + (index % 3) as f64,
+                12.0,
                 true,
                 false,
-                30.0 + index as f64,
+                180.0 + index as f64,
                 "route-a",
             );
         }
-        let live = tracker.snapshot(50.0);
-        assert_eq!(live.state, "provisional");
-        assert_eq!(live.current.as_ref().unwrap().class, QualityClass::APlus);
-        assert!(live.previous.is_none());
+        tracker.observe("endpoint", 11.0, false, false, 240.0, "route-a");
+        let partial = tracker.snapshot(245.0);
+        assert!(partial.current.as_ref().unwrap().partial);
+        assert_eq!(partial.current.as_ref().unwrap().class, QualityClass::APlus);
+        assert_eq!(partial.last_known.as_ref().unwrap().class, QualityClass::B);
 
-        tracker.observe("endpoint", 11.0, false, false, 85.0, "route-a");
-        let finished = tracker.snapshot(90.0);
-        assert_eq!(finished.state, "final");
-        assert!(finished.current.as_ref().unwrap().completed_at.is_some());
-
-        tracker.observe("endpoint", 80.0, false, true, 100.0, "route-a");
-        let collecting = tracker.snapshot(110.0);
-        assert_eq!(collecting.state, "provisional");
-        assert!(collecting.current.as_ref().unwrap().incomplete);
+        complete_result(&mut tracker, "endpoint", "route-a", 260.0, 12.0, 100.0);
+        let replacement = tracker.snapshot(345.0);
         assert_eq!(
-            collecting.previous.as_ref().unwrap().class,
-            QualityClass::APlus
+            replacement.last_known.as_ref().unwrap().class,
+            QualityClass::C
         );
     }
 
@@ -459,6 +504,7 @@ mod tests {
         assert_eq!(snapshot.ul_samples, 0);
         assert_eq!(snapshot.state, "final");
         assert!(snapshot.current.as_ref().unwrap().incomplete);
+        assert!(snapshot.last_known.is_none());
 
         tracker.observe("endpoint", 20.0, false, true, 42.0, "route-a");
         let next = tracker.snapshot(42.0);
@@ -509,20 +555,11 @@ mod tests {
     fn route_change_keeps_last_result_but_marks_it_stale() {
         let mut tracker = QualityGradeTracker::new(30.0);
         seed_baseline(&mut tracker, "endpoint", "route-a");
-        for index in 0..MIN_LOADED_SAMPLES {
-            tracker.observe(
-                "endpoint",
-                12.0,
-                true,
-                false,
-                30.0 + index as f64,
-                "route-a",
-            );
-        }
-        tracker.observe("endpoint", 11.0, false, false, 85.0, "route-a");
+        complete_result(&mut tracker, "endpoint", "route-a", 30.0, 12.0, 40.0);
         tracker.set_route("route-b");
-        let snapshot = tracker.snapshot(100.0);
+        let snapshot = tracker.snapshot(115.0);
         assert!(snapshot.current_stale);
+        assert!(snapshot.last_known_stale);
         assert!(!snapshot.baseline_ready);
     }
 

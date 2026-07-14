@@ -3834,10 +3834,7 @@ impl Controller {
             )
         });
         let grade_snapshot = self.quality_grade.snapshot(epoch_secs());
-        let grade_result = grade_snapshot
-            .current
-            .as_ref()
-            .filter(|result| !result.incomplete);
+        let grade_result = grade_snapshot.last_known.as_ref();
         let line = graph_history_line(
             now,
             rtt_ms,
@@ -4336,7 +4333,7 @@ impl Controller {
         file.seek(SeekFrom::End(-2))?;
         write!(
             file,
-            ",\"quality_grade_method\":\"transport_rtt_p90_loaded_minus_p5_idle_v4\",\"quality_grade_state\":\"{}\",\"quality_grade_collected_samples\":{},\"quality_grade_required_samples\":{},\"quality_grade_baseline_ready\":{},\"quality_grade_baseline_samples\":{},\"quality_grade_baseline_required_samples\":{},\"quality_grade_dl_samples\":{},\"quality_grade_ul_samples\":{},\"quality_grade_bidirectional_samples\":{},\"quality_grade_finalize_remaining_s\":{},\"quality_grade_current\":{},\"quality_grade_previous\":{},\"rating_load_phase\":\"{}\",\"rating_load_candidate\":\"{}\",\"rating_load_raw_dl_percent\":{:.3},\"rating_load_raw_ul_percent\":{:.3},\"rating_load_smoothed_dl_percent\":{:.3},\"rating_load_smoothed_ul_percent\":{:.3},\"rating_load_aggregate_dl_kbps\":{:.3},\"rating_load_aggregate_ul_kbps\":{:.3},\"rating_load_effective_dl_kbps\":{:.3},\"rating_load_effective_ul_kbps\":{:.3},\"rating_load_reference_dl_kbps\":{:.3},\"rating_load_reference_ul_kbps\":{:.3},\"rating_load_enter_percent\":{:.3},\"rating_load_exit_percent\":{:.3},\"rating_load_enter_dl_percent\":{:.3},\"rating_load_enter_ul_percent\":{:.3},\"rating_load_exit_dl_percent\":{:.3},\"rating_load_exit_ul_percent\":{:.3},\"rating_load_enter_dl_kbps\":{:.3},\"rating_load_enter_ul_kbps\":{:.3},\"rating_load_phase_age_s\":{:.3},\"rating_capture_active\":{},\"rating_capture_mode\":\"{}\",\"rating_capture_requested_phase\":\"{}\",\"rating_capture_background_dl_kbps\":{:.3},\"rating_capture_background_ul_kbps\":{:.3},\"rating_capture_peak_dl_percent\":{:.3},\"rating_capture_peak_ul_percent\":{:.3},\"rating_capture_contaminated\":{},\"rating_capture_contamination_reason\":\"{}\",\"graph_history_enabled\":{},\"graph_history_budget_mode\":\"{}\",\"graph_history_configured_budget_kib\":{},\"graph_history_safe_max_kib\":{},\"graph_history_effective_total_kib\":{},\"graph_history_instance_budget_kib\":{},\"graph_history_used_total_kib\":{},\"graph_history_used_instance_kib\":{},\"graph_history_stored_samples\":{},\"graph_history_instances\":{},\"graph_history_mem_total_kib\":{},\"graph_history_mem_available_kib\":{},\"graph_history_paused_low_memory\":{}",
+            ",\"quality_grade_method\":\"transport_rtt_p90_loaded_minus_p5_idle_v4\",\"quality_grade_state\":\"{}\",\"quality_grade_collected_samples\":{},\"quality_grade_required_samples\":{},\"quality_grade_baseline_ready\":{},\"quality_grade_baseline_samples\":{},\"quality_grade_baseline_required_samples\":{},\"quality_grade_dl_samples\":{},\"quality_grade_ul_samples\":{},\"quality_grade_bidirectional_samples\":{},\"quality_grade_finalize_remaining_s\":{},\"quality_grade_current\":{},\"quality_grade_last_known\":{},\"rating_load_phase\":\"{}\",\"rating_load_candidate\":\"{}\",\"rating_load_raw_dl_percent\":{:.3},\"rating_load_raw_ul_percent\":{:.3},\"rating_load_smoothed_dl_percent\":{:.3},\"rating_load_smoothed_ul_percent\":{:.3},\"rating_load_aggregate_dl_kbps\":{:.3},\"rating_load_aggregate_ul_kbps\":{:.3},\"rating_load_effective_dl_kbps\":{:.3},\"rating_load_effective_ul_kbps\":{:.3},\"rating_load_reference_dl_kbps\":{:.3},\"rating_load_reference_ul_kbps\":{:.3},\"rating_load_enter_percent\":{:.3},\"rating_load_exit_percent\":{:.3},\"rating_load_enter_dl_percent\":{:.3},\"rating_load_enter_ul_percent\":{:.3},\"rating_load_exit_dl_percent\":{:.3},\"rating_load_exit_ul_percent\":{:.3},\"rating_load_enter_dl_kbps\":{:.3},\"rating_load_enter_ul_kbps\":{:.3},\"rating_load_phase_age_s\":{:.3},\"rating_capture_active\":{},\"rating_capture_mode\":\"{}\",\"rating_capture_requested_phase\":\"{}\",\"rating_capture_background_dl_kbps\":{:.3},\"rating_capture_background_ul_kbps\":{:.3},\"rating_capture_peak_dl_percent\":{:.3},\"rating_capture_peak_ul_percent\":{:.3},\"rating_capture_contaminated\":{},\"rating_capture_contamination_reason\":\"{}\",\"graph_history_enabled\":{},\"graph_history_budget_mode\":\"{}\",\"graph_history_configured_budget_kib\":{},\"graph_history_safe_max_kib\":{},\"graph_history_effective_total_kib\":{},\"graph_history_instance_budget_kib\":{},\"graph_history_used_total_kib\":{},\"graph_history_used_instance_kib\":{},\"graph_history_stored_samples\":{},\"graph_history_instances\":{},\"graph_history_mem_total_kib\":{},\"graph_history_mem_available_kib\":{},\"graph_history_paused_low_memory\":{}",
             json_escape(quality_grade.state),
             quality_grade.collected_samples,
             quality_grade.required_samples,
@@ -4352,8 +4349,8 @@ impl Controller {
                 quality_grade.current_stale,
             ),
             quality_grade_result_json(
-                quality_grade.previous.as_ref(),
-                quality_grade.previous_stale,
+                quality_grade.last_known.as_ref(),
+                quality_grade.last_known_stale,
             ),
             self.rating_load_snapshot.phase.as_str(),
             self.rating_load_snapshot.candidate.as_str(),

@@ -30,9 +30,10 @@ idle and per-direction p90 loaded windows, CPU/load-phase rejection, and two
 confirmed bad windows before optional control. Measurement-only mode must leave
 all CAKE rates unchanged. Detected-grade tests cover the 2 ms noise clamp,
 worse-of-download/upload selection, `PARTIAL` one-direction evidence,
-bidirectional exclusion, route-change staleness, and `CURRENT`/`PREVIOUS`
-lifecycle. Graph acceptance checks the
-proportional RAM tiers, critical-memory suspension, shared per-instance budget,
+bidirectional exclusion, route-change staleness, and `CURRENT`/`LAST KNOWN`
+lifecycle. Incomplete and partial attempts must not replace `LAST KNOWN`. Graph
+acceptance checks the proportional RAM tiers, critical-memory suspension,
+shared per-instance budget,
 streaming compaction, bounded history paging, vertical WAN cards, grade-event
 hover details, and fixed non-scrolling axis labels.
 
@@ -323,9 +324,9 @@ All runtime status files parsed as JSON and reported daemon version
 `1.0.0-rc.7`. The two-uplink router retained independent route identities and
 histories for its active primary and standby backup. The WWAN router retained
 its main-route identity and custom rates. The Status page displayed the live
-`CURRENT` detected-rating lifecycle and the last completed `PREVIOUS` result;
-before any result has completed, the latter explicitly reads
-`No completed rating yet` rather than implying a second learning cycle.
+detected-rating lifecycle and a retained completed-result slot; before any
+result had completed, the latter explicitly reported that no completed rating
+existed rather than implying a second learning cycle.
 
 RAM budgeting was checked at two materially different memory sizes. A
 disposable router with roughly 0.7 GiB available RAM exposed a 16 MiB safe
@@ -343,7 +344,7 @@ routers. They verified:
 - synchronized latency/CPU and download/upload canvases;
 - Y-axis labels remaining fixed during horizontal timeline scrolling;
 - exact RTT, CPU, DL, UL, floor, state, and grade values on hover;
-- current/previous detected-rating labels and the empty-previous state;
+- current/retained detected-rating labels and the empty last-known state;
 - dynamic RAM preset disabling, usage, per-instance share, and history span;
 - no application console or page exception after authentication; and
 - no horizontal overflow at a 390 px mobile viewport.

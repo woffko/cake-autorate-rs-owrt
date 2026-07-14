@@ -373,7 +373,7 @@ function renderDetectedGrade(label, result, state, collected, required, dlSample
 	if (!result) {
 		if (state === 'none') {
 			value = '-';
-			detail = _('No completed rating yet');
+			detail = _('No complete rating known yet');
 		} else if (state === 'collecting') {
 			value = _('COLLECTING');
 			detail = _('DL %d/%d · UL %d/%d').format(
@@ -415,7 +415,9 @@ function formatQuality(status) {
 
 	if (status.quality_grade_state) {
 		var current = status.quality_grade_current || null;
-		var previous = status.quality_grade_previous || null;
+		var lastKnown = status.quality_grade_last_known || null;
+		if (lastKnown && (lastKnown.partial || lastKnown.incomplete))
+			lastKnown = null;
 		var state = String(status.quality_grade_state || 'learning_baseline');
 		var title = [
 			_('Detected rating uses network RTT loaded p90 minus the preceding idle p5. DNS, process startup, and connection handshake time are excluded.'),
@@ -465,7 +467,7 @@ function formatQuality(status) {
 			renderDetectedGrade(_('CURRENT'), current, state,
 				status.quality_grade_collected_samples, status.quality_grade_required_samples,
 				status.quality_grade_dl_samples, status.quality_grade_ul_samples),
-			renderDetectedGrade(_('PREVIOUS'), previous, previous ? 'final' : 'none', 0, 0, 0, 0)
+			renderDetectedGrade(_('LAST KNOWN'), lastKnown, lastKnown ? 'final' : 'none', 0, 0, 0, 0)
 		]);
 	}
 

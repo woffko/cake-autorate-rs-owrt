@@ -48,15 +48,15 @@ socket libraries; ordinary OpenWrt runtime dependencies remain explicit below.
 
 The current tree builds these OpenWrt 25.12.5 APKs:
 
-- `cake-autorate-rs-1.0_rc10-r1-x86_64.apk` — x86_64 autorate daemon.
-- `cake-autorate-rs-1.0_rc10-r1-aarch64_generic.apk` — rockchip/armv8
+- `cake-autorate-rs-1.0_rc11-r1-x86_64.apk` — x86_64 autorate daemon.
+- `cake-autorate-rs-1.0_rc11-r1-aarch64_generic.apk` — rockchip/armv8
   autorate daemon.
-- `luci-app-cake-autorate-rs-1.0_rc10-r1.apk` — architecture-independent LuCI
+- `luci-app-cake-autorate-rs-1.0_rc11-r1.apk` — architecture-independent LuCI
   interface and SQM integration.
 
 The daemon package installs `uci`, `fping`, and `uclient-fetch` as dependencies.
 The LuCI package installs the daemon, `luci-base`, and `sqm-scripts`; the latter
-brings the CAKE, IFB, `tc`, and `ip` runtime pieces. Native RC10 transport probes
+brings the CAKE, IFB, `tc`, and `ip` runtime pieces. Native transport probes
 use the daemon's statically linked rustls/webpki stack. Full Auto-Tune and the
 diagnostic legacy HTTP backend still use OpenWrt `uclient-fetch`, so the offline
 installer includes the standard mbedTLS provider when none is already present.
@@ -85,8 +85,9 @@ TCP-connect and persistent HTTP are comparison fallbacks. DNS, process startup,
 TCP/TLS, and protocol handshakes are outside the scored clock. Four raw RTT
 observations are filtered per batch, every rating needs at least 20 idle and 20
 loaded samples, and download/upload have independent windows. Status displays
-`CURRENT` plus the retained `PREVIOUS` result; a one-direction result is labeled
-`PARTIAL`, never presented as a final connection grade.
+`CURRENT` plus `LAST KNOWN`. The latter changes only after a complete DL+UL
+result; a one-direction result is labeled `PARTIAL` and never replaces the last
+known connection grade.
 
 RC9 fixes passive grade collection from ordinary routed client traffic. Rating
 load classification no longer reuses the autorate controller's instantaneous
@@ -94,7 +95,7 @@ load classification no longer reuses the autorate controller's instantaneous
 60% enter / 40% exit hysteresis, a one-second direction hold, a 1.5-second
 dropout grace, and independent DL/UL dominance. Status exposes the phase,
 raw/smoothed load, directional counts, finalization countdown, `CURRENT`, and
-retained `PREVIOUS`. A per-instance `Get rating` action can either generate
+retained `LAST KNOWN`. A per-instance `Get rating` action can either generate
 shaped router-side load or wait for a sequential client test; neither mode
 disables SQM/autorate, changes CAKE limits, or stores samples in flash.
 
@@ -517,16 +518,16 @@ them together. For x86_64:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc10-r1-x86_64.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc10-r1.apk
+  /root/cake-autorate-rs-1.0_rc11-r1-x86_64.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc11-r1.apk
 ```
 
 For rockchip/armv8 (`aarch64_generic`):
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc10-r1-aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc10-r1.apk
+  /root/cake-autorate-rs-1.0_rc11-r1-aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc11-r1.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:
@@ -546,16 +547,16 @@ x86_64:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc9-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc9-x86_64.sh
+tar -xzf cake-autorate-rs-1.0-rc11-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc11-x86_64.sh
 ```
 
 Banana Pi R2 Pro and other OpenWrt 25.12.5 rockchip/armv8 devices:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc9-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc9-aarch64_generic.sh
+tar -xzf cake-autorate-rs-1.0-rc11-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc11-aarch64_generic.sh
 ```
 
 The installer resolves its own location, so it also works when the extracted

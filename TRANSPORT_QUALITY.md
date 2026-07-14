@@ -137,11 +137,11 @@ lower the overall grade.
 | 400 ms or more | F |
 
 One-direction evidence is shown as `PARTIAL`, never as a final connection
-grade. `CURRENT` shows the active/latest episode and `PREVIOUS` retains the
-last completed episode while a new one is collecting. Results record p5, p90,
-sample counts, direction, completion time, endpoint, and route identity. A
-route change marks retained results stale rather than combining old and new
-paths.
+grade. `CURRENT` shows the active/latest attempt, including a partial or
+incomplete result. `LAST KNOWN` retains only the most recent complete DL+UL
+grade; partial/incomplete attempts never overwrite it. Results record p5, p90,
+sample counts, direction, completion time, endpoint, and route identity. A route
+change marks retained results stale rather than combining old and new paths.
 
 The compatibility reference is the live
 [LibreQoS Internet Quality Test](https://test.libreqos.com/advanced/) and its
@@ -159,7 +159,7 @@ enough evidence, with a maximum of three passes.
 `Guided client capture` waits while the user runs sequential download and
 upload load through the router. Before either mode starts, the helper requires a
 quiet window, records the per-direction background, and starts a fresh rating
-episode without discarding the previous result. Both modes arm a RAM-only
+episode without discarding the last known complete result. Both modes arm a RAM-only
 bounded marker which subtracts that background and lets the same detector learn
 separate conservative thresholds from the DL and UL peaks:
 
