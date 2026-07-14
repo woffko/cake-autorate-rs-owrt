@@ -21,6 +21,8 @@ does not claim authorship of the original cake-autorate concept.
 
 ## Documentation
 
+- [Quick setup guide](SETUP_GUIDE.md) covers a clean installation, the first
+  instance, Full Auto-Tune, conservative retry, Status/Quality and Multi-WAN.
 - [Controller mathematics](ALGORITHM_MATH.md) describes rate measurement,
   delay baselines, bufferbloat detection, the fast rate controller, and the
   bounded adaptive-ceiling state machine with formulas and examples.
@@ -48,10 +50,10 @@ socket libraries; ordinary OpenWrt runtime dependencies remain explicit below.
 
 The current tree builds these OpenWrt 25.12.5 APKs:
 
-- `cake-autorate-rs-1.0_rc12-r5-x86_64.apk` — x86_64 autorate daemon.
-- `cake-autorate-rs-1.0_rc12-r5-aarch64_generic.apk` — rockchip/armv8
+- `cake-autorate-rs-1.0_rc13-r1-x86_64.apk` — x86_64 autorate daemon.
+- `cake-autorate-rs-1.0_rc13-r1-aarch64_generic.apk` — rockchip/armv8
   autorate daemon.
-- `luci-app-cake-autorate-rs-1.0_rc12-r5.apk` — architecture-independent LuCI
+- `luci-app-cake-autorate-rs-1.0_rc13-r1.apk` — architecture-independent LuCI
   interface and SQM integration.
 
 The daemon package installs `uci`, `fping`, `uclient-fetch`, and `sqm-scripts`
@@ -128,6 +130,24 @@ episode is discarded and cannot replace the last known complete rating.
 A clean guided run closes as soon as both directions have enough samples; the
 daemon commits that exact episode as the new last known result instead of
 waiting indefinitely for a completely traffic-free 30-second gap.
+
+RC13 makes a clean installation instance-free: the package supplies only the
+global RAM-history policy until the user creates an uplink in LuCI. Status now
+defaults to Instance, Uplink/State, Quality and Get rating; a global **List
+columns** menu can add route, timestamps, reflectors, RTT, achieved traffic,
+CAKE rates and CPU without restarting the daemon. Desktop Status uses the
+available viewport, narrow screens use per-instance cards, and graph events
+share a synchronized two-lane label layout so close LEARNING/route/rating
+markers do not overlap.
+
+Settings are grouped into Autorate setup, SQM setup, Testing & Auto-Tune,
+Monitoring and Advanced. Every instance row provides **Re-run Auto-Tune**
+before Edit/Delete. Strict calibration now stops on measurable background
+traffic and offers Retry, Cancel, or an explicit one-run conservative mode.
+Conservative proposals are marked low-confidence, subtract the measured
+background plus safety margin, never raise a confirmed maximum or adaptive
+cap, and retain any unusable direction. See the [quick setup
+guide](SETUP_GUIDE.md) for the recommended workflow.
 
 Transport measurement/rating and transport-driven CAKE control are now separate
 options. Measurement can remain enabled for Status and Graphs while
@@ -545,16 +565,16 @@ them together. For x86_64:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc12-r5-x86_64.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc12-r5.apk
+  /root/cake-autorate-rs-1.0_rc13-r1-x86_64.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc13-r1.apk
 ```
 
 For rockchip/armv8 (`aarch64_generic`):
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc12-r5-aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc12-r5.apk
+  /root/cake-autorate-rs-1.0_rc13-r1-aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc13-r1.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:
@@ -574,16 +594,16 @@ x86_64:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc12-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc12-x86_64.sh
+tar -xzf cake-autorate-rs-1.0-rc13-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc13-x86_64.sh
 ```
 
 Banana Pi R2 Pro and other OpenWrt 25.12.5 rockchip/armv8 devices:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc12-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc12-aarch64_generic.sh
+tar -xzf cake-autorate-rs-1.0-rc13-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc13-aarch64_generic.sh
 ```
 
 The installer resolves its own location, so it also works when the extracted
@@ -606,10 +626,14 @@ Optional MQTT support can be installed from LuCI or manually:
 apk add mosquitto-client-nossl
 ```
 
-Then edit `/etc/config/cake-autorate` or use LuCI:
+Fresh installs contain no autorate instance and do not create an SQM queue.
+Create the first one in **Network → CAKE Autorate SQM → Settings** as described
+in the [quick setup guide](SETUP_GUIDE.md). After staging the Review result,
+use **Save & Apply**. Existing package upgrades retain all configured
+instances. To enable an already-created instance named `wan_sqm` from SSH:
 
 ```sh
-uci set cake-autorate.primary.enabled='1'
+uci set cake-autorate.wan_sqm.enabled='1'
 uci commit cake-autorate
 /etc/init.d/cake-autorate enable
 /etc/init.d/cake-autorate restart
@@ -619,8 +643,8 @@ Graph history is opt-in per instance. The same switch is available on the
 LuCI `Graphs` page; from the shell it can be changed with:
 
 ```sh
-uci set cake-autorate.primary.graph_history_enabled='1'  # use '0' to disable
-uci set cake-autorate.primary.graph_history_interval_s='10'  # accepted: 1-60
+uci set cake-autorate.wan_sqm.graph_history_enabled='1'  # use '0' to disable
+uci set cake-autorate.wan_sqm.graph_history_interval_s='10'  # accepted: 1-60
 uci set cake-autorate.globals.graph_history_ram_budget_kib='auto'
 uci commit cake-autorate
 /etc/init.d/cake-autorate restart
@@ -641,21 +665,21 @@ history. Files are removed on service stop/reboot and never stored in flash.
 ## Quick Checks
 
 ```sh
-cake-autorated --instance primary --dump-config
-cake-autorated --instance primary --once
-cat /var/run/cake-autorate/primary/status.json
-/usr/libexec/cake-autorate-rs/speedtest primary "" status auto
-/usr/libexec/cake-autorate-rs/quality-test primary status
-/usr/libexec/cake-autorate-rs/mqtt-status primary status
+cake-autorated --instance wan_sqm --dump-config
+cake-autorated --instance wan_sqm --once
+cat /var/run/cake-autorate/wan_sqm/status.json
+/usr/libexec/cake-autorate-rs/speedtest wan_sqm "" status auto
+/usr/libexec/cake-autorate-rs/quality-test wan_sqm status
+/usr/libexec/cake-autorate-rs/mqtt-status wan_sqm status
 ```
 
 For a no-shaper smoke test, disable both shaper adjustment flags:
 
 ```sh
-uci set cake-autorate.primary.adjust_dl_shaper_rate='0'
-uci set cake-autorate.primary.adjust_ul_shaper_rate='0'
+uci set cake-autorate.wan_sqm.adjust_dl_shaper_rate='0'
+uci set cake-autorate.wan_sqm.adjust_ul_shaper_rate='0'
 uci commit cake-autorate
-cake-autorated --instance primary --once
+cake-autorated --instance wan_sqm --once
 ```
 
 For `ping` fallback and CPU/log smoke tests, use a temporary disabled-rate

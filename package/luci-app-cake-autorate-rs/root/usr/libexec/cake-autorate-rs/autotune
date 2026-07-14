@@ -6,6 +6,7 @@ mode="${3:-status}"
 backend="${4:-auto}"
 route_mode_override="${5:-}"
 mwan3_member_override="${6:-}"
+conservative_override="${7:-0}"
 
 job_root="${CAKE_AUTORATE_AUTOTUNE_DIR:-/tmp/cake-autorate-autotune}"
 speedtest_bin="${CAKE_AUTORATE_SPEEDTEST:-/usr/libexec/cake-autorate-rs/speedtest}"
@@ -66,6 +67,85 @@ write_status() {
 	progress="$2"
 	message="$3"
 	atomic_write "$status_file" "{\"state\":\"running\",\"phase\":\"$(json_escape "$phase")\",\"progress\":$progress,\"message\":\"$(json_escape "$message")\"}"
+}
+
+configured_rate() {
+	direction="$1"
+	case "$direction" in
+		dl) keys="sqm_download base_dl_shaper_rate_kbps max_dl_shaper_rate_kbps" ;;
+		ul) keys="sqm_upload base_ul_shaper_rate_kbps max_ul_shaper_rate_kbps" ;;
+	esac
+	for key in $keys; do
+		value="$(uci -q get "cake-autorate.$job_name.$key" 2>/dev/null)"
+		if is_positive_uint "$value"; then
+			printf '%s\n' "$value"
+			return 0
+		fi
+	done
+	printf '%s\n' 20000
+}
+
+measure_background_traffic() {
+	if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_PREFLIGHT:-0}" = 1 ]; then
+		background_dl_kbps="${CAKE_AUTORATE_AUTOTUNE_BACKGROUND_DL_KBPS:-0}"
+		background_ul_kbps="${CAKE_AUTORATE_AUTOTUNE_BACKGROUND_UL_KBPS:-0}"
+	else
+		duration="${CAKE_AUTORATE_AUTOTUNE_BACKGROUND_SAMPLE_S:-3}"
+		case "$duration" in ''|*[!0-9]*) duration=3 ;; esac
+		[ "$duration" -ge 1 ] 2>/dev/null || duration=3
+		rx_before="$(sed -n '1p' "/sys/class/net/$target_if/statistics/rx_bytes" 2>/dev/null)"
+		tx_before="$(sed -n '1p' "/sys/class/net/$target_if/statistics/tx_bytes" 2>/dev/null)"
+		sleep "$duration"
+		rx_after="$(sed -n '1p' "/sys/class/net/$target_if/statistics/rx_bytes" 2>/dev/null)"
+		tx_after="$(sed -n '1p' "/sys/class/net/$target_if/statistics/tx_bytes" 2>/dev/null)"
+		background_dl_kbps="$(awk -v a="${rx_after:-0}" -v b="${rx_before:-0}" -v s="$duration" 'BEGIN { d=a-b; if (d<0)d=0; printf "%.0f", d*8/s/1000 }')"
+		background_ul_kbps="$(awk -v a="${tx_after:-0}" -v b="${tx_before:-0}" -v s="$duration" 'BEGIN { d=a-b; if (d<0)d=0; printf "%.0f", d*8/s/1000 }')"
+	fi
+
+	dl_reference="$(configured_rate dl)"
+	ul_reference="$(configured_rate ul)"
+	background_dl_limit="$(awk -v r="$dl_reference" 'BEGIN { v=r*0.05; if(v<1000)v=1000; printf "%.0f",v }')"
+	background_ul_limit="$(awk -v r="$ul_reference" 'BEGIN { v=r*0.05; if(v<1000)v=1000; printf "%.0f",v }')"
+	background_dl_hard="$(awk -v r="$dl_reference" 'BEGIN { v=r*0.35; if(v<5000)v=5000; printf "%.0f",v }')"
+	background_ul_hard="$(awk -v r="$ul_reference" 'BEGIN { v=r*0.35; if(v<5000)v=5000; printf "%.0f",v }')"
+	background_blocked=false
+	[ "$background_dl_kbps" -le "$background_dl_limit" ] 2>/dev/null || background_blocked=true
+	[ "$background_ul_kbps" -le "$background_ul_limit" ] 2>/dev/null || background_blocked=true
+	background_dl_usable=true
+	background_ul_usable=true
+	[ "$background_dl_kbps" -le "$background_dl_hard" ] 2>/dev/null || background_dl_usable=false
+	[ "$background_ul_kbps" -le "$background_ul_hard" ] 2>/dev/null || background_ul_usable=false
+}
+
+background_json() {
+	printf '{"download_kbps":%s,"upload_kbps":%s,"strict_download_limit_kbps":%s,"strict_upload_limit_kbps":%s,"download_usable":%s,"upload_usable":%s}' \
+		"${background_dl_kbps:-0}" "${background_ul_kbps:-0}" \
+		"${background_dl_limit:-0}" "${background_ul_limit:-0}" \
+		"${background_dl_usable:-true}" "${background_ul_usable:-true}"
+}
+
+check_background_traffic() {
+	write_status quiet-check 27 "Checking background traffic before throughput calibration"
+	measure_background_traffic
+	if [ "$background_blocked" = true ] && [ "${conservative_mode:-0}" != 1 ]; then
+		atomic_write "$error_file" "{\"state\":\"background-blocked\",\"error\":\"Background traffic is above the strict calibration limit. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"quiet-check\",\"background\":$(background_json),\"configuration_written\":false}"
+		exit 1
+	fi
+	if [ "${conservative_mode:-0}" = 1 ]; then
+		current_dl_min="$(uci -q get "cake-autorate.$job_name.min_dl_shaper_rate_kbps" 2>/dev/null)"
+		current_dl_base="$(uci -q get "cake-autorate.$job_name.base_dl_shaper_rate_kbps" 2>/dev/null)"
+		current_dl_max="$(uci -q get "cake-autorate.$job_name.max_dl_shaper_rate_kbps" 2>/dev/null)"
+		current_dl_cap="$(uci -q get "cake-autorate.$job_name.adaptive_ceiling_dl_cap_kbps" 2>/dev/null)"
+		current_ul_min="$(uci -q get "cake-autorate.$job_name.min_ul_shaper_rate_kbps" 2>/dev/null)"
+		current_ul_base="$(uci -q get "cake-autorate.$job_name.base_ul_shaper_rate_kbps" 2>/dev/null)"
+		current_ul_max="$(uci -q get "cake-autorate.$job_name.max_ul_shaper_rate_kbps" 2>/dev/null)"
+		current_ul_cap="$(uci -q get "cake-autorate.$job_name.adaptive_ceiling_ul_cap_kbps" 2>/dev/null)"
+		if { [ "$background_dl_usable" != true ] || [ "$background_ul_usable" != true ]; } &&
+		   { ! is_positive_uint "$current_dl_base" || ! is_positive_uint "$current_ul_base"; }; then
+			atomic_write "$error_file" "{\"state\":\"failed\",\"error\":\"Background traffic leaves an unusable direction and this new instance has no confirmed limits to retain.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"quiet-check\",\"background\":$(background_json),\"configuration_written\":false}"
+			exit 1
+		fi
+	fi
 }
 
 resolve_interface_device() {
@@ -681,14 +761,37 @@ run_measurement() {
 
 calculate_proposal() {
 	base_scale="${1:-1.0}"
-	"$daemon_bin" --autotune-proposal \
-		--dl-samples "$download_samples" \
-		--ul-samples "$upload_samples" \
-		--idle-median-ms "$idle_median_ms" \
-		--idle-p95-ms "$idle_p95_ms" \
-		--idle-samples "$baseline_samples" \
-		--link-kind "$link_kind" \
-		--base-scale "$base_scale"
+	if [ "${conservative_mode:-0}" = 1 ]; then
+		"$daemon_bin" --autotune-proposal \
+			--dl-samples "$download_samples" \
+			--ul-samples "$upload_samples" \
+			--idle-median-ms "$idle_median_ms" \
+			--idle-p95-ms "$idle_p95_ms" \
+			--idle-samples "$baseline_samples" \
+			--link-kind "$link_kind" \
+			--base-scale "$base_scale" \
+			--conservative-background-dl-kbps "${background_dl_kbps:-0}" \
+			--conservative-background-ul-kbps "${background_ul_kbps:-0}" \
+			--retain-dl "$([ "$background_dl_usable" = true ] && printf 0 || printf 1)" \
+			--retain-ul "$([ "$background_ul_usable" = true ] && printf 0 || printf 1)" \
+			--current-dl-min-kbps "${current_dl_min:-0}" \
+			--current-dl-base-kbps "${current_dl_base:-0}" \
+			--current-dl-max-kbps "${current_dl_max:-0}" \
+			--current-dl-cap-kbps "${current_dl_cap:-0}" \
+			--current-ul-min-kbps "${current_ul_min:-0}" \
+			--current-ul-base-kbps "${current_ul_base:-0}" \
+			--current-ul-max-kbps "${current_ul_max:-0}" \
+			--current-ul-cap-kbps "${current_ul_cap:-0}"
+	else
+		"$daemon_bin" --autotune-proposal \
+			--dl-samples "$download_samples" \
+			--ul-samples "$upload_samples" \
+			--idle-median-ms "$idle_median_ms" \
+			--idle-p95-ms "$idle_p95_ms" \
+			--idle-samples "$baseline_samples" \
+			--link-kind "$link_kind" \
+			--base-scale "$base_scale"
+	fi
 }
 
 revision_scale_for_validation() {
@@ -825,6 +928,7 @@ run_shaped_validation() {
 
 run_job() {
 	job_paths
+	conservative_mode="${conservative_override:-0}"
 	cancelled=0
 	temp_shaper_active=0
 	temp_ifb_created=0
@@ -858,6 +962,7 @@ run_job() {
 	http_idle_max_ms="$3"
 	http_idle_samples="$4"
 	[ "$http_idle_samples" -ge 3 ] 2>/dev/null || fail "Too few idle TCP/HTTPS latency samples."
+	check_background_traffic
 
 	download_samples=""
 	upload_samples=""
@@ -868,11 +973,14 @@ run_job() {
 	run_measurement 2
 
 	write_status proposal 80 "Calculating safe initial limits and adaptive ceiling bounds"
-	proposal="$(calculate_proposal 1.0)" || fail "Autotune proposal calculation failed."
+	initial_scale=1.0
+	[ "$conservative_mode" = 1 ] && initial_scale=0.85
+	proposal="$(calculate_proposal "$initial_scale")" || fail "Autotune proposal calculation failed."
 	run_shaped_validation 1
 	validation_attempts_json="$validation_json"
 	if [ "$validation_pass" != true ]; then
 		revision_scale="$(revision_scale_for_validation)"
+		[ "$conservative_mode" = 1 ] && revision_scale=0.80
 		write_status correction 91 "Revising base rates once after a borderline validation result"
 		proposal="$(calculate_proposal "$revision_scale")" || fail "Autotune correction calculation failed."
 		run_shaped_validation 2
@@ -885,11 +993,14 @@ run_job() {
 	fi
 
 	write_status review 96 "Preparing validated review; no configuration has been written"
-	atomic_write "$result_file" "{\"state\":\"complete\",\"schema_version\":1,\"job_id\":\"$(json_escape "$job_name")\",\"target_interface\":\"$(json_escape "$target_if_input")\",\"resolved_interface\":\"$(json_escape "$target_if")\",\"source_ip\":\"$(json_escape "$source_ip")\",\"route_interface\":\"$(json_escape "$route_if")\",\"route_mode\":\"$(json_escape "$route_mode")\",\"mwan3_member\":\"$(json_escape "$mwan3_member")\",\"route_identity\":\"$(json_escape "$route_identity")\",\"link_kind\":\"$(json_escape "$link_kind")\",\"baseline\":{\"median_ms\":$idle_median_ms,\"p95_ms\":$idle_p95_ms,\"samples\":$baseline_samples,\"http_median_ms\":$http_idle_median_ms,\"http_p95_ms\":$http_idle_p95_ms,\"http_samples\":$http_idle_samples,\"http_url\":\"$(json_escape "$http_probe_url")\"},\"runs\":[$runs_json],\"validation_attempts\":[$validation_attempts_json],\"validation\":$validation_json,\"pinger_plan\":$pinger_plan,\"proposal\":$proposal,\"configuration_written\":false}"
+	confidence_mode=normal
+	[ "$conservative_mode" = 1 ] && confidence_mode=low
+	atomic_write "$result_file" "{\"state\":\"complete\",\"schema_version\":2,\"job_id\":\"$(json_escape "$job_name")\",\"target_interface\":\"$(json_escape "$target_if_input")\",\"resolved_interface\":\"$(json_escape "$target_if")\",\"source_ip\":\"$(json_escape "$source_ip")\",\"route_interface\":\"$(json_escape "$route_if")\",\"route_mode\":\"$(json_escape "$route_mode")\",\"mwan3_member\":\"$(json_escape "$mwan3_member")\",\"route_identity\":\"$(json_escape "$route_identity")\",\"link_kind\":\"$(json_escape "$link_kind")\",\"conservative\":$([ "$conservative_mode" = 1 ] && printf true || printf false),\"confidence_mode\":\"$confidence_mode\",\"background\":$(background_json),\"usable_directions\":{\"download\":${background_dl_usable:-true},\"upload\":${background_ul_usable:-true}},\"baseline\":{\"median_ms\":$idle_median_ms,\"p95_ms\":$idle_p95_ms,\"samples\":$baseline_samples,\"http_median_ms\":$http_idle_median_ms,\"http_p95_ms\":$http_idle_p95_ms,\"http_samples\":$http_idle_samples,\"http_url\":\"$(json_escape "$http_probe_url")\"},\"runs\":[$runs_json],\"validation_attempts\":[$validation_attempts_json],\"validation\":$validation_json,\"pinger_plan\":$pinger_plan,\"proposal\":$proposal,\"configuration_written\":false}"
 	rm -f "$status_file" "$error_file"
 }
 
 start_job() {
+	start_conservative="${1:-0}"
 	setsid_bin="$(command -v setsid 2>/dev/null)"
 	[ -n "$setsid_bin" ] || json_error "setsid is required for Full Auto-Tune."
 	mkdir -p "$job_dir" || json_error "Unable to create autotune job directory."
@@ -905,7 +1016,7 @@ start_job() {
 
 	rm -f "$pid_file" "$status_file" "$result_file" "$error_file" "$cancel_file" "$log_file"
 	write_status starting 0 "Starting Full Auto-Tune"
-	"$setsid_bin" "$0" "$job_name" "$target_if_input" job-run "$backend" "$route_mode_override" "$mwan3_member_override" \
+	"$setsid_bin" "$0" "$job_name" "$target_if_input" job-run "$backend" "$route_mode_override" "$mwan3_member_override" "$start_conservative" \
 		</dev/null > "$log_file" 2>&1 &
 	pid="$!"
 	printf '%s\n' "$pid" > "$pid_file"
@@ -948,7 +1059,8 @@ safe_interface_name "$target_if_input" || json_error "Invalid target interface."
 job_paths
 
 case "$mode" in
-	start) start_job ;;
+	start) start_job 0 ;;
+	start-conservative) start_job 1 ;;
 	status) status_job ;;
 	cancel) cancel_job ;;
 	job-run) run_job ;;

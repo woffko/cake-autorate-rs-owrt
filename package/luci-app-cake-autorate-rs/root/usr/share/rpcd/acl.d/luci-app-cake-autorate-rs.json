@@ -45,7 +45,8 @@
 				"/usr/libexec/cake-autorate-rs/pinger-plan *": [ "exec" ],
 				"/usr/libexec/cake-autorate-rs/log-bundle *": [ "exec" ],
 				"/usr/libexec/cake-autorate-rs/mqtt-status *": [ "exec" ],
-				"/usr/libexec/cake-autorate-rs/graph-history *": [ "exec" ]
+				"/usr/libexec/cake-autorate-rs/graph-history *": [ "exec" ],
+				"/usr/libexec/cake-autorate-rs/status-columns *": [ "exec" ]
 			},
 			"ubus": {
 				"luci": [ "setInitAction" ]

@@ -78,6 +78,33 @@ impl AutotuneProposal {
         Ok(())
     }
 
+    pub fn apply_conservative_constraints(
+        &mut self,
+        retain_download: Option<DirectionProposal>,
+        retain_upload: Option<DirectionProposal>,
+        confirmed_download_max: Option<u64>,
+        confirmed_download_cap: Option<u64>,
+        confirmed_upload_max: Option<u64>,
+        confirmed_upload_cap: Option<u64>,
+    ) {
+        constrain_direction(
+            &mut self.download,
+            retain_download,
+            confirmed_download_max,
+            confirmed_download_cap,
+        );
+        constrain_direction(
+            &mut self.upload,
+            retain_upload,
+            confirmed_upload_max,
+            confirmed_upload_cap,
+        );
+        self.confidence = self.confidence.min(45);
+        self.warnings.push(
+            "Low-confidence conservative calibration: measured background was subtracted and confirmed maxima/caps were never raised.",
+        );
+    }
+
     pub fn to_json(&self) -> String {
         let warnings = self
             .warnings
@@ -267,6 +294,32 @@ fn revise_direction_base(direction: &mut DirectionProposal, scale: f64) {
         .min(upper.max(direction.minimum_kbps));
 }
 
+fn constrain_direction(
+    direction: &mut DirectionProposal,
+    retained: Option<DirectionProposal>,
+    confirmed_max: Option<u64>,
+    confirmed_cap: Option<u64>,
+) {
+    if let Some(retained) = retained {
+        *direction = retained;
+        return;
+    }
+
+    let cap_bound = confirmed_cap.filter(|value| *value > 0).or(confirmed_max);
+    if let Some(cap) = cap_bound {
+        direction.absolute_cap_kbps = direction.absolute_cap_kbps.min(cap);
+        direction.maximum_kbps = direction.maximum_kbps.min(direction.absolute_cap_kbps);
+        direction.base_kbps = direction.base_kbps.min(direction.maximum_kbps);
+        direction.minimum_kbps = direction.minimum_kbps.min(direction.base_kbps);
+    }
+    if let Some(maximum) = confirmed_max.filter(|value| *value > 0) {
+        direction.maximum_kbps = direction.maximum_kbps.min(maximum);
+        direction.base_kbps = direction.base_kbps.min(direction.maximum_kbps);
+        direction.minimum_kbps = direction.minimum_kbps.min(direction.base_kbps);
+        direction.absolute_cap_kbps = direction.absolute_cap_kbps.max(direction.maximum_kbps);
+    }
+}
+
 fn direction_json(direction: DirectionProposal) -> String {
     format!(
         concat!(
@@ -365,6 +418,49 @@ mod tests {
         assert!(proposal.upload.variability > proposal.download.variability);
         assert!(proposal.upload.maximum_kbps > proposal.upload.base_kbps);
         assert!(proposal.adaptive_ceiling_enabled);
+    }
+
+    #[test]
+    fn conservative_constraints_never_raise_confirmed_bounds_and_can_retain_direction() {
+        let mut proposal = build_proposal(
+            &[900_000.0, 880_000.0],
+            &[900_000.0, 870_000.0],
+            LatencyBaseline {
+                median_ms: 4.0,
+                p95_ms: 6.0,
+                samples: 10,
+            },
+            LinkKind::Ethernet,
+        )
+        .unwrap();
+        let retained_upload = DirectionProposal {
+            minimum_kbps: 10_000,
+            base_kbps: 20_000,
+            maximum_kbps: 30_000,
+            absolute_cap_kbps: 35_000,
+            observed_low_kbps: proposal.upload.observed_low_kbps,
+            observed_median_kbps: proposal.upload.observed_median_kbps,
+            observed_high_kbps: proposal.upload.observed_high_kbps,
+            variability: proposal.upload.variability,
+        };
+
+        proposal.apply_conservative_constraints(
+            None,
+            Some(retained_upload),
+            Some(700_000),
+            Some(750_000),
+            Some(30_000),
+            Some(35_000),
+        );
+
+        assert!(proposal.download.maximum_kbps <= 700_000);
+        assert!(proposal.download.absolute_cap_kbps <= 750_000);
+        assert_eq!(proposal.upload, retained_upload);
+        assert!(proposal.confidence <= 45);
+        assert!(proposal
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Low-confidence")));
     }
 
     #[test]

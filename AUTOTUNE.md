@@ -34,6 +34,11 @@ instance.
   queue is stopped and restored through `/usr/lib/sqm/run.sh`.
 - A per-interface lock prevents overlapping heavy jobs. Only the selected
   instance and selected SQM queue are paused; other WAN instances continue.
+- Before heavy throughput starts, a three-second RX/TX observation compares
+  background use with the current directional CAKE references. The strict
+  default stops at `quiet-check` above max(5%, 1 Mbit/s) and reports the exact
+  DL/UL background; it never silently treats aggregate interface traffic as
+  speed-test throughput.
 
 The job runs a shaped test on the same server, independently samples ICMP
 latency/loss, TCP/HTTPS latency to Cloudflare, and total CPU, rechecks the WAN
@@ -51,26 +56,45 @@ x86_64 and ARM router gates pass.
    method and active/spare set.
 3. `baseline`: collect individual RTT samples from up to three selected
    reflectors plus five small TCP/HTTPS requests and calculate both baselines.
-4. `throughput`: run two unshaped download/upload samples. `speedtest-go`
+4. `quiet-check`: measure pre-test background and either proceed, stop for a
+   quiet retry, or require explicit one-run conservative consent.
+5. `throughput`: run two unshaped download/upload samples. `speedtest-go`
    validates the first good automatically selected server. Its ID is passed as
    a job-local hard pin to the second raw run and every shaped run.
-5. `proposal`: call the Rust daemon's pure `--autotune-proposal` mode.
-6. `shaped`: temporarily apply CAKE at proposed base rates, run the same test
+6. `proposal`: call the Rust daemon's pure `--autotune-proposal` mode.
+7. `shaped`: temporarily apply CAKE at proposed base rates, run the same test
    server with SQM bypass disabled, and concurrently collect RTT/loss,
    TCP/HTTPS request latency, and CPU.
-7. `correction` (only after a failed score): reduce base rates for high
+8. `correction` (only after a failed score): reduce base rates for high
    latency/loss/CPU, or raise them within observed-low bounds for clean but
    underperforming throughput, then repeat shaped validation once.
-8. `review`: return the raw runs, validation, baseline, reflector plan, detected link, and
+9. `review`: return the raw runs, validation, baseline, reflector plan, detected link, and
    apply-ready proposal to LuCI.
 
 The RPC-facing helper supports:
 
 ```text
 /usr/libexec/cake-autorate-rs/autotune JOB INTERFACE start [BACKEND]
+/usr/libexec/cake-autorate-rs/autotune JOB INTERFACE start-conservative [BACKEND]
 /usr/libexec/cake-autorate-rs/autotune JOB INTERFACE status [BACKEND]
 /usr/libexec/cake-autorate-rs/autotune JOB INTERFACE cancel [BACKEND]
 ```
+
+## Background traffic and conservative continuation
+
+Retrying on a quiet link is the preferred action. **Continue conservatively**
+is an explicit override for the current job only; it is not saved as an
+instance setting and scheduled calibration remains strict.
+
+The conservative calculator subtracts 125% of the observed pre-test
+background from each directional speed-test sample, then applies an additional
+0.85 base-rate scale. It caps confidence at 45 and labels Review **LOW**. A
+usable direction may move lower but its confirmed maximum and absolute
+adaptive-ceiling cap can never rise. Background above max(35% of the current
+directional reference, 5 Mbit/s) makes that direction unusable: re-tuning an
+existing instance retains its complete min/base/max/cap tuple, while a new
+instance without confirmed values fails closed. If both shaped validation
+attempts fail, current settings remain active and UCI is untouched.
 
 ## Balanced proposal mathematics
 

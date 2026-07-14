@@ -57,6 +57,17 @@ Release offline bundles must be installed with networking disabled into an
 empty APK root. Published assets must then be downloaded again and validated
 against the published `SHA256SUMS`.
 
+RC13 adds deterministic UI and calibration gates: clean package config must
+contain no `cake_autorate` section; mandatory Status columns cannot be hidden;
+saved optional columns and Reset default must survive polling; 390 px Status
+must render cards while desktop uses the full viewport. Graph event labels are
+tested with clustered route/state/grade/DL/UL changes and must occupy two
+lanes on both synchronized charts. Re-run Auto-Tune must prefill the selected
+instance and stage no change before Review. Background tests cover strict
+stop, quiet retry, cancel, moderate conservative continuation, unusable
+direction retention, and the invariant that a low-confidence result never
+raises a confirmed max or cap.
+
 ## Anonymous WAN comparison
 
 ### Setup
@@ -611,3 +622,54 @@ index, and all 65 APKs. The remaining release payload hashes are:
 
 The release checksum manifest covers these four files plus both daemon APKs
 and the shared noarch LuCI APK.
+
+## RC13 compact UI and safe recalibration gate (2026-07-14)
+
+RC13 was built for x86_64 and rockchip/armv8 and installed first on a
+disposable x86 router. A real purge/reinstall proved that the package default
+contains only the global RAM-history policy: it created no autorate instance,
+no managed SQM queue, and no daemon instance process. The saved test
+configuration was then restored byte-for-byte.
+
+Authenticated Playwright exercised the installed LuCI application at desktop
+and 390 px widths. It verified that the four mandatory Status columns remain
+visible, optional column choices and Reset survive a reload, desktop uses the
+available viewport, and mobile renders cards without page overflow. Re-run
+Auto-Tune opened the selected instance with its route, queue, backend, and
+rates prefilled. Edit showed the four topic tabs plus Advanced only when expert
+options were enabled. Clustered LEARNING, route, rating, DL, and UL markers
+used two non-overlapping lanes on both synchronized charts; fixed axis names
+did not move with the timeline, and hover exposed the exact values.
+
+The final packages were then installed read-only with respect to configuration
+on an x86 nftables-mwan3 router and an ARMv8 variable-WWAN router. The x86
+instances retained independent `ACTIVE`/`STANDBY` route state and their
+900000/860000 plus 108000/14500 kbit/s CAKE pairs. The ARM instance retained
+`ACTIVE/RUNNING` and its existing WWAN limits. cake-autorate, SQM, network, and
+(where present) mwan3 configuration hashes were identical before and after;
+mwan3 was not restarted. Playwright passed Status, Graphs, both responsive
+layouts, hover, action ordering, and topic-tab checks on both devices without
+a LuCI exception.
+
+The x86 offline archive was copied to `/root/` on the disposable router,
+extracted, and installed from its local `packages.adb` with `--no-network`.
+The installer reported the exact RC13 daemon and LuCI versions, created a dated
+backup, restarted the existing instance, and preserved the cake-autorate and
+SQM hashes. Both repositories index 65 APKs; the ARM daemon itself was also
+installed and exercised on the ARM router. Final release hashes are:
+
+| Artifact | SHA-256 |
+|---|---|
+| x86_64 daemon APK | `f3b0d299aaeccebe43a57fbe000fcd7234fb672ee42418ec71a9891ddf157cb5` |
+| aarch64_generic daemon APK | `1cfbf6c7a1717ffc5749987604f210d2486d3ec1f46dd1987cf12823e330a6fc` |
+| noarch LuCI APK | `b547ba8d24bf97d010475c52d62110259829c480d718f743ba798f58453e7987` |
+| x86_64 installer | `5350c2c478bd7390023bd7b7c758608709e5ceee3ca7bb76c125c6502c8a062c` |
+| aarch64_generic installer | `99b8a228bf718bc95cd2875c7014abcaaf0c6b83e4fb2fc07f5ae61d107e0d37` |
+| x86_64 offline bundle | `3138d86f313756cab0f1ea3e9e072e69ad0b2c3a2819bf5864cdcb62a03eb046` |
+| rockchip/armv8 offline bundle | `043d2ca269604c48de9418ef7ae2655ff6202881d031e793ddc777dd9b5114de` |
+
+The deterministic final gate comprises 103 Rust tests, strict Clippy and
+formatting, all daemon and LuCI shell suites (including clean defaults and the
+isolated Status-column commit helper), four LuCI JavaScript suites, shell/JSON
+syntax, `git diff --check`, both SDK builds, checksum verification, the offline
+installer run, and the three installed-router browser checks described above.

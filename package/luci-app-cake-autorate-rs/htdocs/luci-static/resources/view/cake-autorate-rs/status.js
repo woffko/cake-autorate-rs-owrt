@@ -5,6 +5,53 @@
 'require ui';
 'require cake-autorate-rs.ui as cakeUi';
 
+var STATUS_COLUMN_DEFINITIONS = [
+	{ key: 'instance', title: _('Instance'), mandatory: true },
+	{ key: 'uplink', title: _('Uplink / state'), mandatory: true },
+	{ key: 'quality', title: _('Quality'), mandatory: true },
+	{ key: 'rating', title: _('Rating test'), mandatory: true },
+	{ key: 'route', title: _('Route / external IP') },
+	{ key: 'updated', title: _('Updated') },
+	{ key: 'reflector', title: _('Reflector') },
+	{ key: 'runtime_reflectors', title: _('Runtime reflectors') },
+	{ key: 'rtt', title: _('RTT') },
+	{ key: 'dl_achieved', title: _('DL achieved') },
+	{ key: 'ul_achieved', title: _('UL achieved') },
+	{ key: 'cake_dl', title: _('CAKE DL') },
+	{ key: 'cake_ul', title: _('CAKE UL') },
+	{ key: 'cpu', title: _('CPU') }
+];
+
+var STATUS_DEFAULT_COLUMNS = STATUS_COLUMN_DEFINITIONS.filter(function(column) {
+	return column.mandatory;
+}).map(function(column) { return column.key; });
+
+function statusColumnSelection(globalSection) {
+	var configured = globalSection && globalSection.status_columns;
+	var values = Array.isArray(configured) ? configured :
+		(typeof configured === 'string' ? configured.split(/[\s,]+/) : []);
+	var selected = {};
+
+	STATUS_DEFAULT_COLUMNS.forEach(function(key) { selected[key] = true; });
+	values.forEach(function(key) {
+		if (STATUS_COLUMN_DEFINITIONS.some(function(column) { return column.key === key; }))
+			selected[key] = true;
+	});
+
+	return STATUS_COLUMN_DEFINITIONS.filter(function(column) {
+		return selected[column.key];
+	}).map(function(column) { return column.key; });
+}
+
+function selectedStatusColumns(keys) {
+	var selected = {};
+	(keys || []).forEach(function(key) { selected[key] = true; });
+	STATUS_DEFAULT_COLUMNS.forEach(function(key) { selected[key] = true; });
+	return STATUS_COLUMN_DEFINITIONS.filter(function(column) {
+		return selected[column.key];
+	});
+}
+
 function statusPath(section) {
 	return '/var/run/cake-autorate/' + section + '/status.json';
 }
@@ -643,93 +690,156 @@ function renderQualityAction(section, status, enabled) {
 	]);
 }
 
-function renderTable(sections, statuses) {
-	var rows = [];
-	var children;
+function statusCell(column, sectionData, status, enabled) {
+	var section = sectionData['.name'];
 
-	for (var i = 0; i < sections.length; i++) {
-		var sectionData = sections[i];
-		var section = sectionData['.name'];
-		var st = statuses[i] || {};
-		var enabled = String(sectionData.enabled || '0') === '1';
-		var disabledRow;
+	if (!enabled && column.key !== 'instance' && column.key !== 'uplink' && column.key !== 'rating')
+		return '-';
 
-		if (!enabled) {
-			disabledRow = [
-					section,
-					_('DISABLED'),
-					'-', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-',
-					renderQualityAction(sectionData, st, false)
-			];
-			rows.push(disabledRow);
-			continue;
-		}
-
-		rows.push([
-			section,
-			formatState(st, enabled),
-			formatRoute(st),
-			st.updated_at ? E('div', { 'class': 'cake-status-timestamp' }, [
-				E('span', {}, new Date(st.updated_at * 1000).toLocaleDateString()),
-				E('small', {}, new Date(st.updated_at * 1000).toLocaleTimeString())
-			]) : '-',
-			st.reflector || '-',
-			reflectorSummary(st),
-			st.rtt_ms != null ? Number(st.rtt_ms).toFixed(2) + ' ms' : '-',
-			formatQuality(st),
-			formatRate(st.dl_achieved_rate_kbps),
-			formatRate(st.ul_achieved_rate_kbps),
-			formatShaperRate(st, 'dl'),
-			formatShaperRate(st, 'ul'),
-			formatPercent(st.cpu_total_percent),
-			renderQualityAction(sectionData, st, true)
-		]);
+	switch (column.key) {
+	case 'instance': return section;
+	case 'uplink': return enabled ? formatState(status, enabled) : _('DISABLED');
+	case 'quality': return enabled ? formatQuality(status) : '-';
+	case 'rating': return renderQualityAction(sectionData, status, enabled);
+	case 'route': return formatRoute(status);
+	case 'updated':
+		return status.updated_at ? E('div', { 'class': 'cake-status-timestamp' }, [
+			E('span', {}, new Date(status.updated_at * 1000).toLocaleDateString()),
+			E('small', {}, new Date(status.updated_at * 1000).toLocaleTimeString())
+		]) : '-';
+	case 'reflector': return status.reflector || '-';
+	case 'runtime_reflectors': return reflectorSummary(status);
+	case 'rtt': return status.rtt_ms != null ? Number(status.rtt_ms).toFixed(2) + ' ms' : '-';
+	case 'dl_achieved': return formatRate(status.dl_achieved_rate_kbps);
+	case 'ul_achieved': return formatRate(status.ul_achieved_rate_kbps);
+	case 'cake_dl': return formatShaperRate(status, 'dl');
+	case 'cake_ul': return formatShaperRate(status, 'ul');
+	case 'cpu': return formatPercent(status.cpu_total_percent);
+	default: return '-';
 	}
+}
 
-	children = [
-		E('tr', { 'class': 'tr table-titles' }, [
-			E('th', { 'class': 'th' }, _('Instance')),
-			E('th', { 'class': 'th' }, _('Uplink')),
-			E('th', { 'class': 'th' }, _('Route')),
-			E('th', { 'class': 'th' }, _('Updated')),
-			E('th', { 'class': 'th' }, _('Reflector')),
-			E('th', { 'class': 'th' }, _('Runtime reflectors')),
-			E('th', { 'class': 'th' }, _('RTT')),
-			E('th', { 'class': 'th' }, _('Quality')),
-			E('th', { 'class': 'th' }, _('DL achieved')),
-			E('th', { 'class': 'th' }, _('UL achieved')),
-			E('th', { 'class': 'th' }, _('CAKE DL')),
-			E('th', { 'class': 'th' }, _('CAKE UL')),
-			E('th', { 'class': 'th' }, _('CPU')),
-			E('th', { 'class': 'th' }, _('Rating test'))
-		])
-	];
+function renderTable(sections, statuses, selectedKeys) {
+	var columns = selectedStatusColumns(selectedKeys);
+	var children = [ E('tr', { 'class': 'tr table-titles' }, columns.map(function(column) {
+		return E('th', { 'class': 'th', 'data-column': column.key }, column.title);
+	})) ];
 
-	if (rows.length) {
-		for (var i = 0; i < rows.length; i++)
-			children.push(E('tr', { 'class': 'tr cake-status-row' }, rows[i].map(function(cell) {
-				return E('td', { 'class': 'td cake-status-cell' }, cell);
-			})));
-	} else {
+	if (!sections.length) {
 		children.push(E('tr', { 'class': 'tr' }, [
-			E('td', { 'class': 'td', 'colspan': '14' }, _('No instances configured.'))
+			E('td', { 'class': 'td', 'colspan': String(columns.length) }, _('No instances configured.'))
 		]));
 	}
 
+	sections.forEach(function(sectionData, index) {
+		var status = statuses[index] || {};
+		var enabled = String(sectionData.enabled || '0') === '1';
+		children.push(E('tr', { 'class': 'tr cake-status-row' }, columns.map(function(column) {
+			return E('td', {
+				'class': 'td cake-status-cell cake-status-column-' + column.key,
+				'data-title': column.title,
+				'data-column': column.key
+			}, statusCell(column, sectionData, status, enabled));
+		})));
+	});
+
 	return E('table', { 'class': 'table cake-status-table' }, children);
+}
+
+function renderCards(sections, statuses, selectedKeys) {
+	var columns = selectedStatusColumns(selectedKeys);
+
+	if (!sections.length)
+		return E('div', { 'class': 'alert-message notice' }, _('No instances configured.'));
+
+	return E('div', { 'class': 'cake-status-cards' }, sections.map(function(sectionData, index) {
+		var status = statuses[index] || {};
+		var enabled = String(sectionData.enabled || '0') === '1';
+		return E('section', { 'class': 'cake-status-card' }, columns.map(function(column) {
+			return E('div', { 'class': 'cake-status-card-field cake-status-card-' + column.key }, [
+				E('strong', { 'class': 'cake-status-card-label' }, column.title),
+				E('div', { 'class': 'cake-status-card-value' },
+					statusCell(column, sectionData, status, enabled))
+			]);
+		}));
+	}));
+}
+
+function renderStatusData(sections, statuses, selectedKeys) {
+	return E('div', { 'class': 'cake-status-data' }, [
+		E('div', { 'class': 'cake-status-table-scroll' }, renderTable(sections, statuses, selectedKeys)),
+		renderCards(sections, statuses, selectedKeys)
+	]);
+}
+
+function renderColumnChooser(globalSection, selectedKeys, onChange) {
+	var selected = {};
+	selectedKeys.forEach(function(key) { selected[key] = true; });
+	var details = E('details', { 'class': 'cake-status-column-picker' });
+	var checks = {};
+	var options = STATUS_COLUMN_DEFINITIONS.map(function(column) {
+		var input = E('input', {
+			'type': 'checkbox',
+			'checked': selected[column.key] || column.mandatory ? '' : null,
+			'disabled': column.mandatory ? '' : null
+		});
+		checks[column.key] = input;
+		return E('label', { 'class': 'cake-status-column-option' }, [ input, column.title ]);
+	});
+
+	function saveSelection(reset) {
+		var keys = STATUS_DEFAULT_COLUMNS.slice();
+		if (!reset) {
+			STATUS_COLUMN_DEFINITIONS.forEach(function(column) {
+				if (!column.mandatory && checks[column.key].checked)
+					keys.push(column.key);
+			});
+		}
+		var storedKeys = keys.filter(function(key) {
+			return STATUS_DEFAULT_COLUMNS.indexOf(key) < 0;
+		});
+		var args = [ reset ? 'reset' : 'set' ].concat(reset ? [] : storedKeys);
+
+		return fs.exec('/usr/libexec/cake-autorate-rs/status-columns', args).then(function(result) {
+			if (!result || result.code !== 0)
+				throw new Error(result && result.stderr || _('status-columns helper failed'));
+			details.open = false;
+			onChange(keys);
+		}).catch(function(error) {
+			ui.addNotification(null, E('p', _('Unable to save Status columns: %s').format(
+				error.message || error)), 'error');
+		});
+	}
+
+	details.appendChild(E('summary', { 'class': 'btn cbi-button cbi-button-neutral' }, _('List columns')));
+	details.appendChild(E('div', { 'class': 'cake-status-column-menu' }, [
+		E('div', { 'class': 'cake-status-column-options' }, options),
+		E('div', { 'class': 'cake-status-column-buttons' }, [
+			E('button', {
+				'class': 'btn cbi-button cbi-button-positive',
+				'click': ui.createHandlerFn(null, function() { return saveSelection(false); })
+			}, _('Apply')),
+			E('button', {
+				'class': 'btn cbi-button cbi-button-neutral',
+				'click': ui.createHandlerFn(null, function() { return saveSelection(true); })
+			}, _('Reset default'))
+		])
+	]));
+	return details;
 }
 
 return L.view.extend({
 	load: function() {
 		return uci.load('cake-autorate').then(function() {
 			var sections = uci.sections('cake-autorate', 'cake_autorate');
+			var globalSection = uci.sections('cake-autorate', 'globals')[0] || { '.name': 'globals' };
 			return Promise.all([
 				Promise.all(sections.map(function(section) {
 					return readStatus(section['.name']);
 				})),
 				readPackageVersions()
 			]).then(function(result) {
-				return [ sections, result[0], result[1] ];
+				return [ sections, result[0], result[1], globalSection ];
 			});
 		});
 	},
@@ -739,23 +849,37 @@ return L.view.extend({
 		var sections = data[0];
 		var statuses = data[1];
 		var versions = data[2] || {};
-		var table = renderTable(sections, statuses);
+		var globalSection = data[3] || { '.name': 'globals' };
+		var visibleColumns = statusColumnSelection(globalSection);
+		var statusData = renderStatusData(sections, statuses, visibleColumns);
+		var columnChooser;
+		var replaceStatusData = function(nextStatuses, nextColumns) {
+			statuses = nextStatuses || statuses;
+			visibleColumns = nextColumns || visibleColumns;
+			var nextData = renderStatusData(sections, statuses, visibleColumns);
+			if (statusData.parentNode) {
+				statusData.parentNode.replaceChild(nextData, statusData);
+				statusData = nextData;
+			}
+		};
+		columnChooser = renderColumnChooser(globalSection, visibleColumns, function(keys) {
+			replaceStatusData(statuses, keys);
+		});
 
 		poll.add(function() {
 			return Promise.all(sections.map(function(section) {
 				return readStatus(section['.name']);
 			})).then(function(nextStatuses) {
-				var nextTable = renderTable(sections, nextStatuses);
-				if (table.parentNode) {
-					table.parentNode.replaceChild(nextTable, table);
-					table = nextTable;
-				}
+				replaceStatusData(nextStatuses);
 			});
 		}, 5);
 
-		return E('div', {}, [
+		return E('div', { 'class': 'cake-status-root' }, [
 			E('style', {}, [
-				'.cake-status-table{width:100%;table-layout:auto;margin-top:18px}',
+				'.cake-status-root{width:calc(100vw - 48px);max-width:none;margin-left:calc((100% - (100vw - 48px))/2);box-sizing:border-box}',
+				'.cake-status-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}',
+				'.cake-status-table-scroll{width:100%;overflow-x:auto;margin-top:18px}',
+				'.cake-status-table{width:100%;min-width:max-content;table-layout:auto;margin:0}',
 				'.cake-status-table th{vertical-align:bottom!important;padding-top:10px!important;padding-bottom:10px!important}',
 				'.cake-status-table td{vertical-align:top!important;padding-top:13px!important;padding-bottom:13px!important;line-height:1.35}',
 				'.cake-status-row{border-bottom:1px solid rgba(127,127,127,.25)}',
@@ -775,32 +899,36 @@ return L.view.extend({
 				'.cake-quality-ready{color:#16a085!important}',
 				'.cake-quality-job-state{white-space:pre-wrap;margin-top:14px}',
 				'.cake-quality-job-detail{line-height:1.45;margin:12px 0;color:#888}',
-				'.cake-status-actions{display:flex;align-items:center;gap:7px;flex-wrap:wrap;width:100%;box-sizing:border-box}',
-				'@media(max-width:900px){.cake-status-table{display:block;overflow-x:auto}.cake-status-table th,.cake-status-table td{min-width:92px}.cake-status-table th:nth-child(6),.cake-status-table td:nth-child(6){min-width:180px}}'
+				'.cake-status-actions{display:flex;align-items:center;gap:7px;flex-wrap:wrap;box-sizing:border-box;margin:0}',
+				'.cake-status-column-picker{position:relative;margin-left:auto}.cake-status-column-picker>summary{list-style:none;cursor:pointer}.cake-status-column-picker>summary::-webkit-details-marker{display:none}',
+				'.cake-status-column-menu{position:absolute;right:0;top:calc(100% + 6px);z-index:20;min-width:270px;padding:12px;border:1px solid rgba(127,127,127,.4);border-radius:6px;background:var(--background-color-high,#fff);box-shadow:0 5px 20px rgba(0,0,0,.22)}',
+				'.cake-status-column-options{display:grid;grid-template-columns:1fr;gap:7px}.cake-status-column-option{display:flex;align-items:center;gap:7px;white-space:nowrap}.cake-status-column-buttons{display:flex;gap:7px;margin-top:12px}',
+				'.cake-status-cards{display:none}.cake-status-card{border:1px solid rgba(127,127,127,.3);border-radius:6px;padding:12px;background:rgba(127,127,127,.04)}.cake-status-card-field{display:grid;grid-template-columns:minmax(105px,35%) minmax(0,1fr);gap:10px;padding:8px 0;border-bottom:1px solid rgba(127,127,127,.18)}.cake-status-card-field:last-child{border-bottom:0}.cake-status-card-label{font-size:12px}.cake-status-card-value{min-width:0;overflow-wrap:anywhere}',
+				'@media(max-width:900px){.cake-status-root{width:calc(100vw - 24px);margin-left:calc((100% - (100vw - 24px))/2)}.cake-status-table-scroll{display:none}.cake-status-cards{display:grid;grid-template-columns:1fr;gap:12px;margin-top:16px}.cake-status-toolbar{align-items:flex-start}.cake-status-column-picker{margin-left:0}.cake-status-column-menu{left:0;right:auto;max-width:calc(100vw - 36px)}}'
 			].join('')),
 			renderVersions(versions),
-			E('div', { 'class': 'cbi-page-actions cake-status-actions' }, [
-				E('button', {
-					'class': 'btn cbi-button cbi-button-action',
-					'click': ui.createHandlerFn(this, function() { return serviceAction('start'); })
-				}, _('Start')),
-				' ',
-				E('button', {
-					'class': 'btn cbi-button cbi-button-action',
-					'click': ui.createHandlerFn(this, function() { return serviceAction('restart'); })
-				}, _('Restart')),
-				' ',
-				E('button', {
-					'class': 'btn cbi-button cbi-button-remove',
-					'click': ui.createHandlerFn(this, function() { return serviceAction('stop'); })
-				}, _('Stop')),
-				' ',
-				E('button', {
-					'class': 'btn cbi-button cbi-button-action',
-					'click': ui.createHandlerFn(this, exportLogs)
-				}, _('Export logs'))
+			E('div', { 'class': 'cbi-section cake-status-toolbar' }, [
+				E('div', { 'class': 'cake-status-actions' }, [
+					E('button', {
+						'class': 'btn cbi-button cbi-button-action',
+						'click': ui.createHandlerFn(this, function() { return serviceAction('start'); })
+					}, _('Start')),
+					E('button', {
+						'class': 'btn cbi-button cbi-button-action',
+						'click': ui.createHandlerFn(this, function() { return serviceAction('restart'); })
+					}, _('Restart')),
+					E('button', {
+						'class': 'btn cbi-button cbi-button-remove',
+						'click': ui.createHandlerFn(this, function() { return serviceAction('stop'); })
+					}, _('Stop')),
+					E('button', {
+						'class': 'btn cbi-button cbi-button-action',
+						'click': ui.createHandlerFn(this, exportLogs)
+					}, _('Export logs'))
+				]),
+				columnChooser
 			]),
-			table
+			statusData
 		]);
 	}
 });

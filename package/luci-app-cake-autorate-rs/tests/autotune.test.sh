@@ -87,6 +87,35 @@ grep -q '"state":"failed"' "$work/routebad-status.json"
 grep -q 'route identity changed' "$work/routebad-status.json"
 unset AUTOTUNE_MOCK_ROUTE_MISMATCH
 
+: > "$work/counter"
+export CAKE_AUTORATE_AUTOTUNE_BACKGROUND_DL_KBPS=2500
+export CAKE_AUTORATE_AUTOTUNE_BACKGROUND_UL_KBPS=1500
+"$autotune" background lo start speedtest-go > "$work/background-start.json"
+attempt=0
+while [ "$attempt" -lt 100 ]; do
+	"$autotune" background lo status speedtest-go > "$work/background-status.json"
+	grep -q '"state":"background-blocked"' "$work/background-status.json" && break
+	attempt=$((attempt + 1))
+	sleep 0.05
+done
+grep -q '"background_blocked":true' "$work/background-status.json"
+grep -q '"retryable":true' "$work/background-status.json"
+grep -q '"download_kbps":2500' "$work/background-status.json"
+
+: > "$work/counter"
+"$autotune" background lo start-conservative speedtest-go > "$work/background-conservative-start.json"
+attempt=0
+while [ "$attempt" -lt 100 ]; do
+	"$autotune" background lo status speedtest-go > "$work/background-conservative-status.json"
+	grep -q '"state":"complete"' "$work/background-conservative-status.json" && break
+	attempt=$((attempt + 1))
+	sleep 0.05
+done
+grep -q '"conservative":true' "$work/background-conservative-status.json"
+grep -q '"confidence_mode":"low"' "$work/background-conservative-status.json"
+grep -q '"configuration_written":false' "$work/background-conservative-status.json"
+unset CAKE_AUTORATE_AUTOTUNE_BACKGROUND_DL_KBPS CAKE_AUTORATE_AUTOTUNE_BACKGROUND_UL_KBPS
+
 export AUTOTUNE_MOCK_BLOCK=1
 export AUTOTUNE_MOCK_RESTORE_MARKER="$work/restored"
 "$autotune" cancelled lo start speedtest-go > "$work/cancel-start.json"
