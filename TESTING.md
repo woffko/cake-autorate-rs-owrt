@@ -23,7 +23,15 @@ the calculated floor, `quality_limited` appears when the safe floor prevents the
 target, old five-column graph history remains readable, and all new history
 stays in `/var/run`.
 
-RC6 adds a second disposable-router gate: two nftables mwan3 members, distinct
+RC7 also requires deterministic coverage for the separate detected rating:
+endpoint-specific p5 idle baselines, p90 loaded percentiles, the 2 ms noise
+clamp, worse-of-download/upload selection, bidirectional exclusion, route-change
+staleness, and `CURRENT`/`PREVIOUS` lifecycle. Graph acceptance checks the
+proportional RAM tiers, critical-memory suspension, shared per-instance budget,
+streaming compaction, bounded history paging, vertical WAN cards, grade-event
+hover details, and fixed non-scrolling axis labels.
+
+RC6 added a second disposable-router gate: two nftables mwan3 members, distinct
 CAKE/IFB pairs, per-member ICMP and HTTP/TCP probes, router-side speed tests,
 Full Auto-Tune isolation, failover/failback, and route relearning. Production
 deployment is permitted only after both the original single-WAN safety gate
@@ -273,3 +281,54 @@ intentional 50% evidence stage, exact hover values, and fixed chart axes:
 The data/timeline scrolled over more than 2,000 px in both layouts while these
 coordinates remained fixed. This is the acceptance condition for the RC6
 graph-scale regression.
+
+## RC7 detected-grade and RAM-history acceptance gate (2026-07-14)
+
+RC7 was first installed on a disposable OpenWrt 25.12.5 x86_64 router, then on
+an x86_64 two-uplink nftables-mwan3 router and an ARMv8 variable-WWAN router.
+The existing `cake-autorate`, SQM, network, and (where present) mwan3 files were
+hashed before and after each upgrade. Every hash remained unchanged. Existing
+CAKE rates, PPPoE overhead, routes, source addresses, policy tables, active /
+standby state, and external-path selection also remained unchanged.
+
+The exact release artifacts used for the gate were:
+
+| Artifact | SHA-256 |
+|---|---|
+| x86_64 daemon APK | `a69faf03c8905579ff465a99b1628776e2516f8185fd9f692db2e04a6ef9753c` |
+| aarch64_generic daemon APK | `b41a73730cdee070e01793438f99346b81c7ed6a4bcf5c02153cb27726380661` |
+| noarch LuCI APK | `afedbabe92c993ae61d9681834c89795a11a0d002ec1af0536c0e21fc280bfc6` |
+
+All runtime status files parsed as JSON and reported daemon version
+`1.0.0-rc.7`. The two-uplink router retained independent route identities and
+histories for its active primary and standby backup. The WWAN router retained
+its main-route identity and custom rates. The Status page displayed the live
+`CURRENT` detected-rating lifecycle and the last completed `PREVIOUS` result;
+before any result has completed, the latter explicitly reads
+`No completed rating yet` rather than implying a second learning cycle.
+
+RAM budgeting was checked at two materially different memory sizes. A
+disposable router with roughly 0.7 GiB available RAM exposed a 16 MiB safe
+maximum and selected a 4 MiB automatic budget. Larger routers exposed the
+100 MiB hard maximum; Auto selected 16 MiB total, split into 8 MiB per enabled
+history on the two-uplink system. Presets above the effective safe maximum were
+disabled in LuCI. History remained under `/var/run`, the helper returned
+bounded page/stat results, and every CSV row used the extended grade/state
+schema.
+
+Authenticated Playwright checks ran against the installed package on all three
+routers. They verified:
+
+- one vertically stacked graph card per uplink;
+- synchronized latency/CPU and download/upload canvases;
+- Y-axis labels remaining fixed during horizontal timeline scrolling;
+- exact RTT, CPU, DL, UL, floor, state, and grade values on hover;
+- current/previous detected-rating labels and the empty-previous state;
+- dynamic RAM preset disabling, usage, per-instance share, and history span;
+- no application console or page exception after authentication; and
+- no horizontal overflow at a 390 px mobile viewport.
+
+The local release gate passed 78 Rust tests, strict Clippy, Rust formatting,
+init/SQM conflict tests, scheduler and Auto-Tune lifecycle tests, speed-test
+routing tests, the graph-history helper test, four LuCI JavaScript suites,
+shell and JavaScript syntax checks, ACL JSON parsing, and `git diff --check`.

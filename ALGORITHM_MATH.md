@@ -70,11 +70,32 @@ the member has a non-zero share in the default mwan3 policy, otherwise
 `STANDBY`. An unavailable or mismatched member is `OFFLINE`; its pingers are
 stopped and it cannot accumulate reflector offences or promote a ceiling.
 
-The quality confidence is intentionally staged. A learned idle transport
-baseline contributes half of the evidence, so the UI may report
-`BASELINE READY` at 50% while waiting for natural loaded samples. That is a
-stable waiting state, not a stalled learning loop. A grade is emitted only
-after the loaded evidence required by the quality classifier exists.
+The strict controller quality confidence is intentionally staged. A learned
+idle transport baseline contributes half of that controller evidence, so the
+UI may report `BASELINE READY` while waiting for natural loaded samples. That
+is a stable waiting state, not a stalled learning loop.
+
+The separately displayed detected rating follows the current LibreQoS browser
+test statistics. For selected endpoint `e`, direction `d`, idle samples `I_e`,
+and loaded samples `J_d`:
+
+```text
+B_e       = percentile(I_e, 0.05)
+P_d       = percentile(J_d, 0.90)
+raw_d     = P_d - B_e
+delta_d   = 0                    if abs(raw_d) < 2 ms
+            max(raw_d, 0)       otherwise
+grade     = max_severity(grade(delta_DL), grade(delta_UL))
+```
+
+Percentiles are linearly interpolated between adjacent sorted observations.
+Bidirectional samples are reported but excluded from `grade`. The boundaries
+are A+ for `delta < 5`, A for `< 30`, B for `< 60`, C for `< 200`, D for
+`< 400`, and F otherwise. At least three idle samples and three loaded samples
+are required. `CURRENT` is the active provisional/final result; `PREVIOUS` is
+the last completed episode and remains visible while another episode collects.
+All these samples are scoped to `I_u`; after a route change the retained result
+is explicitly stale and cannot be combined with new samples.
 
 All ICMP, transport, speed-test, and Auto-Tune observations are accepted only
 when their route identity equals the instance identity:
@@ -288,6 +309,42 @@ UL: 860000 -> 885800 -> 912374 -> 939745 -> 950000 (cap)
 These are ceiling targets, not unconditional rate jumps. Each direction still
 needs continuous clean high load, must ramp through the fast controller, must
 complete its observation interval, and can independently roll back.
+
+## Bounded RAM-only graph history
+
+Graph storage is optional controller telemetry, never a control dependency. Let
+`V` be Linux `MemAvailable` plus bytes already owned by all history files. The
+safe global maximum is selected from proportional tiers:
+
+| `V` | Safe maximum |
+|---:|---:|
+| below 64 MiB | 256 KiB |
+| 64–128 MiB | 1 MiB |
+| 128–256 MiB | 2 MiB |
+| 256–512 MiB | 8 MiB |
+| 512–768 MiB | 16 MiB |
+| 768 MiB–1 GiB | 32 MiB |
+| at least 1 GiB | 100 MiB |
+
+Adding owned history back to `V` prevents the safe tier from oscillating merely
+because this application consumed its own allowance. In `auto` mode the
+requested preset is the largest supported value no greater than one quarter of
+the safe maximum. For a manual request `U`, total RAM `T`, and current owned
+history `H`:
+
+```text
+reserve       = max(32 MiB, 0.05 * T)
+pressure_cap  = max(H + MemAvailable - reserve, 0)
+effective     = min(U, safe_max(V), pressure_cap, 100 MiB)
+per_instance  = floor(effective / enabled_history_instances)
+```
+
+When `MemAvailable < 16 MiB`, `effective = 0`; existing graph files are removed
+and sampling pauses, while autorate continues normally. The daemon refreshes
+the budget every 30 seconds. On reaching an instance cap it streams the newest
+rows into a replacement file targeting 75% of the cap, so compaction itself
+does not load a large history into RAM. Browser reads are separately paged and
+bounded to 10,000 rows.
 
 ## Choosing fixed SQM or autorate
 

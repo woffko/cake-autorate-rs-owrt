@@ -32,8 +32,9 @@ does not claim authorship of the original cake-autorate concept.
   proposal formulas, safety contract, confidence score, and remaining shaped
   validation gate.
 - [Transport-aware quality control](TRANSPORT_QUALITY.md) documents HTTP/TCP
-  latency fusion, estimated grades, the throughput floor, bounded natural-load
-  search, and scheduled Full Auto-Tune.
+  latency fusion, the strict control signal, LibreQoS-like detected ratings,
+  the throughput floor, bounded natural-load search, and scheduled Full
+  Auto-Tune.
 - [Multi-WAN routing and lifecycle](MULTIWAN.md) describes the structured
   `main`/`mwan3` route model, per-uplink state isolation, failover/recovery,
   route identity checks, SQM ownership, and operational diagnostics.
@@ -47,10 +48,10 @@ plus OpenWrt userland tools.
 
 The current tree builds these OpenWrt 25.12.5 APKs:
 
-- `cake-autorate-rs-1.0_rc6-r1-x86_64.apk` — x86_64 autorate daemon.
-- `cake-autorate-rs-1.0_rc6-r1-aarch64_generic.apk` — rockchip/armv8
+- `cake-autorate-rs-1.0_rc7-r1-x86_64.apk` — x86_64 autorate daemon.
+- `cake-autorate-rs-1.0_rc7-r1-aarch64_generic.apk` — rockchip/armv8
   autorate daemon.
-- `luci-app-cake-autorate-rs-1.0_rc6-r1.apk` — architecture-independent LuCI
+- `luci-app-cake-autorate-rs-1.0_rc7-r1.apk` — architecture-independent LuCI
   interface and SQM integration.
 
 The daemon package installs `uci`, `fping`, and `uclient-fetch` as dependencies.
@@ -61,7 +62,7 @@ installer includes the standard mbedTLS provider when none is already present.
 The wizard now labels a device with its logical OpenWrt networks, for example
 `eth1 — wan, wan6`, while continuing to save and use the physical device name.
 
-RC6 adds structured nftables `mwan3` support. One autorate instance owns one
+RC6 added structured nftables `mwan3` support. One autorate instance owns one
 uplink, one CAKE/IFB pair, one route identity, and independent latency,
 transport, quality, throughput-reference, and adaptive-ceiling state. ICMP,
 HTTP/TCP, speed tests, and Full Auto-Tune all use the same `main` route or a
@@ -77,13 +78,23 @@ ownership. A speed test or Full Auto-Tune pauses only the selected daemon and
 queue, verifies route identity/external IP before accepting evidence, and pins
 all speedtest-go calibration phases to the first selected server.
 
-RC6 retains optional RAM-only synchronized RTT/CPU and DL/UL charts with a
-1–60 second per-instance interval, a 128 KiB cap, shared scroll/follow state,
-exact hover values, and fixed Y-axis labels that remain visible while the data
-timeline scrolls. CPU remains available in live Status without CPU log output.
-The Quality cell distinguishes an untrained link from a learned baseline that
-is merely waiting for loaded traffic, avoiding an indefinite-looking
-`LEARNING 50%` state.
+RC7 adds a user-facing detected connection rating that follows the current
+LibreQoS browser-test method: per-endpoint idle p5, per-direction loaded p90,
+sub-2 ms noise clamping, and the worse of download/upload A+/A/B/C/D/F grades.
+Status displays `CURRENT` while a test is collecting and retains `PREVIOUS`
+until the new result completes, so the last useful grade never disappears.
+Bidirectional latency remains visible as a diagnostic but does not lower the
+overall grade. A route or external-address change marks the previous result
+stale and starts isolated baseline learning for that uplink.
+
+Optional RAM-only graphs now use one configurable global budget shared across
+enabled instances. LuCI derives a safe upper bound from `MemAvailable`, offers
+only proportional presets (from 256 KiB through 100 MiB), pages older samples
+instead of loading the whole history into the browser, and pauses history under
+critical memory pressure. WAN cards are stacked vertically; synchronized
+RTT/CPU and DL/UL charts retain exact hover values and fixed Y-axis labels while
+their common timeline scrolls. CPU remains available in live Status without CPU
+log output.
 
 The release includes separate minimal x86_64 and rockchip/armv8 offline
 bundles. Extract the matching archive under `/root/` and run its included
@@ -153,8 +164,9 @@ Implemented:
 - Optional transport-aware HTTP/TCP latency, also disabled by default. It
   complements ICMP, blocks unsafe upward growth when ordinary transport is
   delayed, drives a bounded natural-traffic search above a protected throughput
-  floor, and exposes an explicitly estimated A+/A/B/C/D/F class plus
-  `quality_limited` reason. See [TRANSPORT_QUALITY.md](TRANSPORT_QUALITY.md).
+  floor, and exposes a strict controller signal plus a separately sampled
+  LibreQoS-like detected A+/A/B/C/D/F rating and `quality_limited` reason. See
+  [TRANSPORT_QUALITY.md](TRANSPORT_QUALITY.md).
 - `tc qdisc change ... cake bandwidth ...` shaper updates.
 - Upstream-style idle/stall handling: sustained idle can stop pingers, activity
   restarts them, and optional minimum-rate enforcement applies on sustained idle
@@ -162,14 +174,16 @@ Implemented:
 - daemon log rotation by age/size with best-effort gzip compression.
 - JSON status file under `/var/run/cake-autorate/<instance>/status.json`.
 - Optional per-instance LuCI `Graphs` history for RTT, transport/effective
-  latency, total CPU, download/upload traffic, and DL/UL safety floors. It is
-  disabled by default and enabled directly on each active
+  latency, total CPU, download/upload traffic, DL/UL safety floors, and detected
+  grade events. It is disabled by default and enabled directly on each active
   instance card. A per-instance dropdown selects 1, 2, 5, 10, 15, 30, or 60
-  second sampling. Both charts share a horizontally scrollable timeline,
-  auto-follow new samples until the user scrolls back, and expose exact values
-  on hover. Samples stay only in `/var/run` tmpfs, and a hard 128 KiB
-  per-instance cap removes the oldest rows before RAM use can grow unbounded.
-  History is removed when the service stops and never writes router flash.
+  second sampling. Each uplink is a separate vertical card; both charts share a
+  horizontally scrollable timeline, auto-follow new samples until the user
+  scrolls back, and expose exact values on hover. Samples stay only in
+  `/var/run` tmpfs. A configurable global `auto` or 256 KiB–100 MiB budget is
+  divided across enabled instances, dynamically capped from `MemAvailable`, and
+  compacted in a streaming pass. Older rows are read in bounded pages, critical
+  memory pressure pauses history, and no sample is written to router flash.
 - LuCI Status can export a diagnostic text bundle containing redacted
   cake-autorate config, SQM config, runtime status, daemon logs, package
   versions, and recent syslog lines.
@@ -457,16 +471,16 @@ them together. For x86_64:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc6-r1-x86_64.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc6-r1.apk
+  /root/cake-autorate-rs-1.0_rc7-r1-x86_64.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc7-r1.apk
 ```
 
 For rockchip/armv8 (`aarch64_generic`):
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc6-r1-aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc6-r1.apk
+  /root/cake-autorate-rs-1.0_rc7-r1-aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc7-r1.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:
@@ -486,16 +500,16 @@ x86_64:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc6-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc6-x86_64.sh
+tar -xzf cake-autorate-rs-1.0-rc7-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc7-x86_64.sh
 ```
 
 Banana Pi R2 Pro and other OpenWrt 25.12.5 rockchip/armv8 devices:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc6-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc6-aarch64_generic.sh
+tar -xzf cake-autorate-rs-1.0-rc7-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc7-aarch64_generic.sh
 ```
 
 The installer resolves its own location, so it also works when the extracted
@@ -533,14 +547,21 @@ LuCI `Graphs` page; from the shell it can be changed with:
 ```sh
 uci set cake-autorate.primary.graph_history_enabled='1'  # use '0' to disable
 uci set cake-autorate.primary.graph_history_interval_s='10'  # accepted: 1-60
+uci set cake-autorate.globals.graph_history_ram_budget_kib='auto'
 uci commit cake-autorate
 /etc/init.d/cake-autorate restart
 ```
 
 When enabled, `history.csv` is sampled at the selected interval under
-`/var/run/cake-autorate/<instance>/`. Each row contains timestamp, RTT, total
-CPU, download kbit/s, and upload kbit/s. It has a hard 128 KiB per-instance
-limit, is removed on service stop/reboot, and is never stored in flash.
+`/var/run/cake-autorate/<instance>/`. Each row contains timestamp, RTT,
+transport/effective latency, total CPU, download/upload kbit/s, safety floors,
+and a detected-grade event when one changes. The global budget accepts `auto`
+or one of `256`, `512`, `1024`, `2048`, `4096`, `8192`, `16384`, `32768`,
+`65536`, and `102400` KiB. The daemon caps that request according to available
+RAM and divides the effective total across enabled histories. For example,
+roughly 100 MiB available permits at most 1 MiB total, while 1 GiB permits at
+most 100 MiB. At less than 16 MiB available, collection pauses and releases its
+history. Files are removed on service stop/reboot and never stored in flash.
 
 ## Quick Checks
 

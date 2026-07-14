@@ -24,7 +24,7 @@ const windowStub = {
 };
 const loadHelpers = new Function('fs', 'poll', 'uci', 'ui', 'L', 'E', '_', 'window',
 	`${prefix}\nreturn { parseHistory, historyInterval, buildChartGeometry, nearestPoint, ` +
-		'bindHover, bindScroll, scrollState };');
+		'bindHover, bindScroll, scrollState, formatMemoryKib };');
 const helpers = loadHelpers({}, {}, {}, {}, {}, () => {}, value => value, windowStub);
 
 function assert(condition, message) {
@@ -36,10 +36,18 @@ assert(source.includes('.cake-graph-fixed-axis{position:sticky;left:0'),
 	'Y-axis labels must stay fixed while the data timeline scrolls');
 assert(source.includes('.cake-graph-chart-title{position:sticky;left:0'),
 	'chart titles must stay fixed while the data timeline scrolls');
+assert(source.includes('.cake-graphs-grid{display:grid;grid-template-columns:minmax(0,1fr)'),
+	'different WAN cards must be stacked in one column');
+assert(source.includes('HISTORY_PAGE_SAMPLES = 10000'),
+	'large histories must be fetched in bounded pages');
+assert(source.includes('graph_history_ram_budget_kib'),
+	'Graphs must expose the global RAM budget');
+assert(helpers.formatMemoryKib(1024) === '1.0 MiB', 'memory formatter failed');
+assert(helpers.formatMemoryKib(null) === '-', 'missing memory must not look like zero use');
 
 const now = Math.floor(Date.now() / 1000);
 const points = helpers.parseHistory([
-	`${now - 2},10.125,1.5,1000.0,500.0,20.5,22.0,600.0,300.0,ACTIVE,mwan3|wan|pppoe-wan|198.51.100.1|0x100|1`,
+	`${now - 2},10.125,1.5,1000.0,500.0,20.5,22.0,600.0,300.0,ACTIVE,mwan3|wan|pppoe-wan|198.51.100.1|0x100|1,A+,final,1.25`,
 	`${now - 1},,2.5,2000.0,750.0`,
 	`${now},12.500,3.5,3000.0,1000.0`,
 ].join('\n'));
@@ -51,6 +59,8 @@ assert(points[0].dlFloor === 600 && points[0].ulFloor === 300,
 	'nine-column throughput floor parsing failed');
 assert(points[0].uplinkState === 'ACTIVE' && points[0].routeIdentity.includes('0x100'),
 	'Multi-WAN state and route identity parsing failed');
+assert(points[0].grade === 'A+' && points[0].gradeState === 'final' && points[0].gradeIncrease === 1.25,
+	'quality-grade event parsing failed');
 
 const legacy = helpers.parseHistory(`${now},9.5,4.0`);
 assert(legacy.length === 1 && legacy[0].dl === null && legacy[0].ul === null,
@@ -92,7 +102,7 @@ const canvas = eventTarget({
 });
 helpers.bindHover(canvas, geometry, hoverInfo);
 canvas.emit('mousemove', { clientX: geometry.width - geometry.right });
-for (const label of ['RTT', 'transport', 'effective', 'CPU', 'DL', 'UL', 'floors'])
+for (const label of ['grade', 'RTT', 'transport', 'effective', 'CPU', 'DL', 'UL', 'floors'])
 	assert(hoverInfo.textContent.includes(label), `hover output is missing ${label}`);
 assert(hoverInfo.style.visibility === 'visible', 'hover output should be visible');
 canvas.emit('mouseleave');

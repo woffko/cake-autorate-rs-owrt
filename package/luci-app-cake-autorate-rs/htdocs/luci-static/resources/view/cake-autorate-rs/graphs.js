@@ -5,11 +5,14 @@
 'require ui';
 'require cake-autorate-rs.ui as cakeUi';
 
-var HISTORY_MAX_KIB = 128;
 var HISTORY_INTERVALS = [ 1, 2, 5, 10, 15, 30, 60 ];
+var HISTORY_BUDGETS_KIB = [ 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 102400 ];
+var HISTORY_PAGE_SAMPLES = 10000;
 var GRAPH_POINT_SPACING_PX = 2;
 var GRAPH_MAX_WIDTH_PX = 20000;
 var graphScrollStates = {};
+var graphPageOffsets = {};
+var graphRefreshNow = null;
 
 function statusPath(section) {
 	return '/var/run/cake-autorate/' + section + '/status.json';
@@ -27,7 +30,8 @@ function parseHistory(data) {
 	var points = [];
 
 	String(data || '').split(/\n/).forEach(function(line) {
-		var fields, timestamp, rtt, cpu, dl, ul, transport, effective, dlFloor, ulFloor, uplinkState, routeIdentity;
+		var fields, timestamp, rtt, cpu, dl, ul, transport, effective, dlFloor, ulFloor,
+			uplinkState, routeIdentity, grade, gradeState, gradeIncrease;
 
 		if (!line)
 			return;
@@ -47,6 +51,9 @@ function parseHistory(data) {
 		ulFloor = fields.length < 9 || fields[8] === '' ? null : Number(fields[8]);
 		uplinkState = fields.length < 10 ? '' : fields[9];
 		routeIdentity = fields.length < 11 ? '' : fields[10];
+		grade = fields.length < 12 ? '' : fields[11];
+		gradeState = fields.length < 13 ? '' : fields[12];
+		gradeIncrease = fields.length < 14 || fields[13] === '' ? null : Number(fields[13]);
 		if (!isFinite(timestamp) || timestamp <= 0)
 			return;
 
@@ -61,18 +68,36 @@ function parseHistory(data) {
 			dlFloor: dlFloor == null || !isFinite(dlFloor) ? null : dlFloor,
 			ulFloor: ulFloor == null || !isFinite(ulFloor) ? null : ulFloor,
 			uplinkState: uplinkState,
-			routeIdentity: routeIdentity
+			routeIdentity: routeIdentity,
+			grade: grade,
+			gradeState: gradeState,
+			gradeIncrease: gradeIncrease == null || !isFinite(gradeIncrease) ? null : gradeIncrease
 		});
 	});
 
 	return points;
 }
 
-function readHistory(section, enabled) {
+function readHistory(section, enabled, offset, total) {
 	if (!enabled)
 		return Promise.resolve([]);
 
-	return L.resolveDefault(fs.read_direct(historyPath(section)).then(parseHistory), []);
+	offset = Math.max(0, Number(offset || 0));
+	return fs.exec('/usr/libexec/cake-autorate-rs/graph-history', [
+		section, 'read', String(offset), String(HISTORY_PAGE_SAMPLES)
+	]).then(function(result) {
+		if (result.code !== 0)
+			throw new Error(result.stderr || 'history helper failed');
+		var points = parseHistory(result.stdout || '');
+		var available = Math.max(0, Number(total || points.length) - offset);
+		return points.slice(0, Math.min(HISTORY_PAGE_SAMPLES, available || points.length));
+	}).catch(function() {
+		return L.resolveDefault(fs.read_direct(historyPath(section)).then(function(data) {
+			var points = parseHistory(data);
+			var end = Math.max(0, points.length - offset);
+			return points.slice(Math.max(0, end - HISTORY_PAGE_SAMPLES), end);
+		}), []);
+	});
 }
 
 function isEnabled(section) {
@@ -125,16 +150,23 @@ function formatTime(timestamp, includeDate) {
 function loadInstances(sections) {
 	return Promise.all(sections.map(function(section) {
 		var enabled = historyEnabled(section);
+		var sectionName = section['.name'];
 
-		return Promise.all([
-			readStatus(section['.name']),
-			readHistory(section['.name'], enabled)
-		]).then(function(data) {
+		return readStatus(sectionName).then(function(status) {
+			var total = Number(status && status.graph_history_stored_samples || 0);
+			var offset = Math.max(0, Number(graphPageOffsets[sectionName] || 0));
+			if (total > 0)
+				offset = Math.min(offset, Math.max(0, total - 1));
+			graphPageOffsets[sectionName] = offset;
+			return readHistory(sectionName, enabled, offset, total).then(function(history) {
 			return {
 				section: section,
-				status: data[0],
-				history: data[1]
+				status: status,
+				history: history,
+				historyOffset: offset,
+				historyTotal: total || history.length
 			};
+			});
 		});
 	}));
 }
@@ -176,6 +208,80 @@ function setHistoryInterval(section, interval, select, previous) {
 		if (!select.disabled)
 			select.value = String(previous);
 	});
+}
+
+function formatMemoryKib(kib) {
+	if (kib == null || kib === '')
+		return '-';
+	kib = Number(kib);
+	if (!isFinite(kib) || kib < 0)
+		return '-';
+	if (kib >= 1024 * 1024)
+		return (kib / 1024 / 1024).toFixed(2) + ' GiB';
+	if (kib >= 1024)
+		return (kib / 1024).toFixed(kib >= 10 * 1024 ? 0 : 1) + ' MiB';
+	return Math.round(kib) + ' KiB';
+}
+
+function budgetLabel(kib) {
+	if (kib === 'auto')
+		return _('Automatic (recommended)');
+	return formatMemoryKib(Number(kib));
+}
+
+function setHistoryBudget(value, select, previous) {
+	select.disabled = true;
+	return fs.exec('/usr/libexec/cake-autorate-rs/graph-history', [
+		'globals', 'set-budget', String(value)
+	]).then(function(result) {
+		if (result.code !== 0)
+			throw new Error(result.stderr || _('Unable to save the RAM budget.'));
+		window.location = window.location.href.split('#')[0];
+	}).catch(function(err) {
+		select.disabled = false;
+		select.value = String(previous);
+		ui.addNotification(null,
+			E('p', _('Unable to update graph RAM budget: %s').format(err.message || err)),
+			'error');
+	});
+}
+
+function renderMemoryBudget(instances, globalSection) {
+	var status = instances.map(function(instance) { return instance.status; }).filter(Boolean)[0] || {};
+	var configured = String(globalSection && globalSection.graph_history_ram_budget_kib || 'auto');
+	var safeMax = Number(status.graph_history_safe_max_kib || 1024);
+	var select = E('select', {
+		'class': 'cbi-input-select cake-graph-budget-select',
+		'title': _('Total RAM budget shared by all graph histories')
+	}, [ E('option', { 'value': 'auto' }, budgetLabel('auto')) ].concat(
+		HISTORY_BUDGETS_KIB.map(function(value) {
+			return E('option', {
+				'value': String(value),
+				'disabled': value > safeMax && String(value) !== configured ? '' : null
+			}, budgetLabel(value));
+		})
+	));
+
+	select.value = configured;
+	select.addEventListener('change', function() {
+		return setHistoryBudget(select.value, select, configured);
+	});
+
+	return E('div', { 'class': 'cake-graph-memory-panel' }, [
+		E('label', { 'class': 'cake-graph-budget-label' }, [
+			E('span', {}, _('History RAM budget')),
+			select
+		]),
+		E('div', { 'class': 'cake-graph-memory-stats' }, [
+			E('span', {}, _('Available: %s').format(formatMemoryKib(status.graph_history_mem_available_kib))),
+			E('span', {}, _('Safe maximum: %s').format(formatMemoryKib(safeMax))),
+			E('span', {}, _('Effective: %s').format(formatMemoryKib(status.graph_history_effective_total_kib))),
+			E('span', {}, _('Used: %s').format(formatMemoryKib(status.graph_history_used_total_kib))),
+			E('span', {}, _('Instances: %d').format(Number(status.graph_history_instances || instances.length || 0))),
+			status.graph_history_paused_low_memory ?
+				E('strong', { 'class': 'cake-graph-memory-paused' }, _('History paused: low available RAM')) : ''
+		])
+	]);
 }
 
 function drawLine(ctx, points, valueKey, xFor, yFor, color) {
@@ -325,6 +431,47 @@ function drawRouteEvents(ctx, geometry) {
 	}
 }
 
+function gradeColor(grade) {
+	if (grade === 'A+' || grade === 'A')
+		return '#16a085';
+	if (grade === 'B')
+		return '#8eae2f';
+	if (grade === 'C')
+		return '#d08b20';
+	return '#d34b4b';
+}
+
+function drawGradeEvents(ctx, geometry, labels) {
+	var previousGrade = '';
+	var previousState = '';
+
+	geometry.points.forEach(function(point) {
+		if (!point.grade)
+			return;
+		var changed = point.grade !== previousGrade ||
+			(point.gradeState === 'final' && previousState !== 'final');
+		previousGrade = point.grade;
+		previousState = point.gradeState;
+		if (!changed)
+			return;
+
+		var x = chartX(geometry, point.timestamp);
+		ctx.save();
+		ctx.strokeStyle = gradeColor(point.grade);
+		ctx.setLineDash([ 2, 3 ]);
+		ctx.beginPath();
+		ctx.moveTo(x, geometry.top);
+		ctx.lineTo(x, geometry.top + geometry.plotHeight);
+		ctx.stroke();
+		if (labels) {
+			ctx.setLineDash([]);
+			ctx.fillStyle = ctx.strokeStyle;
+			ctx.fillText(point.grade, x + 3, geometry.top + 25);
+		}
+		ctx.restore();
+	});
+}
+
 function drawLatencyChart(canvas, geometry) {
 	var ctx = prepareCanvas(canvas, geometry);
 	var rttMax = 10;
@@ -369,6 +516,7 @@ function drawLatencyChart(canvas, geometry) {
 		return chartX(geometry, timestamp);
 	}, cpuY, '#6c5ce7');
 	drawRouteEvents(ctx, geometry);
+	drawGradeEvents(ctx, geometry, true);
 	return rttMax;
 }
 
@@ -430,6 +578,7 @@ function drawTrafficChart(canvas, geometry) {
 		return chartX(geometry, timestamp);
 	}, rateY, '#f6b26b');
 	drawRouteEvents(ctx, geometry);
+	drawGradeEvents(ctx, geometry, false);
 	return rateMax;
 }
 
@@ -482,9 +631,11 @@ function bindHover(canvas, geometry, hoverInfo) {
 			(geometry.lastTimestamp - geometry.firstTimestamp) * ratio;
 		var point = nearestPoint(geometry.points, timestamp);
 
-		hoverInfo.textContent = '%s · %s · RTT %s · transport Δ %s · effective Δ %s · CPU %s · DL %s · UL %s · floors %s/%s'.format(
+		hoverInfo.textContent = '%s · %s · grade %s (%s) · RTT %s · transport Δ %s · effective Δ %s · CPU %s · DL %s · UL %s · floors %s/%s'.format(
 			new Date(point.timestamp * 1000).toLocaleString(),
 			point.uplinkState || '-',
+			point.grade || '-',
+			formatMetric(point.gradeIncrease, ' ms', 1),
 			formatMetric(point.rtt, ' ms', 3),
 			formatMetric(point.transport, ' ms', 3),
 			formatMetric(point.effective, ' ms', 3),
@@ -556,12 +707,20 @@ function renderIntervalSelect(sectionName, interval) {
 	]);
 }
 
+function changeHistoryPage(sectionName, offset) {
+	graphPageOffsets[sectionName] = Math.max(0, Math.round(offset));
+	graphScrollStates[sectionName] = { followLatest: true, left: 0 };
+	return graphRefreshNow ? graphRefreshNow() : Promise.resolve();
+}
+
 function renderCard(instance) {
 	var section = instance.section;
 	var status = instance.status || {};
 	var sectionName = section['.name'];
 	var enabled = historyEnabled(section);
 	var interval = historyInterval(section);
+	var totalSamples = Number(instance.historyTotal || (instance.history || []).length);
+	var pageOffset = Number(instance.historyOffset || 0);
 	var button = E('button', {
 		'class': enabled ? 'btn cbi-button cbi-button-negative' : 'btn cbi-button cbi-button-action'
 	}, enabled ? _('Disable history') : _('Enable history'));
@@ -600,6 +759,24 @@ function renderCard(instance) {
 		var latestButton = E('button', {
 			'class': 'btn cbi-button cbi-button-neutral cake-graph-latest'
 		}, _('Latest'));
+		var olderButton = E('button', {
+			'class': 'btn cbi-button cbi-button-neutral cake-graph-page',
+			'disabled': totalSamples > pageOffset + (instance.history || []).length ? null : ''
+		}, _('Older'));
+		var newerButton = E('button', {
+			'class': 'btn cbi-button cbi-button-neutral cake-graph-page',
+			'disabled': pageOffset > 0 ? null : ''
+		}, _('Newer'));
+		olderButton.addEventListener('click', function() {
+			return changeHistoryPage(sectionName, pageOffset + (instance.history || []).length);
+		});
+		newerButton.addEventListener('click', function() {
+			return changeHistoryPage(sectionName, Math.max(0, pageOffset - HISTORY_PAGE_SAMPLES));
+		});
+		var usedBytes = Math.max(1, Number(status.graph_history_used_instance_kib || 0) * 1024);
+		var bytesPerSample = totalSamples > 0 ? Math.max(1, usedBytes / totalSamples) : 120;
+		var estimatedHours = Number(status.graph_history_instance_budget_kib || 0) * 1024 /
+			bytesPerSample * interval / 3600;
 
 		body = E('div', { 'class': 'cake-graph-body' }, [
 			E('div', { 'class': 'cake-graph-legend' }, [
@@ -616,7 +793,15 @@ function renderCard(instance) {
 				E('span', { 'class': 'cake-graph-ul' },
 					_('UL: %s').format(formatTrafficRate(status.ul_achieved_rate_kbps))),
 				E('span', { 'class': 'cake-graph-samples' },
-					_('Stored: %d samples').format((instance.history || []).length)),
+					_('Showing: %d / %d · offset %d').format(
+						(instance.history || []).length, totalSamples, pageOffset)),
+				E('span', { 'class': 'cake-graph-samples' },
+					_('RAM: %s / %s · about %s h').format(
+						formatMemoryKib(status.graph_history_used_instance_kib),
+						formatMemoryKib(status.graph_history_instance_budget_kib),
+						isFinite(estimatedHours) ? estimatedHours.toFixed(1) : '-')),
+				olderButton,
+				newerButton,
 				latestButton
 			]),
 			hoverInfo,
@@ -670,8 +855,9 @@ return L.view.extend({
 	load: function() {
 		return uci.load('cake-autorate').then(function() {
 			var sections = uci.sections('cake-autorate', 'cake_autorate');
+			var globalSection = uci.sections('cake-autorate', 'globals')[0] || {};
 			return loadInstances(sections).then(function(instances) {
-				return [ sections, instances ];
+				return [ sections, instances, globalSection ];
 			});
 		});
 	},
@@ -679,11 +865,16 @@ return L.view.extend({
 	render: function(data) {
 		cakeUi.ensureAppHeader();
 		var sections = data[0];
+		var globalSection = data[2] || {};
 		var content = renderInstances(data[1]);
+		var memoryPanel = renderMemoryBudget(data[1], globalSection);
 		var root = E('div', {}, [
 			E('style', {}, [
 				'.cake-graphs-warning{margin-bottom:18px}',
-				'.cake-graphs-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:16px}',
+				'.cake-graphs-grid{display:grid;grid-template-columns:minmax(0,1fr);gap:16px}',
+				'.cake-graph-memory-panel{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap;margin:0 0 18px;padding:12px 14px;border:1px solid rgba(127,127,127,.3);border-radius:6px;background:rgba(127,127,127,.05)}',
+				'.cake-graph-budget-label{display:flex;flex-direction:column;gap:4px;font-weight:600}.cake-graph-budget-select{min-width:220px}',
+				'.cake-graph-memory-stats{display:flex;gap:14px;flex-wrap:wrap;color:#777}.cake-graph-memory-paused{color:#d34b4b}',
 				'.cake-graph-card{min-width:0;border:1px solid rgba(127,127,127,.3);border-radius:6px;padding:14px;background:rgba(127,127,127,.04)}',
 				'.cake-graph-header{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px}',
 				'.cake-graph-header h3{margin:0 0 3px}',
@@ -703,25 +894,31 @@ return L.view.extend({
 				'.cake-graph-axis-top{top:27px}.cake-graph-axis-bottom{top:181px}',
 				'.cake-graph-canvas{display:block;max-width:none;height:220px}',
 				'.cake-graph-disabled{min-height:80px;display:flex;align-items:center;color:#777}',
-				'@media(max-width:600px){.cake-graphs-grid{grid-template-columns:1fr}.cake-graph-header{align-items:flex-start;flex-direction:column}.cake-graph-actions{width:100%;justify-content:space-between}.cake-graph-canvas{height:200px}.cake-graph-latest{margin-left:0}}'
+				'@media(max-width:600px){.cake-graphs-grid{grid-template-columns:minmax(0,1fr)}.cake-graph-header{align-items:flex-start;flex-direction:column}.cake-graph-actions{width:100%;justify-content:space-between}.cake-graph-canvas{height:200px}.cake-graph-latest{margin-left:0}.cake-graph-memory-panel{align-items:stretch;flex-direction:column}.cake-graph-budget-select{width:100%}}'
 			].join('')),
 			E('div', { 'class': 'alert-message warning cake-graphs-warning' }, [
 				E('strong', {}, _('Optional RAM history. ')),
-				_('Enabling graphs stores RTT, transport/effective latency, CPU, download/upload, and safety-floor samples only in /var/run (RAM), never in flash. Each active instance can use up to %d KiB. Choose a per-instance interval from 1 second to 1 minute; shorter intervals fill the limit sooner. Oldest samples are discarded automatically. Both charts share one horizontal timeline and follow the newest data until you scroll back. Hover over either chart for exact values. Data is cleared when the service stops or the router reboots.')
-					.format(HISTORY_MAX_KIB)
+				_('Enabling graphs stores RTT, transport/effective latency, CPU, download/upload, and safety-floor samples only in /var/run (RAM), never in flash. The selected total budget is shared by all enabled instances and is reduced automatically under memory pressure. Large histories are fetched in bounded pages so the browser never loads the entire RAM buffer. Oldest samples are discarded automatically. Both charts share one horizontal timeline and follow the newest data until you scroll back. Hover over either chart for exact values. Data is cleared when the service stops or the router reboots.')
 			]),
+			memoryPanel,
 			content
 		]);
 
-		poll.add(function() {
+		graphRefreshNow = function() {
 			return loadInstances(sections).then(function(instances) {
 				var nextContent = renderInstances(instances);
+				var nextMemoryPanel = renderMemoryBudget(instances, globalSection);
 				if (content.parentNode) {
 					content.parentNode.replaceChild(nextContent, content);
 					content = nextContent;
 				}
+				if (memoryPanel.parentNode) {
+					memoryPanel.parentNode.replaceChild(nextMemoryPanel, memoryPanel);
+					memoryPanel = nextMemoryPanel;
+				}
 			});
-		}, 5);
+		};
+		poll.add(graphRefreshNow, 5);
 
 		return root;
 	},

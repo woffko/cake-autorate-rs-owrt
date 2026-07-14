@@ -5,7 +5,7 @@ with small HTTP/TCP requests. It addresses links where ICMP remains clean while
 ordinary TCP traffic queues badly. It is disabled by default and does not write
 samples to flash.
 
-## Signals and classification
+## Strict controller signal
 
 Each configured HTTP(S) endpoint keeps its own 20-sample idle-latency window.
 The endpoint baseline is the 20th percentile of that window. A sample taken
@@ -27,19 +27,66 @@ effective_delta_ms = max(ICMP_DL_delta_ms,
                          confirmed_transport_delta_ms)
 ```
 
-The Status grade is explicitly an estimate, not a LibreQoS or Ookla result:
+The strict controller class uses the effective confirmed signal above. Its
+threshold labels match LibreQoS grade boundaries, but its sampling deliberately
+remains conservative and stateful for shaper control:
 
-| Effective loaded increase | Estimated class |
+| Effective loaded increase | Controller class |
 |---:|:---|
-| up to 5 ms | A+ |
-| up to 30 ms | A |
-| up to 60 ms | B |
-| up to 200 ms | C |
-| up to 400 ms | D |
-| over 400 ms | F |
+| less than 5 ms | A+ |
+| less than 30 ms | A |
+| less than 60 ms | B |
+| less than 200 ms | C |
+| less than 400 ms | D |
+| 400 ms or more | F |
 
-Before enough endpoint and loaded samples exist the class is `LEARNING`.
-Status also shows confidence, sample age, per-direction classes, and a reason.
+Before enough endpoint and loaded samples exist this signal is `LEARNING` or
+`BASELINE READY`. It continues to drive the throughput floor and bounded search
+described below. It is not the user-facing connection test and is never
+weakened merely to make a displayed grade look better.
+
+## Detected LibreQoS-like rating
+
+RC7 adds a second, observational tracker for the Status and Graphs pages. Its
+statistics follow the method used by the live LibreQoS Internet Quality Test in
+July 2026:
+
+```text
+idle_baseline(endpoint) = p5(idle HTTP/TCP samples for that endpoint)
+loaded_delta(direction) = p90(loaded HTTP/TCP samples for that direction)
+                          - idle_baseline(the selected endpoint)
+scored_delta(direction) = 0, when abs(loaded_delta) < 2 ms
+                          max(loaded_delta, 0), otherwise
+overall_grade = worse(grade(download), grade(upload))
+```
+
+The bidirectional phase is retained as a diagnostic but, matching the live
+test, does not affect the overall grade. The same exact `<5`, `<30`, `<60`,
+`<200`, `<400`, otherwise-F boundaries are used. This is described as
+*LibreQoS-like* rather than an official LibreQoS result because the daemon uses
+natural routed traffic and small rotating HTTP probes rather than LibreQoS's
+browser traffic generator.
+
+Each endpoint owns a 40-sample idle window. At least three clean idle samples
+are required before its baseline can score a load episode, and at least three
+loaded samples are required before that direction is final. One endpoint is
+selected for an episode so different DNS/TCP/TLS paths are never subtracted
+from one another. During an active episode Status publishes a partial
+`CURRENT` value and its sample progress. When the episode ends, the completed
+result becomes `PREVIOUS`; while the next episode is still `COLLECTING`, that
+previous result remains visible instead of being replaced by an empty grade.
+
+Every result records its endpoint, baseline p5, loaded p90, direction, sample
+count, completion time, and route identity. A route, source/external address,
+or member change clears the affected endpoint learning and marks the retained
+previous result `STALE`. Results and baselines never cross uplinks.
+
+The compatibility reference is the live
+[LibreQoS Internet Quality Test](https://test.libreqos.com/advanced/) and its
+published browser implementation. LibreQoS may evolve independently; this
+document and the daemon status field
+`quality_grade_method=p90_loaded_minus_p5_idle` identify the implemented
+snapshot explicitly.
 
 ## Throughput safety floor
 

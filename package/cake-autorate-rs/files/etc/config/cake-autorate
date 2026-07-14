@@ -1,3 +1,9 @@
+config globals 'globals'
+	# Total RAM budget shared by every enabled graph-history instance. Use auto
+	# to select a conservative value from MemAvailable, or one of the LuCI
+	# presets from 256 KiB through 102400 KiB (100 MiB).
+	option graph_history_ram_budget_kib 'auto'
+
 config cake_autorate 'primary'
 	option enabled '0'
 

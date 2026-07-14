@@ -1,6 +1,6 @@
 # Multi-WAN Routing and Lifecycle
 
-RC6 treats every autorate instance as the owner of one uplink. The model is
+The current implementation treats every autorate instance as the owner of one uplink. The model is
 deliberately explicit:
 
 ```text
@@ -111,9 +111,11 @@ These events invalidate stale learning:
 - fwmark or routing-table change; and
 - a different selected member.
 
-Transport endpoint baselines, loaded samples, estimated quality, throughput
+Transport endpoint baselines, loaded samples, detected quality, throughput
 references, and adaptive-ceiling safe/failed bounds are reset together for
-that instance. Another uplink continues independently.
+that instance. The last completed detected grade remains visible but is marked
+stale until that route learns and completes a new episode. Another uplink
+continues independently.
 
 ## SQM ownership and calibration isolation
 
@@ -152,8 +154,11 @@ The Multi-WAN creation mode detects unique enabled members and previews the
 instance names, target devices, SQM sections, and conflicts before saving.
 Status shows lifecycle state, route/member/device, source and external address,
 fwmark, routing table, policy share, and the reason for standby/offline.
-Graphs remain separate per instance and annotate route/lifecycle changes; all
-history remains RAM-only.
+Graphs remain separate per instance, are stacked vertically, and annotate
+route/lifecycle and detected-grade changes. History remains RAM-only. One
+global memory budget is divided across every enabled instance; no WAN can claim
+another WAN's full allowance, and low-memory suspension affects only telemetry,
+not shaping or route lifecycle.
 
 ## Diagnostics
 
@@ -176,6 +181,6 @@ exports arbitrary command prefixes.
 
 Structured routing and public-address validation currently use IPv4. IPv6
 mwan3 members may coexist in the router configuration, but IPv6-only autorate
-calibration is not yet a supported RC6 path. Load balancing can mark multiple
+calibration is not yet a supported RC path. Load balancing can mark multiple
 members active; each instance still remains bound to its configured member and
 must own a distinct shaper.

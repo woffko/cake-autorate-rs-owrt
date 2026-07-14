@@ -11,6 +11,7 @@
 				"/etc/init.d/cake-autorate status": [ "exec" ],
 				"/etc/init.d/sqm status": [ "exec" ],
 				"/usr/libexec/cake-autorate-rs/package-versions": [ "exec" ],
+				"/usr/libexec/cake-autorate-rs/graph-history *": [ "exec" ],
 				"/usr/libexec/cake-autorate-rs/mwan3-info": [ "exec" ],
 				"/usr/libexec/cake-autorate-rs/log-bundle *": [ "exec" ]
 			},
@@ -42,7 +43,8 @@
 				"/usr/libexec/cake-autorate-rs/autotune *": [ "exec" ],
 				"/usr/libexec/cake-autorate-rs/pinger-plan *": [ "exec" ],
 				"/usr/libexec/cake-autorate-rs/log-bundle *": [ "exec" ],
-				"/usr/libexec/cake-autorate-rs/mqtt-status *": [ "exec" ]
+				"/usr/libexec/cake-autorate-rs/mqtt-status *": [ "exec" ],
+				"/usr/libexec/cake-autorate-rs/graph-history *": [ "exec" ]
 			},
 			"ubus": {
 				"luci": [ "setInitAction" ]

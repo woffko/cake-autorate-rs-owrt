@@ -1,0 +1,53 @@
+#!/bin/sh
+
+section="$1"
+mode="${2:-read}"
+offset="${3:-0}"
+limit="${4:-10000}"
+
+case "$section" in
+	''|*[!A-Za-z0-9_@.-]*)
+		echo "invalid instance" >&2
+		exit 2
+		;;
+esac
+
+run_root="${CAKE_AUTORATE_RUN_ROOT:-/var/run/cake-autorate}"
+uci_bin="${CAKE_AUTORATE_UCI_BIN:-uci}"
+path="$run_root/$section/history.csv"
+
+case "$mode" in
+	read)
+		case "$offset" in ''|*[!0-9]*) exit 2 ;; esac
+		case "$limit" in ''|*[!0-9]*) exit 2 ;; esac
+		[ "$offset" -le 10000000 ] 2>/dev/null || exit 2
+		[ "$limit" -ge 100 ] 2>/dev/null && [ "$limit" -le 20000 ] 2>/dev/null || exit 2
+		[ -f "$path" ] || exit 0
+		count=$((offset + limit))
+		tail -n "$count" "$path" | head -n "$limit"
+		;;
+	stats)
+		if [ -f "$path" ]; then
+			bytes="$(wc -c < "$path")"
+			lines="$(wc -l < "$path")"
+		else
+			bytes=0
+			lines=0
+		fi
+		printf '{"bytes":%s,"samples":%s}\n' "$bytes" "$lines"
+		;;
+	set-budget)
+		value="$offset"
+		case "$value" in
+			auto|256|512|1024|2048|4096|8192|16384|32768|65536|102400) ;;
+			*) echo "invalid RAM budget" >&2; exit 2 ;;
+		esac
+		"$uci_bin" -q get cake-autorate.globals >/dev/null 2>&1 || "$uci_bin" set cake-autorate.globals=globals
+		"$uci_bin" set "cake-autorate.globals.graph_history_ram_budget_kib=$value"
+		"$uci_bin" commit cake-autorate
+		;;
+	*)
+		echo "usage: graph-history INSTANCE read [OFFSET LIMIT] | stats | set-budget VALUE" >&2
+		exit 2
+		;;
+esac

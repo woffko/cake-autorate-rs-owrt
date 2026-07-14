@@ -144,9 +144,100 @@ function formatPercent(value) {
 	return isNaN(value) ? '-' : value.toFixed(1) + '%';
 }
 
+function qualityGradeClass(grade) {
+	return 'cake-quality-grade-' + String(grade || 'unknown').toLowerCase().replace('+', '-plus');
+}
+
+function qualityDirectionSummary(result) {
+	var values = [];
+
+	if (result && result.dl)
+		values.push(_('DL %s').format(result.dl.grade || '-'));
+	if (result && result.ul)
+		values.push(_('UL %s').format(result.ul.grade || '-'));
+	if (result && result.bidirectional)
+		values.push(_('Bidi +%s ms').format(Number(result.bidirectional.increase_ms || 0).toFixed(1)));
+
+	return values.length ? values.join(' · ') : '-';
+}
+
+function qualityAge(result) {
+	var timestamp = Number(result && (result.completed_at || result.started_at) || 0);
+	var seconds;
+
+	if (!isFinite(timestamp) || timestamp <= 0)
+		return '-';
+	seconds = Math.max(0, Math.round(Date.now() / 1000 - timestamp));
+	if (seconds < 60)
+		return _('%d s ago').format(seconds);
+	if (seconds < 3600)
+		return _('%d min ago').format(Math.round(seconds / 60));
+	if (seconds < 86400)
+		return _('%d h ago').format(Math.round(seconds / 3600));
+	return _('%d d ago').format(Math.round(seconds / 86400));
+}
+
+function renderDetectedGrade(label, result, state, collected, required) {
+	var value, detail, classes = 'cake-quality-detected';
+
+	if (!result) {
+		if (state === 'none') {
+			value = '-';
+			detail = _('No completed rating yet');
+		} else if (state === 'collecting') {
+			value = _('COLLECTING');
+			detail = _('%d / %d scored samples').format(Number(collected || 0), Number(required || 0));
+		} else if (state === 'baseline_ready') {
+			value = _('BASELINE READY');
+			detail = _('Waiting for loaded traffic');
+		} else {
+			value = _('LEARNING');
+			detail = _('Collecting idle baseline');
+		}
+	} else {
+		value = result.grade || '-';
+		detail = _('+%s ms · %s · %s').format(
+			Number(result.increase_ms || 0).toFixed(1),
+			qualityDirectionSummary(result),
+			qualityAge(result));
+		classes += ' ' + qualityGradeClass(value);
+		if (result.stale)
+			classes += ' cake-quality-stale';
+	}
+
+	return E('div', { 'class': classes }, [
+		E('span', { 'class': 'cake-quality-label' }, label),
+		E('strong', {}, value),
+		E('small', {}, detail + (result && result.partial ? ' · ' + _('partial') : '') +
+			(result && result.stale ? ' · ' + _('STALE') : ''))
+	]);
+}
+
 function formatQuality(status) {
 	if (!status || !status.transport_latency_enabled)
 		return E('span', { 'title': _('Transport-aware estimation is disabled.') }, '-');
+
+	if (status.quality_grade_state) {
+		var current = status.quality_grade_current || null;
+		var previous = status.quality_grade_previous || null;
+		var state = String(status.quality_grade_state || 'learning_baseline');
+		var title = [
+			_('Detected rating uses loaded p90 minus the preceding idle p5 on one HTTP/TCP endpoint.'),
+			_('Download and upload are scored independently; the worse grade is shown.'),
+			_('Bidirectional latency is diagnostic and does not affect the total grade.'),
+			_('Controller signal: %s · effective delta: %s ms').format(
+				status.quality_class || 'LEARNING',
+				status.effective_latency_delta_ms == null ? '-' : Number(status.effective_latency_delta_ms).toFixed(1)),
+			_('Transport error code: %s').format(status.transport_error_code || '-'),
+			_('Safe floors: DL %s · UL %s').format(formatRate(status.throughput_floor_dl_kbps), formatRate(status.throughput_floor_ul_kbps))
+		].join('\n');
+
+		return E('div', { 'class': 'cake-quality-stack', 'title': title }, [
+			renderDetectedGrade(_('CURRENT'), current, state,
+				status.quality_grade_collected_samples, status.quality_grade_required_samples),
+			renderDetectedGrade(_('PREVIOUS'), previous, previous ? 'final' : 'none', 0, 0)
+		]);
+	}
 
 	var value = status.quality_class || 'LEARNING';
 	var confidence = Number(status.quality_confidence || 0);
@@ -316,7 +407,10 @@ function renderTable(sections, statuses) {
 			section,
 			formatState(st, enabled),
 			formatRoute(st),
-			st.updated_at ? new Date(st.updated_at * 1000).toLocaleString() : '-',
+			st.updated_at ? E('div', { 'class': 'cake-status-timestamp' }, [
+				E('span', {}, new Date(st.updated_at * 1000).toLocaleDateString()),
+				E('small', {}, new Date(st.updated_at * 1000).toLocaleTimeString())
+			]) : '-',
 			st.reflector || '-',
 			reflectorSummary(st),
 			st.rtt_ms != null ? Number(st.rtt_ms).toFixed(2) + ' ms' : '-',
@@ -349,8 +443,8 @@ function renderTable(sections, statuses) {
 
 	if (rows.length) {
 		for (var i = 0; i < rows.length; i++)
-			children.push(E('tr', { 'class': 'tr' }, rows[i].map(function(cell) {
-				return E('td', { 'class': 'td' }, cell);
+			children.push(E('tr', { 'class': 'tr cake-status-row' }, rows[i].map(function(cell) {
+				return E('td', { 'class': 'td cake-status-cell' }, cell);
 			})));
 	} else {
 		children.push(E('tr', { 'class': 'tr' }, [
@@ -358,7 +452,7 @@ function renderTable(sections, statuses) {
 		]));
 	}
 
-	return E('table', { 'class': 'table' }, children);
+	return E('table', { 'class': 'table cake-status-table' }, children);
 }
 
 return L.view.extend({
@@ -396,8 +490,27 @@ return L.view.extend({
 		}, 5);
 
 		return E('div', {}, [
+			E('style', {}, [
+				'.cake-status-table{width:100%;table-layout:auto;margin-top:18px}',
+				'.cake-status-table th{vertical-align:bottom!important;padding-top:10px!important;padding-bottom:10px!important}',
+				'.cake-status-table td{vertical-align:top!important;padding-top:13px!important;padding-bottom:13px!important;line-height:1.35}',
+				'.cake-status-row{border-bottom:1px solid rgba(127,127,127,.25)}',
+				'.cake-status-cell>div{min-height:100%;display:flex;flex-direction:column;align-items:flex-start}',
+				'.cake-status-cell small{display:block;margin-top:3px;line-height:1.3}',
+				'.cake-status-timestamp span,.cake-status-timestamp small{white-space:nowrap}',
+				'.cake-quality-stack{gap:7px;min-width:210px}',
+				'.cake-quality-detected{display:grid!important;grid-template-columns:66px minmax(30px,auto);column-gap:7px;align-items:baseline!important}',
+				'.cake-quality-detected small{grid-column:1 / -1;color:#888;white-space:normal}',
+				'.cake-quality-label{font-size:10px;font-weight:700;letter-spacing:.04em;color:#888}',
+				'.cake-quality-grade-a-plus strong,.cake-quality-grade-a strong{color:#16a085}',
+				'.cake-quality-grade-b strong{color:#8eae2f}.cake-quality-grade-c strong{color:#d08b20}',
+				'.cake-quality-grade-d strong,.cake-quality-grade-f strong{color:#d34b4b}',
+				'.cake-quality-stale{opacity:.65}',
+				'.cake-status-actions{display:flex;align-items:center;gap:7px;flex-wrap:wrap;width:100%;box-sizing:border-box}',
+				'@media(max-width:900px){.cake-status-table{display:block;overflow-x:auto}.cake-status-table th,.cake-status-table td{min-width:92px}.cake-status-table th:nth-child(6),.cake-status-table td:nth-child(6){min-width:180px}}'
+			].join('')),
 			renderVersions(versions),
-			E('div', { 'class': 'cbi-page-actions' }, [
+			E('div', { 'class': 'cbi-page-actions cake-status-actions' }, [
 				E('button', {
 					'class': 'btn cbi-button cbi-button-action',
 					'click': ui.createHandlerFn(this, function() { return serviceAction('start'); })

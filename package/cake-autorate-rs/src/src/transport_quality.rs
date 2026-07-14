@@ -236,15 +236,15 @@ pub fn classify_quality(delta_ms: Option<f64>) -> QualityClass {
         return QualityClass::Learning;
     };
 
-    if delta_ms <= 5.0 {
+    if delta_ms < 5.0 {
         QualityClass::APlus
-    } else if delta_ms <= 30.0 {
+    } else if delta_ms < 30.0 {
         QualityClass::A
-    } else if delta_ms <= 60.0 {
+    } else if delta_ms < 60.0 {
         QualityClass::B
-    } else if delta_ms <= 200.0 {
+    } else if delta_ms < 200.0 {
         QualityClass::C
-    } else if delta_ms <= 400.0 {
+    } else if delta_ms < 400.0 {
         QualityClass::D
     } else {
         QualityClass::F
@@ -587,11 +587,12 @@ mod tests {
     #[test]
     fn quality_thresholds_are_stable() {
         assert_eq!(classify_quality(None), QualityClass::Learning);
-        assert_eq!(classify_quality(Some(5.0)), QualityClass::APlus);
-        assert_eq!(classify_quality(Some(30.0)), QualityClass::A);
-        assert_eq!(classify_quality(Some(60.0)), QualityClass::B);
-        assert_eq!(classify_quality(Some(200.0)), QualityClass::C);
-        assert_eq!(classify_quality(Some(400.0)), QualityClass::D);
+        assert_eq!(classify_quality(Some(4.999)), QualityClass::APlus);
+        assert_eq!(classify_quality(Some(5.0)), QualityClass::A);
+        assert_eq!(classify_quality(Some(30.0)), QualityClass::B);
+        assert_eq!(classify_quality(Some(60.0)), QualityClass::C);
+        assert_eq!(classify_quality(Some(200.0)), QualityClass::D);
+        assert_eq!(classify_quality(Some(400.0)), QualityClass::F);
         assert_eq!(classify_quality(Some(401.0)), QualityClass::F);
     }
 

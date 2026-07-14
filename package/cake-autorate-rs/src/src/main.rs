@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod adaptive_ceiling;
 mod autotune;
+mod quality_grade;
 mod routing;
 mod transport_quality;
 
@@ -19,6 +20,7 @@ use adaptive_ceiling::{
     AdaptiveCeilingChange, AdaptiveCeilingDirection, AdaptiveCeilingObservation,
     AdaptiveCeilingPolicy, AdaptiveCeilingUpdate,
 };
+use quality_grade::{QualityGradeMetric, QualityGradeResult, QualityGradeTracker};
 use routing::{RouteMode, RouteSnapshot, RouteSpec, UplinkLifecycle, UplinkState};
 use transport_quality::{
     classify_quality, effective_latency_delta_ms, throughput_floor, transport_allows_growth,
@@ -28,8 +30,10 @@ use transport_quality::{
 
 static TERMINATE: AtomicBool = AtomicBool::new(false);
 const STALE_REFLECTOR_RESPONSE_MAX_AGE_S: f64 = 0.5;
-const GRAPH_HISTORY_MAX_BYTES: u64 = 128 * 1024;
-const GRAPH_HISTORY_COMPACT_BYTES: usize = 96 * 1024;
+const GRAPH_HISTORY_MIN_BUDGET_KIB: u64 = 256;
+const GRAPH_HISTORY_HARD_MAX_KIB: u64 = 100 * 1024;
+const GRAPH_HISTORY_BUDGET_REFRESH_S: u64 = 30;
+const GRAPH_HISTORY_CRITICAL_AVAILABLE_KIB: u64 = 16 * 1024;
 
 const UPSTREAM_DEFAULT_REFLECTORS: &[&str] = &[
     "1.1.1.1",
@@ -174,6 +178,8 @@ struct Config {
     output_cpu_raw_stats: bool,
     graph_history_enabled: bool,
     graph_history_interval_s: u64,
+    graph_history_ram_budget_kib: Option<u64>,
+    graph_history_instance_count: usize,
     log_to_file: bool,
     debug: bool,
     log_debug_messages_to_syslog: bool,
@@ -297,6 +303,8 @@ impl Config {
             output_cpu_raw_stats: false,
             graph_history_enabled: false,
             graph_history_interval_s: 10,
+            graph_history_ram_budget_kib: None,
+            graph_history_instance_count: 1,
             log_to_file: true,
             debug: true,
             log_debug_messages_to_syslog: false,
@@ -874,6 +882,10 @@ impl Config {
             cfg.reflectors = cfg.irtt_servers.clone();
         }
 
+        let (history_budget_kib, history_instance_count) = load_global_history_config()?;
+        cfg.graph_history_ram_budget_kib = history_budget_kib;
+        cfg.graph_history_instance_count = history_instance_count;
+
         cfg.normalize_paths();
         cfg.refresh_wire_packet_sizes();
         cfg.validate()?;
@@ -1153,6 +1165,14 @@ impl Config {
         }
         if !(1..=60).contains(&self.graph_history_interval_s) {
             return Err("graph_history_interval_s must be between 1 and 60".to_string());
+        }
+        if let Some(budget_kib) = self.graph_history_ram_budget_kib {
+            if !(GRAPH_HISTORY_MIN_BUDGET_KIB..=GRAPH_HISTORY_HARD_MAX_KIB).contains(&budget_kib) {
+                return Err(format!(
+                    "graph_history_ram_budget_kib must be auto or between {} and {}",
+                    GRAPH_HISTORY_MIN_BUDGET_KIB, GRAPH_HISTORY_HARD_MAX_KIB
+                ));
+            }
         }
         if self.reflector_health_check_interval_s <= 0.0 {
             return Err("reflector_health_check_interval_s must be greater than zero".to_string());
@@ -2043,6 +2063,157 @@ struct StatusSnapshot {
     health: Option<ReflectorHealth>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MemoryInfo {
+    total_kib: u64,
+    available_kib: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct HistoryBudgetSnapshot {
+    configured_kib: Option<u64>,
+    safe_max_kib: u64,
+    effective_total_kib: u64,
+    instance_budget_kib: u64,
+    used_total_kib: u64,
+    used_instance_kib: u64,
+    memory: MemoryInfo,
+    instances: usize,
+    paused_low_memory: bool,
+}
+
+fn read_memory_info() -> io::Result<MemoryInfo> {
+    let data = fs::read_to_string("/proc/meminfo")?;
+    let mut total_kib = 0;
+    let mut available_kib = 0;
+    for line in data.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let parsed = value
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        match key {
+            "MemTotal" => total_kib = parsed,
+            "MemAvailable" => available_kib = parsed,
+            _ => {}
+        }
+    }
+    if total_kib == 0 || available_kib == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "MemTotal or MemAvailable is missing from /proc/meminfo",
+        ));
+    }
+    Ok(MemoryInfo {
+        total_kib,
+        available_kib,
+    })
+}
+
+fn history_usage_bytes(root: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(root) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| fs::metadata(entry.path().join("history.csv")).ok())
+        .map(|metadata| metadata.len())
+        .sum()
+}
+
+fn history_safe_max_kib(available_plus_history_kib: u64) -> u64 {
+    match available_plus_history_kib {
+        value if value < 64 * 1024 => 256,
+        value if value < 128 * 1024 => 1024,
+        value if value < 256 * 1024 => 2 * 1024,
+        value if value < 512 * 1024 => 8 * 1024,
+        value if value < 768 * 1024 => 16 * 1024,
+        value if value < 1024 * 1024 => 32 * 1024,
+        _ => GRAPH_HISTORY_HARD_MAX_KIB,
+    }
+}
+
+fn automatic_history_budget_kib(safe_max_kib: u64) -> u64 {
+    const PRESETS: &[u64] = &[
+        256,
+        512,
+        1024,
+        2 * 1024,
+        4 * 1024,
+        8 * 1024,
+        16 * 1024,
+        32 * 1024,
+        64 * 1024,
+        100 * 1024,
+    ];
+    let target = (safe_max_kib / 4).max(GRAPH_HISTORY_MIN_BUDGET_KIB);
+    PRESETS
+        .iter()
+        .copied()
+        .filter(|value| *value <= target && *value <= safe_max_kib)
+        .max()
+        .unwrap_or_else(|| safe_max_kib.min(GRAPH_HISTORY_MIN_BUDGET_KIB))
+}
+
+fn compute_history_budget(
+    configured_kib: Option<u64>,
+    instances: usize,
+    memory: MemoryInfo,
+    used_total_kib: u64,
+    used_instance_kib: u64,
+) -> HistoryBudgetSnapshot {
+    let instances = instances.max(1);
+    let safe_max_kib = history_safe_max_kib(memory.available_kib.saturating_add(used_total_kib));
+    let requested_kib = configured_kib
+        .unwrap_or_else(|| automatic_history_budget_kib(safe_max_kib))
+        .min(GRAPH_HISTORY_HARD_MAX_KIB);
+    let reserve_kib = (memory.total_kib / 20).max(32 * 1024);
+    let pressure_cap_kib = used_total_kib
+        .saturating_add(memory.available_kib)
+        .saturating_sub(reserve_kib);
+    let paused_low_memory = memory.available_kib < GRAPH_HISTORY_CRITICAL_AVAILABLE_KIB;
+    let effective_total_kib = if paused_low_memory {
+        0
+    } else {
+        requested_kib.min(safe_max_kib).min(pressure_cap_kib)
+    };
+
+    HistoryBudgetSnapshot {
+        configured_kib,
+        safe_max_kib,
+        effective_total_kib,
+        instance_budget_kib: effective_total_kib / instances as u64,
+        used_total_kib,
+        used_instance_kib,
+        memory,
+        instances,
+        paused_low_memory,
+    }
+}
+
+fn history_budget_snapshot(cfg: &Config) -> HistoryBudgetSnapshot {
+    let memory = read_memory_info().unwrap_or_default();
+    let root = Path::new("/var/run/cake-autorate");
+    let used_total_kib = history_usage_bytes(root).div_ceil(1024);
+    let used_instance_kib = fs::metadata(cfg.graph_history_path())
+        .map(|metadata| metadata.len().div_ceil(1024))
+        .unwrap_or(0);
+    let (configured_kib, instances) = load_global_history_config().unwrap_or((
+        cfg.graph_history_ram_budget_kib,
+        cfg.graph_history_instance_count,
+    ));
+    compute_history_budget(
+        configured_kib,
+        instances,
+        memory,
+        used_total_kib,
+        used_instance_kib,
+    )
+}
+
 struct LogFile {
     path: PathBuf,
     file: BufWriter<File>,
@@ -2156,6 +2327,7 @@ struct Controller {
     adaptive_dl: AdaptiveCeilingDirection,
     adaptive_ul: AdaptiveCeilingDirection,
     transport_latency: TransportLatencyTracker,
+    quality_grade: QualityGradeTracker,
     quality_search_dl: QualitySearchDirection,
     quality_search_ul: QualitySearchDirection,
     quality_dl_class: QualityClass,
@@ -2170,6 +2342,9 @@ struct Controller {
     last_decay_ul: Instant,
     last_cpu_sample: Instant,
     last_graph_history_sample: Instant,
+    last_history_budget_refresh: Instant,
+    history_budget: HistoryBudgetSnapshot,
+    history_sample_count: u64,
     cpu_total_percent: Option<f64>,
     cpu_core_percentages: Vec<f64>,
     started_at: f64,
@@ -2186,7 +2361,8 @@ impl Controller {
     fn new(mut cfg: Config) -> Result<Self, String> {
         ensure_run_dir(&cfg.run_dir())
             .map_err(|e| format!("failed to create run directory: {e}"))?;
-        if cfg.graph_history_enabled {
+        let history_budget = history_budget_snapshot(&cfg);
+        if cfg.graph_history_enabled && history_budget.instance_budget_kib > 0 {
             if let Err(e) = File::create(cfg.graph_history_path()) {
                 eprintln!("WARNING: failed to initialize graph history: {e}");
             }
@@ -2250,6 +2426,7 @@ impl Controller {
             adaptive_dl,
             adaptive_ul,
             transport_latency: TransportLatencyTracker::new(),
+            quality_grade: QualityGradeTracker::new(),
             quality_search_dl: QualitySearchDirection::new(),
             quality_search_ul: QualitySearchDirection::new(),
             quality_dl_class: QualityClass::Learning,
@@ -2264,6 +2441,9 @@ impl Controller {
             last_decay_ul: now,
             last_cpu_sample: now,
             last_graph_history_sample: now,
+            last_history_budget_refresh: now,
+            history_budget,
+            history_sample_count: 0,
             cpu_total_percent: None,
             cpu_core_percentages: Vec::new(),
             run_state: "RUNNING".to_string(),
@@ -2359,12 +2539,23 @@ impl Controller {
             return;
         }
         let confirmed_delta = match (result.latency_ms, result.error.as_deref()) {
-            (Some(latency_ms), _) => self.transport_latency.observe_success(
-                &result.endpoint,
-                latency_ms,
-                result.loaded,
-                now,
-            ),
+            (Some(latency_ms), _) => {
+                let grade_route = self.quality_grade_route_key();
+                self.quality_grade.observe(
+                    &result.endpoint,
+                    latency_ms,
+                    result.dl_loaded,
+                    result.ul_loaded,
+                    epoch_secs(),
+                    &grade_route,
+                );
+                self.transport_latency.observe_success(
+                    &result.endpoint,
+                    latency_ms,
+                    result.loaded,
+                    now,
+                )
+            }
             (_, Some(error)) => {
                 self.transport_latency.observe_failure(error);
                 self.log("DEBUG", &format!("transport latency probe failed: {error}"));
@@ -2522,6 +2713,9 @@ impl Controller {
         self.route_identity = snapshot.as_ref().map(RouteSnapshot::stable_key);
         self.route_snapshot = snapshot;
 
+        let grade_route = self.quality_grade_route_key();
+        self.quality_grade.set_route(&grade_route);
+
         if reset_learning {
             self.reset_uplink_learning("uplink route identity changed");
         }
@@ -2553,6 +2747,8 @@ impl Controller {
         self.dl_delta_us = filled_f64_window(self.cfg.bufferbloat_detection_window);
         self.ul_delta_us = filled_f64_window(self.cfg.bufferbloat_detection_window);
         self.transport_latency.reset();
+        let grade_route = self.quality_grade_route_key();
+        self.quality_grade.set_route(&grade_route);
         self.quality_search_dl.reset();
         self.quality_search_ul.reset();
         self.quality_dl_class = QualityClass::Learning;
@@ -2569,8 +2765,30 @@ impl Controller {
         if self.route_external_ip == value {
             return;
         }
+        let changed_existing = !self.route_external_ip.is_empty() && !value.is_empty();
         self.route_external_ip = value;
+        if changed_existing {
+            self.transport_latency.reset();
+            self.quality_search_dl.reset();
+            self.quality_search_ul.reset();
+            self.quality_dl_class = QualityClass::Learning;
+            self.quality_ul_class = QualityClass::Learning;
+            self.log(
+                "INFO",
+                "Reset transport and displayed quality learning after external IP change",
+            );
+        }
+        let grade_route = self.quality_grade_route_key();
+        self.quality_grade.set_route(&grade_route);
         let _ = self.refresh_status_from_last_sample();
+    }
+
+    fn quality_grade_route_key(&self) -> String {
+        format!(
+            "{}|external={}",
+            self.route_identity.as_deref().unwrap_or("unresolved"),
+            self.route_external_ip
+        )
     }
 
     fn note_probe_gap(&mut self) {
@@ -2928,7 +3146,36 @@ impl Controller {
     }
 
     fn maybe_record_graph_history(&mut self, dl_rate_kbps: f64, ul_rate_kbps: f64) {
-        if !self.cfg.graph_history_enabled
+        if !self.cfg.graph_history_enabled {
+            return;
+        }
+
+        if self.last_history_budget_refresh.elapsed()
+            >= Duration::from_secs(GRAPH_HISTORY_BUDGET_REFRESH_S)
+        {
+            self.history_budget = history_budget_snapshot(&self.cfg);
+            self.last_history_budget_refresh = Instant::now();
+            let instance_cap = self.history_budget.instance_budget_kib.saturating_mul(1024);
+            let current_size = fs::metadata(self.cfg.graph_history_path())
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            if instance_cap == 0 {
+                let _ = fs::remove_file(self.cfg.graph_history_path());
+                self.history_sample_count = 0;
+                self.history_budget.used_instance_kib = 0;
+            } else if current_size > instance_cap {
+                let target = instance_cap.saturating_mul(3) / 4;
+                match compact_graph_history_file(&self.cfg.graph_history_path(), target) {
+                    Ok(samples) => self.history_sample_count = samples,
+                    Err(error) => self.log(
+                        "ERROR",
+                        &format!("failed to enforce reduced graph history budget: {error}"),
+                    ),
+                }
+            }
+        }
+        if self.history_budget.paused_low_memory
+            || self.history_budget.instance_budget_kib == 0
             || self.last_graph_history_sample.elapsed()
                 < Duration::from_secs(self.cfg.graph_history_interval_s)
         {
@@ -2955,6 +3202,8 @@ impl Controller {
                 transport.delta_ms,
             )
         });
+        let grade_snapshot = self.quality_grade.snapshot();
+        let grade_result = grade_snapshot.current.as_ref();
         let line = graph_history_line(
             now,
             rtt_ms,
@@ -2967,17 +3216,25 @@ impl Controller {
             Some(self.throughput_floor_ul),
             self.uplink_state.as_str(),
             self.route_identity.as_deref().unwrap_or(""),
+            grade_result.map(|result| result.class.as_str()),
+            grade_snapshot.state,
+            grade_result.map(|result| result.increase_ms),
         );
         let path = self.cfg.graph_history_path();
+        let instance_cap = self.history_budget.instance_budget_kib.saturating_mul(1024);
 
         if fs::metadata(&path)
             .map(|metadata| metadata.len().saturating_add(line.len() as u64))
             .unwrap_or(0)
-            > GRAPH_HISTORY_MAX_BYTES
+            > instance_cap
         {
-            if let Err(e) = compact_graph_history_file(&path) {
-                self.log("ERROR", &format!("failed to compact graph history: {e}"));
-                return;
+            let target = instance_cap.saturating_mul(3) / 4;
+            match compact_graph_history_file(&path, target) {
+                Ok(samples) => self.history_sample_count = samples,
+                Err(e) => {
+                    self.log("ERROR", &format!("failed to compact graph history: {e}"));
+                    return;
+                }
             }
         }
 
@@ -2988,6 +3245,13 @@ impl Controller {
             .and_then(|mut file| file.write_all(line.as_bytes()));
         if let Err(e) = result {
             self.log("ERROR", &format!("failed to append graph history: {e}"));
+        } else {
+            self.history_sample_count = self.history_sample_count.saturating_add(1);
+            self.history_budget.used_instance_kib = fs::metadata(&path)
+                .map(|metadata| metadata.len().div_ceil(1024))
+                .unwrap_or(0);
+            self.history_budget.used_total_kib =
+                history_usage_bytes(Path::new("/var/run/cake-autorate")).div_ceil(1024);
         }
     }
 
@@ -3338,6 +3602,7 @@ impl Controller {
         } else {
             transport.status
         };
+        let quality_grade = self.quality_grade.snapshot();
         let mut file = File::create(&tmp)?;
         writeln!(
             file,
@@ -3419,6 +3684,44 @@ impl Controller {
             self.quality_search_dl.limited(),
             self.quality_search_ul.limited(),
         )?;
+        file.seek(SeekFrom::End(-2))?;
+        write!(
+            file,
+            ",\"quality_grade_method\":\"p90_loaded_minus_p5_idle\",\"quality_grade_state\":\"{}\",\"quality_grade_collected_samples\":{},\"quality_grade_required_samples\":{},\"quality_grade_baseline_ready\":{},\"quality_grade_current\":{},\"quality_grade_previous\":{},\"graph_history_enabled\":{},\"graph_history_budget_mode\":\"{}\",\"graph_history_configured_budget_kib\":{},\"graph_history_safe_max_kib\":{},\"graph_history_effective_total_kib\":{},\"graph_history_instance_budget_kib\":{},\"graph_history_used_total_kib\":{},\"graph_history_used_instance_kib\":{},\"graph_history_stored_samples\":{},\"graph_history_instances\":{},\"graph_history_mem_total_kib\":{},\"graph_history_mem_available_kib\":{},\"graph_history_paused_low_memory\":{}",
+            json_escape(quality_grade.state),
+            quality_grade.collected_samples,
+            quality_grade.required_samples,
+            quality_grade.baseline_ready,
+            quality_grade_result_json(
+                quality_grade.current.as_ref(),
+                quality_grade.current_stale,
+            ),
+            quality_grade_result_json(
+                quality_grade.previous.as_ref(),
+                quality_grade.previous_stale,
+            ),
+            self.cfg.graph_history_enabled,
+            if self.history_budget.configured_kib.is_some() {
+                "manual"
+            } else {
+                "auto"
+            },
+            self.history_budget
+                .configured_kib
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            self.history_budget.safe_max_kib,
+            self.history_budget.effective_total_kib,
+            self.history_budget.instance_budget_kib,
+            self.history_budget.used_total_kib,
+            self.history_budget.used_instance_kib,
+            self.history_sample_count,
+            self.history_budget.instances,
+            self.history_budget.memory.total_kib,
+            self.history_budget.memory.available_kib,
+            self.history_budget.paused_low_memory,
+        )?;
+        writeln!(file, "}}")?;
         let route_mode = self
             .route_snapshot
             .as_ref()
@@ -4835,6 +5138,77 @@ fn parse_uci_values(value: &str) -> Vec<String> {
     values
 }
 
+fn load_global_history_config() -> Result<(Option<u64>, usize), String> {
+    let output = match Command::new("uci")
+        .arg("-q")
+        .arg("show")
+        .arg("cake-autorate")
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return Ok((None, 1)),
+    };
+    let data = String::from_utf8_lossy(&output.stdout);
+    let mut types = HashMap::<String, String>::new();
+    let mut enabled = HashMap::<String, bool>::new();
+    let mut history_enabled = HashMap::<String, bool>::new();
+    let mut budget = None;
+
+    for line in data.lines() {
+        let Some((left, raw_value)) = line.split_once('=') else {
+            continue;
+        };
+        let values = parse_uci_values(raw_value);
+        let Some(value) = values.first() else {
+            continue;
+        };
+        let parts = left.split('.').collect::<Vec<_>>();
+        if parts.len() == 2 && parts[0] == "cake-autorate" {
+            types.insert(parts[1].to_string(), value.to_string());
+            continue;
+        }
+        if parts.len() != 3 || parts[0] != "cake-autorate" {
+            continue;
+        }
+        match parts[2] {
+            "enabled" => {
+                enabled.insert(
+                    parts[1].to_string(),
+                    parse_bool(value).map_err(|error| format!("{}.enabled: {error}", parts[1]))?,
+                );
+            }
+            "graph_history_enabled" => {
+                history_enabled.insert(
+                    parts[1].to_string(),
+                    parse_bool(value)
+                        .map_err(|error| format!("{}.graph_history_enabled: {error}", parts[1]))?,
+                );
+            }
+            "graph_history_ram_budget_kib"
+                if parts[1] == "globals" && value != "auto" && !value.is_empty() =>
+            {
+                budget = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|error| format!("graph_history_ram_budget_kib: {error}"))?,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let count = types
+        .iter()
+        .filter(|(section, section_type)| {
+            section_type.as_str() == "cake_autorate"
+                && enabled.get(*section).copied().unwrap_or(false)
+                && history_enabled.get(*section).copied().unwrap_or(false)
+        })
+        .count()
+        .max(1);
+    Ok((budget, count))
+}
+
 fn parse_bool(value: &str) -> Result<bool, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" | "enabled" => Ok(true),
@@ -4913,6 +5287,41 @@ fn json_string_or_null(value: Option<&str>) -> String {
         .unwrap_or_else(|| "null".to_string())
 }
 
+fn quality_grade_metric_json(metric: Option<&QualityGradeMetric>) -> String {
+    let Some(metric) = metric else {
+        return "null".to_string();
+    };
+    format!(
+        "{{\"grade\":\"{}\",\"increase_ms\":{:.3},\"loaded_p90_ms\":{:.3},\"samples\":{}}}",
+        metric.class.as_str(),
+        metric.increase_ms,
+        metric.loaded_p90_ms,
+        metric.samples,
+    )
+}
+
+fn quality_grade_result_json(result: Option<&QualityGradeResult>, stale: bool) -> String {
+    let Some(result) = result else {
+        return "null".to_string();
+    };
+    format!(
+        "{{\"grade\":\"{}\",\"increase_ms\":{:.3},\"baseline_p5_ms\":{:.3},\"endpoint\":\"{}\",\"started_at\":{:.3},\"completed_at\":{},\"route_identity\":\"{}\",\"partial\":{},\"stale\":{},\"samples\":{},\"dl\":{},\"ul\":{},\"bidirectional\":{}}}",
+        result.class.as_str(),
+        result.increase_ms,
+        result.baseline_p5_ms,
+        json_escape(&result.endpoint),
+        result.started_at,
+        json_f64_or_null(result.completed_at, 3),
+        json_escape(&result.route_identity),
+        result.partial,
+        stale,
+        result.samples(),
+        quality_grade_metric_json(result.dl.as_ref()),
+        quality_grade_metric_json(result.ul.as_ref()),
+        quality_grade_metric_json(result.bidirectional.as_ref()),
+    )
+}
+
 fn json_f64_or_empty(value: Option<f64>, precision: usize) -> String {
     match value {
         Some(value) if value.is_finite() => format!("{:.*}", precision, value),
@@ -4933,9 +5342,12 @@ fn graph_history_line(
     ul_floor_kbps: Option<f64>,
     uplink_state: &str,
     route_identity: &str,
+    grade: Option<&str>,
+    grade_state: &str,
+    grade_increase_ms: Option<f64>,
 ) -> String {
     format!(
-        "{:.0},{},{},{},{},{},{},{},{},{},{}\n",
+        "{:.0},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
         timestamp,
         json_f64_or_empty(rtt_ms, 3),
         json_f64_or_empty(cpu_percent, 1),
@@ -4946,10 +5358,14 @@ fn graph_history_line(
         json_f64_or_empty(dl_floor_kbps, 1),
         json_f64_or_empty(ul_floor_kbps, 1),
         uplink_state.replace(',', ""),
-        route_identity.replace(',', "")
+        route_identity.replace(',', ""),
+        grade.unwrap_or("").replace(',', ""),
+        grade_state.replace(',', ""),
+        json_f64_or_empty(grade_increase_ms, 3),
     )
 }
 
+#[cfg(test)]
 fn compact_graph_history_data(data: &str, max_bytes: usize) -> String {
     let mut newest = Vec::new();
     let mut bytes = 0usize;
@@ -4971,12 +5387,53 @@ fn compact_graph_history_data(data: &str, max_bytes: usize) -> String {
     }
 }
 
-fn compact_graph_history_file(path: &Path) -> io::Result<()> {
-    let data = fs::read_to_string(path).unwrap_or_default();
-    let compacted = compact_graph_history_data(&data, GRAPH_HISTORY_COMPACT_BYTES);
+fn compact_graph_history_file(path: &Path, max_bytes: u64) -> io::Result<u64> {
+    if max_bytes == 0 {
+        return match fs::remove_file(path) {
+            Ok(()) => Ok(0),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(error),
+        };
+    }
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    if metadata.len() <= max_bytes {
+        return Ok(0);
+    }
+
+    let mut source = File::open(path)?;
+    let start = metadata.len().saturating_sub(max_bytes);
+    let starts_at_line = if start > 0 {
+        source.seek(SeekFrom::Start(start - 1))?;
+        let mut previous = [0u8; 1];
+        source.read_exact(&mut previous)?;
+        previous[0] == b'\n'
+    } else {
+        true
+    };
+    source.seek(SeekFrom::Start(start))?;
+    let mut reader = BufReader::new(source);
+    if !starts_at_line {
+        let mut partial = Vec::new();
+        reader.read_until(b'\n', &mut partial)?;
+    }
     let tmp = path.with_extension("csv.tmp");
-    fs::write(&tmp, compacted)?;
-    fs::rename(tmp, path)
+    let mut output = BufWriter::new(File::create(&tmp)?);
+    let mut samples = 0u64;
+    loop {
+        let mut line = Vec::new();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        output.write_all(&line)?;
+        samples = samples.saturating_add(1);
+    }
+    output.flush()?;
+    fs::rename(tmp, path)?;
+    Ok(samples)
 }
 
 fn json_f64_array(values: &[f64], precision: usize) -> String {
@@ -5268,16 +5725,18 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_graph_history_data, default_reflectors, graph_history_line, irtt_target_arg,
+        compact_graph_history_data, compact_graph_history_file, compute_history_budget,
+        default_reflectors, graph_history_line, history_safe_max_kib, irtt_target_arg,
         max_wire_packet_size_bits_from_mtu, monitor_tick_timeout, next_spare_reflector,
         packet_compensation_us, parse_fping_line, parse_fping_ts_line, parse_irtt_duration_us,
         parse_irtt_line, parse_reflector_candidates, parse_tc_linklayer_overhead,
         parse_tsping_line, parse_uci_values, pinger_command, pinger_response_interval_s,
         reflector_bad_reflectors, reflector_health_json, reflector_spare_reflectors,
         sample_is_stale, stall_detection_timeout, throughput_floor, transport_error_code,
-        transport_result_matches_route, uplink_error_code, Config, ReflectorHealth, ReflectorState,
-        Sample, ThroughputGuardInput, UplinkState,
+        transport_result_matches_route, uplink_error_code, Config, MemoryInfo, ReflectorHealth,
+        ReflectorState, Sample, ThroughputGuardInput, UplinkState,
     };
+    use std::fs;
     use std::time::Instant;
 
     #[test]
@@ -5579,12 +6038,71 @@ mod tests {
                 Some(30.0),
                 "ACTIVE",
                 "mwan3|wan|pppoe-wan|198.51.100.1|0x100|1",
+                Some("A+"),
+                "final",
+                Some(1.25),
             ),
-            "123,1.235,2.3,1000.0,50.5,10.123,11.988,600.0,30.0,ACTIVE,mwan3|wan|pppoe-wan|198.51.100.1|0x100|1\n"
+            "123,1.235,2.3,1000.0,50.5,10.123,11.988,600.0,30.0,ACTIVE,mwan3|wan|pppoe-wan|198.51.100.1|0x100|1,A+,final,1.250\n"
         );
 
         let data = "1,1,1\n2,2,2\n3,3,3\n";
         assert_eq!(compact_graph_history_data(data, 12), "2,2,2\n3,3,3\n");
+
+        let path = std::env::temp_dir().join(format!(
+            "cake-autorate-history-{}-{}.csv",
+            std::process::id(),
+            super::epoch_secs()
+        ));
+        fs::write(&path, data).unwrap();
+        assert_eq!(compact_graph_history_file(&path, 12).unwrap(), 2);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "2,2,2\n3,3,3\n");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn graph_history_budget_scales_with_available_ram_and_never_breaks_reserve() {
+        assert_eq!(history_safe_max_kib(100 * 1024), 1024);
+        assert_eq!(history_safe_max_kib(1024 * 1024), 100 * 1024);
+
+        let small = compute_history_budget(
+            Some(100 * 1024),
+            2,
+            MemoryInfo {
+                total_kib: 128 * 1024,
+                available_kib: 100 * 1024,
+            },
+            0,
+            0,
+        );
+        assert_eq!(small.safe_max_kib, 1024);
+        assert_eq!(small.effective_total_kib, 1024);
+        assert_eq!(small.instance_budget_kib, 512);
+
+        let large = compute_history_budget(
+            Some(100 * 1024),
+            1,
+            MemoryInfo {
+                total_kib: 2 * 1024 * 1024,
+                available_kib: 1024 * 1024,
+            },
+            0,
+            0,
+        );
+        assert_eq!(large.safe_max_kib, 100 * 1024);
+        assert_eq!(large.effective_total_kib, 100 * 1024);
+
+        let critical = compute_history_budget(
+            None,
+            1,
+            MemoryInfo {
+                total_kib: 128 * 1024,
+                available_kib: 15 * 1024,
+            },
+            1024,
+            1024,
+        );
+        assert!(critical.paused_low_memory);
+        assert_eq!(critical.effective_total_kib, 0);
     }
 
     #[test]
