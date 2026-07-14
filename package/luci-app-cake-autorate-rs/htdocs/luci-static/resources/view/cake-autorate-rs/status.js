@@ -29,6 +29,181 @@ function readPackageVersions() {
 	);
 }
 
+function parseExecJson(result) {
+	var text = result && result.stdout ? result.stdout.trim() : '';
+
+	if (!text)
+		throw new Error(_('Helper returned no data.'));
+	return JSON.parse(text);
+}
+
+function qualityTestExec(section, action, mode, backend) {
+	return fs.exec('/usr/libexec/cake-autorate-rs/quality-test', [
+		section, action, mode || 'client', backend || 'auto'
+	]).then(parseExecJson);
+}
+
+function qualityTestDelay() {
+	return new Promise(function(resolve) {
+		window.setTimeout(resolve, 1000);
+	});
+}
+
+function qualityReadiness(section, status) {
+	if (String(section.enabled || '0') !== '1')
+		return { ready: false, reason: _('Autorate instance is disabled.') };
+	if (String(section.sqm_enabled || '0') !== '1')
+		return { ready: false, reason: _('Managed SQM must be enabled.') };
+	if (!status || !status.transport_latency_enabled)
+		return { ready: false, reason: _('Transport-aware latency must be enabled.') };
+	if (!status.route_active)
+		return { ready: false, reason: _('The selected uplink route is not active.') };
+	if (!status.transport_probe_trusted)
+		return { ready: false, reason: _('A trusted native transport backend is required.') };
+	if (!status.quality_grade_baseline_ready)
+		return {
+			ready: false,
+			reason: _('Idle baseline: %d / %d samples.').format(
+				Number(status.quality_grade_baseline_samples || 0),
+				Number(status.quality_grade_baseline_required_samples || 20))
+		};
+	return { ready: true, reason: _('Ready. SQM and autorate remain enabled during this test.') };
+}
+
+function qualityProgressText(job) {
+	var required = Number(job.required_samples || 20);
+	var baselineRequired = Number(job.baseline_required || 20);
+	var parts = [
+		_('Baseline %d/%d').format(Number(job.baseline_samples || 0), baselineRequired),
+		_('DL %d/%d').format(Number(job.dl_samples || 0), required),
+		_('UL %d/%d').format(Number(job.ul_samples || 0), required),
+		_('Phase %s').format(job.phase || 'IDLE'),
+		_('Load DL %s / UL %s').format(
+			formatPercent(job.smoothed_dl_percent),
+			formatPercent(job.smoothed_ul_percent))
+	];
+
+	if (job.finalize_remaining_s != null)
+		parts.push(_('Finalize in about %d s').format(Math.ceil(Number(job.finalize_remaining_s || 0))));
+	if (job.last_rejected_reason)
+		parts.push(_('Last rejected: %s').format(job.last_rejected_reason));
+	return parts.join(' · ');
+}
+
+function showQualityTest(section, status) {
+	var instance = section['.name'];
+	var readiness = qualityReadiness(section, status);
+	var mode = E('select', { 'class': 'cbi-input-select' }, [
+		E('option', { 'value': 'automatic' }, _('Automatic router-side test')),
+		E('option', { 'value': 'client' }, _('Guided client capture'))
+	]);
+	var state = E('div', { 'class': 'alert-message notice cake-quality-job-state' }, readiness.reason);
+	var detail = E('div', { 'class': 'cake-quality-job-detail' },
+		_('Automatic mode generates shaped download and upload traffic through this uplink. It may take 1–3 passes and transfer several gigabytes on a fast line. Guided mode waits up to three minutes while you run a sequential download and upload test from a LAN client. Neither mode disables SQM or autorate, changes CAKE limits, or writes samples to flash.'));
+	var running = false;
+	var closed = false;
+	var startButton;
+	var closeButton;
+
+	function setState(text, error) {
+		state.className = 'alert-message ' + (error ? 'error' : 'notice') + ' cake-quality-job-state';
+		state.textContent = text;
+	}
+
+	function finish(job) {
+		running = false;
+		startButton.disabled = !readiness.ready;
+		mode.disabled = false;
+		closeButton.textContent = _('Close');
+		if (job.state === 'complete') {
+			setState(_('Rating %s complete: +%s ms · DL %s · UL %s. Limits were not changed.').format(
+				job.grade || '-', Number(job.increase_ms || 0).toFixed(1),
+				job.dl_grade || '-', job.ul_grade || '-'), false);
+		} else if (job.state === 'cancelled') {
+			setState(_('Rating capture cancelled.'), false);
+		} else {
+			setState(job.error || job.message || _('Rating capture did not complete.'), true);
+		}
+	}
+
+	function pollJob() {
+		if (!running || closed)
+			return Promise.resolve();
+		return qualityTestDelay().then(function() {
+			return qualityTestExec(instance, 'status');
+		}).then(function(job) {
+			if (job.state === 'running') {
+				setState((job.message || _('Collecting rating samples.')) + '\n' + qualityProgressText(job), false);
+				return pollJob();
+			}
+			finish(job);
+		}).catch(function(error) {
+			finish({ state: 'error', error: error.message || String(error) });
+		});
+	}
+
+	function start() {
+		if (!readiness.ready || running)
+			return Promise.resolve();
+		running = true;
+		startButton.disabled = true;
+		mode.disabled = true;
+		closeButton.textContent = _('Cancel');
+		setState(_('Starting rating capture…'), false);
+		return qualityTestExec(instance, 'start', mode.value,
+			section.speedtest_backend || 'auto').then(function(job) {
+			if (job.error)
+				throw new Error(job.error);
+			return pollJob();
+		}).catch(function(error) {
+			finish({ state: 'error', error: error.message || String(error) });
+		});
+	}
+
+	function close() {
+		closed = true;
+		if (running)
+			return qualityTestExec(instance, 'cancel').catch(function() {}).then(function() {
+				ui.hideModal();
+			});
+		ui.hideModal();
+		return Promise.resolve();
+	}
+
+	startButton = E('button', {
+		'class': 'btn cbi-button cbi-button-action',
+		'disabled': readiness.ready ? null : '',
+		'click': ui.createHandlerFn(null, start)
+	}, _('Start rating'));
+	closeButton = E('button', {
+		'class': 'btn cbi-button cbi-button-neutral',
+		'click': ui.createHandlerFn(null, close)
+	}, _('Close'));
+
+	ui.showModal(_('Get rating — %s').format(instance), [
+		E('div', { 'class': 'cbi-section' }, [
+			E('label', { 'class': 'cbi-value' }, [
+				E('span', { 'class': 'cbi-value-title' }, _('Test mode')),
+				E('span', { 'class': 'cbi-value-field' }, mode)
+			]),
+			detail,
+			state
+		]),
+		E('div', { 'class': 'right' }, [ startButton, ' ', closeButton ])
+	]);
+
+	qualityTestExec(instance, 'status').then(function(job) {
+		if (job.state === 'running' && !closed) {
+			running = true;
+			startButton.disabled = true;
+			mode.disabled = true;
+			closeButton.textContent = _('Cancel');
+			setState((job.message || _('Collecting rating samples.')) + '\n' + qualityProgressText(job), false);
+			pollJob();
+		}
+	}).catch(function() {});
+}
+
 function renderVersions(versions) {
 	return E('div', { 'class': 'alert-message notice cake-package-versions' }, [
 		E('strong', {}, _('Installed versions: ')),
@@ -177,7 +352,7 @@ function qualityAge(result) {
 	return _('%d d ago').format(Math.round(seconds / 86400));
 }
 
-function renderDetectedGrade(label, result, state, collected, required) {
+function renderDetectedGrade(label, result, state, collected, required, dlSamples, ulSamples) {
 	var value, detail, classes = 'cake-quality-detected';
 
 	if (!result) {
@@ -186,7 +361,9 @@ function renderDetectedGrade(label, result, state, collected, required) {
 			detail = _('No completed rating yet');
 		} else if (state === 'collecting') {
 			value = _('COLLECTING');
-			detail = _('%d / %d scored samples').format(Number(collected || 0), Number(required || 0));
+			detail = _('DL %d/%d · UL %d/%d').format(
+				Number(dlSamples || 0), Number(required || 0),
+				Number(ulSamples || 0), Number(required || 0));
 		} else if (state === 'baseline_ready') {
 			value = _('BASELINE READY');
 			detail = _('Waiting for loaded traffic');
@@ -195,12 +372,14 @@ function renderDetectedGrade(label, result, state, collected, required) {
 			detail = _('Collecting idle baseline');
 		}
 	} else {
-		value = result.partial ? _('PARTIAL') : (result.grade || '-');
+		value = result.incomplete ?
+			(result.completed_at == null ? _('COLLECTING') : _('INCOMPLETE')) :
+			(result.partial ? _('PARTIAL') : (result.grade || '-'));
 		detail = _('+%s ms · %s · %s').format(
 			Number(result.increase_ms || 0).toFixed(1),
 			qualityDirectionSummary(result),
 			qualityAge(result));
-		if (!result.partial)
+		if (!result.partial && !result.incomplete)
 			classes += ' ' + qualityGradeClass(value);
 		if (result.stale)
 			classes += ' cake-quality-stale';
@@ -210,6 +389,7 @@ function renderDetectedGrade(label, result, state, collected, required) {
 		E('span', { 'class': 'cake-quality-label' }, label),
 		E('strong', {}, value),
 		E('small', {}, detail + (result && result.partial ? ' · ' + _('partial') : '') +
+			(result && result.incomplete ? ' · ' + _('incomplete') : '') +
 			(result && result.stale ? ' · ' + _('STALE') : ''))
 	]);
 }
@@ -240,14 +420,16 @@ function formatQuality(status) {
 				status.quality_class || 'LEARNING',
 				status.effective_latency_delta_ms == null ? '-' : Number(status.effective_latency_delta_ms).toFixed(1)),
 			_('Rejected sample: %s').format(status.transport_probe_rejected_reason || '-'),
+			_('Last rejected sample: %s').format(status.transport_probe_last_rejected_reason || '-'),
 			_('Transport error code: %s').format(status.transport_error_code || '-'),
 			_('Safe floors: DL %s · UL %s').format(formatRate(status.throughput_floor_dl_kbps), formatRate(status.throughput_floor_ul_kbps))
 		].join('\n');
 
 		return E('div', { 'class': 'cake-quality-stack', 'title': title }, [
 			renderDetectedGrade(_('CURRENT'), current, state,
-				status.quality_grade_collected_samples, status.quality_grade_required_samples),
-			renderDetectedGrade(_('PREVIOUS'), previous, previous ? 'final' : 'none', 0, 0)
+				status.quality_grade_collected_samples, status.quality_grade_required_samples,
+				status.quality_grade_dl_samples, status.quality_grade_ul_samples),
+			renderDetectedGrade(_('PREVIOUS'), previous, previous ? 'final' : 'none', 0, 0, 0, 0)
 		]);
 	}
 
@@ -394,6 +576,23 @@ function reflectorSummary(status) {
 	]);
 }
 
+function renderQualityAction(section, status, enabled) {
+	var readiness = qualityReadiness(section, status);
+
+	return E('div', { 'class': 'cake-quality-action' }, [
+		E('button', {
+			'class': 'btn cbi-button cbi-button-action',
+			'disabled': enabled ? null : '',
+			'title': readiness.reason,
+			'click': ui.createHandlerFn(null, function() {
+				showQualityTest(section, status);
+			})
+		}, _('Get rating')),
+		E('small', { 'class': readiness.ready ? 'cake-quality-ready' : 'cake-quality-not-ready' },
+			readiness.ready ? _('Ready') : readiness.reason)
+	]);
+}
+
 function renderTable(sections, statuses) {
 	var rows = [];
 	var children;
@@ -406,10 +605,11 @@ function renderTable(sections, statuses) {
 		var disabledRow;
 
 		if (!enabled) {
-				disabledRow = [
+			disabledRow = [
 					section,
 					_('DISABLED'),
-					'-', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-'
+					'-', '-', '-', '-', '-', '-', '-', '-', '-', '-', '-',
+					renderQualityAction(sectionData, st, false)
 			];
 			rows.push(disabledRow);
 			continue;
@@ -431,7 +631,8 @@ function renderTable(sections, statuses) {
 			formatRate(st.ul_achieved_rate_kbps),
 			formatShaperRate(st, 'dl'),
 			formatShaperRate(st, 'ul'),
-			formatPercent(st.cpu_total_percent)
+			formatPercent(st.cpu_total_percent),
+			renderQualityAction(sectionData, st, true)
 		]);
 	}
 
@@ -449,7 +650,8 @@ function renderTable(sections, statuses) {
 			E('th', { 'class': 'th' }, _('UL achieved')),
 			E('th', { 'class': 'th' }, _('CAKE DL')),
 			E('th', { 'class': 'th' }, _('CAKE UL')),
-			E('th', { 'class': 'th' }, _('CPU'))
+			E('th', { 'class': 'th' }, _('CPU')),
+			E('th', { 'class': 'th' }, _('Rating test'))
 		])
 	];
 
@@ -460,7 +662,7 @@ function renderTable(sections, statuses) {
 			})));
 	} else {
 		children.push(E('tr', { 'class': 'tr' }, [
-			E('td', { 'class': 'td', 'colspan': '13' }, _('No instances configured.'))
+			E('td', { 'class': 'td', 'colspan': '14' }, _('No instances configured.'))
 		]));
 	}
 
@@ -518,6 +720,11 @@ return L.view.extend({
 				'.cake-quality-grade-b strong{color:#8eae2f}.cake-quality-grade-c strong{color:#d08b20}',
 				'.cake-quality-grade-d strong,.cake-quality-grade-f strong{color:#d34b4b}',
 				'.cake-quality-stale{opacity:.65}',
+				'.cake-quality-action{min-width:145px;gap:5px}',
+				'.cake-quality-action small{white-space:normal;max-width:190px;color:#888}',
+				'.cake-quality-ready{color:#16a085!important}',
+				'.cake-quality-job-state{white-space:pre-wrap;margin-top:14px}',
+				'.cake-quality-job-detail{line-height:1.45;margin:12px 0;color:#888}',
 				'.cake-status-actions{display:flex;align-items:center;gap:7px;flex-wrap:wrap;width:100%;box-sizing:border-box}',
 				'@media(max-width:900px){.cake-status-table{display:block;overflow-x:auto}.cake-status-table th,.cake-status-table td{min-width:92px}.cake-status-table th:nth-child(6),.cake-status-table td:nth-child(6){min-width:180px}}'
 			].join('')),

@@ -1,0 +1,344 @@
+#!/bin/sh
+
+section="$1"
+requested_mode="${2:-status}"
+capture_mode="${3:-client}"
+backend="${4:-auto}"
+
+job_root="${CAKE_AUTORATE_QUALITY_DIR:-/tmp/cake-autorate-quality}"
+runtime_root="${CAKE_AUTORATE_RUNTIME_DIR:-/var/run/cake-autorate}"
+speedtest_bin="${CAKE_AUTORATE_SPEEDTEST:-/usr/libexec/cake-autorate-rs/speedtest}"
+jsonfilter_bin="${CAKE_AUTORATE_JSONFILTER:-$(command -v jsonfilter 2>/dev/null)}"
+uci_bin="${CAKE_AUTORATE_UCI:-uci}"
+setsid_bin="${CAKE_AUTORATE_SETSID:-$(command -v setsid 2>/dev/null)}"
+timeout_s="${CAKE_AUTORATE_QUALITY_TIMEOUT_S:-180}"
+max_automatic_runs="${CAKE_AUTORATE_QUALITY_MAX_RUNS:-3}"
+
+json_escape() {
+	printf '%s' "$1" | tr '\n\r\t' '   ' | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+json_error() {
+	printf '{"error":"%s"}\n' "$(json_escape "$1")"
+	exit 1
+}
+
+worker_fail() {
+	message="$1"
+	atomic_write "$error_file" "{\"state\":\"error\",\"error\":\"$(json_escape "$message")\"}"
+	exit 1
+}
+
+safe_name() {
+	case "$1" in
+		''|*[!A-Za-z0-9_]*) return 1 ;;
+	esac
+}
+
+safe_interface() {
+	case "$1" in
+		''|*[!A-Za-z0-9_.:@-]*) return 1 ;;
+	esac
+}
+
+is_pid() {
+	case "$1" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$1" -gt 1 ] 2>/dev/null
+}
+
+now_epoch() {
+	date +%s
+}
+
+job_paths() {
+	job_dir="$job_root/$section"
+	pid_file="$job_dir/pid"
+	status_file="$job_dir/status.json"
+	result_file="$job_dir/result.json"
+	error_file="$job_dir/error.json"
+	cancel_file="$job_dir/cancelled"
+	log_file="$job_dir/job.log"
+	runtime_dir="$runtime_root/$section"
+	daemon_status="$runtime_dir/status.json"
+	capture_file="$runtime_dir/rating-capture"
+}
+
+atomic_write() {
+	file="$1"
+	shift
+	tmp="$file.$$"
+	printf '%s\n' "$*" > "$tmp" && mv "$tmp" "$file"
+}
+
+status_value() {
+	[ -n "$jsonfilter_bin" ] && [ -s "$daemon_status" ] || return 0
+	"$jsonfilter_bin" -i "$daemon_status" -e "@$1" 2>/dev/null | sed -n '1p'
+}
+
+write_running_status() {
+	message="$1"
+	atomic_write "$status_file" "{\"state\":\"running\",\"mode\":\"$(json_escape "$capture_mode")\",\"message\":\"$(json_escape "$message")\"}"
+}
+
+write_capture() {
+	mkdir -p "$runtime_dir" || return 1
+	chmod 700 "$runtime_dir" 2>/dev/null || true
+	atomic_write "$capture_file" "$token|$capture_mode|$deadline"
+}
+
+clear_capture() {
+	current="$(sed -n '1p' "$capture_file" 2>/dev/null)"
+	case "$current" in
+		"$token|"*) rm -f "$capture_file" ;;
+	esac
+}
+
+resolve_target() {
+	target_if="$("$uci_bin" -q get "cake-autorate.$section.sqm_interface" 2>/dev/null)"
+	[ -n "$target_if" ] || target_if="$("$uci_bin" -q get "cake-autorate.$section.ul_if" 2>/dev/null)"
+	[ -n "$target_if" ] || target_if="$(status_value '.route_device')"
+	safe_interface "$target_if"
+}
+
+preflight() {
+	[ "$("$uci_bin" -q get "cake-autorate.$section.enabled" 2>/dev/null)" = 1 ] || {
+		failure="Autorate instance is disabled."
+		return 1
+	}
+	[ "$("$uci_bin" -q get "cake-autorate.$section.sqm_enabled" 2>/dev/null)" = 1 ] || {
+		failure="Managed SQM must be enabled for a loaded rating."
+		return 1
+	}
+	[ "$("$uci_bin" -q get "cake-autorate.$section.transport_latency_enabled" 2>/dev/null)" = 1 ] || {
+		failure="Transport-aware latency must be enabled."
+		return 1
+	}
+	[ -n "$jsonfilter_bin" ] || {
+		failure="jsonfilter is required."
+		return 1
+	}
+	[ -s "$daemon_status" ] || {
+		failure="Runtime status is unavailable."
+		return 1
+	}
+	[ "$(status_value '.route_active')" = true ] || {
+		failure="Selected uplink route is not active."
+		return 1
+	}
+	[ "$(status_value '.transport_probe_trusted')" = true ] || {
+		failure="A trusted native transport backend is required."
+		return 1
+	}
+	[ "$(status_value '.quality_grade_baseline_ready')" = true ] || {
+		failure="Idle RTT baseline is not ready yet."
+		return 1
+	}
+	resolve_target || {
+		failure="Unable to resolve the target interface."
+		return 1
+	}
+	if [ "$capture_mode" = automatic ] && [ ! -x "$speedtest_bin" ]; then
+		failure="Speed test helper is unavailable."
+		return 1
+	fi
+	return 0
+}
+
+lock_path_for_target() {
+	lock_name="$(printf '%s' "$target_if" | tr ':@.' '___')"
+	interface_lock="/tmp/cake-autorate-speedtest/interface-$lock_name.lock"
+}
+
+acquire_interface_lock() {
+	lock_path_for_target
+	mkdir -p /tmp/cake-autorate-speedtest || return 1
+	if ! mkdir "$interface_lock" 2>/dev/null; then
+		owner="$(sed -n '1p' "$interface_lock/pid" 2>/dev/null)"
+		if is_pid "$owner" && kill -0 "$owner" 2>/dev/null; then
+			failure="Another speed test, Auto-Tune, or rating job is using $target_if."
+			return 1
+		fi
+		rm -f "$interface_lock/pid" 2>/dev/null
+		rmdir "$interface_lock" 2>/dev/null || return 1
+		mkdir "$interface_lock" 2>/dev/null || return 1
+	fi
+	printf '%s\n' "$$" > "$interface_lock/pid"
+	CAKE_AUTORATE_INTERFACE_LOCK_OWNER="$$"
+	export CAKE_AUTORATE_INTERFACE_LOCK_OWNER
+}
+
+release_interface_lock() {
+	[ -n "${interface_lock:-}" ] || return 0
+	owner="$(sed -n '1p' "$interface_lock/pid" 2>/dev/null)"
+	if [ "$owner" = "$$" ]; then
+		rm -f "$interface_lock/pid" 2>/dev/null
+		rmdir "$interface_lock" 2>/dev/null || true
+	fi
+	interface_lock=""
+}
+
+emit_live_status() {
+	state="idle"
+	[ -s "$status_file" ] && state="running"
+	job_mode="$("$jsonfilter_bin" -i "$status_file" -e '@.mode' 2>/dev/null | sed -n '1p')"
+	[ -n "$job_mode" ] || job_mode="$capture_mode"
+	phase="$(status_value '.rating_load_phase')"
+	candidate="$(status_value '.rating_load_candidate')"
+	baseline="$(status_value '.quality_grade_baseline_samples')"
+	baseline_required="$(status_value '.quality_grade_baseline_required_samples')"
+	dl="$(status_value '.quality_grade_dl_samples')"
+	ul="$(status_value '.quality_grade_ul_samples')"
+	required="$(status_value '.quality_grade_required_samples')"
+	finalize="$(status_value '.quality_grade_finalize_remaining_s')"
+	dl_load="$(status_value '.rating_load_smoothed_dl_percent')"
+	ul_load="$(status_value '.rating_load_smoothed_ul_percent')"
+	last_reject="$(status_value '.transport_probe_last_rejected_reason')"
+	message="$(status_value '.quality_grade_state')"
+	printf '{"state":"%s","mode":"%s","phase":"%s","candidate":"%s","message":"%s","baseline_samples":%s,"baseline_required":%s,"dl_samples":%s,"ul_samples":%s,"required_samples":%s,"finalize_remaining_s":%s,"smoothed_dl_percent":%s,"smoothed_ul_percent":%s,"last_rejected_reason":"%s"}\n' \
+		"$state" "$(json_escape "$job_mode")" "$(json_escape "${phase:-IDLE}")" \
+		"$(json_escape "${candidate:-IDLE}")" "$(json_escape "${message:-waiting}")" \
+		"${baseline:-0}" "${baseline_required:-20}" "${dl:-0}" "${ul:-0}" \
+		"${required:-20}" "${finalize:-null}" "${dl_load:-0}" "${ul_load:-0}" \
+		"$(json_escape "$last_reject")"
+}
+
+result_is_complete() {
+	grade="$(status_value '.quality_grade_current.grade')"
+	partial="$(status_value '.quality_grade_current.partial')"
+	incomplete="$(status_value '.quality_grade_current.incomplete')"
+	started="$(status_value '.quality_grade_current.started_at')"
+	completed="$(status_value '.quality_grade_current.completed_at')"
+	grade_state="$(status_value '.quality_grade_state')"
+	awk -v started="${started:-0}" -v job="$job_started" 'BEGIN { exit !(started + 0 >= job + 0) }' || return 1
+	[ "$grade_state" = final ] && [ -n "$completed" ] && [ -n "$grade" ] && \
+		[ "$grade" != LEARNING ] && [ "$partial" != true ] && [ "$incomplete" != true ]
+}
+
+write_final_result() {
+	grade="$(status_value '.quality_grade_current.grade')"
+	increase="$(status_value '.quality_grade_current.increase_ms')"
+	dl_grade="$(status_value '.quality_grade_current.dl.grade')"
+	ul_grade="$(status_value '.quality_grade_current.ul.grade')"
+	dl_samples="$(status_value '.quality_grade_current.dl_samples')"
+	ul_samples="$(status_value '.quality_grade_current.ul_samples')"
+	atomic_write "$result_file" "{\"state\":\"complete\",\"mode\":\"$(json_escape "$capture_mode")\",\"grade\":\"$(json_escape "$grade")\",\"increase_ms\":${increase:-0},\"dl_grade\":\"$(json_escape "$dl_grade")\",\"ul_grade\":\"$(json_escape "$ul_grade")\",\"dl_samples\":${dl_samples:-0},\"ul_samples\":${ul_samples:-0},\"message\":\"Rating completed without changing CAKE limits.\"}"
+}
+
+worker_cleanup() {
+	clear_capture
+	release_interface_lock
+	rm -f "$pid_file" "$status_file"
+}
+
+worker_signal() {
+	atomic_write "$error_file" '{"state":"cancelled","error":"Rating capture cancelled."}'
+	exit 0
+}
+
+automatic_samples_ready() {
+	dl="$(status_value '.quality_grade_dl_samples')"
+	ul="$(status_value '.quality_grade_ul_samples')"
+	required="$(status_value '.quality_grade_required_samples')"
+	awk -v dl="${dl:-0}" -v ul="${ul:-0}" -v required="${required:-20}" \
+		'BEGIN { exit !(dl + 0 >= required + 0 && ul + 0 >= required + 0) }'
+}
+
+worker() {
+	job_started="$(now_epoch)"
+	token="$job_started-$$"
+	deadline="$((job_started + timeout_s))"
+	trap worker_cleanup EXIT
+	trap worker_signal INT TERM
+	preflight || worker_fail "$failure"
+	acquire_interface_lock || worker_fail "${failure:-Unable to lock the selected interface.}"
+	write_capture || worker_fail "Unable to arm rating capture."
+	write_running_status "Rating capture armed."
+
+	if [ "$capture_mode" = automatic ]; then
+		route_mode="$("$uci_bin" -q get "cake-autorate.$section.route_mode" 2>/dev/null)"
+		mwan3_member="$("$uci_bin" -q get "cake-autorate.$section.mwan3_member" 2>/dev/null)"
+		run=1
+		while [ "$run" -le "$max_automatic_runs" ]; do
+			write_running_status "Generating shaped download and upload load (pass $run/$max_automatic_runs)."
+			if ! "$speedtest_bin" "$section" "$target_if" run "$backend" shaped "$route_mode" "$mwan3_member" >> "$log_file" 2>&1; then
+				worker_fail "Automatic load generator failed; SQM and rates were left unchanged."
+			fi
+			sleep 2
+			automatic_samples_ready && break
+			run=$((run + 1))
+		done
+		write_running_status "Load generation finished; waiting for the rating window to finalize."
+	else
+		write_running_status "Run a sequential download/upload test from a LAN client."
+	fi
+
+	while [ "$(now_epoch)" -lt "$deadline" ]; do
+		[ -f "$cancel_file" ] && {
+			atomic_write "$error_file" '{"state":"cancelled","error":"Rating capture cancelled."}'
+			exit 0
+		}
+		if result_is_complete; then
+			write_final_result
+			exit 0
+		fi
+		sleep 1
+	done
+	partial="$(status_value '.quality_grade_current.partial')"
+	incomplete="$(status_value '.quality_grade_current.incomplete')"
+	dl="$(status_value '.quality_grade_dl_samples')"
+	ul="$(status_value '.quality_grade_ul_samples')"
+	atomic_write "$error_file" "{\"state\":\"incomplete\",\"error\":\"Rating did not collect both directions before timeout.\",\"partial\":${partial:-false},\"incomplete\":${incomplete:-true},\"dl_samples\":${dl:-0},\"ul_samples\":${ul:-0}}"
+}
+
+start_job() {
+	case "$capture_mode" in automatic|client) ;; *) json_error "Unknown rating mode." ;; esac
+	[ -n "$setsid_bin" ] && [ -x "$setsid_bin" ] || json_error "setsid is required."
+	mkdir -p "$job_dir" || json_error "Unable to create rating job directory."
+	chmod 700 "$job_dir" 2>/dev/null || true
+	if [ -s "$pid_file" ]; then
+		pid="$(sed -n '1p' "$pid_file")"
+		if is_pid "$pid" && kill -0 "$pid" 2>/dev/null; then
+			emit_live_status
+			return 0
+		fi
+	fi
+	preflight || json_error "$failure"
+	rm -f "$pid_file" "$status_file" "$result_file" "$error_file" "$cancel_file" "$log_file"
+	"$setsid_bin" "$0" "$section" worker "$capture_mode" "$backend" </dev/null >> "$log_file" 2>&1 &
+	pid="$!"
+	printf '%s\n' "$pid" > "$pid_file"
+	printf '{"state":"running","mode":"%s","message":"Starting rating capture."}\n' "$(json_escape "$capture_mode")"
+}
+
+show_status() {
+	if [ -s "$result_file" ]; then cat "$result_file"; return 0; fi
+	if [ -s "$error_file" ]; then cat "$error_file"; return 0; fi
+	if [ -s "$pid_file" ]; then
+		pid="$(sed -n '1p' "$pid_file")"
+		if is_pid "$pid" && kill -0 "$pid" 2>/dev/null; then emit_live_status; return 0; fi
+	fi
+	printf '{"state":"idle","message":"No rating job is running."}\n'
+}
+
+cancel_job() {
+	touch "$cancel_file"
+	if [ -s "$pid_file" ]; then
+		pid="$(sed -n '1p' "$pid_file")"
+		if is_pid "$pid" && kill -0 "$pid" 2>/dev/null; then
+			kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+		fi
+	fi
+	rm -f "$capture_file"
+	printf '{"state":"cancelled","message":"Rating capture cancelled."}\n'
+}
+
+safe_name "$section" || json_error "Invalid instance name."
+job_paths
+
+case "$requested_mode" in
+	start) start_job ;;
+	status) show_status ;;
+	cancel) cancel_job ;;
+	worker) worker ;;
+	*) json_error "Unknown quality-test operation." ;;
+esac

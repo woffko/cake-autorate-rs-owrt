@@ -24,7 +24,7 @@ const windowStub = {
 };
 const loadHelpers = new Function('fs', 'poll', 'uci', 'ui', 'L', 'E', '_', 'window',
 	`${prefix}\nreturn { parseHistory, historyInterval, buildChartGeometry, nearestPoint, ` +
-		'bindHover, bindScroll, scrollState, formatMemoryKib };');
+		'bindHover, bindScroll, scrollState, scrollMaximum, formatMemoryKib, lineConnected, niceRateCeiling };');
 const helpers = loadHelpers({}, {}, {}, {}, {}, () => {}, value => value, windowStub);
 
 function assert(condition, message) {
@@ -32,22 +32,26 @@ function assert(condition, message) {
 		throw new Error(message);
 }
 
-assert(source.includes('.cake-graph-fixed-axis{position:sticky;left:0'),
+assert(source.includes('.cake-graph-fixed-axis{position:absolute;left:0;right:0'),
 	'Y-axis labels must stay fixed while the data timeline scrolls');
 assert(source.includes('.cake-graph-chart-title{position:sticky;left:0'),
 	'chart titles must stay fixed while the data timeline scrolls');
+assert(source.includes('viewport.offsetWidth'),
+	'follow-latest must account for the stable scrollbar gutter');
 assert(source.includes('.cake-graphs-grid{display:grid;grid-template-columns:minmax(0,1fr)'),
 	'different WAN cards must be stacked in one column');
 assert(source.includes('HISTORY_PAGE_SAMPLES = 10000'),
 	'large histories must be fetched in bounded pages');
 assert(source.includes('graph_history_ram_budget_kib'),
 	'Graphs must expose the global RAM budget');
+assert(source.includes('Show safety floors') && source.includes('if (showFloors && point.dlFloor'),
+	'safety floors must be optional and excluded from the default traffic scale');
 assert(helpers.formatMemoryKib(1024) === '1.0 MiB', 'memory formatter failed');
 assert(helpers.formatMemoryKib(null) === '-', 'missing memory must not look like zero use');
 
 const now = Math.floor(Date.now() / 1000);
 const points = helpers.parseHistory([
-	`${now - 2},10.125,1.5,1000.0,500.0,20.5,22.0,600.0,300.0,ACTIVE,mwan3|wan|pppoe-wan|198.51.100.1|0x100|1,A+,final,1.25`,
+	`${now - 2},10.125,1.5,1000.0,500.0,20.5,22.0,600.0,300.0,ACTIVE,mwan3|wan|pppoe-wan|198.51.100.1|0x100|1,A+,final,1.25,DL,20,7`,
 	`${now - 1},,2.5,2000.0,750.0`,
 	`${now},12.500,3.5,3000.0,1000.0`,
 ].join('\n'));
@@ -61,6 +65,8 @@ assert(points[0].uplinkState === 'ACTIVE' && points[0].routeIdentity.includes('0
 	'Multi-WAN state and route identity parsing failed');
 assert(points[0].grade === 'A+' && points[0].gradeState === 'final' && points[0].gradeIncrease === 1.25,
 	'quality-grade event parsing failed');
+assert(points[0].ratingPhase === 'DL' && points[0].ratingDlSamples === 20 && points[0].ratingUlSamples === 7,
+	'rating progress event parsing failed');
 
 const legacy = helpers.parseHistory(`${now},9.5,4.0`);
 assert(legacy.length === 1 && legacy[0].dl === null && legacy[0].ul === null,
@@ -83,6 +89,18 @@ for (let index = 0; index < 2000; index++) {
 const geometry = helpers.buildChartGeometry(longHistory, 1, { clientWidth: 900 });
 assert(geometry.width > 900, 'long history should require horizontal scrolling');
 assert(helpers.nearestPoint(points, now - 1.1) === points[1], 'nearest hover sample failed');
+assert(helpers.lineConnected(
+	{ timestamp: 1, routeIdentity: 'route-a', uplinkState: 'ACTIVE' },
+	{ timestamp: 2, routeIdentity: 'route-a', uplinkState: 'ACTIVE' }, 1),
+	'adjacent samples on one route should connect');
+assert(!helpers.lineConnected(
+	{ timestamp: 1, routeIdentity: 'route-a', uplinkState: 'ACTIVE' },
+	{ timestamp: 2, routeIdentity: 'route-b', uplinkState: 'ACTIVE' }, 1),
+	'lines must break on route changes');
+assert(!helpers.lineConnected(
+	{ timestamp: 1, routeIdentity: 'route-a', uplinkState: 'ACTIVE' },
+	{ timestamp: 20, routeIdentity: 'route-a', uplinkState: 'ACTIVE' }, 1),
+	'lines must break across missing sample gaps');
 
 function eventTarget(properties) {
 	const listeners = {};
@@ -102,7 +120,7 @@ const canvas = eventTarget({
 });
 helpers.bindHover(canvas, geometry, hoverInfo);
 canvas.emit('mousemove', { clientX: geometry.width - geometry.right });
-for (const label of ['grade', 'RTT', 'transport', 'effective', 'CPU', 'DL', 'UL', 'floors'])
+for (const label of ['rating phase', 'grade', 'RTT', 'transport', 'effective', 'CPU', 'DL', 'UL', 'floors'])
 	assert(hoverInfo.textContent.includes(label), `hover output is missing ${label}`);
 assert(hoverInfo.style.visibility === 'visible', 'hover output should be visible');
 canvas.emit('mouseleave');
@@ -127,5 +145,13 @@ assert(replacementViewport.scrollLeft === 0, 'poll replacement should preserve m
 replacementLatest.emit('click');
 assert(replacementViewport.scrollLeft === replacementViewport.scrollWidth - 900,
 	'Latest should restore follow mode');
+
+const gutterViewport = {
+	clientWidth: 900,
+	offsetWidth: 915,
+	scrollWidth: geometry.width,
+};
+assert(helpers.scrollMaximum(gutterViewport) === geometry.width - 915,
+	'stable scrollbar gutter must not leave Latest short of the actual edge');
 
 console.log('graphs.js tests passed');

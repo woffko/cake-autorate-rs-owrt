@@ -41,6 +41,7 @@
 				"/etc/init.d/sqm restart": [ "exec" ],
 				"/usr/libexec/cake-autorate-rs/speedtest *": [ "exec" ],
 				"/usr/libexec/cake-autorate-rs/autotune *": [ "exec" ],
+				"/usr/libexec/cake-autorate-rs/quality-test *": [ "exec" ],
 				"/usr/libexec/cake-autorate-rs/pinger-plan *": [ "exec" ],
 				"/usr/libexec/cake-autorate-rs/log-bundle *": [ "exec" ],
 				"/usr/libexec/cake-autorate-rs/mqtt-status *": [ "exec" ],

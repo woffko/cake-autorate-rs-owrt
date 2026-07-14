@@ -63,6 +63,9 @@ RC8 native transport RTT sockets do not spawn a helper. They apply the resolved
 L3 device (`SO_BINDTODEVICE`), source IPv4 bind, and mwan3 `SO_MARK` directly;
 DNS resolution happens before the RTT clock starts. Persistent connections are
 owned by one route identity and discarded when that identity changes.
+RC9 rating-load windows, directional sample counters, active episodes, and
+capture markers are likewise owned by one instance/route identity; a WAN
+cannot complete a grade using another WAN's traffic or baseline.
 
 The legacy exact prefix `ping_prefix_string='mwan3 use <member> exec'` is
 migrated by the init script to these structured fields. Arbitrary free-form
@@ -161,7 +164,9 @@ instance names, target devices, SQM sections, and conflicts before saving.
 Status shows lifecycle state, route/member/device, source and external address,
 fwmark, routing table, policy share, and the reason for standby/offline.
 Graphs remain separate per instance, are stacked vertically, and annotate
-route/lifecycle and detected-grade changes. History remains RAM-only. One
+route/lifecycle, rating-phase, directional-count, and detected-grade changes.
+`Get rating` locks only the selected interface and routes shaped automatic load
+through that instance's validated member. History remains RAM-only. One
 global memory budget is divided across every enabled instance; no WAN can claim
 another WAN's full allowance, and low-memory suspension affects only telemetry,
 not shaping or route lifecycle.

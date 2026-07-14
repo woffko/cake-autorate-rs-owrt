@@ -18,7 +18,7 @@ const source = fs.readFileSync(sourcePath, 'utf8');
 const prefix = source.slice(0, source.indexOf('return L.view.extend'));
 const E = (tag, attrs, children) => ({ tag, attrs: attrs || {}, children: children || [] });
 const helpers = new Function('fs', 'poll', 'uci', 'ui', 'cakeUi', 'L', 'E', '_',
-	`${prefix}\nreturn { formatQuality, formatRoute, formatState };`
+	`${prefix}\nreturn { formatQuality, formatRoute, formatState, qualityReadiness, qualityProgressText };`
 )({}, {}, {}, {}, {}, {}, E, value => value);
 
 const quality = helpers.formatQuality({
@@ -60,6 +60,8 @@ const collecting = helpers.formatQuality({
 	quality_grade_state: 'collecting',
 	quality_grade_collected_samples: 2,
 	quality_grade_required_samples: 3,
+	quality_grade_dl_samples: 2,
+	quality_grade_ul_samples: 0,
 	quality_grade_current: null,
 	quality_grade_previous: detected.children ? {
 		grade: 'A', increase_ms: 10, completed_at: Date.now() / 1000 - 30,
@@ -67,7 +69,7 @@ const collecting = helpers.formatQuality({
 	} : null,
 });
 assert.equal(collecting.children[0].children[1].children, 'COLLECTING');
-assert.match(collecting.children[0].children[2].children, /2 \/ 3/);
+assert.match(collecting.children[0].children[2].children, /DL 2\/3.*UL 0\/3/);
 assert.equal(collecting.children[1].children[1].children, 'A');
 
 const noPrevious = helpers.formatQuality({
@@ -82,8 +84,46 @@ assert.equal(noPrevious.children[0].children[1].children, 'LEARNING');
 assert.equal(noPrevious.children[1].children[1].children, '-');
 assert.equal(noPrevious.children[1].children[2].children, 'No completed rating yet');
 
+const incomplete = helpers.formatQuality({
+	transport_latency_enabled: true,
+	quality_grade_state: 'final',
+	quality_grade_current: {
+		grade: 'LEARNING', increase_ms: 0, completed_at: Date.now() / 1000,
+		partial: false, incomplete: true, dl_samples: 4, ul_samples: 0,
+	},
+	quality_grade_previous: null,
+});
+assert.equal(incomplete.children[0].children[1].children, 'INCOMPLETE');
+
+const ready = helpers.qualityReadiness({ enabled: '1', sqm_enabled: '1' }, {
+	transport_latency_enabled: true,
+	route_active: true,
+	transport_probe_trusted: true,
+	quality_grade_baseline_ready: true,
+});
+assert.equal(ready.ready, true);
+const learning = helpers.qualityReadiness({ enabled: '1', sqm_enabled: '1' }, {
+	transport_latency_enabled: true,
+	route_active: true,
+	transport_probe_trusted: true,
+	quality_grade_baseline_ready: false,
+	quality_grade_baseline_samples: 7,
+	quality_grade_baseline_required_samples: 20,
+});
+assert.equal(learning.ready, false);
+assert.match(learning.reason, /7 \/ 20/);
+assert.match(helpers.qualityProgressText({
+	baseline_samples: 20, baseline_required: 20,
+	dl_samples: 12, ul_samples: 9, required_samples: 20,
+	phase: 'DL', smoothed_dl_percent: 81, smoothed_ul_percent: 3,
+}), /DL 12\/20.*UL 9\/20.*Phase DL/);
+
 assert.match(source, /cake-status-table td\{vertical-align:top!important/);
 assert.match(source, /cake-status-table th\{vertical-align:bottom!important/);
+assert.match(source, /quality-test/);
+assert.match(source, /Get rating/);
+assert.doesNotMatch(source, /'disabled':\s*!/,
+	'Boolean false must not be serialized as an HTML disabled attribute');
 
 const route = helpers.formatRoute({
 	route_mode: 'mwan3',
