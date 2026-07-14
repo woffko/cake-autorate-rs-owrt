@@ -100,7 +100,9 @@ are A+ for `delta < 5`, A for `< 30`, B for `< 60`, C for `< 200`, D for
 `< 400`, and F otherwise. At least 20 idle samples and 20 loaded samples per
 scored direction are required. A one-direction result is `PARTIAL` and is never
 shown as a final grade. `CURRENT` is the active/latest result; `PREVIOUS` is the
-last completed episode and remains visible while another episode collects. All
+last completed episode and remains visible while another episode collects. An
+episode finalizes after 30 seconds without accepted directional loaded samples
+by default. All
 these samples are scoped to `I_u`; after a route change the retained result is
 explicitly stale and cannot be combined with new samples.
 
@@ -128,7 +130,7 @@ L = 100 * R / C
 Download uses the configured RX counter and upload uses TX. Counter rollback
 is saturated at zero. An interval is never treated as shorter than 1 ms.
 
-Load is classified as:
+The fast rate controller classifies load as:
 
 ```text
 high  if L > 100 * high_load_thr
@@ -138,6 +140,50 @@ idle  otherwise
 
 The packaged `high_load_thr` default is `0.75`, or 75% of the current CAKE
 rate.
+
+## Independent rating-load state machine
+
+Detected grading must recognize sustained routed client tests without inheriting
+the fast controller's instantaneous transitions. For each direction, RC9 keeps
+all `(R, R/C)` observations in a window of length `W` and calculates:
+
+```text
+Rbar_d = mean(R_d)
+Lbar_d = mean(clamp(R_d / C_d, 0, 10))
+```
+
+Let `E` be the enter ratio, `X` the exit ratio, `K` the minimum absolute rate,
+and `D` the direction-dominance ratio. With defaults `W=2 s`, `E=0.60`,
+`X=0.40`, `K=2000 kbit/s`, and `D=1.5`:
+
+```text
+loaded_d(E) = (Lbar_d >= E) and (Rbar_d >= K)
+
+phase = IDLE          if neither direction is loaded
+        DL            if only DL is loaded
+        UL            if only UL is loaded
+        DL            if both and Lbar_DL >= D * Lbar_UL
+        UL            if both and Lbar_UL >= D * Lbar_DL
+        BIDIRECTIONAL otherwise
+```
+
+A new candidate must persist for one second before the phase changes. A loaded
+phase remains supported using `X` and `K/2`; only 1.5 seconds continuously below
+that lower boundary returns it to idle. Thus the enter/exit gap is true
+hysteresis, not two independent labels. A transport batch is admitted to a
+directional grade window only when its route identity and rating phase still
+match at completion.
+
+The optional bounded capture marker used by `Get rating` does not inject
+samples. It learns the highest smoothed ratio `P` seen during that job and uses:
+
+```text
+E_capture = min(E, max(0.15, 0.55 * P))
+X_capture = min(X, max(0.10, 0.67 * E_capture))
+```
+
+Removing the marker immediately restores normal passive thresholds. Controller
+classification and all CAKE update equations remain unchanged.
 
 ## Delay samples and moving baseline
 
@@ -352,6 +398,13 @@ the budget every 30 seconds. On reaching an instance cap it streams the newest
 rows into a replacement file targeting 75% of the cap, so compaction itself
 does not load a large history into RAM. Browser reads are separately paged and
 bounded to 10,000 rows.
+
+Traffic-axis autoscaling uses observed DL/UL samples only. The safety floors are
+excluded unless `Show safety floors` is enabled, preventing a high configured
+floor from visually flattening low ordinary traffic. The fixed scale overlays
+sit outside the horizontal scroll track. Follow-to-latest uses the browser's
+actual viewport width including a stable scrollbar gutter, so the right edge is
+not left one gutter short.
 
 ## Choosing fixed SQM or autorate
 

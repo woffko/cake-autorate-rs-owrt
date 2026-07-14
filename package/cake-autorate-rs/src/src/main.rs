@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod adaptive_ceiling;
 mod autotune;
 mod quality_grade;
+mod rating_load;
 mod routing;
 mod transport_probe;
 mod transport_quality;
@@ -22,6 +23,7 @@ use adaptive_ceiling::{
     AdaptiveCeilingPolicy, AdaptiveCeilingUpdate,
 };
 use quality_grade::{QualityGradeMetric, QualityGradeResult, QualityGradeTracker};
+use rating_load::{RatingLoadConfig, RatingLoadDetector, RatingLoadSnapshot, RatingPhase};
 use routing::{RouteMode, RouteSnapshot, RouteSpec, UplinkLifecycle, UplinkState};
 use transport_probe::{RouteBinding, TransportProbeBackend, TransportProbeEngine};
 use transport_quality::{
@@ -113,6 +115,14 @@ struct Config {
     transport_probe_timeout_s: u64,
     transport_load_hold_s: f64,
     transport_cpu_max_percent: f64,
+    rating_load_window_s: f64,
+    rating_load_enter_ratio: f64,
+    rating_load_exit_ratio: f64,
+    rating_load_hold_s: f64,
+    rating_load_dropout_s: f64,
+    rating_load_min_kbps: f64,
+    rating_load_dominance_ratio: f64,
+    rating_episode_gap_s: f64,
     quality_target_delay_ms: f64,
     quality_search_max_steps: usize,
     quality_search_observe_s: f64,
@@ -243,6 +253,14 @@ impl Config {
             transport_probe_timeout_s: 5,
             transport_load_hold_s: 3.0,
             transport_cpu_max_percent: 85.0,
+            rating_load_window_s: 2.0,
+            rating_load_enter_ratio: 0.60,
+            rating_load_exit_ratio: 0.40,
+            rating_load_hold_s: 1.0,
+            rating_load_dropout_s: 1.5,
+            rating_load_min_kbps: 2000.0,
+            rating_load_dominance_ratio: 1.5,
+            rating_episode_gap_s: 30.0,
             quality_target_delay_ms: 30.0,
             quality_search_max_steps: 3,
             quality_search_observe_s: 6.0,
@@ -527,6 +545,42 @@ impl Config {
             &single,
             "transport_cpu_max_percent",
             &mut cfg.transport_cpu_max_percent,
+        )?;
+        set_f64(
+            &single,
+            "rating_load_window_s",
+            &mut cfg.rating_load_window_s,
+        )?;
+        set_f64(
+            &single,
+            "rating_load_enter_ratio",
+            &mut cfg.rating_load_enter_ratio,
+        )?;
+        set_f64(
+            &single,
+            "rating_load_exit_ratio",
+            &mut cfg.rating_load_exit_ratio,
+        )?;
+        set_f64(&single, "rating_load_hold_s", &mut cfg.rating_load_hold_s)?;
+        set_f64(
+            &single,
+            "rating_load_dropout_s",
+            &mut cfg.rating_load_dropout_s,
+        )?;
+        set_f64(
+            &single,
+            "rating_load_min_kbps",
+            &mut cfg.rating_load_min_kbps,
+        )?;
+        set_f64(
+            &single,
+            "rating_load_dominance_ratio",
+            &mut cfg.rating_load_dominance_ratio,
+        )?;
+        set_f64(
+            &single,
+            "rating_episode_gap_s",
+            &mut cfg.rating_episode_gap_s,
         )?;
         set_f64(
             &single,
@@ -1164,6 +1218,47 @@ impl Config {
             {
                 return Err("transport_cpu_max_percent must be between 50 and 100".to_string());
             }
+            if !self.rating_load_window_s.is_finite()
+                || !(0.5..=10.0).contains(&self.rating_load_window_s)
+            {
+                return Err("rating_load_window_s must be between 0.5 and 10".to_string());
+            }
+            if !self.rating_load_enter_ratio.is_finite()
+                || !(0.10..=1.0).contains(&self.rating_load_enter_ratio)
+            {
+                return Err("rating_load_enter_ratio must be between 0.10 and 1.0".to_string());
+            }
+            if !self.rating_load_exit_ratio.is_finite()
+                || !(0.05..1.0).contains(&self.rating_load_exit_ratio)
+                || self.rating_load_exit_ratio >= self.rating_load_enter_ratio
+            {
+                return Err(
+                    "rating_load_exit_ratio must be below rating_load_enter_ratio".to_string(),
+                );
+            }
+            if !self.rating_load_hold_s.is_finite()
+                || !(0.2..=10.0).contains(&self.rating_load_hold_s)
+            {
+                return Err("rating_load_hold_s must be between 0.2 and 10".to_string());
+            }
+            if !self.rating_load_dropout_s.is_finite()
+                || !(0.2..=10.0).contains(&self.rating_load_dropout_s)
+            {
+                return Err("rating_load_dropout_s must be between 0.2 and 10".to_string());
+            }
+            if !self.rating_load_min_kbps.is_finite() || self.rating_load_min_kbps < 0.0 {
+                return Err("rating_load_min_kbps must not be negative".to_string());
+            }
+            if !self.rating_load_dominance_ratio.is_finite()
+                || !(1.1..=10.0).contains(&self.rating_load_dominance_ratio)
+            {
+                return Err("rating_load_dominance_ratio must be between 1.1 and 10".to_string());
+            }
+            if !self.rating_episode_gap_s.is_finite()
+                || !(5.0..=120.0).contains(&self.rating_episode_gap_s)
+            {
+                return Err("rating_episode_gap_s must be between 5 and 120".to_string());
+            }
             if !self.quality_target_delay_ms.is_finite()
                 || !(5.0..=200.0).contains(&self.quality_target_delay_ms)
             {
@@ -1301,6 +1396,18 @@ impl Config {
         RouteSpec::new(&self.route_mode, &self.mwan3_member, &self.ul_if)
     }
 
+    fn rating_load_config(&self) -> RatingLoadConfig {
+        RatingLoadConfig {
+            window: Duration::from_secs_f64(self.rating_load_window_s),
+            enter_ratio: self.rating_load_enter_ratio,
+            exit_ratio: self.rating_load_exit_ratio,
+            hold: Duration::from_secs_f64(self.rating_load_hold_s),
+            dropout: Duration::from_secs_f64(self.rating_load_dropout_s),
+            min_rate_kbps: self.rating_load_min_kbps,
+            dominance_ratio: self.rating_load_dominance_ratio,
+        }
+    }
+
     fn run_dir(&self) -> PathBuf {
         PathBuf::from(format!("/var/run/cake-autorate/{}", self.instance))
     }
@@ -1316,6 +1423,10 @@ impl Config {
 
     fn graph_history_path(&self) -> PathBuf {
         self.run_dir().join("history.csv")
+    }
+
+    fn rating_capture_path(&self) -> PathBuf {
+        self.run_dir().join("rating-capture")
     }
 }
 
@@ -1732,17 +1843,19 @@ impl RateMonitor {
 
 #[derive(Clone, Debug)]
 struct TransportProbeRequest {
-    loaded: bool,
+    control_valid: bool,
     dl_loaded: bool,
     ul_loaded: bool,
+    rating_phase: RatingPhase,
 }
 
 #[derive(Clone, Debug)]
 struct TransportProbeResult {
+    control_valid: bool,
     endpoint: String,
-    loaded: bool,
     dl_loaded: bool,
     ul_loaded: bool,
+    rating_phase: RatingPhase,
     latency_ms: Option<f64>,
     error: Option<String>,
     route_identity: Option<String>,
@@ -1941,10 +2054,11 @@ impl TransportProbeRuntime {
                 };
                 if result_tx
                     .send(TransportProbeResult {
+                        control_valid: request.control_valid,
                         endpoint: endpoint.clone(),
-                        loaded: request.loaded,
                         dl_loaded: request.dl_loaded,
                         ul_loaded: request.ul_loaded,
+                        rating_phase: request.rating_phase,
                         latency_ms,
                         error,
                         route_identity: stable_identity,
@@ -1988,23 +2102,27 @@ impl TransportProbeRuntime {
         ul_rate: f64,
         dl_shaper: f64,
         ul_shaper: f64,
+        rating: &RatingLoadSnapshot,
     ) {
-        let dl_loaded = percent(dl_rate, dl_shaper) >= cfg.high_load_thr * 100.0;
-        let ul_loaded = percent(ul_rate, ul_shaper) >= cfg.high_load_thr * 100.0;
-        let phase = (dl_loaded, ul_loaded);
+        let raw_dl_loaded = percent(dl_rate, dl_shaper) >= cfg.high_load_thr * 100.0;
+        let raw_ul_loaded = percent(ul_rate, ul_shaper) >= cfg.high_load_thr * 100.0;
+        let phase = (raw_dl_loaded, raw_ul_loaded);
         if phase != self.load_candidate {
             self.load_candidate = phase;
             self.load_candidate_since = Instant::now();
         }
-        let loaded = dl_loaded || ul_loaded;
-        if self.in_flight
-            || (loaded
-                && self.load_candidate_since.elapsed()
-                    < Duration::from_secs_f64(cfg.transport_load_hold_s))
-        {
+        let raw_loaded = raw_dl_loaded || raw_ul_loaded;
+        let control_valid = !raw_loaded
+            || self.load_candidate_since.elapsed()
+                >= Duration::from_secs_f64(cfg.transport_load_hold_s);
+        if self.in_flight || (raw_loaded && !control_valid && !rating.phase.loaded()) {
             return;
         }
-        let interval = if loaded {
+        let dl_loaded = control_valid && raw_dl_loaded;
+        let ul_loaded = control_valid && raw_ul_loaded;
+        let loaded = dl_loaded || ul_loaded;
+        let any_loaded = loaded || rating.phase.loaded();
+        let interval = if any_loaded {
             cfg.transport_probe_loaded_interval_s
         } else {
             cfg.transport_probe_idle_interval_s
@@ -2016,9 +2134,10 @@ impl TransportProbeRuntime {
         if self
             .requests
             .try_send(TransportProbeRequest {
-                loaded,
+                control_valid,
                 dl_loaded,
                 ul_loaded,
+                rating_phase: rating.phase,
             })
             .is_ok()
         {
@@ -2533,6 +2652,8 @@ struct Controller {
     transport_latency_dl: TransportLatencyTracker,
     transport_latency_ul: TransportLatencyTracker,
     quality_grade: QualityGradeTracker,
+    rating_load: RatingLoadDetector,
+    rating_load_snapshot: RatingLoadSnapshot,
     quality_search_dl: QualitySearchDirection,
     quality_search_ul: QualitySearchDirection,
     quality_dl_class: QualityClass,
@@ -2544,6 +2665,8 @@ struct Controller {
     transport_server_processing_ms: f64,
     transport_connection_reused: bool,
     transport_rejected_reason: Option<String>,
+    transport_last_rejected_reason: Option<String>,
+    transport_last_rejected_at: Option<f64>,
     transport_bad_windows_dl: u8,
     transport_bad_windows_ul: u8,
     throughput_floor_dl: f64,
@@ -2605,6 +2728,8 @@ impl Controller {
             }
         };
         let now = Instant::now();
+        let rating_load = RatingLoadDetector::new(now);
+        let rating_load_snapshot = rating_load.snapshot(now, cfg.rating_load_config());
         let adaptive_dl = AdaptiveCeilingDirection::new(
             cfg.max_dl_shaper_rate_kbps,
             cfg.adaptive_ceiling_dl_cap_kbps,
@@ -2642,7 +2767,9 @@ impl Controller {
             transport_latency: TransportLatencyTracker::new(),
             transport_latency_dl: TransportLatencyTracker::new(),
             transport_latency_ul: TransportLatencyTracker::new(),
-            quality_grade: QualityGradeTracker::new(),
+            quality_grade: QualityGradeTracker::new(cfg.rating_episode_gap_s),
+            rating_load,
+            rating_load_snapshot,
             quality_search_dl: QualitySearchDirection::new(),
             quality_search_ul: QualitySearchDirection::new(),
             quality_dl_class: QualityClass::Learning,
@@ -2654,6 +2781,8 @@ impl Controller {
             transport_server_processing_ms: 0.0,
             transport_connection_reused: false,
             transport_rejected_reason: None,
+            transport_last_rejected_reason: None,
+            transport_last_rejected_at: None,
             transport_bad_windows_dl: 0,
             transport_bad_windows_ul: 0,
             throughput_floor_dl,
@@ -2702,6 +2831,49 @@ impl Controller {
 
     fn sample_rates(&mut self) -> (f64, f64) {
         self.rate_monitor.sample()
+    }
+
+    fn update_rating_load(
+        &mut self,
+        now: Instant,
+        dl_rate: f64,
+        ul_rate: f64,
+    ) -> RatingLoadSnapshot {
+        self.sync_rating_capture(now);
+        self.rating_load_snapshot = self.rating_load.observe(
+            now,
+            dl_rate,
+            ul_rate,
+            self.shaper_dl,
+            self.shaper_ul,
+            self.cfg.rating_load_config(),
+        );
+        self.rating_load_snapshot.clone()
+    }
+
+    fn sync_rating_capture(&mut self, now: Instant) {
+        let content = fs::read_to_string(self.cfg.rating_capture_path()).unwrap_or_default();
+        let mut fields = content.trim().split('|');
+        let token = fields.next().unwrap_or("");
+        let mode = fields.next().unwrap_or("");
+        let deadline = fields.next().and_then(|value| value.parse::<f64>().ok());
+        if !token.is_empty()
+            && matches!(mode, "automatic" | "client")
+            && deadline.map(|value| value > epoch_secs()).unwrap_or(false)
+        {
+            self.rating_load.set_capture(Some(token), Some(mode), now);
+        } else {
+            self.rating_load.set_capture(None, None, now);
+            if !content.is_empty() {
+                let _ = fs::remove_file(self.cfg.rating_capture_path());
+            }
+        }
+    }
+
+    fn record_transport_rejection(&mut self, reason: &str) {
+        self.transport_rejected_reason = Some(reason.to_string());
+        self.transport_last_rejected_reason = Some(reason.to_string());
+        self.transport_last_rejected_at = Some(epoch_secs());
     }
 
     fn shaper_rates(&self) -> (f64, f64) {
@@ -2757,7 +2929,7 @@ impl Controller {
         self.transport_rejected_reason = None;
 
         if let Some(error) = result.error.as_deref() {
-            self.transport_rejected_reason = Some("probe_error".to_string());
+            self.record_transport_rejection("probe_error");
             self.transport_latency.observe_failure(error);
             self.log("DEBUG", &format!("transport latency probe failed: {error}"));
             let _ = self.refresh_status_from_last_sample();
@@ -2769,7 +2941,7 @@ impl Controller {
                 self.route_identity.as_deref(),
             )
         {
-            self.transport_rejected_reason = Some("route_changed".to_string());
+            self.record_transport_rejection("route_changed");
             self.transport_latency
                 .observe_failure("route changed before transport result was accepted");
             self.log(
@@ -2780,7 +2952,7 @@ impl Controller {
             return;
         }
         if !result.trusted {
-            self.transport_rejected_reason = Some("untrusted_backend".to_string());
+            self.record_transport_rejection("untrusted_backend");
             self.transport_latency
                 .observe_failure("untrusted transport backend is diagnostic-only");
             self.log("DEBUG", "discarded untrusted legacy transport measurement");
@@ -2788,7 +2960,7 @@ impl Controller {
             return;
         }
         let Some(latency_ms) = result.latency_ms else {
-            self.transport_rejected_reason = Some("empty_result".to_string());
+            self.record_transport_rejection("empty_result");
             self.transport_latency
                 .observe_failure("transport probe returned no result");
             let _ = self.refresh_status_from_last_sample();
@@ -2799,7 +2971,7 @@ impl Controller {
             .map(|cpu| cpu > self.cfg.transport_cpu_max_percent)
             .unwrap_or(false)
         {
-            self.transport_rejected_reason = Some("cpu_pressure".to_string());
+            self.record_transport_rejection("cpu_pressure");
             self.log(
                 "DEBUG",
                 "discarded transport probe while router CPU was above the configured limit",
@@ -2807,18 +2979,23 @@ impl Controller {
             let _ = self.refresh_status_from_last_sample();
             return;
         }
-        let current_phase = self.last_status.as_ref().map(|status| {
+        let current_control_phase = self.last_status.as_ref().map(|status| {
             (
                 status.dl_load_pct >= self.cfg.high_load_thr * 100.0,
                 status.ul_load_pct >= self.cfg.high_load_thr * 100.0,
             )
         });
-        if current_phase != Some((result.dl_loaded, result.ul_loaded)) {
-            self.transport_rejected_reason = Some("load_phase_changed".to_string());
+        let controller_phase_valid = result.control_valid
+            && current_control_phase == Some((result.dl_loaded, result.ul_loaded));
+        let rating_phase_valid = self.rating_load_snapshot.phase == result.rating_phase;
+        if !rating_phase_valid {
+            self.record_transport_rejection("rating_phase_changed");
             self.log(
                 "DEBUG",
-                "discarded transport probe because the load phase changed during measurement",
+                "rating ignored a transport probe because its latched load phase changed",
             );
+        }
+        if !controller_phase_valid && !rating_phase_valid {
             let _ = self.refresh_status_from_last_sample();
             return;
         }
@@ -2832,30 +3009,47 @@ impl Controller {
         let mut confirmed_delta = None;
         let mut confirmed_dl_delta = None;
         let mut confirmed_ul_delta = None;
+        let rating_flags = result.rating_phase.direction_flags();
+        let controller_measurement_valid = if self.cfg.transport_controller_enabled {
+            controller_phase_valid
+        } else {
+            rating_phase_valid
+        };
+        let tracker_flags = if self.cfg.transport_controller_enabled {
+            (result.dl_loaded, result.ul_loaded)
+        } else {
+            rating_flags
+        };
+        let tracker_loaded = tracker_flags.0 || tracker_flags.1;
         for sample_ms in samples {
-            self.quality_grade.observe(
-                &result.endpoint,
-                sample_ms,
-                result.dl_loaded,
-                result.ul_loaded,
-                epoch_secs(),
-                &grade_route,
-            );
+            if rating_phase_valid {
+                self.quality_grade.observe(
+                    &result.endpoint,
+                    sample_ms,
+                    rating_flags.0,
+                    rating_flags.1,
+                    epoch_secs(),
+                    &grade_route,
+                );
+            }
+            if !controller_measurement_valid {
+                continue;
+            }
             if let Some(delta_ms) = self.transport_latency.observe_success(
                 &result.endpoint,
                 sample_ms,
-                result.loaded,
+                tracker_loaded,
                 now,
             ) {
                 confirmed_delta = Some(delta_ms);
             }
-            if !result.loaded {
+            if !tracker_loaded {
                 self.transport_latency_dl
                     .observe_success(&result.endpoint, sample_ms, false, now);
                 self.transport_latency_ul
                     .observe_success(&result.endpoint, sample_ms, false, now);
             } else {
-                if result.dl_loaded {
+                if tracker_flags.0 {
                     if let Some(delta_ms) = self.transport_latency_dl.observe_success(
                         &result.endpoint,
                         sample_ms,
@@ -2865,7 +3059,7 @@ impl Controller {
                         confirmed_dl_delta = Some(delta_ms);
                     }
                 }
-                if result.ul_loaded {
+                if tracker_flags.1 {
                     if let Some(delta_ms) = self.transport_latency_ul.observe_success(
                         &result.endpoint,
                         sample_ms,
@@ -3099,6 +3293,10 @@ impl Controller {
         self.quality_dl_class = QualityClass::Learning;
         self.quality_ul_class = QualityClass::Learning;
         let now = Instant::now();
+        self.rating_load = RatingLoadDetector::new(now);
+        self.rating_load_snapshot = self
+            .rating_load
+            .snapshot(now, self.cfg.rating_load_config());
         let dl_update = self.adaptive_dl.reset_to_configured(now);
         let ul_update = self.adaptive_ul.reset_to_configured(now);
         self.log_adaptive_update("DL", dl_update);
@@ -3551,8 +3749,11 @@ impl Controller {
                 transport.delta_ms,
             )
         });
-        let grade_snapshot = self.quality_grade.snapshot();
-        let grade_result = grade_snapshot.current.as_ref();
+        let grade_snapshot = self.quality_grade.snapshot(epoch_secs());
+        let grade_result = grade_snapshot
+            .current
+            .as_ref()
+            .filter(|result| !result.incomplete);
         let line = graph_history_line(
             now,
             rtt_ms,
@@ -3568,6 +3769,9 @@ impl Controller {
             grade_result.map(|result| result.class.as_str()),
             grade_snapshot.state,
             grade_result.map(|result| result.increase_ms),
+            self.rating_load_snapshot.phase.as_str(),
+            grade_snapshot.dl_samples,
+            grade_snapshot.ul_samples,
         );
         let path = self.cfg.graph_history_path();
         let instance_cap = self.history_budget.instance_budget_kib.saturating_mul(1024);
@@ -3953,7 +4157,7 @@ impl Controller {
         } else {
             transport.status
         };
-        let quality_grade = self.quality_grade.snapshot();
+        let quality_grade = self.quality_grade.snapshot(epoch_secs());
         let mut file = File::create(&tmp)?;
         writeln!(
             file,
@@ -4010,7 +4214,7 @@ impl Controller {
         file.seek(SeekFrom::End(-2))?;
         writeln!(
             file,
-            ",\"transport_latency_enabled\":{},\"transport_controller_enabled\":{},\"transport_probe_method\":\"network_rtt_v2\",\"transport_probe_backend\":\"{}\",\"transport_probe_trusted\":{},\"transport_probe_raw_samples\":{},\"transport_probe_discarded_samples\":{},\"transport_probe_server_processing_ms\":{:.3},\"transport_probe_connection_reused\":{},\"transport_probe_rejected_reason\":{},\"transport_status\":\"{}\",\"transport_endpoint\":{},\"transport_latency_ms\":{},\"transport_baseline_ms\":{},\"transport_delta_ms\":{},\"transport_sample_age_s\":{},\"transport_confidence\":{},\"transport_successful_samples\":{},\"transport_failed_samples\":{},\"transport_last_error\":{},\"effective_latency_delta_ms\":{:.3},\"quality_estimated\":true,\"quality_class\":\"{}\",\"quality_dl_class\":\"{}\",\"quality_ul_class\":\"{}\",\"quality_confidence\":{},\"quality_reason\":\"{}\",\"throughput_guard_enabled\":{},\"throughput_floor_dl_kbps\":{:.0},\"throughput_floor_ul_kbps\":{:.0},\"quality_limited\":{},\"quality_limited_dl\":{},\"quality_limited_ul\":{}}}",
+            ",\"transport_latency_enabled\":{},\"transport_controller_enabled\":{},\"transport_probe_method\":\"network_rtt_v3\",\"transport_probe_backend\":\"{}\",\"transport_probe_trusted\":{},\"transport_probe_raw_samples\":{},\"transport_probe_discarded_samples\":{},\"transport_probe_server_processing_ms\":{:.3},\"transport_probe_connection_reused\":{},\"transport_probe_rejected_reason\":{},\"transport_probe_last_rejected_reason\":{},\"transport_probe_last_rejected_at\":{},\"transport_status\":\"{}\",\"transport_endpoint\":{},\"transport_latency_ms\":{},\"transport_baseline_ms\":{},\"transport_delta_ms\":{},\"transport_sample_age_s\":{},\"transport_confidence\":{},\"transport_successful_samples\":{},\"transport_failed_samples\":{},\"transport_last_error\":{},\"effective_latency_delta_ms\":{:.3},\"quality_estimated\":true,\"quality_class\":\"{}\",\"quality_dl_class\":\"{}\",\"quality_ul_class\":\"{}\",\"quality_confidence\":{},\"quality_reason\":\"{}\",\"throughput_guard_enabled\":{},\"throughput_floor_dl_kbps\":{:.0},\"throughput_floor_ul_kbps\":{:.0},\"quality_limited\":{},\"quality_limited_dl\":{},\"quality_limited_ul\":{}}}",
             self.cfg.transport_latency_enabled,
             self.cfg.transport_controller_enabled,
             json_escape(&self.transport_backend),
@@ -4020,6 +4224,8 @@ impl Controller {
             self.transport_server_processing_ms,
             self.transport_connection_reused,
             json_string_or_null(self.transport_rejected_reason.as_deref()),
+            json_string_or_null(self.transport_last_rejected_reason.as_deref()),
+            json_f64_or_null(self.transport_last_rejected_at, 3),
             json_escape(transport.status),
             json_string_or_null(transport.endpoint.as_deref()),
             json_f64_or_null(transport.latency_ms, 3),
@@ -4046,11 +4252,17 @@ impl Controller {
         file.seek(SeekFrom::End(-2))?;
         write!(
             file,
-            ",\"quality_grade_method\":\"transport_rtt_p90_loaded_minus_p5_idle_v2\",\"quality_grade_state\":\"{}\",\"quality_grade_collected_samples\":{},\"quality_grade_required_samples\":{},\"quality_grade_baseline_ready\":{},\"quality_grade_current\":{},\"quality_grade_previous\":{},\"graph_history_enabled\":{},\"graph_history_budget_mode\":\"{}\",\"graph_history_configured_budget_kib\":{},\"graph_history_safe_max_kib\":{},\"graph_history_effective_total_kib\":{},\"graph_history_instance_budget_kib\":{},\"graph_history_used_total_kib\":{},\"graph_history_used_instance_kib\":{},\"graph_history_stored_samples\":{},\"graph_history_instances\":{},\"graph_history_mem_total_kib\":{},\"graph_history_mem_available_kib\":{},\"graph_history_paused_low_memory\":{}",
+            ",\"quality_grade_method\":\"transport_rtt_p90_loaded_minus_p5_idle_v3\",\"quality_grade_state\":\"{}\",\"quality_grade_collected_samples\":{},\"quality_grade_required_samples\":{},\"quality_grade_baseline_ready\":{},\"quality_grade_baseline_samples\":{},\"quality_grade_baseline_required_samples\":{},\"quality_grade_dl_samples\":{},\"quality_grade_ul_samples\":{},\"quality_grade_bidirectional_samples\":{},\"quality_grade_finalize_remaining_s\":{},\"quality_grade_current\":{},\"quality_grade_previous\":{},\"rating_load_phase\":\"{}\",\"rating_load_candidate\":\"{}\",\"rating_load_raw_dl_percent\":{:.3},\"rating_load_raw_ul_percent\":{:.3},\"rating_load_smoothed_dl_percent\":{:.3},\"rating_load_smoothed_ul_percent\":{:.3},\"rating_load_enter_percent\":{:.3},\"rating_load_exit_percent\":{:.3},\"rating_load_phase_age_s\":{:.3},\"rating_capture_active\":{},\"rating_capture_mode\":\"{}\",\"rating_capture_peak_dl_percent\":{:.3},\"rating_capture_peak_ul_percent\":{:.3},\"graph_history_enabled\":{},\"graph_history_budget_mode\":\"{}\",\"graph_history_configured_budget_kib\":{},\"graph_history_safe_max_kib\":{},\"graph_history_effective_total_kib\":{},\"graph_history_instance_budget_kib\":{},\"graph_history_used_total_kib\":{},\"graph_history_used_instance_kib\":{},\"graph_history_stored_samples\":{},\"graph_history_instances\":{},\"graph_history_mem_total_kib\":{},\"graph_history_mem_available_kib\":{},\"graph_history_paused_low_memory\":{}",
             json_escape(quality_grade.state),
             quality_grade.collected_samples,
             quality_grade.required_samples,
             quality_grade.baseline_ready,
+            quality_grade.baseline_samples,
+            quality_grade.baseline_required_samples,
+            quality_grade.dl_samples,
+            quality_grade.ul_samples,
+            quality_grade.bidirectional_samples,
+            json_f64_or_null(quality_grade.finalize_remaining_s, 1),
             quality_grade_result_json(
                 quality_grade.current.as_ref(),
                 quality_grade.current_stale,
@@ -4059,6 +4271,19 @@ impl Controller {
                 quality_grade.previous.as_ref(),
                 quality_grade.previous_stale,
             ),
+            self.rating_load_snapshot.phase.as_str(),
+            self.rating_load_snapshot.candidate.as_str(),
+            self.rating_load_snapshot.raw_dl_percent,
+            self.rating_load_snapshot.raw_ul_percent,
+            self.rating_load_snapshot.smoothed_dl_percent,
+            self.rating_load_snapshot.smoothed_ul_percent,
+            self.rating_load_snapshot.enter_percent,
+            self.rating_load_snapshot.exit_percent,
+            self.rating_load_snapshot.phase_age_s,
+            self.rating_load_snapshot.capture_active,
+            self.rating_load_snapshot.capture_mode,
+            self.rating_load_snapshot.capture_peak_dl_percent,
+            self.rating_load_snapshot.capture_peak_ul_percent,
             self.cfg.graph_history_enabled,
             if self.history_budget.configured_kib.is_some() {
                 "manual"
@@ -4514,11 +4739,12 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
             controller.note_probe_gap();
         }
         let (dl_rate, ul_rate) = controller.sample_rates();
+        let rating_load = controller.update_rating_load(now, dl_rate, ul_rate);
         if route_probes_allowed {
             if let Some(runtime) = transport_probe.as_mut() {
                 runtime.drain(&mut controller);
                 let (dl_shaper, ul_shaper) = controller.shaper_rates();
-                runtime.maybe_start(&cfg, dl_rate, ul_rate, dl_shaper, ul_shaper);
+                runtime.maybe_start(&cfg, dl_rate, ul_rate, dl_shaper, ul_shaper, &rating_load);
             }
         }
         if controller.maybe_sample_cpu() {
@@ -5664,7 +5890,7 @@ fn quality_grade_result_json(result: Option<&QualityGradeResult>, stale: bool) -
         return "null".to_string();
     };
     format!(
-        "{{\"grade\":\"{}\",\"increase_ms\":{:.3},\"baseline_p5_ms\":{:.3},\"endpoint\":\"{}\",\"started_at\":{:.3},\"completed_at\":{},\"route_identity\":\"{}\",\"partial\":{},\"stale\":{},\"samples\":{},\"dl\":{},\"ul\":{},\"bidirectional\":{}}}",
+        "{{\"grade\":\"{}\",\"increase_ms\":{:.3},\"baseline_p5_ms\":{:.3},\"endpoint\":\"{}\",\"started_at\":{:.3},\"completed_at\":{},\"route_identity\":\"{}\",\"partial\":{},\"incomplete\":{},\"completion_reason\":\"{}\",\"stale\":{},\"samples\":{},\"dl_samples\":{},\"ul_samples\":{},\"bidirectional_samples\":{},\"dl\":{},\"ul\":{},\"bidirectional\":{}}}",
         result.class.as_str(),
         result.increase_ms,
         result.baseline_p5_ms,
@@ -5673,8 +5899,13 @@ fn quality_grade_result_json(result: Option<&QualityGradeResult>, stale: bool) -
         json_f64_or_null(result.completed_at, 3),
         json_escape(&result.route_identity),
         result.partial,
+        result.incomplete,
+        json_escape(&result.completion_reason),
         stale,
         result.samples(),
+        result.dl_samples,
+        result.ul_samples,
+        result.bidirectional_samples,
         quality_grade_metric_json(result.dl.as_ref()),
         quality_grade_metric_json(result.ul.as_ref()),
         quality_grade_metric_json(result.bidirectional.as_ref()),
@@ -5704,9 +5935,12 @@ fn graph_history_line(
     grade: Option<&str>,
     grade_state: &str,
     grade_increase_ms: Option<f64>,
+    rating_phase: &str,
+    rating_dl_samples: usize,
+    rating_ul_samples: usize,
 ) -> String {
     format!(
-        "{:.0},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+        "{:.0},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
         timestamp,
         json_f64_or_empty(rtt_ms, 3),
         json_f64_or_empty(cpu_percent, 1),
@@ -5721,6 +5955,9 @@ fn graph_history_line(
         grade.unwrap_or("").replace(',', ""),
         grade_state.replace(',', ""),
         json_f64_or_empty(grade_increase_ms, 3),
+        rating_phase.replace(',', ""),
+        rating_dl_samples,
+        rating_ul_samples,
     )
 }
 
@@ -6529,8 +6766,11 @@ mod tests {
                 Some("A+"),
                 "final",
                 Some(1.25),
+                "DL",
+                20,
+                7,
             ),
-            "123,1.235,2.3,1000.0,50.5,10.123,11.988,600.0,30.0,ACTIVE,mwan3|wan|pppoe-wan|84.1.1.1|0x100|1,A+,final,1.250\n"
+            "123,1.235,2.3,1000.0,50.5,10.123,11.988,600.0,30.0,ACTIVE,mwan3|wan|pppoe-wan|84.1.1.1|0x100|1,A+,final,1.250,DL,20,7\n"
         );
 
         let data = "1,1,1\n2,2,2\n3,3,3\n";

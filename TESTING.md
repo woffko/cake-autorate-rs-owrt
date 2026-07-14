@@ -36,6 +36,16 @@ proportional RAM tiers, critical-memory suspension, shared per-instance budget,
 streaming compaction, bounded history paging, vertical WAN cards, grade-event
 hover details, and fixed non-scrolling axis labels.
 
+RC9 additionally requires replay coverage for passive routed-traffic phase
+detection: the two-second rolling mean, 60/40 hysteresis, one-second direction
+hold, 1.5-second dropout, DL/UL dominance, bidirectional exclusion, and route
+reset. Helper tests cover automatic completion, guided cancellation, readiness
+failure, interface locking, and cleanup. Installed-browser acceptance must
+exercise the `Get rating` modal and progress, complete a real shaped automatic
+rating without changing CAKE, and verify safety-floor scaling, scrollbar-gutter
+follow mode, hover rating phases/counts, vertical multi-WAN cards, and 390 px
+mobile layout.
+
 RC6 added a second disposable-router gate: two nftables mwan3 members, distinct
 CAKE/IFB pairs, per-member ICMP and HTTP/TCP probes, router-side speed tests,
 Full Auto-Tune isolation, failover/failback, and route relearning. Production
@@ -421,7 +431,86 @@ controller state, raw/discarded samples, and rejection reason. Graph cards were
 vertical per WAN, both canvases shared one timeline, and fixed Y labels did not
 move with horizontal scrolling. No LuCI application page exception remained.
 
-The final local gate passed 82 Rust tests, strict Clippy and formatting, five
+The final local gate passed 82 Rust tests, strict Clippy and formatting, six
 shell lifecycle/routing suites, four LuCI JavaScript suites, package builds for
 x86_64 and aarch64_generic, shell/JSON/diff validation, and the three live
 router checks above.
+
+## RC9 passive rating and graph acceptance gate (2026-07-14)
+
+RC9 was built for x86_64 and rockchip/armv8, installed first on the disposable
+x86 router, and then on the same production Multi-WAN and ARM variable-WWAN
+routers. The project APKs used for the live gate were:
+
+| Artifact | SHA-256 |
+|---|---|
+| x86_64 daemon APK | `388f6a0b35c8e01d11aee936e245e8491a1aef5b004dc6e6fb904a03dcdf4011` |
+| aarch64_generic daemon APK | `98ec7832bf43458377710152e1092db7a43060d4d7ed827736dd626e45a2bd2f` |
+| noarch LuCI APK | `ee38e03158d4cef9f1aa20f17144b6953abaaf38a36d49b825150cb7baab2ba7` |
+
+The disposable router retained its exact cake-autorate and SQM hashes and its
+85/10 Mbit/s CAKE pair across installation. A temporary measurement-only
+WebSocket setting reached a trusted 20/20 idle baseline. Playwright opened the
+new per-instance action, selected guided capture, observed live baseline,
+DL/UL, phase, and load progress, cancelled it, and confirmed that the runtime
+marker disappeared. CAKE and the SQM hash were unchanged.
+
+Playwright then ran the complete automatic path with SQM and autorate left
+enabled. The helper collected 61 download and 53 upload raw RTT samples and
+finalized `A+`: idle p5 was 1.715 ms, loaded p90 was 3.377/3.348 ms, and both
+directional increases entered the 2 ms noise clamp. The result was stored as
+`CURRENT/final`; the helper reported completion without applying any rate. CAKE
+remained exactly 85/10 Mbit/s. The temporary UCI file was then restored to its
+original hash.
+
+The browser gate caught two genuine integration defects before release. LuCI
+had serialized Boolean false as `disabled="false"`, which still disables an
+HTML button; both `Get rating` and `Start rating` now omit the attribute when
+enabled. A stable scrollbar gutter also made the old latest-edge calculation
+15 px too large, causing `Latest` to leave follow mode immediately. The graph
+now computes the actual maximum from the gutter-aware viewport width, with a
+JavaScript regression test.
+
+More than 300 real one-second RAM rows were rendered. The desktop timeline grew
+to 1450 px inside a 1135 px viewport; both canvases had identical widths. Fixed
+Y overlays did not move while the timeline scrolled, hover reported exact
+rating phase and DL/UL counts, manual scroll-back survived polling, and
+`Latest` returned to the actual right edge. Safety floors were off initially;
+enabling them changed a quiet 10 Mbit/s scale to 50 Mbit/s as expected. The
+same checks passed at 390 px without horizontal page overflow.
+
+On the production Multi-WAN router, package installation preserved the
+cake-autorate, SQM, and mwan3 hashes. The primary 900/860 Mbit/s CAKE pair and
+backup 108/14.5 Mbit/s pair were unchanged; lifecycle remained
+`ACTIVE`/`STANDBY`, route identities and external-address evidence were
+unchanged, and mwan3 was never restarted. Read-only Playwright confirmed two
+separate vertically stacked cards, correct independent state/floors, two
+synchronized canvases each, and no page or console exception.
+
+The ARM router likewise retained its cake-autorate/SQM hashes, its existing
+WWAN CAKE rates, route identity, and `ACTIVE/RUNNING` lifecycle. Its installed
+daemon reported `1.0.0-rc.9`, and the HTTP LuCI Status/Get rating/Graphs/mobile
+gate completed without an application error.
+
+The local gate passed 88 Rust tests, strict Clippy and formatting, six shell
+lifecycle/routing/helper suites, four LuCI JavaScript suites, shell and
+JavaScript syntax, ACL JSON parsing, `git diff --check`, both SDK builds, and
+the three installed-router checks above.
+
+Each RC9 offline repository indexes 65 APKs. Both project packages and all
+required dependencies were then installed with networking disabled into empty
+x86_64 and aarch64_generic roots; APK selected 62 required packages on each
+architecture and completed without a feed lookup. The release installers pass
+`sh -n`, the two archives each contain the installer, `packages.adb`, and all
+65 APKs, and the final release payload hashes are:
+
+| Artifact | SHA-256 |
+|---|---|
+| x86_64 installer | `626722ec88db229d1388470d14f52d57a2e9f06737181ea39ad5a54d400b8c7c` |
+| aarch64_generic installer | `5f46092a298742fe17bb0cb7f140da4e73b78448880f89cd3d4de16c92231747` |
+| x86_64 offline bundle | `8615f596d659dfd09642d16ed2da95da35b0a104f71055a43477b46c682ef946` |
+| rockchip/armv8 offline bundle | `4d627db78be016b5541a9343c6922dffb72f9c6f12c355e2208ecfd800fb85a0` |
+
+The release `SHA256SUMS` covers these four files plus both daemon APKs and the
+shared noarch LuCI APK. Published-asset verification is performed again from a
+fresh directory after GitHub upload.

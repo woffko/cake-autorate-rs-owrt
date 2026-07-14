@@ -12,6 +12,7 @@ var GRAPH_POINT_SPACING_PX = 2;
 var GRAPH_MAX_WIDTH_PX = 20000;
 var graphScrollStates = {};
 var graphPageOffsets = {};
+var graphFloorStates = {};
 var graphRefreshNow = null;
 
 function statusPath(section) {
@@ -31,7 +32,8 @@ function parseHistory(data) {
 
 	String(data || '').split(/\n/).forEach(function(line) {
 		var fields, timestamp, rtt, cpu, dl, ul, transport, effective, dlFloor, ulFloor,
-			uplinkState, routeIdentity, grade, gradeState, gradeIncrease;
+			uplinkState, routeIdentity, grade, gradeState, gradeIncrease, ratingPhase,
+			ratingDlSamples, ratingUlSamples;
 
 		if (!line)
 			return;
@@ -54,6 +56,9 @@ function parseHistory(data) {
 		grade = fields.length < 12 ? '' : fields[11];
 		gradeState = fields.length < 13 ? '' : fields[12];
 		gradeIncrease = fields.length < 14 || fields[13] === '' ? null : Number(fields[13]);
+		ratingPhase = fields.length < 15 ? '' : fields[14];
+		ratingDlSamples = fields.length < 16 || fields[15] === '' ? null : Number(fields[15]);
+		ratingUlSamples = fields.length < 17 || fields[16] === '' ? null : Number(fields[16]);
 		if (!isFinite(timestamp) || timestamp <= 0)
 			return;
 
@@ -71,7 +76,10 @@ function parseHistory(data) {
 			routeIdentity: routeIdentity,
 			grade: grade,
 			gradeState: gradeState,
-			gradeIncrease: gradeIncrease == null || !isFinite(gradeIncrease) ? null : gradeIncrease
+			gradeIncrease: gradeIncrease == null || !isFinite(gradeIncrease) ? null : gradeIncrease,
+			ratingPhase: ratingPhase,
+			ratingDlSamples: ratingDlSamples == null || !isFinite(ratingDlSamples) ? null : ratingDlSamples,
+			ratingUlSamples: ratingUlSamples == null || !isFinite(ratingUlSamples) ? null : ratingUlSamples
 		});
 	});
 
@@ -284,26 +292,46 @@ function renderMemoryBudget(instances, globalSection) {
 	]);
 }
 
-function drawLine(ctx, points, valueKey, xFor, yFor, color) {
+function lineConnected(previous, current, interval) {
+	if (!previous)
+		return false;
+	if (current.timestamp - previous.timestamp > Math.max(5, interval * 3.5))
+		return false;
+	if (previous.routeIdentity && current.routeIdentity &&
+		previous.routeIdentity !== current.routeIdentity)
+		return false;
+	if (previous.uplinkState && current.uplinkState &&
+		previous.uplinkState !== current.uplinkState)
+		return false;
+	return true;
+}
+
+function drawLine(ctx, geometry, valueKey, yFor, color, dashed) {
 	var drawing = false;
+	var previous = null;
 
 	ctx.beginPath();
 	ctx.strokeStyle = color;
 	ctx.lineWidth = 1.5;
-	for (var i = 0; i < points.length; i++) {
-		var value = points[i][valueKey];
+	ctx.setLineDash(dashed ? [ 6, 4 ] : []);
+	for (var i = 0; i < geometry.points.length; i++) {
+		var point = geometry.points[i];
+		var value = point[valueKey];
 		if (value == null || !isFinite(value)) {
 			drawing = false;
+			previous = point;
 			continue;
 		}
 
-		if (drawing)
-			ctx.lineTo(xFor(points[i].timestamp), yFor(value));
+		if (drawing && lineConnected(previous, point, geometry.interval))
+			ctx.lineTo(chartX(geometry, point.timestamp), yFor(value));
 		else
-			ctx.moveTo(xFor(points[i].timestamp), yFor(value));
+			ctx.moveTo(chartX(geometry, point.timestamp), yFor(value));
 		drawing = true;
+		previous = point;
 	}
 	ctx.stroke();
+	ctx.setLineDash([]);
 }
 
 function buildChartGeometry(rawPoints, interval, viewport) {
@@ -340,7 +368,8 @@ function buildChartGeometry(rawPoints, interval, viewport) {
 		plotHeight: plotHeight,
 		firstTimestamp: firstTimestamp,
 		lastTimestamp: lastTimestamp,
-		includeDate: includeDate
+		includeDate: includeDate,
+		interval: interval
 	};
 }
 
@@ -472,6 +501,38 @@ function drawGradeEvents(ctx, geometry, labels) {
 	});
 }
 
+function drawRatingPhaseEvents(ctx, geometry) {
+	var previousPhase = '';
+
+	geometry.points.forEach(function(point) {
+		var phase = point.ratingPhase || '';
+		if (!phase || phase === previousPhase) {
+			previousPhase = phase || previousPhase;
+			return;
+		}
+		previousPhase = phase;
+		if (phase === 'IDLE')
+			return;
+
+		var x = chartX(geometry, point.timestamp);
+		ctx.save();
+		ctx.strokeStyle = phase === 'DL' ? '#2980b9' :
+			(phase === 'UL' ? '#e67e22' : '#8e44ad');
+		ctx.setLineDash([ 3, 4 ]);
+		ctx.beginPath();
+		ctx.moveTo(x, geometry.top);
+		ctx.lineTo(x, geometry.top + geometry.plotHeight);
+		ctx.stroke();
+		ctx.setLineDash([]);
+		ctx.fillStyle = ctx.strokeStyle;
+		ctx.fillText('%s %s/%s'.format(phase,
+			point.ratingDlSamples == null ? 0 : point.ratingDlSamples,
+			point.ratingUlSamples == null ? 0 : point.ratingUlSamples),
+			x + 3, geometry.top + 12);
+		ctx.restore();
+	});
+}
+
 function drawLatencyChart(canvas, geometry) {
 	var ctx = prepareCanvas(canvas, geometry);
 	var rttMax = 10;
@@ -503,18 +564,10 @@ function drawLatencyChart(canvas, geometry) {
 		return rttMax;
 	}
 
-	drawLine(ctx, geometry.points, 'rtt', function(timestamp) {
-		return chartX(geometry, timestamp);
-	}, rttY, '#22a06b');
-	drawLine(ctx, geometry.points, 'transport', function(timestamp) {
-		return chartX(geometry, timestamp);
-	}, rttY, '#d35400');
-	drawLine(ctx, geometry.points, 'effective', function(timestamp) {
-		return chartX(geometry, timestamp);
-	}, rttY, '#c0398f');
-	drawLine(ctx, geometry.points, 'cpu', function(timestamp) {
-		return chartX(geometry, timestamp);
-	}, cpuY, '#6c5ce7');
+	drawLine(ctx, geometry, 'rtt', rttY, '#22a06b');
+	drawLine(ctx, geometry, 'transport', rttY, '#d35400');
+	drawLine(ctx, geometry, 'effective', rttY, '#c0398f');
+	drawLine(ctx, geometry, 'cpu', cpuY, '#6c5ce7');
 	drawRouteEvents(ctx, geometry);
 	drawGradeEvents(ctx, geometry, true);
 	return rttMax;
@@ -537,7 +590,7 @@ function formatTrafficRate(value) {
 	return value >= 1000 ? (value / 1000).toFixed(2) + ' Mbps' : value.toFixed(0) + ' kbps';
 }
 
-function drawTrafficChart(canvas, geometry) {
+function drawTrafficChart(canvas, geometry, showFloors) {
 	var ctx = prepareCanvas(canvas, geometry);
 	var rateMax = 100;
 
@@ -546,9 +599,9 @@ function drawTrafficChart(canvas, geometry) {
 			rateMax = Math.max(rateMax, point.dl);
 		if (point.ul != null && isFinite(point.ul))
 			rateMax = Math.max(rateMax, point.ul);
-		if (point.dlFloor != null && isFinite(point.dlFloor))
+		if (showFloors && point.dlFloor != null && isFinite(point.dlFloor))
 			rateMax = Math.max(rateMax, point.dlFloor);
-		if (point.ulFloor != null && isFinite(point.ulFloor))
+		if (showFloors && point.ulFloor != null && isFinite(point.ulFloor))
 			rateMax = Math.max(rateMax, point.ulFloor);
 	});
 	rateMax = niceRateCeiling(rateMax);
@@ -565,20 +618,15 @@ function drawTrafficChart(canvas, geometry) {
 		return rateMax;
 	}
 
-	drawLine(ctx, geometry.points, 'dl', function(timestamp) {
-		return chartX(geometry, timestamp);
-	}, rateY, '#2980b9');
-	drawLine(ctx, geometry.points, 'ul', function(timestamp) {
-		return chartX(geometry, timestamp);
-	}, rateY, '#e67e22');
-	drawLine(ctx, geometry.points, 'dlFloor', function(timestamp) {
-		return chartX(geometry, timestamp);
-	}, rateY, '#74a9cf');
-	drawLine(ctx, geometry.points, 'ulFloor', function(timestamp) {
-		return chartX(geometry, timestamp);
-	}, rateY, '#f6b26b');
+	drawLine(ctx, geometry, 'dl', rateY, '#2980b9');
+	drawLine(ctx, geometry, 'ul', rateY, '#e67e22');
+	if (showFloors) {
+		drawLine(ctx, geometry, 'dlFloor', rateY, '#74a9cf', true);
+		drawLine(ctx, geometry, 'ulFloor', rateY, '#f6b26b', true);
+	}
 	drawRouteEvents(ctx, geometry);
 	drawGradeEvents(ctx, geometry, false);
+	drawRatingPhaseEvents(ctx, geometry);
 	return rateMax;
 }
 
@@ -631,9 +679,12 @@ function bindHover(canvas, geometry, hoverInfo) {
 			(geometry.lastTimestamp - geometry.firstTimestamp) * ratio;
 		var point = nearestPoint(geometry.points, timestamp);
 
-		hoverInfo.textContent = '%s · %s · grade %s (%s) · RTT %s · transport Δ %s · effective Δ %s · CPU %s · DL %s · UL %s · floors %s/%s'.format(
+		hoverInfo.textContent = '%s · %s · rating phase %s (DL %s / UL %s) · grade %s (%s) · RTT %s · transport Δ %s · effective Δ %s · CPU %s · DL %s · UL %s · floors %s/%s'.format(
 			new Date(point.timestamp * 1000).toLocaleString(),
 			point.uplinkState || '-',
+			point.ratingPhase || 'IDLE',
+			point.ratingDlSamples == null ? '-' : point.ratingDlSamples,
+			point.ratingUlSamples == null ? '-' : point.ratingUlSamples,
 			point.grade || '-',
 			formatMetric(point.gradeIncrease, ' ms', 1),
 			formatMetric(point.rtt, ' ms', 3),
@@ -659,6 +710,14 @@ function scrollState(section) {
 	return graphScrollStates[section];
 }
 
+function scrollMaximum(viewport) {
+	/* offsetWidth includes the stable scrollbar gutter which limits the actual
+	 * scrollLeft range in Chromium. clientWidth alone leaves follow mode about
+	 * one gutter width short of the newest sample. */
+	return Math.max(0, viewport.scrollWidth -
+		Math.max(viewport.clientWidth || 0, viewport.offsetWidth || 0));
+}
+
 function bindScroll(viewport, latestButton, section) {
 	var state = scrollState(section);
 
@@ -667,7 +726,7 @@ function bindScroll(viewport, latestButton, section) {
 	}
 
 	viewport.addEventListener('scroll', function() {
-		var maxScroll = Math.max(0, viewport.scrollWidth - viewport.clientWidth);
+		var maxScroll = scrollMaximum(viewport);
 		state.left = viewport.scrollLeft;
 		state.followLatest = maxScroll - viewport.scrollLeft <= 8;
 		updateButton();
@@ -675,13 +734,13 @@ function bindScroll(viewport, latestButton, section) {
 
 	latestButton.addEventListener('click', function() {
 		state.followLatest = true;
-		viewport.scrollLeft = Math.max(0, viewport.scrollWidth - viewport.clientWidth);
+		viewport.scrollLeft = scrollMaximum(viewport);
 		state.left = viewport.scrollLeft;
 		updateButton();
 	});
 
 	window.requestAnimationFrame(function() {
-		var maxScroll = Math.max(0, viewport.scrollWidth - viewport.clientWidth);
+		var maxScroll = scrollMaximum(viewport);
 		viewport.scrollLeft = state.followLatest ? maxScroll : Math.min(state.left, maxScroll);
 		state.left = viewport.scrollLeft;
 		updateButton();
@@ -731,6 +790,7 @@ function renderCard(instance) {
 	});
 
 	if (enabled) {
+		var showFloors = !!graphFloorStates[sectionName];
 		var latencyCanvas = E('canvas', {
 			'class': 'cake-graph-canvas',
 			'role': 'img',
@@ -743,15 +803,22 @@ function renderCard(instance) {
 		});
 		var latencyAxis = fixedAxis({ leftBottom: '0', rightTop: 'CPU 100%', rightBottom: '0%' });
 		var trafficAxis = fixedAxis({ leftBottom: '0' });
+		latencyAxis.root.className += ' cake-graph-latency-axis';
+		trafficAxis.root.className += ' cake-graph-traffic-axis';
 		var track = E('div', { 'class': 'cake-graph-track' }, [
 			E('div', { 'class': 'cake-graph-chart-title' }, _('Latency and CPU')),
-			latencyAxis.root,
 			latencyCanvas,
 			E('div', { 'class': 'cake-graph-chart-title' }, _('Download and upload traffic')),
-			trafficAxis.root,
 			trafficCanvas
 		]);
 		var viewport = E('div', { 'class': 'cake-graph-scroll' }, track);
+		var chartFrame = E('div', { 'class': 'cake-graph-frame' }, [
+			viewport,
+			latencyAxis.root,
+			trafficAxis.root
+		]);
+		var floorToggle = E('input', { 'type': 'checkbox' });
+		floorToggle.checked = showFloors;
 		var hoverInfo = E('div', {
 			'class': 'cake-graph-hover',
 			'style': 'visibility:hidden'
@@ -792,6 +859,10 @@ function renderCard(instance) {
 					_('DL: %s').format(formatTrafficRate(status.dl_achieved_rate_kbps))),
 				E('span', { 'class': 'cake-graph-ul' },
 					_('UL: %s').format(formatTrafficRate(status.ul_achieved_rate_kbps))),
+				E('label', { 'class': 'cake-graph-floors' }, [
+					floorToggle,
+					E('span', {}, _('Show safety floors'))
+				]),
 				E('span', { 'class': 'cake-graph-samples' },
 					_('Showing: %d / %d · offset %d').format(
 						(instance.history || []).length, totalSamples, pageOffset)),
@@ -805,15 +876,22 @@ function renderCard(instance) {
 				latestButton
 			]),
 			hoverInfo,
-			viewport
+			chartFrame
 		]);
 		window.requestAnimationFrame(function() {
 			var geometry = buildChartGeometry(instance.history || [], interval, viewport);
 			track.style.width = geometry.width + 'px';
-			latencyAxis.root.style.width = Math.max(320, viewport.clientWidth || 720) + 'px';
-			trafficAxis.root.style.width = Math.max(320, viewport.clientWidth || 720) + 'px';
 			latencyAxis.leftTop.textContent = _('RTT %d ms').format(drawLatencyChart(latencyCanvas, geometry));
-			trafficAxis.leftTop.textContent = _('Traffic %s').format(formatTrafficRate(drawTrafficChart(trafficCanvas, geometry)));
+			function redrawTraffic() {
+				trafficAxis.leftTop.textContent = _('Traffic %s').format(
+					formatTrafficRate(drawTrafficChart(trafficCanvas, geometry, showFloors)));
+			}
+			redrawTraffic();
+			floorToggle.addEventListener('change', function() {
+				showFloors = floorToggle.checked;
+				graphFloorStates[sectionName] = showFloors;
+				redrawTraffic();
+			});
 			bindHover(latencyCanvas, geometry, hoverInfo);
 			bindHover(trafficCanvas, geometry, hoverInfo);
 			bindScroll(viewport, latestButton, sectionName);
@@ -883,12 +961,15 @@ return L.view.extend({
 				'.cake-graph-interval{min-width:120px}',
 				'.cake-graph-legend{display:flex;align-items:center;gap:18px;margin-bottom:5px;font-weight:600;flex-wrap:wrap}',
 				'.cake-graph-rtt{color:#22a06b}.cake-graph-transport{color:#d35400}.cake-graph-effective{color:#c0398f}.cake-graph-cpu{color:#6c5ce7}.cake-graph-dl{color:#2980b9}.cake-graph-ul{color:#e67e22}.cake-graph-samples{color:#777;font-weight:400}',
+				'.cake-graph-floors{display:inline-flex;align-items:center;gap:5px;color:#777;font-weight:400;cursor:pointer}',
 				'.cake-graph-latest{margin-left:auto}',
 				'.cake-graph-hover{min-height:1.5em;margin:3px 0 6px;padding:4px 7px;border-radius:4px;background:rgba(127,127,127,.12);font-variant-numeric:tabular-nums}',
+				'.cake-graph-frame{position:relative;min-width:0}',
 				'.cake-graph-scroll{display:block;width:100%;overflow-x:auto;overflow-y:hidden;scrollbar-gutter:stable}',
 				'.cake-graph-track{display:block;max-width:none}',
 				'.cake-graph-chart-title{position:sticky;left:0;z-index:1;display:inline-block;margin:5px 0 1px;padding:2px 6px;border-radius:3px;background:var(--background-color-high,#fff);font-weight:600}',
-				'.cake-graph-fixed-axis{position:sticky;left:0;z-index:2;height:0;pointer-events:none;font-size:12px;color:#777}',
+				'.cake-graph-fixed-axis{position:absolute;left:0;right:0;z-index:2;height:0;pointer-events:none;font-size:12px;color:#777}',
+				'.cake-graph-latency-axis{top:0}.cake-graph-traffic-axis{top:247px}',
 				'.cake-graph-fixed-axis span{position:absolute;padding:1px 3px;border-radius:2px;background:var(--background-color-high,rgba(255,255,255,.82));white-space:nowrap}',
 				'.cake-graph-axis-left{left:1px}.cake-graph-axis-right{right:1px;text-align:right}',
 				'.cake-graph-axis-top{top:27px}.cake-graph-axis-bottom{top:181px}',

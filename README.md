@@ -48,15 +48,15 @@ socket libraries; ordinary OpenWrt runtime dependencies remain explicit below.
 
 The current tree builds these OpenWrt 25.12.5 APKs:
 
-- `cake-autorate-rs-1.0_rc8-r1-x86_64.apk` — x86_64 autorate daemon.
-- `cake-autorate-rs-1.0_rc8-r1-aarch64_generic.apk` — rockchip/armv8
+- `cake-autorate-rs-1.0_rc9-r1-x86_64.apk` — x86_64 autorate daemon.
+- `cake-autorate-rs-1.0_rc9-r1-aarch64_generic.apk` — rockchip/armv8
   autorate daemon.
-- `luci-app-cake-autorate-rs-1.0_rc8-r1.apk` — architecture-independent LuCI
+- `luci-app-cake-autorate-rs-1.0_rc9-r1.apk` — architecture-independent LuCI
   interface and SQM integration.
 
 The daemon package installs `uci`, `fping`, and `uclient-fetch` as dependencies.
 The LuCI package installs the daemon, `luci-base`, and `sqm-scripts`; the latter
-brings the CAKE, IFB, `tc`, and `ip` runtime pieces. Native RC8 transport probes
+brings the CAKE, IFB, `tc`, and `ip` runtime pieces. Native RC9 transport probes
 use the daemon's statically linked rustls/webpki stack. Full Auto-Tune and the
 diagnostic legacy HTTP backend still use OpenWrt `uclient-fetch`, so the offline
 installer includes the standard mbedTLS provider when none is already present.
@@ -88,6 +88,16 @@ loaded samples, and download/upload have independent windows. Status displays
 `CURRENT` plus the retained `PREVIOUS` result; a one-direction result is labeled
 `PARTIAL`, never presented as a final connection grade.
 
+RC9 fixes passive grade collection from ordinary routed client traffic. Rating
+load classification no longer reuses the autorate controller's instantaneous
+`high_load_thr`: it averages per-direction rate over a two-second window, uses
+60% enter / 40% exit hysteresis, a one-second direction hold, a 1.5-second
+dropout grace, and independent DL/UL dominance. Status exposes the phase,
+raw/smoothed load, directional counts, finalization countdown, `CURRENT`, and
+retained `PREVIOUS`. A per-instance `Get rating` action can either generate
+shaped router-side load or wait for a sequential client test; neither mode
+disables SQM/autorate, changes CAKE limits, or stores samples in flash.
+
 Transport measurement/rating and transport-driven CAKE control are now separate
 options. Measurement can remain enabled for Status and Graphs while
 `transport_controller_enabled=0` guarantees it cannot change a shaper. The
@@ -103,8 +113,9 @@ only proportional presets (from 256 KiB through 100 MiB), pages older samples
 instead of loading the whole history into the browser, and pauses history under
 critical memory pressure. WAN cards are stacked vertically; synchronized
 RTT/CPU and DL/UL charts retain exact hover values and fixed Y-axis labels while
-their common timeline scrolls. CPU remains available in live Status without CPU
-log output.
+their common timeline scrolls. Safety-floor lines are hidden by default so they
+do not flatten ordinary traffic; `Show safety floors` adds them on demand. CPU
+remains available in live Status without CPU log output.
 
 The release includes separate minimal x86_64 and rockchip/armv8 offline
 bundles. Extract the matching archive under `/root/` and run its included
@@ -179,6 +190,12 @@ Implemented:
   block unsafe ceiling growth or run a bounded natural-traffic search above a
   protected per-direction floor. See
   [TRANSPORT_QUALITY.md](TRANSPORT_QUALITY.md).
+- Passive detected-rating load classification is independent of controller
+  high/low/idle state. A bounded rolling average, enter/exit hysteresis,
+  direction latch, and dropout grace turn real forwarded traffic into stable
+  `DL`, `UL`, or `BIDIRECTIONAL` rating phases without double-counting byte
+  counters. Optional `Get rating` automatic/client capture uses the same
+  detector and only supplies a bounded trigger; it never bypasses shaping.
 - `tc qdisc change ... cake bandwidth ...` shaper updates.
 - Upstream-style idle/stall handling: sustained idle can stop pingers, activity
   restarts them, and optional minimum-rate enforcement applies on sustained idle
@@ -485,16 +502,16 @@ them together. For x86_64:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc8-r1-x86_64.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc8-r1.apk
+  /root/cake-autorate-rs-1.0_rc9-r1-x86_64.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc9-r1.apk
 ```
 
 For rockchip/armv8 (`aarch64_generic`):
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc8-r1-aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc8-r1.apk
+  /root/cake-autorate-rs-1.0_rc9-r1-aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc9-r1.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:
@@ -514,16 +531,16 @@ x86_64:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc8-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc8-x86_64.sh
+tar -xzf cake-autorate-rs-1.0-rc9-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc9-x86_64.sh
 ```
 
 Banana Pi R2 Pro and other OpenWrt 25.12.5 rockchip/armv8 devices:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc8-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc8-aarch64_generic.sh
+tar -xzf cake-autorate-rs-1.0-rc9-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc9-aarch64_generic.sh
 ```
 
 The installer resolves its own location, so it also works when the extracted
@@ -569,7 +586,8 @@ uci commit cake-autorate
 When enabled, `history.csv` is sampled at the selected interval under
 `/var/run/cake-autorate/<instance>/`. Each row contains timestamp, RTT,
 transport/effective latency, total CPU, download/upload kbit/s, safety floors,
-and a detected-grade event when one changes. The global budget accepts `auto`
+rating phase and directional sample counts, plus a detected-grade event when
+one changes. The global budget accepts `auto`
 or one of `256`, `512`, `1024`, `2048`, `4096`, `8192`, `16384`, `32768`,
 `65536`, and `102400` KiB. The daemon caps that request according to available
 RAM and divides the effective total across enabled histories. For example,
@@ -584,6 +602,7 @@ cake-autorated --instance primary --dump-config
 cake-autorated --instance primary --once
 cat /var/run/cake-autorate/primary/status.json
 /usr/libexec/cake-autorate-rs/speedtest primary "" status auto
+/usr/libexec/cake-autorate-rs/quality-test primary status
 /usr/libexec/cake-autorate-rs/mqtt-status primary status
 ```
 

@@ -70,6 +70,14 @@ var optionDescriptions = {
 	transport_probe_timeout_s: 'Maximum seconds allowed for one asynchronous transport probe.',
 	transport_load_hold_s: 'High load must remain in the same download/upload phase for this long before a loaded RTT probe starts.',
 	transport_cpu_max_percent: 'Discard a transport sample when total router CPU is above this percentage so local saturation is not mistaken for WAN latency.',
+	rating_load_window_s: 'Independent rolling throughput window used only to detect rating load. It does not change the autorate controller high-load threshold.',
+	rating_load_enter_ratio: 'Smoothed share of the current CAKE rate required to enter a download or upload rating phase. 0.60 means 60%. An explicit Get rating capture may learn a lower safe trigger from the observed peak.',
+	rating_load_exit_ratio: 'Lower hysteresis threshold used to leave a latched rating phase. It must remain below the enter ratio.',
+	rating_load_hold_s: 'How long one direction must satisfy the enter threshold before its rating phase is latched.',
+	rating_load_dropout_s: 'How long a short traffic gap is tolerated without losing the latched download or upload phase.',
+	rating_load_min_kbps: 'Absolute minimum traffic rate required for passive rating detection, independent of the percentage threshold.',
+	rating_load_dominance_ratio: 'When both directions are active, one direction must exceed the other by this ratio to avoid classifying the sample as bidirectional.',
+	rating_episode_gap_s: 'Idle time after loaded traffic before the current rating episode is finalized. This keeps short browser-test gaps inside one result.',
 	quality_target_delay_ms: 'Target loaded transport-delay increase. The default 30 ms corresponds to an estimated A-like target.',
 	quality_search_max_steps: 'Maximum bounded rate reductions in one search before cooldown and rollback to the best useful candidate.',
 	quality_search_observe_s: 'Observation time after each candidate rate change.',
@@ -796,6 +804,15 @@ function validateTransportProbeUrl(value) {
 	if (!/^(wss?|https?|tcp):\/\/\S+$/.test(String(value || '')))
 		return _('Enter a ws://, wss://, http://, https://, or tcp:// endpoint without spaces.');
 
+	return true;
+}
+
+function validateRatingLoadRatios(section, section_id) {
+	var enter = parseFloat(formOrUci(section, section_id, 'rating_load_enter_ratio') || '0.60');
+	var exit = parseFloat(formOrUci(section, section_id, 'rating_load_exit_ratio') || '0.40');
+
+	if (isFinite(enter) && isFinite(exit) && exit >= enter)
+		return _('Rating exit ratio must be lower than the enter ratio.');
 	return true;
 }
 
@@ -2895,6 +2912,28 @@ function addQualityOptions(section) {
 	o = value(section, 'quality', 'transport_load_hold_s', _('Stable load hold'), 'and(ufloat,min(1),max(30))', '3.0');
 	o.depends('transport_latency_enabled', '1');
 	o = value(section, 'quality', 'transport_cpu_max_percent', _('CPU rejection threshold'), 'and(ufloat,min(50),max(100))', '85.0');
+	o.depends('transport_latency_enabled', '1');
+	o = value(section, 'quality', 'rating_load_window_s', _('Rating load window'), 'and(ufloat,min(0.5),max(10))', '2.0');
+	o.depends('transport_latency_enabled', '1');
+	o = value(section, 'quality', 'rating_load_enter_ratio', _('Rating enter ratio'), 'and(ufloat,min(0.1),max(1))', '0.60');
+	o.depends('transport_latency_enabled', '1');
+	o.validate = function(section_id) {
+		return validateRatingLoadRatios(validationSection(this), section_id);
+	};
+	o = value(section, 'quality', 'rating_load_exit_ratio', _('Rating exit ratio'), 'and(ufloat,min(0.05),max(0.99))', '0.40');
+	o.depends('transport_latency_enabled', '1');
+	o.validate = function(section_id) {
+		return validateRatingLoadRatios(validationSection(this), section_id);
+	};
+	o = value(section, 'quality', 'rating_load_hold_s', _('Rating phase hold'), 'and(ufloat,min(0.2),max(10))', '1.0');
+	o.depends('transport_latency_enabled', '1');
+	o = value(section, 'quality', 'rating_load_dropout_s', _('Rating dropout tolerance'), 'and(ufloat,min(0.2),max(10))', '1.5');
+	o.depends('transport_latency_enabled', '1');
+	o = value(section, 'quality', 'rating_load_min_kbps', _('Rating minimum traffic'), 'and(ufloat,min(0))', '2000');
+	o.depends('transport_latency_enabled', '1');
+	o = value(section, 'quality', 'rating_load_dominance_ratio', _('Direction dominance ratio'), 'and(ufloat,min(1.1),max(10))', '1.5');
+	o.depends('transport_latency_enabled', '1');
+	o = value(section, 'quality', 'rating_episode_gap_s', _('Rating finalize gap'), 'and(ufloat,min(5),max(120))', '30.0');
 	o.depends('transport_latency_enabled', '1');
 
 	o = flag(section, 'quality', 'transport_controller_enabled', _('Allow transport control'), '0');

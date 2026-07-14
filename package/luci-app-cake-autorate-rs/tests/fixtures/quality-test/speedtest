@@ -1,0 +1,21 @@
+#!/bin/sh
+
+section="$1"
+runtime="${CAKE_AUTORATE_RUNTIME_DIR:?}/$section/status.json"
+counter="${CAKE_AUTORATE_QUALITY_DIR:?}/speedtest-runs"
+runs="$(sed -n '1p' "$counter" 2>/dev/null)"
+runs="${runs:-0}"
+runs=$((runs + 1))
+printf '%s\n' "$runs" > "$counter"
+
+if [ "$runs" -eq 1 ]; then
+	cat > "$runtime" <<'EOF'
+{"route_active":true,"route_device":"lo","transport_probe_trusted":true,"quality_grade_baseline_ready":true,"quality_grade_baseline_samples":20,"quality_grade_baseline_required_samples":20,"quality_grade_dl_samples":10,"quality_grade_ul_samples":10,"quality_grade_required_samples":20,"quality_grade_state":"collecting","rating_load_phase":"UL","rating_load_candidate":"UL","rating_load_smoothed_dl_percent":5,"rating_load_smoothed_ul_percent":85}
+EOF
+else
+	cat > "$runtime" <<'EOF'
+{"route_active":true,"route_device":"lo","transport_probe_trusted":true,"quality_grade_baseline_ready":true,"quality_grade_baseline_samples":20,"quality_grade_baseline_required_samples":20,"quality_grade_dl_samples":20,"quality_grade_ul_samples":20,"quality_grade_required_samples":20,"quality_grade_state":"final","rating_load_phase":"IDLE","rating_load_candidate":"IDLE","rating_load_smoothed_dl_percent":0,"rating_load_smoothed_ul_percent":0,"quality_grade_current":{"grade":"A","increase_ms":8.5,"started_at":9999999999,"completed_at":9999999999,"partial":false,"incomplete":false,"dl_samples":20,"ul_samples":20,"dl":{"grade":"A+"},"ul":{"grade":"A"}}}
+EOF
+fi
+
+printf '{"download_kbps":800000,"upload_kbps":700000,"shaper_bypassed":false}\n'

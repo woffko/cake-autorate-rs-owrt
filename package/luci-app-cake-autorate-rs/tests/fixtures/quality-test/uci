@@ -1,0 +1,12 @@
+#!/bin/sh
+
+key="$3"
+
+case "$key" in
+	*.enabled) [ "${CAKE_TEST_DISABLED:-0}" = 1 ] && printf '0\n' || printf '1\n' ;;
+	*.sqm_enabled|*.transport_latency_enabled) printf '1\n' ;;
+	*.sqm_interface|*.ul_if) printf 'lo\n' ;;
+	*.route_mode) printf 'main\n' ;;
+	*.mwan3_member) printf '\n' ;;
+	*) exit 1 ;;
+esac

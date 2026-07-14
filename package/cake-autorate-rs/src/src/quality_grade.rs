@@ -5,7 +5,6 @@ use crate::transport_quality::{classify_quality, QualityClass};
 pub const MIN_BASELINE_SAMPLES: usize = 20;
 pub const MIN_LOADED_SAMPLES: usize = 20;
 const BASELINE_WINDOW: usize = 120;
-const LOAD_SESSION_GRACE_S: f64 = 20.0;
 
 #[derive(Clone, Debug)]
 pub struct QualityGradeMetric {
@@ -25,6 +24,11 @@ pub struct QualityGradeResult {
     pub completed_at: Option<f64>,
     pub route_identity: String,
     pub partial: bool,
+    pub incomplete: bool,
+    pub dl_samples: usize,
+    pub ul_samples: usize,
+    pub bidirectional_samples: usize,
+    pub completion_reason: String,
     pub dl: Option<QualityGradeMetric>,
     pub ul: Option<QualityGradeMetric>,
     pub bidirectional: Option<QualityGradeMetric>,
@@ -32,13 +36,7 @@ pub struct QualityGradeResult {
 
 impl QualityGradeResult {
     pub fn samples(&self) -> usize {
-        self.dl.as_ref().map(|metric| metric.samples).unwrap_or(0)
-            + self.ul.as_ref().map(|metric| metric.samples).unwrap_or(0)
-            + self
-                .bidirectional
-                .as_ref()
-                .map(|metric| metric.samples)
-                .unwrap_or(0)
+        self.dl_samples + self.ul_samples + self.bidirectional_samples
     }
 }
 
@@ -49,6 +47,12 @@ pub struct QualityGradeSnapshot {
     pub previous: Option<QualityGradeResult>,
     pub collected_samples: usize,
     pub required_samples: usize,
+    pub baseline_samples: usize,
+    pub baseline_required_samples: usize,
+    pub dl_samples: usize,
+    pub ul_samples: usize,
+    pub bidirectional_samples: usize,
+    pub finalize_remaining_s: Option<f64>,
     pub baseline_ready: bool,
     pub current_stale: bool,
     pub previous_stale: bool,
@@ -91,17 +95,35 @@ impl ActiveWindow {
         let ul = metric(&self.ul, baseline_p5_ms);
         let bidirectional = metric(&self.bidirectional, baseline_p5_ms);
 
-        let (class, increase_ms, partial) = match (&dl, &ul) {
+        let (class, increase_ms, partial, incomplete, completion_reason) = match (&dl, &ul) {
             (Some(dl), Some(ul)) => {
                 if quality_rank(dl.class) <= quality_rank(ul.class) {
-                    (dl.class, dl.increase_ms.max(ul.increase_ms), false)
+                    (
+                        dl.class,
+                        dl.increase_ms.max(ul.increase_ms),
+                        false,
+                        false,
+                        "complete",
+                    )
                 } else {
-                    (ul.class, dl.increase_ms.max(ul.increase_ms), false)
+                    (
+                        ul.class,
+                        dl.increase_ms.max(ul.increase_ms),
+                        false,
+                        false,
+                        "complete",
+                    )
                 }
             }
-            (Some(dl), None) => (dl.class, dl.increase_ms, true),
-            (None, Some(ul)) => (ul.class, ul.increase_ms, true),
-            (None, None) => return None,
+            (Some(dl), None) => (dl.class, dl.increase_ms, true, false, "upload_incomplete"),
+            (None, Some(ul)) => (ul.class, ul.increase_ms, true, false, "download_incomplete"),
+            (None, None) => (
+                QualityClass::Learning,
+                0.0,
+                false,
+                true,
+                "insufficient_directional_samples",
+            ),
         };
 
         Some(QualityGradeResult {
@@ -113,6 +135,11 @@ impl ActiveWindow {
             completed_at,
             route_identity: self.route_identity.clone(),
             partial,
+            incomplete,
+            dl_samples: self.dl.len(),
+            ul_samples: self.ul.len(),
+            bidirectional_samples: self.bidirectional.len(),
+            completion_reason: completion_reason.to_string(),
             dl,
             ul,
             bidirectional,
@@ -127,16 +154,18 @@ pub struct QualityGradeTracker {
     latest: Option<QualityGradeResult>,
     previous: Option<QualityGradeResult>,
     route_identity: String,
+    session_grace_s: f64,
 }
 
 impl QualityGradeTracker {
-    pub fn new() -> Self {
+    pub fn new(session_grace_s: f64) -> Self {
         Self {
             baselines: HashMap::new(),
             active: None,
             latest: None,
             previous: None,
             route_identity: String::new(),
+            session_grace_s: session_grace_s.max(1.0),
         }
     }
 
@@ -172,7 +201,7 @@ impl QualityGradeTracker {
             if self
                 .active
                 .as_ref()
-                .map(|active| timestamp - active.last_loaded_at >= LOAD_SESSION_GRACE_S)
+                .map(|active| timestamp - active.last_loaded_at >= self.session_grace_s)
                 .unwrap_or(false)
             {
                 self.finish_active(timestamp);
@@ -183,7 +212,7 @@ impl QualityGradeTracker {
         if self
             .active
             .as_ref()
-            .map(|active| timestamp - active.last_loaded_at >= LOAD_SESSION_GRACE_S)
+            .map(|active| timestamp - active.last_loaded_at >= self.session_grace_s)
             .unwrap_or(false)
         {
             self.finish_active(timestamp);
@@ -213,7 +242,13 @@ impl QualityGradeTracker {
         }
     }
 
-    pub fn snapshot(&self) -> QualityGradeSnapshot {
+    pub fn snapshot(&self, now: f64) -> QualityGradeSnapshot {
+        let baseline_samples = self
+            .baselines
+            .values()
+            .map(VecDeque::len)
+            .max()
+            .unwrap_or(0);
         let baseline_ready = self
             .baselines
             .values()
@@ -241,6 +276,18 @@ impl QualityGradeTracker {
             .as_ref()
             .map(|result| result.route_identity != self.route_identity)
             .unwrap_or(false);
+        let (dl_samples, ul_samples, bidirectional_samples, finalize_remaining_s) = self
+            .active
+            .as_ref()
+            .map(|active| {
+                (
+                    active.dl.len(),
+                    active.ul.len(),
+                    active.bidirectional.len(),
+                    Some((self.session_grace_s - (now - active.last_loaded_at)).max(0.0)),
+                )
+            })
+            .unwrap_or((0, 0, 0, None));
 
         QualityGradeSnapshot {
             state,
@@ -248,6 +295,12 @@ impl QualityGradeTracker {
             previous,
             collected_samples,
             required_samples: MIN_LOADED_SAMPLES,
+            baseline_samples,
+            baseline_required_samples: MIN_BASELINE_SAMPLES,
+            dl_samples,
+            ul_samples,
+            bidirectional_samples,
+            finalize_remaining_s,
             baseline_ready,
             current_stale,
             previous_stale,
@@ -258,6 +311,9 @@ impl QualityGradeTracker {
         let Some(active) = self.active.take() else {
             return;
         };
+        if active.samples() == 0 {
+            return;
+        }
         let Some(result) = active.result(Some(timestamp)) else {
             return;
         };
@@ -345,7 +401,7 @@ mod tests {
 
     #[test]
     fn current_and_previous_survive_the_next_collection_window() {
-        let mut tracker = QualityGradeTracker::new();
+        let mut tracker = QualityGradeTracker::new(30.0);
         seed_baseline(&mut tracker, "endpoint", "route-a");
         for index in 0..MIN_LOADED_SAMPLES {
             tracker.observe(
@@ -357,20 +413,20 @@ mod tests {
                 "route-a",
             );
         }
-        let live = tracker.snapshot();
+        let live = tracker.snapshot(50.0);
         assert_eq!(live.state, "provisional");
         assert_eq!(live.current.as_ref().unwrap().class, QualityClass::APlus);
         assert!(live.previous.is_none());
 
-        tracker.observe("endpoint", 11.0, false, false, 70.0, "route-a");
-        let finished = tracker.snapshot();
+        tracker.observe("endpoint", 11.0, false, false, 85.0, "route-a");
+        let finished = tracker.snapshot(90.0);
         assert_eq!(finished.state, "final");
         assert!(finished.current.as_ref().unwrap().completed_at.is_some());
 
-        tracker.observe("endpoint", 80.0, false, true, 80.0, "route-a");
-        let collecting = tracker.snapshot();
-        assert_eq!(collecting.state, "collecting");
-        assert!(collecting.current.is_none());
+        tracker.observe("endpoint", 80.0, false, true, 100.0, "route-a");
+        let collecting = tracker.snapshot(110.0);
+        assert_eq!(collecting.state, "provisional");
+        assert!(collecting.current.as_ref().unwrap().incomplete);
         assert_eq!(
             collecting.previous.as_ref().unwrap().class,
             QualityClass::APlus
@@ -379,7 +435,7 @@ mod tests {
 
     #[test]
     fn bidirectional_is_diagnostic_and_does_not_set_overall_grade() {
-        let mut tracker = QualityGradeTracker::new();
+        let mut tracker = QualityGradeTracker::new(30.0);
         seed_baseline(&mut tracker, "endpoint", "route-a");
         for index in 0..MIN_LOADED_SAMPLES {
             tracker.observe(
@@ -391,9 +447,10 @@ mod tests {
                 "route-a",
             );
         }
-        let snapshot = tracker.snapshot();
-        assert_eq!(snapshot.state, "collecting");
-        assert!(snapshot.current.is_none());
+        let snapshot = tracker.snapshot(100.0);
+        assert_eq!(snapshot.state, "provisional");
+        assert!(snapshot.current.as_ref().unwrap().incomplete);
+        assert_eq!(snapshot.bidirectional_samples, MIN_LOADED_SAMPLES);
     }
 
     #[test]
@@ -417,7 +474,7 @@ mod tests {
 
     #[test]
     fn route_change_keeps_last_result_but_marks_it_stale() {
-        let mut tracker = QualityGradeTracker::new();
+        let mut tracker = QualityGradeTracker::new(30.0);
         seed_baseline(&mut tracker, "endpoint", "route-a");
         for index in 0..MIN_LOADED_SAMPLES {
             tracker.observe(
@@ -429,9 +486,9 @@ mod tests {
                 "route-a",
             );
         }
-        tracker.observe("endpoint", 11.0, false, false, 70.0, "route-a");
+        tracker.observe("endpoint", 11.0, false, false, 85.0, "route-a");
         tracker.set_route("route-b");
-        let snapshot = tracker.snapshot();
+        let snapshot = tracker.snapshot(100.0);
         assert!(snapshot.current_stale);
         assert!(!snapshot.baseline_ready);
     }

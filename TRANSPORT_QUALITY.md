@@ -1,6 +1,8 @@
 # Transport RTT, detected quality, and optional control
 
-RC8 separates three things that earlier releases mixed together:
+RC8 separated three things that earlier releases mixed together; RC9 keeps
+that measurement contract and fixes load/episode detection for passive routed
+traffic:
 
 1. a route-bound network RTT measurement;
 2. an observational A+/A/B/C/D/F connection rating; and
@@ -23,8 +25,8 @@ RC8 removes that value from both rating and control. Status identifies the new
 contract as:
 
 ```text
-transport_probe_method=network_rtt_v2
-quality_grade_method=transport_rtt_p90_loaded_minus_p5_idle_v2
+transport_probe_method=network_rtt_v3
+quality_grade_method=transport_rtt_p90_loaded_minus_p5_idle_v3
 ```
 
 The legacy process-timed mode remains selectable only for diagnosis. It is
@@ -68,12 +70,39 @@ A native result is accepted only when all of these remain true:
 - member, device, source address, fwmark, and table still match;
 - the backend is trusted and returns non-empty positive RTT data;
 - total router CPU is not above `transport_cpu_max_percent` (85% by default);
-- download/upload load classification did not change while the batch ran; and
-- loaded traffic had stayed in the same phase for at least
-  `transport_load_hold_s` (3 seconds by default).
+- the independent rating load phase did not change while the batch ran; and
+- the observation still belongs to the same route-bound rating phase when the
+  batch completes.
 
 Rejected evidence is reported but never treated as bufferbloat. A route or
 source/external-address change clears only that uplink's learned windows.
+
+## RC9 passive rating load detector
+
+The controller's `high_load_thr` answers a different question: whether the fast
+rate controller should grow or reduce CAKE now. RC9 therefore does not reuse it
+to label rating samples. For direction `d`, achieved rate `R_d`, current CAKE
+rate `C_d`, and the samples in the last `W` seconds:
+
+```text
+ratio_d(i) = clamp(R_d(i) / C_d(i), 0, 10)
+smooth_d   = mean(ratio_d(i), i inside W)
+rate_d     = mean(R_d(i), i inside W)
+```
+
+Packaged defaults are `W=2 s`, enter ratio `0.60`, exit ratio `0.40`, minimum
+rate `2000 kbit/s`, one-second candidate hold, and 1.5-second dropout grace. A
+direction enters a loaded phase only when both its smoothed ratio and absolute
+rate pass the enter thresholds. When both pass, a 1.5:1 dominance ratio selects
+DL or UL; otherwise the sample is `BIDIRECTIONAL`. Leaving a loaded phase uses
+the lower exit threshold and half the minimum rate, then requires the dropout
+grace. This hysteresis prevents short counter bursts, direction flips, and
+small gaps inside one speed-test phase from fragmenting an episode.
+
+The detector consumes the same per-interface RX/TX deltas already calculated
+by the daemon exactly once; no WAN aggregate is added to an IFB/device counter.
+It runs in `passive` mode continuously, so a sequential browser or CLI test from
+a LAN client can produce a rating without clicking anything in LuCI.
 
 ## Detected LibreQoS-compatible rating
 
@@ -92,7 +121,7 @@ At least 20 idle samples are required before `BASELINE READY`, and at least 20
 loaded samples are required for each scored direction. Download and upload use
 separate windows; download evidence can never lower the upload shaper or vice
 versa. Adjacent directional phases belong to one test episode when less than
-20 seconds apart. Bidirectional observations remain diagnostic and do not
+30 seconds apart by default. Bidirectional observations remain diagnostic and do not
 lower the overall grade.
 
 | Loaded RTT increase | Grade |
@@ -113,9 +142,31 @@ paths.
 
 The compatibility reference is the live
 [LibreQoS Internet Quality Test](https://test.libreqos.com/advanced/) and its
-published browser implementation. RC8 measures natural routed traffic instead
+published browser implementation. RC9 measures natural routed traffic instead
 of generating the browser test's saturation load, so its Status rating is a
 compatible detector, not a claim that an official browser test was run.
+
+## `Get rating` helper
+
+Status offers `Get rating` after the instance, managed SQM, trusted transport
+backend, active route, and 20-sample idle baseline are ready. `Automatic`
+invokes the existing route-bound speed-test backend in shaped mode and stops as
+soon as both directions have enough evidence, with a maximum of three passes.
+`Guided client capture` waits while the user runs sequential download and
+upload load through the router. Both modes arm a RAM-only bounded marker which
+lets the same detector learn a conservative threshold from that test's peak:
+
+```text
+capture_enter = min(configured_enter, max(0.15, 0.55 * learned_peak))
+capture_exit  = min(configured_exit,  max(0.10, 0.67 * capture_enter))
+```
+
+This helps variable links reach a stable phase without weakening normal
+passive thresholds. The helper never disables SQM or autorate, never applies a
+speed-test result to CAKE, uses the existing per-interface heavy-job lock, and
+removes its marker on completion, cancellation, error, or timeout. LuCI reports
+baseline, DL/UL counts, phase, smoothed load, finalization time, and the last
+rejection reason while it runs.
 
 ## Optional strict controller
 

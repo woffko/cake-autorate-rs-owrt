@@ -48,6 +48,16 @@ config cake_autorate 'primary'
 	option transport_probe_endpoint 'wss://ping-bufferbloat.libreqos.com/ws'
 	option transport_load_hold_s '3.0'
 	option transport_cpu_max_percent '85.0'
+	# Rating has its own burst-tolerant load detector. These values never change
+	# autorate's high_load_thr or enable the optional transport controller.
+	option rating_load_window_s '2.0'
+	option rating_load_enter_ratio '0.60'
+	option rating_load_exit_ratio '0.40'
+	option rating_load_hold_s '1.0'
+	option rating_load_dropout_s '1.5'
+	option rating_load_min_kbps '2000'
+	option rating_load_dominance_ratio '1.5'
+	option rating_episode_gap_s '30.0'
 	# Retained for migration and the diagnostic-only legacy-http backend.
 	list transport_probe_url 'https://speed.cloudflare.com/__down?bytes=0'
 	list transport_probe_url 'https://www.google.com/generate_204'
