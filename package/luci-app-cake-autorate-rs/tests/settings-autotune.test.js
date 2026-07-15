@@ -189,6 +189,12 @@ assert.match(source, /decorateAutorateSubcategories/);
 for (const label of [ 'Connection & routing', 'Rate limits', 'Adaptive ceiling',
 	'Latency probes', 'Quality & rating', 'Controller' ])
 	assert(source.includes(label), `missing Autorate subcategory: ${label}`);
+assert(source.includes("'class': 'cbi-tabmenu cake-autorate-subnav'"),
+	'Autorate subcategories must use native LuCI tab styling');
+assert(source.includes("tabItems[definition.id].className = active ? 'cbi-tab' : 'cbi-tab-disabled'"),
+	'Autorate subcategories must use native LuCI active/inactive tab states');
+assert(!source.includes("'btn cbi-button cbi-button-action' : 'btn cbi-button cbi-button-neutral'"),
+	'Autorate subcategories must not be rendered as action buttons');
 assert.doesNotMatch(source, /s\.tab\('general'/,
 	'General must be merged into the Autorate setup category');
 

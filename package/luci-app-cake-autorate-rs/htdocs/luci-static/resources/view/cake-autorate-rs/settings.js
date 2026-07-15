@@ -3026,9 +3026,10 @@ function decorateAutorateSubcategories(section, sectionId, containers) {
 
 	var definitions = autorateSubcategoryDefinitions();
 	var panels = {};
-	var buttons = {};
-	var nav = E('div', {
-		'class': 'cake-autorate-subnav',
+	var tabs = {};
+	var tabItems = {};
+	var nav = E('ul', {
+		'class': 'cbi-tabmenu cake-autorate-subnav',
 		'role': 'tablist',
 		'aria-label': _('Autorate settings sections')
 	});
@@ -3036,13 +3037,17 @@ function decorateAutorateSubcategories(section, sectionId, containers) {
 
 	definitions.forEach(function(definition) {
 		var panelId = 'cake-autorate-subpanel-%s-%s'.format(sectionId, definition.id);
-		var button = E('button', {
-			'type': 'button',
-			'class': 'btn cbi-button cbi-button-neutral',
+		var tab = E('a', {
+			'href': '#',
 			'role': 'tab',
 			'aria-controls': panelId,
 			'aria-selected': 'false'
 		}, definition.title);
+		var tabItem = E('li', {
+			'class': 'cbi-tab-disabled',
+			'role': 'presentation',
+			'data-subtab': definition.id
+		}, [ tab ]);
 		var panel = E('div', {
 			'id': panelId,
 			'class': 'cake-autorate-subpanel',
@@ -3051,12 +3056,31 @@ function decorateAutorateSubcategories(section, sectionId, containers) {
 			E('p', { 'class': 'cake-autorate-subdescription' }, definition.description)
 		]);
 
-		button.addEventListener('click', function() {
+		tab.addEventListener('click', function(ev) {
+			ev.preventDefault();
 			activate(definition.id);
 		});
-		buttons[definition.id] = button;
+		tab.addEventListener('keydown', function(ev) {
+			var index = definitions.findIndex(function(item) { return item.id === definition.id; });
+			var target = null;
+			if (ev.key === 'ArrowLeft' || ev.key === 'ArrowUp')
+				target = definitions[(index + definitions.length - 1) % definitions.length].id;
+			else if (ev.key === 'ArrowRight' || ev.key === 'ArrowDown')
+				target = definitions[(index + 1) % definitions.length].id;
+			else if (ev.key === 'Home')
+				target = definitions[0].id;
+			else if (ev.key === 'End')
+				target = definitions[definitions.length - 1].id;
+			if (target) {
+				ev.preventDefault();
+				activate(target);
+				tabs[target].focus();
+			}
+		});
+		tabs[definition.id] = tab;
+		tabItems[definition.id] = tabItem;
 		panels[definition.id] = panel;
-		nav.appendChild(button);
+		nav.appendChild(tabItem);
 		panelRoot.appendChild(panel);
 	});
 
@@ -3074,19 +3098,18 @@ function decorateAutorateSubcategories(section, sectionId, containers) {
 		definitions.forEach(function(definition) {
 			var active = definition.id === group;
 			panels[definition.id].style.display = active ? '' : 'none';
-			buttons[definition.id].className = active ?
-				'btn cbi-button cbi-button-action' : 'btn cbi-button cbi-button-neutral';
-			buttons[definition.id].setAttribute('aria-selected', active ? 'true' : 'false');
-			buttons[definition.id].setAttribute('tabindex', active ? '0' : '-1');
+			tabItems[definition.id].className = active ? 'cbi-tab' : 'cbi-tab-disabled';
+			tabs[definition.id].setAttribute('aria-selected', active ? 'true' : 'false');
+			tabs[definition.id].setAttribute('tabindex', active ? '0' : '-1');
 		});
 	}
 
 	autorateContainer.appendChild(E('style', {}, [
-		'.cake-autorate-subnav{display:flex;flex-wrap:wrap;gap:5px;margin:12px 0 14px}',
-		'.cake-autorate-subnav .cbi-button{flex:1 1 150px;min-width:0;white-space:normal}',
+		'.cake-autorate-subnav{margin:12px 0 14px;max-width:100%;overflow-x:auto;overflow-y:hidden;flex-wrap:nowrap;scrollbar-width:thin}',
+		'.cake-autorate-subnav>li{flex:0 0 auto}',
+		'.cake-autorate-subnav>li>a{white-space:nowrap}',
 		'.cake-autorate-subpanel{min-width:0}',
-		'.cake-autorate-subdescription{margin:0 0 12px;color:var(--text-color-medium,#777)}',
-		'@media(max-width:600px){.cake-autorate-subnav{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.cake-autorate-subnav .cbi-button{width:100%}}'
+		'.cake-autorate-subdescription{margin:0 0 12px;color:var(--text-color-medium,#777)}'
 	].join('')));
 	autorateContainer.appendChild(nav);
 	autorateContainer.appendChild(panelRoot);

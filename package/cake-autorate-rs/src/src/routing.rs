@@ -5,6 +5,8 @@ use std::process::{Command, Output};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+const ROUTE_IDENTITY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RouteMode {
     Main,
@@ -102,6 +104,60 @@ pub struct RouteSnapshot {
     pub active: bool,
     pub member_status: String,
     pub reason: String,
+}
+
+pub struct RouteInspector {
+    spec: RouteSpec,
+    cached: Option<RouteSnapshot>,
+    default_policy: Option<String>,
+    last_full_refresh: Option<Instant>,
+}
+
+impl RouteInspector {
+    pub fn new(spec: RouteSpec) -> Self {
+        Self {
+            spec,
+            cached: None,
+            default_policy: None,
+            last_full_refresh: None,
+        }
+    }
+
+    pub fn inspect(&mut self) -> Result<RouteSnapshot, String> {
+        let full_refresh_due = self
+            .last_full_refresh
+            .map(|last| last.elapsed() >= ROUTE_IDENTITY_REFRESH_INTERVAL)
+            .unwrap_or(true);
+        if full_refresh_due || self.cached.is_none() {
+            return self.inspect_fresh();
+        }
+
+        let cached = self.cached.as_ref().expect("cached route checked above");
+        let snapshot = match self.spec.effective_mode()? {
+            RouteMode::Main => inspect_main_cached(&self.spec, cached),
+            RouteMode::Mwan3 => {
+                inspect_mwan3_cached(&self.spec, cached, self.default_policy.as_deref())
+            }
+        }?;
+        self.cached = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    pub fn inspect_fresh(&mut self) -> Result<RouteSnapshot, String> {
+        let snapshot = match self.spec.effective_mode()? {
+            RouteMode::Main => {
+                self.default_policy = None;
+                inspect_main(&self.spec)?
+            }
+            RouteMode::Mwan3 => {
+                self.default_policy = mwan3_default_policy();
+                inspect_mwan3_with_policy(&self.spec, self.default_policy.as_deref())?
+            }
+        };
+        self.last_full_refresh = Some(Instant::now());
+        self.cached = Some(snapshot.clone());
+        Ok(snapshot)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -320,7 +376,10 @@ pub fn routed_command(
 pub fn inspect_route(spec: &RouteSpec) -> Result<RouteSnapshot, String> {
     match spec.effective_mode()? {
         RouteMode::Main => inspect_main(spec),
-        RouteMode::Mwan3 => inspect_mwan3(spec),
+        RouteMode::Mwan3 => {
+            let default_policy = mwan3_default_policy();
+            inspect_mwan3_with_policy(spec, default_policy.as_deref())
+        }
     }
 }
 
@@ -378,7 +437,34 @@ fn inspect_main(spec: &RouteSpec) -> Result<RouteSnapshot, String> {
     })
 }
 
-fn inspect_mwan3(spec: &RouteSpec) -> Result<RouteSnapshot, String> {
+fn inspect_main_cached(spec: &RouteSpec, cached: &RouteSnapshot) -> Result<RouteSnapshot, String> {
+    let device_path = format!("/sys/class/net/{}", spec.expected_device);
+    let device_online = Path::new(&device_path).exists();
+    let default_device = default_route_device().unwrap_or_default();
+    let active = device_online && default_device == spec.expected_device;
+    let online = active;
+    let reason = if !device_online {
+        format!("interface {} is unavailable", spec.expected_device)
+    } else if !active {
+        format!("main default route uses {default_device}")
+    } else {
+        String::new()
+    };
+    let mut identity = cached.identity.clone();
+    identity.device = spec.expected_device.clone();
+    Ok(RouteSnapshot {
+        identity,
+        online,
+        active,
+        member_status: if online { "online" } else { "route_mismatch" }.to_string(),
+        reason,
+    })
+}
+
+fn inspect_mwan3_with_policy(
+    spec: &RouteSpec,
+    default_policy: Option<&str>,
+) -> Result<RouteSnapshot, String> {
     ensure_nft_mwan3()?;
     let request = format!(r#"{{"interface":"{}"}}"#, spec.member);
     let mwan_status = run_output("ubus", &["call", "mwan3", "status", &request])
@@ -436,9 +522,7 @@ fn inspect_mwan3(spec: &RouteSpec) -> Result<RouteSnapshot, String> {
         && member_status == "online"
         && device_matches;
     let default_device = default_route_device().unwrap_or_default();
-    let default_policy = mwan3_default_policy();
     let policy_percent = default_policy
-        .as_deref()
         .and_then(|policy| json_policy_member_percent(&mwan_json, policy, &spec.member));
     let active = online
         && policy_percent
@@ -456,7 +540,7 @@ fn inspect_mwan3(spec: &RouteSpec) -> Result<RouteSnapshot, String> {
     } else if !member_up || member_status != "online" {
         format!("member {} is {member_status}", spec.member)
     } else if !active {
-        match (default_policy.as_deref(), policy_percent) {
+        match (default_policy, policy_percent) {
             (Some(policy), Some(percent)) => {
                 format!("standby: mwan3 policy {policy} assigns {percent}%")
             }
@@ -480,6 +564,82 @@ fn inspect_mwan3(spec: &RouteSpec) -> Result<RouteSnapshot, String> {
         member_status,
         reason,
     })
+}
+
+fn inspect_mwan3_cached(
+    spec: &RouteSpec,
+    cached: &RouteSnapshot,
+    default_policy: Option<&str>,
+) -> Result<RouteSnapshot, String> {
+    ensure_nft_mwan3()?;
+    let request = format!(r#"{{"interface":"{}"}}"#, spec.member);
+    let mwan_status = run_output("ubus", &["call", "mwan3", "status", &request])
+        .map_err(|error| format!("failed to inspect mwan3 member {}: {error}", spec.member))?;
+    if !mwan_status.status.success() {
+        return Err(format!(
+            "mwan3 status failed for {}: {}",
+            spec.member,
+            output_error(&mwan_status)
+        ));
+    }
+    let mwan_json = String::from_utf8_lossy(&mwan_status.stdout);
+    Ok(mwan3_snapshot_from_cached_status(
+        spec,
+        cached,
+        default_policy,
+        &mwan_json,
+    ))
+}
+
+fn mwan3_snapshot_from_cached_status(
+    spec: &RouteSpec,
+    cached: &RouteSnapshot,
+    default_policy: Option<&str>,
+    mwan_json: &str,
+) -> RouteSnapshot {
+    let member_status = json_string_value(mwan_json, "status").unwrap_or_default();
+    let running = json_bool_value(mwan_json, "running").unwrap_or(false);
+    let member_up = json_bool_value(mwan_json, "up").unwrap_or(false);
+    let enabled = json_bool_value(mwan_json, "enabled").unwrap_or(false);
+    let device_matches = cached.identity.device == spec.expected_device;
+    let online = enabled && running && member_up && member_status == "online" && device_matches;
+    let policy_percent = default_policy
+        .and_then(|policy| json_policy_member_percent(mwan_json, policy, &spec.member));
+    let active = online
+        && policy_percent
+            .map(|percent| percent > 0)
+            .unwrap_or_else(|| {
+                default_route_device().as_deref() == Some(cached.identity.device.as_str())
+            });
+    let reason = if !device_matches {
+        format!(
+            "route mismatch: member {} uses {}, expected {}",
+            spec.member, cached.identity.device, spec.expected_device
+        )
+    } else if !enabled {
+        format!("member {} is disabled", spec.member)
+    } else if !running {
+        format!("member {} interface is down", spec.member)
+    } else if !member_up || member_status != "online" {
+        format!("member {} is {member_status}", spec.member)
+    } else if !active {
+        match (default_policy, policy_percent) {
+            (Some(policy), Some(percent)) => {
+                format!("standby: mwan3 policy {policy} assigns {percent}%")
+            }
+            _ => "standby: selected mwan3 member is not default-active".to_string(),
+        }
+    } else {
+        String::new()
+    };
+
+    RouteSnapshot {
+        identity: cached.identity.clone(),
+        online,
+        active,
+        member_status,
+        reason,
+    }
 }
 
 fn ensure_nft_mwan3() -> Result<(), String> {
@@ -657,11 +817,27 @@ fn env_value(environment: &str, key: &str) -> Option<String> {
 }
 
 fn default_route_device() -> Option<String> {
+    if let Ok(routes) = std::fs::read_to_string("/proc/net/route") {
+        if let Some(device) = parse_proc_default_route_device(&routes) {
+            return Some(device);
+        }
+    }
     let output = run_output("ip", &["-4", "route", "show", "default"]).ok()?;
     if !output.status.success() {
         return None;
     }
     parse_default_route_device(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_proc_default_route_device(routes: &str) -> Option<String> {
+    routes.lines().skip(1).find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.get(1) == Some(&"00000000") {
+            fields.first().map(|value| (*value).to_string())
+        } else {
+            None
+        }
+    })
 }
 
 fn parse_default_route_device(routes: &str) -> Option<String> {
@@ -829,6 +1005,35 @@ mwan3.default_rule_v4.use_policy='wan_then_wan2'\n";
             json_policy_member_percent(status, "wan_then_wan2", "wan2"),
             Some(100)
         );
+
+        let spec = RouteSpec::new("mwan3", "wan2", "eth0");
+        let cached = RouteSnapshot {
+            identity: RouteIdentity {
+                mode: "mwan3".to_string(),
+                member: "wan2".to_string(),
+                device: "eth0".to_string(),
+                source_ip: "10.0.100.101".to_string(),
+                fwmark: "0x200".to_string(),
+                table: "2".to_string(),
+            },
+            online: true,
+            active: false,
+            member_status: "online".to_string(),
+            reason: String::new(),
+        };
+        let online = r#"{"status":"online","running":true,"up":true,"enabled":true,
+            "policies":{"ipv4":{"wan_then_wan2":[{"interface":"wan2","percent":100}]}}}"#;
+        let snapshot =
+            mwan3_snapshot_from_cached_status(&spec, &cached, Some("wan_then_wan2"), online);
+        assert!(snapshot.online);
+        assert!(snapshot.active);
+        assert_eq!(snapshot.stable_key(), cached.stable_key());
+
+        let offline = r#"{"status":"offline","running":true,"up":false,"enabled":true}"#;
+        let snapshot =
+            mwan3_snapshot_from_cached_status(&spec, &cached, Some("wan_then_wan2"), offline);
+        assert!(!snapshot.online);
+        assert!(!snapshot.active);
     }
 
     #[test]
@@ -836,6 +1041,14 @@ mwan3.default_rule_v4.use_policy='wan_then_wan2'\n";
         assert_eq!(
             parse_default_route_device("default via 10.0.0.1 dev eth0 metric 20\n").as_deref(),
             Some("eth0")
+        );
+        assert_eq!(
+            parse_proc_default_route_device(
+                "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n\
+                 eth2 00000000 0100000A 0003 0 0 0 00000000 0 0 0\n"
+            )
+            .as_deref(),
+            Some("eth2")
         );
         let rules =
             "1001: from all iif pppoe-wan lookup 1\n2001: from all fwmark 0x100/0x3f00 lookup 1\n";

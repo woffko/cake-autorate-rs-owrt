@@ -71,3 +71,19 @@ For the algorithms and safety invariants see [Controller
 mathematics](ALGORITHM_MATH.md), [Full Auto-Tune](AUTOTUNE.md), and
 [Multi-WAN routing](MULTIWAN.md). Repeatable checks and anonymized observations
 are in [Testing](TESTING.md).
+
+## Checking CPU overhead
+
+The CPU column in Status is the total router utilization, so forwarded traffic,
+PPPoE, CAKE and network softirq work are intentionally included. To distinguish
+that data-plane load from the control application, run:
+
+```sh
+/usr/libexec/cake-autorate-rs/cpu-profile 30
+```
+
+The report shows router busy/softirq percentages and each autorate daemon,
+pinger and Auto-Tune scheduler both as a percentage of one logical CPU and of
+the router's total logical-CPU capacity. The helper is read-only, samples for
+5–300 seconds, uses only a temporary file under `/tmp`, and does not enable
+logging or write to flash.
