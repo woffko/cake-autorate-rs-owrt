@@ -60,13 +60,20 @@ against the published `SHA256SUMS`.
 RC13 adds deterministic UI and calibration gates: clean package config must
 contain no `cake_autorate` section; mandatory Status columns cannot be hidden;
 saved optional columns and Reset default must survive polling; 390 px Status
-must render cards while desktop uses the full viewport. Graph event labels are
+must render cards while desktop remains aligned to the LuCI content container.
+Optional columns may scroll only inside their table wrapper. Graph event labels are
 tested with clustered route/state/grade/DL/UL changes and must occupy two
 lanes on both synchronized charts. Re-run Auto-Tune must prefill the selected
 instance and stage no change before Review. Background tests cover strict
 stop, quiet retry, cancel, moderate conservative continuation, unusable
 direction retention, and the invariant that a low-confidence result never
 raises a confirmed max or cap.
+
+RC14 additionally requires that a complete grade moves only to `LAST KNOWN`.
+With no active episode, `CURRENT` must be null in status JSON and render as
+`WAITING FOR DATA`; route changes and cancelled captures must not resurrect a
+previous complete grade as current. Partial or incomplete attempts remain
+eligible for the current-attempt slot but never replace `LAST KNOWN`.
 
 ## Anonymous WAN comparison
 
@@ -633,8 +640,9 @@ configuration was then restored byte-for-byte.
 
 Authenticated Playwright exercised the installed LuCI application at desktop
 and 390 px widths. It verified that the four mandatory Status columns remain
-visible, optional column choices and Reset survive a reload, desktop uses the
-available viewport, and mobile renders cards without page overflow. Re-run
+visible, optional column choices and Reset survive a reload, desktop remains
+aligned to the LuCI content container, and mobile renders cards without page
+overflow. Re-run
 Auto-Tune opened the selected instance with its route, queue, backend, and
 rates prefilled. Edit showed the four topic tabs plus Advanced only when expert
 options were enabled. Clustered LEARNING, route, rating, DL, and UL markers
@@ -673,3 +681,64 @@ formatting, all daemon and LuCI shell suites (including clean defaults and the
 isolated Status-column commit helper), four LuCI JavaScript suites, shell/JSON
 syntax, `git diff --check`, both SDK builds, checksum verification, the offline
 installer run, and the three installed-router browser checks described above.
+
+## RC14 Status geometry and rating-lifecycle gate (2026-07-15)
+
+RC14 first reproduced the RC13 width defect with authenticated Playwright. At
+2048 px the LuCI content container and application header were 1180 px wide at
+x=434, while Status escaped to 2000 px at x=24. Equivalent escape was measured
+at 1280, 1500, and 1920 px. The corrected page now remains exactly 1180 px and
+aligned with the header at all four desktop widths. The compact four-column
+layout uses the full container; enabling every optional column grows only the
+inner table to 1770 px and leaves the page itself at the viewport width.
+
+At 390 px Status switches to cards, has no page overflow, and keeps the Get
+rating button and its readiness explanation in a vertical stack. The browser
+gate caught and corrected an initial mobile overlap before the final LuCI APK
+was built. Read-only production checks also opened Graphs after a polling
+cycle: the two-uplink router rendered two vertically stacked cards and four
+canvases, while the ARM router rendered one card and two canvases, without a
+page or console exception.
+
+The rating lifecycle was then exercised on the disposable router rather than
+only mocked. Baseline learning reached 22 accepted samples, automatic Get
+rating collected 50 DL and 57 UL samples, and the helper completed `A+` without
+changing the 85/10 Mbit/s CAKE pair. Immediately after finalization the daemon
+reported `quality_grade_state=baseline_ready`,
+`quality_grade_current=null`, and `quality_grade_last_known.grade=A+` with a
+complete, non-partial result. LuCI consequently rendered `CURRENT — WAITING FOR
+DATA` and `LAST KNOWN — A+`. A genuinely new passive incomplete episode may
+occupy CURRENT, but it cannot replace LAST KNOWN; starting or cancelling a
+guided capture also cannot resurrect the old complete result as CURRENT.
+
+The final packages were installed on the x86_64 nftables-mwan3 router and the
+rockchip/armv8 router. cake-autorate, SQM, network, and (where present) mwan3
+hashes were identical before and after. Only cake-autorate was restarted. The
+x86 router retained independent `ACTIVE`/`STANDBY` members and route
+identities; the ARM router retained `ACTIVE/RUNNING` and its existing WWAN
+limits. Authenticated Playwright confirmed the RC14 daemon/LuCI version banner,
+content-aligned Status at 1280/1920/2048 px, 390 px cards without overlapping
+content, and the expected synchronized graph count on both devices.
+
+Both offline repositories index 65 APKs. Dependency-only installation with
+networking and package scripts disabled selected all 62 required packages in
+fresh x86_64 and aarch64_generic roots. The x86 archive was then copied to
+`/root/` on the disposable router and its installer completed with
+`--no-network`, created an RC14 backup, and preserved the cake-autorate and SQM
+hashes. Final release hashes are:
+
+| Artifact | SHA-256 |
+|---|---|
+| x86_64 daemon APK | `51c9330de9cc626eb485bed16d07cb4526579c6ebbdc66ee943aa1a8af644b52` |
+| aarch64_generic daemon APK | `86ab6f4c4d2a6d370ca174018fb56a505f9544c4fe76d8fa21bf8d78e42872e8` |
+| noarch LuCI APK | `389db479b3468349d41ca08936803a90ee67ff02df6c45f420e1683cc8157f5b` |
+| x86_64 installer | `08ff7d90f399a29fe141c1acf997e1f199d21f73b7ac4b07adc325211eb994c7` |
+| aarch64_generic installer | `ddafcb3f0e84704f9b375142c8eb62100eb479640174e6344c15b2f9f809e5d9` |
+| x86_64 offline bundle | `48bfc6efa196c28595a859d91d1ea037ff4d7248b3336944c6a5363411eb0034` |
+| rockchip/armv8 offline bundle | `7d04f6cc934aa28e8630508623095efaefc94d37929c993c9061eda402bf3a65` |
+
+The final deterministic gate passed 103 Rust tests, strict Clippy and
+formatting, nine shell suites, four LuCI JavaScript suites, JavaScript/shell
+syntax, ACL JSON parsing, `git diff --check`, both SDK builds, both empty-root
+offline dependency installs, the `/root/` installer run, and all three router
+browser checks above.

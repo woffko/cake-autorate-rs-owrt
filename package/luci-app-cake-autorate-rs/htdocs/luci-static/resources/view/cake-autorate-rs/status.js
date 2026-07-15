@@ -432,8 +432,8 @@ function renderDetectedGrade(label, result, state, collected, required, dlSample
 				Number(dlSamples || 0), Number(required || 0),
 				Number(ulSamples || 0), Number(required || 0));
 		} else if (state === 'baseline_ready') {
-			value = _('BASELINE READY');
-			detail = _('Waiting for loaded traffic');
+			value = _('WAITING FOR DATA');
+			detail = _('Run Get rating or generate new loaded traffic');
 		} else {
 			value = _('LEARNING');
 			detail = _('Collecting idle baseline');
@@ -743,7 +743,11 @@ function renderTable(sections, statuses, selectedKeys) {
 		})));
 	});
 
-	return E('table', { 'class': 'table cake-status-table' }, children);
+	return E('table', {
+		'class': 'table cake-status-table ' +
+			(columns.length === STATUS_DEFAULT_COLUMNS.length ?
+				'cake-status-table-compact' : 'cake-status-table-expanded')
+	}, children);
 }
 
 function renderCards(sections, statuses, selectedKeys) {
@@ -876,10 +880,16 @@ return L.view.extend({
 
 		return E('div', { 'class': 'cake-status-root' }, [
 			E('style', {}, [
-				'.cake-status-root{width:calc(100vw - 48px);max-width:none;margin-left:calc((100% - (100vw - 48px))/2);box-sizing:border-box}',
+				'.cake-status-root{width:100%;max-width:100%;min-width:0;margin:0;box-sizing:border-box}',
 				'.cake-status-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}',
-				'.cake-status-table-scroll{width:100%;overflow-x:auto;margin-top:18px}',
-				'.cake-status-table{width:100%;min-width:max-content;table-layout:auto;margin:0}',
+				'.cake-status-table-scroll{width:100%;max-width:100%;min-width:0;overflow-x:auto;margin-top:18px}',
+				'.cake-status-table{width:100%;margin:0}',
+				'.cake-status-table-compact{min-width:0;table-layout:fixed}',
+				'.cake-status-table-compact [data-column="instance"]{width:14%}',
+				'.cake-status-table-compact [data-column="uplink"]{width:22%}',
+				'.cake-status-table-compact [data-column="quality"]{width:43%}',
+				'.cake-status-table-compact [data-column="rating"]{width:21%}',
+				'.cake-status-table-expanded{min-width:max-content;table-layout:auto}',
 				'.cake-status-table th{vertical-align:bottom!important;padding-top:10px!important;padding-bottom:10px!important}',
 				'.cake-status-table td{vertical-align:top!important;padding-top:13px!important;padding-bottom:13px!important;line-height:1.35}',
 				'.cake-status-row{border-bottom:1px solid rgba(127,127,127,.25)}',
@@ -894,7 +904,7 @@ return L.view.extend({
 				'.cake-quality-grade-b strong{color:#8eae2f}.cake-quality-grade-c strong{color:#d08b20}',
 				'.cake-quality-grade-d strong,.cake-quality-grade-f strong{color:#d34b4b}',
 				'.cake-quality-stale{opacity:.65}',
-				'.cake-quality-action{min-width:145px;gap:5px}',
+				'.cake-quality-action{min-width:145px;display:flex;flex-direction:column;align-items:flex-start;gap:5px}',
 				'.cake-quality-action small{white-space:normal;max-width:190px;color:#888}',
 				'.cake-quality-ready{color:#16a085!important}',
 				'.cake-quality-job-state{white-space:pre-wrap;margin-top:14px}',
@@ -904,7 +914,7 @@ return L.view.extend({
 				'.cake-status-column-menu{position:absolute;right:0;top:calc(100% + 6px);z-index:20;min-width:270px;padding:12px;border:1px solid rgba(127,127,127,.4);border-radius:6px;background:var(--background-color-high,#fff);box-shadow:0 5px 20px rgba(0,0,0,.22)}',
 				'.cake-status-column-options{display:grid;grid-template-columns:1fr;gap:7px}.cake-status-column-option{display:flex;align-items:center;gap:7px;white-space:nowrap}.cake-status-column-buttons{display:flex;gap:7px;margin-top:12px}',
 				'.cake-status-cards{display:none}.cake-status-card{border:1px solid rgba(127,127,127,.3);border-radius:6px;padding:12px;background:rgba(127,127,127,.04)}.cake-status-card-field{display:grid;grid-template-columns:minmax(105px,35%) minmax(0,1fr);gap:10px;padding:8px 0;border-bottom:1px solid rgba(127,127,127,.18)}.cake-status-card-field:last-child{border-bottom:0}.cake-status-card-label{font-size:12px}.cake-status-card-value{min-width:0;overflow-wrap:anywhere}',
-				'@media(max-width:900px){.cake-status-root{width:calc(100vw - 24px);margin-left:calc((100% - (100vw - 24px))/2)}.cake-status-table-scroll{display:none}.cake-status-cards{display:grid;grid-template-columns:1fr;gap:12px;margin-top:16px}.cake-status-toolbar{align-items:flex-start}.cake-status-column-picker{margin-left:0}.cake-status-column-menu{left:0;right:auto;max-width:calc(100vw - 36px)}}'
+				'@media(max-width:900px){.cake-status-table-scroll{display:none}.cake-status-cards{display:grid;grid-template-columns:1fr;gap:12px;margin-top:16px}.cake-status-toolbar{align-items:flex-start}.cake-status-column-picker{margin-left:0}.cake-status-column-menu{left:0;right:auto;max-width:min(270px,calc(100vw - 36px))}}'
 			].join('')),
 			renderVersions(versions),
 			E('div', { 'class': 'cbi-section cake-status-toolbar' }, [

@@ -50,10 +50,10 @@ socket libraries; ordinary OpenWrt runtime dependencies remain explicit below.
 
 The current tree builds these OpenWrt 25.12.5 APKs:
 
-- `cake-autorate-rs-1.0_rc13-r1-x86_64.apk` — x86_64 autorate daemon.
-- `cake-autorate-rs-1.0_rc13-r1-aarch64_generic.apk` — rockchip/armv8
+- `cake-autorate-rs-1.0_rc14-r1-x86_64.apk` — x86_64 autorate daemon.
+- `cake-autorate-rs-1.0_rc14-r1-aarch64_generic.apk` — rockchip/armv8
   autorate daemon.
-- `luci-app-cake-autorate-rs-1.0_rc13-r1.apk` — architecture-independent LuCI
+- `luci-app-cake-autorate-rs-1.0_rc14-r1.apk` — architecture-independent LuCI
   interface and SQM integration.
 
 The daemon package installs `uci`, `fping`, `uclient-fetch`, and `sqm-scripts`
@@ -135,8 +135,9 @@ RC13 makes a clean installation instance-free: the package supplies only the
 global RAM-history policy until the user creates an uplink in LuCI. Status now
 defaults to Instance, Uplink/State, Quality and Get rating; a global **List
 columns** menu can add route, timestamps, reflectors, RTT, achieved traffic,
-CAKE rates and CPU without restarting the daemon. Desktop Status uses the
-available viewport, narrow screens use per-instance cards, and graph events
+CAKE rates and CPU without restarting the daemon. Desktop Status follows the
+normal LuCI content width, wider optional tables scroll inside that container,
+narrow screens use per-instance cards, and graph events
 share a synchronized two-lane label layout so close LEARNING/route/rating
 markers do not overlap.
 
@@ -148,6 +149,20 @@ Conservative proposals are marked low-confidence, subtract the measured
 background plus safety margin, never raise a confirmed maximum or adaptive
 cap, and retain any unusable direction. See the [quick setup
 guide](SETUP_GUIDE.md) for the recommended workflow.
+
+RC14 corrects the RC13 Status-width regression. The page no longer escapes
+the theme's content container through viewport-relative sizing. Its version
+banner, toolbar, compact four-column table, and form actions share the same
+edges as the application title and tabs. Optional columns expand only the
+table's own horizontal scroller, while the narrow-screen card layout remains
+unchanged.
+
+RC14 also separates live and retained rating semantics. `CURRENT` represents
+only a newly collecting or incomplete episode. Once a complete result is
+accepted into `LAST KNOWN`, `CURRENT` returns to `WAITING FOR DATA` until a new
+loaded episode starts; it never mirrors the retained grade. Starting,
+cancelling, or changing the route clears stale current-attempt data without
+discarding the last complete rating.
 
 Transport measurement/rating and transport-driven CAKE control are now separate
 options. Measurement can remain enabled for Status and Graphs while
@@ -565,16 +580,16 @@ them together. For x86_64:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc13-r1-x86_64.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc13-r1.apk
+  /root/cake-autorate-rs-1.0_rc14-r1-x86_64.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc14-r1.apk
 ```
 
 For rockchip/armv8 (`aarch64_generic`):
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc13-r1-aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc13-r1.apk
+  /root/cake-autorate-rs-1.0_rc14-r1-aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc14-r1.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:
@@ -594,16 +609,16 @@ x86_64:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc13-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc13-x86_64.sh
+tar -xzf cake-autorate-rs-1.0-rc14-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc14-x86_64.sh
 ```
 
 Banana Pi R2 Pro and other OpenWrt 25.12.5 rockchip/armv8 devices:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc13-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc13-aarch64_generic.sh
+tar -xzf cake-autorate-rs-1.0-rc14-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc14-aarch64_generic.sh
 ```
 
 The installer resolves its own location, so it also works when the extracted

@@ -98,6 +98,21 @@ assert.equal(collecting.children[0].children[1].children, 'COLLECTING');
 assert.match(collecting.children[0].children[2].children, /DL 2\/3.*UL 0\/3/);
 assert.equal(collecting.children[1].children[1].children, 'A');
 
+const waitingWithLastKnown = helpers.formatQuality({
+	transport_latency_enabled: true,
+	quality_grade_state: 'baseline_ready',
+	quality_grade_collected_samples: 0,
+	quality_grade_required_samples: 20,
+	quality_grade_current: null,
+	quality_grade_last_known: {
+		grade: 'B', increase_ms: 45, completed_at: Date.now() / 1000 - 60,
+		dl: { grade: 'A' }, ul: { grade: 'B' }, partial: false, incomplete: false, stale: false,
+	},
+});
+assert.equal(waitingWithLastKnown.children[0].children[1].children, 'WAITING FOR DATA');
+assert.match(waitingWithLastKnown.children[0].children[2].children, /Run Get rating/);
+assert.equal(waitingWithLastKnown.children[1].children[1].children, 'B');
+
 const noLastKnown = helpers.formatQuality({
 	transport_latency_enabled: true,
 	quality_grade_state: 'learning_baseline',
@@ -205,8 +220,16 @@ assert.match(source, /column\.mandatory \? '' : null/,
 assert.match(source, /cake-status-cards\{display:none\}/);
 assert.match(source, /@media\(max-width:900px\).*cake-status-cards\{display:grid/,
 	'narrow Status pages must switch to instance cards');
-assert.match(source, /width:calc\(100vw - 48px\)/,
-	'Status must use the available desktop viewport width');
+assert.match(source, /cake-status-root\{width:100%;max-width:100%;min-width:0;margin:0/,
+	'Status must remain inside the LuCI content container');
+assert.doesNotMatch(source, /cake-status-root\{[^}]*100vw/,
+	'Status must not escape the LuCI content container through viewport units');
+assert.match(source, /cake-status-table-compact\{min-width:0;table-layout:fixed\}/,
+	'the four mandatory columns must use a compact fixed layout');
+assert.match(source, /cake-status-table-expanded\{min-width:max-content;table-layout:auto\}/,
+	'optional columns must overflow only inside the table scroller');
+assert.match(source, /cake-quality-action\{min-width:145px;display:flex;flex-direction:column;align-items:flex-start;gap:5px\}/,
+	'rating action and readiness text must stack without overlapping in mobile cards');
 assert.doesNotMatch(source, /'disabled':\s*!/,
 	'Boolean false must not be serialized as an HTML disabled attribute');
 

@@ -184,14 +184,17 @@ impl QualityGradeTracker {
         self.route_identity = route_identity.to_string();
         self.baselines.clear();
         self.active = None;
+        self.latest = None;
     }
 
     pub fn begin_capture(&mut self, timestamp: f64) {
         self.finish_active(timestamp);
+        self.latest = None;
     }
 
     pub fn cancel_capture(&mut self) {
         self.active = None;
+        self.latest = None;
     }
 
     pub fn end_capture(&mut self, timestamp: f64) {
@@ -338,10 +341,11 @@ impl QualityGradeTracker {
         let Some(result) = active.result(Some(timestamp)) else {
             return;
         };
-        let is_complete = !result.partial && !result.incomplete;
-        self.latest = Some(result.clone());
-        if is_complete {
+        if !result.partial && !result.incomplete {
             self.last_known = Some(result);
+            self.latest = None;
+        } else {
+            self.latest = Some(result);
         }
     }
 
@@ -461,8 +465,8 @@ mod tests {
         seed_baseline(&mut tracker, "endpoint", "route-a");
         complete_result(&mut tracker, "endpoint", "route-a", 30.0, 12.0, 40.0);
         let accepted = tracker.snapshot(115.0);
-        assert_eq!(accepted.state, "final");
-        assert_eq!(accepted.current.as_ref().unwrap().class, QualityClass::B);
+        assert_eq!(accepted.state, "baseline_ready");
+        assert!(accepted.current.is_none());
         assert_eq!(accepted.last_known.as_ref().unwrap().class, QualityClass::B);
 
         tracker.observe("endpoint", 80.0, false, true, 120.0, "route-a");
@@ -518,8 +522,8 @@ mod tests {
         let snapshot = tracker.snapshot(41.0);
         assert_eq!(snapshot.dl_samples, 0);
         assert_eq!(snapshot.ul_samples, 0);
-        assert_eq!(snapshot.state, "final");
-        assert!(snapshot.current.as_ref().unwrap().incomplete);
+        assert_eq!(snapshot.state, "baseline_ready");
+        assert!(snapshot.current.is_none());
         assert!(snapshot.last_known.is_none());
 
         tracker.observe("endpoint", 20.0, false, true, 42.0, "route-a");
@@ -564,7 +568,8 @@ mod tests {
 
         tracker.cancel_capture();
         let restored = tracker.snapshot(166.0);
-        assert_eq!(restored.current.as_ref().unwrap().class, QualityClass::B);
+        assert_eq!(restored.state, "baseline_ready");
+        assert!(restored.current.is_none());
         assert_eq!(restored.last_known.as_ref().unwrap().class, QualityClass::B);
     }
 
@@ -594,9 +599,8 @@ mod tests {
 
         tracker.end_capture(75.0);
         let snapshot = tracker.snapshot(75.0);
-        assert_eq!(snapshot.state, "final");
-        assert!(!snapshot.current.as_ref().unwrap().partial);
-        assert!(!snapshot.current.as_ref().unwrap().incomplete);
+        assert_eq!(snapshot.state, "baseline_ready");
+        assert!(snapshot.current.is_none());
         assert_eq!(snapshot.last_known.as_ref().unwrap().class, QualityClass::B);
     }
 
@@ -646,7 +650,8 @@ mod tests {
         complete_result(&mut tracker, "endpoint", "route-a", 30.0, 12.0, 40.0);
         tracker.set_route("route-b");
         let snapshot = tracker.snapshot(115.0);
-        assert!(snapshot.current_stale);
+        assert!(snapshot.current.is_none());
+        assert!(!snapshot.current_stale);
         assert!(snapshot.last_known_stale);
         assert!(!snapshot.baseline_ready);
     }
