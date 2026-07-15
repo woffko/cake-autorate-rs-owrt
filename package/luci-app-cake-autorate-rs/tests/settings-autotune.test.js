@@ -38,7 +38,7 @@ const helpers = new Function(
 	`${prefix}\ninterfaceContext = { deviceNames: { eth1: true }, deviceNetworks: {}, ` +
 		`networkDevices: {}, defaultDevice: 'eth1' };\nreturn { writeWizardConfig, validateTransportProbeUrl, ` +
 		`buildMwan3Context, uniqueMwan3Uplinks, multiwanInstancePlans, wizardPlanConflicts, ` +
-		`topicTab, ` +
+		`topicTab, autorateSubcategory, autorateSubcategoryDefinitions, ` +
 		`setInterfaceContext: function(value) { interfaceContext = value; }, ` +
 		`setMwan3Context: function(value) { mwan3Context = value; } };`
 )({}, {}, {}, uci, {}, {}, {}, {}, () => ({}), value => value);
@@ -48,6 +48,15 @@ assert.equal(helpers.topicTab('general'), 'autorate');
 assert.equal(helpers.topicTab('sqm_qdisc'), 'sqm');
 assert.equal(helpers.topicTab('speedtest'), 'testing');
 assert.equal(helpers.topicTab('logging'), 'monitoring');
+assert.equal(helpers.autorateSubcategory('setup', 'wan_if'), 'connection');
+assert.equal(helpers.autorateSubcategory('setup', 'min_dl_shaper_rate_kbps'), 'limits');
+assert.equal(helpers.autorateSubcategory('rates', 'adaptive_ceiling_enabled'), 'ceiling');
+assert.equal(helpers.autorateSubcategory('reflectors', 'reflector'), 'probes');
+assert.equal(helpers.autorateSubcategory('quality', 'transport_probe_backend'), 'probes');
+assert.equal(helpers.autorateSubcategory('quality', 'rating_load_enter_ratio'), 'quality');
+assert.equal(helpers.autorateSubcategory('controller', 'alpha_delta_ewma'), 'controller');
+assert.deepEqual(helpers.autorateSubcategoryDefinitions().map(group => group.id),
+	[ 'connection', 'limits', 'ceiling', 'probes', 'quality', 'controller' ]);
 
 const proposal = {
 	download: {
@@ -176,6 +185,10 @@ assert.match(source, /confidence_mode === 'low'/);
 assert.match(source, /s\.tab\('autorate', _\('Autorate setup'\)\)/);
 assert.match(source, /s\.tab\('sqm', _\('SQM setup'\)\)/);
 assert.match(source, /s\.tab\('testing', _\('Testing & Auto-Tune'\)\)/);
+assert.match(source, /decorateAutorateSubcategories/);
+for (const label of [ 'Connection & routing', 'Rate limits', 'Adaptive ceiling',
+	'Latency probes', 'Quality & rating', 'Controller' ])
+	assert(source.includes(label), `missing Autorate subcategory: ${label}`);
 assert.doesNotMatch(source, /s\.tab\('general'/,
 	'General must be merged into the Autorate setup category');
 

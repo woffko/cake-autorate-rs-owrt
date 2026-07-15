@@ -39,6 +39,25 @@ opens the calibration page with the instance interface, route/member, backend,
 queue and current limits prefilled. The current configuration remains active
 until the Review result is explicitly staged and saved.
 
+Inside **Edit**, **Autorate setup** is split into focused groups:
+
+- **Connection & routing** selects the managed interface and the main or mwan3
+  path.
+- **Rate limits** contains the minimum, base and maximum rates used by the fast
+  controller.
+- **Adaptive ceiling** contains the optional growth state machine and its
+  absolute caps.
+- **Latency probes** configures ICMP reflectors and probe timing.
+- **Quality & rating** configures native transport measurement and the detected
+  connection grade.
+- **Controller** contains the response thresholds and timing of the autorate
+  controller itself.
+
+These are navigation groups, not separate configurations. Values in groups
+that are not currently visible are still validated and saved with the same UCI
+instance. Use **Advanced** only for compatibility and low-level options that do
+not belong to the normal setup workflow.
+
 ## Multi-WAN rules
 
 - One autorate instance owns one uplink and one CAKE/IFB pair.
