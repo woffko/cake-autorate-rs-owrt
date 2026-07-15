@@ -10,6 +10,9 @@ var HISTORY_BUDGETS_KIB = [ 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 6553
 var HISTORY_PAGE_SAMPLES = 10000;
 var GRAPH_POINT_SPACING_PX = 2;
 var GRAPH_MAX_WIDTH_PX = 20000;
+var GRAPH_EVENT_CLUSTER_DISTANCE_PX = 12;
+var GRAPH_EVENT_LABEL_LANES = 3;
+var GRAPH_EVENT_LABEL_GAP_PX = 5;
 var graphScrollStates = {};
 var graphPageOffsets = {};
 var graphFloorStates = {};
@@ -435,6 +438,11 @@ function gradeColor(grade) {
 	return '#d34b4b';
 }
 
+function isQualityGrade(grade) {
+	return grade === 'A+' || grade === 'A' || grade === 'B' || grade === 'C' ||
+		grade === 'D' || grade === 'F';
+}
+
 function collectChartEvents(geometry) {
 	var events = [];
 	var previous = null;
@@ -450,6 +458,7 @@ function collectChartEvents(geometry) {
 			if (stateChanged || identityChanged) {
 				events.push({
 					timestamp: point.timestamp,
+					kind: identityChanged ? 'route' : 'uplink',
 					label: identityChanged ? _('route change') : point.uplinkState,
 					shortLabel: identityChanged ? _('ROUTE') :
 						(point.uplinkState === 'LEARNING' ? _('LEARN') : point.uplinkState),
@@ -460,12 +469,13 @@ function collectChartEvents(geometry) {
 			}
 		}
 
-		if (point.grade) {
+		if (isQualityGrade(point.grade)) {
 			var gradeChanged = point.grade !== previousGrade ||
 				(point.gradeState === 'final' && previousGradeState !== 'final');
 			if (gradeChanged) {
 				events.push({
 					timestamp: point.timestamp,
+					kind: 'grade',
 					label: _('grade %s').format(point.grade),
 					shortLabel: point.grade,
 					color: gradeColor(point.grade),
@@ -483,6 +493,7 @@ function collectChartEvents(geometry) {
 				point.ratingUlSamples == null ? 0 : point.ratingUlSamples);
 			events.push({
 				timestamp: point.timestamp,
+				kind: 'rating',
 				label: progress,
 				shortLabel: phase,
 				color: phase === 'DL' ? '#2980b9' :
@@ -498,46 +509,128 @@ function collectChartEvents(geometry) {
 	return events.sort(function(a, b) { return a.timestamp - b.timestamp; });
 }
 
-function layoutEventLabels(ctx, geometry, events) {
-	var laneEnds = [ geometry.left - 8, geometry.left - 8 ];
+function clusterChartEvents(geometry, events) {
+	var clusters = [];
 
-	return events.map(function(event) {
+	events.forEach(function(event) {
 		var x = chartX(geometry, event.timestamp);
-		var label = event.label;
-		var width = ctx.measureText(label).width + 7;
-		var lane = x >= laneEnds[0] ? 0 : (x >= laneEnds[1] ? 1 : -1);
+		var cluster = clusters.length ? clusters[clusters.length - 1] : null;
 
-		if (lane < 0 || width > 104) {
-			label = event.shortLabel || label;
-			width = ctx.measureText(label).width + 7;
-			lane = x >= laneEnds[0] ? 0 : (x >= laneEnds[1] ? 1 :
-				(laneEnds[0] <= laneEnds[1] ? 0 : 1));
+		if (!cluster || x - cluster.firstX > GRAPH_EVENT_CLUSTER_DISTANCE_PX) {
+			clusters.push({
+				timestamp: event.timestamp,
+				x: x,
+				firstX: x,
+				lastX: x,
+				events: [ event ]
+			});
+			return;
 		}
-		laneEnds[lane] = x + width + 4;
+
+		cluster.events.push(event);
+		cluster.lastX = x;
+		cluster.timestamp = cluster.events.reduce(function(sum, candidate) {
+			return sum + candidate.timestamp;
+		}, 0) / cluster.events.length;
+		cluster.x = chartX(geometry, cluster.timestamp);
+	});
+
+	return clusters.map(function(cluster) {
+		var labels = [];
+		var shortLabels = [];
+
+		cluster.events.forEach(function(event) {
+			if (labels[labels.length - 1] !== event.label)
+				labels.push(event.label);
+			if (shortLabels[shortLabels.length - 1] !== (event.shortLabel || event.label))
+				shortLabels.push(event.shortLabel || event.label);
+		});
+
+		cluster.label = labels.join(' → ');
+		cluster.shortLabel = shortLabels.length > 2 ?
+			'%s…%s'.format(shortLabels[0], shortLabels[shortLabels.length - 1]) :
+			shortLabels.join('→');
+		cluster.color = cluster.events.some(function(event) {
+			return event.kind === 'uplink' && event.label === 'OFFLINE';
+		}) ? '#c0392b' : cluster.events[cluster.events.length - 1].color;
+		cluster.dash = cluster.events[cluster.events.length - 1].dash;
+		return cluster;
+	});
+}
+
+function chartEventClusters(geometry) {
+	if (!geometry.eventClusters)
+		geometry.eventClusters = clusterChartEvents(geometry, collectChartEvents(geometry));
+
+	return geometry.eventClusters;
+}
+
+function eventLabelPlacement(ctx, geometry, cluster, label) {
+	var width = ctx.measureText(label).width + 7;
+	var rightEdge = geometry.width - geometry.right;
+	var align = cluster.x + 3 + width <= rightEdge ? 'left' : 'right';
+	var textX = align === 'left' ? cluster.x + 3 : cluster.x - 3;
+	var start = align === 'left' ? textX : textX - width;
+
+	return {
+		label: label,
+		width: width,
+		align: align,
+		textX: textX,
+		start: Math.max(geometry.left, start),
+		end: Math.min(rightEdge, start + width)
+	};
+}
+
+function layoutEventLabels(ctx, geometry, clusters) {
+	var laneEnds = [];
+	for (var laneIndex = 0; laneIndex < GRAPH_EVENT_LABEL_LANES; laneIndex++)
+		laneEnds.push(geometry.left - GRAPH_EVENT_LABEL_GAP_PX);
+
+	return clusters.map(function(cluster) {
+		var placement = eventLabelPlacement(ctx, geometry, cluster, cluster.label);
+		var lane = laneEnds.findIndex(function(end) {
+			return placement.start >= end + GRAPH_EVENT_LABEL_GAP_PX;
+		});
+
+		if (lane < 0 || placement.width > 144) {
+			placement = eventLabelPlacement(ctx, geometry, cluster, cluster.shortLabel);
+			lane = laneEnds.findIndex(function(end) {
+				return placement.start >= end + GRAPH_EVENT_LABEL_GAP_PX;
+			});
+		}
+
+		if (lane >= 0)
+			laneEnds[lane] = placement.end;
+
 		return {
-			event: event,
-			x: x,
+			cluster: cluster,
+			x: cluster.x,
 			lane: lane,
-			label: label
+			label: lane >= 0 ? placement.label : '',
+			textX: placement.textX,
+			textAlign: placement.align
 		};
 	});
 }
 
 function drawChartEvents(ctx, geometry) {
-	var layouts = layoutEventLabels(ctx, geometry, collectChartEvents(geometry));
+	var layouts = layoutEventLabels(ctx, geometry, chartEventClusters(geometry));
 
 	layouts.forEach(function(layout) {
 		ctx.save();
-		ctx.strokeStyle = layout.event.color;
-		ctx.setLineDash(layout.event.dash || [ 3, 3 ]);
+		ctx.strokeStyle = layout.cluster.color;
+		ctx.setLineDash(layout.cluster.dash || [ 3, 3 ]);
 		ctx.beginPath();
 		ctx.moveTo(layout.x, geometry.top);
 		ctx.lineTo(layout.x, geometry.top + geometry.plotHeight);
 		ctx.stroke();
-		ctx.setLineDash([]);
-		ctx.fillStyle = layout.event.color;
-		ctx.textAlign = 'left';
-		ctx.fillText(layout.label, layout.x + 3, 14 + layout.lane * 17);
+		if (layout.label) {
+			ctx.setLineDash([]);
+			ctx.fillStyle = layout.cluster.color;
+			ctx.textAlign = layout.textAlign;
+			ctx.fillText(layout.label, layout.textX, 14 + layout.lane * 17);
+		}
 		ctx.restore();
 	});
 }
@@ -668,6 +761,22 @@ function nearestPoint(points, timestamp) {
 	return points[low];
 }
 
+function nearestEventCluster(geometry, logicalX) {
+	var clusters = chartEventClusters(geometry);
+	var nearest = null;
+	var distance = Infinity;
+
+	clusters.forEach(function(cluster) {
+		var candidate = Math.abs(cluster.x - logicalX);
+		if (candidate < distance) {
+			distance = candidate;
+			nearest = cluster;
+		}
+	});
+
+	return distance <= GRAPH_EVENT_CLUSTER_DISTANCE_PX / 2 ? nearest : null;
+}
+
 function bindHover(canvas, geometry, hoverInfo) {
 	canvas.addEventListener('mousemove', function(ev) {
 		if (!geometry.points.length)
@@ -684,6 +793,7 @@ function bindHover(canvas, geometry, hoverInfo) {
 		var timestamp = geometry.firstTimestamp +
 			(geometry.lastTimestamp - geometry.firstTimestamp) * ratio;
 		var point = nearestPoint(geometry.points, timestamp);
+		var eventCluster = nearestEventCluster(geometry, logicalX);
 
 		hoverInfo.textContent = '%s · %s · route %s · rating phase %s (DL %s / UL %s) · grade %s (%s) · RTT %s · transport Δ %s · effective Δ %s · CPU %s · DL %s · UL %s · floors %s/%s'.format(
 			new Date(point.timestamp * 1000).toLocaleString(),
@@ -702,6 +812,8 @@ function bindHover(canvas, geometry, hoverInfo) {
 			formatTrafficRate(point.ul),
 			formatTrafficRate(point.dlFloor),
 			formatTrafficRate(point.ulFloor));
+		if (eventCluster)
+			hoverInfo.textContent += ' · %s: %s'.format(_('events'), eventCluster.label);
 		hoverInfo.style.visibility = 'visible';
 	});
 

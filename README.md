@@ -50,10 +50,10 @@ socket libraries; ordinary OpenWrt runtime dependencies remain explicit below.
 
 The current tree builds these OpenWrt 25.12.5 APKs:
 
-- `cake-autorate-rs-1.0_rc14-r1-x86_64.apk` — x86_64 autorate daemon.
-- `cake-autorate-rs-1.0_rc14-r1-aarch64_generic.apk` — rockchip/armv8
+- `cake-autorate-rs-1.0_rc15-r1-x86_64.apk` — x86_64 autorate daemon.
+- `cake-autorate-rs-1.0_rc15-r1-aarch64_generic.apk` — rockchip/armv8
   autorate daemon.
-- `luci-app-cake-autorate-rs-1.0_rc14-r1.apk` — architecture-independent LuCI
+- `luci-app-cake-autorate-rs-1.0_rc15-r1.apk` — architecture-independent LuCI
   interface and SQM integration.
 
 The daemon package installs `uci`, `fping`, `uclient-fetch`, and `sqm-scripts`
@@ -137,9 +137,8 @@ defaults to Instance, Uplink/State, Quality and Get rating; a global **List
 columns** menu can add route, timestamps, reflectors, RTT, achieved traffic,
 CAKE rates and CPU without restarting the daemon. Desktop Status follows the
 normal LuCI content width, wider optional tables scroll inside that container,
-narrow screens use per-instance cards, and graph events
-share a synchronized two-lane label layout so close LEARNING/route/rating
-markers do not overlap.
+narrow screens use per-instance cards. RC15 supersedes the original graph-event
+label layout described for RC13.
 
 Settings are grouped into Autorate setup, SQM setup, Testing & Auto-Tune,
 Monitoring and Advanced. Every instance row provides **Re-run Auto-Tune**
@@ -163,6 +162,23 @@ accepted into `LAST KNOWN`, `CURRENT` returns to `WAITING FOR DATA` until a new
 loaded episode starts; it never mirrors the retained grade. Starting,
 cancelling, or changing the route clears stale current-attempt data without
 discarding the last complete rating.
+
+RC15 fixes dense graph-event history observed on a long-running Multi-WAN
+router. State, route and completed-rating events that land within 12 screen
+pixels are collapsed into one marker shared by both synchronized charts. The
+marker keeps the complete transition list in its hover text, uses up to three
+collision-safe label lanes, shortens long clusters such as
+`OFFLINE…ACTIVE`, and leaves the marker visible when no label lane is free.
+`LEARNING` remains an uplink-state event and is never duplicated as a quality
+grade. This keeps multi-hour and narrow-screen charts readable without losing
+the underlying timestamps.
+
+The **Autorate setup** editor is now divided into six in-page groups:
+Connection & routing, Rate limits, Adaptive ceiling, Latency probes, Quality &
+rating, and Controller. Switching groups changes only the presentation; all
+options retain their existing UCI names, dependency rules, validation and Save
+& Apply behaviour. The compact group selector becomes a two-column layout on
+narrow screens.
 
 Transport measurement/rating and transport-driven CAKE control are now separate
 options. Measurement can remain enabled for Status and Graphs while
@@ -580,16 +596,16 @@ them together. For x86_64:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc14-r1-x86_64.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc14-r1.apk
+  /root/cake-autorate-rs-1.0_rc15-r1-x86_64.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc15-r1.apk
 ```
 
 For rockchip/armv8 (`aarch64_generic`):
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc14-r1-aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc14-r1.apk
+  /root/cake-autorate-rs-1.0_rc15-r1-aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc15-r1.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:
@@ -609,16 +625,16 @@ x86_64:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc14-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc14-x86_64.sh
+tar -xzf cake-autorate-rs-1.0-rc15-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc15-x86_64.sh
 ```
 
 Banana Pi R2 Pro and other OpenWrt 25.12.5 rockchip/armv8 devices:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc14-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc14-aarch64_generic.sh
+tar -xzf cake-autorate-rs-1.0-rc15-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc15-aarch64_generic.sh
 ```
 
 The installer resolves its own location, so it also works when the extracted

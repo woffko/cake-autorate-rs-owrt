@@ -742,3 +742,55 @@ formatting, nine shell suites, four LuCI JavaScript suites, JavaScript/shell
 syntax, ACL JSON parsing, `git diff --check`, both SDK builds, both empty-root
 offline dependency installs, the `/root/` installer run, and all three router
 browser checks above.
+
+## RC15 graph-event and Autorate-navigation gate (2026-07-15)
+
+RC15 was reproduced against the live multi-hour RAM history from the x86_64
+Multi-WAN router before its daemon was restarted. The captured `wan_sqm`
+history was 566,599 bytes and contained real `ACTIVE → OFFLINE → LEARNING →
+ACTIVE` transitions separated by only seconds on a several-hour timeline. The
+old two-lane renderer placed the third label into an occupied lane. The new
+deterministic test maps the same timestamps to a narrow plot, verifies that
+`LEARNING` is not emitted as a fake quality grade, clusters events within 12
+screen pixels, retains the complete transition list for hover, and guarantees
+that the bounded three-lane label layout never overlaps.
+
+The noarch RC15 LuCI APK was first installed without restarting the daemon, so
+Playwright exercised the corrected renderer against the original history.
+Both synchronized charts used the same clustered markers. Three dense WAN
+transitions occupied three distinct text rows, nearby backup-WAN rating events
+were also separated, and the 390 px page had no horizontal overflow or browser
+exception. After the full package upgrade and controlled daemon restart,
+`wan_sqm` returned to `ACTIVE/RUNNING` and `wanb_sqm` to
+`STANDBY/RUNNING`. The cake-autorate, SQM, network and mwan3 configuration
+hashes were unchanged.
+
+Installed Settings acceptance opened the real Edit modal on both the
+disposable router and the Multi-WAN router. The **Autorate setup** selector had
+exactly six groups with 11, 10, 8, 24, 29 and 20 rendered options respectively.
+Every switch left the inactive option nodes in the same form, exactly one
+tabpanel and one ARIA tab were active, a no-op modal Save parsed successfully,
+and a fresh open retained all groups. At 390 px the selector was a two-column
+grid with no intersecting buttons or body overflow. Configuration hashes on
+the disposable router remained unchanged.
+
+Both OpenWrt 25.12.5 SDK builds completed for x86_64 and
+rockchip/armv8 (`aarch64_generic`). The noarch LuCI package was independently
+built in both SDKs and produced the same SHA-256. Each offline repository
+contains and indexes 65 APKs. With networking and package scripts disabled,
+fresh x86_64 and aarch64_generic roots each selected and installed all 62
+required packages. The x86 bundle installer then ran on the disposable router
+using only its local `packages.adb`, reported RC15 for both packages, restarted
+the existing instance and preserved cake-autorate, SQM and network hashes.
+
+Final RC15 release payload hashes are:
+
+| Artifact | SHA-256 |
+|---|---|
+| x86_64 daemon APK | `9626247b8e2010eded6b77b37e44d62e54c863208004f1d166c567dc20c27346` |
+| aarch64_generic daemon APK | `5b9a79a4a33e46251f320be2d767472d55dc0de861096337d347c863af929e92` |
+| noarch LuCI APK | `87dd08ad700e16cb4e05a5896a12411c6d7b57d767840e186eec148ce5bba814` |
+| x86_64 installer | `66ab3be109de2ebcde1de3c32d7d5ce9e43dbf4762fe91cc1490ec2f9c9a0897` |
+| aarch64_generic installer | `ad74f49645626891c5f71f2bea193052f70ad9e7df3bf53bf450878ed4a52511` |
+| x86_64 offline bundle | `53e57b7764c7607074043e1819b61d7d6f7eb01c2ae1170b6c95c91e54dcc2bf` |
+| rockchip/armv8 offline bundle | `1a750c5dafaba4728de0afe2f95ea638119ccb6c500645feea32a48e57c8d8a1` |

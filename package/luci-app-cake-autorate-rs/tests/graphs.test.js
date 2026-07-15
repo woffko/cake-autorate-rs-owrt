@@ -25,7 +25,7 @@ const windowStub = {
 const loadHelpers = new Function('fs', 'poll', 'uci', 'ui', 'L', 'E', '_', 'window',
 	`${prefix}\nreturn { parseHistory, historyInterval, buildChartGeometry, nearestPoint, ` +
 		'bindHover, bindScroll, scrollState, scrollMaximum, formatMemoryKib, lineConnected, niceRateCeiling, ' +
-		'collectChartEvents, layoutEventLabels };');
+		'collectChartEvents, clusterChartEvents, chartEventClusters, layoutEventLabels };');
 const helpers = loadHelpers({}, {}, {}, {}, {}, () => {}, value => value, windowStub);
 
 function assert(condition, message) {
@@ -37,8 +37,10 @@ assert(source.includes('.cake-graph-fixed-axis{position:absolute;left:0;right:0'
 	'Y-axis labels must stay fixed while the data timeline scrolls');
 assert(source.includes('.cake-graph-chart-title{position:sticky;left:0'),
 	'chart titles must stay fixed while the data timeline scrolls');
-assert(source.includes('laneEnds = [ geometry.left - 8, geometry.left - 8 ]'),
-	'event labels must use a two-lane collision layout');
+assert(source.includes('GRAPH_EVENT_LABEL_LANES = 3'),
+	'event labels must use a bounded three-lane collision layout');
+assert(source.includes('clusterChartEvents'),
+	'nearby state, route, grade and rating events must be clustered');
 assert(source.includes('drawChartEvents(ctx, geometry)') &&
 	source.match(/drawChartEvents\(ctx, geometry\)/g).length >= 3,
 	'latency and traffic charts must draw one synchronized event model');
@@ -114,12 +116,28 @@ const eventGeometry = helpers.buildChartGeometry([
 	{ timestamp: now - 1.99, uplinkState: 'ACTIVE', routeIdentity: 'b', ratingPhase: 'UL', ratingDlSamples: 2, ratingUlSamples: 1, grade: 'A', gradeState: 'final' },
 ], 1, { clientWidth: 390 });
 const events = helpers.collectChartEvents(eventGeometry);
-const layouts = helpers.layoutEventLabels({ measureText: text => ({ width: text.length * 7 }) }, eventGeometry, events);
+const clusters = helpers.clusterChartEvents(eventGeometry, events);
+const layouts = helpers.layoutEventLabels({ measureText: text => ({ width: text.length * 7 }) }, eventGeometry, clusters);
 assert(events.length >= 5, 'route, state, grade and rating events must share one model');
-assert(layouts.every(layout => layout.lane === 0 || layout.lane === 1),
-	'close graph events must be stacked into two event lanes');
-assert(layouts.some(layout => layout.label === 'DL' || layout.label === 'UL' || layout.label === 'ROUTE'),
+assert(clusters.length < events.length && clusters.some(cluster => cluster.events.length >= 3),
+	'events within a few pixels must collapse into one synchronized marker');
+assert(layouts.every(layout => layout.lane >= -1 && layout.lane < 3),
+	'cluster labels must stay in bounded non-overlapping lanes');
+assert(layouts.every(layout => !layout.label || layout.label.length < 40),
 	'crowded event labels must abbreviate while hover retains full data');
+
+const capturedPattern = helpers.buildChartGeometry([
+	{ timestamp: now - 40000, uplinkState: 'ACTIVE', routeIdentity: 'route-a', ratingPhase: 'IDLE' },
+	{ timestamp: now - 10020, uplinkState: 'OFFLINE', routeIdentity: 'route-a', ratingPhase: 'IDLE' },
+	{ timestamp: now - 10010, uplinkState: 'LEARNING', routeIdentity: 'route-a', ratingPhase: 'IDLE', grade: 'LEARNING', gradeState: 'learning_baseline' },
+	{ timestamp: now - 10000, uplinkState: 'ACTIVE', routeIdentity: 'route-a', ratingPhase: 'IDLE' },
+	{ timestamp: now, uplinkState: 'ACTIVE', routeIdentity: 'route-a', ratingPhase: 'IDLE' },
+], 10, { clientWidth: 390 });
+const capturedEvents = helpers.collectChartEvents(capturedPattern);
+const capturedClusters = helpers.clusterChartEvents(capturedPattern, capturedEvents);
+assert(capturedEvents.length === 3, 'LEARNING must not be emitted as a fake A+-F grade event');
+assert(capturedClusters.length === 1 && capturedClusters[0].shortLabel === 'OFFLINE…ACTIVE',
+	'10.0.77.1 OFFLINE -> LEARNING -> ACTIVE pattern must render as one marker');
 
 function eventTarget(properties) {
 	const listeners = {};
@@ -144,6 +162,14 @@ for (const label of ['rating phase', 'grade', 'RTT', 'transport', 'effective', '
 assert(hoverInfo.style.visibility === 'visible', 'hover output should be visible');
 canvas.emit('mouseleave');
 assert(hoverInfo.style.visibility === 'hidden', 'hover output should hide on leave');
+
+const eventHover = { style: {}, textContent: '' };
+const eventCanvas = eventTarget({
+	getBoundingClientRect: () => ({ left: 0, width: eventGeometry.width }),
+});
+helpers.bindHover(eventCanvas, eventGeometry, eventHover);
+eventCanvas.emit('mousemove', { clientX: helpers.chartEventClusters(eventGeometry)[0].x });
+assert(eventHover.textContent.includes('events:'), 'cluster hover must preserve full event details');
 
 const latest = eventTarget({ disabled: true });
 const viewport = eventTarget({ clientWidth: 900, scrollWidth: geometry.width, scrollLeft: 0 });

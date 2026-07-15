@@ -238,6 +238,7 @@ var mwan3Context = {
 var mwan3Capability = {};
 
 var speedtestLastResults = {};
+var autorateSubcategoryStates = {};
 
 function describe(option, key) {
 	var description = optionDescriptions[key];
@@ -2939,6 +2940,160 @@ function topicTab(tab) {
 	return topics[tab] || 'advanced';
 }
 
+function autorateSubcategory(tab, optionName) {
+	if (optionName === '_autorate_topic')
+		return null;
+
+	if (tab === 'general')
+		return 'limits';
+
+	if (tab === 'rates')
+		return optionName.indexOf('adaptive_ceiling_') === 0 ? 'ceiling' : 'limits';
+
+	if (tab === 'reflectors')
+		return 'probes';
+
+	if (tab === 'quality') {
+		if (optionName === 'transport_latency_enabled' ||
+			optionName.indexOf('transport_probe_') === 0 ||
+			optionName === 'transport_load_hold_s' ||
+			optionName === 'transport_cpu_max_percent')
+			return 'probes';
+
+		return 'quality';
+	}
+
+	if (tab === 'latency' || tab === 'controller')
+		return 'controller';
+
+	if (tab === 'setup') {
+		if (optionName === 'manual_rate_limits' ||
+			optionName.indexOf('min_') === 0 || optionName.indexOf('base_') === 0 ||
+			optionName.indexOf('max_') === 0)
+			return 'limits';
+
+		return 'connection';
+	}
+
+	return 'connection';
+}
+
+function autorateSubcategoryDefinitions() {
+	return [
+		{
+			id: 'connection',
+			title: _('Connection & routing'),
+			description: _('Enable the instance, select its uplink and route, and set the normal download and upload rates.')
+		},
+		{
+			id: 'limits',
+			title: _('Rate limits'),
+			description: _('Control which directions may change and, when needed, set explicit minimum, base, and maximum rates.')
+		},
+		{
+			id: 'ceiling',
+			title: _('Adaptive ceiling'),
+			description: _('Configure bounded clean-load probes that can raise the learned-safe ceiling without exceeding absolute caps.')
+		},
+		{
+			id: 'probes',
+			title: _('Latency probes'),
+			description: _('Select ICMP/OWD reflectors and the route-bound transport RTT signal used for quality measurement.')
+		},
+		{
+			id: 'quality',
+			title: _('Quality & rating'),
+			description: _('Tune load detection, guided rating capture, optional transport control, and throughput safety floors.')
+		},
+		{
+			id: 'controller',
+			title: _('Controller'),
+			description: _('Advanced delay thresholds, smoothing, detection windows, and CAKE rate adjustment factors.')
+		}
+	];
+}
+
+function decorateAutorateSubcategories(section, sectionId, containers) {
+	var autorateContainer = containers.querySelector('[data-tab="autorate"]');
+	if (!autorateContainer || autorateContainer.querySelector('.cake-autorate-subnav'))
+		return containers;
+
+	var optionGroups = {};
+	section.children.forEach(function(option) {
+		if (option.cakeAutorateGroup)
+			optionGroups[option.option] = option.cakeAutorateGroup;
+	});
+
+	var definitions = autorateSubcategoryDefinitions();
+	var panels = {};
+	var buttons = {};
+	var nav = E('div', {
+		'class': 'cake-autorate-subnav',
+		'role': 'tablist',
+		'aria-label': _('Autorate settings sections')
+	});
+	var panelRoot = E('div', { 'class': 'cake-autorate-subpanels' });
+
+	definitions.forEach(function(definition) {
+		var panelId = 'cake-autorate-subpanel-%s-%s'.format(sectionId, definition.id);
+		var button = E('button', {
+			'type': 'button',
+			'class': 'btn cbi-button cbi-button-neutral',
+			'role': 'tab',
+			'aria-controls': panelId,
+			'aria-selected': 'false'
+		}, definition.title);
+		var panel = E('div', {
+			'id': panelId,
+			'class': 'cake-autorate-subpanel',
+			'role': 'tabpanel'
+		}, [
+			E('p', { 'class': 'cake-autorate-subdescription' }, definition.description)
+		]);
+
+		button.addEventListener('click', function() {
+			activate(definition.id);
+		});
+		buttons[definition.id] = button;
+		panels[definition.id] = panel;
+		nav.appendChild(button);
+		panelRoot.appendChild(panel);
+	});
+
+	Array.prototype.slice.call(autorateContainer.children).forEach(function(node) {
+		var group = node.getAttribute && optionGroups[node.getAttribute('data-name')];
+		if (group && panels[group])
+			panels[group].appendChild(node);
+	});
+
+	function activate(group) {
+		if (!panels[group])
+			group = definitions[0].id;
+		autorateSubcategoryStates[sectionId] = group;
+
+		definitions.forEach(function(definition) {
+			var active = definition.id === group;
+			panels[definition.id].style.display = active ? '' : 'none';
+			buttons[definition.id].className = active ?
+				'btn cbi-button cbi-button-action' : 'btn cbi-button cbi-button-neutral';
+			buttons[definition.id].setAttribute('aria-selected', active ? 'true' : 'false');
+			buttons[definition.id].setAttribute('tabindex', active ? '0' : '-1');
+		});
+	}
+
+	autorateContainer.appendChild(E('style', {}, [
+		'.cake-autorate-subnav{display:flex;flex-wrap:wrap;gap:5px;margin:12px 0 14px}',
+		'.cake-autorate-subnav .cbi-button{flex:1 1 150px;min-width:0;white-space:normal}',
+		'.cake-autorate-subpanel{min-width:0}',
+		'.cake-autorate-subdescription{margin:0 0 12px;color:var(--text-color-medium,#777)}',
+		'@media(max-width:600px){.cake-autorate-subnav{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.cake-autorate-subnav .cbi-button{width:100%}}'
+	].join('')));
+	autorateContainer.appendChild(nav);
+	autorateContainer.appendChild(panelRoot);
+	activate(autorateSubcategoryStates[sectionId] || definitions[0].id);
+	return containers;
+}
+
 function addTopicIntroduction(section, tab, name, text) {
 	var option = section.taboption(tab, form.DummyValue, name, '');
 	modal(option);
@@ -4087,6 +4242,12 @@ return L.view.extend({
 		};
 		s.addModalOptions = function(modalSection, section_id) {
 			var parse = modalSection.parse;
+			var renderTabContainers = modalSection.renderTabContainers;
+
+			modalSection.renderTabContainers = function(renderSectionId, nodes) {
+				var containers = renderTabContainers.call(this, renderSectionId, nodes);
+				return decorateAutorateSubcategories(this, renderSectionId, containers);
+			};
 
 			modalSection.parse = function() {
 				var validation = validateInstanceSection(this, section_id);
@@ -4110,8 +4271,12 @@ return L.view.extend({
 		var originalTabOption = s.taboption;
 		s.taboption = function(tab) {
 			var args = Array.prototype.slice.call(arguments);
-			args[0] = topicTab(tab);
-			return originalTabOption.apply(this, args);
+			var logicalTab = tab;
+			args[0] = topicTab(logicalTab);
+			var option = originalTabOption.apply(this, args);
+			if (args[0] === 'autorate')
+				option.cakeAutorateGroup = autorateSubcategory(logicalTab, option.option);
+			return option;
 		};
 
 		addTopicIntroduction(s, 'autorate', '_autorate_topic',
