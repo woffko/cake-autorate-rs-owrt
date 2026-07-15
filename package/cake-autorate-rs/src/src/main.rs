@@ -24,7 +24,7 @@ use adaptive_ceiling::{
 };
 use quality_grade::{QualityGradeMetric, QualityGradeResult, QualityGradeTracker};
 use rating_load::{RatingLoadConfig, RatingLoadDetector, RatingLoadSnapshot, RatingPhase};
-use routing::{RouteMode, RouteSnapshot, RouteSpec, UplinkLifecycle, UplinkState};
+use routing::{RouteInspector, RouteMode, RouteSnapshot, RouteSpec, UplinkLifecycle, UplinkState};
 use transport_probe::{RouteBinding, TransportProbeBackend, TransportProbeEngine};
 use transport_quality::{
     classify_quality, effective_latency_delta_ms, throughput_floor, transport_allows_growth,
@@ -38,9 +38,11 @@ const GRAPH_HISTORY_MIN_BUDGET_KIB: u64 = 256;
 const GRAPH_HISTORY_HARD_MAX_KIB: u64 = 100 * 1024;
 const GRAPH_HISTORY_BUDGET_REFRESH_S: u64 = 30;
 const GRAPH_HISTORY_CRITICAL_AVAILABLE_KIB: u64 = 16 * 1024;
-const SQM_RUNTIME_HEALTH_CHECK_S: u64 = 3;
+const SQM_RUNTIME_HEALTH_CHECK_FAST_S: u64 = 3;
+const SQM_RUNTIME_HEALTH_CHECK_HEALTHY_S: u64 = 15;
 const SQM_RUNTIME_RECOVERY_COOLDOWN_S: u64 = 30;
-const RATE_SAMPLE_MIN_INTERVAL: Duration = Duration::from_millis(25);
+const STATUS_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
+const CAKE_GROWTH_UPDATE_MIN_INTERVAL: Duration = Duration::from_millis(100);
 const TRANSPORT_BASELINE_LEARNING_INTERVAL_S: f64 = 1.0;
 
 const UPSTREAM_DEFAULT_REFLECTORS: &[&str] = &[
@@ -1887,6 +1889,7 @@ enum LoadKind {
 struct RateMonitor {
     rx_path: PathBuf,
     tx_path: PathBuf,
+    min_interval: Duration,
     prev_rx: u64,
     prev_tx: u64,
     last: Instant,
@@ -1894,11 +1897,19 @@ struct RateMonitor {
     last_ul_kbps: f64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RateSample {
+    dl_kbps: f64,
+    ul_kbps: f64,
+    fresh: bool,
+}
+
 impl RateMonitor {
-    fn new(rx_path: &str, tx_path: &str) -> io::Result<Self> {
+    fn new(rx_path: &str, tx_path: &str, interval_ms: u64) -> io::Result<Self> {
         Ok(Self {
             rx_path: PathBuf::from(rx_path),
             tx_path: PathBuf::from(tx_path),
+            min_interval: Duration::from_millis(interval_ms.max(25)),
             prev_rx: read_u64_file(rx_path).unwrap_or(0),
             prev_tx: read_u64_file(tx_path).unwrap_or(0),
             last: Instant::now(),
@@ -1907,11 +1918,15 @@ impl RateMonitor {
         })
     }
 
-    fn sample(&mut self) -> (f64, f64) {
+    fn sample(&mut self) -> RateSample {
         let now = Instant::now();
         let interval = now.duration_since(self.last);
-        if interval < RATE_SAMPLE_MIN_INTERVAL {
-            return (self.last_dl_kbps, self.last_ul_kbps);
+        if interval < self.min_interval {
+            return RateSample {
+                dl_kbps: self.last_dl_kbps,
+                ul_kbps: self.last_ul_kbps,
+                fresh: false,
+            };
         }
         let elapsed = interval.as_secs_f64();
         let rx = read_u64_file(&self.rx_path).unwrap_or(self.prev_rx);
@@ -1923,7 +1938,11 @@ impl RateMonitor {
         self.last = now;
         self.last_dl_kbps = dl;
         self.last_ul_kbps = ul;
-        (dl, ul)
+        RateSample {
+            dl_kbps: dl,
+            ul_kbps: ul,
+            fresh: true,
+        }
     }
 }
 
@@ -2104,29 +2123,25 @@ impl TransportProbeRuntime {
         let endpoint = cfg.transport_probe_endpoint.clone();
         thread::spawn(move || {
             let mut engine: Option<(String, TransportProbeEngine)> = None;
+            let mut route_inspector = RouteInspector::new(route_spec.clone());
             while let Ok(request) = request_rx.recv() {
-                let before = routing::inspect_route(&route_spec);
+                let before = route_inspector.inspect();
                 let measurement = match before.as_ref() {
                     Ok(snapshot) if snapshot.online => {
                         let identity = snapshot.stable_key();
                         if backend == TransportProbeBackend::LegacyHttp {
                             let started = Instant::now();
-                            match run_transport_probe(&route_spec, timeout_s, &endpoint) {
-                                Ok(after) if after.stable_key() == identity => {
-                                    Ok(transport_probe::TransportProbeSample {
-                                        backend,
-                                        endpoint: endpoint.clone(),
-                                        rtt_ms: started.elapsed().as_secs_f64() * 1000.0,
-                                        raw_samples_ms: Vec::new(),
-                                        discarded_samples: 0,
-                                        server_processing_ms: 0.0,
-                                        trusted: false,
-                                        connection_reused: false,
-                                    })
-                                }
-                                Ok(_) => {
-                                    Err("route changed during legacy transport probe".to_string())
-                                }
+                            match run_transport_probe(&route_spec, timeout_s, &endpoint, snapshot) {
+                                Ok(()) => Ok(transport_probe::TransportProbeSample {
+                                    backend,
+                                    endpoint: endpoint.clone(),
+                                    rtt_ms: started.elapsed().as_secs_f64() * 1000.0,
+                                    raw_samples_ms: Vec::new(),
+                                    discarded_samples: 0,
+                                    server_processing_ms: 0.0,
+                                    trusted: false,
+                                    connection_reused: false,
+                                }),
                                 Err(error) => Err(error),
                             }
                         } else {
@@ -2166,7 +2181,7 @@ impl TransportProbeRuntime {
                     }),
                     Err(error) => Err(error.clone()),
                 };
-                let after = routing::inspect_route(&route_spec);
+                let after = route_inspector.inspect();
                 let stable_identity = match (&before, &after) {
                     (Ok(before), Ok(after))
                         if before.online
@@ -2416,20 +2431,20 @@ fn run_transport_probe(
     route_spec: &RouteSpec,
     timeout_s: u64,
     endpoint: &str,
-) -> Result<RouteSnapshot, String> {
-    let before = routing::inspect_route(route_spec)?;
-    if !before.online {
-        return Err(if before.reason.is_empty() {
-            format!("route {} is offline", before.identity.mode)
+    snapshot: &RouteSnapshot,
+) -> Result<(), String> {
+    if !snapshot.online {
+        return Err(if snapshot.reason.is_empty() {
+            format!("route {} is offline", snapshot.identity.mode)
         } else {
-            before.reason
+            snapshot.reason.clone()
         });
     }
-    if route_spec.effective_mode()? == RouteMode::Main && !before.active {
-        return Err(if before.reason.is_empty() {
-            format!("main route does not use {}", before.identity.device)
+    if route_spec.effective_mode()? == RouteMode::Main && !snapshot.active {
+        return Err(if snapshot.reason.is_empty() {
+            format!("main route does not use {}", snapshot.identity.device)
         } else {
-            before.reason
+            snapshot.reason.clone()
         });
     }
 
@@ -2445,13 +2460,7 @@ fn run_transport_probe(
             .arg("/dev/null")
             .arg(endpoint);
         match curl.stdout(Stdio::null()).stderr(Stdio::null()).status() {
-            Ok(status) if status.success() => {
-                let after = routing::inspect_route(route_spec)?;
-                if before.stable_key() != after.stable_key() || !after.online {
-                    return Err("route changed during transport probe".to_string());
-                }
-                return Ok(after);
-            }
+            Ok(status) if status.success() => return Ok(()),
             Ok(status) => return Err(format!("curl exited with {status}")),
             Err(error) if error.kind() != io::ErrorKind::NotFound => {
                 return Err(format!("failed to execute curl: {error}"));
@@ -2477,11 +2486,7 @@ fn run_transport_probe(
         return Err(format!("routed uclient-fetch exited with {status}"));
     }
 
-    let after = routing::inspect_route(route_spec)?;
-    if before.stable_key() != after.stable_key() || !after.online {
-        return Err("route changed during transport probe".to_string());
-    }
-    Ok(after)
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -2847,6 +2852,8 @@ struct Controller {
     throughput_floor_ul: f64,
     last_set_dl: u64,
     last_set_ul: u64,
+    last_shaper_attempt_dl: Instant,
+    last_shaper_attempt_ul: Instant,
     last_bb_dl: Instant,
     last_bb_ul: Instant,
     last_decay_dl: Instant,
@@ -2872,6 +2879,7 @@ struct Controller {
     sqm_last_recovery_attempt: Option<Instant>,
     sqm_last_recovery_at: Option<f64>,
     last_status: Option<StatusSnapshot>,
+    last_status_publish: Instant,
 }
 
 impl Controller {
@@ -2898,8 +2906,12 @@ impl Controller {
             None
         };
 
-        let rate_monitor = RateMonitor::new(&cfg.rx_bytes_path, &cfg.tx_bytes_path)
-            .map_err(|e| format!("failed to create rate monitor: {e}"))?;
+        let rate_monitor = RateMonitor::new(
+            &cfg.rx_bytes_path,
+            &cfg.tx_bytes_path,
+            cfg.monitor_achieved_rates_interval_ms,
+        )
+        .map_err(|e| format!("failed to create rate monitor: {e}"))?;
         let cpu_monitor = match CpuMonitor::new() {
             Ok(monitor) => Some(monitor),
             Err(e) => {
@@ -2974,6 +2986,8 @@ impl Controller {
             throughput_floor_ul,
             last_set_dl: 0,
             last_set_ul: 0,
+            last_shaper_attempt_dl: now,
+            last_shaper_attempt_ul: now,
             last_bb_dl: now,
             last_bb_ul: now,
             last_decay_dl: now,
@@ -3002,6 +3016,7 @@ impl Controller {
             sqm_last_recovery_attempt: None,
             sqm_last_recovery_at: None,
             last_status: None,
+            last_status_publish: now.checked_sub(STATUS_PUBLISH_INTERVAL).unwrap_or(now),
             dl_baseline_us: HashMap::new(),
             ul_baseline_us: HashMap::new(),
             dl_ewma_us: HashMap::new(),
@@ -3024,7 +3039,7 @@ impl Controller {
         self.apply_shaper("ul");
     }
 
-    fn sample_rates(&mut self) -> (f64, f64) {
+    fn sample_rates(&mut self) -> RateSample {
         self.rate_monitor.sample()
     }
 
@@ -3053,8 +3068,12 @@ impl Controller {
     }
 
     fn accept_recovered_sqm(&mut self, reason: &str) -> Result<(), String> {
-        self.rate_monitor = RateMonitor::new(&self.cfg.rx_bytes_path, &self.cfg.tx_bytes_path)
-            .map_err(|error| format!("failed to reset interface counters: {error}"))?;
+        self.rate_monitor = RateMonitor::new(
+            &self.cfg.rx_bytes_path,
+            &self.cfg.tx_bytes_path,
+            self.cfg.monitor_achieved_rates_interval_ms,
+        )
+        .map_err(|error| format!("failed to reset interface counters: {error}"))?;
         self.last_set_dl = 0;
         self.last_set_ul = 0;
         self.quality_grade.reset();
@@ -3746,9 +3765,11 @@ impl Controller {
         sample: Sample,
         active_reflectors: &[String],
         health: &ReflectorHealth,
-    ) -> (f64, f64) {
+    ) -> RateSample {
         let now = Instant::now();
-        let (dl_rate, ul_rate) = self.rate_monitor.sample();
+        let rate_sample = self.rate_monitor.sample();
+        let dl_rate = rate_sample.dl_kbps;
+        let ul_rate = rate_sample.ul_kbps;
         let dl_load_pct = percent(dl_rate, self.shaper_dl);
         let ul_load_pct = percent(ul_rate, self.shaper_ul);
 
@@ -3960,7 +3981,7 @@ impl Controller {
             active_reflectors,
             Some(health),
         );
-        (dl_rate, ul_rate)
+        rate_sample
     }
 
     fn maybe_sample_cpu(&mut self) -> bool {
@@ -4323,26 +4344,33 @@ impl Controller {
     }
 
     fn apply_shaper(&mut self, direction: &str) {
-        let (interface, adjust, rate, last) = if direction == "dl" {
+        let is_dl = direction == "dl";
+        let (interface, adjust, rate, last, last_attempt_elapsed) = if is_dl {
             (
                 self.cfg.dl_if.clone(),
                 self.cfg.adjust_dl_shaper_rate,
                 self.shaper_dl,
-                &mut self.last_set_dl,
+                self.last_set_dl,
+                self.last_shaper_attempt_dl.elapsed(),
             )
         } else {
             (
                 self.cfg.ul_if.clone(),
                 self.cfg.adjust_ul_shaper_rate,
                 self.shaper_ul,
-                &mut self.last_set_ul,
+                self.last_set_ul,
+                self.last_shaper_attempt_ul.elapsed(),
             )
         };
         let rounded = rate.round().max(1.0) as u64;
-        if rounded == *last {
+        if !shaper_update_due(last, rounded, last_attempt_elapsed) {
             return;
         }
-        *last = rounded;
+        if is_dl {
+            self.last_shaper_attempt_dl = Instant::now();
+        } else {
+            self.last_shaper_attempt_ul = Instant::now();
+        }
 
         if self.cfg.output_cake_changes {
             self.log(
@@ -4352,6 +4380,11 @@ impl Controller {
         }
 
         if !adjust {
+            if is_dl {
+                self.last_set_dl = rounded;
+            } else {
+                self.last_set_ul = rounded;
+            }
             return;
         }
 
@@ -4367,7 +4400,13 @@ impl Controller {
             .status();
 
         match status {
-            Ok(s) if s.success() => {}
+            Ok(s) if s.success() => {
+                if is_dl {
+                    self.last_set_dl = rounded;
+                } else {
+                    self.last_set_ul = rounded;
+                }
+            }
             Ok(s) => self.log(
                 "ERROR",
                 &format!("tc failed for {interface} with status {s}"),
@@ -4394,19 +4433,40 @@ impl Controller {
         active_reflectors: &[String],
         health: Option<&ReflectorHealth>,
     ) -> io::Result<()> {
-        self.last_status = Some(StatusSnapshot {
-            dl_rate,
-            ul_rate,
-            dl_load_pct,
-            ul_load_pct,
-            dl_delay_count,
-            ul_delay_count,
-            avg_dl_delta,
-            avg_ul_delta,
-            sample: sample.clone(),
-            active_reflectors: active_reflectors.to_vec(),
-            health: health.cloned(),
-        });
+        let publish_due = status_publish_due(self.last_status_publish.elapsed());
+        if let Some(snapshot) = self.last_status.as_mut() {
+            snapshot.dl_rate = dl_rate;
+            snapshot.ul_rate = ul_rate;
+            snapshot.dl_load_pct = dl_load_pct;
+            snapshot.ul_load_pct = ul_load_pct;
+            snapshot.dl_delay_count = dl_delay_count;
+            snapshot.ul_delay_count = ul_delay_count;
+            snapshot.avg_dl_delta = avg_dl_delta;
+            snapshot.avg_ul_delta = avg_ul_delta;
+            snapshot.sample = sample.clone();
+            if publish_due {
+                snapshot.active_reflectors = active_reflectors.to_vec();
+                snapshot.health = health.cloned();
+            }
+        } else {
+            self.last_status = Some(StatusSnapshot {
+                dl_rate,
+                ul_rate,
+                dl_load_pct,
+                ul_load_pct,
+                dl_delay_count,
+                ul_delay_count,
+                avg_dl_delta,
+                avg_ul_delta,
+                sample: sample.clone(),
+                active_reflectors: active_reflectors.to_vec(),
+                health: health.cloned(),
+            });
+        }
+
+        if !publish_due {
+            return Ok(());
+        }
 
         self.write_status_file(
             dl_rate,
@@ -4705,7 +4765,9 @@ impl Controller {
             route_active,
             json_string_or_null(self.route_identity.as_deref()),
         )?;
-        fs::rename(tmp, path)
+        fs::rename(tmp, path)?;
+        self.last_status_publish = Instant::now();
+        Ok(())
     }
 
     fn refresh_status_from_last_sample(&mut self) -> io::Result<()> {
@@ -4835,8 +4897,9 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
 
     let mut controller = Controller::new(cfg.clone())?;
     let route_spec = cfg.route_spec();
+    let mut route_inspector = RouteInspector::new(route_spec.clone());
     let mut uplink_lifecycle = UplinkLifecycle::new();
-    let initial_inspected = routing::inspect_route(&route_spec);
+    let initial_inspected = route_inspector.inspect_fresh();
     let (mut current_route_snapshot, initial_route_error) = match initial_inspected {
         Ok(snapshot) => (Some(snapshot), None),
         Err(error) => (None, Some(error)),
@@ -4892,14 +4955,20 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
     let route_check_interval = Duration::from_secs_f64(cfg.route_check_interval_s);
     let route_stability = Duration::from_secs_f64(cfg.route_stability_s);
     let mut last_route_check = Instant::now();
-    let sqm_health_interval = Duration::from_secs(SQM_RUNTIME_HEALTH_CHECK_S);
+    let sqm_health_fast_interval = Duration::from_secs(SQM_RUNTIME_HEALTH_CHECK_FAST_S);
+    let sqm_health_healthy_interval = Duration::from_secs(SQM_RUNTIME_HEALTH_CHECK_HEALTHY_S);
     let mut last_sqm_health_check = Instant::now()
-        .checked_sub(sqm_health_interval)
+        .checked_sub(sqm_health_healthy_interval)
         .unwrap_or_else(Instant::now);
     let mut route_probes_allowed = initial_transition.probes_allowed;
     external_ip_probe.maybe_start(route_probes_allowed);
 
     while !TERMINATE.load(Ordering::SeqCst) {
+        let sqm_health_interval = if controller.sqm_runtime_healthy {
+            sqm_health_healthy_interval
+        } else {
+            sqm_health_fast_interval
+        };
         if last_sqm_health_check.elapsed() >= sqm_health_interval {
             last_sqm_health_check = Instant::now();
             let (sqm_ready, sqm_recovered) = controller.ensure_managed_sqm();
@@ -4930,7 +4999,7 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
         external_ip_probe.drain(&mut controller);
         if last_route_check.elapsed() >= route_check_interval {
             last_route_check = Instant::now();
-            let inspected = routing::inspect_route(&route_spec);
+            let inspected = route_inspector.inspect();
             let transition = uplink_lifecycle.observe(
                 inspected.as_ref().map_err(|error| error.as_str()),
                 last_route_check,
@@ -5024,7 +5093,7 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                     }
                 }
                 Ok(Err(e)) => {
-                    let inspected = routing::inspect_route(&route_spec);
+                    let inspected = route_inspector.inspect_fresh();
                     let route_is_online = inspected
                         .as_ref()
                         .map(|snapshot| snapshot.online)
@@ -5071,7 +5140,7 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                         continue;
                     }
 
-                    let inspected = routing::inspect_route(&route_spec);
+                    let inspected = route_inspector.inspect_fresh();
                     let route_is_online = inspected
                         .as_ref()
                         .map(|snapshot| snapshot.online)
@@ -5108,8 +5177,14 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
         {
             controller.note_probe_gap();
         }
-        let (dl_rate, ul_rate) = sampled_rates.unwrap_or_else(|| controller.sample_rates());
-        let rating_load = controller.update_rating_load(now, dl_rate, ul_rate);
+        let rate_sample = sampled_rates.unwrap_or_else(|| controller.sample_rates());
+        let dl_rate = rate_sample.dl_kbps;
+        let ul_rate = rate_sample.ul_kbps;
+        let rating_load = if rate_sample.fresh {
+            controller.update_rating_load(now, dl_rate, ul_rate)
+        } else {
+            controller.rating_load_snapshot.clone()
+        };
         if route_probes_allowed {
             if let Some(runtime) = transport_probe.as_mut() {
                 runtime.drain(&mut controller);
@@ -6037,6 +6112,17 @@ fn classify_load(
     }
 }
 
+fn shaper_update_due(last: u64, target: u64, since_last_attempt: Duration) -> bool {
+    if target == last {
+        return false;
+    }
+    last == 0 || target < last || since_last_attempt >= CAKE_GROWTH_UPDATE_MIN_INTERVAL
+}
+
+fn status_publish_due(since_last_publish: Duration) -> bool {
+    since_last_publish >= STATUS_PUBLISH_INTERVAL
+}
+
 fn load_label(kind: LoadKind, bb: bool, prefix: &str) -> String {
     let base = match kind {
         LoadKind::High => "high",
@@ -6956,11 +7042,12 @@ mod tests {
         parse_irtt_duration_us, parse_irtt_line, parse_reflector_candidates,
         parse_tc_linklayer_overhead, parse_tsping_line, parse_uci_values, pinger_command,
         pinger_response_interval_s, qdisc_output_has_cake, reflector_bad_reflectors,
-        reflector_health_json, reflector_spare_reflectors, sample_is_stale,
-        stall_detection_timeout, throughput_floor, transport_error_code,
+        reflector_health_json, reflector_spare_reflectors, sample_is_stale, shaper_update_due,
+        stall_detection_timeout, status_publish_due, throughput_floor, transport_error_code,
         transport_probe_interval_s, transport_result_matches_route, uplink_error_code, Config,
         MemoryInfo, RateMonitor, ReflectorHealth, ReflectorState, Sample, ThroughputGuardInput,
-        UplinkState, TRANSPORT_BASELINE_LEARNING_INTERVAL_S,
+        UplinkState, CAKE_GROWTH_UPDATE_MIN_INTERVAL, STATUS_PUBLISH_INTERVAL,
+        TRANSPORT_BASELINE_LEARNING_INTERVAL_S,
     };
     use std::fs;
     use std::thread;
@@ -7565,18 +7652,50 @@ mod tests {
         let tx = root.join("tx_bytes");
         fs::write(&rx, "0\n").unwrap();
         fs::write(&tx, "0\n").unwrap();
-        let mut monitor = RateMonitor::new(rx.to_str().unwrap(), tx.to_str().unwrap()).unwrap();
+        let mut monitor =
+            RateMonitor::new(rx.to_str().unwrap(), tx.to_str().unwrap(), 200).unwrap();
 
         fs::write(&rx, "1000000\n").unwrap();
         fs::write(&tx, "500000\n").unwrap();
         monitor.last = Instant::now();
-        assert_eq!(monitor.sample(), (0.0, 0.0));
+        let stale = monitor.sample();
+        assert!(!stale.fresh);
+        assert_eq!((stale.dl_kbps, stale.ul_kbps), (0.0, 0.0));
 
-        thread::sleep(Duration::from_millis(30));
-        let (dl, ul) = monitor.sample();
-        assert!(dl > 200_000.0, "download delta was not retained: {dl}");
-        assert!(ul > 100_000.0, "upload delta was not retained: {ul}");
+        thread::sleep(Duration::from_millis(210));
+        let fresh = monitor.sample();
+        assert!(fresh.fresh);
+        let dl = fresh.dl_kbps;
+        let ul = fresh.ul_kbps;
+        assert!(dl > 30_000.0, "download delta was not retained: {dl}");
+        assert!(ul > 15_000.0, "upload delta was not retained: {ul}");
         assert!((dl / ul - 2.0).abs() < 0.01);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cake_growth_is_coalesced_but_reductions_are_immediate() {
+        assert!(!shaper_update_due(
+            800_000,
+            804_000,
+            Duration::from_millis(50)
+        ));
+        assert!(shaper_update_due(
+            800_000,
+            804_000,
+            CAKE_GROWTH_UPDATE_MIN_INTERVAL
+        ));
+        assert!(shaper_update_due(
+            800_000,
+            700_000,
+            Duration::from_millis(0)
+        ));
+        assert!(shaper_update_due(0, 800_000, Duration::from_millis(0)));
+    }
+
+    #[test]
+    fn status_publication_is_bounded_independently_of_control_samples() {
+        assert!(!status_publish_due(Duration::from_millis(249)));
+        assert!(status_publish_due(STATUS_PUBLISH_INTERVAL));
     }
 }

@@ -794,3 +794,74 @@ Final RC15 release payload hashes are:
 | aarch64_generic installer | `ad74f49645626891c5f71f2bea193052f70ad9e7df3bf53bf450878ed4a52511` |
 | x86_64 offline bundle | `53e57b7764c7607074043e1819b61d7d6f7eb01c2ae1170b6c95c91e54dcc2bf` |
 | rockchip/armv8 offline bundle | `1a750c5dafaba4728de0afe2f95ea638119ccb6c500645feea32a48e57c8d8a1` |
+
+## RC16 native tabs and controller CPU gate (2026-07-15)
+
+RC16 keeps the latency controller on every reflector response but moves work
+that does not need probe-rate timing off that hot path. The achieved-rate and
+rating detector follows `monitor_achieved_rates_interval_ms`; atomic status
+publication is bounded to 4 Hz; healthy SQM checks run every 15 seconds and
+return to 3 seconds after a fault; positive CAKE changes are coalesced to 10 Hz
+while reductions remain immediate. Multi-WAN member state is still inspected at
+the configured route interval, with the validated device/source/mark/table
+identity refreshed every 30 seconds or immediately on an error.
+
+A read-only `/usr/libexec/cake-autorate-rs/cpu-profile` helper was used before
+and after the upgrade on the same four-core x86_64 Multi-WAN router. It reads
+`/proc/stat` and per-process self plus waited-child ticks, uses only a temporary
+file in `/tmp`, and reports both one-CPU and total-capacity percentages. The
+30-second RC15 baseline attributed about 6.20% of one CPU to the primary
+daemon, 3.60% to the standby daemon and 0.80% to the persistent pinger/control
+remainder: about 10.6% of one CPU, or 2.65% of four-core capacity. RC16 measured
+1.43% and 1.40% for the two daemons, 0.83% and 0.80% for their two pingers, and
+0.07% for the scheduler: 4.53% of one CPU, or 1.13% total capacity. That is a
+57% reduction for the observed control stack and a 71% reduction for the two
+daemons combined. Whole-router busy time was 2.79%, including 0.57% softirq;
+that value intentionally includes unrelated forwarding, PPPoE, CAKE and other
+router work. A stable 30-second disposable-router sample measured the single
+daemon at 0.37% of one CPU (0.18% of its two-core capacity), with router busy at
+0.60%.
+
+Authenticated Playwright opened the installed Edit modal on the disposable
+router and the production Multi-WAN router. The six groups contained 11, 10,
+8, 24, 29 and 20 options, used native `cbi-tabmenu` with exactly one `cbi-tab`
+and five `cbi-tab-disabled` items, and retained all inactive form nodes.
+Mouse, ArrowRight, Home and End navigation selected the correct ARIA tab. At
+390 px the 712-pixel tab strip scrolled inside a 323-pixel modal content area,
+the document remained exactly 390 pixels wide, and no links overlapped. Graphs
+then rendered one card/two canvases on the disposable router and two stacked
+cards/four canvases on the Multi-WAN router without a browser or console error.
+
+The final local gate passed 105 Rust tests, strict Clippy, Rust formatting,
+nine shell suites, four LuCI JavaScript suites, shell syntax and
+`git diff --check`. Both OpenWrt 25.12.5 SDK builds completed for x86_64 and
+rockchip/armv8 (`aarch64_generic`); independently built noarch LuCI APKs have
+the same SHA-256. Each regenerated offline repository contains 65 APKs. With
+network access and package scripts disabled, fresh x86_64 and
+`aarch64_generic` roots selected and installed all 62 required packages. The
+x86 bundle installer also ran using only its local `packages.adb` on the
+disposable router, reported both RC16 packages, created a dated backup,
+restarted the existing instance, and preserved cake-autorate, SQM and network
+hashes.
+
+The Multi-WAN router retained `wan_sqm` as `ACTIVE` on `pppoe-wan` and
+`wanb_sqm` as `STANDBY` on `eth0`; both managed SQM runtimes remained healthy.
+Its cake-autorate, SQM, network and mwan3 hashes were unchanged across the
+upgrade:
+
+- cake-autorate: `dc285ba5f5b619ee601c82aef40acb8c6a9fc90cff469f93b34422304d94bc69`;
+- SQM: `a328a63cb1252861d070eb7ba53bed97571efdae98445bd518268c674b42a2cb`;
+- network: `ed6d568293ed2d632c51827f5fa3227acaec4ed257359eb9a92b85a355065190`;
+- mwan3: `fea15a18e8f39f4211ee37959759a5892d0f592dd6e105cf147263b4dde67e81`.
+
+Final RC16 release payload hashes are:
+
+| Artifact | SHA-256 |
+|---|---|
+| x86_64 daemon APK | `16fa2093ae592551411739b2ca1bcb497ef78e1a01eae99aca4328641a265b80` |
+| aarch64_generic daemon APK | `71d27e6d73ca65e21d03bff341bba66a96a5350e16e3fdd1711d77d98d737d0f` |
+| noarch LuCI APK | `4cf7b544c51ebfc760fb14ff3832c0c683519d35477ef99c34b559862e660d4a` |
+| x86_64 installer | `756950eae6b58332c3e2b8ce5ec42948281e315341a903a97c689cb8372e62cc` |
+| aarch64_generic installer | `7a459d1db7c17cbb01381aad3c82e33112dafcec7271146cd3de15d9caa2cb43` |
+| x86_64 offline bundle | `98ae66fc3373f7b4fe5301fb3c714458313ce8d71a93d0b69229985db4709cea` |
+| rockchip/armv8 offline bundle | `dc901656e376fc66e45e9171b9d06dccdd75877e7eef039e54d8184d8ea26dff` |

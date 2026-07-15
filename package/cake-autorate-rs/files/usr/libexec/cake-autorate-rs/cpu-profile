@@ -1,0 +1,90 @@
+#!/bin/sh
+
+duration="${1:-30}"
+case "$duration" in
+	''|*[!0-9]*) echo "usage: cpu-profile [SECONDS]" >&2; exit 2 ;;
+esac
+[ "$duration" -ge 5 ] 2>/dev/null && [ "$duration" -le 300 ] 2>/dev/null || {
+	echo "duration must be between 5 and 300 seconds" >&2
+	exit 2
+}
+
+state="$(mktemp /tmp/cake-autorate-cpu.XXXXXX)" || exit 1
+trap 'rm -f "$state"' EXIT INT TERM
+hz="$(getconf CLK_TCK 2>/dev/null)"
+case "$hz" in ''|*[!0-9]*) hz=100 ;; esac
+cores="$(grep -c '^cpu[0-9]' /proc/stat 2>/dev/null)"
+case "$cores" in ''|*[!0-9]*|0) cores=1 ;; esac
+
+process_ticks() {
+	pid="$1"
+	[ -r "/proc/$pid/stat" ] || return 1
+	set -- $(cat "/proc/$pid/stat")
+	printf '%s\n' "$((${14} + ${15} + ${16} + ${17}))"
+}
+
+system_ticks() {
+	read -r _ user nice system idle iowait irq softirq steal _ < /proc/stat
+	busy="$((user + nice + system + irq + softirq + steal))"
+	total="$((busy + idle + iowait))"
+	printf '%s %s %s\n' "$total" "$busy" "$softirq"
+}
+
+remember() {
+	pid="$1"
+	kind="$2"
+	ticks="$(process_ticks "$pid")" || return 0
+	command="$(tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
+	[ -n "$command" ] || command="[$kind]"
+	printf '%s|%s|%s|%s\n' "$pid" "$ticks" "$kind" "$command" >> "$state"
+}
+
+# BusyBox pgrep -x compares the complete argv[0] on some OpenWrt builds, so an
+# absolute executable path does not match the short process name.  Anchor the
+# full command line instead; this also avoids counting this profiler itself.
+for pid in $(pgrep -f '^/usr/sbin/cake-autorated ' 2>/dev/null); do
+	remember "$pid" daemon
+done
+for name in fping fping-ts tsping irtt; do
+	for pid in $(pgrep -x "$name" 2>/dev/null); do remember "$pid" probe; done
+done
+for pid in $(pgrep -f '/cake-autorate-rs/autotune-scheduler run' 2>/dev/null); do
+	remember "$pid" scheduler
+done
+
+[ -s "$state" ] || {
+	echo "no cake-autorate processes found" >&2
+	exit 1
+}
+
+set -- $(system_ticks)
+total_before="$1"
+busy_before="$2"
+softirq_before="$3"
+sleep "$duration"
+set -- $(system_ticks)
+total_delta="$(($1 - total_before))"
+busy_delta="$(($2 - busy_before))"
+softirq_delta="$(($3 - softirq_before))"
+
+printf 'Window: %ss; clock: %s Hz; logical CPUs: %s\n' "$duration" "$hz" "$cores"
+awk -v busy="$busy_delta" -v softirq="$softirq_delta" -v total="$total_delta" '
+	BEGIN {
+		if (total <= 0) total = 1
+		printf "Router busy: %.2f%%; softirq: %.2f%% of total capacity\n", busy * 100 / total, softirq * 100 / total
+	}'
+
+while IFS='|' read -r pid before kind command; do
+	after="$(process_ticks "$pid")" || {
+		printf '%-9s pid %-6s exited during measurement: %s\n' "$kind" "$pid" "$command"
+		continue
+	}
+	delta="$((after - before))"
+	awk -v kind="$kind" -v pid="$pid" -v ticks="$delta" -v hz="$hz" \
+		-v seconds="$duration" -v cores="$cores" -v command="$command" '
+		BEGIN {
+			one = ticks * 100 / hz / seconds
+			total = one / cores
+			printf "%-9s pid %-6s %6.2f%% of one CPU; %6.2f%% total: %s\n", kind, pid, one, total, command
+		}'
+done < "$state"

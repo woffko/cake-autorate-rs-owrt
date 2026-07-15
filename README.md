@@ -116,9 +116,11 @@ contamination reason.
 RC12 fixes a directional measurement race found on a floating backup WAN. The
 fast controller, detected-rating classifier, transport trigger, and graph
 history now share the same per-interval RX/TX sample instead of consuming the
-counter delta twice. Counter bursts closer than 25 ms are coalesced so clustered
-reflector replies cannot create a false high-load peak. Managed instances also verify the real CAKE qdiscs, IFB
-counter, and ingress redirect every three seconds. A missing runtime is shown
+counter delta twice. Counter bursts closer than the configured achieved-rate
+interval (with a 25 ms hard minimum) are coalesced so clustered reflector
+replies cannot create a false high-load peak. Managed instances also verify the
+real CAKE qdiscs, IFB counter, and ingress redirect every 15 seconds while
+healthy and every three seconds after a failure. A missing runtime is shown
 as an error, blocks `Get rating`, and is repaired only for that managed SQM
 target with a 30-second retry cooldown; successful recovery resets stale
 baselines and counter state before measurement resumes. Until the transport
@@ -173,12 +175,28 @@ collision-safe label lanes, shortens long clusters such as
 grade. This keeps multi-hour and narrow-screen charts readable without losing
 the underlying timestamps.
 
+RC16 gives the six Autorate groups the same native LuCI tab treatment as the
+main editor sections. They use `cbi-tabmenu`, `cbi-tab`, and
+`cbi-tab-disabled`, support arrow/Home/End keyboard navigation, and scroll
+inside their own tab strip on narrow screens instead of widening the page.
+
+RC16 also reduces idle controller overhead without lowering the latency-control
+sample rate. RTT decisions still consume every probe reply, while byte-counter
+and rating work follows the configured achieved-rate interval, status JSON is
+published at most four times per second, healthy SQM validation relaxes from 3
+to 15 seconds, and increases in CAKE bandwidth are coalesced to at most 10
+updates per second. Rate reductions remain immediate. Multi-WAN route checks
+still observe member state at the configured interval, but reuse the validated
+route identity and perform the heavier device/source/mark/table refresh every
+30 seconds or immediately after an error. The installed `cpu-profile` helper
+separates daemon/probe/scheduler CPU from whole-router busy and softirq time.
+
 The **Autorate setup** editor is now divided into six in-page groups:
 Connection & routing, Rate limits, Adaptive ceiling, Latency probes, Quality &
 rating, and Controller. Switching groups changes only the presentation; all
 options retain their existing UCI names, dependency rules, validation and Save
-& Apply behaviour. The compact group selector becomes a two-column layout on
-narrow screens.
+& Apply behaviour. The selector uses the same native LuCI tabs as the outer
+editor and becomes a horizontally scrollable tab strip on narrow screens.
 
 Transport measurement/rating and transport-driven CAKE control are now separate
 options. Measurement can remain enabled for Status and Graphs while
@@ -251,6 +269,10 @@ Implemented:
 - sysfs RX/TX byte counter sampling.
 - CPU usage sampling from `/proc/stat` is always exposed in runtime status;
   `output_cpu_stats` and `output_cpu_raw_stats` control log records only.
+  The Status value is whole-router utilization. Run
+  `/usr/libexec/cake-autorate-rs/cpu-profile 30` to measure the daemon,
+  persistent pingers and scheduler separately, including short-lived child
+  work waited by each daemon.
 - adaptive rate calculations using delay/load windows.
 - Optional Rust-only bounded-probe ceiling extension, disabled by default so
   the upstream configured maximum remains a hard limit. When enabled, each
@@ -702,6 +724,7 @@ cat /var/run/cake-autorate/wan_sqm/status.json
 /usr/libexec/cake-autorate-rs/speedtest wan_sqm "" status auto
 /usr/libexec/cake-autorate-rs/quality-test wan_sqm status
 /usr/libexec/cake-autorate-rs/mqtt-status wan_sqm status
+/usr/libexec/cake-autorate-rs/cpu-profile 30
 ```
 
 For a no-shaper smoke test, disable both shaper adjustment flags:

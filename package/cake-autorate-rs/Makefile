@@ -3,7 +3,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=cake-autorate-rs
-PKG_VERSION:=1.0_rc15
+PKG_VERSION:=1.0_rc16
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=woffko
@@ -60,6 +60,7 @@ define Package/cake-autorate-rs/install
 	$(INSTALL_BIN) ./files/usr/libexec/cake-autorate-rs/mqtt-publisher $(1)/usr/libexec/cake-autorate-rs/mqtt-publisher
 	$(INSTALL_BIN) ./files/usr/libexec/cake-autorate-rs/mqtt-status $(1)/usr/libexec/cake-autorate-rs/mqtt-status
 	$(INSTALL_BIN) ./files/usr/libexec/cake-autorate-rs/sqm-recover $(1)/usr/libexec/cake-autorate-rs/sqm-recover
+	$(INSTALL_BIN) ./files/usr/libexec/cake-autorate-rs/cpu-profile $(1)/usr/libexec/cake-autorate-rs/cpu-profile
 endef
 
 $(eval $(call BuildPackage,cake-autorate-rs))
