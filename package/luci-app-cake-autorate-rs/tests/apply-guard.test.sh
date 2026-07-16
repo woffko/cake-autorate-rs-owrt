@@ -59,9 +59,10 @@ EOF
 fingerprint="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 cat > "$autotune/wan_sqm/result.json" <<EOF
 {
-  "state":"complete", "schema_version":4,
+  "state":"complete", "schema_version":5,
   "producer":"cake-autorate-rs-autotune", "profile":"best_overall",
-  "auto_apply_eligible":true,
+  "run_id":"apply-guard-test-run", "auto_apply_eligible":true,
+  "manual_apply_eligible":true,
   "phase_evidence_complete":true, "phase_contamination_seen":false,
   "runtime_restored":true, "recovery_pending":false,
   "configuration_written":false, "conservative":false,
@@ -75,11 +76,14 @@ cat > "$autotune/wan_sqm/result.json" <<EOF
   "validation_thresholds":{"candidate_realization_min_percent":80,
     "candidate_realization_max_percent":110,"capacity_retention_min_percent":80,
     "delay_max_ms":30,"loss_max_percent":3,"cpu_max_percent":85},
-  "validation":{"pass":true,"contaminated":false,"correction":{"action":"none","feasible":true}},
+  "validation":{"profile":"best_overall","pass":true,"hard_pass":true,
+    "quality_target_met":true,"actual_grade":"A","effective_delta_ms":10,
+    "contaminated":false,"correction":{"action":"none","feasible":true}},
   "pinger_plan":{"recommended_method":"fping","recommended_no_pingers":3,
     "recommended_reflectors":["1.1.1.1","9.9.9.9","8.8.8.8"]},
   "proposal":{
-    "schema_version":2,"profile":"best_overall","target_grade":"A",
+    "schema_version":3,"profile":"best_overall","target_grade":"A",
+    "quality_target_required":true,"throughput_priority":false,
     "download":{"minimum_kbps":40000,"base_kbps":80000,"maximum_kbps":90000,
       "absolute_cap_kbps":95000,"observed_low_kbps":85000,"observed_median_kbps":88000,
       "observed_high_kbps":92000},
@@ -105,7 +109,7 @@ chmod 600 "$autotune/wan_sqm/result.json"
 
 cp "$autotune/wan_sqm/result.json" "$work/result.valid"
 sed -i 's/"base_kbps":80000/"base_kbps":0/' "$autotune/wan_sqm/result.json"
-if $helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 "$fingerprint" >/dev/null 2>&1; then
+if $helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint" >/dev/null 2>&1; then
 	echo "apply guard armed an invalid proposal" >&2
 	exit 1
 fi
@@ -121,11 +125,14 @@ node - "$work/result.valid" "$autotune/wan_sqm/result.json" <<'EOF'
 const fs = require('node:fs');
 const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 result.profile = 'gaming';
+result.validation.profile = 'gaming';
 result.validation_thresholds.capacity_retention_min_percent = 70;
 result.validation_thresholds.delay_max_ms = 5;
 result.validation_thresholds.loss_max_percent = 1;
 result.proposal.profile = 'gaming';
 result.proposal.target_grade = 'A+';
+result.proposal.quality_target_required = true;
+result.proposal.throughput_priority = false;
 result.proposal.validation.capacity_retention_min_percent = 70;
 result.proposal.validation.icmp_delta_max_ms = 5;
 result.proposal.validation.transport_delta_max_ms = 5;
@@ -143,7 +150,7 @@ result.proposal.sqm = {
 };
 fs.writeFileSync(process.argv[3], JSON.stringify(result));
 EOF
-gaming_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 "$fingerprint")"
+gaming_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint")"
 gaming_token="$(printf '%s\n' "$gaming_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
 [ "$(uci -c "$guard/$gaming_token/expected" -q get cake-autorate.wan_sqm.autotune_profile)" = gaming ]
 [ "$(uci -c "$guard/$gaming_token/expected" -q get cake-autorate.wan_sqm.quality_target_delay_ms)" = 5 ]
@@ -160,7 +167,7 @@ uci -q set sqm.cake_autorate_apply_wan_sqm=queue
 uci -q set sqm.cake_autorate_apply_wan_sqm.enabled=1
 uci -q set sqm.cake_autorate_apply_wan_sqm.interface=user-owned
 cp "$config/sqm" "$work/sqm.with-collision"
-if $helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 "$fingerprint" >/dev/null 2>&1; then
+if $helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint" >/dev/null 2>&1; then
 	echo "apply guard reused a preexisting SQM enrollment section" >&2
 	exit 1
 fi
@@ -170,7 +177,7 @@ cmp -s "$work/sqm.with-collision" "$config/sqm" || {
 }
 cp "$work/sqm.before-collision" "$config/sqm"
 
-arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 "$fingerprint")"
+arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint")"
 printf '%s\n' "$arm" | grep -q '"state":"armed"'
 token="$(printf '%s\n' "$arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
 [ "${#token}" -eq 64 ]
@@ -327,10 +334,108 @@ fi
 [ "$(sed -n '1p' "$APPLY_GUARD_SQM_INIT_STATE")" = enabled ]
 $helper verify-init | grep -q '"state":"clear"'
 
-# A reviewed-but-disabled existing instance must not require live qdiscs. Init
-# removes its default managed queue and the postcheck requires daemon absence.
+# Fair may explicitly recommend disabling SQM only when a complete unshaped
+# control is no worse for latency and improves both directions. The guarded
+# transaction preserves the owned queue as disabled and proves all runtime
+# shaping state has disappeared.
+node - "$work/result.valid" "$autotune/wan_sqm/result.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+result.profile = 'fair';
+result.auto_apply_eligible = false;
+result.manual_apply_eligible = true;
+result.validation_thresholds.capacity_retention_min_percent = 90;
+result.validation_thresholds.delay_max_ms = 200;
+result.validation_thresholds.loss_max_percent = 5;
+result.validation = {
+	profile: 'fair',
+	pass: false,
+	hard_pass: true,
+	quality_target_met: false,
+	actual_grade: 'D',
+	effective_delta_ms: 220,
+	contaminated: false,
+	correction: { action: 'infeasible', feasible: false }
+};
+result.proposal.profile = 'fair';
+result.proposal.target_grade = 'C';
+result.proposal.quality_target_required = false;
+result.proposal.throughput_priority = true;
+result.proposal.validation.capacity_retention_min_percent = 90;
+result.proposal.validation.icmp_delta_max_ms = 200;
+result.proposal.validation.transport_delta_max_ms = 200;
+result.proposal.validation.loss_max_percent = 5;
+result.fair_outcome = {
+	mode: 'sqm-disable-recommended',
+	target_grade: 'C',
+	target_delta_ms: 200,
+	capacity_floor_percent: 90,
+	actual_grade: 'D',
+	actual_effective_delta_ms: 220,
+	recommended_action: 'disable_sqm',
+	allowed_actions: [ 'apply_sqm', 'keep_current', 'disable_sqm' ],
+	disable_sqm_available: true,
+	comparison_reason: 'no-material-latency-benefit-with-throughput-cost',
+	no_sqm_control: {
+		available: true,
+		measurement_evidence: {
+			valid: true,
+			reason: 'ok',
+			test_direction: 'both',
+			shaper_bypassed: true,
+			sqm_paused: true
+		},
+		grade: 'D',
+		effective_delta_ms: 218,
+		throughput: { download_kbps: 85000, upload_kbps: 22000 },
+		forwarded_background: {
+			available: true,
+			contaminated: false,
+			duration_s: 20,
+			download_kbps: 100,
+			upload_kbps: 50,
+			download_limit_kbps: 1700,
+			upload_limit_kbps: 1000
+		}
+	},
+	throughput_gain_without_sqm: { download_percent: 3, upload_percent: 3 }
+};
+fs.writeFileSync(process.argv[3], JSON.stringify(result));
+EOF
+cp "$autotune/wan_sqm/result.json" "$work/result.fair-disable"
+node - "$work/result.fair-disable" "$autotune/wan_sqm/result.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+result.fair_outcome.throughput_gain_without_sqm.upload_percent = 1.9;
+fs.writeFileSync(process.argv[3], JSON.stringify(result));
+EOF
+if $helper arm wan_sqm pppoe-wan speedtest-go main '' 0 0 disable_sqm "$fingerprint" >/dev/null 2>&1; then
+	echo "apply guard accepted a no-SQM recommendation below the bidirectional gain threshold" >&2
+	exit 1
+fi
+node - "$work/result.fair-disable" "$autotune/wan_sqm/result.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+result.fair_outcome.no_sqm_control.measurement_evidence.sqm_paused = false;
+fs.writeFileSync(process.argv[3], JSON.stringify(result));
+EOF
+if $helper arm wan_sqm pppoe-wan speedtest-go main '' 0 0 disable_sqm "$fingerprint" >/dev/null 2>&1; then
+	echo "apply guard accepted a no-SQM recommendation without SQM-pause proof" >&2
+	exit 1
+fi
+node - "$work/result.fair-disable" "$autotune/wan_sqm/result.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+result.fair_outcome.no_sqm_control.forwarded_background.contaminated = true;
+fs.writeFileSync(process.argv[3], JSON.stringify(result));
+EOF
+if $helper arm wan_sqm pppoe-wan speedtest-go main '' 0 0 disable_sqm "$fingerprint" >/dev/null 2>&1; then
+	echo "apply guard accepted a no-SQM recommendation with contaminated background traffic" >&2
+	exit 1
+fi
+cp "$work/result.fair-disable" "$autotune/wan_sqm/result.json"
 export APPLY_GUARD_DAEMON_RUNNING=0
-disabled_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 0 0 "$fingerprint")"
+disabled_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 0 0 disable_sqm "$fingerprint")"
 disabled_token="$(printf '%s\n' "$disabled_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
 cp "$guard/$disabled_token/expected/cake-autorate" "$config/cake-autorate"
 uci -q set sqm.cake_autorate_apply_wan_sqm=cake_autorate_apply_guard
@@ -340,7 +445,10 @@ uci -q set sqm.cake_autorate_apply_wan_sqm._autotune_apply_fingerprint="$fingerp
 uci -q set sqm.cake_autorate_apply_wan_sqm._autotune_apply_token="$disabled_token"
 $helper verify-init >/dev/null
 cp "$guard/$disabled_token/expected/sqm" "$config/sqm"
+rmdir "$work/sys/ifb4pppoe-wan"
 APPLY_GUARD_TC_ACTIVE=0 $helper postcheck "$disabled_token" >/dev/null
+[ "$(uci -q get sqm.cake_wan_sqm.enabled)" = 0 ]
+[ "$(uci -q get sqm.cake_wan_sqm._cake_autorate_managed)" = wan_sqm ]
 $helper prepare-confirm "$disabled_token" >/dev/null
 # Simulate loss of all tmpfs proof after successful prepare-confirm. Persistent
 # configuration must contain no token-dependent marker and init must stay clear.
@@ -392,7 +500,7 @@ after_missing="$(find "$guard" -mindepth 1 -maxdepth 1 -type d | wc -l)"
 orphan_token=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 mkdir "$guard/$orphan_token"
 touch -d '5 minutes ago' "$guard/$orphan_token"
-orphan_replacement="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 0 0 "$fingerprint")"
+orphan_replacement="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 0 0 disable_sqm "$fingerprint")"
 orphan_replacement_token="$(printf '%s\n' "$orphan_replacement" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
 [ ! -e "$guard/$orphan_token" ]
 $helper abort "$orphan_replacement_token" >/dev/null
@@ -403,22 +511,22 @@ capacity_tokens=
 capacity_first=
 capacity_index=0
 while [ "$capacity_index" -lt 8 ]; do
-	capacity_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 0 0 "$fingerprint")"
+	capacity_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 0 0 disable_sqm "$fingerprint")"
 	capacity_token="$(printf '%s\n' "$capacity_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
 	[ -n "$capacity_token" ]
 	[ -n "$capacity_first" ] || capacity_first="$capacity_token"
 	capacity_tokens="${capacity_tokens:+$capacity_tokens }$capacity_token"
 	capacity_index=$((capacity_index + 1))
 done
-if $helper arm wan_sqm pppoe-wan speedtest-go main '' 0 0 "$fingerprint" >/dev/null 2>&1; then
+if $helper arm wan_sqm pppoe-wan speedtest-go main '' 0 0 disable_sqm "$fingerprint" >/dev/null 2>&1; then
 	echo "apply guard exceeded its live-token capacity" >&2
 	exit 1
 fi
 sed -i 's/^expires_epoch=.*/expires_epoch=0/' "$guard/$capacity_first/meta"
-replacement_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 0 0 "$fingerprint")"
+replacement_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 0 0 disable_sqm "$fingerprint")"
 replacement_token="$(printf '%s\n' "$replacement_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
 [ ! -e "$guard/$capacity_first" ]
-if $helper arm wan_sqm pppoe-wan speedtest-go main '' 0 0 "$fingerprint" >/dev/null 2>&1; then
+if $helper arm wan_sqm pppoe-wan speedtest-go main '' 0 0 disable_sqm "$fingerprint" >/dev/null 2>&1; then
 	echo "apply guard capacity was not re-enforced after GC" >&2
 	exit 1
 fi

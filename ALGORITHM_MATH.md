@@ -173,7 +173,7 @@ already sits below the measured link. For example, `A/C = 92.5%` and `A/O =
 combination retained too little observed capacity. Calling both values
 "retention" loses the information needed to choose a correction.
 
-RC18 selects a profile before proposal construction. Let `L` be observed-low
+RC19 selects a profile before proposal construction. Let `L` be observed-low
 capacity and `H` observed-high capacity for one direction. The proposal tuple
 is:
 
@@ -201,11 +201,14 @@ The profile also fixes the validation contract:
 |---|---:|---:|---:|---:|
 | Gaming | 0.70 | 5 ms | 1% | A+ |
 | Best overall | 0.80 | 30 ms | 3% | A |
-| Fair | 0.90 | 60 ms | 5% | B |
+| Fair | 0.90 | 200 ms | 5% | C |
 
 All profiles use the same 80–110% realization interval and 85% CPU ceiling.
 These target grades describe the local loaded-delay contract; they are not a
 guarantee about remote servers, Wi-Fi, ISP policy or another bottleneck.
+Gaming and Best overall require every quality gate. Fair marks its class-C
+latency gates as a quality goal while retaining measurement integrity,
+realization, 90% capacity, CPU, route and background evidence as hard gates.
 
 The packaged hard realization gate is two-sided:
 
@@ -252,7 +255,8 @@ loss, and CPU as explicit gates. Its correction state is then:
 - `retry-measurement` when realization is outside the trustworthy range and a
   single repeat may distinguish noise from invalid shaper enforcement;
 - directional `increase` when quality is clean and only that direction misses
-  retention;
+  retention, bounded below observed-low capacity (`0.95 * O` for Gaming/Best
+  overall and `1.00 * O` for throughput-first Fair);
 - bounded `decrease` for adverse loaded evidence, never below `C_required` or
   the configured minimum;
 - `infeasible` when the safety floor and rate/quality constraints have no
@@ -260,9 +264,38 @@ loss, and CPU as explicit gates. Its correction state is then:
 - `none` after all gates pass.
 
 No diagnostic score overrides a failed gate. A contaminated phase, missing
-telemetry, changed route identity, incomplete result, or `infeasible` decision
-is reviewable evidence but cannot be Auto-Applied. See
-[AUTOTUNE.md](AUTOTUNE.md) for the complete job state machine.
+telemetry, changed route identity or incomplete result cannot be applied.
+Gaming/Best overall also reject `infeasible`. Fair may expose its
+highest-throughput hard-safe candidate manually when only the optional class-C
+target is unmet; it can never become scheduled Auto-Apply.
+
+### Fair no-SQM comparison
+
+Let `S_dl,S_ul` be achieved throughput for the best hard-safe shaped Fair
+candidate and `U_dl,U_ul` the simultaneous bidirectional unshaped control:
+
+```text
+gain_dl = 100 * (U_dl / S_dl - 1)
+gain_ul = 100 * (U_ul / S_ul - 1)
+```
+
+The disable-SQM suggestion exists only when all of these are true:
+
+```text
+grade_unshaped <= grade_shaped
+delta_unshaped <= delta_shaped + 10 ms
+gain_dl >= 2%
+gain_ul >= 2%
+```
+
+The control must additionally prove `test_direction=both`,
+`shaper_bypassed=true`, `sqm_paused=true`, no temporary shaper, and available
+non-contaminated forwarded-background counters whose DL/UL rates do not exceed
+their phase limits. This is a comparison result, not a controller transition.
+LuCI never preselects it, the user must confirm it, and Apply Guard verifies
+that the disabled instance leaves no daemon, CAKE qdisc, IFB or ingress
+redirect. The saved instance/queue configuration is retained with enable flags
+off so the action remains reversible.
 
 The diagnostic validation score is the minimum normalized margin across all
 gates. For a minimum gate it is `100 * actual / limit`; for a maximum gate it

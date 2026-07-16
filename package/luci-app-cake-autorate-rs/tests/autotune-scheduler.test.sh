@@ -33,15 +33,22 @@ case "$expression" in
 		[ "$attestation" = 0 ] && emit "${RESULT_STATE-complete}" || emit "${ATTEST_STATE-ready}"
 		;;
 	@.schema_version)
-		[ "$attestation" = 0 ] && emit "${RESULT_SCHEMA_VERSION-4}" || emit "${ATTEST_SCHEMA_VERSION-1}"
+		[ "$attestation" = 0 ] && emit "${RESULT_SCHEMA_VERSION-5}" || emit "${ATTEST_SCHEMA_VERSION-1}"
 		;;
 	@.producer) emit "${RESULT_PRODUCER-cake-autorate-rs-autotune}" ;;
 	@.profile) emit "${RESULT_PROFILE-best_overall}" ;;
-	@.proposal.schema_version) emit "${RESULT_PROPOSAL_SCHEMA_VERSION-2}" ;;
+	@.run_id) emit "${RESULT_RUN_ID-scheduler-test-run}" ;;
+	@.validation.profile) emit "${RESULT_VALIDATION_PROFILE-${RESULT_PROFILE-best_overall}}" ;;
+	@.proposal.schema_version) emit "${RESULT_PROPOSAL_SCHEMA_VERSION-3}" ;;
 	@.proposal.profile) emit "${RESULT_PROPOSAL_PROFILE-${RESULT_PROFILE-best_overall}}" ;;
 	@.proposal.target_grade) emit "${RESULT_TARGET_GRADE-A}" ;;
+	@.proposal.quality_target_required) emit "${RESULT_QUALITY_TARGET_REQUIRED-true}" ;;
+	@.proposal.throughput_priority) emit "${RESULT_THROUGHPUT_PRIORITY-false}" ;;
 	@.validation.pass) emit "${RESULT_VALIDATION_PASS-true}" ;;
+	@.validation.hard_pass) emit "${RESULT_VALIDATION_HARD_PASS-true}" ;;
+	@.validation.quality_target_met) emit "${RESULT_QUALITY_TARGET_MET-true}" ;;
 	@.auto_apply_eligible) emit "${RESULT_AUTO_APPLY_ELIGIBLE-true}" ;;
+	@.manual_apply_eligible) emit "${RESULT_MANUAL_APPLY_ELIGIBLE-true}" ;;
 	@.confidence_mode) emit "${RESULT_CONFIDENCE_MODE-normal}" ;;
 	@.validation.contaminated) emit "${RESULT_VALIDATION_CONTAMINATED-false}" ;;
 	@.phase_evidence_complete) emit "${RESULT_PHASE_EVIDENCE_COMPLETE-true}" ;;
@@ -54,6 +61,7 @@ case "$expression" in
 	@.validation.gates\[\*\].code)
 		emit "${RESULT_GATE_CODES-download-candidate-realization upload-candidate-realization download-candidate-realization-maximum upload-candidate-realization-maximum download-capacity-retention upload-capacity-retention download-icmp-latency download-transport-latency download-packet-loss download-cpu upload-icmp-latency upload-transport-latency upload-packet-loss upload-cpu}"
 		;;
+	@.validation.gates\[\*\].required) emit "${RESULT_GATE_REQUIRED-true true true true true true true true true true true true true true}" ;;
 	@.validation.gates\[\*\].pass) emit "${RESULT_GATE_PASSES-true true true true true true true true true true true true true true}" ;;
 	@.validation.gates\[\*\].actual) emit "${RESULT_GATE_ACTUALS-90 90 90 90 90 90 10 10 0 40 10 10 0 40}" ;;
 	@.validation.gates\[\*\].limit) emit "${RESULT_GATE_LIMITS-80 80 110 110 80 80 30 30 3 85 30 30 3 85}" ;;
@@ -397,20 +405,28 @@ reset_case() {
 	unset SERVICE_MUTATE_KEY SERVICE_MUTATE_VALUE MISSING_KEY
 	unset CONFIG_ROUTE_MODE CONFIG_MWAN3_MEMBER
 	unset ATTEST_STATE ATTEST_SCHEMA_VERSION ATTEST_TARGET_INTERFACE ATTEST_RESOLVED_INTERFACE ATTEST_ROUTE_INTERFACE ATTEST_SOURCE_IP ATTEST_EXTERNAL_IP ATTEST_ROUTE_MODE ATTEST_MWAN3_MEMBER ATTEST_ROUTE_IDENTITY
-	unset RESULT_CORRECTION_ACTION RESULT_CORRECTION_FEASIBLE RESULT_GATE_CODES RESULT_GATE_PASSES RESULT_GATE_ACTUALS RESULT_GATE_LIMITS RESULT_GATE_COMPARISONS
-	unset RESULT_PRODUCER RESULT_PROFILE RESULT_PROPOSAL_SCHEMA_VERSION RESULT_PROPOSAL_PROFILE RESULT_TARGET_GRADE
+	unset RESULT_CORRECTION_ACTION RESULT_CORRECTION_FEASIBLE RESULT_GATE_CODES RESULT_GATE_REQUIRED RESULT_GATE_PASSES RESULT_GATE_ACTUALS RESULT_GATE_LIMITS RESULT_GATE_COMPARISONS
+	unset RESULT_PRODUCER RESULT_PROFILE RESULT_RUN_ID RESULT_VALIDATION_PROFILE RESULT_PROPOSAL_SCHEMA_VERSION RESULT_PROPOSAL_PROFILE RESULT_TARGET_GRADE
+	unset RESULT_QUALITY_TARGET_REQUIRED RESULT_THROUGHPUT_PRIORITY RESULT_VALIDATION_HARD_PASS RESULT_QUALITY_TARGET_MET RESULT_MANUAL_APPLY_ELIGIBLE
 	unset RESULT_REALIZATION_MIN_PERCENT RESULT_REALIZATION_MAX_PERCENT RESULT_RETENTION_PERCENT RESULT_ICMP_DELTA_MAX_MS RESULT_DELAY_MAX_MS RESULT_LOSS_MAX_PERCENT RESULT_CPU_MAX_PERCENT
 	unset RESULT_SQM_QDISC RESULT_SQM_SCRIPT RESULT_SQM_CLASSIFICATION RESULT_SQM_SQUASH_DSCP RESULT_SQM_SQUASH_INGRESS RESULT_SQM_INGRESS_ECN RESULT_SQM_EGRESS_ECN RESULT_SQM_IQDISC_OPTS RESULT_SQM_EQDISC_OPTS
 	unset RESULT_MINIMUM_KBPS RESULT_BASE_KBPS RESULT_MAXIMUM_KBPS RESULT_CAP_KBPS RESULT_OBSERVED_LOW_KBPS RESULT_OBSERVED_MEDIAN_KBPS RESULT_OBSERVED_HIGH_KBPS RESULT_ACTIVE_THRESHOLD_KBPS RESULT_ADJUST_UP_MS RESULT_DELAY_MS RESULT_ADJUST_DOWN_MS RESULT_HOLD_S RESULT_GROWTH_PERCENT RESULT_PROBE_S RESULT_COOLDOWN_S RESULT_TTL_S RESULT_LINK_OVERHEAD RESULT_LINK_MPU RESULT_CONFIDENCE
 	export RESULT_STATE=complete
-	export RESULT_SCHEMA_VERSION=4
+	export RESULT_SCHEMA_VERSION=5
 	export RESULT_PRODUCER=cake-autorate-rs-autotune
 	export RESULT_PROFILE=best_overall
-	export RESULT_PROPOSAL_SCHEMA_VERSION=2
+	export RESULT_RUN_ID=scheduler-test-run
+	export RESULT_VALIDATION_PROFILE=best_overall
+	export RESULT_PROPOSAL_SCHEMA_VERSION=3
 	export RESULT_PROPOSAL_PROFILE=best_overall
 	export RESULT_TARGET_GRADE=A
+	export RESULT_QUALITY_TARGET_REQUIRED=true
+	export RESULT_THROUGHPUT_PRIORITY=false
 	export RESULT_VALIDATION_PASS=true
+	export RESULT_VALIDATION_HARD_PASS=true
+	export RESULT_QUALITY_TARGET_MET=true
 	export RESULT_AUTO_APPLY_ELIGIBLE=true
+	export RESULT_MANUAL_APPLY_ELIGIBLE=true
 	export RESULT_CONFIDENCE_MODE=normal
 	export RESULT_VALIDATION_CONTAMINATED=false
 	export RESULT_PHASE_EVIDENCE_COMPLETE=true
@@ -469,6 +485,7 @@ assert_global_lock_released
 # targets under the same rollback journal.
 reset_case
 export RESULT_PROFILE=gaming
+export RESULT_VALIDATION_PROFILE=gaming
 export RESULT_PROPOSAL_PROFILE=gaming
 export RESULT_TARGET_GRADE=A+
 export RESULT_RETENTION_PERCENT=70
@@ -500,15 +517,22 @@ export RESULT_PROPOSAL_ADAPTIVE_ENABLED=true
 apply_result test '{}' "$fingerprint_a" eth0
 ! grep -q 'adaptive_ceiling_enabled' "$log"
 
-reset_case; export RESULT_SCHEMA_VERSION=3; expect_gate_rejection 'legacy schema'
+reset_case; export RESULT_SCHEMA_VERSION=4; expect_gate_rejection 'legacy schema'
 reset_case; export RESULT_SCHEMA_VERSION=__missing__; expect_gate_rejection 'unknown schema'
 reset_case; export RESULT_PRODUCER=foreign; expect_gate_rejection 'foreign result producer'
+reset_case; export RESULT_RUN_ID=__missing__; expect_gate_rejection 'missing immutable run identity'
 reset_case; export RESULT_PROFILE=gaming; expect_gate_rejection 'profile/policy mismatch'
-reset_case; export RESULT_PROPOSAL_SCHEMA_VERSION=1; expect_gate_rejection 'legacy proposal schema'
+reset_case; export RESULT_VALIDATION_PROFILE=fair; expect_gate_rejection 'validation profile mismatch'
+reset_case; export RESULT_PROPOSAL_SCHEMA_VERSION=2; expect_gate_rejection 'legacy proposal schema'
 reset_case; export RESULT_PROPOSAL_PROFILE=fair; expect_gate_rejection 'proposal profile mismatch'
+reset_case; export RESULT_QUALITY_TARGET_REQUIRED=false; expect_gate_rejection 'tampered quality-target policy'
+reset_case; export RESULT_THROUGHPUT_PRIORITY=true; expect_gate_rejection 'tampered throughput-priority policy'
 reset_case; export RESULT_STATE=failed; expect_gate_rejection 'non-complete result'
 reset_case; export RESULT_VALIDATION_PASS=false; expect_gate_rejection 'failed validation'
+reset_case; export RESULT_VALIDATION_HARD_PASS=false; expect_gate_rejection 'failed hard safety gates'
+reset_case; export RESULT_QUALITY_TARGET_MET=false; expect_gate_rejection 'unmet unattended quality target'
 reset_case; export RESULT_AUTO_APPLY_ELIGIBLE=false; expect_gate_rejection 'helper-ineligible result'
+reset_case; export RESULT_MANUAL_APPLY_ELIGIBLE=false; expect_gate_rejection 'non-reviewable result'
 reset_case; export RESULT_CONFIDENCE_MODE=low; expect_gate_rejection 'low-confidence result'
 reset_case; export RESULT_VALIDATION_CONTAMINATED=true; expect_gate_rejection 'contaminated validation'
 reset_case; export RESULT_PHASE_EVIDENCE_COMPLETE=false; expect_gate_rejection 'incomplete phase evidence'
@@ -521,6 +545,7 @@ reset_case; export RESULT_CONFIGURATION_WRITTEN=__missing__; expect_gate_rejecti
 reset_case; export RESULT_CORRECTION_ACTION=increase; expect_gate_rejection 'non-none correction'
 reset_case; export RESULT_CORRECTION_FEASIBLE=false; expect_gate_rejection 'infeasible correction'
 reset_case; export RESULT_GATE_PASSES='true true true true true true true false true true true true true true'; expect_gate_rejection 'one failed directional gate'
+reset_case; export RESULT_GATE_REQUIRED='true true true true true true false true true true true true true true'; expect_gate_rejection 'forged optional best-overall latency gate'
 reset_case; export RESULT_GATE_CODES='download-candidate-realization upload-candidate-realization download-candidate-realization-maximum upload-candidate-realization-maximum download-capacity-retention upload-capacity-retention download-icmp-latency download-transport-latency download-packet-loss download-cpu upload-icmp-latency upload-transport-latency upload-packet-loss'; expect_gate_rejection 'missing directional gate'
 reset_case; export RESULT_GATE_CODES='download-candidate-realization upload-candidate-realization download-candidate-realization-maximum upload-candidate-realization-maximum download-capacity-retention upload-capacity-retention download-icmp-latency download-transport-latency download-packet-loss download-cpu upload-icmp-latency upload-transport-latency upload-packet-loss upload-packet-loss'; expect_gate_rejection 'duplicate directional gate'
 reset_case; export RESULT_GATE_ACTUALS='90 90 90 90 90 90 10 10 nan 40 10 10 0 40'; expect_gate_rejection 'malformed gate metric'

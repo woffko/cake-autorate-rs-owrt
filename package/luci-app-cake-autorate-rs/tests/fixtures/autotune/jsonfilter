@@ -32,8 +32,17 @@ case "$expression" in
 	'@.profile')
 		printf '%s\n' "$input" | sed -n 's/.*"profile":"\([^"]*\)".*/\1/p'
 		;;
+	'@.run_id')
+		printf '%s\n' "$input" | sed -n 's/.*"run_id":"\([^"]*\)".*/\1/p'
+		;;
 	'@.target_grade')
 		printf '%s\n' "$input" | sed -n 's/.*"target_grade":"\([^"]*\)".*/\1/p'
+		;;
+	'@.quality_target_required')
+		printf '%s\n' "$input" | sed -n 's/.*"quality_target_required":\(true\|false\).*/\1/p'
+		;;
+	'@.throughput_priority')
+		printf '%s\n' "$input" | sed -n 's/.*"throughput_priority":\(true\|false\).*/\1/p'
 		;;
 	'@.target_interface')
 		printf '%s\n' "$input" | sed -n 's/.*"target_interface":"\([^"]*\)".*/\1/p'
@@ -51,7 +60,7 @@ case "$expression" in
 		printf '%s\n' "$input" | sed -n 's/.*"route_identity":"\([^"]*\)".*/\1/p'
 		;;
 	'@.available')
-		printf '%s\n' true
+		printf '%s\n' "$input" | sed -n 's/.*"available":\(true\|false\).*/\1/p'
 		;;
 	'@.selected_backend')
 		printf '%s\n' "$input" | sed -n 's/.*"selected_backend":"\([^"]*\)".*/\1/p'
@@ -239,8 +248,47 @@ case "$expression" in
 	'@.sqm_paused')
 		printf '%s\n' "$input" | sed -n 's/.*"sqm_paused":\(true\|false\).*/\1/p'
 		;;
+	'@.forwarded_background.available')
+		printf '%s\n' "$input" | sed -n 's/.*"forwarded_background":{[^}]*"available":\(true\|false\).*/\1/p'
+		;;
+	'@.forwarded_background.contaminated')
+		printf '%s\n' "$input" | sed -n 's/.*"forwarded_background":{[^}]*"contaminated":\(true\|false\).*/\1/p'
+		;;
+	'@.forwarded_background.download_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"forwarded_background":{[^}]*"download_kbps":\([0-9.][0-9.]*\).*/\1/p'
+		;;
+	'@.forwarded_background.upload_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"forwarded_background":{[^}]*"upload_kbps":\([0-9.][0-9.]*\).*/\1/p'
+		;;
+	'@.forwarded_background.download_limit_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"forwarded_background":{[^}]*"download_limit_kbps":\([0-9.][0-9.]*\).*/\1/p'
+		;;
+	'@.forwarded_background.upload_limit_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"forwarded_background":{[^}]*"upload_limit_kbps":\([0-9.][0-9.]*\).*/\1/p'
+		;;
 	'@.pass')
-		printf '%s\n' "$input" | sed -n 's/^{"schema_version":[0-9][0-9]*,"pass":\(true\|false\),.*/\1/p'
+		printf '%s\n' "$input" | sed -n 's/^.*"pass":\(true\|false\),.*/\1/p'
+		;;
+	'@.hard_pass')
+		printf '%s\n' "$input" | sed -n 's/^.*"hard_pass":\(true\|false\),.*/\1/p'
+		;;
+	'@.quality_target_met')
+		printf '%s\n' "$input" | sed -n 's/^.*"quality_target_met":\(true\|false\),.*/\1/p'
+		;;
+	'@.actual_grade')
+		printf '%s\n' "$input" | sed -n 's/^.*"actual_grade":"\([^"]*\)".*/\1/p'
+		;;
+	'@.grade')
+		printf '%s\n' "$input" | sed -n 's/^.*"grade":"\([^"]*\)".*/\1/p'
+		;;
+	'@.effective_delta_ms')
+		printf '%s\n' "$input" | sed -n 's/^.*"effective_delta_ms":\([0-9.][0-9.]*\).*/\1/p'
+		;;
+	'@.throughput.download_kbps')
+		printf '%s\n' "$input" | sed -n 's/^.*"throughput":{"download_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.throughput.upload_kbps')
+		printf '%s\n' "$input" | sed -n 's/^.*"throughput":{[^}]*"upload_kbps":\([0-9][0-9]*\).*/\1/p'
 		;;
 	'@.score')
 		printf '%s\n' "$input" | sed -n 's/^.*"score":\([0-9.][0-9.]*\),"metrics".*/\1/p'

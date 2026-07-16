@@ -11,13 +11,13 @@ median throughput become P20/P50 capacity references, the throughput guard is
 enabled, and native transport-latency monitoring is enabled for the created
 instance.
 
-> **RC18 status:** the profile-aware proposal, validation, temporary SQM,
+> **RC19 status:** the profile-aware proposal, validation, temporary SQM,
 > attestation, apply and rollback paths passed deterministic Rust/shell/LuCI
 > tests, both OpenWrt architecture builds, disposable x86 execution of every
 > profile, production Multi-WAN and ARM checks, and authenticated
 > desktop/mobile Playwright validation. Full Auto-Tune remains fail-closed:
-> only a complete passing Review whose profile and policy match throughout the
-> job can be applied.
+> only a complete passing Review, or an explicitly typed hard-safe Fair
+> fallback, whose profile and policy match throughout the job can be applied.
 
 ## Safety contract
 
@@ -25,9 +25,18 @@ instance.
   `/tmp/cake-autorate-autotune/<job>/`; they never write router flash.
 - The browser starts and polls a router-side process. Closing LuCI does not
   strand an rpcd request or partially write a configuration.
-- `cancel` terminates the complete job process group. The existing speed-test
-  helper owns temporary SQM/autorate suspension and restores it from its signal
-  trap.
+- Every speed-test phase starts stopped, is identity-checked, publishes its
+  process group into the recovery journal, and only then resumes in an isolated
+  session. Timeout or cancel sends bounded TERM followed by KILL to the complete
+  group. A helper exit code remains authoritative even when it printed valid
+  JSON first.
+- Phase output is written to one root-owned bounded raw file in RAM. It is
+  promoted atomically only after exact exit status zero and strict validation
+  that it contains one JSON object. Failed raw output remains diagnostic and
+  can never become a successful sample.
+- Completed/failed job snapshots are retained only in bounded RAM history.
+  The default keeps at most five terminal runs and 2 MiB per instance; the
+  oldest entries are discarded first and reboot clears all history.
 - Preflight requires a resolved, up interface, a global IPv4 address, and a
   validated route identity. This may be the active main/default WAN or a
   specific online nftables mwan3 member whose L3 device matches the target.
@@ -66,7 +75,7 @@ second latency signal is deliberate: mobile carriers may prioritize ICMP while
 TCP is still badly queued. The validator returns typed gates and either accepts
 the candidate, requests one measurement retry, proposes a bounded directional
 correction, or declares the requirements infeasible. Full Auto-Tune remains
-experimental, but the RC18 x86_64 Multi-WAN and ARM acceptance gates have
+experimental, but the RC19 x86_64 Multi-WAN and ARM acceptance gates have
 passed.
 
 ## Calibration profiles
@@ -80,13 +89,17 @@ temporary shaped validation and final configuration.
 |---|---|---:|---:|---:|---:|---|
 | Gaming | Lowest latency, with more throughput headroom available to CAKE | A+ | 70% | 5 ms | 1% | `layer_cake.qos`, `diffserv4`, preserve DSCP |
 | Best overall | Recommended latency/throughput balance | A | 80% | 30 ms | 3% | `piece_of_cake.qos`, best effort |
-| Fair | Favor sustained large transfers while retaining bounded latency | B | 90% | 60 ms | 5% | `piece_of_cake.qos`, best effort |
+| Fair | Favor sustained large transfers; aim for bounded latency when capacity permits | C | 90% | 200 ms | 5% | `piece_of_cake.qos`, best effort |
 
 The grades are target classes, not promises about an ISP, server, Wi-Fi client
 or unrelated bottleneck. Every profile also requires 80–110% candidate
 realization and no more than 85% total router CPU during either shaped
-direction. If target delay and the retained-capacity floor have no legal
-intersection, the result is infeasible and cannot be applied.
+direction. Gaming and Best overall require their complete target contract.
+Fair treats class C as a quality goal while its measurement-integrity,
+realization, retained-capacity, CPU, route and background gates remain hard.
+If class C cannot be reached above the 90% floor, Review may retain the best
+hard-safe shaped candidate as a manual throughput fallback. It is never
+Auto-Applied.
 
 Best overall is the default for new jobs and for existing instances which do
 not yet have `autotune_profile`. The old `balanced` CLI value is accepted as an
@@ -112,7 +125,9 @@ overall when upstream markings are not trusted.
    quiet retry, or require explicit one-run conservative consent.
 5. `throughput`: run two unshaped download/upload samples. `speedtest-go`
    validates the first good automatically selected server. Its ID is passed as
-   a job-local hard pin to the second raw run and every shaped run.
+   a job-local hard pin to the second raw run and every shaped run. For Fair,
+   the second sample also collects simultaneous ICMP, persistent transport,
+   CPU and forwarded-background evidence as the controlled no-SQM comparison.
 6. `proposal`: call the Rust daemon's pure `--autotune-proposal` mode.
 7. `shaped`: temporarily apply CAKE at proposed base rates, run the same test
    server with SQM bypass disabled, and concurrently collect rate-limited ICMP
@@ -124,8 +139,8 @@ overall when upstream markings are not trusted.
    safety-floor-bounded reduction for adverse loaded evidence. There is no
    open-ended search.
 10. `review`: return raw runs, every validation attempt, baseline, reflector
-    plan, route identity, phase-background evidence, detected link, and an
-    apply-ready proposal only when the final validation passed.
+    plan, route identity, phase-background evidence, detected link, and either
+    a passing proposal or the explicitly typed Fair manual choices.
 
 The RPC-facing helper uses the same explicit route and profile identity for
 start, polling, cancellation and live attestation:
@@ -154,6 +169,10 @@ adaptive-ceiling cap can never rise. Background above max(35% of the current
 directional reference, 5 Mbit/s) makes that direction unusable: re-tuning an
 existing instance retains its complete min/base/max/cap tuple, while a new
 instance without confirmed values fails closed.
+
+Conservative output is diagnostic-only in RC19. It shows the safer suggested
+values and why evidence was weak, but it does not expose Apply and scheduled
+Auto-Apply never consumes it.
 
 The phase counters are independent of that initial quiet check. Their evidence
 is stored with the run as `available`, `contaminated`, duration, observed DL/UL
@@ -262,10 +281,12 @@ three separately.
 The hard gates are independent of the diagnostic score. The packaged job
 requires candidate realization in the closed 80..110% range and uses the
 selected profile's retention, latency and loss limits from the table above.
-All profiles require CPU no greater than 85%. Proposal schema 2 carries the
-canonical profile, target grade, exact validation thresholds and complete SQM
-recommendation; result schema 4 binds that policy to the job identity and
-configuration fingerprint. The standalone Rust CLI has defensive fallback
+All profiles require CPU no greater than 85%. Proposal schema 3 carries the
+canonical profile, target grade, whether that target is a hard requirement,
+the throughput-priority flag, exact validation thresholds and complete SQM
+recommendation. Result schema 5 binds that policy, the immutable run identity,
+phase evidence and recovery state to the job identity and configuration
+fingerprint. The standalone Rust CLI has defensive fallback
 thresholds, but the job always passes the proposal's validated profile values
 explicitly. The diagnostic score is the worst normalized gate margin: a
 minimum gate contributes `100 * actual / limit`, a maximum gate contributes
@@ -325,12 +346,12 @@ All rate results are rounded to 100 kbit/s. Its decisions are:
   maximum cannot reach the required floor;
 - `none`: every hard gate passed.
 
-`infeasible` is a result, not permission to violate the throughput floor. A
-failed, incomplete, strictly contaminated, or infeasible run keeps its evidence
-for diagnosis but exposes no apply action. A passing conservative result may be
-accepted manually from Review with a prominent LOW-confidence warning, but is
-never eligible for scheduled Auto-Apply. Main-route jobs require the target to
-be the active default device. Structured Multi-WAN jobs route ICMP, native
+`infeasible` is a result, not permission to violate the throughput floor.
+Gaming and Best overall expose no apply action after an infeasible result.
+Fair may still expose its highest-throughput hard-safe shaped candidate when
+only the optional class-C quality target remains unmet. Failed, incomplete,
+strictly contaminated or conservative runs remain diagnostic-only. Main-route
+jobs require the target to be the active default device. Structured Multi-WAN jobs route ICMP, native
 transport sockets, and the selected speed-test backend through the same
 validated member. Baseline and loaded observations remain bound to the selected
 route identity; throughput and shaped phases additionally recheck external IPv4
@@ -343,9 +364,34 @@ temporary shaper, an unrealized/over-realized candidate after its one bounded
 retry, and similar ambiguous observations end as `INCONCLUSIVE` with an
 explicit retry reason. `FAILED` is reserved for a valid complete measurement
 which proves that the configured safety floor and quality limits have no legal
-intersection. Neither state exposes Apply or replaces the active settings.
+intersection. Neither state exposes Apply or replaces the active settings,
+except for the specific complete Fair hard-safe outcome described above;
+measurement-integrity failures never qualify for it.
 
-When a passing Review is applied, LuCI uses a guarded UCI transaction rather
+## Fair Review outcomes
+
+Fair separates a throughput-first decision from unattended quality approval:
+
+1. **Apply the best safe Fair SQM candidate** keeps the measured 90% throughput
+   floor. It is automatic only when class C is met; otherwise it is an explicit
+   manual choice.
+2. **Keep current settings** closes a re-run without writing configuration, or
+   cancels creation of a new instance.
+3. **Disable autorate and SQM** appears only for an existing managed instance
+   when a simultaneous bidirectional unshaped control is valid, SQM was proved
+   paused, no temporary shaper existed, forwarded-background counters were
+   available and clean, the no-SQM grade is no worse, its effective delay is
+   no more than 10 ms above the shaped candidate, and both download and upload
+   improve by at least 2%.
+
+The third action is a comparison suggestion, never the preselected choice.
+The user must select it and confirm a red warning. Apply Guard then preserves
+the instance and owned queue configuration as disabled, restarts the normal
+service transaction, and proves that no instance daemon, target/IFB CAKE qdisc,
+ingress/clsact redirect or owned IFB remains. Any ambiguous postcondition rolls
+back. Scheduled Auto-Apply can never choose this action.
+
+When an eligible Review action is applied, LuCI uses a guarded UCI transaction rather
 than treating a browser RPC success as sufficient proof. The guard snapshots
 the complete `cake-autorate` and `sqm` packages, starts the normal rollback
 window, verifies the exact daemon/qdisc/IFB/redirect runtime, removes its
@@ -359,12 +405,16 @@ remains recoverable rather than being declared successful.
 Rust unit tests cover every stable/variable profile matrix, profile aliases,
 Gaming `diffserv4`, invalid samples, JSON output, three-ratio separation, typed
 gates, measurement retry, directional increase, safety-floor-bounded decrease,
-and infeasible correction. The shell lifecycle test uses isolated mock helpers
+infeasible correction, Fair target/fallback separation and no-SQM comparison.
+The shell lifecycle test uses isolated mock helpers
 to verify profile/job binding, exact temporary CAKE tokens, progress/result
 output, job-local server pinning, reflector diversity, one-second ICMP pacing,
-persistent transport parsing, phase-background evidence, RAM-only state,
-process-group cancellation, and both speed-test and temporary shaper cleanup
-traps. Real-router acceptance also checks per-member route identity and that
+persistent transport parsing, phase-background evidence, bounded RAM history,
+valid-JSON/nonzero-exit rejection, atomic result publication, process-group
+timeout/cancellation, orphan cleanup, recovery, and both speed-test and
+temporary shaper cleanup traps. Apply Guard tests reject incomplete,
+contaminated, one-direction, below-2%-gain and runtime-residue disable
+attempts. Real-router acceptance also checks per-member route identity and that
 the unselected autorate/SQM instance continues running.
 
 ## Optional scheduler

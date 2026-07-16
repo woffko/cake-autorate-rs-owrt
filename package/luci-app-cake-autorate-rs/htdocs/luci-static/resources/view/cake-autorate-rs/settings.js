@@ -99,7 +99,7 @@ var optionDescriptions = {
 	throughput_reference_dl_p50_kbps: 'Optional download median capacity from Full Auto-Tune.',
 	throughput_reference_ul_p20_kbps: 'Optional upload 20th-percentile capacity from Full Auto-Tune.',
 	throughput_reference_ul_p50_kbps: 'Optional upload median capacity from Full Auto-Tune.',
-	autotune_profile: 'Profile used by the next manual or scheduled Full Auto-Tune run. Gaming targets A+ and enables diffserv4, Best overall targets A, and Fair targets B while preserving more throughput.',
+	autotune_profile: 'Profile used by the next manual or scheduled Full Auto-Tune run. Gaming targets A+ and enables diffserv4, Best overall targets A, and Fair prioritizes throughput with a conditional class-C target and an explicit evidence-backed no-SQM fallback.',
 	scheduled_autotune_enabled: 'Periodically run the validated Full Auto-Tune workflow only inside the configured quiet window. Disabled by default.',
 	scheduled_autotune_interval_hours: 'Minimum hours between successful scheduled calibrations.',
 	scheduled_autotune_idle_window_s: 'Traffic must remain below the active threshold for this long before a scheduled test may start.',
@@ -1355,7 +1355,7 @@ function speedtestJobDelay() {
 
 var AUTOTUNE_RECOVERY_MAX_POLLS = 12;
 var AUTOTUNE_RECOVERY_MAX_DELAY_MS = 5000;
-var AUTOTUNE_RESULT_SCHEMA_VERSION = 4;
+var AUTOTUNE_RESULT_SCHEMA_VERSION = 5;
 var AUTOTUNE_RESULT_PRODUCER = 'cake-autorate-rs-autotune';
 
 function canonicalAutotuneProfile(value) {
@@ -1381,6 +1381,8 @@ function autotuneProfilePolicy(value) {
 		return {
 			id: profile,
 			targetGrade: 'A+',
+			qualityTargetRequired: true,
+			throughputPriority: false,
 			retentionPercent: 70,
 			delayMaxMs: 5,
 			lossMaxPercent: 1,
@@ -1401,6 +1403,8 @@ function autotuneProfilePolicy(value) {
 		return {
 			id: profile,
 			targetGrade: 'A',
+			qualityTargetRequired: true,
+			throughputPriority: false,
 			retentionPercent: 80,
 			delayMaxMs: 30,
 			lossMaxPercent: 3,
@@ -1420,9 +1424,11 @@ function autotuneProfilePolicy(value) {
 	case 'fair':
 		return {
 			id: profile,
-			targetGrade: 'B',
+			targetGrade: 'C',
+			qualityTargetRequired: false,
+			throughputPriority: true,
 			retentionPercent: 90,
-			delayMaxMs: 60,
+			delayMaxMs: 200,
 			lossMaxPercent: 5,
 			cpuMaxPercent: 85,
 			sqm: {
@@ -1459,8 +1465,8 @@ function autotuneProfileDefinitions() {
 		{
 			id: 'fair',
 			title: _('Fair'),
-			target: _('Target B or better · under 60 ms'),
-			description: _('Favors large sustained transfers with a 90% capacity safety floor while retaining bounded bufferbloat control.')
+			target: _('Throughput first · aim for C or better · under 200 ms'),
+			description: _('Keeps at least 90% of measured capacity. If the quality target conflicts with that floor, it presents the best safe SQM candidate and may offer an evidence-backed option to disable SQM.')
 		}
 	];
 }
@@ -1478,9 +1484,12 @@ function autotuneProposalMatchesProfile(result) {
 		return first != null && second != null && Math.abs(first - second) < 0.000001;
 	};
 
-	if (!proposal || !policy || autotuneNumber(proposal.schema_version) !== 2 ||
+	if (!proposal || !policy || autotuneNumber(proposal.schema_version) !== 3 ||
 	    canonicalAutotuneProfile(proposal.profile) !== profile ||
-	    proposal.target_grade !== policy.targetGrade || !validation || !thresholds || !sqm)
+	    proposal.target_grade !== policy.targetGrade ||
+	    proposal.quality_target_required !== policy.qualityTargetRequired ||
+	    proposal.throughput_priority !== policy.throughputPriority ||
+	    !validation || !thresholds || !sqm)
 		return false;
 
 	if (!sameNumber(validation.candidate_realization_min_percent, 80) ||
@@ -1683,8 +1692,8 @@ function runAutotuneJob(section_id, wan, backend, onProgress, routeMode, mwan3Me
 					return poll();
 				}
 
-				if (!autotuneResultValidated(result)) {
-					var invalid = new Error(_('Full Auto-Tune ended without a validated proposal.'));
+				if (!autotuneResultHasReviewChoice(result)) {
+					var invalid = new Error(_('Full Auto-Tune ended without a safe reviewable result.'));
 					invalid.autotuneResult = result;
 					throw invalid;
 				}
@@ -2133,13 +2142,28 @@ function wizardSqmQueueText(state) {
 }
 
 function writeWizardConfig(section_id, state) {
+	var autotuneAction = state.autotune_action || 'apply_sqm';
 	/* Auto-Tune data is untrusted until the complete result passes the same
 	 * fail-closed predicate used by Next, Review and Apply.  Keep this guard at
 	 * the staging boundary as a final defence against stale wizard state. */
 	if ((state.mode === 'autotune' ||
 	    (state.autotune_result && state.autotune_proposal)) &&
-	    !autotuneResultValidated(state.autotune_result))
+	    !autotuneResultReviewable(state.autotune_result, autotuneAction))
 		throw new Error(_('Refusing to stage an unvalidated Auto-Tune proposal.'));
+	if (autotuneAction === 'keep_current')
+		throw new Error(_('Keeping the current settings must not create a configuration transaction.'));
+	if (autotuneAction === 'disable_sqm') {
+		if (!uci.get('cake-autorate', section_id))
+			throw new Error(_('SQM can be disabled only for an existing instance.'));
+		/* Preserve every learned and user-edited parameter. The guarded service
+		 * restart disables this instance and its owned queue, then proves that
+		 * the daemon, CAKE qdiscs, redirect and IFB are all gone. */
+		uci.set('cake-autorate', section_id, 'enabled', '0');
+		uci.set('cake-autorate', section_id, 'sqm_enabled', '0');
+		state.enabled = false;
+		state.sqm_enabled = false;
+		return;
+	}
 
 	var wan = normalizeInterfaceName(state.wan_if);
 	var dl = rateValue(state.sqm_download, '20000');
@@ -2415,8 +2439,9 @@ function autotuneValidationAttempts(result) {
 	return attempts;
 }
 
-function autotuneValidationGatesComplete(validation) {
+function autotuneValidationGatesComplete(validation, profile, requireQualityTarget) {
 	var gates = validation && validation.gates;
+	var policy = autotuneProfilePolicy(profile);
 	var required = [
 		'download-candidate-realization', 'upload-candidate-realization',
 		'download-candidate-realization-maximum', 'upload-candidate-realization-maximum',
@@ -2428,13 +2453,24 @@ function autotuneValidationGatesComplete(validation) {
 	];
 	var reported = {};
 
-	if (!Array.isArray(gates) || gates.length !== required.length)
+	if (!policy || !Array.isArray(gates) || gates.length !== required.length ||
+	    canonicalAutotuneProfile(validation.profile) !== policy.id)
 		return false;
 
 	for (var i = 0; i < gates.length; i++) {
 		var gate = gates[i];
 		var code = gate && String(gate.code || '').toLowerCase().replace(/_/g, '-');
-		if (required.indexOf(code) < 0 || reported[code] || gate.pass !== true)
+		var latencyGate = code === 'download-icmp-latency' ||
+			code === 'download-transport-latency' ||
+			code === 'upload-icmp-latency' ||
+			code === 'upload-transport-latency';
+		var gateRequired = latencyGate ? policy.qualityTargetRequired : true;
+
+		if (required.indexOf(code) < 0 || reported[code] ||
+		    gate.required !== gateRequired || typeof gate.pass !== 'boolean' ||
+		    (gateRequired && gate.pass !== true) ||
+		    (requireQualityTarget && gate.pass !== true) ||
+		    autotuneNumber(gate.actual) == null || autotuneNumber(gate.limit) == null)
 			return false;
 		reported[code] = true;
 	}
@@ -2508,43 +2544,184 @@ function autotuneHasInfeasibleDecision(result) {
 	return false;
 }
 
-function autotuneResultValidated(result) {
+function autotuneFairAllowedActions(outcome) {
+	var actions = outcome && outcome.allowed_actions;
+	var known = [ 'apply_sqm', 'keep_current', 'disable_sqm' ];
+	var seen = {};
+
+	if (!Array.isArray(actions) || !actions.length)
+		return null;
+	for (var i = 0; i < actions.length; i++) {
+		if (known.indexOf(actions[i]) < 0 || seen[actions[i]])
+			return null;
+		seen[actions[i]] = true;
+	}
+	if (!seen.apply_sqm || !seen.keep_current ||
+	    !!seen.disable_sqm !== (outcome.disable_sqm_available === true))
+		return null;
+	return seen;
+}
+
+function autotuneFairOutcomeValidated(result) {
+	var outcome = result && result.fair_outcome;
+	var validation = result && result.validation;
+	var actions = autotuneFairAllowedActions(outcome);
+	var outcomeDelta = autotuneNumber(outcome && outcome.actual_effective_delta_ms);
+	var validationDelta = autotuneNumber(validation && validation.effective_delta_ms);
+
+	if (canonicalAutotuneProfile(result && result.profile) !== 'fair' ||
+	    !outcome || !validation || !actions ||
+	    outcome.target_grade !== 'C' ||
+	    autotuneNumber(outcome.target_delta_ms) !== 200 ||
+	    autotuneNumber(outcome.capacity_floor_percent) !== 90 ||
+	    outcome.actual_grade !== validation.actual_grade ||
+	    outcomeDelta == null || validationDelta == null ||
+	    Math.abs(outcomeDelta - validationDelta) > 0.001)
+		return false;
+
+	if (validation.quality_target_met === true)
+		return outcome.mode === 'quality-target-met' &&
+			outcome.recommended_action === 'apply_sqm' &&
+			outcome.disable_sqm_available === false;
+
+	return (outcome.mode === 'throughput-fallback' ||
+		outcome.mode === 'sqm-disable-recommended') &&
+		(actions[outcome.recommended_action] === true);
+}
+
+function autotuneResultEvidenceValidated(result) {
 	if (!(result && result.state === 'complete' && result.proposal &&
-		result.validation && result.validation.pass === true && !result.error))
+		result.validation && !result.error))
 		return false;
 	if (!result.job_id || !result.target_interface || !result.resolved_interface ||
 	    !result.route_interface || !result.source_ip || !result.route_identity || !result.external_ip ||
 	    (result.route_mode !== 'main' && result.route_mode !== 'mwan3'))
 		return false;
 
-	/* Current results are intentionally fail-closed. A bare legacy `pass` is not
-	 * enough because it did not prove phase-scoped background telemetry. */
+	/* Current results are intentionally fail-closed. A bare legacy `pass` is
+	 * not enough because it did not prove phase-scoped background telemetry or
+	 * bind the review to one immutable run. */
 	if (autotuneNumber(result.schema_version) !== AUTOTUNE_RESULT_SCHEMA_VERSION ||
 	    result.producer !== AUTOTUNE_RESULT_PRODUCER ||
+	    !/^[A-Za-z0-9_-]{1,128}$/.test(result.run_id || '') ||
 	    result.phase_evidence_complete !== true || result.runtime_restored !== true ||
-	    result.recovery_pending !== false || result.auto_apply_eligible !== true ||
+	    result.recovery_pending !== false || result.manual_apply_eligible !== true ||
 	    result.configuration_written !== false ||
 	    !/^sha256:[0-9a-f]{64}$/.test(result.config_fingerprint || '') ||
 	    !autotuneProposalMatchesProfile(result))
 		return false;
 
 	/* Conservative/contaminated output remains useful diagnostics, but it is
-	 * never a configuration proposal.  This single predicate gates Next,
-	 * Review/Apply, and the proposal staging path. */
+	 * never a configuration proposal. */
 	if (result.conservative === true || result.confidence_mode !== 'normal' ||
 	    result.phase_contamination_seen !== false ||
 	    result.validation.contaminated !== false ||
-	    !autotunePhaseEvidenceClean(result) ||
-	    !autotuneValidationGatesComplete(result.validation) ||
-	    autotuneHasInfeasibleDecision(result))
+	    !autotunePhaseEvidenceClean(result))
+		return false;
+
+	return true;
+}
+
+function autotuneResultValidated(result) {
+	if (!autotuneResultEvidenceValidated(result) ||
+	    result.validation.pass !== true ||
+	    result.validation.hard_pass !== true ||
+	    result.validation.quality_target_met !== true ||
+	    result.auto_apply_eligible !== true ||
+	    !autotuneValidationGatesComplete(result.validation, result.profile, true))
 		return false;
 
 	var correction = result.validation.correction;
-	return !!(correction && correction.action === 'none' && correction.feasible === true);
+	if (!(correction && correction.action === 'none' && correction.feasible === true))
+		return false;
+
+	return canonicalAutotuneProfile(result.profile) !== 'fair' ||
+		autotuneFairOutcomeValidated(result);
 }
 
-function revalidateAutotuneProposal(section_id, wan, backend, expected, routeMode, mwan3Member) {
-	if (!autotuneResultValidated(expected))
+function autotuneDisableSqmEvidenceValidated(result) {
+	var outcome = result && result.fair_outcome;
+	var control = outcome && outcome.no_sqm_control;
+	var evidence = control && control.measurement_evidence;
+	var gains = outcome && outcome.throughput_gain_without_sqm;
+	var validation = result && result.validation;
+	var grades = { 'A+': 0, 'A': 1, 'B': 2, 'C': 3, 'D': 4, 'F': 5 };
+	var dlGain = autotuneNumber(gains && gains.download_percent);
+	var ulGain = autotuneNumber(gains && gains.upload_percent);
+	var controlDelta = autotuneNumber(control && control.effective_delta_ms);
+	var shapedDelta = autotuneNumber(validation && validation.effective_delta_ms);
+
+	return !!(autotuneFairOutcomeValidated(result) &&
+		outcome.mode === 'sqm-disable-recommended' &&
+		outcome.recommended_action === 'disable_sqm' &&
+		outcome.disable_sqm_available === true &&
+		control && control.available === true &&
+		evidence && evidence.valid === true &&
+		evidence.test_direction === 'both' &&
+		evidence.shaper_bypassed === true &&
+		evidence.sqm_paused === true &&
+		autotuneBackgroundEvidenceClean(control.forwarded_background) &&
+		autotuneNumber(control.forwarded_background.download_kbps) != null &&
+		autotuneNumber(control.forwarded_background.upload_kbps) != null &&
+		autotuneNumber(control.forwarded_background.download_limit_kbps) != null &&
+		autotuneNumber(control.forwarded_background.upload_limit_kbps) != null &&
+		autotuneNumber(control.forwarded_background.download_kbps) <=
+			autotuneNumber(control.forwarded_background.download_limit_kbps) &&
+		autotuneNumber(control.forwarded_background.upload_kbps) <=
+			autotuneNumber(control.forwarded_background.upload_limit_kbps) &&
+		Object.prototype.hasOwnProperty.call(grades, control.grade) &&
+		Object.prototype.hasOwnProperty.call(grades, validation.actual_grade) &&
+		grades[control.grade] <= grades[validation.actual_grade] &&
+		controlDelta != null && shapedDelta != null &&
+		controlDelta <= shapedDelta + 10 &&
+		dlGain != null && ulGain != null && dlGain >= 2 && ulGain >= 2);
+}
+
+function autotuneResultReviewable(result, action) {
+	action = action || 'apply_sqm';
+	if (!autotuneResultEvidenceValidated(result))
+		return false;
+
+	if (action === 'keep_current')
+		return autotuneResultValidated(result) ||
+			(autotuneFairOutcomeValidated(result) &&
+				autotuneFairAllowedActions(result.fair_outcome).keep_current === true);
+
+	if (action === 'apply_sqm') {
+		if (autotuneResultValidated(result))
+			return true;
+		return canonicalAutotuneProfile(result.profile) === 'fair' &&
+			result.auto_apply_eligible === false &&
+			result.validation.pass === false &&
+			result.validation.hard_pass === true &&
+			result.validation.quality_target_met === false &&
+			autotuneValidationGatesComplete(result.validation, result.profile, false) &&
+			autotuneFairOutcomeValidated(result) &&
+			autotuneFairAllowedActions(result.fair_outcome).apply_sqm === true;
+	}
+
+	if (action === 'disable_sqm')
+		return canonicalAutotuneProfile(result.profile) === 'fair' &&
+			result.auto_apply_eligible === false &&
+			result.validation.pass === false &&
+			result.validation.hard_pass === true &&
+			result.validation.quality_target_met === false &&
+			autotuneValidationGatesComplete(result.validation, result.profile, false) &&
+			autotuneDisableSqmEvidenceValidated(result);
+
+	return false;
+}
+
+function autotuneResultHasReviewChoice(result) {
+	return autotuneResultReviewable(result, 'apply_sqm') ||
+		autotuneResultReviewable(result, 'keep_current') ||
+		autotuneResultReviewable(result, 'disable_sqm');
+}
+
+function revalidateAutotuneProposal(section_id, wan, backend, expected, routeMode, mwan3Member,
+		action) {
+	action = action || 'apply_sqm';
+	if (!autotuneResultReviewable(expected, action))
 		return Promise.reject(new Error(_('The Auto-Tune proposal is no longer valid. Run Auto-Tune again.')));
 	var selectedMode = routeMode === 'auto' ? (mwan3Member ? 'mwan3' : 'main') : routeMode;
 	selectedMode = selectedMode || 'main';
@@ -2568,8 +2745,9 @@ function revalidateAutotuneProposal(section_id, wan, backend, expected, routeMod
 	]).then(function(status) {
 		var current = parseExecJson(status);
 
-		if (!autotuneResultValidated(current) ||
+		if (!autotuneResultReviewable(current, action) ||
 		    current.config_fingerprint !== expectedFingerprint ||
+		    current.run_id !== expected.run_id ||
 		    current.job_id !== expected.job_id ||
 		    current.resolved_interface !== expected.resolved_interface ||
 		    current.route_identity !== expected.route_identity ||
@@ -2620,8 +2798,11 @@ function autotuneSqmRollbackSection(section_id) {
 
 function stageAutotuneApplyMarker(section_id, state) {
 	var result = state && state.autotune_result;
+	var action = state && state.autotune_action || 'apply_sqm';
+	var enabled = action === 'apply_sqm';
 
-	if (!autotuneResultValidated(result))
+	if (!autotuneResultReviewable(result, action) ||
+	    (action !== 'apply_sqm' && action !== 'disable_sqm'))
 		throw new Error(_('Refusing to create an apply marker for an invalid Full Auto-Tune result.'));
 	if (result.job_id !== section_id)
 		throw new Error(_('The Full Auto-Tune result belongs to a different instance.'));
@@ -2636,9 +2817,10 @@ function stageAutotuneApplyMarker(section_id, state) {
 		uci.set('cake-autorate', section_id, '_autotune_apply_mwan3_member', result.mwan3_member);
 	else
 		uci.unset('cake-autorate', section_id, '_autotune_apply_mwan3_member');
-	uci.set('cake-autorate', section_id, '_autotune_apply_enabled', state.enabled ? '1' : '0');
+	uci.set('cake-autorate', section_id, '_autotune_apply_enabled', enabled ? '1' : '0');
 	uci.set('cake-autorate', section_id, '_autotune_apply_disable_adaptive',
 		state.adaptive_ceiling_disable_confirmed === true ? '1' : '0');
+	uci.set('cake-autorate', section_id, '_autotune_apply_action', action);
 	/* A no-op metadata section enrolls the entire sqm package in rpcd's same
 	 * rollback snapshot. Init commits its generated queue (and may disable a
 	 * conflicting legacy queue), so protecting only cake-autorate would leave
@@ -2675,6 +2857,7 @@ function pendingAutotuneApplyMarkers() {
 			member: section._autotune_apply_mwan3_member || '',
 			enabled: section._autotune_apply_enabled,
 			disableAdaptive: section._autotune_apply_disable_adaptive,
+			action: section._autotune_apply_action,
 			fingerprint: section._autotune_apply_fingerprint
 		};
 		if (!/^[A-Za-z0-9_]+$/.test(marker.job || '') ||
@@ -2685,6 +2868,9 @@ function pendingAutotuneApplyMarkers() {
 		    (marker.routeMode === 'mwan3' && !/^[A-Za-z0-9_.:@-]+$/.test(marker.member)) ||
 		    (marker.enabled !== '0' && marker.enabled !== '1') ||
 		    (marker.disableAdaptive !== '0' && marker.disableAdaptive !== '1') ||
+		    (marker.action !== 'apply_sqm' && marker.action !== 'disable_sqm') ||
+		    (marker.action === 'apply_sqm' && marker.enabled !== '1') ||
+		    (marker.action === 'disable_sqm' && marker.enabled !== '0') ||
 		    !/^sha256:[0-9a-f]{64}$/.test(marker.fingerprint || ''))
 			throw new Error(_('A staged Full Auto-Tune apply marker is incomplete or unsafe. Run Auto-Tune again.'));
 
@@ -2726,7 +2912,7 @@ function armAutotuneApplyGuards() {
 			return fs.exec(AUTOTUNE_APPLY_GUARD, [
 				'arm', marker.job, marker.target, marker.backend,
 				marker.routeMode, marker.member, marker.enabled,
-				marker.disableAdaptive, marker.fingerprint
+				marker.disableAdaptive, marker.action, marker.fingerprint
 			]);
 		}).then(function(result) {
 			var parsed = parseApplyGuardResult(result, 'armed');
@@ -2944,6 +3130,8 @@ function clearAutotuneProposalState(state) {
 	state.autotune_progress = 0;
 	state.autotune_result = null;
 	state.autotune_proposal = null;
+	state.autotune_action = 'apply_sqm';
+	state.disable_sqm_confirmed = false;
 	state.autotune_background_block = null;
 }
 
@@ -3510,6 +3698,8 @@ function showCreateWizard(grid, name, existingName) {
 		enabled: true,
 		sqm_enabled: true,
 		autotune_profile: 'best_overall',
+		autotune_action: 'apply_sqm',
+		disable_sqm_confirmed: false,
 		speedtest_backend: 'auto',
 		speedtest_go_server_id: '',
 		speedtest_apply_percent: '90',
@@ -3751,14 +3941,18 @@ function showCreateWizard(grid, name, existingName) {
 	}
 
 	function applyAutotuneResult(result) {
-		if (!autotuneResultValidated(result))
-			throw new Error(_('Refusing to stage an Auto-Tune result that did not pass every validation gate.'));
+		if (!autotuneResultHasReviewChoice(result))
+			throw new Error(_('Refusing to stage an Auto-Tune result without a safe review choice.'));
 
 		var proposal = result.proposal;
 		var firstRun = result.runs && result.runs.length ? result.runs[0] : {};
-
 		state.autotune_result = result;
 		state.autotune_proposal = proposal;
+		/* Even an evidence-backed no-SQM recommendation is a destructive
+		 * alternative, not a default. Keep the safe shaped candidate selected
+		 * until the user deliberately chooses and confirms disable. */
+		state.autotune_action = 'apply_sqm';
+		state.disable_sqm_confirmed = false;
 		state.autotune_profile = canonicalAutotuneProfile(result.profile) || 'best_overall';
 		state.autotune_diagnostics = null;
 		state.autotune_failure_message = '';
@@ -4148,10 +4342,15 @@ function showCreateWizard(grid, name, existingName) {
 		var reflectors = (state.reflectors && state.reflectors.length) ? state.reflectors : defaultReflectors();
 		var activeCount = Math.min(parseInt(state.no_pingers || '6', 10), reflectors.length);
 		var reviewNodes = [];
+		var selectedAutotuneAction = state.autotune_action || 'apply_sqm';
+		var autorateDecision = selectedAutotuneAction === 'disable_sqm' ?
+			_('disable autorate and SQM') :
+			(selectedAutotuneAction === 'keep_current' ?
+				_('keep current settings') : (state.enabled ? _('enabled') : _('disabled')));
 		var rows = [
 			[ _('Target interface'), targetInterfaceLabel(wan) ],
 			[ _('Probe routing'), state.route_mode === 'mwan3' ? _('mwan3 member %s').format(state.mwan3_member) : _('Main routing table') ],
-			[ _('Autorate + SQM'), state.enabled ? _('enabled') : _('disabled') ],
+			[ _('Autorate + SQM'), autorateDecision ],
 			[ _('SQM queue'), wizardSqmQueueText(state) ],
 			[ _('Download speed'), state.sqm_download + ' kbit/s' ],
 			[ _('Upload speed'), state.sqm_upload + ' kbit/s' ],
@@ -4172,7 +4371,7 @@ function showCreateWizard(grid, name, existingName) {
 		/* Never render a proposal in Review unless it is also eligible for
 		 * staging.  This keeps a stale result object from becoming an implied
 		 * approval surface after a failed or interrupted run. */
-		var autotune = autotuneResultValidated(state.autotune_result) ?
+		var autotune = autotuneResultHasReviewChoice(state.autotune_result) ?
 			state.autotune_result : null;
 		if (autotune) {
 			var proposal = autotune.proposal;
@@ -4209,6 +4408,83 @@ function showCreateWizard(grid, name, existingName) {
 				[ _('Detected link layer'), _('%s; overhead %d, MPU %d').format(proposal.link.kind, proposal.link.overhead, proposal.link.mpu) ],
 				[ _('Test server'), firstRun.server_sponsor ? _('%s #%s').format(firstRun.server_sponsor, firstRun.server_id || '-') : _('automatic') ]
 			);
+			if (autotune.profile === 'fair' && validation &&
+			    validation.quality_target_met === false) {
+				var outcome = autotune.fair_outcome;
+				var actionChoices = [
+					{
+						id: 'apply_sqm',
+						title: _('Apply the best safe Fair SQM candidate'),
+						description: _('Keeps the measured 90% throughput floor. The loaded-latency target was not reached, so this is an explicit manual choice.')
+					},
+					{
+						id: 'keep_current',
+						title: _('Keep current settings'),
+						description: rerun ? _('Close Auto-Tune without writing any configuration.') :
+							_('Do not create this instance.')
+					}
+				];
+				if (rerun && autotuneResultReviewable(autotune, 'disable_sqm')) {
+					actionChoices.push({
+						id: 'disable_sqm',
+						title: _('Disable autorate and SQM (comparison suggestion)'),
+						description: _('The unshaped control was no worse for latency and improved both download and upload by at least 2%. This is reversible, but traffic will no longer be shaped.')
+					});
+				}
+				var actionGroup = E('div', {
+					'style': 'display:flex;flex-direction:column;gap:8px'
+				}, actionChoices.map(function(choice) {
+					var input = E('input', {
+						'type': 'radio',
+						'name': 'cake-autotune-action-' + state.name,
+						'value': choice.id,
+						'checked': selectedAutotuneAction === choice.id ? 'checked' : null
+					});
+					input.addEventListener('change', function() {
+						if (!input.checked)
+							return;
+						state.autotune_action = choice.id;
+						state.disable_sqm_confirmed = false;
+						render();
+					});
+					return E('label', {
+						'style': 'display:flex;gap:8px;align-items:flex-start;white-space:normal'
+					}, [
+						input,
+						E('span', {}, [
+							E('strong', {}, choice.title),
+							E('br'),
+							E('span', { 'style': 'font-size:12px' }, choice.description)
+						])
+					]);
+				}));
+				rows.push(
+					[ _('Fair result'), _('%s · +%s ms effective loaded latency; target C is +200 ms or less').format(
+						validation.actual_grade || '-',
+						autotuneNumber(validation.effective_delta_ms) == null ? '-' :
+							autotuneNumber(validation.effective_delta_ms).toFixed(1)) ],
+					[ _('Review action'), actionGroup ]
+				);
+				if (outcome && outcome.no_sqm_control && outcome.no_sqm_control.available === true) {
+					rows.push([ _('Unshaped control'), _('%s · +%s ms; throughput change DL %s%% / UL %s%%').format(
+						outcome.no_sqm_control.grade || '-',
+						autotuneNumber(outcome.no_sqm_control.effective_delta_ms).toFixed(1),
+						autotuneNumber(outcome.throughput_gain_without_sqm.download_percent).toFixed(1),
+						autotuneNumber(outcome.throughput_gain_without_sqm.upload_percent).toFixed(1)) ]);
+				}
+				if (selectedAutotuneAction === 'disable_sqm') {
+					var disableSqm = wizardCheckbox(state.disable_sqm_confirmed === true);
+					disableSqm.addEventListener('change', function() {
+						state.disable_sqm_confirmed = disableSqm.checked;
+					});
+					rows.push([ _('Disable-SQM confirmation'), E('label', {
+						'style': 'white-space:normal;color:#d9534f;font-weight:600'
+					}, [
+						disableSqm, ' ',
+						_('I understand that this disables CAKE shaping and may increase latency under load.')
+					]) ]);
+				}
+			}
 			if (needsAdaptiveConsent) {
 				var disableAdaptive = wizardCheckbox(state.adaptive_ceiling_disable_confirmed === true);
 				disableAdaptive.addEventListener('change', function() {
@@ -4288,10 +4564,10 @@ function showCreateWizard(grid, name, existingName) {
 		}
 
 		if (step === 1) {
-			if (state.mode === 'autotune' && !autotuneResultValidated(state.autotune_result)) {
+			if (state.mode === 'autotune' && !autotuneResultHasReviewChoice(state.autotune_result)) {
 				showError(state.autotune_diagnostics ?
 					_('This Auto-Tune run produced diagnostics only. Run it again successfully before continuing to Review.') :
-					_('Run Full Auto-Tune before continuing to Review. Only a fully validated proposal can be applied.'));
+					_('Run Full Auto-Tune before continuing to Review.'));
 				return false;
 			}
 
@@ -4338,10 +4614,21 @@ function showCreateWizard(grid, name, existingName) {
 
 	function validateWizard() {
 		showError(null);
-		if (state.mode === 'autotune' && !autotuneResultValidated(state.autotune_result)) {
-			showError(_('This Auto-Tune result is diagnostic-only and cannot be applied.'));
+		var selectedAction = state.autotune_action || 'apply_sqm';
+		if (state.mode === 'autotune' &&
+		    !autotuneResultReviewable(state.autotune_result, selectedAction)) {
+			showError(_('The selected Auto-Tune action is not supported by the validated evidence.'));
 			return false;
 		}
+		if (selectedAction === 'disable_sqm' && (!rerun ||
+		    state.disable_sqm_confirmed !== true)) {
+			showError(rerun ?
+				_('Confirm that you understand the effect of disabling SQM.') :
+				_('SQM can be disabled only for an existing instance.'));
+			return false;
+		}
+		if (selectedAction === 'keep_current')
+			return true;
 
 		if (!state.name) {
 			showError(_('Instance name is required.'));
@@ -4411,11 +4698,19 @@ function showCreateWizard(grid, name, existingName) {
 
 		if (!validateWizard())
 			return;
+		if (state.autotune_action === 'keep_current') {
+			ui.hideModal();
+			ui.addNotification(null, E('p', rerun ?
+				_('Current settings were kept; no configuration was written.') :
+				_('Instance creation was cancelled; no configuration was written.')), 'info');
+			return;
+		}
 
 		var freshness = state.mode === 'autotune' ?
 			revalidateAutotuneProposal(state.name, state.wan_if,
 				state.speedtest_backend, state.autotune_result,
-				state.route_mode, state.mwan3_member) : Promise.resolve();
+				state.route_mode, state.mwan3_member,
+				state.autotune_action || 'apply_sqm') : Promise.resolve();
 
 		return freshness.then(function() {
 			var section_id, created = [];
@@ -4463,10 +4758,17 @@ function showCreateWizard(grid, name, existingName) {
 				return L.bind(grid.map.reset, grid.map)().then(function() { return created; });
 			})
 			.then(function(created) {
+				var notification;
 				ui.hideModal();
-				ui.addNotification(null, E('p', rerun ?
-					_('Auto-Tune proposal staged for %s. Review pending changes, then Save & Apply.').format(existingName) :
-					_('%d instance(s) created: %s. Review pending changes, then Save & Apply.').format(created.length, created.join(', '))), 'info');
+				if (state.autotune_action === 'disable_sqm')
+					notification = _('SQM disable is staged for %s. Review pending changes, then Save & Apply.').format(existingName);
+				else if (rerun)
+					notification =
+						_('Auto-Tune proposal staged for %s. Review pending changes, then Save & Apply.').format(existingName);
+				else
+					notification = _('%d instance(s) created: %s. Review pending changes, then Save & Apply.').format(
+						created.length, created.join(', '));
+				ui.addNotification(null, E('p', notification), 'info');
 			})
 			.catch(function(err) {
 				showError(err.message || err);
@@ -4509,7 +4811,7 @@ function showCreateWizard(grid, name, existingName) {
 		}
 
 		var invalidAutotune = state.mode === 'autotune' &&
-			!autotuneResultValidated(state.autotune_result);
+			!autotuneResultHasReviewChoice(state.autotune_result);
 		if (state.step < 2 && !(state.step === 1 && invalidAutotune)) {
 			buttons.push(E('button', {
 				'class': 'btn cbi-button cbi-button-positive',
@@ -4528,7 +4830,9 @@ function showCreateWizard(grid, name, existingName) {
 			buttons.push(E('button', {
 				'class': 'btn cbi-button cbi-button-positive important',
 				'click': finish
-			}, rerun ? _('Use proposal') : _('Create')));
+			}, state.autotune_action === 'keep_current' ? _('Keep current') :
+				(state.autotune_action === 'disable_sqm' ? _('Stage SQM disable') :
+					(rerun ? _('Use proposal') : _('Create')))));
 		}
 
 		content.push(E('div', { 'class': 'button-row' }, buttons));
@@ -4920,7 +5224,7 @@ function addQualityOptions(section) {
 	o = listValue(section, 'testing', 'autotune_profile', _('Auto-Tune profile'), [
 		[ 'gaming', _('Gaming — target A+, diffserv4') ],
 		[ 'best_overall', _('Best overall — target A (recommended)') ],
-		[ 'fair', _('Fair — target B, favor sustained throughput') ]
+		[ 'fair', _('Fair — throughput first, aim for C') ]
 	], 'best_overall');
 	describe(o, 'autotune_profile');
 

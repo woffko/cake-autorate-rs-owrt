@@ -116,7 +116,7 @@ pending_result_file=$work/result.pending.json
 pending_error_file=$work/error.pending.json
 heartbeat_file=$work/heartbeat
 EOF
-	printf '%s\n' '{"state":"failed","schema_version":4,"producer":"cake-autorate-rs-autotune","profile":"best_overall","runtime_restored":false,"recovery_pending":true}' > "$work/error.pending.json"
+	printf '%s\n' '{"state":"failed","schema_version":5,"producer":"cake-autorate-rs-autotune","profile":"best_overall","runtime_restored":false,"recovery_pending":true}' > "$work/error.pending.json"
 	: > "$work/heartbeat"
 }
 
@@ -253,7 +253,7 @@ grep -q '"runtime_restored":true' "$work/error.json"
 reset_case
 write_journal "$work/malformed-pending.journal" 242 100
 printf '%s\n%s\n' \
-	'{"state":"failed","schema_version":4,"producer":"cake-autorate-rs-autotune","profile":"best_overall","runtime_restored":false,"recovery_pending":true}' \
+	'{"state":"failed","schema_version":5,"producer":"cake-autorate-rs-autotune","profile":"best_overall","runtime_restored":false,"recovery_pending":true}' \
 	'{"forged":true}' > "$work/error.pending.json"
 "$helper" recover "$work/malformed-pending.journal"
 node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$work/error.json"

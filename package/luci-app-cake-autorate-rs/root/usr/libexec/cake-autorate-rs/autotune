@@ -31,7 +31,7 @@ case "$profile_argument" in
 esac
 reflector_scan_cooldown_s="${CAKE_AUTORATE_REFLECTOR_SCAN_COOLDOWN_S:-5}"
 baseline_retry_backoff_s="${CAKE_AUTORATE_BASELINE_RETRY_BACKOFF_S:-20}"
-autotune_result_schema=4
+autotune_result_schema=5
 autotune_result_producer="cake-autorate-rs-autotune"
 
 job_root="${CAKE_AUTORATE_AUTOTUNE_DIR:-/tmp/cake-autorate-autotune}"
@@ -301,6 +301,7 @@ job_paths() {
 	pending_error_file="$job_dir/error.pending.json"
 	cancel_file="$job_dir/cancelled"
 	log_file="$job_dir/job.log"
+	history_dir="$job_dir/history"
 }
 
 secure_ram_directory() {
@@ -320,6 +321,100 @@ secure_ram_directory() {
 prepare_job_storage() {
 	secure_ram_directory "$job_root" || return 1
 	secure_ram_directory "$job_dir"
+}
+
+remove_history_run() {
+	history_remove_dir="$1"
+	case "$history_remove_dir" in "$history_dir"/*) ;; *) return 1 ;; esac
+	[ -d "$history_remove_dir" ] && [ ! -L "$history_remove_dir" ] || return 1
+	runtime_lock_path_owned_by_euid "$history_remove_dir" || return 1
+	[ -z "$(find "$history_remove_dir" -type l -print -quit 2>/dev/null)" ] || return 1
+	find "$history_remove_dir" -type f -exec rm -f {} \; 2>/dev/null || return 1
+	find "$history_remove_dir" -depth -type d -exec rmdir {} \; 2>/dev/null || return 1
+}
+
+prune_history() {
+	history_max_runs="${CAKE_AUTORATE_AUTOTUNE_HISTORY_RUNS:-5}"
+	history_max_kib="${CAKE_AUTORATE_AUTOTUNE_HISTORY_KIB:-2048}"
+	is_uint_between "$history_max_runs" 1 20 || history_max_runs=5
+	is_uint_between "$history_max_kib" 128 16384 || history_max_kib=2048
+	history_count=0
+	for history_candidate in $(find "$history_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | LC_ALL=C sort -r); do
+		history_count=$((history_count + 1))
+		[ "$history_count" -le "$history_max_runs" ] ||
+			remove_history_run "$history_candidate" || return 1
+	done
+	while :; do
+		history_used_kib="$(du -sk "$history_dir" 2>/dev/null | awk 'NR == 1 { print $1; exit }')"
+		case "$history_used_kib" in ''|*[!0-9]*) return 1 ;; esac
+		[ "$history_used_kib" -le "$history_max_kib" ] && break
+		history_oldest="$(find "$history_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null |
+			LC_ALL=C sort | sed -n '1p')"
+		[ -n "$history_oldest" ] || break
+		remove_history_run "$history_oldest" || return 1
+	done
+}
+
+archive_previous_terminal() {
+	history_terminal=""
+	if [ -s "$result_file" ]; then
+		history_terminal="$result_file"
+	elif [ -s "$error_file" ]; then
+		history_terminal="$error_file"
+	else
+		return 0
+	fi
+	owned_regular_file "$history_terminal" || return 1
+	history_size="$(wc -c < "$history_terminal" 2>/dev/null)"
+	case "$history_size" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$history_size" -ge 2 ] && [ "$history_size" -le 1048576 ] || return 1
+	history_payload="$(cat "$history_terminal" 2>/dev/null)" || return 1
+	strict_single_json_object "$history_payload" || return 1
+	history_epoch="$(date +%s)"
+	is_positive_uint "$history_epoch" || return 1
+	history_run_id="$(extract_json "$history_payload" '@.run_id' 2>/dev/null || true)"
+	case "$history_run_id" in
+		''|*[!A-Za-z0-9_-]*) history_run_id="legacy-$history_epoch-$$" ;;
+	esac
+	history_state="$(extract_json "$history_payload" '@.state' 2>/dev/null || true)"
+	case "$history_state" in
+		complete|failed|inconclusive|background-blocked|cancelled|legacy) ;;
+		*) history_state=unknown ;;
+	esac
+	secure_ram_directory "$history_dir" || return 1
+	history_target="$history_dir/$history_epoch-$history_run_id"
+	[ ! -e "$history_target" ] && [ ! -L "$history_target" ] || return 1
+	mkdir "$history_target" 2>/dev/null || return 1
+	chmod 700 "$history_target" 2>/dev/null || return 1
+	runtime_lock_path_owned_by_euid "$history_target" || return 1
+	if ! cp "$history_terminal" "$history_target/terminal.json" 2>/dev/null ||
+	   ! chmod 600 "$history_target/terminal.json" 2>/dev/null ||
+	   ! owned_regular_file "$history_target/terminal.json"; then
+		remove_history_run "$history_target" >/dev/null 2>&1 || true
+		return 1
+	fi
+	if owned_regular_file "$log_file"; then
+		history_log_size="$(wc -c < "$log_file" 2>/dev/null)"
+		case "$history_log_size" in
+			''|*[!0-9]*) history_log_size=0 ;;
+		esac
+		if [ "$history_log_size" -gt 0 ] && [ "$history_log_size" -le 524288 ]; then
+			cp "$log_file" "$history_target/job.log" 2>/dev/null &&
+				chmod 600 "$history_target/job.log" 2>/dev/null &&
+				owned_regular_file "$history_target/job.log" || {
+					remove_history_run "$history_target" >/dev/null 2>&1 || true
+					return 1
+				}
+		fi
+	fi
+	atomic_write "$history_target/meta" \
+		"run_id=$history_run_id
+state=$history_state
+completed_epoch=$history_epoch" || {
+		remove_history_run "$history_target" >/dev/null 2>&1 || true
+		return 1
+	}
+	prune_history
 }
 
 owned_regular_file() {
@@ -691,7 +786,7 @@ config_fingerprint_matches() {
 }
 
 config_changed_inconclusive() {
-	stage_terminal_json error "{\"state\":\"inconclusive\",\"schema_version\":4,\"stage\":\"config-changed\",\"error\":\"Managed CAKE Autorate/SQM configuration changed during calibration; all measurements are stale.\",\"reason\":\"config-changed\",\"retryable\":true,\"auto_apply_eligible\":false,\"phase_evidence_complete\":false,\"configuration_written\":false}"
+	stage_terminal_json error "{\"state\":\"inconclusive\",\"schema_version\":5,\"stage\":\"config-changed\",\"error\":\"Managed CAKE Autorate/SQM configuration changed during calibration; all measurements are stale.\",\"reason\":\"config-changed\",\"retryable\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"configuration_written\":false}"
 	exit 1
 }
 
@@ -716,12 +811,12 @@ stage_terminal_json() {
 	payload="$2"
 	if [ "${config_fingerprint_captured:-false}" = true ] &&
 	   ! config_fingerprint_matches; then
-		payload="{\"state\":\"inconclusive\",\"schema_version\":4,\"stage\":\"config-changed\",\"error\":\"Managed CAKE Autorate/SQM configuration changed during calibration; all measurements are stale.\",\"reason\":\"config-changed\",\"retryable\":true,\"auto_apply_eligible\":false,\"phase_evidence_complete\":false,\"configuration_written\":false}"
+		payload="{\"state\":\"inconclusive\",\"schema_version\":5,\"stage\":\"config-changed\",\"error\":\"Managed CAKE Autorate/SQM configuration changed during calibration; all measurements are stale.\",\"reason\":\"config-changed\",\"retryable\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"configuration_written\":false}"
 		terminal_kind=error
 	fi
 	terminal_json_shape_valid "$payload" || return 1
 	case "$payload" in
-		*'}') payload="${payload%?},\"producer\":\"$autotune_result_producer\",\"profile\":\"$autotune_profile\",\"config_fingerprint\":\"$(json_escape "${config_fingerprint:-}")\",\"runtime_restored\":false,\"recovery_pending\":true}" ;;
+		*'}') payload="${payload%?},\"producer\":\"$autotune_result_producer\",\"profile\":\"$autotune_profile\",\"run_id\":\"$(json_escape "${worker_token:-unknown}")\",\"config_fingerprint\":\"$(json_escape "${config_fingerprint:-}")\",\"runtime_restored\":false,\"recovery_pending\":true}" ;;
 		*) return 1 ;;
 	esac
 	terminal_json_valid "$payload" || return 1
@@ -774,7 +869,7 @@ publish_staged_terminal() {
 emit_saved_terminal() {
 	saved_terminal_file="$1"
 	owned_regular_file "$saved_terminal_file" || {
-		printf '{"state":"failed","schema_version":%s,"producer":"%s","error":"Saved Full Auto-Tune state is unsafe or unreadable; run calibration again.","auto_apply_eligible":false,"configuration_written":false,"runtime_restored":true,"recovery_pending":false}\n' \
+		printf '{"state":"failed","schema_version":%s,"producer":"%s","error":"Saved Full Auto-Tune state is unsafe or unreadable; run calibration again.","auto_apply_eligible":false,"manual_apply_eligible":false,"configuration_written":false,"runtime_restored":true,"recovery_pending":false}\n' \
 			"$autotune_result_schema" "$autotune_result_producer"
 		return 0
 	}
@@ -786,13 +881,13 @@ emit_saved_terminal() {
 	if strict_single_json_object "$saved_terminal"; then
 		saved_schema="$(extract_json "$saved_terminal" '@.schema_version' 2>/dev/null || true)"
 		saved_state="$(extract_json "$saved_terminal" '@.state' 2>/dev/null || true)"
-		printf '{"state":"legacy","schema_version":%s,"producer":"%s","legacy_schema_version":"%s","legacy_state":"%s","error":"Saved Full Auto-Tune diagnostics were created by an older result schema. They cannot be applied; run Full Auto-Tune again.","auto_apply_eligible":false,"configuration_written":false,"runtime_restored":true,"recovery_pending":false,"legacy_result":%s}\n' \
+		printf '{"state":"legacy","schema_version":%s,"producer":"%s","legacy_schema_version":"%s","legacy_state":"%s","error":"Saved Full Auto-Tune diagnostics were created by an older result schema. They cannot be applied; run Full Auto-Tune again.","auto_apply_eligible":false,"manual_apply_eligible":false,"configuration_written":false,"runtime_restored":true,"recovery_pending":false,"legacy_result":%s}\n' \
 			"$autotune_result_schema" "$autotune_result_producer" \
 			"$(json_escape "${saved_schema:-unknown}")" \
 			"$(json_escape "${saved_state:-unknown}")" "$saved_terminal"
 		return 0
 	fi
-	printf '{"state":"failed","schema_version":%s,"producer":"%s","error":"Saved Full Auto-Tune diagnostics are malformed and were ignored; run calibration again.","auto_apply_eligible":false,"configuration_written":false,"runtime_restored":true,"recovery_pending":false}\n' \
+	printf '{"state":"failed","schema_version":%s,"producer":"%s","error":"Saved Full Auto-Tune diagnostics are malformed and were ignored; run calibration again.","auto_apply_eligible":false,"manual_apply_eligible":false,"configuration_written":false,"runtime_restored":true,"recovery_pending":false}\n' \
 		"$autotune_result_schema" "$autotune_result_producer"
 }
 
@@ -801,7 +896,7 @@ write_status() {
 	progress="$2"
 	message="$3"
 	current_phase="$phase"
-	atomic_write "$status_file" "{\"state\":\"running\",\"phase\":\"$(json_escape "$phase")\",\"progress\":$progress,\"message\":\"$(json_escape "$message")\",\"job_id\":\"$(json_escape "$job_name")\",\"requested_target_interface\":\"$(json_escape "$target_if_input")\",\"requested_backend\":\"$(json_escape "$backend_input")\",\"requested_route_mode\":\"$(json_escape "$route_mode_override")\",\"requested_mwan3_member\":\"$(json_escape "$mwan3_member_override")\",\"requested_profile\":\"$(json_escape "$autotune_profile")\",\"requested_conservative\":$([ "${conservative_mode:-0}" = 1 ] && printf true || printf false)}"
+	atomic_write "$status_file" "{\"state\":\"running\",\"phase\":\"$(json_escape "$phase")\",\"progress\":$progress,\"message\":\"$(json_escape "$message")\",\"job_id\":\"$(json_escape "$job_name")\",\"run_id\":\"$(json_escape "${active_run_id:-${worker_token:-pending}}")\",\"requested_target_interface\":\"$(json_escape "$target_if_input")\",\"requested_backend\":\"$(json_escape "$backend_input")\",\"requested_route_mode\":\"$(json_escape "$route_mode_override")\",\"requested_mwan3_member\":\"$(json_escape "$mwan3_member_override")\",\"requested_profile\":\"$(json_escape "$autotune_profile")\",\"requested_conservative\":$([ "${conservative_mode:-0}" = 1 ] && printf true || printf false)}"
 }
 
 nonnegative_delta() {
@@ -906,7 +1001,7 @@ check_background_traffic() {
 	write_status quiet-check 27 "Checking background traffic before throughput calibration"
 	measure_background_traffic
 	if [ "$background_blocked" = true ] && [ "${conservative_mode:-0}" != 1 ]; then
-		stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":4,\"error\":\"Background traffic is above the strict calibration limit. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"quiet-check\",\"auto_apply_eligible\":false,\"phase_evidence_complete\":false,\"phase_contamination_seen\":false,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
+		stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":5,\"error\":\"Background traffic is above the strict calibration limit. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"quiet-check\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"phase_contamination_seen\":false,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
 		exit 1
 	fi
 	if [ "${conservative_mode:-0}" = 1 ]; then
@@ -920,7 +1015,7 @@ check_background_traffic() {
 		current_ul_cap="$(uci -q get "cake-autorate.$job_name.adaptive_ceiling_ul_cap_kbps" 2>/dev/null)"
 		if { [ "$background_dl_usable" != true ] || [ "$background_ul_usable" != true ]; } &&
 		   { ! is_positive_uint "$current_dl_base" || ! is_positive_uint "$current_ul_base"; }; then
-			stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":4,\"error\":\"Background traffic leaves an unusable direction and this new instance has no confirmed limits to retain.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"quiet-check\",\"auto_apply_eligible\":false,\"phase_evidence_complete\":false,\"phase_contamination_seen\":false,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
+			stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":5,\"error\":\"Background traffic leaves an unusable direction and this new instance has no confirmed limits to retain.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"quiet-check\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"phase_contamination_seen\":false,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
 			exit 1
 		fi
 	fi
@@ -2070,7 +2165,7 @@ capture_idle_baseline() {
 				baseline_phase_attempt=$((baseline_phase_attempt + 1))
 				continue
 			fi
-			stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":4,\"stage\":\"baseline\",\"error\":\"The uplink was busy before both idle baseline attempts. Retry when quiet; conservative mode cannot invent an idle p95.\",\"background_blocked\":true,\"retryable\":true,\"auto_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
+			stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":5,\"stage\":\"baseline\",\"error\":\"The uplink was busy before both idle baseline attempts. Retry when quiet; conservative mode cannot invent an idle p95.\",\"background_blocked\":true,\"retryable\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
 			exit 1
 		fi
 
@@ -2446,7 +2541,9 @@ proposal_json_valid() {
 	proposal_schema="$(extract_json "$proposal_candidate" '@.schema_version')" || return 1
 	proposal_profile="$(extract_json "$proposal_candidate" '@.profile')" || return 1
 	proposal_target_grade="$(extract_json "$proposal_candidate" '@.target_grade')" || return 1
-	[ "$proposal_schema" = 2 ] && [ "$proposal_profile" = "$autotune_profile" ] || return 1
+	proposal_quality_required="$(extract_json "$proposal_candidate" '@.quality_target_required')" || return 1
+	proposal_throughput_priority="$(extract_json "$proposal_candidate" '@.throughput_priority')" || return 1
+	[ "$proposal_schema" = 3 ] && [ "$proposal_profile" = "$autotune_profile" ] || return 1
 
 	proposal_dl_min="$(extract_json "$proposal_candidate" '@.download.minimum_kbps')" || return 1
 	proposal_dl_base="$(extract_json "$proposal_candidate" '@.download.base_kbps')" || return 1
@@ -2533,6 +2630,8 @@ proposal_json_valid() {
 	case "$autotune_profile" in
 		gaming)
 			[ "$proposal_target_grade" = A+ ] &&
+				[ "$proposal_quality_required" = true ] &&
+				[ "$proposal_throughput_priority" = false ] &&
 				numbers_equal "$proposal_validation_retention" 70 &&
 				numbers_equal "$proposal_validation_icmp" 5 &&
 				numbers_equal "$proposal_validation_transport" 5 &&
@@ -2546,16 +2645,20 @@ proposal_json_valid() {
 			;;
 		best_overall)
 			[ "$proposal_target_grade" = A ] &&
+				[ "$proposal_quality_required" = true ] &&
+				[ "$proposal_throughput_priority" = false ] &&
 				numbers_equal "$proposal_validation_retention" 80 &&
 				numbers_equal "$proposal_validation_icmp" 30 &&
 				numbers_equal "$proposal_validation_transport" 30 &&
 				numbers_equal "$proposal_validation_loss" 3 || return 1
 			;;
 		fair)
-			[ "$proposal_target_grade" = B ] &&
+			[ "$proposal_target_grade" = C ] &&
+				[ "$proposal_quality_required" = false ] &&
+				[ "$proposal_throughput_priority" = true ] &&
 				numbers_equal "$proposal_validation_retention" 90 &&
-				numbers_equal "$proposal_validation_icmp" 60 &&
-				numbers_equal "$proposal_validation_transport" 60 &&
+				numbers_equal "$proposal_validation_icmp" 200 &&
+				numbers_equal "$proposal_validation_transport" 200 &&
 				numbers_equal "$proposal_validation_loss" 5 || return 1
 			;;
 		*) return 1 ;;
@@ -2659,15 +2762,89 @@ clear_active_test_journal() {
 	return 0
 }
 
+speedtest_supervisor_fail() {
+	speedtest_supervisor_reason="$1"
+	speedtest_supervisor_rc="${2:-1}"
+	return "$speedtest_supervisor_rc"
+}
+
+finalize_speedtest_result() {
+	final_destination="$1"
+	final_test_rc="$2"
+	final_timed_out="$3"
+
+	if process_group_contains_session "$test_pid"; then
+		speedtest_supervisor_fail descendant-remained 1
+		return
+	fi
+	if ! clear_active_test_journal; then
+		speedtest_supervisor_fail journal-clear 1
+		return
+	fi
+	if [ "$final_timed_out" = 1 ]; then
+		speedtest_supervisor_fail timeout 124
+		return
+	fi
+	if [ "$final_test_rc" -ne 0 ] 2>/dev/null; then
+		speedtest_supervisor_fail "helper-exit:$final_test_rc" "$final_test_rc"
+		return
+	fi
+	if ! owned_regular_file "$test_output"; then
+		speedtest_supervisor_fail result-unsafe 1
+		return
+	fi
+	final_size="$(wc -c < "$test_output" 2>/dev/null)"
+	case "$final_size" in
+		''|*[!0-9]*)
+			speedtest_supervisor_fail result-size-unavailable 1
+			return
+			;;
+	esac
+	if [ "$final_size" -lt 2 ] || [ "$final_size" -gt 262144 ]; then
+		speedtest_supervisor_fail result-size-invalid 1
+		return
+	fi
+	final_payload="$(cat "$test_output" 2>/dev/null)" || {
+		speedtest_supervisor_fail result-read 1
+		return
+	}
+	if ! strict_single_json_object "$final_payload"; then
+		speedtest_supervisor_fail result-malformed 1
+		return
+	fi
+	[ ! -L "$final_destination" ] || {
+		speedtest_supervisor_fail destination-unsafe 1
+		return
+	}
+	rm -f "$final_destination"
+	if ! mv "$test_output" "$final_destination" || ! owned_regular_file "$final_destination"; then
+		speedtest_supervisor_fail result-publish 1
+		return
+	fi
+	speedtest_supervisor_reason=ok
+	speedtest_supervisor_rc=0
+	return 0
+}
+
 run_speedtest_with_timeout() {
 	# Keep every speedtest-go phase on the server selected by the first
 	# unshaped sample.  The helper's automatic validation may otherwise pick a
 	# different server under a deliberately shaped low-rate validation run,
 	# making the throughput and latency comparison invalid.
+	speedtest_destination="$1"
+	shift
+	speedtest_supervisor_reason=precondition
+	speedtest_supervisor_rc=1
 	[ "${recovery_prepared:-0}" = 1 ] && [ "${recovery_armed:-0}" = 1 ] &&
-		[ -f "$recovery_journal" ] && [ -e "$recovery_heartbeat" ] || return 1
+		[ -f "$recovery_journal" ] && [ -e "$recovery_heartbeat" ] || {
+			speedtest_supervisor_fail recovery-not-armed 1
+			return
+		}
 	setsid_bin="$(command -v setsid 2>/dev/null)"
-	[ -n "$setsid_bin" ] || return 1
+	[ -n "$setsid_bin" ] || {
+		speedtest_supervisor_fail setsid-unavailable 1
+		return
+	}
 	test_timeout_s="${CAKE_AUTORATE_AUTOTUNE_SPEEDTEST_TIMEOUT_S:-90}"
 	test_termination_grace_s="${CAKE_AUTORATE_AUTOTUNE_SPEEDTEST_TERM_GRACE_S:-3}"
 	case "$test_timeout_s" in ''|*[!0-9]*) test_timeout_s=90 ;; esac
@@ -2677,7 +2854,7 @@ run_speedtest_with_timeout() {
 	[ "$test_termination_grace_s" -ge 1 ] 2>/dev/null || test_termination_grace_s=3
 	[ "$test_termination_grace_s" -le 10 ] 2>/dev/null || test_termination_grace_s=10
 	test_output="$job_dir/speedtest-phase.raw"
-	rm -f "$test_output"
+	rm -f "$test_output" "$speedtest_destination"
 	launch_parent_group="$(proc_group "$$" 2>/dev/null)"
 	launch_parent_session="$(proc_session "$$" 2>/dev/null)"
 	if [ "$backend" = "speedtest-go" ] && is_positive_uint "${selected_server_id:-}"; then
@@ -2693,7 +2870,8 @@ run_speedtest_with_timeout() {
 	is_positive_uint "$test_starttime" || {
 		kill -KILL "$test_pid" 2>/dev/null || true
 		wait "$test_pid" 2>/dev/null || true
-		return 1
+		speedtest_supervisor_fail launch-identity 1
+		return
 	}
 	test_stopped=0
 	identity_attempt=0
@@ -2715,15 +2893,16 @@ run_speedtest_with_timeout() {
 		[ "$(proc_starttime "$test_pid" 2>/dev/null)" = "$test_starttime" ] &&
 			kill -KILL "$test_pid" 2>/dev/null || true
 		wait "$test_pid" 2>/dev/null || true
-		rm -f "$test_output"
-		return 1
+		speedtest_supervisor_fail launch-stopped-handshake 1
+		return
 	fi
 	recovery_active_test_pgid="$test_pid"
 	recovery_active_test_starttime="$test_starttime"
 	if ! write_recovery_journal; then
 		kill -KILL "$test_pid" 2>/dev/null || true
 		wait "$test_pid" 2>/dev/null || true
-		return 1
+		speedtest_supervisor_fail journal-publish 1
+		return
 	fi
 	[ "$(proc_starttime "$test_pid" 2>/dev/null)" = "$test_starttime" ] &&
 		[ "$(proc_state "$test_pid" 2>/dev/null)" = T ] &&
@@ -2733,17 +2912,31 @@ run_speedtest_with_timeout() {
 			[ "$(proc_starttime "$test_pid" 2>/dev/null)" = "$test_starttime" ] &&
 				kill -KILL "$test_pid" 2>/dev/null || true
 			wait "$test_pid" 2>/dev/null || true
-			process_group_contains_session "$test_pid" && return 1
-			clear_active_test_journal || return 1
-			return 1
+			if process_group_contains_session "$test_pid"; then
+				speedtest_supervisor_fail descendant-remained 1
+				return
+			fi
+			if ! clear_active_test_journal; then
+				speedtest_supervisor_fail journal-clear 1
+				return
+			fi
+			speedtest_supervisor_fail identity-before-resume 1
+			return
 		}
 	kill -CONT "$test_pid" 2>/dev/null || {
-		[ "$(proc_starttime "$test_pid" 2>/dev/null)" = "$test_starttime" ] &&
+			[ "$(proc_starttime "$test_pid" 2>/dev/null)" = "$test_starttime" ] &&
 			kill -KILL "$test_pid" 2>/dev/null || true
 		wait "$test_pid" 2>/dev/null || true
-		process_group_contains_session "$test_pid" && return 1
-		clear_active_test_journal || return 1
-		return 1
+		if process_group_contains_session "$test_pid"; then
+			speedtest_supervisor_fail descendant-remained 1
+			return
+		fi
+		if ! clear_active_test_journal; then
+			speedtest_supervisor_fail journal-clear 1
+			return
+		fi
+		speedtest_supervisor_fail resume 1
+		return
 	}
 	test_group_verified=0
 	transition_attempt=0
@@ -2764,11 +2957,8 @@ run_speedtest_with_timeout() {
 		case "$test_state" in
 			''|Z|z)
 				if wait "$test_pid" 2>/dev/null; then test_rc=0; else test_rc="$?"; fi
-				process_group_contains_session "$test_pid" && return 1
-				clear_active_test_journal || return 1
-				cat "$test_output" 2>/dev/null
-				rm -f "$test_output"
-				return "$test_rc"
+				finalize_speedtest_result "$speedtest_destination" "$test_rc" 0
+				return
 				;;
 			*)
 				# The child never completed its verified setsid transition.  It is
@@ -2779,10 +2969,16 @@ run_speedtest_with_timeout() {
 					kill -KILL "$test_pid" 2>/dev/null || true
 				fi
 				wait "$test_pid" 2>/dev/null || true
-				process_group_contains_session "$test_pid" && return 1
-				clear_active_test_journal || return 1
-				rm -f "$test_output"
-				return 1
+				if process_group_contains_session "$test_pid"; then
+					speedtest_supervisor_fail descendant-remained 1
+					return
+				fi
+				if ! clear_active_test_journal; then
+					speedtest_supervisor_fail journal-clear 1
+					return
+				fi
+				speedtest_supervisor_fail setsid-transition 1
+				return
 				;;
 		esac
 	fi
@@ -2793,7 +2989,8 @@ run_speedtest_with_timeout() {
 		if [ "$elapsed_seconds" -ge "$test_timeout_s" ]; then
 			timed_out=1
 			signal_test_group_until_gone "$test_pid" "$test_starttime" || {
-				return 1
+				speedtest_supervisor_fail termination-failed 1
+				return
 			}
 			break
 		fi
@@ -2801,18 +2998,14 @@ run_speedtest_with_timeout() {
 		   [ "$(proc_starttime "$test_pid" 2>/dev/null)" = "$test_starttime" ] &&
 		   ! speedtest_identity_matches "$test_pid" "$test_starttime"; then
 			signal_test_group_until_gone "$test_pid" "$test_starttime" || true
-			return 1
+			speedtest_supervisor_fail identity-mismatch 1
+			return
 		fi
 		elapsed_seconds=$((elapsed_seconds + 1))
 		sleep 1
 	done
 	if wait "$test_pid"; then test_rc=0; else test_rc="$?"; fi
-	process_group_contains_session "$test_pid" && return 1
-	clear_active_test_journal || return 1
-	cat "$test_output" 2>/dev/null
-	[ "$timed_out" = 1 ] && test_rc=124
-	rm -f "$test_output"
-	return "$test_rc"
+	finalize_speedtest_result "$speedtest_destination" "$test_rc" "$timed_out"
 }
 
 baseline_latency() {
@@ -2922,19 +3115,36 @@ preflight() {
 		fail "Enabled autorate instance $conflicting_instance already owns $target_if. Tune that instance instead of creating a duplicate."
 }
 
+speedtest_supervisor_json() {
+	if [ -z "${speedtest_supervisor_reason:-}" ] || [ "$speedtest_supervisor_reason" = ok ]; then
+		printf 'null'
+		return
+	fi
+	supervisor_raw_available=false
+	supervisor_raw_bytes=0
+	if [ -n "${test_output:-}" ] && owned_regular_file "$test_output"; then
+		supervisor_raw_available=true
+		supervisor_raw_bytes="$(wc -c < "$test_output" 2>/dev/null)"
+		case "$supervisor_raw_bytes" in ''|*[!0-9]*) supervisor_raw_bytes=0 ;; esac
+	fi
+	printf '{"reason":"%s","exit_code":%s,"raw_available":%s,"raw_bytes":%s}' \
+		"$(json_escape "$speedtest_supervisor_reason")" \
+		"${speedtest_supervisor_rc:-1}" "$supervisor_raw_available" "$supervisor_raw_bytes"
+}
+
 fail() {
 	message="$1"
 	if [ -e "$cancel_file" ]; then
 		exit 130
 	fi
-	stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":4,\"stage\":\"$(json_escape "${current_phase:-unknown}")\",\"error\":\"$(json_escape "$message")\",\"auto_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":${phase_contamination_seen:-false},\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[${phase_background_runs_json:-}],\"validation_attempts\":[${validation_attempts_json:-}],\"validation\":${validation_json:-null},\"pinger_plan\":${pinger_plan:-null},\"proposal\":${proposal:-null},\"configuration_written\":false}"
+	stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":5,\"stage\":\"$(json_escape "${current_phase:-unknown}")\",\"error\":\"$(json_escape "$message")\",\"speedtest_supervisor\":$(speedtest_supervisor_json),\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":${phase_contamination_seen:-false},\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[${phase_background_runs_json:-}],\"validation_attempts\":[${validation_attempts_json:-}],\"validation\":${validation_json:-null},\"pinger_plan\":${pinger_plan:-null},\"proposal\":${proposal:-null},\"configuration_written\":false}"
 	exit 1
 }
 
 measurement_inconclusive() {
 	measurement_stage="$1"
 	measurement_reason="$2"
-	stage_terminal_json error "{\"state\":\"inconclusive\",\"schema_version\":4,\"stage\":\"$(json_escape "$measurement_stage")\",\"error\":\"Measurement evidence remained invalid after a bounded retry; no candidate was accepted.\",\"reason\":\"$(json_escape "$measurement_reason")\",\"retryable\":true,\"auto_apply_eligible\":false,\"phase_evidence_complete\":false,\"phase_contamination_seen\":${phase_contamination_seen:-false},\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[${phase_background_runs_json:-}],\"validation_attempts\":[${validation_attempts_json:-}],\"pinger_plan\":${pinger_plan:-null},\"proposal\":${proposal:-null},\"configuration_written\":false}"
+	stage_terminal_json error "{\"state\":\"inconclusive\",\"schema_version\":5,\"stage\":\"$(json_escape "$measurement_stage")\",\"error\":\"Measurement evidence remained invalid after a bounded retry; no candidate was accepted.\",\"reason\":\"$(json_escape "$measurement_reason")\",\"retryable\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"phase_contamination_seen\":${phase_contamination_seen:-false},\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[${phase_background_runs_json:-}],\"validation_attempts\":[${validation_attempts_json:-}],\"pinger_plan\":${pinger_plan:-null},\"proposal\":${proposal:-null},\"configuration_written\":false}"
 	exit 1
 }
 
@@ -2945,14 +3155,33 @@ run_measurement() {
 		write_status throughput "$((30 + index * 20))" "Running unshaped throughput sample $index of 2 (attempt $measurement_attempt)"
 		phase_background_kind=unshaped
 		start_phase_background_counter "$(configured_rate dl)" "$(configured_rate ul)"
+		fair_control_this_attempt=0
+		if [ "$autotune_profile" = fair ] && [ "$index" -eq 2 ]; then
+			if start_fair_control_monitors "$measurement_attempt"; then
+				fair_control_this_attempt=1
+			else
+				fair_control_json='{"available":false,"measurement_evidence":{"valid":false,"reason":"control-monitor-start-failed"}}'
+			fi
+		fi
 		measurement_result_file="$job_dir/unshaped-$index-$measurement_attempt.result"
-		if ! run_speedtest_with_timeout "$job_name" "$target_if" run "$backend" "" "$route_mode" "$mwan3_member" > "$measurement_result_file"; then
+		if ! run_speedtest_with_timeout "$measurement_result_file" \
+			"$job_name" "$target_if" run "$backend" "" "$route_mode" "$mwan3_member"; then
+			[ "$fair_control_this_attempt" -eq 0 ] ||
+				stop_fair_control_monitors >/dev/null 2>&1 || true
 			stop_phase_background_counter
-			fail "Throughput sample $index failed."
+			fail "Throughput sample $index failed in the speed-test supervisor (${speedtest_supervisor_reason:-unknown})."
 		fi
 		result="$(cat "$measurement_result_file" 2>/dev/null)"
 		rm -f "$measurement_result_file"
+		if [ "$fair_control_this_attempt" -eq 1 ] &&
+		   ! stop_fair_control_monitors; then
+			fair_control_json='{"available":false,"measurement_evidence":{"valid":false,"reason":"control-monitor-stop-failed"}}'
+			fair_control_this_attempt=0
+		fi
 		stop_phase_background_counter
+		if [ "$fair_control_this_attempt" -eq 1 ]; then
+			evaluate_fair_control "$result"
+		fi
 		result_backend="$(extract_json "$result" '@.backend')"
 		[ "$result_backend" = "$backend" ] ||
 			fail "Speed test backend changed from $backend to ${result_backend:-unknown} during unshaped sample $index."
@@ -2975,7 +3204,7 @@ run_measurement() {
 			if [ "${conservative_mode:-0}" = 1 ]; then
 				break
 			fi
-			stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":4,\"error\":\"Forwarded WAN traffic contaminated both attempts of unshaped sample $index. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"throughput\",\"auto_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
+			stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":5,\"error\":\"Forwarded WAN traffic contaminated both attempts of unshaped sample $index. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"throughput\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
 			exit 1
 		fi
 		measurement_attempt=$((measurement_attempt + 1))
@@ -3065,6 +3294,252 @@ stop_validation_monitors() {
 	[ "$monitors_stopped" = 1 ]
 }
 
+quality_grade_for_delta() {
+	awk -v delta="$1" 'BEGIN {
+		if (delta < 5) print "A+"
+		else if (delta < 30) print "A"
+		else if (delta < 60) print "B"
+		else if (delta < 200) print "C"
+		else if (delta < 400) print "D"
+		else print "F"
+	}'
+}
+
+quality_grade_rank() {
+	case "$1" in
+		A+) printf '0\n' ;;
+		A) printf '1\n' ;;
+		B) printf '2\n' ;;
+		C) printf '3\n' ;;
+		D) printf '4\n' ;;
+		F) printf '5\n' ;;
+		*) return 1 ;;
+	esac
+}
+
+build_fair_outcome() {
+	fair_outcome_mode="$1"
+	fair_recommended_action=apply_sqm
+	fair_disable_available=false
+	fair_comparison_reason=quality-target-met
+	fair_control_available="$(extract_json "$fair_control_json" '@.available' 2>/dev/null || true)"
+	fair_control_dl_gain_percent=0
+	fair_control_ul_gain_percent=0
+
+	if [ "$fair_outcome_mode" = throughput-fallback ]; then
+		fair_comparison_reason=quality-target-unreachable-above-throughput-floor
+		if [ "$fair_control_available" = true ]; then
+			fair_control_grade_value="$(extract_json "$fair_control_json" '@.grade')"
+			fair_control_delta_value="$(extract_json "$fair_control_json" '@.effective_delta_ms')"
+			fair_control_dl="$(extract_json "$fair_control_json" '@.throughput.download_kbps')"
+			fair_control_ul="$(extract_json "$fair_control_json" '@.throughput.upload_kbps')"
+			fair_control_background_available="$(extract_json "$fair_control_json" '@.forwarded_background.available')"
+			fair_control_background_contaminated="$(extract_json "$fair_control_json" '@.forwarded_background.contaminated')"
+			fair_control_background_dl="$(extract_json "$fair_control_json" '@.forwarded_background.download_kbps')"
+			fair_control_background_ul="$(extract_json "$fair_control_json" '@.forwarded_background.upload_kbps')"
+			fair_control_background_dl_limit="$(extract_json "$fair_control_json" '@.forwarded_background.download_limit_kbps')"
+			fair_control_background_ul_limit="$(extract_json "$fair_control_json" '@.forwarded_background.upload_limit_kbps')"
+			fair_shaped_rank="$(quality_grade_rank "$validation_actual_grade")" || fair_shaped_rank=99
+			fair_control_rank="$(quality_grade_rank "$fair_control_grade_value")" || fair_control_rank=99
+			fair_control_dl_gain_percent="$(awk -v control="$fair_control_dl" -v shaped="$shaped_dl" 'BEGIN {
+				if (control <= 0 || shaped <= 0) { print 0; exit }
+				printf "%.3f", (control / shaped - 1) * 100
+			}')"
+			fair_control_ul_gain_percent="$(awk -v control="$fair_control_ul" -v shaped="$shaped_ul" 'BEGIN {
+				if (control <= 0 || shaped <= 0) { print 0; exit }
+				printf "%.3f", (control / shaped - 1) * 100
+			}')"
+			if awk -v control_rank="$fair_control_rank" -v shaped_rank="$fair_shaped_rank" \
+				-v control_delta="$fair_control_delta_value" -v shaped_delta="$effective_loaded_delta_ms" \
+				-v dl_gain="$fair_control_dl_gain_percent" -v ul_gain="$fair_control_ul_gain_percent" \
+				-v background_available="$fair_control_background_available" \
+				-v background_contaminated="$fair_control_background_contaminated" \
+				-v background_dl="$fair_control_background_dl" -v background_ul="$fair_control_background_ul" \
+				-v background_dl_limit="$fair_control_background_dl_limit" \
+				-v background_ul_limit="$fair_control_background_ul_limit" 'BEGIN {
+					exit(!(background_available == "true" && background_contaminated == "false" &&
+						background_dl ~ /^[0-9]+([.][0-9]+)?$/ &&
+						background_ul ~ /^[0-9]+([.][0-9]+)?$/ &&
+						background_dl_limit ~ /^[0-9]+([.][0-9]+)?$/ &&
+						background_ul_limit ~ /^[0-9]+([.][0-9]+)?$/ &&
+						background_dl <= background_dl_limit &&
+						background_ul <= background_ul_limit &&
+						control_rank <= shaped_rank &&
+						control_delta <= shaped_delta + 10 &&
+						dl_gain >= 2 && ul_gain >= 2))
+				}'; then
+				fair_outcome_mode=sqm-disable-recommended
+				fair_recommended_action=disable_sqm
+				fair_disable_available=true
+				fair_comparison_reason=no-material-latency-benefit-with-throughput-cost
+			fi
+		fi
+	fi
+
+	fair_allowed_actions='"apply_sqm","keep_current"'
+	[ "$fair_disable_available" = true ] &&
+		fair_allowed_actions="$fair_allowed_actions,\"disable_sqm\""
+	fair_outcome_json="{\"mode\":\"$(json_escape "$fair_outcome_mode")\",\"target_grade\":\"C\",\"target_delta_ms\":200,\"capacity_floor_percent\":90,\"actual_grade\":\"$(json_escape "$validation_actual_grade")\",\"actual_effective_delta_ms\":$effective_loaded_delta_ms,\"recommended_action\":\"$fair_recommended_action\",\"allowed_actions\":[$fair_allowed_actions],\"disable_sqm_available\":$fair_disable_available,\"comparison_reason\":\"$(json_escape "$fair_comparison_reason")\",\"no_sqm_control\":$fair_control_json,\"throughput_gain_without_sqm\":{\"download_percent\":$fair_control_dl_gain_percent,\"upload_percent\":$fair_control_ul_gain_percent}}"
+}
+
+start_fair_control_monitors() {
+	fair_control_attempt="$1"
+	fair_control_active=1
+	cpu_pid=""
+	latency_pid=""
+	transport_pid=""
+	loaded_raw="$job_dir/fair-control-icmp-$fair_control_attempt.raw"
+	latency_marker="$job_dir/fair-control-latency.running"
+	transport_raw="$job_dir/fair-control-transport-$fair_control_attempt.raw"
+	transport_values="$job_dir/fair-control-transport-$fair_control_attempt.values"
+	transport_sorted="$job_dir/fair-control-transport-$fair_control_attempt.sorted"
+	transport_errors="$job_dir/fair-control-transport-$fair_control_attempt.errors"
+	cpu_values="$job_dir/fair-control-cpu-$fair_control_attempt.values"
+	cpu_marker="$job_dir/fair-control-cpu.running"
+	: > "$loaded_raw"
+	: > "$transport_raw"
+	: > "$transport_values"
+	: > "$cpu_values"
+	: > "$cpu_marker"
+	: > "$latency_marker"
+
+	if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_SHAPER:-0}" = 1 ]; then
+		if [ "${AUTOTUNE_MOCK_FAIR_CONTROL_BAD:-0}" = 1 ]; then
+			fair_control_icmp_base=310
+			fair_control_transport_raw='[310.0,320.0,330.0,340.0]'
+		else
+			fair_control_icmp_base=20
+			fair_control_transport_raw='[20.0,22.0,23.0,24.0]'
+		fi
+		printf '%s\n' \
+			"[1.00000] 1.1.1.1 : [0], 64 bytes, ${fair_control_icmp_base}.0 ms (${fair_control_icmp_base}.0 avg, 0% loss)" \
+			"[1.10000] 9.9.9.9 : [0], 64 bytes, $((fair_control_icmp_base + 1)).0 ms ($((fair_control_icmp_base + 1)).0 avg, 0% loss)" \
+			"[1.20000] 8.8.8.8 : [0], 64 bytes, $((fair_control_icmp_base + 2)).0 ms ($((fair_control_icmp_base + 2)).0 avg, 0% loss)" \
+			"[2.00000] 1.1.1.1 : [1], 64 bytes, $((fair_control_icmp_base + 2)).0 ms ($((fair_control_icmp_base + 1)).0 avg, 0% loss)" \
+			"[2.10000] 9.9.9.9 : [1], 64 bytes, $((fair_control_icmp_base + 3)).0 ms ($((fair_control_icmp_base + 2)).0 avg, 0% loss)" \
+			"[2.20000] 8.8.8.8 : [1], 64 bytes, $((fair_control_icmp_base + 4)).0 ms ($((fair_control_icmp_base + 3)).0 avg, 0% loss)" \
+			"[3.00000] 1.1.1.1 : [2], 64 bytes, $((fair_control_icmp_base + 4)).0 ms ($((fair_control_icmp_base + 2)).0 avg, 0% loss)" \
+			"[3.10000] 9.9.9.9 : [2], 64 bytes, $((fair_control_icmp_base + 5)).0 ms ($((fair_control_icmp_base + 3)).0 avg, 0% loss)" \
+			"[3.20000] 8.8.8.8 : [2], 64 bytes, $((fair_control_icmp_base + 6)).0 ms ($((fair_control_icmp_base + 4)).0 avg, 0% loss)" \
+			"[4.00000] 1.1.1.1 : [3], 64 bytes, $((fair_control_icmp_base + 6)).0 ms ($((fair_control_icmp_base + 3)).0 avg, 0% loss)" \
+			"[4.10000] 9.9.9.9 : [3], 64 bytes, $((fair_control_icmp_base + 7)).0 ms ($((fair_control_icmp_base + 4)).0 avg, 0% loss)" \
+			"[4.20000] 8.8.8.8 : [3], 64 bytes, $((fair_control_icmp_base + 8)).0 ms ($((fair_control_icmp_base + 5)).0 avg, 0% loss)" > "$loaded_raw"
+		printf '%s\n' 12.0 > "$cpu_values"
+		printf '%s\n' \
+			"{\"index\":1,\"backend\":\"$transport_probe_reported_backend\",\"endpoint\":\"$transport_probe_endpoint\",\"raw_ms\":$fair_control_transport_raw,\"trusted\":true,\"connection_reused\":true}" \
+			"{\"index\":2,\"backend\":\"$transport_probe_reported_backend\",\"endpoint\":\"$transport_probe_endpoint\",\"raw_ms\":$fair_control_transport_raw,\"trusted\":true,\"connection_reused\":true}" \
+			"{\"index\":3,\"backend\":\"$transport_probe_reported_backend\",\"endpoint\":\"$transport_probe_endpoint\",\"raw_ms\":$fair_control_transport_raw,\"trusted\":true,\"connection_reused\":true}" \
+			"{\"index\":4,\"backend\":\"$transport_probe_reported_backend\",\"endpoint\":\"$transport_probe_endpoint\",\"raw_ms\":$fair_control_transport_raw,\"trusted\":true,\"connection_reused\":true}" > "$transport_raw"
+	else
+		cpu_monitor "$cpu_values" "$cpu_marker" &
+		cpu_pid="$!"
+		cpu_starttime="$(proc_starttime "$cpu_pid" 2>/dev/null)"
+		is_positive_uint "$cpu_starttime" || {
+			stop_validation_monitors >/dev/null 2>&1 || true
+			fair_control_active=0
+			return 1
+		}
+		start_transport_latency_monitor "$transport_raw" "$transport_errors" || {
+			stop_validation_monitors >/dev/null 2>&1 || true
+			fair_control_active=0
+			return 1
+		}
+		icmp_latency_monitor "$loaded_raw" "$latency_marker" &
+		latency_pid="$!"
+		latency_starttime="$(proc_starttime "$latency_pid" 2>/dev/null)"
+		is_positive_uint "$latency_starttime" || {
+			stop_validation_monitors >/dev/null 2>&1 || true
+			fair_control_active=0
+			return 1
+		}
+	fi
+	return 0
+}
+
+stop_fair_control_monitors() {
+	[ "${fair_control_active:-0}" = 1 ] || return 0
+	stop_validation_monitors || return 1
+	fair_control_active=0
+	return 0
+}
+
+evaluate_fair_control() {
+	fair_control_result="$1"
+	fair_control_valid=true
+	fair_control_reason=ok
+	fair_control_direction="$(extract_json "$fair_control_result" '@.test_direction')"
+	fair_control_bypassed="$(extract_json "$fair_control_result" '@.shaper_bypassed')"
+	fair_control_sqm_paused="$(extract_json "$fair_control_result" '@.sqm_paused')"
+	if [ "$fair_control_direction" != both ]; then
+		fair_control_valid=false
+		fair_control_reason=control-direction-invalid
+	elif [ "$fair_control_bypassed" != true ]; then
+		fair_control_valid=false
+		fair_control_reason=control-shaper-proof-invalid
+	elif [ "$fair_control_sqm_paused" != true ] || [ "${temp_shaper_active:-0}" != 0 ]; then
+		fair_control_valid=false
+		fair_control_reason=control-sqm-proof-invalid
+	fi
+	fair_control_icmp_stats="$job_dir/fair-control-icmp-$fair_control_attempt.tsv"
+	if [ "$fair_control_valid" = true ] &&
+	   ! build_icmp_evidence "$loaded_raw" "$reflectors" "$fair_control_icmp_stats" loaded 3 3; then
+		fair_control_valid=false
+		fair_control_reason=control-icmp-insufficient
+	elif [ "$fair_control_valid" = true ] &&
+	     ! classify_loaded_icmp_evidence "$fair_control_icmp_stats" "$job_dir/icmp-baseline-reflectors.tsv"; then
+		fair_control_valid=false
+		fair_control_reason=control-icmp-inconsistent
+	fi
+	if [ "$fair_control_valid" = true ]; then
+		fair_control_loaded="$(latency_stats "$loaded_raw")" || {
+			fair_control_valid=false
+			fair_control_reason=control-icmp-statistics
+		}
+	fi
+	if [ "$fair_control_valid" = true ]; then
+		set -- $fair_control_loaded
+		fair_control_icmp_median_ms="$1"
+		fair_control_icmp_p95_ms="$2"
+		fair_control_icmp_max_ms="$3"
+		fair_control_icmp_samples="$4"
+		fair_control_loss_percent="$(packet_loss_percent "$loaded_raw")"
+		[ -n "$fair_control_loss_percent" ] || {
+			fair_control_valid=false
+			fair_control_reason=control-loss-unavailable
+		}
+	fi
+	if [ "$fair_control_valid" = true ] &&
+	   ! validate_transport_evidence "$transport_raw" "$transport_values" 4 12; then
+		fair_control_valid=false
+		fair_control_reason="$transport_evidence_reason"
+	fi
+	if [ "$fair_control_valid" = true ]; then
+		fair_control_transport="$(numeric_latency_stats "$transport_values" "$transport_sorted")" || {
+			fair_control_valid=false
+			fair_control_reason=control-transport-statistics
+		}
+	fi
+	fair_control_cpu_peak="$(sort -n "$cpu_values" 2>/dev/null | tail -n 1)"
+	if [ -z "$fair_control_cpu_peak" ]; then
+		fair_control_valid=false
+		fair_control_reason=control-cpu-unavailable
+	fi
+	if [ "$fair_control_valid" != true ]; then
+		fair_control_json="{\"available\":false,\"measurement_evidence\":{\"valid\":false,\"reason\":\"$(json_escape "$fair_control_reason")\"}}"
+		return 0
+	fi
+	set -- $fair_control_transport
+	fair_control_transport_median_ms="$1"
+	fair_control_transport_p95_ms="$2"
+	fair_control_transport_max_ms="$3"
+	fair_control_transport_samples="$4"
+	fair_control_icmp_delta_ms="$(nonnegative_delta "$fair_control_icmp_p95_ms" "$idle_p95_ms")"
+	fair_control_transport_delta_ms="$(nonnegative_delta "$fair_control_transport_p95_ms" "$transport_idle_p95_ms")"
+	fair_control_effective_delta_ms="$(maximum_number "$fair_control_icmp_delta_ms" "$fair_control_transport_delta_ms")"
+	fair_control_grade="$(quality_grade_for_delta "$fair_control_effective_delta_ms")"
+	fair_control_json="{\"available\":true,\"measurement_evidence\":{\"valid\":true,\"reason\":\"ok\",\"test_direction\":\"both\",\"shaper_bypassed\":true,\"sqm_paused\":true},\"grade\":\"$(json_escape "$fair_control_grade")\",\"effective_delta_ms\":$fair_control_effective_delta_ms,\"throughput\":{\"download_kbps\":$(extract_json "$fair_control_result" '@.download_kbps'),\"upload_kbps\":$(extract_json "$fair_control_result" '@.upload_kbps')},\"icmp_latency\":{\"median_ms\":$fair_control_icmp_median_ms,\"p95_ms\":$fair_control_icmp_p95_ms,\"max_ms\":$fair_control_icmp_max_ms,\"idle_p95_ms\":$idle_p95_ms,\"delta_p95_ms\":$fair_control_icmp_delta_ms,\"samples\":$fair_control_icmp_samples,\"loss_percent\":$fair_control_loss_percent},\"transport_latency\":{\"backend\":\"$(json_escape "$transport_probe_backend")\",\"endpoint\":\"$(json_escape "$transport_probe_endpoint")\",\"median_ms\":$fair_control_transport_median_ms,\"p95_ms\":$fair_control_transport_p95_ms,\"max_ms\":$fair_control_transport_max_ms,\"idle_p95_ms\":$transport_idle_p95_ms,\"delta_p95_ms\":$fair_control_transport_delta_ms,\"samples\":$fair_control_transport_samples},\"cpu_peak_percent\":$fair_control_cpu_peak,\"forwarded_background\":$(phase_background_json)}"
+}
+
 run_validation_direction_phase() {
 	phase_direction="$1"
 	phase_validation_attempt="$2"
@@ -3105,7 +3580,8 @@ run_validation_direction_phase() {
 			if [ "${AUTOTUNE_MOCK_ICMP_RATE_LIMIT:-0}" = 1 ]; then
 				printf '%s\n' '[5.00000] 1.1.1.1 : [4], timed out (NaN avg, 20% loss)' >> "$loaded_raw"
 			fi
-			if [ "${AUTOTUNE_MOCK_RC16:-0}" = 1 ]; then
+			if [ "${AUTOTUNE_MOCK_RC16:-0}" = 1 ] ||
+			   [ "${AUTOTUNE_MOCK_FAIR_SHAPED_BAD:-0}" = 1 ]; then
 				printf '%s\n' 53.2 > "$cpu_values"
 				phase_test_transport_raw='[230.0,240.0,250.0,480.0]'
 			else
@@ -3140,11 +3616,12 @@ run_validation_direction_phase() {
 		fi
 		start_phase_background_counter "$dl_base" "$ul_base"
 		phase_result_file="$job_dir/shaped-$phase_direction-$phase_validation_attempt-$phase_background_attempt.result"
-		if ! run_speedtest_with_timeout "$job_name" "$target_if" run "$backend" shaped "$route_mode" "$mwan3_member" "$phase_direction" > "$phase_result_file"; then
+		if ! run_speedtest_with_timeout "$phase_result_file" \
+			"$job_name" "$target_if" run "$backend" shaped "$route_mode" "$mwan3_member" "$phase_direction"; then
 			stop_phase_background_counter
 			stop_validation_monitors ||
 				fail "A validation monitor could not be terminated; crash recovery remains armed."
-			fail "The $phase_direction-only shaped validation speed test failed."
+			fail "The $phase_direction-only shaped validation speed test failed in the supervisor (${speedtest_supervisor_reason:-unknown})."
 		fi
 		if ! temporary_shaper_owned; then
 			stop_phase_background_counter
@@ -3276,7 +3753,7 @@ run_validation_direction_phase() {
 			continue
 		fi
 		if [ "${conservative_mode:-0}" != 1 ]; then
-			stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":4,\"error\":\"Forwarded WAN traffic contaminated both $phase_direction-only shaped validation attempts. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"shaped-$phase_direction\",\"auto_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"proposal\":$proposal,\"configuration_written\":false}"
+			stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":5,\"error\":\"Forwarded WAN traffic contaminated both $phase_direction-only shaped validation attempts. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"shaped-$phase_direction\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"proposal\":$proposal,\"configuration_written\":false}"
 			exit 1
 		fi
 		if [ "$phase_background_available" != true ]; then
@@ -3357,6 +3834,7 @@ run_shaped_validation() {
 	fi
 
 	typed_validation_decision="$("$daemon_bin" --autotune-validate \
+		--profile "$autotune_profile" \
 		--dl-observed-low-kbps "$raw_dl_low" \
 		--ul-observed-low-kbps "$raw_ul_low" \
 		--dl-candidate-kbps "$dl_base" \
@@ -3385,6 +3863,9 @@ run_shaped_validation() {
 		fail "The typed shaped-candidate validator rejected its inputs."
 
 	validation_pass="$(extract_json "$typed_validation_decision" '@.pass')"
+	validation_hard_pass="$(extract_json "$typed_validation_decision" '@.hard_pass')"
+	validation_quality_target_met="$(extract_json "$typed_validation_decision" '@.quality_target_met')"
+	validation_actual_grade="$(extract_json "$typed_validation_decision" '@.actual_grade')"
 	validation_score="$(extract_json "$typed_validation_decision" '@.score')"
 	validation_correction_action="$(extract_json "$typed_validation_decision" '@.correction.action')"
 	validation_correction_feasible="$(extract_json "$typed_validation_decision" '@.correction.feasible')"
@@ -3402,6 +3883,11 @@ run_shaped_validation() {
 		true:true|false:true|false:false) ;;
 		*) fail "The typed validator returned an invalid decision." ;;
 	esac
+	case "$validation_hard_pass:$validation_quality_target_met" in
+		true:true|true:false|false:true|false:false) ;;
+		*) fail "The typed validator returned invalid Fair safety or quality state." ;;
+	esac
+	case "$validation_actual_grade" in A+|A|B|C|D|F) ;; *) fail "The typed validator returned an invalid quality grade." ;; esac
 	case "$validation_correction_action" in
 		none|increase|decrease|mixed|retry-measurement|infeasible) ;;
 		*) fail "The typed validator returned an unknown correction action." ;;
@@ -3434,7 +3920,7 @@ run_shaped_validation() {
 	transport_loaded_p95_ms="$(maximum_number "$dl_transport_p95_ms" "$ul_transport_p95_ms")"
 	transport_loaded_max_ms="$(maximum_number "$dl_transport_max_ms" "$ul_transport_max_ms")"
 	transport_loaded_samples=$((dl_transport_samples + ul_transport_samples))
-	validation_json="{\"pass\":$validation_pass,\"contaminated\":$validation_contaminated,\"score\":$validation_score,\"metrics\":$validation_metrics_json,\"signals\":$validation_signals_json,\"gates\":$validation_gates_json,\"reasons\":$validation_reasons_json,\"correction\":$validation_correction_json,\"candidate_base\":{\"download_kbps\":$dl_base,\"upload_kbps\":$ul_base},\"throughput\":{\"download_kbps\":$shaped_dl,\"upload_kbps\":$shaped_ul,\"download_candidate_realization_percent\":$dl_candidate_realization,\"upload_candidate_realization_percent\":$ul_candidate_realization,\"download_capacity_retention_percent\":$dl_retention,\"upload_capacity_retention_percent\":$ul_retention,\"comparison\":\"observed-low\"},\"direction_phases\":{\"download\":$download_phase_observation_json,\"upload\":$upload_phase_observation_json},\"latency\":{\"median_ms\":$loaded_median_ms,\"p95_ms\":$loaded_p95_ms,\"max_ms\":$loaded_max_ms,\"delta_p95_ms\":$loaded_delta_ms,\"samples\":$loaded_samples,\"loss_percent\":$loss_percent},\"transport_latency\":{\"backend\":\"$(json_escape "$transport_probe_backend")\",\"endpoint\":\"$(json_escape "$transport_probe_endpoint")\",\"median_ms\":$transport_loaded_median_ms,\"p95_ms\":$transport_loaded_p95_ms,\"max_ms\":$transport_loaded_max_ms,\"delta_p95_ms\":$transport_loaded_delta_ms,\"samples\":$transport_loaded_samples},\"effective_delta_ms\":$effective_loaded_delta_ms,\"cpu_peak_percent\":$cpu_peak,\"server_id\":\"$(json_escape "$selected_server_id")\",\"decision\":$typed_validation_decision}"
+	validation_json="{\"profile\":\"$(json_escape "$autotune_profile")\",\"pass\":$validation_pass,\"hard_pass\":$validation_hard_pass,\"quality_target_met\":$validation_quality_target_met,\"actual_grade\":\"$(json_escape "$validation_actual_grade")\",\"contaminated\":$validation_contaminated,\"score\":$validation_score,\"metrics\":$validation_metrics_json,\"signals\":$validation_signals_json,\"gates\":$validation_gates_json,\"reasons\":$validation_reasons_json,\"correction\":$validation_correction_json,\"candidate_base\":{\"download_kbps\":$dl_base,\"upload_kbps\":$ul_base},\"throughput\":{\"download_kbps\":$shaped_dl,\"upload_kbps\":$shaped_ul,\"download_candidate_realization_percent\":$dl_candidate_realization,\"upload_candidate_realization_percent\":$ul_candidate_realization,\"download_capacity_retention_percent\":$dl_retention,\"upload_capacity_retention_percent\":$ul_retention,\"comparison\":\"observed-low\"},\"direction_phases\":{\"download\":$download_phase_observation_json,\"upload\":$upload_phase_observation_json},\"latency\":{\"median_ms\":$loaded_median_ms,\"p95_ms\":$loaded_p95_ms,\"max_ms\":$loaded_max_ms,\"delta_p95_ms\":$loaded_delta_ms,\"samples\":$loaded_samples,\"loss_percent\":$loss_percent},\"transport_latency\":{\"backend\":\"$(json_escape "$transport_probe_backend")\",\"endpoint\":\"$(json_escape "$transport_probe_endpoint")\",\"median_ms\":$transport_loaded_median_ms,\"p95_ms\":$transport_loaded_p95_ms,\"max_ms\":$transport_loaded_max_ms,\"delta_p95_ms\":$transport_loaded_delta_ms,\"samples\":$transport_loaded_samples},\"effective_delta_ms\":$effective_loaded_delta_ms,\"cpu_peak_percent\":$cpu_peak,\"server_id\":\"$(json_escape "$selected_server_id")\",\"decision\":$typed_validation_decision}"
 }
 
 journal_value() {
@@ -3597,9 +4083,9 @@ worker_cleanup() {
 
 	if [ ! -s "$pending_result_file" ] && [ ! -s "$pending_error_file" ]; then
 		if [ "$worker_rc" -eq 130 ] || [ -e "$cancel_file" ]; then
-			stage_terminal_json error "{\"state\":\"cancelled\",\"schema_version\":4,\"stage\":\"$(json_escape "${current_phase:-unknown}")\",\"error\":\"Full Auto-Tune was cancelled; no configuration was written.\",\"auto_apply_eligible\":false,\"configuration_written\":false}" || true
+			stage_terminal_json error "{\"state\":\"cancelled\",\"schema_version\":5,\"stage\":\"$(json_escape "${current_phase:-unknown}")\",\"error\":\"Full Auto-Tune was cancelled; no configuration was written.\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"configuration_written\":false}" || true
 		else
-			stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":4,\"stage\":\"$(json_escape "${current_phase:-unknown}")\",\"error\":\"Full Auto-Tune worker exited without a complete diagnostic result.\",\"auto_apply_eligible\":false,\"configuration_written\":false}" || true
+			stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":5,\"stage\":\"$(json_escape "${current_phase:-unknown}")\",\"error\":\"Full Auto-Tune worker exited without a complete diagnostic result.\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"configuration_written\":false}" || true
 		fi
 	fi
 
@@ -3631,6 +4117,7 @@ worker_cleanup() {
 
 run_job() {
 	job_paths
+	active_run_id="$worker_token"
 	conservative_mode="${conservative_override:-0}"
 	cancelled=0
 	temp_shaper_active=0
@@ -3680,6 +4167,9 @@ run_job() {
 	phase_contamination_seen=false
 	config_fingerprint=""
 	config_fingerprint_captured=false
+	speedtest_supervisor_reason=""
+	speedtest_supervisor_rc=0
+	test_output=""
 	current_phase=starting
 	trap 'cancelled=1; exit 130' INT TERM
 	trap 'worker_cleanup "$?"' EXIT
@@ -3770,6 +4260,8 @@ run_job() {
 	runs_json=""
 	selected_server_id=""
 	selected_external_ip=""
+	fair_control_json=null
+	fair_control_active=0
 	run_measurement 1
 	run_measurement 2
 
@@ -3795,12 +4287,35 @@ run_job() {
 	validation_attempts_json=""
 	measurement_retry_used=0
 	rate_correction_used=0
+	max_rate_corrections=1
+	[ "$autotune_profile" = fair ] && max_rate_corrections=2
+	fair_best_total=0
+	fair_best_proposal=""
+	fair_best_validation_json=""
+	fair_outcome_json=null
 	while [ "$validation_attempt_number" -le 3 ]; do
 		run_shaped_validation "$validation_attempt_number"
 		if [ -n "$validation_attempts_json" ]; then
 			validation_attempts_json="$validation_attempts_json,$validation_json"
 		else
 			validation_attempts_json="$validation_json"
+		fi
+		if [ "$autotune_profile" = fair ] && [ "$validation_hard_pass" = true ]; then
+			fair_candidate_total=$((shaped_dl + shaped_ul))
+			if [ "$fair_candidate_total" -gt "$fair_best_total" ]; then
+				fair_best_total="$fair_candidate_total"
+				fair_best_proposal="$proposal"
+				fair_best_validation_json="$validation_json"
+				fair_best_shaped_dl="$shaped_dl"
+				fair_best_shaped_ul="$shaped_ul"
+				fair_best_loaded_delta_ms="$loaded_delta_ms"
+				fair_best_transport_loaded_delta_ms="$transport_loaded_delta_ms"
+				fair_best_effective_loaded_delta_ms="$effective_loaded_delta_ms"
+				fair_best_loss_percent="$loss_percent"
+				fair_best_cpu_peak="$cpu_peak"
+				fair_best_actual_grade="$validation_actual_grade"
+				fair_best_validation_contaminated="$validation_contaminated"
+			fi
 		fi
 		[ "$validation_pass" = true ] && break
 
@@ -3812,8 +4327,8 @@ run_job() {
 				;;
 			increase|decrease|mixed)
 				[ "$validation_correction_feasible" = true ] || break
-				[ "$rate_correction_used" -eq 0 ] || break
-				rate_correction_used=1
+				[ "$rate_correction_used" -lt "$max_rate_corrections" ] || break
+				rate_correction_used=$((rate_correction_used + 1))
 				dl_revision_scale="$(scale_for_reference_base "$dl_correction_proposed_kbps" "$reference_dl_base")" ||
 					fail "Unable to calculate the exact download correction scale."
 				ul_revision_scale="$(scale_for_reference_base "$ul_correction_proposed_kbps" "$reference_ul_base")" ||
@@ -3834,26 +4349,56 @@ run_job() {
 		esac
 		validation_attempt_number=$((validation_attempt_number + 1))
 	done
+	if [ "$validation_pass" != true ] && [ "$autotune_profile" = fair ] &&
+	   [ -n "$fair_best_proposal" ]; then
+		proposal="$fair_best_proposal"
+		validation_json="$fair_best_validation_json"
+		validation_hard_pass=true
+		validation_quality_target_met=false
+		validation_actual_grade="$fair_best_actual_grade"
+		shaped_dl="$fair_best_shaped_dl"
+		shaped_ul="$fair_best_shaped_ul"
+		loaded_delta_ms="$fair_best_loaded_delta_ms"
+		transport_loaded_delta_ms="$fair_best_transport_loaded_delta_ms"
+		effective_loaded_delta_ms="$fair_best_effective_loaded_delta_ms"
+		loss_percent="$fair_best_loss_percent"
+		cpu_peak="$fair_best_cpu_peak"
+		validation_contaminated="$fair_best_validation_contaminated"
+		build_fair_outcome throughput-fallback
+	elif [ "$validation_pass" = true ] && [ "$autotune_profile" = fair ]; then
+		build_fair_outcome quality-target-met
+	fi
 	if [ "$validation_pass" != true ]; then
-		if [ "$validation_correction_action" = retry-measurement ]; then
+		if [ "$autotune_profile" = fair ] && [ "$validation_hard_pass" = true ]; then
+			:
+		elif [ "$validation_correction_action" = retry-measurement ]; then
 			phase_evidence_complete=false
 			measurement_inconclusive validation \
 				"${validation_correction_reason:-candidate-realization-unreliable}-after-bounded-retry"
+		else
+			validation_error="Directional candidate validation failed (${validation_correction_action}: ${validation_correction_reason}; DL realization ${dl_candidate_realization}%, capacity ${dl_retention}%; UL realization ${ul_candidate_realization}%, capacity ${ul_retention}%; max ICMP +${loaded_delta_ms} ms, transport +${transport_loaded_delta_ms} ms, loss ${loss_percent}%, CPU ${cpu_peak}%); no configuration was written."
+			stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":5,\"stage\":\"validation\",\"error\":\"$(json_escape "$validation_error")\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":$phase_evidence_complete,\"phase_contamination_seen\":$phase_contamination_seen,\"route_mode\":\"$(json_escape "$route_mode")\",\"route_interface\":\"$(json_escape "$route_if")\",\"route_identity\":\"$(json_escape "$route_identity")\",\"external_ip\":\"$(json_escape "$selected_external_ip")\",\"background\":$(background_json),\"baseline\":{\"median_ms\":$idle_median_ms,\"p95_ms\":$idle_p95_ms,\"samples\":$baseline_samples,\"transport_median_ms\":$transport_idle_median_ms,\"transport_p95_ms\":$transport_idle_p95_ms,\"transport_samples\":$transport_idle_samples,\"transport_backend\":\"$(json_escape "$transport_probe_backend")\",\"transport_endpoint\":\"$(json_escape "$transport_probe_endpoint")\"},\"runs\":[$runs_json],\"phase_background\":[$phase_background_runs_json],\"validation_attempts\":[$validation_attempts_json],\"validation\":$validation_json,\"fair_outcome\":$fair_outcome_json,\"pinger_plan\":$pinger_plan,\"proposal\":$proposal,\"configuration_written\":false}"
+			exit 1
 		fi
-		validation_error="Directional candidate validation failed (${validation_correction_action}: ${validation_correction_reason}; DL realization ${dl_candidate_realization}%, capacity ${dl_retention}%; UL realization ${ul_candidate_realization}%, capacity ${ul_retention}%; max ICMP +${loaded_delta_ms} ms, transport +${transport_loaded_delta_ms} ms, loss ${loss_percent}%, CPU ${cpu_peak}%); no configuration was written."
-		stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":4,\"stage\":\"validation\",\"error\":\"$(json_escape "$validation_error")\",\"auto_apply_eligible\":false,\"phase_evidence_complete\":$phase_evidence_complete,\"phase_contamination_seen\":$phase_contamination_seen,\"route_mode\":\"$(json_escape "$route_mode")\",\"route_interface\":\"$(json_escape "$route_if")\",\"route_identity\":\"$(json_escape "$route_identity")\",\"external_ip\":\"$(json_escape "$selected_external_ip")\",\"background\":$(background_json),\"baseline\":{\"median_ms\":$idle_median_ms,\"p95_ms\":$idle_p95_ms,\"samples\":$baseline_samples,\"transport_median_ms\":$transport_idle_median_ms,\"transport_p95_ms\":$transport_idle_p95_ms,\"transport_samples\":$transport_idle_samples,\"transport_backend\":\"$(json_escape "$transport_probe_backend")\",\"transport_endpoint\":\"$(json_escape "$transport_probe_endpoint")\"},\"runs\":[$runs_json],\"phase_background\":[$phase_background_runs_json],\"validation_attempts\":[$validation_attempts_json],\"validation\":$validation_json,\"pinger_plan\":$pinger_plan,\"proposal\":$proposal,\"configuration_written\":false}"
-		exit 1
 	fi
 
 	write_status review 96 "Preparing validated review; no configuration has been written"
 	confidence_mode=normal
 	[ "$conservative_mode" = 1 ] && confidence_mode=low
 	auto_apply_eligible=false
+	manual_apply_eligible=false
 	if [ "$confidence_mode" = normal ] && [ "$phase_evidence_complete" = true ] &&
 		[ "$phase_contamination_seen" = false ] && [ "$validation_contaminated" = false ]; then
-		auto_apply_eligible=true
+		if [ "$autotune_profile" = fair ]; then
+			[ "$validation_hard_pass" = true ] && manual_apply_eligible=true
+			[ "$validation_pass" = true ] && [ "$validation_quality_target_met" = true ] &&
+				auto_apply_eligible=true
+		elif [ "$validation_pass" = true ]; then
+			manual_apply_eligible=true
+			auto_apply_eligible=true
+		fi
 	fi
-	stage_terminal_json result "{\"state\":\"complete\",\"schema_version\":4,\"auto_apply_eligible\":$auto_apply_eligible,\"phase_evidence_complete\":$phase_evidence_complete,\"phase_contamination_seen\":$phase_contamination_seen,\"job_id\":\"$(json_escape "$job_name")\",\"target_interface\":\"$(json_escape "$target_if_input")\",\"resolved_interface\":\"$(json_escape "$target_if")\",\"source_ip\":\"$(json_escape "$source_ip")\",\"external_ip\":\"$(json_escape "$selected_external_ip")\",\"route_interface\":\"$(json_escape "$route_if")\",\"route_mode\":\"$(json_escape "$route_mode")\",\"mwan3_member\":\"$(json_escape "$mwan3_member")\",\"route_identity\":\"$(json_escape "$route_identity")\",\"link_kind\":\"$(json_escape "$link_kind")\",\"conservative\":$([ "$conservative_mode" = 1 ] && printf true || printf false),\"confidence_mode\":\"$confidence_mode\",\"background\":$(background_json),\"phase_background\":[$phase_background_runs_json],\"usable_directions\":{\"download\":${background_dl_usable:-true},\"upload\":${background_ul_usable:-true}},\"validation_thresholds\":{\"candidate_realization_min_percent\":$validation_candidate_realization_min_percent,\"candidate_realization_max_percent\":$validation_candidate_realization_max_percent,\"capacity_retention_min_percent\":$validation_capacity_retention_min_percent,\"delay_max_ms\":$validation_delay_max_ms,\"loss_max_percent\":$validation_loss_max_percent,\"cpu_max_percent\":$validation_cpu_max_percent},\"baseline\":{\"median_ms\":$idle_median_ms,\"p95_ms\":$idle_p95_ms,\"samples\":$baseline_samples,\"transport_median_ms\":$transport_idle_median_ms,\"transport_p95_ms\":$transport_idle_p95_ms,\"transport_samples\":$transport_idle_samples,\"transport_backend\":\"$(json_escape "$transport_probe_backend")\",\"transport_endpoint\":\"$(json_escape "$transport_probe_endpoint")\"},\"runs\":[$runs_json],\"validation_attempts\":[$validation_attempts_json],\"validation\":$validation_json,\"pinger_plan\":$pinger_plan,\"proposal\":$proposal,\"configuration_written\":false}"
+	stage_terminal_json result "{\"state\":\"complete\",\"schema_version\":5,\"auto_apply_eligible\":$auto_apply_eligible,\"manual_apply_eligible\":$manual_apply_eligible,\"phase_evidence_complete\":$phase_evidence_complete,\"phase_contamination_seen\":$phase_contamination_seen,\"job_id\":\"$(json_escape "$job_name")\",\"target_interface\":\"$(json_escape "$target_if_input")\",\"resolved_interface\":\"$(json_escape "$target_if")\",\"source_ip\":\"$(json_escape "$source_ip")\",\"external_ip\":\"$(json_escape "$selected_external_ip")\",\"route_interface\":\"$(json_escape "$route_if")\",\"route_mode\":\"$(json_escape "$route_mode")\",\"mwan3_member\":\"$(json_escape "$mwan3_member")\",\"route_identity\":\"$(json_escape "$route_identity")\",\"link_kind\":\"$(json_escape "$link_kind")\",\"conservative\":$([ "$conservative_mode" = 1 ] && printf true || printf false),\"confidence_mode\":\"$confidence_mode\",\"background\":$(background_json),\"phase_background\":[$phase_background_runs_json],\"usable_directions\":{\"download\":${background_dl_usable:-true},\"upload\":${background_ul_usable:-true}},\"validation_thresholds\":{\"candidate_realization_min_percent\":$validation_candidate_realization_min_percent,\"candidate_realization_max_percent\":$validation_candidate_realization_max_percent,\"capacity_retention_min_percent\":$validation_capacity_retention_min_percent,\"delay_max_ms\":$validation_delay_max_ms,\"loss_max_percent\":$validation_loss_max_percent,\"cpu_max_percent\":$validation_cpu_max_percent},\"baseline\":{\"median_ms\":$idle_median_ms,\"p95_ms\":$idle_p95_ms,\"samples\":$baseline_samples,\"transport_median_ms\":$transport_idle_median_ms,\"transport_p95_ms\":$transport_idle_p95_ms,\"transport_samples\":$transport_idle_samples,\"transport_backend\":\"$(json_escape "$transport_probe_backend")\",\"transport_endpoint\":\"$(json_escape "$transport_probe_endpoint")\"},\"runs\":[$runs_json],\"validation_attempts\":[$validation_attempts_json],\"validation\":$validation_json,\"fair_outcome\":$fair_outcome_json,\"pinger_plan\":$pinger_plan,\"proposal\":$proposal,\"configuration_written\":false}"
 }
 
 job_recovery_pending() {
@@ -3891,10 +4436,13 @@ start_job() {
 	fi
 	job_recovery_pending && json_error "Full Auto-Tune recovery is still pending for $job_name; wait for runtime restoration before starting another test."
 
+	archive_previous_terminal ||
+		json_error "Unable to archive and bound the previous Full Auto-Tune diagnostics in RAM."
+	new_token="$(new_worker_token)"
+	active_run_id="$new_token"
 	rm -f "$pid_file" "$status_file" "$result_file" "$error_file" "$pending_result_file" \
 		"$pending_error_file" "$cancel_file" "$log_file"
 	write_status starting 0 "Starting Full Auto-Tune"
-	new_token="$(new_worker_token)"
 	"$setsid_bin" "$0" "$job_name" "$target_if_input" job-run "$backend" "$route_mode_override" "$mwan3_member_override" "$autotune_profile" "$start_conservative" "$new_token" \
 		</dev/null > "$log_file" 2>&1 6>&- &
 	pid="$!"
@@ -3943,7 +4491,7 @@ status_job() {
 		json_error "A different Full Auto-Tune request is running for this instance; its status was not attached to this uplink."
 	fi
 	if job_recovery_pending; then
-		printf '{"state":"recovery-pending","recovery_pending":true,"auto_apply_eligible":false,"error":"Full Auto-Tune runtime restoration is still pending; any settled result is withheld."}\n'
+		printf '{"state":"recovery-pending","recovery_pending":true,"auto_apply_eligible":false,"manual_apply_eligible":false,"error":"Full Auto-Tune runtime restoration is still pending; any settled result is withheld."}\n'
 		return 0
 	fi
 	if [ -s "$result_file" ]; then
@@ -3955,6 +4503,33 @@ status_job() {
 	else
 		printf '{"state":"idle"}\n'
 	fi
+}
+
+history_job() {
+	printf '{"state":"ready","schema_version":1,"runs":['
+	history_first=1
+	if [ -d "$history_dir" ] && [ ! -L "$history_dir" ] &&
+	   runtime_lock_path_owned_by_euid "$history_dir"; then
+		for history_candidate in $(find "$history_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null |
+			LC_ALL=C sort -r); do
+			history_meta="$history_candidate/meta"
+			owned_regular_file "$history_meta" || continue
+			history_run_id="$(sed -n 's/^run_id=//p' "$history_meta")"
+			history_state="$(sed -n 's/^state=//p' "$history_meta")"
+			history_epoch="$(sed -n 's/^completed_epoch=//p' "$history_meta")"
+			case "$history_run_id" in ''|*[!A-Za-z0-9_-]*) continue ;; esac
+			case "$history_state" in
+				complete|failed|inconclusive|background-blocked|cancelled|legacy|unknown) ;;
+				*) continue ;;
+			esac
+			is_positive_uint "$history_epoch" || continue
+			[ "$history_first" = 1 ] || printf ','
+			printf '{"run_id":"%s","state":"%s","completed_epoch":%s}' \
+				"$(json_escape "$history_run_id")" "$(json_escape "$history_state")" "$history_epoch"
+			history_first=0
+		done
+	fi
+	printf ']}\n'
 }
 
 attest_job() {
@@ -4037,6 +4612,7 @@ case "$mode" in
 	start) start_job 0 ;;
 	start-conservative) start_job 1 ;;
 	status) status_job ;;
+	history) history_job ;;
 	attest) attest_job ;;
 	cancel) cancel_job ;;
 	job-run) run_job ;;

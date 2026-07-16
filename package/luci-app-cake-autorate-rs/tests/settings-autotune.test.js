@@ -8,6 +8,9 @@ const sourcePath = path.join(__dirname, '..', 'htdocs', 'luci-static', 'resource
 	'view', 'cake-autorate-rs', 'settings.js');
 const source = fs.readFileSync(sourcePath, 'utf8');
 const prefix = source.slice(0, source.indexOf('return L.view.extend'));
+assert.match(source,
+	/Even an evidence-backed no-SQM recommendation[\s\S]*state\.autotune_action = 'apply_sqm';/,
+	'disable-SQM comparison must never be the preselected Review action');
 const written = {};
 const fixtureSections = { 'cake-autorate': [], mwan3: [] };
 if (typeof String.prototype.format !== 'function') {
@@ -42,7 +45,9 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 			`topicTab, autorateSubcategory, autorateSubcategoryDefinitions, ` +
 			`canonicalAutotuneProfile, autotuneProfilePolicy, autotuneProfileDefinitions, ` +
 			`autotuneProposalMatchesProfile, ` +
-			`autotuneResultValidated, autotuneAttemptDiagnostics, autotuneDiagnostics, ` +
+			`autotuneResultValidated, autotuneResultReviewable, ` +
+			`autotuneResultHasReviewChoice, autotuneDisableSqmEvidenceValidated, ` +
+			`autotuneAttemptDiagnostics, autotuneDiagnostics, ` +
 			`autotuneRuntimeSettled, autotuneLegacyResult, ` +
 			`autotuneRecoveryPending, autotuneRecoveryProgress, ` +
 			`revalidateAutotuneProposal, ` +
@@ -84,9 +89,11 @@ assert.equal(helpers.autotuneProfilePolicy('best_overall').retentionPercent, 80)
 assert.equal(helpers.autotuneProfilePolicy('fair').retentionPercent, 90);
 
 const proposal = {
-	schema_version: 2,
+	schema_version: 3,
 	profile: 'best_overall',
 	target_grade: 'A',
+	quality_target_required: true,
+	throughput_priority: false,
 	download: {
 		minimum_kbps: 16700,
 		base_kbps: 35500,
@@ -410,10 +417,35 @@ const cleanDirectionPhase = direction => ({
 	transport_latency: { samples: 20, delta_p95_ms: 5 },
 	cpu_peak_percent: 55,
 });
+const gateLimit = code => {
+	if (code.includes('candidate-realization-maximum'))
+		return 110;
+	if (code.includes('candidate-realization'))
+		return 80;
+	if (code.includes('capacity-retention'))
+		return 80;
+	if (code.includes('latency'))
+		return 30;
+	if (code.includes('packet-loss'))
+		return 3;
+	return 85;
+};
 const validValidation = {
+	profile: 'best_overall',
 	pass: true,
+	hard_pass: true,
+	quality_target_met: true,
+	actual_grade: 'A',
+	effective_delta_ms: 10,
 	contaminated: false,
-	gates: passingGateCodes.map(code => ({ code, pass: true })),
+	gates: passingGateCodes.map(code => ({
+		code,
+		required: true,
+		pass: true,
+		actual: code.includes('candidate-realization') ||
+			code.includes('capacity-retention') ? 100 : 0,
+		limit: gateLimit(code),
+	})),
 	correction: { action: 'none', feasible: true },
 	direction_phases: {
 		download: cleanDirectionPhase('download'),
@@ -431,10 +463,12 @@ const validResult = {
 	source_ip: '192.0.2.10',
 	route_identity: 'main||pppoe-wan|192.0.2.10||main',
 	external_ip: '192.0.2.20',
-	schema_version: 4,
+	schema_version: 5,
 	producer: 'cake-autorate-rs-autotune',
+	run_id: 'settings-test-run',
 	profile: 'best_overall',
 	auto_apply_eligible: true,
+	manual_apply_eligible: true,
 	phase_evidence_complete: true,
 	phase_contamination_seen: false,
 	runtime_restored: true,
@@ -478,6 +512,17 @@ assert.equal(helpers.autotuneResultValidated(validResult), true);
 const resultForProfile = (profile, targetGrade, retention, delay, loss, sqm) => ({
 	...validResult,
 	profile,
+	validation: {
+		...validValidation,
+		profile,
+		gates: validValidation.gates.map(gate => ({
+			...gate,
+			required: profile === 'fair' && gate.code.includes('latency') ? false : true,
+			limit: gate.code.includes('capacity-retention') ? retention :
+				(gate.code.includes('latency') ? delay :
+					(gate.code.includes('packet-loss') ? loss : gate.limit)),
+		})),
+	},
 	validation_thresholds: {
 		...validResult.validation_thresholds,
 		capacity_retention_min_percent: retention,
@@ -488,6 +533,8 @@ const resultForProfile = (profile, targetGrade, retention, delay, loss, sqm) => 
 		...proposal,
 		profile,
 		target_grade: targetGrade,
+		quality_target_required: profile !== 'fair',
+		throughput_priority: profile === 'fair',
 		validation: {
 			...proposal.validation,
 			capacity_retention_min_percent: retention,
@@ -509,9 +556,124 @@ const gamingResult = resultForProfile('gaming', 'A+', 70, 5, 1, {
 	iqdisc_opts: 'diffserv4',
 	eqdisc_opts: 'diffserv4',
 });
-const fairResult = resultForProfile('fair', 'B', 90, 60, 5, proposal.sqm);
+const fairResult = {
+	...resultForProfile('fair', 'C', 90, 200, 5, proposal.sqm),
+	fair_outcome: {
+		mode: 'quality-target-met',
+		target_grade: 'C',
+		target_delta_ms: 200,
+		capacity_floor_percent: 90,
+		actual_grade: 'A',
+		actual_effective_delta_ms: 10,
+		recommended_action: 'apply_sqm',
+		allowed_actions: [ 'apply_sqm', 'keep_current' ],
+		disable_sqm_available: false,
+		comparison_reason: 'quality-target-met',
+		no_sqm_control: { available: false },
+		throughput_gain_without_sqm: { download_percent: 0, upload_percent: 0 },
+	},
+};
 assert.equal(helpers.autotuneResultValidated(gamingResult), true);
 assert.equal(helpers.autotuneResultValidated(fairResult), true);
+const fairFallback = {
+	...fairResult,
+	auto_apply_eligible: false,
+	validation: {
+		...fairResult.validation,
+		pass: false,
+		hard_pass: true,
+		quality_target_met: false,
+		actual_grade: 'D',
+		effective_delta_ms: 220,
+		gates: fairResult.validation.gates.map(gate =>
+			gate.code.includes('latency') ?
+				{ ...gate, required: false, pass: false, actual: 220, limit: 200 } :
+				{ ...gate }),
+		correction: { action: 'infeasible', feasible: false },
+	},
+	fair_outcome: {
+		...fairResult.fair_outcome,
+		mode: 'throughput-fallback',
+		actual_grade: 'D',
+		actual_effective_delta_ms: 220,
+		recommended_action: 'apply_sqm',
+		comparison_reason: 'quality-target-unreachable-above-throughput-floor',
+	},
+};
+assert.equal(helpers.autotuneResultValidated(fairFallback), false,
+	'Fair throughput fallback must never masquerade as an automatic pass');
+assert.equal(helpers.autotuneResultReviewable(fairFallback, 'apply_sqm'), true);
+assert.equal(helpers.autotuneResultReviewable(fairFallback, 'keep_current'), true);
+assert.equal(helpers.autotuneResultReviewable(fairFallback, 'disable_sqm'), false);
+const fairDisable = {
+	...fairFallback,
+	fair_outcome: {
+		...fairFallback.fair_outcome,
+		mode: 'sqm-disable-recommended',
+		recommended_action: 'disable_sqm',
+		allowed_actions: [ 'apply_sqm', 'keep_current', 'disable_sqm' ],
+		disable_sqm_available: true,
+		comparison_reason: 'no-material-latency-benefit-with-throughput-cost',
+		no_sqm_control: {
+			available: true,
+			measurement_evidence: {
+				valid: true,
+				reason: 'ok',
+				test_direction: 'both',
+				shaper_bypassed: true,
+				sqm_paused: true,
+			},
+			grade: 'D',
+			effective_delta_ms: 218,
+			throughput: { download_kbps: 900000, upload_kbps: 850000 },
+			forwarded_background: {
+				available: true,
+				contaminated: false,
+				duration_s: 20,
+				download_kbps: 100,
+				upload_kbps: 50,
+				download_limit_kbps: 18000,
+				upload_limit_kbps: 17000,
+			},
+		},
+		throughput_gain_without_sqm: { download_percent: 3, upload_percent: 2.5 },
+	},
+};
+assert.equal(helpers.autotuneDisableSqmEvidenceValidated(fairDisable), true);
+assert.equal(helpers.autotuneResultReviewable(fairDisable, 'disable_sqm'), true);
+assert.equal(helpers.autotuneResultReviewable({
+	...fairDisable,
+	fair_outcome: {
+		...fairDisable.fair_outcome,
+		throughput_gain_without_sqm: { download_percent: 3, upload_percent: 1.9 },
+	},
+}, 'disable_sqm'), false, 'both no-SQM directions must improve by at least 2%');
+assert.equal(helpers.autotuneResultReviewable({
+	...fairDisable,
+	fair_outcome: {
+		...fairDisable.fair_outcome,
+		no_sqm_control: {
+			...fairDisable.fair_outcome.no_sqm_control,
+			measurement_evidence: {
+				...fairDisable.fair_outcome.no_sqm_control.measurement_evidence,
+				sqm_paused: false,
+			},
+		},
+	},
+}, 'disable_sqm'), false, 'disable must fail closed without an unshaped control proof');
+assert.equal(helpers.autotuneResultReviewable({
+	...fairDisable,
+	fair_outcome: {
+		...fairDisable.fair_outcome,
+		no_sqm_control: {
+			...fairDisable.fair_outcome.no_sqm_control,
+			forwarded_background: {
+				...fairDisable.fair_outcome.no_sqm_control.forwarded_background,
+				contaminated: true,
+			},
+		},
+	},
+}, 'disable_sqm'), false, 'disable must fail closed when background traffic contaminated the control');
 assert.equal(helpers.autotuneResultValidated({
 	...gamingResult,
 	proposal: {
@@ -824,7 +986,10 @@ assert.match(source, /UL candidate realization maximum/);
 assert.match(source, /Calibration was inconclusive/);
 assert.match(source, /alert-message %s.*warning/s,
 	'retryable inconclusive diagnostics must render as a warning, not a red failure');
-assert.match(source, /autotuneResultValidated\(state\.autotune_result\)/);
+assert.match(source, /autotuneResultReviewable\(state\.autotune_result, selectedAction\)/);
+assert.match(source, /Disable autorate and SQM/);
+assert.match(source, /Keep current settings/);
+assert.match(source, /I understand that this disables CAKE shaping/);
 assert.match(source, /start-conservative/);
 assert.match(source, /Continue conservatively/);
 assert.match(source, /confidence_mode === 'low'/);
@@ -1045,7 +1210,7 @@ async function testAutotuneTerminalPrecedence() {
 		await assert.rejects(
 			contaminatedHelpers.runAutotuneJob('wan_sqm', 'pppoe-wan', 'speedtest-go'),
 			err => {
-				assert.match(err.message, /without a validated proposal/);
+				assert.match(err.message, /without a safe reviewable result/);
 				assert.deepEqual(err.autotuneResult, contaminated,
 					'diagnostic payload must be retained for the failure UI');
 				return true;

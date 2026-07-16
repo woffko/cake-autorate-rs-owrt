@@ -6636,7 +6636,7 @@ fn print_usage() {
     eprintln!(
         "       cake-autorated --autotune-proposal --dl-samples LIST --ul-samples LIST \\\n         --idle-median-ms N --idle-p95-ms N --idle-samples N [--link-kind KIND] \\\n         [--profile gaming|best_overall|fair] \\\n         [--base-scale N | --dl-base-scale N --ul-base-scale N]"
     );
-    eprintln!("       cake-autorated --autotune-validate --dl-observed-low-kbps N --ul-observed-low-kbps N --dl-candidate-kbps N --ul-candidate-kbps N --dl-achieved-kbps N --ul-achieved-kbps N --dl-min-kbps N --ul-min-kbps N --dl-max-kbps N --ul-max-kbps N --icmp-delta-ms N --transport-delta-ms N --loss-percent N --cpu-percent N");
+    eprintln!("       cake-autorated --autotune-validate [--profile gaming|best_overall|fair] --dl-observed-low-kbps N --ul-observed-low-kbps N --dl-candidate-kbps N --ul-candidate-kbps N --dl-achieved-kbps N --ul-achieved-kbps N --dl-min-kbps N --ul-min-kbps N --dl-max-kbps N --ul-max-kbps N --icmp-delta-ms N --transport-delta-ms N --loss-percent N --cpu-percent N");
     eprintln!("         [--dl-icmp-delta-ms N --ul-icmp-delta-ms N --dl-transport-delta-ms N --ul-transport-delta-ms N --dl-loss-percent N --ul-loss-percent N --dl-cpu-percent N --ul-cpu-percent N]");
     eprintln!("       cake-autorated --transport-probe --backend websocket|tcp|http|legacy-http [--endpoint URL] [--device IFACE] [--source-ip IPv4] [--fwmark HEX] [--count N] [--timeout SEC] [--interval-ms N]");
 }
@@ -6917,8 +6917,8 @@ where
     I: Iterator<Item = String>,
 {
     use autotune::{
-        validate_shaped_candidate, DirectionLoadInput, DirectionValidationInput, ValidationInput,
-        ValidationThresholds,
+        validate_shaped_candidate, AutotuneProfile, DirectionLoadInput, DirectionValidationInput,
+        ValidationInput, ValidationThresholds,
     };
 
     let mut dl_observed_low = None;
@@ -6943,6 +6943,7 @@ where
     let mut ul_loss_percent = None;
     let mut dl_cpu_percent = None;
     let mut ul_cpu_percent = None;
+    let mut profile = AutotuneProfile::BestOverall;
     let mut thresholds = ValidationThresholds::default();
     let mut args = args;
 
@@ -6951,6 +6952,10 @@ where
             .next()
             .ok_or_else(|| format!("missing value for {arg}"))?;
         match arg.as_str() {
+            "--profile" => {
+                profile = AutotuneProfile::parse(&value)
+                    .ok_or_else(|| format!("unsupported Auto-Tune profile: {value}"))?
+            }
             "--dl-observed-low-kbps" => {
                 dl_observed_low = Some(parse_cli_u64("download observed-low rate", &value)?)
             }
@@ -7048,6 +7053,7 @@ where
         required_metric(specific.or(shared), name)
     };
     let result = validate_shaped_candidate(ValidationInput {
+        profile,
         download: DirectionValidationInput {
             observed_low_kbps: required_rate(dl_observed_low, "dl-observed-low-kbps")?,
             candidate_kbps: required_rate(dl_candidate, "dl-candidate-kbps")?,

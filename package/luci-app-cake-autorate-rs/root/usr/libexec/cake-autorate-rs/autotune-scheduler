@@ -243,6 +243,7 @@ numbers_equal() {
 result_has_exact_passing_gates() (
 	gate_json="$1"
 	gate_codes="$(extract "$gate_json" '@.validation.gates[*].code')" || return 1
+	gate_required="$(extract "$gate_json" '@.validation.gates[*].required')" || return 1
 	gate_passes="$(extract "$gate_json" '@.validation.gates[*].pass')" || return 1
 	gate_actuals="$(extract "$gate_json" '@.validation.gates[*].actual')" || return 1
 	gate_limits="$(extract "$gate_json" '@.validation.gates[*].limit')" || return 1
@@ -253,6 +254,12 @@ result_has_exact_passing_gates() (
 	expected_delay="$(extract "$gate_json" '@.validation_thresholds.delay_max_ms')" || return 1
 	expected_loss="$(extract "$gate_json" '@.validation_thresholds.loss_max_percent')" || return 1
 	expected_cpu="$(extract "$gate_json" '@.validation_thresholds.cpu_max_percent')" || return 1
+	gate_profile="$(extract "$gate_json" '@.profile')" || return 1
+	case "$gate_profile" in
+		gaming|best_overall) expected_quality_required=true ;;
+		fair) expected_quality_required=false ;;
+		*) return 1 ;;
+	esac
 	for expected_gate_limit in "$expected_realization_min" "$expected_realization_max" \
 		"$expected_retention" "$expected_delay" "$expected_loss" "$expected_cpu"
 	do
@@ -293,6 +300,11 @@ result_has_exact_passing_gates() (
 	set -- $gate_passes
 	[ "$#" -eq 14 ] || return 1
 	for gate_pass in "$@"; do [ "$gate_pass" = true ] || return 1; done
+	set -- $gate_required
+	[ "$#" -eq 14 ] || return 1
+	for required_flag in "$@"; do
+		case "$required_flag" in true|false) ;; *) return 1 ;; esac
+	done
 	set -- $gate_actuals
 	[ "$#" -eq 14 ] || return 1
 	for gate_actual in "$@"; do is_decimal_between "$gate_actual" 0 100000000 || return 1; done
@@ -307,15 +319,17 @@ result_has_exact_passing_gates() (
 
 	# `pass:true` is not an attestation by itself. Recompute each gate from its
 	# actual/limit pair and require the comparison kind dictated by its code.
-	awk -v codes="$gate_codes" -v passes="$gate_passes" \
+	awk -v codes="$gate_codes" -v requireds="$gate_required" -v passes="$gate_passes" \
 		-v actuals="$gate_actuals" -v limits="$gate_limits" \
 		-v comparisons="$gate_comparisons" \
 		-v realization_min="$expected_realization_min" \
 		-v realization_max="$expected_realization_max" \
 		-v retention="$expected_retention" -v delay="$expected_delay" \
-		-v loss="$expected_loss" -v cpu="$expected_cpu" 'BEGIN {
+		-v loss="$expected_loss" -v cpu="$expected_cpu" \
+		-v quality_required="$expected_quality_required" 'BEGIN {
 		n = split(codes, code, " ")
-		if (split(passes, pass, " ") != n || split(actuals, actual, " ") != n ||
+		if (split(requireds, required, " ") != n || split(passes, pass, " ") != n ||
+		    split(actuals, actual, " ") != n ||
 		    split(limits, limit, " ") != n || split(comparisons, comparison, " ") != n)
 			exit 1
 		for (i = 1; i <= n; i++) {
@@ -323,6 +337,13 @@ result_has_exact_passing_gates() (
 			            code[i] == "upload-candidate-realization" ||
 			            code[i] == "download-capacity-retention" ||
 			            code[i] == "upload-capacity-retention") ? "minimum" : "maximum"
+			is_latency = (code[i] == "download-icmp-latency" ||
+			              code[i] == "download-transport-latency" ||
+			              code[i] == "upload-icmp-latency" ||
+			              code[i] == "upload-transport-latency")
+			expected_required = is_latency ? quality_required : "true"
+			if (required[i] != expected_required)
+				exit 1
 			if (pass[i] != "true" || comparison[i] != expected)
 				exit 1
 			if (code[i] == "download-candidate-realization" ||
@@ -363,7 +384,9 @@ result_proposal_is_safe() {
 	proposal_schema="$(extract "$proposal_json" '@.proposal.schema_version')"
 	proposal_profile="$(extract "$proposal_json" '@.proposal.profile')"
 	proposal_target_grade="$(extract "$proposal_json" '@.proposal.target_grade')"
-	[ "$proposal_schema" = 2 ] && [ "$result_profile" = "$proposal_profile" ] || return 1
+	proposal_quality_required="$(extract "$proposal_json" '@.proposal.quality_target_required')"
+	proposal_throughput_priority="$(extract "$proposal_json" '@.proposal.throughput_priority')"
+	[ "$proposal_schema" = 3 ] && [ "$result_profile" = "$proposal_profile" ] || return 1
 	case "$result_profile" in gaming|best_overall|fair) ;; *) return 1 ;; esac
 	dl_min="$(extract "$proposal_json" '@.proposal.download.minimum_kbps')"
 	dl_base="$(extract "$proposal_json" '@.proposal.download.base_kbps')"
@@ -454,6 +477,8 @@ result_proposal_is_safe() {
 	case "$result_profile" in
 		gaming)
 			[ "$proposal_target_grade" = A+ ] &&
+				[ "$proposal_quality_required" = true ] &&
+				[ "$proposal_throughput_priority" = false ] &&
 				numbers_equal "$validation_retention" 70 &&
 				numbers_equal "$validation_transport" 5 &&
 				numbers_equal "$validation_loss" 1 &&
@@ -466,14 +491,18 @@ result_proposal_is_safe() {
 			;;
 		best_overall)
 			[ "$proposal_target_grade" = A ] &&
+				[ "$proposal_quality_required" = true ] &&
+				[ "$proposal_throughput_priority" = false ] &&
 				numbers_equal "$validation_retention" 80 &&
 				numbers_equal "$validation_transport" 30 &&
 				numbers_equal "$validation_loss" 3 || return 1
 			;;
 		fair)
-			[ "$proposal_target_grade" = B ] &&
+			[ "$proposal_target_grade" = C ] &&
+				[ "$proposal_quality_required" = false ] &&
+				[ "$proposal_throughput_priority" = true ] &&
 				numbers_equal "$validation_retention" 90 &&
-				numbers_equal "$validation_transport" 60 &&
+				numbers_equal "$validation_transport" 200 &&
 				numbers_equal "$validation_loss" 5 || return 1
 			;;
 	esac
@@ -556,8 +585,14 @@ result_is_auto_apply_eligible() {
 	gate_state="$(extract "$gate_result" '@.state')"
 	gate_schema_version="$(extract "$gate_result" '@.schema_version')"
 	gate_producer="$(extract "$gate_result" '@.producer')"
+	gate_profile="$(extract "$gate_result" '@.profile')"
+	gate_validation_profile="$(extract "$gate_result" '@.validation.profile')"
+	gate_run_id="$(extract "$gate_result" '@.run_id')"
 	gate_validation_pass="$(extract "$gate_result" '@.validation.pass')"
+	gate_validation_hard_pass="$(extract "$gate_result" '@.validation.hard_pass')"
+	gate_quality_target_met="$(extract "$gate_result" '@.validation.quality_target_met')"
 	gate_auto_apply_eligible="$(extract "$gate_result" '@.auto_apply_eligible')"
+	gate_manual_apply_eligible="$(extract "$gate_result" '@.manual_apply_eligible')"
 	gate_confidence_mode="$(extract "$gate_result" '@.confidence_mode')"
 	gate_validation_contaminated="$(extract "$gate_result" '@.validation.contaminated')"
 	gate_phase_evidence_complete="$(extract "$gate_result" '@.phase_evidence_complete')"
@@ -572,10 +607,16 @@ result_is_auto_apply_eligible() {
 	# confidence, contaminated, or otherwise unknown evidence must never become
 	# a configuration change merely because the helper reported "complete".
 	[ "$gate_state" = complete ] || return 1
-	[ "$gate_schema_version" = 4 ] || return 1
+	[ "$gate_schema_version" = 5 ] || return 1
 	[ "$gate_producer" = "$autotune_result_producer" ] || return 1
+	[ "$gate_validation_profile" = "$gate_profile" ] || return 1
+	case "$gate_run_id" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac
+	[ "${#gate_run_id}" -le 128 ] || return 1
 	[ "$gate_validation_pass" = true ] || return 1
+	[ "$gate_validation_hard_pass" = true ] || return 1
+	[ "$gate_quality_target_met" = true ] || return 1
 	[ "$gate_auto_apply_eligible" = true ] || return 1
+	[ "$gate_manual_apply_eligible" = true ] || return 1
 	[ "$gate_confidence_mode" = normal ] || return 1
 	[ "$gate_validation_contaminated" = false ] || return 1
 	[ "$gate_phase_evidence_complete" = true ] || return 1
