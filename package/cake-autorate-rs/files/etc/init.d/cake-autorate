@@ -9,11 +9,110 @@ EXTRA_HELP="\trecover_interface <mwan3-member>\tStart a member instance that was
 CONFIG="cake-autorate"
 SQM_CONFIG="sqm"
 DAEMON="/usr/sbin/cake-autorated"
+RUNTIME_LOCK_LIB="${CAKE_AUTORATE_RUNTIME_LOCK_LIB:-/usr/libexec/cake-autorate-rs/runtime-lock}"
+RUNTIME_LOCK_AVAILABLE=0
+APPLY_GUARD="${CAKE_AUTORATE_APPLY_GUARD:-/usr/libexec/cake-autorate-rs/apply-guard}"
+SERVICE_APPLY_GUARD_VERIFIED=0
+SERVICE_RUNTIME_LOCK_HELD=0
+SERVICE_RUNTIME_LOCK_BORROWED=0
+SERVICE_RUNTIME_STOP_RELEASE_PENDING=0
 SQM_MANAGED=0
 CAKE_CONFIG_CHANGED=0
 SQM_INTERFACES=""
 SQM_CONFLICT_FILE="${CAKE_AUTORATE_SQM_CONFLICT_FILE:-/var/run/cake-autorate/sqm-conflicts}"
 BRIDGER_CONFIG_CHANGED=0
+
+if [ -r "$RUNTIME_LOCK_LIB" ]; then
+	# shellcheck source=/usr/libexec/cake-autorate-rs/runtime-lock
+	. "$RUNTIME_LOCK_LIB"
+	RUNTIME_LOCK_AVAILABLE=1
+fi
+
+service_apply_guard_markers_present() {
+	{
+		uci -q show "$CONFIG" 2>/dev/null
+		uci -q show "$SQM_CONFIG" 2>/dev/null
+	} | grep -q '\._autotune_apply_'
+}
+
+service_apply_guard_preflight() {
+	local operation="$1"
+	local output
+
+	[ "$SERVICE_APPLY_GUARD_VERIFIED" -eq 0 ] || return 0
+	service_apply_guard_markers_present || return 0
+	if [ ! -x "$APPLY_GUARD" ]; then
+		logger -t cake-autorate "refusing to $operation: a Full Auto-Tune apply marker exists but its apply-guard helper is unavailable"
+		return 1
+	fi
+	if ! output="$($APPLY_GUARD verify-init 2>&1)"; then
+		logger -t cake-autorate "refusing to $operation before any SQM/service mutation: Full Auto-Tune apply guard rejected the transaction: $output"
+		return 1
+	fi
+	case "$output" in
+		*'"state":"verified"'*) ;;
+		*)
+			logger -t cake-autorate "refusing to $operation before any SQM/service mutation: Full Auto-Tune apply guard returned an invalid response"
+			return 1
+			;;
+	esac
+	SERVICE_APPLY_GUARD_VERIFIED=1
+	return 0
+}
+
+service_runtime_lock_acquire_or_exit() {
+	local operation="$1"
+	local rc
+
+	[ "$SERVICE_RUNTIME_LOCK_HELD" -eq 0 ] || return 0
+	if [ "$RUNTIME_LOCK_AVAILABLE" -ne 1 ]; then
+		logger -t cake-autorate "refusing to $operation: shared runtime-lock helper is unavailable"
+		exit 1
+	fi
+
+	if [ "${CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_BORROW:-0}" = 1 ]; then
+		if runtime_lock_borrow_global_exclusive; then
+			SERVICE_RUNTIME_LOCK_BORROWED=1
+			rc=0
+		else
+			rc=$?
+		fi
+	elif runtime_lock_acquire_global_exclusive; then
+		rc=0
+	else
+		rc=$?
+	fi
+	if [ "$rc" -ne 0 ]; then
+		case "$rc" in
+			75)
+				logger -t cake-autorate "deferring $operation: Auto-Tune, rating, speed test, or recovery currently owns a managed interface"
+				;;
+			*)
+				logger -t cake-autorate "refusing to $operation: global runtime lock could not be acquired (error $rc)"
+				;;
+		esac
+		# rc.common does not stop after a non-zero stop_service() return.  Exit
+		# here so a busy lock can never be followed by procd_kill().
+		exit 1
+	fi
+
+	SERVICE_RUNTIME_LOCK_HELD=1
+}
+
+service_runtime_lock_release_or_exit() {
+	local operation="$1"
+
+	[ "$SERVICE_RUNTIME_LOCK_HELD" -eq 1 ] || return 0
+	if ! runtime_lock_release_global; then
+		logger -t cake-autorate "failed to release global runtime lock after $operation"
+		# Exiting closes the kernel-held descriptor even if explicit unlock
+		# failed, and prevents any later mutation in this shell.
+		exit 1
+	fi
+
+	SERVICE_RUNTIME_LOCK_HELD=0
+	SERVICE_RUNTIME_LOCK_BORROWED=0
+}
 
 set_cake_option_if_changed() {
 	local section="$1"
@@ -316,7 +415,10 @@ remove_empty_clsact() {
 prepare_sqm_ingress_interfaces() {
 	local iface
 
-	sync_bridger_blacklist
+	# Bridger UCI is outside the guarded rpcd transaction. Defer this
+	# persistent side effect until a later ordinary service start; the guarded
+	# postcheck still proves that both CAKE qdiscs are live before confirmation.
+	[ "$SERVICE_APPLY_GUARD_VERIFIED" -eq 1 ] || sync_bridger_blacklist
 	for iface in $SQM_INTERFACES; do
 		remove_empty_clsact "$iface" || true
 	done
@@ -467,7 +569,9 @@ start_sqm_backend() {
 	[ "$SQM_MANAGED" -eq 1 ] || return 0
 	[ -x /etc/init.d/sqm ] || return 0
 
-	/etc/init.d/sqm enable >/dev/null 2>&1 || true
+	# Enabling the boot service is not UCI-rollbackable. During a guarded apply
+	# the helper performs and verifies it only after rpcd confirmation.
+	[ "$SERVICE_APPLY_GUARD_VERIFIED" -eq 1 ] || /etc/init.d/sqm enable >/dev/null 2>&1 || true
 	/etc/init.d/sqm restart >/dev/null 2>&1 || /etc/init.d/sqm start >/dev/null 2>&1 || true
 }
 
@@ -597,7 +701,8 @@ start_instance() {
 	procd_close_instance
 }
 
-start_service() {
+start_service_locked() {
+	service_apply_guard_preflight "start CAKE Autorate" || return 1
 	config_load "$CONFIG"
 	sync_interface_presets
 	detect_managed_sqm_conflicts
@@ -608,7 +713,24 @@ start_service() {
 	[ -x /etc/init.d/cake-autorate-mqtt ] && /etc/init.d/cake-autorate-mqtt restart >/dev/null 2>&1 || true
 }
 
-recover_interface() {
+start_service() {
+	local lock_was_held="$SERVICE_RUNTIME_LOCK_HELD"
+	local rc
+
+	service_runtime_lock_acquire_or_exit "start CAKE Autorate"
+	if start_service_locked; then
+		rc=0
+	else
+		rc=$?
+	fi
+	if [ "$lock_was_held" -eq 0 ]; then
+		service_runtime_lock_release_or_exit "starting CAKE Autorate"
+	fi
+
+	return "$rc"
+}
+
+recover_interface_locked() {
 	local member="$1"
 	local section configured enabled
 
@@ -626,9 +748,58 @@ recover_interface() {
 	done
 }
 
+recover_interface() {
+	local lock_was_held="$SERVICE_RUNTIME_LOCK_HELD"
+	local rc
+
+	service_runtime_lock_acquire_or_exit "recover mwan3 interface '$1'"
+	if recover_interface_locked "$@"; then
+		rc=0
+	else
+		rc=$?
+	fi
+	if [ "$lock_was_held" -eq 0 ]; then
+		service_runtime_lock_release_or_exit "recovering mwan3 interface '$1'"
+	fi
+
+	return "$rc"
+}
+
 reload_service() {
-	stop
-	start
+	local lock_was_held="$SERVICE_RUNTIME_LOCK_HELD"
+	local rc=0
+
+	service_runtime_lock_acquire_or_exit "reload CAKE Autorate"
+	if ! service_apply_guard_preflight "reload CAKE Autorate"; then
+		rc=1
+	else
+		stop "$@" || rc=$?
+	fi
+	if [ "$rc" -eq 0 ]; then
+		start "$@" || rc=$?
+	fi
+	if [ "$lock_was_held" -eq 0 ]; then
+		service_runtime_lock_release_or_exit "reloading CAKE Autorate"
+	fi
+
+	return "$rc"
+}
+
+# rc.common's stock restart() releases all service-local state between stop
+# and start.  Route it through the same transaction as reload so Auto-Tune
+# cannot enter that gap and observe a half-stopped SQM setup.
+restart() {
+	local rc
+
+	trap '' TERM
+	if reload_service "$@"; then
+		rc=0
+	else
+		rc=$?
+	fi
+	trap - TERM
+
+	return "$rc"
 }
 
 cleanup_runtime_files() {
@@ -640,6 +811,20 @@ cleanup_runtime_files() {
 }
 
 stop_service() {
+	local lock_was_held="$SERVICE_RUNTIME_LOCK_HELD"
+
+	service_runtime_lock_acquire_or_exit "stop CAKE Autorate"
+	if ! service_apply_guard_preflight "stop CAKE Autorate"; then
+		# rc.common invokes procd_kill() after this hook even if it merely
+		# returns non-zero. Exiting is therefore required to keep an invalid or
+		# tokenless apply marker from stopping the known-good service/SQM state.
+		exit 1
+	fi
+	if [ "$lock_was_held" -eq 0 ]; then
+		# rc.common calls procd_kill() only after this hook returns.  Keep the
+		# exclusive descriptor open until service_stopped() has run.
+		SERVICE_RUNTIME_STOP_RELEASE_PENDING=1
+	fi
 	stop_managed_sqm_backend
 }
 
@@ -649,6 +834,10 @@ service_stopped() {
 	# cleanup, then remove all volatile runtime files synchronously.
 	sleep 1
 	cleanup_runtime_files
+	if [ "$SERVICE_RUNTIME_STOP_RELEASE_PENDING" -eq 1 ]; then
+		SERVICE_RUNTIME_STOP_RELEASE_PENDING=0
+		service_runtime_lock_release_or_exit "stopping CAKE Autorate"
+	fi
 }
 
 service_triggers() {

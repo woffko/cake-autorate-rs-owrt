@@ -1,0 +1,22 @@
+#!/bin/sh
+
+printf 'kill %s\n' "$*" >> "$CAKE_RECOVER_TEST_ROOT/actions"
+
+if [ "${1:-}" = -CONT ] && [ "${CAKE_RECOVER_KEEP_STOPPED:-0}" != 1 ]; then
+	status="$CAKE_AUTORATE_RECOVER_PROC_ROOT/${2:-}/status"
+	[ ! -f "$status" ] || printf 'State:\tS (fixture)\n' > "$status"
+fi
+
+last=""
+for argument in "$@"; do last="$argument"; done
+case "$last" in
+	-*)
+		group="${last#-}"
+		for stat_file in "$CAKE_AUTORATE_RECOVER_PROC_ROOT"/[0-9]*/stat; do
+			[ -r "$stat_file" ] || continue
+			found="$(sed 's/^.*) //' "$stat_file" | awk 'NF >= 3 { print $3; exit }')"
+			[ "$found" != "$group" ] || rm -rf "${stat_file%/stat}"
+		done
+		;;
+esac
+exit 0

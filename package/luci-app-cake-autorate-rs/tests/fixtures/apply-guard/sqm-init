@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+state="${APPLY_GUARD_SQM_INIT_STATE:?}"
+case "${1:-}" in
+	enable) printf '%s\n' enabled > "$state" ;;
+	enabled) [ "$(sed -n '1p' "$state" 2>/dev/null)" = enabled ] ;;
+	disable) printf '%s\n' disabled > "$state" ;;
+	*) exit 1 ;;
+esac

@@ -1,0 +1,8 @@
+#!/bin/sh
+
+if [ "${1:-}" = --autotune-proposal ]; then
+	printf '%s\n' '{"schema_version":1,"profile":"balanced","download":{"minimum_kbps":20000,"base_kbps":738500,"maximum_kbps":1000000,"absolute_cap_kbps":1000000,"observed_low_kbps":883500,"observed_median_kbps":883500,"observed_high_kbps":883500,"variability":0.0000},"upload":{"minimum_kbps":20000,"base_kbps":755500,"maximum_kbps":1000000,"absolute_cap_kbps":1000000,"observed_low_kbps":904500,"observed_median_kbps":904500,"observed_high_kbps":904500,"variability":0.0000},"active_threshold_kbps":20000,"thresholds_ms":{"adjust_up":5,"delay":15,"adjust_down":40},"adaptive_ceiling":{"enabled":false,"hold_s":20,"growth_percent":3,"probe_s":8,"cooldown_s":60,"failed_bound_ttl_s":1800},"link":{"kind":"cellular","layer":"none","overhead":0,"mpu":0},"confidence":80,"warnings":[]}'
+	exit 0
+fi
+
+exec "${AUTOTUNE_REAL_DAEMON:?}" "$@"

@@ -1,0 +1,9 @@
+#!/bin/sh
+
+printf 'sqm-recover %s\n' "$*" >> "$CAKE_RECOVER_TEST_ROOT/actions"
+[ "${CAKE_RECOVER_SQM_BLOCK:-0}" != 1 ] || {
+	: > "$CAKE_RECOVER_TEST_ROOT/sqm-entered"
+	while [ ! -e "$CAKE_RECOVER_TEST_ROOT/sqm-release" ]; do sleep 0.02; done
+}
+[ "${CAKE_RECOVER_SQM_FAIL:-0}" != 1 ] || exit 1
+: > "$CAKE_RECOVER_TEST_ROOT/sqm-restored"

@@ -1,3 +1,10 @@
 #!/bin/sh
 
-printf '%s\n' '{"recommended_method":"fping","recommended_no_pingers":3,"recommended_reflectors":["1.1.1.1","9.9.9.9","8.8.8.8"],"warnings":[]}'
+if [ "${AUTOTUNE_MOCK_MALFORMED_PINGER:-0}" = 1 ]; then
+	printf '%s\n%s\n' \
+		'{"recommended_method":"fping","recommended_no_pingers":3,"recommended_reflectors":["1.1.1.1","9.9.9.9","8.8.8.8"],"rtt_reflectors":["1.1.1.1","9.9.9.9","8.8.8.8"],"warnings":[]}' \
+		'{"forged":true}'
+	exit 0
+fi
+
+printf '%s\n' '{"recommended_method":"fping","recommended_no_pingers":3,"recommended_reflectors":["1.1.1.1","9.9.9.9","8.8.8.8"],"rtt_reflectors":["1.1.1.1","1.0.0.1","9.9.9.9","9.9.9.10","8.8.8.8"],"warnings":[]}'

@@ -3,13 +3,70 @@
 [ "$1" = "-e" ] || exit 1
 expression="$2"
 input="$(sed -n '1p')"
+case "$input" in \{*\}) ;; *) exit 1 ;; esac
 
 case "$expression" in
+	'@.state')
+		printf '%s\n' "$input" | awk -F '"state":"' '
+			NF > 1 {
+				value = $2
+				sub(/".*/, "", value)
+				print value
+				exit
+			}
+		'
+		;;
+	'@.schema_version')
+		printf '%s\n' "$input" | awk -F '"schema_version":' '
+			NF > 1 {
+				value = $2
+				sub(/[^0-9].*/, "", value)
+				if (value != "") print value
+				exit
+			}
+		'
+		;;
+	'@.producer')
+		printf '%s\n' "$input" | sed -n 's/.*"producer":"\([^"]*\)".*/\1/p'
+		;;
+	'@.target_interface')
+		printf '%s\n' "$input" | sed -n 's/.*"target_interface":"\([^"]*\)".*/\1/p'
+		;;
+	'@.resolved_interface')
+		printf '%s\n' "$input" | sed -n 's/.*"resolved_interface":"\([^"]*\)".*/\1/p'
+		;;
+	'@.source_ip')
+		printf '%s\n' "$input" | sed -n 's/.*"source_ip":"\([^"]*\)".*/\1/p'
+		;;
+	'@.external_ip')
+		printf '%s\n' "$input" | sed -n 's/.*"external_ip":"\([^"]*\)".*/\1/p'
+		;;
+	'@.route_identity')
+		printf '%s\n' "$input" | sed -n 's/.*"route_identity":"\([^"]*\)".*/\1/p'
+		;;
 	'@.available')
 		printf '%s\n' true
 		;;
+	'@.selected_backend')
+		printf '%s\n' "$input" | sed -n 's/.*"selected_backend":"\([^"]*\)".*/\1/p'
+		;;
+	'@.backend')
+		printf '%s\n' "$input" | sed -n 's/.*"backend":"\([^"]*\)".*/\1/p'
+		;;
+	'@.test_direction')
+		printf '%s\n' "$input" | sed -n 's/.*"test_direction":"\([^"]*\)".*/\1/p'
+		;;
 	'@.recommended_reflectors[*]')
 		printf '%s\n' 1.1.1.1 9.9.9.9 8.8.8.8
+		;;
+	'@.rtt_reflectors[*]')
+		printf '%s\n' 1.1.1.1 1.0.0.1 9.9.9.9 9.9.9.10 8.8.8.8
+		;;
+	'@.recommended_method')
+		printf '%s\n' fping
+		;;
+	'@.recommended_no_pingers')
+		printf '%s\n' 3
 		;;
 	'@.download_kbps')
 		printf '%s\n' "$input" | sed -n 's/.*"download_kbps":\([0-9][0-9]*\).*/\1/p'
@@ -23,11 +80,56 @@ case "$expression" in
 	'@.upload.base_kbps')
 		printf '%s\n' "$input" | sed -n 's/.*"upload":{[^}]*"base_kbps":\([0-9][0-9]*\).*/\1/p'
 		;;
+	'@.download.minimum_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"download":{"minimum_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.upload.minimum_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"upload":{"minimum_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.download.maximum_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"download":{[^}]*"maximum_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.upload.maximum_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"upload":{[^}]*"maximum_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
 	'@.download.observed_low_kbps')
 		printf '%s\n' "$input" | sed -n 's/.*"download":{[^}]*"observed_low_kbps":\([0-9][0-9]*\).*/\1/p'
 		;;
+	'@.download.absolute_cap_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"download":{[^}]*"absolute_cap_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.download.observed_median_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"download":{[^}]*"observed_median_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
 	'@.upload.observed_low_kbps')
 		printf '%s\n' "$input" | sed -n 's/.*"upload":{[^}]*"observed_low_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.upload.absolute_cap_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"upload":{[^}]*"absolute_cap_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.upload.observed_median_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"upload":{[^}]*"observed_median_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.active_threshold_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"active_threshold_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.thresholds_ms.adjust_up')
+		printf '%s\n' "$input" | sed -n 's/.*"thresholds_ms":{"adjust_up":\([0-9.][0-9.]*\).*/\1/p'
+		;;
+	'@.thresholds_ms.delay')
+		printf '%s\n' "$input" | sed -n 's/.*"thresholds_ms":{[^}]*"delay":\([0-9.][0-9.]*\).*/\1/p'
+		;;
+	'@.thresholds_ms.adjust_down')
+		printf '%s\n' "$input" | sed -n 's/.*"thresholds_ms":{[^}]*"adjust_down":\([0-9.][0-9.]*\).*/\1/p'
+		;;
+	'@.link.layer')
+		printf '%s\n' "$input" | sed -n 's/.*"link":{[^}]*"layer":"\([^"]*\)".*/\1/p'
+		;;
+	'@.link.overhead')
+		printf '%s\n' "$input" | sed -n 's/.*"link":{[^}]*"overhead":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.link.mpu')
+		printf '%s\n' "$input" | sed -n 's/.*"link":{[^}]*"mpu":\([0-9][0-9]*\).*/\1/p'
 		;;
 	'@.server_id')
 		printf '%s\n' "$input" | sed -n 's/.*"server_id":"\([^"]*\)".*/\1/p'
@@ -52,6 +154,54 @@ case "$expression" in
 		;;
 	'@.external_ip_after')
 		printf '%s\n' "$input" | sed -n 's/.*"external_ip_after":"\([^"]*\)".*/\1/p'
+		;;
+	'@.shaper_bypassed')
+		printf '%s\n' "$input" | sed -n 's/.*"shaper_bypassed":\(true\|false\).*/\1/p'
+		;;
+	'@.sqm_paused')
+		printf '%s\n' "$input" | sed -n 's/.*"sqm_paused":\(true\|false\).*/\1/p'
+		;;
+	'@.pass')
+		printf '%s\n' "$input" | sed -n 's/^{"schema_version":[0-9][0-9]*,"pass":\(true\|false\),.*/\1/p'
+		;;
+	'@.score')
+		printf '%s\n' "$input" | sed -n 's/^.*"score":\([0-9.][0-9.]*\),"metrics".*/\1/p'
+		;;
+	'@.metrics.download.candidate_realization_percent')
+		printf '%s\n' "$input" | sed -n 's/^.*"metrics":{"download":{"candidate_realization_percent":\([0-9.][0-9.]*\).*/\1/p'
+		;;
+	'@.metrics.upload.candidate_realization_percent')
+		printf '%s\n' "$input" | sed -n 's/^.*"metrics":{.*"upload":{"candidate_realization_percent":\([0-9.][0-9.]*\).*/\1/p'
+		;;
+	'@.metrics.download.capacity_retention_percent')
+		printf '%s\n' "$input" | sed -n 's/^.*"metrics":{"download":{[^}]*"capacity_retention_percent":\([0-9.][0-9.]*\).*/\1/p'
+		;;
+	'@.metrics.upload.capacity_retention_percent')
+		printf '%s\n' "$input" | sed -n 's/^.*"metrics":{.*"upload":{[^}]*"capacity_retention_percent":\([0-9.][0-9.]*\).*/\1/p'
+		;;
+	'@.metrics.effective_delta_ms')
+		printf '%s\n' "$input" | sed -n 's/^.*"effective_delta_ms":\([0-9.][0-9.]*\)},"signals".*/\1/p'
+		;;
+	'@.correction.action')
+		printf '%s\n' "$input" | sed -n 's/^.*"correction":{"action":"\([^"]*\)".*/\1/p'
+		;;
+	'@.correction.feasible')
+		printf '%s\n' "$input" | sed -n 's/^.*"correction":{"action":"[^"]*","feasible":\(true\|false\).*/\1/p'
+		;;
+	'@.correction.reason')
+		printf '%s\n' "$input" | sed -n 's/^.*"correction":{"action":"[^"]*","feasible":\(true\|false\),"reason":"\([^"]*\)".*/\2/p'
+		;;
+	'@.correction.download.action')
+		printf '%s\n' "$input" | sed -n 's/^.*"correction":{.*"download":{"action":"\([^"]*\)".*/\1/p'
+		;;
+	'@.correction.upload.action')
+		printf '%s\n' "$input" | sed -n 's/^.*"upload":{"action":"\([^"]*\)".*/\1/p'
+		;;
+	'@.correction.download.proposed_kbps')
+		printf '%s\n' "$input" | sed -n 's/^.*"correction":{.*"download":{[^}]*"proposed_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.correction.upload.proposed_kbps')
+		printf '%s\n' "$input" | sed -n 's/^.*"upload":{[^}]*"proposed_kbps":\([0-9][0-9]*\).*/\1/p'
 		;;
 	*)
 		exit 1

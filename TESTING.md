@@ -270,9 +270,10 @@ Consequences:
 
 1. Do not solve this case by blindly reducing the starting rate; the controlled
    90/12 Mbit/s trial lost throughput without improving the grade.
-2. Full Auto-Tune now requires an idle and loaded TCP/HTTPS latency signal in
-   addition to fping. The larger latency delta drives its score, and either
-   delta above 100 ms fails closed. `uclient-fetch` is an explicit dependency.
+2. This historical pre-RC8 experiment added an idle and loaded TCP/HTTPS signal
+   beside fping. At that time either delta above 100 ms failed closed and the
+   implementation timed `uclient-fetch`; current Full Auto-Tune uses the native
+   probe and the per-instance UCI target (30 ms by default).
 3. Runtime autorate therefore uses a non-prioritized HTTP/TCP signal in addition
    to ICMP. In structured Multi-WAN mode the HTTP client is executed through the
    selected nftables mwan3 member; main-route mode still verifies that the
@@ -865,3 +866,118 @@ Final RC16 release payload hashes are:
 | aarch64_generic installer | `7a459d1db7c17cbb01381aad3c82e33112dafcec7271146cd3de15d9caa2cb43` |
 | x86_64 offline bundle | `98ae66fc3373f7b4fe5301fb3c714458313ce8d71a93d0b69229985db4709cea` |
 | rockchip/armv8 offline bundle | `dc901656e376fc66e45e9171b9d06dccdd75877e7eef039e54d8184d8ea26dff` |
+
+## RC17 Full Auto-Tune validation regression and acceptance (2026-07-16)
+
+An anonymized RC16 re-run on a nominal gigabit PPPoE uplink failed closed and
+wrote no UCI configuration. The existing SQM queue was restored. That safe
+rollback was correct, but the retained evidence showed that the rejection
+reason and proposed fixed `0.95` correction were not mathematically sound.
+
+The second shaped candidate was 738.5/755.5 Mbit/s and achieved
+683.153/698.955 Mbit/s. RC16 displayed approximately 77.3% for both directions
+because it divided achieved throughput by unshaped observed-low capacity. It
+did not show that achieved/candidate was about 92.5% in both directions. RC17
+therefore has independent regression assertions for:
+
+```text
+candidate realization = achieved / candidate
+capacity retention    = achieved / observed-low
+candidate capacity    = candidate / observed-low
+```
+
+The same capture exposed a quantile mismatch. Idle native-transport samples
+had median 220 ms and p95 420 ms; loaded p95 was 480 ms. The RC16 calculation
+reported `480 - 220 = 260 ms`. Like-for-like comparison gives
+`480 - 420 = 60 ms`. An earlier candidate had loaded p95 410 ms and therefore
+a clamped p95-to-p95 delta of 0 ms, not the reported 190 ms. The RC17 transport
+regression proves persistent native connection reuse and
+`max(loaded_p95 - idle_p95, 0)`.
+
+ICMP evidence was also self-contaminated. A roughly 25-second shaped phase
+issued 79 rapid `fping -c 1` batches against three addresses from one anycast
+provider family. Their reported losses were about 1.3%, 7.6%, and 19.0%, while
+idle/loaded p95 RTT was 9.91/10.10 ms (only +0.19 ms). This is consistent with
+public-reflector ICMP rate limiting, not proof of WAN loss. RC17 verifies no
+more than one loaded batch per second, at least three provider/address
+families, and median per-reflector loss.
+
+Router CPU peaked at 53.2%, below the hard gate. Route identity, external path,
+and pinned speed-test server remained stable. However, RC16 had only an initial
+aggregate quiet check, so absence of forwarded client traffic during every
+heavy phase could not be proven. The correction adds temporary per-phase
+nftables forwarding counters. Router-originated speed-test bytes are excluded;
+missing counters or more than max(2% of the directional reference, 1 Mbit/s)
+mark the phase contaminated. Each phase gets one repeat before strict failure.
+
+The completed deterministic RC17 gate covers:
+
+1. Replaying the numbers above returns candidate realization 92.5%, capacity
+   retention 77.3%, and an `infeasible` result when the required retention
+   floor leaves no legal downward correction.
+2. Candidate realization is a two-sided 80..110% gate. A low or implausibly
+   high result requests the same measurement again; bounded retry exhaustion
+   is `INCONCLUSIVE`, not a proved candidate failure.
+3. Clean low retention raises only the failed direction within observed-low,
+   configured maximum, and per-revision bounds.
+4. Adverse latency/loss/CPU can reduce a direction only when the predicted
+   retention remains at or above the safety floor.
+5. Persistent WebSocket/HTTPS transport uses every valid raw sample for
+   p95-to-p95 deltas; an exact `[10, 10, 10, 200]` tail cannot be erased by a
+   robust central filter. TCP-connect is rejected before any heavy phase.
+6. ICMP is rate-limited and family-diverse. A reflector set which becomes
+   rate-limited under load makes the run inconclusive and is never silently
+   re-baselined. Phase-background evidence is present in success and error
+   diagnostics.
+7. Every shaped helper call is bracketed by exact ownership/rate checks for the
+   temporary root CAKE qdiscs, IFB, and ingress redirect. Plausible helper JSON
+   cannot pass after either the precondition or postcondition is invalidated.
+8. A failed, incomplete, contaminated, conservative, infeasible, or
+   inconclusive result has no LuCI apply action and cannot pass scheduled
+   Auto-Apply. The scheduler requires the exact current 14-gate set.
+9. Cancellation/error atomically leaves job status terminal and restores the
+   selected qdisc/SQM state without touching the other WAN.
+10. Apply tests exercise both packages as one guarded rollback transaction:
+    pre-existing guard-section collisions, exact list ordering, route drift,
+    old-plus-new daemon overlap, duplicate/child root qdiscs, confirm retry,
+    no-data reconciliation, timeout rollback, tmpfs-token loss after marker
+    removal, and fail-closed indeterminate state.
+
+All local acceptance gates passed:
+
+- `cargo fmt --check`, `cargo check --all-targets`, and 136 Rust unit tests;
+- all six daemon shell suites, all eight LuCI shell suites, and all five LuCI
+  JavaScript suites;
+- `git diff --check` and POSIX-shell syntax checks for every changed runtime
+  helper;
+- independent OpenWrt 25.12.5 x86_64 and rockchip/armv8 builds. Their noarch
+  LuCI APKs are byte-identical;
+- fresh `--no-network --no-scripts` installation of all 68 indexed packages
+  from each offline repository;
+- authenticated desktop and mobile Playwright flows for Status, Graphs,
+  Settings, Edit, and Re-run Auto-Tune on the production x86 Multi-WAN and ARM
+  routers. The final graph test also covers transitive clustering of dense
+  `OFFLINE`/`LEARNING`/`ACTIVE` event chains.
+
+The production upgrade replaced only the same-version LuCI package. On the
+x86 Multi-WAN router, both daemon instances remained running and the existing
+PPPoE/secondary-WAN CAKE qdiscs remained at 794400/14500 kbit/s. The
+`cake-autorate`, SQM, network, and mwan3 configuration hashes remained
+unchanged. On the ARM router, the instance remained running, its CAKE qdisc
+remained at 15773 kbit/s, and the `cake-autorate`, SQM, and network hashes also
+remained unchanged. An existing schema-2 diagnostic is now exposed as
+read-only `state=legacy`, wrapped in schema 3 with producer
+`cake-autorate-rs-autotune`, `auto_apply_eligible=false`, and
+`configuration_written=false`; it cannot enter Review or scheduled Auto-Apply.
+
+Final RC17 release payload hashes are:
+
+| Artifact | SHA-256 |
+|---|---|
+| x86_64 daemon APK | `ac5cf3ab58ebb8b3e4857a9ad4aac5639460bcab70bfcae6c281ea126b8ed650` |
+| aarch64_generic daemon APK | `85bb5d288f198299f1be6845d983a723cf5194f214766bc8c1fe14812e2e3eae` |
+| noarch LuCI APK | `b689258836d7ad1e3b85e7ba8b1d9b99c559abeac782e5ee9d02d028009999cd` |
+| x86_64 installer | `7719a8d40b27746f6ef9163c61e38af96659f8fc5fc5324c2a7825312d4899f0` |
+| aarch64_generic installer | `d177d34effc2421fbc6fa16e6ff8ec37981a48b564bbc3c2db69fb45f84ae5f4` |
+| x86_64 offline bundle | `c60babaa865106ce0d739b4bad599c6b1faf038970c30d3c740314ac3c380ea6` |
+| rockchip/armv8 offline bundle | `5c8ce4c0beb649e9534ecb0f02af066140678b5e0a76f3e2bbc273ed6fdd7168` |

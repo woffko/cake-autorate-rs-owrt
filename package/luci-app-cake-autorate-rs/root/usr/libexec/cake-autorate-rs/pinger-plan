@@ -62,13 +62,59 @@ route_exec() {
 }
 
 valid_reflector() {
-	case "$1" in
-		''|*[!0-9A-Za-z:._-]*)
+	# Reflectors become individual argv entries for fping/tsping.  Accept only a
+	# syntactically useful IP literal or DNS name, never an option-looking token
+	# or a shell pathname pattern.
+	case "$1" in ''|-*|*[!0-9A-Za-z:.-]*) return 1 ;; esac
+	printf '%s\n' "$1" | awk '
+		function ipv4(value, parts, n, i) {
+			n = split(value, parts, ".")
+			if (n != 4) return 0
+			for (i = 1; i <= 4; i++)
+				if (parts[i] !~ /^[0-9]+$/ || parts[i] + 0 > 255 ||
+				    (length(parts[i]) > 1 && substr(parts[i], 1, 1) == "0")) return 0
 			return 1
-			;;
-	esac
-
-	return 0
+		}
+		function hostname(value, labels, n, i) {
+			if (length(value) > 253 || value ~ /^-/ || value ~ /-$/ || value ~ /\.\./) return 0
+			n = split(value, labels, ".")
+			for (i = 1; i <= n; i++)
+				if (length(labels[i]) < 1 || length(labels[i]) > 63 ||
+				    labels[i] !~ /^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$/) return 0
+			return 1
+		}
+		function ipv6(value, groups, n, i, compressed, count, scan, pos, compressions) {
+			if (value !~ /^[0-9A-Fa-f:.]+$/ || value ~ /:::/) return 0
+			scan = value
+			while ((pos = index(scan, "::")) > 0) { compressions++; scan = substr(scan, pos + 2) }
+			if (compressions > 1) return 0
+			compressed = compressions == 1
+			n = split(value, groups, ":")
+			count = 0
+			for (i = 1; i <= n; i++) {
+				if (groups[i] == "") continue
+				if (index(groups[i], ".") > 0) {
+					if (i != n || !ipv4(groups[i])) return 0
+					count += 2
+				} else {
+					if (groups[i] !~ /^[0-9A-Fa-f]+$/ || length(groups[i]) > 4) return 0
+					count++
+				}
+			}
+			return compressed ? count < 8 : count == 8
+		}
+		{
+			value = $0
+			# The shell allow-list above already excludes whitespace, glob and
+			# pathname metacharacters.  Do not repeat that check as a bracket
+			# expression here: BusyBox awk rejects literal braces inside such an
+			# expression even though GNU awk accepts it.
+			if (value == "" || substr(value, 1, 1) == "-") exit 1
+			if (index(value, ":") > 0) exit(ipv6(value) ? 0 : 1)
+			if (value ~ /^[0-9.]+$/) exit(ipv4(value) ? 0 : 1)
+			exit(hostname(value) ? 0 : 1)
+		}
+	'
 }
 
 valid_irtt_server() {
@@ -130,6 +176,10 @@ append_line_var() {
 			irtt_servers="${irtt_servers}${irtt_servers:+
 }$2"
 			;;
+		rtt_usable)
+			rtt_usable="${rtt_usable}${rtt_usable:+
+}$2"
+			;;
 	esac
 }
 
@@ -155,7 +205,16 @@ probe_fping_batch() {
 		return 1
 	fi
 
-	output="$(route_exec "$fping_bin" $extra -c 1 -t 1000 $targets 2>&1)"
+	case $- in *f*) had_noglob=1 ;; *) had_noglob=0; set -f ;; esac
+	set -- "$fping_bin"
+	[ -z "$extra" ] || set -- "$@" "$extra"
+	# A default 10 ms inter-target burst across the upstream pool can trigger
+	# resolver/provider ICMP policers and poison the baseline that follows the
+	# scan. One hundred milliseconds keeps a 30-target pass bounded (~3 s)
+	# while remaining gentle enough for the tested OpenWrt uplinks.
+	set -- "$@" -i 100 -c 1 -t 1000 -- $targets
+	[ "$had_noglob" = 1 ] || set +f
+	output="$(route_exec "$@" 2>&1)"
 
 	printf '%s\n' "$output" | awk '
 		/: xmt\/rcv\/%loss = / && /min\/avg\/max =/ {
@@ -188,11 +247,14 @@ probe_tsping_batch() {
 
 	tmp="${TMPDIR:-/tmp}/cake-autorate-rs-tsping-scan.$$"
 	rm -f "$tmp"
+	case $- in *f*) had_noglob=1 ;; *) had_noglob=0; set -f ;; esac
+	set -- $targets
+	[ "$had_noglob" = 1 ] || set +f
 	if [ "${route_mode:-main}" = mwan3 ]; then
 		command -v timeout >/dev/null 2>&1 || return 1
-		timeout 4 mwan3 use "$mwan3_member" exec "$tsping_bin" --print-timestamps --machine-readable=, --sleep-time 0 --target-spacing 50 $targets >"$tmp" 2>/dev/null || true
+		timeout 4 mwan3 use "$mwan3_member" exec "$tsping_bin" --print-timestamps --machine-readable=, --sleep-time 0 --target-spacing 50 "$@" >"$tmp" 2>/dev/null || true
 	else
-		"$tsping_bin" --print-timestamps --machine-readable=, --sleep-time 0 --target-spacing 50 $targets >"$tmp" 2>/dev/null &
+		"$tsping_bin" --print-timestamps --machine-readable=, --sleep-time 0 --target-spacing 50 "$@" >"$tmp" 2>/dev/null &
 		pid="$!"
 		sleep 4
 		kill "$pid" 2>/dev/null || true
@@ -488,6 +550,10 @@ print_warnings_array() {
 	print_string_array "$warnings"
 }
 
+if [ "${CAKE_AUTORATE_PINGER_PLAN_SOURCE_ONLY:-0}" = 1 ]; then
+	return 0 2>/dev/null || exit 0
+fi
+
 UPSTREAM_DEFAULT_REFLECTORS="1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 9.9.9.9 9.9.9.10 9.9.9.11 94.140.14.15 94.140.14.140 94.140.14.141 94.140.15.15 94.140.15.16 64.6.65.6 156.154.70.1 156.154.70.2 156.154.70.3 156.154.70.4 156.154.70.5 156.154.71.1 156.154.71.2 156.154.71.3 156.154.71.4 156.154.71.5 208.67.220.2 208.67.220.123 208.67.220.220 208.67.222.2 208.67.222.123 185.228.168.9 185.228.168.10"
 default_pool_count=0
 for reflector in $UPSTREAM_DEFAULT_REFLECTORS; do
@@ -529,6 +595,7 @@ irtt_servers=""
 irtt_server_count=0
 candidate_source="configured"
 
+case $- in *f*) candidate_had_noglob=1 ;; *) candidate_had_noglob=0; set -f ;; esac
 if [ -n "$configured_reflectors" ]; then
 	for reflector in $configured_reflectors; do
 		append_candidate "$reflector"
@@ -557,6 +624,9 @@ if [ -n "$configured_irtt_servers" ]; then
 		fi
 	done
 fi
+# Keep pathname expansion disabled for the remainder of this short-lived
+# helper.  The validated space-separated reflector lists are intentionally
+# expanded only as argv tokens, never as filesystem patterns.
 
 refresh_pinger_bins
 
@@ -583,6 +653,7 @@ timestamp_ok_count=0
 timestamp_probe_backend=""
 scan_rows=""
 scan_candidates=""
+rtt_usable=""
 active=""
 spare=""
 bad=""
@@ -636,6 +707,7 @@ if [ "$mode" = "scan" ]; then
 		if [ -n "$rtt_ms" ]; then
 			rtt_ok=1
 			rtt_ok_count=$((rtt_ok_count + 1))
+			append_line_var rtt_usable "$reflector"
 		fi
 
 		if [ -n "$ts_ms" ]; then
@@ -812,6 +884,8 @@ print_string_array "$spare"
 printf ',"recommended_reflectors":'
 print_string_array "${active}${active:+
 }$spare"
+printf ',"rtt_reflectors":'
+print_string_array "$rtt_usable"
 printf ',"bad":'
 print_string_array "$bad"
 printf ',"warnings":'

@@ -25,7 +25,7 @@ const windowStub = {
 const loadHelpers = new Function('fs', 'poll', 'uci', 'ui', 'L', 'E', '_', 'window',
 	`${prefix}\nreturn { parseHistory, historyInterval, buildChartGeometry, nearestPoint, ` +
 		'bindHover, bindScroll, scrollState, scrollMaximum, formatMemoryKib, lineConnected, niceRateCeiling, ' +
-		'collectChartEvents, clusterChartEvents, chartEventClusters, layoutEventLabels };');
+		'collectChartEvents, clusterChartEvents, chartEventClusters, eventLabelPlacement, layoutEventLabels };');
 const helpers = loadHelpers({}, {}, {}, {}, {}, () => {}, value => value, windowStub);
 
 function assert(condition, message) {
@@ -41,9 +41,8 @@ assert(source.includes('GRAPH_EVENT_LABEL_LANES = 3'),
 	'event labels must use a bounded three-lane collision layout');
 assert(source.includes('clusterChartEvents'),
 	'nearby state, route, grade and rating events must be clustered');
-assert(source.includes('drawChartEvents(ctx, geometry)') &&
-	source.match(/drawChartEvents\(ctx, geometry\)/g).length >= 3,
-	'latency and traffic charts must draw one synchronized event model');
+assert(source.includes('drawChartEvents(ctx, geometry, false)'),
+	'traffic chart must keep synchronized markers without duplicating event labels');
 assert(source.includes('viewport.offsetWidth'),
 	'follow-latest must account for the stable scrollbar gutter');
 assert(source.includes('.cake-graphs-grid{display:grid;grid-template-columns:minmax(0,1fr)'),
@@ -126,6 +125,20 @@ assert(layouts.every(layout => layout.lane >= -1 && layout.lane < 3),
 assert(layouts.every(layout => !layout.label || layout.label.length < 40),
 	'crowded event labels must abbreviate while hover retains full data');
 
+const zeroProgressEvents = helpers.collectChartEvents(helpers.buildChartGeometry([
+	{ timestamp: now - 1, uplinkState: 'ACTIVE', routeIdentity: 'a', ratingPhase: 'IDLE' },
+	{ timestamp: now, uplinkState: 'ACTIVE', routeIdentity: 'a', ratingPhase: 'UL', ratingDlSamples: 0, ratingUlSamples: 0 },
+], 1, { clientWidth: 390 }));
+assert(zeroProgressEvents.some(event => event.kind === 'rating' && event.label === 'UL'),
+	'zero-sample phase marker must not render a meaningless 0/0 suffix');
+
+const edgePlacement = helpers.eventLabelPlacement(
+	{ measureText: text => ({ width: text.length * 7 }) },
+	{ left: 40, right: 20, width: 390 },
+	{ x: 40 }, 'UL');
+assert(edgePlacement.start >= 40 && edgePlacement.end <= 370 && edgePlacement.textX >= 43,
+	'event label at the left edge must remain inside the plot');
+
 const capturedPattern = helpers.buildChartGeometry([
 	{ timestamp: now - 40000, uplinkState: 'ACTIVE', routeIdentity: 'route-a', ratingPhase: 'IDLE' },
 	{ timestamp: now - 10020, uplinkState: 'OFFLINE', routeIdentity: 'route-a', ratingPhase: 'IDLE' },
@@ -138,6 +151,22 @@ const capturedClusters = helpers.clusterChartEvents(capturedPattern, capturedEve
 assert(capturedEvents.length === 3, 'LEARNING must not be emitted as a fake A+-F grade event');
 assert(capturedClusters.length === 1 && capturedClusters[0].shortLabel === 'OFFLINE…ACTIVE',
 	'10.0.77.1 OFFLINE -> LEARNING -> ACTIVE pattern must render as one marker');
+
+const chainedDenseEvents = helpers.clusterChartEvents({
+	firstTimestamp: 0,
+	lastTimestamp: 100,
+	left: 0,
+	right: 0,
+	width: 100,
+	plotWidth: 100,
+}, [
+	{ timestamp: 10, kind: 'uplink', label: 'OFFLINE', shortLabel: 'OFFLINE', color: '#c0392b' },
+	{ timestamp: 20, kind: 'uplink', label: 'LEARNING', shortLabel: 'LEARN', color: '#d4a017' },
+	{ timestamp: 30, kind: 'uplink', label: 'ACTIVE', shortLabel: 'ACTIVE', color: '#2471a3' },
+]);
+assert(chainedDenseEvents.length === 1 &&
+	chainedDenseEvents[0].shortLabel === 'OFFLINE…ACTIVE',
+	'adjacent dense events must cluster transitively instead of producing colliding labels');
 
 function eventTarget(properties) {
 	const listeners = {};

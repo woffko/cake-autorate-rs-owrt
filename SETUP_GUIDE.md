@@ -13,17 +13,20 @@ instance only after identifying the intended uplink.
    table**. On nftables mwan3 select the member that resolves to this same L3
    device.
 3. Choose **Full Auto-Tune**. Stop large downloads and uploads first. The
-   strict run measures idle ICMP and native transport latency, two unshaped
-   throughput samples, and a shaped validation candidate.
+   strict run measures idle ICMP across three independent reflector families,
+   persistent native transport latency, two unshaped throughput samples, and a
+   shaped validation candidate. It counts forwarded client traffic separately
+   during every heavy phase.
 4. If background traffic blocks calibration, prefer **Retry when quiet**. The
    explicit **Continue conservatively** action applies to that run only: it
    subtracts measured background with an extra margin, never raises confirmed
    maxima or adaptive caps, and retains a direction whose evidence is not
-   usable. The Review page labels such a result **LOW confidence**.
+   usable. The Review page labels such a result **LOW confidence** and it is
+   not eligible for scheduled Auto-Apply.
 5. Review the proposed min/base/max rates, absolute adaptive-ceiling caps,
-   link-layer overhead, latency thresholds and warnings. Nothing is written
-   before **Use proposal/Create**, and the staged UCI change still requires
-   **Save & Apply**.
+   link-layer overhead, latency thresholds, validation gates, and warnings.
+   Nothing is written before **Use proposal/Create**, and the staged UCI
+   change still requires **Save & Apply**.
 6. On **Status**, confirm that the uplink becomes `ACTIVE`, the controller is
    `RUNNING`, CAKE rates are non-zero, and Quality reaches `BASELINE READY`.
    Use **Get rating** while the link is otherwise quiet to obtain a complete
@@ -37,7 +40,33 @@ instance only after identifying the intended uplink.
 Use **Re-run Auto-Tune** immediately before **Edit** in the Settings row. It
 opens the calibration page with the instance interface, route/member, backend,
 queue and current limits prefilled. The current configuration remains active
-until the Review result is explicitly staged and saved.
+until a passing Review result is explicitly staged and saved. Re-run preserves
+the instance's explicit Adaptive Ceiling enabled/disabled choice; changing it
+requires the corresponding Review control.
+
+## Reading Auto-Tune diagnostics
+
+The Review/diagnostics page keeps three throughput percentages separate for
+download and upload:
+
+| Field | Meaning |
+|---|---|
+| Candidate realization | Achieved throughput divided by the temporary CAKE candidate; low values request a repeat of the same measurement |
+| Capacity retention | Achieved throughput divided by the unshaped observed-low capacity; this is the throughput safety gate |
+| Candidate capacity | Temporary CAKE candidate divided by observed-low capacity; this shows how conservative the candidate is |
+
+Latency is shown as loaded p95 minus idle p95 for both ICMP and native
+transport. The page also reports loss, CPU, forwarded background for each
+phase, every pass/fail gate, and any typed correction:
+`retry-measurement`, `increase`, `decrease`, `mixed`, or `infeasible`.
+
+`infeasible` means the requested latency/rate constraints cannot be satisfied
+without crossing the throughput safety floor or configured bounds. It is not
+an instruction to accept a more destructive rate. Failed, incomplete, strictly
+contaminated, and infeasible runs remain available as diagnostics but expose no
+apply action and do not replace the current UCI configuration. If the user
+explicitly selected conservative mode, a passing LOW-confidence result may be
+applied manually from Review; it is never eligible for scheduled Auto-Apply.
 
 Inside **Edit**, **Autorate setup** is split into focused groups:
 
@@ -64,8 +93,9 @@ not belong to the normal setup workflow.
 - Never point two enabled instances at the same L3 device or SQM queue.
 - Each mwan3 member has its own latency baseline, rating, throughput reference,
   adaptive ceiling and Auto-Tune schedule.
-- A standby/offline member is not a valid calibration route. Wait for it to be
-  active, or test it through the corresponding member after failover.
+- An offline or mismatched member is not a valid calibration route. An online
+  standby member may be calibrated through its explicitly selected forced
+  `mwan3` member route; route identity must remain stable for the full run.
 
 For the algorithms and safety invariants see [Controller
 mathematics](ALGORITHM_MATH.md), [Full Auto-Tune](AUTOTUNE.md), and

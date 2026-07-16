@@ -8,6 +8,37 @@ job_key_override="$5"
 route_mode_override="$6"
 mwan3_member_override="$7"
 direction_override="${8:-}"
+runtime_lock_lib="${CAKE_AUTORATE_RUNTIME_LOCK_LIB:-/usr/libexec/cake-autorate-rs/runtime-lock}"
+speedtest_self="${CAKE_AUTORATE_SPEEDTEST_SELF:-$0}"
+
+# A job-start caller launches the worker stopped, records its exact PID and
+# /proc start time while holding the per-job flock, then resumes it.  This
+# closes the check/launch/pid-publication race between simultaneous LuCI RPCs.
+if [ "${CAKE_AUTORATE_SPEEDTEST_JOB_START_STOPPED:-0}" = 1 ]; then
+	kill -STOP "$$" 2>/dev/null || exit 1
+	unset CAKE_AUTORATE_SPEEDTEST_JOB_START_STOPPED
+fi
+
+# Full Auto-Tune can request a launch handshake for a separately supervised
+# process group.  Stop before backend discovery, route probing, SQM changes, or
+# network traffic; the parent records PID/starttime in its RAM recovery journal
+# and sends CONT only after that obligation is durable.
+if [ "${CAKE_AUTORATE_SPEEDTEST_START_STOPPED:-0}" = 1 ]; then
+	# The first process is deliberately still in the Auto-Tune owner's process
+	# group. If the owner dies before journalling this PID, owner-group recovery
+	# removes it. After CONT, exec(setsid) keeps the same PID/starttime while
+	# making that pre-journalled PID the independently supervised PGID/SID.
+	setsid_reexec="${CAKE_AUTORATE_SPEEDTEST_SETSID:-$(command -v setsid 2>/dev/null)}"
+	[ -n "$setsid_reexec" ] || exit 1
+	kill -STOP "$$" 2>/dev/null || exit 1
+	unset CAKE_AUTORATE_SPEEDTEST_START_STOPPED
+	exec "$setsid_reexec" "$0" "$@"
+fi
+
+if [ -r "$runtime_lock_lib" ]; then
+	# shellcheck source=/usr/libexec/cake-autorate-rs/runtime-lock
+	. "$runtime_lock_lib"
+fi
 
 case "$direction_override" in
 	''|both|download|upload) ;;
@@ -25,7 +56,8 @@ if [ "$target_if_override" = "--status" ] || [ "$target_if_override" = "status" 
 	mode="status"
 fi
 
-if [ "$mode" != "status" ] && [ -n "$mode" ] && [ -z "$backend_override" ]; then
+if [ "$mode" != "status" ] && [ "$mode" != "route-status" ] &&
+   [ -n "$mode" ] && [ -z "$backend_override" ]; then
 	backend_override="$mode"
 	mode=""
 fi
@@ -36,10 +68,17 @@ upload_retry_bytes_default="1000000 262144"
 timeout_default="45"
 duration_default="15"
 route_probe_default="1.1.1.1"
+sqm_run_bin="${CAKE_AUTORATE_SQM_RUN:-/usr/lib/sqm/run.sh}"
+sqm_recover_bin="${CAKE_AUTORATE_SQM_RECOVER:-/usr/libexec/cake-autorate-rs/sqm-recover}"
+sqm_config_file="${CAKE_AUTORATE_SQM_CONFIG_FILE:-/etc/config/sqm}"
 
 uci_get() {
 	[ -n "$section" ] || return 0
 	uci -q get "cake-autorate.$section.$1" 2>/dev/null
+}
+
+uci_raw_get() {
+	uci -q get "$1" 2>/dev/null
 }
 
 json_escape() {
@@ -133,6 +172,41 @@ command_path() {
 	command -v "$1" 2>/dev/null || true
 }
 
+# Some OpenWrt BusyBox builds reject fractional `sleep` arguments. Keep the
+# recovery/poll loops bounded without spinning: use fractional sleep when the
+# installed applet accepts it, fall back to `usleep`, and finally one second.
+speedtest_brief_sleep_mode=""
+speedtest_usleep_bin=""
+brief_sleep() {
+	local duration="${1:-0.05}" usec
+
+	case "$duration" in
+		0.05) usec=50000 ;;
+		0.10|0.1) usec=100000 ;;
+		*) return 1 ;;
+	esac
+	case "$speedtest_brief_sleep_mode" in
+		fractional) sleep "$duration" ;;
+		usleep) "$speedtest_usleep_bin" "$usec" ;;
+		whole) sleep 1 ;;
+		'')
+			if sleep "$duration" 2>/dev/null; then
+				speedtest_brief_sleep_mode=fractional
+				return 0
+			fi
+			speedtest_usleep_bin="$(command_path usleep)"
+			if [ -n "$speedtest_usleep_bin" ] &&
+			   "$speedtest_usleep_bin" "$usec" 2>/dev/null; then
+				speedtest_brief_sleep_mode=usleep
+				return 0
+			fi
+			speedtest_brief_sleep_mode=whole
+			sleep 1
+			;;
+		*) return 1 ;;
+	esac
+}
+
 resolve_interface_device() {
 	local name="$1"
 	local status dev
@@ -202,6 +276,17 @@ safe_route_name() {
 	esac
 
 	return 0
+}
+
+valid_ipv4() {
+	case "$1" in ''|*[!0-9.]*) return 1 ;; esac
+	printf '%s\n' "$1" | awk -F. '
+		NF != 4 { exit 1 }
+		{
+			for (i = 1; i <= 4; i++)
+				if ($i !~ /^[0-9]+$/ || $i < 0 || $i > 255) exit 1
+		}
+	'
 }
 
 effective_route_mode() {
@@ -324,14 +409,44 @@ inspect_selected_route() {
 }
 
 fetch_external_ip() {
-	local output
+	local output candidate
 
 	if [ -n "$fallback_fetch" ]; then
 		output="$(route_exec "$fallback_fetch" -q -4 -O - --timeout="$timeout_s" "$external_ip_url" 2>/dev/null)" || output=""
 	elif [ -n "$curl_fetch" ]; then
 		output="$(route_exec "$curl_fetch" -4 -fsS --max-time "$timeout_s" "$external_ip_url" 2>/dev/null)" || output=""
 	fi
-	printf '%s\n' "$output" | tr -cd '0-9A-Fa-f:.\n' | sed -n '/./{p;q;}'
+	# Accept exactly one dotted-quad payload. Selecting only the first line would
+	# let a backend append attacker-controlled or malformed data while still
+	# passing route attestation.
+	candidate="$(printf '%s' "$output" | tr -d '\r')"
+	valid_ipv4 "$candidate" || return 1
+	printf '%s\n' "$candidate"
+}
+
+route_status_json() {
+	local route_status_external_ip
+
+	if ! inspect_selected_route; then
+		json_error "${route_error:-selected route is unavailable}"
+	fi
+	valid_ipv4 "$route_source_ip" || json_error "Selected route has no valid IPv4 source address."
+	route_status_external_ip="$(fetch_external_ip)"
+	[ -n "$route_status_external_ip" ] ||
+		json_error "Unable to determine the external IPv4 address through the selected route."
+	printf '{"state":"ready","schema_version":1,"target_interface":"%s","resolved_interface":"%s","route_interface":"%s","route_mode":"%s","mwan3_member":"%s","source_ip":"%s","external_ip":"%s","route_fwmark":"%s","route_table":"%s","route_identity":"%s","route_active":%s,"member_status":"%s"}\n' \
+		"$(json_escape "$target_if_override")" \
+		"$(json_escape "$target_if")" \
+		"$(json_escape "$route_device")" \
+		"$(json_escape "$route_mode")" \
+		"$(json_escape "$mwan3_member")" \
+		"$(json_escape "$route_source_ip")" \
+		"$(json_escape "$route_status_external_ip")" \
+		"$(json_escape "$route_fwmark")" \
+		"$(json_escape "$route_table")" \
+		"$(json_escape "$route_identity")" \
+		"$route_active" \
+		"$(json_escape "$route_member_status")"
 }
 
 speedtest_unshaped_enabled() {
@@ -353,7 +468,9 @@ sqm_state_dir() {
 	local dir
 
 	dir="$(
-		. /etc/sqm/sqm.conf 2>/dev/null
+		if [ -r /etc/sqm/sqm.conf ]; then
+			. /etc/sqm/sqm.conf 2>/dev/null
+		fi
 		printf '%s' "${SQM_STATE_DIR:-/var/run/sqm}"
 	)"
 	[ -n "$dir" ] || dir="/var/run/sqm"
@@ -368,9 +485,220 @@ sqm_active_for_device() {
 	[ -f "$dir/$1.state" ]
 }
 
+capture_managed_sqm_recovery_snapshot() {
+	local manage_sqm sqm_enabled owner enabled configured_target snapshot tmp
+
+	calibration_sqm_managed=0
+	calibration_sqm_section=""
+	calibration_sqm_target="$target_if"
+	calibration_sqm_ul_if=""
+	calibration_sqm_dl_if=""
+	calibration_sqm_config_fingerprint=""
+	# standalone_recovery_arm publishes the planned path before this copy. If
+	# SIGKILL lands while the snapshot is being prepared, its supervisor can
+	# therefore remove both the unpublished temporary and final path safely.
+	if [ -n "${calibration_sqm_config_snapshot:-}" ]; then
+		snapshot="$calibration_sqm_config_snapshot"
+	else
+		snapshot="$runtime_lock_root/sqm-snapshot.${section}-$$-${runtime_interface_lock_token}"
+		calibration_sqm_config_snapshot="$snapshot"
+	fi
+	managed_sqm_snapshot_path_valid "$snapshot" 0 || return 1
+	[ ! -e "$snapshot" ] || return 1
+	manage_sqm="$(uci_get manage_sqm)"
+	[ -n "$manage_sqm" ] || manage_sqm=1
+	# A standalone unshaped test may mutate only a queue whose complete managed
+	# identity can be journalled and checked by sqm-recover. An unmanaged active
+	# queue is left untouched instead of relying on a state-file-only restart.
+	bool_enabled "$manage_sqm" || return 1
+	sqm_enabled="$(uci_get sqm_enabled)"
+	bool_enabled "$sqm_enabled" || return 1
+	calibration_sqm_section="$(uci_get sqm_section)"
+	[ -n "$calibration_sqm_section" ] || calibration_sqm_section="cake_$section"
+	calibration_sqm_ul_if="$(uci_get ul_if)"
+	[ -n "$calibration_sqm_ul_if" ] || calibration_sqm_ul_if="$target_if"
+	calibration_sqm_dl_if="$(uci_get dl_if)"
+	[ -n "$calibration_sqm_dl_if" ] || calibration_sqm_dl_if="ifb4$target_if"
+	safe_uci_name "$calibration_sqm_section" &&
+		safe_route_name "$calibration_sqm_target" &&
+		safe_route_name "$calibration_sqm_ul_if" &&
+		safe_route_name "$calibration_sqm_dl_if" || return 1
+	owner="$(uci_raw_get "sqm.$calibration_sqm_section._cake_autorate_managed")"
+	enabled="$(uci_raw_get "sqm.$calibration_sqm_section.enabled")"
+	configured_target="$(uci_raw_get "sqm.$calibration_sqm_section.interface")"
+	[ "$owner" = "$section" ] && [ "$enabled" = 1 ] &&
+		[ "$configured_target" = "$target_if" ] || return 1
+	[ -f "$sqm_config_file" ] && [ ! -L "$sqm_config_file" ] || return 1
+	runtime_lock_path_owned_by_euid "$sqm_config_file" || return 1
+	tmp="$snapshot.tmp"
+	[ ! -e "$tmp" ] && [ ! -L "$tmp" ] || return 1
+	if ! cp "$sqm_config_file" "$tmp" || ! chmod 600 "$tmp" 2>/dev/null ||
+	   ! runtime_lock_path_owned_by_euid "$tmp" || ! mv "$tmp" "$snapshot"; then
+		rm -f "$tmp" 2>/dev/null || true
+		return 1
+	fi
+	managed_sqm_snapshot_path_valid "$snapshot" 1 || {
+		remove_managed_sqm_snapshot >/dev/null 2>&1 || true
+		return 1
+	}
+	calibration_sqm_config_fingerprint="$(managed_sqm_snapshot_fingerprint \
+		"$calibration_sqm_section" "$snapshot")" || {
+		remove_managed_sqm_snapshot >/dev/null 2>&1 || true
+		return 1
+	}
+	[ "$(managed_sqm_config_fingerprint "$calibration_sqm_section")" = \
+	  "$calibration_sqm_config_fingerprint" ] || {
+		remove_managed_sqm_snapshot >/dev/null 2>&1 || true
+		return 1
+	}
+	# Bind the identity reads and the full-section digest to one stable snapshot.
+	# A raw UCI writer which ignores the runtime lock is still detected before
+	# the first SQM mutation below.
+	owner="$(uci_raw_get "sqm.$calibration_sqm_section._cake_autorate_managed")"
+	enabled="$(uci_raw_get "sqm.$calibration_sqm_section.enabled")"
+	configured_target="$(uci_raw_get "sqm.$calibration_sqm_section.interface")"
+	if [ "$owner" != "$section" ] || [ "$enabled" != 1 ] ||
+	   [ "$configured_target" != "$target_if" ]; then
+		remove_managed_sqm_snapshot >/dev/null 2>&1 || true
+		return 1
+	fi
+	calibration_sqm_managed=1
+}
+
+managed_sqm_config_fingerprint() {
+	local sqm_config_section="$1" config_dir="${2:-}" raw sorted digest
+
+	safe_uci_name "$sqm_config_section" || return 1
+	command -v sha256sum >/dev/null 2>&1 || return 1
+	command -v sort >/dev/null 2>&1 || return 1
+	command -v runtime_lock_ram_path >/dev/null 2>&1 || return 1
+	runtime_lock_ram_path "$speedtest_job_dir" || return 1
+	[ ! -L "$speedtest_job_dir" ] || return 1
+	mkdir -p "$speedtest_job_dir" || return 1
+	[ -d "$speedtest_job_dir" ] && [ ! -L "$speedtest_job_dir" ] || return 1
+	command -v runtime_lock_path_owned_by_euid >/dev/null 2>&1 || return 1
+	runtime_lock_path_owned_by_euid "$speedtest_job_dir" || return 1
+	chmod 700 "$speedtest_job_dir" 2>/dev/null || return 1
+	raw="$(mktemp "$speedtest_job_dir/.sqm-config.XXXXXX")" || return 1
+	sorted="$(mktemp "$speedtest_job_dir/.sqm-config-sorted.XXXXXX")" || {
+		rm -f "$raw"
+		return 1
+	}
+	if [ -n "$config_dir" ]; then
+		case "$config_dir" in "$runtime_lock_root"/sqm-snapshot-check-*) ;; *)
+			rm -f "$raw" "$sorted"
+			return 1
+		;; esac
+		uci -q -c "$config_dir" show "sqm.$sqm_config_section" > "$raw" || {
+			rm -f "$raw" "$sorted"
+			return 1
+		}
+	else
+		uci -q show "sqm.$sqm_config_section" > "$raw" || {
+			rm -f "$raw" "$sorted"
+			return 1
+		}
+	fi
+	if [ ! -s "$raw" ] ||
+	   ! LC_ALL=C sort "$raw" > "$sorted"; then
+		rm -f "$raw" "$sorted"
+		return 1
+	fi
+	digest="$(sha256sum "$sorted" 2>/dev/null | awk 'NR == 1 { print $1; exit }')"
+	rm -f "$raw" "$sorted"
+	[ "${#digest}" -eq 64 ] 2>/dev/null || return 1
+	case "$digest" in *[!0-9a-f]*) return 1 ;; esac
+	printf 'sha256:%s\n' "$digest"
+}
+
+managed_sqm_snapshot_path_valid() {
+	local snapshot="$1" require_file="${2:-1}" name mode
+
+	[ -n "$snapshot" ] || return 1
+	runtime_lock_ram_path "$snapshot" || return 1
+	case "$snapshot" in "$runtime_lock_root"/sqm-snapshot.*) ;; *) return 1 ;; esac
+	name="${snapshot#"$runtime_lock_root"/sqm-snapshot.}"
+	case "$name" in ''|*/*|*[!A-Za-z0-9_-]*) return 1 ;; esac
+	[ ! -L "$snapshot" ] || return 1
+	if [ "$require_file" = 0 ] && [ ! -e "$snapshot" ]; then
+		return 0
+	fi
+	[ -f "$snapshot" ] || return 1
+	runtime_lock_path_owned_by_euid "$snapshot" || return 1
+	mode="$(LC_ALL=C ls -ldn "$snapshot" 2>/dev/null |
+		awk 'NR == 1 { print substr($1, 1, 10); exit }')"
+	[ "$mode" = "-rw-------" ]
+}
+
+managed_sqm_snapshot_fingerprint() {
+	local sqm_config_section="$1" snapshot="$2" check_dir fingerprint rc=0
+
+	managed_sqm_snapshot_path_valid "$snapshot" 1 || return 1
+	check_dir="$runtime_lock_root/sqm-snapshot-check-$$-${runtime_interface_lock_token}"
+	case "$check_dir" in "$runtime_lock_root"/sqm-snapshot-check-*) ;; *) return 1 ;; esac
+	[ ! -e "$check_dir" ] && [ ! -L "$check_dir" ] || return 1
+	mkdir "$check_dir" || return 1
+	chmod 700 "$check_dir" 2>/dev/null || rc=1
+	runtime_lock_path_owned_by_euid "$check_dir" || rc=1
+	if [ "$rc" -eq 0 ]; then
+		cp "$snapshot" "$check_dir/sqm" || rc=1
+	fi
+	if [ "$rc" -eq 0 ]; then
+		chmod 600 "$check_dir/sqm" 2>/dev/null || rc=1
+	fi
+	if [ "$rc" -eq 0 ]; then
+		fingerprint="$(managed_sqm_config_fingerprint "$sqm_config_section" "$check_dir")" || rc=1
+	fi
+	rm -f "$check_dir/sqm" 2>/dev/null || rc=1
+	rmdir "$check_dir" 2>/dev/null || rc=1
+	[ "$rc" -eq 0 ] || return 1
+	printf '%s\n' "$fingerprint"
+}
+
+remove_managed_sqm_snapshot() {
+	local snapshot="${calibration_sqm_config_snapshot:-}" tmp
+
+	[ -n "$snapshot" ] || return 0
+	managed_sqm_snapshot_path_valid "$snapshot" 0 || return 1
+	tmp="$snapshot.tmp"
+	if [ -e "$tmp" ] || [ -L "$tmp" ]; then
+		[ -f "$tmp" ] && [ ! -L "$tmp" ] || return 1
+		runtime_lock_path_owned_by_euid "$tmp" || return 1
+		rm -f "$tmp" || return 1
+	fi
+	if [ -e "$snapshot" ]; then
+		managed_sqm_snapshot_path_valid "$snapshot" 1 || return 1
+		rm -f "$snapshot" || return 1
+	fi
+	[ ! -e "$snapshot" ] && [ ! -L "$snapshot" ]
+}
+
 autorate_instance_running() {
+	[ -n "$(autorate_instance_pid)" ]
+}
+
+autorate_instance_pid() {
 	safe_uci_name "$section" || return 1
-	pgrep -f "^/usr/sbin/cake-autorated --instance $section\$" >/dev/null 2>&1
+	pgrep -f "^/usr/sbin/cake-autorated --instance $section\$" 2>/dev/null | sed -n '1p'
+}
+
+speedtest_process_starttime() {
+	local pid="$1"
+
+	if command -v runtime_lock_process_starttime >/dev/null 2>&1; then
+		runtime_lock_process_starttime "$pid"
+		return $?
+	fi
+	[ -r "/proc/$pid/stat" ] || return 1
+	sed 's/^.*) //' "/proc/$pid/stat" 2>/dev/null | awk 'NF >= 20 { print $20; exit }'
+}
+
+speedtest_process_identity_matches() {
+	local pid="$1" expected_start="$2" actual_start
+
+	is_positive_uint "$pid" && is_positive_uint "$expected_start" || return 1
+	actual_start="$(speedtest_process_starttime "$pid" 2>/dev/null)"
+	[ "$actual_start" = "$expected_start" ]
 }
 
 process_is_stopped() {
@@ -378,48 +706,599 @@ process_is_stopped() {
 	grep -q '^State:[[:space:]]*[Tt]' "/proc/$1/status" 2>/dev/null
 }
 
+wait_for_process_state() {
+	local pid="$1" expected_start="$2" wanted="$3" attempts="${4:-40}" i=0
+
+	while [ "$i" -lt "$attempts" ]; do
+		speedtest_process_identity_matches "$pid" "$expected_start" || return 2
+		if [ "$wanted" = stopped ]; then
+			process_is_stopped "$pid" && return 0
+		else
+			process_is_stopped "$pid" || return 0
+		fi
+		i=$((i + 1))
+		brief_sleep 0.05
+	done
+	return 1
+}
+
+wait_for_sqm_state() {
+	local wanted="$1" attempts="${2:-40}" i=0
+
+	while [ "$i" -lt "$attempts" ]; do
+		if [ "$wanted" = active ]; then
+			sqm_active_for_device "$target_if" && return 0
+		else
+			sqm_active_for_device "$target_if" || return 0
+		fi
+		i=$((i + 1))
+		brief_sleep 0.05
+	done
+	return 1
+}
+
+standalone_recovery_write() {
+	local tmp journal_version
+
+	[ -n "${standalone_recovery_journal:-}" ] || return 0
+	command -v runtime_lock_ram_path >/dev/null 2>&1 || return 1
+	runtime_lock_ram_path "$standalone_recovery_journal" || return 1
+	journal_version="${standalone_recovery_version:-4}"
+	[ "$journal_version" = 4 ] || return 1
+	tmp="$standalone_recovery_journal.tmp.$$"
+	if {
+		printf 'version=%s\n' "$journal_version"
+		printf 'owner_pid=%s\n' "$standalone_recovery_owner_pid"
+		printf 'owner_start=%s\n' "$standalone_recovery_owner_start"
+		printf 'target_if=%s\n' "$target_if"
+		printf 'section=%s\n' "$section"
+		printf 'lock_token=%s\n' "$standalone_recovery_lock_token"
+		printf 'autorate_pid=%s\n' "${calibration_autorate_pid:-}"
+		printf 'autorate_start=%s\n' "${calibration_autorate_start:-}"
+		printf 'autorate_restore_required=%s\n' "${calibration_autorate_was_running:-0}"
+		printf 'sqm_restore_required=%s\n' "${calibration_sqm_was_running:-0}"
+		printf 'sqm_managed=%s\n' "${calibration_sqm_managed:-0}"
+		printf 'sqm_section=%s\n' "${calibration_sqm_section:-}"
+		printf 'sqm_target=%s\n' "${calibration_sqm_target:-}"
+		printf 'sqm_ul_if=%s\n' "${calibration_sqm_ul_if:-}"
+		printf 'sqm_dl_if=%s\n' "${calibration_sqm_dl_if:-}"
+		printf 'sqm_config_fingerprint=%s\n' "${calibration_sqm_config_fingerprint:-}"
+		printf 'sqm_config_snapshot=%s\n' "${calibration_sqm_config_snapshot:-}"
+		printf 'phase=%s\n' "${standalone_recovery_phase:-armed}"
+	} > "$tmp" && mv "$tmp" "$standalone_recovery_journal"; then
+		return 0
+	fi
+	rm -f "$tmp" 2>/dev/null || true
+	return 1
+}
+
+standalone_recovery_load() {
+	local file="$1" line key value seen="" required expected_snapshot
+
+	command -v runtime_lock_ram_path >/dev/null 2>&1 || return 1
+	runtime_lock_ram_path "$file" || return 1
+	[ -f "$file" ] && [ ! -L "$file" ] || return 1
+	recovery_version=""
+	recovery_owner_pid=""
+	recovery_owner_start=""
+	recovery_target_if=""
+	recovery_section=""
+	recovery_lock_token=""
+	recovery_autorate_pid=""
+	recovery_autorate_start=""
+	recovery_autorate_required=""
+	recovery_sqm_required=""
+	recovery_sqm_managed=""
+	recovery_sqm_section=""
+	recovery_sqm_target=""
+	recovery_sqm_ul_if=""
+	recovery_sqm_dl_if=""
+	recovery_sqm_config_fingerprint=""
+	recovery_sqm_config_snapshot=""
+	recovery_phase=""
+	while IFS= read -r line || [ -n "$line" ]; do
+		case "$line" in *=*) ;; *) return 1 ;; esac
+		key="${line%%=*}"
+		value="${line#*=}"
+		case " $seen " in *" $key "*) return 1 ;; esac
+		case "$key" in
+			version) recovery_version="$value" ;;
+			owner_pid) recovery_owner_pid="$value" ;;
+			owner_start) recovery_owner_start="$value" ;;
+			target_if) recovery_target_if="$value" ;;
+			section) recovery_section="$value" ;;
+			lock_token) recovery_lock_token="$value" ;;
+			autorate_pid) recovery_autorate_pid="$value" ;;
+			autorate_start) recovery_autorate_start="$value" ;;
+			autorate_restore_required) recovery_autorate_required="$value" ;;
+			sqm_restore_required) recovery_sqm_required="$value" ;;
+			sqm_managed) recovery_sqm_managed="$value" ;;
+			sqm_section) recovery_sqm_section="$value" ;;
+			sqm_target) recovery_sqm_target="$value" ;;
+			sqm_ul_if) recovery_sqm_ul_if="$value" ;;
+			sqm_dl_if) recovery_sqm_dl_if="$value" ;;
+			sqm_config_fingerprint) recovery_sqm_config_fingerprint="$value" ;;
+			sqm_config_snapshot) recovery_sqm_config_snapshot="$value" ;;
+			phase) recovery_phase="$value" ;;
+			*) return 1 ;;
+		esac
+		seen="${seen}${seen:+ }$key"
+	done < "$file"
+	for required in version owner_pid owner_start target_if section lock_token \
+		autorate_pid autorate_start autorate_restore_required sqm_restore_required \
+		sqm_managed sqm_section sqm_target sqm_ul_if sqm_dl_if \
+		sqm_config_fingerprint sqm_config_snapshot phase; do
+		case " $seen " in *" $required "*) ;; *) return 1 ;; esac
+	done
+	[ "$recovery_version" = 4 ] || return 1
+	is_positive_uint "$recovery_owner_pid" && is_positive_uint "$recovery_owner_start" || return 1
+	safe_route_name "$recovery_target_if" && safe_uci_name "$recovery_section" || return 1
+	case "$recovery_lock_token" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac
+	case "$recovery_autorate_required:$recovery_sqm_required" in
+		0:0|0:1|1:0|1:1) ;;
+		*) return 1 ;;
+	esac
+	if [ "$recovery_autorate_required" = 1 ]; then
+		is_positive_uint "$recovery_autorate_pid" && is_positive_uint "$recovery_autorate_start" || return 1
+	else
+		[ -z "$recovery_autorate_pid$recovery_autorate_start" ] || return 1
+	fi
+	case "$recovery_sqm_managed" in 0|1) ;; *) return 1 ;; esac
+	[ "$recovery_sqm_required" != 1 ] || [ "$recovery_sqm_managed" = 1 ] || return 1
+	if [ "$recovery_sqm_managed" = 1 ]; then
+		safe_uci_name "$recovery_sqm_section" &&
+			safe_route_name "$recovery_sqm_target" &&
+			safe_route_name "$recovery_sqm_ul_if" &&
+			safe_route_name "$recovery_sqm_dl_if" || return 1
+		[ "$recovery_sqm_target" = "$recovery_target_if" ] || return 1
+		case "$recovery_sqm_config_fingerprint" in
+			sha256:????????????????????????????????????????????????????????????????) ;;
+			*) return 1 ;;
+		esac
+		case "${recovery_sqm_config_fingerprint#sha256:}" in *[!0-9a-f]*) return 1 ;; esac
+	elif [ -n "$recovery_sqm_config_fingerprint" ]; then
+		return 1
+	fi
+	managed_sqm_snapshot_path_valid "$recovery_sqm_config_snapshot" 0 || return 1
+	expected_snapshot="$runtime_lock_root/sqm-snapshot.${recovery_section}-${recovery_owner_pid}-${recovery_lock_token}"
+	[ "$recovery_sqm_config_snapshot" = "$expected_snapshot" ] || return 1
+	if [ "$recovery_sqm_required" = 1 ]; then
+		managed_sqm_snapshot_path_valid "$recovery_sqm_config_snapshot" 1 || return 1
+	fi
+	case "$recovery_phase" in armed|restored) ;;
+		*) return 1 ;;
+	esac
+	if [ "$recovery_phase" = restored ]; then
+		[ "$recovery_autorate_required" = 0 ] && [ "$recovery_sqm_required" = 0 ] || return 1
+	fi
+}
+
+standalone_recovery_ready_matches() {
+	local file="$1" pid start owner_pid owner_start token extra
+
+	[ -f "$file" ] && [ ! -L "$file" ] || return 1
+	pid="$(sed -n '1s/^pid=//p' "$file")"
+	start="$(sed -n '2s/^start=//p' "$file")"
+	owner_pid="$(sed -n '3s/^owner_pid=//p' "$file")"
+	owner_start="$(sed -n '4s/^owner_start=//p' "$file")"
+	token="$(sed -n '5s/^token=//p' "$file")"
+	extra="$(sed -n '6p' "$file")"
+	[ -z "$extra" ] || return 1
+	is_positive_uint "$pid" && is_positive_uint "$start" || return 1
+	[ "$owner_pid" = "$standalone_recovery_owner_pid" ] &&
+		[ "$owner_start" = "$standalone_recovery_owner_start" ] &&
+		[ "$token" = "$standalone_recovery_lock_token" ] || return 1
+	speedtest_process_identity_matches "$pid" "$start" || return 1
+	standalone_recovery_supervisor_pid="$pid"
+	standalone_recovery_supervisor_start="$start"
+}
+
+standalone_recovery_supervisor_alive() {
+	speedtest_process_identity_matches "$standalone_recovery_supervisor_pid" \
+		"$standalone_recovery_supervisor_start"
+}
+
+standalone_recovery_arm() {
+	local lock_name setsid_bin ready i=0
+
+	[ "${interface_lock_shared:-0}" != 1 ] || return 0
+	[ "${standalone_recovery_armed:-0}" != 1 ] || return 0
+	setsid_bin="$(command_path setsid)"
+	[ -n "$setsid_bin" ] || return 1
+	command -v runtime_lock_write_record >/dev/null 2>&1 || return 1
+	safe_uci_name "$section" && safe_route_name "$target_if" || return 1
+	lock_name="$(printf '%s' "$target_if" | tr ':@.' '___')"
+	runtime_lock_ram_path "$speedtest_job_dir" || return 1
+	[ ! -L "$speedtest_job_dir" ] || return 1
+	mkdir -p "$speedtest_job_dir" || return 1
+	[ -d "$speedtest_job_dir" ] && [ ! -L "$speedtest_job_dir" ] || return 1
+	runtime_lock_path_owned_by_euid "$speedtest_job_dir" || return 1
+	chmod 700 "$speedtest_job_dir" 2>/dev/null || return 1
+	standalone_recovery_journal="$speedtest_job_dir/recovery-$section-$lock_name-$$.journal"
+	ready="$standalone_recovery_journal.ready"
+	standalone_recovery_owner_pid="$$"
+	standalone_recovery_owner_start="$runtime_interface_lock_starttime"
+	standalone_recovery_lock_token="$runtime_interface_lock_token"
+	standalone_recovery_phase=armed
+	standalone_recovery_version=4
+	calibration_autorate_was_running=0
+	calibration_autorate_pid=""
+	calibration_autorate_start=""
+	calibration_sqm_was_running=0
+	calibration_sqm_managed=0
+	calibration_sqm_section=""
+	calibration_sqm_target="$target_if"
+	calibration_sqm_ul_if=""
+	calibration_sqm_dl_if=""
+	calibration_sqm_config_fingerprint=""
+	calibration_sqm_config_snapshot="$runtime_lock_root/sqm-snapshot.${section}-$$-${runtime_interface_lock_token}"
+	managed_sqm_snapshot_path_valid "$calibration_sqm_config_snapshot" 0 || return 1
+	[ ! -e "$calibration_sqm_config_snapshot" ] || return 1
+	rm -f "$standalone_recovery_journal" "$ready"
+	standalone_recovery_write || return 1
+
+	"$setsid_bin" "$speedtest_self" --standalone-recover "$standalone_recovery_journal" \
+		</dev/null >/dev/null 2>&1 &
+	standalone_recovery_supervisor_pid="$!"
+	standalone_recovery_supervisor_start="$(speedtest_process_starttime "$standalone_recovery_supervisor_pid" 2>/dev/null)"
+	while [ "$i" -lt 100 ]; do
+		if standalone_recovery_ready_matches "$ready"; then
+			break
+		fi
+		kill -0 "$standalone_recovery_supervisor_pid" 2>/dev/null || break
+		i=$((i + 1))
+		brief_sleep 0.05
+	done
+	if ! standalone_recovery_ready_matches "$ready"; then
+		if speedtest_process_identity_matches "$standalone_recovery_supervisor_pid" \
+		   "$standalone_recovery_supervisor_start"; then
+			kill "$standalone_recovery_supervisor_pid" 2>/dev/null || true
+		fi
+		wait "$standalone_recovery_supervisor_pid" 2>/dev/null || true
+		rm -f "$standalone_recovery_journal" "$ready"
+		standalone_recovery_journal=""
+		return 1
+	fi
+
+	# Link the already-live supervisor into the authoritative interface record
+	# before the first STOP or SQM command.  Before this rewrite a crash has no
+	# paused state to restore and the stale record is safely replaceable.
+	if ! runtime_lock_write_record "$runtime_interface_lock_record" "$$" \
+	   "$runtime_interface_lock_starttime" speedtest "$runtime_interface_lock_token" \
+	   "$standalone_recovery_journal"; then
+		if standalone_recovery_supervisor_alive; then
+			kill "$standalone_recovery_supervisor_pid" 2>/dev/null || true
+		fi
+		wait "$standalone_recovery_supervisor_pid" 2>/dev/null || true
+		rm -f "$standalone_recovery_journal" "$ready"
+		standalone_recovery_journal=""
+		return 1
+	fi
+	export CAKE_AUTORATE_INTERFACE_LOCK_RECOVERY_JOURNAL="$standalone_recovery_journal"
+	standalone_recovery_ready_file="$ready"
+	standalone_recovery_armed=1
+}
+
+standalone_recovery_mark_restored() {
+	[ "${standalone_recovery_armed:-0}" = 1 ] || return 0
+	standalone_recovery_phase=restored
+	standalone_recovery_write
+}
+
 prepare_speedtest_calibration() {
-	local autorate_pid
+	local autorate_pid autorate_start sqm_preflight_active=0
 	[ -n "$section" ] || return 0
 	[ -n "$target_if" ] || return 0
 	speedtest_unshaped_enabled || return 0
 
-	calibration_shaper_bypassed="true"
+	if [ "${interface_lock_shared:-0}" != 1 ]; then
+		standalone_recovery_arm || {
+			append_warning "Unshaped speed test was refused because crash recovery could not be armed."
+			return 1
+		}
+	fi
+
+	if [ -x "$sqm_run_bin" ] && sqm_active_for_device "$target_if"; then
+		capture_managed_sqm_recovery_snapshot || {
+			append_warning "Active SQM has no immutable managed recovery identity; the unshaped test was refused before pausing autorate or SQM."
+			standalone_recovery_mark_restored || true
+			return 1
+		}
+		sqm_preflight_active=1
+	fi
 
 	if autorate_instance_running; then
-		autorate_pid="$(pgrep -f "^/usr/sbin/cake-autorated --instance $section\$" | sed -n '1p')"
+		autorate_pid="$(autorate_instance_pid)"
+		autorate_start="$(speedtest_process_starttime "$autorate_pid" 2>/dev/null)"
+		is_positive_uint "$autorate_pid" && is_positive_uint "$autorate_start" || {
+			append_warning "Autorate instance $section changed identity before it could be paused."
+			standalone_recovery_mark_restored || true
+			return 1
+		}
 		if is_positive_uint "$autorate_pid" && process_is_stopped "$autorate_pid"; then
-			append_warning "Autorate instance $section was already paused by its owning maintenance job."
-		elif is_positive_uint "$autorate_pid" && kill -STOP "$autorate_pid" 2>/dev/null; then
+			if [ "${interface_lock_shared:-0}" = 1 ]; then
+				append_warning "Autorate instance $section was already paused by its owning maintenance job."
+			else
+				append_warning "Autorate instance $section was unexpectedly already paused; refusing an unowned mutation."
+				standalone_recovery_mark_restored || true
+				return 1
+			fi
+		else
 			calibration_autorate_pid="$autorate_pid"
+			calibration_autorate_start="$autorate_start"
 			calibration_autorate_was_running=1
+			[ "${standalone_recovery_armed:-0}" != 1 ] || {
+				standalone_recovery_supervisor_alive || return 1
+				standalone_recovery_write || return 1
+			}
+			if ! kill -STOP "$autorate_pid" 2>/dev/null ||
+			   ! wait_for_process_state "$autorate_pid" "$autorate_start" stopped; then
+				# A STOP which was delivered but not observed is conservatively
+				# undone.  SQM has not been touched at this point.
+				if speedtest_process_identity_matches "$autorate_pid" "$autorate_start"; then
+					kill -CONT "$autorate_pid" 2>/dev/null || true
+					wait_for_process_state "$autorate_pid" "$autorate_start" running 20 >/dev/null 2>&1 || true
+				fi
+				calibration_autorate_was_running=0
+				calibration_autorate_pid=""
+				calibration_autorate_start=""
+				[ "${standalone_recovery_armed:-0}" != 1 ] || standalone_recovery_write || true
+				append_warning "Autorate instance $section could not be verifiably paused; SQM was left unchanged."
+				standalone_recovery_mark_restored || true
+				return 1
+			fi
 			calibration_autorate_paused="true"
 			append_warning "Paused autorate instance $section during unshaped speed test."
 		fi
 	fi
 
-	if [ -x /usr/lib/sqm/run.sh ] && sqm_active_for_device "$target_if"; then
-		if /usr/lib/sqm/run.sh stop "$target_if" >/dev/null 2>&1; then
-			calibration_sqm_was_running=1
-			calibration_sqm_paused="true"
-			append_warning "Temporarily disabled SQM on $target_if during unshaped speed test."
+	if [ "$sqm_preflight_active" = 1 ]; then
+		current_sqm_fingerprint="$(managed_sqm_config_fingerprint \
+			"$calibration_sqm_section" 2>/dev/null)" || current_sqm_fingerprint=""
+		if [ "$current_sqm_fingerprint" != "$calibration_sqm_config_fingerprint" ]; then
+			append_warning "Managed SQM configuration changed after recovery preflight; the unshaped test was cancelled."
+			restore_speedtest_calibration >/dev/null 2>&1 || true
+			return 1
 		fi
+		if ! sqm_active_for_device "$target_if"; then
+			append_warning "SQM state changed after recovery preflight; the unshaped test was cancelled."
+			restore_speedtest_calibration >/dev/null 2>&1 || true
+			return 1
+		fi
+		calibration_sqm_was_running=1
+		[ "${standalone_recovery_armed:-0}" != 1 ] || {
+			standalone_recovery_supervisor_alive || {
+				restore_speedtest_calibration >/dev/null 2>&1 || true
+				return 1
+			}
+			standalone_recovery_write || {
+				restore_speedtest_calibration >/dev/null 2>&1 || true
+				return 1
+			}
+		}
+		if ! "$sqm_run_bin" stop "$target_if" >/dev/null 2>&1 ||
+		   ! wait_for_sqm_state inactive; then
+			append_warning "SQM on $target_if could not be verifiably stopped; the unshaped test was cancelled."
+			restore_speedtest_calibration >/dev/null 2>&1 || true
+			return 1
+		fi
+		calibration_sqm_paused="true"
+		append_warning "Temporarily disabled SQM on $target_if during unshaped speed test."
+	elif [ -x "$sqm_run_bin" ] && sqm_active_for_device "$target_if"; then
+		append_warning "SQM appeared after recovery preflight; the unshaped test was cancelled."
+		restore_speedtest_calibration >/dev/null 2>&1 || true
+		return 1
 	fi
+
+	calibration_shaper_bypassed="true"
 }
 
 restore_speedtest_calibration() {
+	local rc=0
+
 	if [ "$calibration_sqm_was_running" = "1" ]; then
-		/usr/lib/sqm/run.sh start "$target_if" >/dev/null 2>&1 || true
-		calibration_sqm_was_running=0
+		# The immutable recovery helper is the sole SQM mutation path. It
+		# revalidates owner/enablement/target under the inherited kernel locks,
+		# repairs CAKE/IFB/redirect if necessary, and verifies exact health.
+		# Starting run.sh first would mutate from a stale snapshot before that
+		# validation and could route traffic through the wrong queue.
+		if [ "${calibration_sqm_managed:-0}" = 1 ] && [ -x "$sqm_recover_bin" ] &&
+		   "$sqm_recover_bin" "$section" "$calibration_sqm_section" \
+			"$calibration_sqm_target" "$calibration_sqm_ul_if" \
+			"$calibration_sqm_dl_if" "$calibration_sqm_config_fingerprint" \
+			"$calibration_sqm_config_snapshot" >/dev/null 2>&1; then
+			calibration_sqm_was_running=0
+			if [ "${standalone_recovery_armed:-0}" = 1 ] && ! standalone_recovery_write; then
+				# The snapshot is still present. Keep the old obligation durable
+				# so the supervisor can safely repeat the idempotent exact restore.
+				calibration_sqm_was_running=1
+				rc=1
+			else
+				# Only the caller may unlink its snapshot, and only after the
+				# journal durably says SQM no longer requires restoration.
+				# Keep the now-absent path in the version-4 journal: the recovery
+				# supervisor validates that exact path and can distinguish a
+				# completed unlink from a malformed/missing journal field.
+				remove_managed_sqm_snapshot || true
+			fi
+		else
+			rc=1
+		fi
+	fi
+	if [ "$rc" -ne 0 ]; then
+		# Keep the exact autorate process stopped while its managed SQM backing
+		# is absent or unverified. Resuming it here would let the controller
+		# operate without the queue it owns and would hide a recovery obligation.
+		[ "${standalone_recovery_armed:-0}" != 1 ] || standalone_recovery_write || true
+		return 1
 	fi
 
 	if [ "$calibration_autorate_was_running" = "1" ]; then
-		if is_positive_uint "$calibration_autorate_pid"; then
-			kill -CONT "$calibration_autorate_pid" >/dev/null 2>&1 || true
+		if ! speedtest_process_identity_matches "$calibration_autorate_pid" "$calibration_autorate_start"; then
+			# The exact process which was stopped no longer exists; never signal a
+			# recycled PID.  There is consequently no paused process left to resume.
+			calibration_autorate_was_running=0
+			calibration_autorate_pid=""
+			calibration_autorate_start=""
+		elif kill -CONT "$calibration_autorate_pid" >/dev/null 2>&1 &&
+		     wait_for_process_state "$calibration_autorate_pid" "$calibration_autorate_start" running; then
+			calibration_autorate_was_running=0
+			calibration_autorate_pid=""
+			calibration_autorate_start=""
+		else
+			rc=1
 		fi
-		calibration_autorate_was_running=0
-		calibration_autorate_pid=""
+		[ "${standalone_recovery_armed:-0}" != 1 ] || standalone_recovery_write || rc=1
 	fi
+
+	if [ "$rc" -eq 0 ]; then
+		standalone_recovery_mark_restored || rc=1
+	fi
+	return "$rc"
+}
+
+standalone_recovery_main() {
+	local journal="$1" ready tmp supervisor_start record_owned=0 settled_record_owned=0
+
+	standalone_recovery_load "$journal" || exit 1
+	standalone_recovery_journal="$journal"
+	ready="$journal.ready"
+	[ "${CAKE_AUTORATE_INTERFACE_LOCK_FD:-}" = 9 ] || exit 1
+	[ "${CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_FD:-}" = 8 ] || exit 1
+	[ "${CAKE_AUTORATE_INTERFACE_LOCK_TOKEN:-}" = "$recovery_lock_token" ] || exit 1
+	runtime_lock_interface_paths "$recovery_target_if" || exit 1
+	runtime_lock_verify_inherited 9 "$runtime_interface_lock_guard" exclusive || exit 1
+	runtime_lock_verify_inherited 8 "$runtime_lock_root/runtime.guard" shared || exit 1
+	runtime_lock_load_record "$runtime_interface_lock_record" || exit 1
+	[ "$runtime_record_pid" = "$recovery_owner_pid" ] &&
+		[ "$runtime_record_starttime" = "$recovery_owner_start" ] &&
+		[ "$runtime_record_role" = speedtest ] &&
+		[ "$runtime_record_token" = "$recovery_lock_token" ] &&
+		{ [ -z "$runtime_record_journal" ] || [ "$runtime_record_journal" = "$journal" ]; } || exit 1
+
+	supervisor_start="$(speedtest_process_starttime "$$")" || exit 1
+	tmp="$ready.tmp.$$"
+	if {
+		printf 'pid=%s\n' "$$"
+		printf 'start=%s\n' "$supervisor_start"
+		printf 'owner_pid=%s\n' "$recovery_owner_pid"
+		printf 'owner_start=%s\n' "$recovery_owner_start"
+		printf 'token=%s\n' "$recovery_lock_token"
+	} > "$tmp" && mv "$tmp" "$ready"; then
+		:
+	else
+		rm -f "$tmp" 2>/dev/null || true
+		exit 1
+	fi
+
+	while speedtest_process_identity_matches "$recovery_owner_pid" "$recovery_owner_start"; do
+		brief_sleep 0.10
+	done
+
+	# Reload the last atomically published obligation only after the exact owner
+	# is gone.  The inherited kernel descriptors keep service/SQM mutations out
+	# throughout recovery.
+	standalone_recovery_load "$journal" || exit 1
+	standalone_recovery_journal="$journal"
+	standalone_recovery_owner_pid="$recovery_owner_pid"
+	standalone_recovery_owner_start="$recovery_owner_start"
+	standalone_recovery_lock_token="$recovery_lock_token"
+	standalone_recovery_phase="$recovery_phase"
+	standalone_recovery_version="$recovery_version"
+	target_if="$recovery_target_if"
+	section="$recovery_section"
+	calibration_autorate_pid="$recovery_autorate_pid"
+	calibration_autorate_start="$recovery_autorate_start"
+	calibration_autorate_was_running="$recovery_autorate_required"
+	calibration_sqm_was_running="$recovery_sqm_required"
+	calibration_sqm_managed="$recovery_sqm_managed"
+	calibration_sqm_section="$recovery_sqm_section"
+	calibration_sqm_target="$recovery_sqm_target"
+	calibration_sqm_ul_if="$recovery_sqm_ul_if"
+	calibration_sqm_dl_if="$recovery_sqm_dl_if"
+	calibration_sqm_config_fingerprint="$recovery_sqm_config_fingerprint"
+	calibration_sqm_config_snapshot="$recovery_sqm_config_snapshot"
+	standalone_recovery_armed=1
+
+	# The normal owner marks the obligation restored before releasing its locks.
+	# A new operation may already own this interface by the time the supervisor
+	# is scheduled. Never recreate or overwrite ownership in the settled case;
+	# remove only the exact record left by the old owner.
+	if [ "$recovery_phase" = restored ]; then
+		settled_record_owned=0
+		if [ -e "$runtime_interface_lock_record" ]; then
+			runtime_lock_load_record "$runtime_interface_lock_record" || exit 1
+			if [ "$runtime_record_pid" = "$recovery_owner_pid" ] &&
+			   [ "$runtime_record_starttime" = "$recovery_owner_start" ] &&
+			   [ "$runtime_record_role" = speedtest ] &&
+			   [ "$runtime_record_token" = "$recovery_lock_token" ] &&
+			   [ "$runtime_record_journal" = "$journal" ]; then
+				settled_record_owned=1
+			fi
+		fi
+		remove_managed_sqm_snapshot || exit 1
+		if [ "$settled_record_owned" -eq 1 ]; then
+			rm -f "$runtime_interface_lock_record" || exit 1
+		fi
+		rm -f "$ready" "$journal"
+		exec 9>&-
+		exec 8>&-
+		exit 0
+	fi
+
+	# The owner died with a live obligation. Reassert the inherited locks after
+	# its death. If a foreign holder won either lock, fail closed without touching
+	# SQM or autorate state.
+	runtime_lock_verify_inherited 9 "$runtime_interface_lock_guard" exclusive || exit 1
+	runtime_lock_verify_inherited 8 "$runtime_lock_root/runtime.guard" shared || exit 1
+
+	if [ -e "$runtime_interface_lock_record" ]; then
+		runtime_lock_load_record "$runtime_interface_lock_record" || exit 1
+		if [ "$runtime_record_pid" = "$recovery_owner_pid" ] &&
+		   [ "$runtime_record_starttime" = "$recovery_owner_start" ] &&
+		   [ "$runtime_record_role" = speedtest ] &&
+		   [ "$runtime_record_token" = "$recovery_lock_token" ] &&
+		   { [ -z "$runtime_record_journal" ] || [ "$runtime_record_journal" = "$journal" ]; }; then
+			runtime_interface_lock_starttime="$supervisor_start"
+			runtime_interface_lock_owner_pid="$$"
+			runtime_interface_lock_token="$recovery_lock_token"
+			runtime_lock_write_record "$runtime_interface_lock_record" "$$" \
+				"$supervisor_start" recovery "$recovery_lock_token" "$journal" || exit 1
+			runtime_interface_lock_held=1
+			record_owned=1
+		else
+			# A new or corrupt ownership record is never safe to overwrite.
+			exit 1
+		fi
+	else
+		# Missing metadata can be rebuilt only after both inherited kernel locks
+		# have been reasserted above.
+		runtime_interface_lock_starttime="$supervisor_start"
+		runtime_interface_lock_owner_pid="$$"
+		runtime_interface_lock_token="$recovery_lock_token"
+		runtime_lock_write_record "$runtime_interface_lock_record" "$$" \
+			"$supervisor_start" recovery "$recovery_lock_token" "$journal" || exit 1
+		runtime_interface_lock_held=1
+		record_owned=1
+	fi
+	[ "$record_owned" -eq 1 ] || exit 1
+	export CAKE_AUTORATE_INTERFACE_LOCK_OWNER="$$"
+	export CAKE_AUTORATE_INTERFACE_LOCK_STARTTIME="$supervisor_start"
+	export CAKE_AUTORATE_INTERFACE_LOCK_TOKEN="$recovery_lock_token"
+	export CAKE_AUTORATE_INTERFACE_LOCK_RECOVERY_JOURNAL="$journal"
+	export CAKE_AUTORATE_INTERFACE_LOCK_FD=9
+
+	while ! restore_speedtest_calibration; do
+		logger -t cake-autorate-speedtest "retrying crash recovery for $section on $target_if" 2>/dev/null || true
+		sleep 1
+	done
+	remove_managed_sqm_snapshot || exit 1
+	rm -f "$ready" "$journal"
+	runtime_lock_release_interface || exit 1
+	runtime_global_lock_mode=shared
+	runtime_global_lock_inherited=0
+	runtime_lock_release_global || exit 1
+	exit 0
 }
 
 json_first_file() {
@@ -1263,54 +2142,77 @@ run_preferred_backend() {
 	json_error "$(backend_title "$preferred_backend") backend failed"
 }
 
-speedtest_job_dir="/tmp/cake-autorate-speedtest"
+speedtest_job_dir="${CAKE_AUTORATE_SPEEDTEST_JOB_DIR:-/tmp/cake-autorate-speedtest}"
 
 acquire_interface_lock() {
-	local owner lock_name requested_owner
+	local requested_owner requested_start requested_token requested_journal lock_rc
 
 	safe_route_name "$target_if" || json_error "Invalid target interface for speed test lock."
-	lock_name="$(printf '%s' "$target_if" | tr ':@.' '___')"
-	interface_lock_dir="$speedtest_job_dir/interface-$lock_name.lock"
-	mkdir -p "$speedtest_job_dir" || json_error "Unable to create speed test lock directory."
-	chmod 700 "$speedtest_job_dir" 2>/dev/null || true
-
-	if mkdir "$interface_lock_dir" 2>/dev/null; then
-		printf '%s\n' "$$" > "$interface_lock_dir/pid"
-		return 0
-	fi
-
-	owner="$(sed -n '1p' "$interface_lock_dir/pid" 2>/dev/null)"
+	command -v runtime_lock_acquire_interface >/dev/null 2>&1 ||
+		json_error "The shared CAKE/SQM runtime-lock helper is unavailable."
 	requested_owner="${CAKE_AUTORATE_INTERFACE_LOCK_OWNER:-}"
-	if is_positive_uint "$requested_owner" && [ "$owner" = "$requested_owner" ] && kill -0 "$owner" 2>/dev/null; then
-		# Full Auto-Tune owns this per-interface lock for its entire workflow.
-		# Child speed tests borrow, but never release, the parent lock.
-		interface_lock_shared=1
-		return 0
+	requested_start="${CAKE_AUTORATE_INTERFACE_LOCK_STARTTIME:-}"
+	requested_token="${CAKE_AUTORATE_INTERFACE_LOCK_TOKEN:-}"
+	requested_journal="${CAKE_AUTORATE_INTERFACE_LOCK_RECOVERY_JOURNAL:-}"
+	if [ -n "$requested_owner$requested_start$requested_token$requested_journal" ]; then
+		is_positive_uint "$requested_owner" && is_positive_uint "$requested_start" &&
+			[ -n "$requested_token" ] ||
+			json_error "Parent interface-lock identity is incomplete."
+		[ "${CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_FD:-}" = 8 ] ||
+			json_error "Parent global runtime-lock identity is incomplete."
+		if ! runtime_lock_ensure_global_shared; then
+			json_error "Parent global runtime lock does not match its inherited descriptor."
+		fi
+		if runtime_lock_borrow_interface "$target_if" "$requested_owner" "$requested_start" \
+		   "$requested_token" "$requested_journal"; then
+			interface_lock_shared=1
+			interface_lock_dir="$runtime_interface_lock_record"
+			return 0
+		fi
+		json_error "Parent interface-lock identity or inherited kernel lock does not match."
 	fi
-	if is_positive_uint "$owner" && kill -0 "$owner" 2>/dev/null; then
-		json_error "Another heavy speed test is already using $target_if."
-	fi
-	rm -f "$interface_lock_dir/pid" 2>/dev/null
-	rmdir "$interface_lock_dir" 2>/dev/null || json_error "Speed test lock for $target_if is busy."
-	mkdir "$interface_lock_dir" 2>/dev/null || json_error "Unable to lock $target_if for speed testing."
-	printf '%s\n' "$$" > "$interface_lock_dir/pid"
+	runtime_lock_acquire_global_shared || {
+		lock_rc="$?"
+		[ "$lock_rc" -eq 75 ] && json_error "CAKE/SQM service mutation is already in progress."
+		json_error "Unable to acquire the global CAKE/SQM runtime lock."
+	}
+	runtime_lock_acquire_interface "$target_if" speedtest "" || {
+		lock_rc="$?"
+		runtime_lock_release_global >/dev/null 2>&1 || true
+		case "$lock_rc" in
+			75) json_error "Another heavy speed test is already using $target_if." ;;
+			76) json_error "Full Auto-Tune recovery is pending for $target_if." ;;
+			*) json_error "Unable to establish an atomic speed-test interface lock." ;;
+		esac
+	}
+	interface_lock_dir="$runtime_interface_lock_record"
 }
 
 release_interface_lock() {
-	local owner
-
 	[ -n "$interface_lock_dir" ] || return 0
 	[ "${interface_lock_shared:-0}" = 1 ] && return 0
-	owner="$(sed -n '1p' "$interface_lock_dir/pid" 2>/dev/null)"
-	[ "$owner" = "$$" ] || return 0
-	rm -f "$interface_lock_dir/pid" 2>/dev/null
-	rmdir "$interface_lock_dir" 2>/dev/null || true
+	if [ "${standalone_recovery_armed:-0}" = 1 ] &&
+	   [ "${standalone_recovery_phase:-armed}" != restored ]; then
+		return 1
+	fi
+	if [ "${standalone_recovery_armed:-0}" = 1 ] &&
+	   ! standalone_recovery_supervisor_alive; then
+		# Restoration is complete, so a supervisor which died before garbage
+		# collection no longer represents an obligation. Remove its tmpfs-only
+		# metadata while the owner still holds both authoritative locks.
+		remove_managed_sqm_snapshot || return 1
+		rm -f "$standalone_recovery_journal" "${standalone_recovery_ready_file:-}" || return 1
+		standalone_recovery_armed=0
+	fi
+	runtime_lock_release_interface || return 1
+	runtime_lock_release_global || return 1
 	interface_lock_dir=""
 	interface_lock_shared=0
 }
 
 speedtest_job_paths() {
 	job_key="$1"
+	job_mutex_file="$speedtest_job_dir/$job_key.start.lock"
 	job_pid_file="$speedtest_job_dir/$job_key.pid"
 	job_result_file="$speedtest_job_dir/$job_key.result"
 	job_error_file="$speedtest_job_dir/$job_key.error"
@@ -1319,31 +2221,147 @@ speedtest_job_paths() {
 	job_log_file="$speedtest_job_dir/$job_key.log"
 }
 
+speedtest_job_record_load() {
+	local file="$1" line key value seen=""
+
+	[ -f "$file" ] && [ ! -L "$file" ] || return 1
+	job_record_version=""
+	job_record_pid=""
+	job_record_start=""
+	job_record_key=""
+	while IFS= read -r line || [ -n "$line" ]; do
+		case "$line" in *=*) ;; *) return 1 ;; esac
+		key="${line%%=*}"
+		value="${line#*=}"
+		case " $seen " in *" $key "*) return 1 ;; esac
+		case "$key" in
+			version) job_record_version="$value" ;;
+			pid) job_record_pid="$value" ;;
+			start) job_record_start="$value" ;;
+			job_key) job_record_key="$value" ;;
+			*) return 1 ;;
+		esac
+		seen="${seen}${seen:+ }$key"
+	done < "$file"
+	[ "$job_record_version" = 1 ] && is_positive_uint "$job_record_pid" &&
+		is_positive_uint "$job_record_start" && [ "$job_record_key" = "$job_key" ]
+}
+
+speedtest_job_cmdline_matches() {
+	local pid="$1"
+
+	[ -r "/proc/$pid/cmdline" ] || return 1
+	tr '\000' '\n' < "/proc/$pid/cmdline" | awk \
+		-v self="$speedtest_self" -v section="$section" -v target="$target_if_override" \
+		-v backend="$preferred_backend" -v key="$job_key" '
+		$0 == self { state = 1; next }
+		state == 1 && $0 == section { state = 2; next }
+		state == 2 && $0 == target { state = 3; next }
+		state == 3 && $0 == "job-run" { state = 4; next }
+		state == 4 && $0 == backend { state = 5; next }
+		state == 5 && $0 == key { state = 6; exit }
+		END { exit !(state == 6) }'
+}
+
+speedtest_job_record_matches_process() {
+	local pid="$1" start="$2"
+
+	speedtest_process_identity_matches "$pid" "$start" &&
+		speedtest_job_cmdline_matches "$pid"
+}
+
+speedtest_job_record_write() {
+	local pid="$1" start="$2" tmp="$job_pid_file.tmp.$$"
+
+	if {
+		printf 'version=1\n'
+		printf 'pid=%s\n' "$pid"
+		printf 'start=%s\n' "$start"
+		printf 'job_key=%s\n' "$job_key"
+	} > "$tmp" && mv "$tmp" "$job_pid_file"; then
+		return 0
+	fi
+	rm -f "$tmp" 2>/dev/null || true
+	return 1
+}
+
+speedtest_job_record_matches_self() {
+	speedtest_job_record_load "$job_pid_file" &&
+		[ "$job_record_pid" = "$$" ] &&
+		speedtest_process_identity_matches "$$" "$job_record_start" &&
+		speedtest_job_cmdline_matches "$$"
+}
+
 speedtest_job_start() {
-	local setsid_bin
+	local setsid_bin flock_bin job_pid job_start i=0
 
 	job_key="$section"
 	safe_uci_name "$job_key" || json_error "Invalid speed test job name."
 	setsid_bin="$(command_path setsid)"
 	[ -n "$setsid_bin" ] || json_error "The setsid command is required to run speed tests safely."
 	mkdir -p "$speedtest_job_dir" || json_error "Unable to create speed test job directory."
+	[ -d "$speedtest_job_dir" ] && [ ! -L "$speedtest_job_dir" ] ||
+		json_error "Speed test job directory is unsafe."
 	chmod 700 "$speedtest_job_dir" 2>/dev/null || true
 	speedtest_job_paths "$job_key"
+	flock_bin="${CAKE_AUTORATE_RUNTIME_FLOCK:-flock}"
+	command -v "$flock_bin" >/dev/null 2>&1 || json_error "The flock command is required for speed test jobs."
+	exec 6>>"$job_mutex_file" || json_error "Unable to open the speed test start lock."
+	"$flock_bin" -x 6 || json_error "Unable to serialize speed test startup."
 
-	if [ -f "$job_pid_file" ]; then
-		job_pid="$(cat "$job_pid_file" 2>/dev/null)"
-		if is_positive_uint "$job_pid" && kill -0 "$job_pid" 2>/dev/null; then
+	if speedtest_job_record_load "$job_pid_file"; then
+		if speedtest_job_record_matches_process "$job_record_pid" "$job_record_start"; then
 			printf '{"state":"running","job_id":"%s"}\n' "$(json_escape "$job_key")"
+			"$flock_bin" -u 6
+			exec 6>&-
 			return 0
 		fi
 	fi
 
 	rm -f "$job_pid_file" "$job_result_file" "$job_error_file" "$job_work_file" "$job_stderr_file" "$job_log_file"
-	"$setsid_bin" "$0" "$section" "$target_if_override" job-run "$preferred_backend" "$job_key" "$route_mode_override" "$mwan3_member_override" \
-		</dev/null >"$job_log_file" 2>&1 &
+	CAKE_AUTORATE_SPEEDTEST_JOB_START_STOPPED=1 \
+		"$setsid_bin" "$speedtest_self" "$section" "$target_if_override" job-run "$preferred_backend" "$job_key" "$route_mode_override" "$mwan3_member_override" \
+		6>&- </dev/null >"$job_log_file" 2>&1 &
 	job_pid="$!"
-	printf '%s\n' "$job_pid" > "$job_pid_file"
+	while [ "$i" -lt 100 ]; do
+		job_start="$(speedtest_process_starttime "$job_pid" 2>/dev/null)"
+		if is_positive_uint "$job_start" && process_is_stopped "$job_pid" &&
+		   speedtest_job_cmdline_matches "$job_pid"; then
+			break
+		fi
+		kill -0 "$job_pid" 2>/dev/null || break
+		i=$((i + 1))
+		brief_sleep 0.05
+	done
+	if ! is_positive_uint "${job_start:-}" || ! process_is_stopped "$job_pid" ||
+	   ! speedtest_job_cmdline_matches "$job_pid"; then
+		kill -KILL "$job_pid" 2>/dev/null || true
+		wait "$job_pid" 2>/dev/null || true
+		"$flock_bin" -u 6
+		exec 6>&-
+		json_error "Speed test worker could not complete its verified launch handshake."
+	fi
+	if ! speedtest_job_record_write "$job_pid" "$job_start"; then
+		kill -KILL "$job_pid" 2>/dev/null || true
+		wait "$job_pid" 2>/dev/null || true
+		"$flock_bin" -u 6
+		exec 6>&-
+		json_error "Unable to publish the verified speed test worker identity."
+	fi
+	if ! kill -CONT "$job_pid" 2>/dev/null; then
+		if speedtest_job_record_load "$job_pid_file" &&
+		   [ "$job_record_pid" = "$job_pid" ] && [ "$job_record_start" = "$job_start" ]; then
+			rm -f "$job_pid_file"
+		fi
+		kill -KILL "$job_pid" 2>/dev/null || true
+		wait "$job_pid" 2>/dev/null || true
+		"$flock_bin" -u 6
+		exec 6>&-
+		json_error "Verified speed test worker could not be resumed."
+	fi
 	printf '{"state":"running","job_id":"%s"}\n' "$(json_escape "$job_key")"
+	"$flock_bin" -u 6
+	exec 6>&-
 }
 
 speedtest_job_run() {
@@ -1351,6 +2369,7 @@ speedtest_job_run() {
 	safe_uci_name "$job_key" || exit 1
 	mkdir -p "$speedtest_job_dir" || exit 1
 	speedtest_job_paths "$job_key"
+	speedtest_job_record_matches_self || exit 1
 
 	"$0" "$section" "$target_if_override" run "$preferred_backend" "" "$route_mode_override" "$mwan3_member_override" >"$job_work_file" 2>"$job_stderr_file"
 	job_rc="$?"
@@ -1369,7 +2388,9 @@ speedtest_job_run() {
 		rm -f "$job_work_file"
 	fi
 
-	rm -f "$job_pid_file"
+	if speedtest_job_record_matches_self; then
+		rm -f "$job_pid_file"
+	fi
 }
 
 speedtest_job_status() {
@@ -1387,9 +2408,8 @@ speedtest_job_status() {
 		return 0
 	fi
 
-	if [ -f "$job_pid_file" ]; then
-		job_pid="$(cat "$job_pid_file" 2>/dev/null)"
-		if is_positive_uint "$job_pid" && kill -0 "$job_pid" 2>/dev/null; then
+	if speedtest_job_record_load "$job_pid_file"; then
+		if speedtest_job_record_matches_process "$job_record_pid" "$job_record_start"; then
 			printf '{"state":"running","job_id":"%s"}\n' "$(json_escape "$job_key")"
 			return 0
 		fi
@@ -1397,6 +2417,11 @@ speedtest_job_status() {
 
 	printf '{"error":"Speed test job is not running."}\n'
 }
+
+if [ "$section" = "--standalone-recover" ]; then
+	standalone_recovery_main "$target_if_override"
+	exit $?
+fi
 
 if [ "${CAKE_AUTORATE_SPEEDTEST_SOURCE_ONLY:-0}" = "1" ]; then
 	return 0 2>/dev/null || exit 0
@@ -1454,12 +2479,25 @@ fetch=""
 fetch_kind=""
 calibration_autorate_was_running=0
 calibration_autorate_pid=""
+calibration_autorate_start=""
 calibration_sqm_was_running=0
+calibration_sqm_managed=0
+calibration_sqm_section=""
+calibration_sqm_target=""
+calibration_sqm_ul_if=""
+calibration_sqm_dl_if=""
+calibration_sqm_config_fingerprint=""
+calibration_sqm_config_snapshot=""
 calibration_shaper_bypassed="false"
 calibration_autorate_paused="false"
 calibration_sqm_paused="false"
 interface_lock_dir=""
 interface_lock_shared=0
+standalone_recovery_armed=0
+standalone_recovery_journal=""
+standalone_recovery_phase=""
+standalone_recovery_supervisor_pid=""
+standalone_recovery_supervisor_start=""
 external_ip_before=""
 external_ip_after=""
 
@@ -1493,16 +2531,38 @@ if [ "$route_mode" = "mwan3" ] && [ -z "$mwan3_member" ]; then
 	json_error "route_mode=mwan3 requires mwan3_member."
 fi
 
+if [ "$mode" = "route-status" ]; then
+	route_status_timeout_s="${CAKE_AUTORATE_ROUTE_STATUS_TIMEOUT_S:-5}"
+	case "$route_status_timeout_s" in ''|*[!0-9]*) route_status_timeout_s=5 ;; esac
+	[ "$route_status_timeout_s" -ge 1 ] 2>/dev/null || route_status_timeout_s=5
+	[ "$route_status_timeout_s" -le 10 ] 2>/dev/null || route_status_timeout_s=10
+	timeout_s="$route_status_timeout_s"
+	route_status_json
+	exit $?
+fi
+
 tmp_download="/tmp/cake-autorate-speedtest-download.$$"
 tmp_upload="/tmp/cake-autorate-speedtest-upload.$$"
 tmp_response="/tmp/cake-autorate-speedtest-response.$$"
 
 cleanup() {
-	restore_speedtest_calibration
-	release_interface_lock
+	cleanup_status="$?"
+	cleanup_failed=0
+	if restore_speedtest_calibration; then
+		release_interface_lock || cleanup_failed=1
+	else
+		cleanup_failed=1
+	fi
 	rm -f "$tmp_download" "$tmp_upload" "$tmp_response"
+	trap - EXIT
+	[ "$cleanup_status" -ne 0 ] && exit "$cleanup_status"
+	[ "$cleanup_failed" -eq 0 ] || exit 1
+	exit 0
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 acquire_interface_lock
 if ! inspect_selected_route; then
@@ -1513,10 +2573,14 @@ external_ip_before="$(fetch_external_ip)"
 if [ -z "$external_ip_before" ]; then
 	json_error "Unable to determine the external IPv4 address through the selected route."
 fi
-prepare_speedtest_calibration
+if ! prepare_speedtest_calibration; then
+	json_error "Unable to establish a crash-safe unshaped speed-test calibration. ${warning}"
+fi
 
 if run_preferred_backend; then
-	restore_speedtest_calibration
+	if ! restore_speedtest_calibration; then
+		json_error "Speed test finished, but SQM/autorate restoration is still being recovered."
+	fi
 	if ! inspect_selected_route; then
 		json_error "Selected route failed after speed test: ${route_error:-unavailable}."
 	fi

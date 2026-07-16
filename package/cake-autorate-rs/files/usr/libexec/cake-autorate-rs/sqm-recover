@@ -1,13 +1,27 @@
 #!/bin/sh
 
-section="$1"
+section="${1:-}"
+expected_sqm_section="${2:-}"
+expected_target="${3:-}"
+expected_ul_if="${4:-}"
+expected_dl_if="${5:-}"
 uci_bin="${CAKE_AUTORATE_UCI:-uci}"
 tc_bin="${CAKE_AUTORATE_TC:-tc}"
+sha256sum_bin="${CAKE_AUTORATE_SHA256SUM:-sha256sum}"
 sqm_run="${CAKE_AUTORATE_SQM_RUN:-/usr/lib/sqm/run.sh}"
 sys_class_net="${CAKE_AUTORATE_SYS_CLASS_NET:-/sys/class/net}"
 sqm_state_dir="${CAKE_AUTORATE_SQM_STATE_DIR:-/var/run/sqm}"
-lock_root="${CAKE_AUTORATE_SQM_RECOVERY_LOCK_DIR:-/tmp/cake-autorate-sqm-recovery}"
-speedtest_lock_root="${CAKE_AUTORATE_SPEEDTEST_LOCK_DIR:-/tmp/cake-autorate-speedtest}"
+sqm_config_file="${CAKE_AUTORATE_SQM_CONFIG_FILE:-/etc/config/sqm}"
+runtime_lock_lib="${CAKE_AUTORATE_RUNTIME_LOCK_LIB:-/usr/libexec/cake-autorate-rs/runtime-lock}"
+sqm_private_config_dir=""
+sqm_recovery_snapshot=""
+
+[ -r "$runtime_lock_lib" ] || {
+	printf '%s\n' "Runtime lock library is unavailable: $runtime_lock_lib" >&2
+	exit 1
+}
+# shellcheck source=/usr/libexec/cake-autorate-rs/runtime-lock
+. "$runtime_lock_lib"
 
 fail() {
 	printf '%s\n' "$*" >&2
@@ -26,25 +40,426 @@ safe_interface() {
 	esac
 }
 
-is_pid() {
+is_positive_uint() {
 	case "$1" in ''|*[!0-9]*) return 1 ;; esac
-	[ "$1" -gt 1 ] 2>/dev/null
+	[ "$1" -gt 0 ] 2>/dev/null
+}
+
+is_signed_int() {
+	case "$1" in
+		-*) signed_value="${1#-}" ;;
+		*) signed_value="$1" ;;
+	esac
+	case "$signed_value" in ''|*[!0-9]*) return 1 ;; esac
+}
+
+safe_state_value() {
+	case "$1" in *[!A-Za-z0-9_.,:/@+\ -]*) return 1 ;; esac
 }
 
 uci_get() {
 	"$uci_bin" -q get "cake-autorate.$section.$1" 2>/dev/null
 }
 
-lock_name_for() {
-	printf '%s' "$1" | tr ':@.' '___'
+uci_raw_get() {
+	"$uci_bin" -q get "$1" 2>/dev/null
 }
 
-cake_present() {
-	"$tc_bin" qdisc show dev "$1" 2>/dev/null | awk '$1 == "qdisc" && ($2 == "cake" || $2 == "cake_mq") { found = 1 } END { exit !found }'
+valid_sha256_fingerprint() {
+	case "$1" in sha256:*) sqm_fingerprint_value="${1#sha256:}" ;; *) return 1 ;; esac
+	case "$sqm_fingerprint_value" in ''|*[!0-9a-f]*) return 1 ;; esac
+	[ "${#sqm_fingerprint_value}" -eq 64 ]
+}
+
+compute_sqm_fingerprint() {
+	sqm_fingerprint_config_dir="${1:-}"
+	command -v "$sha256sum_bin" >/dev/null 2>&1 || return 1
+	if [ -n "$sqm_fingerprint_config_dir" ]; then
+		sqm_fingerprint_raw="$("$uci_bin" -q -c "$sqm_fingerprint_config_dir" show "sqm.$sqm_section" 2>/dev/null)" || return 1
+	else
+		sqm_fingerprint_raw="$("$uci_bin" -q show "sqm.$sqm_section" 2>/dev/null)" || return 1
+	fi
+	[ -n "$sqm_fingerprint_raw" ] || return 1
+	sqm_fingerprint_hash="$(printf '%s\n' "$sqm_fingerprint_raw" | LC_ALL=C sort | \
+		"$sha256sum_bin" 2>/dev/null | awk 'NR == 1 { print $1; exit }')"
+	# BusyBox awk does not consistently implement interval regexps.
+	case "$sqm_fingerprint_hash" in ''|*[!0-9a-f]*) return 1 ;; esac
+	[ "${#sqm_fingerprint_hash}" -eq 64 ] || return 1
+	printf 'sha256:%s\n' "$sqm_fingerprint_hash"
+}
+
+private_uci_raw_get() {
+	"$uci_bin" -q -c "$sqm_private_config_dir" get "$1" 2>/dev/null
+}
+
+private_managed_snapshot_valid() {
+	[ "$(private_uci_raw_get "sqm.$sqm_section._cake_autorate_managed")" = "$section" ] &&
+		[ "$(private_uci_raw_get "sqm.$sqm_section.enabled")" = 1 ] &&
+		[ "$(private_uci_raw_get "sqm.$sqm_section.interface")" = "$target" ]
+}
+
+recovery_snapshot_path_valid() {
+	[ -n "$sqm_recovery_snapshot" ] || return 1
+	runtime_lock_ram_path "$sqm_recovery_snapshot" || return 1
+	sqm_snapshot_prefix="$runtime_lock_root/sqm-snapshot."
+	case "$sqm_recovery_snapshot" in
+		"$sqm_snapshot_prefix"*) ;;
+		*) return 1 ;;
+	esac
+	sqm_snapshot_name="${sqm_recovery_snapshot#"$sqm_snapshot_prefix"}"
+	case "$sqm_snapshot_name" in
+		''|*/*|*[!A-Za-z0-9_-]*) return 1 ;;
+	esac
+	[ -f "$sqm_recovery_snapshot" ] && [ ! -L "$sqm_recovery_snapshot" ] || return 1
+	runtime_lock_path_owned_by_euid "$sqm_recovery_snapshot" || return 1
+	# The caller creates this before SQM mutation and journals the path.  Reject
+	# group/world-readable files rather than silently tightening a snapshot that
+	# may already have exposed configuration outside its recovery transaction.
+	sqm_snapshot_mode="$(LC_ALL=C ls -ldn "$sqm_recovery_snapshot" 2>/dev/null |
+		awk 'NR == 1 { print substr($1, 1, 10); exit }')"
+	[ "$sqm_snapshot_mode" = "-rw-------" ]
+}
+
+prepare_private_sqm_config() {
+	runtime_lock_set_current_pid || return 1
+	sqm_private_config_dir="$runtime_lock_root/sqm-recover-config.$runtime_lock_current_pid_value"
+	case "$sqm_private_config_dir" in "$runtime_lock_root"/sqm-recover-config.*) ;; *) return 1 ;; esac
+	[ ! -e "$sqm_private_config_dir" ] && [ ! -L "$sqm_private_config_dir" ] || return 1
+	if [ "$sqm_snapshot_recovery" = 1 ]; then
+		recovery_snapshot_path_valid || return 1
+		sqm_private_source="$sqm_recovery_snapshot"
+	else
+		sqm_private_source="$sqm_config_file"
+		[ -f "$sqm_private_source" ] && [ ! -L "$sqm_private_source" ] || return 1
+		runtime_lock_path_owned_by_euid "$sqm_private_source" || return 1
+	fi
+	mkdir "$sqm_private_config_dir" || return 1
+	chmod 700 "$sqm_private_config_dir" 2>/dev/null || return 1
+	runtime_lock_path_owned_by_euid "$sqm_private_config_dir" || return 1
+	cp "$sqm_private_source" "$sqm_private_config_dir/sqm" || return 1
+	# Re-check the caller-owned source after the copy.  The private copy and its
+	# canonical hash below are authoritative for every subsequent sqm-run.
+	if [ "$sqm_snapshot_recovery" = 1 ]; then
+		recovery_snapshot_path_valid || return 1
+	else
+		[ -f "$sqm_private_source" ] && [ ! -L "$sqm_private_source" ] || return 1
+		runtime_lock_path_owned_by_euid "$sqm_private_source" || return 1
+	fi
+	[ -f "$sqm_private_config_dir/sqm" ] && [ ! -L "$sqm_private_config_dir/sqm" ] || return 1
+	runtime_lock_path_owned_by_euid "$sqm_private_config_dir/sqm" || return 1
+	chmod 600 "$sqm_private_config_dir/sqm" 2>/dev/null || return 1
+	private_managed_snapshot_valid || return 1
+	sqm_private_fingerprint="$(compute_sqm_fingerprint "$sqm_private_config_dir")" || return 1
+	[ -n "$sqm_expected_fingerprint" ] &&
+		[ "$sqm_private_fingerprint" = "$sqm_expected_fingerprint" ] || return 1
+}
+
+managed_snapshot_valid() {
+	[ "$(uci_raw_get "sqm.$sqm_section._cake_autorate_managed")" = "$section" ] &&
+		[ "$(uci_raw_get "sqm.$sqm_section.enabled")" = 1 ] &&
+		[ "$(uci_raw_get "sqm.$sqm_section.interface")" = "$target" ]
+}
+
+standalone_snapshot_valid() {
+	current_target="$(uci_get sqm_interface)"
+	[ -n "$current_target" ] || current_target="$(uci_get ul_if)"
+	current_ul="$(uci_get ul_if)"
+	[ -n "$current_ul" ] || current_ul="$current_target"
+	current_dl="$(uci_get dl_if)"
+	[ -n "$current_dl" ] || current_dl="ifb4$current_target"
+	current_sqm_section="$(uci_get sqm_section)"
+	[ -n "$current_sqm_section" ] || current_sqm_section="cake_$section"
+	[ "$(uci_get enabled)" = 1 ] && [ "$(uci_get manage_sqm)" = 1 ] &&
+		[ "$(uci_get sqm_enabled)" = 1 ] &&
+		[ "$current_target" = "$target" ] && [ "$current_ul" = "$ul_if" ] &&
+		[ "$current_dl" = "$dl_if" ] && [ "$current_sqm_section" = "$sqm_section" ]
+}
+
+capture_health_policy() {
+	health_min_dl_raw=""
+	health_max_dl_raw=""
+	health_cap_dl_raw=""
+	health_min_ul_raw=""
+	health_max_ul_raw=""
+	health_cap_ul_raw=""
+	[ "$recovery_mode" != 1 ] || return 0
+	health_min_dl_raw="$(uci_get min_dl_shaper_rate_kbps)"
+	health_max_dl_raw="$(uci_get max_dl_shaper_rate_kbps)"
+	health_cap_dl_raw="$(uci_get adaptive_ceiling_dl_cap_kbps)"
+	health_min_ul_raw="$(uci_get min_ul_shaper_rate_kbps)"
+	health_max_ul_raw="$(uci_get max_ul_shaper_rate_kbps)"
+	health_cap_ul_raw="$(uci_get adaptive_ceiling_ul_cap_kbps)"
+	for health_rate in "$health_min_dl_raw" "$health_max_dl_raw" "$health_cap_dl_raw" \
+		"$health_min_ul_raw" "$health_max_ul_raw" "$health_cap_ul_raw"; do
+		[ -z "$health_rate" ] || is_positive_uint "$health_rate" || return 1
+	done
+}
+
+health_policy_snapshot_valid() {
+	[ "$recovery_mode" != 1 ] || return 0
+	[ "$(uci_get min_dl_shaper_rate_kbps)" = "$health_min_dl_raw" ] &&
+		[ "$(uci_get max_dl_shaper_rate_kbps)" = "$health_max_dl_raw" ] &&
+		[ "$(uci_get adaptive_ceiling_dl_cap_kbps)" = "$health_cap_dl_raw" ] &&
+		[ "$(uci_get min_ul_shaper_rate_kbps)" = "$health_min_ul_raw" ] &&
+		[ "$(uci_get max_ul_shaper_rate_kbps)" = "$health_max_ul_raw" ] &&
+		[ "$(uci_get adaptive_ceiling_ul_cap_kbps)" = "$health_cap_ul_raw" ]
+}
+
+load_sqm_runtime_identity() {
+	sqm_identity_file="$sqm_state_dir/$target.state"
+	[ -f "$sqm_identity_file" ] && [ ! -L "$sqm_identity_file" ] || return 1
+	runtime_lock_path_owned_by_euid "$sqm_identity_file" || return 1
+	sqm_identity_iface=""
+	sqm_identity_qdisc=""
+	sqm_identity_script=""
+	sqm_identity_uplink=""
+	sqm_identity_downlink=""
+	sqm_identity_linklayer=""
+	sqm_identity_llam=""
+	sqm_identity_overhead=""
+	sqm_identity_mpu=""
+	sqm_identity_use_mq=""
+	sqm_identity_ingress_opts=""
+	sqm_identity_egress_opts=""
+	sqm_identity_iqdisc_opts=""
+	sqm_identity_eqdisc_opts=""
+	sqm_identity_zero_dscp=""
+	sqm_identity_ignore_dscp=""
+	sqm_identity_seen=""
+	while IFS= read -r sqm_identity_line || [ -n "$sqm_identity_line" ]; do
+		case "$sqm_identity_line" in '') continue ;; *=*) ;; *) return 1 ;; esac
+		sqm_identity_key="${sqm_identity_line%%=*}"
+		case "$sqm_identity_key" in ''|*[!A-Z0-9_]*) return 1 ;; esac
+		case " $sqm_identity_seen " in *" $sqm_identity_key "*) return 1 ;; esac
+		sqm_identity_value="${sqm_identity_line#*=}"
+		case "$sqm_identity_value" in
+			\"*\")
+				sqm_identity_value="${sqm_identity_value#\"}"
+				sqm_identity_value="${sqm_identity_value%\"}"
+				;;
+			*) return 1 ;;
+		esac
+		safe_state_value "$sqm_identity_value" || return 1
+		case "$sqm_identity_key" in
+			IFACE) sqm_identity_iface="$sqm_identity_value" ;;
+			QDISC) sqm_identity_qdisc="$sqm_identity_value" ;;
+			SCRIPT) sqm_identity_script="$sqm_identity_value" ;;
+			UPLINK) sqm_identity_uplink="$sqm_identity_value" ;;
+			DOWNLINK) sqm_identity_downlink="$sqm_identity_value" ;;
+			LINKLAYER) sqm_identity_linklayer="$sqm_identity_value" ;;
+			LLAM) sqm_identity_llam="$sqm_identity_value" ;;
+			OVERHEAD) sqm_identity_overhead="$sqm_identity_value" ;;
+			STAB_MPU) sqm_identity_mpu="$sqm_identity_value" ;;
+			USE_MQ) sqm_identity_use_mq="$sqm_identity_value" ;;
+			INGRESS_CAKE_OPTS) sqm_identity_ingress_opts="$sqm_identity_value" ;;
+			EGRESS_CAKE_OPTS) sqm_identity_egress_opts="$sqm_identity_value" ;;
+			IQDISC_OPTS) sqm_identity_iqdisc_opts="$sqm_identity_value" ;;
+			EQDISC_OPTS) sqm_identity_eqdisc_opts="$sqm_identity_value" ;;
+			ZERO_DSCP_INGRESS) sqm_identity_zero_dscp="$sqm_identity_value" ;;
+			IGNORE_DSCP_INGRESS) sqm_identity_ignore_dscp="$sqm_identity_value" ;;
+			*) : ;;
+		esac
+		sqm_identity_seen="${sqm_identity_seen}${sqm_identity_seen:+ }$sqm_identity_key"
+	done < "$sqm_identity_file"
+	[ "$sqm_identity_iface" = "$target" ] || return 1
+	case "$sqm_identity_qdisc" in cake|cake_mq) ;; *) return 1 ;; esac
+	case "$sqm_identity_script" in ''|*[!A-Za-z0-9_.-]*) return 1 ;; esac
+	is_positive_uint "$sqm_identity_uplink" && is_positive_uint "$sqm_identity_downlink" || return 1
+	case "$sqm_identity_linklayer" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac
+	case "$sqm_identity_llam" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac
+	is_signed_int "$sqm_identity_overhead" || return 1
+	case "$sqm_identity_mpu" in ''|*[!0-9]*) return 1 ;; esac
+	case "$sqm_identity_use_mq" in 0|1) ;; *) return 1 ;; esac
+	case "$sqm_identity_zero_dscp:$sqm_identity_ignore_dscp" in 0:0|0:1|1:0|1:1) ;; *) return 1 ;; esac
+}
+
+private_state_identity_matches() {
+	private_qdisc="$(private_uci_raw_get "sqm.$sqm_section.qdisc")"
+	private_script="$(private_uci_raw_get "sqm.$sqm_section.script")"
+	private_download="$(private_uci_raw_get "sqm.$sqm_section.download")"
+	private_upload="$(private_uci_raw_get "sqm.$sqm_section.upload")"
+	private_linklayer="$(private_uci_raw_get "sqm.$sqm_section.linklayer")"
+	private_llam="$(private_uci_raw_get "sqm.$sqm_section.linklayer_adaptation_mechanism")"
+	private_overhead="$(private_uci_raw_get "sqm.$sqm_section.overhead")"
+	private_mpu="$(private_uci_raw_get "sqm.$sqm_section.tcMPU")"
+	private_use_mq="$(private_uci_raw_get "sqm.$sqm_section.use_mq")"
+	private_iqdisc_opts="$(private_uci_raw_get "sqm.$sqm_section.iqdisc_opts")"
+	private_eqdisc_opts="$(private_uci_raw_get "sqm.$sqm_section.eqdisc_opts")"
+	private_zero_dscp="$(private_uci_raw_get "sqm.$sqm_section.squash_dscp")"
+	private_ignore_dscp="$(private_uci_raw_get "sqm.$sqm_section.squash_ingress")"
+	[ -n "$private_qdisc" ] || private_qdisc=cake
+	[ -n "$private_linklayer" ] || private_linklayer=none
+	[ -n "$private_llam" ] || private_llam=default
+	[ -n "$private_overhead" ] || private_overhead=0
+	[ -n "$private_mpu" ] || private_mpu=0
+	[ -n "$private_use_mq" ] || private_use_mq=0
+	[ -n "$private_zero_dscp" ] || private_zero_dscp=0
+	[ -n "$private_ignore_dscp" ] || private_ignore_dscp=0
+	[ "$private_qdisc" = "$sqm_identity_qdisc" ] &&
+		[ "$private_script" = "$sqm_identity_script" ] &&
+		[ "$private_download" = "$sqm_identity_downlink" ] &&
+		[ "$private_upload" = "$sqm_identity_uplink" ] &&
+		[ "$private_linklayer" = "$sqm_identity_linklayer" ] &&
+		[ "$private_llam" = "$sqm_identity_llam" ] &&
+		[ "$private_overhead" = "$sqm_identity_overhead" ] &&
+		[ "$private_mpu" = "$sqm_identity_mpu" ] &&
+		[ "$private_use_mq" = "$sqm_identity_use_mq" ] &&
+		[ "$private_iqdisc_opts" = "$sqm_identity_iqdisc_opts" ] &&
+		[ "$private_eqdisc_opts" = "$sqm_identity_eqdisc_opts" ] &&
+		[ "$private_zero_dscp" = "$sqm_identity_zero_dscp" ] &&
+		[ "$private_ignore_dscp" = "$sqm_identity_ignore_dscp" ]
+}
+
+health_rate_bounds() {
+	health_dl_min="$sqm_identity_downlink"
+	health_dl_max="$sqm_identity_downlink"
+	health_ul_min="$sqm_identity_uplink"
+	health_ul_max="$sqm_identity_uplink"
+	[ "$recovery_mode" != 1 ] || return 0
+	if is_positive_uint "$health_min_dl_raw"; then health_dl_min="$health_min_dl_raw"; fi
+	if is_positive_uint "$health_cap_dl_raw"; then
+		health_dl_max="$health_cap_dl_raw"
+	elif is_positive_uint "$health_max_dl_raw"; then
+		health_dl_max="$health_max_dl_raw"
+	fi
+	if is_positive_uint "$health_min_ul_raw"; then health_ul_min="$health_min_ul_raw"; fi
+	if is_positive_uint "$health_cap_ul_raw"; then
+		health_ul_max="$health_cap_ul_raw"
+	elif is_positive_uint "$health_max_ul_raw"; then
+		health_ul_max="$health_max_ul_raw"
+	fi
+	[ "$health_dl_min" -le "$sqm_identity_downlink" ] &&
+		[ "$sqm_identity_downlink" -le "$health_dl_max" ] &&
+		[ "$health_ul_min" -le "$sqm_identity_uplink" ] &&
+		[ "$sqm_identity_uplink" -le "$health_ul_max" ]
+}
+
+cake_last_group_option() {
+	cake_group_options="$1"
+	cake_group="$2"
+	cake_group_result=""
+	for cake_group_token in $cake_group_options; do
+		case "$cake_group:$cake_group_token" in
+			class:besteffort|class:diffserv3|class:diffserv4|class:diffserv8|class:precedence) cake_group_result="$cake_group_token" ;;
+			isolation:triple-isolate|isolation:dual-srchost|isolation:dual-dsthost|isolation:srchost|isolation:dsthost|isolation:hosts|isolation:flows|isolation:flowblind) cake_group_result="$cake_group_token" ;;
+			nat:nat|nat:nonat|wash:wash|wash:nowash|ack:ack-filter|ack:ack-filter-aggressive|ack:no-ack-filter|split:split-gso|split:no-split-gso) cake_group_result="$cake_group_token" ;;
+		esac
+	done
+	printf '%s\n' "$cake_group_result"
+}
+
+cake_line_has_option() {
+	case " $1 " in *" $2 "*) return 0 ;; *) return 1 ;; esac
+}
+
+cake_options_match() {
+	cake_options_line="$1"
+	cake_expected_options="$2"
+	for cake_option_group in class isolation nat wash ack split; do
+		cake_expected_option="$(cake_last_group_option "$cake_expected_options" "$cake_option_group")"
+		if [ -z "$cake_expected_option" ]; then
+			case "$cake_option_group" in
+				isolation) cake_expected_option=triple-isolate ;;
+				nat) cake_expected_option=nonat ;;
+				wash) cake_expected_option=nowash ;;
+				ack) cake_expected_option=no-ack-filter ;;
+				split) cake_expected_option=split-gso ;;
+				*) continue ;;
+			esac
+		fi
+		cake_line_has_option "$cake_options_line" "$cake_expected_option" || return 1
+	done
+}
+
+cake_linklayer_matches() {
+	cake_link_line="$1"
+	case "$sqm_identity_llam:$sqm_identity_linklayer" in
+		cake:none|default:none)
+			cake_line_has_option "$cake_link_line" raw || return 1
+			cake_link_expected_overhead=0
+			;;
+		cake:*|default:*)
+			case "$sqm_identity_linklayer" in
+				atm) cake_line_has_option "$cake_link_line" atm || return 1 ;;
+				*) cake_line_has_option "$cake_link_line" noatm || return 1 ;;
+			esac
+			cake_link_expected_overhead="$sqm_identity_overhead"
+			;;
+		*) return 0 ;;
+	esac
+	printf '%s\n' "$cake_link_line" | awk -v overhead="$cake_link_expected_overhead" -v mpu="$sqm_identity_mpu" '
+		{
+			seen_overhead = 0
+			seen_mpu = (mpu + 0 == 0)
+			for (i = 1; i <= NF; i++) {
+				if ($i == "overhead" && i < NF && $(i + 1) == overhead) seen_overhead = 1
+				if ($i == "mpu" && i < NF && $(i + 1) == mpu) seen_mpu = 1
+			}
+		}
+		END { exit !(seen_overhead && seen_mpu) }
+	'
+}
+
+cake_identity_matches() {
+	cake_device="$1"
+	cake_min_rate="$2"
+	cake_max_rate="$3"
+	cake_options="$4"
+	cake_state="$("$tc_bin" -details qdisc show dev "$cake_device" 2>/dev/null)" || return 1
+	cake_root_line="$(printf '%s\n' "$cake_state" | awk -v min="$cake_min_rate" -v max="$cake_max_rate" -v use_mq="$sqm_identity_use_mq" '
+		function rate_kbps(value, raw, factor) {
+			raw = tolower(value)
+			factor = -1
+			if (raw ~ /kbit$/) { factor = 1; sub(/kbit$/, "", raw) }
+			else if (raw ~ /mbit$/) { factor = 1000; sub(/mbit$/, "", raw) }
+			else if (raw ~ /gbit$/) { factor = 1000000; sub(/gbit$/, "", raw) }
+			else if (raw ~ /bit$/) { factor = 0.001; sub(/bit$/, "", raw) }
+			if (factor < 0 || raw !~ /^[0-9]+([.][0-9]+)?$/) return -1
+			return (raw + 0) * factor
+		}
+		$1 == "qdisc" && ($2 == "cake" || $2 == "cake_mq") && $4 == "root" {
+			count++
+			valid = ($3 ~ /^[[:xdigit:]]+:$/ && $3 != "0:")
+			if ($2 == "cake_mq" && use_mq != 1) valid = 0
+			rate = -1
+			for (i = 1; i <= NF; i++) if ($i == "bandwidth" && i < NF) rate = rate_kbps($(i + 1))
+			if (rate + 0.0001 < min || rate - 0.0001 > max) valid = 0
+			line = $0
+		}
+		END {
+			if (count != 1 || !valid) exit 1
+			print line
+		}
+	')" || return 1
+	[ -n "$cake_root_line" ] || return 1
+	cake_options_match "$cake_root_line" "$cake_options" || return 1
+	cake_linklayer_matches "$cake_root_line"
+}
+
+ingress_qdisc_present() {
+	ingress_qdisc_state="$("$tc_bin" -details qdisc show dev "$target" 2>/dev/null)" || return 1
+	printf '%s\n' "$ingress_qdisc_state" |
+		awk '$1 == "qdisc" && $2 == "ingress" && $3 == "ffff:" && $4 == "parent" { count++ } END { exit(count == 1 ? 0 : 1) }'
 }
 
 redirect_present() {
-	"$tc_bin" filter show dev "$target" ingress 2>/dev/null | grep -Fq "$dl_if"
+	redirect_state="$("$tc_bin" filter show dev "$target" ingress 2>/dev/null)" || return 1
+	printf '%s\n' "$redirect_state" | awk -v expected="$dl_if" '
+	function clean(value) {
+			sub(/^[[(]+/, "", value)
+			sub(/[]),;]+$/, "", value)
+			return value
+		}
+		{
+			for (i = 1; i <= NF; i++) {
+				if ($i == "redirect" && $(i + 1) == "dev" && clean($(i + 2)) == expected)
+					found = 1
+				if ($i == "Redirect" && $(i + 1) == "to" && $(i + 2) == "device" && clean($(i + 3)) == expected)
+					found = 1
+			}
+		}
+		END { exit(found ? 0 : 1) }
+	'
 }
 
 healthy() {
@@ -58,64 +473,190 @@ healthy() {
 	esac
 	[ -f "$sys_class_net/$dl_if/statistics/$dl_counter" ] || return 1
 	[ -f "$sys_class_net/$ul_if/statistics/$ul_counter" ] || return 1
-	cake_present "$dl_if" || return 1
-	cake_present "$ul_if" || return 1
-	case "$dl_if" in ifb*) redirect_present || return 1 ;; esac
+	load_sqm_runtime_identity || return 1
+	private_state_identity_matches || return 1
+	health_rate_bounds || return 1
+	cake_identity_matches "$dl_if" "$health_dl_min" "$health_dl_max" \
+		"$sqm_identity_ingress_opts $sqm_identity_iqdisc_opts" || return 1
+	cake_identity_matches "$ul_if" "$health_ul_min" "$health_ul_max" \
+		"$sqm_identity_egress_opts $sqm_identity_eqdisc_opts" || return 1
+	case "$dl_if" in
+		ifb*) ingress_qdisc_present && redirect_present || return 1 ;;
+	esac
 	return 0
 }
 
 release_lock() {
-	owner="$(sed -n '1p' "$lock_dir/pid" 2>/dev/null)"
-	if [ "$owner" = "$$" ]; then
-		rm -f "$lock_dir/pid" 2>/dev/null
-		rmdir "$lock_dir" 2>/dev/null || true
+	release_rc=0
+	if [ -n "${sqm_private_config_dir:-}" ]; then
+		case "$sqm_private_config_dir" in
+			"$runtime_lock_root"/sqm-recover-config.*)
+				rm -rf "$sqm_private_config_dir" 2>/dev/null || release_rc=1
+				;;
+			*) release_rc=1 ;;
+		esac
+		sqm_private_config_dir=""
 	fi
+	[ "${sqm_lock_borrowed:-0}" = 1 ] && return "$release_rc"
+	if [ "${runtime_interface_lock_held:-0}" = 1 ]; then
+		runtime_lock_release_interface || release_rc=1
+	fi
+	if [ -n "${runtime_global_lock_mode:-}" ]; then
+		runtime_lock_release_global || release_rc=1
+	fi
+	return "$release_rc"
 }
 
 safe_name "$section" || fail "Invalid CAKE Autorate instance name."
-[ "$(uci_get enabled)" = 1 ] || fail "Autorate instance $section is disabled."
-[ "$(uci_get manage_sqm)" != 0 ] || fail "Managed SQM is disabled for $section."
-[ "$(uci_get sqm_enabled)" = 1 ] || fail "Managed SQM queue is disabled for $section."
-
-target="$(uci_get sqm_interface)"
-[ -n "$target" ] || target="$(uci_get ul_if)"
-ul_if="$(uci_get ul_if)"
-[ -n "$ul_if" ] || ul_if="$target"
-dl_if="$(uci_get dl_if)"
-[ -n "$dl_if" ] || dl_if="ifb4$target"
+sqm_expected_fingerprint=""
+sqm_snapshot_recovery=0
+case "$#" in
+	1)
+		recovery_mode=0
+		[ "$(uci_get enabled)" = 1 ] || fail "Autorate instance $section is disabled."
+		[ "$(uci_get manage_sqm)" = 1 ] || fail "Managed SQM is disabled for $section."
+		[ "$(uci_get sqm_enabled)" = 1 ] || fail "Managed SQM queue is disabled for $section."
+		target="$(uci_get sqm_interface)"
+		[ -n "$target" ] || target="$(uci_get ul_if)"
+		ul_if="$(uci_get ul_if)"
+		[ -n "$ul_if" ] || ul_if="$target"
+		dl_if="$(uci_get dl_if)"
+		[ -n "$dl_if" ] || dl_if="ifb4$target"
+		sqm_section="$(uci_get sqm_section)"
+		[ -n "$sqm_section" ] || sqm_section="cake_$section"
+		;;
+	7)
+		recovery_mode=1
+		sqm_snapshot_recovery=1
+		sqm_section="$expected_sqm_section"
+		target="$expected_target"
+		ul_if="$expected_ul_if"
+		dl_if="$expected_dl_if"
+		sqm_expected_fingerprint="$6"
+		sqm_recovery_snapshot="$7"
+		valid_sha256_fingerprint "$sqm_expected_fingerprint" ||
+			fail "Invalid managed SQM recovery fingerprint."
+		runtime_lock_ram_path "$sqm_recovery_snapshot" ||
+			fail "Invalid managed SQM recovery snapshot path."
+		;;
+	*) fail "SQM recovery requires an instance name or a complete recovery snapshot." ;;
+esac
 safe_interface "$target" || fail "Invalid SQM target interface."
 safe_interface "$ul_if" || fail "Invalid SQM upload interface."
 safe_interface "$dl_if" || fail "Invalid SQM download interface."
+safe_name "$sqm_section" || fail "Invalid managed SQM section."
+if [ "$sqm_snapshot_recovery" = 1 ]; then
+	recovery_snapshot_path_valid ||
+		fail "Managed SQM recovery snapshot is missing, unsafe, or not private to the runtime owner."
+fi
+if [ "$sqm_snapshot_recovery" != 1 ]; then
+	[ "$(uci_raw_get "sqm.$sqm_section._cake_autorate_managed")" = "$section" ] ||
+		fail "Managed SQM ownership marker changed for $section."
+	[ "$(uci_raw_get "sqm.$sqm_section.enabled")" = 1 ] ||
+		fail "Managed SQM section $sqm_section is disabled."
+	[ "$(uci_raw_get "sqm.$sqm_section.interface")" = "$target" ] ||
+		fail "Managed SQM section $sqm_section changed target interface."
+fi
 [ -x "$sqm_run" ] || fail "SQM runner is unavailable."
-
-lock_name="$(lock_name_for "$target")"
-speedtest_lock="$speedtest_lock_root/interface-$lock_name.lock"
-speedtest_pid="$(sed -n '1p' "$speedtest_lock/pid" 2>/dev/null)"
-if is_pid "$speedtest_pid" && kill -0 "$speedtest_pid" 2>/dev/null; then
-	printf '%s\n' "SQM recovery deferred: a speed test is using $target." >&2
-	exit 75
+capture_health_policy || fail "Invalid CAKE/SQM health-policy bounds for $section."
+if [ "$recovery_mode" != 1 ]; then
+	sqm_expected_fingerprint="$(compute_sqm_fingerprint)" ||
+		fail "Unable to fingerprint managed SQM configuration for $section."
+elif [ "$sqm_snapshot_recovery" = 1 ]; then
+	# The authoritative configuration is the caller-captured RAM snapshot.  Do
+	# not consult mutable live UCI here: it may legitimately have drifted after
+	# SQM was stopped, which is exactly the crash case this recovery API covers.
+	:
+else
+	fail "Invalid SQM recovery mode."
 fi
 
-mkdir -p "$lock_root" || fail "Unable to create the SQM recovery lock root."
-lock_dir="$lock_root/interface-$lock_name.lock"
-if ! mkdir "$lock_dir" 2>/dev/null; then
-	owner="$(sed -n '1p' "$lock_dir/pid" 2>/dev/null)"
-	if is_pid "$owner" && kill -0 "$owner" 2>/dev/null; then
-		printf '%s\n' "SQM recovery is already running for $target." >&2
-		exit 75
+sqm_lock_borrowed=0
+sqm_global_borrow_requested="${CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_BORROW:-0}"
+case "$sqm_global_borrow_requested" in 0|1) ;; *) fail "Invalid global runtime-lock borrow request." ;; esac
+requested_owner="${CAKE_AUTORATE_INTERFACE_LOCK_OWNER:-}"
+requested_start="${CAKE_AUTORATE_INTERFACE_LOCK_STARTTIME:-}"
+requested_token="${CAKE_AUTORATE_INTERFACE_LOCK_TOKEN:-}"
+requested_journal="${CAKE_AUTORATE_INTERFACE_LOCK_RECOVERY_JOURNAL:-}"
+inherited_lock_requested=0
+if [ -n "$requested_owner$requested_start$requested_token$requested_journal" ]; then
+	[ -n "$requested_owner" ] && [ -n "$requested_start" ] &&
+		[ -n "$requested_token" ] && [ -n "$requested_journal" ] ||
+		fail "Inherited runtime lock metadata is incomplete."
+	inherited_lock_requested=1
+fi
+if [ "$recovery_mode" = 1 ] && [ "$inherited_lock_requested" != 1 ]; then
+	fail "SQM recovery requires an inherited, verified runtime lock."
+fi
+if [ "$inherited_lock_requested" = 1 ]; then
+	runtime_lock_ensure_global_shared || {
+		lock_rc="$?"
+		[ "$lock_rc" -eq 75 ] && exit 75
+		fail "Inherited global CAKE/SQM lock is invalid."
+	}
+	if runtime_lock_borrow_interface "$target" "$requested_owner" "$requested_start" \
+	   "$requested_token" "$requested_journal"; then
+		sqm_lock_borrowed=1
+	else
+		lock_rc="$?"
+		[ "$lock_rc" -eq 75 ] && exit 75
+		fail "Inherited interface lock does not match SQM recovery ownership."
 	fi
-	rm -f "$lock_dir/pid" 2>/dev/null
-	rmdir "$lock_dir" 2>/dev/null || fail "Unable to clear a stale SQM recovery lock."
-	mkdir "$lock_dir" 2>/dev/null || fail "Unable to acquire the SQM recovery lock."
+else
+	if [ "$sqm_global_borrow_requested" = 1 ]; then
+		if runtime_lock_borrow_global_exclusive; then
+			:
+		else
+			lock_rc="$?"
+			[ "$lock_rc" -eq 75 ] && exit 75
+			fail "Unable to borrow the scheduler-owned exclusive CAKE/SQM lock."
+		fi
+	else
+		runtime_lock_acquire_global_shared || {
+			lock_rc="$?"
+			[ "$lock_rc" -eq 75 ] && exit 75
+			fail "Unable to acquire the global CAKE/SQM lock."
+		}
+	fi
+	runtime_lock_acquire_interface "$target" sqm-recover "" || {
+		lock_rc="$?"
+		runtime_lock_release_global >/dev/null 2>&1 || true
+		case "$lock_rc" in
+			75|76)
+				printf '%s\n' "SQM recovery deferred: a heavy operation is using $target." >&2
+				exit 75
+				;;
+			*) fail "Unable to acquire the SQM recovery interface lock." ;;
+		esac
+	}
 fi
-printf '%s\n' "$$" > "$lock_dir/pid" || fail "Unable to write the SQM recovery lock."
-trap release_lock EXIT INT TERM
+trap release_lock EXIT
+trap 'exit 130' INT TERM HUP
+
+# Revalidate after the authoritative kernel lock is held. Recovery arguments
+# remain immutable, while a concurrent configuration change causes a fail-closed
+# exit before any SQM command.
+if [ "$sqm_snapshot_recovery" != 1 ]; then
+	managed_snapshot_valid || fail "Managed SQM ownership, enablement, or target changed while locking $section."
+	standalone_snapshot_valid || fail "CAKE/SQM recovery configuration changed while locking $section."
+fi
+health_policy_snapshot_valid || fail "CAKE/SQM health-policy bounds changed while locking $section."
+prepare_private_sqm_config ||
+	fail "Managed SQM configuration changed or could not be frozen safely while locking $section."
 
 healthy && exit 0
 
-"$sqm_run" stop "$target" >/dev/null 2>&1 || true
-rm -f "$sqm_state_dir/$target.state" 2>/dev/null
-"$sqm_run" start "$target" >/dev/null 2>&1 || fail "Failed to start managed SQM on $target."
+sqm_runtime_state="$sqm_state_dir/$target.state"
+if [ -L "$sqm_runtime_state" ]; then
+	fail "Managed SQM state is a symlink; refusing to source it during recovery."
+elif [ -e "$sqm_runtime_state" ]; then
+	[ -f "$sqm_runtime_state" ] && load_sqm_runtime_identity && private_state_identity_matches ||
+		fail "Managed SQM state is malformed or does not match frozen UCI; refusing to source it."
+	UCI_CONFIG_DIR="$sqm_private_config_dir" "$sqm_run" stop "$target" >/dev/null 2>&1 || true
+fi
+rm -f "$sqm_state_dir/$target.state" 2>/dev/null || fail "Unable to clear stale SQM state for $target."
+UCI_CONFIG_DIR="$sqm_private_config_dir" "$sqm_run" start "$target" >/dev/null 2>&1 ||
+	fail "Failed to start managed SQM on $target."
 
 attempt=0
 while [ "$attempt" -lt 10 ]; do

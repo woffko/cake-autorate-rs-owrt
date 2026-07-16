@@ -1,0 +1,1169 @@
+#!/bin/sh
+
+# Fail-closed bridge between a validated Full Auto-Tune result and the LuCI
+# UCI rollback transaction which applies it.  A marker committed without its
+# root-owned tmpfs token deliberately prevents the service from touching SQM.
+
+mode="${1:-verify-init}"
+shift 2>/dev/null || true
+
+guard_root="${CAKE_AUTORATE_APPLY_GUARD_DIR:-/tmp/cake-autorate-apply-guard}"
+config_dir="${CAKE_AUTORATE_CONFIG_DIR:-/etc/config}"
+autotune_root="${CAKE_AUTORATE_AUTOTUNE_DIR:-/tmp/cake-autorate-autotune}"
+autotune_bin="${CAKE_AUTORATE_AUTOTUNE:-/usr/libexec/cake-autorate-rs/autotune}"
+speedtest_bin="${CAKE_AUTORATE_SPEEDTEST:-/usr/libexec/cake-autorate-rs/speedtest}"
+runtime_lock_lib="${CAKE_AUTORATE_RUNTIME_LOCK_LIB:-/usr/libexec/cake-autorate-rs/runtime-lock}"
+jsonfilter_bin="${CAKE_AUTORATE_JSONFILTER:-$(command -v jsonfilter 2>/dev/null)}"
+daemon_bin="${CAKE_AUTORATE_DAEMON:-/usr/sbin/cake-autorated}"
+tc_bin="${CAKE_AUTORATE_TC:-$(command -v tc 2>/dev/null)}"
+sys_class_net="${CAKE_AUTORATE_SYS_CLASS_NET:-/sys/class/net}"
+proc_root="${CAKE_AUTORATE_PROC_ROOT:-/proc}"
+sqm_init="${CAKE_AUTORATE_SQM_INIT:-/etc/init.d/sqm}"
+token_ttl_s="${CAKE_AUTORATE_APPLY_GUARD_TTL_S:-180}"
+postcheck_wait_s="${CAKE_AUTORATE_APPLY_GUARD_POSTCHECK_WAIT_S:-15}"
+orphan_age_s="${CAKE_AUTORATE_APPLY_GUARD_ORPHAN_AGE_S:-900}"
+
+[ -r "$runtime_lock_lib" ] && . "$runtime_lock_lib"
+
+json_escape() {
+	printf '%s' "$1" | tr '\n\r\t' '   ' | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+die() {
+	error_message="$1"
+	if [ -n "${arm_cleanup_dir:-}" ] && [ -d "$arm_cleanup_dir" ] && [ ! -L "$arm_cleanup_dir" ]; then
+		cleanup_token_dir "$arm_cleanup_dir" >/dev/null 2>&1 || true
+		arm_cleanup_dir=""
+	fi
+	printf '{"state":"failed","error":"%s"}\n' "$(json_escape "$error_message")"
+	exit 1
+}
+
+safe_job() {
+	case "$1" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+}
+
+safe_interface() {
+	case "$1" in ''|*[!A-Za-z0-9_.:@-]*) return 1 ;; esac
+}
+
+safe_backend() {
+	case "$1" in auto|speedtest-go) return 0 ;; *) return 1 ;; esac
+}
+
+safe_token() {
+	case "$1" in
+		????????????????????????????????????????????????????????????????)
+			case "$1" in *[!0-9a-f]*) return 1 ;; esac
+			;;
+		*) return 1 ;;
+	esac
+}
+
+safe_fingerprint() {
+	case "$1" in
+		sha256:????????????????????????????????????????????????????????????????)
+			case "${1#sha256:}" in *[!0-9a-f]*) return 1 ;; esac
+			;;
+		*) return 1 ;;
+	esac
+}
+
+is_uint() {
+	case "$1" in ''|*[!0-9]*) return 1 ;; esac
+}
+
+is_int() {
+	case "$1" in
+		-[0-9]*) case "${1#-}" in ''|*[!0-9]*) return 1 ;; esac ;;
+		[0-9]*) case "$1" in *[!0-9]*) return 1 ;; esac ;;
+		*) return 1 ;;
+	esac
+}
+
+is_positive_rate() {
+	is_uint "$1" && [ "$1" -gt 0 ] 2>/dev/null && [ "$1" -le 100000000 ] 2>/dev/null
+}
+
+owned_regular() {
+	[ -f "$1" ] && [ ! -L "$1" ] || return 1
+	command -v runtime_lock_path_owned_by_euid >/dev/null 2>&1 || return 1
+	runtime_lock_path_owned_by_euid "$1"
+}
+
+secure_directory() {
+	dir="$1"
+	command -v runtime_lock_ram_path >/dev/null 2>&1 || return 1
+	command -v runtime_lock_path_owned_by_euid >/dev/null 2>&1 || return 1
+	runtime_lock_ram_path "$dir" || return 1
+	[ ! -L "$dir" ] || return 1
+	if [ ! -e "$dir" ]; then
+		mkdir -p "$dir" 2>/dev/null || return 1
+	fi
+	[ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+	runtime_lock_path_owned_by_euid "$dir" || return 1
+	chmod 700 "$dir" 2>/dev/null
+}
+
+require_secure_directory() {
+	dir="$1"
+	command -v runtime_lock_ram_path >/dev/null 2>&1 || return 1
+	command -v runtime_lock_path_owned_by_euid >/dev/null 2>&1 || return 1
+	runtime_lock_ram_path "$dir" || return 1
+	[ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+	runtime_lock_path_owned_by_euid "$dir" || return 1
+	chmod 700 "$dir" 2>/dev/null
+}
+
+prepare_root() {
+	secure_directory "$guard_root" || die "The Full Auto-Tune apply guard directory is unsafe or not tmpfs-backed."
+}
+
+token_live_referenced() {
+	reference_token="$1"
+	safe_token "$reference_token" || return 1
+	uci -q show cake-autorate 2>/dev/null |
+		grep -Fq "._autotune_apply_token='$reference_token'" && return 0
+	uci -q show sqm 2>/dev/null |
+		grep -Fq "._autotune_apply_token='$reference_token'"
+}
+
+guard_orphan_old_enough() {
+	orphan_dir="$1"
+	orphan_minutes=$(((orphan_age_s + 59) / 60))
+	find "$orphan_dir" -prune -mmin "+$orphan_minutes" -print 2>/dev/null | grep -q .
+}
+
+guard_capacity_check() {
+	guard_now="$(date +%s)"
+	is_uint "$guard_now" || return 1
+	guard_count=0
+	for guard_candidate in "$guard_root"/*; do
+		[ -e "$guard_candidate" ] || continue
+		[ -d "$guard_candidate" ] && [ ! -L "$guard_candidate" ] || return 1
+		runtime_lock_path_owned_by_euid "$guard_candidate" || return 1
+		guard_name="${guard_candidate##*/}"
+		safe_token "$guard_name" || return 1
+		guard_expires="$(meta_get expires_epoch "$guard_candidate" 2>/dev/null || true)"
+		if is_uint "$guard_expires"; then
+			if [ "$guard_expires" -lt "$guard_now" ] &&
+			   ! token_live_referenced "$guard_name" &&
+			   ! owned_regular "$guard_candidate/postverified" &&
+			   ! owned_regular "$guard_candidate/prepared"; then
+				cleanup_token_dir "$guard_candidate" || return 1
+				continue
+			fi
+		elif ! token_live_referenced "$guard_name" && guard_orphan_old_enough "$guard_candidate"; then
+			cleanup_token_dir "$guard_candidate" || return 1
+			continue
+		fi
+		guard_count=$((guard_count + 1))
+		[ "$guard_count" -lt 8 ] || return 1
+	done
+}
+
+bounded_regular_file() {
+	bounded_file="$1"
+	bounded_max="$2"
+	owned_regular "$bounded_file" || return 1
+	bounded_size="$(wc -c < "$bounded_file" 2>/dev/null)"
+	is_uint "$bounded_size" && [ "$bounded_size" -le "$bounded_max" ]
+}
+
+json_get() {
+	file="$1"
+	expression="$2"
+	[ -n "$jsonfilter_bin" ] || return 1
+	"$jsonfilter_bin" -i "$file" -e "$expression" 2>/dev/null
+}
+
+meta_get() {
+	key="$1"
+	file="$2/meta"
+	owned_regular "$file" || return 1
+	awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; found++ } END { if (found != 1) exit 1 }' "$file"
+}
+
+uci_at() {
+	directory="$1"
+	shift
+	[ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+	if [ ! -d "$directory/.uci" ]; then
+		[ ! -e "$directory/.uci" ] && mkdir "$directory/.uci" || return 1
+	fi
+	[ -d "$directory/.uci" ] && [ ! -L "$directory/.uci" ] || return 1
+	chmod 700 "$directory/.uci" 2>/dev/null || return 1
+	uci -c "$directory" -t "$directory/.uci" -p "$directory/.uci" "$@"
+}
+
+live_uci_transaction() {
+	[ -n "${token_dir:-}" ] && secure_directory "$token_dir/live-uci" || return 1
+	uci -c "$config_dir" -t "$token_dir/live-uci" -p "$token_dir/live-uci" "$@"
+}
+
+original_get() {
+	job="$1"
+	option="$2"
+	fallback="$3"
+	value="$(uci_at "$token_dir/original" -q get "cake-autorate.$job.$option" 2>/dev/null || true)"
+	[ -n "$value" ] || value="$fallback"
+	printf '%s\n' "$value"
+}
+
+expected_set() {
+	job="$1"
+	option="$2"
+	value="$3"
+	uci_at "$token_dir/expected" -q set "cake-autorate.$job.$option=$value"
+}
+
+expected_delete() {
+	uci_at "$token_dir/expected" -q delete "$1" 2>/dev/null || true
+}
+
+canonical_section() {
+	directory="$1"
+	config="$2"
+	section="$3"
+	output="$4"
+	uci_at "$directory" -q show "$config.$section" 2>/dev/null | LC_ALL=C sort > "$output"
+}
+
+canonical_live_section() {
+	config="$1"
+	section="$2"
+	output="$3"
+	uci -q show "$config.$section" 2>/dev/null | LC_ALL=C sort > "$output"
+}
+
+canonical_package() {
+	directory="$1"
+	config="$2"
+	output="$3"
+	uci_at "$directory" -q show "$config" 2>/dev/null | LC_ALL=C sort > "$output"
+}
+
+canonical_live_package() {
+	config="$1"
+	output="$2"
+	uci -q show "$config" 2>/dev/null | LC_ALL=C sort > "$output"
+}
+
+sqm_guard_section() {
+	guard_job="$1"
+	safe_job "$guard_job" || return 1
+	printf 'cake_autorate_apply_%s\n' "$guard_job"
+}
+
+same_files() {
+	cmp -s "$1" "$2"
+}
+
+snapshot_fingerprint() {
+	snapshot_directory="$1"
+	snapshot_config="$2"
+	snapshot_file="$token_dir/check-snapshot-${snapshot_config}.$$"
+	canonical_package "$snapshot_directory" "$snapshot_config" "$snapshot_file" || return 1
+	snapshot_digest="$(sha256sum "$snapshot_file" 2>/dev/null | awk 'NR == 1 { print $1; exit }')"
+	rm -f "$snapshot_file"
+	case "$snapshot_digest" in
+		????????????????????????????????????????????????????????????????)
+			case "$snapshot_digest" in *[!0-9a-f]*) return 1 ;; esac
+			;;
+		*) return 1 ;;
+	esac
+	printf 'sha256:%s\n' "$snapshot_digest"
+}
+
+daemon_identity() {
+	identity_job="$1"
+	identity_pids="$(pgrep -f "^$daemon_bin --instance $identity_job\$" 2>/dev/null | LC_ALL=C sort -n)"
+	[ -n "$identity_pids" ] || { printf '%s\n' none; return 0; }
+	for identity_pid in $identity_pids; do
+		is_uint "$identity_pid" || return 1
+		identity_start="$(awk '{ print $22; exit }' "$proc_root/$identity_pid/stat" 2>/dev/null)"
+		is_uint "$identity_start" || return 1
+		printf '%s:%s,' "$identity_pid" "$identity_start"
+	done
+	printf '\n'
+}
+
+daemon_identity_count() {
+	[ "$1" = none ] && { printf '0\n'; return 0; }
+	printf '%s\n' "$1" | awk -F, '{ count = 0; for (i = 1; i <= NF; i++) if ($i != "") count++; print count }'
+}
+
+daemon_identities_intersect() {
+	current_identities="$1"
+	original_identities="$2"
+	[ "$current_identities" != none ] && [ "$original_identities" != none ] || return 1
+	for current_identity_entry in $(printf '%s' "$current_identities" | tr ',' ' '); do
+		case ",$original_identities" in
+			*",$current_identity_entry,"*) return 0 ;;
+		esac
+	done
+	return 1
+}
+
+cake_root_bandwidth_kbps() {
+	bandwidth_device="$1"
+	"$tc_bin" qdisc show dev "$bandwidth_device" 2>/dev/null | awk '
+		/^qdisc cake / {
+			is_root = 0
+			for (i = 1; i <= NF; i++) if ($i == "root") is_root = 1
+			if (!is_root) next
+			count++
+			for (i = 1; i <= NF; i++) if ($i == "bandwidth") {
+				value = $(i + 1)
+				if (value ~ /^[0-9]+([.][0-9]+)?Kbit$/) { sub(/Kbit$/, "", value); rate = value + 0 }
+				else if (value ~ /^[0-9]+([.][0-9]+)?Mbit$/) { sub(/Mbit$/, "", value); rate = value * 1000 }
+				else if (value ~ /^[0-9]+([.][0-9]+)?Gbit$/) { sub(/Gbit$/, "", value); rate = value * 1000000 }
+			}
+		}
+		END { if (count != 1 || rate <= 0) exit 1; printf "%.0f\n", rate }
+	'
+}
+
+snapshot_configs() {
+	bounded_regular_file "$config_dir/cake-autorate" 1048576 || return 1
+	bounded_regular_file "$config_dir/sqm" 1048576 || return 1
+	for snapshot_dir in "$token_dir/original" "$token_dir/expected-pre" "$token_dir/expected" "$token_dir/expected-final"; do
+		mkdir "$snapshot_dir" || return 1
+		chmod 700 "$snapshot_dir" || return 1
+		cp "$config_dir/cake-autorate" "$snapshot_dir/cake-autorate" || return 1
+		cp "$config_dir/sqm" "$snapshot_dir/sqm" || return 1
+		chmod 600 "$snapshot_dir/cake-autorate" "$snapshot_dir/sqm" || return 1
+	done
+}
+
+require_result_flag() {
+	[ "$(json_get "$result_copy" "$1")" = "$2" ] || die "$3"
+}
+
+require_result_value() {
+	result_value="$(json_get "$result_copy" "$1")" || return 1
+	[ -n "$result_value" ] || return 1
+	printf '%s\n' "$result_value"
+}
+
+proposal_rate() {
+	proposal_value="$(require_result_value "$1")" || return 1
+	is_positive_rate "$proposal_value" || return 1
+	printf '%s\n' "$proposal_value"
+}
+
+proposal_uint() {
+	proposal_value="$(require_result_value "$1")" || return 1
+	is_uint "$proposal_value" || return 1
+	printf '%s\n' "$proposal_value"
+}
+
+max_rate() {
+	current="$1"
+	minimum="$2"
+	fallback="$3"
+	awk -v current="$current" -v minimum="$minimum" -v fallback="$fallback" 'BEGIN {
+		if (current !~ /^[0-9]+([.][0-9]+)?$/) current = fallback
+		value = current + 0
+		if (value < minimum + 0) value = minimum + 0
+		printf "%.15g\n", value
+	}'
+}
+
+normalized_number() {
+	current="$1"
+	fallback="$2"
+	awk -v current="$current" -v fallback="$fallback" 'BEGIN {
+		if (current !~ /^-?[0-9]+([.][0-9]+)?$/) current = fallback
+		if (current !~ /^-?[0-9]+([.][0-9]+)?$/) exit 1
+		printf "%.15g\n", current + 0
+	}'
+}
+
+build_expected_manifest() {
+	job="$1"
+	target="$2"
+	route_mode="$3"
+	member="$4"
+	enabled="$5"
+	disable_adaptive="$6"
+	fingerprint="$7"
+	token="$8"
+	expires="$9"
+
+	sqm_section="$(original_get "$job" sqm_section "cake_$job")"
+	safe_job "$sqm_section" || die "The managed SQM section name is unsafe."
+	sqm_guard="$(sqm_guard_section "$job")" || die "The SQM rollback marker identity is unsafe."
+	for expected_dir in "$token_dir/expected-pre" "$token_dir/expected"; do
+		uci_at "$expected_dir" -q get "sqm.$sqm_guard" >/dev/null 2>&1 ||
+			uci_at "$expected_dir" -q set "sqm.$sqm_guard=cake_autorate_apply_guard" || return 1
+		uci_at "$expected_dir" -q set "sqm.$sqm_guard._autotune_apply_guard=1" || return 1
+		uci_at "$expected_dir" -q set "sqm.$sqm_guard._autotune_apply_job=$job" || return 1
+		uci_at "$expected_dir" -q set "sqm.$sqm_guard._autotune_apply_fingerprint=$fingerprint" || return 1
+		uci_at "$expected_dir" -q set "sqm.$sqm_guard._autotune_apply_token=$token" || return 1
+		uci_at "$expected_dir" -q commit sqm || return 1
+	done
+
+	dl_min="$(proposal_rate '@.proposal.download.minimum_kbps')" || die "The Full Auto-Tune proposal contains an invalid download minimum."
+	dl_base="$(proposal_rate '@.proposal.download.base_kbps')" || die "The Full Auto-Tune proposal contains an invalid download base."
+	dl_max="$(proposal_rate '@.proposal.download.maximum_kbps')" || die "The Full Auto-Tune proposal contains an invalid download maximum."
+	dl_cap="$(proposal_rate '@.proposal.download.absolute_cap_kbps')" || die "The Full Auto-Tune proposal contains an invalid download cap."
+	dl_low="$(proposal_rate '@.proposal.download.observed_low_kbps')" || die "The Full Auto-Tune proposal contains an invalid download reference."
+	dl_median="$(proposal_rate '@.proposal.download.observed_median_kbps')" || die "The Full Auto-Tune proposal contains an invalid download median."
+	ul_min="$(proposal_rate '@.proposal.upload.minimum_kbps')" || die "The Full Auto-Tune proposal contains an invalid upload minimum."
+	ul_base="$(proposal_rate '@.proposal.upload.base_kbps')" || die "The Full Auto-Tune proposal contains an invalid upload base."
+	ul_max="$(proposal_rate '@.proposal.upload.maximum_kbps')" || die "The Full Auto-Tune proposal contains an invalid upload maximum."
+	ul_cap="$(proposal_rate '@.proposal.upload.absolute_cap_kbps')" || die "The Full Auto-Tune proposal contains an invalid upload cap."
+	ul_low="$(proposal_rate '@.proposal.upload.observed_low_kbps')" || die "The Full Auto-Tune proposal contains an invalid upload reference."
+	ul_median="$(proposal_rate '@.proposal.upload.observed_median_kbps')" || die "The Full Auto-Tune proposal contains an invalid upload median."
+	active_threshold="$(proposal_rate '@.proposal.active_threshold_kbps')" || die "The Full Auto-Tune proposal contains an invalid active threshold."
+	[ "$dl_min" -le "$dl_base" ] && [ "$dl_base" -le "$dl_max" ] && [ "$dl_max" -le "$dl_cap" ] ||
+		die "The Full Auto-Tune download bounds are not monotonic."
+	[ "$ul_min" -le "$ul_base" ] && [ "$ul_base" -le "$ul_max" ] && [ "$ul_max" -le "$ul_cap" ] ||
+		die "The Full Auto-Tune upload bounds are not monotonic."
+	adjust_up="$(proposal_uint '@.proposal.thresholds_ms.adjust_up')" || die "The Full Auto-Tune proposal contains an invalid adjust-up threshold."
+	delay="$(proposal_uint '@.proposal.thresholds_ms.delay')" || die "The Full Auto-Tune proposal contains an invalid delay threshold."
+	adjust_down="$(proposal_uint '@.proposal.thresholds_ms.adjust_down')" || die "The Full Auto-Tune proposal contains an invalid adjust-down threshold."
+	[ "$adjust_up" -le "$delay" ] && [ "$delay" -le "$adjust_down" ] ||
+		die "The Full Auto-Tune delay thresholds are not monotonic."
+
+	adaptive_enabled="$(json_get "$result_copy" '@.proposal.adaptive_ceiling.enabled')"
+	case "$adaptive_enabled" in true|false) ;; *) die "The Full Auto-Tune adaptive-ceiling decision is invalid." ;; esac
+	adaptive_hold="$(proposal_uint '@.proposal.adaptive_ceiling.hold_s')" || die "The Full Auto-Tune adaptive hold is invalid."
+	adaptive_growth="$(proposal_uint '@.proposal.adaptive_ceiling.growth_percent')" || die "The Full Auto-Tune adaptive growth is invalid."
+	adaptive_probe="$(proposal_uint '@.proposal.adaptive_ceiling.probe_s')" || die "The Full Auto-Tune adaptive probe duration is invalid."
+	adaptive_cooldown="$(proposal_uint '@.proposal.adaptive_ceiling.cooldown_s')" || die "The Full Auto-Tune adaptive cooldown is invalid."
+	adaptive_ttl="$(proposal_uint '@.proposal.adaptive_ceiling.failed_bound_ttl_s')" || die "The Full Auto-Tune adaptive failed-bound TTL is invalid."
+	[ "$adaptive_hold" -gt 0 ] && [ "$adaptive_growth" -gt 0 ] && [ "$adaptive_probe" -gt 0 ] &&
+		[ "$adaptive_cooldown" -gt 0 ] && [ "$adaptive_ttl" -gt 0 ] ||
+		die "The Full Auto-Tune adaptive-ceiling timings must be positive."
+	old_adaptive="$(original_get "$job" adaptive_ceiling_enabled 0)"
+	if [ "$old_adaptive" = 1 ] && [ "$adaptive_enabled" = false ] && [ "$disable_adaptive" = 0 ]; then
+		adaptive_flag=1
+		dl_cap="$(max_rate "$(original_get "$job" adaptive_ceiling_dl_cap_kbps '')" "$dl_max" "$dl_cap")"
+		ul_cap="$(max_rate "$(original_get "$job" adaptive_ceiling_ul_cap_kbps '')" "$ul_max" "$ul_cap")"
+		adaptive_hold="$(normalized_number "$(original_get "$job" adaptive_ceiling_hold_time_s '')" "$adaptive_hold")"
+		adaptive_growth="$(normalized_number "$(original_get "$job" adaptive_ceiling_growth_percent '')" "$adaptive_growth")"
+		adaptive_probe="$(normalized_number "$(original_get "$job" adaptive_ceiling_probe_duration_s '')" "$adaptive_probe")"
+		adaptive_cooldown="$(normalized_number "$(original_get "$job" adaptive_ceiling_cooldown_s '')" "$adaptive_cooldown")"
+		adaptive_ttl="$(normalized_number "$(original_get "$job" adaptive_ceiling_failed_bound_ttl_s '')" "$adaptive_ttl")"
+	else
+		[ "$adaptive_enabled" = true ] && adaptive_flag=1 || adaptive_flag=0
+	fi
+
+	link_layer="$(require_result_value '@.proposal.link.layer')" || die "The Full Auto-Tune link-layer proposal is missing."
+	case "$link_layer" in none|ethernet|atm) ;; *) die "The Full Auto-Tune link-layer proposal is invalid." ;; esac
+	overhead="$(json_get "$result_copy" '@.proposal.link.overhead')"
+	is_int "$overhead" && [ "$overhead" -ge -1500 ] 2>/dev/null && [ "$overhead" -le 1500 ] 2>/dev/null ||
+		die "The Full Auto-Tune overhead proposal is invalid."
+	mpu="$(proposal_uint '@.proposal.link.mpu')" || die "The Full Auto-Tune MPU proposal is invalid."
+	[ "$link_layer" = none ] && link_advanced=0 || link_advanced=1
+
+	pinger_method="$(require_result_value '@.pinger_plan.recommended_method')" || die "The reflector plan is missing its pinger method."
+	case "$pinger_method" in fping|fping-ts|tsping|irtt|ping) ;; *) die "The reflector plan selected an unsupported pinger." ;; esac
+	no_pingers="$(proposal_uint '@.pinger_plan.recommended_no_pingers')" || die "The reflector plan contains an invalid active count."
+	reflectors="$(json_get "$result_copy" '@.pinger_plan.recommended_reflectors[*]')"
+	[ -n "$reflectors" ] || die "The reflector plan contains no reflectors."
+	reflector_count=0
+	for reflector in $reflectors; do
+		case "$reflector" in ''|-*|*[!0-9A-Za-z:.-]*) die "The reflector plan contains an unsafe reflector." ;; esac
+		reflector_count=$((reflector_count + 1))
+	done
+	[ "$no_pingers" -gt 0 ] && [ "$no_pingers" -le "$reflector_count" ] ||
+		die "The reflector plan active count exceeds its candidate list."
+
+	run_backend="$(json_get "$result_copy" '@.runs[0].backend')"
+	[ -n "$run_backend" ] || run_backend=speedtest-go
+	[ "$run_backend" = speedtest-go ] || die "The Full Auto-Tune result does not identify its pinnable speed-test backend."
+	server_id="$(json_get "$result_copy" '@.runs[0].server_id')"
+	[ -z "$server_id" ] || is_uint "$server_id" || die "The Full Auto-Tune server identity is invalid."
+	apply_percent="$(original_get "$job" speedtest_apply_percent 90)"
+	is_uint "$apply_percent" && [ "$apply_percent" -ge 1 ] && [ "$apply_percent" -le 100 ] || apply_percent=90
+
+	uci_at "$token_dir/expected" -q get "cake-autorate.$job" >/dev/null 2>&1 ||
+		uci_at "$token_dir/expected" -q set "cake-autorate.$job=cake_autorate" || return 1
+	expected_set "$job" enabled "$enabled"
+	expected_set "$job" wan_if "$target"
+	expected_set "$job" route_mode "$route_mode"
+	if [ "$route_mode" = mwan3 ]; then expected_set "$job" mwan3_member "$member"; else expected_delete "cake-autorate.$job.mwan3_member"; fi
+	expected_delete "cake-autorate.$job.ping_prefix_string"
+	expected_set "$job" auto_interface_preset 1
+	expected_set "$job" adjust_dl_shaper_rate 1
+	expected_set "$job" adjust_ul_shaper_rate 1
+	expected_set "$job" manage_sqm 1
+	expected_set "$job" sqm_section "$sqm_section"
+	expected_set "$job" sqm_enabled "$enabled"
+	expected_set "$job" speedtest_backend "$run_backend"
+	if [ -n "$server_id" ]; then expected_set "$job" speedtest_go_server_id "$server_id"; else expected_delete "cake-autorate.$job.speedtest_go_server_id"; fi
+	expected_set "$job" speedtest_apply_percent "$apply_percent"
+	expected_set "$job" pinger_method "$pinger_method"
+	expected_set "$job" no_pingers "$no_pingers"
+	if [ "$pinger_method" != irtt ]; then expected_set "$job" ping_extra_args "-I $target"; fi
+	expected_delete "cake-autorate.$job.reflector"
+	for reflector in $reflectors; do
+		uci_at "$token_dir/expected" -q add_list "cake-autorate.$job.reflector=$reflector" || return 1
+	done
+	expected_set "$job" manual_rate_limits 1
+	expected_set "$job" advanced_settings 0
+	expected_set "$job" sqm_interface "$target"
+	expected_set "$job" ul_if "$target"
+	expected_set "$job" dl_if "ifb4$target"
+	expected_set "$job" sqm_download "$dl_base"
+	expected_set "$job" sqm_upload "$ul_base"
+	expected_set "$job" min_dl_shaper_rate_kbps "$dl_min"
+	expected_set "$job" base_dl_shaper_rate_kbps "$dl_base"
+	expected_set "$job" max_dl_shaper_rate_kbps "$dl_max"
+	expected_set "$job" min_ul_shaper_rate_kbps "$ul_min"
+	expected_set "$job" base_ul_shaper_rate_kbps "$ul_base"
+	expected_set "$job" max_ul_shaper_rate_kbps "$ul_max"
+	expected_set "$job" connection_active_thr_kbps "$active_threshold"
+	expected_set "$job" dl_avg_owd_delta_max_adjust_up_thr_ms "$adjust_up"
+	expected_set "$job" ul_avg_owd_delta_max_adjust_up_thr_ms "$adjust_up"
+	expected_set "$job" dl_owd_delta_delay_thr_ms "$delay"
+	expected_set "$job" ul_owd_delta_delay_thr_ms "$delay"
+	expected_set "$job" dl_avg_owd_delta_max_adjust_down_thr_ms "$adjust_down"
+	expected_set "$job" ul_avg_owd_delta_max_adjust_down_thr_ms "$adjust_down"
+	expected_set "$job" adaptive_ceiling_enabled "$adaptive_flag"
+	expected_set "$job" adaptive_ceiling_dl_cap_kbps "$dl_cap"
+	expected_set "$job" adaptive_ceiling_ul_cap_kbps "$ul_cap"
+	expected_set "$job" adaptive_ceiling_hold_time_s "$adaptive_hold"
+	expected_set "$job" adaptive_ceiling_growth_percent "$adaptive_growth"
+	expected_set "$job" adaptive_ceiling_probe_duration_s "$adaptive_probe"
+	expected_set "$job" adaptive_ceiling_cooldown_s "$adaptive_cooldown"
+	expected_set "$job" adaptive_ceiling_failed_bound_ttl_s "$adaptive_ttl"
+	expected_set "$job" transport_latency_enabled 1
+	expected_set "$job" throughput_guard_enabled 1
+	expected_set "$job" throughput_guard_retention_percent 80
+	expected_set "$job" throughput_reference_dl_p20_kbps "$dl_low"
+	expected_set "$job" throughput_reference_dl_p50_kbps "$dl_median"
+	expected_set "$job" throughput_reference_ul_p20_kbps "$ul_low"
+	expected_set "$job" throughput_reference_ul_p50_kbps "$ul_median"
+
+	for tuple in \
+		"sqm_debug_logging:debug_logging:0" "sqm_verbosity:verbosity:5" \
+		"sqm_qdisc:qdisc:cake" "sqm_script:script:piece_of_cake.qos" \
+		"sqm_qdisc_advanced:qdisc_advanced:0" "sqm_squash_dscp:squash_dscp:1" \
+		"sqm_squash_ingress:squash_ingress:1" "sqm_ingress_ecn:ingress_ecn:ECN" \
+		"sqm_egress_ecn:egress_ecn:NOECN" \
+		"sqm_qdisc_really_really_advanced:qdisc_really_really_advanced:0" \
+		"sqm_ilimit:ilimit:" "sqm_elimit:elimit:" "sqm_itarget:itarget:" \
+		"sqm_etarget:etarget:" "sqm_iqdisc_opts:iqdisc_opts:" "sqm_eqdisc_opts:eqdisc_opts:" \
+		"sqm_tcMTU:tcMTU:2047" "sqm_tcTSIZE:tcTSIZE:128" \
+		"sqm_linklayer_adaptation_mechanism:linklayer_adaptation_mechanism:default"; do
+		cake_option="${tuple%%:*}"
+		rest="${tuple#*:}"
+		sqm_option="${rest%%:*}"
+		fallback="${rest#*:}"
+		option_value="$(original_get "$job" "$cake_option" "$fallback")"
+		[ -z "$option_value" ] || expected_set "$job" "$cake_option" "$option_value"
+	done
+	expected_set "$job" sqm_linklayer "$link_layer"
+	expected_set "$job" sqm_overhead "$overhead"
+	expected_set "$job" sqm_linklayer_advanced "$link_advanced"
+	expected_set "$job" sqm_tcMPU "$mpu"
+
+	expected_set "$job" _autotune_apply_guard 1
+	expected_set "$job" _autotune_apply_fingerprint "$fingerprint"
+	expected_set "$job" _autotune_apply_target "$target"
+	expected_set "$job" _autotune_apply_backend "$run_backend"
+	expected_set "$job" _autotune_apply_route_mode "$route_mode"
+	if [ "$route_mode" = mwan3 ]; then expected_set "$job" _autotune_apply_mwan3_member "$member"; else expected_delete "cake-autorate.$job._autotune_apply_mwan3_member"; fi
+	expected_set "$job" _autotune_apply_enabled "$enabled"
+	expected_set "$job" _autotune_apply_disable_adaptive "$disable_adaptive"
+	expected_set "$job" _autotune_apply_token "$token"
+	expected_set "$job" _autotune_apply_expires "$expires"
+	uci_at "$token_dir/expected" -q commit cake-autorate || return 1
+
+	# Construct the exact managed queue which init must materialize.  This is
+	# checked only after init; before mutation the selected queue must still
+	# equal the arm-time snapshot.
+	if [ "$enabled" = 0 ]; then
+		if [ "$sqm_section" = "cake_$job" ]; then
+			uci_at "$token_dir/expected" -q delete "sqm.$sqm_section" 2>/dev/null || true
+		elif uci_at "$token_dir/expected" -q get "sqm.$sqm_section" >/dev/null 2>&1; then
+			uci_at "$token_dir/expected" -q set "sqm.$sqm_section.enabled=0" || return 1
+			uci_at "$token_dir/expected" -q delete "sqm.$sqm_section._cake_autorate_managed" 2>/dev/null || true
+		fi
+		uci_at "$token_dir/expected" -q commit sqm || return 1
+		printf '%s\n' "$sqm_section" > "$token_dir/sqm-section"
+		chmod 600 "$token_dir/sqm-section"
+		return 0
+	fi
+	uci_at "$token_dir/expected" -q get "sqm.$sqm_section" >/dev/null 2>&1 ||
+		uci_at "$token_dir/expected" -q set "sqm.$sqm_section=queue" || return 1
+	uci_at "$token_dir/expected" -q set "sqm.$sqm_section._cake_autorate_managed=$job"
+	uci_at "$token_dir/expected" -q set "sqm.$sqm_section.enabled=$enabled"
+	resolved="$(require_result_value '@.resolved_interface')" || die "The Full Auto-Tune result has no resolved interface."
+	safe_interface "$resolved" || die "The resolved Full Auto-Tune interface is unsafe."
+	uci_at "$token_dir/expected" -q set "sqm.$sqm_section.interface=$resolved"
+	uci_at "$token_dir/expected" -q set "sqm.$sqm_section.download=$dl_base"
+	uci_at "$token_dir/expected" -q set "sqm.$sqm_section.upload=$ul_base"
+	for tuple in \
+		"sqm_debug_logging:debug_logging:0" "sqm_verbosity:verbosity:5" \
+		"sqm_qdisc:qdisc:cake" "sqm_script:script:piece_of_cake.qos" \
+		"sqm_qdisc_advanced:qdisc_advanced:0" "sqm_squash_dscp:squash_dscp:1" \
+		"sqm_squash_ingress:squash_ingress:1" "sqm_ingress_ecn:ingress_ecn:ECN" \
+		"sqm_egress_ecn:egress_ecn:NOECN" \
+		"sqm_qdisc_really_really_advanced:qdisc_really_really_advanced:0" \
+		"sqm_ilimit:ilimit:" "sqm_elimit:elimit:" "sqm_itarget:itarget:" \
+		"sqm_etarget:etarget:" "sqm_iqdisc_opts:iqdisc_opts:" "sqm_eqdisc_opts:eqdisc_opts:" \
+		"sqm_linklayer:linklayer:none" "sqm_overhead:overhead:0" \
+		"sqm_linklayer_advanced:linklayer_advanced:0" "sqm_tcMTU:tcMTU:2047" \
+		"sqm_tcTSIZE:tcTSIZE:128" "sqm_tcMPU:tcMPU:0" \
+		"sqm_linklayer_adaptation_mechanism:linklayer_adaptation_mechanism:default"; do
+		cake_option="${tuple%%:*}"
+		rest="${tuple#*:}"
+		sqm_option="${rest%%:*}"
+		fallback="${rest#*:}"
+		option_value="$(uci_at "$token_dir/expected" -q get "cake-autorate.$job.$cake_option" 2>/dev/null || true)"
+		[ -n "$option_value" ] || option_value="$fallback"
+		if [ -n "$option_value" ]; then
+			uci_at "$token_dir/expected" -q set "sqm.$sqm_section.$sqm_option=$option_value"
+		else
+			uci_at "$token_dir/expected" -q delete "sqm.$sqm_section.$sqm_option" 2>/dev/null || true
+		fi
+	done
+	uci_at "$token_dir/expected" -q commit sqm || return 1
+	printf '%s\n' "$sqm_section" > "$token_dir/sqm-section"
+	chmod 600 "$token_dir/sqm-section"
+}
+
+build_expected_final_manifest() {
+	cp "$token_dir/expected/cake-autorate" "$token_dir/expected-final/cake-autorate" || return 1
+	cp "$token_dir/expected/sqm" "$token_dir/expected-final/sqm" || return 1
+	chmod 600 "$token_dir/expected-final/cake-autorate" "$token_dir/expected-final/sqm" || return 1
+	for final_option in _autotune_apply_guard _autotune_apply_fingerprint _autotune_apply_target \
+		_autotune_apply_backend _autotune_apply_route_mode _autotune_apply_mwan3_member \
+		_autotune_apply_enabled _autotune_apply_disable_adaptive _autotune_apply_token \
+		_autotune_apply_expires; do
+		if uci_at "$token_dir/expected-final" -q get "cake-autorate.$job.$final_option" >/dev/null 2>&1; then
+			uci_at "$token_dir/expected-final" -q delete "cake-autorate.$job.$final_option" || return 1
+		fi
+	done
+	uci_at "$token_dir/expected-final" -q delete "sqm.$sqm_guard" || return 1
+	uci_at "$token_dir/expected-final" -q commit cake-autorate || return 1
+	uci_at "$token_dir/expected-final" -q commit sqm || return 1
+}
+
+attest_route() {
+	job="$1"
+	target="$2"
+	backend="$3"
+	route_mode="$4"
+	member="$5"
+	expected_fingerprint="$6"
+	attestation="$token_dir/attestation.json"
+	"$autotune_bin" "$job" "$target" attest "$backend" "$route_mode" "$member" > "$attestation" 2>/dev/null ||
+		die "Live Full Auto-Tune route/configuration attestation failed."
+	owned_regular "$attestation" && chmod 600 "$attestation" || die "The attestation file is unsafe."
+	[ "$(json_get "$attestation" '@.state')" = ready ] || die "The live Full Auto-Tune attestation is not ready."
+	[ "$(json_get "$attestation" '@.schema_version')" = 1 ] || die "The live Full Auto-Tune attestation schema is invalid."
+	[ "$(json_get "$attestation" '@.config_fingerprint')" = "$expected_fingerprint" ] || die "The calibrated configuration changed before apply."
+	for field in target_interface resolved_interface route_interface route_mode mwan3_member source_ip external_ip route_identity; do
+		[ "$(json_get "$attestation" "@.$field")" = "$(json_get "$result_copy" "@.$field")" ] ||
+			die "The calibrated route identity changed before apply."
+	done
+}
+
+arm_guard() {
+	job="${1:-}"
+	target="${2:-}"
+	backend="${3:-}"
+	route_mode="${4:-}"
+	member="${5:-}"
+	enabled="${6:-}"
+	disable_adaptive="${7:-}"
+	fingerprint="${8:-}"
+
+	safe_job "$job" || die "Unsafe Full Auto-Tune instance name."
+	safe_interface "$target" || die "Unsafe Full Auto-Tune target interface."
+	safe_backend "$backend" || die "Unsupported Full Auto-Tune apply backend."
+	case "$route_mode" in main) [ -z "$member" ] || die "Main routing cannot name an mwan3 member." ;; mwan3) safe_interface "$member" || die "Unsafe mwan3 member." ;; *) die "Unsupported Full Auto-Tune route mode." ;; esac
+	case "$enabled:$disable_adaptive" in 0:0|0:1|1:0|1:1) ;; *) die "Invalid Full Auto-Tune review decisions." ;; esac
+	safe_fingerprint "$fingerprint" || die "Invalid Full Auto-Tune result fingerprint."
+	is_uint "$token_ttl_s" && [ "$token_ttl_s" -ge 30 ] && [ "$token_ttl_s" -le 900 ] || die "Invalid apply-guard TTL."
+	is_uint "$orphan_age_s" && [ "$orphan_age_s" -ge 60 ] && [ "$orphan_age_s" -le 86400 ] || die "Invalid abandoned-token GC age."
+	prepare_root
+	guard_capacity_check || die "Too many unsafe or abandoned Full Auto-Tune apply tokens exist."
+	sqm_guard="$(sqm_guard_section "$job")" || die "The SQM rollback marker identity is unsafe."
+	if uci -q get "sqm.$sqm_guard" >/dev/null 2>&1; then
+		die "The reserved SQM rollback section already exists; reconcile or remove it before applying."
+	fi
+	if uci -q show cake-autorate 2>/dev/null | grep -q '\._autotune_apply_'; then
+		die "A persistent Full Auto-Tune apply marker already exists; reconcile it before applying another proposal."
+	fi
+
+	result="$autotune_root/$job/result.json"
+	bounded_regular_file "$result" 1048576 || die "The validated Full Auto-Tune result is missing, unsafe, or too large."
+	if command -v hexdump >/dev/null 2>&1; then
+		token="$(hexdump -vn32 -e '32/1 "%02x"' /dev/urandom 2>/dev/null)"
+	else
+		token="$(od -An -N32 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+	fi
+	safe_token "$token" || die "Unable to create a secure Full Auto-Tune apply token."
+	token_dir="$guard_root/$token"
+	[ ! -e "$token_dir" ] && [ ! -L "$token_dir" ] || die "The Full Auto-Tune apply token already exists."
+	mkdir "$token_dir" && chmod 700 "$token_dir" || die "Unable to create the Full Auto-Tune apply token."
+	arm_cleanup_dir="$token_dir"
+	cp "$result" "$token_dir/result.json" || die "Unable to bind the Full Auto-Tune result to its apply token."
+	chmod 600 "$token_dir/result.json" || die "Unable to protect the Full Auto-Tune result copy."
+	result_copy="$token_dir/result.json"
+	owned_regular "$result_copy" || die "The Full Auto-Tune result copy is unsafe."
+
+	require_result_flag '@.state' complete "Only a complete Full Auto-Tune result can be applied."
+	require_result_flag '@.schema_version' 3 "Only the fail-closed Full Auto-Tune schema can be applied."
+	require_result_flag '@.auto_apply_eligible' true "This Full Auto-Tune result is not eligible for apply."
+	require_result_flag '@.phase_evidence_complete' true "This Full Auto-Tune result has incomplete phase evidence."
+	require_result_flag '@.phase_contamination_seen' false "A contaminated Full Auto-Tune result cannot be applied."
+	require_result_flag '@.runtime_restored' true "Full Auto-Tune runtime recovery is incomplete."
+	require_result_flag '@.recovery_pending' false "Full Auto-Tune recovery is still pending."
+	require_result_flag '@.configuration_written' false "The Full Auto-Tune result has unexpected write state."
+	require_result_flag '@.conservative' false "A conservative Full Auto-Tune result cannot be auto-applied."
+	require_result_flag '@.confidence_mode' normal "Only normal-confidence Full Auto-Tune output can be applied."
+	require_result_flag '@.validation.pass' true "Full Auto-Tune validation did not pass."
+	require_result_flag '@.validation.contaminated' false "Full Auto-Tune validation was contaminated."
+	require_result_flag '@.validation.correction.action' none "The Full Auto-Tune proposal still requires correction."
+	require_result_flag '@.validation.correction.feasible' true "The Full Auto-Tune proposal is infeasible."
+	[ "$(json_get "$result_copy" '@.job_id')" = "$job" ] || die "The Full Auto-Tune result belongs to a different instance."
+	[ "$(json_get "$result_copy" '@.target_interface')" = "$target" ] || die "The Full Auto-Tune result targets a different interface."
+	[ "$(json_get "$result_copy" '@.route_mode')" = "$route_mode" ] || die "The Full Auto-Tune result uses a different route mode."
+	[ "$(json_get "$result_copy" '@.mwan3_member')" = "$member" ] || die "The Full Auto-Tune result uses a different mwan3 member."
+	[ "$(json_get "$result_copy" '@.config_fingerprint')" = "$fingerprint" ] || die "The Full Auto-Tune result fingerprint changed."
+
+	snapshot_configs || die "Unable to snapshot the pre-apply configuration into tmpfs."
+	attest_route "$job" "$target" "$backend" "$route_mode" "$member" "$fingerprint"
+	now="$(date +%s)"
+	is_uint "$now" || die "Unable to establish the apply-token clock."
+	expires=$((now + token_ttl_s))
+	original_daemon_identity="$(daemon_identity "$job")" || die "Unable to snapshot the pre-apply daemon generation."
+	build_expected_manifest "$job" "$target" "$route_mode" "$member" "$enabled" "$disable_adaptive" "$fingerprint" "$token" "$expires" ||
+		die "Unable to build the exact Full Auto-Tune apply manifest."
+	build_expected_final_manifest || die "Unable to build the marker-free Full Auto-Tune terminal manifest."
+	expected_cake_fingerprint="$(snapshot_fingerprint "$token_dir/expected" cake-autorate)" || die "Unable to hash the expected CAKE manifest."
+	expected_pre_sqm_fingerprint="$(snapshot_fingerprint "$token_dir/expected-pre" sqm)" || die "Unable to hash the pre-init SQM manifest."
+	expected_sqm_fingerprint="$(snapshot_fingerprint "$token_dir/expected" sqm)" || die "Unable to hash the expected SQM manifest."
+	expected_final_cake_fingerprint="$(snapshot_fingerprint "$token_dir/expected-final" cake-autorate)" || die "Unable to hash the terminal CAKE manifest."
+	expected_final_sqm_fingerprint="$(snapshot_fingerprint "$token_dir/expected-final" sqm)" || die "Unable to hash the terminal SQM manifest."
+	original_cake_fingerprint="$(snapshot_fingerprint "$token_dir/original" cake-autorate)" || die "Unable to hash the original CAKE snapshot."
+	original_sqm_fingerprint="$(snapshot_fingerprint "$token_dir/original" sqm)" || die "Unable to hash the original SQM snapshot."
+	{
+		printf 'version=1\n'
+		printf 'job=%s\n' "$job"
+		printf 'target=%s\n' "$target"
+		printf 'backend=%s\n' "$backend"
+		printf 'route_mode=%s\n' "$route_mode"
+		printf 'mwan3_member=%s\n' "$member"
+		printf 'enabled=%s\n' "$enabled"
+		printf 'disable_adaptive=%s\n' "$disable_adaptive"
+		printf 'result_fingerprint=%s\n' "$fingerprint"
+		printf 'expected_cake_fingerprint=%s\n' "$expected_cake_fingerprint"
+		printf 'expected_pre_sqm_fingerprint=%s\n' "$expected_pre_sqm_fingerprint"
+		printf 'expected_sqm_fingerprint=%s\n' "$expected_sqm_fingerprint"
+		printf 'expected_final_cake_fingerprint=%s\n' "$expected_final_cake_fingerprint"
+		printf 'expected_final_sqm_fingerprint=%s\n' "$expected_final_sqm_fingerprint"
+		printf 'original_cake_fingerprint=%s\n' "$original_cake_fingerprint"
+		printf 'original_sqm_fingerprint=%s\n' "$original_sqm_fingerprint"
+		printf 'original_daemon_identity=%s\n' "$original_daemon_identity"
+		printf 'source_ip=%s\n' "$(json_get "$result_copy" '@.source_ip')"
+		printf 'external_ip=%s\n' "$(json_get "$result_copy" '@.external_ip')"
+		printf 'route_identity=%s\n' "$(json_get "$result_copy" '@.route_identity')"
+		printf 'expires_epoch=%s\n' "$expires"
+	} > "$token_dir/meta" || die "Unable to write the Full Auto-Tune token metadata."
+	chmod 600 "$token_dir/meta" || die "Unable to protect the Full Auto-Tune token metadata."
+	owned_regular "$token_dir/meta" || die "The Full Auto-Tune token metadata is unsafe."
+	arm_cleanup_dir=""
+	printf '{"state":"armed","schema_version":1,"token":"%s","expires_epoch":%s}\n' "$token" "$expires"
+}
+
+load_token() {
+	token="$1"
+	safe_token "$token" || die "Invalid Full Auto-Tune apply token."
+	prepare_root
+	token_dir="$guard_root/$token"
+	require_secure_directory "$token_dir" || die "The Full Auto-Tune apply token is missing, foreign-owned, or unsafe."
+	[ "$(meta_get version "$token_dir")" = 1 ] || die "Unsupported Full Auto-Tune apply-token schema."
+	job="$(meta_get job "$token_dir")"
+	target="$(meta_get target "$token_dir")"
+	backend="$(meta_get backend "$token_dir")"
+	route_mode="$(meta_get route_mode "$token_dir")"
+	member="$(meta_get mwan3_member "$token_dir")"
+	expires="$(meta_get expires_epoch "$token_dir")"
+	safe_job "$job" && safe_interface "$target" && safe_backend "$backend" && is_uint "$expires" || die "The Full Auto-Tune token metadata is invalid."
+	case "$route_mode" in main) [ -z "$member" ] || die "The Full Auto-Tune token route is invalid." ;; mwan3) safe_interface "$member" || die "The Full Auto-Tune token member is invalid." ;; *) die "The Full Auto-Tune token route mode is invalid." ;; esac
+	now="$(date +%s)"
+	is_uint "$now" || die "Unable to establish the apply-token clock."
+	if [ "$now" -le "$expires" ]; then token_expired=0; else token_expired=1; fi
+	result_copy="$token_dir/result.json"
+	owned_regular "$result_copy" || die "The token-bound Full Auto-Tune result is unsafe."
+	require_secure_directory "$token_dir/original" && require_secure_directory "$token_dir/expected-pre" &&
+		require_secure_directory "$token_dir/expected" && require_secure_directory "$token_dir/expected-final" ||
+		die "The token-bound configuration snapshots are unsafe."
+	owned_regular "$token_dir/sqm-section" || die "The token-bound SQM identity is unsafe."
+	result_fingerprint="$(meta_get result_fingerprint "$token_dir")"
+	safe_fingerprint "$result_fingerprint" &&
+		[ "$(json_get "$result_copy" '@.config_fingerprint')" = "$result_fingerprint" ] ||
+		die "The token-bound Full Auto-Tune result fingerprint is inconsistent."
+	for fingerprint_spec in \
+		"expected_cake_fingerprint:$token_dir/expected:cake-autorate" \
+		"expected_pre_sqm_fingerprint:$token_dir/expected-pre:sqm" \
+		"expected_sqm_fingerprint:$token_dir/expected:sqm" \
+		"expected_final_cake_fingerprint:$token_dir/expected-final:cake-autorate" \
+		"expected_final_sqm_fingerprint:$token_dir/expected-final:sqm" \
+		"original_cake_fingerprint:$token_dir/original:cake-autorate" \
+		"original_sqm_fingerprint:$token_dir/original:sqm"; do
+		fingerprint_key="${fingerprint_spec%%:*}"
+		fingerprint_rest="${fingerprint_spec#*:}"
+		fingerprint_directory="${fingerprint_rest%:*}"
+		fingerprint_config="${fingerprint_rest##*:}"
+		stored_fingerprint="$(meta_get "$fingerprint_key" "$token_dir")"
+		safe_fingerprint "$stored_fingerprint" || die "A token-bound manifest fingerprint is invalid."
+		[ "$(snapshot_fingerprint "$fingerprint_directory" "$fingerprint_config")" = "$stored_fingerprint" ] ||
+			die "A token-bound Full Auto-Tune snapshot changed."
+	done
+}
+
+require_token_unexpired() {
+	[ "${token_expired:-1}" -eq 0 ] || die "The Full Auto-Tune apply token expired. Run Auto-Tune again."
+}
+
+verify_marker() {
+	marker_job="$1"
+	marker_stage="${2:-pre}"
+	marker_allow_expired="${3:-0}"
+	marker_token="$(uci -q get "cake-autorate.$marker_job._autotune_apply_token" 2>/dev/null)"
+	load_token "$marker_token"
+	[ "$marker_allow_expired" = 1 ] || require_token_unexpired
+	[ "$job" = "$marker_job" ] || die "The Full Auto-Tune marker/token instance does not match."
+	[ "$(uci -q get "cake-autorate.$job._autotune_apply_guard" 2>/dev/null)" = 1 ] || die "The Full Auto-Tune apply marker is malformed."
+	[ "$(uci -q get "cake-autorate.$job._autotune_apply_fingerprint" 2>/dev/null)" = "$(meta_get result_fingerprint "$token_dir")" ] || die "The Full Auto-Tune marker fingerprint does not match its token."
+	[ "$(uci -q get "cake-autorate.$job._autotune_apply_expires" 2>/dev/null)" = "$expires" ] || die "The Full Auto-Tune marker expiry does not match its token."
+	sqm_guard="$(sqm_guard_section "$job")" || die "The SQM rollback marker identity is unsafe."
+	[ "$(uci -q get "sqm.$sqm_guard" 2>/dev/null)" = cake_autorate_apply_guard ] ||
+		die "The SQM rollback marker has an unexpected section type."
+	[ "$(uci -q get "sqm.$sqm_guard._autotune_apply_guard" 2>/dev/null)" = 1 ] ||
+		die "The SQM package is not enrolled in the rollback transaction."
+	[ "$(uci -q get "sqm.$sqm_guard._autotune_apply_job" 2>/dev/null)" = "$job" ] ||
+		die "The SQM rollback marker belongs to a different instance."
+	[ "$(uci -q get "sqm.$sqm_guard._autotune_apply_token" 2>/dev/null)" = "$marker_token" ] ||
+		die "The SQM rollback marker does not match the apply token."
+
+	expected_cake="$token_dir/check-expected-cake.$$"
+	live_cake="$token_dir/check-live-cake.$$"
+	canonical_package "$token_dir/expected" cake-autorate "$expected_cake"
+	canonical_live_package cake-autorate "$live_cake"
+	if ! same_files "$expected_cake" "$live_cake"; then
+		rm -f "$expected_cake" "$live_cake"
+		die "The applied CAKE Autorate package differs from the exact validated proposal manifest."
+	fi
+	rm -f "$expected_cake" "$live_cake"
+
+	if [ "$marker_stage" = pre ]; then
+		# A config.change reload can run before the explicit guarded restart.
+		# Therefore the protected queue may be either the exact arm-time value
+		# or the exact manifest already materialized by that first reload. No
+		# third/intermediate state is accepted.
+		expected_pre_sqm="$token_dir/check-expected-pre-sqm.$$"
+		expected_sqm="$token_dir/check-expected-sqm.$$"
+		live_sqm="$token_dir/check-live-sqm.$$"
+		canonical_package "$token_dir/expected-pre" sqm "$expected_pre_sqm"
+		canonical_package "$token_dir/expected" sqm "$expected_sqm"
+		canonical_live_package sqm "$live_sqm"
+		if ! same_files "$expected_pre_sqm" "$live_sqm" &&
+		   ! same_files "$expected_sqm" "$live_sqm"; then
+			rm -f "$expected_pre_sqm" "$expected_sqm" "$live_sqm"
+			die "The protected SQM package changed outside the validated proposal transaction."
+		fi
+		rm -f "$expected_pre_sqm" "$expected_sqm" "$live_sqm"
+	fi
+
+	verify_live_route
+}
+
+verify_live_route() {
+	route_json="$token_dir/route-check.$$"
+	"$speedtest_bin" "$job" "$target" route-status "$backend" "" "$route_mode" "$member" > "$route_json" 2>/dev/null ||
+		die "Unable to attest the selected route during Full Auto-Tune apply."
+	owned_regular "$route_json" && chmod 600 "$route_json" || die "The route attestation output is unsafe."
+	[ "$(json_get "$route_json" '@.state')" = ready ] || die "The selected Full Auto-Tune route is no longer ready."
+	[ "$(json_get "$route_json" '@.source_ip')" = "$(meta_get source_ip "$token_dir")" ] || die "The selected uplink source address changed during apply."
+	[ "$(json_get "$route_json" '@.external_ip')" = "$(meta_get external_ip "$token_dir")" ] || die "The selected uplink external address changed during apply."
+	[ "$(json_get "$route_json" '@.route_identity')" = "$(meta_get route_identity "$token_dir")" ] || die "The selected uplink route identity changed during apply."
+	rm -f "$route_json"
+}
+
+guarded_jobs() {
+	uci -q show cake-autorate 2>/dev/null |
+		sed -n "s/^cake-autorate\.\([A-Za-z0-9_]*\)\._autotune_apply_[A-Za-z0-9_]*=.*/\1/p" |
+		LC_ALL=C sort -u
+}
+
+guarded_sqm_jobs() {
+	uci -q show sqm 2>/dev/null |
+		sed -n "s/^sqm\.cake_autorate_apply_[A-Za-z0-9_]*\._autotune_apply_job='\([A-Za-z0-9_]*\)'$/\1/p" |
+		LC_ALL=C sort -u
+}
+
+any_apply_marker_lines() {
+	uci -q show cake-autorate 2>/dev/null | grep -q '\._autotune_apply_' && return 0
+	uci -q show sqm 2>/dev/null | grep -q '\._autotune_apply_'
+}
+
+verify_init() {
+	prepare_root
+	jobs="$(guarded_jobs)"
+	sqm_jobs="$(guarded_sqm_jobs)"
+	if [ -z "$jobs$sqm_jobs" ]; then
+		any_apply_marker_lines && die "An incomplete Full Auto-Tune apply marker exists."
+		printf '{"state":"clear","schema_version":1}\n'
+		return 0
+	fi
+	[ -n "$jobs" ] && [ -n "$sqm_jobs" ] && [ "$jobs" = "$sqm_jobs" ] ||
+		die "The CAKE and SQM apply markers are not an exact pair."
+	[ "$(printf '%s\n' $jobs | wc -l)" -eq 1 ] ||
+		die "Only one Full Auto-Tune apply marker may be active in a transaction."
+	count=0
+	for marker_job in $jobs; do
+		safe_job "$marker_job" || die "An unsafe Full Auto-Tune marker section exists."
+		verify_marker "$marker_job" pre
+		count=$((count + 1))
+	done
+	printf '{"state":"verified","schema_version":1,"markers":%s}\n' "$count"
+}
+
+snapshot_state_matches() {
+	state_directory="$1"
+	state_cake="$token_dir/check-state-cake.$$"
+	state_live_cake="$token_dir/check-state-live-cake.$$"
+	state_sqm="$token_dir/check-state-sqm.$$"
+	state_live_sqm="$token_dir/check-state-live-sqm.$$"
+	state_match_rc=1
+	if canonical_package "$state_directory" cake-autorate "$state_cake" &&
+	   canonical_live_package cake-autorate "$state_live_cake" &&
+	   canonical_package "$state_directory" sqm "$state_sqm" &&
+	   canonical_live_package sqm "$state_live_sqm" &&
+	   same_files "$state_cake" "$state_live_cake" &&
+	   same_files "$state_sqm" "$state_live_sqm"; then
+		state_match_rc=0
+	fi
+	rm -f "$state_cake" "$state_live_cake" "$state_sqm" "$state_live_sqm"
+	return "$state_match_rc"
+}
+
+verify_rollback() {
+	load_token "${1:-}"
+	original_cake="$token_dir/check-rollback-original-cake.$$"
+	live_cake="$token_dir/check-rollback-live-cake.$$"
+	original_sqm="$token_dir/check-rollback-original-sqm.$$"
+	live_sqm="$token_dir/check-rollback-live-sqm.$$"
+	canonical_package "$token_dir/original" cake-autorate "$original_cake"
+	canonical_live_package cake-autorate "$live_cake"
+	canonical_package "$token_dir/original" sqm "$original_sqm"
+	canonical_live_package sqm "$live_sqm"
+	if ! same_files "$original_cake" "$live_cake" ||
+	   ! same_files "$original_sqm" "$live_sqm"; then
+		rm -f "$original_cake" "$live_cake" "$original_sqm" "$live_sqm"
+		die "The rollback timer did not restore the exact pre-apply CAKE/SQM state."
+	fi
+	rm -f "$original_cake" "$live_cake" "$original_sqm" "$live_sqm"
+	sqm_guard="$(sqm_guard_section "$job")" || die "The SQM rollback marker identity is unsafe."
+	if uci -q get "sqm.$sqm_guard" >/dev/null 2>&1; then
+		die "The SQM rollback marker survived the UCI rollback."
+	fi
+	printf '{"state":"rolled-back","schema_version":1,"token":"%s"}\n' "$token"
+}
+
+postcheck() {
+	is_uint "$postcheck_wait_s" && [ "$postcheck_wait_s" -ge 1 ] && [ "$postcheck_wait_s" -le 30 ] ||
+		die "Invalid Full Auto-Tune postcheck wait bound."
+	requested_token="${1:-}"
+	load_token "$requested_token"
+	require_token_unexpired
+	[ "$(uci -q get "cake-autorate.$job._autotune_apply_token" 2>/dev/null)" = "$requested_token" ] ||
+		die "The requested postcheck token is not the live Full Auto-Tune token."
+	verify_marker "$job" post
+	expected_sqm="$token_dir/check-expected-sqm.$$"
+	live_sqm="$token_dir/check-live-sqm.$$"
+	canonical_package "$token_dir/expected" sqm "$expected_sqm"
+	sqm_attempt=0
+	while :; do
+		canonical_live_package sqm "$live_sqm"
+		same_files "$expected_sqm" "$live_sqm" && break
+		sqm_attempt=$((sqm_attempt + 1))
+		[ "$sqm_attempt" -lt "$postcheck_wait_s" ] || break
+		sleep 1
+	done
+	if ! same_files "$expected_sqm" "$live_sqm"; then
+		rm -f "$expected_sqm" "$live_sqm"
+		die "The managed SQM package differs from the exact Full Auto-Tune manifest."
+	fi
+	rm -f "$expected_sqm" "$live_sqm"
+	enabled="$(meta_get enabled "$token_dir")"
+	if [ "$enabled" = 1 ]; then
+		runtime_attempt=0
+		while ! pgrep -f "^$daemon_bin --instance $job\$" >/dev/null 2>&1; do
+			runtime_attempt=$((runtime_attempt + 1))
+			[ "$runtime_attempt" -lt 5 ] || die "The validated autorate instance did not start."
+			sleep 1
+		done
+		resolved="$(json_get "$result_copy" '@.resolved_interface')"
+		dl_if="$(uci -q get "cake-autorate.$job.dl_if" 2>/dev/null)"
+		safe_interface "$resolved" && safe_interface "$dl_if" || die "The validated SQM runtime interfaces are invalid."
+		[ -n "$tc_bin" ] && [ -x "$tc_bin" ] || die "tc is unavailable for the managed SQM runtime check."
+		[ -d "$sys_class_net/$resolved" ] && [ -d "$sys_class_net/$dl_if" ] ||
+			die "The validated SQM interfaces are not present after restart."
+		"$tc_bin" qdisc show dev "$resolved" 2>/dev/null | grep -Eq '^qdisc cake | qdisc cake ' ||
+			die "The validated upload CAKE qdisc is not active after restart."
+		"$tc_bin" qdisc show dev "$dl_if" 2>/dev/null | grep -Eq '^qdisc cake | qdisc cake ' ||
+			die "The validated download CAKE qdisc is not active after restart."
+		expected_ul="$(json_get "$result_copy" '@.proposal.upload.base_kbps')"
+		expected_dl="$(json_get "$result_copy" '@.proposal.download.base_kbps')"
+		[ "$(cake_root_bandwidth_kbps "$resolved")" = "$expected_ul" ] ||
+			die "The active upload CAKE bandwidth does not match the validated manifest."
+		[ "$(cake_root_bandwidth_kbps "$dl_if")" = "$expected_dl" ] ||
+			die "The active download CAKE bandwidth does not match the validated manifest."
+		"$tc_bin" qdisc show dev "$resolved" 2>/dev/null | grep -Eq '^qdisc ingress | qdisc ingress ' ||
+			die "The validated ingress qdisc is not active after restart."
+		"$tc_bin" filter show dev "$resolved" parent ffff: 2>/dev/null |
+			grep -Ei "mirred.*redirect.*(dev|device) $dl_if([^A-Za-z0-9_.:@-]|$)" >/dev/null ||
+			die "The validated ingress redirect does not target the expected IFB."
+		current_daemon_identity="$(daemon_identity "$job")" || die "Unable to identify the validated daemon generation."
+		original_daemon_identity="$(meta_get original_daemon_identity "$token_dir")"
+		[ "$current_daemon_identity" != none ] || die "The validated autorate daemon generation is missing."
+		[ "$(daemon_identity_count "$current_daemon_identity")" -eq 1 ] ||
+			die "The validated autorate instance has multiple daemon generations."
+		! daemon_identities_intersect "$current_daemon_identity" "$original_daemon_identity" ||
+			die "The postcheck observed a stale pre-apply daemon generation."
+	else
+		if pgrep -f "^$daemon_bin --instance $job\$" >/dev/null 2>&1; then
+			die "A disabled Full Auto-Tune instance unexpectedly started."
+		fi
+		[ -n "$tc_bin" ] && [ -x "$tc_bin" ] || die "tc is unavailable for the disabled SQM runtime check."
+		resolved="$(json_get "$result_copy" '@.resolved_interface')"
+		dl_if="$(uci -q get "cake-autorate.$job.dl_if" 2>/dev/null)"
+		safe_interface "$resolved" && safe_interface "$dl_if" || die "The disabled SQM runtime interfaces are invalid."
+		if "$tc_bin" qdisc show dev "$resolved" 2>/dev/null | grep -Eq '^qdisc cake | qdisc cake '; then
+			die "A disabled Full Auto-Tune instance left an upload CAKE qdisc active."
+		fi
+		if "$tc_bin" qdisc show dev "$dl_if" 2>/dev/null | grep -Eq '^qdisc cake | qdisc cake '; then
+			die "A disabled Full Auto-Tune instance left a download CAKE qdisc active."
+		fi
+	fi
+	: > "$token_dir/postverified"
+	chmod 600 "$token_dir/postverified"
+	owned_regular "$token_dir/postverified" || die "Unable to record the post-apply verification."
+	printf '{"state":"verified","schema_version":1,"token":"%s"}\n' "$token"
+}
+
+prepare_confirm() {
+	requested_token="${1:-}"
+	load_token "$requested_token"
+	owned_regular "$token_dir/postverified" || die "The Full Auto-Tune transaction was not post-verified."
+	sqm_guard="$(sqm_guard_section "$job")" || die "The SQM rollback marker identity is unsafe."
+	if owned_regular "$token_dir/prepared"; then
+		! token_live_referenced "$token" || die "A prepared transaction unexpectedly regained a live token marker."
+		snapshot_state_matches "$token_dir/expected-final" || die "The prepared Full Auto-Tune terminal state changed."
+		printf '{"state":"prepared","schema_version":1,"token":"%s"}\n' "$token"
+		return 0
+	fi
+	[ "$(uci -q get "cake-autorate.$job._autotune_apply_token" 2>/dev/null)" = "$requested_token" ] ||
+		die "The requested prepare-confirm token is not the live CAKE marker token."
+	[ "$(uci -q get "sqm.$sqm_guard._autotune_apply_token" 2>/dev/null)" = "$requested_token" ] ||
+		die "The requested prepare-confirm token is not the live SQM marker token."
+	verify_marker "$job" post 1
+	snapshot_state_matches "$token_dir/expected" || die "The post-verified configuration changed before prepare-confirm."
+
+	# Remove the enrollment marker first and the CAKE marker last. Both commits
+	# remain covered by rpcd's already armed rollback snapshot.
+	live_uci_transaction -q delete "sqm.$sqm_guard" || die "Unable to remove the prepared SQM rollback marker."
+	live_uci_transaction -q commit sqm || die "Unable to commit prepared SQM marker cleanup."
+	for option in _autotune_apply_guard _autotune_apply_fingerprint _autotune_apply_target \
+		_autotune_apply_backend _autotune_apply_route_mode _autotune_apply_mwan3_member \
+		_autotune_apply_enabled _autotune_apply_disable_adaptive _autotune_apply_token \
+		_autotune_apply_expires; do
+		if uci -q get "cake-autorate.$job.$option" >/dev/null 2>&1; then
+			live_uci_transaction -q delete "cake-autorate.$job.$option" ||
+				die "Unable to remove a prepared Full Auto-Tune marker option."
+		fi
+	done
+	live_uci_transaction -q commit cake-autorate || die "Unable to commit prepared CAKE marker cleanup."
+	! token_live_referenced "$token" || die "A live token reference survived prepare-confirm."
+	snapshot_state_matches "$token_dir/expected-final" || die "The marker-free Full Auto-Tune terminal manifest was not materialized exactly."
+	: > "$token_dir/prepared"
+	chmod 600 "$token_dir/prepared"
+	owned_regular "$token_dir/prepared" || die "Unable to record the prepared Full Auto-Tune transaction."
+	printf '{"state":"prepared","schema_version":1,"token":"%s"}\n' "$token"
+}
+
+reconcile() {
+	load_token "${1:-}"
+	owned_regular "$token_dir/prepared" || die "The Full Auto-Tune transaction was never prepared for confirmation."
+	if snapshot_state_matches "$token_dir/original"; then
+		printf '{"state":"rolled-back","schema_version":1,"token":"%s"}\n' "$token"
+		return 0
+	fi
+	if snapshot_state_matches "$token_dir/expected-final"; then
+		printf '{"state":"confirmed","schema_version":1,"token":"%s"}\n' "$token"
+		return 0
+	fi
+	die "Neither exact rollback nor exact prepared-final state can be proven."
+}
+
+cleanup_token_dir() {
+	cleanup_dir="$1"
+	case "$cleanup_dir" in "$guard_root"/*) ;; *) return 1 ;; esac
+	[ -d "$cleanup_dir" ] && [ ! -L "$cleanup_dir" ] || return 1
+	runtime_lock_path_owned_by_euid "$cleanup_dir" || return 1
+	find "$cleanup_dir" -type f -exec rm -f {} \; 2>/dev/null || return 1
+	find "$cleanup_dir" -depth -type d -exec rmdir {} \; 2>/dev/null || return 1
+}
+
+finalize() {
+	load_token "${1:-}"
+	owned_regular "$token_dir/postverified" && owned_regular "$token_dir/prepared" ||
+		die "The Full Auto-Tune transaction was not prepared for confirmation."
+	sqm_guard="$(sqm_guard_section "$job")" || die "The SQM rollback marker identity is unsafe."
+	! token_live_referenced "$token" || die "A prepared Full Auto-Tune token is still referenced by persistent configuration."
+	if uci -q show "cake-autorate.$job" 2>/dev/null | grep -q "^cake-autorate\.$job\._autotune_apply_" ||
+	   uci -q get "sqm.$sqm_guard" >/dev/null 2>&1; then
+		die "A persistent Full Auto-Tune marker survived prepare-confirm."
+	fi
+	snapshot_state_matches "$token_dir/expected-final" || die "The confirmed Full Auto-Tune terminal state changed before finalize."
+	enabled="$(meta_get enabled "$token_dir")"
+	if [ "$enabled" = 1 ]; then
+		[ -x "$sqm_init" ] || die "The SQM service cannot be enabled persistently after confirmation."
+		"$sqm_init" enable >/dev/null 2>&1 || die "Unable to enable the confirmed SQM service persistently."
+		"$sqm_init" enabled >/dev/null 2>&1 || die "The confirmed SQM service is not enabled persistently."
+	fi
+	cleanup_token_dir "$token_dir" || die "Unable to remove the completed Full Auto-Tune apply token."
+	printf '{"state":"finalized","schema_version":1}\n'
+}
+
+abort_guard() {
+	token="${1:-}"
+	safe_token "$token" || die "Invalid Full Auto-Tune apply token."
+	prepare_root
+	token_dir="$guard_root/$token"
+	token_live_referenced "$token" && die "Refusing to abort a Full Auto-Tune token referenced by live configuration."
+	if [ -d "$token_dir" ] && [ ! -L "$token_dir" ]; then
+		runtime_lock_path_owned_by_euid "$token_dir" || die "Refusing to remove a foreign Full Auto-Tune token."
+		if owned_regular "$token_dir/postverified" || owned_regular "$token_dir/prepared"; then
+			load_token "$token"
+			snapshot_state_matches "$token_dir/original" ||
+				die "Refusing to abort post-verified state before exact rollback is proven."
+		fi
+		cleanup_token_dir "$token_dir" || die "Unable to invalidate the Full Auto-Tune token."
+	fi
+	printf '{"state":"aborted","schema_version":1}\n'
+}
+
+case "$mode" in
+	arm) arm_guard "$@" ;;
+	verify-init) verify_init ;;
+	verify-rollback) verify_rollback "$@" ;;
+	postcheck) postcheck "$@" ;;
+	prepare-confirm) prepare_confirm "$@" ;;
+	reconcile) reconcile "$@" ;;
+	finalize) finalize "$@" ;;
+	abort) abort_guard "$@" ;;
+	*) die "Unsupported Full Auto-Tune apply-guard operation." ;;
+esac

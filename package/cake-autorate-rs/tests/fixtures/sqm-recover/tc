@@ -1,14 +1,43 @@
 #!/bin/sh
 
-case "$1 $2 $3 $4 $5 $6" in
-	"qdisc show dev ifb4eth0  ")
-		[ -f "$CAKE_TEST_ROOT/healthy" ] && printf 'qdisc cake 8001: root bandwidth 100Mbit\n'
-		;;
-	"qdisc show dev eth0  ")
-		[ -f "$CAKE_TEST_ROOT/healthy" ] && printf 'qdisc cake 8002: root bandwidth 20Mbit\n'
-		;;
-	"filter show dev eth0 ingress ")
-		[ -f "$CAKE_TEST_ROOT/healthy" ] && printf 'action order 1: mirred (Egress Redirect to device ifb4eth0)\n'
-		;;
-	*) exit 1 ;;
-esac
+mode=""
+[ ! -f "$CAKE_TEST_ROOT/tc-mode" ] || mode="$(sed -n '1p' "$CAKE_TEST_ROOT/tc-mode")"
+[ -f "$CAKE_TEST_ROOT/healthy" ] || exit 0
+
+if [ "$1" = -details ]; then
+	shift
+fi
+
+if [ "$1" = qdisc ] && [ "$2" = show ] && [ "$3" = dev ]; then
+	[ "$mode" != qdisc-read-fail ] || exit 1
+	case "$4:$mode" in
+		ifb4eth0:dl-child-cake) printf 'qdisc cake 8001: parent 1:1 bandwidth 100Mbit\n' ;;
+		eth0:ul-child-cake) printf 'qdisc cake 8002: parent 1:1 bandwidth 20Mbit\n' ;;
+		ifb4eth0:wrong-bandwidth) printf 'qdisc cake 8001: root bandwidth 333Mbit besteffort triple-isolate nat wash no-ack-filter split-gso rtt 100ms raw overhead 0\n' ;;
+		eth0:wrong-bandwidth) printf 'qdisc cake 8002: root bandwidth 444Mbit besteffort triple-isolate nat nowash no-ack-filter split-gso rtt 100ms raw overhead 0\nqdisc ingress ffff: parent ffff:fff1\n' ;;
+		ifb4eth0:wrong-options) printf 'qdisc cake 8001: root bandwidth 100Mbit diffserv3 triple-isolate nonat nowash no-ack-filter split-gso rtt 100ms raw overhead 0\n' ;;
+		eth0:wrong-options) printf 'qdisc cake 8002: root bandwidth 20Mbit diffserv3 triple-isolate nonat wash no-ack-filter split-gso rtt 100ms raw overhead 0\nqdisc ingress ffff: parent ffff:fff1\n' ;;
+		ifb4eth0:bad-handle) printf 'qdisc cake 0: root bandwidth 100Mbit besteffort triple-isolate nat wash no-ack-filter split-gso rtt 100ms raw overhead 0\n' ;;
+		eth0:bad-handle) printf 'qdisc cake nope: root bandwidth 20Mbit besteffort triple-isolate nat nowash no-ack-filter split-gso rtt 100ms raw overhead 0\nqdisc ingress ffff: parent ffff:fff1\n' ;;
+		ifb4eth0:wrong-linklayer) printf 'qdisc cake 8001: root bandwidth 100Mbit besteffort triple-isolate nat wash no-ack-filter split-gso rtt 100ms noatm overhead 44 mpu 84\n' ;;
+		eth0:wrong-linklayer) printf 'qdisc cake 8002: root bandwidth 20Mbit besteffort triple-isolate nat nowash no-ack-filter split-gso rtt 100ms noatm overhead 44 mpu 84\nqdisc ingress ffff: parent ffff:fff1\n' ;;
+		ifb4eth0:*) printf 'qdisc cake 8001: root bandwidth 100Mbit besteffort triple-isolate nat wash no-ack-filter split-gso rtt 100ms raw overhead 0\n' ;;
+		eth0:missing-ingress) printf 'qdisc cake 8002: root bandwidth 20Mbit besteffort triple-isolate nat nowash no-ack-filter split-gso rtt 100ms raw overhead 0\n' ;;
+		eth0:*) printf 'qdisc cake 8002: root bandwidth 20Mbit besteffort triple-isolate nat nowash no-ack-filter split-gso rtt 100ms raw overhead 0\nqdisc ingress ffff: parent ffff:fff1\n' ;;
+		*) exit 1 ;;
+	esac
+	exit 0
+fi
+
+if [ "$1" = filter ] && [ "$2" = show ] && [ "$3" = dev ] &&
+   [ "$4" = eth0 ] && [ "$5" = ingress ]; then
+	[ "$mode" != filter-read-fail ] || exit 1
+	if [ "$mode" = wrong-redirect ]; then
+		printf 'action order 1: mirred (Egress Redirect to device ifb4eth00)\n'
+	else
+		printf 'action order 1: mirred (Egress Redirect to device ifb4eth0)\n'
+	fi
+	exit 0
+fi
+
+exit 1

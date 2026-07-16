@@ -1,0 +1,7 @@
+#!/bin/sh
+
+printf 'ip %s\n' "$*" >> "$CAKE_RECOVER_TEST_ROOT/actions"
+if [ "${1:-} ${2:-}" = "link delete" ]; then
+	rm -rf "$CAKE_AUTORATE_RECOVER_SYS_CLASS_NET/${4:-}" 2>/dev/null || true
+fi
+exit 0

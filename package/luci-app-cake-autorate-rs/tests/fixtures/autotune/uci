@@ -1,0 +1,46 @@
+#!/bin/sh
+
+[ "${1:-}" = -q ] && shift
+action="${1:-}"
+key="${2:-}"
+
+case "$action:$key" in
+	get:cake-autorate.*.sqm_section)
+		[ "${AUTOTUNE_MOCK_UCI_ABSENT:-0}" != 1 ] || exit 1
+		instance="${key#cake-autorate.}"
+		instance="${instance%.sqm_section}"
+		printf 'cake_%s\n' "$instance"
+		;;
+	get:sqm.cake_*._cake_autorate_managed)
+		[ "${AUTOTUNE_MOCK_UCI_ABSENT:-0}" != 1 ] || exit 1
+		instance="${key#sqm.cake_}"
+		instance="${instance%._cake_autorate_managed}"
+		if [ "${AUTOTUNE_MOCK_UCI_MISOWNED:-0}" = 1 ]; then
+			printf '%s\n' foreign
+		else
+			printf '%s\n' "$instance"
+		fi
+		;;
+	show:cake-autorate.*)
+		[ "${AUTOTUNE_MOCK_UCI_ABSENT:-0}" != 1 ] || exit 1
+		instance="${key#cake-autorate.}"
+		case "$instance" in *.*|'') exit 1 ;; esac
+		printf "cake-autorate.%s=cake_autorate\n" "$instance"
+		printf "cake-autorate.%s.sqm_section='cake_%s'\n" "$instance" "$instance"
+		printf "cake-autorate.%s.test_revision='%s'\n" "$instance" "${AUTOTUNE_MOCK_UCI_REVISION:-0}"
+		;;
+	show:sqm.cake_*)
+		if [ "${AUTOTUNE_MOCK_UCI_ABSENT:-0}" = 1 ] &&
+		   [ "${AUTOTUNE_MOCK_UCI_FOREIGN_SQM:-0}" != 1 ]; then
+			exit 1
+		fi
+		instance="${key#sqm.cake_}"
+		case "$instance" in *.*|'') exit 1 ;; esac
+		printf "sqm.cake_%s=queue\n" "$instance"
+		printf "sqm.cake_%s._cake_autorate_managed='%s'\n" "$instance" "$instance"
+		printf "sqm.cake_%s.interface='lo'\n" "$instance"
+		;;
+	*)
+		exit 1
+		;;
+esac

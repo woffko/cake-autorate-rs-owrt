@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+
+[ "$3" = route-status ] || exit 1
+printf '{"state":"ready","schema_version":1,"target_interface":"%s","resolved_interface":"pppoe-wan","route_interface":"pppoe-wan","route_mode":"main","mwan3_member":"","source_ip":"%s","external_ip":"%s","route_identity":"%s"}\n' \
+	"$2" "${APPLY_GUARD_SOURCE_IP:-192.0.2.10}" "${APPLY_GUARD_EXTERNAL_IP:-192.0.2.20}" \
+	"${APPLY_GUARD_ROUTE_IDENTITY:-main||pppoe-wan|192.0.2.10||main}"

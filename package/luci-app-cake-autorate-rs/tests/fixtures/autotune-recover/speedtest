@@ -1,0 +1,7 @@
+#!/bin/sh
+
+sleep 300 &
+child="$!"
+[ -z "${AUTOTUNE_RECOVER_SPEEDTEST_CHILD_PID_FILE:-}" ] ||
+	printf '%s\n' "$child" > "$AUTOTUNE_RECOVER_SPEEDTEST_CHILD_PID_FILE"
+wait "$child"

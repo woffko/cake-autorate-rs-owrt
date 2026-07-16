@@ -1,0 +1,87 @@
+#!/bin/sh
+set -eu
+
+directory="${CAKE_AUTORATE_CONFIG_DIR:?}"
+while :; do
+	case "${1:-}" in
+		-c) directory="$2"; shift 2 ;;
+		-P|-p|-t) shift 2 ;;
+		*) break ;;
+	esac
+done
+[ "${1:-}" = -q ] && shift
+action="${1:-}"
+argument="${2:-}"
+config="${argument%%.*}"
+if [ "$config" = "$argument" ]; then
+	rest=""; section=""; option=""
+else
+	rest="${argument#*.}"
+	section="${rest%%.*}"
+	option="${rest#*.}"
+	[ "$option" != "$rest" ] || option=""
+fi
+file="$directory/$config"
+mkdir -p "$directory"
+[ -e "$file" ] || : > "$file"
+
+rewrite_without() {
+	awk -F '|' -v section="$section" -v option="$option" '
+		!($1 == section && (option == "" || $2 == option)) { print }
+	' "$file" > "$file.tmp.$$"
+	mv "$file.tmp.$$" "$file"
+}
+
+case "$action" in
+	get)
+		if [ -n "$option" ]; then
+			awk -F '|' -v section="$section" -v option="$option" '
+				$1 == section && $2 == option { if (seen++) printf " "; printf "%s", substr($0, index($0, "|") + 1 + length(option) + 1) }
+				END { if (seen) print ""; else exit 1 }
+			' "$file"
+		else
+			awk -F '|' -v section="$section" '$1 == section && $2 == "__type" { print $3; found=1 } END { if (!found) exit 1 }' "$file"
+		fi
+		;;
+	show)
+		awk -F '|' -v config="$config" -v section="$section" '
+			(section == "" || $1 == section) {
+				value = substr($0, index($0, "|") + 1 + length($2) + 1)
+				key = $1 SUBSEP $2
+				if (!(key in seen)) { order[++count] = key; names[key] = $1; options[key] = $2; seen[key] = 1 }
+				if ($2 == "__type") values[key] = value
+				else values[key] = values[key] (values[key] == "" ? "" : " ") "\047" value "\047"
+			}
+			END {
+				if (!count) exit 1
+				for (i = 1; i <= count; i++) {
+					key = order[i]
+					if (options[key] == "__type") printf "%s.%s=%s\n", config, names[key], values[key]
+					else printf "%s.%s.%s=%s\n", config, names[key], options[key], values[key]
+				}
+			}
+		' "$file"
+		;;
+	set)
+		lhs="${argument%%=*}"
+		value="${argument#*=}"
+		config="${lhs%%.*}"; rest="${lhs#*.}"; section="${rest%%.*}"; option="${rest#*.}"
+		[ "$option" != "$rest" ] || option="__type"
+		file="$directory/$config"; [ -e "$file" ] || : > "$file"
+		rewrite_without
+		printf '%s|%s|%s\n' "$section" "$option" "$value" >> "$file"
+		;;
+	add_list)
+		lhs="${argument%%=*}"
+		value="${argument#*=}"
+		config="${lhs%%.*}"; rest="${lhs#*.}"; section="${rest%%.*}"; option="${rest#*.}"
+		file="$directory/$config"; [ -e "$file" ] || : > "$file"
+		printf '%s|%s|%s\n' "$section" "$option" "$value" >> "$file"
+		;;
+	delete)
+		rewrite_without
+		;;
+	commit)
+		;;
+	*) exit 1 ;;
+esac

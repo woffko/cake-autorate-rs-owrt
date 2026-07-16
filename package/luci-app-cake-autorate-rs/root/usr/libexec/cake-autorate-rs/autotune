@@ -1,24 +1,77 @@
 #!/bin/sh
 
-job_name="$1"
-target_if_input="$2"
+umask 077
+
+job_name="${1:-}"
+target_if_input="${2:-}"
 mode="${3:-status}"
 backend="${4:-auto}"
+backend_input="$backend"
 route_mode_override="${5:-}"
 mwan3_member_override="${6:-}"
 conservative_override="${7:-0}"
+worker_token="${8:-}"
+reflector_scan_cooldown_s="${CAKE_AUTORATE_REFLECTOR_SCAN_COOLDOWN_S:-5}"
+baseline_retry_backoff_s="${CAKE_AUTORATE_BASELINE_RETRY_BACKOFF_S:-20}"
+autotune_result_schema=3
+autotune_result_producer="cake-autorate-rs-autotune"
 
 job_root="${CAKE_AUTORATE_AUTOTUNE_DIR:-/tmp/cake-autorate-autotune}"
 speedtest_bin="${CAKE_AUTORATE_SPEEDTEST:-/usr/libexec/cake-autorate-rs/speedtest}"
 pinger_plan_bin="${CAKE_AUTORATE_PINGER_PLAN:-/usr/libexec/cake-autorate-rs/pinger-plan}"
 daemon_bin="${CAKE_AUTORATE_DAEMON:-/usr/sbin/cake-autorated}"
+transport_probe_bin="${CAKE_AUTORATE_TRANSPORT_PROBE:-$daemon_bin}"
+recovery_bin="${CAKE_AUTORATE_AUTOTUNE_RECOVER:-/usr/libexec/cake-autorate-rs/autotune-recover}"
+runtime_lock_lib="${CAKE_AUTORATE_RUNTIME_LOCK_LIB:-/usr/libexec/cake-autorate-rs/runtime-lock}"
+sqm_config_file="${CAKE_AUTORATE_SQM_CONFIG_FILE:-/etc/config/sqm}"
 jsonfilter_bin="${CAKE_AUTORATE_JSONFILTER:-$(command -v jsonfilter 2>/dev/null)}"
 fping_bin="${CAKE_AUTORATE_FPING:-$(command -v fping 2>/dev/null)}"
-http_fetch_bin="${CAKE_AUTORATE_HTTP_FETCH:-$(command -v uclient-fetch 2>/dev/null)}"
-http_probe_url="${CAKE_AUTORATE_HTTP_PROBE_URL:-https://speed.cloudflare.com/__down?bytes=0}"
+
+if [ -r "$runtime_lock_lib" ]; then
+	# shellcheck source=/usr/libexec/cake-autorate-rs/runtime-lock
+	. "$runtime_lock_lib"
+fi
 
 json_escape() {
 	printf '%s' "$1" | tr '\n\r\t' '   ' | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+strict_single_json_object() {
+	json_candidate="$1"
+	[ -n "$json_candidate" ] || return 1
+	[ "${#json_candidate}" -le 262144 ] 2>/dev/null || return 1
+	printf '%s\n' "$json_candidate" | awk '
+		NR > 1 { bad = 1; next }
+		NR == 1 {
+			for (i = 1; i <= length($0); i++) {
+				ch = substr($0, i, 1)
+				if (!started) {
+					if (ch ~ /[[:space:]]/) continue
+					if (ch != "{") { bad = 1; break }
+					started = 1; stack[++depth] = ch; continue
+				}
+				if (ended) {
+					if (ch !~ /[[:space:]]/) { bad = 1; break }
+					continue
+				}
+				if (in_string) {
+					if (escaped) { escaped = 0; continue }
+					if (ch == "\\") { escaped = 1; continue }
+					if (ch == "\"") in_string = 0
+					continue
+				}
+				if (ch == "\"") { in_string = 1; continue }
+				if (ch == "{" || ch == "[") { stack[++depth] = ch; continue }
+				if (ch == "}" || ch == "]") {
+					expected = (ch == "}" ? "{" : "[")
+					if (depth < 1 || stack[depth] != expected) { bad = 1; break }
+					delete stack[depth--]
+					if (depth == 0) ended = 1
+				}
+			}
+		}
+		END { exit(bad || !started || !ended || depth != 0 || in_string || escaped ? 1 : 0) }
+	'
 }
 
 json_error() {
@@ -45,28 +98,684 @@ is_positive_uint() {
 	[ "$1" -gt 0 ] 2>/dev/null
 }
 
+valid_reflector() {
+	# Keep this in sync with pinger-plan: reflector text is later expanded into
+	# individual fping argv entries, so option-like and glob-like tokens are not
+	# merely "bad hosts"; they are unsafe command arguments.
+	case "$1" in ''|-*|*[!0-9A-Za-z:.-]*) return 1 ;; esac
+	printf '%s\n' "$1" | awk '
+		function ipv4(value, parts, n, i) {
+			n = split(value, parts, ".")
+			if (n != 4) return 0
+			for (i = 1; i <= 4; i++)
+				if (parts[i] !~ /^[0-9]+$/ || parts[i] + 0 > 255 ||
+				    (length(parts[i]) > 1 && substr(parts[i], 1, 1) == "0")) return 0
+			return 1
+		}
+		function hostname(value, labels, n, i) {
+			if (length(value) > 253 || value ~ /^-/ || value ~ /-$/ || value ~ /\.\./) return 0
+			n = split(value, labels, ".")
+			for (i = 1; i <= n; i++)
+				if (length(labels[i]) < 1 || length(labels[i]) > 63 ||
+				    labels[i] !~ /^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$/) return 0
+			return 1
+		}
+		function ipv6(value, groups, n, i, compressed, count, scan, pos, compressions) {
+			if (value !~ /^[0-9A-Fa-f:.]+$/ || value ~ /:::/) return 0
+			scan = value
+			while ((pos = index(scan, "::")) > 0) { compressions++; scan = substr(scan, pos + 2) }
+			if (compressions > 1) return 0
+			compressed = compressions == 1
+			n = split(value, groups, ":")
+			count = 0
+			for (i = 1; i <= n; i++) {
+				if (groups[i] == "") continue
+				if (index(groups[i], ".") > 0) {
+					if (i != n || !ipv4(groups[i])) return 0
+					count += 2
+				} else {
+					if (groups[i] !~ /^[0-9A-Fa-f]+$/ || length(groups[i]) > 4) return 0
+					count++
+				}
+			}
+			return compressed ? count < 8 : count == 8
+		}
+		{
+			value = $0
+			# The shell allow-list above already excludes whitespace, glob and
+			# pathname metacharacters.  A repeated bracket expression containing
+			# literal braces is not portable to BusyBox awk on OpenWrt.
+			if (value == "" || substr(value, 1, 1) == "-") exit 1
+			if (index(value, ":") > 0) exit(ipv6(value) ? 0 : 1)
+			if (value ~ /^[0-9.]+$/) exit(ipv4(value) ? 0 : 1)
+			exit(hostname(value) ? 0 : 1)
+		}
+	'
+}
+
+reflector_family() {
+	case "$1" in
+		1.1.1.1|1.0.0.1) printf '%s' cloudflare ;;
+		8.8.8.8|8.8.4.4) printf '%s' google ;;
+		9.9.9.*) printf '%s' quad9 ;;
+		94.140.*) printf '%s' adguard ;;
+		64.6.*) printf '%s' verisign ;;
+		156.154.*) printf '%s' ultradns ;;
+		208.67.*) printf '%s' opendns ;;
+		185.228.*) printf '%s' cleanbrowsing ;;
+		*.*.*.*)
+			printf '%s\n' "$1" | awk -F . '{ print "ipv4-" $1 "." $2 "." $3 }'
+			;;
+		*) printf '%s' "$1" ;;
+	esac
+}
+
+select_diverse_reflectors() {
+	selected=""
+	families=""
+	reflector_family_count=0
+	for candidate in "$@"; do
+		[ -n "$candidate" ] || continue
+		valid_reflector "$candidate" || continue
+		family="$(reflector_family "$candidate")"
+		case " $families " in
+			*" $family "*) continue ;;
+		esac
+		selected="${selected}${selected:+ }$candidate"
+		families="${families}${families:+ }$family"
+		reflector_family_count=$((reflector_family_count + 1))
+		[ "$reflector_family_count" -ge 3 ] && break
+	done
+	printf '%s\n' "$selected"
+}
+
+reflectors_json_array() {
+	reflector_json_first=1
+	printf '['
+	for reflector_json_value in "$@"; do
+		valid_reflector "$reflector_json_value" || return 1
+		[ "$reflector_json_first" = 1 ] || printf ','
+		printf '"%s"' "$(json_escape "$reflector_json_value")"
+		reflector_json_first=0
+	done
+	printf ']'
+}
+
+valid_irtt_target() {
+	valid_reflector "$1" && return 0
+	case "$1" in ''|*://*) return 1 ;; esac
+	printf '%s' "$1" | grep -Eq '^\[[0-9A-Fa-f:.]+\](:[0-9]+)?$'
+}
+
+pinger_targets_json_array() {
+	pinger_json_method="$1"
+	shift
+	pinger_json_first=1
+	pinger_json_count=0
+	printf '['
+	for pinger_json_value in "$@"; do
+		case "$pinger_json_method" in
+			irtt) valid_irtt_target "$pinger_json_value" || return 1 ;;
+			fping|fping-ts|tsping|ping) valid_reflector "$pinger_json_value" || return 1 ;;
+			*) return 1 ;;
+		esac
+		pinger_json_count=$((pinger_json_count + 1))
+		[ "$pinger_json_count" -le 64 ] || return 1
+		[ "$pinger_json_first" = 1 ] || printf ','
+		printf '"%s"' "$(json_escape "$pinger_json_value")"
+		pinger_json_first=0
+	done
+	printf ']'
+}
+
 job_paths() {
 	job_dir="$job_root/$job_name"
 	pid_file="$job_dir/pid"
 	status_file="$job_dir/status.json"
 	result_file="$job_dir/result.json"
 	error_file="$job_dir/error.json"
+	pending_result_file="$job_dir/result.pending.json"
+	pending_error_file="$job_dir/error.pending.json"
 	cancel_file="$job_dir/cancelled"
 	log_file="$job_dir/job.log"
+}
+
+secure_ram_directory() {
+	secure_dir="$1"
+	command -v runtime_lock_ram_path >/dev/null 2>&1 &&
+		command -v runtime_lock_path_owned_by_euid >/dev/null 2>&1 || return 1
+	runtime_lock_ram_path "$secure_dir" || return 1
+	[ ! -L "$secure_dir" ] || return 1
+	if [ ! -e "$secure_dir" ]; then
+		mkdir "$secure_dir" 2>/dev/null || return 1
+	fi
+	[ -d "$secure_dir" ] && [ ! -L "$secure_dir" ] || return 1
+	runtime_lock_path_owned_by_euid "$secure_dir" || return 1
+	chmod 700 "$secure_dir" 2>/dev/null || return 1
+}
+
+prepare_job_storage() {
+	secure_ram_directory "$job_root" || return 1
+	secure_ram_directory "$job_dir"
+}
+
+owned_regular_file() {
+	[ -f "$1" ] && [ ! -L "$1" ] || return 1
+	runtime_lock_path_owned_by_euid "$1"
+}
+
+proc_stat_field() {
+	proc_pid="$1"
+	proc_field="$2"
+	[ -r "/proc/$proc_pid/stat" ] || return 1
+	# Fields after the final ") " start at the kernel's field 3.  Parsing the
+	# tail avoids breaking on a command name containing spaces or parentheses.
+	sed -n '1{s/^[0-9][0-9]* (.*) //;p;}' "/proc/$proc_pid/stat" 2>/dev/null |
+		awk -v field="$proc_field" '{ print $field; exit }'
+}
+
+proc_starttime() {
+	# Kernel field 22 is tail field 20 after stripping pid/comm.
+	proc_stat_field "$1" 20
+}
+
+proc_state() {
+	# Kernel field 3 is tail field 1.
+	proc_stat_field "$1" 1
+}
+
+proc_group() {
+	# Kernel field 5 is tail field 3.
+	proc_stat_field "$1" 3
+}
+
+proc_session() {
+	# Kernel field 6 is tail field 4.
+	proc_stat_field "$1" 4
+}
+
+proc_cmdline_has_arg() {
+	proc_pid="$1"
+	expected_arg="$2"
+	[ -r "/proc/$proc_pid/cmdline" ] || return 1
+	cmdline_args="$(cat "/proc/$proc_pid/cmdline" 2>/dev/null | tr '\000' '\n')"
+	[ -n "$cmdline_args" ] || return 1
+	printf '%s\n' "$cmdline_args" | grep -F -x -- "$expected_arg" >/dev/null 2>&1
+}
+
+read_worker_identity() {
+	identity_pid=""
+	identity_starttime=""
+	identity_token=""
+	identity_target=""
+	identity_backend=""
+	identity_route_mode=""
+	identity_mwan3_member=""
+	identity_conservative=""
+	owned_regular_file "$pid_file" || return 1
+	identity_pid="$(sed -n '1p' "$pid_file" 2>/dev/null)"
+	identity_starttime="$(sed -n '2p' "$pid_file" 2>/dev/null)"
+	identity_token="$(sed -n '3p' "$pid_file" 2>/dev/null)"
+	identity_target="$(sed -n '4p' "$pid_file" 2>/dev/null)"
+	identity_backend="$(sed -n '5p' "$pid_file" 2>/dev/null)"
+	identity_route_mode="$(sed -n '6p' "$pid_file" 2>/dev/null)"
+	identity_mwan3_member="$(sed -n '7p' "$pid_file" 2>/dev/null)"
+	identity_conservative="$(sed -n '8p' "$pid_file" 2>/dev/null)"
+}
+
+worker_identity_matches() {
+	read_worker_identity
+	is_positive_uint "$identity_pid" || return 1
+	is_positive_uint "$identity_starttime" || return 1
+	case "$identity_token" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac
+	[ "$(proc_starttime "$identity_pid")" = "$identity_starttime" ] || return 1
+	[ "$(proc_group "$identity_pid")" = "$identity_pid" ] || return 1
+	[ "$(proc_session "$identity_pid")" = "$identity_pid" ] || return 1
+	proc_cmdline_has_arg "$identity_pid" job-run || return 1
+	proc_cmdline_has_arg "$identity_pid" "$identity_token" || return 1
+	return 0
+}
+
+worker_request_matches() {
+	expected_conservative="${1:-0}"
+	# worker_identity_matches() has already read and authenticated one complete
+	# identity snapshot at both call sites.  Re-reading pid_file here creates a
+	# completion race: the verified owner may remove its identity between the
+	# two reads, turning an ordinary terminal transition into a false request
+	# mismatch.  Compare the authenticated snapshot instead.
+	[ "$identity_target" = "$target_if_input" ] &&
+		[ "$identity_backend" = "$backend_input" ] &&
+		[ "$identity_route_mode" = "$route_mode_override" ] &&
+		[ "$identity_mwan3_member" = "$mwan3_member_override" ] || return 1
+	[ "$expected_conservative" = any ] || [ "$identity_conservative" = "$expected_conservative" ]
+}
+
+remove_own_worker_identity() {
+	[ -s "$pid_file" ] || return 0
+	read_worker_identity
+	if [ "$identity_pid" = "$$" ] && [ -n "${worker_token:-}" ] &&
+	   [ "$identity_token" = "$worker_token" ]; then
+		rm -f "$pid_file"
+	fi
+}
+
+new_worker_token() {
+	token="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+	case "$token" in
+		''|*[!A-Fa-f0-9]*) token="$(awk '{ gsub(/[.]/, "", $1); print $1 }' /proc/uptime 2>/dev/null)-$$" ;;
+	esac
+	printf '%s\n' "$token"
 }
 
 atomic_write() {
 	file="$1"
 	tmp="$file.$$"
 	shift
-	printf '%s\n' "$*" > "$tmp" && mv "$tmp" "$file"
+	[ ! -L "$file" ] || return 1
+	[ ! -e "$tmp" ] && [ ! -L "$tmp" ] || return 1
+	printf '%s\n' "$*" > "$tmp" &&
+		owned_regular_file "$tmp" && chmod 600 "$tmp" 2>/dev/null &&
+		mv "$tmp" "$file" && owned_regular_file "$file"
+}
+
+configure_recovery_paths() {
+	case "$worker_token" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac
+	recovery_owner_starttime="$(proc_starttime "$$" 2>/dev/null)"
+	is_positive_uint "$recovery_owner_starttime" || return 1
+	recovery_root="$job_root/recovery"
+	recovery_stem="${job_name}_${worker_token}"
+	recovery_journal="$recovery_root/$recovery_stem.journal"
+	recovery_done_marker="$recovery_root/$recovery_stem.done"
+	recovery_heartbeat="$recovery_root/$recovery_stem.armed"
+}
+
+write_recovery_journal() {
+	[ "${recovery_prepared:-0}" = 1 ] || return 0
+	tmp="$recovery_journal.tmp.$$"
+	{
+		printf 'journal_version=4\n'
+		printf 'job=%s\n' "$job_name"
+		printf 'section=%s\n' "$job_name"
+		printf 'owner_pid=%s\n' "$$"
+		printf 'owner_pgid=%s\n' "$$"
+		printf 'proc_starttime=%s\n' "$recovery_owner_starttime"
+		printf 'target_if=%s\n' "$target_if"
+		printf 'temp_ifb=%s\n' "${recovery_temp_ifb:-}"
+		printf 'temp_ifb_alias=%s\n' "${recovery_temp_ifb_alias:-}"
+		printf 'temp_ifb_ifindex=%s\n' "${recovery_temp_ifb_ifindex:-}"
+		printf 'temp_target_handle=%s\n' "${recovery_temp_target_handle:-}"
+		printf 'temp_ifb_handle=%s\n' "${recovery_temp_ifb_handle:-}"
+		printf 'temp_ingress_handle=%s\n' "${recovery_temp_ingress_handle:-}"
+		printf 'temp_redirect_pref=%s\n' "${recovery_temp_redirect_pref:-}"
+		printf 'shaper_started=%s\n' "${recovery_shaper_started:-0}"
+		printf 'sqm_was_active=%s\n' "${recovery_sqm_was_active:-0}"
+		printf 'sqm_restore_mode=%s\n' "${recovery_sqm_restore_mode:-none}"
+		printf 'sqm_section=%s\n' "${recovery_sqm_section:-}"
+		printf 'sqm_target_if=%s\n' "${recovery_sqm_target_if:-}"
+		printf 'sqm_ul_if=%s\n' "${recovery_sqm_ul_if:-}"
+		printf 'sqm_dl_if=%s\n' "${recovery_sqm_dl_if:-}"
+		printf 'sqm_config_fingerprint=%s\n' "${recovery_sqm_config_fingerprint:-}"
+		printf 'sqm_config_snapshot=%s\n' "${recovery_sqm_config_snapshot:-}"
+		printf 'sqm_restore_required=%s\n' "${recovery_sqm_restore_required:-0}"
+		printf 'autorate_pid=%s\n' "${recovery_autorate_pid:-}"
+		printf 'autorate_starttime=%s\n' "${recovery_autorate_starttime:-}"
+		printf 'active_test_pgid=%s\n' "${recovery_active_test_pgid:-}"
+		printf 'active_test_starttime=%s\n' "${recovery_active_test_starttime:-}"
+		printf 'nft_table=%s\n' "${recovery_nft_table:-}"
+		printf 'interface_lock=%s\n' "$autotune_interface_lock"
+		printf 'interface_lock_token=%s\n' "$worker_token"
+		printf 'done_marker=%s\n' "$recovery_done_marker"
+		printf 'error_file=%s\n' "$error_file"
+		printf 'result_file=%s\n' "$result_file"
+		printf 'status_file=%s\n' "$status_file"
+		printf 'pending_result_file=%s\n' "$pending_result_file"
+		printf 'pending_error_file=%s\n' "$pending_error_file"
+		printf 'heartbeat_file=%s\n' "$recovery_heartbeat"
+	} > "$tmp" && owned_regular_file "$tmp" && chmod 600 "$tmp" 2>/dev/null &&
+		mv "$tmp" "$recovery_journal" && owned_regular_file "$recovery_journal"
+}
+
+managed_sqm_config_fingerprint() {
+	fingerprint_section="$1"
+	safe_job_name "$fingerprint_section" || return 1
+	command -v sha256sum >/dev/null 2>&1 || return 1
+	fingerprint_raw="$(uci -q show "sqm.$fingerprint_section" 2>/dev/null)" || return 1
+	[ -n "$fingerprint_raw" ] || return 1
+	fingerprint_digest="$(printf '%s\n' "$fingerprint_raw" | LC_ALL=C sort | sha256sum 2>/dev/null | awk 'NR == 1 { print $1; exit }')"
+	case "$fingerprint_digest" in
+		????????????????????????????????????????????????????????????????) ;;
+		*) return 1 ;;
+	esac
+	case "$fingerprint_digest" in *[!0-9a-f]*) return 1 ;; esac
+	printf 'sha256:%s\n' "$fingerprint_digest"
+}
+
+managed_sqm_snapshot_fingerprint() {
+	snapshot_file="$1"
+	fingerprint_section="$2"
+	safe_job_name "$fingerprint_section" || return 1
+	owned_regular_file "$snapshot_file" || return 1
+	verify_dir="$runtime_lock_root/autotune-snapshot-verify.$worker_token"
+	case "$verify_dir" in "$runtime_lock_root"/autotune-snapshot-verify.*) ;; *) return 1 ;; esac
+	[ ! -e "$verify_dir" ] && [ ! -L "$verify_dir" ] || return 1
+	mkdir "$verify_dir" 2>/dev/null || return 1
+	chmod 700 "$verify_dir" 2>/dev/null || return 1
+	runtime_lock_path_owned_by_euid "$verify_dir" || return 1
+	if ! cp "$snapshot_file" "$verify_dir/sqm" 2>/dev/null ||
+	   ! chmod 600 "$verify_dir/sqm" 2>/dev/null ||
+	   ! owned_regular_file "$verify_dir/sqm"; then
+		rm -f "$verify_dir/sqm" 2>/dev/null || true
+		rmdir "$verify_dir" 2>/dev/null || true
+		return 1
+	fi
+	fingerprint_raw="$(uci -q -c "$verify_dir" show "sqm.$fingerprint_section" 2>/dev/null)" || {
+		rm -f "$verify_dir/sqm" 2>/dev/null || true
+		rmdir "$verify_dir" 2>/dev/null || true
+		return 1
+	}
+	rm -f "$verify_dir/sqm" 2>/dev/null || return 1
+	rmdir "$verify_dir" 2>/dev/null || return 1
+	[ -n "$fingerprint_raw" ] || return 1
+	fingerprint_digest="$(printf '%s\n' "$fingerprint_raw" | LC_ALL=C sort | sha256sum 2>/dev/null | awk 'NR == 1 { print $1; exit }')"
+	case "$fingerprint_digest" in
+		????????????????????????????????????????????????????????????????) ;;
+		*) return 1 ;;
+	esac
+	case "$fingerprint_digest" in *[!0-9a-f]*) return 1 ;; esac
+	printf 'sha256:%s\n' "$fingerprint_digest"
+}
+
+capture_sqm_config_file() {
+	snapshot_target="$runtime_lock_root/sqm-snapshot.autotune_$worker_token"
+	snapshot_tmp="$runtime_lock_root/.sqm-snapshot.autotune_$worker_token.$$"
+	case "$snapshot_target" in "$runtime_lock_root"/sqm-snapshot.*) ;; *) return 1 ;; esac
+	[ -f "$sqm_config_file" ] && [ ! -L "$sqm_config_file" ] || return 1
+	runtime_lock_path_owned_by_euid "$sqm_config_file" || return 1
+	[ ! -e "$snapshot_target" ] && [ ! -L "$snapshot_target" ] || return 1
+	[ ! -e "$snapshot_tmp" ] && [ ! -L "$snapshot_tmp" ] || return 1
+	if ! cp "$sqm_config_file" "$snapshot_tmp" 2>/dev/null ||
+	   ! owned_regular_file "$snapshot_tmp" ||
+	   ! chmod 600 "$snapshot_tmp" 2>/dev/null ||
+	   ! mv "$snapshot_tmp" "$snapshot_target" ||
+	   ! owned_regular_file "$snapshot_target"; then
+		rm -f "$snapshot_tmp" 2>/dev/null || true
+		return 1
+	fi
+	[ "$(LC_ALL=C ls -ldn "$snapshot_target" 2>/dev/null | awk 'NR == 1 { print substr($1, 1, 10); exit }')" = '-rw-------' ] || {
+		rm -f "$snapshot_target" 2>/dev/null || true
+		return 1
+	}
+	# Re-check the source after the copy. A concurrent replacement cannot turn
+	# a partially observed file into an authoritative recovery snapshot.
+	[ -f "$sqm_config_file" ] && [ ! -L "$sqm_config_file" ] &&
+		runtime_lock_path_owned_by_euid "$sqm_config_file" || {
+		rm -f "$snapshot_target" 2>/dev/null || true
+		return 1
+	}
+	printf '%s\n' "$snapshot_target"
+}
+
+prepare_recovery() {
+	[ -x "$recovery_bin" ] || fail "Full Auto-Tune recovery helper is not installed."
+	setsid_bin="$(command -v setsid 2>/dev/null)"
+	[ -n "$setsid_bin" ] || fail "setsid is required for Full Auto-Tune recovery."
+	secure_ram_directory "$recovery_root" || fail "Unsafe or foreign-owned Full Auto-Tune recovery directory."
+	[ "$(proc_starttime "$$" 2>/dev/null)" = "$recovery_owner_starttime" ] ||
+		fail "Full Auto-Tune owner identity changed before recovery was armed."
+	[ "$(proc_group "$$")" = "$$" ] && [ "$(proc_session "$$")" = "$$" ] ||
+		fail "Full Auto-Tune worker is not its isolated process-group leader."
+	[ ! -e "$recovery_journal" ] && [ ! -e "$recovery_done_marker" ] && [ ! -e "$recovery_heartbeat" ] ||
+		fail "A recovery record with this worker token already exists."
+	recovery_prepared=1
+	write_recovery_journal || fail "Unable to publish the initial recovery journal."
+	# The watcher must not inherit either kernel flock.  It is deliberately
+	# detached and acquires the journal-bound locks only after the owner dies.
+	CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_FD= \
+	CAKE_AUTORATE_INTERFACE_LOCK_FD= \
+	CAKE_AUTORATE_INTERFACE_LOCK_OWNER= \
+	CAKE_AUTORATE_INTERFACE_LOCK_STARTTIME= \
+	CAKE_AUTORATE_INTERFACE_LOCK_TOKEN= \
+	CAKE_AUTORATE_INTERFACE_LOCK_RECOVERY_JOURNAL= \
+		"$setsid_bin" "$recovery_bin" watch "$recovery_journal" \
+		</dev/null >/dev/null 2>&1 8>&- 9>&- &
+	recovery_watcher_pid="$!"
+	return 0
+}
+
+arm_recovery() {
+	[ "${recovery_prepared:-0}" = 1 ] && [ -f "$recovery_journal" ] ||
+		fail "Full Auto-Tune recovery journal disappeared before arming."
+	runtime_lock_load_record "$autotune_interface_lock" &&
+		[ "$runtime_record_pid" = "$$" ] &&
+		[ "$runtime_record_starttime" = "$recovery_owner_starttime" ] &&
+		[ "$runtime_record_token" = "$worker_token" ] &&
+		[ "$runtime_record_journal" = "$recovery_journal" ] ||
+		fail "Interface lock identity changed before Full Auto-Tune recovery was armed."
+	heartbeat_tmp="$recovery_heartbeat.tmp.$$"
+	: > "$heartbeat_tmp" && mv "$heartbeat_tmp" "$recovery_heartbeat" ||
+		fail "Unable to arm Full Auto-Tune crash recovery."
+	recovery_armed=1
+}
+
+compute_config_fingerprint() {
+	command -v sha256sum >/dev/null 2>&1 || return 1
+	safe_job_name "$job_name" || return 1
+	fingerprint_cake_raw="$job_dir/config-fingerprint.cake.raw.$$"
+	fingerprint_cake_sorted="$job_dir/config-fingerprint.cake.sorted.$$"
+	fingerprint_sqm_raw="$job_dir/config-fingerprint.sqm.raw.$$"
+	fingerprint_sqm_sorted="$job_dir/config-fingerprint.sqm.sorted.$$"
+	fingerprint_input="$job_dir/config-fingerprint.input.$$"
+	if uci -q show "cake-autorate.$job_name" > "$fingerprint_cake_raw" 2>/dev/null &&
+	   [ -s "$fingerprint_cake_raw" ]; then
+		fingerprint_sqm_section="$(uci -q get "cake-autorate.$job_name.sqm_section" 2>/dev/null)"
+		[ -n "$fingerprint_sqm_section" ] || fingerprint_sqm_section="cake_$job_name"
+		safe_job_name "$fingerprint_sqm_section" || return 1
+		[ "$(uci -q get "sqm.$fingerprint_sqm_section._cake_autorate_managed" 2>/dev/null)" = "$job_name" ] || return 1
+		uci -q show "sqm.$fingerprint_sqm_section" > "$fingerprint_sqm_raw" 2>/dev/null &&
+			[ -s "$fingerprint_sqm_raw" ] || return 1
+	else
+		# Create wizard: no instance exists yet.  Bind the result to that absence
+		# and to the absence of its default SQM name; a foreign/same-name queue is
+		# a conflict, not configuration to inherit.
+		fingerprint_sqm_section="cake_$job_name"
+		safe_job_name "$fingerprint_sqm_section" || return 1
+		: > "$fingerprint_cake_raw"
+		if uci -q show "sqm.$fingerprint_sqm_section" > "$fingerprint_sqm_raw" 2>/dev/null &&
+		   [ -s "$fingerprint_sqm_raw" ]; then
+			return 1
+		fi
+		printf '<absent>\n' > "$fingerprint_cake_raw"
+		printf '<absent>\n' > "$fingerprint_sqm_raw"
+	fi
+	if [ ! -s "$fingerprint_cake_raw" ] || [ ! -s "$fingerprint_sqm_raw" ]; then
+		rm -f "$fingerprint_cake_raw" "$fingerprint_cake_sorted" \
+			"$fingerprint_sqm_raw" "$fingerprint_sqm_sorted" "$fingerprint_input"
+		return 1
+	fi
+	LC_ALL=C sort "$fingerprint_cake_raw" > "$fingerprint_cake_sorted" || return 1
+	LC_ALL=C sort "$fingerprint_sqm_raw" > "$fingerprint_sqm_sorted" || return 1
+	{
+		printf 'cake-autorate:%s\n' "$job_name"
+		cat "$fingerprint_cake_sorted"
+		printf 'sqm:%s\n' "$fingerprint_sqm_section"
+		cat "$fingerprint_sqm_sorted"
+	} > "$fingerprint_input" || return 1
+	fingerprint_digest="$(sha256sum "$fingerprint_input" 2>/dev/null | awk '{ print $1; exit }')"
+	rm -f "$fingerprint_cake_raw" "$fingerprint_cake_sorted" \
+		"$fingerprint_sqm_raw" "$fingerprint_sqm_sorted" "$fingerprint_input"
+	case "$fingerprint_digest" in
+		????????????????????????????????????????????????????????????????)
+			case "$fingerprint_digest" in *[!0-9a-f]*) return 1 ;; esac
+			printf 'sha256:%s\n' "$fingerprint_digest"
+			;;
+		*) return 1 ;;
+	esac
+}
+
+capture_config_fingerprint() {
+	config_fingerprint="$(compute_config_fingerprint)" ||
+		fail "Unable to capture the managed UCI configuration fingerprint under the calibration lock."
+	config_fingerprint_captured=true
+}
+
+config_fingerprint_matches() {
+	[ "${config_fingerprint_captured:-false}" = true ] || return 1
+	current_config_fingerprint="$(compute_config_fingerprint)" || return 1
+	[ "$current_config_fingerprint" = "$config_fingerprint" ]
+}
+
+config_changed_inconclusive() {
+	stage_terminal_json error "{\"state\":\"inconclusive\",\"schema_version\":3,\"stage\":\"config-changed\",\"error\":\"Managed CAKE Autorate/SQM configuration changed during calibration; all measurements are stale.\",\"reason\":\"config-changed\",\"retryable\":true,\"auto_apply_eligible\":false,\"phase_evidence_complete\":false,\"configuration_written\":false}"
+	exit 1
+}
+
+terminal_json_shape_valid() {
+	terminal_candidate="$1"
+	strict_single_json_object "$terminal_candidate" || return 1
+	terminal_candidate_state="$(extract_json "$terminal_candidate" '@.state')" || return 1
+	terminal_candidate_schema="$(extract_json "$terminal_candidate" '@.schema_version')" || return 1
+	[ -n "$terminal_candidate_state" ] &&
+		[ "$terminal_candidate_schema" = "$autotune_result_schema" ]
+}
+
+terminal_json_valid() {
+	terminal_candidate="$1"
+	terminal_json_shape_valid "$terminal_candidate" || return 1
+	terminal_candidate_producer="$(extract_json "$terminal_candidate" '@.producer')" || return 1
+	[ "$terminal_candidate_producer" = "$autotune_result_producer" ]
+}
+
+stage_terminal_json() {
+	terminal_kind="$1"
+	payload="$2"
+	if [ "${config_fingerprint_captured:-false}" = true ] &&
+	   ! config_fingerprint_matches; then
+		payload="{\"state\":\"inconclusive\",\"schema_version\":3,\"stage\":\"config-changed\",\"error\":\"Managed CAKE Autorate/SQM configuration changed during calibration; all measurements are stale.\",\"reason\":\"config-changed\",\"retryable\":true,\"auto_apply_eligible\":false,\"phase_evidence_complete\":false,\"configuration_written\":false}"
+		terminal_kind=error
+	fi
+	terminal_json_shape_valid "$payload" || return 1
+	case "$payload" in
+		*'}') payload="${payload%?},\"producer\":\"$autotune_result_producer\",\"config_fingerprint\":\"$(json_escape "${config_fingerprint:-}")\",\"runtime_restored\":false,\"recovery_pending\":true}" ;;
+		*) return 1 ;;
+	esac
+	terminal_json_valid "$payload" || return 1
+	terminal_state="$(extract_json "$payload" '@.state')" || return 1
+	case "$terminal_kind" in
+		result)
+			[ "$terminal_state" = complete ] || return 1
+			rm -f "$pending_error_file"
+			atomic_write "$pending_result_file" "$payload"
+			;;
+		error)
+			[ "$terminal_state" != complete ] || return 1
+			rm -f "$pending_result_file"
+			atomic_write "$pending_error_file" "$payload"
+			;;
+		*) return 1 ;;
+	esac
+}
+
+publish_staged_terminal() {
+	if [ -s "$pending_result_file" ]; then
+		pending_source="$pending_result_file"
+		public_target="$result_file"
+	elif [ -s "$pending_error_file" ]; then
+		pending_source="$pending_error_file"
+		public_target="$error_file"
+	else
+		return 1
+	fi
+	pending_payload="$(cat "$pending_source" 2>/dev/null)" || return 1
+	terminal_json_valid "$pending_payload" || return 1
+	case "$pending_payload" in *'"runtime_restored":false,"recovery_pending":true}') ;; *) return 1 ;; esac
+	terminal_payload="$(printf '%s\n' "$pending_payload" |
+		sed 's/,\"runtime_restored\":false,\"recovery_pending\":true}$/,"runtime_restored":true,"recovery_pending":false}/')"
+	case "$terminal_payload" in
+		*'"runtime_restored":true,"recovery_pending":false}') ;;
+		*) return 1 ;;
+	esac
+	terminal_json_valid "$terminal_payload" || return 1
+	atomic_write "$public_target" "$terminal_payload" || return 1
+	if [ "$public_target" = "$result_file" ]; then
+		rm -f "$error_file"
+	else
+		rm -f "$result_file"
+	fi
+	rm -f "$pending_result_file" "$pending_error_file" "$status_file"
+	return 0
+}
+
+emit_saved_terminal() {
+	saved_terminal_file="$1"
+	owned_regular_file "$saved_terminal_file" || {
+		printf '{"state":"failed","schema_version":%s,"producer":"%s","error":"Saved Full Auto-Tune state is unsafe or unreadable; run calibration again.","auto_apply_eligible":false,"configuration_written":false,"runtime_restored":true,"recovery_pending":false}\n' \
+			"$autotune_result_schema" "$autotune_result_producer"
+		return 0
+	}
+	saved_terminal="$(cat "$saved_terminal_file" 2>/dev/null)" || saved_terminal=""
+	if terminal_json_valid "$saved_terminal"; then
+		printf '%s\n' "$saved_terminal"
+		return 0
+	fi
+	if strict_single_json_object "$saved_terminal"; then
+		saved_schema="$(extract_json "$saved_terminal" '@.schema_version' 2>/dev/null || true)"
+		saved_state="$(extract_json "$saved_terminal" '@.state' 2>/dev/null || true)"
+		printf '{"state":"legacy","schema_version":%s,"producer":"%s","legacy_schema_version":"%s","legacy_state":"%s","error":"Saved Full Auto-Tune diagnostics were created by an older result schema. They cannot be applied; run Full Auto-Tune again.","auto_apply_eligible":false,"configuration_written":false,"runtime_restored":true,"recovery_pending":false,"legacy_result":%s}\n' \
+			"$autotune_result_schema" "$autotune_result_producer" \
+			"$(json_escape "${saved_schema:-unknown}")" \
+			"$(json_escape "${saved_state:-unknown}")" "$saved_terminal"
+		return 0
+	fi
+	printf '{"state":"failed","schema_version":%s,"producer":"%s","error":"Saved Full Auto-Tune diagnostics are malformed and were ignored; run calibration again.","auto_apply_eligible":false,"configuration_written":false,"runtime_restored":true,"recovery_pending":false}\n' \
+		"$autotune_result_schema" "$autotune_result_producer"
 }
 
 write_status() {
 	phase="$1"
 	progress="$2"
 	message="$3"
-	atomic_write "$status_file" "{\"state\":\"running\",\"phase\":\"$(json_escape "$phase")\",\"progress\":$progress,\"message\":\"$(json_escape "$message")\"}"
+	current_phase="$phase"
+	atomic_write "$status_file" "{\"state\":\"running\",\"phase\":\"$(json_escape "$phase")\",\"progress\":$progress,\"message\":\"$(json_escape "$message")\",\"job_id\":\"$(json_escape "$job_name")\",\"requested_target_interface\":\"$(json_escape "$target_if_input")\",\"requested_backend\":\"$(json_escape "$backend_input")\",\"requested_route_mode\":\"$(json_escape "$route_mode_override")\",\"requested_mwan3_member\":\"$(json_escape "$mwan3_member_override")\",\"requested_conservative\":$([ "${conservative_mode:-0}" = 1 ] && printf true || printf false)}"
+}
+
+nonnegative_delta() {
+	awk -v loaded="${1:-0}" -v idle="${2:-0}" 'BEGIN {
+		delta = loaded - idle
+		if (delta < 0) delta = 0
+		printf "%.1f", delta
+	}'
+}
+
+maximum_number() {
+	awk -v first="${1:-0}" -v second="${2:-0}" 'BEGIN {
+		printf "%.3f", (first > second ? first : second)
+	}'
+}
+
+bounded_float_setting() {
+	option="$1"
+	default_value="$2"
+	minimum_value="$3"
+	maximum_value="$4"
+	value="$(uci -q get "cake-autorate.$job_name.$option" 2>/dev/null)"
+	awk -v value="$value" -v fallback="$default_value" -v minimum="$minimum_value" -v maximum="$maximum_value" 'BEGIN {
+		if (value !~ /^[0-9]+([.][0-9]+)?$/) value = fallback
+		if (value < minimum) value = minimum
+		if (value > maximum) value = maximum
+		printf "%.3f", value
+	}'
+}
+
+configure_validation_thresholds() {
+	validation_candidate_realization_min_percent=80.000
+	# A shaped test that substantially exceeds the candidate did not prove that
+	# the candidate CAKE rate was actually enforced. Keep this a hard, symmetric
+	# measurement-evidence bound rather than treating overshoot as extra capacity.
+	validation_candidate_realization_max_percent=110.000
+	validation_capacity_retention_min_percent="$(bounded_float_setting throughput_guard_retention_percent 80 50 100)"
+	validation_delay_max_ms="$(bounded_float_setting quality_target_delay_ms 30 5 200)"
+	validation_loss_max_percent=5.000
+	validation_cpu_max_percent="$(bounded_float_setting transport_cpu_max_percent 85 50 100)"
 }
 
 configured_rate() {
@@ -124,11 +833,26 @@ background_json() {
 		"${background_dl_usable:-true}" "${background_ul_usable:-true}"
 }
 
+baseline_diagnostics_json() {
+	printf '{"median_ms":%s,"p95_ms":%s,"samples":%s,"transport_median_ms":%s,"transport_p95_ms":%s,"transport_samples":%s,"transport_backend":"%s","transport_endpoint":"%s"}' \
+		"${idle_median_ms:-0}" "${idle_p95_ms:-0}" "${baseline_samples:-0}" \
+		"${transport_idle_median_ms:-0}" "${transport_idle_p95_ms:-0}" "${transport_idle_samples:-0}" \
+		"$(json_escape "${transport_probe_backend:-}")" "$(json_escape "${transport_probe_endpoint:-}")"
+}
+
+route_diagnostics_json() {
+	printf '{"mode":"%s","member":"%s","interface":"%s","mark":"%s","table":"%s","identity":"%s","external_ip":"%s"}' \
+		"$(json_escape "${route_mode:-}")" "$(json_escape "${mwan3_member:-}")" \
+		"$(json_escape "${route_if:-}")" "$(json_escape "${route_mark:-}")" \
+		"$(json_escape "${route_table:-}")" "$(json_escape "${route_identity:-}")" \
+		"$(json_escape "${selected_external_ip:-}")"
+}
+
 check_background_traffic() {
 	write_status quiet-check 27 "Checking background traffic before throughput calibration"
 	measure_background_traffic
 	if [ "$background_blocked" = true ] && [ "${conservative_mode:-0}" != 1 ]; then
-		atomic_write "$error_file" "{\"state\":\"background-blocked\",\"error\":\"Background traffic is above the strict calibration limit. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"quiet-check\",\"background\":$(background_json),\"configuration_written\":false}"
+		stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":3,\"error\":\"Background traffic is above the strict calibration limit. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"quiet-check\",\"auto_apply_eligible\":false,\"phase_evidence_complete\":false,\"phase_contamination_seen\":false,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
 		exit 1
 	fi
 	if [ "${conservative_mode:-0}" = 1 ]; then
@@ -142,10 +866,159 @@ check_background_traffic() {
 		current_ul_cap="$(uci -q get "cake-autorate.$job_name.adaptive_ceiling_ul_cap_kbps" 2>/dev/null)"
 		if { [ "$background_dl_usable" != true ] || [ "$background_ul_usable" != true ]; } &&
 		   { ! is_positive_uint "$current_dl_base" || ! is_positive_uint "$current_ul_base"; }; then
-			atomic_write "$error_file" "{\"state\":\"failed\",\"error\":\"Background traffic leaves an unusable direction and this new instance has no confirmed limits to retain.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"quiet-check\",\"background\":$(background_json),\"configuration_written\":false}"
+			stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":3,\"error\":\"Background traffic leaves an unusable direction and this new instance has no confirmed limits to retain.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"quiet-check\",\"auto_apply_eligible\":false,\"phase_evidence_complete\":false,\"phase_contamination_seen\":false,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
 			exit 1
 		fi
 	fi
+}
+
+cleanup_phase_background_counter() {
+	if [ "${phase_counter_created:-0}" = 1 ] && [ -n "${nft_bin:-}" ]; then
+		"$nft_bin" delete table inet "$phase_counter_table" >/dev/null 2>&1 || true
+	fi
+	phase_counter_created=0
+}
+
+active_nft_flowtable() {
+	ruleset="$1"
+	printf '%s\n' "$ruleset" | awk '
+		$1 == "flowtable" && index($0, "{") { in_flowtable = 1 }
+		in_flowtable && /hook[[:space:]]+ingress([[:space:]]|;)/ { found = 1 }
+		in_flowtable && $1 == "}" { in_flowtable = 0 }
+		END { exit(found ? 0 : 1) }
+	'
+}
+
+preflight_phase_accounting() {
+	nft_bin="$(command -v nft 2>/dev/null)"
+	[ -n "$nft_bin" ] || fail "nft is required to prove that calibration phases are free of forwarded client traffic."
+	phase_ruleset="$($nft_bin list ruleset 2>/dev/null)" ||
+		fail "Unable to inspect nftables before calibration; forwarded-traffic evidence cannot be trusted."
+	if active_nft_flowtable "$phase_ruleset"; then
+		fail "Active nftables flowtable/offload bypasses the calibration forward counters. Disable software and hardware flow offloading before Full Auto-Tune."
+	fi
+}
+
+cleanup_stale_phase_background_tables() {
+	[ -n "${nft_bin:-}" ] || return 1
+	table_listing="$($nft_bin list tables 2>/dev/null)" || return 1
+	stale_tables="$(printf '%s\n' "$table_listing" | awk '$1 == "table" && $2 == "inet" { print $3 }')"
+	for stale_table in $stale_tables; do
+		case "$stale_table" in
+			"cake_autotune_${job_name}_"*)
+				stale_suffix="${stale_table#cake_autotune_${job_name}_}"
+				case "$stale_suffix" in ''|*[!0-9]*) continue ;; esac
+				"$nft_bin" delete table inet "$stale_table" >/dev/null 2>&1 || return 1
+				;;
+		esac
+	done
+	return 0
+}
+
+start_phase_background_counter() {
+	phase_reference_dl_kbps="${1:-0}"
+	phase_reference_ul_kbps="${2:-0}"
+	phase_background_available=false
+	phase_background_contaminated=false
+	phase_background_dl_kbps=0
+	phase_background_ul_kbps=0
+	phase_counter_started="$(cut -d ' ' -f 1 /proc/uptime 2>/dev/null)"
+
+	if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_PREFLIGHT:-0}" = 1 ]; then
+		phase_background_available=true
+		return 0
+	fi
+
+	nft_bin="$(command -v nft 2>/dev/null)"
+	[ -n "$nft_bin" ] || return 0
+	# A PID suffix makes a stale table from a prior SIGKILL harmless.  The
+	# current worker still removes only its own table during normal cleanup.
+	phase_counter_table="cake_autotune_${job_name}_$$"
+	cleanup_phase_background_counter
+	recovery_nft_table="$phase_counter_table"
+	write_recovery_journal || fail "Unable to journal the nftables counter before creating it."
+	"$nft_bin" add table inet "$phase_counter_table" >/dev/null 2>&1 || return 0
+	phase_counter_created=1
+	"$nft_bin" add chain inet "$phase_counter_table" forward \
+		'{ type filter hook forward priority -1; policy accept; }' >/dev/null 2>&1 || {
+		cleanup_phase_background_counter
+		return 0
+	}
+	"$nft_bin" add rule inet "$phase_counter_table" forward iifname "$target_if" counter \
+		comment cake-autotune-dl >/dev/null 2>&1 || {
+		cleanup_phase_background_counter
+		return 0
+	}
+	"$nft_bin" add rule inet "$phase_counter_table" forward oifname "$target_if" counter \
+		comment cake-autotune-ul >/dev/null 2>&1 || {
+		cleanup_phase_background_counter
+		return 0
+	}
+	phase_background_available=true
+}
+
+stop_phase_background_counter() {
+	phase_counter_stopped="$(cut -d ' ' -f 1 /proc/uptime 2>/dev/null)"
+	phase_duration_s="$(awk -v start="${phase_counter_started:-0}" -v stop="${phase_counter_stopped:-0}" 'BEGIN {
+		d = stop - start; if (d < 0.01) d = 0.01; printf "%.2f", d
+	}')"
+
+	if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_PREFLIGHT:-0}" = 1 ]; then
+		if [ "${phase_background_kind:-}" = baseline ]; then
+			test_phase_unavailable="${CAKE_AUTORATE_AUTOTUNE_TEST_BASELINE_BACKGROUND_UNAVAILABLE:-0}"
+			if [ "${baseline_phase_attempt:-0}" = 1 ]; then
+				test_phase_dl="${CAKE_AUTORATE_AUTOTUNE_TEST_BASELINE_BACKGROUND_FIRST_DL_KBPS:-${CAKE_AUTORATE_AUTOTUNE_TEST_BASELINE_BACKGROUND_DL_KBPS:-0}}"
+				test_phase_ul="${CAKE_AUTORATE_AUTOTUNE_TEST_BASELINE_BACKGROUND_FIRST_UL_KBPS:-${CAKE_AUTORATE_AUTOTUNE_TEST_BASELINE_BACKGROUND_UL_KBPS:-0}}"
+			else
+				test_phase_dl="${CAKE_AUTORATE_AUTOTUNE_TEST_BASELINE_BACKGROUND_DL_KBPS:-0}"
+				test_phase_ul="${CAKE_AUTORATE_AUTOTUNE_TEST_BASELINE_BACKGROUND_UL_KBPS:-0}"
+			fi
+		else
+			test_phase_unavailable="${CAKE_AUTORATE_AUTOTUNE_TEST_PHASE_BACKGROUND_UNAVAILABLE:-0}"
+			test_phase_dl="${CAKE_AUTORATE_AUTOTUNE_TEST_PHASE_BACKGROUND_DL_KBPS:-0}"
+			test_phase_ul="${CAKE_AUTORATE_AUTOTUNE_TEST_PHASE_BACKGROUND_UL_KBPS:-0}"
+		fi
+		if [ "$test_phase_unavailable" = 1 ]; then
+			phase_background_available=false
+		else
+			phase_background_dl_kbps="$test_phase_dl"
+			phase_background_ul_kbps="$test_phase_ul"
+		fi
+	elif [ "${phase_background_available:-false}" = true ] && [ "${phase_counter_created:-0}" = 1 ]; then
+		if phase_counter_dump="$($nft_bin list chain inet "$phase_counter_table" forward 2>/dev/null)"; then
+			phase_background_dl_bytes="$(printf '%s\n' "$phase_counter_dump" | awk '
+				/comment "?cake-autotune-dl"?/ { for (i = 1; i <= NF; i++) if ($i == "bytes") { print $(i + 1); exit } }')"
+			phase_background_ul_bytes="$(printf '%s\n' "$phase_counter_dump" | awk '
+				/comment "?cake-autotune-ul"?/ { for (i = 1; i <= NF; i++) if ($i == "bytes") { print $(i + 1); exit } }')"
+			case "$phase_background_dl_bytes:$phase_background_ul_bytes" in
+				*[!0-9:]*|:*|*:) phase_background_available=false ;;
+				*)
+					phase_background_dl_kbps="$(awk -v b="$phase_background_dl_bytes" -v s="$phase_duration_s" 'BEGIN { printf "%.0f", b * 8 / s / 1000 }')"
+					phase_background_ul_kbps="$(awk -v b="$phase_background_ul_bytes" -v s="$phase_duration_s" 'BEGIN { printf "%.0f", b * 8 / s / 1000 }')"
+					;;
+			esac
+		else
+			phase_background_available=false
+		fi
+	fi
+	cleanup_phase_background_counter
+
+	phase_background_dl_limit="$(awk -v r="${phase_reference_dl_kbps:-0}" 'BEGIN { v=r*0.02; if(v<1000)v=1000; printf "%.0f",v }')"
+	phase_background_ul_limit="$(awk -v r="${phase_reference_ul_kbps:-0}" 'BEGIN { v=r*0.02; if(v<1000)v=1000; printf "%.0f",v }')"
+	phase_background_contaminated=false
+	if [ "${phase_background_available:-false}" != true ]; then
+		phase_background_contaminated=true
+		phase_evidence_complete=false
+	fi
+	[ "${phase_background_dl_kbps:-0}" -le "$phase_background_dl_limit" ] 2>/dev/null || phase_background_contaminated=true
+	[ "${phase_background_ul_kbps:-0}" -le "$phase_background_ul_limit" ] 2>/dev/null || phase_background_contaminated=true
+}
+
+phase_background_json() {
+	printf '{"available":%s,"contaminated":%s,"duration_s":%s,"download_kbps":%s,"upload_kbps":%s,"download_limit_kbps":%s,"upload_limit_kbps":%s}' \
+		"${phase_background_available:-false}" "${phase_background_contaminated:-false}" \
+		"${phase_duration_s:-0}" "${phase_background_dl_kbps:-0}" "${phase_background_ul_kbps:-0}" \
+		"${phase_background_dl_limit:-0}" "${phase_background_ul_limit:-0}"
 }
 
 resolve_interface_device() {
@@ -194,16 +1067,45 @@ route_exec() {
 
 route_rule_for_device() {
 	device="$1"
+	wrapper_mark="${2:-}"
 	rules="$(ip -4 rule show 2>/dev/null)"
-	route_table="$(printf '%s\n' "$rules" | awk -v device="$device" '
+	discovered_table="$(printf '%s\n' "$rules" | awk -v device="$device" '
 		{ for (i = 1; i <= NF; i++) if ($i == "iif" && $(i + 1) == device)
 			for (j = 1; j <= NF; j++) if ($j == "lookup") { print $(j + 1); exit } }')"
-	route_mark=""
-	if [ -n "$route_table" ]; then
-		route_mark="$(printf '%s\n' "$rules" | awk -v table="$route_table" '
+	if [ -z "$discovered_table" ] && [ -n "$wrapper_mark" ]; then
+		discovered_table="$(printf '%s\n' "$rules" | awk -v mark="$wrapper_mark" '
+			{
+				matched = 0
+				for (i = 1; i <= NF; i++) if ($i == "fwmark") {
+					split($(i + 1), value, "/")
+					if (value[1] == mark) matched = 1
+				}
+				if (matched) for (i = 1; i <= NF; i++) if ($i == "lookup") { print $(i + 1); exit }
+			}')"
+	fi
+	discovered_mark=""
+	if [ -n "$discovered_table" ]; then
+		discovered_mark="$(printf '%s\n' "$rules" | awk -v table="$discovered_table" '
 			{ found = 0; for (i = 1; i <= NF; i++) if ($i == "lookup" && $(i + 1) == table) found = 1;
 			  if (found) for (i = 1; i <= NF; i++) if ($i == "fwmark") { split($(i + 1), value, "/"); print value[1]; exit } }')"
 	fi
+	[ -n "$discovered_table" ] || return 1
+	printf '%s|%s\n' "$discovered_mark" "$discovered_table"
+}
+
+valid_route_mark() {
+	mark="$1"
+	case "$mark" in
+		0x*) digits="${mark#0x}"; case "$digits" in ''|*[!A-Fa-f0-9]*) return 1 ;; esac ;;
+		*) case "$mark" in ''|*[!0-9]*) return 1 ;; esac ;;
+	esac
+}
+
+valid_route_table() {
+	table="$1"
+	case "$table" in
+		''|main|default|local|*[!A-Za-z0-9_.-]*) return 1 ;;
+	esac
 }
 
 inspect_autotune_route() {
@@ -237,7 +1139,22 @@ inspect_autotune_route() {
 		[ -n "$route_if" ] || route_if="$network_device"
 		source_ip="$(printf '%s\n' "$route_environment" | sed -n 's/^SRCIP=//p' | sed -n '1p')"
 		[ "$route_if" = "$target_if" ] && [ -n "$source_ip" ] || return 1
-		route_rule_for_device "$route_if"
+		route_mark="$(printf '%s\n' "$route_environment" | sed -n 's/^FWMARK=//p' | sed -n '1p')"
+		route_mark="${route_mark%%/*}"
+		route_rule="$(route_rule_for_device "$route_if" "$route_mark" 2>/dev/null)" || return 1
+		discovered_mark="${route_rule%%|*}"
+		route_table="${route_rule#*|}"
+		[ -n "$discovered_mark" ] && route_mark="$discovered_mark"
+		valid_route_mark "$route_mark" || return 1
+		valid_route_table "$route_table" || return 1
+		forced_route="$(mwan3 use "$mwan3_member" exec ip -4 route get 1.1.1.1 from "$source_ip" 2>/dev/null)" || return 1
+		forced_route_if="$(printf '%s\n' "$forced_route" | sed -n 's/.* dev \([^ ]*\).*/\1/p' | sed -n '1p')"
+		[ "$forced_route_if" = "$target_if" ] || return 1
+		table_default="$(ip -4 route show table "$route_table" default 2>/dev/null)" || return 1
+		printf '%s\n' "$table_default" | awk -v device="$target_if" '
+			{ for (i = 1; i <= NF; i++) if ($i == "dev" && $(i + 1) == device) found = 1 }
+			END { exit(found ? 0 : 1) }
+		' || return 1
 	else
 		source_ip="$(source_ip_for "$target_if")"
 		[ -n "$source_ip" ] || return 1
@@ -252,11 +1169,47 @@ inspect_autotune_route() {
 	return 0
 }
 
+autorate_cmdline_matches() {
+	candidate_pid="$1"
+	[ -r "/proc/$candidate_pid/cmdline" ] || return 1
+	cmdline="$(tr '\000' '\n' < "/proc/$candidate_pid/cmdline")"
+	[ "$(printf '%s\n' "$cmdline" | sed -n '1p')" = /usr/sbin/cake-autorated ] || return 1
+	[ "$(printf '%s\n' "$cmdline" | sed -n '2p')" = --instance ] || return 1
+	[ "$(printf '%s\n' "$cmdline" | sed -n '3p')" = "$job_name" ] || return 1
+	[ -z "$(printf '%s\n' "$cmdline" | sed -n '4p')" ]
+}
+
 pause_job_autorate() {
-	autorate_pid="$(pgrep -f "^/usr/sbin/cake-autorated --instance $job_name\$" | sed -n '1p')"
-	if is_positive_uint "$autorate_pid" && kill -STOP "$autorate_pid" 2>/dev/null; then
-		autorate_paused=1
-	fi
+	autorate_candidates="$(pgrep -f "^/usr/sbin/cake-autorated --instance $job_name\$" 2>/dev/null || true)"
+	set -- $autorate_candidates
+	[ "$#" -le 1 ] || fail "Multiple autorate processes exist for $job_name; refusing ambiguous calibration."
+	[ "$#" -eq 1 ] || return 0
+	autorate_pid="$1"
+	autorate_starttime="$(proc_starttime "$autorate_pid" 2>/dev/null)"
+	is_positive_uint "$autorate_starttime" && autorate_cmdline_matches "$autorate_pid" ||
+		fail "Unable to verify the autorate process identity before calibration."
+	case "$(proc_state "$autorate_pid" 2>/dev/null)" in
+		T|t) fail "Autorate instance $job_name was already stopped before calibration." ;;
+		Z|z|'') fail "Autorate instance $job_name is not a live controllable process." ;;
+	esac
+	recovery_autorate_pid="$autorate_pid"
+	recovery_autorate_starttime="$autorate_starttime"
+	write_recovery_journal || fail "Unable to journal the autorate identity before stopping it."
+	[ "$(proc_starttime "$autorate_pid" 2>/dev/null)" = "$autorate_starttime" ] &&
+		autorate_cmdline_matches "$autorate_pid" || fail "Autorate process identity changed before STOP."
+	kill -STOP "$autorate_pid" 2>/dev/null || fail "Unable to stop autorate for deterministic calibration."
+	stop_attempt=0
+	while [ "$stop_attempt" -lt 3 ]; do
+		[ "$(proc_starttime "$autorate_pid" 2>/dev/null)" = "$autorate_starttime" ] ||
+			fail "Autorate process identity changed while waiting for STOP."
+		[ "$(proc_state "$autorate_pid" 2>/dev/null)" = T ] && {
+			autorate_paused=1
+			return 0
+		}
+		stop_attempt=$((stop_attempt + 1))
+		sleep 1
+	done
+	fail "Autorate instance did not enter the stopped state."
 }
 
 resume_job_autorate() {
@@ -267,34 +1220,39 @@ resume_job_autorate() {
 	autorate_pid=""
 }
 
+configure_autotune_interface_lock_path() {
+	command -v runtime_lock_interface_paths >/dev/null 2>&1 || return 1
+	runtime_lock_interface_paths "$target_if" || return 1
+	autotune_interface_lock="$runtime_interface_lock_record"
+}
+
 acquire_autotune_interface_lock() {
-	lock_name="$(printf '%s' "$target_if" | tr ':@.' '___')"
-	autotune_interface_lock="/tmp/cake-autorate-speedtest/interface-$lock_name.lock"
-	mkdir -p /tmp/cake-autorate-speedtest || fail "Unable to create the interface lock directory."
-	chmod 700 /tmp/cake-autorate-speedtest 2>/dev/null || true
-	if ! mkdir "$autotune_interface_lock" 2>/dev/null; then
-		lock_owner="$(sed -n '1p' "$autotune_interface_lock/pid" 2>/dev/null)"
-		if is_positive_uint "$lock_owner" && kill -0 "$lock_owner" 2>/dev/null; then
-			fail "Another speed test or Full Auto-Tune job is already using $target_if."
-		fi
-		rm -f "$autotune_interface_lock/pid" 2>/dev/null
-		rmdir "$autotune_interface_lock" 2>/dev/null || fail "Interface lock for $target_if is busy."
-		mkdir "$autotune_interface_lock" 2>/dev/null || fail "Unable to lock $target_if for Full Auto-Tune."
-	fi
-	printf '%s\n' "$$" > "$autotune_interface_lock/pid"
-	CAKE_AUTORATE_INTERFACE_LOCK_OWNER="$$"
-	export CAKE_AUTORATE_INTERFACE_LOCK_OWNER
+	[ -n "${autotune_interface_lock:-}" ] ||
+		configure_autotune_interface_lock_path || fail "Unable to derive a safe interface lock for $target_if."
+	runtime_lock_acquire_global_shared || {
+		lock_rc="$?"
+		[ "$lock_rc" -eq 75 ] && fail "CAKE/SQM service mutation is already in progress."
+		fail "Unable to acquire the global CAKE/SQM runtime lock."
+	}
+	runtime_lock_acquire_interface "$target_if" autotune "$recovery_journal" "$worker_token" || {
+		lock_rc="$?"
+		runtime_lock_release_global >/dev/null 2>&1 || true
+		case "$lock_rc" in
+			75) fail "Another speed test or Full Auto-Tune job is already using $target_if." ;;
+			76) fail "Full Auto-Tune recovery is still pending for $target_if." ;;
+			*) fail "Unable to establish an atomic interface lock for $target_if." ;;
+		esac
+	}
+	[ "$runtime_interface_lock_starttime" = "$recovery_owner_starttime" ] ||
+		fail "Interface-lock owner identity does not match the recovery journal."
 }
 
 release_autotune_interface_lock() {
-	[ -n "${autotune_interface_lock:-}" ] || return 0
-	lock_owner="$(sed -n '1p' "$autotune_interface_lock/pid" 2>/dev/null)"
-	if [ "$lock_owner" = "$$" ]; then
-		rm -f "$autotune_interface_lock/pid" 2>/dev/null
-		rmdir "$autotune_interface_lock" 2>/dev/null || true
-	fi
+	[ "${runtime_interface_lock_held:-0}" = 1 ] || return 0
+	runtime_lock_release_interface || return 1
+	runtime_lock_release_global || return 1
 	autotune_interface_lock=""
-	unset CAKE_AUTORATE_INTERFACE_LOCK_OWNER
+	return 0
 }
 
 detect_link_kind() {
@@ -343,9 +1301,158 @@ autorate_conflict_for_target() {
 
 sqm_state_dir() {
 	(
-		. /etc/sqm/sqm.conf 2>/dev/null
+		[ ! -r /etc/sqm/sqm.conf ] || . /etc/sqm/sqm.conf 2>/dev/null
 		printf '%s' "${SQM_STATE_DIR:-/var/run/sqm}"
 	)
+}
+
+inspect_sqm_ownership() {
+	sqm_ownership_error=""
+	preflight_managed_sqm_active=0
+	command -v tc >/dev/null 2>&1 || {
+		sqm_ownership_error="tc is required to inspect existing qdisc ownership."
+		return 1
+	}
+	qdisc_state="$(tc qdisc show dev "$target_if" 2>/dev/null)" || {
+		sqm_ownership_error="Unable to inspect qdisc state on $target_if; Full Auto-Tune will not assume the target is clean."
+		return 1
+	}
+	root_kind="$(printf '%s\n' "$qdisc_state" | awk '$4 == "root" { print $2; exit }')"
+	has_ingress=false
+	printf '%s\n' "$qdisc_state" | grep -Eq ' ingress | clsact ' && has_ingress=true
+	state_dir="$(sqm_state_dir)"
+	state_present=false
+	[ -f "$state_dir/$target_if.state" ] && state_present=true
+	existing_instance="$(uci -q get "cake-autorate.$job_name" 2>/dev/null || true)"
+
+	qdisc_clean=false
+	case "$root_kind" in ''|noqueue|mq) [ "$has_ingress" = false ] && [ "$state_present" = false ] && qdisc_clean=true ;; esac
+	if [ -z "$existing_instance" ]; then
+		[ "$qdisc_clean" = true ] && return 0
+		sqm_ownership_error="Target $target_if already has root qdisc ${root_kind:-unknown}, ingress/clsact state, or an SQM state file that is not owned by this new instance."
+		return 1
+	fi
+
+	[ "$(uci -q get "cake-autorate.$job_name.manage_sqm" 2>/dev/null)" = 1 ] || {
+		sqm_ownership_error="Existing instance $job_name does not manage SQM; Full Auto-Tune will not replace or snapshot an arbitrary qdisc."
+		return 1
+	}
+	[ "$(uci -q get "cake-autorate.$job_name.sqm_enabled" 2>/dev/null)" = 1 ] || {
+		sqm_ownership_error="Existing instance $job_name has managed SQM disabled; enable its matching queue before Full Auto-Tune."
+		return 1
+	}
+	configured_sqm_if="$(uci -q get "cake-autorate.$job_name.sqm_interface" 2>/dev/null || true)"
+	[ -n "$configured_sqm_if" ] || configured_sqm_if="$(uci -q get "cake-autorate.$job_name.ul_if" 2>/dev/null || true)"
+	resolved_sqm_if="$(resolve_interface_device "$configured_sqm_if" 2>/dev/null)"
+	[ "$resolved_sqm_if" = "$target_if" ] || {
+		sqm_ownership_error="Existing instance $job_name manages ${resolved_sqm_if:-no resolved SQM interface}, not $target_if."
+		return 1
+	}
+	sqm_section="$(uci -q get "cake-autorate.$job_name.sqm_section" 2>/dev/null || true)"
+	[ -n "$sqm_section" ] || sqm_section="cake_$job_name"
+	[ "$(uci -q get "sqm.$sqm_section._cake_autorate_managed" 2>/dev/null)" = "$job_name" ] || {
+		sqm_ownership_error="SQM section $sqm_section is not marked as owned by instance $job_name."
+		return 1
+	}
+	[ "$(uci -q get "sqm.$sqm_section.enabled" 2>/dev/null)" = 1 ] || {
+		sqm_ownership_error="Managed SQM section $sqm_section is disabled."
+		return 1
+	}
+	[ "$(uci -q get "sqm.$sqm_section.interface" 2>/dev/null)" = "$target_if" ] || {
+		sqm_ownership_error="Managed SQM section $sqm_section does not target $target_if."
+		return 1
+	}
+	[ "$state_present" = true ] && [ "$root_kind" = cake ] && [ "$has_ingress" = true ] || {
+		sqm_ownership_error="Managed SQM for $job_name is not active as CAKE plus ingress on $target_if."
+		return 1
+	}
+	dl_if="$(uci -q get "cake-autorate.$job_name.dl_if" 2>/dev/null || true)"
+	[ -n "$dl_if" ] || dl_if="ifb4$target_if"
+	safe_interface_name "$dl_if" || {
+		sqm_ownership_error="Managed download IFB for $job_name is invalid."
+		return 1
+	}
+	[ -e "/sys/class/net/$dl_if" ] &&
+		[ "$(tc qdisc show dev "$dl_if" 2>/dev/null | awk '$4 == "root" { print $2; exit }')" = cake ] || {
+		sqm_ownership_error="Managed download IFB $dl_if is missing or does not have CAKE."
+		return 1
+	}
+	managed_redirect_state="$(tc filter show dev "$target_if" ingress 2>/dev/null)" || {
+		sqm_ownership_error="Unable to inspect the managed ingress redirect on $target_if."
+		return 1
+	}
+	printf '%s\n' "$managed_redirect_state" | grep -Fq "redirect dev $dl_if" ||
+		printf '%s\n' "$managed_redirect_state" | grep -Fq "Redirect to device $dl_if)" || {
+		sqm_ownership_error="Managed SQM ingress on $target_if does not redirect to the expected IFB $dl_if."
+		return 1
+	}
+	preflight_managed_sqm_active=1
+	return 0
+}
+
+preflight_sqm_ownership() {
+	if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_PREFLIGHT:-0}" = 1 ] &&
+	   [ "${CAKE_AUTORATE_AUTOTUNE_TEST_SQM_OWNERSHIP:-0}" != 1 ]; then
+		return 0
+	fi
+	inspect_sqm_ownership || fail "$sqm_ownership_error"
+}
+
+capture_recovery_sqm_snapshot() {
+	recovery_sqm_was_active=0
+	recovery_sqm_restore_mode=none
+	recovery_sqm_section=""
+	recovery_sqm_target_if=""
+	recovery_sqm_ul_if=""
+	recovery_sqm_dl_if=""
+	recovery_sqm_config_fingerprint=""
+	recovery_sqm_config_snapshot=""
+	recovery_sqm_restore_required=0
+
+	state_dir="$(sqm_state_dir)"
+	if [ "${preflight_managed_sqm_active:-0}" != 1 ]; then
+		[ ! -f "$state_dir/$target_if.state" ] || return 1
+		return 0
+	fi
+	inspect_sqm_ownership || return 1
+	[ "${preflight_managed_sqm_active:-0}" = 1 ] || return 1
+	[ -f "$state_dir/$target_if.state" ] || return 1
+	# Production preflight has already proved that this state file, target CAKE,
+	# ingress redirect, and IFB are owned by this exact instance.  Persist the
+	# immutable identity before the first unshaped speedtest is allowed to stop
+	# SQM, so SIGKILL during that child cannot strand the link unshaped.
+	[ -n "${sqm_section:-}" ] || return 1
+	recovery_sqm_section="$sqm_section"
+	recovery_sqm_target_if="$target_if"
+	recovery_sqm_ul_if="$(uci -q get "cake-autorate.$job_name.ul_if" 2>/dev/null)"
+	[ -n "$recovery_sqm_ul_if" ] || recovery_sqm_ul_if="$target_if"
+	recovery_sqm_dl_if="${dl_if:-$(uci -q get "cake-autorate.$job_name.dl_if" 2>/dev/null)}"
+	[ -n "$recovery_sqm_dl_if" ] || recovery_sqm_dl_if="ifb4$target_if"
+	safe_job_name "$recovery_sqm_section" &&
+		safe_interface_name "$recovery_sqm_target_if" &&
+		safe_interface_name "$recovery_sqm_ul_if" &&
+		safe_interface_name "$recovery_sqm_dl_if" || return 1
+	fingerprint_before="$(managed_sqm_config_fingerprint "$recovery_sqm_section")" || return 1
+	snapshot_candidate="$(capture_sqm_config_file)" || return 1
+	snapshot_fingerprint="$(managed_sqm_snapshot_fingerprint "$snapshot_candidate" "$recovery_sqm_section")" || {
+		rm -f "$snapshot_candidate" 2>/dev/null || true
+		return 1
+	}
+	fingerprint_after="$(managed_sqm_config_fingerprint "$recovery_sqm_section")" || {
+		rm -f "$snapshot_candidate" 2>/dev/null || true
+		return 1
+	}
+	[ "$fingerprint_before" = "$snapshot_fingerprint" ] &&
+		[ "$fingerprint_before" = "$fingerprint_after" ] || {
+		rm -f "$snapshot_candidate" 2>/dev/null || true
+		return 1
+	}
+	recovery_sqm_config_fingerprint="$fingerprint_before"
+	recovery_sqm_config_snapshot="$snapshot_candidate"
+	recovery_sqm_restore_required=1
+	recovery_sqm_was_active=1
+	recovery_sqm_restore_mode=managed
+	return 0
 }
 
 cake_link_args() {
@@ -354,6 +1461,119 @@ cake_link_args() {
 		ethernet) printf '%s' 'ethernet overhead 18 mpu 64' ;;
 		*) printf '%s' 'raw' ;;
 	esac
+}
+
+configure_temp_shaper_identity() {
+	identity_seed="$(printf '%s' "$worker_token" | cut -c1-8)"
+	case "$identity_seed" in
+		????????) ;;
+		*) identity_seed="" ;;
+	esac
+	case "$identity_seed" in
+		''|*[!A-Fa-f0-9]*)
+			identity_seed="$(printf '%s' "$worker_token" | cksum 2>/dev/null |
+				awk 'NF >= 1 { printf "%08x", $1; exit }')"
+			;;
+	esac
+	case "$identity_seed" in ????????) ;; *) return 1 ;; esac
+	handle_seed="$(printf '%s' "$identity_seed" | cut -c1-3 | tr 'A-F' 'a-f')"
+	temp_ifb="catf$identity_seed"
+	temp_ifb_alias="cake-autotune-$worker_token"
+	temp_target_handle="a${handle_seed}:"
+	temp_ifb_handle="b${handle_seed}:"
+	temp_ingress_handle="ffff:"
+	temp_redirect_pref="$((49152 + ($$ % 1024)))"
+	[ "${#temp_ifb}" -le 15 ] && safe_interface_name "$temp_ifb" || return 1
+	case "$temp_ifb_alias" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac
+	recovery_temp_ifb="$temp_ifb"
+	recovery_temp_ifb_alias="$temp_ifb_alias"
+	recovery_temp_ifb_ifindex=""
+	recovery_temp_target_handle="$temp_target_handle"
+	recovery_temp_ifb_handle="$temp_ifb_handle"
+	recovery_temp_ingress_handle="$temp_ingress_handle"
+	recovery_temp_redirect_pref="$temp_redirect_pref"
+}
+
+exact_root_qdisc() {
+	qdisc_device="$1"
+	qdisc_handle="$2"
+	qdisc_expected_kbps="$3"
+	is_positive_uint "$qdisc_expected_kbps" || return 1
+	qdisc_output="$(tc qdisc show dev "$qdisc_device" 2>/dev/null)" || return 1
+	printf '%s\n' "$qdisc_output" | awk -v handle="$qdisc_handle" -v expected="$qdisc_expected_kbps" '
+		function rate_kbps(token, value, multiplier) {
+			value = token
+			if (value ~ /[Kk]bit$/) { sub(/[Kk]bit$/, "", value); multiplier = 1 }
+			else if (value ~ /[Mm]bit$/) { sub(/[Mm]bit$/, "", value); multiplier = 1000 }
+			else if (value ~ /[Gg]bit$/) { sub(/[Gg]bit$/, "", value); multiplier = 1000000 }
+			else if (value ~ /[Tt]bit$/) { sub(/[Tt]bit$/, "", value); multiplier = 1000000000 }
+			else if (value ~ /bit$/) { sub(/bit$/, "", value); multiplier = 0.001 }
+			else return -1
+			if (value !~ /^[0-9]+([.][0-9]+)?$/) return -1
+			return value * multiplier
+		}
+		$1 == "qdisc" && $2 == "cake" && $3 == handle && $4 == "root" {
+			found++
+			for (i = 5; i < NF; i++) if ($i == "bandwidth") {
+				actual = rate_kbps($(i + 1))
+				delta = actual - expected
+				if (delta < 0) delta = -delta
+				if (actual >= 0 && delta < 0.5) rate_matches++
+				break
+			}
+		}
+		END { exit(found == 1 && rate_matches == 1 ? 0 : 1) }
+	'
+}
+
+exact_ingress_redirect() {
+	qdisc_output="$(tc qdisc show dev "$target_if" 2>/dev/null)" || return 1
+	printf '%s\n' "$qdisc_output" | awk -v handle="$temp_ingress_handle" '
+		$1 == "qdisc" && $2 == "ingress" && $3 == handle { found++ }
+		END { exit(found == 1 ? 0 : 1) }
+	' || return 1
+	filter_output="$(tc filter show dev "$target_if" ingress 2>/dev/null)" || return 1
+	printf '%s\n' "$filter_output" | grep -Eq "(^|[[:space:]])pref[[:space:]]+$temp_redirect_pref([[:space:]]|$)" || return 1
+	printf '%s\n' "$filter_output" | grep -Fq "redirect dev $temp_ifb" ||
+		printf '%s\n' "$filter_output" | grep -Fq "Redirect to device $temp_ifb)" || return 1
+}
+
+exact_temp_ifb() {
+	[ -e "/sys/class/net/$temp_ifb" ] || return 1
+	[ "$(cat "/sys/class/net/$temp_ifb/ifalias" 2>/dev/null)" = "$temp_ifb_alias" ] || return 1
+	is_positive_uint "${recovery_temp_ifb_ifindex:-}" || return 1
+	[ "$(cat "/sys/class/net/$temp_ifb/ifindex" 2>/dev/null)" = "$recovery_temp_ifb_ifindex" ] || return 1
+}
+
+temporary_shaper_owned() {
+	if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_SHAPER:-0}" = 1 ]; then
+		[ "${temp_shaper_active:-0}" = 1 ] || return 1
+		is_positive_uint "${temp_download_kbps:-}" || return 1
+		is_positive_uint "${temp_upload_kbps:-}" || return 1
+		if [ -n "${AUTOTUNE_MOCK_SHAPER_OWNERSHIP_LOST_MARKER:-}" ] &&
+		   [ -e "$AUTOTUNE_MOCK_SHAPER_OWNERSHIP_LOST_MARKER" ]; then
+			return 1
+		fi
+		if [ -n "${AUTOTUNE_MOCK_SHAPER_OWNERSHIP_CHECK_COUNTER:-}" ]; then
+			ownership_check_count="$(sed -n '1p' "$AUTOTUNE_MOCK_SHAPER_OWNERSHIP_CHECK_COUNTER" 2>/dev/null)"
+			case "$ownership_check_count" in ''|*[!0-9]*) ownership_check_count=0 ;; esac
+			ownership_check_count=$((ownership_check_count + 1))
+			printf '%s\n' "$ownership_check_count" > "$AUTOTUNE_MOCK_SHAPER_OWNERSHIP_CHECK_COUNTER" || return 1
+			if is_positive_uint "${AUTOTUNE_MOCK_SHAPER_INVALIDATE_AFTER_CHECK:-}" &&
+			   [ "$ownership_check_count" -eq "$AUTOTUNE_MOCK_SHAPER_INVALIDATE_AFTER_CHECK" ]; then
+				[ -n "${AUTOTUNE_MOCK_SHAPER_OWNERSHIP_LOST_MARKER:-}" ] || return 1
+				: > "$AUTOTUNE_MOCK_SHAPER_OWNERSHIP_LOST_MARKER" || return 1
+			fi
+		fi
+		return 0
+	fi
+	[ "${recovery_shaper_started:-0}" = 1 ] || return 1
+	is_positive_uint "${temp_download_kbps:-}" || return 1
+	is_positive_uint "${temp_upload_kbps:-}" || return 1
+	exact_temp_ifb &&
+		exact_root_qdisc "$target_if" "$temp_target_handle" "$temp_upload_kbps" &&
+		exact_root_qdisc "$temp_ifb" "$temp_ifb_handle" "$temp_download_kbps" &&
+		exact_ingress_redirect
 }
 
 restore_temp_shaper() {
@@ -365,20 +1585,37 @@ restore_temp_shaper() {
 	fi
 
 	if [ "${temp_shaper_active:-0}" = 1 ]; then
-		tc qdisc del dev "$target_if" ingress >/dev/null 2>&1 || true
-		tc qdisc del dev "$target_if" root >/dev/null 2>&1 || true
-		tc qdisc del dev "$temp_ifb" root >/dev/null 2>&1 || true
+		temporary_shaper_owned || return 1
+		tc qdisc del dev "$target_if" ingress >/dev/null 2>&1 || return 1
+		tc qdisc del dev "$target_if" root >/dev/null 2>&1 || return 1
+		tc qdisc del dev "$temp_ifb" root >/dev/null 2>&1 || return 1
 		if [ "${temp_ifb_created:-0}" = 1 ]; then
-			ip link set dev "$temp_ifb" down >/dev/null 2>&1 || true
-			ip link delete dev "$temp_ifb" type ifb >/dev/null 2>&1 || true
+			ip link set dev "$temp_ifb" down >/dev/null 2>&1 || return 1
+			ip link delete dev "$temp_ifb" type ifb >/dev/null 2>&1 || return 1
 		fi
+		[ ! -e "/sys/class/net/$temp_ifb" ] || return 1
 		temp_shaper_active=0
 	fi
 
-	if [ "${sqm_was_active:-0}" = 1 ]; then
-		/usr/lib/sqm/run.sh start "$target_if" >/dev/null 2>&1 || true
-		sqm_was_active=0
-	fi
+	# Managed SQM is intentionally not restarted here. The recovery helper owns
+	# that operation and verifies the immutable SQM/IFB/redirect postconditions
+	# before it resumes autorate and releases the interface lock.
+}
+
+discard_unpublished_temp_ifb() {
+	# This path is only for a synchronous failure before shaper_started=1 is
+	# durably published.  Delete nothing unless the just-created link still has
+	# both the locally captured ifindex and our random ownership alias.  Crash
+	# recovery deliberately ignores an uncommitted IFB and restores managed SQM.
+	[ "${temp_ifb_created:-0}" = 1 ] || return 0
+	is_positive_uint "${created_temp_ifb_ifindex:-}" || return 1
+	[ "$(cat "/sys/class/net/$temp_ifb/ifindex" 2>/dev/null)" = "$created_temp_ifb_ifindex" ] || return 1
+	[ "$(cat "/sys/class/net/$temp_ifb/ifalias" 2>/dev/null)" = "$temp_ifb_alias" ] || return 1
+	ip link set dev "$temp_ifb" down >/dev/null 2>&1 || return 1
+	ip link delete dev "$temp_ifb" type ifb >/dev/null 2>&1 || return 1
+	[ ! -e "/sys/class/net/$temp_ifb" ] || return 1
+	temp_ifb_created=0
+	return 0
 }
 
 prepare_temp_shaper() {
@@ -387,48 +1624,112 @@ prepare_temp_shaper() {
 
 	if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_SHAPER:-0}" = 1 ]; then
 		temp_shaper_active=1
+		temp_download_kbps="$download_kbps"
+		temp_upload_kbps="$upload_kbps"
 		return 0
 	fi
 
 	command -v tc >/dev/null 2>&1 || fail "tc is required for shaped validation."
 	command -v ip >/dev/null 2>&1 || fail "ip is required for shaped validation."
 	[ -x /usr/lib/sqm/run.sh ] || fail "sqm-scripts is required for shaped validation."
-	temp_ifb="ifb4$target_if"
-	[ "${#temp_ifb}" -le 15 ] || fail "Derived IFB name $temp_ifb exceeds the Linux interface-name limit."
-
-	state_dir="$(sqm_state_dir)"
-	if [ -f "$state_dir/$target_if.state" ]; then
-		sqm_was_active=1
-		/usr/lib/sqm/run.sh stop "$target_if" >/dev/null 2>&1 ||
-			fail "Unable to pause existing SQM before shaped validation."
+	[ -n "${temp_ifb:-}" ] && [ -n "${temp_ifb_alias:-}" ] ||
+		fail "Temporary shaper ownership identity is unavailable."
+	if [ "${temp_shaper_active:-0}" = 1 ]; then
+		[ "${recovery_shaper_started:-0}" = 1 ] && [ "$recovery_temp_ifb" = "$temp_ifb" ] ||
+			fail "Temporary shaper identity changed between validation attempts."
+		temporary_shaper_owned || fail "Temporary shaper ownership changed between validation attempts."
+		link_args="$(cake_link_args)"
+		# Retain the same journal-owned shaper across a bounded correction/retry;
+		# only its rates change. Restarting managed SQM between attempts creates a
+		# larger crash window and used to make attempt two impossible.
+		# shellcheck disable=SC2086
+		tc qdisc replace dev "$target_if" root handle "$temp_target_handle" cake bandwidth "${upload_kbps}kbit" besteffort wash $link_args >/dev/null 2>&1 ||
+			fail "Unable to update the temporary upload CAKE rate."
+		# shellcheck disable=SC2086
+		tc qdisc replace dev "$temp_ifb" root handle "$temp_ifb_handle" cake bandwidth "${download_kbps}kbit" besteffort wash ingress $link_args >/dev/null 2>&1 ||
+			fail "Unable to update the temporary download CAKE rate."
+		temp_download_kbps="$download_kbps"
+		temp_upload_kbps="$upload_kbps"
+		temporary_shaper_owned || fail "Temporary shaper ownership changed while updating candidate rates."
+		return 0
 	fi
 
-	root_kind="$(tc qdisc show dev "$target_if" 2>/dev/null | awk '$4 == "root" { print $2; exit }')"
+	state_dir="$(sqm_state_dir)"
+	if [ "${recovery_sqm_was_active:-0}" = 1 ]; then
+		[ -f "$state_dir/$target_if.state" ] ||
+			fail "Managed SQM disappeared before shaped validation; recovery remains armed."
+		current_sqm_section="$(uci -q get "cake-autorate.$job_name.sqm_section" 2>/dev/null)"
+		[ -n "$current_sqm_section" ] || current_sqm_section="cake_$job_name"
+		current_ul_if="$(uci -q get "cake-autorate.$job_name.ul_if" 2>/dev/null)"
+		[ -n "$current_ul_if" ] || current_ul_if="$target_if"
+		current_dl_if="$(uci -q get "cake-autorate.$job_name.dl_if" 2>/dev/null)"
+		[ -n "$current_dl_if" ] || current_dl_if="ifb4$target_if"
+		[ "$current_sqm_section" = "$recovery_sqm_section" ] &&
+			[ "$target_if" = "$recovery_sqm_target_if" ] &&
+			[ "$current_ul_if" = "$recovery_sqm_ul_if" ] &&
+			[ "$current_dl_if" = "$recovery_sqm_dl_if" ] ||
+			fail "Managed SQM identity changed during Full Auto-Tune."
+		sqm_was_active=1
+		write_recovery_journal || fail "Unable to refresh the managed SQM journal before stopping it."
+		/usr/lib/sqm/run.sh stop "$target_if" >/dev/null 2>&1 ||
+			fail "Unable to pause existing SQM before shaped validation."
+	elif [ -f "$state_dir/$target_if.state" ]; then
+		fail "Unexpected SQM state appeared after the recovery snapshot was armed."
+	fi
+
+	post_stop_qdisc_state="$(tc qdisc show dev "$target_if" 2>/dev/null)" ||
+		fail "Unable to inspect qdisc state after stopping managed SQM."
+	root_kind="$(printf '%s\n' "$post_stop_qdisc_state" | awk '$4 == "root" { print $2; exit }')"
 	case "$root_kind" in
 		''|noqueue|mq|fq_codel|pfifo_fast) ;;
 		*) fail "Refusing to replace unmanaged root qdisc $root_kind on $target_if." ;;
 	esac
-	if tc qdisc show dev "$target_if" 2>/dev/null | grep -Eq ' ingress | clsact '; then
+	if printf '%s\n' "$post_stop_qdisc_state" | grep -Eq ' ingress | clsact '; then
 		fail "Refusing to replace unmanaged ingress/clsact state on $target_if."
 	fi
 	[ ! -e "/sys/class/net/$temp_ifb" ] || fail "Refusing to reuse existing IFB $temp_ifb."
 
+	recovery_temp_ifb="$temp_ifb"
+	recovery_temp_ifb_alias="$temp_ifb_alias"
+	recovery_temp_ifb_ifindex=""
+	recovery_shaper_started=0
+	write_recovery_journal || fail "Unable to journal the temporary shaper before creating it."
 	ip link add name "$temp_ifb" type ifb >/dev/null 2>&1 || fail "Unable to create temporary IFB $temp_ifb."
 	temp_ifb_created=1
+	created_temp_ifb_ifindex="$(cat "/sys/class/net/$temp_ifb/ifindex" 2>/dev/null)"
+	is_positive_uint "$created_temp_ifb_ifindex" || fail "Unable to capture newly-created temporary IFB identity."
+	ip link set dev "$temp_ifb" alias "$temp_ifb_alias" >/dev/null 2>&1 ||
+		fail "Unable to mark temporary IFB ownership."
+	ip link set dev "$temp_ifb" up >/dev/null 2>&1 || {
+		discard_unpublished_temp_ifb || true
+		fail "Unable to bring up temporary IFB $temp_ifb."
+	}
+	recovery_temp_ifb_ifindex="$created_temp_ifb_ifindex"
+	recovery_shaper_started=1
+	write_recovery_journal || {
+		recovery_shaper_started=0
+		recovery_temp_ifb_ifindex=""
+		discard_unpublished_temp_ifb || true
+		fail "Unable to atomically journal the created temporary IFB identity."
+	}
+	# Only a complete name+alias+ifindex tuple published in one atomic journal
+	# transition authorizes qdisc attachment or recovery-side deletion.
 	temp_shaper_active=1
-	ip link set dev "$temp_ifb" up >/dev/null 2>&1 || fail "Unable to bring up temporary IFB $temp_ifb."
 	link_args="$(cake_link_args)"
 	# shellcheck disable=SC2086
-	tc qdisc replace dev "$target_if" root cake bandwidth "${upload_kbps}kbit" besteffort wash $link_args >/dev/null 2>&1 ||
+	tc qdisc replace dev "$target_if" root handle "$temp_target_handle" cake bandwidth "${upload_kbps}kbit" besteffort wash $link_args >/dev/null 2>&1 ||
 		fail "Unable to attach temporary upload CAKE qdisc."
 	# shellcheck disable=SC2086
-	tc qdisc replace dev "$temp_ifb" root cake bandwidth "${download_kbps}kbit" besteffort wash ingress $link_args >/dev/null 2>&1 ||
+	tc qdisc replace dev "$temp_ifb" root handle "$temp_ifb_handle" cake bandwidth "${download_kbps}kbit" besteffort wash ingress $link_args >/dev/null 2>&1 ||
 		fail "Unable to attach temporary download CAKE qdisc."
+	temp_download_kbps="$download_kbps"
+	temp_upload_kbps="$upload_kbps"
 	tc qdisc add dev "$target_if" handle ffff: ingress >/dev/null 2>&1 ||
 		fail "Unable to attach temporary ingress qdisc."
-	tc filter add dev "$target_if" parent ffff: protocol all u32 match u32 0 0 \
+	tc filter add dev "$target_if" parent ffff: protocol all pref "$temp_redirect_pref" u32 match u32 0 0 \
 		action mirred egress redirect dev "$temp_ifb" >/dev/null 2>&1 ||
 		fail "Unable to redirect ingress traffic into temporary IFB."
+	temporary_shaper_owned || fail "Temporary CAKE/IFB ownership postconditions failed."
 }
 
 cpu_monitor() {
@@ -467,43 +1768,359 @@ numeric_latency_stats() {
 	' "$sorted"
 }
 
-http_latency_once() {
-	start="$(cut -d ' ' -f 1 /proc/uptime 2>/dev/null)"
-	[ -n "$start" ] || return 1
-	route_exec "$http_fetch_bin" -4 -q -T 5 -O /dev/null "$http_probe_url" >/dev/null 2>&1 || return 1
-	finish="$(cut -d ' ' -f 1 /proc/uptime 2>/dev/null)"
-	[ -n "$finish" ] || return 1
-	awk -v start="$start" -v finish="$finish" 'BEGIN {
-		elapsed = (finish - start) * 1000
-		if (elapsed < 0) exit 1
-		printf "%.1f\n", elapsed
-	}'
+configure_transport_probe() {
+	transport_probe_backend="$(uci -q get "cake-autorate.$job_name.transport_probe_backend" 2>/dev/null || true)"
+	transport_probe_endpoint="$(uci -q get "cake-autorate.$job_name.transport_probe_endpoint" 2>/dev/null || true)"
+	transport_probe_configuration_error=""
+	transport_probe_timeout_s="$(uci -q get "cake-autorate.$job_name.transport_probe_timeout_s" 2>/dev/null || true)"
+	case "$transport_probe_timeout_s" in
+		''|*[!0-9]*) transport_probe_timeout_s=5 ;;
+	esac
+	[ "$transport_probe_timeout_s" -ge 1 ] 2>/dev/null || transport_probe_timeout_s=5
+	[ "$transport_probe_timeout_s" -le 30 ] 2>/dev/null || transport_probe_timeout_s=30
+
+	case "$transport_probe_backend:$transport_probe_endpoint" in
+		:) transport_probe_backend=websocket; transport_probe_endpoint=wss://ping-bufferbloat.libreqos.com/ws ;;
+		websocket:ws://*|websocket:wss://*) ;;
+		tcp:tcp://*)
+			transport_probe_configuration_error="Full Auto-Tune requires persistent WebSocket or HTTPS transport evidence; TCP connect probes are diagnostic-only."
+			return 1
+			;;
+		http:https://*) ;;
+		legacy-http:http://*|legacy-http:https://*)
+			transport_probe_configuration_error="Full Auto-Tune requires persistent WebSocket or HTTPS transport evidence; Legacy HTTP is diagnostic-only."
+			return 1
+			;;
+		*)
+			transport_probe_configuration_error="The configured transport probe backend and endpoint do not match."
+			return 1
+			;;
+	esac
+	case "$transport_probe_backend" in
+		websocket) transport_probe_reported_backend=websocket ;;
+		http) transport_probe_reported_backend=persistent-http ;;
+		tcp) transport_probe_reported_backend=tcp-connect ;;
+	esac
+	return 0
 }
 
-baseline_http_latency() {
-	values="$job_dir/http-baseline.values"
-	sorted="$job_dir/http-baseline.sorted"
-	: > "$values"
-	for sample in 1 2 3 4 5; do
-		http_latency_once >> "$values" || true
-	done
+run_transport_probe_cli() {
+	count="$1"
+	interval_ms="$2"
+	set -- "$transport_probe_bin" --transport-probe \
+		--backend "$transport_probe_backend" \
+		--endpoint "$transport_probe_endpoint" \
+		--device "$target_if" \
+		--source-ip "$source_ip" \
+		--count "$count" \
+		--timeout "$transport_probe_timeout_s" \
+		--interval-ms "$interval_ms"
+	[ -n "${route_mark:-}" ] && set -- "$@" --fwmark "$route_mark"
+	"$@"
+}
+
+extract_transport_values() {
+	input="$1"
+	output="$2"
+	awk '
+		match($0, /"raw_ms":\[[^]]*\]/) {
+			raw = substr($0, RSTART, RLENGTH)
+			sub(/^"raw_ms":\[/, "", raw)
+			sub(/\]$/, "", raw)
+			n = split(raw, values, ",")
+			for (i = 1; i <= n; i++)
+				if (values[i] ~ /^[0-9]+([.][0-9]+)?$/)
+					print values[i]
+		}
+	' "$input" > "$output"
+}
+
+validate_transport_evidence() {
+	input="$1"
+	output="$2"
+	minimum_rows="$3"
+	minimum_samples="$4"
+	report="$output.report"
+	transport_evidence_valid=false
+	transport_evidence_reason=transport-output-invalid
+	transport_evidence_rows=0
+	transport_evidence_samples=0
+	: > "$output"
+
+	# TCP connect timings are useful diagnostics but do not have persistent
+	# session semantics.  Full Auto-Tune compares loaded and idle application
+	# latency, so a handshake-only backend is intentionally inconclusive.
+	if [ "$transport_probe_reported_backend" = tcp-connect ]; then
+		transport_evidence_reason=transport-backend-not-persistent
+		return 1
+	fi
+
+	awk -v expected_backend="$transport_probe_reported_backend" \
+	    -v expected_endpoint="$transport_probe_endpoint" '
+		function string_field(line, key, pattern, value) {
+			pattern = "\\\"" key "\\\":\\\"[^\\\"]*\\\""
+			if (!match(line, pattern)) return ""
+			value = substr(line, RSTART + length(key) + 4, RLENGTH - length(key) - 5)
+			return value
+		}
+		NF {
+			rows++
+			backend = string_field($0, "backend")
+			endpoint = string_field($0, "endpoint")
+			if (backend != expected_backend) bad_backend++
+			if (endpoint != expected_endpoint) bad_endpoint++
+			if ($0 !~ /"trusted":true([,}])/) bad_trust++
+			if ($0 ~ /"connection_reused":true([,}])/) reused++
+			else if ($0 !~ /"connection_reused":false([,}])/) bad_reuse_field++
+			else if (rows > 1) nonpersistent_after_warmup++
+			if (match($0, /"raw_ms":\[[^]]*\]/)) {
+				raw = substr($0, RSTART, RLENGTH)
+				sub(/^"raw_ms":\[/, "", raw)
+				sub(/\]$/, "", raw)
+				n = split(raw, values, ",")
+				for (i = 1; i <= n; i++) {
+					gsub(/^[[:space:]]+|[[:space:]]+$/, "", values[i])
+					if (values[i] ~ /^[0-9]+([.][0-9]+)?$/) {
+						print "V " values[i]
+						samples++
+					} else if (values[i] != "") bad_sample++
+				}
+			} else bad_raw++
+		}
+		END {
+			reason = "ok"
+			if (rows < 1) reason = "transport-output-empty"
+			else if (bad_backend) reason = "transport-backend-mismatch"
+			else if (bad_endpoint) reason = "transport-endpoint-mismatch"
+			else if (bad_trust) reason = "transport-untrusted"
+			else if (bad_reuse_field || nonpersistent_after_warmup || reused < rows - 1)
+				reason = "transport-not-persistent"
+			else if (bad_raw || bad_sample) reason = "transport-samples-malformed"
+			print "M " reason " " rows " " samples
+		}
+	' "$input" > "$report" 2>/dev/null || {
+		rm -f "$report"
+		return 1
+	}
+	awk '$1 == "V" { print $2 }' "$report" > "$output"
+	set -- $(awk '$1 == "M" { print $2, $3, $4; exit }' "$report")
+	rm -f "$report"
+	transport_evidence_reason="${1:-transport-output-invalid}"
+	transport_evidence_rows="${2:-0}"
+	transport_evidence_samples="${3:-0}"
+	[ "$transport_evidence_reason" = ok ] || return 1
+	[ "$transport_evidence_rows" -ge "$minimum_rows" ] 2>/dev/null || {
+		transport_evidence_reason=transport-too-few-probes
+		return 1
+	}
+	[ "$transport_evidence_samples" -ge "$minimum_samples" ] 2>/dev/null || {
+		transport_evidence_reason=transport-too-few-samples
+		return 1
+	}
+	transport_evidence_valid=true
+	return 0
+}
+
+baseline_transport_latency() {
+	raw="$job_dir/transport-baseline.raw"
+	values="$job_dir/transport-baseline.values"
+	sorted="$job_dir/transport-baseline.sorted"
+	errors="$job_dir/transport-baseline.errors"
+	: > "$raw"
+	if ! run_transport_probe_cli 5 250 > "$raw" 2> "$errors"; then
+		[ -s "$raw" ] || return 1
+	fi
+	validate_transport_evidence "$raw" "$values" 5 15 || {
+		printf '%s\n' "$transport_evidence_reason" > "$job_dir/transport-baseline.evidence-error"
+		return 1
+	}
 	numeric_latency_stats "$values" "$sorted"
 }
 
-http_latency_monitor() {
+wait_for_baseline_retry() {
+	case "$baseline_retry_backoff_s" in
+		''|*[!0-9]*) baseline_retry_backoff_s=20 ;;
+		*) [ "$baseline_retry_backoff_s" -le 60 ] 2>/dev/null || baseline_retry_backoff_s=20 ;;
+	esac
+	if [ "$baseline_retry_backoff_s" -gt 0 ] 2>/dev/null; then
+		write_status quiet-check 19 "Waiting for ICMP policers and background traffic to settle before baseline retry"
+		sleep "$baseline_retry_backoff_s"
+	fi
+}
+
+capture_idle_baseline() {
+	baseline_phase_attempt=1
+	while [ "$baseline_phase_attempt" -le 2 ]; do
+		write_status quiet-check 19 "Checking that the selected uplink is idle before baseline attempt $baseline_phase_attempt"
+		measure_background_traffic
+		baseline_prequiet=true
+		[ "$background_blocked" = true ] && baseline_prequiet=false
+		if [ "$baseline_prequiet" != true ]; then
+			baseline_entry="{\"phase\":\"baseline\",\"attempt\":$baseline_phase_attempt,\"skipped\":true,\"prequiet\":false,\"postquiet\":false,\"icmp_valid\":false,\"transport_valid\":false,\"forwarded_background\":null}"
+			if [ -n "${phase_background_runs_json:-}" ]; then
+				phase_background_runs_json="$phase_background_runs_json,$baseline_entry"
+			else
+				phase_background_runs_json="$baseline_entry"
+			fi
+			phase_contamination_seen=true
+			if [ "$baseline_phase_attempt" -lt 2 ]; then
+				baseline_phase_attempt=$((baseline_phase_attempt + 1))
+				continue
+			fi
+			stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":3,\"stage\":\"baseline\",\"error\":\"The uplink was busy before both idle baseline attempts. Retry when quiet; conservative mode cannot invent an idle p95.\",\"background_blocked\":true,\"retryable\":true,\"auto_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
+			exit 1
+		fi
+
+		write_status baseline 22 "Measuring clean idle latency baseline (attempt $baseline_phase_attempt)"
+		phase_background_kind=baseline
+		start_phase_background_counter "$(configured_rate dl)" "$(configured_rate ul)"
+		baseline_valid=true
+		candidate_baseline="$(baseline_latency "$reflectors")" || baseline_valid=false
+		transport_baseline_valid=true
+		candidate_transport_baseline="$(baseline_transport_latency)" || transport_baseline_valid=false
+		stop_phase_background_counter
+
+		write_status quiet-check 25 "Checking that the uplink stayed idle through baseline attempt $baseline_phase_attempt"
+		measure_background_traffic
+		baseline_postquiet=true
+		[ "$background_blocked" = true ] && baseline_postquiet=false
+		baseline_traffic_contaminated="$phase_background_contaminated"
+		[ "$baseline_prequiet" = true ] || baseline_traffic_contaminated=true
+		[ "$baseline_postquiet" = true ] || baseline_traffic_contaminated=true
+		baseline_contaminated="$baseline_traffic_contaminated"
+		[ "$baseline_valid" = true ] || baseline_contaminated=true
+		[ "$transport_baseline_valid" = true ] || baseline_contaminated=true
+		baseline_entry="{\"phase\":\"baseline\",\"attempt\":$baseline_phase_attempt,\"prequiet\":$baseline_prequiet,\"postquiet\":$baseline_postquiet,\"icmp_valid\":$baseline_valid,\"transport_valid\":$transport_baseline_valid,\"forwarded_background\":$(phase_background_json)}"
+		if [ -n "${phase_background_runs_json:-}" ]; then
+			phase_background_runs_json="$phase_background_runs_json,$baseline_entry"
+		else
+			phase_background_runs_json="$baseline_entry"
+		fi
+
+		if [ "$baseline_contaminated" != true ]; then
+			set -- $candidate_baseline
+			idle_median_ms="$1"
+			idle_p95_ms="$2"
+			baseline_samples="$3"
+			set -- $candidate_transport_baseline
+			transport_idle_median_ms="$1"
+			transport_idle_p95_ms="$2"
+			transport_idle_max_ms="$3"
+			transport_idle_samples="$4"
+			[ "$baseline_samples" -ge 9 ] 2>/dev/null || baseline_valid=false
+			[ "$transport_idle_samples" -ge 15 ] 2>/dev/null || transport_baseline_valid=false
+			if [ "$baseline_valid" = true ] && [ "$transport_baseline_valid" = true ]; then
+				phase_background_kind=""
+				return 0
+			fi
+			baseline_contaminated=true
+		fi
+
+		# A probe parser/rate-limit retry is measurement instability, not proof
+		# of forwarded client traffic.  Preserve auto-apply eligibility when a
+		# second baseline is fully clean; real pre/post/counter contamination
+		# remains sticky and fail-closed.
+		[ "$baseline_traffic_contaminated" = true ] && phase_contamination_seen=true
+		if [ "$baseline_phase_attempt" -lt 2 ]; then
+			wait_for_baseline_retry
+			baseline_phase_attempt=$((baseline_phase_attempt + 1))
+			continue
+		fi
+		if [ "$phase_background_available" != true ]; then
+			fail "Forwarded-traffic evidence was unavailable for both idle baseline attempts; an idle p95 cannot be proven."
+		fi
+		if [ "$baseline_valid" != true ]; then
+			phase_evidence_complete=false
+			measurement_inconclusive baseline icmp-insufficient-per-reflector-baseline
+		fi
+		if [ "$transport_baseline_valid" != true ]; then
+			phase_evidence_complete=false
+			baseline_transport_reason="$(sed -n '1p' "$job_dir/transport-baseline.evidence-error" 2>/dev/null)"
+			measurement_inconclusive baseline "${baseline_transport_reason:-transport-baseline-invalid}"
+		fi
+		fail "Background traffic contaminated both idle baseline attempts. Conservative mode cannot reuse a contaminated idle p95."
+	done
+	return 1
+}
+
+start_transport_latency_monitor() {
 	output="$1"
-	marker="$2"
-	while [ -e "$marker" ]; do
-		http_latency_once >> "$output" || true
+	errors="$2"
+	: > "$output"
+	run_transport_probe_cli 100 1000 > "$output" 2> "$errors" &
+	transport_pid="$!"
+	transport_starttime="$(proc_starttime "$transport_pid" 2>/dev/null)"
+	is_positive_uint "$transport_starttime" || {
+		kill -KILL "$transport_pid" 2>/dev/null || true
+		wait "$transport_pid" 2>/dev/null || true
+		transport_pid=""
+		return 1
+	}
+}
+
+owned_monitor_gone() {
+	monitor_pid="$1"
+	monitor_start="$2"
+	actual_monitor_start="$(proc_starttime "$monitor_pid" 2>/dev/null)" || return 0
+	[ "$actual_monitor_start" = "$monitor_start" ] || return 1
+	case "$(proc_state "$monitor_pid" 2>/dev/null)" in ''|Z|z) return 0 ;; esac
+	return 1
+}
+
+stop_owned_monitor() {
+	monitor_pid="$1"
+	monitor_start="$2"
+	[ -n "$monitor_pid" ] || return 0
+	is_positive_uint "$monitor_start" || return 1
+	owned_monitor_gone "$monitor_pid" "$monitor_start" && {
+		wait "$monitor_pid" 2>/dev/null || true
+		return 0
+	}
+	[ "$(proc_starttime "$monitor_pid" 2>/dev/null)" = "$monitor_start" ] || return 1
+	kill -TERM "$monitor_pid" 2>/dev/null || true
+	monitor_wait=0
+	while [ "$monitor_wait" -lt 3 ]; do
+		owned_monitor_gone "$monitor_pid" "$monitor_start" && {
+			wait "$monitor_pid" 2>/dev/null || true
+			return 0
+		}
+		monitor_wait=$((monitor_wait + 1))
 		sleep 1
 	done
+	[ "$(proc_starttime "$monitor_pid" 2>/dev/null)" = "$monitor_start" ] || return 1
+	kill -KILL "$monitor_pid" 2>/dev/null || true
+	monitor_wait=0
+	while [ "$monitor_wait" -lt 3 ]; do
+		owned_monitor_gone "$monitor_pid" "$monitor_start" && {
+			wait "$monitor_pid" 2>/dev/null || true
+			return 0
+		}
+		monitor_wait=$((monitor_wait + 1))
+		sleep 1
+	done
+	return 1
+
+}
+
+stop_transport_latency_monitor() {
+	[ -n "${transport_pid:-}" ] || return 0
+	stop_owned_monitor "$transport_pid" "${transport_starttime:-}" || return 1
+	transport_pid=""
+	transport_starttime=""
+	return 0
 }
 
 icmp_latency_monitor() {
 	output="$1"
 	marker="$2"
 	while [ -e "$marker" ]; do
-		route_exec "$fping_bin" -I "$target_if" -D -c 1 -p 1000 $reflectors >> "$output" 2>&1 || true
+		case $- in *f*) monitor_had_noglob=1 ;; *) monitor_had_noglob=0; set -f ;; esac
+		# fping accepts --; every following token has also passed
+		# valid_reflector, preventing target text from becoming an option.
+		set -- $reflectors
+		[ "$monitor_had_noglob" = 1 ] || set +f
+		route_exec "$fping_bin" -I "$target_if" -D -c 1 -p 1000 -- "$@" >> "$output" 2>&1 || true
+		[ -e "$marker" ] && sleep 1
 	done
 }
 
@@ -530,6 +2147,118 @@ latency_stats() {
 			printf "%.3f %.3f %.3f %d", median, value[p95_index], value[NR], NR
 		}
 	' "$sorted"
+}
+
+build_icmp_evidence() {
+	icmp_build_input="$1"
+	icmp_build_expected="$2"
+	icmp_build_output="$3"
+	icmp_build_format="$4"
+	icmp_build_minimum_attempts="$5"
+	icmp_build_minimum_successes="$6"
+	awk -v expected="$icmp_build_expected" -v format="$icmp_build_format" \
+	    -v minimum_attempts="$icmp_build_minimum_attempts" -v minimum_successes="$icmp_build_minimum_successes" '
+		function remember(host, value) {
+			success[host]++
+			values[host SUBSEP success[host]] = value + 0
+		}
+		format == "baseline" {
+			# fping right-aligns the separator, so short IPv4 addresses have
+			# several spaces before the colon.  Match the whitespace-delimited
+			# separator rather than the exact three-byte string " : ".
+			if (!match($0, /[[:space:]]+:[[:space:]]+/)) next
+			host = substr($0, 1, RSTART - 1)
+			gsub(/[[:space:]]+$/, "", host)
+			rest = substr($0, RSTART + RLENGTH)
+			n = split(rest, fields, /[[:space:]]+/)
+			for (i = 1; i <= n; i++) {
+				if (fields[i] == "-") attempts[host]++
+				else if (fields[i] ~ /^[0-9]+([.][0-9]+)?$/) {
+					attempts[host]++
+					remember(host, fields[i])
+				}
+			}
+			next
+		}
+		format == "loaded" {
+			host = $2
+			if (host == "") next
+			if (index($0, "timed out")) {
+				attempts[host]++
+				next
+			}
+			if (index($0, " bytes,") && index($0, " ms")) {
+				attempts[host]++
+				for (i = 2; i <= NF; i++)
+					if ($i == "ms" && $(i - 1) ~ /^[0-9]+([.][0-9]+)?$/) {
+						remember(host, $(i - 1))
+						break
+					}
+			}
+		}
+		END {
+			nhosts = split(expected, hosts, /[[:space:]]+/)
+			if (nhosts < 3) invalid = 1
+			for (h = 1; h <= nhosts; h++) {
+				host = hosts[h]
+				if (host == "") { invalid = 1; continue }
+				if (attempts[host] < minimum_attempts || success[host] < minimum_successes) invalid = 1
+				for (i = 1; i <= success[host]; i++) sorted[i] = values[host SUBSEP i]
+				for (i = 1; i <= success[host]; i++)
+					for (j = i + 1; j <= success[host]; j++)
+						if (sorted[j] < sorted[i]) { tmp = sorted[i]; sorted[i] = sorted[j]; sorted[j] = tmp }
+				p95index = int((success[host] * 95 + 99) / 100)
+				if (p95index < 1) p95index = 1
+				p95 = success[host] ? sorted[p95index] : 0
+				loss = attempts[host] ? 100 * (attempts[host] - success[host]) / attempts[host] : 100
+				printf "%s\t%d\t%d\t%.2f\t%.3f\n", host, attempts[host], success[host], loss, p95
+				for (i = 1; i <= success[host]; i++) delete sorted[i]
+			}
+			exit(invalid ? 1 : 0)
+		}
+	' "$icmp_build_input" > "$icmp_build_output"
+}
+
+classify_loaded_icmp_evidence() {
+	loaded_stats="$1"
+	baseline_stats="$2"
+	classification="$(awk '
+		FNR == NR { baseline[$1] = $5; next }
+		{
+			n++
+			host[n] = $1
+			loss[n] = $4 + 0
+			delta[n] = $5 - baseline[$1]
+			if (delta[n] < 0) delta[n] = 0
+		}
+		END {
+			if (n < 3) { print "incomplete|fewer-than-three-reflector-families"; exit }
+			for (i = 1; i <= n; i++) {
+				sorted_loss[i] = loss[i]
+				sorted_delta[i] = delta[i]
+			}
+			for (i = 1; i <= n; i++) for (j = i + 1; j <= n; j++) {
+				if (sorted_loss[j] < sorted_loss[i]) { tmp=sorted_loss[i]; sorted_loss[i]=sorted_loss[j]; sorted_loss[j]=tmp }
+				if (sorted_delta[j] < sorted_delta[i]) { tmp=sorted_delta[i]; sorted_delta[i]=sorted_delta[j]; sorted_delta[j]=tmp }
+			}
+			max_loss = sorted_loss[n]
+			second_loss = sorted_loss[n - 1]
+			if (max_loss >= 20 && second_loss <= 5) {
+				for (i = 1; i <= n; i++) if (loss[i] == max_loss) { print "rate-limit|" host[i]; exit }
+			}
+			median_delta = sorted_delta[int((n + 1) / 2)]
+			spread_limit = median_delta * 3 + 10
+			if (spread_limit < 30) spread_limit = 30
+			if (sorted_delta[n] - sorted_delta[1] > spread_limit) {
+				print "disagreement|reflector-family-p95-disagreement"
+				exit
+			}
+			print "ok|ok"
+		}
+	' "$baseline_stats" "$loaded_stats" 2>/dev/null)"
+	icmp_evidence_class="${classification%%|*}"
+	icmp_evidence_detail="${classification#*|}"
+	[ "$icmp_evidence_class" = ok ]
 }
 
 packet_loss_percent() {
@@ -578,29 +2307,25 @@ packet_loss_percent() {
 	'
 }
 
-score_validation() {
-	raw_dl_low="$1"
-	raw_ul_low="$2"
-	shaped_dl="$3"
-	shaped_ul="$4"
-	loaded_p95="$5"
-	idle_median="$6"
-	loss="$7"
-	cpu_peak="$8"
-	http_delta="$9"
-	awk -v rdl="$raw_dl_low" -v rul="$raw_ul_low" -v sdl="$shaped_dl" -v sul="$shaped_ul" \
-		-v loaded="$loaded_p95" -v idle="$idle_median" -v loss="$loss" -v cpu="$cpu_peak" -v http="$http_delta" 'BEGIN {
-		dlr = rdl > 0 ? sdl * 100 / rdl : 0; ulr = rul > 0 ? sul * 100 / rul : 0;
-		delta = loaded - idle; if (delta < 0) delta = 0;
-		effective = delta > http ? delta : http; score = 100;
-		if (dlr < 90) score -= (90 - dlr) * 1.5;
-		if (ulr < 90) score -= (90 - ulr) * 1.5;
-		if (effective > 40) score -= (effective - 40) * 0.5;
-		if (loss > 1) score -= (loss - 1) * 5;
-		if (cpu > 80) score -= (cpu - 80) * 2;
-		if (score < 0) score = 0; if (score > 100) score = 100;
-		pass = dlr >= 80 && ulr >= 80 && delta <= 100 && http <= 100 && loss <= 5 && cpu <= 95;
-		printf "%.1f %.1f %.1f %.1f %.1f %.1f %s", dlr, ulr, delta, http, effective, score, pass ? "true" : "false";
+typed_json_fragment() {
+	typed_json="$1"
+	typed_field="$2"
+	case "$typed_field" in
+		metrics) printf '%s\n' "$typed_json" | sed -n 's/^.*"metrics":\(.*\),"signals":.*$/\1/p' ;;
+		signals) printf '%s\n' "$typed_json" | sed -n 's/^.*"signals":\(.*\),"gates":.*$/\1/p' ;;
+		gates) printf '%s\n' "$typed_json" | sed -n 's/^.*"gates":\(\[.*\]\),"reasons":.*$/\1/p' ;;
+		reasons) printf '%s\n' "$typed_json" | sed -n 's/^.*"reasons":\(\[.*\]\),"correction":.*$/\1/p' ;;
+		correction) printf '%s\n' "$typed_json" | sed -n 's/^.*"correction":\(.*\)}$/\1/p' ;;
+		*) return 1 ;;
+	esac
+}
+
+scale_for_reference_base() {
+	desired_kbps="$1"
+	reference_kbps="$2"
+	awk -v desired="$desired_kbps" -v reference="$reference_kbps" 'BEGIN {
+		if (desired <= 0 || reference <= 0) exit 1
+		printf "%.9f", desired / reference
 	}'
 }
 
@@ -611,27 +2336,259 @@ extract_json() {
 	printf '%s\n' "$json" | "$jsonfilter_bin" -e "$expression" 2>/dev/null
 }
 
+proposal_json_valid() {
+	proposal_candidate="$1"
+	[ -n "$proposal_candidate" ] || return 1
+	strict_single_json_object "$proposal_candidate" || return 1
+	for proposal_expression in \
+		'@.download.minimum_kbps' '@.download.base_kbps' '@.download.maximum_kbps' \
+		'@.download.absolute_cap_kbps' '@.download.observed_low_kbps' '@.download.observed_median_kbps' \
+		'@.upload.minimum_kbps' '@.upload.base_kbps' '@.upload.maximum_kbps' \
+		'@.upload.absolute_cap_kbps' '@.upload.observed_low_kbps' '@.upload.observed_median_kbps' \
+		'@.active_threshold_kbps' '@.thresholds_ms.adjust_up' '@.thresholds_ms.delay' \
+		'@.thresholds_ms.adjust_down' '@.link.layer' '@.link.overhead' '@.link.mpu'; do
+		proposal_value="$(extract_json "$proposal_candidate" "$proposal_expression")" || return 1
+		[ -n "$proposal_value" ] || return 1
+	done
+	for proposal_expression in '@.download.base_kbps' '@.upload.base_kbps'; do
+		proposal_value="$(extract_json "$proposal_candidate" "$proposal_expression")" || return 1
+		is_positive_uint "$proposal_value" || return 1
+	done
+	return 0
+}
+
+process_group_contains_session() {
+	group_id="$1"
+	for proc_dir in /proc/[0-9]*; do
+		[ -r "$proc_dir/stat" ] || continue
+		member_pid="${proc_dir#/proc/}"
+		case "$(proc_state "$member_pid" 2>/dev/null)" in
+			''|Z|z) continue ;;
+		esac
+		[ "$(proc_group "$member_pid")" = "$group_id" ] || continue
+		[ "$(proc_session "$member_pid")" = "$group_id" ] || continue
+		return 0
+	done
+	return 1
+}
+
+speedtest_identity_matches() {
+	candidate_pid="$1"
+	expected_starttime="$2"
+	[ "$(proc_starttime "$candidate_pid" 2>/dev/null)" = "$expected_starttime" ] || return 1
+	proc_cmdline_has_arg "$candidate_pid" "$speedtest_bin" || return 1
+	proc_cmdline_has_arg "$candidate_pid" "$job_name" || return 1
+	proc_cmdline_has_arg "$candidate_pid" "$target_if" || return 1
+}
+
+signal_test_group_until_gone() {
+	group_id="$1"
+	group_starttime="$2"
+	process_group_contains_session "$group_id" || return 0
+	if [ -d "/proc/$group_id" ]; then
+		[ "$(proc_starttime "$group_id" 2>/dev/null)" = "$group_starttime" ] || return 1
+		case "$(proc_state "$group_id" 2>/dev/null)" in
+			Z|z) ;;
+			*) speedtest_identity_matches "$group_id" "$group_starttime" || return 1 ;;
+		esac
+	fi
+	kill -TERM -- "-$group_id" >/dev/null 2>&1 || kill -TERM "-$group_id" >/dev/null 2>&1 || true
+	grace_second=0
+	while [ "$grace_second" -lt "$test_termination_grace_s" ]; do
+		process_group_contains_session "$group_id" || return 0
+		if [ -d "/proc/$group_id" ]; then
+			[ "$(proc_starttime "$group_id" 2>/dev/null)" = "$group_starttime" ] || return 1
+			case "$(proc_state "$group_id" 2>/dev/null)" in
+				Z|z) ;;
+				*) speedtest_identity_matches "$group_id" "$group_starttime" || return 1 ;;
+			esac
+		fi
+		grace_second=$((grace_second + 1))
+		sleep 1
+	done
+	if [ -d "/proc/$group_id" ]; then
+		[ "$(proc_starttime "$group_id" 2>/dev/null)" = "$group_starttime" ] || return 1
+		case "$(proc_state "$group_id" 2>/dev/null)" in
+			Z|z) ;;
+			*) speedtest_identity_matches "$group_id" "$group_starttime" || return 1 ;;
+		esac
+	fi
+	kill -KILL -- "-$group_id" >/dev/null 2>&1 || kill -KILL "-$group_id" >/dev/null 2>&1 || true
+	grace_second=0
+	while [ "$grace_second" -lt 3 ]; do
+		process_group_contains_session "$group_id" || return 0
+		grace_second=$((grace_second + 1))
+		sleep 1
+	done
+	return 1
+}
+
+clear_active_test_journal() {
+	old_active_test_pgid="${recovery_active_test_pgid:-}"
+	old_active_test_starttime="${recovery_active_test_starttime:-}"
+	recovery_active_test_pgid=""
+	recovery_active_test_starttime=""
+	if ! write_recovery_journal; then
+		recovery_active_test_pgid="$old_active_test_pgid"
+		recovery_active_test_starttime="$old_active_test_starttime"
+		return 1
+	fi
+	return 0
+}
+
 run_speedtest_with_timeout() {
 	# Keep every speedtest-go phase on the server selected by the first
 	# unshaped sample.  The helper's automatic validation may otherwise pick a
 	# different server under a deliberately shaped low-rate validation run,
 	# making the throughput and latency comparison invalid.
+	[ "${recovery_prepared:-0}" = 1 ] && [ "${recovery_armed:-0}" = 1 ] &&
+		[ -f "$recovery_journal" ] && [ -e "$recovery_heartbeat" ] || return 1
+	setsid_bin="$(command -v setsid 2>/dev/null)"
+	[ -n "$setsid_bin" ] || return 1
+	test_timeout_s="${CAKE_AUTORATE_AUTOTUNE_SPEEDTEST_TIMEOUT_S:-90}"
+	test_termination_grace_s="${CAKE_AUTORATE_AUTOTUNE_SPEEDTEST_TERM_GRACE_S:-3}"
+	case "$test_timeout_s" in ''|*[!0-9]*) test_timeout_s=90 ;; esac
+	case "$test_termination_grace_s" in ''|*[!0-9]*) test_termination_grace_s=3 ;; esac
+	[ "$test_timeout_s" -ge 1 ] 2>/dev/null || test_timeout_s=90
+	[ "$test_timeout_s" -le 300 ] 2>/dev/null || test_timeout_s=300
+	[ "$test_termination_grace_s" -ge 1 ] 2>/dev/null || test_termination_grace_s=3
+	[ "$test_termination_grace_s" -le 10 ] 2>/dev/null || test_termination_grace_s=10
+	test_output="$job_dir/speedtest-phase.raw"
+	rm -f "$test_output"
+	launch_parent_group="$(proc_group "$$" 2>/dev/null)"
+	launch_parent_session="$(proc_session "$$" 2>/dev/null)"
 	if [ "$backend" = "speedtest-go" ] && is_positive_uint "${selected_server_id:-}"; then
 		CAKE_AUTORATE_SPEEDTEST_GO_SERVER_ID="$selected_server_id" \
-			"$speedtest_bin" "$@" &
+		CAKE_AUTORATE_SPEEDTEST_START_STOPPED=1 CAKE_AUTORATE_SPEEDTEST_SETSID="$setsid_bin" \
+			"$speedtest_bin" "$@" > "$test_output" &
 	else
-		"$speedtest_bin" "$@" &
+		CAKE_AUTORATE_SPEEDTEST_START_STOPPED=1 CAKE_AUTORATE_SPEEDTEST_SETSID="$setsid_bin" \
+			"$speedtest_bin" "$@" > "$test_output" &
 	fi
 	test_pid="$!"
-	(
-		sleep 90
-		kill -TERM "$test_pid" 2>/dev/null || true
-	) >/dev/null 2>&1 &
-	watchdog_pid="$!"
-	wait "$test_pid"
-	test_rc="$?"
-	kill "$watchdog_pid" 2>/dev/null || true
-	wait "$watchdog_pid" 2>/dev/null || true
+	test_starttime="$(proc_starttime "$test_pid" 2>/dev/null)"
+	is_positive_uint "$test_starttime" || {
+		kill -KILL "$test_pid" 2>/dev/null || true
+		wait "$test_pid" 2>/dev/null || true
+		return 1
+	}
+	test_stopped=0
+	identity_attempt=0
+	while [ "$identity_attempt" -lt 5 ]; do
+		if [ "$(proc_starttime "$test_pid" 2>/dev/null)" = "$test_starttime" ] &&
+		   [ "$(proc_state "$test_pid" 2>/dev/null)" = T ] &&
+		   [ "$(proc_group "$test_pid" 2>/dev/null)" = "$launch_parent_group" ] &&
+		   [ "$(proc_session "$test_pid" 2>/dev/null)" = "$launch_parent_session" ] &&
+		   speedtest_identity_matches "$test_pid" "$test_starttime"; then
+			test_stopped=1
+			break
+		fi
+		[ "$(proc_state "$test_pid" 2>/dev/null)" = Z ] && break
+		kill -0 "$test_pid" 2>/dev/null || break
+		identity_attempt=$((identity_attempt + 1))
+		sleep 1
+	done
+	if [ "$test_stopped" != 1 ]; then
+		[ "$(proc_starttime "$test_pid" 2>/dev/null)" = "$test_starttime" ] &&
+			kill -KILL "$test_pid" 2>/dev/null || true
+		wait "$test_pid" 2>/dev/null || true
+		rm -f "$test_output"
+		return 1
+	fi
+	recovery_active_test_pgid="$test_pid"
+	recovery_active_test_starttime="$test_starttime"
+	if ! write_recovery_journal; then
+		kill -KILL "$test_pid" 2>/dev/null || true
+		wait "$test_pid" 2>/dev/null || true
+		return 1
+	fi
+	[ "$(proc_starttime "$test_pid" 2>/dev/null)" = "$test_starttime" ] &&
+		[ "$(proc_state "$test_pid" 2>/dev/null)" = T ] &&
+		[ "$(proc_group "$test_pid" 2>/dev/null)" = "$launch_parent_group" ] &&
+		[ "$(proc_session "$test_pid" 2>/dev/null)" = "$launch_parent_session" ] &&
+		speedtest_identity_matches "$test_pid" "$test_starttime" || {
+			[ "$(proc_starttime "$test_pid" 2>/dev/null)" = "$test_starttime" ] &&
+				kill -KILL "$test_pid" 2>/dev/null || true
+			wait "$test_pid" 2>/dev/null || true
+			process_group_contains_session "$test_pid" && return 1
+			clear_active_test_journal || return 1
+			return 1
+		}
+	kill -CONT "$test_pid" 2>/dev/null || {
+		[ "$(proc_starttime "$test_pid" 2>/dev/null)" = "$test_starttime" ] &&
+			kill -KILL "$test_pid" 2>/dev/null || true
+		wait "$test_pid" 2>/dev/null || true
+		process_group_contains_session "$test_pid" && return 1
+		clear_active_test_journal || return 1
+		return 1
+	}
+	test_group_verified=0
+	transition_attempt=0
+	while [ "$transition_attempt" -lt 5 ]; do
+		test_state="$(proc_state "$test_pid" 2>/dev/null)"
+		case "$test_state" in ''|Z|z) break ;; esac
+		if speedtest_identity_matches "$test_pid" "$test_starttime" &&
+		   [ "$(proc_group "$test_pid" 2>/dev/null)" = "$test_pid" ] &&
+		   [ "$(proc_session "$test_pid" 2>/dev/null)" = "$test_pid" ]; then
+			test_group_verified=1
+			break
+		fi
+		transition_attempt=$((transition_attempt + 1))
+		sleep 1
+	done
+	if [ "$test_group_verified" != 1 ]; then
+		test_state="$(proc_state "$test_pid" 2>/dev/null)"
+		case "$test_state" in
+			''|Z|z)
+				if wait "$test_pid" 2>/dev/null; then test_rc=0; else test_rc="$?"; fi
+				process_group_contains_session "$test_pid" && return 1
+				clear_active_test_journal || return 1
+				cat "$test_output" 2>/dev/null
+				rm -f "$test_output"
+				return "$test_rc"
+				;;
+			*)
+				# The child never completed its verified setsid transition.  It is
+				# still an exact child in the owner group, so kill only that PID;
+				# never enter an unbounded wait and never clear the journal until
+				# absence of a separately created group has been proved.
+				if [ "$(proc_starttime "$test_pid" 2>/dev/null)" = "$test_starttime" ]; then
+					kill -KILL "$test_pid" 2>/dev/null || true
+				fi
+				wait "$test_pid" 2>/dev/null || true
+				process_group_contains_session "$test_pid" && return 1
+				clear_active_test_journal || return 1
+				rm -f "$test_output"
+				return 1
+				;;
+		esac
+	fi
+
+	timed_out=0
+	elapsed_seconds=0
+	while process_group_contains_session "$test_pid"; do
+		if [ "$elapsed_seconds" -ge "$test_timeout_s" ]; then
+			timed_out=1
+			signal_test_group_until_gone "$test_pid" "$test_starttime" || {
+				return 1
+			}
+			break
+		fi
+		if [ -d "/proc/$test_pid" ] &&
+		   [ "$(proc_starttime "$test_pid" 2>/dev/null)" = "$test_starttime" ] &&
+		   ! speedtest_identity_matches "$test_pid" "$test_starttime"; then
+			signal_test_group_until_gone "$test_pid" "$test_starttime" || true
+			return 1
+		fi
+		elapsed_seconds=$((elapsed_seconds + 1))
+		sleep 1
+	done
+	if wait "$test_pid"; then test_rc=0; else test_rc="$?"; fi
+	process_group_contains_session "$test_pid" && return 1
+	clear_active_test_journal || return 1
+	cat "$test_output" 2>/dev/null
+	[ "$timed_out" = 1 ] && test_rc=124
+	rm -f "$test_output"
 	return "$test_rc"
 }
 
@@ -646,15 +2603,22 @@ baseline_latency() {
 	[ -n "$reflectors" ] || reflectors="1.1.1.1 9.9.9.9"
 	# fping writes summary output to stderr.  -C gives each individual RTT,
 	# which is preferable to estimating p95 from only min/avg/max.
-	route_exec "$fping_bin" -I "$target_if" -C 5 -q $reflectors > /dev/null 2> "$output" || true
-	awk -F ':' '
+	case $- in *f*) baseline_had_noglob=1 ;; *) baseline_had_noglob=0; set -f ;; esac
+	set -- $reflectors
+	[ "$baseline_had_noglob" = 1 ] || set +f
+	route_exec "$fping_bin" -I "$target_if" -C 5 -p 1000 -q -- "$@" > /dev/null 2> "$output" || true
+	# A large total is not enough: one fast reflector could otherwise hide two
+	# dead or heavily lossy families.  Require an independently useful baseline
+	# (at least three successful RTTs) from every selected reflector.
+	build_icmp_evidence "$output" "$reflectors" \
+		"$job_dir/icmp-baseline-reflectors.tsv" baseline 5 3 || return 1
+	awk '
 		{
-			for (i = 2; i <= NF; i++) {
-				n = split($i, fields, /[[:space:]]+/)
-				for (j = 1; j <= n; j++)
-					if (fields[j] ~ /^[0-9]+([.][0-9]+)?$/)
-						print fields[j]
-			}
+			if (!match($0, /[[:space:]]+:[[:space:]]+/)) next
+			rest = substr($0, RSTART + RLENGTH)
+			n = split(rest, fields, /[[:space:]]+/)
+			for (i = 1; i <= n; i++)
+				if (fields[i] ~ /^[0-9]+([.][0-9]+)?$/) print fields[i]
 		}
 	' "$output" > "$values"
 	[ -s "$values" ] || return 1
@@ -674,12 +2638,15 @@ baseline_latency() {
 
 preflight() {
 	write_status preflight 5 "Checking interface, route, test backend, and helper availability"
+	[ -r "$runtime_lock_lib" ] && command -v runtime_lock_acquire_interface >/dev/null 2>&1 ||
+		fail "The shared CAKE/SQM runtime-lock helper is unavailable."
 	[ -x "$speedtest_bin" ] || fail "Speed test helper is not installed."
 	[ -x "$pinger_plan_bin" ] || fail "Reflector planner is not installed."
 	[ -x "$daemon_bin" ] || fail "cake-autorated is not installed."
 	[ -n "$jsonfilter_bin" ] || fail "jsonfilter is required for Full Auto-Tune."
 	[ -n "$fping_bin" ] || fail "fping is required for Full Auto-Tune latency validation."
-	[ -x "$http_fetch_bin" ] || fail "uclient-fetch is required for Full Auto-Tune TCP/HTTPS latency validation."
+	[ -x "$transport_probe_bin" ] || fail "The native transport probe helper is required for Full Auto-Tune latency validation."
+	configure_transport_probe || fail "$transport_probe_configuration_error"
 
 	if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_PREFLIGHT:-0}" = 1 ]; then
 		# Test-only injection: LuCI/rpcd does not pass caller-controlled
@@ -707,10 +2674,26 @@ preflight() {
 		calibration_route_identity="$route_identity"
 		link_kind="$(detect_link_kind "$target_if" "$target_if_input")"
 	fi
+	preflight_sqm_ownership
 
-	backend_status="$($speedtest_bin "$job_name" "$target_if" status "$backend" 2>/dev/null)"
+	requested_backend="$backend"
+	status_backend="$requested_backend"
+	# Full Auto-Tune needs one server that can be pinned across unshaped and
+	# directional shaped phases. Generic speedtest `auto` may prefer
+	# librespeed-cli first, so deliberately resolve the supported pinnable
+	# backend instead of selecting one and rejecting it afterwards.
+	[ "$requested_backend" = auto ] && status_backend=speedtest-go
+	backend_status="$($speedtest_bin "$job_name" "$target_if" status "$status_backend" 2>/dev/null)"
 	backend_available="$(extract_json "$backend_status" '@.available')"
 	[ "$backend_available" = true ] || fail "No usable speed test backend is available."
+	resolved_backend="$(extract_json "$backend_status" '@.selected_backend')"
+	case "$resolved_backend" in
+		speedtest-go) ;;
+		'') fail "The speed test helper did not resolve $status_backend to a concrete backend." ;;
+		*) fail "Full Auto-Tune requires a backend with a pinnable, verifiable server identity; $resolved_backend cannot currently prove comparable multi-phase samples." ;;
+	esac
+	backend="$resolved_backend"
+	preflight_phase_accounting
 	conflicting_instance="$(autorate_conflict_for_target 2>/dev/null || true)"
 	[ -z "$conflicting_instance" ] ||
 		fail "Enabled autorate instance $conflicting_instance already owns $target_if. Tune that instance instead of creating a duplicate."
@@ -721,20 +2704,65 @@ fail() {
 	if [ -e "$cancel_file" ]; then
 		exit 130
 	fi
-	atomic_write "$error_file" "{\"state\":\"failed\",\"error\":\"$(json_escape "$message")\"}"
+	stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":3,\"stage\":\"$(json_escape "${current_phase:-unknown}")\",\"error\":\"$(json_escape "$message")\",\"auto_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":${phase_contamination_seen:-false},\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[${phase_background_runs_json:-}],\"validation_attempts\":[${validation_attempts_json:-}],\"validation\":${validation_json:-null},\"pinger_plan\":${pinger_plan:-null},\"proposal\":${proposal:-null},\"configuration_written\":false}"
+	exit 1
+}
+
+measurement_inconclusive() {
+	measurement_stage="$1"
+	measurement_reason="$2"
+	stage_terminal_json error "{\"state\":\"inconclusive\",\"schema_version\":3,\"stage\":\"$(json_escape "$measurement_stage")\",\"error\":\"Measurement evidence remained invalid after a bounded retry; no candidate was accepted.\",\"reason\":\"$(json_escape "$measurement_reason")\",\"retryable\":true,\"auto_apply_eligible\":false,\"phase_evidence_complete\":false,\"phase_contamination_seen\":${phase_contamination_seen:-false},\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[${phase_background_runs_json:-}],\"validation_attempts\":[${validation_attempts_json:-}],\"pinger_plan\":${pinger_plan:-null},\"proposal\":${proposal:-null},\"configuration_written\":false}"
 	exit 1
 }
 
 run_measurement() {
 	index="$1"
-	write_status throughput "$((30 + index * 20))" "Running unshaped throughput sample $index of 2"
-	result="$(run_speedtest_with_timeout "$job_name" "$target_if" run "$backend" "" "$route_mode" "$mwan3_member")" ||
-		fail "Throughput sample $index failed."
+	measurement_attempt=1
+	while [ "$measurement_attempt" -le 2 ]; do
+		write_status throughput "$((30 + index * 20))" "Running unshaped throughput sample $index of 2 (attempt $measurement_attempt)"
+		phase_background_kind=unshaped
+		start_phase_background_counter "$(configured_rate dl)" "$(configured_rate ul)"
+		measurement_result_file="$job_dir/unshaped-$index-$measurement_attempt.result"
+		if ! run_speedtest_with_timeout "$job_name" "$target_if" run "$backend" "" "$route_mode" "$mwan3_member" > "$measurement_result_file"; then
+			stop_phase_background_counter
+			fail "Throughput sample $index failed."
+		fi
+		result="$(cat "$measurement_result_file" 2>/dev/null)"
+		rm -f "$measurement_result_file"
+		stop_phase_background_counter
+		result_backend="$(extract_json "$result" '@.backend')"
+		[ "$result_backend" = "$backend" ] ||
+			fail "Speed test backend changed from $backend to ${result_backend:-unknown} during unshaped sample $index."
+		download="$(extract_json "$result" '@.download_kbps')"
+		upload="$(extract_json "$result" '@.upload_kbps')"
+		phase_entry="{\"phase\":\"unshaped\",\"sample\":$index,\"attempt\":$measurement_attempt,\"measured\":{\"download_kbps\":${download:-0},\"upload_kbps\":${upload:-0}},\"forwarded_background\":$(phase_background_json)}"
+		if [ -n "${phase_background_runs_json:-}" ]; then
+			phase_background_runs_json="$phase_background_runs_json,$phase_entry"
+		else
+			phase_background_runs_json="$phase_entry"
+		fi
+		if [ "$phase_background_contaminated" != true ]; then
+			break
+		fi
+		phase_contamination_seen=true
+		if [ "$measurement_attempt" -ge 2 ]; then
+			if [ "$phase_background_available" != true ]; then
+				fail "Forwarded-traffic evidence was unavailable for both attempts of unshaped sample $index."
+			fi
+			if [ "${conservative_mode:-0}" = 1 ]; then
+				break
+			fi
+			stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":3,\"error\":\"Forwarded WAN traffic contaminated both attempts of unshaped sample $index. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"throughput\",\"auto_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
+			exit 1
+		fi
+		measurement_attempt=$((measurement_attempt + 1))
+	done
 	download="$(extract_json "$result" '@.download_kbps')"
 	upload="$(extract_json "$result" '@.upload_kbps')"
 	is_positive_uint "$download" || fail "Throughput sample $index returned no download rate."
 	is_positive_uint "$upload" || fail "Throughput sample $index returned no upload rate."
 	server_id="$(extract_json "$result" '@.server_id')"
+	is_positive_uint "$server_id" || fail "The pinned speedtest-go server identity was missing from throughput sample $index."
 	result_route_identity="$(extract_json "$result" '@.route_mode')|$(extract_json "$result" '@.mwan3_member')|$(extract_json "$result" '@.route_interface')|$(extract_json "$result" '@.route_source_ip')|$(extract_json "$result" '@.route_fwmark')|$(extract_json "$result" '@.route_table')"
 	[ "$result_route_identity" = "$calibration_route_identity" ] ||
 		fail "WAN route identity changed between Full Auto-Tune phases."
@@ -743,7 +2771,7 @@ run_measurement() {
 	if [ "$index" -eq 1 ]; then
 		selected_server_id="$server_id"
 		selected_external_ip="$result_external_ip"
-	elif [ -n "$selected_server_id" ] && [ -n "$server_id" ] && [ "$server_id" != "$selected_server_id" ]; then
+	elif [ -n "$selected_server_id" ] && [ "$server_id" != "$selected_server_id" ]; then
 		fail "Speed test server changed during raw calibration; retry for comparable samples."
 	fi
 	[ "$result_external_ip" = "$selected_external_ip" ] ||
@@ -760,7 +2788,8 @@ run_measurement() {
 }
 
 calculate_proposal() {
-	base_scale="${1:-1.0}"
+	dl_base_scale="${1:-1.0}"
+	ul_base_scale="${2:-$dl_base_scale}"
 	if [ "${conservative_mode:-0}" = 1 ]; then
 		"$daemon_bin" --autotune-proposal \
 			--dl-samples "$download_samples" \
@@ -769,7 +2798,8 @@ calculate_proposal() {
 			--idle-p95-ms "$idle_p95_ms" \
 			--idle-samples "$baseline_samples" \
 			--link-kind "$link_kind" \
-			--base-scale "$base_scale" \
+			--dl-base-scale "$dl_base_scale" \
+			--ul-base-scale "$ul_base_scale" \
 			--conservative-background-dl-kbps "${background_dl_kbps:-0}" \
 			--conservative-background-ul-kbps "${background_ul_kbps:-0}" \
 			--retain-dl "$([ "$background_dl_usable" = true ] && printf 0 || printf 1)" \
@@ -790,140 +2820,588 @@ calculate_proposal() {
 			--idle-p95-ms "$idle_p95_ms" \
 			--idle-samples "$baseline_samples" \
 			--link-kind "$link_kind" \
-			--base-scale "$base_scale"
+			--dl-base-scale "$dl_base_scale" \
+			--ul-base-scale "$ul_base_scale"
 	fi
 }
 
-revision_scale_for_validation() {
-	awk -v dl="$dl_retention" -v ul="$ul_retention" -v delta="$effective_loaded_delta_ms" \
-		-v loss="$loss_percent" -v cpu="$cpu_peak" 'BEGIN {
-		if (delta > 60 || loss > 1) print "0.95";
-		else if (cpu > 80) print "0.95";
-		else if ((dl < 80 || ul < 80) && delta <= 40 && loss <= 1) print "1.05";
-		else print "0.95";
-	}'
+stop_validation_monitors() {
+	rm -f "${cpu_marker:-}" "${latency_marker:-}"
+	monitors_stopped=1
+	stop_transport_latency_monitor || monitors_stopped=0
+	[ -z "${latency_pid:-}" ] ||
+		stop_owned_monitor "$latency_pid" "${latency_starttime:-}" || monitors_stopped=0
+	[ -z "${cpu_pid:-}" ] ||
+		stop_owned_monitor "$cpu_pid" "${cpu_starttime:-}" || monitors_stopped=0
+	latency_pid=""
+	latency_starttime=""
+	cpu_pid=""
+	cpu_starttime=""
+	[ "$monitors_stopped" = 1 ]
+}
+
+run_validation_direction_phase() {
+	phase_direction="$1"
+	phase_validation_attempt="$2"
+	phase_background_attempt=1
+	while [ "$phase_background_attempt" -le 2 ]; do
+		cpu_pid=""
+		latency_pid=""
+		transport_pid=""
+		loaded_raw="$job_dir/loaded-$phase_direction-$phase_validation_attempt-$phase_background_attempt.raw"
+		latency_marker="$job_dir/latency-$phase_direction.running"
+		transport_raw="$job_dir/transport-loaded-$phase_direction-$phase_validation_attempt-$phase_background_attempt.raw"
+		transport_values="$job_dir/transport-loaded-$phase_direction-$phase_validation_attempt-$phase_background_attempt.values"
+		transport_sorted="$job_dir/transport-loaded-$phase_direction-$phase_validation_attempt-$phase_background_attempt.sorted"
+		transport_errors="$job_dir/transport-loaded-$phase_direction-$phase_validation_attempt-$phase_background_attempt.errors"
+		cpu_values="$job_dir/cpu-$phase_direction-$phase_validation_attempt-$phase_background_attempt.values"
+		cpu_marker="$job_dir/cpu-$phase_direction.running"
+		: > "$loaded_raw"
+		: > "$transport_raw"
+		: > "$transport_values"
+		: > "$cpu_values"
+		: > "$cpu_marker"
+		: > "$latency_marker"
+
+		if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_SHAPER:-0}" = 1 ]; then
+			printf '%s\n' \
+				'[1.00000] 1.1.1.1 : [0], 64 bytes, 20.0 ms (20.0 avg, 0% loss)' \
+				'[1.10000] 9.9.9.9 : [0], 64 bytes, 21.0 ms (21.0 avg, 0% loss)' \
+				'[1.20000] 8.8.8.8 : [0], 64 bytes, 22.0 ms (22.0 avg, 0% loss)' \
+				'[2.00000] 1.1.1.1 : [1], 64 bytes, 22.0 ms (21.0 avg, 0% loss)' \
+				'[2.10000] 9.9.9.9 : [1], 64 bytes, 23.0 ms (22.0 avg, 0% loss)' \
+				'[2.20000] 8.8.8.8 : [1], 64 bytes, 24.0 ms (23.0 avg, 0% loss)' \
+				'[3.00000] 1.1.1.1 : [2], 64 bytes, 24.0 ms (22.0 avg, 0% loss)' \
+				'[3.10000] 9.9.9.9 : [2], 64 bytes, 25.0 ms (23.0 avg, 0% loss)' \
+				'[3.20000] 8.8.8.8 : [2], 64 bytes, 26.0 ms (24.0 avg, 0% loss)' \
+				'[4.00000] 1.1.1.1 : [3], 64 bytes, 26.0 ms (23.0 avg, 0% loss)' \
+				'[4.10000] 9.9.9.9 : [3], 64 bytes, 27.0 ms (24.0 avg, 0% loss)' \
+				'[4.20000] 8.8.8.8 : [3], 64 bytes, 28.0 ms (25.0 avg, 0% loss)' > "$loaded_raw"
+			if [ "${AUTOTUNE_MOCK_ICMP_RATE_LIMIT:-0}" = 1 ]; then
+				printf '%s\n' '[5.00000] 1.1.1.1 : [4], timed out (NaN avg, 20% loss)' >> "$loaded_raw"
+			fi
+			if [ "${AUTOTUNE_MOCK_RC16:-0}" = 1 ]; then
+				printf '%s\n' 53.2 > "$cpu_values"
+				phase_test_transport_raw='[230.0,240.0,250.0,480.0]'
+			else
+				printf '%s\n' 12.0 > "$cpu_values"
+				phase_test_transport_raw='[20.0,22.0,23.0,24.0]'
+			fi
+			printf '%s\n' \
+				"{\"index\":1,\"backend\":\"$transport_probe_reported_backend\",\"endpoint\":\"$transport_probe_endpoint\",\"raw_ms\":$phase_test_transport_raw,\"trusted\":true,\"connection_reused\":true}" \
+				"{\"index\":2,\"backend\":\"$transport_probe_reported_backend\",\"endpoint\":\"$transport_probe_endpoint\",\"raw_ms\":$phase_test_transport_raw,\"trusted\":true,\"connection_reused\":true}" \
+				"{\"index\":3,\"backend\":\"$transport_probe_reported_backend\",\"endpoint\":\"$transport_probe_endpoint\",\"raw_ms\":$phase_test_transport_raw,\"trusted\":true,\"connection_reused\":true}" \
+				"{\"index\":4,\"backend\":\"$transport_probe_reported_backend\",\"endpoint\":\"$transport_probe_endpoint\",\"raw_ms\":$phase_test_transport_raw,\"trusted\":true,\"connection_reused\":true}" > "$transport_raw"
+		else
+			cpu_monitor "$cpu_values" "$cpu_marker" &
+			cpu_pid="$!"
+			cpu_starttime="$(proc_starttime "$cpu_pid" 2>/dev/null)"
+			is_positive_uint "$cpu_starttime" || fail "Unable to register the CPU monitor process."
+			start_transport_latency_monitor "$transport_raw" "$transport_errors" ||
+				fail "Unable to register the transport-latency monitor process."
+			icmp_latency_monitor "$loaded_raw" "$latency_marker" &
+			latency_pid="$!"
+			latency_starttime="$(proc_starttime "$latency_pid" 2>/dev/null)"
+			is_positive_uint "$latency_starttime" || fail "Unable to register the ICMP monitor process."
+		fi
+
+		write_status shaped 87 "Running $phase_direction-only validation phase $phase_validation_attempt on the pinned server (traffic check $phase_background_attempt)"
+		phase_background_kind=shaped
+		if ! temporary_shaper_owned; then
+			stop_validation_monitors ||
+				fail "A validation monitor could not be terminated; crash recovery remains armed."
+			phase_evidence_complete=false
+			measurement_inconclusive "shaped-$phase_direction" temporary-shaper-precondition-failed
+		fi
+		start_phase_background_counter "$dl_base" "$ul_base"
+		phase_result_file="$job_dir/shaped-$phase_direction-$phase_validation_attempt-$phase_background_attempt.result"
+		if ! run_speedtest_with_timeout "$job_name" "$target_if" run "$backend" shaped "$route_mode" "$mwan3_member" "$phase_direction" > "$phase_result_file"; then
+			stop_phase_background_counter
+			stop_validation_monitors ||
+				fail "A validation monitor could not be terminated; crash recovery remains armed."
+			fail "The $phase_direction-only shaped validation speed test failed."
+		fi
+		if ! temporary_shaper_owned; then
+			stop_phase_background_counter
+			stop_validation_monitors ||
+				fail "A validation monitor could not be terminated; crash recovery remains armed."
+			rm -f "$phase_result_file"
+			phase_evidence_complete=false
+			measurement_inconclusive "shaped-$phase_direction" temporary-shaper-postcondition-failed
+		fi
+		phase_result="$(cat "$phase_result_file" 2>/dev/null)"
+		rm -f "$phase_result_file"
+		stop_phase_background_counter
+		stop_validation_monitors ||
+			fail "A validation monitor could not be terminated; crash recovery remains armed."
+		phase_backend="$(extract_json "$phase_result" '@.backend')"
+		[ "$phase_backend" = "$backend" ] ||
+			fail "Speed test backend changed from $backend to ${phase_backend:-unknown} during $phase_direction-only validation."
+		phase_reported_direction="$(extract_json "$phase_result" '@.test_direction')"
+		[ "$phase_reported_direction" = "$phase_direction" ] ||
+			fail "Speed test helper reported ${phase_reported_direction:-no direction} for the requested $phase_direction-only validation phase."
+		phase_shaper_bypassed="$(extract_json "$phase_result" '@.shaper_bypassed')"
+		phase_sqm_paused="$(extract_json "$phase_result" '@.sqm_paused')"
+
+		case "$phase_direction" in
+			download) phase_achieved_kbps="$(extract_json "$phase_result" '@.download_kbps')" ;;
+			upload) phase_achieved_kbps="$(extract_json "$phase_result" '@.upload_kbps')" ;;
+		esac
+		is_positive_uint "$phase_achieved_kbps" || fail "The $phase_direction-only validation returned no rate."
+
+		phase_measurement_valid=true
+		phase_measurement_reason=ok
+		if [ "$phase_shaper_bypassed" != false ] || [ "$phase_sqm_paused" != false ]; then
+			phase_measurement_valid=false
+			phase_measurement_reason=shaped-shaper-proof-invalid
+		fi
+		phase_icmp_stats="$job_dir/icmp-loaded-$phase_direction-$phase_validation_attempt-$phase_background_attempt.tsv"
+		if [ "$phase_measurement_valid" = true ] &&
+		   ! build_icmp_evidence "$loaded_raw" "$reflectors" "$phase_icmp_stats" loaded 3 3; then
+			phase_measurement_valid=false
+			phase_measurement_reason=icmp-insufficient-per-reflector-samples
+		elif [ "$phase_measurement_valid" = true ] &&
+		     ! classify_loaded_icmp_evidence "$phase_icmp_stats" "$job_dir/icmp-baseline-reflectors.tsv"; then
+			phase_measurement_valid=false
+			case "$icmp_evidence_class" in
+				rate-limit) phase_measurement_reason="icmp-rate-limit-suspected:$icmp_evidence_detail" ;;
+				disagreement) phase_measurement_reason=icmp-reflector-family-disagreement ;;
+				*) phase_measurement_reason=icmp-evidence-incomplete ;;
+			esac
+		fi
+		if [ "$phase_measurement_valid" = true ]; then
+			phase_loaded="$(latency_stats "$loaded_raw")" || {
+				phase_measurement_valid=false
+				phase_measurement_reason=icmp-no-aggregate-samples
+			}
+		fi
+		if [ "$phase_measurement_valid" = true ]; then
+			set -- $phase_loaded
+			phase_loaded_median_ms="$1"
+			phase_loaded_p95_ms="$2"
+			phase_loaded_max_ms="$3"
+			phase_loaded_samples="$4"
+			phase_loss_percent="$(packet_loss_percent "$loaded_raw")"
+			[ -n "$phase_loss_percent" ] || {
+				phase_measurement_valid=false
+				phase_measurement_reason=icmp-loss-unavailable
+			}
+		fi
+		if [ "$phase_measurement_valid" = true ] &&
+		   ! validate_transport_evidence "$transport_raw" "$transport_values" 4 12; then
+			phase_measurement_valid=false
+			phase_measurement_reason="$transport_evidence_reason"
+		fi
+		if [ "$phase_measurement_valid" = true ]; then
+			phase_transport_loaded="$(numeric_latency_stats "$transport_values" "$transport_sorted")" || {
+				phase_measurement_valid=false
+				phase_measurement_reason=transport-statistics-unavailable
+			}
+		fi
+		phase_cpu_peak="$(sort -n "$cpu_values" 2>/dev/null | tail -n 1)"
+		if [ -z "$phase_cpu_peak" ]; then
+			phase_measurement_valid=false
+			phase_measurement_reason=cpu-samples-unavailable
+		fi
+
+		phase_entry="{\"phase\":\"shaped\",\"direction\":\"$phase_direction\",\"validation_attempt\":$phase_validation_attempt,\"attempt\":$phase_background_attempt,\"measured_kbps\":$phase_achieved_kbps,\"measurement_evidence\":{\"valid\":$phase_measurement_valid,\"reason\":\"$(json_escape "$phase_measurement_reason")\"},\"forwarded_background\":$(phase_background_json)}"
+		if [ -n "${phase_background_runs_json:-}" ]; then
+			phase_background_runs_json="$phase_background_runs_json,$phase_entry"
+		else
+			phase_background_runs_json="$phase_entry"
+		fi
+		if [ "$phase_measurement_valid" != true ]; then
+			if [ "$phase_background_attempt" -lt 2 ]; then
+				case "$phase_measurement_reason" in
+					icmp-rate-limit-suspected:*)
+						# Replacing a reflector here used to overwrite the accepted idle
+						# baseline while the temporary shaper and loaded phase were active.
+						# That can only reduce loaded-minus-idle delay and create a false
+						# pass. A different reflector set requires a brand-new clean run.
+						phase_evidence_complete=false
+						measurement_inconclusive "shaped-$phase_direction" \
+							"$phase_measurement_reason-restart-required"
+						;;
+				esac
+				phase_background_attempt=$((phase_background_attempt + 1))
+				continue
+			fi
+			phase_evidence_complete=false
+			measurement_inconclusive "shaped-$phase_direction" "$phase_measurement_reason"
+		fi
+
+		set -- $phase_transport_loaded
+		phase_transport_median_ms="$1"
+		phase_transport_p95_ms="$2"
+		phase_transport_max_ms="$3"
+		phase_transport_samples="$4"
+		phase_icmp_delta_ms="$(nonnegative_delta "$phase_loaded_p95_ms" "$idle_p95_ms")"
+		phase_transport_delta_ms="$(nonnegative_delta "$phase_transport_p95_ms" "$transport_idle_p95_ms")"
+		if [ "${AUTOTUNE_MOCK_RC16:-0}" = 1 ]; then
+			phase_icmp_delta_ms=0.19
+			phase_loss_percent=7.59
+		fi
+		phase_observation_json="{\"direction\":\"$phase_direction\",\"throughput_kbps\":$phase_achieved_kbps,\"measurement_evidence\":{\"valid\":true,\"reason\":\"ok\",\"transport_rows\":$transport_evidence_rows},\"icmp_latency\":{\"median_ms\":$phase_loaded_median_ms,\"p95_ms\":$phase_loaded_p95_ms,\"max_ms\":$phase_loaded_max_ms,\"idle_p95_ms\":$idle_p95_ms,\"delta_p95_ms\":$phase_icmp_delta_ms,\"samples\":$phase_loaded_samples,\"loss_percent\":$phase_loss_percent},\"transport_latency\":{\"backend\":\"$(json_escape "$transport_probe_backend")\",\"endpoint\":\"$(json_escape "$transport_probe_endpoint")\",\"median_ms\":$phase_transport_median_ms,\"p95_ms\":$phase_transport_p95_ms,\"max_ms\":$phase_transport_max_ms,\"idle_p95_ms\":$transport_idle_p95_ms,\"delta_p95_ms\":$phase_transport_delta_ms,\"samples\":$phase_transport_samples},\"cpu_peak_percent\":$phase_cpu_peak,\"forwarded_background\":$(phase_background_json),\"server_id\":\"$(json_escape "$(extract_json "$phase_result" '@.server_id')")\"}"
+		if [ "$phase_background_contaminated" != true ]; then
+			break
+		fi
+		phase_contamination_seen=true
+		if [ "$phase_background_attempt" -lt 2 ]; then
+			phase_background_attempt=$((phase_background_attempt + 1))
+			continue
+		fi
+		if [ "${conservative_mode:-0}" != 1 ]; then
+			stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":3,\"error\":\"Forwarded WAN traffic contaminated both $phase_direction-only shaped validation attempts. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"shaped-$phase_direction\",\"auto_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"proposal\":$proposal,\"configuration_written\":false}"
+			exit 1
+		fi
+		if [ "$phase_background_available" != true ]; then
+			fail "Forwarded-traffic evidence was unavailable for both $phase_direction-only validation attempts."
+		fi
+		validation_contaminated=true
+		break
+	done
+
+	phase_server_id="$(extract_json "$phase_result" '@.server_id')"
+	is_positive_uint "$phase_server_id" ||
+		fail "The pinned speedtest-go server identity was missing during $phase_direction-only validation."
+	if [ "$phase_server_id" != "$selected_server_id" ]; then
+		fail "Speed test server changed during $phase_direction-only shaped validation."
+	fi
+	phase_route_identity="$(extract_json "$phase_result" '@.route_mode')|$(extract_json "$phase_result" '@.mwan3_member')|$(extract_json "$phase_result" '@.route_interface')|$(extract_json "$phase_result" '@.route_source_ip')|$(extract_json "$phase_result" '@.route_fwmark')|$(extract_json "$phase_result" '@.route_table')"
+	[ "$phase_route_identity" = "$calibration_route_identity" ] ||
+		fail "WAN route identity changed during $phase_direction-only shaped validation."
+	[ "$(extract_json "$phase_result" '@.external_ip_after')" = "$selected_external_ip" ] ||
+		fail "External IP changed during $phase_direction-only shaped validation."
 }
 
 run_shaped_validation() {
-	attempt="${1:-1}"
-	cpu_pid=""
-	latency_pid=""
-	http_pid=""
+	validation_attempt="${1:-1}"
+	config_fingerprint_matches || config_changed_inconclusive
 	dl_base="$(extract_json "$proposal" '@.download.base_kbps')"
 	ul_base="$(extract_json "$proposal" '@.upload.base_kbps')"
 	raw_dl_low="$(extract_json "$proposal" '@.download.observed_low_kbps')"
 	raw_ul_low="$(extract_json "$proposal" '@.upload.observed_low_kbps')"
-	is_positive_uint "$dl_base" || fail "Proposal returned no download base rate."
-	is_positive_uint "$ul_base" || fail "Proposal returned no upload base rate."
+	dl_minimum="$(extract_json "$proposal" '@.download.minimum_kbps')"
+	ul_minimum="$(extract_json "$proposal" '@.upload.minimum_kbps')"
+	dl_maximum="$(extract_json "$proposal" '@.download.maximum_kbps')"
+	ul_maximum="$(extract_json "$proposal" '@.upload.maximum_kbps')"
+	for required_rate in "$dl_base" "$ul_base" "$raw_dl_low" "$raw_ul_low" \
+		"$dl_minimum" "$ul_minimum" "$dl_maximum" "$ul_maximum"; do
+		is_positive_uint "$required_rate" || fail "Proposal returned an invalid rate for shaped validation."
+	done
 
-	write_status shaped 84 "Temporarily applying candidate CAKE rates for validation attempt $attempt"
+	write_status shaped 84 "Temporarily applying candidate CAKE rates for directional validation attempt $validation_attempt"
 	prepare_temp_shaper "$dl_base" "$ul_base"
+	validation_contaminated=false
 
-	loaded_raw="$job_dir/loaded.raw"
-	latency_marker="$job_dir/latency.running"
-	http_values="$job_dir/http-loaded.values"
-	http_sorted="$job_dir/http-loaded.sorted"
-	http_marker="$job_dir/http.running"
-	cpu_values="$job_dir/cpu.values"
-	cpu_marker="$job_dir/cpu.running"
-	: > "$loaded_raw"
-	: > "$http_values"
-	: > "$cpu_values"
-	: > "$cpu_marker"
-	: > "$http_marker"
-	: > "$latency_marker"
+	run_validation_direction_phase download "$validation_attempt"
+	shaped_dl="$phase_achieved_kbps"
+	download_phase_observation_json="$phase_observation_json"
+	dl_loaded_median_ms="$phase_loaded_median_ms"
+	dl_loaded_p95_ms="$phase_loaded_p95_ms"
+	dl_loaded_max_ms="$phase_loaded_max_ms"
+	dl_loaded_samples="$phase_loaded_samples"
+	dl_icmp_delta_ms="$phase_icmp_delta_ms"
+	dl_loss_percent="$phase_loss_percent"
+	dl_transport_median_ms="$phase_transport_median_ms"
+	dl_transport_p95_ms="$phase_transport_p95_ms"
+	dl_transport_max_ms="$phase_transport_max_ms"
+	dl_transport_samples="$phase_transport_samples"
+	dl_transport_delta_ms="$phase_transport_delta_ms"
+	dl_cpu_peak="$phase_cpu_peak"
 
-	if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_SHAPER:-0}" = 1 ]; then
-		printf '%s\n' \
-			'[1.00000] 1.1.1.1 : [0], 64 bytes, 20.0 ms (20.0 avg, 0% loss)' \
-			'[1.20000] 1.1.1.1 : [1], 64 bytes, 22.0 ms (21.0 avg, 0% loss)' \
-			'[1.40000] 1.1.1.1 : [2], 64 bytes, 24.0 ms (22.0 avg, 0% loss)' \
-			'[1.60000] 1.1.1.1 : [3], 64 bytes, 26.0 ms (23.0 avg, 0% loss)' \
-			'[1.80000] 1.1.1.1 : [4], 64 bytes, 28.0 ms (24.0 avg, 0% loss)' > "$loaded_raw"
-		printf '%s\n' 12.0 > "$cpu_values"
-		printf '%s\n' 20.0 22.0 24.0 26.0 28.0 > "$http_values"
-	else
-		cpu_monitor "$cpu_values" "$cpu_marker" &
-		cpu_pid="$!"
-		http_latency_monitor "$http_values" "$http_marker" &
-		http_pid="$!"
-		# One probe per second and reflector avoids public DNS ICMP rate limits;
-		# the concurrent speed test is long enough for a useful sample set.
-		icmp_latency_monitor "$loaded_raw" "$latency_marker" &
-		latency_pid="$!"
-	fi
-
-	write_status shaped 87 "Running shaped validation attempt $attempt on the same test server"
-	shaped_result="$(run_speedtest_with_timeout "$job_name" "$target_if" run "$backend" shaped "$route_mode" "$mwan3_member")" || {
-		rm -f "$cpu_marker" "$http_marker" "$latency_marker"
-		[ -n "${cpu_pid:-}" ] && wait "$cpu_pid" 2>/dev/null || true
-		[ -n "${http_pid:-}" ] && wait "$http_pid" 2>/dev/null || true
-		[ -n "${latency_pid:-}" ] && wait "$latency_pid" 2>/dev/null || true
-		restore_temp_shaper
-		fail "Shaped validation speed test failed."
-	}
-	rm -f "$cpu_marker" "$http_marker" "$latency_marker"
-	if [ -n "${latency_pid:-}" ]; then
-		wait "$latency_pid" 2>/dev/null || true
-	fi
-	if [ -n "${cpu_pid:-}" ]; then
-		wait "$cpu_pid" 2>/dev/null || true
-	fi
-	if [ -n "${http_pid:-}" ]; then
-		wait "$http_pid" 2>/dev/null || true
-	fi
-	restore_temp_shaper
-
-	shaped_dl="$(extract_json "$shaped_result" '@.download_kbps')"
-	shaped_ul="$(extract_json "$shaped_result" '@.upload_kbps')"
-	is_positive_uint "$shaped_dl" || fail "Shaped validation returned no download rate."
-	is_positive_uint "$shaped_ul" || fail "Shaped validation returned no upload rate."
-	shaped_server_id="$(extract_json "$shaped_result" '@.server_id')"
-	if [ -n "$selected_server_id" ] && [ -n "$shaped_server_id" ] && [ "$shaped_server_id" != "$selected_server_id" ]; then
-		fail "Speed test server changed during shaped validation; retry for comparable results."
-	fi
-	shaped_route_identity="$(extract_json "$shaped_result" '@.route_mode')|$(extract_json "$shaped_result" '@.mwan3_member')|$(extract_json "$shaped_result" '@.route_interface')|$(extract_json "$shaped_result" '@.route_source_ip')|$(extract_json "$shaped_result" '@.route_fwmark')|$(extract_json "$shaped_result" '@.route_table')"
-	[ "$shaped_route_identity" = "$calibration_route_identity" ] ||
-		fail "WAN route identity changed during shaped validation."
-	[ "$(extract_json "$shaped_result" '@.external_ip_after')" = "$selected_external_ip" ] ||
-		fail "External IP changed during shaped validation."
-	loaded="$(latency_stats "$loaded_raw")" || fail "Shaped validation returned no independent latency samples."
-	set -- $loaded
-	loaded_median_ms="$1"
-	loaded_p95_ms="$2"
-	loaded_max_ms="$3"
-	loaded_samples="$4"
-	[ "$loaded_samples" -ge 5 ] 2>/dev/null || fail "Too few independent latency samples during shaped validation."
-	loss_percent="$(packet_loss_percent "$loaded_raw")"
-	[ -n "$loss_percent" ] || fail "Unable to determine packet loss during shaped validation."
-	cpu_peak="$(sort -n "$cpu_values" 2>/dev/null | tail -n 1)"
-	[ -n "$cpu_peak" ] || fail "Unable to sample CPU during shaped validation."
-	http_loaded="$(numeric_latency_stats "$http_values" "$http_sorted")" || fail "Unable to sample TCP/HTTPS latency during shaped validation."
-	set -- $http_loaded
-	http_loaded_median_ms="$1"
-	http_loaded_p95_ms="$2"
-	http_loaded_max_ms="$3"
-	http_loaded_samples="$4"
-	[ "$http_loaded_samples" -ge 3 ] 2>/dev/null || fail "Too few TCP/HTTPS latency samples during shaped validation."
-	http_loaded_delta_ms="$(awk -v loaded="$http_loaded_p95_ms" -v idle="$http_idle_median_ms" 'BEGIN {
-		delta = loaded - idle; if (delta < 0) delta = 0; printf "%.1f", delta
-	}')"
-
+	run_validation_direction_phase upload "$validation_attempt"
+	shaped_ul="$phase_achieved_kbps"
+	upload_phase_observation_json="$phase_observation_json"
+	ul_loaded_median_ms="$phase_loaded_median_ms"
+	ul_loaded_p95_ms="$phase_loaded_p95_ms"
+	ul_loaded_max_ms="$phase_loaded_max_ms"
+	ul_loaded_samples="$phase_loaded_samples"
+	ul_icmp_delta_ms="$phase_icmp_delta_ms"
+	ul_loss_percent="$phase_loss_percent"
+	ul_transport_median_ms="$phase_transport_median_ms"
+	ul_transport_p95_ms="$phase_transport_p95_ms"
+	ul_transport_max_ms="$phase_transport_max_ms"
+	ul_transport_samples="$phase_transport_samples"
+	ul_transport_delta_ms="$phase_transport_delta_ms"
+	ul_cpu_peak="$phase_cpu_peak"
 	if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_PREFLIGHT:-0}" != 1 ]; then
 		inspect_autotune_route || fail "Selected route went offline during calibration."
-		[ "$route_identity" = "$calibration_route_identity" ] || fail "WAN route identity changed during calibration; no configuration was written."
+		[ "$route_identity" = "$calibration_route_identity" ] ||
+			fail "WAN route identity changed during calibration; no configuration was written."
 	fi
 
-	validation_score="$(score_validation "$raw_dl_low" "$raw_ul_low" "$shaped_dl" "$shaped_ul" "$loaded_p95_ms" "$idle_median_ms" "$loss_percent" "$cpu_peak" "$http_loaded_delta_ms")"
-	set -- $validation_score
-	dl_retention="$1"
-	ul_retention="$2"
-	loaded_delta_ms="$3"
-	http_loaded_delta_ms="$4"
-	effective_loaded_delta_ms="$5"
-	score="$6"
-	validation_pass="$7"
-	validation_json="{\"pass\":$validation_pass,\"score\":$score,\"candidate_base\":{\"download_kbps\":$dl_base,\"upload_kbps\":$ul_base},\"throughput\":{\"download_kbps\":$shaped_dl,\"upload_kbps\":$shaped_ul,\"download_retention_percent\":$dl_retention,\"upload_retention_percent\":$ul_retention,\"comparison\":\"observed-low\"},\"latency\":{\"median_ms\":$loaded_median_ms,\"p95_ms\":$loaded_p95_ms,\"max_ms\":$loaded_max_ms,\"delta_p95_ms\":$loaded_delta_ms,\"samples\":$loaded_samples,\"loss_percent\":$loss_percent},\"http_latency\":{\"url\":\"$(json_escape "$http_probe_url")\",\"median_ms\":$http_loaded_median_ms,\"p95_ms\":$http_loaded_p95_ms,\"max_ms\":$http_loaded_max_ms,\"delta_p95_ms\":$http_loaded_delta_ms,\"samples\":$http_loaded_samples},\"effective_delta_ms\":$effective_loaded_delta_ms,\"cpu_peak_percent\":$cpu_peak,\"server_id\":\"$(json_escape "$(extract_json "$shaped_result" '@.server_id')")\"}"
+	typed_validation_decision="$("$daemon_bin" --autotune-validate \
+		--dl-observed-low-kbps "$raw_dl_low" \
+		--ul-observed-low-kbps "$raw_ul_low" \
+		--dl-candidate-kbps "$dl_base" \
+		--ul-candidate-kbps "$ul_base" \
+		--dl-achieved-kbps "$shaped_dl" \
+		--ul-achieved-kbps "$shaped_ul" \
+		--dl-min-kbps "$dl_minimum" \
+		--ul-min-kbps "$ul_minimum" \
+		--dl-max-kbps "$dl_maximum" \
+		--ul-max-kbps "$ul_maximum" \
+		--dl-icmp-delta-ms "$dl_icmp_delta_ms" \
+		--ul-icmp-delta-ms "$ul_icmp_delta_ms" \
+		--dl-transport-delta-ms "$dl_transport_delta_ms" \
+		--ul-transport-delta-ms "$ul_transport_delta_ms" \
+		--dl-loss-percent "$dl_loss_percent" \
+		--ul-loss-percent "$ul_loss_percent" \
+		--dl-cpu-percent "$dl_cpu_peak" \
+		--ul-cpu-percent "$ul_cpu_peak" \
+		--candidate-realization-min-percent "$validation_candidate_realization_min_percent" \
+		--candidate-realization-max-percent "$validation_candidate_realization_max_percent" \
+		--capacity-retention-min-percent "$validation_capacity_retention_min_percent" \
+		--icmp-delta-max-ms "$validation_delay_max_ms" \
+		--transport-delta-max-ms "$validation_delay_max_ms" \
+		--loss-max-percent "$validation_loss_max_percent" \
+		--cpu-max-percent "$validation_cpu_max_percent")" ||
+		fail "The typed shaped-candidate validator rejected its inputs."
+
+	validation_pass="$(extract_json "$typed_validation_decision" '@.pass')"
+	validation_score="$(extract_json "$typed_validation_decision" '@.score')"
+	validation_correction_action="$(extract_json "$typed_validation_decision" '@.correction.action')"
+	validation_correction_feasible="$(extract_json "$typed_validation_decision" '@.correction.feasible')"
+	validation_correction_reason="$(extract_json "$typed_validation_decision" '@.correction.reason')"
+	dl_correction_action="$(extract_json "$typed_validation_decision" '@.correction.download.action')"
+	ul_correction_action="$(extract_json "$typed_validation_decision" '@.correction.upload.action')"
+	dl_correction_proposed_kbps="$(extract_json "$typed_validation_decision" '@.correction.download.proposed_kbps')"
+	ul_correction_proposed_kbps="$(extract_json "$typed_validation_decision" '@.correction.upload.proposed_kbps')"
+	dl_candidate_realization="$(extract_json "$typed_validation_decision" '@.metrics.download.candidate_realization_percent')"
+	ul_candidate_realization="$(extract_json "$typed_validation_decision" '@.metrics.upload.candidate_realization_percent')"
+	dl_retention="$(extract_json "$typed_validation_decision" '@.metrics.download.capacity_retention_percent')"
+	ul_retention="$(extract_json "$typed_validation_decision" '@.metrics.upload.capacity_retention_percent')"
+	effective_loaded_delta_ms="$(extract_json "$typed_validation_decision" '@.metrics.effective_delta_ms')"
+	case "$validation_pass:$validation_correction_feasible" in
+		true:true|false:true|false:false) ;;
+		*) fail "The typed validator returned an invalid decision." ;;
+	esac
+	case "$validation_correction_action" in
+		none|increase|decrease|mixed|retry-measurement|infeasible) ;;
+		*) fail "The typed validator returned an unknown correction action." ;;
+	esac
+	[ -n "$validation_score" ] && [ -n "$validation_correction_reason" ] &&
+		[ -n "$dl_candidate_realization" ] && [ -n "$ul_candidate_realization" ] &&
+		[ -n "$dl_retention" ] && [ -n "$ul_retention" ] &&
+		[ -n "$effective_loaded_delta_ms" ] || fail "The typed validator omitted required metrics."
+	is_positive_uint "$dl_correction_proposed_kbps" || fail "Typed validator returned no download correction target."
+	is_positive_uint "$ul_correction_proposed_kbps" || fail "Typed validator returned no upload correction target."
+
+	validation_metrics_json="$(typed_json_fragment "$typed_validation_decision" metrics)"
+	validation_signals_json="$(typed_json_fragment "$typed_validation_decision" signals)"
+	validation_gates_json="$(typed_json_fragment "$typed_validation_decision" gates)"
+	validation_reasons_json="$(typed_json_fragment "$typed_validation_decision" reasons)"
+	validation_correction_json="$(typed_json_fragment "$typed_validation_decision" correction)"
+	[ -n "$validation_metrics_json" ] && [ -n "$validation_signals_json" ] &&
+		[ -n "$validation_gates_json" ] && [ -n "$validation_reasons_json" ] &&
+		[ -n "$validation_correction_json" ] || fail "Unable to preserve structured typed validation diagnostics."
+
+	loaded_delta_ms="$(maximum_number "$dl_icmp_delta_ms" "$ul_icmp_delta_ms")"
+	transport_loaded_delta_ms="$(maximum_number "$dl_transport_delta_ms" "$ul_transport_delta_ms")"
+	loss_percent="$(maximum_number "$dl_loss_percent" "$ul_loss_percent")"
+	cpu_peak="$(maximum_number "$dl_cpu_peak" "$ul_cpu_peak")"
+	loaded_median_ms="$(maximum_number "$dl_loaded_median_ms" "$ul_loaded_median_ms")"
+	loaded_p95_ms="$(maximum_number "$dl_loaded_p95_ms" "$ul_loaded_p95_ms")"
+	loaded_max_ms="$(maximum_number "$dl_loaded_max_ms" "$ul_loaded_max_ms")"
+	loaded_samples=$((dl_loaded_samples + ul_loaded_samples))
+	transport_loaded_median_ms="$(maximum_number "$dl_transport_median_ms" "$ul_transport_median_ms")"
+	transport_loaded_p95_ms="$(maximum_number "$dl_transport_p95_ms" "$ul_transport_p95_ms")"
+	transport_loaded_max_ms="$(maximum_number "$dl_transport_max_ms" "$ul_transport_max_ms")"
+	transport_loaded_samples=$((dl_transport_samples + ul_transport_samples))
+	validation_json="{\"pass\":$validation_pass,\"contaminated\":$validation_contaminated,\"score\":$validation_score,\"metrics\":$validation_metrics_json,\"signals\":$validation_signals_json,\"gates\":$validation_gates_json,\"reasons\":$validation_reasons_json,\"correction\":$validation_correction_json,\"candidate_base\":{\"download_kbps\":$dl_base,\"upload_kbps\":$ul_base},\"throughput\":{\"download_kbps\":$shaped_dl,\"upload_kbps\":$shaped_ul,\"download_candidate_realization_percent\":$dl_candidate_realization,\"upload_candidate_realization_percent\":$ul_candidate_realization,\"download_capacity_retention_percent\":$dl_retention,\"upload_capacity_retention_percent\":$ul_retention,\"comparison\":\"observed-low\"},\"direction_phases\":{\"download\":$download_phase_observation_json,\"upload\":$upload_phase_observation_json},\"latency\":{\"median_ms\":$loaded_median_ms,\"p95_ms\":$loaded_p95_ms,\"max_ms\":$loaded_max_ms,\"delta_p95_ms\":$loaded_delta_ms,\"samples\":$loaded_samples,\"loss_percent\":$loss_percent},\"transport_latency\":{\"backend\":\"$(json_escape "$transport_probe_backend")\",\"endpoint\":\"$(json_escape "$transport_probe_endpoint")\",\"median_ms\":$transport_loaded_median_ms,\"p95_ms\":$transport_loaded_p95_ms,\"max_ms\":$transport_loaded_max_ms,\"delta_p95_ms\":$transport_loaded_delta_ms,\"samples\":$transport_loaded_samples},\"effective_delta_ms\":$effective_loaded_delta_ms,\"cpu_peak_percent\":$cpu_peak,\"server_id\":\"$(json_escape "$selected_server_id")\",\"decision\":$typed_validation_decision}"
+}
+
+journal_value() {
+	journal_key="$1"
+	[ -f "${recovery_journal:-}" ] && [ ! -L "$recovery_journal" ] || return 1
+	awk -v key="$journal_key" '
+		index($0, key "=") == 1 {
+			count++
+			value = substr($0, length(key) + 2)
+		}
+		END {
+			if (count != 1) exit 1
+			print value
+		}
+	' "$recovery_journal"
+}
+
+read_journalled_active_test() {
+	journal_test_pgid="$(journal_value active_test_pgid 2>/dev/null)" || return 1
+	journal_test_starttime="$(journal_value active_test_starttime 2>/dev/null)" || return 1
+	case "$journal_test_pgid:$journal_test_starttime" in
+		:) return 0 ;;
+		*:*)
+			is_positive_uint "$journal_test_pgid" && is_positive_uint "$journal_test_starttime" || return 1
+			[ "$journal_test_pgid" != "$$" ] || return 1
+			return 0
+			;;
+		*) return 1 ;;
+	esac
+}
+
+terminate_journalled_active_test() {
+	read_journalled_active_test || return 1
+	[ -n "$journal_test_pgid" ] || return 0
+	recovery_active_test_pgid="$journal_test_pgid"
+	recovery_active_test_starttime="$journal_test_starttime"
+	test_termination_grace_s="${CAKE_AUTORATE_AUTOTUNE_SPEEDTEST_TERM_GRACE_S:-3}"
+	case "$test_termination_grace_s" in ''|*[!0-9]*) test_termination_grace_s=3 ;; esac
+	[ "$test_termination_grace_s" -ge 1 ] 2>/dev/null || test_termination_grace_s=3
+	[ "$test_termination_grace_s" -le 10 ] 2>/dev/null || test_termination_grace_s=10
+
+	if process_group_contains_session "$journal_test_pgid"; then
+		signal_test_group_until_gone "$journal_test_pgid" "$journal_test_starttime" || return 1
+	fi
+	# Cancellation can interrupt the child before exec(setsid).  In that narrow
+	# state it is still a member of the owner's isolated group, so signal only
+	# the exact PID/starttime recorded before CONT.
+	if [ "$(proc_starttime "$journal_test_pgid" 2>/dev/null)" = "$journal_test_starttime" ]; then
+		case "$(proc_state "$journal_test_pgid" 2>/dev/null)" in
+			''|Z|z) ;;
+			*)
+				kill -TERM "$journal_test_pgid" 2>/dev/null || true
+				cleanup_wait=0
+				while [ "$cleanup_wait" -lt "$test_termination_grace_s" ] &&
+				      [ "$(proc_starttime "$journal_test_pgid" 2>/dev/null)" = "$journal_test_starttime" ] &&
+				      ! { case "$(proc_state "$journal_test_pgid" 2>/dev/null)" in ''|Z|z) true ;; *) false ;; esac; }; do
+					cleanup_wait=$((cleanup_wait + 1))
+					sleep 1
+				done
+				if [ "$(proc_starttime "$journal_test_pgid" 2>/dev/null)" = "$journal_test_starttime" ]; then
+					case "$(proc_state "$journal_test_pgid" 2>/dev/null)" in
+						''|Z|z) ;;
+						*) kill -KILL "$journal_test_pgid" 2>/dev/null || true ;;
+					esac
+				fi
+				cleanup_wait=0
+				while [ "$cleanup_wait" -lt 3 ] &&
+				      [ "$(proc_starttime "$journal_test_pgid" 2>/dev/null)" = "$journal_test_starttime" ]; do
+					case "$(proc_state "$journal_test_pgid" 2>/dev/null)" in
+						''|Z|z) break ;;
+					esac
+					cleanup_wait=$((cleanup_wait + 1))
+					sleep 1
+				done
+				;;
+		esac
+	fi
+	process_group_contains_session "$journal_test_pgid" && return 1
+	if [ "$(proc_starttime "$journal_test_pgid" 2>/dev/null)" = "$journal_test_starttime" ]; then
+		case "$(proc_state "$journal_test_pgid" 2>/dev/null)" in ''|Z|z) ;; *) return 1 ;; esac
+	fi
+	return 0
+}
+
+owner_session_has_live_children() {
+	for proc_dir in /proc/[0-9]*; do
+		[ -r "$proc_dir/stat" ] || continue
+		member_pid="${proc_dir#/proc/}"
+		[ "$member_pid" != "$$" ] || continue
+		case "$(proc_state "$member_pid" 2>/dev/null)" in ''|Z|z) continue ;; esac
+		[ "$(proc_group "$member_pid" 2>/dev/null)" = "$$" ] || continue
+		[ "$(proc_session "$member_pid" 2>/dev/null)" = "$$" ] || continue
+		return 0
+	done
+	return 1
+}
+
+signal_owner_session_children() {
+	owner_signal="$1"
+	for proc_dir in /proc/[0-9]*; do
+		[ -r "$proc_dir/stat" ] || continue
+		member_pid="${proc_dir#/proc/}"
+		[ "$member_pid" != "$$" ] || continue
+		case "$(proc_state "$member_pid" 2>/dev/null)" in ''|Z|z) continue ;; esac
+		[ "$(proc_group "$member_pid" 2>/dev/null)" = "$$" ] || continue
+		[ "$(proc_session "$member_pid" 2>/dev/null)" = "$$" ] || continue
+		kill "-$owner_signal" "$member_pid" 2>/dev/null || true
+	done
+}
+
+terminate_owner_session_children() {
+	owner_session_has_live_children || return 0
+	signal_owner_session_children TERM
+	sleep 1
+	owner_session_has_live_children || return 0
+	signal_owner_session_children KILL
+	sleep 1
+	! owner_session_has_live_children
+}
+
+clear_terminated_active_test_journal() {
+	read_journalled_active_test || return 1
+	[ -n "$journal_test_pgid" ] || return 0
+	process_group_contains_session "$journal_test_pgid" && return 1
+	if [ "$(proc_starttime "$journal_test_pgid" 2>/dev/null)" = "$journal_test_starttime" ]; then
+		case "$(proc_state "$journal_test_pgid" 2>/dev/null)" in ''|Z|z) ;; *) return 1 ;; esac
+	fi
+	recovery_active_test_pgid="$journal_test_pgid"
+	recovery_active_test_starttime="$journal_test_starttime"
+	clear_active_test_journal
+}
+
+worker_cleanup() {
+	worker_rc="$1"
+	[ "${cleanup_started:-0}" = 0 ] || return 0
+	cleanup_started=1
+	trap - 0
+	trap '' INT TERM HUP
+	[ -n "${recovery_heartbeat:-}" ] && [ -e "$recovery_heartbeat" ] && recovery_armed=1
+	[ "${recovery_armed:-0}" = 1 ] &&
+		write_status restoring 98 "Restoring and verifying SQM, autorate, and temporary calibration state" || true
+
+	# No qdisc, nftables, SQM, or autorate mutation is allowed until every
+	# journalled test and every monitor in the owner's session is proved gone.
+	cleanup_runtime_ok=1
+	if [ "${recovery_armed:-0}" = 1 ] && ! terminate_journalled_active_test; then
+		cleanup_runtime_ok=0
+	fi
+	rm -f "${cpu_marker:-}" "${latency_marker:-}"
+	stop_transport_latency_monitor || cleanup_runtime_ok=0
+	terminate_owner_session_children || cleanup_runtime_ok=0
+	if [ "${recovery_armed:-0}" = 1 ] && ! clear_terminated_active_test_journal; then
+		cleanup_runtime_ok=0
+	fi
+	if [ "$cleanup_runtime_ok" = 1 ]; then
+		cleanup_phase_background_counter
+		cleanup_stale_phase_background_tables >/dev/null 2>&1 || true
+		restore_temp_shaper || cleanup_runtime_ok=0
+	fi
+
+	if [ ! -s "$pending_result_file" ] && [ ! -s "$pending_error_file" ]; then
+		if [ "$worker_rc" -eq 130 ] || [ -e "$cancel_file" ]; then
+			stage_terminal_json error "{\"state\":\"cancelled\",\"schema_version\":3,\"stage\":\"$(json_escape "${current_phase:-unknown}")\",\"error\":\"Full Auto-Tune was cancelled; no configuration was written.\",\"auto_apply_eligible\":false,\"configuration_written\":false}" || true
+		else
+			stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":3,\"stage\":\"$(json_escape "${current_phase:-unknown}")\",\"error\":\"Full Auto-Tune worker exited without a complete diagnostic result.\",\"auto_apply_eligible\":false,\"configuration_written\":false}" || true
+		fi
+	fi
+
+	if [ "${recovery_armed:-0}" = 1 ]; then
+		if [ "$cleanup_runtime_ok" = 1 ] && "$recovery_bin" finalize "$recovery_journal"; then
+			recovery_armed=0
+			publish_staged_terminal || true
+		else
+			# Keep pending diagnostics private.  The helper's recovery-failed
+			# result, armed journal, and interface lock remain authoritative for
+			# the detached watcher/procd retry after this owner exits.
+			rm -f "$status_file"
+		fi
+	else
+		# No network mutation is allowed before the heartbeat is armed.
+		if release_autotune_interface_lock; then
+			[ -z "${recovery_sqm_config_snapshot:-}" ] || rm -f "$recovery_sqm_config_snapshot" 2>/dev/null || true
+			[ -n "${recovery_journal:-}" ] && rm -f "$recovery_journal" "${recovery_journal}.cleanup-done" 2>/dev/null || true
+			publish_staged_terminal || true
+		else
+			# Keep the prepared journal for dead-owner garbage collection if a
+			# partial lock reservation could not be removed synchronously.
+			rm -f "$status_file"
+		fi
+	fi
+	remove_own_worker_identity
+	return 0
 }
 
 run_job() {
@@ -932,37 +3410,134 @@ run_job() {
 	cancelled=0
 	temp_shaper_active=0
 	temp_ifb_created=0
+	created_temp_ifb_ifindex=""
+	temp_download_kbps=""
+	temp_upload_kbps=""
 	sqm_was_active=0
 	temp_ifb=""
 	autorate_pid=""
 	autorate_paused=0
 	autotune_interface_lock=""
+	recovery_prepared=0
+	recovery_armed=0
+	recovery_owner_starttime=""
+	recovery_root=""
+	recovery_journal=""
+	recovery_done_marker=""
+	recovery_heartbeat=""
+	recovery_watcher_pid=""
+	recovery_temp_ifb=""
+	recovery_temp_ifb_alias=""
+	recovery_temp_ifb_ifindex=""
+	recovery_temp_target_handle=""
+	recovery_temp_ifb_handle=""
+	recovery_temp_ingress_handle=""
+	recovery_temp_redirect_pref=""
+	recovery_shaper_started=0
+	recovery_sqm_was_active=0
+	recovery_sqm_restore_mode=none
+	recovery_sqm_section=""
+	recovery_sqm_target_if=""
+	recovery_sqm_ul_if=""
+	recovery_sqm_dl_if=""
+	recovery_sqm_config_fingerprint=""
+	recovery_sqm_config_snapshot=""
+	recovery_sqm_restore_required=0
+	recovery_autorate_pid=""
+	recovery_autorate_starttime=""
+	recovery_active_test_pgid=""
+	recovery_active_test_starttime=""
+	recovery_nft_table=""
+	cleanup_started=0
+	phase_counter_created=0
+	phase_background_runs_json=""
+	phase_evidence_complete=false
+	phase_contamination_seen=false
+	config_fingerprint=""
+	config_fingerprint_captured=false
+	current_phase=starting
 	trap 'cancelled=1; exit 130' INT TERM
-	trap 'rc=$?; rm -f "${cpu_marker:-}" "${http_marker:-}" "${latency_marker:-}"; restore_temp_shaper; resume_job_autorate; release_autotune_interface_lock; rm -f "$pid_file"; if [ "$rc" -eq 130 ] && [ ! -s "$result_file" ]; then atomic_write "$error_file" "{\"state\":\"cancelled\",\"error\":\"Full Auto-Tune was cancelled; temporary speed-test state was restored.\"}"; fi' EXIT
+	trap 'worker_cleanup "$?"' EXIT
+	case "$worker_token" in ''|*[!A-Za-z0-9_-]*) fail "Full Auto-Tune worker identity token is missing or invalid." ;; esac
+	registration_attempt=0
+	worker_registered=false
+	while [ "$registration_attempt" -lt 5 ]; do
+		if [ -s "$pid_file" ]; then
+			read_worker_identity
+			if [ "$identity_pid" = "$$" ] && [ "$identity_token" = "$worker_token" ] &&
+			   [ "$identity_starttime" = "$(proc_starttime "$$" 2>/dev/null)" ] &&
+			   [ "$identity_target" = "$target_if_input" ] && [ "$identity_backend" = "$backend_input" ] &&
+			   [ "$identity_route_mode" = "$route_mode_override" ] &&
+			   [ "$identity_mwan3_member" = "$mwan3_member_override" ] &&
+			   [ "$identity_conservative" = "$conservative_mode" ]; then
+				worker_registered=true
+				break
+			fi
+		fi
+		sleep 1
+		registration_attempt=$((registration_attempt + 1))
+	done
+	[ "$worker_registered" = true ] || fail "Full Auto-Tune worker identity could not be registered safely."
 
 	preflight
+	configure_recovery_paths || fail "Unable to derive safe Full Auto-Tune recovery paths."
+	configure_temp_shaper_identity || fail "Unable to derive a unique temporary shaper identity."
+	configure_autotune_interface_lock_path || fail "Unable to derive a safe interface lock for $target_if."
 	acquire_autotune_interface_lock
+	capture_config_fingerprint
+	prepare_recovery
+	capture_recovery_sqm_snapshot || fail "Managed SQM changed before the exclusive calibration lock was acquired."
+	write_recovery_journal || fail "Unable to publish the locked managed-SQM recovery snapshot."
+	arm_recovery
+	cleanup_stale_phase_background_tables || fail "Unable to remove stale Full Auto-Tune nftables counters for this job."
 	pause_job_autorate
 	write_status reflectors 15 "Selecting healthy latency reflectors"
-	pinger_plan="$($pinger_plan_bin "$job_name" scan "" "$route_mode" "$mwan3_member" 2>/dev/null)" ||
+	pinger_plan_candidate="$($pinger_plan_bin "$job_name" scan "" "$route_mode" "$mwan3_member" 2>/dev/null)" ||
 		fail "Reflector scan failed."
-	reflectors="$(extract_json "$pinger_plan" '@.recommended_reflectors[*]' | head -n 3 | tr '\n' ' ')"
-
-	write_status baseline 22 "Measuring idle latency baseline"
-	baseline="$(baseline_latency "$reflectors")" || fail "Unable to establish an idle ICMP latency baseline."
-	set -- $baseline
-	idle_median_ms="$1"
-	idle_p95_ms="$2"
-	baseline_samples="$3"
-	[ "$baseline_samples" -ge 3 ] 2>/dev/null || fail "Too few idle ICMP latency samples."
-	http_baseline="$(baseline_http_latency)" || fail "Unable to establish an idle TCP/HTTPS latency baseline."
-	set -- $http_baseline
-	http_idle_median_ms="$1"
-	http_idle_p95_ms="$2"
-	http_idle_max_ms="$3"
-	http_idle_samples="$4"
-	[ "$http_idle_samples" -ge 3 ] 2>/dev/null || fail "Too few idle TCP/HTTPS latency samples."
+	strict_single_json_object "$pinger_plan_candidate" || fail "Reflector planner returned malformed or empty JSON."
+	rtt_candidates="$(extract_json "$pinger_plan_candidate" '@.rtt_reflectors[*]')"
+	[ -n "$rtt_candidates" ] || rtt_candidates="$(extract_json "$pinger_plan_candidate" '@.recommended_reflectors[*]')"
+	[ -n "$rtt_candidates" ] || fail "Reflector planner returned malformed or empty JSON."
+	case $- in *f*) reflector_had_noglob=1 ;; *) reflector_had_noglob=0; set -f ;; esac
+	reflectors="$(select_diverse_reflectors $rtt_candidates)"
+	[ "$reflector_had_noglob" = 1 ] || set +f
+	set -- $reflectors
+	[ "$#" -ge 3 ] || fail "Fewer than three independent reflector families are reachable on the selected uplink."
+	pinger_rtt_reflectors_json="$(reflectors_json_array "$@")" ||
+		fail "Reflector planner returned an unsafe RTT reflector."
+	pinger_method="$(extract_json "$pinger_plan_candidate" '@.recommended_method')" ||
+		fail "Reflector planner returned no recommended method."
+	case "$pinger_method" in fping|fping-ts|tsping|ping|irtt) ;; *) fail "Reflector planner returned an unsupported method." ;; esac
+	pinger_count="$(extract_json "$pinger_plan_candidate" '@.recommended_no_pingers')" ||
+		fail "Reflector planner returned no active-pinger count."
+	is_positive_uint "$pinger_count" && [ "$pinger_count" -le 16 ] 2>/dev/null ||
+		fail "Reflector planner returned an invalid active-pinger count."
+	recommended_candidates="$(extract_json "$pinger_plan_candidate" '@.recommended_reflectors[*]')" ||
+		fail "Reflector planner returned no recommended targets."
+	[ -n "$recommended_candidates" ] || fail "Reflector planner returned no recommended targets."
+	case $- in *f*) recommended_had_noglob=1 ;; *) recommended_had_noglob=0; set -f ;; esac
+	set -- $recommended_candidates
+	[ "$recommended_had_noglob" = 1 ] || set +f
+	[ "$#" -ge "$pinger_count" ] 2>/dev/null || fail "Reflector planner returned fewer targets than active pingers."
+	pinger_reflectors_json="$(pinger_targets_json_array "$pinger_method" "$@")" ||
+		fail "Reflector planner returned an unsafe recommended target."
+	# Reconstruct a bounded allowlisted object. Raw helper JSON, warnings, and
+	# unrecognised fields are never spliced into a terminal result.
+	pinger_plan="{\"recommended_method\":\"$(json_escape "$pinger_method")\",\"recommended_no_pingers\":$pinger_count,\"recommended_reflectors\":$pinger_reflectors_json,\"rtt_reflectors\":$pinger_rtt_reflectors_json,\"warnings\":[]}"
+	case "$reflector_scan_cooldown_s" in
+		''|*[!0-9]*) reflector_scan_cooldown_s=5 ;;
+		*) [ "$reflector_scan_cooldown_s" -le 30 ] 2>/dev/null || reflector_scan_cooldown_s=5 ;;
+	esac
+	if [ "$reflector_scan_cooldown_s" -gt 0 ] 2>/dev/null; then
+		write_status reflectors 17 "Allowing ICMP policers to recover after the paced reflector scan"
+		sleep "$reflector_scan_cooldown_s"
+	fi
+	# Baseline and every following heavy phase must append an available nftables
+	# observation. A missing/list/parse failure flips this false permanently.
+	phase_evidence_complete=true
+	capture_idle_baseline
 	check_background_traffic
+	configure_validation_thresholds
 
 	download_samples=""
 	upload_samples=""
@@ -973,80 +3548,245 @@ run_job() {
 	run_measurement 2
 
 	write_status proposal 80 "Calculating safe initial limits and adaptive ceiling bounds"
-	initial_scale=1.0
-	[ "$conservative_mode" = 1 ] && initial_scale=0.85
-	proposal="$(calculate_proposal "$initial_scale")" || fail "Autotune proposal calculation failed."
-	run_shaped_validation 1
-	validation_attempts_json="$validation_json"
-	if [ "$validation_pass" != true ]; then
-		revision_scale="$(revision_scale_for_validation)"
-		[ "$conservative_mode" = 1 ] && revision_scale=0.80
-		write_status correction 91 "Revising base rates once after a borderline validation result"
-		proposal="$(calculate_proposal "$revision_scale")" || fail "Autotune correction calculation failed."
-		run_shaped_validation 2
-		validation_attempts_json="$validation_attempts_json,$validation_json"
+	reference_proposal_candidate="$(calculate_proposal 1.0 1.0)" || fail "Autotune reference proposal calculation failed."
+	proposal_json_valid "$reference_proposal_candidate" || fail "Autotune reference proposal returned malformed JSON."
+	reference_proposal="$reference_proposal_candidate"
+	reference_dl_base="$(extract_json "$reference_proposal" '@.download.base_kbps')"
+	reference_ul_base="$(extract_json "$reference_proposal" '@.upload.base_kbps')"
+	is_positive_uint "$reference_dl_base" || fail "Reference proposal returned no download base."
+	is_positive_uint "$reference_ul_base" || fail "Reference proposal returned no upload base."
+	if [ "$conservative_mode" = 1 ]; then
+		proposal_candidate="$(calculate_proposal 0.85 0.85)" || fail "Conservative autotune proposal calculation failed."
+		proposal_json_valid "$proposal_candidate" || fail "Conservative autotune proposal returned malformed JSON."
+		proposal="$proposal_candidate"
+	else
+		proposal="$reference_proposal"
 	fi
+
+	validation_attempt_number=1
+	validation_attempts_json=""
+	measurement_retry_used=0
+	rate_correction_used=0
+	while [ "$validation_attempt_number" -le 3 ]; do
+		run_shaped_validation "$validation_attempt_number"
+		if [ -n "$validation_attempts_json" ]; then
+			validation_attempts_json="$validation_attempts_json,$validation_json"
+		else
+			validation_attempts_json="$validation_json"
+		fi
+		[ "$validation_pass" = true ] && break
+
+		case "$validation_correction_action" in
+			retry-measurement)
+				[ "$measurement_retry_used" -eq 0 ] || break
+				measurement_retry_used=1
+				write_status correction 90 "Repeating the same directional candidate because its achieved rate was not reliable"
+				;;
+			increase|decrease|mixed)
+				[ "$validation_correction_feasible" = true ] || break
+				[ "$rate_correction_used" -eq 0 ] || break
+				rate_correction_used=1
+				dl_revision_scale="$(scale_for_reference_base "$dl_correction_proposed_kbps" "$reference_dl_base")" ||
+					fail "Unable to calculate the exact download correction scale."
+				ul_revision_scale="$(scale_for_reference_base "$ul_correction_proposed_kbps" "$reference_ul_base")" ||
+					fail "Unable to calculate the exact upload correction scale."
+				write_status correction 91 "Applying one typed, direction-specific bounded correction"
+				proposal_candidate="$(calculate_proposal "$dl_revision_scale" "$ul_revision_scale")" ||
+					fail "Autotune direction-specific correction calculation failed."
+				proposal_json_valid "$proposal_candidate" ||
+					fail "Autotune direction-specific correction returned malformed JSON."
+				proposal="$proposal_candidate"
+				realized_dl_correction="$(extract_json "$proposal" '@.download.base_kbps')"
+				realized_ul_correction="$(extract_json "$proposal" '@.upload.base_kbps')"
+				[ "$realized_dl_correction" = "$dl_correction_proposed_kbps" ] &&
+					[ "$realized_ul_correction" = "$ul_correction_proposed_kbps" ] ||
+					fail "Proposal constraints could not realize the typed direction-specific correction exactly."
+				;;
+			infeasible|none|*) break ;;
+		esac
+		validation_attempt_number=$((validation_attempt_number + 1))
+	done
 	if [ "$validation_pass" != true ]; then
-		validation_error="Candidate failed shaped validation after one bounded correction (DL ${dl_retention}%, UL ${ul_retention}%, ICMP +${loaded_delta_ms} ms, TCP/HTTPS +${http_loaded_delta_ms} ms, loss ${loss_percent}%, CPU ${cpu_peak}%); no configuration was written."
-		atomic_write "$error_file" "{\"state\":\"failed\",\"error\":\"$(json_escape "$validation_error")\",\"validation_attempts\":[$validation_attempts_json],\"proposal\":$proposal,\"configuration_written\":false}"
+		if [ "$validation_correction_action" = retry-measurement ]; then
+			phase_evidence_complete=false
+			measurement_inconclusive validation \
+				"${validation_correction_reason:-candidate-realization-unreliable}-after-bounded-retry"
+		fi
+		validation_error="Directional candidate validation failed (${validation_correction_action}: ${validation_correction_reason}; DL realization ${dl_candidate_realization}%, capacity ${dl_retention}%; UL realization ${ul_candidate_realization}%, capacity ${ul_retention}%; max ICMP +${loaded_delta_ms} ms, transport +${transport_loaded_delta_ms} ms, loss ${loss_percent}%, CPU ${cpu_peak}%); no configuration was written."
+		stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":3,\"stage\":\"validation\",\"error\":\"$(json_escape "$validation_error")\",\"auto_apply_eligible\":false,\"phase_evidence_complete\":$phase_evidence_complete,\"phase_contamination_seen\":$phase_contamination_seen,\"route_mode\":\"$(json_escape "$route_mode")\",\"route_interface\":\"$(json_escape "$route_if")\",\"route_identity\":\"$(json_escape "$route_identity")\",\"external_ip\":\"$(json_escape "$selected_external_ip")\",\"background\":$(background_json),\"baseline\":{\"median_ms\":$idle_median_ms,\"p95_ms\":$idle_p95_ms,\"samples\":$baseline_samples,\"transport_median_ms\":$transport_idle_median_ms,\"transport_p95_ms\":$transport_idle_p95_ms,\"transport_samples\":$transport_idle_samples,\"transport_backend\":\"$(json_escape "$transport_probe_backend")\",\"transport_endpoint\":\"$(json_escape "$transport_probe_endpoint")\"},\"runs\":[$runs_json],\"phase_background\":[$phase_background_runs_json],\"validation_attempts\":[$validation_attempts_json],\"validation\":$validation_json,\"pinger_plan\":$pinger_plan,\"proposal\":$proposal,\"configuration_written\":false}"
 		exit 1
 	fi
 
 	write_status review 96 "Preparing validated review; no configuration has been written"
 	confidence_mode=normal
 	[ "$conservative_mode" = 1 ] && confidence_mode=low
-	atomic_write "$result_file" "{\"state\":\"complete\",\"schema_version\":2,\"job_id\":\"$(json_escape "$job_name")\",\"target_interface\":\"$(json_escape "$target_if_input")\",\"resolved_interface\":\"$(json_escape "$target_if")\",\"source_ip\":\"$(json_escape "$source_ip")\",\"route_interface\":\"$(json_escape "$route_if")\",\"route_mode\":\"$(json_escape "$route_mode")\",\"mwan3_member\":\"$(json_escape "$mwan3_member")\",\"route_identity\":\"$(json_escape "$route_identity")\",\"link_kind\":\"$(json_escape "$link_kind")\",\"conservative\":$([ "$conservative_mode" = 1 ] && printf true || printf false),\"confidence_mode\":\"$confidence_mode\",\"background\":$(background_json),\"usable_directions\":{\"download\":${background_dl_usable:-true},\"upload\":${background_ul_usable:-true}},\"baseline\":{\"median_ms\":$idle_median_ms,\"p95_ms\":$idle_p95_ms,\"samples\":$baseline_samples,\"http_median_ms\":$http_idle_median_ms,\"http_p95_ms\":$http_idle_p95_ms,\"http_samples\":$http_idle_samples,\"http_url\":\"$(json_escape "$http_probe_url")\"},\"runs\":[$runs_json],\"validation_attempts\":[$validation_attempts_json],\"validation\":$validation_json,\"pinger_plan\":$pinger_plan,\"proposal\":$proposal,\"configuration_written\":false}"
-	rm -f "$status_file" "$error_file"
+	auto_apply_eligible=false
+	if [ "$confidence_mode" = normal ] && [ "$phase_evidence_complete" = true ] &&
+		[ "$phase_contamination_seen" = false ] && [ "$validation_contaminated" = false ]; then
+		auto_apply_eligible=true
+	fi
+	stage_terminal_json result "{\"state\":\"complete\",\"schema_version\":3,\"auto_apply_eligible\":$auto_apply_eligible,\"phase_evidence_complete\":$phase_evidence_complete,\"phase_contamination_seen\":$phase_contamination_seen,\"job_id\":\"$(json_escape "$job_name")\",\"target_interface\":\"$(json_escape "$target_if_input")\",\"resolved_interface\":\"$(json_escape "$target_if")\",\"source_ip\":\"$(json_escape "$source_ip")\",\"external_ip\":\"$(json_escape "$selected_external_ip")\",\"route_interface\":\"$(json_escape "$route_if")\",\"route_mode\":\"$(json_escape "$route_mode")\",\"mwan3_member\":\"$(json_escape "$mwan3_member")\",\"route_identity\":\"$(json_escape "$route_identity")\",\"link_kind\":\"$(json_escape "$link_kind")\",\"conservative\":$([ "$conservative_mode" = 1 ] && printf true || printf false),\"confidence_mode\":\"$confidence_mode\",\"background\":$(background_json),\"phase_background\":[$phase_background_runs_json],\"usable_directions\":{\"download\":${background_dl_usable:-true},\"upload\":${background_ul_usable:-true}},\"validation_thresholds\":{\"candidate_realization_min_percent\":$validation_candidate_realization_min_percent,\"candidate_realization_max_percent\":$validation_candidate_realization_max_percent,\"capacity_retention_min_percent\":$validation_capacity_retention_min_percent,\"delay_max_ms\":$validation_delay_max_ms,\"loss_max_percent\":$validation_loss_max_percent,\"cpu_max_percent\":$validation_cpu_max_percent},\"baseline\":{\"median_ms\":$idle_median_ms,\"p95_ms\":$idle_p95_ms,\"samples\":$baseline_samples,\"transport_median_ms\":$transport_idle_median_ms,\"transport_p95_ms\":$transport_idle_p95_ms,\"transport_samples\":$transport_idle_samples,\"transport_backend\":\"$(json_escape "$transport_probe_backend")\",\"transport_endpoint\":\"$(json_escape "$transport_probe_endpoint")\"},\"runs\":[$runs_json],\"validation_attempts\":[$validation_attempts_json],\"validation\":$validation_json,\"pinger_plan\":$pinger_plan,\"proposal\":$proposal,\"configuration_written\":false}"
+}
+
+job_recovery_pending() {
+	recovery_scan_root="$job_root/recovery"
+	for recovery_candidate in "$recovery_scan_root/${job_name}_"*.journal; do
+		[ -f "$recovery_candidate" ] || continue
+		return 0
+	done
+	return 1
 }
 
 start_job() {
 	start_conservative="${1:-0}"
 	setsid_bin="$(command -v setsid 2>/dev/null)"
 	[ -n "$setsid_bin" ] || json_error "setsid is required for Full Auto-Tune."
-	mkdir -p "$job_dir" || json_error "Unable to create autotune job directory."
-	chmod 700 "$job_dir" 2>/dev/null || true
+	prepare_job_storage || json_error "Unsafe or foreign-owned Full Auto-Tune job directory."
+	start_guard="$job_dir/start.guard"
+	[ ! -L "$start_guard" ] || json_error "Unsafe Full Auto-Tune start lock."
+	exec 6>>"$start_guard" || json_error "Unable to open the Full Auto-Tune start lock."
+	start_flock_bin="${runtime_lock_flock_bin:-flock}"
+	command -v "$start_flock_bin" >/dev/null 2>&1 || json_error "flock is required for Full Auto-Tune."
+	"$start_flock_bin" 6 || json_error "Unable to serialize Full Auto-Tune startup."
 
+	# A live registered worker owns its recovery journal by design.  Check it
+	# before scanning journals so an idempotent second RPC returns current state
+	# rather than misreporting the normal armed run as recovery-pending.
 	if [ -s "$pid_file" ]; then
-		pid="$(sed -n '1p' "$pid_file" 2>/dev/null)"
-		if is_positive_uint "$pid" && kill -0 "$pid" 2>/dev/null; then
-			cat "$status_file" 2>/dev/null || printf '{"state":"running","phase":"starting","progress":0}\n'
-			return 0
+		if worker_identity_matches; then
+			if worker_request_matches "$start_conservative"; then
+				cat "$status_file" 2>/dev/null || printf '{"state":"running","phase":"starting","progress":0}\n'
+				return 0
+			fi
+			json_error "A different Full Auto-Tune request is already running for this instance. Cancel it or wait for completion."
 		fi
 	fi
+	job_recovery_pending && json_error "Full Auto-Tune recovery is still pending for $job_name; wait for runtime restoration before starting another test."
 
-	rm -f "$pid_file" "$status_file" "$result_file" "$error_file" "$cancel_file" "$log_file"
+	rm -f "$pid_file" "$status_file" "$result_file" "$error_file" "$pending_result_file" \
+		"$pending_error_file" "$cancel_file" "$log_file"
 	write_status starting 0 "Starting Full Auto-Tune"
-	"$setsid_bin" "$0" "$job_name" "$target_if_input" job-run "$backend" "$route_mode_override" "$mwan3_member_override" "$start_conservative" \
-		</dev/null > "$log_file" 2>&1 &
+	new_token="$(new_worker_token)"
+	"$setsid_bin" "$0" "$job_name" "$target_if_input" job-run "$backend" "$route_mode_override" "$mwan3_member_override" "$start_conservative" "$new_token" \
+		</dev/null > "$log_file" 2>&1 6>&- &
 	pid="$!"
-	printf '%s\n' "$pid" > "$pid_file"
+	launch_attempt=0
+	launch_starttime=""
+	while [ "$launch_attempt" -lt 5 ]; do
+		launch_starttime="$(proc_starttime "$pid" 2>/dev/null)"
+		if is_positive_uint "$launch_starttime" &&
+		   [ "$(proc_group "$pid")" = "$pid" ] &&
+		   [ "$(proc_session "$pid")" = "$pid" ] &&
+		   proc_cmdline_has_arg "$pid" job-run && proc_cmdline_has_arg "$pid" "$new_token"; then
+			break
+		fi
+		kill -0 "$pid" 2>/dev/null || break
+		sleep 1
+		launch_attempt=$((launch_attempt + 1))
+	done
+	if ! is_positive_uint "$launch_starttime" ||
+	   [ "$(proc_group "$pid" 2>/dev/null)" != "$pid" ] ||
+	   [ "$(proc_session "$pid" 2>/dev/null)" != "$pid" ] ||
+	   ! proc_cmdline_has_arg "$pid" "$new_token"; then
+		[ -n "$launch_starttime" ] && [ "$(proc_starttime "$pid" 2>/dev/null)" = "$launch_starttime" ] &&
+			kill -TERM "$pid" 2>/dev/null || true
+		json_error "Unable to establish an isolated Full Auto-Tune worker process group."
+	fi
+	worker_identity="$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s' \
+		"$pid" "$launch_starttime" "$new_token" "$target_if_input" "$backend_input" \
+		"$route_mode_override" "$mwan3_member_override" "$start_conservative")"
+	atomic_write "$pid_file" "$worker_identity" || {
+		[ "$(proc_starttime "$pid" 2>/dev/null)" = "$launch_starttime" ] &&
+			kill -TERM "$pid" 2>/dev/null || true
+		json_error "Unable to publish the Full Auto-Tune worker identity."
+	}
 	cat "$status_file"
 }
 
 status_job() {
-	if [ -s "$result_file" ]; then
-		cat "$result_file"
-	elif [ -s "$error_file" ]; then
-		cat "$error_file"
-	elif [ -s "$pid_file" ]; then
-		pid="$(sed -n '1p' "$pid_file" 2>/dev/null)"
-		if is_positive_uint "$pid" && kill -0 "$pid" 2>/dev/null; then
+	# A verified live owner is authoritative.  Otherwise an armed recovery
+	# journal outranks every settled-looking result/error: accepting that result
+	# before runtime restoration is exactly how stale calibration escaped.
+	if [ -s "$pid_file" ] && worker_identity_matches; then
+		if worker_request_matches any; then
 			cat "$status_file" 2>/dev/null || printf '{"state":"running","phase":"starting","progress":0}\n'
-		else
-			printf '{"state":"failed","error":"Autotune worker exited without a result."}\n'
+			return 0
 		fi
+		json_error "A different Full Auto-Tune request is running for this instance; its status was not attached to this uplink."
+	fi
+	if job_recovery_pending; then
+		printf '{"state":"recovery-pending","recovery_pending":true,"auto_apply_eligible":false,"error":"Full Auto-Tune runtime restoration is still pending; any settled result is withheld."}\n'
+		return 0
+	fi
+	if [ -s "$result_file" ]; then
+		emit_saved_terminal "$result_file"
+	elif [ -s "$error_file" ]; then
+		emit_saved_terminal "$error_file"
+	elif [ -s "$pid_file" ]; then
+		printf '{"state":"failed","error":"Autotune worker identity is stale or the worker exited without a result."}\n'
 	else
 		printf '{"state":"idle"}\n'
 	fi
 }
 
+attest_job() {
+	# Unlike status, this path never replays result.json. It recomputes both the
+	# complete managed UCI fingerprint and the selected route/external address
+	# immediately before LuCI stages a reviewed proposal.
+	if [ -s "$pid_file" ]; then
+		json_error "Full Auto-Tune state is not settled; live attestation is unavailable."
+	fi
+	job_recovery_pending &&
+		json_error "Full Auto-Tune recovery is pending; live attestation is unavailable."
+	mkdir -p "$job_dir" || json_error "Unable to create the Full Auto-Tune attestation directory."
+	[ -d "$job_dir" ] && [ ! -L "$job_dir" ] || json_error "Unsafe Full Auto-Tune attestation directory."
+	chmod 700 "$job_dir" 2>/dev/null || true
+
+	attest_fingerprint_before="$(compute_config_fingerprint)" ||
+		json_error "Unable to recompute the managed UCI configuration fingerprint."
+	attest_route="$(CAKE_AUTORATE_ROUTE_STATUS_TIMEOUT_S=5 \
+		"$speedtest_bin" "$job_name" "$target_if_input" route-status "${backend:-auto}" "" \
+		"${route_mode_override:-}" "${mwan3_member_override:-}" 2>/dev/null)" ||
+		json_error "Unable to attest the currently selected uplink route."
+	attest_fingerprint_after="$(compute_config_fingerprint)" ||
+		json_error "Unable to confirm the managed UCI configuration fingerprint."
+	[ "$attest_fingerprint_before" = "$attest_fingerprint_after" ] ||
+		json_error "Managed UCI configuration changed during live attestation."
+	[ "$(extract_json "$attest_route" '@.state')" = ready ] &&
+		[ "$(extract_json "$attest_route" '@.schema_version')" = 1 ] ||
+		json_error "The route helper returned an invalid attestation."
+
+	attest_target="$(extract_json "$attest_route" '@.target_interface')"
+	attest_resolved="$(extract_json "$attest_route" '@.resolved_interface')"
+	attest_route_if="$(extract_json "$attest_route" '@.route_interface')"
+	attest_mode="$(extract_json "$attest_route" '@.route_mode')"
+	attest_member="$(extract_json "$attest_route" '@.mwan3_member')"
+	attest_source_ip="$(extract_json "$attest_route" '@.source_ip')"
+	attest_external_ip="$(extract_json "$attest_route" '@.external_ip')"
+	attest_identity="$(extract_json "$attest_route" '@.route_identity')"
+	[ -n "$attest_target" ] && [ -n "$attest_resolved" ] && [ -n "$attest_route_if" ] &&
+		[ -n "$attest_source_ip" ] && [ -n "$attest_external_ip" ] && [ -n "$attest_identity" ] ||
+		json_error "The route helper returned incomplete identity fields."
+	case "$attest_mode" in main) [ -z "$attest_member" ] || json_error "Main-route attestation unexpectedly names an mwan3 member." ;;
+		mwan3) [ -n "$attest_member" ] || json_error "mwan3 attestation returned no member." ;;
+		*) json_error "The route helper returned an invalid route mode." ;;
+	esac
+
+	printf '{"state":"ready","schema_version":1,"config_fingerprint":"%s","target_interface":"%s","resolved_interface":"%s","route_interface":"%s","route_mode":"%s","mwan3_member":"%s","source_ip":"%s","external_ip":"%s","route_identity":"%s"}\n' \
+		"$(json_escape "$attest_fingerprint_before")" "$(json_escape "$attest_target")" \
+		"$(json_escape "$attest_resolved")" "$(json_escape "$attest_route_if")" \
+		"$(json_escape "$attest_mode")" "$(json_escape "$attest_member")" \
+		"$(json_escape "$attest_source_ip")" "$(json_escape "$attest_external_ip")" \
+		"$(json_escape "$attest_identity")"
+}
+
 cancel_job() {
 	if [ -s "$pid_file" ]; then
-		pid="$(sed -n '1p' "$pid_file" 2>/dev/null)"
-		if is_positive_uint "$pid" && kill -0 "$pid" 2>/dev/null; then
+		if worker_identity_matches; then
+			pid="$identity_pid"
 			: > "$cancel_file"
 			write_status cancelling 0 "Cancelling Full Auto-Tune and restoring temporary speed-test/SQM state"
-			kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+			kill -TERM "$pid" 2>/dev/null || true
 			cat "$status_file"
 			return 0
 		fi
@@ -1054,14 +3794,20 @@ cancel_job() {
 	printf '{"state":"idle"}\n'
 }
 
+if [ "${CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY:-0}" = 1 ]; then
+	return 0 2>/dev/null || exit 0
+fi
+
 safe_job_name "$job_name" || json_error "Invalid autotune job name."
 safe_interface_name "$target_if_input" || json_error "Invalid target interface."
 job_paths
+prepare_job_storage || json_error "Unsafe or foreign-owned Full Auto-Tune state directory."
 
 case "$mode" in
 	start) start_job 0 ;;
 	start-conservative) start_job 1 ;;
 	status) status_job ;;
+	attest) attest_job ;;
 	cancel) cancel_job ;;
 	job-run) run_job ;;
 	*) json_error "Unsupported autotune mode." ;;
