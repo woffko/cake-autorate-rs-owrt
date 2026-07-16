@@ -802,8 +802,12 @@ impl HttpProbe {
     ) -> Result<(f64, f64), String> {
         let separator = if parsed.path.contains('?') { '&' } else { '?' };
         let request = format!(
-            "GET {}{}t={} HTTP/1.1\r\nHost: {}\r\nUser-Agent: cake-autorate-rs/rc19\r\nAccept: application/json\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n",
-            parsed.path, separator, *sequence, parsed.host
+            "GET {}{}t={} HTTP/1.1\r\nHost: {}\r\nUser-Agent: cake-autorate-rs/{}\r\nAccept: application/json\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n",
+            parsed.path,
+            separator,
+            *sequence,
+            parsed.host,
+            env!("CARGO_PKG_VERSION")
         );
         *sequence = sequence.wrapping_add(1).max(1);
         deadline.ensure("persistent HTTP request")?;

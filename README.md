@@ -40,6 +40,9 @@ does not claim authorship of the original cake-autorate concept.
 - [Multi-WAN routing and lifecycle](MULTIWAN.md) describes the structured
   `main`/`mwan3` route model, per-uplink state isolation, failover/recovery,
   route identity checks, SQM ownership, and operational diagnostics.
+- [Profile traffic priorities](TRAFFIC_PRIORITIES.md) documents the native
+  per-profile DSCP rule editor, its strict ownership boundary, outbound-only
+  classification, rule order, runtime attestation, and Multi-WAN isolation.
 
 The current targets are OpenWrt 25.12.5 on `x86/64` and
 `rockchip/armv8` (`aarch64_generic`, including the Banana Pi R2 Pro). Native
@@ -50,26 +53,28 @@ socket libraries; ordinary OpenWrt runtime dependencies remain explicit below.
 
 The latest published release provides these OpenWrt 25.12.5 APKs:
 
-- `cake-autorate-rs-1.0_rc19-r1-x86_64.apk` — x86_64 autorate daemon.
-- `cake-autorate-rs-1.0_rc19-r1-aarch64_generic.apk` — rockchip/armv8
+- `cake-autorate-rs-1.0_rc20-r1-x86_64.apk` — x86_64 autorate daemon.
+- `cake-autorate-rs-1.0_rc20-r1-aarch64_generic.apk` — rockchip/armv8
   autorate daemon.
-- `luci-app-cake-autorate-rs-1.0_rc19-r1.apk` — architecture-independent LuCI
+- `luci-app-cake-autorate-rs-1.0_rc20-r1.apk` — architecture-independent LuCI
   interface and SQM integration.
 
-RC19 completed both architecture builds, fresh offline dependency resolution,
-disposable x86 validation, production Multi-WAN validation, ARM validation,
-and authenticated desktop/mobile Playwright checks. Exact release hashes and
-the anonymized acceptance evidence are recorded in [Testing](TESTING.md).
+RC20 adds fail-closed Apply Guard recovery, a complete per-instance Services
+reconciliation column, structured speed-test failures, LuCI cache refresh on
+upgrade, and native editable profile rules without qosify/eBPF integration.
+Both architecture builds, offline dependency resolution, virtual-router
+validation, production Multi-WAN/ARM checks, and authenticated desktop/mobile
+Playwright evidence are recorded in [Testing](TESTING.md).
 
 The daemon package installs `uci`, `fping`, `uclient-fetch`, and `sqm-scripts`
 as dependencies; the latter brings the CAKE, IFB, `tc`, and `ip` runtime
-pieces. The LuCI package installs the daemon, `luci-base`, `sqm-scripts`, and
-`uclient-fetch`, plus `jsonfilter` for strict helper-result parsing and
-`nftables-json` for structured forwarding/background counters. Native transport
-probes use the daemon's statically linked rustls/webpki stack. The diagnostic
-legacy HTTP backend and built-in speed-test fallback can still use OpenWrt
-`uclient-fetch`, so the offline installer includes the standard mbedTLS
-provider when none is already present.
+pieces. `nftables-json` supplies validated forwarding/background counters and
+the private profile-classification table. The LuCI package installs the
+daemon, `luci-base`, `sqm-scripts`, `uclient-fetch`, `jsonfilter`, and
+`nftables-json`. Native transport probes use the daemon's statically linked
+rustls/webpki stack. The diagnostic legacy HTTP backend and built-in speed-test
+fallback can still use OpenWrt `uclient-fetch`, so the offline installer
+includes the standard mbedTLS provider when none is already present.
 The wizard now labels a device with its logical OpenWrt networks, for example
 `eth1 — wan, wan6`, while continuing to save and use the physical device name.
 
@@ -234,9 +239,11 @@ is the default and the compatibility replacement for the former balanced
 proposal; it targets an A-like loaded-delay result while retaining at least
 80% of observed-low capacity. **Gaming** targets A+, accepts a lower 70%
 throughput floor, and configures `layer_cake.qos` with CAKE `diffserv4`.
-Gaming never guesses applications or rewrites client policy: only traffic
-already marked with DSCP receives differentiated treatment, and ingress marks
-are deliberately preserved. **Fair** prioritizes sustained throughput, keeps
+With the optional native rules disabled, Gaming never guesses applications or
+rewrites client policy: traffic already marked with DSCP receives
+differentiated treatment, and WAN-ingress marks are deliberately preserved.
+Enabling RC20's native rules replaces that upload policy as documented below.
+**Fair** prioritizes sustained throughput, keeps
 at least 90% of observed-low capacity, and aims for class C or better
 (`<= 200 ms` effective loaded delay) when the link permits it. If that target
 conflicts with the throughput floor, Review retains the best measured
@@ -262,6 +269,37 @@ Terminal Auto-Tune history is likewise RAM-only and bounded by both count and
 size. Proposal schema 3 and result schema 5 bind the profile policy, immutable
 run ID, phase evidence, action, configuration fingerprint and restored runtime
 state through LuCI, scheduler and Apply Guard.
+
+RC20 keeps CAKE, IFB devices, ingress redirects, and bandwidth rates under one
+owner while adding native profile-specific traffic rules. There is no qosify
+or eBPF integration. The new **Traffic priorities** page provides editable
+Gaming, Best overall, and Fair rules; the backend owns only
+`table inet cake_autorate_dscp`, resets and classifies outbound packets before
+upload CAKE, validates the whole nftables transaction, and records a RAM-only
+SHA-256 attestation for every instance/interface/profile binding. It cannot
+classify WAN ingress after it has already entered the SQM IFB, so Best overall
+and Fair use best-effort plus wash on download and `diffserv4` on upload.
+Gaming retains its trusted WAN-ingress `diffserv4` policy. When native rules
+are enabled, their deterministic CS0 reset replaces pre-existing DSCP on
+upload only; matching built-in/custom rules then set the selected class. See
+[Profile traffic priorities](TRAFFIC_PRIORITIES.md).
+
+The Status default now includes a mandatory **Services** column. It reconciles
+the configured instance with its real daemon count, managed SQM section,
+upload/download CAKE qdiscs and rates, IFB, ingress redirect, classifier
+attestation, active heavy operation, and Apply Guard transaction. Half-applied,
+duplicate, stale, ineffective, drifted, and orphaned states are shown instead
+of being collapsed into a generic RUNNING label. Disabling an instance is
+healthy only after its daemon and every owned shaping object are actually gone.
+
+RC20 also makes Full Auto-Tune apply recovery boot-aware. Persistent UCI
+markers are paired with a RAM transaction, boot identity, immutable token, and
+supervised receipt; a service start refuses to mutate SQM until a valid
+transaction is verified or a provably stale transaction is recovered.
+Speed-test supervisor failures retain a structured stage/reason/exit status
+instead of becoming a generic helper error. Package installation clears both
+LuCI index and module caches and reloads rpcd so a browser refresh receives the
+new view/ACL code immediately.
 
 The **Autorate setup** editor is now divided into six in-page groups:
 Connection & routing, Rate limits, Adaptive ceiling, Latency probes, Quality &
@@ -293,7 +331,8 @@ The release includes separate minimal x86_64 and rockchip/armv8 offline
 bundles. Extract the matching archive under `/root/` and run its included
 installer; it validates the OpenWrt release and APK architecture, backs up the
 existing UCI configuration, and installs the two project APKs together with all
-65 project/runtime packages from the local repository without network access.
+required project/runtime packages from the local repository without network
+access.
 
 ## Repository Layout
 
@@ -419,6 +458,17 @@ Implemented:
   runtime error, and a per-interface helper performs a targeted SQM restart.
   Attempts are serialized, deferred during a speed test, and rate-limited to
   avoid a recovery loop.
+- The mandatory Status **Services** column independently reconciles configured
+  intent with daemon processes, managed SQM ownership, both CAKE qdiscs and
+  rates, IFB/redirect topology, native traffic-rule attestation, current heavy
+  operation, and guarded apply state. It exposes `HEALTHY`, `DISABLED`,
+  `DEGRADED`, `ORPHANED`, or `BLOCKED` plus the exact component-level reason.
+- Optional native profile traffic rules classify only outbound packets in the
+  private `inet cake_autorate_dscp` table. Gaming, Best overall, and Fair have
+  separate built-in defaults and editable ordered custom rules. No qosify,
+  eBPF, external qdisc owner, or free-form shell rule is used. The loaded
+  ruleset is SHA-256-attested against its instance, resolved interface, and
+  profile; Status reports missing, ineffective, drifted, and orphaned rules.
 - LuCI setup wizard for creating instances, importing SQM rates, running a
   router-side speed test, and writing derived limits. Its normal speed-test step
   shows only rates and the test action; backend/package/headroom controls and
@@ -590,6 +640,7 @@ Daemon package dependencies:
 - `fping`
 - `uclient-fetch`
 - `sqm-scripts`
+- `nftables-json`
 
 LuCI package dependencies:
 
@@ -699,16 +750,16 @@ them together. For x86_64:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc19-r1-x86_64.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc19-r1.apk
+  /root/cake-autorate-rs-1.0_rc20-r1-x86_64.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc20-r1.apk
 ```
 
 For rockchip/armv8 (`aarch64_generic`):
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc19-r1-aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc19-r1.apk
+  /root/cake-autorate-rs-1.0_rc20-r1-aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc20-r1.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:
@@ -728,16 +779,16 @@ x86_64:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc19-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc19-x86_64.sh
+tar -xzf cake-autorate-rs-1.0-rc20-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc20-x86_64.sh
 ```
 
 Banana Pi R2 Pro and other OpenWrt 25.12.5 rockchip/armv8 devices:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc19-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc19-aarch64_generic.sh
+tar -xzf cake-autorate-rs-1.0-rc20-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc20-aarch64_generic.sh
 ```
 
 The installer resolves its own location, so it also works when the extracted

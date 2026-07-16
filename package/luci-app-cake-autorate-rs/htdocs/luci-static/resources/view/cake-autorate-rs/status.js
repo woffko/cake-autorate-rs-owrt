@@ -8,6 +8,7 @@
 var STATUS_COLUMN_DEFINITIONS = [
 	{ key: 'instance', title: _('Instance'), mandatory: true },
 	{ key: 'uplink', title: _('Uplink / state'), mandatory: true },
+	{ key: 'services', title: _('Services'), mandatory: true },
 	{ key: 'quality', title: _('Quality'), mandatory: true },
 	{ key: 'rating', title: _('Rating test'), mandatory: true },
 	{ key: 'route', title: _('Route / external IP') },
@@ -82,6 +83,15 @@ function parseExecJson(result) {
 	if (!text)
 		throw new Error(_('Helper returned no data.'));
 	return JSON.parse(text);
+}
+
+function readRuntimeHealth() {
+	return L.resolveDefault(
+		fs.exec('/usr/libexec/cake-autorate-rs/runtime-health', []).then(parseExecJson).then(function(result) {
+			return result && result.instances || {};
+		}),
+		{}
+	);
 }
 
 function qualityTestExec(section, action, mode, backend) {
@@ -608,6 +618,89 @@ function formatState(status, enabled) {
 	]);
 }
 
+function formatHealthRate(value) {
+	value = Number(value || 0);
+	if (!isFinite(value) || value <= 0)
+		return '-';
+	if (value >= 1000000)
+		return (value / 1000000).toFixed(value >= 10000000 ? 1 : 2) + ' Gbps';
+	if (value >= 1000)
+		return (value / 1000).toFixed(value >= 100000 ? 0 : 1) + ' Mbps';
+	return value.toFixed(0) + ' kbps';
+}
+
+function formatServices(health) {
+	var overall, title, details;
+
+	if (!health)
+		return E('div', { 'class': 'cake-services-stack cake-services-unavailable' }, [
+			E('strong', {}, _('UNAVAILABLE')),
+			E('small', {}, _('Runtime reconciliation returned no data.'))
+		]);
+
+	overall = String(health.overall_state || 'UNKNOWN').toUpperCase();
+	title = [
+		_('Overall: %s').format(overall),
+		_('Autorate: %s (%d process(es))').format(
+			health.autorate_state || '-', Number(health.autorate_processes || 0)),
+		_('Managed SQM: %s (%s)').format(health.sqm_config_state || '-', health.sqm_section || '-'),
+		_('Upload CAKE: %s on %s at %s').format(
+			health.cake_ul_state || '-', health.ul_interface || '-',
+			formatHealthRate(health.cake_ul_rate_kbps)),
+		_('Download CAKE: %s on %s at %s').format(
+			health.cake_dl_state || '-', health.dl_interface || '-',
+			formatHealthRate(health.cake_dl_rate_kbps)),
+		_('Traffic rules: %s (%s; upload CAKE %s)').format(
+			health.classifier_state || '-', health.classifier_profile || '-',
+			health.cake_ul_mode || '-'),
+		_('Attested rules: %s (%s)').format(
+			health.classifier_target || '-',
+			health.classifier_applied_profile || '-'),
+		_('IFB: %s').format(health.ifb_state || '-'),
+		_('Ingress redirect: %s').format(health.ingress_state || '-'),
+		_('Operation: %s').format(health.operation_state || '-'),
+		_('Apply transaction: %s').format(health.apply_state || '-')
+	];
+	if (health.issues)
+		title.push(_('Detected issue: %s').format(health.issues));
+
+	details = [
+		E('span', {}, [
+			_('Autorate %s').format(health.autorate_state || '-'),
+			' · ',
+			_('SQM %s').format(health.sqm_config_state || '-')
+		]),
+		E('span', {}, [
+			_('UL %s %s').format(
+				health.cake_ul_state || '-', formatHealthRate(health.cake_ul_rate_kbps)),
+			' · ',
+			_('DL %s %s').format(
+				health.cake_dl_state || '-', formatHealthRate(health.cake_dl_rate_kbps))
+		]),
+		E('span', {}, [
+			_('IFB %s').format(health.ifb_state || '-'),
+			' · ',
+			_('Ingress %s').format(health.ingress_state || '-')
+		]),
+		E('span', {}, [
+			_('Rules %s').format(health.classifier_state || '-'),
+			' · ',
+			_('Profile %s').format(health.classifier_profile || '-')
+		]),
+		E('span', {}, _('Operation %s').format(health.operation_state || '-'))
+	];
+	if (health.issues)
+		details.push(E('small', { 'class': 'cake-services-issue' }, health.issues));
+
+	return E('div', {
+		'class': 'cake-services-stack cake-services-' + overall.toLowerCase().replace(/[^a-z0-9_-]/g, '-'),
+		'title': title.join('\n')
+	}, [
+		E('strong', { 'class': 'cake-services-overall' }, overall),
+		E('div', { 'class': 'cake-services-details' }, details)
+	]);
+}
+
 function formatRoute(status) {
 	if (!status || !status.route_mode)
 		return '-';
@@ -690,15 +783,17 @@ function renderQualityAction(section, status, enabled) {
 	]);
 }
 
-function statusCell(column, sectionData, status, enabled) {
+function statusCell(column, sectionData, status, enabled, health) {
 	var section = sectionData['.name'];
 
-	if (!enabled && column.key !== 'instance' && column.key !== 'uplink' && column.key !== 'rating')
+	if (!enabled && column.key !== 'instance' && column.key !== 'uplink' &&
+	    column.key !== 'services' && column.key !== 'rating')
 		return '-';
 
 	switch (column.key) {
 	case 'instance': return section;
 	case 'uplink': return enabled ? formatState(status, enabled) : _('DISABLED');
+	case 'services': return formatServices(health);
 	case 'quality': return enabled ? formatQuality(status) : '-';
 	case 'rating': return renderQualityAction(sectionData, status, enabled);
 	case 'route': return formatRoute(status);
@@ -719,7 +814,7 @@ function statusCell(column, sectionData, status, enabled) {
 	}
 }
 
-function renderTable(sections, statuses, selectedKeys) {
+function renderTable(sections, statuses, selectedKeys, runtimeHealth) {
 	var columns = selectedStatusColumns(selectedKeys);
 	var children = [ E('tr', { 'class': 'tr table-titles' }, columns.map(function(column) {
 		return E('th', { 'class': 'th', 'data-column': column.key }, column.title);
@@ -734,12 +829,13 @@ function renderTable(sections, statuses, selectedKeys) {
 	sections.forEach(function(sectionData, index) {
 		var status = statuses[index] || {};
 		var enabled = String(sectionData.enabled || '0') === '1';
+		var health = runtimeHealth && runtimeHealth[sectionData['.name']] || null;
 		children.push(E('tr', { 'class': 'tr cake-status-row' }, columns.map(function(column) {
 			return E('td', {
 				'class': 'td cake-status-cell cake-status-column-' + column.key,
 				'data-title': column.title,
 				'data-column': column.key
-			}, statusCell(column, sectionData, status, enabled));
+			}, statusCell(column, sectionData, status, enabled, health));
 		})));
 	});
 
@@ -750,7 +846,7 @@ function renderTable(sections, statuses, selectedKeys) {
 	}, children);
 }
 
-function renderCards(sections, statuses, selectedKeys) {
+function renderCards(sections, statuses, selectedKeys, runtimeHealth) {
 	var columns = selectedStatusColumns(selectedKeys);
 
 	if (!sections.length)
@@ -759,20 +855,22 @@ function renderCards(sections, statuses, selectedKeys) {
 	return E('div', { 'class': 'cake-status-cards' }, sections.map(function(sectionData, index) {
 		var status = statuses[index] || {};
 		var enabled = String(sectionData.enabled || '0') === '1';
+		var health = runtimeHealth && runtimeHealth[sectionData['.name']] || null;
 		return E('section', { 'class': 'cake-status-card' }, columns.map(function(column) {
 			return E('div', { 'class': 'cake-status-card-field cake-status-card-' + column.key }, [
 				E('strong', { 'class': 'cake-status-card-label' }, column.title),
 				E('div', { 'class': 'cake-status-card-value' },
-					statusCell(column, sectionData, status, enabled))
+					statusCell(column, sectionData, status, enabled, health))
 			]);
 		}));
 	}));
 }
 
-function renderStatusData(sections, statuses, selectedKeys) {
+function renderStatusData(sections, statuses, selectedKeys, runtimeHealth) {
 	return E('div', { 'class': 'cake-status-data' }, [
-		E('div', { 'class': 'cake-status-table-scroll' }, renderTable(sections, statuses, selectedKeys)),
-		renderCards(sections, statuses, selectedKeys)
+		E('div', { 'class': 'cake-status-table-scroll' },
+			renderTable(sections, statuses, selectedKeys, runtimeHealth)),
+		renderCards(sections, statuses, selectedKeys, runtimeHealth)
 	]);
 }
 
@@ -841,9 +939,10 @@ return L.view.extend({
 				Promise.all(sections.map(function(section) {
 					return readStatus(section['.name']);
 				})),
-				readPackageVersions()
+				readPackageVersions(),
+				readRuntimeHealth()
 			]).then(function(result) {
-				return [ sections, result[0], result[1], globalSection ];
+				return [ sections, result[0], result[1], globalSection, result[2] ];
 			});
 		});
 	},
@@ -854,13 +953,16 @@ return L.view.extend({
 		var statuses = data[1];
 		var versions = data[2] || {};
 		var globalSection = data[3] || { '.name': 'globals' };
+		var runtimeHealth = data[4] || {};
 		var visibleColumns = statusColumnSelection(globalSection);
-		var statusData = renderStatusData(sections, statuses, visibleColumns);
+		var statusData = renderStatusData(sections, statuses, visibleColumns, runtimeHealth);
 		var columnChooser;
-		var replaceStatusData = function(nextStatuses, nextColumns) {
+		var replaceStatusData = function(nextStatuses, nextColumns, nextRuntimeHealth) {
 			statuses = nextStatuses || statuses;
 			visibleColumns = nextColumns || visibleColumns;
-			var nextData = renderStatusData(sections, statuses, visibleColumns);
+			if (nextRuntimeHealth != null)
+				runtimeHealth = nextRuntimeHealth;
+			var nextData = renderStatusData(sections, statuses, visibleColumns, runtimeHealth);
 			if (statusData.parentNode) {
 				statusData.parentNode.replaceChild(nextData, statusData);
 				statusData = nextData;
@@ -871,10 +973,13 @@ return L.view.extend({
 		});
 
 		poll.add(function() {
-			return Promise.all(sections.map(function(section) {
-				return readStatus(section['.name']);
-			})).then(function(nextStatuses) {
-				replaceStatusData(nextStatuses);
+			return Promise.all([
+				Promise.all(sections.map(function(section) {
+					return readStatus(section['.name']);
+				})),
+				readRuntimeHealth()
+			]).then(function(result) {
+				replaceStatusData(result[0], null, result[1]);
 			});
 		}, 5);
 
@@ -885,10 +990,11 @@ return L.view.extend({
 				'.cake-status-table-scroll{width:100%;max-width:100%;min-width:0;overflow-x:auto;margin-top:18px}',
 				'.cake-status-table{width:100%;margin:0}',
 				'.cake-status-table-compact{min-width:0;table-layout:fixed}',
-				'.cake-status-table-compact [data-column="instance"]{width:14%}',
-				'.cake-status-table-compact [data-column="uplink"]{width:22%}',
-				'.cake-status-table-compact [data-column="quality"]{width:43%}',
-				'.cake-status-table-compact [data-column="rating"]{width:21%}',
+				'.cake-status-table-compact [data-column="instance"]{width:9%}',
+				'.cake-status-table-compact [data-column="uplink"]{width:15%}',
+				'.cake-status-table-compact [data-column="services"]{width:29%}',
+				'.cake-status-table-compact [data-column="quality"]{width:30%}',
+				'.cake-status-table-compact [data-column="rating"]{width:17%}',
 				'.cake-status-table-expanded{min-width:max-content;table-layout:auto}',
 				'.cake-status-table th{vertical-align:bottom!important;padding-top:10px!important;padding-bottom:10px!important}',
 				'.cake-status-table td{vertical-align:top!important;padding-top:13px!important;padding-bottom:13px!important;line-height:1.35}',
@@ -896,6 +1002,12 @@ return L.view.extend({
 				'.cake-status-cell>div{min-height:100%;display:flex;flex-direction:column;align-items:flex-start}',
 				'.cake-status-cell small{display:block;margin-top:3px;line-height:1.3}',
 				'.cake-status-timestamp span,.cake-status-timestamp small{white-space:nowrap}',
+				'.cake-services-stack{gap:5px;min-width:210px}.cake-services-overall{letter-spacing:.025em}',
+				'.cake-services-details{display:flex!important;flex-direction:column;gap:2px;font-size:11px;line-height:1.3}',
+				'.cake-services-healthy .cake-services-overall{color:#16a085}.cake-services-disabled .cake-services-overall{color:#888}',
+				'.cake-services-unmanaged .cake-services-overall,.cake-services-degraded .cake-services-overall{color:#d08b20}',
+				'.cake-services-orphaned .cake-services-overall,.cake-services-blocked .cake-services-overall,.cake-services-unavailable strong{color:#d34b4b}',
+				'.cake-services-issue{white-space:normal!important;overflow-wrap:anywhere;color:#d34b4b!important;max-width:100%}',
 				'.cake-quality-stack{gap:7px;min-width:210px}',
 				'.cake-quality-detected{display:grid!important;grid-template-columns:66px minmax(30px,auto);column-gap:7px;align-items:baseline!important}',
 				'.cake-quality-detected small{grid-column:1 / -1;color:#888;white-space:normal}',

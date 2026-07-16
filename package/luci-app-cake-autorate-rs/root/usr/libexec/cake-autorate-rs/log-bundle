@@ -128,6 +128,19 @@ if [ -x /etc/init.d/cake-autorate ]; then
 	run_command "cake-autorate service status" /etc/init.d/cake-autorate status
 fi
 
+if [ -x /usr/libexec/cake-autorate-rs/runtime-health ]; then
+	run_command "per-instance runtime reconciliation" /usr/libexec/cake-autorate-rs/runtime-health
+fi
+
+if [ -x /usr/libexec/cake-autorate-rs/traffic-classifier ]; then
+	run_command "native traffic-priority classifier" \
+		/usr/libexec/cake-autorate-rs/traffic-classifier status
+fi
+if command -v nft >/dev/null 2>&1; then
+	run_command "native traffic-priority nftables table" \
+		nft list table inet cake_autorate_dscp
+fi
+
 if [ -x /etc/init.d/cake-autorate-mqtt ]; then
 	run_command "cake-autorate-mqtt service status" /etc/init.d/cake-autorate-mqtt status
 fi

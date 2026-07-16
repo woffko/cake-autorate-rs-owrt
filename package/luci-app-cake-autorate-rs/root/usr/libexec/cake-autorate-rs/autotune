@@ -725,7 +725,20 @@ compute_config_fingerprint() {
 	fingerprint_cake_sorted="$job_dir/config-fingerprint.cake.sorted.$$"
 	fingerprint_sqm_raw="$job_dir/config-fingerprint.sqm.raw.$$"
 	fingerprint_sqm_sorted="$job_dir/config-fingerprint.sqm.sorted.$$"
+	fingerprint_rules_raw="$job_dir/config-fingerprint.rules.raw.$$"
+	fingerprint_rules_sorted="$job_dir/config-fingerprint.rules.sorted.$$"
 	fingerprint_input="$job_dir/config-fingerprint.input.$$"
+	: > "$fingerprint_rules_raw" || return 1
+	for fingerprint_rule_section in $(uci -q show cake-autorate 2>/dev/null |
+		sed -n 's/^cake-autorate\.\([A-Za-z0-9_][A-Za-z0-9_]*\)=traffic_rule$/\1/p' |
+		LC_ALL=C sort -u); do
+		safe_job_name "$fingerprint_rule_section" || return 1
+		[ "$(uci -q get "cake-autorate.$fingerprint_rule_section.instance" 2>/dev/null)" = "$job_name" ] ||
+			continue
+		uci -q show "cake-autorate.$fingerprint_rule_section" >> "$fingerprint_rules_raw" 2>/dev/null ||
+			return 1
+	done
+	[ -s "$fingerprint_rules_raw" ] || printf '<none>\n' > "$fingerprint_rules_raw"
 	if uci -q show "cake-autorate.$job_name" > "$fingerprint_cake_raw" 2>/dev/null &&
 	   [ -s "$fingerprint_cake_raw" ]; then
 		fingerprint_sqm_section="$(uci -q get "cake-autorate.$job_name.sqm_section" 2>/dev/null)"
@@ -750,20 +763,25 @@ compute_config_fingerprint() {
 	fi
 	if [ ! -s "$fingerprint_cake_raw" ] || [ ! -s "$fingerprint_sqm_raw" ]; then
 		rm -f "$fingerprint_cake_raw" "$fingerprint_cake_sorted" \
-			"$fingerprint_sqm_raw" "$fingerprint_sqm_sorted" "$fingerprint_input"
+			"$fingerprint_sqm_raw" "$fingerprint_sqm_sorted" \
+			"$fingerprint_rules_raw" "$fingerprint_rules_sorted" "$fingerprint_input"
 		return 1
 	fi
 	LC_ALL=C sort "$fingerprint_cake_raw" > "$fingerprint_cake_sorted" || return 1
 	LC_ALL=C sort "$fingerprint_sqm_raw" > "$fingerprint_sqm_sorted" || return 1
+	LC_ALL=C sort "$fingerprint_rules_raw" > "$fingerprint_rules_sorted" || return 1
 	{
 		printf 'cake-autorate:%s\n' "$job_name"
 		cat "$fingerprint_cake_sorted"
 		printf 'sqm:%s\n' "$fingerprint_sqm_section"
 		cat "$fingerprint_sqm_sorted"
+		printf 'traffic-rules:%s\n' "$job_name"
+		cat "$fingerprint_rules_sorted"
 	} > "$fingerprint_input" || return 1
 	fingerprint_digest="$(sha256sum "$fingerprint_input" 2>/dev/null | awk '{ print $1; exit }')"
 	rm -f "$fingerprint_cake_raw" "$fingerprint_cake_sorted" \
-		"$fingerprint_sqm_raw" "$fingerprint_sqm_sorted" "$fingerprint_input"
+		"$fingerprint_sqm_raw" "$fingerprint_sqm_sorted" \
+		"$fingerprint_rules_raw" "$fingerprint_rules_sorted" "$fingerprint_input"
 	case "$fingerprint_digest" in
 		????????????????????????????????????????????????????????????????)
 			case "$fingerprint_digest" in *[!0-9a-f]*) return 1 ;; esac
@@ -1622,10 +1640,14 @@ replace_temporary_cake_qdisc() {
 	case "$autotune_profile" in
 		gaming) set -- "$@" diffserv4 nat ;;
 		best_overall|fair)
-			set -- "$@" besteffort nat
-			# piece_of_cake.qos washes only the ingress/IFB path when
-			# squash_dscp=1. Its egress path remains besteffort+nat.
-			[ "$qdisc_direction" != download ] || set -- "$@" wash
+			if [ "$qdisc_direction" = download ]; then
+				# Native rules run before outbound enqueue, not before WAN
+				# ingress is redirected to IFB. Keep untrusted download
+				# markings in one best-effort tin and wash them afterwards.
+				set -- "$@" besteffort nat wash
+			else
+				set -- "$@" diffserv4 nat
+			fi
 			;;
 		*) return 1 ;;
 	esac
@@ -1714,10 +1736,11 @@ exact_root_qdisc() {
 			! printf '%s\n' "$qdisc_line" | grep -Eq '(^|[[:space:]])wash([[:space:]]|$)' || return 1
 			;;
 		best_overall|fair)
-			printf '%s\n' "$qdisc_line" | grep -Eq '(^|[[:space:]])besteffort([[:space:]]|$)' || return 1
 			if [ "$qdisc_direction" = download ]; then
+				printf '%s\n' "$qdisc_line" | grep -Eq '(^|[[:space:]])besteffort([[:space:]]|$)' || return 1
 				printf '%s\n' "$qdisc_line" | grep -Eq '(^|[[:space:]])wash([[:space:]]|$)' || return 1
 			else
+				printf '%s\n' "$qdisc_line" | grep -Eq '(^|[[:space:]])diffserv4([[:space:]]|$)' || return 1
 				! printf '%s\n' "$qdisc_line" | grep -Eq '(^|[[:space:]])wash([[:space:]]|$)' || return 1
 			fi
 			;;
@@ -2665,12 +2688,12 @@ proposal_json_valid() {
 	esac
 	case "$autotune_profile" in
 		best_overall|fair)
-			[ "$proposal_sqm_script" = piece_of_cake.qos ] &&
-				[ "$proposal_sqm_classification" = besteffort ] &&
+			[ "$proposal_sqm_script" = layer_cake.qos ] &&
+				[ "$proposal_sqm_classification" = diffserv4 ] &&
 				[ "$proposal_sqm_squash_dscp" = true ] &&
 				[ "$proposal_sqm_squash_ingress" = true ] &&
-				[ -z "$proposal_sqm_iqdisc_opts" ] &&
-				[ -z "$proposal_sqm_eqdisc_opts" ] || return 1
+				[ "$proposal_sqm_iqdisc_opts" = besteffort ] &&
+				[ "$proposal_sqm_eqdisc_opts" = diffserv4 ] || return 1
 			;;
 	esac
 
@@ -2768,6 +2791,20 @@ speedtest_supervisor_fail() {
 	return "$speedtest_supervisor_rc"
 }
 
+capture_speedtest_helper_error() {
+	speedtest_supervisor_detail=""
+	owned_regular_file "$test_output" || return 0
+	helper_error_size="$(wc -c < "$test_output" 2>/dev/null)"
+	case "$helper_error_size" in ''|*[!0-9]*) return 0 ;; esac
+	[ "$helper_error_size" -ge 2 ] && [ "$helper_error_size" -le 262144 ] || return 0
+	helper_error_payload="$(cat "$test_output" 2>/dev/null)" || return 0
+	strict_single_json_object "$helper_error_payload" || return 0
+	helper_error_detail="$(extract_json "$helper_error_payload" '@.error' 2>/dev/null | sed -n '1p')"
+	[ -n "$helper_error_detail" ] || return 0
+	[ "${#helper_error_detail}" -le 1024 ] 2>/dev/null || return 0
+	speedtest_supervisor_detail="$helper_error_detail"
+}
+
 finalize_speedtest_result() {
 	final_destination="$1"
 	final_test_rc="$2"
@@ -2786,6 +2823,7 @@ finalize_speedtest_result() {
 		return
 	fi
 	if [ "$final_test_rc" -ne 0 ] 2>/dev/null; then
+		capture_speedtest_helper_error
 		speedtest_supervisor_fail "helper-exit:$final_test_rc" "$final_test_rc"
 		return
 	fi
@@ -2835,6 +2873,7 @@ run_speedtest_with_timeout() {
 	shift
 	speedtest_supervisor_reason=precondition
 	speedtest_supervisor_rc=1
+	speedtest_supervisor_detail=""
 	[ "${recovery_prepared:-0}" = 1 ] && [ "${recovery_armed:-0}" = 1 ] &&
 		[ -f "$recovery_journal" ] && [ -e "$recovery_heartbeat" ] || {
 			speedtest_supervisor_fail recovery-not-armed 1
@@ -3127,9 +3166,15 @@ speedtest_supervisor_json() {
 		supervisor_raw_bytes="$(wc -c < "$test_output" 2>/dev/null)"
 		case "$supervisor_raw_bytes" in ''|*[!0-9]*) supervisor_raw_bytes=0 ;; esac
 	fi
-	printf '{"reason":"%s","exit_code":%s,"raw_available":%s,"raw_bytes":%s}' \
+	if [ -n "${speedtest_supervisor_detail:-}" ]; then
+		supervisor_detail_json="\"$(json_escape "$speedtest_supervisor_detail")\""
+	else
+		supervisor_detail_json=null
+	fi
+	printf '{"reason":"%s","exit_code":%s,"raw_available":%s,"raw_bytes":%s,"detail":%s}' \
 		"$(json_escape "$speedtest_supervisor_reason")" \
-		"${speedtest_supervisor_rc:-1}" "$supervisor_raw_available" "$supervisor_raw_bytes"
+		"${speedtest_supervisor_rc:-1}" "$supervisor_raw_available" "$supervisor_raw_bytes" \
+		"$supervisor_detail_json"
 }
 
 fail() {
@@ -3169,7 +3214,12 @@ run_measurement() {
 			[ "$fair_control_this_attempt" -eq 0 ] ||
 				stop_fair_control_monitors >/dev/null 2>&1 || true
 			stop_phase_background_counter
-			fail "Throughput sample $index failed in the speed-test supervisor (${speedtest_supervisor_reason:-unknown})."
+			if [ -n "${speedtest_supervisor_detail:-}" ]; then
+				speedtest_failure_summary="${speedtest_supervisor_reason:-unknown}: $speedtest_supervisor_detail"
+			else
+				speedtest_failure_summary="${speedtest_supervisor_reason:-unknown}"
+			fi
+			fail "Throughput sample $index failed in the speed-test supervisor ($speedtest_failure_summary)."
 		fi
 		result="$(cat "$measurement_result_file" 2>/dev/null)"
 		rm -f "$measurement_result_file"

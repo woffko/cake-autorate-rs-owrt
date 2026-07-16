@@ -3,7 +3,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-cake-autorate-rs
-PKG_VERSION:=1.0_rc19
+PKG_VERSION:=1.0_rc20
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=woffko
@@ -29,9 +29,9 @@ endef
 
 define Package/luci-app-cake-autorate-rs/postinst
 [ -n "$${IPKG_INSTROOT}" ] || { \
-	rm -f /tmp/luci-indexcache.*; \
-	rm -rf /tmp/luci-modulecache/; \
-	/etc/init.d/rpcd reload 2>/dev/null; \
+	rm -f /tmp/luci-indexcache /tmp/luci-indexcache.*; \
+	rm -rf /tmp/luci-modulecache /tmp/luci-modulecache.*; \
+	/etc/init.d/rpcd reload >/dev/null 2>&1 || true; \
 	/etc/init.d/cake-autorate-autotune enable >/dev/null 2>&1 || true; \
 	/etc/init.d/cake-autorate-autotune start >/dev/null 2>&1 || true; \
 	exit 0; \

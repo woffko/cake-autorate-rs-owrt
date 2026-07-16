@@ -1,6 +1,6 @@
 [package]
 name = "cake-autorate-rs"
-version = "1.0.0-rc.19"
+version = "1.0.0-rc.20"
 edition = "2021"
 license = "GPL-2.0-or-later"
 

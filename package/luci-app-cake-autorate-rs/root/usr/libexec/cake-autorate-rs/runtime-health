@@ -1,0 +1,524 @@
+#!/bin/sh
+
+# Read-only, per-instance reconciliation of configured intent with the actual
+# autorate process and kernel shaping topology. The helper deliberately never
+# starts, stops, repairs or rewrites anything: Status must expose half-applied
+# and orphaned states instead of making them disappear while being observed.
+
+uci_bin="${CAKE_AUTORATE_UCI_BIN:-uci}"
+tc_bin="${CAKE_AUTORATE_TC_BIN:-tc}"
+pgrep_bin="${CAKE_AUTORATE_PGREP_BIN:-pgrep}"
+ubus_bin="${CAKE_AUTORATE_UBUS_BIN:-ubus}"
+jsonfilter_bin="${CAKE_AUTORATE_JSONFILTER_BIN:-jsonfilter}"
+daemon_bin="${CAKE_AUTORATE_DAEMON_BIN:-/usr/sbin/cake-autorated}"
+sys_class_net="${CAKE_AUTORATE_SYS_CLASS_NET:-/sys/class/net}"
+proc_root="${CAKE_AUTORATE_PROC_ROOT:-/proc}"
+runtime_root="${CAKE_AUTORATE_RUNTIME_ROOT:-/var/run/cake-autorate}"
+autotune_root="${CAKE_AUTORATE_AUTOTUNE_DIR:-/tmp/cake-autorate-autotune}"
+quality_root="${CAKE_AUTORATE_QUALITY_DIR:-/tmp/cake-autorate-quality}"
+speedtest_root="${CAKE_AUTORATE_SPEEDTEST_JOB_DIR:-/tmp/cake-autorate-speedtest}"
+apply_root="${CAKE_AUTORATE_APPLY_GUARD_DIR:-/tmp/cake-autorate-apply-guard}"
+traffic_classifier_bin="${CAKE_AUTORATE_TRAFFIC_CLASSIFIER:-/usr/libexec/cake-autorate-rs/traffic-classifier}"
+
+classifier_global_state=UNAVAILABLE
+classifier_attested_instances=""
+if [ -x "$traffic_classifier_bin" ]; then
+	classifier_status="$("$traffic_classifier_bin" status 2>/dev/null || true)"
+	case "$classifier_status" in
+		*'"state":"active"'*)
+			classifier_global_state=ACTIVE
+			classifier_attested_instances="$(printf '%s\n' "$classifier_status" |
+				sed -n 's/.*"attested_instances":"\([^"]*\)".*/\1/p')"
+			;;
+		*'"state":"inactive"'*) classifier_global_state=INACTIVE ;;
+		*'"state":"drifted"'*) classifier_global_state=DRIFTED ;;
+		*'"state":"untracked"'*) classifier_global_state=UNTRACKED ;;
+		*'"state":"unavailable"'*) classifier_global_state=UNAVAILABLE ;;
+		*) classifier_global_state=ERROR ;;
+	esac
+fi
+
+json_escape() {
+	printf '%s' "$1" | awk '
+		BEGIN { ORS = "" }
+		{
+			gsub(/\\/, "\\\\")
+			gsub(/"/, "\\\"")
+			gsub(/\t/, "\\t")
+			gsub(/\r/, "\\r")
+			if (NR > 1) printf "\\n"
+			printf "%s", $0
+		}
+	'
+}
+
+safe_name() {
+	case "$1" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+}
+
+safe_interface() {
+	case "$1" in ''|*[!A-Za-z0-9_.:@-]*) return 1 ;; esac
+}
+
+is_uint() {
+	case "$1" in ''|*[!0-9]*) return 1 ;; esac
+}
+
+uci_get() {
+	"$uci_bin" -q get "cake-autorate.$instance.$1" 2>/dev/null
+}
+
+sqm_get() {
+	"$uci_bin" -q get "sqm.$sqm_section.$1" 2>/dev/null
+}
+
+resolve_interface_device() {
+	resolve_name="$1"
+	[ -n "$resolve_name" ] || return 1
+	if [ -e "$sys_class_net/$resolve_name" ]; then
+		printf '%s\n' "$resolve_name"
+		return 0
+	fi
+	if [ -x "$ubus_bin" ] && [ -x "$jsonfilter_bin" ]; then
+		resolve_status="$("$ubus_bin" call "network.interface.$resolve_name" status 2>/dev/null || true)"
+		if [ -n "$resolve_status" ]; then
+			resolve_device="$(printf '%s\n' "$resolve_status" |
+				"$jsonfilter_bin" -e '@.l3_device' 2>/dev/null | sed -n '1p')"
+			[ -n "$resolve_device" ] || resolve_device="$(printf '%s\n' "$resolve_status" |
+				"$jsonfilter_bin" -e '@.device' 2>/dev/null | sed -n '1p')"
+			if safe_interface "$resolve_device" && [ -e "$sys_class_net/$resolve_device" ]; then
+				printf '%s\n' "$resolve_device"
+				return 0
+			fi
+		fi
+	fi
+	safe_interface "$resolve_name" || return 1
+	printf '%s\n' "$resolve_name"
+}
+
+cake_info() {
+	cake_device="$1"
+	if ! safe_interface "$cake_device" || [ ! -e "$sys_class_net/$cake_device" ]; then
+		printf '0||0|\n'
+		return 0
+	fi
+	"$tc_bin" qdisc show dev "$cake_device" 2>/dev/null | awk '
+		function rate_kbps(value, raw, factor) {
+			raw = tolower(value)
+			factor = -1
+			if (raw ~ /kbit$/) { factor = 1; sub(/kbit$/, "", raw) }
+			else if (raw ~ /mbit$/) { factor = 1000; sub(/mbit$/, "", raw) }
+			else if (raw ~ /gbit$/) { factor = 1000000; sub(/gbit$/, "", raw) }
+			else if (raw ~ /bit$/) { factor = 0.001; sub(/bit$/, "", raw) }
+			if (factor < 0 || raw !~ /^[0-9]+([.][0-9]+)?$/) return 0
+			return (raw + 0) * factor
+		}
+		$1 == "qdisc" && ($2 == "cake" || $2 == "cake_mq") {
+			root = 0
+			for (i = 1; i <= NF; i++) if ($i == "root") root = 1
+			if (!root) next
+			count++
+			kind = $2
+			for (i = 1; i <= NF; i++) {
+				if ($i == "bandwidth" && i < NF) rate = rate_kbps($(i + 1))
+				if ($i == "besteffort" || $i == "diffserv3" ||
+				    $i == "diffserv4" || $i == "diffserv8" ||
+				    $i == "precedence") mode = $i
+			}
+		}
+		END { printf "%d|%s|%.0f|%s\n", count + 0, kind, rate + 0, mode }
+	'
+}
+
+load_cake_info() {
+	cake_info_raw="$(cake_info "$1")"
+	old_ifs="$IFS"
+	IFS='|'
+	set -- $cake_info_raw
+	IFS="$old_ifs"
+	cake_count="${1:-0}"
+	cake_kind="${2:-}"
+	cake_rate="${3:-0}"
+	cake_mode="${4:-}"
+	is_uint "$cake_count" || cake_count=0
+	is_uint "$cake_rate" || cake_rate=0
+}
+
+ingress_qdisc_present() {
+	safe_interface "$1" || return 1
+	[ -e "$sys_class_net/$1" ] || return 1
+	"$tc_bin" qdisc show dev "$1" 2>/dev/null |
+		awk '$1 == "qdisc" && ($2 == "ingress" || $2 == "clsact") { found = 1 }
+			END { exit(found ? 0 : 1) }'
+}
+
+redirect_present() {
+	redirect_target="$1"
+	redirect_ifb="$2"
+	safe_interface "$redirect_target" && safe_interface "$redirect_ifb" || return 1
+	"$tc_bin" filter show dev "$redirect_target" ingress 2>/dev/null | awk -v expected="$redirect_ifb" '
+		function clean(value) {
+			sub(/^[[(]+/, "", value)
+			sub(/[]),;]+$/, "", value)
+			return value
+		}
+		{
+			for (i = 1; i <= NF; i++) {
+				if ($i == "redirect" && $(i + 1) == "dev" && clean($(i + 2)) == expected)
+					found = 1
+				if ($i == "Redirect" && $(i + 1) == "to" &&
+				    $(i + 2) == "device" && clean($(i + 3)) == expected)
+					found = 1
+			}
+		}
+		END { exit(found ? 0 : 1) }
+	'
+}
+
+process_count() {
+	process_pattern="$1"
+	"$pgrep_bin" -f "$process_pattern" 2>/dev/null |
+		awk '/^[0-9]+$/ { count++ } END { print count + 0 }'
+}
+
+pid_file_running() {
+	pid_file="$1"
+	[ -f "$pid_file" ] && [ ! -L "$pid_file" ] || return 1
+	pid_value="$(sed -n '1p' "$pid_file" 2>/dev/null)"
+	is_uint "$pid_value" || return 1
+	[ -d "$proc_root/$pid_value" ]
+}
+
+detect_operation() {
+	if [ "$apply_state" = APPLYING ] || [ "$apply_state" = STALE ]; then
+		printf '%s\n' "$apply_state"
+	elif pid_file_running "$autotune_root/$instance/pid"; then
+		printf 'AUTOTUNE\n'
+	elif pid_file_running "$quality_root/$instance/pid"; then
+		printf 'RATING\n'
+	elif pid_file_running "$speedtest_root/$instance.pid"; then
+		printf 'SPEEDTEST\n'
+	else
+		printf 'IDLE\n'
+	fi
+}
+
+add_issue() {
+	issues="${issues}${issues:+; }$1"
+}
+
+owned_runtime_state() {
+	runtime_expected="$1"
+	runtime_count="$2"
+	if [ "$manage_sqm" != 1 ]; then
+		[ "$runtime_count" -gt 0 ] && printf 'EXTERNAL\n' || printf 'ABSENT\n'
+	elif [ "$runtime_expected" = 1 ]; then
+		case "$runtime_count" in
+			0) printf 'MISSING\n' ;;
+			1) printf 'ACTIVE\n' ;;
+			*) printf 'DUPLICATE\n' ;;
+		esac
+	else
+		[ "$runtime_count" -gt 0 ] && printf 'ORPHANED\n' || printf 'ABSENT\n'
+	fi
+}
+
+emit_instance() {
+	instance="$1"
+	safe_name "$instance" || return 0
+	issues=""
+
+	enabled="$(uci_get enabled)"
+	manage_sqm="$(uci_get manage_sqm)"
+	sqm_enabled="$(uci_get sqm_enabled)"
+	traffic_rules_enabled="$(uci_get traffic_rules_enabled)"
+	classifier_profile="$(uci_get autotune_profile)"
+	[ "$enabled" = 1 ] || enabled=0
+	[ -n "$manage_sqm" ] || manage_sqm=1
+	[ "$manage_sqm" = 1 ] || manage_sqm=0
+	[ -n "$sqm_enabled" ] || sqm_enabled="$enabled"
+	[ "$sqm_enabled" = 1 ] || sqm_enabled=0
+	[ -n "$traffic_rules_enabled" ] || traffic_rules_enabled=0
+	[ "$traffic_rules_enabled" = 1 ] || traffic_rules_enabled=0
+	case "$classifier_profile" in
+		gaming) ;;
+		best-overall|balanced|'') classifier_profile=best_overall ;;
+		best_overall|fair) ;;
+		*) classifier_profile=unknown ;;
+	esac
+
+	target="$(uci_get wan_if)"
+	[ -n "$target" ] || target="$(uci_get sqm_interface)"
+	[ -n "$target" ] || target="$(uci_get ul_if)"
+	resolved_target="$(resolve_interface_device "$target" 2>/dev/null || true)"
+	[ -n "$resolved_target" ] || resolved_target="$target"
+	ul_if="$(uci_get ul_if)"
+	[ -n "$ul_if" ] || ul_if="$resolved_target"
+	ul_if="$(resolve_interface_device "$ul_if" 2>/dev/null || true)"
+	[ -n "$ul_if" ] || ul_if="$resolved_target"
+	dl_if="$(uci_get dl_if)"
+	[ -n "$dl_if" ] || dl_if="ifb4$resolved_target"
+	sqm_section="$(uci_get sqm_section)"
+	[ -n "$sqm_section" ] || sqm_section="cake_$instance"
+
+	daemon_count="$(process_count "^$daemon_bin --instance $instance\$")"
+	case "$enabled:$daemon_count" in
+		1:0) autorate_state=STOPPED; add_issue "Autorate is enabled but its process is absent." ;;
+		1:1) autorate_state=RUNNING ;;
+		1:*) autorate_state=DUPLICATE; add_issue "More than one autorate process owns this instance." ;;
+		0:0) autorate_state=DISABLED ;;
+		0:*) autorate_state=UNEXPECTED; add_issue "Autorate is disabled but its process is still running." ;;
+	esac
+
+	if [ "$manage_sqm" != 1 ]; then
+		sqm_config_state=UNMANAGED
+		sqm_owner=""
+		sqm_config_target=""
+		sqm_queue_enabled=0
+	elif ! safe_name "$sqm_section" ||
+	     ! "$uci_bin" -q get "sqm.$sqm_section" >/dev/null 2>&1; then
+		sqm_config_state=MISSING
+		sqm_owner=""
+		sqm_config_target=""
+		sqm_queue_enabled=0
+		[ "$enabled" = 1 ] && add_issue "The managed SQM queue is missing."
+	else
+		sqm_owner="$(sqm_get _cake_autorate_managed)"
+		sqm_config_target="$(sqm_get interface)"
+		sqm_config_target="$(resolve_interface_device "$sqm_config_target" 2>/dev/null || true)"
+		sqm_queue_enabled="$(sqm_get enabled)"
+		[ "$sqm_queue_enabled" = 1 ] || sqm_queue_enabled=0
+		if [ "$sqm_owner" != "$instance" ]; then
+			sqm_config_state=CONFLICT
+			add_issue "The SQM queue ownership marker belongs to another instance."
+		elif [ -z "$resolved_target" ] || [ "$sqm_config_target" != "$resolved_target" ]; then
+			sqm_config_state=CONFLICT
+			add_issue "The managed SQM queue targets a different interface."
+		elif [ "$sqm_queue_enabled" = 1 ]; then
+			sqm_config_state=ENABLED
+		else
+			sqm_config_state=DISABLED
+		fi
+	fi
+
+	expected_runtime=0
+	if [ "$enabled" = 1 ] && [ "$manage_sqm" = 1 ] && [ "$sqm_enabled" = 1 ] &&
+	   [ "$sqm_config_state" = ENABLED ]; then
+		expected_runtime=1
+	fi
+	if [ "$enabled" != "$sqm_enabled" ] && [ "$manage_sqm" = 1 ]; then
+		add_issue "Autorate and managed SQM enable flags disagree."
+	fi
+
+	load_cake_info "$ul_if"
+	ul_cake_count="$cake_count"
+	ul_cake_kind="$cake_kind"
+	ul_cake_rate="$cake_rate"
+	ul_cake_mode="$cake_mode"
+	cake_ul_state="$(owned_runtime_state "$expected_runtime" "$ul_cake_count")"
+
+	load_cake_info "$dl_if"
+	dl_cake_count="$cake_count"
+	dl_cake_kind="$cake_kind"
+	dl_cake_rate="$cake_rate"
+	dl_cake_mode="$cake_mode"
+	cake_dl_state="$(owned_runtime_state "$expected_runtime" "$dl_cake_count")"
+
+	if [ -e "$sys_class_net/$dl_if" ]; then
+		if [ "$manage_sqm" != 1 ]; then
+			ifb_state=EXTERNAL
+		elif [ "$expected_runtime" = 1 ]; then
+			ifb_state=PRESENT
+		else
+			ifb_state=ORPHANED
+		fi
+	else
+		[ "$expected_runtime" = 1 ] && ifb_state=MISSING || ifb_state=ABSENT
+	fi
+
+	ingress_present=0
+	ingress_qdisc_present "$resolved_target" && ingress_present=1
+	redirect_active=0
+	redirect_present "$resolved_target" "$dl_if" && redirect_active=1
+	if [ "$manage_sqm" != 1 ]; then
+		if [ "$ingress_present" = 1 ] || [ "$redirect_active" = 1 ]; then
+			ingress_state=EXTERNAL
+		else
+			ingress_state=ABSENT
+		fi
+	elif [ "$expected_runtime" = 1 ]; then
+		if [ "$ingress_present" = 1 ] && [ "$redirect_active" = 1 ]; then
+			ingress_state=ACTIVE
+		else
+			ingress_state=MISSING
+		fi
+	elif [ "$ingress_present" = 1 ] || [ "$redirect_active" = 1 ]; then
+		ingress_state=ORPHANED
+	else
+		ingress_state=ABSENT
+	fi
+
+	case "$cake_ul_state" in
+		MISSING) add_issue "Upload CAKE qdisc is missing." ;;
+		DUPLICATE) add_issue "Multiple upload CAKE root qdiscs were detected." ;;
+		ORPHANED) add_issue "Upload CAKE still limits traffic although the instance is disabled." ;;
+	esac
+	case "$cake_dl_state" in
+		MISSING) add_issue "Download CAKE qdisc is missing." ;;
+		DUPLICATE) add_issue "Multiple download CAKE root qdiscs were detected." ;;
+		ORPHANED) add_issue "Download CAKE still limits traffic although the instance is disabled." ;;
+	esac
+	case "$ifb_state" in
+		MISSING) add_issue "The managed download IFB is missing." ;;
+		ORPHANED) add_issue "The managed download IFB remains after SQM was disabled." ;;
+	esac
+	case "$ingress_state" in
+		MISSING) add_issue "The ingress redirect to the managed IFB is missing." ;;
+		ORPHANED) add_issue "The ingress redirect remains after SQM was disabled." ;;
+	esac
+
+	classifier_expected=0
+	if [ "$enabled" = 1 ] && [ "$manage_sqm" = 1 ] && [ "$sqm_enabled" = 1 ] &&
+	   [ "$traffic_rules_enabled" = 1 ]; then
+		classifier_expected=1
+	fi
+	classifier_instance_status=""
+	classifier_applied_target=""
+	classifier_applied_profile=""
+	classifier_attestation_state="$classifier_global_state"
+	if [ "$classifier_global_state" = ACTIVE ]; then
+		classifier_attestation_state=MISSING
+		old_ifs="$IFS"
+		IFS=';'
+		set -- $classifier_attested_instances
+		IFS="$old_ifs"
+		for classifier_record in "$@"; do
+			classifier_record_instance="${classifier_record%%|*}"
+			classifier_record_rest="${classifier_record#*|}"
+			classifier_record_target="${classifier_record_rest%%|*}"
+			classifier_record_profile="${classifier_record_rest#*|}"
+			if [ "$classifier_record_instance" = "$instance" ]; then
+				classifier_attestation_state=ACTIVE
+				classifier_applied_target="$classifier_record_target"
+				classifier_applied_profile="$classifier_record_profile"
+				break
+			fi
+		done
+	fi
+	if [ "$classifier_expected" != 1 ]; then
+		if [ "$classifier_attestation_state" = ACTIVE ]; then
+			classifier_state=ORPHANED
+			add_issue "Traffic-priority rules remain loaded for this disabled instance."
+		else
+			classifier_state=DISABLED
+		fi
+	elif [ "$cake_ul_state" = ACTIVE ] && [ "$ul_cake_mode" != diffserv4 ]; then
+		classifier_state=INEFFECTIVE
+		add_issue "Traffic-priority rules require upload CAKE diffserv4; re-run Auto-Tune or update the SQM profile."
+	elif [ "$classifier_attestation_state" = ACTIVE ] &&
+	     { [ "$classifier_applied_target" != "$resolved_target" ] ||
+	       [ "$classifier_applied_profile" != "$classifier_profile" ]; }; then
+		classifier_state=DRIFTED
+		add_issue "Loaded traffic-priority rules target a stale interface or profile."
+	elif [ "$classifier_attestation_state" = ACTIVE ] &&
+	     [ "$cake_ul_state" = ACTIVE ]; then
+		classifier_state=ACTIVE
+	elif [ "$classifier_attestation_state" = ACTIVE ]; then
+		classifier_state=INEFFECTIVE
+		add_issue "Traffic-priority rules are loaded but upload CAKE is not using diffserv4."
+	elif [ "$classifier_attestation_state" = DRIFTED ] ||
+	     [ "$classifier_attestation_state" = UNTRACKED ]; then
+		classifier_state=DRIFTED
+		add_issue "The native traffic-priority table no longer matches its attested state."
+	elif [ "$classifier_attestation_state" = MISSING ] ||
+	     [ "$classifier_attestation_state" = INACTIVE ]; then
+		classifier_state=MISSING
+		add_issue "Traffic-priority rules are enabled but no attested rules exist for this instance."
+	else
+		classifier_state="$classifier_attestation_state"
+		add_issue "Traffic-priority classifier status is unavailable or invalid."
+	fi
+
+	apply_marker="$(uci_get _autotune_apply_guard)"
+	apply_token="$(uci_get _autotune_apply_token)"
+	if [ "$apply_marker" = 1 ]; then
+		if case "$apply_token" in
+			????????????????????????????????????????????????????????????????)
+				case "$apply_token" in *[!0-9a-f]*) false ;; *) true ;; esac
+				;;
+			*) false ;;
+		   esac &&
+		   [ -d "$apply_root/$apply_token" ] && [ ! -L "$apply_root/$apply_token" ]; then
+			apply_state=APPLYING
+		else
+			apply_state=STALE
+			add_issue "A persistent apply marker has no live RAM transaction."
+		fi
+	elif "$uci_bin" -q show "cake-autorate.$instance" 2>/dev/null |
+	     grep -q '\._autotune_apply_'; then
+		apply_state=BLOCKED
+		add_issue "Malformed or partial Full Auto-Tune apply metadata is present."
+	else
+		apply_state=IDLE
+	fi
+	operation_state="$(detect_operation)"
+
+	overall_state=HEALTHY
+	if [ "$apply_state" = STALE ] || [ "$apply_state" = BLOCKED ]; then
+		overall_state=BLOCKED
+	elif [ "$enabled" = 0 ]; then
+		if [ "$autorate_state" = DISABLED ] &&
+		   [ "$cake_ul_state" != ORPHANED ] && [ "$cake_dl_state" != ORPHANED ] &&
+		   [ "$ifb_state" != ORPHANED ] && [ "$ingress_state" != ORPHANED ]; then
+			overall_state=DISABLED
+		else
+			overall_state=ORPHANED
+		fi
+	elif [ "$manage_sqm" != 1 ]; then
+		[ "$autorate_state" = RUNNING ] && overall_state=UNMANAGED || overall_state=DEGRADED
+	elif [ "$autorate_state" != RUNNING ] || [ "$sqm_config_state" != ENABLED ] ||
+	     [ "$cake_ul_state" != ACTIVE ] || [ "$cake_dl_state" != ACTIVE ] ||
+	     [ "$ifb_state" != PRESENT ] || [ "$ingress_state" != ACTIVE ] ||
+	     [ "$classifier_state" = ORPHANED ] ||
+	     { [ "$classifier_expected" = 1 ] && [ "$classifier_state" != ACTIVE ]; }; then
+		case "$autorate_state:$sqm_config_state:$cake_ul_state:$cake_dl_state:$ifb_state:$ingress_state:$classifier_state" in
+			*DUPLICATE*|*CONFLICT*|*ORPHANED*) overall_state=ORPHANED ;;
+			*) overall_state=DEGRADED ;;
+		esac
+	fi
+
+	observed_at="$(date +%s)"
+	is_uint "$observed_at" || observed_at=0
+	printf '"%s":{' "$(json_escape "$instance")"
+	printf '"overall_state":"%s",' "$overall_state"
+	printf '"autorate_state":"%s","autorate_processes":%s,' "$autorate_state" "$daemon_count"
+	printf '"sqm_config_state":"%s","sqm_section":"%s","sqm_owner":"%s","sqm_target":"%s",' \
+		"$sqm_config_state" "$(json_escape "$sqm_section")" "$(json_escape "$sqm_owner")" \
+		"$(json_escape "$sqm_config_target")"
+	printf '"target_interface":"%s","ul_interface":"%s","dl_interface":"%s",' \
+		"$(json_escape "$resolved_target")" "$(json_escape "$ul_if")" "$(json_escape "$dl_if")"
+	printf '"cake_ul_state":"%s","cake_ul_kind":"%s","cake_ul_mode":"%s","cake_ul_count":%s,"cake_ul_rate_kbps":%s,' \
+		"$cake_ul_state" "$ul_cake_kind" "$ul_cake_mode" "$ul_cake_count" "$ul_cake_rate"
+	printf '"cake_dl_state":"%s","cake_dl_kind":"%s","cake_dl_mode":"%s","cake_dl_count":%s,"cake_dl_rate_kbps":%s,' \
+		"$cake_dl_state" "$dl_cake_kind" "$dl_cake_mode" "$dl_cake_count" "$dl_cake_rate"
+	printf '"classifier_state":"%s","classifier_profile":"%s","classifier_global_state":"%s",' \
+		"$classifier_state" "$classifier_profile" "$classifier_global_state"
+	printf '"classifier_target":"%s","classifier_applied_profile":"%s",' \
+		"$(json_escape "$classifier_applied_target")" "$(json_escape "$classifier_applied_profile")"
+	printf '"ifb_state":"%s","ingress_state":"%s","apply_state":"%s","operation_state":"%s",' \
+		"$ifb_state" "$ingress_state" "$apply_state" "$operation_state"
+	printf '"issues":"%s","observed_at":%s}' "$(json_escape "$issues")" "$observed_at"
+}
+
+instances="$("$uci_bin" -q show cake-autorate 2>/dev/null |
+	sed -n 's/^cake-autorate\.\([A-Za-z0-9_][A-Za-z0-9_]*\)=cake_autorate$/\1/p' |
+	LC_ALL=C sort -u)"
+
+printf '{"schema_version":1,"instances":{'
+separator=""
+for instance_name in $instances; do
+	printf '%s' "$separator"
+	emit_instance "$instance_name"
+	separator=","
+done
+printf '}}\n'

@@ -11,7 +11,7 @@ median throughput become P20/P50 capacity references, the throughput guard is
 enabled, and native transport-latency monitoring is enabled for the created
 instance.
 
-> **RC19 status:** the profile-aware proposal, validation, temporary SQM,
+> **RC20 status:** the profile-aware proposal, validation, temporary SQM,
 > attestation, apply and rollback paths passed deterministic Rust/shell/LuCI
 > tests, both OpenWrt architecture builds, disposable x86 execution of every
 > profile, production Multi-WAN and ARM checks, and authenticated
@@ -75,7 +75,7 @@ second latency signal is deliberate: mobile carriers may prioritize ICMP while
 TCP is still badly queued. The validator returns typed gates and either accepts
 the candidate, requests one measurement retry, proposes a bounded directional
 correction, or declares the requirements infeasible. Full Auto-Tune remains
-experimental, but the RC19 x86_64 Multi-WAN and ARM acceptance gates have
+experimental, but the RC20 x86_64 Multi-WAN and ARM acceptance gates have
 passed.
 
 ## Calibration profiles
@@ -87,9 +87,9 @@ temporary shaped validation and final configuration.
 
 | Profile | Intended balance | Target | Minimum retained observed-low capacity | Maximum loaded ICMP/transport delta | Maximum loss | SQM policy |
 |---|---|---:|---:|---:|---:|---|
-| Gaming | Lowest latency, with more throughput headroom available to CAKE | A+ | 70% | 5 ms | 1% | `layer_cake.qos`, `diffserv4`, preserve DSCP |
-| Best overall | Recommended latency/throughput balance | A | 80% | 30 ms | 3% | `piece_of_cake.qos`, best effort |
-| Fair | Favor sustained large transfers; aim for bounded latency when capacity permits | C | 90% | 200 ms | 5% | `piece_of_cake.qos`, best effort |
+| Gaming | Lowest latency, with more throughput headroom available to CAKE | A+ | 70% | 5 ms | 1% | `layer_cake.qos`; upload/download `diffserv4`; preserve DSCP |
+| Best overall | Recommended latency/throughput balance | A | 80% | 30 ms | 3% | `layer_cake.qos`; upload `diffserv4`; download best effort + wash |
+| Fair | Favor sustained large transfers; aim for bounded latency when capacity permits | C | 90% | 200 ms | 5% | `layer_cake.qos`; upload `diffserv4`; download best effort + wash |
 
 The grades are target classes, not promises about an ISP, server, Wi-Fi client
 or unrelated bottleneck. Every profile also requires 80–110% candidate
@@ -105,11 +105,22 @@ Best overall is the default for new jobs and for existing instances which do
 not yet have `autotune_profile`. The old `balanced` CLI value is accepted as an
 alias for `best_overall`, but all new results use the canonical name.
 
-Gaming does not inspect applications and does not manufacture DSCP markings.
-Its `diffserv4` classes help only traffic already marked by a trusted client,
-firewall or upstream policy. Unmarked traffic remains in CAKE's best-effort
-tin. Because Gaming preserves ingress DSCP instead of washing it, use Best
-overall when upstream markings are not trusted.
+With native traffic rules disabled, Gaming can use trusted client upload and
+WAN-ingress markings. The optional outbound rule editor instead establishes a
+deterministic upload policy: it resets outbound DSCP to CS0 and then matches
+only explicitly configured profiles/presets/ports/addresses. It does not
+install qosify/eBPF or infer an application from traffic contents. Gaming
+continues to preserve WAN-ingress DSCP instead of washing it, so use Best
+overall when downstream markings are not trusted. Best overall and Fair wash
+download markings but can still apply their native profile rules before
+upload CAKE.
+
+The classifier is not a second shaper. It owns only its private nftables table;
+CAKE, IFB, redirects, and rates remain under the one managed SQM owner. Custom
+rules relevant to the selected instance are part of the calibration
+configuration fingerprint, so changing them invalidates stale Review or
+Scheduled Auto-Apply evidence. See
+[Profile traffic priorities](TRAFFIC_PRIORITIES.md).
 
 ## Job phases
 
@@ -170,7 +181,7 @@ directional reference, 5 Mbit/s) makes that direction unusable: re-tuning an
 existing instance retains its complete min/base/max/cap tuple, while a new
 instance without confirmed values fails closed.
 
-Conservative output is diagnostic-only in RC19. It shows the safer suggested
+Conservative output is diagnostic-only in RC20. It shows the safer suggested
 values and why evidence was weak, but it does not expose Apply and scheduled
 Auto-Apply never consumes it.
 
@@ -296,8 +307,8 @@ tightest constraint but never overrides a failed gate.
 
 Temporary validation mirrors the final SQM policy. Gaming creates upload and
 IFB CAKE qdiscs with `diffserv4 nat` and without `wash`. Best overall and Fair
-use `besteffort nat`; their upload path remains unwashed while the download
-IFB uses `wash`, matching `piece_of_cake.qos` with ingress DSCP squashing.
+create upload CAKE with `diffserv4 nat`; their download IFB uses
+`besteffort nat wash`, matching the final asymmetric `layer_cake.qos` policy.
 PPPoE validation uses Ethernet overhead 44 and MPU 84; plain Ethernet uses
 overhead 18 and MPU 64. The verifier rejects the shaped result if any class,
 wash mode, rate, link-layer token, IFB or ingress redirect differs.
@@ -399,6 +410,12 @@ temporary enrollment markers inside that same rollback window, and only then
 confirms. A missing or ambiguous confirmation is reconciled against exact
 pre-change and marker-free expected-final fingerprints; an indeterminate state
 remains recoverable rather than being declared successful.
+
+RC20 additionally binds the transaction to the current boot identity and an
+immutable supervised receipt. Service start performs the Apply Guard preflight
+before any SQM or daemon mutation. It either verifies the live transaction,
+recovers a provably stale boot/transaction pair, or refuses the start; a
+partial persistent marker can no longer be mistaken for a successful apply.
 
 ## Tests
 

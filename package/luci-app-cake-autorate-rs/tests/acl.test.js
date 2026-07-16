@@ -28,5 +28,15 @@ assert.deepStrictEqual(
 	[ 'cake-autorate', 'sqm' ],
 	'The app must not receive UCI write access to network or mwan3',
 );
+assert.deepStrictEqual(
+	group.read.file['/usr/libexec/cake-autorate-rs/runtime-health'],
+	[ 'exec' ],
+	'Status must have read-only execution access to the runtime reconciliation helper',
+);
+assert.deepStrictEqual(
+	group.read.file['/usr/libexec/cake-autorate-rs/traffic-classifier status'],
+	[ 'exec' ],
+	'Traffic priorities must only receive read-only access to classifier status',
+);
 
 console.log('ACL tests passed');

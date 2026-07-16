@@ -1198,3 +1198,130 @@ Final RC19 payload hashes are:
 | aarch64_generic installer | `aef2f47e28b9f3321789f6e5b854a8ef17c53917c2ca45a6ae09e40d1011b6a0` |
 | x86_64 offline bundle | `e9a2b17c9cc2d513cb0e2c7862cbf4ed8fab468f48bfab04d716452583689b7a` |
 | rockchip/armv8 offline bundle | `93f8c3a95ba847a4f3b4aab12e67d92eed238939168469bd611f6a081bbd7d64` |
+
+## RC20 runtime ownership and traffic-priority acceptance (2026-07-17)
+
+RC20 makes the actual data-plane state observable and keeps ownership
+unambiguous. The mandatory **Services** status column reports the daemon,
+managed SQM section, upload/download CAKE qdiscs, IFB, ingress redirect,
+Apply Guard/operation state and the optional classifier independently. It can
+therefore distinguish a disabled service from an orphan shaper instead of
+inferring health from a stale status file.
+
+The traffic-priority feature borrows the useful profile/rule editing model
+from packet-classification frontends, but deliberately has no qosify or eBPF
+integration. It adds no second SQM service and never creates, changes or
+deletes a qdisc, IFB or bandwidth rate. The helper owns only
+`table inet cake_autorate_dscp`; CAKE Autorate remains the sole owner of SQM,
+CAKE and rates. Upgraded instances are opt-in. Rules are validated as
+structured protocol/port/address fields, rendered without a shell command and
+applied only when the selected upload CAKE queue is `layer_cake.qos` with
+`diffserv4`.
+
+The deterministic local gate passed:
+
+- `cargo fmt --check`, locked `cargo check`, Clippy with `-D warnings`, and all
+  142 Rust tests;
+- all seven daemon shell suites, all nine LuCI shell suites and all seven LuCI
+  JavaScript suites;
+- POSIX syntax checks for every packaged runtime helper, JavaScript syntax
+  checks for every LuCI view and `git diff --check`;
+- boot-aware Apply Guard recovery, server-side confirmation supervision,
+  immutable receipts, stale-marker cleanup and exact rollback tests;
+- structured speed-test failure propagation, package-upgrade LuCI cache
+  invalidation, mandatory runtime-health rendering and profile/rule validation
+  tests;
+- independent OpenWrt 25.12.5 x86_64 and rockchip/armv8 SDK builds. The two
+  noarch LuCI APKs are byte-identical.
+
+The native classifier was exercised on the disposable x86 router rather than
+only through mocks:
+
+1. A temporary Gaming profile produced upload and IFB download CAKE queues at
+   the original 10/85 Mbit/s rates, both using `diffserv4`.
+2. The helper loaded its isolated forward/output nftables chains and an
+   ordered WireGuard custom rule mapping UDP/51820 to AF41.
+3. An out-of-band rule mutation changed status to `DRIFTED`; reapply restored
+   an attested `ACTIVE` table.
+4. Stopping CAKE Autorate removed the private table and the managed CAKE/IFB
+   runtime; starting it restored the configured runtime.
+5. The exact pre-test files were restored. Final hashes remained:
+
+| Disposable x86 configuration | SHA-256 |
+|---|---|
+| `cake-autorate` | `aaf00467c59f1c3f573925791cfbca71382f6cf86125bee2328ac67d0116b3bb` |
+| `sqm` | `0204b58ff12277f15aa536e1406ee0dbf2aeeb739f7b48c7169a2b598ecb8d68` |
+| `network` | `ea57aa4b5e44ca7b02c3ea84c174688f9f0185200077f3e87a39f1a071a280ce` |
+| `mwan3` | `88c720fe486115b5a3db09b6efd3b7519878c35105a7ad2a86b0e8127c8f6b96` |
+
+Both offline repositories index 68 APKs. Fresh network-disabled,
+script-disabled x86_64 and aarch64_generic roots selected the complete
+68-package closure including the fallback mbedTLS provider. Both installers
+pass `sh -n`; each archive contains one platform installer, `packages.adb` and
+68 APKs. The exact x86 archive installed on the disposable router, created
+backup `rc20-install-20260716-214352`, restarted only CAKE Autorate, reported
+the active instance HEALTHY and preserved all four hashes above.
+
+The exact release archives were then installed on two existing acceptance
+routers without running a heavy calibration:
+
+- On the ARM router, the existing package cache was moved from the nearly full
+  overlay to tmpfs under an EXIT/HUP/INT/TERM restoration trap. This allowed
+  the unchanged 8 MiB installer safety gate to pass. Backup
+  `rc20-install-20260717-004718` was created, the cache was restored, and
+  `wwan_adaptive` remained HEALTHY with one daemon, the managed queue, both
+  CAKE qdiscs, IFB and ingress redirect active. All configuration hashes were
+  unchanged:
+
+| ARM configuration | SHA-256 |
+|---|---|
+| `cake-autorate` | `ac59a8a2a26e88803a5c493ea86c840c3dd9c10a2058ce0768164515abcdb10c` |
+| `sqm` | `1e29f86a4cfba8cecaa5aee5cface48c6ef2599fa9aa7a567c4d363ec641c920` |
+| `network` | `3d16217f0e3ec73b9ba55b006caf30c5abda024126c429df30ca93e170e4ea68` |
+
+- On the x86 Multi-WAN router, backup
+  `rc20-install-20260717-004910` was created. The four tracker PIDs and two
+  route-monitor PIDs were identical before and after installation; mwan3 was
+  never restarted. `network` and `mwan3` hashes were unchanged. Startup
+  removed one expired Apply Guard marker and synchronized the managed primary
+  SQM queue from its authoritative instance values (894500/889200 kbit/s);
+  those are the only configuration differences. The resulting hashes remained
+  stable through the browser audit:
+
+| x86 Multi-WAN configuration | Before | Final |
+|---|---|---|
+| `cake-autorate` | `64fd14786b8d83d8915d7df05853053b98d0812a1220177f9aaef38b96c3fd40` | `bc9061adcfab4bff099146fdf0492494e6394b39bc00183da9c0a73f2e8f9550` |
+| `sqm` | `dd46843564cb4612be739ca40dacfbd3e9fb4223355cefb89aa269c4a719e484` | `08a7ba40701ec94145a147876f20a6258b5276540261a439ddffb3b5a1896e59` |
+| `network` | `ed6d568293ed2d632c51827f5fa3227acaec4ed257359eb9a92b85a355065190` | unchanged |
+| `mwan3` | `fea15a18e8f39f4211ee37959759a5892d0f592dd6e105cf147263b4dde67e81` | unchanged |
+
+Both `wan_sqm` and `wanb_sqm` reported HEALTHY with independent daemon,
+queue, CAKE and IFB state. Member-scoped HTTP and ICMP probes proved distinct
+paths: the primary used PPPoE/table 1 and the backup used Ethernet/table 2;
+the observed external addresses differed and both members had zero packet
+loss. This verifies route binding without publishing customer addresses.
+
+Authenticated Playwright checked Status, Graphs, Traffic priorities, Settings,
+Edit and Re-run Auto-Tune at 1500x900 and 390x844 on the disposable x86,
+production x86 Multi-WAN and production ARM routers. It rendered 2/4/2
+canvases respectively, found zero page/console/RPC errors and zero horizontal
+overflow on every page. A visual pass confirmed mandatory Services details,
+stacked Multi-WAN graph cards, fixed chart labels, readable mobile modals and
+the new profile-rule editor. The browser did not start calibration or save
+configuration. Evidence is retained under:
+
+- `/home/w0w/cake-autorate-rs-owrt/test-logs/rc20-playwright-virtual`;
+- `/home/w0w/cake-autorate-rs-owrt/test-logs/rc20-playwright-77`;
+- `/home/w0w/cake-autorate-rs-owrt/test-logs/rc20-playwright-100`.
+
+Final RC20 payload hashes are:
+
+| Artifact | SHA-256 |
+|---|---|
+| x86_64 daemon APK | `76a84fb7a8b1bc02af61354ede586de3d25e2e0fc82179fd567744bd51ebacee` |
+| aarch64_generic daemon APK | `30d6f27b2522b6c6d6ece1cdba7a78859b4b4092ba7e51096960e95b360b7686` |
+| noarch LuCI APK | `c48f8cfdae1d08304398750489473ce43a9154fb2b254d6a36643fe504ff69b6` |
+| x86_64 installer | `59c3901caf8130d1df73eadc6d6b3ed8eaf2e18c7dcf7e85530268b742fdfe8c` |
+| aarch64_generic installer | `f942ca9bea8180cf0dd73a97f37159be1d4fc5d531e0e5af09730972fa8a0231` |
+| x86_64 offline bundle | `1c8d02d98d7d8cc295534ba50ddb5acc4ff83085188e10c5d9fb550fa6d03bd7` |
+| rockchip/armv8 offline bundle | `bd1833db70edf9cc5d8406979e30a22e2bdcaae7c967e8fdc297e8d94a3ac4d5` |

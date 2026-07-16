@@ -160,14 +160,14 @@ impl SqmRecommendation {
             },
             AutotuneProfile::BestOverall | AutotuneProfile::Fair => Self {
                 qdisc: "cake",
-                script: "piece_of_cake.qos",
-                classification: "besteffort",
+                script: "layer_cake.qos",
+                classification: "diffserv4",
                 squash_dscp: true,
                 squash_ingress: true,
                 ingress_ecn: "ECN",
                 egress_ecn: "NOECN",
-                iqdisc_opts: "",
-                eqdisc_opts: "",
+                iqdisc_opts: "besteffort",
+                eqdisc_opts: "diffserv4",
             },
         }
     }
@@ -1326,10 +1326,14 @@ pub fn build_proposal_for_profile(
     }
     if profile == AutotuneProfile::Gaming {
         warnings.push(
-            "Gaming diffserv4 prioritizes only traffic already marked with DSCP; CAKE Autorate does not guess applications or rewrite client policy.",
+            "Gaming uses native profile rules for outbound DSCP classification. Review or disable the built-in presets and add explicit application/network rules when needed.",
         );
         warnings.push(
-            "Gaming preserves ingress DSCP. Use Best overall when upstream markings are not trusted.",
+            "Gaming preserves ingress DSCP because download packets reach the SQM IFB before outbound nftables classification. Use Best overall when upstream markings are not trusted.",
+        );
+    } else {
+        warnings.push(
+            "Profile traffic rules classify outbound traffic with diffserv4. Download traffic remains best effort because WAN ingress reaches the SQM IFB before the native nftables rule hooks.",
         );
     }
     if profile == AutotuneProfile::Fair {
@@ -1705,7 +1709,7 @@ mod tests {
         assert!(proposal
             .warnings
             .iter()
-            .any(|warning| warning.contains("does not guess applications")));
+            .any(|warning| warning.contains("native profile rules")));
     }
 
     #[test]
@@ -1858,7 +1862,7 @@ mod tests {
         assert!(json.contains("\"profile\":\"best_overall\""));
         assert!(json.contains("\"minimum_kbps\""));
         assert!(json.contains("\"adaptive_ceiling\""));
-        assert!(json.contains("\"classification\":\"besteffort\""));
+        assert!(json.contains("\"classification\":\"diffserv4\""));
         assert!(json.contains("\"overhead\":44"));
     }
 

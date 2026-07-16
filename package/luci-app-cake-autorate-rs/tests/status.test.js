@@ -18,15 +18,16 @@ const source = fs.readFileSync(sourcePath, 'utf8');
 const prefix = source.slice(0, source.indexOf('return L.view.extend'));
 const E = (tag, attrs, children) => ({ tag, attrs: attrs || {}, children: children || [] });
 const helpers = new Function('fs', 'poll', 'uci', 'ui', 'cakeUi', 'L', 'E', '_',
-	`${prefix}\nreturn { formatQuality, formatRoute, formatState, qualityReadiness, qualityProgressText, ` +
+	`${prefix}\nreturn { formatQuality, formatRoute, formatState, formatServices, qualityReadiness, qualityProgressText, ` +
 		`statusColumnSelection, selectedStatusColumns };`
 )({}, {}, {}, {}, {}, {}, E, value => value);
 
-assert.deepEqual(helpers.statusColumnSelection({}), [ 'instance', 'uplink', 'quality', 'rating' ]);
+assert.deepEqual(helpers.statusColumnSelection({}),
+	[ 'instance', 'uplink', 'services', 'quality', 'rating' ]);
 assert.deepEqual(helpers.statusColumnSelection({ status_columns: [ 'cpu', 'route' ] }),
-	[ 'instance', 'uplink', 'quality', 'rating', 'route', 'cpu' ]);
+	[ 'instance', 'uplink', 'services', 'quality', 'rating', 'route', 'cpu' ]);
 assert.deepEqual(helpers.selectedStatusColumns([ 'cpu' ]).map(column => column.key),
-	[ 'instance', 'uplink', 'quality', 'rating', 'cpu' ],
+	[ 'instance', 'uplink', 'services', 'quality', 'rating', 'cpu' ],
 	'mandatory columns must remain visible even when omitted by saved preferences');
 
 const quality = helpers.formatQuality({
@@ -180,6 +181,55 @@ const unhealthyState = helpers.formatState({
 assert.equal(unhealthyState.children[0].children, 'ERROR');
 assert.equal(unhealthyState.children[1].children, 'CAKE/IFB unavailable');
 assert.match(unhealthyState.attrs.title, /download counter is missing/);
+const healthyServices = helpers.formatServices({
+	overall_state: 'HEALTHY',
+	autorate_state: 'RUNNING',
+	autorate_processes: 1,
+	sqm_config_state: 'ENABLED',
+	sqm_section: 'cake_wan_sqm',
+	cake_ul_state: 'ACTIVE',
+	cake_ul_rate_kbps: 806000,
+	cake_ul_mode: 'diffserv4',
+	cake_dl_state: 'ACTIVE',
+	cake_dl_rate_kbps: 801000,
+	ul_interface: 'pppoe-wan',
+	dl_interface: 'ifb4pppoe-wan',
+	ifb_state: 'PRESENT',
+	ingress_state: 'ACTIVE',
+	classifier_state: 'ACTIVE',
+	classifier_profile: 'best_overall',
+	classifier_target: 'pppoe-wan',
+	classifier_applied_profile: 'best_overall',
+	operation_state: 'IDLE',
+	apply_state: 'IDLE',
+	issues: '',
+});
+assert.equal(healthyServices.children[0].children, 'HEALTHY');
+assert.match(healthyServices.attrs.class, /cake-services-healthy/);
+assert.match(healthyServices.attrs.title, /Upload CAKE: ACTIVE on pppoe-wan at 806 Mbps/);
+assert.match(healthyServices.attrs.title, /Traffic rules: ACTIVE \(best_overall; upload CAKE diffserv4\)/);
+assert.match(healthyServices.attrs.title, /Attested rules: pppoe-wan \(best_overall\)/);
+const orphanedServices = helpers.formatServices({
+	overall_state: 'ORPHANED',
+	autorate_state: 'DISABLED',
+	autorate_processes: 0,
+	sqm_config_state: 'DISABLED',
+	sqm_section: 'cake_wan_sqm',
+	cake_ul_state: 'ORPHANED',
+	cake_ul_rate_kbps: 794400,
+	cake_dl_state: 'ORPHANED',
+	cake_dl_rate_kbps: 792000,
+	ul_interface: 'pppoe-wan',
+	dl_interface: 'ifb4pppoe-wan',
+	ifb_state: 'ORPHANED',
+	ingress_state: 'ORPHANED',
+	operation_state: 'IDLE',
+	apply_state: 'IDLE',
+	issues: 'Upload CAKE still limits traffic although the instance is disabled.',
+});
+assert.equal(orphanedServices.children[0].children, 'ORPHANED');
+assert.match(orphanedServices.attrs.class, /cake-services-orphaned/);
+assert.match(orphanedServices.attrs.title, /Detected issue: Upload CAKE still limits traffic/);
 const learning = helpers.qualityReadiness({ enabled: '1', sqm_enabled: '1' }, {
 	transport_latency_enabled: true,
 	route_active: true,
@@ -213,6 +263,8 @@ assert.match(source, /List columns/);
 assert.match(source, /Reset default/);
 assert.match(source, /\/usr\/libexec\/cake-autorate-rs\/status-columns/,
 	'column preferences must use the isolated persistence helper');
+assert.match(source, /\/usr\/libexec\/cake-autorate-rs\/runtime-health/,
+	'Status must reconcile configured intent with actual daemon and kernel state');
 assert.doesNotMatch(source, /return uci\.save\(\)/,
 	'Status preferences must not leave an uncommitted LuCI UCI transaction');
 assert.match(source, /column\.mandatory \? '' : null/,
@@ -225,7 +277,7 @@ assert.match(source, /cake-status-root\{width:100%;max-width:100%;min-width:0;ma
 assert.doesNotMatch(source, /cake-status-root\{[^}]*100vw/,
 	'Status must not escape the LuCI content container through viewport units');
 assert.match(source, /cake-status-table-compact\{min-width:0;table-layout:fixed\}/,
-	'the four mandatory columns must use a compact fixed layout');
+	'the five mandatory columns must use a compact fixed layout');
 assert.match(source, /cake-status-table-expanded\{min-width:max-content;table-layout:auto\}/,
 	'optional columns must overflow only inside the table scroller');
 assert.match(source, /cake-quality-action\{min-width:145px;display:flex;flex-direction:column;align-items:flex-start;gap:5px\}/,

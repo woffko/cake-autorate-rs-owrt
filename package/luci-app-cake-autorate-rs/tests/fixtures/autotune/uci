@@ -5,6 +5,21 @@ action="${1:-}"
 key="${2:-}"
 
 case "$action:$key" in
+	show:cake-autorate)
+		printf '%s\n' \
+			"cake-autorate.globals=globals" \
+			"cake-autorate.rule_fixture=traffic_rule"
+		;;
+	get:cake-autorate.rule_fixture.instance)
+		printf 'fingerprint\n'
+		;;
+	show:cake-autorate.rule_fixture)
+		printf '%s\n' \
+			"cake-autorate.rule_fixture=traffic_rule" \
+			"cake-autorate.rule_fixture.instance='fingerprint'" \
+			"cake-autorate.rule_fixture.profile='best_overall'" \
+			"cake-autorate.rule_fixture.revision='${AUTOTUNE_MOCK_RULE_REVISION:-0}'"
+		;;
 	get:cake-autorate.*.sqm_section)
 		[ "${AUTOTUNE_MOCK_UCI_ABSENT:-0}" != 1 ] || exit 1
 		instance="${key#cake-autorate.}"

@@ -6,18 +6,30 @@ init_script="$base/files/etc/init.d/cake-autorate"
 work="${TMPDIR:-/tmp}/cake-init-apply-guard-test.$$"
 log="$work/mutations"
 helper="$work/apply-guard"
+classifier="$work/traffic-classifier"
 mkdir -p "$work"
 trap 'rm -rf "$work"' EXIT INT TERM
 
 cat > "$helper" <<'EOF'
 #!/bin/sh
-case "${APPLY_GUARD_FIXTURE_STATE:-reject}" in
-	verified) printf '%s\n' '{"state":"verified","schema_version":1,"markers":1}' ;;
-	clear) printf '%s\n' '{"state":"clear","schema_version":1}' ;;
+case "${1:-verify-init}:${APPLY_GUARD_FIXTURE_STATE:-reject}" in
+	verify-init:verified) printf '%s\n' '{"state":"verified","schema_version":1,"markers":1,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' ;;
+	verify-init:clear) printf '%s\n' '{"state":"clear","schema_version":1}' ;;
+	recover-stale:recoverable)
+		: > "${APPLY_GUARD_FIXTURE_RECOVERED:?}"
+		printf '%s\n' '{"state":"recovered","schema_version":1,"reason":"boot-changed"}'
+		;;
+	recover-stale:clear) printf '%s\n' '{"state":"clear","schema_version":1}' ;;
 	*) printf '%s\n' '{"state":"failed","error":"token missing"}'; exit 1 ;;
 esac
 EOF
 chmod +x "$helper"
+
+cat > "$classifier" <<'EOF'
+#!/bin/sh
+printf 'classifier-%s\n' "${1:-missing}" >> "${APPLY_GUARD_FIXTURE_MUTATIONS:?}"
+EOF
+chmod +x "$classifier"
 
 harness() {
 	operation="$1"
@@ -25,14 +37,21 @@ harness() {
 	state="$3"
 	markers="$4"
 	CAKE_AUTORATE_APPLY_GUARD="$guard_path"
+	CAKE_AUTORATE_TRAFFIC_CLASSIFIER="$classifier"
 	APPLY_GUARD_FIXTURE_STATE="$state"
 	APPLY_GUARD_FIXTURE_MARKERS="$markers"
+	APPLY_GUARD_FIXTURE_RECOVERED="$work/recovered"
+	APPLY_GUARD_FIXTURE_MUTATIONS="$log"
+	rm -f "$APPLY_GUARD_FIXTURE_RECOVERED"
 	export CAKE_AUTORATE_APPLY_GUARD APPLY_GUARD_FIXTURE_STATE APPLY_GUARD_FIXTURE_MARKERS
+	export CAKE_AUTORATE_TRAFFIC_CLASSIFIER APPLY_GUARD_FIXTURE_RECOVERED
+	export APPLY_GUARD_FIXTURE_MUTATIONS
 	. "$init_script"
 
 	logger() { :; }
 	uci() {
 		[ "${1:-}" = -q ] && [ "${2:-}" = show ] || return 1
+		[ ! -e "$APPLY_GUARD_FIXTURE_RECOVERED" ] || return 1
 		case "${3:-}:${APPLY_GUARD_FIXTURE_MARKERS:-both}" in
 			cake-autorate:cake|cake-autorate:both)
 				printf '%s\n' "cake-autorate.wan_sqm._autotune_apply_guard='1'"
@@ -55,6 +74,11 @@ harness() {
 	config_foreach() { mark start-instance; }
 	stop() { mark stop-service; }
 	start() { mark start-service; }
+	procd_open_instance() {
+		case "${1:-}" in apply_guard_*) mark apply-supervisor ;; esac
+	}
+	procd_set_param() { :; }
+	procd_close_instance() { :; }
 
 	case "$operation" in
 		start) start_service_locked ;;
@@ -103,11 +127,35 @@ for operation in start reload stop; do
 	assert_rejected_without_mutation "$operation" "$helper" reject sqm
 done
 
+for operation in start reload stop; do
+	: > "$log"
+	sh "$0" harness "$operation" "$helper" recoverable both "$log"
+	case "$operation" in
+		start)
+			grep -qx config-load "$log"
+			grep -qx sync-sqm "$log"
+			grep -qx start-sqm "$log"
+			grep -qx classifier-apply "$log"
+			;;
+		reload)
+			grep -qx stop-service "$log"
+			grep -qx start-service "$log"
+			;;
+		stop)
+			grep -qx stop-sqm "$log"
+			grep -qx classifier-clear "$log"
+			grep -qx procd-kill "$log"
+			;;
+	esac
+done
+
 : > "$log"
 sh "$0" harness start "$helper" verified both "$log"
 grep -qx config-load "$log"
 grep -qx sync-sqm "$log"
 grep -qx start-sqm "$log"
+grep -qx classifier-apply "$log"
+grep -qx apply-supervisor "$log"
 
 : > "$log"
 sh "$0" harness reload "$helper" verified both "$log"
@@ -117,6 +165,7 @@ grep -qx start-service "$log"
 : > "$log"
 sh "$0" harness stop "$helper" verified both "$log"
 grep -qx stop-sqm "$log"
+grep -qx classifier-clear "$log"
 grep -qx procd-kill "$log"
 
 echo "init apply guard tests passed"

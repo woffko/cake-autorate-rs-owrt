@@ -36,6 +36,18 @@
 		}
 	},
 
+	"admin/network/cake-autorate-rs/priorities": {
+		"title": "Traffic priorities",
+		"order": 18,
+		"action": {
+			"type": "view",
+			"path": "cake-autorate-rs/priorities"
+		},
+		"depends": {
+			"acl": [ "luci-app-cake-autorate-rs" ]
+		}
+	},
+
 	"admin/network/cake-autorate-rs/graphs": {
 		"title": "Graphs",
 		"order": 15,
