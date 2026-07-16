@@ -22,6 +22,7 @@ sqm_init="${CAKE_AUTORATE_SQM_INIT:-/etc/init.d/sqm}"
 token_ttl_s="${CAKE_AUTORATE_APPLY_GUARD_TTL_S:-180}"
 postcheck_wait_s="${CAKE_AUTORATE_APPLY_GUARD_POSTCHECK_WAIT_S:-15}"
 orphan_age_s="${CAKE_AUTORATE_APPLY_GUARD_ORPHAN_AGE_S:-900}"
+autotune_result_producer="cake-autorate-rs-autotune"
 
 [ -r "$runtime_lock_lib" ] && . "$runtime_lock_lib"
 
@@ -83,6 +84,21 @@ is_int() {
 
 is_positive_rate() {
 	is_uint "$1" && [ "$1" -gt 0 ] 2>/dev/null && [ "$1" -le 100000000 ] 2>/dev/null
+}
+
+is_decimal() {
+	case "$1" in
+		''|*[!0-9.]*|.*|*..*|*.) return 1 ;;
+	esac
+}
+
+numbers_equal() {
+	is_decimal "$1" && is_decimal "$2" || return 1
+	awk -v first="$1" -v second="$2" 'BEGIN {
+		delta = (first + 0) - (second + 0)
+		if (delta < 0) delta = -delta
+		exit(delta > 0.000001)
+	}'
 }
 
 owned_regular() {
@@ -380,6 +396,134 @@ normalized_number() {
 	}'
 }
 
+load_profile_contract() {
+	profile="$(require_result_value '@.profile')" ||
+		die "The Full Auto-Tune result has no calibration profile."
+	proposal_schema="$(require_result_value '@.proposal.schema_version')" ||
+		die "The Full Auto-Tune proposal schema is missing."
+	proposal_profile="$(require_result_value '@.proposal.profile')" ||
+		die "The Full Auto-Tune proposal profile is missing."
+	target_grade="$(require_result_value '@.proposal.target_grade')" ||
+		die "The Full Auto-Tune target grade is missing."
+	[ "$proposal_schema" = 2 ] && [ "$proposal_profile" = "$profile" ] ||
+		die "The Full Auto-Tune proposal profile contract is invalid."
+
+	validation_realization_min="$(require_result_value '@.proposal.validation.candidate_realization_min_percent')" ||
+		die "The Full Auto-Tune realization floor is missing."
+	validation_realization_max="$(require_result_value '@.proposal.validation.candidate_realization_max_percent')" ||
+		die "The Full Auto-Tune realization ceiling is missing."
+	validation_retention="$(require_result_value '@.proposal.validation.capacity_retention_min_percent')" ||
+		die "The Full Auto-Tune capacity-retention floor is missing."
+	validation_icmp="$(require_result_value '@.proposal.validation.icmp_delta_max_ms')" ||
+		die "The Full Auto-Tune ICMP latency target is missing."
+	validation_transport="$(require_result_value '@.proposal.validation.transport_delta_max_ms')" ||
+		die "The Full Auto-Tune transport latency target is missing."
+	validation_loss="$(require_result_value '@.proposal.validation.loss_max_percent')" ||
+		die "The Full Auto-Tune loss target is missing."
+	validation_cpu="$(require_result_value '@.proposal.validation.cpu_max_percent')" ||
+		die "The Full Auto-Tune CPU ceiling is missing."
+	for profile_number in "$validation_realization_min" "$validation_realization_max" \
+		"$validation_retention" "$validation_icmp" "$validation_transport" \
+		"$validation_loss" "$validation_cpu"; do
+		is_decimal "$profile_number" ||
+			die "The Full Auto-Tune profile contains a malformed numeric policy."
+	done
+	numbers_equal "$validation_realization_min" 80 &&
+		numbers_equal "$validation_realization_max" 110 &&
+		numbers_equal "$validation_cpu" 85 &&
+		numbers_equal "$validation_icmp" "$validation_transport" ||
+		die "The Full Auto-Tune common validation policy is invalid."
+
+	for threshold_pair in \
+		"@.validation_thresholds.candidate_realization_min_percent:$validation_realization_min" \
+		"@.validation_thresholds.candidate_realization_max_percent:$validation_realization_max" \
+		"@.validation_thresholds.capacity_retention_min_percent:$validation_retention" \
+		"@.validation_thresholds.delay_max_ms:$validation_transport" \
+		"@.validation_thresholds.loss_max_percent:$validation_loss" \
+		"@.validation_thresholds.cpu_max_percent:$validation_cpu"; do
+		threshold_path="${threshold_pair%%:*}"
+		threshold_expected="${threshold_pair#*:}"
+		threshold_actual="$(require_result_value "$threshold_path")" ||
+			die "The Full Auto-Tune terminal validation policy is incomplete."
+		numbers_equal "$threshold_actual" "$threshold_expected" ||
+			die "The Full Auto-Tune terminal and proposal validation policies differ."
+	done
+
+	sqm_qdisc="$(require_result_value '@.proposal.sqm.qdisc')" ||
+		die "The Full Auto-Tune queue discipline is missing."
+	sqm_script="$(require_result_value '@.proposal.sqm.script')" ||
+		die "The Full Auto-Tune SQM script is missing."
+	sqm_classification="$(require_result_value '@.proposal.sqm.classification')" ||
+		die "The Full Auto-Tune CAKE classification mode is missing."
+	sqm_squash_dscp="$(require_result_value '@.proposal.sqm.squash_dscp')" ||
+		die "The Full Auto-Tune DSCP policy is missing."
+	sqm_squash_ingress="$(require_result_value '@.proposal.sqm.squash_ingress')" ||
+		die "The Full Auto-Tune ingress DSCP policy is missing."
+	sqm_ingress_ecn="$(require_result_value '@.proposal.sqm.ingress_ecn')" ||
+		die "The Full Auto-Tune ingress ECN policy is missing."
+	sqm_egress_ecn="$(require_result_value '@.proposal.sqm.egress_ecn')" ||
+		die "The Full Auto-Tune egress ECN policy is missing."
+	sqm_iqdisc_opts="$(json_get "$result_copy" '@.proposal.sqm.iqdisc_opts')" ||
+		die "The Full Auto-Tune ingress qdisc options are missing."
+	sqm_eqdisc_opts="$(json_get "$result_copy" '@.proposal.sqm.eqdisc_opts')" ||
+		die "The Full Auto-Tune egress qdisc options are missing."
+	[ "$sqm_qdisc" = cake ] && [ "$sqm_ingress_ecn" = ECN ] &&
+		[ "$sqm_egress_ecn" = NOECN ] ||
+		die "The Full Auto-Tune common CAKE policy is invalid."
+
+	case "$profile" in
+		gaming)
+			[ "$target_grade" = A+ ] &&
+				numbers_equal "$validation_retention" 70 &&
+				numbers_equal "$validation_transport" 5 &&
+				numbers_equal "$validation_loss" 1 &&
+				[ "$sqm_script" = layer_cake.qos ] &&
+				[ "$sqm_classification" = diffserv4 ] &&
+				[ "$sqm_squash_dscp" = false ] &&
+				[ "$sqm_squash_ingress" = false ] &&
+				[ "$sqm_iqdisc_opts" = diffserv4 ] &&
+				[ "$sqm_eqdisc_opts" = diffserv4 ] ||
+				die "The Gaming profile policy is invalid."
+			sqm_qdisc_advanced=1
+			sqm_qdisc_really_really_advanced=1
+			;;
+		best_overall)
+			[ "$target_grade" = A ] &&
+				numbers_equal "$validation_retention" 80 &&
+				numbers_equal "$validation_transport" 30 &&
+				numbers_equal "$validation_loss" 3 ||
+				die "The Best overall profile policy is invalid."
+			sqm_qdisc_advanced=0
+			sqm_qdisc_really_really_advanced=0
+			;;
+		fair)
+			[ "$target_grade" = B ] &&
+				numbers_equal "$validation_retention" 90 &&
+				numbers_equal "$validation_transport" 60 &&
+				numbers_equal "$validation_loss" 5 ||
+				die "The Fair profile policy is invalid."
+			sqm_qdisc_advanced=0
+			sqm_qdisc_really_really_advanced=0
+			;;
+		*)
+			die "The Full Auto-Tune profile is unsupported."
+			;;
+	esac
+	case "$profile" in
+		best_overall|fair)
+			[ "$sqm_script" = piece_of_cake.qos ] &&
+				[ "$sqm_classification" = besteffort ] &&
+				[ "$sqm_squash_dscp" = true ] &&
+				[ "$sqm_squash_ingress" = true ] &&
+				[ -z "$sqm_iqdisc_opts" ] &&
+				[ -z "$sqm_eqdisc_opts" ] ||
+				die "The best-effort CAKE profile policy is invalid."
+			;;
+	esac
+	[ "$sqm_squash_dscp" = true ] && sqm_squash_dscp_value=1 || sqm_squash_dscp_value=0
+	[ "$sqm_squash_ingress" = true ] && sqm_squash_ingress_value=1 || sqm_squash_ingress_value=0
+}
+
 build_expected_manifest() {
 	job="$1"
 	target="$2"
@@ -403,6 +547,8 @@ build_expected_manifest() {
 		uci_at "$expected_dir" -q set "sqm.$sqm_guard._autotune_apply_token=$token" || return 1
 		uci_at "$expected_dir" -q commit sqm || return 1
 	done
+
+	load_profile_contract
 
 	dl_min="$(proposal_rate '@.proposal.download.minimum_kbps')" || die "The Full Auto-Tune proposal contains an invalid download minimum."
 	dl_base="$(proposal_rate '@.proposal.download.base_kbps')" || die "The Full Auto-Tune proposal contains an invalid download base."
@@ -454,7 +600,7 @@ build_expected_manifest() {
 	link_layer="$(require_result_value '@.proposal.link.layer')" || die "The Full Auto-Tune link-layer proposal is missing."
 	case "$link_layer" in none|ethernet|atm) ;; *) die "The Full Auto-Tune link-layer proposal is invalid." ;; esac
 	overhead="$(json_get "$result_copy" '@.proposal.link.overhead')"
-	is_int "$overhead" && [ "$overhead" -ge -1500 ] 2>/dev/null && [ "$overhead" -le 1500 ] 2>/dev/null ||
+	is_uint "$overhead" && [ "$overhead" -le 1500 ] 2>/dev/null ||
 		die "The Full Auto-Tune overhead proposal is invalid."
 	mpu="$(proposal_uint '@.proposal.link.mpu')" || die "The Full Auto-Tune MPU proposal is invalid."
 	[ "$link_layer" = none ] && link_advanced=0 || link_advanced=1
@@ -496,6 +642,7 @@ build_expected_manifest() {
 	expected_set "$job" speedtest_backend "$run_backend"
 	if [ -n "$server_id" ]; then expected_set "$job" speedtest_go_server_id "$server_id"; else expected_delete "cake-autorate.$job.speedtest_go_server_id"; fi
 	expected_set "$job" speedtest_apply_percent "$apply_percent"
+	expected_set "$job" autotune_profile "$profile"
 	expected_set "$job" pinger_method "$pinger_method"
 	expected_set "$job" no_pingers "$no_pingers"
 	if [ "$pinger_method" != irtt ]; then expected_set "$job" ping_extra_args "-I $target"; fi
@@ -533,21 +680,36 @@ build_expected_manifest() {
 	expected_set "$job" adaptive_ceiling_failed_bound_ttl_s "$adaptive_ttl"
 	expected_set "$job" transport_latency_enabled 1
 	expected_set "$job" throughput_guard_enabled 1
-	expected_set "$job" throughput_guard_retention_percent 80
+	expected_set "$job" throughput_guard_retention_percent "$validation_retention"
+	expected_set "$job" quality_target_delay_ms "$validation_transport"
 	expected_set "$job" throughput_reference_dl_p20_kbps "$dl_low"
 	expected_set "$job" throughput_reference_dl_p50_kbps "$dl_median"
 	expected_set "$job" throughput_reference_ul_p20_kbps "$ul_low"
 	expected_set "$job" throughput_reference_ul_p50_kbps "$ul_median"
 
+	expected_set "$job" sqm_qdisc "$sqm_qdisc"
+	expected_set "$job" sqm_script "$sqm_script"
+	expected_set "$job" sqm_qdisc_advanced "$sqm_qdisc_advanced"
+	expected_set "$job" sqm_squash_dscp "$sqm_squash_dscp_value"
+	expected_set "$job" sqm_squash_ingress "$sqm_squash_ingress_value"
+	expected_set "$job" sqm_ingress_ecn "$sqm_ingress_ecn"
+	expected_set "$job" sqm_egress_ecn "$sqm_egress_ecn"
+	expected_set "$job" sqm_qdisc_really_really_advanced "$sqm_qdisc_really_really_advanced"
+	if [ -n "$sqm_iqdisc_opts" ]; then
+		expected_set "$job" sqm_iqdisc_opts "$sqm_iqdisc_opts"
+	else
+		expected_delete "cake-autorate.$job.sqm_iqdisc_opts"
+	fi
+	if [ -n "$sqm_eqdisc_opts" ]; then
+		expected_set "$job" sqm_eqdisc_opts "$sqm_eqdisc_opts"
+	else
+		expected_delete "cake-autorate.$job.sqm_eqdisc_opts"
+	fi
+
 	for tuple in \
 		"sqm_debug_logging:debug_logging:0" "sqm_verbosity:verbosity:5" \
-		"sqm_qdisc:qdisc:cake" "sqm_script:script:piece_of_cake.qos" \
-		"sqm_qdisc_advanced:qdisc_advanced:0" "sqm_squash_dscp:squash_dscp:1" \
-		"sqm_squash_ingress:squash_ingress:1" "sqm_ingress_ecn:ingress_ecn:ECN" \
-		"sqm_egress_ecn:egress_ecn:NOECN" \
-		"sqm_qdisc_really_really_advanced:qdisc_really_really_advanced:0" \
 		"sqm_ilimit:ilimit:" "sqm_elimit:elimit:" "sqm_itarget:itarget:" \
-		"sqm_etarget:etarget:" "sqm_iqdisc_opts:iqdisc_opts:" "sqm_eqdisc_opts:eqdisc_opts:" \
+		"sqm_etarget:etarget:" \
 		"sqm_tcMTU:tcMTU:2047" "sqm_tcTSIZE:tcTSIZE:128" \
 		"sqm_linklayer_adaptation_mechanism:linklayer_adaptation_mechanism:default"; do
 		cake_option="${tuple%%:*}"
@@ -711,7 +873,8 @@ arm_guard() {
 	owned_regular "$result_copy" || die "The Full Auto-Tune result copy is unsafe."
 
 	require_result_flag '@.state' complete "Only a complete Full Auto-Tune result can be applied."
-	require_result_flag '@.schema_version' 3 "Only the fail-closed Full Auto-Tune schema can be applied."
+	require_result_flag '@.schema_version' 4 "Only the fail-closed Full Auto-Tune schema can be applied."
+	require_result_flag '@.producer' "$autotune_result_producer" "The Full Auto-Tune result producer is invalid."
 	require_result_flag '@.auto_apply_eligible' true "This Full Auto-Tune result is not eligible for apply."
 	require_result_flag '@.phase_evidence_complete' true "This Full Auto-Tune result has incomplete phase evidence."
 	require_result_flag '@.phase_contamination_seen' false "A contaminated Full Auto-Tune result cannot be applied."

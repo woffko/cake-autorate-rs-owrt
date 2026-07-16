@@ -33,8 +33,13 @@ case "$expression" in
 		[ "$attestation" = 0 ] && emit "${RESULT_STATE-complete}" || emit "${ATTEST_STATE-ready}"
 		;;
 	@.schema_version)
-		[ "$attestation" = 0 ] && emit "${RESULT_SCHEMA_VERSION-3}" || emit "${ATTEST_SCHEMA_VERSION-1}"
+		[ "$attestation" = 0 ] && emit "${RESULT_SCHEMA_VERSION-4}" || emit "${ATTEST_SCHEMA_VERSION-1}"
 		;;
+	@.producer) emit "${RESULT_PRODUCER-cake-autorate-rs-autotune}" ;;
+	@.profile) emit "${RESULT_PROFILE-best_overall}" ;;
+	@.proposal.schema_version) emit "${RESULT_PROPOSAL_SCHEMA_VERSION-2}" ;;
+	@.proposal.profile) emit "${RESULT_PROPOSAL_PROFILE-${RESULT_PROFILE-best_overall}}" ;;
+	@.proposal.target_grade) emit "${RESULT_TARGET_GRADE-A}" ;;
 	@.validation.pass) emit "${RESULT_VALIDATION_PASS-true}" ;;
 	@.auto_apply_eligible) emit "${RESULT_AUTO_APPLY_ELIGIBLE-true}" ;;
 	@.confidence_mode) emit "${RESULT_CONFIDENCE_MODE-normal}" ;;
@@ -51,7 +56,7 @@ case "$expression" in
 		;;
 	@.validation.gates\[\*\].pass) emit "${RESULT_GATE_PASSES-true true true true true true true true true true true true true true}" ;;
 	@.validation.gates\[\*\].actual) emit "${RESULT_GATE_ACTUALS-90 90 90 90 90 90 10 10 0 40 10 10 0 40}" ;;
-	@.validation.gates\[\*\].limit) emit "${RESULT_GATE_LIMITS-80 80 110 110 80 80 100 100 5 95 100 100 5 95}" ;;
+	@.validation.gates\[\*\].limit) emit "${RESULT_GATE_LIMITS-80 80 110 110 80 80 30 30 3 85 30 30 3 85}" ;;
 	@.validation.gates\[\*\].comparison) emit "${RESULT_GATE_COMPARISONS-minimum minimum maximum maximum minimum minimum maximum maximum maximum maximum maximum maximum maximum maximum}" ;;
 	@.config_fingerprint) emit "${RESULT_CONFIG_FINGERPRINT-__missing__}" ;;
 	@.job_id) emit "${RESULT_JOB_ID-test}" ;;
@@ -79,6 +84,34 @@ case "$expression" in
 	@.route_identity)
 		[ "$attestation" = 0 ] && emit "${RESULT_ROUTE_IDENTITY-main||eth0|192.0.2.2||main}" || emit "${ATTEST_ROUTE_IDENTITY-${RESULT_ROUTE_IDENTITY-main||eth0|192.0.2.2||main}}"
 		;;
+	@.proposal.validation.candidate_realization_min_percent|@.validation_thresholds.candidate_realization_min_percent)
+		emit "${RESULT_REALIZATION_MIN_PERCENT-80}"
+		;;
+	@.proposal.validation.candidate_realization_max_percent|@.validation_thresholds.candidate_realization_max_percent)
+		emit "${RESULT_REALIZATION_MAX_PERCENT-110}"
+		;;
+	@.proposal.validation.capacity_retention_min_percent|@.validation_thresholds.capacity_retention_min_percent)
+		emit "${RESULT_RETENTION_PERCENT-80}"
+		;;
+	@.proposal.validation.icmp_delta_max_ms) emit "${RESULT_ICMP_DELTA_MAX_MS-30}" ;;
+	@.proposal.validation.transport_delta_max_ms|@.validation_thresholds.delay_max_ms)
+		emit "${RESULT_DELAY_MAX_MS-30}"
+		;;
+	@.proposal.validation.loss_max_percent|@.validation_thresholds.loss_max_percent)
+		emit "${RESULT_LOSS_MAX_PERCENT-3}"
+		;;
+	@.proposal.validation.cpu_max_percent|@.validation_thresholds.cpu_max_percent)
+		emit "${RESULT_CPU_MAX_PERCENT-85}"
+		;;
+	@.proposal.sqm.qdisc) emit "${RESULT_SQM_QDISC-cake}" ;;
+	@.proposal.sqm.script) emit "${RESULT_SQM_SCRIPT-piece_of_cake.qos}" ;;
+	@.proposal.sqm.classification) emit "${RESULT_SQM_CLASSIFICATION-besteffort}" ;;
+	@.proposal.sqm.squash_dscp) emit "${RESULT_SQM_SQUASH_DSCP-true}" ;;
+	@.proposal.sqm.squash_ingress) emit "${RESULT_SQM_SQUASH_INGRESS-true}" ;;
+	@.proposal.sqm.ingress_ecn) emit "${RESULT_SQM_INGRESS_ECN-ECN}" ;;
+	@.proposal.sqm.egress_ecn) emit "${RESULT_SQM_EGRESS_ECN-NOECN}" ;;
+	@.proposal.sqm.iqdisc_opts) emit "${RESULT_SQM_IQDISC_OPTS-}" ;;
+	@.proposal.sqm.eqdisc_opts) emit "${RESULT_SQM_EQDISC_OPTS-}" ;;
 	*.minimum_kbps) echo "${RESULT_MINIMUM_KBPS-5000}" ;;
 	*.base_kbps) echo "${RESULT_BASE_KBPS-20000}" ;;
 	*.maximum_kbps) echo "${RESULT_MAXIMUM_KBPS-80000}" ;;
@@ -152,6 +185,8 @@ state_value() {
 	case "$state_key" in
 		cake-autorate.test) echo cake_autorate ;;
 		cake-autorate.test.sqm_section) echo cake_test ;;
+		cake-autorate.test.speedtest_backend) echo auto ;;
+		cake-autorate.test.autotune_profile) echo best_overall ;;
 		cake-autorate.test.route_mode) echo "${CONFIG_ROUTE_MODE:-main}" ;;
 		cake-autorate.test.mwan3_member)
 			[ -n "${CONFIG_MWAN3_MEMBER:-}" ] || return 1
@@ -363,9 +398,17 @@ reset_case() {
 	unset CONFIG_ROUTE_MODE CONFIG_MWAN3_MEMBER
 	unset ATTEST_STATE ATTEST_SCHEMA_VERSION ATTEST_TARGET_INTERFACE ATTEST_RESOLVED_INTERFACE ATTEST_ROUTE_INTERFACE ATTEST_SOURCE_IP ATTEST_EXTERNAL_IP ATTEST_ROUTE_MODE ATTEST_MWAN3_MEMBER ATTEST_ROUTE_IDENTITY
 	unset RESULT_CORRECTION_ACTION RESULT_CORRECTION_FEASIBLE RESULT_GATE_CODES RESULT_GATE_PASSES RESULT_GATE_ACTUALS RESULT_GATE_LIMITS RESULT_GATE_COMPARISONS
+	unset RESULT_PRODUCER RESULT_PROFILE RESULT_PROPOSAL_SCHEMA_VERSION RESULT_PROPOSAL_PROFILE RESULT_TARGET_GRADE
+	unset RESULT_REALIZATION_MIN_PERCENT RESULT_REALIZATION_MAX_PERCENT RESULT_RETENTION_PERCENT RESULT_ICMP_DELTA_MAX_MS RESULT_DELAY_MAX_MS RESULT_LOSS_MAX_PERCENT RESULT_CPU_MAX_PERCENT
+	unset RESULT_SQM_QDISC RESULT_SQM_SCRIPT RESULT_SQM_CLASSIFICATION RESULT_SQM_SQUASH_DSCP RESULT_SQM_SQUASH_INGRESS RESULT_SQM_INGRESS_ECN RESULT_SQM_EGRESS_ECN RESULT_SQM_IQDISC_OPTS RESULT_SQM_EQDISC_OPTS
 	unset RESULT_MINIMUM_KBPS RESULT_BASE_KBPS RESULT_MAXIMUM_KBPS RESULT_CAP_KBPS RESULT_OBSERVED_LOW_KBPS RESULT_OBSERVED_MEDIAN_KBPS RESULT_OBSERVED_HIGH_KBPS RESULT_ACTIVE_THRESHOLD_KBPS RESULT_ADJUST_UP_MS RESULT_DELAY_MS RESULT_ADJUST_DOWN_MS RESULT_HOLD_S RESULT_GROWTH_PERCENT RESULT_PROBE_S RESULT_COOLDOWN_S RESULT_TTL_S RESULT_LINK_OVERHEAD RESULT_LINK_MPU RESULT_CONFIDENCE
 	export RESULT_STATE=complete
-	export RESULT_SCHEMA_VERSION=3
+	export RESULT_SCHEMA_VERSION=4
+	export RESULT_PRODUCER=cake-autorate-rs-autotune
+	export RESULT_PROFILE=best_overall
+	export RESULT_PROPOSAL_SCHEMA_VERSION=2
+	export RESULT_PROPOSAL_PROFILE=best_overall
+	export RESULT_TARGET_GRADE=A
 	export RESULT_VALIDATION_PASS=true
 	export RESULT_AUTO_APPLY_ELIGIBLE=true
 	export RESULT_CONFIDENCE_MODE=normal
@@ -421,14 +464,48 @@ restart_line="$(sed -n '/^service:1:restart$/=' "$log")"
 ! recovery_transactions_pending
 assert_global_lock_released
 
+# Gaming is a complete policy, not just a label: scheduled apply must atomically
+# switch to layer_cake + diffserv4, preserve DSCP and stage the A+ validation
+# targets under the same rollback journal.
+reset_case
+export RESULT_PROFILE=gaming
+export RESULT_PROPOSAL_PROFILE=gaming
+export RESULT_TARGET_GRADE=A+
+export RESULT_RETENTION_PERCENT=70
+export RESULT_ICMP_DELTA_MAX_MS=5
+export RESULT_DELAY_MAX_MS=5
+export RESULT_LOSS_MAX_PERCENT=1
+export RESULT_SQM_SCRIPT=layer_cake.qos
+export RESULT_SQM_CLASSIFICATION=diffserv4
+export RESULT_SQM_SQUASH_DSCP=false
+export RESULT_SQM_SQUASH_INGRESS=false
+export RESULT_SQM_IQDISC_OPTS=diffserv4
+export RESULT_SQM_EQDISC_OPTS=diffserv4
+export RESULT_GATE_ACTUALS='90 90 90 90 90 90 2 2 0 40 2 2 0 40'
+export RESULT_GATE_LIMITS='80 80 110 110 70 70 5 5 1 85 5 5 1 85'
+apply_result test '{}' "$fingerprint_a" eth0
+[ "$(uci -q get cake-autorate.test.autotune_profile)" = gaming ]
+[ "$(uci -q get cake-autorate.test.quality_target_delay_ms)" = 5 ]
+[ "$(uci -q get cake-autorate.test.throughput_guard_retention_percent)" = 70 ]
+[ "$(uci -q get cake-autorate.test.sqm_script)" = layer_cake.qos ]
+[ "$(uci -q get cake-autorate.test.sqm_squash_dscp)" = 0 ]
+[ "$(uci -q get cake-autorate.test.sqm_squash_ingress)" = 0 ]
+[ "$(uci -q get cake-autorate.test.sqm_iqdisc_opts)" = diffserv4 ]
+[ "$(uci -q get cake-autorate.test.sqm_eqdisc_opts)" = diffserv4 ]
+assert_global_lock_released
+
 # Scheduled re-runs preserve the administrator's adaptive-ceiling choice.
 reset_case
 export RESULT_PROPOSAL_ADAPTIVE_ENABLED=true
 apply_result test '{}' "$fingerprint_a" eth0
 ! grep -q 'adaptive_ceiling_enabled' "$log"
 
-reset_case; export RESULT_SCHEMA_VERSION=2; expect_gate_rejection 'legacy schema'
+reset_case; export RESULT_SCHEMA_VERSION=3; expect_gate_rejection 'legacy schema'
 reset_case; export RESULT_SCHEMA_VERSION=__missing__; expect_gate_rejection 'unknown schema'
+reset_case; export RESULT_PRODUCER=foreign; expect_gate_rejection 'foreign result producer'
+reset_case; export RESULT_PROFILE=gaming; expect_gate_rejection 'profile/policy mismatch'
+reset_case; export RESULT_PROPOSAL_SCHEMA_VERSION=1; expect_gate_rejection 'legacy proposal schema'
+reset_case; export RESULT_PROPOSAL_PROFILE=fair; expect_gate_rejection 'proposal profile mismatch'
 reset_case; export RESULT_STATE=failed; expect_gate_rejection 'non-complete result'
 reset_case; export RESULT_VALIDATION_PASS=false; expect_gate_rejection 'failed validation'
 reset_case; export RESULT_AUTO_APPLY_ELIGIBLE=false; expect_gate_rejection 'helper-ineligible result'
@@ -645,7 +722,15 @@ assert_global_lock_released
 # verifies runtime before removing the obligation.
 reset_case
 export KILL_CALLER_ON_RESTART=1
-apply_result test '{}' "$fingerprint_a" eth0 &
+(
+	# Keep an actual subshell between the mock service and the test harness.
+	# Some /bin/sh implementations tail-exec the final background command,
+	# which would make the deliberate SIGKILL hit this entire test script.
+	apply_result test '{}' "$fingerprint_a" eth0
+	crash_status="$?"
+	:
+	exit "$crash_status"
+) &
 crashed_apply_pid="$!"
 if wait "$crashed_apply_pid" 2>/dev/null; then
 	echo 'SIGKILL apply harness unexpectedly succeeded' >&2
@@ -730,6 +815,8 @@ grep -q '"state":"deferred"' "$state_root/test.json"
 # started attempt consumes budget + advances the RAM retry throttle.
 cat > "$tmp/poll-helper" <<'EOF'
 #!/bin/sh
+[ "$7" = best_overall ] || exit 3
+[ "$8" = 0 ] || exit 4
 case "$3" in
 	start)
 		printf '%s\n' start >> "$TEST_POLL_LOG"

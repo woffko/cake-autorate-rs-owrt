@@ -12,26 +12,40 @@ instance only after identifying the intended uplink.
    `wan — pppoe-wan — eth2`. For a normal single-WAN router use **Main routing
    table**. On nftables mwan3 select the member that resolves to this same L3
    device.
-3. Choose **Full Auto-Tune**. Stop large downloads and uploads first. The
+3. Choose **Full Auto-Tune**, then select a calibration profile:
+
+   - **Best overall** is recommended for most links. It targets an A-like
+     loaded-delay result while retaining at least 80% of observed-low
+     capacity.
+   - **Gaming** targets A+ with a 70% throughput floor and configures CAKE
+     `diffserv4`. It prioritizes only traffic already marked with DSCP; it does
+     not detect games or rewrite client policy. Use it only when markings are
+     trusted.
+   - **Fair** targets B while retaining at least 90% of observed-low capacity,
+     favoring sustained large downloads/uploads over the strictest latency.
+
+   Existing instances without an RC18 profile default to Best overall.
+4. Stop large downloads and uploads first. The
    strict run measures idle ICMP across three independent reflector families,
    persistent native transport latency, two unshaped throughput samples, and a
    shaped validation candidate. It counts forwarded client traffic separately
    during every heavy phase.
-4. If background traffic blocks calibration, prefer **Retry when quiet**. The
+5. If background traffic blocks calibration, prefer **Retry when quiet**. The
    explicit **Continue conservatively** action applies to that run only: it
    subtracts measured background with an extra margin, never raises confirmed
    maxima or adaptive caps, and retains a direction whose evidence is not
    usable. The Review page labels such a result **LOW confidence** and it is
    not eligible for scheduled Auto-Apply.
-5. Review the proposed min/base/max rates, absolute adaptive-ceiling caps,
-   link-layer overhead, latency thresholds, validation gates, and warnings.
-   Nothing is written before **Use proposal/Create**, and the staged UCI
-   change still requires **Save & Apply**.
-6. On **Status**, confirm that the uplink becomes `ACTIVE`, the controller is
+6. Review the selected profile, proposed min/base/max rates, absolute
+   adaptive-ceiling caps, link-layer overhead, latency thresholds, validation
+   gates, exact CAKE class policy, and warnings. Nothing is written before
+   **Use proposal/Create**, and the staged UCI change still requires
+   **Save & Apply**.
+7. On **Status**, confirm that the uplink becomes `ACTIVE`, the controller is
    `RUNNING`, CAKE rates are non-zero, and Quality reaches `BASELINE READY`.
    Use **Get rating** while the link is otherwise quiet to obtain a complete
    download/upload grade.
-7. Enable **Graphs** only if RAM history is useful. Samples stay in `/var/run`
+8. Enable **Graphs** only if RAM history is useful. Samples stay in `/var/run`
    and disappear on service stop or reboot. Start with the automatic memory
    budget and a 10-second interval.
 
@@ -39,10 +53,12 @@ instance only after identifying the intended uplink.
 
 Use **Re-run Auto-Tune** immediately before **Edit** in the Settings row. It
 opens the calibration page with the instance interface, route/member, backend,
-queue and current limits prefilled. The current configuration remains active
-until a passing Review result is explicitly staged and saved. Re-run preserves
-the instance's explicit Adaptive Ceiling enabled/disabled choice; changing it
-requires the corresponding Review control.
+queue, current limits and saved profile prefilled. The current configuration
+remains active until a passing Review result is explicitly staged and saved.
+Changing profile affects the complete proposal and SQM policy, not just the
+grade label. Re-run preserves the instance's explicit Adaptive Ceiling
+enabled/disabled choice; changing it requires the corresponding Review
+control.
 
 ## Reading Auto-Tune diagnostics
 

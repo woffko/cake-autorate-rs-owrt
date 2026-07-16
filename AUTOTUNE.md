@@ -2,20 +2,22 @@
 
 Full Auto-Tune is an experimental creation path for a CAKE Autorate instance.
 The existing manual three-step wizard remains available. The automatic path
-measures the selected link, calculates a complete balanced proposal, displays
-the evidence and parameters, and writes UCI only after the user confirms the
-Review step.
+measures the selected link, calculates a complete profile-specific proposal,
+displays the evidence and parameters, and writes UCI only after the user
+confirms the Review step.
 
 Full Auto-Tune also seeds transport-aware runtime control: observed-low and
 median throughput become P20/P50 capacity references, the throughput guard is
 enabled, and native transport-latency monitoring is enabled for the created
 instance.
 
-> **RC17 status:** the validation rewrite described below passed deterministic
-> Rust/shell/LuCI tests, both OpenWrt architecture builds, fresh offline
-> dependency installation, production Multi-WAN and ARM checks, and
-> authenticated desktop/mobile Playwright validation. Full Auto-Tune remains
-> fail-closed: only a complete passing Review can be applied.
+> **RC18 status:** the profile-aware proposal, validation, temporary SQM,
+> attestation, apply and rollback paths passed deterministic Rust/shell/LuCI
+> tests, both OpenWrt architecture builds, disposable x86 execution of every
+> profile, production Multi-WAN and ARM checks, and authenticated
+> desktop/mobile Playwright validation. Full Auto-Tune remains fail-closed:
+> only a complete passing Review whose profile and policy match throughout the
+> job can be applied.
 
 ## Safety contract
 
@@ -64,8 +66,37 @@ second latency signal is deliberate: mobile carriers may prioritize ICMP while
 TCP is still badly queued. The validator returns typed gates and either accepts
 the candidate, requests one measurement retry, proposes a bounded directional
 correction, or declares the requirements infeasible. Full Auto-Tune remains
-experimental, but the RC17 x86_64 Multi-WAN and ARM acceptance gates have
+experimental, but the RC18 x86_64 Multi-WAN and ARM acceptance gates have
 passed.
+
+## Calibration profiles
+
+The profile is a calibration contract, not a cosmetic preset. It selects the
+rate factors, loaded-delay target, throughput safety floor, loss gate,
+adaptive-ceiling cadence and SQM traffic-class policy used by proposal,
+temporary shaped validation and final configuration.
+
+| Profile | Intended balance | Target | Minimum retained observed-low capacity | Maximum loaded ICMP/transport delta | Maximum loss | SQM policy |
+|---|---|---:|---:|---:|---:|---|
+| Gaming | Lowest latency, with more throughput headroom available to CAKE | A+ | 70% | 5 ms | 1% | `layer_cake.qos`, `diffserv4`, preserve DSCP |
+| Best overall | Recommended latency/throughput balance | A | 80% | 30 ms | 3% | `piece_of_cake.qos`, best effort |
+| Fair | Favor sustained large transfers while retaining bounded latency | B | 90% | 60 ms | 5% | `piece_of_cake.qos`, best effort |
+
+The grades are target classes, not promises about an ISP, server, Wi-Fi client
+or unrelated bottleneck. Every profile also requires 80–110% candidate
+realization and no more than 85% total router CPU during either shaped
+direction. If target delay and the retained-capacity floor have no legal
+intersection, the result is infeasible and cannot be applied.
+
+Best overall is the default for new jobs and for existing instances which do
+not yet have `autotune_profile`. The old `balanced` CLI value is accepted as an
+alias for `best_overall`, but all new results use the canonical name.
+
+Gaming does not inspect applications and does not manufacture DSCP markings.
+Its `diffserv4` classes help only traffic already marked by a trusted client,
+firewall or upstream policy. Unmarked traffic remains in CAKE's best-effort
+tin. Because Gaming preserves ingress DSCP instead of washing it, use Best
+overall when upstream markings are not trusted.
 
 ## Job phases
 
@@ -96,14 +127,18 @@ passed.
     plan, route identity, phase-background evidence, detected link, and an
     apply-ready proposal only when the final validation passed.
 
-The RPC-facing helper supports:
+The RPC-facing helper uses the same explicit route and profile identity for
+start, polling, cancellation and live attestation:
 
 ```text
-/usr/libexec/cake-autorate-rs/autotune JOB INTERFACE start [BACKEND]
-/usr/libexec/cake-autorate-rs/autotune JOB INTERFACE start-conservative [BACKEND]
-/usr/libexec/cake-autorate-rs/autotune JOB INTERFACE status [BACKEND]
-/usr/libexec/cake-autorate-rs/autotune JOB INTERFACE cancel [BACKEND]
+/usr/libexec/cake-autorate-rs/autotune JOB INTERFACE MODE BACKEND \
+  [ROUTE_MODE] [MWAN3_MEMBER] [PROFILE] [CONSERVATIVE]
 ```
+
+`MODE` is `start`, `start-conservative`, `status`, `cancel`, or the internal
+attestation mode used by LuCI. `PROFILE` is `gaming`, `best_overall`, or
+`fair`. RC17 callers which supplied the conservative flag as argument seven
+remain compatible and resolve to Best overall.
 
 ## Background traffic and conservative continuation
 
@@ -126,7 +161,7 @@ kbit/s, and both limits. Missing counters are not interpreted as zero traffic.
 If validation does not pass, current settings remain active and UCI is
 untouched.
 
-## Balanced proposal mathematics
+## Profile proposal mathematics
 
 Invalid, zero, NaN, and infinite throughput samples are rejected. For each
 direction the samples are sorted. With up to three samples, the observed low is
@@ -140,23 +175,14 @@ variability_d = (high_d - low_d) / max(median_d, 1)
 variable      = variability_DL >= 0.15 or variability_UL >= 0.15
 ```
 
-Stable direction proposal:
+For each profile, the tuple below is
+`(minimum / low, base / low, maximum / high, cap / high)`:
 
-```text
-minimum = 0.70 * low
-base    = 0.88 * low
-maximum = 0.95 * high
-cap     = 1.05 * high
-```
-
-Variable direction proposal:
-
-```text
-minimum = 0.40 * low
-base    = 0.85 * low
-maximum = 1.25 * high
-cap     = 1.80 * high
-```
+| Profile | Stable direction | Variable direction |
+|---|---|---|
+| Gaming | `(0.60, 0.82, 0.92, 1.02)` | `(0.35, 0.75, 1.20, 1.60)` |
+| Best overall | `(0.70, 0.88, 0.95, 1.05)` | `(0.40, 0.85, 1.25, 1.80)` |
+| Fair | `(0.80, 0.94, 0.98, 1.08)` | `(0.60, 0.92, 1.30, 1.90)` |
 
 Rates are rounded to 100 kbit/s and then constrained to
 `minimum <= base <= maximum <= cap`. The deliberately wide variable maximum is
@@ -168,19 +194,36 @@ Activity detection is one tenth of the weaker observed-low direction, rounded
 to 100 kbit/s and clamped to 500..20000 kbit/s. This keeps low-rate uploads
 visible without treating tiny background traffic as an active connection.
 
-For idle RTT median `m` and p95 `p`:
+For idle RTT median `m`, p95 `p`, and `j = max(p - m, 0)`, the runtime
+threshold proposal is profile-specific:
 
 ```text
-jitter        = max(p - m, 0)
-adjust-up     = ceil(clamp(1.5 * jitter, 3, 15)) ms
-delay         = max(adjust-up + 8, 15) ms
-adjust-down   = max(delay + 25, 40) ms
+Gaming:
+  adjust-up   = ceil(clamp(j, 1, 3)) ms
+  delay       = 5 ms
+  adjust-down = 20 ms
+
+Best overall:
+  adjust-up   = ceil(clamp(1.5 * j, 3, 15)) ms
+  delay       = max(adjust-up + 8, 15) ms
+  adjust-down = max(delay + 25, 40) ms
+
+Fair:
+  adjust-up   = ceil(clamp(2 * j, 5, 20)) ms
+  delay       = max(adjust-up + 15, 30) ms
+  adjust-down = max(delay + 30, 60) ms
 ```
 
-When either direction is variable, bounded adaptive ceiling is proposed with a
-15 second qualification, 3% open step, 8 second observation, 45 second
-cooldown, and 900 second failed-bound memory. Stable measurements use a 20/3/8
-/60/1800 policy but leave adaptive ceiling disabled.
+Adaptive ceiling is enabled automatically only when either direction is
+variable. The proposed
+`hold / growth / observation / cooldown / failed-bound TTL` values are:
+
+| Profile | Policy |
+|---|---|
+| Gaming | `30 s / 1% / 8 s / 90 s / 1800 s` |
+| Best overall, variable | `15 s / 3% / 8 s / 45 s / 900 s` |
+| Best overall, stable | `20 s / 3% / 8 s / 60 s / 1800 s`, disabled |
+| Fair | `10 s / 5% / 10 s / 30 s / 600 s` |
 
 Detected PPPoE uses Ethernet framing, overhead 44, and MPU 84. Plain Ethernet
 uses overhead 18 and MPU 64. Cellular links use raw/no-overhead defaults;
@@ -201,8 +244,8 @@ Confidence is not a substitute for the separate shaped validation score.
 ## Shaped validation mathematics
 
 For each direction let `O` be the unshaped observed-low capacity, `C` the CAKE
-candidate, and `A` the shaped test's achieved throughput. RC17 deliberately
-keeps three different ratios:
+candidate, and `A` the shaped test's achieved throughput. The validator
+deliberately keeps three different ratios:
 
 ```text
 candidate_realization = 100 * A / C
@@ -217,16 +260,26 @@ candidate itself is. None is a substitute for another, and the UI labels all
 three separately.
 
 The hard gates are independent of the diagnostic score. The packaged job
-requires candidate realization in the closed 80..110% range, capacity retention at or above
-`throughput_guard_retention_percent` (80% by default), both loaded-delay deltas
-at or below `quality_target_delay_ms` (30 ms by default), loss no greater than
-5%, and CPU no greater than `transport_cpu_max_percent` (85% by default). The
-standalone Rust CLI has defensive fallback thresholds, but the job always
-passes the validated UCI values explicitly. The diagnostic score is the worst
-normalized gate margin: a minimum gate contributes `100 * actual / limit`, a
-maximum gate contributes 100 while it passes and `100 * limit / actual` after
-it fails, and the lowest contribution wins. It is clamped to 0..100. Thus the
-score identifies the tightest constraint but never overrides a failed gate.
+requires candidate realization in the closed 80..110% range and uses the
+selected profile's retention, latency and loss limits from the table above.
+All profiles require CPU no greater than 85%. Proposal schema 2 carries the
+canonical profile, target grade, exact validation thresholds and complete SQM
+recommendation; result schema 4 binds that policy to the job identity and
+configuration fingerprint. The standalone Rust CLI has defensive fallback
+thresholds, but the job always passes the proposal's validated profile values
+explicitly. The diagnostic score is the worst normalized gate margin: a
+minimum gate contributes `100 * actual / limit`, a maximum gate contributes
+100 while it passes and `100 * limit / actual` after it fails, and the lowest
+contribution wins. It is clamped to 0..100. Thus the score identifies the
+tightest constraint but never overrides a failed gate.
+
+Temporary validation mirrors the final SQM policy. Gaming creates upload and
+IFB CAKE qdiscs with `diffserv4 nat` and without `wash`. Best overall and Fair
+use `besteffort nat`; their upload path remains unwashed while the download
+IFB uses `wash`, matching `piece_of_cake.qos` with ingress DSCP squashing.
+PPPoE validation uses Ethernet overhead 44 and MPU 84; plain Ethernet uses
+overhead 18 and MPU 64. The verifier rejects the shaped result if any class,
+wash mode, rate, link-layer token, IFB or ingress redirect differs.
 
 Idle and loaded transport use the same quantile:
 
@@ -303,16 +356,16 @@ remains recoverable rather than being declared successful.
 
 ## Tests
 
-Rust unit tests cover stable fibre, variable cellular, asymmetric directions,
-invalid samples, JSON output, three-ratio separation, typed gates,
-measurement retry, directional increase, safety-floor-bounded decrease, and
-infeasible correction. The shell lifecycle test uses isolated mock helpers to
-verify progress/result output, job-local server pinning, reflector diversity,
-one-second ICMP pacing, persistent transport parsing, phase-background
-evidence, RAM-only state, process-group cancellation, and both speed-test and
-temporary shaper cleanup traps. Real-router acceptance also checks per-member
-route identity and that the unselected autorate/SQM instance continues
-running.
+Rust unit tests cover every stable/variable profile matrix, profile aliases,
+Gaming `diffserv4`, invalid samples, JSON output, three-ratio separation, typed
+gates, measurement retry, directional increase, safety-floor-bounded decrease,
+and infeasible correction. The shell lifecycle test uses isolated mock helpers
+to verify profile/job binding, exact temporary CAKE tokens, progress/result
+output, job-local server pinning, reflector diversity, one-second ICMP pacing,
+persistent transport parsing, phase-background evidence, RAM-only state,
+process-group cancellation, and both speed-test and temporary shaper cleanup
+traps. Real-router acceptance also checks per-member route identity and that
+the unselected autorate/SQM instance continues running.
 
 ## Optional scheduler
 
@@ -324,7 +377,9 @@ The scheduler reuses the exact preflight, route identity, two raw samples,
 same-server shaped validation, bounded correction, cleanup, and fail-closed
 result described above. Auto-Apply additionally requires a current result
 schema, `state=complete`, final `validation.pass=true`, normal confidence, and
-no phase contamination. Re-running an existing instance preserves the user's
-explicit Adaptive Ceiling enabled/disabled choice; a calibration proposal does
-not silently flip it. See [TRANSPORT_QUALITY.md](TRANSPORT_QUALITY.md) for the
+no phase contamination. It also requires an exact match between the instance's
+saved profile and the profile, target, gate set and SQM policy inside the
+current result. Re-running an existing instance preserves the user's explicit
+Adaptive Ceiling enabled/disabled choice; a calibration proposal does not
+silently flip it. See [TRANSPORT_QUALITY.md](TRANSPORT_QUALITY.md) for the
 runtime safeguards and [MULTIWAN.md](MULTIWAN.md) for routing behavior.

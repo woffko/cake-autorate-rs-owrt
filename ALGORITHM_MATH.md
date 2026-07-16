@@ -173,6 +173,40 @@ already sits below the measured link. For example, `A/C = 92.5%` and `A/O =
 combination retained too little observed capacity. Calling both values
 "retention" loses the information needed to choose a correction.
 
+RC18 selects a profile before proposal construction. Let `L` be observed-low
+capacity and `H` observed-high capacity for one direction. The proposal tuple
+is:
+
+```text
+minimum = factor_min * L
+base    = factor_base * L
+maximum = factor_max * H
+cap     = factor_cap * H
+```
+
+| Profile | Stable factors `(min, base, max, cap)` | Variable factors `(min, base, max, cap)` |
+|---|---|---|
+| Gaming | `(0.60, 0.82, 0.92, 1.02)` | `(0.35, 0.75, 1.20, 1.60)` |
+| Best overall | `(0.70, 0.88, 0.95, 1.05)` | `(0.40, 0.85, 1.25, 1.80)` |
+| Fair | `(0.80, 0.94, 0.98, 1.08)` | `(0.60, 0.92, 1.30, 1.90)` |
+
+A direction is variable when
+`(H - L) / max(median, 1) >= 0.15`; adaptive ceiling is proposed when either
+direction is variable. Rates are rounded to 100 kbit/s and constrained so
+`minimum <= base <= maximum <= cap`.
+
+The profile also fixes the validation contract:
+
+| Profile | Retention floor `F` | Loaded-delay ceiling | Loss ceiling | Target |
+|---|---:|---:|---:|---:|
+| Gaming | 0.70 | 5 ms | 1% | A+ |
+| Best overall | 0.80 | 30 ms | 3% | A |
+| Fair | 0.90 | 60 ms | 5% | B |
+
+All profiles use the same 80–110% realization interval and 85% CPU ceiling.
+These target grades describe the local loaded-delay contract; they are not a
+guarantee about remote servers, Wi-Fi, ISP policy or another bottleneck.
+
 The packaged hard realization gate is two-sided:
 
 ```text
@@ -433,6 +467,18 @@ for a ceiling probe only when all of the following hold:
 - delay offence count is below the detector threshold;
 - average delay is no greater than `Tup`; and
 - the fast shaper is at least 98% of `E`.
+
+Full Auto-Tune chooses the outer-loop cadence from the selected profile:
+
+| Profile | Hold | Growth | Observation | Cooldown | Failed-bound TTL |
+|---|---:|---:|---:|---:|---:|
+| Gaming | 30 s | 1% | 8 s | 90 s | 1800 s |
+| Best overall, variable | 15 s | 3% | 8 s | 45 s | 900 s |
+| Fair | 10 s | 5% | 10 s | 30 s | 600 s |
+
+Stable Best overall proposals carry `20 s / 3% / 8 s / 60 s / 1800 s` but
+leave adaptive ceiling disabled. Existing instances retain the user's explicit
+enabled/disabled choice during a re-run.
 
 Eligibility must remain clean for `adaptive_ceiling_hold_time_s`. Without a
 known failed bound, the next target is:

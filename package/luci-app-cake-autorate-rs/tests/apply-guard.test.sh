@@ -59,7 +59,9 @@ EOF
 fingerprint="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 cat > "$autotune/wan_sqm/result.json" <<EOF
 {
-  "state":"complete", "schema_version":3, "auto_apply_eligible":true,
+  "state":"complete", "schema_version":4,
+  "producer":"cake-autorate-rs-autotune", "profile":"best_overall",
+  "auto_apply_eligible":true,
   "phase_evidence_complete":true, "phase_contamination_seen":false,
   "runtime_restored":true, "recovery_pending":false,
   "configuration_written":false, "conservative":false,
@@ -70,18 +72,31 @@ cat > "$autotune/wan_sqm/result.json" <<EOF
   "route_identity":"main||pppoe-wan|192.0.2.10||main",
   "config_fingerprint":"$fingerprint",
   "runs":[{"backend":"speedtest-go","server_id":"17372"}],
+  "validation_thresholds":{"candidate_realization_min_percent":80,
+    "candidate_realization_max_percent":110,"capacity_retention_min_percent":80,
+    "delay_max_ms":30,"loss_max_percent":3,"cpu_max_percent":85},
   "validation":{"pass":true,"contaminated":false,"correction":{"action":"none","feasible":true}},
   "pinger_plan":{"recommended_method":"fping","recommended_no_pingers":3,
     "recommended_reflectors":["1.1.1.1","9.9.9.9","8.8.8.8"]},
   "proposal":{
+    "schema_version":2,"profile":"best_overall","target_grade":"A",
     "download":{"minimum_kbps":40000,"base_kbps":80000,"maximum_kbps":90000,
-      "absolute_cap_kbps":95000,"observed_low_kbps":85000,"observed_median_kbps":88000},
+      "absolute_cap_kbps":95000,"observed_low_kbps":85000,"observed_median_kbps":88000,
+      "observed_high_kbps":92000},
     "upload":{"minimum_kbps":10000,"base_kbps":20000,"maximum_kbps":24000,
-      "absolute_cap_kbps":25000,"observed_low_kbps":21000,"observed_median_kbps":23000},
+      "absolute_cap_kbps":25000,"observed_low_kbps":21000,"observed_median_kbps":23000,
+      "observed_high_kbps":24500},
     "active_threshold_kbps":2000,
     "thresholds_ms":{"adjust_up":6,"delay":15,"adjust_down":40},
     "adaptive_ceiling":{"enabled":true,"hold_s":15,"growth_percent":3,
       "probe_s":8,"cooldown_s":45,"failed_bound_ttl_s":900},
+    "validation":{"candidate_realization_min_percent":80,
+      "candidate_realization_max_percent":110,"capacity_retention_min_percent":80,
+      "icmp_delta_max_ms":30,"transport_delta_max_ms":30,
+      "loss_max_percent":3,"cpu_max_percent":85},
+    "sqm":{"qdisc":"cake","script":"piece_of_cake.qos",
+      "classification":"besteffort","squash_dscp":true,"squash_ingress":true,
+      "ingress_ecn":"ECN","egress_ecn":"NOECN","iqdisc_opts":"","eqdisc_opts":""},
     "link":{"kind":"ethernet","layer":"none","overhead":0,"mpu":0}
   }
 }
@@ -98,6 +113,44 @@ if find "$guard" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
 	echo "failed arm leaked a root-owned apply token" >&2
 	exit 1
 fi
+cp "$work/result.valid" "$autotune/wan_sqm/result.json"
+
+# Gaming must arm an exact diffserv4 manifest rather than merely relabeling a
+# best-effort proposal. The token is aborted before the main lifecycle test.
+node - "$work/result.valid" "$autotune/wan_sqm/result.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+result.profile = 'gaming';
+result.validation_thresholds.capacity_retention_min_percent = 70;
+result.validation_thresholds.delay_max_ms = 5;
+result.validation_thresholds.loss_max_percent = 1;
+result.proposal.profile = 'gaming';
+result.proposal.target_grade = 'A+';
+result.proposal.validation.capacity_retention_min_percent = 70;
+result.proposal.validation.icmp_delta_max_ms = 5;
+result.proposal.validation.transport_delta_max_ms = 5;
+result.proposal.validation.loss_max_percent = 1;
+result.proposal.sqm = {
+	qdisc: 'cake',
+	script: 'layer_cake.qos',
+	classification: 'diffserv4',
+	squash_dscp: false,
+	squash_ingress: false,
+	ingress_ecn: 'ECN',
+	egress_ecn: 'NOECN',
+	iqdisc_opts: 'diffserv4',
+	eqdisc_opts: 'diffserv4'
+};
+fs.writeFileSync(process.argv[3], JSON.stringify(result));
+EOF
+gaming_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 "$fingerprint")"
+gaming_token="$(printf '%s\n' "$gaming_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
+[ "$(uci -c "$guard/$gaming_token/expected" -q get cake-autorate.wan_sqm.autotune_profile)" = gaming ]
+[ "$(uci -c "$guard/$gaming_token/expected" -q get cake-autorate.wan_sqm.quality_target_delay_ms)" = 5 ]
+[ "$(uci -c "$guard/$gaming_token/expected" -q get cake-autorate.wan_sqm.sqm_script)" = layer_cake.qos ]
+[ "$(uci -c "$guard/$gaming_token/expected" -q get cake-autorate.wan_sqm.sqm_squash_dscp)" = 0 ]
+[ "$(uci -c "$guard/$gaming_token/expected" -q get cake-autorate.wan_sqm.sqm_iqdisc_opts)" = diffserv4 ]
+$helper abort "$gaming_token" >/dev/null
 cp "$work/result.valid" "$autotune/wan_sqm/result.json"
 
 # The deterministic enrollment name is reserved. Never reuse or later delete

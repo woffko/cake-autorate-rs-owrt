@@ -6634,7 +6634,7 @@ fn reflector_health_json(
 fn print_usage() {
     eprintln!("usage: cake-autorated [--instance NAME] [--once] [--dump-config]");
     eprintln!(
-        "       cake-autorated --autotune-proposal --dl-samples LIST --ul-samples LIST \\\n         --idle-median-ms N --idle-p95-ms N --idle-samples N [--link-kind KIND] \\\n         [--base-scale N | --dl-base-scale N --ul-base-scale N]"
+        "       cake-autorated --autotune-proposal --dl-samples LIST --ul-samples LIST \\\n         --idle-median-ms N --idle-p95-ms N --idle-samples N [--link-kind KIND] \\\n         [--profile gaming|best_overall|fair] \\\n         [--base-scale N | --dl-base-scale N --ul-base-scale N]"
     );
     eprintln!("       cake-autorated --autotune-validate --dl-observed-low-kbps N --ul-observed-low-kbps N --dl-candidate-kbps N --ul-candidate-kbps N --dl-achieved-kbps N --ul-achieved-kbps N --dl-min-kbps N --ul-min-kbps N --dl-max-kbps N --ul-max-kbps N --icmp-delta-ms N --transport-delta-ms N --loss-percent N --cpu-percent N");
     eprintln!("         [--dl-icmp-delta-ms N --ul-icmp-delta-ms N --dl-transport-delta-ms N --ul-transport-delta-ms N --dl-loss-percent N --ul-loss-percent N --dl-cpu-percent N --ul-cpu-percent N]");
@@ -6766,7 +6766,7 @@ fn run_autotune_proposal_cli<I>(args: I) -> Result<(), String>
 where
     I: Iterator<Item = String>,
 {
-    use autotune::{build_proposal, LatencyBaseline, LinkKind};
+    use autotune::{build_proposal_for_profile, AutotuneProfile, LatencyBaseline, LinkKind};
 
     let mut download = None;
     let mut upload = None;
@@ -6777,6 +6777,7 @@ where
     let mut download_base_scale = None;
     let mut upload_base_scale = None;
     let mut link_kind = LinkKind::Unknown;
+    let mut profile = AutotuneProfile::BestOverall;
     let mut conservative_background_dl_kbps = None;
     let mut conservative_background_ul_kbps = None;
     let mut retain_dl = false;
@@ -6836,6 +6837,10 @@ where
                 link_kind = LinkKind::parse(&value)
                     .ok_or_else(|| format!("unsupported link kind: {value}"))?
             }
+            "--profile" => {
+                profile = AutotuneProfile::parse(&value)
+                    .ok_or_else(|| format!("unsupported autotune profile: {value}"))?
+            }
             _ => return Err(format!("unsupported autotune option: {arg}")),
         }
     }
@@ -6852,7 +6857,7 @@ where
         subtract_background_samples(&mut upload, conservative_background_ul_kbps.unwrap_or(0.0))?;
     }
 
-    let mut proposal = build_proposal(
+    let mut proposal = build_proposal_for_profile(
         &download,
         &upload,
         LatencyBaseline {
@@ -6861,6 +6866,7 @@ where
             samples: idle_samples.ok_or_else(|| "--idle-samples is required".to_string())?,
         },
         link_kind,
+        profile,
     )?;
     if download_base_scale.is_none() && upload_base_scale.is_none() {
         proposal.revise_base_rates(base_scale)?;

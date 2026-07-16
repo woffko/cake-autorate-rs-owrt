@@ -27,6 +27,142 @@ impl LinkKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutotuneProfile {
+    Gaming,
+    BestOverall,
+    Fair,
+}
+
+impl AutotuneProfile {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "gaming" => Some(Self::Gaming),
+            "best_overall" | "best-overall" | "balanced" => Some(Self::BestOverall),
+            "fair" => Some(Self::Fair),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gaming => "gaming",
+            Self::BestOverall => "best_overall",
+            Self::Fair => "fair",
+        }
+    }
+
+    pub fn target_grade(self) -> &'static str {
+        match self {
+            Self::Gaming => "A+",
+            Self::BestOverall => "A",
+            Self::Fair => "B",
+        }
+    }
+
+    pub fn validation_thresholds(self) -> ValidationThresholds {
+        let (capacity_retention_min_percent, latency_delta_max_ms, loss_max_percent) = match self {
+            Self::Gaming => (70.0, 5.0, 1.0),
+            Self::BestOverall => (80.0, 30.0, 3.0),
+            Self::Fair => (90.0, 60.0, 5.0),
+        };
+        ValidationThresholds {
+            candidate_realization_min_percent: 80.0,
+            candidate_realization_max_percent: 110.0,
+            capacity_retention_min_percent,
+            icmp_delta_max_ms: latency_delta_max_ms,
+            transport_delta_max_ms: latency_delta_max_ms,
+            loss_max_percent,
+            cpu_max_percent: 85.0,
+        }
+    }
+
+    fn direction_factors(self, variable: bool) -> (f64, f64, f64, f64) {
+        match (self, variable) {
+            (Self::Gaming, true) => (0.35, 0.75, 1.20, 1.60),
+            (Self::Gaming, false) => (0.60, 0.82, 0.92, 1.02),
+            (Self::BestOverall, true) => (0.40, 0.85, 1.25, 1.80),
+            (Self::BestOverall, false) => (0.70, 0.88, 0.95, 1.05),
+            (Self::Fair, true) => (0.60, 0.92, 1.30, 1.90),
+            (Self::Fair, false) => (0.80, 0.94, 0.98, 1.08),
+        }
+    }
+
+    fn latency_thresholds(self, jitter_ms: f64) -> Result<(u64, u64, u64), String> {
+        let (adjust_up, delay_threshold, adjust_down) = match self {
+            Self::Gaming => {
+                let adjust_up = jitter_ms.clamp(1.0, 3.0).ceil();
+                let adjust_up = checked_latency_threshold(adjust_up)?;
+                // The A+ contract is a five-millisecond loaded-delay ceiling,
+                // so the runtime detector may not quietly relax beyond the
+                // bound that shaped validation proved.
+                (adjust_up, 5, 20)
+            }
+            Self::BestOverall => {
+                let adjust_up = (jitter_ms * 1.5).clamp(3.0, 15.0).ceil();
+                let adjust_up = checked_latency_threshold(adjust_up)?;
+                (
+                    adjust_up,
+                    (adjust_up + 8).max(15),
+                    ((adjust_up + 8).max(15) + 25).max(40),
+                )
+            }
+            Self::Fair => {
+                let adjust_up = (jitter_ms * 2.0).clamp(5.0, 20.0).ceil();
+                let adjust_up = checked_latency_threshold(adjust_up)?;
+                (
+                    adjust_up,
+                    (adjust_up + 15).max(30),
+                    ((adjust_up + 15).max(30) + 30).max(60),
+                )
+            }
+        };
+        Ok((adjust_up, delay_threshold, adjust_down))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SqmRecommendation {
+    pub qdisc: &'static str,
+    pub script: &'static str,
+    pub classification: &'static str,
+    pub squash_dscp: bool,
+    pub squash_ingress: bool,
+    pub ingress_ecn: &'static str,
+    pub egress_ecn: &'static str,
+    pub iqdisc_opts: &'static str,
+    pub eqdisc_opts: &'static str,
+}
+
+impl SqmRecommendation {
+    fn for_profile(profile: AutotuneProfile) -> Self {
+        match profile {
+            AutotuneProfile::Gaming => Self {
+                qdisc: "cake",
+                script: "layer_cake.qos",
+                classification: "diffserv4",
+                squash_dscp: false,
+                squash_ingress: false,
+                ingress_ecn: "ECN",
+                egress_ecn: "NOECN",
+                iqdisc_opts: "diffserv4",
+                eqdisc_opts: "diffserv4",
+            },
+            AutotuneProfile::BestOverall | AutotuneProfile::Fair => Self {
+                qdisc: "cake",
+                script: "piece_of_cake.qos",
+                classification: "besteffort",
+                squash_dscp: true,
+                squash_ingress: true,
+                ingress_ecn: "ECN",
+                egress_ecn: "NOECN",
+                iqdisc_opts: "",
+                eqdisc_opts: "",
+            },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LatencyBaseline {
     pub median_ms: f64,
@@ -56,6 +192,8 @@ pub struct DirectionProposal {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AutotuneProposal {
+    pub profile: AutotuneProfile,
+    pub target_grade: &'static str,
     pub download: DirectionProposal,
     pub upload: DirectionProposal,
     pub active_threshold_kbps: u64,
@@ -72,6 +210,8 @@ pub struct AutotuneProposal {
     pub link_layer: &'static str,
     pub overhead: u64,
     pub mpu: u64,
+    pub validation_thresholds: ValidationThresholds,
+    pub sqm: SqmRecommendation,
     pub confidence: u64,
     pub warnings: Vec<&'static str>,
 }
@@ -129,15 +269,26 @@ impl AutotuneProposal {
             .join(",");
         format!(
             concat!(
-                "{{\"schema_version\":1,\"profile\":\"balanced\",",
+                "{{\"schema_version\":2,\"profile\":\"{}\",\"target_grade\":\"{}\",",
                 "\"download\":{},\"upload\":{},",
                 "\"active_threshold_kbps\":{},",
                 "\"thresholds_ms\":{{\"adjust_up\":{},\"delay\":{},\"adjust_down\":{}}},",
                 "\"adaptive_ceiling\":{{\"enabled\":{},\"hold_s\":{},\"growth_percent\":{},",
                 "\"probe_s\":{},\"cooldown_s\":{},\"failed_bound_ttl_s\":{}}},",
+                "\"validation\":{{\"candidate_realization_min_percent\":{:.1},",
+                "\"candidate_realization_max_percent\":{:.1},",
+                "\"capacity_retention_min_percent\":{:.1},",
+                "\"icmp_delta_max_ms\":{:.1},\"transport_delta_max_ms\":{:.1},",
+                "\"loss_max_percent\":{:.1},\"cpu_max_percent\":{:.1}}},",
+                "\"sqm\":{{\"qdisc\":\"{}\",\"script\":\"{}\",\"classification\":\"{}\",",
+                "\"squash_dscp\":{},\"squash_ingress\":{},",
+                "\"ingress_ecn\":\"{}\",\"egress_ecn\":\"{}\",",
+                "\"iqdisc_opts\":\"{}\",\"eqdisc_opts\":\"{}\"}},",
                 "\"link\":{{\"kind\":\"{}\",\"layer\":\"{}\",\"overhead\":{},\"mpu\":{}}},",
                 "\"confidence\":{},\"warnings\":[{}]}}"
             ),
+            self.profile.as_str(),
+            self.target_grade,
             direction_json(self.download),
             direction_json(self.upload),
             self.active_threshold_kbps,
@@ -150,6 +301,22 @@ impl AutotuneProposal {
             self.adaptive_probe_s,
             self.adaptive_cooldown_s,
             self.adaptive_failed_bound_ttl_s,
+            self.validation_thresholds.candidate_realization_min_percent,
+            self.validation_thresholds.candidate_realization_max_percent,
+            self.validation_thresholds.capacity_retention_min_percent,
+            self.validation_thresholds.icmp_delta_max_ms,
+            self.validation_thresholds.transport_delta_max_ms,
+            self.validation_thresholds.loss_max_percent,
+            self.validation_thresholds.cpu_max_percent,
+            self.sqm.qdisc,
+            self.sqm.script,
+            self.sqm.classification,
+            self.sqm.squash_dscp,
+            self.sqm.squash_ingress,
+            self.sqm.ingress_ecn,
+            self.sqm.egress_ecn,
+            self.sqm.iqdisc_opts,
+            self.sqm.eqdisc_opts,
             self.link_kind.as_str(),
             self.link_layer,
             self.overhead,
@@ -1021,26 +1188,45 @@ fn validation_correction_json(correction: ValidationCorrection) -> String {
     )
 }
 
+fn checked_latency_threshold(value_ms: f64) -> Result<u64, String> {
+    if !value_ms.is_finite() || !(0.0..=MAX_LATENCY_MS).contains(&value_ms) {
+        return Err("calculated latency threshold is out of range".to_string());
+    }
+    Ok(value_ms as u64)
+}
+
+#[cfg(test)]
 pub fn build_proposal(
     download_samples_kbps: &[f64],
     upload_samples_kbps: &[f64],
     baseline: LatencyBaseline,
     link_kind: LinkKind,
 ) -> Result<AutotuneProposal, String> {
+    build_proposal_for_profile(
+        download_samples_kbps,
+        upload_samples_kbps,
+        baseline,
+        link_kind,
+        AutotuneProfile::BestOverall,
+    )
+}
+
+pub fn build_proposal_for_profile(
+    download_samples_kbps: &[f64],
+    upload_samples_kbps: &[f64],
+    baseline: LatencyBaseline,
+    link_kind: LinkKind,
+    profile: AutotuneProfile,
+) -> Result<AutotuneProposal, String> {
     validate_throughput_samples("download", download_samples_kbps)?;
     validate_throughput_samples("upload", upload_samples_kbps)?;
     validate_latency_baseline(baseline)?;
-    let download = propose_direction(download_samples_kbps)?;
-    let upload = propose_direction(upload_samples_kbps)?;
+    let download = propose_direction(download_samples_kbps, profile)?;
+    let upload = propose_direction(upload_samples_kbps, profile)?;
     let variable = download.variability >= 0.15 || upload.variability >= 0.15;
     let jitter_ms = (baseline.p95_ms - baseline.median_ms).max(0.0);
-    let adjust_up_threshold = (jitter_ms * 1.5).clamp(3.0, 15.0).ceil();
-    if !adjust_up_threshold.is_finite() || !(0.0..=MAX_LATENCY_MS).contains(&adjust_up_threshold) {
-        return Err("calculated latency threshold is out of range".to_string());
-    }
-    let adjust_up_threshold_ms = adjust_up_threshold as u64;
-    let delay_threshold_ms = (adjust_up_threshold_ms + 8).max(15);
-    let adjust_down_threshold_ms = (delay_threshold_ms + 25).max(40);
+    let (adjust_up_threshold_ms, delay_threshold_ms, adjust_down_threshold_ms) =
+        profile.latency_thresholds(jitter_ms)?;
     // Activity detection must stay well below the weakest observed direction.
     // Using a percentage of the proposed minimum is too high when one
     // direction looked stable during a short, otherwise variable calibration.
@@ -1063,6 +1249,19 @@ pub fn build_proposal(
     if link_kind == LinkKind::Unknown {
         warnings.push("Link-layer encapsulation could not be detected; verify overhead before applying the proposal.");
     }
+    if profile == AutotuneProfile::Gaming {
+        warnings.push(
+            "Gaming diffserv4 prioritizes only traffic already marked with DSCP; CAKE Autorate does not guess applications or rewrite client policy.",
+        );
+        warnings.push(
+            "Gaming preserves ingress DSCP. Use Best overall when upstream markings are not trusted.",
+        );
+    }
+    if profile == AutotuneProfile::Fair {
+        warnings.push(
+            "Fair prioritizes sustained throughput with a B-or-better latency target; choose Gaming or Best overall for stricter latency.",
+        );
+    }
     let sample_confidence = download_samples_kbps
         .len()
         .min(upload_samples_kbps.len())
@@ -1083,6 +1282,8 @@ pub fn build_proposal(
     };
 
     Ok(AutotuneProposal {
+        profile,
+        target_grade: profile.target_grade(),
         download,
         upload,
         active_threshold_kbps,
@@ -1090,21 +1291,63 @@ pub fn build_proposal(
         delay_threshold_ms,
         adjust_down_threshold_ms,
         adaptive_ceiling_enabled: variable,
-        adaptive_hold_s: if variable { 15 } else { 20 },
-        adaptive_growth_percent: 3,
-        adaptive_probe_s: 8,
-        adaptive_cooldown_s: if variable { 45 } else { 60 },
-        adaptive_failed_bound_ttl_s: if variable { 900 } else { 1800 },
+        adaptive_hold_s: match profile {
+            AutotuneProfile::Gaming => 30,
+            AutotuneProfile::BestOverall => {
+                if variable {
+                    15
+                } else {
+                    20
+                }
+            }
+            AutotuneProfile::Fair => 10,
+        },
+        adaptive_growth_percent: match profile {
+            AutotuneProfile::Gaming => 1,
+            AutotuneProfile::BestOverall => 3,
+            AutotuneProfile::Fair => 5,
+        },
+        adaptive_probe_s: match profile {
+            AutotuneProfile::Fair => 10,
+            AutotuneProfile::Gaming | AutotuneProfile::BestOverall => 8,
+        },
+        adaptive_cooldown_s: match profile {
+            AutotuneProfile::Gaming => 90,
+            AutotuneProfile::BestOverall => {
+                if variable {
+                    45
+                } else {
+                    60
+                }
+            }
+            AutotuneProfile::Fair => 30,
+        },
+        adaptive_failed_bound_ttl_s: match profile {
+            AutotuneProfile::Gaming => 1800,
+            AutotuneProfile::BestOverall => {
+                if variable {
+                    900
+                } else {
+                    1800
+                }
+            }
+            AutotuneProfile::Fair => 600,
+        },
         link_kind,
         link_layer,
         overhead,
         mpu,
+        validation_thresholds: profile.validation_thresholds(),
+        sqm: SqmRecommendation::for_profile(profile),
         confidence: (sample_confidence + latency_confidence + link_confidence).min(100),
         warnings,
     })
 }
 
-fn propose_direction(samples_kbps: &[f64]) -> Result<DirectionProposal, String> {
+fn propose_direction(
+    samples_kbps: &[f64],
+    profile: AutotuneProfile,
+) -> Result<DirectionProposal, String> {
     let mut samples = samples_kbps.to_vec();
     samples.sort_by(f64::total_cmp);
 
@@ -1118,11 +1361,14 @@ fn propose_direction(samples_kbps: &[f64]) -> Result<DirectionProposal, String> 
     let variability = ((high - low) / median.max(1.0)).max(0.0);
     let variable = variability >= 0.15;
 
-    let (minimum, base, maximum, cap) = if variable {
-        (low * 0.40, low * 0.85, high * 1.25, high * 1.80)
-    } else {
-        (low * 0.70, low * 0.88, high * 0.95, high * 1.05)
-    };
+    let (minimum_factor, base_factor, maximum_factor, cap_factor) =
+        profile.direction_factors(variable);
+    let (minimum, base, maximum, cap) = (
+        low * minimum_factor,
+        low * base_factor,
+        high * maximum_factor,
+        high * cap_factor,
+    );
     let minimum = checked_rounded_rate(minimum)?;
     let base = checked_rounded_rate(base)?.max(minimum);
     let maximum = checked_rounded_rate(maximum)?.max(base);
@@ -1285,6 +1531,100 @@ mod tests {
     use super::*;
 
     #[test]
+    fn profile_names_are_strict_with_a_balanced_compatibility_alias() {
+        assert_eq!(
+            AutotuneProfile::parse("gaming"),
+            Some(AutotuneProfile::Gaming)
+        );
+        assert_eq!(
+            AutotuneProfile::parse("best_overall"),
+            Some(AutotuneProfile::BestOverall)
+        );
+        assert_eq!(
+            AutotuneProfile::parse("balanced"),
+            Some(AutotuneProfile::BestOverall)
+        );
+        assert_eq!(AutotuneProfile::parse("fair"), Some(AutotuneProfile::Fair));
+        assert_eq!(AutotuneProfile::parse("Gaming"), None);
+        assert_eq!(AutotuneProfile::parse("throughput"), None);
+    }
+
+    #[test]
+    fn profiles_trade_latency_headroom_for_bounded_capacity() {
+        let build = |profile| {
+            build_proposal_for_profile(
+                &[100_000.0, 101_000.0, 99_000.0],
+                &[50_000.0, 51_000.0, 49_000.0],
+                LatencyBaseline {
+                    median_ms: 5.0,
+                    p95_ms: 7.0,
+                    samples: 20,
+                },
+                LinkKind::Ethernet,
+                profile,
+            )
+            .unwrap()
+        };
+        let gaming = build(AutotuneProfile::Gaming);
+        let best = build(AutotuneProfile::BestOverall);
+        let fair = build(AutotuneProfile::Fair);
+
+        assert!(gaming.download.base_kbps < best.download.base_kbps);
+        assert!(best.download.base_kbps < fair.download.base_kbps);
+        assert_eq!(
+            gaming.validation_thresholds.capacity_retention_min_percent,
+            70.0
+        );
+        assert_eq!(
+            best.validation_thresholds.capacity_retention_min_percent,
+            80.0
+        );
+        assert_eq!(
+            fair.validation_thresholds.capacity_retention_min_percent,
+            90.0
+        );
+        assert_eq!(gaming.validation_thresholds.transport_delta_max_ms, 5.0);
+        assert_eq!(best.validation_thresholds.transport_delta_max_ms, 30.0);
+        assert_eq!(fair.validation_thresholds.transport_delta_max_ms, 60.0);
+        assert!(gaming.adjust_up_threshold_ms <= best.adjust_up_threshold_ms);
+        assert!(best.adjust_up_threshold_ms <= fair.adjust_up_threshold_ms);
+        assert_eq!(gaming.delay_threshold_ms, 5);
+        assert!(gaming.adjust_up_threshold_ms <= gaming.delay_threshold_ms);
+    }
+
+    #[test]
+    fn gaming_profile_emits_explicit_diffserv4_without_application_guessing() {
+        let proposal = build_proposal_for_profile(
+            &[100_000.0, 101_000.0],
+            &[50_000.0, 51_000.0],
+            LatencyBaseline {
+                median_ms: 5.0,
+                p95_ms: 7.0,
+                samples: 20,
+            },
+            LinkKind::Ethernet,
+            AutotuneProfile::Gaming,
+        )
+        .unwrap();
+        let json = proposal.to_json();
+
+        assert_eq!(proposal.sqm.script, "layer_cake.qos");
+        assert_eq!(proposal.sqm.classification, "diffserv4");
+        assert!(!proposal.sqm.squash_dscp);
+        assert!(!proposal.sqm.squash_ingress);
+        assert_eq!(proposal.sqm.iqdisc_opts, "diffserv4");
+        assert_eq!(proposal.sqm.eqdisc_opts, "diffserv4");
+        assert!(json.contains("\"schema_version\":2"));
+        assert!(json.contains("\"profile\":\"gaming\""));
+        assert!(json.contains("\"target_grade\":\"A+\""));
+        assert!(json.contains("\"script\":\"layer_cake.qos\""));
+        assert!(proposal
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("does not guess applications")));
+    }
+
+    #[test]
     fn stable_fibre_proposal_keeps_headroom_without_enabling_adaptive_ceiling() {
         let proposal = build_proposal(
             &[896_000.0, 904_000.0, 900_000.0],
@@ -1430,9 +1770,11 @@ mod tests {
         .unwrap()
         .to_json();
 
-        assert!(json.contains("\"schema_version\":1"));
+        assert!(json.contains("\"schema_version\":2"));
+        assert!(json.contains("\"profile\":\"best_overall\""));
         assert!(json.contains("\"minimum_kbps\""));
         assert!(json.contains("\"adaptive_ceiling\""));
+        assert!(json.contains("\"classification\":\"besteffort\""));
         assert!(json.contains("\"overhead\":44"));
     }
 
@@ -1592,6 +1934,52 @@ mod tests {
             result.correction.upload.proposed_kbps,
             input.upload.candidate_kbps
         );
+    }
+
+    #[test]
+    fn every_profile_fails_closed_when_its_latency_target_conflicts_with_its_floor() {
+        for profile in [
+            AutotuneProfile::Gaming,
+            AutotuneProfile::BestOverall,
+            AutotuneProfile::Fair,
+        ] {
+            let thresholds = profile.validation_thresholds();
+            let candidate = (100_000.0 * thresholds.capacity_retention_min_percent / 100.0) as u64;
+            let direction = DirectionValidationInput {
+                observed_low_kbps: 100_000,
+                candidate_kbps: candidate,
+                achieved_kbps: candidate,
+                minimum_kbps: 10_000,
+                maximum_kbps: 110_000,
+            };
+            let load = DirectionLoadInput {
+                icmp_delta_ms: thresholds.icmp_delta_max_ms + 10.0,
+                transport_delta_ms: thresholds.transport_delta_max_ms + 10.0,
+                loss_percent: 0.0,
+                cpu_percent: 10.0,
+            };
+            let result = validate_shaped_candidate(ValidationInput {
+                download: direction,
+                upload: direction,
+                download_load: load,
+                upload_load: load,
+                thresholds,
+            })
+            .unwrap();
+
+            assert!(
+                !result.pass,
+                "{profile:?} must not accept a conflicting candidate"
+            );
+            assert!(!result.correction.feasible);
+            assert_eq!(result.correction.action, CorrectionAction::Infeasible);
+            assert_eq!(
+                result.correction.reason,
+                "safety-floor-blocks-rate-reduction"
+            );
+            assert_eq!(result.correction.download.proposed_kbps, candidate);
+            assert_eq!(result.correction.upload.proposed_kbps, candidate);
+        }
     }
 
     #[test]

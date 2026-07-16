@@ -981,3 +981,106 @@ Final RC17 release payload hashes are:
 | aarch64_generic installer | `d177d34effc2421fbc6fa16e6ff8ec37981a48b564bbc3c2db69fb45f84ae5f4` |
 | x86_64 offline bundle | `c60babaa865106ce0d739b4bad599c6b1faf038970c30d3c740314ac3c380ea6` |
 | rockchip/armv8 offline bundle | `5c8ce4c0beb649e9534ecb0f02af066140678b5e0a76f3e2bbc273ed6fdd7168` |
+
+## RC18 profile-aware Full Auto-Tune acceptance (2026-07-16)
+
+RC18 adds Gaming, Best overall and Fair as complete calibration contracts.
+The selected profile is carried through the worker identity, proposal schema
+2, result schema 4, status/cancel/attestation calls, temporary qdisc policy,
+guarded UCI/SQM apply, scheduler eligibility and rollback. Unknown or
+mismatched profile data fails closed. Existing RC17 callers and instances
+without a saved profile resolve to Best overall; the historical `balanced`
+CLI value is a read-compatible alias.
+
+The deterministic gate passed:
+
+- `cargo fmt --check`, `cargo check --all-targets`,
+  `cargo clippy --all-targets -- -D warnings`, and 140 Rust unit tests;
+- all six daemon shell suites, all eight LuCI shell suites, and all five LuCI
+  JavaScript suites;
+- syntax checks for every runtime shell helper and JavaScript view,
+  `git diff --check`, and both OpenWrt 25.12.5 SDK builds;
+- profile matrices for stable and variable links, profile parsing/aliases,
+  target grades, exact validation gates, adaptive-ceiling cadence and Gaming
+  `diffserv4` output;
+- fail-closed result/profile/SQM mismatches in the lifecycle, scheduler,
+  recovery and apply guard;
+- exact temporary qdisc verification including class mode, direction-specific
+  `wash`, `nat`, bandwidth, PPPoE/Ethernet overhead, IFB and ingress redirect.
+
+The actual Full Auto-Tune lifecycle was then run for all three profiles on a
+disposable x86 OpenWrt router. During Gaming validation, `tc` showed
+`diffserv4 triple-isolate nat nowash` on both the selected Ethernet root and
+the temporary IFB. Best overall and Fair showed best-effort upload without
+`wash` and best-effort IFB download with `wash`, matching
+`piece_of_cake.qos`. The small two-vCPU virtual router could not establish a
+trustworthy passing shaped result: candidate realization and/or CPU evidence
+remained outside the selected contract. Each run therefore ended
+`INCONCLUSIVE`, exposed no apply action, wrote no UCI configuration, restored
+the original 10/85 Mbit/s CAKE pair, removed its temporary recovery state and
+reported `runtime_restored=true`. This is the expected safe outcome rather
+than a calibration success claim. One initial Best overall reflector-planner
+attempt also failed transiently and a bounded retry completed normally.
+
+The disposable router's configuration SHA-256 values were identical before
+and after all profile runs and the final offline-installer test:
+
+| Config | SHA-256 |
+|---|---|
+| `cake-autorate` | `aaf00467c59f1c3f573925791cfbca71382f6cf86125bee2328ac67d0116b3bb` |
+| `sqm` | `0204b58ff12277f15aa536e1406ee0dbf2aeeb739f7b48c7169a2b598ecb8d68` |
+| `network` | `ea57aa4b5e44ca7b02c3ea84c174688f9f0185200077f3e87a39f1a071a280ce` |
+
+The final packages were installed on both production targets without running
+heavy calibration. On the x86 nftables-mwan3 router, both autorate instances
+and all four mwan3 tracker/route-monitor processes remained running; mwan3 was
+never restarted. Existing PPPoE and backup-WAN CAKE/IFB queues remained
+present, including PPPoE overhead 44/MPU 84. All four configuration hashes
+were unchanged:
+
+| Config | SHA-256 |
+|---|---|
+| `cake-autorate` | `88cc2cd79dffa695fa8b16b96a5fc375d31a95adac6e724773a5373b1c2dd6d8` |
+| `sqm` | `a4405847b3044c9f41c09097fd9e850915d7113953502ec60ccb8365b93eb8bb` |
+| `network` | `ed6d568293ed2d632c51827f5fa3227acaec4ed257359eb9a92b85a355065190` |
+| `mwan3` | `fea15a18e8f39f4211ee37959759a5892d0f592dd6e105cf147263b4dde67e81` |
+
+On the rockchip/armv8 router, the existing WWAN instance remained running and
+continued to manage its dynamic CAKE pair. Its configuration hashes were also
+unchanged:
+
+| Config | SHA-256 |
+|---|---|
+| `cake-autorate` | `ac59a8a2a26e88803a5c493ea86c840c3dd9c10a2058ce0768164515abcdb10c` |
+| `sqm` | `1e29f86a4cfba8cecaa5aee5cface48c6ef2599fa9aa7a567c4d363ec641c920` |
+| `network` | `3d16217f0e3ec73b9ba55b006caf30c5abda024126c429df30ca93e170e4ea68` |
+
+Authenticated Playwright opened the installed Settings and Re-run Auto-Tune
+wizard at 1500×900 and 390×844 on the disposable x86, production x86
+Multi-WAN and production ARM routers. It verified that Best overall is the
+default for an old instance, selected Gaming/Best overall/Fair, checked target
+and policy text, and recorded no page or console errors. A final visual pass
+confirmed that profile cards wrap only at word boundaries on both LuCI themes.
+No calibration was started and no settings were saved by the browser test.
+
+Both offline repositories index 68 APKs. Fresh network- and script-disabled
+x86_64 and aarch64_generic roots selected and installed all 68 packages,
+including the default mbedTLS provider. Both installers pass `sh -n`; both
+archives contain exactly one platform installer, `packages.adb`, and 68 APKs.
+Running the exact x86 archive installer on the disposable router first proved
+its 8 MiB rootfs safety gate by refusing after an intentionally too-tight
+`/root` extraction, before changing packages. Running the same unmodified
+bundle from `/tmp` then completed, made a dated UCI backup, restarted only
+CAKE Autorate and preserved the three configuration hashes above.
+
+Final RC18 payload hashes are:
+
+| Artifact | SHA-256 |
+|---|---|
+| x86_64 daemon APK | `aae1935a57ae350624eeaf6911cb67c981aeba5283d92c8c413b243fd25da032` |
+| aarch64_generic daemon APK | `982e87b9072c4c8ed2ee9fb23f657e6bfd8d9c808a9a5ced5682566f424aa99a` |
+| noarch LuCI APK | `e7830b65c3af94dd5c972c42c9749d8d81bff64198142c38aa46c567de3c001d` |
+| x86_64 installer | `39f0db3d56c646419f700c8fffdc86ae2efe4a5764684682d055d5bd5eef318f` |
+| aarch64_generic installer | `e34b9dee545826b79db3e8f1f4379d1db410585cc0da4f6d4fa53926f6a34321` |
+| x86_64 offline bundle | `afc9aad043bc5cea3c998e50a80f7e5bd40857d112beb01bf57fb8b207bb92f6` |
+| rockchip/armv8 offline bundle | `386ef81777e4784912183ca0fd73611c88e758f76d7c82444ca318f718983cfb` |

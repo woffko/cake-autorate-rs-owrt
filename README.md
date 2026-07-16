@@ -50,13 +50,13 @@ socket libraries; ordinary OpenWrt runtime dependencies remain explicit below.
 
 The latest published release provides these OpenWrt 25.12.5 APKs:
 
-- `cake-autorate-rs-1.0_rc17-r1-x86_64.apk` — x86_64 autorate daemon.
-- `cake-autorate-rs-1.0_rc17-r1-aarch64_generic.apk` — rockchip/armv8
+- `cake-autorate-rs-1.0_rc18-r1-x86_64.apk` — x86_64 autorate daemon.
+- `cake-autorate-rs-1.0_rc18-r1-aarch64_generic.apk` — rockchip/armv8
   autorate daemon.
-- `luci-app-cake-autorate-rs-1.0_rc17-r1.apk` — architecture-independent LuCI
+- `luci-app-cake-autorate-rs-1.0_rc18-r1.apk` — architecture-independent LuCI
   interface and SQM integration.
 
-RC17 completed both architecture builds, fresh offline dependency resolution,
+RC18 completed both architecture builds, fresh offline dependency resolution,
 disposable x86 validation, production Multi-WAN validation, ARM validation,
 and authenticated desktop/mobile Playwright checks. Exact release hashes and
 the anonymized acceptance evidence are recorded in [Testing](TESTING.md).
@@ -227,6 +227,21 @@ passing final validation, normal confidence, and no phase contamination. This
 contract is covered by deterministic Rust, shell, LuCI, offline-install, and
 real-router acceptance gates; see [Full Auto-Tune](AUTOTUNE.md) and
 [Testing](TESTING.md).
+
+RC18 adds three explicit, end-to-end Full Auto-Tune profiles. **Best overall**
+is the default and the compatibility replacement for the former balanced
+proposal; it targets an A-like loaded-delay result while retaining at least
+80% of observed-low capacity. **Gaming** targets A+, accepts a lower 70%
+throughput floor, and configures `layer_cake.qos` with CAKE `diffserv4`.
+Gaming never guesses applications or rewrites client policy: only traffic
+already marked with DSCP receives differentiated treatment, and ingress marks
+are deliberately preserved. **Fair** targets B while retaining at least 90%
+of observed-low capacity for sustained transfers. Each profile owns its rate
+factors, validation limits, adaptive-ceiling cadence, and exact SQM policy.
+The selected profile is bound into the job identity, proposal, result,
+attestation, guarded apply and rollback paths; mismatched or legacy evidence
+fails closed. Existing instances without a profile resolve to Best overall,
+and the old `balanced` CLI spelling remains a read-compatible alias.
 
 The **Autorate setup** editor is now divided into six in-page groups:
 Connection & routing, Rate limits, Adaptive ceiling, Latency probes, Quality &
@@ -661,16 +676,16 @@ them together. For x86_64:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc17-r1-x86_64.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc17-r1.apk
+  /root/cake-autorate-rs-1.0_rc18-r1-x86_64.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc18-r1.apk
 ```
 
 For rockchip/armv8 (`aarch64_generic`):
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc17-r1-aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc17-r1.apk
+  /root/cake-autorate-rs-1.0_rc18-r1-aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc18-r1.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:
@@ -690,25 +705,27 @@ x86_64:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc17-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc17-x86_64.sh
+tar -xzf cake-autorate-rs-1.0-rc18-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc18-x86_64.sh
 ```
 
 Banana Pi R2 Pro and other OpenWrt 25.12.5 rockchip/armv8 devices:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc17-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc17-aarch64_generic.sh
+tar -xzf cake-autorate-rs-1.0-rc18-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc18-aarch64_generic.sh
 ```
 
 The installer resolves its own location, so it also works when the extracted
 bundle is kept in another directory.
 
-Each archive is about 4 MiB and needs roughly 10 MiB of free space while
-both the archive and its extracted contents are present. If `/root/` is too
-small, use another writable filesystem (for example `/tmp/` when its tmpfs has
-enough RAM) for both commands instead.
+Each archive is about 4 MiB. Keeping both the archive and its extracted
+repository in `/root/` needs roughly 16 MiB free before extraction: about
+8 MiB for those files plus the installer's mandatory 8 MiB rootfs safety
+margin. If `/root/` is smaller, copy, extract and run the bundle from another
+writable filesystem (for example `/tmp/` when its tmpfs has enough RAM); the
+installer still backs up UCI under `/root/cake-autorate-backups/`.
 
 Optional speed test backends can be installed from LuCI or manually:
 

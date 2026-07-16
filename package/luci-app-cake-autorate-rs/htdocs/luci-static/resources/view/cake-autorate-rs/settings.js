@@ -99,6 +99,7 @@ var optionDescriptions = {
 	throughput_reference_dl_p50_kbps: 'Optional download median capacity from Full Auto-Tune.',
 	throughput_reference_ul_p20_kbps: 'Optional upload 20th-percentile capacity from Full Auto-Tune.',
 	throughput_reference_ul_p50_kbps: 'Optional upload median capacity from Full Auto-Tune.',
+	autotune_profile: 'Profile used by the next manual or scheduled Full Auto-Tune run. Gaming targets A+ and enables diffserv4, Best overall targets A, and Fair targets B while preserving more throughput.',
 	scheduled_autotune_enabled: 'Periodically run the validated Full Auto-Tune workflow only inside the configured quiet window. Disabled by default.',
 	scheduled_autotune_interval_hours: 'Minimum hours between successful scheduled calibrations.',
 	scheduled_autotune_idle_window_s: 'Traffic must remain below the active threshold for this long before a scheduled test may start.',
@@ -1354,8 +1355,159 @@ function speedtestJobDelay() {
 
 var AUTOTUNE_RECOVERY_MAX_POLLS = 12;
 var AUTOTUNE_RECOVERY_MAX_DELAY_MS = 5000;
-var AUTOTUNE_RESULT_SCHEMA_VERSION = 3;
+var AUTOTUNE_RESULT_SCHEMA_VERSION = 4;
 var AUTOTUNE_RESULT_PRODUCER = 'cake-autorate-rs-autotune';
+
+function canonicalAutotuneProfile(value) {
+	switch (value) {
+	case 'gaming':
+		return 'gaming';
+	case 'balanced':
+	case 'best-overall':
+	case 'best_overall':
+		return 'best_overall';
+	case 'fair':
+		return 'fair';
+	default:
+		return null;
+	}
+}
+
+function autotuneProfilePolicy(value) {
+	var profile = canonicalAutotuneProfile(value);
+
+	switch (profile) {
+	case 'gaming':
+		return {
+			id: profile,
+			targetGrade: 'A+',
+			retentionPercent: 70,
+			delayMaxMs: 5,
+			lossMaxPercent: 1,
+			cpuMaxPercent: 85,
+			sqm: {
+				qdisc: 'cake',
+				script: 'layer_cake.qos',
+				classification: 'diffserv4',
+				squashDscp: false,
+				squashIngress: false,
+				ingressEcn: 'ECN',
+				egressEcn: 'NOECN',
+				iqdiscOpts: 'diffserv4',
+				eqdiscOpts: 'diffserv4'
+			}
+		};
+	case 'best_overall':
+		return {
+			id: profile,
+			targetGrade: 'A',
+			retentionPercent: 80,
+			delayMaxMs: 30,
+			lossMaxPercent: 3,
+			cpuMaxPercent: 85,
+			sqm: {
+				qdisc: 'cake',
+				script: 'piece_of_cake.qos',
+				classification: 'besteffort',
+				squashDscp: true,
+				squashIngress: true,
+				ingressEcn: 'ECN',
+				egressEcn: 'NOECN',
+				iqdiscOpts: '',
+				eqdiscOpts: ''
+			}
+		};
+	case 'fair':
+		return {
+			id: profile,
+			targetGrade: 'B',
+			retentionPercent: 90,
+			delayMaxMs: 60,
+			lossMaxPercent: 5,
+			cpuMaxPercent: 85,
+			sqm: {
+				qdisc: 'cake',
+				script: 'piece_of_cake.qos',
+				classification: 'besteffort',
+				squashDscp: true,
+				squashIngress: true,
+				ingressEcn: 'ECN',
+				egressEcn: 'NOECN',
+				iqdiscOpts: '',
+				eqdiscOpts: ''
+			}
+		};
+	default:
+		return null;
+	}
+}
+
+function autotuneProfileDefinitions() {
+	return [
+		{
+			id: 'gaming',
+			title: _('Gaming'),
+			target: _('Target A+ · under 5 ms loaded-latency increase'),
+			description: _('Maximum latency headroom with a 70% capacity safety floor. Uses CAKE diffserv4 and preserves existing DSCP markings; applications are never guessed.')
+		},
+		{
+			id: 'best_overall',
+			title: _('Best overall'),
+			target: _('Target A or better · under 30 ms'),
+			description: _('Recommended balance of latency and throughput with an 80% capacity safety floor and best-effort CAKE.')
+		},
+		{
+			id: 'fair',
+			title: _('Fair'),
+			target: _('Target B or better · under 60 ms'),
+			description: _('Favors large sustained transfers with a 90% capacity safety floor while retaining bounded bufferbloat control.')
+		}
+	];
+}
+
+function autotuneProposalMatchesProfile(result) {
+	var proposal = result && result.proposal;
+	var profile = canonicalAutotuneProfile(result && result.profile);
+	var policy = autotuneProfilePolicy(profile);
+	var validation = proposal && proposal.validation;
+	var thresholds = result && result.validation_thresholds;
+	var sqm = proposal && proposal.sqm;
+	var sameNumber = function(first, second) {
+		first = autotuneNumber(first);
+		second = autotuneNumber(second);
+		return first != null && second != null && Math.abs(first - second) < 0.000001;
+	};
+
+	if (!proposal || !policy || autotuneNumber(proposal.schema_version) !== 2 ||
+	    canonicalAutotuneProfile(proposal.profile) !== profile ||
+	    proposal.target_grade !== policy.targetGrade || !validation || !thresholds || !sqm)
+		return false;
+
+	if (!sameNumber(validation.candidate_realization_min_percent, 80) ||
+	    !sameNumber(validation.candidate_realization_max_percent, 110) ||
+	    !sameNumber(validation.capacity_retention_min_percent, policy.retentionPercent) ||
+	    !sameNumber(validation.icmp_delta_max_ms, policy.delayMaxMs) ||
+	    !sameNumber(validation.transport_delta_max_ms, policy.delayMaxMs) ||
+	    !sameNumber(validation.loss_max_percent, policy.lossMaxPercent) ||
+	    !sameNumber(validation.cpu_max_percent, policy.cpuMaxPercent) ||
+	    !sameNumber(thresholds.candidate_realization_min_percent, 80) ||
+	    !sameNumber(thresholds.candidate_realization_max_percent, 110) ||
+	    !sameNumber(thresholds.capacity_retention_min_percent, policy.retentionPercent) ||
+	    !sameNumber(thresholds.delay_max_ms, policy.delayMaxMs) ||
+	    !sameNumber(thresholds.loss_max_percent, policy.lossMaxPercent) ||
+	    !sameNumber(thresholds.cpu_max_percent, policy.cpuMaxPercent))
+		return false;
+
+	return sqm.qdisc === policy.sqm.qdisc &&
+		sqm.script === policy.sqm.script &&
+		sqm.classification === policy.sqm.classification &&
+		sqm.squash_dscp === policy.sqm.squashDscp &&
+		sqm.squash_ingress === policy.sqm.squashIngress &&
+		sqm.ingress_ecn === policy.sqm.ingressEcn &&
+		sqm.egress_ecn === policy.sqm.egressEcn &&
+		(sqm.iqdisc_opts || '') === policy.sqm.iqdiscOpts &&
+		(sqm.eqdisc_opts || '') === policy.sqm.eqdiscOpts;
+}
 
 function autotuneJobDelay(delayMs) {
 	return new Promise(function(resolve) {
@@ -1447,11 +1599,14 @@ function runSpeedtestJob(section_id, wan, backend, onProgress, routeMode, mwan3M
 	});
 }
 
-function runAutotuneJob(section_id, wan, backend, onProgress, routeMode, mwan3Member, conservative) {
+function runAutotuneJob(section_id, wan, backend, onProgress, routeMode, mwan3Member,
+		profile, conservative) {
 	var command = '/usr/libexec/cake-autorate-rs/autotune';
 	var action = conservative ? 'start-conservative' : 'start';
+	profile = canonicalAutotuneProfile(profile) || 'best_overall';
 
-	return fs.exec(command, [ section_id, wan, action, backend, routeMode || '', mwan3Member || '' ]).then(function(res) {
+	return fs.exec(command, [ section_id, wan, action, backend, routeMode || '',
+		mwan3Member || '', profile, conservative ? '1' : '0' ]).then(function(res) {
 		var started = parseExecJson(res);
 
 		if (started.error && !autotuneRecoveryPending(started))
@@ -1462,7 +1617,7 @@ function runAutotuneJob(section_id, wan, backend, onProgress, routeMode, mwan3Me
 		var poll = function() {
 			return autotuneJobDelay(pollDelayMs).then(function() {
 				return fs.exec(command, [ section_id, wan, 'status', backend,
-					routeMode || '', mwan3Member || '', conservative ? '1' : '0' ]);
+					routeMode || '', mwan3Member || '', profile, conservative ? '1' : '0' ]);
 			}).then(function(status) {
 				var result = parseExecJson(status);
 				var active = result.state === 'running' || result.state === 'cancelling';
@@ -1542,12 +1697,15 @@ function runAutotuneJob(section_id, wan, backend, onProgress, routeMode, mwan3Me
 	});
 }
 
-function cancelAutotuneJob(section_id, wan, backend) {
+function cancelAutotuneJob(section_id, wan, backend, profile) {
 	return fs.exec('/usr/libexec/cake-autorate-rs/autotune', [
 		section_id,
 		wan,
 		'cancel',
-		backend || 'auto'
+		backend || 'auto',
+		'',
+		'',
+		canonicalAutotuneProfile(profile) || 'best_overall'
 	]).then(parseExecJson);
 }
 
@@ -1988,6 +2146,9 @@ function writeWizardConfig(section_id, state) {
 	var ul = rateValue(state.sqm_upload, '20000');
 	var sqmSection = state.sqm_section || managedSqmSectionName(section_id);
 	var pingExtraArgs = state.ping_extra_args || pingerInterfaceArgs(wan, state.pinger_method || 'fping');
+	var selectedAutotuneProfile = state.autotune_proposal ?
+		canonicalAutotuneProfile(state.autotune_proposal.profile) :
+		canonicalAutotuneProfile(state.autotune_profile);
 
 	uci.set('cake-autorate', section_id, 'enabled', state.enabled ? '1' : '0');
 	uci.set('cake-autorate', section_id, 'wan_if', wan);
@@ -2003,6 +2164,8 @@ function writeWizardConfig(section_id, state) {
 	uci.set('cake-autorate', section_id, 'manage_sqm', '1');
 	uci.set('cake-autorate', section_id, 'sqm_section', sqmSection);
 	uci.set('cake-autorate', section_id, 'sqm_enabled', state.enabled ? '1' : '0');
+	uci.set('cake-autorate', section_id, 'autotune_profile',
+		selectedAutotuneProfile || 'best_overall');
 	uci.set('cake-autorate', section_id, 'speedtest_backend', state.speedtest_backend || 'auto');
 	if (state.speedtest_go_server_id)
 		uci.set('cake-autorate', section_id, 'speedtest_go_server_id', state.speedtest_go_server_id);
@@ -2034,6 +2197,8 @@ function writeWizardConfig(section_id, state) {
 		var ulProposal = proposal.upload;
 		var thresholds = proposal.thresholds_ms;
 		var adaptive = adaptiveCeilingWritePlan(state, proposal);
+		var validationPolicy = proposal.validation;
+		var sqmPolicy = proposal.sqm;
 
 		uci.set('cake-autorate', section_id, 'min_dl_shaper_rate_kbps', String(dlProposal.minimum_kbps));
 		uci.set('cake-autorate', section_id, 'base_dl_shaper_rate_kbps', String(dlProposal.base_kbps));
@@ -2058,11 +2223,27 @@ function writeWizardConfig(section_id, state) {
 		uci.set('cake-autorate', section_id, 'adaptive_ceiling_failed_bound_ttl_s', String(adaptive.failed_bound_ttl_s));
 		uci.set('cake-autorate', section_id, 'transport_latency_enabled', '1');
 		uci.set('cake-autorate', section_id, 'throughput_guard_enabled', '1');
-		uci.set('cake-autorate', section_id, 'throughput_guard_retention_percent', '80');
+		uci.set('cake-autorate', section_id, 'throughput_guard_retention_percent',
+			String(validationPolicy.capacity_retention_min_percent));
+		uci.set('cake-autorate', section_id, 'quality_target_delay_ms',
+			String(validationPolicy.transport_delta_max_ms));
 		uci.set('cake-autorate', section_id, 'throughput_reference_dl_p20_kbps', String(dlProposal.observed_low_kbps));
 		uci.set('cake-autorate', section_id, 'throughput_reference_dl_p50_kbps', String(dlProposal.observed_median_kbps));
 		uci.set('cake-autorate', section_id, 'throughput_reference_ul_p20_kbps', String(ulProposal.observed_low_kbps));
 		uci.set('cake-autorate', section_id, 'throughput_reference_ul_p50_kbps', String(ulProposal.observed_median_kbps));
+		state.autotune_profile = canonicalAutotuneProfile(proposal.profile) || 'best_overall';
+		uci.set('cake-autorate', section_id, 'autotune_profile', state.autotune_profile);
+		state.sqm_qdisc = sqmPolicy.qdisc;
+		state.sqm_script = sqmPolicy.script;
+		state.sqm_qdisc_advanced = state.autotune_profile === 'gaming' ? '1' : '0';
+		state.sqm_qdisc_really_really_advanced =
+			state.autotune_profile === 'gaming' ? '1' : '0';
+		state.sqm_squash_dscp = sqmPolicy.squash_dscp ? '1' : '0';
+		state.sqm_squash_ingress = sqmPolicy.squash_ingress ? '1' : '0';
+		state.sqm_ingress_ecn = sqmPolicy.ingress_ecn;
+		state.sqm_egress_ecn = sqmPolicy.egress_ecn;
+		state.sqm_iqdisc_opts = sqmPolicy.iqdisc_opts || '';
+		state.sqm_eqdisc_opts = sqmPolicy.eqdisc_opts || '';
 	}
 
 	for (var i = 0; i < sqmImportOptionMap.length; i++) {
@@ -2072,6 +2253,8 @@ function writeWizardConfig(section_id, state) {
 
 		if (value !== '')
 			uci.set('cake-autorate', section_id, key, String(value));
+		else
+			uci.unset('cake-autorate', section_id, key);
 	}
 }
 
@@ -2271,7 +2454,7 @@ function autotunePhaseEvidenceClean(result) {
 	var directions = [ 'download', 'upload' ];
 	var cleanBaselineSeen = false;
 
-	/* A clean RC17 run has an idle baseline, two unshaped samples, and a
+	/* A clean current-schema run has an idle baseline, two unshaped samples, and a
 	 * download-only plus upload-only shaped phase.  Treat missing evidence as
 	 * incomplete rather than trusting a top-level boolean. */
 	if (!Array.isArray(entries) || entries.length < 5)
@@ -2334,14 +2517,15 @@ function autotuneResultValidated(result) {
 	    (result.route_mode !== 'main' && result.route_mode !== 'mwan3'))
 		return false;
 
-	/* RC17 results are intentionally fail-closed.  A bare legacy `pass` is not
+	/* Current results are intentionally fail-closed. A bare legacy `pass` is not
 	 * enough because it did not prove phase-scoped background telemetry. */
 	if (autotuneNumber(result.schema_version) !== AUTOTUNE_RESULT_SCHEMA_VERSION ||
 	    result.producer !== AUTOTUNE_RESULT_PRODUCER ||
 	    result.phase_evidence_complete !== true || result.runtime_restored !== true ||
 	    result.recovery_pending !== false || result.auto_apply_eligible !== true ||
 	    result.configuration_written !== false ||
-	    !/^sha256:[0-9a-f]{64}$/.test(result.config_fingerprint || ''))
+	    !/^sha256:[0-9a-f]{64}$/.test(result.config_fingerprint || '') ||
+	    !autotuneProposalMatchesProfile(result))
 		return false;
 
 	/* Conservative/contaminated output remains useful diagnostics, but it is
@@ -2372,11 +2556,15 @@ function revalidateAutotuneProposal(section_id, wan, backend, expected, routeMod
 		return Promise.reject(new Error(_('The selected uplink no longer matches the validated Auto-Tune result. Run Auto-Tune again.')));
 
 	var expectedFingerprint = expected.config_fingerprint;
+	var expectedProfile = canonicalAutotuneProfile(expected.profile);
 	return fs.exec('/usr/libexec/cake-autorate-rs/autotune', [
 		section_id,
 		wan,
 		'status',
-		backend || 'auto'
+		backend || 'auto',
+		selectedMode,
+		selectedMember,
+		expectedProfile || 'best_overall'
 	]).then(function(status) {
 		var current = parseExecJson(status);
 
@@ -2394,7 +2582,8 @@ function revalidateAutotuneProposal(section_id, wan, backend, expected, routeMod
 			'attest',
 			backend || 'auto',
 			selectedMode,
-			selectedMember
+			selectedMember,
+			expectedProfile || 'best_overall'
 		]).then(function(attestationStatus) {
 			var attestation = parseExecJson(attestationStatus);
 
@@ -3320,6 +3509,7 @@ function showCreateWizard(grid, name, existingName) {
 		multiwan_set: false,
 		enabled: true,
 		sqm_enabled: true,
+		autotune_profile: 'best_overall',
 		speedtest_backend: 'auto',
 		speedtest_go_server_id: '',
 		speedtest_apply_percent: '90',
@@ -3349,6 +3539,8 @@ function showCreateWizard(grid, name, existingName) {
 		state.route_selection = state.mwan3_member ? 'mwan3:' + state.mwan3_member : 'main';
 		state.enabled = uci.get('cake-autorate', existingName, 'enabled') === '1';
 		state.sqm_enabled = uci.get('cake-autorate', existingName, 'sqm_enabled') === '1';
+		state.autotune_profile = canonicalAutotuneProfile(
+			uci.get('cake-autorate', existingName, 'autotune_profile')) || 'best_overall';
 		state.speedtest_backend = uci.get('cake-autorate', existingName, 'speedtest_backend') || 'auto';
 		state.speedtest_go_server_id = uci.get('cake-autorate', existingName, 'speedtest_go_server_id') || '';
 		state.speedtest_apply_percent = uci.get('cake-autorate', existingName, 'speedtest_apply_percent') || '90';
@@ -3567,6 +3759,7 @@ function showCreateWizard(grid, name, existingName) {
 
 		state.autotune_result = result;
 		state.autotune_proposal = proposal;
+		state.autotune_profile = canonicalAutotuneProfile(result.profile) || 'best_overall';
 		state.autotune_diagnostics = null;
 		state.autotune_failure_message = '';
 		state.adaptive_ceiling_disable_confirmed = false;
@@ -3580,12 +3773,50 @@ function showCreateWizard(grid, name, existingName) {
 		state.sqm_overhead = String(proposal.link.overhead);
 		state.sqm_tcMPU = String(proposal.link.mpu);
 		state.sqm_linklayer_advanced = proposal.link.layer === 'none' ? '0' : '1';
+		state.sqm_qdisc = proposal.sqm.qdisc;
+		state.sqm_script = proposal.sqm.script;
+		state.sqm_qdisc_advanced = state.autotune_profile === 'gaming' ? '1' : '0';
+		state.sqm_qdisc_really_really_advanced =
+			state.autotune_profile === 'gaming' ? '1' : '0';
+		state.sqm_squash_dscp = proposal.sqm.squash_dscp ? '1' : '0';
+		state.sqm_squash_ingress = proposal.sqm.squash_ingress ? '1' : '0';
+		state.sqm_ingress_ecn = proposal.sqm.ingress_ecn;
+		state.sqm_egress_ecn = proposal.sqm.egress_ecn;
+		state.sqm_iqdisc_opts = proposal.sqm.iqdisc_opts || '';
+		state.sqm_eqdisc_opts = proposal.sqm.eqdisc_opts || '';
 		state.speedtest_backend = firstRun.backend || state.speedtest_backend || 'auto';
 		state.speedtest_go_server_id = firstRun.server_id || '';
 		applyPingerPlanToState(state, result.pinger_plan);
 	}
 
 	function renderAutotuneStep() {
+		var profileButtons = autotuneProfileDefinitions().map(function(definition) {
+			var selected = state.autotune_profile === definition.id;
+			return E('button', {
+				'type': 'button',
+				'class': 'btn cbi-button %s'.format(selected ? 'cbi-button-positive' : ''),
+				'disabled': state.autotune_running ? 'disabled' : null,
+				'data-profile': definition.id,
+				'aria-pressed': selected ? 'true' : 'false',
+				'style': 'display:flex;flex-direction:column;align-items:flex-start;gap:4px;flex:1 1 220px;min-height:104px;padding:10px;text-align:left;white-space:normal;word-break:normal;overflow-wrap:break-word;hyphens:none;line-height:1.4',
+				'click': function(ev) {
+					var selectedProfile = canonicalAutotuneProfile(
+						ev.currentTarget.getAttribute('data-profile'));
+					if (!selectedProfile || selectedProfile === state.autotune_profile)
+						return;
+					clearAutotuneProposalState(state);
+					state.autotune_diagnostics = null;
+					state.autotune_failure_message = '';
+					state.autotune_background_block = null;
+					state.autotune_profile = selectedProfile;
+					render();
+				}
+			}, [
+				E('strong', {}, definition.title),
+				E('span', { 'style': 'font-size:12px;font-weight:600' }, definition.target),
+				E('span', { 'style': 'font-size:12px' }, definition.description)
+			]);
+		});
 		var status = E('div', { 'style': 'margin-top:8px;white-space:normal' },
 			state.autotune_result ? _('Calibration complete. Review the validated proposed parameters.') :
 				(state.autotune_diagnostics ?
@@ -3621,7 +3852,8 @@ function showCreateWizard(grid, name, existingName) {
 				state.autotune_progress = job.progress || 0;
 				progress.value = state.autotune_progress;
 				status.textContent = job.message || job.phase || _('Full Auto-Tune is running...');
-			}, state.route_mode, state.mwan3_member, conservative).then(function(result) {
+			}, state.route_mode, state.mwan3_member, state.autotune_profile,
+			conservative).then(function(result) {
 				applyAutotuneResult(result);
 				state.autotune_running = false;
 				state.step = 2;
@@ -3686,11 +3918,15 @@ function showCreateWizard(grid, name, existingName) {
 			'click': function() {
 				cancelButton.disabled = true;
 				status.textContent = _('Cancelling and restoring the previous SQM state...');
-				cancelAutotuneJob(state.name, state.wan_if, state.speedtest_backend);
+				cancelAutotuneJob(state.name, state.wan_if, state.speedtest_backend,
+					state.autotune_profile);
 			}
 		}, _('Cancel test'));
 
 		var fields = [
+			wizardField(_('Calibration profile'),
+				E('div', { 'style': 'display:flex;flex-wrap:wrap;gap:8px' }, profileButtons),
+				_('The profile fixes the latency target and minimum retained capacity for this run. If the target and safety floor cannot both be met, Auto-Tune rejects the candidate instead of destroying throughput.')),
 			E('div', { 'class': 'alert-message warning' }, [
 				E('strong', {}, _('Traffic warning: ')),
 				_('Full Auto-Tune runs two unshaped samples followed by separate router-side download-only and upload-only validation phases. An unreliable measurement may be repeated once and one bounded directional correction may be validated. Other WAN traffic can reduce confidence, but is never counted as test throughput.')
@@ -3949,7 +4185,13 @@ function showCreateWizard(grid, name, existingName) {
 				state.original_adaptive_ceiling.enabled === true && adaptive.enabled === false);
 			var thresholds = proposal.thresholds_ms;
 			var firstRun = autotune.runs && autotune.runs.length ? autotune.runs[0] : {};
+			var profilePolicy = autotuneProfilePolicy(autotune.profile);
 			rows.push(
+				[ _('Calibration profile'), profilePolicy ?
+					_('%s · target %s or better').format(
+						autotuneProfileDefinitions().filter(function(item) {
+							return item.id === profilePolicy.id;
+						})[0].title, profilePolicy.targetGrade) : '-' ],
 				[ _('Calibration confidence'), (autotune.confidence_mode === 'low' ? _('LOW · ') : '') + String(proposal.confidence) + '%' ],
 				[ _('Idle latency'), _('%s ms median / %s ms p95').format(autotune.baseline.median_ms, autotune.baseline.p95_ms) ],
 				[ _('Observed download'), _('%d / %d / %d kbit/s low / median / high').format(dl.observed_low_kbps, dl.observed_median_kbps, dl.observed_high_kbps) ],
@@ -3961,6 +4203,9 @@ function showCreateWizard(grid, name, existingName) {
 					(adaptiveDecision.preserved ?
 						_('Auto-Tune recommends disabling it, but the existing enabled setting and tuning parameters will be preserved.') :
 						_('disabled as proposed for the measured stable link')) ],
+				[ _('CAKE traffic classes'), proposal.sqm.classification === 'diffserv4' ?
+					_('diffserv4; preserve existing DSCP (no application guessing)') :
+					_('best effort; ignore external DSCP') ],
 				[ _('Detected link layer'), _('%s; overhead %d, MPU %d').format(proposal.link.kind, proposal.link.overhead, proposal.link.mpu) ],
 				[ _('Test server'), firstRun.server_sponsor ? _('%s #%s').format(firstRun.server_sponsor, firstRun.server_id || '-') : _('automatic') ]
 			);
@@ -4239,7 +4484,8 @@ function showCreateWizard(grid, name, existingName) {
 				'class': 'btn cbi-button',
 				'click': function() {
 					if (state.autotune_running)
-						cancelAutotuneJob(state.name, state.wan_if, state.speedtest_backend);
+						cancelAutotuneJob(state.name, state.wan_if,
+							state.speedtest_backend, state.autotune_profile);
 					ui.hideModal();
 				}
 			}, _('Cancel')),
@@ -4670,6 +4916,13 @@ function addQualityOptions(section) {
 	o.depends({ transport_latency_enabled: '1', transport_controller_enabled: '1', throughput_guard_enabled: '1' });
 	o = value(section, 'quality', 'throughput_reference_ul_p50_kbps', _('UL capacity P50'), 'uinteger', '0');
 	o.depends({ transport_latency_enabled: '1', transport_controller_enabled: '1', throughput_guard_enabled: '1' });
+
+	o = listValue(section, 'testing', 'autotune_profile', _('Auto-Tune profile'), [
+		[ 'gaming', _('Gaming — target A+, diffserv4') ],
+		[ 'best_overall', _('Best overall — target A (recommended)') ],
+		[ 'fair', _('Fair — target B, favor sustained throughput') ]
+	], 'best_overall');
+	describe(o, 'autotune_profile');
 
 	o = flag(section, 'testing', 'scheduled_autotune_enabled', _('Scheduled Full Auto-Tune'), '0');
 	o = value(section, 'testing', 'scheduled_autotune_interval_hours', _('Retune interval'), 'and(uinteger,min(1),max(8760))', '24');

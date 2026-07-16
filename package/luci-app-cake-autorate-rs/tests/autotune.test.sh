@@ -50,10 +50,10 @@ export AUTOTUNE_MOCK_DIRECTION_LOG="$work/test-directions"
 
 # The fixture must model jsonfilter's top-level lookup semantics.  Greedy text
 # extraction used to select nested proposal fields and report schema 1/state
-# inner instead of the terminal envelope's schema 3/state complete.
-nested_terminal='{"state":"complete","schema_version":3,"nested":{"state":"inner","schema_version":1}}'
+# inner instead of the terminal envelope's schema 4/state complete.
+nested_terminal='{"state":"complete","schema_version":4,"nested":{"state":"inner","schema_version":1}}'
 test "$(printf '%s\n' "$nested_terminal" | "$CAKE_AUTORATE_JSONFILTER" -e '@.state')" = complete
-test "$(printf '%s\n' "$nested_terminal" | "$CAKE_AUTORATE_JSONFILTER" -e '@.schema_version')" = 3
+test "$(printf '%s\n' "$nested_terminal" | "$CAKE_AUTORATE_JSONFILTER" -e '@.schema_version')" = 4
 
 # Request matching must consume the identity snapshot authenticated by
 # worker_identity_matches().  The worker is allowed to unlink pid_file as it
@@ -69,6 +69,8 @@ CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
 	identity_backend=speedtest-go
 	identity_route_mode=
 	identity_mwan3_member=
+	autotune_profile=best_overall
+	identity_profile=best_overall
 	identity_conservative=0
 	worker_request_matches any
 ' sh "$autotune" "$work"
@@ -82,8 +84,8 @@ CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
 	expected="[\"[2001:db8::1]:2112\",\"irtt.example\"]"
 	[ "$actual" = "$expected" ]
 	! pinger_targets_json_array fping "--bad-option" >/dev/null
-	strict_single_json_object "{\"state\":\"complete\",\"schema_version\":3}"
-	! strict_single_json_object "$(printf "%s\n%s" "{\"state\":\"complete\",\"schema_version\":3}" "{\"forged\":true}")"
+	strict_single_json_object "{\"state\":\"complete\",\"schema_version\":4}"
+	! strict_single_json_object "$(printf "%s\n%s" "{\"state\":\"complete\",\"schema_version\":4}" "{\"forged\":true}")"
 ' sh "$autotune"
 
 "$autotune" fullauto lo start speedtest-go > "$work/start.json"
@@ -104,6 +106,15 @@ while [ "$attempt" -lt 800 ]; do
 	if grep -q '"state":"complete"' "$work/status.json"; then
 		break
 	fi
+	case "$status_state" in
+		running|cancelling|recovery-pending) ;;
+		*)
+			printf 'Full Auto-Tune unexpectedly ended in state %s during the happy-path test.\n' \
+				"$status_state" >&2
+			cat "$work/status.json" >&2
+			exit 1
+			;;
+	esac
 	attempt=$((attempt + 1))
 	sleep 0.02
 done
@@ -690,7 +701,30 @@ export CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1
 . "$autotune"
 unset CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY
 
+autotune_profile=best_overall
 if proposal_json_valid 'not-json},"forged":true,{' ; then exit 1; fi
+download_samples=50000,110000
+upload_samples=10000,20000
+idle_median_ms=13
+idle_p95_ms=16
+baseline_samples=15
+link_kind=cellular
+conservative_mode=0
+autotune_profile=gaming
+gaming_proposal="$(calculate_proposal)"
+proposal_json_valid "$gaming_proposal"
+printf '%s\n' "$gaming_proposal" | grep -q '"profile":"gaming","target_grade":"A+"'
+printf '%s\n' "$gaming_proposal" | grep -q '"script":"layer_cake.qos","classification":"diffserv4"'
+printf '%s\n' "$gaming_proposal" | grep -q '"iqdisc_opts":"diffserv4","eqdisc_opts":"diffserv4"'
+tampered_gaming="$(printf '%s\n' "$gaming_proposal" | sed 's/"classification":"diffserv4"/"classification":"besteffort"/')"
+if proposal_json_valid "$tampered_gaming"; then exit 1; fi
+autotune_profile=fair
+fair_proposal="$(calculate_proposal)"
+proposal_json_valid "$fair_proposal"
+printf '%s\n' "$fair_proposal" | grep -q '"profile":"fair","target_grade":"B"'
+printf '%s\n' "$fair_proposal" | grep -q '"capacity_retention_min_percent":90.0'
+printf '%s\n' "$fair_proposal" | grep -q '"script":"piece_of_cake.qos","classification":"besteffort"'
+autotune_profile=best_overall
 route_mode=main
 target_if=lo
 reflectors="1.1.1.1 9.9.9.9 8.8.8.8"
@@ -925,7 +959,7 @@ grep -q '"state":"legacy"' "$work/status-settled.json"
 grep -q '"legacy_result":{"state":"complete"' "$work/status-settled.json"
 grep -q '"auto_apply_eligible":false' "$work/status-settled.json"
 
-printf '%s\n' '{"state":"complete","schema_version":3,"producer":"cake-autorate-rs-autotune"}' > "$result_file"
+printf '%s\n' '{"state":"complete","schema_version":4,"producer":"cake-autorate-rs-autotune","profile":"best_overall"}' > "$result_file"
 status_job > "$work/status-current.json"
 grep -q '"state":"complete"' "$work/status-current.json"
 if grep -q '"state":"legacy"' "$work/status-current.json"; then exit 1; fi
@@ -978,18 +1012,53 @@ inspect_sqm_ownership
 unset AUTOTUNE_MOCK_QDISC_STATE SQM_STATE_DIR
 unset -f tc uci
 
-# Temporary-shaper ownership includes the exact configured CAKE bandwidth, not
-# merely a matching qdisc kind and handle.
+# Temporary-shaper creation uses a typed argv contract. Gaming validation must
+# preserve DSCP and exercise diffserv4; throughput profiles must validate the
+# same besteffort+wash policy that they later propose.
+tc() {
+	printf '%s\n' "$*" > "$work/temp-cake.argv"
+}
+autotune_profile=gaming
+link_kind=pppoe
+replace_temporary_cake_qdisc lo a123: 806473 upload
+grep -qx 'qdisc replace dev lo root handle a123: cake bandwidth 806473kbit diffserv4 nat ethernet overhead 44 mpu 84' "$work/temp-cake.argv"
+replace_temporary_cake_qdisc ifb-test b123: 806473 download
+grep -qx 'qdisc replace dev ifb-test root handle b123: cake bandwidth 806473kbit diffserv4 nat ethernet overhead 44 mpu 84' "$work/temp-cake.argv"
+autotune_profile=best_overall
+link_kind=ethernet
+replace_temporary_cake_qdisc lo a123: 806473 upload
+grep -qx 'qdisc replace dev lo root handle a123: cake bandwidth 806473kbit besteffort nat ethernet overhead 18 mpu 64' "$work/temp-cake.argv"
+autotune_profile=fair
+link_kind=cellular
+replace_temporary_cake_qdisc ifb-test b123: 806473 download
+grep -qx 'qdisc replace dev ifb-test root handle b123: cake bandwidth 806473kbit besteffort nat wash raw' "$work/temp-cake.argv"
+unset -f tc
+
+# Temporary-shaper ownership includes the exact configured CAKE bandwidth,
+# classification, DSCP policy, and direction, not merely a matching kind and
+# handle.
 tc() {
 	printf '%s\n' "${AUTOTUNE_MOCK_QDISC_STATE:-}"
 }
-export AUTOTUNE_MOCK_QDISC_STATE='qdisc cake a123: root refcnt 2 bandwidth 806.473Mbit besteffort'
-exact_root_qdisc lo a123: 806473
-if exact_root_qdisc lo a123: 806472; then exit 1; fi
-export AUTOTUNE_MOCK_QDISC_STATE='qdisc cake a123: root refcnt 2 besteffort'
-if exact_root_qdisc lo a123: 806473; then exit 1; fi
+autotune_profile=best_overall
+export AUTOTUNE_MOCK_QDISC_STATE='qdisc cake a123: root refcnt 2 bandwidth 806.473Mbit besteffort nat'
+exact_root_qdisc lo a123: 806473 upload
+if exact_root_qdisc lo a123: 806472 upload; then exit 1; fi
+export AUTOTUNE_MOCK_QDISC_STATE='qdisc cake a123: root refcnt 2 besteffort nat'
+if exact_root_qdisc lo a123: 806473 upload; then exit 1; fi
+export AUTOTUNE_MOCK_QDISC_STATE='qdisc cake a123: root refcnt 2 bandwidth 806.473Mbit besteffort nat wash'
+exact_root_qdisc lo a123: 806473 download
+if exact_root_qdisc lo a123: 806473 upload; then exit 1; fi
+autotune_profile=gaming
+export AUTOTUNE_MOCK_QDISC_STATE='qdisc cake a123: root refcnt 2 bandwidth 806473Kbit diffserv4 nat'
+exact_root_qdisc lo a123: 806473 upload
+export AUTOTUNE_MOCK_QDISC_STATE='qdisc cake a123: root refcnt 2 bandwidth 806473Kbit diffserv4 nat wash'
+if exact_root_qdisc lo a123: 806473 upload; then exit 1; fi
+export AUTOTUNE_MOCK_QDISC_STATE='qdisc cake a123: root refcnt 2 bandwidth 806473Kbit besteffort nat'
+if exact_root_qdisc lo a123: 806473 upload; then exit 1; fi
 unset AUTOTUNE_MOCK_QDISC_STATE
 unset -f tc
+autotune_profile=best_overall
 
 # Timeout supervision owns an isolated session/process group. TERM is bounded
 # and followed by KILL, including a helper child that deliberately ignores

@@ -40,6 +40,8 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 			`networkDevices: {}, defaultDevice: 'eth1' };\nreturn { writeWizardConfig, validateTransportProbeUrl, ` +
 			`buildMwan3Context, uniqueMwan3Uplinks, multiwanInstancePlans, wizardPlanConflicts, ` +
 			`topicTab, autorateSubcategory, autorateSubcategoryDefinitions, ` +
+			`canonicalAutotuneProfile, autotuneProfilePolicy, autotuneProfileDefinitions, ` +
+			`autotuneProposalMatchesProfile, ` +
 			`autotuneResultValidated, autotuneAttemptDiagnostics, autotuneDiagnostics, ` +
 			`autotuneRuntimeSettled, autotuneLegacyResult, ` +
 			`autotuneRecoveryPending, autotuneRecoveryProgress, ` +
@@ -72,8 +74,19 @@ assert.equal(helpers.autorateSubcategory('quality', 'rating_load_enter_ratio'), 
 assert.equal(helpers.autorateSubcategory('controller', 'alpha_delta_ewma'), 'controller');
 assert.deepEqual(helpers.autorateSubcategoryDefinitions().map(group => group.id),
 	[ 'connection', 'limits', 'ceiling', 'probes', 'quality', 'controller' ]);
+assert.equal(helpers.canonicalAutotuneProfile('balanced'), 'best_overall');
+assert.equal(helpers.canonicalAutotuneProfile('unknown'), null);
+assert.deepEqual(helpers.autotuneProfileDefinitions().map(profile => profile.id),
+	[ 'gaming', 'best_overall', 'fair' ]);
+assert.equal(helpers.autotuneProfilePolicy('gaming').sqm.classification, 'diffserv4');
+assert.equal(helpers.autotuneProfilePolicy('gaming').delayMaxMs, 5);
+assert.equal(helpers.autotuneProfilePolicy('best_overall').retentionPercent, 80);
+assert.equal(helpers.autotuneProfilePolicy('fair').retentionPercent, 90);
 
 const proposal = {
+	schema_version: 2,
+	profile: 'best_overall',
+	target_grade: 'A',
 	download: {
 		minimum_kbps: 16700,
 		base_kbps: 35500,
@@ -81,6 +94,7 @@ const proposal = {
 		absolute_cap_kbps: 204200,
 		observed_low_kbps: 41700,
 		observed_median_kbps: 95000,
+		observed_high_kbps: 170000,
 	},
 	upload: {
 		minimum_kbps: 6500,
@@ -89,6 +103,7 @@ const proposal = {
 		absolute_cap_kbps: 19000,
 		observed_low_kbps: 16200,
 		observed_median_kbps: 16800,
+		observed_high_kbps: 18000,
 	},
 	active_threshold_kbps: 1600,
 	thresholds_ms: { adjust_up: 6, delay: 15, adjust_down: 40 },
@@ -99,6 +114,26 @@ const proposal = {
 		probe_s: 8,
 		cooldown_s: 45,
 		failed_bound_ttl_s: 900,
+	},
+	validation: {
+		candidate_realization_min_percent: 80,
+		candidate_realization_max_percent: 110,
+		capacity_retention_min_percent: 80,
+		icmp_delta_max_ms: 30,
+		transport_delta_max_ms: 30,
+		loss_max_percent: 3,
+		cpu_max_percent: 85,
+	},
+	sqm: {
+		qdisc: 'cake',
+		script: 'piece_of_cake.qos',
+		classification: 'besteffort',
+		squash_dscp: true,
+		squash_ingress: true,
+		ingress_ecn: 'ECN',
+		egress_ecn: 'NOECN',
+		iqdisc_opts: '',
+		eqdisc_opts: '',
 	},
 	link: { kind: 'cellular', layer: 'none', overhead: 0, mpu: 0 },
 };
@@ -143,6 +178,9 @@ assert.equal(written.adaptive_ceiling_ul_cap_kbps, '19000');
 assert.equal(written.adaptive_ceiling_cooldown_s, '45');
 assert.equal(written.transport_latency_enabled, '1');
 assert.equal(written.throughput_guard_enabled, '1');
+assert.equal(written.autotune_profile, 'best_overall');
+assert.equal(written.throughput_guard_retention_percent, '80');
+assert.equal(written.quality_target_delay_ms, '30');
 assert.equal(written.throughput_reference_dl_p20_kbps, '41700');
 assert.equal(written.throughput_reference_dl_p50_kbps, '95000');
 assert.equal(written.throughput_reference_ul_p20_kbps, '16200');
@@ -152,6 +190,14 @@ assert.equal(written.sqm_overhead, '0');
 assert.equal(written.sqm_tcMPU, '0');
 assert.equal(written.speedtest_go_server_id, '17372');
 assert.equal(written.route_mode, 'main');
+assert.equal(written.sqm_qdisc, 'cake');
+assert.equal(written.sqm_script, 'piece_of_cake.qos');
+assert.equal(written.sqm_qdisc_advanced, '0');
+assert.equal(written.sqm_qdisc_really_really_advanced, '0');
+assert.equal(written.sqm_squash_dscp, '1');
+assert.equal(written.sqm_squash_ingress, '1');
+assert.equal(written.sqm_iqdisc_opts, undefined);
+assert.equal(written.sqm_eqdisc_opts, undefined);
 
 const failedResult = {
 	state: 'failed',
@@ -385,8 +431,9 @@ const validResult = {
 	source_ip: '192.0.2.10',
 	route_identity: 'main||pppoe-wan|192.0.2.10||main',
 	external_ip: '192.0.2.20',
-	schema_version: 3,
+	schema_version: 4,
 	producer: 'cake-autorate-rs-autotune',
+	profile: 'best_overall',
 	auto_apply_eligible: true,
 	phase_evidence_complete: true,
 	phase_contamination_seen: false,
@@ -396,6 +443,14 @@ const validResult = {
 	config_fingerprint: `sha256:${'a'.repeat(64)}`,
 	conservative: false,
 	confidence_mode: 'normal',
+	validation_thresholds: {
+		candidate_realization_min_percent: 80,
+		candidate_realization_max_percent: 110,
+		capacity_retention_min_percent: 80,
+		delay_max_ms: 30,
+		loss_max_percent: 3,
+		cpu_max_percent: 85,
+	},
 	proposal,
 	phase_background: [
 		{ phase: 'baseline', icmp_valid: true, transport_valid: true, forwarded_background: cleanBackground() },
@@ -420,6 +475,57 @@ const validAttestation = {
 	route_identity: validResult.route_identity,
 };
 assert.equal(helpers.autotuneResultValidated(validResult), true);
+const resultForProfile = (profile, targetGrade, retention, delay, loss, sqm) => ({
+	...validResult,
+	profile,
+	validation_thresholds: {
+		...validResult.validation_thresholds,
+		capacity_retention_min_percent: retention,
+		delay_max_ms: delay,
+		loss_max_percent: loss,
+	},
+	proposal: {
+		...proposal,
+		profile,
+		target_grade: targetGrade,
+		validation: {
+			...proposal.validation,
+			capacity_retention_min_percent: retention,
+			icmp_delta_max_ms: delay,
+			transport_delta_max_ms: delay,
+			loss_max_percent: loss,
+		},
+		sqm,
+	},
+});
+const gamingResult = resultForProfile('gaming', 'A+', 70, 5, 1, {
+	qdisc: 'cake',
+	script: 'layer_cake.qos',
+	classification: 'diffserv4',
+	squash_dscp: false,
+	squash_ingress: false,
+	ingress_ecn: 'ECN',
+	egress_ecn: 'NOECN',
+	iqdisc_opts: 'diffserv4',
+	eqdisc_opts: 'diffserv4',
+});
+const fairResult = resultForProfile('fair', 'B', 90, 60, 5, proposal.sqm);
+assert.equal(helpers.autotuneResultValidated(gamingResult), true);
+assert.equal(helpers.autotuneResultValidated(fairResult), true);
+assert.equal(helpers.autotuneResultValidated({
+	...gamingResult,
+	proposal: {
+		...gamingResult.proposal,
+		sqm: { ...gamingResult.proposal.sqm, classification: 'besteffort' },
+	},
+}), false, 'Gaming must fail closed if diffserv4 is removed');
+assert.equal(helpers.autotuneResultValidated({
+	...fairResult,
+	validation_thresholds: {
+		...fairResult.validation_thresholds,
+		capacity_retention_min_percent: 80,
+	},
+}), false, 'Fair must fail closed if its throughput floor is weakened');
 assert.equal(helpers.autotuneResultValidated({
 	...validResult,
 	phase_background: [
@@ -438,7 +544,7 @@ assert.equal(helpers.autotuneResultValidated({
 }), false);
 assert.equal(helpers.autotuneResultValidated({
 	state: 'complete', proposal, validation: { pass: true },
-}), false, 'legacy pass without RC17 phase evidence must fail closed');
+}), false, 'legacy pass without current phase evidence must fail closed');
 assert.equal(helpers.autotuneResultValidated({
 	...validResult,
 	phase_evidence_complete: false,
@@ -761,11 +867,13 @@ async function testAutotuneTerminalPrecedence() {
 		assert.deepEqual(freshCalls, [
 			{
 				command: '/usr/libexec/cake-autorate-rs/autotune',
-				args: [ 'wan_sqm', 'pppoe-wan', 'status', 'speedtest-go' ],
+				args: [ 'wan_sqm', 'pppoe-wan', 'status', 'speedtest-go',
+					'main', '', 'best_overall' ],
 			},
 			{
 				command: '/usr/libexec/cake-autorate-rs/autotune',
-				args: [ 'wan_sqm', 'pppoe-wan', 'attest', 'speedtest-go', 'main', '' ],
+				args: [ 'wan_sqm', 'pppoe-wan', 'attest', 'speedtest-go',
+					'main', '', 'best_overall' ],
 			},
 		], 'proposal staging must re-read the terminal result and recompute live UCI/route identity');
 

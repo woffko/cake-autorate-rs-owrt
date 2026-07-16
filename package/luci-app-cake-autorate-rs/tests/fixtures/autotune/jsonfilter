@@ -29,6 +29,12 @@ case "$expression" in
 	'@.producer')
 		printf '%s\n' "$input" | sed -n 's/.*"producer":"\([^"]*\)".*/\1/p'
 		;;
+	'@.profile')
+		printf '%s\n' "$input" | sed -n 's/.*"profile":"\([^"]*\)".*/\1/p'
+		;;
+	'@.target_grade')
+		printf '%s\n' "$input" | sed -n 's/.*"target_grade":"\([^"]*\)".*/\1/p'
+		;;
 	'@.target_interface')
 		printf '%s\n' "$input" | sed -n 's/.*"target_interface":"\([^"]*\)".*/\1/p'
 		;;
@@ -101,6 +107,9 @@ case "$expression" in
 	'@.download.observed_median_kbps')
 		printf '%s\n' "$input" | sed -n 's/.*"download":{[^}]*"observed_median_kbps":\([0-9][0-9]*\).*/\1/p'
 		;;
+	'@.download.observed_high_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"download":{[^}]*"observed_high_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
 	'@.upload.observed_low_kbps')
 		printf '%s\n' "$input" | sed -n 's/.*"upload":{[^}]*"observed_low_kbps":\([0-9][0-9]*\).*/\1/p'
 		;;
@@ -109,6 +118,9 @@ case "$expression" in
 		;;
 	'@.upload.observed_median_kbps')
 		printf '%s\n' "$input" | sed -n 's/.*"upload":{[^}]*"observed_median_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.upload.observed_high_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"upload":{[^}]*"observed_high_kbps":\([0-9][0-9]*\).*/\1/p'
 		;;
 	'@.active_threshold_kbps')
 		printf '%s\n' "$input" | sed -n 's/.*"active_threshold_kbps":\([0-9][0-9]*\).*/\1/p'
@@ -121,6 +133,72 @@ case "$expression" in
 		;;
 	'@.thresholds_ms.adjust_down')
 		printf '%s\n' "$input" | sed -n 's/.*"thresholds_ms":{[^}]*"adjust_down":\([0-9.][0-9.]*\).*/\1/p'
+		;;
+	'@.adaptive_ceiling.enabled')
+		printf '%s\n' "$input" | sed -n 's/.*"adaptive_ceiling":{"enabled":\(true\|false\).*/\1/p'
+		;;
+	'@.adaptive_ceiling.hold_s')
+		printf '%s\n' "$input" | sed -n 's/.*"adaptive_ceiling":{[^}]*"hold_s":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.adaptive_ceiling.growth_percent')
+		printf '%s\n' "$input" | sed -n 's/.*"adaptive_ceiling":{[^}]*"growth_percent":\([0-9.][0-9.]*\).*/\1/p'
+		;;
+	'@.adaptive_ceiling.probe_s')
+		printf '%s\n' "$input" | sed -n 's/.*"adaptive_ceiling":{[^}]*"probe_s":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.adaptive_ceiling.cooldown_s')
+		printf '%s\n' "$input" | sed -n 's/.*"adaptive_ceiling":{[^}]*"cooldown_s":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.adaptive_ceiling.failed_bound_ttl_s')
+		printf '%s\n' "$input" | sed -n 's/.*"adaptive_ceiling":{[^}]*"failed_bound_ttl_s":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.validation.candidate_realization_min_percent')
+		printf '%s\n' "$input" | sed -n 's/.*"validation":{"candidate_realization_min_percent":\([0-9.][0-9.]*\).*/\1/p'
+		;;
+	'@.validation.candidate_realization_max_percent')
+		printf '%s\n' "$input" | sed -n 's/.*"validation":{[^}]*"candidate_realization_max_percent":\([0-9.][0-9.]*\).*/\1/p'
+		;;
+	'@.validation.capacity_retention_min_percent')
+		printf '%s\n' "$input" | sed -n 's/.*"validation":{[^}]*"capacity_retention_min_percent":\([0-9.][0-9.]*\).*/\1/p'
+		;;
+	'@.validation.icmp_delta_max_ms')
+		printf '%s\n' "$input" | sed -n 's/.*"validation":{[^}]*"icmp_delta_max_ms":\([0-9.][0-9.]*\).*/\1/p'
+		;;
+	'@.validation.transport_delta_max_ms')
+		printf '%s\n' "$input" | sed -n 's/.*"validation":{[^}]*"transport_delta_max_ms":\([0-9.][0-9.]*\).*/\1/p'
+		;;
+	'@.validation.loss_max_percent')
+		printf '%s\n' "$input" | sed -n 's/.*"validation":{[^}]*"loss_max_percent":\([0-9.][0-9.]*\).*/\1/p'
+		;;
+	'@.validation.cpu_max_percent')
+		printf '%s\n' "$input" | sed -n 's/.*"validation":{[^}]*"cpu_max_percent":\([0-9.][0-9.]*\).*/\1/p'
+		;;
+	'@.sqm.qdisc')
+		printf '%s\n' "$input" | sed -n 's/.*"sqm":{"qdisc":"\([^"]*\)".*/\1/p'
+		;;
+	'@.sqm.script')
+		printf '%s\n' "$input" | sed -n 's/.*"sqm":{[^}]*"script":"\([^"]*\)".*/\1/p'
+		;;
+	'@.sqm.classification')
+		printf '%s\n' "$input" | sed -n 's/.*"sqm":{[^}]*"classification":"\([^"]*\)".*/\1/p'
+		;;
+	'@.sqm.squash_dscp')
+		printf '%s\n' "$input" | sed -n 's/.*"sqm":{[^}]*"squash_dscp":\(true\|false\).*/\1/p'
+		;;
+	'@.sqm.squash_ingress')
+		printf '%s\n' "$input" | sed -n 's/.*"sqm":{[^}]*"squash_ingress":\(true\|false\).*/\1/p'
+		;;
+	'@.sqm.ingress_ecn')
+		printf '%s\n' "$input" | sed -n 's/.*"sqm":{[^}]*"ingress_ecn":"\([^"]*\)".*/\1/p'
+		;;
+	'@.sqm.egress_ecn')
+		printf '%s\n' "$input" | sed -n 's/.*"sqm":{[^}]*"egress_ecn":"\([^"]*\)".*/\1/p'
+		;;
+	'@.sqm.iqdisc_opts')
+		printf '%s\n' "$input" | sed -n 's/.*"sqm":{[^}]*"iqdisc_opts":"\([^"]*\)".*/\1/p'
+		;;
+	'@.sqm.eqdisc_opts')
+		printf '%s\n' "$input" | sed -n 's/.*"sqm":{[^}]*"eqdisc_opts":"\([^"]*\)".*/\1/p'
 		;;
 	'@.link.layer')
 		printf '%s\n' "$input" | sed -n 's/.*"link":{[^}]*"layer":"\([^"]*\)".*/\1/p'

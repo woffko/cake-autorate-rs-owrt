@@ -14,6 +14,8 @@ retry_delay_s="${CAKE_AUTOTUNE_SCHEDULER_RETRY_DELAY_S:-900}"
 poll_interval_s="${CAKE_AUTOTUNE_SCHEDULER_POLL_INTERVAL_S:-5}"
 job_timeout_s="${CAKE_AUTOTUNE_SCHEDULER_JOB_TIMEOUT_S:-1800}"
 recovery_root="$state_root/recovery"
+autotune_result_producer="cake-autorate-rs-autotune"
+absent_candidate_marker="__CAKE_AUTOTUNE_OPTION_ABSENT__"
 
 mkdir -p "$state_root"
 
@@ -228,6 +230,16 @@ is_decimal_between() {
 		'BEGIN { exit !(value >= minimum && value <= maximum) }'
 }
 
+numbers_equal() {
+	is_decimal_between "$1" 0 100000000 || return 1
+	is_decimal_between "$2" 0 100000000 || return 1
+	awk -v first="$1" -v second="$2" 'BEGIN {
+		delta = (first + 0) - (second + 0)
+		if (delta < 0) delta = -delta
+		exit(delta > 0.000001)
+	}'
+}
+
 result_has_exact_passing_gates() (
 	gate_json="$1"
 	gate_codes="$(extract "$gate_json" '@.validation.gates[*].code')" || return 1
@@ -235,6 +247,17 @@ result_has_exact_passing_gates() (
 	gate_actuals="$(extract "$gate_json" '@.validation.gates[*].actual')" || return 1
 	gate_limits="$(extract "$gate_json" '@.validation.gates[*].limit')" || return 1
 	gate_comparisons="$(extract "$gate_json" '@.validation.gates[*].comparison')" || return 1
+	expected_realization_min="$(extract "$gate_json" '@.validation_thresholds.candidate_realization_min_percent')" || return 1
+	expected_realization_max="$(extract "$gate_json" '@.validation_thresholds.candidate_realization_max_percent')" || return 1
+	expected_retention="$(extract "$gate_json" '@.validation_thresholds.capacity_retention_min_percent')" || return 1
+	expected_delay="$(extract "$gate_json" '@.validation_thresholds.delay_max_ms')" || return 1
+	expected_loss="$(extract "$gate_json" '@.validation_thresholds.loss_max_percent')" || return 1
+	expected_cpu="$(extract "$gate_json" '@.validation_thresholds.cpu_max_percent')" || return 1
+	for expected_gate_limit in "$expected_realization_min" "$expected_realization_max" \
+		"$expected_retention" "$expected_delay" "$expected_loss" "$expected_cpu"
+	do
+		is_decimal_between "$expected_gate_limit" 0.001 100000000 || return 1
+	done
 	# jsonfilter emits a whitespace-separated vector. Disable pathname expansion
 	# inside this subshell before every deliberate tokenization so a hostile gate
 	# token can never expand against files in the scheduler working directory.
@@ -286,7 +309,11 @@ result_has_exact_passing_gates() (
 	# actual/limit pair and require the comparison kind dictated by its code.
 	awk -v codes="$gate_codes" -v passes="$gate_passes" \
 		-v actuals="$gate_actuals" -v limits="$gate_limits" \
-		-v comparisons="$gate_comparisons" 'BEGIN {
+		-v comparisons="$gate_comparisons" \
+		-v realization_min="$expected_realization_min" \
+		-v realization_max="$expected_realization_max" \
+		-v retention="$expected_retention" -v delay="$expected_delay" \
+		-v loss="$expected_loss" -v cpu="$expected_cpu" 'BEGIN {
 		n = split(codes, code, " ")
 		if (split(passes, pass, " ") != n || split(actuals, actual, " ") != n ||
 		    split(limits, limit, " ") != n || split(comparisons, comparison, " ") != n)
@@ -297,6 +324,29 @@ result_has_exact_passing_gates() (
 			            code[i] == "download-capacity-retention" ||
 			            code[i] == "upload-capacity-retention") ? "minimum" : "maximum"
 			if (pass[i] != "true" || comparison[i] != expected)
+				exit 1
+			if (code[i] == "download-candidate-realization" ||
+			    code[i] == "upload-candidate-realization")
+				expected_limit = realization_min
+			else if (code[i] == "download-candidate-realization-maximum" ||
+			         code[i] == "upload-candidate-realization-maximum")
+				expected_limit = realization_max
+			else if (code[i] == "download-capacity-retention" ||
+			         code[i] == "upload-capacity-retention")
+				expected_limit = retention
+			else if (code[i] == "download-icmp-latency" ||
+			         code[i] == "download-transport-latency" ||
+			         code[i] == "upload-icmp-latency" ||
+			         code[i] == "upload-transport-latency")
+				expected_limit = delay
+			else if (code[i] == "download-packet-loss" ||
+			         code[i] == "upload-packet-loss")
+				expected_limit = loss
+			else
+				expected_limit = cpu
+			delta = (limit[i] + 0) - (expected_limit + 0)
+			if (delta < 0) delta = -delta
+			if (delta > 0.000001)
 				exit 1
 			if (expected == "minimum" && actual[i] + 0 < limit[i] + 0)
 				exit 1
@@ -309,6 +359,12 @@ result_has_exact_passing_gates() (
 
 result_proposal_is_safe() {
 	proposal_json="$1"
+	result_profile="$(extract "$proposal_json" '@.profile')"
+	proposal_schema="$(extract "$proposal_json" '@.proposal.schema_version')"
+	proposal_profile="$(extract "$proposal_json" '@.proposal.profile')"
+	proposal_target_grade="$(extract "$proposal_json" '@.proposal.target_grade')"
+	[ "$proposal_schema" = 2 ] && [ "$result_profile" = "$proposal_profile" ] || return 1
+	case "$result_profile" in gaming|best_overall|fair) ;; *) return 1 ;; esac
 	dl_min="$(extract "$proposal_json" '@.proposal.download.minimum_kbps')"
 	dl_base="$(extract "$proposal_json" '@.proposal.download.base_kbps')"
 	dl_max="$(extract "$proposal_json" '@.proposal.download.maximum_kbps')"
@@ -336,6 +392,28 @@ result_proposal_is_safe() {
 	link_mpu="$(extract "$proposal_json" '@.proposal.link.mpu')"
 	link_layer="$(extract "$proposal_json" '@.proposal.link.layer')"
 	proposal_confidence="$(extract "$proposal_json" '@.proposal.confidence')"
+	validation_realization_min="$(extract "$proposal_json" '@.proposal.validation.candidate_realization_min_percent')"
+	validation_realization_max="$(extract "$proposal_json" '@.proposal.validation.candidate_realization_max_percent')"
+	validation_retention="$(extract "$proposal_json" '@.proposal.validation.capacity_retention_min_percent')"
+	validation_icmp="$(extract "$proposal_json" '@.proposal.validation.icmp_delta_max_ms')"
+	validation_transport="$(extract "$proposal_json" '@.proposal.validation.transport_delta_max_ms')"
+	validation_loss="$(extract "$proposal_json" '@.proposal.validation.loss_max_percent')"
+	validation_cpu="$(extract "$proposal_json" '@.proposal.validation.cpu_max_percent')"
+	result_validation_realization_min="$(extract "$proposal_json" '@.validation_thresholds.candidate_realization_min_percent')"
+	result_validation_realization_max="$(extract "$proposal_json" '@.validation_thresholds.candidate_realization_max_percent')"
+	result_validation_retention="$(extract "$proposal_json" '@.validation_thresholds.capacity_retention_min_percent')"
+	result_validation_delay="$(extract "$proposal_json" '@.validation_thresholds.delay_max_ms')"
+	result_validation_loss="$(extract "$proposal_json" '@.validation_thresholds.loss_max_percent')"
+	result_validation_cpu="$(extract "$proposal_json" '@.validation_thresholds.cpu_max_percent')"
+	sqm_qdisc="$(extract "$proposal_json" '@.proposal.sqm.qdisc')"
+	sqm_script="$(extract "$proposal_json" '@.proposal.sqm.script')"
+	sqm_classification="$(extract "$proposal_json" '@.proposal.sqm.classification')"
+	sqm_squash_dscp="$(extract "$proposal_json" '@.proposal.sqm.squash_dscp')"
+	sqm_squash_ingress="$(extract "$proposal_json" '@.proposal.sqm.squash_ingress')"
+	sqm_ingress_ecn="$(extract "$proposal_json" '@.proposal.sqm.ingress_ecn')"
+	sqm_egress_ecn="$(extract "$proposal_json" '@.proposal.sqm.egress_ecn')"
+	sqm_iqdisc_opts="$(extract "$proposal_json" '@.proposal.sqm.iqdisc_opts')"
+	sqm_eqdisc_opts="$(extract "$proposal_json" '@.proposal.sqm.eqdisc_opts')"
 
 	for rate_value in "$dl_min" "$dl_base" "$dl_max" "$dl_cap" "$dl_low" "$dl_median" "$dl_high" \
 		"$ul_min" "$ul_base" "$ul_max" "$ul_cap" "$ul_low" "$ul_median" "$ul_high"
@@ -361,6 +439,54 @@ result_proposal_is_safe() {
 	is_uint_between "$link_mpu" 0 65535 || return 1
 	is_uint_between "$proposal_confidence" 1 100 || return 1
 	case "$link_layer" in none|ethernet|atm) ;; *) return 1 ;; esac
+	numbers_equal "$validation_realization_min" 80 || return 1
+	numbers_equal "$validation_realization_max" 110 || return 1
+	numbers_equal "$validation_cpu" 85 || return 1
+	numbers_equal "$result_validation_realization_min" "$validation_realization_min" || return 1
+	numbers_equal "$result_validation_realization_max" "$validation_realization_max" || return 1
+	numbers_equal "$result_validation_retention" "$validation_retention" || return 1
+	numbers_equal "$result_validation_delay" "$validation_transport" || return 1
+	numbers_equal "$result_validation_loss" "$validation_loss" || return 1
+	numbers_equal "$result_validation_cpu" "$validation_cpu" || return 1
+	numbers_equal "$validation_icmp" "$validation_transport" || return 1
+	[ "$sqm_qdisc" = cake ] && [ "$sqm_ingress_ecn" = ECN ] &&
+		[ "$sqm_egress_ecn" = NOECN ] || return 1
+	case "$result_profile" in
+		gaming)
+			[ "$proposal_target_grade" = A+ ] &&
+				numbers_equal "$validation_retention" 70 &&
+				numbers_equal "$validation_transport" 5 &&
+				numbers_equal "$validation_loss" 1 &&
+				[ "$sqm_script" = layer_cake.qos ] &&
+				[ "$sqm_classification" = diffserv4 ] &&
+				[ "$sqm_squash_dscp" = false ] &&
+				[ "$sqm_squash_ingress" = false ] &&
+				[ "$sqm_iqdisc_opts" = diffserv4 ] &&
+				[ "$sqm_eqdisc_opts" = diffserv4 ] || return 1
+			;;
+		best_overall)
+			[ "$proposal_target_grade" = A ] &&
+				numbers_equal "$validation_retention" 80 &&
+				numbers_equal "$validation_transport" 30 &&
+				numbers_equal "$validation_loss" 3 || return 1
+			;;
+		fair)
+			[ "$proposal_target_grade" = B ] &&
+				numbers_equal "$validation_retention" 90 &&
+				numbers_equal "$validation_transport" 60 &&
+				numbers_equal "$validation_loss" 5 || return 1
+			;;
+	esac
+	case "$result_profile" in
+		best_overall|fair)
+			[ "$sqm_script" = piece_of_cake.qos ] &&
+				[ "$sqm_classification" = besteffort ] &&
+				[ "$sqm_squash_dscp" = true ] &&
+				[ "$sqm_squash_ingress" = true ] &&
+				[ -z "$sqm_iqdisc_opts" ] &&
+				[ -z "$sqm_eqdisc_opts" ] || return 1
+			;;
+	esac
 }
 
 route_attestation_matches_result() {
@@ -429,6 +555,7 @@ result_is_auto_apply_eligible() {
 	gate_result="$1"
 	gate_state="$(extract "$gate_result" '@.state')"
 	gate_schema_version="$(extract "$gate_result" '@.schema_version')"
+	gate_producer="$(extract "$gate_result" '@.producer')"
 	gate_validation_pass="$(extract "$gate_result" '@.validation.pass')"
 	gate_auto_apply_eligible="$(extract "$gate_result" '@.auto_apply_eligible')"
 	gate_confidence_mode="$(extract "$gate_result" '@.confidence_mode')"
@@ -445,8 +572,8 @@ result_is_auto_apply_eligible() {
 	# confidence, contaminated, or otherwise unknown evidence must never become
 	# a configuration change merely because the helper reported "complete".
 	[ "$gate_state" = complete ] || return 1
-	case "$gate_schema_version" in ''|*[!0-9]*) return 1 ;; esac
-	[ "$gate_schema_version" -ge 3 ] || return 1
+	[ "$gate_schema_version" = 4 ] || return 1
+	[ "$gate_producer" = "$autotune_result_producer" ] || return 1
 	[ "$gate_validation_pass" = true ] || return 1
 	[ "$gate_auto_apply_eligible" = true ] || return 1
 	[ "$gate_confidence_mode" = normal ] || return 1
@@ -523,16 +650,34 @@ stage_candidate_option() {
 	case "$stage_option" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
 	case "$stage_value" in *'|'*|*'
 '*) return 1 ;; esac
+	[ "$stage_value" != "$absent_candidate_marker" ] || return 1
 	if stage_previous="$(uci -q get "cake-autorate.$section.$stage_option" 2>/dev/null)"; then
 		stage_present=1
 		case "$stage_previous" in *'|'*|*'
 '*) return 1 ;; esac
+		[ "$stage_previous" != "$absent_candidate_marker" ] || return 1
 	else
 		stage_present=0
 		stage_previous=""
 	fi
 	printf '%s|%s|%s|%s\n' "$stage_option" "$stage_present" "$stage_previous" "$stage_value" >> "$ownership_journal"
 	uci -q -P "$transaction_savedir" set "cake-autorate.$section.$stage_option=$stage_value" || return 1
+}
+
+stage_candidate_absent_option() {
+	stage_option="$1"
+	case "$stage_option" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+	if stage_previous="$(uci -q get "cake-autorate.$section.$stage_option" 2>/dev/null)"; then
+		stage_present=1
+		case "$stage_previous" in *'|'*|*'
+'*) return 1 ;; esac
+		[ "$stage_previous" != "$absent_candidate_marker" ] || return 1
+	else
+		return 0
+	fi
+	printf '%s|%s|%s|%s\n' "$stage_option" "$stage_present" "$stage_previous" \
+		"$absent_candidate_marker" >> "$ownership_journal"
+	uci -q -P "$transaction_savedir" delete "cake-autorate.$section.$stage_option" || return 1
 }
 
 prepare_recovery_root() {
@@ -631,13 +776,18 @@ recover_apply_transaction_locked() {
 		case "$rollback_previous:$rollback_candidate" in *'|'*|*'
 '*) return 1 ;; esac
 		[ -n "$rollback_candidate" ] || return 1
+		[ "$rollback_previous" != "$absent_candidate_marker" ] || return 1
 		if rollback_current="$(uci -q get "cake-autorate.$recovery_section.$rollback_option" 2>/dev/null)"; then
 			rollback_current_present=1
 		else
 			rollback_current_present=0
 			rollback_current=""
 		fi
-		if [ "$rollback_current_present" -eq 1 ] && [ "$rollback_current" = "$rollback_candidate" ]; then
+		if { [ "$rollback_candidate" = "$absent_candidate_marker" ] &&
+		     [ "$rollback_current_present" -eq 0 ]; } ||
+		   { [ "$rollback_candidate" != "$absent_candidate_marker" ] &&
+		     [ "$rollback_current_present" -eq 1 ] &&
+		     [ "$rollback_current" = "$rollback_candidate" ]; }; then
 			if [ "$rollback_present" -eq 1 ]; then
 				uci -q -P "$rollback_savedir" set "cake-autorate.$recovery_section.$rollback_option=$rollback_previous" || return 1
 			else
@@ -759,6 +909,17 @@ apply_result() (
 	ul_cap="$(extract "$result" '@.proposal.upload.absolute_cap_kbps')"
 	ul_low="$(extract "$result" '@.proposal.upload.observed_low_kbps')"
 	ul_median="$(extract "$result" '@.proposal.upload.observed_median_kbps')"
+	profile="$(extract "$result" '@.profile')"
+	retention="$(extract "$result" '@.proposal.validation.capacity_retention_min_percent')"
+	target_delay="$(extract "$result" '@.proposal.validation.transport_delta_max_ms')"
+	sqm_qdisc="$(extract "$result" '@.proposal.sqm.qdisc')"
+	sqm_script="$(extract "$result" '@.proposal.sqm.script')"
+	sqm_squash_dscp="$(extract "$result" '@.proposal.sqm.squash_dscp')"
+	sqm_squash_ingress="$(extract "$result" '@.proposal.sqm.squash_ingress')"
+	sqm_ingress_ecn="$(extract "$result" '@.proposal.sqm.ingress_ecn')"
+	sqm_egress_ecn="$(extract "$result" '@.proposal.sqm.egress_ecn')"
+	sqm_iqdisc_opts="$(extract "$result" '@.proposal.sqm.iqdisc_opts')"
+	sqm_eqdisc_opts="$(extract "$result" '@.proposal.sqm.eqdisc_opts')"
 	result_is_auto_apply_eligible "$result" || exit 1
 	configuration_has_pending_changes || exit 1
 	result_matches_apply_context "$section" "$expected_interface" "$expected_fingerprint" "$result" || exit 1
@@ -774,6 +935,9 @@ apply_result() (
 	stage_candidate_option adaptive_ceiling_ul_cap_kbps "$ul_cap" || exit 1
 	stage_candidate_option transport_latency_enabled 1 || exit 1
 	stage_candidate_option throughput_guard_enabled 1 || exit 1
+	stage_candidate_option autotune_profile "$profile" || exit 1
+	stage_candidate_option throughput_guard_retention_percent "$retention" || exit 1
+	stage_candidate_option quality_target_delay_ms "$target_delay" || exit 1
 	stage_candidate_option throughput_reference_dl_p20_kbps "$dl_low" || exit 1
 	stage_candidate_option throughput_reference_dl_p50_kbps "$dl_median" || exit 1
 	stage_candidate_option throughput_reference_ul_p20_kbps "$ul_low" || exit 1
@@ -806,6 +970,25 @@ apply_result() (
 	link_layer="$(extract "$result" '@.proposal.link.layer')"
 	case "$link_layer" in none|ethernet|atm) ;; *) exit 1 ;; esac
 	stage_candidate_option sqm_linklayer "$link_layer" || exit 1
+	stage_candidate_option sqm_qdisc "$sqm_qdisc" || exit 1
+	stage_candidate_option sqm_script "$sqm_script" || exit 1
+	stage_candidate_option sqm_squash_dscp \
+		"$([ "$sqm_squash_dscp" = true ] && printf 1 || printf 0)" || exit 1
+	stage_candidate_option sqm_squash_ingress \
+		"$([ "$sqm_squash_ingress" = true ] && printf 1 || printf 0)" || exit 1
+	stage_candidate_option sqm_ingress_ecn "$sqm_ingress_ecn" || exit 1
+	stage_candidate_option sqm_egress_ecn "$sqm_egress_ecn" || exit 1
+	if [ "$profile" = gaming ]; then
+		stage_candidate_option sqm_qdisc_advanced 1 || exit 1
+		stage_candidate_option sqm_qdisc_really_really_advanced 1 || exit 1
+		stage_candidate_option sqm_iqdisc_opts "$sqm_iqdisc_opts" || exit 1
+		stage_candidate_option sqm_eqdisc_opts "$sqm_eqdisc_opts" || exit 1
+	else
+		stage_candidate_option sqm_qdisc_advanced 0 || exit 1
+		stage_candidate_option sqm_qdisc_really_really_advanced 0 || exit 1
+		stage_candidate_absent_option sqm_iqdisc_opts || exit 1
+		stage_candidate_absent_option sqm_eqdisc_opts || exit 1
+	fi
 
 	# The proposal may have spent many seconds in extraction/staging.  Repeat
 	# every trust check at the last possible point before the private UCI delta
@@ -858,13 +1041,22 @@ run_section() {
 	expected_fingerprint="$5"
 	backend="$(uci -q get "cake-autorate.$section.speedtest_backend" 2>/dev/null)"
 	[ -n "$backend" ] || backend=auto
+	profile="$(uci -q get "cake-autorate.$section.autotune_profile" 2>/dev/null)"
+	case "$profile" in
+		gaming|fair) ;;
+		best_overall|best-overall|balanced|'') profile=best_overall ;;
+		*)
+			write_state "$section" deferred "Scheduled Full Auto-Tune profile is invalid"
+			return
+			;;
+	esac
 	configuration_has_pending_changes &&
 		[ "$(configuration_fingerprint "$section")" = "$expected_fingerprint" ] || {
 			write_state "$section" deferred "Configuration changed before scheduled Full Auto-Tune could start"
 			return
 		}
 	write_state "$section" running "Scheduled Full Auto-Tune is running"
-	"$helper" "$section" "$interface" start "$backend" >/dev/null 2>&1 || {
+	"$helper" "$section" "$interface" start "$backend" "" "" "$profile" 0 >/dev/null 2>&1 || {
 		finish_attempt_accounting "$section" "$interface" "$bytes_before"
 		write_state "$section" failed "Unable to start scheduled Full Auto-Tune"
 		return
@@ -873,7 +1065,7 @@ run_section() {
 	deadline="$((now + job_timeout_s))"
 	state=running
 	while [ "$(date +%s)" -lt "$deadline" ]; do
-		if ! result="$("$helper" "$section" "$interface" status "$backend" 2>/dev/null)"; then
+		if ! result="$("$helper" "$section" "$interface" status "$backend" "" "" "$profile" 0 2>/dev/null)"; then
 			finish_attempt_accounting "$section" "$interface" "$bytes_before"
 			write_state "$section" failed "Scheduled Full Auto-Tune status could not be read; no result was trusted"
 			return
@@ -908,7 +1100,7 @@ run_section() {
 		if [ "$state" = recovery-pending ]; then
 			write_state "$section" recovery-pending "Full Auto-Tune runtime recovery is still pending; the scheduler will retry only after it settles"
 		else
-			if ! "$helper" "$section" "$interface" cancel "$backend" >/dev/null 2>&1; then
+			if ! "$helper" "$section" "$interface" cancel "$backend" "" "" "$profile" 0 >/dev/null 2>&1; then
 				write_state "$section" failed "Scheduled Full Auto-Tune timed out and cancellation could not be confirmed"
 			else
 				write_state "$section" failed "Scheduled Full Auto-Tune timed out"
@@ -918,6 +1110,11 @@ run_section() {
 		return
 	}
 
+	if [ "$(extract "$result" '@.profile' 2>/dev/null)" != "$profile" ]; then
+		finish_attempt_accounting "$section" "$interface" "$bytes_before"
+		write_state "$section" failed "Scheduled Full Auto-Tune returned a different calibration profile; no result was trusted"
+		return
+	fi
 	finish_attempt_accounting "$section" "$interface" "$bytes_before"
 	printf '%s\n' "$(date +%s)" > "$state_root/$section.last"
 	if [ "$(uci -q get "cake-autorate.$section.scheduled_autotune_auto_apply" 2>/dev/null)" = 1 ]; then
