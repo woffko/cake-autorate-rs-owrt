@@ -27,7 +27,7 @@ function historyPath(section) {
 }
 
 function readStatus(section) {
-	return L.resolveDefault(fs.read_direct(statusPath(section)).then(JSON.parse), null);
+	return L.resolveDefault(fs.read(statusPath(section)).then(JSON.parse), null);
 }
 
 function parseHistory(data) {
@@ -488,9 +488,10 @@ function collectChartEvents(geometry) {
 
 		var phase = point.ratingPhase || '';
 		if (phase && phase !== previousPhase && phase !== 'IDLE') {
-			var progress = '%s %s/%s'.format(phase,
-				point.ratingDlSamples == null ? 0 : point.ratingDlSamples,
-				point.ratingUlSamples == null ? 0 : point.ratingUlSamples);
+			var dlSamples = point.ratingDlSamples == null ? 0 : point.ratingDlSamples;
+			var ulSamples = point.ratingUlSamples == null ? 0 : point.ratingUlSamples;
+			var progress = dlSamples || ulSamples ?
+				'%s %s/%s'.format(phase, dlSamples, ulSamples) : phase;
 			events.push({
 				timestamp: point.timestamp,
 				kind: 'rating',
@@ -516,7 +517,13 @@ function clusterChartEvents(geometry, events) {
 		var x = chartX(geometry, event.timestamp);
 		var cluster = clusters.length ? clusters[clusters.length - 1] : null;
 
-		if (!cluster || x - cluster.firstX > GRAPH_EVENT_CLUSTER_DISTANCE_PX) {
+		/*
+		 * Use the previous event, not the first event in the cluster, as the
+		 * density boundary.  Otherwise a sequence at x=0,10,20 is split into
+		 * two labels even though every adjacent pair belongs to one visual
+		 * burst.  The two resulting labels then collide above the chart.
+		 */
+		if (!cluster || x - cluster.lastX > GRAPH_EVENT_CLUSTER_DISTANCE_PX) {
 			clusters.push({
 				timestamp: event.timestamp,
 				x: x,
@@ -566,19 +573,25 @@ function chartEventClusters(geometry) {
 }
 
 function eventLabelPlacement(ctx, geometry, cluster, label) {
-	var width = ctx.measureText(label).width + 7;
+	var textWidth = ctx.measureText(label).width;
+	var width = textWidth + 7;
+	var leftEdge = geometry.left + 3;
 	var rightEdge = geometry.width - geometry.right;
 	var align = cluster.x + 3 + width <= rightEdge ? 'left' : 'right';
 	var textX = align === 'left' ? cluster.x + 3 : cluster.x - 3;
-	var start = align === 'left' ? textX : textX - width;
+	if (align === 'left')
+		textX = Math.max(leftEdge, Math.min(textX, rightEdge - textWidth - 3));
+	else
+		textX = Math.min(rightEdge - 3, Math.max(textX, leftEdge + textWidth));
+	var start = align === 'left' ? textX : textX - textWidth;
 
 	return {
 		label: label,
 		width: width,
 		align: align,
 		textX: textX,
-		start: Math.max(geometry.left, start),
-		end: Math.min(rightEdge, start + width)
+		start: Math.max(geometry.left, start - 3),
+		end: Math.min(rightEdge, start + textWidth + 3)
 	};
 }
 
@@ -614,7 +627,7 @@ function layoutEventLabels(ctx, geometry, clusters) {
 	});
 }
 
-function drawChartEvents(ctx, geometry) {
+function drawChartEvents(ctx, geometry, showLabels) {
 	var layouts = layoutEventLabels(ctx, geometry, chartEventClusters(geometry));
 
 	layouts.forEach(function(layout) {
@@ -625,7 +638,7 @@ function drawChartEvents(ctx, geometry) {
 		ctx.moveTo(layout.x, geometry.top);
 		ctx.lineTo(layout.x, geometry.top + geometry.plotHeight);
 		ctx.stroke();
-		if (layout.label) {
+		if (showLabels !== false && layout.label) {
 			ctx.setLineDash([]);
 			ctx.fillStyle = layout.cluster.color;
 			ctx.textAlign = layout.textAlign;
@@ -725,7 +738,7 @@ function drawTrafficChart(canvas, geometry, showFloors) {
 		drawLine(ctx, geometry, 'dlFloor', rateY, '#74a9cf', true);
 		drawLine(ctx, geometry, 'ulFloor', rateY, '#f6b26b', true);
 	}
-	drawChartEvents(ctx, geometry);
+	drawChartEvents(ctx, geometry, false);
 	return rateMax;
 }
 

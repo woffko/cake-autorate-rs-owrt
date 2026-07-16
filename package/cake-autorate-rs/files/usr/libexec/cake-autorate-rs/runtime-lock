@@ -1,0 +1,543 @@
+#!/bin/sh
+
+# Shared tmpfs-only locking primitives for every operation that can mutate a
+# managed CAKE/SQM interface.  BusyBox flock is part of the OpenWrt base
+# system.  The kernel lock is authoritative; the adjacent atomically replaced
+# record exists only to bind an inherited lock to one verified owner/recovery
+# journal and to make fail-closed diagnostics possible.
+
+runtime_lock_root="${CAKE_AUTORATE_RUNTIME_LOCK_ROOT:-/tmp/cake-autorate-speedtest}"
+runtime_lock_flock_bin="${CAKE_AUTORATE_RUNTIME_FLOCK:-flock}"
+
+runtime_lock_safe_interface() {
+	case "$1" in
+		''|*[!A-Za-z0-9_.:@-]*) return 1 ;;
+	esac
+}
+
+runtime_lock_safe_role() {
+	case "$1" in
+		''|*[!A-Za-z0-9_-]*) return 1 ;;
+	esac
+}
+
+runtime_lock_safe_token() {
+	case "$1" in
+		''|*[!A-Za-z0-9_-]*) return 1 ;;
+	esac
+}
+
+runtime_lock_ram_path() {
+	case "$1" in
+		/tmp/*|/run/*|/var/run/*) ;;
+		*) return 1 ;;
+	esac
+	case "$1" in
+		*'/../'*|*'/..'|*'//'*) return 1 ;;
+	esac
+	case "$1" in
+		*[!A-Za-z0-9_./:@-]*) return 1 ;;
+	esac
+}
+
+runtime_lock_effective_uid() {
+	# `stat` is not part of a minimal OpenWrt image.  BusyBox `id` and numeric
+	# `ls` are, so use those below instead of adding a package dependency.
+	runtime_lock_uid="$(id -u 2>/dev/null)" || return 1
+	runtime_lock_is_uint "$runtime_lock_uid" || return 1
+	printf '%s\n' "$runtime_lock_uid"
+}
+
+runtime_lock_path_uid() {
+	[ -n "$1" ] || return 1
+	LC_ALL=C ls -ldn "$1" 2>/dev/null |
+		awk 'NR == 1 && $3 ~ /^[0-9]+$/ { print $3; exit }'
+}
+
+runtime_lock_path_owned_by_euid() {
+	runtime_lock_owned_path="$1"
+	runtime_lock_owner="$(runtime_lock_path_uid "$runtime_lock_owned_path")" || return 1
+	runtime_lock_euid="$(runtime_lock_effective_uid)" || return 1
+	[ -n "$runtime_lock_owner" ] && [ "$runtime_lock_owner" = "$runtime_lock_euid" ]
+}
+
+runtime_lock_guard_path_safe() {
+	runtime_lock_guard_path="$1"
+	[ -n "$runtime_lock_guard_path" ] || return 1
+	[ ! -L "$runtime_lock_guard_path" ] || return 1
+	if [ -e "$runtime_lock_guard_path" ]; then
+		[ -f "$runtime_lock_guard_path" ] || return 1
+		runtime_lock_path_owned_by_euid "$runtime_lock_guard_path" || return 1
+	fi
+}
+
+runtime_lock_guard_fd_safe() {
+	runtime_lock_guard_fd="$1"
+	runtime_lock_guard_path="$2"
+	runtime_lock_guard_path_safe "$runtime_lock_guard_path" || return 1
+	runtime_lock_fd_matches_path "$runtime_lock_guard_fd" "$runtime_lock_guard_path" || return 1
+	runtime_lock_path_owned_by_euid "$runtime_lock_guard_path" || return 1
+	chmod 600 "$runtime_lock_guard_path" 2>/dev/null || return 1
+}
+
+# Prove that an inherited descriptor already carries the lock mode advertised
+# by its environment metadata.  Merely checking /proc/.../fd is insufficient:
+# an attacker (or stale launcher) can pass an unlocked descriptor for the
+# correct path.  A fresh open-file-description must conflict first, after which
+# re-applying the *same* mode on the inherited descriptor proves it remains
+# usable.  Crucially, an advertised exclusive descriptor is reasserted with
+# -x, never -s, because LOCK_SH would downgrade the owner's lock.
+runtime_lock_verify_inherited() {
+	runtime_lock_verify_fd="$1"
+	runtime_lock_verify_path="$2"
+	runtime_lock_verify_mode="$3"
+	runtime_lock_guard_fd_safe "$runtime_lock_verify_fd" "$runtime_lock_verify_path" || return 1
+	case "$runtime_lock_verify_mode" in
+		shared)
+			# A real shared owner permits another shared open-file-description.
+			# If this conflicts, the inherited FD is actually exclusive (or a
+			# foreign exclusive owner exists); issuing -s on it could downgrade
+			# the real owner's lock, so reject before touching the descriptor.
+			"$runtime_lock_flock_bin" -sn "$runtime_lock_verify_path" true >/dev/null 2>&1 || return 1
+			if "$runtime_lock_flock_bin" -xn "$runtime_lock_verify_path" true >/dev/null 2>&1; then
+				return 1
+			fi
+			"$runtime_lock_flock_bin" -sn "$runtime_lock_verify_fd" >/dev/null 2>&1 || return 75
+			;;
+		exclusive)
+			if "$runtime_lock_flock_bin" -sn "$runtime_lock_verify_path" true >/dev/null 2>&1; then
+				return 1
+			fi
+			"$runtime_lock_flock_bin" -xn "$runtime_lock_verify_fd" >/dev/null 2>&1 || return 75
+			;;
+		*) return 1 ;;
+	esac
+}
+
+runtime_lock_is_pid() {
+	case "$1" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$1" -gt 1 ] 2>/dev/null
+}
+
+runtime_lock_is_uint() {
+	case "$1" in ''|*[!0-9]*) return 1 ;; esac
+}
+
+runtime_lock_set_current_pid() {
+	# POSIX shells deliberately keep $$ equal to the parent shell inside (...).
+	# Open /proc/self with the shell builtin itself so this remains the actual
+	# process which owns newly opened descriptors and records.  Do not wrap this
+	# helper in command substitution: that would create another process.
+	IFS=' ' read -r runtime_lock_current_pid_value runtime_lock_current_stat_rest \
+		< /proc/self/stat || return 1
+	runtime_lock_is_pid "$runtime_lock_current_pid_value"
+}
+
+runtime_lock_process_starttime() {
+	runtime_lock_pid="$1"
+	[ -r "/proc/$runtime_lock_pid/stat" ] || return 1
+	sed 's/^.*) //' "/proc/$runtime_lock_pid/stat" 2>/dev/null |
+		awk 'NF >= 20 { print $20; exit }'
+}
+
+runtime_lock_prepare_root() {
+	runtime_lock_ram_path "$runtime_lock_root" || return 1
+	[ ! -L "$runtime_lock_root" ] || return 1
+	mkdir -p "$runtime_lock_root" || return 1
+	[ -d "$runtime_lock_root" ] && [ ! -L "$runtime_lock_root" ] || return 1
+	# Tests run as their invoking uid; production helpers run as root.  Requiring
+	# the current effective uid here therefore means root ownership on OpenWrt
+	# without a test-only bypass that could accidentally weaken production.
+	runtime_lock_path_owned_by_euid "$runtime_lock_root" || return 1
+	chmod 700 "$runtime_lock_root" 2>/dev/null || return 1
+	command -v "$runtime_lock_flock_bin" >/dev/null 2>&1
+}
+
+runtime_lock_new_token() {
+	runtime_lock_generated="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+	case "$runtime_lock_generated" in
+		''|*[!A-Fa-f0-9]*)
+			runtime_lock_set_current_pid || return 1
+			runtime_lock_generated="$runtime_lock_current_pid_value-$(runtime_lock_process_starttime "$runtime_lock_current_pid_value" 2>/dev/null)-$(awk '{ gsub(/[.]/, "", $1); print $1 }' /proc/uptime 2>/dev/null)"
+			;;
+	esac
+	runtime_lock_safe_token "$runtime_lock_generated" || return 1
+	printf '%s\n' "$runtime_lock_generated"
+}
+
+runtime_lock_interface_paths() {
+	runtime_lock_safe_interface "$1" || return 1
+	runtime_lock_name="$(printf '%s' "$1" | tr ':@.' '___')"
+	case "$runtime_lock_name" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac
+	runtime_interface_lock_record="$runtime_lock_root/interface-$runtime_lock_name.lock"
+	runtime_interface_lock_guard="$runtime_interface_lock_record.guard"
+}
+
+runtime_lock_fd_matches_path() {
+	runtime_lock_fd="$1"
+	runtime_lock_expected_path="$2"
+	runtime_lock_is_uint "$runtime_lock_fd" || return 1
+	[ -n "$runtime_lock_expected_path" ] || return 1
+	# readlink runs as a child which inherits the descriptor, so /proc/self is
+	# the descriptor table of the actual calling shell even when $$ still names
+	# an outer dash process.
+	[ "$(readlink "/proc/self/fd/$runtime_lock_fd" 2>/dev/null)" = "$runtime_lock_expected_path" ]
+}
+
+runtime_lock_load_record() {
+	runtime_lock_record_path="$1"
+	[ -f "$runtime_lock_record_path" ] && [ ! -L "$runtime_lock_record_path" ] || return 1
+	runtime_lock_path_owned_by_euid "$runtime_lock_record_path" || return 1
+	runtime_record_version=""
+	runtime_record_pid=""
+	runtime_record_starttime=""
+	runtime_record_role=""
+	runtime_record_token=""
+	runtime_record_journal=""
+	runtime_record_seen=""
+	while IFS= read -r runtime_record_line || [ -n "$runtime_record_line" ]; do
+		case "$runtime_record_line" in *=*) ;; *) return 1 ;; esac
+		runtime_record_key="${runtime_record_line%%=*}"
+		runtime_record_value="${runtime_record_line#*=}"
+		case " $runtime_record_seen " in *" $runtime_record_key "*) return 1 ;; esac
+		case "$runtime_record_key" in
+			version) runtime_record_version="$runtime_record_value" ;;
+			pid) runtime_record_pid="$runtime_record_value" ;;
+			proc_starttime) runtime_record_starttime="$runtime_record_value" ;;
+			role) runtime_record_role="$runtime_record_value" ;;
+			token) runtime_record_token="$runtime_record_value" ;;
+			recovery_journal) runtime_record_journal="$runtime_record_value" ;;
+			*) return 1 ;;
+		esac
+		runtime_record_seen="${runtime_record_seen}${runtime_record_seen:+ }$runtime_record_key"
+	done < "$runtime_lock_record_path"
+	[ "$runtime_record_version" = 1 ] || return 1
+	runtime_lock_is_pid "$runtime_record_pid" || return 1
+	runtime_lock_is_uint "$runtime_record_starttime" || return 1
+	runtime_lock_safe_role "$runtime_record_role" || return 1
+	runtime_lock_safe_token "$runtime_record_token" || return 1
+	[ -z "$runtime_record_journal" ] || runtime_lock_ram_path "$runtime_record_journal" || return 1
+}
+
+runtime_lock_write_record() {
+	runtime_lock_record_path="$1"
+	runtime_lock_record_pid="$2"
+	runtime_lock_record_start="$3"
+	runtime_lock_record_role="$4"
+	runtime_lock_record_token="$5"
+	runtime_lock_record_journal="$6"
+	runtime_lock_is_pid "$runtime_lock_record_pid" || return 1
+	runtime_lock_is_uint "$runtime_lock_record_start" || return 1
+	runtime_lock_safe_role "$runtime_lock_record_role" || return 1
+	runtime_lock_safe_token "$runtime_lock_record_token" || return 1
+	[ -z "$runtime_lock_record_journal" ] || runtime_lock_ram_path "$runtime_lock_record_journal" || return 1
+	runtime_lock_set_current_pid || return 1
+	runtime_lock_record_tmp="$runtime_lock_record_path.tmp.$runtime_lock_current_pid_value"
+	[ ! -e "$runtime_lock_record_tmp" ] && [ ! -L "$runtime_lock_record_tmp" ] || return 1
+	[ ! -L "$runtime_lock_record_path" ] || return 1
+	if [ -e "$runtime_lock_record_path" ]; then
+		[ -f "$runtime_lock_record_path" ] || return 1
+		runtime_lock_path_owned_by_euid "$runtime_lock_record_path" || return 1
+	fi
+	if {
+		printf 'version=1\n'
+		printf 'pid=%s\n' "$runtime_lock_record_pid"
+		printf 'proc_starttime=%s\n' "$runtime_lock_record_start"
+		printf 'role=%s\n' "$runtime_lock_record_role"
+		printf 'token=%s\n' "$runtime_lock_record_token"
+		printf 'recovery_journal=%s\n' "$runtime_lock_record_journal"
+	} > "$runtime_lock_record_tmp" &&
+	   runtime_lock_path_owned_by_euid "$runtime_lock_record_tmp" &&
+	   chmod 600 "$runtime_lock_record_tmp" 2>/dev/null &&
+	   mv "$runtime_lock_record_tmp" "$runtime_lock_record_path" &&
+	   runtime_lock_path_owned_by_euid "$runtime_lock_record_path"; then
+		return 0
+	fi
+	rm -f "$runtime_lock_record_tmp" 2>/dev/null || true
+	return 1
+}
+
+runtime_lock_acquire_global_shared() {
+	runtime_lock_prepare_root || return 1
+	runtime_lock_guard_path_safe "$runtime_lock_root/runtime.guard" || return 1
+	exec 8>>"$runtime_lock_root/runtime.guard" || return 1
+	runtime_lock_guard_fd_safe 8 "$runtime_lock_root/runtime.guard" || {
+		exec 8>&-
+		return 1
+	}
+	"$runtime_lock_flock_bin" -sn 8 || {
+		exec 8>&-
+		return 75
+	}
+	runtime_global_lock_mode=shared
+	runtime_global_lock_inherited=0
+	export CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_FD=8
+	export CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_MODE=shared
+}
+
+runtime_lock_ensure_global_shared() {
+	if [ "${CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_FD:-}" = 8 ]; then
+		runtime_lock_prepare_root || return 1
+		case "${CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_MODE:-}" in
+			shared|exclusive) runtime_lock_claimed_global_mode="$CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_MODE" ;;
+			*) return 1 ;;
+		esac
+		runtime_lock_verify_inherited 8 "$runtime_lock_root/runtime.guard" "$runtime_lock_claimed_global_mode" || return $?
+		runtime_global_lock_mode="$runtime_lock_claimed_global_mode"
+		runtime_global_lock_inherited=1
+		return 0
+	fi
+	runtime_lock_acquire_global_shared
+}
+
+runtime_lock_acquire_global_exclusive() {
+	runtime_lock_prepare_root || return 1
+	runtime_lock_guard_path_safe "$runtime_lock_root/runtime.guard" || return 1
+	exec 8>>"$runtime_lock_root/runtime.guard" || return 1
+	runtime_lock_guard_fd_safe 8 "$runtime_lock_root/runtime.guard" || {
+		exec 8>&-
+		return 1
+	}
+	"$runtime_lock_flock_bin" -xn 8 || {
+		exec 8>&-
+		return 75
+	}
+	runtime_global_lock_mode=exclusive
+	runtime_global_lock_inherited=0
+	export CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_FD=8
+	export CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_MODE=exclusive
+}
+
+# Borrow a scheduler-owned exclusive descriptor without reopening runtime.guard
+# and without issuing another flock operation against its open-file
+# description.  The path/mode checks prevent an arbitrary inherited fd from
+# being mistaken for the global transaction lock.
+runtime_lock_borrow_global_exclusive() {
+	[ "${CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_FD:-}" = 8 ] || return 1
+	[ "${CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_MODE:-}" = exclusive ] || return 1
+	runtime_lock_prepare_root || return 1
+	runtime_lock_verify_inherited 8 "$runtime_lock_root/runtime.guard" exclusive || return $?
+	runtime_global_lock_mode=exclusive
+	runtime_global_lock_inherited=1
+}
+
+runtime_lock_release_global() {
+	[ -n "${runtime_global_lock_mode:-}" ] || return 0
+	if [ "${runtime_global_lock_inherited:-0}" != 1 ]; then
+		"$runtime_lock_flock_bin" -u 8 || return 1
+		exec 8>&-
+	fi
+	runtime_global_lock_mode=""
+	runtime_global_lock_inherited=0
+	unset CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_FD CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_MODE
+}
+
+runtime_lock_abort_global_claim() {
+	[ -n "${runtime_global_lock_mode:-}" ] || return 0
+	if [ "${runtime_global_lock_inherited:-0}" != 1 ]; then
+		"$runtime_lock_flock_bin" -u 8 >/dev/null 2>&1 || true
+		exec 8>&-
+	fi
+	runtime_global_lock_mode=""
+	runtime_global_lock_inherited=0
+	unset CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_FD CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_MODE
+}
+
+runtime_lock_acquire_interface() {
+	runtime_lock_target="$1"
+	runtime_lock_role="$2"
+	runtime_lock_journal="${3:-}"
+	runtime_lock_requested_token="${4:-}"
+	runtime_lock_prepare_root || return 1
+	runtime_lock_interface_paths "$runtime_lock_target" || return 1
+	runtime_lock_safe_role "$runtime_lock_role" || return 1
+	[ -z "$runtime_lock_journal" ] || runtime_lock_ram_path "$runtime_lock_journal" || return 1
+	runtime_lock_guard_path_safe "$runtime_interface_lock_guard" || return 1
+	exec 9>>"$runtime_interface_lock_guard" || return 1
+	runtime_lock_guard_fd_safe 9 "$runtime_interface_lock_guard" || {
+		exec 9>&-
+		return 1
+	}
+	"$runtime_lock_flock_bin" -xn 9 || {
+		exec 9>&-
+		return 75
+	}
+	if [ -L "$runtime_interface_lock_record" ]; then
+		"$runtime_lock_flock_bin" -u 9 >/dev/null 2>&1 || true
+		exec 9>&-
+		return 1
+	elif [ -e "$runtime_interface_lock_record" ]; then
+		if ! runtime_lock_load_record "$runtime_interface_lock_record"; then
+			"$runtime_lock_flock_bin" -u 9 >/dev/null 2>&1 || true
+			exec 9>&-
+			return 1
+		fi
+		if [ -n "$runtime_record_journal" ] && [ -f "$runtime_record_journal" ]; then
+			"$runtime_lock_flock_bin" -u 9 >/dev/null 2>&1 || true
+			exec 9>&-
+			return 76
+		fi
+	fi
+	if [ -n "$runtime_lock_requested_token" ]; then
+		runtime_lock_safe_token "$runtime_lock_requested_token" || {
+			"$runtime_lock_flock_bin" -u 9 >/dev/null 2>&1 || true
+			exec 9>&-
+			return 1
+		}
+		runtime_interface_lock_token="$runtime_lock_requested_token"
+	else
+		runtime_interface_lock_token="$(runtime_lock_new_token)" || {
+			"$runtime_lock_flock_bin" -u 9 >/dev/null 2>&1 || true
+			exec 9>&-
+			return 1
+		}
+	fi
+	runtime_lock_set_current_pid || {
+		"$runtime_lock_flock_bin" -u 9 >/dev/null 2>&1 || true
+		exec 9>&-
+		return 1
+	}
+	runtime_interface_lock_owner_pid="$runtime_lock_current_pid_value"
+	runtime_interface_lock_starttime="$(runtime_lock_process_starttime "$runtime_interface_lock_owner_pid")" || {
+		"$runtime_lock_flock_bin" -u 9 >/dev/null 2>&1 || true
+		exec 9>&-
+		return 1
+	}
+	runtime_lock_write_record "$runtime_interface_lock_record" "$runtime_interface_lock_owner_pid" \
+		"$runtime_interface_lock_starttime" "$runtime_lock_role" \
+		"$runtime_interface_lock_token" "$runtime_lock_journal" || {
+		"$runtime_lock_flock_bin" -u 9 >/dev/null 2>&1 || true
+		exec 9>&-
+		return 1
+	}
+	runtime_interface_lock_held=1
+	export CAKE_AUTORATE_INTERFACE_LOCK_OWNER="$runtime_interface_lock_owner_pid"
+	export CAKE_AUTORATE_INTERFACE_LOCK_STARTTIME="$runtime_interface_lock_starttime"
+	export CAKE_AUTORATE_INTERFACE_LOCK_TOKEN="$runtime_interface_lock_token"
+	export CAKE_AUTORATE_INTERFACE_LOCK_RECOVERY_JOURNAL="$runtime_lock_journal"
+	export CAKE_AUTORATE_INTERFACE_LOCK_FD=9
+}
+
+runtime_lock_borrow_interface() {
+	runtime_lock_target="$1"
+	runtime_lock_expected_pid="$2"
+	runtime_lock_expected_start="$3"
+	runtime_lock_expected_token="$4"
+	runtime_lock_expected_journal="${5:-}"
+	[ "${CAKE_AUTORATE_INTERFACE_LOCK_FD:-}" = 9 ] || return 1
+	runtime_lock_interface_paths "$runtime_lock_target" || return 1
+	runtime_lock_verify_inherited 9 "$runtime_interface_lock_guard" exclusive || return $?
+	runtime_lock_load_record "$runtime_interface_lock_record" || return 1
+	[ "$runtime_record_pid" = "$runtime_lock_expected_pid" ] &&
+		[ "$runtime_record_starttime" = "$runtime_lock_expected_start" ] &&
+		[ "$runtime_record_token" = "$runtime_lock_expected_token" ] &&
+		[ "$runtime_record_journal" = "$runtime_lock_expected_journal" ] || return 1
+	[ "$(runtime_lock_process_starttime "$runtime_lock_expected_pid" 2>/dev/null)" = "$runtime_lock_expected_start" ] || return 1
+	runtime_interface_lock_borrowed=1
+}
+
+runtime_lock_abort_interface_claim() {
+	if [ "${runtime_lock_interface_fd_inherited:-0}" != 1 ]; then
+		"$runtime_lock_flock_bin" -u 9 >/dev/null 2>&1 || true
+	fi
+	exec 9>&-
+	runtime_lock_interface_fd_inherited=0
+}
+
+runtime_lock_claim_interface_recovery() {
+	runtime_lock_target="$1"
+	runtime_lock_expected_pid="$2"
+	runtime_lock_expected_start="$3"
+	runtime_lock_expected_token="$4"
+	runtime_lock_expected_journal="$5"
+	runtime_lock_allow_missing="${6:-0}"
+	runtime_lock_prepare_root || return 1
+	runtime_lock_interface_paths "$runtime_lock_target" || return 1
+	if [ "${CAKE_AUTORATE_INTERFACE_LOCK_FD:-}" = 9 ] &&
+	   [ "${CAKE_AUTORATE_INTERFACE_LOCK_TOKEN:-}" = "$runtime_lock_expected_token" ]; then
+		runtime_lock_verify_inherited 9 "$runtime_interface_lock_guard" exclusive || return $?
+		runtime_lock_interface_fd_inherited=1
+	else
+		runtime_lock_interface_fd_inherited=0
+		runtime_lock_guard_path_safe "$runtime_interface_lock_guard" || return 1
+		exec 9>>"$runtime_interface_lock_guard" || return 1
+		runtime_lock_guard_fd_safe 9 "$runtime_interface_lock_guard" || {
+			exec 9>&-
+			return 1
+		}
+		"$runtime_lock_flock_bin" -xn 9 || {
+			exec 9>&-
+			return 75
+		}
+	fi
+	if [ -L "$runtime_interface_lock_record" ]; then
+		runtime_lock_abort_interface_claim
+		return 1
+	elif [ -e "$runtime_interface_lock_record" ]; then
+		runtime_lock_load_record "$runtime_interface_lock_record" || {
+			runtime_lock_abort_interface_claim
+			return 1
+		}
+		[ "$runtime_record_token" = "$runtime_lock_expected_token" ] &&
+			[ "$runtime_record_journal" = "$runtime_lock_expected_journal" ] || {
+			runtime_lock_abort_interface_claim
+			return 1
+		}
+		case "$runtime_record_role" in
+			autotune)
+				[ "$runtime_record_pid" = "$runtime_lock_expected_pid" ] &&
+					[ "$runtime_record_starttime" = "$runtime_lock_expected_start" ] || {
+					runtime_lock_abort_interface_claim
+					return 1
+				}
+				;;
+			recovery) ;;
+			*)
+				runtime_lock_abort_interface_claim
+				return 1
+				;;
+		esac
+	else
+		[ "$runtime_lock_allow_missing" = 1 ] || {
+			runtime_lock_abort_interface_claim
+			return 1
+		}
+	fi
+	runtime_lock_set_current_pid || {
+		runtime_lock_abort_interface_claim
+		return 1
+	}
+	runtime_interface_lock_owner_pid="$runtime_lock_current_pid_value"
+	runtime_interface_lock_starttime="$(runtime_lock_process_starttime "$runtime_interface_lock_owner_pid")" || {
+		runtime_lock_abort_interface_claim
+		return 1
+	}
+	runtime_interface_lock_token="$runtime_lock_expected_token"
+	runtime_lock_write_record "$runtime_interface_lock_record" "$runtime_interface_lock_owner_pid" \
+		"$runtime_interface_lock_starttime" recovery "$runtime_interface_lock_token" \
+		"$runtime_lock_expected_journal" || {
+		runtime_lock_abort_interface_claim
+		return 1
+	}
+	runtime_interface_lock_held=1
+	export CAKE_AUTORATE_INTERFACE_LOCK_OWNER="$runtime_interface_lock_owner_pid"
+	export CAKE_AUTORATE_INTERFACE_LOCK_STARTTIME="$runtime_interface_lock_starttime"
+	export CAKE_AUTORATE_INTERFACE_LOCK_TOKEN="$runtime_interface_lock_token"
+	export CAKE_AUTORATE_INTERFACE_LOCK_RECOVERY_JOURNAL="$runtime_lock_expected_journal"
+	export CAKE_AUTORATE_INTERFACE_LOCK_FD=9
+}
+
+runtime_lock_release_interface() {
+	[ "${runtime_interface_lock_held:-0}" = 1 ] || return 0
+	runtime_lock_load_record "$runtime_interface_lock_record" || return 1
+	[ "$runtime_record_pid" = "$runtime_interface_lock_owner_pid" ] &&
+		[ "$runtime_record_starttime" = "$runtime_interface_lock_starttime" ] &&
+		[ "$runtime_record_token" = "$runtime_interface_lock_token" ] || return 1
+	rm -f "$runtime_interface_lock_record" || return 1
+	"$runtime_lock_flock_bin" -u 9 || return 1
+	exec 9>&-
+	runtime_interface_lock_held=0
+	unset CAKE_AUTORATE_INTERFACE_LOCK_OWNER CAKE_AUTORATE_INTERFACE_LOCK_STARTTIME \
+		CAKE_AUTORATE_INTERFACE_LOCK_TOKEN CAKE_AUTORATE_INTERFACE_LOCK_RECOVERY_JOURNAL \
+		CAKE_AUTORATE_INTERFACE_LOCK_FD
+}

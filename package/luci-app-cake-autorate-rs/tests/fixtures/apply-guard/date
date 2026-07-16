@@ -1,0 +1,8 @@
+#!/bin/sh
+
+if [ "${1:-}" = '+%s' ] && [ -n "${APPLY_GUARD_NOW_EPOCH:-}" ]; then
+	printf '%s\n' "$APPLY_GUARD_NOW_EPOCH"
+	exit 0
+fi
+
+exec /bin/date "$@"

@@ -1,0 +1,36 @@
+#!/bin/sh
+
+[ "${APPLY_GUARD_TC_ACTIVE:-1}" = 1 ] || exit 0
+if [ "$1" = qdisc ] && [ "$2" = show ] && [ "$3" = dev ]; then
+	case "$4" in
+		pppoe-wan)
+			case "${APPLY_GUARD_TC_MODE:-root}" in
+				child) printf '%s\n' 'qdisc cake 8010: parent 1:1 bandwidth 20Mbit besteffort' ;;
+				duplicate)
+					printf '%s\n' 'qdisc cake 8010: root refcnt 2 bandwidth 20Mbit besteffort'
+					printf '%s\n' 'qdisc cake 8012: root refcnt 2 bandwidth 20Mbit besteffort'
+					;;
+				*) printf '%s\n' 'qdisc cake 8010: root refcnt 2 bandwidth 20Mbit besteffort' ;;
+			esac
+			printf '%s\n' 'qdisc ingress ffff: parent ffff:fff1 ----------------'
+			;;
+		ifb4pppoe-wan)
+			case "${APPLY_GUARD_TC_MODE:-root}" in
+				child) printf '%s\n' 'qdisc cake 8011: parent 1:1 bandwidth 80Mbit besteffort' ;;
+				duplicate)
+					printf '%s\n' 'qdisc cake 8011: root refcnt 2 bandwidth 80Mbit besteffort'
+					printf '%s\n' 'qdisc cake 8013: root refcnt 2 bandwidth 80Mbit besteffort'
+					;;
+				*) printf '%s\n' 'qdisc cake 8011: root refcnt 2 bandwidth 80Mbit besteffort' ;;
+			esac
+			;;
+		*) exit 1 ;;
+	esac
+	exit 0
+fi
+if [ "$1" = filter ] && [ "$2" = show ] && [ "$3" = dev ] &&
+   [ "$4" = pppoe-wan ] && [ "$5" = parent ] && [ "$6" = ffff: ]; then
+	printf '%s\n' 'action order 1: mirred (Egress Redirect to device ifb4pppoe-wan) stolen'
+	exit 0
+fi
+exit 1

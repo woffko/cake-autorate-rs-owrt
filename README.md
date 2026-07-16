@@ -31,8 +31,8 @@ does not claim authorship of the original cake-autorate concept.
 - [Bounded probe ceiling](ADAPTIVE_CEILING.md) is the concise state-machine and
   safety-invariant reference for the optional outer controller.
 - [Full Auto-Tune](AUTOTUNE.md) documents the experimental calibration job,
-  proposal formulas, safety contract, confidence score, and remaining shaped
-  validation gate.
+  proposal formulas, phase-background accounting, three separate throughput
+  ratios, typed correction states, and fail-closed validation contract.
 - [Transport-aware quality control](TRANSPORT_QUALITY.md) documents HTTP/TCP
   latency fusion, the strict control signal, LibreQoS-like detected ratings,
   the throughput floor, bounded natural-load search, and scheduled Full
@@ -48,20 +48,28 @@ socket libraries; ordinary OpenWrt runtime dependencies remain explicit below.
 
 ## Current package tree
 
-The current tree builds these OpenWrt 25.12.5 APKs:
+The latest published release provides these OpenWrt 25.12.5 APKs:
 
-- `cake-autorate-rs-1.0_rc15-r1-x86_64.apk` — x86_64 autorate daemon.
-- `cake-autorate-rs-1.0_rc15-r1-aarch64_generic.apk` — rockchip/armv8
+- `cake-autorate-rs-1.0_rc17-r1-x86_64.apk` — x86_64 autorate daemon.
+- `cake-autorate-rs-1.0_rc17-r1-aarch64_generic.apk` — rockchip/armv8
   autorate daemon.
-- `luci-app-cake-autorate-rs-1.0_rc15-r1.apk` — architecture-independent LuCI
+- `luci-app-cake-autorate-rs-1.0_rc17-r1.apk` — architecture-independent LuCI
   interface and SQM integration.
+
+RC17 completed both architecture builds, fresh offline dependency resolution,
+disposable x86 validation, production Multi-WAN validation, ARM validation,
+and authenticated desktop/mobile Playwright checks. Exact release hashes and
+the anonymized acceptance evidence are recorded in [Testing](TESTING.md).
 
 The daemon package installs `uci`, `fping`, `uclient-fetch`, and `sqm-scripts`
 as dependencies; the latter brings the CAKE, IFB, `tc`, and `ip` runtime
-pieces. The LuCI package installs the daemon and `luci-base`. Native transport probes
-use the daemon's statically linked rustls/webpki stack. Full Auto-Tune and the
-diagnostic legacy HTTP backend still use OpenWrt `uclient-fetch`, so the offline
-installer includes the standard mbedTLS provider when none is already present.
+pieces. The LuCI package installs the daemon, `luci-base`, `sqm-scripts`, and
+`uclient-fetch`, plus `jsonfilter` for strict helper-result parsing and
+`nftables-json` for structured forwarding/background counters. Native transport
+probes use the daemon's statically linked rustls/webpki stack. The diagnostic
+legacy HTTP backend and built-in speed-test fallback can still use OpenWrt
+`uclient-fetch`, so the offline installer includes the standard mbedTLS
+provider when none is already present.
 The wizard now labels a device with its logical OpenWrt networks, for example
 `eth1 — wan, wan6`, while continuing to save and use the physical device name.
 
@@ -190,6 +198,35 @@ still observe member state at the configured interval, but reuse the validated
 route identity and perform the heavier device/source/mark/table refresh every
 30 seconds or immediately after an error. The installed `cpu-profile` helper
 separates daemon/probe/scheduler CPU from whole-router busy and softirq time.
+
+RC17 corrects the Full Auto-Tune validation path found during a real RC16
+re-run. It labels candidate realization (`achieved / candidate`), capacity
+retention (`achieved / observed-low`), and candidate capacity
+(`candidate / observed-low`) as separate quantities. ICMP validation is paced
+to one batch per second and selects three distinct known provider families;
+unknown IPv4 reflectors are separated by `/24`.
+Native transport uses a warmed persistent WebSocket or HTTP connection and
+compares loaded p95 with idle p95 while retaining every valid raw tail sample;
+process startup, DNS, TCP/TLS, and protocol handshakes are outside those scored
+intervals. The native TCP backend measures a fresh TCP connect for each
+observation and is therefore diagnostic-only for Full Auto-Tune. Candidate
+realization must remain between 80% and 110%, and every shaped result is
+accepted only after the exact temporary CAKE/IFB/redirect ownership is verified
+again.
+
+The same work adds per-phase nftables counters for forwarded client traffic,
+distinct from router-generated speed-test traffic. A contaminated phase is
+retried once and strict mode then stops. An explicitly requested conservative
+run may expose a passing low-confidence proposal for manual Review, but it is
+never eligible for scheduled Auto-Apply. A typed Rust validator can request the
+same measurement again, raise only a clean under-retaining direction, perform
+a safety-floor-bounded decrease, or report `infeasible`. Failed,
+contaminated, incomplete, and infeasible runs keep diagnostics but cannot be
+applied. Scheduled Auto-Apply requires a complete current-schema result, a
+passing final validation, normal confidence, and no phase contamination. This
+contract is covered by deterministic Rust, shell, LuCI, offline-install, and
+real-router acceptance gates; see [Full Auto-Tune](AUTOTUNE.md) and
+[Testing](TESTING.md).
 
 The **Autorate setup** editor is now divided into six in-page groups:
 Connection & routing, Rate limits, Adaptive ceiling, Latency probes, Quality &
@@ -355,19 +392,18 @@ Implemented:
   direct validated navigation by clicking any numbered step.
 - Experimental `Full Auto-Tune` creation mode alongside the manual wizard. It
   performs interface/route/backend preflight, reflector selection, idle ICMP
-  and TCP/HTTPS latency baselines, and two unshaped throughput samples on a
-  reused validated server. A pure Rust calculator derives explicit DL/UL min/base/max, activity
-  and delay thresholds, link-layer overhead, and bounded adaptive-ceiling
-  limits. LuCI shows the raw evidence and complete proposal before creating the
-  instance; job state stays under `/tmp`, cancellation terminates the process
-  group, and UCI is not written before confirmation. The job also temporarily
-  validates the proposed base rates with CAKE on the same server while sampling
-  independent loaded ICMP RTT/loss, TCP/HTTPS request latency, and CPU, then
-  restores the previous qdisc/SQM state. The TCP signal prevents prioritized
-  ICMP on mobile networks from hiding real loaded latency. Server, address,
-  route, telemetry, and score failures stop without a proposal. A borderline
-  score receives one bounded base-rate correction and retest; a second failure
-  stops. It remains experimental until both target-router gates are complete.
+  and native persistent-transport baselines, and two unshaped throughput
+  samples on a reused validated server. A pure Rust calculator derives explicit
+  DL/UL min/base/max, activity and delay thresholds, link-layer overhead, and
+  bounded adaptive-ceiling limits. LuCI shows the raw evidence and complete
+  proposal before creating the instance; job state stays under `/tmp`,
+  cancellation terminates the process group, and UCI is not written before
+  confirmation. The shaped job records ICMP p95-to-p95 growth, native transport
+  p95-to-p95 growth, loss, CPU, three distinct throughput ratios, and forwarded
+  client background before restoring the previous qdisc/SQM state. Typed gates
+  and a bounded Rust correction solver replace the old combined retention and
+  fixed-scale decision. Any missing, changed, contaminated, infeasible, or
+  failed evidence stops without an apply-ready proposal.
 - Optional scheduled Full Auto-Tune, disabled by default, adds a quiet-time
   gate, maintenance window, interval, RAM-only daily byte budget, and explicit
   review-only versus validated auto-apply mode.
@@ -488,7 +524,8 @@ SQM integration:
   plus autorate control.
 - Installing the LuCI package automatically installs `sqm-scripts` and
   `uclient-fetch`, which provide the normal OpenWrt CAKE/IFB shaping stack and
-  the Full Auto-Tune TCP/HTTPS latency gate.
+  the legacy HTTP/built-in speed-test fallback. Full Auto-Tune transport
+  validation uses the native Rust probe in the daemon package.
 - The LuCI package declares `PROVIDES:=luci-app-sqm` and `CONFLICTS:=luci-app-sqm`
   as the replacement intent. OpenWrt 25.12 APK package generation currently emits
   the provide metadata, but conflict metadata still needs verification in final
@@ -509,24 +546,29 @@ SQM integration:
 
 ## Runtime Dependencies
 
-Required package dependencies:
+Daemon package dependencies:
 
 - `uci`
 - `fping`
 - `uclient-fetch`
+- `sqm-scripts`
 
 LuCI package dependencies:
 
 - `cake-autorate-rs`
 - `luci-base`
 - `sqm-scripts`
+- `uclient-fetch`
+- `jsonfilter`
+- `nftables-json`
 
-Native WebSocket and persistent-HTTP probes use statically linked rustls and
-webpki roots and add no dynamic APK dependency. Full Auto-Tune and
-`legacy-http` use `uclient-fetch`; normal LuCI images already provide a
-`libustream` TLS provider and CA certificates. The offline bundle contains
-`ca-bundle` and the default `libustream-mbedtls20201210`, while preserving an
-already installed OpenSSL or wolfSSL provider.
+Native WebSocket and persistent-HTTP probes, including Full Auto-Tune
+transport validation, use statically linked rustls and webpki roots and add no
+dynamic APK dependency. `legacy-http` and the built-in speed-test fallback can
+use `uclient-fetch`; normal LuCI images already provide a `libustream` TLS
+provider and CA certificates. The offline bundle contains `ca-bundle` and the
+default `libustream-mbedtls20201210`, while preserving an already installed
+OpenSSL or wolfSSL provider.
 
 `sqm-scripts` pulls the required `tc`, CAKE, IFB, iptables, and related shaping
 packages on OpenWrt.
@@ -536,8 +578,9 @@ Optional speed test backend packages:
 - `librespeed-cli`
 - `speedtest-go`
 - `iperf3`
-- `jsonfilter` is required to parse CLI backend JSON and is installed by the
-  LuCI helper when installing an optional backend.
+
+`jsonfilter` is a mandatory LuCI dependency used for typed helper JSON, not an
+optional speed-test backend dependency.
 
 The LuCI Speed Test tab and setup wizard show backend availability and can run
 `apk add` for the selected optional backend. The built-in HTTP backend requires
@@ -618,16 +661,16 @@ them together. For x86_64:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc15-r1-x86_64.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc15-r1.apk
+  /root/cake-autorate-rs-1.0_rc17-r1-x86_64.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc17-r1.apk
 ```
 
 For rockchip/armv8 (`aarch64_generic`):
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc15-r1-aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc15-r1.apk
+  /root/cake-autorate-rs-1.0_rc17-r1-aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc17-r1.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:
@@ -647,22 +690,22 @@ x86_64:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc15-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc15-x86_64.sh
+tar -xzf cake-autorate-rs-1.0-rc17-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc17-x86_64.sh
 ```
 
 Banana Pi R2 Pro and other OpenWrt 25.12.5 rockchip/armv8 devices:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc15-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc15-aarch64_generic.sh
+tar -xzf cake-autorate-rs-1.0-rc17-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc17-aarch64_generic.sh
 ```
 
 The installer resolves its own location, so it also works when the extracted
 bundle is kept in another directory.
 
-Each archive is about 3.3 MiB and needs roughly 8 MiB of free space while
+Each archive is about 4 MiB and needs roughly 10 MiB of free space while
 both the archive and its extracted contents are present. If `/root/` is too
 small, use another writable filesystem (for example `/tmp/` when its tmpfs has
 enough RAM) for both commands instead.

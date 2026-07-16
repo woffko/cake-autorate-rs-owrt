@@ -3,9 +3,33 @@
 state_root="${CAKE_AUTOTUNE_SCHEDULER_STATE_ROOT:-/var/run/cake-autorate-autotune-scheduler}"
 helper="${CAKE_AUTOTUNE_HELPER:-/usr/libexec/cake-autorate-rs/autotune}"
 service="${CAKE_AUTOTUNE_SERVICE:-/etc/init.d/cake-autorate}"
+route_helper="${CAKE_AUTOTUNE_ROUTE_HELPER:-/usr/libexec/cake-autorate-rs/speedtest}"
+sqm_health_helper="${CAKE_AUTOTUNE_SQM_HEALTH_HELPER:-/usr/libexec/cake-autorate-rs/sqm-recover}"
+daemon_bin="${CAKE_AUTOTUNE_DAEMON:-/usr/sbin/cake-autorated}"
+proc_root="${CAKE_AUTOTUNE_PROC_ROOT:-/proc}"
+runtime_lock_lib="${CAKE_AUTORATE_RUNTIME_LOCK_LIB:-/usr/libexec/cake-autorate-rs/runtime-lock}"
+runtime_lock_available=0
 sleep_s=60
+retry_delay_s="${CAKE_AUTOTUNE_SCHEDULER_RETRY_DELAY_S:-900}"
+poll_interval_s="${CAKE_AUTOTUNE_SCHEDULER_POLL_INTERVAL_S:-5}"
+job_timeout_s="${CAKE_AUTOTUNE_SCHEDULER_JOB_TIMEOUT_S:-1800}"
+recovery_root="$state_root/recovery"
 
 mkdir -p "$state_root"
+
+case "$retry_delay_s" in ''|*[!0-9]*) retry_delay_s=900 ;; esac
+case "$poll_interval_s" in ''|*[!0-9]*) poll_interval_s=5 ;; esac
+case "$job_timeout_s" in ''|*[!0-9]*) job_timeout_s=1800 ;; esac
+[ "$retry_delay_s" -ge 60 ] 2>/dev/null || retry_delay_s=60
+[ "$poll_interval_s" -ge 1 ] 2>/dev/null || poll_interval_s=1
+[ "$poll_interval_s" -le 60 ] 2>/dev/null || poll_interval_s=60
+[ "$job_timeout_s" -ge 60 ] 2>/dev/null || job_timeout_s=60
+
+if [ -r "$runtime_lock_lib" ]; then
+	# shellcheck source=/usr/libexec/cake-autorate-rs/runtime-lock
+	. "$runtime_lock_lib"
+	runtime_lock_available=1
+fi
 
 json_escape() {
 	printf '%s' "$1" | tr '\n\r\t' '   ' | sed 's/\\/\\\\/g; s/"/\\"/g'
@@ -15,10 +39,10 @@ write_state() {
 	section="$1"
 	state="$2"
 	message="$3"
-	tmp="$state_root/$section.json.$$"
+	state_tmp="$state_root/$section.json.$$"
 	printf '{"state":"%s","message":"%s","updated_at":%s}\n' \
-		"$(json_escape "$state")" "$(json_escape "$message")" "$(date +%s)" > "$tmp" &&
-		mv "$tmp" "$state_root/$section.json"
+		"$(json_escape "$state")" "$(json_escape "$message")" "$(date +%s)" > "$state_tmp" &&
+		mv "$state_tmp" "$state_root/$section.json"
 }
 
 get_uint() {
@@ -117,15 +141,612 @@ extract() {
 	jsonfilter -s "$1" -e "$2" 2>/dev/null
 }
 
-apply_result() {
+safe_uci_section() {
+	case "$1" in
+		''|*[!A-Za-z0-9_]*) return 1 ;;
+	esac
+}
+
+valid_ipv4() {
+	case "$1" in ''|*[!0-9.]*) return 1 ;; esac
+	printf '%s\n' "$1" | awk -F. '
+		NF != 4 { exit 1 }
+		{
+			for (i = 1; i <= 4; i++)
+				if ($i !~ /^[0-9]+$/ || $i < 0 || $i > 255) exit 1
+		}
+	'
+}
+
+configuration_has_pending_changes() {
+	[ -z "$(uci -q changes cake-autorate 2>/dev/null)" ] &&
+		[ -z "$(uci -q changes sqm 2>/dev/null)" ]
+}
+
+# Hash the exact committed/runtime-visible UCI input that determines one
+# autorate instance and the SQM queue it owns.  The Auto-Tune helper emits this
+# same fingerprint in its terminal result; the scheduler compares it with the
+# pre-run snapshot and recomputes it immediately before commit.
+configuration_fingerprint() {
+	fingerprint_section="$1"
+	safe_uci_section "$fingerprint_section" || return 1
+	[ "$(uci -q get "cake-autorate.$fingerprint_section" 2>/dev/null)" = cake_autorate ] || return 1
+	fingerprint_sqm_section="$(uci -q get "cake-autorate.$fingerprint_section.sqm_section" 2>/dev/null)"
+	[ -n "$fingerprint_sqm_section" ] || fingerprint_sqm_section="cake_$fingerprint_section"
+	safe_uci_section "$fingerprint_sqm_section" || return 1
+	[ "$(uci -q get "sqm.$fingerprint_sqm_section._cake_autorate_managed" 2>/dev/null)" = "$fingerprint_section" ] || return 1
+	command -v sha256sum >/dev/null 2>&1 || return 1
+
+	fingerprint_cake_raw="$(mktemp "$state_root/.fingerprint-cake.XXXXXX")" || return 1
+	fingerprint_cake_sorted="$(mktemp "$state_root/.fingerprint-cake-sorted.XXXXXX")" || {
+		rm -f "$fingerprint_cake_raw"
+		return 1
+	}
+	fingerprint_sqm_raw="$(mktemp "$state_root/.fingerprint-sqm.XXXXXX")" || {
+		rm -f "$fingerprint_cake_raw" "$fingerprint_cake_sorted"
+		return 1
+	}
+	fingerprint_sqm_sorted="$(mktemp "$state_root/.fingerprint-sqm-sorted.XXXXXX")" || {
+		rm -f "$fingerprint_cake_raw" "$fingerprint_cake_sorted" "$fingerprint_sqm_raw"
+		return 1
+	}
+	if ! uci -q show "cake-autorate.$fingerprint_section" > "$fingerprint_cake_raw" ||
+	   ! LC_ALL=C sort "$fingerprint_cake_raw" > "$fingerprint_cake_sorted" ||
+	   ! uci -q show "sqm.$fingerprint_sqm_section" > "$fingerprint_sqm_raw" ||
+	   ! LC_ALL=C sort "$fingerprint_sqm_raw" > "$fingerprint_sqm_sorted"; then
+		rm -f "$fingerprint_cake_raw" "$fingerprint_cake_sorted" "$fingerprint_sqm_raw" "$fingerprint_sqm_sorted"
+		return 1
+	fi
+	fingerprint_digest="$({
+		printf 'cake-autorate:%s\n' "$fingerprint_section"
+		cat "$fingerprint_cake_sorted"
+		printf 'sqm:%s\n' "$fingerprint_sqm_section"
+		cat "$fingerprint_sqm_sorted"
+	} | sha256sum 2>/dev/null | awk 'NR == 1 { print $1 }')"
+	rm -f "$fingerprint_cake_raw" "$fingerprint_cake_sorted" "$fingerprint_sqm_raw" "$fingerprint_sqm_sorted"
+	[ "${#fingerprint_digest}" -eq 64 ] 2>/dev/null || return 1
+	case "$fingerprint_digest" in *[!0-9a-f]*) return 1 ;; esac
+	printf 'sha256:%s\n' "$fingerprint_digest"
+}
+
+is_uint_between() {
+	value="$1"
+	minimum="$2"
+	maximum="$3"
+	case "$value" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$value" -ge "$minimum" ] 2>/dev/null && [ "$value" -le "$maximum" ] 2>/dev/null
+}
+
+is_decimal_between() {
+	value="$1"
+	minimum="$2"
+	maximum="$3"
+	case "$value" in
+		''|*[!0-9.]*|.*|*..*|*.) return 1 ;;
+	esac
+	awk -v value="$value" -v minimum="$minimum" -v maximum="$maximum" \
+		'BEGIN { exit !(value >= minimum && value <= maximum) }'
+}
+
+result_has_exact_passing_gates() (
+	gate_json="$1"
+	gate_codes="$(extract "$gate_json" '@.validation.gates[*].code')" || return 1
+	gate_passes="$(extract "$gate_json" '@.validation.gates[*].pass')" || return 1
+	gate_actuals="$(extract "$gate_json" '@.validation.gates[*].actual')" || return 1
+	gate_limits="$(extract "$gate_json" '@.validation.gates[*].limit')" || return 1
+	gate_comparisons="$(extract "$gate_json" '@.validation.gates[*].comparison')" || return 1
+	# jsonfilter emits a whitespace-separated vector. Disable pathname expansion
+	# inside this subshell before every deliberate tokenization so a hostile gate
+	# token can never expand against files in the scheduler working directory.
+	set -f
+	set -- $gate_codes
+	[ "$#" -eq 14 ] || return 1
+	gate_seen=" "
+	for gate_code in "$@"; do
+		case "$gate_code" in
+			download-candidate-realization|upload-candidate-realization|\
+			download-candidate-realization-maximum|upload-candidate-realization-maximum|\
+			download-capacity-retention|upload-capacity-retention|\
+			download-icmp-latency|download-transport-latency|\
+			download-packet-loss|download-cpu|\
+			upload-icmp-latency|upload-transport-latency|\
+			upload-packet-loss|upload-cpu) ;;
+			*) return 1 ;;
+		esac
+		case "$gate_seen" in *" $gate_code "*) return 1 ;; esac
+		gate_seen="$gate_seen$gate_code "
+	done
+	for required_gate in \
+		download-candidate-realization upload-candidate-realization \
+		download-candidate-realization-maximum upload-candidate-realization-maximum \
+		download-capacity-retention upload-capacity-retention \
+		download-icmp-latency download-transport-latency \
+		download-packet-loss download-cpu \
+		upload-icmp-latency upload-transport-latency \
+		upload-packet-loss upload-cpu
+	do
+		case "$gate_seen" in *" $required_gate "*) ;; *) return 1 ;; esac
+	done
+	set -- $gate_passes
+	[ "$#" -eq 14 ] || return 1
+	for gate_pass in "$@"; do [ "$gate_pass" = true ] || return 1; done
+	set -- $gate_actuals
+	[ "$#" -eq 14 ] || return 1
+	for gate_actual in "$@"; do is_decimal_between "$gate_actual" 0 100000000 || return 1; done
+	set -- $gate_limits
+	[ "$#" -eq 14 ] || return 1
+	for gate_limit in "$@"; do is_decimal_between "$gate_limit" 0.001 100000000 || return 1; done
+	set -- $gate_comparisons
+	[ "$#" -eq 14 ] || return 1
+	for gate_comparison in "$@"; do
+		case "$gate_comparison" in minimum|maximum) ;; *) return 1 ;; esac
+	done
+
+	# `pass:true` is not an attestation by itself. Recompute each gate from its
+	# actual/limit pair and require the comparison kind dictated by its code.
+	awk -v codes="$gate_codes" -v passes="$gate_passes" \
+		-v actuals="$gate_actuals" -v limits="$gate_limits" \
+		-v comparisons="$gate_comparisons" 'BEGIN {
+		n = split(codes, code, " ")
+		if (split(passes, pass, " ") != n || split(actuals, actual, " ") != n ||
+		    split(limits, limit, " ") != n || split(comparisons, comparison, " ") != n)
+			exit 1
+		for (i = 1; i <= n; i++) {
+			expected = (code[i] == "download-candidate-realization" ||
+			            code[i] == "upload-candidate-realization" ||
+			            code[i] == "download-capacity-retention" ||
+			            code[i] == "upload-capacity-retention") ? "minimum" : "maximum"
+			if (pass[i] != "true" || comparison[i] != expected)
+				exit 1
+			if (expected == "minimum" && actual[i] + 0 < limit[i] + 0)
+				exit 1
+			if (expected == "maximum" && actual[i] + 0 > limit[i] + 0)
+				exit 1
+		}
+		exit 0
+	}'
+)
+
+result_proposal_is_safe() {
+	proposal_json="$1"
+	dl_min="$(extract "$proposal_json" '@.proposal.download.minimum_kbps')"
+	dl_base="$(extract "$proposal_json" '@.proposal.download.base_kbps')"
+	dl_max="$(extract "$proposal_json" '@.proposal.download.maximum_kbps')"
+	dl_cap="$(extract "$proposal_json" '@.proposal.download.absolute_cap_kbps')"
+	dl_low="$(extract "$proposal_json" '@.proposal.download.observed_low_kbps')"
+	dl_median="$(extract "$proposal_json" '@.proposal.download.observed_median_kbps')"
+	dl_high="$(extract "$proposal_json" '@.proposal.download.observed_high_kbps')"
+	ul_min="$(extract "$proposal_json" '@.proposal.upload.minimum_kbps')"
+	ul_base="$(extract "$proposal_json" '@.proposal.upload.base_kbps')"
+	ul_max="$(extract "$proposal_json" '@.proposal.upload.maximum_kbps')"
+	ul_cap="$(extract "$proposal_json" '@.proposal.upload.absolute_cap_kbps')"
+	ul_low="$(extract "$proposal_json" '@.proposal.upload.observed_low_kbps')"
+	ul_median="$(extract "$proposal_json" '@.proposal.upload.observed_median_kbps')"
+	ul_high="$(extract "$proposal_json" '@.proposal.upload.observed_high_kbps')"
+	active_threshold="$(extract "$proposal_json" '@.proposal.active_threshold_kbps')"
+	adjust_up="$(extract "$proposal_json" '@.proposal.thresholds_ms.adjust_up')"
+	delay_threshold="$(extract "$proposal_json" '@.proposal.thresholds_ms.delay')"
+	adjust_down="$(extract "$proposal_json" '@.proposal.thresholds_ms.adjust_down')"
+	adaptive_hold="$(extract "$proposal_json" '@.proposal.adaptive_ceiling.hold_s')"
+	adaptive_growth="$(extract "$proposal_json" '@.proposal.adaptive_ceiling.growth_percent')"
+	adaptive_probe="$(extract "$proposal_json" '@.proposal.adaptive_ceiling.probe_s')"
+	adaptive_cooldown="$(extract "$proposal_json" '@.proposal.adaptive_ceiling.cooldown_s')"
+	adaptive_ttl="$(extract "$proposal_json" '@.proposal.adaptive_ceiling.failed_bound_ttl_s')"
+	link_overhead="$(extract "$proposal_json" '@.proposal.link.overhead')"
+	link_mpu="$(extract "$proposal_json" '@.proposal.link.mpu')"
+	link_layer="$(extract "$proposal_json" '@.proposal.link.layer')"
+	proposal_confidence="$(extract "$proposal_json" '@.proposal.confidence')"
+
+	for rate_value in "$dl_min" "$dl_base" "$dl_max" "$dl_cap" "$dl_low" "$dl_median" "$dl_high" \
+		"$ul_min" "$ul_base" "$ul_max" "$ul_cap" "$ul_low" "$ul_median" "$ul_high"
+	do
+		is_uint_between "$rate_value" 100 100000000 || return 1
+	done
+	[ "$dl_min" -le "$dl_base" ] && [ "$dl_base" -le "$dl_max" ] && [ "$dl_max" -le "$dl_cap" ] || return 1
+	[ "$ul_min" -le "$ul_base" ] && [ "$ul_base" -le "$ul_max" ] && [ "$ul_max" -le "$ul_cap" ] || return 1
+	[ "$dl_low" -le "$dl_median" ] && [ "$dl_median" -le "$dl_high" ] && [ "$dl_high" -le "$dl_cap" ] || return 1
+	[ "$ul_low" -le "$ul_median" ] && [ "$ul_median" -le "$ul_high" ] && [ "$ul_high" -le "$ul_cap" ] || return 1
+	is_uint_between "$active_threshold" 1 20000 || return 1
+	[ "$active_threshold" -le "$dl_min" ] && [ "$active_threshold" -le "$ul_min" ] || return 1
+	is_uint_between "$adjust_up" 1 200 || return 1
+	is_uint_between "$delay_threshold" 1 1000 || return 1
+	is_uint_between "$adjust_down" 1 5000 || return 1
+	[ "$adjust_up" -le "$delay_threshold" ] && [ "$delay_threshold" -le "$adjust_down" ] || return 1
+	is_uint_between "$adaptive_hold" 1 86400 || return 1
+	is_decimal_between "$adaptive_growth" 0.1 10 || return 1
+	is_uint_between "$adaptive_probe" 1 3600 || return 1
+	is_uint_between "$adaptive_cooldown" 0 86400 || return 1
+	is_uint_between "$adaptive_ttl" 1 604800 || return 1
+	is_uint_between "$link_overhead" 0 1500 || return 1
+	is_uint_between "$link_mpu" 0 65535 || return 1
+	is_uint_between "$proposal_confidence" 1 100 || return 1
+	case "$link_layer" in none|ethernet|atm) ;; *) return 1 ;; esac
+}
+
+route_attestation_matches_result() {
+	attestation_section="$1"
+	attestation_interface="$2"
+	attestation_result="$3"
+	[ -x "$route_helper" ] || return 1
+	attestation_json="$(CAKE_AUTORATE_ROUTE_STATUS_TIMEOUT_S=5 \
+		"$route_helper" "$attestation_section" "$attestation_interface" route-status auto 2>/dev/null)" || return 1
+	[ "$(extract "$attestation_json" '@.state')" = ready ] || return 1
+	[ "$(extract "$attestation_json" '@.schema_version')" = 1 ] || return 1
+	for attestation_field in target_interface resolved_interface route_interface route_mode mwan3_member source_ip external_ip route_identity; do
+		attestation_value="$(extract "$attestation_json" "@.$attestation_field")"
+		case "$attestation_field" in source_ip|external_ip) valid_ipv4 "$attestation_value" || return 1 ;; esac
+		case "$attestation_field" in
+			target_interface) result_value="$(extract "$attestation_result" '@.target_interface')" ;;
+			resolved_interface) result_value="$(extract "$attestation_result" '@.resolved_interface')" ;;
+			route_interface) result_value="$(extract "$attestation_result" '@.route_interface')" ;;
+			route_mode) result_value="$(extract "$attestation_result" '@.route_mode')" ;;
+			mwan3_member) result_value="$(extract "$attestation_result" '@.mwan3_member')" ;;
+			source_ip) result_value="$(extract "$attestation_result" '@.source_ip')" ;;
+			external_ip) result_value="$(extract "$attestation_result" '@.external_ip')" ;;
+			route_identity) result_value="$(extract "$attestation_result" '@.route_identity')" ;;
+		esac
+		[ "$attestation_value" = "$result_value" ] || return 1
+	done
+}
+
+daemon_identity_healthy() {
+	health_section="$1"
+	daemon_expected="$(uci -q get "cake-autorate.$health_section.enabled" 2>/dev/null)"
+	[ -x "$daemon_bin" ] || return 1
+	daemon_real="$(readlink -f "$daemon_bin" 2>/dev/null)" || return 1
+	[ -n "$daemon_real" ] || return 1
+	daemon_matches=0
+	for daemon_proc in "$proc_root"/[0-9]*; do
+		[ -d "$daemon_proc" ] || continue
+		[ "$(readlink -f "$daemon_proc/exe" 2>/dev/null)" = "$daemon_real" ] || continue
+		[ -r "$daemon_proc/cmdline" ] || continue
+		daemon_argv="$(tr '\000' '\n' < "$daemon_proc/cmdline" 2>/dev/null)"
+		[ "$daemon_argv" = "$(printf '%s\n--instance\n%s' "$daemon_bin" "$health_section")" ] || continue
+		daemon_matches=$((daemon_matches + 1))
+	done
+	if [ "$daemon_expected" = 1 ]; then
+		[ "$daemon_matches" -eq 1 ]
+	else
+		[ "$daemon_matches" -eq 0 ]
+	fi
+}
+
+managed_sqm_healthy() {
+	health_section="$1"
+	[ "$(uci -q get "cake-autorate.$health_section.manage_sqm" 2>/dev/null)" = 1 ] || return 1
+	[ "$(uci -q get "cake-autorate.$health_section.sqm_enabled" 2>/dev/null)" = 1 ] || return 1
+	[ -x "$sqm_health_helper" ] || return 1
+	CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_BORROW=1 \
+		"$sqm_health_helper" "$health_section" >/dev/null 2>&1
+}
+
+runtime_health_exact() {
+	health_section="$1"
+	daemon_identity_healthy "$health_section" && managed_sqm_healthy "$health_section"
+}
+
+result_is_auto_apply_eligible() {
+	gate_result="$1"
+	gate_state="$(extract "$gate_result" '@.state')"
+	gate_schema_version="$(extract "$gate_result" '@.schema_version')"
+	gate_validation_pass="$(extract "$gate_result" '@.validation.pass')"
+	gate_auto_apply_eligible="$(extract "$gate_result" '@.auto_apply_eligible')"
+	gate_confidence_mode="$(extract "$gate_result" '@.confidence_mode')"
+	gate_validation_contaminated="$(extract "$gate_result" '@.validation.contaminated')"
+	gate_phase_evidence_complete="$(extract "$gate_result" '@.phase_evidence_complete')"
+	gate_phase_contamination_seen="$(extract "$gate_result" '@.phase_contamination_seen')"
+	gate_runtime_restored="$(extract "$gate_result" '@.runtime_restored')"
+	gate_recovery_pending="$(extract "$gate_result" '@.recovery_pending')"
+	gate_configuration_written="$(extract "$gate_result" '@.configuration_written')"
+	gate_correction_action="$(extract "$gate_result" '@.validation.correction.action')"
+	gate_correction_feasible="$(extract "$gate_result" '@.validation.correction.feasible')"
+
+	# Every field is deliberately mandatory. Missing, malformed, legacy, low-
+	# confidence, contaminated, or otherwise unknown evidence must never become
+	# a configuration change merely because the helper reported "complete".
+	[ "$gate_state" = complete ] || return 1
+	case "$gate_schema_version" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$gate_schema_version" -ge 3 ] || return 1
+	[ "$gate_validation_pass" = true ] || return 1
+	[ "$gate_auto_apply_eligible" = true ] || return 1
+	[ "$gate_confidence_mode" = normal ] || return 1
+	[ "$gate_validation_contaminated" = false ] || return 1
+	[ "$gate_phase_evidence_complete" = true ] || return 1
+	[ "$gate_phase_contamination_seen" = false ] || return 1
+	[ "$gate_runtime_restored" = true ] || return 1
+	[ "$gate_recovery_pending" = false ] || return 1
+	[ "$gate_configuration_written" = false ] || return 1
+	[ "$gate_correction_action" = none ] || return 1
+	[ "$gate_correction_feasible" = true ] || return 1
+	result_has_exact_passing_gates "$gate_result" || return 1
+	result_proposal_is_safe "$gate_result" || return 1
+}
+
+result_matches_apply_context() {
+	context_section="$1"
+	context_interface="$2"
+	context_expected_fingerprint="$3"
+	context_result="$4"
+
+	result_fingerprint="$(extract "$context_result" '@.config_fingerprint')"
+	[ -n "$context_expected_fingerprint" ] && [ "$result_fingerprint" = "$context_expected_fingerprint" ] || return 1
+	case "$result_fingerprint" in sha256:*) ;; *) return 1 ;; esac
+	result_fingerprint_hex="${result_fingerprint#sha256:}"
+	[ "${#result_fingerprint_hex}" -eq 64 ] 2>/dev/null || return 1
+	case "$result_fingerprint_hex" in *[!0-9a-f]*) return 1 ;; esac
+	[ "$(configuration_fingerprint "$context_section")" = "$context_expected_fingerprint" ] || return 1
+
+	[ "$(extract "$context_result" '@.job_id')" = "$context_section" ] || return 1
+	[ "$(extract "$context_result" '@.target_interface')" = "$context_interface" ] || return 1
+	[ "$(extract "$context_result" '@.resolved_interface')" = "$context_interface" ] || return 1
+	[ "$(extract "$context_result" '@.route_interface')" = "$context_interface" ] || return 1
+	result_source_ip="$(extract "$context_result" '@.source_ip')"
+	result_external_ip="$(extract "$context_result" '@.external_ip')"
+	valid_ipv4 "$result_source_ip" && valid_ipv4 "$result_external_ip" || return 1
+
+	configured_route_mode="$(uci -q get "cake-autorate.$context_section.route_mode" 2>/dev/null)"
+	configured_member="$(uci -q get "cake-autorate.$context_section.mwan3_member" 2>/dev/null)"
+	[ -n "$configured_route_mode" ] || configured_route_mode=auto
+	case "$configured_route_mode" in
+		main) expected_route_mode=main; expected_member="" ;;
+		mwan3) expected_route_mode=mwan3; expected_member="$configured_member" ;;
+		auto)
+			if [ -n "$configured_member" ]; then
+				expected_route_mode=mwan3
+				expected_member="$configured_member"
+			else
+				expected_route_mode=main
+				expected_member=""
+			fi
+			;;
+		*) return 1 ;;
+	esac
+	[ "$(extract "$context_result" '@.route_mode')" = "$expected_route_mode" ] || return 1
+	[ "$(extract "$context_result" '@.mwan3_member')" = "$expected_member" ] || return 1
+	result_route_identity="$(extract "$context_result" '@.route_identity')"
+	case "$expected_route_mode" in
+		main)
+			[ "$result_route_identity" = "main||$context_interface|$result_source_ip||main" ] || return 1
+			;;
+		mwan3)
+			route_identity_prefix="mwan3|$expected_member|$context_interface|$result_source_ip|"
+			case "$result_route_identity" in "$route_identity_prefix"*) ;; *) return 1 ;; esac
+			route_identity_tail="${result_route_identity#"$route_identity_prefix"}"
+			case "$route_identity_tail" in *'|'?*) ;; *) return 1 ;; esac
+			;;
+	esac
+}
+
+stage_candidate_option() {
+	stage_option="$1"
+	stage_value="$2"
+	case "$stage_option" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+	case "$stage_value" in *'|'*|*'
+'*) return 1 ;; esac
+	if stage_previous="$(uci -q get "cake-autorate.$section.$stage_option" 2>/dev/null)"; then
+		stage_present=1
+		case "$stage_previous" in *'|'*|*'
+'*) return 1 ;; esac
+	else
+		stage_present=0
+		stage_previous=""
+	fi
+	printf '%s|%s|%s|%s\n' "$stage_option" "$stage_present" "$stage_previous" "$stage_value" >> "$ownership_journal"
+	uci -q -P "$transaction_savedir" set "cake-autorate.$section.$stage_option=$stage_value" || return 1
+}
+
+prepare_recovery_root() {
+	case "$recovery_root" in /tmp/*|/run/*|/var/run/*) ;; *) return 1 ;; esac
+	case "$recovery_root" in *'/../'*|*'/..'|*'//'*) return 1 ;; esac
+	[ ! -L "$recovery_root" ] || return 1
+	mkdir -p "$recovery_root" || return 1
+	[ -d "$recovery_root" ] && [ ! -L "$recovery_root" ] || return 1
+	chmod 700 "$recovery_root" 2>/dev/null || true
+}
+
+safe_transaction_dir() {
+	case "$1" in "$recovery_root"/apply-*) ;; *) return 1 ;; esac
+	[ -d "$1" ] && [ ! -L "$1" ]
+}
+
+write_transaction_meta() {
+	meta_dir="$1"
+	meta_section="$2"
+	meta_interface="$3"
+	meta_phase="$4"
+	safe_transaction_dir "$meta_dir" || return 1
+	safe_uci_section "$meta_section" || return 1
+	case "$meta_interface" in ''|*[!A-Za-z0-9_.:@-]*) return 1 ;; esac
+	case "$meta_phase" in prepared|commit-intent|candidate-committed|applied|restored) ;; *) return 1 ;; esac
+	meta_tmp="$meta_dir/meta.tmp.$$"
+	{
+		printf 'version=1\n'
+		printf 'section=%s\n' "$meta_section"
+		printf 'interface=%s\n' "$meta_interface"
+		printf 'phase=%s\n' "$meta_phase"
+	} > "$meta_tmp" && mv "$meta_tmp" "$meta_dir/meta"
+}
+
+load_transaction_meta() {
+	load_dir="$1"
+	safe_transaction_dir "$load_dir" || return 1
+	[ -f "$load_dir/meta" ] && [ ! -L "$load_dir/meta" ] || return 1
+	recovery_version=""
+	recovery_section=""
+	recovery_interface=""
+	recovery_phase=""
+	recovery_seen=" "
+	while IFS= read -r recovery_line || [ -n "$recovery_line" ]; do
+		case "$recovery_line" in *=*) ;; *) return 1 ;; esac
+		recovery_key="${recovery_line%%=*}"
+		recovery_value="${recovery_line#*=}"
+		case "$recovery_seen" in *" $recovery_key "*) return 1 ;; esac
+		case "$recovery_key" in
+			version) recovery_version="$recovery_value" ;;
+			section) recovery_section="$recovery_value" ;;
+			interface) recovery_interface="$recovery_value" ;;
+			phase) recovery_phase="$recovery_value" ;;
+			*) return 1 ;;
+		esac
+		recovery_seen="$recovery_seen$recovery_key "
+	done < "$load_dir/meta"
+	[ "$recovery_version" = 1 ] || return 1
+	safe_uci_section "$recovery_section" || return 1
+	case "$recovery_interface" in ''|*[!A-Za-z0-9_.:@-]*) return 1 ;; esac
+	case "$recovery_phase" in prepared|commit-intent|candidate-committed|applied|restored) ;; *) return 1 ;; esac
+}
+
+remove_transaction_dir() {
+	remove_dir="$1"
+	safe_transaction_dir "$remove_dir" || return 1
+	rm -rf "$remove_dir"
+}
+
+restart_service_locked() {
+	CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_BORROW=1 "$service" restart >/dev/null 2>&1
+}
+
+recover_apply_transaction_locked() {
+	recover_dir="$1"
+	load_transaction_meta "$recover_dir" || return 1
+	case "$recovery_phase" in
+		prepared|applied|restored)
+			remove_transaction_dir "$recover_dir"
+			return $?
+			;;
+	esac
+	ownership_file="$recover_dir/owned-options"
+	[ -s "$ownership_file" ] && [ ! -L "$ownership_file" ] || return 1
+	rollback_savedir="$recover_dir/rollback-uci"
+	[ ! -e "$rollback_savedir" ] || rm -rf "$rollback_savedir" || return 1
+	mkdir -p "$rollback_savedir" || return 1
+	rollback_count=0
+	rollback_seen=" "
+	while IFS='|' read -r rollback_option rollback_present rollback_previous rollback_candidate rollback_extra; do
+		[ -z "$rollback_extra" ] || return 1
+		case "$rollback_option" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+		case "$rollback_seen" in *" $rollback_option "*) return 1 ;; esac
+		rollback_seen="$rollback_seen$rollback_option "
+		case "$rollback_present" in 0|1) ;; *) return 1 ;; esac
+		case "$rollback_previous:$rollback_candidate" in *'|'*|*'
+'*) return 1 ;; esac
+		[ -n "$rollback_candidate" ] || return 1
+		if rollback_current="$(uci -q get "cake-autorate.$recovery_section.$rollback_option" 2>/dev/null)"; then
+			rollback_current_present=1
+		else
+			rollback_current_present=0
+			rollback_current=""
+		fi
+		if [ "$rollback_current_present" -eq 1 ] && [ "$rollback_current" = "$rollback_candidate" ]; then
+			if [ "$rollback_present" -eq 1 ]; then
+				uci -q -P "$rollback_savedir" set "cake-autorate.$recovery_section.$rollback_option=$rollback_previous" || return 1
+			else
+				uci -q -P "$rollback_savedir" delete "cake-autorate.$recovery_section.$rollback_option" || return 1
+			fi
+			rollback_count=$((rollback_count + 1))
+		elif [ "$rollback_present" -eq 1 ] && [ "$rollback_current_present" -eq 1 ] &&
+		     [ "$rollback_current" = "$rollback_previous" ]; then
+			:
+		elif [ "$rollback_present" -eq 0 ] && [ "$rollback_current_present" -eq 0 ]; then
+			:
+		else
+			write_state "$recovery_section" recovery-pending "Automatic apply recovery found a foreign value; no owned setting was overwritten"
+			return 1
+		fi
+	done < "$ownership_file"
+	[ "$rollback_seen" != " " ] || return 1
+	if [ "$rollback_count" -gt 0 ]; then
+		uci -q -P "$rollback_savedir" commit cake-autorate >/dev/null 2>&1 || {
+			write_state "$recovery_section" recovery-pending "Unable to commit the scheduler-owned rollback"
+			return 1
+		}
+	fi
+	if ! restart_service_locked; then
+		write_state "$recovery_section" recovery-pending "Rollback values are restored, but CAKE Autorate restart failed"
+		return 1
+	fi
+	if ! runtime_health_exact "$recovery_section"; then
+		write_state "$recovery_section" recovery-pending "Rollback runtime health could not be verified"
+		return 1
+	fi
+	write_transaction_meta "$recover_dir" "$recovery_section" "$recovery_interface" restored || return 1
+	remove_transaction_dir "$recover_dir" || return 1
+	write_state "$recovery_section" recovered "Interrupted automatic apply was rolled back and runtime health was verified"
+}
+
+recovery_transactions_pending() {
+	prepare_recovery_root || return 0
+	for pending_dir in "$recovery_root"/apply-*; do
+		[ -e "$pending_dir" ] && return 0
+	done
+	return 1
+}
+
+recover_pending_transactions() {
+	prepare_recovery_root || return 1
+	recovery_failed=0
+	for pending_dir in "$recovery_root"/apply-*; do
+		[ -e "$pending_dir" ] || continue
+		if [ "$runtime_lock_available" -ne 1 ]; then
+			recovery_failed=1
+			continue
+		fi
+		if ! runtime_lock_acquire_global_exclusive; then
+			recovery_failed=1
+			continue
+		fi
+		if ! recover_apply_transaction_locked "$pending_dir"; then
+			recovery_failed=1
+		fi
+		runtime_lock_release_global || recovery_failed=1
+	done
+	[ "$recovery_failed" -eq 0 ] && ! recovery_transactions_pending
+}
+
+apply_result() (
 	section="$1"
 	result="$2"
-	# Never mix scheduler-owned deltas with an administrator's uncommitted edit.
-	[ -z "$(uci -q changes cake-autorate 2>/dev/null)" ] || return 1
-	rollback_apply() {
-		uci -q revert "cake-autorate.$section" >/dev/null 2>&1 || true
-		"$service" restart >/dev/null 2>&1 || true
+	expected_fingerprint="${3:-}"
+	expected_interface="${4:-}"
+	transaction_dir=""
+	transaction_savedir=""
+	ownership_journal=""
+	apply_lock_held=0
+	apply_succeeded=0
+	apply_cleanup() {
+		apply_cleanup_rc=$?
+		if [ "$apply_succeeded" -ne 1 ] && [ -n "$transaction_dir" ] &&
+		   [ -d "$transaction_dir" ] && [ "$apply_lock_held" -eq 1 ]; then
+			if ! recover_apply_transaction_locked "$transaction_dir"; then
+				apply_cleanup_rc=1
+			fi
+		fi
+		if [ "$apply_lock_held" -eq 1 ]; then
+			runtime_lock_release_global || apply_cleanup_rc=1
+		fi
+		trap - EXIT INT TERM
+		exit "$apply_cleanup_rc"
 	}
+	trap apply_cleanup EXIT
+	trap 'exit 1' INT TERM
+
+	safe_uci_section "$section" || exit 1
+	case "$expected_interface" in ''|*[!A-Za-z0-9_.:@-]*) exit 1 ;; esac
+	[ "$runtime_lock_available" -eq 1 ] || exit 1
+	result_is_auto_apply_eligible "$result" || exit 1
+	runtime_lock_acquire_global_exclusive || exit 1
+	apply_lock_held=1
+	configuration_has_pending_changes || exit 1
+	result_matches_apply_context "$section" "$expected_interface" "$expected_fingerprint" "$result" || exit 1
+	route_attestation_matches_result "$section" "$expected_interface" "$result" || exit 1
+
+	prepare_recovery_root || exit 1
+	transaction_dir="$(mktemp -d "$recovery_root/apply-$section.XXXXXX")" || exit 1
+	transaction_savedir="$transaction_dir/uci"
+	mkdir -p "$transaction_savedir" || exit 1
+	ownership_journal="$transaction_dir/owned-options"
+	: > "$ownership_journal" || exit 1
+	write_transaction_meta "$transaction_dir" "$section" "$expected_interface" prepared || exit 1
 	dl_min="$(extract "$result" '@.proposal.download.minimum_kbps')"
 	dl_base="$(extract "$result" '@.proposal.download.base_kbps')"
 	dl_max="$(extract "$result" '@.proposal.download.maximum_kbps')"
@@ -138,31 +759,25 @@ apply_result() {
 	ul_cap="$(extract "$result" '@.proposal.upload.absolute_cap_kbps')"
 	ul_low="$(extract "$result" '@.proposal.upload.observed_low_kbps')"
 	ul_median="$(extract "$result" '@.proposal.upload.observed_median_kbps')"
-	case "$dl_min:$dl_base:$dl_max:$dl_cap:$dl_low:$dl_median:$ul_min:$ul_base:$ul_max:$ul_cap:$ul_low:$ul_median" in
-		*[!0-9:]*) return 1 ;;
-	esac
-
-	uci -q batch <<-EOF || {
-		set cake-autorate.$section.min_dl_shaper_rate_kbps='$dl_min'
-		set cake-autorate.$section.base_dl_shaper_rate_kbps='$dl_base'
-		set cake-autorate.$section.max_dl_shaper_rate_kbps='$dl_max'
-		set cake-autorate.$section.min_ul_shaper_rate_kbps='$ul_min'
-		set cake-autorate.$section.base_ul_shaper_rate_kbps='$ul_base'
-		set cake-autorate.$section.max_ul_shaper_rate_kbps='$ul_max'
-		set cake-autorate.$section.sqm_download='$dl_base'
-		set cake-autorate.$section.sqm_upload='$ul_base'
-		set cake-autorate.$section.adaptive_ceiling_dl_cap_kbps='$dl_cap'
-		set cake-autorate.$section.adaptive_ceiling_ul_cap_kbps='$ul_cap'
-		set cake-autorate.$section.transport_latency_enabled='1'
-		set cake-autorate.$section.throughput_guard_enabled='1'
-		set cake-autorate.$section.throughput_reference_dl_p20_kbps='$dl_low'
-		set cake-autorate.$section.throughput_reference_dl_p50_kbps='$dl_median'
-		set cake-autorate.$section.throughput_reference_ul_p20_kbps='$ul_low'
-		set cake-autorate.$section.throughput_reference_ul_p50_kbps='$ul_median'
-	EOF
-		rollback_apply
-		return 1
-	}
+	result_is_auto_apply_eligible "$result" || exit 1
+	configuration_has_pending_changes || exit 1
+	result_matches_apply_context "$section" "$expected_interface" "$expected_fingerprint" "$result" || exit 1
+	stage_candidate_option min_dl_shaper_rate_kbps "$dl_min" || exit 1
+	stage_candidate_option base_dl_shaper_rate_kbps "$dl_base" || exit 1
+	stage_candidate_option max_dl_shaper_rate_kbps "$dl_max" || exit 1
+	stage_candidate_option min_ul_shaper_rate_kbps "$ul_min" || exit 1
+	stage_candidate_option base_ul_shaper_rate_kbps "$ul_base" || exit 1
+	stage_candidate_option max_ul_shaper_rate_kbps "$ul_max" || exit 1
+	stage_candidate_option sqm_download "$dl_base" || exit 1
+	stage_candidate_option sqm_upload "$ul_base" || exit 1
+	stage_candidate_option adaptive_ceiling_dl_cap_kbps "$dl_cap" || exit 1
+	stage_candidate_option adaptive_ceiling_ul_cap_kbps "$ul_cap" || exit 1
+	stage_candidate_option transport_latency_enabled 1 || exit 1
+	stage_candidate_option throughput_guard_enabled 1 || exit 1
+	stage_candidate_option throughput_reference_dl_p20_kbps "$dl_low" || exit 1
+	stage_candidate_option throughput_reference_dl_p50_kbps "$dl_median" || exit 1
+	stage_candidate_option throughput_reference_ul_p20_kbps "$ul_low" || exit 1
+	stage_candidate_option throughput_reference_ul_p50_kbps "$ul_median" || exit 1
 
 	for pair in \
 		"connection_active_thr_kbps @.proposal.active_threshold_kbps" \
@@ -183,36 +798,56 @@ apply_result() {
 		set -- $pair
 		value="$(extract "$result" "$2")"
 		case "$value" in
-			''|*[!0-9.]*) rollback_apply; return 1 ;;
+			''|*[!0-9.]*) exit 1 ;;
 		esac
-		uci -q set "cake-autorate.$section.$1=$value" || {
-			rollback_apply
-			return 1
-		}
+		stage_candidate_option "$1" "$value" || exit 1
 	done
 
-	adaptive="$(extract "$result" '@.proposal.adaptive_ceiling.enabled')"
-	[ "$adaptive" = true ] && adaptive=1 || adaptive=0
 	link_layer="$(extract "$result" '@.proposal.link.layer')"
-	uci -q set "cake-autorate.$section.adaptive_ceiling_enabled=$adaptive" || {
-		rollback_apply
-		return 1
-	}
-	uci -q set "cake-autorate.$section.sqm_linklayer=$link_layer" || {
-		rollback_apply
-		return 1
-	}
+	case "$link_layer" in none|ethernet|atm) ;; *) exit 1 ;; esac
+	stage_candidate_option sqm_linklayer "$link_layer" || exit 1
 
-	# Validate the staged UCI delta by restarting before it is committed. If the
-	# candidate cannot run, revert it and return the previous instance to service.
-	"$service" restart >/dev/null 2>&1 || {
-		rollback_apply
-		return 1
-	}
-	uci commit cake-autorate || {
-		rollback_apply
-		return 1
-	}
+	# The proposal may have spent many seconds in extraction/staging.  Repeat
+	# every trust check at the last possible point before the private UCI delta
+	# becomes committed state.
+	result_is_auto_apply_eligible "$result" || exit 1
+	configuration_has_pending_changes || exit 1
+	result_matches_apply_context "$section" "$expected_interface" "$expected_fingerprint" "$result" || exit 1
+	route_attestation_matches_result "$section" "$expected_interface" "$result" || exit 1
+	write_transaction_meta "$transaction_dir" "$section" "$expected_interface" commit-intent || exit 1
+	uci -q -P "$transaction_savedir" commit cake-autorate || exit 1
+	write_transaction_meta "$transaction_dir" "$section" "$expected_interface" candidate-committed || exit 1
+
+	# The init child explicitly borrows fd 8.  It neither reacquires nor releases
+	# the scheduler-owned exclusive lock, so stage/commit/restart is one
+	# continuous transaction and cannot deadlock on itself.
+	restart_service_locked || exit 1
+	runtime_health_exact "$section" || exit 1
+	route_attestation_matches_result "$section" "$expected_interface" "$result" || exit 1
+	write_transaction_meta "$transaction_dir" "$section" "$expected_interface" applied || exit 1
+	apply_succeeded=1
+	if ! remove_transaction_dir "$transaction_dir"; then
+		# The applied marker is authoritative: commit, restart, exact SQM/daemon
+		# health, and route attestation all succeeded. A tmpfs cleanup error must not
+		# report the already-live candidate as failed; startup safely removes an
+		# applied-phase journal without rolling it back.
+		write_state "$section" applied "Validated proposal was applied; stale RAM transaction cleanup is deferred" || true
+	fi
+	exit 0
+)
+
+finish_attempt_accounting() {
+	attempt_section="$1"
+	attempt_interface="$2"
+	attempt_bytes_before="$3"
+	attempt_finished_at="$(date +%s)"
+	attempt_bytes_after="$(interface_bytes "$attempt_interface" 2>/dev/null || printf '%s' "$attempt_bytes_before")"
+	if [ "$attempt_bytes_after" -ge "$attempt_bytes_before" ] 2>/dev/null; then
+		record_budget "$attempt_section" "$((attempt_bytes_after - attempt_bytes_before))"
+	fi
+	attempt_tmp="$state_root/$attempt_section.last-attempt.$$"
+	printf '%s\n' "$attempt_finished_at" > "$attempt_tmp" &&
+		mv "$attempt_tmp" "$state_root/$attempt_section.last-attempt"
 }
 
 run_section() {
@@ -220,79 +855,134 @@ run_section() {
 	interface="$2"
 	now="$3"
 	bytes_before="$4"
+	expected_fingerprint="$5"
 	backend="$(uci -q get "cake-autorate.$section.speedtest_backend" 2>/dev/null)"
 	[ -n "$backend" ] || backend=auto
+	configuration_has_pending_changes &&
+		[ "$(configuration_fingerprint "$section")" = "$expected_fingerprint" ] || {
+			write_state "$section" deferred "Configuration changed before scheduled Full Auto-Tune could start"
+			return
+		}
 	write_state "$section" running "Scheduled Full Auto-Tune is running"
 	"$helper" "$section" "$interface" start "$backend" >/dev/null 2>&1 || {
+		finish_attempt_accounting "$section" "$interface" "$bytes_before"
 		write_state "$section" failed "Unable to start scheduled Full Auto-Tune"
 		return
 	}
 
-	deadline="$((now + 1800))"
+	deadline="$((now + job_timeout_s))"
+	state=running
 	while [ "$(date +%s)" -lt "$deadline" ]; do
-		result="$("$helper" "$section" "$interface" status "$backend" 2>/dev/null)"
+		if ! result="$("$helper" "$section" "$interface" status "$backend" 2>/dev/null)"; then
+			finish_attempt_accounting "$section" "$interface" "$bytes_before"
+			write_state "$section" failed "Scheduled Full Auto-Tune status could not be read; no result was trusted"
+			return
+		fi
 		state="$(extract "$result" '@.state')"
 		case "$state" in
 			complete) break ;;
-			failed|cancelled|'')
+			running|recovery-pending)
+				sleep "$poll_interval_s"
+				continue
+				;;
+			inconclusive|background-blocked)
+				finish_attempt_accounting "$section" "$interface" "$bytes_before"
+				reason="$(extract "$result" '@.reason' 2>/dev/null || true)"
+				[ -n "$reason" ] || reason="$state"
+				write_state "$section" deferred "Scheduled Full Auto-Tune was inconclusive ($reason); it will retry after the safety delay"
+				return
+				;;
+			failed|cancelled|idle)
+				finish_attempt_accounting "$section" "$interface" "$bytes_before"
 				write_state "$section" failed "Scheduled Full Auto-Tune failed; no configuration was written"
 				return
 				;;
+			*)
+				finish_attempt_accounting "$section" "$interface" "$bytes_before"
+				write_state "$section" failed "Scheduled Full Auto-Tune returned an unknown state; no result was trusted"
+				return
+				;;
 		esac
-		sleep 5
 	done
 	[ "$state" = complete ] || {
-		"$helper" "$section" "$interface" cancel "$backend" >/dev/null 2>&1 || true
-		write_state "$section" failed "Scheduled Full Auto-Tune timed out"
+		if [ "$state" = recovery-pending ]; then
+			write_state "$section" recovery-pending "Full Auto-Tune runtime recovery is still pending; the scheduler will retry only after it settles"
+		else
+			if ! "$helper" "$section" "$interface" cancel "$backend" >/dev/null 2>&1; then
+				write_state "$section" failed "Scheduled Full Auto-Tune timed out and cancellation could not be confirmed"
+			else
+				write_state "$section" failed "Scheduled Full Auto-Tune timed out"
+			fi
+		fi
+		finish_attempt_accounting "$section" "$interface" "$bytes_before"
 		return
 	}
 
-	bytes_after="$(interface_bytes "$interface" 2>/dev/null || printf '%s' "$bytes_before")"
-	[ "$bytes_after" -ge "$bytes_before" ] 2>/dev/null &&
-		record_budget "$section" "$((bytes_after - bytes_before))"
+	finish_attempt_accounting "$section" "$interface" "$bytes_before"
 	printf '%s\n' "$(date +%s)" > "$state_root/$section.last"
 	if [ "$(uci -q get "cake-autorate.$section.scheduled_autotune_auto_apply" 2>/dev/null)" = 1 ]; then
-		if apply_result "$section" "$result"; then
+		if ! result_is_auto_apply_eligible "$result"; then
+			write_state "$section" proposal_ready "Full Auto-Tune completed, but its evidence is not eligible for automatic apply; manual review is required"
+			return
+		fi
+		if apply_result "$section" "$result" "$expected_fingerprint" "$interface"; then
 			write_state "$section" applied "Validated Full Auto-Tune proposal was applied"
 		else
-			uci -q revert "cake-autorate.$section" >/dev/null 2>&1 || true
-			write_state "$section" failed "Validated result could not be applied"
+			write_state "$section" failed "Validated result could not be applied because configuration, route, recovery, or runtime state changed"
 		fi
-	else
+	elif result_is_auto_apply_eligible "$result"; then
 		write_state "$section" proposal_ready "Validated proposal is ready for manual review"
+	else
+		write_state "$section" proposal_ready "Proposal is ready for manual review, but is not eligible for automatic apply"
 	fi
 }
 
 check_section() {
 	section="$1"
-	[ "$(uci -q get "cake-autorate.$section.scheduled_autotune_enabled" 2>/dev/null)" = 1 ] || return
-	[ -z "$(uci -q changes cake-autorate 2>/dev/null)" ] || {
-		write_state "$section" deferred "Uncommitted CAKE Autorate settings are pending"
+	[ "$(uci -q get "cake-autorate.$section.scheduled_autotune_enabled" 2>/dev/null)" = 1 ] || return 0
+	if recovery_transactions_pending; then
+		write_state "$section" recovery-pending "An interrupted automatic apply must be recovered before another calibration"
+		return
+	fi
+	configuration_has_pending_changes || {
+		write_state "$section" deferred "Uncommitted CAKE Autorate or managed SQM settings are pending"
 		return
 	}
 	interval_h="$(get_uint "$section" scheduled_autotune_interval_hours 24)"
 	start_h="$(get_uint "$section" scheduled_autotune_window_start_hour 2)"
 	end_h="$(get_uint "$section" scheduled_autotune_window_end_hour 5)"
-	within_window "$start_h" "$end_h" || return
+	within_window "$start_h" "$end_h" || return 0
 	now="$(date +%s)"
 	last=0
 	[ -s "$state_root/$section.last" ] && last="$(sed -n '1p' "$state_root/$section.last")"
 	case "$last" in ''|*[!0-9]*) last=0 ;; esac
-	[ "$((now - last))" -ge "$((interval_h * 3600))" ] || return
+	[ "$((now - last))" -ge "$((interval_h * 3600))" ] || return 0
+	last_attempt=0
+	[ -s "$state_root/$section.last-attempt" ] && last_attempt="$(sed -n '1p' "$state_root/$section.last-attempt")"
+	case "$last_attempt" in ''|*[!0-9]*) last_attempt=0 ;; esac
+	[ "$((now - last_attempt))" -ge "$retry_delay_s" ] || return 0
 	budget_ready "$section" || {
 		write_state "$section" deferred "Daily traffic budget reached"
 		return
 	}
 	interface="$(uci -q get "cake-autorate.$section.wan_if" 2>/dev/null)"
 	[ -n "$interface" ] || interface="$(uci -q get "cake-autorate.$section.sqm_interface" 2>/dev/null)"
-	interface="$(resolve_interface "$interface")" || return
-	bytes="$(interface_bytes "$interface")" || return
-	idle_ready "$section" "$interface" "$now" "$bytes" || return
-	run_section "$section" "$interface" "$now" "$bytes"
+	interface="$(resolve_interface "$interface")" || return 0
+	bytes="$(interface_bytes "$interface")" || return 0
+	idle_ready "$section" "$interface" "$now" "$bytes" || return 0
+	fingerprint="$(configuration_fingerprint "$section")" || {
+		write_state "$section" deferred "Unable to fingerprint the instance and its owned SQM queue"
+		return
+	}
+	run_section "$section" "$interface" "$now" "$bytes" "$fingerprint"
 }
 
 run_loop() {
 	while true; do
+		if ! recover_pending_transactions; then
+			sleep "$sleep_s"
+			continue
+		fi
 		sections="$(uci -q show cake-autorate 2>/dev/null | sed -n 's/^cake-autorate\.\([^.=]*\)=cake_autorate$/\1/p')"
 		for section in $sections; do
 			check_section "$section"
@@ -305,6 +995,12 @@ run_loop() {
 
 case "${1:-run}" in
 	run) run_loop ;;
-	check) check_section "$2" ;;
+	check)
+		recover_pending_transactions || {
+			[ -z "${2:-}" ] || write_state "$2" recovery-pending "Interrupted automatic apply recovery is incomplete"
+			exit 1
+		}
+		check_section "$2"
+		;;
 	*) printf 'usage: %s [run|check INSTANCE]\n' "$0" >&2; exit 2 ;;
 esac

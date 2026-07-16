@@ -26,7 +26,7 @@ contract as:
 
 ```text
 transport_probe_method=network_rtt_v3
-quality_grade_method=transport_rtt_p90_loaded_minus_p5_idle_v3
+quality_grade_method=transport_rtt_p90_loaded_minus_p5_idle_v4
 ```
 
 The legacy process-timed mode remains selectable only for diagnosis. It is
@@ -251,6 +251,14 @@ Periodic Full Auto-Tune is a separate opt-in facility. It keeps its own
 maintenance window, quiet-time, budget, validation, and review/auto-apply
 policy. Failure, timeout, route mismatch, CPU saturation, or insufficient
 throughput retention leaves UCI unchanged.
+
+The RC17 Auto-Tune validator deliberately does not reuse the detected-grade
+p90-minus-p5 formula above. A bounded calibration phase compares persistent
+native transport `loaded p95 - idle p95`, and separately records ICMP
+`loaded p95 - idle p95`. It also records forwarded client traffic for every
+heavy phase. Failed, contaminated, conservative, incomplete, or infeasible
+calibration evidence cannot be Auto-Applied. See [AUTOTUNE.md](AUTOTUNE.md) for
+the three throughput ratios and typed correction rules.
 
 ## Multi-WAN isolation
 

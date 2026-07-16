@@ -32,6 +32,8 @@ export CAKE_AUTORATE_SPEEDTEST="$fixtures/speedtest"
 export CAKE_AUTORATE_JSONFILTER="$fixtures/jsonfilter"
 export CAKE_AUTORATE_UCI="$fixtures/uci"
 export CAKE_AUTORATE_QUALITY_TIMEOUT_S=15
+export CAKE_AUTORATE_RUNTIME_LOCK_LIB="$test_dir/../../cake-autorate-rs/files/usr/libexec/cake-autorate-rs/runtime-lock"
+export CAKE_AUTORATE_RUNTIME_LOCK_ROOT="$work/runtime-locks"
 
 "$helper" automatic start automatic speedtest-go > "$work/start.json"
 grep -q '"state":"running"' "$work/start.json"

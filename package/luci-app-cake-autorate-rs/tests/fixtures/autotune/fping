@@ -1,6 +1,27 @@
 #!/bin/sh
 
-printf '%s\n' \
-	'1.1.1.1 : 10.0 11.0 12.0 13.0 14.0' \
-	'9.9.9.9 : 12.0 13.0 14.0 15.0 16.0' \
-	'8.8.8.8 : 11.0 12.0 13.0 14.0 15.0' >&2
+if [ -n "${AUTOTUNE_MOCK_FPING_CALLS:-}" ]; then
+	awk '{ print $1 }' /proc/uptime >> "$AUTOTUNE_MOCK_FPING_CALLS"
+fi
+
+sparse_reflector="${AUTOTUNE_MOCK_FPING_SPARSE_REFLECTOR:-0}"
+if [ "${AUTOTUNE_MOCK_FPING_SPARSE_FIRST_ONLY:-0}" = 1 ]; then
+	if [ ! -e "${AUTOTUNE_MOCK_FPING_SPARSE_MARKER:?}" ]; then
+		: > "$AUTOTUNE_MOCK_FPING_SPARSE_MARKER"
+		sparse_reflector=1
+	else
+		sparse_reflector=0
+	fi
+fi
+
+if [ "$sparse_reflector" = 1 ]; then
+	printf '%s\n' \
+		'1.1.1.1       : 10.0 11.0 12.0 13.0 14.0' \
+		'9.9.9.9       : 12.0 13.0 - - -' \
+		'8.8.8.8       : 11.0 12.0 13.0 14.0 15.0' >&2
+else
+	printf '%s\n' \
+		'1.1.1.1       : 10.0 11.0 12.0 13.0 14.0' \
+		'9.9.9.9       : 12.0 13.0 14.0 15.0 16.0' \
+		'8.8.8.8       : 11.0 12.0 13.0 14.0 15.0' >&2
+fi

@@ -1,0 +1,61 @@
+#!/bin/sh
+
+printf 'tc %s\n' "$*" >> "$CAKE_RECOVER_TEST_ROOT/actions"
+[ "${CAKE_RECOVER_TC_FOREIGN_ROOT:-0}" != 1 ] || {
+	case "$*" in
+		'qdisc show dev eth0') printf 'qdisc htb 8001: root refcnt 2\n'; exit 0 ;;
+	esac
+}
+[ "${CAKE_RECOVER_TC_OWNED:-0}" != 1 ] || {
+	case "$*" in
+		'qdisc show dev eth0')
+			[ ! -e "$CAKE_RECOVER_TEST_ROOT/tc-target-root" ] ||
+				printf 'qdisc cake adea: root bandwidth 100Mbit\n'
+			[ ! -e "$CAKE_RECOVER_TEST_ROOT/tc-ingress" ] ||
+				printf 'qdisc ingress ffff: parent ffff:fff1\n'
+			exit 0
+			;;
+		'qdisc show dev catfdeadbeef')
+			[ ! -e "$CAKE_RECOVER_TEST_ROOT/tc-ifb-root" ] ||
+				printf 'qdisc cake bdea: root bandwidth 100Mbit\n'
+			exit 0
+			;;
+		'filter show dev eth0 ingress')
+			if [ -e "$CAKE_RECOVER_TEST_ROOT/tc-filter" ]; then
+				printf 'filter parent ffff: protocol all pref 49152 u32\n'
+				printf ' action order 1: mirred egress redirect dev catfdeadbeef\n'
+			fi
+			exit 0
+			;;
+		'qdisc del dev eth0 ingress')
+			rm -f "$CAKE_RECOVER_TEST_ROOT/tc-ingress" "$CAKE_RECOVER_TEST_ROOT/tc-filter"
+			exit 0
+			;;
+		'qdisc del dev eth0 root') rm -f "$CAKE_RECOVER_TEST_ROOT/tc-target-root"; exit 0 ;;
+		'qdisc del dev catfdeadbeef root') rm -f "$CAKE_RECOVER_TEST_ROOT/tc-ifb-root"; exit 0 ;;
+	esac
+}
+[ "${CAKE_RECOVER_TC_KERNEL_DEFAULT:-0}" != 1 ] || {
+	case "$*" in
+		'qdisc show dev eth0') printf 'qdisc mq 0: root\n'; exit 0 ;;
+	esac
+}
+[ "${CAKE_RECOVER_TC_SHOW_FAIL:-0}" != 1 ] || {
+	case "$*" in
+		'qdisc show '*|'filter show '*) exit 1 ;;
+	esac
+}
+[ "${CAKE_RECOVER_TC_LEAK:-0}" != 1 ] || {
+	case "$*" in
+		'qdisc show dev eth0')
+			printf 'qdisc cake adea: root bandwidth 100Mbit\n'
+			printf 'qdisc ingress ffff: parent ffff:fff1\n'
+			;;
+		'qdisc show dev catfdeadbeef') printf 'qdisc cake bdea: root bandwidth 100Mbit\n' ;;
+		'filter show dev eth0 ingress')
+			printf 'filter parent ffff: protocol all pref 49152 u32\n'
+			printf ' action order 1: mirred egress redirect dev catfdeadbeef\n'
+			;;
+	esac
+}
+exit 0

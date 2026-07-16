@@ -1,0 +1,38 @@
+#!/bin/sh
+
+[ -n "${AUTOTUNE_MOCK_NFT_LOG:-}" ] && printf '%s\n' "$*" >> "$AUTOTUNE_MOCK_NFT_LOG"
+
+case "$1" in
+	add|delete)
+		exit 0
+		;;
+	list)
+		if [ "${2:-}" = ruleset ]; then
+			if [ "${AUTOTUNE_MOCK_NFT_FLOWTABLE:-0}" = 1 ]; then
+				printf '%s\n' \
+					'table inet fw4 {' \
+					' flowtable ft {' \
+					'  hook ingress priority filter' \
+					'  devices = { eth0 }' \
+					' }' \
+					'}'
+			fi
+			exit 0
+		fi
+		if [ "${2:-}" = tables ]; then
+			[ -n "${AUTOTUNE_MOCK_NFT_TABLES:-}" ] && printf '%s\n' "$AUTOTUNE_MOCK_NFT_TABLES"
+			exit 0
+		fi
+		[ "${AUTOTUNE_MOCK_NFT_FAIL_LIST:-0}" = 1 ] && exit 1
+		if [ "${AUTOTUNE_MOCK_NFT_MISSING_COUNTER:-0}" = 1 ]; then
+			printf '%s\n' 'iifname "lo" counter packets 1 bytes 100 comment "cake-autotune-dl"'
+			exit 0
+		fi
+		printf '%s\n' \
+			'iifname "lo" counter packets 1 bytes 100 comment "cake-autotune-dl"' \
+			'oifname "lo" counter packets 1 bytes 100 comment "cake-autotune-ul"'
+		exit 0
+		;;
+esac
+
+exit 1

@@ -57,7 +57,7 @@ function statusPath(section) {
 }
 
 function readStatus(section) {
-	return L.resolveDefault(fs.read_direct(statusPath(section)).then(JSON.parse), null);
+	return L.resolveDefault(fs.read(statusPath(section)).then(JSON.parse), null);
 }
 
 function readPackageVersions() {

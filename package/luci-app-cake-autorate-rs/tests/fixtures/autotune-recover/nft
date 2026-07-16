@@ -1,0 +1,20 @@
+#!/bin/sh
+
+printf 'nft %s\n' "$*" >> "$CAKE_RECOVER_TEST_ROOT/actions"
+table="${4:-}"
+marker="$CAKE_RECOVER_TEST_ROOT/nft-$table"
+if [ "${CAKE_RECOVER_NFT_LIST_FAIL:-0}" = 1 ] && [ "${1:-} ${2:-}" = 'list tables' ]; then
+	exit 1
+fi
+if [ "${1:-} ${2:-}" = 'list tables' ]; then
+	for existing in "$CAKE_RECOVER_TEST_ROOT"/nft-*; do
+		[ -e "$existing" ] || continue
+		printf 'table inet %s\n' "${existing##*/nft-}"
+	done
+	exit 0
+fi
+case "${1:-} ${2:-} ${3:-}" in
+	'list table inet') [ -e "$marker" ] ;;
+	'delete table inet') rm -f "$marker" ;;
+	*) exit 1 ;;
+esac

@@ -1,9 +1,95 @@
 #!/bin/sh
 
-key="$3"
+if [ "${1:-}" = -q ]; then shift; fi
+if [ "${1:-}" = -c ]; then
+	config_dir="$2"
+	shift 2
+else
+	config_dir=""
+fi
+action="${1:-}"
+key="${2:-}"
+[ -z "${CAKE_TEST_UCI_CONTEXT_LOG:-}" ] ||
+	printf '%s|%s|%s\n' "$action" "${config_dir:-LIVE}" "$key" >> "$CAKE_TEST_UCI_CONTEXT_LOG"
+
+if [ "$action" = show ]; then
+	[ -z "${CAKE_TEST_UCI_LOG:-}" ] || printf 'show:%s:%s\n' "$config_dir" "$key" >> "$CAKE_TEST_UCI_LOG"
+	[ "$key" = sqm.cake_wanb_sqm ] || exit 1
+	show_changed="${CAKE_TEST_SQM_SHOW_CHANGED:-0}"
+	if [ -z "$config_dir" ] && [ "${CAKE_TEST_LIVE_SQM_SHOW_CHANGED:-0}" = 1 ]; then
+		show_changed=1
+	fi
+	if [ "${CAKE_TEST_SQM_SHOW_CHANGE_AFTER_INITIAL:-0}" = 1 ]; then
+		show_reads="$(grep -c '^show:' "$CAKE_TEST_UCI_LOG" 2>/dev/null || true)"
+		[ "$show_reads" -le 1 ] || show_changed=1
+	fi
+	printf "sqm.cake_wanb_sqm='queue'\n"
+	printf "sqm.cake_wanb_sqm._cake_autorate_managed='%s'\n" "${CAKE_TEST_SQM_OWNER:-wanb_sqm}"
+	printf "sqm.cake_wanb_sqm.enabled='%s'\n" "${CAKE_TEST_SQM_ENABLED:-1}"
+	printf "sqm.cake_wanb_sqm.interface='%s'\n" "${CAKE_TEST_SQM_TARGET:-eth0}"
+	printf "sqm.cake_wanb_sqm.download='100000'\n"
+	if [ "$show_changed" = 1 ]; then
+		printf "sqm.cake_wanb_sqm.upload='21000'\n"
+	else
+		printf "sqm.cake_wanb_sqm.upload='20000'\n"
+	fi
+	printf "sqm.cake_wanb_sqm.qdisc='cake'\n"
+	printf "sqm.cake_wanb_sqm.script='piece_of_cake.qos'\n"
+	printf "sqm.cake_wanb_sqm.linklayer='none'\n"
+	printf "sqm.cake_wanb_sqm.overhead='0'\n"
+	printf "sqm.cake_wanb_sqm.tcMPU='0'\n"
+	exit 0
+fi
+
+[ "$action" = get ] || exit 1
+[ -z "${CAKE_TEST_UCI_LOG:-}" ] || printf '%s\n' "$key" >> "$CAKE_TEST_UCI_LOG"
+
+if [ "${CAKE_TEST_SQM_CHANGE_AFTER_INITIAL:-0}" = 1 ]; then
+	case "$key" in
+		sqm.cake_wanb_sqm.*)
+			reads="$(grep -c '^sqm\.cake_wanb_sqm\.' "$CAKE_TEST_UCI_LOG" 2>/dev/null || true)"
+			if [ "$reads" -gt 3 ]; then
+				case "$key" in
+					sqm.cake_wanb_sqm._cake_autorate_managed) printf 'another_instance\n' ;;
+					sqm.cake_wanb_sqm.enabled) printf '0\n' ;;
+					sqm.cake_wanb_sqm.interface) printf 'eth9\n' ;;
+				esac
+				exit 0
+			fi
+			;;
+	esac
+fi
+
 case "$key" in
-	*.enabled|*.sqm_enabled|*.manage_sqm) printf '1\n' ;;
-	*.sqm_interface|*.ul_if) printf 'eth0\n' ;;
-	*.dl_if) printf 'ifb4eth0\n' ;;
+	cake-autorate.*.enabled|cake-autorate.*.sqm_enabled|cake-autorate.*.manage_sqm)
+		[ "${CAKE_TEST_MUTABLE_CAKE_UCI:-0}" = 1 ] && printf '0\n' || printf '1\n'
+		;;
+	cake-autorate.*.sqm_interface|cake-autorate.*.ul_if)
+		[ "${CAKE_TEST_MUTABLE_CAKE_UCI:-0}" = 1 ] && printf 'eth9\n' || printf 'eth0\n'
+		;;
+	cake-autorate.*.dl_if)
+		[ "${CAKE_TEST_MUTABLE_CAKE_UCI:-0}" = 1 ] && printf 'ifb4eth9\n' || printf 'ifb4eth0\n'
+		;;
+	cake-autorate.*.sqm_section)
+		[ "${CAKE_TEST_MUTABLE_CAKE_UCI:-0}" = 1 ] && printf 'cake_changed\n' || printf 'cake_wanb_sqm\n'
+		;;
+	sqm.cake_wanb_sqm._cake_autorate_managed)
+		printf '%s\n' "${CAKE_TEST_SQM_OWNER:-wanb_sqm}"
+		;;
+	sqm.cake_wanb_sqm.enabled)
+		printf '%s\n' "${CAKE_TEST_SQM_ENABLED:-1}"
+		;;
+	sqm.cake_wanb_sqm.interface)
+		printf '%s\n' "${CAKE_TEST_SQM_TARGET:-eth0}"
+		;;
+	sqm.cake_wanb_sqm.download) printf '100000\n' ;;
+	sqm.cake_wanb_sqm.upload) printf '20000\n' ;;
+	sqm.cake_wanb_sqm.qdisc) printf 'cake\n' ;;
+	sqm.cake_wanb_sqm.script) printf 'piece_of_cake.qos\n' ;;
+	sqm.cake_wanb_sqm.linklayer) printf 'none\n' ;;
+	sqm.cake_wanb_sqm.linklayer_adaptation_mechanism) printf 'default\n' ;;
+	sqm.cake_wanb_sqm.overhead|sqm.cake_wanb_sqm.tcMPU|sqm.cake_wanb_sqm.use_mq|\
+	sqm.cake_wanb_sqm.squash_dscp|sqm.cake_wanb_sqm.squash_ingress) printf '0\n' ;;
+	sqm.cake_wanb_sqm.iqdisc_opts|sqm.cake_wanb_sqm.eqdisc_opts) printf '\n' ;;
 	*) exit 1 ;;
 esac

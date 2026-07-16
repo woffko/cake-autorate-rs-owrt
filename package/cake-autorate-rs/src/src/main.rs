@@ -1222,7 +1222,10 @@ impl Config {
                 TransportProbeBackend::TcpConnect => {
                     self.transport_probe_endpoint.starts_with("tcp://")
                 }
-                TransportProbeBackend::PersistentHttp | TransportProbeBackend::LegacyHttp => {
+                TransportProbeBackend::PersistentHttp => {
+                    self.transport_probe_endpoint.starts_with("https://")
+                }
+                TransportProbeBackend::LegacyHttp => {
                     self.transport_probe_endpoint.starts_with("http://")
                         || self.transport_probe_endpoint.starts_with("https://")
                 }
@@ -6631,36 +6634,102 @@ fn reflector_health_json(
 fn print_usage() {
     eprintln!("usage: cake-autorated [--instance NAME] [--once] [--dump-config]");
     eprintln!(
-        "       cake-autorated --autotune-proposal --dl-samples LIST --ul-samples LIST \\\n         --idle-median-ms N --idle-p95-ms N --idle-samples N [--link-kind KIND]"
+        "       cake-autorated --autotune-proposal --dl-samples LIST --ul-samples LIST \\\n         --idle-median-ms N --idle-p95-ms N --idle-samples N [--link-kind KIND] \\\n         [--base-scale N | --dl-base-scale N --ul-base-scale N]"
     );
+    eprintln!("       cake-autorated --autotune-validate --dl-observed-low-kbps N --ul-observed-low-kbps N --dl-candidate-kbps N --ul-candidate-kbps N --dl-achieved-kbps N --ul-achieved-kbps N --dl-min-kbps N --ul-min-kbps N --dl-max-kbps N --ul-max-kbps N --icmp-delta-ms N --transport-delta-ms N --loss-percent N --cpu-percent N");
+    eprintln!("         [--dl-icmp-delta-ms N --ul-icmp-delta-ms N --dl-transport-delta-ms N --ul-transport-delta-ms N --dl-loss-percent N --ul-loss-percent N --dl-cpu-percent N --ul-cpu-percent N]");
     eprintln!("       cake-autorated --transport-probe --backend websocket|tcp|http|legacy-http [--endpoint URL] [--device IFACE] [--source-ip IPv4] [--fwmark HEX] [--count N] [--timeout SEC] [--interval-ms N]");
 }
 
 fn parse_rate_samples(value: &str) -> Result<Vec<f64>, String> {
-    value
-        .split(',')
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| {
-            value
-                .trim()
-                .parse::<f64>()
-                .map_err(|_| format!("invalid rate sample: {value}"))
-        })
-        .collect()
+    if value.trim().is_empty() {
+        return Err("rate sample list must not be empty".to_string());
+    }
+    let mut samples = Vec::new();
+    for (index, value) in value.split(',').enumerate() {
+        if index >= autotune::MAX_THROUGHPUT_SAMPLES {
+            return Err(format!(
+                "rate sample count must not exceed {}",
+                autotune::MAX_THROUGHPUT_SAMPLES
+            ));
+        }
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(format!("rate sample {} is empty", index + 1));
+        }
+        let sample = value
+            .parse::<f64>()
+            .map_err(|_| format!("invalid rate sample {}: {value}", index + 1))?;
+        if !sample.is_finite() || sample <= 0.0 || sample > autotune::MAX_RATE_KBPS as f64 {
+            return Err(format!(
+                "rate sample {} must be finite and between 0 and {} kbit/s",
+                index + 1,
+                autotune::MAX_RATE_KBPS
+            ));
+        }
+        samples.push(sample);
+    }
+    Ok(samples)
 }
 
 fn parse_optional_rate(value: &str) -> Result<Option<u64>, String> {
     let rate = value
         .parse::<u64>()
         .map_err(|_| format!("invalid current rate: {value}"))?;
+    if rate > autotune::MAX_RATE_KBPS {
+        return Err(format!(
+            "current rate must not exceed {} kbit/s",
+            autotune::MAX_RATE_KBPS
+        ));
+    }
     Ok((rate > 0).then_some(rate))
 }
 
-fn subtract_background_samples(samples: &mut [f64], background_kbps: f64) {
-    let safety_background = background_kbps.max(0.0) * 1.25;
+fn parse_cli_u64(name: &str, value: &str) -> Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| format!("invalid {name}: {value}"))?;
+    if parsed == 0 || parsed > autotune::MAX_RATE_KBPS {
+        return Err(format!(
+            "{name} must be between 1 and {} kbit/s",
+            autotune::MAX_RATE_KBPS
+        ));
+    }
+    Ok(parsed)
+}
+
+fn parse_cli_f64(name: &str, value: &str) -> Result<f64, String> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_| format!("invalid {name}: {value}"))?;
+    if !parsed.is_finite() {
+        return Err(format!("{name} must be finite"));
+    }
+    Ok(parsed)
+}
+
+fn parse_strict_bool(name: &str, value: &str) -> Result<bool, String> {
+    match value {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(format!("{name} must be exactly 0 or 1")),
+    }
+}
+
+fn subtract_background_samples(samples: &mut [f64], background_kbps: f64) -> Result<(), String> {
+    if !background_kbps.is_finite()
+        || !(0.0..=autotune::MAX_RATE_KBPS as f64).contains(&background_kbps)
+    {
+        return Err(format!(
+            "conservative background must be finite and between 0 and {} kbit/s",
+            autotune::MAX_RATE_KBPS
+        ));
+    }
+    let safety_background = background_kbps * 1.25;
     for sample in samples {
         *sample = (*sample - safety_background).max(100.0);
     }
+    Ok(())
 }
 
 fn current_direction(
@@ -6705,6 +6774,8 @@ where
     let mut idle_p95_ms = None;
     let mut idle_samples = None;
     let mut base_scale = 1.0;
+    let mut download_base_scale = None;
+    let mut upload_base_scale = None;
     let mut link_kind = LinkKind::Unknown;
     let mut conservative_background_dl_kbps = None;
     let mut conservative_background_ul_kbps = None;
@@ -6727,20 +6798,8 @@ where
         match arg.as_str() {
             "--dl-samples" => download = Some(parse_rate_samples(&value)?),
             "--ul-samples" => upload = Some(parse_rate_samples(&value)?),
-            "--idle-median-ms" => {
-                idle_median_ms = Some(
-                    value
-                        .parse::<f64>()
-                        .map_err(|_| "invalid idle median".to_string())?,
-                )
-            }
-            "--idle-p95-ms" => {
-                idle_p95_ms = Some(
-                    value
-                        .parse::<f64>()
-                        .map_err(|_| "invalid idle p95".to_string())?,
-                )
-            }
+            "--idle-median-ms" => idle_median_ms = Some(parse_cli_f64("idle median", &value)?),
+            "--idle-p95-ms" => idle_p95_ms = Some(parse_cli_f64("idle p95", &value)?),
             "--idle-samples" => {
                 idle_samples = Some(
                     value
@@ -6748,27 +6807,23 @@ where
                         .map_err(|_| "invalid idle sample count".to_string())?,
                 )
             }
-            "--base-scale" => {
-                base_scale = value
-                    .parse::<f64>()
-                    .map_err(|_| "invalid base-rate scale".to_string())?
+            "--base-scale" => base_scale = parse_cli_f64("base-rate scale", &value)?,
+            "--dl-base-scale" => {
+                download_base_scale = Some(parse_cli_f64("download base-rate scale", &value)?)
+            }
+            "--ul-base-scale" => {
+                upload_base_scale = Some(parse_cli_f64("upload base-rate scale", &value)?)
             }
             "--conservative-background-dl-kbps" => {
-                conservative_background_dl_kbps = Some(
-                    value
-                        .parse::<f64>()
-                        .map_err(|_| "invalid conservative download background".to_string())?,
-                )
+                conservative_background_dl_kbps =
+                    Some(parse_cli_f64("conservative download background", &value)?)
             }
             "--conservative-background-ul-kbps" => {
-                conservative_background_ul_kbps = Some(
-                    value
-                        .parse::<f64>()
-                        .map_err(|_| "invalid conservative upload background".to_string())?,
-                )
+                conservative_background_ul_kbps =
+                    Some(parse_cli_f64("conservative upload background", &value)?)
             }
-            "--retain-dl" => retain_dl = value == "1",
-            "--retain-ul" => retain_ul = value == "1",
+            "--retain-dl" => retain_dl = parse_strict_bool("retain-dl", &value)?,
+            "--retain-ul" => retain_ul = parse_strict_bool("retain-ul", &value)?,
             "--current-dl-min-kbps" => current_dl_min = parse_optional_rate(&value)?,
             "--current-dl-base-kbps" => current_dl_base = parse_optional_rate(&value)?,
             "--current-dl-max-kbps" => current_dl_max = parse_optional_rate(&value)?,
@@ -6793,8 +6848,8 @@ where
         subtract_background_samples(
             &mut download,
             conservative_background_dl_kbps.unwrap_or(0.0),
-        );
-        subtract_background_samples(&mut upload, conservative_background_ul_kbps.unwrap_or(0.0));
+        )?;
+        subtract_background_samples(&mut upload, conservative_background_ul_kbps.unwrap_or(0.0))?;
     }
 
     let mut proposal = build_proposal(
@@ -6807,7 +6862,14 @@ where
         },
         link_kind,
     )?;
-    proposal.revise_base_rates(base_scale)?;
+    if download_base_scale.is_none() && upload_base_scale.is_none() {
+        proposal.revise_base_rates(base_scale)?;
+    } else {
+        proposal.revise_base_rates_by_direction(
+            download_base_scale.unwrap_or(base_scale),
+            upload_base_scale.unwrap_or(base_scale),
+        )?;
+    }
     if conservative {
         let retained_download = if retain_dl {
             Some(current_direction(
@@ -6841,6 +6903,182 @@ where
         );
     }
     println!("{}", proposal.to_json());
+    Ok(())
+}
+
+fn run_autotune_validation_cli<I>(args: I) -> Result<(), String>
+where
+    I: Iterator<Item = String>,
+{
+    use autotune::{
+        validate_shaped_candidate, DirectionLoadInput, DirectionValidationInput, ValidationInput,
+        ValidationThresholds,
+    };
+
+    let mut dl_observed_low = None;
+    let mut ul_observed_low = None;
+    let mut dl_candidate = None;
+    let mut ul_candidate = None;
+    let mut dl_achieved = None;
+    let mut ul_achieved = None;
+    let mut dl_minimum = None;
+    let mut ul_minimum = None;
+    let mut dl_maximum = None;
+    let mut ul_maximum = None;
+    let mut icmp_delta_ms = None;
+    let mut transport_delta_ms = None;
+    let mut loss_percent = None;
+    let mut cpu_percent = None;
+    let mut dl_icmp_delta_ms = None;
+    let mut ul_icmp_delta_ms = None;
+    let mut dl_transport_delta_ms = None;
+    let mut ul_transport_delta_ms = None;
+    let mut dl_loss_percent = None;
+    let mut ul_loss_percent = None;
+    let mut dl_cpu_percent = None;
+    let mut ul_cpu_percent = None;
+    let mut thresholds = ValidationThresholds::default();
+    let mut args = args;
+
+    while let Some(arg) = args.next() {
+        let value = args
+            .next()
+            .ok_or_else(|| format!("missing value for {arg}"))?;
+        match arg.as_str() {
+            "--dl-observed-low-kbps" => {
+                dl_observed_low = Some(parse_cli_u64("download observed-low rate", &value)?)
+            }
+            "--ul-observed-low-kbps" => {
+                ul_observed_low = Some(parse_cli_u64("upload observed-low rate", &value)?)
+            }
+            "--dl-candidate-kbps" => {
+                dl_candidate = Some(parse_cli_u64("download candidate rate", &value)?)
+            }
+            "--ul-candidate-kbps" => {
+                ul_candidate = Some(parse_cli_u64("upload candidate rate", &value)?)
+            }
+            "--dl-achieved-kbps" => {
+                dl_achieved = Some(parse_cli_u64("download achieved rate", &value)?)
+            }
+            "--ul-achieved-kbps" => {
+                ul_achieved = Some(parse_cli_u64("upload achieved rate", &value)?)
+            }
+            "--dl-min-kbps" => dl_minimum = Some(parse_cli_u64("download minimum rate", &value)?),
+            "--ul-min-kbps" => ul_minimum = Some(parse_cli_u64("upload minimum rate", &value)?),
+            "--dl-max-kbps" => dl_maximum = Some(parse_cli_u64("download maximum rate", &value)?),
+            "--ul-max-kbps" => ul_maximum = Some(parse_cli_u64("upload maximum rate", &value)?),
+            "--icmp-delta-ms" => {
+                icmp_delta_ms = Some(parse_cli_f64("ICMP same-quantile delta", &value)?)
+            }
+            "--transport-delta-ms" => {
+                transport_delta_ms = Some(parse_cli_f64("transport same-quantile delta", &value)?)
+            }
+            "--loss-percent" => loss_percent = Some(parse_cli_f64("packet loss percent", &value)?),
+            "--cpu-percent" => cpu_percent = Some(parse_cli_f64("CPU percent", &value)?),
+            "--dl-icmp-delta-ms" => {
+                dl_icmp_delta_ms = Some(parse_cli_f64("download ICMP same-quantile delta", &value)?)
+            }
+            "--ul-icmp-delta-ms" => {
+                ul_icmp_delta_ms = Some(parse_cli_f64("upload ICMP same-quantile delta", &value)?)
+            }
+            "--dl-transport-delta-ms" => {
+                dl_transport_delta_ms = Some(parse_cli_f64(
+                    "download transport same-quantile delta",
+                    &value,
+                )?)
+            }
+            "--ul-transport-delta-ms" => {
+                ul_transport_delta_ms = Some(parse_cli_f64(
+                    "upload transport same-quantile delta",
+                    &value,
+                )?)
+            }
+            "--dl-loss-percent" => {
+                dl_loss_percent = Some(parse_cli_f64("download packet loss percent", &value)?)
+            }
+            "--ul-loss-percent" => {
+                ul_loss_percent = Some(parse_cli_f64("upload packet loss percent", &value)?)
+            }
+            "--dl-cpu-percent" => {
+                dl_cpu_percent = Some(parse_cli_f64("download CPU percent", &value)?)
+            }
+            "--ul-cpu-percent" => {
+                ul_cpu_percent = Some(parse_cli_f64("upload CPU percent", &value)?)
+            }
+            "--candidate-realization-min-percent" => {
+                thresholds.candidate_realization_min_percent =
+                    parse_cli_f64("candidate realization minimum", &value)?
+            }
+            "--candidate-realization-max-percent" => {
+                thresholds.candidate_realization_max_percent =
+                    parse_cli_f64("candidate realization maximum", &value)?
+            }
+            "--capacity-retention-min-percent" => {
+                thresholds.capacity_retention_min_percent =
+                    parse_cli_f64("capacity retention minimum", &value)?
+            }
+            "--icmp-delta-max-ms" => {
+                thresholds.icmp_delta_max_ms = parse_cli_f64("ICMP delta maximum", &value)?
+            }
+            "--transport-delta-max-ms" => {
+                thresholds.transport_delta_max_ms =
+                    parse_cli_f64("transport delta maximum", &value)?
+            }
+            "--loss-max-percent" => {
+                thresholds.loss_max_percent = parse_cli_f64("packet loss maximum", &value)?
+            }
+            "--cpu-max-percent" => {
+                thresholds.cpu_max_percent = parse_cli_f64("CPU maximum", &value)?
+            }
+            _ => return Err(format!("unsupported autotune validation option: {arg}")),
+        }
+    }
+
+    let required_rate =
+        |value: Option<u64>, name: &str| value.ok_or_else(|| format!("--{name} is required"));
+    let required_metric =
+        |value: Option<f64>, name: &str| value.ok_or_else(|| format!("--{name} is required"));
+    let directional_metric = |specific: Option<f64>, shared: Option<f64>, name: &str| {
+        required_metric(specific.or(shared), name)
+    };
+    let result = validate_shaped_candidate(ValidationInput {
+        download: DirectionValidationInput {
+            observed_low_kbps: required_rate(dl_observed_low, "dl-observed-low-kbps")?,
+            candidate_kbps: required_rate(dl_candidate, "dl-candidate-kbps")?,
+            achieved_kbps: required_rate(dl_achieved, "dl-achieved-kbps")?,
+            minimum_kbps: required_rate(dl_minimum, "dl-min-kbps")?,
+            maximum_kbps: required_rate(dl_maximum, "dl-max-kbps")?,
+        },
+        upload: DirectionValidationInput {
+            observed_low_kbps: required_rate(ul_observed_low, "ul-observed-low-kbps")?,
+            candidate_kbps: required_rate(ul_candidate, "ul-candidate-kbps")?,
+            achieved_kbps: required_rate(ul_achieved, "ul-achieved-kbps")?,
+            minimum_kbps: required_rate(ul_minimum, "ul-min-kbps")?,
+            maximum_kbps: required_rate(ul_maximum, "ul-max-kbps")?,
+        },
+        download_load: DirectionLoadInput {
+            icmp_delta_ms: directional_metric(dl_icmp_delta_ms, icmp_delta_ms, "dl-icmp-delta-ms")?,
+            transport_delta_ms: directional_metric(
+                dl_transport_delta_ms,
+                transport_delta_ms,
+                "dl-transport-delta-ms",
+            )?,
+            loss_percent: directional_metric(dl_loss_percent, loss_percent, "dl-loss-percent")?,
+            cpu_percent: directional_metric(dl_cpu_percent, cpu_percent, "dl-cpu-percent")?,
+        },
+        upload_load: DirectionLoadInput {
+            icmp_delta_ms: directional_metric(ul_icmp_delta_ms, icmp_delta_ms, "ul-icmp-delta-ms")?,
+            transport_delta_ms: directional_metric(
+                ul_transport_delta_ms,
+                transport_delta_ms,
+                "ul-transport-delta-ms",
+            )?,
+            loss_percent: directional_metric(ul_loss_percent, loss_percent, "ul-loss-percent")?,
+            cpu_percent: directional_metric(ul_cpu_percent, cpu_percent, "ul-cpu-percent")?,
+        },
+        thresholds,
+    })?;
+    println!("{}", result.to_json());
     Ok(())
 }
 
@@ -6971,6 +7209,13 @@ fn main() {
             }
             return;
         }
+        Some("--autotune-validate") => {
+            if let Err(error) = run_autotune_validation_cli(initial_args) {
+                eprintln!("ERROR: {error}");
+                std::process::exit(2);
+            }
+            return;
+        }
         Some("--transport-probe") => {
             if let Err(error) = run_transport_probe_cli(initial_args) {
                 eprintln!("ERROR: {error}");
@@ -7035,15 +7280,16 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_graph_history_data, compact_graph_history_file, compute_history_budget,
+        autotune, compact_graph_history_data, compact_graph_history_file, compute_history_budget,
         default_reflectors, graph_history_line, history_safe_max_kib, ingress_output_targets_ifb,
         irtt_target_arg, max_wire_packet_size_bits_from_mtu, monitor_tick_timeout,
-        next_spare_reflector, packet_compensation_us, parse_fping_line, parse_fping_ts_line,
-        parse_irtt_duration_us, parse_irtt_line, parse_reflector_candidates,
-        parse_tc_linklayer_overhead, parse_tsping_line, parse_uci_values, pinger_command,
-        pinger_response_interval_s, qdisc_output_has_cake, reflector_bad_reflectors,
-        reflector_health_json, reflector_spare_reflectors, sample_is_stale, shaper_update_due,
-        stall_detection_timeout, status_publish_due, throughput_floor, transport_error_code,
+        next_spare_reflector, packet_compensation_us, parse_cli_f64, parse_fping_line,
+        parse_fping_ts_line, parse_irtt_duration_us, parse_irtt_line, parse_rate_samples,
+        parse_reflector_candidates, parse_strict_bool, parse_tc_linklayer_overhead,
+        parse_tsping_line, parse_uci_values, pinger_command, pinger_response_interval_s,
+        qdisc_output_has_cake, reflector_bad_reflectors, reflector_health_json,
+        reflector_spare_reflectors, sample_is_stale, shaper_update_due, stall_detection_timeout,
+        status_publish_due, subtract_background_samples, throughput_floor, transport_error_code,
         transport_probe_interval_s, transport_result_matches_route, uplink_error_code, Config,
         MemoryInfo, RateMonitor, ReflectorHealth, ReflectorState, Sample, ThroughputGuardInput,
         UplinkState, CAKE_GROWTH_UPDATE_MIN_INTERVAL, STATUS_PUBLISH_INTERVAL,
@@ -7697,5 +7943,69 @@ mod tests {
     fn status_publication_is_bounded_independently_of_control_samples() {
         assert!(!status_publish_due(Duration::from_millis(249)));
         assert!(status_publish_due(STATUS_PUBLISH_INTERVAL));
+    }
+
+    #[test]
+    fn autotune_cli_rate_lists_are_strict_and_bounded() {
+        for invalid in [
+            "",
+            " ",
+            ",",
+            "1,",
+            ",1",
+            "1,,2",
+            "0",
+            "-1",
+            "NaN",
+            "inf",
+            "100000001",
+        ] {
+            assert!(
+                parse_rate_samples(invalid).is_err(),
+                "accepted invalid sample list {invalid:?}"
+            );
+        }
+        assert_eq!(
+            parse_rate_samples("0.1, 100000000").unwrap(),
+            vec![0.1, 100_000_000.0]
+        );
+        assert!(parse_rate_samples(
+            &std::iter::repeat_n("1", autotune::MAX_THROUGHPUT_SAMPLES + 1)
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn autotune_cli_booleans_floats_and_background_are_fail_closed() {
+        assert_eq!(parse_strict_bool("retain", "0"), Ok(false));
+        assert_eq!(parse_strict_bool("retain", "1"), Ok(true));
+        for invalid in ["", "true", "false", "2", "-1"] {
+            assert!(parse_strict_bool("retain", invalid).is_err());
+        }
+        for invalid in ["NaN", "inf", "-inf"] {
+            assert!(parse_cli_f64("metric", invalid).is_err());
+        }
+        let mut samples = [1_000.0];
+        for invalid in [
+            f64::NAN,
+            f64::INFINITY,
+            -1.0,
+            autotune::MAX_RATE_KBPS as f64 + 1.0,
+        ] {
+            assert!(subtract_background_samples(&mut samples, invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn config_rejects_plaintext_persistent_http() {
+        let mut cfg = Config::defaults("test".to_string());
+        cfg.transport_latency_enabled = true;
+        cfg.transport_probe_backend = "persistent-http".to_string();
+        cfg.transport_probe_endpoint = "http://example.invalid/ping".to_string();
+        assert!(cfg.validate().is_err());
+        cfg.transport_probe_endpoint = "https://example.invalid/ping".to_string();
+        assert!(cfg.validate().is_ok());
     }
 }

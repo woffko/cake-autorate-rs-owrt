@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+
+[ "$3" = attest ] || exit 1
+result="${CAKE_AUTORATE_AUTOTUNE_DIR:?}/$1/result.json"
+fingerprint="$("${CAKE_AUTORATE_JSONFILTER:?}" -i "$result" -e '@.config_fingerprint')"
+printf '{"state":"ready","schema_version":1,"config_fingerprint":"%s","target_interface":"%s","resolved_interface":"pppoe-wan","route_interface":"pppoe-wan","route_mode":"main","mwan3_member":"","source_ip":"192.0.2.10","external_ip":"192.0.2.20","route_identity":"main||pppoe-wan|192.0.2.10||main"}\n' "$fingerprint" "$2"

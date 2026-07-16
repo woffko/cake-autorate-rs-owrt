@@ -2,6 +2,7 @@
 'require fs';
 'require form';
 'require network';
+'require rpc';
 'require uci';
 'require ui';
 'require tools.widgets as widgets';
@@ -811,11 +812,30 @@ function validateIrttServerValue(value) {
 	return true;
 }
 
-function validateTransportProbeUrl(value) {
-	if (!/^(wss?|https?|tcp):\/\/\S+$/.test(String(value || '')))
-		return _('Enter a ws://, wss://, http://, https://, or tcp:// endpoint without spaces.');
+function validateTransportProbeUrl(backend, value) {
+	backend = String(backend || '');
+	value = String(value || '');
 
-	return true;
+	switch (backend) {
+	case 'websocket':
+		if (/^wss?:\/\/\S+$/.test(value))
+			return true;
+		return _('Persistent WebSocket requires a ws:// or wss:// endpoint without spaces.');
+	case 'tcp':
+		if (/^tcp:\/\/\S+$/.test(value))
+			return true;
+		return _('TCP connect requires a tcp:// endpoint without spaces.');
+	case 'http':
+		if (/^https:\/\/\S+$/.test(value))
+			return true;
+		return _('Persistent HTTP requires an https:// endpoint without spaces.');
+	case 'legacy-http':
+		if (/^https?:\/\/\S+$/.test(value))
+			return true;
+		return _('Legacy HTTP requires an http:// or https:// endpoint without spaces.');
+	default:
+		return _('Select a supported transport probe backend.');
+	}
 }
 
 function validateRatingLoadRatios(section, section_id) {
@@ -1332,6 +1352,66 @@ function speedtestJobDelay() {
 	});
 }
 
+var AUTOTUNE_RECOVERY_MAX_POLLS = 12;
+var AUTOTUNE_RECOVERY_MAX_DELAY_MS = 5000;
+var AUTOTUNE_RESULT_SCHEMA_VERSION = 3;
+var AUTOTUNE_RESULT_PRODUCER = 'cake-autorate-rs-autotune';
+
+function autotuneJobDelay(delayMs) {
+	return new Promise(function(resolve) {
+		window.setTimeout(resolve, delayMs);
+	});
+}
+
+function autotuneRuntimeSettled(result) {
+	return !!(result && result.recovery_pending === false &&
+		result.runtime_restored === true);
+}
+
+function autotuneLegacyResult(result) {
+	var schema;
+
+	if (!result)
+		return null;
+	if (result.state === 'legacy' && result.legacy_result)
+		return result.legacy_result;
+	if (result.recovery_pending === true || result.runtime_restored === false)
+		return null;
+	if (result.state === 'running' || result.state === 'cancelling' ||
+	    result.state === 'recovering' || result.state === 'recovery-pending' ||
+	    result.state === 'idle')
+		return null;
+	schema = autotuneNumber(result.schema_version);
+	if (schema != null && (schema < AUTOTUNE_RESULT_SCHEMA_VERSION ||
+	    result.producer !== AUTOTUNE_RESULT_PRODUCER))
+		return result;
+	if (schema == null && (result.proposal || result.validation ||
+	    Array.isArray(result.validation_attempts)))
+		return result;
+	return null;
+}
+
+function autotuneRecoveryPending(result) {
+	return !!(result && (result.recovery_pending === true ||
+		result.runtime_restored === false));
+}
+
+function autotuneRecoveryProgress(result) {
+	var progress = {};
+
+	for (var key in (result || {}))
+		if (Object.prototype.hasOwnProperty.call(result, key) && key !== 'error')
+			progress[key] = result[key];
+
+	progress.state = 'recovering';
+	progress.phase = 'recovery';
+	progress.progress = 0;
+	progress.message = result && result.recovery_message ? result.recovery_message :
+		_('Restoring the previous SQM and autorate runtime state...');
+
+	return progress;
+}
+
 function runSpeedtestJob(section_id, wan, backend, onProgress, routeMode, mwan3Member) {
 	var command = '/usr/libexec/cake-autorate-rs/speedtest';
 
@@ -1374,28 +1454,85 @@ function runAutotuneJob(section_id, wan, backend, onProgress, routeMode, mwan3Me
 	return fs.exec(command, [ section_id, wan, action, backend, routeMode || '', mwan3Member || '' ]).then(function(res) {
 		var started = parseExecJson(res);
 
-		if (started.error)
+		if (started.error && !autotuneRecoveryPending(started))
 			throw new Error(started.error);
 
+		var recoveryPolls = 0;
+		var pollDelayMs = 1000;
 		var poll = function() {
-			return speedtestJobDelay().then(function() {
-				return fs.exec(command, [ section_id, wan, 'status', backend ]);
+			return autotuneJobDelay(pollDelayMs).then(function() {
+				return fs.exec(command, [ section_id, wan, 'status', backend,
+					routeMode || '', mwan3Member || '', conservative ? '1' : '0' ]);
 			}).then(function(status) {
 				var result = parseExecJson(status);
+				var active = result.state === 'running' || result.state === 'cancelling';
+				var settled = autotuneRuntimeSettled(result);
+				var legacy = autotuneLegacyResult(result);
 
-				if (result.state === 'running' || result.state === 'cancelling') {
+				/* Package upgrades can leave a RAM-only RC16 terminal file until
+				 * the next start.  It is settled diagnostics, not recovery and
+				 * never a current proposal. */
+				if (legacy) {
+					var legacyError = new Error(result.error ||
+						_('Saved Auto-Tune diagnostics use an older result schema. Run Full Auto-Tune again.'));
+					legacyError.autotuneResult = result.state === 'legacy' ? result : {
+						state: 'legacy',
+						schema_version: AUTOTUNE_RESULT_SCHEMA_VERSION,
+						producer: AUTOTUNE_RESULT_PRODUCER,
+						legacy_schema_version: result.schema_version == null ? 'unknown' : result.schema_version,
+						legacy_state: result.state || 'unknown',
+						legacy_result: result,
+						error: legacyError.message,
+						auto_apply_eligible: false,
+						configuration_written: false,
+						runtime_restored: true,
+						recovery_pending: false
+					};
+					throw legacyError;
+				}
+
+				/* A terminal error is authoritative only after the recovery helper
+				 * has restored runtime state and published both completion flags.
+				 * Check it before stale state=running/progress=87 fields. */
+				if (settled && result.error) {
+					var error = new Error(result.error);
+					error.autotuneResult = result;
+					throw error;
+				}
+
+				/* A running payload without recovery flags is a normal active job.
+				 * Once either recovery flag says otherwise, progress=87 is stale:
+				 * clear it and use bounded exponential-backoff recovery polling. */
+				if (active && !autotuneRecoveryPending(result)) {
+					recoveryPolls = 0;
+					pollDelayMs = 1000;
 					if (onProgress)
 						onProgress(result);
 					return poll();
 				}
 
-				if (result.error) {
-					var error = new Error(result.error);
-					error.autotuneResult = result;
-					throw error;
+				if (!settled) {
+					recoveryPolls++;
+					if (onProgress)
+						onProgress(autotuneRecoveryProgress(result));
+
+					if (recoveryPolls >= AUTOTUNE_RECOVERY_MAX_POLLS) {
+						var pending = new Error(_('Runtime recovery is still pending; no Auto-Tune result was accepted.'));
+						pending.autotuneRecoveryPending = true;
+						pending.autotuneRecoveryStatus = result;
+						throw pending;
+					}
+
+					pollDelayMs = Math.min(1000 * Math.pow(2, recoveryPolls),
+						AUTOTUNE_RECOVERY_MAX_DELAY_MS);
+					return poll();
 				}
-				if (result.state !== 'complete' || !result.proposal)
-					throw new Error(_('Full Auto-Tune ended without a usable proposal.'));
+
+				if (!autotuneResultValidated(result)) {
+					var invalid = new Error(_('Full Auto-Tune ended without a validated proposal.'));
+					invalid.autotuneResult = result;
+					throw invalid;
+				}
 
 				return result;
 			});
@@ -1812,8 +1949,8 @@ function applySqmSectionPreset(section_id, wan_if, replaceExisting, section) {
 	}
 }
 
-function importSqmQueueIntoState(state) {
-	var queue = findImportableSqmQueueForInterface(state.wan_if);
+function importSqmQueueIntoState(state, allowReuse) {
+	var queue = allowReuse === false ? null : findImportableSqmQueueForInterface(state.wan_if);
 
 	state.imported_sqm_queue = queueSectionName(queue) || '';
 	state.sqm_section = state.imported_sqm_queue || managedSqmSectionName(state.name);
@@ -1838,6 +1975,14 @@ function wizardSqmQueueText(state) {
 }
 
 function writeWizardConfig(section_id, state) {
+	/* Auto-Tune data is untrusted until the complete result passes the same
+	 * fail-closed predicate used by Next, Review and Apply.  Keep this guard at
+	 * the staging boundary as a final defence against stale wizard state. */
+	if ((state.mode === 'autotune' ||
+	    (state.autotune_result && state.autotune_proposal)) &&
+	    !autotuneResultValidated(state.autotune_result))
+		throw new Error(_('Refusing to stage an unvalidated Auto-Tune proposal.'));
+
 	var wan = normalizeInterfaceName(state.wan_if);
 	var dl = rateValue(state.sqm_download, '20000');
 	var ul = rateValue(state.sqm_upload, '20000');
@@ -1888,7 +2033,7 @@ function writeWizardConfig(section_id, state) {
 		var dlProposal = proposal.download;
 		var ulProposal = proposal.upload;
 		var thresholds = proposal.thresholds_ms;
-		var adaptive = proposal.adaptive_ceiling;
+		var adaptive = adaptiveCeilingWritePlan(state, proposal);
 
 		uci.set('cake-autorate', section_id, 'min_dl_shaper_rate_kbps', String(dlProposal.minimum_kbps));
 		uci.set('cake-autorate', section_id, 'base_dl_shaper_rate_kbps', String(dlProposal.base_kbps));
@@ -1904,8 +2049,8 @@ function writeWizardConfig(section_id, state) {
 		uci.set('cake-autorate', section_id, 'dl_avg_owd_delta_max_adjust_down_thr_ms', String(thresholds.adjust_down));
 		uci.set('cake-autorate', section_id, 'ul_avg_owd_delta_max_adjust_down_thr_ms', String(thresholds.adjust_down));
 		uci.set('cake-autorate', section_id, 'adaptive_ceiling_enabled', adaptive.enabled ? '1' : '0');
-		uci.set('cake-autorate', section_id, 'adaptive_ceiling_dl_cap_kbps', String(dlProposal.absolute_cap_kbps));
-		uci.set('cake-autorate', section_id, 'adaptive_ceiling_ul_cap_kbps', String(ulProposal.absolute_cap_kbps));
+		uci.set('cake-autorate', section_id, 'adaptive_ceiling_dl_cap_kbps', String(adaptive.dl_cap_kbps));
+		uci.set('cake-autorate', section_id, 'adaptive_ceiling_ul_cap_kbps', String(adaptive.ul_cap_kbps));
 		uci.set('cake-autorate', section_id, 'adaptive_ceiling_hold_time_s', String(adaptive.hold_s));
 		uci.set('cake-autorate', section_id, 'adaptive_ceiling_growth_percent', String(adaptive.growth_percent));
 		uci.set('cake-autorate', section_id, 'adaptive_ceiling_probe_duration_s', String(adaptive.probe_s));
@@ -1987,6 +2132,1161 @@ function validatePositiveInteger(value) {
 	value = parseInt(value, 10);
 
 	return !isNaN(value) && value > 0;
+}
+
+function autotuneNumber(value) {
+	if (value == null || value === '' || typeof value === 'boolean')
+		return null;
+	value = Number(value);
+	return isFinite(value) ? value : null;
+}
+
+function autotunePercent(numerator, denominator) {
+	numerator = autotuneNumber(numerator);
+	denominator = autotuneNumber(denominator);
+
+	if (numerator == null || denominator == null || denominator <= 0)
+		return null;
+
+	return Math.round(numerator * 1000 / denominator) / 10;
+}
+
+function firstAutotuneNumber(values) {
+	for (var i = 0; i < values.length; i++) {
+		var value = autotuneNumber(values[i]);
+		if (value != null)
+			return value;
+	}
+
+	return null;
+}
+
+function autotuneGateValue(validation, names) {
+	var gates = validation && validation.gates;
+	if (!gates)
+		return null;
+	var normalize = function(value) {
+		return String(value || '').toLowerCase().replace(/_/g, '-');
+	};
+	var wanted = names.map(normalize);
+	var matched = [];
+
+	if (Array.isArray(gates)) {
+		for (var i = 0; i < gates.length; i++) {
+			var item = gates[i];
+			if (!item || wanted.indexOf(normalize(item.code || item.id || item.name)) < 0)
+				continue;
+			if (typeof item.pass === 'boolean')
+				matched.push(item.pass);
+			else if (typeof item.passed === 'boolean')
+				matched.push(item.passed);
+		}
+	}
+	else {
+		for (var j = 0; j < names.length; j++) {
+			var candidates = [ names[j], normalize(names[j]), names[j].replace(/-/g, '_') ];
+			var gate;
+			for (var k = 0; k < candidates.length; k++) {
+				if (Object.prototype.hasOwnProperty.call(gates, candidates[k])) {
+					gate = gates[candidates[k]];
+					break;
+				}
+			}
+			if (typeof gate === 'boolean')
+				matched.push(gate);
+			else if (gate && typeof gate.pass === 'boolean')
+				matched.push(gate.pass);
+			else if (gate && typeof gate.passed === 'boolean')
+				matched.push(gate.passed);
+		}
+	}
+
+	return matched.length ? matched.every(function(pass) { return pass; }) : null;
+}
+
+function autotuneGateMetric(validation, names) {
+	var gates = validation && validation.gates;
+	if (!Array.isArray(gates))
+		return null;
+	var wanted = names.map(function(value) {
+		return String(value || '').toLowerCase().replace(/_/g, '-');
+	});
+
+	for (var i = 0; i < gates.length; i++) {
+		var gate = gates[i];
+		var code = gate && String(gate.code || gate.id || gate.name || '').toLowerCase().replace(/_/g, '-');
+		if (wanted.indexOf(code) >= 0)
+			return autotuneNumber(gate.actual);
+	}
+
+	return null;
+}
+
+function autotuneValidationAttempts(result) {
+	var attempts = result && Array.isArray(result.validation_attempts) ?
+		result.validation_attempts.slice() : [];
+
+	if (!attempts.length && result && result.validation)
+		attempts.push(result.validation);
+
+	return attempts;
+}
+
+function autotuneValidationGatesComplete(validation) {
+	var gates = validation && validation.gates;
+	var required = [
+		'download-candidate-realization', 'upload-candidate-realization',
+		'download-candidate-realization-maximum', 'upload-candidate-realization-maximum',
+		'download-capacity-retention', 'upload-capacity-retention',
+		'download-icmp-latency', 'download-transport-latency',
+		'download-packet-loss', 'download-cpu',
+		'upload-icmp-latency', 'upload-transport-latency',
+		'upload-packet-loss', 'upload-cpu'
+	];
+	var reported = {};
+
+	if (!Array.isArray(gates) || gates.length !== required.length)
+		return false;
+
+	for (var i = 0; i < gates.length; i++) {
+		var gate = gates[i];
+		var code = gate && String(gate.code || '').toLowerCase().replace(/_/g, '-');
+		if (required.indexOf(code) < 0 || reported[code] || gate.pass !== true)
+			return false;
+		reported[code] = true;
+	}
+
+	return required.every(function(code) { return reported[code] === true; });
+}
+
+function autotuneBackgroundEvidenceClean(background) {
+	return !!(background && background.available === true &&
+		background.contaminated === false);
+}
+
+function autotunePhaseEvidenceClean(result) {
+	var entries = result && result.phase_background;
+	var validation = result && result.validation;
+	var directionPhases = validation && validation.direction_phases;
+	var directions = [ 'download', 'upload' ];
+	var cleanBaselineSeen = false;
+
+	/* A clean RC17 run has an idle baseline, two unshaped samples, and a
+	 * download-only plus upload-only shaped phase.  Treat missing evidence as
+	 * incomplete rather than trusting a top-level boolean. */
+	if (!Array.isArray(entries) || entries.length < 5)
+		return false;
+
+	for (var i = 0; i < entries.length; i++) {
+		var entry = entries[i];
+		if (!autotuneBackgroundEvidenceClean(entry && entry.forwarded_background))
+			return false;
+		if (entry && entry.phase === 'baseline' && entry.icmp_valid === true &&
+		    entry.transport_valid === true)
+			cleanBaselineSeen = true;
+	}
+	if (!cleanBaselineSeen)
+		return false;
+
+	if (!directionPhases)
+		return false;
+
+	for (var j = 0; j < directions.length; j++) {
+		var direction = directions[j];
+		var phase = directionPhases[direction];
+		if (!phase || phase.direction !== direction ||
+		    autotuneNumber(phase.throughput_kbps) == null ||
+		    autotuneNumber(phase.throughput_kbps) <= 0 ||
+		    !autotuneBackgroundEvidenceClean(phase.forwarded_background) ||
+		    autotuneNumber(phase.icmp_latency && phase.icmp_latency.samples) == null ||
+		    autotuneNumber(phase.icmp_latency && phase.icmp_latency.samples) <= 0 ||
+		    autotuneNumber(phase.transport_latency && phase.transport_latency.samples) == null ||
+		    autotuneNumber(phase.transport_latency && phase.transport_latency.samples) <= 0 ||
+		    autotuneNumber(phase.cpu_peak_percent) == null)
+			return false;
+	}
+
+	return true;
+}
+
+function autotuneHasInfeasibleDecision(result) {
+	var attempts = autotuneValidationAttempts(result);
+
+	for (var i = 0; i < attempts.length; i++) {
+		var correction = attempts[i] && attempts[i].correction;
+		if (!correction && attempts[i] && attempts[i].decision)
+			correction = attempts[i].decision.correction;
+		if (correction && (correction.action === 'infeasible' ||
+		    correction.download && correction.download.action === 'infeasible' ||
+		    correction.upload && correction.upload.action === 'infeasible'))
+			return true;
+	}
+
+	return false;
+}
+
+function autotuneResultValidated(result) {
+	if (!(result && result.state === 'complete' && result.proposal &&
+		result.validation && result.validation.pass === true && !result.error))
+		return false;
+	if (!result.job_id || !result.target_interface || !result.resolved_interface ||
+	    !result.route_interface || !result.source_ip || !result.route_identity || !result.external_ip ||
+	    (result.route_mode !== 'main' && result.route_mode !== 'mwan3'))
+		return false;
+
+	/* RC17 results are intentionally fail-closed.  A bare legacy `pass` is not
+	 * enough because it did not prove phase-scoped background telemetry. */
+	if (autotuneNumber(result.schema_version) !== AUTOTUNE_RESULT_SCHEMA_VERSION ||
+	    result.producer !== AUTOTUNE_RESULT_PRODUCER ||
+	    result.phase_evidence_complete !== true || result.runtime_restored !== true ||
+	    result.recovery_pending !== false || result.auto_apply_eligible !== true ||
+	    result.configuration_written !== false ||
+	    !/^sha256:[0-9a-f]{64}$/.test(result.config_fingerprint || ''))
+		return false;
+
+	/* Conservative/contaminated output remains useful diagnostics, but it is
+	 * never a configuration proposal.  This single predicate gates Next,
+	 * Review/Apply, and the proposal staging path. */
+	if (result.conservative === true || result.confidence_mode !== 'normal' ||
+	    result.phase_contamination_seen !== false ||
+	    result.validation.contaminated !== false ||
+	    !autotunePhaseEvidenceClean(result) ||
+	    !autotuneValidationGatesComplete(result.validation) ||
+	    autotuneHasInfeasibleDecision(result))
+		return false;
+
+	var correction = result.validation.correction;
+	return !!(correction && correction.action === 'none' && correction.feasible === true);
+}
+
+function revalidateAutotuneProposal(section_id, wan, backend, expected, routeMode, mwan3Member) {
+	if (!autotuneResultValidated(expected))
+		return Promise.reject(new Error(_('The Auto-Tune proposal is no longer valid. Run Auto-Tune again.')));
+	var selectedMode = routeMode === 'auto' ? (mwan3Member ? 'mwan3' : 'main') : routeMode;
+	selectedMode = selectedMode || 'main';
+	var selectedMember = selectedMode === 'mwan3' ? (mwan3Member || '') : '';
+	if (expected.job_id !== section_id ||
+	    normalizeInterfaceName(expected.resolved_interface) !== normalizeInterfaceName(wan) ||
+	    expected.route_mode !== selectedMode ||
+	    (expected.mwan3_member || '') !== selectedMember)
+		return Promise.reject(new Error(_('The selected uplink no longer matches the validated Auto-Tune result. Run Auto-Tune again.')));
+
+	var expectedFingerprint = expected.config_fingerprint;
+	return fs.exec('/usr/libexec/cake-autorate-rs/autotune', [
+		section_id,
+		wan,
+		'status',
+		backend || 'auto'
+	]).then(function(status) {
+		var current = parseExecJson(status);
+
+		if (!autotuneResultValidated(current) ||
+		    current.config_fingerprint !== expectedFingerprint ||
+		    current.job_id !== expected.job_id ||
+		    current.resolved_interface !== expected.resolved_interface ||
+		    current.route_identity !== expected.route_identity ||
+		    JSON.stringify(current.proposal) !== JSON.stringify(expected.proposal))
+			throw new Error(_('Configuration or Auto-Tune state changed after validation. Run Auto-Tune again before staging this proposal.'));
+
+		return fs.exec('/usr/libexec/cake-autorate-rs/autotune', [
+			section_id,
+			wan,
+			'attest',
+			backend || 'auto',
+			selectedMode,
+			selectedMember
+		]).then(function(attestationStatus) {
+			var attestation = parseExecJson(attestationStatus);
+
+			if (!attestation || attestation.state !== 'ready' ||
+			    autotuneNumber(attestation.schema_version) !== 1 ||
+			    attestation.config_fingerprint !== expectedFingerprint ||
+			    attestation.target_interface !== expected.target_interface ||
+			    attestation.resolved_interface !== expected.resolved_interface ||
+			    attestation.route_interface !== expected.route_interface ||
+			    attestation.route_mode !== expected.route_mode ||
+			    (attestation.mwan3_member || '') !== (expected.mwan3_member || '') ||
+			    attestation.source_ip !== expected.source_ip ||
+			    attestation.external_ip !== expected.external_ip ||
+			    attestation.route_identity !== expected.route_identity)
+				throw new Error(_('Configuration or selected uplink route changed after validation. Run Auto-Tune again before staging this proposal.'));
+
+			return current;
+		});
+	});
+}
+
+var AUTOTUNE_APPLY_GUARD = '/usr/libexec/cake-autorate-rs/apply-guard';
+var AUTOTUNE_APPLY_TIMEOUT_S = 30;
+var UBUS_STATUS_NO_DATA = 5;
+var callUciConfirmStatus = rpc.declare({
+	object: 'uci',
+	method: 'confirm',
+	reject: false
+});
+
+function autotuneSqmRollbackSection(section_id) {
+	return 'cake_autorate_apply_' + section_id;
+}
+
+function stageAutotuneApplyMarker(section_id, state) {
+	var result = state && state.autotune_result;
+
+	if (!autotuneResultValidated(result))
+		throw new Error(_('Refusing to create an apply marker for an invalid Full Auto-Tune result.'));
+	if (result.job_id !== section_id)
+		throw new Error(_('The Full Auto-Tune result belongs to a different instance.'));
+
+	uci.set('cake-autorate', section_id, '_autotune_apply_guard', '1');
+	uci.set('cake-autorate', section_id, '_autotune_apply_fingerprint', result.config_fingerprint);
+	uci.set('cake-autorate', section_id, '_autotune_apply_target', result.target_interface);
+	uci.set('cake-autorate', section_id, '_autotune_apply_backend',
+		(result.runs && result.runs[0] && result.runs[0].backend) || state.speedtest_backend || 'speedtest-go');
+	uci.set('cake-autorate', section_id, '_autotune_apply_route_mode', result.route_mode);
+	if (result.route_mode === 'mwan3')
+		uci.set('cake-autorate', section_id, '_autotune_apply_mwan3_member', result.mwan3_member);
+	else
+		uci.unset('cake-autorate', section_id, '_autotune_apply_mwan3_member');
+	uci.set('cake-autorate', section_id, '_autotune_apply_enabled', state.enabled ? '1' : '0');
+	uci.set('cake-autorate', section_id, '_autotune_apply_disable_adaptive',
+		state.adaptive_ceiling_disable_confirmed === true ? '1' : '0');
+	/* A no-op metadata section enrolls the entire sqm package in rpcd's same
+	 * rollback snapshot. Init commits its generated queue (and may disable a
+	 * conflicting legacy queue), so protecting only cake-autorate would leave
+	 * persistent SQM side effects after a failed validation. */
+	var sqmGuard = autotuneSqmRollbackSection(section_id);
+	if (uci.get('sqm', sqmGuard))
+		throw new Error(_('The reserved SQM rollback section already exists. Reconcile or remove the stale section before applying.'));
+	uci.add('sqm', 'cake_autorate_apply_guard', sqmGuard);
+	uci.set('sqm', sqmGuard, '_autotune_apply_guard', '1');
+	uci.set('sqm', sqmGuard, '_autotune_apply_job', section_id);
+	uci.set('sqm', sqmGuard, '_autotune_apply_fingerprint', result.config_fingerprint);
+	uci.unset('sqm', sqmGuard, '_autotune_apply_token');
+	/* A token is minted only when this page itself starts the rollback-enabled
+	 * apply.  Committing this global marker from another LuCI page therefore
+	 * makes init fail closed before it can stop or rewrite SQM. */
+	uci.unset('cake-autorate', section_id, '_autotune_apply_token');
+	uci.unset('cake-autorate', section_id, '_autotune_apply_expires');
+}
+
+function pendingAutotuneApplyMarkers() {
+	var sections = uci.sections('cake-autorate', 'cake_autorate') || [];
+	var markers = [];
+
+	for (var i = 0; i < sections.length; i++) {
+		var section = sections[i];
+		if (section._autotune_apply_guard !== '1')
+			continue;
+
+		var marker = {
+			job: section['.name'],
+			target: section._autotune_apply_target,
+			backend: section._autotune_apply_backend,
+			routeMode: section._autotune_apply_route_mode,
+			member: section._autotune_apply_mwan3_member || '',
+			enabled: section._autotune_apply_enabled,
+			disableAdaptive: section._autotune_apply_disable_adaptive,
+			fingerprint: section._autotune_apply_fingerprint
+		};
+		if (!/^[A-Za-z0-9_]+$/.test(marker.job || '') ||
+		    !/^[A-Za-z0-9_.:@-]+$/.test(marker.target || '') ||
+		    (marker.backend !== 'auto' && marker.backend !== 'speedtest-go') ||
+		    (marker.routeMode !== 'main' && marker.routeMode !== 'mwan3') ||
+		    (marker.routeMode === 'main' && marker.member) ||
+		    (marker.routeMode === 'mwan3' && !/^[A-Za-z0-9_.:@-]+$/.test(marker.member)) ||
+		    (marker.enabled !== '0' && marker.enabled !== '1') ||
+		    (marker.disableAdaptive !== '0' && marker.disableAdaptive !== '1') ||
+		    !/^sha256:[0-9a-f]{64}$/.test(marker.fingerprint || ''))
+			throw new Error(_('A staged Full Auto-Tune apply marker is incomplete or unsafe. Run Auto-Tune again.'));
+
+		markers.push(marker);
+	}
+
+	return markers;
+}
+
+function parseApplyGuardResult(result, expectedState) {
+	if (!result || result.code !== 0)
+		throw new Error(result && (result.stderr || result.stdout) || _('The Full Auto-Tune apply guard failed.'));
+
+	var parsed = parseExecJson(result);
+	if (!parsed || parsed.state !== expectedState || parsed.schema_version !== 1)
+		throw new Error(_('The Full Auto-Tune apply guard returned an invalid response.'));
+
+	return parsed;
+}
+
+function abortAutotuneApplyGuards(guards) {
+	var tasks = [];
+	for (var i = 0; i < (guards || []).length; i++)
+		if (guards[i].token)
+			tasks.push(L.resolveDefault(fs.exec(AUTOTUNE_APPLY_GUARD,
+				[ 'abort', guards[i].token ]), null));
+	return Promise.all(tasks);
+}
+
+function armAutotuneApplyGuards() {
+	var markers = pendingAutotuneApplyMarkers();
+	var armed = [];
+	var chain = Promise.resolve();
+	if (markers.length !== 1)
+		return Promise.reject(new Error(_('Exactly one Full Auto-Tune proposal must be applied at a time.')));
+
+	markers.forEach(function(marker) {
+		chain = chain.then(function() {
+			return fs.exec(AUTOTUNE_APPLY_GUARD, [
+				'arm', marker.job, marker.target, marker.backend,
+				marker.routeMode, marker.member, marker.enabled,
+				marker.disableAdaptive, marker.fingerprint
+			]);
+		}).then(function(result) {
+			var parsed = parseApplyGuardResult(result, 'armed');
+			if (!/^[0-9a-f]{64}$/.test(parsed.token || '') ||
+			    !Number.isSafeInteger(parsed.expires_epoch) || parsed.expires_epoch <= 0)
+				throw new Error(_('The Full Auto-Tune apply guard returned an invalid token.'));
+			marker.token = parsed.token;
+			marker.expires = String(parsed.expires_epoch);
+			armed.push(marker);
+		});
+	});
+
+	return chain.then(function() {
+		for (var i = 0; i < armed.length; i++) {
+			uci.set('cake-autorate', armed[i].job, '_autotune_apply_token', armed[i].token);
+			uci.set('cake-autorate', armed[i].job, '_autotune_apply_expires', armed[i].expires);
+			uci.set('sqm', autotuneSqmRollbackSection(armed[i].job),
+				'_autotune_apply_token', armed[i].token);
+		}
+		return uci.save().then(function() {
+			return uci.changes();
+		}).then(function(changes) {
+			var changedPackages = Object.keys(changes || {}).filter(function(config) {
+				return changes[config] && changes[config].length;
+			});
+			if (changedPackages.indexOf('cake-autorate') < 0 || changedPackages.indexOf('sqm') < 0 ||
+			    changedPackages.some(function(config) {
+				    return config !== 'cake-autorate' && config !== 'sqm';
+			    }))
+				throw new Error(_('Full Auto-Tune Save & Apply must contain only its exact CAKE and SQM changes. Apply or revert all other pending changes first.'));
+			return armed;
+		});
+	}).catch(function(error) {
+		return abortAutotuneApplyGuards(armed).then(function() { throw error; });
+	});
+}
+
+function applyGuardDelay(ms) {
+	return new Promise(function(resolve) { window.setTimeout(resolve, ms); });
+}
+
+function verifyGuardOperation(guards, operation, expectedState) {
+	var chain = Promise.resolve();
+	guards.forEach(function(guard) {
+		chain = chain.then(function() {
+			return fs.exec(AUTOTUNE_APPLY_GUARD, [ operation, guard.token ]);
+		}).then(function(result) {
+			var parsed = parseApplyGuardResult(result, expectedState);
+			if (parsed.token !== guard.token)
+				throw new Error(_('The Full Auto-Tune apply guard verified a different transaction token.'));
+		});
+	});
+	return chain;
+}
+
+function abortAutotuneApplyGuardsStrict(guards) {
+	var chain = Promise.resolve();
+	guards.forEach(function(guard) {
+		chain = chain.then(function() {
+			return fs.exec(AUTOTUNE_APPLY_GUARD, [ 'abort', guard.token ]);
+		}).then(function(result) {
+			parseApplyGuardResult(result, 'aborted');
+		});
+	});
+	return chain;
+}
+
+function rollbackGuardedApply(guards, error, applyDeadlineMs) {
+	/* Never call confirm on this path. rpcd restores the pre-apply UCI snapshot
+	 * when the rollback timer expires. Keep the root-owned snapshots alive
+	 * until both cake-autorate and sqm are proven restored, restart the old
+	 * runtime, prove the files again, and only then invalidate the tokens. */
+	var delayMs = Math.max(0, (applyDeadlineMs || Date.now()) + 2000 - Date.now());
+	var transaction = applyGuardDelay(delayMs)
+		.then(function() { return verifyGuardOperation(guards, 'verify-rollback', 'rolled-back'); })
+		.then(function() { return applyGuardDelay(1000); })
+		.then(function() { return verifyGuardOperation(guards, 'verify-rollback', 'rolled-back'); })
+		.then(function() { return abortAutotuneApplyGuardsStrict(guards); });
+
+	return transaction.then(function() {
+		throw error;
+	}, function(rollbackError) {
+		var failure = new Error(_('Full Auto-Tune apply failed and the exact UCI rollback could not be verified: %s').format(
+			rollbackError && rollbackError.message ? rollbackError.message : rollbackError));
+		failure.applyError = error;
+		failure.rollbackError = rollbackError;
+		throw failure;
+	});
+}
+
+function finalizeGuardedApply(guards) {
+	var chain = Promise.resolve();
+	guards.forEach(function(guard) {
+		chain = chain.then(function() {
+			return fs.exec(AUTOTUNE_APPLY_GUARD, [ 'finalize', guard.token ]);
+		}).then(function(result) {
+			parseApplyGuardResult(result, 'finalized');
+		});
+	});
+	return chain;
+}
+
+function reconcilePreparedApply(guards) {
+	var chain = Promise.resolve();
+	var terminalState = null;
+	guards.forEach(function(guard) {
+		chain = chain.then(function() {
+			return fs.exec(AUTOTUNE_APPLY_GUARD, [ 'reconcile', guard.token ]);
+		}).then(function(result) {
+			if (!result || result.code !== 0)
+				throw new Error(result && (result.stderr || result.stdout) || _('Unable to reconcile the Full Auto-Tune transaction.'));
+			var parsed = parseExecJson(result);
+			if (!parsed || parsed.schema_version !== 1 || parsed.token !== guard.token ||
+			    (parsed.state !== 'confirmed' && parsed.state !== 'rolled-back'))
+				throw new Error(_('The Full Auto-Tune reconciliation response is invalid.'));
+			if (terminalState && terminalState !== parsed.state)
+				throw new Error(_('Full Auto-Tune guards disagree about the terminal transaction state.'));
+			terminalState = parsed.state;
+		});
+	});
+	return chain.then(function() { return terminalState; });
+}
+
+function reconcileAuthoritativeNoPending(guards, error, applyDeadlineMs) {
+	var delayMs = Math.max(0, applyDeadlineMs + 2000 - Date.now());
+	return applyGuardDelay(delayMs).then(function() {
+		return reconcilePreparedApply(guards).then(function(state) {
+			if (state === 'confirmed')
+				return finalizeGuardedApply(guards);
+			return abortAutotuneApplyGuardsStrict(guards).then(function() {
+				error.transactionRolledBack = true;
+				throw error;
+		});
+		});
+	});
+}
+
+function confirmationIndeterminate(error, retryError) {
+	var failure = new Error(_('The confirmation outcome remains unknown. The marker-free transaction proof was retained for explicit reconciliation.'));
+	failure.confirmIndeterminate = true;
+	failure.confirmError = error;
+	failure.retryError = retryError;
+	return failure;
+}
+
+function confirmPreparedApply(guards, applyDeadlineMs) {
+	function finalizeConfirmed() {
+		return finalizeGuardedApply(guards).catch(function(error) {
+			error.applyConfirmed = true;
+			throw error;
+		});
+	}
+
+	function retryOnce(firstError) {
+		return callUciConfirmStatus().then(function(status) {
+			if (status === 0)
+				return finalizeConfirmed();
+			if (status === UBUS_STATUS_NO_DATA)
+				return reconcileAuthoritativeNoPending(guards, firstError, applyDeadlineMs);
+			throw confirmationIndeterminate(firstError,
+				new Error(_('The confirmation retry returned ubus status %s.').format(status)));
+		}, function(retryError) {
+			throw confirmationIndeterminate(firstError, retryError);
+		});
+	}
+
+	return callUciConfirmStatus().then(function(status) {
+		if (status === 0)
+			return finalizeConfirmed();
+		return retryOnce(new Error(_('UCI could not confirm the verified Full Auto-Tune transaction.')));
+	}, function(error) {
+		return retryOnce(error);
+	});
+}
+
+function runGuardedSaveApply(view, ev) {
+	var guards = [];
+	var applyStarted = false;
+	var applyDeadlineMs = 0;
+	var confirmPhase = false;
+
+	return view.handleSave(ev).then(function() {
+		return armAutotuneApplyGuards();
+	}).then(function(armed) {
+		guards = armed;
+		applyStarted = true;
+		applyDeadlineMs = Date.now() + AUTOTUNE_APPLY_TIMEOUT_S * 1000;
+		return uci.callApply(AUTOTUNE_APPLY_TIMEOUT_S, true);
+	}).then(function(result) {
+		if (result !== 0)
+			throw new Error(_('UCI rejected the rollback-enabled configuration apply.'));
+		return verifyGuardOperation(guards, 'postcheck', 'verified');
+	}).then(function() {
+		return verifyGuardOperation(guards, 'prepare-confirm', 'prepared');
+	}).then(function() {
+		confirmPhase = true;
+		return confirmPreparedApply(guards, applyDeadlineMs);
+	}).then(function() {
+		applyStarted = false;
+		window.location = window.location.href.split('#')[0];
+		return view;
+	}).catch(function(error) {
+		if (error.confirmIndeterminate || error.transactionRolledBack || error.applyConfirmed)
+			throw error;
+		if (confirmPhase)
+			throw confirmationIndeterminate(error, null);
+		if (applyStarted)
+			return rollbackGuardedApply(guards, error, applyDeadlineMs);
+		return abortAutotuneApplyGuards(guards).then(function() { throw error; });
+	});
+}
+
+function clearAutotuneProposalState(state) {
+	state.autotune_running = false;
+	state.autotune_progress = 0;
+	state.autotune_result = null;
+	state.autotune_proposal = null;
+	state.autotune_background_block = null;
+}
+
+function recordAutotuneTerminalFailure(state, result, message) {
+	clearAutotuneProposalState(state);
+	state.autotune_diagnostics = result && Object.keys(result).length ? result : {
+		state: 'failed',
+		error: message || _('Full Auto-Tune failed.'),
+		configuration_written: false
+	};
+	state.autotune_failure_message = message || _('Full Auto-Tune failed.');
+
+	return state;
+}
+
+function autotuneRetryableInconclusive(result) {
+	return !!(result && result.state === 'inconclusive' && result.retryable === true);
+}
+
+function recordAutotuneRetryableInconclusive(state, result) {
+	clearAutotuneProposalState(state);
+	state.autotune_diagnostics = result;
+	state.autotune_failure_message = '';
+	state.autotune_background_block = result && result.background_blocked ? result : null;
+
+	return state;
+}
+
+function autotuneAttemptDiagnostics(validation, result, index) {
+	validation = validation || {};
+	result = result || {};
+	var decision = validation.decision || validation;
+	var throughput = validation.throughput || {};
+	var candidate = validation.candidate_base || validation.candidate || {};
+	var proposal = result.proposal || {};
+	var proposalDl = proposal.download || {};
+	var proposalUl = proposal.upload || {};
+	var metrics = decision.metrics || validation.metrics || {};
+	var metricsDl = metrics.download || {};
+	var metricsUl = metrics.upload || {};
+	var signals = decision.signals || validation.signals || {};
+	var directionPhases = validation.direction_phases || {};
+	var downloadPhase = directionPhases.download || {};
+	var uploadPhase = directionPhases.upload || {};
+	var downloadIcmp = downloadPhase.icmp_latency || {};
+	var uploadIcmp = uploadPhase.icmp_latency || {};
+	var downloadTransport = downloadPhase.transport_latency || {};
+	var uploadTransport = uploadPhase.transport_latency || {};
+	var downloadSignals = signals.download || {};
+	var uploadSignals = signals.upload || {};
+	var achievedDl = firstAutotuneNumber([ throughput.download_kbps, validation.download_kbps ]);
+	var achievedUl = firstAutotuneNumber([ throughput.upload_kbps, validation.upload_kbps ]);
+	var candidateDl = firstAutotuneNumber([ candidate.download_kbps, candidate.dl_kbps,
+		proposalDl.base_kbps ]);
+	var candidateUl = firstAutotuneNumber([ candidate.upload_kbps, candidate.ul_kbps,
+		proposalUl.base_kbps ]);
+	var realization = validation.candidate_realization || throughput.candidate_realization || {};
+	var retention = validation.capacity_retention || throughput.capacity_retention || {};
+	var realizationDl = firstAutotuneNumber([
+		realization.download_percent, realization.dl_percent,
+		metricsDl.candidate_realization_percent,
+		throughput.download_realization_percent,
+		throughput.download_candidate_realization_percent,
+		autotuneGateMetric(validation, [ 'download-candidate-realization' ]),
+		autotunePercent(achievedDl, candidateDl)
+	]);
+	var realizationUl = firstAutotuneNumber([
+		realization.upload_percent, realization.ul_percent,
+		metricsUl.candidate_realization_percent,
+		throughput.upload_realization_percent,
+		throughput.upload_candidate_realization_percent,
+		autotuneGateMetric(validation, [ 'upload-candidate-realization' ]),
+		autotunePercent(achievedUl, candidateUl)
+	]);
+	var retentionDl = firstAutotuneNumber([
+		retention.download_percent, retention.dl_percent,
+		metricsDl.capacity_retention_percent,
+		throughput.download_capacity_retention_percent,
+		throughput.download_retention_percent,
+		autotuneGateMetric(validation, [ 'download-capacity-retention' ])
+	]);
+	var retentionUl = firstAutotuneNumber([
+		retention.upload_percent, retention.ul_percent,
+		metricsUl.capacity_retention_percent,
+		throughput.upload_capacity_retention_percent,
+		throughput.upload_retention_percent,
+		autotuneGateMetric(validation, [ 'upload-capacity-retention' ])
+	]);
+	var candidateCapacityDl = firstAutotuneNumber([
+		metricsDl.candidate_capacity_percent,
+		throughput.download_candidate_capacity_percent,
+		autotunePercent(candidateDl, proposalDl.observed_low_kbps)
+	]);
+	var candidateCapacityUl = firstAutotuneNumber([
+		metricsUl.candidate_capacity_percent,
+		throughput.upload_candidate_capacity_percent,
+		autotunePercent(candidateUl, proposalUl.observed_low_kbps)
+	]);
+	var icmp = validation.icmp_latency || validation.latency || {};
+	var transport = validation.transport_latency || validation.http_latency || {};
+	var background = validation.background || validation.background_traffic ||
+		result.validation_background || null;
+	if (!background && (downloadPhase.forwarded_background || uploadPhase.forwarded_background)) {
+		var dlBackground = downloadPhase.forwarded_background || {};
+		var ulBackground = uploadPhase.forwarded_background || {};
+		background = {
+			clean: dlBackground.contaminated === false && ulBackground.contaminated === false,
+			contaminated: dlBackground.contaminated === true || ulBackground.contaminated === true,
+			download_kbps: Math.max(autotuneNumber(dlBackground.download_kbps) || 0,
+				autotuneNumber(ulBackground.download_kbps) || 0),
+			upload_kbps: Math.max(autotuneNumber(dlBackground.upload_kbps) || 0,
+				autotuneNumber(ulBackground.upload_kbps) || 0)
+		};
+	}
+	var icmpDelta = firstAutotuneNumber([ icmp.delta_p95_ms, validation.icmp_delta_ms,
+		autotuneGateMetric(decision, [ 'icmp-latency' ]) ]);
+	var loss = firstAutotuneNumber([ icmp.loss_percent, validation.loss_percent,
+		autotuneGateMetric(decision, [ 'packet-loss' ]) ]);
+	var transportDelta = firstAutotuneNumber([ transport.delta_p95_ms,
+		transport.delta_ms, validation.transport_delta_ms,
+		autotuneGateMetric(decision, [ 'transport-latency' ]) ]);
+	var cpu = firstAutotuneNumber([ validation.cpu_peak_percent,
+		validation.cpu && validation.cpu.peak_percent,
+		autotuneGateMetric(decision, [ 'cpu' ]) ]);
+	var dlLoad = {
+		icmp_delta_ms: firstAutotuneNumber([ downloadSignals.icmp_delta_ms,
+			downloadIcmp.delta_p95_ms, icmpDelta ]),
+		transport_delta_ms: firstAutotuneNumber([ downloadSignals.transport_delta_ms,
+			downloadTransport.delta_p95_ms, transportDelta ]),
+		loss_percent: firstAutotuneNumber([ downloadSignals.loss_percent,
+			downloadIcmp.loss_percent, loss ]),
+		cpu_percent: firstAutotuneNumber([ downloadSignals.cpu_percent,
+			downloadPhase.cpu_peak_percent, cpu ])
+	};
+	var ulLoad = {
+		icmp_delta_ms: firstAutotuneNumber([ uploadSignals.icmp_delta_ms,
+			uploadIcmp.delta_p95_ms, icmpDelta ]),
+		transport_delta_ms: firstAutotuneNumber([ uploadSignals.transport_delta_ms,
+			uploadTransport.delta_p95_ms, transportDelta ]),
+		loss_percent: firstAutotuneNumber([ uploadSignals.loss_percent,
+			uploadIcmp.loss_percent, loss ]),
+		cpu_percent: firstAutotuneNumber([ uploadSignals.cpu_percent,
+			uploadPhase.cpu_peak_percent, cpu ])
+	};
+	var dlRealizationGate = autotuneGateValue(decision,
+		[ 'download-candidate-realization' ]);
+	var ulRealizationGate = autotuneGateValue(decision,
+		[ 'upload-candidate-realization' ]);
+	var dlRealizationMaximumGate = autotuneGateValue(decision,
+		[ 'download-candidate-realization-maximum' ]);
+	var ulRealizationMaximumGate = autotuneGateValue(decision,
+		[ 'upload-candidate-realization-maximum' ]);
+	var dlCapacityGate = autotuneGateValue(decision,
+		[ 'download-capacity-retention', 'download_capacity_retention' ]);
+	var ulCapacityGate = autotuneGateValue(decision,
+		[ 'upload-capacity-retention', 'upload_capacity_retention' ]);
+	var legacyCapacityGate = autotuneGateValue(decision,
+		[ 'capacity_retention', 'throughput_retention', 'throughput' ]);
+	var icmpGate = autotuneGateValue(decision,
+		[ 'icmp_latency', 'latency', 'icmp' ]);
+	var lossGate = autotuneGateValue(decision,
+		[ 'icmp_loss', 'packet_loss', 'packet-loss', 'loss' ]);
+	var transportGate = autotuneGateValue(decision,
+		[ 'transport_latency', 'http_latency', 'transport' ]);
+	var cpuGate = autotuneGateValue(decision, [ 'cpu', 'cpu_peak' ]);
+	var dlIcmpGate = autotuneGateValue(decision, [ 'download-icmp-latency' ]);
+	var dlLossGate = autotuneGateValue(decision, [ 'download-packet-loss' ]);
+	var dlTransportGate = autotuneGateValue(decision, [ 'download-transport-latency' ]);
+	var dlCpuGate = autotuneGateValue(decision, [ 'download-cpu' ]);
+	var ulIcmpGate = autotuneGateValue(decision, [ 'upload-icmp-latency' ]);
+	var ulLossGate = autotuneGateValue(decision, [ 'upload-packet-loss' ]);
+	var ulTransportGate = autotuneGateValue(decision, [ 'upload-transport-latency' ]);
+	var ulCpuGate = autotuneGateValue(decision, [ 'upload-cpu' ]);
+	var backgroundGate = autotuneGateValue(validation,
+		[ 'background', 'background_traffic', 'traffic_contamination' ]);
+
+	if (dlRealizationGate == null && realizationDl != null)
+		dlRealizationGate = realizationDl >= 80;
+	if (ulRealizationGate == null && realizationUl != null)
+		ulRealizationGate = realizationUl >= 80;
+	if (dlCapacityGate == null)
+		dlCapacityGate = legacyCapacityGate != null ? legacyCapacityGate :
+			(retentionDl == null ? null : retentionDl >= 80);
+	if (ulCapacityGate == null)
+		ulCapacityGate = legacyCapacityGate != null ? legacyCapacityGate :
+			(retentionUl == null ? null : retentionUl >= 80);
+	if (icmpGate == null && icmpDelta != null)
+		icmpGate = icmpDelta <= 100;
+	if (lossGate == null && loss != null)
+		lossGate = loss <= 5;
+	if (transportGate == null && transportDelta != null)
+		transportGate = transportDelta <= 100;
+	if (cpuGate == null && cpu != null)
+		cpuGate = cpu <= 95;
+	if (dlIcmpGate == null)
+		dlIcmpGate = icmpGate != null ? icmpGate : (dlLoad.icmp_delta_ms == null ? null : dlLoad.icmp_delta_ms <= 100);
+	if (dlLossGate == null)
+		dlLossGate = lossGate != null ? lossGate : (dlLoad.loss_percent == null ? null : dlLoad.loss_percent <= 5);
+	if (dlTransportGate == null)
+		dlTransportGate = transportGate != null ? transportGate :
+			(dlLoad.transport_delta_ms == null ? null : dlLoad.transport_delta_ms <= 100);
+	if (dlCpuGate == null)
+		dlCpuGate = cpuGate != null ? cpuGate : (dlLoad.cpu_percent == null ? null : dlLoad.cpu_percent <= 95);
+	if (ulIcmpGate == null)
+		ulIcmpGate = icmpGate != null ? icmpGate : (ulLoad.icmp_delta_ms == null ? null : ulLoad.icmp_delta_ms <= 100);
+	if (ulLossGate == null)
+		ulLossGate = lossGate != null ? lossGate : (ulLoad.loss_percent == null ? null : ulLoad.loss_percent <= 5);
+	if (ulTransportGate == null)
+		ulTransportGate = transportGate != null ? transportGate :
+			(ulLoad.transport_delta_ms == null ? null : ulLoad.transport_delta_ms <= 100);
+	if (ulCpuGate == null)
+		ulCpuGate = cpuGate != null ? cpuGate : (ulLoad.cpu_percent == null ? null : ulLoad.cpu_percent <= 95);
+	if (backgroundGate == null && background) {
+		if (typeof background.clean === 'boolean')
+			backgroundGate = background.clean;
+		else if (typeof background.contaminated === 'boolean')
+			backgroundGate = !background.contaminated;
+		else if (typeof background.detected === 'boolean')
+			backgroundGate = !background.detected;
+	}
+
+	return {
+		index: index,
+		pass: validation.pass === true,
+		score: autotuneNumber(validation.score),
+		candidate: { download_kbps: candidateDl, upload_kbps: candidateUl },
+		achieved: { download_kbps: achievedDl, upload_kbps: achievedUl },
+		candidate_realization: { download_percent: realizationDl, upload_percent: realizationUl },
+		capacity_retention: { download_percent: retentionDl, upload_percent: retentionUl },
+		candidate_capacity: { download_percent: candidateCapacityDl, upload_percent: candidateCapacityUl },
+		icmp: {
+			median_ms: autotuneNumber(icmp.median_ms),
+			p95_ms: autotuneNumber(icmp.p95_ms),
+			max_ms: autotuneNumber(icmp.max_ms),
+			delta_p95_ms: icmpDelta,
+			loss_percent: loss,
+			samples: autotuneNumber(icmp.samples)
+		},
+		transport: {
+			backend: transport.backend || transport.method || '',
+			url: transport.url || transport.endpoint || '',
+			median_ms: autotuneNumber(transport.median_ms),
+			p95_ms: autotuneNumber(transport.p95_ms),
+			max_ms: autotuneNumber(transport.max_ms),
+			delta_p95_ms: transportDelta,
+			samples: autotuneNumber(transport.samples)
+		},
+		cpu_peak_percent: cpu,
+		direction_load: { download: dlLoad, upload: ulLoad },
+		directional_load_reported: !!(signals.download || signals.upload ||
+			directionPhases.download || directionPhases.upload),
+		correction: decision.correction || validation.correction || null,
+		reasons: decision.reasons || validation.reasons || [],
+		background: background,
+		gates: [
+			{ id: 'download_candidate_realization', pass: dlRealizationGate },
+			{ id: 'upload_candidate_realization', pass: ulRealizationGate },
+			{ id: 'download_candidate_realization_maximum', pass: dlRealizationMaximumGate },
+			{ id: 'upload_candidate_realization_maximum', pass: ulRealizationMaximumGate },
+			{ id: 'download_capacity_retention', pass: dlCapacityGate },
+			{ id: 'upload_capacity_retention', pass: ulCapacityGate },
+			{ id: 'icmp_latency', pass: icmpGate },
+			{ id: 'icmp_loss', pass: lossGate },
+			{ id: 'transport_latency', pass: transportGate },
+			{ id: 'cpu', pass: cpuGate },
+			{ id: 'download_icmp', pass: dlIcmpGate },
+			{ id: 'download_loss', pass: dlLossGate },
+			{ id: 'download_transport', pass: dlTransportGate },
+			{ id: 'download_cpu', pass: dlCpuGate },
+			{ id: 'upload_icmp', pass: ulIcmpGate },
+			{ id: 'upload_loss', pass: ulLossGate },
+			{ id: 'upload_transport', pass: ulTransportGate },
+			{ id: 'upload_cpu', pass: ulCpuGate },
+			{ id: 'background', pass: backgroundGate }
+		]
+	};
+}
+
+function autotuneDiagnostics(result) {
+	var legacy = autotuneLegacyResult(result);
+	var diagnosticResult = legacy || result;
+	var attempts = autotuneValidationAttempts(diagnosticResult);
+
+	return {
+		validated: autotuneResultValidated(result),
+		legacy: !!legacy,
+		legacy_schema_version: result && result.legacy_schema_version != null ?
+			result.legacy_schema_version :
+			(legacy && legacy.schema_version != null ? legacy.schema_version : null),
+		state: result && result.state || 'unknown',
+		stage: diagnosticResult && diagnosticResult.stage || '',
+		reason: diagnosticResult && diagnosticResult.reason || '',
+		error: result && result.error ||
+			(diagnosticResult && diagnosticResult.error) || '',
+		configuration_written: !!(diagnosticResult && diagnosticResult.configuration_written),
+		attempts: attempts.map(function(attempt, index) {
+			return autotuneAttemptDiagnostics(attempt, diagnosticResult, index + 1);
+		})
+	};
+}
+
+function adaptiveCeilingWritePlan(state, proposal) {
+	state = state || {};
+	proposal = proposal || {};
+	var adaptive = proposal.adaptive_ceiling || {};
+	var dl = proposal.download || {};
+	var ul = proposal.upload || {};
+	var original = state.original_adaptive_ceiling || {};
+	var preserve = original.enabled === true && adaptive.enabled === false &&
+		state.adaptive_ceiling_disable_confirmed !== true;
+	var maxRate = function(current, minimum, fallback) {
+		var currentNumber = autotuneNumber(current);
+		var minimumNumber = autotuneNumber(minimum);
+		var fallbackNumber = autotuneNumber(fallback);
+		var value = currentNumber != null ? currentNumber : fallbackNumber;
+
+		if (minimumNumber != null && (value == null || value < minimumNumber))
+			value = minimumNumber;
+		return value;
+	};
+
+	if (preserve) {
+		return {
+			enabled: true,
+			preserved: true,
+			dl_cap_kbps: maxRate(original.dl_cap_kbps, dl.maximum_kbps, dl.absolute_cap_kbps),
+			ul_cap_kbps: maxRate(original.ul_cap_kbps, ul.maximum_kbps, ul.absolute_cap_kbps),
+			hold_s: firstAutotuneNumber([ original.hold_s, adaptive.hold_s ]),
+			growth_percent: firstAutotuneNumber([ original.growth_percent, adaptive.growth_percent ]),
+			probe_s: firstAutotuneNumber([ original.probe_s, adaptive.probe_s ]),
+			cooldown_s: firstAutotuneNumber([ original.cooldown_s, adaptive.cooldown_s ]),
+			failed_bound_ttl_s: firstAutotuneNumber([
+				original.failed_bound_ttl_s, adaptive.failed_bound_ttl_s
+			])
+		};
+	}
+
+	return {
+		enabled: adaptive.enabled === true,
+		preserved: false,
+		dl_cap_kbps: firstAutotuneNumber([ dl.absolute_cap_kbps, dl.maximum_kbps ]),
+		ul_cap_kbps: firstAutotuneNumber([ ul.absolute_cap_kbps, ul.maximum_kbps ]),
+		hold_s: autotuneNumber(adaptive.hold_s),
+		growth_percent: autotuneNumber(adaptive.growth_percent),
+		probe_s: autotuneNumber(adaptive.probe_s),
+		cooldown_s: autotuneNumber(adaptive.cooldown_s),
+		failed_bound_ttl_s: autotuneNumber(adaptive.failed_bound_ttl_s)
+	};
+}
+
+function autotuneMetric(value, suffix) {
+	value = autotuneNumber(value);
+	if (value == null)
+		return '-';
+
+	return String(Math.round(value * 10) / 10) + (suffix || '');
+}
+
+function autotuneGate(attempt, id) {
+	for (var i = 0; i < attempt.gates.length; i++)
+		if (attempt.gates[i].id === id)
+			return attempt.gates[i].pass;
+
+	return null;
+}
+
+function renderAutotuneGate(pass) {
+	var text = pass === true ? _('PASS') : (pass === false ? _('FAIL') : _('NOT REPORTED'));
+	var color = pass === true ? '#0a8f5a' : (pass === false ? '#d94141' : '#777');
+
+	return E('strong', { 'style': 'color:%s;white-space:nowrap'.format(color) }, text);
+}
+
+function renderAutotuneDiagnostics(result) {
+	var diagnostics = autotuneDiagnostics(result);
+	var retryableInconclusive = autotuneRetryableInconclusive(result);
+	var nodes = [ E('div', {
+		'class': 'alert-message %s'.format(diagnostics.validated ? 'success' :
+			(retryableInconclusive ? 'warning' : 'error')),
+		'style': 'margin:10px 0'
+	}, [
+		E('strong', {}, diagnostics.legacy ? _('Legacy diagnostics. ') :
+			(diagnostics.validated ? _('Validated proposal. ') :
+			(retryableInconclusive ? _('Calibration was inconclusive. ') : _('Proposal rejected. '))),
+		diagnostics.error || (diagnostics.validated ?
+			_('Every required validation gate passed.') :
+			(retryableInconclusive ?
+				_('No proposal was accepted. Retry the calibration; Review and Apply remain unavailable.') :
+				_('No settings can be applied from this result. Review the failed gates below.'))))
+	]) ];
+
+	if (diagnostics.legacy)
+		nodes.push(E('p', {}, _('Result schema: %s. This saved result is read-only and cannot be reused by the current validator.').format(
+			diagnostics.legacy_schema_version == null ? _('unknown') :
+				diagnostics.legacy_schema_version)));
+
+	if (diagnostics.stage || diagnostics.reason)
+		nodes.push(E('p', {}, _('Stage: %s. Diagnostic reason: %s.').format(
+			diagnostics.stage || '-', diagnostics.reason || '-')));
+
+	if (!diagnostics.attempts.length) {
+		nodes.push(E('p', {}, _('The job returned no structured validation attempts.')));
+		return E('div', { 'class': 'cake-autotune-diagnostics' }, nodes);
+	}
+
+	for (var i = 0; i < diagnostics.attempts.length; i++) {
+		var attempt = diagnostics.attempts[i];
+		var dlSummary = _('%s candidate → %s achieved').format(
+			autotuneMetric(attempt.candidate.download_kbps, ' kbit/s'),
+			autotuneMetric(attempt.achieved.download_kbps, ' kbit/s'));
+		var ulSummary = _('%s candidate → %s achieved').format(
+			autotuneMetric(attempt.candidate.upload_kbps, ' kbit/s'),
+			autotuneMetric(attempt.achieved.upload_kbps, ' kbit/s'));
+		var icmpSummary = _('%s median / %s p95 / +%s delta; %s loss; %s samples').format(
+			autotuneMetric(attempt.icmp.median_ms, ' ms'),
+			autotuneMetric(attempt.icmp.p95_ms, ' ms'),
+			autotuneMetric(attempt.icmp.delta_p95_ms, ' ms'),
+			autotuneMetric(attempt.icmp.loss_percent, '%'),
+			autotuneMetric(attempt.icmp.samples, ''));
+		var transportName = attempt.transport.backend || attempt.transport.url || _('transport probe');
+		var transportSummary = _('%s: %s median / %s p95 / +%s delta; %s samples').format(
+			transportName,
+			autotuneMetric(attempt.transport.median_ms, ' ms'),
+			autotuneMetric(attempt.transport.p95_ms, ' ms'),
+			autotuneMetric(attempt.transport.delta_p95_ms, ' ms'),
+			autotuneMetric(attempt.transport.samples, ''));
+		var background = attempt.background;
+		var backgroundSummary = background ? _('%s; DL %s, UL %s kbit/s').format(
+			background.clean === true ? _('clean') :
+				(background.contaminated === true || background.detected === true ? _('detected') : _('reported')),
+			background.download_kbps == null ? '-' : background.download_kbps,
+			background.upload_kbps == null ? '-' : background.upload_kbps) :
+			_('Not reported for this validation attempt');
+		var dlLoad = attempt.direction_load.download;
+		var ulLoad = attempt.direction_load.upload;
+		var correction = attempt.correction || {};
+		var correctionSummary = correction.action ? _('%s — %s; DL %s → %s kbit/s, UL %s → %s kbit/s').format(
+			correction.action,
+			correction.reason || '-',
+			correction.download && correction.download.action || '-',
+			correction.download && correction.download.proposed_kbps || '-',
+			correction.upload && correction.upload.action || '-',
+			correction.upload && correction.upload.proposed_kbps || '-') : _('Not reported');
+		var reasonSummary = attempt.reasons && attempt.reasons.length ? attempt.reasons.map(function(reason) {
+			return reason.code || reason.reason || String(reason);
+		}).join(', ') : _('none');
+		var rows = [
+			[ _('Download throughput'), dlSummary, '-' ],
+			[ _('DL candidate realization'), autotuneMetric(attempt.candidate_realization.download_percent, '%'),
+				renderAutotuneGate(autotuneGate(attempt, 'download_candidate_realization')) ],
+			[ _('DL candidate realization maximum'), autotuneMetric(attempt.candidate_realization.download_percent, '%'),
+				renderAutotuneGate(autotuneGate(attempt, 'download_candidate_realization_maximum')) ],
+			[ _('DL candidate / raw capacity'), autotuneMetric(attempt.candidate_capacity.download_percent, '%'), '-' ],
+			[ _('DL capacity retained'), autotuneMetric(attempt.capacity_retention.download_percent, '%'),
+				renderAutotuneGate(autotuneGate(attempt, 'download_capacity_retention')) ],
+			[ _('Upload throughput'), ulSummary, '-' ],
+			[ _('UL candidate realization'), autotuneMetric(attempt.candidate_realization.upload_percent, '%'),
+				renderAutotuneGate(autotuneGate(attempt, 'upload_candidate_realization')) ],
+			[ _('UL candidate realization maximum'), autotuneMetric(attempt.candidate_realization.upload_percent, '%'),
+				renderAutotuneGate(autotuneGate(attempt, 'upload_candidate_realization_maximum')) ],
+			[ _('UL candidate / raw capacity'), autotuneMetric(attempt.candidate_capacity.upload_percent, '%'), '-' ],
+			[ _('UL capacity retained'), autotuneMetric(attempt.capacity_retention.upload_percent, '%'),
+				renderAutotuneGate(autotuneGate(attempt, 'upload_capacity_retention')) ]
+		];
+		if (attempt.directional_load_reported) {
+			rows.push(
+				[ _('DL ICMP loaded delta'), autotuneMetric(dlLoad.icmp_delta_ms, ' ms'),
+					renderAutotuneGate(autotuneGate(attempt, 'download_icmp')) ],
+				[ _('DL ICMP packet loss'), autotuneMetric(dlLoad.loss_percent, '%'),
+					renderAutotuneGate(autotuneGate(attempt, 'download_loss')) ],
+				[ _('DL transport loaded delta'), autotuneMetric(dlLoad.transport_delta_ms, ' ms'),
+					renderAutotuneGate(autotuneGate(attempt, 'download_transport')) ],
+				[ _('DL CPU peak'), autotuneMetric(dlLoad.cpu_percent, '%'),
+					renderAutotuneGate(autotuneGate(attempt, 'download_cpu')) ],
+				[ _('UL ICMP loaded delta'), autotuneMetric(ulLoad.icmp_delta_ms, ' ms'),
+					renderAutotuneGate(autotuneGate(attempt, 'upload_icmp')) ],
+				[ _('UL ICMP packet loss'), autotuneMetric(ulLoad.loss_percent, '%'),
+					renderAutotuneGate(autotuneGate(attempt, 'upload_loss')) ],
+				[ _('UL transport loaded delta'), autotuneMetric(ulLoad.transport_delta_ms, ' ms'),
+					renderAutotuneGate(autotuneGate(attempt, 'upload_transport')) ],
+				[ _('UL CPU peak'), autotuneMetric(ulLoad.cpu_percent, '%'),
+					renderAutotuneGate(autotuneGate(attempt, 'upload_cpu')) ]
+			);
+		}
+		else {
+			rows.push(
+				[ _('ICMP latency'), icmpSummary, renderAutotuneGate(autotuneGate(attempt, 'icmp_latency')) ],
+				[ _('ICMP packet loss'), autotuneMetric(attempt.icmp.loss_percent, '%'),
+					renderAutotuneGate(autotuneGate(attempt, 'icmp_loss')) ],
+				[ _('Transport latency'), transportSummary,
+					renderAutotuneGate(autotuneGate(attempt, 'transport_latency')) ],
+				[ _('CPU peak'), autotuneMetric(attempt.cpu_peak_percent, '%'),
+					renderAutotuneGate(autotuneGate(attempt, 'cpu')) ]
+			);
+		}
+		rows.push(
+			[ _('Typed correction'), correctionSummary, '-' ],
+			[ _('Failed gate reasons'), reasonSummary, '-' ],
+			[ _('Background traffic'), backgroundSummary,
+				renderAutotuneGate(autotuneGate(attempt, 'background')) ]
+		);
+		var table = E('table', { 'class': 'table', 'style': 'margin-top:8px' }, [
+			E('tr', { 'class': 'tr table-titles' }, [
+				E('th', { 'class': 'th' }, _('Gate / metric')),
+				E('th', { 'class': 'th' }, _('Measured result')),
+				E('th', { 'class': 'th' }, _('Gate'))
+			])
+		].concat(rows.map(function(row) {
+			return E('tr', { 'class': 'tr' }, [
+				E('td', { 'class': 'td' }, row[0]),
+				E('td', { 'class': 'td', 'style': 'white-space:normal' }, row[1]),
+				E('td', { 'class': 'td' }, row[2])
+			]);
+		})));
+
+		nodes.push(E('details', {
+			'open': i === diagnostics.attempts.length - 1 ? '' : null,
+			'style': 'margin:8px 0;padding:8px;border:1px solid rgba(127,127,127,.35);border-radius:4px'
+		}, [
+			E('summary', { 'style': 'cursor:pointer;font-weight:600' },
+				_('Validation attempt %d — %s%s').format(attempt.index,
+					attempt.pass ? _('passed') : _('failed'),
+					attempt.score == null ? '' : _(' · score %s/100').format(attempt.score))),
+			table
+		]));
+	}
+
+	if (!diagnostics.configuration_written)
+		nodes.push(E('p', { 'style': 'font-weight:600' },
+			_('No UCI configuration was written by this Auto-Tune job.')));
+
+	return E('div', { 'class': 'cake-autotune-diagnostics' }, nodes);
 }
 
 function replaceNodeContent(node, children) {
@@ -2074,23 +3374,34 @@ function showCreateWizard(grid, name, existingName) {
 				absolute_cap_kbps: uci.get('cake-autorate', existingName, 'adaptive_ceiling_ul_cap_kbps')
 			}
 		};
+		state.original_adaptive_ceiling = {
+			enabled: uci.get('cake-autorate', existingName, 'adaptive_ceiling_enabled') === '1',
+			dl_cap_kbps: uci.get('cake-autorate', existingName, 'adaptive_ceiling_dl_cap_kbps'),
+			ul_cap_kbps: uci.get('cake-autorate', existingName, 'adaptive_ceiling_ul_cap_kbps'),
+			hold_s: uci.get('cake-autorate', existingName, 'adaptive_ceiling_hold_time_s'),
+			growth_percent: uci.get('cake-autorate', existingName, 'adaptive_ceiling_growth_percent'),
+			probe_s: uci.get('cake-autorate', existingName, 'adaptive_ceiling_probe_duration_s'),
+			cooldown_s: uci.get('cake-autorate', existingName, 'adaptive_ceiling_cooldown_s'),
+			failed_bound_ttl_s: uci.get('cake-autorate', existingName, 'adaptive_ceiling_failed_bound_ttl_s')
+		};
+		state.adaptive_ceiling_disable_confirmed = false;
 		for (var importIndex = 0; importIndex < sqmImportOptionMap.length; importIndex++) {
 			var importKey = sqmImportOptionMap[importIndex][0];
 			state[importKey] = uci.get('cake-autorate', existingName, importKey) || sqmImportOptionMap[importIndex][2];
 		}
-	} else {
-		importSqmQueueIntoState(state);
-	}
+		} else {
+			importSqmQueueIntoState(state, state.mode !== 'autotune');
+		}
 
-	function syncSqmForInterface() {
-		importSqmQueueIntoState(state);
+		function syncSqmForInterface() {
+			importSqmQueueIntoState(state, state.mode !== 'autotune');
 	}
 
 	function stepTitle() {
 		return [
 			_('Interface'),
 			state.mode === 'autotune' ? _('Full Auto-Tune') : _('Speed test'),
-			_('Review')
+			state.autotune_diagnostics && !state.autotune_result ? _('Review diagnostics') : _('Review')
 		][state.step];
 	}
 
@@ -2098,7 +3409,7 @@ function showCreateWizard(grid, name, existingName) {
 		var labels = [
 			_('Interface'),
 			state.mode === 'autotune' ? _('Full Auto-Tune') : _('Speed test'),
-			_('Review')
+			state.autotune_diagnostics && !state.autotune_result ? _('Review diagnostics') : _('Review')
 		];
 		var steps = [];
 
@@ -2152,10 +3463,13 @@ function showCreateWizard(grid, name, existingName) {
 					state.mode = ev.currentTarget.getAttribute('data-mode');
 					state.autotune_result = null;
 					state.autotune_proposal = null;
+					state.autotune_diagnostics = null;
+					state.autotune_failure_message = '';
 					if (state.mode === 'autotune') {
 						state.enabled = true;
 						state.sqm_enabled = true;
 					}
+					syncSqmForInterface();
 					render();
 				}
 			}, [
@@ -2169,6 +3483,8 @@ function showCreateWizard(grid, name, existingName) {
 			if (newWan !== state.wan_if) {
 				state.autotune_result = null;
 				state.autotune_proposal = null;
+				state.autotune_diagnostics = null;
+				state.autotune_failure_message = '';
 			}
 			state.wan_if = newWan;
 			var matchingMembers = mwan3MembersForDevice(newWan);
@@ -2185,6 +3501,10 @@ function showCreateWizard(grid, name, existingName) {
 		});
 
 		route.addEventListener('change', function() {
+			state.autotune_result = null;
+			state.autotune_proposal = null;
+			state.autotune_diagnostics = null;
+			state.autotune_failure_message = '';
 			state.route_selection = route.value;
 			if (route.value.indexOf('mwan3:') === 0) {
 				state.route_mode = 'mwan3';
@@ -2239,11 +3559,17 @@ function showCreateWizard(grid, name, existingName) {
 	}
 
 	function applyAutotuneResult(result) {
+		if (!autotuneResultValidated(result))
+			throw new Error(_('Refusing to stage an Auto-Tune result that did not pass every validation gate.'));
+
 		var proposal = result.proposal;
 		var firstRun = result.runs && result.runs.length ? result.runs[0] : {};
 
 		state.autotune_result = result;
 		state.autotune_proposal = proposal;
+		state.autotune_diagnostics = null;
+		state.autotune_failure_message = '';
+		state.adaptive_ceiling_disable_confirmed = false;
 		if (!rerun) {
 			state.enabled = true;
 			state.sqm_enabled = true;
@@ -2261,14 +3587,27 @@ function showCreateWizard(grid, name, existingName) {
 
 	function renderAutotuneStep() {
 		var status = E('div', { 'style': 'margin-top:8px;white-space:normal' },
-			state.autotune_result ? _('Calibration complete. Review the proposed parameters before creating the instance.') : '');
+			state.autotune_result ? _('Calibration complete. Review the validated proposed parameters.') :
+				(state.autotune_diagnostics ?
+					(autotuneLegacyResult(state.autotune_diagnostics) ?
+						_('Saved diagnostics use an older result schema. Review them if useful, then run calibration again.') :
+					(autotuneRetryableInconclusive(state.autotune_diagnostics) ?
+						_('Calibration was inconclusive. Retry when ready; this result cannot be reviewed or applied.') :
+						_('Calibration did not validate. Review the diagnostics; this result cannot be applied.'))) : ''));
 		var progress = E('progress', {
 			'max': '100',
 			'value': state.autotune_progress || '0',
-			'style': 'width:min(620px,100%);display:block;margin-top:8px'
+			'style': 'width:min(620px,100%);display:' +
+				(!state.autotune_running && state.autotune_diagnostics ? 'none' : 'block') +
+				';margin-top:8px'
 		});
 		var startCalibration = function(conservative) {
 			showError(null);
+			state.autotune_result = null;
+			state.autotune_proposal = null;
+			state.autotune_diagnostics = null;
+			state.autotune_failure_message = '';
+			state.autotune_recovery_pending = null;
 			state.autotune_running = true;
 			state.autotune_progress = 0;
 			state.autotune_background_block = null;
@@ -2288,11 +3627,30 @@ function showCreateWizard(grid, name, existingName) {
 				state.step = 2;
 				render();
 			}).catch(function(err) {
-				state.autotune_running = false;
+				clearAutotuneProposalState(state);
+				state.autotune_diagnostics = null;
+				state.autotune_failure_message = '';
+				state.autotune_recovery_pending = null;
+				progress.value = 0;
+				progress.style.display = 'none';
 				runButton.disabled = false;
 				cancelButton.disabled = true;
+
+				/* Exhausting the bounded recovery poll is not a terminal job
+				 * result.  Preserve no proposal/diagnostics and make that explicit
+				 * so Review and staging remain unavailable. */
+				if (err.autotuneRecoveryPending) {
+					state.autotune_recovery_pending = err.autotuneRecoveryStatus || {};
+					status.textContent = _('Runtime recovery is still pending. No result or proposal was accepted.');
+					showError(err.message || _('Runtime recovery is still pending.'));
+					return;
+				}
+
 				var result = err.autotuneResult || {};
-				if (result.background_blocked && result.retryable) {
+				if (autotuneRetryableInconclusive(result)) {
+					recordAutotuneRetryableInconclusive(state, result);
+					render();
+				} else if (result.background_blocked && result.retryable) {
 					state.autotune_background_block = result;
 					var background = result.background || {};
 					status.textContent = _('Background traffic blocked strict calibration at %s: DL %s kbit/s, UL %s kbit/s. Usable directions: DL %s, UL %s.').format(
@@ -2304,8 +3662,9 @@ function showCreateWizard(grid, name, existingName) {
 					conservativeButton.style.display = '';
 					showError(_('The strict run stopped before throughput testing. Retry when quiet, continue once with conservative safeguards, or cancel.'));
 				} else {
-					showError(_('Full Auto-Tune failed: %s').format(err.message || err));
-					status.textContent = '';
+					recordAutotuneTerminalFailure(state, result, err.message || String(err));
+					render();
+					showError(_('Full Auto-Tune failed: %s').format(state.autotune_failure_message));
 				}
 			});
 		};
@@ -2315,7 +3674,7 @@ function showCreateWizard(grid, name, existingName) {
 			'click': function() {
 				return startCalibration(false);
 			}
-		}, state.autotune_result ? _('Run again') : _('Start Full Auto-Tune'));
+		}, state.autotune_result || state.autotune_diagnostics ? _('Run again') : _('Start Full Auto-Tune'));
 		var conservativeButton = E('button', {
 			'class': 'btn cbi-button cbi-button-positive',
 			'style': state.autotune_background_block ? '' : 'display:none',
@@ -2331,14 +3690,19 @@ function showCreateWizard(grid, name, existingName) {
 			}
 		}, _('Cancel test'));
 
-		return [
+		var fields = [
 			E('div', { 'class': 'alert-message warning' }, [
 				E('strong', {}, _('Traffic warning: ')),
-				_('Full Auto-Tune runs two unshaped and at least one shaped router-side download/upload test; a borderline result is tested once more. Other WAN traffic can reduce confidence, but is never counted as test throughput.')
+				_('Full Auto-Tune runs two unshaped samples followed by separate router-side download-only and upload-only validation phases. An unreliable measurement may be repeated once and one bounded directional correction may be validated. Other WAN traffic can reduce confidence, but is never counted as test throughput.')
 			]),
 			wizardField(_('Calibration'), E('div', {}, [ runButton, ' ', conservativeButton, ' ', cancelButton, progress, status ]),
 				_('All intermediate state stays in RAM. No UCI configuration is written until you confirm the Review step.'))
 		];
+
+		if (state.autotune_diagnostics)
+			fields.push(renderAutotuneDiagnostics(state.autotune_diagnostics));
+
+		return fields;
 	}
 
 	function renderSpeedStep() {
@@ -2547,6 +3911,7 @@ function showCreateWizard(grid, name, existingName) {
 		var wan = normalizeInterfaceName(state.wan_if);
 		var reflectors = (state.reflectors && state.reflectors.length) ? state.reflectors : defaultReflectors();
 		var activeCount = Math.min(parseInt(state.no_pingers || '6', 10), reflectors.length);
+		var reviewNodes = [];
 		var rows = [
 			[ _('Target interface'), targetInterfaceLabel(wan) ],
 			[ _('Probe routing'), state.route_mode === 'mwan3' ? _('mwan3 member %s').format(state.mwan3_member) : _('Main routing table') ],
@@ -2557,6 +3922,8 @@ function showCreateWizard(grid, name, existingName) {
 			[ _('Preferred backend'), speedtestBackendChoiceTitle(state.speedtest_backend) ],
 			[ _('Pinger plan'), _('%s, %d active / %d candidates').format(state.pinger_method || 'fping', activeCount, reflectors.length) ]
 		];
+		if (state.autotune_diagnostics && !state.autotune_result)
+			reviewNodes.push(renderAutotuneDiagnostics(state.autotune_diagnostics));
 		if (state.multiwan_set) {
 			var multiwanPlans = multiwanInstancePlans(state);
 			var multiwanConflicts = wizardPlanConflicts(multiwanPlans, state.enabled,
@@ -2566,13 +3933,20 @@ function showCreateWizard(grid, name, existingName) {
 			}).join('\n') ]);
 			rows.push([ _('Detected conflicts'), multiwanConflicts.length ? multiwanConflicts.join('\n') : _('None') ]);
 		}
-		var autotune = state.autotune_result;
+		/* Never render a proposal in Review unless it is also eligible for
+		 * staging.  This keeps a stale result object from becoming an implied
+		 * approval surface after a failed or interrupted run. */
+		var autotune = autotuneResultValidated(state.autotune_result) ?
+			state.autotune_result : null;
 		if (autotune) {
 			var proposal = autotune.proposal;
 			var validation = autotune.validation;
 			var dl = proposal.download;
 			var ul = proposal.upload;
 			var adaptive = proposal.adaptive_ceiling;
+			var adaptiveDecision = adaptiveCeilingWritePlan(state, proposal);
+			var needsAdaptiveConsent = !!(state.original_adaptive_ceiling &&
+				state.original_adaptive_ceiling.enabled === true && adaptive.enabled === false);
 			var thresholds = proposal.thresholds_ms;
 			var firstRun = autotune.runs && autotune.runs.length ? autotune.runs[0] : {};
 			rows.push(
@@ -2583,10 +3957,24 @@ function showCreateWizard(grid, name, existingName) {
 				[ _('Proposed DL min / base / max'), _('%d / %d / %d kbit/s').format(dl.minimum_kbps, dl.base_kbps, dl.maximum_kbps) ],
 				[ _('Proposed UL min / base / max'), _('%d / %d / %d kbit/s').format(ul.minimum_kbps, ul.base_kbps, ul.maximum_kbps) ],
 				[ _('Delay thresholds'), _('%d / %d / %d ms adjust-up / delay / adjust-down').format(thresholds.adjust_up, thresholds.delay, thresholds.adjust_down) ],
-				[ _('Adaptive ceiling'), adaptive.enabled ? _('enabled; caps %d / %d kbit/s').format(dl.absolute_cap_kbps, ul.absolute_cap_kbps) : _('not needed for the measured stable link') ],
+				[ _('Adaptive ceiling'), adaptive.enabled ? _('enabled; caps %d / %d kbit/s').format(dl.absolute_cap_kbps, ul.absolute_cap_kbps) :
+					(adaptiveDecision.preserved ?
+						_('Auto-Tune recommends disabling it, but the existing enabled setting and tuning parameters will be preserved.') :
+						_('disabled as proposed for the measured stable link')) ],
 				[ _('Detected link layer'), _('%s; overhead %d, MPU %d').format(proposal.link.kind, proposal.link.overhead, proposal.link.mpu) ],
 				[ _('Test server'), firstRun.server_sponsor ? _('%s #%s').format(firstRun.server_sponsor, firstRun.server_id || '-') : _('automatic') ]
 			);
+			if (needsAdaptiveConsent) {
+				var disableAdaptive = wizardCheckbox(state.adaptive_ceiling_disable_confirmed === true);
+				disableAdaptive.addEventListener('change', function() {
+					state.adaptive_ceiling_disable_confirmed = disableAdaptive.checked;
+					render();
+				});
+				rows.push([ _('Adaptive ceiling consent'), E('label', { 'style': 'white-space:normal' }, [
+					disableAdaptive, ' ',
+					_('Explicitly allow this proposal to disable the currently enabled adaptive ceiling.')
+				]) ]);
+			}
 			if (autotune.conservative) {
 				var background = autotune.background || {};
 				var usable = autotune.usable_directions || {};
@@ -2602,30 +3990,8 @@ function showCreateWizard(grid, name, existingName) {
 					autotune.baseline.http_median_ms,
 					autotune.baseline.http_p95_ms) ]);
 			}
-			if (validation) {
-				rows.push(
-					[ _('Shaped validation'), _('%s/100, %s').format(validation.score, validation.pass ? _('passed') : _('failed')) ],
-					[ _('Validation attempts'), String((autotune.validation_attempts || [ validation ]).length) ],
-					[ _('Shaped throughput'), _('%d / %d kbit/s DL / UL; %s%% / %s%% of observed low').format(
-						validation.throughput.download_kbps,
-						validation.throughput.upload_kbps,
-						validation.throughput.download_retention_percent,
-						validation.throughput.upload_retention_percent) ],
-					[ _('Loaded latency'), _('%s ms median / %s ms p95 / %s ms max; %s%% loss').format(
-						validation.latency.median_ms,
-						validation.latency.p95_ms,
-						validation.latency.max_ms,
-						validation.latency.loss_percent) ],
-					[ _('Validation CPU peak'), String(validation.cpu_peak_percent) + '%' ]
-				);
-				if (validation.http_latency) {
-					rows.push([ _('Loaded TCP/HTTPS latency'), _('%s ms median / %s ms p95 / +%s ms; %d samples').format(
-						validation.http_latency.median_ms,
-						validation.http_latency.p95_ms,
-						validation.http_latency.delta_p95_ms,
-						validation.http_latency.samples) ]);
-				}
-			}
+			if (validation)
+				reviewNodes.push(renderAutotuneDiagnostics(autotune));
 			if (proposal.warnings && proposal.warnings.length)
 				rows.push([ _('Auto-Tune warnings'), proposal.warnings.join(' ') ]);
 		}
@@ -2644,14 +4010,16 @@ function showCreateWizard(grid, name, existingName) {
 			);
 		}
 
-		return [
+		reviewNodes.push(
 			E('table', { 'class': 'table' }, rows.map(function(row) {
 				return E('tr', { 'class': 'tr' }, [
 					E('td', { 'class': 'td' }, row[0]),
 					E('td', { 'class': 'td' }, row[1])
 				]);
 			}))
-		];
+		);
+
+		return reviewNodes;
 	}
 
 	function validateStep(step) {
@@ -2675,8 +4043,10 @@ function showCreateWizard(grid, name, existingName) {
 		}
 
 		if (step === 1) {
-			if (state.mode === 'autotune' && !state.autotune_proposal) {
-				showError(_('Run Full Auto-Tune successfully before continuing to Review.'));
+			if (state.mode === 'autotune' && !autotuneResultValidated(state.autotune_result)) {
+				showError(state.autotune_diagnostics ?
+					_('This Auto-Tune run produced diagnostics only. Run it again successfully before continuing to Review.') :
+					_('Run Full Auto-Tune before continuing to Review. Only a fully validated proposal can be applied.'));
 				return false;
 			}
 
@@ -2723,6 +4093,10 @@ function showCreateWizard(grid, name, existingName) {
 
 	function validateWizard() {
 		showError(null);
+		if (state.mode === 'autotune' && !autotuneResultValidated(state.autotune_result)) {
+			showError(_('This Auto-Tune result is diagnostic-only and cannot be applied.'));
+			return false;
+		}
 
 		if (!state.name) {
 			showError(_('Instance name is required.'));
@@ -2789,46 +4163,61 @@ function showCreateWizard(grid, name, existingName) {
 
 	function finish() {
 		var config_name = grid.uciconfig || grid.map.config;
-		var section_id, created = [];
 
 		if (!validateWizard())
 			return;
 
-		var plans = state.multiwan_set ? multiwanInstancePlans(state) : [ {
-			name: state.name,
-			member: state.mwan3_member,
-			device: state.wan_if,
-			sqmSection: state.sqm_section || managedSqmSectionName(state.name)
-		} ];
-		for (var planIndex = 0; planIndex < plans.length; planIndex++) {
-			var plan = plans[planIndex];
-			var instanceState = {};
-			for (var key in state)
-				if (state.hasOwnProperty(key))
-					instanceState[key] = state[key];
-			instanceState.name = plan.name;
-			instanceState.wan_if = plan.device;
-			instanceState.route_mode = plan.member ? 'mwan3' : state.route_mode;
-			instanceState.mwan3_member = plan.member || '';
-			instanceState.route_selection = plan.member ? 'mwan3:' + plan.member : 'main';
-			instanceState.sqm_section = plan.sqmSection;
-			instanceState.ping_extra_args = pingerInterfaceArgs(plan.device, instanceState.pinger_method || 'fping');
-			var existingQueue = findImportableSqmQueueForInterface(plan.device);
-			if (existingQueue) {
-				instanceState.sqm_section = queueSectionName(existingQueue);
-				instanceState.sqm_download = rateValue(existingQueue.download, instanceState.sqm_download);
-				instanceState.sqm_upload = rateValue(existingQueue.upload, instanceState.sqm_upload);
+		var freshness = state.mode === 'autotune' ?
+			revalidateAutotuneProposal(state.name, state.wan_if,
+				state.speedtest_backend, state.autotune_result,
+				state.route_mode, state.mwan3_member) : Promise.resolve();
+
+		return freshness.then(function() {
+			var section_id, created = [];
+			var plans = state.multiwan_set ? multiwanInstancePlans(state) : [ {
+				name: state.name,
+				member: state.mwan3_member,
+				device: state.wan_if,
+				sqmSection: state.sqm_section || managedSqmSectionName(state.name)
+			} ];
+
+			for (var planIndex = 0; planIndex < plans.length; planIndex++) {
+				var plan = plans[planIndex];
+				var instanceState = {};
+				for (var key in state)
+					if (state.hasOwnProperty(key))
+						instanceState[key] = state[key];
+				instanceState.name = plan.name;
+				instanceState.wan_if = plan.device;
+				instanceState.route_mode = plan.member ? 'mwan3' : state.route_mode;
+				instanceState.mwan3_member = plan.member || '';
+				instanceState.route_selection = plan.member ? 'mwan3:' + plan.member : 'main';
+				instanceState.sqm_section = plan.sqmSection;
+				instanceState.ping_extra_args = pingerInterfaceArgs(plan.device, instanceState.pinger_method || 'fping');
+					var existingQueue = state.mode === 'autotune' ? null :
+						findImportableSqmQueueForInterface(plan.device);
+				if (existingQueue) {
+					instanceState.sqm_section = queueSectionName(existingQueue);
+					instanceState.sqm_download = rateValue(existingQueue.download, instanceState.sqm_download);
+					instanceState.sqm_upload = rateValue(existingQueue.upload, instanceState.sqm_upload);
+				}
+
+				section_id = rerun ? existingName : grid.map.data.add(config_name, grid.sectiontype, plan.name);
+				writeWizardConfig(section_id, instanceState);
+				if (state.mode === 'autotune')
+					stageAutotuneApplyMarker(section_id, instanceState);
+				created.push(section_id);
 			}
 
-			section_id = rerun ? existingName : grid.map.data.add(config_name, grid.sectiontype, plan.name);
-			writeWizardConfig(section_id, instanceState);
-			created.push(section_id);
-		}
-
-		return grid.map.save(null, true)
-			.then(L.bind(grid.map.load, grid.map))
-			.then(L.bind(grid.map.reset, grid.map))
-			.then(function() {
+			return grid.map.save(null, true).then(function() { return created; });
+		})
+			.then(function(created) {
+				return L.bind(grid.map.load, grid.map)().then(function() { return created; });
+			})
+			.then(function(created) {
+				return L.bind(grid.map.reset, grid.map)().then(function() { return created; });
+			})
+			.then(function(created) {
 				ui.hideModal();
 				ui.addNotification(null, E('p', rerun ?
 					_('Auto-Tune proposal staged for %s. Review pending changes, then Save & Apply.').format(existingName) :
@@ -2873,7 +4262,9 @@ function showCreateWizard(grid, name, existingName) {
 			buttons.push(' ');
 		}
 
-		if (state.step < 2) {
+		var invalidAutotune = state.mode === 'autotune' &&
+			!autotuneResultValidated(state.autotune_result);
+		if (state.step < 2 && !(state.step === 1 && invalidAutotune)) {
 			buttons.push(E('button', {
 				'class': 'btn cbi-button cbi-button-positive',
 				'click': function() {
@@ -2881,7 +4272,13 @@ function showCreateWizard(grid, name, existingName) {
 				}
 			}, _('Next')));
 		}
-		else {
+		else if (invalidAutotune && state.autotune_diagnostics) {
+			buttons.push(E('button', {
+				'class': 'btn cbi-button cbi-button-positive',
+				'click': function() { ui.hideModal(); }
+			}, _('Close diagnostics')));
+		}
+		else if (!invalidAutotune) {
 			buttons.push(E('button', {
 				'class': 'btn cbi-button cbi-button-positive important',
 				'click': finish
@@ -3192,7 +4589,10 @@ function addQualityOptions(section) {
 	o.depends('transport_latency_enabled', '1');
 	o.rmempty = false;
 	o.validate = function(section_id, value) {
-		return validateTransportProbeUrl(value);
+		return validateTransportProbeUrl(
+			formOrUci(validationSection(this), section_id, 'transport_probe_backend'),
+			value
+		);
 	};
 
 	o = value(section, 'quality', 'transport_probe_idle_interval_s', _('Idle probe interval'), 'and(ufloat,min(5),max(3600))', '15.0');
@@ -4198,20 +5598,19 @@ function loadSqmScripts() {
 }
 
 return L.view.extend({
-	handleSaveApply: function(ev) {
-		var self = this;
-
-		return this.handleSave(ev).then(function() {
-			return uci.apply(30);
-		}).then(function() {
-			return fs.exec('/etc/init.d/cake-autorate', [ 'restart' ]);
-		}).then(function(result) {
-			if (result.code !== 0)
-				throw new Error(result.stderr || _('Unable to restart CAKE Autorate.'));
-
-			window.location = window.location.href.split('#')[0];
-			return self;
-		});
+	handleSaveApply: function(ev, mode) {
+		var markers;
+		try {
+			markers = pendingAutotuneApplyMarkers();
+		}
+		catch (error) {
+			return Promise.reject(error);
+		}
+		if (!markers.length)
+			return this.super('handleSaveApply', [ ev, mode ]);
+		if (markers.length !== 1)
+			return Promise.reject(new Error(_('Apply one Full Auto-Tune proposal at a time.')));
+		return runGuardedSaveApply(this, ev);
 	},
 
 	load: function() {

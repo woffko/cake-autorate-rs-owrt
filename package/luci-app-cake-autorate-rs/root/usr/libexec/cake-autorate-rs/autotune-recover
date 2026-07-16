@@ -1,0 +1,1424 @@
+#!/bin/sh
+
+# Crash-only recovery companion for Full Auto-Tune.  The worker writes a
+# deliberately small key=value journal and starts this helper in a separate
+# session.  No journal value is ever evaluated as shell code.
+
+mode="${1:-}"
+journal="${2:-}"
+
+proc_root="${CAKE_AUTORATE_RECOVER_PROC_ROOT:-/proc}"
+sys_class_net="${CAKE_AUTORATE_RECOVER_SYS_CLASS_NET:-/sys/class/net}"
+tc_bin="${CAKE_AUTORATE_RECOVER_TC:-tc}"
+ip_bin="${CAKE_AUTORATE_RECOVER_IP:-ip}"
+nft_bin="${CAKE_AUTORATE_RECOVER_NFT:-nft}"
+kill_bin="${CAKE_AUTORATE_RECOVER_KILL:-kill}"
+jsonfilter_bin="${CAKE_AUTORATE_JSONFILTER:-$(command -v jsonfilter 2>/dev/null)}"
+sqm_recover="${CAKE_AUTORATE_RECOVER_SQM_RECOVER:-/usr/libexec/cake-autorate-rs/sqm-recover}"
+runtime_lock_lib="${CAKE_AUTORATE_RUNTIME_LOCK_LIB:-/usr/libexec/cake-autorate-rs/runtime-lock}"
+poll_seconds="${CAKE_AUTORATE_RECOVER_POLL_SECONDS:-1}"
+self="${CAKE_AUTORATE_RECOVER_SELF:-$0}"
+autotune_result_producer="cake-autorate-rs-autotune"
+
+umask 077
+
+[ -r "$runtime_lock_lib" ] || {
+	printf '%s\n' "Runtime lock library is unavailable: $runtime_lock_lib" >&2
+	exit 1
+}
+# shellcheck source=/usr/libexec/cake-autorate-rs/runtime-lock
+. "$runtime_lock_lib"
+
+usage() {
+	printf '%s\n' "Usage: autotune-recover watch|recover|finalize JOURNAL | monitor RECOVERY_ROOT" >&2
+	exit 2
+}
+
+safe_name() {
+	case "$1" in
+		''|*[!A-Za-z0-9_]*) return 1 ;;
+	esac
+}
+
+safe_interface() {
+	case "$1" in
+		''|*[!A-Za-z0-9_.:@-]*) return 1 ;;
+	esac
+}
+
+safe_optional_name() {
+	[ -z "$1" ] || safe_interface "$1"
+}
+
+safe_alias() {
+	case "$1" in
+		''|*[!A-Za-z0-9_-]*) return 1 ;;
+	esac
+}
+
+safe_qdisc_handle() {
+	printf '%s\n' "$1" | grep -Eq '^[A-Fa-f0-9]{1,4}:$'
+}
+
+is_pid() {
+	case "$1" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$1" -gt 1 ] 2>/dev/null
+}
+
+is_uint() {
+	case "$1" in ''|*[!0-9]*) return 1 ;; esac
+}
+
+valid_sha256_fingerprint() {
+	case "$1" in sha256:????????????????????????????????????????????????????????????????) ;;
+		*) return 1 ;;
+	esac
+	case "${1#sha256:}" in *[!0-9a-f]*) return 1 ;; esac
+}
+
+valid_sqm_snapshot_path() {
+	[ -n "$sqm_config_snapshot" ] || return 1
+	runtime_lock_ram_path "$sqm_config_snapshot" || return 1
+	snapshot_prefix="$runtime_lock_root/sqm-snapshot."
+	case "$sqm_config_snapshot" in "$snapshot_prefix"*) ;; *) return 1 ;; esac
+	snapshot_name="${sqm_config_snapshot#"$snapshot_prefix"}"
+	case "$snapshot_name" in ''|*/*|*[!A-Za-z0-9_-]*) return 1 ;; esac
+	[ ! -L "$sqm_config_snapshot" ] || return 1
+	if [ -e "$sqm_config_snapshot" ]; then
+		owned_regular_file "$sqm_config_snapshot" || return 1
+		[ "$(LC_ALL=C ls -ldn "$sqm_config_snapshot" 2>/dev/null | awk 'NR == 1 { print substr($1, 1, 10); exit }')" = '-rw-------' ] || return 1
+	fi
+}
+
+ram_path() {
+	case "$1" in
+		/tmp/*|/run/*|/var/run/*) ;;
+		*) return 1 ;;
+	esac
+	case "$1" in
+		*'/../'*|*'/..'|*'/./'*|*'/.'|*'//'*) return 1 ;;
+	esac
+	case "$1" in
+		*[!A-Za-z0-9_./:@-]*) return 1 ;;
+	esac
+}
+
+owned_regular_file() {
+	[ -f "$1" ] && [ ! -L "$1" ] || return 1
+	runtime_lock_path_owned_by_euid "$1"
+}
+
+secure_existing_directory() {
+	ram_path "$1" || return 1
+	[ -d "$1" ] && [ ! -L "$1" ] || return 1
+	runtime_lock_path_owned_by_euid "$1" || return 1
+	chmod 700 "$1" 2>/dev/null || return 1
+}
+
+safe_optional_owned_file() {
+	[ ! -e "$1" ] && [ ! -L "$1" ] && return 0
+	owned_regular_file "$1"
+}
+
+json_escape() {
+	printf '%s' "$1" | tr '\n\r\t' '   ' | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+strict_single_json_object() {
+	json_candidate="$1"
+	[ -n "$json_candidate" ] || return 1
+	[ "${#json_candidate}" -le 262144 ] 2>/dev/null || return 1
+	printf '%s\n' "$json_candidate" | awk '
+		NR > 1 { bad = 1; next }
+		NR == 1 {
+			for (i = 1; i <= length($0); i++) {
+				ch = substr($0, i, 1)
+				if (!started) {
+					if (ch ~ /[[:space:]]/) continue
+					if (ch != "{") { bad = 1; break }
+					started = 1; stack[++depth] = ch; continue
+				}
+				if (ended) {
+					if (ch !~ /[[:space:]]/) { bad = 1; break }
+					continue
+				}
+				if (in_string) {
+					if (escaped) { escaped = 0; continue }
+					if (ch == "\\") { escaped = 1; continue }
+					if (ch == "\"") in_string = 0
+					continue
+				}
+				if (ch == "\"") { in_string = 1; continue }
+				if (ch == "{" || ch == "[") { stack[++depth] = ch; continue }
+				if (ch == "}" || ch == "]") {
+					expected = (ch == "}" ? "{" : "[")
+					if (depth < 1 || stack[depth] != expected) { bad = 1; break }
+					delete stack[depth--]
+					if (depth == 0) ended = 1
+				}
+			}
+		}
+		END { exit(bad || !started || !ended || depth != 0 || in_string || escaped ? 1 : 0) }
+	'
+}
+
+terminal_json_valid() {
+	terminal_candidate="$1"
+	strict_single_json_object "$terminal_candidate" || return 1
+	[ -n "$jsonfilter_bin" ] || return 1
+	terminal_state="$(printf '%s\n' "$terminal_candidate" | "$jsonfilter_bin" -e '@.state' 2>/dev/null)" || return 1
+	terminal_schema="$(printf '%s\n' "$terminal_candidate" | "$jsonfilter_bin" -e '@.schema_version' 2>/dev/null)" || return 1
+	[ -n "$terminal_state" ] && [ "$terminal_schema" = 3 ]
+}
+
+fatal() {
+	printf '%s\n' "$*" >&2
+	exit 1
+}
+
+seen_key() {
+	case " $seen_keys " in
+		*" $1 "*) return 0 ;;
+	esac
+	return 1
+}
+
+require_key() {
+	seen_key "$1" || fatal "Recovery journal is missing required key: $1"
+}
+
+load_journal() {
+	ram_path "$journal" || fatal "Recovery journal must be stored in RAM."
+	journal_parent="${journal%/*}"
+	secure_existing_directory "$journal_parent" || fatal "Recovery journal directory is unsafe or foreign-owned."
+	owned_regular_file "$journal" || fatal "Recovery journal is not an euid-owned regular file."
+	chmod 600 "$journal" 2>/dev/null || fatal "Recovery journal permissions cannot be secured."
+
+	journal_version=""
+	job=""
+	section=""
+	owner_pid=""
+	owner_pgid=""
+	proc_starttime=""
+		target_if=""
+		temp_ifb=""
+		temp_ifb_alias=""
+		temp_ifb_ifindex=""
+		temp_target_handle=""
+		temp_ifb_handle=""
+		temp_ingress_handle=""
+		temp_redirect_pref=""
+	shaper_started=""
+	sqm_was_active=""
+	sqm_restore_mode=""
+	sqm_section=""
+	sqm_target_if=""
+	sqm_ul_if=""
+	sqm_dl_if=""
+	sqm_config_fingerprint=""
+	sqm_config_snapshot=""
+	sqm_restore_required=""
+	autorate_pid=""
+	autorate_starttime=""
+	active_test_pgid=""
+	active_test_starttime=""
+	nft_table=""
+	interface_lock=""
+	interface_lock_token=""
+	done_marker=""
+	error_file=""
+	result_file=""
+	status_file=""
+	pending_result_file=""
+	pending_error_file=""
+	heartbeat_file=""
+	seen_keys=""
+	seen_recovery_paths=""
+
+	while IFS= read -r line || [ -n "$line" ]; do
+		case "$line" in
+			''|'#'*) continue ;;
+			*=*) ;;
+			*) fatal "Malformed recovery journal line." ;;
+		esac
+		key="${line%%=*}"
+		value="${line#*=}"
+		seen_key "$key" && fatal "Duplicate recovery journal key: $key"
+		case "$key" in
+			journal_version) journal_version="$value" ;;
+			job) job="$value" ;;
+			section) section="$value" ;;
+			owner_pid) owner_pid="$value" ;;
+			owner_pgid) owner_pgid="$value" ;;
+			proc_starttime) proc_starttime="$value" ;;
+				target_if) target_if="$value" ;;
+				temp_ifb) temp_ifb="$value" ;;
+				temp_ifb_alias) temp_ifb_alias="$value" ;;
+				temp_ifb_ifindex) temp_ifb_ifindex="$value" ;;
+				temp_target_handle) temp_target_handle="$value" ;;
+				temp_ifb_handle) temp_ifb_handle="$value" ;;
+				temp_ingress_handle) temp_ingress_handle="$value" ;;
+				temp_redirect_pref) temp_redirect_pref="$value" ;;
+			shaper_started) shaper_started="$value" ;;
+			sqm_was_active) sqm_was_active="$value" ;;
+			sqm_restore_mode) sqm_restore_mode="$value" ;;
+			sqm_section) sqm_section="$value" ;;
+			sqm_target_if) sqm_target_if="$value" ;;
+			sqm_ul_if) sqm_ul_if="$value" ;;
+			sqm_dl_if) sqm_dl_if="$value" ;;
+			sqm_config_fingerprint) sqm_config_fingerprint="$value" ;;
+			sqm_config_snapshot) sqm_config_snapshot="$value" ;;
+			sqm_restore_required) sqm_restore_required="$value" ;;
+			autorate_pid) autorate_pid="$value" ;;
+			autorate_starttime) autorate_starttime="$value" ;;
+			active_test_pgid) active_test_pgid="$value" ;;
+			active_test_starttime) active_test_starttime="$value" ;;
+			nft_table) nft_table="$value" ;;
+			interface_lock) interface_lock="$value" ;;
+			interface_lock_token) interface_lock_token="$value" ;;
+			done_marker) done_marker="$value" ;;
+			error_file) error_file="$value" ;;
+			result_file) result_file="$value" ;;
+			status_file) status_file="$value" ;;
+			pending_result_file) pending_result_file="$value" ;;
+			pending_error_file) pending_error_file="$value" ;;
+			heartbeat_file) heartbeat_file="$value" ;;
+			*) fatal "Unknown recovery journal key: $key" ;;
+		esac
+		seen_keys="${seen_keys}${seen_keys:+ }$key"
+	done < "$journal"
+
+		for key in journal_version job section owner_pid owner_pgid proc_starttime target_if temp_ifb \
+			temp_ifb_alias temp_ifb_ifindex temp_target_handle temp_ifb_handle temp_ingress_handle temp_redirect_pref \
+			shaper_started sqm_was_active sqm_restore_mode sqm_section sqm_target_if sqm_ul_if sqm_dl_if \
+			sqm_config_fingerprint sqm_config_snapshot sqm_restore_required \
+		autorate_pid autorate_starttime \
+		active_test_pgid active_test_starttime nft_table \
+		interface_lock interface_lock_token done_marker error_file result_file status_file \
+		pending_result_file pending_error_file heartbeat_file; do
+		require_key "$key"
+	done
+	[ "$journal_version" = 4 ] || fatal "Unsupported recovery journal version."
+	safe_name "$job" || fatal "Invalid recovery job name."
+	safe_name "$section" || fatal "Invalid recovery instance name."
+	is_pid "$owner_pid" || fatal "Invalid recovery owner PID."
+	is_pid "$owner_pgid" || fatal "Invalid recovery owner process group."
+	[ "$owner_pgid" = "$owner_pid" ] || fatal "Recovery owner must be its setsid process-group leader."
+	is_uint "$proc_starttime" || fatal "Invalid recovery owner start time."
+		safe_interface "$target_if" || fatal "Invalid recovery target interface."
+		safe_interface "$temp_ifb" || fatal "Invalid recovery IFB name."
+		safe_alias "$temp_ifb_alias" || fatal "Invalid recovery IFB ownership alias."
+		[ -z "$temp_ifb_ifindex" ] || is_uint "$temp_ifb_ifindex" || fatal "Invalid recovery IFB index."
+		safe_qdisc_handle "$temp_target_handle" || fatal "Invalid recovery target qdisc handle."
+		safe_qdisc_handle "$temp_ifb_handle" || fatal "Invalid recovery IFB qdisc handle."
+		[ "$temp_ingress_handle" = ffff: ] || fatal "Invalid recovery ingress qdisc handle."
+		is_uint "$temp_redirect_pref" || fatal "Invalid recovery redirect preference."
+	case "$shaper_started:$sqm_was_active" in
+		0:0|0:1|1:0|1:1) ;;
+		*) fatal "Invalid recovery state flags." ;;
+	esac
+	case "$sqm_was_active:$sqm_restore_mode" in
+		0:none|1:managed) ;;
+		*) fatal "SQM recovery mode does not match the saved SQM state." ;;
+	esac
+	if [ "$sqm_was_active" = 1 ]; then
+		safe_name "$sqm_section" || fatal "Invalid managed SQM section identity."
+		safe_interface "$sqm_target_if" || fatal "Invalid managed SQM target identity."
+		safe_interface "$sqm_ul_if" || fatal "Invalid managed SQM upload identity."
+		safe_interface "$sqm_dl_if" || fatal "Invalid managed SQM download identity."
+		[ "$sqm_target_if" = "$target_if" ] || fatal "Managed SQM target does not match recovery target."
+		valid_sha256_fingerprint "$sqm_config_fingerprint" || fatal "Invalid managed SQM configuration fingerprint."
+		case "$sqm_restore_required" in 0|1) ;; *) fatal "Invalid managed SQM restore-required state." ;; esac
+		valid_sqm_snapshot_path || fatal "Invalid managed SQM configuration snapshot path."
+		if [ "$sqm_restore_required" = 1 ]; then
+			[ -f "$sqm_config_snapshot" ] || fatal "Required managed SQM configuration snapshot is missing."
+		fi
+	else
+		[ -z "$sqm_config_fingerprint" ] && [ -z "$sqm_config_snapshot" ] &&
+			[ "$sqm_restore_required" = 0 ] ||
+			fatal "Inactive SQM recovery must not carry a restore snapshot."
+	fi
+	case "$autorate_pid:$autorate_starttime" in
+		:) ;;
+		*:*)
+			is_pid "$autorate_pid" && is_uint "$autorate_starttime" ||
+				fatal "Invalid autorate process identity."
+			;;
+	esac
+	case "$active_test_pgid:$active_test_starttime" in
+		:) ;;
+		*:*)
+			is_pid "$active_test_pgid" && is_uint "$active_test_starttime" ||
+				fatal "Invalid active speed-test process-group identity."
+			[ "$active_test_pgid" != "$owner_pgid" ] ||
+				fatal "Speed test and Full Auto-Tune must not share a process group."
+			;;
+	esac
+	safe_optional_name "$nft_table" || fatal "Invalid recovery nftables table name."
+	ram_path "$interface_lock" || fatal "Interface lock must be stored in RAM."
+	runtime_lock_safe_token "$interface_lock_token" || fatal "Invalid interface-lock token."
+	ram_path "$done_marker" || fatal "Recovery done marker must be stored in RAM."
+	ram_path "$error_file" || fatal "Recovery error file must be stored in RAM."
+	ram_path "$result_file" || fatal "Recovery result file must be stored in RAM."
+	ram_path "$status_file" || fatal "Recovery status file must be stored in RAM."
+	ram_path "$pending_result_file" || fatal "Recovery pending result must be stored in RAM."
+	ram_path "$pending_error_file" || fatal "Recovery pending error must be stored in RAM."
+	ram_path "$heartbeat_file" || fatal "Recovery heartbeat must be stored in RAM."
+	job_state_parent="${error_file%/*}"
+	secure_existing_directory "$job_state_parent" || fatal "Full Auto-Tune job state directory is unsafe or foreign-owned."
+	for protected_path in "$done_marker" "$error_file" "$result_file" "$status_file" \
+		"$pending_result_file" "$pending_error_file" "$heartbeat_file"; do
+		safe_optional_owned_file "$protected_path" || fatal "Recovery state path is unsafe or foreign-owned: $protected_path"
+	done
+	cleanup_marker="$journal.cleanup-done"
+	internal_recovery_mutex="$journal.recovery-lock"
+	internal_sqm_bypass="$journal.sqm-lock-bypass"
+	for recovery_path in "$journal" "$interface_lock" "$done_marker" "$error_file" "$result_file" \
+		"$status_file" "$pending_result_file" "$pending_error_file" "$heartbeat_file" \
+		"$cleanup_marker" "$internal_recovery_mutex" "$internal_sqm_bypass"; do
+		case " $seen_recovery_paths " in
+			*" $recovery_path "*) fatal "Recovery journal paths must be distinct." ;;
+		esac
+		seen_recovery_paths="${seen_recovery_paths}${seen_recovery_paths:+ }$recovery_path"
+	done
+	if [ -n "$sqm_config_snapshot" ]; then
+		case " $seen_recovery_paths " in
+			*" $sqm_config_snapshot "*) fatal "Recovery journal paths must be distinct." ;;
+		esac
+		seen_recovery_paths="${seen_recovery_paths}${seen_recovery_paths:+ }$sqm_config_snapshot"
+	fi
+	[ ! -L "$done_marker" ] || fatal "Refusing a symlink recovery done marker."
+	[ ! -L "$error_file" ] || fatal "Refusing a symlink recovery error file."
+	[ ! -L "$result_file" ] || fatal "Refusing a symlink recovery result file."
+	[ ! -L "$status_file" ] || fatal "Refusing a symlink recovery status file."
+	[ ! -L "$pending_result_file" ] || fatal "Refusing a symlink pending recovery result."
+	[ ! -L "$pending_error_file" ] || fatal "Refusing a symlink pending recovery error."
+	[ ! -L "$heartbeat_file" ] || fatal "Refusing a symlink recovery heartbeat."
+
+	ram_path "$cleanup_marker" || fatal "Invalid internal recovery marker path."
+}
+
+process_starttime() {
+	pid="$1"
+	[ -r "$proc_root/$pid/stat" ] || return 1
+	sed 's/^.*) //' "$proc_root/$pid/stat" 2>/dev/null |
+		awk 'NF >= 20 { print $20; exit }'
+}
+
+cmdline_lines() {
+	pid="$1"
+	[ -r "$proc_root/$pid/cmdline" ] || return 1
+	tr '\000' '\n' < "$proc_root/$pid/cmdline"
+}
+
+owner_cmdline_matches() {
+	lines="$(cmdline_lines "$owner_pid")" || return 1
+	first="$(printf '%s\n' "$lines" | sed -n '1p')"
+	second="$(printf '%s\n' "$lines" | sed -n '2p')"
+	case "$first" in
+		*/autotune|autotune) ;;
+		*/sh|sh|*/ash|ash|*/dash|dash)
+			case "$second" in */autotune|autotune) ;; *) return 1 ;; esac
+			;;
+		*) return 1 ;;
+	esac
+	printf '%s\n' "$lines" | grep -Fxq "$job" || return 1
+	printf '%s\n' "$lines" | grep -Fxq 'job-run'
+}
+
+owner_identity_matches() {
+	actual_starttime="$(process_starttime "$owner_pid")" || return 1
+	[ "$actual_starttime" = "$proc_starttime" ] || return 1
+	owner_cmdline_matches
+}
+
+owner_pid_exists() {
+	[ -d "$proc_root/$owner_pid" ]
+}
+
+owner_pid_reused() {
+	actual_starttime="$(process_starttime "$owner_pid")" || return 1
+	[ "$actual_starttime" != "$proc_starttime" ]
+}
+
+owner_pid_is_zombie() {
+	actual_starttime="$(process_starttime "$owner_pid")" || return 1
+	[ "$actual_starttime" = "$proc_starttime" ] || return 1
+	grep -q '^State:[[:space:]]*[Zz]' "$proc_root/$owner_pid/status" 2>/dev/null
+}
+
+autorate_identity_matches() {
+	[ -n "$autorate_pid" ] || return 1
+	actual_starttime="$(process_starttime "$autorate_pid")" || return 1
+	[ "$actual_starttime" = "$autorate_starttime" ] || return 1
+	autorate_cmdline_matches_pid "$autorate_pid"
+}
+
+autorate_cmdline_matches_pid() {
+	candidate_pid="$1"
+	lines="$(cmdline_lines "$candidate_pid")" || return 1
+	program="$(printf '%s\n' "$lines" | sed -n '1p')"
+	argument_one="$(printf '%s\n' "$lines" | sed -n '2p')"
+	argument_two="$(printf '%s\n' "$lines" | sed -n '3p')"
+	argument_three="$(printf '%s\n' "$lines" | sed -n '4p')"
+	case "$program" in */cake-autorated|cake-autorated) ;; *) return 1 ;; esac
+	[ "$argument_one" = --instance ] && [ "$argument_two" = "$section" ] && [ -z "$argument_three" ]
+}
+
+running_replacement_autorate() {
+	replacement_pid=""
+	for cmdline_file in "$proc_root"/[0-9]*/cmdline; do
+		[ -r "$cmdline_file" ] || continue
+		candidate_pid="${cmdline_file%/cmdline}"
+		candidate_pid="${candidate_pid##*/}"
+		autorate_cmdline_matches_pid "$candidate_pid" || continue
+		grep -q '^State:[[:space:]]*[TtZz]' "$proc_root/$candidate_pid/status" 2>/dev/null && continue
+		if [ -n "$replacement_pid" ] && [ "$replacement_pid" != "$candidate_pid" ]; then
+			return 1
+		fi
+		replacement_pid="$candidate_pid"
+	done
+	[ -n "$replacement_pid" ]
+}
+
+wait_for_replacement_autorate() {
+	attempt=0
+	while [ "$attempt" -lt 3 ]; do
+		if running_replacement_autorate; then
+			add_warning "the original autorate process was replaced by verified running PID $replacement_pid"
+			return 0
+		fi
+		attempt=$((attempt + 1))
+		sleep 1
+	done
+	return 1
+}
+
+add_error() {
+	if [ -n "$recovery_errors" ]; then
+		recovery_errors="$recovery_errors; $1"
+	else
+		recovery_errors="$1"
+	fi
+}
+
+add_warning() {
+	if [ -n "$recovery_warnings" ]; then
+		recovery_warnings="$recovery_warnings; $1"
+	else
+		recovery_warnings="$1"
+	fi
+}
+
+write_recovery_error() {
+	message="$1"
+	tmp="$error_file.tmp.$$"
+	printf '{"state":"recovery-failed","schema_version":3,"producer":"%s","job":"%s","instance":"%s","error":"%s","runtime_restored":false,"recovery_pending":true,"auto_apply_eligible":false,"configuration_written":false}\n' \
+		"$autotune_result_producer" "$(json_escape "$job")" "$(json_escape "$section")" "$(json_escape "$message")" > "$tmp" &&
+		mv "$tmp" "$error_file"
+}
+
+write_interrupted_recovery() {
+	message="Full Auto-Tune was interrupted; temporary network state was recovered and no configuration was written."
+	[ -z "$recovery_warnings" ] || message="$message Warnings: $recovery_warnings"
+	tmp="$pending_error_file.tmp.$$"
+	printf '{"state":"failed","schema_version":3,"producer":"%s","stage":"recovery","job":"%s","instance":"%s","recovered":true,"error":"%s","auto_apply_eligible":false,"configuration_written":false,"runtime_restored":false,"recovery_pending":true}\n' \
+		"$autotune_result_producer" "$(json_escape "$job")" "$(json_escape "$section")" "$(json_escape "$message")" > "$tmp" &&
+		mv "$tmp" "$pending_error_file" && rm -f "$pending_result_file"
+}
+
+publish_pending_terminal() {
+	if [ -s "$pending_result_file" ]; then
+		terminal_source="$pending_result_file"
+		terminal_target="$result_file"
+		terminal_other="$error_file"
+	elif [ -s "$pending_error_file" ]; then
+		terminal_source="$pending_error_file"
+		terminal_target="$error_file"
+		terminal_other="$result_file"
+	elif [ -s "$result_file" ]; then
+		terminal_payload="$(cat "$result_file" 2>/dev/null)" || terminal_payload=""
+		terminal_json_valid "$terminal_payload" &&
+			case "$terminal_payload" in *'"runtime_restored":true,"recovery_pending":false}') return 0 ;; esac
+		return 1
+	elif [ -s "$error_file" ]; then
+		terminal_payload="$(cat "$error_file" 2>/dev/null)" || terminal_payload=""
+		terminal_json_valid "$terminal_payload" &&
+			case "$terminal_payload" in *'"runtime_restored":true,"recovery_pending":false}') return 0 ;; esac
+		return 1
+	else
+		return 1
+	fi
+	pending_payload="$(cat "$terminal_source" 2>/dev/null)" || pending_payload=""
+	if terminal_json_valid "$pending_payload" &&
+	   case "$pending_payload" in *'"runtime_restored":false,"recovery_pending":true}') true ;; *) false ;; esac; then
+		terminal_payload="$(printf '%s\n' "$pending_payload" |
+			sed 's/,"runtime_restored":false,"recovery_pending":true}$/,"runtime_restored":true,"recovery_pending":false}/')"
+	else
+		# Runtime restoration is already proven at this point.  A corrupt private
+		# diagnostic must not keep the interface lock forever or be copied to the
+		# public API; replace it with a small internally generated failure object.
+		terminal_target="$error_file"
+		terminal_other="$result_file"
+		terminal_payload="{\"state\":\"recovery-failed\",\"schema_version\":3,\"producer\":\"$autotune_result_producer\",\"job\":\"$(json_escape "$job")\",\"instance\":\"$(json_escape "$section")\",\"error\":\"Stored Full Auto-Tune terminal data was malformed and was discarded after safe runtime restoration.\",\"auto_apply_eligible\":false,\"configuration_written\":false,\"runtime_restored\":true,\"recovery_pending\":false}"
+	fi
+	terminal_json_valid "$terminal_payload" || return 1
+	case "$terminal_payload" in *'"runtime_restored":true,"recovery_pending":false}') ;; *) return 1 ;; esac
+	terminal_tmp="$terminal_target.tmp.$$"
+	printf '%s\n' "$terminal_payload" > "$terminal_tmp" && mv "$terminal_tmp" "$terminal_target" || return 1
+	rm -f "$terminal_other" "$status_file" "$pending_result_file" "$pending_error_file"
+}
+
+mark_done() {
+	tmp="$done_marker.tmp.$$"
+	printf '%s\n' recovered > "$tmp" && mv "$tmp" "$done_marker" || return 1
+	if ! rm -f "$heartbeat_file"; then
+		rm -f "$done_marker" 2>/dev/null || true
+		return 1
+	fi
+	return 0
+}
+
+real_process_starttime() {
+	pid="$1"
+	[ -r "/proc/$pid/stat" ] || return 1
+	sed 's/^.*) //' "/proc/$pid/stat" 2>/dev/null | awk 'NF >= 20 { print $20; exit }'
+}
+
+acquire_recovery_mutex() {
+	recovery_mutex="$journal.recovery-lock"
+	[ ! -L "$recovery_mutex" ] || return 1
+	if [ -e "$recovery_mutex" ]; then
+		owned_regular_file "$recovery_mutex" || return 1
+	fi
+	exec 7>>"$recovery_mutex" || return 1
+	runtime_lock_guard_fd_safe 7 "$recovery_mutex" || {
+		exec 7>&-
+		return 1
+	}
+	"$runtime_lock_flock_bin" -n 7 || {
+		exec 7>&-
+		return 75
+	}
+	if [ -n "${CAKE_AUTORATE_RECOVER_TEST_MUTEX_CREATED_MARKER:-}" ]; then
+		: > "$CAKE_AUTORATE_RECOVER_TEST_MUTEX_CREATED_MARKER"
+		while [ ! -e "${CAKE_AUTORATE_RECOVER_TEST_MUTEX_CREATED_RELEASE:-}" ]; do
+			sleep 1
+		done
+	fi
+	return 0
+}
+
+release_recovery_mutex() {
+	[ -n "${recovery_mutex:-}" ] || return 0
+	"$runtime_lock_flock_bin" -u 7 >/dev/null 2>&1 || return 1
+	exec 7>&-
+	# Once the journal is gone no new recovery claimant can legitimately use
+	# this mutex.  Remove the tmpfs inode after unlock so repeated scheduled jobs
+	# do not leak one recovery-lock file per run until reboot.
+	[ -e "$journal" ] || rm -f "$recovery_mutex" 2>/dev/null || true
+	recovery_mutex=""
+}
+
+claim_interface_lock() {
+	allow_incomplete_claim="${1:-0}"
+	interface_lock_claimed=0
+	runtime_lock_ensure_global_shared || {
+		claim_rc="$?"
+		[ "$claim_rc" -eq 75 ] && add_error "CAKE/SQM service mutation overlaps recovery" ||
+			add_error "unable to acquire global CAKE/SQM recovery lock"
+		return 1
+	}
+	runtime_lock_interface_paths "$target_if" || {
+		add_error "invalid recovery interface lock identity"
+		runtime_lock_abort_global_claim
+		return 1
+	}
+	[ "$runtime_interface_lock_record" = "$interface_lock" ] || {
+		add_error "recovery interface lock path does not match its target"
+		runtime_lock_abort_global_claim
+		return 1
+	}
+	runtime_lock_claim_interface_recovery "$target_if" "$owner_pid" "$proc_starttime" \
+		"$interface_lock_token" "$journal" "$allow_incomplete_claim" || {
+		claim_rc="$?"
+		[ "$claim_rc" -eq 75 ] && add_error "interface lock is still held by a live process" ||
+			add_error "interface lock ownership does not match the recovery journal"
+		runtime_lock_abort_global_claim
+		return 1
+	}
+	interface_lock_claimed=1
+	return 0
+}
+
+release_claimed_interface_lock() {
+	[ "${interface_lock_claimed:-0}" = 1 ] || return 0
+	runtime_lock_release_interface || {
+		add_error "verified recovery interface lock could not be released"
+		return 1
+	}
+	interface_lock_claimed=0
+	return 0
+}
+
+process_group_alive_for() {
+	expected_group="$1"
+	for stat_file in "$proc_root"/[0-9]*/stat; do
+		[ -r "$stat_file" ] || continue
+		group="$(sed 's/^.*) //' "$stat_file" 2>/dev/null |
+			awk 'NF >= 3 && $1 !~ /^[Zz]$/ { print $3; exit }')"
+		[ "$group" = "$expected_group" ] && return 0
+	done
+	return 1
+}
+
+wait_for_group_exit() {
+	expected_group="$1"
+	attempt=0
+	while [ "$attempt" -lt 3 ]; do
+		process_group_alive_for "$expected_group" || return 0
+		attempt=$((attempt + 1))
+		sleep 1
+	done
+	return 1
+}
+
+signal_group_until_gone() {
+	expected_group="$1"
+	"$kill_bin" -TERM -- "-$expected_group" >/dev/null 2>&1 ||
+		"$kill_bin" -TERM "-$expected_group" >/dev/null 2>&1 || true
+	wait_for_group_exit "$expected_group" && return 0
+	"$kill_bin" -KILL -- "-$expected_group" >/dev/null 2>&1 ||
+		"$kill_bin" -KILL "-$expected_group" >/dev/null 2>&1 || true
+	wait_for_group_exit "$expected_group"
+}
+
+speedtest_cmdline_matches() {
+	test_pid="$1"
+	lines="$(cmdline_lines "$test_pid")" || return 1
+	first="$(printf '%s\n' "$lines" | sed -n '1p')"
+	second="$(printf '%s\n' "$lines" | sed -n '2p')"
+	case "$first" in
+		*/speedtest|speedtest) ;;
+		*/sh|sh|*/ash|ash|*/dash|dash)
+			case "$second" in */speedtest|speedtest) ;; *) return 1 ;; esac
+			;;
+		*/setsid|setsid)
+			# Two-stage launch journals the PID while it is stopped in the owner
+			# group, then execs setsid with the same PID/starttime. Accept this
+			# short, verified transition before setsid execs the speedtest script.
+			case "$second" in */speedtest|speedtest) ;; *) return 1 ;; esac
+			;;
+		*) return 1 ;;
+	esac
+	printf '%s\n' "$lines" | grep -Fxq "$job" || return 1
+	printf '%s\n' "$lines" | grep -Fxq "$target_if"
+}
+
+terminate_active_test_group() {
+	[ -n "$active_test_pgid" ] || return 0
+	test_actual_start="$(process_starttime "$active_test_pgid")" || test_actual_start=""
+	if [ -n "$test_actual_start" ] && [ "$test_actual_start" != "$active_test_starttime" ]; then
+		add_warning "active speed-test PGID was reused and the unrelated process group was not signalled"
+		return 0
+	fi
+	if [ "$test_actual_start" = "$active_test_starttime" ] &&
+		! grep -q '^State:[[:space:]]*[Zz]' "$proc_root/$active_test_pgid/status" 2>/dev/null &&
+		! speedtest_cmdline_matches "$active_test_pgid"; then
+		add_error "active speed-test argv no longer matches the journalled helper identity"
+		return 1
+	fi
+	process_group_alive_for "$active_test_pgid" || return 0
+	signal_group_until_gone "$active_test_pgid" || {
+		add_error "active speed-test process group is still running"
+		return 1
+	}
+	return 0
+}
+
+terminate_orphan_group() {
+	process_group_alive_for "$owner_pgid" || return 0
+	if owner_pid_reused; then
+		# A reused numeric PID is unrelated.  Never signal it or a group that may
+		# now belong to it; journal-owned network state can still be recovered.
+		add_warning "owner PID was reused, so the unrelated process group was left untouched"
+		return 0
+	fi
+	[ "$owner_pgid" != "$$" ] || {
+		add_error "refused to signal the recovery helper's own process group"
+		return 1
+	}
+	signal_group_until_gone "$owner_pgid" || {
+		add_error "orphaned Full Auto-Tune process group is still running"
+		return 1
+	}
+	return 0
+}
+
+root_qdisc_status() {
+	device="$1"
+	expected_handle="$2"
+	state="$($tc_bin qdisc show dev "$device" 2>/dev/null)" || {
+		printf '%s\n' unreadable
+		return 0
+	}
+	printf '%s\n' "$state" | awk -v handle="$expected_handle" '
+		$1 == "qdisc" && $4 == "root" {
+			roots++
+			if ($2 == "cake" && $3 == handle) exact++
+			else if ($3 == "0:" &&
+			         ($2 == "mq" || $2 == "noqueue" ||
+			          $2 == "fq_codel" || $2 == "pfifo_fast")) defaults++
+			else foreign++
+		}
+		END {
+			# `tc qdisc del ... root` does not necessarily leave an empty
+			# listing. Physical OpenWrt devices commonly regain a kernel-owned
+			# handle-0 mq/fq_codel root. That is the clean postcondition, not a
+			# replacement of the journal-owned random CAKE handle.
+			if (roots == 0 || (defaults == roots && foreign == 0)) print "absent"
+			else if (roots == 1 && exact == 1) print "exact"
+			else print "conflict"
+		}
+	'
+}
+
+ingress_qdisc_status() {
+	state="$($tc_bin qdisc show dev "$target_if" 2>/dev/null)" || {
+		printf '%s\n' unreadable
+		return 0
+	}
+	printf '%s\n' "$state" | awk -v handle="$temp_ingress_handle" '
+		$1 == "qdisc" && ($2 == "ingress" || $2 == "clsact") {
+			entries++
+			if ($2 == "ingress" && $3 == handle) exact++
+		}
+		END {
+			if (entries == 0) print "absent"
+			else if (entries == 1 && exact == 1) print "exact"
+			else print "conflict"
+		}
+	'
+}
+
+redirect_filter_status() {
+	state="$($tc_bin filter show dev "$target_if" ingress 2>/dev/null)" || {
+		printf '%s\n' unreadable
+		return 0
+	}
+	[ -n "$state" ] || {
+		printf '%s\n' absent
+		return 0
+	}
+	pref_state="$(printf '%s\n' "$state" | awk -v expected="$temp_redirect_pref" '
+		{
+			for (i = 1; i <= NF; i++) if ($i == "pref" && i < NF) {
+				seen++
+				if ($(i + 1) == expected) own++
+				else foreign++
+			}
+		}
+		END {
+			if (seen > 0 && own > 0 && foreign == 0) print "exact"
+			else print "conflict"
+		}
+	')"
+	[ "$pref_state" = exact ] || {
+		printf '%s\n' conflict
+		return 0
+	}
+	if printf '%s\n' "$state" | grep -Fq "redirect dev $temp_ifb" ||
+	   printf '%s\n' "$state" | grep -Fq "Redirect to device $temp_ifb)"; then
+		printf '%s\n' exact
+	else
+		printf '%s\n' conflict
+	fi
+}
+
+temp_ifb_status() {
+	[ -e "$sys_class_net/$temp_ifb" ] || {
+		printf '%s\n' absent
+		return 0
+	}
+	[ -n "$temp_ifb_ifindex" ] &&
+		[ "$(cat "$sys_class_net/$temp_ifb/ifindex" 2>/dev/null)" = "$temp_ifb_ifindex" ] &&
+		[ "$(cat "$sys_class_net/$temp_ifb/ifalias" 2>/dev/null)" = "$temp_ifb_alias" ] && {
+			printf '%s\n' exact
+			return 0
+		}
+	printf '%s\n' conflict
+}
+
+inspect_temporary_shaper() {
+	temp_target_status="$(root_qdisc_status "$target_if" "$temp_target_handle")"
+	temp_ifb_link_status="$(temp_ifb_status)"
+	if [ "$temp_ifb_link_status" = absent ]; then
+		temp_ifb_root_status=absent
+	else
+		temp_ifb_root_status="$(root_qdisc_status "$temp_ifb" "$temp_ifb_handle")"
+	fi
+	temp_ingress_status="$(ingress_qdisc_status)"
+	temp_filter_status="$(redirect_filter_status)"
+
+	for component in "$temp_target_status" "$temp_ifb_link_status" "$temp_ifb_root_status" \
+		"$temp_ingress_status" "$temp_filter_status"; do
+		case "$component" in
+			unreadable) temporary_inspection=unreadable; return 0 ;;
+			conflict) temporary_inspection=conflict; return 0 ;;
+		esac
+	done
+	if [ "$temp_target_status" = absent ] && [ "$temp_ifb_link_status" = absent ] &&
+	   [ "$temp_ingress_status" = absent ] && [ "$temp_filter_status" = absent ]; then
+		temporary_inspection=absent
+		return 0
+	fi
+	# Every partial or complete temporary shaper must be anchored by the exact
+	# random-token IFB identity.  Never infer ownership from a generic CAKE
+	# qdisc or the conventional ingress handle alone.
+	[ "$temp_ifb_link_status" = exact ] || {
+		temporary_inspection=conflict
+		return 0
+	}
+	case "$temp_ingress_status:$temp_filter_status" in
+		absent:absent|exact:absent|exact:exact) temporary_inspection=owned ;;
+		*) temporary_inspection=conflict ;;
+	esac
+	return 0
+}
+
+cleanup_temporary_state() {
+	[ -e "$cleanup_marker" ] && return 0
+
+	if [ "$shaper_started" = 1 ]; then
+		inspect_temporary_shaper
+		temporary_state="$temporary_inspection"
+		case "$temporary_state" in
+			absent) ;;
+			owned)
+				[ "$temp_ingress_status" = absent ] ||
+					"$tc_bin" qdisc del dev "$target_if" ingress >/dev/null 2>&1 ||
+					{ sqm_restore_safe=0; add_error "exact temporary ingress qdisc could not be deleted"; }
+				[ "$temp_target_status" = absent ] ||
+					"$tc_bin" qdisc del dev "$target_if" root >/dev/null 2>&1 ||
+					{ sqm_restore_safe=0; add_error "exact temporary upload CAKE qdisc could not be deleted"; }
+				[ "$temp_ifb_root_status" = absent ] ||
+					"$tc_bin" qdisc del dev "$temp_ifb" root >/dev/null 2>&1 ||
+					{ sqm_restore_safe=0; add_error "exact temporary download CAKE qdisc could not be deleted"; }
+				if [ "$sqm_restore_safe" = 1 ]; then
+					if ! "$ip_bin" link set dev "$temp_ifb" down >/dev/null 2>&1; then
+						sqm_restore_safe=0
+						add_error "exact temporary IFB could not be brought down"
+					elif ! "$ip_bin" link delete dev "$temp_ifb" type ifb >/dev/null 2>&1; then
+						sqm_restore_safe=0
+						add_error "exact temporary IFB could not be deleted"
+					fi
+				fi
+				;;
+			unreadable)
+				sqm_restore_safe=0
+				add_error "temporary qdisc/IFB ownership state could not be read"
+				;;
+			*)
+				sqm_restore_safe=0
+				add_error "temporary qdisc/IFB ownership no longer matches the recovery journal"
+				;;
+		esac
+	fi
+
+	if [ -n "$nft_table" ]; then
+		if nft_tables="$($nft_bin list tables 2>/dev/null)"; then
+			if printf '%s\n' "$nft_tables" | grep -Fxq "table inet $nft_table"; then
+				"$nft_bin" delete table inet "$nft_table" >/dev/null 2>&1 || true
+				if nft_tables="$($nft_bin list tables 2>/dev/null)"; then
+					printf '%s\n' "$nft_tables" | grep -Fxq "table inet $nft_table" &&
+						add_error "temporary nftables table still exists after cleanup"
+				else
+					add_error "nftables postcondition could not be read after cleanup"
+				fi
+			fi
+		else
+			add_error "nftables state could not be read during cleanup"
+		fi
+	fi
+
+	if [ "$shaper_started" = 1 ]; then
+		inspect_temporary_shaper
+		post_cleanup_state="$temporary_inspection"
+		if [ "$post_cleanup_state" != absent ]; then
+			sqm_restore_safe=0
+			add_error "temporary shaper postconditions are not clean after ownership-checked cleanup"
+		fi
+	fi
+
+	[ -n "$recovery_errors" ] || : > "$cleanup_marker"
+}
+
+resume_expected_autorate() {
+	[ -n "$autorate_pid" ] || return 0
+	if [ ! -d "$proc_root/$autorate_pid" ]; then
+		wait_for_replacement_autorate && return 0
+		add_error "the paused autorate process disappeared and no verified replacement started"
+		return 1
+	fi
+	if ! autorate_identity_matches; then
+		add_warning "refused to resume an autorate PID whose identity changed"
+		wait_for_replacement_autorate && return 0
+		add_error "no verified running replacement exists for the reused autorate PID"
+		return 1
+	fi
+	if grep -q '^State:[[:space:]]*[Tt]' "$proc_root/$autorate_pid/status" 2>/dev/null; then
+		"$kill_bin" -CONT "$autorate_pid" >/dev/null 2>&1 || {
+			add_error "failed to resume the paused autorate instance"
+			return 1
+		}
+	fi
+	attempt=0
+	while [ "$attempt" -lt 3 ]; do
+		if ! autorate_identity_matches; then
+			add_error "autorate process identity changed while waiting for resume"
+			return 1
+		fi
+		if grep -q '^State:[[:space:]]*[TtZz]' "$proc_root/$autorate_pid/status" 2>/dev/null; then
+			:
+		else
+			return 0
+		fi
+		attempt=$((attempt + 1))
+		sleep 1
+	done
+	add_error "autorate instance did not leave the stopped state after CONT"
+	return 1
+}
+
+resume_original_autorate_strict() {
+	[ -n "$autorate_pid" ] || return 0
+	if ! autorate_identity_matches; then
+		add_error "the original autorate identity changed during normal finalize"
+		return 1
+	fi
+	if ! grep -q '^State:[[:space:]]*[Tt]' "$proc_root/$autorate_pid/status" 2>/dev/null; then
+		add_error "the original autorate instance was not stopped during normal finalize"
+		return 1
+	fi
+	"$kill_bin" -CONT "$autorate_pid" >/dev/null 2>&1 || {
+		add_error "failed to resume the original autorate instance"
+		return 1
+	}
+	attempt=0
+	while [ "$attempt" -lt 3 ]; do
+		if ! autorate_identity_matches; then
+			add_error "the original autorate identity changed while resuming"
+			return 1
+		fi
+		if ! grep -q '^State:[[:space:]]*[TtZz]' "$proc_root/$autorate_pid/status" 2>/dev/null; then
+			return 0
+		fi
+		attempt=$((attempt + 1))
+		sleep 1
+	done
+	add_error "the original autorate instance did not resume during normal finalize"
+	return 1
+}
+
+complete_recovery_transaction() {
+	[ "$sqm_restore_required" = 0 ] || {
+		write_recovery_error "Runtime recovery cannot complete while managed SQM restoration is still required."
+		return 1
+	}
+	remove_recovery_sqm_snapshot || {
+		write_recovery_error "Runtime was restored, but its private SQM snapshot could not be removed safely."
+		return 1
+	}
+	[ -e "$done_marker" ] || mark_done || {
+		write_recovery_error "Runtime postconditions passed, but the recovery tombstone could not be written."
+		return 1
+	}
+	# The journal remains the durable tombstone until both the interface lock and
+	# public terminal state are complete.  A helper SIGKILL at either boundary is
+	# therefore resumed by the watcher/procd monitor without lying to LuCI.
+	release_claimed_interface_lock || {
+		write_recovery_error "$recovery_errors"
+		return 1
+	}
+	# Public runtime_restored=true is a promise that neither the interface nor
+	# the global service lock remains held by this transaction.  Keep the done
+	# journal as a resumable tombstone while crossing this boundary.
+	runtime_lock_release_global || {
+		write_recovery_error "Runtime postconditions passed, but the global CAKE/SQM lock could not be released."
+		return 1
+	}
+	if [ ! -s "$pending_result_file" ] && [ ! -s "$pending_error_file" ]; then
+		if ! { [ -s "$result_file" ] && grep -q '"runtime_restored":true' "$result_file" 2>/dev/null; } &&
+		   ! { [ -s "$error_file" ] && grep -q '"runtime_restored":true' "$error_file" 2>/dev/null; }; then
+			write_interrupted_recovery || {
+				write_recovery_error "Runtime was restored, but no terminal diagnostic could be staged."
+				return 1
+			}
+		fi
+	fi
+	publish_pending_terminal || {
+		write_recovery_error "Runtime was restored and unlocked, but the terminal diagnostic was not published."
+		return 1
+	}
+	# Removing the journal is last.  A crash after this point cannot strand an
+	# interface lock or expose a false runtime_restored result.
+	rm -f "$journal" || return 1
+	rm -f "$cleanup_marker" "$heartbeat_file" "$done_marker" 2>/dev/null || true
+	return 0
+}
+
+recover_managed_sqm() {
+	sqm_lock_bypass="$journal.sqm-lock-bypass"
+	CAKE_AUTORATE_SPEEDTEST_LOCK_DIR="$sqm_lock_bypass" \
+		"$sqm_recover" "$section" "$sqm_section" "$sqm_target_if" "$sqm_ul_if" "$sqm_dl_if" \
+		"$sqm_config_fingerprint" "$sqm_config_snapshot"
+}
+
+mark_sqm_restore_complete() {
+	[ "$sqm_restore_required" = 1 ] || return 0
+	journal_tmp="$journal.sqm-restored.$$"
+	[ ! -e "$journal_tmp" ] && [ ! -L "$journal_tmp" ] || return 1
+	awk '
+		BEGIN { seen = 0 }
+		/^sqm_restore_required=/ {
+			if (seen++) exit 2
+			print "sqm_restore_required=0"
+			next
+		}
+		{ print }
+		END { if (seen != 1) exit 3 }
+	' "$journal" > "$journal_tmp" || {
+		rm -f "$journal_tmp" 2>/dev/null || true
+		return 1
+	}
+	owned_regular_file "$journal_tmp" && chmod 600 "$journal_tmp" 2>/dev/null &&
+		mv "$journal_tmp" "$journal" && owned_regular_file "$journal" || {
+		rm -f "$journal_tmp" 2>/dev/null || true
+		return 1
+	}
+	sqm_restore_required=0
+}
+
+remove_recovery_sqm_snapshot() {
+	[ -n "$sqm_config_snapshot" ] || return 0
+	valid_sqm_snapshot_path || return 1
+	[ ! -e "$sqm_config_snapshot" ] || rm -f "$sqm_config_snapshot"
+}
+
+restore_managed_sqm_transaction() {
+	[ "$sqm_restore_required" = 1 ] || return 0
+	recover_managed_sqm || return 1
+	# The durable journal transition comes before unlink. A SIGKILL before this
+	# point safely repeats restoration; one after it only retries snapshot GC.
+	mark_sqm_restore_complete || return 1
+	remove_recovery_sqm_snapshot
+}
+
+discard_unarmed_sqm_snapshot() {
+	[ "$sqm_restore_required" = 1 ] || return 0
+	# No heartbeat means the worker never crossed its first destructive
+	# transition, so the pre-mutation snapshot can be retired without a restore.
+	mark_sqm_restore_complete || return 1
+	remove_recovery_sqm_snapshot
+}
+
+recover_now() {
+	# Dispatch has to parse once to discover the mode, but that snapshot is not
+	# authoritative: the worker atomically replaces the journal before every
+	# mutation. Serialize first, then reload the latest complete file while holding
+	# the mutex so a stale watcher/procd scan can never win recovery with old data.
+	if [ -n "${CAKE_AUTORATE_RECOVER_TEST_BEFORE_LOCK_MARKER:-}" ]; then
+		: > "$CAKE_AUTORATE_RECOVER_TEST_BEFORE_LOCK_MARKER"
+		while [ ! -e "${CAKE_AUTORATE_RECOVER_TEST_BEFORE_LOCK_RELEASE:-}" ]; do
+			sleep 1
+		done
+	fi
+	acquire_recovery_mutex || return $?
+	if [ ! -f "$journal" ]; then
+		release_recovery_mutex
+		return 0
+	fi
+	load_journal
+	if [ -e "$done_marker" ]; then
+		recovery_errors=""
+		recovery_warnings=""
+		if owner_identity_matches && [ "${CAKE_AUTORATE_INTERFACE_LOCK_FD:-}" != 9 ]; then
+			release_recovery_mutex
+			return 75
+		fi
+		if ! claim_interface_lock 1; then
+			write_recovery_error "$recovery_errors"
+			release_recovery_mutex
+			return 1
+		fi
+		complete_recovery_transaction || {
+			release_recovery_mutex
+			return 1
+		}
+		release_recovery_mutex
+		return 0
+	fi
+	# The heartbeat doubles as an arming token.  It is created immediately
+	# before the first destructive transition and removed only after the done
+	# marker is published.  A dead owner with a merely prepared journal needs no
+	# network recovery, but its RAM journal and interface reservation must not be
+	# scanned forever.
+	if [ ! -e "$heartbeat_file" ]; then
+		if owner_identity_matches; then
+			release_recovery_mutex
+			return 75
+		fi
+		if owner_pid_exists && ! owner_pid_reused && ! owner_pid_is_zombie; then
+			release_recovery_mutex
+			return 75
+		fi
+		recovery_errors=""
+		recovery_warnings=""
+		if ! claim_interface_lock 1; then
+			write_recovery_error "$recovery_errors"
+			release_recovery_mutex
+			return 1
+		fi
+		discard_unarmed_sqm_snapshot || {
+			write_recovery_error "Unable to retire the unarmed managed-SQM snapshot."
+			release_recovery_mutex
+			return 1
+		}
+		write_interrupted_recovery || {
+			write_recovery_error "Unable to stage an interrupted pre-mutation result."
+			release_recovery_mutex
+			return 1
+		}
+		complete_recovery_transaction || {
+			release_recovery_mutex
+			return 1
+		}
+		release_recovery_mutex
+		return 0
+	fi
+
+	if owner_identity_matches; then
+		[ "${CAKE_AUTORATE_RECOVER_QUIET_DEFER:-0}" = 1 ] ||
+			printf '%s\n' "Recovery deferred: Full Auto-Tune owner is still running." >&2
+		release_recovery_mutex
+		return 75
+	fi
+	if owner_pid_exists && ! owner_pid_reused && ! owner_pid_is_zombie; then
+		write_recovery_error "Refused recovery because the original owner is still alive with an unexpected command line."
+		release_recovery_mutex
+		return 1
+	fi
+	recovery_errors=""
+	recovery_warnings=""
+	sqm_restore_safe=1
+	owner_pid_reused && add_warning "owner PID identity changed; the unrelated reused PID was not signalled"
+	owner_pid_is_zombie && add_warning "the original Full Auto-Tune owner was recovered before its zombie was reaped"
+	# Children intentionally inherit the kernel flock. Quiesce exact journalled
+	# process groups before trying to claim that lock; the immutable journal-bound
+	# record prevents a new normal operation from stealing the unlocked gap.
+	terminate_active_test_group || true
+	[ -n "$recovery_errors" ] || terminate_orphan_group || true
+	if [ -n "$recovery_errors" ]; then
+		write_recovery_error "$recovery_errors"
+		release_recovery_mutex
+		return 1
+	fi
+	if ! claim_interface_lock 1; then
+		write_recovery_error "$recovery_errors"
+		release_recovery_mutex
+		return 1
+	fi
+	[ -n "$recovery_errors" ] || cleanup_temporary_state
+
+	# Counter cleanup and other ancillary diagnostics must never leave a link
+	# unshaped.  Restore the immutable managed-SQM snapshot whenever qdisc/IFB
+	# ownership is safe, even if a non-shaping cleanup error keeps recovery
+	# pending for a later retry.
+	if [ "$sqm_restore_safe" = 1 ] && [ "$sqm_was_active" = 1 ] && [ "$sqm_restore_required" = 1 ]; then
+		if [ ! -x "$sqm_recover" ]; then
+			add_error "SQM recovery helper is unavailable"
+		elif ! restore_managed_sqm_transaction >/dev/null 2>&1; then
+			add_error "managed SQM failed its CAKE, IFB, or redirect recovery postconditions"
+		fi
+	fi
+	[ -n "$recovery_errors" ] || resume_expected_autorate || true
+
+	if [ -n "$recovery_errors" ]; then
+		write_recovery_error "$recovery_errors"
+		release_recovery_mutex
+		return 1
+	fi
+
+	write_interrupted_recovery || {
+		release_recovery_mutex
+		return 1
+	}
+	complete_recovery_transaction || {
+		release_recovery_mutex
+		return 1
+	}
+	release_recovery_mutex
+	return 0
+}
+
+finalize_now() {
+	recovery_errors=""
+	recovery_warnings=""
+	sqm_restore_safe=1
+	acquire_recovery_mutex || return $?
+	if [ ! -f "$journal" ]; then
+		release_recovery_mutex
+		return 1
+	fi
+	load_journal
+	if [ -e "$done_marker" ]; then
+		recovery_errors=""
+		recovery_warnings=""
+		if owner_identity_matches && [ "${CAKE_AUTORATE_INTERFACE_LOCK_FD:-}" != 9 ]; then
+			release_recovery_mutex
+			return 75
+		fi
+		if ! claim_interface_lock 1; then
+			write_recovery_error "$recovery_errors"
+			release_recovery_mutex
+			return 1
+		fi
+		complete_recovery_transaction || {
+			release_recovery_mutex
+			return 1
+		}
+		release_recovery_mutex
+		return 0
+	fi
+	[ -e "$heartbeat_file" ] || {
+		write_recovery_error "Refused finalize because the recovery journal is not armed."
+		release_recovery_mutex
+		return 1
+	}
+	if ! owner_identity_matches; then
+		write_recovery_error "Refused finalize because the Full Auto-Tune owner identity changed."
+		release_recovery_mutex
+		return 1
+	fi
+	if ! claim_interface_lock 0; then
+		write_recovery_error "$recovery_errors"
+		release_recovery_mutex
+		return 1
+	fi
+	[ -z "$active_test_pgid" ] && [ -z "$active_test_starttime" ] ||
+		add_error "active speed-test identity is still present during finalize"
+	if [ "$shaper_started" = 1 ]; then
+		inspect_temporary_shaper
+		if [ "$temporary_inspection" != absent ]; then
+			sqm_restore_safe=0
+			add_error "temporary shaper ownership postconditions are not clean during finalize"
+		fi
+	fi
+	if [ -n "$nft_table" ]; then
+		if nft_tables="$($nft_bin list tables 2>/dev/null)"; then
+			printf '%s\n' "$nft_tables" | grep -Fxq "table inet $nft_table" &&
+				add_error "temporary nftables table still exists during finalize"
+		else
+			add_error "nftables postcondition could not be read during finalize"
+		fi
+	fi
+	if [ "$sqm_restore_safe" = 1 ] && [ "$sqm_was_active" = 1 ] && [ "$sqm_restore_required" = 1 ]; then
+		if [ ! -x "$sqm_recover" ]; then
+			add_error "SQM recovery helper is unavailable"
+		elif ! restore_managed_sqm_transaction >/dev/null 2>&1; then
+			add_error "managed SQM failed its CAKE, IFB, or redirect finalize postconditions"
+		fi
+	fi
+	[ -n "$recovery_errors" ] || resume_original_autorate_strict || true
+
+	if [ -n "$recovery_errors" ]; then
+		write_recovery_error "$recovery_errors"
+		release_recovery_mutex
+		return 1
+	fi
+
+	complete_recovery_transaction || {
+		release_recovery_mutex
+		return 1
+	}
+	release_recovery_mutex
+	return 0
+}
+
+watch_owner() {
+	case "$poll_seconds" in ''|0|*[!0-9]*) poll_seconds=1 ;; esac
+	while [ ! -e "$done_marker" ]; do
+		owner_identity_matches || break
+		sleep "$poll_seconds"
+	done
+	if [ -e "$done_marker" ]; then
+		[ -f "$journal" ] && recover_now
+		return $?
+	fi
+	# The worker atomically replaces the journal before every destructive state
+	# transition.  Reload only after the owner has disappeared so recovery sees
+	# the final autorate/SQM/nft/speed-test identities rather than the initial
+	# prepared snapshot read when this detached watcher started.
+	[ -f "$journal" ] || return 0
+	load_journal
+	[ -e "$done_marker" ] && return 0
+	recover_now
+}
+
+monitor_recovery_root() {
+	recovery_root="$1"
+	ram_path "$recovery_root" || fatal "Recovery monitor root must be stored in RAM."
+	recovery_parent="${recovery_root%/*}"
+	[ "$recovery_parent" != "$recovery_root" ] || fatal "Recovery monitor root must have a parent directory."
+	ram_path "$recovery_parent" || fatal "Recovery monitor parent must be stored in RAM."
+	[ ! -L "$recovery_parent" ] || fatal "Refusing a symlink recovery monitor parent."
+	if [ ! -e "$recovery_parent" ]; then
+		mkdir "$recovery_parent" 2>/dev/null || [ -d "$recovery_parent" ] ||
+			fatal "Unable to create recovery monitor parent."
+	fi
+	secure_existing_directory "$recovery_parent" ||
+		fatal "Recovery monitor parent is unsafe or foreign-owned."
+	[ ! -L "$recovery_root" ] || fatal "Refusing a symlink recovery monitor root."
+	if [ ! -e "$recovery_root" ]; then
+		mkdir "$recovery_root" 2>/dev/null || [ -d "$recovery_root" ] ||
+			fatal "Unable to create recovery monitor root."
+	fi
+	secure_existing_directory "$recovery_root" || fatal "Recovery monitor root is unsafe or foreign-owned."
+	case "$poll_seconds" in ''|0|*[!0-9]*) poll_seconds=1 ;; esac
+	trap 'exit 0' INT TERM
+	while :; do
+		for candidate in "$recovery_root"/*.journal; do
+			[ -f "$candidate" ] || continue
+			if CAKE_AUTORATE_RECOVER_QUIET_DEFER=1 "$self" recover "$candidate"; then
+				:
+			else
+				status="$?"
+				[ "$status" -eq 75 ] ||
+					printf '%s\n' "Full Auto-Tune recovery remains incomplete for $candidate." >&2
+			fi
+		done
+		sleep "$poll_seconds"
+	done
+}
+
+if [ "${CAKE_AUTORATE_RECOVER_SOURCE_ONLY:-0}" = 1 ]; then
+	return 0 2>/dev/null || exit 0
+fi
+
+case "$mode" in
+	monitor)
+		[ -n "$journal" ] || journal="/tmp/cake-autorate-autotune/recovery"
+		monitor_recovery_root "$journal"
+		exit $?
+		;;
+	watch|recover|finalize) ;;
+	*) usage ;;
+esac
+[ -n "$journal" ] || usage
+load_journal
+
+case "$mode" in
+	watch) watch_owner ;;
+	recover) recover_now ;;
+	finalize) finalize_now ;;
+esac

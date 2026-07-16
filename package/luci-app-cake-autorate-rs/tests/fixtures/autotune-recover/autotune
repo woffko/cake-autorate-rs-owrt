@@ -1,0 +1,11 @@
+#!/bin/sh
+
+if [ -n "${AUTOTUNE_RECOVER_CHILD_PID_FILE:-}" ]; then
+	sleep 300 &
+	child="$!"
+	printf '%s\n' "$child" > "$AUTOTUNE_RECOVER_CHILD_PID_FILE"
+	wait "$child"
+	exit $?
+fi
+
+while :; do sleep 1; done

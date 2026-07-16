@@ -8,6 +8,7 @@ backend="${4:-auto}"
 job_root="${CAKE_AUTORATE_QUALITY_DIR:-/tmp/cake-autorate-quality}"
 runtime_root="${CAKE_AUTORATE_RUNTIME_DIR:-/var/run/cake-autorate}"
 speedtest_bin="${CAKE_AUTORATE_SPEEDTEST:-/usr/libexec/cake-autorate-rs/speedtest}"
+runtime_lock_lib="${CAKE_AUTORATE_RUNTIME_LOCK_LIB:-/usr/libexec/cake-autorate-rs/runtime-lock}"
 jsonfilter_bin="${CAKE_AUTORATE_JSONFILTER:-$(command -v jsonfilter 2>/dev/null)}"
 uci_bin="${CAKE_AUTORATE_UCI:-uci}"
 setsid_bin="${CAKE_AUTORATE_SETSID:-$(command -v setsid 2>/dev/null)}"
@@ -20,6 +21,11 @@ quiet_window_s="5"
 quiet_timeout_s="30"
 quiet_ratio="0.05"
 quiet_min_kbps="1000"
+
+if [ -r "$runtime_lock_lib" ]; then
+	# shellcheck source=/usr/libexec/cake-autorate-rs/runtime-lock
+	. "$runtime_lock_lib"
+fi
 
 json_escape() {
 	printf '%s' "$1" | tr '\n\r\t' '   ' | sed 's/\\/\\\\/g; s/"/\\"/g'
@@ -233,35 +239,36 @@ measure_quiet_background() {
 }
 
 lock_path_for_target() {
-	lock_name="$(printf '%s' "$target_if" | tr ':@.' '___')"
-	interface_lock="/tmp/cake-autorate-speedtest/interface-$lock_name.lock"
+	runtime_lock_interface_paths "$target_if" || return 1
+	interface_lock="$runtime_interface_lock_record"
 }
 
 acquire_interface_lock() {
-	lock_path_for_target
-	mkdir -p /tmp/cake-autorate-speedtest || return 1
-	if ! mkdir "$interface_lock" 2>/dev/null; then
-		owner="$(sed -n '1p' "$interface_lock/pid" 2>/dev/null)"
-		if is_pid "$owner" && kill -0 "$owner" 2>/dev/null; then
-			failure="Another speed test, Auto-Tune, or rating job is using $target_if."
-			return 1
-		fi
-		rm -f "$interface_lock/pid" 2>/dev/null
-		rmdir "$interface_lock" 2>/dev/null || return 1
-		mkdir "$interface_lock" 2>/dev/null || return 1
-	fi
-	printf '%s\n' "$$" > "$interface_lock/pid"
-	CAKE_AUTORATE_INTERFACE_LOCK_OWNER="$$"
-	export CAKE_AUTORATE_INTERFACE_LOCK_OWNER
+	command -v runtime_lock_acquire_interface >/dev/null 2>&1 || {
+		failure="The shared CAKE/SQM runtime-lock helper is unavailable."
+		return 1
+	}
+	lock_path_for_target || return 1
+	runtime_lock_acquire_global_shared || {
+		failure="CAKE/SQM service mutation is already in progress."
+		return 1
+	}
+	runtime_lock_acquire_interface "$target_if" rating "" || {
+		lock_rc="$?"
+		runtime_lock_release_global >/dev/null 2>&1 || true
+		case "$lock_rc" in
+			75) failure="Another speed test, Auto-Tune, or rating job is using $target_if." ;;
+			76) failure="Full Auto-Tune recovery is pending for $target_if." ;;
+			*) failure="Unable to establish an atomic rating interface lock." ;;
+		esac
+		return 1
+	}
 }
 
 release_interface_lock() {
 	[ -n "${interface_lock:-}" ] || return 0
-	owner="$(sed -n '1p' "$interface_lock/pid" 2>/dev/null)"
-	if [ "$owner" = "$$" ]; then
-		rm -f "$interface_lock/pid" 2>/dev/null
-		rmdir "$interface_lock" 2>/dev/null || true
-	fi
+	runtime_lock_release_interface || return 1
+	runtime_lock_release_global || return 1
 	interface_lock=""
 }
 

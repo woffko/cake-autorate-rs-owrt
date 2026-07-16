@@ -1,0 +1,52 @@
+#!/bin/sh
+
+count=5
+backend=websocket
+endpoint=wss://ping-bufferbloat.libreqos.com/ws
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--backend)
+			backend="$2"
+			shift 2
+			;;
+		--endpoint)
+			endpoint="$2"
+			shift 2
+			;;
+		--count)
+			count="$2"
+			shift 2
+			;;
+		*)
+			shift
+			;;
+	esac
+done
+
+case "$backend" in
+	websocket) reported_backend=websocket ;;
+	http) reported_backend=persistent-http ;;
+	tcp) reported_backend=tcp-connect ;;
+	*) reported_backend="$backend" ;;
+esac
+
+[ "${AUTOTUNE_MOCK_TRANSPORT_BAD_BACKEND:-0}" != 1 ] || reported_backend=tcp-connect
+[ "${AUTOTUNE_MOCK_TRANSPORT_BAD_ENDPOINT:-0}" != 1 ] || endpoint=https://wrong.example.invalid/
+trusted=true
+[ "${AUTOTUNE_MOCK_TRANSPORT_UNTRUSTED:-0}" != 1 ] || trusted=false
+
+index=1
+while [ "$index" -le "$count" ]; do
+	reused=true
+	if [ "${AUTOTUNE_MOCK_TRANSPORT_NONPERSISTENT:-0}" = 1 ] && [ "$index" -gt 1 ]; then
+		reused=false
+	fi
+	if [ "${AUTOTUNE_MOCK_RC16:-0}" = 1 ]; then
+		raw_ms='[210.0,220.0,230.0,420.0]'
+	else
+		raw_ms='[11.0,12.0,13.0,14.0]'
+	fi
+	printf '{"index":%s,"backend":"%s","endpoint":"%s","rtt_ms":13.0,"raw_ms":%s,"discarded":0,"server_processing_ms":0.0,"trusted":%s,"connection_reused":%s}\n' \
+		"$index" "$reported_backend" "$endpoint" "$raw_ms" "$trusted" "$reused"
+	index=$((index + 1))
+done

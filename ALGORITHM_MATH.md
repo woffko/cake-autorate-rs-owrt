@@ -148,6 +148,102 @@ idle  otherwise
 The packaged `high_load_thr` default is `0.75`, or 75% of the current CAKE
 rate.
 
+## Full Auto-Tune candidate validation
+
+Full Auto-Tune has a separate, bounded validation step; it does not reuse the
+fast runtime controller's instantaneous load decision. For one direction let:
+
+- `O` be the lowest credible unshaped throughput observation;
+- `C` be the temporary shaped CAKE candidate;
+- `A` be throughput achieved while that candidate is installed.
+
+Three ratios answer different questions:
+
+```text
+candidate_realization = 100 * A / C
+capacity_retention    = 100 * A / O
+candidate_capacity   = 100 * C / O
+```
+
+Candidate realization determines whether the measurement exercised the
+candidate strongly enough to support an inference. Capacity retention is the
+throughput safety gate. Candidate capacity shows how far the proposed shaper
+already sits below the measured link. For example, `A/C = 92.5%` and `A/O =
+77.3%` means the test realized the candidate well, but the candidate/result
+combination retained too little observed capacity. Calling both values
+"retention" loses the information needed to choose a correction.
+
+The packaged hard realization gate is two-sided:
+
+```text
+80% <= candidate_realization <= 110%
+```
+
+The lower bound rejects a test which did not exercise the candidate. The upper
+bound rejects a result which could not have been produced by the claimed CAKE
+rate and therefore indicates a bypassed, replaced, or otherwise unenforced
+temporary shaper. The shell lifecycle additionally verifies the exact owned
+CAKE/IFB/redirect topology immediately after every shaped speed test.
+
+ICMP and native transport loaded delay both compare like quantiles:
+
+```text
+Delta_icmp     = max(ICMP_loaded_p95 - ICMP_idle_p95, 0)
+Delta_transport = max(transport_loaded_p95 - transport_idle_p95, 0)
+Delta_effective = max(Delta_icmp, Delta_transport)
+```
+
+Subtracting an idle median from a loaded p95 mixes baseline jitter into the
+loaded delta and is invalid. Native WebSocket/HTTP sampling reuses a connection
+within the phase so DNS, process startup, TCP/TLS, and protocol handshakes are
+outside the scored clock. All valid raw samples remain in the percentile input;
+a robust central statistic may be reported diagnostically but cannot discard a
+real high-latency tail. TCP-connect samples are diagnostic-only and cannot feed
+Full Auto-Tune because each sample includes a new handshake. ICMP validation
+emits at most one batch per second and requires targets from at least three
+independent reflector families.
+
+Let `F` be the required capacity-retention fraction and
+`r = candidate_realization / 100`. Assuming a bounded revision preserves the
+observed realization, the smallest candidate that can satisfy the safety floor
+is:
+
+```text
+C_required = ceil_100(O * F / r)
+```
+
+The typed validator evaluates realization, retention, both latency deltas,
+loss, and CPU as explicit gates. Its correction state is then:
+
+- `retry-measurement` when realization is outside the trustworthy range and a
+  single repeat may distinguish noise from invalid shaper enforcement;
+- directional `increase` when quality is clean and only that direction misses
+  retention;
+- bounded `decrease` for adverse loaded evidence, never below `C_required` or
+  the configured minimum;
+- `infeasible` when the safety floor and rate/quality constraints have no
+  legal intersection;
+- `none` after all gates pass.
+
+No diagnostic score overrides a failed gate. A contaminated phase, missing
+telemetry, changed route identity, incomplete result, or `infeasible` decision
+is reviewable evidence but cannot be Auto-Applied. See
+[AUTOTUNE.md](AUTOTUNE.md) for the complete job state machine.
+
+The diagnostic validation score is the minimum normalized margin across all
+gates. For a minimum gate it is `100 * actual / limit`; for a maximum gate it
+is 100 while passing and `100 * limit / actual` while failing. The final value
+is clamped to 0..100. This makes the tightest constraint visible without
+turning several incomparable units into an additive penalty or weakening the
+all-gates-must-pass rule.
+
+If the sole bounded measurement retry still cannot establish trustworthy
+realization, or if transport/reflector/shaper evidence becomes unreliable, the
+run is `INCONCLUSIVE` and retryable. It is not relabeled as a proven failed
+candidate. `FAILED`/`infeasible` is reserved for complete trustworthy evidence
+showing that the quality limits cannot be met above the configured safety
+floor.
+
 ## Independent rating-load state machine
 
 Detected grading must recognize sustained routed client tests without inheriting

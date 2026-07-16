@@ -1,0 +1,32 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+let file = null;
+let expression = null;
+for (let i = 0; i < args.length; i++) {
+	if (args[i] === '-i') file = args[++i];
+	else if (args[i] === '-e') expression = args[++i];
+}
+if (!expression) process.exit(1);
+const input = file ? fs.readFileSync(file, 'utf8') : fs.readFileSync(0, 'utf8');
+let value = JSON.parse(input);
+const path = expression.replace(/^@\.?/, '').split('.').filter(Boolean);
+for (const part of path) {
+	const all = part.match(/^([^[]+)\[\*\]$/);
+	const indexed = part.match(/^([^[]+)\[([0-9]+)\]$/);
+	if (all) {
+		value = value && value[all[1]];
+		if (!Array.isArray(value)) process.exit(1);
+		process.stdout.write(value.map(String).join('\n') + (value.length ? '\n' : ''));
+		process.exit(0);
+	}
+	if (indexed)
+		value = value && value[indexed[1]] && value[indexed[1]][Number(indexed[2])];
+	else
+		value = value && value[part];
+}
+if (value === undefined || value === null) process.exit(1);
+if (typeof value === 'object') process.stdout.write(JSON.stringify(value) + '\n');
+else process.stdout.write(String(value) + '\n');
