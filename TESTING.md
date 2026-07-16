@@ -1084,3 +1084,117 @@ Final RC18 payload hashes are:
 | aarch64_generic installer | `e34b9dee545826b79db3e8f1f4379d1db410585cc0da4f6d4fa53926f6a34321` |
 | x86_64 offline bundle | `afc9aad043bc5cea3c998e50a80f7e5bd40857d112beb01bf57fb8b207bb92f6` |
 | rockchip/armv8 offline bundle | `386ef81777e4784912183ca0fd73611c88e758f76d7c82444ca318f718983cfb` |
+
+## RC19 throughput-first Fair and supervisor acceptance (2026-07-16)
+
+RC19 changes Fair from a hard B/60 ms contract to a throughput-first
+class-C/200 ms goal above a hard 90% observed-low capacity floor. Proposal
+schema 3 records `quality_target_required=false` and
+`throughput_priority=true`; result schema 5 separates `hard_pass` from
+`quality_target_met`, records the actual grade and binds the terminal result to
+an immutable run ID, configuration fingerprint, phase evidence and restored
+runtime state.
+
+The deterministic Fair gate covers three Review outcomes:
+
+- a class-C-or-better candidate remains eligible for normal validated apply;
+- a complete hard-safe candidate which misses only the quality goal can be
+  applied manually or discarded with **Keep current settings**;
+- an existing managed instance may receive a separate disable-SQM comparison
+  suggestion only after a simultaneous bidirectional unshaped control proves
+  SQM pause/bypass, no temporary shaper, clean forwarded-background counters,
+  no worse grade, no more than 10 ms worse effective delay, and at least 2%
+  throughput gain in both directions.
+
+The disable choice is deliberately not preselected and can never be scheduled.
+Negative LuCI and Apply Guard tests reject one-direction evidence, missing
+pause/bypass proof, contaminated or unavailable counters, either directional
+gain below 2%, worse latency/grade, mismatched action/run/fingerprint and any
+post-apply daemon, CAKE, IFB, clsact or ingress-redirect residue.
+
+The speed-test supervisor gate additionally verifies:
+
+- the helper starts stopped and cannot run before its process identity and
+  recovery journal entry are established;
+- the complete isolated group receives bounded TERM then KILL on timeout or
+  cancel, including a child which ignores TERM;
+- valid JSON followed by a non-zero helper exit remains a failed raw diagnostic
+  and is never promoted;
+- only one bounded root-owned JSON object from an exact zero exit is published
+  atomically;
+- crash recovery restores runtime/SQM state and leaves no orphan helper;
+- per-instance terminal history remains in RAM and is pruned by both run count
+  and byte limit.
+
+The complete local gate passed:
+
+- `cargo fmt --check`, `cargo check --locked --all-targets`,
+  `cargo clippy --locked --all-targets -- -D warnings`, and all 142 Rust tests;
+- all daemon and LuCI shell suites, all LuCI JavaScript suites, changed-helper
+  `sh -n`, changed-view `node --check`, and `git diff --check`;
+- OpenWrt 25.12.5 x86_64 and rockchip/armv8 SDK builds. The two SDKs produced
+  byte-identical noarch LuCI packages.
+
+Both final offline repositories index 68 APKs. Fresh architecture-specific
+roots with networking and package scripts disabled selected and installed all
+68 packages. Both installers pass `sh -n`, both manifests verify, and each
+archive contains one platform installer, `packages.adb`, and 68 APKs.
+
+The exact x86_64 archive was then installed on the disposable router. It made
+backup `rc19-install-20260716-173514`, left its existing instance running with
+the original CAKE/IFB topology, and preserved all four configuration hashes:
+
+| Disposable x86 configuration | SHA-256 |
+|---|---|
+| `cake-autorate` | `aaf00467c59f1c3f573925791cfbca71382f6cf86125bee2328ac67d0116b3bb` |
+| `sqm` | `0204b58ff12277f15aa536e1406ee0dbf2aeeb739f7b48c7169a2b598ecb8d68` |
+| `network` | `ea57aa4b5e44ca7b02c3ea84c174688f9f0185200077f3e87a39f1a071a280ce` |
+| `mwan3` | `88c720fe486115b5a3db09b6efd3b7519878c35105a7ad2a86b0e8127c8f6b96` |
+
+The same exact release archives were installed on the two production
+acceptance routers:
+
+- the x86_64 Multi-WAN router made backup
+  `rc19-install-20260716-203724`; `wan_sqm` and `wanb_sqm` remained running,
+  both WAN members and their trackers remained online, mwan3 was not
+  restarted, and the existing PPPoE and Ethernet CAKE/IFB pairs remained
+  present;
+- the aarch64_generic router had only 7.4 MiB free in its root filesystem, so
+  its old `/root/packages` cache was moved temporarily to `/tmp` under an
+  exit/signal restoration trap. The normal installer safety check then passed,
+  backup `rc19-install-20260716-203922` was created, the cache was restored,
+  and `wwan_adaptive` plus its CAKE/IFB pair remained running.
+
+Post-install hashes exactly matched the pre-install values:
+
+| Router/configuration | SHA-256 |
+|---|---|
+| x86 Multi-WAN `cake-autorate` | `88cc2cd79dffa695fa8b16b96a5fc375d31a95adac6e724773a5373b1c2dd6d8` |
+| x86 Multi-WAN `sqm` | `a4405847b3044c9f41c09097fd9e850915d7113953502ec60ccb8365b93eb8bb` |
+| x86 Multi-WAN `network` | `ed6d568293ed2d632c51827f5fa3227acaec4ed257359eb9a92b85a355065190` |
+| x86 Multi-WAN `mwan3` | `fea15a18e8f39f4211ee37959759a5892d0f592dd6e105cf147263b4dde67e81` |
+| ARM `cake-autorate` | `ac59a8a2a26e88803a5c493ea86c840c3dd9c10a2058ce0768164515abcdb10c` |
+| ARM `sqm` | `1e29f86a4cfba8cecaa5aee5cface48c6ef2599fa9aa7a567c4d363ec641c920` |
+| ARM `network` | `3d16217f0e3ec73b9ba55b006caf30c5abda024126c429df30ca93e170e4ea68` |
+
+Authenticated Playwright opened Status, Graphs, Settings and Re-run Auto-Tune
+at 1500x900 and 390x844 on all three routers. It selected and checked Gaming,
+Best overall and Fair, including Fair's throughput-first/class-C/90% contract
+and possible evidence-backed disable-SQM choice. The virtual router rendered
+two canvases, the production Multi-WAN router four, and the production ARM
+router two. Every run reported zero browser/page errors and
+`scrollWidth == clientWidth`; a visual pass also confirmed readable desktop
+tables, mobile cards, vertically stacked WAN graph cards, and word-safe profile
+text. The browser tests did not start calibration or save configuration.
+
+Final RC19 payload hashes are:
+
+| Artifact | SHA-256 |
+|---|---|
+| x86_64 daemon APK | `621e4375e2a4a460a3b9351c6f6878d9d07f5cbfb30b169e0ce85ce73f8b8f12` |
+| aarch64_generic daemon APK | `51b74c5e67c6e65952f3e723a257d09d2c918afef5d894f0bfdc425130b97a52` |
+| noarch LuCI APK | `441b2eb34e9d8a452e24cb053bad971fb33de9e477441a5af3ac83587d8c3f63` |
+| x86_64 installer | `f9b46243ed94d2e0b9c5351d51c6d4cbf1a83adbb035229893961633555f047e` |
+| aarch64_generic installer | `aef2f47e28b9f3321789f6e5b854a8ef17c53917c2ca45a6ae09e40d1011b6a0` |
+| x86_64 offline bundle | `e9a2b17c9cc2d513cb0e2c7862cbf4ed8fab468f48bfab04d716452583689b7a` |
+| rockchip/armv8 offline bundle | `93f8c3a95ba847a4f3b4aab12e67d92eed238939168469bd611f6a081bbd7d64` |

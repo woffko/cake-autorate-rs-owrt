@@ -169,7 +169,7 @@ terminal_json_valid() {
 	terminal_state="$(printf '%s\n' "$terminal_candidate" | "$jsonfilter_bin" -e '@.state' 2>/dev/null)" || return 1
 	terminal_schema="$(printf '%s\n' "$terminal_candidate" | "$jsonfilter_bin" -e '@.schema_version' 2>/dev/null)" || return 1
 	terminal_producer="$(printf '%s\n' "$terminal_candidate" | "$jsonfilter_bin" -e '@.producer' 2>/dev/null)" || return 1
-	[ -n "$terminal_state" ] && [ "$terminal_schema" = 4 ] &&
+	[ -n "$terminal_state" ] && [ "$terminal_schema" = 5 ] &&
 		[ "$terminal_producer" = "$autotune_result_producer" ]
 }
 
@@ -515,7 +515,7 @@ add_warning() {
 write_recovery_error() {
 	message="$1"
 	tmp="$error_file.tmp.$$"
-	printf '{"state":"recovery-failed","schema_version":4,"producer":"%s","job":"%s","instance":"%s","error":"%s","runtime_restored":false,"recovery_pending":true,"auto_apply_eligible":false,"configuration_written":false}\n' \
+	printf '{"state":"recovery-failed","schema_version":5,"producer":"%s","job":"%s","instance":"%s","error":"%s","runtime_restored":false,"recovery_pending":true,"auto_apply_eligible":false,"manual_apply_eligible":false,"configuration_written":false}\n' \
 		"$autotune_result_producer" "$(json_escape "$job")" "$(json_escape "$section")" "$(json_escape "$message")" > "$tmp" &&
 		mv "$tmp" "$error_file"
 }
@@ -524,7 +524,7 @@ write_interrupted_recovery() {
 	message="Full Auto-Tune was interrupted; temporary network state was recovered and no configuration was written."
 	[ -z "$recovery_warnings" ] || message="$message Warnings: $recovery_warnings"
 	tmp="$pending_error_file.tmp.$$"
-	printf '{"state":"failed","schema_version":4,"producer":"%s","stage":"recovery","job":"%s","instance":"%s","recovered":true,"error":"%s","auto_apply_eligible":false,"configuration_written":false,"runtime_restored":false,"recovery_pending":true}\n' \
+	printf '{"state":"failed","schema_version":5,"producer":"%s","stage":"recovery","job":"%s","instance":"%s","recovered":true,"error":"%s","auto_apply_eligible":false,"manual_apply_eligible":false,"configuration_written":false,"runtime_restored":false,"recovery_pending":true}\n' \
 		"$autotune_result_producer" "$(json_escape "$job")" "$(json_escape "$section")" "$(json_escape "$message")" > "$tmp" &&
 		mv "$tmp" "$pending_error_file" && rm -f "$pending_result_file"
 }
@@ -562,7 +562,7 @@ publish_pending_terminal() {
 		# public API; replace it with a small internally generated failure object.
 		terminal_target="$error_file"
 		terminal_other="$result_file"
-		terminal_payload="{\"state\":\"recovery-failed\",\"schema_version\":4,\"producer\":\"$autotune_result_producer\",\"job\":\"$(json_escape "$job")\",\"instance\":\"$(json_escape "$section")\",\"error\":\"Stored Full Auto-Tune terminal data was malformed and was discarded after safe runtime restoration.\",\"auto_apply_eligible\":false,\"configuration_written\":false,\"runtime_restored\":true,\"recovery_pending\":false}"
+		terminal_payload="{\"state\":\"recovery-failed\",\"schema_version\":5,\"producer\":\"$autotune_result_producer\",\"job\":\"$(json_escape "$job")\",\"instance\":\"$(json_escape "$section")\",\"error\":\"Stored Full Auto-Tune terminal data was malformed and was discarded after safe runtime restoration.\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"configuration_written\":false,\"runtime_restored\":true,\"recovery_pending\":false}"
 	fi
 	terminal_json_valid "$terminal_payload" || return 1
 	case "$terminal_payload" in *'"runtime_restored":true,"recovery_pending":false}') ;; *) return 1 ;; esac

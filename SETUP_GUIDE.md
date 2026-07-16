@@ -21,10 +21,11 @@ instance only after identifying the intended uplink.
      `diffserv4`. It prioritizes only traffic already marked with DSCP; it does
      not detect games or rewrite client policy. Use it only when markings are
      trusted.
-   - **Fair** targets B while retaining at least 90% of observed-low capacity,
-     favoring sustained large downloads/uploads over the strictest latency.
+   - **Fair** keeps at least 90% of observed-low capacity and aims for C or
+     better (no more than 200 ms effective loaded-delay growth), favoring
+     sustained large downloads/uploads over the strictest latency.
 
-   Existing instances without an RC18 profile default to Best overall.
+   Existing instances without a saved profile default to Best overall.
 4. Stop large downloads and uploads first. The
    strict run measures idle ICMP across three independent reflector families,
    persistent native transport latency, two unshaped throughput samples, and a
@@ -34,8 +35,8 @@ instance only after identifying the intended uplink.
    explicit **Continue conservatively** action applies to that run only: it
    subtracts measured background with an extra margin, never raises confirmed
    maxima or adaptive caps, and retains a direction whose evidence is not
-   usable. The Review page labels such a result **LOW confidence** and it is
-   not eligible for scheduled Auto-Apply.
+   usable. The Review page labels such a result **LOW confidence** and keeps it
+   diagnostic-only: it cannot be applied or consumed by scheduled Auto-Apply.
 6. Review the selected profile, proposed min/base/max rates, absolute
    adaptive-ceiling caps, link-layer overhead, latency thresholds, validation
    gates, exact CAKE class policy, and warnings. Nothing is written before
@@ -54,7 +55,7 @@ instance only after identifying the intended uplink.
 Use **Re-run Auto-Tune** immediately before **Edit** in the Settings row. It
 opens the calibration page with the instance interface, route/member, backend,
 queue, current limits and saved profile prefilled. The current configuration
-remains active until a passing Review result is explicitly staged and saved.
+remains active until an eligible Review result is explicitly staged and saved.
 Changing profile affects the complete proposal and SQM policy, not just the
 grade label. Re-run preserves the instance's explicit Adaptive Ceiling
 enabled/disabled choice; changing it requires the corresponding Review
@@ -79,10 +80,19 @@ phase, every pass/fail gate, and any typed correction:
 `infeasible` means the requested latency/rate constraints cannot be satisfied
 without crossing the throughput safety floor or configured bounds. It is not
 an instruction to accept a more destructive rate. Failed, incomplete, strictly
-contaminated, and infeasible runs remain available as diagnostics but expose no
-apply action and do not replace the current UCI configuration. If the user
-explicitly selected conservative mode, a passing LOW-confidence result may be
-applied manually from Review; it is never eligible for scheduled Auto-Apply.
+contaminated and conservative runs remain diagnostics and do not replace the
+current UCI configuration. Gaming and Best overall also expose no action after
+an infeasible result.
+
+Fair is the narrow exception: if measurement integrity, route, background,
+candidate-realization, 90% retained-capacity and CPU gates all pass but class C
+does not, Review offers the best hard-safe shaped candidate as a manual choice.
+For an existing managed instance it may additionally offer **Disable autorate
+and SQM (comparison suggestion)** after a clean simultaneous bidirectional
+no-SQM control proves no worse grade, no material latency benefit from shaping,
+and at least 2% more throughput in both directions. The choice is never
+preselected, requires explicit confirmation, and scheduled Auto-Apply cannot
+use it. **Keep current settings** writes nothing.
 
 Inside **Edit**, **Autorate setup** is split into focused groups:
 

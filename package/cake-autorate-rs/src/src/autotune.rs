@@ -1,3 +1,5 @@
+use crate::transport_quality::classify_quality;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkKind {
     Ethernet,
@@ -56,15 +58,23 @@ impl AutotuneProfile {
         match self {
             Self::Gaming => "A+",
             Self::BestOverall => "A",
-            Self::Fair => "B",
+            Self::Fair => "C",
         }
+    }
+
+    pub fn quality_target_required(self) -> bool {
+        self != Self::Fair
+    }
+
+    pub fn throughput_priority(self) -> bool {
+        self == Self::Fair
     }
 
     pub fn validation_thresholds(self) -> ValidationThresholds {
         let (capacity_retention_min_percent, latency_delta_max_ms, loss_max_percent) = match self {
             Self::Gaming => (70.0, 5.0, 1.0),
             Self::BestOverall => (80.0, 30.0, 3.0),
-            Self::Fair => (90.0, 60.0, 5.0),
+            Self::Fair => (90.0, 200.0, 5.0),
         };
         ValidationThresholds {
             candidate_realization_min_percent: 80.0,
@@ -194,6 +204,8 @@ pub struct DirectionProposal {
 pub struct AutotuneProposal {
     pub profile: AutotuneProfile,
     pub target_grade: &'static str,
+    pub quality_target_required: bool,
+    pub throughput_priority: bool,
     pub download: DirectionProposal,
     pub upload: DirectionProposal,
     pub active_threshold_kbps: u64,
@@ -228,8 +240,13 @@ impl AutotuneProposal {
     ) -> Result<(), String> {
         validate_base_scale(download_scale)?;
         validate_base_scale(upload_scale)?;
-        revise_direction_base(&mut self.download, download_scale);
-        revise_direction_base(&mut self.upload, upload_scale);
+        let observed_low_ceiling = if self.profile == AutotuneProfile::Fair {
+            1.0
+        } else {
+            0.95
+        };
+        revise_direction_base(&mut self.download, download_scale, observed_low_ceiling);
+        revise_direction_base(&mut self.upload, upload_scale, observed_low_ceiling);
         Ok(())
     }
 
@@ -269,7 +286,8 @@ impl AutotuneProposal {
             .join(",");
         format!(
             concat!(
-                "{{\"schema_version\":2,\"profile\":\"{}\",\"target_grade\":\"{}\",",
+                "{{\"schema_version\":3,\"profile\":\"{}\",\"target_grade\":\"{}\",",
+                "\"quality_target_required\":{},\"throughput_priority\":{},",
                 "\"download\":{},\"upload\":{},",
                 "\"active_threshold_kbps\":{},",
                 "\"thresholds_ms\":{{\"adjust_up\":{},\"delay\":{},\"adjust_down\":{}}},",
@@ -289,6 +307,8 @@ impl AutotuneProposal {
             ),
             self.profile.as_str(),
             self.target_grade,
+            self.quality_target_required,
+            self.throughput_priority,
             direction_json(self.download),
             direction_json(self.upload),
             self.active_threshold_kbps,
@@ -370,6 +390,7 @@ impl Default for ValidationThresholds {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ValidationInput {
+    pub profile: AutotuneProfile,
     pub download: DirectionValidationInput,
     pub upload: DirectionValidationInput,
     pub download_load: DirectionLoadInput,
@@ -428,6 +449,7 @@ impl GateComparison {
 pub struct ValidationGate {
     pub code: &'static str,
     pub scope: ValidationScope,
+    pub required: bool,
     pub pass: bool,
     pub actual: f64,
     pub limit: f64,
@@ -478,7 +500,11 @@ pub struct ValidationCorrection {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ValidationResult {
+    pub profile: AutotuneProfile,
     pub pass: bool,
+    pub hard_pass: bool,
+    pub quality_target_met: bool,
+    pub actual_grade: &'static str,
     pub score: f64,
     pub effective_delta_ms: f64,
     pub download: DirectionValidationMetrics,
@@ -504,12 +530,18 @@ impl ValidationResult {
         let reasons = self.reasons().map(gate_json).collect::<Vec<_>>().join(",");
         format!(
             concat!(
-                "{{\"schema_version\":2,\"pass\":{},\"score\":{:.1},",
+                "{{\"schema_version\":3,\"profile\":\"{}\",\"pass\":{},",
+                "\"hard_pass\":{},\"quality_target_met\":{},\"actual_grade\":\"{}\",",
+                "\"score\":{:.1},",
                 "\"metrics\":{{\"download\":{},\"upload\":{},\"effective_delta_ms\":{:.3}}},",
                 "\"signals\":{{\"download\":{},\"upload\":{}}},",
                 "\"gates\":[{}],\"reasons\":[{}],\"correction\":{}}}"
             ),
+            self.profile.as_str(),
             self.pass,
+            self.hard_pass,
+            self.quality_target_met,
+            self.actual_grade,
             self.score,
             validation_metrics_json(self.download),
             validation_metrics_json(self.upload),
@@ -528,7 +560,7 @@ pub fn validate_shaped_candidate(input: ValidationInput) -> Result<ValidationRes
     let download = validation_metrics(input.download);
     let upload = validation_metrics(input.upload);
     let thresholds = input.thresholds;
-    let gates = vec![
+    let mut gates = vec![
         minimum_gate(
             "download-candidate-realization",
             ValidationScope::Download,
@@ -614,18 +646,44 @@ pub fn validate_shaped_candidate(input: ValidationInput) -> Result<ValidationRes
             thresholds.cpu_max_percent,
         ),
     ];
+    if !input.profile.quality_target_required() {
+        for gate in &mut gates {
+            if matches!(
+                gate.code,
+                "download-icmp-latency"
+                    | "download-transport-latency"
+                    | "upload-icmp-latency"
+                    | "upload-transport-latency"
+            ) {
+                gate.required = false;
+            }
+        }
+    }
     let pass = gates.iter().all(|gate| gate.pass);
+    let hard_pass = gates
+        .iter()
+        .filter(|gate| gate.required)
+        .all(|gate| gate.pass);
+    let quality_target_met = gates
+        .iter()
+        .filter(|gate| gate.code.contains("latency"))
+        .all(|gate| gate.pass);
     let effective_delta_ms = input
         .download_load
         .icmp_delta_ms
         .max(input.download_load.transport_delta_ms)
         .max(input.upload_load.icmp_delta_ms)
         .max(input.upload_load.transport_delta_ms);
+    let actual_grade = classify_quality(Some(effective_delta_ms)).as_str();
     let score = validation_score(&gates);
     let correction = validation_correction(&input, download, upload, &gates, pass);
 
     Ok(ValidationResult {
+        profile: input.profile,
         pass,
+        hard_pass,
+        quality_target_met,
+        actual_grade,
         score,
         effective_delta_ms,
         download,
@@ -755,6 +813,7 @@ fn minimum_gate(
     ValidationGate {
         code,
         scope,
+        required: true,
         pass: actual >= limit,
         actual,
         limit,
@@ -771,6 +830,7 @@ fn maximum_gate(
     ValidationGate {
         code,
         scope,
+        required: true,
         pass: actual <= limit,
         actual,
         limit,
@@ -810,6 +870,11 @@ fn validation_correction(
     gates: &[ValidationGate],
     pass: bool,
 ) -> ValidationCorrection {
+    let observed_low_ceiling = if input.profile == AutotuneProfile::Fair {
+        1.0
+    } else {
+        0.95
+    };
     if pass {
         return ValidationCorrection {
             action: CorrectionAction::None,
@@ -836,6 +901,7 @@ fn validation_correction(
         "download-candidate-realization",
         "download-candidate-realization-maximum",
         "download-capacity-retention",
+        observed_low_ceiling,
         &[
             "download-icmp-latency",
             "download-transport-latency",
@@ -851,6 +917,7 @@ fn validation_correction(
         "upload-candidate-realization",
         "upload-candidate-realization-maximum",
         "upload-capacity-retention",
+        observed_low_ceiling,
         &[
             "upload-icmp-latency",
             "upload-transport-latency",
@@ -931,6 +998,7 @@ fn direction_validation_correction(
     realization_min_gate: &str,
     realization_max_gate: &str,
     retention_gate: &str,
+    observed_low_ceiling: f64,
     adverse_gates: &[&str],
 ) -> DirectionCorrection {
     let hold = hold_direction_correction(input, metrics, floor_percent);
@@ -944,7 +1012,7 @@ fn direction_validation_correction(
         return decrease_direction_correction(input, metrics, floor_percent);
     }
     if !gate_pass(gates, retention_gate) {
-        return increase_direction_correction(input, metrics, floor_percent);
+        return increase_direction_correction(input, metrics, floor_percent, observed_low_ceiling);
     }
     hold
 }
@@ -1058,10 +1126,16 @@ fn increase_direction_correction(
     input: DirectionValidationInput,
     metrics: DirectionValidationMetrics,
     floor_percent: f64,
+    observed_low_ceiling: f64,
 ) -> DirectionCorrection {
     let required_floor_kbps =
         required_candidate_for_floor(input, metrics, floor_percent).max(input.minimum_kbps);
-    let revision_upper = rounded_rate(input.observed_low_kbps as f64 * 0.95)
+    // A hard 95%-of-observed ceiling made a 90% retained-throughput floor
+    // mathematically unreachable whenever the shaped realization was below
+    // about 94.74%.  The observed-low sample itself remains the outer safety
+    // bound; the candidate, configured maximum, and one-step 20% bound still
+    // prevent an unbounded correction.
+    let revision_upper = rounded_rate(input.observed_low_kbps as f64 * observed_low_ceiling)
         .min(input.maximum_kbps)
         .min(rounded_rate(input.candidate_kbps as f64 * 1.20))
         .max(input.minimum_kbps);
@@ -1148,9 +1222,10 @@ fn direction_load_json(load: DirectionLoadInput) -> String {
 
 fn gate_json(gate: &ValidationGate) -> String {
     format!(
-        "{{\"code\":\"{}\",\"scope\":\"{}\",\"pass\":{},\"actual\":{:.3},\"limit\":{:.3},\"comparison\":\"{}\"}}",
+        "{{\"code\":\"{}\",\"scope\":\"{}\",\"required\":{},\"pass\":{},\"actual\":{:.3},\"limit\":{:.3},\"comparison\":\"{}\"}}",
         gate.code,
         gate.scope.as_str(),
+        gate.required,
         gate.pass,
         gate.actual,
         gate.limit,
@@ -1259,7 +1334,10 @@ pub fn build_proposal_for_profile(
     }
     if profile == AutotuneProfile::Fair {
         warnings.push(
-            "Fair prioritizes sustained throughput with a B-or-better latency target; choose Gaming or Best overall for stricter latency.",
+            "Fair prioritizes sustained throughput with a 90% safety floor. Class C is a conditional goal; if the link cannot reach it without crossing that floor, the measured grade is reported instead of destroying throughput.",
+        );
+        warnings.push(
+            "When a validated no-SQM control is no worse than the best shaped candidate, Review may recommend disabling SQM. That choice is never applied automatically.",
         );
     }
     let sample_confidence = download_samples_kbps
@@ -1284,6 +1362,8 @@ pub fn build_proposal_for_profile(
     Ok(AutotuneProposal {
         profile,
         target_grade: profile.target_grade(),
+        quality_target_required: profile.quality_target_required(),
+        throughput_priority: profile.throughput_priority(),
         download,
         upload,
         active_threshold_kbps,
@@ -1470,8 +1550,9 @@ fn rounded_rate(rate_kbps: f64) -> u64 {
         .expect("rate derived from previously validated bounded integer input")
 }
 
-fn revise_direction_base(direction: &mut DirectionProposal, scale: f64) {
-    let upper = rounded_rate(direction.observed_low_kbps as f64 * 0.95).min(direction.maximum_kbps);
+fn revise_direction_base(direction: &mut DirectionProposal, scale: f64, observed_low_ceiling: f64) {
+    let upper = rounded_rate(direction.observed_low_kbps as f64 * observed_low_ceiling)
+        .min(direction.maximum_kbps);
     direction.base_kbps = rounded_rate(direction.base_kbps as f64 * scale)
         .max(direction.minimum_kbps)
         .min(upper.max(direction.minimum_kbps));
@@ -1585,7 +1666,10 @@ mod tests {
         );
         assert_eq!(gaming.validation_thresholds.transport_delta_max_ms, 5.0);
         assert_eq!(best.validation_thresholds.transport_delta_max_ms, 30.0);
-        assert_eq!(fair.validation_thresholds.transport_delta_max_ms, 60.0);
+        assert_eq!(fair.validation_thresholds.transport_delta_max_ms, 200.0);
+        assert_eq!(fair.target_grade, "C");
+        assert!(!fair.quality_target_required);
+        assert!(fair.throughput_priority);
         assert!(gaming.adjust_up_threshold_ms <= best.adjust_up_threshold_ms);
         assert!(best.adjust_up_threshold_ms <= fair.adjust_up_threshold_ms);
         assert_eq!(gaming.delay_threshold_ms, 5);
@@ -1614,7 +1698,7 @@ mod tests {
         assert!(!proposal.sqm.squash_ingress);
         assert_eq!(proposal.sqm.iqdisc_opts, "diffserv4");
         assert_eq!(proposal.sqm.eqdisc_opts, "diffserv4");
-        assert!(json.contains("\"schema_version\":2"));
+        assert!(json.contains("\"schema_version\":3"));
         assert!(json.contains("\"profile\":\"gaming\""));
         assert!(json.contains("\"target_grade\":\"A+\""));
         assert!(json.contains("\"script\":\"layer_cake.qos\""));
@@ -1770,7 +1854,7 @@ mod tests {
         .unwrap()
         .to_json();
 
-        assert!(json.contains("\"schema_version\":2"));
+        assert!(json.contains("\"schema_version\":3"));
         assert!(json.contains("\"profile\":\"best_overall\""));
         assert!(json.contains("\"minimum_kbps\""));
         assert!(json.contains("\"adaptive_ceiling\""));
@@ -1815,6 +1899,7 @@ mod tests {
             cpu_percent: 53.2,
         };
         ValidationInput {
+            profile: AutotuneProfile::BestOverall,
             download,
             upload,
             download_load: load,
@@ -1959,6 +2044,7 @@ mod tests {
                 cpu_percent: 10.0,
             };
             let result = validate_shaped_candidate(ValidationInput {
+                profile,
                 download: direction,
                 upload: direction,
                 download_load: load,
@@ -1971,6 +2057,12 @@ mod tests {
                 !result.pass,
                 "{profile:?} must not accept a conflicting candidate"
             );
+            if profile == AutotuneProfile::Fair {
+                assert!(result.hard_pass);
+                assert!(!result.quality_target_met);
+            } else {
+                assert!(!result.hard_pass);
+            }
             assert!(!result.correction.feasible);
             assert_eq!(result.correction.action, CorrectionAction::Infeasible);
             assert_eq!(
@@ -1980,6 +2072,85 @@ mod tests {
             assert_eq!(result.correction.download.proposed_kbps, candidate);
             assert_eq!(result.correction.upload.proposed_kbps, candidate);
         }
+    }
+
+    #[test]
+    fn fair_reports_actual_grade_when_class_c_conflicts_with_the_throughput_floor() {
+        let thresholds = AutotuneProfile::Fair.validation_thresholds();
+        let direction = DirectionValidationInput {
+            observed_low_kbps: 100_000,
+            candidate_kbps: 90_000,
+            achieved_kbps: 90_000,
+            minimum_kbps: 60_000,
+            maximum_kbps: 100_000,
+        };
+        let load = DirectionLoadInput {
+            icmp_delta_ms: 250.0,
+            transport_delta_ms: 230.0,
+            loss_percent: 0.0,
+            cpu_percent: 20.0,
+        };
+        let result = validate_shaped_candidate(ValidationInput {
+            profile: AutotuneProfile::Fair,
+            download: direction,
+            upload: direction,
+            download_load: load,
+            upload_load: load,
+            thresholds,
+        })
+        .unwrap();
+
+        assert!(!result.pass);
+        assert!(result.hard_pass);
+        assert!(!result.quality_target_met);
+        assert_eq!(result.actual_grade, "D");
+        assert_eq!(result.correction.action, CorrectionAction::Infeasible);
+        assert_eq!(
+            result.correction.reason,
+            "safety-floor-blocks-rate-reduction"
+        );
+    }
+
+    #[test]
+    fn fair_can_raise_a_clean_candidate_above_the_old_ninety_five_percent_cap() {
+        let thresholds = AutotuneProfile::Fair.validation_thresholds();
+        let direction = DirectionValidationInput {
+            observed_low_kbps: 100_000,
+            candidate_kbps: 94_000,
+            achieved_kbps: 88_360,
+            minimum_kbps: 80_000,
+            maximum_kbps: 98_000,
+        };
+        let load = DirectionLoadInput {
+            icmp_delta_ms: 10.0,
+            transport_delta_ms: 10.0,
+            loss_percent: 0.0,
+            cpu_percent: 20.0,
+        };
+        let result = validate_shaped_candidate(ValidationInput {
+            profile: AutotuneProfile::Fair,
+            download: direction,
+            upload: direction,
+            download_load: load,
+            upload_load: load,
+            thresholds,
+        })
+        .unwrap();
+
+        assert!(!result.pass);
+        assert!(!result.hard_pass);
+        assert!(result.quality_target_met);
+        assert_eq!(result.correction.action, CorrectionAction::Increase);
+        assert!(result.correction.feasible);
+        assert!(result.correction.download.proposed_kbps > 95_000);
+        assert!(result.correction.download.proposed_kbps <= 98_000);
+        assert!(
+            result
+                .correction
+                .download
+                .predicted_capacity_retention_percent
+                >= 90.0
+        );
     }
 
     #[test]
@@ -2211,7 +2382,7 @@ mod tests {
 
         assert!(json.contains("\"candidate_realization_percent\""));
         assert!(json.contains("\"capacity_retention_percent\""));
-        assert!(json.contains("\"schema_version\":2"));
+        assert!(json.contains("\"schema_version\":3"));
         assert!(json.contains("\"signals\":{\"download\":"));
         assert!(json.contains("\"code\":\"download-transport-latency\""));
         assert!(json.contains("\"code\":\"upload-transport-latency\""));

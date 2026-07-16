@@ -50,13 +50,13 @@ socket libraries; ordinary OpenWrt runtime dependencies remain explicit below.
 
 The latest published release provides these OpenWrt 25.12.5 APKs:
 
-- `cake-autorate-rs-1.0_rc18-r1-x86_64.apk` — x86_64 autorate daemon.
-- `cake-autorate-rs-1.0_rc18-r1-aarch64_generic.apk` — rockchip/armv8
+- `cake-autorate-rs-1.0_rc19-r1-x86_64.apk` — x86_64 autorate daemon.
+- `cake-autorate-rs-1.0_rc19-r1-aarch64_generic.apk` — rockchip/armv8
   autorate daemon.
-- `luci-app-cake-autorate-rs-1.0_rc18-r1.apk` — architecture-independent LuCI
+- `luci-app-cake-autorate-rs-1.0_rc19-r1.apk` — architecture-independent LuCI
   interface and SQM integration.
 
-RC18 completed both architecture builds, fresh offline dependency resolution,
+RC19 completed both architecture builds, fresh offline dependency resolution,
 disposable x86 validation, production Multi-WAN validation, ARM validation,
 and authenticated desktop/mobile Playwright checks. Exact release hashes and
 the anonymized acceptance evidence are recorded in [Testing](TESTING.md).
@@ -217,31 +217,51 @@ again.
 The same work adds per-phase nftables counters for forwarded client traffic,
 distinct from router-generated speed-test traffic. A contaminated phase is
 retried once and strict mode then stops. An explicitly requested conservative
-run may expose a passing low-confidence proposal for manual Review, but it is
-never eligible for scheduled Auto-Apply. A typed Rust validator can request the
-same measurement again, raise only a clean under-retaining direction, perform
-a safety-floor-bounded decrease, or report `infeasible`. Failed,
-contaminated, incomplete, and infeasible runs keep diagnostics but cannot be
-applied. Scheduled Auto-Apply requires a complete current-schema result, a
+run exposes only low-confidence diagnostics and safer suggested values; it is
+never apply-eligible. A typed Rust validator can request the same measurement
+again, raise only a clean under-retaining direction, perform a
+safety-floor-bounded decrease, or report `infeasible`. Failed, contaminated,
+incomplete, and infeasible runs keep diagnostics but cannot be applied, except
+for the explicitly typed Fair hard-safe fallback described below. Scheduled
+Auto-Apply requires a complete current-schema result, a
 passing final validation, normal confidence, and no phase contamination. This
 contract is covered by deterministic Rust, shell, LuCI, offline-install, and
 real-router acceptance gates; see [Full Auto-Tune](AUTOTUNE.md) and
 [Testing](TESTING.md).
 
-RC18 adds three explicit, end-to-end Full Auto-Tune profiles. **Best overall**
+RC19 carries three explicit, end-to-end Full Auto-Tune profiles. **Best overall**
 is the default and the compatibility replacement for the former balanced
 proposal; it targets an A-like loaded-delay result while retaining at least
 80% of observed-low capacity. **Gaming** targets A+, accepts a lower 70%
 throughput floor, and configures `layer_cake.qos` with CAKE `diffserv4`.
 Gaming never guesses applications or rewrites client policy: only traffic
 already marked with DSCP receives differentiated treatment, and ingress marks
-are deliberately preserved. **Fair** targets B while retaining at least 90%
-of observed-low capacity for sustained transfers. Each profile owns its rate
-factors, validation limits, adaptive-ceiling cadence, and exact SQM policy.
+are deliberately preserved. **Fair** prioritizes sustained throughput, keeps
+at least 90% of observed-low capacity, and aims for class C or better
+(`<= 200 ms` effective loaded delay) when the link permits it. If that target
+conflicts with the throughput floor, Review retains the best measured
+hard-safe SQM candidate as a manual choice instead of failing the whole run.
+It may also offer a separate, never-preselected option to disable autorate and
+SQM when a clean simultaneous no-SQM control proves no worse latency class,
+no more than 10 ms additional effective delay, and at least 2% more download
+and upload throughput. That option requires explicit confirmation, preserves
+the configuration as disabled, and is never scheduled or automatically
+applied. Each profile owns its rate factors, validation limits,
+adaptive-ceiling cadence, and exact SQM policy.
 The selected profile is bound into the job identity, proposal, result,
 attestation, guarded apply and rollback paths; mismatched or legacy evidence
 fails closed. Existing instances without a profile resolve to Best overall,
 and the old `balanced` CLI spelling remains a read-compatible alias.
+
+RC19 also hardens the calibration supervisor. Each speed-test helper starts
+stopped, is identity-checked, enters an isolated process group recorded in the
+recovery journal, and publishes a result only after exact exit status zero and
+strict single-object JSON validation. Timeout/cancel uses bounded TERM then
+KILL for the complete group; diagnostic raw output is retained only in RAM.
+Terminal Auto-Tune history is likewise RAM-only and bounded by both count and
+size. Proposal schema 3 and result schema 5 bind the profile policy, immutable
+run ID, phase evidence, action, configuration fingerprint and restored runtime
+state through LuCI, scheduler and Apply Guard.
 
 The **Autorate setup** editor is now divided into six in-page groups:
 Connection & routing, Rate limits, Adaptive ceiling, Latency probes, Quality &
@@ -417,8 +437,11 @@ Implemented:
   p95-to-p95 growth, loss, CPU, three distinct throughput ratios, and forwarded
   client background before restoring the previous qdisc/SQM state. Typed gates
   and a bounded Rust correction solver replace the old combined retention and
-  fixed-scale decision. Any missing, changed, contaminated, infeasible, or
-  failed evidence stops without an apply-ready proposal.
+  fixed-scale decision. Any missing, changed or contaminated evidence stops
+  without an apply-ready proposal. Fair alone may expose a typed manual
+  throughput fallback after all measurement-integrity, realization, retention,
+  CPU, route and background-evidence hard gates pass; it never weakens those
+  gates or permits unattended apply.
 - Optional scheduled Full Auto-Tune, disabled by default, adds a quiet-time
   gate, maintenance window, interval, RAM-only daily byte budget, and explicit
   review-only versus validated auto-apply mode.
@@ -676,16 +699,16 @@ them together. For x86_64:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc18-r1-x86_64.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc18-r1.apk
+  /root/cake-autorate-rs-1.0_rc19-r1-x86_64.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc19-r1.apk
 ```
 
 For rockchip/armv8 (`aarch64_generic`):
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc18-r1-aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc18-r1.apk
+  /root/cake-autorate-rs-1.0_rc19-r1-aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc19-r1.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:
@@ -705,16 +728,16 @@ x86_64:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc18-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc18-x86_64.sh
+tar -xzf cake-autorate-rs-1.0-rc19-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc19-x86_64.sh
 ```
 
 Banana Pi R2 Pro and other OpenWrt 25.12.5 rockchip/armv8 devices:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc18-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc18-aarch64_generic.sh
+tar -xzf cake-autorate-rs-1.0-rc19-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc19-aarch64_generic.sh
 ```
 
 The installer resolves its own location, so it also works when the extracted

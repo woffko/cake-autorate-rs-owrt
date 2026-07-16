@@ -50,10 +50,10 @@ export AUTOTUNE_MOCK_DIRECTION_LOG="$work/test-directions"
 
 # The fixture must model jsonfilter's top-level lookup semantics.  Greedy text
 # extraction used to select nested proposal fields and report schema 1/state
-# inner instead of the terminal envelope's schema 4/state complete.
-nested_terminal='{"state":"complete","schema_version":4,"nested":{"state":"inner","schema_version":1}}'
+# inner instead of the terminal envelope's schema 5/state complete.
+nested_terminal='{"state":"complete","schema_version":5,"nested":{"state":"inner","schema_version":1}}'
 test "$(printf '%s\n' "$nested_terminal" | "$CAKE_AUTORATE_JSONFILTER" -e '@.state')" = complete
-test "$(printf '%s\n' "$nested_terminal" | "$CAKE_AUTORATE_JSONFILTER" -e '@.schema_version')" = 4
+test "$(printf '%s\n' "$nested_terminal" | "$CAKE_AUTORATE_JSONFILTER" -e '@.schema_version')" = 5
 
 # Request matching must consume the identity snapshot authenticated by
 # worker_identity_matches().  The worker is allowed to unlink pid_file as it
@@ -128,7 +128,8 @@ grep -q '"kind":"cellular"' "$work/status.json"
 grep -q '"median_ms":13.000' "$work/status.json"
 grep -q '"transport_median_ms":12.500' "$work/status.json"
 grep -q '"transport_latency":{' "$work/status.json"
-grep -q '"validation":{"pass":true' "$work/status.json"
+grep -q '"validation":{"profile":"best_overall","pass":true' "$work/status.json"
+grep -q '"manual_apply_eligible":true' "$work/status.json"
 grep -q '"comparison":"observed-low"' "$work/status.json"
 grep -q '"auto_apply_eligible":true' "$work/status.json"
 grep -q '"phase_evidence_complete":true' "$work/status.json"
@@ -168,6 +169,33 @@ node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$work
 wait_for_job_cleanup malformedplan
 unset AUTOTUNE_MOCK_MALFORMED_PINGER
 
+# A helper exit code remains authoritative even when the helper managed to
+# print a well-formed result first. The raw diagnostic is retained in RAM, but
+# it must never be promoted to a successful measurement.
+: > "$work/counter"
+export AUTOTUNE_MOCK_VALID_JSON_EXIT_CODE=7
+export AUTOTUNE_MOCK_VALID_JSON_EXIT_AT_COUNT=1
+"$autotune" nonzerojson lo start speedtest-go > "$work/nonzerojson-start.json"
+attempt=0
+while [ "$attempt" -lt 220 ]; do
+	"$autotune" nonzerojson lo status speedtest-go > "$work/nonzerojson-status.json"
+	grep -q '"reason":"helper-exit:7"' "$work/nonzerojson-status.json" && break
+	attempt=$((attempt + 1))
+	sleep 0.05
+done
+grep -q '"state":"failed"' "$work/nonzerojson-status.json"
+grep -q '"reason":"helper-exit:7","exit_code":7,"raw_available":true' "$work/nonzerojson-status.json"
+node - "$work/nonzerojson-status.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (result.speedtest_supervisor.raw_bytes < 2)
+	throw new Error('valid helper diagnostic was not retained');
+if (result.auto_apply_eligible !== false || result.manual_apply_eligible !== false)
+	throw new Error('failed helper result became reviewable');
+EOF
+wait_for_job_cleanup nonzerojson
+unset AUTOTUNE_MOCK_VALID_JSON_EXIT_CODE AUTOTUNE_MOCK_VALID_JSON_EXIT_AT_COUNT
+
 # A helper that silently runs both directions is not valid evidence for either
 # directional candidate, even when it returns positive rates.
 : > "$work/counter"
@@ -194,12 +222,57 @@ while [ "$attempt" -lt 220 ]; do
 	attempt=$((attempt + 1))
 	sleep 0.05
 done
-grep -q '"validation_attempts":\[{"pass":false' "$work/correct-status.json"
-grep -q '},{"pass":true' "$work/correct-status.json"
-grep -q '"validation":{"pass":true' "$work/correct-status.json"
+grep -q '"validation_attempts":\[{"profile":"best_overall","pass":false' "$work/correct-status.json"
+grep -q '},{"profile":"best_overall","pass":true' "$work/correct-status.json"
+grep -q '"validation":{"profile":"best_overall","pass":true' "$work/correct-status.json"
 grep -q '"action":"retry-measurement"' "$work/correct-status.json"
 wait_for_job_cleanup corrected
 unset AUTOTUNE_MOCK_CORRECT
+
+# Fair is throughput-first but remains evidence-driven. When its class-C target
+# conflicts with the 90% floor and a complete no-SQM control is no worse while
+# materially faster in both directions, Review may offer an explicit disable
+# action. It is deliberately not eligible for unattended application.
+: > "$work/counter"
+export AUTOTUNE_MOCK_FAIR_SHAPED_BAD=1
+"$autotune" fairdisable lo start speedtest-go '' '' fair > "$work/fairdisable-start.json"
+attempt=0
+while [ "$attempt" -lt 260 ]; do
+	"$autotune" fairdisable lo status speedtest-go '' '' fair > "$work/fairdisable-status.json"
+	grep -q '"state":"complete"' "$work/fairdisable-status.json" && break
+	attempt=$((attempt + 1))
+	sleep 0.05
+done
+grep -q '"profile":"fair"' "$work/fairdisable-status.json"
+grep -q '"auto_apply_eligible":false' "$work/fairdisable-status.json"
+grep -q '"manual_apply_eligible":true' "$work/fairdisable-status.json"
+grep -q '"pass":false,"hard_pass":true,"quality_target_met":false' "$work/fairdisable-status.json"
+grep -q '"mode":"sqm-disable-recommended"' "$work/fairdisable-status.json"
+grep -q '"recommended_action":"disable_sqm"' "$work/fairdisable-status.json"
+grep -q '"allowed_actions":\["apply_sqm","keep_current","disable_sqm"\]' "$work/fairdisable-status.json"
+grep -q '"disable_sqm_available":true' "$work/fairdisable-status.json"
+node - "$work/fairdisable-status.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const control = result.fair_outcome.no_sqm_control;
+if (!control.available || !control.measurement_evidence.valid ||
+    control.measurement_evidence.test_direction !== 'both' ||
+    !control.measurement_evidence.shaper_bypassed ||
+    !control.measurement_evidence.sqm_paused ||
+    !control.forwarded_background ||
+    control.forwarded_background.available !== true ||
+    control.forwarded_background.contaminated !== false ||
+    control.forwarded_background.download_kbps > control.forwarded_background.download_limit_kbps ||
+    control.forwarded_background.upload_kbps > control.forwarded_background.upload_limit_kbps)
+	throw new Error('no-SQM recommendation lacks complete control evidence');
+if (result.fair_outcome.throughput_gain_without_sqm.download_percent < 2 ||
+    result.fair_outcome.throughput_gain_without_sqm.upload_percent < 2)
+	throw new Error('no-SQM recommendation lacks bidirectional throughput gain');
+if (result.configuration_written !== false)
+	throw new Error('Fair calibration changed configuration');
+EOF
+wait_for_job_cleanup fairdisable
+unset AUTOTUNE_MOCK_FAIR_SHAPED_BAD
 
 # A candidate that is apparently exceeded by more than 10% did not prove that
 # the temporary CAKE rate was enforced. Retry the same candidate once, then
@@ -217,7 +290,7 @@ done
 grep -q '"state":"inconclusive"' "$work/overshoot-status.json"
 grep -q '"retryable":true' "$work/overshoot-status.json"
 grep -q '"action":"retry-measurement"' "$work/overshoot-status.json"
-grep -q '"code":"download-candidate-realization-maximum","scope":"download","pass":false' "$work/overshoot-status.json"
+grep -q '"code":"download-candidate-realization-maximum","scope":"download","required":true,"pass":false' "$work/overshoot-status.json"
 grep -q '"configuration_written":false' "$work/overshoot-status.json"
 wait_for_job_cleanup overshoot
 unset AUTOTUNE_MOCK_REALIZATION_OVERSHOOT
@@ -701,6 +774,28 @@ export CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1
 . "$autotune"
 unset CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY
 
+# Previous terminal diagnostics are retained in bounded RAM history. Count
+# pruning is deterministic even when several runs finish in the same second,
+# and the public history endpoint exposes metadata rather than arbitrary paths.
+job_name=historyunit
+job_paths
+mkdir -p "$job_dir"
+export CAKE_AUTORATE_AUTOTUNE_HISTORY_RUNS=2
+export CAKE_AUTORATE_AUTOTUNE_HISTORY_KIB=128
+for history_test_run in a b c; do
+	printf '{"state":"complete","schema_version":5,"producer":"cake-autorate-rs-autotune","profile":"fair","run_id":"run-%s"}\n' \
+		"$history_test_run" > "$result_file"
+	printf 'diagnostic for run-%s\n' "$history_test_run" > "$log_file"
+	archive_previous_terminal
+done
+test "$(find "$history_dir" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')" = 2
+history_job > "$work/history.json"
+grep -q '"run_id":"run-c"' "$work/history.json"
+grep -q '"run_id":"run-b"' "$work/history.json"
+if grep -q '"run_id":"run-a"' "$work/history.json"; then exit 1; fi
+node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$work/history.json"
+unset CAKE_AUTORATE_AUTOTUNE_HISTORY_RUNS CAKE_AUTORATE_AUTOTUNE_HISTORY_KIB
+
 autotune_profile=best_overall
 if proposal_json_valid 'not-json},"forged":true,{' ; then exit 1; fi
 download_samples=50000,110000
@@ -721,7 +816,7 @@ if proposal_json_valid "$tampered_gaming"; then exit 1; fi
 autotune_profile=fair
 fair_proposal="$(calculate_proposal)"
 proposal_json_valid "$fair_proposal"
-printf '%s\n' "$fair_proposal" | grep -q '"profile":"fair","target_grade":"B"'
+printf '%s\n' "$fair_proposal" | grep -q '"profile":"fair","target_grade":"C","quality_target_required":false,"throughput_priority":true'
 printf '%s\n' "$fair_proposal" | grep -q '"capacity_retention_min_percent":90.0'
 printf '%s\n' "$fair_proposal" | grep -q '"script":"piece_of_cake.qos","classification":"besteffort"'
 autotune_profile=best_overall
@@ -959,7 +1054,7 @@ grep -q '"state":"legacy"' "$work/status-settled.json"
 grep -q '"legacy_result":{"state":"complete"' "$work/status-settled.json"
 grep -q '"auto_apply_eligible":false' "$work/status-settled.json"
 
-printf '%s\n' '{"state":"complete","schema_version":4,"producer":"cake-autorate-rs-autotune","profile":"best_overall"}' > "$result_file"
+printf '%s\n' '{"state":"complete","schema_version":5,"producer":"cake-autorate-rs-autotune","profile":"best_overall"}' > "$result_file"
 status_job > "$work/status-current.json"
 grep -q '"state":"complete"' "$work/status-current.json"
 if grep -q '"state":"legacy"' "$work/status-current.json"; then exit 1; fi
@@ -1082,12 +1177,14 @@ export AUTOTUNE_MOCK_BLOCK_STARTED="$work/timeout-started"
 export AUTOTUNE_MOCK_ORPHAN_PID_FILE="$work/timeout-orphan.pid"
 export CAKE_AUTORATE_AUTOTUNE_SPEEDTEST_TIMEOUT_S=1
 export CAKE_AUTORATE_AUTOTUNE_SPEEDTEST_TERM_GRACE_S=1
-if timeout_output="$(run_speedtest_with_timeout timeoutprobe lo run speedtest-go)"; then
+timeout_result="$job_dir/timeout.result"
+if run_speedtest_with_timeout "$timeout_result" timeoutprobe lo run speedtest-go; then
 	exit 1
 else
 	timeout_rc="$?"
 fi
 test "$timeout_rc" -eq 124
+test ! -e "$timeout_result"
 test -f "$work/timeout-restored"
 orphan_pid="$(sed -n '1p' "$work/timeout-orphan.pid")"
 orphan_wait=0
