@@ -196,6 +196,38 @@ EOF
 wait_for_job_cleanup nonzerojson
 unset AUTOTUNE_MOCK_VALID_JSON_EXIT_CODE AUTOTUNE_MOCK_VALID_JSON_EXIT_AT_COUNT
 
+# A structured speed-test helper error must survive the supervisor boundary.
+# This is the actionable reason shown by Full Auto-Tune instead of a bare
+# helper-exit:1 message.
+: > "$work/counter"
+export AUTOTUNE_MOCK_JSON_ERROR="Managed SQM restore failed: ingress redirect is missing."
+export AUTOTUNE_MOCK_JSON_ERROR_AT_COUNT=1
+export AUTOTUNE_MOCK_JSON_ERROR_EXIT_CODE=9
+"$autotune" helperdetail lo start speedtest-go > "$work/helperdetail-start.json"
+attempt=0
+while [ "$attempt" -lt 220 ]; do
+	"$autotune" helperdetail lo status speedtest-go > "$work/helperdetail-status.json"
+	grep -q 'Managed SQM restore failed' "$work/helperdetail-status.json" && break
+	attempt=$((attempt + 1))
+	sleep 0.05
+done
+node - "$work/helperdetail-status.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (result.state !== 'failed')
+	throw new Error(`expected failed state, received ${result.state}`);
+if (result.speedtest_supervisor.reason !== 'helper-exit:9')
+	throw new Error(`unexpected supervisor reason ${result.speedtest_supervisor.reason}`);
+if (result.speedtest_supervisor.detail !==
+    'Managed SQM restore failed: ingress redirect is missing.')
+	throw new Error(`structured helper detail was lost: ${result.speedtest_supervisor.detail}`);
+if (!result.error.includes('Managed SQM restore failed'))
+	throw new Error(`actionable helper detail was not promoted to the user error: ${result.error}`);
+EOF
+wait_for_job_cleanup helperdetail
+unset AUTOTUNE_MOCK_JSON_ERROR AUTOTUNE_MOCK_JSON_ERROR_AT_COUNT \
+	AUTOTUNE_MOCK_JSON_ERROR_EXIT_CODE
+
 # A helper that silently runs both directions is not valid evidence for either
 # directional candidate, even when it returns positive rates.
 : > "$work/counter"
@@ -818,7 +850,8 @@ fair_proposal="$(calculate_proposal)"
 proposal_json_valid "$fair_proposal"
 printf '%s\n' "$fair_proposal" | grep -q '"profile":"fair","target_grade":"C","quality_target_required":false,"throughput_priority":true'
 printf '%s\n' "$fair_proposal" | grep -q '"capacity_retention_min_percent":90.0'
-printf '%s\n' "$fair_proposal" | grep -q '"script":"piece_of_cake.qos","classification":"besteffort"'
+printf '%s\n' "$fair_proposal" | grep -q '"script":"layer_cake.qos","classification":"diffserv4"'
+printf '%s\n' "$fair_proposal" | grep -q '"iqdisc_opts":"besteffort","eqdisc_opts":"diffserv4"'
 autotune_profile=best_overall
 route_mode=main
 target_if=lo
@@ -1009,6 +1042,10 @@ test "$changed_fingerprint" != "$existing_fingerprint"
 if config_fingerprint_matches; then exit 1; fi
 unset AUTOTUNE_MOCK_UCI_REVISION
 config_fingerprint_captured=false
+export AUTOTUNE_MOCK_RULE_REVISION=1
+changed_rule_fingerprint="$(compute_config_fingerprint)"
+test "$changed_rule_fingerprint" != "$existing_fingerprint"
+unset AUTOTUNE_MOCK_RULE_REVISION
 export AUTOTUNE_MOCK_UCI_MISOWNED=1
 if compute_config_fingerprint >/dev/null; then exit 1; fi
 unset AUTOTUNE_MOCK_UCI_MISOWNED
@@ -1108,8 +1145,8 @@ unset AUTOTUNE_MOCK_QDISC_STATE SQM_STATE_DIR
 unset -f tc uci
 
 # Temporary-shaper creation uses a typed argv contract. Gaming validation must
-# preserve DSCP and exercise diffserv4; throughput profiles must validate the
-# same besteffort+wash policy that they later propose.
+# preserve DSCP and exercise diffserv4; throughput profiles use outbound
+# diffserv4 while retaining the exact best-effort+wash download policy.
 tc() {
 	printf '%s\n' "$*" > "$work/temp-cake.argv"
 }
@@ -1122,7 +1159,7 @@ grep -qx 'qdisc replace dev ifb-test root handle b123: cake bandwidth 806473kbit
 autotune_profile=best_overall
 link_kind=ethernet
 replace_temporary_cake_qdisc lo a123: 806473 upload
-grep -qx 'qdisc replace dev lo root handle a123: cake bandwidth 806473kbit besteffort nat ethernet overhead 18 mpu 64' "$work/temp-cake.argv"
+grep -qx 'qdisc replace dev lo root handle a123: cake bandwidth 806473kbit diffserv4 nat ethernet overhead 18 mpu 64' "$work/temp-cake.argv"
 autotune_profile=fair
 link_kind=cellular
 replace_temporary_cake_qdisc ifb-test b123: 806473 download
@@ -1136,10 +1173,10 @@ tc() {
 	printf '%s\n' "${AUTOTUNE_MOCK_QDISC_STATE:-}"
 }
 autotune_profile=best_overall
-export AUTOTUNE_MOCK_QDISC_STATE='qdisc cake a123: root refcnt 2 bandwidth 806.473Mbit besteffort nat'
+export AUTOTUNE_MOCK_QDISC_STATE='qdisc cake a123: root refcnt 2 bandwidth 806.473Mbit diffserv4 nat'
 exact_root_qdisc lo a123: 806473 upload
 if exact_root_qdisc lo a123: 806472 upload; then exit 1; fi
-export AUTOTUNE_MOCK_QDISC_STATE='qdisc cake a123: root refcnt 2 besteffort nat'
+export AUTOTUNE_MOCK_QDISC_STATE='qdisc cake a123: root refcnt 2 diffserv4 nat'
 if exact_root_qdisc lo a123: 806473 upload; then exit 1; fi
 export AUTOTUNE_MOCK_QDISC_STATE='qdisc cake a123: root refcnt 2 bandwidth 806.473Mbit besteffort nat wash'
 exact_root_qdisc lo a123: 806473 download

@@ -1,0 +1,652 @@
+#!/bin/sh
+
+# Native nftables DSCP classifier owned by cake-autorate-rs. It never creates,
+# changes or removes a qdisc and therefore cannot become a second owner of
+# CAKE or its rates. Rules run for forwarded/router-originated traffic leaving
+# the selected uplink. WAN ingress reaches the SQM IFB before netfilter, so this
+# helper deliberately does not claim to classify download packets retroactively.
+
+action="${1:-status}"
+uci_bin="${CAKE_AUTORATE_UCI_BIN:-uci}"
+nft_bin="${CAKE_AUTORATE_NFT_BIN:-nft}"
+ubus_bin="${CAKE_AUTORATE_UBUS_BIN:-ubus}"
+jsonfilter_bin="${CAKE_AUTORATE_JSONFILTER_BIN:-jsonfilter}"
+sys_class_net="${CAKE_AUTORATE_SYS_CLASS_NET:-/sys/class/net}"
+runtime_dir="${CAKE_AUTORATE_RUNTIME_ROOT:-/var/run/cake-autorate}"
+state_file="${CAKE_AUTORATE_TRAFFIC_CLASSIFIER_STATE:-$runtime_dir/traffic-classifier.state}"
+table_family=inet
+table_name=cake_autorate_dscp
+ruleset_file=""
+batch_file=""
+rule_order_file=""
+state_instances_file=""
+state_work_file=""
+instance_count=0
+custom_rule_count=0
+builtin_rule_count=0
+
+cleanup() {
+	[ -n "$rule_order_file" ] && rm -f "$rule_order_file" 2>/dev/null || true
+	[ -n "$batch_file" ] && rm -f "$batch_file" 2>/dev/null || true
+	[ -n "$state_instances_file" ] && rm -f "$state_instances_file" 2>/dev/null || true
+	[ -n "$state_work_file" ] && rm -f "$state_work_file" 2>/dev/null || true
+	if [ -n "$ruleset_file" ]; then
+		rm -f "$ruleset_file" "$ruleset_file.forward" "$ruleset_file.output" 2>/dev/null || true
+	fi
+}
+trap cleanup EXIT INT TERM HUP
+
+fail() {
+	printf '%s\n' "$*" >&2
+	exit 1
+}
+
+json_escape() {
+	printf '%s' "$1" | awk '
+		BEGIN { ORS = "" }
+		{
+			gsub(/\\/, "\\\\")
+			gsub(/"/, "\\\"")
+			gsub(/\t/, "\\t")
+			gsub(/\r/, "\\r")
+			if (NR > 1) printf "\\n"
+			printf "%s", $0
+		}
+	'
+}
+
+safe_name() {
+	case "$1" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+}
+
+safe_interface() {
+	case "$1" in ''|*[!A-Za-z0-9_.:@-]*) return 1 ;; esac
+}
+
+is_uint() {
+	case "$1" in ''|*[!0-9]*) return 1 ;; esac
+}
+
+is_sha256() {
+	case "$1" in
+		????????????????????????????????????????????????????????????????)
+			case "$1" in *[!0-9a-f]*) return 1 ;; esac
+			;;
+		*) return 1 ;;
+	esac
+}
+
+canonical_profile() {
+	case "$1" in
+		gaming) printf 'gaming\n' ;;
+		best_overall|best-overall|balanced|'') printf 'best_overall\n' ;;
+		fair) printf 'fair\n' ;;
+		*) return 1 ;;
+	esac
+}
+
+resolve_interface_device() {
+	local resolve_name="$1"
+	local resolve_status resolve_device
+	[ -n "$resolve_name" ] || return 1
+	if [ -e "$sys_class_net/$resolve_name" ]; then
+		printf '%s\n' "$resolve_name"
+		return 0
+	fi
+	if [ -x "$ubus_bin" ] && [ -x "$jsonfilter_bin" ]; then
+		resolve_status="$("$ubus_bin" call "network.interface.$resolve_name" status 2>/dev/null || true)"
+		if [ -n "$resolve_status" ]; then
+			resolve_device="$(printf '%s\n' "$resolve_status" |
+				"$jsonfilter_bin" -e '@.l3_device' 2>/dev/null | sed -n '1p')"
+			[ -n "$resolve_device" ] || resolve_device="$(printf '%s\n' "$resolve_status" |
+				"$jsonfilter_bin" -e '@.device' 2>/dev/null | sed -n '1p')"
+			if safe_interface "$resolve_device" && [ -e "$sys_class_net/$resolve_device" ]; then
+				printf '%s\n' "$resolve_device"
+				return 0
+			fi
+		fi
+	fi
+	safe_interface "$resolve_name" || return 1
+	printf '%s\n' "$resolve_name"
+}
+
+validate_ports() {
+	local ports="$1"
+	local old_ifs port_item port_start port_end
+	[ -n "$ports" ] || return 0
+	case "$ports" in *[!0-9,-]*) return 1 ;; esac
+	old_ifs="$IFS"
+	IFS=','
+	set -- $ports
+	IFS="$old_ifs"
+	[ "$#" -ge 1 ] || return 1
+	for port_item in "$@"; do
+		case "$port_item" in
+			*-*)
+				port_start="${port_item%%-*}"
+				port_end="${port_item#*-}"
+				is_uint "$port_start" && is_uint "$port_end" ||
+					return 1
+				[ "$port_start" -ge 1 ] && [ "$port_start" -le 65535 ] &&
+					[ "$port_end" -ge "$port_start" ] && [ "$port_end" -le 65535 ] ||
+					return 1
+				;;
+			*)
+				is_uint "$port_item" && [ "$port_item" -ge 1 ] &&
+					[ "$port_item" -le 65535 ] || return 1
+				;;
+		esac
+	done
+}
+
+network_family() {
+	local network_value="$1"
+	[ -n "$network_value" ] || { printf 'any\n'; return 0; }
+	[ "${#network_value}" -le 64 ] 2>/dev/null || return 1
+	case "$network_value" in
+		*:*/*|*:*) case "$network_value" in *[!0-9A-Fa-f:./]*) return 1 ;; esac; printf 'ipv6\n' ;;
+		*) case "$network_value" in *[!0-9./]*) return 1 ;; esac; printf 'ipv4\n' ;;
+	esac
+}
+
+dscp_for_class() {
+	case "$1" in
+		voice) printf 'cs5\n' ;;
+		video) printf 'af41\n' ;;
+		best_effort) printf 'cs0\n' ;;
+		background) printf 'cs1\n' ;;
+		*) return 1 ;;
+	esac
+}
+
+preset_values() {
+	local preset_name="$1"
+	case "$preset_name" in
+		custom|'') preset_protocol="$rule_protocol"; preset_source_ports="$rule_source_ports"; preset_destination_ports="$rule_destination_ports" ;;
+		dns) preset_protocol=tcp_udp; preset_source_ports=""; preset_destination_ports=53 ;;
+		ntp) preset_protocol=udp; preset_source_ports=""; preset_destination_ports=123 ;;
+		web) preset_protocol=tcp; preset_source_ports=""; preset_destination_ports=80,443 ;;
+		quic) preset_protocol=udp; preset_source_ports=""; preset_destination_ports=443 ;;
+		ssh) preset_protocol=tcp; preset_source_ports=""; preset_destination_ports=22 ;;
+		steam_realtime) preset_protocol=udp; preset_source_ports=""; preset_destination_ports=27000-27100 ;;
+		xbox_live) preset_protocol=udp; preset_source_ports=""; preset_destination_ports=88,3074 ;;
+		playstation) preset_protocol=udp; preset_source_ports=""; preset_destination_ports=3478-3480 ;;
+		wireguard) preset_protocol=udp; preset_source_ports=""; preset_destination_ports=51820 ;;
+		*) return 1 ;;
+	esac
+}
+
+family_compatible() {
+	local requested="$1"
+	local detected="$2"
+	case "$requested:$detected" in
+		any:any|any:ipv4|any:ipv6|ipv4:any|ipv4:ipv4|ipv6:any|ipv6:ipv6) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+emit_one_rule() {
+	local emit_chain="$1"
+	local emit_target="$2"
+	local emit_family="$3"
+	local emit_protocol="$4"
+	local emit_source_ports="$5"
+	local emit_destination_ports="$6"
+	local emit_source_network="$7"
+	local emit_destination_network="$8"
+	local emit_dscp="$9"
+	local emit_file="$ruleset_file.$emit_chain"
+
+	printf '\t\toifname "%s"' "$emit_target" >> "$emit_file"
+	case "$emit_family" in
+		ipv4)
+			[ -z "$emit_source_network" ] || printf ' ip saddr %s' "$emit_source_network" >> "$emit_file"
+			[ -z "$emit_destination_network" ] || printf ' ip daddr %s' "$emit_destination_network" >> "$emit_file"
+			;;
+		ipv6)
+			[ -z "$emit_source_network" ] || printf ' ip6 saddr %s' "$emit_source_network" >> "$emit_file"
+			[ -z "$emit_destination_network" ] || printf ' ip6 daddr %s' "$emit_destination_network" >> "$emit_file"
+			;;
+	esac
+	case "$emit_protocol" in
+		tcp)
+			printf ' meta l4proto tcp' >> "$emit_file"
+			[ -z "$emit_source_ports" ] || printf ' tcp sport { %s }' "$emit_source_ports" >> "$emit_file"
+			[ -z "$emit_destination_ports" ] || printf ' tcp dport { %s }' "$emit_destination_ports" >> "$emit_file"
+			;;
+		udp)
+			printf ' meta l4proto udp' >> "$emit_file"
+			[ -z "$emit_source_ports" ] || printf ' udp sport { %s }' "$emit_source_ports" >> "$emit_file"
+			[ -z "$emit_destination_ports" ] || printf ' udp dport { %s }' "$emit_destination_ports" >> "$emit_file"
+			;;
+		icmp)
+			[ "$emit_family" = ipv4 ] && printf ' meta l4proto icmp' >> "$emit_file" ||
+				printf ' meta l4proto ipv6-icmp' >> "$emit_file"
+			;;
+		any) ;;
+		*) return 1 ;;
+	esac
+	[ "$emit_family" = ipv4 ] &&
+		printf ' ip dscp set %s\n' "$emit_dscp" >> "$emit_file" ||
+		printf ' ip6 dscp set %s\n' "$emit_dscp" >> "$emit_file"
+}
+
+emit_rule() {
+	local emit_target="$1"
+	local emit_family="$2"
+	local emit_protocol="$3"
+	local emit_source_ports="$4"
+	local emit_destination_ports="$5"
+	local emit_source_network="$6"
+	local emit_destination_network="$7"
+	local emit_class="$8"
+	local source_family destination_family emit_dscp emit_chain emit_proto
+
+	case "$emit_family" in any|ipv4|ipv6) ;; *) return 1 ;; esac
+	case "$emit_protocol" in any|tcp|udp|tcp_udp|icmp) ;; *) return 1 ;; esac
+	validate_ports "$emit_source_ports" && validate_ports "$emit_destination_ports" || return 1
+	case "$emit_protocol" in
+		any|icmp) [ -z "$emit_source_ports$emit_destination_ports" ] || return 1 ;;
+	esac
+	source_family="$(network_family "$emit_source_network")" || return 1
+	destination_family="$(network_family "$emit_destination_network")" || return 1
+	family_compatible "$emit_family" "$source_family" &&
+		family_compatible "$emit_family" "$destination_family" || return 1
+	if [ "$source_family" != any ] && [ "$destination_family" != any ] &&
+	   [ "$source_family" != "$destination_family" ]; then
+		return 1
+	fi
+	if [ "$emit_family" = any ]; then
+		if [ "$source_family" != any ]; then
+			emit_family="$source_family"
+		elif [ "$destination_family" != any ]; then
+			emit_family="$destination_family"
+		fi
+	fi
+	emit_dscp="$(dscp_for_class "$emit_class")" || return 1
+	for emit_chain in forward output; do
+		for emit_proto in $(
+			[ "$emit_protocol" = tcp_udp ] && printf 'tcp udp\n' ||
+				printf '%s\n' "$emit_protocol"
+		); do
+			case "$emit_family" in
+				any)
+					emit_one_rule "$emit_chain" "$emit_target" ipv4 "$emit_proto" \
+						"$emit_source_ports" "$emit_destination_ports" \
+						"$emit_source_network" "$emit_destination_network" "$emit_dscp" || return 1
+					emit_one_rule "$emit_chain" "$emit_target" ipv6 "$emit_proto" \
+						"$emit_source_ports" "$emit_destination_ports" \
+						"$emit_source_network" "$emit_destination_network" "$emit_dscp" || return 1
+					;;
+				ipv4|ipv6)
+					emit_one_rule "$emit_chain" "$emit_target" "$emit_family" "$emit_proto" \
+						"$emit_source_ports" "$emit_destination_ports" \
+						"$emit_source_network" "$emit_destination_network" "$emit_dscp" || return 1
+					;;
+			esac
+		done
+	done
+}
+
+emit_builtin() {
+	local builtin_preset="$1"
+	local builtin_class="$2"
+	rule_protocol=""
+	rule_source_ports=""
+	rule_destination_ports=""
+	preset_values "$builtin_preset" || return 1
+	emit_rule "$target" any "$preset_protocol" "$preset_source_ports" \
+		"$preset_destination_ports" "" "" "$builtin_class" || return 1
+	builtin_rule_count=$((builtin_rule_count + 1))
+}
+
+emit_profile_defaults() {
+	case "$profile" in
+		gaming)
+			emit_builtin dns voice &&
+				emit_builtin ntp voice &&
+				emit_builtin web best_effort &&
+				emit_builtin quic best_effort &&
+				emit_builtin steam_realtime voice &&
+				emit_builtin xbox_live voice &&
+				emit_builtin playstation voice
+			;;
+		best_overall)
+			emit_builtin dns voice &&
+				emit_builtin ntp voice &&
+				emit_builtin ssh video &&
+				emit_builtin web best_effort &&
+				emit_builtin quic best_effort
+			;;
+		fair)
+			emit_builtin dns video &&
+				emit_builtin ntp video &&
+				emit_builtin web best_effort &&
+				emit_builtin quic best_effort
+			;;
+		*) return 1 ;;
+	esac
+}
+
+emit_custom_rule() {
+	local rule_section="$1"
+	local rule_enabled rule_instance rule_profile rule_preset rule_protocol
+	local rule_family rule_source_ports rule_destination_ports
+	local rule_source_network rule_destination_network rule_class
+	safe_name "$rule_section" || return 1
+	rule_enabled="$("$uci_bin" -q get "cake-autorate.$rule_section.enabled" 2>/dev/null)"
+	[ "$rule_enabled" = 1 ] || return 0
+	rule_instance="$("$uci_bin" -q get "cake-autorate.$rule_section.instance" 2>/dev/null)"
+	rule_profile="$("$uci_bin" -q get "cake-autorate.$rule_section.profile" 2>/dev/null)"
+	[ "$rule_instance" = "$instance" ] && [ "$(canonical_profile "$rule_profile" 2>/dev/null)" = "$profile" ] ||
+		return 0
+	rule_preset="$("$uci_bin" -q get "cake-autorate.$rule_section.preset" 2>/dev/null)"
+	[ -n "$rule_preset" ] || rule_preset=custom
+	rule_protocol="$("$uci_bin" -q get "cake-autorate.$rule_section.protocol" 2>/dev/null)"
+	[ -n "$rule_protocol" ] || rule_protocol=udp
+	rule_family="$("$uci_bin" -q get "cake-autorate.$rule_section.family" 2>/dev/null)"
+	[ -n "$rule_family" ] || rule_family=any
+	rule_source_ports="$("$uci_bin" -q get "cake-autorate.$rule_section.source_ports" 2>/dev/null)"
+	rule_destination_ports="$("$uci_bin" -q get "cake-autorate.$rule_section.destination_ports" 2>/dev/null)"
+	rule_source_network="$("$uci_bin" -q get "cake-autorate.$rule_section.source_network" 2>/dev/null)"
+	rule_destination_network="$("$uci_bin" -q get "cake-autorate.$rule_section.destination_network" 2>/dev/null)"
+	rule_class="$("$uci_bin" -q get "cake-autorate.$rule_section.class" 2>/dev/null)"
+	[ -n "$rule_class" ] || rule_class=voice
+	preset_values "$rule_preset" ||
+		fail "Traffic rule $rule_section uses an unsupported preset."
+	emit_rule "$target" "$rule_family" "$preset_protocol" "$preset_source_ports" \
+		"$preset_destination_ports" "$rule_source_network" "$rule_destination_network" \
+		"$rule_class" ||
+		fail "Traffic rule $rule_section contains an invalid family, network, protocol, port, or class."
+	custom_rule_count=$((custom_rule_count + 1))
+}
+
+emit_custom_rules() {
+	local candidate candidate_order ordered_rule
+	rule_order_file="$(mktemp "${TMPDIR:-/tmp}/cake-autorate-rules.XXXXXX")" ||
+		fail "Unable to allocate traffic-rule ordering state."
+	chmod 600 "$rule_order_file" 2>/dev/null || true
+	for candidate in $("$uci_bin" -q show cake-autorate 2>/dev/null |
+		sed -n 's/^cake-autorate\.\([A-Za-z0-9_][A-Za-z0-9_]*\)=traffic_rule$/\1/p'); do
+		safe_name "$candidate" || continue
+		candidate_order="$("$uci_bin" -q get "cake-autorate.$candidate.order" 2>/dev/null)"
+		is_uint "$candidate_order" && [ "$candidate_order" -le 9999 ] || candidate_order=500
+		printf '%04d|%s\n' "$candidate_order" "$candidate" >> "$rule_order_file"
+	done
+	for ordered_rule in $(LC_ALL=C sort "$rule_order_file"); do
+		emit_custom_rule "${ordered_rule#*|}"
+	done
+	rm -f "$rule_order_file"
+	rule_order_file=""
+}
+
+render_ruleset() {
+	local requested_ruleset="$1"
+	local instance instance_enabled rules_enabled defaults_option defaults_enabled
+	local manage_sqm sqm_enabled sqm_script sqm_eqdisc_opts
+	local chain_marker fragment seen_targets=""
+	ruleset_file="$requested_ruleset"
+	: > "$ruleset_file" || fail "Unable to create the nftables ruleset."
+	chmod 600 "$ruleset_file" 2>/dev/null || true
+	: > "$ruleset_file.forward"
+	: > "$ruleset_file.output"
+
+	for instance in $("$uci_bin" -q show cake-autorate 2>/dev/null |
+		sed -n 's/^cake-autorate\.\([A-Za-z0-9_][A-Za-z0-9_]*\)=cake_autorate$/\1/p' |
+		LC_ALL=C sort -u); do
+		safe_name "$instance" || continue
+		instance_enabled="$("$uci_bin" -q get "cake-autorate.$instance.enabled" 2>/dev/null)"
+		manage_sqm="$("$uci_bin" -q get "cake-autorate.$instance.manage_sqm" 2>/dev/null)"
+		sqm_enabled="$("$uci_bin" -q get "cake-autorate.$instance.sqm_enabled" 2>/dev/null)"
+		rules_enabled="$("$uci_bin" -q get "cake-autorate.$instance.traffic_rules_enabled" 2>/dev/null)"
+		[ -n "$manage_sqm" ] || manage_sqm=1
+		[ -n "$sqm_enabled" ] || sqm_enabled="$instance_enabled"
+		# This is a new packet-policy feature, so an upgraded instance without
+		# an explicit choice remains untouched until the user opts in.
+		[ -n "$rules_enabled" ] || rules_enabled=0
+		[ "$instance_enabled" = 1 ] && [ "$manage_sqm" = 1 ] &&
+			[ "$sqm_enabled" = 1 ] && [ "$rules_enabled" = 1 ] || continue
+		profile="$(canonical_profile "$("$uci_bin" -q get "cake-autorate.$instance.autotune_profile" 2>/dev/null)")" ||
+			fail "Instance $instance has an unsupported traffic profile."
+		sqm_script="$("$uci_bin" -q get "cake-autorate.$instance.sqm_script" 2>/dev/null)"
+		sqm_eqdisc_opts="$("$uci_bin" -q get "cake-autorate.$instance.sqm_eqdisc_opts" 2>/dev/null)"
+		[ "$sqm_script" = layer_cake.qos ] || continue
+		case " $sqm_eqdisc_opts " in
+			*" diffserv4 "*) ;;
+			*) continue ;;
+		esac
+		target="$("$uci_bin" -q get "cake-autorate.$instance.wan_if" 2>/dev/null)"
+		[ -n "$target" ] || target="$("$uci_bin" -q get "cake-autorate.$instance.sqm_interface" 2>/dev/null)"
+		[ -n "$target" ] || target="$("$uci_bin" -q get "cake-autorate.$instance.ul_if" 2>/dev/null)"
+		target="$(resolve_interface_device "$target")" ||
+			fail "Unable to resolve the traffic-rule uplink for $instance."
+		safe_interface "$target" || fail "Instance $instance has an unsafe traffic-rule uplink."
+		case "|$seen_targets|" in
+			*"|$target|"*)
+				fail "Multiple enabled instances claim the same traffic-rule uplink $target."
+				;;
+		esac
+		seen_targets="${seen_targets:+$seen_targets|}$target"
+		instance_count=$((instance_count + 1))
+		if [ -n "$state_instances_file" ]; then
+			printf '%s|%s|%s\n' "$instance" "$target" "$profile" >> "$state_instances_file" ||
+				fail "Unable to record the traffic-rule instance manifest."
+		fi
+
+		for chain_marker in forward output; do
+			fragment="$ruleset_file.$chain_marker"
+			printf '\t\toifname "%s" ip dscp set cs0\n' "$target" >> "$fragment"
+			printf '\t\toifname "%s" ip6 dscp set cs0\n' "$target" >> "$fragment"
+		done
+		defaults_option="traffic_defaults_$profile"
+		defaults_enabled="$("$uci_bin" -q get "cake-autorate.$instance.$defaults_option" 2>/dev/null)"
+		[ -n "$defaults_enabled" ] || defaults_enabled=1
+		[ "$defaults_enabled" = 1 ] && emit_profile_defaults
+		emit_custom_rules
+	done
+
+	{
+		printf 'table inet %s {\n' "$table_name"
+		printf '\tchain forward {\n\t\ttype filter hook forward priority -140; policy accept;\n'
+		cat "$ruleset_file.forward"
+		printf '\t}\n\tchain output {\n\t\ttype route hook output priority -140; policy accept;\n'
+		cat "$ruleset_file.output"
+		printf '\t}\n}\n'
+	} > "$ruleset_file" || fail "Unable to assemble the nftables traffic rules."
+	rm -f "$ruleset_file.forward" "$ruleset_file.output"
+}
+
+table_present() {
+	"$nft_bin" list table "$table_family" "$table_name" >/dev/null 2>&1
+}
+
+ruleset_digest() {
+	local digest_input digest
+	digest_input="$("$nft_bin" -j list table "$table_family" "$table_name" 2>/dev/null)" ||
+		return 1
+	[ -n "$digest_input" ] || return 1
+	digest="$(printf '%s\n' "$digest_input" | sha256sum 2>/dev/null |
+		awk 'NR == 1 { print $1; exit }')"
+	is_sha256 "$digest" || return 1
+	printf '%s\n' "$digest"
+}
+
+remove_state_file() {
+	[ ! -e "$state_file" ] && [ ! -L "$state_file" ] || rm -f "$state_file" 2>/dev/null ||
+		fail "Unable to remove stale traffic-classifier state."
+}
+
+prepare_runtime_dir() {
+	[ ! -L "$runtime_dir" ] || fail "Refusing to use a symlinked traffic-classifier runtime directory."
+	mkdir -p "$runtime_dir" 2>/dev/null ||
+		fail "Unable to create the traffic-classifier runtime directory."
+	[ -d "$runtime_dir" ] || fail "The traffic-classifier runtime path is not a directory."
+}
+
+load_manifest() {
+	local requested_instance="${1:-}"
+	local line line_number=0 manifest_schema="" manifest_recorded_digest=""
+	local manifest_instance manifest_target manifest_profile manifest_extra
+	local seen_instances=""
+
+	manifest_valid=0
+	manifest_found=0
+	manifest_count=0
+	manifest_target_value=""
+	manifest_profile_value=""
+	manifest_digest_value=""
+	manifest_serialized=""
+	[ -f "$state_file" ] && [ ! -L "$state_file" ] || return 1
+
+	while IFS= read -r line || [ -n "$line" ]; do
+		line_number=$((line_number + 1))
+		case "$line_number" in
+			1) manifest_schema="${line#schema_version=}"
+				[ "$line" = "schema_version=$manifest_schema" ] &&
+					[ "$manifest_schema" = 2 ] || return 1
+				;;
+			2) manifest_recorded_digest="${line#ruleset_sha256=}"
+				[ "$line" = "ruleset_sha256=$manifest_recorded_digest" ] &&
+					is_sha256 "$manifest_recorded_digest" || return 1
+				;;
+			*)
+				old_ifs="$IFS"
+				IFS='|'
+				read -r manifest_instance manifest_target manifest_profile manifest_extra <<EOF
+$line
+EOF
+				IFS="$old_ifs"
+				[ -z "$manifest_extra" ] &&
+					safe_name "$manifest_instance" &&
+					safe_interface "$manifest_target" &&
+					[ "$(canonical_profile "$manifest_profile" 2>/dev/null)" = "$manifest_profile" ] ||
+					return 1
+				case "|$seen_instances|" in *"|$manifest_instance|"*) return 1 ;; esac
+				seen_instances="${seen_instances:+$seen_instances|}$manifest_instance"
+				manifest_count=$((manifest_count + 1))
+				manifest_serialized="${manifest_serialized:+$manifest_serialized;}$manifest_instance|$manifest_target|$manifest_profile"
+				if [ -n "$requested_instance" ] &&
+				   [ "$manifest_instance" = "$requested_instance" ]; then
+					manifest_found=1
+					manifest_target_value="$manifest_target"
+					manifest_profile_value="$manifest_profile"
+				fi
+				;;
+		esac
+	done < "$state_file"
+	[ "$line_number" -ge 3 ] && [ "$manifest_count" -ge 1 ] || return 1
+	manifest_digest_value="$manifest_recorded_digest"
+	manifest_valid=1
+	return 0
+}
+
+clear_table() {
+	if table_present; then
+		"$nft_bin" delete table "$table_family" "$table_name" >/dev/null 2>&1 ||
+			fail "Unable to remove the cake-autorate-rs DSCP table."
+	fi
+}
+
+case "$action" in
+	render)
+		ruleset_file="$(mktemp "${TMPDIR:-/tmp}/cake-autorate-dscp.XXXXXX")" ||
+			fail "Unable to allocate the nftables ruleset."
+		render_ruleset "$ruleset_file"
+		cat "$ruleset_file"
+		;;
+	apply)
+		command -v "$nft_bin" >/dev/null 2>&1 ||
+			fail "nft is unavailable; traffic-priority rules were not applied."
+		prepare_runtime_dir
+		ruleset_file="$(mktemp "${TMPDIR:-/tmp}/cake-autorate-dscp.XXXXXX")" ||
+			fail "Unable to allocate the nftables ruleset."
+		state_instances_file="$(mktemp "$runtime_dir/.traffic-classifier-instances.XXXXXX")" ||
+			fail "Unable to allocate the traffic-classifier instance manifest."
+		chmod 600 "$state_instances_file" 2>/dev/null || true
+		render_ruleset "$ruleset_file"
+		if [ "$instance_count" -eq 0 ]; then
+			clear_table
+			remove_state_file
+			printf '{"state":"inactive","schema_version":2,"instances":0,"builtin_rules":0,"custom_rules":0}\n'
+			exit 0
+		fi
+		batch_file="$ruleset_file.batch"
+		: > "$batch_file" || fail "Unable to create the nftables apply batch."
+		table_present && printf 'delete table %s %s\n' "$table_family" "$table_name" >> "$batch_file"
+		cat "$ruleset_file" >> "$batch_file"
+		"$nft_bin" -c -f "$batch_file" >/dev/null 2>&1 ||
+			fail "The generated nftables traffic-priority rules failed validation."
+		"$nft_bin" -f "$batch_file" >/dev/null 2>&1 ||
+			fail "Unable to apply the validated nftables traffic-priority rules."
+		applied_digest="$(ruleset_digest)" || {
+			clear_table
+			remove_state_file
+			fail "Applied traffic-priority rules could not be attested; the private table was removed."
+		}
+		state_work_file="$(mktemp "$runtime_dir/.traffic-classifier-state.XXXXXX")" || {
+			clear_table
+			remove_state_file
+			fail "Unable to allocate attested traffic-classifier state."
+		}
+		chmod 600 "$state_work_file" 2>/dev/null || true
+		{
+			printf 'schema_version=2\n'
+			printf 'ruleset_sha256=%s\n' "$applied_digest"
+			cat "$state_instances_file"
+		} > "$state_work_file" || {
+			clear_table
+			remove_state_file
+			fail "Unable to assemble attested traffic-classifier state."
+		}
+		mv -f "$state_work_file" "$state_file" || {
+			clear_table
+			remove_state_file
+			fail "Unable to publish attested traffic-classifier state."
+		}
+		state_work_file=""
+		printf '{"state":"active","schema_version":2,"instances":%s,"builtin_rules":%s,"custom_rules":%s,"ruleset_sha256":"%s"}\n' \
+			"$instance_count" "$builtin_rule_count" "$custom_rule_count" "$applied_digest"
+		rm -f "$batch_file"
+		batch_file=""
+		;;
+	clear)
+		command -v "$nft_bin" >/dev/null 2>&1 || exit 0
+		clear_table
+		remove_state_file
+		printf '{"state":"inactive","schema_version":2}\n'
+		;;
+	status)
+		requested_instance="${2:-}"
+		[ -z "$requested_instance" ] || safe_name "$requested_instance" ||
+			fail "The requested traffic-classifier instance name is unsafe."
+		if ! command -v "$nft_bin" >/dev/null 2>&1; then
+			printf '{"state":"unavailable","schema_version":2,"table_present":false,"table":"inet %s"}\n' "$table_name"
+		elif ! table_present; then
+			printf '{"state":"inactive","schema_version":2,"table_present":false,"table":"inet %s","stale_manifest":%s}\n' \
+				"$table_name" "$([ -e "$state_file" ] || [ -L "$state_file" ] && printf true || printf false)"
+		elif ! load_manifest "$requested_instance"; then
+			printf '{"state":"untracked","schema_version":2,"table_present":true,"table":"inet %s"}\n' "$table_name"
+		else
+			actual_digest="$(ruleset_digest 2>/dev/null || true)"
+			if [ "$actual_digest" != "$manifest_digest_value" ]; then
+				printf '{"state":"drifted","schema_version":2,"table_present":true,"table":"inet %s","instances":%s}\n' \
+					"$table_name" "$manifest_count"
+			elif [ -n "$requested_instance" ] && [ "$manifest_found" != 1 ]; then
+				printf '{"state":"missing","schema_version":2,"table_present":true,"table":"inet %s","instance":"%s"}\n' \
+					"$table_name" "$(json_escape "$requested_instance")"
+			elif [ -n "$requested_instance" ]; then
+				printf '{"state":"active","schema_version":2,"table_present":true,"table":"inet %s","instance":"%s","target":"%s","profile":"%s","ruleset_sha256":"%s"}\n' \
+					"$table_name" "$(json_escape "$requested_instance")" \
+					"$(json_escape "$manifest_target_value")" \
+					"$(json_escape "$manifest_profile_value")" "$manifest_digest_value"
+			else
+				printf '{"state":"active","schema_version":2,"table_present":true,"table":"inet %s","instances":%s,"attested_instances":"%s","ruleset_sha256":"%s"}\n' \
+					"$table_name" "$manifest_count" "$(json_escape "$manifest_serialized")" \
+					"$manifest_digest_value"
+			fi
+		fi
+		;;
+	*)
+		fail "usage: traffic-classifier render|apply|clear|status"
+		;;
+esac

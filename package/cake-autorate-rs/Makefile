@@ -3,7 +3,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=cake-autorate-rs
-PKG_VERSION:=1.0_rc19
+PKG_VERSION:=1.0_rc20
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=woffko
@@ -21,7 +21,7 @@ define Package/cake-autorate-rs
   TITLE:=Rust daemon for adaptive CAKE bandwidth control
   URL:=https://github.com/woffko/cake-autorate-rs-owrt
   MAINTAINER:=woffko
-  DEPENDS:=$(RUST_ARCH_DEPENDS) +uci +fping +uclient-fetch +sqm-scripts
+  DEPENDS:=$(RUST_ARCH_DEPENDS) +uci +fping +uclient-fetch +sqm-scripts +nftables-json
 endef
 
 define Package/cake-autorate-rs/description
@@ -63,6 +63,7 @@ define Package/cake-autorate-rs/install
 	$(INSTALL_BIN) ./files/usr/libexec/cake-autorate-rs/sqm-recover $(1)/usr/libexec/cake-autorate-rs/sqm-recover
 	$(INSTALL_BIN) ./files/usr/libexec/cake-autorate-rs/runtime-lock $(1)/usr/libexec/cake-autorate-rs/runtime-lock
 	$(INSTALL_BIN) ./files/usr/libexec/cake-autorate-rs/cpu-profile $(1)/usr/libexec/cake-autorate-rs/cpu-profile
+	$(INSTALL_BIN) ./files/usr/libexec/cake-autorate-rs/traffic-classifier $(1)/usr/libexec/cake-autorate-rs/traffic-classifier
 endef
 
 $(eval $(call BuildPackage,cake-autorate-rs))

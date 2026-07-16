@@ -16,6 +16,9 @@ case "$expression" in
 			}
 		'
 		;;
+	'@.error')
+		printf '%s\n' "$input" | sed -n 's/.*"error":"\([^"]*\)".*/\1/p'
+		;;
 	'@.schema_version')
 		printf '%s\n' "$input" | awk -F '"schema_version":' '
 			NF > 1 {

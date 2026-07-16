@@ -192,11 +192,34 @@ configuration_fingerprint() {
 		rm -f "$fingerprint_cake_raw" "$fingerprint_cake_sorted" "$fingerprint_sqm_raw"
 		return 1
 	}
+	fingerprint_rules_raw="$(mktemp "$state_root/.fingerprint-rules.XXXXXX")" || {
+		rm -f "$fingerprint_cake_raw" "$fingerprint_cake_sorted" \
+			"$fingerprint_sqm_raw" "$fingerprint_sqm_sorted"
+		return 1
+	}
+	fingerprint_rules_sorted="$(mktemp "$state_root/.fingerprint-rules-sorted.XXXXXX")" || {
+		rm -f "$fingerprint_cake_raw" "$fingerprint_cake_sorted" \
+			"$fingerprint_sqm_raw" "$fingerprint_sqm_sorted" "$fingerprint_rules_raw"
+		return 1
+	}
+	for fingerprint_rule_section in $(uci -q show cake-autorate 2>/dev/null |
+		sed -n 's/^cake-autorate\.\([A-Za-z0-9_][A-Za-z0-9_]*\)=traffic_rule$/\1/p' |
+		LC_ALL=C sort -u); do
+		safe_uci_section "$fingerprint_rule_section" || return 1
+		[ "$(uci -q get "cake-autorate.$fingerprint_rule_section.instance" 2>/dev/null)" = "$fingerprint_section" ] ||
+			continue
+		uci -q show "cake-autorate.$fingerprint_rule_section" >> "$fingerprint_rules_raw" 2>/dev/null ||
+			return 1
+	done
+	[ -s "$fingerprint_rules_raw" ] || printf '<none>\n' > "$fingerprint_rules_raw"
 	if ! uci -q show "cake-autorate.$fingerprint_section" > "$fingerprint_cake_raw" ||
 	   ! LC_ALL=C sort "$fingerprint_cake_raw" > "$fingerprint_cake_sorted" ||
 	   ! uci -q show "sqm.$fingerprint_sqm_section" > "$fingerprint_sqm_raw" ||
-	   ! LC_ALL=C sort "$fingerprint_sqm_raw" > "$fingerprint_sqm_sorted"; then
-		rm -f "$fingerprint_cake_raw" "$fingerprint_cake_sorted" "$fingerprint_sqm_raw" "$fingerprint_sqm_sorted"
+	   ! LC_ALL=C sort "$fingerprint_sqm_raw" > "$fingerprint_sqm_sorted" ||
+	   ! LC_ALL=C sort "$fingerprint_rules_raw" > "$fingerprint_rules_sorted"; then
+		rm -f "$fingerprint_cake_raw" "$fingerprint_cake_sorted" \
+			"$fingerprint_sqm_raw" "$fingerprint_sqm_sorted" \
+			"$fingerprint_rules_raw" "$fingerprint_rules_sorted"
 		return 1
 	fi
 	fingerprint_digest="$({
@@ -204,8 +227,12 @@ configuration_fingerprint() {
 		cat "$fingerprint_cake_sorted"
 		printf 'sqm:%s\n' "$fingerprint_sqm_section"
 		cat "$fingerprint_sqm_sorted"
+		printf 'traffic-rules:%s\n' "$fingerprint_section"
+		cat "$fingerprint_rules_sorted"
 	} | sha256sum 2>/dev/null | awk 'NR == 1 { print $1 }')"
-	rm -f "$fingerprint_cake_raw" "$fingerprint_cake_sorted" "$fingerprint_sqm_raw" "$fingerprint_sqm_sorted"
+	rm -f "$fingerprint_cake_raw" "$fingerprint_cake_sorted" \
+		"$fingerprint_sqm_raw" "$fingerprint_sqm_sorted" \
+		"$fingerprint_rules_raw" "$fingerprint_rules_sorted"
 	[ "${#fingerprint_digest}" -eq 64 ] 2>/dev/null || return 1
 	case "$fingerprint_digest" in *[!0-9a-f]*) return 1 ;; esac
 	printf 'sha256:%s\n' "$fingerprint_digest"
@@ -508,12 +535,12 @@ result_proposal_is_safe() {
 	esac
 	case "$result_profile" in
 		best_overall|fair)
-			[ "$sqm_script" = piece_of_cake.qos ] &&
-				[ "$sqm_classification" = besteffort ] &&
+			[ "$sqm_script" = layer_cake.qos ] &&
+				[ "$sqm_classification" = diffserv4 ] &&
 				[ "$sqm_squash_dscp" = true ] &&
 				[ "$sqm_squash_ingress" = true ] &&
-				[ -z "$sqm_iqdisc_opts" ] &&
-				[ -z "$sqm_eqdisc_opts" ] || return 1
+				[ "$sqm_iqdisc_opts" = besteffort ] &&
+				[ "$sqm_eqdisc_opts" = diffserv4 ] || return 1
 			;;
 	esac
 }
@@ -1019,17 +1046,10 @@ apply_result() (
 		"$([ "$sqm_squash_ingress" = true ] && printf 1 || printf 0)" || exit 1
 	stage_candidate_option sqm_ingress_ecn "$sqm_ingress_ecn" || exit 1
 	stage_candidate_option sqm_egress_ecn "$sqm_egress_ecn" || exit 1
-	if [ "$profile" = gaming ]; then
-		stage_candidate_option sqm_qdisc_advanced 1 || exit 1
-		stage_candidate_option sqm_qdisc_really_really_advanced 1 || exit 1
-		stage_candidate_option sqm_iqdisc_opts "$sqm_iqdisc_opts" || exit 1
-		stage_candidate_option sqm_eqdisc_opts "$sqm_eqdisc_opts" || exit 1
-	else
-		stage_candidate_option sqm_qdisc_advanced 0 || exit 1
-		stage_candidate_option sqm_qdisc_really_really_advanced 0 || exit 1
-		stage_candidate_absent_option sqm_iqdisc_opts || exit 1
-		stage_candidate_absent_option sqm_eqdisc_opts || exit 1
-	fi
+	stage_candidate_option sqm_qdisc_advanced 1 || exit 1
+	stage_candidate_option sqm_qdisc_really_really_advanced 1 || exit 1
+	stage_candidate_option sqm_iqdisc_opts "$sqm_iqdisc_opts" || exit 1
+	stage_candidate_option sqm_eqdisc_opts "$sqm_eqdisc_opts" || exit 1
 
 	# The proposal may have spent many seconds in extraction/staging.  Repeat
 	# every trust check at the last possible point before the private UCI delta

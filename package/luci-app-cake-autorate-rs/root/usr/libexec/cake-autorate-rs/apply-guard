@@ -8,6 +8,7 @@ mode="${1:-verify-init}"
 shift 2>/dev/null || true
 
 guard_root="${CAKE_AUTORATE_APPLY_GUARD_DIR:-/tmp/cake-autorate-apply-guard}"
+receipt_root="${CAKE_AUTORATE_APPLY_RECEIPT_DIR:-/tmp/cake-autorate-apply-receipts}"
 config_dir="${CAKE_AUTORATE_CONFIG_DIR:-/etc/config}"
 autotune_root="${CAKE_AUTORATE_AUTOTUNE_DIR:-/tmp/cake-autorate-autotune}"
 autotune_bin="${CAKE_AUTORATE_AUTOTUNE:-/usr/libexec/cake-autorate-rs/autotune}"
@@ -19,7 +20,10 @@ tc_bin="${CAKE_AUTORATE_TC:-$(command -v tc 2>/dev/null)}"
 sys_class_net="${CAKE_AUTORATE_SYS_CLASS_NET:-/sys/class/net}"
 proc_root="${CAKE_AUTORATE_PROC_ROOT:-/proc}"
 sqm_init="${CAKE_AUTORATE_SQM_INIT:-/etc/init.d/sqm}"
+ubus_bin="${CAKE_AUTORATE_UBUS:-$(command -v ubus 2>/dev/null)}"
+boot_id_file="${CAKE_AUTORATE_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
 token_ttl_s="${CAKE_AUTORATE_APPLY_GUARD_TTL_S:-180}"
+rollback_timeout_s="${CAKE_AUTORATE_APPLY_ROLLBACK_TIMEOUT_S:-30}"
 postcheck_wait_s="${CAKE_AUTORATE_APPLY_GUARD_POSTCHECK_WAIT_S:-15}"
 orphan_age_s="${CAKE_AUTORATE_APPLY_GUARD_ORPHAN_AGE_S:-900}"
 autotune_result_producer="cake-autorate-rs-autotune"
@@ -35,6 +39,11 @@ die() {
 	if [ -n "${arm_cleanup_dir:-}" ] && [ -d "$arm_cleanup_dir" ] && [ ! -L "$arm_cleanup_dir" ]; then
 		cleanup_token_dir "$arm_cleanup_dir" >/dev/null 2>&1 || true
 		arm_cleanup_dir=""
+	fi
+	if [ -n "${recovery_cleanup_dir:-}" ] && [ -d "$recovery_cleanup_dir" ] && [ ! -L "$recovery_cleanup_dir" ]; then
+		find "$recovery_cleanup_dir" -type f -exec rm -f {} \; 2>/dev/null || true
+		find "$recovery_cleanup_dir" -depth -type d -exec rmdir {} \; 2>/dev/null || true
+		recovery_cleanup_dir=""
 	fi
 	printf '{"state":"failed","error":"%s"}\n' "$(json_escape "$error_message")"
 	exit 1
@@ -68,6 +77,23 @@ safe_fingerprint() {
 			;;
 		*) return 1 ;;
 	esac
+}
+
+safe_boot_id() {
+	case "$1" in
+		????????-????-????-????-????????????)
+			boot_id_hex="$(printf '%s' "$1" | tr -d '-')"
+			case "$boot_id_hex" in *[!0-9A-Fa-f]*) return 1 ;; esac
+			;;
+		*) return 1 ;;
+	esac
+}
+
+current_boot_id() {
+	[ -f "$boot_id_file" ] && [ ! -L "$boot_id_file" ] || return 1
+	boot_id="$(sed -n '1p' "$boot_id_file" 2>/dev/null)"
+	safe_boot_id "$boot_id" || return 1
+	printf '%s\n' "$boot_id" | tr 'A-F' 'a-f'
 }
 
 is_uint() {
@@ -133,6 +159,47 @@ require_secure_directory() {
 
 prepare_root() {
 	secure_directory "$guard_root" || die "The Full Auto-Tune apply guard directory is unsafe or not tmpfs-backed."
+}
+
+prepare_receipt_root() {
+	local receipt_count receipt_candidate receipt_name receipt_token
+
+	secure_directory "$receipt_root" ||
+		die "The Full Auto-Tune apply receipt directory is unsafe or not tmpfs-backed."
+	receipt_count=0
+	for receipt_candidate in "$receipt_root"/*.json; do
+		[ -e "$receipt_candidate" ] || continue
+		owned_regular "$receipt_candidate" || die "A Full Auto-Tune apply receipt is unsafe."
+		receipt_name="${receipt_candidate##*/}"
+		receipt_token="${receipt_name%.json}"
+		safe_token "$receipt_token" || die "A Full Auto-Tune apply receipt has an unsafe name."
+		if find "$receipt_candidate" -prune -mmin +1440 -print 2>/dev/null | grep -q .; then
+			rm -f "$receipt_candidate" || die "Unable to remove an expired Full Auto-Tune apply receipt."
+			continue
+		fi
+		receipt_count=$((receipt_count + 1))
+		[ "$receipt_count" -lt 32 ] || die "Too many Full Auto-Tune apply receipts exist."
+	done
+}
+
+write_receipt() {
+	local receipt_token="$1"
+	local receipt_state="$2"
+	local receipt_message="${3:-}"
+	local receipt_tmp receipt_path
+	safe_token "$receipt_token" || die "Unable to write a receipt for an unsafe Full Auto-Tune token."
+	case "$receipt_state" in complete|rolled-back|failed|indeterminate) ;; *) die "Invalid Full Auto-Tune receipt state." ;; esac
+	prepare_receipt_root
+	receipt_tmp="$receipt_root/.$receipt_token.$$"
+	receipt_path="$receipt_root/$receipt_token.json"
+	[ ! -L "$receipt_path" ] || die "The Full Auto-Tune apply receipt destination is unsafe."
+	printf '{"state":"%s","schema_version":1,"token":"%s","message":"%s"}\n' \
+		"$receipt_state" "$receipt_token" "$(json_escape "$receipt_message")" > "$receipt_tmp" ||
+		die "Unable to write the Full Auto-Tune apply receipt."
+	chmod 600 "$receipt_tmp" || die "Unable to protect the Full Auto-Tune apply receipt."
+	owned_regular "$receipt_tmp" || die "The temporary Full Auto-Tune apply receipt is unsafe."
+	mv "$receipt_tmp" "$receipt_path" || die "Unable to publish the Full Auto-Tune apply receipt."
+	owned_regular "$receipt_path" || die "The published Full Auto-Tune apply receipt is unsafe."
 }
 
 token_live_referenced() {
@@ -501,8 +568,8 @@ load_profile_contract() {
 				numbers_equal "$validation_transport" 30 &&
 				numbers_equal "$validation_loss" 3 ||
 				die "The Best overall profile policy is invalid."
-			sqm_qdisc_advanced=0
-			sqm_qdisc_really_really_advanced=0
+			sqm_qdisc_advanced=1
+			sqm_qdisc_really_really_advanced=1
 			;;
 		fair)
 			[ "$target_grade" = C ] &&
@@ -512,8 +579,8 @@ load_profile_contract() {
 				numbers_equal "$validation_transport" 200 &&
 				numbers_equal "$validation_loss" 5 ||
 				die "The Fair profile policy is invalid."
-			sqm_qdisc_advanced=0
-			sqm_qdisc_really_really_advanced=0
+			sqm_qdisc_advanced=1
+			sqm_qdisc_really_really_advanced=1
 			;;
 		*)
 			die "The Full Auto-Tune profile is unsupported."
@@ -521,13 +588,13 @@ load_profile_contract() {
 	esac
 	case "$profile" in
 		best_overall|fair)
-			[ "$sqm_script" = piece_of_cake.qos ] &&
-				[ "$sqm_classification" = besteffort ] &&
+			[ "$sqm_script" = layer_cake.qos ] &&
+				[ "$sqm_classification" = diffserv4 ] &&
 				[ "$sqm_squash_dscp" = true ] &&
 				[ "$sqm_squash_ingress" = true ] &&
-				[ -z "$sqm_iqdisc_opts" ] &&
-				[ -z "$sqm_eqdisc_opts" ] ||
-				die "The best-effort CAKE profile policy is invalid."
+				[ "$sqm_iqdisc_opts" = besteffort ] &&
+				[ "$sqm_eqdisc_opts" = diffserv4 ] ||
+				die "The outbound diffserv4 CAKE profile policy is invalid."
 			;;
 	esac
 	[ "$sqm_squash_dscp" = true ] && sqm_squash_dscp_value=1 || sqm_squash_dscp_value=0
@@ -547,6 +614,7 @@ write_expected_apply_markers() {
 	shift 9
 	marker_token="$1"
 	marker_expires="$2"
+	marker_boot_id="$3"
 
 	expected_set "$marker_job" _autotune_apply_guard 1
 	expected_set "$marker_job" _autotune_apply_fingerprint "$marker_fingerprint"
@@ -563,6 +631,7 @@ write_expected_apply_markers() {
 	expected_set "$marker_job" _autotune_apply_action "$marker_action"
 	expected_set "$marker_job" _autotune_apply_token "$marker_token"
 	expected_set "$marker_job" _autotune_apply_expires "$marker_expires"
+	expected_set "$marker_job" _autotune_apply_boot_id "$marker_boot_id"
 }
 
 build_expected_manifest() {
@@ -577,6 +646,7 @@ build_expected_manifest() {
 	token="$9"
 	shift 9
 	expires="$1"
+	boot_id="$2"
 
 	sqm_section="$(original_get "$job" sqm_section "cake_$job")"
 	safe_job "$sqm_section" || die "The managed SQM section name is unsafe."
@@ -599,7 +669,7 @@ build_expected_manifest() {
 		expected_set "$job" enabled 0
 		expected_set "$job" sqm_enabled 0
 		write_expected_apply_markers "$job" "$target" "$backend" "$route_mode" "$member" \
-			0 "$disable_adaptive" "$action" "$fingerprint" "$token" "$expires"
+			0 "$disable_adaptive" "$action" "$fingerprint" "$token" "$expires" "$boot_id"
 		uci_at "$token_dir/expected" -q commit cake-autorate || return 1
 		uci_at "$token_dir/expected" -q get "sqm.$sqm_section" >/dev/null 2>&1 ||
 			die "The managed SQM queue disappeared before it could be disabled."
@@ -788,7 +858,7 @@ build_expected_manifest() {
 	expected_set "$job" sqm_tcMPU "$mpu"
 
 	write_expected_apply_markers "$job" "$target" "$run_backend" "$route_mode" "$member" \
-		"$enabled" "$disable_adaptive" "$action" "$fingerprint" "$token" "$expires"
+		"$enabled" "$disable_adaptive" "$action" "$fingerprint" "$token" "$expires" "$boot_id"
 	uci_at "$token_dir/expected" -q commit cake-autorate || return 1
 
 	# Construct the exact managed queue which init must materialize.  This is
@@ -841,7 +911,7 @@ build_expected_final_manifest() {
 	for final_option in _autotune_apply_guard _autotune_apply_fingerprint _autotune_apply_target \
 		_autotune_apply_backend _autotune_apply_route_mode _autotune_apply_mwan3_member \
 		_autotune_apply_enabled _autotune_apply_disable_adaptive _autotune_apply_action _autotune_apply_token \
-		_autotune_apply_expires; do
+		_autotune_apply_expires _autotune_apply_boot_id; do
 		if uci_at "$token_dir/expected-final" -q get "cake-autorate.$job.$final_option" >/dev/null 2>&1; then
 			uci_at "$token_dir/expected-final" -q delete "cake-autorate.$job.$final_option" || return 1
 		fi
@@ -918,6 +988,8 @@ arm_guard() {
 	esac
 	safe_fingerprint "$fingerprint" || die "Invalid Full Auto-Tune result fingerprint."
 	is_uint "$token_ttl_s" && [ "$token_ttl_s" -ge 30 ] && [ "$token_ttl_s" -le 900 ] || die "Invalid apply-guard TTL."
+	is_uint "$rollback_timeout_s" && [ "$rollback_timeout_s" -ge 10 ] && [ "$rollback_timeout_s" -le 120 ] ||
+		die "Invalid apply rollback timeout."
 	is_uint "$orphan_age_s" && [ "$orphan_age_s" -ge 60 ] && [ "$orphan_age_s" -le 86400 ] || die "Invalid abandoned-token GC age."
 	prepare_root
 	guard_capacity_check || die "Too many unsafe or abandoned Full Auto-Tune apply tokens exist."
@@ -1068,8 +1140,9 @@ arm_guard() {
 	now="$(date +%s)"
 	is_uint "$now" || die "Unable to establish the apply-token clock."
 	expires=$((now + token_ttl_s))
+	boot_id="$(current_boot_id)" || die "Unable to establish the current boot identity."
 	original_daemon_identity="$(daemon_identity "$job")" || die "Unable to snapshot the pre-apply daemon generation."
-	build_expected_manifest "$job" "$target" "$route_mode" "$member" "$enabled" "$disable_adaptive" "$action" "$fingerprint" "$token" "$expires" ||
+	build_expected_manifest "$job" "$target" "$route_mode" "$member" "$enabled" "$disable_adaptive" "$action" "$fingerprint" "$token" "$expires" "$boot_id" ||
 		die "Unable to build the exact Full Auto-Tune apply manifest."
 	build_expected_final_manifest || die "Unable to build the marker-free Full Auto-Tune terminal manifest."
 	expected_cake_fingerprint="$(snapshot_fingerprint "$token_dir/expected" cake-autorate)" || die "Unable to hash the expected CAKE manifest."
@@ -1080,7 +1153,7 @@ arm_guard() {
 	original_cake_fingerprint="$(snapshot_fingerprint "$token_dir/original" cake-autorate)" || die "Unable to hash the original CAKE snapshot."
 	original_sqm_fingerprint="$(snapshot_fingerprint "$token_dir/original" sqm)" || die "Unable to hash the original SQM snapshot."
 	{
-		printf 'version=1\n'
+		printf 'version=2\n'
 		printf 'job=%s\n' "$job"
 		printf 'target=%s\n' "$target"
 		printf 'backend=%s\n' "$backend"
@@ -1103,11 +1176,13 @@ arm_guard() {
 		printf 'external_ip=%s\n' "$(json_get "$result_copy" '@.external_ip')"
 		printf 'route_identity=%s\n' "$(json_get "$result_copy" '@.route_identity')"
 		printf 'expires_epoch=%s\n' "$expires"
+		printf 'boot_id=%s\n' "$boot_id"
+		printf 'rollback_timeout_s=%s\n' "$rollback_timeout_s"
 	} > "$token_dir/meta" || die "Unable to write the Full Auto-Tune token metadata."
 	chmod 600 "$token_dir/meta" || die "Unable to protect the Full Auto-Tune token metadata."
 	owned_regular "$token_dir/meta" || die "The Full Auto-Tune token metadata is unsafe."
 	arm_cleanup_dir=""
-	printf '{"state":"armed","schema_version":1,"token":"%s","expires_epoch":%s}\n' "$token" "$expires"
+	printf '{"state":"armed","schema_version":1,"token":"%s","expires_epoch":%s,"boot_id":"%s"}\n' "$token" "$expires" "$boot_id"
 }
 
 load_token() {
@@ -1116,7 +1191,8 @@ load_token() {
 	prepare_root
 	token_dir="$guard_root/$token"
 	require_secure_directory "$token_dir" || die "The Full Auto-Tune apply token is missing, foreign-owned, or unsafe."
-	[ "$(meta_get version "$token_dir")" = 1 ] || die "Unsupported Full Auto-Tune apply-token schema."
+	token_version="$(meta_get version "$token_dir")"
+	case "$token_version" in 1|2) ;; *) die "Unsupported Full Auto-Tune apply-token schema." ;; esac
 	job="$(meta_get job "$token_dir")"
 	target="$(meta_get target "$token_dir")"
 	backend="$(meta_get backend "$token_dir")"
@@ -1127,6 +1203,7 @@ load_token() {
 	action="$(meta_get action "$token_dir")"
 	run_id="$(meta_get run_id "$token_dir")"
 	expires="$(meta_get expires_epoch "$token_dir")"
+	token_boot_id="$(meta_get boot_id "$token_dir" 2>/dev/null || true)"
 	safe_job "$job" && safe_interface "$target" && safe_backend "$backend" && is_uint "$expires" ||
 		die "The Full Auto-Tune token metadata is invalid."
 	case "$route_mode" in main) [ -z "$member" ] || die "The Full Auto-Tune token route is invalid." ;; mwan3) safe_interface "$member" || die "The Full Auto-Tune token member is invalid." ;; *) die "The Full Auto-Tune token route mode is invalid." ;; esac
@@ -1135,6 +1212,11 @@ load_token() {
 		*) die "The Full Auto-Tune token action metadata is invalid." ;;
 	esac
 	safe_run_id "$run_id" || die "The Full Auto-Tune token run identity is invalid."
+	if [ "$token_version" = 2 ]; then
+		safe_boot_id "$token_boot_id" || die "The Full Auto-Tune token boot identity is invalid."
+		[ "$token_boot_id" = "$(current_boot_id)" ] ||
+			die "The Full Auto-Tune token belongs to a previous boot."
+	fi
 	now="$(date +%s)"
 	is_uint "$now" || die "Unable to establish the apply-token clock."
 	if [ "$now" -le "$expires" ]; then token_expired=0; else token_expired=1; fi
@@ -1196,6 +1278,10 @@ verify_marker() {
 	[ "$(uci -q get "cake-autorate.$job._autotune_apply_disable_adaptive" 2>/dev/null)" = "$disable_adaptive" ] || die "The Full Auto-Tune marker adaptive decision does not match its token."
 	[ "$(uci -q get "cake-autorate.$job._autotune_apply_action" 2>/dev/null)" = "$action" ] || die "The Full Auto-Tune marker action does not match its token."
 	[ "$(uci -q get "cake-autorate.$job._autotune_apply_expires" 2>/dev/null)" = "$expires" ] || die "The Full Auto-Tune marker expiry does not match its token."
+	if [ "$token_version" = 2 ]; then
+		[ "$(uci -q get "cake-autorate.$job._autotune_apply_boot_id" 2>/dev/null)" = "$token_boot_id" ] ||
+			die "The Full Auto-Tune marker boot identity does not match its token."
+	fi
 	sqm_guard="$(sqm_guard_section "$job")" || die "The SQM rollback marker identity is unsafe."
 	[ "$(uci -q get "sqm.$sqm_guard" 2>/dev/null)" = cake_autorate_apply_guard ] ||
 		die "The SQM rollback marker has an unexpected section type."
@@ -1286,7 +1372,150 @@ verify_init() {
 		verify_marker "$marker_job" pre
 		count=$((count + 1))
 	done
-	printf '{"state":"verified","schema_version":1,"markers":%s}\n' "$count"
+	apply_started_file="$token_dir/apply-started"
+	if [ ! -e "$apply_started_file" ]; then
+		apply_started_tmp="$token_dir/apply-started.$$"
+		date +%s > "$apply_started_tmp" || die "Unable to timestamp the guarded UCI apply."
+		chmod 600 "$apply_started_tmp" || die "Unable to protect the guarded UCI apply timestamp."
+		owned_regular "$apply_started_tmp" || die "The guarded UCI apply timestamp is unsafe."
+		mv "$apply_started_tmp" "$apply_started_file" || die "Unable to publish the guarded UCI apply timestamp."
+	fi
+	owned_regular "$apply_started_file" || die "The guarded UCI apply timestamp is unsafe."
+	printf '{"state":"verified","schema_version":1,"markers":%s,"token":"%s"}\n' "$count" "$marker_token"
+}
+
+persistent_uci() {
+	[ -n "${recovery_cleanup_dir:-}" ] || return 1
+	uci -c "$config_dir" -t "$recovery_cleanup_dir" -p "$recovery_cleanup_dir" "$@"
+}
+
+persistent_guarded_jobs() {
+	persistent_uci -q show cake-autorate 2>/dev/null |
+		sed -n "s/^cake-autorate\.\([A-Za-z0-9_]*\)\._autotune_apply_[A-Za-z0-9_]*=.*/\1/p" |
+		LC_ALL=C sort -u
+}
+
+persistent_guarded_sqm_jobs() {
+	persistent_uci -q show sqm 2>/dev/null |
+		sed -n "s/^sqm\.cake_autorate_apply_[A-Za-z0-9_]*\._autotune_apply_job='\([A-Za-z0-9_]*\)'$/\1/p" |
+		LC_ALL=C sort -u
+}
+
+persistent_marker_lines() {
+	persistent_uci -q show cake-autorate 2>/dev/null | grep -q '\._autotune_apply_' && return 0
+	persistent_uci -q show sqm 2>/dev/null | grep -q '\._autotune_apply_'
+}
+
+cleanup_recovery_dir() {
+	[ -n "${recovery_cleanup_dir:-}" ] || return 0
+	find "$recovery_cleanup_dir" -type f -exec rm -f {} \; 2>/dev/null || return 1
+	find "$recovery_cleanup_dir" -depth -type d -exec rmdir {} \; 2>/dev/null || return 1
+	recovery_cleanup_dir=""
+}
+
+recover_stale() {
+	prepare_root
+	recovery_cleanup_dir="$guard_root/recovery.$$"
+	[ ! -e "$recovery_cleanup_dir" ] && mkdir "$recovery_cleanup_dir" &&
+		chmod 700 "$recovery_cleanup_dir" ||
+		die "Unable to create a private stale-marker recovery transaction."
+	runtime_lock_path_owned_by_euid "$recovery_cleanup_dir" ||
+		die "The stale-marker recovery transaction is not root-owned."
+
+	recovery_jobs="$(persistent_guarded_jobs)"
+	recovery_sqm_jobs="$(persistent_guarded_sqm_jobs)"
+	if [ -z "$recovery_jobs$recovery_sqm_jobs" ]; then
+		persistent_marker_lines && die "An incomplete persistent Full Auto-Tune marker exists."
+		cleanup_recovery_dir || die "Unable to clean the stale-marker recovery transaction."
+		printf '{"state":"clear","schema_version":1}\n'
+		return 0
+	fi
+	[ -n "$recovery_jobs" ] && [ "$recovery_jobs" = "$recovery_sqm_jobs" ] ||
+		die "The persistent CAKE and SQM markers are not an exact pair."
+	[ "$(printf '%s\n' $recovery_jobs | wc -l)" -eq 1 ] ||
+		die "Only one persistent Full Auto-Tune marker may be recovered at a time."
+	recovery_job="$recovery_jobs"
+	safe_job "$recovery_job" || die "The persistent Full Auto-Tune marker has an unsafe instance name."
+	recovery_guard="$(sqm_guard_section "$recovery_job")" ||
+		die "The persistent SQM marker identity is unsafe."
+	recovery_token="$(persistent_uci -q get "cake-autorate.$recovery_job._autotune_apply_token" 2>/dev/null)"
+	safe_token "$recovery_token" || die "The persistent Full Auto-Tune marker has an invalid token."
+	[ "$(persistent_uci -q get "cake-autorate.$recovery_job._autotune_apply_guard" 2>/dev/null)" = 1 ] ||
+		die "The persistent Full Auto-Tune marker is malformed."
+	recovery_fingerprint="$(persistent_uci -q get "cake-autorate.$recovery_job._autotune_apply_fingerprint" 2>/dev/null)"
+	safe_fingerprint "$recovery_fingerprint" || die "The persistent Full Auto-Tune marker fingerprint is invalid."
+	safe_interface "$(persistent_uci -q get "cake-autorate.$recovery_job._autotune_apply_target" 2>/dev/null)" ||
+		die "The persistent Full Auto-Tune marker target is invalid."
+	safe_backend "$(persistent_uci -q get "cake-autorate.$recovery_job._autotune_apply_backend" 2>/dev/null)" ||
+		die "The persistent Full Auto-Tune marker backend is invalid."
+	recovery_route_mode="$(persistent_uci -q get "cake-autorate.$recovery_job._autotune_apply_route_mode" 2>/dev/null)"
+	case "$recovery_route_mode" in
+		main)
+			persistent_uci -q get "cake-autorate.$recovery_job._autotune_apply_mwan3_member" >/dev/null 2>&1 &&
+				die "A persistent main-route marker unexpectedly names an mwan3 member."
+			;;
+		mwan3)
+			safe_interface "$(persistent_uci -q get "cake-autorate.$recovery_job._autotune_apply_mwan3_member" 2>/dev/null)" ||
+				die "The persistent Full Auto-Tune mwan3 member is invalid."
+			;;
+		*) die "The persistent Full Auto-Tune route mode is invalid." ;;
+	esac
+	recovery_enabled="$(persistent_uci -q get "cake-autorate.$recovery_job._autotune_apply_enabled" 2>/dev/null)"
+	recovery_disable_adaptive="$(persistent_uci -q get "cake-autorate.$recovery_job._autotune_apply_disable_adaptive" 2>/dev/null)"
+	recovery_action="$(persistent_uci -q get "cake-autorate.$recovery_job._autotune_apply_action" 2>/dev/null)"
+	case "$recovery_enabled:$recovery_disable_adaptive:$recovery_action" in
+		1:0:apply_sqm|1:1:apply_sqm|0:0:disable_sqm|0:1:disable_sqm) ;;
+		*) die "The persistent Full Auto-Tune marker action is inconsistent." ;;
+	esac
+	recovery_expires="$(persistent_uci -q get "cake-autorate.$recovery_job._autotune_apply_expires" 2>/dev/null)"
+	is_uint "$recovery_expires" || die "The persistent Full Auto-Tune marker expiry is invalid."
+	[ "$(persistent_uci -q get "sqm.$recovery_guard" 2>/dev/null)" = cake_autorate_apply_guard ] ||
+		die "The persistent SQM marker has an unexpected section type."
+	[ "$(persistent_uci -q get "sqm.$recovery_guard._autotune_apply_guard" 2>/dev/null)" = 1 ] &&
+		[ "$(persistent_uci -q get "sqm.$recovery_guard._autotune_apply_job" 2>/dev/null)" = "$recovery_job" ] &&
+		[ "$(persistent_uci -q get "sqm.$recovery_guard._autotune_apply_fingerprint" 2>/dev/null)" = "$recovery_fingerprint" ] &&
+		[ "$(persistent_uci -q get "sqm.$recovery_guard._autotune_apply_token" 2>/dev/null)" = "$recovery_token" ] ||
+		die "The persistent SQM marker does not exactly match the CAKE marker."
+
+	recovery_token_dir="$guard_root/$recovery_token"
+	if [ -e "$recovery_token_dir" ] || [ -L "$recovery_token_dir" ]; then
+		die "A persistent Full Auto-Tune marker still has runtime proof and is not stale."
+	fi
+	recovery_boot_id="$(persistent_uci -q get "cake-autorate.$recovery_job._autotune_apply_boot_id" 2>/dev/null || true)"
+	if [ -z "$recovery_boot_id" ]; then
+		recovery_reason=legacy-token-missing
+	else
+		safe_boot_id "$recovery_boot_id" || die "The persistent Full Auto-Tune marker boot identity is invalid."
+		current_recovery_boot_id="$(current_boot_id)" ||
+			die "Unable to establish the current boot identity during marker recovery."
+		if [ "$recovery_boot_id" != "$current_recovery_boot_id" ]; then
+			recovery_reason=boot-changed
+		else
+			recovery_now="$(date +%s)"
+			is_uint "$recovery_now" || die "Unable to establish the stale-marker recovery clock."
+			[ "$recovery_now" -gt "$recovery_expires" ] ||
+				die "The tokenless Full Auto-Tune marker may still belong to an active same-boot transaction."
+			recovery_reason=expired
+		fi
+	fi
+
+	persistent_uci -q delete "sqm.$recovery_guard" ||
+		die "Unable to remove the stale SQM transaction marker."
+	persistent_uci -q commit sqm || die "Unable to commit stale SQM marker cleanup."
+	for recovery_option in _autotune_apply_guard _autotune_apply_fingerprint _autotune_apply_target \
+		_autotune_apply_backend _autotune_apply_route_mode _autotune_apply_mwan3_member \
+		_autotune_apply_enabled _autotune_apply_disable_adaptive _autotune_apply_action \
+		_autotune_apply_token _autotune_apply_expires _autotune_apply_boot_id; do
+		if persistent_uci -q get "cake-autorate.$recovery_job.$recovery_option" >/dev/null 2>&1; then
+			persistent_uci -q delete "cake-autorate.$recovery_job.$recovery_option" ||
+				die "Unable to remove stale CAKE transaction metadata."
+		fi
+	done
+	persistent_uci -q commit cake-autorate || die "Unable to commit stale CAKE marker cleanup."
+	persistent_marker_lines && die "Persistent Full Auto-Tune metadata survived stale-marker recovery."
+	cleanup_recovery_dir || die "Unable to clean the stale-marker recovery transaction."
+	printf '{"state":"recovered","schema_version":1,"job":"%s","reason":"%s"}\n' \
+		"$recovery_job" "$recovery_reason"
 }
 
 snapshot_state_matches() {
@@ -1462,7 +1691,7 @@ prepare_confirm() {
 	for option in _autotune_apply_guard _autotune_apply_fingerprint _autotune_apply_target \
 		_autotune_apply_backend _autotune_apply_route_mode _autotune_apply_mwan3_member \
 		_autotune_apply_enabled _autotune_apply_disable_adaptive _autotune_apply_action _autotune_apply_token \
-		_autotune_apply_expires; do
+		_autotune_apply_expires _autotune_apply_boot_id; do
 		if uci -q get "cake-autorate.$job.$option" >/dev/null 2>&1; then
 			live_uci_transaction -q delete "cake-autorate.$job.$option" ||
 				die "Unable to remove a prepared Full Auto-Tune marker option."
@@ -1516,8 +1745,126 @@ finalize() {
 		"$sqm_init" enable >/dev/null 2>&1 || die "Unable to enable the confirmed SQM service persistently."
 		"$sqm_init" enabled >/dev/null 2>&1 || die "The confirmed SQM service is not enabled persistently."
 	fi
+	write_receipt "$token" complete "The Full Auto-Tune configuration was verified and confirmed."
 	cleanup_token_dir "$token_dir" || die "Unable to remove the completed Full Auto-Tune apply token."
 	printf '{"state":"finalized","schema_version":1}\n'
+}
+
+guard_status() {
+	local status_token="${1:-}"
+	local status_receipt status_token_dir status_state
+	safe_token "$status_token" || die "Invalid Full Auto-Tune apply token."
+	prepare_receipt_root
+	status_receipt="$receipt_root/$status_token.json"
+	if [ -e "$status_receipt" ]; then
+		bounded_regular_file "$status_receipt" 4096 ||
+			die "The Full Auto-Tune apply receipt is unsafe."
+		cat "$status_receipt"
+		return 0
+	fi
+	prepare_root
+	status_token_dir="$guard_root/$status_token"
+	if [ -d "$status_token_dir" ] && [ ! -L "$status_token_dir" ]; then
+		runtime_lock_path_owned_by_euid "$status_token_dir" ||
+			die "The Full Auto-Tune apply token is foreign-owned."
+		if [ -e "$status_token_dir/prepared" ]; then
+			status_state=confirming
+		elif [ -e "$status_token_dir/postverified" ]; then
+			status_state=verified
+		elif [ -e "$status_token_dir/apply-started" ]; then
+			status_state=applying
+		else
+			status_state=armed
+		fi
+		printf '{"state":"%s","schema_version":1,"token":"%s"}\n' "$status_state" "$status_token"
+		return 0
+	fi
+	die "No Full Auto-Tune apply transaction or receipt exists for this token."
+}
+
+wait_for_rollback_deadline() {
+	supervisor_token_dir="$1"
+	supervisor_started="$(sed -n '1p' "$supervisor_token_dir/apply-started" 2>/dev/null)"
+	is_uint "$supervisor_started" || return 1
+	supervisor_rollback_s="$(meta_get rollback_timeout_s "$supervisor_token_dir" 2>/dev/null || true)"
+	is_uint "$supervisor_rollback_s" && [ "$supervisor_rollback_s" -ge 10 ] &&
+		[ "$supervisor_rollback_s" -le 120 ] || return 1
+	supervisor_deadline=$((supervisor_started + supervisor_rollback_s + 3))
+	while :; do
+		supervisor_now="$(date +%s)"
+		is_uint "$supervisor_now" || return 1
+		[ "$supervisor_now" -ge "$supervisor_deadline" ] && return 0
+		sleep 1
+	done
+}
+
+supervisor_rollback() {
+	supervisor_token="$1"
+	supervisor_error="$2"
+	supervisor_token_dir="$guard_root/$supervisor_token"
+	if wait_for_rollback_deadline "$supervisor_token_dir" &&
+	   supervisor_rollback_output="$("$0" verify-rollback "$supervisor_token" 2>&1)" &&
+	   printf '%s\n' "$supervisor_rollback_output" | grep -q '"state":"rolled-back"' &&
+	   "$0" abort "$supervisor_token" >/dev/null 2>&1; then
+		write_receipt "$supervisor_token" rolled-back "$supervisor_error"
+		return 0
+	fi
+	write_receipt "$supervisor_token" indeterminate \
+		"$supervisor_error; exact rpcd rollback could not be proven."
+	return 1
+}
+
+supervise() {
+	supervisor_token="${1:-}"
+	safe_token "$supervisor_token" || die "Invalid Full Auto-Tune apply token."
+	prepare_root
+	supervisor_token_dir="$guard_root/$supervisor_token"
+	require_secure_directory "$supervisor_token_dir" ||
+		die "The Full Auto-Tune apply token is missing, foreign-owned, or unsafe."
+	supervisor_lock="$supervisor_token_dir/supervisor.lock"
+	if ! mkdir "$supervisor_lock" 2>/dev/null; then
+		[ -d "$supervisor_lock" ] && [ ! -L "$supervisor_lock" ] &&
+			runtime_lock_path_owned_by_euid "$supervisor_lock" ||
+			die "The Full Auto-Tune supervisor lock is unsafe."
+		printf '{"state":"running","schema_version":1,"token":"%s"}\n' "$supervisor_token"
+		return 0
+	fi
+	chmod 700 "$supervisor_lock" || die "Unable to protect the Full Auto-Tune supervisor lock."
+
+	if ! supervisor_output="$("$0" postcheck "$supervisor_token" 2>&1)"; then
+		supervisor_rollback "$supervisor_token" "Post-apply verification failed: $supervisor_output" || true
+		return 1
+	fi
+	if ! supervisor_output="$("$0" prepare-confirm "$supervisor_token" 2>&1)"; then
+		supervisor_rollback "$supervisor_token" "Marker cleanup before confirmation failed: $supervisor_output" || true
+		return 1
+	fi
+	if [ -z "$ubus_bin" ] || [ ! -x "$ubus_bin" ]; then
+		supervisor_rollback "$supervisor_token" "ubus is unavailable for server-side UCI confirmation." || true
+		return 1
+	fi
+	if ! supervisor_confirm_output="$("$ubus_bin" call uci confirm 2>&1)"; then
+		if wait_for_rollback_deadline "$supervisor_token_dir"; then
+			if supervisor_reconcile="$("$0" reconcile "$supervisor_token" 2>&1)"; then
+				case "$supervisor_reconcile" in
+					*'"state":"confirmed"'*)
+						"$0" finalize "$supervisor_token"
+						return $?
+						;;
+					*'"state":"rolled-back"'*)
+						"$0" abort "$supervisor_token" >/dev/null 2>&1 || true
+						write_receipt "$supervisor_token" rolled-back \
+							"UCI confirmation failed and rpcd restored the previous configuration."
+						return 1
+						;;
+				esac
+			fi
+		fi
+		write_receipt "$supervisor_token" indeterminate \
+			"UCI confirmation outcome is unknown: $supervisor_confirm_output"
+		return 1
+	fi
+	"$0" finalize "$supervisor_token"
 }
 
 abort_guard() {
@@ -1541,6 +1888,9 @@ abort_guard() {
 case "$mode" in
 	arm) arm_guard "$@" ;;
 	verify-init) verify_init ;;
+	recover-stale) recover_stale ;;
+	status) guard_status "$@" ;;
+	supervise) supervise "$@" ;;
 	verify-rollback) verify_rollback "$@" ;;
 	postcheck) postcheck "$@" ;;
 	prepare-confirm) prepare_confirm "$@" ;;

@@ -86,6 +86,9 @@ assert.deepEqual(helpers.autotuneProfileDefinitions().map(profile => profile.id)
 assert.equal(helpers.autotuneProfilePolicy('gaming').sqm.classification, 'diffserv4');
 assert.equal(helpers.autotuneProfilePolicy('gaming').delayMaxMs, 5);
 assert.equal(helpers.autotuneProfilePolicy('best_overall').retentionPercent, 80);
+assert.equal(helpers.autotuneProfilePolicy('best_overall').sqm.script, 'layer_cake.qos');
+assert.equal(helpers.autotuneProfilePolicy('best_overall').sqm.iqdiscOpts, 'besteffort');
+assert.equal(helpers.autotuneProfilePolicy('best_overall').sqm.eqdiscOpts, 'diffserv4');
 assert.equal(helpers.autotuneProfilePolicy('fair').retentionPercent, 90);
 
 const proposal = {
@@ -133,14 +136,14 @@ const proposal = {
 	},
 	sqm: {
 		qdisc: 'cake',
-		script: 'piece_of_cake.qos',
-		classification: 'besteffort',
+		script: 'layer_cake.qos',
+		classification: 'diffserv4',
 		squash_dscp: true,
 		squash_ingress: true,
 		ingress_ecn: 'ECN',
 		egress_ecn: 'NOECN',
-		iqdisc_opts: '',
-		eqdisc_opts: '',
+		iqdisc_opts: 'besteffort',
+		eqdisc_opts: 'diffserv4',
 	},
 	link: { kind: 'cellular', layer: 'none', overhead: 0, mpu: 0 },
 };
@@ -198,13 +201,13 @@ assert.equal(written.sqm_tcMPU, '0');
 assert.equal(written.speedtest_go_server_id, '17372');
 assert.equal(written.route_mode, 'main');
 assert.equal(written.sqm_qdisc, 'cake');
-assert.equal(written.sqm_script, 'piece_of_cake.qos');
-assert.equal(written.sqm_qdisc_advanced, '0');
-assert.equal(written.sqm_qdisc_really_really_advanced, '0');
+assert.equal(written.sqm_script, 'layer_cake.qos');
+assert.equal(written.sqm_qdisc_advanced, '1');
+assert.equal(written.sqm_qdisc_really_really_advanced, '1');
 assert.equal(written.sqm_squash_dscp, '1');
 assert.equal(written.sqm_squash_ingress, '1');
-assert.equal(written.sqm_iqdisc_opts, undefined);
-assert.equal(written.sqm_eqdisc_opts, undefined);
+assert.equal(written.sqm_iqdisc_opts, 'besteffort');
+assert.equal(written.sqm_eqdisc_opts, 'diffserv4');
 
 const failedResult = {
 	state: 'failed',
@@ -1329,7 +1332,19 @@ async function testApplyGuardTransaction() {
 				if (operation === 'arm')
 					return Promise.resolve({ code: 0, stdout: JSON.stringify({
 						state: 'armed', schema_version: 1, token, expires_epoch: 2000000000,
+						boot_id: '11111111-2222-3333-4444-555555555555',
 					}) });
+				if (operation === 'status') {
+					let state = 'complete';
+					if (options.serverRolledBack)
+						state = 'rolled-back';
+					else if (options.serverIndeterminate)
+						state = 'indeterminate';
+					return Promise.resolve({ code: 0, stdout: JSON.stringify({
+						state, schema_version: 1, token,
+						message: state === 'complete' ? '' : `server ${state}`,
+					}) });
+				}
 					if (operation === 'postcheck') {
 					postcheckCalls++;
 					return Promise.resolve(options.failPostcheck ||
@@ -1401,23 +1416,9 @@ async function testApplyGuardTransaction() {
 			'view.handleSave',
 			'/usr/libexec/cake-autorate-rs/apply-guard:arm',
 			'uci.save-token',
-				'callApply:30:true',
-				'/usr/libexec/cake-autorate-rs/apply-guard:postcheck',
-				'/usr/libexec/cake-autorate-rs/apply-guard:prepare-confirm',
-				'callConfirm',
-			'/usr/libexec/cake-autorate-rs/apply-guard:finalize',
-		], 'config.change performs the only restart; confirm follows exact postcheck');
-
-		const failed = transactionFixture({ failPostcheck: true });
-		await assert.rejects(failed.helpers.runGuardedSaveApply(failed.view, {}),
-			/postcheck rejected/);
-		assert(!failed.calls.includes('callConfirm'),
-			'a failed postcheck must leave the rpcd rollback transaction unconfirmed');
-		assert(failed.calls.includes('/usr/libexec/cake-autorate-rs/apply-guard:abort'));
-		assert.equal(failed.calls.filter(call => call.endsWith(':verify-rollback')).length, 2,
-			'rollback must be proven twice before token cleanup');
-		assert(!failed.calls.some(call => call.startsWith('/etc/init.d/cake-autorate')),
-			'config.change owns apply and rollback reloads; JS must not race it');
+			'callApply:30:true',
+			'/usr/libexec/cake-autorate-rs/apply-guard:status',
+		], 'the router-side supervisor owns verification and confirmation');
 
 		const lostApply = transactionFixture({ applyReject: true });
 		await assert.rejects(lostApply.helpers.runGuardedSaveApply(lostApply.view, {}),
@@ -1426,39 +1427,19 @@ async function testApplyGuardTransaction() {
 		assert(lostApply.calls.includes('/usr/libexec/cake-autorate-rs/apply-guard:abort'),
 			'an unknown apply response must retain snapshots until exact rollback is proven');
 
-			const retryAck = transactionFixture({ confirmRetryAck: true });
-			await retryAck.helpers.runGuardedSaveApply(retryAck.view, {});
-			assert.equal(retryAck.calls.filter(call => call === 'callConfirm').length, 2,
-				'an unknown confirmation receives exactly one bounded retry');
-			assert(!retryAck.calls.some(call => call.endsWith(':reconcile')),
-				'an acknowledged retry is authoritative without state inference');
+		const serverRollback = transactionFixture({ serverRolledBack: true });
+		await assert.rejects(serverRollback.helpers.runGuardedSaveApply(serverRollback.view, {}),
+			/server rolled-back/);
+		assert(!serverRollback.calls.some(call => call.endsWith(':verify-rollback')),
+			'a server rollback receipt is already authoritative');
+		assert(!serverRollback.calls.includes('/usr/libexec/cake-autorate-rs/apply-guard:abort'),
+			'the server supervisor owns token cleanup');
 
-			const lostConfirm = transactionFixture({ confirmReject: true });
-			await lostConfirm.helpers.runGuardedSaveApply(lostConfirm.view, {});
-			assert.equal(lostConfirm.calls.filter(call => call === 'callConfirm').length, 2);
-			assert(lostConfirm.calls.includes('/usr/libexec/cake-autorate-rs/apply-guard:reconcile'));
-			assert(lostConfirm.calls.includes('/usr/libexec/cake-autorate-rs/apply-guard:finalize'));
-		assert(!lostConfirm.calls.includes('/usr/libexec/cake-autorate-rs/apply-guard:abort'));
-
-		const nonzeroConfirm = transactionFixture({ confirmNonzero: true });
-		await nonzeroConfirm.helpers.runGuardedSaveApply(nonzeroConfirm.view, {});
-		assert(nonzeroConfirm.calls.includes('/usr/libexec/cake-autorate-rs/apply-guard:finalize'),
-			'a nonzero confirm response is reconciled only after the rollback deadline');
-
-			const indeterminate = transactionFixture({ confirmIndeterminate: true });
-			await assert.rejects(indeterminate.helpers.runGuardedSaveApply(indeterminate.view, {}),
-				/confirmation outcome remains unknown/);
-			assert(!indeterminate.calls.includes('/usr/libexec/cake-autorate-rs/apply-guard:abort'));
-			assert(!indeterminate.calls.includes('/usr/libexec/cake-autorate-rs/apply-guard:finalize'),
-				'an indeterminate live state must retain its token and fail closed');
-			assert(!indeterminate.calls.some(call => call.endsWith(':reconcile')),
-				'a lost retry response is not authoritative no-pending evidence');
-
-			const rolledBackConfirm = transactionFixture({ rollbackAfterNoData: true });
-			await assert.rejects(rolledBackConfirm.helpers.runGuardedSaveApply(rolledBackConfirm.view, {}),
-				/UCI could not confirm/);
-			assert(rolledBackConfirm.calls.includes('/usr/libexec/cake-autorate-rs/apply-guard:reconcile'));
-			assert(rolledBackConfirm.calls.includes('/usr/libexec/cake-autorate-rs/apply-guard:abort'));
+		const serverIndeterminate = transactionFixture({ serverIndeterminate: true });
+		await assert.rejects(serverIndeterminate.helpers.runGuardedSaveApply(serverIndeterminate.view, {}),
+			/confirmation outcome remains unknown/);
+		assert(!serverIndeterminate.calls.includes('/usr/libexec/cake-autorate-rs/apply-guard:abort'),
+			'an indeterminate server state must retain its proof for recovery');
 
 		const unrelated = transactionFixture({ otherChanges: true });
 		await assert.rejects(unrelated.helpers.runGuardedSaveApply(unrelated.view, {}),

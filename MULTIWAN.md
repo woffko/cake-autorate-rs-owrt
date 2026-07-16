@@ -8,6 +8,7 @@ one instance
   -> one logical route/member
   -> one resolved L3 device and source address
   -> one managed CAKE/IFB pair
+  -> one profile-specific outbound rule binding
   -> one set of latency, quality, throughput, and ceiling state
 ```
 
@@ -150,6 +151,15 @@ passes that ID to every later raw and shaped phase. The pin is job-local and
 does not rewrite UCI. A candidate that changes route, address, or server fails
 closed and writes no configuration.
 
+The optional native traffic classifier follows the same isolation rule. It
+owns one private nftables table for the application but emits a separate
+`oifname` rule set for each instance's resolved L3 device. Two enabled
+instances cannot claim the same target. The RAM-only attestation binds
+instance, device, active profile, and actual ruleset checksum; a stale profile
+or interface is shown as `DRIFTED` rather than silently reused. Classification
+changes DSCP only and does not choose a mwan3 route, create a CAKE qdisc, or
+change a rate. See [Profile traffic priorities](TRAFFIC_PRIORITIES.md).
+
 ## LuCI behavior
 
 The setup view labels logical and physical topology, for example:
@@ -162,7 +172,8 @@ wanb -> eth0
 The Multi-WAN creation mode detects unique enabled members and previews the
 instance names, target devices, SQM sections, and conflicts before saving.
 Status shows lifecycle state, route/member/device, source and external address,
-fwmark, routing table, policy share, and the reason for standby/offline.
+fwmark, routing table, policy share, complete Services reconciliation
+(daemon/SQM/CAKE/IFB/redirect/rules), and the reason for standby/offline.
 Graphs remain separate per instance, are stacked vertically, and annotate
 route/lifecycle, rating-phase, directional-count, and detected-grade changes.
 `Get rating` locks only the selected interface and routes separate shaped

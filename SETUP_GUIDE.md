@@ -18,9 +18,11 @@ instance only after identifying the intended uplink.
      loaded-delay result while retaining at least 80% of observed-low
      capacity.
    - **Gaming** targets A+ with a 70% throughput floor and configures CAKE
-     `diffserv4`. It prioritizes only traffic already marked with DSCP; it does
-     not detect games or rewrite client policy. Use it only when markings are
-     trusted.
+     `diffserv4`. The optional native Traffic priorities page can mark selected
+     outbound game/interactive traffic without installing qosify or eBPF.
+     Trusted WAN-ingress DSCP is still preserved, so use this profile only
+     when downstream markings are acceptable. Enabling native rules resets
+     upload DSCP to CS0 before applying the selected built-in/custom rules.
    - **Fair** keeps at least 90% of observed-low capacity and aims for C or
      better (no more than 200 ms effective loaded-delay growth), favoring
      sustained large downloads/uploads over the strictest latency.
@@ -43,9 +45,11 @@ instance only after identifying the intended uplink.
    **Use proposal/Create**, and the staged UCI change still requires
    **Save & Apply**.
 7. On **Status**, confirm that the uplink becomes `ACTIVE`, the controller is
-   `RUNNING`, CAKE rates are non-zero, and Quality reaches `BASELINE READY`.
-   Use **Get rating** while the link is otherwise quiet to obtain a complete
-   download/upload grade.
+   `RUNNING`, the mandatory **Services** column is `HEALTHY`, both CAKE rates
+   are non-zero, and Quality reaches `BASELINE READY`. Expand the Services
+   hover text if any daemon, queue, IFB, redirect, traffic rule, operation, or
+   apply transaction is degraded. Use **Get rating** while the link is
+   otherwise quiet to obtain a complete download/upload grade.
 8. Enable **Graphs** only if RAM history is useful. Samples stay in `/var/run`
    and disappear on service stop or reboot. Start with the automatic memory
    budget and a 10-second interval.
@@ -113,12 +117,34 @@ that are not currently visible are still validated and saved with the same UCI
 instance. Use **Advanced** only for compatibility and low-level options that do
 not belong to the normal setup workflow.
 
+## Profile traffic rules
+
+Open **Traffic priorities** after the instance has a validated profile and
+managed SQM:
+
+1. Enable **Outbound rules** for the intended instance.
+2. Keep or disable the defaults for each profile independently. Only the
+   currently active profile is rendered; the others remain saved for a later
+   profile change.
+3. Add a named preset or explicit protocol/ports/address rule. Select Voice
+   (CS5), Interactive (AF41), Best effort (CS0), or Background (CS1).
+4. Use the Order field when rules overlap. Built-ins run first and later custom
+   rules override earlier matches.
+5. Save & Apply, then confirm `Rules ACTIVE` in the Status Services column.
+
+These rules do not integrate with qosify and do not own CAKE. They operate only
+in the private `inet cake_autorate_dscp` nftables table and affect packets
+leaving the selected uplink before upload CAKE. Download packets have already
+entered the SQM IFB before those hooks, so Best overall and Fair intentionally
+keep download classification best-effort. Full details and a UCI example are
+in [Profile traffic priorities](TRAFFIC_PRIORITIES.md).
+
 ## Multi-WAN rules
 
 - One autorate instance owns one uplink and one CAKE/IFB pair.
 - Never point two enabled instances at the same L3 device or SQM queue.
 - Each mwan3 member has its own latency baseline, rating, throughput reference,
-  adaptive ceiling and Auto-Tune schedule.
+  adaptive ceiling, profile traffic rules and Auto-Tune schedule.
 - An offline or mismatched member is not a valid calibration route. An online
   standby member may be calibrated through its explicitly selected forced
   `mwan3` member route; route identity must remain stable for the full run.

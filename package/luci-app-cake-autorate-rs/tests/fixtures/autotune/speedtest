@@ -32,6 +32,12 @@ case "$3" in
 		count="${count:-0}"
 		count=$((count + 1))
 		printf '%s\n' "$count" > "$counter_file"
+		if [ -n "${AUTOTUNE_MOCK_JSON_ERROR:-}" ] &&
+		   { [ -z "${AUTOTUNE_MOCK_JSON_ERROR_AT_COUNT:-}" ] ||
+		     [ "$count" -eq "$AUTOTUNE_MOCK_JSON_ERROR_AT_COUNT" ]; }; then
+			printf '{"error":"%s"}\n' "$AUTOTUNE_MOCK_JSON_ERROR"
+			exit "${AUTOTUNE_MOCK_JSON_ERROR_EXIT_CODE:-1}"
+		fi
 		if [ "${AUTOTUNE_MOCK_BLOCK:-0}" = 1 ] ||
 		   { [ -n "${AUTOTUNE_MOCK_BLOCK_AT_COUNT:-}" ] && [ "$count" -eq "$AUTOTUNE_MOCK_BLOCK_AT_COUNT" ]; }; then
 			trap 'touch "$AUTOTUNE_MOCK_RESTORE_MARKER"; exit 130' INT TERM

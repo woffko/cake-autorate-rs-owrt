@@ -173,7 +173,7 @@ already sits below the measured link. For example, `A/C = 92.5%` and `A/O =
 combination retained too little observed capacity. Calling both values
 "retention" loses the information needed to choose a correction.
 
-RC19 selects a profile before proposal construction. Let `L` be observed-low
+RC20 selects a profile before proposal construction. Let `L` be observed-low
 capacity and `H` observed-high capacity for one direction. The proposal tuple
 is:
 
@@ -209,6 +209,27 @@ guarantee about remote servers, Wi-Fi, ISP policy or another bottleneck.
 Gaming and Best overall require every quality gate. Fair marks its class-C
 latency gates as a quality goal while retaining measurement integrity,
 realization, 90% capacity, CPU, route and background evidence as hard gates.
+
+The profile also fixes the exact CAKE class policy used by both temporary
+validation and final SQM. Gaming uses `diffserv4` in both directions without
+wash. Best overall and Fair use upload `diffserv4` but download
+`besteffort wash`, because ordinary nftables forwarding hooks occur after WAN
+ingress has already been redirected to the SQM IFB. Optional native
+per-profile rules therefore change outbound DSCP only and never become a
+second owner of CAKE or bandwidth. Their instance-relevant UCI sections are
+included in the configuration fingerprint:
+
+```text
+fingerprint = SHA256(
+  canonical(instance UCI)
+  || canonical(owned SQM UCI)
+  || canonical(relevant traffic_rule UCI)
+)
+```
+
+Changing a rule, its profile, order, address, port, or class after calibration
+invalidates the Review/Scheduled Auto-Apply evidence instead of applying a
+proposal measured under a different packet policy.
 
 The packaged hard realization gate is two-sided:
 

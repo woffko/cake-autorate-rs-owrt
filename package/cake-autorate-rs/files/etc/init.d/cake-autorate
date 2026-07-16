@@ -12,7 +12,9 @@ DAEMON="/usr/sbin/cake-autorated"
 RUNTIME_LOCK_LIB="${CAKE_AUTORATE_RUNTIME_LOCK_LIB:-/usr/libexec/cake-autorate-rs/runtime-lock}"
 RUNTIME_LOCK_AVAILABLE=0
 APPLY_GUARD="${CAKE_AUTORATE_APPLY_GUARD:-/usr/libexec/cake-autorate-rs/apply-guard}"
+TRAFFIC_CLASSIFIER="${CAKE_AUTORATE_TRAFFIC_CLASSIFIER:-/usr/libexec/cake-autorate-rs/traffic-classifier}"
 SERVICE_APPLY_GUARD_VERIFIED=0
+SERVICE_APPLY_GUARD_TOKEN=""
 SERVICE_RUNTIME_LOCK_HELD=0
 SERVICE_RUNTIME_LOCK_BORROWED=0
 SERVICE_RUNTIME_STOP_RELEASE_PENDING=0
@@ -37,7 +39,7 @@ service_apply_guard_markers_present() {
 
 service_apply_guard_preflight() {
 	local operation="$1"
-	local output
+	local output recovery_output
 
 	[ "$SERVICE_APPLY_GUARD_VERIFIED" -eq 0 ] || return 0
 	service_apply_guard_markers_present || return 0
@@ -46,7 +48,19 @@ service_apply_guard_preflight() {
 		return 1
 	fi
 	if ! output="$($APPLY_GUARD verify-init 2>&1)"; then
-		logger -t cake-autorate "refusing to $operation before any SQM/service mutation: Full Auto-Tune apply guard rejected the transaction: $output"
+		if recovery_output="$($APPLY_GUARD recover-stale 2>&1)"; then
+			case "$recovery_output" in
+				*'"state":"recovered"'*|*'"state":"clear"'*)
+					service_apply_guard_markers_present && {
+						logger -t cake-autorate "refusing to $operation: stale Full Auto-Tune recovery left transaction markers"
+						return 1
+					}
+					logger -t cake-autorate "recovered stale Full Auto-Tune transaction metadata before $operation: $recovery_output"
+					return 0
+					;;
+			esac
+		fi
+		logger -t cake-autorate "refusing to $operation before any SQM/service mutation: Full Auto-Tune apply guard rejected the transaction: $output; recovery: ${recovery_output:-unavailable}"
 		return 1
 	fi
 	case "$output" in
@@ -57,7 +71,35 @@ service_apply_guard_preflight() {
 			;;
 	esac
 	SERVICE_APPLY_GUARD_VERIFIED=1
+	SERVICE_APPLY_GUARD_TOKEN="$(printf '%s\n' "$output" |
+		sed -n 's/.*"token":"\([0-9a-f][0-9a-f]*\)".*/\1/p')"
+	case "$SERVICE_APPLY_GUARD_TOKEN" in
+		????????????????????????????????????????????????????????????????)
+			case "$SERVICE_APPLY_GUARD_TOKEN" in *[!0-9a-f]*)
+				logger -t cake-autorate "refusing to $operation: Full Auto-Tune apply guard returned an unsafe token"
+				return 1
+				;;
+			esac
+			;;
+		*)
+			logger -t cake-autorate "refusing to $operation: Full Auto-Tune apply guard omitted its transaction token"
+			return 1
+			;;
+	esac
 	return 0
+}
+
+start_apply_guard_supervisor() {
+	local token="$SERVICE_APPLY_GUARD_TOKEN"
+	local short
+
+	[ "$SERVICE_APPLY_GUARD_VERIFIED" -eq 1 ] && [ -n "$token" ] || return 0
+	short="$(printf '%s' "$token" | cut -c1-12)"
+	procd_open_instance "apply_guard_$short"
+	procd_set_param command "$APPLY_GUARD" supervise "$token"
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
 }
 
 service_runtime_lock_acquire_or_exit() {
@@ -709,7 +751,12 @@ start_service_locked() {
 	sync_sqm_config
 	prepare_sqm_ingress_interfaces
 	start_sqm_backend
+	if [ -x "$TRAFFIC_CLASSIFIER" ]; then
+		"$TRAFFIC_CLASSIFIER" apply >/dev/null 2>&1 ||
+			logger -t cake-autorate "traffic-priority rules are degraded: native nftables classifier failed to apply"
+	fi
 	config_foreach start_instance cake_autorate
+	start_apply_guard_supervisor
 	[ -x /etc/init.d/cake-autorate-mqtt ] && /etc/init.d/cake-autorate-mqtt restart >/dev/null 2>&1 || true
 }
 
@@ -824,6 +871,10 @@ stop_service() {
 		# rc.common calls procd_kill() only after this hook returns.  Keep the
 		# exclusive descriptor open until service_stopped() has run.
 		SERVICE_RUNTIME_STOP_RELEASE_PENDING=1
+	fi
+	if [ -x "$TRAFFIC_CLASSIFIER" ]; then
+		"$TRAFFIC_CLASSIFIER" clear >/dev/null 2>&1 ||
+			logger -t cake-autorate "unable to clear the native nftables traffic-priority table during stop"
 	fi
 	stop_managed_sqm_backend
 }

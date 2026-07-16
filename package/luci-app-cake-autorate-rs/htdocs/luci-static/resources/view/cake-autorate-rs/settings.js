@@ -117,8 +117,8 @@ var optionDescriptions = {
 	sqm_qdisc: 'Queueing discipline used by SQM. CAKE is the recommended default.',
 	sqm_script: 'SQM setup script that builds the traffic control rules.',
 	sqm_qdisc_advanced: 'Show DSCP and ECN queueing options from luci-app-sqm.',
-	sqm_squash_dscp: 'Rewrite DSCP markings before packets enter the shaper.',
-	sqm_squash_ingress: 'Ignore DSCP markings on ingress traffic.',
+	sqm_squash_dscp: 'Clear DSCP markings from inbound packets as they leave the download shaper.',
+	sqm_squash_ingress: 'Ignore inbound DSCP markings when CAKE selects a download tin.',
 	sqm_ingress_ecn: 'Enable or disable ECN handling for ingress traffic.',
 	sqm_egress_ecn: 'Enable or disable ECN handling for egress traffic.',
 	sqm_qdisc_really_really_advanced: 'Show raw qdisc limits and options. Use only when you know the SQM script expects them.',
@@ -1411,14 +1411,14 @@ function autotuneProfilePolicy(value) {
 			cpuMaxPercent: 85,
 			sqm: {
 				qdisc: 'cake',
-				script: 'piece_of_cake.qos',
-				classification: 'besteffort',
+				script: 'layer_cake.qos',
+				classification: 'diffserv4',
 				squashDscp: true,
 				squashIngress: true,
 				ingressEcn: 'ECN',
 				egressEcn: 'NOECN',
-				iqdiscOpts: '',
-				eqdiscOpts: ''
+				iqdiscOpts: 'besteffort',
+				eqdiscOpts: 'diffserv4'
 			}
 		};
 	case 'fair':
@@ -1433,14 +1433,14 @@ function autotuneProfilePolicy(value) {
 			cpuMaxPercent: 85,
 			sqm: {
 				qdisc: 'cake',
-				script: 'piece_of_cake.qos',
-				classification: 'besteffort',
+				script: 'layer_cake.qos',
+				classification: 'diffserv4',
 				squashDscp: true,
 				squashIngress: true,
 				ingressEcn: 'ECN',
 				egressEcn: 'NOECN',
-				iqdiscOpts: '',
-				eqdiscOpts: ''
+				iqdiscOpts: 'besteffort',
+				eqdiscOpts: 'diffserv4'
 			}
 		};
 	default:
@@ -1454,19 +1454,19 @@ function autotuneProfileDefinitions() {
 			id: 'gaming',
 			title: _('Gaming'),
 			target: _('Target A+ · under 5 ms loaded-latency increase'),
-			description: _('Maximum latency headroom with a 70% capacity safety floor. Uses CAKE diffserv4 and preserves existing DSCP markings; applications are never guessed.')
+			description: _('Maximum latency headroom with a 70% capacity safety floor. Uses diffserv4, supports optional native outbound rules, and preserves ingress DSCP.')
 		},
 		{
 			id: 'best_overall',
 			title: _('Best overall'),
 			target: _('Target A or better · under 30 ms'),
-			description: _('Recommended balance of latency and throughput with an 80% capacity safety floor and best-effort CAKE.')
+			description: _('Recommended balance with an 80% capacity safety floor. Optional outbound rules use diffserv4 while download stays best effort.')
 		},
 		{
 			id: 'fair',
 			title: _('Fair'),
 			target: _('Throughput first · aim for C or better · under 200 ms'),
-			description: _('Keeps at least 90% of measured capacity. If the quality target conflicts with that floor, it presents the best safe SQM candidate and may offer an evidence-backed option to disable SQM.')
+			description: _('Keeps at least 90% of measured capacity. Optional outbound rules use diffserv4, download stays best effort, and Review may offer an evidence-backed option to disable SQM.')
 		}
 	];
 }
@@ -2259,9 +2259,8 @@ function writeWizardConfig(section_id, state) {
 		uci.set('cake-autorate', section_id, 'autotune_profile', state.autotune_profile);
 		state.sqm_qdisc = sqmPolicy.qdisc;
 		state.sqm_script = sqmPolicy.script;
-		state.sqm_qdisc_advanced = state.autotune_profile === 'gaming' ? '1' : '0';
-		state.sqm_qdisc_really_really_advanced =
-			state.autotune_profile === 'gaming' ? '1' : '0';
+		state.sqm_qdisc_advanced = '1';
+		state.sqm_qdisc_really_really_advanced = '1';
 		state.sqm_squash_dscp = sqmPolicy.squash_dscp ? '1' : '0';
 		state.sqm_squash_ingress = sqmPolicy.squash_ingress ? '1' : '0';
 		state.sqm_ingress_ecn = sqmPolicy.ingress_ecn;
@@ -2917,10 +2916,12 @@ function armAutotuneApplyGuards() {
 		}).then(function(result) {
 			var parsed = parseApplyGuardResult(result, 'armed');
 			if (!/^[0-9a-f]{64}$/.test(parsed.token || '') ||
-			    !Number.isSafeInteger(parsed.expires_epoch) || parsed.expires_epoch <= 0)
+			    !Number.isSafeInteger(parsed.expires_epoch) || parsed.expires_epoch <= 0 ||
+			    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(parsed.boot_id || ''))
 				throw new Error(_('The Full Auto-Tune apply guard returned an invalid token.'));
 			marker.token = parsed.token;
 			marker.expires = String(parsed.expires_epoch);
+			marker.bootId = parsed.boot_id;
 			armed.push(marker);
 		});
 	});
@@ -2929,6 +2930,7 @@ function armAutotuneApplyGuards() {
 		for (var i = 0; i < armed.length; i++) {
 			uci.set('cake-autorate', armed[i].job, '_autotune_apply_token', armed[i].token);
 			uci.set('cake-autorate', armed[i].job, '_autotune_apply_expires', armed[i].expires);
+			uci.set('cake-autorate', armed[i].job, '_autotune_apply_boot_id', armed[i].bootId);
 			uci.set('sqm', autotuneSqmRollbackSection(armed[i].job),
 				'_autotune_apply_token', armed[i].token);
 		}
@@ -3088,11 +3090,66 @@ function confirmPreparedApply(guards, applyDeadlineMs) {
 	});
 }
 
+function guardedApplyStatus(guard) {
+	return fs.exec(AUTOTUNE_APPLY_GUARD, [ 'status', guard.token ]).then(function(result) {
+		if (!result || result.code !== 0)
+			throw new Error(result && (result.stderr || result.stdout) ||
+				_('Unable to read the server-side Full Auto-Tune apply state.'));
+		var parsed = parseExecJson(result);
+		var allowed = [ 'armed', 'applying', 'verified', 'confirming', 'running',
+			'complete', 'rolled-back', 'failed', 'indeterminate' ];
+		if (!parsed || parsed.schema_version !== 1 || parsed.token !== guard.token ||
+		    allowed.indexOf(parsed.state) < 0)
+			throw new Error(_('The server-side Full Auto-Tune apply state is invalid.'));
+		return parsed;
+	});
+}
+
+function waitForGuardedApplySupervisor(guards, applyDeadlineMs) {
+	var deadline = applyDeadlineMs + 15000;
+
+	function poll() {
+		return Promise.all(guards.map(guardedApplyStatus)).then(function(states) {
+			for (var i = 0; i < states.length; i++) {
+				var state = states[i];
+				if (state.state === 'rolled-back') {
+					var rollback = new Error(state.message ||
+						_('The router rejected the Full Auto-Tune configuration and restored the previous state.'));
+					rollback.transactionRolledBack = true;
+					throw rollback;
+				}
+				if (state.state === 'indeterminate') {
+					var uncertain = confirmationIndeterminate(new Error(state.message ||
+						_('The router could not prove whether Full Auto-Tune was confirmed.')), null);
+					throw uncertain;
+				}
+				if (state.state === 'failed')
+					throw new Error(state.message || _('The server-side Full Auto-Tune apply failed.'));
+			}
+			if (states.every(function(state) { return state.state === 'complete'; }))
+				return states;
+			if (Date.now() >= deadline) {
+				var timeout = new Error(_('Timed out waiting for the router to finish the guarded Full Auto-Tune apply.'));
+				timeout.supervisorTimedOut = true;
+				throw timeout;
+			}
+			return applyGuardDelay(500).then(poll);
+		}, function(error) {
+			if (Date.now() >= deadline) {
+				error.supervisorTimedOut = true;
+				throw error;
+			}
+			return applyGuardDelay(500).then(poll);
+		});
+	}
+
+	return poll();
+}
+
 function runGuardedSaveApply(view, ev) {
 	var guards = [];
 	var applyStarted = false;
 	var applyDeadlineMs = 0;
-	var confirmPhase = false;
 
 	return view.handleSave(ev).then(function() {
 		return armAutotuneApplyGuards();
@@ -3104,12 +3161,7 @@ function runGuardedSaveApply(view, ev) {
 	}).then(function(result) {
 		if (result !== 0)
 			throw new Error(_('UCI rejected the rollback-enabled configuration apply.'));
-		return verifyGuardOperation(guards, 'postcheck', 'verified');
-	}).then(function() {
-		return verifyGuardOperation(guards, 'prepare-confirm', 'prepared');
-	}).then(function() {
-		confirmPhase = true;
-		return confirmPreparedApply(guards, applyDeadlineMs);
+		return waitForGuardedApplySupervisor(guards, applyDeadlineMs);
 	}).then(function() {
 		applyStarted = false;
 		window.location = window.location.href.split('#')[0];
@@ -3117,8 +3169,6 @@ function runGuardedSaveApply(view, ev) {
 	}).catch(function(error) {
 		if (error.confirmIndeterminate || error.transactionRolledBack || error.applyConfirmed)
 			throw error;
-		if (confirmPhase)
-			throw confirmationIndeterminate(error, null);
 		if (applyStarted)
 			return rollbackGuardedApply(guards, error, applyDeadlineMs);
 		return abortAutotuneApplyGuards(guards).then(function() { throw error; });
@@ -3969,9 +4019,8 @@ function showCreateWizard(grid, name, existingName) {
 		state.sqm_linklayer_advanced = proposal.link.layer === 'none' ? '0' : '1';
 		state.sqm_qdisc = proposal.sqm.qdisc;
 		state.sqm_script = proposal.sqm.script;
-		state.sqm_qdisc_advanced = state.autotune_profile === 'gaming' ? '1' : '0';
-		state.sqm_qdisc_really_really_advanced =
-			state.autotune_profile === 'gaming' ? '1' : '0';
+		state.sqm_qdisc_advanced = '1';
+		state.sqm_qdisc_really_really_advanced = '1';
 		state.sqm_squash_dscp = proposal.sqm.squash_dscp ? '1' : '0';
 		state.sqm_squash_ingress = proposal.sqm.squash_ingress ? '1' : '0';
 		state.sqm_ingress_ecn = proposal.sqm.ingress_ecn;

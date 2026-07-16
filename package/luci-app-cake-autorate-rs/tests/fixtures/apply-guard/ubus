@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+[ "${1:-}" = call ] && [ "${2:-}" = uci ] && [ "${3:-}" = confirm ] || exit 1
+[ "${APPLY_GUARD_UBUS_CONFIRM:-success}" = success ] || exit 1
+printf '%s\n' '{}'

@@ -112,14 +112,14 @@ case "$expression" in
 		emit "${RESULT_CPU_MAX_PERCENT-85}"
 		;;
 	@.proposal.sqm.qdisc) emit "${RESULT_SQM_QDISC-cake}" ;;
-	@.proposal.sqm.script) emit "${RESULT_SQM_SCRIPT-piece_of_cake.qos}" ;;
-	@.proposal.sqm.classification) emit "${RESULT_SQM_CLASSIFICATION-besteffort}" ;;
+	@.proposal.sqm.script) emit "${RESULT_SQM_SCRIPT-layer_cake.qos}" ;;
+	@.proposal.sqm.classification) emit "${RESULT_SQM_CLASSIFICATION-diffserv4}" ;;
 	@.proposal.sqm.squash_dscp) emit "${RESULT_SQM_SQUASH_DSCP-true}" ;;
 	@.proposal.sqm.squash_ingress) emit "${RESULT_SQM_SQUASH_INGRESS-true}" ;;
 	@.proposal.sqm.ingress_ecn) emit "${RESULT_SQM_INGRESS_ECN-ECN}" ;;
 	@.proposal.sqm.egress_ecn) emit "${RESULT_SQM_EGRESS_ECN-NOECN}" ;;
-	@.proposal.sqm.iqdisc_opts) emit "${RESULT_SQM_IQDISC_OPTS-}" ;;
-	@.proposal.sqm.eqdisc_opts) emit "${RESULT_SQM_EQDISC_OPTS-}" ;;
+	@.proposal.sqm.iqdisc_opts) emit "${RESULT_SQM_IQDISC_OPTS-besteffort}" ;;
+	@.proposal.sqm.eqdisc_opts) emit "${RESULT_SQM_EQDISC_OPTS-diffserv4}" ;;
 	*.minimum_kbps) echo "${RESULT_MINIMUM_KBPS-5000}" ;;
 	*.base_kbps) echo "${RESULT_BASE_KBPS-20000}" ;;
 	*.maximum_kbps) echo "${RESULT_MAXIMUM_KBPS-80000}" ;;
@@ -478,6 +478,10 @@ restart_line="$(sed -n '/^service:1:restart$/=' "$log")"
 [ "$(cat "$route_count")" = 3 ]
 [ "$(cat "$health_count")" = 1 ]
 ! recovery_transactions_pending
+[ "$(uci -q get cake-autorate.test.sqm_script)" = layer_cake.qos ]
+[ "$(uci -q get cake-autorate.test.sqm_qdisc_advanced)" = 1 ]
+[ "$(uci -q get cake-autorate.test.sqm_iqdisc_opts)" = besteffort ]
+[ "$(uci -q get cake-autorate.test.sqm_eqdisc_opts)" = diffserv4 ]
 assert_global_lock_released
 
 # Gaming is a complete policy, not just a label: scheduled apply must atomically

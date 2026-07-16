@@ -11,11 +11,13 @@ autotune="$work/autotune"
 guard="$work/guard"
 mkdir -p "$config" "$autotune/wan_sqm" "$work/sys/pppoe-wan" "$work/sys/ifb4pppoe-wan" "$work/proc/200"
 trap 'rm -rf "$work"' EXIT INT TERM
+printf '%s\n' '11111111-2222-3333-4444-555555555555' > "$work/boot-id"
 
 export PATH="$fixtures:$PATH"
 export CAKE_AUTORATE_CONFIG_DIR="$config"
 export CAKE_AUTORATE_AUTOTUNE_DIR="$autotune"
 export CAKE_AUTORATE_APPLY_GUARD_DIR="$guard"
+export CAKE_AUTORATE_APPLY_RECEIPT_DIR="$work/receipts"
 export CAKE_AUTORATE_AUTOTUNE="$fixtures/autotune"
 export CAKE_AUTORATE_SPEEDTEST="$fixtures/speedtest"
 export CAKE_AUTORATE_JSONFILTER="$fixtures/jsonfilter"
@@ -25,6 +27,8 @@ export CAKE_AUTORATE_TC="$fixtures/tc"
 export CAKE_AUTORATE_SYS_CLASS_NET="$work/sys"
 export CAKE_AUTORATE_PROC_ROOT="$work/proc"
 export CAKE_AUTORATE_SQM_INIT="$fixtures/sqm-init"
+export CAKE_AUTORATE_UBUS="$fixtures/ubus"
+export CAKE_AUTORATE_BOOT_ID_FILE="$work/boot-id"
 export APPLY_GUARD_SQM_INIT_STATE="$work/sqm-init.state"
 export CAKE_AUTORATE_APPLY_GUARD_TTL_S=180
 export CAKE_AUTORATE_APPLY_GUARD_POSTCHECK_WAIT_S=1
@@ -98,9 +102,10 @@ cat > "$autotune/wan_sqm/result.json" <<EOF
       "candidate_realization_max_percent":110,"capacity_retention_min_percent":80,
       "icmp_delta_max_ms":30,"transport_delta_max_ms":30,
       "loss_max_percent":3,"cpu_max_percent":85},
-    "sqm":{"qdisc":"cake","script":"piece_of_cake.qos",
-      "classification":"besteffort","squash_dscp":true,"squash_ingress":true,
-      "ingress_ecn":"ECN","egress_ecn":"NOECN","iqdisc_opts":"","eqdisc_opts":""},
+    "sqm":{"qdisc":"cake","script":"layer_cake.qos",
+      "classification":"diffserv4","squash_dscp":true,"squash_ingress":true,
+      "ingress_ecn":"ECN","egress_ecn":"NOECN",
+      "iqdisc_opts":"besteffort","eqdisc_opts":"diffserv4"},
     "link":{"kind":"ethernet","layer":"none","overhead":0,"mpu":0}
   }
 }
@@ -181,6 +186,10 @@ arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$finger
 printf '%s\n' "$arm" | grep -q '"state":"armed"'
 token="$(printf '%s\n' "$arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
 [ "${#token}" -eq 64 ]
+[ "$(uci -c "$guard/$token/expected" -q get cake-autorate.wan_sqm.sqm_script)" = layer_cake.qos ]
+[ "$(uci -c "$guard/$token/expected" -q get cake-autorate.wan_sqm.sqm_qdisc_advanced)" = 1 ]
+[ "$(uci -c "$guard/$token/expected" -q get cake-autorate.wan_sqm.sqm_iqdisc_opts)" = besteffort ]
+[ "$(uci -c "$guard/$token/expected" -q get cake-autorate.wan_sqm.sqm_eqdisc_opts)" = diffserv4 ]
 
 uci -q set sqm.cake_autorate_apply_wan_sqm=cake_autorate_apply_guard
 uci -q set sqm.cake_autorate_apply_wan_sqm._autotune_apply_guard=1
@@ -334,6 +343,71 @@ fi
 [ "$(sed -n '1p' "$APPLY_GUARD_SQM_INIT_STATE")" = enabled ]
 $helper verify-init | grep -q '"state":"clear"'
 
+# The init-launched server supervisor owns postcheck, marker cleanup and UCI
+# confirmation. Closing or refreshing LuCI after callApply therefore cannot
+# strand a token-dependent marker in persistent configuration.
+cp "$work/result.valid" "$autotune/wan_sqm/result.json"
+export APPLY_GUARD_DAEMON_RUNNING=0
+supervised_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint")"
+supervised_token="$(printf '%s\n' "$supervised_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
+cp "$guard/$supervised_token/expected/cake-autorate" "$config/cake-autorate"
+cp "$guard/$supervised_token/expected/sqm" "$config/sqm"
+$helper verify-init | grep -q '"state":"verified"'
+export APPLY_GUARD_DAEMON_RUNNING=1
+$helper supervise "$supervised_token" | grep -q '"state":"finalized"'
+supervised_status="$($helper status "$supervised_token")" || {
+	printf '%s\n' "$supervised_status" >&2
+	exit 1
+}
+printf '%s\n' "$supervised_status" | grep -q '"state":"complete"' || {
+	printf '%s\n' "$supervised_status" >&2
+	exit 1
+}
+[ ! -e "$guard/$supervised_token" ]
+if uci -q show cake-autorate.wan_sqm | grep -q '_autotune_apply_'; then
+	echo "server-side confirmation left a persistent CAKE marker" >&2
+	exit 1
+fi
+if uci -q get sqm.cake_autorate_apply_wan_sqm >/dev/null 2>&1; then
+	echo "server-side confirmation left a persistent SQM marker" >&2
+	exit 1
+fi
+
+# A failed server-side postcheck must wait for and prove rpcd's exact rollback,
+# discard the token and leave a terminal receipt that LuCI can report after a
+# refresh. Backdate apply-started so the fixture does not sleep for the real
+# rollback window.
+export APPLY_GUARD_DAEMON_RUNNING=0
+rollback_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint")"
+rollback_token="$(printf '%s\n' "$rollback_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
+cp "$guard/$rollback_token/expected/cake-autorate" "$config/cake-autorate"
+cp "$guard/$rollback_token/expected/sqm" "$config/sqm"
+$helper verify-init | grep -q '"state":"verified"'
+printf '0\n' > "$guard/$rollback_token/apply-started"
+cp "$guard/$rollback_token/original/cake-autorate" "$config/cake-autorate"
+cp "$guard/$rollback_token/original/sqm" "$config/sqm"
+if $helper supervise "$rollback_token" >/dev/null 2>&1; then
+	echo "server-side supervisor unexpectedly accepted a rolled-back transaction" >&2
+	exit 1
+fi
+rollback_status="$($helper status "$rollback_token")" || {
+	printf '%s\n' "$rollback_status" >&2
+	exit 1
+}
+printf '%s\n' "$rollback_status" | grep -q '"state":"rolled-back"' || {
+	printf '%s\n' "$rollback_status" >&2
+	exit 1
+}
+[ ! -e "$guard/$rollback_token" ]
+if uci -q show cake-autorate.wan_sqm | grep -q '_autotune_apply_'; then
+	echo "server-side rollback left a persistent CAKE marker" >&2
+	exit 1
+fi
+if uci -q get sqm.cake_autorate_apply_wan_sqm >/dev/null 2>&1; then
+	echo "server-side rollback left a persistent SQM marker" >&2
+	exit 1
+fi
+
 # Fair may explicitly recommend disabling SQM only when a complete unshaped
 # control is no worse for latency and improves both directions. The guarded
 # transaction preserves the owned queue as disabled and proves all runtime
@@ -463,14 +537,95 @@ if uci -q get sqm.cake_autorate_apply_wan_sqm >/dev/null 2>&1; then
 	exit 1
 fi
 
-# A marker committed by another page has no root-owned token and must fail
-# closed rather than letting init stop the known-good SQM state.
+# A same-boot marker with a future expiry and no root-owned token is suspicious:
+# fail closed rather than treating an in-flight transaction as abandoned.
+stale_token=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+stale_fingerprint=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+stale_expiry=$(( $(date +%s) + 180 ))
 uci -q set cake-autorate.wan_sqm._autotune_apply_guard=1
-if $helper verify-init >/dev/null 2>&1; then
-	echo "tokenless apply marker was accepted" >&2
+uci -q set cake-autorate.wan_sqm._autotune_apply_fingerprint="$stale_fingerprint"
+uci -q set cake-autorate.wan_sqm._autotune_apply_target=pppoe-wan
+uci -q set cake-autorate.wan_sqm._autotune_apply_backend=speedtest-go
+uci -q set cake-autorate.wan_sqm._autotune_apply_route_mode=main
+uci -q set cake-autorate.wan_sqm._autotune_apply_enabled=1
+uci -q set cake-autorate.wan_sqm._autotune_apply_disable_adaptive=0
+uci -q set cake-autorate.wan_sqm._autotune_apply_action=apply_sqm
+uci -q set cake-autorate.wan_sqm._autotune_apply_token="$stale_token"
+uci -q set cake-autorate.wan_sqm._autotune_apply_expires="$stale_expiry"
+uci -q set cake-autorate.wan_sqm._autotune_apply_boot_id=11111111-2222-3333-4444-555555555555
+uci -q set sqm.cake_autorate_apply_wan_sqm=cake_autorate_apply_guard
+uci -q set sqm.cake_autorate_apply_wan_sqm._autotune_apply_guard=1
+uci -q set sqm.cake_autorate_apply_wan_sqm._autotune_apply_job=wan_sqm
+uci -q set sqm.cake_autorate_apply_wan_sqm._autotune_apply_fingerprint="$stale_fingerprint"
+uci -q set sqm.cake_autorate_apply_wan_sqm._autotune_apply_token="$stale_token"
+if $helper recover-stale >/dev/null 2>&1; then
+	echo "same-boot unexpired tokenless marker was recovered prematurely" >&2
 	exit 1
 fi
-uci -q delete cake-autorate.wan_sqm._autotune_apply_guard
+if $helper verify-init >/dev/null 2>&1; then
+	echo "same-boot tokenless apply marker was accepted" >&2
+	exit 1
+fi
+
+# Once the same-boot transaction has expired, only its metadata is removed.
+# The selected instance settings and managed queue remain intact.
+uci -q set cake-autorate.wan_sqm._autotune_apply_expires=0
+before_setting="$(uci -q get cake-autorate.wan_sqm.unrelated_preserved)"
+before_queue="$(uci -q get sqm.cake_wan_sqm._cake_autorate_managed)"
+$helper recover-stale | grep -q '"state":"recovered"'
+[ "$(uci -q get cake-autorate.wan_sqm.unrelated_preserved)" = "$before_setting" ]
+[ "$(uci -q get sqm.cake_wan_sqm._cake_autorate_managed)" = "$before_queue" ]
+if uci -q show cake-autorate.wan_sqm | grep -q '_autotune_apply_'; then
+	echo "expired marker recovery left CAKE transaction metadata" >&2
+	exit 1
+fi
+if uci -q get sqm.cake_autorate_apply_wan_sqm >/dev/null 2>&1; then
+	echo "expired marker recovery left the reserved SQM section" >&2
+	exit 1
+fi
+$helper verify-init | grep -q '"state":"clear"'
+
+# A reboot is authoritative: rpcd rollback state and tmpfs tokens cannot cross
+# boot IDs, so a well-formed foreign-boot marker is recovered immediately even
+# if its wall-clock expiry is still in the future.
+uci -q set cake-autorate.wan_sqm._autotune_apply_guard=1
+uci -q set cake-autorate.wan_sqm._autotune_apply_fingerprint="$stale_fingerprint"
+uci -q set cake-autorate.wan_sqm._autotune_apply_target=pppoe-wan
+uci -q set cake-autorate.wan_sqm._autotune_apply_backend=speedtest-go
+uci -q set cake-autorate.wan_sqm._autotune_apply_route_mode=main
+uci -q set cake-autorate.wan_sqm._autotune_apply_enabled=1
+uci -q set cake-autorate.wan_sqm._autotune_apply_disable_adaptive=0
+uci -q set cake-autorate.wan_sqm._autotune_apply_action=apply_sqm
+uci -q set cake-autorate.wan_sqm._autotune_apply_token="$stale_token"
+uci -q set cake-autorate.wan_sqm._autotune_apply_expires="$stale_expiry"
+uci -q set cake-autorate.wan_sqm._autotune_apply_boot_id=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+uci -q set sqm.cake_autorate_apply_wan_sqm=cake_autorate_apply_guard
+uci -q set sqm.cake_autorate_apply_wan_sqm._autotune_apply_guard=1
+uci -q set sqm.cake_autorate_apply_wan_sqm._autotune_apply_job=wan_sqm
+uci -q set sqm.cake_autorate_apply_wan_sqm._autotune_apply_fingerprint="$stale_fingerprint"
+uci -q set sqm.cake_autorate_apply_wan_sqm._autotune_apply_token="$stale_token"
+$helper recover-stale | grep -q '"reason":"boot-changed"'
+$helper verify-init | grep -q '"state":"clear"'
+
+# RC19 did not record a boot ID. A paired legacy marker with no surviving
+# token is recoverable during an upgrade instead of permanently bricking init.
+uci -q set cake-autorate.wan_sqm._autotune_apply_guard=1
+uci -q set cake-autorate.wan_sqm._autotune_apply_fingerprint="$stale_fingerprint"
+uci -q set cake-autorate.wan_sqm._autotune_apply_target=pppoe-wan
+uci -q set cake-autorate.wan_sqm._autotune_apply_backend=speedtest-go
+uci -q set cake-autorate.wan_sqm._autotune_apply_route_mode=main
+uci -q set cake-autorate.wan_sqm._autotune_apply_enabled=1
+uci -q set cake-autorate.wan_sqm._autotune_apply_disable_adaptive=0
+uci -q set cake-autorate.wan_sqm._autotune_apply_action=apply_sqm
+uci -q set cake-autorate.wan_sqm._autotune_apply_token="$stale_token"
+uci -q set cake-autorate.wan_sqm._autotune_apply_expires="$stale_expiry"
+uci -q set sqm.cake_autorate_apply_wan_sqm=cake_autorate_apply_guard
+uci -q set sqm.cake_autorate_apply_wan_sqm._autotune_apply_guard=1
+uci -q set sqm.cake_autorate_apply_wan_sqm._autotune_apply_job=wan_sqm
+uci -q set sqm.cake_autorate_apply_wan_sqm._autotune_apply_fingerprint="$stale_fingerprint"
+uci -q set sqm.cake_autorate_apply_wan_sqm._autotune_apply_token="$stale_token"
+$helper recover-stale | grep -q '"reason":"legacy-token-missing"'
+$helper verify-init | grep -q '"state":"clear"'
 
 # A symlinked/foreign runtime root is never trusted.
 rmdir "$guard"
