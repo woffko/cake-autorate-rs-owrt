@@ -31,7 +31,7 @@ case "$profile_argument" in
 esac
 reflector_scan_cooldown_s="${CAKE_AUTORATE_REFLECTOR_SCAN_COOLDOWN_S:-5}"
 baseline_retry_backoff_s="${CAKE_AUTORATE_BASELINE_RETRY_BACKOFF_S:-20}"
-autotune_result_schema=5
+autotune_result_schema=6
 autotune_result_producer="cake-autorate-rs-autotune"
 
 job_root="${CAKE_AUTORATE_AUTOTUNE_DIR:-/tmp/cake-autorate-autotune}"
@@ -830,7 +830,7 @@ config_fingerprint_matches() {
 }
 
 config_changed_inconclusive() {
-	stage_terminal_json error "{\"state\":\"inconclusive\",\"schema_version\":5,\"stage\":\"config-changed\",\"error\":\"Managed CAKE Autorate/SQM configuration changed during calibration; all measurements are stale.\",\"reason\":\"config-changed\",\"retryable\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"configuration_written\":false}"
+	stage_terminal_json error "{\"state\":\"inconclusive\",\"schema_version\":6,\"stage\":\"config-changed\",\"error\":\"Managed CAKE Autorate/SQM configuration changed during calibration; all measurements are stale.\",\"reason\":\"config-changed\",\"retryable\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"configuration_written\":false}"
 	exit 1
 }
 
@@ -855,7 +855,7 @@ stage_terminal_json() {
 	payload="$2"
 	if [ "${config_fingerprint_captured:-false}" = true ] &&
 	   ! config_fingerprint_matches; then
-		payload="{\"state\":\"inconclusive\",\"schema_version\":5,\"stage\":\"config-changed\",\"error\":\"Managed CAKE Autorate/SQM configuration changed during calibration; all measurements are stale.\",\"reason\":\"config-changed\",\"retryable\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"configuration_written\":false}"
+		payload="{\"state\":\"inconclusive\",\"schema_version\":6,\"stage\":\"config-changed\",\"error\":\"Managed CAKE Autorate/SQM configuration changed during calibration; all measurements are stale.\",\"reason\":\"config-changed\",\"retryable\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"configuration_written\":false}"
 		terminal_kind=error
 	fi
 	terminal_json_shape_valid "$payload" || return 1
@@ -940,7 +940,19 @@ write_status() {
 	progress="$2"
 	message="$3"
 	current_phase="$phase"
+	worker_trace "status phase=$phase progress=$progress message=$(json_escape "$message")"
 	atomic_write "$status_file" "{\"state\":\"running\",\"phase\":\"$(json_escape "$phase")\",\"progress\":$progress,\"message\":\"$(json_escape "$message")\",\"job_id\":\"$(json_escape "$job_name")\",\"run_id\":\"$(json_escape "${active_run_id:-${worker_token:-pending}}")\",\"requested_target_interface\":\"$(json_escape "$target_if_input")\",\"requested_backend\":\"$(json_escape "$backend_input")\",\"requested_route_mode\":\"$(json_escape "$route_mode_override")\",\"requested_mwan3_member\":\"$(json_escape "$mwan3_member_override")\",\"requested_profile\":\"$(json_escape "$autotune_profile")\",\"requested_conservative\":$([ "${conservative_mode:-0}" = 1 ] && printf true || printf false)}"
+}
+
+# A short, RAM-only breadcrumb stream is deliberately written to the worker's
+# already-open job.log.  It contains no command output, secrets, or UCI values;
+# its purpose is to retain the last completed state if the kernel or an external
+# supervisor terminates the owner before the EXIT trap can stage diagnostics.
+worker_trace() {
+	[ "${mode:-}" = job-run ] || return 0
+	trace_sequence=$(( ${trace_sequence:-0} + 1 ))
+	printf 'autotune-trace seq=%s pid=%s phase=%s %s\n' \
+		"$trace_sequence" "$$" "${current_phase:-starting}" "$*" >&2
 }
 
 nonnegative_delta() {
@@ -1045,7 +1057,7 @@ check_background_traffic() {
 	write_status quiet-check 27 "Checking background traffic before throughput calibration"
 	measure_background_traffic
 	if [ "$background_blocked" = true ] && [ "${conservative_mode:-0}" != 1 ]; then
-		stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":5,\"error\":\"Background traffic is above the strict calibration limit. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"quiet-check\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"phase_contamination_seen\":false,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
+		stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":6,\"error\":\"Background traffic is above the strict calibration limit. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"quiet-check\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"phase_contamination_seen\":false,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
 		exit 1
 	fi
 	if [ "${conservative_mode:-0}" = 1 ]; then
@@ -1059,7 +1071,7 @@ check_background_traffic() {
 		current_ul_cap="$(uci -q get "cake-autorate.$job_name.adaptive_ceiling_ul_cap_kbps" 2>/dev/null)"
 		if { [ "$background_dl_usable" != true ] || [ "$background_ul_usable" != true ]; } &&
 		   { ! is_positive_uint "$current_dl_base" || ! is_positive_uint "$current_ul_base"; }; then
-			stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":5,\"error\":\"Background traffic leaves an unusable direction and this new instance has no confirmed limits to retain.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"quiet-check\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"phase_contamination_seen\":false,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
+			stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":6,\"error\":\"Background traffic leaves an unusable direction and this new instance has no confirmed limits to retain.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"quiet-check\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"phase_contamination_seen\":false,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
 			exit 1
 		fi
 	fi
@@ -1819,6 +1831,50 @@ temporary_shaper_owned() {
 		exact_ingress_redirect
 }
 
+temporary_qdisc_stats_json() {
+	stats_direction="$1"
+	case "$stats_direction" in
+		download) stats_device="$temp_ifb"; stats_handle="$temp_ifb_handle" ;;
+		upload) stats_device="$target_if"; stats_handle="$temp_target_handle" ;;
+		*) printf '{"available":false,"reason":"invalid-direction"}'; return ;;
+	esac
+	stats_output="$(tc -s qdisc show dev "$stats_device" 2>/dev/null)" || {
+		printf '{"available":false,"reason":"tc-read-failed"}'
+		return
+	}
+	stats_values="$(printf '%s\n' "$stats_output" | awk -v handle="$stats_handle" '
+		$1 == "qdisc" && $2 == "cake" && $3 == handle { found = 1; next }
+		found && $1 == "Sent" {
+			bytes = $2
+			packets = $4
+			dropped = overlimits = requeues = 0
+			for (i = 5; i <= NF; i++) {
+				key = $i
+				gsub(/[(),]/, "", key)
+				if (key == "dropped" || key == "overlimits" || key == "requeues") {
+					value = $(i + 1)
+					gsub(/[(),]/, "", value)
+					if (value !~ /^[0-9]+$/) value = 0
+					if (key == "dropped") dropped = value
+					else if (key == "overlimits") overlimits = value
+					else requeues = value
+				}
+			}
+			if (bytes ~ /^[0-9]+$/ && packets ~ /^[0-9]+$/)
+				print bytes, packets, dropped, overlimits, requeues
+			exit
+		}
+	')"
+	set -- $stats_values
+	if [ "$#" -ne 5 ]; then
+		printf '{"available":false,"reason":"cake-stats-unavailable"}'
+		return
+	fi
+	printf '{"available":true,"device":"%s","handle":"%s","bytes":%s,"packets":%s,"dropped":%s,"overlimits":%s,"requeues":%s}' \
+		"$(json_escape "$stats_device")" "$(json_escape "$stats_handle")" \
+		"$1" "$2" "$3" "$4" "$5"
+}
+
 restore_temp_shaper() {
 	if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_SHAPER:-0}" = 1 ]; then
 		[ -n "${AUTOTUNE_MOCK_SHAPER_RESTORE_MARKER:-}" ] &&
@@ -1969,22 +2025,83 @@ prepare_temp_shaper() {
 	temporary_shaper_owned || fail "Temporary CAKE/IFB ownership postconditions failed."
 }
 
+cpu_sample_fields() {
+	previous_sample="$1"
+	current_sample="$2"
+	awk -v previous="$previous_sample" -v current="$current_sample" 'BEGIN {
+				previous_rows = split(previous, p_rows, "\n")
+				for (row = 1; row <= previous_rows; row++) {
+					n = split(p_rows[row], field, /[[:space:]]+/)
+					if (n == 4) {
+						p_total[field[1]] = field[2]
+						p_idle[field[1]] = field[3]
+						p_softirq[field[1]] = field[4]
+					}
+				}
+				current_rows = split(current, c_rows, "\n")
+				total_cpu = 0
+				max_core = 0
+				max_softirq = 0
+				for (row = 1; row <= current_rows; row++) {
+					n = split(c_rows[row], field, /[[:space:]]+/)
+					name = field[1]
+					if (n != 4 || !(name in p_total)) continue
+					total = field[2] - p_total[name]
+					idle = field[3] - p_idle[name]
+					softirq = field[4] - p_softirq[name]
+					if (total <= 0) continue
+					util = (total - idle) * 100 / total
+					softirq_util = softirq * 100 / total
+					if (name == "cpu") total_cpu = util
+					else if (util > max_core) max_core = util
+					if (name != "cpu" && softirq_util > max_softirq) max_softirq = softirq_util
+				}
+				effective = total_cpu > max_core ? total_cpu : max_core
+				printf "%.1f %.1f %.1f %.1f\n", effective, total_cpu, max_core, max_softirq
+			}'
+}
+
 cpu_monitor() {
 	output="$1"
 	marker="$2"
 	previous=""
 	while [ -e "$marker" ]; do
-		current="$(awk '/^cpu / { total=0; for (i=2; i<=NF; i++) total += $i; print total, $5 + $6; exit }' /proc/stat)"
+		current="$(awk '
+			/^cpu([0-9]+)?[[:space:]]/ {
+				total = 0
+				# Exclude guest/guest_nice because Linux already accounts those
+				# ticks inside user/nice.
+				for (i = 2; i <= NF && i <= 9; i++) total += $i
+				print $1, total, $5 + $6, $8
+			}
+		' /proc/stat)"
 		if [ -n "$previous" ]; then
-			awk -v previous="$previous" -v current="$current" 'BEGIN {
-				split(previous, p, " "); split(current, c, " ");
-				total = c[1] - p[1]; idle = c[2] - p[2];
-				if (total > 0) printf "%.1f\n", (total - idle) * 100 / total;
-			}' >> "$output"
+			cpu_sample_fields "$previous" "$current" >> "$output"
 		fi
 		previous="$current"
 		sleep 1
 	done
+}
+
+cpu_peak_fields() {
+	cpu_peak_input="$1"
+	awk '
+		NF >= 1 {
+			effective = $1
+			total = NF >= 2 ? $2 : effective
+			core = NF >= 3 ? $3 : effective
+			softirq = NF >= 4 ? $4 : 0
+			if (!seen || effective > max_effective) max_effective = effective
+			if (!seen || total > max_total) max_total = total
+			if (!seen || core > max_core) max_core = core
+			if (!seen || softirq > max_softirq) max_softirq = softirq
+			seen = 1
+		}
+		END {
+			if (!seen) exit 1
+			printf "%.1f %.1f %.1f %.1f", max_effective, max_total, max_core, max_softirq
+		}
+	' "$cpu_peak_input"
 }
 
 numeric_latency_stats() {
@@ -2204,7 +2321,7 @@ capture_idle_baseline() {
 				baseline_phase_attempt=$((baseline_phase_attempt + 1))
 				continue
 			fi
-			stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":5,\"stage\":\"baseline\",\"error\":\"The uplink was busy before both idle baseline attempts. Retry when quiet; conservative mode cannot invent an idle p95.\",\"background_blocked\":true,\"retryable\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
+			stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":6,\"stage\":\"baseline\",\"error\":\"The uplink was busy before both idle baseline attempts. Retry when quiet; conservative mode cannot invent an idle p95.\",\"background_blocked\":true,\"retryable\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
 			exit 1
 		fi
 
@@ -2738,12 +2855,26 @@ process_group_contains_session() {
 }
 
 speedtest_identity_matches() {
-	candidate_pid="$1"
-	expected_starttime="$2"
-	[ "$(proc_starttime "$candidate_pid" 2>/dev/null)" = "$expected_starttime" ] || return 1
-	proc_cmdline_has_arg "$candidate_pid" "$speedtest_bin" || return 1
-	proc_cmdline_has_arg "$candidate_pid" "$job_name" || return 1
-	proc_cmdline_has_arg "$candidate_pid" "$target_if" || return 1
+	local candidate_pid="$1" expected_starttime="$2"
+	local identity_start_before identity_start_after identity_state_after argv_match=1
+
+	# Return 0 for the exact live helper, 1 for a live process whose immutable
+	# argv no longer matches, and 2 when the original process has normally
+	# exited, become a zombie, or otherwise disappeared while /proc was being
+	# sampled.  The distinct terminal-transition result prevents an ordinary
+	# helper exit between the start-time and cmdline reads from being reported
+	# as a hostile PID/argv replacement.
+	identity_start_before="$(proc_starttime "$candidate_pid" 2>/dev/null)"
+	[ "$identity_start_before" = "$expected_starttime" ] || return 2
+	proc_cmdline_has_arg "$candidate_pid" "$speedtest_bin" || argv_match=0
+	proc_cmdline_has_arg "$candidate_pid" "$job_name" || argv_match=0
+	proc_cmdline_has_arg "$candidate_pid" "$target_if" || argv_match=0
+	identity_start_after="$(proc_starttime "$candidate_pid" 2>/dev/null)"
+	identity_state_after="$(proc_state "$candidate_pid" 2>/dev/null)"
+	[ "$identity_start_after" = "$expected_starttime" ] || return 2
+	case "$identity_state_after" in ''|Z|z) return 2 ;; esac
+	[ "$argv_match" = 1 ] || return 1
+	return 0
 }
 
 signal_test_group_until_gone() {
@@ -2826,6 +2957,16 @@ finalize_speedtest_result() {
 	final_test_rc="$2"
 	final_timed_out="$3"
 
+	# The helper leader may be reaped just before its final child disappears.
+	# Give that already-terminating group the same small bounded grace used for
+	# supervised termination. Never signal it here: a genuinely persistent
+	# descendant remains journalled and is rejected below.
+	final_drain_attempt=0
+	while process_group_contains_session "$test_pid" &&
+	      [ "$final_drain_attempt" -lt "$test_termination_grace_s" ]; do
+		final_drain_attempt=$((final_drain_attempt + 1))
+		sleep 1
+	done
 	if process_group_contains_session "$test_pid"; then
 		speedtest_supervisor_fail descendant-remained 1
 		return
@@ -3050,11 +3191,17 @@ run_speedtest_with_timeout() {
 			break
 		fi
 		if [ -d "/proc/$test_pid" ] &&
-		   [ "$(proc_starttime "$test_pid" 2>/dev/null)" = "$test_starttime" ] &&
-		   ! speedtest_identity_matches "$test_pid" "$test_starttime"; then
-			signal_test_group_until_gone "$test_pid" "$test_starttime" || true
-			speedtest_supervisor_fail identity-mismatch 1
-			return
+		   [ "$(proc_starttime "$test_pid" 2>/dev/null)" = "$test_starttime" ]; then
+			if speedtest_identity_matches "$test_pid" "$test_starttime"; then
+				identity_check_rc=0
+			else
+				identity_check_rc="$?"
+			fi
+			if [ "$identity_check_rc" = 1 ]; then
+				signal_test_group_until_gone "$test_pid" "$test_starttime" || true
+				speedtest_supervisor_fail identity-mismatch 1
+				return
+			fi
 		fi
 		elapsed_seconds=$((elapsed_seconds + 1))
 		sleep 1
@@ -3198,14 +3345,14 @@ fail() {
 	if [ -e "$cancel_file" ]; then
 		exit 130
 	fi
-	stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":5,\"stage\":\"$(json_escape "${current_phase:-unknown}")\",\"error\":\"$(json_escape "$message")\",\"speedtest_supervisor\":$(speedtest_supervisor_json),\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":${phase_contamination_seen:-false},\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[${phase_background_runs_json:-}],\"validation_attempts\":[${validation_attempts_json:-}],\"validation\":${validation_json:-null},\"pinger_plan\":${pinger_plan:-null},\"proposal\":${proposal:-null},\"configuration_written\":false}"
+	stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":6,\"stage\":\"$(json_escape "${current_phase:-unknown}")\",\"error\":\"$(json_escape "$message")\",\"speedtest_supervisor\":$(speedtest_supervisor_json),\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":${phase_contamination_seen:-false},\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[${phase_background_runs_json:-}],\"validation_attempts\":[${validation_attempts_json:-}],\"validation\":${validation_json:-null},\"pinger_plan\":${pinger_plan:-null},\"proposal\":${proposal:-null},\"configuration_written\":false}"
 	exit 1
 }
 
 measurement_inconclusive() {
 	measurement_stage="$1"
 	measurement_reason="$2"
-	stage_terminal_json error "{\"state\":\"inconclusive\",\"schema_version\":5,\"stage\":\"$(json_escape "$measurement_stage")\",\"error\":\"Measurement evidence remained invalid after a bounded retry; no candidate was accepted.\",\"reason\":\"$(json_escape "$measurement_reason")\",\"retryable\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"phase_contamination_seen\":${phase_contamination_seen:-false},\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[${phase_background_runs_json:-}],\"validation_attempts\":[${validation_attempts_json:-}],\"pinger_plan\":${pinger_plan:-null},\"proposal\":${proposal:-null},\"configuration_written\":false}"
+	stage_terminal_json error "{\"state\":\"inconclusive\",\"schema_version\":6,\"stage\":\"$(json_escape "$measurement_stage")\",\"error\":\"Measurement evidence remained invalid after a bounded retry; no candidate was accepted.\",\"reason\":\"$(json_escape "$measurement_reason")\",\"retryable\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"phase_contamination_seen\":${phase_contamination_seen:-false},\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[${phase_background_runs_json:-}],\"validation_attempts\":[${validation_attempts_json:-}],\"pinger_plan\":${pinger_plan:-null},\"proposal\":${proposal:-null},\"configuration_written\":false}"
 	exit 1
 }
 
@@ -3213,11 +3360,11 @@ run_measurement() {
 	index="$1"
 	measurement_attempt=1
 	while [ "$measurement_attempt" -le 2 ]; do
-		write_status throughput "$((30 + index * 20))" "Running unshaped throughput sample $index of 2 (attempt $measurement_attempt)"
+		write_status throughput 40 "Running the unshaped full-path control (attempt $measurement_attempt)"
 		phase_background_kind=unshaped
 		start_phase_background_counter "$(configured_rate dl)" "$(configured_rate ul)"
 		fair_control_this_attempt=0
-		if [ "$autotune_profile" = fair ] && [ "$index" -eq 2 ]; then
+		if [ "$autotune_profile" = fair ] && [ "$index" -eq 1 ]; then
 			if start_fair_control_monitors "$measurement_attempt"; then
 				fair_control_this_attempt=1
 			else
@@ -3270,7 +3417,7 @@ run_measurement() {
 			if [ "${conservative_mode:-0}" = 1 ]; then
 				break
 			fi
-			stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":5,\"error\":\"Forwarded WAN traffic contaminated both attempts of unshaped sample $index. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"throughput\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
+			stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":6,\"error\":\"Forwarded WAN traffic contaminated both attempts of unshaped sample $index. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"throughput\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
 			exit 1
 		fi
 		measurement_attempt=$((measurement_attempt + 1))
@@ -3294,15 +3441,100 @@ run_measurement() {
 	fi
 	[ "$result_external_ip" = "$selected_external_ip" ] ||
 		fail "External IP changed between Full Auto-Tune throughput samples."
-	if [ -n "$download_samples" ]; then
-		download_samples="$download_samples,$download"
-		upload_samples="$upload_samples,$upload"
+	if [ -n "$full_download_samples" ]; then
+		full_download_samples="$full_download_samples,$download"
+		full_upload_samples="$full_upload_samples,$upload"
 		runs_json="$runs_json,$result"
 	else
-		download_samples="$download"
-		upload_samples="$upload"
+		full_download_samples="$download"
+		full_upload_samples="$upload"
 		runs_json="$result"
 	fi
+}
+
+run_directional_control() {
+	control_direction="$1"
+	control_index="$2"
+	case "$control_direction" in download|upload) ;; *) fail "Invalid directional control." ;; esac
+	control_attempt=1
+	while [ "$control_attempt" -le 2 ]; do
+		case "$control_direction" in
+			download) control_progress=$((45 + control_index * 5)) ;;
+			upload) control_progress=$((60 + control_index * 5)) ;;
+		esac
+		write_status throughput "$control_progress" \
+			"Running unshaped $control_direction-only control $control_index of 2 (attempt $control_attempt)"
+		phase_background_kind=unshaped
+		start_phase_background_counter "$(configured_rate dl)" "$(configured_rate ul)"
+		control_result_file="$job_dir/unshaped-$control_direction-$control_index-$control_attempt.result"
+		if ! run_speedtest_with_timeout "$control_result_file" \
+			"$job_name" "$target_if" run "$backend" "" "$route_mode" "$mwan3_member" "$control_direction"; then
+			stop_phase_background_counter
+			fail "The unshaped $control_direction-only control failed in the speed-test supervisor (${speedtest_supervisor_reason:-unknown})."
+		fi
+		control_result="$(cat "$control_result_file" 2>/dev/null)"
+		rm -f "$control_result_file"
+		stop_phase_background_counter
+		control_backend="$(extract_json "$control_result" '@.backend')"
+		[ "$control_backend" = "$backend" ] ||
+			fail "Speed test backend changed during the $control_direction-only control."
+		control_reported_direction="$(extract_json "$control_result" '@.test_direction')"
+		[ "$control_reported_direction" = "$control_direction" ] ||
+			fail "Speed test helper reported ${control_reported_direction:-no direction} for the unshaped $control_direction-only control."
+		control_shaper_bypassed="$(extract_json "$control_result" '@.shaper_bypassed')"
+		control_sqm_paused="$(extract_json "$control_result" '@.sqm_paused')"
+		[ "$control_shaper_bypassed" = true ] && [ "$control_sqm_paused" = true ] ||
+			fail "The unshaped $control_direction-only control did not prove SQM bypass."
+		case "$control_direction" in
+			download) control_rate="$(extract_json "$control_result" '@.download_kbps')" ;;
+			upload) control_rate="$(extract_json "$control_result" '@.upload_kbps')" ;;
+		esac
+		is_positive_uint "$control_rate" ||
+			fail "The unshaped $control_direction-only control returned no rate."
+		control_entry="{\"phase\":\"unshaped-directional\",\"direction\":\"$control_direction\",\"sample\":$control_index,\"attempt\":$control_attempt,\"measured_kbps\":$control_rate,\"forwarded_background\":$(phase_background_json)}"
+		phase_background_runs_json="$phase_background_runs_json,$control_entry"
+		if [ "$phase_background_contaminated" != true ]; then
+			break
+		fi
+		phase_contamination_seen=true
+		if [ "$control_attempt" -ge 2 ]; then
+			if [ "$phase_background_available" != true ]; then
+				fail "Forwarded-traffic evidence was unavailable for both $control_direction-only control attempts."
+			fi
+			if [ "${conservative_mode:-0}" != 1 ]; then
+				stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":6,\"error\":\"Forwarded WAN traffic contaminated both $control_direction-only controls. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"directional-control-$control_direction\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
+				exit 1
+			fi
+			break
+		fi
+		control_attempt=$((control_attempt + 1))
+	done
+
+	control_server_id="$(extract_json "$control_result" '@.server_id')"
+	[ "$control_server_id" = "$selected_server_id" ] ||
+		fail "Speed test server changed during the $control_direction-only control."
+	control_route_identity="$(extract_json "$control_result" '@.route_mode')|$(extract_json "$control_result" '@.mwan3_member')|$(extract_json "$control_result" '@.route_interface')|$(extract_json "$control_result" '@.route_source_ip')|$(extract_json "$control_result" '@.route_fwmark')|$(extract_json "$control_result" '@.route_table')"
+	[ "$control_route_identity" = "$calibration_route_identity" ] ||
+		fail "WAN route identity changed during the $control_direction-only control."
+	[ "$(extract_json "$control_result" '@.external_ip_after')" = "$selected_external_ip" ] ||
+		fail "External IP changed during the $control_direction-only control."
+	case "$control_direction" in
+		download)
+			if [ -n "$download_samples" ]; then
+				download_samples="$download_samples,$control_rate"
+			else
+				download_samples="$control_rate"
+			fi
+			;;
+		upload)
+			if [ -n "$upload_samples" ]; then
+				upload_samples="$upload_samples,$control_rate"
+			else
+				upload_samples="$control_rate"
+			fi
+			;;
+	esac
+	runs_json="$runs_json,$control_result"
 }
 
 calculate_proposal() {
@@ -3385,6 +3617,8 @@ quality_grade_rank() {
 
 build_fair_outcome() {
 	fair_outcome_mode="$1"
+	fair_floor_state="${2:-capacity-floor-met}"
+	fair_apply_sqm_available=true
 	fair_recommended_action=apply_sqm
 	fair_disable_available=false
 	fair_comparison_reason=quality-target-met
@@ -3392,8 +3626,15 @@ build_fair_outcome() {
 	fair_control_dl_gain_percent=0
 	fair_control_ul_gain_percent=0
 
+	if [ "$fair_floor_state" = capacity-floor-infeasible ]; then
+		fair_apply_sqm_available=false
+		fair_recommended_action=keep_current
+		fair_comparison_reason=repeatable-shaper-ceiling-below-capacity-floor
+	fi
+
 	if [ "$fair_outcome_mode" = throughput-fallback ]; then
-		fair_comparison_reason=quality-target-unreachable-above-throughput-floor
+		[ "$fair_floor_state" = capacity-floor-infeasible ] ||
+			fair_comparison_reason=quality-target-unreachable-above-throughput-floor
 		if [ "$fair_control_available" = true ]; then
 			fair_control_grade_value="$(extract_json "$fair_control_json" '@.grade')"
 			fair_control_delta_value="$(extract_json "$fair_control_json" '@.effective_delta_ms')"
@@ -3442,10 +3683,14 @@ build_fair_outcome() {
 		fi
 	fi
 
-	fair_allowed_actions='"apply_sqm","keep_current"'
+	if [ "$fair_apply_sqm_available" = true ]; then
+		fair_allowed_actions='"apply_sqm","keep_current"'
+	else
+		fair_allowed_actions='"keep_current"'
+	fi
 	[ "$fair_disable_available" = true ] &&
 		fair_allowed_actions="$fair_allowed_actions,\"disable_sqm\""
-	fair_outcome_json="{\"mode\":\"$(json_escape "$fair_outcome_mode")\",\"target_grade\":\"C\",\"target_delta_ms\":200,\"capacity_floor_percent\":90,\"actual_grade\":\"$(json_escape "$validation_actual_grade")\",\"actual_effective_delta_ms\":$effective_loaded_delta_ms,\"recommended_action\":\"$fair_recommended_action\",\"allowed_actions\":[$fair_allowed_actions],\"disable_sqm_available\":$fair_disable_available,\"comparison_reason\":\"$(json_escape "$fair_comparison_reason")\",\"no_sqm_control\":$fair_control_json,\"throughput_gain_without_sqm\":{\"download_percent\":$fair_control_dl_gain_percent,\"upload_percent\":$fair_control_ul_gain_percent}}"
+	fair_outcome_json="{\"mode\":\"$(json_escape "$fair_outcome_mode")\",\"target_grade\":\"C\",\"target_delta_ms\":200,\"capacity_floor_percent\":90,\"capacity_floor_met\":$([ "$fair_floor_state" = capacity-floor-met ] && printf true || printf false),\"actual_grade\":\"$(json_escape "$validation_actual_grade")\",\"actual_effective_delta_ms\":$effective_loaded_delta_ms,\"recommended_action\":\"$fair_recommended_action\",\"allowed_actions\":[$fair_allowed_actions],\"apply_sqm_available\":$fair_apply_sqm_available,\"disable_sqm_available\":$fair_disable_available,\"comparison_reason\":\"$(json_escape "$fair_comparison_reason")\",\"no_sqm_control\":$fair_control_json,\"throughput_gain_without_sqm\":{\"download_percent\":$fair_control_dl_gain_percent,\"upload_percent\":$fair_control_ul_gain_percent}}"
 }
 
 start_fair_control_monitors() {
@@ -3585,10 +3830,16 @@ evaluate_fair_control() {
 			fair_control_reason=control-transport-statistics
 		}
 	fi
-	fair_control_cpu_peak="$(sort -n "$cpu_values" 2>/dev/null | tail -n 1)"
-	if [ -z "$fair_control_cpu_peak" ]; then
+	fair_control_cpu_fields="$(cpu_peak_fields "$cpu_values" 2>/dev/null)"
+	if [ -z "$fair_control_cpu_fields" ]; then
 		fair_control_valid=false
 		fair_control_reason=control-cpu-unavailable
+	else
+		set -- $fair_control_cpu_fields
+		fair_control_cpu_peak="$1"
+		fair_control_cpu_total_peak="$2"
+		fair_control_cpu_core_peak="$3"
+		fair_control_softirq_peak="$4"
 	fi
 	if [ "$fair_control_valid" != true ]; then
 		fair_control_json="{\"available\":false,\"measurement_evidence\":{\"valid\":false,\"reason\":\"$(json_escape "$fair_control_reason")\"}}"
@@ -3603,7 +3854,7 @@ evaluate_fair_control() {
 	fair_control_transport_delta_ms="$(nonnegative_delta "$fair_control_transport_p95_ms" "$transport_idle_p95_ms")"
 	fair_control_effective_delta_ms="$(maximum_number "$fair_control_icmp_delta_ms" "$fair_control_transport_delta_ms")"
 	fair_control_grade="$(quality_grade_for_delta "$fair_control_effective_delta_ms")"
-	fair_control_json="{\"available\":true,\"measurement_evidence\":{\"valid\":true,\"reason\":\"ok\",\"test_direction\":\"both\",\"shaper_bypassed\":true,\"sqm_paused\":true},\"grade\":\"$(json_escape "$fair_control_grade")\",\"effective_delta_ms\":$fair_control_effective_delta_ms,\"throughput\":{\"download_kbps\":$(extract_json "$fair_control_result" '@.download_kbps'),\"upload_kbps\":$(extract_json "$fair_control_result" '@.upload_kbps')},\"icmp_latency\":{\"median_ms\":$fair_control_icmp_median_ms,\"p95_ms\":$fair_control_icmp_p95_ms,\"max_ms\":$fair_control_icmp_max_ms,\"idle_p95_ms\":$idle_p95_ms,\"delta_p95_ms\":$fair_control_icmp_delta_ms,\"samples\":$fair_control_icmp_samples,\"loss_percent\":$fair_control_loss_percent},\"transport_latency\":{\"backend\":\"$(json_escape "$transport_probe_backend")\",\"endpoint\":\"$(json_escape "$transport_probe_endpoint")\",\"median_ms\":$fair_control_transport_median_ms,\"p95_ms\":$fair_control_transport_p95_ms,\"max_ms\":$fair_control_transport_max_ms,\"idle_p95_ms\":$transport_idle_p95_ms,\"delta_p95_ms\":$fair_control_transport_delta_ms,\"samples\":$fair_control_transport_samples},\"cpu_peak_percent\":$fair_control_cpu_peak,\"forwarded_background\":$(phase_background_json)}"
+	fair_control_json="{\"available\":true,\"measurement_evidence\":{\"valid\":true,\"reason\":\"ok\",\"test_direction\":\"both\",\"shaper_bypassed\":true,\"sqm_paused\":true},\"grade\":\"$(json_escape "$fair_control_grade")\",\"effective_delta_ms\":$fair_control_effective_delta_ms,\"throughput\":{\"download_kbps\":$(extract_json "$fair_control_result" '@.download_kbps'),\"upload_kbps\":$(extract_json "$fair_control_result" '@.upload_kbps')},\"icmp_latency\":{\"median_ms\":$fair_control_icmp_median_ms,\"p95_ms\":$fair_control_icmp_p95_ms,\"max_ms\":$fair_control_icmp_max_ms,\"idle_p95_ms\":$idle_p95_ms,\"delta_p95_ms\":$fair_control_icmp_delta_ms,\"samples\":$fair_control_icmp_samples,\"loss_percent\":$fair_control_loss_percent},\"transport_latency\":{\"backend\":\"$(json_escape "$transport_probe_backend")\",\"endpoint\":\"$(json_escape "$transport_probe_endpoint")\",\"median_ms\":$fair_control_transport_median_ms,\"p95_ms\":$fair_control_transport_p95_ms,\"max_ms\":$fair_control_transport_max_ms,\"idle_p95_ms\":$transport_idle_p95_ms,\"delta_p95_ms\":$fair_control_transport_delta_ms,\"samples\":$fair_control_transport_samples},\"cpu_peak_percent\":$fair_control_cpu_peak,\"cpu\":{\"effective_peak_percent\":$fair_control_cpu_peak,\"total_peak_percent\":$fair_control_cpu_total_peak,\"max_core_peak_percent\":$fair_control_cpu_core_peak,\"softirq_peak_percent\":$fair_control_softirq_peak},\"forwarded_background\":$(phase_background_json)}"
 }
 
 run_validation_direction_phase() {
@@ -3646,7 +3897,10 @@ run_validation_direction_phase() {
 			if [ "${AUTOTUNE_MOCK_ICMP_RATE_LIMIT:-0}" = 1 ]; then
 				printf '%s\n' '[5.00000] 1.1.1.1 : [4], timed out (NaN avg, 20% loss)' >> "$loaded_raw"
 			fi
-			if [ "${AUTOTUNE_MOCK_RC16:-0}" = 1 ] ||
+			if [ "${AUTOTUNE_MOCK_COMPUTE_CEILING:-0}" = 1 ]; then
+				printf '%s\n' 97.0 > "$cpu_values"
+				phase_test_transport_raw='[20.0,22.0,23.0,24.0]'
+			elif [ "${AUTOTUNE_MOCK_RC16:-0}" = 1 ] ||
 			   [ "${AUTOTUNE_MOCK_FAIR_SHAPED_BAD:-0}" = 1 ]; then
 				printf '%s\n' 53.2 > "$cpu_values"
 				phase_test_transport_raw='[230.0,240.0,250.0,480.0]'
@@ -3702,6 +3956,7 @@ run_validation_direction_phase() {
 		stop_phase_background_counter
 		stop_validation_monitors ||
 			fail "A validation monitor could not be terminated; crash recovery remains armed."
+		phase_qdisc_stats_json="$(temporary_qdisc_stats_json "$phase_direction")"
 		phase_backend="$(extract_json "$phase_result" '@.backend')"
 		[ "$phase_backend" = "$backend" ] ||
 			fail "Speed test backend changed from $backend to ${phase_backend:-unknown} during $phase_direction-only validation."
@@ -3766,10 +4021,16 @@ run_validation_direction_phase() {
 				phase_measurement_reason=transport-statistics-unavailable
 			}
 		fi
-		phase_cpu_peak="$(sort -n "$cpu_values" 2>/dev/null | tail -n 1)"
-		if [ -z "$phase_cpu_peak" ]; then
+		phase_cpu_fields="$(cpu_peak_fields "$cpu_values" 2>/dev/null)"
+		if [ -z "$phase_cpu_fields" ]; then
 			phase_measurement_valid=false
 			phase_measurement_reason=cpu-samples-unavailable
+		else
+			set -- $phase_cpu_fields
+			phase_cpu_peak="$1"
+			phase_cpu_total_peak="$2"
+			phase_cpu_core_peak="$3"
+			phase_softirq_peak="$4"
 		fi
 
 		phase_entry="{\"phase\":\"shaped\",\"direction\":\"$phase_direction\",\"validation_attempt\":$phase_validation_attempt,\"attempt\":$phase_background_attempt,\"measured_kbps\":$phase_achieved_kbps,\"measurement_evidence\":{\"valid\":$phase_measurement_valid,\"reason\":\"$(json_escape "$phase_measurement_reason")\"},\"forwarded_background\":$(phase_background_json)}"
@@ -3809,7 +4070,7 @@ run_validation_direction_phase() {
 			phase_icmp_delta_ms=0.19
 			phase_loss_percent=7.59
 		fi
-		phase_observation_json="{\"direction\":\"$phase_direction\",\"throughput_kbps\":$phase_achieved_kbps,\"measurement_evidence\":{\"valid\":true,\"reason\":\"ok\",\"transport_rows\":$transport_evidence_rows},\"icmp_latency\":{\"median_ms\":$phase_loaded_median_ms,\"p95_ms\":$phase_loaded_p95_ms,\"max_ms\":$phase_loaded_max_ms,\"idle_p95_ms\":$idle_p95_ms,\"delta_p95_ms\":$phase_icmp_delta_ms,\"samples\":$phase_loaded_samples,\"loss_percent\":$phase_loss_percent},\"transport_latency\":{\"backend\":\"$(json_escape "$transport_probe_backend")\",\"endpoint\":\"$(json_escape "$transport_probe_endpoint")\",\"median_ms\":$phase_transport_median_ms,\"p95_ms\":$phase_transport_p95_ms,\"max_ms\":$phase_transport_max_ms,\"idle_p95_ms\":$transport_idle_p95_ms,\"delta_p95_ms\":$phase_transport_delta_ms,\"samples\":$phase_transport_samples},\"cpu_peak_percent\":$phase_cpu_peak,\"forwarded_background\":$(phase_background_json),\"server_id\":\"$(json_escape "$(extract_json "$phase_result" '@.server_id')")\"}"
+		phase_observation_json="{\"direction\":\"$phase_direction\",\"throughput_kbps\":$phase_achieved_kbps,\"measurement_evidence\":{\"valid\":true,\"reason\":\"ok\",\"transport_rows\":$transport_evidence_rows},\"icmp_latency\":{\"median_ms\":$phase_loaded_median_ms,\"p95_ms\":$phase_loaded_p95_ms,\"max_ms\":$phase_loaded_max_ms,\"idle_p95_ms\":$idle_p95_ms,\"delta_p95_ms\":$phase_icmp_delta_ms,\"samples\":$phase_loaded_samples,\"loss_percent\":$phase_loss_percent},\"transport_latency\":{\"backend\":\"$(json_escape "$transport_probe_backend")\",\"endpoint\":\"$(json_escape "$transport_probe_endpoint")\",\"median_ms\":$phase_transport_median_ms,\"p95_ms\":$phase_transport_p95_ms,\"max_ms\":$phase_transport_max_ms,\"idle_p95_ms\":$transport_idle_p95_ms,\"delta_p95_ms\":$phase_transport_delta_ms,\"samples\":$phase_transport_samples},\"cpu_peak_percent\":$phase_cpu_peak,\"cpu\":{\"effective_peak_percent\":$phase_cpu_peak,\"total_peak_percent\":$phase_cpu_total_peak,\"max_core_peak_percent\":$phase_cpu_core_peak,\"softirq_peak_percent\":$phase_softirq_peak},\"qdisc\":$phase_qdisc_stats_json,\"forwarded_background\":$(phase_background_json),\"server_id\":\"$(json_escape "$(extract_json "$phase_result" '@.server_id')")\"}"
 		if [ "$phase_background_contaminated" != true ]; then
 			break
 		fi
@@ -3819,7 +4080,7 @@ run_validation_direction_phase() {
 			continue
 		fi
 		if [ "${conservative_mode:-0}" != 1 ]; then
-			stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":5,\"error\":\"Forwarded WAN traffic contaminated both $phase_direction-only shaped validation attempts. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"shaped-$phase_direction\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"proposal\":$proposal,\"configuration_written\":false}"
+			stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":6,\"error\":\"Forwarded WAN traffic contaminated both $phase_direction-only shaped validation attempts. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"shaped-$phase_direction\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"proposal\":$proposal,\"configuration_written\":false}"
 			exit 1
 		fi
 		if [ "$phase_background_available" != true ]; then
@@ -3877,6 +4138,9 @@ run_shaped_validation() {
 	dl_transport_samples="$phase_transport_samples"
 	dl_transport_delta_ms="$phase_transport_delta_ms"
 	dl_cpu_peak="$phase_cpu_peak"
+	dl_cpu_total_peak="$phase_cpu_total_peak"
+	dl_cpu_core_peak="$phase_cpu_core_peak"
+	dl_softirq_peak="$phase_softirq_peak"
 
 	run_validation_direction_phase upload "$validation_attempt"
 	shaped_ul="$phase_achieved_kbps"
@@ -3893,6 +4157,9 @@ run_shaped_validation() {
 	ul_transport_samples="$phase_transport_samples"
 	ul_transport_delta_ms="$phase_transport_delta_ms"
 	ul_cpu_peak="$phase_cpu_peak"
+	ul_cpu_total_peak="$phase_cpu_total_peak"
+	ul_cpu_core_peak="$phase_cpu_core_peak"
+	ul_softirq_peak="$phase_softirq_peak"
 	if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_PREFLIGHT:-0}" != 1 ]; then
 		inspect_autotune_route || fail "Selected route went offline during calibration."
 		[ "$route_identity" = "$calibration_route_identity" ] ||
@@ -3930,6 +4197,7 @@ run_shaped_validation() {
 
 	validation_pass="$(extract_json "$typed_validation_decision" '@.pass')"
 	validation_hard_pass="$(extract_json "$typed_validation_decision" '@.hard_pass')"
+	validation_safety_pass="$(extract_json "$typed_validation_decision" '@.safety_pass')"
 	validation_quality_target_met="$(extract_json "$typed_validation_decision" '@.quality_target_met')"
 	validation_actual_grade="$(extract_json "$typed_validation_decision" '@.actual_grade')"
 	validation_score="$(extract_json "$typed_validation_decision" '@.score')"
@@ -3949,10 +4217,9 @@ run_shaped_validation() {
 		true:true|false:true|false:false) ;;
 		*) fail "The typed validator returned an invalid decision." ;;
 	esac
-	case "$validation_hard_pass:$validation_quality_target_met" in
-		true:true|true:false|false:true|false:false) ;;
-		*) fail "The typed validator returned invalid Fair safety or quality state." ;;
-	esac
+	for validation_boolean in "$validation_hard_pass" "$validation_safety_pass" "$validation_quality_target_met"; do
+		case "$validation_boolean" in true|false) ;; *) fail "The typed validator returned invalid safety or quality state." ;; esac
+	done
 	case "$validation_actual_grade" in A+|A|B|C|D|F) ;; *) fail "The typed validator returned an invalid quality grade." ;; esac
 	case "$validation_correction_action" in
 		none|increase|decrease|mixed|retry-measurement|infeasible) ;;
@@ -3986,7 +4253,135 @@ run_shaped_validation() {
 	transport_loaded_p95_ms="$(maximum_number "$dl_transport_p95_ms" "$ul_transport_p95_ms")"
 	transport_loaded_max_ms="$(maximum_number "$dl_transport_max_ms" "$ul_transport_max_ms")"
 	transport_loaded_samples=$((dl_transport_samples + ul_transport_samples))
-	validation_json="{\"profile\":\"$(json_escape "$autotune_profile")\",\"pass\":$validation_pass,\"hard_pass\":$validation_hard_pass,\"quality_target_met\":$validation_quality_target_met,\"actual_grade\":\"$(json_escape "$validation_actual_grade")\",\"contaminated\":$validation_contaminated,\"score\":$validation_score,\"metrics\":$validation_metrics_json,\"signals\":$validation_signals_json,\"gates\":$validation_gates_json,\"reasons\":$validation_reasons_json,\"correction\":$validation_correction_json,\"candidate_base\":{\"download_kbps\":$dl_base,\"upload_kbps\":$ul_base},\"throughput\":{\"download_kbps\":$shaped_dl,\"upload_kbps\":$shaped_ul,\"download_candidate_realization_percent\":$dl_candidate_realization,\"upload_candidate_realization_percent\":$ul_candidate_realization,\"download_capacity_retention_percent\":$dl_retention,\"upload_capacity_retention_percent\":$ul_retention,\"comparison\":\"observed-low\"},\"direction_phases\":{\"download\":$download_phase_observation_json,\"upload\":$upload_phase_observation_json},\"latency\":{\"median_ms\":$loaded_median_ms,\"p95_ms\":$loaded_p95_ms,\"max_ms\":$loaded_max_ms,\"delta_p95_ms\":$loaded_delta_ms,\"samples\":$loaded_samples,\"loss_percent\":$loss_percent},\"transport_latency\":{\"backend\":\"$(json_escape "$transport_probe_backend")\",\"endpoint\":\"$(json_escape "$transport_probe_endpoint")\",\"median_ms\":$transport_loaded_median_ms,\"p95_ms\":$transport_loaded_p95_ms,\"max_ms\":$transport_loaded_max_ms,\"delta_p95_ms\":$transport_loaded_delta_ms,\"samples\":$transport_loaded_samples},\"effective_delta_ms\":$effective_loaded_delta_ms,\"cpu_peak_percent\":$cpu_peak,\"server_id\":\"$(json_escape "$selected_server_id")\",\"decision\":$typed_validation_decision}"
+	validation_json="{\"profile\":\"$(json_escape "$autotune_profile")\",\"pass\":$validation_pass,\"hard_pass\":$validation_hard_pass,\"safety_pass\":$validation_safety_pass,\"quality_target_met\":$validation_quality_target_met,\"actual_grade\":\"$(json_escape "$validation_actual_grade")\",\"contaminated\":$validation_contaminated,\"score\":$validation_score,\"metrics\":$validation_metrics_json,\"signals\":$validation_signals_json,\"gates\":$validation_gates_json,\"reasons\":$validation_reasons_json,\"correction\":$validation_correction_json,\"candidate_base\":{\"download_kbps\":$dl_base,\"upload_kbps\":$ul_base},\"throughput\":{\"download_kbps\":$shaped_dl,\"upload_kbps\":$shaped_ul,\"download_candidate_realization_percent\":$dl_candidate_realization,\"upload_candidate_realization_percent\":$ul_candidate_realization,\"download_capacity_retention_percent\":$dl_retention,\"upload_capacity_retention_percent\":$ul_retention,\"comparison\":\"direction-matched-observed-low\"},\"direction_phases\":{\"download\":$download_phase_observation_json,\"upload\":$upload_phase_observation_json},\"latency\":{\"median_ms\":$loaded_median_ms,\"p95_ms\":$loaded_p95_ms,\"max_ms\":$loaded_max_ms,\"delta_p95_ms\":$loaded_delta_ms,\"samples\":$loaded_samples,\"loss_percent\":$loss_percent},\"transport_latency\":{\"backend\":\"$(json_escape "$transport_probe_backend")\",\"endpoint\":\"$(json_escape "$transport_probe_endpoint")\",\"median_ms\":$transport_loaded_median_ms,\"p95_ms\":$transport_loaded_p95_ms,\"max_ms\":$transport_loaded_max_ms,\"delta_p95_ms\":$transport_loaded_delta_ms,\"samples\":$transport_loaded_samples},\"effective_delta_ms\":$effective_loaded_delta_ms,\"cpu_peak_percent\":$cpu_peak,\"server_id\":\"$(json_escape "$selected_server_id")\",\"decision\":$typed_validation_decision}"
+}
+
+append_profile_search_observation() {
+	search_direction="$1"
+	case "$search_direction" in
+		download)
+			search_record="$dl_base,$shaped_dl,$dl_icmp_delta_ms,$dl_transport_delta_ms,$dl_loss_percent,$dl_cpu_peak"
+			if [ -n "${dl_search_observations:-}" ]; then
+				dl_search_observations="$dl_search_observations;$search_record"
+			else
+				dl_search_observations="$search_record"
+			fi
+			;;
+		upload)
+			search_record="$ul_base,$shaped_ul,$ul_icmp_delta_ms,$ul_transport_delta_ms,$ul_loss_percent,$ul_cpu_peak"
+			if [ -n "${ul_search_observations:-}" ]; then
+				ul_search_observations="$ul_search_observations;$search_record"
+			else
+				ul_search_observations="$search_record"
+			fi
+			;;
+		*) return 1 ;;
+	esac
+}
+
+run_profile_direction_search() {
+	search_direction="$1"
+	case "$search_direction" in
+		download)
+			search_observed_low="$raw_dl_low"
+			search_minimum="$dl_minimum"
+			search_upper="$dl_maximum"
+			[ "$search_upper" -le "$search_observed_low" ] 2>/dev/null || search_upper="$search_observed_low"
+			search_observations="$dl_search_observations"
+			;;
+		upload)
+			search_observed_low="$raw_ul_low"
+			search_minimum="$ul_minimum"
+			search_upper="$ul_maximum"
+			[ "$search_upper" -le "$search_observed_low" ] 2>/dev/null || search_upper="$search_observed_low"
+			search_observations="$ul_search_observations"
+			;;
+		*) return 1 ;;
+	esac
+
+	search_decision="$("$daemon_bin" --autotune-optimize-direction \
+		--profile "$autotune_profile" \
+		--direction "$search_direction" \
+		--observed-low-kbps "$search_observed_low" \
+		--minimum-kbps "$search_minimum" \
+		--upper-kbps "$search_upper" \
+		--observations "$search_observations" \
+		--uncertainty-percent 1.5 \
+		--max-attempts 8 \
+		--candidate-realization-min-percent "$validation_candidate_realization_min_percent" \
+		--candidate-realization-max-percent "$validation_candidate_realization_max_percent" \
+		--capacity-retention-min-percent "$validation_capacity_retention_min_percent" \
+		--loss-max-percent "$validation_loss_max_percent" \
+		--cpu-max-percent "$validation_cpu_max_percent")" || return 1
+	strict_single_json_object "$search_decision" || return 1
+	search_schema="$(extract_json "$search_decision" '@.schema_version')" || return 1
+	search_profile="$(extract_json "$search_decision" '@.profile')" || return 1
+	search_result_direction="$(extract_json "$search_decision" '@.direction')" || return 1
+	search_action="$(extract_json "$search_decision" '@.action')" || return 1
+	search_reason="$(extract_json "$search_decision" '@.reason')" || return 1
+	[ "$search_schema" = 1 ] && [ "$search_profile" = "$autotune_profile" ] &&
+		[ "$search_result_direction" = "$search_direction" ] || return 1
+	case "$search_action" in test|complete|fallback|inconclusive) ;; *) return 1 ;; esac
+
+	search_next="$(extract_json "$search_decision" '@.next_candidate_kbps' 2>/dev/null || true)"
+	search_selected="$(extract_json "$search_decision" '@.selected.candidate_kbps' 2>/dev/null || true)"
+	search_selected_safety="$(extract_json "$search_decision" '@.selected.safety_pass' 2>/dev/null || true)"
+	search_selected_target="$(extract_json "$search_decision" '@.selected.target_met' 2>/dev/null || true)"
+	search_selected_grade="$(extract_json "$search_decision" '@.selected.grade' 2>/dev/null || true)"
+	case "$search_action" in
+		test) is_positive_uint "$search_next" || return 1 ;;
+		complete|fallback)
+			is_positive_uint "$search_selected" || return 1
+			case "$search_selected_safety" in true|false) ;; *) return 1 ;; esac
+			if [ "$search_selected_safety" != true ]; then
+				[ "$search_action" = fallback ] || return 1
+				case "$search_reason" in
+					repeatable-compute-ceiling-below-capacity-floor|repeatable-shaper-ceiling-below-capacity-floor) ;;
+					*) return 1 ;;
+				esac
+			fi
+			case "$search_selected_target" in true|false) ;; *) return 1 ;; esac
+			case "$search_selected_grade" in A+|A|B|C|D|F) ;; *) return 1 ;; esac
+			;;
+	esac
+
+	case "$search_direction" in
+		download)
+			dl_search_json="$search_decision"
+			dl_search_action="$search_action"
+			dl_search_reason="$search_reason"
+			dl_search_next="$search_next"
+			dl_search_selected="$search_selected"
+			dl_search_selected_safety="$search_selected_safety"
+			dl_search_selected_target="$search_selected_target"
+			dl_search_selected_grade="$search_selected_grade"
+			;;
+		upload)
+			ul_search_json="$search_decision"
+			ul_search_action="$search_action"
+			ul_search_reason="$search_reason"
+			ul_search_next="$search_next"
+			ul_search_selected="$search_selected"
+			ul_search_selected_safety="$search_selected_safety"
+			ul_search_selected_target="$search_selected_target"
+			ul_search_selected_grade="$search_selected_grade"
+			;;
+	esac
+	worker_trace "optimizer direction=$search_direction action=$search_action reason=$(json_escape "$search_reason") next=${search_next:-none} selected=${search_selected:-none} grade=${search_selected_grade:-none}"
+}
+
+set_exact_profile_candidates() {
+	desired_dl_kbps="$1"
+	desired_ul_kbps="$2"
+	dl_revision_scale="$(scale_for_reference_base "$desired_dl_kbps" "$reference_dl_base")" || return 1
+	ul_revision_scale="$(scale_for_reference_base "$desired_ul_kbps" "$reference_ul_base")" || return 1
+	proposal_candidate="$(calculate_proposal "$dl_revision_scale" "$ul_revision_scale")" || return 1
+	proposal_json_valid "$proposal_candidate" || return 1
+	proposal="$proposal_candidate"
+	realized_dl_candidate="$(extract_json "$proposal" '@.download.base_kbps')"
+	realized_ul_candidate="$(extract_json "$proposal" '@.upload.base_kbps')"
+	[ "$realized_dl_candidate" = "$desired_dl_kbps" ] &&
+		[ "$realized_ul_candidate" = "$desired_ul_kbps" ]
 }
 
 journal_value() {
@@ -4123,8 +4518,10 @@ worker_cleanup() {
 	worker_rc="$1"
 	[ "${cleanup_started:-0}" = 0 ] || return 0
 	cleanup_started=1
+	worker_exit_phase="${current_phase:-unknown}"
 	trap - 0
 	trap '' INT TERM HUP
+	worker_trace "cleanup-enter rc=$worker_rc recovery_armed=${recovery_armed:-0}"
 	[ -n "${recovery_heartbeat:-}" ] && [ -e "$recovery_heartbeat" ] && recovery_armed=1
 	[ "${recovery_armed:-0}" = 1 ] &&
 		write_status restoring 98 "Restoring and verifying SQM, autorate, and temporary calibration state" || true
@@ -4149,9 +4546,9 @@ worker_cleanup() {
 
 	if [ ! -s "$pending_result_file" ] && [ ! -s "$pending_error_file" ]; then
 		if [ "$worker_rc" -eq 130 ] || [ -e "$cancel_file" ]; then
-			stage_terminal_json error "{\"state\":\"cancelled\",\"schema_version\":5,\"stage\":\"$(json_escape "${current_phase:-unknown}")\",\"error\":\"Full Auto-Tune was cancelled; no configuration was written.\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"configuration_written\":false}" || true
+			stage_terminal_json error "{\"state\":\"cancelled\",\"schema_version\":6,\"stage\":\"$(json_escape "$worker_exit_phase")\",\"error\":\"Full Auto-Tune was cancelled; no configuration was written.\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"configuration_written\":false}" || true
 		else
-			stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":5,\"stage\":\"$(json_escape "${current_phase:-unknown}")\",\"error\":\"Full Auto-Tune worker exited without a complete diagnostic result.\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"configuration_written\":false}" || true
+			stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":6,\"stage\":\"$(json_escape "$worker_exit_phase")\",\"worker_exit_code\":$worker_rc,\"error\":\"Full Auto-Tune worker exited without a complete diagnostic result.\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"configuration_written\":false}" || true
 		fi
 	fi
 
@@ -4178,7 +4575,14 @@ worker_cleanup() {
 		fi
 	fi
 	remove_own_worker_identity
+	worker_trace "cleanup-complete rc=$worker_rc runtime_ok=$cleanup_runtime_ok"
 	return 0
+}
+
+worker_exit_trap() {
+	worker_exit_rc="$1"
+	worker_trace "exit-trap rc=$worker_exit_rc"
+	worker_cleanup "$worker_exit_rc"
 }
 
 run_job() {
@@ -4227,6 +4631,7 @@ run_job() {
 	recovery_active_test_starttime=""
 	recovery_nft_table=""
 	cleanup_started=0
+	trace_sequence=0
 	phase_counter_created=0
 	phase_background_runs_json=""
 	phase_evidence_complete=false
@@ -4238,7 +4643,7 @@ run_job() {
 	test_output=""
 	current_phase=starting
 	trap 'cancelled=1; exit 130' INT TERM
-	trap 'worker_cleanup "$?"' EXIT
+	trap 'worker_exit_trap "$?"' EXIT
 	[ -n "${autotune_profile:-}" ] || fail "Full Auto-Tune profile is missing."
 	safe_worker_token "$worker_token" ||
 		fail "Full Auto-Tune worker identity token must be exactly 32 hexadecimal characters."
@@ -4322,6 +4727,8 @@ run_job() {
 	capture_idle_baseline
 	check_background_traffic
 
+	full_download_samples=""
+	full_upload_samples=""
 	download_samples=""
 	upload_samples=""
 	runs_json=""
@@ -4330,7 +4737,10 @@ run_job() {
 	fair_control_json=null
 	fair_control_active=0
 	run_measurement 1
-	run_measurement 2
+	run_directional_control download 1
+	run_directional_control download 2
+	run_directional_control upload 1
+	run_directional_control upload 2
 
 	write_status proposal 80 "Calculating safe initial limits and adaptive ceiling bounds"
 	reference_proposal_candidate="$(calculate_proposal 1.0 1.0)" || fail "Autotune reference proposal calculation failed."
@@ -4352,100 +4762,144 @@ run_job() {
 
 	validation_attempt_number=1
 	validation_attempts_json=""
-	measurement_retry_used=0
-	rate_correction_used=0
-	max_rate_corrections=1
-	[ "$autotune_profile" = fair ] && max_rate_corrections=2
-	fair_best_total=0
-	fair_best_proposal=""
-	fair_best_validation_json=""
+	dl_search_observations=""
+	ul_search_observations=""
+	dl_search_active=true
+	ul_search_active=true
+	dl_search_json=null
+	ul_search_json=null
+	dl_search_selected_safety=""
+	ul_search_selected_safety=""
+	profile_search_inconclusive=false
+	profile_search_inconclusive_reason=""
 	fair_outcome_json=null
-	while [ "$validation_attempt_number" -le 3 ]; do
+	while [ "$validation_attempt_number" -le 8 ]; do
 		run_shaped_validation "$validation_attempt_number"
+		write_status search 89 "Evaluating directional profile-search observation $validation_attempt_number"
 		if [ -n "$validation_attempts_json" ]; then
 			validation_attempts_json="$validation_attempts_json,$validation_json"
 		else
 			validation_attempts_json="$validation_json"
 		fi
-		if [ "$autotune_profile" = fair ] && [ "$validation_hard_pass" = true ]; then
-			fair_candidate_total=$((shaped_dl + shaped_ul))
-			if [ "$fair_candidate_total" -gt "$fair_best_total" ]; then
-				fair_best_total="$fair_candidate_total"
-				fair_best_proposal="$proposal"
-				fair_best_validation_json="$validation_json"
-				fair_best_shaped_dl="$shaped_dl"
-				fair_best_shaped_ul="$shaped_ul"
-				fair_best_loaded_delta_ms="$loaded_delta_ms"
-				fair_best_transport_loaded_delta_ms="$transport_loaded_delta_ms"
-				fair_best_effective_loaded_delta_ms="$effective_loaded_delta_ms"
-				fair_best_loss_percent="$loss_percent"
-				fair_best_cpu_peak="$cpu_peak"
-				fair_best_actual_grade="$validation_actual_grade"
-				fair_best_validation_contaminated="$validation_contaminated"
-			fi
-		fi
-		[ "$validation_pass" = true ] && break
 
-		case "$validation_correction_action" in
-			retry-measurement)
-				[ "$measurement_retry_used" -eq 0 ] || break
-				measurement_retry_used=1
-				write_status correction 90 "Repeating the same directional candidate because its achieved rate was not reliable"
-				;;
-			increase|decrease|mixed)
-				[ "$validation_correction_feasible" = true ] || break
-				[ "$rate_correction_used" -lt "$max_rate_corrections" ] || break
-				rate_correction_used=$((rate_correction_used + 1))
-				dl_revision_scale="$(scale_for_reference_base "$dl_correction_proposed_kbps" "$reference_dl_base")" ||
-					fail "Unable to calculate the exact download correction scale."
-				ul_revision_scale="$(scale_for_reference_base "$ul_correction_proposed_kbps" "$reference_ul_base")" ||
-					fail "Unable to calculate the exact upload correction scale."
-				write_status correction 91 "Applying one typed, direction-specific bounded correction"
-				proposal_candidate="$(calculate_proposal "$dl_revision_scale" "$ul_revision_scale")" ||
-					fail "Autotune direction-specific correction calculation failed."
-				proposal_json_valid "$proposal_candidate" ||
-					fail "Autotune direction-specific correction returned malformed JSON."
-				proposal="$proposal_candidate"
-				realized_dl_correction="$(extract_json "$proposal" '@.download.base_kbps')"
-				realized_ul_correction="$(extract_json "$proposal" '@.upload.base_kbps')"
-				[ "$realized_dl_correction" = "$dl_correction_proposed_kbps" ] &&
-					[ "$realized_ul_correction" = "$ul_correction_proposed_kbps" ] ||
-					fail "Proposal constraints could not realize the typed direction-specific correction exactly."
-				;;
-			infeasible|none|*) break ;;
-		esac
+		if [ "$dl_search_active" = true ]; then
+			append_profile_search_observation download || fail "Unable to record the download profile-search observation."
+			run_profile_direction_search download || fail "The typed download profile optimizer rejected its evidence."
+			case "$dl_search_action" in
+				complete|fallback) dl_search_active=false ;;
+				inconclusive)
+					dl_search_active=false
+					profile_search_inconclusive=true
+					profile_search_inconclusive_reason="download:$dl_search_reason"
+					;;
+			esac
+		fi
+		if [ "$ul_search_active" = true ]; then
+			append_profile_search_observation upload || fail "Unable to record the upload profile-search observation."
+			run_profile_direction_search upload || fail "The typed upload profile optimizer rejected its evidence."
+			case "$ul_search_action" in
+				complete|fallback) ul_search_active=false ;;
+				inconclusive)
+					ul_search_active=false
+					profile_search_inconclusive=true
+					[ -n "$profile_search_inconclusive_reason" ] && profile_search_inconclusive_reason="$profile_search_inconclusive_reason;"
+					profile_search_inconclusive_reason="${profile_search_inconclusive_reason}upload:$ul_search_reason"
+					;;
+			esac
+		fi
+
+		[ "$profile_search_inconclusive" = false ] || break
+		if [ "$dl_search_active" = false ] && [ "$ul_search_active" = false ]; then
+			break
+		fi
+		next_dl_candidate="$dl_search_selected"
+		next_ul_candidate="$ul_search_selected"
+		[ "$dl_search_active" = true ] && next_dl_candidate="$dl_search_next"
+		[ "$ul_search_active" = true ] && next_ul_candidate="$ul_search_next"
+		is_positive_uint "$next_dl_candidate" && is_positive_uint "$next_ul_candidate" ||
+			fail "The profile optimizer did not return a bounded candidate pair."
+		write_status search 90 "Testing the next bounded throughput and latency candidate"
+		set_exact_profile_candidates "$next_dl_candidate" "$next_ul_candidate" ||
+			fail "Proposal constraints could not realize the typed profile-search candidate exactly."
 		validation_attempt_number=$((validation_attempt_number + 1))
 	done
-	if [ "$validation_pass" != true ] && [ "$autotune_profile" = fair ] &&
-	   [ -n "$fair_best_proposal" ]; then
-		proposal="$fair_best_proposal"
-		validation_json="$fair_best_validation_json"
-		validation_hard_pass=true
-		validation_quality_target_met=false
-		validation_actual_grade="$fair_best_actual_grade"
-		shaped_dl="$fair_best_shaped_dl"
-		shaped_ul="$fair_best_shaped_ul"
-		loaded_delta_ms="$fair_best_loaded_delta_ms"
-		transport_loaded_delta_ms="$fair_best_transport_loaded_delta_ms"
-		effective_loaded_delta_ms="$fair_best_effective_loaded_delta_ms"
-		loss_percent="$fair_best_loss_percent"
-		cpu_peak="$fair_best_cpu_peak"
-		validation_contaminated="$fair_best_validation_contaminated"
-		build_fair_outcome throughput-fallback
-	elif [ "$validation_pass" = true ] && [ "$autotune_profile" = fair ]; then
-		build_fair_outcome quality-target-met
+	if [ "$profile_search_inconclusive" = true ] || [ "$dl_search_active" = true ] || [ "$ul_search_active" = true ]; then
+		phase_evidence_complete=false
+		measurement_inconclusive validation "profile-search-inconclusive:${profile_search_inconclusive_reason:-bounded-search-did-not-finish}"
 	fi
-	if [ "$validation_pass" != true ]; then
-		if [ "$autotune_profile" = fair ] && [ "$validation_hard_pass" = true ]; then
-			:
-		elif [ "$validation_correction_action" = retry-measurement ]; then
-			phase_evidence_complete=false
-			measurement_inconclusive validation \
-				"${validation_correction_reason:-candidate-realization-unreliable}-after-bounded-retry"
+
+	selected_dl_candidate="$dl_search_selected"
+	selected_ul_candidate="$ul_search_selected"
+	is_positive_uint "$selected_dl_candidate" && is_positive_uint "$selected_ul_candidate" ||
+		fail "The bounded profile search found no candidate above the configured capacity safety floor."
+	profile_floor_infeasible=false
+	profile_floor_infeasible_reason=""
+	if [ "$dl_search_selected_safety" = false ]; then
+		profile_floor_infeasible=true
+		profile_floor_infeasible_reason="download:$dl_search_reason"
+	fi
+	if [ "$ul_search_selected_safety" = false ]; then
+		profile_floor_infeasible=true
+		[ -n "$profile_floor_infeasible_reason" ] &&
+			profile_floor_infeasible_reason="$profile_floor_infeasible_reason;"
+		profile_floor_infeasible_reason="${profile_floor_infeasible_reason}upload:$ul_search_reason"
+	fi
+	if [ "$profile_floor_infeasible" = true ] && [ "$autotune_profile" != fair ]; then
+		validation_error="The selected profile capacity floor is unreachable because the CAKE datapath reached a repeatable shaper or CPU ceiling (${profile_floor_infeasible_reason}); no configuration was written."
+		stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":6,\"stage\":\"validation\",\"error\":\"$(json_escape "$validation_error")\",\"reason\":\"profile-capacity-floor-infeasible\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":$phase_evidence_complete,\"phase_contamination_seen\":$phase_contamination_seen,\"route_mode\":\"$(json_escape "$route_mode")\",\"route_interface\":\"$(json_escape "$route_if")\",\"route_identity\":\"$(json_escape "$route_identity")\",\"external_ip\":\"$(json_escape "$selected_external_ip")\",\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[$runs_json],\"phase_background\":[$phase_background_runs_json],\"validation_attempts\":[$validation_attempts_json],\"validation\":$validation_json,\"profile_search\":{\"download\":$dl_search_json,\"upload\":$ul_search_json},\"fair_outcome\":$fair_outcome_json,\"pinger_plan\":$pinger_plan,\"proposal\":$proposal,\"configuration_written\":false}"
+		exit 1
+	fi
+	current_dl_candidate="$(extract_json "$proposal" '@.download.base_kbps')"
+	current_ul_candidate="$(extract_json "$proposal" '@.upload.base_kbps')"
+	if [ "$current_dl_candidate" != "$selected_dl_candidate" ] ||
+	   [ "$current_ul_candidate" != "$selected_ul_candidate" ]; then
+		set_exact_profile_candidates "$selected_dl_candidate" "$selected_ul_candidate" ||
+			fail "Unable to restore the selected profile-search candidate for confirmation."
+		validation_attempt_number=$((validation_attempt_number + 1))
+		write_status confirmation 94 "Confirming the selected download and upload candidate pair"
+		run_shaped_validation "$validation_attempt_number"
+		validation_attempts_json="$validation_attempts_json,$validation_json"
+	fi
+	if [ "$profile_floor_infeasible" != true ] && [ "$validation_safety_pass" != true ]; then
+		validation_attempt_number=$((validation_attempt_number + 1))
+		write_status confirmation 95 "Repeating the selected pair once because its safety confirmation was unstable"
+		run_shaped_validation "$validation_attempt_number"
+		validation_attempts_json="$validation_attempts_json,$validation_json"
+	fi
+	if [ "$profile_floor_infeasible" != true ] && [ "$validation_safety_pass" != true ]; then
+		validation_error="Selected profile candidate failed final safety confirmation (DL realization ${dl_candidate_realization}%, capacity ${dl_retention}%; UL realization ${ul_candidate_realization}%, capacity ${ul_retention}%; max ICMP +${loaded_delta_ms} ms, transport +${transport_loaded_delta_ms} ms, loss ${loss_percent}%, effective CPU ${cpu_peak}%); no configuration was written."
+		stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":6,\"stage\":\"confirmation\",\"error\":\"$(json_escape "$validation_error")\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":$phase_evidence_complete,\"phase_contamination_seen\":$phase_contamination_seen,\"route_mode\":\"$(json_escape "$route_mode")\",\"route_interface\":\"$(json_escape "$route_if")\",\"route_identity\":\"$(json_escape "$route_identity")\",\"external_ip\":\"$(json_escape "$selected_external_ip")\",\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[$runs_json],\"phase_background\":[$phase_background_runs_json],\"validation_attempts\":[$validation_attempts_json],\"validation\":$validation_json,\"profile_search\":{\"download\":$dl_search_json,\"upload\":$ul_search_json},\"fair_outcome\":$fair_outcome_json,\"pinger_plan\":$pinger_plan,\"proposal\":$proposal,\"configuration_written\":false}"
+		exit 1
+	fi
+
+	profile_target_met="$validation_quality_target_met"
+	profile_manual_only=false
+	profile_capacity_floor_met=true
+	if [ "$profile_floor_infeasible" = true ]; then
+		profile_outcome_mode=capacity-floor-infeasible
+		profile_manual_only=true
+		profile_capacity_floor_met=false
+	else
+		case "$autotune_profile:$profile_target_met" in
+			gaming:true) profile_outcome_mode=target-a-plus-met ;;
+			gaming:false) profile_outcome_mode=best-attainable-quality-fallback; profile_manual_only=true ;;
+			best_overall:true) profile_outcome_mode=target-a-met ;;
+			best_overall:false) profile_outcome_mode=balanced-fallback; profile_manual_only=true ;;
+			fair:true) profile_outcome_mode=throughput-optimum-c-or-better ;;
+			fair:false) profile_outcome_mode=throughput-optimum-quality-fallback; profile_manual_only=true ;;
+		esac
+	fi
+	profile_objective="$(extract_json "$dl_search_json" '@.objective')"
+	profile_target_grade="$(extract_json "$proposal" '@.target_grade')"
+	profile_capacity_floor="$(extract_json "$dl_search_json" '@.capacity_floor_percent')"
+	profile_outcome_json="{\"mode\":\"$profile_outcome_mode\",\"objective\":\"$(json_escape "$profile_objective")\",\"target_grade\":\"$(json_escape "$profile_target_grade")\",\"target_met\":$profile_target_met,\"actual_grade\":\"$(json_escape "$validation_actual_grade")\",\"capacity_floor_percent\":$profile_capacity_floor,\"capacity_floor_met\":$profile_capacity_floor_met,\"infeasible_reason\":\"$(json_escape "$profile_floor_infeasible_reason")\",\"manual_only\":$profile_manual_only,\"selected_pair\":{\"download_kbps\":$selected_dl_candidate,\"upload_kbps\":$selected_ul_candidate},\"download\":$dl_search_json,\"upload\":$ul_search_json}"
+	if [ "$autotune_profile" = fair ]; then
+		if [ "$profile_floor_infeasible" = true ]; then
+			build_fair_outcome throughput-fallback capacity-floor-infeasible
+		elif [ "$profile_target_met" = true ]; then
+			build_fair_outcome quality-target-met
 		else
-			validation_error="Directional candidate validation failed (${validation_correction_action}: ${validation_correction_reason}; DL realization ${dl_candidate_realization}%, capacity ${dl_retention}%; UL realization ${ul_candidate_realization}%, capacity ${ul_retention}%; max ICMP +${loaded_delta_ms} ms, transport +${transport_loaded_delta_ms} ms, loss ${loss_percent}%, CPU ${cpu_peak}%); no configuration was written."
-			stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":5,\"stage\":\"validation\",\"error\":\"$(json_escape "$validation_error")\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":$phase_evidence_complete,\"phase_contamination_seen\":$phase_contamination_seen,\"route_mode\":\"$(json_escape "$route_mode")\",\"route_interface\":\"$(json_escape "$route_if")\",\"route_identity\":\"$(json_escape "$route_identity")\",\"external_ip\":\"$(json_escape "$selected_external_ip")\",\"background\":$(background_json),\"baseline\":{\"median_ms\":$idle_median_ms,\"p95_ms\":$idle_p95_ms,\"samples\":$baseline_samples,\"transport_median_ms\":$transport_idle_median_ms,\"transport_p95_ms\":$transport_idle_p95_ms,\"transport_samples\":$transport_idle_samples,\"transport_backend\":\"$(json_escape "$transport_probe_backend")\",\"transport_endpoint\":\"$(json_escape "$transport_probe_endpoint")\"},\"runs\":[$runs_json],\"phase_background\":[$phase_background_runs_json],\"validation_attempts\":[$validation_attempts_json],\"validation\":$validation_json,\"fair_outcome\":$fair_outcome_json,\"pinger_plan\":$pinger_plan,\"proposal\":$proposal,\"configuration_written\":false}"
-			exit 1
+			build_fair_outcome throughput-fallback
 		fi
 	fi
 
@@ -4456,16 +4910,18 @@ run_job() {
 	manual_apply_eligible=false
 	if [ "$confidence_mode" = normal ] && [ "$phase_evidence_complete" = true ] &&
 		[ "$phase_contamination_seen" = false ] && [ "$validation_contaminated" = false ]; then
-		if [ "$autotune_profile" = fair ]; then
-			[ "$validation_hard_pass" = true ] && manual_apply_eligible=true
-			[ "$validation_pass" = true ] && [ "$validation_quality_target_met" = true ] &&
-				auto_apply_eligible=true
-		elif [ "$validation_pass" = true ]; then
+		if [ "$profile_floor_infeasible" = true ]; then
+			# This only exposes fail-closed Review choices. apply_sqm is absent from
+			# the typed Fair action list and disabling SQM still requires its own
+			# clean bidirectional no-SQM proof in LuCI and apply-guard.
 			manual_apply_eligible=true
-			auto_apply_eligible=true
+		else
+			[ "$validation_safety_pass" = true ] && manual_apply_eligible=true
+			[ "$validation_safety_pass" = true ] && [ "$profile_target_met" = true ] &&
+				auto_apply_eligible=true
 		fi
 	fi
-	stage_terminal_json result "{\"state\":\"complete\",\"schema_version\":5,\"auto_apply_eligible\":$auto_apply_eligible,\"manual_apply_eligible\":$manual_apply_eligible,\"phase_evidence_complete\":$phase_evidence_complete,\"phase_contamination_seen\":$phase_contamination_seen,\"job_id\":\"$(json_escape "$job_name")\",\"target_interface\":\"$(json_escape "$target_if_input")\",\"resolved_interface\":\"$(json_escape "$target_if")\",\"source_ip\":\"$(json_escape "$source_ip")\",\"external_ip\":\"$(json_escape "$selected_external_ip")\",\"route_interface\":\"$(json_escape "$route_if")\",\"route_mode\":\"$(json_escape "$route_mode")\",\"mwan3_member\":\"$(json_escape "$mwan3_member")\",\"route_identity\":\"$(json_escape "$route_identity")\",\"link_kind\":\"$(json_escape "$link_kind")\",\"conservative\":$([ "$conservative_mode" = 1 ] && printf true || printf false),\"confidence_mode\":\"$confidence_mode\",\"background\":$(background_json),\"phase_background\":[$phase_background_runs_json],\"usable_directions\":{\"download\":${background_dl_usable:-true},\"upload\":${background_ul_usable:-true}},\"validation_thresholds\":{\"candidate_realization_min_percent\":$validation_candidate_realization_min_percent,\"candidate_realization_max_percent\":$validation_candidate_realization_max_percent,\"capacity_retention_min_percent\":$validation_capacity_retention_min_percent,\"delay_max_ms\":$validation_delay_max_ms,\"loss_max_percent\":$validation_loss_max_percent,\"cpu_max_percent\":$validation_cpu_max_percent},\"baseline\":{\"median_ms\":$idle_median_ms,\"p95_ms\":$idle_p95_ms,\"samples\":$baseline_samples,\"transport_median_ms\":$transport_idle_median_ms,\"transport_p95_ms\":$transport_idle_p95_ms,\"transport_samples\":$transport_idle_samples,\"transport_backend\":\"$(json_escape "$transport_probe_backend")\",\"transport_endpoint\":\"$(json_escape "$transport_probe_endpoint")\"},\"runs\":[$runs_json],\"validation_attempts\":[$validation_attempts_json],\"validation\":$validation_json,\"fair_outcome\":$fair_outcome_json,\"pinger_plan\":$pinger_plan,\"proposal\":$proposal,\"configuration_written\":false}"
+	stage_terminal_json result "{\"state\":\"complete\",\"schema_version\":6,\"auto_apply_eligible\":$auto_apply_eligible,\"manual_apply_eligible\":$manual_apply_eligible,\"phase_evidence_complete\":$phase_evidence_complete,\"phase_contamination_seen\":$phase_contamination_seen,\"job_id\":\"$(json_escape "$job_name")\",\"target_interface\":\"$(json_escape "$target_if_input")\",\"resolved_interface\":\"$(json_escape "$target_if")\",\"source_ip\":\"$(json_escape "$source_ip")\",\"external_ip\":\"$(json_escape "$selected_external_ip")\",\"route_interface\":\"$(json_escape "$route_if")\",\"route_mode\":\"$(json_escape "$route_mode")\",\"mwan3_member\":\"$(json_escape "$mwan3_member")\",\"route_identity\":\"$(json_escape "$route_identity")\",\"link_kind\":\"$(json_escape "$link_kind")\",\"conservative\":$([ "$conservative_mode" = 1 ] && printf true || printf false),\"confidence_mode\":\"$confidence_mode\",\"background\":$(background_json),\"phase_background\":[$phase_background_runs_json],\"usable_directions\":{\"download\":${background_dl_usable:-true},\"upload\":${background_ul_usable:-true}},\"validation_thresholds\":{\"candidate_realization_min_percent\":$validation_candidate_realization_min_percent,\"candidate_realization_max_percent\":$validation_candidate_realization_max_percent,\"capacity_retention_min_percent\":$validation_capacity_retention_min_percent,\"delay_max_ms\":$validation_delay_max_ms,\"loss_max_percent\":$validation_loss_max_percent,\"cpu_max_percent\":$validation_cpu_max_percent},\"baseline\":{\"median_ms\":$idle_median_ms,\"p95_ms\":$idle_p95_ms,\"samples\":$baseline_samples,\"transport_median_ms\":$transport_idle_median_ms,\"transport_p95_ms\":$transport_idle_p95_ms,\"transport_samples\":$transport_idle_samples,\"transport_backend\":\"$(json_escape "$transport_probe_backend")\",\"transport_endpoint\":\"$(json_escape "$transport_probe_endpoint")\"},\"runs\":[$runs_json],\"validation_attempts\":[$validation_attempts_json],\"validation\":$validation_json,\"profile_outcome\":$profile_outcome_json,\"profile_search\":{\"download\":$dl_search_json,\"upload\":$ul_search_json},\"fair_outcome\":$fair_outcome_json,\"pinger_plan\":$pinger_plan,\"proposal\":$proposal,\"configuration_written\":false}"
 }
 
 job_recovery_pending() {

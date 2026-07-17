@@ -33,7 +33,7 @@ case "$expression" in
 		[ "$attestation" = 0 ] && emit "${RESULT_STATE-complete}" || emit "${ATTEST_STATE-ready}"
 		;;
 	@.schema_version)
-		[ "$attestation" = 0 ] && emit "${RESULT_SCHEMA_VERSION-5}" || emit "${ATTEST_SCHEMA_VERSION-1}"
+		[ "$attestation" = 0 ] && emit "${RESULT_SCHEMA_VERSION-6}" || emit "${ATTEST_SCHEMA_VERSION-1}"
 		;;
 	@.producer) emit "${RESULT_PRODUCER-cake-autorate-rs-autotune}" ;;
 	@.profile) emit "${RESULT_PROFILE-best_overall}" ;;
@@ -46,7 +46,10 @@ case "$expression" in
 	@.proposal.throughput_priority) emit "${RESULT_THROUGHPUT_PRIORITY-false}" ;;
 	@.validation.pass) emit "${RESULT_VALIDATION_PASS-true}" ;;
 	@.validation.hard_pass) emit "${RESULT_VALIDATION_HARD_PASS-true}" ;;
+	@.validation.safety_pass) emit "${RESULT_VALIDATION_SAFETY_PASS-true}" ;;
 	@.validation.quality_target_met) emit "${RESULT_QUALITY_TARGET_MET-true}" ;;
+	@.profile_outcome.target_met) emit "${RESULT_PROFILE_TARGET_MET-true}" ;;
+	@.profile_outcome.manual_only) emit "${RESULT_PROFILE_MANUAL_ONLY-false}" ;;
 	@.auto_apply_eligible) emit "${RESULT_AUTO_APPLY_ELIGIBLE-true}" ;;
 	@.manual_apply_eligible) emit "${RESULT_MANUAL_APPLY_ELIGIBLE-true}" ;;
 	@.confidence_mode) emit "${RESULT_CONFIDENCE_MODE-normal}" ;;
@@ -65,7 +68,7 @@ case "$expression" in
 	@.validation.gates\[\*\].pass) emit "${RESULT_GATE_PASSES-true true true true true true true true true true true true true true}" ;;
 	@.validation.gates\[\*\].actual) emit "${RESULT_GATE_ACTUALS-90 90 90 90 90 90 10 10 0 40 10 10 0 40}" ;;
 	@.validation.gates\[\*\].limit) emit "${RESULT_GATE_LIMITS-80 80 110 110 80 80 30 30 3 85 30 30 3 85}" ;;
-	@.validation.gates\[\*\].comparison) emit "${RESULT_GATE_COMPARISONS-minimum minimum maximum maximum minimum minimum maximum maximum maximum maximum maximum maximum maximum maximum}" ;;
+	@.validation.gates\[\*\].comparison) emit "${RESULT_GATE_COMPARISONS-minimum minimum maximum maximum minimum minimum exclusive-maximum exclusive-maximum maximum maximum exclusive-maximum exclusive-maximum maximum maximum}" ;;
 	@.config_fingerprint) emit "${RESULT_CONFIG_FINGERPRINT-__missing__}" ;;
 	@.job_id) emit "${RESULT_JOB_ID-test}" ;;
 	@.target_interface)
@@ -407,12 +410,12 @@ reset_case() {
 	unset ATTEST_STATE ATTEST_SCHEMA_VERSION ATTEST_TARGET_INTERFACE ATTEST_RESOLVED_INTERFACE ATTEST_ROUTE_INTERFACE ATTEST_SOURCE_IP ATTEST_EXTERNAL_IP ATTEST_ROUTE_MODE ATTEST_MWAN3_MEMBER ATTEST_ROUTE_IDENTITY
 	unset RESULT_CORRECTION_ACTION RESULT_CORRECTION_FEASIBLE RESULT_GATE_CODES RESULT_GATE_REQUIRED RESULT_GATE_PASSES RESULT_GATE_ACTUALS RESULT_GATE_LIMITS RESULT_GATE_COMPARISONS
 	unset RESULT_PRODUCER RESULT_PROFILE RESULT_RUN_ID RESULT_VALIDATION_PROFILE RESULT_PROPOSAL_SCHEMA_VERSION RESULT_PROPOSAL_PROFILE RESULT_TARGET_GRADE
-	unset RESULT_QUALITY_TARGET_REQUIRED RESULT_THROUGHPUT_PRIORITY RESULT_VALIDATION_HARD_PASS RESULT_QUALITY_TARGET_MET RESULT_MANUAL_APPLY_ELIGIBLE
+	unset RESULT_QUALITY_TARGET_REQUIRED RESULT_THROUGHPUT_PRIORITY RESULT_VALIDATION_HARD_PASS RESULT_VALIDATION_SAFETY_PASS RESULT_QUALITY_TARGET_MET RESULT_PROFILE_TARGET_MET RESULT_PROFILE_MANUAL_ONLY RESULT_MANUAL_APPLY_ELIGIBLE
 	unset RESULT_REALIZATION_MIN_PERCENT RESULT_REALIZATION_MAX_PERCENT RESULT_RETENTION_PERCENT RESULT_ICMP_DELTA_MAX_MS RESULT_DELAY_MAX_MS RESULT_LOSS_MAX_PERCENT RESULT_CPU_MAX_PERCENT
 	unset RESULT_SQM_QDISC RESULT_SQM_SCRIPT RESULT_SQM_CLASSIFICATION RESULT_SQM_SQUASH_DSCP RESULT_SQM_SQUASH_INGRESS RESULT_SQM_INGRESS_ECN RESULT_SQM_EGRESS_ECN RESULT_SQM_IQDISC_OPTS RESULT_SQM_EQDISC_OPTS
 	unset RESULT_MINIMUM_KBPS RESULT_BASE_KBPS RESULT_MAXIMUM_KBPS RESULT_CAP_KBPS RESULT_OBSERVED_LOW_KBPS RESULT_OBSERVED_MEDIAN_KBPS RESULT_OBSERVED_HIGH_KBPS RESULT_ACTIVE_THRESHOLD_KBPS RESULT_ADJUST_UP_MS RESULT_DELAY_MS RESULT_ADJUST_DOWN_MS RESULT_HOLD_S RESULT_GROWTH_PERCENT RESULT_PROBE_S RESULT_COOLDOWN_S RESULT_TTL_S RESULT_LINK_OVERHEAD RESULT_LINK_MPU RESULT_CONFIDENCE
 	export RESULT_STATE=complete
-	export RESULT_SCHEMA_VERSION=5
+	export RESULT_SCHEMA_VERSION=6
 	export RESULT_PRODUCER=cake-autorate-rs-autotune
 	export RESULT_PROFILE=best_overall
 	export RESULT_RUN_ID=scheduler-test-run
@@ -424,7 +427,10 @@ reset_case() {
 	export RESULT_THROUGHPUT_PRIORITY=false
 	export RESULT_VALIDATION_PASS=true
 	export RESULT_VALIDATION_HARD_PASS=true
+	export RESULT_VALIDATION_SAFETY_PASS=true
 	export RESULT_QUALITY_TARGET_MET=true
+	export RESULT_PROFILE_TARGET_MET=true
+	export RESULT_PROFILE_MANUAL_ONLY=false
 	export RESULT_AUTO_APPLY_ELIGIBLE=true
 	export RESULT_MANUAL_APPLY_ELIGIBLE=true
 	export RESULT_CONFIDENCE_MODE=normal
@@ -534,7 +540,10 @@ reset_case; export RESULT_THROUGHPUT_PRIORITY=true; expect_gate_rejection 'tampe
 reset_case; export RESULT_STATE=failed; expect_gate_rejection 'non-complete result'
 reset_case; export RESULT_VALIDATION_PASS=false; expect_gate_rejection 'failed validation'
 reset_case; export RESULT_VALIDATION_HARD_PASS=false; expect_gate_rejection 'failed hard safety gates'
+reset_case; export RESULT_VALIDATION_SAFETY_PASS=false; expect_gate_rejection 'failed selected-candidate safety gates'
 reset_case; export RESULT_QUALITY_TARGET_MET=false; expect_gate_rejection 'unmet unattended quality target'
+reset_case; export RESULT_PROFILE_TARGET_MET=false; expect_gate_rejection 'manual profile fallback'
+reset_case; export RESULT_PROFILE_MANUAL_ONLY=true; expect_gate_rejection 'manual-only profile result'
 reset_case; export RESULT_AUTO_APPLY_ELIGIBLE=false; expect_gate_rejection 'helper-ineligible result'
 reset_case; export RESULT_MANUAL_APPLY_ELIGIBLE=false; expect_gate_rejection 'non-reviewable result'
 reset_case; export RESULT_CONFIDENCE_MODE=low; expect_gate_rejection 'low-confidence result'
@@ -557,6 +566,7 @@ reset_case; export RESULT_GATE_LIMITS='80 80 110 110 80 80 100 100 0 95 100 100 
 reset_case; export RESULT_GATE_ACTUALS='79 90 90 90 90 90 10 10 0 40 10 10 0 40'; expect_gate_rejection 'forged passing minimum gate'
 reset_case; export RESULT_GATE_ACTUALS='90 90 111 90 90 90 10 10 0 40 10 10 0 40'; expect_gate_rejection 'forged passing maximum gate'
 reset_case; export RESULT_GATE_COMPARISONS='minimum minimum minimum maximum minimum minimum maximum maximum maximum maximum maximum maximum maximum maximum'; expect_gate_rejection 'mislabeled gate comparison'
+reset_case; export RESULT_GATE_ACTUALS='90 90 90 90 90 90 30 10 0 40 10 10 0 40'; expect_gate_rejection 'quality exactly on exclusive grade boundary'
 
 reset_case; export RESULT_MINIMUM_KBPS=0; expect_gate_rejection 'zero minimum rate'
 reset_case; export RESULT_BASE_KBPS=4000; expect_gate_rejection 'base below minimum'

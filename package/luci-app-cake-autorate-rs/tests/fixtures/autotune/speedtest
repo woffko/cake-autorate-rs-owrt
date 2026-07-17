@@ -60,7 +60,19 @@ case "$3" in
 		   [ -n "${AUTOTUNE_MOCK_SHAPER_OWNERSHIP_LOST_MARKER:-}" ]; then
 			touch "$AUTOTUNE_MOCK_SHAPER_OWNERSHIP_LOST_MARKER"
 		fi
-		if [ "${AUTOTUNE_MOCK_RC16:-0}" = 1 ] && [ "$count" -le 2 ]; then
+		if [ "${AUTOTUNE_MOCK_FAIR_BOUNDARY:-0}" = 1 ] && [ "${5:-}" != shaped ]; then
+			printf '{"download_kbps":902700,"upload_kbps":900000,"backend":"speedtest-go","test_direction":"%s","server_id":"17372","server_sponsor":"Fair boundary fixture","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.1","shaper_bypassed":true,"sqm_paused":true}\n' "$reported_direction"
+		elif [ "${AUTOTUNE_MOCK_FAIR_BOUNDARY:-0}" = 1 ] && [ "$reported_direction" = download ]; then
+			case "$count" in
+				6) boundary_achieved=783677 ;;
+				8) boundary_achieved=795000 ;;
+				10) boundary_achieved=812430 ;;
+				*) boundary_achieved=813000 ;;
+			esac
+			printf '{"download_kbps":%s,"upload_kbps":0,"backend":"speedtest-go","test_direction":"download","server_id":"17372","server_sponsor":"Fair boundary fixture","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.1","shaper_bypassed":false,"sqm_paused":false}\n' "$boundary_achieved"
+		elif [ "${AUTOTUNE_MOCK_FAIR_BOUNDARY:-0}" = 1 ] && [ "$reported_direction" = upload ]; then
+			printf '%s\n' '{"download_kbps":0,"upload_kbps":810000,"backend":"speedtest-go","test_direction":"upload","server_id":"17372","server_sponsor":"Fair boundary fixture","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.1","shaper_bypassed":false,"sqm_paused":false}'
+		elif [ "${AUTOTUNE_MOCK_RC16:-0}" = 1 ] && [ "${5:-}" != shaped ]; then
 			printf '{"download_kbps":883500,"upload_kbps":904500,"backend":"speedtest-go","test_direction":"%s","server_id":"17372","server_sponsor":"RC16 fixture","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.16","shaper_bypassed":true,"sqm_paused":true}\n' "$reported_direction"
 		elif [ "${AUTOTUNE_MOCK_RC16:-0}" = 1 ] && [ "$reported_direction" = download ]; then
 			printf '{"download_kbps":683153,"upload_kbps":0,"backend":"speedtest-go","test_direction":"download","server_id":"17372","server_sponsor":"RC16 fixture","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.16","shaper_bypassed":false,"sqm_paused":false}\n'
@@ -88,9 +100,9 @@ case "$3" in
 			printf '{"download_kbps":45000,"upload_kbps":0,"backend":"%s","test_direction":"download","server_id":"%s","server_sponsor":"Test Server","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.1","shaper_bypassed":false,"sqm_paused":false}\n' "$result_backend" "$server_id"
 		elif [ "${AUTOTUNE_MOCK_FAIR_SHAPED_BAD:-0}" = 1 ] && [ "$reported_direction" = upload ]; then
 			printf '{"download_kbps":0,"upload_kbps":9000,"backend":"%s","test_direction":"upload","server_id":"%s","server_sponsor":"Test Server","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.1","shaper_bypassed":false,"sqm_paused":false}\n' "$result_backend" "$server_id"
-		elif [ "${AUTOTUNE_MOCK_DIRECTIONAL_CORRECT:-0}" = 1 ] && [ "$count" -eq 3 ]; then
+		elif [ "${AUTOTUNE_MOCK_DIRECTIONAL_CORRECT:-0}" = 1 ] && [ "$count" -eq 6 ]; then
 			printf '{"download_kbps":39000,"upload_kbps":10000,"backend":"speedtest-go","test_direction":"%s","server_id":"17372","server_sponsor":"Test Server","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.1","shaper_bypassed":false,"sqm_paused":false}\n' "$reported_direction"
-		elif [ "${AUTOTUNE_MOCK_CORRECT:-0}" = 1 ] && [ "$count" -eq 3 ]; then
+		elif [ "${AUTOTUNE_MOCK_CORRECT:-0}" = 1 ] && [ "$count" -eq 6 ]; then
 			printf '{"download_kbps":20000,"upload_kbps":4000,"backend":"speedtest-go","test_direction":"%s","server_id":"17372","server_sponsor":"Test Server","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.1","shaper_bypassed":false,"sqm_paused":false}\n' "$reported_direction"
 		else
 			printf '{"download_kbps":42000,"upload_kbps":8000,"backend":"%s","test_direction":"%s","server_id":"%s","server_sponsor":"Test Server","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.1","shaper_bypassed":false,"sqm_paused":false}\n' "$result_backend" "$reported_direction" "$server_id"
@@ -99,6 +111,14 @@ case "$3" in
 		   { [ -z "${AUTOTUNE_MOCK_VALID_JSON_EXIT_AT_COUNT:-}" ] ||
 		     [ "$count" -eq "$AUTOTUNE_MOCK_VALID_JSON_EXIT_AT_COUNT" ]; }; then
 			exit "$AUTOTUNE_MOCK_VALID_JSON_EXIT_CODE"
+		fi
+		if [ -n "${AUTOTUNE_MOCK_POST_RESULT_DESCENDANT_AT_COUNT:-}" ] &&
+		   [ "$count" -eq "$AUTOTUNE_MOCK_POST_RESULT_DESCENDANT_AT_COUNT" ]; then
+			# Model a normal helper exit while one already-finishing descendant
+			# still keeps the supervised process group/session alive. The leader
+			# is briefly a zombie with an empty cmdline; this is not PID reuse or
+			# an argv identity violation.
+			sleep 2 &
 		fi
 		;;
 	*)

@@ -966,6 +966,50 @@ quality_grade_rank() {
 	esac
 }
 
+validate_profile_search_contract() {
+	search_direction="$1"
+	search_allow_unsafe="${2:-false}"
+	case "$search_direction" in
+		download) search_rate_path=download ;;
+		upload) search_rate_path=upload ;;
+		*) return 1 ;;
+	esac
+	search_root="@.profile_search.$search_direction"
+	require_result_flag "$search_root.schema_version" 1 "The profile-search schema is invalid."
+	require_result_flag "$search_root.profile" "$profile" "The profile-search profile changed."
+	require_result_flag "$search_root.direction" "$search_direction" "The profile-search direction changed."
+	search_action="$(require_result_value "$search_root.action")" ||
+		die "The profile-search terminal action is missing."
+	case "$search_action" in complete|fallback) ;; *) die "The profile search still has a pending or inconclusive action." ;; esac
+	search_selected_safety="$(require_result_value "$search_root.selected.safety_pass")" ||
+		die "The selected direction safety state is missing."
+	case "$search_selected_safety" in
+		true) ;;
+		false)
+			[ "$search_allow_unsafe" = true ] && [ "$search_action" = fallback ] ||
+				die "The selected direction did not preserve its safety floor."
+			search_reason="$(require_result_value "$search_root.reason")" ||
+				die "The unsafe profile-search reason is missing."
+			case "$search_reason" in
+				repeatable-compute-ceiling-below-capacity-floor|repeatable-shaper-ceiling-below-capacity-floor) ;;
+				*) die "The unsafe profile-search result has no proven repeatable ceiling." ;;
+			esac
+			profile_unsafe_direction_count=$((profile_unsafe_direction_count + 1))
+			;;
+		*) die "The selected direction safety state is invalid." ;;
+	esac
+	selected_rate="$(require_result_value "$search_root.selected.candidate_kbps")" ||
+		die "The selected profile-search rate is missing."
+	proposal_selected_rate="$(require_result_value "@.proposal.$search_rate_path.base_kbps")" ||
+		die "The proposal base rate is missing."
+	validation_selected_rate="$(require_result_value "@.validation.candidate_base.${search_direction}_kbps")" ||
+		die "The confirmed validation rate is missing."
+	is_positive_rate "$selected_rate" &&
+		numbers_equal "$selected_rate" "$proposal_selected_rate" &&
+		numbers_equal "$selected_rate" "$validation_selected_rate" ||
+		die "The selected, proposed, and confirmed direction rates differ."
+}
+
 arm_guard() {
 	job="${1:-}"
 	target="${2:-}"
@@ -1019,7 +1063,7 @@ arm_guard() {
 	owned_regular "$result_copy" || die "The Full Auto-Tune result copy is unsafe."
 
 	require_result_flag '@.state' complete "Only a complete Full Auto-Tune result can be applied."
-	require_result_flag '@.schema_version' 5 "Only the fail-closed Full Auto-Tune schema can be applied."
+	require_result_flag '@.schema_version' 6 "Only the fail-closed Full Auto-Tune schema can be applied."
 	require_result_flag '@.producer' "$autotune_result_producer" "The Full Auto-Tune result producer is invalid."
 	require_result_flag '@.manual_apply_eligible' true "This Full Auto-Tune result is not eligible for explicit review and apply."
 	require_result_flag '@.phase_evidence_complete' true "This Full Auto-Tune result has incomplete phase evidence."
@@ -1034,33 +1078,75 @@ arm_guard() {
 	safe_run_id "$run_id" || die "The Full Auto-Tune run identity is unsafe."
 	load_profile_contract
 	require_result_flag '@.validation.profile' "$profile" "The terminal validation profile differs from the proposal."
+	profile_outcome_mode="$(require_result_value '@.profile_outcome.mode')" ||
+		die "The profile outcome mode is missing."
+	profile_floor_infeasible=false
+	if [ "$profile_outcome_mode" = capacity-floor-infeasible ]; then
+		[ "$profile" = fair ] && [ "$action" = disable_sqm ] ||
+			die "An infeasible capacity floor may only support an explicit Fair SQM-disable review."
+		profile_floor_infeasible=true
+		require_result_flag '@.validation.safety_pass' false "The capacity-floor fallback unexpectedly claims to be safe."
+		require_result_flag '@.profile_outcome.capacity_floor_met' false "The capacity-floor fallback state changed."
+		require_result_flag '@.profile_outcome.manual_only' true "The capacity-floor fallback must be manual-only."
+		require_result_flag '@.auto_apply_eligible' false "A capacity-floor fallback must never auto-apply."
+		profile_infeasible_reason="$(require_result_value '@.profile_outcome.infeasible_reason')" ||
+			die "The capacity-floor fallback reason is missing."
+	else
+		require_result_flag '@.validation.safety_pass' true "The selected candidate failed a safety gate."
+		require_result_flag '@.profile_outcome.capacity_floor_met' true "The selected candidate did not prove its capacity floor."
+	fi
+	require_result_flag '@.profile_outcome.target_grade' "$target_grade" "The profile outcome target changed."
+	profile_outcome_floor="$(require_result_value '@.profile_outcome.capacity_floor_percent')" ||
+		die "The profile outcome capacity floor is missing."
+	numbers_equal "$profile_outcome_floor" "$validation_retention" ||
+		die "The profile outcome and proposal capacity floors differ."
+	profile_target_met="$(require_result_value '@.profile_outcome.target_met')" ||
+		die "The profile outcome target state is missing."
+	[ "$profile_target_met" = "$(json_get "$result_copy" '@.validation.quality_target_met')" ] ||
+		die "The profile outcome and final validation target state differ."
+	profile_unsafe_direction_count=0
+	validate_profile_search_contract download "$profile_floor_infeasible"
+	validate_profile_search_contract upload "$profile_floor_infeasible"
+	if [ "$profile_floor_infeasible" = true ] && [ "$profile_unsafe_direction_count" -lt 1 ]; then
+		die "The capacity-floor fallback contains no direction with a proven repeatable ceiling."
+	fi
 	case "$action" in
 		apply_sqm)
-			if [ "$(json_get "$result_copy" '@.validation.pass')" = true ]; then
+			if [ "$profile_target_met" = true ]; then
 				require_result_flag '@.auto_apply_eligible' true "A fully passing proposal unexpectedly requires manual-only apply."
-				require_result_flag '@.validation.hard_pass' true "The passing proposal failed a hard safety gate."
-				require_result_flag '@.validation.quality_target_met' true "The passing proposal did not meet its quality target."
-				require_result_flag '@.validation.correction.action' none "The Full Auto-Tune proposal still requires correction."
-				require_result_flag '@.validation.correction.feasible' true "The Full Auto-Tune proposal is infeasible."
-			elif [ "$profile" = fair ] &&
-			     [ "$(json_get "$result_copy" '@.validation.hard_pass')" = true ] &&
-			     [ "$(json_get "$result_copy" '@.validation.quality_target_met')" = false ]; then
-				require_result_flag '@.auto_apply_eligible' false "A Fair throughput fallback must never be auto-applied."
-				fair_mode="$(json_get "$result_copy" '@.fair_outcome.mode')"
-				case "$fair_mode" in throughput-fallback|sqm-disable-recommended) ;;
-					*) die "The Fair throughput fallback is missing its typed outcome." ;;
-				esac
-				result_action_allowed apply_sqm ||
-					die "The Fair outcome does not allow applying its best safe SQM candidate."
+				require_result_flag '@.profile_outcome.manual_only' false "A target-meeting outcome was marked manual-only."
 			else
-				die "Full Auto-Tune validation did not produce an applicable SQM candidate."
+				require_result_flag '@.auto_apply_eligible' false "A profile fallback must never be auto-applied."
+				require_result_flag '@.profile_outcome.manual_only' true "A below-target fallback was not marked manual-only."
+				profile_outcome_mode="$(require_result_value '@.profile_outcome.mode')" ||
+					die "The profile fallback outcome is missing."
+				case "$profile:$profile_outcome_mode" in
+					gaming:best-attainable-quality-fallback|best_overall:balanced-fallback) ;;
+					fair:throughput-optimum-quality-fallback)
+						fair_mode="$(json_get "$result_copy" '@.fair_outcome.mode')"
+						case "$fair_mode" in throughput-fallback|sqm-disable-recommended) ;;
+							*) die "The Fair throughput fallback is missing its typed outcome." ;;
+						esac
+						result_action_allowed apply_sqm ||
+							die "The Fair outcome does not allow applying its best safe SQM candidate."
+						;;
+					*) die "The below-target result has no recognized typed fallback." ;;
+				esac
 			fi
 			;;
 		disable_sqm)
 			[ "$profile" = fair ] || die "Only a Fair comparison may recommend disabling SQM."
 			require_result_flag '@.auto_apply_eligible' false "Disabling SQM must never be an automatic action."
-			require_result_flag '@.validation.hard_pass' true "The Fair comparison has no safe shaped reference candidate."
-			require_result_flag '@.validation.quality_target_met' false "SQM disable is not available when the Fair quality target was met."
+			if [ "$profile_floor_infeasible" = true ]; then
+				require_result_flag '@.validation.hard_pass' false "The infeasible Fair result unexpectedly passed all hard gates."
+				require_result_flag '@.fair_outcome.capacity_floor_met' false "The Fair outcome lost its infeasible-floor state."
+				require_result_flag '@.fair_outcome.apply_sqm_available' false "The unsafe shaped candidate must not be applyable."
+			else
+				require_result_flag '@.validation.hard_pass' true "The Fair comparison has no safe shaped reference candidate."
+				require_result_flag '@.validation.quality_target_met' false "SQM disable is not available when the Fair quality target was met."
+				require_result_flag '@.fair_outcome.capacity_floor_met' true "The Fair comparison did not preserve its throughput floor."
+				require_result_flag '@.fair_outcome.apply_sqm_available' true "The safe shaped comparison candidate disappeared."
+			fi
 			require_result_flag '@.fair_outcome.mode' sqm-disable-recommended "The Fair result did not recommend disabling SQM."
 			require_result_flag '@.fair_outcome.target_grade' C "The Fair comparison target changed."
 			require_result_flag '@.fair_outcome.target_delta_ms' 200 "The Fair comparison delay target changed."

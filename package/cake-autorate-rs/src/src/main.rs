@@ -6638,6 +6638,7 @@ fn print_usage() {
     );
     eprintln!("       cake-autorated --autotune-validate [--profile gaming|best_overall|fair] --dl-observed-low-kbps N --ul-observed-low-kbps N --dl-candidate-kbps N --ul-candidate-kbps N --dl-achieved-kbps N --ul-achieved-kbps N --dl-min-kbps N --ul-min-kbps N --dl-max-kbps N --ul-max-kbps N --icmp-delta-ms N --transport-delta-ms N --loss-percent N --cpu-percent N");
     eprintln!("         [--dl-icmp-delta-ms N --ul-icmp-delta-ms N --dl-transport-delta-ms N --ul-transport-delta-ms N --dl-loss-percent N --ul-loss-percent N --dl-cpu-percent N --ul-cpu-percent N]");
+    eprintln!("       cake-autorated --autotune-optimize-direction --profile gaming|best_overall|fair --direction download|upload --observed-low-kbps N --minimum-kbps N --upper-kbps N --observations C,A,I,T,L,P[;...] [--uncertainty-percent N] [--max-attempts N]");
     eprintln!("       cake-autorated --transport-probe --backend websocket|tcp|http|legacy-http [--endpoint URL] [--device IFACE] [--source-ip IPv4] [--fwmark HEX] [--count N] [--timeout SEC] [--interval-ms N]");
 }
 
@@ -7094,6 +7095,136 @@ where
     Ok(())
 }
 
+fn parse_search_observations(value: &str) -> Result<Vec<autotune::SearchObservation>, String> {
+    if value.is_empty() {
+        return Err("search observation list must not be empty".to_string());
+    }
+    let mut observations = Vec::new();
+    for (index, record) in value.split(';').enumerate() {
+        if index >= autotune::MAX_PROFILE_SEARCH_OBSERVATIONS {
+            return Err(format!(
+                "search observation count must not exceed {}",
+                autotune::MAX_PROFILE_SEARCH_OBSERVATIONS
+            ));
+        }
+        let fields = record.split(',').collect::<Vec<_>>();
+        if fields.len() != 6 || fields.iter().any(|field| field.is_empty()) {
+            return Err(format!(
+                "search observation {} must contain candidate,achieved,icmp,transport,loss,cpu",
+                index + 1
+            ));
+        }
+        observations.push(autotune::SearchObservation {
+            candidate_kbps: parse_cli_u64("search candidate rate", fields[0])?,
+            achieved_kbps: parse_cli_u64("search achieved rate", fields[1])?,
+            icmp_delta_ms: parse_cli_f64("search ICMP delta", fields[2])?,
+            transport_delta_ms: parse_cli_f64("search transport delta", fields[3])?,
+            loss_percent: parse_cli_f64("search loss percent", fields[4])?,
+            cpu_percent: parse_cli_f64("search CPU percent", fields[5])?,
+        });
+    }
+    Ok(observations)
+}
+
+fn run_autotune_optimize_direction_cli<I>(args: I) -> Result<(), String>
+where
+    I: Iterator<Item = String>,
+{
+    use autotune::{
+        optimize_profile_direction, AutotuneProfile, ProfileSearchInput, SearchDirection,
+    };
+
+    let mut profile = AutotuneProfile::BestOverall;
+    let mut direction = None;
+    let mut observed_low_kbps = None;
+    let mut minimum_kbps = None;
+    let mut upper_kbps = None;
+    let mut observations = None;
+    let mut uncertainty_percent = 1.5;
+    let mut max_attempts = 6usize;
+    let mut realization_min = None;
+    let mut realization_max = None;
+    let mut retention_min = None;
+    let mut loss_max = None;
+    let mut cpu_max = None;
+    let mut args = args;
+
+    while let Some(arg) = args.next() {
+        let value = args
+            .next()
+            .ok_or_else(|| format!("missing value for {arg}"))?;
+        match arg.as_str() {
+            "--profile" => {
+                profile = AutotuneProfile::parse(&value)
+                    .ok_or_else(|| format!("unsupported Auto-Tune profile: {value}"))?
+            }
+            "--direction" => {
+                direction = Some(
+                    SearchDirection::parse(&value)
+                        .ok_or_else(|| format!("unsupported search direction: {value}"))?,
+                )
+            }
+            "--observed-low-kbps" => {
+                observed_low_kbps = Some(parse_cli_u64("search observed-low rate", &value)?)
+            }
+            "--minimum-kbps" => minimum_kbps = Some(parse_cli_u64("search minimum rate", &value)?),
+            "--upper-kbps" => upper_kbps = Some(parse_cli_u64("search upper rate", &value)?),
+            "--observations" => observations = Some(parse_search_observations(&value)?),
+            "--uncertainty-percent" => {
+                uncertainty_percent = parse_cli_f64("search uncertainty", &value)?
+            }
+            "--max-attempts" => {
+                max_attempts = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid search max attempts: {value}"))?
+            }
+            "--candidate-realization-min-percent" => {
+                realization_min = Some(parse_cli_f64("candidate realization minimum", &value)?)
+            }
+            "--candidate-realization-max-percent" => {
+                realization_max = Some(parse_cli_f64("candidate realization maximum", &value)?)
+            }
+            "--capacity-retention-min-percent" => {
+                retention_min = Some(parse_cli_f64("capacity retention minimum", &value)?)
+            }
+            "--loss-max-percent" => loss_max = Some(parse_cli_f64("packet loss maximum", &value)?),
+            "--cpu-max-percent" => cpu_max = Some(parse_cli_f64("CPU maximum", &value)?),
+            _ => return Err(format!("unsupported Auto-Tune search option: {arg}")),
+        }
+    }
+
+    let mut thresholds = profile.validation_thresholds();
+    if let Some(value) = realization_min {
+        thresholds.candidate_realization_min_percent = value;
+    }
+    if let Some(value) = realization_max {
+        thresholds.candidate_realization_max_percent = value;
+    }
+    if let Some(value) = retention_min {
+        thresholds.capacity_retention_min_percent = value;
+    }
+    if let Some(value) = loss_max {
+        thresholds.loss_max_percent = value;
+    }
+    if let Some(value) = cpu_max {
+        thresholds.cpu_max_percent = value;
+    }
+    let result = optimize_profile_direction(ProfileSearchInput {
+        profile,
+        direction: direction.ok_or_else(|| "--direction is required".to_string())?,
+        observed_low_kbps: observed_low_kbps
+            .ok_or_else(|| "--observed-low-kbps is required".to_string())?,
+        minimum_kbps: minimum_kbps.ok_or_else(|| "--minimum-kbps is required".to_string())?,
+        upper_kbps: upper_kbps.ok_or_else(|| "--upper-kbps is required".to_string())?,
+        thresholds,
+        uncertainty_percent,
+        max_attempts,
+        observations: observations.ok_or_else(|| "--observations is required".to_string())?,
+    })?;
+    println!("{}", result.to_json());
+    Ok(())
+}
+
 fn run_transport_probe_cli<I>(args: I) -> Result<(), String>
 where
     I: Iterator<Item = String>,
@@ -7223,6 +7354,13 @@ fn main() {
         }
         Some("--autotune-validate") => {
             if let Err(error) = run_autotune_validation_cli(initial_args) {
+                eprintln!("ERROR: {error}");
+                std::process::exit(2);
+            }
+            return;
+        }
+        Some("--autotune-optimize-direction") => {
+            if let Err(error) = run_autotune_optimize_direction_cli(initial_args) {
                 eprintln!("ERROR: {error}");
                 std::process::exit(2);
             }

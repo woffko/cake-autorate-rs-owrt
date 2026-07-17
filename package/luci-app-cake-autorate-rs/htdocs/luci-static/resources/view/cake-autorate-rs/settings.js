@@ -1362,7 +1362,7 @@ function speedtestJobDelay() {
 
 var AUTOTUNE_RECOVERY_MAX_POLLS = 12;
 var AUTOTUNE_RECOVERY_MAX_DELAY_MS = 5000;
-var AUTOTUNE_RESULT_SCHEMA_VERSION = 5;
+var AUTOTUNE_RESULT_SCHEMA_VERSION = 6;
 var AUTOTUNE_RESULT_PRODUCER = 'cake-autorate-rs-autotune';
 
 function canonicalAutotuneProfile(value) {
@@ -1461,19 +1461,19 @@ function autotuneProfileDefinitions() {
 			id: 'gaming',
 			title: _('Gaming'),
 			target: _('Target A+ · under 5 ms loaded-latency increase'),
-			description: _('Maximum latency headroom with a 70% capacity safety floor. Uses diffserv4, supports optional native outbound rules, and preserves ingress DSCP.')
+			description: _('Finds the highest throughput that still proves A+, with a hard 70% capacity safety floor. If A+ is unattainable, Review offers the best measured grade at its fastest safe rate. Uses diffserv4, supports optional native outbound rules, and preserves ingress DSCP.')
 		},
 		{
 			id: 'best_overall',
 			title: _('Best overall'),
 			target: _('Target A or better · under 30 ms'),
-			description: _('Recommended balance with an 80% capacity safety floor. Optional outbound rules use diffserv4 while download stays best effort.')
+			description: _('Finds the highest throughput that still proves A, with a hard 80% capacity safety floor. If A is unattainable, Review offers the best balanced safe candidate. Optional outbound rules use diffserv4 while download stays best effort.')
 		},
 		{
 			id: 'fair',
 			title: _('Fair'),
 			target: _('Throughput first · aim for C or better · under 200 ms'),
-			description: _('Keeps at least 90% of measured capacity. Optional outbound rules use diffserv4, download stays best effort, and Review may offer an evidence-backed option to disable SQM.')
+			description: _('Maximizes safe throughput above a hard 90% capacity floor; rating is the secondary tie-breaker and C is a soft target. Optional outbound rules use diffserv4, download stays best effort, and Review may offer an evidence-backed option to disable SQM.')
 		}
 	];
 }
@@ -2474,7 +2474,7 @@ function autotuneValidationGatesComplete(validation, profile, requireQualityTarg
 
 		if (required.indexOf(code) < 0 || reported[code] ||
 		    gate.required !== gateRequired || typeof gate.pass !== 'boolean' ||
-		    (gateRequired && gate.pass !== true) ||
+		    (!latencyGate && gate.pass !== true) ||
 		    (requireQualityTarget && gate.pass !== true) ||
 		    autotuneNumber(gate.actual) == null || autotuneNumber(gate.limit) == null)
 			return false;
@@ -2496,9 +2496,9 @@ function autotunePhaseEvidenceClean(result) {
 	var directions = [ 'download', 'upload' ];
 	var cleanBaselineSeen = false;
 
-	/* A clean current-schema run has an idle baseline, two unshaped samples, and a
-	 * download-only plus upload-only shaped phase.  Treat missing evidence as
-	 * incomplete rather than trusting a top-level boolean. */
+	/* A clean current-schema run has an idle baseline, direction-matched unshaped
+	 * controls, and download-only plus upload-only shaped observations. Treat
+	 * missing evidence as incomplete rather than trusting a top-level boolean. */
 	if (!Array.isArray(entries) || entries.length < 5)
 		return false;
 
@@ -2562,8 +2562,11 @@ function autotuneFairAllowedActions(outcome) {
 			return null;
 		seen[actions[i]] = true;
 	}
-	if (!seen.apply_sqm || !seen.keep_current ||
-	    !!seen.disable_sqm !== (outcome.disable_sqm_available === true))
+	if (typeof outcome.apply_sqm_available !== 'boolean' ||
+	    typeof outcome.disable_sqm_available !== 'boolean' ||
+	    !seen.keep_current ||
+	    !!seen.apply_sqm !== outcome.apply_sqm_available ||
+	    !!seen.disable_sqm !== outcome.disable_sqm_available)
 		return null;
 	return seen;
 }
@@ -2585,6 +2588,17 @@ function autotuneFairOutcomeValidated(result) {
 	    Math.abs(outcomeDelta - validationDelta) > 0.001)
 		return false;
 
+	if (outcome.capacity_floor_met === false) {
+		if (validation.safety_pass !== false || outcome.apply_sqm_available !== false)
+			return false;
+		return (outcome.mode === 'throughput-fallback' ||
+			outcome.mode === 'sqm-disable-recommended') &&
+			(actions[outcome.recommended_action] === true);
+	}
+
+	if (outcome.capacity_floor_met !== true || outcome.apply_sqm_available !== true)
+		return false;
+
 	if (validation.quality_target_met === true)
 		return outcome.mode === 'quality-target-met' &&
 			outcome.recommended_action === 'apply_sqm' &&
@@ -2595,7 +2609,114 @@ function autotuneFairOutcomeValidated(result) {
 		(actions[outcome.recommended_action] === true);
 }
 
-function autotuneResultEvidenceValidated(result) {
+function autotuneCapacityFloorInfeasibleOutcomeValidated(result) {
+	var profile = canonicalAutotuneProfile(result && result.profile);
+	var policy = autotuneProfilePolicy(profile);
+	var outcome = result && result.profile_outcome;
+	var validation = result && result.validation;
+	var proposal = result && result.proposal;
+	var searches = result && result.profile_search;
+	var directions = [ 'download', 'upload' ];
+	var unsafeDirections = 0;
+
+	if (profile !== 'fair' || !policy || !outcome || !validation || !proposal || !searches ||
+	    validation.safety_pass !== false || outcome.mode !== 'capacity-floor-infeasible' ||
+	    outcome.target_grade !== policy.targetGrade || outcome.actual_grade !== validation.actual_grade ||
+	    outcome.target_met !== validation.quality_target_met || outcome.manual_only !== true ||
+	    outcome.capacity_floor_met !== false ||
+	    autotuneNumber(outcome.capacity_floor_percent) !== policy.retentionPercent ||
+	    typeof outcome.infeasible_reason !== 'string' || !outcome.infeasible_reason ||
+	    !outcome.selected_pair)
+		return false;
+
+	for (var i = 0; i < directions.length; i++) {
+		var direction = directions[i];
+		var search = searches[direction];
+		var selected = search && search.selected;
+		var selectedRate = autotuneNumber(selected && selected.candidate_kbps);
+		var proposalRate = autotuneNumber(proposal[direction] && proposal[direction].base_kbps);
+		var validationRate = autotuneNumber(validation.candidate_base &&
+			validation.candidate_base[direction + '_kbps']);
+		var outcomeRate = autotuneNumber(outcome.selected_pair[direction + '_kbps']);
+
+		if (!search || autotuneNumber(search.schema_version) !== 1 ||
+		    canonicalAutotuneProfile(search.profile) !== profile ||
+		    search.direction !== direction ||
+		    (search.action !== 'complete' && search.action !== 'fallback') ||
+		    !selected || selectedRate == null || proposalRate !== selectedRate ||
+		    validationRate !== selectedRate || outcomeRate !== selectedRate)
+			return false;
+
+		if (selected.safety_pass === false) {
+			if (search.action !== 'fallback' ||
+			    (search.reason !== 'repeatable-compute-ceiling-below-capacity-floor' &&
+			     search.reason !== 'repeatable-shaper-ceiling-below-capacity-floor'))
+				return false;
+			unsafeDirections++;
+		}
+		else if (selected.safety_pass !== true) {
+			return false;
+		}
+	}
+
+	return unsafeDirections > 0;
+}
+
+function autotuneProfileOutcomeValidated(result) {
+	var profile = canonicalAutotuneProfile(result && result.profile);
+	var policy = autotuneProfilePolicy(profile);
+	var outcome = result && result.profile_outcome;
+	var validation = result && result.validation;
+	var proposal = result && result.proposal;
+	var searches = result && result.profile_search;
+	var directions = [ 'download', 'upload' ];
+	var targetMet;
+
+	if (!policy || !outcome || !validation || !proposal || !searches ||
+	    outcome.target_grade !== policy.targetGrade ||
+	    autotuneNumber(outcome.capacity_floor_percent) !== policy.retentionPercent ||
+	    outcome.actual_grade !== validation.actual_grade ||
+	    typeof outcome.target_met !== 'boolean' ||
+	    outcome.target_met !== validation.quality_target_met ||
+	    typeof outcome.manual_only !== 'boolean' ||
+	    !outcome.selected_pair)
+		return false;
+
+	targetMet = outcome.target_met;
+	if (outcome.manual_only !== !targetMet)
+		return false;
+
+	for (var i = 0; i < directions.length; i++) {
+		var direction = directions[i];
+		var search = searches[direction];
+		var selected = search && search.selected;
+		var selectedRate = autotuneNumber(selected && selected.candidate_kbps);
+		var proposalRate = autotuneNumber(proposal[direction] && proposal[direction].base_kbps);
+		var validationRate = autotuneNumber(validation.candidate_base &&
+			validation.candidate_base[direction + '_kbps']);
+		var outcomeRate = autotuneNumber(outcome.selected_pair[direction + '_kbps']);
+
+		if (!search || autotuneNumber(search.schema_version) !== 1 ||
+		    canonicalAutotuneProfile(search.profile) !== profile ||
+		    search.direction !== direction ||
+		    (search.action !== 'complete' && search.action !== 'fallback') ||
+		    !selected || selected.safety_pass !== true || selectedRate == null ||
+		    proposalRate !== selectedRate || validationRate !== selectedRate ||
+		    outcomeRate !== selectedRate)
+			return false;
+	}
+
+	if (targetMet)
+		return (profile === 'gaming' && outcome.mode === 'target-a-plus-met') ||
+			(profile === 'best_overall' && outcome.mode === 'target-a-met') ||
+			(profile === 'fair' && outcome.mode === 'throughput-optimum-c-or-better');
+
+	return (profile === 'gaming' && outcome.mode === 'best-attainable-quality-fallback') ||
+		(profile === 'best_overall' && outcome.mode === 'balanced-fallback') ||
+		(profile === 'fair' && outcome.mode === 'throughput-optimum-quality-fallback');
+}
+
+function autotuneResultEnvelopeValidated(result) {
 	if (!(result && result.state === 'complete' && result.proposal &&
 		result.validation && !result.error))
 		return false;
@@ -2626,6 +2747,18 @@ function autotuneResultEvidenceValidated(result) {
 		return false;
 
 	return true;
+}
+
+function autotuneResultEvidenceValidated(result) {
+	return autotuneResultEnvelopeValidated(result) &&
+		result.validation.safety_pass === true &&
+		autotuneProfileOutcomeValidated(result);
+}
+
+function autotuneCapacityFloorInfeasibleResultValidated(result) {
+	return autotuneResultEnvelopeValidated(result) &&
+		autotuneCapacityFloorInfeasibleOutcomeValidated(result) &&
+		autotuneFairOutcomeValidated(result);
 }
 
 function autotuneResultValidated(result) {
@@ -2685,6 +2818,14 @@ function autotuneDisableSqmEvidenceValidated(result) {
 
 function autotuneResultReviewable(result, action) {
 	action = action || 'apply_sqm';
+	if (autotuneCapacityFloorInfeasibleResultValidated(result)) {
+		if (action === 'keep_current')
+			return autotuneFairAllowedActions(result.fair_outcome).keep_current === true;
+		if (action === 'disable_sqm')
+			return result.auto_apply_eligible === false &&
+				autotuneDisableSqmEvidenceValidated(result);
+		return false;
+	}
 	if (!autotuneResultEvidenceValidated(result))
 		return false;
 
@@ -2696,13 +2837,14 @@ function autotuneResultReviewable(result, action) {
 	if (action === 'apply_sqm') {
 		if (autotuneResultValidated(result))
 			return true;
-		return canonicalAutotuneProfile(result.profile) === 'fair' &&
-			result.auto_apply_eligible === false &&
-			result.validation.pass === false &&
-			result.validation.hard_pass === true &&
-			result.validation.quality_target_met === false &&
-			autotuneValidationGatesComplete(result.validation, result.profile, false) &&
-			autotuneFairOutcomeValidated(result) &&
+		if (result.auto_apply_eligible !== false ||
+		    result.validation.safety_pass !== true ||
+		    result.validation.quality_target_met !== false ||
+		    !autotuneValidationGatesComplete(result.validation, result.profile, false))
+			return false;
+		if (canonicalAutotuneProfile(result.profile) !== 'fair')
+			return true;
+		return autotuneFairOutcomeValidated(result) &&
 			autotuneFairAllowedActions(result.fair_outcome).apply_sqm === true;
 	}
 
@@ -2722,6 +2864,17 @@ function autotuneResultHasReviewChoice(result) {
 	return autotuneResultReviewable(result, 'apply_sqm') ||
 		autotuneResultReviewable(result, 'keep_current') ||
 		autotuneResultReviewable(result, 'disable_sqm');
+}
+
+function autotuneDefaultReviewAction(result) {
+	/* Disabling SQM is always an explicit destructive alternative, never a
+	 * default.  Prefer a proved shaped candidate; when the capacity floor is
+	 * infeasible, fail closed onto the non-writing action. */
+	if (autotuneResultReviewable(result, 'apply_sqm'))
+		return 'apply_sqm';
+	if (autotuneResultReviewable(result, 'keep_current'))
+		return 'keep_current';
+	return null;
 }
 
 function revalidateAutotuneProposal(section_id, wan, backend, expected, routeMode, mwan3Member,
@@ -3321,7 +3474,11 @@ function autotuneAttemptDiagnostics(validation, result, index) {
 		loss_percent: firstAutotuneNumber([ downloadSignals.loss_percent,
 			downloadIcmp.loss_percent, loss ]),
 		cpu_percent: firstAutotuneNumber([ downloadSignals.cpu_percent,
-			downloadPhase.cpu_peak_percent, cpu ])
+			downloadPhase.cpu_peak_percent, cpu ]),
+		cpu_total_percent: autotuneNumber(downloadPhase.cpu && downloadPhase.cpu.total_peak_percent),
+		cpu_core_percent: autotuneNumber(downloadPhase.cpu && downloadPhase.cpu.max_core_peak_percent),
+		cpu_softirq_percent: autotuneNumber(downloadPhase.cpu && downloadPhase.cpu.softirq_peak_percent),
+		qdisc: downloadPhase.qdisc
 	};
 	var ulLoad = {
 		icmp_delta_ms: firstAutotuneNumber([ uploadSignals.icmp_delta_ms,
@@ -3331,7 +3488,11 @@ function autotuneAttemptDiagnostics(validation, result, index) {
 		loss_percent: firstAutotuneNumber([ uploadSignals.loss_percent,
 			uploadIcmp.loss_percent, loss ]),
 		cpu_percent: firstAutotuneNumber([ uploadSignals.cpu_percent,
-			uploadPhase.cpu_peak_percent, cpu ])
+			uploadPhase.cpu_peak_percent, cpu ]),
+		cpu_total_percent: autotuneNumber(uploadPhase.cpu && uploadPhase.cpu.total_peak_percent),
+		cpu_core_percent: autotuneNumber(uploadPhase.cpu && uploadPhase.cpu.max_core_peak_percent),
+		cpu_softirq_percent: autotuneNumber(uploadPhase.cpu && uploadPhase.cpu.softirq_peak_percent),
+		qdisc: uploadPhase.qdisc
 	};
 	var dlRealizationGate = autotuneGateValue(decision,
 		[ 'download-candidate-realization' ]);
@@ -3474,6 +3635,7 @@ function autotuneDiagnostics(result) {
 
 	return {
 		validated: autotuneResultValidated(result),
+		reviewable: autotuneResultReviewable(result, 'apply_sqm'),
 		legacy: !!legacy,
 		legacy_schema_version: result && result.legacy_schema_version != null ?
 			result.legacy_schema_version :
@@ -3562,22 +3724,59 @@ function renderAutotuneGate(pass) {
 	return E('strong', { 'style': 'color:%s;white-space:nowrap'.format(color) }, text);
 }
 
+function renderAutotuneQdisc(qdisc) {
+	if (!(qdisc && qdisc.available === true))
+		return qdisc && qdisc.reason ? _('Unavailable (%s)').format(qdisc.reason) : '-';
+	return _('%s packets · %s dropped · %s overlimits · %s requeues').format(
+		autotuneMetric(qdisc.packets, ''), autotuneMetric(qdisc.dropped, ''),
+		autotuneMetric(qdisc.overlimits, ''), autotuneMetric(qdisc.requeues, ''));
+}
+
 function renderAutotuneDiagnostics(result) {
 	var diagnostics = autotuneDiagnostics(result);
+	var diagnosticResult = autotuneLegacyResult(result) || result || {};
+	var profileOutcome = diagnosticResult.profile_outcome;
+	var profileSearch = diagnosticResult.profile_search;
 	var retryableInconclusive = autotuneRetryableInconclusive(result);
+	var alertClass;
+	var alertTitle;
+	var alertMessage;
+
+	if (diagnostics.legacy) {
+		alertClass = 'error';
+		alertTitle = _('Legacy diagnostics. ');
+		alertMessage = diagnostics.error || _('This saved result is read-only.');
+	}
+	else if (diagnostics.validated) {
+		alertClass = 'success';
+		alertTitle = _('Validated proposal. ');
+		alertMessage = diagnostics.error || _('Every required validation gate passed.');
+	}
+	else if (diagnostics.reviewable) {
+		alertClass = 'warning';
+		alertTitle = _('Safe manual fallback. ');
+		alertMessage = diagnostics.error ||
+			_('The requested rating was not reached, but the selected pair preserved every throughput and resource safety gate.');
+	}
+	else if (retryableInconclusive) {
+		alertClass = 'warning';
+		alertTitle = _('Calibration was inconclusive. ');
+		alertMessage = diagnostics.error ||
+			_('No proposal was accepted. Retry the calibration; Review and Apply remain unavailable.');
+	}
+	else {
+		alertClass = 'error';
+		alertTitle = _('Proposal rejected. ');
+		alertMessage = diagnostics.error ||
+			_('No settings can be applied from this result. Review the failed gates below.');
+	}
+
 	var nodes = [ E('div', {
-		'class': 'alert-message %s'.format(diagnostics.validated ? 'success' :
-			(retryableInconclusive ? 'warning' : 'error')),
+		'class': 'alert-message %s'.format(alertClass),
 		'style': 'margin:10px 0'
 	}, [
-		E('strong', {}, diagnostics.legacy ? _('Legacy diagnostics. ') :
-			(diagnostics.validated ? _('Validated proposal. ') :
-			(retryableInconclusive ? _('Calibration was inconclusive. ') : _('Proposal rejected. '))),
-		diagnostics.error || (diagnostics.validated ?
-			_('Every required validation gate passed.') :
-			(retryableInconclusive ?
-				_('No proposal was accepted. Retry the calibration; Review and Apply remain unavailable.') :
-				_('No settings can be applied from this result. Review the failed gates below.'))))
+		E('strong', {}, alertTitle),
+		alertMessage
 	]) ];
 
 	if (diagnostics.legacy)
@@ -3588,6 +3787,57 @@ function renderAutotuneDiagnostics(result) {
 	if (diagnostics.stage || diagnostics.reason)
 		nodes.push(E('p', {}, _('Stage: %s. Diagnostic reason: %s.').format(
 			diagnostics.stage || '-', diagnostics.reason || '-')));
+
+	if (profileOutcome && profileSearch) {
+		nodes.push(E('p', {}, [
+			E('strong', {}, _('Profile result: ')),
+			_('%s; target %s, measured %s; capacity floor %s%.').format(
+				profileOutcome.mode || '-', profileOutcome.target_grade || '-',
+				profileOutcome.actual_grade || '-',
+				autotuneMetric(profileOutcome.capacity_floor_percent, ''))
+		]));
+
+		[ 'download', 'upload' ].forEach(function(direction) {
+			var search = profileSearch[direction];
+			if (!search || !Array.isArray(search.evaluated))
+				return;
+			var rows = search.evaluated.map(function(item) {
+				return E('tr', { 'class': 'tr' }, [
+					E('td', { 'class': 'td' }, String(item.index || '-')),
+					E('td', { 'class': 'td' }, autotuneMetric(item.candidate_kbps, ' kbit/s')),
+					E('td', { 'class': 'td' }, autotuneMetric(item.achieved_kbps, ' kbit/s')),
+					E('td', { 'class': 'td' }, autotuneMetric(item.retention_percent, '%')),
+					E('td', { 'class': 'td' }, '%s / %s'.format(item.grade || '-',
+						autotuneMetric(item.effective_delta_ms, ' ms'))),
+					E('td', { 'class': 'td' }, autotuneMetric(item.loss_percent, '%')),
+					E('td', { 'class': 'td' }, autotuneMetric(item.cpu_percent, '%')),
+					E('td', { 'class': 'td' }, renderAutotuneGate(item.safety_pass))
+				]);
+			});
+			nodes.push(E('details', {
+				'open': '',
+				'style': 'margin:8px 0;padding:8px;border:1px solid rgba(127,127,127,.35);border-radius:4px'
+			}, [
+				E('summary', { 'style': 'cursor:pointer;font-weight:600' },
+					_('%s search — %s (%s)').format(direction === 'download' ? _('Download') : _('Upload'),
+						search.action || '-', search.reason || '-')),
+				E('div', { 'style': 'max-width:100%;overflow-x:auto' }, [
+					E('table', { 'class': 'table', 'style': 'margin-top:8px;min-width:760px' }, [
+						E('tr', { 'class': 'tr table-titles' }, [
+							E('th', { 'class': 'th' }, '#'),
+							E('th', { 'class': 'th' }, _('Candidate')),
+							E('th', { 'class': 'th' }, _('Achieved')),
+							E('th', { 'class': 'th' }, _('Retained')),
+							E('th', { 'class': 'th' }, _('Grade / delay')),
+							E('th', { 'class': 'th' }, _('Loss')),
+							E('th', { 'class': 'th' }, _('CPU')),
+							E('th', { 'class': 'th' }, _('Safety'))
+						])
+					].concat(rows))
+				])
+			]));
+		});
+	}
 
 	if (!diagnostics.attempts.length) {
 		nodes.push(E('p', {}, _('The job returned no structured validation attempts.')));
@@ -3661,16 +3911,22 @@ function renderAutotuneDiagnostics(result) {
 					renderAutotuneGate(autotuneGate(attempt, 'download_loss')) ],
 				[ _('DL transport loaded delta'), autotuneMetric(dlLoad.transport_delta_ms, ' ms'),
 					renderAutotuneGate(autotuneGate(attempt, 'download_transport')) ],
-				[ _('DL CPU peak'), autotuneMetric(dlLoad.cpu_percent, '%'),
+				[ _('DL CPU peak'), _('%s effective · %s total · %s busiest core · %s softirq').format(
+					autotuneMetric(dlLoad.cpu_percent, '%'), autotuneMetric(dlLoad.cpu_total_percent, '%'),
+					autotuneMetric(dlLoad.cpu_core_percent, '%'), autotuneMetric(dlLoad.cpu_softirq_percent, '%')),
 					renderAutotuneGate(autotuneGate(attempt, 'download_cpu')) ],
+				[ _('DL CAKE counters'), renderAutotuneQdisc(dlLoad.qdisc), '-' ],
 				[ _('UL ICMP loaded delta'), autotuneMetric(ulLoad.icmp_delta_ms, ' ms'),
 					renderAutotuneGate(autotuneGate(attempt, 'upload_icmp')) ],
 				[ _('UL ICMP packet loss'), autotuneMetric(ulLoad.loss_percent, '%'),
 					renderAutotuneGate(autotuneGate(attempt, 'upload_loss')) ],
 				[ _('UL transport loaded delta'), autotuneMetric(ulLoad.transport_delta_ms, ' ms'),
 					renderAutotuneGate(autotuneGate(attempt, 'upload_transport')) ],
-				[ _('UL CPU peak'), autotuneMetric(ulLoad.cpu_percent, '%'),
-					renderAutotuneGate(autotuneGate(attempt, 'upload_cpu')) ]
+				[ _('UL CPU peak'), _('%s effective · %s total · %s busiest core · %s softirq').format(
+					autotuneMetric(ulLoad.cpu_percent, '%'), autotuneMetric(ulLoad.cpu_total_percent, '%'),
+					autotuneMetric(ulLoad.cpu_core_percent, '%'), autotuneMetric(ulLoad.cpu_softirq_percent, '%')),
+					renderAutotuneGate(autotuneGate(attempt, 'upload_cpu')) ],
+				[ _('UL CAKE counters'), renderAutotuneQdisc(ulLoad.qdisc), '-' ]
 			);
 		}
 		else {
@@ -4006,9 +4262,12 @@ function showCreateWizard(grid, name, existingName) {
 		state.autotune_result = result;
 		state.autotune_proposal = proposal;
 		/* Even an evidence-backed no-SQM recommendation is a destructive
-		 * alternative, not a default. Keep the safe shaped candidate selected
-		 * until the user deliberately chooses and confirms disable. */
-		state.autotune_action = 'apply_sqm';
+		 * alternative, not a default. A proved safe shaped candidate remains the
+		 * default; an infeasible capacity floor falls back to the non-writing
+		 * action. */
+		state.autotune_action = autotuneDefaultReviewAction(result);
+		if (!state.autotune_action)
+			throw new Error(_('Auto-Tune returned no safe default Review action.'));
 		state.disable_sqm_confirmed = false;
 		state.autotune_profile = canonicalAutotuneProfile(result.profile) || 'best_overall';
 		state.autotune_diagnostics = null;
@@ -4176,10 +4435,10 @@ function showCreateWizard(grid, name, existingName) {
 		var fields = [
 			wizardField(_('Calibration profile'),
 				E('div', { 'style': 'display:flex;flex-wrap:wrap;gap:8px' }, profileButtons),
-				_('The profile fixes the latency target and minimum retained capacity for this run. If the target and safety floor cannot both be met, Auto-Tune rejects the candidate instead of destroying throughput.')),
+				_('The profile chooses how Auto-Tune ranks safe points on the measured throughput/latency boundary. Capacity safety floors are never lowered. A result below the requested quality target can only be reviewed as a clearly marked manual fallback.')),
 			E('div', { 'class': 'alert-message warning' }, [
 				E('strong', {}, _('Traffic warning: ')),
-				_('Full Auto-Tune runs two unshaped samples followed by separate router-side download-only and upload-only validation phases. An unreliable measurement may be repeated once and one bounded directional correction may be validated. Other WAN traffic can reduce confidence, but is never counted as test throughput.')
+				_('Full Auto-Tune measures one bidirectional control plus repeated download-only and upload-only controls, then searches each shaped direction independently. A direction may be measured again while Auto-Tune raises or brackets its candidate, but it never lowers the profile capacity floor. Other WAN traffic can reduce confidence, but is never counted as test throughput.')
 			]),
 			wizardField(_('Calibration'), E('div', {}, [ runButton, ' ', conservativeButton, ' ', cancelButton, progress, status ]),
 				_('All intermediate state stays in RAM. No UCI configuration is written until you confirm the Review step.'))
@@ -4432,6 +4691,8 @@ function showCreateWizard(grid, name, existingName) {
 		if (autotune) {
 			var proposal = autotune.proposal;
 			var validation = autotune.validation;
+			var capacityFloorInfeasible =
+				autotuneCapacityFloorInfeasibleResultValidated(autotune);
 			var dl = proposal.download;
 			var ul = proposal.upload;
 			var adaptive = proposal.adaptive_ceiling;
@@ -4441,6 +4702,11 @@ function showCreateWizard(grid, name, existingName) {
 			var thresholds = proposal.thresholds_ms;
 			var firstRun = autotune.runs && autotune.runs.length ? autotune.runs[0] : {};
 			var profilePolicy = autotuneProfilePolicy(autotune.profile);
+			var cakePolicyText = proposal.sqm.classification === 'diffserv4' ?
+				(proposal.sqm.squash_dscp || proposal.sqm.squash_ingress ?
+					_('upload diffserv4; download best effort + wash') :
+					_('upload/download diffserv4; preserve existing DSCP')) :
+				_('best effort; ignore external DSCP');
 			rows.push(
 				[ _('Calibration profile'), profilePolicy ?
 					_('%s · target %s or better').format(
@@ -4451,36 +4717,43 @@ function showCreateWizard(grid, name, existingName) {
 				[ _('Idle latency'), _('%s ms median / %s ms p95').format(autotune.baseline.median_ms, autotune.baseline.p95_ms) ],
 				[ _('Observed download'), _('%d / %d / %d kbit/s low / median / high').format(dl.observed_low_kbps, dl.observed_median_kbps, dl.observed_high_kbps) ],
 				[ _('Observed upload'), _('%d / %d / %d kbit/s low / median / high').format(ul.observed_low_kbps, ul.observed_median_kbps, ul.observed_high_kbps) ],
-				[ _('Proposed DL min / base / max'), _('%d / %d / %d kbit/s').format(dl.minimum_kbps, dl.base_kbps, dl.maximum_kbps) ],
-				[ _('Proposed UL min / base / max'), _('%d / %d / %d kbit/s').format(ul.minimum_kbps, ul.base_kbps, ul.maximum_kbps) ],
+				[ capacityFloorInfeasible ? _('Diagnostic DL min / candidate / max') :
+					_('Proposed DL min / base / max'), _('%d / %d / %d kbit/s').format(dl.minimum_kbps, dl.base_kbps, dl.maximum_kbps) ],
+				[ capacityFloorInfeasible ? _('Diagnostic UL min / candidate / max') :
+					_('Proposed UL min / base / max'), _('%d / %d / %d kbit/s').format(ul.minimum_kbps, ul.base_kbps, ul.maximum_kbps) ],
 				[ _('Delay thresholds'), _('%d / %d / %d ms adjust-up / delay / adjust-down').format(thresholds.adjust_up, thresholds.delay, thresholds.adjust_down) ],
 				[ _('Adaptive ceiling'), adaptive.enabled ? _('enabled; caps %d / %d kbit/s').format(dl.absolute_cap_kbps, ul.absolute_cap_kbps) :
 					(adaptiveDecision.preserved ?
 						_('Auto-Tune recommends disabling it, but the existing enabled setting and tuning parameters will be preserved.') :
 						_('disabled as proposed for the measured stable link')) ],
-				[ _('CAKE traffic classes'), proposal.sqm.classification === 'diffserv4' ?
-					_('diffserv4; preserve existing DSCP (no application guessing)') :
-					_('best effort; ignore external DSCP') ],
+				[ _('CAKE traffic classes'), cakePolicyText ],
 				[ _('Detected link layer'), _('%s; overhead %d, MPU %d').format(proposal.link.kind, proposal.link.overhead, proposal.link.mpu) ],
 				[ _('Test server'), firstRun.server_sponsor ? _('%s #%s').format(firstRun.server_sponsor, firstRun.server_id || '-') : _('automatic') ]
 			);
 			if (autotune.profile === 'fair' && validation &&
-			    validation.quality_target_met === false) {
+			    (validation.quality_target_met === false || capacityFloorInfeasible)) {
 				var outcome = autotune.fair_outcome;
-				var actionChoices = [
-					{
+				var allowedActions = autotuneFairAllowedActions(outcome) || {};
+				var actionChoices = [];
+				if (allowedActions.apply_sqm === true &&
+				    autotuneResultReviewable(autotune, 'apply_sqm')) {
+					actionChoices.push({
 						id: 'apply_sqm',
 						title: _('Apply the best safe Fair SQM candidate'),
 						description: _('Keeps the measured 90% throughput floor. The loaded-latency target was not reached, so this is an explicit manual choice.')
-					},
-					{
+					});
+				}
+				if (allowedActions.keep_current === true &&
+				    autotuneResultReviewable(autotune, 'keep_current')) {
+					actionChoices.push({
 						id: 'keep_current',
 						title: _('Keep current settings'),
 						description: rerun ? _('Close Auto-Tune without writing any configuration.') :
 							_('Do not create this instance.')
-					}
-				];
-				if (rerun && autotuneResultReviewable(autotune, 'disable_sqm')) {
+					});
+				}
+				if (rerun && allowedActions.disable_sqm === true &&
+				    autotuneResultReviewable(autotune, 'disable_sqm')) {
 					actionChoices.push({
 						id: 'disable_sqm',
 						title: _('Disable autorate and SQM (comparison suggestion)'),
@@ -4521,6 +4794,11 @@ function showCreateWizard(grid, name, existingName) {
 							autotuneNumber(validation.effective_delta_ms).toFixed(1)) ],
 					[ _('Review action'), actionGroup ]
 				);
+				if (capacityFloorInfeasible) {
+					rows.push([ _('Capacity floor'),
+						_('The measured CAKE datapath could not retain the hard 90%% floor. No shaped candidate can be applied. %s').format(
+							autotune.profile_outcome.infeasible_reason || '') ]);
+				}
 				if (outcome && outcome.no_sqm_control && outcome.no_sqm_control.available === true) {
 					rows.push([ _('Unshaped control'), _('%s · +%s ms; throughput change DL %s%% / UL %s%%').format(
 						outcome.no_sqm_control.grade || '-',

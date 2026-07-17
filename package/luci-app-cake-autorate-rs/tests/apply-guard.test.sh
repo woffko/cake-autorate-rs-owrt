@@ -63,7 +63,7 @@ EOF
 fingerprint="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 cat > "$autotune/wan_sqm/result.json" <<EOF
 {
-  "state":"complete", "schema_version":5,
+  "state":"complete", "schema_version":6,
   "producer":"cake-autorate-rs-autotune", "profile":"best_overall",
   "run_id":"apply-guard-test-run", "auto_apply_eligible":true,
   "manual_apply_eligible":true,
@@ -80,9 +80,19 @@ cat > "$autotune/wan_sqm/result.json" <<EOF
   "validation_thresholds":{"candidate_realization_min_percent":80,
     "candidate_realization_max_percent":110,"capacity_retention_min_percent":80,
     "delay_max_ms":30,"loss_max_percent":3,"cpu_max_percent":85},
-  "validation":{"profile":"best_overall","pass":true,"hard_pass":true,
+  "validation":{"profile":"best_overall","pass":true,"hard_pass":true,"safety_pass":true,
     "quality_target_met":true,"actual_grade":"A","effective_delta_ms":10,
-    "contaminated":false,"correction":{"action":"none","feasible":true}},
+    "contaminated":false,"candidate_base":{"download_kbps":80000,"upload_kbps":20000},
+    "correction":{"action":"none","feasible":true}},
+	  "profile_outcome":{"mode":"target-a-met","objective":"balanced-quality-throughput",
+	    "target_grade":"A","target_met":true,"actual_grade":"A","capacity_floor_percent":80,
+	    "capacity_floor_met":true,"infeasible_reason":"","manual_only":false,
+	    "selected_pair":{"download_kbps":80000,"upload_kbps":20000}},
+  "profile_search":{
+    "download":{"schema_version":1,"profile":"best_overall","direction":"download",
+      "action":"complete","selected":{"candidate_kbps":80000,"safety_pass":true,"target_met":true}},
+    "upload":{"schema_version":1,"profile":"best_overall","direction":"upload",
+      "action":"complete","selected":{"candidate_kbps":20000,"safety_pass":true,"target_met":true}}},
   "pinger_plan":{"recommended_method":"fping","recommended_no_pingers":3,
     "recommended_reflectors":["1.1.1.1","9.9.9.9","8.8.8.8"]},
   "proposal":{
@@ -131,6 +141,7 @@ const fs = require('node:fs');
 const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 result.profile = 'gaming';
 result.validation.profile = 'gaming';
+result.validation.actual_grade = 'A+';
 result.validation_thresholds.capacity_retention_min_percent = 70;
 result.validation_thresholds.delay_max_ms = 5;
 result.validation_thresholds.loss_max_percent = 1;
@@ -153,6 +164,14 @@ result.proposal.sqm = {
 	iqdisc_opts: 'diffserv4',
 	eqdisc_opts: 'diffserv4'
 };
+result.profile_outcome = {
+	...result.profile_outcome,
+	mode: 'target-a-plus-met', target_grade: 'A+', actual_grade: 'A+',
+	capacity_floor_percent: 70
+};
+for (const direction of [ 'download', 'upload' ]) {
+	result.profile_search[direction].profile = 'gaming';
+}
 fs.writeFileSync(process.argv[3], JSON.stringify(result));
 EOF
 gaming_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint")"
@@ -425,10 +444,12 @@ result.validation = {
 	profile: 'fair',
 	pass: false,
 	hard_pass: true,
+	safety_pass: true,
 	quality_target_met: false,
 	actual_grade: 'D',
 	effective_delta_ms: 220,
 	contaminated: false,
+	candidate_base: { download_kbps: 80000, upload_kbps: 20000 },
 	correction: { action: 'infeasible', feasible: false }
 };
 result.proposal.profile = 'fair';
@@ -439,15 +460,31 @@ result.proposal.validation.capacity_retention_min_percent = 90;
 result.proposal.validation.icmp_delta_max_ms = 200;
 result.proposal.validation.transport_delta_max_ms = 200;
 result.proposal.validation.loss_max_percent = 5;
+result.profile_outcome = {
+	mode: 'throughput-optimum-quality-fallback',
+	objective: 'throughput-first-quality-tiebreak',
+	target_grade: 'C', target_met: false, actual_grade: 'D',
+	capacity_floor_percent: 90, manual_only: true,
+	capacity_floor_met: true, infeasible_reason: '',
+	selected_pair: { download_kbps: 80000, upload_kbps: 20000 }
+};
+result.profile_search = {
+	download: { schema_version: 1, profile: 'fair', direction: 'download', action: 'complete',
+		selected: { candidate_kbps: 80000, safety_pass: true, target_met: false } },
+	upload: { schema_version: 1, profile: 'fair', direction: 'upload', action: 'complete',
+		selected: { candidate_kbps: 20000, safety_pass: true, target_met: false } }
+};
 result.fair_outcome = {
 	mode: 'sqm-disable-recommended',
 	target_grade: 'C',
 	target_delta_ms: 200,
 	capacity_floor_percent: 90,
+	capacity_floor_met: true,
 	actual_grade: 'D',
 	actual_effective_delta_ms: 220,
 	recommended_action: 'disable_sqm',
 	allowed_actions: [ 'apply_sqm', 'keep_current', 'disable_sqm' ],
+	apply_sqm_available: true,
 	disable_sqm_available: true,
 	comparison_reason: 'no-material-latency-benefit-with-throughput-cost',
 	no_sqm_control: {
@@ -507,6 +544,46 @@ if $helper arm wan_sqm pppoe-wan speedtest-go main '' 0 0 disable_sqm "$fingerpr
 	echo "apply guard accepted a no-SQM recommendation with contaminated background traffic" >&2
 	exit 1
 fi
+
+# A proven repeatable compute ceiling may support the same explicit no-SQM
+# action even though no shaped candidate can satisfy Fair's immutable 90%
+# floor. The unsafe candidate is diagnostic only and can never be applied.
+node - "$work/result.fair-disable" "$autotune/wan_sqm/result.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+result.validation.hard_pass = false;
+result.validation.safety_pass = false;
+result.validation.quality_target_met = true;
+result.validation.actual_grade = 'A';
+result.validation.effective_delta_ms = 10;
+result.profile_outcome.mode = 'capacity-floor-infeasible';
+result.profile_outcome.target_met = true;
+result.profile_outcome.actual_grade = 'A';
+result.profile_outcome.capacity_floor_met = false;
+result.profile_outcome.infeasible_reason = 'download:repeatable-compute-ceiling-below-capacity-floor;upload:repeatable-compute-ceiling-below-capacity-floor';
+for (const direction of [ 'download', 'upload' ]) {
+	result.profile_search[direction].action = 'fallback';
+	result.profile_search[direction].reason = 'repeatable-compute-ceiling-below-capacity-floor';
+	result.profile_search[direction].selected.safety_pass = false;
+}
+result.fair_outcome.capacity_floor_met = false;
+result.fair_outcome.actual_grade = 'A';
+result.fair_outcome.actual_effective_delta_ms = 10;
+result.fair_outcome.allowed_actions = [ 'keep_current', 'disable_sqm' ];
+result.fair_outcome.apply_sqm_available = false;
+result.fair_outcome.no_sqm_control.grade = 'A';
+result.fair_outcome.no_sqm_control.effective_delta_ms = 9;
+fs.writeFileSync(process.argv[3], JSON.stringify(result));
+EOF
+if $helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint" >/dev/null 2>&1; then
+	echo "apply guard accepted an unsafe capacity-floor candidate" >&2
+	exit 1
+fi
+floor_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 0 0 disable_sqm "$fingerprint")"
+floor_token="$(printf '%s\n' "$floor_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
+[ "${#floor_token}" -eq 64 ]
+$helper abort "$floor_token" >/dev/null
+
 cp "$work/result.fair-disable" "$autotune/wan_sqm/result.json"
 export APPLY_GUARD_DAEMON_RUNNING=0
 disabled_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 0 0 disable_sqm "$fingerprint")"
