@@ -174,6 +174,9 @@ instance names, target devices, SQM sections, and conflicts before saving.
 Status shows lifecycle state, route/member/device, source and external address,
 fwmark, routing table, policy share, complete Services reconciliation
 (daemon/SQM/CAKE/IFB/redirect/rules), and the reason for standby/offline.
+Settings exposes **Traffic priorities** separately on every instance row; the
+opened view is bound to that uplink and cannot list or edit rules from another
+member. The former global priorities tab is intentionally absent.
 Graphs remain separate per instance, are stacked vertically, and annotate
 route/lifecycle, rating-phase, directional-count, and detected-grade changes.
 `Get rating` locks only the selected interface and routes separate shaped

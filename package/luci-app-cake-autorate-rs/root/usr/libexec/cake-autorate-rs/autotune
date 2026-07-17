@@ -44,6 +44,8 @@ runtime_lock_lib="${CAKE_AUTORATE_RUNTIME_LOCK_LIB:-/usr/libexec/cake-autorate-r
 sqm_config_file="${CAKE_AUTORATE_SQM_CONFIG_FILE:-/etc/config/sqm}"
 jsonfilter_bin="${CAKE_AUTORATE_JSONFILTER:-$(command -v jsonfilter 2>/dev/null)}"
 fping_bin="${CAKE_AUTORATE_FPING:-$(command -v fping 2>/dev/null)}"
+random_uuid_file="${CAKE_AUTORATE_RANDOM_UUID_FILE:-/proc/sys/kernel/random/uuid}"
+sys_class_net="${CAKE_AUTORATE_SYS_CLASS_NET:-/sys/class/net}"
 
 if [ -r "$runtime_lock_lib" ]; then
 	# shellcheck source=/usr/libexec/cake-autorate-rs/runtime-lock
@@ -106,6 +108,15 @@ safe_job_name() {
 safe_interface_name() {
 	case "$1" in
 		''|*[!A-Za-z0-9_.:@-]*) return 1 ;;
+	esac
+}
+
+safe_worker_token() {
+	case "$1" in
+		????????????????????????????????)
+			case "$1" in *[!A-Fa-f0-9]*) return 1 ;; esac
+			;;
+		*) return 1 ;;
 	esac
 }
 
@@ -521,11 +532,26 @@ remove_own_worker_identity() {
 }
 
 new_worker_token() {
-	token="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
-	case "$token" in
-		''|*[!A-Fa-f0-9]*) token="$(awk '{ gsub(/[.]/, "", $1); print $1 }' /proc/uptime 2>/dev/null)-$$" ;;
-	esac
-	printf '%s\n' "$token"
+	[ -r "$random_uuid_file" ] && [ ! -L "$random_uuid_file" ] || return 1
+	IFS= read -r token_uuid < "$random_uuid_file" || return 1
+	token="$(printf '%s' "$token_uuid" | tr -d '-')"
+	safe_worker_token "$token" || return 1
+	printf '%s\n' "$token" | tr 'A-F' 'a-f'
+}
+
+new_unique_worker_token() {
+	token_attempt=0
+	while [ "$token_attempt" -lt 8 ]; do
+		token_candidate="$(new_worker_token)" || return 1
+		token_ifb="catf$(printf '%s' "$token_candidate" | cut -c1-8)"
+		[ "${#token_ifb}" -le 15 ] && safe_interface_name "$token_ifb" || return 1
+		if [ ! -e "$sys_class_net/$token_ifb" ]; then
+			printf '%s\n' "$token_candidate"
+			return 0
+		fi
+		token_attempt=$((token_attempt + 1))
+	done
+	return 1
 }
 
 atomic_write() {
@@ -540,7 +566,7 @@ atomic_write() {
 }
 
 configure_recovery_paths() {
-	case "$worker_token" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac
+	safe_worker_token "$worker_token" || return 1
 	recovery_owner_starttime="$(proc_starttime "$$" 2>/dev/null)"
 	is_positive_uint "$recovery_owner_starttime" || return 1
 	recovery_root="$job_root/recovery"
@@ -1660,18 +1686,8 @@ replace_temporary_cake_qdisc() {
 }
 
 configure_temp_shaper_identity() {
-	identity_seed="$(printf '%s' "$worker_token" | cut -c1-8)"
-	case "$identity_seed" in
-		????????) ;;
-		*) identity_seed="" ;;
-	esac
-	case "$identity_seed" in
-		''|*[!A-Fa-f0-9]*)
-			identity_seed="$(printf '%s' "$worker_token" | cksum 2>/dev/null |
-				awk 'NF >= 1 { printf "%08x", $1; exit }')"
-			;;
-	esac
-	case "$identity_seed" in ????????) ;; *) return 1 ;; esac
+	safe_worker_token "$worker_token" || return 1
+	identity_seed="$(printf '%s' "$worker_token" | cut -c1-8 | tr 'A-F' 'a-f')"
 	handle_seed="$(printf '%s' "$identity_seed" | cut -c1-3 | tr 'A-F' 'a-f')"
 	temp_ifb="catf$identity_seed"
 	temp_ifb_alias="cake-autotune-$worker_token"
@@ -4224,7 +4240,8 @@ run_job() {
 	trap 'cancelled=1; exit 130' INT TERM
 	trap 'worker_cleanup "$?"' EXIT
 	[ -n "${autotune_profile:-}" ] || fail "Full Auto-Tune profile is missing."
-	case "$worker_token" in ''|*[!A-Za-z0-9_-]*) fail "Full Auto-Tune worker identity token is missing or invalid." ;; esac
+	safe_worker_token "$worker_token" ||
+		fail "Full Auto-Tune worker identity token must be exactly 32 hexadecimal characters."
 	registration_attempt=0
 	worker_registered=false
 	while [ "$registration_attempt" -lt 5 ]; do
@@ -4488,7 +4505,8 @@ start_job() {
 
 	archive_previous_terminal ||
 		json_error "Unable to archive and bound the previous Full Auto-Tune diagnostics in RAM."
-	new_token="$(new_worker_token)"
+	new_token="$(new_unique_worker_token)" ||
+		json_error "Unable to generate a unique 32-hex Full Auto-Tune worker identity from the kernel random UUID source."
 	active_run_id="$new_token"
 	rm -f "$pid_file" "$status_file" "$result_file" "$error_file" "$pending_result_file" \
 		"$pending_error_file" "$cancel_file" "$log_file"

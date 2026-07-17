@@ -1325,3 +1325,73 @@ Final RC20 payload hashes are:
 | aarch64_generic installer | `f942ca9bea8180cf0dd73a97f37159be1d4fc5d531e0e5af09730972fa8a0231` |
 | x86_64 offline bundle | `1c8d02d98d7d8cc295534ba50ddb5acc4ff83085188e10c5d9fb550fa6d03bd7` |
 | rockchip/armv8 offline bundle | `bd1833db70edf9cc5d8406979e30a22e2bdcaae7c967e8fdc297e8d94a3ac4d5` |
+
+## RC21 instance-scoped priorities and upgrade-lifecycle acceptance (2026-07-17)
+
+RC21 was tested against the failure modes observed on minimal OpenWrt images,
+not only against a development host. The affected x86 Multi-WAN image has no
+`od` or `cksum`; its kernel UUID source is present. The new preflight consumed
+that source directly, produced an exact 32-hex worker token and unique
+temporary IFB identity, entered the normal reflector phase, and cancelled with
+`runtime_restored=true` and no pending recovery. Deterministic fixtures also
+proved that an invalid/missing UUID or eight colliding foreign interface names
+fail synchronously before a worker, runtime lock, SQM pause, or recovery
+journal is created. A foreign colliding interface is never deleted.
+
+The final local release gate passed:
+
+- `cargo fmt --check`, locked `cargo check`, strict Clippy and all 142 Rust
+  tests;
+- all seven daemon shell suites, all nine LuCI shell lifecycle/recovery suites
+  and all seven LuCI JavaScript suites;
+- POSIX syntax for every packaged helper, JavaScript syntax for every LuCI
+  view/test, JSON parsing for menu/ACL data, and `git diff --check`;
+- independent OpenWrt 25.12.5 x86_64 and rockchip/armv8 builds. Their noarch
+  LuCI APKs are byte-identical, and both core APKs contain the expected ELF
+  architecture plus matching `post-install` and `post-upgrade` restart hooks.
+
+Package replacement was then verified on a disposable x86 router, an existing
+dual-WAN x86 router, and an existing low-storage ARM router. In all three
+cases the running daemon PID changed automatically during `post-upgrade`; no
+manual restart or reboot was needed. Every pre/post UCI checksum remained
+identical. The dual-WAN device retained both managed CAKE/IFB topologies and
+limits, both instances reported `HEALTHY`, and every IPv4/IPv6 mwan3 member
+remained online. On the ARM device the package cache was moved to RAM only
+under an EXIT/HUP/INT/TERM restoration trap; its post-test file manifest was
+byte-identical to the backup, rootfs free space returned to its initial value,
+and the managed instance remained `HEALTHY`. No device retained a runtime
+recovery file.
+
+The LuCI navigation was tested both from a fresh session and through an actual
+RC20-to-RC21 browser-cache transition. In the latter case the same browser
+session first rendered the old global Traffic priorities tab, received RC21,
+and used only an ordinary reload. RC21 removed that stale tab, flushed LuCI's
+menu cache, kept the login session, rendered one Traffic priorities action per
+instance, and opened a view containing only the selected instance and its
+rules.
+
+Authenticated Playwright then audited the exact final packages on the
+disposable x86, dual-WAN x86, and ARM routers at 1500x900 and 390x844. It
+covered Status, Graphs, Settings, instance-scoped Traffic priorities, Re-run
+Auto-Tune and Edit. The routers rendered 2, 4, and 2 graph canvases
+respectively. Every page had zero horizontal overflow, zero page/console/RPC
+errors, and no `Access denied` response. The checks did not start a heavy
+calibration or save configuration.
+
+Both offline repositories contain and index 68 APKs. The standalone installers
+pass `sh -n`; each archive contains the matching installer, `packages.adb`, and
+the same 68-package closure. Fresh x86_64 and aarch64_generic roots, with
+network and package scripts disabled, installed all 68 packages and selected
+exactly daemon/LuCI `1.0_rc21-r1`.
+
+Final RC21 payload hashes are:
+
+| Artifact | SHA-256 |
+|---|---|
+| x86_64 daemon APK | `56e840c2ad202f109b76450c4789cd6c2da9076701b2b8c4b52c0b2616228a74` |
+| aarch64_generic daemon APK | `099240b5d0dc924f01e883f49755726ca0828f7cc3f75a26b90d00cf7ca8cb2f` |
+| noarch LuCI APK | `b65ce190acdf6fb01713f05850d4c3cb6ae015e6ebc3ad4313d3b9b41b87c01c` |
+| x86_64 installer | `5d4d8a545ea3a1e2eace825a1e6f2ace34c32865a85c43cfe04e0f2ad0e287d0` |
+| aarch64_generic installer | `25939171a0541677dd97941d4a175769292de160cfc0910be8b6067fde7dc013` |
+| x86_64 offline bundle | `cd11384235a90d0ec4c380b7b75a759f235a2f50e55f634ec04b43f2cf557940` |
+| rockchip/armv8 offline bundle | `7e957b41ba893023168d52462208e398681f466470b40b8e21915755b6dac807` |

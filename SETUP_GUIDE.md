@@ -56,14 +56,16 @@ instance only after identifying the intended uplink.
 
 ## Existing instances
 
-Use **Re-run Auto-Tune** immediately before **Edit** in the Settings row. It
-opens the calibration page with the instance interface, route/member, backend,
-queue, current limits and saved profile prefilled. The current configuration
-remains active until an eligible Review result is explicitly staged and saved.
-Changing profile affects the complete proposal and SQM policy, not just the
-grade label. Re-run preserves the instance's explicit Adaptive Ceiling
-enabled/disabled choice; changing it requires the corresponding Review
-control.
+Each Settings row keeps the instance-scoped actions together in this order:
+**Traffic priorities**, **Re-run Auto-Tune**, **Edit**, and **Delete**. Use
+**Re-run Auto-Tune** immediately before editing rates inferred from a new
+calibration. It opens the calibration page with the instance interface,
+route/member, backend, queue, current limits and saved profile prefilled. The
+current configuration remains active until an eligible Review result is
+explicitly staged and saved. Changing profile affects the complete proposal
+and SQM policy, not just the grade label. Re-run preserves the instance's
+explicit Adaptive Ceiling enabled/disabled choice; changing it requires the
+corresponding Review control.
 
 ## Reading Auto-Tune diagnostics
 
@@ -119,8 +121,10 @@ not belong to the normal setup workflow.
 
 ## Profile traffic rules
 
-Open **Traffic priorities** after the instance has a validated profile and
-managed SQM:
+Open **Settings**, find the intended instance, and select its **Traffic
+priorities** action after the instance has a validated profile and managed
+SQM. The page is intentionally bound to that row; it never shows or edits
+another WAN's rules.
 
 1. Enable **Outbound rules** for the intended instance.
 2. Keep or disable the defaults for each profile independently. Only the

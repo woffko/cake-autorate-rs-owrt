@@ -109,6 +109,37 @@ function profileLabel(value) {
 	return PROFILE_LABELS[canonicalProfile(value)] || _('Unknown');
 }
 
+function safeInstanceName(value) {
+	return typeof value === 'string' && /^[A-Za-z0-9_]+$/.test(value);
+}
+
+function selectedInstanceFromLocation(locationObject) {
+	var search = locationObject && typeof locationObject.search === 'string' ?
+		locationObject.search : '';
+	var match = search.match(/(?:^\?|&)instance=([^&]*)/);
+	var value;
+
+	if (!match)
+		return null;
+	try {
+		value = decodeURIComponent(match[1].replace(/\+/g, ' '));
+	} catch (error) {
+		return null;
+	}
+	return safeInstanceName(value) ? value : null;
+}
+
+function settingsUrl() {
+	return L.url('admin/network/cake-autorate-rs/settings');
+}
+
+function backToSettingsButton() {
+	return E('button', {
+		'class': 'btn cbi-button cbi-button-neutral',
+		'click': function() { window.location = settingsUrl(); }
+	}, [ '\u2190 ', _('Back to instances') ]);
+}
+
 function parseClassifierStatus(result) {
 	var text = result && result.stdout ? result.stdout.trim() : '';
 	var parsed;
@@ -147,10 +178,14 @@ function addList(section, name, title, values, defaultValue) {
 
 return L.view.extend({
 	load: function() {
+		var requestedInstance = selectedInstanceFromLocation(window.location);
+		var classifierArgs = [ 'status' ];
+		if (requestedInstance)
+			classifierArgs.push(requestedInstance);
 		return Promise.all([
 			uci.load('cake-autorate'),
 			L.resolveDefault(
-				fs.exec('/usr/libexec/cake-autorate-rs/traffic-classifier', [ 'status' ])
+				fs.exec('/usr/libexec/cake-autorate-rs/traffic-classifier', classifierArgs)
 					.then(parseClassifierStatus),
 				{ state: 'unavailable', table_present: false }
 			)
@@ -160,13 +195,29 @@ return L.view.extend({
 	render: function(data) {
 		var classifier = data[1] || {};
 		var instances = uci.sections('cake-autorate', 'cake_autorate');
-		var instanceValues = instances.map(function(section) {
-			return [ section['.name'], section['.name'] ];
-		});
+		var selectedInstance = selectedInstanceFromLocation(window.location);
+		var selectedSection = instances.filter(function(section) {
+			return section['.name'] === selectedInstance;
+		})[0];
+		var instanceValues = selectedSection ?
+			[ [ selectedInstance, selectedInstance ] ] : [];
 		var stateText;
+
+		cakeUi.ensureAppHeader();
+		if (!selectedSection)
+			return E('div', { 'class': 'cbi-map' }, [
+				E('h2', {}, _('Traffic priorities')),
+				E('div', { 'class': 'alert-message error' },
+					_('Select an existing instance from the Settings page before editing traffic priorities.')),
+				E('div', { 'class': 'cbi-page-actions' }, backToSettingsButton())
+			]);
+
 		switch (classifier.state) {
 		case 'active':
-			stateText = _('The native outbound classifier is active and its loaded rules match the attested runtime state.');
+			stateText = _('The native outbound classifier is active for this instance and its loaded rules match the attested runtime state.');
+			break;
+		case 'missing':
+			stateText = _('The classifier is active globally, but this instance has no attested rules. Save & Apply if outbound rules are enabled below.');
 			break;
 		case 'drifted':
 			stateText = _('The private nftables table changed after it was applied. Save & Apply to replace it, then inspect the Services column.');
@@ -179,12 +230,13 @@ return L.view.extend({
 		}
 		var m, s, o, index;
 
-		cakeUi.ensureAppHeader();
-		m = new form.Map('cake-autorate', _('Traffic priorities'),
-			_('Create and modify profile-specific DSCP rules without qosify or eBPF. cake-autorate-rs remains the only owner of SQM, CAKE, IFB devices and bandwidth rates. This classifier owns only its isolated nftables table.'));
+		m = new form.Map('cake-autorate', _('Traffic priorities \u2014 %s').format(selectedInstance),
+			_('Configure profile-specific outbound DSCP rules for this instance. cake-autorate-rs remains the only owner of SQM, CAKE, IFB devices and bandwidth rates; the classifier owns only its isolated nftables table.'));
 
-		s = m.section(form.TypedSection, 'globals');
-		s.anonymous = true;
+		s = m.section(form.NamedSection, selectedInstance, 'cake_autorate',
+			_('Instance policy'),
+			_('Active calibration profile: %s. Enable only the rules that should reach this instance\'s outbound CAKE queue.').format(
+				profileLabel(selectedSection.autotune_profile)));
 		s.addremove = false;
 		o = s.option(form.DummyValue, '_traffic_priority_notice', _('Runtime'));
 		o.rawhtml = true;
@@ -201,14 +253,9 @@ return L.view.extend({
 			]);
 		};
 
-		s = m.section(form.GridSection, 'cake_autorate', _('Profile defaults by instance'));
-		s.anonymous = false;
-		s.addremove = false;
-		s.nodescriptions = true;
-
 		o = s.option(form.DummyValue, '_active_profile', _('Active profile'));
-		o.cfgvalue = function(sectionId) {
-			return profileLabel(uci.get('cake-autorate', sectionId, 'autotune_profile'));
+		o.cfgvalue = function() {
+			return profileLabel(selectedSection.autotune_profile);
 		};
 
 		addFlag(s, 'traffic_rules_enabled', _('Outbound rules'), '0',
@@ -222,12 +269,13 @@ return L.view.extend({
 
 		s = m.section(form.GridSection, 'traffic_rule', _('Custom profile rules'));
 		s.anonymous = true;
-		s.addremove = instanceValues.length > 0;
+		s.addremove = true;
 		s.addbtntitle = _('Add traffic rule');
 		s.nodescriptions = true;
-		s.description = instanceValues.length ?
-			_('Rules are stored per instance and profile. Built-ins run first; higher ordered custom matches run later.') :
-			_('Create an autorate instance in Settings before adding profile traffic rules.');
+		s.description = _('Only rules belonging to this instance are shown. Built-ins run first; higher ordered custom matches run later.');
+		s.filter = function(sectionId) {
+			return uci.get('cake-autorate', sectionId, 'instance') === selectedInstance;
+		};
 		s.sectiontitle = function(sectionId) {
 			return uci.get('cake-autorate', sectionId, 'name') || sectionId;
 		};
@@ -239,9 +287,10 @@ return L.view.extend({
 		o.placeholder = _('Game or application');
 
 		o = addList(s, 'instance', _('Instance'), instanceValues,
-			instanceValues.length ? instanceValues[0][0] : null);
+			selectedInstance);
+		o.modalonly = true;
 		o.validate = function(sectionId, value) {
-			return instanceValues.some(function(item) { return item[0] === value; }) ?
+			return value === selectedInstance ?
 				true : _('Select an existing CAKE Autorate instance.');
 		};
 
@@ -314,6 +363,11 @@ return L.view.extend({
 			    s.children[index].option !== 'order')
 				s.children[index].modalonly = true;
 
-		return m.render();
+		return m.render().then(function(node) {
+			return E('div', {}, [
+				E('div', { 'class': 'cbi-page-actions' }, backToSettingsButton()),
+				node
+			]);
+		});
 	}
 });

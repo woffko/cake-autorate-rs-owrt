@@ -54,7 +54,14 @@ uses a permanent universal port list.
 
 ## Custom rules
 
-Open **Network → CAKE Autorate SQM → Traffic priorities**. A custom rule has:
+Open **Network → CAKE Autorate SQM → Settings** and select **Traffic
+priorities** on the intended instance row. The action is deliberately placed
+before **Re-run Auto-Tune**, **Edit**, and **Delete**. There is no global
+Traffic priorities tab: the URL carries a validated instance identifier, the
+status call is scoped to that instance, and the editor exposes only rules that
+belong to it.
+
+A custom rule has:
 
 - an instance and one profile;
 - an enabled flag and display name;
@@ -119,6 +126,10 @@ resolved L3 uplink. Two instances cannot claim the same target. A profile
 change on one WAN does not copy rules or learned state to another WAN, and the
 configuration fingerprint binds the relevant custom rules into Full
 Auto-Tune/Scheduled Auto-Apply evidence.
+
+Opening one WAN's editor never places another WAN in the instance selector or
+rule list. This UI isolation complements the backend ownership and fingerprint
+checks; it is not the sole security boundary.
 
 The classifier changes DSCP only. Main-table or mwan3 route selection remains
 the responsibility of the existing structured probe router, and CAKE/IFB/rate

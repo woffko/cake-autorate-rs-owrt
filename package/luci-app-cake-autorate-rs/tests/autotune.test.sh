@@ -48,6 +48,60 @@ export AUTOTUNE_MOCK_COUNTER="$work/counter"
 export AUTOTUNE_MOCK_PIN_LOG="$work/server-pins"
 export AUTOTUNE_MOCK_DIRECTION_LOG="$work/test-directions"
 
+# Minimal OpenWrt images such as the production x86 Multi-WAN router provide
+# neither od nor cksum. Worker/shaper identity must come directly from the
+# kernel UUID source and stay a strict 32-hex value; no late fallback may turn
+# it into an uptime-pid string after the worker has already launched.
+printf '%s\n' '12345678-90AB-CDEF-1234-567890ABCDEF' > "$work/random-uuid"
+mkdir -p "$work/sys-class-net"
+CAKE_AUTORATE_RANDOM_UUID_FILE="$work/random-uuid" \
+CAKE_AUTORATE_SYS_CLASS_NET="$work/sys-class-net" \
+CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
+	set -eu
+	. "$1"
+	worker_token="$(new_unique_worker_token)"
+	[ "$worker_token" = 1234567890abcdef1234567890abcdef ]
+	configure_temp_shaper_identity
+	[ "$temp_ifb" = catf12345678 ]
+	[ "$temp_ifb_alias" = cake-autotune-1234567890abcdef1234567890abcdef ]
+	[ "$temp_target_handle" = a123: ]
+	[ "$temp_ifb_handle" = b123: ]
+	[ "${#temp_ifb}" -le 15 ]
+' sh "$autotune"
+if grep -Eq '(^|[^A-Za-z0-9_])(od|cksum)([^A-Za-z0-9_]|$)' "$autotune"; then
+	echo "autotune still has a hidden od/cksum runtime dependency" >&2
+	exit 1
+fi
+
+# A pre-existing interface with the same candidate name is never reused or
+# removed. The bounded generator retries and fails while the foreign path
+# remains intact.
+mkdir "$work/sys-class-net/catf12345678"
+if CAKE_AUTORATE_RANDOM_UUID_FILE="$work/random-uuid" \
+   CAKE_AUTORATE_SYS_CLASS_NET="$work/sys-class-net" \
+   CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
+	. "$1"
+	new_unique_worker_token
+' sh "$autotune" >/dev/null 2>&1; then
+	echo "colliding temporary IFB identity was accepted" >&2
+	exit 1
+fi
+[ -d "$work/sys-class-net/catf12345678" ]
+
+# Invalid/missing kernel randomness is rejected synchronously by the start RPC
+# before a worker, interface lock, SQM pause, or recovery journal can exist.
+printf '%s\n' 'not-a-kernel-uuid' > "$work/invalid-random-uuid"
+export CAKE_AUTORATE_RANDOM_UUID_FILE="$work/invalid-random-uuid"
+if "$autotune" baduuid lo start speedtest-go > "$work/baduuid.json"; then
+	echo "invalid worker UUID unexpectedly started Full Auto-Tune" >&2
+	exit 1
+fi
+grep -q 'Unable to generate a unique 32-hex Full Auto-Tune worker identity' "$work/baduuid.json"
+[ ! -e "$work/jobs/baduuid/pid" ]
+[ ! -d "$work/jobs/recovery" ] ||
+	! find "$work/jobs/recovery" -name 'baduuid_*' -print -quit | grep -q .
+unset CAKE_AUTORATE_RANDOM_UUID_FILE
+
 # The fixture must model jsonfilter's top-level lookup semantics.  Greedy text
 # extraction used to select nested proposal fields and report schema 1/state
 # inner instead of the terminal envelope's schema 5/state complete.
