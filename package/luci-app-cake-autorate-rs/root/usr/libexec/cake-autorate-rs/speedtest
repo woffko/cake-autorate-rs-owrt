@@ -2048,7 +2048,14 @@ run_iperf3() {
 }
 
 emit_result() {
-	printf '{"download_kbps":%s,"upload_kbps":%s,"download_bytes":%s,"upload_bytes":%s,"download_elapsed_s":%s,"upload_elapsed_s":%s,"test_direction":"%s","source":"%s","backend":"%s","backend_title":"%s","server_id":"%s","server_name":"%s","server_sponsor":"%s","bind_mode":"%s","target_interface":"%s","route_interface":"%s","route_mode":"%s","mwan3_member":"%s","route_source_ip":"%s","route_fwmark":"%s","route_table":"%s","external_ip_before":"%s","external_ip_after":"%s","shaper_bypassed":%s,"autorate_paused":%s,"sqm_paused":%s,"warning":"%s"}\n' \
+	case "$backend:$direction_override" in
+		speedtest-go:download) backend_direction_flag=--no-upload ;;
+		speedtest-go:upload) backend_direction_flag=--no-download ;;
+		speedtest-go:*|*:both|*:) backend_direction_flag=both ;;
+		*:download) backend_direction_flag=download-only ;;
+		*:upload) backend_direction_flag=upload-only ;;
+	esac
+	printf '{"download_kbps":%s,"upload_kbps":%s,"download_bytes":%s,"upload_bytes":%s,"download_elapsed_s":%s,"upload_elapsed_s":%s,"test_direction":"%s","backend_direction_flag":"%s","source":"%s","backend":"%s","backend_title":"%s","server_id":"%s","server_name":"%s","server_sponsor":"%s","bind_mode":"%s","target_interface":"%s","route_interface":"%s","route_mode":"%s","mwan3_member":"%s","route_source_ip":"%s","route_fwmark":"%s","route_table":"%s","external_ip_before":"%s","external_ip_after":"%s","shaper_bypassed":%s,"autorate_paused":%s,"sqm_paused":%s,"warning":"%s"}\n' \
 		"$download_kbps" \
 		"$upload_kbps" \
 		"$download_size" \
@@ -2056,6 +2063,7 @@ emit_result() {
 		"$download_elapsed" \
 		"$upload_elapsed" \
 		"$(json_escape "${direction_override:-both}")" \
+		"$(json_escape "$backend_direction_flag")" \
 		"$(json_escape "$source")" \
 		"$(json_escape "$backend")" \
 		"$(json_escape "$(backend_title "$backend")")" \

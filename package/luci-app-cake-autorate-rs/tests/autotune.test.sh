@@ -11,7 +11,7 @@ export PATH
 
 cleanup() {
 	[ -n "${blocking_pid:-}" ] && kill "$blocking_pid" 2>/dev/null || true
-	rm -rf "$work"
+	[ "${AUTOTUNE_TEST_KEEP_WORK:-0}" = 1 ] || rm -rf "$work"
 }
 trap cleanup EXIT INT TERM
 
@@ -104,7 +104,7 @@ unset CAKE_AUTORATE_RANDOM_UUID_FILE
 
 # The fixture must model jsonfilter's top-level lookup semantics.  Greedy text
 # extraction used to select nested proposal fields and report schema 1/state
-# inner instead of the terminal envelope's schema 5/state complete.
+# inner instead of the terminal envelope's schema 6/state complete.
 nested_terminal='{"state":"complete","schema_version":5,"nested":{"state":"inner","schema_version":1}}'
 test "$(printf '%s\n' "$nested_terminal" | "$CAKE_AUTORATE_JSONFILTER" -e '@.state')" = complete
 test "$(printf '%s\n' "$nested_terminal" | "$CAKE_AUTORATE_JSONFILTER" -e '@.schema_version')" = 5
@@ -140,6 +140,29 @@ CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
 	! pinger_targets_json_array fping "--bad-option" >/dev/null
 	strict_single_json_object "{\"state\":\"complete\",\"schema_version\":4}"
 	! strict_single_json_object "$(printf "%s\n%s" "{\"state\":\"complete\",\"schema_version\":4}" "{\"forged\":true}")"
+' sh "$autotune"
+
+# The terminal-race distinction must not weaken live argv authentication.
+# An exact live helper returns 0; the same PID/starttime with a missing
+# immutable argument returns the dedicated live-mismatch code 1.
+CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
+	set -eu
+	. "$1"
+	speedtest_bin=/bin/sh
+	job_name=identity-job
+	target_if=identity-if
+	/bin/sh -c "while :; do sleep 1; done" identity-job identity-if &
+	identity_pid="$!"
+	identity_start="$(proc_starttime "$identity_pid")"
+	speedtest_identity_matches "$identity_pid" "$identity_start"
+	target_if=missing-if
+	set +e
+	speedtest_identity_matches "$identity_pid" "$identity_start"
+	identity_rc="$?"
+	set -e
+	[ "$identity_rc" -eq 1 ]
+	kill "$identity_pid" 2>/dev/null || true
+	wait "$identity_pid" 2>/dev/null || true
 ' sh "$autotune"
 
 "$autotune" fullauto lo start speedtest-go > "$work/start.json"
@@ -184,7 +207,9 @@ grep -q '"transport_median_ms":12.500' "$work/status.json"
 grep -q '"transport_latency":{' "$work/status.json"
 grep -q '"validation":{"profile":"best_overall","pass":true' "$work/status.json"
 grep -q '"manual_apply_eligible":true' "$work/status.json"
-grep -q '"comparison":"observed-low"' "$work/status.json"
+grep -q '"comparison":"direction-matched-observed-low"' "$work/status.json"
+grep -q '"profile_outcome":{"mode":"target-a-met"' "$work/status.json"
+grep -q '"profile_search":{"download":{"schema_version":1' "$work/status.json"
 grep -q '"auto_apply_eligible":true' "$work/status.json"
 grep -q '"phase_evidence_complete":true' "$work/status.json"
 grep -Eq '"config_fingerprint":"sha256:[0-9a-f]{64}"' "$work/status.json"
@@ -199,11 +224,38 @@ test "$(sed -n '1p' "$work/server-pins")" = automatic
 test "$(sed -n '2p' "$work/server-pins")" = 17372
 test "$(sed -n '3p' "$work/server-pins")" = 17372
 test "$(sed -n '4p' "$work/server-pins")" = 17372
+test "$(sed -n '5p' "$work/server-pins")" = 17372
 test "$(sed -n '1p' "$work/test-directions")" = both
-test "$(sed -n '2p' "$work/test-directions")" = both
+test "$(sed -n '2p' "$work/test-directions")" = download
 test "$(sed -n '3p' "$work/test-directions")" = download
 test "$(sed -n '4p' "$work/test-directions")" = upload
+test "$(sed -n '5p' "$work/test-directions")" = upload
+test "$(sed -n '6p' "$work/test-directions")" = download
+test "$(sed -n '7p' "$work/test-directions")" = upload
 wait_for_job_cleanup fullauto
+
+# A helper may publish its complete JSON and exit while one finishing child
+# briefly keeps the supervised process group alive.  The leader is then a
+# zombie with an empty /proc/<pid>/cmdline.  That normal terminal race must be
+# reaped as success, not misclassified as an identity-mismatch attack.
+: > "$work/counter"
+export AUTOTUNE_MOCK_POST_RESULT_DESCENDANT_AT_COUNT=7
+"$autotune" terminalrace lo start speedtest-go > "$work/terminalrace-start.json"
+attempt=0
+while [ "$attempt" -lt 800 ]; do
+	"$autotune" terminalrace lo status speedtest-go > "$work/terminalrace-status.json"
+	grep -q '"state":"complete"' "$work/terminalrace-status.json" && break
+	if grep -q '"state":"failed"' "$work/terminalrace-status.json"; then
+		cat "$work/terminalrace-status.json" >&2
+		exit 1
+	fi
+	attempt=$((attempt + 1))
+	sleep 0.02
+done
+grep -q '"state":"complete"' "$work/terminalrace-status.json"
+! grep -q 'identity-mismatch' "$work/terminalrace-status.json"
+wait_for_job_cleanup terminalrace
+unset AUTOTUNE_MOCK_POST_RESULT_DESCENDANT_AT_COUNT
 
 # A helper success code with malformed output must yield valid terminal JSON;
 # untrusted text must never be spliced into the diagnostic object.
@@ -290,11 +342,11 @@ export AUTOTUNE_MOCK_RESULT_DIRECTION=both
 attempt=0
 while [ "$attempt" -lt 220 ]; do
 	"$autotune" wrongdirection lo status speedtest-go > "$work/wrongdirection-status.json"
-	grep -q 'reported both for the requested download-only' "$work/wrongdirection-status.json" && break
+	grep -q 'reported both for the unshaped download-only control' "$work/wrongdirection-status.json" && break
 	attempt=$((attempt + 1))
 	sleep 0.05
 done
-grep -q 'reported both for the requested download-only' "$work/wrongdirection-status.json"
+grep -q 'reported both for the unshaped download-only control' "$work/wrongdirection-status.json"
 wait_for_job_cleanup wrongdirection
 unset AUTOTUNE_MOCK_RESULT_DIRECTION
 
@@ -332,10 +384,13 @@ done
 grep -q '"profile":"fair"' "$work/fairdisable-status.json"
 grep -q '"auto_apply_eligible":false' "$work/fairdisable-status.json"
 grep -q '"manual_apply_eligible":true' "$work/fairdisable-status.json"
-grep -q '"pass":false,"hard_pass":true,"quality_target_met":false' "$work/fairdisable-status.json"
+grep -q '"pass":false,"hard_pass":true,"safety_pass":true,"quality_target_met":false' "$work/fairdisable-status.json"
+grep -q '"profile_outcome":{"mode":"throughput-optimum-quality-fallback"' "$work/fairdisable-status.json"
+grep -q '"manual_only":true' "$work/fairdisable-status.json"
 grep -q '"mode":"sqm-disable-recommended"' "$work/fairdisable-status.json"
 grep -q '"recommended_action":"disable_sqm"' "$work/fairdisable-status.json"
 grep -q '"allowed_actions":\["apply_sqm","keep_current","disable_sqm"\]' "$work/fairdisable-status.json"
+grep -q '"apply_sqm_available":true' "$work/fairdisable-status.json"
 grep -q '"disable_sqm_available":true' "$work/fairdisable-status.json"
 node - "$work/fairdisable-status.json" <<'EOF'
 const fs = require('node:fs');
@@ -381,23 +436,64 @@ grep -q '"configuration_written":false' "$work/overshoot-status.json"
 wait_for_job_cleanup overshoot
 unset AUTOTUNE_MOCK_REALIZATION_OVERSHOOT
 
-# The existing low-realization retry has the same terminal evidence semantics:
-# exhausting the bounded retry is inconclusive, not a proven candidate failure.
+# Two stable low-realization samples followed by two stable upper-bound samples
+# prove a repeatable shaper ceiling. This is a typed profile failure, not random
+# measurement uncertainty, and it must never yield an applyable proposal.
 : > "$work/counter"
 export AUTOTUNE_MOCK_REALIZATION_LOW=1
 "$autotune" lowrealization lo start speedtest-go > "$work/lowrealization-start.json"
 attempt=0
 while [ "$attempt" -lt 260 ]; do
 	"$autotune" lowrealization lo status speedtest-go > "$work/lowrealization-status.json"
-	grep -q 'candidate-realization-too-low-after-bounded-retry' "$work/lowrealization-status.json" && break
+	grep -q 'profile-capacity-floor-infeasible' "$work/lowrealization-status.json" && break
 	attempt=$((attempt + 1))
 	sleep 0.05
 done
-grep -q '"state":"inconclusive"' "$work/lowrealization-status.json"
-grep -q '"retryable":true' "$work/lowrealization-status.json"
-if grep -q '"state":"failed"' "$work/lowrealization-status.json"; then exit 1; fi
+grep -q '"state":"failed"' "$work/lowrealization-status.json"
+grep -q 'repeatable-shaper-ceiling-below-capacity-floor' "$work/lowrealization-status.json"
+grep -q '"manual_apply_eligible":false' "$work/lowrealization-status.json"
+grep -q '"configuration_written":false' "$work/lowrealization-status.json"
 wait_for_job_cleanup lowrealization
 unset AUTOTUNE_MOCK_REALIZATION_LOW
+
+# On Fair, the same proven CPU ceiling produces a fail-closed Review instead
+# of applying a candidate below the immutable 90% floor. A clean no-SQM
+# control may offer explicit disable, while apply_sqm is absent by contract.
+: > "$work/counter"
+export AUTOTUNE_MOCK_REALIZATION_LOW=1
+export AUTOTUNE_MOCK_COMPUTE_CEILING=1
+"$autotune" faircpuceiling lo start speedtest-go '' '' fair > "$work/faircpuceiling-start.json"
+attempt=0
+while [ "$attempt" -lt 360 ]; do
+	"$autotune" faircpuceiling lo status speedtest-go '' '' fair > "$work/faircpuceiling-status.json"
+	grep -q '"state":"complete"' "$work/faircpuceiling-status.json" && break
+	attempt=$((attempt + 1))
+	sleep 0.05
+done
+node - "$work/faircpuceiling-status.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (result.state !== 'complete' || result.profile !== 'fair' ||
+    result.validation.safety_pass !== false ||
+    result.profile_outcome.mode !== 'capacity-floor-infeasible' ||
+    result.profile_outcome.capacity_floor_met !== false ||
+    result.fair_outcome.capacity_floor_met !== false ||
+    result.fair_outcome.apply_sqm_available !== false ||
+    result.fair_outcome.mode !== 'sqm-disable-recommended' ||
+    JSON.stringify(result.fair_outcome.allowed_actions) !== JSON.stringify(['keep_current', 'disable_sqm']) ||
+    result.fair_outcome.disable_sqm_available !== true ||
+    result.auto_apply_eligible !== false || result.manual_apply_eligible !== true ||
+    result.configuration_written !== false)
+	throw new Error('Fair repeatable CPU ceiling did not produce the expected fail-closed Review');
+for (const direction of ['download', 'upload']) {
+	const search = result.profile_search[direction];
+	if (search.action !== 'fallback' || search.selected.safety_pass !== false ||
+	    search.reason !== 'repeatable-compute-ceiling-below-capacity-floor')
+		throw new Error(`${direction} lacks a proven compute-ceiling fallback`);
+}
+EOF
+wait_for_job_cleanup faircpuceiling
+unset AUTOTUNE_MOCK_REALIZATION_LOW AUTOTUNE_MOCK_COMPUTE_CEILING
 
 # Shaped evidence must explicitly attest that the speed-test helper neither
 # bypassed the candidate nor paused its temporary CAKE path.
@@ -461,7 +557,9 @@ grep -q '"stage":"shaped-upload"' "$work/preshaperownership-status.json"
 grep -q '"retryable":true' "$work/preshaperownership-status.json"
 grep -q '"configuration_written":false' "$work/preshaperownership-status.json"
 if grep -q '"state":"complete"' "$work/preshaperownership-status.json"; then exit 1; fi
-test "$(sed -n '1p' "$work/counter")" = 3
+# One bidirectional and four direction-matched raw controls precede the first
+# shaped download. The upload helper must not become the seventh invocation.
+test "$(sed -n '1p' "$work/counter")" = 6
 wait_for_job_cleanup preshaperownership
 unset AUTOTUNE_MOCK_SHAPER_OWNERSHIP_LOST_MARKER
 unset AUTOTUNE_MOCK_SHAPER_OWNERSHIP_CHECK_COUNTER AUTOTUNE_MOCK_SHAPER_INVALIDATE_AFTER_CHECK
@@ -486,9 +584,8 @@ test "$(wc -l < "$work/fping-restart.calls" | tr -d ' ')" = 1
 wait_for_job_cleanup ratelimitedreflector
 unset AUTOTUNE_MOCK_ICMP_RATE_LIMIT AUTOTUNE_MOCK_FPING_CALLS
 
-# A clean capacity shortfall raises only the failing direction.  The typed
-# correction target is composed against the unscaled proposal, so UL must not
-# inherit the DL scale.
+# A clean capacity shortfall raises only the failing direction first. The
+# independent typed searches must not leak the DL scale into UL evidence.
 : > "$work/counter"
 export AUTOTUNE_MOCK_DIRECTIONAL_CORRECT=1
 "$autotune" directional lo start speedtest-go > "$work/directional-start.json"
@@ -500,10 +597,20 @@ while [ "$attempt" -lt 220 ]; do
 	sleep 0.05
 done
 grep -q '"state":"complete"' "$work/directional-status.json"
-grep -q '"correction":{"action":"increase"' "$work/directional-status.json"
-grep -q '"download":{"action":"increase"' "$work/directional-status.json"
-grep -q '"upload":{"action":"none"' "$work/directional-status.json"
-grep -q '"candidate_base":{"download_kbps":44600,"upload_kbps":8500}' "$work/directional-status.json"
+node - "$work/directional-status.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const dl = result.profile_search.download.evaluated;
+const ul = result.profile_search.upload.evaluated;
+if (JSON.stringify(dl.map(item => item.candidate_kbps)) !==
+      JSON.stringify([42500, 43600, 50000]) ||
+    JSON.stringify(ul.map(item => item.candidate_kbps)) !==
+      JSON.stringify([8800, 10000]) ||
+    dl[0].safety_pass !== false || ul[0].safety_pass !== true ||
+    result.validation.candidate_base.download_kbps !== 50000 ||
+    result.validation.candidate_base.upload_kbps !== 10000)
+	throw new Error('directional profile search crossed DL and UL candidates');
+EOF
 wait_for_job_cleanup directional
 unset AUTOTUNE_MOCK_DIRECTIONAL_CORRECT
 
@@ -860,6 +967,19 @@ export CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1
 . "$autotune"
 unset CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY
 
+# Aggregate CPU can hide a saturated packet-processing core. The effective
+# safety signal is therefore the worse of total utilization and the busiest
+# core, while softirq remains an explicit diagnostic.
+cpu_previous='cpu 100 80 2
+cpu0 50 45 1
+cpu1 50 35 1'
+cpu_current='cpu 200 160 6
+cpu0 100 90 2
+cpu1 100 70 4'
+test "$(cpu_sample_fields "$cpu_previous" "$cpu_current")" = '30.0 20.0 30.0 6.0'
+printf '%s\n' '30.0 20.0 30.0 6.0' '25.0 25.0 20.0 8.0' > "$work/cpu-samples"
+test "$(cpu_peak_fields "$work/cpu-samples")" = '30.0 25.0 30.0 8.0'
+
 # Previous terminal diagnostics are retained in bounded RAM history. Count
 # pruning is deterministic even when several runs finish in the same second,
 # and the public history endpoint exposes metadata rather than arbitrary paths.
@@ -869,7 +989,7 @@ mkdir -p "$job_dir"
 export CAKE_AUTORATE_AUTOTUNE_HISTORY_RUNS=2
 export CAKE_AUTORATE_AUTOTUNE_HISTORY_KIB=128
 for history_test_run in a b c; do
-	printf '{"state":"complete","schema_version":5,"producer":"cake-autorate-rs-autotune","profile":"fair","run_id":"run-%s"}\n' \
+	printf '{"state":"complete","schema_version":6,"producer":"cake-autorate-rs-autotune","profile":"fair","run_id":"run-%s"}\n' \
 		"$history_test_run" > "$result_file"
 	printf 'diagnostic for run-%s\n' "$history_test_run" > "$log_file"
 	archive_previous_terminal
@@ -1145,7 +1265,7 @@ grep -q '"state":"legacy"' "$work/status-settled.json"
 grep -q '"legacy_result":{"state":"complete"' "$work/status-settled.json"
 grep -q '"auto_apply_eligible":false' "$work/status-settled.json"
 
-printf '%s\n' '{"state":"complete","schema_version":5,"producer":"cake-autorate-rs-autotune","profile":"best_overall"}' > "$result_file"
+printf '%s\n' '{"state":"complete","schema_version":6,"producer":"cake-autorate-rs-autotune","profile":"best_overall"}' > "$result_file"
 status_job > "$work/status-current.json"
 grep -q '"state":"complete"' "$work/status-current.json"
 if grep -q '"state":"legacy"' "$work/status-current.json"; then exit 1; fi
@@ -1242,6 +1362,13 @@ export AUTOTUNE_MOCK_QDISC_STATE='qdisc cake a123: root refcnt 2 bandwidth 80647
 if exact_root_qdisc lo a123: 806473 upload; then exit 1; fi
 export AUTOTUNE_MOCK_QDISC_STATE='qdisc cake a123: root refcnt 2 bandwidth 806473Kbit besteffort nat'
 if exact_root_qdisc lo a123: 806473 upload; then exit 1; fi
+temp_ifb=ifb-test
+temp_ifb_handle=b123:
+temp_target_handle=a123:
+target_if=lo
+export AUTOTUNE_MOCK_QDISC_STATE='qdisc cake b123: root refcnt 2 bandwidth 806473Kbit besteffort nat wash
+ Sent 12345 bytes 67 pkt (dropped 2, overlimits 3 requeues 4)'
+test "$(temporary_qdisc_stats_json download)" = '{"available":true,"device":"ifb-test","handle":"b123:","bytes":12345,"packets":67,"dropped":2,"overlimits":3,"requeues":4}'
 unset AUTOTUNE_MOCK_QDISC_STATE
 unset -f tc
 autotune_profile=best_overall
@@ -1351,39 +1478,45 @@ unset AUTOTUNE_MOCK_NFT_FAIL_LIST AUTOTUNE_MOCK_NFT_LOG
 export CAKE_AUTORATE_AUTOTUNE_TEST_PREFLIGHT=1
 export PATH="$original_path"
 
-# Exact RC16 values also traverse the complete worker pipeline.  Trusted
-# transport p95 is compared to trusted transport p95 (480 - 420 = 60), and the
-# real typed validator rejects the old blind 0.95-style reduction at its
-# safety floor without ever writing configuration.
+# The complete worker pipeline reproduces the observed Fair boundary failure:
+# the first apparently reasonable candidate retains less than 90% of raw
+# capacity. The optimizer must loosen CAKE repeatedly, test the real upper
+# bound, and retain the fastest measured safe point without lowering the 90%
+# contract or writing configuration itself.
 : > "$work/counter"
 real_daemon="$CAKE_AUTORATE_DAEMON"
 export AUTOTUNE_REAL_DAEMON="$real_daemon"
-export CAKE_AUTORATE_DAEMON="$fixtures/daemon-rc16"
-export AUTOTUNE_MOCK_RC16=1
-"$autotune" rc16e2e lo start speedtest-go > "$work/rc16e2e-start.json"
+export CAKE_AUTORATE_DAEMON="$fixtures/daemon-fair-boundary"
+export AUTOTUNE_MOCK_FAIR_BOUNDARY=1
+"$autotune" fairboundary lo start speedtest-go '' '' fair > "$work/fairboundary-start.json"
 attempt=0
-while [ "$attempt" -lt 260 ]; do
-	"$autotune" rc16e2e lo status speedtest-go > "$work/rc16e2e-status.json"
-	grep -q 'safety-floor-blocks-rate-reduction' "$work/rc16e2e-status.json" && break
+while [ "$attempt" -lt 320 ]; do
+	"$autotune" fairboundary lo status speedtest-go '' '' fair > "$work/fairboundary-status.json"
+	grep -q '"state":"complete"' "$work/fairboundary-status.json" && break
 	attempt=$((attempt + 1))
 	sleep 0.05
 done
-grep -q '"state":"failed"' "$work/rc16e2e-status.json"
-grep -q '"candidate_base":{"download_kbps":738500,"upload_kbps":755500}' "$work/rc16e2e-status.json"
-grep -q '"candidate_realization_percent":92.505' "$work/rc16e2e-status.json"
-grep -q '"capacity_retention_percent":77.323' "$work/rc16e2e-status.json"
-grep -q '"candidate_realization_percent":92.516' "$work/rc16e2e-status.json"
-grep -q '"capacity_retention_percent":77.275' "$work/rc16e2e-status.json"
-grep -q '"delta_p95_ms":60.0' "$work/rc16e2e-status.json"
-grep -q '"action":"infeasible"' "$work/rc16e2e-status.json"
-grep -q '"required_floor_kbps":764100' "$work/rc16e2e-status.json"
-grep -q '"required_floor_kbps":782200' "$work/rc16e2e-status.json"
-grep -q '"configuration_written":false' "$work/rc16e2e-status.json"
-grep -Eq '"config_fingerprint":"sha256:[0-9a-f]{64}"' "$work/rc16e2e-status.json"
-if grep -q '"scale":0.950000' "$work/rc16e2e-status.json"; then exit 1; fi
-wait_for_job_cleanup rc16e2e
+node - "$work/fairboundary-status.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const download = result.profile_search && result.profile_search.download;
+const upload = result.profile_search && result.profile_search.upload;
+const candidates = download && download.evaluated.map(item => item.candidate_kbps);
+if (result.state !== 'complete' || result.profile !== 'fair' ||
+    result.configuration_written !== false || result.validation.safety_pass !== true ||
+    result.validation.quality_target_met !== true ||
+    result.profile_outcome.mode !== 'throughput-optimum-c-or-better' ||
+    JSON.stringify(candidates) !== JSON.stringify([848500, 879700, 899000, 902700]) ||
+    download.selected.candidate_kbps !== 902700 ||
+    download.selected.retention_percent < 90 ||
+    upload.selected.candidate_kbps !== 900000 ||
+    upload.selected.retention_percent < 90)
+	throw new Error('Fair bounded search did not reach the maximum safe 90% solution');
+EOF
+grep -Eq '"config_fingerprint":"sha256:[0-9a-f]{64}"' "$work/fairboundary-status.json"
+wait_for_job_cleanup fairboundary
 export CAKE_AUTORATE_DAEMON="$real_daemon"
-unset AUTOTUNE_MOCK_RC16 AUTOTUNE_REAL_DAEMON
+unset AUTOTUNE_MOCK_FAIR_BOUNDARY AUTOTUNE_REAL_DAEMON
 
 # Exact RC16 regression: 92.5% candidate realization is distinct from 77.3%
 # capacity retention, p95(loaded)-p95(idle) is 60 ms (not 260 ms), and a

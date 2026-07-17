@@ -14,25 +14,29 @@ instance only after identifying the intended uplink.
    device.
 3. Choose **Full Auto-Tune**, then select a calibration profile:
 
-   - **Best overall** is recommended for most links. It targets an A-like
-     loaded-delay result while retaining at least 80% of observed-low
-     capacity.
-   - **Gaming** targets A+ with a 70% throughput floor and configures CAKE
+   - **Best overall** is recommended for most links. It finds the fastest safe
+     candidate that still proves A while retaining at least 80% of
+     observed-low capacity. If A is unattainable, Review can show a balanced
+     manual fallback.
+   - **Gaming** finds the fastest safe A+ candidate with a 70% throughput floor
+     and configures CAKE
      `diffserv4`. The optional native Traffic priorities page can mark selected
      outbound game/interactive traffic without installing qosify or eBPF.
      Trusted WAN-ingress DSCP is still preserved, so use this profile only
      when downstream markings are acceptable. Enabling native rules resets
      upload DSCP to CS0 before applying the selected built-in/custom rules.
-   - **Fair** keeps at least 90% of observed-low capacity and aims for C or
-     better (no more than 200 ms effective loaded-delay growth), favoring
-     sustained large downloads/uploads over the strictest latency.
+   - **Fair** maximizes safe throughput while keeping at least 90% of
+     observed-low capacity. C is a soft goal: among candidates within 1.5% of
+     the fastest result, lower loaded delay wins. This favors sustained large
+     downloads/uploads over the strictest latency.
 
    Existing instances without a saved profile default to Best overall.
 4. Stop large downloads and uploads first. The
    strict run measures idle ICMP across three independent reflector families,
-   persistent native transport latency, two unshaped throughput samples, and a
-   shaped validation candidate. It counts forwarded client traffic separately
-   during every heavy phase.
+   persistent native transport latency, one bidirectional plus two download-only
+   and two upload-only unshaped controls, and a bounded per-direction shaped
+   search. It counts forwarded client traffic separately during every heavy
+   phase.
 5. If background traffic blocks calibration, prefer **Retry when quiet**. The
    explicit **Continue conservatively** action applies to that run only: it
    subtracts measured background with an extra margin, never raises confirmed
@@ -79,16 +83,25 @@ download and upload:
 | Candidate capacity | Temporary CAKE candidate divided by observed-low capacity; this shows how conservative the candidate is |
 
 Latency is shown as loaded p95 minus idle p95 for both ICMP and native
-transport. The page also reports loss, CPU, forwarded background for each
-phase, every pass/fail gate, and any typed correction:
-`retry-measurement`, `increase`, `decrease`, `mixed`, or `infeasible`.
+transport. The page also reports loss, aggregate and busiest-core CPU, softirq,
+CAKE counters, forwarded background for each phase, every pass/fail gate and
+the complete ordered candidate history. `test`, `complete`, `fallback`, and
+`inconclusive` are typed optimizer outcomes, not generic error text.
 
-`infeasible` means the requested latency/rate constraints cannot be satisfied
-without crossing the throughput safety floor or configured bounds. It is not
-an instruction to accept a more destructive rate. Failed, incomplete, strictly
+The search can repeat an unreliable candidate, raise an under-retaining
+candidate several times toward `observed-low * floor / realization`, test the
+observed-low upper bound, and bisect the measured quality boundary. It never
+lowers a profile's 70/80/90% capacity floor. Failed, incomplete, strictly
 contaminated and conservative runs remain diagnostics and do not replace the
-current UCI configuration. Gaming and Best overall also expose no action after
-an infeasible result.
+current UCI configuration. A safe result below the Gaming or Best overall
+target is explicitly manual-only and scheduled Auto-Apply cannot consume it.
+
+When repeated tests at the observed-low upper bound prove that CAKE or a busy
+CPU core cannot retain that floor, Review identifies the repeatable
+shaper/compute ceiling instead of continuing to reduce the requirement. Such a
+point cannot be applied as SQM. Fair can retain the current configuration and
+may separately offer disabling SQM only when the clean no-SQM comparison is
+complete and strictly better under its documented gates.
 
 Fair is the narrow exception: if measurement integrity, route, background,
 candidate-realization, 90% retained-capacity and CPU gates all pass but class C

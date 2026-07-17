@@ -1395,3 +1395,82 @@ Final RC21 payload hashes are:
 | aarch64_generic installer | `25939171a0541677dd97941d4a175769292de160cfc0910be8b6067fde7dc013` |
 | x86_64 offline bundle | `cd11384235a90d0ec4c380b7b75a759f235a2f50e55f634ec04b43f2cf557940` |
 | rockchip/armv8 offline bundle | `7e957b41ba893023168d52462208e398681f466470b40b8e21915755b6dac807` |
+
+## RC22 Pareto Auto-Tune and capacity-floor acceptance (2026-07-17)
+
+RC22 replaces the single pass/fail Auto-Tune candidate with a bounded,
+profile-aware search over measured throughput and loaded latency. Gaming
+selects the highest-throughput A+ point when A+ is attainable, then falls back
+to the best attainable grade and the fastest point within that grade. Best
+overall applies the same rule around A. Fair selects the fastest safe point;
+when candidates are within 1.5% of the best throughput it prefers the lower
+loaded delay. The immutable measured-capacity floors remain 70%, 80%, and 90%
+for Gaming, Best overall, and Fair respectively.
+
+When the shaped result does not realize its requested candidate, Auto-Tune may
+perform up to eight bounded observations. A CAKE/CPU ceiling is accepted as
+repeatable only after a pair of same-candidate results agrees within 5%; an
+unstable sequence remains inconclusive. No profile lowers its capacity floor
+to manufacture a pass. If a repeatable implementation ceiling makes the floor
+impossible, Review reports `capacity-floor-infeasible`, keeps the current
+configuration selected, and exposes measured diagnostic limits without an
+Apply action. Fair may additionally offer an explicit disable-SQM experiment
+only when its separate no-SQM control proves material throughput recovery and
+no material loaded-latency benefit from SQM.
+
+The final local release gate passed:
+
+- `cargo fmt --check`, locked `cargo check`, strict Clippy, and all 153 Rust
+  tests;
+- all seven daemon shell suites, all nine LuCI shell lifecycle/recovery suites,
+  and all seven LuCI JavaScript suites;
+- POSIX syntax for every packaged helper, JavaScript syntax for every LuCI
+  view/test, JSON parsing for menu/ACL data, and `git diff --check`;
+- regression coverage for Pareto selection, all three immutable floors,
+  repeated low/high realization, inconclusive noisy observations, compute and
+  shaper ceilings, strict Review action binding, and fail-closed defaults;
+- independent OpenWrt 25.12.5 x86_64 and rockchip/armv8 builds. The two noarch
+  LuCI APKs are byte-identical.
+
+On the disposable x86 router, a real Fair calibration reached the new
+capacity-floor-infeasible branch after five shaped observations. The repeated
+CAKE/CPU ceiling was reported explicitly, the measured quality remained A,
+and no UCI file or qdisc rate changed. A deterministic browser fixture then
+verified that the native desktop and native 390-pixel mobile layouts show no
+Apply choice, select Keep current by default, keep Disable SQM explicit, and
+have zero horizontal overflow or browser/RPC errors. Evidence is retained in:
+
+- `/home/w0w/cake-autorate-rs-owrt/test-logs/rc22-playwright-disposable-final`;
+- `/home/w0w/cake-autorate-rs-owrt/test-logs/rc22-playwright-fair-real`.
+
+The final packages were installed on the production dual-WAN x86 and ARM
+acceptance routers using local APKs without restarting network or mwan3. Their
+daemon PIDs changed through the package lifecycle hook; all pre/post UCI hashes
+and managed qdisc limits remained identical. All four IPv4/IPv6 mwan3 members
+remained online on the dual-WAN router. Authenticated Playwright covered
+Status, Graphs, Settings, Traffic priorities, Edit, and Re-run Auto-Tune at
+1500x900 and 390x844. It rendered 4 and 2 graph canvases respectively, with
+zero horizontal overflow and zero page/console/RPC errors. Evidence is retained
+under:
+
+- `/home/w0w/cake-autorate-rs-owrt/test-logs/rc22-playwright-77-final`;
+- `/home/w0w/cake-autorate-rs-owrt/test-logs/rc22-playwright-100-final`.
+
+Both offline repositories contain and index 68 APKs. Fresh x86_64 and
+aarch64_generic roots, with networking and package scripts disabled, installed
+the complete 68-package closure and selected exactly daemon/LuCI
+`1.0_rc22-r1`. Independently extracted bundles also contain 68 APKs each; their
+installer and project APKs are byte-identical to the standalone release
+assets. `SHA256SUMS` validates all seven payloads.
+
+Final RC22 payload hashes are:
+
+| Artifact | SHA-256 |
+|---|---|
+| x86_64 daemon APK | `102b501664e8635ab5fc68ffb313d5b074d56f6bee1ec4d1e1f93e29a9c41c8a` |
+| aarch64_generic daemon APK | `72f284473e8baf4db05680675b1b21754184b0af3e255677796e0c48f4484730` |
+| noarch LuCI APK | `6d7110a33f0042e2a0c5e7fae27468b8656cf60e04ae98e309c5e574b8fe5eea` |
+| x86_64 installer | `afc37bcdbee96cd8f73d8ff2353eeb48ca8cad5ad8df46fb403d76d4611cbdf9` |
+| aarch64_generic installer | `1eca9340c049feddc04f65d9a9a095522df3d4a4ff1ffb8f52e13f184c2fc92d` |
+| x86_64 offline bundle | `70a39ca945f858f3b4454722523501ceff8697392d8ceca027a6698f9d469fb2` |
+| rockchip/armv8 offline bundle | `004f731774a3b26246e5cf75425dd77bccf4cbc6b35f3ce58e24dbf1d68d2ac9` |

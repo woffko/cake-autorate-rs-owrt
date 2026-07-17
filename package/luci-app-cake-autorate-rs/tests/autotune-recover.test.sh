@@ -252,6 +252,7 @@ grep -q '"runtime_restored":true' "$work/error.json"
 # recovery-failed object.
 reset_case
 write_journal "$work/malformed-pending.journal" 242 100
+printf '%s\n' '{"state":"running","phase":"search","progress":89,"message":"Evaluating directional profile-search observation 2"}' > "$work/status.json"
 printf '%s\n%s\n' \
 	'{"state":"failed","schema_version":5,"producer":"cake-autorate-rs-autotune","profile":"best_overall","runtime_restored":false,"recovery_pending":true}' \
 	'{"forged":true}' > "$work/error.pending.json"
@@ -259,6 +260,8 @@ printf '%s\n%s\n' \
 node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$work/error.json"
 grep -q '"state":"failed"' "$work/error.json"
 grep -q 'Full Auto-Tune was interrupted' "$work/error.json"
+grep -q '"last_worker_phase":"search"' "$work/error.json"
+grep -q '"last_worker_message":"Evaluating directional profile-search observation 2"' "$work/error.json"
 grep -q '"runtime_restored":true' "$work/error.json"
 ! grep -q '"forged":true' "$work/error.json"
 [ ! -e "$work/malformed-pending.journal" ]

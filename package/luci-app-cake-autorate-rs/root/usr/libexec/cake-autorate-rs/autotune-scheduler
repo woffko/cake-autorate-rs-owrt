@@ -341,7 +341,7 @@ result_has_exact_passing_gates() (
 	set -- $gate_comparisons
 	[ "$#" -eq 14 ] || return 1
 	for gate_comparison in "$@"; do
-		case "$gate_comparison" in minimum|maximum) ;; *) return 1 ;; esac
+		case "$gate_comparison" in minimum|maximum|exclusive-maximum) ;; *) return 1 ;; esac
 	done
 
 	# `pass:true` is not an attestation by itself. Recompute each gate from its
@@ -360,14 +360,15 @@ result_has_exact_passing_gates() (
 		    split(limits, limit, " ") != n || split(comparisons, comparison, " ") != n)
 			exit 1
 		for (i = 1; i <= n; i++) {
-			expected = (code[i] == "download-candidate-realization" ||
-			            code[i] == "upload-candidate-realization" ||
-			            code[i] == "download-capacity-retention" ||
-			            code[i] == "upload-capacity-retention") ? "minimum" : "maximum"
 			is_latency = (code[i] == "download-icmp-latency" ||
 			              code[i] == "download-transport-latency" ||
 			              code[i] == "upload-icmp-latency" ||
 			              code[i] == "upload-transport-latency")
+			expected = (code[i] == "download-candidate-realization" ||
+			            code[i] == "upload-candidate-realization" ||
+			            code[i] == "download-capacity-retention" ||
+			            code[i] == "upload-capacity-retention") ? "minimum" :
+			           (is_latency ? "exclusive-maximum" : "maximum")
 			expected_required = is_latency ? quality_required : "true"
 			if (required[i] != expected_required)
 				exit 1
@@ -399,6 +400,8 @@ result_has_exact_passing_gates() (
 			if (expected == "minimum" && actual[i] + 0 < limit[i] + 0)
 				exit 1
 			if (expected == "maximum" && actual[i] + 0 > limit[i] + 0)
+				exit 1
+			if (expected == "exclusive-maximum" && actual[i] + 0 >= limit[i] + 0)
 				exit 1
 		}
 		exit 0
@@ -617,7 +620,10 @@ result_is_auto_apply_eligible() {
 	gate_run_id="$(extract "$gate_result" '@.run_id')"
 	gate_validation_pass="$(extract "$gate_result" '@.validation.pass')"
 	gate_validation_hard_pass="$(extract "$gate_result" '@.validation.hard_pass')"
+	gate_validation_safety_pass="$(extract "$gate_result" '@.validation.safety_pass')"
 	gate_quality_target_met="$(extract "$gate_result" '@.validation.quality_target_met')"
+	gate_profile_target_met="$(extract "$gate_result" '@.profile_outcome.target_met')"
+	gate_profile_manual_only="$(extract "$gate_result" '@.profile_outcome.manual_only')"
 	gate_auto_apply_eligible="$(extract "$gate_result" '@.auto_apply_eligible')"
 	gate_manual_apply_eligible="$(extract "$gate_result" '@.manual_apply_eligible')"
 	gate_confidence_mode="$(extract "$gate_result" '@.confidence_mode')"
@@ -634,14 +640,17 @@ result_is_auto_apply_eligible() {
 	# confidence, contaminated, or otherwise unknown evidence must never become
 	# a configuration change merely because the helper reported "complete".
 	[ "$gate_state" = complete ] || return 1
-	[ "$gate_schema_version" = 5 ] || return 1
+	[ "$gate_schema_version" = 6 ] || return 1
 	[ "$gate_producer" = "$autotune_result_producer" ] || return 1
 	[ "$gate_validation_profile" = "$gate_profile" ] || return 1
 	case "$gate_run_id" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac
 	[ "${#gate_run_id}" -le 128 ] || return 1
 	[ "$gate_validation_pass" = true ] || return 1
 	[ "$gate_validation_hard_pass" = true ] || return 1
+	[ "$gate_validation_safety_pass" = true ] || return 1
 	[ "$gate_quality_target_met" = true ] || return 1
+	[ "$gate_profile_target_met" = true ] || return 1
+	[ "$gate_profile_manual_only" = false ] || return 1
 	[ "$gate_auto_apply_eligible" = true ] || return 1
 	[ "$gate_manual_apply_eligible" = true ] || return 1
 	[ "$gate_confidence_mode" = normal ] || return 1

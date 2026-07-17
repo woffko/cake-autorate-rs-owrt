@@ -199,11 +199,13 @@ The profile also fixes the validation contract:
 
 | Profile | Retention floor `F` | Loaded-delay ceiling | Loss ceiling | Target |
 |---|---:|---:|---:|---:|
-| Gaming | 0.70 | 5 ms | 1% | A+ |
-| Best overall | 0.80 | 30 ms | 3% | A |
-| Fair | 0.90 | 200 ms | 5% | C |
+| Gaming | 0.70 | `< 5 ms` | 1% | A+ |
+| Best overall | 0.80 | `< 30 ms` | 3% | A |
+| Fair | 0.90 | `< 200 ms` | 5% | C (soft) |
 
-All profiles use the same 80–110% realization interval and 85% CPU ceiling.
+All profiles use the same 80–110% realization interval and 85% effective CPU
+ceiling. Effective CPU is the greater of aggregate utilization and the busiest
+core; softirq utilization is recorded separately for diagnosis.
 These target grades describe the local loaded-delay contract; they are not a
 guarantee about remote servers, Wi-Fi, ISP policy or another bottleneck.
 Gaming and Best overall require every quality gate. Fair marks its class-C
@@ -271,24 +273,79 @@ C_required = ceil_100(O * F / r)
 ```
 
 The typed validator evaluates realization, retention, both latency deltas,
-loss, and CPU as explicit gates. Its correction state is then:
+loss, and effective CPU as explicit gates. The profile optimizer then treats
+each valid shaped observation as a point
 
-- `retry-measurement` when realization is outside the trustworthy range and a
-  single repeat may distinguish noise from invalid shaper enforcement;
-- directional `increase` when quality is clean and only that direction misses
-  retention, bounded below observed-low capacity (`0.95 * O` for Gaming/Best
-  overall and `1.00 * O` for throughput-first Fair);
-- bounded `decrease` for adverse loaded evidence, never below `C_required` or
-  the configured minimum;
-- `infeasible` when the safety floor and rate/quality constraints have no
-  legal intersection;
-- `none` after all gates pass.
+```text
+P_i = (candidate_i, achieved_i, effective_delay_i, loss_i, effective_CPU_i)
+```
 
-No diagnostic score overrides a failed gate. A contaminated phase, missing
-telemetry, changed route identity or incomplete result cannot be applied.
-Gaming/Best overall also reject `infeasible`. Fair may expose its
-highest-throughput hard-safe candidate manually when only the optional class-C
-target is unmet; it can never become scheduled Auto-Apply.
+on a bounded empirical throughput/latency frontier. Search is independent for
+download and upload, uses at most eight observations per direction, and never
+tests below the configured minimum or above observed-low capacity. Candidate
+resolution is
+
+```text
+resolution = ceil_100(max(0.005 * O, 100 kbit/s))
+```
+
+An unreliable 80–110% realization may collect up to three observations at the
+same candidate. A low-realization ceiling is considered repeatable only when at
+least one pair differs by no more than 5%; three mutually inconsistent samples
+remain inconclusive. If a clean candidate misses only the hard capacity floor,
+the next test is `C_required`; if measured realization changed, the same
+formula is applied again rather than lowering `F`. The observed-low upper bound
+is tested explicitly. Once a quality pass and a higher quality fail are known,
+their interval is bisected until it is no wider than `resolution` or the
+attempt budget is exhausted. Download can be frozen while upload continues,
+and the exact selected pair receives a final joint confirmation.
+
+If low realization repeats at the same candidate, the optimizer probes the
+observed-low upper bound. A repeatable upper-bound failure to retain `F` proves
+that no candidate inside the legal interval can satisfy the profile floor:
+
+```text
+repeatable_ceiling = exists i != j: abs(A_upper_i - A_upper_j) /
+                                      max(A_upper_i, A_upper_j) <= 0.05
+floor_infeasible   = repeatable_ceiling and
+                     min(A_upper_i, A_upper_j) < O * F
+compute_limited    = floor_infeasible and
+                     CPU_upper_i >= CPU_limit and
+                     CPU_upper_j >= CPU_limit
+```
+
+`compute_limited` yields the typed compute-ceiling reason; otherwise the reason
+is a shaper/datapath ceiling. The upper-bound point remains diagnostic and is
+not reclassified as safe. No correction lowers `F`, and no unsafe point can
+become an SQM apply action.
+
+The profile-specific ordering is:
+
+```text
+Gaming:
+  maximize achieved throughput among safe A+ points
+  fallback: minimize grade severity, then maximize achieved throughput
+
+Best overall:
+  maximize achieved throughput among safe A points
+  quality = 1                                      if effective_delay <= 0
+            clamp(30/effective_delay, 0, 1)        otherwise
+  fallback: maximize 50 * (clamp(retention/100, 0, 1) + quality)
+
+Fair:
+  find the maximum safe achieved throughput T
+  among points with achieved >= 0.985*T, minimize effective delay,
+  then maximize achieved throughput
+```
+
+Thus Fair makes throughput primary and grade secondary, while Gaming and Best
+overall maximize throughput subject to A+ or A. If Gaming cannot prove A+
+above its 70% floor, it offers the best measured grade; if Best overall cannot
+prove A above 80%, it offers the balanced optimum. These are clearly marked
+manual-only fallbacks. Fair can complete below soft C only when all hard gates,
+including 90% capacity retention, still pass. No diagnostic score or profile
+fallback can override a hard gate, and scheduled Auto-Apply accepts only a
+target result.
 
 ### Fair no-SQM comparison
 
@@ -325,7 +382,7 @@ is clamped to 0..100. This makes the tightest constraint visible without
 turning several incomparable units into an additive penalty or weakening the
 all-gates-must-pass rule.
 
-If the sole bounded measurement retry still cannot establish trustworthy
+If the bounded same-candidate repeat still cannot establish trustworthy
 realization, or if transport/reflector/shaper evidence becomes unreliable, the
 run is `INCONCLUSIVE` and retryable. It is not relabeled as a proven failed
 candidate. `FAILED`/`infeasible` is reserved for complete trustworthy evidence

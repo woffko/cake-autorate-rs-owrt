@@ -32,7 +32,7 @@ does not claim authorship of the original cake-autorate concept.
   safety-invariant reference for the optional outer controller.
 - [Full Auto-Tune](AUTOTUNE.md) documents the experimental calibration job,
   proposal formulas, phase-background accounting, three separate throughput
-  ratios, typed correction states, and fail-closed validation contract.
+  ratios, bounded profile optimizer, and fail-closed validation contract.
 - [Transport-aware quality control](TRANSPORT_QUALITY.md) documents HTTP/TCP
   latency fusion, the strict control signal, LibreQoS-like detected ratings,
   the throughput floor, bounded natural-load search, and scheduled Full
@@ -53,13 +53,35 @@ socket libraries; ordinary OpenWrt runtime dependencies remain explicit below.
 
 The latest published release provides these OpenWrt 25.12.5 APKs:
 
-- `cake-autorate-rs-1.0_rc21-r1-x86_64.apk` — x86_64 autorate daemon.
-- `cake-autorate-rs-1.0_rc21-r1-aarch64_generic.apk` — rockchip/armv8
+- `cake-autorate-rs-1.0_rc22-r1-x86_64.apk` — x86_64 autorate daemon.
+- `cake-autorate-rs-1.0_rc22-r1-aarch64_generic.apk` — rockchip/armv8
   autorate daemon.
-- `luci-app-cake-autorate-rs-1.0_rc21-r1.apk` — architecture-independent LuCI
+- `luci-app-cake-autorate-rs-1.0_rc22-r1.apk` — architecture-independent LuCI
   interface and SQM integration.
 
-RC21 fixes the Full Auto-Tune temporary-shaper preflight on minimal OpenWrt
+RC22 replaces the one-correction Full Auto-Tune decision with a bounded
+per-direction throughput/latency frontier search. Gaming finds the maximum safe
+throughput that still proves A+ and otherwise offers the best attainable grade;
+Best overall maximizes safe throughput at A and otherwise offers a balanced
+fallback; Fair maximizes safe throughput and uses quality to break candidates
+within a 1.5% throughput uncertainty band. The 70/80/90% capacity floors are
+immutable. An under-retaining candidate is raised repeatedly using measured
+realization, up to the observed-low upper bound, rather than weakening its
+profile. Only target results can be scheduled; every fallback is manual-only.
+
+Calibration now uses one bidirectional, two download-only and two upload-only
+unshaped controls, up to eight shaped observations per direction, and an exact
+selected-pair confirmation. Diagnostics include aggregate CPU, the busiest
+core, softirq utilization and temporary CAKE packet/drop/overlimit/requeue
+counters. Result schema 6 binds both search histories and the selected pair to
+the existing route, server, profile, fingerprint and guarded-apply evidence.
+If repeated measurements at both the calculated candidate and observed-low
+upper bound prove that the CAKE datapath cannot retain the immutable profile
+floor, the run reports a typed shaper/compute ceiling and writes nothing. Fair
+may then offer only **Keep current**, plus an explicit **Disable SQM** comparison
+when the clean no-SQM control independently satisfies every comparison gate.
+
+RC21 fixed the Full Auto-Tune temporary-shaper preflight on minimal OpenWrt
 systems: it derives collision-resistant identities directly from the kernel
 UUID source, requires an exact 128-bit value, retries a conflicting IFB name,
 and fails before a worker, lock, SQM change, or recovery journal can be
@@ -258,7 +280,7 @@ differentiated treatment, and WAN-ingress marks are deliberately preserved.
 Enabling RC20's native rules replaces that upload policy as documented below.
 **Fair** prioritizes sustained throughput, keeps
 at least 90% of observed-low capacity, and aims for class C or better
-(`<= 200 ms` effective loaded delay) when the link permits it. If that target
+(`< 200 ms` effective loaded delay) when the link permits it. If that target
 conflicts with the throughput floor, Review retains the best measured
 hard-safe SQM candidate as a manual choice instead of failing the whole run.
 It may also offer a separate, never-preselected option to disable autorate and
@@ -279,9 +301,10 @@ recovery journal, and publishes a result only after exact exit status zero and
 strict single-object JSON validation. Timeout/cancel uses bounded TERM then
 KILL for the complete group; diagnostic raw output is retained only in RAM.
 Terminal Auto-Tune history is likewise RAM-only and bounded by both count and
-size. Proposal schema 3 and result schema 5 bind the profile policy, immutable
+size. Proposal schema 3 and RC19 result schema 5 bound the profile policy, immutable
 run ID, phase evidence, action, configuration fingerprint and restored runtime
-state through LuCI, scheduler and Apply Guard.
+state through LuCI, scheduler and Apply Guard; RC22 result schema 6 supersedes
+that contract with typed search histories and an exact selected pair.
 
 RC20 keeps CAKE, IFB devices, ingress redirects, and bandwidth rates under one
 owner while adding native profile-specific traffic rules. There is no qosify
@@ -493,21 +516,23 @@ Implemented:
   direct validated navigation by clicking any numbered step.
 - Experimental `Full Auto-Tune` creation mode alongside the manual wizard. It
   performs interface/route/backend preflight, reflector selection, idle ICMP
-  and native persistent-transport baselines, and two unshaped throughput
-  samples on a reused validated server. A pure Rust calculator derives explicit
+  and native persistent-transport baselines, and one bidirectional plus two
+  download-only and two upload-only unshaped controls on a reused validated
+  server. A pure Rust calculator derives explicit
   DL/UL min/base/max, activity and delay thresholds, link-layer overhead, and
   bounded adaptive-ceiling limits. LuCI shows the raw evidence and complete
   proposal before creating the instance; job state stays under `/tmp`,
   cancellation terminates the process group, and UCI is not written before
   confirmation. The shaped job records ICMP p95-to-p95 growth, native transport
-  p95-to-p95 growth, loss, CPU, three distinct throughput ratios, and forwarded
-  client background before restoring the previous qdisc/SQM state. Typed gates
-  and a bounded Rust correction solver replace the old combined retention and
-  fixed-scale decision. Any missing, changed or contaminated evidence stops
-  without an apply-ready proposal. Fair alone may expose a typed manual
-  throughput fallback after all measurement-integrity, realization, retention,
-  CPU, route and background-evidence hard gates pass; it never weakens those
-  gates or permits unattended apply.
+  p95-to-p95 growth, loss, aggregate/busiest-core/softirq CPU, CAKE counters,
+  three distinct throughput ratios, and forwarded client background before
+  restoring the previous qdisc/SQM state. Typed gates and a bounded Rust
+  per-direction optimizer search the measured quality/throughput boundary,
+  repeat unreliable observations, raise a candidate until its hard floor is
+  reachable, and confirm the exact selected pair. Any missing, changed or
+  contaminated evidence stops without an apply-ready proposal. A safe result
+  below a required profile target is manual-only; it never weakens hard gates
+  or permits unattended apply.
 - Optional scheduled Full Auto-Tune, disabled by default, adds a quiet-time
   gate, maintenance window, interval, RAM-only daily byte budget, and explicit
   review-only versus validated auto-apply mode.
@@ -766,16 +791,16 @@ them together. For x86_64:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc21-r1-x86_64.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc21-r1.apk
+  /root/cake-autorate-rs-1.0_rc22-r1-x86_64.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc22-r1.apk
 ```
 
 For rockchip/armv8 (`aarch64_generic`):
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc21-r1-aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc21-r1.apk
+  /root/cake-autorate-rs-1.0_rc22-r1-aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc22-r1.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:
@@ -795,16 +820,16 @@ x86_64:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc21-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc21-x86_64.sh
+tar -xzf cake-autorate-rs-1.0-rc22-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc22-x86_64.sh
 ```
 
 Banana Pi R2 Pro and other OpenWrt 25.12.5 rockchip/armv8 devices:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc21-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc21-aarch64_generic.sh
+tar -xzf cake-autorate-rs-1.0-rc22-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc22-aarch64_generic.sh
 ```
 
 The installer resolves its own location, so it also works when the extracted

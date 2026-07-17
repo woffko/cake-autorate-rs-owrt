@@ -16,6 +16,12 @@ case "$expression" in
 			}
 		'
 		;;
+	'@.phase')
+		printf '%s\n' "$input" | sed -n 's/.*"phase":"\([^"]*\)".*/\1/p'
+		;;
+	'@.message')
+		printf '%s\n' "$input" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p'
+		;;
 	'@.error')
 		printf '%s\n' "$input" | sed -n 's/.*"error":"\([^"]*\)".*/\1/p'
 		;;
@@ -275,6 +281,9 @@ case "$expression" in
 	'@.hard_pass')
 		printf '%s\n' "$input" | sed -n 's/^.*"hard_pass":\(true\|false\),.*/\1/p'
 		;;
+	'@.safety_pass')
+		printf '%s\n' "$input" | sed -n 's/^.*"safety_pass":\(true\|false\),.*/\1/p'
+		;;
 	'@.quality_target_met')
 		printf '%s\n' "$input" | sed -n 's/^.*"quality_target_met":\(true\|false\),.*/\1/p'
 		;;
@@ -331,6 +340,36 @@ case "$expression" in
 		;;
 	'@.correction.upload.proposed_kbps')
 		printf '%s\n' "$input" | sed -n 's/^.*"upload":{[^}]*"proposed_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.direction')
+		printf '%s\n' "$input" | sed -n 's/^.*"direction":"\([^"]*\)".*/\1/p'
+		;;
+	'@.objective')
+		printf '%s\n' "$input" | sed -n 's/^.*"objective":"\([^"]*\)".*/\1/p'
+		;;
+	'@.capacity_floor_percent')
+		printf '%s\n' "$input" | sed -n 's/^.*"capacity_floor_percent":\([0-9.][0-9.]*\).*/\1/p'
+		;;
+	'@.action')
+		printf '%s\n' "$input" | sed -n 's/^.*"action":"\([^"]*\)".*/\1/p'
+		;;
+	'@.reason')
+		printf '%s\n' "$input" | sed -n 's/^.*"reason":"\([^"]*\)".*/\1/p'
+		;;
+	'@.next_candidate_kbps')
+		printf '%s\n' "$input" | sed -n 's/^.*"next_candidate_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.selected.candidate_kbps')
+		printf '%s\n' "$input" | sed -n 's/^.*"selected":{[^}]*"candidate_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.selected.safety_pass')
+		printf '%s\n' "$input" | sed -n 's/^.*"selected":{[^}]*"safety_pass":\(true\|false\).*/\1/p'
+		;;
+	'@.selected.target_met')
+		printf '%s\n' "$input" | sed -n 's/^.*"selected":{[^}]*"target_met":\(true\|false\).*/\1/p'
+		;;
+	'@.selected.grade')
+		printf '%s\n' "$input" | sed -n 's/^.*"selected":{[^}]*"grade":"\([^"]*\)".*/\1/p'
 		;;
 	*)
 		exit 1
