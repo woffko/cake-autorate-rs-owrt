@@ -13,6 +13,7 @@
 				"/usr/libexec/cake-autorate-rs/package-versions": [ "exec" ],
 				"/usr/libexec/cake-autorate-rs/runtime-health": [ "exec" ],
 				"/usr/libexec/cake-autorate-rs/traffic-classifier status": [ "exec" ],
+				"/usr/libexec/cake-autorate-rs/traffic-classifier status *": [ "exec" ],
 				"/usr/libexec/cake-autorate-rs/graph-history *": [ "exec" ],
 				"/usr/libexec/cake-autorate-rs/mwan3-info": [ "exec" ],
 				"/usr/libexec/cake-autorate-rs/log-bundle *": [ "exec" ]

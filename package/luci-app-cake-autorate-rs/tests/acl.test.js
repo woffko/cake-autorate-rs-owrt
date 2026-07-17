@@ -36,7 +36,12 @@ assert.deepStrictEqual(
 assert.deepStrictEqual(
 	group.read.file['/usr/libexec/cake-autorate-rs/traffic-classifier status'],
 	[ 'exec' ],
-	'Traffic priorities must only receive read-only access to classifier status',
+	'Traffic priorities must retain read-only global classifier diagnostics',
+);
+assert.deepStrictEqual(
+	group.read.file['/usr/libexec/cake-autorate-rs/traffic-classifier status *'],
+	[ 'exec' ],
+	'Traffic priorities must only receive read-only access to instance-scoped classifier status',
 );
 
 console.log('ACL tests passed');

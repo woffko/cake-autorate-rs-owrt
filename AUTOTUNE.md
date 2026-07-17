@@ -11,10 +11,10 @@ median throughput become P20/P50 capacity references, the throughput guard is
 enabled, and native transport-latency monitoring is enabled for the created
 instance.
 
-> **RC20 status:** the profile-aware proposal, validation, temporary SQM,
+> **RC21 status:** the profile-aware proposal, validation, temporary SQM,
 > attestation, apply and rollback paths passed deterministic Rust/shell/LuCI
-> tests, both OpenWrt architecture builds, disposable x86 execution of every
-> profile, production Multi-WAN and ARM checks, and authenticated
+> tests, both OpenWrt architecture builds, disposable x86 preflight/cancel,
+> dual-WAN and ARM runtime checks, and authenticated
 > desktop/mobile Playwright validation. Full Auto-Tune remains fail-closed:
 > only a complete passing Review, or an explicitly typed hard-safe Fair
 > fallback, whose profile and policy match throughout the job can be applied.
@@ -40,6 +40,13 @@ instance.
 - Preflight requires a resolved, up interface, a global IPv4 address, and a
   validated route identity. This may be the active main/default WAN or a
   specific online nftables mwan3 member whose L3 device matches the target.
+- Before starting a worker, taking a runtime lock, stopping SQM, or writing a
+  recovery journal, shaped validation derives its temporary identity from
+  `/proc/sys/kernel/random/uuid`. The normalized value must be exactly 32
+  hexadecimal characters. A colliding `catf<8-hex>` interface is treated as
+  foreign and never removed; preflight retries with a new kernel UUID and then
+  fails synchronously if no unique identity can be proven. Optional BusyBox
+  tools such as `od` and `cksum` are not part of this contract.
 - The test's own reported bytes/rate are authoritative. Aggregate WAN counters
   are deliberately not used for throughput because unrelated clients may be
   using the link.
@@ -75,7 +82,7 @@ second latency signal is deliberate: mobile carriers may prioritize ICMP while
 TCP is still badly queued. The validator returns typed gates and either accepts
 the candidate, requests one measurement retry, proposes a bounded directional
 correction, or declares the requirements infeasible. Full Auto-Tune remains
-experimental, but the RC20 x86_64 Multi-WAN and ARM acceptance gates have
+experimental, but the RC21 x86_64 Multi-WAN and ARM acceptance gates have
 passed.
 
 ## Calibration profiles
@@ -428,8 +435,9 @@ to verify profile/job binding, exact temporary CAKE tokens, progress/result
 output, job-local server pinning, reflector diversity, one-second ICMP pacing,
 persistent transport parsing, phase-background evidence, bounded RAM history,
 valid-JSON/nonzero-exit rejection, atomic result publication, process-group
-timeout/cancellation, orphan cleanup, recovery, and both speed-test and
-temporary shaper cleanup traps. Apply Guard tests reject incomplete,
+timeout/cancellation, kernel-UUID temporary identities, collision retry,
+missing/invalid UUID sources, orphan cleanup, recovery, and both speed-test
+and temporary shaper cleanup traps. Apply Guard tests reject incomplete,
 contaminated, one-direction, below-2%-gain and runtime-residue disable
 attempts. Real-router acceptance also checks per-member route identity and that
 the unselected autorate/SQM instance continues running.

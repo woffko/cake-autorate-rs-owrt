@@ -3,7 +3,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=cake-autorate-rs
-PKG_VERSION:=1.0_rc20
+PKG_VERSION:=1.0_rc21
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=woffko
@@ -39,6 +39,8 @@ define Package/cake-autorate-rs/postinst
 [ -n "$${IPKG_INSTROOT}" ] || { \
 	/etc/init.d/cake-autorate enable >/dev/null 2>&1 || true; \
 	/etc/init.d/cake-autorate-mqtt enable >/dev/null 2>&1 || true; \
+	/etc/init.d/cake-autorate restart >/dev/null 2>&1 || \
+		/etc/init.d/cake-autorate start >/dev/null 2>&1 || true; \
 	exit 0; \
 }
 endef

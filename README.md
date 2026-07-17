@@ -53,18 +53,31 @@ socket libraries; ordinary OpenWrt runtime dependencies remain explicit below.
 
 The latest published release provides these OpenWrt 25.12.5 APKs:
 
-- `cake-autorate-rs-1.0_rc20-r1-x86_64.apk` — x86_64 autorate daemon.
-- `cake-autorate-rs-1.0_rc20-r1-aarch64_generic.apk` — rockchip/armv8
+- `cake-autorate-rs-1.0_rc21-r1-x86_64.apk` — x86_64 autorate daemon.
+- `cake-autorate-rs-1.0_rc21-r1-aarch64_generic.apk` — rockchip/armv8
   autorate daemon.
-- `luci-app-cake-autorate-rs-1.0_rc20-r1.apk` — architecture-independent LuCI
+- `luci-app-cake-autorate-rs-1.0_rc21-r1.apk` — architecture-independent LuCI
   interface and SQM integration.
 
-RC20 adds fail-closed Apply Guard recovery, a complete per-instance Services
-reconciliation column, structured speed-test failures, LuCI cache refresh on
-upgrade, and native editable profile rules without qosify/eBPF integration.
-Both architecture builds, offline dependency resolution, virtual-router
-validation, production Multi-WAN/ARM checks, and authenticated desktop/mobile
-Playwright evidence are recorded in [Testing](TESTING.md).
+RC21 fixes the Full Auto-Tune temporary-shaper preflight on minimal OpenWrt
+systems: it derives collision-resistant identities directly from the kernel
+UUID source, requires an exact 128-bit value, retries a conflicting IFB name,
+and fails before a worker, lock, SQM change, or recovery journal can be
+created. It does not depend on optional `od` or `cksum` utilities.
+
+Traffic priorities are now opened from the corresponding instance row in
+**Settings**, immediately before **Re-run Auto-Tune**, **Edit**, and **Delete**.
+The view, status helper, editable rules, and ACL are restricted to that one
+instance; the former global top-level tab is removed. An ordinary browser
+reload after package upgrade also flushes only the obsolete LuCI menu cache,
+without clearing the login session or requiring a hard refresh.
+
+The daemon package now restarts CAKE Autorate during both install and upgrade,
+so a replaced executable cannot remain mapped until a reboot. The normal
+service transaction restores each configured managed queue and then verifies
+its runtime as usual. Both architecture builds, 68-package offline dependency
+closures, virtual-router validation, dual-WAN/ARM checks, and authenticated
+desktop/mobile Playwright evidence are recorded in [Testing](TESTING.md).
 
 The daemon package installs `uci`, `fping`, `uclient-fetch`, and `sqm-scripts`
 as dependencies; the latter brings the CAKE, IFB, `tc`, and `ip` runtime
@@ -299,7 +312,10 @@ transaction is verified or a provably stale transaction is recovered.
 Speed-test supervisor failures retain a structured stage/reason/exit status
 instead of becoming a generic helper error. Package installation clears both
 LuCI index and module caches and reloads rpcd so a browser refresh receives the
-new view/ACL code immediately.
+new view/ACL code immediately. RC21 also detects the removed global Traffic
+priorities route in an already-open browser session, drops only that stale tab,
+and flushes LuCI's cached menu so the next ordinary navigation uses the current
+per-instance route. The login session and other browser state are preserved.
 
 The **Autorate setup** editor is now divided into six in-page groups:
 Connection & routing, Rate limits, Adaptive ceiling, Latency probes, Quality &
@@ -750,16 +766,16 @@ them together. For x86_64:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc20-r1-x86_64.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc20-r1.apk
+  /root/cake-autorate-rs-1.0_rc21-r1-x86_64.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc21-r1.apk
 ```
 
 For rockchip/armv8 (`aarch64_generic`):
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc20-r1-aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc20-r1.apk
+  /root/cake-autorate-rs-1.0_rc21-r1-aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc21-r1.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:
@@ -779,16 +795,16 @@ x86_64:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc20-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc20-x86_64.sh
+tar -xzf cake-autorate-rs-1.0-rc21-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc21-x86_64.sh
 ```
 
 Banana Pi R2 Pro and other OpenWrt 25.12.5 rockchip/armv8 devices:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc20-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc20-aarch64_generic.sh
+tar -xzf cake-autorate-rs-1.0-rc21-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc21-aarch64_generic.sh
 ```
 
 The installer resolves its own location, so it also works when the extracted

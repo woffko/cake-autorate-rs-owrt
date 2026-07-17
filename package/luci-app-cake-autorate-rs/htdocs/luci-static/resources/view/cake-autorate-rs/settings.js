@@ -13,6 +13,13 @@ function modal(option) {
 	return option;
 }
 
+function trafficPrioritiesUrl(sectionId) {
+	if (!/^[A-Za-z0-9_]+$/.test(sectionId || ''))
+		throw new TypeError(_('The instance name is unsafe.'));
+	return L.url('admin/network/cake-autorate-rs/settings/priorities') +
+		'?instance=' + encodeURIComponent(sectionId);
+}
+
 var optionDescriptions = {
 	enabled: 'Start autorate and its managed SQM queue together for this instance.',
 	adjust_dl_shaper_rate: 'Allow autorate to change the download CAKE bandwidth.',
@@ -6265,6 +6272,13 @@ return L.view.extend({
 						showCreateWizard(this, section_id, section_id);
 					})
 				}, _('Re-run Auto-Tune')), container.firstChild);
+				container.insertBefore(E('button', {
+					'title': _('Traffic priorities'),
+					'class': 'btn cbi-button cbi-button-neutral cake-traffic-priorities',
+					'click': ui.createHandlerFn(this, function() {
+						window.location = trafficPrioritiesUrl(section_id);
+					})
+				}, _('Traffic priorities')), container.firstChild);
 			}
 			return actions;
 		};

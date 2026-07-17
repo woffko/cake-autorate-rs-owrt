@@ -36,9 +36,8 @@
 		}
 	},
 
-	"admin/network/cake-autorate-rs/priorities": {
-		"title": "Traffic priorities",
-		"order": 18,
+	"admin/network/cake-autorate-rs/settings/priorities": {
+		"firstchild_ineligible": true,
 		"action": {
 			"type": "view",
 			"path": "cake-autorate-rs/priorities"

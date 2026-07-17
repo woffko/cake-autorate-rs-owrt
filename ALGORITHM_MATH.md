@@ -173,9 +173,9 @@ already sits below the measured link. For example, `A/C = 92.5%` and `A/O =
 combination retained too little observed capacity. Calling both values
 "retention" loses the information needed to choose a correction.
 
-RC20 selects a profile before proposal construction. Let `L` be observed-low
-capacity and `H` observed-high capacity for one direction. The proposal tuple
-is:
+Profile-aware releases select the calibration contract before proposal
+construction. Let `L` be observed-low capacity and `H` observed-high capacity
+for one direction. The proposal tuple is:
 
 ```text
 minimum = factor_min * L
