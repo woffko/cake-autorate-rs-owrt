@@ -51,35 +51,83 @@ socket libraries; ordinary OpenWrt runtime dependencies remain explicit below.
 
 ## Current package tree
 
-The latest published release provides these OpenWrt 25.12.5 APKs:
+The RC25 release provides these OpenWrt 25.12.5 APKs:
 
-- `cake-autorate-rs-1.0_rc22-r1-x86_64.apk` — x86_64 autorate daemon.
-- `cake-autorate-rs-1.0_rc22-r1-aarch64_generic.apk` — rockchip/armv8
+- `cake-autorate-rs-1.0_rc25-r1-x86_64.apk` — x86_64 autorate daemon.
+- `cake-autorate-rs-1.0_rc25-r1-aarch64_generic.apk` — rockchip/armv8
   autorate daemon.
-- `luci-app-cake-autorate-rs-1.0_rc22-r1.apk` — architecture-independent LuCI
+- `luci-app-cake-autorate-rs-1.0_rc25-r1.apk` — architecture-independent LuCI
   interface and SQM integration.
 
-RC22 replaces the one-correction Full Auto-Tune decision with a bounded
+The current source tree is the RC25 release candidate. RC25 retains the full
+CPU/softirq diagnostics but makes the configured CPU threshold advisory. It
+also separates each profile's 70/80/90% **Auto-Apply throughput objective**
+from a common 50% **historical-throughput trust boundary**. High CPU, a missed
+profile objective, or crossing that historical boundary no longer fails a
+clean validation or lowers a candidate. Such a result requires explicit manual
+review; only a result which also meets the profile objective and target quality
+is eligible for unattended apply.
+
+RC24 fixes the guarded configuration lifecycle:
+the transaction supervisor now runs as an independent procd service so it
+survives rollback of the main daemon, hidden auto-preset interface values are
+retained, and a proven rollback reloads the authoritative LuCI configuration.
+Managed-SQM preflight can recover missing convenience aliases only after the
+owned SQM section and its exact target have been proven.
+Authenticated LuCI now performs rpcd confirmation in the session that opened
+the rollback window; the root supervisor finalizes only after a side-effect-free
+rpcd probe proves that transaction is closed. The internal supervisor remains
+boot-disabled and is started only for a verified live transaction.
+
+RC23 originally hardened the
+RC22 bounded search when a shaped direction reaches a CPU/softirq ceiling even
+though candidate realization remains inside the nominal 80–110% interval. It
+requires repeatable evidence at an exact rate, probes the observed-low upper
+bound and the lowest candidate predicted to retain the profile objective,
+and returns a typed manual-only compute-ceiling outcome if those
+constraints do not intersect. RC25 supersedes that CPU-blocking decision while
+preserving its telemetry. Repeated non-CPU resource failures become
+`INCONCLUSIVE`; they can never manufacture an applicable fallback or a null
+selection.
+
+RC23 records both peak and sustained CPU evidence (mean, p95, sample count,
+samples and longest run above the profile limit, plus softirq p95). It also
+maps the calibrated logical/L3 path to the inspected ingress device and records
+its RX queue `rps_cpus` masks. LuCI warns when multiple RX queues share one
+single-CPU mask. This is diagnostic only: the package never rewrites RPS,
+XPS, IRQ affinity, or OpenWrt Packet Steering settings automatically.
+
+RC22 replaced the one-correction Full Auto-Tune decision with a bounded
 per-direction throughput/latency frontier search. Gaming finds the maximum safe
 throughput that still proves A+ and otherwise offers the best attainable grade;
 Best overall maximizes safe throughput at A and otherwise offers a balanced
 fallback; Fair maximizes safe throughput and uses quality to break candidates
-within a 1.5% throughput uncertainty band. The 70/80/90% capacity floors are
-immutable. An under-retaining candidate is raised repeatedly using measured
-realization, up to the observed-low upper bound, rather than weakening its
-profile. Only target results can be scheduled; every fallback is manual-only.
+within a 1.5% throughput uncertainty band. The 70/80/90% values remain fixed
+profile objectives. A clean shortfall tests the observed-low upper bound; if
+the objective is still missed but the quality and integrity gates pass, the
+fastest safe result is manual-only. Only target/objective results can be
+scheduled.
 
-Calibration now uses one bidirectional, two download-only and two upload-only
-unshaped controls, up to eight shaped observations per direction, and an exact
-selected-pair confirmation. Diagnostics include aggregate CPU, the busiest
+Calibration uses one bidirectional, two download-only and two upload-only
+unshaped controls, a bounded shaped search, and an exact selected-pair
+confirmation. Diagnostics include aggregate CPU, the busiest
 core, softirq utilization and temporary CAKE packet/drop/overlimit/requeue
-counters. Result schema 6 binds both search histories and the selected pair to
+counters. Result schema 7 binds both search histories and the selected pair to
 the existing route, server, profile, fingerprint and guarded-apply evidence.
-If repeated measurements at both the calculated candidate and observed-low
-upper bound prove that the CAKE datapath cannot retain the immutable profile
-floor, the run reports a typed shaper/compute ceiling and writes nothing. Fair
-may then offer only **Keep current**, plus an explicit **Disable SQM** comparison
-when the clean no-SQM control independently satisfies every comparison gate.
+If a controlled candidate crosses the common 50% historical-throughput trust
+boundary, the run keeps the currently controlled result manual-only and
+displays a stronger warning instead of treating variable radio capacity as a
+datapath failure. It also suppresses the disable-SQM recommendation: losing
+more than half of an old 5G sample is evidence to retain the conservative
+shaper for review, not evidence that shaping is useless. On a
+volatile link, three clean same-candidate samples that do not agree within 5%
+seed a lower candidate from the worst clean result. That lower rate must then
+pass the hard 80–110% realization interval before it can be reviewed; the
+original under-realized candidate is never selected or auto-applied. CPU is reported
+alongside that evidence but is not assigned as the cause. Fair may offer
+**Keep current**, plus an explicit **Disable SQM** comparison only when
+historical trust is still intact and the clean no-SQM control independently
+satisfies every comparison gate.
 
 RC21 fixed the Full Auto-Tune temporary-shaper preflight on minimal OpenWrt
 systems: it derives collision-resistant identities directly from the kernel
@@ -271,18 +319,18 @@ real-router acceptance gates; see [Full Auto-Tune](AUTOTUNE.md) and
 
 RC19 carries three explicit, end-to-end Full Auto-Tune profiles. **Best overall**
 is the default and the compatibility replacement for the former balanced
-proposal; it targets an A-like loaded-delay result while retaining at least
-80% of observed-low capacity. **Gaming** targets A+, accepts a lower 70%
-throughput floor, and configures `layer_cake.qos` with CAKE `diffserv4`.
+proposal; it targets an A-like loaded-delay result with an 80% observed-low
+throughput objective. **Gaming** targets A+, uses a 70% objective, and
+configures `layer_cake.qos` with CAKE `diffserv4`.
 With the optional native rules disabled, Gaming never guesses applications or
 rewrites client policy: traffic already marked with DSCP receives
 differentiated treatment, and WAN-ingress marks are deliberately preserved.
 Enabling RC20's native rules replaces that upload policy as documented below.
-**Fair** prioritizes sustained throughput, keeps
-at least 90% of observed-low capacity, and aims for class C or better
-(`< 200 ms` effective loaded delay) when the link permits it. If that target
-conflicts with the throughput floor, Review retains the best measured
-hard-safe SQM candidate as a manual choice instead of failing the whole run.
+**Fair** prioritizes sustained throughput, targets at least 90% of observed-low
+capacity, and aims for class C or better (`< 200 ms` effective loaded delay)
+when the link permits it. If either objective is missed while latency, loss and
+route checks pass, Review retains the best measured
+safe SQM candidate as a manual choice instead of failing the whole run.
 It may also offer a separate, never-preselected option to disable autorate and
 SQM when a clean simultaneous no-SQM control proves no worse latency class,
 no more than 10 ms additional effective delay, and at least 2% more download
@@ -303,8 +351,9 @@ KILL for the complete group; diagnostic raw output is retained only in RAM.
 Terminal Auto-Tune history is likewise RAM-only and bounded by both count and
 size. Proposal schema 3 and RC19 result schema 5 bound the profile policy, immutable
 run ID, phase evidence, action, configuration fingerprint and restored runtime
-state through LuCI, scheduler and Apply Guard; RC22 result schema 6 supersedes
-that contract with typed search histories and an exact selected pair.
+state through LuCI, scheduler and Apply Guard; RC22 result schema 6 added typed
+search histories and an exact selected pair, and RC25 schema 7 adds explicit
+profile-objective and historical-throughput trust evidence.
 
 RC20 keeps CAKE, IFB devices, ingress redirects, and bandwidth rates under one
 owner while adding native profile-specific traffic rules. There is no qosify

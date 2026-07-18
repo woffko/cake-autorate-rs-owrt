@@ -89,6 +89,22 @@ safe_boot_id() {
 	esac
 }
 
+manifest_key_mismatch() {
+	local expected_file="$1"
+	local live_file="$2"
+
+	diff -u "$expected_file" "$live_file" 2>/dev/null | awk '
+		/^[+-]/ {
+			if ($0 ~ /^--- / || $0 ~ /^\+\+\+ /)
+				next;
+			sub(/^[+-]/, "", $0);
+			sub(/=.*/, "", $0);
+			print;
+			exit 0;
+		}
+	'
+}
+
 current_boot_id() {
 	[ -f "$boot_id_file" ] && [ ! -L "$boot_id_file" ] || return 1
 	boot_id="$(sed -n '1p' "$boot_id_file" 2>/dev/null)"
@@ -509,6 +525,7 @@ load_profile_contract() {
 		"@.validation_thresholds.candidate_realization_min_percent:$validation_realization_min" \
 		"@.validation_thresholds.candidate_realization_max_percent:$validation_realization_max" \
 		"@.validation_thresholds.capacity_retention_min_percent:$validation_retention" \
+		"@.validation_thresholds.throughput_safety_floor_percent:50" \
 		"@.validation_thresholds.delay_max_ms:$validation_transport" \
 		"@.validation_thresholds.loss_max_percent:$validation_loss" \
 		"@.validation_thresholds.cpu_max_percent:$validation_cpu"; do
@@ -647,6 +664,9 @@ build_expected_manifest() {
 	shift 9
 	expires="$1"
 	boot_id="$2"
+	resolved="$(require_result_value '@.resolved_interface')" ||
+		die "The Full Auto-Tune result has no resolved interface."
+	safe_interface "$resolved" || die "The resolved Full Auto-Tune interface is unsafe."
 
 	sqm_section="$(original_get "$job" sqm_section "cake_$job")"
 	safe_job "$sqm_section" || die "The managed SQM section name is unsafe."
@@ -762,7 +782,7 @@ build_expected_manifest() {
 	uci_at "$token_dir/expected" -q get "cake-autorate.$job" >/dev/null 2>&1 ||
 		uci_at "$token_dir/expected" -q set "cake-autorate.$job=cake_autorate" || return 1
 	expected_set "$job" enabled "$enabled"
-	expected_set "$job" wan_if "$target"
+	expected_set "$job" wan_if "$resolved"
 	expected_set "$job" route_mode "$route_mode"
 	if [ "$route_mode" = mwan3 ]; then expected_set "$job" mwan3_member "$member"; else expected_delete "cake-autorate.$job.mwan3_member"; fi
 	expected_delete "cake-autorate.$job.ping_prefix_string"
@@ -778,16 +798,16 @@ build_expected_manifest() {
 	expected_set "$job" autotune_profile "$profile"
 	expected_set "$job" pinger_method "$pinger_method"
 	expected_set "$job" no_pingers "$no_pingers"
-	if [ "$pinger_method" != irtt ]; then expected_set "$job" ping_extra_args "-I $target"; fi
+	if [ "$pinger_method" != irtt ]; then expected_set "$job" ping_extra_args "-I $resolved"; fi
 	expected_delete "cake-autorate.$job.reflector"
 	for reflector in $reflectors; do
 		uci_at "$token_dir/expected" -q add_list "cake-autorate.$job.reflector=$reflector" || return 1
 	done
 	expected_set "$job" manual_rate_limits 1
 	expected_set "$job" advanced_settings 0
-	expected_set "$job" sqm_interface "$target"
-	expected_set "$job" ul_if "$target"
-	expected_set "$job" dl_if "ifb4$target"
+	expected_set "$job" sqm_interface "$resolved"
+	expected_set "$job" ul_if "$resolved"
+	expected_set "$job" dl_if "ifb4$resolved"
 	expected_set "$job" sqm_download "$dl_base"
 	expected_set "$job" sqm_upload "$ul_base"
 	expected_set "$job" min_dl_shaper_rate_kbps "$dl_min"
@@ -869,8 +889,6 @@ build_expected_manifest() {
 		uci_at "$token_dir/expected" -q set "sqm.$sqm_section=queue" || return 1
 	uci_at "$token_dir/expected" -q set "sqm.$sqm_section._cake_autorate_managed=$job"
 	uci_at "$token_dir/expected" -q set "sqm.$sqm_section.enabled=$enabled"
-	resolved="$(require_result_value '@.resolved_interface')" || die "The Full Auto-Tune result has no resolved interface."
-	safe_interface "$resolved" || die "The resolved Full Auto-Tune interface is unsafe."
 	uci_at "$token_dir/expected" -q set "sqm.$sqm_section.interface=$resolved"
 	uci_at "$token_dir/expected" -q set "sqm.$sqm_section.download=$dl_base"
 	uci_at "$token_dir/expected" -q set "sqm.$sqm_section.upload=$ul_base"
@@ -991,7 +1009,7 @@ validate_profile_search_contract() {
 			search_reason="$(require_result_value "$search_root.reason")" ||
 				die "The unsafe profile-search reason is missing."
 			case "$search_reason" in
-				repeatable-compute-ceiling-below-capacity-floor|repeatable-shaper-ceiling-below-capacity-floor) ;;
+				repeatable-compute-ceiling-below-capacity-floor|repeatable-shaper-ceiling-below-capacity-floor|repeatable-shaper-ceiling-below-safety-floor) ;;
 				*) die "The unsafe profile-search result has no proven repeatable ceiling." ;;
 			esac
 			profile_unsafe_direction_count=$((profile_unsafe_direction_count + 1))
@@ -1063,7 +1081,7 @@ arm_guard() {
 	owned_regular "$result_copy" || die "The Full Auto-Tune result copy is unsafe."
 
 	require_result_flag '@.state' complete "Only a complete Full Auto-Tune result can be applied."
-	require_result_flag '@.schema_version' 6 "Only the fail-closed Full Auto-Tune schema can be applied."
+	require_result_flag '@.schema_version' 7 "Only the fail-closed Full Auto-Tune schema can be applied."
 	require_result_flag '@.producer' "$autotune_result_producer" "The Full Auto-Tune result producer is invalid."
 	require_result_flag '@.manual_apply_eligible' true "This Full Auto-Tune result is not eligible for explicit review and apply."
 	require_result_flag '@.phase_evidence_complete' true "This Full Auto-Tune result has incomplete phase evidence."
@@ -1081,20 +1099,22 @@ arm_guard() {
 	profile_outcome_mode="$(require_result_value '@.profile_outcome.mode')" ||
 		die "The profile outcome mode is missing."
 	profile_floor_infeasible=false
-	if [ "$profile_outcome_mode" = capacity-floor-infeasible ]; then
+	if [ "$profile_outcome_mode" = safety-floor-infeasible ]; then
 		[ "$profile" = fair ] && [ "$action" = disable_sqm ] ||
 			die "An infeasible capacity floor may only support an explicit Fair SQM-disable review."
 		profile_floor_infeasible=true
 		require_result_flag '@.validation.safety_pass' false "The capacity-floor fallback unexpectedly claims to be safe."
-		require_result_flag '@.profile_outcome.capacity_floor_met' false "The capacity-floor fallback state changed."
 		require_result_flag '@.profile_outcome.manual_only' true "The capacity-floor fallback must be manual-only."
 		require_result_flag '@.auto_apply_eligible' false "A capacity-floor fallback must never auto-apply."
 		profile_infeasible_reason="$(require_result_value '@.profile_outcome.infeasible_reason')" ||
 			die "The capacity-floor fallback reason is missing."
 	else
 		require_result_flag '@.validation.safety_pass' true "The selected candidate failed a safety gate."
-		require_result_flag '@.profile_outcome.capacity_floor_met' true "The selected candidate did not prove its capacity floor."
 	fi
+	profile_historical_trust_met="$(require_result_value '@.profile_outcome.throughput_safety_floor_met')" ||
+		die "The historical throughput trust state is missing."
+	case "$profile_historical_trust_met" in true|false) ;; *) die "The historical throughput trust state is invalid." ;; esac
+	require_result_flag '@.profile_outcome.throughput_safety_floor_percent' 50 "The catastrophic throughput floor changed."
 	require_result_flag '@.profile_outcome.target_grade' "$target_grade" "The profile outcome target changed."
 	profile_outcome_floor="$(require_result_value '@.profile_outcome.capacity_floor_percent')" ||
 		die "The profile outcome capacity floor is missing."
@@ -1104,6 +1124,10 @@ arm_guard() {
 		die "The profile outcome target state is missing."
 	[ "$profile_target_met" = "$(json_get "$result_copy" '@.validation.quality_target_met')" ] ||
 		die "The profile outcome and final validation target state differ."
+	profile_objectives_met="$(require_result_value '@.validation.profile_objectives_met')" ||
+		die "The profile objective state is missing."
+	[ "$profile_objectives_met" = "$(json_get "$result_copy" '@.profile_outcome.capacity_floor_met')" ] ||
+		die "The profile outcome and validation retention-objective states differ."
 	profile_unsafe_direction_count=0
 	validate_profile_search_contract download "$profile_floor_infeasible"
 	validate_profile_search_contract upload "$profile_floor_infeasible"
@@ -1112,7 +1136,7 @@ arm_guard() {
 	fi
 	case "$action" in
 		apply_sqm)
-			if [ "$profile_target_met" = true ]; then
+			if [ "$profile_target_met" = true ] && [ "$profile_objectives_met" = true ]; then
 				require_result_flag '@.auto_apply_eligible' true "A fully passing proposal unexpectedly requires manual-only apply."
 				require_result_flag '@.profile_outcome.manual_only' false "A target-meeting outcome was marked manual-only."
 			else
@@ -1122,6 +1146,12 @@ arm_guard() {
 					die "The profile fallback outcome is missing."
 				case "$profile:$profile_outcome_mode" in
 					gaming:best-attainable-quality-fallback|best_overall:balanced-fallback) ;;
+					gaming:target-a-plus-throughput-advisory|best_overall:target-a-throughput-advisory) ;;
+					gaming:quality-and-throughput-advisory-review|best_overall:quality-and-throughput-advisory-review) ;;
+					fair:latency-safe-throughput-advisory|fair:quality-and-throughput-advisory-review)
+						result_action_allowed apply_sqm ||
+							die "The Fair advisory result does not allow applying its safe SQM candidate."
+						;;
 					fair:throughput-optimum-quality-fallback)
 						fair_mode="$(json_get "$result_copy" '@.fair_outcome.mode')"
 						case "$fair_mode" in throughput-fallback|sqm-disable-recommended) ;;
@@ -1139,18 +1169,18 @@ arm_guard() {
 			require_result_flag '@.auto_apply_eligible' false "Disabling SQM must never be an automatic action."
 			if [ "$profile_floor_infeasible" = true ]; then
 				require_result_flag '@.validation.hard_pass' false "The infeasible Fair result unexpectedly passed all hard gates."
-				require_result_flag '@.fair_outcome.capacity_floor_met' false "The Fair outcome lost its infeasible-floor state."
 				require_result_flag '@.fair_outcome.apply_sqm_available' false "The unsafe shaped candidate must not be applyable."
 			else
 				require_result_flag '@.validation.hard_pass' true "The Fair comparison has no safe shaped reference candidate."
 				require_result_flag '@.validation.quality_target_met' false "SQM disable is not available when the Fair quality target was met."
-				require_result_flag '@.fair_outcome.capacity_floor_met' true "The Fair comparison did not preserve its throughput floor."
 				require_result_flag '@.fair_outcome.apply_sqm_available' true "The safe shaped comparison candidate disappeared."
 			fi
+			require_result_flag '@.fair_outcome.throughput_safety_floor_met' "$profile_historical_trust_met" "The Fair historical throughput trust state changed."
 			require_result_flag '@.fair_outcome.mode' sqm-disable-recommended "The Fair result did not recommend disabling SQM."
 			require_result_flag '@.fair_outcome.target_grade' C "The Fair comparison target changed."
 			require_result_flag '@.fair_outcome.target_delta_ms' 200 "The Fair comparison delay target changed."
 			require_result_flag '@.fair_outcome.capacity_floor_percent' 90 "The Fair comparison throughput floor changed."
+			require_result_flag '@.fair_outcome.throughput_safety_floor_percent' 50 "The Fair comparison safety floor changed."
 			require_result_flag '@.fair_outcome.recommended_action' disable_sqm "The Fair recommendation changed."
 			require_result_flag '@.fair_outcome.disable_sqm_available' true "The no-SQM choice is not supported by complete evidence."
 			require_result_flag '@.fair_outcome.comparison_reason' no-material-latency-benefit-with-throughput-cost "The Fair comparison reason changed."
@@ -1383,8 +1413,11 @@ verify_marker() {
 	canonical_package "$token_dir/expected" cake-autorate "$expected_cake"
 	canonical_live_package cake-autorate "$live_cake"
 	if ! same_files "$expected_cake" "$live_cake"; then
+		local mismatch_option
+		mismatch_option="$(manifest_key_mismatch "$expected_cake" "$live_cake")"
 		rm -f "$expected_cake" "$live_cake"
-		die "The applied CAKE Autorate package differs from the exact validated proposal manifest."
+		[ -n "$mismatch_option" ] && die "The applied CAKE Autorate package differs from the exact validated proposal manifest: $mismatch_option." || \
+			die "The applied CAKE Autorate package differs from the exact validated proposal manifest."
 	fi
 	rm -f "$expected_cake" "$live_cake"
 
@@ -1584,6 +1617,24 @@ recover_stale() {
 			recovery_reason=expired
 		fi
 	fi
+
+	# rpcd keeps its rollback snapshots in tmpfs. A reboot, or loss of the
+	# token after its same-boot deadline, means the proposal can no longer be
+	# proven confirmed or restored exactly. Preserve all diagnostic settings,
+	# but fail safe by making both owners inert before removing transaction
+	# metadata. The normal Edit/Auto-Tune flow can explicitly enable them again.
+	persistent_uci -q set "cake-autorate.$recovery_job.enabled=0" ||
+		die "Unable to disable the unproven CAKE Autorate instance."
+	persistent_uci -q set "cake-autorate.$recovery_job.sqm_enabled=0" ||
+		die "Unable to disable SQM ownership for the unproven instance."
+	for recovery_sqm_section in $(persistent_uci -q show sqm 2>/dev/null |
+		sed -n "s/^sqm\.\([A-Za-z0-9_]*\)\._cake_autorate_managed='$recovery_job'$/\1/p" |
+		LC_ALL=C sort -u); do
+		safe_job "$recovery_sqm_section" ||
+			die "An unproven managed SQM section has an unsafe name."
+		persistent_uci -q set "sqm.$recovery_sqm_section.enabled=0" ||
+			die "Unable to disable an unproven managed SQM queue."
+	done
 
 	persistent_uci -q delete "sqm.$recovery_guard" ||
 		die "Unable to remove the stale SQM transaction marker."
@@ -1795,15 +1846,36 @@ prepare_confirm() {
 reconcile() {
 	load_token "${1:-}"
 	owned_regular "$token_dir/prepared" || die "The Full Auto-Tune transaction was never prepared for confirmation."
-	if snapshot_state_matches "$token_dir/original"; then
-		printf '{"state":"rolled-back","schema_version":1,"token":"%s"}\n' "$token"
-		return 0
-	fi
+	# A no-op proposal may make original and expected-final byte-identical. It
+	# is safe and useful to classify that ambiguity as confirmed: the exact
+	# validated terminal state is present either way. A materially different
+	# original snapshot still falls through to the rollback result below.
 	if snapshot_state_matches "$token_dir/expected-final"; then
 		printf '{"state":"confirmed","schema_version":1,"token":"%s"}\n' "$token"
 		return 0
 	fi
+	if snapshot_state_matches "$token_dir/original"; then
+		printf '{"state":"rolled-back","schema_version":1,"token":"%s"}\n' "$token"
+		return 0
+	fi
 	die "Neither exact rollback nor exact prepared-final state can be proven."
+}
+
+rpcd_rollback_transaction_closed() {
+	local probe_rc
+
+	[ -n "$ubus_bin" ] && [ -x "$ubus_bin" ] || return 1
+	# rpcd rejects every UCI commit with PERMISSION_DENIED while apply_sid is
+	# armed.  Probe a deliberately nonexistent, valid config name: when no
+	# rollback transaction exists this is side-effect free and ubus reports
+	# NOT_FOUND (shell status 256 - UBUS_STATUS_NOT_FOUND = 252). Any other
+	# result is ambiguous and therefore fails closed.
+	if "$ubus_bin" call uci commit '{"config":"cake_autorate_apply_guard_probe"}' >/dev/null 2>&1; then
+		return 1
+	else
+		probe_rc=$?
+	fi
+	[ "$probe_rc" -eq 252 ]
 }
 
 cleanup_token_dir() {
@@ -1825,6 +1897,8 @@ finalize() {
 	   uci -q get "sqm.$sqm_guard" >/dev/null 2>&1; then
 		die "A persistent Full Auto-Tune marker survived prepare-confirm."
 	fi
+	rpcd_rollback_transaction_closed ||
+		die "The rpcd UCI rollback transaction is still armed; refusing to finalize before session-bound confirmation."
 	snapshot_state_matches "$token_dir/expected-final" || die "The confirmed Full Auto-Tune terminal state changed before finalize."
 	if [ "$action" = apply_sqm ]; then
 		[ -x "$sqm_init" ] || die "The SQM service cannot be enabled persistently after confirmation."
@@ -1925,32 +1999,38 @@ supervise() {
 		supervisor_rollback "$supervisor_token" "Marker cleanup before confirmation failed: $supervisor_output" || true
 		return 1
 	fi
-	if [ -z "$ubus_bin" ] || [ ! -x "$ubus_bin" ]; then
-		supervisor_rollback "$supervisor_token" "ubus is unavailable for server-side UCI confirmation." || true
-		return 1
-	fi
-	if ! supervisor_confirm_output="$("$ubus_bin" call uci confirm 2>&1)"; then
-		if wait_for_rollback_deadline "$supervisor_token_dir"; then
-			if supervisor_reconcile="$("$0" reconcile "$supervisor_token" 2>&1)"; then
-				case "$supervisor_reconcile" in
-					*'"state":"confirmed"'*)
-						"$0" finalize "$supervisor_token"
-						return $?
-						;;
-					*'"state":"rolled-back"'*)
-						"$0" abort "$supervisor_token" >/dev/null 2>&1 || true
-						write_receipt "$supervisor_token" rolled-back \
-							"UCI confirmation failed and rpcd restored the previous configuration."
-						return 1
-						;;
-				esac
-			fi
-		fi
+	# rpcd binds a rollback transaction to the LuCI ubus session which started
+	# it. A detached root process cannot safely manufacture that session ID and
+	# `ubus call uci confirm` without it is rejected. LuCI confirms with its own
+	# authenticated RPC session. This independent service waits through the
+	# rollback deadline and remains the authoritative recovery path if the
+	# browser disappears or confirmation/finalization is interrupted.
+	wait_for_rollback_deadline "$supervisor_token_dir" || {
 		write_receipt "$supervisor_token" indeterminate \
-			"UCI confirmation outcome is unknown: $supervisor_confirm_output"
+			"Unable to establish the guarded UCI rollback deadline."
 		return 1
+	}
+	if [ -f "$receipt_root/$supervisor_token.json" ]; then
+		cat "$receipt_root/$supervisor_token.json"
+		return 0
 	fi
-	"$0" finalize "$supervisor_token"
+	if supervisor_reconcile="$("$0" reconcile "$supervisor_token" 2>&1)"; then
+		case "$supervisor_reconcile" in
+			*'"state":"confirmed"'*)
+				"$0" finalize "$supervisor_token"
+				return $?
+				;;
+			*'"state":"rolled-back"'*)
+				"$0" abort "$supervisor_token" >/dev/null 2>&1 || true
+				write_receipt "$supervisor_token" rolled-back \
+					"LuCI did not confirm the transaction and rpcd restored the previous configuration."
+				return 1
+				;;
+		esac
+	fi
+	write_receipt "$supervisor_token" indeterminate \
+		"The guarded UCI transaction passed postcheck, but neither confirmation nor exact rollback could be proven."
+	return 1
 }
 
 abort_guard() {

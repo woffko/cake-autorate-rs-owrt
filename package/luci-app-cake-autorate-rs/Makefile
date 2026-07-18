@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 include $(TOPDIR)/rules.mk
+ifeq ($(DISABLE_FAKEROOT),1)
+override FAKEROOT :=
+endif
 
 PKG_NAME:=luci-app-cake-autorate-rs
-PKG_VERSION:=1.0_rc22
+PKG_VERSION:=1.0_rc25
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=woffko
@@ -32,6 +35,7 @@ define Package/luci-app-cake-autorate-rs/postinst
 	rm -f /tmp/luci-indexcache /tmp/luci-indexcache.*; \
 	rm -rf /tmp/luci-modulecache /tmp/luci-modulecache.*; \
 	/etc/init.d/rpcd reload >/dev/null 2>&1 || true; \
+	/etc/init.d/cake-autorate-apply-guard disable >/dev/null 2>&1 || true; \
 	/etc/init.d/cake-autorate-autotune enable >/dev/null 2>&1 || true; \
 	/etc/init.d/cake-autorate-autotune start >/dev/null 2>&1 || true; \
 	exit 0; \

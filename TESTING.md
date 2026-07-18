@@ -1408,11 +1408,16 @@ loaded delay. The immutable measured-capacity floors remain 70%, 80%, and 90%
 for Gaming, Best overall, and Fair respectively.
 
 When the shaped result does not realize its requested candidate, Auto-Tune may
-perform up to eight bounded observations. A CAKE/CPU ceiling is accepted as
-repeatable only after a pair of same-candidate results agrees within 5%; an
-unstable sequence remains inconclusive. No profile lowers its capacity floor
-to manufacture a pass. If a repeatable implementation ceiling makes the floor
-impossible, Review reports `capacity-floor-infeasible`, keeps the current
+perform up to eight bounded observations. A shaped-path ceiling is accepted as
+repeatable only after a pair of same-candidate results agrees within 5%. RC25
+also covers volatile shared-medium links: after three mutually inconsistent
+but clean samples, the worst achieved value seeds a lower candidate. That rate
+must pass the hard realization interval before selection. Falling below the
+common 50% historical-throughput boundary then adds a warning and prevents
+Auto-Apply; quality/integrity failures remain inconclusive. No profile lowers
+its objective to manufacture an automatic pass.
+If a repeatable implementation ceiling makes the safety floor impossible,
+Review reports `capacity-floor-infeasible`, keeps the current
 configuration selected, and exposes measured diagnostic limits without an
 Apply action. Fair may additionally offer an explicit disable-SQM experiment
 only when its separate no-SQM control proves material throughput recovery and
@@ -1474,3 +1479,263 @@ Final RC22 payload hashes are:
 | aarch64_generic installer | `1eca9340c049feddc04f65d9a9a095522df3d4a4ff1ffb8f52e13f184c2fc92d` |
 | x86_64 offline bundle | `70a39ca945f858f3b4454722523501ceff8697392d8ceca027a6698f9d469fb2` |
 | rockchip/armv8 offline bundle | `004f731774a3b26246e5cf75425dd77bccf4cbc6b35f3ce58e24dbf1d68d2ac9` |
+
+## RC23 sustained-CPU and packet-steering diagnosis (2026-07-17)
+
+RC23 was triggered by a Fair download observation whose candidate realization
+was credible while the busiest CPU/softirq path remained saturated. RC22
+repeated only low-realization candidates; this reliable-but-CPU-unsafe branch
+could therefore exhaust its attempt budget with no safe selected point and
+return an unhelpful fallback. The corrected optimizer independently handles
+each direction, measures the observed-low upper bound, requires repeatable
+same-rate CPU evidence, and probes the calculated immutable-floor candidate
+before declaring a compute ceiling. A non-CPU resource failure repeats and
+then becomes inconclusive rather than an applicable fallback.
+
+The deterministic gate covered the original Fair sequence, continued upload
+search at a boundary candidate, the hard-floor probe, a repeatable compute
+ceiling with a non-null diagnostic selection, and repeated loss/resource
+failure. All 156 Rust tests passed. The complete Auto-Tune shell lifecycle and
+LuCI JavaScript tests also passed, including a forced detailed-terminal write
+failure: the worker retained the original error and stage in a compact
+schema-valid RAM terminal instead of publishing a generic interrupted result.
+
+### Anonymous four-core PPPoE A/B
+
+An existing OpenWrt 25.12.5 x86_64 Multi-WAN router was used for a bounded,
+runtime-only diagnosis. Its primary physical ingress exposed four RX queues,
+all with the same single-CPU RPS mask. OpenWrt Packet Steering was enabled, but
+the effective masks were `8,8,8,8`. No UCI, network, mwan3, IRQ, XPS or qdisc
+setting was changed for the control run.
+
+The unshaped control was approximately 0.9/0.9 Gbit/s and class A+. During
+shaped download, application throughput was about 0.82 Gbit/s while effective
+CPU/softirq repeatedly reached 100%; one observation contained nine
+consecutive samples above the 85% profile limit. Upload remained materially
+below that compute ceiling. RC23 returned the explicit manual-only
+`repeatable-compute-ceiling-below-capacity-floor` result instead of a null or
+applicable fallback.
+
+For the comparison, only the four volatile `rps_cpus` files were changed from
+`8` to `f`, distributing software RX work across all four CPUs on this specific
+router. Download CPU peaks became variable rather than continuously saturated,
+and the bounded search progressed to an approximately 0.884 Gbit/s selected
+download candidate; upload independently progressed to approximately
+0.890 Gbit/s. A later PPPoE address loss invalidated the run before terminal
+confirmation, as required. It is therefore evidence of a datapath bottleneck,
+not a completed calibration result or a universal recommendation.
+
+The original `8` masks were restored immediately. Exact pre-test
+cake-autorate, SQM, network and mwan3 hashes still matched; both daemon
+instances were running; and the pre-existing primary and backup CAKE/IFB rates
+were restored. The project never applies the all-CPU mask automatically.
+Operators evaluating OpenWrt's **Enabled (all CPUs)** mode must repeat their own
+bounded A/B because hardware RSS, IRQ affinity, NAPI placement, XPS, cache/IPI
+costs, PPPoE/IFB work and qdisc locking differ by platform. The
+`steering_flows` field applies to local-socket flow steering, not ordinary
+forwarded client traffic.
+
+### Fresh terminal confirmation with original steering
+
+After the final RC23 package was installed, a new Fair job ran with the
+original `8,8,8,8` masks. It completed all five controls, five directional
+search observations and the selected-pair confirmation. The unshaped controls
+were approximately 0.886–0.896 Gbit/s download and 0.906–0.909 Gbit/s upload.
+Download at the 0.8884 Gbit/s upper candidate repeated at 0.821/0.812 Gbit/s
+with 100% effective CPU; the calculated 0.8753 Gbit/s floor candidate repeated
+at 0.803/0.803 Gbit/s with the same CPU ceiling. Upload continued independently
+and completed at a 0.9059 Gbit/s candidate, 92.4% retained capacity, class A+
+and 73% peak effective CPU.
+
+The terminal result is schema 6, `state=complete`,
+`configuration_written=false`, `runtime_restored=true`, and
+`recovery_pending=false`. It reports
+`download:repeatable-compute-ceiling-below-capacity-floor`, retains the non-null
+diagnostic download candidate, and exposes no **Apply SQM** action. Fair's
+separate clean no-SQM control was class A+ and about 9.8%/8.0% faster than the
+confirmed shaped pair, so the only Review actions are **Keep current** and the
+explicit manual **Disable SQM** comparison. Auto-Apply remains false. The
+original primary and backup qdiscs and all cake/SQM/mwan3 configuration were
+restored after the job.
+
+### Package and browser regression
+
+The RC23 x86_64 daemon and noarch LuCI APKs were installed first on the
+disposable router and then, without a network/mwan3 restart or another heavy
+test, on the existing dual-WAN router. Package replacement preserved all
+configuration hashes, managed qdisc rates, the restored RPS masks and both
+running instances. Authenticated Playwright at 1500 pixels and 390 pixels
+covered Status, Graphs, Settings, Traffic priorities, Edit and Re-run
+Auto-Tune. The disposable and dual-WAN layouts rendered 2 and 4 canvases,
+respectively, with zero horizontal overflow and no page, console or RPC error.
+Evidence is retained in:
+
+- `/home/tester/cake-autorate-rs-owrt/test-logs/rc23-playwright-disposable-final`;
+- `/home/tester/cake-autorate-rs-owrt/test-logs/rc23-playwright-77-final`;
+- `/home/tester/cake-autorate-rs-owrt/test-logs/rc23-playwright-77-postrun` after
+  the fresh terminal confirmation and runtime restoration.
+
+The locally validated x86 artifacts are:
+
+| Artifact | SHA-256 |
+|---|---|
+| x86_64 daemon APK | `d317bdd7a046f5af5191fe7da307d0de310f55cc08d94a83243d62d9adfa950a` |
+| noarch LuCI APK | `7822059c5ba59eb442ab54111ab6524f0eb68d88f231fae62a942d4d36bee73f` |
+
+These are development-gate artifacts, not a claim that RC23 ARM/offline release
+assets have already been built or published.
+
+## RC24 guarded-apply and managed-SQM ownership regression (2026-07-17)
+
+RC24 fixes two related failures found after disabling and re-enabling an
+existing auto-preset instance. First, LuCI could omit the hidden
+`sqm_interface`, `ul_if`, and `dl_if` fields when parsing the form. Second, the
+Full Auto-Tune preflight treated those convenience aliases as the ownership
+root even though the canonical managed SQM section still named the correct
+interface. The corrected form retains all three hidden fields. Preflight now
+proves the safe section name, the `_cake_autorate_managed` owner marker, the
+enabled SQM section, and its resolved target before using any convenience
+alias. Automatic mode prefers the current user-selected `wan_if`; manual mode
+continues to fail closed on an explicitly stale interface.
+
+The rollback supervisor is now a separate procd service. It therefore survives
+the main `cake-autorate` service reload performed by rpcd rollback, verifies
+the restored snapshots, removes the exact token, and publishes the terminal
+receipt. The service is boot-disabled and is started explicitly only after the
+main init verifies a live transaction. LuCI confirms rpcd through the same
+authenticated session that opened the rollback window; finalization then uses
+a side-effect-free commit probe to prove that rpcd no longer has an armed
+`apply_sid`. LuCI reloads the current page after a proved rollback, preventing
+a stale in-memory CBI map from reapplying the just-rolled-back values.
+
+Deterministic validation included the complete 156-test Rust suite, the full
+Auto-Tune shell lifecycle, apply-guard and independent-init tests, LuCI
+Auto-Tune JavaScript tests, all other core/LuCI shell and JavaScript suites,
+packaged shell syntax, `cargo fmt --check`, and `git diff --check`. Ownership
+fixtures cover missing aliases, a stale retained alias in automatic mode, a
+stale explicit alias in manual mode, a mismatched managed section target, and
+the normal managed CAKE/IFB path.
+
+The x86_64 RC24 packages were then installed on the existing dual-WAN
+acceptance router without restarting network or mwan3. A read-only invocation
+of the packaged ownership inspector proved the existing primary instance as
+`cake_wan_sqm -> pppoe-wan -> ifb4pppoe-wan`. UCI had no pending changes; both
+daemon instances and all four primary/backup CAKE qdiscs remained present; no
+apply-guard marker remained. No heavy speed test or calibration was run during
+this regression gate.
+
+Authenticated Playwright used fresh cache-bypassed browser contexts at
+1500x900 and 390x844. It scoped Edit and Re-run Auto-Tune actions to the
+primary instance row, opened the reorganized Edit form, reached the profile
+step of Re-run Auto-Tune, closed both modals, navigated normally again, and
+verified the installed daemon/LuCI version banner. Both viewports had exact
+client/scroll widths and no page, console, RPC, stale-unsaved-change, or stale
+SQM-ownership error. Evidence is retained in:
+
+- `/home/tester/cake-autorate-rs-owrt/test-logs/rc24-r2-final-playwright-77`;
+- `/home/tester/cake-autorate-rs-owrt/test-logs/rc24-r2-final-playwright-100`.
+
+Locally validated development artifacts are:
+
+| Artifact | SHA-256 |
+|---|---|
+| x86_64 daemon APK | `746b70be1708590d9e8bc72f85ce62a1c9520eaacebfe191898467606e272b94` |
+| rockchip/armv8 daemon APK | `bdbc20d2bf7b521cff47322eabd6dd5c05a86816b16fbc28ced526daed9b41a4` |
+| noarch LuCI APK | `7306a12784a9f320a1697ff39a9b621c24de4531632594a77ad1f7bd86b4700b` |
+
+The exact packages were installed on OpenWrt 25.12.5 `rockchip/armv8` and the
+production `x86/64` dual-WAN router. Both retained byte-identical UCI configs,
+empty pending changes, idle Apply Guard state, healthy daemon/CAKE/IFB runtime,
+and rpcd's idle `ubus` status 252. The production network and mwan3 services
+were not restarted. Backups are under
+`/root/cake-autorate-backups/rc24-sessionfix-20260718-075620` on each router.
+These remain development-gate artifacts until tag, push and GitHub publication.
+
+## RC25 variable-cellular safety/objective regression
+
+RC25 separates a profile's retained-capacity objective from historical
+throughput trust. An anonymized OpenWrt 25.12.5 rockchip/armv8 cellular uplink
+provided the motivating Fair sample. Directional unshaped controls ranged from
+about 140.2–154.8 Mbit/s download and 19.5–20.0 Mbit/s upload. A shaped
+131.8/19.5 Mbit/s candidate achieved 98.1/16.3 Mbit/s: 74.4%/83.4% candidate
+realization and 70.0%/83.4% observed-low retention. Loaded ICMP/transport
+deltas remained within Fair's class-C target, loss was zero, the selected CAKE
+qdiscs and rates were exact, and peak effective CPU was 70.9% download and
+56.9% upload.
+
+The old 90% hard-floor policy conflated two different facts. RC25 keeps
+70/80/90% as fixed profile objectives and uses 50% only as an independent
+historical-throughput trust warning. It does not, however, accept the 74.4%
+download realization: a candidate above the current radio bottleneck cannot
+prove that CAKE owns the queue. The bounded search repeats that evidence,
+steps down, and tests the lower candidate. Only a subsequent 80–110% controlled
+result may be offered for manual review. Auto-Apply still requires target
+quality and the profile objective. CPU threshold crossings remain typed `WARN`
+diagnostics and do not influence selection or Apply eligibility.
+
+Deterministic coverage includes the exact cellular ratios, a stable
+low-realization step-down and controlled retest, a below-50% manual trust warning, independent
+DL/UL search, schema-7 LuCI validation, scheduler rejection of an unmet profile
+objective, scheduler acceptance of an exact CPU warning, and guarded manual
+Apply/rollback. It also covers bounded variable evidence with no repeatable
+pair, rejection when any peer fails hard loss/quality gates, strict-profile quality
+enforcement, and conservative use of the worst clean sample to seed the lower
+candidate. The RC25 source gate completed 166 Rust tests, the full
+Auto-Tune lifecycle, all LuCI JavaScript tests, and the init, routing,
+Multi-WAN, classifier, recovery, graph-history and Apply Guard shell suites.
+
+A previous Fair run on the same anonymized cellular router completed under the
+earlier advisory interpretation. Its repeatable 136.8 Mbit/s download
+candidate achieved only about 104.9 and 101.4 Mbit/s. RC25 now deliberately
+rejects that candidate and retests lower instead; final live acceptance is
+recorded only after the controlled-candidate build is installed.
+
+The final RC25 armv8 build completed a fresh Fair run on the same anonymized
+volatile 5G uplink. The bounded search selected 109.4/21.0 Mbit/s and achieved
+90.4/17.9 Mbit/s. Current-candidate realization was 82.6%/85.1%, so both hard
+CAKE-control gates passed. Retention against the earlier directional raw
+sample was only 68.0%/85.1%; those gates were emitted with `required=false`
+and made the class-B `latency-safe-throughput-advisory` result manual-only
+instead of rejecting it. No UCI configuration was written. The original
+114.5/15.8 Mbit/s CAKE queues, daemon, scheduler and recovery monitor were
+restored, and pre/post `cake-autorate` and `sqm` hashes matched exactly.
+
+The same terminal was 132,727 bytes because it retained nine shaped search
+observations. A real LuCI `file.exec` request returned the complete JSON on
+desktop and mobile. Playwright verified daemon/LuCI `1.0_rc25-r1`, a reviewable
+manual result, no browser errors, and no horizontal overflow at 1500 px or
+390 px. The audit artifacts are retained under
+`/home/tester/cake-autorate-rs-owrt/test-logs/rc25-playwright-100-final`.
+
+The final x86_64 build was then installed on the existing Multi-WAN router.
+The four current cake/SQM/network/mwan3 configuration hashes matched exactly
+before and after installation. Both instance daemons plus the scheduler and
+recovery monitor were active; existing primary and backup CAKE rates remained
+unchanged. Desktop/mobile Playwright passed Status, Edit, Re-run Auto-Tune and
+ordinary post-upgrade navigation at 1500 px and 390 px with no console errors,
+stale LuCI constructor, access failure or overflow. Artifacts are under
+`/home/tester/cake-autorate-rs-owrt/test-logs/rc25-playwright-77-final`.
+
+Final individual APK SHA256 values are:
+
+- x86_64 daemon: `26d897888eb64a21bafcd2fb000d111b83c83f9bbf69bd2ceecc28558dcfb557`;
+- aarch64_generic daemon: `fd0c4a7c8f9de7ab2ee0200a21e37c4f3ff0964881269df5f3384d6a592867b9`;
+- noarch LuCI: `76f7284038d5467d485ab42b8d9f024aa1d44b0cf1953499abd330ec54d7fd26`.
+
+The x86_64 and aarch64_generic offline repositories each contain 68 APKs.
+With networking and maintainer scripts disabled, clean architecture-specific
+usermode roots selected and extracted all 65 required packages. Both installer
+scripts pass `sh -n`; complete manifest verification passes. Bundle SHA256
+values are `547ddce52adf6873716b76074399b498250d088fdedf4334520fcb0a32046fad`
+for x86_64 and
+`cdc582f3609f56aeda0acf4ec76c80a12b789c32ea295bd673578576f7b24162`
+for rockchip/armv8.
+
+One earlier live run lost a pinned-server transfer during a later shaped
+search point. RC25 retries `helper-exit` exactly once only at the identical
+candidate, direction and server after re-proving temporary-shaper ownership
+and route identity. A second exit fails closed and never reuses an older
+candidate as current evidence. The deterministic lifecycle suite covers both
+the successful retry and the double-failure path. No test run may write UCI
+before explicit review, and the original daemon and CAKE/IFB runtime state must
+be restored.

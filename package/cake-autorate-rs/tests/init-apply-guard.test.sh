@@ -7,6 +7,7 @@ work="${TMPDIR:-/tmp}/cake-init-apply-guard-test.$$"
 log="$work/mutations"
 helper="$work/apply-guard"
 classifier="$work/traffic-classifier"
+supervisor="$work/apply-guard-supervisor"
 mkdir -p "$work"
 trap 'rm -rf "$work"' EXIT INT TERM
 
@@ -31,6 +32,12 @@ printf 'classifier-%s\n' "${1:-missing}" >> "${APPLY_GUARD_FIXTURE_MUTATIONS:?}"
 EOF
 chmod +x "$classifier"
 
+cat > "$supervisor" <<'EOF'
+#!/bin/sh
+printf 'supervisor-%s\n' "${1:-missing}" >> "${APPLY_GUARD_FIXTURE_MUTATIONS:?}"
+EOF
+chmod +x "$supervisor"
+
 harness() {
 	operation="$1"
 	guard_path="$2"
@@ -38,6 +45,7 @@ harness() {
 	markers="$4"
 	CAKE_AUTORATE_APPLY_GUARD="$guard_path"
 	CAKE_AUTORATE_TRAFFIC_CLASSIFIER="$classifier"
+	CAKE_AUTORATE_APPLY_GUARD_SUPERVISOR="$supervisor"
 	APPLY_GUARD_FIXTURE_STATE="$state"
 	APPLY_GUARD_FIXTURE_MARKERS="$markers"
 	APPLY_GUARD_FIXTURE_RECOVERED="$work/recovered"
@@ -45,6 +53,7 @@ harness() {
 	rm -f "$APPLY_GUARD_FIXTURE_RECOVERED"
 	export CAKE_AUTORATE_APPLY_GUARD APPLY_GUARD_FIXTURE_STATE APPLY_GUARD_FIXTURE_MARKERS
 	export CAKE_AUTORATE_TRAFFIC_CLASSIFIER APPLY_GUARD_FIXTURE_RECOVERED
+	export CAKE_AUTORATE_APPLY_GUARD_SUPERVISOR
 	export APPLY_GUARD_FIXTURE_MUTATIONS
 	. "$init_script"
 
@@ -74,9 +83,7 @@ harness() {
 	config_foreach() { mark start-instance; }
 	stop() { mark stop-service; }
 	start() { mark start-service; }
-	procd_open_instance() {
-		case "${1:-}" in apply_guard_*) mark apply-supervisor ;; esac
-	}
+	procd_open_instance() { mark unexpected-main-procd-instance; }
 	procd_set_param() { :; }
 	procd_close_instance() { :; }
 
@@ -155,7 +162,11 @@ grep -qx config-load "$log"
 grep -qx sync-sqm "$log"
 grep -qx start-sqm "$log"
 grep -qx classifier-apply "$log"
-grep -qx apply-supervisor "$log"
+grep -qx supervisor-start "$log"
+if grep -qx unexpected-main-procd-instance "$log"; then
+	echo 'apply supervisor was incorrectly registered inside cake-autorate' >&2
+	exit 1
+fi
 
 : > "$log"
 sh "$0" harness reload "$helper" verified both "$log"

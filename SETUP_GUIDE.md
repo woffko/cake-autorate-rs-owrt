@@ -25,8 +25,8 @@ instance only after identifying the intended uplink.
      Trusted WAN-ingress DSCP is still preserved, so use this profile only
      when downstream markings are acceptable. Enabling native rules resets
      upload DSCP to CS0 before applying the selected built-in/custom rules.
-   - **Fair** maximizes safe throughput while keeping at least 90% of
-     observed-low capacity. C is a soft goal: among candidates within 1.5% of
+   - **Fair** maximizes safe throughput with a 90% observed-low-capacity
+     objective. C is a soft goal: among candidates within 1.5% of
      the fastest result, lower loaded delay wins. This favors sustained large
      downloads/uploads over the strictest latency.
 
@@ -47,7 +47,11 @@ instance only after identifying the intended uplink.
    adaptive-ceiling caps, link-layer overhead, latency thresholds, validation
    gates, exact CAKE class policy, and warnings. Nothing is written before
    **Use proposal/Create**, and the staged UCI change still requires
-   **Save & Apply**.
+   **Save & Apply**. Keep that authenticated LuCI tab open until it reports
+   completion: rpcd confirmation is deliberately bound to the same login
+   session. If validation or confirmation fails, wait for the page to reload
+   the restored configuration instead of applying the global unsaved-changes
+   banner a second time.
 7. On **Status**, confirm that the uplink becomes `ACTIVE`, the controller is
    `RUNNING`, the mandatory **Services** column is `HEALTHY`, both CAKE rates
    are non-zero, and Quality reaches `BASELINE READY`. Expand the Services
@@ -78,38 +82,47 @@ download and upload:
 
 | Field | Meaning |
 |---|---|
-| Candidate realization | Achieved throughput divided by the temporary CAKE candidate; low values request a repeat of the same measurement |
-| Capacity retention | Achieved throughput divided by the unshaped observed-low capacity; this is the throughput safety gate |
+| Candidate realization | Achieved throughput divided by the temporary CAKE candidate; 80–110% is a hard proof that CAKE actually controlled the tested path, and a repeated low value causes a lower candidate retest |
+| Capacity retention | Achieved throughput divided by unshaped observed-low capacity; 70/80/90% is the profile Auto-Apply objective and 50% is a historical-throughput trust boundary that forces manual review |
 | Candidate capacity | Temporary CAKE candidate divided by observed-low capacity; this shows how conservative the candidate is |
 
 Latency is shown as loaded p95 minus idle p95 for both ICMP and native
 transport. The page also reports loss, aggregate and busiest-core CPU, softirq,
 CAKE counters, forwarded background for each phase, every pass/fail gate and
-the complete ordered candidate history. `test`, `complete`, `fallback`, and
-`inconclusive` are typed optimizer outcomes, not generic error text.
+the complete ordered candidate history. RC23 adds mean/p95 CPU, sample count,
+samples and longest run above the limit, and softirq p95 so an isolated peak
+can be distinguished from sustained saturation. RC25 displays threshold
+crossings as advisory `WARN` evidence; CPU by itself does not reject or lower a
+candidate. `test`, `complete`,
+`fallback`, and `inconclusive` are typed optimizer outcomes, not generic error
+text.
 
-The search can repeat an unreliable candidate, raise an under-retaining
-candidate several times toward `observed-low * floor / realization`, test the
-observed-low upper bound, and bisect the measured quality boundary. It never
-lowers a profile's 70/80/90% capacity floor. Failed, incomplete, strictly
+The search can repeat an unreliable candidate, test the observed-low upper
+bound, and bisect the measured quality boundary. It never silently lowers a
+profile's 70/80/90% Auto-Apply objective. A clean shortfall, including one
+below the common 50% historical trust boundary, can be offered only for
+explicit manual review. Failed, incomplete, strictly
 contaminated and conservative runs remain diagnostics and do not replace the
 current UCI configuration. A safe result below the Gaming or Best overall
 target is explicitly manual-only and scheduled Auto-Apply cannot consume it.
 
-When repeated tests at the observed-low upper bound prove that CAKE or a busy
-CPU core cannot retain that floor, Review identifies the repeatable
-shaper/compute ceiling instead of continuing to reduce the requirement. Such a
-point cannot be applied as SQM. Fair can retain the current configuration and
-may separately offer disabling SQM only when the clean no-SQM comparison is
-complete and strictly better under its documented gates.
+When repeated tests remain below the 50% historical trust boundary, Review
+identifies the result as unusually far from the earlier raw capacity. CPU and
+throughput evidence remain separate warnings and neither is named as a datapath
+failure without profiling. Clean latency/loss/route evidence may still be
+reviewed manually; the result can never Auto-Apply.
 
-Fair is the narrow exception: if measurement integrity, route, background,
-candidate-realization, 90% retained-capacity and CPU gates all pass but class C
-does not, Review offers the best hard-safe shaped candidate as a manual choice.
+Fair is the common cellular-friendly case: if measurement integrity, route,
+background, latency and loss checks pass but the 90% objective or historical
+throughput trust boundary does not, Review offers the best clean shaped
+candidate as a manual choice.
 For an existing managed instance it may additionally offer **Disable autorate
 and SQM (comparison suggestion)** after a clean simultaneous bidirectional
 no-SQM control proves no worse grade, no material latency benefit from shaping,
-and at least 2% more throughput in both directions. The choice is never
+and at least 2% more throughput in both directions. That suggestion is
+suppressed when the shaped result is below the 50% historical trust boundary;
+in that case the conservative SQM candidate remains available for manual
+review. The choice is never
 preselected, requires explicit confirmation, and scheduled Auto-Apply cannot
 use it. **Keep current settings** writes nothing.
 
@@ -186,3 +199,24 @@ pinger and Auto-Tune scheduler both as a percentage of one logical CPU and of
 the router's total logical-CPU capacity. The helper is read-only, samples for
 5–300 seconds, uses only a temporary file under `/tmp`, and does not enable
 logging or write to flash.
+
+### Packet Steering and the RPS warning
+
+RC23 Auto-Tune diagnostics show the resolved physical ingress device, RX queue
+count and Linux `rps_cpus` masks. If several RX queues all carry the same
+single-CPU mask, download may saturate one softirq path while total router CPU
+still appears moderate.
+
+OpenWrt's **Network → Interfaces → Global network options → Packet Steering**
+controls this mechanism. Ordinary **Enabled** lets OpenWrt choose CPU placement;
+**Enabled (all CPUs)** asks it to use every CPU. The separate **Steering flows
+(RPS)** value is for directing locally terminated service flows and does not
+spread ordinary forwarded client traffic.
+
+CAKE Autorate reports this state but never changes it. Do not copy hexadecimal
+masks from another router: core count, hardware RSS, IRQ/NAPI placement, XPS,
+cache topology and driver behavior differ. If Auto-Tune reports a repeatable
+compute ceiling plus the single-CPU warning, compare the OpenWrt modes with a
+short reversible test, confirm rates/latency/packet loss, and retain the change
+only when the same router improves. A route/address change invalidates the
+calibration regardless of steering mode.

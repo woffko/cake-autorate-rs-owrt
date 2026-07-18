@@ -34,7 +34,9 @@ case "$3" in
 		printf '%s\n' "$count" > "$counter_file"
 		if [ -n "${AUTOTUNE_MOCK_JSON_ERROR:-}" ] &&
 		   { [ -z "${AUTOTUNE_MOCK_JSON_ERROR_AT_COUNT:-}" ] ||
-		     [ "$count" -eq "$AUTOTUNE_MOCK_JSON_ERROR_AT_COUNT" ]; }; then
+		     [ "$count" -eq "$AUTOTUNE_MOCK_JSON_ERROR_AT_COUNT" ] ||
+		     { [ -n "${AUTOTUNE_MOCK_JSON_ERROR_AT_COUNT_2:-}" ] &&
+		       [ "$count" -eq "$AUTOTUNE_MOCK_JSON_ERROR_AT_COUNT_2" ]; }; }; then
 			printf '{"error":"%s"}\n' "$AUTOTUNE_MOCK_JSON_ERROR"
 			exit "${AUTOTUNE_MOCK_JSON_ERROR_EXIT_CODE:-1}"
 		fi
@@ -90,6 +92,8 @@ case "$3" in
 			printf '{"download_kbps":42000,"upload_kbps":8000,"backend":"%s","test_direction":"%s","server_id":"%s","server_sponsor":"Test Server","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.1","shaper_bypassed":true,"sqm_paused":false}\n' "$result_backend" "$reported_direction" "$server_id"
 		elif [ "${AUTOTUNE_MOCK_REALIZATION_OVERSHOOT:-0}" = 1 ]; then
 			printf '{"download_kbps":50000,"upload_kbps":10000,"backend":"%s","test_direction":"%s","server_id":"%s","server_sponsor":"Test Server","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.1","shaper_bypassed":false,"sqm_paused":false}\n' "$result_backend" "$reported_direction" "$server_id"
+		elif [ "${AUTOTUNE_MOCK_REALIZATION_ADVISORY:-0}" = 1 ]; then
+			printf '{"download_kbps":30000,"upload_kbps":6000,"backend":"%s","test_direction":"%s","server_id":"%s","server_sponsor":"Test Server","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.1","shaper_bypassed":false,"sqm_paused":false}\n' "$result_backend" "$reported_direction" "$server_id"
 		elif [ "${AUTOTUNE_MOCK_REALIZATION_LOW:-0}" = 1 ]; then
 			printf '{"download_kbps":20000,"upload_kbps":4000,"backend":"%s","test_direction":"%s","server_id":"%s","server_sponsor":"Test Server","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.1","shaper_bypassed":false,"sqm_paused":false}\n' "$result_backend" "$reported_direction" "$server_id"
 		elif [ "${AUTOTUNE_MOCK_CONSERVATIVE_PHASE:-0}" = 1 ] && [ "$count" -le 8 ]; then

@@ -1,6 +1,16 @@
 #!/bin/sh
 set -eu
 
-[ "${1:-}" = call ] && [ "${2:-}" = uci ] && [ "${3:-}" = confirm ] || exit 1
-[ "${APPLY_GUARD_UBUS_CONFIRM:-success}" = success ] || exit 1
-printf '%s\n' '{}'
+[ "${1:-}" = call ] && [ "${2:-}" = uci ] || exit 1
+
+case "${3:-}" in
+	confirm)
+		[ "${APPLY_GUARD_UBUS_CONFIRM:-success}" = success ] || exit 1
+		printf '%s\n' '{}'
+		;;
+	commit)
+		[ "${APPLY_GUARD_RPCD_PENDING:-0}" = 1 ] && exit 250
+		exit 252
+		;;
+	*) exit 1 ;;
+esac

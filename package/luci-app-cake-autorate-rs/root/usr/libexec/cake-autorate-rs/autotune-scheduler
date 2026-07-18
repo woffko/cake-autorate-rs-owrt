@@ -278,6 +278,7 @@ result_has_exact_passing_gates() (
 	expected_realization_min="$(extract "$gate_json" '@.validation_thresholds.candidate_realization_min_percent')" || return 1
 	expected_realization_max="$(extract "$gate_json" '@.validation_thresholds.candidate_realization_max_percent')" || return 1
 	expected_retention="$(extract "$gate_json" '@.validation_thresholds.capacity_retention_min_percent')" || return 1
+	expected_safety_floor="$(extract "$gate_json" '@.validation_thresholds.throughput_safety_floor_percent')" || return 1
 	expected_delay="$(extract "$gate_json" '@.validation_thresholds.delay_max_ms')" || return 1
 	expected_loss="$(extract "$gate_json" '@.validation_thresholds.loss_max_percent')" || return 1
 	expected_cpu="$(extract "$gate_json" '@.validation_thresholds.cpu_max_percent')" || return 1
@@ -288,7 +289,7 @@ result_has_exact_passing_gates() (
 		*) return 1 ;;
 	esac
 	for expected_gate_limit in "$expected_realization_min" "$expected_realization_max" \
-		"$expected_retention" "$expected_delay" "$expected_loss" "$expected_cpu"
+		"$expected_retention" "$expected_safety_floor" "$expected_delay" "$expected_loss" "$expected_cpu"
 	do
 		is_decimal_between "$expected_gate_limit" 0.001 100000000 || return 1
 	done
@@ -297,13 +298,14 @@ result_has_exact_passing_gates() (
 	# token can never expand against files in the scheduler working directory.
 	set -f
 	set -- $gate_codes
-	[ "$#" -eq 14 ] || return 1
+	[ "$#" -eq 16 ] || return 1
 	gate_seen=" "
 	for gate_code in "$@"; do
 		case "$gate_code" in
 			download-candidate-realization|upload-candidate-realization|\
 			download-candidate-realization-maximum|upload-candidate-realization-maximum|\
 			download-capacity-retention|upload-capacity-retention|\
+			download-throughput-safety-floor|upload-throughput-safety-floor|\
 			download-icmp-latency|download-transport-latency|\
 			download-packet-loss|download-cpu|\
 			upload-icmp-latency|upload-transport-latency|\
@@ -317,6 +319,7 @@ result_has_exact_passing_gates() (
 		download-candidate-realization upload-candidate-realization \
 		download-candidate-realization-maximum upload-candidate-realization-maximum \
 		download-capacity-retention upload-capacity-retention \
+		download-throughput-safety-floor upload-throughput-safety-floor \
 		download-icmp-latency download-transport-latency \
 		download-packet-loss download-cpu \
 		upload-icmp-latency upload-transport-latency \
@@ -325,21 +328,23 @@ result_has_exact_passing_gates() (
 		case "$gate_seen" in *" $required_gate "*) ;; *) return 1 ;; esac
 	done
 	set -- $gate_passes
-	[ "$#" -eq 14 ] || return 1
-	for gate_pass in "$@"; do [ "$gate_pass" = true ] || return 1; done
+	[ "$#" -eq 16 ] || return 1
+	for gate_pass in "$@"; do
+		case "$gate_pass" in true|false) ;; *) return 1 ;; esac
+	done
 	set -- $gate_required
-	[ "$#" -eq 14 ] || return 1
+	[ "$#" -eq 16 ] || return 1
 	for required_flag in "$@"; do
 		case "$required_flag" in true|false) ;; *) return 1 ;; esac
 	done
 	set -- $gate_actuals
-	[ "$#" -eq 14 ] || return 1
+	[ "$#" -eq 16 ] || return 1
 	for gate_actual in "$@"; do is_decimal_between "$gate_actual" 0 100000000 || return 1; done
 	set -- $gate_limits
-	[ "$#" -eq 14 ] || return 1
+	[ "$#" -eq 16 ] || return 1
 	for gate_limit in "$@"; do is_decimal_between "$gate_limit" 0.001 100000000 || return 1; done
 	set -- $gate_comparisons
-	[ "$#" -eq 14 ] || return 1
+	[ "$#" -eq 16 ] || return 1
 	for gate_comparison in "$@"; do
 		case "$gate_comparison" in minimum|maximum|exclusive-maximum) ;; *) return 1 ;; esac
 	done
@@ -351,7 +356,8 @@ result_has_exact_passing_gates() (
 		-v comparisons="$gate_comparisons" \
 		-v realization_min="$expected_realization_min" \
 		-v realization_max="$expected_realization_max" \
-		-v retention="$expected_retention" -v delay="$expected_delay" \
+		-v retention="$expected_retention" -v safety_floor="$expected_safety_floor" \
+		-v delay="$expected_delay" \
 		-v loss="$expected_loss" -v cpu="$expected_cpu" \
 		-v quality_required="$expected_quality_required" 'BEGIN {
 		n = split(codes, code, " ")
@@ -367,12 +373,19 @@ result_has_exact_passing_gates() (
 			expected = (code[i] == "download-candidate-realization" ||
 			            code[i] == "upload-candidate-realization" ||
 			            code[i] == "download-capacity-retention" ||
-			            code[i] == "upload-capacity-retention") ? "minimum" :
+			            code[i] == "upload-capacity-retention" ||
+			            code[i] == "download-throughput-safety-floor" ||
+			            code[i] == "upload-throughput-safety-floor") ? "minimum" :
 			           (is_latency ? "exclusive-maximum" : "maximum")
-			expected_required = is_latency ? quality_required : "true"
+			is_advisory = (code[i] == "download-capacity-retention" ||
+			               code[i] == "upload-capacity-retention" ||
+			               code[i] == "download-throughput-safety-floor" ||
+			               code[i] == "upload-throughput-safety-floor" ||
+			               code[i] == "download-cpu" || code[i] == "upload-cpu")
+			expected_required = is_advisory ? "false" : (is_latency ? quality_required : "true")
 			if (required[i] != expected_required)
 				exit 1
-			if (pass[i] != "true" || comparison[i] != expected)
+			if (comparison[i] != expected)
 				exit 1
 			if (code[i] == "download-candidate-realization" ||
 			    code[i] == "upload-candidate-realization")
@@ -383,6 +396,9 @@ result_has_exact_passing_gates() (
 			else if (code[i] == "download-capacity-retention" ||
 			         code[i] == "upload-capacity-retention")
 				expected_limit = retention
+			else if (code[i] == "download-throughput-safety-floor" ||
+			         code[i] == "upload-throughput-safety-floor")
+				expected_limit = safety_floor
 			else if (code[i] == "download-icmp-latency" ||
 			         code[i] == "download-transport-latency" ||
 			         code[i] == "upload-icmp-latency" ||
@@ -397,11 +413,12 @@ result_has_exact_passing_gates() (
 			if (delta < 0) delta = -delta
 			if (delta > 0.000001)
 				exit 1
-			if (expected == "minimum" && actual[i] + 0 < limit[i] + 0)
+			computed_pass = (expected == "minimum") ? (actual[i] + 0 >= limit[i] + 0) :
+			                ((expected == "maximum") ? (actual[i] + 0 <= limit[i] + 0) :
+			                 (actual[i] + 0 < limit[i] + 0))
+			if (pass[i] != (computed_pass ? "true" : "false"))
 				exit 1
-			if (expected == "maximum" && actual[i] + 0 > limit[i] + 0)
-				exit 1
-			if (expected == "exclusive-maximum" && actual[i] + 0 >= limit[i] + 0)
+			if (!computed_pass && !is_advisory)
 				exit 1
 		}
 		exit 0
@@ -622,6 +639,7 @@ result_is_auto_apply_eligible() {
 	gate_validation_hard_pass="$(extract "$gate_result" '@.validation.hard_pass')"
 	gate_validation_safety_pass="$(extract "$gate_result" '@.validation.safety_pass')"
 	gate_quality_target_met="$(extract "$gate_result" '@.validation.quality_target_met')"
+	gate_profile_objectives_met="$(extract "$gate_result" '@.validation.profile_objectives_met')"
 	gate_profile_target_met="$(extract "$gate_result" '@.profile_outcome.target_met')"
 	gate_profile_manual_only="$(extract "$gate_result" '@.profile_outcome.manual_only')"
 	gate_auto_apply_eligible="$(extract "$gate_result" '@.auto_apply_eligible')"
@@ -640,7 +658,7 @@ result_is_auto_apply_eligible() {
 	# confidence, contaminated, or otherwise unknown evidence must never become
 	# a configuration change merely because the helper reported "complete".
 	[ "$gate_state" = complete ] || return 1
-	[ "$gate_schema_version" = 6 ] || return 1
+	[ "$gate_schema_version" = 7 ] || return 1
 	[ "$gate_producer" = "$autotune_result_producer" ] || return 1
 	[ "$gate_validation_profile" = "$gate_profile" ] || return 1
 	case "$gate_run_id" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac
@@ -649,6 +667,7 @@ result_is_auto_apply_eligible() {
 	[ "$gate_validation_hard_pass" = true ] || return 1
 	[ "$gate_validation_safety_pass" = true ] || return 1
 	[ "$gate_quality_target_met" = true ] || return 1
+	[ "$gate_profile_objectives_met" = true ] || return 1
 	[ "$gate_profile_target_met" = true ] || return 1
 	[ "$gate_profile_manual_only" = false ] || return 1
 	[ "$gate_auto_apply_eligible" = true ] || return 1

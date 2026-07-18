@@ -12,6 +12,7 @@ DAEMON="/usr/sbin/cake-autorated"
 RUNTIME_LOCK_LIB="${CAKE_AUTORATE_RUNTIME_LOCK_LIB:-/usr/libexec/cake-autorate-rs/runtime-lock}"
 RUNTIME_LOCK_AVAILABLE=0
 APPLY_GUARD="${CAKE_AUTORATE_APPLY_GUARD:-/usr/libexec/cake-autorate-rs/apply-guard}"
+APPLY_GUARD_SUPERVISOR="${CAKE_AUTORATE_APPLY_GUARD_SUPERVISOR:-/etc/init.d/cake-autorate-apply-guard}"
 TRAFFIC_CLASSIFIER="${CAKE_AUTORATE_TRAFFIC_CLASSIFIER:-/usr/libexec/cake-autorate-rs/traffic-classifier}"
 SERVICE_APPLY_GUARD_VERIFIED=0
 SERVICE_APPLY_GUARD_TOKEN=""
@@ -91,15 +92,20 @@ service_apply_guard_preflight() {
 
 start_apply_guard_supervisor() {
 	local token="$SERVICE_APPLY_GUARD_TOKEN"
-	local short
 
 	[ "$SERVICE_APPLY_GUARD_VERIFIED" -eq 1 ] && [ -n "$token" ] || return 0
-	short="$(printf '%s' "$token" | cut -c1-12)"
-	procd_open_instance "apply_guard_$short"
-	procd_set_param command "$APPLY_GUARD" supervise "$token"
-	procd_set_param stdout 1
-	procd_set_param stderr 1
-	procd_close_instance
+	[ -x "$APPLY_GUARD_SUPERVISOR" ] || {
+		logger -t cake-autorate "refusing guarded apply: the independent apply-guard supervisor service is unavailable"
+		return 1
+	}
+	# The supervisor must not be an instance of this service. rpcd rollback
+	# reloads cake-autorate itself; a child instance would be killed before it
+	# could prove the rollback and publish the terminal receipt.
+	CAKE_AUTORATE_APPLY_GUARD="$APPLY_GUARD" \
+		"$APPLY_GUARD_SUPERVISOR" start >/dev/null 2>&1 || {
+		logger -t cake-autorate "refusing guarded apply: unable to start the independent apply-guard supervisor"
+		return 1
+	}
 }
 
 service_runtime_lock_acquire_or_exit() {
@@ -756,7 +762,7 @@ start_service_locked() {
 			logger -t cake-autorate "traffic-priority rules are degraded: native nftables classifier failed to apply"
 	fi
 	config_foreach start_instance cake_autorate
-	start_apply_guard_supervisor
+	start_apply_guard_supervisor || return 1
 	[ -x /etc/init.d/cake-autorate-mqtt ] && /etc/init.d/cake-autorate-mqtt restart >/dev/null 2>&1 || true
 }
 

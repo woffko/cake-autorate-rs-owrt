@@ -8,8 +8,22 @@ const sourcePath = path.join(__dirname, '..', 'htdocs', 'luci-static', 'resource
 	'view', 'cake-autorate-rs', 'settings.js');
 const source = fs.readFileSync(sourcePath, 'utf8');
 const prefix = source.slice(0, source.indexOf('return L.view.extend'));
-assert.match(source, /hard 90%% floor/,
-	'formatted capacity-floor text must escape its literal percent sign');
+assert.match(source, /50% historical-throughput trust boundary/,
+	'profile help must explain the manual historical-throughput trust boundary');
+assert.match(source,
+	/o = iface\(section, 'interfaces', 'dl_if',[\s\S]*?o\.depends\('auto_interface_preset', '0'\);\s*o\.retain = true;/,
+	'hidden automatic download interface must survive modal saves');
+assert.match(source,
+	/o = iface\(section, 'interfaces', 'ul_if',[\s\S]*?o\.depends\('auto_interface_preset', '0'\);\s*o\.retain = true;/,
+	'hidden automatic upload interface must survive modal saves');
+assert.match(source,
+	/o = iface\(section, 'sqm_basic', 'sqm_interface',[\s\S]*?dependsManagedSqm\(o, \{ auto_interface_preset: '0' \}\);\s*o\.retain = true;/,
+	'hidden automatic SQM interface must survive modal saves');
+assert.match(source, /function renderAutotuneAdvisoryGate[\s\S]*?_\('WARN'\)/,
+	'CPU pressure must render as an advisory warning instead of a failed gate');
+assert(source.includes('variable-throughput-advisory') &&
+	source.includes('Variable-link advisory'),
+	'Auto-Tune review must explain bounded volatile-throughput results');
 const written = {};
 const fixtureSections = { 'cake-autorate': [], mwan3: [] };
 if (typeof String.prototype.format !== 'function') {
@@ -48,6 +62,7 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 			`autotuneResultHasReviewChoice, autotuneDefaultReviewAction, ` +
 			`autotuneDisableSqmEvidenceValidated, ` +
 			`autotuneAttemptDiagnostics, autotuneDiagnostics, ` +
+			`autotuneCpuSustainedSummary, ` +
 			`autotuneRuntimeSettled, autotuneLegacyResult, ` +
 			`autotuneRecoveryPending, autotuneRecoveryProgress, ` +
 			`revalidateAutotuneProposal, ` +
@@ -386,6 +401,45 @@ assert.equal(directionalGates.upload_transport, true);
 assert.equal(directionalAttempt.correction.action, 'infeasible');
 assert.deepEqual(directionalAttempt.reasons.map(reason => reason.code),
 	[ 'download-transport-latency', 'download-cpu' ]);
+
+const sustainedDiagnostics = helpers.autotuneAttemptDiagnostics({
+	direction_phases: {
+		download: {
+			cpu_peak_percent: 100,
+			cpu: {
+				total_peak_percent: 60.4,
+				max_core_peak_percent: 100,
+				softirq_peak_percent: 94.1,
+				mean_effective_percent: 97.3,
+				p95_effective_percent: 100,
+				samples: 10,
+				over_limit_samples: 9,
+				longest_over_limit_samples: 9,
+				p95_softirq_percent: 94.1,
+			},
+		},
+	},
+}, { proposal }, 1);
+assert.equal(sustainedDiagnostics.direction_load.download.cpu_mean_percent, 97.3);
+assert.equal(sustainedDiagnostics.direction_load.download.cpu_over_limit_samples, 9);
+assert.equal(helpers.autotuneCpuSustainedSummary(sustainedDiagnostics.direction_load.download),
+	'97.3% mean · 100% p95 · 9/10 samples above limit · longest 9 s · 94.1% softirq p95');
+
+const datapathDiagnostics = helpers.autotuneDiagnostics({
+	state: 'failed',
+	route: {
+		datapath: {
+			available: true,
+			ingress_device: 'eth2',
+			rx_queues: 4,
+			packet_steering_mode: '1',
+			rps_masks: [ '8', '8', '8', '8' ],
+			single_cpu_rps: true,
+		},
+	},
+});
+assert.equal(datapathDiagnostics.datapath.ingress_device, 'eth2');
+assert.equal(datapathDiagnostics.datapath.single_cpu_rps, true);
 const objectGateDiagnostics = helpers.autotuneAttemptDiagnostics({
 	metrics: {
 		download: { candidate_realization_percent: 95, capacity_retention_percent: 95 },
@@ -401,6 +455,7 @@ const passingGateCodes = [
 	'download-candidate-realization', 'upload-candidate-realization',
 	'download-candidate-realization-maximum', 'upload-candidate-realization-maximum',
 	'download-capacity-retention', 'upload-capacity-retention',
+	'download-throughput-safety-floor', 'upload-throughput-safety-floor',
 	'download-icmp-latency', 'download-transport-latency',
 	'download-packet-loss', 'download-cpu',
 	'upload-icmp-latency', 'upload-transport-latency',
@@ -427,6 +482,8 @@ const gateLimit = code => {
 		return 80;
 	if (code.includes('capacity-retention'))
 		return 80;
+	if (code.includes('throughput-safety-floor'))
+		return 50;
 	if (code.includes('latency'))
 		return 30;
 	if (code.includes('packet-loss'))
@@ -438,16 +495,19 @@ const validValidation = {
 	pass: true,
 	hard_pass: true,
 	safety_pass: true,
+	profile_objectives_met: true,
 	quality_target_met: true,
 	actual_grade: 'A',
 	effective_delta_ms: 10,
 	contaminated: false,
 	gates: passingGateCodes.map(code => ({
 		code,
-		required: true,
+		required: !code.endsWith('-cpu') && !code.includes('capacity-retention') &&
+			!code.includes('throughput-safety-floor'),
 		pass: true,
 		actual: code.includes('candidate-realization') ||
-			code.includes('capacity-retention') ? 100 : 0,
+			code.includes('capacity-retention') ||
+			code.includes('throughput-safety-floor') ? 100 : 0,
 		limit: gateLimit(code),
 	})),
 	correction: { action: 'none', feasible: true },
@@ -510,6 +570,8 @@ const profileOutcomeFor = (profile, targetGrade, retention, candidate, targetMet
 	actual_grade: targetMet ? 'A' : 'D',
 	capacity_floor_percent: retention,
 	capacity_floor_met: true,
+	throughput_safety_floor_percent: 50,
+	throughput_safety_floor_met: true,
 	infeasible_reason: '',
 	manual_only: !targetMet,
 	selected_pair: {
@@ -528,7 +590,7 @@ const validResult = {
 	source_ip: '192.0.2.10',
 	route_identity: 'main||pppoe-wan|192.0.2.10||main',
 	external_ip: '192.0.2.20',
-	schema_version: 6,
+	schema_version: 7,
 	producer: 'cake-autorate-rs-autotune',
 	run_id: 'settings-test-run',
 	profile: 'best_overall',
@@ -546,6 +608,7 @@ const validResult = {
 		candidate_realization_min_percent: 80,
 		candidate_realization_max_percent: 110,
 		capacity_retention_min_percent: 80,
+		throughput_safety_floor_percent: 50,
 		delay_max_ms: 30,
 		loss_max_percent: 3,
 		cpu_max_percent: 85,
@@ -601,7 +664,10 @@ const resultForProfile = (profile, targetGrade, retention, delay, loss, sqm) => 
 			actual_grade: profile === 'gaming' ? 'A+' : 'A',
 			gates: validValidation.gates.map(gate => ({
 				...gate,
-				required: profile === 'fair' && gate.code.includes('latency') ? false : true,
+				required: gate.code.endsWith('-cpu') ||
+					gate.code.includes('capacity-retention') ||
+					gate.code.includes('throughput-safety-floor') ? false :
+					(profile === 'fair' && gate.code.includes('latency') ? false : true),
 				limit: gate.code.includes('capacity-retention') ? retention :
 					(gate.code.includes('latency') ? delay :
 						(gate.code.includes('packet-loss') ? loss : gate.limit)),
@@ -640,6 +706,8 @@ const fairResult = {
 		target_delta_ms: 200,
 		capacity_floor_percent: 90,
 		capacity_floor_met: true,
+		throughput_safety_floor_percent: 50,
+		throughput_safety_floor_met: true,
 		actual_grade: 'A',
 		actual_effective_delta_ms: 10,
 		recommended_action: 'apply_sqm',
@@ -653,6 +721,64 @@ const fairResult = {
 };
 assert.equal(helpers.autotuneResultValidated(gamingResult), true);
 assert.equal(helpers.autotuneResultValidated(fairResult), true);
+const gamingCpuWarning = {
+	...gamingResult,
+	validation: {
+		...gamingResult.validation,
+		warnings: [ { code: 'download-cpu', required: false, pass: false, actual: 90.1, limit: 85 } ],
+		gates: gamingResult.validation.gates.map(gate => gate.code === 'download-cpu' ?
+			{ ...gate, required: false, pass: false, actual: 90.1, limit: 85 } : { ...gate }),
+	},
+};
+assert.equal(helpers.autotuneResultValidated(gamingCpuWarning), true,
+	'advisory CPU pressure must not block an otherwise valid Gaming proposal');
+const gamingCpuDiagnostics = helpers.autotuneDiagnostics(gamingCpuWarning);
+assert.equal(gamingCpuDiagnostics.validated, true);
+assert.deepEqual(gamingCpuDiagnostics.attempts[0].warnings.map(warning => warning.code),
+	[ 'download-cpu' ]);
+const fairVariable5gReview = {
+	...fairResult,
+	auto_apply_eligible: false,
+	validation: {
+		...fairResult.validation,
+		profile_objectives_met: false,
+		score: 77.7,
+		warnings: [
+			{ code: 'download-capacity-retention', required: false, pass: false, actual: 40, limit: 90 },
+			{ code: 'upload-capacity-retention', required: false, pass: false, actual: 45, limit: 90 },
+			{ code: 'download-throughput-safety-floor', required: false, pass: false, actual: 40, limit: 50 },
+			{ code: 'upload-throughput-safety-floor', required: false, pass: false, actual: 45, limit: 50 },
+		],
+		gates: fairResult.validation.gates.map(gate => {
+			if (gate.code === 'download-capacity-retention')
+				return { ...gate, required: false, pass: false, actual: 40, limit: 90 };
+			if (gate.code === 'upload-capacity-retention')
+				return { ...gate, required: false, pass: false, actual: 45, limit: 90 };
+			if (gate.code === 'download-throughput-safety-floor')
+				return { ...gate, required: false, pass: false, actual: 40, limit: 50 };
+			if (gate.code === 'upload-throughput-safety-floor')
+				return { ...gate, required: false, pass: false, actual: 45, limit: 50 };
+			return { ...gate };
+		}),
+	},
+	profile_outcome: {
+		...fairResult.profile_outcome,
+		mode: 'latency-safe-throughput-advisory',
+		capacity_floor_met: false,
+		throughput_safety_floor_met: false,
+		manual_only: true,
+	},
+	fair_outcome: {
+		...fairResult.fair_outcome,
+		capacity_floor_met: false,
+		throughput_safety_floor_met: false,
+		comparison_reason: 'throughput-retention-below-profile-objective',
+	},
+};
+assert.equal(helpers.autotuneResultValidated(fairVariable5gReview), false,
+	'variable 5G advisory result must not auto-apply');
+assert.equal(helpers.autotuneResultReviewable(fairVariable5gReview, 'apply_sqm'), true,
+	'latency-safe 5G throughput shortfall must be manually reviewable');
 const fairFallback = {
 	...fairResult,
 	auto_apply_eligible: false,
@@ -783,8 +909,9 @@ const fairComputeCeiling = {
 	...fairDisable,
 	profile_outcome: {
 		...fairDisable.profile_outcome,
-		mode: 'capacity-floor-infeasible',
+		mode: 'safety-floor-infeasible',
 		capacity_floor_met: false,
+		throughput_safety_floor_met: true,
 		infeasible_reason: 'download:repeatable-compute-ceiling-below-capacity-floor;upload:repeatable-compute-ceiling-below-capacity-floor',
 		manual_only: true,
 	},
@@ -805,6 +932,7 @@ const fairComputeCeiling = {
 	fair_outcome: {
 		...fairDisable.fair_outcome,
 		capacity_floor_met: false,
+		throughput_safety_floor_met: true,
 		allowed_actions: [ 'keep_current', 'disable_sqm' ],
 		apply_sqm_available: false,
 	},
@@ -1419,6 +1547,7 @@ async function testApplyGuardTransaction() {
 			const calls = [];
 			let postcheckCalls = 0;
 			let confirmCalls = 0;
+			let finalized = false;
 			if (options.preexistingGuard)
 				values.sqm.cake_autorate_apply_wan_sqm = {
 					'.name': 'cake_autorate_apply_wan_sqm', '.type': 'queue',
@@ -1484,7 +1613,7 @@ async function testApplyGuardTransaction() {
 						boot_id: '11111111-2222-3333-4444-555555555555',
 					}) });
 				if (operation === 'status') {
-					let state = 'complete';
+					let state = finalized ? 'complete' : 'confirming';
 					if (options.serverRolledBack)
 						state = 'rolled-back';
 					else if (options.serverIndeterminate)
@@ -1517,8 +1646,10 @@ async function testApplyGuardTransaction() {
 					return Promise.resolve(options.confirmReject || options.confirmNonzero || options.confirmIndeterminate ?
 						{ code: 1, stderr: 'not rolled back' } :
 						{ code: 0, stdout: JSON.stringify({ state: 'rolled-back', schema_version: 1, token }) });
-				if (operation === 'finalize')
+				if (operation === 'finalize') {
+					finalized = true;
 					return Promise.resolve({ code: 0, stdout: JSON.stringify({ state: 'finalized', schema_version: 1 }) });
+				}
 				if (operation === 'abort')
 					return Promise.resolve({ code: 0, stdout: JSON.stringify({ state: 'aborted', schema_version: 1 }) });
 				throw new Error(`unexpected exec ${command} ${args.join(' ')}`);
@@ -1567,11 +1698,17 @@ async function testApplyGuardTransaction() {
 			'uci.save-token',
 			'callApply:30:true',
 			'/usr/libexec/cake-autorate-rs/apply-guard:status',
-		], 'the router-side supervisor owns verification and confirmation');
+			'callConfirm',
+			'/usr/libexec/cake-autorate-rs/apply-guard:finalize',
+			'/usr/libexec/cake-autorate-rs/apply-guard:status',
+		], 'the independent supervisor prepares the transaction and LuCI confirms with its authenticated RPC session');
 
 		const lostApply = transactionFixture({ applyReject: true });
 		await assert.rejects(lostApply.helpers.runGuardedSaveApply(lostApply.view, {}),
 			/apply response lost/);
+		assert.equal(global.window.location, 'https://router/settings',
+			'exact client-side rollback must discard the staged LuCI model by reloading');
+		assert.equal(lostApply.calls[0], 'view.handleSave');
 		assert.equal(lostApply.calls.filter(call => call.endsWith(':verify-rollback')).length, 2);
 		assert(lostApply.calls.includes('/usr/libexec/cake-autorate-rs/apply-guard:abort'),
 			'an unknown apply response must retain snapshots until exact rollback is proven');
@@ -1579,6 +1716,9 @@ async function testApplyGuardTransaction() {
 		const serverRollback = transactionFixture({ serverRolledBack: true });
 		await assert.rejects(serverRollback.helpers.runGuardedSaveApply(serverRollback.view, {}),
 			/server rolled-back/);
+		assert.equal(global.window.location, 'https://router/settings',
+			'an authoritative server rollback must reload the marker-free configuration');
+		assert.equal(serverRollback.calls[0], 'view.handleSave');
 		assert(!serverRollback.calls.some(call => call.endsWith(':verify-rollback')),
 			'a server rollback receipt is already authoritative');
 		assert(!serverRollback.calls.includes('/usr/libexec/cake-autorate-rs/apply-guard:abort'),

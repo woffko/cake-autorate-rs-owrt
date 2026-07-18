@@ -1362,7 +1362,7 @@ function speedtestJobDelay() {
 
 var AUTOTUNE_RECOVERY_MAX_POLLS = 12;
 var AUTOTUNE_RECOVERY_MAX_DELAY_MS = 5000;
-var AUTOTUNE_RESULT_SCHEMA_VERSION = 6;
+var AUTOTUNE_RESULT_SCHEMA_VERSION = 7;
 var AUTOTUNE_RESULT_PRODUCER = 'cake-autorate-rs-autotune';
 
 function canonicalAutotuneProfile(value) {
@@ -1461,19 +1461,19 @@ function autotuneProfileDefinitions() {
 			id: 'gaming',
 			title: _('Gaming'),
 			target: _('Target A+ · under 5 ms loaded-latency increase'),
-			description: _('Finds the highest throughput that still proves A+, with a hard 70% capacity safety floor. If A+ is unattainable, Review offers the best measured grade at its fastest safe rate. Uses diffserv4, supports optional native outbound rules, and preserves ingress DSCP.')
+			description: _('Finds the highest throughput that still proves A+. Retaining 70% is the Auto-Apply objective; falling below the separate 50% historical-throughput trust boundary forces explicit manual review. If A+ is unattainable, Review offers the best measured grade at its fastest safe rate. Uses diffserv4, supports optional native outbound rules, and preserves ingress DSCP.')
 		},
 		{
 			id: 'best_overall',
 			title: _('Best overall'),
 			target: _('Target A or better · under 30 ms'),
-			description: _('Finds the highest throughput that still proves A, with a hard 80% capacity safety floor. If A is unattainable, Review offers the best balanced safe candidate. Optional outbound rules use diffserv4 while download stays best effort.')
+			description: _('Finds the highest throughput that still proves A. Retaining 80% is the Auto-Apply objective; falling below the separate 50% historical-throughput trust boundary forces explicit manual review. If A is unattainable, Review offers the best balanced safe candidate. Optional outbound rules use diffserv4 while download stays best effort.')
 		},
 		{
 			id: 'fair',
 			title: _('Fair'),
 			target: _('Throughput first · aim for C or better · under 200 ms'),
-			description: _('Maximizes safe throughput above a hard 90% capacity floor; rating is the secondary tie-breaker and C is a soft target. Optional outbound rules use diffserv4, download stays best effort, and Review may offer an evidence-backed option to disable SQM.')
+			description: _('Maximizes safe throughput; retaining 90% is the Auto-Apply objective and falling below the separate 50% historical-throughput trust boundary forces explicit manual review. Rating is the secondary tie-breaker and C is a soft target. Optional outbound rules use diffserv4, download stays best effort, and Review may offer an evidence-backed option to disable SQM.')
 		}
 	];
 }
@@ -2452,6 +2452,7 @@ function autotuneValidationGatesComplete(validation, profile, requireQualityTarg
 		'download-candidate-realization', 'upload-candidate-realization',
 		'download-candidate-realization-maximum', 'upload-candidate-realization-maximum',
 		'download-capacity-retention', 'upload-capacity-retention',
+		'download-throughput-safety-floor', 'upload-throughput-safety-floor',
 		'download-icmp-latency', 'download-transport-latency',
 		'download-packet-loss', 'download-cpu',
 		'upload-icmp-latency', 'upload-transport-latency',
@@ -2470,12 +2471,19 @@ function autotuneValidationGatesComplete(validation, profile, requireQualityTarg
 			code === 'download-transport-latency' ||
 			code === 'upload-icmp-latency' ||
 			code === 'upload-transport-latency';
-		var gateRequired = latencyGate ? policy.qualityTargetRequired : true;
+		var cpuAdvisory = code === 'download-cpu' || code === 'upload-cpu';
+		var profileAdvisory = code === 'download-capacity-retention' ||
+			code === 'upload-capacity-retention' ||
+			code === 'download-throughput-safety-floor' ||
+			code === 'upload-throughput-safety-floor';
+		var gateRequired = (cpuAdvisory || profileAdvisory) ? false :
+			(latencyGate ? policy.qualityTargetRequired : true);
 
 		if (required.indexOf(code) < 0 || reported[code] ||
 		    gate.required !== gateRequired || typeof gate.pass !== 'boolean' ||
-		    (!latencyGate && gate.pass !== true) ||
-		    (requireQualityTarget && gate.pass !== true) ||
+		    (!latencyGate && !cpuAdvisory && !profileAdvisory && gate.pass !== true) ||
+		    (requireQualityTarget && profileAdvisory && gate.pass !== true) ||
+		    (requireQualityTarget && latencyGate && gate.pass !== true) ||
 		    autotuneNumber(gate.actual) == null || autotuneNumber(gate.limit) == null)
 			return false;
 		reported[code] = true;
@@ -2577,26 +2585,32 @@ function autotuneFairOutcomeValidated(result) {
 	var actions = autotuneFairAllowedActions(outcome);
 	var outcomeDelta = autotuneNumber(outcome && outcome.actual_effective_delta_ms);
 	var validationDelta = autotuneNumber(validation && validation.effective_delta_ms);
+	var historicalTrustMet = autotuneGateValue(validation,
+		[ 'download-throughput-safety-floor', 'upload-throughput-safety-floor' ]);
 
 	if (canonicalAutotuneProfile(result && result.profile) !== 'fair' ||
 	    !outcome || !validation || !actions ||
 	    outcome.target_grade !== 'C' ||
 	    autotuneNumber(outcome.target_delta_ms) !== 200 ||
 	    autotuneNumber(outcome.capacity_floor_percent) !== 90 ||
+	    autotuneNumber(outcome.throughput_safety_floor_percent) !== 50 ||
+	    typeof outcome.throughput_safety_floor_met !== 'boolean' ||
+	    historicalTrustMet == null || outcome.throughput_safety_floor_met !== historicalTrustMet ||
 	    outcome.actual_grade !== validation.actual_grade ||
 	    outcomeDelta == null || validationDelta == null ||
 	    Math.abs(outcomeDelta - validationDelta) > 0.001)
 		return false;
 
-	if (outcome.capacity_floor_met === false) {
-		if (validation.safety_pass !== false || outcome.apply_sqm_available !== false)
+	if (typeof outcome.capacity_floor_met !== 'boolean')
+		return false;
+	if (validation.safety_pass === false) {
+		if (outcome.apply_sqm_available !== false)
 			return false;
 		return (outcome.mode === 'throughput-fallback' ||
 			outcome.mode === 'sqm-disable-recommended') &&
 			(actions[outcome.recommended_action] === true);
 	}
-
-	if (outcome.capacity_floor_met !== true || outcome.apply_sqm_available !== true)
+	if (validation.safety_pass !== true || outcome.apply_sqm_available !== true)
 		return false;
 
 	if (validation.quality_target_met === true)
@@ -2618,12 +2632,16 @@ function autotuneCapacityFloorInfeasibleOutcomeValidated(result) {
 	var searches = result && result.profile_search;
 	var directions = [ 'download', 'upload' ];
 	var unsafeDirections = 0;
+	var historicalTrustMet = autotuneGateValue(validation,
+		[ 'download-throughput-safety-floor', 'upload-throughput-safety-floor' ]);
 
 	if (profile !== 'fair' || !policy || !outcome || !validation || !proposal || !searches ||
-	    validation.safety_pass !== false || outcome.mode !== 'capacity-floor-infeasible' ||
+	    validation.safety_pass !== false || outcome.mode !== 'safety-floor-infeasible' ||
 	    outcome.target_grade !== policy.targetGrade || outcome.actual_grade !== validation.actual_grade ||
 	    outcome.target_met !== validation.quality_target_met || outcome.manual_only !== true ||
-	    outcome.capacity_floor_met !== false ||
+	    typeof outcome.throughput_safety_floor_met !== 'boolean' ||
+	    historicalTrustMet == null || outcome.throughput_safety_floor_met !== historicalTrustMet ||
+	    autotuneNumber(outcome.throughput_safety_floor_percent) !== 50 ||
 	    autotuneNumber(outcome.capacity_floor_percent) !== policy.retentionPercent ||
 	    typeof outcome.infeasible_reason !== 'string' || !outcome.infeasible_reason ||
 	    !outcome.selected_pair)
@@ -2650,7 +2668,8 @@ function autotuneCapacityFloorInfeasibleOutcomeValidated(result) {
 		if (selected.safety_pass === false) {
 			if (search.action !== 'fallback' ||
 			    (search.reason !== 'repeatable-compute-ceiling-below-capacity-floor' &&
-			     search.reason !== 'repeatable-shaper-ceiling-below-capacity-floor'))
+			     search.reason !== 'repeatable-shaper-ceiling-below-capacity-floor' &&
+			     search.reason !== 'repeatable-shaper-ceiling-below-safety-floor'))
 				return false;
 			unsafeDirections++;
 		}
@@ -2671,6 +2690,8 @@ function autotuneProfileOutcomeValidated(result) {
 	var searches = result && result.profile_search;
 	var directions = [ 'download', 'upload' ];
 	var targetMet;
+	var historicalTrustMet = autotuneGateValue(validation,
+		[ 'download-throughput-safety-floor', 'upload-throughput-safety-floor' ]);
 
 	if (!policy || !outcome || !validation || !proposal || !searches ||
 	    outcome.target_grade !== policy.targetGrade ||
@@ -2679,11 +2700,16 @@ function autotuneProfileOutcomeValidated(result) {
 	    typeof outcome.target_met !== 'boolean' ||
 	    outcome.target_met !== validation.quality_target_met ||
 	    typeof outcome.manual_only !== 'boolean' ||
+	    typeof outcome.capacity_floor_met !== 'boolean' ||
+	    outcome.capacity_floor_met !== validation.profile_objectives_met ||
+	    autotuneNumber(outcome.throughput_safety_floor_percent) !== 50 ||
+	    typeof outcome.throughput_safety_floor_met !== 'boolean' ||
+	    historicalTrustMet == null || outcome.throughput_safety_floor_met !== historicalTrustMet ||
 	    !outcome.selected_pair)
 		return false;
 
 	targetMet = outcome.target_met;
-	if (outcome.manual_only !== !targetMet)
+	if (outcome.manual_only !== (!targetMet || !validation.profile_objectives_met))
 		return false;
 
 	for (var i = 0; i < directions.length; i++) {
@@ -2706,10 +2732,18 @@ function autotuneProfileOutcomeValidated(result) {
 			return false;
 	}
 
-	if (targetMet)
+	if (targetMet && validation.profile_objectives_met)
 		return (profile === 'gaming' && outcome.mode === 'target-a-plus-met') ||
 			(profile === 'best_overall' && outcome.mode === 'target-a-met') ||
 			(profile === 'fair' && outcome.mode === 'throughput-optimum-c-or-better');
+
+	if (targetMet)
+		return (profile === 'gaming' && outcome.mode === 'target-a-plus-throughput-advisory') ||
+			(profile === 'best_overall' && outcome.mode === 'target-a-throughput-advisory') ||
+			(profile === 'fair' && outcome.mode === 'latency-safe-throughput-advisory');
+
+	if (!validation.profile_objectives_met)
+		return outcome.mode === 'quality-and-throughput-advisory-review';
 
 	return (profile === 'gaming' && outcome.mode === 'best-attainable-quality-fallback') ||
 		(profile === 'best_overall' && outcome.mode === 'balanced-fallback') ||
@@ -2765,6 +2799,7 @@ function autotuneResultValidated(result) {
 	if (!autotuneResultEvidenceValidated(result) ||
 	    result.validation.pass !== true ||
 	    result.validation.hard_pass !== true ||
+	    result.validation.profile_objectives_met !== true ||
 	    result.validation.quality_target_met !== true ||
 	    result.auto_apply_eligible !== true ||
 	    !autotuneValidationGatesComplete(result.validation, result.profile, true))
@@ -2839,7 +2874,8 @@ function autotuneResultReviewable(result, action) {
 			return true;
 		if (result.auto_apply_eligible !== false ||
 		    result.validation.safety_pass !== true ||
-		    result.validation.quality_target_met !== false ||
+		    (result.validation.quality_target_met !== false &&
+		     result.validation.profile_objectives_met !== false) ||
 		    !autotuneValidationGatesComplete(result.validation, result.profile, false))
 			return false;
 		if (canonicalAutotuneProfile(result.profile) !== 'fair')
@@ -3155,6 +3191,7 @@ function rollbackGuardedApply(guards, error, applyDeadlineMs) {
 		.then(function() { return abortAutotuneApplyGuardsStrict(guards); });
 
 	return transaction.then(function() {
+		error.transactionRolledBack = true;
 		throw error;
 	}, function(rollbackError) {
 		var failure = new Error(_('Full Auto-Tune apply failed and the exact UCI rollback could not be verified: %s').format(
@@ -3267,6 +3304,7 @@ function guardedApplyStatus(guard) {
 
 function waitForGuardedApplySupervisor(guards, applyDeadlineMs) {
 	var deadline = applyDeadlineMs + 15000;
+	var confirmationStarted = false;
 
 	function poll() {
 		return Promise.all(guards.map(guardedApplyStatus)).then(function(states) {
@@ -3288,6 +3326,15 @@ function waitForGuardedApplySupervisor(guards, applyDeadlineMs) {
 			}
 			if (states.every(function(state) { return state.state === 'complete'; }))
 				return states;
+			if (states.every(function(state) { return state.state === 'confirming'; })) {
+				if (confirmationStarted)
+					return applyGuardDelay(500).then(poll);
+				confirmationStarted = true;
+				return confirmPreparedApply(guards, applyDeadlineMs).then(poll, function(error) {
+					error.guardConfirmationFailed = true;
+					throw error;
+				});
+			}
 			if (Date.now() >= deadline) {
 				var timeout = new Error(_('Timed out waiting for the router to finish the guarded Full Auto-Tune apply.'));
 				timeout.supervisorTimedOut = true;
@@ -3295,6 +3342,9 @@ function waitForGuardedApplySupervisor(guards, applyDeadlineMs) {
 			}
 			return applyGuardDelay(500).then(poll);
 		}, function(error) {
+			if (error.guardConfirmationFailed || error.confirmIndeterminate ||
+			    error.applyConfirmed || error.transactionRolledBack)
+				throw error;
 			if (Date.now() >= deadline) {
 				error.supervisorTimedOut = true;
 				throw error;
@@ -3304,6 +3354,19 @@ function waitForGuardedApplySupervisor(guards, applyDeadlineMs) {
 	}
 
 	return poll();
+}
+
+function reloadViewPage() {
+	if (!window.location)
+		return;
+	var pageUrl = typeof window.location === 'string' ? window.location : window.location.href;
+	var cleanUrl = pageUrl ? pageUrl.split('#')[0] : null;
+	if (!cleanUrl)
+		return;
+	if (typeof window.location.replace === 'function')
+		window.location.replace(cleanUrl);
+	else
+		window.location = cleanUrl;
 }
 
 function runGuardedSaveApply(view, ev) {
@@ -3324,7 +3387,7 @@ function runGuardedSaveApply(view, ev) {
 		return waitForGuardedApplySupervisor(guards, applyDeadlineMs);
 	}).then(function() {
 		applyStarted = false;
-		window.location = window.location.href.split('#')[0];
+		reloadViewPage();
 		return view;
 	}).catch(function(error) {
 		if (error.confirmIndeterminate || error.transactionRolledBack || error.applyConfirmed)
@@ -3332,6 +3395,14 @@ function runGuardedSaveApply(view, ev) {
 		if (applyStarted)
 			return rollbackGuardedApply(guards, error, applyDeadlineMs);
 		return abortAutotuneApplyGuards(guards).then(function() { throw error; });
+	}).catch(function(error) {
+		/* rpcd's rollback is authoritative, but the in-memory LuCI UCI model can still
+		 * retain a stale staged proposal after a guarded apply attempt. Reload immediately
+		 * so the global Unsaved changes control cannot accidentally re-commit expired state. */
+		if (applyStarted) {
+			reloadViewPage();
+		}
+		throw error;
 	});
 }
 
@@ -3478,6 +3549,12 @@ function autotuneAttemptDiagnostics(validation, result, index) {
 		cpu_total_percent: autotuneNumber(downloadPhase.cpu && downloadPhase.cpu.total_peak_percent),
 		cpu_core_percent: autotuneNumber(downloadPhase.cpu && downloadPhase.cpu.max_core_peak_percent),
 		cpu_softirq_percent: autotuneNumber(downloadPhase.cpu && downloadPhase.cpu.softirq_peak_percent),
+		cpu_mean_percent: autotuneNumber(downloadPhase.cpu && downloadPhase.cpu.mean_effective_percent),
+		cpu_p95_percent: autotuneNumber(downloadPhase.cpu && downloadPhase.cpu.p95_effective_percent),
+		cpu_samples: autotuneNumber(downloadPhase.cpu && downloadPhase.cpu.samples),
+		cpu_over_limit_samples: autotuneNumber(downloadPhase.cpu && downloadPhase.cpu.over_limit_samples),
+		cpu_longest_over_limit_samples: autotuneNumber(downloadPhase.cpu && downloadPhase.cpu.longest_over_limit_samples),
+		cpu_softirq_p95_percent: autotuneNumber(downloadPhase.cpu && downloadPhase.cpu.p95_softirq_percent),
 		qdisc: downloadPhase.qdisc
 	};
 	var ulLoad = {
@@ -3492,6 +3569,12 @@ function autotuneAttemptDiagnostics(validation, result, index) {
 		cpu_total_percent: autotuneNumber(uploadPhase.cpu && uploadPhase.cpu.total_peak_percent),
 		cpu_core_percent: autotuneNumber(uploadPhase.cpu && uploadPhase.cpu.max_core_peak_percent),
 		cpu_softirq_percent: autotuneNumber(uploadPhase.cpu && uploadPhase.cpu.softirq_peak_percent),
+		cpu_mean_percent: autotuneNumber(uploadPhase.cpu && uploadPhase.cpu.mean_effective_percent),
+		cpu_p95_percent: autotuneNumber(uploadPhase.cpu && uploadPhase.cpu.p95_effective_percent),
+		cpu_samples: autotuneNumber(uploadPhase.cpu && uploadPhase.cpu.samples),
+		cpu_over_limit_samples: autotuneNumber(uploadPhase.cpu && uploadPhase.cpu.over_limit_samples),
+		cpu_longest_over_limit_samples: autotuneNumber(uploadPhase.cpu && uploadPhase.cpu.longest_over_limit_samples),
+		cpu_softirq_p95_percent: autotuneNumber(uploadPhase.cpu && uploadPhase.cpu.p95_softirq_percent),
 		qdisc: uploadPhase.qdisc
 	};
 	var dlRealizationGate = autotuneGateValue(decision,
@@ -3506,6 +3589,10 @@ function autotuneAttemptDiagnostics(validation, result, index) {
 		[ 'download-capacity-retention', 'download_capacity_retention' ]);
 	var ulCapacityGate = autotuneGateValue(decision,
 		[ 'upload-capacity-retention', 'upload_capacity_retention' ]);
+	var dlSafetyFloorGate = autotuneGateValue(decision,
+		[ 'download-throughput-safety-floor' ]);
+	var ulSafetyFloorGate = autotuneGateValue(decision,
+		[ 'upload-throughput-safety-floor' ]);
 	var legacyCapacityGate = autotuneGateValue(decision,
 		[ 'capacity_retention', 'throughput_retention', 'throughput' ]);
 	var icmpGate = autotuneGateValue(decision,
@@ -3536,6 +3623,10 @@ function autotuneAttemptDiagnostics(validation, result, index) {
 	if (ulCapacityGate == null)
 		ulCapacityGate = legacyCapacityGate != null ? legacyCapacityGate :
 			(retentionUl == null ? null : retentionUl >= 80);
+	if (dlSafetyFloorGate == null && retentionDl != null)
+		dlSafetyFloorGate = retentionDl >= 50;
+	if (ulSafetyFloorGate == null && retentionUl != null)
+		ulSafetyFloorGate = retentionUl >= 50;
 	if (icmpGate == null && icmpDelta != null)
 		icmpGate = icmpDelta <= 100;
 	if (lossGate == null && loss != null)
@@ -3603,6 +3694,7 @@ function autotuneAttemptDiagnostics(validation, result, index) {
 			directionPhases.download || directionPhases.upload),
 		correction: decision.correction || validation.correction || null,
 		reasons: decision.reasons || validation.reasons || [],
+		warnings: decision.warnings || validation.warnings || [],
 		background: background,
 		gates: [
 			{ id: 'download_candidate_realization', pass: dlRealizationGate },
@@ -3611,6 +3703,8 @@ function autotuneAttemptDiagnostics(validation, result, index) {
 			{ id: 'upload_candidate_realization_maximum', pass: ulRealizationMaximumGate },
 			{ id: 'download_capacity_retention', pass: dlCapacityGate },
 			{ id: 'upload_capacity_retention', pass: ulCapacityGate },
+			{ id: 'download_throughput_safety_floor', pass: dlSafetyFloorGate },
+			{ id: 'upload_throughput_safety_floor', pass: ulSafetyFloorGate },
 			{ id: 'icmp_latency', pass: icmpGate },
 			{ id: 'icmp_loss', pass: lossGate },
 			{ id: 'transport_latency', pass: transportGate },
@@ -3646,6 +3740,8 @@ function autotuneDiagnostics(result) {
 		error: result && result.error ||
 			(diagnosticResult && diagnosticResult.error) || '',
 		configuration_written: !!(diagnosticResult && diagnosticResult.configuration_written),
+		datapath: diagnosticResult && (diagnosticResult.datapath ||
+			(diagnosticResult.route && diagnosticResult.route.datapath)) || null,
 		attempts: attempts.map(function(attempt, index) {
 			return autotuneAttemptDiagnostics(attempt, diagnosticResult, index + 1);
 		})
@@ -3724,6 +3820,13 @@ function renderAutotuneGate(pass) {
 	return E('strong', { 'style': 'color:%s;white-space:nowrap'.format(color) }, text);
 }
 
+function renderAutotuneAdvisoryGate(pass) {
+	var text = pass === true ? _('PASS') : (pass === false ? _('WARN') : _('NOT REPORTED'));
+	var color = pass === true ? '#0a8f5a' : (pass === false ? '#c87800' : '#777');
+
+	return E('strong', { 'style': 'color:%s;white-space:nowrap'.format(color) }, text);
+}
+
 function renderAutotuneQdisc(qdisc) {
 	if (!(qdisc && qdisc.available === true))
 		return qdisc && qdisc.reason ? _('Unavailable (%s)').format(qdisc.reason) : '-';
@@ -3732,12 +3835,27 @@ function renderAutotuneQdisc(qdisc) {
 		autotuneMetric(qdisc.overlimits, ''), autotuneMetric(qdisc.requeues, ''));
 }
 
+function autotuneCpuSustainedSummary(load) {
+	load = load || {};
+	return _('%s mean · %s p95 · %s/%s samples above limit · longest %s s · %s softirq p95').format(
+		autotuneMetric(load.cpu_mean_percent, '%'),
+		autotuneMetric(load.cpu_p95_percent, '%'),
+		autotuneMetric(load.cpu_over_limit_samples, ''),
+		autotuneMetric(load.cpu_samples, ''),
+		autotuneMetric(load.cpu_longest_over_limit_samples, ''),
+		autotuneMetric(load.cpu_softirq_p95_percent, '%'));
+}
+
 function renderAutotuneDiagnostics(result) {
 	var diagnostics = autotuneDiagnostics(result);
 	var diagnosticResult = autotuneLegacyResult(result) || result || {};
 	var profileOutcome = diagnosticResult.profile_outcome;
 	var profileSearch = diagnosticResult.profile_search;
 	var retryableInconclusive = autotuneRetryableInconclusive(result);
+	var finalAttempt = diagnostics.attempts.length ? diagnostics.attempts[diagnostics.attempts.length - 1] : null;
+	var cpuWarning = finalAttempt &&
+		(autotuneGate(finalAttempt, 'download_cpu') === false ||
+		 autotuneGate(finalAttempt, 'upload_cpu') === false);
 	var alertClass;
 	var alertTitle;
 	var alertMessage;
@@ -3748,9 +3866,11 @@ function renderAutotuneDiagnostics(result) {
 		alertMessage = diagnostics.error || _('This saved result is read-only.');
 	}
 	else if (diagnostics.validated) {
-		alertClass = 'success';
-		alertTitle = _('Validated proposal. ');
-		alertMessage = diagnostics.error || _('Every required validation gate passed.');
+		alertClass = cpuWarning ? 'warning' : 'success';
+		alertTitle = cpuWarning ? _('Validated with CPU warning. ') : _('Validated proposal. ');
+		alertMessage = diagnostics.error || (cpuWarning ?
+			_('Every required validation gate passed, but CPU pressure exceeded the advisory threshold. The proposal remains applicable.') :
+			_('Every required validation gate passed.'));
 	}
 	else if (diagnostics.reviewable) {
 		alertClass = 'warning';
@@ -3788,14 +3908,44 @@ function renderAutotuneDiagnostics(result) {
 		nodes.push(E('p', {}, _('Stage: %s. Diagnostic reason: %s.').format(
 			diagnostics.stage || '-', diagnostics.reason || '-')));
 
+	if (diagnostics.datapath && diagnostics.datapath.available === true &&
+	    diagnostics.datapath.single_cpu_rps === true) {
+		nodes.push(E('div', {
+			'class': 'alert-message warning',
+			'style': 'margin:10px 0'
+		}, _('RX steering warning: %s has %s RX queues, but every queue uses RPS mask %s (OpenWrt packet steering mode %s). This can saturate one softirq CPU before the link reaches line rate.').format(
+			diagnostics.datapath.ingress_device || '-',
+			diagnostics.datapath.rx_queues == null ? '-' : diagnostics.datapath.rx_queues,
+			Array.isArray(diagnostics.datapath.rps_masks) && diagnostics.datapath.rps_masks.length ?
+				diagnostics.datapath.rps_masks[0] : '-',
+			diagnostics.datapath.packet_steering_mode || '0')));
+	}
+
 	if (profileOutcome && profileSearch) {
-		nodes.push(E('p', {}, [
+			nodes.push(E('p', {}, [
 			E('strong', {}, _('Profile result: ')),
-			_('%s; target %s, measured %s; capacity floor %s%.').format(
+			_('%s; target %s, measured %s; retention objective %s%% (%s), historical comparison %s%% (%s).').format(
 				profileOutcome.mode || '-', profileOutcome.target_grade || '-',
 				profileOutcome.actual_grade || '-',
-				autotuneMetric(profileOutcome.capacity_floor_percent, ''))
+				autotuneMetric(profileOutcome.capacity_floor_percent, ''),
+				profileOutcome.capacity_floor_met === true ? _('met') : _('warning'),
+				autotuneMetric(profileOutcome.throughput_safety_floor_percent, ''),
+				profileOutcome.throughput_safety_floor_met === true ? _('within range') : _('warning only'))
 		]));
+
+		var variableDirections = [ 'download', 'upload' ].filter(function(direction) {
+			return profileSearch[direction] &&
+				profileSearch[direction].reason === 'variable-throughput-advisory';
+		});
+		if (variableDirections.length) {
+			nodes.push(E('div', {
+				'class': 'alert-message warning',
+				'style': 'margin:10px 0'
+			}, _('Variable-link advisory: %s throughput did not repeat within 5%%, but every bounded sample passed the hard safety and quality checks. The conservative candidate requires manual confirmation and will not be auto-applied.').format(
+				variableDirections.map(function(direction) {
+					return direction === 'download' ? _('download') : _('upload');
+				}).join(', '))));
+		}
 
 		[ 'download', 'upload' ].forEach(function(direction) {
 			var search = profileSearch[direction];
@@ -3885,6 +4035,9 @@ function renderAutotuneDiagnostics(result) {
 		var reasonSummary = attempt.reasons && attempt.reasons.length ? attempt.reasons.map(function(reason) {
 			return reason.code || reason.reason || String(reason);
 		}).join(', ') : _('none');
+		var warningSummary = attempt.warnings && attempt.warnings.length ? attempt.warnings.map(function(warning) {
+			return warning.code || warning.reason || String(warning);
+		}).join(', ') : _('none');
 		var rows = [
 			[ _('Download throughput'), dlSummary, '-' ],
 			[ _('DL candidate realization'), autotuneMetric(attempt.candidate_realization.download_percent, '%'),
@@ -3893,7 +4046,9 @@ function renderAutotuneDiagnostics(result) {
 				renderAutotuneGate(autotuneGate(attempt, 'download_candidate_realization_maximum')) ],
 			[ _('DL candidate / raw capacity'), autotuneMetric(attempt.candidate_capacity.download_percent, '%'), '-' ],
 			[ _('DL capacity retained'), autotuneMetric(attempt.capacity_retention.download_percent, '%'),
-				renderAutotuneGate(autotuneGate(attempt, 'download_capacity_retention')) ],
+				renderAutotuneAdvisoryGate(autotuneGate(attempt, 'download_capacity_retention')) ],
+			[ _('DL historical throughput trust'), autotuneMetric(attempt.capacity_retention.download_percent, '%'),
+				renderAutotuneAdvisoryGate(autotuneGate(attempt, 'download_throughput_safety_floor')) ],
 			[ _('Upload throughput'), ulSummary, '-' ],
 			[ _('UL candidate realization'), autotuneMetric(attempt.candidate_realization.upload_percent, '%'),
 				renderAutotuneGate(autotuneGate(attempt, 'upload_candidate_realization')) ],
@@ -3901,7 +4056,9 @@ function renderAutotuneDiagnostics(result) {
 				renderAutotuneGate(autotuneGate(attempt, 'upload_candidate_realization_maximum')) ],
 			[ _('UL candidate / raw capacity'), autotuneMetric(attempt.candidate_capacity.upload_percent, '%'), '-' ],
 			[ _('UL capacity retained'), autotuneMetric(attempt.capacity_retention.upload_percent, '%'),
-				renderAutotuneGate(autotuneGate(attempt, 'upload_capacity_retention')) ]
+				renderAutotuneAdvisoryGate(autotuneGate(attempt, 'upload_capacity_retention')) ],
+			[ _('UL historical throughput trust'), autotuneMetric(attempt.capacity_retention.upload_percent, '%'),
+				renderAutotuneAdvisoryGate(autotuneGate(attempt, 'upload_throughput_safety_floor')) ]
 		];
 		if (attempt.directional_load_reported) {
 			rows.push(
@@ -3914,7 +4071,8 @@ function renderAutotuneDiagnostics(result) {
 				[ _('DL CPU peak'), _('%s effective · %s total · %s busiest core · %s softirq').format(
 					autotuneMetric(dlLoad.cpu_percent, '%'), autotuneMetric(dlLoad.cpu_total_percent, '%'),
 					autotuneMetric(dlLoad.cpu_core_percent, '%'), autotuneMetric(dlLoad.cpu_softirq_percent, '%')),
-					renderAutotuneGate(autotuneGate(attempt, 'download_cpu')) ],
+					renderAutotuneAdvisoryGate(autotuneGate(attempt, 'download_cpu')) ],
+				[ _('DL CPU sustained'), autotuneCpuSustainedSummary(dlLoad), '-' ],
 				[ _('DL CAKE counters'), renderAutotuneQdisc(dlLoad.qdisc), '-' ],
 				[ _('UL ICMP loaded delta'), autotuneMetric(ulLoad.icmp_delta_ms, ' ms'),
 					renderAutotuneGate(autotuneGate(attempt, 'upload_icmp')) ],
@@ -3925,7 +4083,8 @@ function renderAutotuneDiagnostics(result) {
 				[ _('UL CPU peak'), _('%s effective · %s total · %s busiest core · %s softirq').format(
 					autotuneMetric(ulLoad.cpu_percent, '%'), autotuneMetric(ulLoad.cpu_total_percent, '%'),
 					autotuneMetric(ulLoad.cpu_core_percent, '%'), autotuneMetric(ulLoad.cpu_softirq_percent, '%')),
-					renderAutotuneGate(autotuneGate(attempt, 'upload_cpu')) ],
+					renderAutotuneAdvisoryGate(autotuneGate(attempt, 'upload_cpu')) ],
+				[ _('UL CPU sustained'), autotuneCpuSustainedSummary(ulLoad), '-' ],
 				[ _('UL CAKE counters'), renderAutotuneQdisc(ulLoad.qdisc), '-' ]
 			);
 		}
@@ -3937,12 +4096,13 @@ function renderAutotuneDiagnostics(result) {
 				[ _('Transport latency'), transportSummary,
 					renderAutotuneGate(autotuneGate(attempt, 'transport_latency')) ],
 				[ _('CPU peak'), autotuneMetric(attempt.cpu_peak_percent, '%'),
-					renderAutotuneGate(autotuneGate(attempt, 'cpu')) ]
+					renderAutotuneAdvisoryGate(autotuneGate(attempt, 'cpu')) ]
 			);
 		}
 		rows.push(
 			[ _('Typed correction'), correctionSummary, '-' ],
 			[ _('Failed gate reasons'), reasonSummary, '-' ],
+			[ _('Advisory warnings'), warningSummary, '-' ],
 			[ _('Background traffic'), backgroundSummary,
 				renderAutotuneGate(autotuneGate(attempt, 'background')) ]
 		);
@@ -4435,7 +4595,7 @@ function showCreateWizard(grid, name, existingName) {
 		var fields = [
 			wizardField(_('Calibration profile'),
 				E('div', { 'style': 'display:flex;flex-wrap:wrap;gap:8px' }, profileButtons),
-				_('The profile chooses how Auto-Tune ranks safe points on the measured throughput/latency boundary. Capacity safety floors are never lowered. A result below the requested quality target can only be reviewed as a clearly marked manual fallback.')),
+				_('The profile chooses how Auto-Tune ranks safe points on the measured throughput/latency boundary. Missed throughput objectives and the 50% historical trust boundary prevent Auto-Apply but remain manually reviewable when latency, loss, routing, and measurement evidence are clean.')),
 			E('div', { 'class': 'alert-message warning' }, [
 				E('strong', {}, _('Traffic warning: ')),
 				_('Full Auto-Tune measures one bidirectional control plus repeated download-only and upload-only controls, then searches each shaped direction independently. A direction may be measured again while Auto-Tune raises or brackets its candidate, but it never lowers the profile capacity floor. Other WAN traffic can reduce confidence, but is never counted as test throughput.')
@@ -4740,7 +4900,7 @@ function showCreateWizard(grid, name, existingName) {
 					actionChoices.push({
 						id: 'apply_sqm',
 						title: _('Apply the best safe Fair SQM candidate'),
-						description: _('Keeps the measured 90% throughput floor. The loaded-latency target was not reached, so this is an explicit manual choice.')
+						description: _('The 90% Fair objective, loaded-latency target, or 50% historical trust boundary was not reached, so this remains an explicit manual choice.')
 					});
 				}
 				if (allowedActions.keep_current === true &&
@@ -4796,7 +4956,7 @@ function showCreateWizard(grid, name, existingName) {
 				);
 				if (capacityFloorInfeasible) {
 					rows.push([ _('Capacity floor'),
-						_('The measured CAKE datapath could not retain the hard 90%% floor. No shaped candidate can be applied. %s').format(
+						_('This legacy result failed a hard shaped-datapath safety check. No shaped candidate can be applied. %s').format(
 							autotune.profile_outcome.infeasible_reason || '') ]);
 				}
 				if (outcome && outcome.no_sqm_control && outcome.no_sqm_control.available === true) {
@@ -5987,12 +6147,14 @@ function addInterfaceOptions(section) {
 
 	o = iface(section, 'interfaces', 'dl_if', _('Download interface'));
 	o.depends('auto_interface_preset', '0');
+	o.retain = true;
 	o.validate = function(section_id) {
 		return validateDifferentInterfaces(validationSection(this), section_id);
 	};
 
 	o = iface(section, 'interfaces', 'ul_if', _('Upload interface'));
 	o.depends('auto_interface_preset', '0');
+	o.retain = true;
 	o.validate = function(section_id) {
 		return validateDifferentInterfaces(validationSection(this), section_id);
 	};
@@ -6328,6 +6490,7 @@ function addSqmOptions(section, qdiscs, scripts) {
 
 	o = iface(section, 'sqm_basic', 'sqm_interface', _('SQM interface'));
 	dependsManagedSqm(o, { auto_interface_preset: '0' });
+	o.retain = true;
 	dependsManagedSqm(flag(section, 'sqm_basic', 'sqm_debug_logging', _('SQM debug logging')));
 	dependsManagedSqm(listValue(section, 'sqm_basic', 'sqm_verbosity', _('SQM log verbosity'), [
 		[ '0', 'silent' ],

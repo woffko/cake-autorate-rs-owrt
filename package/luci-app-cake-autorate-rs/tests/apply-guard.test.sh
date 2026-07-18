@@ -63,7 +63,7 @@ EOF
 fingerprint="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 cat > "$autotune/wan_sqm/result.json" <<EOF
 {
-  "state":"complete", "schema_version":6,
+  "state":"complete", "schema_version":7,
   "producer":"cake-autorate-rs-autotune", "profile":"best_overall",
   "run_id":"apply-guard-test-run", "auto_apply_eligible":true,
   "manual_apply_eligible":true,
@@ -79,14 +79,16 @@ cat > "$autotune/wan_sqm/result.json" <<EOF
   "runs":[{"backend":"speedtest-go","server_id":"17372"}],
   "validation_thresholds":{"candidate_realization_min_percent":80,
     "candidate_realization_max_percent":110,"capacity_retention_min_percent":80,
+    "throughput_safety_floor_percent":50,
     "delay_max_ms":30,"loss_max_percent":3,"cpu_max_percent":85},
   "validation":{"profile":"best_overall","pass":true,"hard_pass":true,"safety_pass":true,
-    "quality_target_met":true,"actual_grade":"A","effective_delta_ms":10,
+    "profile_objectives_met":true,"quality_target_met":true,"actual_grade":"A","effective_delta_ms":10,
     "contaminated":false,"candidate_base":{"download_kbps":80000,"upload_kbps":20000},
     "correction":{"action":"none","feasible":true}},
 	  "profile_outcome":{"mode":"target-a-met","objective":"balanced-quality-throughput",
 	    "target_grade":"A","target_met":true,"actual_grade":"A","capacity_floor_percent":80,
-	    "capacity_floor_met":true,"infeasible_reason":"","manual_only":false,
+	    "capacity_floor_met":true,"throughput_safety_floor_percent":50,
+	    "throughput_safety_floor_met":true,"infeasible_reason":"","manual_only":false,
 	    "selected_pair":{"download_kbps":80000,"upload_kbps":20000}},
   "profile_search":{
     "download":{"schema_version":1,"profile":"best_overall","direction":"download",
@@ -182,6 +184,42 @@ gaming_token="$(printf '%s\n' "$gaming_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)
 [ "$(uci -c "$guard/$gaming_token/expected" -q get cake-autorate.wan_sqm.sqm_squash_dscp)" = 0 ]
 [ "$(uci -c "$guard/$gaming_token/expected" -q get cake-autorate.wan_sqm.sqm_iqdisc_opts)" = diffserv4 ]
 $helper abort "$gaming_token" >/dev/null
+cp "$work/result.valid" "$autotune/wan_sqm/result.json"
+
+# A clean candidate that realizes its current CAKE rate may remain explicitly
+# reviewable even below 50% of an older 5G capacity sample.  Historical
+# retention is advisory; the current safety_pass and selected direction safety
+# are the fail-closed controls.
+node - "$work/result.valid" "$autotune/wan_sqm/result.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+result.auto_apply_eligible = false;
+result.validation.pass = false;
+result.validation.profile_objectives_met = false;
+result.profile_outcome.mode = 'target-a-throughput-advisory';
+result.profile_outcome.capacity_floor_met = false;
+result.profile_outcome.throughput_safety_floor_met = false;
+result.profile_outcome.manual_only = true;
+fs.writeFileSync(process.argv[3], JSON.stringify(result));
+EOF
+historical_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint")"
+historical_token="$(printf '%s\n' "$historical_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
+[ "${#historical_token}" -eq 64 ]
+$helper abort "$historical_token" >/dev/null
+cp "$work/result.valid" "$autotune/wan_sqm/result.json"
+
+# A logical netifd target remains the attested route identity, while every
+# runtime/SQM field in the exact manifest must use its resolved L3 device.
+sed 's/"target_interface":"pppoe-wan"/"target_interface":"wan"/' \
+	"$work/result.valid" > "$autotune/wan_sqm/result.json"
+logical_arm="$($helper arm wan_sqm wan speedtest-go main '' 1 0 apply_sqm "$fingerprint")"
+logical_token="$(printf '%s\n' "$logical_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
+[ "$(uci -c "$guard/$logical_token/expected" -q get cake-autorate.wan_sqm.wan_if)" = pppoe-wan ]
+[ "$(uci -c "$guard/$logical_token/expected" -q get cake-autorate.wan_sqm.sqm_interface)" = pppoe-wan ]
+[ "$(uci -c "$guard/$logical_token/expected" -q get cake-autorate.wan_sqm.ul_if)" = pppoe-wan ]
+[ "$(uci -c "$guard/$logical_token/expected" -q get cake-autorate.wan_sqm.dl_if)" = ifb4pppoe-wan ]
+[ "$(uci -c "$guard/$logical_token/expected" -q get cake-autorate.wan_sqm.ping_extra_args)" = '-I pppoe-wan' ]
+$helper abort "$logical_token" >/dev/null
 cp "$work/result.valid" "$autotune/wan_sqm/result.json"
 
 # The deterministic enrollment name is reserved. Never reuse or later delete
@@ -349,6 +387,10 @@ if uci -q get sqm.cake_autorate_apply_wan_sqm >/dev/null 2>&1; then
 	exit 1
 fi
 $helper reconcile "$token" | grep -q '"state":"confirmed"'
+if APPLY_GUARD_RPCD_PENDING=1 $helper finalize "$token" >/dev/null 2>&1; then
+	echo "finalize accepted a transaction while rpcd rollback proof was still present" >&2
+	exit 1
+fi
 $helper finalize "$token" | grep -q '"state":"finalized"'
 [ ! -e "$guard/$token" ]
 if uci -q get cake-autorate.wan_sqm._autotune_apply_guard >/dev/null 2>&1; then
@@ -362,9 +404,10 @@ fi
 [ "$(sed -n '1p' "$APPLY_GUARD_SQM_INIT_STATE")" = enabled ]
 $helper verify-init | grep -q '"state":"clear"'
 
-# The init-launched server supervisor owns postcheck, marker cleanup and UCI
-# confirmation. Closing or refreshing LuCI after callApply therefore cannot
-# strand a token-dependent marker in persistent configuration.
+# The init-launched server supervisor owns postcheck and marker cleanup. LuCI
+# confirms with the authenticated ubus session that started the rpcd apply;
+# after the deadline the independent supervisor proves final or rolled-back
+# state and finishes cleanup if the browser disappeared mid-finalization.
 cp "$work/result.valid" "$autotune/wan_sqm/result.json"
 export APPLY_GUARD_DAEMON_RUNNING=0
 supervised_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint")"
@@ -373,7 +416,17 @@ cp "$guard/$supervised_token/expected/cake-autorate" "$config/cake-autorate"
 cp "$guard/$supervised_token/expected/sqm" "$config/sqm"
 $helper verify-init | grep -q '"state":"verified"'
 export APPLY_GUARD_DAEMON_RUNNING=1
-$helper supervise "$supervised_token" | grep -q '"state":"finalized"'
+# Simulate LuCI confirmation by retaining expected-final beyond an already
+# elapsed rpcd deadline. The real browser normally finalizes immediately.
+supervised_started=$(( $(date +%s) - 40 ))
+printf '%s\n' "$supervised_started" > "$guard/$supervised_token/apply-started"
+sed -i 's/^rollback_timeout_s=.*/rollback_timeout_s=10/' "$guard/$supervised_token/meta"
+supervised_output="$($helper supervise "$supervised_token")" || {
+	printf '%s\n' "$supervised_output" >&2
+	$helper status "$supervised_token" >&2 || true
+	exit 1
+}
+printf '%s\n' "$supervised_output" | grep -q '"state":"finalized"'
 supervised_status="$($helper status "$supervised_token")" || {
 	printf '%s\n' "$supervised_status" >&2
 	exit 1
@@ -445,6 +498,7 @@ result.validation = {
 	pass: false,
 	hard_pass: true,
 	safety_pass: true,
+	profile_objectives_met: true,
 	quality_target_met: false,
 	actual_grade: 'D',
 	effective_delta_ms: 220,
@@ -465,7 +519,8 @@ result.profile_outcome = {
 	objective: 'throughput-first-quality-tiebreak',
 	target_grade: 'C', target_met: false, actual_grade: 'D',
 	capacity_floor_percent: 90, manual_only: true,
-	capacity_floor_met: true, infeasible_reason: '',
+	capacity_floor_met: true, throughput_safety_floor_percent: 50,
+	throughput_safety_floor_met: true, infeasible_reason: '',
 	selected_pair: { download_kbps: 80000, upload_kbps: 20000 }
 };
 result.profile_search = {
@@ -480,6 +535,8 @@ result.fair_outcome = {
 	target_delta_ms: 200,
 	capacity_floor_percent: 90,
 	capacity_floor_met: true,
+	throughput_safety_floor_percent: 50,
+	throughput_safety_floor_met: true,
 	actual_grade: 'D',
 	actual_effective_delta_ms: 220,
 	recommended_action: 'disable_sqm',
@@ -553,20 +610,23 @@ const fs = require('node:fs');
 const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 result.validation.hard_pass = false;
 result.validation.safety_pass = false;
+result.validation.profile_objectives_met = false;
 result.validation.quality_target_met = true;
 result.validation.actual_grade = 'A';
 result.validation.effective_delta_ms = 10;
-result.profile_outcome.mode = 'capacity-floor-infeasible';
+result.profile_outcome.mode = 'safety-floor-infeasible';
 result.profile_outcome.target_met = true;
 result.profile_outcome.actual_grade = 'A';
 result.profile_outcome.capacity_floor_met = false;
-result.profile_outcome.infeasible_reason = 'download:repeatable-compute-ceiling-below-capacity-floor;upload:repeatable-compute-ceiling-below-capacity-floor';
+result.profile_outcome.throughput_safety_floor_met = false;
+result.profile_outcome.infeasible_reason = 'download:repeatable-compute-ceiling-below-safety-floor;upload:repeatable-compute-ceiling-below-safety-floor';
 for (const direction of [ 'download', 'upload' ]) {
 	result.profile_search[direction].action = 'fallback';
-	result.profile_search[direction].reason = 'repeatable-compute-ceiling-below-capacity-floor';
+	result.profile_search[direction].reason = 'repeatable-shaper-ceiling-below-safety-floor';
 	result.profile_search[direction].selected.safety_pass = false;
 }
 result.fair_outcome.capacity_floor_met = false;
+result.fair_outcome.throughput_safety_floor_met = false;
 result.fair_outcome.actual_grade = 'A';
 result.fair_outcome.actual_effective_delta_ms = 10;
 result.fair_outcome.allowed_actions = [ 'keep_current', 'disable_sqm' ];
@@ -644,14 +704,20 @@ if $helper verify-init >/dev/null 2>&1; then
 	exit 1
 fi
 
-# Once the same-boot transaction has expired, only its metadata is removed.
-# The selected instance settings and managed queue remain intact.
+# Once the same-boot transaction has expired, retain its diagnostics but make
+# the unproven instance and owned queue inert before removing metadata.
 uci -q set cake-autorate.wan_sqm._autotune_apply_expires=0
+uci -q set cake-autorate.wan_sqm.enabled=1
+uci -q set cake-autorate.wan_sqm.sqm_enabled=1
+uci -q set sqm.cake_wan_sqm.enabled=1
 before_setting="$(uci -q get cake-autorate.wan_sqm.unrelated_preserved)"
 before_queue="$(uci -q get sqm.cake_wan_sqm._cake_autorate_managed)"
 $helper recover-stale | grep -q '"state":"recovered"'
 [ "$(uci -q get cake-autorate.wan_sqm.unrelated_preserved)" = "$before_setting" ]
 [ "$(uci -q get sqm.cake_wan_sqm._cake_autorate_managed)" = "$before_queue" ]
+[ "$(uci -q get cake-autorate.wan_sqm.enabled)" = 0 ]
+[ "$(uci -q get cake-autorate.wan_sqm.sqm_enabled)" = 0 ]
+[ "$(uci -q get sqm.cake_wan_sqm.enabled)" = 0 ]
 if uci -q show cake-autorate.wan_sqm | grep -q '_autotune_apply_'; then
 	echo "expired marker recovery left CAKE transaction metadata" >&2
 	exit 1
@@ -662,9 +728,12 @@ if uci -q get sqm.cake_autorate_apply_wan_sqm >/dev/null 2>&1; then
 fi
 $helper verify-init | grep -q '"state":"clear"'
 
-# A reboot is authoritative: rpcd rollback state and tmpfs tokens cannot cross
-# boot IDs, so a well-formed foreign-boot marker is recovered immediately even
-# if its wall-clock expiry is still in the future.
+# A reboot destroys rpcd rollback snapshots and tmpfs proof. A well-formed
+# foreign-boot marker is recovered immediately but can only be made inert, not
+# silently accepted, even if its wall-clock expiry is still in the future.
+uci -q set cake-autorate.wan_sqm.enabled=1
+uci -q set cake-autorate.wan_sqm.sqm_enabled=1
+uci -q set sqm.cake_wan_sqm.enabled=1
 uci -q set cake-autorate.wan_sqm._autotune_apply_guard=1
 uci -q set cake-autorate.wan_sqm._autotune_apply_fingerprint="$stale_fingerprint"
 uci -q set cake-autorate.wan_sqm._autotune_apply_target=pppoe-wan
@@ -682,10 +751,16 @@ uci -q set sqm.cake_autorate_apply_wan_sqm._autotune_apply_job=wan_sqm
 uci -q set sqm.cake_autorate_apply_wan_sqm._autotune_apply_fingerprint="$stale_fingerprint"
 uci -q set sqm.cake_autorate_apply_wan_sqm._autotune_apply_token="$stale_token"
 $helper recover-stale | grep -q '"reason":"boot-changed"'
+[ "$(uci -q get cake-autorate.wan_sqm.enabled)" = 0 ]
+[ "$(uci -q get cake-autorate.wan_sqm.sqm_enabled)" = 0 ]
+[ "$(uci -q get sqm.cake_wan_sqm.enabled)" = 0 ]
 $helper verify-init | grep -q '"state":"clear"'
 
 # RC19 did not record a boot ID. A paired legacy marker with no surviving
 # token is recoverable during an upgrade instead of permanently bricking init.
+uci -q set cake-autorate.wan_sqm.enabled=1
+uci -q set cake-autorate.wan_sqm.sqm_enabled=1
+uci -q set sqm.cake_wan_sqm.enabled=1
 uci -q set cake-autorate.wan_sqm._autotune_apply_guard=1
 uci -q set cake-autorate.wan_sqm._autotune_apply_fingerprint="$stale_fingerprint"
 uci -q set cake-autorate.wan_sqm._autotune_apply_target=pppoe-wan
@@ -702,6 +777,9 @@ uci -q set sqm.cake_autorate_apply_wan_sqm._autotune_apply_job=wan_sqm
 uci -q set sqm.cake_autorate_apply_wan_sqm._autotune_apply_fingerprint="$stale_fingerprint"
 uci -q set sqm.cake_autorate_apply_wan_sqm._autotune_apply_token="$stale_token"
 $helper recover-stale | grep -q '"reason":"legacy-token-missing"'
+[ "$(uci -q get cake-autorate.wan_sqm.enabled)" = 0 ]
+[ "$(uci -q get cake-autorate.wan_sqm.sqm_enabled)" = 0 ]
+[ "$(uci -q get sqm.cake_wan_sqm.enabled)" = 0 ]
 $helper verify-init | grep -q '"state":"clear"'
 
 # A symlinked/foreign runtime root is never trusted.

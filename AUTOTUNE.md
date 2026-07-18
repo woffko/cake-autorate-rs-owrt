@@ -11,12 +11,13 @@ median throughput become P20/P50 capacity references, the throughput guard is
 enabled, and native transport-latency monitoring is enabled for the created
 instance.
 
-> **RC22 status:** Full Auto-Tune now performs a bounded per-direction search
-> over the measured throughput/loaded-latency boundary. Deterministic
-> Rust/shell/LuCI tests cover the search, result attestation, guarded apply and
-> rollback paths. Full Auto-Tune remains fail-closed: only a complete target
-> result is eligible for unattended apply; a safe result below the requested
-> grade is an explicitly typed, manual-only fallback.
+> **RC25 status:** Full Auto-Tune performs a bounded per-direction search over
+> the measured throughput/loaded-latency boundary. Current-candidate
+> realization, loss, route and measurement integrity remain hard gates. CPU,
+> profile capacity objectives and comparison with an earlier volatile-link
+> sample are advisory evidence. Only a complete target/objective result is
+> eligible for unattended apply; every fallback is explicitly typed and
+> manual-only.
 
 ## Safety contract
 
@@ -24,6 +25,12 @@ instance.
   `/tmp/cake-autorate-autotune/<job>/`; they never write router flash.
 - The browser starts and polls a router-side process. Closing LuCI does not
   strand an rpcd request or partially write a configuration.
+- A terminal failure first retains the complete bounded evidence. If an
+  optional diagnostics fragment becomes unreadable during route loss or
+  recovery, the worker stages a compact schema-valid terminal containing the
+  original stage and error instead of replacing it with a generic
+  "interrupted" result. Both detailed breadcrumbs and terminal history remain
+  RAM-only.
 - Every speed-test phase starts stopped, is identity-checked, publishes its
   process group into the recovery journal, and only then resumes in an isolated
   session. Timeout or cancel sends bounded TERM followed by KILL to the complete
@@ -77,40 +84,60 @@ instance.
 The job tests shaped candidates on the same pinned server, independently
 samples ICMP latency/loss, native persistent transport latency, aggregate CPU,
 the busiest CPU core, softirq CPU and the owned CAKE counters, then rechecks
-the WAN address/route before accepting an observation. The effective CPU gate
+the WAN address/route before accepting an observation. The effective CPU metric
 uses the greater of aggregate and busiest-core load, so one saturated core
-cannot hide inside a low multi-core average. The second latency signal is
-deliberate: providers may prioritize ICMP while TCP is still badly queued.
-Each direction is searched independently and the exact selected DL/UL pair is
-confirmed together before rollback and Review.
+cannot hide inside a low multi-core average. In addition to the advisory peak,
+diagnostics retain mean and p95 effective CPU, sample count,
+the number and longest consecutive run above the profile limit, and softirq
+p95. The second latency signal is deliberate: providers may prioritize ICMP
+while TCP is still badly queued. Each direction is searched independently,
+but the exact selected DL/UL pair is confirmed together because both
+directions can still share CPU, interrupt and memory resources.
+
+Preflight also records a diagnostic datapath snapshot. It resolves the
+selected logical/L3 path to the physical ingress device where possible, lists
+every RX queue `rps_cpus` mask, records OpenWrt's Packet Steering mode, and
+flags the specific case where several queues all share one single-CPU mask.
+The snapshot is an indicator, not a complete affinity model: IRQ affinity,
+hardware RSS, XPS, PPPoE/IFB processing and qdisc locking may also be limiting.
+Auto-Tune never changes any of those settings.
 
 ## Calibration profiles
 
 The profile is a calibration contract, not a cosmetic preset. It selects the
-rate factors, loaded-delay target, throughput safety floor, loss gate,
+rate factors, loaded-delay target, throughput trust boundary, loss gate,
 adaptive-ceiling cadence and SQM traffic-class policy used by proposal,
 temporary shaped validation and final configuration.
 
-| Profile | Intended balance | Target | Minimum retained observed-low capacity | Maximum loaded ICMP/transport delta | Maximum loss | SQM policy |
+| Profile | Intended balance | Target | Retained-capacity objective | Maximum loaded ICMP/transport delta | Maximum loss | SQM policy |
 |---|---|---:|---:|---:|---:|---|
 | Gaming | Maximum safe throughput that still proves A+; otherwise the best attainable grade | A+ | 70% | `< 5 ms` | 1% | `layer_cake.qos`; upload/download `diffserv4`; preserve DSCP |
 | Best overall | Maximum safe throughput at A, with a balanced fallback | A | 80% | `< 30 ms` | 3% | `layer_cake.qos`; upload `diffserv4`; download best effort + wash |
 | Fair | Maximum safe throughput first; quality breaks near-throughput ties | C (soft) | 90% | `< 200 ms` | 5% | `layer_cake.qos`; upload `diffserv4`; download best effort + wash |
 
+All profiles also report a separate 50% historical retained-capacity trust
+boundary. Crossing it forces explicit manual review; it is not a hard safety
+failure on cellular/shared-medium links.
 The grades are target classes, not promises about an ISP, server, Wi-Fi client
 or unrelated bottleneck. Grade limits are strict: exactly 5 ms is A, not A+;
-exactly 30 ms is B, not A. Every profile also requires 80–110% candidate
-realization and no more than 85% effective router CPU during either shaped
-direction. The effective value is `max(aggregate CPU, busiest-core CPU)`.
+exactly 30 ms is B, not A. Every profile records the 80–110% candidate
+realization interval as a hard shaper-integrity check. A repeated low value
+causes a lower candidate retest rather than an applicable advisory. All profiles also
+record an 85% effective-router-CPU warning threshold. The effective value is
+`max(aggregate CPU, busiest-core CPU)`.
 Gaming and Best overall require their target for unattended eligibility. If a
-target is unreachable above its immutable 70% or 80% floor, Review can show a
+target or throughput objective is unreachable, Review can show a
 manual-only fallback: Gaming chooses the best attained grade and then the
 fastest candidate in that grade; Best overall chooses the strongest balanced
 quality/throughput candidate. Fair treats C as a soft quality goal while its
-measurement-integrity, realization, 90% retained-capacity, CPU, route and
-background gates remain hard. It maximizes achieved throughput and, within a
+measurement-integrity, loss, route and background gates remain hard. The 50%
+historical-throughput comparison is advisory. Fair maximizes achieved throughput and, within a
 1.5% uncertainty band of the fastest safe result, prefers lower loaded delay.
-No profile ever lowers its capacity floor to manufacture a pass.
+When a current CAKE candidate produces class C's 200 ms boundary or worse,
+the search may reduce that rate even if doing so moves farther below an older
+5G capacity sample. Preserving the old sample would leave the bottleneck and
+its queue in the modem, which defeats SQM.
+No profile silently lowers its objective to manufacture unattended eligibility.
 
 Best overall is the default for new jobs and for existing instances which do
 not yet have `autotune_profile`. The old `balanced` CLI value is accepted as an
@@ -165,8 +192,11 @@ Scheduled Auto-Apply evidence. See
    direction. Repeat one candidate when realization is unreliable; raise a
    clean under-retaining candidate to `ceil_100(O*F/r)`; explicitly test the
    observed-low upper bound; and bisect a discovered quality/safety boundary
-   to 0.5% of observed-low capacity. A completed direction is frozen while the
-   other continues. The exact selected pair is then confirmed together.
+   to 0.5% of observed-low capacity. A reliable but CPU-unsafe point is also
+   repeated at the exact rate, checked at the upper bound, and—when no safe
+   point exists—checked at the calculated hard-floor candidate. A completed
+   direction is frozen while the other continues. The exact selected pair is
+   then confirmed together.
 10. `review`: return raw runs, every validation attempt, baseline, reflector
     plan, route identity, phase-background evidence, detected link, and either
     a passing proposal or the explicitly typed Fair manual choices.
@@ -230,7 +260,7 @@ For each profile, the tuple below is
 |---|---|---|
 | Gaming | `(0.60, 0.82, 0.92, 1.02)` | `(0.35, 0.75, 1.20, 1.60)` |
 | Best overall | `(0.70, 0.88, 0.95, 1.05)` | `(0.40, 0.85, 1.25, 1.80)` |
-| Fair | `(0.80, 0.94, 0.98, 1.08)` | `(0.60, 0.92, 1.30, 1.90)` |
+| Fair | `(0.35, 0.94, 0.98, 1.08)` | `(0.35, 0.92, 1.30, 1.90)` |
 
 Rates are rounded to 100 kbit/s and then constrained to
 `minimum <= base <= maximum <= cap`. The deliberately wide variable maximum is
@@ -307,14 +337,17 @@ capacity remained usable. `candidate_capacity` describes how conservative the
 candidate itself is. None is a substitute for another, and the UI labels all
 three separately.
 
-The hard gates are independent of the diagnostic score. The packaged job
-requires candidate realization in the closed 80..110% range and uses the
-selected profile's retention, latency and loss limits from the table above.
-All profiles require effective CPU no greater than 85%, where effective CPU is
-the greater of aggregate and busiest-core utilization. Proposal schema 3 carries the
+The hard gates are independent of the diagnostic score. The packaged job keeps
+the full 80..110% candidate-realization interval hard: below 80% CAKE may sit
+above the actual bottleneck, while above 110% the claimed temporary shaper is
+not credible. The 70/80/90% retention values are profile objectives and the
+50% historical-retention trust boundary plus effective peak CPU above 85% are
+advisory. Latency/loss policy, route and measurement integrity also remain
+hard. Proposal
+schema 3 carries the
 canonical profile, target grade, whether that target is a hard requirement,
 the throughput-priority flag, exact validation thresholds and complete SQM
-recommendation. Result schema 6 binds that policy, both typed per-direction
+recommendation. Result schema 7 binds that policy, both typed per-direction
 search histories, the selected pair, immutable run identity, phase evidence
 and recovery state to the job identity and configuration
 fingerprint. The standalone Rust CLI has defensive fallback
@@ -368,10 +401,12 @@ the direction's observed-low capacity, not the proposal's initial maximum.
 Its actions are:
 
 - `test`: measure a new bounded candidate, or collect up to three observations
-  at one candidate when realization is outside 80–110%; a matching pair is
-  required before treating low realization as a repeatable ceiling;
-- `complete`: a safe optimum satisfying the profile target was bounded or
-  confirmed (Fair can complete at its throughput optimum even below soft C);
+  at one candidate when realization is outside 80–110%; repeatable or bounded
+  variable low realization causes a lower candidate to be tested so CAKE is
+  proven to control the bottleneck;
+- `complete`: a controlled safe optimum was bounded or confirmed; it may be
+  manual-only when a retention objective or historical trust boundary is
+  missed;
 - `fallback`: trustworthy evidence produced at least one candidate for manual
   review, but the required Gaming/Best overall target was not proved;
 - `inconclusive`: measurement reliability could not be established.
@@ -384,8 +419,9 @@ quality/retention score. Fair explicitly tests the upper bound and maximizes
 safe achieved throughput; candidates within 1.5% of that maximum are ordered
 by lower effective loaded delay and then throughput.
 
-A fallback is not permission to violate the throughput floor. Failed,
-incomplete, strictly contaminated or conservative runs remain diagnostic-only.
+A fallback is never permission to bypass latency, loss, route or measurement
+integrity. Failed, incomplete, strictly contaminated or conservative runs
+remain diagnostic-only.
 Main-route
 jobs require the target to be the active default device. Structured Multi-WAN jobs route ICMP, native
 transport sockets, and the selected speed-test backend through the same
@@ -396,45 +432,64 @@ change fails closed and leaves UCI untouched.
 
 Measurement integrity failures are not presented as a proved bad candidate.
 Missing or untrusted transport evidence, reflector rate limiting, loss of the
-temporary shaper, an unrealized/over-realized candidate after its bounded
-retry, and similar ambiguous observations end as `INCONCLUSIVE` with an
+temporary shaper, an over-realized candidate after its bounded retry, and
+similar ambiguous observations end as `INCONCLUSIVE` with an
 explicit retry reason. `FAILED` is reserved for a valid complete measurement
-which proves that the configured safety floor and quality limits have no legal
-intersection. Neither state exposes Apply or replaces the active settings,
+which proves that hard quality/integrity limits have no legal intersection.
+Neither state exposes Apply or replaces the active settings,
 except for the specific complete Fair hard-safe outcome described above;
 measurement-integrity failures never qualify for it.
 
-A repeatable low-realization result is not automatically blamed on the ISP.
-The search collects as many as three samples at the same candidate and requires
-at least one pair within 5%, then applies the same rule at the observed-low
-upper bound. If the repeatable upper-bound pair still cannot retain the
-immutable profile floor, the result is a typed
-`repeatable-shaper-ceiling-below-capacity-floor`. When both samples in that
-repeatable pair also exceed the profile CPU gate, it is
-reported more specifically as
-`repeatable-compute-ceiling-below-capacity-floor`. The measured unsafe point is
-kept only for diagnostics: Gaming and Best overall fail closed, while Fair can
-show **Keep current** and may show **Disable autorate and SQM** only when its
-separate clean no-SQM comparison passes. It can never expose **Apply SQM** or
-be consumed by Scheduled Auto-Apply.
+A low-realization result is not automatically blamed on the ISP. The search
+collects as many as three samples at the same candidate and first looks for an
+achieved-rate pair within 5%. It then derives a lower bounded candidate from
+the worst clean achieved sample and tests that rate. The original candidate is
+never apply-eligible because it has not proved that CAKE is below the physical
+bottleneck. Once the lower candidate realizes at least 80%, a missed retention
+objective is manual-only; crossing 50% adds a historical-throughput warning.
+
+Cellular, Wi-Fi and some shared-medium links can remain clean while three
+same-candidate throughput results vary by more than 5%. After that bounded
+retry, the worst clean achieved sample likewise seeds a lower candidate. Only
+the subsequent controlled retest can finish the search. A retention shortfall
+then requires explicit manual confirmation and never authorizes scheduled or
+automatic Apply.
+
+RC25 treats the CPU threshold as advisory. CPU peak, aggregate CPU, busiest
+core, softirq, mean, p95, over-limit count and longest over-limit run remain in
+the result, but CPU alone cannot change search action or selection, fail final
+validation, request a rate correction, make a capacity floor infeasible, or
+block manual/scheduled Apply. The typed CPU gates remain visible with
+`required=false`; threshold crossings are emitted in `warnings` and shown as
+`WARN`. A non-CPU resource failure such as excessive loss is still repeated at
+the exact candidate and becomes `INCONCLUSIVE` if unresolved; it never becomes
+an applicable fallback.
+
+An observation which fails a hard loss, route, latency or measurement-integrity
+gate remains diagnostic evidence, not a safe configuration. It can never
+expose **Apply SQM** or be consumed by Scheduled Auto-Apply.
 
 ## Fair Review outcomes
 
 Fair separates a throughput-first decision from unattended quality approval:
 
-1. **Apply the best safe Fair SQM candidate** keeps the measured 90% throughput
-   floor. It is automatic only when class C is met; otherwise it is an explicit
-   manual choice.
+1. **Apply the best safe Fair SQM candidate** is automatic only when both the
+   90% throughput objective and class C are met. A clean candidate that misses
+   either objective or the 50% historical trust boundary is an explicit manual
+   choice.
 2. **Keep current settings** closes a re-run without writing configuration, or
    cancels creation of a new instance.
 3. **Disable autorate and SQM** appears only for an existing managed instance
+   whose shaped result remains above the 50% historical trust boundary, and
    when a simultaneous bidirectional unshaped control is valid, SQM was proved
    paused, no temporary shaper existed, forwarded-background counters were
    available and clean, the no-SQM grade is no worse, its effective delay is
    no more than 10 ms above the shaped candidate, and both download and upload
    improve by at least 2%.
 
-The third action is a comparison suggestion, never the preselected choice.
+The third action is a comparison suggestion, never the preselected choice. A
+candidate below the historical trust boundary retains **Apply SQM** for manual
+review but suppresses **Disable autorate and SQM**.
 The user must select it and confirm a red warning. Apply Guard then preserves
 the instance and owned queue configuration as disabled, restarts the normal
 service transaction, and proves that no instance daemon, target/IFB CAKE qdisc,
@@ -445,8 +500,12 @@ When an eligible Review action is applied, LuCI uses a guarded UCI transaction r
 than treating a browser RPC success as sufficient proof. The guard snapshots
 the complete `cake-autorate` and `sqm` packages, starts the normal rollback
 window, verifies the exact daemon/qdisc/IFB/redirect runtime, removes its
-temporary enrollment markers inside that same rollback window, and only then
-confirms. A missing or ambiguous confirmation is reconciled against exact
+temporary enrollment markers inside that same rollback window, and then asks
+rpcd to confirm through the same authenticated LuCI session that started the
+transaction. The root supervisor never attempts to impersonate that session.
+Only after rpcd has synchronously closed the rollback transaction may the
+supervisor finalize and remove its receipt. A missing or ambiguous
+confirmation is reconciled against exact
 pre-change and marker-free expected-final fingerprints; an indeterminate state
 remains recoverable rather than being declared successful.
 
@@ -456,13 +515,36 @@ before any SQM or daemon mutation. It either verifies the live transaction,
 recovers a provably stale boot/transaction pair, or refuses the start; a
 partial persistent marker can no longer be mistaken for a successful apply.
 
+RC24 runs that receipt supervisor in its own `cake-autorate-apply-guard` procd
+service. This separation is a correctness requirement: rpcd rollback reloads
+the main `cake-autorate` service, so a supervisor registered as one of its
+instances would be killed before it could verify the restored snapshots and
+publish the terminal receipt. The independent service derives the transaction
+from `verify-init` itself, validates the root-owned token, and never trusts a
+token supplied by LuCI or by the main service. A proved rollback also reloads
+the LuCI page immediately so stale in-memory enrollment markers cannot appear
+as ordinary unsaved changes and be committed a second time. This token-driven
+helper is intentionally disabled at boot; the main service starts it only for
+a verified live transaction. Enabling it permanently would add no crash
+recovery and would emit a false missing-token warning on normal boots.
+
+Auto-managed `sqm_interface`, `ul_if`, and `dl_if` values are retained while
+their form controls are hidden. They are still not treated as ownership proof:
+preflight first validates the safe SQM section name, its
+`_cake_autorate_managed` owner and the queue target. In automatic mode the
+selected `wan_if` is authoritative; manual interface aliases take precedence
+only when `auto_interface_preset=0`.
+
 ## Tests
 
 Rust unit tests cover every stable/variable profile matrix, profile aliases,
 Gaming `diffserv4`, invalid samples, JSON output, three-ratio separation, typed
 gates, unreliable-measurement repeat, repeated floor-seeking increases,
 quality-boundary bisection, all three profile orderings, strict grade
-boundaries, Fair target/fallback separation and no-SQM comparison.
+boundaries, Fair target/fallback separation and no-SQM comparison. RC23 adds
+the reliable-realization CPU-saturation regression, exact-rate CPU repeat,
+upper/floor probes, continued asymmetric upload search, non-null diagnostic
+selection and fail-closed repeated non-CPU resource failure.
 The shell lifecycle test uses isolated mock helpers
 to verify profile/job binding, exact temporary CAKE tokens, progress/result
 output, job-local server pinning, reflector diversity, one-second ICMP pacing,
@@ -470,7 +552,9 @@ persistent transport parsing, phase-background evidence, bounded RAM history,
 valid-JSON/nonzero-exit rejection, atomic result publication, process-group
 timeout/cancellation, kernel-UUID temporary identities, collision retry,
 missing/invalid UUID sources, orphan cleanup, recovery, and both speed-test
-and temporary shaper cleanup traps. Apply Guard tests reject incomplete,
+and temporary shaper cleanup traps. It also forces detailed terminal staging
+to fail and requires a compact schema-valid terminal with the original failure
+reason. Apply Guard tests reject incomplete,
 contaminated, one-direction, below-2%-gain and runtime-residue disable
 attempts. Real-router acceptance also checks per-member route identity and that
 the unselected autorate/SQM instance continues running.

@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 include $(TOPDIR)/rules.mk
+ifeq ($(DISABLE_FAKEROOT),1)
+override FAKEROOT :=
+endif
 
 PKG_NAME:=cake-autorate-rs
-PKG_VERSION:=1.0_rc22
+PKG_VERSION:=1.0_rc25
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=woffko

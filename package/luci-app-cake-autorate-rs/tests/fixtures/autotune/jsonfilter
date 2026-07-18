@@ -276,13 +276,16 @@ case "$expression" in
 		printf '%s\n' "$input" | sed -n 's/.*"forwarded_background":{[^}]*"upload_limit_kbps":\([0-9.][0-9.]*\).*/\1/p'
 		;;
 	'@.pass')
-		printf '%s\n' "$input" | sed -n 's/^.*"pass":\(true\|false\),.*/\1/p'
+		printf '%s\n' "$input" | awk -F '"pass":' 'NF > 1 { value=$2; sub(/,.*/, "", value); print value; exit }'
 		;;
 	'@.hard_pass')
 		printf '%s\n' "$input" | sed -n 's/^.*"hard_pass":\(true\|false\),.*/\1/p'
 		;;
 	'@.safety_pass')
 		printf '%s\n' "$input" | sed -n 's/^.*"safety_pass":\(true\|false\),.*/\1/p'
+		;;
+	'@.profile_objectives_met')
+		printf '%s\n' "$input" | sed -n 's/^.*"profile_objectives_met":\(true\|false\),.*/\1/p'
 		;;
 	'@.quality_target_met')
 		printf '%s\n' "$input" | sed -n 's/^.*"quality_target_met":\(true\|false\),.*/\1/p'

@@ -120,6 +120,27 @@ For calibration, external IPv4 and speed-test server ID are also held constant
 between phases. See [MULTIWAN.md](MULTIWAN.md) for the operational state
 machine.
 
+## Calibration datapath snapshot
+
+Auto-Tune resolves the selected logical/L3 route to a physical ingress device
+when netifd exposes that relationship. For each readable RX queue it records
+the hexadecimal Linux `rps_cpus` mask. Bit `n` selects CPU `n`; comma-separated
+groups extend the mask beyond one machine word. The narrow warning condition is:
+
+```text
+single_cpu_rps = rx_queue_count > 1
+                 and every queue has the same mask
+                 and popcount(mask) = 1
+```
+
+This condition explains how multiple queues can still deliver their software
+RX work to one CPU. It is not proof that RPS is the only bottleneck. Hardware
+RSS, interrupt affinity, XPS, NAPI placement, PPPoE, IFB and CAKE/qdisc locking
+are outside this snapshot and may dominate. The snapshot also records
+OpenWrt's `network.globals.packet_steering` mode, but Auto-Tune never writes it
+or any queue/IRQ affinity file. `steering_flows` is intended for local-socket
+flow steering and does not distribute ordinary forwarded client traffic.
+
 ## Achieved rate and load
 
 The daemon samples Linux interface byte counters. Over an elapsed interval
@@ -166,8 +187,10 @@ candidate_capacity   = 100 * C / O
 ```
 
 Candidate realization determines whether the measurement exercised the
-candidate strongly enough to support an inference. Capacity retention is the
-throughput safety gate. Candidate capacity shows how far the proposed shaper
+candidate strongly enough to support an inference. Capacity retention is
+compared with both the profile objective and a historical-throughput trust
+boundary.
+Candidate capacity shows how far the proposed shaper
 already sits below the measured link. For example, `A/C = 92.5%` and `A/O =
 77.3%` means the test realized the candidate well, but the candidate/result
 combination retained too little observed capacity. Calling both values
@@ -188,29 +211,38 @@ cap     = factor_cap * H
 |---|---|---|
 | Gaming | `(0.60, 0.82, 0.92, 1.02)` | `(0.35, 0.75, 1.20, 1.60)` |
 | Best overall | `(0.70, 0.88, 0.95, 1.05)` | `(0.40, 0.85, 1.25, 1.80)` |
-| Fair | `(0.80, 0.94, 0.98, 1.08)` | `(0.60, 0.92, 1.30, 1.90)` |
+| Fair | `(0.35, 0.94, 0.98, 1.08)` | `(0.35, 0.92, 1.30, 1.90)` |
 
 A direction is variable when
 `(H - L) / max(median, 1) >= 0.15`; adaptive ceiling is proposed when either
 direction is variable. Rates are rounded to 100 kbit/s and constrained so
-`minimum <= base <= maximum <= cap`.
+`minimum <= base <= maximum <= cap`. Directional Full Auto-Tune revisions
+accept a bounded base scale of `0.35..1.5`; the lower limit matches Fair's
+search floor, while each proposal's minimum/maximum and observed-low ceiling
+remain authoritative.
 
 The profile also fixes the validation contract:
 
-| Profile | Retention floor `F` | Loaded-delay ceiling | Loss ceiling | Target |
+| Profile | Retention objective `F` | Loaded-delay ceiling | Loss ceiling | Target |
 |---|---:|---:|---:|---:|
 | Gaming | 0.70 | `< 5 ms` | 1% | A+ |
 | Best overall | 0.80 | `< 30 ms` | 3% | A |
 | Fair | 0.90 | `< 200 ms` | 5% | C (soft) |
 
-All profiles use the same 80–110% realization interval and 85% effective CPU
-ceiling. Effective CPU is the greater of aggregate utilization and the busiest
-core; softirq utilization is recorded separately for diagnosis.
+All profiles use the same 80–110% realization interval, a separate 50%
+historical-retention trust boundary, and an 85% effective-CPU warning threshold.
+Effective CPU is the greater of aggregate utilization and the busiest core.
+Both realization bounds are hard shaper-integrity gates; a repeated low value
+causes the search to test a lower candidate rather than accepting a CAKE rate
+above the measured bottleneck. The CPU threshold is advisory. Diagnostics
+retain mean and p95 effective CPU, sample count, samples and
+longest consecutive run above 85%, softirq peak, and softirq p95.
 These target grades describe the local loaded-delay contract; they are not a
 guarantee about remote servers, Wi-Fi, ISP policy or another bottleneck.
 Gaming and Best overall require every quality gate. Fair marks its class-C
-latency gates as a quality goal while retaining measurement integrity,
-realization, 90% capacity, CPU, route and background evidence as hard gates.
+latency gates as a quality goal while retaining measurement integrity, loss,
+route and background evidence as hard gates. The 50% historical comparison is
+advisory; its 90% retention value remains the Auto-Apply throughput objective.
 
 The profile also fixes the exact CAKE class policy used by both temporary
 validation and final SQM. Gaming uses `diffserv4` in both directions without
@@ -233,14 +265,14 @@ Changing a rule, its profile, order, address, port, or class after calibration
 invalidates the Review/Scheduled Auto-Apply evidence instead of applying a
 proposal measured under a different packet policy.
 
-The packaged hard realization gate is two-sided:
+The packaged realization interval is two-sided:
 
 ```text
 80% <= candidate_realization <= 110%
 ```
 
-The lower bound rejects a test which did not exercise the candidate. The upper
-bound rejects a result which could not have been produced by the claimed CAKE
+The lower bound triggers bounded repetition followed by a lower controlled
+candidate test. The upper bound rejects a result which could not have been produced by the claimed CAKE
 rate and therefore indicates a bypassed, replaced, or otherwise unenforced
 temporary shaper. The shell lifecycle additionally verifies the exact owned
 CAKE/IFB/redirect topology immediately after every shaped speed test.
@@ -263,17 +295,18 @@ Full Auto-Tune because each sample includes a new handshake. ICMP validation
 emits at most one batch per second and requires targets from at least three
 independent reflector families.
 
-Let `F` be the required capacity-retention fraction and
+Let `F` be the profile capacity-retention objective and
 `r = candidate_realization / 100`. Assuming a bounded revision preserves the
-observed realization, the smallest candidate that can satisfy the safety floor
+observed realization, the smallest candidate predicted to satisfy that objective
 is:
 
 ```text
 C_required = ceil_100(O * F / r)
 ```
 
-The typed validator evaluates realization, retention, both latency deltas,
-loss, and effective CPU as explicit gates. The profile optimizer then treats
+The typed validator evaluates realization, profile retention, the 50% trust
+boundary, both latency deltas, loss, and effective CPU as explicit gates. The
+profile optimizer then treats
 each valid shaped observation as a point
 
 ```text
@@ -290,34 +323,63 @@ resolution = ceil_100(max(0.005 * O, 100 kbit/s))
 ```
 
 An unreliable 80–110% realization may collect up to three observations at the
-same candidate. A low-realization ceiling is considered repeatable only when at
-least one pair differs by no more than 5%; three mutually inconsistent samples
-remain inconclusive. If a clean candidate misses only the hard capacity floor,
-the next test is `C_required`; if measured realization changed, the same
-formula is applied again rather than lowering `F`. The observed-low upper bound
-is tested explicitly. Once a quality pass and a higher quality fail are known,
+same candidate. A low-realization ceiling is considered repeatable when at
+least one pair differs by no more than 5%. If all three remain mutually
+inconsistent but clean, the worst achieved sample is still usable only to seed
+a lower bounded candidate. In both cases the lower candidate must itself pass
+the hard realization interval before selection. If a clean controlled
+candidate misses only the profile objective,
+the observed-low upper bound is tested explicitly. A stable optimum remains
+reviewable even when `F` or the 50% historical trust boundary is not reached. Once a
+quality pass and a higher quality fail are known,
 their interval is bisected until it is no wider than `resolution` or the
 attempt budget is exhausted. Download can be frozen while upload continues,
 and the exact selected pair receives a final joint confirmation.
 
-If low realization repeats at the same candidate, the optimizer probes the
-observed-low upper bound. A repeatable upper-bound failure to retain `F` proves
-that no candidate inside the legal interval can satisfy the profile floor:
+If low realization repeats at the same candidate, the optimizer computes a
+lower retest from the worst clean achieved sample, targeting the middle of the
+allowed realization interval. For volatile evidence, all three observations
+must independently satisfy loss and quality constraints; the worst clean
+point, not the largest burst, seeds the retest. Falling below 50% after a
+controlled retest marks unusually large historical variation but does not
+prove a cellular datapath fault:
 
 ```text
-repeatable_ceiling = exists i != j: abs(A_upper_i - A_upper_j) /
-                                      max(A_upper_i, A_upper_j) <= 0.05
-floor_infeasible   = repeatable_ceiling and
-                     min(A_upper_i, A_upper_j) < O * F
-compute_limited    = floor_infeasible and
-                     CPU_upper_i >= CPU_limit and
-                     CPU_upper_j >= CPU_limit
+repeatable_ceiling = exists i != j: abs(A_i - A_j) / max(A_i, A_j) <= 0.05
+C_retest           = ceil_100(min(A_i) / 0.90)
+trust_warning      = controlled(A_retest, C_retest) and A_retest < O * 0.50
 ```
 
-`compute_limited` yields the typed compute-ceiling reason; otherwise the reason
-is a shaper/datapath ceiling. The upper-bound point remains diagnostic and is
-not reclassified as safe. No correction lowers `F`, and no unsafe point can
-become an SQM apply action.
+For Fair, the 200 ms class-C boundary is a soft optimization target rather
+than permission to preserve an oversized shaper. If a lower controlled
+candidate improves a result at or above that boundary, the old observed-low
+rate does not block the decrease. The selected rate still has to realize
+80–110%, so the shaped queue is demonstrably on the router rather than in the
+5G modem.
+
+CPU pressure is recorded independently:
+
+```text
+cpu_warning = CPU_peak > CPU_advisory_limit
+```
+
+RC25 does not use `cpu_warning` in `resource_safe`, candidate selection,
+correction, retry, capacity-floor feasibility or Apply eligibility. This avoids
+treating a one-second busiest-core peak, local load-generator work or softirq
+placement as proof that the link configuration is unsafe. The CPU gate remains
+in typed JSON with `required=false`; a failed advisory gate is published in
+`warnings`, not `reasons`, and is excluded from the validation score.
+
+A non-CPU resource failure is repeated at the exact rate and remains
+inconclusive if it does not resolve. Under-realized points are never selected.
+Controlled points that miss `F` are manual-only; points below 50% carry an
+additional trust warning and likewise can never Auto-Apply.
+
+Download and upload searches use separate directional phases and histories.
+That independence avoids letting one direction's candidate overwrite the
+other's frontier; it does not assume independent hardware. The exact selected
+pair is jointly confirmed so shared CPU, interrupts, buffers, IFB/PPPoE work,
+or qdisc contention can still reject the combined result.
 
 The profile-specific ordering is:
 
@@ -339,13 +401,12 @@ Fair:
 ```
 
 Thus Fair makes throughput primary and grade secondary, while Gaming and Best
-overall maximize throughput subject to A+ or A. If Gaming cannot prove A+
-above its 70% floor, it offers the best measured grade; if Best overall cannot
-prove A above 80%, it offers the balanced optimum. These are clearly marked
-manual-only fallbacks. Fair can complete below soft C only when all hard gates,
-including 90% capacity retention, still pass. No diagnostic score or profile
-fallback can override a hard gate, and scheduled Auto-Apply accepts only a
-target result.
+overall maximize throughput subject to A+ or A. If Gaming cannot prove A+ or
+its 70% objective, it offers the best safe measured result; Best overall does
+the same for A and 80%. Fair can complete for manual review when its 90%
+objective, 50% trust boundary, or soft C target is missed. These results are manual-only. No
+diagnostic score or fallback can override a hard gate, and scheduled
+Auto-Apply accepts only a target result which also meets the profile objective.
 
 ### Fair no-SQM comparison
 
@@ -360,6 +421,7 @@ gain_ul = 100 * (U_ul / S_ul - 1)
 The disable-SQM suggestion exists only when all of these are true:
 
 ```text
+historical_trust_met = true
 grade_unshaped <= grade_shaped
 delta_unshaped <= delta_shaped + 10 ms
 gain_dl >= 2%
