@@ -1538,10 +1538,12 @@ async function testApplyGuardTransaction() {
 		setTimeout(resolve) { resolve(); },
 	};
 
-		function transactionFixture(options = {}) {
+	function transactionFixture(options = {}) {
 		global.window.location = { href: 'https://router/settings#pending' };
 		const values = {
-			'cake-autorate': { wan_sqm: { '.name': 'wan_sqm', '.type': 'cake_autorate' } },
+			'cake-autorate': { wan_sqm: {
+				'.name': 'wan_sqm', '.type': 'cake_autorate', enabled: '1', sqm_enabled: '1',
+			} },
 			sqm: {},
 		};
 			const calls = [];
@@ -1682,18 +1684,25 @@ async function testApplyGuardTransaction() {
 		assert.equal(values.sqm.cake_autorate_apply_wan_sqm._autotune_apply_guard, '1',
 			'SQM must be enrolled in the same rollback transaction before apply');
 		const view = {
-			handleSave() { calls.push('view.handleSave'); return Promise.resolve(); },
+			handleSave() {
+				calls.push('view.handleSave');
+				values['cake-autorate'].wan_sqm.enabled = '0';
+				values['cake-autorate'].wan_sqm.sqm_enabled = '0';
+				return Promise.resolve();
+			},
 		};
-		return { helpers, view, calls, token };
+		return { helpers, view, calls, token, values };
 	}
 
 	try {
 			transactionFixture({ preexistingGuard: true });
 
-			const success = transactionFixture();
+		const success = transactionFixture();
 		await success.helpers.runGuardedSaveApply(success.view, {});
+		assert.equal(success.values['cake-autorate'].wan_sqm.enabled, '1');
+		assert.equal(success.values['cake-autorate'].wan_sqm.sqm_enabled, '1',
+			'guarded apply must preserve the wizard-staged enabled service state');
 		assert.deepEqual(success.calls, [
-			'view.handleSave',
 			'/usr/libexec/cake-autorate-rs/apply-guard:arm',
 			'uci.save-token',
 			'callApply:30:true',
@@ -1708,7 +1717,9 @@ async function testApplyGuardTransaction() {
 			/apply response lost/);
 		assert.equal(global.window.location, 'https://router/settings',
 			'exact client-side rollback must discard the staged LuCI model by reloading');
-		assert.equal(lostApply.calls[0], 'view.handleSave');
+		assert.equal(lostApply.calls[0], '/usr/libexec/cake-autorate-rs/apply-guard:arm');
+		assert(!lostApply.calls.includes('view.handleSave'),
+			'a staged exact proposal must not be rewritten through hidden modal fields');
 		assert.equal(lostApply.calls.filter(call => call.endsWith(':verify-rollback')).length, 2);
 		assert(lostApply.calls.includes('/usr/libexec/cake-autorate-rs/apply-guard:abort'),
 			'an unknown apply response must retain snapshots until exact rollback is proven');
@@ -1718,7 +1729,7 @@ async function testApplyGuardTransaction() {
 			/server rolled-back/);
 		assert.equal(global.window.location, 'https://router/settings',
 			'an authoritative server rollback must reload the marker-free configuration');
-		assert.equal(serverRollback.calls[0], 'view.handleSave');
+		assert.equal(serverRollback.calls[0], '/usr/libexec/cake-autorate-rs/apply-guard:arm');
 		assert(!serverRollback.calls.some(call => call.endsWith(':verify-rollback')),
 			'a server rollback receipt is already authoritative');
 		assert(!serverRollback.calls.includes('/usr/libexec/cake-autorate-rs/apply-guard:abort'),

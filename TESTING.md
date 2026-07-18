@@ -1791,3 +1791,35 @@ instance-scoped priorities with no JavaScript/RPC errors or horizontal
 overflow. Artifacts are retained under
 `/home/w0w/cake-autorate-rs-owrt/test-logs/rc26-playwright-77` and
 `/home/w0w/cake-autorate-rs-owrt/test-logs/rc26-playwright-100`.
+
+## RC26-r4 guarded Save & Apply regression
+
+The exact Full Auto-Tune proposal is staged before the user presses the global
+LuCI **Save & Apply** button. RC26-r3 incorrectly invoked the generic LuCI
+form save a second time in that guarded path. Modal-only force-write controls
+that were not rendered at the time could contribute their fallback value `0`;
+for an enabled managed instance this could write both `enabled=0` and
+`sqm_enabled=0`, remove the owned SQM queue on restart, and make the next
+Auto-Tune preflight correctly refuse the disabled queue.
+
+RC26-r4 arms the transaction directly from the already staged proposal, then
+saves only the fresh guard token and its expiry. Normal settings changes with
+no Auto-Tune marker retain the ordinary LuCI save path. The JavaScript
+regression fixture deliberately models a generic save which attempts to set
+both service flags to zero and proves that the guarded path never calls it.
+
+The same release normalizes the two policy-number fields at the exact manifest
+boundary: JSON's `70.0`/`5.0` and JavaScript/UCI's `70`/`5` compare as the same
+numeric value, while a real numeric mismatch remains rejected with the exact
+UCI key named in the diagnostic. The complete Apply Guard lifecycle test passes
+when run sequentially; the settings test, package extraction/source-hash
+comparison, shell syntax check and `git diff --check` also pass.
+
+LuCI `1.0_rc26-r4` was installed on both the x86_64 Multi-WAN and rockchip/armv8
+routers. Before/after hashes of `cake-autorate`, `sqm` and `network` were
+identical on each router; their existing daemons and CAKE qdiscs remained
+active. A cache-bypassed Playwright audit on the x86_64 router verified Status,
+Edit and the Re-run Auto-Tune entry at desktop and 390-pixel mobile widths with
+the RC26-r4 version banner, no page/console/RPC errors and no horizontal
+overflow. Evidence is retained under
+`/home/w0w/cake-autorate-rs-owrt/test-logs/rc26-r4-save-apply-77`.

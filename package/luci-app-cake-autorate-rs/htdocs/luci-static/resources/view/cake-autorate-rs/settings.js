@@ -3374,7 +3374,13 @@ function runGuardedSaveApply(view, ev) {
 	var applyStarted = false;
 	var applyDeadlineMs = 0;
 
-	return view.handleSave(ev).then(function() {
+	/* The wizard already staged and saved the exact proposal plus markers into
+	 * rpcd's UCI transaction. Calling the generic view.handleSave() here would
+	 * serialize every modal-only GridSection option a second time. Unrendered
+	 * forcewrite flags can then fall back to "0" (notably enabled), silently
+	 * changing an enabled proposal into a disabled instance before the guard is
+	 * armed. Only the guard token fields still need to be added and saved below. */
+	return Promise.resolve().then(function() {
 		return armAutotuneApplyGuards();
 	}).then(function(armed) {
 		guards = armed;
