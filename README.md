@@ -51,15 +51,25 @@ socket libraries; ordinary OpenWrt runtime dependencies remain explicit below.
 
 ## Current package tree
 
-The RC26 release provides these OpenWrt 25.12.5 APKs:
+The RC26-r4 release provides these OpenWrt 25.12.5 APKs:
 
 - `cake-autorate-rs-1.0_rc26-r1-x86_64.apk` — x86_64 autorate daemon.
 - `cake-autorate-rs-1.0_rc26-r1-aarch64_generic.apk` — rockchip/armv8
   autorate daemon.
-- `luci-app-cake-autorate-rs-1.0_rc26-r1.apk` — architecture-independent LuCI
+- `luci-app-cake-autorate-rs-1.0_rc26-r4.apk` — architecture-independent LuCI
   interface and SQM integration.
 
-The current source tree is the RC26 release candidate. RC26 fixes repeated
+The current source tree is the RC26-r4 release candidate. RC26-r4 fixes the
+guarded Full Auto-Tune **Save & Apply** path. Once the wizard had staged an
+exact proposal, the top-level LuCI action serialized its modal-only fields a
+second time; non-rendered force-write flags could fall back to `0`, disabling
+the autorate instance and its managed SQM queue. Guarded apply now only arms
+the already-staged exact proposal; ordinary Save & Apply still uses the normal
+LuCI form save. RC26-r4 also canonicalizes JSON decimal policy values such as
+`70.0` and `5.0` before comparing their UCI representations (`70` and `5`) in
+the exact Apply Guard manifest.
+
+RC26 fixes repeated
 Full Auto-Tune monitor cleanup: the tracked background PID is now the native
 transport probe rather than an intermediate `ash` process, and natural monitor
 exit or PID reuse is recognized as successful cleanup without ever signalling
@@ -849,7 +859,7 @@ them together. For x86_64:
 ```sh
 apk add --allow-untrusted \
   /root/cake-autorate-rs-1.0_rc26-r1-x86_64.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc26-r1.apk
+  /root/luci-app-cake-autorate-rs-1.0_rc26-r4.apk
 ```
 
 For rockchip/armv8 (`aarch64_generic`):
@@ -857,7 +867,7 @@ For rockchip/armv8 (`aarch64_generic`):
 ```sh
 apk add --allow-untrusted \
   /root/cake-autorate-rs-1.0_rc26-r1-aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc26-r1.apk
+  /root/luci-app-cake-autorate-rs-1.0_rc26-r4.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:
@@ -877,16 +887,16 @@ x86_64:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc26-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc26-x86_64.sh
+tar -xzf cake-autorate-rs-1.0-rc26-r4-openwrt-25.12.5-x86_64-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc26-r4-x86_64.sh
 ```
 
 Banana Pi R2 Pro and other OpenWrt 25.12.5 rockchip/armv8 devices:
 
 ```sh
 cd /root
-tar -xzf cake-autorate-rs-1.0-rc26-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
-/root/install-cake-autorate-rs-1.0-rc26-aarch64_generic.sh
+tar -xzf cake-autorate-rs-1.0-rc26-r4-openwrt-25.12.5-rockchip-armv8-offline-bundle.tar.gz
+/root/install-cake-autorate-rs-1.0-rc26-r4-aarch64_generic.sh
 ```
 
 The installer resolves its own location, so it also works when the extracted

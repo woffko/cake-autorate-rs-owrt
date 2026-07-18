@@ -174,12 +174,22 @@ result.profile_outcome = {
 for (const direction of [ 'download', 'upload' ]) {
 	result.profile_search[direction].profile = 'gaming';
 }
-fs.writeFileSync(process.argv[3], JSON.stringify(result));
+let serialized = JSON.stringify(result);
+/* Match serde_json's representation of integral f64 policy values. LuCI
+ * stages these through JavaScript String(), which intentionally normalizes
+ * them back to integer-looking UCI strings. */
+serialized = serialized
+	.replaceAll('"capacity_retention_min_percent":70', '"capacity_retention_min_percent":70.0')
+	.replace('"delay_max_ms":5', '"delay_max_ms":5.0')
+	.replace('"icmp_delta_max_ms":5', '"icmp_delta_max_ms":5.0')
+	.replace('"transport_delta_max_ms":5', '"transport_delta_max_ms":5.0');
+fs.writeFileSync(process.argv[3], serialized);
 EOF
 gaming_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint")"
 gaming_token="$(printf '%s\n' "$gaming_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
 [ "$(uci -c "$guard/$gaming_token/expected" -q get cake-autorate.wan_sqm.autotune_profile)" = gaming ]
 [ "$(uci -c "$guard/$gaming_token/expected" -q get cake-autorate.wan_sqm.quality_target_delay_ms)" = 5 ]
+[ "$(uci -c "$guard/$gaming_token/expected" -q get cake-autorate.wan_sqm.throughput_guard_retention_percent)" = 70 ]
 [ "$(uci -c "$guard/$gaming_token/expected" -q get cake-autorate.wan_sqm.sqm_script)" = layer_cake.qos ]
 [ "$(uci -c "$guard/$gaming_token/expected" -q get cake-autorate.wan_sqm.sqm_squash_dscp)" = 0 ]
 [ "$(uci -c "$guard/$gaming_token/expected" -q get cake-autorate.wan_sqm.sqm_iqdisc_opts)" = diffserv4 ]
@@ -262,10 +272,14 @@ printf '%s\n' "$verified" | grep -q '"state":"verified"'
 
 # Any stale or additional protected-section edit is rejected before init.
 uci -q set cake-autorate.wan_sqm.max_dl_shaper_rate_kbps=89999
-if $helper verify-init >/dev/null 2>&1; then
+if mismatch="$($helper verify-init 2>/dev/null)"; then
 	echo "apply guard accepted a stale CAKE manifest" >&2
 	exit 1
 fi
+printf '%s\n' "$mismatch" | grep -q 'cake-autorate.wan_sqm.max_dl_shaper_rate_kbps' || {
+	echo "apply guard did not identify the mismatched UCI option without diff" >&2
+	exit 1
+}
 cp "$guard/$token/expected/cake-autorate" "$config/cake-autorate"
 
 # Ordered lists are semantic: active/spare reflector order must not be hidden

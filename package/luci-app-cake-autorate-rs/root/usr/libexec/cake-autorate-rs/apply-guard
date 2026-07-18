@@ -93,16 +93,24 @@ manifest_key_mismatch() {
 	local expected_file="$1"
 	local live_file="$2"
 
-	diff -u "$expected_file" "$live_file" 2>/dev/null | awk '
-		/^[+-]/ {
-			if ($0 ~ /^--- / || $0 ~ /^\+\+\+ /)
-				next;
-			sub(/^[+-]/, "", $0);
-			sub(/=.*/, "", $0);
-			print;
-			exit 0;
+	# Minimal OpenWrt images commonly omit diff. Both inputs are already
+	# sorted canonical UCI output, so compare them directly with POSIX awk and
+	# retain a useful option name without adding a package dependency.
+	awk '
+		FNR == NR { expected[++expected_count] = $0; next }
+		{ live[++live_count] = $0 }
+		END {
+			limit = expected_count > live_count ? expected_count : live_count
+			for (i = 1; i <= limit; i++) {
+				if (expected[i] == live[i])
+					continue
+				line = expected[i] != "" ? expected[i] : live[i]
+				sub(/=.*/, "", line)
+				print line
+				exit
+			}
 		}
-	'
+	' "$expected_file" "$live_file"
 }
 
 current_boot_id() {
@@ -136,7 +144,7 @@ is_decimal() {
 
 numbers_equal() {
 	is_decimal "$1" && is_decimal "$2" || return 1
-	awk -v first="$1" -v second="$2" 'BEGIN {
+	LC_ALL=C awk -v first="$1" -v second="$2" 'BEGIN {
 		delta = (first + 0) - (second + 0)
 		if (delta < 0) delta = -delta
 		exit(delta > 0.000001)
@@ -461,7 +469,7 @@ max_rate() {
 	current="$1"
 	minimum="$2"
 	fallback="$3"
-	awk -v current="$current" -v minimum="$minimum" -v fallback="$fallback" 'BEGIN {
+	LC_ALL=C awk -v current="$current" -v minimum="$minimum" -v fallback="$fallback" 'BEGIN {
 		if (current !~ /^[0-9]+([.][0-9]+)?$/) current = fallback
 		value = current + 0
 		if (value < minimum + 0) value = minimum + 0
@@ -472,7 +480,7 @@ max_rate() {
 normalized_number() {
 	current="$1"
 	fallback="$2"
-	awk -v current="$current" -v fallback="$fallback" 'BEGIN {
+	LC_ALL=C awk -v current="$current" -v fallback="$fallback" 'BEGIN {
 		if (current !~ /^-?[0-9]+([.][0-9]+)?$/) current = fallback
 		if (current !~ /^-?[0-9]+([.][0-9]+)?$/) exit 1
 		printf "%.15g\n", current + 0
@@ -702,6 +710,14 @@ build_expected_manifest() {
 	fi
 
 	load_profile_contract
+	# serde_json preserves integral floating-point policy values as e.g. 70.0
+	# and 5.0, while JavaScript String() stages the same numbers as 70 and 5.
+	# UCI compares strings, so canonicalize proposal policy numbers before
+	# constructing the exact manifest.
+	validation_retention_uci="$(normalized_number "$validation_retention" "$validation_retention")" ||
+		die "The Full Auto-Tune capacity-retention policy cannot be normalized."
+	validation_transport_uci="$(normalized_number "$validation_transport" "$validation_transport")" ||
+		die "The Full Auto-Tune transport-latency policy cannot be normalized."
 
 	dl_min="$(proposal_rate '@.proposal.download.minimum_kbps')" || die "The Full Auto-Tune proposal contains an invalid download minimum."
 	dl_base="$(proposal_rate '@.proposal.download.base_kbps')" || die "The Full Auto-Tune proposal contains an invalid download base."
@@ -833,8 +849,8 @@ build_expected_manifest() {
 	expected_set "$job" adaptive_ceiling_failed_bound_ttl_s "$adaptive_ttl"
 	expected_set "$job" transport_latency_enabled 1
 	expected_set "$job" throughput_guard_enabled 1
-	expected_set "$job" throughput_guard_retention_percent "$validation_retention"
-	expected_set "$job" quality_target_delay_ms "$validation_transport"
+	expected_set "$job" throughput_guard_retention_percent "$validation_retention_uci"
+	expected_set "$job" quality_target_delay_ms "$validation_transport_uci"
 	expected_set "$job" throughput_reference_dl_p20_kbps "$dl_low"
 	expected_set "$job" throughput_reference_dl_p50_kbps "$dl_median"
 	expected_set "$job" throughput_reference_ul_p20_kbps "$ul_low"
