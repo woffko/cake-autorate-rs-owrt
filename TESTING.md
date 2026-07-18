@@ -1739,3 +1739,55 @@ candidate as current evidence. The deterministic lifecycle suite covers both
 the successful retry and the double-failure path. No test run may write UCI
 before explicit review, and the original daemon and CAKE/IFB runtime state must
 be restored.
+
+## RC26 repeated Auto-Tune monitor cleanup regression
+
+An anonymized x86_64 Multi-WAN router exposed a lifecycle race when a completed
+profile calibration was followed by a Gaming run. The first Gaming validation
+passed, but a later phase was rejected with `A validation monitor could not be
+terminated`. Runtime recovery still succeeded and no UCI configuration was
+written.
+
+The retained RAM evidence showed that completed transport-monitor raw files
+continued growing across later phases: representative files reached 84, 68 and
+50 rows although one directional speed test produced about 16–17 probe rows.
+The backgrounded shell function made `$!` identify an intermediate BusyBox
+`ash` process; terminating that process did not terminate its native WebSocket
+probe child. Removing the CPU/ICMP marker then exposed a second race: a monitor
+could exit naturally between two `/proc` checks, and absence or safe PID reuse
+was incorrectly reported as cleanup failure.
+
+RC26 makes the asynchronous shell replace itself with the native probe, so the
+recorded PID owns the actual process. Cleanup considers a missing process,
+zombie, or changed start time proof that the original owned monitor is gone;
+it never signals the new owner of a reused PID. Deterministic tests cover both
+the between-check exit and PID-reuse paths and prove that the tracked transport
+PID terminates without an orphan.
+
+The patched router then completed a fresh Gaming search at score 100 with A+
+quality. Its first two download/upload raw files stopped at 17/16 and 16/16
+rows, exactly one native probe existed during each phase, and none remained at
+completion. The terminal reported `configuration_written=false`,
+`runtime_restored=true`, and `recovery_pending=false`; pre/post hashes of the
+cake-autorate, SQM, network and mwan3 configurations were identical, both
+autorate instances resumed, and the original CAKE rates were restored. The
+source gate also completed 166 Rust tests, the full Auto-Tune lifecycle suite,
+and the scheduler and crash-recovery suites.
+
+Both RC26 OpenWrt 25.12.5 SDK builds completed. Individual APK SHA256 values
+are `9f22375b2ca3da8e0851f0806559b86a30ee276a3c8b1d2ac3a6baefa90ccee4`
+for x86_64, `af33294df4305bd51a54bd6330b3dc818a6baf90249f03d3914f495cbe7a7e1f`
+for aarch64_generic, and
+`f30f62f3313cfd8b0d70710d0410e6321ba6bfa694d5638de52ddd38adaeb2fe`
+for the identical noarch LuCI package. Both 68-package offline repositories
+resolve and extract into clean architecture-specific roots without network or
+maintainer scripts, and both installers pass `sh -n` and manifest validation.
+
+The final packages were upgraded in place on the x86_64 Multi-WAN and armv8
+cellular routers without changing their pre-existing cake-autorate/SQM hashes
+or queue rates. Desktop and 390-pixel mobile Playwright audits verified daemon
+and LuCI `1.0_rc26-r1`, Status, Graphs, Settings, Re-run Auto-Tune, Edit and
+instance-scoped priorities with no JavaScript/RPC errors or horizontal
+overflow. Artifacts are retained under
+`/home/tester/cake-autorate-rs-owrt/test-logs/rc26-playwright-77` and
+`/home/tester/cake-autorate-rs-owrt/test-logs/rc26-playwright-100`.

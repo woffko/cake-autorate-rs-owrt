@@ -11,13 +11,15 @@ median throughput become P20/P50 capacity references, the throughput guard is
 enabled, and native transport-latency monitoring is enabled for the created
 instance.
 
-> **RC25 status:** Full Auto-Tune performs a bounded per-direction search over
+> **RC26 status:** Full Auto-Tune performs a bounded per-direction search over
 > the measured throughput/loaded-latency boundary. Current-candidate
 > realization, loss, route and measurement integrity remain hard gates. CPU,
 > profile capacity objectives and comparison with an earlier volatile-link
 > sample are advisory evidence. Only a complete target/objective result is
 > eligible for unattended apply; every fallback is explicitly typed and
-> manual-only.
+> manual-only. Each shaped phase owns the native transport-monitor PID
+> directly; terminal cleanup treats an absent or safely identified reused PID
+> as already stopped and never signals its new owner.
 
 ## Safety contract
 

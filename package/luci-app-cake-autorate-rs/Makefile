@@ -6,7 +6,7 @@ override FAKEROOT :=
 endif
 
 PKG_NAME:=luci-app-cake-autorate-rs
-PKG_VERSION:=1.0_rc25
+PKG_VERSION:=1.0_rc26
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=woffko

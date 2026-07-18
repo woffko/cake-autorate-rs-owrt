@@ -2306,6 +2306,10 @@ run_transport_probe_cli() {
 		--timeout "$transport_probe_timeout_s" \
 		--interval-ms "$interval_ms"
 	[ -n "${route_mark:-}" ] && set -- "$@" --fwmark "$route_mark"
+	# Background monitors set this only inside their asynchronous subshell.  An
+	# exec keeps $! attached to the native probe instead of an ash wrapper which
+	# could be terminated while leaving its long-running child orphaned.
+	[ "${transport_probe_exec:-0}" = 1 ] && exec "$@"
 	"$@"
 }
 
@@ -2537,7 +2541,7 @@ start_transport_latency_monitor() {
 	output="$1"
 	errors="$2"
 	: > "$output"
-	run_transport_probe_cli 100 1000 > "$output" 2> "$errors" &
+	transport_probe_exec=1 run_transport_probe_cli 100 1000 > "$output" 2> "$errors" &
 	transport_pid="$!"
 	transport_starttime="$(proc_starttime "$transport_pid" 2>/dev/null)"
 	is_positive_uint "$transport_starttime" || {
@@ -2552,7 +2556,10 @@ owned_monitor_gone() {
 	monitor_pid="$1"
 	monitor_start="$2"
 	actual_monitor_start="$(proc_starttime "$monitor_pid" 2>/dev/null)" || return 0
-	[ "$actual_monitor_start" = "$monitor_start" ] || return 1
+	# A different start time proves that our child has already exited and its
+	# PID was reused.  Treat that exactly like an absent process: it is unsafe
+	# to signal the new owner, but there is no owned monitor left to terminate.
+	[ "$actual_monitor_start" = "$monitor_start" ] || return 0
 	case "$(proc_state "$monitor_pid" 2>/dev/null)" in ''|Z|z) return 0 ;; esac
 	return 1
 }
@@ -2566,7 +2573,13 @@ stop_owned_monitor() {
 		wait "$monitor_pid" 2>/dev/null || true
 		return 0
 	}
-	[ "$(proc_starttime "$monitor_pid" 2>/dev/null)" = "$monitor_start" ] || return 1
+	# Marker-driven monitors can exit naturally between the gone check above
+	# and this identity guard.  Absence or PID reuse is successful cleanup, not
+	# a lifecycle failure.  Only signal the still-identical child.
+	[ "$(proc_starttime "$monitor_pid" 2>/dev/null)" = "$monitor_start" ] || {
+		wait "$monitor_pid" 2>/dev/null || true
+		return 0
+	}
 	kill -TERM "$monitor_pid" 2>/dev/null || true
 	monitor_wait=0
 	while [ "$monitor_wait" -lt 3 ]; do
@@ -2577,7 +2590,10 @@ stop_owned_monitor() {
 		monitor_wait=$((monitor_wait + 1))
 		sleep 1
 	done
-	[ "$(proc_starttime "$monitor_pid" 2>/dev/null)" = "$monitor_start" ] || return 1
+	[ "$(proc_starttime "$monitor_pid" 2>/dev/null)" = "$monitor_start" ] || {
+		wait "$monitor_pid" 2>/dev/null || true
+		return 0
+	}
 	kill -KILL "$monitor_pid" 2>/dev/null || true
 	monitor_wait=0
 	while [ "$monitor_wait" -lt 3 ]; do

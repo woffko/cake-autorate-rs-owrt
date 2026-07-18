@@ -1119,6 +1119,71 @@ export CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1
 . "$autotune"
 unset CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY
 
+# Marker-driven monitors normally exit by themselves.  If the child vanishes
+# between the first state check and the pre-signal identity guard, cleanup must
+# succeed without signalling a missing or PID-reused process.  This used to
+# reject otherwise valid repeated Auto-Tune runs under load.
+CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
+	. "$1"
+	monitor_calls="$2/monitor-starttime.calls"
+	monitor_kill="$2/monitor-kill.called"
+	: > "$monitor_calls"
+	proc_starttime() {
+		call_count="$(wc -l < "$monitor_calls" | tr -d " ")"
+		printf "call\n" >> "$monitor_calls"
+		[ "$call_count" = 0 ] || return 1
+		printf "111\n"
+	}
+	proc_state() { printf "R\n"; }
+	kill() { : > "$monitor_kill"; return 1; }
+	stop_owned_monitor 4242 111
+	[ ! -e "$monitor_kill" ]
+' sh "$autotune" "$work"
+
+# A reused PID also proves that the original monitor is gone.  It must not be
+# killed and must not poison the completed calibration result.
+CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
+	. "$1"
+	monitor_kill="$2/monitor-reused-kill.called"
+	proc_starttime() { printf "222\n"; }
+	proc_state() { printf "R\n"; }
+	kill() { : > "$monitor_kill"; return 1; }
+	stop_owned_monitor 4242 111
+	[ ! -e "$monitor_kill" ]
+' sh "$autotune" "$work"
+
+# The tracked transport PID must be the native probe itself.  A background ash
+# wrapper would die while leaving its long-running child to contaminate later
+# validation attempts and accelerate PID reuse.
+transport_monitor_fixture="$work/transport-monitor-fixture"
+printf '%s\n' \
+	'#!/bin/sh' \
+	'printf "%s\n" "$$" > "$AUTOTUNE_MONITOR_PID_FILE"' \
+	'exec sleep 30' > "$transport_monitor_fixture"
+chmod +x "$transport_monitor_fixture"
+transport_probe_bin="$transport_monitor_fixture"
+transport_probe_backend=websocket
+transport_probe_endpoint=wss://example.test/ws
+transport_probe_timeout_s=5
+target_if=lo
+source_ip=127.0.0.1
+route_mark=""
+export AUTOTUNE_MONITOR_PID_FILE="$work/transport-monitor.pid"
+start_transport_latency_monitor "$work/transport-monitor.raw" "$work/transport-monitor.errors"
+monitor_ready_attempt=0
+while [ ! -s "$AUTOTUNE_MONITOR_PID_FILE" ] && [ "$monitor_ready_attempt" -lt 50 ]; do
+	monitor_ready_attempt=$((monitor_ready_attempt + 1))
+	sleep 0.02
+done
+test "$(sed -n '1p' "$AUTOTUNE_MONITOR_PID_FILE")" = "$transport_pid"
+stopped_transport_pid="$transport_pid"
+stop_transport_latency_monitor
+if kill -0 "$stopped_transport_pid" 2>/dev/null; then
+	echo 'transport monitor remained after owned cleanup' >&2
+	exit 1
+fi
+unset AUTOTUNE_MONITOR_PID_FILE
+
 # Missing an old 5G capacity comparison does not make a currently controlled
 # Fair candidate unsafe and must never produce a disable-SQM recommendation.
 profile_safety_floor_met=false
