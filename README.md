@@ -63,6 +63,32 @@ The current targets are OpenWrt 25.12.5 on `x86/64` and
 route-bound WebSocket/TCP/HTTP probing uses statically linked Rust TLS and
 socket libraries; ordinary OpenWrt runtime dependencies remain explicit below.
 
+## Interface overview
+
+**Status** keeps the operational state in one place: uplink lifecycle,
+Autorate/SQM/classifier health, active profiles, current collection state and
+the last complete connection rating. The example below is a real completed
+automatic test on an isolated `test_instance`; it measured A+ for both download
+and upload without changing the configured CAKE limits. Results naturally
+depend on the tested link and load at that moment.
+
+[![Status overview with a completed A+ rating](docs/screenshots/status-overview.png)](docs/screenshots/status-overview.png)
+
+**Graphs** use an opt-in, bounded RAM-only history. Latency, transport delta,
+effective delay, CPU and synchronized download/upload traffic share the same
+timeline; the oldest samples are discarded automatically and nothing is
+written to flash. This capture contains the load phases from the same rating
+test.
+
+[![RAM-only latency, CPU and traffic graphs](docs/screenshots/graphs-overview.png)](docs/screenshots/graphs-overview.png)
+
+**Settings** manages each uplink independently and exposes traffic priorities,
+Full Auto-Tune, categorized editing and deletion directly from its instance
+row. A clean package installation creates no instance until the user chooses
+**Create instance**.
+
+[![Per-instance settings and actions](docs/screenshots/settings-overview.png)](docs/screenshots/settings-overview.png)
+
 ## Current package tree
 
 The current development tree builds these OpenWrt 25.12.5 APKs:
