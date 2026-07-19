@@ -297,9 +297,57 @@ migrate_legacy_route_instance() {
 	fi
 }
 
+canonical_traffic_autotune_profile() {
+	case "$1" in
+		gaming) printf 'gaming\n' ;;
+		fair) printf 'fair\n' ;;
+		best_overall|best-overall|balanced|'') printf 'best_overall\n' ;;
+		*) return 1 ;;
+	esac
+}
+
+migrate_traffic_profile_instance() {
+	local section="$1"
+	local migrated configured autotune defaults_option defaults_enabled
+	local rule rule_instance rule_profile raw_rule_profile
+
+	config_get migrated "$section" traffic_profile_migrated
+	[ "$migrated" = 1 ] && return 0
+	config_get configured "$section" traffic_profile
+	autotune="$(canonical_traffic_autotune_profile "$(uci -q get "$CONFIG.$section.autotune_profile")")" ||
+		autotune=best_overall
+	defaults_option="traffic_defaults_$autotune"
+	defaults_enabled="$(uci -q get "$CONFIG.$section.$defaults_option")"
+
+	if [ "$defaults_enabled" = 0 ] && { [ -z "$configured" ] || [ "$configured" = custom ]; }; then
+		[ -n "$configured" ] || set_cake_option_if_changed "$section" traffic_profile custom
+		# Old custom rules were scoped to the Auto-Tune profile. Move only the
+		# currently active group into the new explicit Custom profile; retain all
+		# inactive profile groups untouched for rollback and later reuse.
+		for rule in $(uci -q show "$CONFIG" 2>/dev/null |
+			sed -n "s/^$CONFIG\.\([A-Za-z0-9_][A-Za-z0-9_]*\)=traffic_rule$/\1/p"); do
+			rule_instance="$(uci -q get "$CONFIG.$rule.instance")"
+			[ "$rule_instance" = "$section" ] || continue
+			raw_rule_profile="$(uci -q get "$CONFIG.$rule.profile")"
+			[ -n "$raw_rule_profile" ] || raw_rule_profile="$autotune"
+			rule_profile="$(canonical_traffic_autotune_profile "$raw_rule_profile" 2>/dev/null)" ||
+				continue
+			[ "$rule_profile" = "$autotune" ] || continue
+			uci set "$CONFIG.$rule.profile=custom"
+			CAKE_CONFIG_CHANGED=1
+		done
+		logger -t cake-autorate "migrated disabled built-in priorities for instance '$section' to the explicit Custom profile"
+	elif [ -z "$configured" ]; then
+		set_cake_option_if_changed "$section" traffic_profile auto
+		logger -t cake-autorate "linked traffic priorities for instance '$section' to its Auto-Tune profile"
+	fi
+	set_cake_option_if_changed "$section" traffic_profile_migrated 1
+}
+
 sync_interface_presets() {
 	CAKE_CONFIG_CHANGED=0
 	config_foreach migrate_legacy_route_instance cake_autorate
+	config_foreach migrate_traffic_profile_instance cake_autorate
 	config_foreach sync_interface_preset_instance cake_autorate
 	config_foreach sync_rate_preset_instance cake_autorate
 	[ "$CAKE_CONFIG_CHANGED" -eq 1 ] || return 0

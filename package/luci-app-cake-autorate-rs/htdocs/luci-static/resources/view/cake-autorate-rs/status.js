@@ -586,36 +586,73 @@ function probeWarning(status, enabled) {
 	return _('No probe replies. Check the pinger and multi-WAN policy routing.');
 }
 
-function formatState(status, enabled) {
-	var value = status && (status.uplink_state || status.state);
-	var warning;
+function trafficProfileLabel(value) {
+	switch (value) {
+	case 'gaming': return _('Gaming');
+	case 'best-overall':
+	case 'balanced':
+	case 'best_overall': return _('Best overall');
+	case 'fair': return _('Fair');
+	case 'custom': return _('Custom');
+	default: return _('Unknown');
+	}
+}
 
-	if (!value)
-		return '-';
-	if (status.sqm_runtime_managed && !status.sqm_runtime_healthy)
+function formatState(status, enabled, sectionData, health) {
+	var value = status && (status.uplink_state || status.state);
+	var warning, autotuneProfile, priorities, priorityTitle, lines;
+
+	autotuneProfile = trafficProfileLabel(
+		health && health.autotune_profile || sectionData && sectionData.autotune_profile);
+	if (!sectionData || sectionData.traffic_rules_enabled !== '1') {
+		priorities = _('Off');
+	} else {
+		var sectionAutotune = (function(value) {
+			switch (value) {
+			case 'gaming': return 'gaming';
+			case 'fair': return 'fair';
+			default: return 'best_overall';
+			}
+		})(sectionData.autotune_profile);
+		var mode = health && health.traffic_profile_mode || sectionData.traffic_profile ||
+			(sectionData['traffic_defaults_' + sectionAutotune] === '0' ? 'custom' : 'auto');
+		var resolved = health && health.traffic_profile_resolved ||
+			(mode === 'auto' ? sectionData.autotune_profile : mode);
+		priorities = trafficProfileLabel(resolved);
+		if (mode === 'auto')
+			priorities += ' · ' + _('linked');
+		else if (mode !== 'custom')
+			priorities += ' · ' + _('manual');
+		priorityTitle = health && health.classifier_state ?
+			_('Runtime classifier: %s').format(health.classifier_state) : '';
+	}
+	value = value ? String(value).toUpperCase() : (enabled ? '-' : _('DISABLED'));
+	lines = [
+		E('strong', {}, value),
+		E('small', { 'style': 'display:block;white-space:nowrap' },
+			_('Controller: %s').format(String(status && status.state || (enabled ? '-' : 'disabled')).toUpperCase())),
+		E('small', { 'style': 'display:block;white-space:nowrap' },
+			_('Auto-Tune: %s').format(autotuneProfile)),
+		E('small', { 'style': 'display:block;white-space:nowrap', 'title': priorityTitle || '' },
+			_('Priorities: %s').format(priorities))
+	];
+	if (status && status.sqm_runtime_managed && !status.sqm_runtime_healthy) {
+		lines[0] = E('strong', { 'style': 'color:#f44' }, status.sqm_runtime_state || _('ERROR'));
+		lines.splice(1, 0, E('small', { 'style': 'display:block;color:#f66' }, _('CAKE/IFB unavailable')));
 		return E('div', {
 			'title': status.sqm_runtime_reason || _('Managed SQM runtime is unhealthy.')
-		}, [
-			E('strong', { 'style': 'color:#f44' }, status.sqm_runtime_state || _('ERROR')),
-			E('small', { 'style': 'display:block;color:#f66' }, _('CAKE/IFB unavailable'))
-		]);
+		}, lines);
+	}
 
-	value = String(value).toUpperCase();
 	warning = probeWarning(status, enabled);
 
 	if (!warning)
-		return E('div', { 'title': status.uplink_reason || '' }, [
-			E('strong', {}, value),
-			E('small', { 'style': 'display:block;white-space:nowrap' },
-				_('Controller: %s').format(String(status.state || '-').toUpperCase()))
-		]);
+		return E('div', { 'title': status.uplink_reason || '' }, lines);
 
-	return E('div', { 'title': warning }, [
-		E('div', {}, value),
-		E('small', {
+	lines.push(E('small', {
 			'style': 'display:block;color:#b00;white-space:nowrap'
-		}, [ '⚠ ', _('No probe replies') ])
-	]);
+		}, [ '⚠ ', _('No probe replies') ]));
+	return E('div', { 'title': warning }, lines);
 }
 
 function formatHealthRate(value) {
@@ -650,12 +687,15 @@ function formatServices(health) {
 		_('Download CAKE: %s on %s at %s').format(
 			health.cake_dl_state || '-', health.dl_interface || '-',
 			formatHealthRate(health.cake_dl_rate_kbps)),
-		_('Traffic rules: %s (%s; upload CAKE %s)').format(
-			health.classifier_state || '-', health.classifier_profile || '-',
+		_('Traffic rules: %s (configured %s; resolved %s; upload CAKE %s)').format(
+			health.classifier_state || '-', health.traffic_profile_mode || '-',
+			health.traffic_profile_resolved || health.classifier_profile || '-',
 			health.cake_ul_mode || '-'),
-		_('Attested rules: %s (%s)').format(
+		_('Attested rules: %s (Auto-Tune %s; configured %s; resolved %s)').format(
 			health.classifier_target || '-',
-			health.classifier_applied_profile || '-'),
+			health.classifier_applied_autotune_profile || '-',
+			health.classifier_applied_configured_profile || '-',
+			health.classifier_applied_resolved_profile || health.classifier_applied_profile || '-'),
 		_('IFB: %s').format(health.ifb_state || '-'),
 		_('Ingress redirect: %s').format(health.ingress_state || '-'),
 		_('Operation: %s').format(health.operation_state || '-'),
@@ -685,7 +725,7 @@ function formatServices(health) {
 		E('span', {}, [
 			_('Rules %s').format(health.classifier_state || '-'),
 			' · ',
-			_('Profile %s').format(health.classifier_profile || '-')
+			_('Profile %s').format(health.traffic_profile_resolved || health.classifier_profile || '-')
 		]),
 		E('span', {}, _('Operation %s').format(health.operation_state || '-'))
 	];
@@ -792,7 +832,7 @@ function statusCell(column, sectionData, status, enabled, health) {
 
 	switch (column.key) {
 	case 'instance': return section;
-	case 'uplink': return enabled ? formatState(status, enabled) : _('DISABLED');
+	case 'uplink': return formatState(status, enabled, sectionData, health);
 	case 'services': return formatServices(health);
 	case 'quality': return enabled ? formatQuality(status) : '-';
 	case 'rating': return renderQualityAction(sectionData, status, enabled);

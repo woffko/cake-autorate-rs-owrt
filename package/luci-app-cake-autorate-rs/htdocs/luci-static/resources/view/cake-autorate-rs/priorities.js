@@ -6,9 +6,11 @@
 'require cake-autorate-rs.ui as cakeUi';
 
 var PROFILE_LABELS = {
+	auto: _('Automatic'),
 	gaming: _('Gaming'),
 	best_overall: _('Best overall'),
-	fair: _('Fair')
+	fair: _('Fair'),
+	custom: _('Custom')
 };
 
 var PRESET_LABELS = [
@@ -23,6 +25,18 @@ var PRESET_LABELS = [
 	[ 'playstation', _('PlayStation Network') ],
 	[ 'wireguard', _('WireGuard') ]
 ];
+
+var PRESET_LABEL_MAP = PRESET_LABELS.reduce(function(result, item) {
+	result[item[0]] = item[1];
+	return result;
+}, {});
+
+var CLASS_LABELS = {
+	voice: _('Latency-critical / Voice'),
+	video: _('Interactive / Video'),
+	best_effort: _('Best effort'),
+	background: _('Background / Bulk')
+};
 
 function canonicalProfile(value) {
 	switch (value) {
@@ -40,6 +54,40 @@ function canonicalProfile(value) {
 	default:
 		return null;
 	}
+}
+
+function canonicalTrafficProfile(value) {
+	switch (value) {
+	case 'auto':
+	case 'gaming':
+	case 'best_overall':
+	case 'fair':
+	case 'custom':
+		return value;
+	case 'best-overall':
+	case 'balanced':
+		return 'best_overall';
+	default:
+		return null;
+	}
+}
+
+function configuredTrafficProfile(section) {
+	var configured = canonicalTrafficProfile(section && section.traffic_profile);
+	var autotune = canonicalProfile(section && section.autotune_profile) || 'best_overall';
+	if (configured)
+		return configured;
+	return section && section['traffic_defaults_' + autotune] === '0' ? 'custom' : 'auto';
+}
+
+function resolvedTrafficProfile(configured, autotune) {
+	return configured === 'auto' ? (canonicalProfile(autotune) || 'best_overall') : configured;
+}
+
+function effectiveRuleProfile(value) {
+	var profile = canonicalTrafficProfile(value);
+	return profile === 'gaming' || profile === 'best_overall' ||
+		profile === 'fair' || profile === 'custom' ? profile : 'custom';
 }
 
 function validatePortList(sectionId, value) {
@@ -155,6 +203,62 @@ function parseClassifierStatus(result) {
 		{ state: 'invalid', table_present: false };
 }
 
+function parsePresetCatalog(result) {
+	var text = result && result.stdout ? result.stdout.trim() : '';
+	var parsed;
+	try {
+		parsed = JSON.parse(text);
+	} catch (error) {
+		return { schema_version: 0, profiles: {} };
+	}
+	if (!parsed || parsed.schema_version !== 1 || !parsed.profiles ||
+	    typeof parsed.profiles !== 'object')
+		return { schema_version: 0, profiles: {} };
+	return parsed;
+}
+
+function profileCard(title, summary) {
+	return E('span', { 'class': 'traffic-profile-card-copy' }, [
+		E('strong', {}, title),
+		E('small', {}, summary)
+	]);
+}
+
+function rulePreview(profile, catalog) {
+	var rules = catalog && catalog.profiles && catalog.profiles[profile];
+	if (profile === 'custom')
+		return E('div', { 'class': 'traffic-profile-empty' },
+			_('Custom uses only enabled rules assigned to the Custom profile below.'));
+	if (!Array.isArray(rules) || rules.length === 0)
+		return E('div', { 'class': 'traffic-profile-empty' },
+			_('The built-in rule catalog is unavailable. Save & Apply is not affected, but the preview cannot be shown.'));
+	return E('table', { 'class': 'table traffic-profile-rule-table' }, [
+		E('thead', {}, E('tr', {}, [
+			E('th', {}, _('Traffic')),
+			E('th', {}, _('Match')),
+			E('th', {}, _('CAKE class')),
+			E('th', {}, _('DSCP'))
+		])),
+		E('tbody', {}, rules.map(function(rule) {
+			var match = String(rule.protocol || _('any')).toUpperCase();
+			var trafficLabel = _('Traffic');
+			var matchLabel = _('Match');
+			var classLabel = _('CAKE class');
+			var dscpLabel = _('DSCP');
+			if (rule.destination_ports)
+				match += ' · ' + _('destination %s').format(rule.destination_ports);
+			if (rule.source_ports)
+				match += ' · ' + _('source %s').format(rule.source_ports);
+			return E('tr', {}, [
+				E('td', { 'data-label': trafficLabel }, PRESET_LABEL_MAP[rule.preset] || rule.preset || rule.id),
+				E('td', { 'data-label': matchLabel }, match),
+				E('td', { 'data-label': classLabel }, CLASS_LABELS[rule['class']] || rule['class']),
+				E('td', { 'data-label': dscpLabel }, String(rule.dscp || '').toUpperCase())
+			]);
+		}))
+	]);
+}
+
 function addFlag(section, name, title, defaultValue, description) {
 	var option = section.option(form.Flag, name, title);
 	option.default = defaultValue;
@@ -188,12 +292,18 @@ return L.view.extend({
 				fs.exec('/usr/libexec/cake-autorate-rs/traffic-classifier', classifierArgs)
 					.then(parseClassifierStatus),
 				{ state: 'unavailable', table_present: false }
+			),
+			L.resolveDefault(
+				fs.exec('/usr/libexec/cake-autorate-rs/traffic-classifier', [ 'presets' ])
+					.then(parsePresetCatalog),
+				{ schema_version: 0, profiles: {} }
 			)
 		]);
 	},
 
 	render: function(data) {
 		var classifier = data[1] || {};
+		var catalog = data[2] || { profiles: {} };
 		var instances = uci.sections('cake-autorate', 'cake_autorate');
 		var selectedInstance = selectedInstanceFromLocation(window.location);
 		var selectedSection = instances.filter(function(section) {
@@ -201,7 +311,7 @@ return L.view.extend({
 		})[0];
 		var instanceValues = selectedSection ?
 			[ [ selectedInstance, selectedInstance ] ] : [];
-		var stateText;
+		var configuredProfile, resolvedProfile, stateText;
 
 		cakeUi.ensureAppHeader();
 		if (!selectedSection)
@@ -211,6 +321,8 @@ return L.view.extend({
 					_('Select an existing instance from the Settings page before editing traffic priorities.')),
 				E('div', { 'class': 'cbi-page-actions' }, backToSettingsButton())
 			]);
+		configuredProfile = configuredTrafficProfile(selectedSection);
+		resolvedProfile = resolvedTrafficProfile(configuredProfile, selectedSection.autotune_profile);
 
 		switch (classifier.state) {
 		case 'active':
@@ -229,6 +341,79 @@ return L.view.extend({
 			stateText = _('The native outbound classifier is inactive. Save & Apply or inspect the Services column if rules are expected.');
 		}
 		var m, s, o, index;
+
+		function stagePresetCopy(sourceProfile) {
+			var existing = uci.sections('cake-autorate', 'traffic_rule').filter(function(rule) {
+				return rule.instance === selectedInstance &&
+					effectiveRuleProfile(rule.profile) === 'custom';
+			});
+			var rules = catalog.profiles && catalog.profiles[sourceProfile];
+
+			uci.set('cake-autorate', selectedInstance, 'traffic_profile', 'custom');
+			uci.set('cake-autorate', selectedInstance, 'traffic_profile_migrated', '1');
+			if (existing.length > 0) {
+				ui.addNotification(null, E('p', {},
+					_('Custom rules already exist. They were preserved and the Custom profile was selected.')),
+					'info');
+				return uci.save().then(function() { window.location.reload(); });
+			}
+			if (!Array.isArray(rules) || rules.length === 0)
+				return Promise.reject(new Error(_('The selected built-in profile has no readable catalog rules.')));
+
+			rules.forEach(function(rule, ruleIndex) {
+				var sectionId = uci.add('cake-autorate', 'traffic_rule');
+				uci.set('cake-autorate', sectionId, 'enabled', '1');
+				uci.set('cake-autorate', sectionId, 'instance', selectedInstance);
+				uci.set('cake-autorate', sectionId, 'profile', 'custom');
+				uci.set('cake-autorate', sectionId, 'preset', 'custom');
+				uci.set('cake-autorate', sectionId, 'name', PRESET_LABEL_MAP[rule.preset] || rule.id);
+				uci.set('cake-autorate', sectionId, 'family', 'any');
+				uci.set('cake-autorate', sectionId, 'protocol', rule.protocol || 'any');
+				uci.set('cake-autorate', sectionId, 'source_ports', rule.source_ports || '');
+				uci.set('cake-autorate', sectionId, 'destination_ports', rule.destination_ports || '');
+				uci.set('cake-autorate', sectionId, 'class', rule['class']);
+				uci.set('cake-autorate', sectionId, 'order', String((ruleIndex + 1) * 100));
+			});
+			return uci.save().then(function() {
+				ui.addNotification(null, E('p', {},
+					_('An editable Custom copy was staged as unsaved changes. Review it, then use Save & Apply.')),
+					'info');
+				window.location.reload();
+			});
+		}
+
+		function requestPresetCopy() {
+			var checked = document.querySelector('.traffic-profile-selector input[type="radio"]:checked');
+			var source = checked ? canonicalTrafficProfile(checked.value) : configuredProfile;
+			if (source === 'auto')
+				source = canonicalProfile(selectedSection.autotune_profile) || 'best_overall';
+			if (source === 'custom') {
+				ui.addNotification(null, E('p', {}, _('Custom is already selected. Edit its rules below.')), 'info');
+				return Promise.resolve();
+			}
+			ui.showModal(_('Customize %s').format(PROFILE_LABELS[source]), [
+				E('p', {}, _('This creates an independent editable copy of the shown built-in rules and switches this instance to Custom. Future package upgrades will not overwrite the copy. Existing rules are never deleted.')),
+				E('div', { 'class': 'right' }, [
+					E('button', { 'class': 'btn', 'click': ui.hideModal }, _('Cancel')),
+					' ',
+					E('button', {
+						'class': 'btn cbi-button-positive important',
+						'click': function() {
+							ui.hideModal();
+							/* Preserve valid edits already present elsewhere on this page
+							 * before the staged Custom copy causes a reload. This writes only
+							 * LuCI's pending UCI delta; it never commits or applies it. */
+							return m.save(null, true).then(function() {
+								return stagePresetCopy(source);
+							}).catch(function(error) {
+								ui.addNotification(null, E('p', {}, error.message || String(error)), 'error');
+							});
+						}
+					}, _('Create editable copy'))
+				])
+			]);
+			return Promise.resolve();
+		}
 
 		m = new form.Map('cake-autorate', _('Traffic priorities \u2014 %s').format(selectedInstance),
 			_('Configure profile-specific outbound DSCP rules for this instance. cake-autorate-rs remains the only owner of SQM, CAKE, IFB devices and bandwidth rates; the classifier owns only its isolated nftables table.'));
@@ -253,21 +438,46 @@ return L.view.extend({
 			]);
 		};
 
-		o = s.option(form.DummyValue, '_active_profile', _('Active profile'));
+		o = s.option(form.DummyValue, '_active_profile', _('Auto-Tune profile'));
 		o.cfgvalue = function() {
 			return profileLabel(selectedSection.autotune_profile);
 		};
 
-		addFlag(s, 'traffic_rules_enabled', _('Outbound rules'), '0',
-			_('Enable the native classifier for this managed SQM instance.'));
-		addFlag(s, 'traffic_defaults_gaming', _('Gaming defaults'), '1',
-			_('DNS/NTP and conservative game-platform presets; web remains best effort.'));
-		addFlag(s, 'traffic_defaults_best_overall', _('Best overall defaults'), '1',
-			_('Prioritize DNS/NTP and interactive SSH while keeping web/QUIC best effort.'));
-		addFlag(s, 'traffic_defaults_fair', _('Fair defaults'), '1',
-			_('Keep a minimal interactive set while sustained transfers remain best effort.'));
+		addFlag(s, 'traffic_rules_enabled', _('Enable outbound traffic prioritization'), '0',
+			_('Tags forwarded and router-originated upload packets before outbound CAKE. Turning this off does not stop CAKE, SQM or Autorate and does not remove their bandwidth limits.'));
 
-		s = m.section(form.GridSection, 'traffic_rule', _('Custom profile rules'));
+		o = s.option(form.ListValue, 'traffic_profile', _('Traffic profile'));
+		o.widget = 'radio';
+		o.orientation = 'horizontal';
+		o.default = 'auto';
+		o.rmempty = false;
+		o.value('auto', profileCard(_('Automatic (recommended)'),
+		_('Follow the Auto-Tune profile; currently resolves to %s.').format(PROFILE_LABELS[resolvedProfile])));
+		o.value('gaming', profileCard(_('Gaming'), _('DNS, NTP and conservative game-platform rules.')));
+		o.value('best_overall', profileCard(_('Best overall'), _('Interactive essentials without prioritizing bulk web traffic.')));
+		o.value('fair', profileCard(_('Fair'), _('A minimal interactive set with throughput first.')));
+		o.value('custom', profileCard(_('Custom'), _('Only your editable Custom rules are active.')));
+		o.cfgvalue = function() { return configuredProfile; };
+		o.renderWidget = function() {
+			var node = form.ListValue.prototype.renderWidget.apply(this, arguments);
+			node.classList.add('traffic-profile-selector');
+			return node;
+		};
+
+		o = s.option(form.DummyValue, '_traffic_profile_preview', _('Included rules'));
+		o.rawhtml = true;
+		o.cfgvalue = function() {
+			return E('div', { 'id': 'traffic-profile-preview', 'data-profile': configuredProfile },
+				rulePreview(resolvedProfile, catalog));
+		};
+
+		o = s.option(form.Button, '_customize_profile', _('Editable copy'));
+		o.inputtitle = _('Customize this preset');
+		o.inputstyle = 'action';
+		o.onclick = requestPresetCopy;
+		o.description = _('Copies the selected built-in rules into UCI as independent Custom rules. It never overwrites or deletes existing rules.');
+
+		s = m.section(form.GridSection, 'traffic_rule', _('Editable traffic rules'));
 		s.anonymous = true;
 		s.addremove = true;
 		s.addbtntitle = _('Add traffic rule');
@@ -295,10 +505,15 @@ return L.view.extend({
 		};
 
 		o = addList(s, 'profile', _('Profile'), [
+			[ 'custom', _('Custom') ],
 			[ 'gaming', _('Gaming') ],
 			[ 'best_overall', _('Best overall') ],
 			[ 'fair', _('Fair') ]
-		], 'best_overall');
+		], 'custom');
+		o.cfgvalue = function(sectionId) {
+			return effectiveRuleProfile(uci.get('cake-autorate', sectionId, 'profile'));
+		};
+		o.description = _('A rule is active only when this value matches the resolved traffic profile. Other rules remain saved but inactive.');
 
 		o = addList(s, 'preset', _('Preset'), PRESET_LABELS, 'custom');
 
@@ -364,7 +579,45 @@ return L.view.extend({
 				s.children[index].modalonly = true;
 
 		return m.render().then(function(node) {
+			var style = E('style', {}, [
+				'.traffic-profile-selector .cbi-radio{display:inline-flex;vertical-align:top;width:min(18rem,calc(50% - .6rem));min-height:6.2rem;margin:.3rem;padding:.75rem;border:1px solid var(--border-color-medium,#666);border-radius:.55rem;box-sizing:border-box;cursor:pointer}',
+				'.traffic-profile-selector .cbi-radio:has(input:checked){border-color:#00a67d;box-shadow:0 0 0 1px #00a67d;background:rgba(0,166,125,.08)}',
+				'.traffic-profile-selector .cbi-radio input{margin:.2rem .55rem 0 0;flex:0 0 auto}',
+				'.traffic-profile-card-copy{display:flex;flex-direction:column;gap:.35rem;line-height:1.25}',
+				'.traffic-profile-card-copy small{font-weight:normal;opacity:.82}',
+				'.traffic-profile-rule-table{max-width:58rem}',
+				'.traffic-profile-rule-table th,.traffic-profile-rule-table td{white-space:normal}',
+				'.traffic-profile-empty{padding:.75rem;border-left:3px solid #777}',
+				'@media(max-width:700px){.traffic-profile-selector .cbi-radio{display:flex;width:100%;margin:.3rem 0}.traffic-profile-rule-table{display:block;font-size:.92em}.traffic-profile-rule-table thead{display:none}.traffic-profile-rule-table tbody,.traffic-profile-rule-table tr{display:block}.traffic-profile-rule-table tr{margin:.55rem 0;padding:.4rem;border:1px solid var(--border-color-medium,#777);border-radius:.45rem}.traffic-profile-rule-table td{display:grid;grid-template-columns:minmax(6.5rem,36%) minmax(0,1fr);gap:.55rem;padding:.25rem .35rem;border:0;overflow-wrap:anywhere}.traffic-profile-rule-table td:before{content:attr(data-label);font-weight:600;opacity:.78}}'
+			].join('\n'));
+			var selector = node.querySelector('.traffic-profile-selector');
+			var preview = node.querySelector('#traffic-profile-preview');
+			var showPreview = function(value) {
+				var profile = canonicalTrafficProfile(value) || 'auto';
+				var resolved = resolvedTrafficProfile(profile, selectedSection.autotune_profile);
+				if (!preview)
+					return;
+				preview.setAttribute('data-profile', profile);
+				preview.replaceChildren(rulePreview(resolved, catalog));
+			};
+			if (selector) {
+				selector.querySelectorAll('.cbi-radio').forEach(function(card) {
+					var input = card.querySelector('input[type="radio"]');
+					if (!input)
+						return;
+					input.addEventListener('change', function() {
+						if (input.checked)
+							showPreview(input.value);
+					});
+					card.addEventListener('mouseenter', function() { showPreview(input.value); });
+					card.addEventListener('mouseleave', function() {
+						var checked = selector.querySelector('input[type="radio"]:checked');
+						showPreview(checked ? checked.value : configuredProfile);
+					});
+				});
+			}
 			return E('div', {}, [
+				style,
 				E('div', { 'class': 'cbi-page-actions' }, backToSettingsButton()),
 				node
 			]);

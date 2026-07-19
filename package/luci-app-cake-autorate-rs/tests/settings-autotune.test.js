@@ -164,6 +164,7 @@ const proposal = {
 };
 
 helpers.writeWizardConfig('auto_wwan', {
+	is_new_instance: true,
 	name: 'auto_wwan',
 	wan_if: 'eth1',
 	enabled: true,
@@ -204,6 +205,9 @@ assert.equal(written.adaptive_ceiling_cooldown_s, '45');
 assert.equal(written.transport_latency_enabled, '1');
 assert.equal(written.throughput_guard_enabled, '1');
 assert.equal(written.autotune_profile, 'best_overall');
+assert.equal(written.traffic_profile, 'auto');
+assert.equal(written.traffic_profile_migrated, '1');
+assert.equal(written.traffic_rules_enabled, '0');
 assert.equal(written.throughput_guard_retention_percent, '80');
 assert.equal(written.quality_target_delay_ms, '30');
 assert.equal(written.throughput_reference_dl_p20_kbps, '41700');

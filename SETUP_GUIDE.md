@@ -152,15 +152,22 @@ priorities** action after the instance has a validated profile and managed
 SQM. The page is intentionally bound to that row; it never shows or edits
 another WAN's rules.
 
-1. Enable **Outbound rules** for the intended instance.
-2. Keep or disable the defaults for each profile independently. Only the
-   currently active profile is rendered; the others remain saved for a later
-   profile change.
-3. Add a named preset or explicit protocol/ports/address rule. Select Voice
+1. Enable **Outbound rules** for the intended instance. This is an explicit
+   opt-in and does not enable or disable Autorate/SQM.
+2. Choose exactly one policy: **Automatic** follows the current Auto-Tune
+   profile; **Gaming**, **Best overall**, or **Fair** pins that policy;
+   **Custom** uses only its editable rules. Hover, focus, or select a profile
+   to inspect the exact built-in matches and DSCP values.
+3. To change a built-in policy, use **Customize this preset**. LuCI stages an
+   editable Custom copy and waits for the normal **Save & Apply** transaction;
+   it never overwrites an existing Custom group automatically.
+4. Add a named preset or explicit protocol/ports/address rule. Select Voice
    (CS5), Interactive (AF41), Best effort (CS0), or Background (CS1).
-4. Use the Order field when rules overlap. Built-ins run first and later custom
+5. Use the Order field when rules overlap. Built-ins run first and later custom
    rules override earlier matches.
-5. Save & Apply, then confirm `Rules ACTIVE` in the Status Services column.
+6. Save & Apply, then confirm `Rules ACTIVE` in the Status Services column and
+   verify that **Uplink / state** names both the Auto-Tune profile and the
+   resolved traffic-priority profile.
 
 These rules do not integrate with qosify and do not own CAKE. They operate only
 in the private `inet cake_autorate_dscp` nftables table and affect packets
@@ -168,6 +175,12 @@ leaving the selected uplink before upload CAKE. Download packets have already
 entered the SQM IFB before those hooks, so Best overall and Fair intentionally
 keep download classification best-effort. Full details and a UCI example are
 in [Profile traffic priorities](TRAFFIC_PRIORITIES.md).
+
+The documentation includes anonymized
+[desktop](docs/screenshots/traffic-priorities-desktop.png),
+[mobile](docs/screenshots/traffic-priorities-mobile.png), and
+[Custom editing](docs/screenshots/traffic-priorities-custom.png) examples from
+the isolated test router.
 
 ## Multi-WAN rules
 

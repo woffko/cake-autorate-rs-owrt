@@ -232,7 +232,7 @@ emit_instance() {
 	manage_sqm="$(uci_get manage_sqm)"
 	sqm_enabled="$(uci_get sqm_enabled)"
 	traffic_rules_enabled="$(uci_get traffic_rules_enabled)"
-	classifier_profile="$(uci_get autotune_profile)"
+	autotune_profile="$(uci_get autotune_profile)"
 	[ "$enabled" = 1 ] || enabled=0
 	[ -n "$manage_sqm" ] || manage_sqm=1
 	[ "$manage_sqm" = 1 ] || manage_sqm=0
@@ -240,12 +240,24 @@ emit_instance() {
 	[ "$sqm_enabled" = 1 ] || sqm_enabled=0
 	[ -n "$traffic_rules_enabled" ] || traffic_rules_enabled=0
 	[ "$traffic_rules_enabled" = 1 ] || traffic_rules_enabled=0
-	case "$classifier_profile" in
+	case "$autotune_profile" in
 		gaming) ;;
-		best-overall|balanced|'') classifier_profile=best_overall ;;
+		best-overall|balanced|'') autotune_profile=best_overall ;;
 		best_overall|fair) ;;
-		*) classifier_profile=unknown ;;
+		*) autotune_profile=unknown ;;
 	esac
+	traffic_profile_mode="$(uci_get traffic_profile)"
+	if [ -z "$traffic_profile_mode" ]; then
+		legacy_defaults="$(uci_get "traffic_defaults_$autotune_profile")"
+		[ "$legacy_defaults" = 0 ] && traffic_profile_mode=custom || traffic_profile_mode=auto
+	fi
+	case "$traffic_profile_mode" in
+		auto) traffic_profile_resolved="$autotune_profile" ;;
+		gaming|best_overall|fair|custom) traffic_profile_resolved="$traffic_profile_mode" ;;
+		*) traffic_profile_mode=unknown; traffic_profile_resolved=unknown ;;
+	esac
+	# Compatibility alias for older LuCI clients.
+	classifier_profile="$traffic_profile_resolved"
 
 	target="$(uci_get wan_if)"
 	[ -n "$target" ] || target="$(uci_get sqm_interface)"
@@ -384,6 +396,9 @@ emit_instance() {
 	fi
 	classifier_instance_status=""
 	classifier_applied_target=""
+	classifier_applied_autotune_profile=""
+	classifier_applied_configured_profile=""
+	classifier_applied_resolved_profile=""
 	classifier_applied_profile=""
 	classifier_attestation_state="$classifier_global_state"
 	if [ "$classifier_global_state" = ACTIVE ]; then
@@ -393,14 +408,21 @@ emit_instance() {
 		set -- $classifier_attested_instances
 		IFS="$old_ifs"
 		for classifier_record in "$@"; do
-			classifier_record_instance="${classifier_record%%|*}"
-			classifier_record_rest="${classifier_record#*|}"
-			classifier_record_target="${classifier_record_rest%%|*}"
-			classifier_record_profile="${classifier_record_rest#*|}"
+			old_ifs="$IFS"
+			IFS='|'
+			read -r classifier_record_instance classifier_record_target \
+				classifier_record_autotune_profile classifier_record_configured_profile \
+				classifier_record_resolved_profile <<EOF
+$classifier_record
+EOF
+			IFS="$old_ifs"
 			if [ "$classifier_record_instance" = "$instance" ]; then
 				classifier_attestation_state=ACTIVE
 				classifier_applied_target="$classifier_record_target"
-				classifier_applied_profile="$classifier_record_profile"
+				classifier_applied_autotune_profile="$classifier_record_autotune_profile"
+				classifier_applied_configured_profile="$classifier_record_configured_profile"
+				classifier_applied_resolved_profile="$classifier_record_resolved_profile"
+				classifier_applied_profile="$classifier_record_resolved_profile"
 				break
 			fi
 		done
@@ -417,7 +439,9 @@ emit_instance() {
 		add_issue "Traffic-priority rules require upload CAKE diffserv4; re-run Auto-Tune or update the SQM profile."
 	elif [ "$classifier_attestation_state" = ACTIVE ] &&
 	     { [ "$classifier_applied_target" != "$resolved_target" ] ||
-	       [ "$classifier_applied_profile" != "$classifier_profile" ]; }; then
+	       [ "$classifier_applied_autotune_profile" != "$autotune_profile" ] ||
+	       [ "$classifier_applied_configured_profile" != "$traffic_profile_mode" ] ||
+	       [ "$classifier_applied_resolved_profile" != "$traffic_profile_resolved" ]; }; then
 		classifier_state=DRIFTED
 		add_issue "Loaded traffic-priority rules target a stale interface or profile."
 	elif [ "$classifier_attestation_state" = ACTIVE ] &&
@@ -503,8 +527,13 @@ emit_instance() {
 		"$cake_dl_state" "$dl_cake_kind" "$dl_cake_mode" "$dl_cake_count" "$dl_cake_rate"
 	printf '"classifier_state":"%s","classifier_profile":"%s","classifier_global_state":"%s",' \
 		"$classifier_state" "$classifier_profile" "$classifier_global_state"
+	printf '"autotune_profile":"%s","traffic_profile_mode":"%s","traffic_profile_resolved":"%s",' \
+		"$autotune_profile" "$traffic_profile_mode" "$traffic_profile_resolved"
 	printf '"classifier_target":"%s","classifier_applied_profile":"%s",' \
 		"$(json_escape "$classifier_applied_target")" "$(json_escape "$classifier_applied_profile")"
+	printf '"classifier_applied_autotune_profile":"%s","classifier_applied_configured_profile":"%s","classifier_applied_resolved_profile":"%s",' \
+		"$classifier_applied_autotune_profile" "$classifier_applied_configured_profile" \
+		"$classifier_applied_resolved_profile"
 	printf '"ifb_state":"%s","ingress_state":"%s","apply_state":"%s","operation_state":"%s",' \
 		"$ifb_state" "$ingress_state" "$apply_state" "$operation_state"
 	printf '"issues":"%s","observed_at":%s}' "$(json_escape "$issues")" "$observed_at"

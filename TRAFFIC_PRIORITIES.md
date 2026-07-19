@@ -48,9 +48,29 @@ classification.
 | Fair | DNS, NTP | Interactive / AF41 |
 | Fair | HTTP/HTTPS and QUIC | Best effort / CS0 |
 
-Each built-in group has its own enable flag. The presets are intentionally
-small; they are starting policy, not a claim that every game or application
-uses a permanent universal port list.
+The editor presents one exclusive traffic profile:
+
+- **Automatic (recommended)** follows the instance's current Auto-Tune
+  profile;
+- **Gaming**, **Best overall**, and **Fair** pin traffic policy independently
+  of future Auto-Tune runs;
+- **Custom** runs only the editable rules assigned to Custom.
+
+Hovering a profile card previews its exact matches, classes and DSCP values;
+selecting it keeps the preview open for touch and keyboard users. The preview
+comes from the same catalog that generates the nftables rules, so the UI and
+runtime do not maintain two copies of the presets. The presets are
+intentionally small; they are starting policy, not a claim that every game or
+application uses a permanent universal port list.
+
+Desktop profile selection and the rule preview:
+
+[![Traffic priorities desktop view](docs/screenshots/traffic-priorities-desktop.png)](docs/screenshots/traffic-priorities-desktop.png)
+
+On a narrow screen the same fields become labelled cards rather than a
+horizontally compressed table:
+
+[![Traffic priorities mobile view](docs/screenshots/traffic-priorities-mobile.png)](docs/screenshots/traffic-priorities-mobile.png)
 
 ## Custom rules
 
@@ -74,8 +94,26 @@ A custom rule has:
 
 Built-in rules run first. Custom rules then run from the lowest order to the
 highest, so a later matching rule can deliberately override an earlier one.
+Rules assigned to Gaming, Best overall, or Fair supplement that profile.
+Rules assigned to Custom are active only in Custom mode. Inactive profile
+groups stay saved and visible; switching profiles never deletes them.
+
+**Customize this preset** creates an explicit Custom copy of the currently
+shown built-in rules with editable protocol and port fields. It stages the copy
+as normal LuCI/UCI pending changes, switches the instance to Custom, and still
+requires **Save & Apply**. It never commits automatically, overwrites an
+existing Custom group, or deletes another profile's rules. Because the copy is
+ordinary UCI data, package upgrades do not rewrite it.
+
+[![Custom preset staged for editing](docs/screenshots/traffic-priorities-custom.png)](docs/screenshots/traffic-priorities-custom.png)
+
 All values pass closed allowlists and nftables validation; no UCI value is
 executed as shell text.
+
+A legacy or manually written rule without `option profile` is treated as
+Custom and remains inactive under Automatic or any pinned built-in profile.
+This fail-safe default prevents a malformed rule from following profile
+changes; opening and saving it in LuCI writes the explicit Custom value.
 
 Example UCI rule:
 
@@ -104,10 +142,17 @@ Rules are installed only when all of these are true for the instance:
 4. upload CAKE is configured with `diffserv4`;
 5. no other enabled instance claims the same resolved uplink.
 
+Turning **Enable outbound traffic prioritization** off disables only this
+classifier. It does not stop Autorate or SQM, remove CAKE/IFB, or remove the
+bandwidth limits owned by the instance.
+
 The helper validates the complete nftables transaction before atomically
 replacing its private table. After apply it hashes the actual JSON ruleset and
-stores a RAM-only manifest binding each instance to its resolved interface and
-profile. The mandatory **Services** column reports:
+stores a RAM-only manifest binding each instance to its resolved interface,
+Auto-Tune profile, configured traffic-profile mode, and resolved traffic
+profile. The **Uplink / state** column shows both profiles explicitly, for
+example `Auto-Tune: Gaming` and `Priorities: Gaming · linked`. The mandatory
+**Services** column reports:
 
 - `ACTIVE` when the table, checksum, instance, interface, profile, and upload
   `diffserv4` queue agree;
@@ -118,6 +163,16 @@ profile. The mandatory **Services** column reports:
 
 The manifest lives under `/var/run`, is never written to flash, and disappears
 on stop or reboot.
+
+## Upgrade compatibility
+
+The service performs a one-time, idempotent migration when an existing
+instance has no `traffic_profile` option. An enabled or absent legacy defaults
+flag becomes `traffic_profile=auto`. If the active profile's legacy defaults
+flag was explicitly disabled, that instance becomes `traffic_profile=custom`
+and only the rules belonging to that formerly active profile move to Custom.
+Rules saved for inactive profiles remain untouched. The separate
+`traffic_rules_enabled` opt-in is never enabled by migration.
 
 ## Multi-WAN
 

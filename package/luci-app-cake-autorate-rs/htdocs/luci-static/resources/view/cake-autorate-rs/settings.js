@@ -2197,6 +2197,11 @@ function writeWizardConfig(section_id, state) {
 	uci.set('cake-autorate', section_id, 'sqm_enabled', state.enabled ? '1' : '0');
 	uci.set('cake-autorate', section_id, 'autotune_profile',
 		selectedAutotuneProfile || 'best_overall');
+	if (state.is_new_instance) {
+		uci.set('cake-autorate', section_id, 'traffic_profile', 'auto');
+		uci.set('cake-autorate', section_id, 'traffic_profile_migrated', '1');
+		uci.set('cake-autorate', section_id, 'traffic_rules_enabled', '0');
+	}
 	uci.set('cake-autorate', section_id, 'speedtest_backend', state.speedtest_backend || 'auto');
 	if (state.speedtest_go_server_id)
 		uci.set('cake-autorate', section_id, 'speedtest_go_server_id', state.speedtest_go_server_id);
@@ -5233,6 +5238,7 @@ function showCreateWizard(grid, name, existingName) {
 				instanceState.mwan3_member = plan.member || '';
 				instanceState.route_selection = plan.member ? 'mwan3:' + plan.member : 'main';
 				instanceState.sqm_section = plan.sqmSection;
+				instanceState.is_new_instance = !rerun;
 				instanceState.ping_extra_args = pingerInterfaceArgs(plan.device, instanceState.pinger_method || 'fping');
 					var existingQueue = state.mode === 'autotune' ? null :
 						findImportableSqmQueueForInterface(plan.device);

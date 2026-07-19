@@ -177,10 +177,22 @@ const unhealthyState = helpers.formatState({
 	sqm_runtime_healthy: false,
 	sqm_runtime_state: 'ERROR',
 	sqm_runtime_reason: 'download counter is missing for ifb4eth0',
-}, true);
+}, true, { autotune_profile: 'best_overall', traffic_rules_enabled: '0' }, null);
 assert.equal(unhealthyState.children[0].children, 'ERROR');
 assert.equal(unhealthyState.children[1].children, 'CAKE/IFB unavailable');
+assert.equal(unhealthyState.children[3].children, 'Auto-Tune: Best overall');
+assert.equal(unhealthyState.children[4].children, 'Priorities: Off');
 assert.match(unhealthyState.attrs.title, /download counter is missing/);
+const profiledState = helpers.formatState({
+	state: 'RUNNING', uplink_state: 'ACTIVE',
+}, true, {
+	autotune_profile: 'gaming', traffic_rules_enabled: '1', traffic_profile: 'auto',
+}, {
+	autotune_profile: 'gaming', traffic_profile_mode: 'auto',
+	traffic_profile_resolved: 'gaming', classifier_state: 'ACTIVE',
+});
+assert.equal(profiledState.children[2].children, 'Auto-Tune: Gaming');
+assert.equal(profiledState.children[3].children, 'Priorities: Gaming · linked');
 const healthyServices = helpers.formatServices({
 	overall_state: 'HEALTHY',
 	autorate_state: 'RUNNING',
@@ -198,8 +210,13 @@ const healthyServices = helpers.formatServices({
 	ingress_state: 'ACTIVE',
 	classifier_state: 'ACTIVE',
 	classifier_profile: 'best_overall',
+	traffic_profile_mode: 'auto',
+	traffic_profile_resolved: 'best_overall',
 	classifier_target: 'pppoe-wan',
 	classifier_applied_profile: 'best_overall',
+	classifier_applied_autotune_profile: 'best_overall',
+	classifier_applied_configured_profile: 'auto',
+	classifier_applied_resolved_profile: 'best_overall',
 	operation_state: 'IDLE',
 	apply_state: 'IDLE',
 	issues: '',
@@ -207,8 +224,8 @@ const healthyServices = helpers.formatServices({
 assert.equal(healthyServices.children[0].children, 'HEALTHY');
 assert.match(healthyServices.attrs.class, /cake-services-healthy/);
 assert.match(healthyServices.attrs.title, /Upload CAKE: ACTIVE on pppoe-wan at 806 Mbps/);
-assert.match(healthyServices.attrs.title, /Traffic rules: ACTIVE \(best_overall; upload CAKE diffserv4\)/);
-assert.match(healthyServices.attrs.title, /Attested rules: pppoe-wan \(best_overall\)/);
+assert.match(healthyServices.attrs.title, /Traffic rules: ACTIVE \(configured auto; resolved best_overall; upload CAKE diffserv4\)/);
+assert.match(healthyServices.attrs.title, /Attested rules: pppoe-wan \(Auto-Tune best_overall; configured auto; resolved best_overall\)/);
 const orphanedServices = helpers.formatServices({
 	overall_state: 'ORPHANED',
 	autorate_state: 'DISABLED',

@@ -19,6 +19,7 @@ case "$*" in
 	"-q get cake-autorate.wan_sqm.sqm_enabled") printf '%s\n' "${TC_SQM_ENABLED:-1}" ;;
 	"-q get cake-autorate.wan_sqm.traffic_rules_enabled") printf '%s\n' "${TC_RULES_ENABLED-1}" ;;
 	"-q get cake-autorate.wan_sqm.autotune_profile") printf '%s\n' "${TC_PROFILE:-gaming}" ;;
+	"-q get cake-autorate.wan_sqm.traffic_profile") printf '%s\n' "${TC_TRAFFIC_PROFILE:-}" ;;
 	"-q get cake-autorate.wan_sqm.sqm_script") printf '%s\n' "${TC_SQM_SCRIPT:-layer_cake.qos}" ;;
 	"-q get cake-autorate.wan_sqm.sqm_eqdisc_opts") printf '%s\n' "${TC_SQM_EQDISC_OPTS:-diffserv4}" ;;
 	"-q get cake-autorate.wan_sqm.wan_if") printf 'eth0\n' ;;
@@ -35,7 +36,7 @@ case "$*" in
 		;;
 	"-q get cake-autorate.rule1.enabled") printf '%s\n' "${TC_CUSTOM_ENABLED:-1}" ;;
 	"-q get cake-autorate.rule1.instance") printf 'wan_sqm\n' ;;
-	"-q get cake-autorate.rule1.profile") printf '%s\n' "${TC_CUSTOM_PROFILE:-gaming}" ;;
+	"-q get cake-autorate.rule1.profile") printf '%s\n' "${TC_CUSTOM_PROFILE-gaming}" ;;
 	"-q get cake-autorate.rule1.preset") printf '%s\n' "${TC_CUSTOM_PRESET:-wireguard}" ;;
 	"-q get cake-autorate.rule1.protocol") printf '%s\n' "${TC_CUSTOM_PROTOCOL:-udp}" ;;
 	"-q get cake-autorate.rule1.family") printf '%s\n' "${TC_CUSTOM_FAMILY:-any}" ;;
@@ -115,6 +116,21 @@ if grep -q 'dscp set cs1' "$ROOT/gaming.nft"; then
 	exit 1
 fi
 
+export TC_CUSTOM_PROFILE=''
+"$HELPER" render > "$ROOT/legacy-empty-profile.nft"
+if grep -q 'dport { 51820 } ip dscp set af41' "$ROOT/legacy-empty-profile.nft"; then
+	echo "a missing-profile rule leaked into the active built-in profile" >&2
+	exit 1
+fi
+export TC_TRAFFIC_PROFILE=custom
+"$HELPER" render > "$ROOT/legacy-empty-profile-custom.nft"
+grep -q 'dport { 51820 } ip dscp set af41' "$ROOT/legacy-empty-profile-custom.nft"
+unset TC_TRAFFIC_PROFILE
+unset TC_CUSTOM_PROFILE
+
+"$HELPER" presets > "$ROOT/presets.json"
+node -e 'const c=require(process.argv[1]); if (c.schema_version !== 1 || c.profiles.gaming.length !== 7 || c.profiles.best_overall.length !== 5 || c.profiles.fair.length !== 4) process.exit(1)' "$ROOT/presets.json"
+
 export TC_RULES_ENABLED=''
 "$HELPER" render > "$ROOT/upgrade-opt-in.nft"
 if grep -q 'oifname "eth0"' "$ROOT/upgrade-opt-in.nft"; then
@@ -132,10 +148,11 @@ fi
 grep -q 'dport { 51820 } ip dscp set af41' "$ROOT/custom-only.nft"
 
 export TC_DEFAULTS_GAMING=1
+export TC_TRAFFIC_PROFILE=auto
 : > "$TC_NFT_LOG"
 "$HELPER" apply > "$ROOT/apply.json"
 grep -q '"state":"active"' "$ROOT/apply.json"
-grep -q '"schema_version":2' "$ROOT/apply.json"
+grep -q '"schema_version":3' "$ROOT/apply.json"
 grep -q '"instances":1' "$ROOT/apply.json"
 grep -q '"custom_rules":1' "$ROOT/apply.json"
 grep -Eq '"ruleset_sha256":"[0-9a-f]{64}"' "$ROOT/apply.json"
@@ -146,10 +163,13 @@ grep -q 'table inet cake_autorate_dscp' "$TC_NFT_APPLIED"
 "$HELPER" status > "$ROOT/status-active.json"
 grep -q '"state":"active"' "$ROOT/status-active.json"
 grep -q '"instances":1' "$ROOT/status-active.json"
-grep -q '"attested_instances":"wan_sqm|eth0|gaming"' "$ROOT/status-active.json"
+grep -q '"attested_instances":"wan_sqm|eth0|gaming|auto|gaming"' "$ROOT/status-active.json"
 "$HELPER" status wan_sqm > "$ROOT/status-instance.json"
 grep -q '"state":"active"' "$ROOT/status-instance.json"
 grep -q '"target":"eth0"' "$ROOT/status-instance.json"
+grep -q '"autotune_profile":"gaming"' "$ROOT/status-instance.json"
+grep -q '"configured_profile":"auto"' "$ROOT/status-instance.json"
+grep -q '"resolved_profile":"gaming"' "$ROOT/status-instance.json"
 grep -q '"profile":"gaming"' "$ROOT/status-instance.json"
 "$HELPER" status missing_instance > "$ROOT/status-missing.json"
 grep -q '"state":"missing"' "$ROOT/status-missing.json"
@@ -166,6 +186,23 @@ if "$HELPER" render >/dev/null 2>&1; then
 fi
 export TC_CUSTOM_DESTINATION_PORTS=''
 export TC_CUSTOM_PRESET=wireguard
+
+export TC_TRAFFIC_PROFILE=best_overall
+"$HELPER" render > "$ROOT/manual-best.nft"
+grep -q 'tcp dport { 22 } ip dscp set af41' "$ROOT/manual-best.nft"
+if grep -q '27000-27100\|dport { 51820 }' "$ROOT/manual-best.nft"; then
+	echo "Gaming rules leaked into the manually selected Best overall profile" >&2
+	exit 1
+fi
+
+export TC_TRAFFIC_PROFILE=custom TC_CUSTOM_PROFILE=custom
+"$HELPER" render > "$ROOT/explicit-custom.nft"
+grep -q 'dport { 51820 } ip dscp set af41' "$ROOT/explicit-custom.nft"
+if grep -q '27000-27100\|dport { 53 }' "$ROOT/explicit-custom.nft"; then
+	echo "built-in rules leaked into the explicit Custom profile" >&2
+	exit 1
+fi
+export TC_TRAFFIC_PROFILE=auto TC_CUSTOM_PROFILE=gaming
 
 export TC_MANAGE_SQM=0
 "$HELPER" render > "$ROOT/unmanaged.nft"

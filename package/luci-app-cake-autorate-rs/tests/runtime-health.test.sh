@@ -25,6 +25,7 @@ case "$*" in
 	"-q get cake-autorate.wan_sqm.sqm_enabled") printf '%s\n' "${RH_SQM_ENABLED:-1}" ;;
 	"-q get cake-autorate.wan_sqm.traffic_rules_enabled") printf '%s\n' "${RH_RULES_ENABLED-1}" ;;
 	"-q get cake-autorate.wan_sqm.autotune_profile") printf '%s\n' "${RH_PROFILE:-best_overall}" ;;
+	"-q get cake-autorate.wan_sqm.traffic_profile") printf '%s\n' "${RH_TRAFFIC_PROFILE:-auto}" ;;
 	"-q get cake-autorate.wan_sqm.wan_if") printf 'eth0\n' ;;
 	"-q get cake-autorate.wan_sqm.sqm_interface") printf 'eth0\n' ;;
 	"-q get cake-autorate.wan_sqm.ul_if") printf 'eth0\n' ;;
@@ -80,10 +81,10 @@ case "${RH_CLASSIFIER_STATE:-active}" in
 	active)
 		if [ "$*" = "status wan_sqm" ]; then
 			printf '%s\n' \
-				"{\"state\":\"active\",\"table_present\":true,\"instance\":\"wan_sqm\",\"target\":\"${RH_CLASSIFIER_TARGET:-eth0}\",\"profile\":\"${RH_CLASSIFIER_PROFILE:-best_overall}\"}"
+				"{\"state\":\"active\",\"schema_version\":3,\"table_present\":true,\"instance\":\"wan_sqm\",\"target\":\"${RH_CLASSIFIER_TARGET:-eth0}\",\"autotune_profile\":\"${RH_PROFILE:-best_overall}\",\"configured_profile\":\"${RH_TRAFFIC_PROFILE:-auto}\",\"resolved_profile\":\"${RH_CLASSIFIER_PROFILE:-best_overall}\"}"
 		else
 			printf '%s\n' \
-				"{\"state\":\"active\",\"table_present\":true,\"attested_instances\":\"wan_sqm|${RH_CLASSIFIER_TARGET:-eth0}|${RH_CLASSIFIER_PROFILE:-best_overall}\"}"
+				"{\"state\":\"active\",\"schema_version\":3,\"table_present\":true,\"attested_instances\":\"wan_sqm|${RH_CLASSIFIER_TARGET:-eth0}|${RH_PROFILE:-best_overall}|${RH_TRAFFIC_PROFILE:-auto}|${RH_CLASSIFIER_PROFILE:-best_overall}\"}"
 		fi
 		;;
 	inactive) printf '%s\n' '{"state":"inactive","table_present":false}' ;;
@@ -141,7 +142,7 @@ mkdir -p "$ROOT/sys/ifb4eth0"
 export RH_ENABLED=1 RH_MANAGE=1 RH_SQM_ENABLED=1 RH_QUEUE_PRESENT=1
 export RH_QUEUE_ENABLED=1 RH_OWNER=wan_sqm RH_TARGET=eth0
 export RH_DAEMON_COUNT=1 RH_TC_MODE=healthy RH_MARKER=0
-export RH_RULES_ENABLED=1 RH_CLASSIFIER_STATE=active RH_PROFILE=best_overall
+export RH_RULES_ENABLED=1 RH_CLASSIFIER_STATE=active RH_PROFILE=best_overall RH_TRAFFIC_PROFILE=auto
 "$HELPER" > "$ROOT/healthy.json"
 assert_field "$ROOT/healthy.json" overall_state HEALTHY
 assert_field "$ROOT/healthy.json" autorate_state RUNNING
@@ -153,6 +154,9 @@ assert_field "$ROOT/healthy.json" cake_dl_rate_kbps 500000
 assert_field "$ROOT/healthy.json" ingress_state ACTIVE
 assert_field "$ROOT/healthy.json" classifier_state ACTIVE
 assert_field "$ROOT/healthy.json" classifier_profile best_overall
+assert_field "$ROOT/healthy.json" autotune_profile best_overall
+assert_field "$ROOT/healthy.json" traffic_profile_mode auto
+assert_field "$ROOT/healthy.json" traffic_profile_resolved best_overall
 assert_field "$ROOT/healthy.json" cake_ul_mode diffserv4
 
 export RH_RULES_ENABLED='' RH_CLASSIFIER_STATE=inactive

@@ -7,7 +7,7 @@ endif
 
 PKG_NAME:=cake-autorate-rs
 PKG_VERSION:=1.0_rc26
-PKG_RELEASE:=1
+PKG_RELEASE:=3
 
 PKG_MAINTAINER:=woffko
 PKG_LICENSE:=GPL-2.0-or-later

@@ -85,6 +85,17 @@ canonical_profile() {
 	esac
 }
 
+canonical_traffic_profile() {
+	case "$1" in
+		auto|'') printf 'auto\n' ;;
+		gaming) printf 'gaming\n' ;;
+		best_overall|best-overall|balanced) printf 'best_overall\n' ;;
+		fair) printf 'fair\n' ;;
+		custom) printf 'custom\n' ;;
+		*) return 1 ;;
+	esac
+}
+
 resolve_interface_device() {
 	local resolve_name="$1"
 	local resolve_status resolve_device
@@ -174,6 +185,71 @@ preset_values() {
 		wireguard) preset_protocol=udp; preset_source_ports=""; preset_destination_ports=51820 ;;
 		*) return 1 ;;
 	esac
+}
+
+profile_rule_lines() {
+	case "$1" in
+		gaming)
+			printf '%s\n' \
+				'dns|dns|voice' \
+				'ntp|ntp|voice' \
+				'web|web|best_effort' \
+				'quic|quic|best_effort' \
+				'steam_realtime|steam_realtime|voice' \
+				'xbox_live|xbox_live|voice' \
+				'playstation|playstation|voice'
+			;;
+		best_overall)
+			printf '%s\n' \
+				'dns|dns|voice' \
+				'ntp|ntp|voice' \
+				'ssh|ssh|video' \
+				'web|web|best_effort' \
+				'quic|quic|best_effort'
+			;;
+		fair)
+			printf '%s\n' \
+				'dns|dns|video' \
+				'ntp|ntp|video' \
+				'web|web|best_effort' \
+				'quic|quic|best_effort'
+			;;
+		*) return 1 ;;
+	esac
+}
+
+emit_presets_json() {
+	local catalog_profile catalog_line catalog_id catalog_preset catalog_class
+	local catalog_dscp first_profile=1 first_rule old_ifs
+	printf '{"schema_version":1,"profiles":{'
+	for catalog_profile in gaming best_overall fair; do
+		[ "$first_profile" = 1 ] || printf ','
+		first_profile=0
+		printf '"%s":[' "$catalog_profile"
+		first_rule=1
+		while IFS= read -r catalog_line; do
+			old_ifs="$IFS"
+			IFS='|'
+			read -r catalog_id catalog_preset catalog_class <<EOF
+$catalog_line
+EOF
+			IFS="$old_ifs"
+			preset_values "$catalog_preset" || fail "The built-in traffic catalog is invalid."
+			catalog_dscp="$(dscp_for_class "$catalog_class")" ||
+				fail "The built-in traffic catalog uses an invalid class."
+			[ "$first_rule" = 1 ] || printf ','
+			first_rule=0
+			printf '{"id":"%s","preset":"%s","class":"%s","dscp":"%s","protocol":"%s","source_ports":"%s","destination_ports":"%s"}' \
+				"$(json_escape "$catalog_id")" "$(json_escape "$catalog_preset")" \
+				"$(json_escape "$catalog_class")" "$(json_escape "$catalog_dscp")" \
+				"$(json_escape "$preset_protocol")" "$(json_escape "$preset_source_ports")" \
+				"$(json_escape "$preset_destination_ports")"
+		done <<EOF
+$(profile_rule_lines "$catalog_profile")
+EOF
+		printf ']'
+	done
+	printf '}}\n'
 }
 
 family_compatible() {
@@ -301,31 +377,18 @@ emit_builtin() {
 }
 
 emit_profile_defaults() {
-	case "$profile" in
-		gaming)
-			emit_builtin dns voice &&
-				emit_builtin ntp voice &&
-				emit_builtin web best_effort &&
-				emit_builtin quic best_effort &&
-				emit_builtin steam_realtime voice &&
-				emit_builtin xbox_live voice &&
-				emit_builtin playstation voice
-			;;
-		best_overall)
-			emit_builtin dns voice &&
-				emit_builtin ntp voice &&
-				emit_builtin ssh video &&
-				emit_builtin web best_effort &&
-				emit_builtin quic best_effort
-			;;
-		fair)
-			emit_builtin dns video &&
-				emit_builtin ntp video &&
-				emit_builtin web best_effort &&
-				emit_builtin quic best_effort
-			;;
-		*) return 1 ;;
-	esac
+	local builtin_line builtin_id builtin_preset builtin_class old_ifs
+	while IFS= read -r builtin_line; do
+		old_ifs="$IFS"
+		IFS='|'
+		read -r builtin_id builtin_preset builtin_class <<EOF
+$builtin_line
+EOF
+		IFS="$old_ifs"
+		emit_builtin "$builtin_preset" "$builtin_class" || return 1
+	done <<EOF
+$(profile_rule_lines "$profile")
+EOF
 }
 
 emit_custom_rule() {
@@ -338,7 +401,12 @@ emit_custom_rule() {
 	[ "$rule_enabled" = 1 ] || return 0
 	rule_instance="$("$uci_bin" -q get "cake-autorate.$rule_section.instance" 2>/dev/null)"
 	rule_profile="$("$uci_bin" -q get "cake-autorate.$rule_section.profile" 2>/dev/null)"
-	[ "$rule_instance" = "$instance" ] && [ "$(canonical_profile "$rule_profile" 2>/dev/null)" = "$profile" ] ||
+	# Old LuCI versions wrote an explicit profile. A missing value therefore
+	# means a manual or malformed rule, not "follow whichever profile is active".
+	# Keep it inert unless the user explicitly selects Custom.
+	[ -n "$rule_profile" ] || rule_profile=custom
+	[ "$rule_instance" = "$instance" ] &&
+		[ "$(canonical_traffic_profile "$rule_profile" 2>/dev/null)" = "$rule_match_profile" ] ||
 		return 0
 	rule_preset="$("$uci_bin" -q get "cake-autorate.$rule_section.preset" 2>/dev/null)"
 	[ -n "$rule_preset" ] || rule_preset=custom
@@ -384,6 +452,7 @@ render_ruleset() {
 	local requested_ruleset="$1"
 	local instance instance_enabled rules_enabled defaults_option defaults_enabled
 	local manage_sqm sqm_enabled sqm_script sqm_eqdisc_opts
+	local autotune_profile configured_profile legacy_traffic_profile
 	local chain_marker fragment seen_targets=""
 	ruleset_file="$requested_ruleset"
 	: > "$ruleset_file" || fail "Unable to create the nftables ruleset."
@@ -406,8 +475,32 @@ render_ruleset() {
 		[ -n "$rules_enabled" ] || rules_enabled=0
 		[ "$instance_enabled" = 1 ] && [ "$manage_sqm" = 1 ] &&
 			[ "$sqm_enabled" = 1 ] && [ "$rules_enabled" = 1 ] || continue
-		profile="$(canonical_profile "$("$uci_bin" -q get "cake-autorate.$instance.autotune_profile" 2>/dev/null)")" ||
-			fail "Instance $instance has an unsupported traffic profile."
+		autotune_profile="$(canonical_profile "$("$uci_bin" -q get "cake-autorate.$instance.autotune_profile" 2>/dev/null)")" ||
+			fail "Instance $instance has an unsupported Auto-Tune profile."
+		configured_profile="$("$uci_bin" -q get "cake-autorate.$instance.traffic_profile" 2>/dev/null)"
+		legacy_traffic_profile=0
+		if [ -z "$configured_profile" ]; then
+			defaults_option="traffic_defaults_$autotune_profile"
+			defaults_enabled="$("$uci_bin" -q get "cake-autorate.$instance.$defaults_option" 2>/dev/null)"
+			[ -n "$defaults_enabled" ] || defaults_enabled=1
+			if [ "$defaults_enabled" = 1 ]; then
+				configured_profile=auto
+			else
+				configured_profile=custom
+				legacy_traffic_profile=1
+			fi
+		fi
+		configured_profile="$(canonical_traffic_profile "$configured_profile")" ||
+			fail "Instance $instance has an unsupported traffic-priority profile."
+		case "$configured_profile" in
+			auto) profile="$autotune_profile"; rule_match_profile="$profile" ;;
+			gaming|best_overall|fair) profile="$configured_profile"; rule_match_profile="$profile" ;;
+			custom)
+				profile=custom
+				[ "$legacy_traffic_profile" = 1 ] && rule_match_profile="$autotune_profile" ||
+					rule_match_profile=custom
+				;;
+		esac
 		sqm_script="$("$uci_bin" -q get "cake-autorate.$instance.sqm_script" 2>/dev/null)"
 		sqm_eqdisc_opts="$("$uci_bin" -q get "cake-autorate.$instance.sqm_eqdisc_opts" 2>/dev/null)"
 		[ "$sqm_script" = layer_cake.qos ] || continue
@@ -429,7 +522,8 @@ render_ruleset() {
 		seen_targets="${seen_targets:+$seen_targets|}$target"
 		instance_count=$((instance_count + 1))
 		if [ -n "$state_instances_file" ]; then
-			printf '%s|%s|%s\n' "$instance" "$target" "$profile" >> "$state_instances_file" ||
+			printf '%s|%s|%s|%s|%s\n' "$instance" "$target" "$autotune_profile" \
+				"$configured_profile" "$profile" >> "$state_instances_file" ||
 				fail "Unable to record the traffic-rule instance manifest."
 		fi
 
@@ -438,10 +532,7 @@ render_ruleset() {
 			printf '\t\toifname "%s" ip dscp set cs0\n' "$target" >> "$fragment"
 			printf '\t\toifname "%s" ip6 dscp set cs0\n' "$target" >> "$fragment"
 		done
-		defaults_option="traffic_defaults_$profile"
-		defaults_enabled="$("$uci_bin" -q get "cake-autorate.$instance.$defaults_option" 2>/dev/null)"
-		[ -n "$defaults_enabled" ] || defaults_enabled=1
-		[ "$defaults_enabled" = 1 ] && emit_profile_defaults
+		[ "$profile" = custom ] || emit_profile_defaults
 		emit_custom_rules
 	done
 
@@ -486,14 +577,17 @@ prepare_runtime_dir() {
 load_manifest() {
 	local requested_instance="${1:-}"
 	local line line_number=0 manifest_schema="" manifest_recorded_digest=""
-	local manifest_instance manifest_target manifest_profile manifest_extra
+	local manifest_instance manifest_target manifest_autotune_profile
+	local manifest_configured_profile manifest_resolved_profile manifest_extra
 	local seen_instances=""
 
 	manifest_valid=0
 	manifest_found=0
 	manifest_count=0
 	manifest_target_value=""
-	manifest_profile_value=""
+	manifest_autotune_profile_value=""
+	manifest_configured_profile_value=""
+	manifest_resolved_profile_value=""
 	manifest_digest_value=""
 	manifest_serialized=""
 	[ -f "$state_file" ] && [ ! -L "$state_file" ] || return 1
@@ -503,7 +597,7 @@ load_manifest() {
 		case "$line_number" in
 			1) manifest_schema="${line#schema_version=}"
 				[ "$line" = "schema_version=$manifest_schema" ] &&
-					[ "$manifest_schema" = 2 ] || return 1
+					[ "$manifest_schema" = 3 ] || return 1
 				;;
 			2) manifest_recorded_digest="${line#ruleset_sha256=}"
 				[ "$line" = "ruleset_sha256=$manifest_recorded_digest" ] &&
@@ -512,24 +606,30 @@ load_manifest() {
 			*)
 				old_ifs="$IFS"
 				IFS='|'
-				read -r manifest_instance manifest_target manifest_profile manifest_extra <<EOF
+				read -r manifest_instance manifest_target manifest_autotune_profile \
+					manifest_configured_profile manifest_resolved_profile manifest_extra <<EOF
 $line
 EOF
 				IFS="$old_ifs"
 				[ -z "$manifest_extra" ] &&
 					safe_name "$manifest_instance" &&
 					safe_interface "$manifest_target" &&
-					[ "$(canonical_profile "$manifest_profile" 2>/dev/null)" = "$manifest_profile" ] ||
+					[ "$(canonical_profile "$manifest_autotune_profile" 2>/dev/null)" = "$manifest_autotune_profile" ] &&
+					[ "$(canonical_traffic_profile "$manifest_configured_profile" 2>/dev/null)" = "$manifest_configured_profile" ] &&
+					[ "$(canonical_traffic_profile "$manifest_resolved_profile" 2>/dev/null)" = "$manifest_resolved_profile" ] &&
+					[ "$manifest_resolved_profile" != auto ] ||
 					return 1
 				case "|$seen_instances|" in *"|$manifest_instance|"*) return 1 ;; esac
 				seen_instances="${seen_instances:+$seen_instances|}$manifest_instance"
 				manifest_count=$((manifest_count + 1))
-				manifest_serialized="${manifest_serialized:+$manifest_serialized;}$manifest_instance|$manifest_target|$manifest_profile"
+				manifest_serialized="${manifest_serialized:+$manifest_serialized;}$manifest_instance|$manifest_target|$manifest_autotune_profile|$manifest_configured_profile|$manifest_resolved_profile"
 				if [ -n "$requested_instance" ] &&
 				   [ "$manifest_instance" = "$requested_instance" ]; then
 					manifest_found=1
 					manifest_target_value="$manifest_target"
-					manifest_profile_value="$manifest_profile"
+					manifest_autotune_profile_value="$manifest_autotune_profile"
+					manifest_configured_profile_value="$manifest_configured_profile"
+					manifest_resolved_profile_value="$manifest_resolved_profile"
 				fi
 				;;
 		esac
@@ -567,7 +667,7 @@ case "$action" in
 		if [ "$instance_count" -eq 0 ]; then
 			clear_table
 			remove_state_file
-			printf '{"state":"inactive","schema_version":2,"instances":0,"builtin_rules":0,"custom_rules":0}\n'
+			printf '{"state":"inactive","schema_version":3,"instances":0,"builtin_rules":0,"custom_rules":0}\n'
 			exit 0
 		fi
 		batch_file="$ruleset_file.batch"
@@ -590,7 +690,7 @@ case "$action" in
 		}
 		chmod 600 "$state_work_file" 2>/dev/null || true
 		{
-			printf 'schema_version=2\n'
+			printf 'schema_version=3\n'
 			printf 'ruleset_sha256=%s\n' "$applied_digest"
 			cat "$state_instances_file"
 		} > "$state_work_file" || {
@@ -604,7 +704,7 @@ case "$action" in
 			fail "Unable to publish attested traffic-classifier state."
 		}
 		state_work_file=""
-		printf '{"state":"active","schema_version":2,"instances":%s,"builtin_rules":%s,"custom_rules":%s,"ruleset_sha256":"%s"}\n' \
+		printf '{"state":"active","schema_version":3,"instances":%s,"builtin_rules":%s,"custom_rules":%s,"ruleset_sha256":"%s"}\n' \
 			"$instance_count" "$builtin_rule_count" "$custom_rule_count" "$applied_digest"
 		rm -f "$batch_file"
 		batch_file=""
@@ -613,40 +713,46 @@ case "$action" in
 		command -v "$nft_bin" >/dev/null 2>&1 || exit 0
 		clear_table
 		remove_state_file
-		printf '{"state":"inactive","schema_version":2}\n'
+		printf '{"state":"inactive","schema_version":3}\n'
+		;;
+	presets)
+		emit_presets_json
 		;;
 	status)
 		requested_instance="${2:-}"
 		[ -z "$requested_instance" ] || safe_name "$requested_instance" ||
 			fail "The requested traffic-classifier instance name is unsafe."
 		if ! command -v "$nft_bin" >/dev/null 2>&1; then
-			printf '{"state":"unavailable","schema_version":2,"table_present":false,"table":"inet %s"}\n' "$table_name"
+			printf '{"state":"unavailable","schema_version":3,"table_present":false,"table":"inet %s"}\n' "$table_name"
 		elif ! table_present; then
-			printf '{"state":"inactive","schema_version":2,"table_present":false,"table":"inet %s","stale_manifest":%s}\n' \
+			printf '{"state":"inactive","schema_version":3,"table_present":false,"table":"inet %s","stale_manifest":%s}\n' \
 				"$table_name" "$([ -e "$state_file" ] || [ -L "$state_file" ] && printf true || printf false)"
 		elif ! load_manifest "$requested_instance"; then
-			printf '{"state":"untracked","schema_version":2,"table_present":true,"table":"inet %s"}\n' "$table_name"
+			printf '{"state":"untracked","schema_version":3,"table_present":true,"table":"inet %s"}\n' "$table_name"
 		else
 			actual_digest="$(ruleset_digest 2>/dev/null || true)"
 			if [ "$actual_digest" != "$manifest_digest_value" ]; then
-				printf '{"state":"drifted","schema_version":2,"table_present":true,"table":"inet %s","instances":%s}\n' \
+				printf '{"state":"drifted","schema_version":3,"table_present":true,"table":"inet %s","instances":%s}\n' \
 					"$table_name" "$manifest_count"
 			elif [ -n "$requested_instance" ] && [ "$manifest_found" != 1 ]; then
-				printf '{"state":"missing","schema_version":2,"table_present":true,"table":"inet %s","instance":"%s"}\n' \
+				printf '{"state":"missing","schema_version":3,"table_present":true,"table":"inet %s","instance":"%s"}\n' \
 					"$table_name" "$(json_escape "$requested_instance")"
 			elif [ -n "$requested_instance" ]; then
-				printf '{"state":"active","schema_version":2,"table_present":true,"table":"inet %s","instance":"%s","target":"%s","profile":"%s","ruleset_sha256":"%s"}\n' \
+				printf '{"state":"active","schema_version":3,"table_present":true,"table":"inet %s","instance":"%s","target":"%s","autotune_profile":"%s","configured_profile":"%s","resolved_profile":"%s","profile":"%s","ruleset_sha256":"%s"}\n' \
 					"$table_name" "$(json_escape "$requested_instance")" \
 					"$(json_escape "$manifest_target_value")" \
-					"$(json_escape "$manifest_profile_value")" "$manifest_digest_value"
+					"$(json_escape "$manifest_autotune_profile_value")" \
+					"$(json_escape "$manifest_configured_profile_value")" \
+					"$(json_escape "$manifest_resolved_profile_value")" \
+					"$(json_escape "$manifest_resolved_profile_value")" "$manifest_digest_value"
 			else
-				printf '{"state":"active","schema_version":2,"table_present":true,"table":"inet %s","instances":%s,"attested_instances":"%s","ruleset_sha256":"%s"}\n' \
+				printf '{"state":"active","schema_version":3,"table_present":true,"table":"inet %s","instances":%s,"attested_instances":"%s","ruleset_sha256":"%s"}\n' \
 					"$table_name" "$manifest_count" "$(json_escape "$manifest_serialized")" \
 					"$manifest_digest_value"
 			fi
 		fi
 		;;
 	*)
-		fail "usage: traffic-classifier render|apply|clear|status"
+		fail "usage: traffic-classifier render|apply|clear|presets|status"
 		;;
 esac

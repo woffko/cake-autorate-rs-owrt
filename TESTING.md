@@ -53,9 +53,11 @@ Full Auto-Tune isolation, failover/failback, and route relearning. Production
 deployment is permitted only after both the original single-WAN safety gate
 and this Multi-WAN gate pass.
 
-Release offline bundles must be installed with networking disabled into an
-empty APK root. Published assets must then be downloaded again and validated
-against the published `SHA256SUMS`.
+For releases that publish an offline bundle, install it with networking
+disabled into an empty APK root and validate the redownloaded assets against
+the published checksums. Direct-APK releases such as RC26-r7 instead verify
+the exact published APK hashes and install them through a router configured
+with compatible OpenWrt package feeds.
 
 RC13 adds deterministic UI and calibration gates: clean package config must
 contain no `cake_autorate` section; mandatory Status columns cannot be hidden;
@@ -1823,3 +1825,48 @@ Edit and the Re-run Auto-Tune entry at desktop and 390-pixel mobile widths with
 the RC26-r4 version banner, no page/console/RPC errors and no horizontal
 overflow. Evidence is retained under
 `/home/tester/cake-autorate-rs-owrt/test-logs/rc26-r4-save-apply-77`.
+
+## RC26-r7 traffic-profile and responsive-UI validation
+
+RC26-r7 replaces the ambiguous independent preset checkboxes with one explicit
+per-instance policy: Automatic, Gaming, Best overall, Fair, or Custom. The
+classifier master remains a separate opt-in. A one-time migration adds only a
+resolved `traffic_profile` and its marker; it never enables outbound rules.
+Backend rendering and LuCI previews consume the same catalog, and runtime
+health binds the configured mode plus the resolved profile to its RAM-only
+manifest.
+
+Deterministic shell and JavaScript fixtures cover legacy migration, explicit
+master-off behavior, catalog/renderer parity, Custom-copy staging, scoped ACL,
+runtime drift, status labels, keyboard/touch selection, and the responsive
+preview. Authenticated Playwright then exercised the isolated x86_64 test
+router at desktop and 390-pixel mobile widths. Automatic, all three pinned
+profiles, and Custom rendered without page, console, RPC, or horizontal
+overflow errors; the narrow preview used labelled cards and a staged Custom
+copy remained an unsaved LuCI transaction. Anonymized captures are committed
+under `docs/screenshots/`.
+
+The exact release candidates were then upgraded in place on an anonymized
+x86_64 Multi-WAN router and an anonymized rockchip/armv8 cellular router.
+Existing cake-autorate, SQM, network, and mwan3 configuration hashes and live
+CAKE rates remained unchanged. Existing instances returned `HEALTHY`; only the
+safe profile-migration keys were added. Each outbound-classifier setting was
+preserved: it remained disabled on the isolated test and cellular routers and
+remained active with the existing Gaming policy on the Multi-WAN router.
+Cache-bypassed desktop/mobile Playwright checks found no JavaScript, RPC,
+layout, or horizontal-overflow errors and confirmed the expected per-instance
+preview counts.
+
+The release APK SHA256 values are:
+
+- x86_64 daemon `cake-autorate-rs-1.0_rc26-r3`:
+  `819ceeb0378d49a2c73bd53b9e4f79e3b18a671ac44bc01b835cd9aa599cfc29`;
+- aarch64_generic daemon `cake-autorate-rs-1.0_rc26-r3`:
+  `dce3ea44a604c5207546eae6646d89741d87f40e996ca63859f0fa829baa285a`;
+- noarch LuCI `luci-app-cake-autorate-rs-1.0_rc26-r7`:
+  `f4c4be4eaa536e4453035552be38486ca4df1fa8ef1b054c6812f0f079586677`.
+
+Local evidence is retained under
+`/home/tester/cake-autorate-rs-owrt/test-logs/rc26-r7-test-router-smoke`,
+`/home/tester/cake-autorate-rs-owrt/test-logs/rc26-r7-production-77`, and
+`/home/tester/cake-autorate-rs-owrt/test-logs/rc26-r7-production-100`.
