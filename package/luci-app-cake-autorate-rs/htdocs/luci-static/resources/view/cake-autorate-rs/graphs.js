@@ -182,32 +182,16 @@ function loadInstances(sections) {
 	}));
 }
 
-function saveGraphConfig(section, control) {
-	control.disabled = true;
-
-	return uci.save().then(function() {
-		return uci.apply(30);
-	}).then(function() {
-		return fs.exec('/etc/init.d/cake-autorate', [ 'restart' ]);
-	}).then(function(result) {
-		if (result.code !== 0)
-			throw new Error(result.stderr || _('Unable to restart CAKE Autorate.'));
-
-		window.location = window.location.href.split('#')[0];
-	}).catch(function(err) {
-		control.disabled = false;
-		ui.addNotification(null,
-			E('p', _('Unable to update graph settings: %s').format(err.message || err)),
-			'error');
-	});
-}
-
-function setHistoryEnabled(section, enabled, button) {
+function setHistoryEnabled(section, enabled, interval, button) {
 	uci.set('cake-autorate', section, 'graph_history_enabled', enabled ? '1' : '0');
-	return saveGraphConfig(section, button);
+	button.setAttribute('data-enabled', enabled ? '1' : '0');
+	button.className = enabled ?
+		'btn cbi-button cbi-button-negative' : 'btn cbi-button cbi-button-action';
+	button.textContent = enabled ? _('Disable history') : _('Enable history');
+	return graphRefreshNow ? graphRefreshNow() : Promise.resolve();
 }
 
-function setHistoryInterval(section, interval, select, previous) {
+function setHistoryInterval(section, enabled, interval, select, previous) {
 	interval = Number(interval);
 	if (!isFinite(interval) || interval < 1 || interval > 60) {
 		select.value = String(previous);
@@ -215,10 +199,7 @@ function setHistoryInterval(section, interval, select, previous) {
 	}
 
 	uci.set('cake-autorate', section, 'graph_history_interval_s', String(Math.round(interval)));
-	return saveGraphConfig(section, select).then(function() {
-		if (!select.disabled)
-			select.value = String(previous);
-	});
+	return graphRefreshNow ? graphRefreshNow() : Promise.resolve();
 }
 
 function formatMemoryKib(kib) {
@@ -241,20 +222,8 @@ function budgetLabel(kib) {
 }
 
 function setHistoryBudget(value, select, previous) {
-	select.disabled = true;
-	return fs.exec('/usr/libexec/cake-autorate-rs/graph-history', [
-		'globals', 'set-budget', String(value)
-	]).then(function(result) {
-		if (result.code !== 0)
-			throw new Error(result.stderr || _('Unable to save the RAM budget.'));
-		window.location = window.location.href.split('#')[0];
-	}).catch(function(err) {
-		select.disabled = false;
-		select.value = String(previous);
-		ui.addNotification(null,
-			E('p', _('Unable to update graph RAM budget: %s').format(err.message || err)),
-			'error');
-	});
+	uci.set('cake-autorate', 'globals', 'graph_history_ram_budget_kib', String(value));
+	return graphRefreshNow ? graphRefreshNow() : Promise.resolve();
 }
 
 function renderMemoryBudget(instances, globalSection) {
@@ -879,7 +848,7 @@ function bindScroll(viewport, latestButton, section) {
 	});
 }
 
-function renderIntervalSelect(sectionName, interval) {
+function renderIntervalSelect(sectionName, enabled, interval) {
 	var select = E('select', {
 		'class': 'cbi-input-select cake-graph-interval',
 		'title': _('Graph sample interval')
@@ -889,7 +858,7 @@ function renderIntervalSelect(sectionName, interval) {
 
 	select.value = String(interval);
 	select.addEventListener('change', function() {
-		return setHistoryInterval(sectionName, select.value, select, interval);
+		return setHistoryInterval(sectionName, enabled, select.value, select, interval);
 	});
 
 	return E('label', { 'class': 'cake-graph-interval-label' }, [
@@ -913,12 +882,14 @@ function renderCard(instance) {
 	var totalSamples = Number(instance.historyTotal || (instance.history || []).length);
 	var pageOffset = Number(instance.historyOffset || 0);
 	var button = E('button', {
-		'class': enabled ? 'btn cbi-button cbi-button-negative' : 'btn cbi-button cbi-button-action'
+		'class': enabled ? 'btn cbi-button cbi-button-negative' : 'btn cbi-button cbi-button-action',
+		'data-enabled': enabled ? '1' : '0'
 	}, enabled ? _('Disable history') : _('Enable history'));
 	var body;
 
 	button.addEventListener('click', function() {
-		return setHistoryEnabled(sectionName, !enabled, button);
+		var nextEnabled = button.getAttribute('data-enabled') !== '1';
+		return setHistoryEnabled(sectionName, nextEnabled, interval, button);
 	});
 
 	if (enabled) {
@@ -1042,7 +1013,7 @@ function renderCard(instance) {
 					String(status.state || '-').toUpperCase()))
 			]),
 			E('div', { 'class': 'cake-graph-actions' }, [
-				renderIntervalSelect(sectionName, interval),
+		renderIntervalSelect(sectionName, enabled, interval),
 				button
 			])
 		]),
@@ -1118,9 +1089,11 @@ return L.view.extend({
 		]);
 
 		graphRefreshNow = function() {
-			return loadInstances(sections).then(function(instances) {
+			var nextSections = uci.sections('cake-autorate', 'cake_autorate');
+			var nextGlobalSection = uci.sections('cake-autorate', 'globals')[0] || {};
+			return loadInstances(nextSections).then(function(instances) {
 				var nextContent = renderInstances(instances);
-				var nextMemoryPanel = renderMemoryBudget(instances, globalSection);
+				var nextMemoryPanel = renderMemoryBudget(instances, nextGlobalSection);
 				if (content.parentNode) {
 					content.parentNode.replaceChild(nextContent, content);
 					content = nextContent;
@@ -1136,7 +1109,18 @@ return L.view.extend({
 		return root;
 	},
 
-	handleSaveApply: null,
-	handleSave: null,
-	handleReset: null
+	handleSave: function() {
+		return uci.save();
+	},
+
+	handleSaveApply: function(ev, mode) {
+		return this.handleSave(ev).then(function() {
+			return ui.changes.apply(mode == '0');
+		});
+	},
+
+	handleReset: function() {
+		uci.unload('cake-autorate');
+		window.location = window.location.href.split('#')[0];
+	}
 });

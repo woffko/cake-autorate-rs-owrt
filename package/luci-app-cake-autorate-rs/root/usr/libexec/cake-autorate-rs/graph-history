@@ -16,6 +16,33 @@ run_root="${CAKE_AUTORATE_RUN_ROOT:-/var/run/cake-autorate}"
 uci_bin="${CAKE_AUTORATE_UCI_BIN:-uci}"
 path="$run_root/$section/history.csv"
 
+commit_graph_options() {
+	local transaction_root lock_bin lock_path option locked=0
+	transaction_root="$(mktemp -d "${TMPDIR:-/tmp}/cake-graph-config.XXXXXX")" || return 1
+	lock_bin="${CAKE_AUTORATE_LOCK_BIN:-lock}"
+	lock_path="${CAKE_AUTORATE_GRAPH_LOCK:-/var/lock/cake-autorate-graph-config.lock}"
+	cleanup_graph_options() {
+		[ "$locked" = 0 ] || "$lock_bin" -u "$lock_path" >/dev/null 2>&1 || true
+		rm -rf "$transaction_root"
+	}
+	trap cleanup_graph_options EXIT INT TERM
+
+	if command -v "$lock_bin" >/dev/null 2>&1; then
+		"$lock_bin" -n "$lock_path" || {
+			echo "another graph configuration update is running" >&2
+			return 75
+		}
+		locked=1
+	fi
+
+	for option in "$@"; do
+		"$uci_bin" -t "$transaction_root" set "$option" || return 1
+	done
+	"$uci_bin" -t "$transaction_root" commit cake-autorate || return 1
+	cleanup_graph_options
+	trap - EXIT INT TERM
+}
+
 case "$mode" in
 	read)
 		case "$offset" in ''|*[!0-9]*) exit 2 ;; esac
@@ -42,9 +69,9 @@ case "$mode" in
 			auto|256|512|1024|2048|4096|8192|16384|32768|65536|102400) ;;
 			*) echo "invalid RAM budget" >&2; exit 2 ;;
 		esac
-		"$uci_bin" -q get cake-autorate.globals >/dev/null 2>&1 || "$uci_bin" set cake-autorate.globals=globals
-		"$uci_bin" set "cake-autorate.globals.graph_history_ram_budget_kib=$value"
-		"$uci_bin" commit cake-autorate
+		"$uci_bin" -q get cake-autorate.globals >/dev/null 2>&1 ||
+			commit_graph_options cake-autorate.globals=globals || exit $?
+		commit_graph_options "cake-autorate.globals.graph_history_ram_budget_kib=$value"
 		;;
 	*)
 		echo "usage: graph-history INSTANCE read [OFFSET LIMIT] | stats | set-budget VALUE" >&2

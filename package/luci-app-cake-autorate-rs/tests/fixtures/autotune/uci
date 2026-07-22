@@ -26,6 +26,14 @@ case "$action:$key" in
 		instance="${instance%.sqm_section}"
 		printf 'cake_%s\n' "$instance"
 		;;
+	get:cake-autorate.*.sqm_download|get:cake-autorate.*.base_dl_shaper_rate_kbps|get:cake-autorate.*.max_dl_shaper_rate_kbps)
+		[ -n "${AUTOTUNE_MOCK_CONFIGURED_DL_KBPS:-}" ] || exit 1
+		printf '%s\n' "$AUTOTUNE_MOCK_CONFIGURED_DL_KBPS"
+		;;
+	get:cake-autorate.*.sqm_upload|get:cake-autorate.*.base_ul_shaper_rate_kbps|get:cake-autorate.*.max_ul_shaper_rate_kbps)
+		[ -n "${AUTOTUNE_MOCK_CONFIGURED_UL_KBPS:-}" ] || exit 1
+		printf '%s\n' "$AUTOTUNE_MOCK_CONFIGURED_UL_KBPS"
+		;;
 	get:sqm.cake_*._cake_autorate_managed)
 		[ "${AUTOTUNE_MOCK_UCI_ABSENT:-0}" != 1 ] || exit 1
 		instance="${key#sqm.cake_}"

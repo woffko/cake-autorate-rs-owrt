@@ -22,11 +22,16 @@ const windowStub = {
 	devicePixelRatio: 1,
 	requestAnimationFrame: callback => callback(),
 };
+const uciCalls = [];
+const uciStub = {
+	set: (...args) => uciCalls.push(args),
+};
 const loadHelpers = new Function('fs', 'poll', 'uci', 'ui', 'L', 'E', '_', 'window',
 	`${prefix}\nreturn { parseHistory, historyInterval, buildChartGeometry, nearestPoint, ` +
 		'bindHover, bindScroll, scrollState, scrollMaximum, formatMemoryKib, lineConnected, niceRateCeiling, ' +
-		'collectChartEvents, clusterChartEvents, chartEventClusters, eventLabelPlacement, layoutEventLabels };');
-const helpers = loadHelpers({}, {}, {}, {}, {}, () => {}, value => value, windowStub);
+		'collectChartEvents, clusterChartEvents, chartEventClusters, eventLabelPlacement, layoutEventLabels, ' +
+		'setHistoryEnabled, setHistoryInterval, setHistoryBudget };');
+const helpers = loadHelpers({}, {}, uciStub, {}, {}, () => {}, value => value, windowStub);
 
 function assert(condition, message) {
 	if (!condition)
@@ -51,6 +56,27 @@ assert(source.includes('HISTORY_PAGE_SAMPLES = 10000'),
 	'large histories must be fetched in bounded pages');
 assert(source.includes('graph_history_ram_budget_kib'),
 	'Graphs must expose the global RAM budget');
+assert(source.includes("ui.changes.apply(mode == '0')") && source.includes('handleSave: function()'),
+	'Graphs must use the standard LuCI Save & Apply footer workflow');
+assert(!source.includes('uci.apply('),
+	'Graphs must not navigate away from the deferred uci.apply() confirmation timer');
+const historyButton = {
+	attributes: {},
+	setAttribute(name, value) { this.attributes[name] = value; },
+	className: '',
+	textContent: '',
+};
+helpers.setHistoryEnabled('wan_sqm', true, 10, historyButton);
+helpers.setHistoryInterval('wan_sqm', true, 30, { value: '30' }, 10);
+helpers.setHistoryBudget('2048', { value: '2048' }, 'auto');
+assert(uciCalls.some(call => call.join('|') === 'cake-autorate|wan_sqm|graph_history_enabled|1'),
+	'enabled control must stage its UCI value without applying it');
+assert(uciCalls.some(call => call.join('|') === 'cake-autorate|wan_sqm|graph_history_interval_s|30'),
+	'interval control must stage its UCI value without applying it');
+assert(uciCalls.some(call => call.join('|') === 'cake-autorate|globals|graph_history_ram_budget_kib|2048'),
+	'RAM budget control must participate in the same standard Save & Apply transaction');
+assert(historyButton.attributes['data-enabled'] === '1' && historyButton.textContent === 'Disable history',
+	'enabled control must reflect its staged state before Save & Apply');
 assert(source.includes('Show safety floors') && source.includes('if (showFloors && point.dlFloor'),
 	'safety floors must be optional and excluded from the default traffic scale');
 assert(helpers.formatMemoryKib(1024) === '1.0 MiB', 'memory formatter failed');

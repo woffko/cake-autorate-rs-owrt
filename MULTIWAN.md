@@ -148,8 +148,16 @@ A router-side speed test or Full Auto-Tune job:
 
 For `speedtest-go`, Full Auto-Tune selects a server on the first raw sample and
 passes that ID to every later raw and shaped phase. The pin is job-local and
-does not rewrite UCI. A candidate that changes route, address, or server fails
-closed and writes no configuration.
+does not rewrite UCI. Because `speedtest-go` is a static Go binary, it cannot
+use mwan3's `LD_PRELOAD` socket-mark wrapper. The package therefore runs only
+that backend as its unprivileged `cake-speedtest` user and installs a temporary
+UID-scoped nftables route hook after mwan3's output hook. A global RAM lock
+prevents two members from assigning different marks to that UID concurrently.
+The result is accepted only when the selected L3 interface's RX/TX counters
+also prove a minimum share of the reported download and upload payload. The
+temporary table and lock are removed on success, failure, signal, or stale-owner
+recovery. A candidate that changes route, address or server, or lacks this byte
+proof, fails closed and writes no configuration.
 
 The optional native traffic classifier follows the same isolation rule. It
 owns one private nftables table for the application but emits a separate
@@ -171,6 +179,25 @@ wanb -> eth0
 
 The Multi-WAN creation mode detects unique enabled members and previews the
 instance names, target devices, SQM sections, and conflicts before saving.
+Full Auto-Tune then presents one member at a time. Every member retains an
+independent calibration profile, result, diagnostics, and Accept/Skip decision;
+changing the current profile or retrying its test cannot alter an earlier
+accepted result. A failed or inconclusive run remains on that member for Retry,
+Conservative retry, or explicit Skip instead of silently starting the next
+WAN. **Accept safe proposal** is enabled only for a shaped proposal that passes
+the same schema-8 reviewability predicate used by final staging. `trusted` may
+be eligible for unattended apply; `provisional` and `estimated` are always an
+explicit per-member decision. Skip is available after settled
+runtime recovery, including before testing when the user deliberately wants an
+uncalibrated placeholder. The final Review lists accepted and skipped uplinks
+before any UCI write. After confirmation, accepted uplinks are applied one at a
+time through the existing single-proposal Apply Guard: stage one marker, arm,
+rollback-enabled apply, runtime proof, confirm, then reload UCI before the next
+member. The first failure halts the batch. Explicitly skipped uplinks are added
+disabled in a final rollback-enabled transaction only after proving that no
+Auto-Tune marker remains. This prevents the former two-marker Save failure
+without weakening the server guard or combining independent CAKE owners into
+one ambiguous transaction.
 Status shows lifecycle state, route/member/device, source and external address,
 fwmark, routing table, policy share, complete Services reconciliation
 (daemon/SQM/CAKE/IFB/redirect/rules), and the reason for standby/offline.
@@ -186,6 +213,16 @@ decision are per-uplink. History remains RAM-only. One
 global memory budget is divided across every enabled instance; no WAN can claim
 another WAN's full allowance, and low-memory suspension affects only telemetry,
 not shaping or route lifecycle.
+
+When the creation wizard calibrates an uplink with no saved rates, its traffic
+threshold is not derived from a synthetic fallback. The member's first
+baseline is retained provisionally, the first speed control remains pinned to
+that member, and the measured DL/UL capacities resolve separate total-interface
+and forwarded-client limits. A retrospectively contaminated member remains on
+its own Review step and may be retried, continued once with conservative
+confidence, or skipped; it cannot contaminate or advance another member. Any
+safe result retaining contaminated evidence is manual-only and carries its own
+typed confidence reasons; a fresh fully clean rerun may become trusted.
 
 ## Diagnostics
 

@@ -318,6 +318,197 @@ route_exec() {
 	fi
 }
 
+# nft-mwan3 routes dynamically linked programs by injecting an SO_MARK wrapper
+# through LD_PRELOAD. speedtest-go is a static Go binary, so its bulk sockets do
+# not pass through that wrapper. Run only that backend under a package-owned,
+# unprivileged uid and override mwan3's output mark for that uid in a temporary
+# route-hook chain. The lock is global because two different member marks for
+# the same uid would be ambiguous.
+speedtest_route_pin_lock="${CAKE_AUTORATE_SPEEDTEST_ROUTE_PIN_LOCK:-/tmp/cake-autorate-speedtest-route-pin.lock}"
+speedtest_route_pin_active=0
+speedtest_route_pin_table=""
+speedtest_route_pin_uid=""
+speedtest_route_pin_gid=""
+speedtest_route_pin_owner_start=""
+speedtest_route_proof_error=""
+
+speedtest_route_pin_lock_safe() {
+	[ -d "$speedtest_route_pin_lock" ] && [ ! -L "$speedtest_route_pin_lock" ] || return 1
+	command -v runtime_lock_path_owned_by_euid >/dev/null 2>&1 || return 1
+	runtime_lock_path_owned_by_euid "$speedtest_route_pin_lock"
+}
+
+release_speedtest_route_pin() {
+	local owner_pid owner_start owner_table
+
+	[ "${speedtest_route_pin_active:-0}" = 1 ] || return 0
+	speedtest_route_pin_lock_safe || return 1
+	owner_pid="$(sed -n '1p' "$speedtest_route_pin_lock/owner" 2>/dev/null)"
+	owner_start="$(sed -n '2p' "$speedtest_route_pin_lock/owner" 2>/dev/null)"
+	owner_table="$(sed -n '3p' "$speedtest_route_pin_lock/owner" 2>/dev/null)"
+	[ "$owner_pid" = "$$" ] && [ "$owner_start" = "$speedtest_route_pin_owner_start" ] &&
+		[ "$owner_table" = "$speedtest_route_pin_table" ] || return 1
+	case "$owner_table" in cake_st_[0-9]*) ;; *) return 1 ;; esac
+	nft delete table inet "$owner_table" >/dev/null 2>&1 || return 1
+	rm -f "$speedtest_route_pin_lock/owner" || return 1
+	rmdir "$speedtest_route_pin_lock" || return 1
+	speedtest_route_pin_active=0
+	speedtest_route_pin_table=""
+	return 0
+}
+
+recover_stale_speedtest_route_pin() {
+	local owner_pid owner_start owner_table
+
+	[ -e "$speedtest_route_pin_lock" ] || return 0
+	speedtest_route_pin_lock_safe || return 1
+	[ -f "$speedtest_route_pin_lock/owner" ] && [ ! -L "$speedtest_route_pin_lock/owner" ] || return 1
+	runtime_lock_path_owned_by_euid "$speedtest_route_pin_lock/owner" || return 1
+	owner_pid="$(sed -n '1p' "$speedtest_route_pin_lock/owner" 2>/dev/null)"
+	owner_start="$(sed -n '2p' "$speedtest_route_pin_lock/owner" 2>/dev/null)"
+	owner_table="$(sed -n '3p' "$speedtest_route_pin_lock/owner" 2>/dev/null)"
+	if speedtest_process_identity_matches "$owner_pid" "$owner_start"; then
+		return 75
+	fi
+	case "$owner_table" in cake_st_[0-9]*) ;; *) return 1 ;; esac
+	nft delete table inet "$owner_table" >/dev/null 2>&1 || return 1
+	rm -f "$speedtest_route_pin_lock/owner" || return 1
+	rmdir "$speedtest_route_pin_lock" || return 1
+}
+
+acquire_speedtest_route_pin() {
+	local pin_user="cake-speedtest" route_mark_clear_mask lock_rc
+
+	[ "$route_mode" = mwan3 ] || return 0
+	[ "${speedtest_route_pin_active:-0}" = 1 ] && return 0
+	command -v nft >/dev/null 2>&1 || {
+		speedtest_route_proof_error="nft is required to pin static speedtest-go sockets to an mwan3 member"
+		return 1
+	}
+	command -v start-stop-daemon >/dev/null 2>&1 || {
+		speedtest_route_proof_error="start-stop-daemon is required for isolated speedtest-go routing"
+		return 1
+	}
+	speedtest_route_pin_uid="$(id -u "$pin_user" 2>/dev/null)"
+	speedtest_route_pin_gid="$(id -g "$pin_user" 2>/dev/null)"
+	is_uint "$speedtest_route_pin_uid" && is_uint "$speedtest_route_pin_gid" || {
+		speedtest_route_proof_error="the package-owned cake-speedtest user is unavailable"
+		return 1
+	}
+	case "$route_fwmark:$route_mark_mask" in
+		0x[0-9A-Fa-f]*:0x[0-9A-Fa-f]*) ;;
+		*) speedtest_route_proof_error="mwan3 returned an invalid member mark or mask"; return 1 ;;
+	esac
+	case "$route_table" in ''|*[!0-9]*) speedtest_route_proof_error="mwan3 returned an invalid routing table"; return 1 ;; esac
+
+	recover_stale_speedtest_route_pin
+	lock_rc="$?"
+	case "$lock_rc" in
+		0) ;;
+		75) speedtest_route_proof_error="another pinned speedtest-go calibration is already running"; return 1 ;;
+		*) speedtest_route_proof_error="a stale speedtest-go route pin could not be recovered safely"; return 1 ;;
+	esac
+	umask 077
+	mkdir "$speedtest_route_pin_lock" 2>/dev/null || {
+		speedtest_route_proof_error="another pinned speedtest-go calibration started concurrently"
+		return 1
+	}
+	speedtest_route_pin_table="cake_st_$$"
+	speedtest_route_pin_owner_start="$(speedtest_process_starttime "$$" 2>/dev/null)"
+	is_positive_uint "$speedtest_route_pin_owner_start" || {
+		rmdir "$speedtest_route_pin_lock" 2>/dev/null || true
+		speedtest_route_proof_error="unable to bind the speedtest-go route pin to its owner"
+		return 1
+	}
+	printf '%s\n%s\n%s\n' "$$" "$speedtest_route_pin_owner_start" "$speedtest_route_pin_table" \
+		> "$speedtest_route_pin_lock/owner" || {
+		rmdir "$speedtest_route_pin_lock" 2>/dev/null || true
+		speedtest_route_proof_error="unable to record the speedtest-go route pin owner"
+		return 1
+	}
+	chmod 600 "$speedtest_route_pin_lock/owner" || {
+		rm -f "$speedtest_route_pin_lock/owner"
+		rmdir "$speedtest_route_pin_lock" 2>/dev/null || true
+		return 1
+	}
+	route_mark_clear_mask="$(printf '0x%08x' "$((0xffffffff ^ route_mark_mask))" 2>/dev/null)"
+	case "$route_mark_clear_mask" in
+		0x[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+		*)
+			rm -f "$speedtest_route_pin_lock/owner"
+			rmdir "$speedtest_route_pin_lock" 2>/dev/null || true
+			return 1
+			;;
+	esac
+	nft add table inet "$speedtest_route_pin_table" >/dev/null 2>&1 &&
+		nft "add chain inet $speedtest_route_pin_table output { type route hook output priority mangle + 2; policy accept; }" >/dev/null 2>&1 &&
+		nft "add rule inet $speedtest_route_pin_table output meta skuid $speedtest_route_pin_uid meta mark set meta mark & $route_mark_clear_mask | $route_fwmark" >/dev/null 2>&1 || {
+		nft delete table inet "$speedtest_route_pin_table" >/dev/null 2>&1 || true
+		rm -f "$speedtest_route_pin_lock/owner"
+		rmdir "$speedtest_route_pin_lock" 2>/dev/null || true
+		speedtest_route_proof_error="unable to install the isolated speedtest-go mwan3 route pin"
+		return 1
+	}
+	speedtest_route_pin_active=1
+	return 0
+}
+
+run_speedtest_go_command() {
+	local binary="$1"
+	shift
+	if [ "$route_mode" = mwan3 ]; then
+		[ "${speedtest_route_pin_active:-0}" = 1 ] || {
+			speedtest_route_proof_error="the isolated speedtest-go route pin was not initialized by its parent"
+			return 1
+		}
+		HOME=/tmp start-stop-daemon -S -c "$speedtest_route_pin_uid:$speedtest_route_pin_gid" \
+			-d /tmp -x "$binary" -- "$@"
+	else
+		route_exec "$binary" "$@"
+	fi
+}
+
+interface_byte_counter() {
+	local device="$1" direction="$2" file
+	case "$direction" in rx|tx) ;; *) return 1 ;; esac
+	case "$device" in ''|*[!A-Za-z0-9_.:@-]*) return 1 ;; esac
+	file="/sys/class/net/$device/statistics/${direction}_bytes"
+	[ -r "$file" ] || return 1
+	sed -n '1p' "$file"
+}
+
+minimum_proof_bytes() {
+	awk -v kbps="$1" -v elapsed="$2" 'BEGIN {
+		value = kbps * elapsed * 1000 / 8 * 0.10;
+		if (value < 1048576) value = 1048576;
+		printf "%.0f", value
+	}'
+}
+
+verify_speedtest_go_route_bytes() {
+	local rx_after tx_after
+
+	rx_after="$(interface_byte_counter "$route_device" rx)" || return 1
+	tx_after="$(interface_byte_counter "$route_device" tx)" || return 1
+	is_uint "$speedtest_route_rx_before" && is_uint "$speedtest_route_tx_before" &&
+		is_uint "$rx_after" && is_uint "$tx_after" || return 1
+	[ "$rx_after" -ge "$speedtest_route_rx_before" ] && [ "$tx_after" -ge "$speedtest_route_tx_before" ] || return 1
+	speedtest_route_rx_delta=$((rx_after - speedtest_route_rx_before))
+	speedtest_route_tx_delta=$((tx_after - speedtest_route_tx_before))
+	speedtest_route_rx_required=0
+	speedtest_route_tx_required=0
+	if is_positive_uint "$download_kbps"; then
+		speedtest_route_rx_required="$(minimum_proof_bytes "$download_kbps" "$download_elapsed")"
+		[ "$speedtest_route_rx_delta" -ge "$speedtest_route_rx_required" ] || return 1
+	fi
+	if is_positive_uint "$upload_kbps"; then
+		speedtest_route_tx_required="$(minimum_proof_bytes "$upload_kbps" "$upload_elapsed")"
+		[ "$speedtest_route_tx_delta" -ge "$speedtest_route_tx_required" ] || return 1
+	fi
+	speedtest_route_traffic_proved=true
+	return 0
+}
+
 route_rule_for_device() {
 	local device="$1" rules table mark
 
@@ -339,6 +530,7 @@ inspect_selected_route() {
 	route_device=""
 	route_source_ip=""
 	route_fwmark=""
+	route_mark_mask=""
 	route_table=""
 	route_member_status="unknown"
 	route_active="false"
@@ -374,7 +566,8 @@ inspect_selected_route() {
 		env_device="$(printf '%s\n' "$environment" | sed -n 's/^DEVICE=//p' | sed -n '1p')"
 		route_device="${env_device:-$network_device}"
 		route_source_ip="$(printf '%s\n' "$environment" | sed -n 's/^SRCIP=//p' | sed -n '1p')"
-		route_fwmark="$(printf '%s\n' "$environment" | sed -n 's/^FWMARK=//p' | sed -n '1p')"
+		route_mark_mask="$(printf '%s\n' "$environment" | sed -n 's/^FWMARK=//p' | sed -n '1p')"
+		route_fwmark="$route_mark_mask"
 		route_rule="$(route_rule_for_device "$route_device")"
 		if [ -n "$route_rule" ]; then
 			route_fwmark="${route_rule%%|*}"
@@ -483,6 +676,18 @@ sqm_active_for_device() {
 	[ -n "$1" ] || return 1
 	dir="$(sqm_state_dir)"
 	[ -f "$dir/$1.state" ]
+}
+
+target_is_verifiably_unshaped() {
+	local qdisc_state root_kind has_ingress=false
+
+	command -v tc >/dev/null 2>&1 || return 1
+	qdisc_state="$(tc qdisc show dev "$target_if" 2>/dev/null)" || return 1
+	root_kind="$(printf '%s\n' "$qdisc_state" | awk '$4 == "root" { print $2; exit }')"
+	printf '%s\n' "$qdisc_state" | grep -Eq ' ingress | clsact ' && has_ingress=true
+	case "$root_kind" in ''|noqueue|mq) ;; *) return 1 ;; esac
+	[ "$has_ingress" = false ] || return 1
+	! sqm_active_for_device "$target_if"
 }
 
 capture_managed_sqm_recovery_snapshot() {
@@ -1083,11 +1288,20 @@ prepare_speedtest_calibration() {
 			return 1
 		fi
 		calibration_sqm_paused="true"
+		calibration_sqm_bypass_mode="paused-managed"
 		append_warning "Temporarily disabled SQM on $target_if during unshaped speed test."
 	elif [ -x "$sqm_run_bin" ] && sqm_active_for_device "$target_if"; then
 		append_warning "SQM appeared after recovery preflight; the unshaped test was cancelled."
 		restore_speedtest_calibration >/dev/null 2>&1 || true
 		return 1
+	fi
+	if [ "$calibration_sqm_paused" != true ]; then
+		target_is_verifiably_unshaped || {
+			append_warning "The target did not have managed SQM to pause and its qdisc state was not verifiably unshaped."
+			restore_speedtest_calibration >/dev/null 2>&1 || true
+			return 1
+		}
+		calibration_sqm_bypass_mode="already-unshaped"
 	fi
 
 	calibration_shaper_bypassed="true"
@@ -1831,7 +2045,7 @@ speedtest_go_candidate_ids() {
 		[ -n "$source_ip" ] && set -- "$@" --source "$source_ip" --dns-bind-source
 	fi
 
-	if ! route_exec "$@" > "$list_file" 2>/dev/null; then
+	if ! run_speedtest_go_command "$@" > "$list_file" 2>/dev/null; then
 		rm -f "$list_file"
 		return 1
 	fi
@@ -1874,8 +2088,15 @@ run_speedtest_go_once() {
 	fi
 
 	rm -f "$tmp_response"
+	speedtest_route_traffic_proved=false
+	speedtest_route_rx_delta=0
+	speedtest_route_tx_delta=0
+	speedtest_route_rx_required=0
+	speedtest_route_tx_required=0
+	speedtest_route_rx_before="$(interface_byte_counter "$route_device" rx)" || return 1
+	speedtest_route_tx_before="$(interface_byte_counter "$route_device" tx)" || return 1
 	start="$(now_s)"
-	if ! route_exec "$@" > "$tmp_response" 2>/dev/null; then
+	if ! run_speedtest_go_command "$@" > "$tmp_response" 2>/dev/null; then
 		return 1
 	fi
 	stop="$(now_s)"
@@ -1898,13 +2119,24 @@ run_speedtest_go_once() {
 	download_size="0"
 	upload_size="0"
 
-	direction_result_available
+	direction_result_available || return 1
+	if ! verify_speedtest_go_route_bytes; then
+		speedtest_route_proof_error="speedtest-go traffic did not traverse the selected interface $route_device"
+		return 1
+	fi
+	return 0
 }
 
 run_speedtest_go() {
 	local cached_server candidate_ids candidate_id attempts rejected_server max_attempts
 
 	backend_available "speedtest-go" || return 1
+	# Acquire in the top-level backend process. Candidate discovery runs in a
+	# command substitution; creating the lock there would strand subshell state
+	# while $$ still names the live parent shell on BusyBox ash.
+	if [ "$route_mode" = mwan3 ]; then
+		acquire_speedtest_route_pin || return 1
+	fi
 
 	if is_positive_uint "$speedtest_go_server_id"; then
 		run_speedtest_go_once "$speedtest_go_server_id"
@@ -1925,12 +2157,14 @@ run_speedtest_go() {
 		if run_speedtest_go_once "$cached_server" && speedtest_go_result_is_plausible; then
 			return 0
 		fi
+		[ -z "$speedtest_route_proof_error" ] || return 1
 
 		append_warning "speedtest-go cached server ID $cached_server failed validation; automatic selection will retry."
 		speedtest_go_clear_cached_server
 	fi
 
 	candidate_ids="$(speedtest_go_candidate_ids)"
+	[ -z "$speedtest_route_proof_error" ] || return 1
 	if [ -z "$candidate_ids" ]; then
 		append_warning "speedtest-go could not list nearby servers; using its default automatic selection."
 		if run_speedtest_go_once ""; then
@@ -1940,6 +2174,7 @@ run_speedtest_go() {
 			fi
 			speedtest_go_save_bad_result
 		fi
+		[ -z "$speedtest_route_proof_error" ] || return 1
 	else
 		attempts=0
 		for candidate_id in $candidate_ids; do
@@ -1948,6 +2183,7 @@ run_speedtest_go() {
 			attempts=$((attempts + 1))
 
 			if ! run_speedtest_go_once "$candidate_id"; then
+				[ -z "$speedtest_route_proof_error" ] || return 1
 				continue
 			fi
 
@@ -2055,7 +2291,7 @@ emit_result() {
 		*:download) backend_direction_flag=download-only ;;
 		*:upload) backend_direction_flag=upload-only ;;
 	esac
-	printf '{"download_kbps":%s,"upload_kbps":%s,"download_bytes":%s,"upload_bytes":%s,"download_elapsed_s":%s,"upload_elapsed_s":%s,"test_direction":"%s","backend_direction_flag":"%s","source":"%s","backend":"%s","backend_title":"%s","server_id":"%s","server_name":"%s","server_sponsor":"%s","bind_mode":"%s","target_interface":"%s","route_interface":"%s","route_mode":"%s","mwan3_member":"%s","route_source_ip":"%s","route_fwmark":"%s","route_table":"%s","external_ip_before":"%s","external_ip_after":"%s","shaper_bypassed":%s,"autorate_paused":%s,"sqm_paused":%s,"warning":"%s"}\n' \
+	printf '{"download_kbps":%s,"upload_kbps":%s,"download_bytes":%s,"upload_bytes":%s,"download_elapsed_s":%s,"upload_elapsed_s":%s,"test_direction":"%s","backend_direction_flag":"%s","source":"%s","backend":"%s","backend_title":"%s","server_id":"%s","server_name":"%s","server_sponsor":"%s","bind_mode":"%s","target_interface":"%s","route_interface":"%s","route_mode":"%s","mwan3_member":"%s","route_source_ip":"%s","route_fwmark":"%s","route_table":"%s","route_traffic_proof":{"available":%s,"passed":%s,"rx_bytes":%s,"tx_bytes":%s,"required_rx_bytes":%s,"required_tx_bytes":%s},"external_ip_before":"%s","external_ip_after":"%s","shaper_bypassed":%s,"autorate_paused":%s,"sqm_paused":%s,"sqm_bypass_mode":"%s","warning":"%s"}\n' \
 		"$download_kbps" \
 		"$upload_kbps" \
 		"$download_size" \
@@ -2078,11 +2314,18 @@ emit_result() {
 		"$(json_escape "$route_source_ip")" \
 		"$(json_escape "$route_fwmark")" \
 		"$(json_escape "$route_table")" \
+		"$([ "$backend" = speedtest-go ] && printf true || printf false)" \
+		"${speedtest_route_traffic_proved:-false}" \
+		"${speedtest_route_rx_delta:-0}" \
+		"${speedtest_route_tx_delta:-0}" \
+		"${speedtest_route_rx_required:-0}" \
+		"${speedtest_route_tx_required:-0}" \
 		"$(json_escape "$external_ip_before")" \
 		"$(json_escape "$external_ip_after")" \
 		"$calibration_shaper_bypassed" \
 		"$calibration_autorate_paused" \
 		"$calibration_sqm_paused" \
+		"$(json_escape "${calibration_sqm_bypass_mode:-none}")" \
 		"$(json_escape "$warning")"
 }
 
@@ -2106,6 +2349,7 @@ run_available_backends() {
 				run_builtin_http && return 0
 				;;
 		esac
+		[ -z "$speedtest_route_proof_error" ] || return 1
 
 		append_warning "$(backend_title "$candidate") backend failed; trying next backend."
 	done
@@ -2146,6 +2390,7 @@ run_preferred_backend() {
 	if run_backend "$preferred_backend"; then
 		return 0
 	fi
+	[ -z "$speedtest_route_proof_error" ] || json_error "$speedtest_route_proof_error"
 
 	json_error "$(backend_title "$preferred_backend") backend failed"
 }
@@ -2499,6 +2744,7 @@ calibration_sqm_config_snapshot=""
 calibration_shaper_bypassed="false"
 calibration_autorate_paused="false"
 calibration_sqm_paused="false"
+calibration_sqm_bypass_mode="none"
 interface_lock_dir=""
 interface_lock_shared=0
 standalone_recovery_armed=0
@@ -2508,6 +2754,11 @@ standalone_recovery_supervisor_pid=""
 standalone_recovery_supervisor_start=""
 external_ip_before=""
 external_ip_after=""
+speedtest_route_traffic_proved=false
+speedtest_route_rx_delta=0
+speedtest_route_tx_delta=0
+speedtest_route_rx_required=0
+speedtest_route_tx_required=0
 
 if [ "$mode" = "status" ]; then
 	backend_status_json
@@ -2556,6 +2807,7 @@ tmp_response="/tmp/cake-autorate-speedtest-response.$$"
 cleanup() {
 	cleanup_status="$?"
 	cleanup_failed=0
+	release_speedtest_route_pin || cleanup_failed=1
 	if restore_speedtest_calibration; then
 		release_interface_lock || cleanup_failed=1
 	else
@@ -2603,4 +2855,7 @@ if run_preferred_backend; then
 	exit 0
 fi
 
+if [ -n "$speedtest_route_proof_error" ]; then
+	json_error "$speedtest_route_proof_error"
+fi
 json_error "no speed test backend is available"

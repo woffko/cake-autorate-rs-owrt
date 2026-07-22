@@ -93,24 +93,25 @@ row. A clean package installation creates no instance until the user chooses
 
 The current development tree builds these OpenWrt 25.12.5 APKs:
 
-- `cake-autorate-rs-1.0_rc26-r3_openwrt-25.12_x86_64.apk` — x86_64
+- `cake-autorate-rs-1.0_rc27-r1_openwrt-25.12_x86_64.apk` — x86_64
   autorate daemon.
-- `cake-autorate-rs-1.0_rc26-r3_openwrt-25.12_aarch64_generic.apk` — rockchip/armv8
+- `cake-autorate-rs-1.0_rc27-r1_openwrt-25.12_aarch64_generic.apk` — rockchip/armv8
   autorate daemon.
-- `luci-app-cake-autorate-rs-1.0_rc26-r7_openwrt-25.12_all.apk` —
+- `luci-app-cake-autorate-rs-1.0_rc27-r2_openwrt-25.12_all.apk` —
   architecture-independent LuCI interface and SQM integration.
 
-This RC26 development candidate adds the explicit Automatic/Gaming/Best
-overall/Fair/Custom traffic-profile model, one-time legacy migration, a shared
-backend/UI preset catalog, per-instance runtime attestation and status labels,
-and an editable Custom-copy workflow that remains an unsaved LuCI transaction
-until the user chooses Save & Apply. The classifier master remains an explicit
-opt-in and turning it off never stops Autorate or SQM. Narrow screens render
-the preset preview as labelled cards instead of compressing four table columns.
-RC26-r7 publishes direct APK assets for both supported daemon architectures
-plus the architecture-independent LuCI APK. As with the referenced mwan3
-release model, dependencies resolve through the router's configured OpenWrt
-package feeds; no offline bundle or wrapper installer is attached.
+RC27 adds background-aware Full Auto-Tune confidence without mixing forwarded
+traffic into the isolated speed-test result. It reports separate download,
+upload, quality and overall confidence, labels results trusted, provisional or
+estimated, and permits unattended apply only for clean trusted evidence. A
+strict busy-link stop can be retried or restarted once with conservative
+safeguards; a structurally safe lower-confidence proposal remains an explicit
+manual decision. CPU saturation is visible as a warning rather than a false
+quality failure. The release retains the explicit Automatic/Gaming/Best
+overall/Fair/Custom traffic-profile model and sequential per-member Multi-WAN
+calibration. Direct APK assets are provided for both daemon architectures plus
+the architecture-independent LuCI APK. Dependencies resolve through the
+router's configured OpenWrt package feeds; no offline bundle is attached.
 
 ## Relationship to upstream cake-autorate
 
@@ -164,7 +165,7 @@ are documented in the linked feature references above.
 
 ## Current release highlights
 
-RC26-r7 makes traffic policy one exclusive per-instance choice:
+Traffic policy is one exclusive per-instance choice:
 **Automatic**, **Gaming**, **Best overall**, **Fair**, or **Custom**. Automatic
 follows the Auto-Tune profile; pinned policies do not change on later
 calibration. Previewed rules come from the same catalog as the nftables
@@ -347,13 +348,20 @@ Implemented:
   restoring the previous qdisc/SQM state. Typed gates and a bounded Rust
   per-direction optimizer search the measured quality/throughput boundary,
   repeat unreliable observations, raise a candidate until its hard floor is
-  reachable, and confirm the exact selected pair. Any missing, changed or
-  contaminated evidence stops without an apply-ready proposal. A safe result
-  below a required profile target is manual-only; it never weakens hard gates
-  or permits unattended apply.
+  reachable, and confirm the exact selected pair. Result schema 8 reports
+  separate DL-capacity, UL-capacity, quality and overall confidence and labels
+  the result `trusted`, `provisional`, or `estimated`. Missing or structurally
+  invalid evidence remains a hard stop; measured background lowers confidence
+  and may expose a safe explicit-review proposal, but never unattended apply.
+  A safe result below a required profile target is likewise manual-only; no
+  confidence class weakens route, SQM ownership, loss/latency, measurement, or
+  runtime-restoration gates.
 - Optional scheduled Full Auto-Tune, disabled by default, adds a quiet-time
   gate, maintenance window, interval, RAM-only daily byte budget, and explicit
-  review-only versus validated auto-apply mode.
+  review-only versus validated auto-apply mode. Unattended apply requires a
+  clean schema-8 `trusted` result, overall and quality confidence of at least
+  85%, met profile objectives and complete restored runtime; lower-confidence
+  results remain explicit-review only.
 - LuCI instance editing keeps advanced speed test backend controls and
   pinger/reflector planning behind the advanced settings toggle. The automatic
   interface preset, speed-test headroom, and manual min/base/max escape hatches
@@ -514,7 +522,7 @@ Native WebSocket and persistent-HTTP probes, including Full Auto-Tune
 transport validation, use statically linked rustls and webpki roots and add no
 dynamic APK dependency. `legacy-http` and the built-in speed-test fallback can
 use `uclient-fetch`; normal LuCI images already provide a `libustream` TLS
-provider and CA certificates. RC26-r7 ships only direct APK assets, so these
+provider and CA certificates. RC27 ships only direct APK assets, so these
 dependencies must resolve through compatible configured OpenWrt feeds.
 
 `sqm-scripts` pulls the required `tc`, CAKE, IFB, iptables, and related shaping
@@ -608,16 +616,16 @@ them together. For x86_64:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc26-r3_openwrt-25.12_x86_64.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc26-r7_openwrt-25.12_all.apk
+  /root/cake-autorate-rs-1.0_rc27-r1_openwrt-25.12_x86_64.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc27-r2_openwrt-25.12_all.apk
 ```
 
 For rockchip/armv8 (`aarch64_generic`):
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc26-r3_openwrt-25.12_aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc26-r7_openwrt-25.12_all.apk
+  /root/cake-autorate-rs-1.0_rc27-r1_openwrt-25.12_aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc27-r2_openwrt-25.12_all.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:

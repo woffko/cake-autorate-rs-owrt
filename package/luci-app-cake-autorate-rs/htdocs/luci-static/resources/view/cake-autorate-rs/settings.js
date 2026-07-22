@@ -468,11 +468,37 @@ function mwan3MembersForDevice(device) {
 	});
 }
 
-function wizardRouteChoices() {
+function managedUplinkOwner(member, ignoredInstance) {
+	var device = member && normalizeInterfaceName(member.device);
+	var existing = uci.sections('cake-autorate', 'cake_autorate') || [];
+
+	for (var i = 0; i < existing.length; i++) {
+		var section = existing[i];
+		var name = section['.name'];
+		if (!name || name === ignoredInstance || section.manage_sqm === '0')
+			continue;
+		var target = normalizeInterfaceName(section.sqm_interface || section.ul_if || section.wan_if);
+		if ((section.mwan3_member && section.mwan3_member === member.name) ||
+		    (device && target === device))
+			return name;
+	}
+
+	return '';
+}
+
+function availableMwan3Uplinks(ignoredInstance) {
+	return uniqueMwan3Uplinks().filter(function(member) {
+		return !managedUplinkOwner(member, ignoredInstance);
+	});
+}
+
+function wizardRouteChoices(ignoredInstance) {
 	var choices = [ [ 'main', _('Main routing table') ] ];
 
 	for (var i = 0; i < mwan3Context.members.length; i++) {
 		var member = mwan3Context.members[i];
+		if (managedUplinkOwner(member, ignoredInstance))
+			continue;
 		choices.push([ 'mwan3:' + member.name, _('mwan3: %s').format(member.label) ]);
 	}
 	return choices;
@@ -494,8 +520,8 @@ function uniqueMwan3Uplinks() {
 	return uplinks;
 }
 
-function multiwanInstancePlans(state) {
-	var uplinks = uniqueMwan3Uplinks();
+function multiwanInstancePlans(state, ignoredInstance) {
+	var uplinks = availableMwan3Uplinks(ignoredInstance);
 	return uplinks.map(function(member) {
 		var instanceName = member.device === normalizeInterfaceName(state.wan_if) ?
 			state.name : member.name.replace(/[^A-Za-z0-9_]/g, '_') + '_sqm';
@@ -531,7 +557,7 @@ function wizardPlanConflicts(plans, enabled, ignoredInstance) {
 			var existingTarget = normalizeInterfaceName(section.sqm_interface || section.ul_if || section.wan_if);
 			if (existingName === plan.name)
 				conflicts.push(_('Instance "%s" already exists.').format(plan.name));
-			if (enabled && section.enabled === '1' && section.manage_sqm !== '0' && existingTarget === plan.device)
+			if (section.manage_sqm !== '0' && existingTarget === plan.device)
 				conflicts.push(_('Instance "%s" already manages a CAKE queue on %s.').format(existingName, existingTarget));
 		}
 	}
@@ -1362,7 +1388,7 @@ function speedtestJobDelay() {
 
 var AUTOTUNE_RECOVERY_MAX_POLLS = 12;
 var AUTOTUNE_RECOVERY_MAX_DELAY_MS = 5000;
-var AUTOTUNE_RESULT_SCHEMA_VERSION = 7;
+var AUTOTUNE_RESULT_SCHEMA_VERSION = 8;
 var AUTOTUNE_RESULT_PRODUCER = 'cake-autorate-rs-autotune';
 
 function canonicalAutotuneProfile(value) {
@@ -1713,7 +1739,7 @@ function runAutotuneJob(section_id, wan, backend, onProgress, routeMode, mwan3Me
 	});
 }
 
-function cancelAutotuneJob(section_id, wan, backend, profile) {
+function cancelAutotuneJob(section_id, wan, backend, profile, routeMode, mwan3Member) {
 	return fs.exec('/usr/libexec/cake-autorate-rs/autotune', [
 		section_id,
 		wan,
@@ -1722,7 +1748,29 @@ function cancelAutotuneJob(section_id, wan, backend, profile) {
 		'',
 		'',
 		canonicalAutotuneProfile(profile) || 'best_overall'
-	]).then(parseExecJson);
+	]).then(parseExecJson).then(function(cancelled) {
+		var polls = 0;
+		var waitForSettlement = function(result) {
+			if (autotuneRuntimeSettled(result) || result.state === 'idle')
+				return result;
+			if (polls++ >= AUTOTUNE_RECOVERY_MAX_POLLS)
+				throw new Error(_('Cancellation was requested, but runtime recovery is still pending.'));
+			return autotuneJobDelay(Math.min(1000 * Math.pow(2, Math.min(polls, 3)),
+				AUTOTUNE_RECOVERY_MAX_DELAY_MS)).then(function() {
+				return fs.exec('/usr/libexec/cake-autorate-rs/autotune', [
+					section_id,
+					wan,
+					'status',
+					backend || 'auto',
+					routeMode || '',
+					mwan3Member || '',
+					canonicalAutotuneProfile(profile) || 'best_overall'
+				]);
+			}).then(parseExecJson).then(waitForSettlement);
+		};
+
+		return waitForSettlement(cancelled);
+	});
 }
 
 function installSpeedtestBackend(section_id, wan, backend) {
@@ -2148,12 +2196,19 @@ function wizardSqmQueueText(state) {
 	return _('Create managed SQM queue "%s"').format(state.sqm_section);
 }
 
-function writeWizardConfig(section_id, state) {
+function writeWizardConfig(section_id, state, allowUncalibrated) {
 	var autotuneAction = state.autotune_action || 'apply_sqm';
+	var uncalibrated = allowUncalibrated === true;
+	if (uncalibrated) {
+		if (state.mode !== 'autotune' || state.autotune_result || state.autotune_proposal)
+			throw new Error(_('Invalid disabled, uncalibrated Multi-WAN fallback state.'));
+		state.enabled = false;
+		state.sqm_enabled = false;
+	}
 	/* Auto-Tune data is untrusted until the complete result passes the same
 	 * fail-closed predicate used by Next, Review and Apply.  Keep this guard at
 	 * the staging boundary as a final defence against stale wizard state. */
-	if ((state.mode === 'autotune' ||
+	if (!uncalibrated && (state.mode === 'autotune' ||
 	    (state.autotune_result && state.autotune_proposal)) &&
 	    !autotuneResultReviewable(state.autotune_result, autotuneAction))
 		throw new Error(_('Refusing to stage an unvalidated Auto-Tune proposal.'));
@@ -2502,12 +2557,127 @@ function autotuneBackgroundEvidenceClean(background) {
 		background.contaminated === false);
 }
 
+function autotuneConfidencePercent(value) {
+	value = autotuneNumber(value);
+	return value != null && value >= 0 && value <= 100 ? value : null;
+}
+
+function autotuneConfidence(result) {
+	var proposalConfidence = result && result.proposal && result.proposal.confidence;
+	var reported = result && result.confidence;
+	var legacy = autotuneConfidencePercent(proposalConfidence);
+	var confidence;
+
+	if (reported == null) {
+		if (legacy == null)
+			return null;
+		return {
+			overall_percent: legacy,
+			capacity_download_percent: legacy,
+			capacity_upload_percent: legacy,
+			quality_percent: legacy,
+			reasons: [],
+			legacy: true
+		};
+	}
+
+	confidence = {
+		overall_percent: autotuneConfidencePercent(reported.overall_percent),
+		capacity_download_percent: autotuneConfidencePercent(reported.capacity_download_percent),
+		capacity_upload_percent: autotuneConfidencePercent(reported.capacity_upload_percent),
+		quality_percent: autotuneConfidencePercent(reported.quality_percent),
+		reasons: Array.isArray(reported.reasons) ? reported.reasons.map(function(reason) {
+			if (typeof reason === 'string')
+				return { code: reason, scope: 'overall', message: '' };
+			return {
+				code: reason && typeof reason.code === 'string' ? reason.code : '',
+				scope: reason && typeof reason.scope === 'string' ? reason.scope : 'overall',
+				message: reason && typeof reason.message === 'string' ? reason.message : ''
+			};
+		}).filter(function(reason) { return !!reason.code; }) : [],
+		legacy: false
+	};
+
+	if (confidence.overall_percent == null ||
+	    confidence.capacity_download_percent == null ||
+	    confidence.capacity_upload_percent == null ||
+	    confidence.quality_percent == null ||
+	    !Array.isArray(reported.reasons))
+		return null;
+
+	return confidence;
+}
+
+function autotuneResultClass(result) {
+	var reported = result && result.result_class;
+	if (reported === 'trusted' || reported === 'provisional' || reported === 'estimated')
+		return reported;
+	return 'technical_failure';
+}
+
+function autotuneResultClassLabel(result) {
+	var resultClass = autotuneResultClass(result);
+	return resultClass === 'trusted' ? _('Trusted') :
+		(resultClass === 'provisional' ? _('Provisional') :
+			(resultClass === 'estimated' ? _('Estimated') : _('Technical failure')));
+}
+
+function autotuneBackgroundAwareResult(result) {
+	return !!(result && (result.result_class === 'trusted' ||
+		result.result_class === 'provisional' || result.result_class === 'estimated'));
+}
+
+function autotunePhaseEvidenceUsable(result) {
+	var entries = result && result.phase_background;
+	var validation = result && result.validation;
+	var phases = validation && validation.direction_phases;
+	var baselineSeen = false;
+
+	if (!Array.isArray(entries) || entries.length < 5 || !phases)
+		return false;
+
+	for (var i = 0; i < entries.length; i++) {
+		var entry = entries[i];
+		if (!(entry && entry.forwarded_background &&
+		    entry.forwarded_background.available === true))
+			return false;
+		if (entry.phase === 'baseline' && entry.icmp_valid === true &&
+		    entry.transport_valid === true)
+			baselineSeen = true;
+	}
+
+	if (!baselineSeen)
+		return false;
+
+	return [ 'download', 'upload' ].every(function(direction) {
+		var phase = phases[direction];
+		return !!(phase && phase.direction === direction &&
+			autotuneNumber(phase.throughput_kbps) > 0 &&
+			phase.forwarded_background && phase.forwarded_background.available === true &&
+			autotuneNumber(phase.icmp_latency && phase.icmp_latency.samples) > 0 &&
+			autotuneNumber(phase.transport_latency && phase.transport_latency.samples) > 0 &&
+			autotuneNumber(phase.cpu_peak_percent) != null);
+	});
+}
+
+function autotuneConservativeAvailable(result) {
+	if (!result || result.background_blocked !== true || result.retryable !== true ||
+	    result.conservative_available === false)
+		return false;
+	/* Background-aware continuation always starts a fresh measurement job.  It
+	 * therefore re-measures an idle baseline instead of reusing or inventing the
+	 * failed strict attempt. Technical baseline failures set availability false. */
+	return true;
+}
+
 function autotunePhaseEvidenceClean(result) {
 	var entries = result && result.phase_background;
 	var validation = result && result.validation;
 	var directionPhases = validation && validation.direction_phases;
 	var directions = [ 'download', 'upload' ];
 	var cleanBaselineSeen = false;
+	var deferredBaselineSeen = false;
+	var retrospectiveBaselinePassed = false;
 
 	/* A clean current-schema run has an idle baseline, direction-matched unshaped
 	 * controls, and download-only plus upload-only shaped observations. Treat
@@ -2520,10 +2690,19 @@ function autotunePhaseEvidenceClean(result) {
 		if (!autotuneBackgroundEvidenceClean(entry && entry.forwarded_background))
 			return false;
 		if (entry && entry.phase === 'baseline' && entry.icmp_valid === true &&
-		    entry.transport_valid === true)
+		    entry.transport_valid === true) {
 			cleanBaselineSeen = true;
+			if (entry.forwarded_background.reference_deferred === true ||
+			    entry.total_interface_background &&
+			    entry.total_interface_background.reference_deferred === true)
+				deferredBaselineSeen = true;
+		}
+		if (entry && entry.phase === 'baseline-retrospective' && entry.passed === true &&
+		    autotuneNumber(entry.measured_capacity && entry.measured_capacity.download_kbps) > 0 &&
+		    autotuneNumber(entry.measured_capacity && entry.measured_capacity.upload_kbps) > 0)
+			retrospectiveBaselinePassed = true;
 	}
-	if (!cleanBaselineSeen)
+	if (!cleanBaselineSeen || (deferredBaselineSeen && !retrospectiveBaselinePassed))
 		return false;
 
 	if (!directionPhases)
@@ -2756,6 +2935,9 @@ function autotuneProfileOutcomeValidated(result) {
 }
 
 function autotuneResultEnvelopeValidated(result) {
+	var backgroundAware;
+	var resultClass;
+
 	if (!(result && result.state === 'complete' && result.proposal &&
 		result.validation && !result.error))
 		return false;
@@ -2777,13 +2959,41 @@ function autotuneResultEnvelopeValidated(result) {
 	    !autotuneProposalMatchesProfile(result))
 		return false;
 
-	/* Conservative/contaminated output remains useful diagnostics, but it is
-	 * never a configuration proposal. */
-	if (result.conservative === true || result.confidence_mode !== 'normal' ||
-	    result.phase_contamination_seen !== false ||
-	    result.validation.contaminated !== false ||
-	    !autotunePhaseEvidenceClean(result))
+	backgroundAware = autotuneBackgroundAwareResult(result);
+	resultClass = autotuneResultClass(result);
+	/* Schema 8 is the first background-aware result contract.  A current-schema
+	 * result without its typed class and confidence dimensions is malformed,
+	 * not a legacy result that may inherit trust from a numeric proposal score. */
+	if (!backgroundAware)
 		return false;
+	{
+		var confidence = autotuneConfidence(result);
+		/* Server eligibility is necessary but never sufficient. Keep route,
+		 * immutable-run, runtime, proposal/profile and structured phase checks on
+		 * the client too. Background contamination lowers confidence; it is no
+		 * longer confused with a broken measurement. */
+		if ((resultClass !== 'trusted' && resultClass !== 'provisional' &&
+		     resultClass !== 'estimated') || !confidence ||
+		    !autotunePhaseEvidenceUsable(result) ||
+		    typeof result.validation.contaminated !== 'boolean')
+			return false;
+		if (Math.abs(confidence.overall_percent - Math.min(
+		    confidence.capacity_download_percent,
+		    confidence.capacity_upload_percent,
+		    confidence.quality_percent)) > 0.000001)
+			return false;
+		if (resultClass === 'trusted' &&
+		    (result.validation.contaminated !== false ||
+		     result.phase_contamination_seen !== false ||
+		     !autotunePhaseEvidenceClean(result) ||
+		     confidence.overall_percent < 85 || confidence.quality_percent < 85))
+			return false;
+		if (resultClass === 'provisional' &&
+		    (confidence.overall_percent < 40 || confidence.overall_percent >= 85))
+			return false;
+		if (resultClass === 'estimated' && confidence.overall_percent >= 40)
+			return false;
+	}
 
 	return true;
 }
@@ -2802,6 +3012,7 @@ function autotuneCapacityFloorInfeasibleResultValidated(result) {
 
 function autotuneResultValidated(result) {
 	if (!autotuneResultEvidenceValidated(result) ||
+	    autotuneResultClass(result) !== 'trusted' ||
 	    result.validation.pass !== true ||
 	    result.validation.hard_pass !== true ||
 	    result.validation.profile_objectives_met !== true ||
@@ -2835,10 +3046,11 @@ function autotuneDisableSqmEvidenceValidated(result) {
 		outcome.recommended_action === 'disable_sqm' &&
 		outcome.disable_sqm_available === true &&
 		control && control.available === true &&
-		evidence && evidence.valid === true &&
-		evidence.test_direction === 'both' &&
-		evidence.shaper_bypassed === true &&
-		evidence.sqm_paused === true &&
+			evidence && evidence.valid === true &&
+			evidence.test_direction === 'both' &&
+			evidence.shaper_bypassed === true &&
+			((evidence.sqm_bypass_mode === 'paused-managed' && evidence.sqm_paused === true) ||
+			 (evidence.sqm_bypass_mode === 'already-unshaped' && evidence.sqm_paused === false)) &&
 		autotuneBackgroundEvidenceClean(control.forwarded_background) &&
 		autotuneNumber(control.forwarded_background.download_kbps) != null &&
 		autotuneNumber(control.forwarded_background.upload_kbps) != null &&
@@ -2877,6 +3089,19 @@ function autotuneResultReviewable(result, action) {
 	if (action === 'apply_sqm') {
 		if (autotuneResultValidated(result))
 			return true;
+		/* Background-aware results may be safe and explicitly applicable even
+		 * when confidence is insufficient for Auto-Apply. The hard envelope,
+		 * profile evidence and safety checks above still have to pass. */
+		if (autotuneBackgroundAwareResult(result)) {
+			if (result.manual_apply_eligible !== true ||
+			    result.validation.safety_pass !== true ||
+			    !autotuneValidationGatesComplete(result.validation, result.profile, false))
+				return false;
+			if (canonicalAutotuneProfile(result.profile) !== 'fair')
+				return true;
+			return autotuneFairOutcomeValidated(result) &&
+				autotuneFairAllowedActions(result.fair_outcome).apply_sqm === true;
+		}
 		if (result.auto_apply_eligible !== false ||
 		    result.validation.safety_pass !== true ||
 		    (result.validation.quality_target_met !== false &&
@@ -2989,6 +3214,12 @@ var UBUS_STATUS_NO_DATA = 5;
 var callUciConfirmStatus = rpc.declare({
 	object: 'uci',
 	method: 'confirm',
+	reject: false
+});
+var callUciRevertStatus = rpc.declare({
+	object: 'uci',
+	method: 'revert',
+	params: [ 'config' ],
 	reject: false
 });
 
@@ -3374,7 +3605,22 @@ function reloadViewPage() {
 		window.location = cleanUrl;
 }
 
-function runGuardedSaveApply(view, ev) {
+function discardStagedUciPackages(packages) {
+	packages = packages || [];
+	return Promise.all(packages.map(function(config) {
+		return callUciRevertStatus(config).then(function(status) {
+			if (status !== 0)
+				throw new Error(_('UCI could not discard the rolled-back %s transaction.').format(config));
+			return config;
+		});
+	})).then(function(configs) {
+		if (typeof uci.unload === 'function' && configs.length)
+			uci.unload(configs);
+		return configs;
+	});
+}
+
+function runGuardedSaveApply(view, ev, reloadOnSuccess) {
 	var guards = [];
 	var applyStarted = false;
 	var applyDeadlineMs = 0;
@@ -3398,7 +3644,8 @@ function runGuardedSaveApply(view, ev) {
 		return waitForGuardedApplySupervisor(guards, applyDeadlineMs);
 	}).then(function() {
 		applyStarted = false;
-		reloadViewPage();
+		if (reloadOnSuccess !== false)
+			reloadViewPage();
 		return view;
 	}).catch(function(error) {
 		if (error.confirmIndeterminate || error.transactionRolledBack || error.applyConfirmed)
@@ -3407,14 +3654,88 @@ function runGuardedSaveApply(view, ev) {
 			return rollbackGuardedApply(guards, error, applyDeadlineMs);
 		return abortAutotuneApplyGuards(guards).then(function() { throw error; });
 	}).catch(function(error) {
-		/* rpcd's rollback is authoritative, but the in-memory LuCI UCI model can still
-		 * retain a stale staged proposal after a guarded apply attempt. Reload immediately
-		 * so the global Unsaved changes control cannot accidentally re-commit expired state. */
-		if (applyStarted) {
+		/* rpcd's rollback is authoritative, but the browser RPC session retains
+		 * its rejected delta. A reload alone resurrects the same transaction as
+		 * dozens of phantom Unsaved changes. Revert only after rollback is proved
+		 * (or before apply started), then discard the local cache. Never revert an
+		 * indeterminate or already confirmed apply. */
+		var safeToDiscard = !error.applyConfirmed && !error.confirmIndeterminate &&
+			(error.transactionRolledBack || !applyStarted);
+		var cleanup = safeToDiscard ?
+			discardStagedUciPackages([ 'cake-autorate', 'sqm' ]) : Promise.resolve();
+		return cleanup.then(function() {
 			reloadViewPage();
-		}
+			throw error;
+		}, function(cleanupError) {
+			var failure = new Error(_('%s The browser UCI transaction could not be discarded: %s').format(
+				error && error.message ? error.message : error,
+				cleanupError && cleanupError.message ? cleanupError.message : cleanupError));
+			failure.applyError = error;
+			failure.cleanupError = cleanupError;
+			reloadViewPage();
+			throw failure;
+		});
+	});
+}
+
+function changedUciPackages(changes) {
+	return Object.keys(changes || {}).filter(function(config) {
+		return changes[config] && changes[config].length;
+	});
+}
+
+function requireCleanUciTransaction() {
+	return uci.changes().then(function(changes) {
+		var packages = changedUciPackages(changes);
+		if (packages.length)
+			throw new Error(_('Apply or revert the existing pending changes before creating a Multi-WAN set.'));
+	});
+}
+
+function applyPlainRollbackTransaction(allowedPackages) {
+	var applyStarted = false;
+
+	return uci.save().then(function() {
+		return uci.changes();
+	}).then(function(changes) {
+		var packages = changedUciPackages(changes);
+		if (!packages.length)
+			return false;
+		if (packages.some(function(config) { return allowedPackages.indexOf(config) < 0; }))
+			throw new Error(_('The Multi-WAN transaction contains unrelated pending changes.'));
+		applyStarted = true;
+		return uci.callApply(AUTOTUNE_APPLY_TIMEOUT_S, true).then(function(status) {
+			if (status !== 0)
+				throw new Error(_('UCI rejected the rollback-enabled Multi-WAN configuration apply.'));
+			return callUciConfirmStatus();
+		}).then(function(status) {
+			if (status !== 0)
+				throw new Error(_('UCI could not confirm the Multi-WAN configuration transaction.'));
+			applyStarted = false;
+			return true;
+		});
+	}).catch(function(error) {
+		/* Never confirm an uncertain apply. rpcd's timeout remains authoritative;
+		 * discard the client cache so it cannot recommit the same transaction. */
+		if (applyStarted)
+			reloadViewPage();
 		throw error;
 	});
+}
+
+function runSequentialAutotuneApplies(items, applyOne) {
+	var applied = [];
+	var chain = Promise.resolve();
+
+	(items || []).forEach(function(item, index) {
+		chain = chain.then(function() {
+			return applyOne(item, index);
+		}).then(function(result) {
+			applied.push(result);
+		});
+	});
+
+	return chain.then(function() { return applied; });
 }
 
 function clearAutotuneProposalState(state) {
@@ -3425,6 +3746,30 @@ function clearAutotuneProposalState(state) {
 	state.autotune_action = 'apply_sqm';
 	state.disable_sqm_confirmed = false;
 	state.autotune_background_block = null;
+	state.autotune_batch = null;
+	state.autotune_batch_index = 0;
+	state.autotune_active_plan = null;
+	state.autotune_cancel_requested = false;
+	state.autotune_cancelled = false;
+}
+
+function multiwanAutotuneItemAccepted(item) {
+	return !!(item && item.decision === 'accepted' && item.state &&
+		autotuneResultReviewable(item.state.autotune_result, 'apply_sqm'));
+}
+
+function multiwanAutotuneItemDecided(item) {
+	return multiwanAutotuneItemAccepted(item) ||
+		!!(item && item.decision === 'skipped' && item.uncalibrated === true);
+}
+
+function multiwanAutotuneBatchDecided(items) {
+	return Array.isArray(items) && items.length > 0 &&
+		items.every(multiwanAutotuneItemDecided);
+}
+
+function multiwanAutotuneItemCanSkip(item, running) {
+	return !!item && running !== true && item.recovery_pending !== true;
 }
 
 function recordAutotuneTerminalFailure(state, result, message) {
@@ -3857,6 +4202,51 @@ function autotuneCpuSustainedSummary(load) {
 		autotuneMetric(load.cpu_softirq_p95_percent, '%'));
 }
 
+function autotuneConfidenceReasonText(reason) {
+	if (reason && reason.message)
+		return reason.message;
+	return String(reason && reason.code || '-').replace(/[-_]+/g, ' ');
+}
+
+function renderAutotuneConfidence(result) {
+	var confidence = autotuneConfidence(result);
+	if (!confidence)
+		return null;
+
+	var rows = [
+		[ _('Overall'), autotuneMetric(confidence.overall_percent, '%') ],
+		[ _('Download capacity'), autotuneMetric(confidence.capacity_download_percent, '%') ],
+		[ _('Upload capacity'), autotuneMetric(confidence.capacity_upload_percent, '%') ],
+		[ _('Quality'), autotuneMetric(confidence.quality_percent, '%') ]
+	];
+	var nodes = [
+		E('strong', {}, _('%s result · %s confidence').format(
+			autotuneResultClassLabel(result),
+			autotuneMetric(confidence.overall_percent, '%'))),
+		E('table', { 'class': 'table', 'style': 'margin-top:6px' }, rows.map(function(row) {
+			return E('tr', { 'class': 'tr' }, [
+				E('td', { 'class': 'td' }, row[0]),
+				E('td', { 'class': 'td' }, row[1])
+			]);
+		}))
+	];
+
+	if (confidence.reasons.length) {
+		nodes.push(E('div', { 'style': 'margin-top:6px' }, [
+			E('strong', {}, _('Why confidence was reduced:')),
+			E('ul', { 'style': 'margin:4px 0 0 20px' }, confidence.reasons.map(function(reason) {
+				return E('li', {}, _('%s: %s').format(
+					reason.scope || 'overall', autotuneConfidenceReasonText(reason)));
+			}))
+		]));
+	}
+
+	return E('div', {
+		'class': 'cake-autotune-confidence',
+		'style': 'margin:10px 0;padding:8px;border:1px solid rgba(127,127,127,.35);border-radius:4px'
+	}, nodes);
+}
+
 function renderAutotuneDiagnostics(result) {
 	var diagnostics = autotuneDiagnostics(result);
 	var diagnosticResult = autotuneLegacyResult(result) || result || {};
@@ -3870,6 +4260,7 @@ function renderAutotuneDiagnostics(result) {
 	var alertClass;
 	var alertTitle;
 	var alertMessage;
+	var resultClass = autotuneResultClass(diagnosticResult);
 
 	if (diagnostics.legacy) {
 		alertClass = 'error';
@@ -3878,10 +4269,22 @@ function renderAutotuneDiagnostics(result) {
 	}
 	else if (diagnostics.validated) {
 		alertClass = cpuWarning ? 'warning' : 'success';
-		alertTitle = cpuWarning ? _('Validated with CPU warning. ') : _('Validated proposal. ');
+		alertTitle = cpuWarning ? _('Trusted proposal with CPU warning. ') : _('Trusted proposal. ');
 		alertMessage = diagnostics.error || (cpuWarning ?
 			_('Every required validation gate passed, but CPU pressure exceeded the advisory threshold. The proposal remains applicable.') :
 			_('Every required validation gate passed.'));
+	}
+	else if (resultClass === 'provisional' && diagnostics.reviewable) {
+		alertClass = 'warning';
+		alertTitle = _('Valid provisional proposal. ');
+		alertMessage = diagnostics.error ||
+			_('The safety checks passed, but measurement uncertainty requires manual review.');
+	}
+	else if (resultClass === 'estimated' && diagnostics.reviewable) {
+		alertClass = 'warning';
+		alertTitle = _('Estimated result. ');
+		alertMessage = diagnostics.error ||
+			_('A conservative safe proposal is available, but confidence is low and explicit confirmation is required.');
 	}
 	else if (diagnostics.reviewable) {
 		alertClass = 'warning';
@@ -3897,9 +4300,9 @@ function renderAutotuneDiagnostics(result) {
 	}
 	else {
 		alertClass = 'error';
-		alertTitle = _('Proposal rejected. ');
+		alertTitle = _('Technical failure. ');
 		alertMessage = diagnostics.error ||
-			_('No settings can be applied from this result. Review the failed gates below.');
+			_('No safe proposal can be applied from this result. Review the failed technical or safety checks below.');
 	}
 
 	var nodes = [ E('div', {
@@ -3909,6 +4312,9 @@ function renderAutotuneDiagnostics(result) {
 		E('strong', {}, alertTitle),
 		alertMessage
 	]) ];
+	var confidenceNode = renderAutotuneConfidence(diagnosticResult);
+	if (confidenceNode)
+		nodes.push(confidenceNode);
 
 	if (diagnostics.legacy)
 		nodes.push(E('p', {}, _('Result schema: %s. This saved result is read-only and cannot be reused by the current validator.').format(
@@ -3998,6 +4404,47 @@ function renderAutotuneDiagnostics(result) {
 				])
 			]));
 		});
+	}
+
+	var baselineTraffic = diagnosticResult.baseline_traffic;
+	if (baselineTraffic && baselineTraffic.phase === 'baseline-retrospective') {
+		var measuredCapacity = baselineTraffic.measured_capacity || {};
+		var totalBackground = baselineTraffic.total_interface_background || {};
+		var forwardedBackground = baselineTraffic.forwarded_background || {};
+		var baselineRows = [
+			[ _('Measured raw capacity'), _('DL %s / UL %s kbit/s').format(
+				autotuneMetric(measuredCapacity.download_kbps, ''),
+				autotuneMetric(measuredCapacity.upload_kbps, '')) ],
+			[ _('Baseline total traffic'), _('DL %s / UL %s kbit/s; limits %s / %s').format(
+				autotuneMetric(totalBackground.baseline_download_kbps, ''),
+				autotuneMetric(totalBackground.baseline_upload_kbps, ''),
+				autotuneMetric(totalBackground.download_limit_kbps, ''),
+				autotuneMetric(totalBackground.upload_limit_kbps, '')) ],
+			[ _('Pre-test total traffic'), _('DL %s / UL %s kbit/s; limits %s / %s').format(
+				autotuneMetric(totalBackground.prethroughput_download_kbps, ''),
+				autotuneMetric(totalBackground.prethroughput_upload_kbps, ''),
+				autotuneMetric(totalBackground.download_limit_kbps, ''),
+				autotuneMetric(totalBackground.upload_limit_kbps, '')) ],
+			[ _('Forwarded client traffic'), _('DL %s / UL %s kbit/s; limits %s / %s').format(
+				autotuneMetric(forwardedBackground.download_kbps, ''),
+				autotuneMetric(forwardedBackground.upload_kbps, ''),
+				autotuneMetric(forwardedBackground.download_limit_kbps, ''),
+				autotuneMetric(forwardedBackground.upload_limit_kbps, '')) ]
+		];
+		nodes.push(E('details', {
+			'open': '',
+			'style': 'margin:8px 0;padding:8px;border:1px solid rgba(127,127,127,.35);border-radius:4px'
+		}, [
+			E('summary', { 'style': 'cursor:pointer;font-weight:600' },
+				_('Deferred baseline traffic check — %s').format(
+					baselineTraffic.passed === true ? _('passed') : _('failed'))),
+			E('table', { 'class': 'table', 'style': 'margin-top:8px' }, baselineRows.map(function(row) {
+				return E('tr', { 'class': 'tr' }, [
+					E('td', { 'class': 'td' }, row[0]),
+					E('td', { 'class': 'td', 'style': 'white-space:normal' }, row[1])
+				]);
+			}))
+		]));
 	}
 
 	if (!diagnostics.attempts.length) {
@@ -4168,7 +4615,9 @@ function showCreateWizard(grid, name, existingName) {
 	if (rerun)
 		name = existingName;
 	var defaultWan = defaultTargetInterface();
-	var defaultMembers = mwan3MembersForDevice(defaultWan);
+	var defaultMembers = availableMwan3Uplinks(rerun ? existingName : null).filter(function(member) {
+		return member.device === defaultWan;
+	});
 	var defaultMember = defaultMembers.length ? defaultMembers[0].name : '';
 	var state = {
 		name: name,
@@ -4178,7 +4627,9 @@ function showCreateWizard(grid, name, existingName) {
 		route_mode: defaultMember ? 'mwan3' : 'main',
 		mwan3_member: defaultMember,
 		route_selection: defaultMember ? 'mwan3:' + defaultMember : 'main',
+		multiwan_enabled: !!defaultMember,
 		multiwan_set: false,
+		autotune_batch_index: 0,
 		enabled: true,
 		sqm_enabled: true,
 		autotune_profile: 'best_overall',
@@ -4211,6 +4662,8 @@ function showCreateWizard(grid, name, existingName) {
 		state.route_mode = uci.get('cake-autorate', existingName, 'route_mode') || 'auto';
 		state.mwan3_member = uci.get('cake-autorate', existingName, 'mwan3_member') || '';
 		state.route_selection = state.mwan3_member ? 'mwan3:' + state.mwan3_member : 'main';
+		state.multiwan_enabled = !!state.mwan3_member &&
+			(state.route_mode === 'mwan3' || state.route_mode === 'auto');
 		state.enabled = uci.get('cake-autorate', existingName, 'enabled') === '1';
 		state.sqm_enabled = uci.get('cake-autorate', existingName, 'sqm_enabled') === '1';
 		state.autotune_profile = canonicalAutotuneProfile(
@@ -4310,11 +4763,12 @@ function showCreateWizard(grid, name, existingName) {
 	}
 
 	function renderInterfaceStep() {
-		var detectedUplinks = uniqueMwan3Uplinks();
+		var detectedUplinks = availableMwan3Uplinks(rerun ? existingName : null);
 		var target = wizardSelectOptions(targetInterfaceChoiceOptions(), state.wan_if);
-		var route = wizardSelectOptions(wizardRouteChoices(), state.route_selection);
+		var route = wizardSelectOptions(wizardRouteChoices(rerun ? existingName : null), state.route_selection);
 		var enabled = wizardCheckbox(state.enabled);
-		var multiwan = wizardCheckbox(state.multiwan_set);
+		var multiwan = wizardCheckbox(state.multiwan_enabled);
+		var multiwanAll = wizardCheckbox(state.multiwan_set);
 		var queueInfo = E('div', { 'class': 'cbi-value-dummy' }, wizardSqmQueueText(state));
 		var modeButtons = [
 			[ 'autotune', _('Full Auto-Tune'), _('Measures the link, calculates limits and presents a complete proposal. Uses significant traffic.') ],
@@ -4331,6 +4785,8 @@ function showCreateWizard(grid, name, existingName) {
 					state.autotune_proposal = null;
 					state.autotune_diagnostics = null;
 					state.autotune_failure_message = '';
+					state.autotune_batch = null;
+					state.autotune_cancelled = false;
 					if (state.mode === 'autotune') {
 						state.enabled = true;
 						state.sqm_enabled = true;
@@ -4351,6 +4807,8 @@ function showCreateWizard(grid, name, existingName) {
 				state.autotune_proposal = null;
 				state.autotune_diagnostics = null;
 				state.autotune_failure_message = '';
+				state.autotune_batch = null;
+				state.autotune_cancelled = false;
 			}
 			state.wan_if = newWan;
 			var matchingMembers = mwan3MembersForDevice(newWan);
@@ -4371,8 +4829,11 @@ function showCreateWizard(grid, name, existingName) {
 			state.autotune_proposal = null;
 			state.autotune_diagnostics = null;
 			state.autotune_failure_message = '';
+			state.autotune_batch = null;
+			state.autotune_cancelled = false;
 			state.route_selection = route.value;
 			if (route.value.indexOf('mwan3:') === 0) {
+				state.multiwan_enabled = true;
 				state.route_mode = 'mwan3';
 				state.mwan3_member = route.value.substring(6);
 				var member = mwan3Context.byName[state.mwan3_member];
@@ -4384,6 +4845,8 @@ function showCreateWizard(grid, name, existingName) {
 			} else {
 				state.route_mode = 'main';
 				state.mwan3_member = '';
+				state.multiwan_enabled = false;
+				state.multiwan_set = false;
 			}
 			render();
 		});
@@ -4394,9 +4857,37 @@ function showCreateWizard(grid, name, existingName) {
 		});
 
 		multiwan.addEventListener('change', function() {
-			state.multiwan_set = multiwan.checked;
+			state.autotune_batch = null;
+			state.autotune_cancelled = false;
+			state.multiwan_enabled = multiwan.checked;
+			if (state.multiwan_enabled) {
+				state.enabled = true;
+				state.sqm_enabled = true;
+				var matching = detectedUplinks.filter(function(member) {
+					return member.device === normalizeInterfaceName(state.wan_if);
+				});
+				var selected = matching.length ? matching[0] : detectedUplinks[0];
+				if (selected) {
+					state.route_mode = 'mwan3';
+					state.mwan3_member = selected.name;
+					state.route_selection = 'mwan3:' + selected.name;
+					state.wan_if = selected.device;
+				}
+			} else {
+				state.multiwan_set = false;
+				state.route_mode = 'main';
+				state.mwan3_member = '';
+				state.route_selection = 'main';
+			}
+			render();
+		});
+
+		multiwanAll.addEventListener('change', function() {
+			state.autotune_batch = null;
+			state.autotune_cancelled = false;
+			state.multiwan_set = multiwanAll.checked;
 			if (state.multiwan_set) {
-				state.mode = 'manual';
+				state.multiwan_enabled = true;
 				state.enabled = true;
 				state.sqm_enabled = true;
 			}
@@ -4410,66 +4901,485 @@ function showCreateWizard(grid, name, existingName) {
 			wizardField(_('SQM queue'), queueInfo, optionDescriptions._wizard_sqm_queue),
 			wizardField(_('Enable autorate'), enabled, optionDescriptions.enabled)
 		];
-		if (detectedUplinks.length > 1) {
-			var plan = multiwanInstancePlans(state).map(function(item) {
+		if (detectedUplinks.length) {
+			var plan = multiwanInstancePlans(state, rerun ? existingName : null).map(function(item) {
 				return '%s: %s → %s → %s'.format(item.name, item.member, item.device, item.sqmSection);
 			}).join('\n');
 			fields.push(wizardField(
-				_('Multi-WAN set'),
-				E('div', {}, [ multiwan, ' ', _('Create one isolated instance per detected uplink.'),
-					E('pre', { 'style': 'white-space:pre-wrap;margin-top:6px' }, plan) ]),
-				_('mwan3 IPv4/IPv6 entries resolving to the same L3 device are grouped into one uplink so duplicate CAKE queues cannot be created. Each instance keeps independent probes, baselines, limits, and schedules.')));
+				_('Multi-WAN routing'),
+				E('div', {}, [
+					E('label', { 'style': 'display:block;white-space:normal' }, [
+						multiwan, ' ', _('Route calibration through the selected mwan3 member.')
+					]),
+					E('label', { 'style': !rerun && state.multiwan_enabled && detectedUplinks.length > 1 ?
+						'display:block;margin-top:8px;white-space:normal' : 'display:none' }, [
+						multiwanAll, ' ', _('Create and calibrate every unused detected uplink sequentially.')
+					]),
+					state.multiwan_set ? E('pre', { 'style': 'white-space:pre-wrap;margin-top:6px' }, plan) : null
+				]),
+				_('Each instance owns one L3 device and one CAKE queue. Members already owned by another instance are excluded. Full Auto-Tune keeps the selected mwan3 route and does not change the global default route.')));
 		}
 
 		return fields;
 	}
 
-	function applyAutotuneResult(result) {
+	function cloneStateForPlan(plan) {
+		var instanceState = {};
+		for (var key in state)
+			if (Object.prototype.hasOwnProperty.call(state, key) &&
+			    key !== 'autotune_batch' && key !== 'autotune_active_plan')
+				instanceState[key] = state[key];
+		instanceState.name = plan.name;
+		instanceState.wan_if = plan.device;
+		instanceState.route_mode = 'mwan3';
+		instanceState.mwan3_member = plan.member;
+		instanceState.route_selection = 'mwan3:' + plan.member;
+		instanceState.sqm_section = plan.sqmSection;
+		instanceState.ping_extra_args = pingerInterfaceArgs(plan.device,
+			instanceState.pinger_method || 'fping');
+		return instanceState;
+	}
+
+	function batchAutotuneReady() {
+		return state.multiwan_set && multiwanAutotuneBatchDecided(state.autotune_batch);
+	}
+
+	function autotuneReadyForReview() {
+		return state.multiwan_set ? batchAutotuneReady() :
+			autotuneResultHasReviewChoice(state.autotune_result);
+	}
+
+	function applyAutotuneResultToState(targetState, result) {
 		if (!autotuneResultHasReviewChoice(result))
 			throw new Error(_('Refusing to stage an Auto-Tune result without a safe review choice.'));
 
 		var proposal = result.proposal;
 		var firstRun = result.runs && result.runs.length ? result.runs[0] : {};
-		state.autotune_result = result;
-		state.autotune_proposal = proposal;
+		targetState.autotune_result = result;
+		targetState.autotune_proposal = proposal;
 		/* Even an evidence-backed no-SQM recommendation is a destructive
 		 * alternative, not a default. A proved safe shaped candidate remains the
 		 * default; an infeasible capacity floor falls back to the non-writing
 		 * action. */
-		state.autotune_action = autotuneDefaultReviewAction(result);
-		if (!state.autotune_action)
+		targetState.autotune_action = autotuneDefaultReviewAction(result);
+		if (!targetState.autotune_action)
 			throw new Error(_('Auto-Tune returned no safe default Review action.'));
-		state.disable_sqm_confirmed = false;
-		state.autotune_profile = canonicalAutotuneProfile(result.profile) || 'best_overall';
-		state.autotune_diagnostics = null;
-		state.autotune_failure_message = '';
-		state.adaptive_ceiling_disable_confirmed = false;
+		targetState.disable_sqm_confirmed = false;
+		targetState.autotune_profile = canonicalAutotuneProfile(result.profile) || 'best_overall';
+		targetState.autotune_diagnostics = null;
+		targetState.autotune_failure_message = '';
+		targetState.adaptive_ceiling_disable_confirmed = false;
 		if (!rerun) {
-			state.enabled = true;
-			state.sqm_enabled = true;
+			targetState.enabled = true;
+			targetState.sqm_enabled = true;
 		}
-		state.sqm_download = String(proposal.download.base_kbps);
-		state.sqm_upload = String(proposal.upload.base_kbps);
-		state.sqm_linklayer = proposal.link.layer;
-		state.sqm_overhead = String(proposal.link.overhead);
-		state.sqm_tcMPU = String(proposal.link.mpu);
-		state.sqm_linklayer_advanced = proposal.link.layer === 'none' ? '0' : '1';
-		state.sqm_qdisc = proposal.sqm.qdisc;
-		state.sqm_script = proposal.sqm.script;
-		state.sqm_qdisc_advanced = '1';
-		state.sqm_qdisc_really_really_advanced = '1';
-		state.sqm_squash_dscp = proposal.sqm.squash_dscp ? '1' : '0';
-		state.sqm_squash_ingress = proposal.sqm.squash_ingress ? '1' : '0';
-		state.sqm_ingress_ecn = proposal.sqm.ingress_ecn;
-		state.sqm_egress_ecn = proposal.sqm.egress_ecn;
-		state.sqm_iqdisc_opts = proposal.sqm.iqdisc_opts || '';
-		state.sqm_eqdisc_opts = proposal.sqm.eqdisc_opts || '';
-		state.speedtest_backend = firstRun.backend || state.speedtest_backend || 'auto';
-		state.speedtest_go_server_id = firstRun.server_id || '';
-		applyPingerPlanToState(state, result.pinger_plan);
+		targetState.sqm_download = String(proposal.download.base_kbps);
+		targetState.sqm_upload = String(proposal.upload.base_kbps);
+		targetState.sqm_linklayer = proposal.link.layer;
+		targetState.sqm_overhead = String(proposal.link.overhead);
+		targetState.sqm_tcMPU = String(proposal.link.mpu);
+		targetState.sqm_linklayer_advanced = proposal.link.layer === 'none' ? '0' : '1';
+		targetState.sqm_qdisc = proposal.sqm.qdisc;
+		targetState.sqm_script = proposal.sqm.script;
+		targetState.sqm_qdisc_advanced = '1';
+		targetState.sqm_qdisc_really_really_advanced = '1';
+		targetState.sqm_squash_dscp = proposal.sqm.squash_dscp ? '1' : '0';
+		targetState.sqm_squash_ingress = proposal.sqm.squash_ingress ? '1' : '0';
+		targetState.sqm_ingress_ecn = proposal.sqm.ingress_ecn;
+		targetState.sqm_egress_ecn = proposal.sqm.egress_ecn;
+		targetState.sqm_iqdisc_opts = proposal.sqm.iqdisc_opts || '';
+		targetState.sqm_eqdisc_opts = proposal.sqm.eqdisc_opts || '';
+		targetState.speedtest_backend = firstRun.backend || targetState.speedtest_backend || 'auto';
+		targetState.speedtest_go_server_id = firstRun.server_id || '';
+		applyPingerPlanToState(targetState, result.pinger_plan);
+	}
+
+	function applyAutotuneResult(result) {
+		applyAutotuneResultToState(state, result);
+	}
+
+	function ensureMultiwanAutotuneBatch() {
+		if (Array.isArray(state.autotune_batch) && state.autotune_batch.length)
+			return state.autotune_batch;
+
+		state.autotune_batch = multiwanInstancePlans(state, rerun ? existingName : null).map(function(plan) {
+			return {
+				plan: plan,
+				state: cloneStateForPlan(plan),
+				status: 'profile',
+				decision: 'pending',
+				uncalibrated: false,
+				error: '',
+				diagnostics: null,
+				recovery_pending: false
+			};
+		});
+		state.autotune_batch_index = 0;
+		return state.autotune_batch;
+	}
+
+	function resetMultiwanAutotuneItem(item) {
+		if (!item || !item.state)
+			return;
+		item.state.autotune_result = null;
+		item.state.autotune_proposal = null;
+		item.state.autotune_diagnostics = null;
+		item.state.autotune_failure_message = '';
+		item.state.autotune_background_block = null;
+		item.state.autotune_recovery_pending = null;
+		item.state.autotune_cancelled = false;
+		item.state.autotune_action = 'apply_sqm';
+		item.state.disable_sqm_confirmed = false;
+		item.status = 'profile';
+		item.decision = 'pending';
+		item.uncalibrated = false;
+		item.error = '';
+		item.diagnostics = null;
+		item.recovery_pending = false;
+	}
+
+	function advanceMultiwanAutotuneItem() {
+		state.autotune_active_plan = null;
+		state.autotune_progress = 0;
+		state.autotune_batch_index = (state.autotune_batch_index || 0) + 1;
+		if (state.autotune_batch_index >= state.autotune_batch.length)
+			state.step = 2;
+		render();
+	}
+
+	function skipMultiwanAutotuneItem(item) {
+		var diagnostics = item.state.autotune_result || item.state.autotune_diagnostics ||
+			item.diagnostics || null;
+		var reason = item.error || (diagnostics && diagnostics.error) ||
+			_('Calibration was skipped by the user.');
+		resetMultiwanAutotuneItem(item);
+		item.diagnostics = diagnostics;
+		item.error = reason;
+		item.state.enabled = false;
+		item.state.sqm_enabled = false;
+		item.status = 'skipped';
+		item.decision = 'skipped';
+		item.uncalibrated = true;
+		advanceMultiwanAutotuneItem();
+	}
+
+	function acceptMultiwanAutotuneItem(item) {
+		if (!multiwanAutotuneItemAccepted({
+			decision: 'accepted', state: item && item.state
+		})) {
+			showError(_('This uplink has no validated safe shaped proposal to accept.'));
+			return;
+		}
+		item.state.autotune_action = 'apply_sqm';
+		item.status = 'accepted';
+		item.decision = 'accepted';
+		item.uncalibrated = false;
+		advanceMultiwanAutotuneItem();
+	}
+
+	function renderMultiwanAutotuneStep() {
+		var batch = ensureMultiwanAutotuneBatch();
+		if (!batch.length) {
+			return [ E('div', { 'class': 'alert-message error' },
+				_('Every detected mwan3 uplink is already owned by an instance.')) ];
+		}
+
+		var index = Math.min(state.autotune_batch_index || 0, batch.length - 1);
+		var item = batch[index];
+		var itemState = item.state;
+		var settledResult = itemState.autotune_result || itemState.autotune_diagnostics ||
+			item.diagnostics || null;
+		var canAccept = item.status === 'review' &&
+			autotuneResultReviewable(itemState.autotune_result, 'apply_sqm');
+		var acceptedProposal = canAccept && itemState.autotune_result.proposal;
+		var itemResultClass = autotuneResultClass(itemState.autotune_result);
+		var itemConfidence = autotuneConfidence(itemState.autotune_result);
+		var safeManualProposal = canAccept && itemResultClass !== 'trusted';
+		var canSkip = multiwanAutotuneItemCanSkip(item, state.autotune_running);
+		var statusLabels = {
+			profile: _('Choose profile'),
+			running: _('Running'),
+			review: _('Awaiting decision'),
+			accepted: _('Accepted'),
+			skipped: _('Skipped'),
+			recovery: _('Restoring runtime')
+		};
+		var timeline = E('div', {
+			'style': 'display:flex;flex-wrap:wrap;gap:6px;margin:0 0 14px'
+		}, batch.map(function(batchItem, batchIndex) {
+			var active = batchIndex === index;
+			return E('div', {
+				'style': 'flex:1 1 170px;padding:8px;border:1px solid %s;border-radius:4px;white-space:normal'.format(
+					active ? '#00b77a' : 'rgba(127,127,127,.4)')
+			}, [
+				E('strong', {}, _('%d/%d · %s').format(batchIndex + 1, batch.length,
+					batchItem.plan.member)),
+				E('br'),
+				E('span', { 'style': 'font-size:12px' }, _('%s → %s · %s').format(
+					batchItem.plan.device,
+					batchItem.plan.name,
+					statusLabels[batchItem.status] || batchItem.status || _('Pending')))
+			]);
+		}));
+
+		var profileButtons = autotuneProfileDefinitions().map(function(definition) {
+			var selected = itemState.autotune_profile === definition.id;
+			return E('button', {
+				'type': 'button',
+				'class': 'btn cbi-button %s'.format(selected ? 'cbi-button-positive' : ''),
+				'disabled': state.autotune_running || item.recovery_pending ? 'disabled' : null,
+				'data-profile': definition.id,
+				'aria-pressed': selected ? 'true' : 'false',
+				'style': 'display:flex;flex-direction:column;align-items:flex-start;gap:4px;flex:1 1 220px;min-height:104px;padding:10px;text-align:left;white-space:normal;word-break:normal;overflow-wrap:break-word;hyphens:none;line-height:1.4',
+				'click': function(ev) {
+					var selectedProfile = canonicalAutotuneProfile(
+						ev.currentTarget.getAttribute('data-profile'));
+					if (!selectedProfile || selectedProfile === itemState.autotune_profile)
+						return;
+					resetMultiwanAutotuneItem(item);
+					itemState.autotune_profile = selectedProfile;
+					render();
+				}
+			}, [
+				E('strong', {}, definition.title),
+				E('span', { 'style': 'font-size:12px;font-weight:600' }, definition.target),
+				E('span', { 'style': 'font-size:12px' }, definition.description)
+			]);
+		});
+
+		var progress = E('progress', {
+			'max': '100',
+			'value': state.autotune_progress || '0',
+			'style': 'width:min(620px,100%);' +
+				(state.autotune_running ? 'display:block' : 'display:none!important') +
+				';margin-top:8px'
+		});
+		var status = E('div', { 'style': 'margin-top:8px;white-space:normal' },
+			item.error || (item.status === 'review' ?
+				(canAccept ? _('Calibration finished. Accept the safe proposal or skip this uplink.') :
+					_('Calibration finished without an acceptable shaped proposal. Retry or skip this uplink.')) :
+				_('Select the quality profile for this uplink, then start its calibration.')));
+
+		var startCalibration = function(conservative) {
+			var generation = (state.autotune_generation || 0) + 1;
+			showError(null);
+			resetMultiwanAutotuneItem(item);
+			state.autotune_generation = generation;
+			state.autotune_cancel_requested = false;
+			state.autotune_cancelled = false;
+			state.autotune_running = true;
+			state.autotune_progress = 0;
+			state.autotune_active_plan = item;
+			item.status = 'running';
+			status.textContent = conservative ?
+				_('Starting conservative Full Auto-Tune for %s...').format(item.plan.member) :
+				_('Starting Full Auto-Tune for %s...').format(item.plan.member);
+			runButton.disabled = true;
+			conservativeButton.disabled = true;
+			cancelButton.disabled = false;
+			for (var profileIndex = 0; profileIndex < profileButtons.length; profileIndex++)
+				profileButtons[profileIndex].disabled = true;
+			progress.style.display = 'block';
+			var decisionNodes = decisionButtons.querySelectorAll('button');
+			for (var decisionIndex = 0; decisionIndex < decisionNodes.length; decisionIndex++)
+				decisionNodes[decisionIndex].disabled = true;
+
+			return runAutotuneJob(item.plan.name, item.plan.device,
+				itemState.speedtest_backend, function(job) {
+					if (generation !== state.autotune_generation || state.autotune_cancel_requested)
+						return;
+					state.autotune_progress = job.progress || 0;
+					progress.value = state.autotune_progress;
+					status.textContent = _('[%d/%d] %s: %s').format(index + 1, batch.length,
+						item.plan.member, job.message || job.phase || _('Full Auto-Tune is running...'));
+				}, 'mwan3', item.plan.member, itemState.autotune_profile, conservative)
+				.then(function(result) {
+					if (generation !== state.autotune_generation || state.autotune_cancel_requested)
+						return;
+					applyAutotuneResultToState(itemState, result);
+					item.diagnostics = result;
+					item.status = 'review';
+					item.error = '';
+					state.autotune_running = false;
+					state.autotune_active_plan = null;
+					state.autotune_progress = 100;
+					render();
+				}).catch(function(err) {
+					if (generation !== state.autotune_generation)
+						return;
+					if (state.autotune_cancel_requested)
+						return;
+					state.autotune_running = false;
+					state.autotune_active_plan = null;
+					state.autotune_progress = 0;
+					state.autotune_cancel_requested = false;
+
+					if (err.autotuneRecoveryPending) {
+						item.status = 'recovery';
+						item.recovery_pending = true;
+						item.error = err.message || _('Runtime recovery is still pending.');
+						itemState.autotune_recovery_pending = err.autotuneRecoveryStatus || {};
+						render();
+						return;
+					}
+
+					var result = err.autotuneResult || null;
+					item.diagnostics = result;
+					item.error = err.message || String(err);
+					if (autotuneRetryableInconclusive(result))
+						recordAutotuneRetryableInconclusive(itemState, result);
+					else if (result && result.background_blocked && result.retryable) {
+						itemState.autotune_result = null;
+						itemState.autotune_proposal = null;
+						itemState.autotune_diagnostics = result;
+						itemState.autotune_background_block = result;
+					}
+					else
+						recordAutotuneTerminalFailure(itemState, result || {}, item.error);
+					item.status = 'review';
+					render();
+				});
+		};
+
+		var runButton = E('button', {
+			'class': 'btn cbi-button cbi-button-action',
+			'disabled': state.autotune_running || item.recovery_pending ? 'disabled' : null,
+			'click': function() { return startCalibration(false); }
+		}, safeManualProposal ? _('Retry for higher confidence') :
+			(settledResult ? _('Run again') : _('Start Full Auto-Tune')));
+		var conservativeButton = E('button', {
+			'class': 'btn cbi-button cbi-button-positive',
+			'style': autotuneConservativeAvailable(itemState.autotune_background_block) ? '' : 'display:none',
+			'disabled': state.autotune_running || item.recovery_pending ? 'disabled' : null,
+			'click': function() { return startCalibration(true); }
+		}, _('Continue conservatively'));
+		var cancelButton = E('button', {
+			'class': 'btn cbi-button cbi-button-negative',
+			'disabled': state.autotune_running && item.status === 'running' ? null : 'disabled',
+			'click': function() {
+				state.autotune_cancel_requested = true;
+				status.textContent = _('Cancelling and restoring %s...').format(item.plan.member);
+				var generation = state.autotune_generation;
+				return cancelAutotuneJob(itemState.name, itemState.wan_if,
+					itemState.speedtest_backend, itemState.autotune_profile,
+					itemState.route_mode, itemState.mwan3_member).then(function() {
+					if (generation !== state.autotune_generation)
+						return;
+					state.autotune_generation++;
+					state.autotune_running = false;
+					state.autotune_active_plan = null;
+					state.autotune_cancel_requested = false;
+					state.autotune_progress = 0;
+					item.status = 'review';
+					item.recovery_pending = false;
+					item.error = _('Calibration cancelled. Previous runtime state was restored.');
+					render();
+				}).catch(function(err) {
+					state.autotune_running = false;
+					state.autotune_active_plan = null;
+					state.autotune_cancel_requested = false;
+					item.status = 'recovery';
+					item.recovery_pending = true;
+					item.error = err.message || String(err);
+					render();
+				});
+			}
+		}, _('Cancel test'));
+		var restoreButton = E('button', {
+			'class': 'btn cbi-button cbi-button-negative',
+			'style': item.recovery_pending ? '' : 'display:none',
+			'disabled': state.autotune_running ? 'disabled' : null,
+			'click': function() {
+				state.autotune_running = true;
+				state.autotune_active_plan = item;
+				item.status = 'recovery';
+				render();
+				return cancelAutotuneJob(itemState.name, itemState.wan_if,
+					itemState.speedtest_backend, itemState.autotune_profile,
+					itemState.route_mode, itemState.mwan3_member).then(function() {
+					state.autotune_running = false;
+					state.autotune_active_plan = null;
+					item.recovery_pending = false;
+					item.status = 'review';
+					item.error = _('Runtime was restored. Retry or skip this uplink.');
+					render();
+				}).catch(function(err) {
+					state.autotune_running = false;
+					state.autotune_active_plan = null;
+					item.error = err.message || String(err);
+					render();
+				});
+			}
+		}, _('Restore and check'));
+
+		var decisionButtons = E('div', { 'style': 'display:flex;flex-wrap:wrap;gap:8px;margin-top:12px' }, [
+			E('button', {
+				'class': 'btn cbi-button cbi-button-positive important',
+				'disabled': canAccept ? null : 'disabled',
+				'click': function() { acceptMultiwanAutotuneItem(item); }
+			}, safeManualProposal ? _('Accept safe proposal') : _('Accept proposal')),
+			E('button', {
+				'class': 'btn cbi-button',
+				'disabled': canSkip ? null : 'disabled',
+				'click': function() { skipMultiwanAutotuneItem(item); }
+			}, settledResult ? _('Skip this uplink') : _('Skip calibration'))
+		]);
+
+		var fields = [
+			timeline,
+			E('h5', {}, _('%s — %s → %s').format(item.plan.member,
+				item.plan.device, item.plan.name)),
+			wizardField(_('Calibration profile for %s').format(item.plan.member),
+				E('div', { 'style': 'display:flex;flex-wrap:wrap;gap:8px' }, profileButtons),
+				_('This choice applies only to the current uplink. Other uplinks may use different profiles.')),
+			E('div', { 'class': 'alert-message warning' }, [
+				E('strong', {}, _('Traffic warning: ')),
+				_('Only this mwan3 member is calibrated now. Client traffic is not intentionally interrupted, but concurrent traffic on this uplink can reduce measurement confidence.')
+			]),
+			wizardField(_('Calibration'), E('div', {}, [
+				runButton, ' ', conservativeButton, ' ', cancelButton, ' ', restoreButton,
+				progress, status, decisionButtons
+			]), _('Nothing is written to UCI until the final Review is confirmed.'))
+		];
+		if (acceptedProposal) {
+			fields.push(wizardField(_('Proposal for %s').format(item.plan.member),
+				E('table', { 'class': 'table' }, [
+					E('tr', { 'class': 'tr' }, [
+						E('td', { 'class': 'td' }, _('Result / confidence')),
+						E('td', { 'class': 'td' }, _('%s · %s').format(
+							autotuneResultClassLabel(itemState.autotune_result),
+							itemConfidence ? autotuneMetric(itemConfidence.overall_percent, '%') : '-'))
+					]),
+					E('tr', { 'class': 'tr' }, [
+						E('td', { 'class': 'td' }, _('Quality result')),
+						E('td', { 'class': 'td' }, itemState.autotune_result.validation &&
+							itemState.autotune_result.validation.actual_grade || '-')
+					]),
+					E('tr', { 'class': 'tr' }, [
+						E('td', { 'class': 'td' }, _('Download min / base / max')),
+						E('td', { 'class': 'td' }, _('%s / %s / %s kbit/s').format(
+							acceptedProposal.download.minimum_kbps,
+							acceptedProposal.download.base_kbps,
+							acceptedProposal.download.maximum_kbps))
+					]),
+					E('tr', { 'class': 'tr' }, [
+						E('td', { 'class': 'td' }, _('Upload min / base / max')),
+						E('td', { 'class': 'td' }, _('%s / %s / %s kbit/s').format(
+							acceptedProposal.upload.minimum_kbps,
+							acceptedProposal.upload.base_kbps,
+							acceptedProposal.upload.maximum_kbps))
+					])
+				]), _('Accept stages this proposal only for the current uplink. Skip creates it disabled and uncalibrated.')));
+		}
+
+		if (settledResult)
+			fields.push(renderAutotuneDiagnostics(settledResult));
+		return fields;
 	}
 
 	function renderAutotuneStep() {
+		if (state.multiwan_set)
+			return renderMultiwanAutotuneStep();
 		var profileButtons = autotuneProfileDefinitions().map(function(definition) {
 			var selected = state.autotune_profile === definition.id;
 			return E('button', {
@@ -4498,7 +5408,9 @@ function showCreateWizard(grid, name, existingName) {
 			]);
 		});
 		var status = E('div', { 'style': 'margin-top:8px;white-space:normal' },
-			state.autotune_result ? _('Calibration complete. Review the validated proposed parameters.') :
+			state.autotune_cancelled ? _('Calibration cancelled. Previous runtime state was restored.') :
+			state.autotune_result ? _('%s result is ready. Review its confidence and proposed parameters.').format(
+				autotuneResultClassLabel(state.autotune_result)) :
 				(state.autotune_diagnostics ?
 					(autotuneLegacyResult(state.autotune_diagnostics) ?
 						_('Saved diagnostics use an older result schema. Review them if useful, then run calibration again.') :
@@ -4513,7 +5425,11 @@ function showCreateWizard(grid, name, existingName) {
 				';margin-top:8px'
 		});
 		var startCalibration = function(conservative) {
+			var generation = (state.autotune_generation || 0) + 1;
 			showError(null);
+			state.autotune_generation = generation;
+			state.autotune_cancel_requested = false;
+			state.autotune_cancelled = false;
 			state.autotune_result = null;
 			state.autotune_proposal = null;
 			state.autotune_diagnostics = null;
@@ -4522,23 +5438,36 @@ function showCreateWizard(grid, name, existingName) {
 			state.autotune_running = true;
 			state.autotune_progress = 0;
 			state.autotune_background_block = null;
+			state.autotune_batch = null;
+			state.autotune_active_plan = null;
 			runButton.disabled = true;
 			conservativeButton.style.display = 'none';
 			cancelButton.disabled = false;
 			status.textContent = conservative ?
 				_('Starting conservative Full Auto-Tune...') : _('Starting Full Auto-Tune...');
 
-			return runAutotuneJob(state.name, state.wan_if, state.speedtest_backend, function(job) {
+			var progressCallback = function(job, prefix) {
+				if (generation !== state.autotune_generation || state.autotune_cancel_requested)
+					return;
 				state.autotune_progress = job.progress || 0;
 				progress.value = state.autotune_progress;
-				status.textContent = job.message || job.phase || _('Full Auto-Tune is running...');
-			}, state.route_mode, state.mwan3_member, state.autotune_profile,
-			conservative).then(function(result) {
+				status.textContent = (prefix || '') +
+					(job.message || job.phase || _('Full Auto-Tune is running...'));
+			};
+
+			return runAutotuneJob(state.name, state.wan_if, state.speedtest_backend, function(job) {
+				progressCallback(job, '');
+			}, state.route_mode, state.mwan3_member, state.autotune_profile, conservative).then(function(result) {
+				if (generation !== state.autotune_generation || state.autotune_cancel_requested)
+					return;
 				applyAutotuneResult(result);
 				state.autotune_running = false;
 				state.step = 2;
 				render();
 			}).catch(function(err) {
+				if (generation !== state.autotune_generation || state.autotune_cancel_requested ||
+				    (err.autotuneResult && err.autotuneResult.state === 'cancelled'))
+					return;
 				clearAutotuneProposalState(state);
 				state.autotune_diagnostics = null;
 				state.autotune_failure_message = '';
@@ -4571,8 +5500,13 @@ function showCreateWizard(grid, name, existingName) {
 						background.upload_kbps || 0,
 						background.download_usable ? _('yes') : _('no'),
 						background.upload_usable ? _('yes') : _('no'));
-					conservativeButton.style.display = '';
-					showError(_('The strict run stopped before throughput testing. Retry when quiet, continue once with conservative safeguards, or cancel.'));
+					if (autotuneConservativeAvailable(result)) {
+						conservativeButton.style.display = '';
+						showError(_('The strict run stopped before throughput testing. Retry when quiet, continue once with conservative safeguards, or cancel.'));
+					} else {
+						conservativeButton.style.display = 'none';
+						showError(_('A trustworthy idle baseline could not be established. Retry when this uplink is quieter; conservative mode is unavailable for this stage.'));
+					}
 				} else {
 					recordAutotuneTerminalFailure(state, result, err.message || String(err));
 					render();
@@ -4586,10 +5520,13 @@ function showCreateWizard(grid, name, existingName) {
 			'click': function() {
 				return startCalibration(false);
 			}
-		}, state.autotune_result || state.autotune_diagnostics ? _('Run again') : _('Start Full Auto-Tune'));
+		}, state.autotune_result && autotuneResultClass(state.autotune_result) !== 'trusted' ?
+			_('Retry for higher confidence') :
+			(state.autotune_result || state.autotune_diagnostics || state.autotune_batch ?
+				_('Run again') : _('Start Full Auto-Tune')));
 		var conservativeButton = E('button', {
 			'class': 'btn cbi-button cbi-button-positive',
-			'style': state.autotune_background_block ? '' : 'display:none',
+			'style': autotuneConservativeAvailable(state.autotune_background_block) ? '' : 'display:none',
 			'click': function() { return startCalibration(true); }
 		}, _('Continue conservatively'));
 		var cancelButton = E('button', {
@@ -4598,8 +5535,25 @@ function showCreateWizard(grid, name, existingName) {
 			'click': function() {
 				cancelButton.disabled = true;
 				status.textContent = _('Cancelling and restoring the previous SQM state...');
-				cancelAutotuneJob(state.name, state.wan_if, state.speedtest_backend,
-					state.autotune_profile);
+				state.autotune_cancel_requested = true;
+				var generation = state.autotune_generation;
+				var active = state.autotune_active_plan && state.autotune_active_plan.state || state;
+				return cancelAutotuneJob(active.name, active.wan_if, state.speedtest_backend,
+					state.autotune_profile, active.route_mode, active.mwan3_member).then(function() {
+					if (generation !== state.autotune_generation)
+						return;
+					state.autotune_generation++;
+					state.autotune_running = false;
+					state.autotune_active_plan = null;
+					state.autotune_batch = null;
+					state.autotune_progress = 0;
+					state.autotune_cancelled = true;
+					state.autotune_cancel_requested = false;
+					render();
+				}).catch(function(err) {
+					state.autotune_cancel_requested = false;
+					showError(err.message || String(err));
+				});
 			}
 		}, _('Cancel test'));
 
@@ -4833,7 +5787,10 @@ function showCreateWizard(grid, name, existingName) {
 			_('disable autorate and SQM') :
 			(selectedAutotuneAction === 'keep_current' ?
 				_('keep current settings') : (state.enabled ? _('enabled') : _('disabled')));
-		var rows = [
+		var rows = state.multiwan_set ? [
+			[ _('Setup'), _('Sequential per-uplink Full Auto-Tune') ],
+			[ _('Decision rule'), _('Each uplink has its own profile and explicit Accept or Skip decision.') ]
+		] : [
 			[ _('Target interface'), targetInterfaceLabel(wan) ],
 			[ _('Probe routing'), state.route_mode === 'mwan3' ? _('mwan3 member %s').format(state.mwan3_member) : _('Main routing table') ],
 			[ _('Autorate + SQM'), autorateDecision ],
@@ -4846,13 +5803,46 @@ function showCreateWizard(grid, name, existingName) {
 		if (state.autotune_diagnostics && !state.autotune_result)
 			reviewNodes.push(renderAutotuneDiagnostics(state.autotune_diagnostics));
 		if (state.multiwan_set) {
-			var multiwanPlans = multiwanInstancePlans(state);
+			var multiwanPlans = multiwanInstancePlans(state, rerun ? existingName : null);
 			var multiwanConflicts = wizardPlanConflicts(multiwanPlans, state.enabled,
 				rerun ? existingName : null);
-			rows.push([ _('Multi-WAN instances'), multiwanPlans.map(function(item) {
+			rows.push([ _('Multi-WAN instances'), E('pre', {
+				'style': 'margin:0;white-space:pre-wrap;font:inherit'
+			}, multiwanPlans.map(function(item) {
 				return '%s: %s → %s; %s'.format(item.name, item.member, item.device, item.sqmSection);
-			}).join('\n') ]);
+			}).join('\n')) ]);
 			rows.push([ _('Detected conflicts'), multiwanConflicts.length ? multiwanConflicts.join('\n') : _('None') ]);
+			(state.autotune_batch || []).forEach(function(item) {
+				var result = item.state && item.state.autotune_result;
+				var profile = autotuneProfileDefinitions().filter(function(definition) {
+					return definition.id === item.state.autotune_profile;
+				})[0];
+				if (multiwanAutotuneItemAccepted(item)) {
+						rows.push([ _('Result: %s').format(item.plan.member),
+							_('ACCEPTED · %s · calibrated via %s; DL %s / UL %s kbit/s; grade %s').format(
+								profile ? profile.title : item.state.autotune_profile,
+								item.plan.device,
+								item.state.sqm_download,
+								item.state.sqm_upload,
+								result.validation && result.validation.actual_grade || '-') ]);
+					}
+				else if (item.decision === 'skipped') {
+						rows.push([ _('Result: %s').format(item.plan.member),
+							_('SKIPPED · %s · the instance will be created disabled and marked for calibration. %s').format(
+								profile ? profile.title : item.state.autotune_profile,
+								item.error || _('The selected route was unavailable or validation did not complete.')) ]);
+					}
+				if (item.diagnostics) {
+						reviewNodes.push(E('details', {
+							'style': 'margin:8px 0;padding:8px;border:1px solid rgba(127,127,127,.35);border-radius:4px'
+						}, [
+							E('summary', { 'style': 'cursor:pointer;font-weight:600' },
+								_('%s diagnostics — %s').format(item.plan.member,
+									item.decision === 'accepted' ? _('accepted') : _('skipped'))),
+							renderAutotuneDiagnostics(item.diagnostics)
+						]));
+				}
+			});
 		}
 		/* Never render a proposal in Review unless it is also eligible for
 		 * staging.  This keeps a stale result object from becoming an implied
@@ -4873,6 +5863,7 @@ function showCreateWizard(grid, name, existingName) {
 			var thresholds = proposal.thresholds_ms;
 			var firstRun = autotune.runs && autotune.runs.length ? autotune.runs[0] : {};
 			var profilePolicy = autotuneProfilePolicy(autotune.profile);
+			var confidence = autotuneConfidence(autotune);
 			var cakePolicyText = proposal.sqm.classification === 'diffserv4' ?
 				(proposal.sqm.squash_dscp || proposal.sqm.squash_ingress ?
 					_('upload diffserv4; download best effort + wash') :
@@ -4884,7 +5875,15 @@ function showCreateWizard(grid, name, existingName) {
 						autotuneProfileDefinitions().filter(function(item) {
 							return item.id === profilePolicy.id;
 						})[0].title, profilePolicy.targetGrade) : '-' ],
-				[ _('Calibration confidence'), (autotune.confidence_mode === 'low' ? _('LOW · ') : '') + String(proposal.confidence) + '%' ],
+				[ _('Result class'), autotuneResultClassLabel(autotune) ],
+				[ _('Overall confidence'), confidence ? autotuneMetric(confidence.overall_percent, '%') : '-' ],
+				[ _('Capacity confidence'), confidence ? _('DL %s / UL %s').format(
+					autotuneMetric(confidence.capacity_download_percent, '%'),
+					autotuneMetric(confidence.capacity_upload_percent, '%')) : '-' ],
+				[ _('Quality confidence'), confidence ? autotuneMetric(confidence.quality_percent, '%') : '-' ],
+				[ _('Application'), autotune.auto_apply_eligible === true ?
+					_('Validated for automatic or manual application') :
+					_('Manual review required; automatic application is disabled') ],
 				[ _('Idle latency'), _('%s ms median / %s ms p95').format(autotune.baseline.median_ms, autotune.baseline.p95_ms) ],
 				[ _('Observed download'), _('%d / %d / %d kbit/s low / median / high').format(dl.observed_low_kbps, dl.observed_median_kbps, dl.observed_high_kbps) ],
 				[ _('Observed upload'), _('%d / %d / %d kbit/s low / median / high').format(ul.observed_low_kbps, ul.observed_median_kbps, ul.observed_high_kbps) ],
@@ -4901,6 +5900,8 @@ function showCreateWizard(grid, name, existingName) {
 				[ _('Detected link layer'), _('%s; overhead %d, MPU %d').format(proposal.link.kind, proposal.link.overhead, proposal.link.mpu) ],
 				[ _('Test server'), firstRun.server_sponsor ? _('%s #%s').format(firstRun.server_sponsor, firstRun.server_id || '-') : _('automatic') ]
 			);
+			if (confidence && confidence.reasons.length)
+				rows.push([ _('Confidence notes'), confidence.reasons.map(autotuneConfidenceReasonText).join('; ') ]);
 			if (autotune.profile === 'fair' && validation &&
 			    (validation.quality_target_met === false || capacityFloorInfeasible)) {
 				var outcome = autotune.fair_outcome;
@@ -5069,7 +6070,7 @@ function showCreateWizard(grid, name, existingName) {
 		}
 
 		if (step === 1) {
-			if (state.mode === 'autotune' && !autotuneResultHasReviewChoice(state.autotune_result)) {
+			if (state.mode === 'autotune' && !autotuneReadyForReview()) {
 				showError(state.autotune_diagnostics ?
 					_('This Auto-Tune run produced diagnostics only. Run it again successfully before continuing to Review.') :
 					_('Run Full Auto-Tune before continuing to Review.'));
@@ -5095,7 +6096,6 @@ function showCreateWizard(grid, name, existingName) {
 				showError(_('Download and upload speeds must be positive integers.'));
 				return false;
 			}
-
 		}
 
 		return true;
@@ -5104,6 +6104,16 @@ function showCreateWizard(grid, name, existingName) {
 	function navigateWizardStep(target) {
 		if (isNaN(target) || target < 0 || target > 2 || target === state.step)
 			return;
+		if (state.autotune_running) {
+			showError(_('Wait for the current calibration to stop and restore its runtime state.'));
+			return;
+		}
+		var currentBatchItem = state.multiwan_set && Array.isArray(state.autotune_batch) ?
+			state.autotune_batch[state.autotune_batch_index || 0] : null;
+		if (currentBatchItem && currentBatchItem.recovery_pending) {
+			showError(_('Runtime recovery is still pending for the current uplink.'));
+			return;
+		}
 
 		if (target > state.step) {
 			if (!validateStep(state.step))
@@ -5119,9 +6129,13 @@ function showCreateWizard(grid, name, existingName) {
 
 	function validateWizard() {
 		showError(null);
+		if (rerun && state.multiwan_set) {
+			showError(_('Calibrating every uplink is available only while creating new instances. Re-run calibrates the selected existing instance.'));
+			return false;
+		}
 		var selectedAction = state.autotune_action || 'apply_sqm';
-		if (state.mode === 'autotune' &&
-		    !autotuneResultReviewable(state.autotune_result, selectedAction)) {
+			if (state.mode === 'autotune' && !state.multiwan_set &&
+			    !autotuneResultReviewable(state.autotune_result, selectedAction)) {
 			showError(_('The selected Auto-Tune action is not supported by the validated evidence.'));
 			return false;
 		}
@@ -5150,6 +6164,10 @@ function showCreateWizard(grid, name, existingName) {
 				showError(_('This router does not provide the required nftables mwan3 member API.'));
 				return false;
 			}
+			if (state.mode === 'autotune' && state.multiwan_set && !batchAutotuneReady()) {
+				showError(_('Every Multi-WAN plan must have either a validated proposal or an explicit disabled, uncalibrated fallback.'));
+				return false;
+			}
 			var member = mwan3Context.byName[state.mwan3_member];
 			if (!member || member.device !== normalizeInterfaceName(state.wan_if)) {
 				showError(_('Select an online-configured mwan3 member matching the target interface.'));
@@ -5157,7 +6175,7 @@ function showCreateWizard(grid, name, existingName) {
 			}
 		}
 
-		var plans = state.multiwan_set ? multiwanInstancePlans(state) : [ {
+		var plans = state.multiwan_set ? multiwanInstancePlans(state, rerun ? existingName : null) : [ {
 			name: state.name,
 			device: normalizeInterfaceName(state.wan_if)
 		} ];
@@ -5198,6 +6216,95 @@ function showCreateWizard(grid, name, existingName) {
 		return true;
 	}
 
+	function stageWizardPlanItem(config_name, item) {
+		var plan = item.plan;
+		var instanceState = item.state;
+		var existingQueue = state.mode === 'autotune' ? null :
+			findImportableSqmQueueForInterface(plan.device);
+
+		instanceState.is_new_instance = !rerun;
+		if (existingQueue) {
+			instanceState.sqm_section = queueSectionName(existingQueue);
+			instanceState.sqm_download = rateValue(existingQueue.download, instanceState.sqm_download);
+			instanceState.sqm_upload = rateValue(existingQueue.upload, instanceState.sqm_upload);
+		}
+
+		var section_id = rerun ? existingName :
+			grid.map.data.add(config_name, grid.sectiontype, plan.name);
+		writeWizardConfig(section_id, instanceState, item.uncalibrated === true);
+		if (item.uncalibrated) {
+			uci.set('cake-autorate', section_id, 'enabled', '0');
+			uci.set('cake-autorate', section_id, 'sqm_enabled', '0');
+			uci.set('cake-autorate', section_id, 'autotune_pending', '1');
+		}
+		else if (state.mode === 'autotune') {
+			uci.unset('cake-autorate', section_id, 'autotune_pending');
+			stageAutotuneApplyMarker(section_id, instanceState);
+		}
+		return section_id;
+	}
+
+	function reloadWizardUci() {
+		if (typeof uci.unload === 'function') {
+			uci.unload('cake-autorate');
+			uci.unload('sqm');
+		}
+		return Promise.all([
+			uci.load('cake-autorate'),
+			L.resolveDefault(uci.load('sqm'), null)
+		]);
+	}
+
+	function applySequentialMultiwanPlan(config_name, planItems) {
+		var accepted = planItems.filter(function(item) {
+			return item.decision === 'accepted' && item.uncalibrated !== true;
+		});
+		var skipped = planItems.filter(function(item) {
+			return item.uncalibrated === true;
+		});
+		var created = [];
+
+		return requireCleanUciTransaction().then(function() {
+			return runSequentialAutotuneApplies(accepted, function(item) {
+				var section_id = stageWizardPlanItem(config_name, item);
+				return uci.save().then(function() {
+					/* Keep the proven single-proposal server guard. Multi-WAN is a
+					 * sequence of isolated, rollback-enabled transactions, never one
+					 * ambiguous transaction with several route/SQM owners. */
+					return runGuardedSaveApply(null, null, false);
+				}).then(function() {
+					created.push(section_id);
+					return reloadWizardUci();
+				}).then(function() {
+					return requireCleanUciTransaction();
+				}).then(function() {
+					return section_id;
+				}).catch(function(error) {
+					throw new Error(_('Failed to apply Multi-WAN proposal %s: %s').format(
+						item.plan.name, error && error.message ? error.message : error));
+				});
+			});
+		}).then(function() {
+			if (!skipped.length)
+				return created;
+			if (pendingAutotuneApplyMarkers().length ||
+			    (uci.sections('sqm', 'cake_autorate_apply_guard') || []).length)
+				throw new Error(_('A stale Full Auto-Tune marker remains; refusing to mix it with disabled uplinks.'));
+
+			for (var i = 0; i < skipped.length; i++)
+				created.push(stageWizardPlanItem(config_name, skipped[i]));
+
+			/* Skipped uplinks carry no measured proposal and are deliberately
+			 * written disabled. They share no active SQM side effects, so a plain
+			 * rollback-enabled cake-autorate transaction is sufficient. */
+			return applyPlainRollbackTransaction([ 'cake-autorate' ]).then(function() {
+				return reloadWizardUci();
+			}).then(function() {
+				return created;
+			});
+		});
+	}
+
 	function finish() {
 		var config_name = grid.uciconfig || grid.map.config;
 
@@ -5211,7 +6318,15 @@ function showCreateWizard(grid, name, existingName) {
 			return;
 		}
 
-		var freshness = state.mode === 'autotune' ?
+		var freshness = state.mode === 'autotune' && state.multiwan_set ?
+			Promise.all((state.autotune_batch || []).filter(function(item) {
+				return item.decision === 'accepted' && !item.uncalibrated;
+			}).map(function(item) {
+				return revalidateAutotuneProposal(item.plan.name, item.plan.device,
+					item.state.speedtest_backend, item.state.autotune_result,
+					'mwan3', item.plan.member,
+					item.state.autotune_action || 'apply_sqm');
+			})) : state.mode === 'autotune' ?
 			revalidateAutotuneProposal(state.name, state.wan_if,
 				state.speedtest_backend, state.autotune_result,
 				state.route_mode, state.mwan3_member,
@@ -5219,41 +6334,25 @@ function showCreateWizard(grid, name, existingName) {
 
 		return freshness.then(function() {
 			var section_id, created = [];
-			var plans = state.multiwan_set ? multiwanInstancePlans(state) : [ {
-				name: state.name,
-				member: state.mwan3_member,
-				device: state.wan_if,
-				sqmSection: state.sqm_section || managedSqmSectionName(state.name)
-			} ];
+			var planItems = state.multiwan_set && state.mode === 'autotune' ? state.autotune_batch :
+				(state.multiwan_set ? multiwanInstancePlans(state, rerun ? existingName : null).map(function(plan) {
+					return { plan: plan, state: cloneStateForPlan(plan), uncalibrated: false };
+				}) : [ {
+				plan: {
+					name: state.name,
+					member: state.mwan3_member,
+					device: state.wan_if,
+					sqmSection: state.sqm_section || managedSqmSectionName(state.name)
+				},
+				state: state,
+				uncalibrated: false
+			} ]);
 
-			for (var planIndex = 0; planIndex < plans.length; planIndex++) {
-				var plan = plans[planIndex];
-				var instanceState = {};
-				for (var key in state)
-					if (state.hasOwnProperty(key))
-						instanceState[key] = state[key];
-				instanceState.name = plan.name;
-				instanceState.wan_if = plan.device;
-				instanceState.route_mode = plan.member ? 'mwan3' : state.route_mode;
-				instanceState.mwan3_member = plan.member || '';
-				instanceState.route_selection = plan.member ? 'mwan3:' + plan.member : 'main';
-				instanceState.sqm_section = plan.sqmSection;
-				instanceState.is_new_instance = !rerun;
-				instanceState.ping_extra_args = pingerInterfaceArgs(plan.device, instanceState.pinger_method || 'fping');
-					var existingQueue = state.mode === 'autotune' ? null :
-						findImportableSqmQueueForInterface(plan.device);
-				if (existingQueue) {
-					instanceState.sqm_section = queueSectionName(existingQueue);
-					instanceState.sqm_download = rateValue(existingQueue.download, instanceState.sqm_download);
-					instanceState.sqm_upload = rateValue(existingQueue.upload, instanceState.sqm_upload);
-				}
+			if (state.multiwan_set && state.mode === 'autotune')
+				return applySequentialMultiwanPlan(config_name, planItems);
 
-				section_id = rerun ? existingName : grid.map.data.add(config_name, grid.sectiontype, plan.name);
-				writeWizardConfig(section_id, instanceState);
-				if (state.mode === 'autotune')
-					stageAutotuneApplyMarker(section_id, instanceState);
-				created.push(section_id);
-			}
+			for (var planIndex = 0; planIndex < planItems.length; planIndex++)
+				created.push(stageWizardPlanItem(config_name, planItems[planIndex]));
 
 			return grid.map.save(null, true).then(function() { return created; });
 		})
@@ -5271,6 +6370,9 @@ function showCreateWizard(grid, name, existingName) {
 				else if (rerun)
 					notification =
 						_('Auto-Tune proposal staged for %s. Review pending changes, then Save & Apply.').format(existingName);
+				else if (state.multiwan_set && state.mode === 'autotune')
+					notification = _('%d Multi-WAN instance(s) created and applied sequentially: %s.').format(
+						created.length, created.join(', '));
 				else
 					notification = _('%d instance(s) created: %s. Review pending changes, then Save & Apply.').format(
 						created.length, created.join(', '));
@@ -5291,9 +6393,14 @@ function showCreateWizard(grid, name, existingName) {
 			E('button', {
 				'class': 'btn cbi-button',
 				'click': function() {
-					if (state.autotune_running)
-						cancelAutotuneJob(state.name, state.wan_if,
-							state.speedtest_backend, state.autotune_profile);
+					if (state.autotune_running) {
+						state.autotune_cancel_requested = true;
+						state.autotune_generation = (state.autotune_generation || 0) + 1;
+						var active = state.autotune_active_plan && state.autotune_active_plan.state || state;
+						cancelAutotuneJob(active.name, active.wan_if,
+							active.speedtest_backend, active.autotune_profile,
+							active.route_mode, active.mwan3_member).catch(function() {});
+					}
 					ui.hideModal();
 				}
 			}, _('Cancel')),
@@ -5309,6 +6416,7 @@ function showCreateWizard(grid, name, existingName) {
 		if (state.step > 0) {
 			buttons.push(E('button', {
 				'class': 'btn cbi-button',
+				'disabled': state.autotune_running ? 'disabled' : null,
 				'click': function() {
 					navigateWizardStep(state.step - 1);
 				}
@@ -5316,8 +6424,7 @@ function showCreateWizard(grid, name, existingName) {
 			buttons.push(' ');
 		}
 
-		var invalidAutotune = state.mode === 'autotune' &&
-			!autotuneResultHasReviewChoice(state.autotune_result);
+		var invalidAutotune = state.mode === 'autotune' && !autotuneReadyForReview();
 		if (state.step < 2 && !(state.step === 1 && invalidAutotune)) {
 			buttons.push(E('button', {
 				'class': 'btn cbi-button cbi-button-positive',
@@ -5333,12 +6440,25 @@ function showCreateWizard(grid, name, existingName) {
 			}, _('Close diagnostics')));
 		}
 		else if (!invalidAutotune) {
+			var safeManualReview = state.step === 2 && state.mode === 'autotune' &&
+				!state.multiwan_set && state.autotune_result &&
+				autotuneResultClass(state.autotune_result) !== 'trusted';
+			if (safeManualReview) {
+				buttons.push(E('button', {
+					'class': 'btn cbi-button',
+					'click': function() { navigateWizardStep(1); }
+				}, _('Retry for higher confidence')));
+				buttons.push(' ');
+			}
 			buttons.push(E('button', {
 				'class': 'btn cbi-button cbi-button-positive important',
 				'click': finish
 			}, state.autotune_action === 'keep_current' ? _('Keep current') :
 				(state.autotune_action === 'disable_sqm' ? _('Stage SQM disable') :
-					(rerun ? _('Use proposal') : _('Create')))));
+					(rerun ? (safeManualReview ? _('Use safe proposal') : _('Use proposal')) :
+						(state.multiwan_set && state.mode === 'autotune' ?
+							_('Create & apply sequentially') :
+							(safeManualReview ? _('Create with safe proposal') : _('Create')))))));
 		}
 
 		content.push(E('div', { 'class': 'button-row' }, buttons));

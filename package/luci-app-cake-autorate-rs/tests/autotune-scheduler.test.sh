@@ -33,7 +33,7 @@ case "$expression" in
 		[ "$attestation" = 0 ] && emit "${RESULT_STATE-complete}" || emit "${ATTEST_STATE-ready}"
 		;;
 	@.schema_version)
-		[ "$attestation" = 0 ] && emit "${RESULT_SCHEMA_VERSION-7}" || emit "${ATTEST_SCHEMA_VERSION-1}"
+		[ "$attestation" = 0 ] && emit "${RESULT_SCHEMA_VERSION-8}" || emit "${ATTEST_SCHEMA_VERSION-1}"
 		;;
 	@.producer) emit "${RESULT_PRODUCER-cake-autorate-rs-autotune}" ;;
 	@.profile) emit "${RESULT_PROFILE-best_overall}" ;;
@@ -53,6 +53,9 @@ case "$expression" in
 	@.profile_outcome.manual_only) emit "${RESULT_PROFILE_MANUAL_ONLY-false}" ;;
 	@.auto_apply_eligible) emit "${RESULT_AUTO_APPLY_ELIGIBLE-true}" ;;
 	@.manual_apply_eligible) emit "${RESULT_MANUAL_APPLY_ELIGIBLE-true}" ;;
+	@.result_class) emit "${RESULT_CLASS-trusted}" ;;
+	@.confidence.overall_percent) emit "${RESULT_CONFIDENCE_OVERALL-100}" ;;
+	@.confidence.quality_percent) emit "${RESULT_CONFIDENCE_QUALITY-100}" ;;
 	@.confidence_mode) emit "${RESULT_CONFIDENCE_MODE-normal}" ;;
 	@.validation.contaminated) emit "${RESULT_VALIDATION_CONTAMINATED-false}" ;;
 	@.phase_evidence_complete) emit "${RESULT_PHASE_EVIDENCE_COMPLETE-true}" ;;
@@ -413,11 +416,12 @@ reset_case() {
 	unset RESULT_CORRECTION_ACTION RESULT_CORRECTION_FEASIBLE RESULT_GATE_CODES RESULT_GATE_REQUIRED RESULT_GATE_PASSES RESULT_GATE_ACTUALS RESULT_GATE_LIMITS RESULT_GATE_COMPARISONS
 	unset RESULT_PRODUCER RESULT_PROFILE RESULT_RUN_ID RESULT_VALIDATION_PROFILE RESULT_PROPOSAL_SCHEMA_VERSION RESULT_PROPOSAL_PROFILE RESULT_TARGET_GRADE
 	unset RESULT_QUALITY_TARGET_REQUIRED RESULT_THROUGHPUT_PRIORITY RESULT_VALIDATION_HARD_PASS RESULT_VALIDATION_SAFETY_PASS RESULT_QUALITY_TARGET_MET RESULT_PROFILE_OBJECTIVES_MET RESULT_PROFILE_TARGET_MET RESULT_PROFILE_MANUAL_ONLY RESULT_MANUAL_APPLY_ELIGIBLE
+	unset RESULT_CLASS RESULT_CONFIDENCE_OVERALL RESULT_CONFIDENCE_QUALITY
 	unset RESULT_REALIZATION_MIN_PERCENT RESULT_REALIZATION_MAX_PERCENT RESULT_RETENTION_PERCENT RESULT_ICMP_DELTA_MAX_MS RESULT_DELAY_MAX_MS RESULT_LOSS_MAX_PERCENT RESULT_CPU_MAX_PERCENT
 	unset RESULT_SQM_QDISC RESULT_SQM_SCRIPT RESULT_SQM_CLASSIFICATION RESULT_SQM_SQUASH_DSCP RESULT_SQM_SQUASH_INGRESS RESULT_SQM_INGRESS_ECN RESULT_SQM_EGRESS_ECN RESULT_SQM_IQDISC_OPTS RESULT_SQM_EQDISC_OPTS
 	unset RESULT_MINIMUM_KBPS RESULT_BASE_KBPS RESULT_MAXIMUM_KBPS RESULT_CAP_KBPS RESULT_OBSERVED_LOW_KBPS RESULT_OBSERVED_MEDIAN_KBPS RESULT_OBSERVED_HIGH_KBPS RESULT_ACTIVE_THRESHOLD_KBPS RESULT_ADJUST_UP_MS RESULT_DELAY_MS RESULT_ADJUST_DOWN_MS RESULT_HOLD_S RESULT_GROWTH_PERCENT RESULT_PROBE_S RESULT_COOLDOWN_S RESULT_TTL_S RESULT_LINK_OVERHEAD RESULT_LINK_MPU RESULT_CONFIDENCE
 	export RESULT_STATE=complete
-	export RESULT_SCHEMA_VERSION=7
+	export RESULT_SCHEMA_VERSION=8
 	export RESULT_PRODUCER=cake-autorate-rs-autotune
 	export RESULT_PROFILE=best_overall
 	export RESULT_RUN_ID=scheduler-test-run
@@ -436,6 +440,9 @@ reset_case() {
 	export RESULT_PROFILE_MANUAL_ONLY=false
 	export RESULT_AUTO_APPLY_ELIGIBLE=true
 	export RESULT_MANUAL_APPLY_ELIGIBLE=true
+	export RESULT_CLASS=trusted
+	export RESULT_CONFIDENCE_OVERALL=100
+	export RESULT_CONFIDENCE_QUALITY=100
 	export RESULT_CONFIDENCE_MODE=normal
 	export RESULT_VALIDATION_CONTAMINATED=false
 	export RESULT_PHASE_EVIDENCE_COMPLETE=true
@@ -530,7 +537,8 @@ export RESULT_PROPOSAL_ADAPTIVE_ENABLED=true
 apply_result test '{}' "$fingerprint_a" eth0
 ! grep -q 'adaptive_ceiling_enabled' "$log"
 
-reset_case; export RESULT_SCHEMA_VERSION=4; expect_gate_rejection 'legacy schema'
+reset_case; export RESULT_SCHEMA_VERSION=7; expect_gate_rejection 'legacy schema'
+reset_case; export RESULT_SCHEMA_VERSION=4; expect_gate_rejection 'older legacy schema'
 reset_case; export RESULT_SCHEMA_VERSION=__missing__; expect_gate_rejection 'unknown schema'
 reset_case; export RESULT_PRODUCER=foreign; expect_gate_rejection 'foreign result producer'
 reset_case; export RESULT_RUN_ID=__missing__; expect_gate_rejection 'missing immutable run identity'
@@ -550,6 +558,14 @@ reset_case; export RESULT_PROFILE_TARGET_MET=false; expect_gate_rejection 'manua
 reset_case; export RESULT_PROFILE_MANUAL_ONLY=true; expect_gate_rejection 'manual-only profile result'
 reset_case; export RESULT_AUTO_APPLY_ELIGIBLE=false; expect_gate_rejection 'helper-ineligible result'
 reset_case; export RESULT_MANUAL_APPLY_ELIGIBLE=false; expect_gate_rejection 'non-reviewable result'
+reset_case; export RESULT_CLASS=provisional; expect_gate_rejection 'provisional result'
+reset_case; export RESULT_CLASS=estimated; expect_gate_rejection 'estimated result'
+reset_case; export RESULT_CLASS=__missing__; expect_gate_rejection 'missing result class'
+reset_case; export RESULT_CONFIDENCE_OVERALL=84.9; expect_gate_rejection 'overall confidence below trusted threshold'
+reset_case; export RESULT_CONFIDENCE_OVERALL=__missing__; expect_gate_rejection 'missing overall confidence'
+reset_case; export RESULT_CONFIDENCE_QUALITY=84.9; expect_gate_rejection 'quality confidence below trusted threshold'
+reset_case; export RESULT_CONFIDENCE_QUALITY=101; expect_gate_rejection 'out-of-range quality confidence'
+reset_case; export RESULT_CONFIDENCE_QUALITY=__missing__; expect_gate_rejection 'missing quality confidence'
 reset_case; export RESULT_CONFIDENCE_MODE=low; expect_gate_rejection 'low-confidence result'
 reset_case; export RESULT_VALIDATION_CONTAMINATED=true; expect_gate_rejection 'contaminated validation'
 reset_case; export RESULT_PHASE_EVIDENCE_COMPLETE=false; expect_gate_rejection 'incomplete phase evidence'

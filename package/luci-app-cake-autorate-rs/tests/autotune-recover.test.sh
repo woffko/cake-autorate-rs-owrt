@@ -116,7 +116,7 @@ pending_result_file=$work/result.pending.json
 pending_error_file=$work/error.pending.json
 heartbeat_file=$work/heartbeat
 EOF
-	printf '%s\n' '{"state":"failed","schema_version":5,"producer":"cake-autorate-rs-autotune","profile":"best_overall","runtime_restored":false,"recovery_pending":true}' > "$work/error.pending.json"
+	printf '%s\n' '{"state":"failed","schema_version":8,"producer":"cake-autorate-rs-autotune","profile":"best_overall","runtime_restored":false,"recovery_pending":true}' > "$work/error.pending.json"
 	: > "$work/heartbeat"
 }
 
@@ -166,6 +166,50 @@ CAKE_AUTORATE_RECOVER_SOURCE_ONLY=1 sh -c '
 	! grep -q "\"forged\":true" "$error_file"
 ' sh "$helper" "$work"
 
+# Recovery warnings are appended to an otherwise authoritative terminal without
+# changing its state or conservative-action contract.
+CAKE_AUTORATE_RECOVER_SOURCE_ONLY=1 sh -c '
+	set -eu
+	. "$1"
+	job=wan_sqm
+	section=wan_sqm
+	pending_result_file="$2/warning-result.pending.json"
+	pending_error_file="$2/warning-error.pending.json"
+	result_file="$2/warning-result.json"
+	error_file="$2/warning-error.json"
+	status_file="$2/warning-status.json"
+	recovery_warnings="fixture recovery warning"
+	printf "%s\n" \
+		"{\"state\":\"background-blocked\",\"schema_version\":8,\"producer\":\"cake-autorate-rs-autotune\",\"conservative_available\":true,\"runtime_restored\":false,\"recovery_pending\":true}" > "$pending_error_file"
+	publish_pending_terminal
+	node -e '\''JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))'\'' "$error_file"
+	grep -q "\"state\":\"background-blocked\"" "$error_file"
+	grep -q "\"conservative_available\":true" "$error_file"
+	grep -q "\"recovery_warning\":\"fixture recovery warning\"" "$error_file"
+	grep -q "\"runtime_restored\":true" "$error_file"
+' sh "$helper" "$work"
+
+# Schema 7 is legacy after the confidence-envelope contract landed. Even a
+# syntactically valid legacy terminal object is never republished as current;
+# recovery replaces it with a bounded schema-8 diagnostic after restoration.
+CAKE_AUTORATE_RECOVER_SOURCE_ONLY=1 sh -c '
+	set -eu
+	. "$1"
+	job=wan_sqm
+	section=wan_sqm
+	pending_result_file="$2/legacy-result.pending.json"
+	pending_error_file="$2/legacy-error.pending.json"
+	result_file="$2/legacy-result.json"
+	error_file="$2/legacy-error.json"
+	status_file="$2/legacy-status.json"
+	printf "%s\n" \
+		"{\"state\":\"failed\",\"schema_version\":7,\"producer\":\"cake-autorate-rs-autotune\",\"error\":\"legacy-marker\",\"runtime_restored\":false,\"recovery_pending\":true}" > "$pending_error_file"
+	publish_pending_terminal
+	grep -q "\"schema_version\":8" "$error_file"
+	grep -q "\"state\":\"recovery-failed\"" "$error_file"
+	! grep -q "legacy-marker" "$error_file"
+' sh "$helper" "$work"
+
 # A normally completed owner creates the done marker before disappearing.
 # Recovery must be a complete no-op even if stale-looking journal data remains.
 reset_case
@@ -177,6 +221,64 @@ rm -f "$CAKE_AUTORATE_RUNTIME_LOCK_ROOT/sqm-snapshot.recoverytest"
 [ ! -s "$work/actions" ]
 [ ! -e "$work/normal.journal" ]
 [ ! -e "$work/heartbeat" ]
+
+# A worker can stage a deliberate strict-background stop and then hand runtime
+# restoration to the detached watcher if normal finalize cannot finish. Recovery
+# must publish that authoritative terminal rather than replace it with a generic
+# interrupted diagnostic.
+reset_case
+write_journal "$work/background-blocked.journal" 201 100
+set_no_sqm_journal "$work/background-blocked.journal"
+printf '%s\n' '{"state":"background-blocked","schema_version":8,"producer":"cake-autorate-rs-autotune","stage":"baseline","conservative_available":true,"terminal_marker":"preserve-me","runtime_restored":false,"recovery_pending":true}' > "$work/error.pending.json"
+"$helper" recover "$work/background-blocked.journal"
+node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$work/error.json"
+grep -q '"state":"background-blocked"' "$work/error.json"
+grep -q '"conservative_available":true' "$work/error.json"
+grep -q '"terminal_marker":"preserve-me"' "$work/error.json"
+grep -q '"runtime_restored":true' "$work/error.json"
+grep -q '"recovery_pending":false' "$work/error.json"
+! grep -q 'Full Auto-Tune was interrupted' "$work/error.json"
+[ ! -e "$work/background-blocked.journal" ]
+[ ! -e "$interface_record" ]
+
+# The same terminal must survive the managed-SQM restoration and exact paused
+# autorate resume path used by a live Auto-Tune job.
+reset_case
+write_journal "$work/background-managed.journal" 203 100 303 903
+write_fake_process 303 903 T /usr/sbin/cake-autorated --instance wan_sqm
+printf '%s\n' '{"state":"background-blocked","schema_version":8,"producer":"cake-autorate-rs-autotune","stage":"baseline","conservative_available":true,"terminal_marker":"managed-preserve","runtime_restored":false,"recovery_pending":true}' > "$work/error.pending.json"
+"$helper" recover "$work/background-managed.journal"
+node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$work/error.json"
+grep -Fqx "$expected_sqm_call" "$work/actions"
+grep -q '^kill -CONT 303$' "$work/actions"
+sqm_line="$(sed -n '/^sqm-recover /=' "$work/actions")"
+cont_line="$(sed -n '/^kill -CONT /=' "$work/actions")"
+[ -n "$sqm_line" ] && [ -n "$cont_line" ] && [ "$sqm_line" -lt "$cont_line" ]
+grep -q '"state":"background-blocked"' "$work/error.json"
+grep -q '"conservative_available":true' "$work/error.json"
+grep -q '"terminal_marker":"managed-preserve"' "$work/error.json"
+grep -q '"runtime_restored":true' "$work/error.json"
+grep -q '"recovery_pending":false' "$work/error.json"
+[ ! -e "$work/background-managed.journal" ]
+[ ! -e "$interface_record" ]
+
+# With no staged terminal, the recovery-generated fallback retains the worker's
+# last valid status checkpoint so LuCI can explain where the run stopped.
+reset_case
+write_journal "$work/no-pending.journal" 202 100
+set_no_sqm_journal "$work/no-pending.journal"
+rm -f "$work/error.pending.json" "$work/result.pending.json"
+printf '%s\n' '{"state":"running","phase":"quiet-check","progress":19,"message":"Checking that the selected uplink is idle before baseline attempt 2"}' > "$work/status.json"
+"$helper" recover "$work/no-pending.journal"
+node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$work/error.json"
+grep -q '"state":"failed"' "$work/error.json"
+grep -q 'Full Auto-Tune was interrupted' "$work/error.json"
+grep -q '"last_worker_phase":"quiet-check"' "$work/error.json"
+grep -q '"last_worker_message":"Checking that the selected uplink is idle before baseline attempt 2"' "$work/error.json"
+grep -q '"runtime_restored":true' "$work/error.json"
+grep -q '"recovery_pending":false' "$work/error.json"
+[ ! -e "$work/no-pending.journal" ]
+[ ! -e "$interface_record" ]
 
 # A watcher in its own process observes a real owner killed with SIGKILL, then
 # removes only journal-owned temporary state, resumes the exact daemon, and
@@ -245,11 +347,12 @@ unset AUTOTUNE_RECOVER_CHILD_PID_FILE AUTOTUNE_RECOVER_SPEEDTEST_CHILD_PID_FILE
 grep -Fqx "$expected_sqm_call" "$work/actions"
 [ -e "$work/sqm-restored" ]
 grep -q '"runtime_restored":true' "$work/error.json"
+grep -q '"schema_version":8' "$work/error.json"
 
 # A syntactically valid first object followed by a second JSON document must
-# never be published from the private recovery transaction.  Runtime cleanup
+# never be published from the private recovery transaction. Runtime cleanup
 # completes, but the untrusted diagnostic is replaced with a bounded internal
-# recovery-failed object.
+# recovery-failed object rather than being mistaken for a missing terminal.
 reset_case
 write_journal "$work/malformed-pending.journal" 242 100
 printf '%s\n' '{"state":"running","phase":"search","progress":89,"message":"Evaluating directional profile-search observation 2"}' > "$work/status.json"
@@ -258,11 +361,10 @@ printf '%s\n%s\n' \
 	'{"forged":true}' > "$work/error.pending.json"
 "$helper" recover "$work/malformed-pending.journal"
 node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$work/error.json"
-grep -q '"state":"failed"' "$work/error.json"
-grep -q 'Full Auto-Tune was interrupted' "$work/error.json"
-grep -q '"last_worker_phase":"search"' "$work/error.json"
-grep -q '"last_worker_message":"Evaluating directional profile-search observation 2"' "$work/error.json"
+grep -q '"state":"recovery-failed"' "$work/error.json"
+grep -q 'Stored Full Auto-Tune terminal data was malformed' "$work/error.json"
 grep -q '"runtime_restored":true' "$work/error.json"
+grep -q '"schema_version":8' "$work/error.json"
 ! grep -q '"forged":true' "$work/error.json"
 [ ! -e "$work/malformed-pending.journal" ]
 [ ! -e "$interface_record" ]
@@ -294,6 +396,7 @@ grep -Fqx "$expected_sqm_call" "$work/actions"
 [ ! -e "$work/partial-ifb.journal" ]
 [ ! -e "$interface_record" ]
 grep -q '"runtime_restored":true' "$work/error.json"
+grep -q '"schema_version":8' "$work/error.json"
 
 # RC17 journals bind restoration to a complete private SQM snapshot. The exact
 # SHA256 identity and root-owned RAM file are both forwarded to the strict

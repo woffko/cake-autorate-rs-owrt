@@ -36,6 +36,7 @@ export CAKE_AUTORATE_TEST_UCI_LOG="$ROOT/uci.log"
 
 "$HELPER" test set-budget 102400
 grep -q 'graph_history_ram_budget_kib=102400' "$ROOT/uci.log"
+grep -q 'commit cake-autorate' "$ROOT/uci.log"
 if "$HELPER" test set-budget 999999 >/dev/null 2>&1; then
 	echo "invalid budget was accepted" >&2
 	exit 1
