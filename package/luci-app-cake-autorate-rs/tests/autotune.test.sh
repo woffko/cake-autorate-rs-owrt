@@ -35,7 +35,7 @@ export CAKE_AUTORATE_JSONFILTER="$fixtures/jsonfilter"
 export CAKE_AUTORATE_FPING="$fixtures/fping"
 export CAKE_AUTORATE_DAEMON="$package_dir/src/target/debug/cake-autorated"
 export CAKE_AUTORATE_TRANSPORT_PROBE="$fixtures/transport-probe"
-export CAKE_AUTORATE_AUTOTUNE_RECOVER="$test_dir/../root/usr/libexec/cake-autorate-rs/autotune-recover"
+export CAKE_AUTORATE_AUTOTUNE_RECOVER="${CAKE_AUTORATE_AUTOTUNE_RECOVER:-$test_dir/../root/usr/libexec/cake-autorate-rs/autotune-recover}"
 export CAKE_AUTORATE_RUNTIME_LOCK_LIB="$package_dir/files/usr/libexec/cake-autorate-rs/runtime-lock"
 export CAKE_AUTORATE_RUNTIME_LOCK_ROOT="$work/runtime-locks"
 export CAKE_AUTORATE_AUTOTUNE_TEST_PREFLIGHT=1
@@ -47,6 +47,8 @@ export AUTOTUNE_MOCK_SHAPER_RESTORE_MARKER="$work/shaper-restored"
 export AUTOTUNE_MOCK_COUNTER="$work/counter"
 export AUTOTUNE_MOCK_PIN_LOG="$work/server-pins"
 export AUTOTUNE_MOCK_DIRECTION_LOG="$work/test-directions"
+export AUTOTUNE_MOCK_CONFIGURED_DL_KBPS=50000
+export AUTOTUNE_MOCK_CONFIGURED_UL_KBPS=10000
 
 # Minimal OpenWrt images such as the production x86 Multi-WAN router provide
 # neither od nor cksum. Worker/shaper identity must come directly from the
@@ -142,6 +144,58 @@ CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
 	! strict_single_json_object "$(printf "%s\n%s" "{\"state\":\"complete\",\"schema_version\":4}" "{\"forged\":true}")"
 ' sh "$autotune"
 
+# Confidence is evidence-derived rather than inherited from the button used to
+# start the worker. The weakest direction controls the overall percentage, and
+# any sticky contamination is reviewable but cannot be labelled trusted.
+CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
+	set -eu
+	. "$1"
+	observed_background_dl_max_share_percent=0
+	observed_background_ul_max_share_percent=0
+	baseline_quality_provisional=false
+	unresolved_background_contamination=false
+	validation_contaminated=false
+	phase_contamination_seen=false
+	build_autotune_confidence
+	[ "$capacity_download_confidence_percent" = 100 ]
+	[ "$capacity_upload_confidence_percent" = 100 ]
+	[ "$quality_confidence_percent" = 100 ]
+	[ "$overall_confidence_percent" = 100 ]
+	[ "$result_class" = trusted ]
+	[ "$confidence_json" = "{\"overall_percent\":100,\"capacity_download_percent\":100,\"capacity_upload_percent\":100,\"quality_percent\":100,\"reasons\":[]}" ]
+
+	observed_background_dl_max_share_percent=12
+	observed_background_ul_max_share_percent=35
+	phase_contamination_seen=true
+	unresolved_background_contamination=true
+	build_autotune_confidence
+	[ "$capacity_download_confidence_percent" = 88 ]
+	[ "$capacity_upload_confidence_percent" = 60 ]
+	[ "$quality_confidence_percent" = 70 ]
+	[ "$overall_confidence_percent" = 60 ]
+	[ "$result_class" = provisional ]
+	case "$confidence_json" in
+		*"\"code\":\"background-share-download\""*"\"code\":\"background-contamination-accepted\""*) ;;
+		*) exit 1 ;;
+	esac
+
+	observed_background_dl_max_share_percent=0
+	observed_background_ul_max_share_percent=0
+	unresolved_background_contamination=false
+	phase_contamination_seen=true
+	build_autotune_confidence
+	[ "$quality_confidence_percent" = 84 ]
+	[ "$overall_confidence_percent" = 84 ]
+	[ "$result_class" = provisional ]
+
+	observed_background_dl_max_share_percent=81
+	phase_contamination_seen=false
+	build_autotune_confidence
+	[ "$capacity_download_confidence_percent" = 25 ]
+	[ "$overall_confidence_percent" = 25 ]
+	[ "$result_class" = estimated ]
+' sh "$autotune"
+
 # The terminal-race distinction must not weaken live argv authentication.
 # An exact live helper returns 0; the same PID/starttime with a missing
 # immutable argument returns the dedicated live-mismatch code 1.
@@ -233,6 +287,43 @@ test "$(sed -n '5p' "$work/test-directions")" = upload
 test "$(sed -n '6p' "$work/test-directions")" = download
 test "$(sed -n '7p' "$work/test-directions")" = upload
 wait_for_job_cleanup fullauto
+
+# Regression: choosing conservative continuation is consent to measure in the
+# presence of background traffic, not a permanent low-confidence verdict. A
+# fresh conservative run whose actual evidence is clean and whose final
+# validation scores 100/100 must remain manually applicable (and may regain
+# trusted/auto eligibility).
+: > "$work/counter"
+export AUTOTUNE_MOCK_CONSERVATIVE_PHASE=1
+"$autotune" conservativeclean lo start-conservative speedtest-go > "$work/conservativeclean-start.json"
+attempt=0
+while [ "$attempt" -lt 800 ]; do
+	"$autotune" conservativeclean lo status speedtest-go > "$work/conservativeclean-status.json"
+	grep -q '"state":"complete"' "$work/conservativeclean-status.json" && break
+	attempt=$((attempt + 1))
+	sleep 0.02
+done
+node - "$work/conservativeclean-status.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (result.schema_version !== 8 || result.state !== 'complete' ||
+    result.conservative !== true || result.phase_contamination_seen !== false ||
+    !result.validation || result.validation.score !== 100 ||
+    result.validation.safety_pass !== true ||
+    !Array.isArray(result.validation_attempts) ||
+    !result.validation_attempts.some(attempt => attempt.score === 100) ||
+    result.manual_apply_eligible !== true || result.auto_apply_eligible !== true ||
+    result.result_class !== 'trusted' || !result.confidence ||
+    result.confidence.overall_percent !== 100 ||
+    result.confidence.capacity_download_percent !== 100 ||
+    result.confidence.capacity_upload_percent !== 100 ||
+    result.confidence.quality_percent !== 100 ||
+    !Array.isArray(result.confidence.reasons) || result.confidence.reasons.length !== 0 ||
+    !result.proposal || typeof result.proposal.confidence !== 'number')
+	throw new Error('clean conservative continuation remained ineligible or lost trusted confidence');
+EOF
+wait_for_job_cleanup conservativeclean
+unset AUTOTUNE_MOCK_CONSERVATIVE_PHASE
 
 # A helper may publish its complete JSON and exit while one finishing child
 # briefly keeps the supervised process group alive.  The leader is then a
@@ -885,17 +976,22 @@ unset CAKE_AUTORATE_AUTOTUNE_TEST_BASELINE_BACKGROUND_FIRST_DL_KBPS
 
 : > "$work/counter"
 export CAKE_AUTORATE_AUTOTUNE_TEST_BASELINE_BACKGROUND_DL_KBPS=999999
+export AUTOTUNE_MOCK_CONSERVATIVE_PHASE=1
 "$autotune" baselineblocked lo start-conservative speedtest-go > "$work/baselineblocked-start.json"
 attempt=0
-while [ "$attempt" -lt 220 ]; do
+while [ "$attempt" -lt 800 ]; do
 	"$autotune" baselineblocked lo status speedtest-go > "$work/baselineblocked-status.json"
-	grep -q 'Conservative mode cannot reuse a contaminated idle p95' "$work/baselineblocked-status.json" && break
+	grep -q '"state":"complete"' "$work/baselineblocked-status.json" && break
 	attempt=$((attempt + 1))
 	sleep 0.05
 done
-grep -q 'Conservative mode cannot reuse a contaminated idle p95' "$work/baselineblocked-status.json"
+grep -q '"state":"complete"' "$work/baselineblocked-status.json"
+grep -q '"result_class":"estimated"' "$work/baselineblocked-status.json"
+grep -q '"capacity_download_percent":25' "$work/baselineblocked-status.json"
+grep -q '"quality_percent":55' "$work/baselineblocked-status.json"
+grep -q '"manual_apply_eligible":true' "$work/baselineblocked-status.json"
 wait_for_job_cleanup baselineblocked
-unset CAKE_AUTORATE_AUTOTUNE_TEST_BASELINE_BACKGROUND_DL_KBPS
+unset CAKE_AUTORATE_AUTOTUNE_TEST_BASELINE_BACKGROUND_DL_KBPS AUTOTUNE_MOCK_CONSERVATIVE_PHASE
 
 : > "$work/counter"
 export AUTOTUNE_MOCK_FPING_SPARSE_FIRST_ONLY=1
@@ -961,23 +1057,113 @@ while [ "$attempt" -lt 220 ]; do
 done
 grep -q '"background_blocked":true' "$work/background-status.json"
 grep -q '"retryable":true' "$work/background-status.json"
+grep -q '"conservative_available":true' "$work/background-status.json"
 grep -q '"download_kbps":2500' "$work/background-status.json"
 wait_for_job_cleanup background
 
 : > "$work/counter"
+export AUTOTUNE_MOCK_CONSERVATIVE_PHASE=1
 "$autotune" background lo start-conservative speedtest-go > "$work/background-conservative-start.json"
 attempt=0
-while [ "$attempt" -lt 220 ]; do
+while [ "$attempt" -lt 800 ]; do
 	"$autotune" background lo status speedtest-go > "$work/background-conservative-status.json"
-	grep -q '"state":"background-blocked"' "$work/background-conservative-status.json" && break
+	grep -q '"state":"complete"' "$work/background-conservative-status.json" && break
 	attempt=$((attempt + 1))
 	sleep 0.05
 done
-grep -q '"state":"background-blocked"' "$work/background-conservative-status.json"
-grep -q 'conservative mode cannot invent an idle p95' "$work/background-conservative-status.json"
+grep -q '"state":"complete"' "$work/background-conservative-status.json"
+grep -q '"result_class":"provisional"' "$work/background-conservative-status.json"
+grep -q '"manual_apply_eligible":true' "$work/background-conservative-status.json"
+grep -q '"quality_percent":55' "$work/background-conservative-status.json"
+grep -q '"code":"baseline-background"' "$work/background-conservative-status.json"
 grep -q '"configuration_written":false' "$work/background-conservative-status.json"
 wait_for_job_cleanup background
+unset CAKE_AUTORATE_AUTOTUNE_BACKGROUND_DL_KBPS CAKE_AUTORATE_AUTOTUNE_BACKGROUND_UL_KBPS \
+	AUTOTUNE_MOCK_CONSERVATIVE_PHASE
+
+# A new instance has no configured capacity.  Its idle baseline is provisional
+# until the first routed unshaped control supplies a real direction-specific
+# reference.  Eight Mbit/s is acceptable on this mocked ~900 Mbit/s link and
+# must not be compared with the old synthetic 20 Mbit/s fallback.
+unset AUTOTUNE_MOCK_CONFIGURED_DL_KBPS AUTOTUNE_MOCK_CONFIGURED_UL_KBPS
+: > "$work/counter"
+export AUTOTUNE_MOCK_FAIR_BOUNDARY=1
+export CAKE_AUTORATE_AUTOTUNE_BACKGROUND_DL_KBPS=8000
+export CAKE_AUTORATE_AUTOTUNE_BACKGROUND_UL_KBPS=8000
+export CAKE_AUTORATE_AUTOTUNE_TEST_BASELINE_BACKGROUND_DL_KBPS=8000
+export CAKE_AUTORATE_AUTOTUNE_TEST_BASELINE_BACKGROUND_UL_KBPS=8000
+"$autotune" deferredhigh lo start speedtest-go '' '' fair > "$work/deferredhigh-start.json"
+attempt=0
+while [ "$attempt" -lt 800 ]; do
+	"$autotune" deferredhigh lo status speedtest-go '' '' fair > "$work/deferredhigh-status.json"
+	grep -q '"state":"complete"' "$work/deferredhigh-status.json" && break
+	attempt=$((attempt + 1))
+	sleep 0.05
+done
+grep -q '"state":"complete"' "$work/deferredhigh-status.json"
+grep -q '"phase":"baseline-retrospective","passed":true' "$work/deferredhigh-status.json"
+grep -q '"reference_deferred":true' "$work/deferredhigh-status.json"
+grep -q '"download_reference_kbps":902700' "$work/deferredhigh-status.json"
+grep -q '"upload_reference_kbps":900000' "$work/deferredhigh-status.json"
+wait_for_job_cleanup deferredhigh
+unset AUTOTUNE_MOCK_FAIR_BOUNDARY
+
+# When a new instance had no initial capacity reference, retrospective scoring
+# must not leave its previously deferred background share at zero. A 90%
+# baseline remains measurable after explicit conservative consent, but is an
+# estimated result with low direction-specific capacity confidence.
+: > "$work/counter"
+export CAKE_AUTORATE_AUTOTUNE_BACKGROUND_DL_KBPS=45000
+export CAKE_AUTORATE_AUTOTUNE_BACKGROUND_UL_KBPS=9000
+export CAKE_AUTORATE_AUTOTUNE_TEST_BASELINE_BACKGROUND_DL_KBPS=45000
+export CAKE_AUTORATE_AUTOTUNE_TEST_BASELINE_BACKGROUND_UL_KBPS=9000
+export AUTOTUNE_MOCK_CONSERVATIVE_PHASE=1
+"$autotune" deferredestimated lo start-conservative speedtest-go > "$work/deferredestimated-start.json"
+attempt=0
+while [ "$attempt" -lt 800 ]; do
+	"$autotune" deferredestimated lo status speedtest-go > "$work/deferredestimated-status.json"
+	grep -q '"state":"complete"' "$work/deferredestimated-status.json" && break
+	attempt=$((attempt + 1))
+	sleep 0.05
+done
+grep -q '"state":"complete"' "$work/deferredestimated-status.json"
+grep -q '"phase":"baseline-retrospective","passed":false' "$work/deferredestimated-status.json"
+grep -q '"download_share_percent":90.0' "$work/deferredestimated-status.json"
+grep -q '"upload_share_percent":90.0' "$work/deferredestimated-status.json"
+grep -q '"result_class":"estimated"' "$work/deferredestimated-status.json"
+grep -q '"capacity_download_percent":25' "$work/deferredestimated-status.json"
+grep -q '"capacity_upload_percent":25' "$work/deferredestimated-status.json"
+grep -q '"manual_apply_eligible":true' "$work/deferredestimated-status.json"
+grep -q '"code":"baseline-background"' "$work/deferredestimated-status.json"
+grep -q '"code":"background-contamination-accepted"' "$work/deferredestimated-status.json"
+wait_for_job_cleanup deferredestimated
+unset AUTOTUNE_MOCK_CONSERVATIVE_PHASE
+export CAKE_AUTORATE_AUTOTUNE_BACKGROUND_DL_KBPS=8000
+export CAKE_AUTORATE_AUTOTUNE_BACKGROUND_UL_KBPS=8000
+export CAKE_AUTORATE_AUTOTUNE_TEST_BASELINE_BACKGROUND_DL_KBPS=8000
+export CAKE_AUTORATE_AUTOTUNE_TEST_BASELINE_BACKGROUND_UL_KBPS=8000
+
+# The same provisional traffic is unsafe on the default 50/10 Mbit/s fixture.
+# Retrospective validation must fail at the baseline stage before a proposal.
+: > "$work/counter"
+"$autotune" deferredlow lo start speedtest-go > "$work/deferredlow-start.json"
+attempt=0
+while [ "$attempt" -lt 260 ]; do
+	"$autotune" deferredlow lo status speedtest-go > "$work/deferredlow-status.json"
+	grep -q 'baseline-retrospective' "$work/deferredlow-status.json" && break
+	attempt=$((attempt + 1))
+	sleep 0.05
+done
+grep -q '"state":"background-blocked"' "$work/deferredlow-status.json"
+grep -q '"stage":"baseline-retrospective"' "$work/deferredlow-status.json"
+grep -q '"conservative_available":true' "$work/deferredlow-status.json"
+grep -q '"manual_apply_eligible":false' "$work/deferredlow-status.json"
+grep -q '"phase":"baseline-retrospective","passed":false' "$work/deferredlow-status.json"
+wait_for_job_cleanup deferredlow
 unset CAKE_AUTORATE_AUTOTUNE_BACKGROUND_DL_KBPS CAKE_AUTORATE_AUTOTUNE_BACKGROUND_UL_KBPS
+unset CAKE_AUTORATE_AUTOTUNE_TEST_BASELINE_BACKGROUND_DL_KBPS CAKE_AUTORATE_AUTOTUNE_TEST_BASELINE_BACKGROUND_UL_KBPS
+export AUTOTUNE_MOCK_CONFIGURED_DL_KBPS=50000
+export AUTOTUNE_MOCK_CONFIGURED_UL_KBPS=10000
 
 # Forwarded client traffic is accounted independently in every heavy phase.
 # Normal mode fails closed after one retry; explicit conservative mode may
@@ -1014,6 +1200,9 @@ grep -q '"state":"complete"' "$work/phaseconservative-status.json"
 grep -q '"phase_contamination_seen":true' "$work/phaseconservative-status.json"
 grep -q '"contaminated":true' "$work/phaseconservative-status.json"
 grep -q '"auto_apply_eligible":false' "$work/phaseconservative-status.json"
+grep -q '"manual_apply_eligible":true' "$work/phaseconservative-status.json"
+grep -q '"result_class":"estimated"' "$work/phaseconservative-status.json"
+grep -q '"overall_percent":25' "$work/phaseconservative-status.json"
 grep -q '"confidence_mode":"low"' "$work/phaseconservative-status.json"
 wait_for_job_cleanup phaseconservative
 unset AUTOTUNE_MOCK_CONSERVATIVE_PHASE
@@ -1232,7 +1421,7 @@ mkdir -p "$job_dir"
 export CAKE_AUTORATE_AUTOTUNE_HISTORY_RUNS=2
 export CAKE_AUTORATE_AUTOTUNE_HISTORY_KIB=128
 for history_test_run in a b c; do
-	printf '{"state":"complete","schema_version":7,"producer":"cake-autorate-rs-autotune","profile":"fair","run_id":"run-%s"}\n' \
+	printf '{"state":"complete","schema_version":8,"producer":"cake-autorate-rs-autotune","profile":"fair","run_id":"run-%s"}\n' \
 		"$history_test_run" > "$result_file"
 	printf 'diagnostic for run-%s\n' "$history_test_run" > "$log_file"
 	archive_previous_terminal
@@ -1508,7 +1697,7 @@ grep -q '"state":"legacy"' "$work/status-settled.json"
 grep -q '"legacy_result":{"state":"complete"' "$work/status-settled.json"
 grep -q '"auto_apply_eligible":false' "$work/status-settled.json"
 
-printf '%s\n' '{"state":"complete","schema_version":7,"producer":"cake-autorate-rs-autotune","profile":"best_overall"}' > "$result_file"
+printf '%s\n' '{"state":"complete","schema_version":8,"producer":"cake-autorate-rs-autotune","profile":"best_overall"}' > "$result_file"
 status_job > "$work/status-current.json"
 grep -q '"state":"complete"' "$work/status-current.json"
 if grep -q '"state":"legacy"' "$work/status-current.json"; then exit 1; fi
@@ -1524,6 +1713,16 @@ valid_route_table mwan_wanb
 if valid_route_table main; then exit 1; fi
 if valid_route_table '2;reboot'; then exit 1; fi
 
+# mwan3's socket wrapper does not affect netlink route queries.  Route
+# attestation must therefore pass the independently discovered member mark to
+# ip route get instead of wrapping the ip process with mwan3 use.
+ip() {
+	test "$*" = '-4 route get 1.1.1.1 from 10.0.100.102 mark 0x200'
+	printf '%s\n' '1.1.1.1 from 10.0.100.102 via 10.0.100.1 dev eth0 table 2 mark 0x200'
+}
+test "$(route_device_for_mark 10.0.100.102 0x200)" = eth0
+unset -f ip 2>/dev/null || true
+
 # A stale or reused PID is not a worker identity: status may report failure,
 # but cancel must not signal the unrelated process.
 job_name=staleidentity
@@ -1533,7 +1732,8 @@ printf '%s\n%s\n%s\n' "$$" "$(proc_starttime "$$")" not-the-worker-token > "$pid
 status_job > "$work/stale-status.json"
 cancel_job > "$work/stale-cancel.json"
 grep -q 'identity is stale' "$work/stale-status.json"
-grep -q '"state":"idle"' "$work/stale-cancel.json"
+grep -q 'identity is stale' "$work/stale-cancel.json"
+if grep -q '"state":"idle"' "$work/stale-cancel.json"; then exit 1; fi
 
 # A new instance may use only a clean target. Existing CAKE/fq_codel/pfifo or
 # ingress state without matching managed-SQM ownership is intentionally not

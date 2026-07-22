@@ -93,21 +93,35 @@ manifest_key_mismatch() {
 	local expected_file="$1"
 	local live_file="$2"
 
-	# Minimal OpenWrt images commonly omit diff. Both inputs are already
-	# sorted canonical UCI output, so compare them directly with POSIX awk and
-	# retain a useful option name without adding a package dependency.
+	# Minimal OpenWrt images commonly omit diff. Compare by UCI key rather than
+	# by line number: one extra key otherwise shifts every following sorted line
+	# and reports an innocent neighbouring option as the mismatch.
 	awk '
-		FNR == NR { expected[++expected_count] = $0; next }
-		{ live[++live_count] = $0 }
+		FNR == NR {
+			line = $0
+			key = line
+			sub(/=.*/, "", key)
+			expected[key] = line
+			next
+		}
+		{
+			line = $0
+			key = line
+			sub(/=.*/, "", key)
+			live[key] = line
+		}
 		END {
-			limit = expected_count > live_count ? expected_count : live_count
-			for (i = 1; i <= limit; i++) {
-				if (expected[i] == live[i])
-					continue
-				line = expected[i] != "" ? expected[i] : live[i]
-				sub(/=.*/, "", line)
-				print line
-				exit
+			for (key in expected) {
+				if (!(key in live) || expected[key] != live[key]) {
+					print key
+					exit
+				}
+			}
+			for (key in live) {
+				if (!(key in expected)) {
+					print key
+					exit
+				}
 			}
 		}
 	' "$expected_file" "$live_file"
@@ -140,6 +154,11 @@ is_decimal() {
 	case "$1" in
 		''|*[!0-9.]*|.*|*..*|*.) return 1 ;;
 	esac
+}
+
+is_percent() {
+	is_decimal "$1" || return 1
+	LC_ALL=C awk -v value="$1" 'BEGIN { exit(value >= 0 && value <= 100 ? 0 : 1) }'
 }
 
 numbers_equal() {
@@ -797,6 +816,15 @@ build_expected_manifest() {
 
 	uci_at "$token_dir/expected" -q get "cake-autorate.$job" >/dev/null 2>&1 ||
 		uci_at "$token_dir/expected" -q set "cake-autorate.$job=cake_autorate" || return 1
+	# The create wizard gives every new instance an explicit, inert traffic
+	# profile policy. Existing instances retain their original policy verbatim.
+	# These three values are part of the exact proposal manifest even though
+	# they do not enable the optional native classifier.
+	if ! uci_at "$token_dir/original" -q get "cake-autorate.$job" >/dev/null 2>&1; then
+		expected_set "$job" traffic_profile auto
+		expected_set "$job" traffic_profile_migrated 1
+		expected_set "$job" traffic_rules_enabled 0
+	fi
 	expected_set "$job" enabled "$enabled"
 	expected_set "$job" wan_if "$resolved"
 	expected_set "$job" route_mode "$route_mode"
@@ -1097,17 +1125,62 @@ arm_guard() {
 	owned_regular "$result_copy" || die "The Full Auto-Tune result copy is unsafe."
 
 	require_result_flag '@.state' complete "Only a complete Full Auto-Tune result can be applied."
-	require_result_flag '@.schema_version' 7 "Only the fail-closed Full Auto-Tune schema can be applied."
+	require_result_flag '@.schema_version' 8 "Only the background-aware fail-closed Full Auto-Tune schema can be applied."
 	require_result_flag '@.producer' "$autotune_result_producer" "The Full Auto-Tune result producer is invalid."
+	require_result_flag '@.result_available' true "The Full Auto-Tune result contains no reviewable measurement."
 	require_result_flag '@.manual_apply_eligible' true "This Full Auto-Tune result is not eligible for explicit review and apply."
 	require_result_flag '@.phase_evidence_complete' true "This Full Auto-Tune result has incomplete phase evidence."
-	require_result_flag '@.phase_contamination_seen' false "A contaminated Full Auto-Tune result cannot be applied."
 	require_result_flag '@.runtime_restored' true "Full Auto-Tune runtime recovery is incomplete."
 	require_result_flag '@.recovery_pending' false "Full Auto-Tune recovery is still pending."
 	require_result_flag '@.configuration_written' false "The Full Auto-Tune result has unexpected write state."
-	require_result_flag '@.conservative' false "A conservative Full Auto-Tune result cannot be auto-applied."
-	require_result_flag '@.confidence_mode' normal "Only normal-confidence Full Auto-Tune output can be applied."
-	require_result_flag '@.validation.contaminated' false "Full Auto-Tune validation was contaminated."
+	result_class="$(require_result_value '@.result_class')" ||
+		die "The Full Auto-Tune result class is missing."
+	case "$result_class" in trusted|provisional|estimated) ;;
+		*) die "The Full Auto-Tune result class is invalid." ;;
+	esac
+	confidence_overall="$(require_result_value '@.confidence.overall_percent')" ||
+		die "The overall Full Auto-Tune confidence is missing."
+	confidence_dl="$(require_result_value '@.confidence.capacity_download_percent')" ||
+		die "The download-capacity confidence is missing."
+	confidence_ul="$(require_result_value '@.confidence.capacity_upload_percent')" ||
+		die "The upload-capacity confidence is missing."
+	confidence_quality="$(require_result_value '@.confidence.quality_percent')" ||
+		die "The quality confidence is missing."
+	for confidence_value in "$confidence_overall" "$confidence_dl" "$confidence_ul" "$confidence_quality"; do
+		is_percent "$confidence_value" || die "The Full Auto-Tune confidence evidence is malformed."
+	done
+	confidence_min="$(LC_ALL=C awk -v a="$confidence_dl" -v b="$confidence_ul" -v c="$confidence_quality" 'BEGIN {
+		min = a + 0; if (b + 0 < min) min = b + 0; if (c + 0 < min) min = c + 0;
+		printf "%.15g\n", min
+	}')"
+	numbers_equal "$confidence_overall" "$confidence_min" ||
+		die "The overall confidence is not the weakest reported confidence dimension."
+	validation_contaminated="$(require_result_value '@.validation.contaminated')" ||
+		die "The validation contamination state is missing."
+	phase_contamination_seen="$(require_result_value '@.phase_contamination_seen')" ||
+		die "The phase contamination state is missing."
+	case "$validation_contaminated:$phase_contamination_seen" in
+		true:true|true:false|false:true|false:false) ;;
+		*) die "The background contamination evidence is malformed." ;;
+	esac
+	case "$result_class" in
+		trusted)
+			LC_ALL=C awk -v value="$confidence_overall" 'BEGIN { exit(value >= 85 ? 0 : 1) }' ||
+				die "A trusted result reported less than 85 percent confidence."
+			require_result_flag '@.validation.contaminated' false "A trusted validation cannot be contaminated."
+			require_result_flag '@.phase_contamination_seen' false "A trusted result cannot retain phase contamination."
+		;;
+		provisional)
+			LC_ALL=C awk -v value="$confidence_overall" 'BEGIN { exit(value >= 40 && value < 85 ? 0 : 1) }' ||
+				die "A provisional result must report at least 40 and less than 85 percent confidence."
+			require_result_flag '@.auto_apply_eligible' false "A non-trusted result must remain manual-only."
+		;;
+		estimated)
+			LC_ALL=C awk -v value="$confidence_overall" 'BEGIN { exit(value < 40 ? 0 : 1) }' ||
+				die "An estimated result must report less than 40 percent confidence."
+			require_result_flag '@.auto_apply_eligible' false "A non-trusted result must remain manual-only."
+		;;
+	esac
 	run_id="$(require_result_value '@.run_id')" || die "The Full Auto-Tune run identity is missing."
 	safe_run_id "$run_id" || die "The Full Auto-Tune run identity is unsafe."
 	load_profile_contract
@@ -1153,8 +1226,12 @@ arm_guard() {
 	case "$action" in
 		apply_sqm)
 			if [ "$profile_target_met" = true ] && [ "$profile_objectives_met" = true ]; then
-				require_result_flag '@.auto_apply_eligible' true "A fully passing proposal unexpectedly requires manual-only apply."
 				require_result_flag '@.profile_outcome.manual_only' false "A target-meeting outcome was marked manual-only."
+				if [ "$result_class" = trusted ]; then
+					require_result_flag '@.auto_apply_eligible' true "A trusted, fully passing proposal unexpectedly requires manual-only apply."
+				else
+					require_result_flag '@.auto_apply_eligible' false "A non-trusted result must never auto-apply."
+				fi
 			else
 				require_result_flag '@.auto_apply_eligible' false "A profile fallback must never be auto-applied."
 				require_result_flag '@.profile_outcome.manual_only' true "A below-target fallback was not marked manual-only."
@@ -1202,9 +1279,16 @@ arm_guard() {
 			require_result_flag '@.fair_outcome.comparison_reason' no-material-latency-benefit-with-throughput-cost "The Fair comparison reason changed."
 			require_result_flag '@.fair_outcome.no_sqm_control.available' true "The no-SQM control is unavailable."
 			require_result_flag '@.fair_outcome.no_sqm_control.measurement_evidence.valid' true "The no-SQM control evidence is invalid."
-			require_result_flag '@.fair_outcome.no_sqm_control.measurement_evidence.test_direction' both "The no-SQM control was not bidirectional."
-			require_result_flag '@.fair_outcome.no_sqm_control.measurement_evidence.shaper_bypassed' true "The control did not prove that shaping was bypassed."
-			require_result_flag '@.fair_outcome.no_sqm_control.measurement_evidence.sqm_paused' true "The control did not prove that SQM was paused."
+				require_result_flag '@.fair_outcome.no_sqm_control.measurement_evidence.test_direction' both "The no-SQM control was not bidirectional."
+				require_result_flag '@.fair_outcome.no_sqm_control.measurement_evidence.shaper_bypassed' true "The control did not prove that shaping was bypassed."
+				fair_bypass_mode="$(require_result_value '@.fair_outcome.no_sqm_control.measurement_evidence.sqm_bypass_mode')" ||
+					die "The no-SQM control has no typed bypass evidence."
+				fair_sqm_paused="$(require_result_value '@.fair_outcome.no_sqm_control.measurement_evidence.sqm_paused')" ||
+					die "The no-SQM control has no SQM pause evidence."
+				case "$fair_bypass_mode:$fair_sqm_paused" in
+					paused-managed:true|already-unshaped:false) ;;
+					*) die "The no-SQM control returned inconsistent typed bypass evidence." ;;
+				esac
 			require_result_flag '@.fair_outcome.no_sqm_control.forwarded_background.available' true "The no-SQM control has no forwarded-traffic evidence."
 			require_result_flag '@.fair_outcome.no_sqm_control.forwarded_background.contaminated' false "Background traffic contaminated the no-SQM control."
 			fair_background_dl="$(require_result_value '@.fair_outcome.no_sqm_control.forwarded_background.download_kbps')" ||

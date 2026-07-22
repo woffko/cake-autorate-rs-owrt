@@ -259,6 +259,8 @@ pub struct AutotuneProposal {
     pub mpu: u64,
     pub validation_thresholds: ValidationThresholds,
     pub sqm: SqmRecommendation,
+    /// Numeric confidence in the proposal builder's direct inputs. Full
+    /// Auto-Tune publishes its structured result confidence at the job level.
     pub confidence: u64,
     pub warnings: Vec<&'static str>,
 }
@@ -305,9 +307,8 @@ impl AutotuneProposal {
             confirmed_upload_max,
             confirmed_upload_cap,
         );
-        self.confidence = self.confidence.min(45);
         self.warnings.push(
-            "Low-confidence conservative calibration: measured background was subtracted and confirmed maxima/caps were never raised.",
+            "Conservative calibration constraints were applied: isolated speed-test samples were preserved and confirmed maxima/caps were never raised.",
         );
     }
 
@@ -1703,7 +1704,6 @@ fn constrain_direction(
 ) {
     if let Some(retained) = retained {
         *direction = retained;
-        return;
     }
 
     let cap_bound = confirmed_cap.filter(|value| *value > 0).or(confirmed_max);
@@ -2871,6 +2871,7 @@ mod tests {
             observed_high_kbps: proposal.upload.observed_high_kbps,
             variability: proposal.upload.variability,
         };
+        let input_confidence = proposal.confidence;
 
         proposal.apply_conservative_constraints(
             None,
@@ -2884,11 +2885,50 @@ mod tests {
         assert!(proposal.download.maximum_kbps <= 700_000);
         assert!(proposal.download.absolute_cap_kbps <= 750_000);
         assert_eq!(proposal.upload, retained_upload);
-        assert!(proposal.confidence <= 45);
+        assert_eq!(proposal.confidence, input_confidence);
         assert!(proposal
             .warnings
             .iter()
-            .any(|warning| warning.contains("Low-confidence")));
+            .any(|warning| warning.contains("isolated speed-test samples were preserved")));
+    }
+
+    #[test]
+    fn retained_direction_is_still_clamped_to_confirmed_maximum_and_cap() {
+        let mut proposal = build_proposal(
+            &[900_000.0, 880_000.0],
+            &[900_000.0, 870_000.0],
+            LatencyBaseline {
+                median_ms: 4.0,
+                p95_ms: 6.0,
+                samples: 10,
+            },
+            LinkKind::Ethernet,
+        )
+        .unwrap();
+        let retained_download = DirectionProposal {
+            minimum_kbps: 500_000,
+            base_kbps: 650_000,
+            maximum_kbps: 800_000,
+            absolute_cap_kbps: 900_000,
+            observed_low_kbps: proposal.download.observed_low_kbps,
+            observed_median_kbps: proposal.download.observed_median_kbps,
+            observed_high_kbps: proposal.download.observed_high_kbps,
+            variability: proposal.download.variability,
+        };
+
+        proposal.apply_conservative_constraints(
+            Some(retained_download),
+            None,
+            Some(600_000),
+            Some(625_000),
+            None,
+            None,
+        );
+
+        assert_eq!(proposal.download.minimum_kbps, 500_000);
+        assert_eq!(proposal.download.base_kbps, 600_000);
+        assert_eq!(proposal.download.maximum_kbps, 600_000);
+        assert_eq!(proposal.download.absolute_cap_kbps, 625_000);
     }
 
     #[test]
@@ -2927,6 +2967,7 @@ mod tests {
         assert!(json.contains("\"adaptive_ceiling\""));
         assert!(json.contains("\"classification\":\"diffserv4\""));
         assert!(json.contains("\"overhead\":44"));
+        assert!(json.contains("\"confidence\":"));
     }
 
     #[test]

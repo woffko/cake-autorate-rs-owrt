@@ -644,6 +644,9 @@ result_is_auto_apply_eligible() {
 	gate_profile_manual_only="$(extract "$gate_result" '@.profile_outcome.manual_only')"
 	gate_auto_apply_eligible="$(extract "$gate_result" '@.auto_apply_eligible')"
 	gate_manual_apply_eligible="$(extract "$gate_result" '@.manual_apply_eligible')"
+	gate_result_class="$(extract "$gate_result" '@.result_class')"
+	gate_confidence_overall="$(extract "$gate_result" '@.confidence.overall_percent')"
+	gate_confidence_quality="$(extract "$gate_result" '@.confidence.quality_percent')"
 	gate_confidence_mode="$(extract "$gate_result" '@.confidence_mode')"
 	gate_validation_contaminated="$(extract "$gate_result" '@.validation.contaminated')"
 	gate_phase_evidence_complete="$(extract "$gate_result" '@.phase_evidence_complete')"
@@ -658,7 +661,7 @@ result_is_auto_apply_eligible() {
 	# confidence, contaminated, or otherwise unknown evidence must never become
 	# a configuration change merely because the helper reported "complete".
 	[ "$gate_state" = complete ] || return 1
-	[ "$gate_schema_version" = 7 ] || return 1
+	[ "$gate_schema_version" = 8 ] || return 1
 	[ "$gate_producer" = "$autotune_result_producer" ] || return 1
 	[ "$gate_validation_profile" = "$gate_profile" ] || return 1
 	case "$gate_run_id" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac
@@ -672,6 +675,9 @@ result_is_auto_apply_eligible() {
 	[ "$gate_profile_manual_only" = false ] || return 1
 	[ "$gate_auto_apply_eligible" = true ] || return 1
 	[ "$gate_manual_apply_eligible" = true ] || return 1
+	[ "$gate_result_class" = trusted ] || return 1
+	is_decimal_between "$gate_confidence_overall" 85 100 || return 1
+	is_decimal_between "$gate_confidence_quality" 85 100 || return 1
 	[ "$gate_confidence_mode" = normal ] || return 1
 	[ "$gate_validation_contaminated" = false ] || return 1
 	[ "$gate_phase_evidence_complete" = true ] || return 1

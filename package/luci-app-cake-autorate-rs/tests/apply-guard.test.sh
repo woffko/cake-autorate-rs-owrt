@@ -63,9 +63,12 @@ EOF
 fingerprint="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 cat > "$autotune/wan_sqm/result.json" <<EOF
 {
-  "state":"complete", "schema_version":7,
+  "state":"complete", "schema_version":8, "result_available":true,
   "producer":"cake-autorate-rs-autotune", "profile":"best_overall",
-  "run_id":"apply-guard-test-run", "auto_apply_eligible":true,
+  "run_id":"apply-guard-test-run", "result_class":"trusted",
+  "confidence":{"overall_percent":100,"capacity_download_percent":100,
+    "capacity_upload_percent":100,"quality_percent":100,"reasons":[]},
+  "auto_apply_eligible":true,
   "manual_apply_eligible":true,
   "phase_evidence_complete":true, "phase_contamination_seen":false,
   "runtime_restored":true, "recovery_pending":false,
@@ -134,6 +137,99 @@ if find "$guard" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
 	echo "failed arm leaked a root-owned apply token" >&2
 	exit 1
 fi
+cp "$work/result.valid" "$autotune/wan_sqm/result.json"
+
+# Background-aware confidence changes whether a result may be unattended, not
+# whether an explicitly reviewed, otherwise safe proposal may be applied.
+# Generate the positive non-trusted cases and deliberately malformed/tampered
+# variants from the same attested result so all unrelated hard gates stay live.
+node - "$work/result.valid" "$work" <<'EOF'
+const fs = require('node:fs');
+const path = require('node:path');
+const source = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const root = process.argv[3];
+
+function write(name, mutate) {
+	const result = structuredClone(source);
+	mutate(result);
+	fs.writeFileSync(path.join(root, `confidence-${name}.json`), JSON.stringify(result));
+}
+
+function makeNonTrusted(result, resultClass, overall, download, upload, quality) {
+	result.result_class = resultClass;
+	result.confidence = {
+		overall_percent: overall,
+		capacity_download_percent: download,
+		capacity_upload_percent: upload,
+		quality_percent: quality,
+		reasons: [ { code: 'background-share', scope: 'all', message: 'Concurrent traffic reduced confidence.' } ]
+	};
+	result.auto_apply_eligible = false;
+	result.conservative = true;
+	result.confidence_mode = 'low';
+	result.phase_contamination_seen = true;
+	result.validation.contaminated = true;
+}
+
+write('provisional', result => makeNonTrusted(result, 'provisional', 70, 70, 88, 75));
+write('estimated', result => makeNonTrusted(result, 'estimated', 25, 25, 35, 40));
+write('malformed', result => { result.confidence.overall_percent = 'seventy'; });
+write('missing-top-level', result => {
+	delete result.confidence;
+	result.proposal.confidence = 100;
+});
+write('unknown-class', result => { result.result_class = 'high'; });
+write('minimum-mismatch', result => {
+	result.confidence = { overall_percent: 71, capacity_download_percent: 70,
+		capacity_upload_percent: 88, quality_percent: 75, reasons: [] };
+});
+write('trusted-low', result => {
+	result.result_class = 'trusted';
+	result.confidence = { overall_percent: 70, capacity_download_percent: 70,
+		capacity_upload_percent: 88, quality_percent: 75, reasons: [] };
+});
+write('provisional-clean-high', result => {
+	result.result_class = 'provisional';
+	result.confidence = { overall_percent: 90, capacity_download_percent: 90,
+		capacity_upload_percent: 95, quality_percent: 92, reasons: [] };
+	result.auto_apply_eligible = false;
+});
+write('provisional-contaminated-high', result =>
+	makeNonTrusted(result, 'provisional', 90, 90, 95, 92));
+write('estimated-high', result => makeNonTrusted(result, 'estimated', 40, 40, 55, 45));
+write('nontrusted-auto', result => {
+	makeNonTrusted(result, 'provisional', 70, 70, 88, 75);
+	result.auto_apply_eligible = true;
+});
+write('trusted-contaminated', result => {
+	result.result_class = 'trusted';
+	result.confidence = { overall_percent: 90, capacity_download_percent: 90,
+		capacity_upload_percent: 95, quality_percent: 92, reasons: [] };
+	result.phase_contamination_seen = true;
+	result.validation.contaminated = true;
+});
+write('legacy-schema', result => { result.schema_version = 7; });
+EOF
+
+for confidence_class in provisional estimated; do
+	cp "$work/confidence-$confidence_class.json" "$autotune/wan_sqm/result.json"
+	confidence_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint")"
+	confidence_token="$(printf '%s\n' "$confidence_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
+	[ "${#confidence_token}" -eq 64 ]
+	$helper abort "$confidence_token" >/dev/null
+done
+
+for rejected_contract in malformed missing-top-level unknown-class minimum-mismatch trusted-low provisional-clean-high provisional-contaminated-high estimated-high nontrusted-auto trusted-contaminated legacy-schema; do
+	cp "$work/confidence-$rejected_contract.json" "$autotune/wan_sqm/result.json"
+	if $helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint" >/dev/null 2>&1; then
+		echo "apply guard accepted invalid confidence contract: $rejected_contract" >&2
+		exit 1
+	fi
+	if find "$guard" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
+		echo "rejected confidence contract leaked an apply token: $rejected_contract" >&2
+		exit 1
+	fi
+done
 cp "$work/result.valid" "$autotune/wan_sqm/result.json"
 
 # Gaming must arm an exact diffserv4 manifest rather than merely relabeling a
@@ -232,6 +328,27 @@ logical_token="$(printf '%s\n' "$logical_arm" | sed -n 's/.*"token":"\([0-9a-f]*
 $helper abort "$logical_token" >/dev/null
 cp "$work/result.valid" "$autotune/wan_sqm/result.json"
 
+# A freshly created wizard instance has an explicit but inactive native traffic
+# policy. It is part of the exact manifest; omitting it makes the guard reject
+# the otherwise valid first Save & Apply transaction.
+mkdir -p "$autotune/new_sqm"
+node - "$work/result.valid" "$autotune/new_sqm/result.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+result.job_id = 'new_sqm';
+fs.writeFileSync(process.argv[3], JSON.stringify(result));
+EOF
+chmod 600 "$autotune/new_sqm/result.json"
+if ! new_arm="$($helper arm new_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint" 2>&1)"; then
+	printf '%s\n' "$new_arm" >&2
+	exit 1
+fi
+new_token="$(printf '%s\n' "$new_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
+[ "$(uci -c "$guard/$new_token/expected" -q get cake-autorate.new_sqm.traffic_profile)" = auto ]
+[ "$(uci -c "$guard/$new_token/expected" -q get cake-autorate.new_sqm.traffic_profile_migrated)" = 1 ]
+[ "$(uci -c "$guard/$new_token/expected" -q get cake-autorate.new_sqm.traffic_rules_enabled)" = 0 ]
+$helper abort "$new_token" >/dev/null
+
 # The deterministic enrollment name is reserved. Never reuse or later delete
 # a preexisting user section with the same name, regardless of its type.
 cp "$config/sqm" "$work/sqm.before-collision"
@@ -278,6 +395,19 @@ if mismatch="$($helper verify-init 2>/dev/null)"; then
 fi
 printf '%s\n' "$mismatch" | grep -q 'cake-autorate.wan_sqm.max_dl_shaper_rate_kbps' || {
 	echo "apply guard did not identify the mismatched UCI option without diff" >&2
+	exit 1
+}
+cp "$guard/$token/expected/cake-autorate" "$config/cake-autorate"
+
+# An extra key shifts sorted UCI output. Diagnostics must name that actual key,
+# not the innocent option which happens to occupy the same line number.
+uci -q set cake-autorate.wan_sqm.traffic_profile=auto
+if mismatch="$($helper verify-init 2>/dev/null)"; then
+	echo "apply guard accepted an extra CAKE manifest option" >&2
+	exit 1
+fi
+printf '%s\n' "$mismatch" | grep -q 'cake-autorate.wan_sqm.traffic_profile' || {
+	echo "apply guard misidentified the extra UCI option" >&2
 	exit 1
 }
 cp "$guard/$token/expected/cake-autorate" "$config/cake-autorate"
@@ -565,7 +695,8 @@ result.fair_outcome = {
 			reason: 'ok',
 			test_direction: 'both',
 			shaper_bypassed: true,
-			sqm_paused: true
+			sqm_paused: true,
+			sqm_bypass_mode: 'paused-managed'
 		},
 		grade: 'D',
 		effective_delta_ms: 218,

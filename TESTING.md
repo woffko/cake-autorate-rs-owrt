@@ -612,10 +612,12 @@ episode. No LuCI application exception occurred.
 The final local gate passed 96 Rust tests, strict Clippy and formatting, six
 shell lifecycle/routing/helper suites, four LuCI JavaScript suites, both SDK
 package builds, shell/JavaScript syntax, `git diff --check`, and all three live
-router checks. The quiet-link timeout, background subtraction, independent
+router checks. The quiet-link timeout, rating-load/background separation, independent
 DL/UL capture thresholds, frozen candidate threshold, explicit phase
 acknowledgement, ACK allowance, and true opposite-direction contamination all
-have deterministic regression coverage.
+have deterministic regression coverage. This historical RC10 wording does not
+describe Full Auto-Tune throughput: its isolated helper rate is neither
+increased nor reduced by forwarded-background counters.
 
 Each RC10 offline repository contains 65 APKs and a newly generated
 `packages.adb`. With networking and package scripts disabled, APK selected and
@@ -904,7 +906,8 @@ public-reflector ICMP rate limiting, not proof of WAN loss. RC17 verifies no
 more than one loaded batch per second, at least three provider/address
 families, and median per-reflector loss.
 
-Router CPU peaked at 53.2%, below the hard gate. Route identity, external path,
+Router CPU peaked at 53.2%, below the then-current hard gate. CPU is advisory in
+the current policy. Route identity, external path,
 and pinned speed-test server remained stable. However, RC16 had only an initial
 aggregate quiet check, so absence of forwarded client traffic during every
 heavy phase could not be proven. The correction adds temporary per-phase
@@ -922,8 +925,10 @@ The completed deterministic RC17 gate covers:
    is `INCONCLUSIVE`, not a proved candidate failure.
 3. Clean low retention raises only the failed direction within observed-low,
    configured maximum, and per-revision bounds.
-4. Adverse latency/loss/CPU can reduce a direction only when the predicted
-   retention remains at or above the safety floor.
+4. In the historical RC17 policy adverse latency/loss/CPU could reduce a
+   direction only when the predicted retention remained at or above the safety
+   floor. Current releases keep CPU as a warning; latency/loss still influence
+   the safe profile boundary.
 5. Persistent WebSocket/HTTPS transport uses every valid raw sample for
    p95-to-p95 deltas; an exact `[10, 10, 10, 200]` tail cannot be erased by a
    robust central filter. TCP-connect is rejected before any heavy phase.
@@ -934,9 +939,11 @@ The completed deterministic RC17 gate covers:
 7. Every shaped helper call is bracketed by exact ownership/rate checks for the
    temporary root CAKE qdiscs, IFB, and ingress redirect. Plausible helper JSON
    cannot pass after either the precondition or postcondition is invalidated.
-8. A failed, incomplete, contaminated, conservative, infeasible, or
-   inconclusive result has no LuCI apply action and cannot pass scheduled
-   Auto-Apply. The scheduler requires the exact current 14-gate set.
+8. In RC17 a failed, incomplete, contaminated, conservative, infeasible, or
+   inconclusive result had no LuCI apply action. Schema 8 supersedes only the
+   background/conservative part: a structurally complete safe provisional or
+   estimated result may be applied explicitly, while only clean trusted
+   evidence can pass scheduled Auto-Apply.
 9. Cancellation/error atomically leaves job status terminal and restores the
    selected qdisc/SQM state without touching the other WAN.
 10. Apply tests exercise both packages as one guarded rollback transaction:
@@ -1870,3 +1877,243 @@ Local evidence is retained under
 `/home/w0w/cake-autorate-rs-owrt/test-logs/rc26-r7-test-router-smoke`,
 `/home/w0w/cake-autorate-rs-owrt/test-logs/rc26-r7-production-77`, and
 `/home/w0w/cake-autorate-rs-owrt/test-logs/rc26-r7-production-100`.
+
+## RC26-r11 sequential Multi-WAN creation validation
+
+The first batch implementation automatically ran every detected member with
+one shared profile. Its global diagnostics renderer also referenced wizard
+state outside the wizard closure, producing `state is not defined` after a
+real terminal result. RC26-r11 removes the recursive batch runner and uses an
+explicit per-uplink state machine: profile selection, running/recovery, result
+review, Accept or Skip, then the next member. A safe manual-review shaped
+proposal may be accepted through the same predicate used by final staging;
+failed or unreviewable results cannot. Skip remains locked while a worker or
+runtime recovery is active. Accepted decisions from earlier members are not
+cleared by a later retry, failure, or cancellation.
+
+The complete LuCI JavaScript and shell matrix passed, including Auto-Tune
+lifecycle/recovery, Apply Guard, speed-test routing, quality, graphs, runtime
+health and status. Source tests additionally reject a wizard-local reference
+inside the global diagnostics renderer, reject a recursive `runPlan(index)`,
+and exercise mixed Accepted/Skipped completion plus recovery locks.
+
+The noarch LuCI APK was installed on an isolated dual-WAN x86_64 router. A
+first Playwright pass selected Gaming for `wan`, Fair for `wanb`, skipped each
+independently, and reached aggregate Review without UCI writes or browser
+errors. A real pass then observed `wan/Gaming` stop at a background-blocked
+idle baseline and wait for explicit Skip. Only after that decision did
+`wanb/Fair` run through its pinned mwan3 member; it produced a safe A+ proposal
+with both Accept and Skip available. The test deliberately chose Skip and
+verified both typed results in final Review. The final installed DOM check also
+proved the idle progress element has computed `display:none`. Configuration
+hashes for cake-autorate, SQM, network and mwan3 remained byte-identical, no UCI
+delta remained, and no worker or speed-test process remained. Evidence is
+retained under:
+
+- `/home/w0w/cake-autorate-rs-owrt/test-logs/rc26-r10-multiwan-real-77-2`;
+- `/home/w0w/cake-autorate-rs-owrt/test-logs/rc26-r11-multiwan-final-77-2`.
+
+## RC26-r13 deferred baseline validation
+
+The first sequential-wizard test exposed a capacity-model error for a new
+instance. With no saved CAKE rate, the quiet check used a synthetic 20 Mbit/s
+reference and therefore treated ordinary background upload above 1 Mbit/s as a
+busy link. RC26-r13 keeps such a baseline provisional instead. Total interface
+traffic and nftables-forwarded client traffic are captured independently; the
+first routed unshaped control supplies the real directional capacity, after
+which the provisional observations must pass max(5% of capacity, 1 Mbit/s) for
+total traffic and max(2%, 1 Mbit/s) for forwarded traffic. A failure remains
+fail-closed, offers no conservative override, and produces no proposal.
+
+Schema 8 supersedes that UI policy without weakening the initial strict stop:
+a background-only failure may start a fresh conservative measurement, retain
+the baseline as provisional evidence, and expose a manual safe proposal only
+after all hard gates pass. Invalid latency probes or unavailable counters still
+have no override.
+
+Fixtures cover both sides of the boundary: approximately 8 Mbit/s is accepted
+on a newly measured approximately 900 Mbit/s link, while the same traffic is
+rejected retrospectively against a 50/10 Mbit/s reference. LuCI tests reject
+deferred phase evidence without a later passing retrospective record, suppress
+the conservative button for baseline failures, and render the measured
+capacity, observed traffic, and limits. The complete Auto-Tune lifecycle test,
+settings JavaScript tests, shell syntax, and `git diff --check` passed. Gemini
+independently reviewed the state machine and limits; its BusyBox portability
+finding led to explicit numeric coercion in the baseline maximum calculation.
+The current schema-8 regression instead requires the conservative button for a
+typed background-only baseline failure and still suppresses it for technical
+baseline failure.
+
+The exact noarch `1.0_rc26-r13` APK was installed on the isolated x86_64
+dual-WAN router. A real `mwan3 member wan` Gaming calibration observed about
+5.9 Mbit/s baseline upload, measured 908033/918141 kbit/s raw capacity, and
+retrospectively applied 45402/45907 kbit/s total limits plus 18161/18363 kbit/s
+forwarded limits. The baseline passed, the search completed at A+, and the
+review proposed 883500/912300 kbit/s without writing it. Runtime restoration
+completed, recovery files and workers disappeared, SQM returned to its original
+no-instance state, and the SQM/network/mwan3 hashes remained byte-identical
+with no UCI delta. A cache-fresh Playwright pass also exercised independent
+Gaming/Fair member selection, Skip decisions, and aggregate Review without a
+browser error or write.
+
+APK SHA256:
+`04457381a32d43a25722ef171dc7a1c2874754956c5476b5559755bbf6af9f98`.
+
+## RC26-r17 pinned wanb routing and sequential apply validation
+
+The isolated dual-WAN router exposed two independent regressions. A static
+`speedtest-go` binary ignored the `LD_PRELOAD`-based mwan3 socket mark, so a
+calibration labelled `wanb` could follow the main `wan` route. In addition,
+the exact Apply Guard manifest for a newly created instance omitted the three
+safe traffic-profile migration fields written by the wizard. The server
+correctly rolled that transaction back, but the authenticated LuCI RPC session
+retained its staged delta and displayed a large phantom **UNSAVED CHANGES**
+count after reload.
+
+RC26-r17 runs the speed-test helper as the unprivileged `cake-speedtest` user
+and installs a short-lived nftables output mark scoped to that UID. A global
+lock, stale-state recovery, member/device/source-address verification and
+selected-interface byte-counter proof keep the route fail-closed. The Apply
+Guard now includes the fresh-instance traffic-profile defaults in its exact
+expected manifest and compares manifests by UCI key instead of line position,
+so any future extra, missing or changed value names the actual offending key.
+After a proved rollback, LuCI explicitly reverts the `cake-autorate` and `sqm`
+deltas in the same RPC session and unloads its local UCI cache; it never does
+so after a confirmed or indeterminate apply.
+
+The exact noarch `luci-app-cake-autorate-rs-1.0_rc26-r17.apk` was installed on
+the isolated router. A direct `wanb` run reported `route_interface=eth0`,
+`route_mode=mwan3`, `mwan3_member=wanb`, source `10.0.100.102`, mark `0x200`,
+routing table 2, and passed RX/TX byte proof. During the real sequential LuCI
+run the live helper process used the same source and member while the temporary
+nft rule matched UID 32769 and set the `wanb` mark. `wan/Gaming` was explicitly
+skipped after contaminated validation; `wanb/Fair` completed through `eth0`,
+produced an accepted grade C proposal at 82400/14400 kbit/s, and the final
+**Create & apply sequentially** transaction returned success. Its server-side
+receipt is `complete`, the persisted UCI owner/queue/member are consistent,
+and a cache-bypassed desktop plus 390-pixel Playwright audit found no RPC/JS
+errors, horizontal overflow, or stale unsaved marker.
+
+Deterministic route, Apply Guard and settings tests cover the static-binary
+route path, exact fresh-instance manifest, accurate extra-key diagnostic and
+same-session rollback cleanup. After the installed test, the router was
+restored from its pre-test archive; the cake-autorate, SQM, network and mwan3
+SHA256 values again exactly match the recorded baseline. Local browser evidence
+is retained under
+`/home/w0w/cake-autorate-rs-owrt/test-logs/rc26-r17-multiwan-route-save-77-2`
+and
+`/home/w0w/cake-autorate-rs-owrt/test-logs/rc26-r17-post-apply-77-2`.
+
+APK SHA256:
+`54a8bbe509b6ffbd2551f8a3b2e47c96b63fc4f9803f2ca7b67552ad72ab5890`.
+
+## RC26-r19 standard graph Save & Apply validation
+
+The former Graphs controls saved, applied and then navigated independently of
+LuCI's page action lifecycle. LuCI schedules the UCI confirmation after its
+apply RPC returns; the immediate navigation destroyed that timer and left
+rpcd's rollback transaction armed. A later graph change therefore received
+`UBUS_STATUS_PERMISSION_DENIED`, while its session delta appeared as phantom
+unsaved changes. The authenticated session already had the required UCI ACL;
+no permission broadening was needed.
+
+RC26-r19 stages graph history enablement, sample interval and the shared RAM
+budget in LuCI's UCI cache. The page now exposes the standard bottom
+**Save & Apply**, **Save** and **Reset** actions. `ui.changes.apply()` owns the
+apply, confirmation and reload sequence, while Reset unloads the staged
+package state. Periodic graph refreshes rebuild from the same staged UCI cache
+and therefore do not overwrite unsaved selections.
+
+The noarch package was installed on the isolated x86_64 dual-WAN router. A
+Playwright regression changed `wanb_sqm` from 10 to 15 seconds, proved Reset
+restored 10 seconds, then completed two consecutive standard Save & Apply
+cycles (10 -> 15 -> 10). Both cycles completed without RPC/console/page errors,
+without a non-empty rpcd session delta and without an Unsaved Changes marker.
+Graph history remained enabled and its RAM-only CSV continued gaining samples.
+SQM, network and mwan3 hashes remained unchanged and both managed CAKE queues
+remained present.
+
+Evidence:
+
+- `/home/w0w/cake-autorate-rs-owrt/test-logs/rc26-r19-graphs-footer-77-2`;
+- `tools/playwright/rc26-r19-graphs-footer-flow.js`.
+
+APK SHA256:
+`86f6b6bcb6e65634d1163d7542af72b5a6b47b4c7b0434a13d1f19b9b726ce9a`.
+
+## RC27 schema-8 background-confidence local gate (2026-07-22)
+
+RC27 separates measurement safety from confidence. The terminal schema is 8
+and carries `result_class=trusted|provisional|estimated` plus overall,
+directional-capacity and quality percentages. Overall must equal the weakest
+dimension. Clean evidence at 85% or higher may be trusted; 40..84% is
+provisional and less than 40% is estimated. The latter two classes can only be
+accepted through an explicit guarded manual action after all structural,
+route, SQM ownership, latency/loss, measurement and runtime-restoration checks
+pass. The scheduler accepts only clean trusted evidence. CPU over 85% remains
+visible as `WARN` and does not by itself block a safe result.
+
+The exact former rejection was made deterministic: a clean conservative run
+with a complete 100/100 validation remains trusted, manually reviewable and
+auto-eligible instead of being rejected solely because the conservative button
+started it. Contaminated conservative fixtures cover provisional manual apply,
+strict background stop with a fresh-rerun offer, and an extreme deferred
+baseline at 90% of later-measured capacity. The latter reports 25% DL and UL
+capacity confidence, class `estimated`, both baseline/contamination reasons,
+and no unattended eligibility. Rust also proves that isolated speed-test
+samples are not reduced by forwarded background and that retained values never
+rise above confirmed maximum/cap bounds.
+
+The local acceptance gate passed 168 Rust tests, all LuCI JavaScript tests, the
+complete Auto-Tune lifecycle, Apply Guard, recovery, scheduler, routing,
+quality, runtime-health, graph-history and status-column shell suites, shell
+syntax, Rust formatting and `git diff --check`. Apply Guard regression covers
+safe provisional/estimated explicit apply and rejects absent top-level
+confidence, legacy-only proposal confidence, class/band mismatch,
+`overall != min(DL, UL, quality)`, non-trusted Auto-Apply, trusted contaminated
+evidence and schema 7. Gemini Pro independently found and then verified the
+deferred-share correction; Gemini Flash and Spark prompted the matching LuCI
+boundary regressions.
+
+## RC27 managed-SQM background recovery validation (2026-07-22)
+
+The x86_64 dual-WAN router was tested with its normal firewall and mwan3 policy
+active. A controlled forwarded download held the primary uplink at about
+51 Mbit/s while Playwright started a strict Gaming calibration. The first run
+stopped after both quiet checks with the typed `background-blocked` terminal
+and exposed **Continue conservatively**. No firewall, routing or persistent UCI
+setting was changed.
+
+This live test exposed a recovery presentation race: after runtime restoration,
+the detached recovery helper replaced the valid staged terminal with a generic
+interruption diagnostic. RC27-r2 now preserves the authoritative schema-8
+terminal, publishes it only after managed SQM is restored and the exact paused
+autorate process is resumed, and creates a generic recovery failure only when
+no valid private terminal exists. The worker also leaves its status checkpoint
+available while handing cleanup to the watcher.
+
+The repeated live run completed the intended strict-stop -> conservative path.
+It returned class `provisional` with 55% overall confidence, 88% download
+capacity confidence, 100% upload capacity confidence and 55% quality
+confidence. The reasons identify baseline background, accepted phase
+contamination and reduced download-capacity certainty. The result offered an
+explicit safe manual proposal, remained ineligible for Auto-Apply, reported A+
+for the selected Gaming point, and left `configuration_written=false`.
+After completion the original CAKE rates and both autorate processes were
+present, the temporary worker and shaper state were gone, and `uci changes` was
+empty.
+
+The deterministic recovery suite now also covers the same staged
+`background-blocked` terminal through managed-SQM restoration and stopped
+autorate resume, verifies restore-before-resume ordering, and checks that a
+bounded `recovery_warning` keeps valid JSON and does not change the terminal
+state or conservative action. The Playwright flow recognizes the lower-
+confidence **Use safe proposal** state and captures a screenshot plus modal
+text after 60 seconds without visible progress, avoiding blind waits.
+
+Installed x86_64 packages used for this pass:
+
+- `cake-autorate-rs-1.0_rc27-r1.apk`, SHA256
+  `05dd9400a7cb38de4c8f4c09c6a70243d510ef91d5400b110d0a3360a50e4d65`;
+- `luci-app-cake-autorate-rs-1.0_rc27-r2.apk`, SHA256
+  `fe49f1f85afcc7c180b4f00ed07c8c7f93f92316e7bed37da4fe5b48a69fe0ff`.

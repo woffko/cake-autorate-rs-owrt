@@ -257,6 +257,9 @@ case "$expression" in
 	'@.sqm_paused')
 		printf '%s\n' "$input" | sed -n 's/.*"sqm_paused":\(true\|false\).*/\1/p'
 		;;
+	'@.sqm_bypass_mode')
+		printf '%s\n' "$input" | sed -n 's/.*"sqm_bypass_mode":"\([^"]*\)".*/\1/p'
+		;;
 	'@.forwarded_background.available')
 		printf '%s\n' "$input" | sed -n 's/.*"forwarded_background":{[^}]*"available":\(true\|false\).*/\1/p'
 		;;

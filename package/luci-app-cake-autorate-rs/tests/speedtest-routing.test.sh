@@ -279,6 +279,13 @@ grep -qx "trap 'exit 143' TERM" "$script" || fail_test "speedtest TERM handler d
 if grep -q '^trap cleanup EXIT INT TERM' "$script"; then
 	fail_test "speedtest signal trap can continue execution after cleanup"
 fi
+(
+	route_mode=mwan3
+	speedtest_route_pin_active=0
+	speedtest_route_proof_error=""
+	if run_speedtest_go_command /bin/true; then exit 1; fi
+	[ "$speedtest_route_proof_error" = "the isolated speedtest-go route pin was not initialized by its parent" ]
+) || fail_test "an uninitialized child speedtest-go route was allowed to run"
 
 cat > "$work/bin/usleep-fixture" <<'EOF'
 #!/bin/sh
@@ -488,11 +495,22 @@ upload_bytes=4000000
 bind_interface_enabled=0
 target_if=""
 route_if=""
+route_device=eth0
 route_source_ip=""
 tmp_response="$work/speedtest.json"
 warning=""
 CAKE_TEST_SPEEDTEST_ARGV="$work/speedtest-argv"
 export CAKE_TEST_SPEEDTEST_ARGV
+run_speedtest_go_command() { "$@"; }
+interface_byte_counter() { printf '%s\n' 1000; }
+verify_speedtest_go_route_bytes() {
+	speedtest_route_traffic_proved=true
+	speedtest_route_rx_delta=200000000
+	speedtest_route_tx_delta=160000000
+	speedtest_route_rx_required=10000000
+	speedtest_route_tx_required=8000000
+	return 0
+}
 
 direction_override=download
 run_speedtest_go_once 1
@@ -534,6 +552,11 @@ calibration_autorate_paused=false
 calibration_sqm_paused=false
 warning=
 direction_override=both
+speedtest_route_traffic_proved=true
+speedtest_route_rx_delta=200000000
+speedtest_route_tx_delta=160000000
+speedtest_route_rx_required=10000000
+speedtest_route_tx_required=8000000
 emit_result > "$work/result.json"
 
 node -e '
@@ -545,7 +568,24 @@ if (value.test_direction !== "both")
   throw new Error("test direction missing from speedtest result");
 if (value.route_mode !== "mwan3" || value.mwan3_member !== "wanb" || value.route_fwmark !== "0x200" || value.route_table !== "2")
   throw new Error("route metadata missing from speedtest result");
+if (!value.route_traffic_proof || value.route_traffic_proof.passed !== true ||
+    value.route_traffic_proof.rx_bytes !== 200000000 || value.route_traffic_proof.tx_bytes !== 160000000)
+  throw new Error("selected-interface byte proof missing from speedtest result");
 ' "$work/result.json"
+
+[ "$(minimum_proof_bytes 100000 10)" -eq 12500000 ] ||
+	fail_test "speedtest route byte proof calculated the wrong proportional floor"
+[ "$(minimum_proof_bytes 1 1)" -eq 1048576 ] ||
+	fail_test "speedtest route byte proof did not retain its one-MiB minimum"
+grep -q 'meta skuid.*meta mark set' "$script" ||
+	fail_test "static speedtest-go route pin is not uid-scoped in nft output"
+if grep -q '^[[:space:]]*local .*route_mark_mask' "$script"; then
+	fail_test "mwan3 FWMARK mask is shadowed inside route-pin acquisition"
+fi
+grep -q 'speedtest_route_proof_error="the isolated speedtest-go route pin was not initialized by its parent"' "$script" ||
+	fail_test "speedtest-go commands can still acquire mwan3 routing from a subshell"
+grep -q 'USERID:=cake-speedtest:cake-speedtest' "$base/Makefile" ||
+	fail_test "package-owned speedtest route user is missing"
 
 # Two simultaneous LuCI job-start RPCs must publish and resume exactly one
 # verified worker. The second caller observes the same immutable PID/start

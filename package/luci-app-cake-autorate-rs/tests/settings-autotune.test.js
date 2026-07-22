@@ -24,6 +24,27 @@ assert.match(source, /function renderAutotuneAdvisoryGate[\s\S]*?_\('WARN'\)/,
 assert(source.includes('variable-throughput-advisory') &&
 	source.includes('Variable-link advisory'),
 	'Auto-Tune review must explain bounded volatile-throughput results');
+const diagnosticsRendererSource = source.slice(
+	source.indexOf('function renderAutotuneDiagnostics'),
+	source.indexOf('function replaceNodeContent'));
+assert.doesNotMatch(diagnosticsRendererSource, /\bstate\./,
+	'the global diagnostics renderer must not capture wizard-local state');
+assert.doesNotMatch(source, /function runPlan\(index\)/,
+	'Multi-WAN Auto-Tune must never recursively run every uplink without a user decision');
+assert.match(source, /function renderMultiwanAutotuneStep\(\)/,
+	'Multi-WAN Auto-Tune needs a dedicated per-uplink workflow');
+assert.match(source, /Calibration profile for %s/,
+	'each Multi-WAN uplink must expose its own profile choice');
+assert.match(source, /Accept proposal[\s\S]*Skip this uplink/,
+	'each Multi-WAN result must require an explicit Accept or Skip decision');
+assert.match(source,
+	/runSequentialAutotuneApplies\(accepted,[\s\S]*?stageWizardPlanItem\(config_name, item\)[\s\S]*?runGuardedSaveApply\(null, null, false\)[\s\S]*?reloadWizardUci\(\)/,
+	'Multi-WAN proposals must be guarded, applied and reloaded one at a time');
+assert.match(source, /Create & apply sequentially/,
+	'the Multi-WAN final action must describe that it applies the accepted proposals');
+assert.match(source,
+	/pendingAutotuneApplyMarkers\(\)\.length[\s\S]*?cake_autorate_apply_guard[\s\S]*?refusing to mix it with disabled uplinks/,
+	'disabled fallback instances must never share a transaction with stale apply markers');
 const written = {};
 const fixtureSections = { 'cake-autorate': [], mwan3: [] };
 if (typeof String.prototype.format !== 'function') {
@@ -54,12 +75,18 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 		'fs', 'form', 'network', 'uci', 'ui', 'widgets', 'cakeUi', 'rpc', 'L', 'E', '_',
 		`${prefix}\ninterfaceContext = { deviceNames: { eth1: true }, deviceNetworks: {}, ` +
 			`networkDevices: {}, defaultDevice: 'eth1' };\nreturn { writeWizardConfig, validateTransportProbeUrl, ` +
-			`buildMwan3Context, uniqueMwan3Uplinks, multiwanInstancePlans, wizardPlanConflicts, ` +
+			`buildMwan3Context, uniqueMwan3Uplinks, managedUplinkOwner, availableMwan3Uplinks, ` +
+			`multiwanInstancePlans, wizardPlanConflicts, ` +
 			`topicTab, autorateSubcategory, autorateSubcategoryDefinitions, ` +
 			`canonicalAutotuneProfile, autotuneProfilePolicy, autotuneProfileDefinitions, ` +
 			`autotuneProposalMatchesProfile, ` +
 			`autotuneResultValidated, autotuneResultReviewable, ` +
 			`autotuneResultHasReviewChoice, autotuneDefaultReviewAction, ` +
+			`autotuneConfidence, autotuneResultClass, autotuneBackgroundAwareResult, ` +
+			`autotunePhaseEvidenceUsable, ` +
+			`autotuneConservativeAvailable, autotunePhaseEvidenceClean, ` +
+			`multiwanAutotuneItemAccepted, multiwanAutotuneItemDecided, multiwanAutotuneBatchDecided, ` +
+			`multiwanAutotuneItemCanSkip, ` +
 			`autotuneDisableSqmEvidenceValidated, ` +
 			`autotuneAttemptDiagnostics, autotuneDiagnostics, ` +
 			`autotuneCpuSustainedSummary, ` +
@@ -67,10 +94,12 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 			`autotuneRecoveryPending, autotuneRecoveryProgress, ` +
 			`revalidateAutotuneProposal, ` +
 			`stageAutotuneApplyMarker, pendingAutotuneApplyMarkers, ` +
-			`armAutotuneApplyGuards, runGuardedSaveApply, ` +
+			`armAutotuneApplyGuards, runGuardedSaveApply, discardStagedUciPackages, ` +
+			`changedUciPackages, requireCleanUciTransaction, applyPlainRollbackTransaction, ` +
+			`runSequentialAutotuneApplies, ` +
 			`clearAutotuneProposalState, recordAutotuneTerminalFailure, ` +
 			`autotuneRetryableInconclusive, recordAutotuneRetryableInconclusive, ` +
-			`adaptiveCeilingWritePlan, runAutotuneJob, ` +
+				`adaptiveCeilingWritePlan, runAutotuneJob, cancelAutotuneJob, ` +
 			`setInterfaceContext: function(value) { interfaceContext = value; }, ` +
 			`setMwan3Context: function(value) { mwan3Context = value; } };`
 	)(fsImpl || {}, {}, {}, uciImpl || uci, {}, {}, {}, rpcImpl || {
@@ -79,6 +108,60 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 }
 
 const helpers = compileHelpers({});
+
+async function testSequentialMultiwanTransactions() {
+	const events = [];
+	const results = await helpers.runSequentialAutotuneApplies([ 'wan', 'wanb' ], async item => {
+		events.push(`start:${item}`);
+		await Promise.resolve();
+		events.push(`end:${item}`);
+		return `${item}_sqm`;
+	});
+	assert.deepEqual(events, [ 'start:wan', 'end:wan', 'start:wanb', 'end:wanb' ],
+		'Multi-WAN applies must never overlap');
+	assert.deepEqual(results, [ 'wan_sqm', 'wanb_sqm' ]);
+
+	const stopped = [];
+	await assert.rejects(helpers.runSequentialAutotuneApplies([ 'wan', 'wanb', 'third' ], item => {
+		stopped.push(item);
+		return item === 'wanb' ? Promise.reject(new Error('guard rejected')) : Promise.resolve(item);
+	}), /guard rejected/);
+	assert.deepEqual(stopped, [ 'wan', 'wanb' ],
+		'a failed guarded uplink must stop later transactions');
+
+	const calls = [];
+	const cleanUci = {
+		save() { calls.push('save'); return Promise.resolve(); },
+		changes() { calls.push('changes'); return Promise.resolve({ 'cake-autorate': [ [ 'set' ] ] }); },
+		callApply(timeout, rollback) {
+			calls.push(`apply:${timeout}:${rollback}`);
+			return Promise.resolve(0);
+		},
+	};
+	const transaction = compileHelpers({}, cleanUci, {}, {
+		declare() { return () => { calls.push('confirm'); return Promise.resolve(0); }; },
+	});
+	assert.equal(await transaction.applyPlainRollbackTransaction([ 'cake-autorate' ]), true);
+	assert.deepEqual(calls, [ 'save', 'changes', 'apply:30:true', 'confirm' ]);
+
+	const reverted = [];
+	const cacheEvents = [];
+	const cleanup = compileHelpers({}, {
+		unload(packages) { cacheEvents.push([ 'unload', packages ]); },
+	}, {}, {
+		declare(spec) {
+			if (spec.method === 'revert')
+				return config => { reverted.push(config); return Promise.resolve(0); };
+			return () => Promise.resolve(0);
+		},
+	});
+	assert.deepEqual(await cleanup.discardStagedUciPackages([ 'cake-autorate', 'sqm' ]),
+		[ 'cake-autorate', 'sqm' ]);
+	assert.deepEqual(reverted, [ 'cake-autorate', 'sqm' ],
+		'rollback cleanup must revert both packages in the active browser RPC session');
+	assert.deepEqual(cacheEvents, [ [ 'unload', [ 'cake-autorate', 'sqm' ] ] ],
+		'rollback cleanup must unload the rejected local UCI cache before reload');
+}
 
 assert.equal(helpers.topicTab('setup'), 'autorate');
 assert.equal(helpers.topicTab('general'), 'autorate');
@@ -594,10 +677,18 @@ const validResult = {
 	source_ip: '192.0.2.10',
 	route_identity: 'main||pppoe-wan|192.0.2.10||main',
 	external_ip: '192.0.2.20',
-	schema_version: 7,
+	schema_version: 8,
 	producer: 'cake-autorate-rs-autotune',
 	run_id: 'settings-test-run',
 	profile: 'best_overall',
+	result_class: 'trusted',
+	confidence: {
+		overall_percent: 100,
+		capacity_download_percent: 100,
+		capacity_upload_percent: 100,
+		quality_percent: 100,
+		reasons: [],
+	},
 	auto_apply_eligible: true,
 	manual_apply_eligible: true,
 	phase_evidence_complete: true,
@@ -643,6 +734,205 @@ const validAttestation = {
 	route_identity: validResult.route_identity,
 };
 assert.equal(helpers.autotuneResultValidated(validResult), true);
+assert.equal(helpers.autotuneResultClass(validResult), 'trusted',
+	'a complete schema-8 confidence envelope must keep its trusted classification');
+const legacyConfidenceResult = {
+	...validResult,
+	schema_version: 7,
+	result_class: undefined,
+	confidence: undefined,
+	proposal: { ...validResult.proposal, confidence: 90 },
+};
+assert.deepEqual(helpers.autotuneConfidence(legacyConfidenceResult), {
+	overall_percent: 90,
+	capacity_download_percent: 90,
+	capacity_upload_percent: 90,
+	quality_percent: 90,
+	reasons: [],
+	legacy: true,
+}, 'legacy proposal confidence must remain readable');
+assert.equal(helpers.autotuneResultClass(legacyConfidenceResult), 'technical_failure',
+	'legacy diagnostics without a typed result class must not inherit trust');
+assert.equal(helpers.autotuneResultReviewable(legacyConfidenceResult, 'apply_sqm'), false,
+	'legacy result schemas must remain read-only');
+
+const backgroundAwareConfidence = {
+	overall_percent: 68,
+	capacity_download_percent: 81,
+	capacity_upload_percent: 72,
+	quality_percent: 68,
+	reasons: [ {
+		code: 'background-variation',
+		scope: 'upload',
+		message: 'Upload background varied during validation',
+	} ],
+};
+const provisionalResult = JSON.parse(JSON.stringify(validResult));
+Object.assign(provisionalResult, {
+	result_class: 'provisional',
+	confidence: backgroundAwareConfidence,
+	conservative: true,
+	confidence_mode: 'low',
+	auto_apply_eligible: false,
+	manual_apply_eligible: true,
+	phase_contamination_seen: true,
+});
+provisionalResult.validation.contaminated = true;
+provisionalResult.phase_background[3].forwarded_background.contaminated = true;
+provisionalResult.validation.direction_phases.download.forwarded_background.contaminated = true;
+assert.equal(helpers.autotuneBackgroundAwareResult(provisionalResult), true);
+assert.equal(helpers.autotunePhaseEvidenceUsable(provisionalResult), true,
+	'contaminated but structured phase evidence must remain usable');
+assert.equal(helpers.autotuneResultValidated(provisionalResult), false,
+	'a provisional result must never become Auto-Apply eligible');
+assert.equal(helpers.autotuneResultReviewable(provisionalResult, 'apply_sqm'), true,
+	'a safe server-authorized provisional result must be manually applicable');
+assert.equal(helpers.autotuneResultHasReviewChoice(provisionalResult), true);
+assert.equal(helpers.autotuneResultClass(provisionalResult), 'provisional');
+assert.deepEqual(helpers.autotuneConfidence(provisionalResult), {
+	...backgroundAwareConfidence,
+	reasons: backgroundAwareConfidence.reasons,
+	legacy: false,
+});
+const estimatedResult = JSON.parse(JSON.stringify(provisionalResult));
+estimatedResult.result_class = 'estimated';
+estimatedResult.confidence.overall_percent = 34;
+estimatedResult.confidence.quality_percent = 34;
+assert.equal(helpers.autotuneResultReviewable(estimatedResult, 'apply_sqm'), true,
+	'an estimated result remains manually applicable only when the backend explicitly authorizes it');
+
+const trustedResult = JSON.parse(JSON.stringify(validResult));
+trustedResult.result_class = 'trusted';
+trustedResult.confidence = {
+	overall_percent: 96,
+	capacity_download_percent: 97,
+	capacity_upload_percent: 96,
+	quality_percent: 98,
+	reasons: [],
+};
+assert.equal(helpers.autotuneResultValidated(trustedResult), true,
+	'a clean background-aware trusted result must retain Auto-Apply eligibility');
+const recoveredProvisional = JSON.parse(JSON.stringify(provisionalResult));
+Object.assign(recoveredProvisional, {
+	result_class: 'provisional',
+	auto_apply_eligible: false,
+	confidence: {
+		overall_percent: 82,
+		capacity_download_percent: 100,
+		capacity_upload_percent: 100,
+		quality_percent: 82,
+		reasons: [ { code: 'background-contamination-resolved', scope: 'all' } ],
+	},
+});
+recoveredProvisional.validation.contaminated = false;
+recoveredProvisional.validation.direction_phases.download.forwarded_background.contaminated = false;
+assert.equal(helpers.autotuneResultValidated(recoveredProvisional), false,
+	'earlier discarded background must keep automatic application fail-closed');
+assert.equal(helpers.autotuneResultReviewable(recoveredProvisional, 'apply_sqm'), true,
+	'later clean evidence may still leave an explicit safe provisional proposal');
+
+const unsafeProvisional = JSON.parse(JSON.stringify(provisionalResult));
+unsafeProvisional.validation.safety_pass = false;
+assert.equal(helpers.autotuneResultReviewable(unsafeProvisional, 'apply_sqm'), false,
+	'confidence must never bypass the hard safety verdict');
+const unauthorizedProvisional = JSON.parse(JSON.stringify(provisionalResult));
+unauthorizedProvisional.manual_apply_eligible = false;
+assert.equal(helpers.autotuneResultReviewable(unauthorizedProvisional, 'apply_sqm'), false,
+	'LuCI must require explicit server-side manual eligibility');
+const malformedConfidence = JSON.parse(JSON.stringify(provisionalResult));
+malformedConfidence.confidence.quality_percent = 101;
+assert.equal(helpers.autotuneResultReviewable(malformedConfidence, 'apply_sqm'), false,
+	'out-of-range confidence must fail closed');
+const mismatchedConfidenceMinimum = JSON.parse(JSON.stringify(provisionalResult));
+mismatchedConfidenceMinimum.confidence.overall_percent = 70;
+assert.equal(helpers.autotuneResultReviewable(mismatchedConfidenceMinimum, 'apply_sqm'), false,
+	'overall confidence must equal the weakest capacity/quality dimension');
+const provisionalAboveBand = JSON.parse(JSON.stringify(provisionalResult));
+Object.assign(provisionalAboveBand.confidence, {
+	overall_percent: 90,
+	capacity_download_percent: 90,
+	capacity_upload_percent: 90,
+	quality_percent: 90,
+});
+assert.equal(helpers.autotuneResultReviewable(provisionalAboveBand, 'apply_sqm'), false,
+	'a provisional class must not claim trusted-band confidence');
+const estimatedAtBoundary = JSON.parse(JSON.stringify(estimatedResult));
+estimatedAtBoundary.confidence.overall_percent = 40;
+estimatedAtBoundary.confidence.quality_percent = 40;
+assert.equal(helpers.autotuneResultReviewable(estimatedAtBoundary, 'apply_sqm'), false,
+	'an estimated class must remain below the 40-percent boundary');
+const trustedBelowBand = JSON.parse(JSON.stringify(trustedResult));
+trustedBelowBand.confidence.overall_percent = 84;
+trustedBelowBand.confidence.capacity_download_percent = 84;
+assert.equal(helpers.autotuneResultValidated(trustedBelowBand), false,
+	'a trusted class must not fall below the 85-percent boundary');
+const unknownClass = JSON.parse(JSON.stringify(provisionalResult));
+unknownClass.result_class = 'optimistic';
+assert.equal(helpers.autotuneResultReviewable(unknownClass, 'apply_sqm'), false,
+	'unknown result classes must fail closed instead of falling back to legacy handling');
+const deferredWithoutProof = JSON.parse(JSON.stringify(validResult));
+deferredWithoutProof.phase_background[0].forwarded_background.reference_deferred = true;
+deferredWithoutProof.phase_background[0].total_interface_background = {
+	reference_deferred: true,
+};
+assert.equal(helpers.autotunePhaseEvidenceClean(deferredWithoutProof), false,
+	'a provisional baseline must not validate without a measured-capacity proof');
+assert.equal(helpers.autotuneResultValidated(deferredWithoutProof), false,
+	'a forged complete result must not bypass deferred baseline validation');
+const deferredWithProof = JSON.parse(JSON.stringify(deferredWithoutProof));
+deferredWithProof.phase_background.push({
+	phase: 'baseline-retrospective',
+	passed: true,
+	measured_capacity: { download_kbps: 900000, upload_kbps: 900000 },
+	forwarded_background: {
+		...cleanBackground(),
+		reference_deferred: false,
+		download_reference_kbps: 900000,
+		upload_reference_kbps: 900000,
+	},
+});
+assert.equal(helpers.autotunePhaseEvidenceClean(deferredWithProof), true,
+	'a clean retrospective proof must complete provisional baseline evidence');
+assert.equal(helpers.autotuneResultValidated(deferredWithProof), true,
+	'a correctly attested deferred baseline remains reviewable');
+assert.equal(helpers.autotuneConservativeAvailable({
+	background_blocked: true, retryable: true, conservative_available: true, stage: 'baseline',
+}), true, 'background-aware continuation must rerun rather than manufacture the idle baseline');
+assert.equal(helpers.autotuneConservativeAvailable({
+	background_blocked: true, retryable: true, conservative_available: true,
+	stage: 'baseline-retrospective',
+}), true, 'retrospective contamination may trigger a fresh background-aware run');
+assert.equal(helpers.autotuneConservativeAvailable({
+	background_blocked: true, retryable: true, conservative_available: false, stage: 'baseline',
+}), false, 'a technical baseline failure must remain fail-closed');
+assert.equal(helpers.autotuneConservativeAvailable({
+	background_blocked: true, retryable: true, stage: 'throughput',
+}), true, 'measured throughput contamination may retain explicit conservative review');
+const acceptedWan = {
+	decision: 'accepted', uncalibrated: false,
+	state: { autotune_profile: 'gaming', autotune_result: validResult },
+};
+const skippedWan = {
+	decision: 'skipped', uncalibrated: true,
+	state: { autotune_profile: 'fair', autotune_result: null },
+};
+assert.equal(helpers.multiwanAutotuneItemAccepted(acceptedWan), true);
+assert.equal(helpers.multiwanAutotuneItemDecided(skippedWan), true);
+assert.equal(helpers.multiwanAutotuneBatchDecided([ acceptedWan, skippedWan ]), true,
+	'independent profiles and Accept/Skip decisions must complete the batch');
+assert.equal(helpers.multiwanAutotuneBatchDecided([
+	acceptedWan,
+	{ decision: 'pending', uncalibrated: false, state: { autotune_profile: 'fair' } },
+]), false, 'the next uplink cannot be bypassed without an explicit decision');
+assert.equal(helpers.multiwanAutotuneItemCanSkip({ recovery_pending: true }, false), false,
+	'Skip must remain locked until runtime restoration is proven');
+assert.equal(helpers.multiwanAutotuneItemCanSkip({ recovery_pending: false }, true), false,
+	'Skip must remain locked while a calibration process is active');
+assert.equal(helpers.multiwanAutotuneItemCanSkip({ recovery_pending: false }, false), true,
+	'a settled failed result must always remain explicitly skippable');
+assert.equal(helpers.multiwanAutotuneItemAccepted({
+	decision: 'accepted', state: { autotune_result: failedResult },
+}), false, 'a failed proposal must never become acceptable through UI state alone');
 const resultForProfile = (profile, targetGrade, retention, delay, loss, sqm) => {
 	const candidateProposal = {
 		...proposal,
@@ -852,8 +1142,9 @@ const fairDisable = {
 				valid: true,
 				reason: 'ok',
 				test_direction: 'both',
-				shaper_bypassed: true,
-				sqm_paused: true,
+					shaper_bypassed: true,
+					sqm_paused: true,
+					sqm_bypass_mode: 'paused-managed',
 			},
 			grade: 'D',
 			effective_delta_ms: 218,
@@ -872,6 +1163,22 @@ const fairDisable = {
 	},
 };
 assert.equal(helpers.autotuneDisableSqmEvidenceValidated(fairDisable), true);
+const fairAlreadyUnshaped = {
+	...fairDisable,
+	fair_outcome: {
+		...fairDisable.fair_outcome,
+		no_sqm_control: {
+			...fairDisable.fair_outcome.no_sqm_control,
+			measurement_evidence: {
+				...fairDisable.fair_outcome.no_sqm_control.measurement_evidence,
+				sqm_paused: false,
+				sqm_bypass_mode: 'already-unshaped',
+			},
+		},
+	},
+};
+assert.equal(helpers.autotuneDisableSqmEvidenceValidated(fairAlreadyUnshaped), true,
+	'a verified already-unshaped target must not pretend that an SQM queue was paused');
 assert.equal(helpers.autotuneResultReviewable(fairDisable, 'disable_sqm'), true);
 assert.equal(helpers.autotuneDefaultReviewAction(fairDisable), 'apply_sqm',
 	'disable SQM must never be preselected while a safe shaped candidate exists');
@@ -1153,6 +1460,32 @@ assert.doesNotThrow(() => helpers.writeWizardConfig('accept_valid_autotune', {
 	autotune_proposal: proposal,
 }));
 
+const disabledFallback = {
+	mode: 'autotune',
+	wan_if: 'eth1',
+	route_mode: 'mwan3',
+	mwan3_member: 'wanb',
+	enabled: true,
+	sqm_enabled: true,
+	sqm_download: '20000',
+	sqm_upload: '20000',
+};
+assert.doesNotThrow(() => helpers.writeWizardConfig('uncalibrated_wanb', disabledFallback, true),
+	'a failed batch member must stage as a disabled uncalibrated instance');
+assert.equal(disabledFallback.enabled, false);
+assert.equal(disabledFallback.sqm_enabled, false);
+assert.equal(written.enabled, '0');
+assert.equal(written.sqm_enabled, '0');
+assert.equal(written.route_mode, 'mwan3');
+assert.equal(written.mwan3_member, 'wanb');
+assert.equal(written.manual_rate_limits, '0');
+assert.throws(() => helpers.writeWizardConfig('invalid_uncalibrated', {
+	...disabledFallback,
+	autotune_result: validResult,
+	autotune_proposal: proposal,
+}, true), /Invalid disabled, uncalibrated Multi-WAN fallback state/,
+	'a disabled fallback must never carry a stale proposal');
+
 const stableProposal = {
 	...proposal,
 	adaptive_ceiling: { ...proposal.adaptive_ceiling, enabled: false },
@@ -1254,8 +1587,21 @@ fixtureSections['cake-autorate'] = [
 	{ '.name': 'old_wanb', enabled: '1', manage_sqm: '1', wan_if: 'eth0' },
 ];
 assert.match(helpers.wizardPlanConflicts(plans, true).join(' '), /old_wanb.*eth0/);
+assert.equal(helpers.managedUplinkOwner(mwan3.byName.wanb), 'old_wanb');
+assert.deepEqual(helpers.availableMwan3Uplinks().map(member => member.name), [ 'wan' ],
+	'an uplink already reserved by another instance must not be selectable again');
+assert.deepEqual(helpers.availableMwan3Uplinks('old_wanb').map(member => member.name),
+	[ 'wan', 'wanb' ], 'editing an instance must retain its own uplink selection');
 const duplicatePlans = [ plans[0], { ...plans[1], name: 'primary_sqm' } ];
 assert.match(helpers.wizardPlanConflicts(duplicatePlans, false).join(' '), /duplicated/);
+
+assert.doesNotMatch(source, /state\.multiwan_set = multiwan\.checked;[\s\S]{0,120}state\.mode = 'manual'/,
+	'enabling Multi-WAN must not silently replace Full Auto-Tune with Manual');
+assert.match(source, /Create and calibrate every unused detected uplink sequentially/);
+assert.match(source, /runAutotuneJob\(item\.plan\.name, item\.plan\.device/,
+	'batch Auto-Tune must launch one route-bound job per uplink instead of cloning one proposal');
+assert.match(source, /item\.state\.enabled = false;[\s\S]*item\.state\.sqm_enabled = false;/,
+	'failed batch members must remain disabled and uncalibrated');
 
 assert.match(source, /Re-run Auto-Tune/);
 assert.match(source, /Review diagnostics/);
@@ -1276,7 +1622,19 @@ assert.match(source, /Keep current settings/);
 assert.match(source, /I understand that this disables CAKE shaping/);
 assert.match(source, /start-conservative/);
 assert.match(source, /Continue conservatively/);
-assert.match(source, /confidence_mode === 'low'/);
+assert.match(source, /Deferred baseline traffic check/);
+assert.match(source, /autotuneConservativeAvailable\(itemState\.autotune_background_block\)/,
+	'Multi-WAN must not offer a conservative override for an untrusted baseline');
+assert.match(source, /autotuneConservativeAvailable\(state\.autotune_background_block\)/,
+	'single-uplink Auto-Tune must not offer a conservative override for an untrusted baseline');
+assert.match(source, /Valid provisional proposal/);
+assert.match(source, /Estimated result/);
+assert.match(source, /Technical failure/);
+assert.match(source, /Accept safe proposal/);
+assert.match(source, /Retry for higher confidence/);
+assert.match(source, /Capacity confidence/);
+assert.match(source, /Quality confidence/);
+assert.match(source, /Why confidence was reduced/);
 assert.match(source, /s\.tab\('autorate', _\('Autorate setup'\)\)/);
 assert.match(source, /s\.tab\('sqm', _\('SQM setup'\)\)/);
 assert.match(source, /s\.tab\('testing', _\('Testing & Auto-Tune'\)\)/);
@@ -1460,6 +1818,27 @@ async function testAutotuneTerminalPrecedence() {
 		assert.deepEqual(completed, validResult);
 		assert.deepEqual(successProgress, [ 87 ]);
 		assert.equal(successCalls.length, 3);
+
+		timerDelays = [];
+		const cancelCalls = [];
+		const cancelledTerminal = {
+			state: 'cancelled',
+			error: 'Full Auto-Tune was cancelled; no configuration was written.',
+			runtime_restored: true,
+			recovery_pending: false,
+		};
+		const cancelHelpers = pollingHelpers([
+			{ state: 'cancelling', runtime_restored: false, recovery_pending: true },
+			cancelledTerminal,
+		], cancelCalls);
+		assert.deepEqual(await cancelHelpers.cancelAutotuneJob(
+			'wan_sqm', 'pppoe-wan', 'speedtest-go', 'best_overall', 'mwan3', 'wan'),
+		cancelledTerminal, 'user cancellation must wait for runtime restoration and return neutrally');
+		assert.deepEqual(cancelCalls.map(call => call.args), [
+			[ 'wan_sqm', 'pppoe-wan', 'cancel', 'speedtest-go', '', '', 'best_overall' ],
+			[ 'wan_sqm', 'pppoe-wan', 'status', 'speedtest-go', 'mwan3', 'wan', 'best_overall' ],
+		]);
+		assert.deepEqual(timerDelays, [ 2000 ]);
 
 		timerDelays = [];
 		const delayedResultCalls = [];
@@ -1760,7 +2139,8 @@ async function testApplyGuardTransaction() {
 	}
 }
 
-testAutotuneTerminalPrecedence().then(() => testApplyGuardTransaction()).then(() => {
+testSequentialMultiwanTransactions().then(() => testAutotuneTerminalPrecedence()).then(() =>
+	testApplyGuardTransaction()).then(() => {
 	console.log('settings autotune tests passed');
 }).catch(err => {
 	console.error(err);

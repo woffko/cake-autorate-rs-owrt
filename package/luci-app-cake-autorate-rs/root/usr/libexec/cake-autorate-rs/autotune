@@ -31,7 +31,7 @@ case "$profile_argument" in
 esac
 reflector_scan_cooldown_s="${CAKE_AUTORATE_REFLECTOR_SCAN_COOLDOWN_S:-5}"
 baseline_retry_backoff_s="${CAKE_AUTORATE_BASELINE_RETRY_BACKOFF_S:-20}"
-autotune_result_schema=7
+autotune_result_schema=8
 autotune_result_producer="cake-autorate-rs-autotune"
 
 job_root="${CAKE_AUTORATE_AUTOTUNE_DIR:-/tmp/cake-autorate-autotune}"
@@ -854,9 +854,14 @@ terminal_json_valid() {
 stage_terminal_json() {
 	terminal_kind="$1"
 	payload="$2"
+	# Schema 8 adds evidence-derived confidence and result-class semantics. Keep
+	# the numerous fail-closed terminal construction sites readable while
+	# normalising their single top-level schema field at the publication gate.
+	# Nested daemon/proposal schemas are deliberately left unchanged.
+	payload="$(printf '%s\n' "$payload" | sed 's/"schema_version":7/"schema_version":8/')"
 	if [ "${config_fingerprint_captured:-false}" = true ] &&
 	   ! config_fingerprint_matches; then
-		payload="{\"state\":\"inconclusive\",\"schema_version\":7,\"stage\":\"config-changed\",\"error\":\"Managed CAKE Autorate/SQM configuration changed during calibration; all measurements are stale.\",\"reason\":\"config-changed\",\"retryable\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"configuration_written\":false}"
+		payload="{\"state\":\"inconclusive\",\"schema_version\":8,\"stage\":\"config-changed\",\"error\":\"Managed CAKE Autorate/SQM configuration changed during calibration; all measurements are stale.\",\"reason\":\"config-changed\",\"retryable\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"configuration_written\":false}"
 		terminal_kind=error
 	fi
 	terminal_json_shape_valid "$payload" || return 1
@@ -984,11 +989,12 @@ configure_validation_thresholds() {
 	validation_delay_max_ms="$validation_transport_delay_max_ms"
 }
 
-configured_rate() {
+configured_rate_value() {
 	direction="$1"
 	case "$direction" in
 		dl) keys="sqm_download base_dl_shaper_rate_kbps max_dl_shaper_rate_kbps" ;;
 		ul) keys="sqm_upload base_ul_shaper_rate_kbps max_ul_shaper_rate_kbps" ;;
+		*) return 1 ;;
 	esac
 	for key in $keys; do
 		value="$(uci -q get "cake-autorate.$job_name.$key" 2>/dev/null)"
@@ -997,7 +1003,126 @@ configured_rate() {
 			return 0
 		fi
 	done
-	printf '%s\n' 20000
+	return 1
+}
+
+phase_reference_rate() {
+	direction="$1"
+	case "$direction" in
+		dl) measured="${calibration_capacity_dl_kbps:-}" ;;
+		ul) measured="${calibration_capacity_ul_kbps:-}" ;;
+		*) return 1 ;;
+	esac
+	if is_positive_uint "$measured"; then
+		printf '%s\n' "$measured"
+		return 0
+	fi
+	configured_rate_value "$direction" 2>/dev/null || printf '%s\n' 0
+}
+
+strict_background_limit() {
+	reference="$1"
+	percent="$2"
+	minimum="${3:-1000}"
+	awk -v r="$reference" -v p="$percent" -v m="$minimum" 'BEGIN { v=r*p; if(v<m)v=m; printf "%.0f",v }'
+}
+
+background_rate_exceeds() {
+	actual="${1:-0}"
+	limit="${2:-0}"
+	[ "$actual" -gt "$limit" ] 2>/dev/null
+}
+
+background_share_percent() {
+	actual="${1:-0}"
+	reference="${2:-0}"
+	if ! is_positive_uint "$reference"; then
+		printf '%s\n' 0
+		return 0
+	fi
+	awk -v a="$actual" -v r="$reference" 'BEGIN {
+		p = (a + 0) * 100 / r
+		if (p < 0) p = 0
+		if (p > 999) p = 999
+		printf "%.1f", p
+	}'
+}
+
+capacity_confidence_for_share() {
+	share="${1:-0}"
+	awk -v p="$share" 'BEGIN {
+		if (p <= 2) print 100
+		else if (p <= 5) print 96
+		else if (p <= 15) print 88
+		else if (p <= 30) print 75
+		else if (p <= 50) print 60
+		else if (p <= 80) print 40
+		else print 25
+	}'
+}
+
+append_confidence_reason() {
+	reason_code="$1"
+	reason_scope="$2"
+	reason_message="$3"
+	reason_entry="{\"code\":\"$(json_escape "$reason_code")\",\"scope\":\"$(json_escape "$reason_scope")\",\"message\":\"$(json_escape "$reason_message")\"}"
+	if [ -n "${confidence_reasons_json:-}" ]; then
+		confidence_reasons_json="$confidence_reasons_json,$reason_entry"
+	else
+		confidence_reasons_json="$reason_entry"
+	fi
+}
+
+build_autotune_confidence() {
+	capacity_download_confidence_percent="$(capacity_confidence_for_share "${observed_background_dl_max_share_percent:-0}")"
+	capacity_upload_confidence_percent="$(capacity_confidence_for_share "${observed_background_ul_max_share_percent:-0}")"
+	quality_confidence_percent=100
+	confidence_reasons_json=""
+
+	[ "$capacity_download_confidence_percent" -eq 100 ] ||
+		append_confidence_reason background-share-download download \
+		"Concurrent download traffic reduced capacity confidence."
+	[ "$capacity_upload_confidence_percent" -eq 100 ] ||
+		append_confidence_reason background-share-upload upload \
+		"Concurrent upload traffic reduced capacity confidence."
+
+	if [ "${baseline_quality_provisional:-false}" = true ]; then
+		[ "$quality_confidence_percent" -le 55 ] || quality_confidence_percent=55
+		append_confidence_reason baseline-background quality \
+			"Idle latency was measured while background traffic was present."
+	fi
+	if [ "${unresolved_background_contamination:-false}" = true ] ||
+	   [ "${validation_contaminated:-false}" = true ]; then
+		[ "$quality_confidence_percent" -le 70 ] || quality_confidence_percent=70
+		append_confidence_reason background-contamination-accepted quality \
+			"At least one accepted validation observation included background traffic."
+	fi
+	if [ "${phase_contamination_seen:-false}" = true ] &&
+	   [ "${unresolved_background_contamination:-false}" != true ] &&
+	   [ "${validation_contaminated:-false}" != true ]; then
+		[ "$quality_confidence_percent" -le 84 ] || quality_confidence_percent=84
+		append_confidence_reason background-contamination-resolved all \
+			"Earlier background traffic was followed by clean repeated measurements."
+	fi
+
+	overall_confidence_percent="$capacity_download_confidence_percent"
+	[ "$capacity_upload_confidence_percent" -ge "$overall_confidence_percent" ] ||
+		overall_confidence_percent="$capacity_upload_confidence_percent"
+	[ "$quality_confidence_percent" -ge "$overall_confidence_percent" ] ||
+		overall_confidence_percent="$quality_confidence_percent"
+
+	if [ "$overall_confidence_percent" -ge 85 ] &&
+	   [ "${phase_contamination_seen:-false}" != true ] &&
+	   [ "${baseline_quality_provisional:-false}" != true ] &&
+	   [ "${unresolved_background_contamination:-false}" != true ] &&
+	   [ "${validation_contaminated:-false}" != true ]; then
+		result_class=trusted
+	elif [ "$overall_confidence_percent" -ge 40 ]; then
+		result_class=provisional
+	else
+		result_class=estimated
+	fi
+	confidence_json="{\"overall_percent\":$overall_confidence_percent,\"capacity_download_percent\":$capacity_download_confidence_percent,\"capacity_upload_percent\":$capacity_upload_confidence_percent,\"quality_percent\":$quality_confidence_percent,\"reasons\":[$confidence_reasons_json]}"
 }
 
 measure_background_traffic() {
@@ -1017,26 +1142,59 @@ measure_background_traffic() {
 		background_ul_kbps="$(awk -v a="${tx_after:-0}" -v b="${tx_before:-0}" -v s="$duration" 'BEGIN { d=a-b; if (d<0)d=0; printf "%.0f", d*8/s/1000 }')"
 	fi
 
-	dl_reference="$(configured_rate dl)"
-	ul_reference="$(configured_rate ul)"
-	background_dl_limit="$(awk -v r="$dl_reference" 'BEGIN { v=r*0.05; if(v<1000)v=1000; printf "%.0f",v }')"
-	background_ul_limit="$(awk -v r="$ul_reference" 'BEGIN { v=r*0.05; if(v<1000)v=1000; printf "%.0f",v }')"
-	background_dl_hard="$(awk -v r="$dl_reference" 'BEGIN { v=r*0.35; if(v<5000)v=5000; printf "%.0f",v }')"
-	background_ul_hard="$(awk -v r="$ul_reference" 'BEGIN { v=r*0.35; if(v<5000)v=5000; printf "%.0f",v }')"
+	dl_reference="$(phase_reference_rate dl)"
+	ul_reference="$(phase_reference_rate ul)"
+	background_dl_reference_known=false
+	background_ul_reference_known=false
+	background_reference_deferred=false
+	if is_positive_uint "$dl_reference"; then
+		background_dl_reference_known=true
+		background_dl_limit="$(strict_background_limit "$dl_reference" 0.05)"
+		background_dl_hard="$(strict_background_limit "$dl_reference" 0.35 5000)"
+	else
+		background_dl_limit=0
+		background_dl_hard=0
+		background_reference_deferred=true
+	fi
+	if is_positive_uint "$ul_reference"; then
+		background_ul_reference_known=true
+		background_ul_limit="$(strict_background_limit "$ul_reference" 0.05)"
+		background_ul_hard="$(strict_background_limit "$ul_reference" 0.35 5000)"
+	else
+		background_ul_limit=0
+		background_ul_hard=0
+		background_reference_deferred=true
+	fi
 	background_blocked=false
-	[ "$background_dl_kbps" -le "$background_dl_limit" ] 2>/dev/null || background_blocked=true
-	[ "$background_ul_kbps" -le "$background_ul_limit" ] 2>/dev/null || background_blocked=true
+	[ "$background_dl_reference_known" != true ] ||
+		! background_rate_exceeds "$background_dl_kbps" "$background_dl_limit" || background_blocked=true
+	[ "$background_ul_reference_known" != true ] ||
+		! background_rate_exceeds "$background_ul_kbps" "$background_ul_limit" || background_blocked=true
 	background_dl_usable=true
 	background_ul_usable=true
-	[ "$background_dl_kbps" -le "$background_dl_hard" ] 2>/dev/null || background_dl_usable=false
-	[ "$background_ul_kbps" -le "$background_ul_hard" ] 2>/dev/null || background_ul_usable=false
+	[ "$background_dl_reference_known" != true ] ||
+		! background_rate_exceeds "$background_dl_kbps" "$background_dl_hard" || background_dl_usable=false
+	[ "$background_ul_reference_known" != true ] ||
+		! background_rate_exceeds "$background_ul_kbps" "$background_ul_hard" || background_ul_usable=false
+	background_dl_share_percent="$(background_share_percent "$background_dl_kbps" "$dl_reference")"
+	background_ul_share_percent="$(background_share_percent "$background_ul_kbps" "$ul_reference")"
+	if awk -v a="$background_dl_share_percent" -v b="${observed_background_dl_max_share_percent:-0}" 'BEGIN { exit(a > b ? 0 : 1) }'; then
+		observed_background_dl_max_share_percent="$background_dl_share_percent"
+	fi
+	if awk -v a="$background_ul_share_percent" -v b="${observed_background_ul_max_share_percent:-0}" 'BEGIN { exit(a > b ? 0 : 1) }'; then
+		observed_background_ul_max_share_percent="$background_ul_share_percent"
+	fi
 }
 
 background_json() {
-	printf '{"download_kbps":%s,"upload_kbps":%s,"strict_download_limit_kbps":%s,"strict_upload_limit_kbps":%s,"download_usable":%s,"upload_usable":%s}' \
+	printf '{"download_kbps":%s,"upload_kbps":%s,"download_reference_kbps":%s,"upload_reference_kbps":%s,"download_reference_known":%s,"upload_reference_known":%s,"reference_deferred":%s,"strict_download_limit_kbps":%s,"strict_upload_limit_kbps":%s,"download_usable":%s,"upload_usable":%s,"download_share_percent":%s,"upload_share_percent":%s}' \
 		"${background_dl_kbps:-0}" "${background_ul_kbps:-0}" \
+		"${dl_reference:-0}" "${ul_reference:-0}" \
+		"${background_dl_reference_known:-false}" "${background_ul_reference_known:-false}" \
+		"${background_reference_deferred:-false}" \
 		"${background_dl_limit:-0}" "${background_ul_limit:-0}" \
-		"${background_dl_usable:-true}" "${background_ul_usable:-true}"
+		"${background_dl_usable:-true}" "${background_ul_usable:-true}" \
+		"${background_dl_share_percent:-0}" "${background_ul_share_percent:-0}"
 }
 
 baseline_diagnostics_json() {
@@ -1126,24 +1284,15 @@ collect_datapath_diagnostics() {
 check_background_traffic() {
 	write_status quiet-check 27 "Checking background traffic before throughput calibration"
 	measure_background_traffic
+	prethroughput_background_dl_kbps="${background_dl_kbps:-0}"
+	prethroughput_background_ul_kbps="${background_ul_kbps:-0}"
+	prethroughput_background_reference_deferred="${background_reference_deferred:-false}"
 	if [ "$background_blocked" = true ] && [ "${conservative_mode:-0}" != 1 ]; then
 		stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":7,\"error\":\"Background traffic is above the strict calibration limit. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"quiet-check\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"phase_contamination_seen\":false,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
 		exit 1
 	fi
-	if [ "${conservative_mode:-0}" = 1 ]; then
-		current_dl_min="$(uci -q get "cake-autorate.$job_name.min_dl_shaper_rate_kbps" 2>/dev/null)"
-		current_dl_base="$(uci -q get "cake-autorate.$job_name.base_dl_shaper_rate_kbps" 2>/dev/null)"
-		current_dl_max="$(uci -q get "cake-autorate.$job_name.max_dl_shaper_rate_kbps" 2>/dev/null)"
-		current_dl_cap="$(uci -q get "cake-autorate.$job_name.adaptive_ceiling_dl_cap_kbps" 2>/dev/null)"
-		current_ul_min="$(uci -q get "cake-autorate.$job_name.min_ul_shaper_rate_kbps" 2>/dev/null)"
-		current_ul_base="$(uci -q get "cake-autorate.$job_name.base_ul_shaper_rate_kbps" 2>/dev/null)"
-		current_ul_max="$(uci -q get "cake-autorate.$job_name.max_ul_shaper_rate_kbps" 2>/dev/null)"
-		current_ul_cap="$(uci -q get "cake-autorate.$job_name.adaptive_ceiling_ul_cap_kbps" 2>/dev/null)"
-		if { [ "$background_dl_usable" != true ] || [ "$background_ul_usable" != true ]; } &&
-		   { ! is_positive_uint "$current_dl_base" || ! is_positive_uint "$current_ul_base"; }; then
-			stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":7,\"error\":\"Background traffic leaves an unusable direction and this new instance has no confirmed limits to retain.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"quiet-check\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"phase_contamination_seen\":false,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
-			exit 1
-		fi
+	if [ "${conservative_mode:-0}" = 1 ] && [ "$background_blocked" = true ]; then
+		preflight_background_contaminated=true
 	fi
 }
 
@@ -1232,6 +1381,47 @@ start_phase_background_counter() {
 	phase_background_available=true
 }
 
+classify_phase_background() {
+	phase_reference_dl_kbps="${1:-0}"
+	phase_reference_ul_kbps="${2:-0}"
+	phase_background_dl_reference_known=false
+	phase_background_ul_reference_known=false
+	phase_background_reference_deferred=false
+	if is_positive_uint "$phase_reference_dl_kbps"; then
+		phase_background_dl_reference_known=true
+		phase_background_dl_limit="$(strict_background_limit "$phase_reference_dl_kbps" 0.02)"
+	else
+		phase_background_dl_limit=0
+		phase_background_reference_deferred=true
+	fi
+	if is_positive_uint "$phase_reference_ul_kbps"; then
+		phase_background_ul_reference_known=true
+		phase_background_ul_limit="$(strict_background_limit "$phase_reference_ul_kbps" 0.02)"
+	else
+		phase_background_ul_limit=0
+		phase_background_reference_deferred=true
+	fi
+	phase_background_contaminated=false
+	if [ "${phase_background_available:-false}" != true ]; then
+		phase_background_contaminated=true
+		phase_evidence_complete=false
+	fi
+	[ "$phase_background_dl_reference_known" != true ] ||
+		! background_rate_exceeds "${phase_background_dl_kbps:-0}" "$phase_background_dl_limit" ||
+		phase_background_contaminated=true
+	[ "$phase_background_ul_reference_known" != true ] ||
+		! background_rate_exceeds "${phase_background_ul_kbps:-0}" "$phase_background_ul_limit" ||
+		phase_background_contaminated=true
+	phase_background_dl_share_percent="$(background_share_percent "${phase_background_dl_kbps:-0}" "$phase_reference_dl_kbps")"
+	phase_background_ul_share_percent="$(background_share_percent "${phase_background_ul_kbps:-0}" "$phase_reference_ul_kbps")"
+	if awk -v a="$phase_background_dl_share_percent" -v b="${observed_background_dl_max_share_percent:-0}" 'BEGIN { exit(a > b ? 0 : 1) }'; then
+		observed_background_dl_max_share_percent="$phase_background_dl_share_percent"
+	fi
+	if awk -v a="$phase_background_ul_share_percent" -v b="${observed_background_ul_max_share_percent:-0}" 'BEGIN { exit(a > b ? 0 : 1) }'; then
+		observed_background_ul_max_share_percent="$phase_background_ul_share_percent"
+	fi
+}
+
 stop_phase_background_counter() {
 	phase_counter_stopped="$(cut -d ' ' -f 1 /proc/uptime 2>/dev/null)"
 	phase_duration_s="$(awk -v start="${phase_counter_started:-0}" -v stop="${phase_counter_stopped:-0}" 'BEGIN {
@@ -1278,22 +1468,18 @@ stop_phase_background_counter() {
 	fi
 	cleanup_phase_background_counter
 
-	phase_background_dl_limit="$(awk -v r="${phase_reference_dl_kbps:-0}" 'BEGIN { v=r*0.02; if(v<1000)v=1000; printf "%.0f",v }')"
-	phase_background_ul_limit="$(awk -v r="${phase_reference_ul_kbps:-0}" 'BEGIN { v=r*0.02; if(v<1000)v=1000; printf "%.0f",v }')"
-	phase_background_contaminated=false
-	if [ "${phase_background_available:-false}" != true ]; then
-		phase_background_contaminated=true
-		phase_evidence_complete=false
-	fi
-	[ "${phase_background_dl_kbps:-0}" -le "$phase_background_dl_limit" ] 2>/dev/null || phase_background_contaminated=true
-	[ "${phase_background_ul_kbps:-0}" -le "$phase_background_ul_limit" ] 2>/dev/null || phase_background_contaminated=true
+	classify_phase_background "${phase_reference_dl_kbps:-0}" "${phase_reference_ul_kbps:-0}"
 }
 
 phase_background_json() {
-	printf '{"available":%s,"contaminated":%s,"duration_s":%s,"download_kbps":%s,"upload_kbps":%s,"download_limit_kbps":%s,"upload_limit_kbps":%s}' \
+	printf '{"available":%s,"contaminated":%s,"reference_deferred":%s,"duration_s":%s,"download_kbps":%s,"upload_kbps":%s,"download_reference_kbps":%s,"upload_reference_kbps":%s,"download_reference_known":%s,"upload_reference_known":%s,"download_limit_kbps":%s,"upload_limit_kbps":%s,"download_share_percent":%s,"upload_share_percent":%s}' \
 		"${phase_background_available:-false}" "${phase_background_contaminated:-false}" \
+		"${phase_background_reference_deferred:-false}" \
 		"${phase_duration_s:-0}" "${phase_background_dl_kbps:-0}" "${phase_background_ul_kbps:-0}" \
-		"${phase_background_dl_limit:-0}" "${phase_background_ul_limit:-0}"
+		"${phase_reference_dl_kbps:-0}" "${phase_reference_ul_kbps:-0}" \
+		"${phase_background_dl_reference_known:-false}" "${phase_background_ul_reference_known:-false}" \
+		"${phase_background_dl_limit:-0}" "${phase_background_ul_limit:-0}" \
+		"${phase_background_dl_share_percent:-0}" "${phase_background_ul_share_percent:-0}"
 }
 
 resolve_interface_device() {
@@ -1330,6 +1516,13 @@ route_device_for() {
 		ip route get 1.1.1.1 2>/dev/null |
 			sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1
 	fi
+}
+
+route_device_for_mark() {
+	source_ip="$1"
+	mark="$2"
+	ip -4 route get 1.1.1.1 from "$source_ip" mark "$mark" 2>/dev/null |
+		sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1
 }
 
 route_exec() {
@@ -1422,8 +1615,10 @@ inspect_autotune_route() {
 		[ -n "$discovered_mark" ] && route_mark="$discovered_mark"
 		valid_route_mark "$route_mark" || return 1
 		valid_route_table "$route_table" || return 1
-		forced_route="$(mwan3 use "$mwan3_member" exec ip -4 route get 1.1.1.1 from "$source_ip" 2>/dev/null)" || return 1
-		forced_route_if="$(printf '%s\n' "$forced_route" | sed -n 's/.* dev \([^ ]*\).*/\1/p' | sed -n '1p')"
+		# mwan3 use applies its member policy to real sockets, but ip route get
+		# is a netlink query and does not inherit that socket mark.  Query the
+		# policy route with the independently discovered member mark instead.
+		forced_route_if="$(route_device_for_mark "$source_ip" "$route_mark")" || return 1
 		[ "$forced_route_if" = "$target_if" ] || return 1
 		table_default="$(ip -4 route show table "$route_table" default 2>/dev/null)" || return 1
 		printf '%s\n' "$table_default" | awk -v device="$target_if" '
@@ -2447,9 +2642,12 @@ capture_idle_baseline() {
 	while [ "$baseline_phase_attempt" -le 2 ]; do
 		write_status quiet-check 19 "Checking that the selected uplink is idle before baseline attempt $baseline_phase_attempt"
 		measure_background_traffic
+		baseline_pre_dl_kbps="${background_dl_kbps:-0}"
+		baseline_pre_ul_kbps="${background_ul_kbps:-0}"
+		baseline_pre_reference_deferred="${background_reference_deferred:-false}"
 		baseline_prequiet=true
 		[ "$background_blocked" = true ] && baseline_prequiet=false
-		if [ "$baseline_prequiet" != true ]; then
+		if [ "$baseline_prequiet" != true ] && [ "${conservative_mode:-0}" != 1 ]; then
 			baseline_entry="{\"phase\":\"baseline\",\"attempt\":$baseline_phase_attempt,\"skipped\":true,\"prequiet\":false,\"postquiet\":false,\"icmp_valid\":false,\"transport_valid\":false,\"forwarded_background\":null}"
 			if [ -n "${phase_background_runs_json:-}" ]; then
 				phase_background_runs_json="$phase_background_runs_json,$baseline_entry"
@@ -2461,13 +2659,13 @@ capture_idle_baseline() {
 				baseline_phase_attempt=$((baseline_phase_attempt + 1))
 				continue
 			fi
-			stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":7,\"stage\":\"baseline\",\"error\":\"The uplink was busy before both idle baseline attempts. Retry when quiet; conservative mode cannot invent an idle p95.\",\"background_blocked\":true,\"retryable\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
+			stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":7,\"stage\":\"baseline\",\"error\":\"The uplink was busy before both idle baseline attempts. Retry when quiet or explicitly rerun with background-aware conservative safeguards.\",\"background_blocked\":true,\"retryable\":true,\"conservative_available\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
 			exit 1
 		fi
 
 		write_status baseline 22 "Measuring clean idle latency baseline (attempt $baseline_phase_attempt)"
 		phase_background_kind=baseline
-		start_phase_background_counter "$(configured_rate dl)" "$(configured_rate ul)"
+		start_phase_background_counter "$(phase_reference_rate dl)" "$(phase_reference_rate ul)"
 		baseline_valid=true
 		candidate_baseline="$(baseline_latency "$reflectors")" || baseline_valid=false
 		transport_baseline_valid=true
@@ -2476,6 +2674,9 @@ capture_idle_baseline() {
 
 		write_status quiet-check 25 "Checking that the uplink stayed idle through baseline attempt $baseline_phase_attempt"
 		measure_background_traffic
+		baseline_post_dl_kbps="${background_dl_kbps:-0}"
+		baseline_post_ul_kbps="${background_ul_kbps:-0}"
+		baseline_post_reference_deferred="${background_reference_deferred:-false}"
 		baseline_postquiet=true
 		[ "$background_blocked" = true ] && baseline_postquiet=false
 		baseline_traffic_contaminated="$phase_background_contaminated"
@@ -2484,14 +2685,14 @@ capture_idle_baseline() {
 		baseline_contaminated="$baseline_traffic_contaminated"
 		[ "$baseline_valid" = true ] || baseline_contaminated=true
 		[ "$transport_baseline_valid" = true ] || baseline_contaminated=true
-		baseline_entry="{\"phase\":\"baseline\",\"attempt\":$baseline_phase_attempt,\"prequiet\":$baseline_prequiet,\"postquiet\":$baseline_postquiet,\"icmp_valid\":$baseline_valid,\"transport_valid\":$transport_baseline_valid,\"forwarded_background\":$(phase_background_json)}"
+		baseline_entry="{\"phase\":\"baseline\",\"attempt\":$baseline_phase_attempt,\"prequiet\":$baseline_prequiet,\"postquiet\":$baseline_postquiet,\"icmp_valid\":$baseline_valid,\"transport_valid\":$transport_baseline_valid,\"total_interface_background\":{\"pre_download_kbps\":$baseline_pre_dl_kbps,\"pre_upload_kbps\":$baseline_pre_ul_kbps,\"post_download_kbps\":$baseline_post_dl_kbps,\"post_upload_kbps\":$baseline_post_ul_kbps,\"reference_deferred\":$([ "$baseline_pre_reference_deferred" = true ] || [ "$baseline_post_reference_deferred" = true ] && printf true || printf false)},\"forwarded_background\":$(phase_background_json)}"
 		if [ -n "${phase_background_runs_json:-}" ]; then
 			phase_background_runs_json="$phase_background_runs_json,$baseline_entry"
 		else
 			phase_background_runs_json="$baseline_entry"
 		fi
 
-		if [ "$baseline_contaminated" != true ]; then
+		if [ "$baseline_valid" = true ] && [ "$transport_baseline_valid" = true ]; then
 			set -- $candidate_baseline
 			idle_median_ms="$1"
 			idle_p95_ms="$2"
@@ -2503,7 +2704,28 @@ capture_idle_baseline() {
 			transport_idle_samples="$4"
 			[ "$baseline_samples" -ge 9 ] 2>/dev/null || baseline_valid=false
 			[ "$transport_idle_samples" -ge 15 ] 2>/dev/null || transport_baseline_valid=false
-			if [ "$baseline_valid" = true ] && [ "$transport_baseline_valid" = true ]; then
+			if [ "$baseline_valid" = true ] && [ "$transport_baseline_valid" = true ] &&
+			   { [ "$baseline_contaminated" != true ] ||
+			     { [ "${conservative_mode:-0}" = 1 ] && [ "$phase_background_available" = true ]; }; }; then
+				baseline_background_available="${phase_background_available:-false}"
+				baseline_background_dl_kbps="${phase_background_dl_kbps:-0}"
+				baseline_background_ul_kbps="${phase_background_ul_kbps:-0}"
+				baseline_reference_deferred=false
+				[ "${phase_background_reference_deferred:-false}" != true ] &&
+					[ "$baseline_pre_reference_deferred" != true ] &&
+					[ "$baseline_post_reference_deferred" != true ] || baseline_reference_deferred=true
+				# BusyBox awk rejects the compact a>b?a:b form on some OpenWrt
+				# builds.  Keep this deliberately verbose because empty maxima would
+				# invalidate the deferred baseline evidence JSON.
+				baseline_total_dl_kbps="$(awk -v a="$baseline_pre_dl_kbps" -v b="$baseline_post_dl_kbps" 'BEGIN { if (a + 0 > b + 0) print a + 0; else print b + 0 }')"
+				baseline_total_ul_kbps="$(awk -v a="$baseline_pre_ul_kbps" -v b="$baseline_post_ul_kbps" 'BEGIN { if (a + 0 > b + 0) print a + 0; else print b + 0 }')"
+				if [ "$baseline_contaminated" = true ]; then
+					phase_contamination_seen=true
+					unresolved_background_contamination=true
+					baseline_quality_provisional=true
+					download_background_unresolved=true
+					upload_background_unresolved=true
+				fi
 				phase_background_kind=""
 				return 0
 			fi
@@ -2535,6 +2757,90 @@ capture_idle_baseline() {
 		fail "Background traffic contaminated both idle baseline attempts. Conservative mode cannot reuse a contaminated idle p95."
 	done
 	return 1
+}
+
+validate_deferred_baseline_capacity() {
+	retrospective_dl_capacity="${1:-0}"
+	retrospective_ul_capacity="${2:-0}"
+	if [ "${baseline_reference_deferred:-false}" != true ] &&
+	   [ "${prethroughput_background_reference_deferred:-false}" != true ]; then
+		return 0
+	fi
+	is_positive_uint "$retrospective_dl_capacity" ||
+		fail "Deferred baseline validation has no trusted download capacity."
+	is_positive_uint "$retrospective_ul_capacity" ||
+		fail "Deferred baseline validation has no trusted upload capacity."
+
+	retrospective_total_dl_limit="$(strict_background_limit "$retrospective_dl_capacity" 0.05)"
+	retrospective_total_ul_limit="$(strict_background_limit "$retrospective_ul_capacity" 0.05)"
+	retrospective_forwarded_dl_limit="$(strict_background_limit "$retrospective_dl_capacity" 0.02)"
+	retrospective_forwarded_ul_limit="$(strict_background_limit "$retrospective_ul_capacity" 0.02)"
+	retrospective_pass=true
+	background_rate_exceeds "${baseline_total_dl_kbps:-0}" "$retrospective_total_dl_limit" && retrospective_pass=false
+	background_rate_exceeds "${baseline_total_ul_kbps:-0}" "$retrospective_total_ul_limit" && retrospective_pass=false
+	background_rate_exceeds "${baseline_background_dl_kbps:-0}" "$retrospective_forwarded_dl_limit" && retrospective_pass=false
+	background_rate_exceeds "${baseline_background_ul_kbps:-0}" "$retrospective_forwarded_ul_limit" && retrospective_pass=false
+	background_rate_exceeds "${prethroughput_background_dl_kbps:-0}" "$retrospective_total_dl_limit" && retrospective_pass=false
+	background_rate_exceeds "${prethroughput_background_ul_kbps:-0}" "$retrospective_total_ul_limit" && retrospective_pass=false
+	retrospective_contaminated=true
+	[ "$retrospective_pass" = true ] && retrospective_contaminated=false
+	# The provisional baseline was sampled before a capacity reference existed,
+	# so its shares were necessarily recorded as zero. Re-score every retained
+	# total-interface and forwarded observation now that the routed control has
+	# supplied real direction-specific capacities.
+	retrospective_dl_share_percent="$(awk \
+		-v a="${baseline_total_dl_kbps:-0}" \
+		-v b="${baseline_background_dl_kbps:-0}" \
+		-v c="${prethroughput_background_dl_kbps:-0}" \
+		-v r="$retrospective_dl_capacity" 'BEGIN {
+			m = a + 0; if (b + 0 > m) m = b + 0; if (c + 0 > m) m = c + 0
+			p = m * 100 / r; if (p > 999) p = 999; printf "%.1f", p
+		}')"
+	retrospective_ul_share_percent="$(awk \
+		-v a="${baseline_total_ul_kbps:-0}" \
+		-v b="${baseline_background_ul_kbps:-0}" \
+		-v c="${prethroughput_background_ul_kbps:-0}" \
+		-v r="$retrospective_ul_capacity" 'BEGIN {
+			m = a + 0; if (b + 0 > m) m = b + 0; if (c + 0 > m) m = c + 0
+			p = m * 100 / r; if (p > 999) p = 999; printf "%.1f", p
+		}')"
+	if awk -v a="$retrospective_dl_share_percent" -v b="${observed_background_dl_max_share_percent:-0}" 'BEGIN { exit(a > b ? 0 : 1) }'; then
+		observed_background_dl_max_share_percent="$retrospective_dl_share_percent"
+	fi
+	if awk -v a="$retrospective_ul_share_percent" -v b="${observed_background_ul_max_share_percent:-0}" 'BEGIN { exit(a > b ? 0 : 1) }'; then
+		observed_background_ul_max_share_percent="$retrospective_ul_share_percent"
+	fi
+
+	retrospective_entry="{\"phase\":\"baseline-retrospective\",\"passed\":$retrospective_pass,\"measured_capacity\":{\"download_kbps\":$retrospective_dl_capacity,\"upload_kbps\":$retrospective_ul_capacity},\"total_interface_background\":{\"baseline_download_kbps\":${baseline_total_dl_kbps:-0},\"baseline_upload_kbps\":${baseline_total_ul_kbps:-0},\"prethroughput_download_kbps\":${prethroughput_background_dl_kbps:-0},\"prethroughput_upload_kbps\":${prethroughput_background_ul_kbps:-0},\"download_limit_kbps\":$retrospective_total_dl_limit,\"upload_limit_kbps\":$retrospective_total_ul_limit,\"download_share_percent\":$retrospective_dl_share_percent,\"upload_share_percent\":$retrospective_ul_share_percent},\"forwarded_background\":{\"available\":${baseline_background_available:-false},\"contaminated\":$retrospective_contaminated,\"reference_deferred\":false,\"download_kbps\":${baseline_background_dl_kbps:-0},\"upload_kbps\":${baseline_background_ul_kbps:-0},\"download_reference_kbps\":$retrospective_dl_capacity,\"upload_reference_kbps\":$retrospective_ul_capacity,\"download_reference_known\":true,\"upload_reference_known\":true,\"download_limit_kbps\":$retrospective_forwarded_dl_limit,\"upload_limit_kbps\":$retrospective_forwarded_ul_limit}}"
+	if [ -n "${phase_background_runs_json:-}" ]; then
+		phase_background_runs_json="$phase_background_runs_json,$retrospective_entry"
+	else
+		phase_background_runs_json="$retrospective_entry"
+	fi
+
+	dl_reference="$retrospective_dl_capacity"
+	ul_reference="$retrospective_ul_capacity"
+	background_dl_reference_known=true
+	background_ul_reference_known=true
+	background_reference_deferred=false
+	background_dl_limit="$retrospective_total_dl_limit"
+	background_ul_limit="$retrospective_total_ul_limit"
+	background_dl_hard="$(strict_background_limit "$retrospective_dl_capacity" 0.35 5000)"
+	background_ul_hard="$(strict_background_limit "$retrospective_ul_capacity" 0.35 5000)"
+	if [ "$retrospective_pass" != true ] && [ "${conservative_mode:-0}" != 1 ]; then
+		phase_contamination_seen=true
+		stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":7,\"stage\":\"baseline-retrospective\",\"reason\":\"baseline-retrospectively-contaminated\",\"error\":\"The provisional idle baseline carried too much traffic relative to the measured link capacity. Retry when quieter or explicitly rerun with background-aware conservative safeguards.\",\"background_blocked\":true,\"retryable\":true,\"conservative_available\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"baseline_traffic\":$retrospective_entry,\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
+		exit 1
+	fi
+	if [ "$retrospective_pass" != true ]; then
+		phase_contamination_seen=true
+		unresolved_background_contamination=true
+		baseline_quality_provisional=true
+		download_background_unresolved=true
+		upload_background_unresolved=true
+	fi
+	baseline_reference_deferred=false
+	prethroughput_background_reference_deferred=false
 }
 
 start_transport_latency_monitor() {
@@ -3526,7 +3832,7 @@ run_measurement() {
 	while [ "$measurement_attempt" -le 2 ]; do
 		write_status throughput 40 "Running the unshaped full-path control (attempt $measurement_attempt)"
 		phase_background_kind=unshaped
-		start_phase_background_counter "$(configured_rate dl)" "$(configured_rate ul)"
+		start_phase_background_counter "$(phase_reference_rate dl)" "$(phase_reference_rate ul)"
 		fair_control_this_attempt=0
 		if [ "$autotune_profile" = fair ] && [ "$index" -eq 1 ]; then
 			if start_fair_control_monitors "$measurement_attempt"; then
@@ -3564,6 +3870,15 @@ run_measurement() {
 			fail "Speed test backend changed from $backend to ${result_backend:-unknown} during unshaped sample $index."
 		download="$(extract_json "$result" '@.download_kbps')"
 		upload="$(extract_json "$result" '@.upload_kbps')"
+		is_positive_uint "$download" || fail "Throughput sample $index returned no download rate."
+		is_positive_uint "$upload" || fail "Throughput sample $index returned no upload rate."
+		if [ "${phase_background_reference_deferred:-false}" = true ]; then
+			# A new instance has no trustworthy configured rate.  The speed test
+			# itself is router-originated and therefore absent from the forward
+			# counter, so its verified raw result safely resolves the relative
+			# client-traffic limit for this phase.
+			classify_phase_background "$download" "$upload"
+		fi
 		phase_entry="{\"phase\":\"unshaped\",\"sample\":$index,\"attempt\":$measurement_attempt,\"measured\":{\"download_kbps\":${download:-0},\"upload_kbps\":${upload:-0}},\"forwarded_background\":$(phase_background_json)}"
 		if [ -n "${phase_background_runs_json:-}" ]; then
 			phase_background_runs_json="$phase_background_runs_json,$phase_entry"
@@ -3579,6 +3894,9 @@ run_measurement() {
 				fail "Forwarded-traffic evidence was unavailable for both attempts of unshaped sample $index."
 			fi
 			if [ "${conservative_mode:-0}" = 1 ]; then
+				unresolved_background_contamination=true
+				download_background_unresolved=true
+				upload_background_unresolved=true
 				break
 			fi
 			stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":7,\"error\":\"Forwarded WAN traffic contaminated both attempts of unshaped sample $index. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"throughput\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
@@ -3614,6 +3932,8 @@ run_measurement() {
 		full_upload_samples="$upload"
 		runs_json="$result"
 	fi
+	calibration_capacity_dl_kbps="$download"
+	calibration_capacity_ul_kbps="$upload"
 }
 
 run_directional_control() {
@@ -3629,7 +3949,7 @@ run_directional_control() {
 		write_status throughput "$control_progress" \
 			"Running unshaped $control_direction-only control $control_index of 2 (attempt $control_attempt)"
 		phase_background_kind=unshaped
-		start_phase_background_counter "$(configured_rate dl)" "$(configured_rate ul)"
+		start_phase_background_counter "$(phase_reference_rate dl)" "$(phase_reference_rate ul)"
 		control_result_file="$job_dir/unshaped-$control_direction-$control_index-$control_attempt.result"
 		if ! run_speedtest_with_timeout "$control_result_file" \
 			"$job_name" "$target_if" run "$backend" "" "$route_mode" "$mwan3_member" "$control_direction"; then
@@ -3647,8 +3967,13 @@ run_directional_control() {
 			fail "Speed test helper reported ${control_reported_direction:-no direction} for the unshaped $control_direction-only control."
 		control_shaper_bypassed="$(extract_json "$control_result" '@.shaper_bypassed')"
 		control_sqm_paused="$(extract_json "$control_result" '@.sqm_paused')"
-		[ "$control_shaper_bypassed" = true ] && [ "$control_sqm_paused" = true ] ||
-			fail "The unshaped $control_direction-only control did not prove SQM bypass."
+		control_sqm_bypass_mode="$(extract_json "$control_result" '@.sqm_bypass_mode')"
+		[ "$control_shaper_bypassed" = true ] ||
+			fail "The unshaped $control_direction-only control did not prove shaper bypass."
+		case "$control_sqm_bypass_mode:$control_sqm_paused" in
+			paused-managed:true|already-unshaped:false) ;;
+			*) fail "The unshaped $control_direction-only control returned inconsistent SQM bypass evidence." ;;
+		esac
 		case "$control_direction" in
 			download) control_rate="$(extract_json "$control_result" '@.download_kbps')" ;;
 			upload) control_rate="$(extract_json "$control_result" '@.upload_kbps')" ;;
@@ -3669,6 +3994,11 @@ run_directional_control() {
 				stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":7,\"error\":\"Forwarded WAN traffic contaminated both $control_direction-only controls. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"directional-control-$control_direction\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
 				exit 1
 			fi
+			unresolved_background_contamination=true
+			case "$control_direction" in
+				download) download_background_unresolved=true ;;
+				upload) upload_background_unresolved=true ;;
+			esac
 			break
 		fi
 		control_attempt=$((control_attempt + 1))
@@ -3953,15 +4283,24 @@ evaluate_fair_control() {
 	fair_control_direction="$(extract_json "$fair_control_result" '@.test_direction')"
 	fair_control_bypassed="$(extract_json "$fair_control_result" '@.shaper_bypassed')"
 	fair_control_sqm_paused="$(extract_json "$fair_control_result" '@.sqm_paused')"
+	fair_control_sqm_bypass_mode="$(extract_json "$fair_control_result" '@.sqm_bypass_mode')"
 	if [ "$fair_control_direction" != both ]; then
 		fair_control_valid=false
 		fair_control_reason=control-direction-invalid
 	elif [ "$fair_control_bypassed" != true ]; then
 		fair_control_valid=false
 		fair_control_reason=control-shaper-proof-invalid
-	elif [ "$fair_control_sqm_paused" != true ] || [ "${temp_shaper_active:-0}" != 0 ]; then
+	elif [ "${temp_shaper_active:-0}" != 0 ]; then
 		fair_control_valid=false
 		fair_control_reason=control-sqm-proof-invalid
+	else
+		case "$fair_control_sqm_bypass_mode:$fair_control_sqm_paused" in
+			paused-managed:true|already-unshaped:false) ;;
+			*)
+				fair_control_valid=false
+				fair_control_reason=control-sqm-proof-invalid
+				;;
+		esac
 	fi
 	fair_control_icmp_stats="$job_dir/fair-control-icmp-$fair_control_attempt.tsv"
 	if [ "$fair_control_valid" = true ] &&
@@ -4034,7 +4373,7 @@ evaluate_fair_control() {
 	fair_control_transport_delta_ms="$(nonnegative_delta "$fair_control_transport_p95_ms" "$transport_idle_p95_ms")"
 	fair_control_effective_delta_ms="$(maximum_number "$fair_control_icmp_delta_ms" "$fair_control_transport_delta_ms")"
 	fair_control_grade="$(quality_grade_for_delta "$fair_control_effective_delta_ms")"
-	fair_control_json="{\"available\":true,\"measurement_evidence\":{\"valid\":true,\"reason\":\"ok\",\"test_direction\":\"both\",\"shaper_bypassed\":true,\"sqm_paused\":true},\"grade\":\"$(json_escape "$fair_control_grade")\",\"effective_delta_ms\":$fair_control_effective_delta_ms,\"throughput\":{\"download_kbps\":$(extract_json "$fair_control_result" '@.download_kbps'),\"upload_kbps\":$(extract_json "$fair_control_result" '@.upload_kbps')},\"icmp_latency\":{\"median_ms\":$fair_control_icmp_median_ms,\"p95_ms\":$fair_control_icmp_p95_ms,\"max_ms\":$fair_control_icmp_max_ms,\"idle_p95_ms\":$idle_p95_ms,\"delta_p95_ms\":$fair_control_icmp_delta_ms,\"samples\":$fair_control_icmp_samples,\"loss_percent\":$fair_control_loss_percent},\"transport_latency\":{\"backend\":\"$(json_escape "$transport_probe_backend")\",\"endpoint\":\"$(json_escape "$transport_probe_endpoint")\",\"median_ms\":$fair_control_transport_median_ms,\"p95_ms\":$fair_control_transport_p95_ms,\"max_ms\":$fair_control_transport_max_ms,\"idle_p95_ms\":$transport_idle_p95_ms,\"delta_p95_ms\":$fair_control_transport_delta_ms,\"samples\":$fair_control_transport_samples},\"cpu_peak_percent\":$fair_control_cpu_peak,\"cpu\":{\"effective_peak_percent\":$fair_control_cpu_peak,\"total_peak_percent\":$fair_control_cpu_total_peak,\"max_core_peak_percent\":$fair_control_cpu_core_peak,\"softirq_peak_percent\":$fair_control_softirq_peak,\"mean_effective_percent\":$fair_control_cpu_mean,\"p95_effective_percent\":$fair_control_cpu_p95,\"samples\":$fair_control_cpu_samples,\"over_limit_samples\":$fair_control_cpu_over_limit_samples,\"longest_over_limit_samples\":$fair_control_cpu_longest_over_limit,\"p95_softirq_percent\":$fair_control_softirq_p95},\"forwarded_background\":$(phase_background_json)}"
+	fair_control_json="{\"available\":true,\"measurement_evidence\":{\"valid\":true,\"reason\":\"ok\",\"test_direction\":\"both\",\"shaper_bypassed\":true,\"sqm_paused\":$fair_control_sqm_paused,\"sqm_bypass_mode\":\"$(json_escape "$fair_control_sqm_bypass_mode")\"},\"grade\":\"$(json_escape "$fair_control_grade")\",\"effective_delta_ms\":$fair_control_effective_delta_ms,\"throughput\":{\"download_kbps\":$(extract_json "$fair_control_result" '@.download_kbps'),\"upload_kbps\":$(extract_json "$fair_control_result" '@.upload_kbps')},\"icmp_latency\":{\"median_ms\":$fair_control_icmp_median_ms,\"p95_ms\":$fair_control_icmp_p95_ms,\"max_ms\":$fair_control_icmp_max_ms,\"idle_p95_ms\":$idle_p95_ms,\"delta_p95_ms\":$fair_control_icmp_delta_ms,\"samples\":$fair_control_icmp_samples,\"loss_percent\":$fair_control_loss_percent},\"transport_latency\":{\"backend\":\"$(json_escape "$transport_probe_backend")\",\"endpoint\":\"$(json_escape "$transport_probe_endpoint")\",\"median_ms\":$fair_control_transport_median_ms,\"p95_ms\":$fair_control_transport_p95_ms,\"max_ms\":$fair_control_transport_max_ms,\"idle_p95_ms\":$transport_idle_p95_ms,\"delta_p95_ms\":$fair_control_transport_delta_ms,\"samples\":$fair_control_transport_samples},\"cpu_peak_percent\":$fair_control_cpu_peak,\"cpu\":{\"effective_peak_percent\":$fair_control_cpu_peak,\"total_peak_percent\":$fair_control_cpu_total_peak,\"max_core_peak_percent\":$fair_control_cpu_core_peak,\"softirq_peak_percent\":$fair_control_softirq_peak,\"mean_effective_percent\":$fair_control_cpu_mean,\"p95_effective_percent\":$fair_control_cpu_p95,\"samples\":$fair_control_cpu_samples,\"over_limit_samples\":$fair_control_cpu_over_limit_samples,\"longest_over_limit_samples\":$fair_control_cpu_longest_over_limit,\"p95_softirq_percent\":$fair_control_softirq_p95},\"forwarded_background\":$(phase_background_json)}"
 }
 
 run_validation_direction_phase() {
@@ -4300,6 +4639,11 @@ run_validation_direction_phase() {
 			fail "Forwarded-traffic evidence was unavailable for both $phase_direction-only validation attempts."
 		fi
 		validation_contaminated=true
+		unresolved_background_contamination=true
+		case "$phase_direction" in
+			download) download_background_unresolved=true ;;
+			upload) upload_background_unresolved=true ;;
+		esac
 		break
 	done
 
@@ -4775,8 +5119,10 @@ worker_cleanup() {
 		else
 			# Keep pending diagnostics private.  The helper's recovery-failed
 			# result, armed journal, and interface lock remain authoritative for
-			# the detached watcher/procd retry after this owner exits.
-			rm -f "$status_file"
+			# the detached watcher/procd retry after this owner exits. Preserve the
+			# last status checkpoint as well: recovery uses it only when no valid
+			# pending terminal exists, and removes it after terminal publication.
+			true
 		fi
 	else
 		# No network mutation is allowed before the heartbeat is armed.
@@ -4852,6 +5198,17 @@ run_job() {
 	phase_background_runs_json=""
 	phase_evidence_complete=false
 	phase_contamination_seen=false
+	preflight_background_contaminated=false
+	baseline_quality_provisional=false
+	unresolved_background_contamination=false
+	download_background_unresolved=false
+	upload_background_unresolved=false
+	observed_background_dl_max_share_percent=0
+	observed_background_ul_max_share_percent=0
+	calibration_capacity_dl_kbps=""
+	calibration_capacity_ul_kbps=""
+	baseline_reference_deferred=false
+	prethroughput_background_reference_deferred=false
 	config_fingerprint=""
 	config_fingerprint_captured=false
 	speedtest_supervisor_reason=""
@@ -4953,6 +5310,7 @@ run_job() {
 	fair_control_json=null
 	fair_control_active=0
 	run_measurement 1
+	validate_deferred_baseline_capacity "$calibration_capacity_dl_kbps" "$calibration_capacity_ul_kbps"
 	run_directional_control download 1
 	run_directional_control download 2
 	run_directional_control upload 1
@@ -5142,12 +5500,12 @@ run_job() {
 	fi
 
 	write_status review 96 "Preparing validated review; no configuration has been written"
+	build_autotune_confidence
 	confidence_mode=normal
-	[ "$conservative_mode" = 1 ] && confidence_mode=low
+	[ "$overall_confidence_percent" -ge 85 ] || confidence_mode=low
 	auto_apply_eligible=false
 	manual_apply_eligible=false
-	if [ "$confidence_mode" = normal ] && [ "$phase_evidence_complete" = true ] &&
-		[ "$phase_contamination_seen" = false ] && [ "$validation_contaminated" = false ]; then
+	if [ "$phase_evidence_complete" = true ]; then
 		if [ "$profile_floor_infeasible" = true ]; then
 			# This only exposes fail-closed Review choices. apply_sqm is absent from
 			# the typed Fair action list and disabling SQM still requires its own
@@ -5155,12 +5513,13 @@ run_job() {
 			manual_apply_eligible=true
 		else
 			[ "$validation_safety_pass" = true ] && manual_apply_eligible=true
-			[ "$validation_safety_pass" = true ] && [ "$profile_target_met" = true ] &&
+			[ "$result_class" = trusted ] && [ "$validation_safety_pass" = true ] &&
+				[ "$profile_target_met" = true ] &&
 				[ "$validation_profile_objectives_met" = true ] &&
 				auto_apply_eligible=true
 		fi
 	fi
-	stage_terminal_json result "{\"state\":\"complete\",\"schema_version\":7,\"auto_apply_eligible\":$auto_apply_eligible,\"manual_apply_eligible\":$manual_apply_eligible,\"phase_evidence_complete\":$phase_evidence_complete,\"phase_contamination_seen\":$phase_contamination_seen,\"job_id\":\"$(json_escape "$job_name")\",\"target_interface\":\"$(json_escape "$target_if_input")\",\"resolved_interface\":\"$(json_escape "$target_if")\",\"source_ip\":\"$(json_escape "$source_ip")\",\"external_ip\":\"$(json_escape "$selected_external_ip")\",\"route_interface\":\"$(json_escape "$route_if")\",\"route_mode\":\"$(json_escape "$route_mode")\",\"mwan3_member\":\"$(json_escape "$mwan3_member")\",\"route_identity\":\"$(json_escape "$route_identity")\",\"link_kind\":\"$(json_escape "$link_kind")\",\"datapath\":$datapath_json,\"conservative\":$([ "$conservative_mode" = 1 ] && printf true || printf false),\"confidence_mode\":\"$confidence_mode\",\"background\":$(background_json),\"phase_background\":[$phase_background_runs_json],\"usable_directions\":{\"download\":${background_dl_usable:-true},\"upload\":${background_ul_usable:-true}},\"validation_thresholds\":{\"candidate_realization_min_percent\":$validation_candidate_realization_min_percent,\"candidate_realization_max_percent\":$validation_candidate_realization_max_percent,\"capacity_retention_min_percent\":$validation_capacity_retention_min_percent,\"throughput_safety_floor_percent\":50,\"delay_max_ms\":$validation_delay_max_ms,\"loss_max_percent\":$validation_loss_max_percent,\"cpu_max_percent\":$validation_cpu_max_percent},\"baseline\":{\"median_ms\":$idle_median_ms,\"p95_ms\":$idle_p95_ms,\"samples\":$baseline_samples,\"transport_median_ms\":$transport_idle_median_ms,\"transport_p95_ms\":$transport_idle_p95_ms,\"transport_samples\":$transport_idle_samples,\"transport_backend\":\"$(json_escape "$transport_probe_backend")\",\"transport_endpoint\":\"$(json_escape "$transport_probe_endpoint")\"},\"runs\":[$runs_json],\"validation_attempts\":[$validation_attempts_json],\"validation\":$validation_json,\"profile_outcome\":$profile_outcome_json,\"profile_search\":{\"download\":$dl_search_json,\"upload\":$ul_search_json},\"fair_outcome\":$fair_outcome_json,\"pinger_plan\":$pinger_plan,\"proposal\":$proposal,\"configuration_written\":false}"
+	stage_terminal_json result "{\"state\":\"complete\",\"schema_version\":8,\"result_available\":true,\"result_class\":\"$result_class\",\"confidence\":$confidence_json,\"auto_apply_eligible\":$auto_apply_eligible,\"manual_apply_eligible\":$manual_apply_eligible,\"phase_evidence_complete\":$phase_evidence_complete,\"phase_contamination_seen\":$phase_contamination_seen,\"job_id\":\"$(json_escape "$job_name")\",\"target_interface\":\"$(json_escape "$target_if_input")\",\"resolved_interface\":\"$(json_escape "$target_if")\",\"source_ip\":\"$(json_escape "$source_ip")\",\"external_ip\":\"$(json_escape "$selected_external_ip")\",\"route_interface\":\"$(json_escape "$route_if")\",\"route_mode\":\"$(json_escape "$route_mode")\",\"mwan3_member\":\"$(json_escape "$mwan3_member")\",\"route_identity\":\"$(json_escape "$route_identity")\",\"link_kind\":\"$(json_escape "$link_kind")\",\"datapath\":$datapath_json,\"conservative\":$([ "$conservative_mode" = 1 ] && printf true || printf false),\"confidence_mode\":\"$confidence_mode\",\"background\":$(background_json),\"phase_background\":[$phase_background_runs_json],\"usable_directions\":{\"download\":${background_dl_usable:-true},\"upload\":${background_ul_usable:-true}},\"validation_thresholds\":{\"candidate_realization_min_percent\":$validation_candidate_realization_min_percent,\"candidate_realization_max_percent\":$validation_candidate_realization_max_percent,\"capacity_retention_min_percent\":$validation_capacity_retention_min_percent,\"throughput_safety_floor_percent\":50,\"delay_max_ms\":$validation_delay_max_ms,\"loss_max_percent\":$validation_loss_max_percent,\"cpu_max_percent\":$validation_cpu_max_percent},\"baseline\":{\"median_ms\":$idle_median_ms,\"p95_ms\":$idle_p95_ms,\"samples\":$baseline_samples,\"transport_median_ms\":$transport_idle_median_ms,\"transport_p95_ms\":$transport_idle_p95_ms,\"transport_samples\":$transport_idle_samples,\"transport_backend\":\"$(json_escape "$transport_probe_backend")\",\"transport_endpoint\":\"$(json_escape "$transport_probe_endpoint")\"},\"runs\":[$runs_json],\"validation_attempts\":[$validation_attempts_json],\"validation\":$validation_json,\"profile_outcome\":$profile_outcome_json,\"profile_search\":{\"download\":$dl_search_json,\"upload\":$ul_search_json},\"fair_outcome\":$fair_outcome_json,\"pinger_plan\":$pinger_plan,\"proposal\":$proposal,\"configuration_written\":false}"
 }
 
 job_recovery_pending() {
@@ -5356,6 +5715,11 @@ cancel_job() {
 			cat "$status_file"
 			return 0
 		fi
+		# Do not turn a stale worker identity into a synthetic idle state.  A
+		# terminal file or an armed recovery journal remains authoritative, and
+		# an unexplained stale PID must stay visibly unsettled.
+		status_job
+		return 0
 	fi
 	printf '{"state":"idle"}\n'
 }

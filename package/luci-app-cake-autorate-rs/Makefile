@@ -6,8 +6,8 @@ override FAKEROOT :=
 endif
 
 PKG_NAME:=luci-app-cake-autorate-rs
-PKG_VERSION:=1.0_rc26
-PKG_RELEASE:=7
+PKG_VERSION:=1.0_rc27
+PKG_RELEASE:=2
 
 PKG_MAINTAINER:=woffko
 PKG_LICENSE:=Apache-2.0
@@ -24,6 +24,7 @@ define Package/luci-app-cake-autorate-rs
   PROVIDES:=luci-app-sqm
   CONFLICTS:=luci-app-sqm
   PKGARCH:=all
+  USERID:=cake-speedtest:cake-speedtest
 endef
 
 define Package/luci-app-cake-autorate-rs/description

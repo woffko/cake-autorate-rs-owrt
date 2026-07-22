@@ -6717,7 +6717,16 @@ fn parse_strict_bool(name: &str, value: &str) -> Result<bool, String> {
     }
 }
 
-fn subtract_background_samples(samples: &mut [f64], background_kbps: f64) -> Result<(), String> {
+/// Validate background metadata without changing the isolated speed-test
+/// samples. The speed-test helper reports only its own flow rate; forwarded
+/// client traffic is measured separately and must not be subtracted here.
+fn validated_conservative_samples(
+    samples: &[f64],
+    background_kbps: Option<f64>,
+) -> Result<&[f64], String> {
+    let Some(background_kbps) = background_kbps else {
+        return Ok(samples);
+    };
     if !background_kbps.is_finite()
         || !(0.0..=autotune::MAX_RATE_KBPS as f64).contains(&background_kbps)
     {
@@ -6726,11 +6735,7 @@ fn subtract_background_samples(samples: &mut [f64], background_kbps: f64) -> Res
             autotune::MAX_RATE_KBPS
         ));
     }
-    let safety_background = background_kbps * 1.25;
-    for sample in samples {
-        *sample = (*sample - safety_background).max(100.0);
-    }
-    Ok(())
+    Ok(samples)
 }
 
 fn current_direction(
@@ -6846,17 +6851,12 @@ where
         }
     }
 
-    let mut download = download.ok_or_else(|| "--dl-samples is required".to_string())?;
-    let mut upload = upload.ok_or_else(|| "--ul-samples is required".to_string())?;
+    let download = download.ok_or_else(|| "--dl-samples is required".to_string())?;
+    let upload = upload.ok_or_else(|| "--ul-samples is required".to_string())?;
     let conservative =
         conservative_background_dl_kbps.is_some() || conservative_background_ul_kbps.is_some();
-    if conservative {
-        subtract_background_samples(
-            &mut download,
-            conservative_background_dl_kbps.unwrap_or(0.0),
-        )?;
-        subtract_background_samples(&mut upload, conservative_background_ul_kbps.unwrap_or(0.0))?;
-    }
+    let download = validated_conservative_samples(&download, conservative_background_dl_kbps)?;
+    let upload = validated_conservative_samples(&upload, conservative_background_ul_kbps)?;
 
     let mut proposal = build_proposal_for_profile(
         &download,
@@ -7439,8 +7439,8 @@ mod tests {
         parse_tsping_line, parse_uci_values, pinger_command, pinger_response_interval_s,
         qdisc_output_has_cake, reflector_bad_reflectors, reflector_health_json,
         reflector_spare_reflectors, sample_is_stale, shaper_update_due, stall_detection_timeout,
-        status_publish_due, subtract_background_samples, throughput_floor, transport_error_code,
-        transport_probe_interval_s, transport_result_matches_route, uplink_error_code, Config,
+        status_publish_due, throughput_floor, transport_error_code, transport_probe_interval_s,
+        transport_result_matches_route, uplink_error_code, validated_conservative_samples, Config,
         MemoryInfo, RateMonitor, ReflectorHealth, ReflectorState, Sample, ThroughputGuardInput,
         UplinkState, CAKE_GROWTH_UPDATE_MIN_INTERVAL, STATUS_PUBLISH_INTERVAL,
         TRANSPORT_BASELINE_LEARNING_INTERVAL_S,
@@ -8137,15 +8137,22 @@ mod tests {
         for invalid in ["NaN", "inf", "-inf"] {
             assert!(parse_cli_f64("metric", invalid).is_err());
         }
-        let mut samples = [1_000.0];
         for invalid in [
             f64::NAN,
             f64::INFINITY,
             -1.0,
             autotune::MAX_RATE_KBPS as f64 + 1.0,
         ] {
-            assert!(subtract_background_samples(&mut samples, invalid).is_err());
+            assert!(validated_conservative_samples(&[1_000.0], Some(invalid)).is_err());
         }
+    }
+
+    #[test]
+    fn conservative_background_does_not_reduce_isolated_speedtest_samples() {
+        let samples = [780_162.0, 835_696.0];
+        let validated = validated_conservative_samples(&samples, Some(250_000.0)).unwrap();
+
+        assert_eq!(validated, samples);
     }
 
     #[test]
