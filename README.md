@@ -89,6 +89,17 @@ row. A clean package installation creates no instance until the user chooses
 
 [![Per-instance settings and actions](docs/screenshots/settings-overview.png)](docs/screenshots/settings-overview.png)
 
+The Edit dialog groups routing, rate limits, adaptive ceiling, probes, quality,
+controller, SQM, testing and monitoring controls instead of presenting one long
+form. See the current [categorized Autorate setup](docs/screenshots/settings-autorate-setup.png).
+
+**Full Auto-Tune** offers Gaming, Best overall and Fair calibration profiles,
+then measures the selected uplink and presents diagnostics before anything is
+written to UCI. Multi-WAN calibration keeps the route and evidence separate for
+each selected uplink.
+
+[![Full Auto-Tune calibration profiles](docs/screenshots/autotune-profiles.png)](docs/screenshots/autotune-profiles.png)
+
 ## Current package tree
 
 The current development tree builds these OpenWrt 25.12.5 APKs:
@@ -182,6 +193,9 @@ and authenticated Playwright checks.
 
 [Mobile preset view](docs/screenshots/traffic-priorities-mobile.png) ·
 [staged Custom copy](docs/screenshots/traffic-priorities-custom.png)
+
+The screenshots use anonymized instance, interface, host and address labels;
+rates and diagnostics remain representative of the live RC27 interface.
 
 ## Release history
 
