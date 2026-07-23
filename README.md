@@ -58,10 +58,14 @@ and responsibility remain with the human author.
   per-profile DSCP rule editor, its strict ownership boundary, outbound-only
   classification, rule order, runtime attestation, and Multi-WAN isolation.
 
-The current targets are OpenWrt 25.12.5 on `x86/64` and
-`rockchip/armv8` (`aarch64_generic`, including the Banana Pi R2 Pro). Native
-route-bound WebSocket/TCP/HTTP probing uses statically linked Rust TLS and
-socket libraries; ordinary OpenWrt runtime dependencies remain explicit below.
+The release targets OpenWrt 25.12 and publishes the daemon for the same 12
+package ABIs as the nftables [`mwan3` v3.6.11-1 release](https://github.com/dl12345/mwan3/releases/tag/v3.6.11-1):
+x86_64, four AArch64 variants, five ARMv7 variants, MIPS 24Kc and
+little-endian MIPS 24Kc. Run
+`apk --print-arch` on the router and select the identically suffixed daemon
+APK. Native route-bound WebSocket/TCP/HTTP probing uses statically linked Rust
+TLS and socket libraries; ordinary OpenWrt runtime dependencies remain
+explicit below.
 
 ## Interface overview
 
@@ -102,14 +106,30 @@ each selected uplink.
 
 ## Current package tree
 
-The current development tree builds these OpenWrt 25.12.5 APKs:
+The current development tree builds the OpenWrt 25.12 daemon APK for this ABI
+matrix:
 
-- `cake-autorate-rs-1.0_rc27-r1_openwrt-25.12_x86_64.apk` — x86_64
-  autorate daemon.
-- `cake-autorate-rs-1.0_rc27-r1_openwrt-25.12_aarch64_generic.apk` — rockchip/armv8
-  autorate daemon.
-- `luci-app-cake-autorate-rs-1.0_rc27-r2_openwrt-25.12_all.apk` —
-  architecture-independent LuCI interface and SQM integration.
+| APK suffix | Representative OpenWrt target |
+|---|---|
+| `x86_64` | `x86/64` |
+| `aarch64_cortex-a53` | `bcm27xx/bcm2710` |
+| `aarch64_cortex-a72` | `bcm27xx/bcm2711` |
+| `aarch64_cortex-a76` | `bcm27xx/bcm2712` |
+| `aarch64_generic` | `armsr/armv8`, `rockchip/armv8` |
+| `arm_cortex-a7` | `mediatek/mt7629` |
+| `arm_cortex-a7_neon-vfpv4` | `bcm27xx/bcm2709` |
+| `arm_cortex-a9` | `bcm53xx/generic` |
+| `arm_cortex-a9_vfpv3-d16` | `mvebu/cortexa9` |
+| `arm_cortex-a15_neon-vfpv4` | `armsr/armv7` |
+| `mips_24kc` | `ath79/generic` |
+| `mipsel_24kc` | little-endian 24Kc targets |
+
+The target is an APK ABI rather than one specific board. The authoritative
+choice is the value returned by `apk --print-arch`. Every daemon asset follows
+the name
+`cake-autorate-rs-1.0_rc27-r1_openwrt-25.12_<arch>.apk`; the shared
+`luci-app-cake-autorate-rs-1.0_rc27-r2_openwrt-25.12_all.apk` contains the
+architecture-independent LuCI interface and SQM integration.
 
 RC27 adds background-aware Full Auto-Tune confidence without mixing forwarded
 traffic into the isolated speed-test result. It reports separate download,
@@ -120,9 +140,9 @@ safeguards; a structurally safe lower-confidence proposal remains an explicit
 manual decision. CPU saturation is visible as a warning rather than a false
 quality failure. The release retains the explicit Automatic/Gaming/Best
 overall/Fair/Custom traffic-profile model and sequential per-member Multi-WAN
-calibration. Direct APK assets are provided for both daemon architectures plus
-the architecture-independent LuCI APK. Dependencies resolve through the
-router's configured OpenWrt package feeds; no offline bundle is attached.
+calibration. Direct APK assets are provided for all 12 daemon ABIs plus the
+architecture-independent LuCI APK. Dependencies resolve through the router's
+configured OpenWrt package feeds; no offline bundle is attached.
 
 ## Relationship to upstream cake-autorate
 
@@ -152,7 +172,7 @@ that controller:
 | Area | Original project | Added by this Rust/OpenWrt port |
 |---|---|---|
 | Runtime | Concurrent Bash processes and external pingers | One memory-safe Rust controller per UCI/procd instance, bounded parsers and native route-bound transport probes |
-| Platform | OpenWrt and Asuswrt-Merlin | OpenWrt 25.12 package feed/SDK integration for x86_64 and rockchip/armv8; Asuswrt-Merlin is not supported |
+| Platform | OpenWrt and Asuswrt-Merlin | OpenWrt 25.12 package feed/SDK integration for the published x86_64, AArch64, ARMv7 and MIPS ABI matrix; Asuswrt-Merlin is not supported |
 | Configuration | Shell configuration files | UCI source of truth, procd lifecycle, rpcd ACLs, and an integrated LuCI interface |
 | SQM ownership | Works with an existing CAKE/SQM setup | Creates, synchronizes, verifies, repairs, and uniquely owns each managed SQM/CAKE/IFB/redirect path while leaving unrelated queues alone |
 | Multiple links | Multiple script instances are possible | Structured main-table or nftables mwan3 member routing, one isolated instance/state/queue per uplink, route identity checks, failover states, and cross-WAN ownership guards |
@@ -588,9 +608,9 @@ configured base topic.
 
 ## Build In OpenWrt SDK
 
-Use a clean OpenWrt 25.12.5 SDK for either `x86/64` or `rockchip/armv8`. The
-Rust feed builds a large host Rust/LLVM toolchain on first use, so cache the SDK
-or use a prepared build image for normal iteration.
+Use a clean OpenWrt 25.12 SDK whose package architecture matches the required
+APK suffix. The Rust feed builds a large host Rust/LLVM toolchain on first use,
+so cache the SDK or use a prepared build image for normal iteration.
 
 Recommended feed workflow:
 
@@ -626,15 +646,13 @@ CONFIG_PACKAGE_rust=m
 ## Install
 
 Copy the matching daemon APK plus the noarch LuCI APK to the router and install
-them together. For x86_64:
+them together. Determine the daemon suffix first:
 
 ```sh
-apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc27-r1_openwrt-25.12_x86_64.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc27-r2_openwrt-25.12_all.apk
+apk --print-arch
 ```
 
-For rockchip/armv8 (`aarch64_generic`):
+For example, when it prints `aarch64_generic`:
 
 ```sh
 apk add --allow-untrusted \
