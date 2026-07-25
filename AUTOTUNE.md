@@ -38,6 +38,39 @@ accepted transaction has completed and no guard marker remains.
 > directly; terminal cleanup treats an absent or safely identified reused PID
 > as already stopped and never signals its new owner.
 
+## Planned transport-aware adaptive ceiling (proposal, not shipped)
+
+The following is a proposed next-step design and is not part of current runtime behavior:
+
+- The loop is per direction (`dl` / `ul`) and keeps explicit state fields:
+  - `safe_ceiling_{dir}`: highest proven safe runtime ceiling
+  - `failed_bound_{dir}`: upper bound inferred from the latest failed shaped candidate
+  - `runtime_minimum_{dir}`: lowest tested useful runtime point for the current route epoch
+  - `exploration_minimum_{dir}`: bounded lower search floor for retests
+- State transitions are staged as:
+  `idle → raw-calibration → restore → shaped-test → runtime-grow → runtime-reduce → hold → fail-closed`,
+  with each transition requiring per-direction route/runtime identity and transport evidence.
+- Raw calibration is a user-selected ingress-bypass transaction: only the
+  managed download CAKE/IFB path is removed, the selected uplink is measured,
+  and a recovery watchdog restores the exact prior runtime on success, cancel,
+  timeout, worker death, or browser loss. Upload shaping may stay active for a
+  directionally isolated test. Raw results seed search bounds and are never an
+  immediately applicable configuration.
+- Candidate progression is controlled by bounded shaped tests only; raw directional maxima set `safe_ceiling` search bounds, while failed shaped points update `failed_bound`.
+- Runtime growth is passive-only by default: growth is allowed only under proven sustained saturation plus clean transport-latency evidence. An explicitly enabled active mode may inject bounded traffic to test above the current ceiling.
+- Runtime reduction uses causal backoff: when delay does not improve after a controlled reduction, stop lowering and hold that direction in `hold`.
+- Keep both `runtime_minimum` and `exploration_minimum`; the former is the minimum operational rate, the latter gates exploratory retests.
+- Optional active probing is manual/opt-in and uses a strict periodic path. LuCI
+  must show estimated transfer per run/day/month, enforce a configured data
+  budget, and stop scheduling when the budget is exhausted.
+- User choice is split into calibration strategy (raw-capacity bypass,
+  shaped-only, or trusted-bound reuse), runtime learning (passive-only,
+  periodic active probes, or fixed bounds), and policy (latency-first,
+  balanced, throughput-first, or bypass recommendation).
+- Fail-closed remains unchanged: identity loss, counter contamination, transport parse/continuity issues, or confidence collapse keep the direction closed to changes and force conservative reporting.
+- Confidence reporting should stay explicit and directional (safe/provisional/limited) so policy and state transitions remain auditable.
+- Scheduler/unlimited limitations: proposed adaptive-capacity control assumes finite bounded maxima and is intended for bounded/scheduled operation; unlimited mode remains excluded until bounded safety evidence is proven for both directions.
+
 ## Safety contract
 
 - The job state and raw measurements live under
@@ -146,6 +179,7 @@ temporary shaped validation and final configuration.
 |---|---|---:|---:|---:|---:|---|
 | Gaming | Maximum safe throughput that still proves A+; otherwise the best attainable grade | A+ | 70% | `< 5 ms` | 1% | `layer_cake.qos`; upload/download `diffserv4`; preserve DSCP |
 | Best overall | Maximum safe throughput at A, with a balanced fallback | A | 80% | `< 30 ms` | 3% | `layer_cake.qos`; upload `diffserv4`; download best effort + wash |
+| Variable link | Find a measured CAKE-controlled latency knee on 4G/5G, satellite or wireless links | B | 70% | `< 60 ms` | 3% | `layer_cake.qos`; upload `diffserv4`; download best effort + wash |
 | Fair | Maximum safe throughput first; quality breaks near-throughput ties | C (soft) | 90% | `< 200 ms` | 5% | `layer_cake.qos`; upload `diffserv4`; download best effort + wash |
 
 All profiles also report a separate 50% historical retained-capacity trust
@@ -173,6 +207,28 @@ the search may reduce that rate even if doing so moves farther below an older
 5G capacity sample. Preserving the old sample would leave the bottleneck and
 its queue in the modem, which defeats SQM.
 No profile silently lowers its objective to manufacture unattended eligibility.
+
+Gaming also exposes a wizard-only **Extreme A+ search** opt-in. It does not
+become a persistent or scheduled profile. Ordinary Gaming never explores
+below 70% of the conservative raw reference. Extreme A+ may explore wider
+links more deeply using these direction-specific floors:
+
+| Conservative raw reference | Download exploration floor | Upload exploration floor |
+|---:|---:|---:|
+| below 20 Mbit/s | 70% | 70% |
+| 20–25 Mbit/s | 70% | 50% |
+| 25–100 Mbit/s | 55% | 50% |
+| 100–500 Mbit/s | 40% | 30% |
+| at least 500 Mbit/s | 25% | 25% |
+
+These are search boundaries, not inferred recommendations from game traffic.
+A runtime minimum is accepted only from an actually tested, shaper-controlled
+A+ observation. The highest safe A+ point remains the base rate; the lowest
+tested A+ point supplies optional autorate headroom. If either runtime minimum
+retains less than 70%, Auto-Apply is disabled even when the selected base rate
+passes every other gate. Review explicitly labels the result as suitable only
+for a time-limited latency-critical session and not recommended for continuous
+household use.
 
 Best overall is the default for new jobs and for existing instances which do
 not yet have `autotune_profile`. The old `balanced` CLI value is accepted as an
@@ -312,9 +368,13 @@ For each profile, the tuple below is
 
 | Profile | Stable direction | Variable direction |
 |---|---|---|
-| Gaming | `(0.60, 0.82, 0.92, 1.02)` | `(0.35, 0.75, 1.20, 1.60)` |
+| Gaming | `(0.70, 0.82, 0.92, 1.02)` | `(0.70, 0.75, 1.20, 1.60)` |
 | Best overall | `(0.70, 0.88, 0.95, 1.05)` | `(0.40, 0.85, 1.25, 1.80)` |
+| Variable link | `(0.35, 0.80, 1.25, 1.80)` | `(0.35, 0.80, 1.25, 1.80)` |
 | Fair | `(0.35, 0.94, 0.98, 1.08)` | `(0.35, 0.92, 1.30, 1.90)` |
+
+Extreme A+ uses the Gaming upper factors and the capacity-aware exploration
+floor from the table above.
 
 Rates are rounded to 100 kbit/s and then constrained to
 `minimum <= base <= maximum <= cap`. The deliberately wide variable maximum is

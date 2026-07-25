@@ -97,12 +97,57 @@ The Edit dialog groups routing, rate limits, adaptive ceiling, probes, quality,
 controller, SQM, testing and monitoring controls instead of presenting one long
 form. See the current [categorized Autorate setup](docs/screenshots/settings-autorate-setup.png).
 
-**Full Auto-Tune** offers Gaming, Best overall and Fair calibration profiles,
+**Full Auto-Tune** offers Gaming, Best overall, Variable link and Fair
+calibration profiles,
 then measures the selected uplink and presents diagnostics before anything is
 written to UCI. Multi-WAN calibration keeps the route and evidence separate for
-each selected uplink.
+each selected uplink. Gaming additionally has a one-run **Extreme A+ search**
+for wide links: it accepts only measured A+ minima, disables Auto-Apply below
+70% retained capacity, and warns that such a throughput sacrifice is intended
+for short latency-critical sessions rather than continuous household use.
 
 [![Full Auto-Tune calibration profiles](docs/screenshots/autotune-profiles.png)](docs/screenshots/autotune-profiles.png)
+
+### Controlled cellular observations (anonymized, not shipped behavior)
+
+The following controlled OpenWrt cellular-link sample runs are anonymized benchmark evidence and are **not** shipped behavior or guarantees.
+
+- Raw/unshaped path: **324–342 / 40–43 Mbps** observed with **C/C**.
+- Existing CAKE 114.5/15.8 produced **102–104 / 14.2** with DL **C** and UL **A**.
+- Upload-only shaping showed about **342 / 13.9** with DL **B** and UL **A**.
+- Simultaneous load comparison:
+  - no CAKE: **202 / 44.9**, D, **205 ms**
+  - 114.5/15.8: **107 / 11.7**, A, **17 ms**
+  - 250/15.8: **219 / 10.3**, B, **34.8 ms**
+  - 200/15.8: **180 / 11.7**, B, **31.6 ms**
+  - 175/15.8: **154 / 11.2**, A, **18.8 ms**
+
+ICMP samples in this set stayed around **10–13 ms** while TCP/WebSocket samples were **72–190 ms**. This is a measurable risk signal that some providers/networks may prioritize or specially treat ICMP, so ICMP-only grading can understate user-traffic latency.
+
+### Planned transport-aware adaptive ceiling (proposal, not shipped)
+
+Planned vNext behavior is scoped as a controlled runtime feature, separate from current release behavior:
+
+- Add per-direction adaptive state fields: `safe_ceiling_dl`, `safe_ceiling_ul`, `failed_bound_dl`, `failed_bound_ul`, `runtime_minimum_dl`, `runtime_minimum_ul`, `exploration_minimum_dl`, and `exploration_minimum_ul`.
+- Offer an explicit raw-capacity calibration mode which transactionally removes
+  only the managed download ingress CAKE/IFB path, measures the selected uplink,
+  and restores the exact prior runtime through a watchdog even if the worker or
+  browser disappears. Upload shaping may remain active when the selected test
+  requires it.
+- Run shaped control candidates through the same transport-aware validation path before lowering or raising rates.
+- Increase passively by default only when saturation and transport latency evidence remain clean across both ICMP and native transport signals. Optional active probes may test above the current bound, but only clean candidate evidence may update `safe_ceiling`; route changes and proven capacity collapse invalidate stale bounds.
+- Apply causal backoff: stop further downward tuning when measured delay does not improve after a controlled reduction, and hold direction at last-known good value.
+- Expose two operation envelopes: `runtime_minimum` (hard floor for runtime behavior) and `exploration_minimum` (bounded search floor).
+- Add optional, scheduler-driven active-probing rounds with explicit opt-in,
+  estimated transfer per run/day/month, a configurable data budget, and a hard
+  stop when that budget is exhausted.
+- Keep three user choices separate: calibration strategy (raw-capacity bypass,
+  shaped-only, or reuse trusted bounds), runtime learning (passive-only,
+  periodic active probes, or fixed bounds), and operating policy
+  (latency-first, balanced, throughput-first, or bypass recommendation).
+- Keep fail-closed behavior unchanged: any integrity, identity, or contamination failure preserves last safe state and emits lower-confidence fallback instead of changing runtime rates.
+- Report confidence per direction and aggregate confidence with explicit provenance (`safe`, `provisional`, `limited`) so policy choice is auditable.
+- Current limitation under this proposal is scheduler-unbounded/`unlimited` paths: the adaptive ceiling should only run when an explicit bounded max is in place and must remain disabled for unlimited mode until bounded safety bounds are proven.
 
 ## Current package tree
 
