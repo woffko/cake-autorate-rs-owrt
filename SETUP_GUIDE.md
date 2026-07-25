@@ -12,20 +12,41 @@ instance only after identifying the intended uplink.
    `wan — pppoe-wan — eth2`. For a normal single-WAN router use **Main routing
    table**. On nftables mwan3 select the member that resolves to this same L3
    device.
-3. Choose **Full Auto-Tune**, then select a calibration profile:
+3. Choose **Full Auto-Tune**, then make three independent choices:
 
-   - **Best overall** is recommended for most links. It finds the fastest safe
+   - **Calibration strategy:** **Shaped only** is the recommended low-disruption
+     start; **Full raw capacity** temporarily bypasses only the selected managed
+     CAKE direction and can transfer several GiB on a fast link; **Reuse trusted
+     bounds** avoids a new raw sweep only while route-bound evidence remains
+     valid.
+   - **Runtime learning:** **Passive only** learns from real saturated traffic;
+     **Periodic active probes** is opt-in and consumes the configured
+     daily/monthly allowance; **Fixed bounds** performs no synthetic growth
+     tests.
+   - **Operating profile:**
+
+     - **Best overall** is recommended for most links. It finds the fastest safe
      candidate that still proves A while retaining at least 80% of
      observed-low capacity. If A is unattainable, Review can show a balanced
      manual fallback.
-   - **Gaming** finds the fastest safe A+ candidate with a 70% throughput floor
+     - **Gaming** finds the fastest safe A+ candidate with a 70% throughput floor
      and configures CAKE
      `diffserv4`. The optional native Traffic priorities page can mark selected
      outbound game/interactive traffic without installing qosify or eBPF.
      Trusted WAN-ingress DSCP is still preserved, so use this profile only
      when downstream markings are acceptable. Enabling native rules resets
      upload DSCP to CS0 before applying the selected built-in/custom rules.
-   - **Fair** maximizes safe throughput with a 90% observed-low-capacity
+     For a deliberately time-limited latency-critical session, its
+     **Extreme A+ search** checkbox may test a wide link below 70%, down to 25%
+     on a 500+ Mbit/s direction. It keeps only measured A+ points, never runs
+     from the scheduler, and any result below 70% requires explicit manual
+     review. It is not recommended as a permanent household configuration.
+     - **Variable link** is intended for 4G/5G, satellite and other changing
+     links. It explores down to 35% only to measure the point at which further
+     CAKE reduction stops improving loaded latency. The runtime minimum is
+     written only from an actually tested point; noisy or uncontrolled curves
+     remain diagnostic-only.
+     - **Fair** maximizes safe throughput with a 90% observed-low-capacity
      objective. C is a soft goal: among candidates within 1.5% of
      the fastest result, lower loaded delay wins. This favors sustained large
      downloads/uploads over the strictest latency.
@@ -61,6 +82,13 @@ instance only after identifying the intended uplink.
 8. Enable **Graphs** only if RAM history is useful. Samples stay in `/var/run`
    and disappear on service stop or reboot. Start with the automatic memory
    budget and a 10-second interval.
+
+For scale, one anonymized cellular Full raw run reached roughly 403/46 Mbit/s.
+A 2 GiB hard allowance stopped it safely after the first shaped point, restored
+SQM and left UCI untouched; completing the whole Variable-link frontier at that
+speed may need about 4.5-6 GiB. Choose the budget before starting or use Shaped
+only. A high CPU value is a warning for router capacity, not an Auto-Tune
+blocker by itself.
 
 ## Existing instances
 

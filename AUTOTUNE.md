@@ -38,9 +38,10 @@ accepted transaction has completed and no guard marker remains.
 > directly; terminal cleanup treats an absent or safely identified reused PID
 > as already stopped and never signals its new owner.
 
-## Planned transport-aware adaptive ceiling (proposal, not shipped)
+## Transport-aware adaptive capacity (current development)
 
-The following is a proposed next-step design and is not part of current runtime behavior:
+The current development source implements this model. It is not published
+release behavior until a new release containing it is available:
 
 - The loop is per direction (`dl` / `ul`) and keeps explicit state fields:
   - `safe_ceiling_{dir}`: highest proven safe runtime ceiling
@@ -58,18 +59,34 @@ The following is a proposed next-step design and is not part of current runtime 
   immediately applicable configuration.
 - Candidate progression is controlled by bounded shaped tests only; raw directional maxima set `safe_ceiling` search bounds, while failed shaped points update `failed_bound`.
 - Runtime growth is passive-only by default: growth is allowed only under proven sustained saturation plus clean transport-latency evidence. An explicitly enabled active mode may inject bounded traffic to test above the current ceiling.
-- Runtime reduction uses causal backoff: when delay does not improve after a controlled reduction, stop lowering and hold that direction in `hold`.
+- Runtime reduction uses causal backoff: two controlled reductions without a
+  meaningful transport improvement restore the last useful point and hold that
+  direction in `HOLD_NO_EFFECT`.
 - Keep both `runtime_minimum` and `exploration_minimum`; the former is the minimum operational rate, the latter gates exploratory retests.
-- Optional active probing is manual/opt-in and uses a strict periodic path. LuCI
-  must show estimated transfer per run/day/month, enforce a configured data
-  budget, and stop scheduling when the budget is exhausted.
+- Optional active probing is manual/opt-in and uses a strict periodic path.
+  LuCI shows the next run and remaining allowance; a crash-safe reservation and
+  settlement ledger enforces per-instance daily/monthly byte budgets.
 - User choice is split into calibration strategy (raw-capacity bypass,
   shaped-only, or trusted-bound reuse), runtime learning (passive-only,
-  periodic active probes, or fixed bounds), and policy (latency-first,
-  balanced, throughput-first, or bypass recommendation).
+  periodic active probes, or fixed bounds), and operating profile (Gaming,
+  Best overall, Variable link, or Fair).
 - Fail-closed remains unchanged: identity loss, counter contamination, transport parse/continuity issues, or confidence collapse keep the direction closed to changes and force conservative reporting.
-- Confidence reporting should stay explicit and directional (safe/provisional/limited) so policy and state transitions remain auditable.
-- Scheduler/unlimited limitations: proposed adaptive-capacity control assumes finite bounded maxima and is intended for bounded/scheduled operation; unlimited mode remains excluded until bounded safety evidence is proven for both directions.
+- Confidence reporting stays explicit and directional
+  (safe/provisional/limited) so policy and state transitions remain auditable.
+
+Every frontier finishes with simultaneous DL+UL confirmation. If ordinary
+shaping is unsafe or poorly realized, Review can run a repeated upload-only
+shaped diagnostic with download ingress bypassed. It can recommend manual
+review, but it never silently removes a direction from the runtime topology.
+
+On an anonymized cellular link, a deliberate 2 GiB limit completed raw
+403/46 Mbit/s controls and a first shaped 220/30 Mbit/s point, then stopped
+before the next candidate with `traffic-budget-exhausted`. Runtime restoration
+was attested and no UCI was written. A complete Variable-link frontier at that
+capacity can require about 4.5-6 GiB. This is why synthetic probes are opt-in
+and budgeted. ICMP may look much cleaner than user transport on some networks;
+the worse corroborated ICMP or native transport delta remains authoritative.
+CPU is an advisory warning, not a standalone blocker.
 
 ## Safety contract
 
@@ -687,7 +704,7 @@ the unselected autorate/SQM instance continues running.
 
 `cake-autorate-autotune` is a lightweight procd service. Per-instance
 `scheduled_autotune_*` options select interval, local hour window, required
-quiet time, RAM-only daily traffic budget, and whether a validated result is
+quiet time, persistent daily/monthly traffic budgets, and whether a validated result is
 automatically applied. The feature defaults off, and auto-apply defaults off.
 The scheduler reuses the exact preflight, route identity, five raw controls,
 same-server directional search, selected-pair confirmation, cleanup, and fail-closed

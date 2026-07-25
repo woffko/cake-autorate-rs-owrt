@@ -4,6 +4,9 @@ set -eu
 base="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 . "$base/files/etc/init.d/cake-autorate"
 
+[ "$(canonical_traffic_autotune_profile gaming_extreme)" = gaming ]
+[ "$(canonical_traffic_autotune_profile gaming-extreme)" = gaming ]
+
 traffic_profile=""
 traffic_profile_migrated=""
 autotune_profile=gaming

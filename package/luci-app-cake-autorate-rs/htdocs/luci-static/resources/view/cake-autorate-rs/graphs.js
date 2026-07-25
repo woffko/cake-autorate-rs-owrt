@@ -36,7 +36,8 @@ function parseHistory(data) {
 	String(data || '').split(/\n/).forEach(function(line) {
 		var fields, timestamp, rtt, cpu, dl, ul, transport, effective, dlFloor, ulFloor,
 			uplinkState, routeIdentity, grade, gradeState, gradeIncrease, ratingPhase,
-			ratingDlSamples, ratingUlSamples;
+			ratingDlSamples, ratingUlSamples, adaptiveDlPhase, adaptiveUlPhase,
+			adaptiveDlReason, adaptiveUlReason, causalDlState, causalUlState, sqmRuntimeState;
 
 		if (!line)
 			return;
@@ -62,6 +63,13 @@ function parseHistory(data) {
 		ratingPhase = fields.length < 15 ? '' : fields[14];
 		ratingDlSamples = fields.length < 16 || fields[15] === '' ? null : Number(fields[15]);
 		ratingUlSamples = fields.length < 17 || fields[16] === '' ? null : Number(fields[16]);
+		adaptiveDlPhase = fields.length < 18 ? '' : fields[17];
+		adaptiveUlPhase = fields.length < 19 ? '' : fields[18];
+		adaptiveDlReason = fields.length < 20 ? '' : fields[19];
+		adaptiveUlReason = fields.length < 21 ? '' : fields[20];
+		causalDlState = fields.length < 22 ? '' : fields[21];
+		causalUlState = fields.length < 23 ? '' : fields[22];
+		sqmRuntimeState = fields.length < 24 ? '' : fields[23];
 		if (!isFinite(timestamp) || timestamp <= 0)
 			return;
 
@@ -82,7 +90,14 @@ function parseHistory(data) {
 			gradeIncrease: gradeIncrease == null || !isFinite(gradeIncrease) ? null : gradeIncrease,
 			ratingPhase: ratingPhase,
 			ratingDlSamples: ratingDlSamples == null || !isFinite(ratingDlSamples) ? null : ratingDlSamples,
-			ratingUlSamples: ratingUlSamples == null || !isFinite(ratingUlSamples) ? null : ratingUlSamples
+			ratingUlSamples: ratingUlSamples == null || !isFinite(ratingUlSamples) ? null : ratingUlSamples,
+			adaptiveDlPhase: adaptiveDlPhase,
+			adaptiveUlPhase: adaptiveUlPhase,
+			adaptiveDlReason: adaptiveDlReason,
+			adaptiveUlReason: adaptiveUlReason,
+			causalDlState: causalDlState,
+			causalUlState: causalUlState,
+			sqmRuntimeState: sqmRuntimeState
 		});
 	});
 
@@ -418,6 +433,9 @@ function collectChartEvents(geometry) {
 	var previousGrade = '';
 	var previousGradeState = '';
 	var previousPhase = '';
+	var previousAdaptiveReason = { dl: '', ul: '' };
+	var previousCausal = { dl: '', ul: '' };
+	var previousSqmState = '';
 
 	geometry.points.forEach(function(point) {
 		if (previous) {
@@ -473,6 +491,61 @@ function collectChartEvents(geometry) {
 		}
 		if (phase)
 			previousPhase = phase;
+
+		[ 'dl', 'ul' ].forEach(function(direction) {
+			var upper = direction.toUpperCase();
+			var adaptivePhase = point[direction === 'dl' ? 'adaptiveDlPhase' : 'adaptiveUlPhase'] || '';
+			var adaptiveReason = point[direction === 'dl' ? 'adaptiveDlReason' : 'adaptiveUlReason'] || '';
+			var causal = point[direction === 'dl' ? 'causalDlState' : 'causalUlState'] || '';
+			var eventLabel = '';
+			var eventShort = '';
+			var eventColor = '#8e44ad';
+
+			if (causal === 'no_cake_effect' && previousCausal[direction] !== causal) {
+				eventLabel = _('%s no CAKE effect').format(upper);
+				eventShort = _('%s NO EFFECT').format(upper);
+				eventColor = '#c0392b';
+			} else if (adaptiveReason && adaptiveReason !== previousAdaptiveReason[direction]) {
+				if (adaptiveReason === 'bounded probe opened' || adaptivePhase === 'probe_ramp') {
+					eventLabel = _('%s upward probe').format(upper);
+					eventShort = _('%s PROBE').format(upper);
+					eventColor = '#2980b9';
+				} else if (adaptiveReason === 'probe confirmed safe') {
+					eventLabel = _('%s safe bound promoted').format(upper);
+					eventShort = _('%s SAFE').format(upper);
+					eventColor = '#16a085';
+				} else if (adaptivePhase === 'backoff' || /bufferbloat|expired|timed out|gap/.test(adaptiveReason)) {
+					eventLabel = _('%s backoff: %s').format(upper, adaptiveReason);
+					eventShort = _('%s BACKOFF').format(upper);
+					eventColor = '#d08b20';
+				}
+			}
+			if (eventLabel) {
+				events.push({
+					timestamp: point.timestamp,
+					kind: 'adaptive', label: eventLabel, shortLabel: eventShort,
+					color: eventColor, dash: [ 5, 3 ]
+				});
+			}
+			if (adaptiveReason)
+				previousAdaptiveReason[direction] = adaptiveReason;
+			if (causal)
+				previousCausal[direction] = causal;
+		});
+
+		if (point.sqmRuntimeState && point.sqmRuntimeState !== previousSqmState &&
+		    (point.sqmRuntimeState === 'RECOVERING' || previousSqmState === 'RECOVERING')) {
+			events.push({
+				timestamp: point.timestamp,
+				kind: 'recovery',
+				label: point.sqmRuntimeState === 'RECOVERING' ? _('SQM recovery') : _('SQM recovered'),
+				shortLabel: point.sqmRuntimeState === 'RECOVERING' ? _('RECOVER') : _('RESTORED'),
+				color: point.sqmRuntimeState === 'RECOVERING' ? '#d08b20' : '#16a085',
+				dash: [ 6, 3 ]
+			});
+		}
+		if (point.sqmRuntimeState)
+			previousSqmState = point.sqmRuntimeState;
 		previous = point;
 	});
 
@@ -882,6 +955,7 @@ function renderCard(instance) {
 	var totalSamples = Number(instance.historyTotal || (instance.history || []).length);
 	var pageOffset = Number(instance.historyOffset || 0);
 	var button = E('button', {
+		'type': 'button',
 		'class': enabled ? 'btn cbi-button cbi-button-negative' : 'btn cbi-button cbi-button-action',
 		'data-enabled': enabled ? '1' : '0'
 	}, enabled ? _('Disable history') : _('Enable history'));
@@ -927,13 +1001,16 @@ function renderCard(instance) {
 			'style': 'visibility:hidden'
 		}, _('Move the pointer over a graph to inspect a sample.'));
 		var latestButton = E('button', {
+			'type': 'button',
 			'class': 'btn cbi-button cbi-button-neutral cake-graph-latest'
 		}, _('Latest'));
 		var olderButton = E('button', {
+			'type': 'button',
 			'class': 'btn cbi-button cbi-button-neutral cake-graph-page',
 			'disabled': totalSamples > pageOffset + (instance.history || []).length ? null : ''
 		}, _('Older'));
 		var newerButton = E('button', {
+			'type': 'button',
 			'class': 'btn cbi-button cbi-button-neutral cake-graph-page',
 			'disabled': pageOffset > 0 ? null : ''
 		}, _('Newer'));

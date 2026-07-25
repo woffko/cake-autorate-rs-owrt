@@ -14,7 +14,7 @@ node -e '
 const fs = require("node:fs");
 const value = process.argv[2].replace(/^@\.?/, "").split(".").filter(Boolean)
   .reduce((current, key) => current == null ? undefined : current[key],
-    JSON.parse(fs.readFileSync(process.argv[1], "utf8")));
+    JSON.parse(fs.readFileSync(process.argv[1] || 0, "utf8")));
 if (value !== undefined && value !== null)
   process.stdout.write(typeof value === "object" ? JSON.stringify(value) : String(value));
 ' "$input" "$expression"

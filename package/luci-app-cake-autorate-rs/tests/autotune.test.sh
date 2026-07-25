@@ -50,6 +50,21 @@ export AUTOTUNE_MOCK_DIRECTION_LOG="$work/test-directions"
 export AUTOTUNE_MOCK_CONFIGURED_DL_KBPS=50000
 export AUTOTUNE_MOCK_CONFIGURED_UL_KBPS=10000
 
+cat > "$work/procd-job" <<'EOF'
+#!/bin/sh
+[ "$1" = launch ] || exit 1
+log_file="$4"
+shift 4
+command="$1"
+shift
+setsid "$command" "$@" </dev/null >>"$log_file" 2>&1 6>&- &
+pid="$!"
+start="$(sed 's/^.*) //' "/proc/$pid/stat" | awk '{ print $20; exit }')"
+printf '{"pid":%s,"starttime":%s}\n' "$pid" "$start"
+EOF
+chmod +x "$work/procd-job"
+export CAKE_AUTORATE_PROCD_JOB="$work/procd-job"
+
 # Minimal OpenWrt images such as the production x86 Multi-WAN router provide
 # neither od nor cksum. Worker/shaper identity must come directly from the
 # kernel UUID source and stay a strict 32-hex value; no late fallback may turn
@@ -131,6 +146,28 @@ CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
 	worker_request_matches any
 ' sh "$autotune" "$work"
 
+# A scheduled run measures the selected uplink's aggregate RX+TX counters from
+# one job-wide baseline. Counter resets are rejected instead of silently
+# granting a fresh traffic allowance.
+mkdir -p "$work/budget-net/eth0/statistics"
+printf '%s\n' 1000 > "$work/budget-net/eth0/statistics/rx_bytes"
+printf '%s\n' 2000 > "$work/budget-net/eth0/statistics/tx_bytes"
+CAKE_AUTORATE_SYS_CLASS_NET="$work/budget-net" \
+CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
+	set -eu
+	. "$1"
+	target_if=eth0
+	traffic_budget_bytes=10000
+	traffic_budget_start_bytes="$(interface_total_bytes "$target_if")"
+	[ "$traffic_budget_start_bytes" = 3000 ]
+	printf "%s\n" 4500 > "$2/eth0/statistics/rx_bytes"
+	printf "%s\n" 3500 > "$2/eth0/statistics/tx_bytes"
+	[ "$(traffic_budget_consumed_bytes)" = 5000 ]
+	printf "%s\n" 1 > "$2/eth0/statistics/rx_bytes"
+	printf "%s\n" 1 > "$2/eth0/statistics/tx_bytes"
+	! traffic_budget_consumed_bytes >/dev/null
+' sh "$autotune" "$work/budget-net"
+
 # Typed pinger reconstruction keeps IRTT targets separate from the independently
 # selected RTT baseline pool and rejects option/shell-like helper output.
 CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
@@ -163,6 +200,21 @@ CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
 	[ "$overall_confidence_percent" = 100 ]
 	[ "$result_class" = trusted ]
 	[ "$confidence_json" = "{\"overall_percent\":100,\"capacity_download_percent\":100,\"capacity_upload_percent\":100,\"quality_percent\":100,\"reasons\":[]}" ]
+
+	validation_candidate_realization_min_percent=80
+	dl_candidate_realization=77.729
+	ul_candidate_realization=63.459
+	build_autotune_confidence
+	[ "$capacity_download_confidence_percent" = 78 ]
+	[ "$capacity_upload_confidence_percent" = 63 ]
+	[ "$quality_confidence_percent" = 100 ]
+	[ "$overall_confidence_percent" = 63 ]
+	[ "$result_class" = provisional ]
+	case "$confidence_json" in
+		*"\"code\":\"candidate-realization-download\""*"\"code\":\"candidate-realization-upload\""*) ;;
+		*) exit 1 ;;
+	esac
+	unset dl_candidate_realization ul_candidate_realization validation_candidate_realization_min_percent
 
 	observed_background_dl_max_share_percent=12
 	observed_background_ul_max_share_percent=35
@@ -263,7 +315,8 @@ grep -q '"validation":{"profile":"best_overall","pass":true' "$work/status.json"
 grep -q '"manual_apply_eligible":true' "$work/status.json"
 grep -q '"comparison":"direction-matched-observed-low"' "$work/status.json"
 grep -q '"profile_outcome":{"mode":"target-a-met"' "$work/status.json"
-grep -q '"profile_search":{"download":{"schema_version":1' "$work/status.json"
+grep -q '"profile_search":{"download":{"schema_version":2' "$work/status.json"
+grep -q '"bidirectional_confirmation":{"tested":true,"safety_pass":true,"auto_apply_pass":true' "$work/status.json"
 grep -q '"auto_apply_eligible":true' "$work/status.json"
 grep -q '"phase_evidence_complete":true' "$work/status.json"
 grep -Eq '"config_fingerprint":"sha256:[0-9a-f]{64}"' "$work/status.json"
@@ -287,6 +340,25 @@ test "$(sed -n '5p' "$work/test-directions")" = upload
 test "$(sed -n '6p' "$work/test-directions")" = download
 test "$(sed -n '7p' "$work/test-directions")" = upload
 wait_for_job_cleanup fullauto
+
+# Explicit shaped-only calibration keeps managed SQM present during its
+# capacity/control samples; only the later temporary candidate validations use
+# the ordinary shaped test path.
+: > "$work/counter"
+export AUTOTUNE_MOCK_CALIBRATION_SHAPED=1
+"$autotune" shapedstrategy lo start speedtest-go '' '' best_overall 0 '' 0 shaped_only > "$work/shapedstrategy-start.json"
+attempt=0
+while [ "$attempt" -lt 800 ]; do
+	"$autotune" shapedstrategy lo status speedtest-go > "$work/shapedstrategy-status.json"
+	grep -q '"state":"complete"' "$work/shapedstrategy-status.json" && break
+	attempt=$((attempt + 1))
+	sleep 0.02
+done
+grep -q '"state":"complete"' "$work/shapedstrategy-status.json"
+grep -q '"phase":"shaped_only"' "$work/shapedstrategy-status.json"
+! grep -q '"phase":"full_raw"' "$work/shapedstrategy-status.json"
+wait_for_job_cleanup shapedstrategy
+unset AUTOTUNE_MOCK_CALIBRATION_SHAPED
 
 # Regression: choosing conservative continuation is consent to measure in the
 # presence of background traffic, not a permanent low-confidence verdict. A
@@ -602,6 +674,10 @@ if (result.state !== 'complete' || result.validation.pass !== true ||
     result.validation.correction.action !== 'none' ||
     result.auto_apply_eligible !== true || result.manual_apply_eligible !== true)
 	throw new Error('advisory CPU load incorrectly blocked a reliable proposal');
+if (!result.bidirectional_confirmation || result.bidirectional_confirmation.safety_pass !== true ||
+    result.bidirectional_confirmation.cpu_warning !== true ||
+    result.bidirectional_confirmation.advisory_reason !== 'cpu-load-high')
+	throw new Error('bidirectional CPU load was not retained as a non-blocking warning');
 for (const direction of ['download', 'upload']) {
 	const gate = result.validation.gates.find(item => item.code === `${direction}-cpu`);
 	if (!gate || gate.required !== false || gate.pass !== false)
@@ -618,6 +694,42 @@ for (const direction of ['download', 'upload']) {
 EOF
 wait_for_job_cleanup cpuadvisory
 unset AUTOTUNE_MOCK_COMPUTE_CEILING
+
+# A candidate which is safe in both isolated directions but misses the latency
+# target under simultaneous load remains reviewable and manual-only. Throughput
+# is retained; the joint quality evidence, not CPU, blocks Auto-Apply.
+: > "$work/counter"
+export AUTOTUNE_MOCK_BIDI_HIGH_LATENCY=1
+export AUTOTUNE_MOCK_UPLOAD_ONLY_SAFE=1
+"$autotune" bidilatency lo start speedtest-go > "$work/bidilatency-start.json"
+attempt=0
+while [ "$attempt" -lt 260 ]; do
+	"$autotune" bidilatency lo status speedtest-go > "$work/bidilatency-status.json"
+	grep -q '"state":"complete"' "$work/bidilatency-status.json" && break
+	attempt=$((attempt + 1))
+	sleep 0.05
+done
+node - "$work/bidilatency-status.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const bidi = result.bidirectional_confirmation;
+const directional = result.directional_recommendation;
+if (result.state !== 'complete' || !bidi || bidi.tested !== true ||
+    bidi.safety_pass !== false || bidi.auto_apply_pass !== false ||
+    bidi.advisory_reason !== 'loaded-latency-target-missed' ||
+    result.auto_apply_eligible !== false || result.manual_apply_eligible !== true ||
+    !result.profile_outcome || result.profile_outcome.manual_only !== true ||
+    result.profile_outcome.target_met !== false || !directional ||
+    directional.tested !== true || directional.recommended_topology !== 'upload_only_shaped' ||
+    directional.manual_only !== true || directional.repeatable !== true ||
+    !Array.isArray(directional.observations) || directional.observations.length !== 2 ||
+    directional.observations.some(item => item.pass !== true ||
+        item.observation.measurement_evidence.sqm_bypass_mode !== 'ingress-only-managed' ||
+        item.observation.measurement_evidence.sqm_paused !== false))
+	throw new Error('unsafe simultaneous latency did not produce a manual-only review result');
+EOF
+wait_for_job_cleanup bidilatency
+unset AUTOTUNE_MOCK_BIDI_HIGH_LATENCY AUTOTUNE_MOCK_UPLOAD_ONLY_SAFE
 
 # Stable low-realization samples must make the optimizer step down and prove a
 # controlled candidate. A resulting retention shortfall remains manual-only.
@@ -871,6 +983,146 @@ test "$compact_failure_rc" -eq 1
 grep -q '"stage":"shaped"' "$compact_failure_marker"
 grep -q 'Selected route went offline during calibration' "$compact_failure_marker"
 grep -q '"phase_evidence_complete":false' "$compact_failure_marker"
+
+# Directional topology comparison is explicit, repeatable evidence. Shaped-only
+# calibration must not bypass ingress, and even a proven upload-only benefit is
+# diagnostic/manual-only until the runtime owns that topology safely.
+(
+	export CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1
+	# shellcheck disable=SC1090
+	. "$autotune"
+	calibration_strategy=shaped_only
+	bidirectional_safety_pass=false
+	bidirectional_realization_pass=false
+	build_directional_recommendation
+	printf '%s\n' "$directional_recommendation_json" > "$work/directional-shaped-only.json"
+)
+node - "$work/directional-shaped-only.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (result.tested !== false || result.recommended_topology !== 'manual_review' ||
+    result.reason !== 'directional-bypass-not-authorized' || result.manual_only !== true)
+	throw new Error('shaped-only strategy did not fail closed before directional bypass');
+EOF
+
+(
+	export CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1
+	# shellcheck disable=SC1090
+	. "$autotune"
+	calibration_strategy=full_raw
+	bidirectional_attempt=3
+	bidirectional_safety_pass=false
+	bidirectional_realization_pass=true
+	bidirectional_latency_pass=false
+	bidirectional_loss_pass=true
+	bidirectional_download_kbps=42000
+	bidirectional_effective_delta_ms=60
+	dl_base=45000
+	ul_base=9000
+	validation_delay_max_ms=30
+	validation_loss_max_percent=1
+	validation_candidate_realization_min_percent=80
+	directional_mock_count=0
+	write_status() { :; }
+	run_validation_direction_phase() {
+		directional_mock_count=$((directional_mock_count + 1))
+		phase_achieved_dl_kbps=50000
+		phase_achieved_ul_kbps=9000
+		phase_icmp_delta_ms=4
+		phase_transport_delta_ms=8
+		phase_loss_percent=0
+		phase_observation_json="{\"topology\":\"upload_only_shaped\",\"sequence\":$directional_mock_count,\"measurement_evidence\":{\"shaper_bypassed\":true,\"sqm_paused\":false,\"sqm_bypass_mode\":\"ingress-only-managed\"}}"
+	}
+	build_directional_recommendation
+	printf '%s\n' "$directional_recommendation_json" > "$work/directional-upload-only.json"
+)
+node - "$work/directional-upload-only.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (result.tested !== true || result.recommended_topology !== 'upload_only_shaped' ||
+    result.reason !== 'repeatable-download-bypass-benefit' || result.manual_only !== true ||
+    result.repeatable !== true || result.observations.length !== 2 ||
+    result.observations.some(item => item.pass !== true))
+	throw new Error('repeatable upload-only evidence was not preserved as a manual recommendation');
+EOF
+
+(
+	export CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1
+	# shellcheck disable=SC1090
+	. "$autotune"
+	calibration_strategy=full_raw
+	bidirectional_attempt=3
+	bidirectional_safety_pass=false
+	bidirectional_realization_pass=true
+	bidirectional_latency_pass=false
+	bidirectional_loss_pass=true
+	bidirectional_download_kbps=42000
+	bidirectional_effective_delta_ms=60
+	dl_base=45000
+	ul_base=9000
+	validation_delay_max_ms=30
+	validation_loss_max_percent=1
+	validation_candidate_realization_min_percent=80
+	directional_mock_count=0
+	write_status() { :; }
+	run_validation_direction_phase() {
+		directional_mock_count=$((directional_mock_count + 1))
+		phase_achieved_dl_kbps=50000
+		phase_achieved_ul_kbps=9000
+		phase_icmp_delta_ms=4
+		phase_transport_delta_ms=8
+		[ "$directional_mock_count" -eq 1 ] || phase_achieved_dl_kbps=35000
+		phase_loss_percent=0
+		phase_observation_json="{\"topology\":\"upload_only_shaped\",\"sequence\":$directional_mock_count}"
+	}
+	build_directional_recommendation
+	printf '%s\n' "$directional_recommendation_json" > "$work/directional-noisy.json"
+)
+node - "$work/directional-noisy.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (result.recommended_topology !== 'manual_review' || result.manual_only !== true ||
+    result.reason !== 'upload-only-benefit-not-repeatable' || result.repeatable !== false)
+	throw new Error('inconsistent directional evidence did not fail closed to manual review');
+EOF
+
+(
+	export CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1
+	# shellcheck disable=SC1090
+	. "$autotune"
+	bidirectional_latency_pass=true
+	bidirectional_loss_pass=false
+	bidirectional_download_kbps=42000
+	bidirectional_effective_delta_ms=2
+	phase_achieved_dl_kbps=50000
+	phase_achieved_ul_kbps=9000
+	phase_icmp_delta_ms=29
+	phase_transport_delta_ms=20
+	phase_loss_percent=0
+	phase_observation_json='{}'
+	dl_base=45000
+	ul_base=9000
+	validation_delay_max_ms=30
+	validation_loss_max_percent=1
+	validation_candidate_realization_min_percent=80
+	evaluate_upload_only_observation
+	[ "$upload_only_latency_pass" = true ]
+	[ "$upload_only_loss_pass" = true ]
+	[ "$upload_only_effect_pass" = false ]
+	[ "$upload_only_observation_pass" = false ]
+)
+
+(
+	export CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1
+	# shellcheck disable=SC1090
+	. "$autotune"
+	speedtest_bypass_scope=egress
+	run_speedtest_with_timeout() {
+		[ "$speedtest_bypass_scope" = ingress ]
+	}
+	run_speedtest_with_bypass_scope ingress ignored
+	[ "$speedtest_bypass_scope" = egress ]
+)
 
 # Auto must resolve once to a concrete backend. Backends without a pinnable
 # server identity and any backend drift in a result fail before proposal math.
@@ -1231,6 +1483,40 @@ wait_for_job_cleanup phaseunknown
 test ! -e "$work/jobs/phaseunknown/status.json"
 unset CAKE_AUTORATE_AUTOTUNE_TEST_PHASE_BACKGROUND_UNAVAILABLE
 
+# A scheduled worker enforces its passed byte allowance while the speed-test
+# group is live. Exhaustion terminates only that verified group, clears the
+# active-test journal, and publishes a typed retryable budget failure.
+: > "$work/counter"
+mkdir -p "$work/budget-runtime/lo/statistics"
+printf '%s\n' 100 > "$work/budget-runtime/lo/statistics/rx_bytes"
+printf '%s\n' 100 > "$work/budget-runtime/lo/statistics/tx_bytes"
+export CAKE_AUTORATE_SYS_CLASS_NET="$work/budget-runtime"
+export AUTOTUNE_MOCK_BLOCK_AT_COUNT=1
+export AUTOTUNE_MOCK_BLOCK_STARTED="$work/budget-block-started"
+export AUTOTUNE_MOCK_RESTORE_MARKER="$work/budget-group-terminated"
+"$autotune" budgetstop lo start speedtest-go '' '' best_overall 0 '' 1000 full_raw > "$work/budgetstop-start.json"
+attempt=0
+while [ "$attempt" -lt 260 ]; do
+	[ -e "$AUTOTUNE_MOCK_BLOCK_STARTED" ] && break
+	attempt=$((attempt + 1))
+	sleep 0.05
+done
+[ -e "$AUTOTUNE_MOCK_BLOCK_STARTED" ]
+printf '%s\n' 1200 > "$work/budget-runtime/lo/statistics/rx_bytes"
+printf '%s\n' 1200 > "$work/budget-runtime/lo/statistics/tx_bytes"
+attempt=0
+while [ "$attempt" -lt 260 ]; do
+	"$autotune" budgetstop lo status speedtest-go > "$work/budgetstop-status.json"
+	grep -q '"state":"failed"' "$work/budgetstop-status.json" && break
+	attempt=$((attempt + 1))
+	sleep 0.05
+done
+grep -q '"reason":"traffic-budget-exhausted"' "$work/budgetstop-status.json"
+grep -q '"limit_bytes":1000' "$work/budgetstop-status.json"
+test -f "$work/budget-group-terminated"
+wait_for_job_cleanup budgetstop
+unset CAKE_AUTORATE_SYS_CLASS_NET AUTOTUNE_MOCK_BLOCK_AT_COUNT AUTOTUNE_MOCK_BLOCK_STARTED AUTOTUNE_MOCK_RESTORE_MARKER
+
 export AUTOTUNE_MOCK_BLOCK=1
 export AUTOTUNE_MOCK_RESTORE_MARKER="$work/restored"
 export AUTOTUNE_MOCK_BLOCK_STARTED="$work/block-started"
@@ -1451,6 +1737,18 @@ printf '%s\n' "$gaming_proposal" | grep -q '"script":"layer_cake.qos","classific
 printf '%s\n' "$gaming_proposal" | grep -q '"iqdisc_opts":"diffserv4","eqdisc_opts":"diffserv4"'
 tampered_gaming="$(printf '%s\n' "$gaming_proposal" | sed 's/"classification":"diffserv4"/"classification":"besteffort"/')"
 if proposal_json_valid "$tampered_gaming"; then exit 1; fi
+autotune_profile=gaming_extreme
+extreme_proposal="$(calculate_proposal)"
+proposal_json_valid "$extreme_proposal"
+printf '%s\n' "$extreme_proposal" | grep -q '"profile":"gaming_extreme","target_grade":"A+"'
+# 50 Mbit/s DL uses the 55% band, while a 10 Mbit/s UL keeps the narrow-link
+# 70% boundary. The one-run mode must never starve a narrow uplink.
+printf '%s\n' "$extreme_proposal" | grep -q '"download":{"minimum_kbps":27500'
+printf '%s\n' "$extreme_proposal" | grep -q '"upload":{"minimum_kbps":7000'
+extreme_measured_proposal="$(calculate_proposal 1 1 30000 7000)"
+proposal_json_valid "$extreme_measured_proposal"
+printf '%s\n' "$extreme_measured_proposal" | grep -q '"download":{"minimum_kbps":30000'
+printf '%s\n' "$extreme_measured_proposal" | grep -q '"upload":{"minimum_kbps":7000'
 autotune_profile=fair
 fair_proposal="$(calculate_proposal)"
 proposal_json_valid "$fair_proposal"
@@ -2046,5 +2344,25 @@ grep -q '"required_floor_kbps":782200' "$work/rc16-decision.json"
 if grep -q '"scale":0.950000' "$work/rc16-decision.json"; then
 	exit 1
 fi
+
+# A large settled diagnostic must not be reparsed and returned by every LuCI
+# poll. status-summary stays compact, while result returns the exact terminal
+# object once under the UI's extended result timeout.
+mkdir -p "$work/jobs/largeterminal"
+node - "$work/jobs/largeterminal/result.json" <<'EOF'
+const fs = require('node:fs');
+fs.writeFileSync(process.argv[2], JSON.stringify({
+	state: 'complete', schema_version: 8, producer: 'cake-autorate-rs-autotune',
+	job_id: 'largeterminal', run_id: 'large-run', runtime_restored: true,
+	recovery_pending: false, padding: 'x'.repeat(180000)
+}) + '\n');
+EOF
+"$autotune" largeterminal lo status-summary speedtest-go > "$work/large-summary.json"
+grep -q '"terminal_available":true' "$work/large-summary.json"
+grep -q '"job_id":"largeterminal"' "$work/large-summary.json"
+[ "$(wc -c < "$work/large-summary.json")" -lt 1024 ]
+[ -s "$work/jobs/largeterminal/terminal.integrity" ]
+"$autotune" largeterminal lo result speedtest-go > "$work/large-result.json"
+cmp "$work/jobs/largeterminal/result.json" "$work/large-result.json"
 
 printf '%s\n' 'autotune lifecycle tests passed'

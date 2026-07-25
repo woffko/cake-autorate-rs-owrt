@@ -52,6 +52,13 @@ assert(source.includes('Configure profile-specific outbound DSCP rules for this 
 	'the per-instance ownership boundary must be explicit in LuCI');
 assert(source.includes('Download packets reach the SQM IFB before these nftables hooks'),
 	'LuCI must not claim that outbound nft rules classify download traffic');
+for (const match of source.matchAll(/o\.depends\('preset', 'custom'\);([\s\S]{0,100})/g))
+	assert.match(match[1], /o\.retain = true;/,
+		'custom rule values hidden by a preset must survive modal saves');
+for (const [index, button] of source.split("E('button', {").slice(1).entries()) {
+	assert.match(button.slice(0, 160), /'type': 'button'/,
+		`custom priorities button ${index + 1} must not submit the surrounding LuCI form`);
+}
 assert(source.includes("s.option(form.ListValue, 'traffic_profile'") &&
 	source.includes("o.widget = 'radio'") && source.includes("o.value('auto'") &&
 	source.includes("o.value('custom'"),

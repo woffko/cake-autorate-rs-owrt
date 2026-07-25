@@ -203,6 +203,9 @@ state_value() {
 		cake-autorate.test.sqm_section) echo cake_test ;;
 		cake-autorate.test.speedtest_backend) echo auto ;;
 		cake-autorate.test.autotune_profile) echo best_overall ;;
+		cake-autorate.test.autotune_calibration_strategy) echo shaped_only ;;
+		cake-autorate.test.scheduled_autotune_max_traffic_mb_day) echo 4096 ;;
+		cake-autorate.test.scheduled_autotune_max_traffic_mb_month) echo 16384 ;;
 		cake-autorate.test.route_mode) echo "${CONFIG_ROUTE_MODE:-main}" ;;
 		cake-autorate.test.mwan3_member)
 			[ -n "${CONFIG_MWAN3_MEMBER:-}" ] || return 1
@@ -334,6 +337,7 @@ export TEST_STAGE_SEEN="$stage_seen"
 export TEST_ROUTE_COUNT="$route_count"
 export TEST_LOCK_ROOT="$tmp/locks"
 export CAKE_AUTOTUNE_SCHEDULER_STATE_ROOT="$tmp/state"
+export CAKE_AUTOTUNE_BUDGET_STORE_ROOT="$tmp/persistent-budget"
 export CAKE_AUTOTUNE_SERVICE="$tmp/service"
 export CAKE_AUTOTUNE_ROUTE_HELPER="$tmp/route-helper"
 export CAKE_AUTORATE_RUNTIME_LOCK_ROOT="$tmp/locks"
@@ -345,6 +349,37 @@ export CAKE_AUTOTUNE_SCHEDULER_SOURCE_ONLY=1
 	echo 'scheduler default daemon path does not match the installed binary' >&2
 	exit 1
 }
+
+# Monthly accounting is atomic, persistent outside /var/run, and contributes a
+# second hard bound independently of the RAM-only daily counter.
+record_monthly_budget test 1234
+read -r persisted_month persisted_bytes < "$CAKE_AUTOTUNE_BUDGET_STORE_ROOT/test.monthly"
+[ "$persisted_month" = "$(date +%Y%m)" ]
+[ "$persisted_bytes" = 1234 ]
+[ "$(monthly_budget_remaining_bytes test)" = "$((16384 * 1024 * 1024 - 1234))" ]
+# Reservation is charged before a job starts, then atomically replaced with
+# measured usage.  A reservation intentionally remains charged after a crash.
+reserve_monthly_budget test 4096
+settle_monthly_budget test 4096 "$(date +%Y%m)" 2000
+read -r persisted_month persisted_bytes < "$CAKE_AUTOTUNE_BUDGET_STORE_ROOT/test.monthly"
+[ "$persisted_bytes" = 3234 ]
+reserve_monthly_budget test 8192
+read -r persisted_month persisted_bytes < "$CAKE_AUTOTUNE_BUDGET_STORE_ROOT/test.monthly"
+[ "$persisted_bytes" = 11426 ]
+[ "$(monthly_budget_remaining_bytes test)" = "$((16384 * 1024 * 1024 - 11426))" ]
+# Crossing a month boundary must not subtract an old reservation from the new
+# ledger. Charge the complete observed delta to the new month instead.
+printf '%s %s\n' 190001 4096 > "$CAKE_AUTOTUNE_BUDGET_STORE_ROOT/test.monthly"
+settle_monthly_budget test 4096 190001 2000
+read -r persisted_month persisted_bytes < "$CAKE_AUTOTUNE_BUDGET_STORE_ROOT/test.monthly"
+[ "$persisted_month" = "$(date +%Y%m)" ]
+[ "$persisted_bytes" = 2000 ]
+rm -f "$CAKE_AUTOTUNE_BUDGET_STORE_ROOT/test.monthly"
+scheduler_snapshot="$(scheduler_status test)"
+case "$scheduler_snapshot" in
+	*'"enabled":false'*'"daily":{"limit_bytes":4294967296,"used_bytes":0,"remaining_bytes":4294967296}'*'"monthly":{"limit_bytes":17179869184,"used_bytes":0,"remaining_bytes":17179869184}'*) ;;
+	*) printf '%s\n' "unexpected scheduler status: $scheduler_snapshot" >&2; exit 1 ;;
+esac
 
 # Exercise the production daemon identity check against a synthetic /proc
 # tree before replacing health probes with deterministic apply-test stubs.
@@ -883,6 +918,8 @@ cat > "$tmp/poll-helper" <<'EOF'
 #!/bin/sh
 [ "$7" = best_overall ] || exit 3
 [ "$8" = 0 ] || exit 4
+[ "${10:-0}" = "${EXPECTED_TRAFFIC_BUDGET:-0}" ] || exit 5
+[ "${11:-}" = shaped_only ] || exit 6
 case "$3" in
 	start)
 		printf '%s\n' start >> "$TEST_POLL_LOG"
@@ -909,6 +946,7 @@ chmod +x "$tmp/poll-helper"
 export TEST_POLL_LOG="$tmp/poll.log"
 export TEST_POLL_COUNT="$tmp/poll.count"
 export TEST_POLL_SEQUENCE="$tmp/poll.sequence"
+export EXPECTED_TRAFFIC_BUDGET=4096
 helper="$tmp/poll-helper"
 poll_interval_s=1
 interface_bytes() { printf '%s\n' "${TEST_INTERFACE_BYTES:-3000}"; }
@@ -944,14 +982,14 @@ assert_attempt_accounted() {
 
 prepare_poll_case
 printf '%s\n' recovery-pending complete > "$TEST_POLL_SEQUENCE"
-run_section test eth0 "$(date +%s)" 1000 "$fingerprint_a"
+run_section test eth0 "$(date +%s)" 1000 "$fingerprint_a" 4096
 grep -q '"state":"proposal_ready"' "$state_root/test.json"
 [ "$(cat "$TEST_POLL_COUNT")" = 2 ]
 assert_attempt_accounted
 
 prepare_poll_case
 printf '%s\n' background-blocked > "$TEST_POLL_SEQUENCE"
-run_section test eth0 "$(date +%s)" 1000 "$fingerprint_a"
+run_section test eth0 "$(date +%s)" 1000 "$fingerprint_a" 4096
 grep -q '"state":"deferred"' "$state_root/test.json"
 [ "$(cat "$TEST_POLL_COUNT")" = 1 ]
 assert_attempt_accounted
@@ -959,28 +997,28 @@ assert_attempt_accounted
 prepare_poll_case
 export POLL_REASON=config-changed
 printf '%s\n' inconclusive > "$TEST_POLL_SEQUENCE"
-run_section test eth0 "$(date +%s)" 1000 "$fingerprint_a"
+run_section test eth0 "$(date +%s)" 1000 "$fingerprint_a" 4096
 grep -q 'config-changed' "$state_root/test.json"
 grep -q '"state":"deferred"' "$state_root/test.json"
 assert_attempt_accounted
 
 prepare_poll_case
 printf '%s\n' future-unknown-state > "$TEST_POLL_SEQUENCE"
-run_section test eth0 "$(date +%s)" 1000 "$fingerprint_a"
+run_section test eth0 "$(date +%s)" 1000 "$fingerprint_a" 4096
 grep -q '"state":"failed"' "$state_root/test.json"
 grep -q 'unknown state' "$state_root/test.json"
 assert_attempt_accounted
 
 prepare_poll_case
 printf '%s\n' command-error > "$TEST_POLL_SEQUENCE"
-run_section test eth0 "$(date +%s)" 1000 "$fingerprint_a"
+run_section test eth0 "$(date +%s)" 1000 "$fingerprint_a" 4096
 grep -q 'status could not be read' "$state_root/test.json"
 assert_attempt_accounted
 
 prepare_poll_case
 export POLL_START_RC=1
 printf '%s\n' complete > "$TEST_POLL_SEQUENCE"
-run_section test eth0 "$(date +%s)" 1000 "$fingerprint_a"
+run_section test eth0 "$(date +%s)" 1000 "$fingerprint_a" 4096
 grep -q 'Unable to start' "$state_root/test.json"
 [ "$(cat "$TEST_POLL_LOG")" = start ]
 assert_attempt_accounted
@@ -988,7 +1026,7 @@ assert_attempt_accounted
 for terminal_state in failed cancelled idle; do
 	prepare_poll_case
 	printf '%s\n' "$terminal_state" > "$TEST_POLL_SEQUENCE"
-	run_section test eth0 "$(date +%s)" 1000 "$fingerprint_a"
+	run_section test eth0 "$(date +%s)" 1000 "$fingerprint_a" 4096
 	grep -q 'no configuration was written' "$state_root/test.json"
 	[ "$(cat "$TEST_POLL_COUNT")" = 1 ]
 	assert_attempt_accounted
@@ -997,7 +1035,7 @@ done
 prepare_poll_case
 job_timeout_s=1
 printf '%s\n' running > "$TEST_POLL_SEQUENCE"
-run_section test eth0 "$(date +%s)" 1000 "$fingerprint_a"
+run_section test eth0 "$(date +%s)" 1000 "$fingerprint_a" 4096
 grep -q 'timed out' "$state_root/test.json"
 grep -qx cancel "$TEST_POLL_LOG"
 assert_attempt_accounted
@@ -1006,7 +1044,7 @@ job_timeout_s=1800
 prepare_poll_case
 job_timeout_s=1
 printf '%s\n' recovery-pending > "$TEST_POLL_SEQUENCE"
-run_section test eth0 "$(date +%s)" 1000 "$fingerprint_a"
+run_section test eth0 "$(date +%s)" 1000 "$fingerprint_a" 4096
 grep -q '"state":"recovery-pending"' "$state_root/test.json"
 if grep -qx cancel "$TEST_POLL_LOG"; then
 	echo 'scheduler cancelled a recovery-pending helper' >&2
@@ -1027,7 +1065,7 @@ printf '%s\n' \
 	'S|cake-autorate.test.wan_if|eth0' > "$committed"
 resolve_interface() { printf '%s\n' eth0; }
 idle_ready() { return 0; }
-budget_ready() { return 0; }
+budget_remaining_bytes() { printf '%s\n' 4096; }
 configuration_fingerprint() { printf '%s\n' "$fingerprint_a"; }
 scheduled_called="$tmp/scheduled-called"
 rm -f "$scheduled_called"

@@ -91,12 +91,13 @@ cat > "$autotune/wan_sqm/result.json" <<EOF
 	  "profile_outcome":{"mode":"target-a-met","objective":"balanced-quality-throughput",
 	    "target_grade":"A","target_met":true,"actual_grade":"A","capacity_floor_percent":80,
 	    "capacity_floor_met":true,"throughput_safety_floor_percent":50,
-	    "throughput_safety_floor_met":true,"infeasible_reason":"","manual_only":false,
+	    "throughput_safety_floor_met":true,"deep_runtime_minimum":false,
+	    "runtime_minimum_retention":null,"infeasible_reason":"","manual_only":false,
 	    "selected_pair":{"download_kbps":80000,"upload_kbps":20000}},
   "profile_search":{
-    "download":{"schema_version":1,"profile":"best_overall","direction":"download",
+    "download":{"schema_version":2,"profile":"best_overall","direction":"download",
       "action":"complete","selected":{"candidate_kbps":80000,"safety_pass":true,"target_met":true}},
-    "upload":{"schema_version":1,"profile":"best_overall","direction":"upload",
+    "upload":{"schema_version":2,"profile":"best_overall","direction":"upload",
       "action":"complete","selected":{"candidate_kbps":20000,"safety_pass":true,"target_met":true}}},
   "pinger_plan":{"recommended_method":"fping","recommended_no_pingers":3,
     "recommended_reflectors":["1.1.1.1","9.9.9.9","8.8.8.8"]},
@@ -290,6 +291,79 @@ gaming_token="$(printf '%s\n' "$gaming_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)
 [ "$(uci -c "$guard/$gaming_token/expected" -q get cake-autorate.wan_sqm.sqm_squash_dscp)" = 0 ]
 [ "$(uci -c "$guard/$gaming_token/expected" -q get cake-autorate.wan_sqm.sqm_iqdisc_opts)" = diffserv4 ]
 $helper abort "$gaming_token" >/dev/null
+
+# Extreme A+ is a one-run calibration mode. Its result must attest a tested
+# runtime minimum, while the persistent runtime profile remains ordinary
+# Gaming so scheduled calibration cannot silently repeat the deep search.
+node - "$autotune/wan_sqm/result.json" <<'EOF'
+const fs = require('node:fs');
+const path = process.argv[2];
+const result = JSON.parse(fs.readFileSync(path, 'utf8'));
+result.profile = 'gaming_extreme';
+result.validation.profile = 'gaming_extreme';
+result.proposal.profile = 'gaming_extreme';
+result.profile_outcome.mode = 'extreme-a-plus-met';
+result.profile_outcome.deep_runtime_minimum = false;
+for (const direction of [ 'download', 'upload' ]) {
+	const search = result.profile_search[direction];
+	const selected = search.selected.candidate_kbps;
+	search.profile = 'gaming_extreme';
+	search.exploration_minimum_kbps = result.proposal[direction].minimum_kbps;
+	search.runtime_minimum_kbps = selected;
+	search.runtime_minimum_observation_index = 1;
+	search.inconclusive = false;
+	search.evaluated = [ { candidate_kbps: selected } ];
+	result.proposal[direction].minimum_kbps = selected;
+}
+result.profile_outcome.runtime_minimum_retention = {
+	download_percent: Math.round(result.proposal.download.minimum_kbps * 1000 /
+		result.proposal.download.observed_low_kbps) / 10,
+	upload_percent: Math.round(result.proposal.upload.minimum_kbps * 1000 /
+		result.proposal.upload.observed_low_kbps) / 10,
+};
+fs.writeFileSync(path, JSON.stringify(result));
+EOF
+extreme_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint")"
+extreme_token="$(printf '%s\n' "$extreme_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
+[ "$(uci -c "$guard/$extreme_token/expected" -q get cake-autorate.wan_sqm.autotune_profile)" = gaming ]
+[ "$(uci -c "$guard/$extreme_token/expected" -q get cake-autorate.wan_sqm.min_dl_shaper_rate_kbps)" = \
+  "$(uci -c "$guard/$extreme_token/expected" -q get cake-autorate.wan_sqm.base_dl_shaper_rate_kbps)" ]
+$helper abort "$extreme_token" >/dev/null
+
+# A tested A+ runtime minimum below 70% must remain reviewable but may never
+# become an unattended apply, even when the selected upper candidate itself
+# passes every profile objective.
+node - "$autotune/wan_sqm/result.json" <<'EOF'
+const fs = require('node:fs');
+const path = process.argv[2];
+const result = JSON.parse(fs.readFileSync(path, 'utf8'));
+result.auto_apply_eligible = false;
+result.profile_outcome.mode = 'extreme-a-plus-throughput-sacrifice';
+result.profile_outcome.manual_only = true;
+result.profile_outcome.deep_runtime_minimum = true;
+const retention = {};
+for (const direction of [ 'download', 'upload' ]) {
+	const proposal = result.proposal[direction];
+	const runtimeMinimum = Math.round(proposal.observed_low_kbps * 0.6);
+	const search = result.profile_search[direction];
+	search.exploration_minimum_kbps = Math.round(proposal.observed_low_kbps * 0.25);
+	search.runtime_minimum_kbps = runtimeMinimum;
+	search.runtime_minimum_observation_index = 1;
+	search.evaluated = [ { candidate_kbps: runtimeMinimum } ];
+	proposal.minimum_kbps = runtimeMinimum;
+	retention[direction + '_percent'] =
+		Math.round(runtimeMinimum * 1000 / proposal.observed_low_kbps) / 10;
+}
+result.profile_outcome.runtime_minimum_retention = retention;
+fs.writeFileSync(path, JSON.stringify(result));
+EOF
+extreme_deep_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint")"
+extreme_deep_token="$(printf '%s\n' "$extreme_deep_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
+[ "${#extreme_deep_token}" -eq 64 ]
+[ "$(uci -c "$guard/$extreme_deep_token/expected" -q get cake-autorate.wan_sqm.autotune_profile)" = gaming ]
+[ "$(uci -c "$guard/$extreme_deep_token/expected" -q get cake-autorate.wan_sqm.min_dl_shaper_rate_kbps)" = 51000 ]
+[ "$(uci -c "$guard/$extreme_deep_token/expected" -q get cake-autorate.wan_sqm.min_ul_shaper_rate_kbps)" = 12600 ]
+$helper abort "$extreme_deep_token" >/dev/null
 cp "$work/result.valid" "$autotune/wan_sqm/result.json"
 
 # A clean candidate that realizes its current CAKE rate may remain explicitly
@@ -664,13 +738,14 @@ result.profile_outcome = {
 	target_grade: 'C', target_met: false, actual_grade: 'D',
 	capacity_floor_percent: 90, manual_only: true,
 	capacity_floor_met: true, throughput_safety_floor_percent: 50,
-	throughput_safety_floor_met: true, infeasible_reason: '',
+	throughput_safety_floor_met: true, deep_runtime_minimum: false,
+	runtime_minimum_retention: null, infeasible_reason: '',
 	selected_pair: { download_kbps: 80000, upload_kbps: 20000 }
 };
 result.profile_search = {
-	download: { schema_version: 1, profile: 'fair', direction: 'download', action: 'complete',
+	download: { schema_version: 2, profile: 'fair', direction: 'download', action: 'complete',
 		selected: { candidate_kbps: 80000, safety_pass: true, target_met: false } },
-	upload: { schema_version: 1, profile: 'fair', direction: 'upload', action: 'complete',
+	upload: { schema_version: 2, profile: 'fair', direction: 'upload', action: 'complete',
 		selected: { candidate_kbps: 20000, safety_pass: true, target_met: false } }
 };
 result.fair_outcome = {

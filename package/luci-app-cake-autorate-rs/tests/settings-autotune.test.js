@@ -8,8 +8,30 @@ const sourcePath = path.join(__dirname, '..', 'htdocs', 'luci-static', 'resource
 	'view', 'cake-autorate-rs', 'settings.js');
 const source = fs.readFileSync(sourcePath, 'utf8');
 const prefix = source.slice(0, source.indexOf('return L.view.extend'));
+assert.match(source, /function modal\(option\)\s*\{[\s\S]*?option\.modalonly = true;[\s\S]*?option\.retain = true;/,
+	'all modal settings must retain dependency-hidden values instead of staging unrelated deletions');
+assert.match(source,
+	/return uci\.save\(\)\.then\(function\(\) \{ return created; \}\);/,
+	'the wizard must persist its exact staged proposal without reparsing stale GridSection widgets');
+assert.doesNotMatch(source,
+	/return grid\.map\.save\(null, true\)\.then\(function\(\) \{ return created; \}\);/,
+	'the wizard must not overwrite its staged proposal from stale modal widgets');
+assert.match(source,
+	/handleSave: function\(ev\)[\s\S]*?pendingAutotuneApplyMarkers\(\)[\s\S]*?cannot be stored as ordinary pending changes[\s\S]*?this\.super\('handleSave'/,
+	'plain Save must refuse to strand a guarded Auto-Tune proposal as ordinary pending changes');
 assert.match(source, /50% historical-throughput trust boundary/,
 	'profile help must explain the manual historical-throughput trust boundary');
+assert.match(source,
+	/\.cake-autotune-profile-grid\{display:grid;grid-template-columns:repeat\(4,minmax\(0,1fr\)\);[^}]*align-items:stretch/,
+	'the four Auto-Tune profiles must share one equal-width horizontal grid');
+assert.match(source,
+	/\.cake-autotune-profile-card\{[^}]*width:100%;height:100%;[^}]*box-sizing:border-box/,
+	'profile cards must stretch to the same row height without overflowing');
+assert.match(source,
+	/@media\(max-width:800px\)\{\.cake-autotune-profile-grid\{grid-template-columns:minmax\(0,1fr\)\}\}/,
+	'the equal four-card row must collapse safely on narrow screens');
+assert.equal((source.match(/autotuneProfileGrid\(profileButtons\)/g) || []).length, 2,
+	'single-WAN and sequential Multi-WAN profile selectors must use the same layout');
 assert.match(source,
 	/o = iface\(section, 'interfaces', 'dl_if',[\s\S]*?o\.depends\('auto_interface_preset', '0'\);\s*o\.retain = true;/,
 	'hidden automatic download interface must survive modal saves');
@@ -45,6 +67,10 @@ assert.match(source, /Create & apply sequentially/,
 assert.match(source,
 	/pendingAutotuneApplyMarkers\(\)\.length[\s\S]*?cake_autorate_apply_guard[\s\S]*?refusing to mix it with disabled uplinks/,
 	'disabled fallback instances must never share a transaction with stale apply markers');
+for (const [index, button] of source.split("E('button', {").slice(1).entries()) {
+	assert.match(button.slice(0, 180), /'type': 'button'/,
+		`custom settings button ${index + 1} must not submit the surrounding LuCI form`);
+}
 const written = {};
 const fixtureSections = { 'cake-autorate': [], mwan3: [] };
 if (typeof String.prototype.format !== 'function') {
@@ -79,6 +105,8 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 			`multiwanInstancePlans, wizardPlanConflicts, ` +
 			`topicTab, autorateSubcategory, autorateSubcategoryDefinitions, ` +
 			`canonicalAutotuneProfile, autotuneProfilePolicy, autotuneProfileDefinitions, ` +
+			`visibleAutotuneProfile, autotuneRunProfile, storedAutotuneProfile, ` +
+			`autotuneAchievedGrade, autotuneGradeTone, ` +
 			`autotuneProposalMatchesProfile, ` +
 			`autotuneResultValidated, autotuneResultReviewable, ` +
 			`autotuneResultHasReviewChoice, autotuneDefaultReviewAction, ` +
@@ -95,6 +123,7 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 			`revalidateAutotuneProposal, ` +
 			`stageAutotuneApplyMarker, pendingAutotuneApplyMarkers, ` +
 			`armAutotuneApplyGuards, runGuardedSaveApply, discardStagedUciPackages, ` +
+			`reconcileConfirmedUciPackages, ` +
 			`changedUciPackages, requireCleanUciTransaction, applyPlainRollbackTransaction, ` +
 			`runSequentialAutotuneApplies, ` +
 			`clearAutotuneProposalState, recordAutotuneTerminalFailure, ` +
@@ -108,6 +137,36 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 }
 
 const helpers = compileHelpers({});
+assert.match(source, /Simultaneous DL\+UL confirmation/,
+	'Review must expose the final simultaneous direction confirmation');
+assert.match(source, /Directional CAKE finding/,
+	'Review must expose a repeatable upload-only CAKE finding');
+assert.match(source, /current proposal still shapes both directions/,
+	'directional evidence must not imply that LuCI silently applies a different runtime topology');
+assert.match(source, /directional-bypass-not-authorized/,
+	'shaped-only calibration must explain why no raw directional comparison was attempted');
+assert.match(source, /Monthly traffic budget/,
+	'scheduled active calibration must expose a persistent monthly allowance');
+
+assert.equal(helpers.autotuneAchievedGrade({
+	validation: { actual_grade: 'b' },
+	profile_outcome: { actual_grade: 'A+' }
+}), 'B', 'the final validation grade must be the authoritative achieved class');
+assert.equal(helpers.autotuneAchievedGrade({
+	profile_outcome: { actual_grade: 'C' }
+}), 'C', 'the profile outcome may supply the achieved class when validation omitted it');
+assert.equal(helpers.autotuneAchievedGrade({ validation: { actual_grade: 'incomplete' } }), null,
+	'incomplete or unknown grades must not produce a misleading badge');
+assert.equal(helpers.autotuneGradeTone('A+'), 'good');
+assert.equal(helpers.autotuneGradeTone('A'), 'good');
+assert.equal(helpers.autotuneGradeTone('B'), 'warning');
+assert.equal(helpers.autotuneGradeTone('C'), 'warning');
+assert.equal(helpers.autotuneGradeTone('D'), 'bad');
+assert.equal(helpers.autotuneGradeTone('F'), 'bad');
+assert.match(source, /Achieved class:/,
+	'proposal diagnostics must show the actual class achieved during calibration');
+assert.match(source, /Selected target: %s/,
+	'the achieved class must remain distinct from a different selected target');
 
 async function testSequentialMultiwanTransactions() {
 	const events = [];
@@ -171,6 +230,7 @@ assert.equal(helpers.topicTab('logging'), 'monitoring');
 assert.equal(helpers.autorateSubcategory('setup', 'wan_if'), 'connection');
 assert.equal(helpers.autorateSubcategory('setup', 'min_dl_shaper_rate_kbps'), 'limits');
 assert.equal(helpers.autorateSubcategory('rates', 'adaptive_ceiling_enabled'), 'ceiling');
+assert.equal(helpers.autorateSubcategory('rates', 'runtime_learning_mode'), 'ceiling');
 assert.equal(helpers.autorateSubcategory('reflectors', 'reflector'), 'probes');
 assert.equal(helpers.autorateSubcategory('quality', 'transport_probe_backend'), 'probes');
 assert.equal(helpers.autorateSubcategory('quality', 'rating_load_enter_ratio'), 'quality');
@@ -178,15 +238,26 @@ assert.equal(helpers.autorateSubcategory('controller', 'alpha_delta_ewma'), 'con
 assert.deepEqual(helpers.autorateSubcategoryDefinitions().map(group => group.id),
 	[ 'connection', 'limits', 'ceiling', 'probes', 'quality', 'controller' ]);
 assert.equal(helpers.canonicalAutotuneProfile('balanced'), 'best_overall');
+assert.equal(helpers.canonicalAutotuneProfile('gaming-extreme'), 'gaming_extreme');
 assert.equal(helpers.canonicalAutotuneProfile('unknown'), null);
 assert.deepEqual(helpers.autotuneProfileDefinitions().map(profile => profile.id),
-	[ 'gaming', 'best_overall', 'fair' ]);
+	[ 'gaming', 'gaming_extreme', 'best_overall', 'variable_link', 'fair' ]);
+assert.equal(helpers.autotuneProfileDefinitions()[1].hidden, true);
 assert.equal(helpers.autotuneProfilePolicy('gaming').sqm.classification, 'diffserv4');
 assert.equal(helpers.autotuneProfilePolicy('gaming').delayMaxMs, 5);
+assert.equal(helpers.autotuneProfilePolicy('gaming_extreme').retentionPercent, 70);
+assert.equal(helpers.visibleAutotuneProfile('gaming_extreme'), 'gaming');
+assert.equal(helpers.autotuneRunProfile({
+	autotune_profile: 'gaming', autotune_extreme_a_plus: true,
+}), 'gaming_extreme');
+assert.equal(helpers.storedAutotuneProfile('gaming_extreme'), 'gaming');
 assert.equal(helpers.autotuneProfilePolicy('best_overall').retentionPercent, 80);
 assert.equal(helpers.autotuneProfilePolicy('best_overall').sqm.script, 'layer_cake.qos');
 assert.equal(helpers.autotuneProfilePolicy('best_overall').sqm.iqdiscOpts, 'besteffort');
 assert.equal(helpers.autotuneProfilePolicy('best_overall').sqm.eqdiscOpts, 'diffserv4');
+assert.equal(helpers.autotuneProfilePolicy('variable_link').targetGrade, 'B');
+assert.equal(helpers.autotuneProfilePolicy('variable_link').retentionPercent, 70);
+assert.equal(helpers.autotuneProfilePolicy('variable_link').delayMaxMs, 60);
 assert.equal(helpers.autotuneProfilePolicy('fair').retentionPercent, 90);
 
 const proposal = {
@@ -609,7 +680,7 @@ const validValidation = {
 };
 const profileSearchFor = (profile, targetGrade, retention, candidate, targetMet = true, action = 'complete') => ({
 	download: {
-		schema_version: 1,
+		schema_version: 2,
 		profile,
 		direction: 'download',
 		target_grade: targetGrade,
@@ -626,9 +697,16 @@ const profileSearchFor = (profile, targetGrade, retention, candidate, targetMet 
 			target_met: targetMet,
 		},
 		evaluated: [],
+		...(profile === 'gaming_extreme' ? {
+			exploration_minimum_kbps: Math.floor(candidate.download.base_kbps / 2),
+			runtime_minimum_kbps: candidate.download.base_kbps,
+			runtime_minimum_observation_index: 1,
+			inconclusive: false,
+			evaluated: [ { candidate_kbps: candidate.download.base_kbps } ],
+		} : {}),
 	},
 	upload: {
-		schema_version: 1,
+		schema_version: 2,
 		profile,
 		direction: 'upload',
 		target_grade: targetGrade,
@@ -645,13 +723,26 @@ const profileSearchFor = (profile, targetGrade, retention, candidate, targetMet 
 			target_met: targetMet,
 		},
 		evaluated: [],
+		...(profile === 'gaming_extreme' ? {
+			exploration_minimum_kbps: Math.floor(candidate.upload.base_kbps / 2),
+			runtime_minimum_kbps: candidate.upload.base_kbps,
+			runtime_minimum_observation_index: 1,
+			inconclusive: false,
+			evaluated: [ { candidate_kbps: candidate.upload.base_kbps } ],
+		} : {}),
 	},
 });
+const profileOutcomeMode = (profile, targetMet) => {
+	if (targetMet)
+		return profile === 'gaming' ? 'target-a-plus-met' :
+			(profile === 'gaming_extreme' ? 'extreme-a-plus-met' :
+				(profile === 'fair' ? 'throughput-optimum-c-or-better' : 'target-a-met'));
+	return profile === 'gaming' ? 'best-attainable-quality-fallback' :
+		(profile === 'gaming_extreme' ? 'extreme-best-attainable-quality-fallback' :
+			(profile === 'fair' ? 'throughput-optimum-quality-fallback' : 'balanced-fallback'));
+};
 const profileOutcomeFor = (profile, targetGrade, retention, candidate, targetMet = true) => ({
-	mode: targetMet ? (profile === 'gaming' ? 'target-a-plus-met' :
-		(profile === 'fair' ? 'throughput-optimum-c-or-better' : 'target-a-met')) :
-		(profile === 'gaming' ? 'best-attainable-quality-fallback' :
-			(profile === 'fair' ? 'throughput-optimum-quality-fallback' : 'balanced-fallback')),
+	mode: profileOutcomeMode(profile, targetMet),
 	target_grade: targetGrade,
 	target_met: targetMet,
 	actual_grade: targetMet ? 'A' : 'D',
@@ -659,6 +750,8 @@ const profileOutcomeFor = (profile, targetGrade, retention, candidate, targetMet
 	capacity_floor_met: true,
 	throughput_safety_floor_percent: 50,
 	throughput_safety_floor_met: true,
+	deep_runtime_minimum: false,
+	runtime_minimum_retention: null,
 	infeasible_reason: '',
 	manual_only: !targetMet,
 	selected_pair: {
@@ -955,7 +1048,7 @@ const resultForProfile = (profile, targetGrade, retention, delay, loss, sqm) => 
 		validation: {
 			...validValidation,
 			profile,
-			actual_grade: profile === 'gaming' ? 'A+' : 'A',
+			actual_grade: profile === 'gaming' || profile === 'gaming_extreme' ? 'A+' : 'A',
 			gates: validValidation.gates.map(gate => ({
 				...gate,
 				required: gate.code.endsWith('-cpu') ||
@@ -976,7 +1069,7 @@ const resultForProfile = (profile, targetGrade, retention, delay, loss, sqm) => 
 		proposal: candidateProposal,
 		profile_outcome: {
 			...profileOutcomeFor(profile, targetGrade, retention, candidateProposal),
-			actual_grade: profile === 'gaming' ? 'A+' : 'A',
+			actual_grade: profile === 'gaming' || profile === 'gaming_extreme' ? 'A+' : 'A',
 		},
 		profile_search: profileSearchFor(profile, targetGrade, retention, candidateProposal),
 	};
@@ -992,6 +1085,35 @@ const gamingResult = resultForProfile('gaming', 'A+', 70, 5, 1, {
 	iqdisc_opts: 'diffserv4',
 	eqdisc_opts: 'diffserv4',
 });
+const extremeProposal = {
+	...gamingResult.proposal,
+	profile: 'gaming_extreme',
+	download: {
+		...gamingResult.proposal.download,
+		minimum_kbps: gamingResult.proposal.download.base_kbps,
+	},
+	upload: {
+		...gamingResult.proposal.upload,
+		minimum_kbps: gamingResult.proposal.upload.base_kbps,
+	},
+};
+const extremeGamingResult = {
+	...gamingResult,
+	profile: 'gaming_extreme',
+	proposal: extremeProposal,
+	validation: { ...gamingResult.validation, profile: 'gaming_extreme' },
+	profile_outcome: {
+		...profileOutcomeFor('gaming_extreme', 'A+', 70, extremeProposal),
+		actual_grade: 'A+',
+		runtime_minimum_retention: {
+			download_percent: Math.round(extremeProposal.download.minimum_kbps * 1000 /
+				extremeProposal.download.observed_low_kbps) / 10,
+			upload_percent: Math.round(extremeProposal.upload.minimum_kbps * 1000 /
+				extremeProposal.upload.observed_low_kbps) / 10,
+		},
+	},
+	profile_search: profileSearchFor('gaming_extreme', 'A+', 70, extremeProposal),
+};
 const fairResult = {
 	...resultForProfile('fair', 'C', 90, 200, 5, proposal.sqm),
 	fair_outcome: {
@@ -1014,6 +1136,70 @@ const fairResult = {
 	},
 };
 assert.equal(helpers.autotuneResultValidated(gamingResult), true);
+assert.equal(helpers.autotuneResultValidated(extremeGamingResult), true,
+	'an explicitly selected Extreme A+ result may auto-apply only while it still retains 70%');
+const extremeSacrifice = {
+	...extremeGamingResult,
+	auto_apply_eligible: false,
+	proposal: {
+		...extremeGamingResult.proposal,
+		download: {
+			...extremeGamingResult.proposal.download,
+			minimum_kbps: Math.round(extremeGamingResult.proposal.download.observed_low_kbps * 0.6),
+		},
+		upload: {
+			...extremeGamingResult.proposal.upload,
+			minimum_kbps: Math.round(extremeGamingResult.proposal.upload.observed_low_kbps * 0.6),
+		},
+	},
+	validation: {
+		...extremeGamingResult.validation,
+		profile_objectives_met: false,
+		gates: extremeGamingResult.validation.gates.map(gate =>
+			gate.code.includes('capacity-retention') ?
+				{ ...gate, required: false, pass: false, actual: 60, limit: 70 } : { ...gate }),
+	},
+	profile_outcome: {
+		...extremeGamingResult.profile_outcome,
+		mode: 'extreme-a-plus-throughput-sacrifice',
+		capacity_floor_met: false,
+		deep_runtime_minimum: true,
+		runtime_minimum_retention: { download_percent: 60, upload_percent: 60 },
+		manual_only: true,
+	},
+	profile_search: {
+		...extremeGamingResult.profile_search,
+		download: {
+			...extremeGamingResult.profile_search.download,
+			runtime_minimum_kbps: Math.round(extremeGamingResult.proposal.download.observed_low_kbps * 0.6),
+			evaluated: [ { candidate_kbps:
+				Math.round(extremeGamingResult.proposal.download.observed_low_kbps * 0.6) } ],
+		},
+		upload: {
+			...extremeGamingResult.profile_search.upload,
+			runtime_minimum_kbps: Math.round(extremeGamingResult.proposal.upload.observed_low_kbps * 0.6),
+			evaluated: [ { candidate_kbps:
+				Math.round(extremeGamingResult.proposal.upload.observed_low_kbps * 0.6) } ],
+		},
+	},
+};
+assert.equal(helpers.autotuneResultValidated(extremeSacrifice), false,
+	'an Extreme A+ throughput sacrifice must never qualify for Auto-Apply');
+assert.equal(helpers.autotuneResultReviewable(extremeSacrifice, 'apply_sqm'), true,
+	'a technically controlled Extreme A+ point remains available only for explicit review');
+const extremeUntestedMinimum = {
+	...extremeSacrifice,
+	profile_search: {
+		...extremeSacrifice.profile_search,
+		download: {
+			...extremeSacrifice.profile_search.download,
+			evaluated: [ { candidate_kbps:
+				extremeSacrifice.profile_search.download.runtime_minimum_kbps + 1 } ],
+		},
+	},
+};
+assert.equal(helpers.autotuneResultReviewable(extremeUntestedMinimum, 'apply_sqm'), false,
+	'an Extreme A+ minimum absent from typed search evidence must fail closed');
 assert.equal(helpers.autotuneResultValidated(fairResult), true);
 const gamingCpuWarning = {
 	...gamingResult,
@@ -1073,6 +1259,63 @@ assert.equal(helpers.autotuneResultValidated(fairVariable5gReview), false,
 	'variable 5G advisory result must not auto-apply');
 assert.equal(helpers.autotuneResultReviewable(fairVariable5gReview, 'apply_sqm'), true,
 	'latency-safe 5G throughput shortfall must be manually reviewable');
+const fairCandidateRealizationShortfall = {
+	...fairVariable5gReview,
+	result_class: 'provisional',
+	confidence: {
+		overall_percent: 73,
+		capacity_download_percent: 73,
+		capacity_upload_percent: 100,
+		quality_percent: 100,
+		reasons: [ {
+			code: 'candidate-realization-download',
+			scope: 'download',
+			message: 'The selected CAKE rate was not fully exercised.',
+		} ],
+	},
+	validation: {
+		...fairVariable5gReview.validation,
+		gates: fairVariable5gReview.validation.gates.map(gate => {
+			if (gate.code === 'download-candidate-realization')
+				return { ...gate, required: true, pass: false, actual: 73, limit: 80 };
+			if (gate.code === 'download-capacity-retention')
+				return { ...gate, required: false, pass: false, actual: 69, limit: 90 };
+			if (gate.code === 'upload-capacity-retention')
+				return { ...gate, required: false, pass: true, actual: 94, limit: 90 };
+			if (gate.code === 'download-throughput-safety-floor')
+				return { ...gate, required: false, pass: true, actual: 69, limit: 50 };
+			if (gate.code === 'upload-throughput-safety-floor')
+				return { ...gate, required: false, pass: true, actual: 94, limit: 50 };
+			return { ...gate };
+		}),
+	},
+	profile_outcome: {
+		...fairVariable5gReview.profile_outcome,
+		throughput_safety_floor_met: true,
+	},
+	fair_outcome: {
+		...fairVariable5gReview.fair_outcome,
+		throughput_safety_floor_met: true,
+	},
+};
+assert.equal(helpers.autotuneResultValidated(fairCandidateRealizationShortfall), false,
+	'a provisional Fair realization shortfall must never become Auto-Apply eligible');
+assert.equal(helpers.autotuneResultReviewable(fairCandidateRealizationShortfall, 'apply_sqm'), true,
+	'a Fair candidate explicitly authorized above the safety floor must remain manually reviewable');
+assert.equal(helpers.autotuneDefaultReviewAction(fairCandidateRealizationShortfall), 'apply_sqm',
+	'the safe Fair manual proposal must not silently fall back to Keep current');
+assert.equal(helpers.autotuneResultReviewable({
+	...fairCandidateRealizationShortfall,
+	validation: {
+		...fairCandidateRealizationShortfall.validation,
+		gates: fairCandidateRealizationShortfall.validation.gates.map(gate =>
+			gate.code === 'download-packet-loss' ? { ...gate, pass: false } : { ...gate }),
+	},
+}, 'apply_sqm'), false, 'Fair manual review must not relax packet-loss or other safety gates');
+assert.equal(helpers.autotuneResultReviewable({
+	...fairCandidateRealizationShortfall,
+	profile: 'best_overall',
+}, 'apply_sqm'), false, 'candidate-realization exceptions must never leak into other profiles');
 const fairFallback = {
 	...fairResult,
 	auto_apply_eligible: false,
@@ -1460,6 +1703,22 @@ assert.doesNotThrow(() => helpers.writeWizardConfig('accept_valid_autotune', {
 	autotune_proposal: proposal,
 }));
 
+assert.doesNotThrow(() => helpers.writeWizardConfig('legacy_auto_route', {
+	mode: 'autotune',
+	wan_if: 'eth1',
+	route_mode: 'auto',
+	mwan3_member: '',
+	enabled: true,
+	sqm_download: String(proposal.download.base_kbps),
+	sqm_upload: String(proposal.upload.base_kbps),
+	autotune_result: validResult,
+	autotune_proposal: proposal,
+}));
+assert.equal(written.route_mode, 'main',
+	'a legacy auto route must be persisted as the concrete route attested by Auto-Tune');
+assert.equal(written.mwan3_member, undefined,
+	'a main-route result must discard any stale mwan3 member before guarded apply');
+
 const disabledFallback = {
 	mode: 'autotune',
 	wan_if: 'eth1',
@@ -1818,6 +2077,52 @@ async function testAutotuneTerminalPrecedence() {
 		assert.deepEqual(completed, validResult);
 		assert.deepEqual(successProgress, [ 87 ]);
 		assert.equal(successCalls.length, 3);
+		assert.deepEqual(successCalls[0].args.slice(8), [ '', '0', 'shaped_only' ],
+			'manual Auto-Tune must pass an explicit zero traffic budget and calibration strategy');
+
+		timerDelays = [];
+		const compactCalls = [];
+		const compactHelpers = pollingHelpers([
+			{ state: 'running', progress: 0 },
+			{ state: 'complete', terminal_available: true, terminal_kind: 'result',
+				runtime_restored: true, recovery_pending: false },
+			validResult,
+		], compactCalls);
+		assert.deepEqual(await compactHelpers.runAutotuneJob(
+			'wan_sqm', 'pppoe-wan', 'speedtest-go', null), validResult);
+		assert.deepEqual(compactCalls.map(call => call.args[2]),
+			[ 'start', 'status-summary', 'result' ],
+			'a compact terminal poll must fetch the large result exactly once');
+
+		timerDelays = [];
+		const timeoutCalls = [];
+		const matchingRunning = {
+			state: 'running', job_id: 'wan_sqm', requested_target_interface: 'pppoe-wan',
+			requested_backend: 'speedtest-go', requested_route_mode: '',
+			requested_mwan3_member: '', requested_profile: 'best_overall',
+			requested_conservative: false,
+		};
+		const timeoutPayloads = [ matchingRunning, {
+			state: 'complete', terminal_available: true, terminal_kind: 'result',
+			runtime_restored: true, recovery_pending: false,
+		}, validResult ];
+		let firstStart = true;
+		const timeoutHelpers = compileHelpers({
+			exec(command, args) {
+				timeoutCalls.push({ command, args });
+				if (firstStart) {
+					firstStart = false;
+					return Promise.reject(new Error('XHR request timed out'));
+				}
+				assert(timeoutPayloads.length, 'unexpected retry poll');
+				return Promise.resolve({ stdout: JSON.stringify(timeoutPayloads.shift()) });
+			},
+		});
+		assert.deepEqual(await timeoutHelpers.runAutotuneJob(
+			'wan_sqm', 'pppoe-wan', 'speedtest-go', null), validResult);
+		assert.deepEqual(timeoutCalls.map(call => call.args[2]),
+			[ 'start', 'status-summary', 'status-summary', 'result' ],
+			'an ambiguous start timeout must reattach only through the exact request identity');
 
 		timerDelays = [];
 		const cancelCalls = [];
@@ -1836,7 +2141,7 @@ async function testAutotuneTerminalPrecedence() {
 		cancelledTerminal, 'user cancellation must wait for runtime restoration and return neutrally');
 		assert.deepEqual(cancelCalls.map(call => call.args), [
 			[ 'wan_sqm', 'pppoe-wan', 'cancel', 'speedtest-go', '', '', 'best_overall' ],
-			[ 'wan_sqm', 'pppoe-wan', 'status', 'speedtest-go', 'mwan3', 'wan', 'best_overall' ],
+			[ 'wan_sqm', 'pppoe-wan', 'status-summary', 'speedtest-go', 'mwan3', 'wan', 'best_overall' ],
 		]);
 		assert.deepEqual(timerDelays, [ 2000 ]);
 
@@ -1930,6 +2235,8 @@ async function testApplyGuardTransaction() {
 			sqm: {},
 		};
 			const calls = [];
+			const sessionPackages = new Set([ 'cake-autorate', 'sqm' ]);
+			let changesCalls = 0;
 			let postcheckCalls = 0;
 			let confirmCalls = 0;
 			let finalized = false;
@@ -1963,9 +2270,15 @@ async function testApplyGuardTransaction() {
 			},
 			save() { calls.push('uci.save-token'); return Promise.resolve([]); },
 			changes() {
-				return Promise.resolve(options.otherChanges ?
-					{ 'cake-autorate': [ [ 'set' ] ], sqm: [ [ 'set' ] ], network: [ [ 'set' ] ] } :
-					{ 'cake-autorate': [ [ 'set' ] ], sqm: [ [ 'set' ] ] });
+				changesCalls++;
+				const changes = {};
+				sessionPackages.forEach(config => { changes[config] = [ [ 'set' ] ]; });
+				if (options.otherChanges || (options.lateOtherChanges && changesCalls > 1))
+					changes.network = [ [ 'set' ] ];
+				return Promise.resolve(changes);
+			},
+			unload(packages) {
+				calls.push(`uci.unload:${packages.join(',')}`);
 			},
 			callApply(timeout, rollback) {
 				calls.push(`callApply:${timeout}:${rollback}`);
@@ -2044,7 +2357,17 @@ async function testApplyGuardTransaction() {
 			resolveDefault(promise, fallback) { return Promise.resolve(promise).catch(() => fallback); },
 			};
 			const fakeRpc = {
-				declare() { return () => fakeUci.callConfirmStatus(); },
+				declare(spec) {
+					if (spec.method === 'revert')
+						return config => {
+							calls.push(`uci.revert:${config}`);
+							if (options.cleanupReject && config === 'sqm')
+								return Promise.resolve(4);
+							sessionPackages.delete(config);
+							return Promise.resolve(0);
+						};
+					return () => fakeUci.callConfirmStatus();
+				},
 			};
 			const helpers = compileHelpers(fakeFs, fakeUci, fakeL, fakeRpc);
 			if (options.preexistingGuard) {
@@ -2093,7 +2416,32 @@ async function testApplyGuardTransaction() {
 			'callConfirm',
 			'/usr/libexec/cake-autorate-rs/apply-guard:finalize',
 			'/usr/libexec/cake-autorate-rs/apply-guard:status',
+			'uci.revert:cake-autorate',
+			'uci.revert:sqm',
+			'uci.unload:cake-autorate,sqm',
 		], 'the independent supervisor prepares the transaction and LuCI confirms with its authenticated RPC session');
+
+		const cleanupFailure = transactionFixture({ cleanupReject: true });
+		await assert.rejects(cleanupFailure.helpers.runGuardedSaveApply(cleanupFailure.view, {}),
+			/applied and confirmed, but the browser UCI transaction could not be cleared/);
+		assert(cleanupFailure.calls.includes('/usr/libexec/cake-autorate-rs/apply-guard:finalize'),
+			'cleanup is attempted only after authoritative guard finalization');
+		assert(!cleanupFailure.calls.some(call => call.endsWith(':verify-rollback')),
+			'a browser reconciliation failure must not roll back a confirmed configuration');
+		assert(!cleanupFailure.calls.includes('/usr/libexec/cake-autorate-rs/apply-guard:abort'),
+			'a finalized guard must not be aborted after a browser reconciliation failure');
+		assert.deepEqual(cleanupFailure.calls.slice(-3), [
+			'uci.revert:cake-autorate',
+			'uci.revert:sqm',
+			'uci.unload:cake-autorate',
+		], 'a partial server cleanup must unload every successfully reverted package before surfacing failure');
+		assert.equal(global.window.location.href, 'https://router/settings#pending',
+			'a confirmed apply reconciliation failure must remain visible instead of navigating away');
+
+		const lateUnrelated = transactionFixture({ lateOtherChanges: true });
+		await lateUnrelated.helpers.runGuardedSaveApply(lateUnrelated.view, {});
+		assert(!lateUnrelated.calls.includes('uci.revert:network'),
+			'success reconciliation must never discard a package staged concurrently by another view');
 
 		const lostApply = transactionFixture({ applyReject: true });
 		await assert.rejects(lostApply.helpers.runGuardedSaveApply(lostApply.view, {}),
@@ -2123,6 +2471,8 @@ async function testApplyGuardTransaction() {
 			/confirmation outcome remains unknown/);
 		assert(!serverIndeterminate.calls.includes('/usr/libexec/cake-autorate-rs/apply-guard:abort'),
 			'an indeterminate server state must retain its proof for recovery');
+		assert.equal(global.window.location.href, 'https://router/settings#pending',
+			'an indeterminate confirmation must remain visible instead of navigating away');
 
 		const unrelated = transactionFixture({ otherChanges: true });
 		await assert.rejects(unrelated.helpers.runGuardedSaveApply(unrelated.view, {}),

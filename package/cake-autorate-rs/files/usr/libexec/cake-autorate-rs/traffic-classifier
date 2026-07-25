@@ -78,7 +78,8 @@ is_sha256() {
 
 canonical_profile() {
 	case "$1" in
-		gaming) printf 'gaming\n' ;;
+		gaming|gaming_extreme|gaming-extreme|extreme_gaming) printf 'gaming\n' ;;
+		variable_link|variable-link|variable) printf 'variable_link\n' ;;
 		best_overall|best-overall|balanced|'') printf 'best_overall\n' ;;
 		fair) printf 'fair\n' ;;
 		*) return 1 ;;
@@ -450,7 +451,7 @@ emit_custom_rules() {
 
 render_ruleset() {
 	local requested_ruleset="$1"
-	local instance instance_enabled rules_enabled defaults_option defaults_enabled
+	local instance instance_enabled rules_enabled defaults_profile defaults_option defaults_enabled
 	local manage_sqm sqm_enabled sqm_script sqm_eqdisc_opts
 	local autotune_profile configured_profile legacy_traffic_profile
 	local chain_marker fragment seen_targets=""
@@ -480,7 +481,9 @@ render_ruleset() {
 		configured_profile="$("$uci_bin" -q get "cake-autorate.$instance.traffic_profile" 2>/dev/null)"
 		legacy_traffic_profile=0
 		if [ -z "$configured_profile" ]; then
-			defaults_option="traffic_defaults_$autotune_profile"
+			defaults_profile="$autotune_profile"
+			[ "$defaults_profile" = variable_link ] && defaults_profile=best_overall
+			defaults_option="traffic_defaults_$defaults_profile"
 			defaults_enabled="$("$uci_bin" -q get "cake-autorate.$instance.$defaults_option" 2>/dev/null)"
 			[ -n "$defaults_enabled" ] || defaults_enabled=1
 			if [ "$defaults_enabled" = 1 ]; then
@@ -493,7 +496,11 @@ render_ruleset() {
 		configured_profile="$(canonical_traffic_profile "$configured_profile")" ||
 			fail "Instance $instance has an unsupported traffic-priority profile."
 		case "$configured_profile" in
-			auto) profile="$autotune_profile"; rule_match_profile="$profile" ;;
+			auto)
+				profile="$autotune_profile"
+				[ "$profile" = variable_link ] && profile=best_overall
+				rule_match_profile="$profile"
+				;;
 			gaming|best_overall|fair) profile="$configured_profile"; rule_match_profile="$profile" ;;
 			custom)
 				profile=custom

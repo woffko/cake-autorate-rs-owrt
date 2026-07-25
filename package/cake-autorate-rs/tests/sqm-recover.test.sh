@@ -89,10 +89,29 @@ assert_no_interface_record
 [ "$(action_count)" -eq 1 ] || fail "healthy SQM was restarted"
 assert_no_interface_record
 
-# Production accepts only standalone health (one argument) and a complete
-# seven-argument immutable restore.  No released RC16 package wrote a compatible
-# recovery journal, so accepting weaker five/six-argument records would only
-# create an unauthenticated downgrade path.
+# Read-only attestation validates the same frozen ownership and exact runtime
+# topology, but must never stop or start SQM.
+before="$(action_count)"
+"$helper" wanb_sqm check
+[ "$(action_count)" -eq "$before" ] || fail "healthy read-only check mutated SQM"
+assert_no_interface_record
+printf '%s\n' dl-child-cake > "$work/tc-mode"
+expect_failure_rc_one "unhealthy read-only check" "$work/check-bad.out" \
+	"$work/check-bad.err" "$helper" wanb_sqm check
+grep -q 'not an exact CAKE' "$work/check-bad.err"
+[ "$(action_count)" -eq "$before" ] || fail "unhealthy read-only check repaired SQM"
+rm -f "$work/tc-mode"
+assert_no_interface_record
+
+expect_failure_rc_one "unknown read-only operation" "$work/check-op.out" \
+	"$work/check-op.err" "$helper" wanb_sqm mutate
+grep -q 'Unknown SQM recovery operation' "$work/check-op.err"
+[ "$(action_count)" -eq "$before" ] || fail "unknown operation mutated SQM"
+
+# Production accepts standalone repair (one argument), read-only attestation
+# (two arguments), and a complete seven-argument immutable restore.  No
+# released RC16 package wrote a compatible recovery journal, so accepting
+# weaker five/six-argument records would create an unauthenticated downgrade.
 expect_failure_rc_one "legacy five-argument recovery" "$work/legacy-five.out" \
 	"$work/legacy-five.err" \
 	"$helper" wanb_sqm cake_wanb_sqm eth0 eth0 ifb4eth0

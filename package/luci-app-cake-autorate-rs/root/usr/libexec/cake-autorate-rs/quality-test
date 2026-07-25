@@ -11,8 +11,11 @@ speedtest_bin="${CAKE_AUTORATE_SPEEDTEST:-/usr/libexec/cake-autorate-rs/speedtes
 runtime_lock_lib="${CAKE_AUTORATE_RUNTIME_LOCK_LIB:-/usr/libexec/cake-autorate-rs/runtime-lock}"
 jsonfilter_bin="${CAKE_AUTORATE_JSONFILTER:-$(command -v jsonfilter 2>/dev/null)}"
 uci_bin="${CAKE_AUTORATE_UCI:-uci}"
-setsid_bin="${CAKE_AUTORATE_SETSID:-$(command -v setsid 2>/dev/null)}"
+procd_job_bin="${CAKE_AUTORATE_PROCD_JOB:-/usr/libexec/cake-autorate-rs/procd-job}"
+quality_self="${CAKE_AUTORATE_QUALITY_SELF:-$0}"
+flock_bin="${CAKE_AUTORATE_RUNTIME_FLOCK:-flock}"
 timeout_s="${CAKE_AUTORATE_QUALITY_TIMEOUT_S:-180}"
+runtime_ready_timeout_s="${CAKE_AUTORATE_QUALITY_READY_TIMEOUT_S:-90}"
 max_automatic_runs="${CAKE_AUTORATE_QUALITY_MAX_RUNS:-3}"
 capture_phase="AUTO"
 background_dl_kbps="0"
@@ -21,6 +24,14 @@ quiet_window_s="5"
 quiet_timeout_s="30"
 quiet_ratio="0.05"
 quiet_min_kbps="1000"
+readiness_retryable=0
+readiness_code=""
+
+case "$runtime_ready_timeout_s" in
+	''|*[!0-9]*) runtime_ready_timeout_s=90 ;;
+esac
+[ "$runtime_ready_timeout_s" -ge 5 ] 2>/dev/null || runtime_ready_timeout_s=5
+[ "$runtime_ready_timeout_s" -le "$timeout_s" ] 2>/dev/null || runtime_ready_timeout_s="$timeout_s"
 
 if [ -r "$runtime_lock_lib" ]; then
 	# shellcheck source=/usr/libexec/cake-autorate-rs/runtime-lock
@@ -59,6 +70,135 @@ is_pid() {
 	[ "$1" -gt 1 ] 2>/dev/null
 }
 
+process_starttime() {
+	[ -r "/proc/$1/stat" ] || return 1
+	sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | awk 'NF >= 20 { print $20; exit }'
+}
+
+process_group() {
+	[ -r "/proc/$1/stat" ] || return 1
+	sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | awk 'NF >= 4 { print $3; exit }'
+}
+
+process_session() {
+	[ -r "/proc/$1/stat" ] || return 1
+	sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | awk 'NF >= 4 { print $4; exit }'
+}
+
+# Fractional sleep is not guaranteed by OpenWrt BusyBox. Prefer it (or
+# usleep) when present, otherwise use a bounded whole-second wait rather than
+# silently spinning through identity and cancellation checks.
+handshake_sleep_mode=""
+handshake_usleep_bin=""
+handshake_sleep() {
+	case "$handshake_sleep_mode" in
+		fractional) sleep 0.05 ;;
+		usleep) "$handshake_usleep_bin" 50000 ;;
+		whole) sleep 1 ;;
+		'')
+			if sleep 0.05 2>/dev/null; then
+				handshake_sleep_mode=fractional
+				return 0
+			fi
+			handshake_usleep_bin="$(command -v usleep 2>/dev/null || true)"
+			if [ -n "$handshake_usleep_bin" ] &&
+			   "$handshake_usleep_bin" 50000 2>/dev/null; then
+				handshake_sleep_mode=usleep
+				return 0
+			fi
+			handshake_sleep_mode=whole
+			sleep 1
+			;;
+		*) return 1 ;;
+	esac
+}
+
+quality_cmdline_matches() {
+	pid="$1"
+	expected_mode="$2"
+	expected_backend="$3"
+	[ -r "/proc/$pid/cmdline" ] || return 1
+	tr '\000' '\n' < "/proc/$pid/cmdline" | awk \
+		-v self="$quality_self" -v section="$section" -v mode="$expected_mode" -v backend="$expected_backend" '
+		$0 == self { state = 1; next }
+		state == 1 && $0 == section { state = 2; next }
+		state == 2 && $0 == "worker" { state = 3; next }
+		state == 3 && $0 == mode { state = 4; next }
+		state == 4 && $0 == backend { state = 5; exit }
+		END { exit !(state == 5) }'
+}
+
+quality_identity_matches() {
+	pid="$1"
+	start="$2"
+	expected_mode="$3"
+	expected_backend="$4"
+	is_pid "$pid" && is_pid "$start" || return 1
+	[ "$(process_starttime "$pid" 2>/dev/null)" = "$start" ] &&
+		quality_cmdline_matches "$pid" "$expected_mode" "$expected_backend"
+}
+
+read_worker_identity() {
+	worker_pid=""
+	worker_start=""
+	worker_section=""
+	worker_mode=""
+	worker_backend=""
+	[ -f "$pid_file" ] && [ ! -L "$pid_file" ] || return 1
+	worker_pid="$(sed -n '1p' "$pid_file" 2>/dev/null)"
+	worker_start="$(sed -n '2p' "$pid_file" 2>/dev/null)"
+	worker_section="$(sed -n '3p' "$pid_file" 2>/dev/null)"
+	worker_mode="$(sed -n '4p' "$pid_file" 2>/dev/null)"
+	worker_backend="$(sed -n '5p' "$pid_file" 2>/dev/null)"
+	case "$worker_mode" in automatic|client) ;; *) return 1 ;; esac
+	case "$worker_backend" in ''|*[!A-Za-z0-9_.-]*) return 1 ;; esac
+	[ "$worker_section" = "$section" ] &&
+		quality_identity_matches "$worker_pid" "$worker_start" "$worker_mode" "$worker_backend"
+}
+
+wait_for_launched_worker() {
+	pid="$1"
+	start="$2"
+	attempt=0
+	# Fractional sleep is not enabled in every OpenWrt BusyBox build.  Bound
+	# the RPC-side exec transition without allowing a failed sleep to spin.
+	# procd may publish the isolated setsid process before its small launcher
+	# has exec'd the final worker.  A 250 ms budget was too short during boot,
+	# when netifd, ModemManager, firewall and SQM hotplug all compete for CPU.
+	# Keep the transition bounded, but tolerate up to three seconds of scheduler
+	# jitter before treating the identity as invalid.
+	while [ "$attempt" -lt 60 ]; do
+		[ "$(process_starttime "$pid" 2>/dev/null)" = "$start" ] || return 1
+		if [ "$(process_group "$pid" 2>/dev/null)" = "$pid" ] &&
+		   [ "$(process_session "$pid" 2>/dev/null)" = "$pid" ] &&
+		   quality_cmdline_matches "$pid" "$capture_mode" "$backend"; then
+			return 0
+		fi
+		attempt=$((attempt + 1))
+		# The portable fallback sleeps a whole second, so three attempts are
+		# already the full bounded budget in that mode.
+		[ "$handshake_sleep_mode" != whole ] || [ "$attempt" -lt 4 ] || return 1
+		handshake_sleep
+	done
+	return 1
+}
+
+verified_launch_identity() {
+	pid="$1"
+	start="$2"
+	is_pid "$pid" && is_pid "$start" || return 1
+	[ "$(process_starttime "$pid" 2>/dev/null)" = "$start" ] &&
+		[ "$(process_group "$pid" 2>/dev/null)" = "$pid" ] &&
+		[ "$(process_session "$pid" 2>/dev/null)" = "$pid" ]
+}
+
+terminate_verified_launch() {
+	pid="$1"
+	start="$2"
+	verified_launch_identity "$pid" "$start" || return 0
+	kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+}
+
 now_epoch() {
 	date +%s
 }
@@ -89,6 +229,44 @@ job_paths() {
 	runtime_dir="$runtime_root/$section"
 	daemon_status="$runtime_dir/status.json"
 	capture_file="$runtime_dir/rating-capture"
+}
+
+ensure_private_directory() {
+	directory="$1"
+	if [ ! -e "$directory" ]; then
+		(umask 077; mkdir "$directory") 2>/dev/null || [ -e "$directory" ] || return 1
+	fi
+	[ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+	# Establish ownership before chmod.  In a sticky shared parent such as
+	# /tmp, a directory owned by this effective UID cannot be replaced by an
+	# unprivileged peer between this check and chmod; an attacker-owned path is
+	# rejected without ever changing its mode or following a swapped symlink.
+	directory_listing="$(LC_ALL=C ls -ldn "$directory" 2>/dev/null)" || return 1
+	set -- $directory_listing
+	case "${1:-}" in d?????????|d?????????[.+]) ;; *) return 1 ;; esac
+	effective_uid="$(id -u)" || return 1
+	[ "${3:-}" = "$effective_uid" ] || return 1
+	chmod 700 "$directory" 2>/dev/null || return 1
+	# Confirm the same object class, owner, and final mode after chmod.  Accept
+	# the optional GNU ls ACL/SELinux suffix while remaining BusyBox-compatible.
+	directory_listing="$(LC_ALL=C ls -ldn "$directory" 2>/dev/null)" || return 1
+	set -- $directory_listing
+	case "${1:-}" in drwx------|drwx------[.+]) ;; *) return 1 ;; esac
+	[ "${3:-}" = "$effective_uid" ]
+}
+
+acquire_start_lock() {
+	ensure_private_directory "$job_root" || return 1
+	ensure_private_directory "$job_dir" || return 1
+	command -v "$flock_bin" >/dev/null 2>&1 || return 1
+	[ ! -L "$job_dir/start.lock" ] || return 1
+	exec 6>>"$job_dir/start.lock" || return 1
+	"$flock_bin" -x 6 || return 1
+}
+
+release_start_lock() {
+	"$flock_bin" -u 6 || return 1
+	exec 6>&-
 }
 
 atomic_write() {
@@ -128,53 +306,212 @@ resolve_target() {
 	safe_interface "$target_if"
 }
 
-preflight() {
+static_preflight() {
+	readiness_retryable=0
+	readiness_code=""
 	[ "$("$uci_bin" -q get "cake-autorate.$section.enabled" 2>/dev/null)" = 1 ] || {
 		failure="Autorate instance is disabled."
+		readiness_code="instance_disabled"
 		return 1
 	}
 	[ "$("$uci_bin" -q get "cake-autorate.$section.sqm_enabled" 2>/dev/null)" = 1 ] || {
 		failure="Managed SQM must be enabled for a loaded rating."
+		readiness_code="sqm_disabled"
 		return 1
 	}
 	[ "$("$uci_bin" -q get "cake-autorate.$section.transport_latency_enabled" 2>/dev/null)" = 1 ] || {
 		failure="Transport-aware latency must be enabled."
+		readiness_code="transport_disabled"
 		return 1
 	}
 	[ -n "$jsonfilter_bin" ] || {
 		failure="jsonfilter is required."
-		return 1
-	}
-	[ -s "$daemon_status" ] || {
-		failure="Runtime status is unavailable."
-		return 1
-	}
-	[ "$(status_value '.route_active')" = true ] || {
-		failure="Selected uplink route is not active."
-		return 1
-	}
-	if [ "$(status_value '.sqm_runtime_managed')" = true ] && \
-	   [ "$(status_value '.sqm_runtime_healthy')" != true ]; then
-		failure="Managed SQM runtime is unhealthy: $(status_value '.sqm_runtime_reason')"
-		return 1
-	fi
-	[ "$(status_value '.transport_probe_trusted')" = true ] || {
-		failure="A trusted native transport backend is required."
-		return 1
-	}
-	[ "$(status_value '.quality_grade_baseline_ready')" = true ] || {
-		failure="Idle RTT baseline is not ready yet."
-		return 1
-	}
-	resolve_target || {
-		failure="Unable to resolve the target interface."
+		readiness_code="jsonfilter_missing"
 		return 1
 	}
 	if [ "$capture_mode" = automatic ] && [ ! -x "$speedtest_bin" ]; then
 		failure="Speed test helper is unavailable."
+		readiness_code="speedtest_missing"
 		return 1
 	fi
 	return 0
+}
+
+runtime_preflight() {
+	uplink_state="$(status_value '.uplink_state')"
+	route_test_ready="$(status_value '.route_test_ready')"
+	readiness_retryable=0
+	readiness_code=""
+	[ -s "$daemon_status" ] || {
+		failure="Runtime status is unavailable."
+		readiness_retryable=1
+		readiness_code="runtime_status_unavailable"
+		return 1
+	}
+	case "$uplink_state" in
+		ACTIVE|STANDBY) ;;
+		RECHECKING)
+			failure="Selected uplink route is being rechecked after a temporary routing error."
+			readiness_retryable=1
+			readiness_code="route_rechecking"
+			return 1
+			;;
+		LEARNING)
+			failure="Selected uplink is still learning its idle baseline."
+			readiness_retryable=1
+			readiness_code="route_learning"
+			return 1
+			;;
+		OFFLINE)
+			failure="Selected uplink is offline."
+			readiness_retryable=1
+			readiness_code="route_offline"
+			return 1
+			;;
+		'') ;; # Compatibility with a status fixture or an older daemon.
+		*)
+			failure="Selected uplink state is unknown: $uplink_state."
+			readiness_retryable=1
+			readiness_code="route_unknown"
+			return 1
+			;;
+	esac
+	if [ "$capture_mode" = automatic ]; then
+		if [ "$route_test_ready" != true ] &&
+		   ! { [ -z "$route_test_ready" ] && [ "$(status_value '.route_active')" = true ]; }; then
+			# Older status producers expose only route_active. Never use this
+			# fallback when the explicit route_test_ready field is present.
+			failure="Selected uplink cannot currently prove an isolated test route."
+			readiness_retryable=1
+			readiness_code="forced_route_not_ready"
+			return 1
+		fi
+	elif [ "$(status_value '.route_active')" != true ]; then
+		failure="Guided client mode requires client traffic to be routed through this uplink. Use Automatic mode or select an mwan3 client rule first."
+		readiness_retryable=0
+		readiness_code="client_route_not_active"
+		return 1
+	fi
+	if [ "$(status_value '.sqm_runtime_managed')" = true ] && \
+	   [ "$(status_value '.sqm_runtime_healthy')" != true ]; then
+		failure="Managed SQM runtime is unhealthy: $(status_value '.sqm_runtime_reason')"
+		case "$(status_value '.sqm_runtime_state')" in
+			WAITING_LINK|WAITING_EXTERNAL_SQM|WAITING_SQM|WAITING_OPERATION|RECOVERING)
+				readiness_retryable=1 ;;
+		esac
+		readiness_code="sqm_runtime_unhealthy"
+		return 1
+	fi
+	[ "$(status_value '.transport_probe_trusted')" = true ] || {
+		failure="A trusted native transport backend is required."
+		readiness_retryable=1
+		readiness_code="transport_not_ready"
+		return 1
+	}
+	[ "$(status_value '.quality_grade_baseline_ready')" = true ] || {
+		failure="Idle RTT baseline is not ready yet."
+		readiness_retryable=1
+		readiness_code="baseline_not_ready"
+		return 1
+	}
+	failure=""
+	return 0
+}
+
+route_status_value() {
+	[ -n "${route_status_payload:-}" ] || return 0
+	printf '%s\n' "$route_status_payload" | "$jsonfilter_bin" -e "@$1" 2>/dev/null | sed -n '1p'
+}
+
+attest_automatic_route() {
+	route_status_payload="$($speedtest_bin "$section" "$target_if" route-status "$backend" "" \
+		"$route_mode" "$mwan3_member" 2>/dev/null)" || {
+		failure="Unable to attest the selected route for automatic load generation."
+		return 1
+	}
+	[ "$(route_status_value '.state')" = ready ] || {
+		failure="The selected route did not return a ready attestation."
+		return 1
+	}
+	[ "$(route_status_value '.resolved_interface')" = "$target_if" ] || {
+		failure="The attested test route no longer matches $target_if."
+		return 1
+	}
+	[ "$(route_status_value '.member_status')" = online ] || {
+		failure="The selected mwan3 member is not online."
+		return 1
+	}
+	[ -n "$(route_status_value '.external_ip')" ] || {
+		failure="The selected route did not prove an external IP."
+		return 1
+	}
+	return 0
+}
+
+start_preflight() {
+	static_preflight || return 1
+	if runtime_preflight; then
+		return 0
+	fi
+	[ "$readiness_retryable" = 1 ]
+}
+
+wait_for_runtime_ready() {
+	ready_deadline="$((job_started + runtime_ready_timeout_s))"
+	while [ "$(now_epoch)" -lt "$ready_deadline" ]; do
+		[ -f "$cancel_file" ] && {
+			failure="Rating capture cancelled."
+			return 1
+		}
+		static_preflight || return 1
+		if runtime_preflight; then
+			return 0
+		fi
+		[ "$readiness_retryable" = 1 ] || return 1
+		write_running_status "Waiting for link/SQM readiness: $failure"
+		sleep 1
+	done
+	failure="Timed out waiting for link/SQM readiness: ${failure:-runtime did not become ready}."
+	readiness_code="runtime_ready_timeout"
+	readiness_retryable=0
+	return 1
+}
+
+acquire_ready_interface() {
+	while [ "$(now_epoch)" -lt "$((job_started + runtime_ready_timeout_s))" ]; do
+		wait_for_runtime_ready || return 1
+		resolve_target || {
+			failure="Unable to resolve the target interface."
+			readiness_code="target_unresolved"
+			return 1
+		}
+		acquire_interface_lock || return 1
+		# Close the preflight-to-lock TOCTOU window.  A native netifd/SQM
+		# hotplug may reset the queue after the first readiness sample but
+		# before the lock.  Never arm capture from that stale observation.
+		if runtime_preflight; then
+			return 0
+		fi
+		postlock_failure="$failure"
+		if ! release_interface_lock; then
+			failure="Unable to release the rating interface lock after runtime changed. Last runtime state: $postlock_failure"
+			readiness_retryable=0
+			return 1
+		fi
+		[ "$readiness_retryable" = 1 ] || return 1
+		write_running_status "Runtime changed while starting; waiting again: $failure"
+	done
+	failure="Timed out while revalidating link/SQM readiness after locking. Last runtime state: ${failure:-unknown}."
+	return 1
+}
+
+runtime_guard() {
+	context="$1"
+	if runtime_preflight; then
+		return 0
+	fi
+	failure="Runtime became unready during $context: $failure"
+	return 1
 }
 
 load_capture_policy() {
@@ -213,6 +550,7 @@ measure_quiet_background() {
 	start_wait="$(now_epoch)"
 
 	while [ "$(( $(now_epoch) - start_wait ))" -lt "$wait_limit" ]; do
+		runtime_guard "background measurement" || return 1
 		current_dl="$(numeric_or_default "$(status_value '.dl_achieved_rate_kbps')" 0)"
 		current_ul="$(numeric_or_default "$(status_value '.ul_achieved_rate_kbps')" 0)"
 		if awk -v dl="$current_dl" -v ul="$current_ul" -v dlmax="$limit_dl" -v ulmax="$limit_ul" \
@@ -267,9 +605,11 @@ acquire_interface_lock() {
 
 release_interface_lock() {
 	[ -n "${interface_lock:-}" ] || return 0
-	runtime_lock_release_interface || return 1
-	runtime_lock_release_global || return 1
+	release_rc=0
+	runtime_lock_release_interface || release_rc=1
+	runtime_lock_release_global || release_rc=1
 	interface_lock=""
+	return "$release_rc"
 }
 
 emit_live_status() {
@@ -337,7 +677,10 @@ write_final_result() {
 worker_cleanup() {
 	clear_capture
 	release_interface_lock
-	rm -f "$pid_file" "$status_file"
+	if read_worker_identity && [ "$worker_pid" = "$$" ]; then
+		rm -f "$pid_file"
+		rm -f "$status_file"
+	fi
 }
 
 worker_signal() {
@@ -370,6 +713,7 @@ wait_capture_phase() {
 	expected="$1"
 	attempt=0
 	while [ "$attempt" -lt 10 ]; do
+		runtime_guard "rating-capture handshake" || return 1
 		active="$(status_value '.rating_capture_active')"
 		observed="$(status_value '.rating_capture_requested_phase')"
 		# Older daemons and the isolated shell fixtures do not expose the
@@ -389,6 +733,7 @@ wait_capture_phase() {
 
 run_automatic_direction() {
 	direction="$1"
+	failure=""
 	case "$direction" in
 		download) phase_name="DL" ;;
 		upload) phase_name="UL" ;;
@@ -396,14 +741,17 @@ run_automatic_direction() {
 	esac
 	run=1
 	while [ "$run" -le "$max_automatic_runs" ]; do
+		runtime_guard "$direction load preparation" || return 1
 		direction_samples_ready "$direction" && return 0
 		write_running_status "Generating shaped $direction load (pass $run/$max_automatic_runs)."
 		set_capture_phase "$phase_name" || worker_fail "Unable to arm the $direction rating phase."
-		wait_capture_phase "$phase_name" || worker_fail "The daemon did not acknowledge the $direction rating phase."
+		wait_capture_phase "$phase_name" ||
+			worker_fail "${failure:-The daemon did not acknowledge the $direction rating phase.}"
 		if ! "$speedtest_bin" "$section" "$target_if" run "$backend" shaped "$route_mode" "$mwan3_member" "$direction" >> "$log_file" 2>&1; then
 			set_capture_phase IDLE 2>/dev/null || true
 			worker_fail "Automatic $direction load generator failed; SQM and rates were left unchanged."
 		fi
+		runtime_guard "$direction load" || return 1
 		set_capture_phase IDLE || worker_fail "Unable to close the $direction rating phase."
 		sleep 3
 		if capture_is_contaminated; then
@@ -413,17 +761,32 @@ run_automatic_direction() {
 		direction_samples_ready "$direction" && return 0
 		run=$((run + 1))
 	done
+	failure=""
 	return 1
 }
 
 worker() {
+	registration_attempt=0
+	# Wait portably for the parent to publish the authenticated PID record.
+	while [ "$registration_attempt" -lt 60 ]; do
+		read_worker_identity && [ "$worker_pid" = "$$" ] && break
+		registration_attempt=$((registration_attempt + 1))
+		[ "$handshake_sleep_mode" != whole ] || [ "$registration_attempt" -lt 4 ] || exit 1
+		handshake_sleep
+	done
+	read_worker_identity && [ "$worker_pid" = "$$" ] || exit 1
 	job_started="$(now_epoch)"
 	token="$job_started-$$"
 	deadline="$((job_started + timeout_s))"
 	trap worker_cleanup EXIT
 	trap worker_signal INT TERM
-	preflight || worker_fail "$failure"
-	acquire_interface_lock || worker_fail "${failure:-Unable to lock the selected interface.}"
+	static_preflight || worker_fail "$failure"
+	route_mode="$("$uci_bin" -q get "cake-autorate.$section.route_mode" 2>/dev/null)"
+	mwan3_member="$("$uci_bin" -q get "cake-autorate.$section.mwan3_member" 2>/dev/null)"
+	acquire_ready_interface || worker_fail "${failure:-Unable to establish a ready rating runtime.}"
+	if [ "$capture_mode" = automatic ]; then
+		attest_automatic_route || worker_fail "$failure"
+	fi
 	write_running_status "Waiting for a quiet link before measuring background traffic."
 	measure_quiet_background || worker_fail "$failure"
 	if [ "$capture_mode" = automatic ]; then
@@ -432,14 +795,15 @@ worker() {
 		capture_phase="AUTO"
 	fi
 	write_capture || worker_fail "Unable to arm rating capture."
-	wait_capture_phase "$capture_phase" || worker_fail "The daemon did not acknowledge the rating capture."
+	wait_capture_phase "$capture_phase" ||
+		worker_fail "${failure:-The daemon did not acknowledge the rating capture.}"
 	write_running_status "Rating capture armed; background is DL $background_dl_kbps / UL $background_ul_kbps kbit/s."
 
 	if [ "$capture_mode" = automatic ]; then
-		route_mode="$("$uci_bin" -q get "cake-autorate.$section.route_mode" 2>/dev/null)"
-		mwan3_member="$("$uci_bin" -q get "cake-autorate.$section.mwan3_member" 2>/dev/null)"
-		run_automatic_direction download || worker_fail "Automatic download did not collect enough clean samples."
-		run_automatic_direction upload || worker_fail "Automatic upload did not collect enough clean samples."
+		run_automatic_direction download ||
+			worker_fail "${failure:-Automatic download did not collect enough clean samples.}"
+		run_automatic_direction upload ||
+			worker_fail "${failure:-Automatic upload did not collect enough clean samples.}"
 		set_capture_phase IDLE || worker_fail "Unable to close the automatic rating phases."
 		write_running_status "Load generation finished; waiting for the rating window to finalize."
 	else
@@ -453,6 +817,7 @@ worker() {
 			atomic_write "$error_file" '{"state":"cancelled","error":"Rating capture cancelled."}'
 			exit 0
 		}
+		runtime_guard "rating collection" || worker_fail "$failure"
 		if result_is_complete; then
 			write_final_result
 			exit 0
@@ -467,44 +832,79 @@ worker() {
 }
 
 start_job() {
+	launch_start=""
 	case "$capture_mode" in automatic|client) ;; *) json_error "Unknown rating mode." ;; esac
-	[ -n "$setsid_bin" ] && [ -x "$setsid_bin" ] || json_error "setsid is required."
-	mkdir -p "$job_dir" || json_error "Unable to create rating job directory."
-	chmod 700 "$job_dir" 2>/dev/null || true
+	[ -x "$procd_job_bin" ] || json_error "The procd job launcher is required."
+	acquire_start_lock || json_error "Unable to establish a private rating job directory and start lock."
 	if [ -s "$pid_file" ]; then
-		pid="$(sed -n '1p' "$pid_file")"
-		if is_pid "$pid" && kill -0 "$pid" 2>/dev/null; then
-			emit_live_status
+		if read_worker_identity; then
+			[ "$worker_mode" = "$capture_mode" ] && [ "$worker_backend" = "$backend" ] ||
+				json_error "A different rating request is already running for this instance."
+			printf '{"state":"running","mode":"%s","message":"Rating capture is already starting or running."}\n' \
+				"$(json_escape "$worker_mode")"
+			release_start_lock
 			return 0
 		fi
 	fi
-	preflight || json_error "$failure"
+	start_preflight || json_error "$failure"
 	rm -f "$pid_file" "$status_file" "$result_file" "$error_file" "$cancel_file" "$log_file"
-	"$setsid_bin" "$0" "$section" worker "$capture_mode" "$backend" </dev/null >> "$log_file" 2>&1 &
-	pid="$!"
-	printf '%s\n' "$pid" > "$pid_file"
+	launch_result="$($procd_job_bin launch "cake-autorate-quality-$section" worker "$log_file" \
+		"$quality_self" "$section" worker "$capture_mode" "$backend" 2>/dev/null)" || {
+		launch_error="$(printf '%s\n' "$launch_result" | "$jsonfilter_bin" -e '@.error' 2>/dev/null | sed -n '1p')"
+		json_error "${launch_error:-Unable to register the rating worker with procd.}"
+	}
+	pid="$(printf '%s\n' "$launch_result" | "$jsonfilter_bin" -e '@.pid' 2>/dev/null | sed -n '1p')"
+	launch_start="$(printf '%s\n' "$launch_result" | "$jsonfilter_bin" -e '@.starttime' 2>/dev/null | sed -n '1p')"
+	if ! is_pid "$pid" || ! is_pid "$launch_start" || ! wait_for_launched_worker "$pid" "$launch_start"; then
+		terminate_verified_launch "$pid" "$launch_start"
+		json_error "The rating worker did not publish a verified isolated identity."
+	fi
+	atomic_write "$pid_file" "$pid
+$launch_start
+$section
+$capture_mode
+$backend" || {
+		terminate_verified_launch "$pid" "$launch_start"
+		json_error "Unable to publish the rating worker identity."
+	}
 	printf '{"state":"running","mode":"%s","message":"Starting rating capture."}\n' "$(json_escape "$capture_mode")"
+	release_start_lock
 }
 
 show_status() {
 	if [ -s "$result_file" ]; then cat "$result_file"; return 0; fi
 	if [ -s "$error_file" ]; then cat "$error_file"; return 0; fi
 	if [ -s "$pid_file" ]; then
-		pid="$(sed -n '1p' "$pid_file")"
-		if is_pid "$pid" && kill -0 "$pid" 2>/dev/null; then emit_live_status; return 0; fi
+		if read_worker_identity; then emit_live_status; return 0; fi
 	fi
 	printf '{"state":"idle","message":"No rating job is running."}\n'
 }
 
 cancel_job() {
-	touch "$cancel_file"
+	cancel_pid=""
+	cancel_start=""
+	acquire_start_lock || json_error "Unable to establish a private rating job directory and start lock."
+	touch "$cancel_file" || json_error "Unable to record rating cancellation."
 	if [ -s "$pid_file" ]; then
-		pid="$(sed -n '1p' "$pid_file")"
-		if is_pid "$pid" && kill -0 "$pid" 2>/dev/null; then
-			kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+		if read_worker_identity; then
+			cancel_pid="$worker_pid"
+			cancel_start="$worker_start"
+			kill -TERM "-$cancel_pid" 2>/dev/null || kill -TERM "$cancel_pid" 2>/dev/null || true
+			cancel_attempt=0
+			while quality_identity_matches "$cancel_pid" "$cancel_start" "$worker_mode" "$worker_backend" &&
+			      [ "$cancel_attempt" -lt 5 ]; do
+				cancel_attempt=$((cancel_attempt + 1))
+				handshake_sleep
+			done
+			if ! quality_identity_matches "$cancel_pid" "$cancel_start" "$worker_mode" "$worker_backend" &&
+			   [ "$(sed -n '1p' "$pid_file" 2>/dev/null)" = "$cancel_pid" ] &&
+			   [ "$(sed -n '2p' "$pid_file" 2>/dev/null)" = "$cancel_start" ]; then
+				rm -f "$pid_file"
+			fi
 		fi
 	fi
 	rm -f "$capture_file"
+	release_start_lock || json_error "Unable to release the rating start lock."
 	printf '{"state":"cancelled","message":"Rating capture cancelled."}\n'
 }
 

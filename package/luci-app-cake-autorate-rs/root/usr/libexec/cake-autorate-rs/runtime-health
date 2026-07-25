@@ -181,6 +181,56 @@ process_count() {
 		awk '/^[0-9]+$/ { count++ } END { print count + 0 }'
 }
 
+read_controller_runtime_status() {
+	controller_state=UNKNOWN
+	controller_status_reason=""
+	controller_status_fresh=0
+	controller_status_file="$runtime_root/$instance/status.json"
+	[ "$daemon_count" -eq 1 ] || return 0
+	[ -f "$controller_status_file" ] && [ ! -L "$controller_status_file" ] || return 0
+
+	controller_updated=""
+	# The production default is the PATH-resolved command name "jsonfilter",
+	# not an absolute pathname.  Testing it with -x therefore rejected an
+	# installed dependency and forced the lossy sed fallback.
+	if command -v "$jsonfilter_bin" >/dev/null 2>&1; then
+		controller_state="$("$jsonfilter_bin" -i "$controller_status_file" -e '@.state' 2>/dev/null || true)"
+		controller_status_reason="$("$jsonfilter_bin" -i "$controller_status_file" -e '@.sqm_runtime_reason' 2>/dev/null || true)"
+		[ -n "$controller_status_reason" ] ||
+			controller_status_reason="$("$jsonfilter_bin" -i "$controller_status_file" -e '@.uplink_reason' 2>/dev/null || true)"
+		controller_updated="$("$jsonfilter_bin" -i "$controller_status_file" -e '@.updated_at' 2>/dev/null || true)"
+	fi
+	if [ -z "$controller_state" ] || [ "$controller_state" = UNKNOWN ]; then
+		# Pick the first state member.  A greedy sed expression can accidentally
+		# consume adaptive_capacity.confidence.state later in the one-line JSON.
+		controller_state="$(awk '
+			match($0, /"state"[[:space:]]*:[[:space:]]*"[^"]*"/) {
+				value = substr($0, RSTART, RLENGTH)
+				sub(/^"state"[[:space:]]*:[[:space:]]*"/, "", value)
+				sub(/"$/, "", value)
+				print value
+				exit
+			}
+		' "$controller_status_file" 2>/dev/null)"
+		controller_status_reason="$(sed -n 's/.*"sqm_runtime_reason":"\([^"]*\)".*/\1/p' "$controller_status_file" 2>/dev/null | sed -n '1p')"
+		[ -n "$controller_status_reason" ] ||
+			controller_status_reason="$(sed -n 's/.*"uplink_reason":"\([^"]*\)".*/\1/p' "$controller_status_file" 2>/dev/null | sed -n '1p')"
+		controller_updated="$(sed -n 's/.*"updated_at":\([0-9][0-9.]*\).*/\1/p' "$controller_status_file" 2>/dev/null | sed -n '1p')"
+	fi
+	case "$controller_state" in
+		WAITING_LINK|WAITING_SQM|WAITING_EXTERNAL_SQM|WAITING_OPERATION|RECOVERING|\
+		RUNNING|IDLE|STALL|LEARNING|ACTIVE|STANDBY|OFFLINE|ERROR|STOPPING) ;;
+		*) controller_state=UNKNOWN; return 0 ;;
+	esac
+	controller_updated="${controller_updated%%.*}"
+	controller_now="$(date +%s 2>/dev/null || true)"
+	if is_uint "$controller_updated" && is_uint "$controller_now" &&
+	   [ "$controller_updated" -le $((controller_now + 10)) ] &&
+	   [ $((controller_now - controller_updated)) -le 90 ]; then
+		controller_status_fresh=1
+	fi
+}
+
 pid_file_running() {
 	pid_file="$1"
 	[ -f "$pid_file" ] && [ ! -L "$pid_file" ] || return 1
@@ -241,9 +291,10 @@ emit_instance() {
 	[ -n "$traffic_rules_enabled" ] || traffic_rules_enabled=0
 	[ "$traffic_rules_enabled" = 1 ] || traffic_rules_enabled=0
 	case "$autotune_profile" in
-		gaming) ;;
+		gaming|gaming_extreme|gaming-extreme|extreme_gaming) autotune_profile=gaming ;;
 		best-overall|balanced|'') autotune_profile=best_overall ;;
-		best_overall|fair) ;;
+		variable-link|variable) autotune_profile=variable_link ;;
+		best_overall|variable_link|fair) ;;
 		*) autotune_profile=unknown ;;
 	esac
 	traffic_profile_mode="$(uci_get traffic_profile)"
@@ -252,7 +303,10 @@ emit_instance() {
 		[ "$legacy_defaults" = 0 ] && traffic_profile_mode=custom || traffic_profile_mode=auto
 	fi
 	case "$traffic_profile_mode" in
-		auto) traffic_profile_resolved="$autotune_profile" ;;
+		auto)
+			traffic_profile_resolved="$autotune_profile"
+			[ "$traffic_profile_resolved" = variable_link ] && traffic_profile_resolved=best_overall
+			;;
 		gaming|best_overall|fair|custom) traffic_profile_resolved="$traffic_profile_mode" ;;
 		*) traffic_profile_mode=unknown; traffic_profile_resolved=unknown ;;
 	esac
@@ -281,6 +335,7 @@ emit_instance() {
 		0:0) autorate_state=DISABLED ;;
 		0:*) autorate_state=UNEXPECTED; add_issue "Autorate is disabled but its process is still running." ;;
 	esac
+	read_controller_runtime_status
 
 	if [ "$manage_sqm" != 1 ]; then
 		sqm_config_state=UNMANAGED
@@ -320,6 +375,28 @@ emit_instance() {
 	fi
 	if [ "$enabled" != "$sqm_enabled" ] && [ "$manage_sqm" = 1 ]; then
 		add_issue "Autorate and managed SQM enable flags disagree."
+	fi
+
+	target_state=MISSING
+	if safe_interface "$resolved_target" && [ -e "$sys_class_net/$resolved_target" ]; then
+		target_state=PRESENT
+	fi
+	controller_transient=0
+	if [ "$controller_status_fresh" = 1 ]; then
+		case "$controller_state" in
+			WAITING_LINK|WAITING_SQM|WAITING_EXTERNAL_SQM|WAITING_OPERATION|RECOVERING)
+				controller_transient=1
+				;;
+		esac
+	fi
+	runtime_link_wait=0
+	if [ "$expected_runtime" = 1 ] && [ "$autorate_state" = RUNNING ] &&
+	   [ "$target_state" = MISSING ]; then
+		runtime_link_wait=1
+	fi
+	suppress_runtime_issues=0
+	if [ "$controller_transient" = 1 ] || [ "$runtime_link_wait" = 1 ]; then
+		suppress_runtime_issues=1
 	fi
 
 	load_cake_info "$ul_if"
@@ -371,21 +448,21 @@ emit_instance() {
 	fi
 
 	case "$cake_ul_state" in
-		MISSING) add_issue "Upload CAKE qdisc is missing." ;;
+		MISSING) [ "$suppress_runtime_issues" = 1 ] || add_issue "Upload CAKE qdisc is missing." ;;
 		DUPLICATE) add_issue "Multiple upload CAKE root qdiscs were detected." ;;
 		ORPHANED) add_issue "Upload CAKE still limits traffic although the instance is disabled." ;;
 	esac
 	case "$cake_dl_state" in
-		MISSING) add_issue "Download CAKE qdisc is missing." ;;
+		MISSING) [ "$suppress_runtime_issues" = 1 ] || add_issue "Download CAKE qdisc is missing." ;;
 		DUPLICATE) add_issue "Multiple download CAKE root qdiscs were detected." ;;
 		ORPHANED) add_issue "Download CAKE still limits traffic although the instance is disabled." ;;
 	esac
 	case "$ifb_state" in
-		MISSING) add_issue "The managed download IFB is missing." ;;
+		MISSING) [ "$suppress_runtime_issues" = 1 ] || add_issue "The managed download IFB is missing." ;;
 		ORPHANED) add_issue "The managed download IFB remains after SQM was disabled." ;;
 	esac
 	case "$ingress_state" in
-		MISSING) add_issue "The ingress redirect to the managed IFB is missing." ;;
+		MISSING) [ "$suppress_runtime_issues" = 1 ] || add_issue "The ingress redirect to the managed IFB is missing." ;;
 		ORPHANED) add_issue "The ingress redirect remains after SQM was disabled." ;;
 	esac
 
@@ -434,6 +511,8 @@ EOF
 		else
 			classifier_state=DISABLED
 		fi
+	elif [ "$suppress_runtime_issues" = 1 ]; then
+		classifier_state=WAITING
 	elif [ "$cake_ul_state" = ACTIVE ] && [ "$ul_cake_mode" != diffserv4 ]; then
 		classifier_state=INEFFECTIVE
 		add_issue "Traffic-priority rules require upload CAKE diffserv4; re-run Auto-Tune or update the SQM profile."
@@ -498,13 +577,30 @@ EOF
 		else
 			overall_state=ORPHANED
 		fi
-	elif [ "$manage_sqm" != 1 ]; then
+	elif [ "$controller_status_fresh" = 1 ] && [ "$autorate_state" = RUNNING ] &&
+	     { [ "$manage_sqm" != 1 ] || [ "$sqm_config_state" = ENABLED ]; }; then
+		case "$controller_state" in
+			RECOVERING) overall_state=RECOVERING ;;
+			WAITING_LINK|WAITING_SQM|WAITING_EXTERNAL_SQM|WAITING_OPERATION)
+				overall_state=WAITING
+				[ -n "$controller_status_reason" ] &&
+					add_issue "Controller is waiting: $controller_status_reason"
+				;;
+			*) : ;;
+		esac
+	fi
+	if [ "$overall_state" = HEALTHY ] && [ "$runtime_link_wait" = 1 ]; then
+		overall_state=WAITING
+		add_issue "Target interface $resolved_target is unavailable; waiting for link and managed SQM."
+	fi
+	if [ "$overall_state" = HEALTHY ] && [ "$manage_sqm" != 1 ]; then
 		[ "$autorate_state" = RUNNING ] && overall_state=UNMANAGED || overall_state=DEGRADED
-	elif [ "$autorate_state" != RUNNING ] || [ "$sqm_config_state" != ENABLED ] ||
+	elif [ "$overall_state" = HEALTHY ] &&
+	     { [ "$autorate_state" != RUNNING ] || [ "$sqm_config_state" != ENABLED ] ||
 	     [ "$cake_ul_state" != ACTIVE ] || [ "$cake_dl_state" != ACTIVE ] ||
 	     [ "$ifb_state" != PRESENT ] || [ "$ingress_state" != ACTIVE ] ||
 	     [ "$classifier_state" = ORPHANED ] ||
-	     { [ "$classifier_expected" = 1 ] && [ "$classifier_state" != ACTIVE ]; }; then
+	     { [ "$classifier_expected" = 1 ] && [ "$classifier_state" != ACTIVE ]; }; }; then
 		case "$autorate_state:$sqm_config_state:$cake_ul_state:$cake_dl_state:$ifb_state:$ingress_state:$classifier_state" in
 			*DUPLICATE*|*CONFLICT*|*ORPHANED*) overall_state=ORPHANED ;;
 			*) overall_state=DEGRADED ;;
@@ -516,11 +612,14 @@ EOF
 	printf '"%s":{' "$(json_escape "$instance")"
 	printf '"overall_state":"%s",' "$overall_state"
 	printf '"autorate_state":"%s","autorate_processes":%s,' "$autorate_state" "$daemon_count"
+	printf '"controller_state":"%s","controller_status_fresh":%s,"controller_reason":"%s",' \
+		"$controller_state" "$controller_status_fresh" "$(json_escape "$controller_status_reason")"
 	printf '"sqm_config_state":"%s","sqm_section":"%s","sqm_owner":"%s","sqm_target":"%s",' \
 		"$sqm_config_state" "$(json_escape "$sqm_section")" "$(json_escape "$sqm_owner")" \
 		"$(json_escape "$sqm_config_target")"
-	printf '"target_interface":"%s","ul_interface":"%s","dl_interface":"%s",' \
-		"$(json_escape "$resolved_target")" "$(json_escape "$ul_if")" "$(json_escape "$dl_if")"
+	printf '"target_interface":"%s","target_state":"%s","ul_interface":"%s","dl_interface":"%s",' \
+		"$(json_escape "$resolved_target")" "$target_state" \
+		"$(json_escape "$ul_if")" "$(json_escape "$dl_if")"
 	printf '"cake_ul_state":"%s","cake_ul_kind":"%s","cake_ul_mode":"%s","cake_ul_count":%s,"cake_ul_rate_kbps":%s,' \
 		"$cake_ul_state" "$ul_cake_kind" "$ul_cake_mode" "$ul_cake_count" "$ul_cake_rate"
 	printf '"cake_dl_state":"%s","cake_dl_kind":"%s","cake_dl_mode":"%s","cake_dl_count":%s,"cake_dl_rate_kbps":%s,' \

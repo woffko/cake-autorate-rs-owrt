@@ -7,7 +7,7 @@ endif
 
 PKG_NAME:=cake-autorate-rs
 PKG_VERSION:=1.0_rc27
-PKG_RELEASE:=1
+PKG_RELEASE:=10
 
 PKG_MAINTAINER:=woffko
 PKG_LICENSE:=GPL-2.0-or-later
@@ -38,13 +38,16 @@ define Package/cake-autorate-rs/conffiles
 /etc/config/cake-autorate
 endef
 
+# apk does not run the package's pre-deinstall hook on an in-place upgrade,
+# and OpenWrt appends this hook after default_postinst.  start_service() sees
+# PKG_UPGRADE=1 and deliberately turns default_postinst's premature start into
+# a no-op; this hook then performs the one and only stop/start transaction with
+# the newly installed files.
 define Package/cake-autorate-rs/postinst
 [ -n "$${IPKG_INSTROOT}" ] || { \
-	/etc/init.d/cake-autorate enable >/dev/null 2>&1 || true; \
-	/etc/init.d/cake-autorate-mqtt enable >/dev/null 2>&1 || true; \
-	/etc/init.d/cake-autorate restart >/dev/null 2>&1 || \
-		/etc/init.d/cake-autorate start >/dev/null 2>&1 || true; \
-	exit 0; \
+	if [ "$${PKG_UPGRADE:-0}" = 1 ]; then \
+		PKG_UPGRADE=0 /etc/init.d/cake-autorate restart >/dev/null 2>&1 || exit 1; \
+	fi; \
 }
 endef
 

@@ -94,6 +94,25 @@ function readRuntimeHealth() {
 	);
 }
 
+function readSchedulerStatus(section) {
+	return L.resolveDefault(
+		fs.exec('/usr/libexec/cake-autorate-rs/autotune-scheduler', [ 'status', section ])
+			.then(parseExecJson),
+		null
+	);
+}
+
+function readInstanceStatus(section) {
+	return Promise.all([
+		readStatus(section),
+		readSchedulerStatus(section)
+	]).then(function(result) {
+		var status = Object.assign({}, result[0] || {});
+		status.scheduled_autotune = result[1];
+		return status;
+	});
+}
+
 function qualityTestExec(section, action, mode, backend) {
 	return fs.exec('/usr/libexec/cake-autorate-rs/quality-test', [
 		section, action, mode || 'client', backend || 'auto'
@@ -106,7 +125,11 @@ function qualityTestDelay() {
 	});
 }
 
-function qualityReadiness(section, status) {
+function qualityReadiness(section, status, mode) {
+	var uplinkState = String(status && status.uplink_state || '').toUpperCase();
+	var testMode = mode || 'automatic';
+	var routeTestReady;
+
 	if (String(section.enabled || '0') !== '1')
 		return { ready: false, reason: _('Autorate instance is disabled.') };
 	if (String(section.sqm_enabled || '0') !== '1')
@@ -118,8 +141,22 @@ function qualityReadiness(section, status) {
 		};
 	if (!status || !status.transport_latency_enabled)
 		return { ready: false, reason: _('Transport-aware latency must be enabled.') };
-	if (!status.route_active)
-		return { ready: false, reason: _('The selected uplink route is not active.') };
+	if (uplinkState === 'OFFLINE')
+		return { ready: false, reason: _('The selected uplink is offline.') };
+	if (uplinkState === 'LEARNING')
+		return { ready: false, reason: _('The selected uplink is still learning its idle baseline.') };
+	if (uplinkState === 'RECHECKING')
+		return { ready: false, reason: _('The selected uplink route is being rechecked after a temporary routing error.') };
+	if (testMode === 'client' && !status.route_active)
+		return {
+			ready: false,
+			reason: _('Guided client mode requires client traffic to be routed through this uplink. It is currently online but not default-active; add or select an mwan3 client rule, or use Automatic router-side test.')
+		};
+	routeTestReady = status.route_test_ready;
+	if (routeTestReady == null)
+		routeTestReady = uplinkState === 'ACTIVE' || uplinkState === 'STANDBY' || status.route_active;
+	if (testMode === 'automatic' && !routeTestReady)
+		return { ready: false, reason: _('The selected uplink cannot currently prove an isolated test route.') };
 	if (!status.transport_probe_trusted)
 		return { ready: false, reason: _('A trusted native transport backend is required.') };
 	if (!status.quality_grade_baseline_ready)
@@ -129,6 +166,8 @@ function qualityReadiness(section, status) {
 				Number(status.quality_grade_baseline_samples || 0),
 				Number(status.quality_grade_baseline_required_samples || 20))
 		};
+	if (testMode === 'automatic' && uplinkState === 'STANDBY')
+		return { ready: true, reason: _('Ready through the isolated mwan3 member. The uplink is online but not default-active; SQM and autorate remain enabled.') };
 	return { ready: true, reason: _('Ready. SQM and autorate remain enabled during this test.') };
 }
 
@@ -169,7 +208,7 @@ function qualityProgressText(job) {
 
 function showQualityTest(section, status) {
 	var instance = section['.name'];
-	var readiness = qualityReadiness(section, status);
+	var readiness = qualityReadiness(section, status, 'automatic');
 	var mode = E('select', { 'class': 'cbi-input-select' }, [
 		E('option', { 'value': 'automatic' }, _('Automatic router-side test')),
 		E('option', { 'value': 'client' }, _('Guided client capture'))
@@ -178,7 +217,9 @@ function showQualityTest(section, status) {
 	var detail = E('div', { 'class': 'cake-quality-job-detail' },
 		_('Automatic mode first waits for a quiet link, measures background traffic, then runs explicit download-only and upload-only phases through this uplink. Unexpected opposite-direction traffic rejects a contaminated phase. It may take 1–3 passes and transfer several gigabytes on a fast line. Guided mode uses independent download and upload triggers while you run a sequential test from a LAN client. Triggers are percentages of the current CAKE rates, not the physical link or adaptive ceiling caps. Neither mode disables SQM or autorate, changes CAKE limits, or writes samples to flash.'));
 	var running = false;
+	var starting = false;
 	var closed = false;
+	var readinessPolling = false;
 	var startButton;
 	var closeButton;
 
@@ -189,6 +230,7 @@ function showQualityTest(section, status) {
 
 	function finish(job) {
 		running = false;
+		starting = false;
 		startButton.disabled = !readiness.ready;
 		mode.disabled = false;
 		closeButton.textContent = _('Close');
@@ -200,6 +242,55 @@ function showQualityTest(section, status) {
 			setState(_('Rating capture cancelled.'), false);
 		} else {
 			setState(job.error || job.message || _('Rating capture did not complete.'), true);
+		}
+	}
+
+	function refreshReadiness(announce) {
+		return readStatus(instance).then(function(freshStatus) {
+			if (!freshStatus) {
+				readiness = {
+					ready: false,
+					reason: _('Waiting for fresh runtime status from the controller.')
+				};
+				if (startButton)
+					startButton.disabled = true;
+				if (announce && !running && !starting && !closed)
+					setState(readiness.reason, false);
+				return readiness;
+			}
+			readiness = qualityReadiness(section, freshStatus, mode.value);
+			if (!running && !starting && startButton)
+				startButton.disabled = !readiness.ready;
+			if (announce && !running && !starting && !closed)
+				setState(readiness.reason, false);
+			return readiness;
+		}).catch(function(error) {
+			readiness = {
+				ready: false,
+				reason: _('Waiting for fresh runtime status: %s').format(error.message || String(error))
+			};
+			if (startButton)
+				startButton.disabled = true;
+			if (announce && !running && !starting)
+				setState(readiness.reason, false);
+			return readiness;
+		});
+	}
+
+	function pollReadiness() {
+		if (closed || running || starting) {
+			readinessPolling = false;
+			return Promise.resolve();
+		}
+		return qualityTestDelay().then(function() {
+			return refreshReadiness(true);
+		}).then(pollReadiness);
+	}
+
+	function ensureReadinessPoll() {
+		if (!readinessPolling && !closed && !running && !starting) {
+			readinessPolling = true;
+			pollReadiness();
 		}
 	}
 
@@ -220,25 +311,41 @@ function showQualityTest(section, status) {
 	}
 
 	function start() {
-		if (!readiness.ready || running)
+		if (running || starting)
 			return Promise.resolve();
-		running = true;
+		starting = true;
 		startButton.disabled = true;
-		mode.disabled = true;
-		closeButton.textContent = _('Cancel');
-		setState(_('Starting rating capture…'), false);
-		return qualityTestExec(instance, 'start', mode.value,
-			section.speedtest_backend || 'auto').then(function(job) {
-			if (job.error)
-				throw new Error(job.error);
-			return pollJob();
+		return refreshReadiness(false).then(function(freshReadiness) {
+			if (closed) {
+				starting = false;
+				return;
+			}
+			if (!freshReadiness.ready) {
+				starting = false;
+				setState(freshReadiness.reason, false);
+				ensureReadinessPoll();
+				return;
+			}
+			starting = false;
+			running = true;
+			mode.disabled = true;
+			closeButton.textContent = _('Cancel');
+			setState(_('Starting rating capture…'), false);
+			return qualityTestExec(instance, 'start', mode.value,
+				section.speedtest_backend || 'auto').then(function(job) {
+				if (job.error)
+					throw new Error(job.error);
+				return pollJob();
+			});
 		}).catch(function(error) {
-			finish({ state: 'error', error: error.message || String(error) });
+			if (!closed)
+				finish({ state: 'error', error: error.message || String(error) });
 		});
 	}
 
 	function close() {
 		closed = true;
+		starting = false;
 		if (running)
 			return qualityTestExec(instance, 'cancel').catch(function() {}).then(function() {
 				ui.hideModal();
@@ -248,14 +355,20 @@ function showQualityTest(section, status) {
 	}
 
 	startButton = E('button', {
+		'type': 'button',
 		'class': 'btn cbi-button cbi-button-action',
 		'disabled': readiness.ready ? null : '',
 		'click': ui.createHandlerFn(null, start)
 	}, _('Start rating'));
 	closeButton = E('button', {
+		'type': 'button',
 		'class': 'btn cbi-button cbi-button-neutral',
 		'click': ui.createHandlerFn(null, close)
 	}, _('Close'));
+	mode.addEventListener('change', function() {
+		if (!running && !starting && !closed)
+			refreshReadiness(true);
+	});
 
 	ui.showModal(_('Get rating — %s').format(instance), [
 		E('div', { 'class': 'cbi-section' }, [
@@ -277,8 +390,13 @@ function showQualityTest(section, status) {
 			closeButton.textContent = _('Cancel');
 			setState((job.message || _('Collecting rating samples.')) + '\n' + qualityProgressText(job), false);
 			pollJob();
+		} else if (!closed) {
+			return refreshReadiness(true).then(ensureReadinessPoll);
 		}
-	}).catch(function() {});
+	}).catch(function() {
+		if (!closed)
+			return refreshReadiness(true).then(ensureReadinessPoll);
+	});
 }
 
 function renderVersions(versions) {
@@ -350,7 +468,23 @@ function formatRate(value) {
 	return value.toFixed(0) + ' kbps';
 }
 
+function formatBytes(value) {
+	var units = [ 'B', 'KiB', 'MiB', 'GiB', 'TiB' ];
+	var unit = 0;
+
+	value = Number(value || 0);
+	if (!isFinite(value) || value < 0)
+		return '-';
+	while (value >= 1024 && unit < units.length - 1) {
+		value /= 1024;
+		unit++;
+	}
+	return (unit === 0 ? value.toFixed(0) : value.toFixed(value >= 10 ? 1 : 2)) + ' ' + units[unit];
+}
+
 function formatShaperRate(status, direction) {
+	var capacityRoot = status.adaptive_capacity || null;
+	var capacity = capacityRoot && capacityRoot[direction === 'dl' ? 'download' : 'upload'];
 	var rateKey = direction === 'dl' ? 'cake_dl_rate_kbps' : 'cake_ul_rate_kbps';
 	var configuredKey = direction === 'dl' ? 'configured_max_dl_shaper_rate_kbps' : 'configured_max_ul_shaper_rate_kbps';
 	var effectiveKey = direction === 'dl' ? 'effective_max_dl_shaper_rate_kbps' : 'effective_max_ul_shaper_rate_kbps';
@@ -360,22 +494,34 @@ function formatShaperRate(status, direction) {
 	var failedKey = direction === 'dl' ? 'adaptive_ceiling_failed_dl_kbps' : 'adaptive_ceiling_failed_ul_kbps';
 	var probeKey = direction === 'dl' ? 'adaptive_ceiling_probe_dl_kbps' : 'adaptive_ceiling_probe_ul_kbps';
 	var reasonKey = 'adaptive_ceiling_' + direction + '_last_reason';
-	var rate = formatRate(status[rateKey]);
-	var phase, failed, probe, detail, title;
+	var rate = formatRate(capacity && capacity.current_rate_kbps != null ?
+		capacity.current_rate_kbps : status[rateKey]);
+	var phase, failed, probe, safe, detail, title, confidence;
 
-	if (!status.adaptive_ceiling_enabled)
+	if (!(capacityRoot ? capacityRoot.enabled : status.adaptive_ceiling_enabled))
 		return rate;
 
-	phase = String(status[phaseKey] || 'cruise').replace(/_/g, ' ');
-	failed = status[failedKey] == null ? '-' : formatRate(status[failedKey]);
-	probe = status[probeKey] == null ? '-' : formatRate(status[probeKey]);
-	detail = _('Phase: %s · safe: %s').format(phase, formatRate(status[safeKey]));
+	phase = String(capacity && capacity.phase || status[phaseKey] || 'cruise').replace(/_/g, ' ');
+	failed = (capacity ? capacity.failed_bound_kbps : status[failedKey]) == null ? '-' :
+		formatRate(capacity ? capacity.failed_bound_kbps : status[failedKey]);
+	probe = (capacity ? capacity.probe_target_kbps : status[probeKey]) == null ? '-' :
+		formatRate(capacity ? capacity.probe_target_kbps : status[probeKey]);
+	safe = formatRate(capacity && capacity.safe_ceiling_kbps != null ?
+		capacity.safe_ceiling_kbps : status[safeKey]);
+	confidence = Number(capacity && capacity.confidence && capacity.confidence.percent || 0);
+	detail = _('Phase: %s · safe: %s · confidence: %d%%').format(phase, safe, confidence);
 	title = [
 		_('Configured max: %s').format(formatRate(status[configuredKey])),
 		_('Effective ceiling: %s').format(formatRate(status[effectiveKey])),
 		_('Absolute cap: %s').format(formatRate(status[capKey])),
+		_('Runtime minimum: %s').format(capacity && capacity.runtime_minimum_kbps != null ?
+			formatRate(capacity.runtime_minimum_kbps) : '-'),
 		_('Failed bound: %s').format(failed),
 		_('Probe target: %s').format(probe),
+		_('Causal result: %s').format(capacity && capacity.causal_state || '-'),
+		_('No CAKE effect: %s').format(capacity && capacity.no_cake_effect === true ? _('yes') :
+			(capacity && capacity.no_cake_effect === false ? _('no') : '-')),
+		_('Route epoch: %s').format(capacityRoot && capacityRoot.route_epoch || '-'),
 		_('Last transition: %s').format(status[reasonKey] || '-')
 	].join('\n');
 
@@ -383,7 +529,7 @@ function formatShaperRate(status, direction) {
 		'title': title
 	}, [
 		E('div', {}, rate),
-		E('small', { 'style': 'white-space:nowrap' },
+		E('small', { 'style': 'display:block;white-space:normal;overflow-wrap:anywhere' },
 			detail)
 	]);
 }
@@ -567,12 +713,23 @@ function hasProbeSample(status) {
 	});
 }
 
+function sqmRuntimePending(status) {
+	var state = String(status && (status.sqm_runtime_state || status.state) || '').toUpperCase();
+
+	return state === 'WAITING_LINK' || state === 'WAITING_SQM' ||
+		state === 'WAITING_EXTERNAL_SQM' || state === 'WAITING_OPERATION' ||
+		state === 'RECOVERING';
+}
+
 function probeWarning(status, enabled) {
 	var started, runtime;
 
 	if (!enabled || !status || !status.state || hasProbeSample(status))
 		return null;
-	if (status.uplink_state === 'OFFLINE' || status.uplink_state === 'LEARNING')
+	if (sqmRuntimePending(status))
+		return null;
+	if (status.uplink_state === 'OFFLINE' || status.uplink_state === 'LEARNING' ||
+	    status.uplink_state === 'RECHECKING')
 		return null;
 
 	started = Number(status.started_at || 0);
@@ -588,10 +745,16 @@ function probeWarning(status, enabled) {
 
 function trafficProfileLabel(value) {
 	switch (value) {
-	case 'gaming': return _('Gaming');
+	case 'gaming':
+	case 'gaming-extreme':
+	case 'extreme_gaming':
+	case 'gaming_extreme': return _('Gaming');
 	case 'best-overall':
 	case 'balanced':
 	case 'best_overall': return _('Best overall');
+	case 'variable':
+	case 'variable-link':
+	case 'variable_link': return _('Variable link');
 	case 'fair': return _('Fair');
 	case 'custom': return _('Custom');
 	default: return _('Unknown');
@@ -600,7 +763,7 @@ function trafficProfileLabel(value) {
 
 function formatState(status, enabled, sectionData, health) {
 	var value = status && (status.uplink_state || status.state);
-	var warning, autotuneProfile, priorities, priorityTitle, lines;
+	var warning, autotuneProfile, priorities, priorityTitle, learningMode, lines, schedule;
 
 	autotuneProfile = trafficProfileLabel(
 		health && health.autotune_profile || sectionData && sectionData.autotune_profile);
@@ -609,7 +772,10 @@ function formatState(status, enabled, sectionData, health) {
 	} else {
 		var sectionAutotune = (function(value) {
 			switch (value) {
-			case 'gaming': return 'gaming';
+			case 'gaming':
+			case 'gaming-extreme':
+			case 'extreme_gaming':
+			case 'gaming_extreme': return 'gaming';
 			case 'fair': return 'fair';
 			default: return 'best_overall';
 			}
@@ -617,7 +783,9 @@ function formatState(status, enabled, sectionData, health) {
 		var mode = health && health.traffic_profile_mode || sectionData.traffic_profile ||
 			(sectionData['traffic_defaults_' + sectionAutotune] === '0' ? 'custom' : 'auto');
 		var resolved = health && health.traffic_profile_resolved ||
-			(mode === 'auto' ? sectionData.autotune_profile : mode);
+			(mode === 'auto' ?
+				(sectionData.autotune_profile === 'variable_link' ? 'best_overall' :
+					sectionData.autotune_profile) : mode);
 		priorities = trafficProfileLabel(resolved);
 		if (mode === 'auto')
 			priorities += ' · ' + _('linked');
@@ -627,18 +795,71 @@ function formatState(status, enabled, sectionData, health) {
 			_('Runtime classifier: %s').format(health.classifier_state) : '';
 	}
 	value = value ? String(value).toUpperCase() : (enabled ? '-' : _('DISABLED'));
+	if (sectionData && sectionData.scheduled_autotune_enabled === '1')
+		learningMode = _('Passive + scheduled active');
+	else if (sectionData && sectionData.adaptive_ceiling_enabled === '1')
+		learningMode = _('Passive only');
+	else
+		learningMode = _('Configured bounds');
 	lines = [
 		E('strong', {}, value),
 		E('small', { 'style': 'display:block;white-space:nowrap' },
 			_('Controller: %s').format(String(status && status.state || (enabled ? '-' : 'disabled')).toUpperCase())),
 		E('small', { 'style': 'display:block;white-space:nowrap' },
 			_('Auto-Tune: %s').format(autotuneProfile)),
+		E('small', { 'style': 'display:block;white-space:normal' },
+			_('Learning: %s').format(learningMode)),
 		E('small', { 'style': 'display:block;white-space:nowrap', 'title': priorityTitle || '' },
 			_('Priorities: %s').format(priorities))
 	];
+	schedule = status && status.scheduled_autotune;
+	if (schedule && schedule.enabled) {
+		var dailyRemaining = Number(schedule.daily && schedule.daily.remaining_bytes || 0);
+		var monthlyRemaining = Number(schedule.monthly && schedule.monthly.remaining_bytes || 0);
+		var nextDue = Number(schedule.next_due_at || 0);
+		var scheduleText = _('Active budget: %s today · %s this month').format(
+			formatBytes(dailyRemaining), formatBytes(monthlyRemaining));
+
+		if (nextDue > 0)
+			scheduleText += ' · ' + _('due %s').format(new Date(nextDue * 1000).toLocaleString());
+		lines.push(E('small', {
+			'style': 'display:block;white-space:normal',
+			'class': schedule.accounting_error ? 'cake-schedule-error' : '',
+			'title': schedule.message || ''
+		}, scheduleText));
+		if (schedule.accounting_error)
+			lines.push(E('small', { 'style': 'display:block;color:#f66;white-space:normal' },
+				_('Scheduled traffic accounting is blocked until it is repaired.')));
+	}
 	if (status && status.sqm_runtime_managed && !status.sqm_runtime_healthy) {
-		lines[0] = E('strong', { 'style': 'color:#f44' }, status.sqm_runtime_state || _('ERROR'));
-		lines.splice(1, 0, E('small', { 'style': 'display:block;color:#f66' }, _('CAKE/IFB unavailable')));
+		var pending = sqmRuntimePending(status);
+		var runtimeState = String(status.sqm_runtime_state || '').toUpperCase();
+		var runtimeLabel = pending ? _('WAITING') : _('ERROR');
+		var runtimeDetail = pending ? _('Waiting for link/SQM') : _('CAKE/IFB unavailable');
+
+		switch (runtimeState) {
+		case 'WAITING_LINK':
+			runtimeDetail = _('WAN link unavailable · automatic recovery armed');
+			break;
+		case 'WAITING_SQM':
+			runtimeDetail = _('Waiting for SQM hotplug to settle');
+			break;
+		case 'WAITING_OPERATION':
+			runtimeDetail = _('Waiting for another SQM operation');
+			break;
+		case 'RECOVERING':
+			runtimeLabel = _('RECOVERING');
+			runtimeDetail = _('Restoring managed CAKE/SQM');
+			break;
+		}
+		lines[0] = E('strong', {
+			'style': pending ? 'color:#d08b20' : 'color:#f44'
+		}, runtimeLabel);
+		lines.splice(1, 0, E('small', {
+			'style': pending ?
+				'display:block;color:#d08b20;white-space:normal;overflow-wrap:anywhere' :
+				'display:block;color:#f66;white-space:normal;overflow-wrap:anywhere'
+		}, runtimeDetail));
 		return E('div', {
 			'title': status.sqm_runtime_reason || _('Managed SQM runtime is unhealthy.')
 		}, lines);
@@ -667,7 +888,7 @@ function formatHealthRate(value) {
 }
 
 function formatServices(health) {
-	var overall, title, details;
+	var overall, diagnostics, details, transient, summaryTitle;
 
 	if (!health)
 		return E('div', { 'class': 'cake-services-stack cake-services-unavailable' }, [
@@ -676,10 +897,13 @@ function formatServices(health) {
 		]);
 
 	overall = String(health.overall_state || 'UNKNOWN').toUpperCase();
-	title = [
+	diagnostics = [
 		_('Overall: %s').format(overall),
 		_('Autorate: %s (%d process(es))').format(
 			health.autorate_state || '-', Number(health.autorate_processes || 0)),
+		_('Controller: %s%s').format(
+			health.controller_state || '-',
+			health.controller_status_fresh ? '' : _(' (status stale or absent)')),
 		_('Managed SQM: %s (%s)').format(health.sqm_config_state || '-', health.sqm_section || '-'),
 		_('Upload CAKE: %s on %s at %s').format(
 			health.cake_ul_state || '-', health.ul_interface || '-',
@@ -702,13 +926,35 @@ function formatServices(health) {
 		_('Apply transaction: %s').format(health.apply_state || '-')
 	];
 	if (health.issues)
-		title.push(_('Detected issue: %s').format(health.issues));
+		diagnostics.push(_('Detected issue: %s').format(health.issues));
 
-	details = [
+	transient = overall === 'WAITING' || overall === 'RECOVERING';
+	summaryTitle = _('Overall: %s').format(overall);
+	if (health.controller_reason)
+		summaryTitle += '\n' + health.controller_reason;
+
+	details = transient ? [
+		E('span', { 'class': 'cake-services-wait-reason' },
+			health.controller_reason ||
+			(health.target_state === 'MISSING' ?
+				_('WAN link unavailable; automatic recovery is armed.') :
+				_('Managed SQM is settling; automatic recovery is armed.'))),
 		E('span', {}, [
 			_('Autorate %s').format(health.autorate_state || '-'),
 			' · ',
 			_('SQM %s').format(health.sqm_config_state || '-')
+		]),
+		E('span', {}, _('Operation %s').format(health.operation_state || '-'))
+	] : [
+		E('span', {}, [
+			_('Autorate %s').format(health.autorate_state || '-'),
+			' · ',
+			_('Controller %s').format(health.controller_state || '-')
+		]),
+		E('span', {}, [
+			_('SQM %s').format(health.sqm_config_state || '-'),
+			' · ',
+			_('Runtime %s').format(health.controller_status_fresh ? _('fresh') : _('stale'))
 		]),
 		E('span', {}, [
 			_('UL %s %s').format(
@@ -729,12 +975,21 @@ function formatServices(health) {
 		]),
 		E('span', {}, _('Operation %s').format(health.operation_state || '-'))
 	];
-	if (health.issues)
-		details.push(E('small', { 'class': 'cake-services-issue' }, health.issues));
+	if (health.issues) {
+		details.push(E('small', {
+			'class': transient ? 'cake-services-note' : 'cake-services-issue'
+		}, health.issues));
+	}
+	details.push(E('details', { 'class': 'cake-services-technical' }, [
+		E('summary', {}, _('Technical details')),
+		E('div', {}, diagnostics.map(function(line) {
+			return E('small', {}, line);
+		}))
+	]));
 
 	return E('div', {
 		'class': 'cake-services-stack cake-services-' + overall.toLowerCase().replace(/[^a-z0-9_-]/g, '-'),
-		'title': title.join('\n')
+		'title': summaryTitle
 	}, [
 		E('strong', { 'class': 'cake-services-overall' }, overall),
 		E('div', { 'class': 'cake-services-details' }, details)
@@ -757,6 +1012,7 @@ function formatRoute(status) {
 		_('fwmark: %s').format(status.route_fwmark || '-'),
 		_('Routing table: %s').format(status.route_table || '-'),
 		_('Default-active: %s').format(status.route_active ? _('yes') : _('no')),
+		_('Forced-test ready: %s').format(status.route_test_ready ? _('yes') : _('no')),
 		_('Uplink error code: %s').format(status.uplink_error_code || '-'),
 		_('Reason: %s').format(status.uplink_reason || '-')
 	].join('\n');
@@ -811,6 +1067,7 @@ function renderQualityAction(section, status, enabled) {
 
 	return E('div', { 'class': 'cake-quality-action' }, [
 		E('button', {
+			'type': 'button',
 			'class': 'btn cbi-button cbi-button-action',
 			'disabled': enabled ? null : '',
 			'title': readiness.reason,
@@ -958,10 +1215,12 @@ function renderColumnChooser(globalSection, selectedKeys, onChange) {
 		E('div', { 'class': 'cake-status-column-options' }, options),
 		E('div', { 'class': 'cake-status-column-buttons' }, [
 			E('button', {
+				'type': 'button',
 				'class': 'btn cbi-button cbi-button-positive',
 				'click': ui.createHandlerFn(null, function() { return saveSelection(false); })
 			}, _('Apply')),
 			E('button', {
+				'type': 'button',
 				'class': 'btn cbi-button cbi-button-neutral',
 				'click': ui.createHandlerFn(null, function() { return saveSelection(true); })
 			}, _('Reset default'))
@@ -977,7 +1236,7 @@ return L.view.extend({
 			var globalSection = uci.sections('cake-autorate', 'globals')[0] || { '.name': 'globals' };
 			return Promise.all([
 				Promise.all(sections.map(function(section) {
-					return readStatus(section['.name']);
+					return readInstanceStatus(section['.name']);
 				})),
 				readPackageVersions(),
 				readRuntimeHealth()
@@ -1015,7 +1274,7 @@ return L.view.extend({
 		poll.add(function() {
 			return Promise.all([
 				Promise.all(sections.map(function(section) {
-					return readStatus(section['.name']);
+					return readInstanceStatus(section['.name']);
 				})),
 				readRuntimeHealth()
 			]).then(function(result) {
@@ -1045,9 +1304,11 @@ return L.view.extend({
 				'.cake-services-stack{gap:5px;min-width:210px}.cake-services-overall{letter-spacing:.025em}',
 				'.cake-services-details{display:flex!important;flex-direction:column;gap:2px;font-size:11px;line-height:1.3}',
 				'.cake-services-healthy .cake-services-overall{color:#16a085}.cake-services-disabled .cake-services-overall{color:#888}',
-				'.cake-services-unmanaged .cake-services-overall,.cake-services-degraded .cake-services-overall{color:#d08b20}',
+				'.cake-services-unmanaged .cake-services-overall,.cake-services-degraded .cake-services-overall,.cake-services-waiting .cake-services-overall,.cake-services-recovering .cake-services-overall{color:#d08b20}',
 				'.cake-services-orphaned .cake-services-overall,.cake-services-blocked .cake-services-overall,.cake-services-unavailable strong{color:#d34b4b}',
 				'.cake-services-issue{white-space:normal!important;overflow-wrap:anywhere;color:#d34b4b!important;max-width:100%}',
+				'.cake-services-note,.cake-services-wait-reason{white-space:normal!important;overflow-wrap:anywhere;color:#d08b20!important;max-width:100%}',
+				'.cake-services-technical{max-width:100%;margin-top:2px}.cake-services-technical>summary{cursor:pointer;color:#888;font-size:11px}.cake-services-technical>div{display:flex;flex-direction:column;gap:2px;margin-top:5px;white-space:normal;overflow-wrap:anywhere}',
 				'.cake-quality-stack{gap:7px;min-width:210px}',
 				'.cake-quality-detected{display:grid!important;grid-template-columns:66px minmax(30px,auto);column-gap:7px;align-items:baseline!important}',
 				'.cake-quality-detected small{grid-column:1 / -1;color:#888;white-space:normal}',
@@ -1072,18 +1333,22 @@ return L.view.extend({
 			E('div', { 'class': 'cbi-section cake-status-toolbar' }, [
 				E('div', { 'class': 'cake-status-actions' }, [
 					E('button', {
+						'type': 'button',
 						'class': 'btn cbi-button cbi-button-action',
 						'click': ui.createHandlerFn(this, function() { return serviceAction('start'); })
 					}, _('Start')),
 					E('button', {
+						'type': 'button',
 						'class': 'btn cbi-button cbi-button-action',
 						'click': ui.createHandlerFn(this, function() { return serviceAction('restart'); })
 					}, _('Restart')),
 					E('button', {
+						'type': 'button',
 						'class': 'btn cbi-button cbi-button-remove',
 						'click': ui.createHandlerFn(this, function() { return serviceAction('stop'); })
 					}, _('Stop')),
 					E('button', {
+						'type': 'button',
 						'class': 'btn cbi-button cbi-button-action',
 						'click': ui.createHandlerFn(this, exportLogs)
 					}, _('Export logs'))

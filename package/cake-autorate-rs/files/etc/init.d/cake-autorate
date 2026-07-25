@@ -4,7 +4,7 @@ START=97
 STOP=4
 USE_PROCD=1
 EXTRA_COMMANDS="recover_interface"
-EXTRA_HELP="\trecover_interface <mwan3-member>\tStart a member instance that was unavailable at boot"
+EXTRA_HELP="\trecover_interface <mwan3-member>\tReport an unexpectedly absent member controller"
 
 CONFIG="cake-autorate"
 SQM_CONFIG="sqm"
@@ -23,6 +23,7 @@ SQM_MANAGED=0
 CAKE_CONFIG_CHANGED=0
 SQM_INTERFACES=""
 SQM_CONFLICT_FILE="${CAKE_AUTORATE_SQM_CONFLICT_FILE:-/var/run/cake-autorate/sqm-conflicts}"
+RUNTIME_ROOT="${CAKE_AUTORATE_RUN_ROOT:-/var/run/cake-autorate}"
 BRIDGER_CONFIG_CHANGED=0
 
 if [ -r "$RUNTIME_LOCK_LIB" ]; then
@@ -299,8 +300,9 @@ migrate_legacy_route_instance() {
 
 canonical_traffic_autotune_profile() {
 	case "$1" in
-		gaming) printf 'gaming\n' ;;
+		gaming|gaming_extreme|gaming-extreme|extreme_gaming) printf 'gaming\n' ;;
 		fair) printf 'fair\n' ;;
+		variable_link|variable-link|variable) printf 'variable_link\n' ;;
 		best_overall|best-overall|balanced|'') printf 'best_overall\n' ;;
 		*) return 1 ;;
 	esac
@@ -308,7 +310,7 @@ canonical_traffic_autotune_profile() {
 
 migrate_traffic_profile_instance() {
 	local section="$1"
-	local migrated configured autotune defaults_option defaults_enabled
+	local migrated configured autotune defaults_profile defaults_option defaults_enabled
 	local rule rule_instance rule_profile raw_rule_profile
 
 	config_get migrated "$section" traffic_profile_migrated
@@ -316,7 +318,9 @@ migrate_traffic_profile_instance() {
 	config_get configured "$section" traffic_profile
 	autotune="$(canonical_traffic_autotune_profile "$(uci -q get "$CONFIG.$section.autotune_profile")")" ||
 		autotune=best_overall
-	defaults_option="traffic_defaults_$autotune"
+	defaults_profile="$autotune"
+	[ "$defaults_profile" = variable_link ] && defaults_profile=best_overall
+	defaults_option="traffic_defaults_$defaults_profile"
 	defaults_enabled="$(uci -q get "$CONFIG.$section.$defaults_option")"
 
 	if [ "$defaults_enabled" = 0 ] && { [ -z "$configured" ] || [ "$configured" = custom ]; }; then
@@ -729,48 +733,21 @@ instance_has_enabled_sqm_backing() {
 	return 1
 }
 
-instance_has_interface_backing() {
+instance_has_startable_config() {
 	local section="$1"
-	local dl rx enabled auto manage_sqm sqm_enabled target
+	local manage_sqm sqm_enabled
 
-	config_get rx "$section" rx_bytes_path
-	[ -n "$rx" ] && return 0
-
-	config_get dl "$section" dl_if
-	case "$dl" in
-		ifb*) ;;
-		*) return 0 ;;
-	esac
-
-	config_get_bool auto "$section" auto_interface_preset 1
-	[ "$auto" -eq 1 ] || return 0
-
-	config_get_bool enabled "$section" enabled 0
 	config_get_bool manage_sqm "$section" manage_sqm 1
-	config_get_bool sqm_enabled "$section" sqm_enabled "$enabled"
+	[ "$manage_sqm" -eq 1 ] || return 0
+	config_get_bool sqm_enabled "$section" sqm_enabled 0
 
-	if [ "$manage_sqm" -eq 1 ] && [ "$sqm_enabled" -ne 1 ]; then
-		logger -t cake-autorate "not starting instance '$section': auto_interface_preset selected dl_if '$dl', but SQM is disabled for this managed instance"
+	if [ "$sqm_enabled" -ne 1 ]; then
+		logger -t cake-autorate "not starting instance '$section': managed SQM is disabled"
 		return 1
 	fi
 
 	if ! instance_has_enabled_sqm_backing "$section"; then
-		logger -t cake-autorate "not starting instance '$section': auto_interface_preset selected dl_if '$dl', but no enabled SQM backing queue is configured for this instance"
-		return 1
-	fi
-
-	if [ ! -e "/sys/class/net/$dl" ]; then
-		logger -t cake-autorate "not starting instance '$section': auto_interface_preset selected dl_if '$dl', but that IFB is not present after SQM startup"
-		return 1
-	fi
-
-	config_get target "$section" sqm_interface
-	[ -n "$target" ] || config_get target "$section" ul_if
-	[ -n "$target" ] || config_get target "$section" wan_if
-	target="$(resolve_interface_device "$target")"
-	if command -v tc >/dev/null 2>&1 &&
-	   ! tc filter show dev "$target" ingress 2>/dev/null | grep -Fq "$dl"; then
-		logger -t cake-autorate "not starting instance '$section': IFB '$dl' exists but '$target' has no active ingress redirect to it (check duplicate SQM queues or bridger clsact)"
+		logger -t cake-autorate "not starting instance '$section': no enabled SQM backing queue is configured for this managed instance"
 		return 1
 	fi
 
@@ -787,7 +764,7 @@ start_instance() {
 		logger -t cake-autorate "not starting instance '$section': duplicate managed CAKE queue target"
 		return 0
 	fi
-	instance_has_interface_backing "$section" || return 0
+	instance_has_startable_config "$section" || return 0
 
 	procd_open_instance "$section"
 	procd_set_param command "$DAEMON" --instance "$section"
@@ -818,6 +795,12 @@ start_service() {
 	local lock_was_held="$SERVICE_RUNTIME_LOCK_HELD"
 	local rc
 
+	# During an in-place APK upgrade default_postinst calls this entry point
+	# before the package-specific postinst hook.  Starting here would leave the
+	# old process alive or create a second SQM lifecycle.  The postinst hook
+	# immediately follows with PKG_UPGRADE=0 and one guarded restart.
+	[ "${PKG_UPGRADE:-0}" = 1 ] && return 0
+
 	service_runtime_lock_acquire_or_exit "start CAKE Autorate"
 	if start_service_locked; then
 		rc=0
@@ -843,9 +826,11 @@ recover_interface_locked() {
 		config_get_bool enabled "$section" enabled 0
 		[ "$enabled" -eq 1 ] || continue
 		pgrep -f "^$DAEMON --instance $section\$" >/dev/null 2>&1 && continue
-		logger -t cake-autorate "mwan3 member '$member' recovered while instance '$section' was absent; reloading managed SQM and instances"
-		reload_service
-		return 0
+		# Enabled, structurally valid instances are registered with procd even
+		# while their WAN/IFB is absent.  Their daemon waits and performs only
+		# target-scoped recovery.  Never turn a member-up hint into a global
+		# reload: that would stop unrelated WAN shapers and race SQM hotplug.
+		logger -t cake-autorate "mwan3 member '$member' is up but controller '$section' is absent; procd respawn/service state requires inspection"
 	done
 }
 
@@ -904,11 +889,26 @@ restart() {
 }
 
 cleanup_runtime_files() {
-	# Runtime status and graph history live only in tmpfs. Remove them whenever
-	# the service is explicitly stopped so LuCI cannot show inactive instances.
-	rm -f /var/run/cake-autorate/*/status.json \
-		/var/run/cake-autorate/*/history.csv \
-		/var/run/cake-autorate/*/history.csv.tmp 2>/dev/null || true
+	local runtime_dir instance
+
+	# Runtime status and graph history live only in tmpfs. A delayed
+	# service_stopped() from an earlier package-manager stop must never erase
+	# files already owned by a replacement daemon, so reconcile each instance
+	# with the actual process before removing anything.
+	for runtime_dir in "$RUNTIME_ROOT"/*; do
+		[ -d "$runtime_dir" ] && [ ! -L "$runtime_dir" ] || continue
+		instance="${runtime_dir##*/}"
+		case "$instance" in
+			''|*[!A-Za-z0-9_]*) continue ;;
+		esac
+		if pgrep -f "^$DAEMON --instance $instance\$" >/dev/null 2>&1; then
+			logger -t cake-autorate "preserving runtime files for active replacement instance '$instance'"
+			continue
+		fi
+		rm -f "$runtime_dir/status.json" \
+			"$runtime_dir/history.csv" \
+			"$runtime_dir/history.csv.tmp" 2>/dev/null || true
+	done
 }
 
 stop_service() {
@@ -934,14 +934,23 @@ stop_service() {
 }
 
 service_stopped() {
+	local cleanup_lock_acquired=0
+
 	# procd_kill() returns before the terminated process is fully reaped. Give
-	# the daemon a moment to stop so it cannot recreate status.json after the
-	# cleanup, then remove all volatile runtime files synchronously.
+	# the daemon a moment to stop. Some package-manager paths invoke this hook
+	# asynchronously, so acquire the same exclusive lifecycle lock when the
+	# original stop shell did not carry it into this callback.
 	sleep 1
+	if [ "$SERVICE_RUNTIME_LOCK_HELD" -eq 0 ]; then
+		service_runtime_lock_acquire_or_exit "clean up stopped CAKE Autorate runtime files"
+		cleanup_lock_acquired=1
+	fi
 	cleanup_runtime_files
 	if [ "$SERVICE_RUNTIME_STOP_RELEASE_PENDING" -eq 1 ]; then
 		SERVICE_RUNTIME_STOP_RELEASE_PENDING=0
 		service_runtime_lock_release_or_exit "stopping CAKE Autorate"
+	elif [ "$cleanup_lock_acquired" -eq 1 ]; then
+		service_runtime_lock_release_or_exit "cleaning up stopped CAKE Autorate runtime files"
 	fi
 }
 

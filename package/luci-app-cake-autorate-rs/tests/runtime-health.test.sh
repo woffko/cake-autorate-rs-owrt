@@ -138,6 +138,20 @@ if (String(value) !== expected)
 EOF
 }
 
+assert_field_matches() {
+	file="$1"
+	field="$2"
+	pattern="$3"
+	node - "$file" "$field" "$pattern" <<'EOF'
+const fs = require('node:fs');
+const [file, field, pattern] = process.argv.slice(2);
+const value = field.split('.').reduce((current, key) => current[key],
+	JSON.parse(fs.readFileSync(file, 'utf8')).instances.wan_sqm);
+if (!new RegExp(pattern).test(String(value)))
+	throw new Error(`${field}: ${String(value)} does not match ${pattern}`);
+EOF
+}
+
 mkdir -p "$ROOT/sys/ifb4eth0"
 export RH_ENABLED=1 RH_MANAGE=1 RH_SQM_ENABLED=1 RH_QUEUE_PRESENT=1
 export RH_QUEUE_ENABLED=1 RH_OWNER=wan_sqm RH_TARGET=eth0
@@ -158,6 +172,7 @@ assert_field "$ROOT/healthy.json" autotune_profile best_overall
 assert_field "$ROOT/healthy.json" traffic_profile_mode auto
 assert_field "$ROOT/healthy.json" traffic_profile_resolved best_overall
 assert_field "$ROOT/healthy.json" cake_ul_mode diffserv4
+assert_field "$ROOT/healthy.json" target_state PRESENT
 
 export RH_RULES_ENABLED='' RH_CLASSIFIER_STATE=inactive
 "$HELPER" > "$ROOT/rules-opt-in.json"
@@ -192,6 +207,78 @@ assert_field "$ROOT/degraded.json" autorate_state STOPPED
 assert_field "$ROOT/degraded.json" cake_ul_state ACTIVE
 assert_field "$ROOT/degraded.json" cake_dl_state MISSING
 assert_field "$ROOT/degraded.json" ifb_state MISSING
+
+mkdir -p "$ROOT/runtime/wan_sqm"
+now="$(date +%s)"
+printf '%s\n' \
+	"{\"state\":\"WAITING_SQM\",\"sqm_runtime_reason\":\"waiting for IFB\",\"updated_at\":$now}" \
+	> "$ROOT/runtime/wan_sqm/status.json"
+export RH_DAEMON_COUNT=1
+"$HELPER" > "$ROOT/waiting.json"
+assert_field "$ROOT/waiting.json" overall_state WAITING
+assert_field "$ROOT/waiting.json" autorate_state RUNNING
+assert_field "$ROOT/waiting.json" controller_state WAITING_SQM
+assert_field "$ROOT/waiting.json" controller_status_fresh 1
+assert_field "$ROOT/waiting.json" classifier_state WAITING
+assert_field_matches "$ROOT/waiting.json" issues '^Controller is waiting: waiting for IFB$'
+
+rm -rf "$ROOT/sys/eth0"
+printf '%s\n' \
+	"{\"state\":\"WAITING_LINK\",\"sqm_runtime_reason\":\"target interface eth0 is unavailable\",\"updated_at\":$now}" \
+	> "$ROOT/runtime/wan_sqm/status.json"
+export RH_TC_MODE=none
+"$HELPER" > "$ROOT/waiting-link.json"
+assert_field "$ROOT/waiting-link.json" overall_state WAITING
+assert_field "$ROOT/waiting-link.json" target_state MISSING
+assert_field "$ROOT/waiting-link.json" classifier_state WAITING
+assert_field_matches "$ROOT/waiting-link.json" issues '^Controller is waiting: target interface eth0 is unavailable$'
+mkdir -p "$ROOT/sys/eth0"
+export RH_TC_MODE=missing_dl
+
+printf '%s\n' \
+	'{"state":"WAITING_SQM","sqm_runtime_reason":"stale wait","updated_at":1}' \
+	> "$ROOT/runtime/wan_sqm/status.json"
+"$HELPER" > "$ROOT/stale-waiting.json"
+assert_field "$ROOT/stale-waiting.json" overall_state DEGRADED
+assert_field "$ROOT/stale-waiting.json" controller_state WAITING_SQM
+assert_field "$ROOT/stale-waiting.json" controller_status_fresh 0
+
+mkdir -p "$ROOT/sys/ifb4eth0"
+export RH_TC_MODE=healthy RH_CLASSIFIER_STATE=active
+printf '%s\n' \
+	"{\"state\":\"IDLE\",\"updated_at\":$now}" \
+	> "$ROOT/runtime/wan_sqm/status.json"
+"$HELPER" > "$ROOT/idle.json"
+assert_field "$ROOT/idle.json" overall_state HEALTHY
+assert_field "$ROOT/idle.json" controller_state IDLE
+assert_field "$ROOT/idle.json" controller_status_fresh 1
+
+printf '%s\n' \
+	"{\"state\":\"STALL\",\"updated_at\":$now}" \
+	> "$ROOT/runtime/wan_sqm/status.json"
+"$HELPER" > "$ROOT/stall.json"
+assert_field "$ROOT/stall.json" overall_state HEALTHY
+assert_field "$ROOT/stall.json" controller_state STALL
+assert_field "$ROOT/stall.json" controller_status_fresh 1
+
+# Production supplies jsonfilter through PATH.  Ensure a relative executable
+# is detected, and ensure the fallback still reads the top-level state rather
+# than a later nested confidence state.
+cat > "$ROOT/bin/jsonfilter" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+chmod +x "$ROOT/bin/jsonfilter"
+PATH="$ROOT/bin:$PATH"
+export PATH CAKE_AUTORATE_JSONFILTER_BIN=jsonfilter
+printf '%s\n' \
+	"{\"state\":\"RUNNING\",\"updated_at\":$now,\"adaptive_capacity\":{\"download\":{\"confidence\":{\"state\":\"passive_transport\"}}}}" \
+	> "$ROOT/runtime/wan_sqm/status.json"
+"$HELPER" > "$ROOT/nested-state.json"
+assert_field "$ROOT/nested-state.json" controller_state RUNNING
+assert_field "$ROOT/nested-state.json" controller_status_fresh 1
+export CAKE_AUTORATE_JSONFILTER_BIN=/bin/false
+rm -rf "$ROOT/runtime/wan_sqm"
 
 mkdir -p "$ROOT/sys/ifb4eth0"
 export RH_DAEMON_COUNT=1 RH_TC_MODE=healthy RH_CLASSIFIER_STATE=inactive

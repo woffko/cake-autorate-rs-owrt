@@ -12,6 +12,7 @@
 				"/etc/init.d/sqm status": [ "exec" ],
 				"/usr/libexec/cake-autorate-rs/package-versions": [ "exec" ],
 				"/usr/libexec/cake-autorate-rs/runtime-health": [ "exec" ],
+				"/usr/libexec/cake-autorate-rs/autotune-scheduler status *": [ "exec" ],
 				"/usr/libexec/cake-autorate-rs/traffic-classifier presets": [ "exec" ],
 				"/usr/libexec/cake-autorate-rs/traffic-classifier status": [ "exec" ],
 				"/usr/libexec/cake-autorate-rs/traffic-classifier status *": [ "exec" ],
@@ -54,7 +55,8 @@
 				"/usr/libexec/cake-autorate-rs/status-columns *": [ "exec" ]
 			},
 			"ubus": {
-				"luci": [ "setInitAction" ]
+				"luci": [ "setInitAction" ],
+				"uci": [ "revert" ]
 			},
 			"uci": [ "cake-autorate", "sqm" ]
 		}

@@ -171,6 +171,11 @@ grep -q '"autotune_profile":"gaming"' "$ROOT/status-instance.json"
 grep -q '"configured_profile":"auto"' "$ROOT/status-instance.json"
 grep -q '"resolved_profile":"gaming"' "$ROOT/status-instance.json"
 grep -q '"profile":"gaming"' "$ROOT/status-instance.json"
+export TC_PROFILE=gaming_extreme
+"$HELPER" status wan_sqm > "$ROOT/status-extreme-uci.json"
+grep -q '"autotune_profile":"gaming"' "$ROOT/status-extreme-uci.json"
+grep -q '"resolved_profile":"gaming"' "$ROOT/status-extreme-uci.json"
+export TC_PROFILE=gaming
 "$HELPER" status missing_instance > "$ROOT/status-missing.json"
 grep -q '"state":"missing"' "$ROOT/status-missing.json"
 export TC_NFT_DRIFT=1

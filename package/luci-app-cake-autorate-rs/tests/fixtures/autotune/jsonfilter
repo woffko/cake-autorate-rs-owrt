@@ -1,11 +1,24 @@
 #!/bin/sh
 
+input_file=""
+if [ "$1" = "-i" ]; then
+	input_file="$2"
+	shift 2
+fi
 [ "$1" = "-e" ] || exit 1
 expression="$2"
-input="$(sed -n '1p')"
+if [ -n "$input_file" ]; then
+	input="$(sed -n '1p' "$input_file")"
+else
+	input="$(sed -n '1p')"
+fi
 case "$input" in \{*\}) ;; *) exit 1 ;; esac
 
 case "$expression" in
+	'@.pid'|'@.starttime')
+		key="${expression#@.}"
+		printf '%s\n' "$input" | sed -n "s/.*\"$key\":\([0-9][0-9]*\).*/\1/p"
+		;;
 	'@.state')
 		printf '%s\n' "$input" | awk -F '"state":"' '
 			NF > 1 {
@@ -43,6 +56,13 @@ case "$expression" in
 		;;
 	'@.run_id')
 		printf '%s\n' "$input" | sed -n 's/.*"run_id":"\([^"]*\)".*/\1/p'
+		;;
+	'@.job_id')
+		printf '%s\n' "$input" | sed -n 's/.*"job_id":"\([^"]*\)".*/\1/p'
+		;;
+	'@.runtime_restored'|'@.recovery_pending')
+		key="${expression#@.}"
+		printf '%s\n' "$input" | sed -n "s/.*\"$key\":\(true\|false\).*/\1/p"
 		;;
 	'@.target_grade')
 		printf '%s\n' "$input" | sed -n 's/.*"target_grade":"\([^"]*\)".*/\1/p'

@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 const ROUTE_IDENTITY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const ROUTE_INSPECTION_ERROR_GRACE: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RouteMode {
@@ -164,6 +165,7 @@ impl RouteInspector {
 pub enum UplinkState {
     Active,
     Standby,
+    Rechecking,
     Offline,
     Learning,
 }
@@ -173,6 +175,7 @@ impl UplinkState {
         match self {
             Self::Active => "ACTIVE",
             Self::Standby => "STANDBY",
+            Self::Rechecking => "RECHECKING",
             Self::Offline => "OFFLINE",
             Self::Learning => "LEARNING",
         }
@@ -197,6 +200,7 @@ pub struct UplinkLifecycle {
     learned: bool,
     learning_samples: usize,
     active_route: bool,
+    inspection_error_since: Option<Instant>,
     reason: String,
 }
 
@@ -209,6 +213,7 @@ impl UplinkLifecycle {
             learned: false,
             learning_samples: 0,
             active_route: false,
+            inspection_error_since: None,
             reason: "route not checked".to_string(),
         }
     }
@@ -225,6 +230,7 @@ impl UplinkLifecycle {
         let snapshot = match snapshot {
             Ok(snapshot) if snapshot.online => snapshot,
             Ok(snapshot) => {
+                self.inspection_error_since = None;
                 self.state = UplinkState::Offline;
                 self.online_since = None;
                 self.learned = false;
@@ -237,6 +243,15 @@ impl UplinkLifecycle {
                 return self.transition(previous_state, false, false);
             }
             Err(error) => {
+                if self.identity.is_some() && self.learned {
+                    let error_since = *self.inspection_error_since.get_or_insert(now);
+                    if now.saturating_duration_since(error_since) < ROUTE_INSPECTION_ERROR_GRACE {
+                        self.state = UplinkState::Rechecking;
+                        self.reason = format!("route status temporarily unavailable: {error}");
+                        return self.transition(previous_state, false, false);
+                    }
+                }
+                self.inspection_error_since = None;
                 self.state = UplinkState::Offline;
                 self.online_since = None;
                 self.learned = false;
@@ -245,6 +260,8 @@ impl UplinkLifecycle {
                 return self.transition(previous_state, false, false);
             }
         };
+
+        self.inspection_error_since = None;
 
         let identity = snapshot.stable_key();
         if self.identity.as_deref() != Some(&identity) {
@@ -1141,5 +1158,54 @@ mwan3.default_rule_v4.use_policy='wan_then_wan2'\n";
         assert!(!recovered.identity_changed);
         assert!(recovered.reset_learning);
         assert_eq!(recovered.state, UplinkState::Learning);
+    }
+
+    #[test]
+    fn lifecycle_debounces_transient_route_inspection_errors() {
+        let start = Instant::now();
+        let route = snapshot(false, "192.0.2.101");
+        let mut lifecycle = UplinkLifecycle::new();
+        lifecycle.observe(Ok(&route), start, Duration::ZERO);
+        lifecycle.record_learning_sample(1);
+        assert_eq!(lifecycle.state(), UplinkState::Standby);
+
+        let transient = lifecycle.observe(
+            Err("mwan3 status failed: Command failed: Not found"),
+            start + Duration::from_secs(1),
+            Duration::ZERO,
+        );
+        assert_eq!(transient.state, UplinkState::Rechecking);
+        assert!(!transient.became_offline);
+        assert!(!transient.reset_learning);
+        assert!(!transient.probes_allowed);
+
+        let recovered =
+            lifecycle.observe(Ok(&route), start + Duration::from_secs(2), Duration::ZERO);
+        assert_eq!(recovered.state, UplinkState::Standby);
+        assert!(!recovered.reset_learning);
+        assert!(recovered.probes_allowed);
+    }
+
+    #[test]
+    fn lifecycle_marks_route_offline_after_inspection_grace_expires() {
+        let start = Instant::now();
+        let route = snapshot(true, "198.51.100.1");
+        let mut lifecycle = UplinkLifecycle::new();
+        lifecycle.observe(Ok(&route), start, Duration::ZERO);
+        lifecycle.record_learning_sample(1);
+
+        lifecycle.observe(
+            Err("ubus temporarily unavailable"),
+            start + Duration::from_secs(1),
+            Duration::ZERO,
+        );
+        let offline = lifecycle.observe(
+            Err("ubus still unavailable"),
+            start + Duration::from_secs(12),
+            Duration::ZERO,
+        );
+        assert_eq!(offline.state, UplinkState::Offline);
+        assert!(offline.became_offline);
+        assert!(offline.reset_learning);
     }
 }

@@ -8,6 +8,7 @@
 var PROFILE_LABELS = {
 	auto: _('Automatic'),
 	gaming: _('Gaming'),
+	variable_link: _('Variable link'),
 	best_overall: _('Best overall'),
 	fair: _('Fair'),
 	custom: _('Custom')
@@ -41,6 +42,9 @@ var CLASS_LABELS = {
 function canonicalProfile(value) {
 	switch (value) {
 	case 'gaming':
+	case 'gaming-extreme':
+	case 'extreme_gaming':
+	case 'gaming_extreme':
 		return 'gaming';
 	case 'balanced':
 	case 'best-overall':
@@ -49,6 +53,10 @@ function canonicalProfile(value) {
 	case null:
 	case undefined:
 		return 'best_overall';
+	case 'variable':
+	case 'variable-link':
+	case 'variable_link':
+		return 'variable_link';
 	case 'fair':
 		return 'fair';
 	default:
@@ -81,7 +89,10 @@ function configuredTrafficProfile(section) {
 }
 
 function resolvedTrafficProfile(configured, autotune) {
-	return configured === 'auto' ? (canonicalProfile(autotune) || 'best_overall') : configured;
+	if (configured !== 'auto')
+		return configured;
+	autotune = canonicalProfile(autotune) || 'best_overall';
+	return autotune === 'variable_link' ? 'best_overall' : autotune;
 }
 
 function effectiveRuleProfile(value) {
@@ -183,6 +194,7 @@ function settingsUrl() {
 
 function backToSettingsButton() {
 	return E('button', {
+		'type': 'button',
 		'class': 'btn cbi-button cbi-button-neutral',
 		'click': function() { window.location = settingsUrl(); }
 	}, [ '\u2190 ', _('Back to instances') ]);
@@ -394,9 +406,10 @@ return L.view.extend({
 			ui.showModal(_('Customize %s').format(PROFILE_LABELS[source]), [
 				E('p', {}, _('This creates an independent editable copy of the shown built-in rules and switches this instance to Custom. Future package upgrades will not overwrite the copy. Existing rules are never deleted.')),
 				E('div', { 'class': 'right' }, [
-					E('button', { 'class': 'btn', 'click': ui.hideModal }, _('Cancel')),
+					E('button', { 'type': 'button', 'class': 'btn', 'click': ui.hideModal }, _('Cancel')),
 					' ',
 					E('button', {
+						'type': 'button',
 						'class': 'btn cbi-button-positive important',
 						'click': function() {
 							ui.hideModal();
@@ -545,18 +558,21 @@ return L.view.extend({
 		], 'udp');
 		o.depends('preset', 'custom');
 		o.modalonly = true;
+		o.retain = true;
 
 		o = s.option(form.Value, 'source_ports', _('Source ports'));
 		o.placeholder = '1024-65535';
 		o.validate = validatePortList;
 		o.depends('preset', 'custom');
 		o.modalonly = true;
+		o.retain = true;
 
 		o = s.option(form.Value, 'destination_ports', _('Destination ports'));
 		o.placeholder = '53,443,27000-27100';
 		o.validate = validatePortList;
 		o.depends('preset', 'custom');
 		o.modalonly = true;
+		o.retain = true;
 
 		o = s.option(form.Value, 'source_network', _('Source address / prefix'));
 		o.placeholder = '192.168.1.50/32';
@@ -568,15 +584,18 @@ return L.view.extend({
 		o.validate = validateNetwork;
 		o.modalonly = true;
 
-		for (index = 0; index < s.children.length; index++)
+		for (index = 0; index < s.children.length; index++) {
 			if (s.children[index].option !== 'enabled' &&
 			    s.children[index].option !== 'name' &&
 			    s.children[index].option !== 'instance' &&
 			    s.children[index].option !== 'profile' &&
 			    s.children[index].option !== 'preset' &&
 			    s.children[index].option !== 'class' &&
-			    s.children[index].option !== 'order')
+			    s.children[index].option !== 'order') {
 				s.children[index].modalonly = true;
+				s.children[index].retain = true;
+			}
+		}
 
 		return m.render().then(function(node) {
 			var style = E('style', {}, [

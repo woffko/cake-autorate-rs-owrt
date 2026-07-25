@@ -118,6 +118,15 @@ harness_main() {
 
 	case "$mode" in
 		start) start_service ;;
+		upgrade-start)
+			PKG_UPGRADE=1
+			export PKG_UPGRADE
+			start_service
+			[ ! -s "$log" ] || {
+				echo "default_postinst upgrade start mutated runtime state" >&2
+				return 94
+			}
+			;;
 		stop) stop ;;
 		reload) reload_service ;;
 		restart) restart ;;
@@ -236,6 +245,13 @@ done
 wait "$holder_pid"
 holder_pid=""
 
+: > "$log"
+sh "$0" harness "$root" "$log" upgrade-start
+[ ! -s "$log" ] || {
+	echo "upgrade start guard did not remain side-effect free" >&2
+	exit 1
+}
+
 sh "$0" harness "$root" "$log" reload
 
 expected="stop-sqm
@@ -262,6 +278,15 @@ actual="$(cat "$log")"
 [ "$actual" = "$expected" ] || {
 	echo "borrowed restart did not preserve one continuous lifecycle transaction" >&2
 	printf 'expected:\n%s\nactual:\n%s\n' "$expected" "$actual" >&2
+	exit 1
+}
+
+: > "$log"
+sh "$0" harness "$root" "$log" recover
+actual="$(cat "$log")"
+[ "$actual" = "config-load" ] || {
+	echo "member recovery hint mutated global service or SQM state" >&2
+	printf 'actual:\n%s\n' "$actual" >&2
 	exit 1
 }
 

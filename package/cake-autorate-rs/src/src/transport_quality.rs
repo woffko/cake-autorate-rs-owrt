@@ -432,6 +432,23 @@ impl QualitySearchDirection {
         self.last_reason
     }
 
+    pub fn causal_state(&self) -> &'static str {
+        match self.last_reason {
+            "candidate_no_meaningful_gain" | "candidate_worsened_latency" => "no_cake_effect",
+            "target_met" => "controlled",
+            "transport_latency_backoff" | "observing_candidate" => "evaluating",
+            _ => "unknown",
+        }
+    }
+
+    pub fn no_cake_effect(&self) -> Option<bool> {
+        match self.causal_state() {
+            "no_cake_effect" => Some(true),
+            "controlled" => Some(false),
+            _ => None,
+        }
+    }
+
     pub fn reset(&mut self) {
         *self = Self::new();
     }
@@ -698,6 +715,53 @@ mod tests {
         assert!(second.limited);
         assert_eq!(second.reason, "candidate_worsened_latency");
         assert_eq!(second.requested_rate_kbps, Some(70_000.0));
+        assert_eq!(search.causal_state(), "no_cake_effect");
+        assert_eq!(search.no_cake_effect(), Some(true));
+    }
+
+    #[test]
+    fn flat_candidate_restores_throughput_and_marks_no_cake_effect() {
+        let now = Instant::now();
+        let mut search = QualitySearchDirection::new();
+        let policy = QualitySearchPolicy {
+            target_delay_ms: 30.0,
+            floor_kbps: 25_000.0,
+            max_steps: 3,
+            observe_duration: Duration::from_secs(5),
+            cooldown: Duration::from_secs(60),
+        };
+        let first = search.observe(now, 100_000.0, 170.0, true, policy);
+        let reduced_rate = first.requested_rate_kbps.unwrap();
+        assert!(reduced_rate < 100_000.0);
+
+        let flat = search.observe(
+            now + Duration::from_secs(6),
+            reduced_rate,
+            163.0,
+            true,
+            policy,
+        );
+        assert!(flat.limited);
+        assert_eq!(flat.reason, "candidate_no_meaningful_gain");
+        assert_eq!(flat.requested_rate_kbps, Some(100_000.0));
+        assert_eq!(search.causal_state(), "no_cake_effect");
+        assert_eq!(search.no_cake_effect(), Some(true));
+    }
+
+    #[test]
+    fn target_met_clears_no_cake_effect_state() {
+        let now = Instant::now();
+        let mut search = QualitySearchDirection::new();
+        let policy = QualitySearchPolicy {
+            target_delay_ms: 30.0,
+            floor_kbps: 25_000.0,
+            max_steps: 3,
+            observe_duration: Duration::from_secs(5),
+            cooldown: Duration::from_secs(60),
+        };
+        search.observe(now, 100_000.0, 20.0, true, policy);
+        assert_eq!(search.causal_state(), "controlled");
+        assert_eq!(search.no_cake_effect(), Some(false));
     }
 
     #[test]

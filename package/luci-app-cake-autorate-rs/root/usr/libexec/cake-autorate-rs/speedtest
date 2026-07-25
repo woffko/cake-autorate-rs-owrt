@@ -8,16 +8,10 @@ job_key_override="$5"
 route_mode_override="$6"
 mwan3_member_override="$7"
 direction_override="${8:-}"
+bypass_scope="${CAKE_AUTORATE_SPEEDTEST_BYPASS_SCOPE:-full}"
 runtime_lock_lib="${CAKE_AUTORATE_RUNTIME_LOCK_LIB:-/usr/libexec/cake-autorate-rs/runtime-lock}"
 speedtest_self="${CAKE_AUTORATE_SPEEDTEST_SELF:-$0}"
-
-# A job-start caller launches the worker stopped, records its exact PID and
-# /proc start time while holding the per-job flock, then resumes it.  This
-# closes the check/launch/pid-publication race between simultaneous LuCI RPCs.
-if [ "${CAKE_AUTORATE_SPEEDTEST_JOB_START_STOPPED:-0}" = 1 ]; then
-	kill -STOP "$$" 2>/dev/null || exit 1
-	unset CAKE_AUTORATE_SPEEDTEST_JOB_START_STOPPED
-fi
+procd_job_bin="${CAKE_AUTORATE_PROCD_JOB:-/usr/libexec/cake-autorate-rs/procd-job}"
 
 # Full Auto-Tune can request a launch handshake for a separately supervised
 # process group.  Stop before backend discovery, route probing, SQM changes, or
@@ -43,6 +37,11 @@ fi
 case "$direction_override" in
 	''|both|download|upload) ;;
 	*) direction_override="" ;;
+esac
+
+case "$bypass_scope" in
+	full|ingress|egress) ;;
+	*) bypass_scope_invalid=1; bypass_scope=full ;;
 esac
 
 if [ "$section" = "--status" ] || [ "$section" = "status" ]; then
@@ -690,6 +689,87 @@ target_is_verifiably_unshaped() {
 	! sqm_active_for_device "$target_if"
 }
 
+device_has_one_root_cake() {
+	local device="$1" state
+
+	safe_route_name "$device" || return 1
+	state="$(tc -details qdisc show dev "$device" 2>/dev/null)" || return 1
+	printf '%s\n' "$state" | awk '
+		$1 == "qdisc" && ($2 == "cake" || $2 == "cake_mq") && $4 == "root" { count++ }
+		END { exit(count == 1 ? 0 : 1) }
+	'
+}
+
+managed_ingress_redirect_present() {
+	local qdisc_state redirect_state
+
+	qdisc_state="$(tc -details qdisc show dev "$target_if" 2>/dev/null)" || return 1
+	printf '%s\n' "$qdisc_state" |
+		awk '$1 == "qdisc" && $2 == "ingress" && $3 == "ffff:" && $4 == "parent" { count++ } END { exit(count == 1 ? 0 : 1) }' ||
+		return 1
+	redirect_state="$(tc filter show dev "$target_if" ingress 2>/dev/null)" || return 1
+	printf '%s\n' "$redirect_state" | awk -v expected="$calibration_sqm_dl_if" '
+		function clean(value) {
+			sub(/^[[(]+/, "", value)
+			sub(/[]),;]+$/, "", value)
+			return value
+		}
+		{
+			for (i = 1; i <= NF; i++) {
+				if ($i == "redirect" && $(i + 1) == "dev" && clean($(i + 2)) == expected)
+					found = 1
+				if ($i == "Redirect" && $(i + 1) == "to" && $(i + 2) == "device" && clean($(i + 3)) == expected)
+					found = 1
+			}
+		}
+		END { exit(found ? 0 : 1) }
+	'
+}
+
+managed_ingress_redirect_absent() {
+	local qdisc_state
+
+	qdisc_state="$(tc -details qdisc show dev "$target_if" 2>/dev/null)" || return 1
+	! printf '%s\n' "$qdisc_state" |
+		grep -Eq '^qdisc (ingress|clsact) '
+}
+
+prepare_directional_sqm_bypass() {
+	local scope="$1"
+
+	case "$scope" in ingress|egress) ;; *) return 1 ;; esac
+	[ "${calibration_sqm_managed:-0}" = 1 ] && [ -x "$sqm_recover_bin" ] || return 1
+	command -v tc >/dev/null 2>&1 || return 1
+	# This check validates the live state file, both managed CAKE roots, the
+	# exact ffff: ingress qdisc, and its redirect while borrowing the locks held
+	# by this transaction.  Never delete a qdisc based on UCI ownership alone.
+	"$sqm_recover_bin" "$section" check >/dev/null 2>&1 || return 1
+	device_has_one_root_cake "$calibration_sqm_ul_if" &&
+		device_has_one_root_cake "$calibration_sqm_dl_if" &&
+		managed_ingress_redirect_present || return 1
+
+	case "$scope" in
+		ingress)
+			tc qdisc del dev "$target_if" ingress >/dev/null 2>&1 || return 1
+			managed_ingress_redirect_absent &&
+				device_has_one_root_cake "$calibration_sqm_ul_if" &&
+				device_has_one_root_cake "$calibration_sqm_dl_if" || return 1
+			calibration_sqm_bypass_mode="ingress-only-managed"
+			append_warning "Temporarily bypassed only download SQM on $target_if; upload CAKE remained active."
+			;;
+		egress)
+			tc qdisc del dev "$calibration_sqm_ul_if" root >/dev/null 2>&1 || return 1
+			! device_has_one_root_cake "$calibration_sqm_ul_if" &&
+				device_has_one_root_cake "$calibration_sqm_dl_if" &&
+				managed_ingress_redirect_present || return 1
+			calibration_sqm_bypass_mode="egress-only-managed"
+			append_warning "Temporarily bypassed only upload SQM on $calibration_sqm_ul_if; download CAKE remained active."
+			;;
+	esac
+	calibration_sqm_paused="false"
+	return 0
+}
+
 capture_managed_sqm_recovery_snapshot() {
 	local manage_sqm sqm_enabled owner enabled configured_target snapshot tmp
 
@@ -1195,6 +1275,17 @@ prepare_speedtest_calibration() {
 	[ -n "$section" ] || return 0
 	[ -n "$target_if" ] || return 0
 	speedtest_unshaped_enabled || return 0
+	if [ "${bypass_scope_invalid:-0}" = 1 ]; then
+		append_warning "Invalid internal SQM bypass scope; the speed test was refused."
+		return 1
+	fi
+	case "$bypass_scope:$direction_override" in
+		ingress:download|egress:upload|full:*) ;;
+		*)
+			append_warning "The requested SQM bypass scope does not match the speed-test direction."
+			return 1
+			;;
+	esac
 
 	if [ "${interface_lock_shared:-0}" != 1 ]; then
 		standalone_recovery_arm || {
@@ -1281,21 +1372,33 @@ prepare_speedtest_calibration() {
 				return 1
 			}
 		}
-		if ! "$sqm_run_bin" stop "$target_if" >/dev/null 2>&1 ||
-		   ! wait_for_sqm_state inactive; then
-			append_warning "SQM on $target_if could not be verifiably stopped; the unshaped test was cancelled."
-			restore_speedtest_calibration >/dev/null 2>&1 || true
-			return 1
-		fi
-		calibration_sqm_paused="true"
-		calibration_sqm_bypass_mode="paused-managed"
-		append_warning "Temporarily disabled SQM on $target_if during unshaped speed test."
+		case "$bypass_scope" in
+			full)
+				if ! "$sqm_run_bin" stop "$target_if" >/dev/null 2>&1 ||
+				   ! wait_for_sqm_state inactive; then
+					append_warning "SQM on $target_if could not be verifiably stopped; the unshaped test was cancelled."
+					restore_speedtest_calibration >/dev/null 2>&1 || true
+					return 1
+				fi
+				calibration_sqm_paused="true"
+				calibration_sqm_bypass_mode="paused-managed"
+				append_warning "Temporarily disabled SQM on $target_if during unshaped speed test."
+				;;
+			ingress|egress)
+				if ! prepare_directional_sqm_bypass "$bypass_scope"; then
+					append_warning "The managed $bypass_scope SQM path could not be bypassed and verified safely; the speed test was cancelled."
+					restore_speedtest_calibration >/dev/null 2>&1 || true
+					return 1
+				fi
+				;;
+		esac
 	elif [ -x "$sqm_run_bin" ] && sqm_active_for_device "$target_if"; then
 		append_warning "SQM appeared after recovery preflight; the unshaped test was cancelled."
 		restore_speedtest_calibration >/dev/null 2>&1 || true
 		return 1
 	fi
-	if [ "$calibration_sqm_paused" != true ]; then
+	if [ "$calibration_sqm_paused" != true ] &&
+	   [ "$calibration_sqm_bypass_mode" = none ]; then
 		target_is_verifiably_unshaped || {
 			append_warning "The target did not have managed SQM to pause and its qdisc state was not verifiably unshaped."
 			restore_speedtest_calibration >/dev/null 2>&1 || true
@@ -1369,6 +1472,26 @@ restore_speedtest_calibration() {
 		standalone_recovery_mark_restored || rc=1
 	fi
 	return "$rc"
+}
+
+restore_speedtest_calibration_bounded() {
+	local attempts="${CAKE_AUTORATE_SPEEDTEST_RESTORE_ATTEMPTS:-8}"
+	local delay_s="${CAKE_AUTORATE_SPEEDTEST_RESTORE_RETRY_DELAY_S:-1}"
+	local attempt=1
+
+	case "$attempts" in ''|*[!0-9]*) attempts=8 ;; esac
+	case "$delay_s" in ''|*[!0-9]*) delay_s=1 ;; esac
+	[ "$attempts" -ge 1 ] 2>/dev/null || attempts=1
+	[ "$attempts" -le 30 ] 2>/dev/null || attempts=30
+	[ "$delay_s" -le 5 ] 2>/dev/null || delay_s=5
+	while [ "$attempt" -le "$attempts" ]; do
+		restore_speedtest_calibration && return 0
+		[ "$attempt" -lt "$attempts" ] || return 1
+		append_warning "SQM/autorate restoration was temporarily unavailable; retrying exact recovery ($attempt/$attempts)."
+		attempt=$((attempt + 1))
+		sleep "$delay_s"
+	done
+	return 1
 }
 
 standalone_recovery_main() {
@@ -2523,6 +2646,20 @@ speedtest_job_record_matches_process() {
 		speedtest_job_cmdline_matches "$pid"
 }
 
+speedtest_wait_for_job_process() {
+	local pid="$1" start="$2" attempt=0
+
+	# Fractional sleep is optional in BusyBox.  Keep this RPC-side transition
+	# bounded to five seconds without spinning when the applet rejects it.
+	while [ "$attempt" -lt 5 ]; do
+		speedtest_job_record_matches_process "$pid" "$start" && return 0
+		speedtest_process_identity_matches "$pid" "$start" || return 1
+		attempt=$((attempt + 1))
+		brief_sleep 0.05
+	done
+	return 1
+}
+
 speedtest_job_record_write() {
 	local pid="$1" start="$2" tmp="$job_pid_file.tmp.$$"
 
@@ -2546,12 +2683,11 @@ speedtest_job_record_matches_self() {
 }
 
 speedtest_job_start() {
-	local setsid_bin flock_bin job_pid job_start i=0
+	local flock_bin job_pid job_start launch_result launch_error
 
 	job_key="$section"
 	safe_uci_name "$job_key" || json_error "Invalid speed test job name."
-	setsid_bin="$(command_path setsid)"
-	[ -n "$setsid_bin" ] || json_error "The setsid command is required to run speed tests safely."
+	[ -x "$procd_job_bin" ] || json_error "The procd job launcher is required to run speed tests safely."
 	mkdir -p "$speedtest_job_dir" || json_error "Unable to create speed test job directory."
 	[ -d "$speedtest_job_dir" ] && [ ! -L "$speedtest_job_dir" ] ||
 		json_error "Speed test job directory is unsafe."
@@ -2572,27 +2708,22 @@ speedtest_job_start() {
 	fi
 
 	rm -f "$job_pid_file" "$job_result_file" "$job_error_file" "$job_work_file" "$job_stderr_file" "$job_log_file"
-	CAKE_AUTORATE_SPEEDTEST_JOB_START_STOPPED=1 \
-		"$setsid_bin" "$speedtest_self" "$section" "$target_if_override" job-run "$preferred_backend" "$job_key" "$route_mode_override" "$mwan3_member_override" \
-		6>&- </dev/null >"$job_log_file" 2>&1 &
-	job_pid="$!"
-	while [ "$i" -lt 100 ]; do
-		job_start="$(speedtest_process_starttime "$job_pid" 2>/dev/null)"
-		if is_positive_uint "$job_start" && process_is_stopped "$job_pid" &&
-		   speedtest_job_cmdline_matches "$job_pid"; then
-			break
-		fi
-		kill -0 "$job_pid" 2>/dev/null || break
-		i=$((i + 1))
-		brief_sleep 0.05
-	done
-	if ! is_positive_uint "${job_start:-}" || ! process_is_stopped "$job_pid" ||
-	   ! speedtest_job_cmdline_matches "$job_pid"; then
-		kill -KILL "$job_pid" 2>/dev/null || true
-		wait "$job_pid" 2>/dev/null || true
+	launch_result="$($procd_job_bin launch "cake-autorate-speedtest-$job_key" worker "$job_log_file" \
+		"$speedtest_self" "$section" "$target_if_override" job-run "$preferred_backend" \
+		"$job_key" "$route_mode_override" "$mwan3_member_override" 2>/dev/null)" || {
+		launch_error="$(printf '%s\n' "$launch_result" | "$jsonfilter_bin" -e '@.error' 2>/dev/null | sed -n '1p')"
 		"$flock_bin" -u 6
 		exec 6>&-
-		json_error "Speed test worker could not complete its verified launch handshake."
+		json_error "${launch_error:-Speed test worker could not be registered with procd.}"
+	}
+	job_pid="$(printf '%s\n' "$launch_result" | "$jsonfilter_bin" -e '@.pid' 2>/dev/null | sed -n '1p')"
+	job_start="$(printf '%s\n' "$launch_result" | "$jsonfilter_bin" -e '@.starttime' 2>/dev/null | sed -n '1p')"
+	if ! is_positive_uint "$job_pid" || ! is_positive_uint "$job_start" ||
+	   ! speedtest_wait_for_job_process "$job_pid" "$job_start"; then
+		kill -KILL "$job_pid" 2>/dev/null || true
+		"$flock_bin" -u 6
+		exec 6>&-
+		json_error "Speed test worker did not publish a verified isolated identity."
 	fi
 	if ! speedtest_job_record_write "$job_pid" "$job_start"; then
 		kill -KILL "$job_pid" 2>/dev/null || true
@@ -2601,27 +2732,24 @@ speedtest_job_start() {
 		exec 6>&-
 		json_error "Unable to publish the verified speed test worker identity."
 	fi
-	if ! kill -CONT "$job_pid" 2>/dev/null; then
-		if speedtest_job_record_load "$job_pid_file" &&
-		   [ "$job_record_pid" = "$job_pid" ] && [ "$job_record_start" = "$job_start" ]; then
-			rm -f "$job_pid_file"
-		fi
-		kill -KILL "$job_pid" 2>/dev/null || true
-		wait "$job_pid" 2>/dev/null || true
-		"$flock_bin" -u 6
-		exec 6>&-
-		json_error "Verified speed test worker could not be resumed."
-	fi
 	printf '{"state":"running","job_id":"%s"}\n' "$(json_escape "$job_key")"
 	"$flock_bin" -u 6
 	exec 6>&-
 }
 
 speedtest_job_run() {
+	local registration_attempt=0
 	job_key="$1"
 	safe_uci_name "$job_key" || exit 1
 	mkdir -p "$speedtest_job_dir" || exit 1
 	speedtest_job_paths "$job_key"
+	# procd launches the worker before the caller can publish its PID record.
+	# brief_sleep() falls back to whole seconds on minimal BusyBox builds.
+	while [ "$registration_attempt" -lt 15 ]; do
+		speedtest_job_record_matches_self && break
+		registration_attempt=$((registration_attempt + 1))
+		brief_sleep 0.05
+	done
 	speedtest_job_record_matches_self || exit 1
 
 	"$0" "$section" "$target_if_override" run "$preferred_backend" "" "$route_mode_override" "$mwan3_member_override" >"$job_work_file" 2>"$job_stderr_file"
@@ -2838,7 +2966,7 @@ if ! prepare_speedtest_calibration; then
 fi
 
 if run_preferred_backend; then
-	if ! restore_speedtest_calibration; then
+	if ! restore_speedtest_calibration_bounded; then
 		json_error "Speed test finished, but SQM/autorate restoration is still being recovered."
 	fi
 	if ! inspect_selected_route; then

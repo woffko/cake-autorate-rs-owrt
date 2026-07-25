@@ -15,12 +15,37 @@ if (typeof String.prototype.format !== 'function') {
 const sourcePath = path.join(__dirname, '..', 'htdocs', 'luci-static', 'resources',
 	'view', 'cake-autorate-rs', 'status.js');
 const source = fs.readFileSync(sourcePath, 'utf8');
+for (const [index, button] of source.split("E('button', {").slice(1).entries()) {
+	assert.match(button.slice(0, 160), /'type': 'button'/,
+		`custom status button ${index + 1} must never act as a form submitter`);
+}
 const prefix = source.slice(0, source.indexOf('return L.view.extend'));
 const E = (tag, attrs, children) => ({ tag, attrs: attrs || {}, children: children || [] });
 const helpers = new Function('fs', 'poll', 'uci', 'ui', 'cakeUi', 'L', 'E', '_',
 	`${prefix}\nreturn { formatQuality, formatRoute, formatState, formatServices, qualityReadiness, qualityProgressText, ` +
-		`statusColumnSelection, selectedStatusColumns };`
+		`statusColumnSelection, selectedStatusColumns, formatShaperRate };`
 )({}, {}, {}, {}, {}, {}, E, value => value);
+
+const passiveCapacity = helpers.formatShaperRate({
+	configured_max_dl_shaper_rate_kbps: 100000,
+	effective_max_dl_shaper_rate_kbps: 110000,
+	adaptive_ceiling_dl_cap_kbps: 150000,
+	adaptive_ceiling_dl_last_reason: 'clean transport saturation',
+	adaptive_capacity: {
+		enabled: true,
+		route_epoch: 'mwan3|wan|pppoe-wan|198.51.100.1',
+		download: {
+			phase: 'hold_no_effect', current_rate_kbps: 90000,
+			safe_ceiling_kbps: 110000, failed_bound_kbps: 120000,
+			runtime_minimum_kbps: 70000, probe_target_kbps: null,
+			no_cake_effect: true, causal_state: 'no_cake_effect',
+			confidence: { percent: 82 }
+		}
+	}
+}, 'dl');
+assert.match(passiveCapacity.children[1].children, /safe: 110000 kbps.*confidence: 82%/);
+assert.match(passiveCapacity.attrs.title, /Runtime minimum: 70000 kbps/);
+assert.match(passiveCapacity.attrs.title, /No CAKE effect: yes/);
 
 assert.deepEqual(helpers.statusColumnSelection({}),
 	[ 'instance', 'uplink', 'services', 'quality', 'rating' ]);
@@ -154,12 +179,44 @@ const rejectedLastKnown = helpers.formatQuality({
 assert.equal(rejectedLastKnown.children[1].children[1].children, '-');
 
 const ready = helpers.qualityReadiness({ enabled: '1', sqm_enabled: '1' }, {
+	uplink_state: 'ACTIVE',
 	transport_latency_enabled: true,
 	route_active: true,
+	route_test_ready: true,
 	transport_probe_trusted: true,
 	quality_grade_baseline_ready: true,
 });
 assert.equal(ready.ready, true);
+const standbyAutomatic = helpers.qualityReadiness({ enabled: '1', sqm_enabled: '1' }, {
+	uplink_state: 'STANDBY',
+	transport_latency_enabled: true,
+	route_active: false,
+	route_test_ready: true,
+	transport_probe_trusted: true,
+	quality_grade_baseline_ready: true,
+}, 'automatic');
+assert.equal(standbyAutomatic.ready, true);
+assert.match(standbyAutomatic.reason, /isolated mwan3 member/);
+const standbyGuided = helpers.qualityReadiness({ enabled: '1', sqm_enabled: '1' }, {
+	uplink_state: 'STANDBY',
+	transport_latency_enabled: true,
+	route_active: false,
+	route_test_ready: true,
+	transport_probe_trusted: true,
+	quality_grade_baseline_ready: true,
+}, 'client');
+assert.equal(standbyGuided.ready, false);
+assert.match(standbyGuided.reason, /Guided client mode requires client traffic/);
+const rechecking = helpers.qualityReadiness({ enabled: '1', sqm_enabled: '1' }, {
+	uplink_state: 'RECHECKING',
+	transport_latency_enabled: true,
+	route_active: false,
+	route_test_ready: false,
+	transport_probe_trusted: true,
+	quality_grade_baseline_ready: true,
+});
+assert.equal(rechecking.ready, false);
+assert.match(rechecking.reason, /being rechecked/);
 const unhealthySqm = helpers.qualityReadiness({ enabled: '1', sqm_enabled: '1' }, {
 	sqm_runtime_managed: true,
 	sqm_runtime_healthy: false,
@@ -181,8 +238,46 @@ const unhealthyState = helpers.formatState({
 assert.equal(unhealthyState.children[0].children, 'ERROR');
 assert.equal(unhealthyState.children[1].children, 'CAKE/IFB unavailable');
 assert.equal(unhealthyState.children[3].children, 'Auto-Tune: Best overall');
-assert.equal(unhealthyState.children[4].children, 'Priorities: Off');
+assert.equal(unhealthyState.children[4].children, 'Learning: Configured bounds');
+assert.equal(unhealthyState.children[5].children, 'Priorities: Off');
 assert.match(unhealthyState.attrs.title, /download counter is missing/);
+const waitingState = helpers.formatState({
+	state: 'WAITING_SQM',
+	uplink_state: 'LEARNING',
+	sqm_runtime_managed: true,
+	sqm_runtime_healthy: false,
+	sqm_runtime_state: 'WAITING_SQM',
+	sqm_runtime_reason: 'waiting for native SQM hotplug',
+	started_at: Date.now() / 1000 - 120,
+}, true, { autotune_profile: 'best_overall', traffic_rules_enabled: '0' }, null);
+assert.equal(waitingState.children[0].children, 'WAITING');
+assert.equal(waitingState.children[1].children, 'Waiting for SQM hotplug to settle');
+assert.match(waitingState.children[0].attrs.style, /d08b20/);
+assert.doesNotMatch(JSON.stringify(waitingState), /No probe replies/);
+const scheduledState = helpers.formatState({
+	state: 'RUNNING', uplink_state: 'ACTIVE',
+	scheduled_autotune: {
+		enabled: true, state: 'deferred', message: 'waiting for window',
+		next_due_at: Date.now() / 1000 + 3600,
+		daily: { remaining_bytes: 1024 * 1024 * 1024 },
+		monthly: { remaining_bytes: 8 * 1024 * 1024 * 1024 },
+		accounting_error: false,
+	},
+}, true, {
+	autotune_profile: 'best_overall', traffic_rules_enabled: '0',
+	scheduled_autotune_enabled: '1',
+}, null);
+assert.match(JSON.stringify(scheduledState), /Active budget: 1\.00 GiB today.*8\.00 GiB this month/);
+assert.match(JSON.stringify(scheduledState), /due/);
+const waitingLinkState = helpers.formatState({
+	state: 'WAITING_LINK', uplink_state: 'OFFLINE',
+	sqm_runtime_managed: true, sqm_runtime_healthy: false,
+	sqm_runtime_state: 'WAITING_LINK',
+	sqm_runtime_reason: 'target interface pppoe-wan is unavailable',
+}, true, { autotune_profile: 'best_overall', traffic_rules_enabled: '0' }, null);
+assert.equal(waitingLinkState.children[0].children, 'WAITING');
+assert.equal(waitingLinkState.children[1].children,
+	'WAN link unavailable · automatic recovery armed');
 const profiledState = helpers.formatState({
 	state: 'RUNNING', uplink_state: 'ACTIVE',
 }, true, {
@@ -192,7 +287,8 @@ const profiledState = helpers.formatState({
 	traffic_profile_resolved: 'gaming', classifier_state: 'ACTIVE',
 });
 assert.equal(profiledState.children[2].children, 'Auto-Tune: Gaming');
-assert.equal(profiledState.children[3].children, 'Priorities: Gaming · linked');
+assert.equal(profiledState.children[3].children, 'Learning: Configured bounds');
+assert.equal(profiledState.children[4].children, 'Priorities: Gaming · linked');
 const healthyServices = helpers.formatServices({
 	overall_state: 'HEALTHY',
 	autorate_state: 'RUNNING',
@@ -223,9 +319,33 @@ const healthyServices = helpers.formatServices({
 });
 assert.equal(healthyServices.children[0].children, 'HEALTHY');
 assert.match(healthyServices.attrs.class, /cake-services-healthy/);
-assert.match(healthyServices.attrs.title, /Upload CAKE: ACTIVE on pppoe-wan at 806 Mbps/);
-assert.match(healthyServices.attrs.title, /Traffic rules: ACTIVE \(configured auto; resolved best_overall; upload CAKE diffserv4\)/);
-assert.match(healthyServices.attrs.title, /Attested rules: pppoe-wan \(Auto-Tune best_overall; configured auto; resolved best_overall\)/);
+assert.equal(healthyServices.attrs.title, 'Overall: HEALTHY');
+assert.match(JSON.stringify(healthyServices), /Upload CAKE: ACTIVE on pppoe-wan at 806 Mbps/);
+assert.match(JSON.stringify(healthyServices), /Traffic rules: ACTIVE.*configured auto.*resolved best_overall/);
+assert.match(JSON.stringify(healthyServices), /Attested rules: pppoe-wan.*Auto-Tune best_overall/);
+const waitingServices = helpers.formatServices({
+	overall_state: 'WAITING',
+	autorate_state: 'RUNNING',
+	autorate_processes: 1,
+	controller_state: 'WAITING_LINK',
+	controller_reason: 'target interface pppoe-wan is unavailable',
+	controller_status_fresh: true,
+	sqm_config_state: 'ENABLED',
+	sqm_section: 'cake_wan_sqm',
+	cake_ul_state: 'MISSING',
+	cake_dl_state: 'MISSING',
+	ifb_state: 'MISSING',
+	ingress_state: 'MISSING',
+	classifier_state: 'MISSING',
+	operation_state: 'IDLE',
+	apply_state: 'IDLE',
+});
+assert.equal(waitingServices.children[0].children, 'WAITING');
+assert.match(waitingServices.attrs.class, /cake-services-waiting/);
+assert.match(waitingServices.attrs.title, /Overall: WAITING/);
+assert.match(waitingServices.attrs.title, /target interface pppoe-wan is unavailable/);
+assert.doesNotMatch(waitingServices.attrs.title, /Upload CAKE/);
+assert.match(JSON.stringify(waitingServices), /automatic recovery is armed|target interface pppoe-wan/);
 const orphanedServices = helpers.formatServices({
 	overall_state: 'ORPHANED',
 	autorate_state: 'DISABLED',
@@ -246,7 +366,8 @@ const orphanedServices = helpers.formatServices({
 });
 assert.equal(orphanedServices.children[0].children, 'ORPHANED');
 assert.match(orphanedServices.attrs.class, /cake-services-orphaned/);
-assert.match(orphanedServices.attrs.title, /Detected issue: Upload CAKE still limits traffic/);
+assert.equal(orphanedServices.attrs.title, 'Overall: ORPHANED');
+assert.match(JSON.stringify(orphanedServices), /Detected issue: Upload CAKE still limits traffic/);
 const learning = helpers.qualityReadiness({ enabled: '1', sqm_enabled: '1' }, {
 	transport_latency_enabled: true,
 	route_active: true,
@@ -276,6 +397,14 @@ assert.match(source, /cake-status-table td\{vertical-align:top!important/);
 assert.match(source, /cake-status-table th\{vertical-align:bottom!important/);
 assert.match(source, /quality-test/);
 assert.match(source, /Get rating/);
+assert.match(source, /refreshReadiness\(false\)[\s\S]*qualityTestExec\(instance, 'start'/,
+	'Get rating must refresh daemon readiness immediately before launching a job');
+assert.match(source, /refreshReadiness\(false\)\.then\(function\(freshReadiness\) \{\s*if \(closed\)/,
+	'closing during the final readiness read must prevent a background rating launch');
+assert.match(source, /if \(!freshStatus\) \{[\s\S]*Waiting for fresh runtime status from the controller/,
+	'a missing runtime snapshot must be reported as transient readiness, not a misleading configuration error');
+assert.match(source, /function pollReadiness\(\)[\s\S]*refreshReadiness\(true\)[\s\S]*then\(pollReadiness\)/,
+	'an open idle rating dialog must follow recovery and baseline changes live');
 assert.match(source, /List columns/);
 assert.match(source, /Reset default/);
 assert.match(source, /\/usr\/libexec\/cake-autorate-rs\/status-columns/,

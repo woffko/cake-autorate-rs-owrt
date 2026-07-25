@@ -587,7 +587,7 @@ load_profile_contract() {
 		die "The Full Auto-Tune common CAKE policy is invalid."
 
 	case "$profile" in
-		gaming)
+		gaming|gaming_extreme)
 			[ "$target_grade" = A+ ] &&
 				[ "$quality_target_required" = true ] &&
 				[ "$throughput_priority" = false ] &&
@@ -615,6 +615,17 @@ load_profile_contract() {
 			sqm_qdisc_advanced=1
 			sqm_qdisc_really_really_advanced=1
 			;;
+		variable_link)
+			[ "$target_grade" = B ] &&
+				[ "$quality_target_required" = true ] &&
+				[ "$throughput_priority" = false ] &&
+				numbers_equal "$validation_retention" 70 &&
+				numbers_equal "$validation_transport" 60 &&
+				numbers_equal "$validation_loss" 3 ||
+				die "The Variable link profile policy is invalid."
+			sqm_qdisc_advanced=1
+			sqm_qdisc_really_really_advanced=1
+			;;
 		fair)
 			[ "$target_grade" = C ] &&
 				[ "$quality_target_required" = false ] &&
@@ -631,7 +642,7 @@ load_profile_contract() {
 			;;
 	esac
 	case "$profile" in
-		best_overall|fair)
+		best_overall|variable_link|fair)
 			[ "$sqm_script" = layer_cake.qos ] &&
 				[ "$sqm_classification" = diffserv4 ] &&
 				[ "$sqm_squash_dscp" = true ] &&
@@ -839,7 +850,27 @@ build_expected_manifest() {
 	expected_set "$job" speedtest_backend "$run_backend"
 	if [ -n "$server_id" ]; then expected_set "$job" speedtest_go_server_id "$server_id"; else expected_delete "cake-autorate.$job.speedtest_go_server_id"; fi
 	expected_set "$job" speedtest_apply_percent "$apply_percent"
-	expected_set "$job" autotune_profile "$profile"
+	runtime_profile="$profile"
+	[ "$runtime_profile" = gaming_extreme ] && runtime_profile=gaming
+	expected_set "$job" autotune_profile "$runtime_profile"
+	calibration_strategy=""
+	for calibration_phase in $(json_get "$result_copy" '@.phase_background[*].phase'); do
+		case "$calibration_phase" in
+			full_raw|shaped_only|reuse_trusted)
+				calibration_strategy="$calibration_phase"
+				break
+				;;
+		esac
+	done
+	case "$calibration_strategy" in
+		full_raw|shaped_only|reuse_trusted) ;;
+		*)
+			# Legacy results predate the explicit field and always used the full
+			# raw-capacity workflow.
+			calibration_strategy=full_raw
+			;;
+	esac
+	expected_set "$job" autotune_calibration_strategy "$calibration_strategy"
 	expected_set "$job" pinger_method "$pinger_method"
 	expected_set "$job" no_pingers "$no_pingers"
 	if [ "$pinger_method" != irtt ]; then expected_set "$job" ping_extra_args "-I $resolved"; fi
@@ -1037,7 +1068,7 @@ validate_profile_search_contract() {
 		*) return 1 ;;
 	esac
 	search_root="@.profile_search.$search_direction"
-	require_result_flag "$search_root.schema_version" 1 "The profile-search schema is invalid."
+	require_result_flag "$search_root.schema_version" 2 "The profile-search schema is invalid."
 	require_result_flag "$search_root.profile" "$profile" "The profile-search profile changed."
 	require_result_flag "$search_root.direction" "$search_direction" "The profile-search direction changed."
 	search_action="$(require_result_value "$search_root.action")" ||
@@ -1070,6 +1101,52 @@ validate_profile_search_contract() {
 		numbers_equal "$selected_rate" "$proposal_selected_rate" &&
 		numbers_equal "$selected_rate" "$validation_selected_rate" ||
 		die "The selected, proposed, and confirmed direction rates differ."
+	if [ "$profile" = variable_link ]; then
+		require_result_flag "$search_root.knee_detected" true "The Variable link result has no measured latency knee."
+		require_result_flag "$search_root.no_cake_effect" false "The Variable link result reports no CAKE-controlled queue."
+		require_result_flag "$search_root.noisy" false "The Variable link result remained noisy."
+		require_result_flag "$search_root.inconclusive" false "The Variable link result remained inconclusive."
+		runtime_minimum="$(require_result_value "$search_root.runtime_minimum_kbps")" ||
+			die "The measured Variable link runtime minimum is missing."
+		runtime_minimum_index="$(require_result_value "$search_root.runtime_minimum_observation_index")" ||
+			die "The measured Variable link runtime observation is missing."
+		is_positive_rate "$runtime_minimum_index" ||
+			die "The measured Variable link runtime observation index is invalid."
+		runtime_evaluated_index=$((runtime_minimum_index - 1))
+		runtime_evaluated_rate="$(require_result_value "$search_root.evaluated[$runtime_evaluated_index].candidate_kbps")" ||
+			die "The measured Variable link runtime observation is not present."
+		exploration_minimum="$(require_result_value "$search_root.exploration_minimum_kbps")" ||
+			die "The Variable link exploration minimum is missing."
+		proposal_runtime_minimum="$(require_result_value "@.proposal.$search_rate_path.minimum_kbps")" ||
+			die "The proposal runtime minimum is missing."
+		is_positive_rate "$runtime_minimum" && is_positive_rate "$exploration_minimum" &&
+			numbers_equal "$runtime_minimum" "$runtime_evaluated_rate" &&
+			numbers_equal "$runtime_minimum" "$proposal_runtime_minimum" &&
+			[ "$runtime_minimum" -ge "$exploration_minimum" ] &&
+			[ "$runtime_minimum" -le "$selected_rate" ] ||
+			die "The Variable link runtime minimum is not a tested, ordered search result."
+	elif [ "$profile" = gaming_extreme ]; then
+		require_result_flag "$search_root.inconclusive" false "The Extreme A+ result remained inconclusive."
+		runtime_minimum="$(require_result_value "$search_root.runtime_minimum_kbps")" ||
+			die "The tested Extreme A+ runtime minimum is missing."
+		runtime_minimum_index="$(require_result_value "$search_root.runtime_minimum_observation_index")" ||
+			die "The tested Extreme A+ runtime observation is missing."
+		is_positive_rate "$runtime_minimum_index" ||
+			die "The tested Extreme A+ runtime observation index is invalid."
+		runtime_evaluated_index=$((runtime_minimum_index - 1))
+		runtime_evaluated_rate="$(require_result_value "$search_root.evaluated[$runtime_evaluated_index].candidate_kbps")" ||
+			die "The tested Extreme A+ runtime observation is not present."
+		exploration_minimum="$(require_result_value "$search_root.exploration_minimum_kbps")" ||
+			die "The Extreme A+ exploration minimum is missing."
+		proposal_runtime_minimum="$(require_result_value "@.proposal.$search_rate_path.minimum_kbps")" ||
+			die "The Extreme A+ proposal runtime minimum is missing."
+		is_positive_rate "$runtime_minimum" && is_positive_rate "$exploration_minimum" &&
+			numbers_equal "$runtime_minimum" "$runtime_evaluated_rate" &&
+			numbers_equal "$runtime_minimum" "$proposal_runtime_minimum" &&
+			[ "$runtime_minimum" -ge "$exploration_minimum" ] &&
+			[ "$runtime_minimum" -le "$selected_rate" ] ||
+			die "The Extreme A+ runtime minimum is not an actually tested A+ search rate."
+	fi
 }
 
 arm_guard() {
@@ -1217,6 +1294,44 @@ arm_guard() {
 		die "The profile objective state is missing."
 	[ "$profile_objectives_met" = "$(json_get "$result_copy" '@.profile_outcome.capacity_floor_met')" ] ||
 		die "The profile outcome and validation retention-objective states differ."
+	profile_deep_runtime_minimum="$(require_result_value '@.profile_outcome.deep_runtime_minimum')" ||
+		die "The runtime-minimum retention state is missing."
+	case "$profile_deep_runtime_minimum" in true|false) ;; *) die "The runtime-minimum retention state is invalid." ;; esac
+	if [ "$profile" = gaming_extreme ]; then
+		extreme_dl_runtime_retention="$(require_result_value '@.profile_outcome.runtime_minimum_retention.download_percent')" ||
+			die "The Extreme A+ download runtime retention is missing."
+		extreme_ul_runtime_retention="$(require_result_value '@.profile_outcome.runtime_minimum_retention.upload_percent')" ||
+			die "The Extreme A+ upload runtime retention is missing."
+		expected_deep_runtime_minimum="$(LC_ALL=C awk -v dl="$extreme_dl_runtime_retention" -v ul="$extreme_ul_runtime_retention" 'BEGIN {
+			if (dl < 0 || ul < 0) exit 1
+			print (dl < 70 || ul < 70) ? "true" : "false"
+		}')" || die "The Extreme A+ runtime retention is invalid."
+		[ "$profile_deep_runtime_minimum" = "$expected_deep_runtime_minimum" ] ||
+			die "The Extreme A+ deep-runtime state does not match its measured retention."
+		for extreme_direction in download upload; do
+			case "$extreme_direction" in
+				download) extreme_reported_retention="$extreme_dl_runtime_retention" ;;
+				upload) extreme_reported_retention="$extreme_ul_runtime_retention" ;;
+			esac
+			extreme_runtime_minimum="$(require_result_value "@.profile_search.$extreme_direction.runtime_minimum_kbps")" ||
+				die "The Extreme A+ runtime minimum is missing."
+			extreme_observed_low="$(require_result_value "@.proposal.$extreme_direction.observed_low_kbps")" ||
+				die "The Extreme A+ observed-low reference is missing."
+			extreme_expected_retention="$(LC_ALL=C awk -v minimum="$extreme_runtime_minimum" -v raw="$extreme_observed_low" 'BEGIN {
+				if (minimum <= 0 || raw <= 0) exit 1
+				printf "%.1f", minimum * 100 / raw
+			}')" || die "The Extreme A+ runtime-retention evidence is invalid."
+			numbers_equal "$extreme_reported_retention" "$extreme_expected_retention" ||
+				die "The Extreme A+ runtime-retention evidence does not match its tested rate."
+		done
+	else
+		[ "$profile_deep_runtime_minimum" = false ] ||
+			die "A non-Extreme profile claims an Extreme runtime minimum."
+		case "$(json_get "$result_copy" '@.profile_outcome.runtime_minimum_retention')" in
+			''|null) ;;
+			*) die "A non-Extreme profile contains Extreme runtime-retention evidence." ;;
+		esac
+	fi
 	profile_unsafe_direction_count=0
 	validate_profile_search_contract download "$profile_floor_infeasible"
 	validate_profile_search_contract upload "$profile_floor_infeasible"
@@ -1225,7 +1340,8 @@ arm_guard() {
 	fi
 	case "$action" in
 		apply_sqm)
-			if [ "$profile_target_met" = true ] && [ "$profile_objectives_met" = true ]; then
+			if [ "$profile_target_met" = true ] && [ "$profile_objectives_met" = true ] &&
+			   [ "$profile_deep_runtime_minimum" = false ]; then
 				require_result_flag '@.profile_outcome.manual_only' false "A target-meeting outcome was marked manual-only."
 				if [ "$result_class" = trusted ]; then
 					require_result_flag '@.auto_apply_eligible' true "A trusted, fully passing proposal unexpectedly requires manual-only apply."
@@ -1238,9 +1354,11 @@ arm_guard() {
 				profile_outcome_mode="$(require_result_value '@.profile_outcome.mode')" ||
 					die "The profile fallback outcome is missing."
 				case "$profile:$profile_outcome_mode" in
-					gaming:best-attainable-quality-fallback|best_overall:balanced-fallback) ;;
+					gaming:best-attainable-quality-fallback|best_overall:balanced-fallback|variable_link:measured-knee-quality-fallback) ;;
 					gaming:target-a-plus-throughput-advisory|best_overall:target-a-throughput-advisory) ;;
-					gaming:quality-and-throughput-advisory-review|best_overall:quality-and-throughput-advisory-review) ;;
+					gaming_extreme:extreme-a-plus-throughput-sacrifice|gaming_extreme:extreme-best-attainable-quality-fallback|gaming_extreme:extreme-quality-and-throughput-review) ;;
+					variable_link:target-b-retention-advisory) ;;
+					gaming:quality-and-throughput-advisory-review|best_overall:quality-and-throughput-advisory-review|variable_link:variable-link-review-required) ;;
 					fair:latency-safe-throughput-advisory|fair:quality-and-throughput-advisory-review)
 						result_action_allowed apply_sqm ||
 							die "The Fair advisory result does not allow applying its safe SQM candidate."

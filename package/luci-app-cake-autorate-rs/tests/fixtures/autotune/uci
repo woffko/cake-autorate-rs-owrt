@@ -34,6 +34,14 @@ case "$action:$key" in
 		[ -n "${AUTOTUNE_MOCK_CONFIGURED_UL_KBPS:-}" ] || exit 1
 		printf '%s\n' "$AUTOTUNE_MOCK_CONFIGURED_UL_KBPS"
 		;;
+	get:cake-autorate.*.throughput_reference_dl_p50_kbps)
+		[ -n "${AUTOTUNE_MOCK_TRUSTED_DL_KBPS:-}" ] || exit 1
+		printf '%s\n' "$AUTOTUNE_MOCK_TRUSTED_DL_KBPS"
+		;;
+	get:cake-autorate.*.throughput_reference_ul_p50_kbps)
+		[ -n "${AUTOTUNE_MOCK_TRUSTED_UL_KBPS:-}" ] || exit 1
+		printf '%s\n' "$AUTOTUNE_MOCK_TRUSTED_UL_KBPS"
+		;;
 	get:sqm.cake_*._cake_autorate_managed)
 		[ "${AUTOTUNE_MOCK_UCI_ABSENT:-0}" != 1 ] || exit 1
 		instance="${key#sqm.cake_}"

@@ -81,8 +81,8 @@ depend on the tested link and load at that moment.
 **Graphs** use an opt-in, bounded RAM-only history. Latency, transport delta,
 effective delay, CPU and synchronized download/upload traffic share the same
 timeline; the oldest samples are discarded automatically and nothing is
-written to flash. This capture contains the load phases from the same rating
-test.
+written to flash. The live Multi-WAN capture also shows an adaptive backoff
+event on the shared time axis.
 
 [![RAM-only latency, CPU and traffic graphs](docs/screenshots/graphs-overview.png)](docs/screenshots/graphs-overview.png)
 
@@ -108,7 +108,7 @@ for short latency-critical sessions rather than continuous household use.
 
 [![Full Auto-Tune calibration profiles](docs/screenshots/autotune-profiles.png)](docs/screenshots/autotune-profiles.png)
 
-### Controlled cellular observations (anonymized, not shipped behavior)
+### Controlled cellular observations (anonymized)
 
 The following controlled OpenWrt cellular-link sample runs are anonymized benchmark evidence and are **not** shipped behavior or guarantees.
 
@@ -124,30 +124,50 @@ The following controlled OpenWrt cellular-link sample runs are anonymized benchm
 
 ICMP samples in this set stayed around **10–13 ms** while TCP/WebSocket samples were **72–190 ms**. This is a measurable risk signal that some providers/networks may prioritize or specially treat ICMP, so ICMP-only grading can understate user-traffic latency.
 
-### Planned transport-aware adaptive ceiling (proposal, not shipped)
+### Transport-aware adaptive capacity (current development)
 
-Planned vNext behavior is scoped as a controlled runtime feature, separate from current release behavior:
+The current development source implements the following controller and LuCI
+model. It remains unreleased until a new release is published:
 
-- Add per-direction adaptive state fields: `safe_ceiling_dl`, `safe_ceiling_ul`, `failed_bound_dl`, `failed_bound_ul`, `runtime_minimum_dl`, `runtime_minimum_ul`, `exploration_minimum_dl`, and `exploration_minimum_ul`.
+- Keep raw capacity, current rate, measured runtime minimum, exploration
+  minimum, safe ceiling, failed bound, confidence and route epoch independently
+  for download and upload. A route/source/member change expires old evidence.
 - Offer an explicit raw-capacity calibration mode which transactionally removes
   only the managed download ingress CAKE/IFB path, measures the selected uplink,
   and restores the exact prior runtime through a watchdog even if the worker or
   browser disappears. Upload shaping may remain active when the selected test
   requires it.
-- Run shaped control candidates through the same transport-aware validation path before lowering or raising rates.
-- Increase passively by default only when saturation and transport latency evidence remain clean across both ICMP and native transport signals. Optional active probes may test above the current bound, but only clean candidate evidence may update `safe_ceiling`; route changes and proven capacity collapse invalidate stale bounds.
-- Apply causal backoff: stop further downward tuning when measured delay does not improve after a controlled reduction, and hold direction at last-known good value.
-- Expose two operation envelopes: `runtime_minimum` (hard floor for runtime behavior) and `exploration_minimum` (bounded search floor).
-- Add optional, scheduler-driven active-probing rounds with explicit opt-in,
-  estimated transfer per run/day/month, a configurable data budget, and a hard
-  stop when that budget is exhausted.
-- Keep three user choices separate: calibration strategy (raw-capacity bypass,
-  shaped-only, or reuse trusted bounds), runtime learning (passive-only,
-  periodic active probes, or fixed bounds), and operating policy
-  (latency-first, balanced, throughput-first, or bypass recommendation).
+- Run shaped candidates through the same transport-aware path, then confirm the
+  selected DL/UL pair under simultaneous load. The worse corroborated ICMP or
+  native transport delta is authoritative.
+- Grow passively by default only under proven saturation and clean transport
+  evidence. Optional active probes can test above the safe bound; only a clean
+  candidate promotes it.
+- Apply causal backoff: two reductions without meaningful latency improvement
+  restore the last useful point and enter `HOLD_NO_EFFECT` instead of destroying
+  throughput for radio/operator delay outside CAKE's control.
+- Keep three user choices separate: calibration strategy (**Shaped only**,
+  **Full raw capacity**, or **Reuse trusted bounds**), runtime learning
+  (**Passive only**, **Periodic active probes**, or **Fixed bounds**), and
+  operating profile (Gaming, Best overall, Variable link, or Fair).
+- Keep scheduled traffic injection opt-in. The scheduler reserves and settles
+  per-instance daily/monthly byte allowances in a crash-safe ledger, shows the
+  next due run and remaining allowance, and stops before exceeding a hard
+  budget.
+- Review may recommend a repeated upload-only-shaped experiment when evidence
+  suggests ingress CAKE is ineffective. This is a manual diagnostic result,
+  not a silent runtime topology change.
 - Keep fail-closed behavior unchanged: any integrity, identity, or contamination failure preserves last safe state and emits lower-confidence fallback instead of changing runtime rates.
 - Report confidence per direction and aggregate confidence with explicit provenance (`safe`, `provisional`, `limited`) so policy choice is auditable.
-- Current limitation under this proposal is scheduler-unbounded/`unlimited` paths: the adaptive ceiling should only run when an explicit bounded max is in place and must remain disabled for unlimited mode until bounded safety bounds are proven.
+
+One live high-capacity cellular development run intentionally used a 2 GiB hard
+limit. It completed raw measurements near **403/46 Mbps** and a first shaped
+point near **220/30 Mbps**, then stopped with typed
+`traffic-budget-exhausted`, restored the original SQM runtime and wrote no UCI.
+A complete Variable-link frontier at that capacity can consume roughly
+**4.5–6 GiB**, so periodic active testing must be enabled only with an
+appropriate data allowance. CPU saturation is reported as advisory evidence;
+it does not by itself reject an otherwise safe candidate.
 
 ## Current package tree
 
@@ -172,8 +192,8 @@ matrix:
 The target is an APK ABI rather than one specific board. The authoritative
 choice is the value returned by `apk --print-arch`. Every daemon asset follows
 the name
-`cake-autorate-rs-1.0_rc27-r1_openwrt-25.12_<arch>.apk`; the shared
-`luci-app-cake-autorate-rs-1.0_rc27-r2_openwrt-25.12_all.apk` contains the
+`cake-autorate-rs-1.0_rc27-r10_openwrt-25.12_<arch>.apk`; the shared
+`luci-app-cake-autorate-rs-1.0_rc27-r18_openwrt-25.12_all.apk` contains the
 architecture-independent LuCI interface and SQM integration.
 
 RC27 adds background-aware Full Auto-Tune confidence without mixing forwarded
@@ -259,8 +279,10 @@ and authenticated Playwright checks.
 [Mobile preset view](docs/screenshots/traffic-priorities-mobile.png) ·
 [staged Custom copy](docs/screenshots/traffic-priorities-custom.png)
 
-The screenshots use anonymized instance, interface, host and address labels;
-rates and diagnostics remain representative of the live RC27 interface.
+The screenshots use anonymized instance, interface, host and address labels.
+They combine a completed rating capture with the current RC27 Multi-WAN,
+graphs, Auto-Tune and traffic-priority interface; rates and diagnostics are
+representative examples rather than guarantees.
 
 ## Release history
 
@@ -701,8 +723,8 @@ For example, when it prints `aarch64_generic`:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc27-r1_openwrt-25.12_aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc27-r2_openwrt-25.12_all.apk
+  /root/cake-autorate-rs-1.0_rc27-r10_openwrt-25.12_aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc27-r18_openwrt-25.12_all.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:

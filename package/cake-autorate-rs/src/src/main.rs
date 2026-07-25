@@ -3,6 +3,7 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,6 +42,9 @@ const GRAPH_HISTORY_CRITICAL_AVAILABLE_KIB: u64 = 16 * 1024;
 const SQM_RUNTIME_HEALTH_CHECK_FAST_S: u64 = 3;
 const SQM_RUNTIME_HEALTH_CHECK_HEALTHY_S: u64 = 15;
 const SQM_RUNTIME_RECOVERY_COOLDOWN_S: u64 = 30;
+const SQM_BOOTSTRAP_HOTPLUG_GRACE_S: u64 = 12;
+const SQM_BOOTSTRAP_RECOVERY_BACKOFF_INITIAL_S: u64 = 5;
+const SQM_BOOTSTRAP_RECOVERY_BACKOFF_MAX_S: u64 = 60;
 const STATUS_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 const CAKE_GROWTH_UPDATE_MIN_INTERVAL: Duration = Duration::from_millis(100);
 const TRANSPORT_BASELINE_LEARNING_INTERVAL_S: f64 = 1.0;
@@ -84,6 +88,7 @@ extern "C" fn handle_signal(_: i32) {
 
 extern "C" {
     fn signal(signum: i32, handler: extern "C" fn(i32)) -> extern "C" fn(i32);
+    fn kill(pid: i32, signal: i32) -> i32;
 }
 
 #[derive(Clone, Debug)]
@@ -1490,7 +1495,10 @@ impl Config {
     }
 
     fn run_dir(&self) -> PathBuf {
-        PathBuf::from(format!("/var/run/cake-autorate/{}", self.instance))
+        env::var_os("CAKE_AUTORATE_RUN_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/var/run/cake-autorate"))
+            .join(&self.instance)
     }
 
     fn log_path(&self) -> PathBuf {
@@ -1950,25 +1958,50 @@ impl RateMonitor {
 }
 
 fn qdisc_output_has_cake(output: &str) -> bool {
-    output.lines().any(|line| {
-        let mut fields = line.split_whitespace();
-        fields.next() == Some("qdisc")
-            && fields
-                .next()
-                .map(|kind| kind == "cake" || kind == "cake_mq")
-                .unwrap_or(false)
-    })
+    output
+        .lines()
+        .filter(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            fields.first() == Some(&"qdisc")
+                && fields
+                    .get(1)
+                    .map(|kind| *kind == "cake" || *kind == "cake_mq")
+                    .unwrap_or(false)
+                && fields.contains(&"root")
+        })
+        .count()
+        == 1
 }
 
 fn ingress_output_targets_ifb(output: &str, ifb: &str) -> bool {
-    !ifb.is_empty() && output.lines().any(|line| line.contains(ifb))
+    fn clean(value: &str) -> &str {
+        value.trim_matches(|character: char| matches!(character, '(' | ')' | '[' | ']' | ',' | ';'))
+    }
+
+    if ifb.is_empty() {
+        return false;
+    }
+    output.lines().any(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        fields.windows(3).any(|window| {
+            window[0].eq_ignore_ascii_case("redirect")
+                && window[1].eq_ignore_ascii_case("dev")
+                && clean(window[2]) == ifb
+        }) || fields.windows(4).any(|window| {
+            window[0].eq_ignore_ascii_case("redirect")
+                && window[1].eq_ignore_ascii_case("to")
+                && window[2].eq_ignore_ascii_case("device")
+                && clean(window[3]) == ifb
+        })
+    })
 }
 
 fn tc_output(args: &[&str]) -> Result<String, String> {
-    let output = Command::new("tc")
+    let tc = env::var("CAKE_AUTORATE_TC").unwrap_or_else(|_| "tc".to_string());
+    let output = Command::new(&tc)
         .args(args)
         .output()
-        .map_err(|error| format!("failed to execute tc: {error}"))?;
+        .map_err(|error| format!("failed to execute {tc}: {error}"))?;
     if !output.status.success() {
         let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if error.is_empty() {
@@ -1980,10 +2013,7 @@ fn tc_output(args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn inspect_managed_sqm(cfg: &Config) -> Result<(), String> {
-    if !cfg.manage_sqm || !cfg.sqm_enabled {
-        return Ok(());
-    }
+fn inspect_sqm_topology(cfg: &Config) -> Result<(), String> {
     if !Path::new(&cfg.rx_bytes_path).is_file() {
         return Err(format!("download counter is missing for {}", cfg.dl_if));
     }
@@ -2011,22 +2041,121 @@ fn inspect_managed_sqm(cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 
-fn recover_managed_sqm(cfg: &Config) -> Result<(), String> {
+fn inspect_managed_sqm(cfg: &Config) -> Result<(), String> {
+    if !cfg.manage_sqm || !cfg.sqm_enabled {
+        return Ok(());
+    }
+    inspect_sqm_topology(cfg)
+}
+
+fn managed_sqm_target_ready(cfg: &Config) -> bool {
+    let sys_class_net = env::var_os("CAKE_AUTORATE_SYS_CLASS_NET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/sys/class/net"));
+
+    sys_class_net.join(&cfg.sqm_interface).exists() || Path::new(&cfg.tx_bytes_path).is_file()
+}
+
+#[derive(Debug)]
+enum SqmRecoveryError {
+    Busy(String),
+    Failed(String),
+    Terminated,
+}
+
+impl SqmRecoveryError {
+    fn message(&self) -> &str {
+        match self {
+            Self::Busy(message) | Self::Failed(message) => message,
+            Self::Terminated => "terminated while recovering managed SQM",
+        }
+    }
+}
+
+fn terminate_helper_process_group(child: &mut Child) {
+    let process_group = -(child.id() as i32);
+    unsafe {
+        kill(process_group, 15);
+    }
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(_) => break,
+        }
+    }
+    unsafe {
+        kill(process_group, 9);
+    }
+    let _ = child.wait();
+}
+
+fn run_sqm_helper(cfg: &Config, operation: Option<&str>) -> Result<(), SqmRecoveryError> {
     let helper = env::var("CAKE_AUTORATE_SQM_RECOVER")
         .unwrap_or_else(|_| "/usr/libexec/cake-autorate-rs/sqm-recover".to_string());
-    let output = Command::new(&helper)
+    let mut command = Command::new(&helper);
+    command
         .arg(&cfg.instance)
-        .output()
-        .map_err(|error| format!("failed to execute {helper}: {error}"))?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if detail.is_empty() {
-            format!("SQM recovery helper failed with {}", output.status)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    if let Some(operation) = operation {
+        command.arg(operation);
+    }
+    let mut child = command.spawn().map_err(|error| {
+        SqmRecoveryError::Failed(format!("failed to execute {helper}: {error}"))
+    })?;
+    let stderr = child.stderr.take();
+    let stderr_reader = thread::spawn(move || {
+        let mut detail = String::new();
+        if let Some(mut stderr) = stderr {
+            let _ = stderr.read_to_string(&mut detail);
+        }
+        detail
+    });
+    let status = loop {
+        if TERMINATE.load(Ordering::SeqCst) {
+            terminate_helper_process_group(&mut child);
+            let _ = stderr_reader.join();
+            return Err(SqmRecoveryError::Terminated);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(Duration::from_millis(100)),
+            Err(error) => {
+                terminate_helper_process_group(&mut child);
+                let _ = stderr_reader.join();
+                return Err(SqmRecoveryError::Failed(format!(
+                    "failed to wait for {helper}: {error}"
+                )));
+            }
+        }
+    };
+    let detail = stderr_reader.join().unwrap_or_default();
+    let detail = detail.trim().to_string();
+    if !status.success() {
+        let message = if detail.is_empty() {
+            format!("SQM recovery helper failed with {status}")
         } else {
             detail
-        });
+        };
+        if status.code() == Some(75) {
+            return Err(SqmRecoveryError::Busy(message));
+        }
+        return Err(SqmRecoveryError::Failed(message));
     }
-    inspect_managed_sqm(cfg)
+    Ok(())
+}
+
+fn attest_managed_sqm(cfg: &Config) -> Result<(), SqmRecoveryError> {
+    run_sqm_helper(cfg, Some("check"))?;
+    inspect_sqm_topology(cfg).map_err(SqmRecoveryError::Failed)
+}
+
+fn recover_managed_sqm(cfg: &Config) -> Result<(), SqmRecoveryError> {
+    run_sqm_helper(cfg, None)?;
+    inspect_sqm_topology(cfg).map_err(SqmRecoveryError::Failed)
 }
 
 #[derive(Clone, Debug)]
@@ -2086,6 +2215,9 @@ fn transport_result_matches_route(
 }
 
 fn uplink_error_code(state: UplinkState, reason: &str) -> Option<&'static str> {
+    if state == UplinkState::Rechecking {
+        return Some("route_rechecking");
+    }
     if state != UplinkState::Offline {
         return None;
     }
@@ -2881,6 +3013,7 @@ struct Controller {
     sqm_recovery_attempts: u64,
     sqm_last_recovery_attempt: Option<Instant>,
     sqm_last_recovery_at: Option<f64>,
+    sqm_topology_missing_since: Option<Instant>,
     last_status: Option<StatusSnapshot>,
     last_status_publish: Instant,
 }
@@ -3018,6 +3151,7 @@ impl Controller {
             sqm_recovery_attempts: 0,
             sqm_last_recovery_attempt: None,
             sqm_last_recovery_at: None,
+            sqm_topology_missing_since: None,
             last_status: None,
             last_status_publish: now.checked_sub(STATUS_PUBLISH_INTERVAL).unwrap_or(now),
             dl_baseline_us: HashMap::new(),
@@ -3091,14 +3225,33 @@ impl Controller {
 
     fn ensure_managed_sqm(&mut self) -> (bool, bool) {
         if !self.cfg.manage_sqm || !self.cfg.sqm_enabled {
+            self.sqm_topology_missing_since = None;
             self.set_sqm_runtime_status("UNMANAGED", true, "");
             return (true, false);
         }
 
+        if !managed_sqm_target_ready(&self.cfg) {
+            self.sqm_topology_missing_since = None;
+            self.sqm_last_recovery_attempt = None;
+            let reason = format!(
+                "target interface {} is unavailable; waiting for link and native SQM hotplug",
+                self.cfg.sqm_interface
+            );
+            self.set_sqm_runtime_status("WAITING_LINK", false, &reason);
+            self.set_run_state("WAITING_LINK");
+            return (false, false);
+        }
+
         match inspect_managed_sqm(&self.cfg) {
-            Ok(()) if self.sqm_runtime_healthy => (true, false),
+            Ok(()) if self.sqm_runtime_healthy => {
+                self.sqm_topology_missing_since = None;
+                (true, false)
+            }
             Ok(()) => match self.accept_recovered_sqm("runtime recovered externally") {
-                Ok(()) => (true, true),
+                Ok(()) => {
+                    self.sqm_topology_missing_since = None;
+                    (true, true)
+                }
                 Err(error) => {
                     self.set_sqm_runtime_status("ERROR", false, &error);
                     self.set_run_state("ERROR");
@@ -3106,6 +3259,16 @@ impl Controller {
                 }
             },
             Err(initial_reason) => {
+                let now = Instant::now();
+                let missing_since = *self.sqm_topology_missing_since.get_or_insert(now);
+                let grace = bootstrap_hotplug_grace();
+                if now.saturating_duration_since(missing_since) < grace {
+                    let reason =
+                        format!("{initial_reason}; allowing the native SQM hotplug path to settle");
+                    self.set_sqm_runtime_status("WAITING_SQM", false, &reason);
+                    self.set_run_state("WAITING_SQM");
+                    return (false, false);
+                }
                 if self
                     .sqm_last_recovery_attempt
                     .map(|attempt| {
@@ -3123,15 +3286,34 @@ impl Controller {
                 self.set_run_state("RECOVERING");
                 match recover_managed_sqm(&self.cfg) {
                     Ok(()) => match self.accept_recovered_sqm("automatic SQM recovery completed") {
-                        Ok(()) => (true, true),
+                        Ok(()) => {
+                            self.sqm_topology_missing_since = None;
+                            (true, true)
+                        }
                         Err(error) => {
                             self.set_sqm_runtime_status("ERROR", false, &error);
                             self.set_run_state("ERROR");
                             (false, false)
                         }
                     },
-                    Err(error) => {
-                        let reason = format!("{initial_reason}; recovery failed: {error}");
+                    Err(SqmRecoveryError::Busy(error)) => {
+                        let reason = format!("{initial_reason}; recovery deferred: {error}");
+                        self.set_sqm_runtime_status("WAITING_OPERATION", false, &reason);
+                        self.set_run_state("WAITING_OPERATION");
+                        (false, false)
+                    }
+                    Err(SqmRecoveryError::Terminated) => {
+                        self.set_sqm_runtime_status(
+                            "STOPPING",
+                            false,
+                            "termination requested during SQM recovery",
+                        );
+                        self.set_run_state("STOPPING");
+                        (false, false)
+                    }
+                    Err(error @ SqmRecoveryError::Failed(_)) => {
+                        let reason =
+                            format!("{initial_reason}; recovery failed: {}", error.message());
                         self.set_sqm_runtime_status("ERROR", false, &reason);
                         self.set_run_state("ERROR");
                         (false, false)
@@ -4110,6 +4292,13 @@ impl Controller {
             self.rating_load_snapshot.phase.as_str(),
             grade_snapshot.dl_samples,
             grade_snapshot.ul_samples,
+            self.adaptive_dl.phase().as_str(),
+            self.adaptive_ul.phase().as_str(),
+            self.adaptive_dl.last_transition_reason(),
+            self.adaptive_ul.last_transition_reason(),
+            self.quality_search_dl.causal_state(),
+            self.quality_search_ul.causal_state(),
+            &self.sqm_runtime_state,
         );
         let path = self.cfg.graph_history_path();
         let instance_cap = self.history_budget.instance_budget_kib.saturating_mul(1024);
@@ -4284,7 +4473,7 @@ impl Controller {
         if !self.cfg.adaptive_ceiling_enabled
             || matches!(
                 self.uplink_state,
-                UplinkState::Offline | UplinkState::Learning
+                UplinkState::Offline | UplinkState::Learning | UplinkState::Rechecking
             )
         {
             return;
@@ -4516,6 +4705,12 @@ impl Controller {
         let transport = self
             .transport_latency
             .snapshot(adaptive_now, self.cfg.transport_latency_enabled);
+        let transport_dl = self
+            .transport_latency_dl
+            .snapshot(adaptive_now, self.cfg.transport_latency_enabled);
+        let transport_ul = self
+            .transport_latency_ul
+            .snapshot(adaptive_now, self.cfg.transport_latency_enabled);
         let effective_delta_ms =
             effective_latency_delta_ms(avg_dl_delta, avg_ul_delta, transport.delta_ms);
         let quality_class = if transport.confirmed {
@@ -4746,12 +4941,39 @@ impl Controller {
             .as_ref()
             .map(|snapshot| snapshot.active)
             .unwrap_or(false);
+        let route_test_ready = self
+            .route_snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot.online
+                    && matches!(
+                        self.uplink_state,
+                        UplinkState::Active | UplinkState::Standby
+                    )
+            })
+            .unwrap_or(false);
         let uplink_error = uplink_error_code(self.uplink_state, &self.uplink_reason);
         let transport_error = transport_error_code(transport.last_error.as_deref());
+        let adaptive_capacity = adaptive_capacity_status_json(AdaptiveCapacityStatusContext {
+            enabled: self.cfg.adaptive_ceiling_enabled,
+            route_epoch: self.route_identity.as_deref(),
+            download: &self.adaptive_dl,
+            upload: &self.adaptive_ul,
+            current_download_kbps: self.shaper_dl,
+            current_upload_kbps: self.shaper_ul,
+            runtime_minimum_download_kbps: self.cfg.min_dl_shaper_rate_kbps,
+            runtime_minimum_upload_kbps: self.cfg.min_ul_shaper_rate_kbps,
+            transport_confidence_download: transport_dl.confidence,
+            transport_confidence_upload: transport_ul.confidence,
+            no_cake_effect_download: self.quality_search_dl.no_cake_effect(),
+            no_cake_effect_upload: self.quality_search_ul.no_cake_effect(),
+            causal_state_download: self.quality_search_dl.causal_state(),
+            causal_state_upload: self.quality_search_ul.causal_state(),
+        });
         file.seek(SeekFrom::End(-2))?;
         writeln!(
             file,
-            ",\"uplink_state\":\"{}\",\"uplink_reason\":\"{}\",\"uplink_error_code\":{},\"transport_error_code\":{},\"route_mode_configured\":\"{}\",\"route_mode\":\"{}\",\"mwan3_member\":\"{}\",\"route_device\":\"{}\",\"route_source_ip\":\"{}\",\"route_external_ip\":\"{}\",\"route_fwmark\":\"{}\",\"route_table\":\"{}\",\"mwan3_member_status\":\"{}\",\"route_active\":{},\"route_identity\":{}}}",
+            ",\"uplink_state\":\"{}\",\"uplink_reason\":\"{}\",\"uplink_error_code\":{},\"transport_error_code\":{},\"route_mode_configured\":\"{}\",\"route_mode\":\"{}\",\"mwan3_member\":\"{}\",\"route_device\":\"{}\",\"route_source_ip\":\"{}\",\"route_external_ip\":\"{}\",\"route_fwmark\":\"{}\",\"route_table\":\"{}\",\"mwan3_member_status\":\"{}\",\"route_active\":{},\"route_test_ready\":{},\"route_identity\":{},\"adaptive_capacity\":{}}}",
             self.uplink_state.as_str(),
             json_escape(&self.uplink_reason),
             json_string_or_null(uplink_error),
@@ -4766,7 +4988,9 @@ impl Controller {
             json_escape(route_table),
             json_escape(member_status),
             route_active,
+            route_test_ready,
             json_string_or_null(self.route_identity.as_deref()),
+            adaptive_capacity,
         )?;
         fs::rename(tmp, path)?;
         self.last_status_publish = Instant::now();
@@ -4894,9 +5118,12 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
     }
 
     if cfg.startup_wait_s > 0.0 {
-        std::thread::sleep(Duration::from_secs_f64(cfg.startup_wait_s));
+        if !interruptible_wait(Duration::from_secs_f64(cfg.startup_wait_s)) {
+            return Err("terminated during startup wait".to_string());
+        }
     }
     cfg.refresh_wire_packet_sizes();
+    wait_for_runtime_topology(&cfg)?;
 
     let mut controller = Controller::new(cfg.clone())?;
     let route_spec = cfg.route_spec();
@@ -5008,14 +5235,20 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                 last_route_check,
                 route_stability,
             );
-            let must_stop = transition.became_offline || transition.identity_changed;
+            let must_stop = transition.became_offline
+                || transition.identity_changed
+                || (route_probes_allowed && !transition.probes_allowed);
             if must_stop {
                 if let Some(mut old) = pinger.take() {
                     old.stop();
                 }
                 controller.note_probe_gap();
             }
-            current_route_snapshot = inspected.ok();
+            match inspected {
+                Ok(snapshot) => current_route_snapshot = Some(snapshot),
+                Err(_) if transition.state == UplinkState::Rechecking => {}
+                Err(_) => current_route_snapshot = None,
+            }
             if transition.identity_changed || transition.state == UplinkState::Offline {
                 controller.set_route_external_ip(String::new());
             }
@@ -5996,6 +6229,283 @@ fn ensure_run_dir(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
+fn bootstrap_recovery_backoff(attempt: u64) -> Duration {
+    let shift = attempt.saturating_sub(1).min(6) as u32;
+    let seconds = SQM_BOOTSTRAP_RECOVERY_BACKOFF_INITIAL_S
+        .saturating_mul(1_u64 << shift)
+        .min(SQM_BOOTSTRAP_RECOVERY_BACKOFF_MAX_S);
+    Duration::from_secs(seconds)
+}
+
+fn bootstrap_hotplug_grace() -> Duration {
+    let seconds = env::var("CAKE_AUTORATE_SQM_BOOTSTRAP_GRACE_S")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value <= 300)
+        .unwrap_or(SQM_BOOTSTRAP_HOTPLUG_GRACE_S);
+    Duration::from_secs(seconds)
+}
+
+fn interruptible_wait(duration: Duration) -> bool {
+    let deadline = Instant::now() + duration;
+    while !TERMINATE.load(Ordering::SeqCst) {
+        let now = Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(200)),
+        );
+    }
+    false
+}
+
+fn write_bootstrap_status(
+    cfg: &Config,
+    state: &str,
+    sqm_state: &str,
+    reason: &str,
+    attempts: u64,
+    started_at: f64,
+) -> io::Result<()> {
+    ensure_run_dir(&cfg.run_dir())?;
+    let path = cfg.run_dir().join("status.json");
+    let tmp = cfg.run_dir().join("status.json.tmp");
+    let uplink_state = if state == "WAITING_LINK" {
+        "OFFLINE"
+    } else {
+        "LEARNING"
+    };
+    let mut file = File::create(&tmp)?;
+    writeln!(
+        file,
+        "{{\"instance\":\"{}\",\"version\":\"{}\",\"state\":\"{}\",\"uplink_state\":\"{}\",\"uplink_reason\":\"{}\",\"sqm_runtime_managed\":{},\"sqm_runtime_state\":\"{}\",\"sqm_runtime_healthy\":false,\"sqm_runtime_reason\":\"{}\",\"sqm_recovery_attempts\":{},\"sqm_last_recovery_at\":null,\"started_at\":{:.6},\"updated_at\":{:.6},\"dl_if\":\"{}\",\"ul_if\":\"{}\",\"reflector\":\"\",\"seq\":\"\",\"rtt_ms\":0,\"dl_achieved_rate_kbps\":0,\"ul_achieved_rate_kbps\":0,\"cake_dl_rate_kbps\":{:.0},\"cake_ul_rate_kbps\":{:.0},\"quality_class\":\"LEARNING\",\"quality_dl_class\":\"LEARNING\",\"quality_ul_class\":\"LEARNING\",\"quality_confidence\":0,\"quality_reason\":\"{}\",\"active_reflectors\":[],\"spare_reflectors\":[],\"bad_reflectors\":[],\"reflector_health\":[]}}",
+        json_escape(&cfg.instance),
+        env!("CARGO_PKG_VERSION"),
+        json_escape(state),
+        uplink_state,
+        json_escape(reason),
+        cfg.manage_sqm && cfg.sqm_enabled,
+        json_escape(sqm_state),
+        json_escape(reason),
+        attempts,
+        started_at,
+        epoch_secs(),
+        json_escape(&cfg.dl_if),
+        json_escape(&cfg.ul_if),
+        cfg.base_dl_shaper_rate_kbps,
+        cfg.base_ul_shaper_rate_kbps,
+        json_escape(state)
+    )?;
+    file.sync_all()?;
+    fs::rename(tmp, path)
+}
+
+fn wait_for_runtime_topology(cfg: &Config) -> Result<(), String> {
+    let started_at = epoch_secs();
+    let poll_interval = Duration::from_secs_f64(cfg.if_up_check_interval_s.clamp(1.0, 10.0));
+    let mut target_seen_at: Option<Instant> = None;
+    let mut next_recovery_at: Option<Instant> = None;
+    let mut recovery_attempts = 0_u64;
+    let mut last_report = (String::new(), String::new());
+
+    loop {
+        if TERMINATE.load(Ordering::SeqCst) {
+            return Err("terminated while waiting for WAN/SQM runtime".to_string());
+        }
+
+        let target_ready = managed_sqm_target_ready(cfg);
+        if !target_ready {
+            target_seen_at = None;
+            next_recovery_at = None;
+            let state = "WAITING_LINK";
+            let reason = format!(
+                "waiting for target interface {} and its counters",
+                cfg.sqm_interface
+            );
+            if last_report != (state.to_string(), reason.clone()) {
+                eprintln!("{state}: {reason}");
+                last_report = (state.to_string(), reason.clone());
+            }
+            write_bootstrap_status(cfg, state, state, &reason, recovery_attempts, started_at)
+                .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
+            if !interruptible_wait(poll_interval) {
+                return Err("terminated while waiting for target interface".to_string());
+            }
+            continue;
+        }
+
+        let now = Instant::now();
+        let target_since = *target_seen_at.get_or_insert(now);
+        let initial_reason = match inspect_sqm_topology(cfg) {
+            Ok(()) if !cfg.manage_sqm || !cfg.sqm_enabled => return Ok(()),
+            Ok(()) => match attest_managed_sqm(cfg) {
+                Ok(()) => return Ok(()),
+                Err(SqmRecoveryError::Busy(reason)) => {
+                    let state = "WAITING_OPERATION";
+                    if last_report != (state.to_string(), reason.clone()) {
+                        eprintln!("{state}: {reason}");
+                        last_report = (state.to_string(), reason.clone());
+                    }
+                    write_bootstrap_status(
+                        cfg,
+                        state,
+                        state,
+                        &reason,
+                        recovery_attempts,
+                        started_at,
+                    )
+                    .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
+                    if !interruptible_wait(poll_interval) {
+                        return Err(
+                            "terminated while waiting for the SQM operation lock".to_string()
+                        );
+                    }
+                    continue;
+                }
+                Err(SqmRecoveryError::Failed(reason)) => reason,
+                Err(SqmRecoveryError::Terminated) => {
+                    return Err("terminated while attesting managed SQM".to_string());
+                }
+            },
+            Err(initial_reason) => initial_reason,
+        };
+
+        {
+            if !cfg.manage_sqm || !cfg.sqm_enabled {
+                let state = "WAITING_EXTERNAL_SQM";
+                if last_report != (state.to_string(), initial_reason.clone()) {
+                    eprintln!("{state}: {initial_reason}");
+                    last_report = (state.to_string(), initial_reason.clone());
+                }
+                write_bootstrap_status(
+                    cfg,
+                    state,
+                    state,
+                    &initial_reason,
+                    recovery_attempts,
+                    started_at,
+                )
+                .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
+                if !interruptible_wait(poll_interval) {
+                    return Err("terminated while waiting for external SQM".to_string());
+                }
+                continue;
+            }
+
+            let grace = bootstrap_hotplug_grace();
+            if now.saturating_duration_since(target_since) < grace {
+                let state = "WAITING_SQM";
+                let reason =
+                    format!("{initial_reason}; allowing the native SQM hotplug path to settle");
+                if last_report != (state.to_string(), reason.clone()) {
+                    eprintln!("{state}: {reason}");
+                    last_report = (state.to_string(), reason.clone());
+                }
+                write_bootstrap_status(cfg, state, state, &reason, recovery_attempts, started_at)
+                    .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
+                if !interruptible_wait(
+                    poll_interval
+                        .min(grace.saturating_sub(now.saturating_duration_since(target_since))),
+                ) {
+                    return Err("terminated while waiting for SQM hotplug".to_string());
+                }
+                continue;
+            }
+
+            if next_recovery_at
+                .map(|deadline| now < deadline)
+                .unwrap_or(false)
+            {
+                let state = "WAITING_SQM";
+                if last_report != (state.to_string(), initial_reason.clone()) {
+                    eprintln!("{state}: {initial_reason}");
+                    last_report = (state.to_string(), initial_reason.clone());
+                }
+                write_bootstrap_status(
+                    cfg,
+                    state,
+                    state,
+                    &initial_reason,
+                    recovery_attempts,
+                    started_at,
+                )
+                .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
+                if !interruptible_wait(poll_interval) {
+                    return Err("terminated while backing off SQM recovery".to_string());
+                }
+                continue;
+            }
+
+            recovery_attempts = recovery_attempts.saturating_add(1);
+            let recovering_reason = format!(
+                "{initial_reason}; starting owned SQM recovery attempt {recovery_attempts}"
+            );
+            write_bootstrap_status(
+                cfg,
+                "RECOVERING",
+                "RECOVERING",
+                &recovering_reason,
+                recovery_attempts,
+                started_at,
+            )
+            .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
+            match recover_managed_sqm(cfg) {
+                Ok(()) => return Ok(()),
+                Err(SqmRecoveryError::Busy(reason)) => {
+                    let state = "WAITING_OPERATION";
+                    if last_report != (state.to_string(), reason.clone()) {
+                        eprintln!("{state}: {reason}");
+                        last_report = (state.to_string(), reason.clone());
+                    }
+                    write_bootstrap_status(
+                        cfg,
+                        state,
+                        state,
+                        &reason,
+                        recovery_attempts,
+                        started_at,
+                    )
+                    .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
+                    next_recovery_at = Some(
+                        Instant::now()
+                            + Duration::from_secs(SQM_BOOTSTRAP_RECOVERY_BACKOFF_INITIAL_S),
+                    );
+                }
+                Err(SqmRecoveryError::Failed(reason)) => {
+                    let delay = bootstrap_recovery_backoff(recovery_attempts);
+                    let state = "WAITING_SQM";
+                    let detail = format!(
+                            "{initial_reason}; recovery attempt {recovery_attempts} failed: {reason}; retrying in {}s",
+                            delay.as_secs()
+                        );
+                    eprintln!("{state}: {detail}");
+                    last_report = (state.to_string(), detail.clone());
+                    write_bootstrap_status(
+                        cfg,
+                        state,
+                        state,
+                        &detail,
+                        recovery_attempts,
+                        started_at,
+                    )
+                    .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
+                    next_recovery_at = Some(Instant::now() + delay);
+                }
+                Err(SqmRecoveryError::Terminated) => {
+                    return Err("terminated during managed SQM recovery".to_string());
+                }
+            }
+        }
+
+        if !interruptible_wait(poll_interval) {
+            return Err("terminated while waiting for SQM recovery".to_string());
+        }
+    }
+}
+
 fn wait_for_path(path: &str, interval_s: f64) -> Result<(), String> {
     let p = Path::new(path);
     while !p.exists() {
@@ -6342,6 +6852,74 @@ fn json_string_or_null(value: Option<&str>) -> String {
         .unwrap_or_else(|| "null".to_string())
 }
 
+struct AdaptiveCapacityStatusContext<'a> {
+    enabled: bool,
+    route_epoch: Option<&'a str>,
+    download: &'a AdaptiveCeilingDirection,
+    upload: &'a AdaptiveCeilingDirection,
+    current_download_kbps: f64,
+    current_upload_kbps: f64,
+    runtime_minimum_download_kbps: f64,
+    runtime_minimum_upload_kbps: f64,
+    transport_confidence_download: u8,
+    transport_confidence_upload: u8,
+    no_cake_effect_download: Option<bool>,
+    no_cake_effect_upload: Option<bool>,
+    causal_state_download: &'a str,
+    causal_state_upload: &'a str,
+}
+
+fn adaptive_capacity_direction_status_json(
+    direction: &AdaptiveCeilingDirection,
+    current_rate_kbps: f64,
+    runtime_minimum_kbps: f64,
+    transport_confidence: u8,
+    no_cake_effect: Option<bool>,
+    causal_state: &str,
+) -> String {
+    let no_cake_effect_json = match no_cake_effect {
+        Some(value) => value.to_string(),
+        None => "null".to_string(),
+    };
+    format!(
+        "{{\"phase\":\"{}\",\"current_rate_kbps\":{:.0},\"raw_capacity_kbps\":null,\"safe_ceiling_kbps\":{:.0},\"failed_bound_kbps\":{},\"runtime_minimum_kbps\":{:.0},\"exploration_minimum_kbps\":null,\"probe_target_kbps\":{},\"no_cake_effect\":{},\"causal_state\":\"{}\",\"last_validation_at\":null,\"confidence\":{{\"state\":\"passive_transport\",\"percent\":{},\"transport_percent\":{}}}}}",
+        direction.phase().as_str(),
+        current_rate_kbps,
+        direction.safe_ceiling_kbps(),
+        json_f64_or_null(direction.failed_ceiling_kbps(), 0),
+        runtime_minimum_kbps,
+        json_f64_or_null(direction.probe_target_kbps(), 0),
+		no_cake_effect_json,
+		json_escape(causal_state),
+		transport_confidence,
+        transport_confidence,
+    )
+}
+
+fn adaptive_capacity_status_json(context: AdaptiveCapacityStatusContext<'_>) -> String {
+    format!(
+		"{{\"schema_version\":1,\"behavior_version\":\"passive_transport_v1\",\"enabled\":{},\"route_epoch\":{},\"download\":{},\"upload\":{}}}",
+        context.enabled,
+        json_string_or_null(context.route_epoch),
+        adaptive_capacity_direction_status_json(
+            context.download,
+            context.current_download_kbps,
+            context.runtime_minimum_download_kbps,
+            context.transport_confidence_download,
+			context.no_cake_effect_download,
+			context.causal_state_download,
+        ),
+        adaptive_capacity_direction_status_json(
+            context.upload,
+            context.current_upload_kbps,
+            context.runtime_minimum_upload_kbps,
+            context.transport_confidence_upload,
+			context.no_cake_effect_upload,
+			context.causal_state_upload,
+        ),
+    )
+}
+
 fn quality_grade_metric_json(metric: Option<&QualityGradeMetric>) -> String {
     let Some(metric) = metric else {
         return "null".to_string();
@@ -6408,9 +6986,16 @@ fn graph_history_line(
     rating_phase: &str,
     rating_dl_samples: usize,
     rating_ul_samples: usize,
+    adaptive_dl_phase: &str,
+    adaptive_ul_phase: &str,
+    adaptive_dl_reason: &str,
+    adaptive_ul_reason: &str,
+    causal_dl_state: &str,
+    causal_ul_state: &str,
+    sqm_runtime_state: &str,
 ) -> String {
     format!(
-        "{:.0},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+        "{:.0},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
         timestamp,
         json_f64_or_empty(rtt_ms, 3),
         json_f64_or_empty(cpu_percent, 1),
@@ -6428,6 +7013,13 @@ fn graph_history_line(
         rating_phase.replace(',', ""),
         rating_dl_samples,
         rating_ul_samples,
+        adaptive_dl_phase.replace(',', ""),
+        adaptive_ul_phase.replace(',', ""),
+        adaptive_dl_reason.replace(',', ""),
+        adaptive_ul_reason.replace(',', ""),
+        causal_dl_state.replace(',', ""),
+        causal_ul_state.replace(',', ""),
+        sqm_runtime_state.replace(',', ""),
     )
 }
 
@@ -6634,11 +7226,11 @@ fn reflector_health_json(
 fn print_usage() {
     eprintln!("usage: cake-autorated [--instance NAME] [--once] [--dump-config]");
     eprintln!(
-        "       cake-autorated --autotune-proposal --dl-samples LIST --ul-samples LIST \\\n         --idle-median-ms N --idle-p95-ms N --idle-samples N [--link-kind KIND] \\\n         [--profile gaming|best_overall|fair] \\\n         [--base-scale N | --dl-base-scale N --ul-base-scale N]"
+        "       cake-autorated --autotune-proposal --dl-samples LIST --ul-samples LIST \\\n         --idle-median-ms N --idle-p95-ms N --idle-samples N [--link-kind KIND] \\\n         [--profile gaming|best_overall|variable_link|fair] \\\n         [--base-scale N | --dl-base-scale N --ul-base-scale N] \\\n         [--dl-runtime-min-kbps N --ul-runtime-min-kbps N]"
     );
-    eprintln!("       cake-autorated --autotune-validate [--profile gaming|best_overall|fair] --dl-observed-low-kbps N --ul-observed-low-kbps N --dl-candidate-kbps N --ul-candidate-kbps N --dl-achieved-kbps N --ul-achieved-kbps N --dl-min-kbps N --ul-min-kbps N --dl-max-kbps N --ul-max-kbps N --icmp-delta-ms N --transport-delta-ms N --loss-percent N --cpu-percent N");
+    eprintln!("       cake-autorated --autotune-validate [--profile gaming|gaming_extreme|best_overall|variable_link|fair] --dl-observed-low-kbps N --ul-observed-low-kbps N --dl-candidate-kbps N --ul-candidate-kbps N --dl-achieved-kbps N --ul-achieved-kbps N --dl-min-kbps N --ul-min-kbps N --dl-max-kbps N --ul-max-kbps N --icmp-delta-ms N --transport-delta-ms N --loss-percent N --cpu-percent N");
     eprintln!("         [--dl-icmp-delta-ms N --ul-icmp-delta-ms N --dl-transport-delta-ms N --ul-transport-delta-ms N --dl-loss-percent N --ul-loss-percent N --dl-cpu-percent N --ul-cpu-percent N]");
-    eprintln!("       cake-autorated --autotune-optimize-direction --profile gaming|best_overall|fair --direction download|upload --observed-low-kbps N --minimum-kbps N --upper-kbps N --observations C,A,I,T,L,P[;...] [--uncertainty-percent N] [--max-attempts N]");
+    eprintln!("       cake-autorated --autotune-optimize-direction --profile gaming|gaming_extreme|best_overall|variable_link|fair --direction download|upload --observed-low-kbps N --minimum-kbps N --upper-kbps N --observations C,A,I,T,L,P[;...] [--uncertainty-percent N] [--max-attempts N]");
     eprintln!("       cake-autorated --transport-probe --backend websocket|tcp|http|legacy-http [--endpoint URL] [--device IFACE] [--source-ip IPv4] [--fwmark HEX] [--count N] [--timeout SEC] [--interval-ms N]");
 }
 
@@ -6782,6 +7374,8 @@ where
     let mut base_scale = 1.0;
     let mut download_base_scale = None;
     let mut upload_base_scale = None;
+    let mut download_runtime_minimum = None;
+    let mut upload_runtime_minimum = None;
     let mut link_kind = LinkKind::Unknown;
     let mut profile = AutotuneProfile::BestOverall;
     let mut conservative_background_dl_kbps = None;
@@ -6820,6 +7414,14 @@ where
             }
             "--ul-base-scale" => {
                 upload_base_scale = Some(parse_cli_f64("upload base-rate scale", &value)?)
+            }
+            "--dl-runtime-min-kbps" => {
+                download_runtime_minimum =
+                    Some(parse_cli_u64("measured download runtime minimum", &value)?)
+            }
+            "--ul-runtime-min-kbps" => {
+                upload_runtime_minimum =
+                    Some(parse_cli_u64("measured upload runtime minimum", &value)?)
             }
             "--conservative-background-dl-kbps" => {
                 conservative_background_dl_kbps =
@@ -6908,6 +7510,18 @@ where
             current_ul_max,
             current_ul_cap,
         );
+    }
+    match (download_runtime_minimum, upload_runtime_minimum) {
+        (Some(download), Some(upload)) => {
+            proposal.set_measured_runtime_minimums(download, upload)?
+        }
+        (None, None) => {}
+        _ => {
+            return Err(
+                "download and upload runtime minimum overrides must be supplied together"
+                    .to_string(),
+            )
+        }
     }
     println!("{}", proposal.to_json());
     Ok(())
@@ -7430,7 +8044,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        autotune, compact_graph_history_data, compact_graph_history_file, compute_history_budget,
+        adaptive_capacity_status_json, autotune, bootstrap_recovery_backoff,
+        compact_graph_history_data, compact_graph_history_file, compute_history_budget,
         default_reflectors, graph_history_line, history_safe_max_kib, ingress_output_targets_ifb,
         irtt_target_arg, max_wire_packet_size_bits_from_mtu, monitor_tick_timeout,
         next_spare_reflector, packet_compensation_us, parse_cli_f64, parse_fping_line,
@@ -7438,16 +8053,64 @@ mod tests {
         parse_reflector_candidates, parse_strict_bool, parse_tc_linklayer_overhead,
         parse_tsping_line, parse_uci_values, pinger_command, pinger_response_interval_s,
         qdisc_output_has_cake, reflector_bad_reflectors, reflector_health_json,
-        reflector_spare_reflectors, sample_is_stale, shaper_update_due, stall_detection_timeout,
-        status_publish_due, throughput_floor, transport_error_code, transport_probe_interval_s,
-        transport_result_matches_route, uplink_error_code, validated_conservative_samples, Config,
-        MemoryInfo, RateMonitor, ReflectorHealth, ReflectorState, Sample, ThroughputGuardInput,
-        UplinkState, CAKE_GROWTH_UPDATE_MIN_INTERVAL, STATUS_PUBLISH_INTERVAL,
+        reflector_spare_reflectors, run_sqm_helper, sample_is_stale, shaper_update_due,
+        stall_detection_timeout, status_publish_due, throughput_floor, transport_error_code,
+        transport_probe_interval_s, transport_result_matches_route, uplink_error_code,
+        validated_conservative_samples, wait_for_runtime_topology, AdaptiveCapacityStatusContext,
+        AdaptiveCeilingDirection, Config, Controller, MemoryInfo, RateMonitor, ReflectorHealth,
+        ReflectorState, Sample, SqmRecoveryError, ThroughputGuardInput, UplinkState,
+        CAKE_GROWTH_UPDATE_MIN_INTERVAL, STATUS_PUBLISH_INTERVAL, TERMINATE,
         TRANSPORT_BASELINE_LEARNING_INTERVAL_S,
     };
+    use std::env;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    static HELPER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn adaptive_capacity_status_exposes_passive_transport_and_causal_state() {
+        let download = AdaptiveCeilingDirection::new(175_000.0, 350_000.0);
+        let upload = AdaptiveCeilingDirection::new(15_773.0, 80_000.0);
+        let json = adaptive_capacity_status_json(AdaptiveCapacityStatusContext {
+            enabled: true,
+            route_epoch: Some("main|wwan0|10.0.0.2|\"epoch\""),
+            download: &download,
+            upload: &upload,
+            current_download_kbps: 154_092.0,
+            current_upload_kbps: 11_175.0,
+            runtime_minimum_download_kbps: 57_258.0,
+            runtime_minimum_upload_kbps: 7_887.0,
+            transport_confidence_download: 100,
+            transport_confidence_upload: 50,
+            no_cake_effect_download: Some(false),
+            no_cake_effect_upload: Some(true),
+            causal_state_download: "controlled",
+            causal_state_upload: "no_cake_effect",
+        });
+
+        assert!(json.contains("\"schema_version\":1"));
+        assert!(json.contains("\"behavior_version\":\"passive_transport_v1\""));
+        assert!(json.contains("\"route_epoch\":\"main|wwan0|10.0.0.2|\\\"epoch\\\"\""));
+        assert!(json.contains("\"current_rate_kbps\":154092"));
+        assert!(json.contains("\"safe_ceiling_kbps\":175000"));
+        assert!(json.contains("\"runtime_minimum_kbps\":57258"));
+        assert!(json.contains("\"raw_capacity_kbps\":null"));
+        assert!(json.contains("\"exploration_minimum_kbps\":null"));
+        assert!(json.contains("\"no_cake_effect\":false"));
+        assert!(json.contains("\"no_cake_effect\":true"));
+        assert!(json.contains("\"causal_state\":\"controlled\""));
+        assert!(json.contains("\"causal_state\":\"no_cake_effect\""));
+        assert!(json.contains("\"state\":\"passive_transport\""));
+        assert!(json.contains("\"percent\":100"));
+        assert!(json.contains("\"transport_percent\":100"));
+        assert!(json.contains("\"transport_percent\":50"));
+    }
 
     #[test]
     fn parses_single_quoted_value() {
@@ -7774,8 +8437,15 @@ mod tests {
                 "DL",
                 20,
                 7,
+                "probe_observe",
+                "cruise",
+                "probe target reached",
+                "initialized",
+                "monitoring",
+                "no_cake_effect",
+                "HEALTHY",
             ),
-            "123,1.235,2.3,1000.0,50.5,10.123,11.988,600.0,30.0,ACTIVE,mwan3|wan|pppoe-wan|198.51.100.1|0x100|1,A+,final,1.250,DL,20,7\n"
+            "123,1.235,2.3,1000.0,50.5,10.123,11.988,600.0,30.0,ACTIVE,mwan3|wan|pppoe-wan|198.51.100.1|0x100|1,A+,final,1.250,DL,20,7,probe_observe,cruise,probe target reached,initialized,monitoring,no_cake_effect,HEALTHY\n"
         );
 
         let data = "1,1,1\n2,2,2\n3,3,3\n";
@@ -8027,10 +8697,312 @@ mod tests {
         assert!(!qdisc_output_has_cake(
             "qdisc mq 0: root\nqdisc fq_codel 0: parent :1"
         ));
+        assert!(!qdisc_output_has_cake(
+            "qdisc mq 0: root\nqdisc cake 8001: parent :1 bandwidth 100Mbit"
+        ));
+        assert!(!qdisc_output_has_cake(
+            "qdisc cake 8001: root bandwidth 100Mbit\nqdisc cake 8002: root bandwidth 90Mbit"
+        ));
 
         let redirect = "action order 1: mirred (Egress Redirect to device ifb4eth0)";
         assert!(ingress_output_targets_ifb(redirect, "ifb4eth0"));
         assert!(!ingress_output_targets_ifb(redirect, "ifb4eth1"));
+        assert!(!ingress_output_targets_ifb(redirect, "ifb4eth"));
+        assert!(!ingress_output_targets_ifb(redirect, "ifb4eth00"));
+    }
+
+    #[test]
+    fn bootstrap_recovery_backoff_is_bounded() {
+        let seconds: Vec<u64> = (1..=7)
+            .map(|attempt| bootstrap_recovery_backoff(attempt).as_secs())
+            .collect();
+        assert_eq!(seconds, vec![5, 10, 20, 40, 60, 60, 60]);
+    }
+
+    #[test]
+    fn terminating_sqm_helper_stops_its_process_group() {
+        let _guard = HELPER_TEST_LOCK.lock().unwrap();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "cake-autorate-helper-termination-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let helper = root.join("helper");
+        let child_pid_path = root.join("child.pid");
+        fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\nsleep 30 &\nprintf '%s\\n' \"$!\" > '{}'\nwait\n",
+                child_pid_path.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let previous_helper = env::var_os("CAKE_AUTORATE_SQM_RECOVER");
+        env::set_var("CAKE_AUTORATE_SQM_RECOVER", &helper);
+        TERMINATE.store(false, Ordering::SeqCst);
+        let signal_path = child_pid_path.clone();
+        let signal_thread = thread::spawn(move || {
+            for _ in 0..100 {
+                if signal_path.exists() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            TERMINATE.store(true, Ordering::SeqCst);
+        });
+
+        let cfg = Config::defaults("termination_test".to_string());
+        let result = run_sqm_helper(&cfg, Some("check"));
+        signal_thread.join().unwrap();
+        assert!(matches!(result, Err(SqmRecoveryError::Terminated)));
+
+        let child_pid: u32 = fs::read_to_string(&child_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let proc_stat = PathBuf::from(format!("/proc/{child_pid}/stat"));
+        for _ in 0..20 {
+            let running = fs::read_to_string(&proc_stat)
+                .ok()
+                .and_then(|stat| stat.rsplit_once(')').map(|(_, rest)| rest.to_string()))
+                .and_then(|rest| rest.split_whitespace().next().map(str::to_string))
+                .map(|state| state != "Z")
+                .unwrap_or(false);
+            if !running {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let still_running = fs::read_to_string(&proc_stat)
+            .ok()
+            .and_then(|stat| stat.rsplit_once(')').map(|(_, rest)| rest.to_string()))
+            .and_then(|rest| rest.split_whitespace().next().map(str::to_string))
+            .map(|state| state != "Z")
+            .unwrap_or(false);
+        assert!(!still_running, "SQM helper left a running child process");
+
+        TERMINATE.store(false, Ordering::SeqCst);
+        if let Some(value) = previous_helper {
+            env::set_var("CAKE_AUTORATE_SQM_RECOVER", value);
+        } else {
+            env::remove_var("CAKE_AUTORATE_SQM_RECOVER");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delayed_topology_recovers_once_then_requires_attestation() {
+        let _guard = HELPER_TEST_LOCK.lock().unwrap();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "cake-autorate-delayed-topology-{}-{unique}",
+            std::process::id()
+        ));
+        let sys = root.join("sys");
+        let target = sys.join("eth0/statistics");
+        let ifb = sys.join("ifb4eth0/statistics");
+        let healthy = root.join("healthy");
+        let helper_log = root.join("helper.log");
+        let tc = root.join("tc");
+        let helper = root.join("sqm-recover");
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(&ifb).unwrap();
+        fs::write(target.join("tx_bytes"), "0\n").unwrap();
+        fs::write(ifb.join("tx_bytes"), "0\n").unwrap();
+        fs::write(
+            &tc,
+            format!(
+                "#!/bin/sh\n[ -e '{}' ] || exit 0\ncase \"$*\" in\n\
+                 'qdisc show dev eth0') printf '%s\\n' 'qdisc cake 8001: root bandwidth 100Mbit' ;;\n\
+                 'qdisc show dev ifb4eth0') printf '%s\\n' 'qdisc cake 8002: root bandwidth 500Mbit' ;;\n\
+                 'filter show dev eth0 ingress') printf '%s\\n' 'action order 1: mirred (Egress Redirect to device ifb4eth0)' ;;\n\
+                 esac\n",
+                healthy.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n: > '{}'\n",
+                helper_log.display(),
+                healthy.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tc, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let variable_names = [
+            "CAKE_AUTORATE_RUN_ROOT",
+            "CAKE_AUTORATE_SYS_CLASS_NET",
+            "CAKE_AUTORATE_TC",
+            "CAKE_AUTORATE_SQM_RECOVER",
+            "CAKE_AUTORATE_SQM_BOOTSTRAP_GRACE_S",
+        ];
+        let previous_values: Vec<_> = variable_names
+            .iter()
+            .map(|name| env::var_os(name))
+            .collect();
+        env::set_var("CAKE_AUTORATE_RUN_ROOT", root.join("run"));
+        env::set_var("CAKE_AUTORATE_SYS_CLASS_NET", &sys);
+        env::set_var("CAKE_AUTORATE_TC", &tc);
+        env::set_var("CAKE_AUTORATE_SQM_RECOVER", &helper);
+        env::set_var("CAKE_AUTORATE_SQM_BOOTSTRAP_GRACE_S", "0");
+        TERMINATE.store(false, Ordering::SeqCst);
+
+        let mut cfg = Config::defaults("late_wan".to_string());
+        cfg.manage_sqm = true;
+        cfg.sqm_enabled = true;
+        cfg.sqm_interface = "eth0".to_string();
+        cfg.ul_if = "eth0".to_string();
+        cfg.dl_if = "ifb4eth0".to_string();
+        cfg.tx_bytes_path = target.join("tx_bytes").to_string_lossy().into_owned();
+        cfg.rx_bytes_path = ifb.join("tx_bytes").to_string_lossy().into_owned();
+        cfg.if_up_check_interval_s = 1.0;
+
+        wait_for_runtime_topology(&cfg).unwrap();
+        assert_eq!(fs::read_to_string(&helper_log).unwrap(), "late_wan\n");
+        fs::write(&helper_log, "").unwrap();
+        wait_for_runtime_topology(&cfg).unwrap();
+        assert_eq!(fs::read_to_string(&helper_log).unwrap(), "late_wan check\n");
+
+        for (name, value) in variable_names.iter().zip(previous_values) {
+            if let Some(value) = value {
+                env::set_var(name, value);
+            } else {
+                env::remove_var(name);
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_link_loss_waits_for_hotplug_before_owned_recovery() {
+        let _guard = HELPER_TEST_LOCK.lock().unwrap();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "cake-autorate-runtime-link-loss-{}-{unique}",
+            std::process::id()
+        ));
+        let sys = root.join("sys");
+        let target = sys.join("eth0/statistics");
+        let ifb = sys.join("ifb4eth0/statistics");
+        let healthy = root.join("healthy");
+        let helper_log = root.join("helper.log");
+        let tc = root.join("tc");
+        let helper = root.join("sqm-recover");
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(&ifb).unwrap();
+        fs::write(target.join("tx_bytes"), "0\n").unwrap();
+        fs::write(ifb.join("tx_bytes"), "0\n").unwrap();
+        fs::write(
+            &tc,
+            format!(
+                "#!/bin/sh\n[ -e '{}' ] || exit 0\ncase \"$*\" in\n\
+                 'qdisc show dev eth0') printf '%s\\n' 'qdisc cake 8001: root bandwidth 100Mbit' ;;\n\
+                 'qdisc show dev ifb4eth0') printf '%s\\n' 'qdisc cake 8002: root bandwidth 500Mbit' ;;\n\
+                 'filter show dev eth0 ingress') printf '%s\\n' 'action order 1: mirred (Egress Redirect to device ifb4eth0)' ;;\n\
+                 esac\n",
+                healthy.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n: > '{}'\n",
+                helper_log.display(),
+                healthy.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tc, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let variable_names = [
+            "CAKE_AUTORATE_RUN_ROOT",
+            "CAKE_AUTORATE_SYS_CLASS_NET",
+            "CAKE_AUTORATE_TC",
+            "CAKE_AUTORATE_SQM_RECOVER",
+            "CAKE_AUTORATE_SQM_BOOTSTRAP_GRACE_S",
+        ];
+        let previous_values: Vec<_> = variable_names
+            .iter()
+            .map(|name| env::var_os(name))
+            .collect();
+        env::set_var("CAKE_AUTORATE_RUN_ROOT", root.join("run"));
+        env::set_var("CAKE_AUTORATE_SYS_CLASS_NET", &sys);
+        env::set_var("CAKE_AUTORATE_TC", &tc);
+        env::set_var("CAKE_AUTORATE_SQM_RECOVER", &helper);
+        env::set_var("CAKE_AUTORATE_SQM_BOOTSTRAP_GRACE_S", "60");
+
+        let mut cfg = Config::defaults("runtime_link_loss".to_string());
+        cfg.manage_sqm = true;
+        cfg.sqm_enabled = true;
+        cfg.sqm_interface = "eth0".to_string();
+        cfg.ul_if = "eth0".to_string();
+        cfg.dl_if = "ifb4eth0".to_string();
+        cfg.tx_bytes_path = target.join("tx_bytes").to_string_lossy().into_owned();
+        cfg.rx_bytes_path = ifb.join("tx_bytes").to_string_lossy().into_owned();
+        cfg.if_up_check_interval_s = 1.0;
+        cfg.log_to_file = false;
+        cfg.adjust_dl_shaper_rate = false;
+        cfg.adjust_ul_shaper_rate = false;
+        let mut controller = Controller::new(cfg).unwrap();
+
+        fs::remove_dir_all(sys.join("eth0")).unwrap();
+        let (ready, recovered) = controller.ensure_managed_sqm();
+        assert!(!ready && !recovered);
+        assert_eq!(controller.sqm_runtime_state, "WAITING_LINK");
+        assert_eq!(controller.sqm_recovery_attempts, 0);
+        assert!(!helper_log.exists());
+
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("tx_bytes"), "0\n").unwrap();
+        let (ready, recovered) = controller.ensure_managed_sqm();
+        assert!(!ready && !recovered);
+        assert_eq!(controller.sqm_runtime_state, "WAITING_SQM");
+        assert_eq!(controller.sqm_recovery_attempts, 0);
+        assert!(!helper_log.exists());
+
+        fs::write(&healthy, "").unwrap();
+        let (ready, recovered) = controller.ensure_managed_sqm();
+        assert!(ready && recovered);
+        assert_eq!(controller.sqm_runtime_state, "HEALTHY");
+        assert!(!helper_log.exists());
+
+        fs::remove_file(&healthy).unwrap();
+        env::set_var("CAKE_AUTORATE_SQM_BOOTSTRAP_GRACE_S", "0");
+        let (ready, recovered) = controller.ensure_managed_sqm();
+        assert!(ready && recovered);
+        assert_eq!(controller.sqm_recovery_attempts, 1);
+        assert_eq!(
+            fs::read_to_string(&helper_log).unwrap(),
+            "runtime_link_loss\n"
+        );
+
+        for (name, value) in variable_names.iter().zip(previous_values) {
+            if let Some(value) = value {
+                env::set_var(name, value);
+            } else {
+                env::remove_var(name);
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -10,6 +10,13 @@
 
 function modal(option) {
 	option.modalonly = true;
+	/* LuCI removes values of dependency-hidden options during parse unless
+	 * `retain` is set.  On this large modal that used to turn an innocent Edit
+	 * into dozens of unrelated deletions (disabled transport/MQTT/scheduler,
+	 * inactive speed-test backends, collapsed SQM expert settings, and so on).
+	 * Preserve dormant values; explicit parent writes still clear genuinely
+	 * incompatible state such as mwan3_member when route_mode becomes main. */
+	option.retain = true;
 	return option;
 }
 
@@ -106,13 +113,15 @@ var optionDescriptions = {
 	throughput_reference_dl_p50_kbps: 'Optional download median capacity from Full Auto-Tune.',
 	throughput_reference_ul_p20_kbps: 'Optional upload 20th-percentile capacity from Full Auto-Tune.',
 	throughput_reference_ul_p50_kbps: 'Optional upload median capacity from Full Auto-Tune.',
-	autotune_profile: 'Profile used by the next manual or scheduled Full Auto-Tune run. Gaming targets A+ and enables diffserv4, Best overall targets A, and Fair prioritizes throughput with a conditional class-C target and an explicit evidence-backed no-SQM fallback.',
+	autotune_profile: 'Profile used by the next manual or scheduled Full Auto-Tune run. Gaming targets A+ and keeps a 70% search floor; its wizard-only Extreme A+ opt-in can explore wide links deeper but is never persisted for scheduled runs. Best overall targets A, Variable link measures a CAKE-controlled latency knee for changing links, and Fair prioritizes throughput with a conditional class-C target and an explicit evidence-backed no-SQM fallback.',
+	autotune_calibration_strategy: 'Shaped only keeps CAKE active and searches inside demonstrated bounds. Full raw capacity temporarily bypasses only the measured direction under the recovery watchdog. Reuse current trusted bounds avoids claiming a new physical line rate.',
 	scheduled_autotune_enabled: 'Periodically run the validated Full Auto-Tune workflow only inside the configured quiet window. Disabled by default.',
 	scheduled_autotune_interval_hours: 'Minimum hours between successful scheduled calibrations.',
 	scheduled_autotune_idle_window_s: 'Traffic must remain below the active threshold for this long before a scheduled test may start.',
 	scheduled_autotune_window_start_hour: 'Local hour when the permitted maintenance window begins (0-23).',
 	scheduled_autotune_window_end_hour: 'Local hour when the permitted maintenance window ends (0-23). Equal start and end permits the whole day.',
-	scheduled_autotune_max_traffic_mb_day: 'Maximum interface traffic attributed to scheduled calibration per local day. Accounting lives only in RAM.',
+	scheduled_autotune_max_traffic_mb_day: 'Hard daily interface-traffic allowance for scheduled calibration. The worker stops its current speed-test process when the remaining allowance is reached; accounting resets after reboot. A zero or invalid value blocks unattended tests rather than enabling unlimited traffic.',
+	scheduled_autotune_max_traffic_mb_month: 'Hard monthly allowance for scheduled calibration. Usage is reserved before a run and settled atomically outside RAM so interrupted tests cannot be silently undercounted. Allow roughly one polling interval of possible overshoot on a very fast link; zero blocks unattended tests.',
 	scheduled_autotune_auto_apply: 'Automatically commit and restart with a proposal only after shaped validation passes. Leave off to keep a review-only proposal.',
 	dl_if: 'Interface whose RX byte counter represents shaped download traffic, usually the IFB created by SQM.',
 	ul_if: 'Interface whose TX byte counter represents upload traffic, usually the WAN device.',
@@ -776,8 +785,10 @@ function adaptiveConfiguredMax(section, section_id, direction) {
 
 function validateAdaptiveCeiling(section, section_id) {
 	var dlMax, ulMax, dlCap, ulCap;
+	var learningMode = formOrUci(section, section_id, 'runtime_learning_mode');
 
-	if (!checkedFormOrUci(section, section_id, 'adaptive_ceiling_enabled', false))
+	if (learningMode === 'fixed' ||
+		(!learningMode && !checkedFormOrUci(section, section_id, 'adaptive_ceiling_enabled', false)))
 		return true;
 
 	dlMax = adaptiveConfiguredMax(section, section_id, 'dl');
@@ -1364,20 +1375,25 @@ function parseExecJson(res) {
 	return JSON.parse((res.stdout || '').trim());
 }
 
-function withSpeedtestRpcTimeout(callback) {
-	var previous = L.env.rpctimeout;
+function withRpcTimeout(minimum, callback) {
+	var rpcEnv = L.env || (L.env = {});
+	var previous = rpcEnv.rpctimeout;
 	var timeout = parseInt(previous, 10);
 
-	if (isNaN(timeout) || timeout < 180)
-		L.env.rpctimeout = 180;
+	if (isNaN(timeout) || timeout < minimum)
+		rpcEnv.rpctimeout = minimum;
 
 	return Promise.resolve().then(callback).then(function(result) {
-		L.env.rpctimeout = previous;
+		rpcEnv.rpctimeout = previous;
 		return result;
 	}, function(err) {
-		L.env.rpctimeout = previous;
+		rpcEnv.rpctimeout = previous;
 		throw err;
 	});
+}
+
+function withSpeedtestRpcTimeout(callback) {
+	return withRpcTimeout(180, callback);
 }
 
 function speedtestJobDelay() {
@@ -1395,10 +1411,18 @@ function canonicalAutotuneProfile(value) {
 	switch (value) {
 	case 'gaming':
 		return 'gaming';
+	case 'gaming-extreme':
+	case 'extreme_gaming':
+	case 'gaming_extreme':
+		return 'gaming_extreme';
 	case 'balanced':
 	case 'best-overall':
 	case 'best_overall':
 		return 'best_overall';
+	case 'variable':
+	case 'variable-link':
+	case 'variable_link':
+		return 'variable_link';
 	case 'fair':
 		return 'fair';
 	default:
@@ -1411,6 +1435,7 @@ function autotuneProfilePolicy(value) {
 
 	switch (profile) {
 	case 'gaming':
+	case 'gaming_extreme':
 		return {
 			id: profile,
 			targetGrade: 'A+',
@@ -1440,6 +1465,28 @@ function autotuneProfilePolicy(value) {
 			throughputPriority: false,
 			retentionPercent: 80,
 			delayMaxMs: 30,
+			lossMaxPercent: 3,
+			cpuMaxPercent: 85,
+			sqm: {
+				qdisc: 'cake',
+				script: 'layer_cake.qos',
+				classification: 'diffserv4',
+				squashDscp: true,
+				squashIngress: true,
+				ingressEcn: 'ECN',
+				egressEcn: 'NOECN',
+				iqdiscOpts: 'besteffort',
+				eqdiscOpts: 'diffserv4'
+			}
+		};
+	case 'variable_link':
+		return {
+			id: profile,
+			targetGrade: 'B',
+			qualityTargetRequired: true,
+			throughputPriority: false,
+			retentionPercent: 70,
+			delayMaxMs: 60,
 			lossMaxPercent: 3,
 			cpuMaxPercent: 85,
 			sqm: {
@@ -1490,10 +1537,23 @@ function autotuneProfileDefinitions() {
 			description: _('Finds the highest throughput that still proves A+. Retaining 70% is the Auto-Apply objective; falling below the separate 50% historical-throughput trust boundary forces explicit manual review. If A+ is unattainable, Review offers the best measured grade at its fastest safe rate. Uses diffserv4, supports optional native outbound rules, and preserves ingress DSCP.')
 		},
 		{
+			id: 'gaming_extreme',
+			hidden: true,
+			title: _('Gaming · Extreme A+'),
+			target: _('Opt-in deep A+ search · manual-only below 70% retention'),
+			description: _('Explores only wide links below the ordinary Gaming boundary, down to a capacity-aware 25% floor. Every proposed minimum is a tested CAKE rate. This mode is not recommended for continuous household use.')
+		},
+		{
 			id: 'best_overall',
 			title: _('Best overall'),
 			target: _('Target A or better · under 30 ms'),
 			description: _('Finds the highest throughput that still proves A. Retaining 80% is the Auto-Apply objective; falling below the separate 50% historical-throughput trust boundary forces explicit manual review. If A is unattainable, Review offers the best balanced safe candidate. Optional outbound rules use diffserv4 while download stays best effort.')
+		},
+		{
+			id: 'variable_link',
+			title: _('Variable link'),
+			target: _('Measured knee · target B or better · under 60 ms'),
+			description: _('For 4G/5G, satellite, wireless, and other changing links. Explores down to 35% of the conservative raw reference, but writes a runtime minimum only when two consecutive reductions prove a latency plateau. Retaining 70% is the Auto-Apply objective; noisy or uncontrolled results fail closed.')
 		},
 		{
 			id: 'fair',
@@ -1502,6 +1562,156 @@ function autotuneProfileDefinitions() {
 			description: _('Maximizes safe throughput; retaining 90% is the Auto-Apply objective and falling below the separate 50% historical-throughput trust boundary forces explicit manual review. Rating is the secondary tie-breaker and C is a soft target. Optional outbound rules use diffserv4, download stays best effort, and Review may offer an evidence-backed option to disable SQM.')
 		}
 	];
+}
+
+function visibleAutotuneProfile(value) {
+	return canonicalAutotuneProfile(value) === 'gaming_extreme' ?
+		'gaming' : canonicalAutotuneProfile(value);
+}
+
+function autotuneRunProfile(state) {
+	var profile = visibleAutotuneProfile(state && state.autotune_profile) || 'best_overall';
+	return profile === 'gaming' && state && state.autotune_extreme_a_plus === true ?
+		'gaming_extreme' : profile;
+}
+
+function autotuneCalibrationStrategy(state) {
+	var strategy = state && state.autotune_calibration_strategy;
+	return [ 'shaped_only', 'full_raw', 'reuse_trusted' ].indexOf(strategy) >= 0 ?
+		strategy : 'shaped_only';
+}
+
+function autotuneResultCalibrationStrategy(result) {
+	var phases = result && result.phase_background;
+	if (Array.isArray(phases)) {
+		for (var i = 0; i < phases.length; i++) {
+			var phase = phases[i] && phases[i].phase;
+			if ([ 'shaped_only', 'full_raw', 'reuse_trusted' ].indexOf(phase) >= 0)
+				return phase;
+		}
+	}
+	return 'full_raw';
+}
+
+function autotuneCalibrationStrategyControl(state, disabled, onChange) {
+	var descriptions = {
+		shaped_only: _('Keeps managed CAKE active while measuring. Safest default; it searches only inside capacity the current bounds can demonstrate.'),
+		full_raw: _('Temporarily bypasses only the direction being measured, under the recovery watchdog. This can consume more traffic and briefly removes shaping for that direction.'),
+		reuse_trusted: _('Revalidates the currently trusted/configured bounds without opening a raw-capacity path. It does not claim a new physical line rate.')
+	};
+	var selected = autotuneCalibrationStrategy(state);
+	var help = E('div', { 'style': 'margin-top:6px;color:var(--text-color-medium,#777)' }, descriptions[selected]);
+	var select = E('select', {
+		'class': 'cbi-input-select',
+		'disabled': disabled ? 'disabled' : null,
+		'change': function(ev) {
+			state.autotune_calibration_strategy = ev.currentTarget.value;
+			help.textContent = descriptions[state.autotune_calibration_strategy];
+			if (onChange)
+				onChange();
+		}
+	}, [
+		E('option', { 'value': 'shaped_only', 'selected': selected === 'shaped_only' ? 'selected' : null }, _('Shaped only (recommended)')),
+		E('option', { 'value': 'full_raw', 'selected': selected === 'full_raw' ? 'selected' : null }, _('Full raw capacity')),
+		E('option', { 'value': 'reuse_trusted', 'selected': selected === 'reuse_trusted' ? 'selected' : null }, _('Reuse current trusted bounds'))
+	]);
+	return E('div', {}, [ select, help ]);
+}
+
+function storedAutotuneProfile(value) {
+	return canonicalAutotuneProfile(value) === 'gaming_extreme' ?
+		'gaming' : canonicalAutotuneProfile(value);
+}
+
+function autotuneExtremeGamingControl(state, disabled, onChange) {
+	if (visibleAutotuneProfile(state && state.autotune_profile) !== 'gaming')
+		return E('div', { 'style': 'display:none' });
+	return E('div', {
+		'class': 'alert-message warning',
+		'style': 'margin:8px 0 0'
+	}, [
+		E('label', { 'style': 'display:flex;align-items:flex-start;gap:8px;font-weight:600' }, [
+			E('input', {
+				'type': 'checkbox',
+				'checked': state.autotune_extreme_a_plus === true ? 'checked' : null,
+				'disabled': disabled ? 'disabled' : null,
+				'change': function(ev) {
+					state.autotune_extreme_a_plus = !!ev.currentTarget.checked;
+					if (onChange)
+						onChange();
+				}
+			}),
+			E('span', {}, _('Enable Extreme A+ search for this run'))
+		]),
+		E('div', { 'style': 'margin:5px 0 0 25px' },
+			_('Wide links may be tested down to a capacity-aware 25% floor only when searching for A+. Results below 70% retention are manual-only and are not recommended for continuous household use. Narrow links keep a higher floor.'))
+	]);
+}
+
+function autotuneProfileGrid(buttons) {
+	return E('div', { 'class': 'cake-autotune-profile-grid' }, [
+		E('style', {},
+			'.cake-autotune-profile-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;align-items:stretch;width:100%;min-width:0}' +
+			'.cake-autotune-profile-card{display:flex!important;flex-direction:column;align-items:flex-start;gap:4px;width:100%;height:100%;min-width:0;min-height:100%;box-sizing:border-box;padding:10px;text-align:left;white-space:normal;word-break:normal;overflow-wrap:break-word;hyphens:none;line-height:1.4}' +
+			'@media(max-width:800px){.cake-autotune-profile-grid{grid-template-columns:minmax(0,1fr)}}')
+	].concat(buttons));
+}
+
+function autotuneAchievedGrade(result) {
+	var validation = result && result.validation;
+	var outcome = result && result.profile_outcome;
+	var grade = validation && validation.actual_grade != null ?
+		validation.actual_grade : (outcome && outcome.actual_grade);
+
+	grade = String(grade == null ? '' : grade).trim().toUpperCase();
+	return [ 'A+', 'A', 'B', 'C', 'D', 'F' ].indexOf(grade) >= 0 ? grade : null;
+}
+
+function autotuneGradeTone(grade) {
+	if (grade === 'A+' || grade === 'A')
+		return 'good';
+	if (grade === 'B' || grade === 'C')
+		return 'warning';
+	if (grade === 'D' || grade === 'F')
+		return 'bad';
+	return null;
+}
+
+function autotuneGradeBadge(grade) {
+	var tone = autotuneGradeTone(grade);
+	var palette = {
+		good: { color: '#00a97f', background: 'rgba(0,169,127,.12)', border: 'rgba(0,169,127,.55)' },
+		warning: { color: '#d89a16', background: 'rgba(216,154,22,.12)', border: 'rgba(216,154,22,.55)' },
+		bad: { color: '#d9534f', background: 'rgba(217,83,79,.12)', border: 'rgba(217,83,79,.55)' }
+	};
+
+	if (!tone)
+		return null;
+	return E('span', {
+		'class': 'cake-autotune-grade cake-autotune-grade-' + tone,
+		'style': 'display:inline-flex;align-items:center;justify-content:center;min-width:2.2em;' +
+			'padding:2px 8px;border-radius:999px;font-weight:700;color:%s;background:%s;border:1px solid %s'.format(
+				palette[tone].color, palette[tone].background, palette[tone].border)
+	}, grade);
+}
+
+function renderAutotuneAchievedClass(result) {
+	var grade = autotuneAchievedGrade(result);
+	var target = result && result.proposal && result.proposal.target_grade ||
+		result && result.profile_outcome && result.profile_outcome.target_grade;
+
+	if (!grade || !result || !result.proposal)
+		return null;
+	return E('div', {
+		'class': 'cake-autotune-achieved-class',
+		'style': 'display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:10px 0;' +
+			'padding:8px 10px;border:1px solid rgba(127,127,127,.35);border-radius:4px'
+	}, [
+		E('strong', {}, _('Achieved class:')),
+		autotuneGradeBadge(grade),
+		target && target !== grade ?
+			E('span', { 'style': 'opacity:.8' }, _('Selected target: %s').format(target)) : null
+	]);
 }
 
 function autotuneProposalMatchesProfile(result) {
@@ -1555,6 +1765,34 @@ function autotuneJobDelay(delayMs) {
 	return new Promise(function(resolve) {
 		window.setTimeout(resolve, delayMs);
 	});
+}
+
+function autotuneTransientRpcError(error) {
+	var message = String(error && (error.message || error) || '');
+	return /XHR request timed out|request timed out|network error|failed to fetch|connection (?:closed|reset)/i.test(message);
+}
+
+function autotuneExecWithRetry(command, args, attempts, delayMs) {
+	return fs.exec(command, args).catch(function(error) {
+		if (!autotuneTransientRpcError(error) || attempts <= 0)
+			throw error;
+		return autotuneJobDelay(delayMs).then(function() {
+			return autotuneExecWithRetry(command, args, attempts - 1,
+				Math.min(delayMs * 2, 5000));
+		});
+	});
+}
+
+function autotuneRunningRequestMatches(result, section_id, wan, backend, routeMode,
+		mwan3Member, profile, conservative) {
+	return !!(result && result.state === 'running' &&
+		result.job_id === section_id &&
+		normalizeInterfaceName(result.requested_target_interface) === normalizeInterfaceName(wan) &&
+		(result.requested_backend || 'auto') === (backend || 'auto') &&
+		(result.requested_route_mode || '') === (routeMode || '') &&
+		(result.requested_mwan3_member || '') === (mwan3Member || '') &&
+		canonicalAutotuneProfile(result.requested_profile) === canonicalAutotuneProfile(profile) &&
+		!!result.requested_conservative === !!conservative);
 }
 
 function autotuneRuntimeSettled(result) {
@@ -1642,14 +1880,31 @@ function runSpeedtestJob(section_id, wan, backend, onProgress, routeMode, mwan3M
 }
 
 function runAutotuneJob(section_id, wan, backend, onProgress, routeMode, mwan3Member,
-		profile, conservative) {
+		profile, conservative, calibrationStrategy) {
 	var command = '/usr/libexec/cake-autorate-rs/autotune';
 	var action = conservative ? 'start-conservative' : 'start';
 	profile = canonicalAutotuneProfile(profile) || 'best_overall';
+	calibrationStrategy = [ 'shaped_only', 'full_raw', 'reuse_trusted' ].indexOf(calibrationStrategy) >= 0 ?
+		calibrationStrategy : 'shaped_only';
+	var requestArgs = [ section_id, wan, action, backend, routeMode || '',
+		mwan3Member || '', profile, conservative ? '1' : '0', '', '0', calibrationStrategy ];
+	var summaryArgs = [ section_id, wan, 'status-summary', backend,
+		routeMode || '', mwan3Member || '', profile, conservative ? '1' : '0', '', '0', calibrationStrategy ];
+	var resultArgs = [ section_id, wan, 'result', backend,
+		routeMode || '', mwan3Member || '', profile, conservative ? '1' : '0', '', '0', calibrationStrategy ];
 
-	return fs.exec(command, [ section_id, wan, action, backend, routeMode || '',
-		mwan3Member || '', profile, conservative ? '1' : '0' ]).then(function(res) {
-		var started = parseExecJson(res);
+	return fs.exec(command, requestArgs).then(parseExecJson).catch(function(error) {
+		/* A timed-out start is ambiguous: rpcd may have accepted the procd job.
+		 * Reattach only when the live immutable request exactly matches this modal. */
+		if (!autotuneTransientRpcError(error))
+			throw error;
+		return autotuneExecWithRetry(command, summaryArgs, 3, 1000).then(parseExecJson).then(function(summary) {
+			if (!autotuneRunningRequestMatches(summary, section_id, wan, backend,
+					routeMode, mwan3Member, profile, conservative))
+				throw error;
+			return summary;
+		});
+	}).then(function(started) {
 
 		if (started.error && !autotuneRecoveryPending(started))
 			throw new Error(started.error);
@@ -1658,8 +1913,21 @@ function runAutotuneJob(section_id, wan, backend, onProgress, routeMode, mwan3Me
 		var pollDelayMs = 1000;
 		var poll = function() {
 			return autotuneJobDelay(pollDelayMs).then(function() {
-				return fs.exec(command, [ section_id, wan, 'status', backend,
-					routeMode || '', mwan3Member || '', profile, conservative ? '1' : '0' ]);
+				return autotuneExecWithRetry(command, summaryArgs, 3, 1000);
+			}).then(function(status) {
+				var summary = parseExecJson(status);
+
+				if (summary.terminal_available === true)
+					return withRpcTimeout(180, function() {
+						return autotuneExecWithRetry(command, resultArgs, 2, 1000);
+					});
+				if (summary.error && summary.state !== 'running' &&
+				    summary.state !== 'cancelling' && !autotuneRecoveryPending(summary)) {
+					var summaryError = new Error(summary.error);
+					summaryError.autotuneResult = summary;
+					throw summaryError;
+				}
+				return status;
 			}).then(function(status) {
 				var result = parseExecJson(status);
 				var active = result.state === 'running' || result.state === 'cancelling';
@@ -1760,7 +2028,7 @@ function cancelAutotuneJob(section_id, wan, backend, profile, routeMode, mwan3Me
 				return fs.exec('/usr/libexec/cake-autorate-rs/autotune', [
 					section_id,
 					wan,
-					'status',
+					'status-summary',
 					backend || 'auto',
 					routeMode || '',
 					mwan3Member || '',
@@ -2233,14 +2501,25 @@ function writeWizardConfig(section_id, state, allowUncalibrated) {
 	var sqmSection = state.sqm_section || managedSqmSectionName(section_id);
 	var pingExtraArgs = state.ping_extra_args || pingerInterfaceArgs(wan, state.pinger_method || 'fping');
 	var selectedAutotuneProfile = state.autotune_proposal ?
-		canonicalAutotuneProfile(state.autotune_proposal.profile) :
-		canonicalAutotuneProfile(state.autotune_profile);
+		storedAutotuneProfile(state.autotune_proposal.profile) :
+		storedAutotuneProfile(state.autotune_profile);
+	/* `auto` is a UI compatibility choice, not a route identity.  Auto-Tune
+	 * attests one concrete route (`main` or `mwan3`) and the apply guard builds
+	 * its exact manifest from that result.  Persisting the pre-run `auto` value
+	 * here makes an otherwise valid legacy-instance re-run fail closed during
+	 * Save & Apply because the staged package no longer matches the attested
+	 * manifest.  Once a result exists, its route is authoritative. */
+	var effectiveRouteMode = state.autotune_result && state.autotune_result.route_mode ||
+		(state.route_mode === 'auto' ? (state.mwan3_member ? 'mwan3' : 'main') :
+			(state.route_mode || 'main'));
+	var effectiveMwan3Member = effectiveRouteMode === 'mwan3' ?
+		(state.autotune_result && state.autotune_result.mwan3_member || state.mwan3_member || '') : '';
 
 	uci.set('cake-autorate', section_id, 'enabled', state.enabled ? '1' : '0');
 	uci.set('cake-autorate', section_id, 'wan_if', wan);
-	uci.set('cake-autorate', section_id, 'route_mode', state.route_mode || 'main');
-	if (state.mwan3_member)
-		uci.set('cake-autorate', section_id, 'mwan3_member', state.mwan3_member);
+	uci.set('cake-autorate', section_id, 'route_mode', effectiveRouteMode);
+	if (effectiveMwan3Member)
+		uci.set('cake-autorate', section_id, 'mwan3_member', effectiveMwan3Member);
 	else
 		uci.unset('cake-autorate', section_id, 'mwan3_member');
 	uci.unset('cake-autorate', section_id, 'ping_prefix_string');
@@ -2252,6 +2531,8 @@ function writeWizardConfig(section_id, state, allowUncalibrated) {
 	uci.set('cake-autorate', section_id, 'sqm_enabled', state.enabled ? '1' : '0');
 	uci.set('cake-autorate', section_id, 'autotune_profile',
 		selectedAutotuneProfile || 'best_overall');
+	uci.set('cake-autorate', section_id, 'autotune_calibration_strategy',
+		autotuneCalibrationStrategy(state));
 	if (state.is_new_instance) {
 		uci.set('cake-autorate', section_id, 'traffic_profile', 'auto');
 		uci.set('cake-autorate', section_id, 'traffic_profile_migrated', '1');
@@ -2322,7 +2603,7 @@ function writeWizardConfig(section_id, state, allowUncalibrated) {
 		uci.set('cake-autorate', section_id, 'throughput_reference_dl_p50_kbps', String(dlProposal.observed_median_kbps));
 		uci.set('cake-autorate', section_id, 'throughput_reference_ul_p20_kbps', String(ulProposal.observed_low_kbps));
 		uci.set('cake-autorate', section_id, 'throughput_reference_ul_p50_kbps', String(ulProposal.observed_median_kbps));
-		state.autotune_profile = canonicalAutotuneProfile(proposal.profile) || 'best_overall';
+		state.autotune_profile = storedAutotuneProfile(proposal.profile) || 'best_overall';
 		uci.set('cake-autorate', section_id, 'autotune_profile', state.autotune_profile);
 		state.sqm_qdisc = sqmPolicy.qdisc;
 		state.sqm_script = sqmPolicy.script;
@@ -2505,7 +2786,8 @@ function autotuneValidationAttempts(result) {
 	return attempts;
 }
 
-function autotuneValidationGatesComplete(validation, profile, requireQualityTarget) {
+function autotuneValidationGatesComplete(validation, profile, requireQualityTarget,
+		allowedFailedGates) {
 	var gates = validation && validation.gates;
 	var policy = autotuneProfilePolicy(profile);
 	var required = [
@@ -2536,12 +2818,14 @@ function autotuneValidationGatesComplete(validation, profile, requireQualityTarg
 			code === 'upload-capacity-retention' ||
 			code === 'download-throughput-safety-floor' ||
 			code === 'upload-throughput-safety-floor';
+		var allowedFailure = allowedFailedGates && allowedFailedGates[code] === true;
 		var gateRequired = (cpuAdvisory || profileAdvisory) ? false :
 			(latencyGate ? policy.qualityTargetRequired : true);
 
 		if (required.indexOf(code) < 0 || reported[code] ||
 		    gate.required !== gateRequired || typeof gate.pass !== 'boolean' ||
-		    (!latencyGate && !cpuAdvisory && !profileAdvisory && gate.pass !== true) ||
+		    (!latencyGate && !cpuAdvisory && !profileAdvisory &&
+		     gate.pass !== true && !allowedFailure) ||
 		    (requireQualityTarget && profileAdvisory && gate.pass !== true) ||
 		    (requireQualityTarget && latencyGate && gate.pass !== true) ||
 		    autotuneNumber(gate.actual) == null || autotuneNumber(gate.limit) == null)
@@ -2841,7 +3125,7 @@ function autotuneCapacityFloorInfeasibleOutcomeValidated(result) {
 			validation.candidate_base[direction + '_kbps']);
 		var outcomeRate = autotuneNumber(outcome.selected_pair[direction + '_kbps']);
 
-		if (!search || autotuneNumber(search.schema_version) !== 1 ||
+		if (!search || autotuneNumber(search.schema_version) !== 2 ||
 		    canonicalAutotuneProfile(search.profile) !== profile ||
 		    search.direction !== direction ||
 		    (search.action !== 'complete' && search.action !== 'fallback') ||
@@ -2893,7 +3177,24 @@ function autotuneProfileOutcomeValidated(result) {
 		return false;
 
 	targetMet = outcome.target_met;
-	if (outcome.manual_only !== (!targetMet || !validation.profile_objectives_met))
+	var extremeDeepMinimum = profile === 'gaming_extreme' &&
+		outcome.deep_runtime_minimum === true;
+	if (profile === 'gaming_extreme') {
+		var runtimeRetention = outcome.runtime_minimum_retention;
+		if (typeof outcome.deep_runtime_minimum !== 'boolean' || !runtimeRetention ||
+		    autotuneNumber(runtimeRetention.download_percent) == null ||
+		    autotuneNumber(runtimeRetention.upload_percent) == null ||
+		    extremeDeepMinimum !==
+			(autotuneNumber(runtimeRetention.download_percent) < 70 ||
+			 autotuneNumber(runtimeRetention.upload_percent) < 70))
+			return false;
+	}
+	else if (outcome.deep_runtime_minimum !== false ||
+	         outcome.runtime_minimum_retention !== null)
+		return false;
+
+	if (outcome.manual_only !== (!targetMet || !validation.profile_objectives_met ||
+	    extremeDeepMinimum))
 		return false;
 
 	for (var i = 0; i < directions.length; i++) {
@@ -2906,7 +3207,7 @@ function autotuneProfileOutcomeValidated(result) {
 			validation.candidate_base[direction + '_kbps']);
 		var outcomeRate = autotuneNumber(outcome.selected_pair[direction + '_kbps']);
 
-		if (!search || autotuneNumber(search.schema_version) !== 1 ||
+		if (!search || autotuneNumber(search.schema_version) !== 2 ||
 		    canonicalAutotuneProfile(search.profile) !== profile ||
 		    search.direction !== direction ||
 		    (search.action !== 'complete' && search.action !== 'fallback') ||
@@ -2914,23 +3215,83 @@ function autotuneProfileOutcomeValidated(result) {
 		    proposalRate !== selectedRate || validationRate !== selectedRate ||
 		    outcomeRate !== selectedRate)
 			return false;
+		if (profile === 'variable_link') {
+			var runtimeMinimum = autotuneNumber(search.runtime_minimum_kbps);
+			var runtimeMinimumIndex = autotuneNumber(search.runtime_minimum_observation_index);
+			var runtimeObservation = Number.isInteger(runtimeMinimumIndex) &&
+				Array.isArray(search.evaluated) && runtimeMinimumIndex >= 1 &&
+				runtimeMinimumIndex <= search.evaluated.length ?
+				search.evaluated[runtimeMinimumIndex - 1] : null;
+			var proposalMinimum = autotuneNumber(proposal[direction] &&
+				proposal[direction].minimum_kbps);
+			var explorationMinimum = autotuneNumber(search.exploration_minimum_kbps);
+			if (search.knee_detected !== true || search.no_cake_effect !== false ||
+			    search.noisy !== false || search.inconclusive !== false ||
+			    runtimeMinimum == null || explorationMinimum == null ||
+			    autotuneNumber(runtimeObservation && runtimeObservation.candidate_kbps) !== runtimeMinimum ||
+			    proposalMinimum !== runtimeMinimum || runtimeMinimum < explorationMinimum ||
+			    runtimeMinimum > selectedRate)
+				return false;
+		}
+		else if (profile === 'gaming_extreme') {
+			var extremeRuntimeMinimum = autotuneNumber(search.runtime_minimum_kbps);
+			var extremeRuntimeMinimumIndex = autotuneNumber(search.runtime_minimum_observation_index);
+			var extremeRuntimeObservation = Number.isInteger(extremeRuntimeMinimumIndex) &&
+				Array.isArray(search.evaluated) && extremeRuntimeMinimumIndex >= 1 &&
+				extremeRuntimeMinimumIndex <= search.evaluated.length ?
+				search.evaluated[extremeRuntimeMinimumIndex - 1] : null;
+			var extremeProposalMinimum = autotuneNumber(proposal[direction] &&
+				proposal[direction].minimum_kbps);
+			var extremeObservedLow = autotuneNumber(proposal[direction] &&
+				proposal[direction].observed_low_kbps);
+			var extremeReportedRetention = autotuneNumber(runtimeRetention &&
+				runtimeRetention[direction + '_percent']);
+			var extremeExplorationMinimum = autotuneNumber(search.exploration_minimum_kbps);
+			var extremeExpectedRetention = extremeRuntimeMinimum != null &&
+				extremeObservedLow > 0 ?
+				Math.round(extremeRuntimeMinimum * 1000 / extremeObservedLow) / 10 : null;
+			if (search.inconclusive !== false || extremeRuntimeMinimum == null ||
+			    extremeExplorationMinimum == null ||
+			    autotuneNumber(extremeRuntimeObservation &&
+				extremeRuntimeObservation.candidate_kbps) !== extremeRuntimeMinimum ||
+			    extremeProposalMinimum !== extremeRuntimeMinimum ||
+			    extremeReportedRetention !== extremeExpectedRetention ||
+			    extremeRuntimeMinimum < extremeExplorationMinimum ||
+			    extremeRuntimeMinimum > selectedRate)
+				return false;
+		}
 	}
 
-	if (targetMet && validation.profile_objectives_met)
+	if (targetMet && validation.profile_objectives_met && !extremeDeepMinimum)
 		return (profile === 'gaming' && outcome.mode === 'target-a-plus-met') ||
+			(profile === 'gaming_extreme' && outcome.mode === 'extreme-a-plus-met') ||
 			(profile === 'best_overall' && outcome.mode === 'target-a-met') ||
+			(profile === 'variable_link' && outcome.mode === 'target-b-measured-knee') ||
 			(profile === 'fair' && outcome.mode === 'throughput-optimum-c-or-better');
+
+	if (profile === 'gaming_extreme' && targetMet &&
+	    validation.profile_objectives_met && extremeDeepMinimum)
+		return outcome.mode === 'extreme-a-plus-throughput-sacrifice';
 
 	if (targetMet)
 		return (profile === 'gaming' && outcome.mode === 'target-a-plus-throughput-advisory') ||
+			(profile === 'gaming_extreme' && outcome.mode === 'extreme-a-plus-throughput-sacrifice') ||
 			(profile === 'best_overall' && outcome.mode === 'target-a-throughput-advisory') ||
+			(profile === 'variable_link' && outcome.mode === 'target-b-retention-advisory') ||
 			(profile === 'fair' && outcome.mode === 'latency-safe-throughput-advisory');
 
-	if (!validation.profile_objectives_met)
+	if (!validation.profile_objectives_met) {
+		if (profile === 'variable_link')
+			return outcome.mode === 'variable-link-review-required';
+		if (profile === 'gaming_extreme')
+			return outcome.mode === 'extreme-quality-and-throughput-review';
 		return outcome.mode === 'quality-and-throughput-advisory-review';
+	}
 
 	return (profile === 'gaming' && outcome.mode === 'best-attainable-quality-fallback') ||
+		(profile === 'gaming_extreme' && outcome.mode === 'extreme-best-attainable-quality-fallback') ||
 		(profile === 'best_overall' && outcome.mode === 'balanced-fallback') ||
+		(profile === 'variable_link' && outcome.mode === 'measured-knee-quality-fallback') ||
 		(profile === 'fair' && outcome.mode === 'throughput-optimum-quality-fallback');
 }
 
@@ -3069,6 +3430,9 @@ function autotuneDisableSqmEvidenceValidated(result) {
 }
 
 function autotuneResultReviewable(result, action) {
+	var fairManualGateExceptions;
+	var fairActions;
+
 	action = action || 'apply_sqm';
 	if (autotuneCapacityFloorInfeasibleResultValidated(result)) {
 		if (action === 'keep_current')
@@ -3093,9 +3457,27 @@ function autotuneResultReviewable(result, action) {
 		 * when confidence is insufficient for Auto-Apply. The hard envelope,
 		 * profile evidence and safety checks above still have to pass. */
 		if (autotuneBackgroundAwareResult(result)) {
+			fairActions = canonicalAutotuneProfile(result.profile) === 'fair' &&
+				autotuneFairOutcomeValidated(result) ?
+				autotuneFairAllowedActions(result.fair_outcome) : null;
+			/* Fair may explicitly offer a manually reviewed, latency-safe candidate
+			 * when volatile link throughput does not fully realize the requested CAKE
+			 * rate.  Keep the exact gate schema and every loss, latency, maximum-rate
+			 * and safety check; relax only the two minimum-realization gates after the
+			 * daemon and the independently validated Fair outcome both authorize it. */
+			if (result.manual_apply_eligible === true &&
+			    result.validation.safety_pass === true &&
+			    fairActions && fairActions.apply_sqm === true &&
+			    result.fair_outcome.throughput_safety_floor_met === true) {
+				fairManualGateExceptions = {
+					'download-candidate-realization': true,
+					'upload-candidate-realization': true
+				};
+			}
 			if (result.manual_apply_eligible !== true ||
 			    result.validation.safety_pass !== true ||
-			    !autotuneValidationGatesComplete(result.validation, result.profile, false))
+			    !autotuneValidationGatesComplete(result.validation, result.profile, false,
+				    fairManualGateExceptions))
 				return false;
 			if (canonicalAutotuneProfile(result.profile) !== 'fair')
 				return true;
@@ -3609,14 +3991,54 @@ function discardStagedUciPackages(packages) {
 	packages = packages || [];
 	return Promise.all(packages.map(function(config) {
 		return callUciRevertStatus(config).then(function(status) {
-			if (status !== 0)
-				throw new Error(_('UCI could not discard the rolled-back %s transaction.').format(config));
-			return config;
+			return { config: config, status: status };
+		}, function(error) {
+			return { config: config, error: error };
 		});
-	})).then(function(configs) {
+	})).then(function(results) {
+		var configs = results.filter(function(result) {
+			return !result.error && result.status === 0;
+		}).map(function(result) {
+			return result.config;
+		});
+		var failed = results.filter(function(result) {
+			return result.error || result.status !== 0;
+		});
+
+		/* Even a partially successful server cleanup must invalidate the matching
+		 * local cache entries. Waiting for every request above avoids a split-brain
+		 * cache when one package fails after another was already reverted. */
 		if (typeof uci.unload === 'function' && configs.length)
 			uci.unload(configs);
+		if (failed.length) {
+			var names = failed.map(function(result) { return result.config; }).join(', ');
+			var firstError = failed[0].error;
+			throw new Error(_('UCI could not discard the staged transaction for: %s.%s').format(
+				names, firstError && firstError.message ? ' ' + firstError.message : ''));
+		}
 		return configs;
+	});
+}
+
+function reconcileConfirmedUciPackages(packages) {
+	packages = packages || [];
+	return discardStagedUciPackages(packages).then(function(configs) {
+		/* The apply-guard supervisor finalizes its temporary markers directly in
+		 * committed UCI after the browser transaction has been confirmed. rpcd may
+		 * nevertheless retain the browser session's now-obsolete saved delta. A
+		 * reload would overlay that stale transaction on the finalized files and
+		 * resurrect the whole proposal as phantom Unsaved changes. Per-package
+		 * revert is safe only here, after confirmed+finalized success: it discards
+		 * the session overlay, not the already committed configuration. */
+		return uci.changes().then(function(changes) {
+			var remaining = configs.filter(function(config) {
+				return changes && changes[config] && changes[config].length;
+			});
+			if (remaining.length)
+				throw new Error(_('The confirmed browser UCI transaction is still pending for: %s.').format(
+					remaining.join(', ')));
+			return configs;
+		});
 	});
 }
 
@@ -3644,6 +4066,18 @@ function runGuardedSaveApply(view, ev, reloadOnSuccess) {
 		return waitForGuardedApplySupervisor(guards, applyDeadlineMs);
 	}).then(function() {
 		applyStarted = false;
+		return reconcileConfirmedUciPackages([ 'cake-autorate', 'sqm' ]).catch(function(cleanupError) {
+			/* Confirmation and guard finalization are already authoritative. Never
+			 * enter rollback recovery merely because the browser session could not be
+			 * reconciled; report the partial UI failure and retain that fact through
+			 * both catch stages below. */
+			var failure = new Error(_('Configuration was applied and confirmed, but the browser UCI transaction could not be cleared: %s').format(
+				cleanupError && cleanupError.message ? cleanupError.message : cleanupError));
+			failure.applyConfirmed = true;
+			failure.cleanupError = cleanupError;
+			throw failure;
+		});
+	}).then(function() {
 		if (reloadOnSuccess !== false)
 			reloadViewPage();
 		return view;
@@ -3664,7 +4098,11 @@ function runGuardedSaveApply(view, ev, reloadOnSuccess) {
 		var cleanup = safeToDiscard ?
 			discardStagedUciPackages([ 'cake-autorate', 'sqm' ]) : Promise.resolve();
 		return cleanup.then(function() {
-			reloadViewPage();
+			/* An indeterminate confirmation or a confirmed apply with failed browser
+			 * reconciliation needs to remain visible in the current view. Navigation
+			 * here would destroy LuCI's error notification before it can be rendered. */
+			if (!error.applyConfirmed && !error.confirmIndeterminate)
+				reloadViewPage();
 			throw error;
 		}, function(cleanupError) {
 			var failure = new Error(_('%s The browser UCI transaction could not be discarded: %s').format(
@@ -3672,7 +4110,8 @@ function runGuardedSaveApply(view, ev, reloadOnSuccess) {
 				cleanupError && cleanupError.message ? cleanupError.message : cleanupError));
 			failure.applyError = error;
 			failure.cleanupError = cleanupError;
-			reloadViewPage();
+			if (!error.applyConfirmed && !error.confirmIndeterminate)
+				reloadViewPage();
 			throw failure;
 		});
 	});
@@ -4312,9 +4751,24 @@ function renderAutotuneDiagnostics(result) {
 		E('strong', {}, alertTitle),
 		alertMessage
 	]) ];
+	var achievedClassNode = renderAutotuneAchievedClass(diagnosticResult);
+	if (achievedClassNode)
+		nodes.push(achievedClassNode);
 	var confidenceNode = renderAutotuneConfidence(diagnosticResult);
 	if (confidenceNode)
 		nodes.push(confidenceNode);
+	if (canonicalAutotuneProfile(diagnosticResult.profile) === 'gaming_extreme') {
+		var extremeRetention = profileOutcome && profileOutcome.capacity_floor_met === true;
+		nodes.push(E('div', {
+			'class': 'alert-message %s'.format(extremeRetention ? 'warning' : 'error'),
+			'style': 'margin:10px 0'
+		}, [
+			E('strong', {}, _('Extreme A+ result: ')),
+			extremeRetention ?
+				_('The opt-in deep search was used, but the selected point still retains at least 70% of measured capacity.') :
+				_('This tested point sacrifices more than 30% of measured capacity. Auto-Apply is disabled. It is intended only for a time-limited latency-critical session and is not recommended for continuous household use.')
+		]));
+	}
 
 	if (diagnostics.legacy)
 		nodes.push(E('p', {}, _('Result schema: %s. This saved result is read-only and cannot be reused by the current validator.').format(
@@ -4324,6 +4778,84 @@ function renderAutotuneDiagnostics(result) {
 	if (diagnostics.stage || diagnostics.reason)
 		nodes.push(E('p', {}, _('Stage: %s. Diagnostic reason: %s.').format(
 			diagnostics.stage || '-', diagnostics.reason || '-')));
+	nodes.push(E('p', {}, _('Calibration strategy: %s.').format(
+		autotuneResultCalibrationStrategy(diagnosticResult).replace(/_/g, ' '))));
+
+	var bidirectional = diagnosticResult.bidirectional_confirmation;
+	if (bidirectional && bidirectional.tested === true) {
+		nodes.push(E('div', {
+			'class': 'alert-message %s'.format(bidirectional.safety_pass === true ?
+				(bidirectional.cpu_warning === true ? 'warning' : 'success') : 'warning'),
+			'style': 'margin:10px 0;white-space:normal'
+		}, [
+			E('strong', {}, _('Simultaneous DL+UL confirmation: ')),
+			_('class %s; achieved DL %s / UL %s kbit/s; realization %s%% / %s%%; effective delay +%s ms; loss %s%%; CPU peak %s%%. %s').format(
+				bidirectional.grade || '-',
+				autotuneMetric(bidirectional.achieved_kbps && bidirectional.achieved_kbps.download, ''),
+				autotuneMetric(bidirectional.achieved_kbps && bidirectional.achieved_kbps.upload, ''),
+				autotuneMetric(bidirectional.realization_percent && bidirectional.realization_percent.download, ''),
+				autotuneMetric(bidirectional.realization_percent && bidirectional.realization_percent.upload, ''),
+				autotuneMetric(bidirectional.effective_delta_ms, ''),
+				autotuneMetric(bidirectional.loss_percent, ''),
+				autotuneMetric(bidirectional.cpu_peak_percent, ''),
+				bidirectional.advisory_reason && bidirectional.advisory_reason !== 'none' ?
+					_('Advisory: %s').format(bidirectional.advisory_reason) : _('No advisory.'))
+		]));
+	}
+
+	var directional = diagnosticResult.directional_recommendation;
+	if (directional && directional.recommended_topology === 'upload_only_shaped') {
+		nodes.push(E('div', {
+			'class': 'alert-message warning',
+			'style': 'margin:10px 0;white-space:normal'
+		}, [
+			E('strong', {}, _('Directional CAKE finding: ')),
+			_('Two repeat measurements found that keeping upload CAKE while bypassing download ingress improved the simultaneous-load result. Confidence: %s%%. This is evidence for manual review only: the current proposal still shapes both directions, and this release will not silently change the runtime topology.').format(
+				autotuneMetric(directional.confidence_percent, ''))
+		]));
+	} else if (directional && directional.recommended_topology === 'manual_review') {
+		var directionalReason = directional.reason === 'directional-bypass-not-authorized' ?
+			_('The selected calibration strategy did not authorize a raw directional bypass test.') :
+			_('The upload-only benefit was not repeatable enough to recommend a topology change.');
+		nodes.push(E('div', {
+			'class': 'alert-message warning',
+			'style': 'margin:10px 0;white-space:normal'
+		}, [
+			E('strong', {}, _('Directional CAKE review: ')),
+			directionalReason,
+			' ',
+			_('Keep both directions shaped or repeat Full Auto-Tune; no topology change was applied.')
+		]));
+	}
+
+	var trafficBudget = diagnosticResult.traffic_budget;
+	if (trafficBudget && trafficBudget.enabled === true) {
+		nodes.push(E('p', {}, _('Scheduled traffic budget: %s of %s bytes observed. Accounting polls every %s second(s), so a fast link may overshoot by roughly one interval.').format(
+			autotuneMetric(trafficBudget.consumed_bytes, ''),
+			autotuneMetric(trafficBudget.limit_bytes, ''),
+			autotuneMetric(trafficBudget.poll_interval_seconds, ''))));
+	}
+
+	if (canonicalAutotuneProfile(diagnosticResult.profile) === 'variable_link' && profileSearch) {
+		var variableSummary = [ 'download', 'upload' ].map(function(direction) {
+			var search = profileSearch[direction];
+			if (!search)
+				return _('%s: no result').format(direction === 'download' ? _('DL') : _('UL'));
+			return _('%s: %s; exploration %s kbit/s; runtime minimum %s; knee confidence %s').format(
+				direction === 'download' ? _('DL') : _('UL'),
+				search.reason || search.search_state || '-',
+				autotuneMetric(search.exploration_minimum_kbps, ''),
+				search.runtime_minimum_kbps == null ? _('not proven') :
+					autotuneMetric(search.runtime_minimum_kbps, _(' kbit/s')),
+				search.knee_detected === true ?
+					autotuneMetric(search.knee_confidence_percent, '%') : _('not detected'));
+		});
+		nodes.push(E('div', {
+			'class': 'alert-message %s'.format(diagnosticResult.search_state === 'no_cake_effect' ?
+				'warning' : (diagnosticResult.search_state === 'noisy' ? 'warning' : 'info')),
+			'style': 'margin:10px 0'
+		}, variableSummary.join(' · ')));
+	}
 
 	if (diagnostics.datapath && diagnostics.datapath.available === true &&
 	    diagnostics.datapath.single_cpu_rps === true) {
@@ -4633,6 +5165,8 @@ function showCreateWizard(grid, name, existingName) {
 		enabled: true,
 		sqm_enabled: true,
 		autotune_profile: 'best_overall',
+		autotune_calibration_strategy: 'shaped_only',
+		autotune_extreme_a_plus: false,
 		autotune_action: 'apply_sqm',
 		disable_sqm_confirmed: false,
 		speedtest_backend: 'auto',
@@ -4668,6 +5202,8 @@ function showCreateWizard(grid, name, existingName) {
 		state.sqm_enabled = uci.get('cake-autorate', existingName, 'sqm_enabled') === '1';
 		state.autotune_profile = canonicalAutotuneProfile(
 			uci.get('cake-autorate', existingName, 'autotune_profile')) || 'best_overall';
+		state.autotune_calibration_strategy = uci.get('cake-autorate', existingName,
+			'autotune_calibration_strategy') || 'shaped_only';
 		state.speedtest_backend = uci.get('cake-autorate', existingName, 'speedtest_backend') || 'auto';
 		state.speedtest_go_server_id = uci.get('cake-autorate', existingName, 'speedtest_go_server_id') || '';
 		state.speedtest_apply_percent = uci.get('cake-autorate', existingName, 'speedtest_apply_percent') || '90';
@@ -4965,7 +5501,9 @@ function showCreateWizard(grid, name, existingName) {
 		if (!targetState.autotune_action)
 			throw new Error(_('Auto-Tune returned no safe default Review action.'));
 		targetState.disable_sqm_confirmed = false;
-		targetState.autotune_profile = canonicalAutotuneProfile(result.profile) || 'best_overall';
+		targetState.autotune_extreme_a_plus =
+			canonicalAutotuneProfile(result.profile) === 'gaming_extreme';
+		targetState.autotune_profile = storedAutotuneProfile(result.profile) || 'best_overall';
 		targetState.autotune_diagnostics = null;
 		targetState.autotune_failure_message = '';
 		targetState.adaptive_ceiling_disable_confirmed = false;
@@ -5122,15 +5660,17 @@ function showCreateWizard(grid, name, existingName) {
 			]);
 		}));
 
-		var profileButtons = autotuneProfileDefinitions().map(function(definition) {
-			var selected = itemState.autotune_profile === definition.id;
+		var profileButtons = autotuneProfileDefinitions().filter(function(definition) {
+			return !definition.hidden;
+		}).map(function(definition) {
+			var selected = visibleAutotuneProfile(itemState.autotune_profile) === definition.id;
 			return E('button', {
 				'type': 'button',
-				'class': 'btn cbi-button %s'.format(selected ? 'cbi-button-positive' : ''),
+				'class': 'btn cbi-button cake-autotune-profile-card %s'.format(
+					selected ? 'cbi-button-positive' : ''),
 				'disabled': state.autotune_running || item.recovery_pending ? 'disabled' : null,
 				'data-profile': definition.id,
 				'aria-pressed': selected ? 'true' : 'false',
-				'style': 'display:flex;flex-direction:column;align-items:flex-start;gap:4px;flex:1 1 220px;min-height:104px;padding:10px;text-align:left;white-space:normal;word-break:normal;overflow-wrap:break-word;hyphens:none;line-height:1.4',
 				'click': function(ev) {
 					var selectedProfile = canonicalAutotuneProfile(
 						ev.currentTarget.getAttribute('data-profile'));
@@ -5138,6 +5678,7 @@ function showCreateWizard(grid, name, existingName) {
 						return;
 					resetMultiwanAutotuneItem(item);
 					itemState.autotune_profile = selectedProfile;
+					itemState.autotune_extreme_a_plus = false;
 					render();
 				}
 			}, [
@@ -5192,7 +5733,8 @@ function showCreateWizard(grid, name, existingName) {
 					progress.value = state.autotune_progress;
 					status.textContent = _('[%d/%d] %s: %s').format(index + 1, batch.length,
 						item.plan.member, job.message || job.phase || _('Full Auto-Tune is running...'));
-				}, 'mwan3', item.plan.member, itemState.autotune_profile, conservative)
+			}, 'mwan3', item.plan.member, autotuneRunProfile(itemState), conservative,
+				autotuneCalibrationStrategy(itemState))
 				.then(function(result) {
 					if (generation !== state.autotune_generation || state.autotune_cancel_requested)
 						return;
@@ -5242,18 +5784,21 @@ function showCreateWizard(grid, name, existingName) {
 		};
 
 		var runButton = E('button', {
+			'type': 'button',
 			'class': 'btn cbi-button cbi-button-action',
 			'disabled': state.autotune_running || item.recovery_pending ? 'disabled' : null,
 			'click': function() { return startCalibration(false); }
 		}, safeManualProposal ? _('Retry for higher confidence') :
 			(settledResult ? _('Run again') : _('Start Full Auto-Tune')));
 		var conservativeButton = E('button', {
+			'type': 'button',
 			'class': 'btn cbi-button cbi-button-positive',
 			'style': autotuneConservativeAvailable(itemState.autotune_background_block) ? '' : 'display:none',
 			'disabled': state.autotune_running || item.recovery_pending ? 'disabled' : null,
 			'click': function() { return startCalibration(true); }
 		}, _('Continue conservatively'));
 		var cancelButton = E('button', {
+			'type': 'button',
 			'class': 'btn cbi-button cbi-button-negative',
 			'disabled': state.autotune_running && item.status === 'running' ? null : 'disabled',
 			'click': function() {
@@ -5261,7 +5806,7 @@ function showCreateWizard(grid, name, existingName) {
 				status.textContent = _('Cancelling and restoring %s...').format(item.plan.member);
 				var generation = state.autotune_generation;
 				return cancelAutotuneJob(itemState.name, itemState.wan_if,
-					itemState.speedtest_backend, itemState.autotune_profile,
+					itemState.speedtest_backend, autotuneRunProfile(itemState),
 					itemState.route_mode, itemState.mwan3_member).then(function() {
 					if (generation !== state.autotune_generation)
 						return;
@@ -5286,6 +5831,7 @@ function showCreateWizard(grid, name, existingName) {
 			}
 		}, _('Cancel test'));
 		var restoreButton = E('button', {
+			'type': 'button',
 			'class': 'btn cbi-button cbi-button-negative',
 			'style': item.recovery_pending ? '' : 'display:none',
 			'disabled': state.autotune_running ? 'disabled' : null,
@@ -5295,7 +5841,7 @@ function showCreateWizard(grid, name, existingName) {
 				item.status = 'recovery';
 				render();
 				return cancelAutotuneJob(itemState.name, itemState.wan_if,
-					itemState.speedtest_backend, itemState.autotune_profile,
+					itemState.speedtest_backend, autotuneRunProfile(itemState),
 					itemState.route_mode, itemState.mwan3_member).then(function() {
 					state.autotune_running = false;
 					state.autotune_active_plan = null;
@@ -5314,11 +5860,13 @@ function showCreateWizard(grid, name, existingName) {
 
 		var decisionButtons = E('div', { 'style': 'display:flex;flex-wrap:wrap;gap:8px;margin-top:12px' }, [
 			E('button', {
+				'type': 'button',
 				'class': 'btn cbi-button cbi-button-positive important',
 				'disabled': canAccept ? null : 'disabled',
 				'click': function() { acceptMultiwanAutotuneItem(item); }
 			}, safeManualProposal ? _('Accept safe proposal') : _('Accept proposal')),
 			E('button', {
+				'type': 'button',
 				'class': 'btn cbi-button',
 				'disabled': canSkip ? null : 'disabled',
 				'click': function() { skipMultiwanAutotuneItem(item); }
@@ -5329,8 +5877,22 @@ function showCreateWizard(grid, name, existingName) {
 			timeline,
 			E('h5', {}, _('%s — %s → %s').format(item.plan.member,
 				item.plan.device, item.plan.name)),
+			wizardField(_('Calibration strategy for %s').format(item.plan.member),
+				autotuneCalibrationStrategyControl(itemState,
+					state.autotune_running || item.recovery_pending, function() {
+						resetMultiwanAutotuneItem(item);
+						render();
+					}),
+				_('This uplink is calibrated independently; raw bypass, when selected, affects only its currently measured direction.')),
 			wizardField(_('Calibration profile for %s').format(item.plan.member),
-				E('div', { 'style': 'display:flex;flex-wrap:wrap;gap:8px' }, profileButtons),
+				E('div', {}, [
+					autotuneProfileGrid(profileButtons),
+					autotuneExtremeGamingControl(itemState,
+						state.autotune_running || item.recovery_pending, function() {
+							resetMultiwanAutotuneItem(item);
+							render();
+						})
+				]),
 				_('This choice applies only to the current uplink. Other uplinks may use different profiles.')),
 			E('div', { 'class': 'alert-message warning' }, [
 				E('strong', {}, _('Traffic warning: ')),
@@ -5342,6 +5904,7 @@ function showCreateWizard(grid, name, existingName) {
 			]), _('Nothing is written to UCI until the final Review is confirmed.'))
 		];
 		if (acceptedProposal) {
+			var achievedGrade = autotuneAchievedGrade(itemState.autotune_result);
 			fields.push(wizardField(_('Proposal for %s').format(item.plan.member),
 				E('table', { 'class': 'table' }, [
 					E('tr', { 'class': 'tr' }, [
@@ -5352,8 +5915,8 @@ function showCreateWizard(grid, name, existingName) {
 					]),
 					E('tr', { 'class': 'tr' }, [
 						E('td', { 'class': 'td' }, _('Quality result')),
-						E('td', { 'class': 'td' }, itemState.autotune_result.validation &&
-							itemState.autotune_result.validation.actual_grade || '-')
+						E('td', { 'class': 'td' }, achievedGrade ?
+							autotuneGradeBadge(achievedGrade) : '-')
 					]),
 					E('tr', { 'class': 'tr' }, [
 						E('td', { 'class': 'td' }, _('Download min / base / max')),
@@ -5380,15 +5943,17 @@ function showCreateWizard(grid, name, existingName) {
 	function renderAutotuneStep() {
 		if (state.multiwan_set)
 			return renderMultiwanAutotuneStep();
-		var profileButtons = autotuneProfileDefinitions().map(function(definition) {
-			var selected = state.autotune_profile === definition.id;
+		var profileButtons = autotuneProfileDefinitions().filter(function(definition) {
+			return !definition.hidden;
+		}).map(function(definition) {
+			var selected = visibleAutotuneProfile(state.autotune_profile) === definition.id;
 			return E('button', {
 				'type': 'button',
-				'class': 'btn cbi-button %s'.format(selected ? 'cbi-button-positive' : ''),
+				'class': 'btn cbi-button cake-autotune-profile-card %s'.format(
+					selected ? 'cbi-button-positive' : ''),
 				'disabled': state.autotune_running ? 'disabled' : null,
 				'data-profile': definition.id,
 				'aria-pressed': selected ? 'true' : 'false',
-				'style': 'display:flex;flex-direction:column;align-items:flex-start;gap:4px;flex:1 1 220px;min-height:104px;padding:10px;text-align:left;white-space:normal;word-break:normal;overflow-wrap:break-word;hyphens:none;line-height:1.4',
 				'click': function(ev) {
 					var selectedProfile = canonicalAutotuneProfile(
 						ev.currentTarget.getAttribute('data-profile'));
@@ -5399,6 +5964,7 @@ function showCreateWizard(grid, name, existingName) {
 					state.autotune_failure_message = '';
 					state.autotune_background_block = null;
 					state.autotune_profile = selectedProfile;
+					state.autotune_extreme_a_plus = false;
 					render();
 				}
 			}, [
@@ -5457,7 +6023,8 @@ function showCreateWizard(grid, name, existingName) {
 
 			return runAutotuneJob(state.name, state.wan_if, state.speedtest_backend, function(job) {
 				progressCallback(job, '');
-			}, state.route_mode, state.mwan3_member, state.autotune_profile, conservative).then(function(result) {
+			}, state.route_mode, state.mwan3_member, autotuneRunProfile(state), conservative,
+				autotuneCalibrationStrategy(state)).then(function(result) {
 				if (generation !== state.autotune_generation || state.autotune_cancel_requested)
 					return;
 				applyAutotuneResult(result);
@@ -5515,6 +6082,7 @@ function showCreateWizard(grid, name, existingName) {
 			});
 		};
 		var runButton = E('button', {
+			'type': 'button',
 			'class': 'btn cbi-button cbi-button-action',
 			'disabled': state.autotune_running ? 'disabled' : null,
 			'click': function() {
@@ -5525,11 +6093,13 @@ function showCreateWizard(grid, name, existingName) {
 			(state.autotune_result || state.autotune_diagnostics || state.autotune_batch ?
 				_('Run again') : _('Start Full Auto-Tune')));
 		var conservativeButton = E('button', {
+			'type': 'button',
 			'class': 'btn cbi-button cbi-button-positive',
 			'style': autotuneConservativeAvailable(state.autotune_background_block) ? '' : 'display:none',
 			'click': function() { return startCalibration(true); }
 		}, _('Continue conservatively'));
 		var cancelButton = E('button', {
+			'type': 'button',
 			'class': 'btn cbi-button cbi-button-negative',
 			'disabled': state.autotune_running ? null : 'disabled',
 			'click': function() {
@@ -5539,7 +6109,7 @@ function showCreateWizard(grid, name, existingName) {
 				var generation = state.autotune_generation;
 				var active = state.autotune_active_plan && state.autotune_active_plan.state || state;
 				return cancelAutotuneJob(active.name, active.wan_if, state.speedtest_backend,
-					state.autotune_profile, active.route_mode, active.mwan3_member).then(function() {
+					autotuneRunProfile(state), active.route_mode, active.mwan3_member).then(function() {
 					if (generation !== state.autotune_generation)
 						return;
 					state.autotune_generation++;
@@ -5558,8 +6128,25 @@ function showCreateWizard(grid, name, existingName) {
 		}, _('Cancel test'));
 
 		var fields = [
+			wizardField(_('Calibration strategy'),
+				autotuneCalibrationStrategyControl(state, state.autotune_running, function() {
+					clearAutotuneProposalState(state);
+					state.autotune_diagnostics = null;
+					state.autotune_failure_message = '';
+					render();
+				}),
+				_('Full raw capacity is explicit opt-in because it temporarily bypasses shaping for the direction under test and can transfer substantially more data.')),
 			wizardField(_('Calibration profile'),
-				E('div', { 'style': 'display:flex;flex-wrap:wrap;gap:8px' }, profileButtons),
+				E('div', {}, [
+					autotuneProfileGrid(profileButtons),
+					autotuneExtremeGamingControl(state, state.autotune_running, function() {
+						clearAutotuneProposalState(state);
+						state.autotune_diagnostics = null;
+						state.autotune_failure_message = '';
+						state.autotune_background_block = null;
+						render();
+					})
+				]),
 				_('The profile chooses how Auto-Tune ranks safe points on the measured throughput/latency boundary. Missed throughput objectives and the 50% historical trust boundary prevent Auto-Apply but remain manually reviewable when latency, loss, routing, and measurement evidence are clean.')),
 			E('div', { 'class': 'alert-message warning' }, [
 				E('strong', {}, _('Traffic warning: ')),
@@ -5612,6 +6199,7 @@ function showCreateWizard(grid, name, existingName) {
 				state.speedtest_last);
 		};
 		var checkButton = E('button', {
+			'type': 'button',
 			'class': 'btn cbi-button',
 			'click': function() {
 				syncInputs();
@@ -5638,6 +6226,7 @@ function showCreateWizard(grid, name, existingName) {
 			}
 		}, _('Check backends'));
 		var installButton = E('button', {
+			'type': 'button',
 			'class': 'btn cbi-button',
 			'click': function() {
 				syncInputs();
@@ -5663,6 +6252,7 @@ function showCreateWizard(grid, name, existingName) {
 			}
 		}, _('Install backend'));
 		var runButton = E('button', {
+			'type': 'button',
 			'class': 'btn cbi-button cbi-button-action',
 			'click': function() {
 				var pct = parseInt(percent.value || '90', 10);
@@ -5715,6 +6305,7 @@ function showCreateWizard(grid, name, existingName) {
 			}
 		}, _('Run speed test'));
 		var scanReflectorsButton = E('button', {
+			'type': 'button',
 			'class': 'btn cbi-button',
 			'click': function() {
 				syncInputs();
@@ -5863,6 +6454,7 @@ function showCreateWizard(grid, name, existingName) {
 			var thresholds = proposal.thresholds_ms;
 			var firstRun = autotune.runs && autotune.runs.length ? autotune.runs[0] : {};
 			var profilePolicy = autotuneProfilePolicy(autotune.profile);
+			var variableSearch = autotune.profile === 'variable_link' ? autotune.profile_search : null;
 			var confidence = autotuneConfidence(autotune);
 			var cakePolicyText = proposal.sqm.classification === 'diffserv4' ?
 				(proposal.sqm.squash_dscp || proposal.sqm.squash_ingress ?
@@ -5876,6 +6468,7 @@ function showCreateWizard(grid, name, existingName) {
 							return item.id === profilePolicy.id;
 						})[0].title, profilePolicy.targetGrade) : '-' ],
 				[ _('Result class'), autotuneResultClassLabel(autotune) ],
+				[ _('Achieved class'), autotuneGradeBadge(autotuneAchievedGrade(autotune)) || '-' ],
 				[ _('Overall confidence'), confidence ? autotuneMetric(confidence.overall_percent, '%') : '-' ],
 				[ _('Capacity confidence'), confidence ? _('DL %s / UL %s').format(
 					autotuneMetric(confidence.capacity_download_percent, '%'),
@@ -5902,6 +6495,19 @@ function showCreateWizard(grid, name, existingName) {
 			);
 			if (confidence && confidence.reasons.length)
 				rows.push([ _('Confidence notes'), confidence.reasons.map(autotuneConfidenceReasonText).join('; ') ]);
+			if (variableSearch && variableSearch.download && variableSearch.upload) {
+				rows.push(
+					[ _('Exploration minimum'), _('DL %s / UL %s kbit/s').format(
+						autotuneMetric(variableSearch.download.exploration_minimum_kbps, ''),
+						autotuneMetric(variableSearch.upload.exploration_minimum_kbps, '')) ],
+					[ _('Measured autorate minimum'), _('DL %s / UL %s kbit/s').format(
+						autotuneMetric(variableSearch.download.runtime_minimum_kbps, ''),
+						autotuneMetric(variableSearch.upload.runtime_minimum_kbps, '')) ],
+					[ _('Latency-knee confidence'), _('DL %s / UL %s').format(
+						autotuneMetric(variableSearch.download.knee_confidence_percent, '%'),
+						autotuneMetric(variableSearch.upload.knee_confidence_percent, '%')) ]
+				);
+			}
 			if (autotune.profile === 'fair' && validation &&
 			    (validation.quality_target_met === false || capacityFloorInfeasible)) {
 				var outcome = autotune.fair_outcome;
@@ -6354,7 +6960,12 @@ function showCreateWizard(grid, name, existingName) {
 			for (var planIndex = 0; planIndex < planItems.length; planIndex++)
 				created.push(stageWizardPlanItem(config_name, planItems[planIndex]));
 
-			return grid.map.save(null, true).then(function() { return created; });
+			/* stageWizardPlanItem() has already written the exact reviewed proposal
+			 * into the shared UCI model.  Re-parsing the GridSection here would use
+			 * stale or unrendered modal widgets and can overwrite that proposal.
+			 * Persist only the staged UCI delta; Save & Apply remains a separate,
+			 * guarded action. */
+			return uci.save().then(function() { return created; });
 		})
 			.then(function(created) {
 				return L.bind(grid.map.load, grid.map)().then(function() { return created; });
@@ -6391,6 +7002,7 @@ function showCreateWizard(grid, name, existingName) {
 		];
 		var buttons = [
 			E('button', {
+				'type': 'button',
 				'class': 'btn cbi-button',
 				'click': function() {
 					if (state.autotune_running) {
@@ -6398,7 +7010,7 @@ function showCreateWizard(grid, name, existingName) {
 						state.autotune_generation = (state.autotune_generation || 0) + 1;
 						var active = state.autotune_active_plan && state.autotune_active_plan.state || state;
 						cancelAutotuneJob(active.name, active.wan_if,
-							active.speedtest_backend, active.autotune_profile,
+							active.speedtest_backend, autotuneRunProfile(active),
 							active.route_mode, active.mwan3_member).catch(function() {});
 					}
 					ui.hideModal();
@@ -6415,6 +7027,7 @@ function showCreateWizard(grid, name, existingName) {
 
 		if (state.step > 0) {
 			buttons.push(E('button', {
+				'type': 'button',
 				'class': 'btn cbi-button',
 				'disabled': state.autotune_running ? 'disabled' : null,
 				'click': function() {
@@ -6427,6 +7040,7 @@ function showCreateWizard(grid, name, existingName) {
 		var invalidAutotune = state.mode === 'autotune' && !autotuneReadyForReview();
 		if (state.step < 2 && !(state.step === 1 && invalidAutotune)) {
 			buttons.push(E('button', {
+				'type': 'button',
 				'class': 'btn cbi-button cbi-button-positive',
 				'click': function() {
 					navigateWizardStep(state.step + 1);
@@ -6435,6 +7049,7 @@ function showCreateWizard(grid, name, existingName) {
 		}
 		else if (invalidAutotune && state.autotune_diagnostics) {
 			buttons.push(E('button', {
+				'type': 'button',
 				'class': 'btn cbi-button cbi-button-positive',
 				'click': function() { ui.hideModal(); }
 			}, _('Close diagnostics')));
@@ -6445,12 +7060,14 @@ function showCreateWizard(grid, name, existingName) {
 				autotuneResultClass(state.autotune_result) !== 'trusted';
 			if (safeManualReview) {
 				buttons.push(E('button', {
+					'type': 'button',
 					'class': 'btn cbi-button',
 					'click': function() { navigateWizardStep(1); }
 				}, _('Retry for higher confidence')));
 				buttons.push(' ');
 			}
 			buttons.push(E('button', {
+				'type': 'button',
 				'class': 'btn cbi-button cbi-button-positive important',
 				'click': finish
 			}, state.autotune_action === 'keep_current' ? _('Keep current') :
@@ -6521,7 +7138,7 @@ function autorateSubcategory(tab, optionName) {
 		return 'limits';
 
 	if (tab === 'rates')
-		return optionName.indexOf('adaptive_ceiling_') === 0 ? 'ceiling' : 'limits';
+		return optionName === 'runtime_learning_mode' || optionName.indexOf('adaptive_ceiling_') === 0 ? 'ceiling' : 'limits';
 
 	if (tab === 'reflectors')
 		return 'probes';
@@ -6706,13 +7323,37 @@ function addRateOptions(section) {
 
 	value(section, 'rates', 'connection_active_thr_kbps', _('Active threshold'), 'uinteger', '2000');
 
-	o = flag(section, 'rates', 'adaptive_ceiling_enabled', _('Adaptive ceiling'), '0');
+	o = listValue(section, 'rates', 'runtime_learning_mode', _('Runtime capacity learning'), [
+		[ 'passive', _('Passive only (recommended — no generated traffic)') ],
+		[ 'periodic_active', _('Passive + scheduled active calibration') ],
+		[ 'fixed', _('Configured bounds only') ]
+	], 'fixed');
+	o.cfgvalue = function(section_id) {
+		if (uci.get('cake-autorate', section_id, 'scheduled_autotune_enabled') === '1')
+			return 'periodic_active';
+		if (uci.get('cake-autorate', section_id, 'adaptive_ceiling_enabled') === '1')
+			return 'passive';
+		return uci.get('cake-autorate', section_id, 'runtime_learning_mode') || 'fixed';
+	};
+	o.write = function(section_id, selected) {
+		uci.set('cake-autorate', section_id, 'runtime_learning_mode', selected);
+		uci.set('cake-autorate', section_id, 'adaptive_ceiling_enabled',
+			selected === 'fixed' ? '0' : '1');
+		uci.set('cake-autorate', section_id, 'scheduled_autotune_enabled',
+			selected === 'periodic_active' ? '1' : '0');
+	};
+	o.remove = function(section_id) {
+		uci.unset('cake-autorate', section_id, 'runtime_learning_mode');
+		uci.set('cake-autorate', section_id, 'adaptive_ceiling_enabled', '0');
+		uci.set('cake-autorate', section_id, 'scheduled_autotune_enabled', '0');
+	};
 	o.validate = function(section_id) {
 		return validateAdaptiveCeiling(validationSection(this), section_id);
 	};
 
 	o = value(section, 'rates', 'adaptive_ceiling_dl_cap_kbps', _('DL absolute cap'), 'and(uinteger,min(1))', '80000');
-	o.depends('adaptive_ceiling_enabled', '1');
+	o.depends('runtime_learning_mode', 'passive');
+	o.depends('runtime_learning_mode', 'periodic_active');
 	o.cfgvalue = function(section_id) {
 		return rateValue(uci.get('cake-autorate', section_id, 'adaptive_ceiling_dl_cap_kbps'),
 			rateValue(uci.get('cake-autorate', section_id, 'max_dl_shaper_rate_kbps'), '80000'));
@@ -6722,7 +7363,8 @@ function addRateOptions(section) {
 	};
 
 	o = value(section, 'rates', 'adaptive_ceiling_ul_cap_kbps', _('UL absolute cap'), 'and(uinteger,min(1))', '35000');
-	o.depends('adaptive_ceiling_enabled', '1');
+	o.depends('runtime_learning_mode', 'passive');
+	o.depends('runtime_learning_mode', 'periodic_active');
 	o.cfgvalue = function(section_id) {
 		return rateValue(uci.get('cake-autorate', section_id, 'adaptive_ceiling_ul_cap_kbps'),
 			rateValue(uci.get('cake-autorate', section_id, 'max_ul_shaper_rate_kbps'), '35000'));
@@ -6732,19 +7374,24 @@ function addRateOptions(section) {
 	};
 
 	o = value(section, 'rates', 'adaptive_ceiling_hold_time_s', _('Qualification time'), 'and(ufloat,min(1))', '20.0');
-	o.depends('adaptive_ceiling_enabled', '1');
+	o.depends('runtime_learning_mode', 'passive');
+	o.depends('runtime_learning_mode', 'periodic_active');
 
 	o = value(section, 'rates', 'adaptive_ceiling_growth_percent', _('Open probe step'), 'and(ufloat,min(0.1),max(10))', '3.0');
-	o.depends('adaptive_ceiling_enabled', '1');
+	o.depends('runtime_learning_mode', 'passive');
+	o.depends('runtime_learning_mode', 'periodic_active');
 
 	o = value(section, 'rates', 'adaptive_ceiling_probe_duration_s', _('Probe observation'), 'and(ufloat,min(1))', '8.0');
-	o.depends('adaptive_ceiling_enabled', '1');
+	o.depends('runtime_learning_mode', 'passive');
+	o.depends('runtime_learning_mode', 'periodic_active');
 
 	o = value(section, 'rates', 'adaptive_ceiling_cooldown_s', _('Probe cooldown'), 'and(ufloat,min(0))', '30.0');
-	o.depends('adaptive_ceiling_enabled', '1');
+	o.depends('runtime_learning_mode', 'passive');
+	o.depends('runtime_learning_mode', 'periodic_active');
 
 	o = value(section, 'rates', 'adaptive_ceiling_failed_bound_ttl_s', _('Failed-bound memory'), 'and(ufloat,min(1))', '900.0');
-	o.depends('adaptive_ceiling_enabled', '1');
+	o.depends('runtime_learning_mode', 'passive');
+	o.depends('runtime_learning_mode', 'periodic_active');
 }
 
 function addQualityOptions(section) {
@@ -6850,23 +7497,33 @@ function addQualityOptions(section) {
 	o = listValue(section, 'testing', 'autotune_profile', _('Auto-Tune profile'), [
 		[ 'gaming', _('Gaming — target A+, diffserv4') ],
 		[ 'best_overall', _('Best overall — target A (recommended)') ],
+		[ 'variable_link', _('Variable link — measured knee, target B') ],
 		[ 'fair', _('Fair — throughput first, aim for C') ]
 	], 'best_overall');
 	describe(o, 'autotune_profile');
+	o = listValue(section, 'testing', 'autotune_calibration_strategy', _('Calibration strategy'), [
+		[ 'shaped_only', _('Shaped only (recommended)') ],
+		[ 'full_raw', _('Full raw capacity (temporary directional bypass)') ],
+		[ 'reuse_trusted', _('Reuse current trusted bounds') ]
+	], 'shaped_only');
+	describe(o, 'autotune_calibration_strategy');
 
-	o = flag(section, 'testing', 'scheduled_autotune_enabled', _('Scheduled Full Auto-Tune'), '0');
 	o = value(section, 'testing', 'scheduled_autotune_interval_hours', _('Retune interval'), 'and(uinteger,min(1),max(8760))', '24');
-	o.depends('scheduled_autotune_enabled', '1');
+	o.depends('runtime_learning_mode', 'periodic_active');
 	o = value(section, 'testing', 'scheduled_autotune_idle_window_s', _('Required quiet time'), 'and(uinteger,min(30),max(3600))', '60');
-	o.depends('scheduled_autotune_enabled', '1');
+	o.depends('runtime_learning_mode', 'periodic_active');
 	o = value(section, 'testing', 'scheduled_autotune_window_start_hour', _('Window starts'), 'and(uinteger,min(0),max(23))', '2');
-	o.depends('scheduled_autotune_enabled', '1');
+	o.depends('runtime_learning_mode', 'periodic_active');
 	o = value(section, 'testing', 'scheduled_autotune_window_end_hour', _('Window ends'), 'and(uinteger,min(0),max(23))', '5');
-	o.depends('scheduled_autotune_enabled', '1');
+	o.depends('runtime_learning_mode', 'periodic_active');
 	o = value(section, 'testing', 'scheduled_autotune_max_traffic_mb_day', _('Daily traffic budget'), 'and(uinteger,min(100),max(1048576))', '4096');
-	o.depends('scheduled_autotune_enabled', '1');
+	o.depends('runtime_learning_mode', 'periodic_active');
+	describe(o, 'scheduled_autotune_max_traffic_mb_day');
+	o = value(section, 'testing', 'scheduled_autotune_max_traffic_mb_month', _('Monthly traffic budget'), 'and(uinteger,min(100),max(1048576))', '16384');
+	o.depends('runtime_learning_mode', 'periodic_active');
+	describe(o, 'scheduled_autotune_max_traffic_mb_month');
 	o = flag(section, 'testing', 'scheduled_autotune_auto_apply', _('Apply validated proposal automatically'), '0');
-	o.depends('scheduled_autotune_enabled', '1');
+	o.depends('runtime_learning_mode', 'periodic_active');
 }
 
 function addSpeedtestOptions(section) {
@@ -7169,6 +7826,7 @@ function addSetupOptions(section) {
 
 		return E('div', {}, [
 			E('button', {
+				'type': 'button',
 				'class': 'cbi-button cbi-button-%s'.format(this.inputstyle || 'button'),
 				'click': function(ev) {
 					return self.onclick(ev, section_id);
@@ -7784,6 +8442,20 @@ function loadSqmScripts() {
 }
 
 return L.view.extend({
+	handleSave: function(ev) {
+		var markers;
+		try {
+			markers = pendingAutotuneApplyMarkers();
+		}
+		catch (error) {
+			return Promise.reject(error);
+		}
+		if (markers.length)
+			return Promise.reject(new Error(_(
+				'A staged Full Auto-Tune proposal cannot be stored as ordinary pending changes. Use Save & Apply to validate and apply it, or Reset to discard it.')));
+		return this.super('handleSave', [ ev ]);
+	},
+
 	handleSaveApply: function(ev, mode) {
 		var markers;
 		try {
@@ -7839,6 +8511,7 @@ return L.view.extend({
 			var container = actions && actions.lastElementChild;
 			if (container) {
 				container.insertBefore(E('button', {
+					'type': 'button',
 					'title': _('Re-run Auto-Tune'),
 					'class': 'btn cbi-button cbi-button-action cake-autotune-rerun',
 					'click': ui.createHandlerFn(this, function() {
@@ -7846,6 +8519,7 @@ return L.view.extend({
 					})
 				}, _('Re-run Auto-Tune')), container.firstChild);
 				container.insertBefore(E('button', {
+					'type': 'button',
 					'title': _('Traffic priorities'),
 					'class': 'btn cbi-button cbi-button-neutral cake-traffic-priorities',
 					'click': ui.createHandlerFn(this, function() {
@@ -7899,7 +8573,7 @@ return L.view.extend({
 		addTopicIntroduction(s, 'sqm', '_sqm_topic',
 			_('Configure the managed SQM interface, CAKE queue, link-layer overhead and PPPoE/Ethernet details.'));
 		addTopicIntroduction(s, 'testing', '_testing_topic',
-			_('Run speed tests and Full Auto-Tune, select test backends, and control optional scheduled recalibration.'));
+			_('Run speed tests and Full Auto-Tune. Scheduled active calibration is opt-in and can transfer many gigabytes; its quiet window and hard daily/monthly budgets apply per uplink.'));
 		addTopicIntroduction(s, 'monitoring', '_monitoring_topic',
 			_('Configure RAM-only graph sampling, logging, MQTT and diagnostic export behavior. Graph memory limits remain on the Graphs page.'));
 		addTopicIntroduction(s, 'advanced', '_advanced_topic',

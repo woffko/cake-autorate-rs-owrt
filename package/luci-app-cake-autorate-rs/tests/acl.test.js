@@ -29,9 +29,19 @@ assert.deepStrictEqual(
 	'The app must not receive UCI write access to network or mwan3',
 );
 assert.deepStrictEqual(
+	group.write.ubus.uci,
+	[ 'revert' ],
+	'Guarded apply reconciliation needs per-package revert while the write.uci scope confines it to cake-autorate and sqm',
+);
+assert.deepStrictEqual(
 	group.read.file['/usr/libexec/cake-autorate-rs/runtime-health'],
 	[ 'exec' ],
 	'Status must have read-only execution access to the runtime reconciliation helper',
+);
+assert.deepStrictEqual(
+	group.read.file['/usr/libexec/cake-autorate-rs/autotune-scheduler status *'],
+	[ 'exec' ],
+	'Status must be able to read scheduler state and traffic budgets without write access',
 );
 assert.deepStrictEqual(
 	group.read.file['/usr/libexec/cake-autorate-rs/traffic-classifier status'],

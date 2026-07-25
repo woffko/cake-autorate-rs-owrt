@@ -15,6 +15,7 @@ sqm_config_file="${CAKE_AUTORATE_SQM_CONFIG_FILE:-/etc/config/sqm}"
 runtime_lock_lib="${CAKE_AUTORATE_RUNTIME_LOCK_LIB:-/usr/libexec/cake-autorate-rs/runtime-lock}"
 sqm_private_config_dir=""
 sqm_recovery_snapshot=""
+sqm_check_only=0
 
 [ -r "$runtime_lock_lib" ] || {
 	printf '%s\n' "Runtime lock library is unavailable: $runtime_lock_lib" >&2
@@ -525,6 +526,22 @@ case "$#" in
 		sqm_section="$(uci_get sqm_section)"
 		[ -n "$sqm_section" ] || sqm_section="cake_$section"
 		;;
+	2)
+		[ "$2" = check ] || fail "Unknown SQM recovery operation."
+		sqm_check_only=1
+		recovery_mode=0
+		[ "$(uci_get enabled)" = 1 ] || fail "Autorate instance $section is disabled."
+		[ "$(uci_get manage_sqm)" = 1 ] || fail "Managed SQM is disabled for $section."
+		[ "$(uci_get sqm_enabled)" = 1 ] || fail "Managed SQM queue is disabled for $section."
+		target="$(uci_get sqm_interface)"
+		[ -n "$target" ] || target="$(uci_get ul_if)"
+		ul_if="$(uci_get ul_if)"
+		[ -n "$ul_if" ] || ul_if="$target"
+		dl_if="$(uci_get dl_if)"
+		[ -n "$dl_if" ] || dl_if="ifb4$target"
+		sqm_section="$(uci_get sqm_section)"
+		[ -n "$sqm_section" ] || sqm_section="cake_$section"
+		;;
 	7)
 		recovery_mode=1
 		sqm_snapshot_recovery=1
@@ -643,6 +660,11 @@ fi
 health_policy_snapshot_valid || fail "CAKE/SQM health-policy bounds changed while locking $section."
 prepare_private_sqm_config ||
 	fail "Managed SQM configuration changed or could not be frozen safely while locking $section."
+
+if [ "$sqm_check_only" = 1 ]; then
+	healthy || fail "Managed SQM on $target is not an exact CAKE, IFB, and ingress match."
+	exit 0
+fi
 
 healthy && exit 0
 

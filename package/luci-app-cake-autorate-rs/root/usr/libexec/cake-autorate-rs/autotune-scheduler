@@ -1,6 +1,7 @@
 #!/bin/sh
 
 state_root="${CAKE_AUTOTUNE_SCHEDULER_STATE_ROOT:-/var/run/cake-autorate-autotune-scheduler}"
+budget_store_root="${CAKE_AUTOTUNE_BUDGET_STORE_ROOT:-/etc/cake-autorate/autotune-budget}"
 helper="${CAKE_AUTOTUNE_HELPER:-/usr/libexec/cake-autorate-rs/autotune}"
 service="${CAKE_AUTOTUNE_SERVICE:-/etc/init.d/cake-autorate}"
 route_helper="${CAKE_AUTOTUNE_ROUTE_HELPER:-/usr/libexec/cake-autorate-rs/speedtest}"
@@ -111,7 +112,7 @@ idle_ready() {
 	[ "$rate_kbps" -le "$threshold" ]
 }
 
-budget_ready() {
+budget_remaining_bytes() {
 	section="$1"
 	limit_mb="$(get_uint "$section" scheduled_autotune_max_traffic_mb_day 4096)"
 	day="$(date +%Y%m%d)"
@@ -121,13 +122,116 @@ budget_ready() {
 		read -r saved_day used < "$file"
 		[ "$saved_day" = "$day" ] || used=0
 	fi
-	case "$used" in ''|*[!0-9]*) used=0 ;; esac
-	[ "$used" -lt "$((limit_mb * 1024 * 1024))" ]
+	case "$used" in ''|*[!0-9]*) return 1 ;; esac
+	limit_bytes="$((limit_mb * 1024 * 1024))"
+	[ "$used" -lt "$limit_bytes" ] || return 1
+	printf '%s\n' "$((limit_bytes - used))"
+}
+
+monthly_budget_remaining_bytes() {
+	section="$1"
+	limit_mb="$(get_uint "$section" scheduled_autotune_max_traffic_mb_month 16384)"
+	month="$(date +%Y%m)"
+	file="$budget_store_root/$section.monthly"
+	used=0
+	[ ! -L "$budget_store_root" ] && [ ! -L "$file" ] || return 1
+	if [ -s "$file" ] && [ ! -L "$file" ]; then
+		read -r saved_month used < "$file"
+		[ "$saved_month" = "$month" ] || used=0
+	fi
+	case "$used" in ''|*[!0-9]*) return 1 ;; esac
+	limit_bytes="$((limit_mb * 1024 * 1024))"
+	[ "$used" -lt "$limit_bytes" ] || return 1
+	printf '%s\n' "$((limit_bytes - used))"
+}
+
+prepare_budget_store() {
+	[ ! -L "$budget_store_root" ] || return 1
+	mkdir -p "$budget_store_root" || return 1
+	chmod 700 "$budget_store_root" 2>/dev/null || true
+	[ -d "$budget_store_root" ] && [ ! -L "$budget_store_root" ] || return 1
+	[ ! -L "$budget_store_root/.lock" ] || return 1
+}
+
+# Adjust the persistent monthly ledger while holding a cross-process lock.
+# A scheduled run first reserves its complete allowance and later replaces that
+# reservation with the measured RX+TX delta.  If power is lost in between, the
+# reservation remains charged: accounting may be conservative, but it can
+# never silently undercount an interrupted active test.
+adjust_monthly_budget() {
+	adjust_section="$1"
+	adjust_subtract="$2"
+	adjust_add="$3"
+	adjust_month="$(date +%Y%m)"
+	adjust_file="$budget_store_root/$adjust_section.monthly"
+	adjust_used=0
+	adjust_tmp=
+	case "$adjust_section" in
+		''|*[!A-Za-z0-9_.:-]*) return 1 ;;
+	esac
+	case "$adjust_subtract:$adjust_add" in
+		*[!0-9:]*) return 1 ;;
+	esac
+	prepare_budget_store || return 1
+	exec 9>>"$budget_store_root/.lock" || return 1
+	chmod 600 "$budget_store_root/.lock" 2>/dev/null || true
+	flock -x 9 || {
+		exec 9>&-
+		return 1
+	}
+	if [ -s "$adjust_file" ] && [ ! -L "$adjust_file" ]; then
+		read -r adjust_saved_month adjust_used < "$adjust_file"
+		[ "$adjust_saved_month" = "$adjust_month" ] || adjust_used=0
+	fi
+	case "$adjust_used:$adjust_subtract:$adjust_add" in
+		*[!0-9:]*) adjust_ok=0 ;;
+		*) adjust_ok=1 ;;
+	esac
+	[ "$adjust_ok" = 1 ] && [ "$adjust_subtract" -le "$adjust_used" ] 2>/dev/null || adjust_ok=0
+	if [ "$adjust_ok" = 1 ]; then
+		adjust_tmp="$budget_store_root/$adjust_section.monthly.$$"
+		[ ! -L "$adjust_tmp" ] || adjust_ok=0
+	fi
+	if [ "$adjust_ok" = 1 ]; then
+		printf '%s %s\n' "$adjust_month" "$((adjust_used - adjust_subtract + adjust_add))" > "$adjust_tmp" || adjust_ok=0
+	fi
+	if [ "$adjust_ok" = 1 ]; then
+		chmod 600 "$adjust_tmp" 2>/dev/null || true
+		mv "$adjust_tmp" "$adjust_file" || adjust_ok=0
+	fi
+	[ "$adjust_ok" = 1 ] || rm -f "${adjust_tmp:-}"
+	flock -u 9 2>/dev/null || true
+	exec 9>&-
+	[ "$adjust_ok" = 1 ]
+}
+
+record_monthly_budget() {
+	adjust_monthly_budget "$1" 0 "$2"
+}
+
+reserve_monthly_budget() {
+	adjust_monthly_budget "$1" 0 "$2"
+}
+
+settle_monthly_budget() {
+	settle_section="$1"
+	settle_reserved="$2"
+	settle_reserved_month="$3"
+	settle_consumed="$4"
+	if [ "$settle_reserved_month" = "$(date +%Y%m)" ]; then
+		adjust_monthly_budget "$settle_section" "$settle_reserved" "$settle_consumed"
+	else
+		# A run crossing a calendar boundary cannot apportion traffic exactly.
+		# The expired old-month reservation is discarded by the new ledger and
+		# the complete observed delta is conservatively charged to the new month.
+		adjust_monthly_budget "$settle_section" 0 "$settle_consumed"
+	fi
 }
 
 record_budget() {
 	section="$1"
 	consumed="$2"
+	case "$section" in ''|*[!A-Za-z0-9_.:-]*) return 1 ;; esac
 	day="$(date +%Y%m%d)"
 	file="$state_root/$section.budget"
 	used=0
@@ -135,8 +239,10 @@ record_budget() {
 		read -r saved_day used < "$file"
 		[ "$saved_day" = "$day" ] || used=0
 	fi
-	case "$used:$consumed" in *[!0-9:]*) return ;; esac
-	printf '%s %s\n' "$day" "$((used + consumed))" > "$file"
+	case "$used:$consumed" in *[!0-9:]*) return 1 ;; esac
+	budget_tmp="$state_root/$section.budget.$$"
+	printf '%s %s\n' "$day" "$((used + consumed))" > "$budget_tmp" || return 1
+	mv "$budget_tmp" "$file"
 }
 
 extract() {
@@ -434,7 +540,7 @@ result_proposal_is_safe() {
 	proposal_quality_required="$(extract "$proposal_json" '@.proposal.quality_target_required')"
 	proposal_throughput_priority="$(extract "$proposal_json" '@.proposal.throughput_priority')"
 	[ "$proposal_schema" = 3 ] && [ "$result_profile" = "$proposal_profile" ] || return 1
-	case "$result_profile" in gaming|best_overall|fair) ;; *) return 1 ;; esac
+	case "$result_profile" in gaming|best_overall|variable_link|fair) ;; *) return 1 ;; esac
 	dl_min="$(extract "$proposal_json" '@.proposal.download.minimum_kbps')"
 	dl_base="$(extract "$proposal_json" '@.proposal.download.base_kbps')"
 	dl_max="$(extract "$proposal_json" '@.proposal.download.maximum_kbps')"
@@ -544,6 +650,14 @@ result_proposal_is_safe() {
 				numbers_equal "$validation_transport" 30 &&
 				numbers_equal "$validation_loss" 3 || return 1
 			;;
+		variable_link)
+			[ "$proposal_target_grade" = B ] &&
+				[ "$proposal_quality_required" = true ] &&
+				[ "$proposal_throughput_priority" = false ] &&
+				numbers_equal "$validation_retention" 70 &&
+				numbers_equal "$validation_transport" 60 &&
+				numbers_equal "$validation_loss" 3 || return 1
+			;;
 		fair)
 			[ "$proposal_target_grade" = C ] &&
 				[ "$proposal_quality_required" = false ] &&
@@ -554,7 +668,7 @@ result_proposal_is_safe() {
 			;;
 	esac
 	case "$result_profile" in
-		best_overall|fair)
+		best_overall|variable_link|fair)
 			[ "$sqm_script" = layer_cake.qos ] &&
 				[ "$sqm_classification" = diffserv4 ] &&
 				[ "$sqm_squash_dscp" = true ] &&
@@ -1118,10 +1232,27 @@ finish_attempt_accounting() {
 	attempt_section="$1"
 	attempt_interface="$2"
 	attempt_bytes_before="$3"
+	attempt_reserved_monthly="${4:-0}"
+	attempt_reserved_month="${5:-$(date +%Y%m)}"
 	attempt_finished_at="$(date +%s)"
-	attempt_bytes_after="$(interface_bytes "$attempt_interface" 2>/dev/null || printf '%s' "$attempt_bytes_before")"
-	if [ "$attempt_bytes_after" -ge "$attempt_bytes_before" ] 2>/dev/null; then
-		record_budget "$attempt_section" "$((attempt_bytes_after - attempt_bytes_before))"
+	attempt_bytes_after="$(interface_bytes "$attempt_interface" 2>/dev/null || true)"
+	case "$attempt_bytes_after" in ''|*[!0-9]*) attempt_bytes_after=invalid ;; esac
+	if [ "$attempt_bytes_after" != invalid ] &&
+	   [ "$attempt_bytes_after" -ge "$attempt_bytes_before" ] 2>/dev/null; then
+		attempt_consumed="$((attempt_bytes_after - attempt_bytes_before))"
+		attempt_daily_ok=true
+		record_budget "$attempt_section" "$attempt_consumed" || attempt_daily_ok=false
+		if settle_monthly_budget "$attempt_section" "$attempt_reserved_monthly" \
+		   "$attempt_reserved_month" "$attempt_consumed" &&
+		   [ "$attempt_daily_ok" = true ]; then
+			rm -f "$state_root/$attempt_section.budget-accounting-failed"
+		else
+			: > "$state_root/$attempt_section.budget-accounting-failed"
+		fi
+	else
+		# A reset or unreadable counter makes actual usage unknowable. Keep the
+		# full persistent reservation charged and stop future scheduled tests.
+		: > "$state_root/$attempt_section.budget-accounting-failed"
 	fi
 	attempt_tmp="$state_root/$attempt_section.last-attempt.$$"
 	printf '%s\n' "$attempt_finished_at" > "$attempt_tmp" &&
@@ -1134,11 +1265,27 @@ run_section() {
 	now="$3"
 	bytes_before="$4"
 	expected_fingerprint="$5"
+	traffic_budget_remaining="${6:-0}"
+	case "$traffic_budget_remaining" in ''|*[!0-9]*) traffic_budget_remaining=0 ;; esac
+	[ "$traffic_budget_remaining" -gt 0 ] 2>/dev/null || {
+		write_state "$section" deferred "Scheduled Full Auto-Tune has no remaining traffic budget"
+		return
+	}
 	backend="$(uci -q get "cake-autorate.$section.speedtest_backend" 2>/dev/null)"
 	[ -n "$backend" ] || backend=auto
+	calibration_strategy="$(uci -q get "cake-autorate.$section.autotune_calibration_strategy" 2>/dev/null)"
+	case "$calibration_strategy" in
+		shaped_only|full_raw|reuse_trusted) ;;
+		'') calibration_strategy=shaped_only ;;
+		*)
+			write_state "$section" deferred "Scheduled Full Auto-Tune calibration strategy is invalid"
+			return
+			;;
+	esac
 	profile="$(uci -q get "cake-autorate.$section.autotune_profile" 2>/dev/null)"
 	case "$profile" in
-		gaming|fair) ;;
+		gaming|variable_link|fair) ;;
+		gaming_extreme|gaming-extreme|extreme_gaming) profile=gaming ;;
 		best_overall|best-overall|balanced|'') profile=best_overall ;;
 		*)
 			write_state "$section" deferred "Scheduled Full Auto-Tune profile is invalid"
@@ -1150,9 +1297,17 @@ run_section() {
 			write_state "$section" deferred "Configuration changed before scheduled Full Auto-Tune could start"
 			return
 		}
+	reserved_monthly_budget="$traffic_budget_remaining"
+	reserved_monthly_month="$(date +%Y%m)"
+	if ! reserve_monthly_budget "$section" "$reserved_monthly_budget"; then
+		: > "$state_root/$section.budget-accounting-failed"
+		write_state "$section" deferred "Persistent monthly traffic budget could not be reserved; no test was started"
+		return
+	fi
 	write_state "$section" running "Scheduled Full Auto-Tune is running"
-	"$helper" "$section" "$interface" start "$backend" "" "" "$profile" 0 >/dev/null 2>&1 || {
-		finish_attempt_accounting "$section" "$interface" "$bytes_before"
+	"$helper" "$section" "$interface" start "$backend" "" "" "$profile" 0 "" \
+		"$traffic_budget_remaining" "$calibration_strategy" >/dev/null 2>&1 || {
+		finish_attempt_accounting "$section" "$interface" "$bytes_before" "$reserved_monthly_budget" "$reserved_monthly_month"
 		write_state "$section" failed "Unable to start scheduled Full Auto-Tune"
 		return
 	}
@@ -1160,8 +1315,9 @@ run_section() {
 	deadline="$((now + job_timeout_s))"
 	state=running
 	while [ "$(date +%s)" -lt "$deadline" ]; do
-		if ! result="$("$helper" "$section" "$interface" status "$backend" "" "" "$profile" 0 2>/dev/null)"; then
-			finish_attempt_accounting "$section" "$interface" "$bytes_before"
+		if ! result="$("$helper" "$section" "$interface" status "$backend" "" "" "$profile" 0 "" \
+			"$traffic_budget_remaining" "$calibration_strategy" 2>/dev/null)"; then
+			finish_attempt_accounting "$section" "$interface" "$bytes_before" "$reserved_monthly_budget" "$reserved_monthly_month"
 			write_state "$section" failed "Scheduled Full Auto-Tune status could not be read; no result was trusted"
 			return
 		fi
@@ -1173,19 +1329,33 @@ run_section() {
 				continue
 				;;
 			inconclusive|background-blocked)
-				finish_attempt_accounting "$section" "$interface" "$bytes_before"
+				finish_attempt_accounting "$section" "$interface" "$bytes_before" "$reserved_monthly_budget" "$reserved_monthly_month"
 				reason="$(extract "$result" '@.reason' 2>/dev/null || true)"
 				[ -n "$reason" ] || reason="$state"
 				write_state "$section" deferred "Scheduled Full Auto-Tune was inconclusive ($reason); it will retry after the safety delay"
 				return
 				;;
-			failed|cancelled|idle)
-				finish_attempt_accounting "$section" "$interface" "$bytes_before"
-				write_state "$section" failed "Scheduled Full Auto-Tune failed; no configuration was written"
+			failed)
+				finish_attempt_accounting "$section" "$interface" "$bytes_before" "$reserved_monthly_budget" "$reserved_monthly_month"
+				failure_reason="$(extract "$result" '@.speedtest_supervisor.reason' 2>/dev/null || true)"
+				case "$failure_reason" in
+					traffic-budget-exhausted)
+						write_state "$section" deferred "Scheduled Full Auto-Tune stopped at the daily traffic budget; no configuration was written"
+						;;
+					traffic-budget-counter-invalid)
+						write_state "$section" deferred "Scheduled Full Auto-Tune stopped because uplink traffic accounting became unavailable"
+						;;
+					*) write_state "$section" failed "Scheduled Full Auto-Tune failed; no configuration was written" ;;
+				esac
+				return
+				;;
+			cancelled|idle)
+				finish_attempt_accounting "$section" "$interface" "$bytes_before" "$reserved_monthly_budget" "$reserved_monthly_month"
+				write_state "$section" failed "Scheduled Full Auto-Tune did not complete; no configuration was written"
 				return
 				;;
 			*)
-				finish_attempt_accounting "$section" "$interface" "$bytes_before"
+				finish_attempt_accounting "$section" "$interface" "$bytes_before" "$reserved_monthly_budget" "$reserved_monthly_month"
 				write_state "$section" failed "Scheduled Full Auto-Tune returned an unknown state; no result was trusted"
 				return
 				;;
@@ -1195,22 +1365,23 @@ run_section() {
 		if [ "$state" = recovery-pending ]; then
 			write_state "$section" recovery-pending "Full Auto-Tune runtime recovery is still pending; the scheduler will retry only after it settles"
 		else
-			if ! "$helper" "$section" "$interface" cancel "$backend" "" "" "$profile" 0 >/dev/null 2>&1; then
+			if ! "$helper" "$section" "$interface" cancel "$backend" "" "" "$profile" 0 "" \
+				"$traffic_budget_remaining" "$calibration_strategy" >/dev/null 2>&1; then
 				write_state "$section" failed "Scheduled Full Auto-Tune timed out and cancellation could not be confirmed"
 			else
 				write_state "$section" failed "Scheduled Full Auto-Tune timed out"
 			fi
 		fi
-		finish_attempt_accounting "$section" "$interface" "$bytes_before"
+		finish_attempt_accounting "$section" "$interface" "$bytes_before" "$reserved_monthly_budget" "$reserved_monthly_month"
 		return
 	}
 
 	if [ "$(extract "$result" '@.profile' 2>/dev/null)" != "$profile" ]; then
-		finish_attempt_accounting "$section" "$interface" "$bytes_before"
+		finish_attempt_accounting "$section" "$interface" "$bytes_before" "$reserved_monthly_budget" "$reserved_monthly_month"
 		write_state "$section" failed "Scheduled Full Auto-Tune returned a different calibration profile; no result was trusted"
 		return
 	fi
-	finish_attempt_accounting "$section" "$interface" "$bytes_before"
+	finish_attempt_accounting "$section" "$interface" "$bytes_before" "$reserved_monthly_budget" "$reserved_monthly_month"
 	printf '%s\n' "$(date +%s)" > "$state_root/$section.last"
 	if [ "$(uci -q get "cake-autorate.$section.scheduled_autotune_auto_apply" 2>/dev/null)" = 1 ]; then
 		if ! result_is_auto_apply_eligible "$result"; then
@@ -1232,6 +1403,10 @@ run_section() {
 check_section() {
 	section="$1"
 	[ "$(uci -q get "cake-autorate.$section.scheduled_autotune_enabled" 2>/dev/null)" = 1 ] || return 0
+	if [ -e "$state_root/$section.budget-accounting-failed" ]; then
+		write_state "$section" deferred "Persistent monthly traffic accounting needs attention before another scheduled calibration"
+		return
+	fi
 	if recovery_transactions_pending; then
 		write_state "$section" recovery-pending "An interrupted automatic apply must be recovered before another calibration"
 		return
@@ -1253,10 +1428,17 @@ check_section() {
 	[ -s "$state_root/$section.last-attempt" ] && last_attempt="$(sed -n '1p' "$state_root/$section.last-attempt")"
 	case "$last_attempt" in ''|*[!0-9]*) last_attempt=0 ;; esac
 	[ "$((now - last_attempt))" -ge "$retry_delay_s" ] || return 0
-	budget_ready "$section" || {
+	daily_remaining_budget="$(budget_remaining_bytes "$section")" || {
 		write_state "$section" deferred "Daily traffic budget reached"
 		return
 	}
+	monthly_remaining_budget="$(monthly_budget_remaining_bytes "$section")" || {
+		write_state "$section" deferred "Monthly traffic budget reached"
+		return
+	}
+	remaining_budget="$daily_remaining_budget"
+	[ "$monthly_remaining_budget" -ge "$remaining_budget" ] 2>/dev/null ||
+		remaining_budget="$monthly_remaining_budget"
 	interface="$(uci -q get "cake-autorate.$section.wan_if" 2>/dev/null)"
 	[ -n "$interface" ] || interface="$(uci -q get "cake-autorate.$section.sqm_interface" 2>/dev/null)"
 	interface="$(resolve_interface "$interface")" || return 0
@@ -1266,7 +1448,7 @@ check_section() {
 		write_state "$section" deferred "Unable to fingerprint the instance and its owned SQM queue"
 		return
 	}
-	run_section "$section" "$interface" "$now" "$bytes" "$fingerprint"
+	run_section "$section" "$interface" "$now" "$bytes" "$fingerprint" "$remaining_budget"
 }
 
 run_loop() {
@@ -1283,6 +1465,80 @@ run_loop() {
 	done
 }
 
+scheduler_status() {
+	status_section="$1"
+	safe_uci_section "$status_section" || return 2
+	status_now="$(date +%s)"
+	status_day="$(date +%Y%m%d)"
+	status_month="$(date +%Y%m)"
+	status_daily_limit_mb="$(get_uint "$status_section" scheduled_autotune_max_traffic_mb_day 4096)"
+	status_monthly_limit_mb="$(get_uint "$status_section" scheduled_autotune_max_traffic_mb_month 16384)"
+	status_daily_limit="$((status_daily_limit_mb * 1024 * 1024))"
+	status_monthly_limit="$((status_monthly_limit_mb * 1024 * 1024))"
+	status_daily_used=0
+	status_monthly_used=0
+	status_accounting_error=false
+
+	status_daily_file="$state_root/$status_section.budget"
+	if [ -s "$status_daily_file" ]; then
+		read -r status_saved_day status_daily_used < "$status_daily_file"
+		[ "$status_saved_day" = "$status_day" ] || status_daily_used=0
+	fi
+	case "$status_daily_used" in ''|*[!0-9]*) status_daily_used=0; status_accounting_error=true ;; esac
+
+	status_monthly_file="$budget_store_root/$status_section.monthly"
+	if [ -L "$budget_store_root" ] || [ -L "$status_monthly_file" ]; then
+		status_accounting_error=true
+	elif [ -s "$status_monthly_file" ]; then
+		read -r status_saved_month status_monthly_used < "$status_monthly_file"
+		[ "$status_saved_month" = "$status_month" ] || status_monthly_used=0
+	fi
+	case "$status_monthly_used" in ''|*[!0-9]*) status_monthly_used=0; status_accounting_error=true ;; esac
+	[ ! -e "$state_root/$status_section.budget-accounting-failed" ] || status_accounting_error=true
+
+	status_daily_remaining="$((status_daily_limit - status_daily_used))"
+	status_monthly_remaining="$((status_monthly_limit - status_monthly_used))"
+	[ "$status_daily_remaining" -ge 0 ] || status_daily_remaining=0
+	[ "$status_monthly_remaining" -ge 0 ] || status_monthly_remaining=0
+
+	status_interval_h="$(get_uint "$status_section" scheduled_autotune_interval_hours 24)"
+	status_last=0
+	status_last_attempt=0
+	[ ! -s "$state_root/$status_section.last" ] || status_last="$(sed -n '1p' "$state_root/$status_section.last")"
+	[ ! -s "$state_root/$status_section.last-attempt" ] || status_last_attempt="$(sed -n '1p' "$state_root/$status_section.last-attempt")"
+	case "$status_last" in ''|*[!0-9]*) status_last=0 ;; esac
+	case "$status_last_attempt" in ''|*[!0-9]*) status_last_attempt=0 ;; esac
+	status_next_due="$((status_last + status_interval_h * 3600))"
+	status_retry_due="$((status_last_attempt + retry_delay_s))"
+	[ "$status_retry_due" -le "$status_next_due" ] || status_next_due="$status_retry_due"
+	[ "$status_next_due" -ge "$status_now" ] || status_next_due="$status_now"
+
+	status_state=idle
+	status_message=
+	status_updated=0
+	if [ -s "$state_root/$status_section.json" ]; then
+		status_state_json="$(sed -n '1p' "$state_root/$status_section.json")"
+		status_state="$(extract "$status_state_json" '@.state' 2>/dev/null || printf idle)"
+		status_message="$(extract "$status_state_json" '@.message' 2>/dev/null || true)"
+		status_updated="$(extract "$status_state_json" '@.updated_at' 2>/dev/null || printf 0)"
+	fi
+	case "$status_updated" in ''|*[!0-9]*) status_updated=0 ;; esac
+	status_enabled=false
+	[ "$(uci -q get "cake-autorate.$status_section.scheduled_autotune_enabled" 2>/dev/null)" != 1 ] || status_enabled=true
+
+	printf '{"instance":"%s","enabled":%s,"state":"%s","message":"%s","updated_at":%s,' \
+		"$(json_escape "$status_section")" "$status_enabled" "$(json_escape "$status_state")" \
+		"$(json_escape "$status_message")" "$status_updated"
+	printf '"next_due_at":%s,"window_start_hour":%s,"window_end_hour":%s,' \
+		"$status_next_due" "$(get_uint "$status_section" scheduled_autotune_window_start_hour 2)" \
+		"$(get_uint "$status_section" scheduled_autotune_window_end_hour 5)"
+	printf '"daily":{"limit_bytes":%s,"used_bytes":%s,"remaining_bytes":%s},' \
+		"$status_daily_limit" "$status_daily_used" "$status_daily_remaining"
+	printf '"monthly":{"limit_bytes":%s,"used_bytes":%s,"remaining_bytes":%s},' \
+		"$status_monthly_limit" "$status_monthly_used" "$status_monthly_remaining"
+	printf '"accounting_error":%s}\n' "$status_accounting_error"
+}
+
 [ "${CAKE_AUTOTUNE_SCHEDULER_SOURCE_ONLY:-0}" = 1 ] && return 0 2>/dev/null
 
 case "${1:-run}" in
@@ -1294,5 +1550,6 @@ case "${1:-run}" in
 		}
 		check_section "$2"
 		;;
-	*) printf 'usage: %s [run|check INSTANCE]\n' "$0" >&2; exit 2 ;;
+	status) scheduler_status "${2:-}" ;;
+	*) printf 'usage: %s [run|check INSTANCE|status INSTANCE]\n' "$0" >&2; exit 2 ;;
 esac

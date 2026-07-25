@@ -16,6 +16,10 @@ if (!String.prototype.format) {
 const sourcePath = path.join(__dirname, '..', 'htdocs', 'luci-static', 'resources',
 	'view', 'cake-autorate-rs', 'graphs.js');
 const source = fs.readFileSync(sourcePath, 'utf8');
+for (const [index, button] of source.split("E('button', {").slice(1).entries()) {
+	assert(button.slice(0, 160).includes("'type': 'button'"),
+		`custom graph button ${index + 1} must not submit the LuCI form`);
+}
 const marker = 'return L.view.extend';
 const prefix = source.slice(0, source.indexOf(marker));
 const windowStub = {
@@ -84,7 +88,7 @@ assert(helpers.formatMemoryKib(null) === '-', 'missing memory must not look like
 
 const now = Math.floor(Date.now() / 1000);
 const points = helpers.parseHistory([
-	`${now - 2},10.125,1.5,1000.0,500.0,20.5,22.0,600.0,300.0,ACTIVE,mwan3|wan|pppoe-wan|198.51.100.1|0x100|1,A+,final,1.25,DL,20,7`,
+	`${now - 2},10.125,1.5,1000.0,500.0,20.5,22.0,600.0,300.0,ACTIVE,mwan3|wan|pppoe-wan|198.51.100.1|0x100|1,A+,final,1.25,DL,20,7,probe_observe,cruise,probe target reached,initialized,monitoring,no_cake_effect,HEALTHY`,
 	`${now - 1},,2.5,2000.0,750.0`,
 	`${now},12.500,3.5,3000.0,1000.0`,
 ].join('\n'));
@@ -100,6 +104,10 @@ assert(points[0].grade === 'A+' && points[0].gradeState === 'final' && points[0]
 	'quality-grade event parsing failed');
 assert(points[0].ratingPhase === 'DL' && points[0].ratingDlSamples === 20 && points[0].ratingUlSamples === 7,
 	'rating progress event parsing failed');
+assert(points[0].adaptiveDlPhase === 'probe_observe' &&
+	points[0].adaptiveDlReason === 'probe target reached' &&
+	points[0].causalUlState === 'no_cake_effect' && points[0].sqmRuntimeState === 'HEALTHY',
+	'adaptive/recovery event columns failed');
 
 const legacy = helpers.parseHistory(`${now},9.5,4.0`);
 assert(legacy.length === 1 && legacy[0].dl === null && legacy[0].ul === null,
@@ -150,6 +158,22 @@ assert(layouts.every(layout => layout.lane >= -1 && layout.lane < 3),
 	'cluster labels must stay in bounded non-overlapping lanes');
 assert(layouts.every(layout => !layout.label || layout.label.length < 40),
 	'crowded event labels must abbreviate while hover retains full data');
+
+const adaptiveEvents = helpers.collectChartEvents(helpers.buildChartGeometry([
+	{ timestamp: now - 4, uplinkState: 'ACTIVE', routeIdentity: 'a', adaptiveDlPhase: 'cruise', adaptiveDlReason: 'initialized', causalDlState: 'monitoring', causalUlState: 'monitoring', sqmRuntimeState: 'HEALTHY' },
+	{ timestamp: now - 3, uplinkState: 'ACTIVE', routeIdentity: 'a', adaptiveDlPhase: 'probe_ramp', adaptiveDlReason: 'bounded probe opened', causalDlState: 'monitoring', causalUlState: 'monitoring', sqmRuntimeState: 'HEALTHY' },
+	{ timestamp: now - 2, uplinkState: 'ACTIVE', routeIdentity: 'a', adaptiveDlPhase: 'backoff', adaptiveDlReason: 'probe confirmed safe', causalDlState: 'monitoring', causalUlState: 'monitoring', sqmRuntimeState: 'RECOVERING' },
+	{ timestamp: now - 1, uplinkState: 'ACTIVE', routeIdentity: 'a', adaptiveDlPhase: 'cruise', adaptiveDlReason: 'probe cooldown complete', causalDlState: 'no_cake_effect', causalUlState: 'monitoring', sqmRuntimeState: 'HEALTHY' },
+], 1, { clientWidth: 700 }));
+assert(adaptiveEvents.some(event => event.label === 'DL upward probe'),
+	'upward probes must be annotated');
+assert(adaptiveEvents.some(event => event.label === 'DL safe bound promoted'),
+	'safe-bound promotions must be annotated');
+assert(adaptiveEvents.some(event => event.label === 'DL no CAKE effect'),
+	'causal no-effect must be annotated');
+assert(adaptiveEvents.some(event => event.label === 'SQM recovery') &&
+	adaptiveEvents.some(event => event.label === 'SQM recovered'),
+	'recovery begin/end must be annotated');
 
 const zeroProgressEvents = helpers.collectChartEvents(helpers.buildChartGeometry([
 	{ timestamp: now - 1, uplinkState: 'ACTIVE', routeIdentity: 'a', ratingPhase: 'IDLE' },

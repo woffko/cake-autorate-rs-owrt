@@ -11,10 +11,12 @@ if [ "${1:-}" = job-start-harness ]; then
 	export CAKE_AUTORATE_RUNTIME_LOCK_ROOT="$harness_work/runtime-locks"
 	export CAKE_AUTORATE_SPEEDTEST_JOB_DIR="$harness_work/jobs"
 	export CAKE_AUTORATE_SPEEDTEST_SELF="$harness_work/bin/job-worker"
+	export PATH="$base/tests/fixtures/quality-test:$PATH"
 	: > "$harness_work/caller-$label.ready"
 	while [ ! -e "$harness_work/callers.go" ]; do sleep 0.01; done
 	set -- wan eth0 '' '' '' '' '' ''
 	CAKE_AUTORATE_SPEEDTEST_SOURCE_ONLY=1 . "$script"
+	refresh_backend_bins
 	section=wan
 	target_if_override=eth0
 	preferred_backend=speedtest-go
@@ -37,7 +39,12 @@ if [ "${1:-}" = recovery-worker ]; then
 	export CAKE_AUTORATE_SQM_CONFIG_FILE="$harness_work/config/sqm"
 	export SQM_STATE_DIR="$harness_work/sqm-state"
 	export CAKE_TEST_AUTORATE_PID="$autorate_pid"
-	set -- wan eth0 '' '' '' '' '' ''
+	if [ "$recovery_behavior" = crash-ingress ]; then
+		export CAKE_AUTORATE_SPEEDTEST_BYPASS_SCOPE=ingress
+		set -- wan eth0 '' '' '' '' '' download
+	else
+		set -- wan eth0 '' '' '' '' '' ''
+	fi
 	CAKE_AUTORATE_SPEEDTEST_SOURCE_ONLY=1 . "$script"
 	section=wan
 	target_if=eth0
@@ -76,6 +83,11 @@ if [ "${1:-}" = recovery-worker ]; then
 	fi
 	prepare_speedtest_calibration
 	: > "$harness_work/calibration.prepared"
+	if [ "$recovery_behavior" = bounded-retry ]; then
+		restore_speedtest_calibration_bounded
+		release_interface_lock
+		exit 0
+	fi
 		if [ "$recovery_behavior" = restore-fail ]; then
 		if restore_speedtest_calibration; then
 			echo "failed immutable SQM recovery was accepted" >&2
@@ -195,7 +207,7 @@ cleanup_test() {
 	[ -z "$autorate_pid" ] || kill -CONT "$autorate_pid" 2>/dev/null || true
 	[ -z "$autorate_pid" ] || kill "$autorate_pid" 2>/dev/null || true
 	[ -z "$autorate_pid" ] || wait "$autorate_pid" 2>/dev/null || true
-	rm -rf "$work"
+	[ "${CAKE_TEST_KEEP_WORK:-0}" = 1 ] || rm -rf "$work"
 }
 trap cleanup_test EXIT INT TERM
 
@@ -271,6 +283,69 @@ export CAKE_AUTORATE_RUNTIME_LOCK_ROOT="$work/runtime-locks"
 
 set -- test eth0 '' '' '' '' ''
 CAKE_AUTORATE_SPEEDTEST_SOURCE_ONLY=1 . "$script"
+
+# Directional raw controls must remove only the selected managed CAKE path.
+# The opposite direction remains shaped until immutable recovery restores the
+# complete SQM transaction after the measurement.
+cat > "$work/bin/tc" <<'EOF'
+#!/bin/sh
+state="$(sed -n '1p' "$CAKE_TEST_DIRECTIONAL_TC_STATE" 2>/dev/null)"
+[ -n "$state" ] || state=healthy
+case "$*" in
+	'-details qdisc show dev eth0')
+		[ "$state" = egress-bypassed ] || printf 'qdisc cake 8001: root bandwidth 80Mbit\n'
+		[ "$state" = egress-bypassed ] && printf 'qdisc fq_codel 0: root\n'
+		[ "$state" = ingress-bypassed ] || printf 'qdisc ingress ffff: parent ffff:fff1\n'
+		;;
+	'-details qdisc show dev ifb4eth0')
+		printf 'qdisc cake 8002: root bandwidth 100Mbit\n'
+		;;
+	'filter show dev eth0 ingress')
+		[ "$state" = ingress-bypassed ] || printf 'action order 1: mirred (Egress Redirect to device ifb4eth0) stolen\n'
+		;;
+	'qdisc del dev eth0 ingress')
+		[ "$state" = healthy ] || exit 1
+		printf 'ingress-bypassed\n' > "$CAKE_TEST_DIRECTIONAL_TC_STATE"
+		;;
+	'qdisc del dev eth0 root')
+		[ "$state" = healthy ] || exit 1
+		printf 'egress-bypassed\n' > "$CAKE_TEST_DIRECTIONAL_TC_STATE"
+		;;
+	*) printf 'unexpected tc argv: %s\n' "$*" >&2; exit 1 ;;
+esac
+EOF
+cat > "$work/bin/sqm-recover-check" <<'EOF'
+#!/bin/sh
+[ "$#" -eq 2 ] && [ "$1" = wan ] && [ "$2" = check ] || exit 1
+printf 'checked\n' >> "$CAKE_TEST_DIRECTIONAL_CHECK_LOG"
+EOF
+chmod +x "$work/bin/tc" "$work/bin/sqm-recover-check"
+export PATH="$work/bin:$PATH"
+export CAKE_TEST_DIRECTIONAL_TC_STATE="$work/directional-tc.state"
+export CAKE_TEST_DIRECTIONAL_CHECK_LOG="$work/directional-check.log"
+section=wan
+target_if=eth0
+calibration_sqm_managed=1
+calibration_sqm_ul_if=eth0
+calibration_sqm_dl_if=ifb4eth0
+sqm_recover_bin="$work/bin/sqm-recover-check"
+warning=""
+printf 'healthy\n' > "$CAKE_TEST_DIRECTIONAL_TC_STATE"
+prepare_directional_sqm_bypass ingress || fail_test "managed ingress-only bypass failed"
+[ "$(sed -n '1p' "$CAKE_TEST_DIRECTIONAL_TC_STATE")" = ingress-bypassed ] ||
+	fail_test "ingress-only bypass removed the wrong qdisc"
+[ "$calibration_sqm_bypass_mode" = ingress-only-managed ] &&
+	[ "$calibration_sqm_paused" = false ] ||
+	fail_test "ingress-only bypass evidence is inconsistent"
+printf 'healthy\n' > "$CAKE_TEST_DIRECTIONAL_TC_STATE"
+prepare_directional_sqm_bypass egress || fail_test "managed egress-only bypass failed"
+[ "$(sed -n '1p' "$CAKE_TEST_DIRECTIONAL_TC_STATE")" = egress-bypassed ] ||
+	fail_test "egress-only bypass removed the wrong qdisc"
+[ "$calibration_sqm_bypass_mode" = egress-only-managed ] &&
+	[ "$calibration_sqm_paused" = false ] ||
+	fail_test "egress-only bypass evidence is inconsistent"
+[ "$(wc -l < "$CAKE_TEST_DIRECTIONAL_CHECK_LOG")" -eq 2 ] ||
+	fail_test "directional bypass skipped exact managed-SQM preflight"
 
 grep -qx 'trap cleanup EXIT' "$script" || fail_test "speedtest EXIT cleanup trap is missing"
 grep -qx "trap 'exit 129' HUP" "$script" || fail_test "speedtest HUP handler does not preserve cleanup"
@@ -592,10 +667,6 @@ grep -q 'USERID:=cake-speedtest:cake-speedtest' "$base/Makefile" ||
 # record instead of launching a duplicate heavy test.
 cat > "$work/bin/job-worker" <<'EOF'
 #!/bin/sh
-if [ "${CAKE_AUTORATE_SPEEDTEST_JOB_START_STOPPED:-0}" = 1 ]; then
-	kill -STOP "$$" || exit 1
-	unset CAKE_AUTORATE_SPEEDTEST_JOB_START_STOPPED
-fi
 exec 7>>"$CAKE_TEST_JOB_WORK/worker-count.guard" || exit 1
 flock -x 7 || exit 1
 count="$(sed -n '1p' "$CAKE_TEST_JOB_WORK/worker-count" 2>/dev/null || true)"
@@ -608,6 +679,19 @@ exec 7>&-
 while [ ! -e "$CAKE_TEST_JOB_WORK/worker-release" ]; do sleep 0.02; done
 EOF
 chmod +x "$work/bin/job-worker"
+cat > "$work/bin/procd-job" <<'EOF'
+#!/bin/sh
+[ "$1" = launch ] || exit 1
+shift 4
+command="$1"
+shift
+setsid "$command" "$@" </dev/null >>"$CAKE_TEST_JOB_WORK/procd-worker.log" 2>&1 6>&- &
+pid="$!"
+start="$(sed 's/^.*) //' "/proc/$pid/stat" | awk '{ print $20; exit }')"
+printf '{"pid":%s,"starttime":%s}\n' "$pid" "$start"
+EOF
+chmod +x "$work/bin/procd-job"
+export CAKE_AUTORATE_PROCD_JOB="$work/bin/procd-job"
 export CAKE_TEST_JOB_WORK="$work"
 : > "$work/worker-count"
 "$0" job-start-harness "$work" one > "$work/caller-one.out" 2> "$work/caller-one.err" &
@@ -697,6 +781,11 @@ esac
 EOF
 cat > "$work/bin/sqm-recover" <<'EOF'
 #!/bin/sh
+[ "$#" -ne 2 ] || {
+	[ "$1" = wan ] && [ "$2" = check ] || exit 1
+	[ "$(sed -n '1p' "$CAKE_TEST_DIRECTIONAL_TC_STATE" 2>/dev/null)" = healthy ]
+	exit $?
+}
 printf '%s %s %s %s %s %s %s\n' "$1" "$2" "$3" "$4" "$5" "$6" "$7" >> "$CAKE_TEST_JOB_WORK/sqm-recover-args"
 [ "$#" -eq 7 ] && [ "$1" = wan ] && [ "$2" = cake_wan ] &&
 	[ "$3" = eth0 ] && [ "$4" = eth0 ] && [ "$5" = ifb4eth0 ] || exit 1
@@ -711,7 +800,16 @@ digest="$(uci -q -c "$snapshot_dir" show "sqm.$2" | LC_ALL=C sort | sha256sum | 
 rm -f "$snapshot_dir/sqm"
 rmdir "$snapshot_dir"
 [ "$6" = "sha256:$digest" ] || exit 1
+[ -z "${CAKE_TEST_SQM_RECOVER_FAIL_COUNT_FILE:-}" ] || {
+	remaining="$(sed -n '1p' "$CAKE_TEST_SQM_RECOVER_FAIL_COUNT_FILE" 2>/dev/null)"
+	case "$remaining" in ''|*[!0-9]*) remaining=0 ;; esac
+	if [ "$remaining" -gt 0 ]; then
+		printf '%s\n' "$((remaining - 1))" > "$CAKE_TEST_SQM_RECOVER_FAIL_COUNT_FILE"
+		exit 1
+	fi
+}
 [ "${CAKE_TEST_SQM_RECOVER_FAIL:-0}" != 1 ] || exit 1
+printf 'healthy\n' > "$CAKE_TEST_DIRECTIONAL_TC_STATE"
 "$CAKE_AUTORATE_SQM_RUN" start eth0 >/dev/null 2>&1 || exit 1
 [ -f "$SQM_STATE_DIR/eth0.state" ]
 EOF
@@ -731,6 +829,28 @@ CAKE_TEST_MANAGE_SQM=0 "$0" recovery-worker "$work" "$autorate_pid" unmanaged \
 wait_for_process_state_test "$autorate_pid" running || fail_test "unmanaged preflight paused autorate"
 if grep -qx stop "$work/sqm-actions"; then fail_test "unmanaged preflight stopped SQM"; fi
 wait_for_recovery_cleanup || fail_test "unmanaged preflight stranded recovery metadata"
+kill "$autorate_pid"
+wait "$autorate_pid" 2>/dev/null || true
+autorate_pid=""
+
+# A short native SQM/hotplug race after a completed transfer must be retried
+# under the same immutable snapshot instead of turning a valid speed sample
+# into an immediate terminal Auto-Tune failure.
+: > "$work/sqm-state/eth0.state"
+: > "$work/sqm-actions"
+printf '2\n' > "$work/sqm-recover-fail-count"
+sh -c 'while :; do sleep 1; done' &
+autorate_pid="$!"
+CAKE_TEST_SQM_RECOVER_FAIL_COUNT_FILE="$work/sqm-recover-fail-count" \
+CAKE_AUTORATE_SPEEDTEST_RESTORE_ATTEMPTS=4 \
+CAKE_AUTORATE_SPEEDTEST_RESTORE_RETRY_DELAY_S=0 \
+	"$0" recovery-worker "$work" "$autorate_pid" bounded-retry \
+	> "$work/bounded-restore.out" 2> "$work/bounded-restore.err" ||
+	fail_test "bounded exact SQM restoration did not recover from transient failures"
+wait_for_process_state_test "$autorate_pid" running || fail_test "bounded restoration did not resume autorate"
+[ -f "$work/sqm-state/eth0.state" ] || fail_test "bounded restoration did not restore SQM"
+[ "$(sed -n '1p' "$work/sqm-recover-fail-count")" = 0 ] || fail_test "bounded restoration did not consume transient failures"
+wait_for_recovery_cleanup || fail_test "bounded restoration stranded recovery metadata"
 kill "$autorate_pid"
 wait "$autorate_pid" 2>/dev/null || true
 autorate_pid=""
@@ -789,6 +909,33 @@ wait_for_process_state_test "$autorate_pid" running || fail_test "snapshot recov
 [ -f "$work/sqm-state/eth0.state" ] || fail_test "snapshot recovery did not restore SQM"
 [ "$(grep -c '^start$' "$work/sqm-actions")" -eq 1 ] || fail_test "snapshot recovery performed an extra SQM start"
 wait_for_recovery_cleanup || fail_test "snapshot recovery stranded recovery metadata"
+kill "$autorate_pid"
+wait "$autorate_pid" 2>/dev/null || true
+autorate_pid=""
+
+# A crash after an ingress-only deletion carries the same durable restoration
+# obligation as a full stop. Recovery must restore both CAKE directions before
+# resuming autorate, even though the native SQM state marker never disappeared.
+rm -f "$work/calibration.prepared" "$work/calibration.release"
+: > "$work/sqm-state/eth0.state"
+: > "$work/sqm-actions"
+printf 'healthy\n' > "$CAKE_TEST_DIRECTIONAL_TC_STATE"
+sh -c 'while :; do sleep 1; done' &
+autorate_pid="$!"
+"$0" recovery-worker "$work" "$autorate_pid" crash-ingress \
+	> "$work/recovery-ingress.out" 2> "$work/recovery-ingress.err" &
+recovery_worker_pid="$!"
+wait_for_file "$work/calibration.prepared" "$recovery_worker_pid"
+wait_for_process_state_test "$autorate_pid" stopped || fail_test "directional crash did not pause autorate"
+[ "$(sed -n '1p' "$CAKE_TEST_DIRECTIONAL_TC_STATE")" = ingress-bypassed ] ||
+	fail_test "directional crash harness did not bypass ingress only"
+kill -KILL "$recovery_worker_pid"
+wait "$recovery_worker_pid" 2>/dev/null || true
+recovery_worker_pid=""
+wait_for_recovery_cleanup || fail_test "directional crash recovery stranded metadata"
+wait_for_process_state_test "$autorate_pid" running || fail_test "directional crash recovery did not resume autorate"
+[ "$(sed -n '1p' "$CAKE_TEST_DIRECTIONAL_TC_STATE")" = healthy ] ||
+	fail_test "directional crash recovery did not restore complete SQM"
 kill "$autorate_pid"
 wait "$autorate_pid" 2>/dev/null || true
 autorate_pid=""
