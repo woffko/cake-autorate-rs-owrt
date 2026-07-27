@@ -5,7 +5,7 @@ root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 REAL_UCI_BIN="$(command -v uci 2>/dev/null || true)"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT INT TERM
-mkdir -p "$tmp/bin" "$tmp/state" "$tmp/locks"
+mkdir -p "$tmp/bin" "$tmp/state" "$tmp/locks" "$tmp/sys/class/net/eth0/statistics"
 log="$tmp/commands.log"
 count="$tmp/service-count"
 sha_count="$tmp/sha-count"
@@ -338,6 +338,7 @@ export TEST_ROUTE_COUNT="$route_count"
 export TEST_LOCK_ROOT="$tmp/locks"
 export CAKE_AUTOTUNE_SCHEDULER_STATE_ROOT="$tmp/state"
 export CAKE_AUTOTUNE_BUDGET_STORE_ROOT="$tmp/persistent-budget"
+export CAKE_AUTOTUNE_SYS_CLASS_NET="$tmp/sys/class/net"
 export CAKE_AUTOTUNE_SERVICE="$tmp/service"
 export CAKE_AUTOTUNE_ROUTE_HELPER="$tmp/route-helper"
 export CAKE_AUTORATE_RUNTIME_LOCK_ROOT="$tmp/locks"
@@ -356,7 +357,7 @@ record_monthly_budget test 1234
 read -r persisted_month persisted_bytes < "$CAKE_AUTOTUNE_BUDGET_STORE_ROOT/test.monthly"
 [ "$persisted_month" = "$(date +%Y%m)" ]
 [ "$persisted_bytes" = 1234 ]
-[ "$(monthly_budget_remaining_bytes test)" = "$((16384 * 1024 * 1024 - 1234))" ]
+[ "$(monthly_budget_remaining_bytes test)" = 17179867950 ]
 # Reservation is charged before a job starts, then atomically replaced with
 # measured usage.  A reservation intentionally remains charged after a crash.
 reserve_monthly_budget test 4096
@@ -366,7 +367,7 @@ read -r persisted_month persisted_bytes < "$CAKE_AUTOTUNE_BUDGET_STORE_ROOT/test
 reserve_monthly_budget test 8192
 read -r persisted_month persisted_bytes < "$CAKE_AUTOTUNE_BUDGET_STORE_ROOT/test.monthly"
 [ "$persisted_bytes" = 11426 ]
-[ "$(monthly_budget_remaining_bytes test)" = "$((16384 * 1024 * 1024 - 11426))" ]
+[ "$(monthly_budget_remaining_bytes test)" = 17179857758 ]
 # Crossing a month boundary must not subtract an old reservation from the new
 # ledger. Charge the complete observed delta to the new month instead.
 printf '%s %s\n' 190001 4096 > "$CAKE_AUTOTUNE_BUDGET_STORE_ROOT/test.monthly"
@@ -374,6 +375,18 @@ settle_monthly_budget test 4096 190001 2000
 read -r persisted_month persisted_bytes < "$CAKE_AUTOTUNE_BUDGET_STORE_ROOT/test.monthly"
 [ "$persisted_month" = "$(date +%Y%m)" ]
 [ "$persisted_bytes" = 2000 ]
+rm -f "$CAKE_AUTOTUNE_BUDGET_STORE_ROOT/test.monthly"
+[ "$(budget_remaining_bytes test)" = 4294967296 ]
+[ "$(monthly_budget_remaining_bytes test)" = 17179869184 ]
+[ "$(uint53_add 4000000000 5000000000)" = 9000000000 ]
+[ "$(uint53_subtract 15000000000 9000000000)" = 6000000000 ]
+[ "$(uint53_multiply 16384 1048576)" = 17179869184 ]
+! uint53_add 9007199254740991 1 >/dev/null
+printf '%s\n' 4000000000 > "$CAKE_AUTOTUNE_SYS_CLASS_NET/eth0/statistics/rx_bytes"
+printf '%s\n' 5000000000 > "$CAKE_AUTOTUNE_SYS_CLASS_NET/eth0/statistics/tx_bytes"
+[ "$(interface_bytes eth0)" = 9000000000 ]
+record_monthly_budget test 8589934592
+[ "$(monthly_budget_remaining_bytes test)" = 8589934592 ]
 rm -f "$CAKE_AUTOTUNE_BUDGET_STORE_ROOT/test.monthly"
 scheduler_snapshot="$(scheduler_status test)"
 case "$scheduler_snapshot" in

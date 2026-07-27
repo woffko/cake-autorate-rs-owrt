@@ -536,7 +536,13 @@ measure_quiet_background() {
 	reference_ul="$(status_value '.cake_ul_rate_kbps')"
 	reference_dl="$(numeric_or_default "$reference_dl" 0)"
 	reference_ul="$(numeric_or_default "$reference_ul" 0)"
-	awk -v dl="$reference_dl" -v ul="$reference_ul" 'BEGIN { exit !(dl > 0 && ul > 0) }' || {
+	sqm_direction_mode="$("$uci_bin" -q get "cake-autorate.$section.sqm_direction_mode" 2>/dev/null)"
+	[ -n "$sqm_direction_mode" ] || sqm_direction_mode="both"
+	awk -v dl="$reference_dl" -v ul="$reference_ul" -v mode="$sqm_direction_mode" 'BEGIN {
+		if (mode == "upload_only") exit !(ul > 0)
+		if (mode == "download_only") exit !(dl > 0)
+		exit !(dl > 0 && ul > 0)
+	}' || {
 		failure="Current CAKE rate references are unavailable."
 		return 1
 	}
@@ -554,7 +560,12 @@ measure_quiet_background() {
 		current_dl="$(numeric_or_default "$(status_value '.dl_achieved_rate_kbps')" 0)"
 		current_ul="$(numeric_or_default "$(status_value '.ul_achieved_rate_kbps')" 0)"
 		if awk -v dl="$current_dl" -v ul="$current_ul" -v dlmax="$limit_dl" -v ulmax="$limit_ul" \
-			'BEGIN { exit !(dl <= dlmax && ul <= ulmax) }'; then
+			-v mode="$sqm_direction_mode" \
+			'BEGIN {
+				if (mode == "upload_only") exit !(ul <= ulmax)
+				if (mode == "download_only") exit !(dl <= dlmax)
+				exit !(dl <= dlmax && ul <= ulmax)
+			}'; then
 			quiet_count=$((quiet_count + 1))
 			sum_dl="$(awk -v sum="$sum_dl" -v value="$current_dl" 'BEGIN { printf "%.3f", sum + value }')"
 			sum_ul="$(awk -v sum="$sum_ul" -v value="$current_ul" 'BEGIN { printf "%.3f", sum + value }')"
@@ -800,10 +811,14 @@ worker() {
 	write_running_status "Rating capture armed; background is DL $background_dl_kbps / UL $background_ul_kbps kbit/s."
 
 	if [ "$capture_mode" = automatic ]; then
-		run_automatic_direction download ||
-			worker_fail "${failure:-Automatic download did not collect enough clean samples.}"
-		run_automatic_direction upload ||
-			worker_fail "${failure:-Automatic upload did not collect enough clean samples.}"
+		if [ "$sqm_direction_mode" != "upload_only" ]; then
+			run_automatic_direction download ||
+				worker_fail "${failure:-Automatic download did not collect enough clean samples.}"
+		fi
+		if [ "$sqm_direction_mode" != "download_only" ]; then
+			run_automatic_direction upload ||
+				worker_fail "${failure:-Automatic upload did not collect enough clean samples.}"
+		fi
 		set_capture_phase IDLE || worker_fail "Unable to close the automatic rating phases."
 		write_running_status "Load generation finished; waiting for the rating window to finalize."
 	else

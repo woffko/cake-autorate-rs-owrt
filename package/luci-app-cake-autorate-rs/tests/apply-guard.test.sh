@@ -2,15 +2,34 @@
 set -eu
 
 base="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-helper="$base/root/usr/libexec/cake-autorate-rs/apply-guard"
+helper_real="$base/root/usr/libexec/cake-autorate-rs/apply-guard"
 fixtures="$base/tests/fixtures/apply-guard"
 runtime_lock="$(CDPATH= cd -- "$base/../cake-autorate-rs/files/usr/libexec/cake-autorate-rs" && pwd)/runtime-lock"
 work="${TMPDIR:-/tmp}/cake-apply-guard-test.$$"
+helper="$work/apply-guard-wrapper"
 config="$work/config"
 autotune="$work/autotune"
 guard="$work/guard"
 mkdir -p "$config" "$autotune/wan_sqm" "$work/sys/pppoe-wan" "$work/sys/ifb4pppoe-wan" "$work/proc/200"
-trap 'rm -rf "$work"' EXIT INT TERM
+cat > "$helper" <<EOF
+#!/bin/sh
+if [ "\${1:-}" = arm ]; then
+	case "\${9:-}" in
+		disable_sqm) exec "$helper_real" "\$@" p-222222222222222222222222 ;;
+		*) exec "$helper_real" "\$@" p-111111111111111111111111 ;;
+	esac
+fi
+exec "$helper_real" "\$@"
+EOF
+chmod 700 "$helper"
+cleanup_test_work() {
+	if [ "${CAKE_AUTORATE_KEEP_TEST_WORK:-0}" = 1 ]; then
+		printf 'Preserved apply-guard test workspace: %s\n' "$work" >&2
+	else
+		rm -rf "$work"
+	fi
+}
+trap cleanup_test_work EXIT INT TERM
 printf '%s\n' '11111111-2222-3333-4444-555555555555' > "$work/boot-id"
 
 export PATH="$fixtures:$PATH"
@@ -80,10 +99,26 @@ cat > "$autotune/wan_sqm/result.json" <<EOF
   "route_identity":"main||pppoe-wan|192.0.2.10||main",
   "config_fingerprint":"$fingerprint",
   "runs":[{"backend":"speedtest-go","server_id":"17372"}],
+	"proposals":[
+	  {"schema_version":1,"proposal_id":"p-111111111111111111111111","rank":1,
+	    "action":"apply_sqm","topology":"both_shaped","is_primary":true,
+	    "applicable":true,"hard_safety_pass":true,"profile_target_met":true,
+	    "profile_objectives_met":true,"grade":"A","effective_delta_ms":10,
+	    "confidence_percent":100,"unmet_objectives":[],
+	    "evidence":{"validation":"validation","confirmation":"bidirectional_confirmation"},
+	    "configuration":{}},
+	  {"schema_version":1,"proposal_id":"p-222222222222222222222222","rank":2,
+	    "action":"disable_sqm","topology":"no_sqm","is_primary":false,
+	    "applicable":true,"hard_safety_pass":true,"profile_target_met":true,
+	    "profile_objectives_met":true,"grade":"A","effective_delta_ms":10,
+	    "confidence_percent":100,"unmet_objectives":[],
+	    "evidence":{"control":"fair_outcome.no_sqm_control"},"configuration":null}
+	],
   "validation_thresholds":{"candidate_realization_min_percent":80,
     "candidate_realization_max_percent":110,"capacity_retention_min_percent":80,
     "throughput_safety_floor_percent":50,
-    "delay_max_ms":30,"loss_max_percent":3,"cpu_max_percent":85},
+    "delay_max_ms":30,"manual_latency_review_max_ms":60,
+    "loss_max_percent":3,"cpu_max_percent":85},
   "validation":{"profile":"best_overall","pass":true,"hard_pass":true,"safety_pass":true,
     "profile_objectives_met":true,"quality_target_met":true,"actual_grade":"A","effective_delta_ms":10,
     "contaminated":false,"candidate_base":{"download_kbps":80000,"upload_kbps":20000},
@@ -93,7 +128,15 @@ cat > "$autotune/wan_sqm/result.json" <<EOF
 	    "capacity_floor_met":true,"throughput_safety_floor_percent":50,
 	    "throughput_safety_floor_met":true,"deep_runtime_minimum":false,
 	    "runtime_minimum_retention":null,"infeasible_reason":"","manual_only":false,
-	    "selected_pair":{"download_kbps":80000,"upload_kbps":20000}},
+	    "selected_pair":{"download_kbps":80000,"upload_kbps":20000},
+	    "bidirectional_confirmation":{"tested":true,"safety_pass":true,"auto_apply_pass":true,
+	      "effective_delta_ms":10,"loss_percent":0}},
+	"bidirectional_confirmation":{"tested":true,"safety_pass":true,"auto_apply_pass":true,
+	  "grade":"A","target_rates_kbps":{"download":80000,"upload":20000},
+	  "achieved_kbps":{"download":80000,"upload":20000},
+	  "realization_percent":{"download":100,"upload":100},
+	  "effective_delta_ms":10,"icmp_delta_ms":5,"transport_delta_ms":10,
+	  "loss_percent":0,"cpu_peak_percent":40,"cpu_warning":false,"advisory_reason":"none"},
   "profile_search":{
     "download":{"schema_version":2,"profile":"best_overall","direction":"download",
       "action":"complete","selected":{"candidate_kbps":80000,"safety_pass":true,"target_met":true}},
@@ -126,6 +169,13 @@ cat > "$autotune/wan_sqm/result.json" <<EOF
   }
 }
 EOF
+node - "$autotune/wan_sqm/result.json" <<'EOF'
+const fs = require('node:fs');
+const file = process.argv[2];
+const result = JSON.parse(fs.readFileSync(file, 'utf8'));
+result.proposals[0].configuration = structuredClone(result.proposal);
+fs.writeFileSync(file, JSON.stringify(result));
+EOF
 chmod 600 "$autotune/wan_sqm/result.json"
 
 cp "$autotune/wan_sqm/result.json" "$work/result.valid"
@@ -136,6 +186,25 @@ if $helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprin
 fi
 if find "$guard" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
 	echo "failed arm leaked a root-owned apply token" >&2
+	exit 1
+fi
+cp "$work/result.valid" "$autotune/wan_sqm/result.json"
+
+# The selected proposal carries a complete immutable copy of every setting
+# which may reach UCI.  A valid canonical proposal must not authorize a
+# candidate whose embedded configuration was changed after measurement.
+node - "$work/result.valid" "$autotune/wan_sqm/result.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+result.proposals[0].configuration.download.observed_median_kbps++;
+fs.writeFileSync(process.argv[3], JSON.stringify(result));
+EOF
+if $helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint" >/dev/null 2>&1; then
+	echo "apply guard accepted a selected-candidate configuration mismatch" >&2
+	exit 1
+fi
+if find "$guard" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
+	echo "rejected selected-candidate configuration mismatch leaked an apply token" >&2
 	exit 1
 fi
 cp "$work/result.valid" "$autotune/wan_sqm/result.json"
@@ -153,6 +222,7 @@ const root = process.argv[3];
 function write(name, mutate) {
 	const result = structuredClone(source);
 	mutate(result);
+	result.proposals[0].configuration = structuredClone(result.proposal);
 	fs.writeFileSync(path.join(root, `confidence-${name}.json`), JSON.stringify(result));
 }
 
@@ -233,6 +303,572 @@ for rejected_contract in malformed missing-top-level unknown-class minimum-misma
 done
 cp "$work/result.valid" "$autotune/wan_sqm/result.json"
 
+# Final simultaneous evidence has its own typed manual-review boundary. A
+# finite profile-latency miss and 50..80% candidate realization may be accepted
+# explicitly; packet loss, sub-50%, shaper overshoot, and inconsistent verdicts
+# remain non-overridable.
+node - "$work/result.valid" "$work" <<'EOF'
+const fs = require('node:fs');
+const path = require('node:path');
+const source = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const root = process.argv[3];
+
+function sync(result) {
+	result.profile_outcome.bidirectional_confirmation = {
+		tested: result.bidirectional_confirmation.tested,
+		safety_pass: result.bidirectional_confirmation.safety_pass,
+		auto_apply_pass: result.bidirectional_confirmation.auto_apply_pass,
+		effective_delta_ms: result.bidirectional_confirmation.effective_delta_ms,
+		loss_percent: result.bidirectional_confirmation.loss_percent,
+	};
+}
+function write(name, mutate) {
+	const result = structuredClone(source);
+	mutate(result);
+	sync(result);
+	fs.writeFileSync(path.join(root, `bidi-${name}.json`), JSON.stringify(result));
+}
+write('latency', result => {
+	result.auto_apply_eligible = false;
+	Object.assign(result.bidirectional_confirmation, {
+		safety_pass: true, auto_apply_pass: false, grade: 'B',
+		effective_delta_ms: 45, icmp_delta_ms: 20, transport_delta_ms: 45,
+		advisory_reason: 'loaded-latency-target-missed',
+	});
+	Object.assign(result.profile_outcome, {
+		mode: 'balanced-fallback', target_met: false, actual_grade: 'B', manual_only: true,
+	});
+});
+write('far-latency', result => {
+	result.auto_apply_eligible = false;
+	Object.assign(result.bidirectional_confirmation, {
+		safety_pass: false, auto_apply_pass: false, grade: 'C',
+		effective_delta_ms: 61, icmp_delta_ms: 61, transport_delta_ms: 61,
+		advisory_reason: 'loaded-latency-target-missed',
+	});
+	Object.assign(result.profile_outcome, {
+		mode: 'balanced-fallback', target_met: false, actual_grade: 'C', manual_only: true,
+	});
+});
+write('low-realization', result => {
+	result.auto_apply_eligible = false;
+	Object.assign(result.bidirectional_confirmation, {
+		safety_pass: true, auto_apply_pass: false,
+		achieved_kbps: { download: 60000, upload: 18000 },
+		realization_percent: { download: 75, upload: 90 },
+		advisory_reason: 'simultaneous-throughput-confidence-low',
+	});
+	result.profile_outcome.manual_only = true;
+});
+write('loss', result => {
+	result.auto_apply_eligible = false;
+	Object.assign(result.bidirectional_confirmation, {
+		safety_pass: false, auto_apply_pass: false, loss_percent: 4,
+		advisory_reason: 'packet-loss-limit-exceeded',
+	});
+	result.profile_outcome.manual_only = true;
+});
+write('sub50', result => {
+	result.auto_apply_eligible = false;
+	Object.assign(result.bidirectional_confirmation, {
+		safety_pass: false, auto_apply_pass: false,
+		achieved_kbps: { download: 39200, upload: 20000 },
+		realization_percent: { download: 49, upload: 100 },
+		advisory_reason: 'simultaneous-throughput-confidence-low',
+	});
+	result.profile_outcome.manual_only = true;
+});
+write('overshoot', result => {
+	result.auto_apply_eligible = false;
+	Object.assign(result.bidirectional_confirmation, {
+		safety_pass: false, auto_apply_pass: false,
+		achieved_kbps: { download: 88800, upload: 20000 },
+		realization_percent: { download: 111, upload: 100 },
+		advisory_reason: 'simultaneous-throughput-confidence-low',
+	});
+	result.profile_outcome.manual_only = true;
+});
+write('inconsistent', result => {
+	result.bidirectional_confirmation.auto_apply_pass = false;
+});
+EOF
+for reviewable_bidi in latency low-realization; do
+	cp "$work/bidi-$reviewable_bidi.json" "$autotune/wan_sqm/result.json"
+	bidi_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint")"
+	bidi_token="$(printf '%s\n' "$bidi_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
+	[ "${#bidi_token}" -eq 64 ]
+	$helper abort "$bidi_token" >/dev/null
+done
+for rejected_bidi in far-latency loss sub50 overshoot inconsistent; do
+	cp "$work/bidi-$rejected_bidi.json" "$autotune/wan_sqm/result.json"
+	if $helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint" >/dev/null 2>&1; then
+		echo "apply guard accepted non-overridable bidirectional failure: $rejected_bidi" >&2
+		exit 1
+	fi
+done
+cp "$work/result.valid" "$autotune/wan_sqm/result.json"
+
+# A repeatable upload-only comparison is independently applicable even when
+# the old both-shaped confirmation is outside its manual latency boundary.
+# Every derived number is recomputed by apply-guard from the underlying
+# throughput and delay measurements; copied pass flags alone are insufficient.
+node - "$work/result.valid" "$work" <<'EOF'
+const fs = require('node:fs');
+const path = require('node:path');
+const source = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const root = process.argv[3];
+
+function uploadObservation(download, upload, delta) {
+	const downloadGain = (download - 80000) * 100 / 80000;
+	const uploadRealization = upload * 100 / 20000;
+	return {
+		candidate_pass: true,
+		hard_safety_pass: true,
+		material_benefit: true,
+		profile_target_met: true,
+		effective_delta_ms: delta,
+		loss_percent: 0,
+		upload_realization_percent: uploadRealization,
+		download_gain_percent: downloadGain,
+		delay_improvement_ms: 61 - delta,
+		grade: delta < 5 ? 'A+' : delta < 30 ? 'A' : delta < 60 ? 'B' : 'C',
+		observation: {
+			topology: 'upload_only_shaped',
+			direction: 'both',
+			throughput_kbps: { download_kbps: download, upload_kbps: upload },
+			measurement_evidence: {
+				valid: true,
+				shaper_bypassed: true,
+				sqm_paused: false,
+				sqm_bypass_mode: 'ingress-only-autotune',
+			},
+		},
+	};
+}
+
+function makeUploadOnly() {
+	const result = structuredClone(source);
+	result.auto_apply_eligible = false;
+	Object.assign(result.bidirectional_confirmation, {
+		safety_pass: false,
+		auto_apply_pass: false,
+		grade: 'C',
+		effective_delta_ms: 61,
+		icmp_delta_ms: 61,
+		transport_delta_ms: 61,
+		advisory_reason: 'loaded-latency-target-missed',
+	});
+	result.profile_outcome.bidirectional_confirmation = {
+		tested: true,
+		safety_pass: false,
+		auto_apply_pass: false,
+		effective_delta_ms: 61,
+		loss_percent: 0,
+	};
+	Object.assign(result.profile_outcome, {
+		mode: 'balanced-fallback',
+		target_met: false,
+		actual_grade: 'C',
+		manual_only: true,
+	});
+	result.proposals[0] = {
+		schema_version: 1,
+		proposal_id: 'p-111111111111111111111111',
+		rank: 1,
+		action: 'apply_sqm',
+		topology: 'upload_only_shaped',
+		is_primary: true,
+		applicable: true,
+		hard_safety_pass: true,
+		profile_target_met: true,
+		profile_objectives_met: true,
+		grade: 'A',
+		effective_delta_ms: 27,
+		confidence_percent: 90,
+		unmet_objectives: [],
+		evidence: { recommendation: 'directional_comparisons.upload_only' },
+		configuration: structuredClone(result.proposal),
+	};
+	result.directional_comparisons = {
+		upload_only: {
+		tested: true,
+		recommended_topology: 'upload_only_shaped',
+		repeatable: true,
+		observations: [
+			uploadObservation(84000, 19000, 25),
+			uploadObservation(83200, 18800, 27),
+		],
+		},
+	};
+	/* Download shaping is disabled by this topology, so an absent or
+	 * inconclusive download search cannot invalidate the tested upload CAKE
+	 * configuration. */
+	delete result.profile_search.download;
+	return result;
+}
+
+function write(name, mutate) {
+	const result = makeUploadOnly();
+	if (mutate)
+		mutate(result);
+	fs.writeFileSync(path.join(root, `upload-only-${name}.json`), JSON.stringify(result));
+}
+
+write('valid');
+write('realization', result => {
+	result.directional_comparisons.upload_only.observations[0].upload_realization_percent = 99;
+});
+write('gain', result => {
+	result.directional_comparisons.upload_only.observations[0].download_gain_percent = 7;
+});
+write('delay', result => {
+	result.directional_comparisons.upload_only.observations[0].delay_improvement_ms = 35;
+});
+write('repeatability', result => {
+	const observation = result.directional_comparisons.upload_only.observations[1];
+	observation.observation.throughput_kbps.upload_kbps = 15000;
+	observation.upload_realization_percent = 75;
+});
+write('missing-active-search', result => {
+	delete result.profile_search.upload;
+});
+write('realization-review', result => {
+	const observations = result.directional_comparisons.upload_only.observations;
+	for (let i = 0; i < observations.length; i++) {
+		const upload = i === 0 ? 15000 : 14800;
+		observations[i].observation.throughput_kbps.upload_kbps = upload;
+		observations[i].upload_realization_percent = upload * 100 / 20000;
+		observations[i].pass = false;
+	}
+	result.proposals[0].unmet_objectives = [ 'candidate-realization' ];
+});
+write('realization-review-missing-ack', result => {
+	const observations = result.directional_comparisons.upload_only.observations;
+	for (let i = 0; i < observations.length; i++) {
+		const upload = i === 0 ? 15000 : 14800;
+		observations[i].observation.throughput_kbps.upload_kbps = upload;
+		observations[i].upload_realization_percent = upload * 100 / 20000;
+		observations[i].pass = false;
+	}
+});
+write('realization-review-duplicate-ack', result => {
+	const observations = result.directional_comparisons.upload_only.observations;
+	for (let i = 0; i < observations.length; i++) {
+		const upload = i === 0 ? 15000 : 14800;
+		observations[i].observation.throughput_kbps.upload_kbps = upload;
+		observations[i].upload_realization_percent = upload * 100 / 20000;
+		observations[i].pass = false;
+	}
+	result.proposals[0].unmet_objectives = [ 'candidate-realization', 'candidate-realization' ];
+});
+write('utility-review', result => {
+	const observations = result.directional_comparisons.upload_only.observations;
+	result.bidirectional_confirmation.effective_delta_ms = 10;
+	result.bidirectional_confirmation.icmp_delta_ms = 10;
+	result.bidirectional_confirmation.transport_delta_ms = 10;
+	result.bidirectional_confirmation.safety_pass = true;
+	result.bidirectional_confirmation.auto_apply_pass = false;
+	result.bidirectional_confirmation.achieved_kbps.download = 60000;
+	result.bidirectional_confirmation.realization_percent.download = 75;
+	result.profile_outcome.bidirectional_confirmation = {
+		tested: true, safety_pass: true, auto_apply_pass: false,
+		effective_delta_ms: 10, loss_percent: 0,
+	};
+	result.profile_outcome.mode = 'target-a-met';
+	result.profile_outcome.target_met = true;
+	result.profile_outcome.actual_grade = 'A';
+	for (let i = 0; i < observations.length; i++) {
+		const download = i === 0 ? 61200 : 60600;
+		const delta = i === 0 ? 25 : 27;
+		observations[i].candidate_pass = false;
+		observations[i].material_benefit = false;
+		observations[i].effective_delta_ms = delta;
+		observations[i].delay_improvement_ms = 10 - delta;
+		observations[i].grade = 'A';
+		observations[i].observation.throughput_kbps.download_kbps = download;
+		observations[i].download_gain_percent = (download - 60000) * 100 / 60000;
+	}
+	result.directional_comparisons.upload_only.recommended_topology = 'manual_review';
+	result.proposals[0].unmet_objectives = [
+		'throughput-benefit-unproven', 'latency-worse-than-shaped'
+	];
+});
+write('utility-review-missing-benefit-ack', result => {
+	const observations = result.directional_comparisons.upload_only.observations;
+	for (const observation of observations) {
+		observation.candidate_pass = false;
+		observation.material_benefit = false;
+		observation.download_gain_percent = 0;
+		observation.observation.throughput_kbps.download_kbps = 80000;
+	}
+	result.directional_comparisons.upload_only.recommended_topology = 'manual_review';
+});
+write('unexpected-utility-ack', result => {
+	result.proposals[0].unmet_objectives = [ 'throughput-benefit-unproven' ];
+});
+EOF
+
+cp "$work/upload-only-valid.json" "$autotune/wan_sqm/result.json"
+upload_only_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint")"
+upload_only_token="$(printf '%s\n' "$upload_only_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
+[ "${#upload_only_token}" -eq 64 ]
+$helper abort "$upload_only_token" >/dev/null
+
+for accepted_upload_only in realization-review utility-review; do
+	cp "$work/upload-only-$accepted_upload_only.json" "$autotune/wan_sqm/result.json"
+	upload_only_review_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint")"
+	upload_only_review_token="$(printf '%s\n' "$upload_only_review_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
+	[ "${#upload_only_review_token}" -eq 64 ]
+	$helper abort "$upload_only_review_token" >/dev/null
+done
+
+for rejected_upload_only in realization gain delay repeatability missing-active-search \
+	realization-review-missing-ack realization-review-duplicate-ack \
+	utility-review-missing-benefit-ack unexpected-utility-ack; do
+	cp "$work/upload-only-$rejected_upload_only.json" "$autotune/wan_sqm/result.json"
+	if $helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint" >/dev/null 2>&1; then
+		echo "apply guard accepted tampered upload-only evidence: $rejected_upload_only" >&2
+		exit 1
+	fi
+	if find "$guard" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
+		echo "rejected upload-only evidence leaked an apply token: $rejected_upload_only" >&2
+		exit 1
+	fi
+done
+cp "$work/result.valid" "$autotune/wan_sqm/result.json"
+
+# A global both-shaped safety-floor failure does not erase a separately tested
+# one-sided topology.  Only its still-shaped direction needs a valid search;
+# the exact selected proposal remains manual-only and independently guarded.
+node - "$work/upload-only-valid.json" "$autotune/wan_sqm/result.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+result.validation.pass = false;
+result.validation.hard_pass = false;
+result.validation.safety_pass = false;
+result.validation.profile_objectives_met = false;
+result.profile_outcome.mode = 'safety-floor-infeasible';
+result.profile_outcome.manual_only = true;
+result.profile_outcome.capacity_floor_met = false;
+result.profile_outcome.throughput_safety_floor_met = false;
+result.profile_outcome.infeasible_reason =
+	'download:repeatable-shaper-ceiling-below-safety-floor';
+fs.writeFileSync(process.argv[3], JSON.stringify(result));
+EOF
+directional_floor_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint")"
+directional_floor_token="$(printf '%s\n' "$directional_floor_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
+[ "${#directional_floor_token}" -eq 64 ]
+$helper abort "$directional_floor_token" >/dev/null
+cp "$work/result.valid" "$autotune/wan_sqm/result.json"
+
+# A flat, target-meeting Variable-link direction is a typed manual fallback,
+# not an invented knee.  It may arm only when its runtime minimum is the exact
+# tested selected point and the final simultaneous pair is safe.
+node - "$work/result.valid" "$autotune/wan_sqm/result.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+result.profile = 'variable_link';
+result.auto_apply_eligible = false;
+result.validation.profile = 'variable_link';
+result.validation.actual_grade = 'B';
+result.validation_thresholds.capacity_retention_min_percent = 70;
+result.validation_thresholds.delay_max_ms = 60;
+result.validation_thresholds.manual_latency_review_max_ms = 200;
+result.validation_thresholds.loss_max_percent = 3;
+result.proposal.profile = 'variable_link';
+result.proposal.target_grade = 'B';
+result.proposal.validation.capacity_retention_min_percent = 70;
+result.proposal.validation.icmp_delta_max_ms = 60;
+result.proposal.validation.transport_delta_max_ms = 60;
+result.profile_outcome.mode = 'directional-no-cake-effect-review';
+result.profile_outcome.target_grade = 'B';
+result.profile_outcome.actual_grade = 'B';
+result.profile_outcome.capacity_floor_percent = 70;
+result.profile_outcome.manual_only = true;
+result.profile_outcome.bidirectional_confirmation =
+	structuredClone(result.bidirectional_confirmation);
+for (const direction of [ 'download', 'upload' ]) {
+	const search = result.profile_search[direction];
+	const rate = search.selected.candidate_kbps;
+	search.profile = 'variable_link';
+	search.action = direction === 'upload' ? 'fallback' : 'complete';
+	search.reason = direction === 'upload' ?
+		'queue-outside-cake-control' : 'latency-knee-confirmed';
+	search.selected.retention_percent = 70;
+	search.selected.target_met = true;
+	search.exploration_minimum_kbps = Math.floor(rate * 0.35);
+	search.runtime_minimum_kbps = rate;
+	search.runtime_minimum_observation_index = 1;
+	search.knee_detected = direction === 'download';
+	search.no_cake_effect = direction === 'upload';
+	search.noisy = false;
+	search.inconclusive = false;
+	search.evaluated = [ { candidate_kbps: rate } ];
+	result.proposal[direction].minimum_kbps = rate;
+}
+result.proposals[0].configuration = structuredClone(result.proposal);
+fs.writeFileSync(process.argv[3], JSON.stringify(result));
+EOF
+variable_no_effect_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint")"
+variable_no_effect_token="$(printf '%s\n' "$variable_no_effect_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
+[ "${#variable_no_effect_token}" -eq 64 ]
+$helper abort "$variable_no_effect_token" >/dev/null
+
+node - "$autotune/wan_sqm/result.json" <<'EOF'
+const fs = require('node:fs');
+const path = process.argv[2];
+const result = JSON.parse(fs.readFileSync(path, 'utf8'));
+result.profile_search.upload.runtime_minimum_kbps--;
+result.proposal.upload.minimum_kbps--;
+fs.writeFileSync(path, JSON.stringify(result));
+EOF
+if $helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint" >/dev/null 2>&1; then
+	echo "apply guard accepted an invented Variable-link no-effect minimum" >&2
+	exit 1
+fi
+cp "$work/result.valid" "$autotune/wan_sqm/result.json"
+
+# Reaching the Variable-link exploration floor without a measured knee may
+# expose only the highest exact-tested, target-meeting point above 50%, and it
+# must remain an explicit manual review with a safe simultaneous confirmation.
+node - "$work/result.valid" "$autotune/wan_sqm/result.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+result.profile = 'variable_link';
+result.auto_apply_eligible = false;
+result.validation.profile = 'variable_link';
+result.validation.actual_grade = 'B';
+result.validation_thresholds.capacity_retention_min_percent = 70;
+result.validation_thresholds.delay_max_ms = 60;
+result.validation_thresholds.manual_latency_review_max_ms = 200;
+result.validation_thresholds.loss_max_percent = 3;
+result.proposal.profile = 'variable_link';
+result.proposal.target_grade = 'B';
+result.proposal.validation.capacity_retention_min_percent = 70;
+result.proposal.validation.icmp_delta_max_ms = 60;
+result.proposal.validation.transport_delta_max_ms = 60;
+result.profile_outcome.mode = 'variable-link-bounded-evidence-review';
+result.profile_outcome.target_grade = 'B';
+result.profile_outcome.actual_grade = 'B';
+result.profile_outcome.capacity_floor_percent = 70;
+result.profile_outcome.manual_only = true;
+result.profile_outcome.bidirectional_confirmation =
+	structuredClone(result.bidirectional_confirmation);
+for (const direction of [ 'download', 'upload' ]) {
+	const search = result.profile_search[direction];
+	const rate = search.selected.candidate_kbps;
+	search.profile = 'variable_link';
+	search.action = direction === 'upload' ? 'fallback' : 'complete';
+	search.reason = direction === 'upload' ?
+		'exploration-floor-reached' : 'latency-knee-confirmed';
+	search.selected.retention_percent = 70;
+	search.selected.target_met = true;
+	search.exploration_minimum_kbps = Math.floor(rate * 0.35);
+	search.runtime_minimum_kbps = rate;
+	search.runtime_minimum_observation_index = 1;
+	search.knee_detected = direction === 'download';
+	search.no_cake_effect = false;
+	search.noisy = false;
+	search.inconclusive = false;
+	search.evaluated = [ { candidate_kbps: rate } ];
+	result.proposal[direction].minimum_kbps = rate;
+}
+result.proposals[0].configuration = structuredClone(result.proposal);
+fs.writeFileSync(process.argv[3], JSON.stringify(result));
+EOF
+variable_floor_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint")"
+variable_floor_token="$(printf '%s\n' "$variable_floor_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
+[ "${#variable_floor_token}" -eq 64 ]
+$helper abort "$variable_floor_token" >/dev/null
+
+node - "$autotune/wan_sqm/result.json" <<'EOF'
+const fs = require('node:fs');
+const path = process.argv[2];
+const result = JSON.parse(fs.readFileSync(path, 'utf8'));
+result.profile_search.upload.runtime_minimum_kbps--;
+result.proposal.upload.minimum_kbps--;
+fs.writeFileSync(path, JSON.stringify(result));
+EOF
+if $helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint" >/dev/null 2>&1; then
+	echo "apply guard accepted an invented Variable-link exploration-floor minimum" >&2
+	exit 1
+fi
+cp "$work/result.valid" "$autotune/wan_sqm/result.json"
+
+# A Variable-link direction that repeatedly realizes only 50..80% may expose
+# one exact-tested hold point for explicit review after lower-rate exploration.
+# It is never strict-safe or Auto-Apply eligible, and sub-50 evidence remains
+# non-overridable.
+node - "$work/result.valid" "$autotune/wan_sqm/result.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+result.profile = 'variable_link';
+result.auto_apply_eligible = false;
+result.validation.profile = 'variable_link';
+result.validation.actual_grade = 'B';
+result.validation_thresholds.capacity_retention_min_percent = 70;
+result.validation_thresholds.delay_max_ms = 60;
+result.validation_thresholds.manual_latency_review_max_ms = 200;
+result.validation_thresholds.loss_max_percent = 3;
+result.proposal.profile = 'variable_link';
+result.proposal.target_grade = 'B';
+result.proposal.validation.capacity_retention_min_percent = 70;
+result.proposal.validation.icmp_delta_max_ms = 60;
+result.proposal.validation.transport_delta_max_ms = 60;
+result.profile_outcome.mode = 'variable-link-bounded-evidence-review';
+result.profile_outcome.target_grade = 'B';
+result.profile_outcome.actual_grade = 'B';
+result.profile_outcome.capacity_floor_percent = 70;
+result.profile_outcome.manual_only = true;
+result.profile_outcome.bidirectional_confirmation =
+	structuredClone(result.bidirectional_confirmation);
+for (const direction of [ 'download', 'upload' ]) {
+	const search = result.profile_search[direction];
+	const rate = search.selected.candidate_kbps;
+	search.profile = 'variable_link';
+	search.action = direction === 'upload' ? 'fallback' : 'complete';
+	search.reason = direction === 'upload' ?
+		'bounded-low-realization-review' : 'latency-knee-confirmed';
+	search.selected.retention_percent = 70;
+	search.selected.target_met = true;
+	search.selected.manual_reviewable = direction === 'upload';
+	search.selected.realization_percent = direction === 'upload' ? 75 : 95;
+	search.selected.safety_pass = direction !== 'upload';
+	search.exploration_minimum_kbps = Math.floor(rate * 0.35);
+	search.runtime_minimum_kbps = rate;
+	search.runtime_minimum_observation_index = 1;
+	search.knee_detected = direction === 'download';
+	search.no_cake_effect = false;
+	search.noisy = false;
+	search.inconclusive = false;
+	search.evaluated = [ { candidate_kbps: rate } ];
+	result.proposal[direction].minimum_kbps = rate;
+}
+result.proposals[0].configuration = structuredClone(result.proposal);
+fs.writeFileSync(process.argv[3], JSON.stringify(result));
+EOF
+variable_bounded_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint")"
+variable_bounded_token="$(printf '%s\n' "$variable_bounded_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
+[ "${#variable_bounded_token}" -eq 64 ]
+$helper abort "$variable_bounded_token" >/dev/null
+
+node - "$autotune/wan_sqm/result.json" <<'EOF'
+const fs = require('node:fs');
+const path = process.argv[2];
+const result = JSON.parse(fs.readFileSync(path, 'utf8'));
+Object.assign(result.profile_search.upload.selected, {
+	manual_reviewable: false,
+	realization_percent: 49,
+	retention_percent: 49,
+});
+fs.writeFileSync(path, JSON.stringify(result));
+EOF
+if $helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint" >/dev/null 2>&1; then
+	echo "apply guard accepted a Variable-link fallback below 50 percent" >&2
+	exit 1
+fi
+cp "$work/result.valid" "$autotune/wan_sqm/result.json"
+
 # Gaming must arm an exact diffserv4 manifest rather than merely relabeling a
 # best-effort proposal. The token is aborted before the main lifecycle test.
 node - "$work/result.valid" "$autotune/wan_sqm/result.json" <<'EOF'
@@ -243,7 +879,14 @@ result.validation.profile = 'gaming';
 result.validation.actual_grade = 'A+';
 result.validation_thresholds.capacity_retention_min_percent = 70;
 result.validation_thresholds.delay_max_ms = 5;
+result.validation_thresholds.manual_latency_review_max_ms = 30;
 result.validation_thresholds.loss_max_percent = 1;
+Object.assign(result.bidirectional_confirmation, {
+	grade: 'A+', effective_delta_ms: 4, icmp_delta_ms: 4,
+	transport_delta_ms: 4,
+});
+result.profile_outcome.bidirectional_confirmation =
+	structuredClone(result.bidirectional_confirmation);
 result.proposal.profile = 'gaming';
 result.proposal.target_grade = 'A+';
 result.proposal.quality_target_required = true;
@@ -271,6 +914,7 @@ result.profile_outcome = {
 for (const direction of [ 'download', 'upload' ]) {
 	result.profile_search[direction].profile = 'gaming';
 }
+result.proposals[0].configuration = structuredClone(result.proposal);
 let serialized = JSON.stringify(result);
 /* Match serde_json's representation of integral f64 policy values. LuCI
  * stages these through JavaScript String(), which intentionally normalizes
@@ -321,6 +965,7 @@ result.profile_outcome.runtime_minimum_retention = {
 	upload_percent: Math.round(result.proposal.upload.minimum_kbps * 1000 /
 		result.proposal.upload.observed_low_kbps) / 10,
 };
+result.proposals[0].configuration = structuredClone(result.proposal);
 fs.writeFileSync(path, JSON.stringify(result));
 EOF
 extreme_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint")"
@@ -355,6 +1000,7 @@ for (const direction of [ 'download', 'upload' ]) {
 		Math.round(runtimeMinimum * 1000 / proposal.observed_low_kbps) / 10;
 }
 result.profile_outcome.runtime_minimum_retention = retention;
+result.proposals[0].configuration = structuredClone(result.proposal);
 fs.writeFileSync(path, JSON.stringify(result));
 EOF
 extreme_deep_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint")"
@@ -366,10 +1012,9 @@ extreme_deep_token="$(printf '%s\n' "$extreme_deep_arm" | sed -n 's/.*"token":"\
 $helper abort "$extreme_deep_token" >/dev/null
 cp "$work/result.valid" "$autotune/wan_sqm/result.json"
 
-# A clean candidate that realizes its current CAKE rate may remain explicitly
-# reviewable even below 50% of an older 5G capacity sample.  Historical
-# retention is advisory; the current safety_pass and selected direction safety
-# are the fail-closed controls.
+# Falling below 50% of measured historical capacity is an explicit-review
+# advisory, not proof that the currently measured CAKE candidate is unsafe.
+# The guard may arm that exact candidate, but it must remain manual-only.
 node - "$work/result.valid" "$autotune/wan_sqm/result.json" <<'EOF'
 const fs = require('node:fs');
 const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
@@ -382,10 +1027,10 @@ result.profile_outcome.throughput_safety_floor_met = false;
 result.profile_outcome.manual_only = true;
 fs.writeFileSync(process.argv[3], JSON.stringify(result));
 EOF
-historical_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint")"
-historical_token="$(printf '%s\n' "$historical_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
-[ "${#historical_token}" -eq 64 ]
-$helper abort "$historical_token" >/dev/null
+historical_advisory_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint")"
+historical_advisory_token="$(printf '%s\n' "$historical_advisory_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
+[ "${#historical_advisory_token}" -eq 64 ]
+$helper abort "$historical_advisory_token" >/dev/null
 cp "$work/result.valid" "$autotune/wan_sqm/result.json"
 
 # A logical netifd target remains the attested route identity, while every
@@ -698,6 +1343,146 @@ if uci -q get sqm.cake_autorate_apply_wan_sqm >/dev/null 2>&1; then
 	exit 1
 fi
 
+# A generic no-SQM proposal is independently guarded by its raw control.  An
+# unsafe, low-realization shaped comparison and the absence of a 2% raw gain
+# must not hide a clean raw topology which is itself inside the hard manual
+# latency/loss boundary.
+node - "$work/result.valid" "$autotune/wan_sqm/result.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+result.auto_apply_eligible = false;
+result.manual_apply_eligible = true;
+result.validation.pass = false;
+result.validation.hard_pass = false;
+result.validation.safety_pass = false;
+result.validation.profile_objectives_met = false;
+result.validation.quality_target_met = false;
+result.validation.actual_grade = 'F';
+result.validation.effective_delta_ms = 500;
+result.validation.throughput = { download_kbps: 90000, upload_kbps: 25000 };
+Object.assign(result.bidirectional_confirmation, {
+	safety_pass: false,
+	auto_apply_pass: false,
+	grade: 'F',
+	achieved_kbps: { download: 1000, upload: 500 },
+	realization_percent: { download: 1.25, upload: 2.5 },
+	effective_delta_ms: 500,
+	transport_delta_ms: 500,
+});
+result.profile_outcome.manual_only = true;
+result.profile_outcome.target_met = false;
+result.profile_outcome.capacity_floor_met = false;
+result.profile_outcome.actual_grade = 'F';
+result.profile_outcome.bidirectional_confirmation = structuredClone(result.bidirectional_confirmation);
+result.raw_control = {
+	available: true,
+	measurement_evidence: {
+		valid: true,
+		reason: 'ok',
+		test_direction: 'both',
+		shaper_bypassed: true,
+		sqm_paused: true,
+		sqm_bypass_mode: 'paused-managed',
+	},
+	grade: 'A',
+	effective_delta_ms: 20,
+	icmp_latency: { loss_percent: 0 },
+	throughput: { download_kbps: 85000, upload_kbps: 22000 },
+	forwarded_background: {
+		available: true,
+		contaminated: false,
+		download_kbps: 100,
+		upload_kbps: 50,
+		download_limit_kbps: 1700,
+		upload_limit_kbps: 1000,
+	},
+};
+Object.assign(result.proposals[1], {
+	action: 'disable_sqm',
+	topology: 'no_sqm',
+	applicable: true,
+	hard_safety_pass: true,
+	profile_target_met: true,
+	profile_objectives_met: true,
+	grade: 'A',
+	effective_delta_ms: 20,
+	confidence_percent: 100,
+	unmet_objectives: [],
+	evidence: { control: 'raw_control' },
+	configuration: null,
+});
+fs.writeFileSync(process.argv[3], JSON.stringify(result));
+EOF
+cp "$autotune/wan_sqm/result.json" "$work/result.raw-independent"
+raw_independent_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 0 0 disable_sqm "$fingerprint")"
+raw_independent_token="$(printf '%s\n' "$raw_independent_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
+[ "${#raw_independent_token}" -eq 64 ]
+$helper abort "$raw_independent_token" >/dev/null
+
+# auto_apply_eligible describes the top-level shaped candidate, not the
+# explicitly selected no-SQM action.  A clean exact raw proposal must remain
+# reviewable when a different shaped proposal is also Auto-Apply eligible.
+node - "$work/result.raw-independent" "$autotune/wan_sqm/result.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+result.auto_apply_eligible = true;
+fs.writeFileSync(process.argv[3], JSON.stringify(result));
+EOF
+raw_with_shaped_auto_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 0 0 disable_sqm "$fingerprint")"
+raw_with_shaped_auto_token="$(printf '%s\n' "$raw_with_shaped_auto_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
+[ "${#raw_with_shaped_auto_token}" -eq 64 ]
+$helper abort "$raw_with_shaped_auto_token" >/dev/null
+
+# Every hard fact in the independent raw proof remains fail-closed.  These
+# mutations also prove that no shaped comparison is consulted on the accepted
+# path above: only the raw topology and its exact candidate may vary here.
+node - "$work/result.raw-independent" "$work" <<'EOF'
+const fs = require('node:fs');
+const input = process.argv[2];
+const dir = process.argv[3];
+const base = JSON.parse(fs.readFileSync(input, 'utf8'));
+const cases = {
+	measurement: r => { r.raw_control.measurement_evidence.valid = false; },
+	direction: r => { r.raw_control.measurement_evidence.test_direction = 'download'; },
+	bypass: r => { r.raw_control.measurement_evidence.shaper_bypassed = false; },
+	background: r => { r.raw_control.forwarded_background.contaminated = true; },
+	loss: r => { r.raw_control.icmp_latency.loss_percent = 4; },
+	delay: r => { r.raw_control.effective_delta_ms = 61; r.raw_control.grade = 'C'; r.proposals[1].effective_delta_ms = 61; r.proposals[1].grade = 'C'; },
+	throughput: r => { r.raw_control.throughput.download_kbps = 0; },
+	proposal: r => { r.proposals[1].effective_delta_ms = 21; },
+	configuration: r => { r.proposals[1].configuration = structuredClone(r.proposal); },
+	route: r => { r.route_identity = 'main||eth9|192.0.2.10||main'; },
+};
+for (const [name, mutate] of Object.entries(cases)) {
+	const result = structuredClone(base);
+	mutate(result);
+	fs.writeFileSync(`${dir}/raw-reject-${name}.json`, JSON.stringify(result));
+}
+EOF
+for raw_rejection in measurement direction bypass background loss delay throughput proposal configuration route; do
+	cp "$work/raw-reject-$raw_rejection.json" "$autotune/wan_sqm/result.json"
+	if $helper arm wan_sqm pppoe-wan speedtest-go main '' 0 0 disable_sqm "$fingerprint" >/dev/null 2>&1; then
+		echo "apply guard accepted tampered raw no-SQM evidence: $raw_rejection" >&2
+		exit 1
+	fi
+done
+
+# Disabling SQM is meaningful only for an existing, owned instance.  A clean
+# raw control must not turn the create wizard into a disabled no-op instance.
+mkdir -p "$autotune/raw_new_sqm"
+node - "$work/result.raw-independent" "$autotune/raw_new_sqm/result.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+result.job_id = 'raw_new_sqm';
+fs.writeFileSync(process.argv[3], JSON.stringify(result));
+EOF
+chmod 600 "$autotune/raw_new_sqm/result.json"
+if $helper arm raw_new_sqm pppoe-wan speedtest-go main '' 0 0 disable_sqm "$fingerprint" >/dev/null 2>&1; then
+	echo "apply guard created a new disabled no-SQM instance" >&2
+	exit 1
+fi
+cp "$work/result.valid" "$autotune/wan_sqm/result.json"
+
 # Fair may explicitly recommend disabling SQM only when a complete unshaped
 # control is no worse for latency and improves both directions. The guarded
 # transaction preserves the owned queue as disabled and proves all runtime
@@ -710,6 +1495,7 @@ result.auto_apply_eligible = false;
 result.manual_apply_eligible = true;
 result.validation_thresholds.capacity_retention_min_percent = 90;
 result.validation_thresholds.delay_max_ms = 200;
+result.validation_thresholds.manual_latency_review_max_ms = 400;
 result.validation_thresholds.loss_max_percent = 5;
 result.validation = {
 	profile: 'fair',
@@ -740,7 +1526,8 @@ result.profile_outcome = {
 	capacity_floor_met: true, throughput_safety_floor_percent: 50,
 	throughput_safety_floor_met: true, deep_runtime_minimum: false,
 	runtime_minimum_retention: null, infeasible_reason: '',
-	selected_pair: { download_kbps: 80000, upload_kbps: 20000 }
+	selected_pair: { download_kbps: 80000, upload_kbps: 20000 },
+	bidirectional_confirmation: structuredClone(result.bidirectional_confirmation)
 };
 result.profile_search = {
 	download: { schema_version: 2, profile: 'fair', direction: 'download', action: 'complete',
@@ -775,6 +1562,7 @@ result.fair_outcome = {
 		},
 		grade: 'D',
 		effective_delta_ms: 218,
+		icmp_latency: { loss_percent: 0 },
 		throughput: { download_kbps: 85000, upload_kbps: 22000 },
 		forwarded_background: {
 			available: true,
@@ -788,9 +1576,101 @@ result.fair_outcome = {
 	},
 	throughput_gain_without_sqm: { download_percent: 3, upload_percent: 3 }
 };
+result.proposals[0].configuration = structuredClone(result.proposal);
 fs.writeFileSync(process.argv[3], JSON.stringify(result));
 EOF
 cp "$autotune/wan_sqm/result.json" "$work/result.fair-disable"
+
+# A schema-8 Fair result must carry the final simultaneous degradation into
+# both typed outcome objects.  The older contradictory shape (directional C in
+# fair_outcome while the final profile outcome is D) is diagnostic-only.
+node - "$work/result.fair-disable" "$work/result.fair-simultaneous" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+result.validation.pass = true;
+result.validation.hard_pass = true;
+result.validation.safety_pass = true;
+result.validation.profile_objectives_met = false;
+result.validation.quality_target_met = true;
+result.validation.actual_grade = 'C';
+result.validation.effective_delta_ms = 191.5;
+result.validation.correction = { action: 'none', feasible: true };
+Object.assign(result.bidirectional_confirmation, {
+	safety_pass: true,
+	auto_apply_pass: false,
+	grade: 'D',
+	effective_delta_ms: 224.2,
+	transport_delta_ms: 224.2,
+});
+Object.assign(result.profile_outcome, {
+	mode: 'quality-and-throughput-advisory-review',
+	target_met: false,
+	actual_grade: 'D',
+	capacity_floor_met: false,
+	manual_only: true,
+	bidirectional_confirmation: structuredClone(result.bidirectional_confirmation),
+});
+result.fair_outcome = {
+	...result.fair_outcome,
+	mode: 'throughput-fallback',
+	capacity_floor_met: false,
+	actual_grade: 'D',
+	actual_effective_delta_ms: 224.2,
+	recommended_action: 'apply_sqm',
+	allowed_actions: [ 'apply_sqm', 'keep_current' ],
+	apply_sqm_available: true,
+	disable_sqm_available: false,
+	comparison_reason: 'quality-target-unreachable-above-throughput-floor',
+	no_sqm_control: { available: false, measurement_evidence: { valid: false, reason: 'not-tested' } },
+	throughput_gain_without_sqm: { download_percent: 0, upload_percent: 0 },
+};
+fs.writeFileSync(process.argv[3], JSON.stringify(result));
+EOF
+cp "$work/result.fair-simultaneous" "$autotune/wan_sqm/result.json"
+fair_simultaneous_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint")"
+fair_simultaneous_token="$(printf '%s\n' "$fair_simultaneous_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
+[ "${#fair_simultaneous_token}" -eq 64 ]
+$helper abort "$fair_simultaneous_token" >/dev/null
+node - "$work/result.fair-simultaneous" "$autotune/wan_sqm/result.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+result.fair_outcome.actual_grade = 'C';
+result.fair_outcome.actual_effective_delta_ms = 191.5;
+fs.writeFileSync(process.argv[3], JSON.stringify(result));
+EOF
+if $helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint" >/dev/null 2>&1; then
+	echo "apply guard accepted a Fair outcome that omitted final simultaneous degradation" >&2
+	exit 1
+fi
+cp "$work/result.fair-disable" "$autotune/wan_sqm/result.json"
+
+# The shaped final pair may be worse than Fair's bounded manual-review range
+# while an independently clean no-SQM control proves that disabling SQM is the
+# safer action.  That must block apply_sqm without hiding disable_sqm.
+node - "$work/result.fair-disable" "$autotune/wan_sqm/result.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+result.bidirectional_confirmation.safety_pass = false;
+result.bidirectional_confirmation.auto_apply_pass = false;
+result.bidirectional_confirmation.grade = 'F';
+result.bidirectional_confirmation.effective_delta_ms = 466;
+result.bidirectional_confirmation.transport_delta_ms = 466;
+result.profile_outcome.actual_grade = 'F';
+result.profile_outcome.bidirectional_confirmation = structuredClone(result.bidirectional_confirmation);
+result.fair_outcome.actual_grade = 'F';
+result.fair_outcome.actual_effective_delta_ms = 466;
+fs.writeFileSync(process.argv[3], JSON.stringify(result));
+EOF
+if $helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint" >/dev/null 2>&1; then
+	echo "apply guard accepted an unsafe shaped Fair confirmation" >&2
+	exit 1
+fi
+unsafe_disable_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 0 0 disable_sqm "$fingerprint")"
+unsafe_disable_token="$(printf '%s\n' "$unsafe_disable_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
+[ "${#unsafe_disable_token}" -eq 64 ]
+$helper abort "$unsafe_disable_token" >/dev/null
+
+cp "$work/result.fair-disable" "$autotune/wan_sqm/result.json"
 node - "$work/result.fair-disable" "$autotune/wan_sqm/result.json" <<'EOF'
 const fs = require('node:fs');
 const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
@@ -819,6 +1699,16 @@ fs.writeFileSync(process.argv[3], JSON.stringify(result));
 EOF
 if $helper arm wan_sqm pppoe-wan speedtest-go main '' 0 0 disable_sqm "$fingerprint" >/dev/null 2>&1; then
 	echo "apply guard accepted a no-SQM recommendation with contaminated background traffic" >&2
+	exit 1
+fi
+node - "$work/result.fair-disable" "$autotune/wan_sqm/result.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+result.fair_outcome.no_sqm_control.icmp_latency.loss_percent = 6;
+fs.writeFileSync(process.argv[3], JSON.stringify(result));
+EOF
+if $helper arm wan_sqm pppoe-wan speedtest-go main '' 0 0 disable_sqm "$fingerprint" >/dev/null 2>&1; then
+	echo "apply guard accepted a no-SQM control above the Fair packet-loss limit" >&2
 	exit 1
 fi
 

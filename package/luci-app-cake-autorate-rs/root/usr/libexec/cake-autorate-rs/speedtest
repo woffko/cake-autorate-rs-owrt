@@ -1270,6 +1270,17 @@ standalone_recovery_mark_restored() {
 	standalone_recovery_write
 }
 
+bypass_scope_matches_direction() {
+	case "$1:$2" in
+		# The upload-only-CAKE comparison deliberately runs simultaneous
+		# download and upload load while bypassing ingress shaping only.  Keep
+		# this exact mixed topology explicit; every other directional bypass
+		# must still match the single transfer direction it measures.
+		ingress:download|ingress:both|egress:upload|full:*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
 prepare_speedtest_calibration() {
 	local autorate_pid autorate_start sqm_preflight_active=0
 	[ -n "$section" ] || return 0
@@ -1279,13 +1290,10 @@ prepare_speedtest_calibration() {
 		append_warning "Invalid internal SQM bypass scope; the speed test was refused."
 		return 1
 	fi
-	case "$bypass_scope:$direction_override" in
-		ingress:download|egress:upload|full:*) ;;
-		*)
-			append_warning "The requested SQM bypass scope does not match the speed-test direction."
-			return 1
-			;;
-	esac
+	if ! bypass_scope_matches_direction "$bypass_scope" "$direction_override"; then
+		append_warning "The requested SQM bypass scope does not match the speed-test direction."
+		return 1
+	fi
 
 	if [ "${interface_lock_shared:-0}" != 1 ]; then
 		standalone_recovery_arm || {

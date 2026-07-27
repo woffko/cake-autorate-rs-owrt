@@ -97,6 +97,7 @@ struct Config {
     enabled: bool,
     manage_sqm: bool,
     sqm_enabled: bool,
+    sqm_direction_mode: String,
     sqm_interface: String,
     dl_if: String,
     ul_if: String,
@@ -238,6 +239,7 @@ impl Config {
             enabled: false,
             manage_sqm: true,
             sqm_enabled: false,
+            sqm_direction_mode: "both".to_string(),
             sqm_interface: String::new(),
             dl_if: "ifb-wan".to_string(),
             ul_if: "wan".to_string(),
@@ -419,6 +421,7 @@ impl Config {
         set_bool(&single, "manage_sqm", &mut cfg.manage_sqm)?;
         cfg.sqm_enabled = cfg.enabled;
         set_bool(&single, "sqm_enabled", &mut cfg.sqm_enabled)?;
+        set_string(&single, "sqm_direction_mode", &mut cfg.sqm_direction_mode);
         set_string(&single, "sqm_interface", &mut cfg.sqm_interface);
         set_string(&single, "dl_if", &mut cfg.dl_if);
         set_string(&single, "ul_if", &mut cfg.ul_if);
@@ -464,6 +467,12 @@ impl Config {
             "adjust_ul_shaper_rate",
             &mut cfg.adjust_ul_shaper_rate,
         )?;
+        if !cfg.download_shaping_enabled() {
+            cfg.adjust_dl_shaper_rate = false;
+        }
+        if !cfg.upload_shaping_enabled() {
+            cfg.adjust_ul_shaper_rate = false;
+        }
         set_f64(
             &single,
             "min_dl_shaper_rate_kbps",
@@ -1071,7 +1080,11 @@ impl Config {
 
     fn normalize_paths(&mut self) {
         if self.rx_bytes_path.is_empty() {
-            self.rx_bytes_path = format!("/sys/class/net/{}/statistics/tx_bytes", self.dl_if);
+            self.rx_bytes_path = if self.download_shaping_enabled() {
+                format!("/sys/class/net/{}/statistics/tx_bytes", self.dl_if)
+            } else {
+                format!("/sys/class/net/{}/statistics/rx_bytes", self.sqm_interface)
+            };
         }
         if self.tx_bytes_path.is_empty() {
             let counter = if self.ul_if.starts_with("ifb") || self.ul_if.starts_with("veth") {
@@ -1084,12 +1097,36 @@ impl Config {
     }
 
     fn refresh_wire_packet_sizes(&mut self) {
-        self.dl_max_wire_packet_size_bits = interface_max_wire_packet_size_bits(&self.dl_if);
+        self.dl_max_wire_packet_size_bits =
+            interface_max_wire_packet_size_bits(if self.download_shaping_enabled() {
+                &self.dl_if
+            } else {
+                &self.sqm_interface
+            });
         self.ul_max_wire_packet_size_bits = interface_max_wire_packet_size_bits(&self.ul_if);
+    }
+
+    fn download_shaping_enabled(&self) -> bool {
+        matches!(self.sqm_direction_mode.as_str(), "both" | "download_only")
+    }
+
+    fn upload_shaping_enabled(&self) -> bool {
+        matches!(self.sqm_direction_mode.as_str(), "both" | "upload_only")
     }
 
     fn validate(&self) -> Result<(), String> {
         self.route_spec().validate()?;
+        if !matches!(
+            self.sqm_direction_mode.as_str(),
+            "both" | "upload_only" | "download_only" | "off"
+        ) {
+            return Err(
+                "sqm_direction_mode must be both, upload_only, download_only, or off".to_string(),
+            );
+        }
+        if self.sqm_enabled && self.sqm_direction_mode == "off" {
+            return Err("sqm_direction_mode off requires sqm_enabled=0".to_string());
+        }
         if !(1.0..=300.0).contains(&self.route_stability_s) {
             return Err("route_stability_s must be between 1 and 300".to_string());
         }
@@ -2021,19 +2058,49 @@ fn inspect_sqm_topology(cfg: &Config) -> Result<(), String> {
         return Err(format!("upload counter is missing for {}", cfg.ul_if));
     }
 
-    let dl_qdisc = tc_output(&["qdisc", "show", "dev", &cfg.dl_if])?;
-    if !qdisc_output_has_cake(&dl_qdisc) {
-        return Err(format!("CAKE qdisc is missing on {}", cfg.dl_if));
+    if cfg.download_shaping_enabled() {
+        let dl_qdisc = tc_output(&["qdisc", "show", "dev", &cfg.dl_if])?;
+        if !qdisc_output_has_cake(&dl_qdisc) {
+            return Err(format!("CAKE qdisc is missing on {}", cfg.dl_if));
+        }
+    } else if tc_output(&["qdisc", "show", "dev", &cfg.dl_if])
+        .map(|output| qdisc_output_has_cake(&output))
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "CAKE qdisc remains on disabled download interface {}",
+            cfg.dl_if
+        ));
     }
-    let ul_qdisc = tc_output(&["qdisc", "show", "dev", &cfg.ul_if])?;
-    if !qdisc_output_has_cake(&ul_qdisc) {
-        return Err(format!("CAKE qdisc is missing on {}", cfg.ul_if));
+    if cfg.upload_shaping_enabled() {
+        let ul_qdisc = tc_output(&["qdisc", "show", "dev", &cfg.ul_if])?;
+        if !qdisc_output_has_cake(&ul_qdisc) {
+            return Err(format!("CAKE qdisc is missing on {}", cfg.ul_if));
+        }
+    } else if tc_output(&["qdisc", "show", "dev", &cfg.ul_if])
+        .map(|output| qdisc_output_has_cake(&output))
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "CAKE qdisc remains on disabled upload interface {}",
+            cfg.ul_if
+        ));
     }
-    if cfg.dl_if.starts_with("ifb") {
+    if cfg.download_shaping_enabled() && cfg.dl_if.starts_with("ifb") {
         let ingress = tc_output(&["filter", "show", "dev", &cfg.sqm_interface, "ingress"])?;
         if !ingress_output_targets_ifb(&ingress, &cfg.dl_if) {
             return Err(format!(
                 "ingress redirect from {} to {} is missing",
+                cfg.sqm_interface, cfg.dl_if
+            ));
+        }
+    } else if !cfg.download_shaping_enabled() && cfg.dl_if.starts_with("ifb") {
+        let redirect_remains = tc_output(&["filter", "show", "dev", &cfg.sqm_interface, "ingress"])
+            .map(|output| ingress_output_targets_ifb(&output, &cfg.dl_if))
+            .unwrap_or(false);
+        if redirect_remains {
+            return Err(format!(
+                "ingress redirect from {} to disabled download interface {} remains",
                 cfg.sqm_interface, cfg.dl_if
             ));
         }
@@ -3628,6 +3695,7 @@ impl Controller {
         let ul_policy = self.quality_policy(false);
         let dl_update = if let Some(dl_delta_ms) = confirmed_dl_delta {
             if controller_enabled
+                && self.cfg.adjust_dl_shaper_rate
                 && (dl_delta_ms <= target_ms || self.transport_bad_windows_dl >= 2)
             {
                 Some(self.quality_search_dl.observe(
@@ -3645,6 +3713,7 @@ impl Controller {
         };
         let ul_update = if let Some(ul_delta_ms) = confirmed_ul_delta {
             if controller_enabled
+                && self.cfg.adjust_ul_shaper_rate
                 && (ul_delta_ms <= target_ms || self.transport_bad_windows_ul >= 2)
             {
                 Some(self.quality_search_ul.observe(
@@ -3715,8 +3784,12 @@ impl Controller {
             "DEBUG",
             &format!("Enforcing minimum shaper rates: {reason}"),
         );
-        self.shaper_dl = self.throughput_floor_dl;
-        self.shaper_ul = self.throughput_floor_ul;
+        if self.cfg.adjust_dl_shaper_rate {
+            self.shaper_dl = self.throughput_floor_dl;
+        }
+        if self.cfg.adjust_ul_shaper_rate {
+            self.shaper_ul = self.throughput_floor_ul;
+        }
         self.apply_shaper("dl");
         self.apply_shaper("ul");
         let _ = self.refresh_status_from_last_sample();
@@ -3735,18 +3808,30 @@ impl Controller {
 
         if self.cfg.adaptive_ceiling_enabled && state != "RUNNING" {
             let now = Instant::now();
-            let (dl_update, ul_update) = if state == "STALL" {
-                (
-                    self.adaptive_dl.reset_to_configured(now),
-                    self.adaptive_ul.reset_to_configured(now),
-                )
-            } else {
-                (
-                    self.adaptive_dl.pause(now, "autorate state paused"),
-                    self.adaptive_ul.pause(now, "autorate state paused"),
-                )
-            };
-            self.apply_adaptive_updates(dl_update, ul_update);
+            let mut changed = false;
+            if self.cfg.adjust_dl_shaper_rate {
+                let update = if state == "STALL" {
+                    self.adaptive_dl.reset_to_configured(now)
+                } else {
+                    self.adaptive_dl.pause(now, "autorate state paused")
+                };
+                changed |= update.change.is_some();
+                self.log_adaptive_update("DL", update);
+            }
+            if self.cfg.adjust_ul_shaper_rate {
+                let update = if state == "STALL" {
+                    self.adaptive_ul.reset_to_configured(now)
+                } else {
+                    self.adaptive_ul.pause(now, "autorate state paused")
+                };
+                changed |= update.change.is_some();
+                self.log_adaptive_update("UL", update);
+            }
+            if changed {
+                self.clamp_rates();
+                self.apply_shaper("dl");
+                self.apply_shaper("ul");
+            }
         }
 
         let _ = self.refresh_status_from_last_sample();
@@ -3861,25 +3946,22 @@ impl Controller {
     fn note_probe_gap(&mut self) {
         if self.cfg.adaptive_ceiling_enabled {
             let now = Instant::now();
-            let dl_update = self.adaptive_dl.abort_probe_gap(now);
-            let ul_update = self.adaptive_ul.abort_probe_gap(now);
-            self.apply_adaptive_updates(dl_update, ul_update);
-        }
-    }
-
-    fn apply_adaptive_updates(
-        &mut self,
-        dl_update: AdaptiveCeilingUpdate,
-        ul_update: AdaptiveCeilingUpdate,
-    ) {
-        let ceiling_changed = dl_update.change.is_some() || ul_update.change.is_some();
-        self.log_adaptive_update("DL", dl_update);
-        self.log_adaptive_update("UL", ul_update);
-
-        if ceiling_changed {
-            self.clamp_rates();
-            self.apply_shaper("dl");
-            self.apply_shaper("ul");
+            let mut changed = false;
+            if self.cfg.adjust_dl_shaper_rate {
+                let update = self.adaptive_dl.abort_probe_gap(now);
+                changed |= update.change.is_some();
+                self.log_adaptive_update("DL", update);
+            }
+            if self.cfg.adjust_ul_shaper_rate {
+                let update = self.adaptive_ul.abort_probe_gap(now);
+                changed |= update.change.is_some();
+                self.log_adaptive_update("UL", update);
+            }
+            if changed {
+                self.clamp_rates();
+                self.apply_shaper("dl");
+                self.apply_shaper("ul");
+            }
         }
     }
 
@@ -4379,6 +4461,10 @@ impl Controller {
         allow_growth: bool,
         now: Instant,
     ) {
+        if (is_dl && !self.cfg.adjust_dl_shaper_rate) || (!is_dl && !self.cfg.adjust_ul_shaper_rate)
+        {
+            return;
+        }
         let mut shaper = if is_dl {
             self.shaper_dl
         } else {
@@ -4502,37 +4588,45 @@ impl Controller {
             && avg_ul_delta_us <= self.avg_adjust_up_thr_us(false)
             && transport_clean;
 
-        let dl_update = self.adaptive_dl.observe(
-            now,
-            AdaptiveCeilingObservation {
-                eligible: dl_eligible,
-                bufferbloat: dl_bufferbloat,
-                shaper_rate_kbps: self.shaper_dl,
-            },
-            policy,
-        );
-        let ul_update = self.adaptive_ul.observe(
-            now,
-            AdaptiveCeilingObservation {
-                eligible: ul_eligible,
-                bufferbloat: ul_bufferbloat,
-                shaper_rate_kbps: self.shaper_ul,
-            },
-            policy,
-        );
-        self.log_adaptive_update("DL", dl_update);
-        self.log_adaptive_update("UL", ul_update);
+        if self.cfg.adjust_dl_shaper_rate {
+            let dl_update = self.adaptive_dl.observe(
+                now,
+                AdaptiveCeilingObservation {
+                    eligible: dl_eligible,
+                    bufferbloat: dl_bufferbloat,
+                    shaper_rate_kbps: self.shaper_dl,
+                },
+                policy,
+            );
+            self.log_adaptive_update("DL", dl_update);
+        }
+        if self.cfg.adjust_ul_shaper_rate {
+            let ul_update = self.adaptive_ul.observe(
+                now,
+                AdaptiveCeilingObservation {
+                    eligible: ul_eligible,
+                    bufferbloat: ul_bufferbloat,
+                    shaper_rate_kbps: self.shaper_ul,
+                },
+                policy,
+            );
+            self.log_adaptive_update("UL", ul_update);
+        }
     }
 
     fn clamp_rates(&mut self) {
-        self.shaper_dl = self
-            .shaper_dl
-            .max(self.throughput_floor_dl)
-            .min(self.adaptive_dl.effective_max_kbps());
-        self.shaper_ul = self
-            .shaper_ul
-            .max(self.throughput_floor_ul)
-            .min(self.adaptive_ul.effective_max_kbps());
+        if self.cfg.adjust_dl_shaper_rate {
+            self.shaper_dl = self
+                .shaper_dl
+                .max(self.throughput_floor_dl)
+                .min(self.adaptive_dl.effective_max_kbps());
+        }
+        if self.cfg.adjust_ul_shaper_rate {
+            self.shaper_ul = self
+                .shaper_ul
+                .max(self.throughput_floor_ul)
+                .min(self.adaptive_ul.effective_max_kbps());
+        }
     }
 
     fn apply_shaper(&mut self, direction: &str) {
@@ -4554,6 +4648,12 @@ impl Controller {
                 self.last_shaper_attempt_ul.elapsed(),
             )
         };
+        /* An unshaped direction is passive telemetry only.  Do not advance
+         * retry clocks, emit a fictitious CAKE command, or remember a fake
+         * applied bandwidth for a qdisc which intentionally does not exist. */
+        if !adjust {
+            return;
+        }
         let rounded = rate.round().max(1.0) as u64;
         if !shaper_update_due(last, rounded, last_attempt_elapsed) {
             return;
@@ -4569,15 +4669,6 @@ impl Controller {
                 "SHAPER",
                 &format!("tc qdisc change root dev {interface} cake bandwidth {rounded}Kbit"),
             );
-        }
-
-        if !adjust {
-            if is_dl {
-                self.last_set_dl = rounded;
-            } else {
-                self.last_set_ul = rounded;
-            }
-            return;
         }
 
         let status = Command::new("tc")
@@ -4730,14 +4821,25 @@ impl Controller {
             transport.status
         };
         let quality_grade = self.quality_grade.snapshot(epoch_secs());
+        let reported_cake_dl = if self.cfg.download_shaping_enabled() {
+            self.shaper_dl
+        } else {
+            0.0
+        };
+        let reported_cake_ul = if self.cfg.upload_shaping_enabled() {
+            self.shaper_ul
+        } else {
+            0.0
+        };
         let mut file = File::create(&tmp)?;
         writeln!(
             file,
-            "{{\"instance\":\"{}\",\"version\":\"{}\",\"state\":\"{}\",\"sqm_runtime_managed\":{},\"sqm_runtime_state\":\"{}\",\"sqm_runtime_healthy\":{},\"sqm_runtime_reason\":\"{}\",\"sqm_recovery_attempts\":{},\"sqm_last_recovery_at\":{},\"started_at\":{:.6},\"updated_at\":{:.6},\"dl_if\":\"{}\",\"ul_if\":\"{}\",\"reflector\":\"{}\",\"seq\":\"{}\",\"probe_timestamp\":{:.6},\"rtt_ms\":{:.3},\"dl_owd_us\":{:.1},\"ul_owd_us\":{:.1},\"dl_achieved_rate_kbps\":{:.1},\"ul_achieved_rate_kbps\":{:.1},\"dl_load_percent\":{:.1},\"ul_load_percent\":{:.1},\"dl_sum_delays\":{},\"ul_sum_delays\":{},\"dl_avg_owd_delta_us\":{:.1},\"ul_avg_owd_delta_us\":{:.1},\"cake_dl_rate_kbps\":{:.0},\"cake_ul_rate_kbps\":{:.0},\"adaptive_ceiling_enabled\":{},\"configured_max_dl_shaper_rate_kbps\":{:.0},\"configured_max_ul_shaper_rate_kbps\":{:.0},\"effective_max_dl_shaper_rate_kbps\":{:.0},\"effective_max_ul_shaper_rate_kbps\":{:.0},\"adaptive_ceiling_dl_cap_kbps\":{:.0},\"adaptive_ceiling_ul_cap_kbps\":{:.0},\"adaptive_ceiling_dl_phase\":\"{}\",\"adaptive_ceiling_ul_phase\":\"{}\",\"adaptive_ceiling_safe_dl_kbps\":{:.0},\"adaptive_ceiling_safe_ul_kbps\":{:.0},\"adaptive_ceiling_failed_dl_kbps\":{},\"adaptive_ceiling_failed_ul_kbps\":{},\"adaptive_ceiling_probe_dl_kbps\":{},\"adaptive_ceiling_probe_ul_kbps\":{},\"adaptive_ceiling_dl_phase_elapsed_s\":{:.3},\"adaptive_ceiling_ul_phase_elapsed_s\":{:.3},\"adaptive_ceiling_dl_last_reason\":\"{}\",\"adaptive_ceiling_ul_last_reason\":\"{}\",\"cpu_total_percent\":{},\"cpu_core_percentages\":{},\"active_reflectors\":{},\"spare_reflectors\":{},\"bad_reflectors\":{},\"reflector_health\":{}}}",
+            "{{\"instance\":\"{}\",\"version\":\"{}\",\"state\":\"{}\",\"sqm_runtime_managed\":{},\"sqm_direction_mode\":\"{}\",\"sqm_runtime_state\":\"{}\",\"sqm_runtime_healthy\":{},\"sqm_runtime_reason\":\"{}\",\"sqm_recovery_attempts\":{},\"sqm_last_recovery_at\":{},\"started_at\":{:.6},\"updated_at\":{:.6},\"dl_if\":\"{}\",\"ul_if\":\"{}\",\"reflector\":\"{}\",\"seq\":\"{}\",\"probe_timestamp\":{:.6},\"rtt_ms\":{:.3},\"dl_owd_us\":{:.1},\"ul_owd_us\":{:.1},\"dl_achieved_rate_kbps\":{:.1},\"ul_achieved_rate_kbps\":{:.1},\"dl_load_percent\":{:.1},\"ul_load_percent\":{:.1},\"dl_sum_delays\":{},\"ul_sum_delays\":{},\"dl_avg_owd_delta_us\":{:.1},\"ul_avg_owd_delta_us\":{:.1},\"cake_dl_rate_kbps\":{:.0},\"cake_ul_rate_kbps\":{:.0},\"adaptive_ceiling_enabled\":{},\"configured_max_dl_shaper_rate_kbps\":{:.0},\"configured_max_ul_shaper_rate_kbps\":{:.0},\"effective_max_dl_shaper_rate_kbps\":{:.0},\"effective_max_ul_shaper_rate_kbps\":{:.0},\"adaptive_ceiling_dl_cap_kbps\":{:.0},\"adaptive_ceiling_ul_cap_kbps\":{:.0},\"adaptive_ceiling_dl_phase\":\"{}\",\"adaptive_ceiling_ul_phase\":\"{}\",\"adaptive_ceiling_safe_dl_kbps\":{:.0},\"adaptive_ceiling_safe_ul_kbps\":{:.0},\"adaptive_ceiling_failed_dl_kbps\":{},\"adaptive_ceiling_failed_ul_kbps\":{},\"adaptive_ceiling_probe_dl_kbps\":{},\"adaptive_ceiling_probe_ul_kbps\":{},\"adaptive_ceiling_dl_phase_elapsed_s\":{:.3},\"adaptive_ceiling_ul_phase_elapsed_s\":{:.3},\"adaptive_ceiling_dl_last_reason\":\"{}\",\"adaptive_ceiling_ul_last_reason\":\"{}\",\"cpu_total_percent\":{},\"cpu_core_percentages\":{},\"active_reflectors\":{},\"spare_reflectors\":{},\"bad_reflectors\":{},\"reflector_health\":{}}}",
             json_escape(&self.cfg.instance),
             env!("CARGO_PKG_VERSION"),
             json_escape(&self.run_state),
             self.cfg.manage_sqm && self.cfg.sqm_enabled,
+            json_escape(&self.cfg.sqm_direction_mode),
             json_escape(&self.sqm_runtime_state),
             self.sqm_runtime_healthy,
             json_escape(&self.sqm_runtime_reason),
@@ -4761,8 +4863,8 @@ impl Controller {
             ul_delay_count,
             avg_dl_delta,
             avg_ul_delta,
-            self.shaper_dl,
-            self.shaper_ul,
+            reported_cake_dl,
+            reported_cake_ul,
             self.cfg.adaptive_ceiling_enabled,
             self.adaptive_dl.configured_max_kbps(),
             self.adaptive_ul.configured_max_kbps(),
@@ -7226,7 +7328,7 @@ fn reflector_health_json(
 fn print_usage() {
     eprintln!("usage: cake-autorated [--instance NAME] [--once] [--dump-config]");
     eprintln!(
-        "       cake-autorated --autotune-proposal --dl-samples LIST --ul-samples LIST \\\n         --idle-median-ms N --idle-p95-ms N --idle-samples N [--link-kind KIND] \\\n         [--profile gaming|best_overall|variable_link|fair] \\\n         [--base-scale N | --dl-base-scale N --ul-base-scale N] \\\n         [--dl-runtime-min-kbps N --ul-runtime-min-kbps N]"
+        "       cake-autorated --autotune-proposal --dl-samples LIST --ul-samples LIST \\\n         --idle-median-ms N --idle-p95-ms N --idle-samples N [--link-kind KIND] \\\n         [--profile gaming|best_overall|variable_link|fair] \\\n         [--base-scale N | --dl-base-scale N --ul-base-scale N] \\\n         [--dl-runtime-min-kbps N] [--ul-runtime-min-kbps N]"
     );
     eprintln!("       cake-autorated --autotune-validate [--profile gaming|gaming_extreme|best_overall|variable_link|fair] --dl-observed-low-kbps N --ul-observed-low-kbps N --dl-candidate-kbps N --ul-candidate-kbps N --dl-achieved-kbps N --ul-achieved-kbps N --dl-min-kbps N --ul-min-kbps N --dl-max-kbps N --ul-max-kbps N --icmp-delta-ms N --transport-delta-ms N --loss-percent N --cpu-percent N");
     eprintln!("         [--dl-icmp-delta-ms N --ul-icmp-delta-ms N --dl-transport-delta-ms N --ul-transport-delta-ms N --dl-loss-percent N --ul-loss-percent N --dl-cpu-percent N --ul-cpu-percent N]");
@@ -7515,13 +7617,9 @@ where
         (Some(download), Some(upload)) => {
             proposal.set_measured_runtime_minimums(download, upload)?
         }
+        (Some(download), None) => proposal.set_measured_download_runtime_minimum(download)?,
+        (None, Some(upload)) => proposal.set_measured_upload_runtime_minimum(upload)?,
         (None, None) => {}
-        _ => {
-            return Err(
-                "download and upload runtime minimum overrides must be supplied together"
-                    .to_string(),
-            )
-        }
     }
     println!("{}", proposal.to_json());
     Ok(())
@@ -8709,6 +8807,38 @@ mod tests {
         assert!(!ingress_output_targets_ifb(redirect, "ifb4eth1"));
         assert!(!ingress_output_targets_ifb(redirect, "ifb4eth"));
         assert!(!ingress_output_targets_ifb(redirect, "ifb4eth00"));
+    }
+
+    #[test]
+    fn direction_mode_disables_only_the_unshaped_controller_and_counter_path() {
+        let mut upload_only = Config::defaults("upload_only".to_string());
+        upload_only.sqm_enabled = true;
+        upload_only.sqm_direction_mode = "upload_only".to_string();
+        upload_only.sqm_interface = "eth0".to_string();
+        upload_only.ul_if = "eth0".to_string();
+        upload_only.dl_if = "ifb4eth0".to_string();
+        upload_only.adjust_dl_shaper_rate = false;
+        upload_only.normalize_paths();
+        assert!(!upload_only.download_shaping_enabled());
+        assert!(upload_only.upload_shaping_enabled());
+        assert!(!upload_only.adjust_dl_shaper_rate);
+        assert_eq!(
+            upload_only.rx_bytes_path,
+            "/sys/class/net/eth0/statistics/rx_bytes"
+        );
+        assert_eq!(
+            upload_only.tx_bytes_path,
+            "/sys/class/net/eth0/statistics/tx_bytes"
+        );
+        assert!(upload_only.validate().is_ok());
+
+        let mut invalid = upload_only.clone();
+        invalid.sqm_direction_mode = "sometimes".to_string();
+        assert!(invalid.validate().is_err());
+        invalid.sqm_direction_mode = "off".to_string();
+        assert!(invalid.validate().is_err());
+        invalid.sqm_enabled = false;
+        assert!(invalid.validate().is_ok());
     }
 
     #[test]

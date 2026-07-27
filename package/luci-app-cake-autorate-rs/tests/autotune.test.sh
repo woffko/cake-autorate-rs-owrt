@@ -50,6 +50,12 @@ export AUTOTUNE_MOCK_DIRECTION_LOG="$work/test-directions"
 export AUTOTUNE_MOCK_CONFIGURED_DL_KBPS=50000
 export AUTOTUNE_MOCK_CONFIGURED_UL_KBPS=10000
 
+autotune_test_part="${AUTOTUNE_TEST_PART:-all}"
+case "$autotune_test_part" in
+	all|early|middle|late|late_core|late_workers) ;;
+	*) echo "unknown AUTOTUNE_TEST_PART: $autotune_test_part" >&2; exit 2 ;;
+esac
+
 cat > "$work/procd-job" <<'EOF'
 #!/bin/sh
 [ "$1" = launch ] || exit 1
@@ -64,6 +70,8 @@ printf '{"pid":%s,"starttime":%s}\n' "$pid" "$start"
 EOF
 chmod +x "$work/procd-job"
 export CAKE_AUTORATE_PROCD_JOB="$work/procd-job"
+
+if [ "$autotune_test_part" = all ] || [ "$autotune_test_part" = early ]; then
 
 # Minimal OpenWrt images such as the production x86 Multi-WAN router provide
 # neither od nor cksum. Worker/shaper identity must come directly from the
@@ -119,6 +127,26 @@ grep -q 'Unable to generate a unique 32-hex Full Auto-Tune worker identity' "$wo
 	! find "$work/jobs/recovery" -name 'baduuid_*' -print -quit | grep -q .
 unset CAKE_AUTORATE_RANDOM_UUID_FILE
 
+# Worker cleanup must publish shaper_started=0 before managed SQM can be
+# restored.  The explicit mock topology exercises that durable transition
+# without creating qdiscs on the test host.
+CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
+	set -eu
+	. "$1"
+	CAKE_AUTORATE_AUTOTUNE_TEST_SHAPER=1
+	AUTOTUNE_MOCK_SHAPER_RESTORE_MARKER="$2/shaper-journal-restored"
+	recovery_prepared=1
+	recovery_shaper_started=1
+	temp_shaper_active=1
+	temp_ingress_active=1
+	journal_trace="$2/shaper-journal-trace"
+	write_recovery_journal() { printf "%s\n" "$recovery_shaper_started" >> "$journal_trace"; }
+	restore_temp_shaper
+	[ "$recovery_shaper_started" = 0 ]
+	[ "$(sed -n "1p" "$journal_trace")" = 0 ]
+	[ -e "$AUTOTUNE_MOCK_SHAPER_RESTORE_MARKER" ]
+' sh "$autotune" "$work"
+
 # The fixture must model jsonfilter's top-level lookup semantics.  Greedy text
 # extraction used to select nested proposal fields and report schema 1/state
 # inner instead of the terminal envelope's schema 6/state complete.
@@ -146,6 +174,23 @@ CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
 	worker_request_matches any
 ' sh "$autotune" "$work"
 
+# Selecting the main table is a complete override and must discard a member
+# inherited from the persistent Multi-WAN instance.  Route inspection may fail
+# later in this host fixture (its real default route is not lo), but diagnostics
+# must already be internally consistent.
+AUTOTUNE_MOCK_ROUTE_MODE=mwan3 AUTOTUNE_MOCK_MWAN3_MEMBER=wanb \
+CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
+	. "$1"
+	job_name=routeoverride
+	target_if_input=lo
+	target_if=lo
+	route_mode_override=main
+	mwan3_member_override=
+	inspect_autotune_route >/dev/null 2>&1 || true
+	[ "$route_mode" = main ]
+	[ -z "$mwan3_member" ]
+' sh "$autotune"
+
 # A scheduled run measures the selected uplink's aggregate RX+TX counters from
 # one job-wide baseline. Counter resets are rejected instead of silently
 # granting a fresh traffic allowance.
@@ -166,6 +211,32 @@ CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
 	printf "%s\n" 1 > "$2/eth0/statistics/rx_bytes"
 	printf "%s\n" 1 > "$2/eth0/statistics/tx_bytes"
 	! traffic_budget_consumed_bytes >/dev/null
+' sh "$autotune" "$work/budget-net"
+
+# The hard allowance and sysfs counters must remain exact above signed 32-bit
+# range on ARM/MIPS BusyBox ash. Production byte math is intentionally routed
+# through awk rather than target-width $((...)).
+printf '%s\n' 4000000000 > "$work/budget-net/eth0/statistics/rx_bytes"
+printf '%s\n' 5000000000 > "$work/budget-net/eth0/statistics/tx_bytes"
+CAKE_AUTORATE_SYS_CLASS_NET="$work/budget-net" \
+CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
+	set -eu
+	. "$1"
+	target_if=eth0
+	traffic_budget_bytes="$(uint53_normalize 8589934592)"
+	traffic_budget_start_bytes="$(interface_total_bytes "$target_if")"
+	[ "$traffic_budget_start_bytes" = 9000000000 ]
+	printf "%s\n" 8500000000 > "$2/eth0/statistics/rx_bytes"
+	printf "%s\n" 6500000000 > "$2/eth0/statistics/tx_bytes"
+	[ "$(traffic_budget_consumed_bytes)" = 6000000000 ]
+	uint53_compare 6000000000 lt "$traffic_budget_bytes"
+	case "$(traffic_budget_json)" in
+		*\"enabled\":true*\"limit_bytes\":8589934592*\"consumed_bytes\":6000000000*) ;;
+		*) exit 1 ;;
+	esac
+	[ "$(uint53_normalize 9007199254740991)" = 9007199254740991 ]
+	! uint53_normalize 9007199254740992 >/dev/null
+	! uint53_add 9007199254740991 1 >/dev/null
 ' sh "$autotune" "$work/budget-net"
 
 # Typed pinger reconstruction keeps IRTT targets separate from the independently
@@ -270,6 +341,34 @@ CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
 	kill "$identity_pid" 2>/dev/null || true
 	wait "$identity_pid" 2>/dev/null || true
 ' sh "$autotune"
+
+# A one-sided runtime topology must pass only its still-shaped direction's
+# exact tested minimum to the Rust proposal builder. Requiring a peer minimum
+# here made a valid Review card disagree with apply-guard later.
+CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
+	set -eu
+	. "$1"
+	argument_log="$2"
+	daemon_bin=fake_proposal_builder
+	download_samples=100000,100000
+	upload_samples=20000,20000
+	idle_median_ms=5
+	idle_p95_ms=6
+	baseline_samples=10
+	link_kind=cellular
+	autotune_profile=variable_link
+	conservative_mode=0
+	fake_proposal_builder() {
+		printf "%s\n" "$*" > "$argument_log"
+		printf "{}\n"
+	}
+	calculate_proposal 1.0 1.0 "" 15000 >/dev/null
+	grep -q -- "--ul-runtime-min-kbps 15000" "$argument_log"
+	! grep -q -- "--dl-runtime-min-kbps" "$argument_log"
+	calculate_proposal 1.0 1.0 75000 "" >/dev/null
+	grep -q -- "--dl-runtime-min-kbps 75000" "$argument_log"
+	! grep -q -- "--ul-runtime-min-kbps" "$argument_log"
+' sh "$autotune" "$work/one-sided-runtime-minimum-args"
 
 "$autotune" fullauto lo start speedtest-go > "$work/start.json"
 
@@ -378,6 +477,7 @@ done
 node - "$work/conservativeclean-status.json" <<'EOF'
 const fs = require('node:fs');
 const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const primary = Array.isArray(result.proposals) ? result.proposals.find(item => item.is_primary) : null;
 if (result.schema_version !== 8 || result.state !== 'complete' ||
     result.conservative !== true || result.phase_contamination_seen !== false ||
     !result.validation || result.validation.score !== 100 ||
@@ -391,7 +491,14 @@ if (result.schema_version !== 8 || result.state !== 'complete' ||
     result.confidence.capacity_upload_percent !== 100 ||
     result.confidence.quality_percent !== 100 ||
     !Array.isArray(result.confidence.reasons) || result.confidence.reasons.length !== 0 ||
-    !result.proposal || typeof result.proposal.confidence !== 'number')
+    !result.proposal || typeof result.proposal.confidence !== 'number' ||
+	!Array.isArray(result.proposals) || result.proposals.length < 1 || result.proposals.length > 4 ||
+	!primary || primary.schema_version !== 1 ||
+	!/^p-[0-9a-f]{24}$/.test(primary.proposal_id) ||
+	primary.action !== 'apply_sqm' ||
+	primary.topology !== 'both_shaped' ||
+	primary.hard_safety_pass !== true ||
+	JSON.stringify(primary.configuration) !== JSON.stringify(result.proposal))
 	throw new Error('clean conservative continuation remained ineligible or lost trusted confidence');
 EOF
 wait_for_job_cleanup conservativeclean
@@ -594,7 +701,7 @@ export AUTOTUNE_MOCK_FAIR_SHAPED_BAD=1
 attempt=0
 while [ "$attempt" -lt 260 ]; do
 	"$autotune" fairdisable lo status speedtest-go '' '' fair > "$work/fairdisable-status.json"
-	grep -q '"state":"complete"' "$work/fairdisable-status.json" && break
+	grep -Eq '"state":"(complete|failed|inconclusive)"' "$work/fairdisable-status.json" && break
 	attempt=$((attempt + 1))
 	sleep 0.05
 done
@@ -633,23 +740,34 @@ wait_for_job_cleanup fairdisable
 unset AUTOTUNE_MOCK_FAIR_SHAPED_BAD
 
 # A candidate that is apparently exceeded by more than 10% did not prove that
-# the temporary CAKE rate was enforced. Retry the same candidate once, then
-# report retryable measurement uncertainty rather than a passing proposal.
+# the temporary CAKE rate was enforced. Retry the same candidate once and never
+# expose it as an applyable CAKE proposal. A separately proven full-raw control
+# may still remain reviewable as an exact no-SQM alternative.
 : > "$work/counter"
 export AUTOTUNE_MOCK_REALIZATION_OVERSHOOT=1
 "$autotune" overshoot lo start speedtest-go > "$work/overshoot-start.json"
 attempt=0
 while [ "$attempt" -lt 260 ]; do
 	"$autotune" overshoot lo status speedtest-go > "$work/overshoot-status.json"
-	grep -q 'candidate-realization-too-high-after-bounded-retry' "$work/overshoot-status.json" && break
+	grep -Eq '"state":"(complete|failed|inconclusive)"' "$work/overshoot-status.json" && break
 	attempt=$((attempt + 1))
 	sleep 0.05
 done
-grep -q '"state":"inconclusive"' "$work/overshoot-status.json"
-grep -q '"retryable":true' "$work/overshoot-status.json"
-grep -q '"action":"retry-measurement"' "$work/overshoot-status.json"
-grep -q '"code":"download-candidate-realization-maximum","scope":"download","required":true,"pass":false' "$work/overshoot-status.json"
-grep -q '"configuration_written":false' "$work/overshoot-status.json"
+node - "$work/overshoot-status.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (result.configuration_written !== false)
+	throw new Error('overshoot calibration changed configuration');
+const proposals = Array.isArray(result.proposals) ? result.proposals : [];
+if (proposals.some(item => item.action === 'apply_sqm'))
+	throw new Error('an unproven overshoot CAKE candidate remained applyable');
+if (result.state === 'complete') {
+	if (!proposals.some(item => item.action === 'disable_sqm' && item.hard_safety_pass === true))
+		throw new Error('complete overshoot fallback lacks independently safe no-SQM evidence');
+} else if (result.state !== 'inconclusive') {
+	throw new Error(`unexpected overshoot terminal state: ${result.state}`);
+}
+EOF
 wait_for_job_cleanup overshoot
 unset AUTOTUNE_MOCK_REALIZATION_OVERSHOOT
 
@@ -695,9 +813,11 @@ EOF
 wait_for_job_cleanup cpuadvisory
 unset AUTOTUNE_MOCK_COMPUTE_CEILING
 
-# A candidate which is safe in both isolated directions but misses the latency
-# target under simultaneous load remains reviewable and manual-only. Throughput
-# is retained; the joint quality evidence, not CPU, blocks Auto-Apply.
+# A candidate which is safe in both isolated directions and misses the latency
+# target by one adjacent grade under simultaneous load remains reviewable and
+# manual-only. Throughput is retained; the acknowledged joint quality miss, not
+# CPU, blocks Auto-Apply. Larger grade gaps are covered by the fail-closed UI
+# and apply-guard fixtures.
 : > "$work/counter"
 export AUTOTUNE_MOCK_BIDI_HIGH_LATENCY=1
 export AUTOTUNE_MOCK_UPLOAD_ONLY_SAFE=1
@@ -714,19 +834,35 @@ const fs = require('node:fs');
 const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const bidi = result.bidirectional_confirmation;
 const directional = result.directional_recommendation;
+const uploadComparison = result.directional_comparisons && result.directional_comparisons.upload_only;
 if (result.state !== 'complete' || !bidi || bidi.tested !== true ||
-    bidi.safety_pass !== false || bidi.auto_apply_pass !== false ||
+    bidi.safety_pass !== true || bidi.auto_apply_pass !== false ||
     bidi.advisory_reason !== 'loaded-latency-target-missed' ||
     result.auto_apply_eligible !== false || result.manual_apply_eligible !== true ||
     !result.profile_outcome || result.profile_outcome.manual_only !== true ||
-    result.profile_outcome.target_met !== false || !directional ||
-    directional.tested !== true || directional.recommended_topology !== 'upload_only_shaped' ||
-    directional.manual_only !== true || directional.repeatable !== true ||
-    !Array.isArray(directional.observations) || directional.observations.length !== 2 ||
-    directional.observations.some(item => item.pass !== true ||
-        item.observation.measurement_evidence.sqm_bypass_mode !== 'ingress-only-managed' ||
+	result.profile_outcome.target_met !== false || !directional ||
+	directional.tested !== true || directional.recommended_topology !== 'manual_review' ||
+	directional.reason !== 'one-sided-benefit-not-repeatable' ||
+	directional.manual_only !== true || directional.repeatable !== false ||
+	!uploadComparison || uploadComparison.recommended_topology !== 'manual_review' ||
+	uploadComparison.reason !== 'upload-only-benefit-not-repeatable' ||
+	uploadComparison.repeatable !== true ||
+	!Array.isArray(uploadComparison.observations) || uploadComparison.observations.length !== 2 ||
+	uploadComparison.observations.some(item => item.pass !== false ||
+		item.gates.download_gain !== false ||
+        item.observation.measurement_evidence.sqm_bypass_mode !== 'ingress-only-autotune' ||
         item.observation.measurement_evidence.sqm_paused !== false))
-	throw new Error('unsafe simultaneous latency did not produce a manual-only review result');
+	throw new Error(`adjacent-grade simultaneous latency miss did not produce a manual-only review result: ${JSON.stringify({
+		state: result.state,
+		error: result.error,
+		message: result.message,
+		diagnostic_reason: result.diagnostic_reason,
+		bidi,
+		auto: result.auto_apply_eligible,
+		manual: result.manual_apply_eligible,
+		outcome: result.profile_outcome,
+		directional
+	})}`);
 EOF
 wait_for_job_cleanup bidilatency
 unset AUTOTUNE_MOCK_BIDI_HIGH_LATENCY AUTOTUNE_MOCK_UPLOAD_ONLY_SAFE
@@ -768,10 +904,10 @@ EOF
 wait_for_job_cleanup lowrealization
 unset AUTOTUNE_MOCK_REALIZATION_ADVISORY
 
-# On Fair, a controlled result below the 50% historical-throughput trust
-# boundary is still a manual-only proposal when latency/loss evidence is clean.
-# High CPU and the old throughput comparison both remain advisory; neither may
-# erase usable evidence or make the result Auto-Applyable.
+# On Fair, controlled evidence below the historical-throughput comparison is a
+# manual proposal, never an automatic one. The operator must explicitly accept
+# the retention warning; current realization, loss and latency remain the hard
+# datapath boundaries rather than a stale raw-capacity sample.
 : > "$work/counter"
 export AUTOTUNE_MOCK_REALIZATION_LOW=1
 export AUTOTUNE_MOCK_COMPUTE_CEILING=1
@@ -792,8 +928,10 @@ if (result.state !== 'complete' || result.profile !== 'fair' ||
     result.profile_outcome.mode !== 'latency-safe-throughput-advisory' ||
     result.profile_outcome.capacity_floor_met !== false ||
     result.auto_apply_eligible !== false || result.manual_apply_eligible !== true ||
-    result.configuration_written !== false)
-	throw new Error(`Fair controlled low-throughput evidence did not produce manual review: ${JSON.stringify({
+    result.configuration_written !== false || !Array.isArray(result.proposals) ||
+    result.proposals.length < 1 || result.proposals[0].hard_safety_pass !== true ||
+    !result.proposals[0].unmet_objectives.includes('retention-objective'))
+	throw new Error(`Fair sub-50% evidence was not retained as an explicit manual proposal: ${JSON.stringify({
 		state: result.state,
 		profile: result.profile,
 		safety: result.validation && result.validation.safety_pass,
@@ -955,6 +1093,10 @@ grep -q 'route identity changed' "$work/routebad-status.json"
 wait_for_job_cleanup routebad
 unset AUTOTUNE_MOCK_ROUTE_MISMATCH
 
+fi
+
+if [ "$autotune_test_part" = all ] || [ "$autotune_test_part" = middle ]; then
+
 # If an optional detailed fragment becomes unavailable during a real route
 # loss, fail() must preserve the original reason in a compact terminal instead
 # of leaving recovery to report only an unstructured worker interruption.
@@ -962,6 +1104,7 @@ compact_failure_marker="$work/compact-failure-terminal.json"
 set +e
 (
 	export CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1
+	export CAKE_AUTORATE_AUTOTUNE_TEST_SHAPER=0
 	# shellcheck disable=SC1090
 	. "$autotune"
 	compact_stage_attempt=0
@@ -991,6 +1134,81 @@ grep -q '"phase_evidence_complete":false' "$compact_failure_marker"
 	export CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1
 	# shellcheck disable=SC1090
 	. "$autotune"
+	target_if=lo
+	tc_root_state='qdisc mq 0: root'
+	tc() { printf '%s\n' "$tc_root_state"; }
+	no_temporary_egress_shaper
+	tc_root_state='qdisc htb 8001: root refcnt 2'
+	if no_temporary_egress_shaper; then
+		echo "foreign replacement root was accepted as download-only bypass" >&2
+		exit 1
+	fi
+)
+
+(
+	export CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1
+	export CAKE_AUTORATE_AUTOTUNE_TEST_SHAPER=0
+	# shellcheck disable=SC1090
+	. "$autotune"
+	target_if=lo
+	temp_ifb=catfrollback
+	temp_ingress_handle=ffff:
+	temp_redirect_pref=49152
+	tc_log="$work/ingress-rollback.log"
+	temporary_upload_only_shaper_owned() { return 0; }
+	tc() {
+		printf '%s\n' "$*" >> "$tc_log"
+		[ "$1 $2" != "filter add" ]
+	}
+	if restore_temporary_ingress; then
+		echo "ingress restore unexpectedly accepted a failed redirect filter" >&2
+		exit 1
+	fi
+	grep -Fqx 'qdisc add dev lo handle ffff: ingress' "$tc_log"
+	grep -Fqx 'qdisc del dev lo ingress' "$tc_log"
+)
+
+(
+	export CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1
+	export CAKE_AUTORATE_AUTOTUNE_TEST_SHAPER=1
+	# shellcheck disable=SC1090
+	. "$autotune"
+	temp_shaper_active=1
+	temp_ingress_active=1
+	temp_egress_active=1
+	temp_download_kbps=50000
+	temp_upload_kbps=10000
+	bypass_temporary_ingress
+	temporary_upload_only_shaper_owned
+	! temporary_shaper_owned
+	restore_temporary_ingress
+	temporary_shaper_owned
+	bypass_temporary_ingress
+	prepare_temp_shaper 42000 8000
+	temporary_shaper_owned
+	[ "$temp_download_kbps" = 42000 ]
+	[ "$temp_upload_kbps" = 8000 ]
+	bypass_temporary_egress
+	temporary_download_only_shaper_owned
+	! temporary_shaper_owned
+	restore_temporary_egress
+	temporary_shaper_owned
+	bypass_temporary_egress
+	prepare_temp_shaper 41000 7000
+	temporary_shaper_owned
+	[ "$temp_download_kbps" = 41000 ]
+	[ "$temp_upload_kbps" = 7000 ]
+	bypass_temporary_ingress
+	restore_temp_shaper
+	[ "$temp_shaper_active" = 0 ]
+	[ "$temp_ingress_active" = 0 ]
+	[ "$temp_egress_active" = 0 ]
+)
+
+(
+	export CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1
+	# shellcheck disable=SC1090
+	. "$autotune"
 	calibration_strategy=shaped_only
 	bidirectional_safety_pass=false
 	bidirectional_realization_pass=false
@@ -1005,6 +1223,65 @@ if (result.tested !== false || result.recommended_topology !== 'manual_review' |
 	throw new Error('shaped-only strategy did not fail closed before directional bypass');
 EOF
 
+# A shaped optimizer with no safe selected point may still finish as schema-8
+# Review when the independent full-raw control is safe.  It must emit exactly
+# one no-SQM candidate and must never fabricate an applicable shaped rate.
+(
+	export CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1
+	# shellcheck disable=SC1090
+	. "$autotune"
+	stage_complete_result() {
+		printf '%s\n' "$proposals_json" > "$work/raw-only-terminal-proposals.json"
+		printf '%s\n' "$profile_outcome_json" > "$work/raw-only-terminal-outcome.json"
+	}
+	worker_token=abcdef0123456789abcdef0123456789
+	calibration_strategy=full_raw
+	phase_evidence_complete=true
+	phase_contamination_seen=false
+	baseline_quality_provisional=false
+	unresolved_background_contamination=false
+	validation_contaminated=false
+	observed_background_dl_max_share_percent=0
+	observed_background_ul_max_share_percent=0
+	autotune_profile=variable_link
+	proposal='{"schema_version":3,"profile":"variable_link","target_grade":"B","download":{"base_kbps":80000},"upload":{"base_kbps":8000}}'
+	validation_json='{"safety_pass":false,"actual_grade":"C"}'
+	validation_candidate_realization_min_percent=80
+	validation_candidate_realization_max_percent=110
+	validation_capacity_retention_min_percent=70
+	validation_delay_max_ms=60
+	validation_manual_latency_review_max_ms=200
+	validation_loss_max_percent=1
+	validation_cpu_max_percent=90
+	effective_loaded_delta_ms=120
+	bidirectional_effective_delta_ms=120
+	shaped_dl=60000
+	shaped_ul=7000
+	raw_dl_low=100000
+	raw_ul_low=10000
+	raw_control_json='{"available":true,"measurement_evidence":{"valid":true,"reason":"ok","test_direction":"both","shaper_bypassed":true,"sqm_paused":true,"sqm_bypass_mode":"paused-managed"},"grade":"C","effective_delta_ms":150,"throughput":{"download_kbps":100000,"upload_kbps":10000},"icmp_latency":{"loss_percent":0},"forwarded_background":{"available":true,"contaminated":false,"download_kbps":0,"upload_kbps":0,"download_limit_kbps":1000,"upload_limit_kbps":1000}}'
+	dl_search_json='{"schema_version":2,"profile":"variable_link","direction":"download","action":"inconclusive","reason":"no-safe-observation"}'
+	ul_search_json='{"schema_version":2,"profile":"variable_link","direction":"upload","action":"inconclusive","reason":"no-safe-observation"}'
+	validation_attempts_json='{"safety_pass":false}'
+	runs_json='{}'
+	fair_disable_available=false
+	dl_search_no_cake_effect=false
+	ul_search_no_cake_effect=false
+	complete_raw_only_review profile-search-inconclusive:no-safe-observation
+)
+node - "$work/raw-only-terminal-proposals.json" "$work/raw-only-terminal-outcome.json" <<'EOF'
+const fs = require('node:fs');
+const proposals = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const outcome = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+if (proposals.length !== 1 || proposals[0].topology !== 'no_sqm' ||
+    proposals[0].action !== 'disable_sqm' || proposals[0].configuration !== null ||
+    proposals[0].hard_safety_pass !== true)
+	throw new Error('safe raw-only terminal did not expose exactly one no-SQM proposal');
+if (outcome.mode !== 'raw-only-safe-review' || outcome.shaped_search_available !== false ||
+    outcome.manual_only !== true)
+	throw new Error('raw-only terminal did not describe the unavailable shaped search');
+EOF
+
 (
 	export CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1
 	# shellcheck disable=SC1090
@@ -1016,22 +1293,33 @@ EOF
 	bidirectional_latency_pass=false
 	bidirectional_loss_pass=true
 	bidirectional_download_kbps=42000
+	bidirectional_upload_kbps=7500
 	bidirectional_effective_delta_ms=60
 	dl_base=45000
 	ul_base=9000
 	validation_delay_max_ms=30
+	validation_manual_latency_review_max_ms=60
 	validation_loss_max_percent=1
 	validation_candidate_realization_min_percent=80
+	validation_candidate_realization_max_percent=110
 	directional_mock_count=0
 	write_status() { :; }
 	run_validation_direction_phase() {
 		directional_mock_count=$((directional_mock_count + 1))
-		phase_achieved_dl_kbps=50000
-		phase_achieved_ul_kbps=9000
+		case "$3" in
+			download_only_shaped)
+				phase_achieved_dl_kbps=45000
+				phase_achieved_ul_kbps=7600
+				;;
+			*)
+				phase_achieved_dl_kbps=50000
+				phase_achieved_ul_kbps=9000
+				;;
+		esac
 		phase_icmp_delta_ms=4
 		phase_transport_delta_ms=8
 		phase_loss_percent=0
-		phase_observation_json="{\"topology\":\"upload_only_shaped\",\"sequence\":$directional_mock_count,\"measurement_evidence\":{\"shaper_bypassed\":true,\"sqm_paused\":false,\"sqm_bypass_mode\":\"ingress-only-managed\"}}"
+		phase_observation_json="{\"topology\":\"${3:-upload_only_shaped}\",\"sequence\":$directional_mock_count,\"throughput_kbps\":{\"download_kbps\":$phase_achieved_dl_kbps,\"upload_kbps\":$phase_achieved_ul_kbps},\"measurement_evidence\":{\"shaper_bypassed\":true,\"sqm_paused\":false}}"
 	}
 	build_directional_recommendation
 	printf '%s\n' "$directional_recommendation_json" > "$work/directional-upload-only.json"
@@ -1057,23 +1345,34 @@ EOF
 	bidirectional_latency_pass=false
 	bidirectional_loss_pass=true
 	bidirectional_download_kbps=42000
+	bidirectional_upload_kbps=7500
 	bidirectional_effective_delta_ms=60
 	dl_base=45000
 	ul_base=9000
 	validation_delay_max_ms=30
+	validation_manual_latency_review_max_ms=60
 	validation_loss_max_percent=1
 	validation_candidate_realization_min_percent=80
+	validation_candidate_realization_max_percent=110
 	directional_mock_count=0
 	write_status() { :; }
 	run_validation_direction_phase() {
 		directional_mock_count=$((directional_mock_count + 1))
-		phase_achieved_dl_kbps=50000
-		phase_achieved_ul_kbps=9000
+		case "$3" in
+			download_only_shaped)
+				phase_achieved_dl_kbps=45000
+				phase_achieved_ul_kbps=7500
+				;;
+			*)
+				phase_achieved_dl_kbps=50000
+				phase_achieved_ul_kbps=9000
+				;;
+		esac
 		phase_icmp_delta_ms=4
 		phase_transport_delta_ms=8
-		[ "$directional_mock_count" -eq 1 ] || phase_achieved_dl_kbps=35000
+		[ "$directional_mock_count" -ne 2 ] || phase_achieved_dl_kbps=35000
 		phase_loss_percent=0
-		phase_observation_json="{\"topology\":\"upload_only_shaped\",\"sequence\":$directional_mock_count}"
+		phase_observation_json="{\"topology\":\"${3:-upload_only_shaped}\",\"sequence\":$directional_mock_count,\"throughput_kbps\":{\"download_kbps\":$phase_achieved_dl_kbps,\"upload_kbps\":$phase_achieved_ul_kbps}}"
 	}
 	build_directional_recommendation
 	printf '%s\n' "$directional_recommendation_json" > "$work/directional-noisy.json"
@@ -1082,8 +1381,223 @@ node - "$work/directional-noisy.json" <<'EOF'
 const fs = require('node:fs');
 const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 if (result.recommended_topology !== 'manual_review' || result.manual_only !== true ||
-    result.reason !== 'upload-only-benefit-not-repeatable' || result.repeatable !== false)
+    result.reason !== 'one-sided-benefit-not-repeatable' || result.repeatable !== false)
 	throw new Error('inconsistent directional evidence did not fail closed to manual review');
+EOF
+
+# Symmetric evidence can recommend retaining download CAKE while bypassing
+# upload CAKE when only the latter causes a repeatable throughput penalty.
+(
+	export CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1
+	# shellcheck disable=SC1090
+	. "$autotune"
+	calibration_strategy=full_raw
+	bidirectional_attempt=5
+	bidirectional_auto_apply_pass=false
+	validation_quality_target_met=false
+	validation_profile_objectives_met=false
+	bidirectional_latency_pass=false
+	bidirectional_loss_pass=true
+	bidirectional_download_kbps=42000
+	bidirectional_upload_kbps=7000
+	bidirectional_effective_delta_ms=60
+	dl_base=45000
+	ul_base=9000
+	validation_delay_max_ms=30
+	validation_manual_latency_review_max_ms=60
+	validation_loss_max_percent=1
+	validation_candidate_realization_min_percent=80
+	validation_candidate_realization_max_percent=110
+	directional_mock_count=0
+	write_status() { :; }
+	run_validation_direction_phase() {
+		directional_mock_count=$((directional_mock_count + 1))
+		case "$3" in
+			download_only_shaped)
+				phase_achieved_dl_kbps=45000
+				phase_achieved_ul_kbps=9000
+				phase_icmp_delta_ms=4
+				phase_transport_delta_ms=8
+				;;
+			*)
+				phase_achieved_dl_kbps=42000
+				phase_achieved_ul_kbps=7050
+				phase_icmp_delta_ms=30
+				phase_transport_delta_ms=55
+				;;
+		esac
+		phase_loss_percent=0
+		phase_observation_json="{\"topology\":\"${3:-upload_only_shaped}\",\"sequence\":$directional_mock_count,\"throughput_kbps\":{\"download_kbps\":$phase_achieved_dl_kbps,\"upload_kbps\":$phase_achieved_ul_kbps}}"
+	}
+	build_directional_recommendation
+	printf '%s\n' "$directional_recommendation_json" > "$work/directional-download-only.json"
+	printf '%s\n' "$directional_comparisons_json" > "$work/directional-comparisons.json"
+	worker_token=0123456789abcdef0123456789abcdef
+	autotune_profile=best_overall
+	proposal='{"download":{"minimum_kbps":30000,"base_kbps":45000,"maximum_kbps":50000,"observed_low_kbps":40000},"upload":{"minimum_kbps":6000,"base_kbps":9000,"maximum_kbps":10000,"observed_low_kbps":8000}}'
+	effective_loaded_delta_ms=60
+	profile_target_met=false
+	profile_capacity_floor_met=true
+	profile_capacity_floor=80
+	bidirectional_realization_pass=false
+	confidence_mode=normal
+	validation_safety_pass=false
+	bidirectional_safety_pass=false
+	phase_evidence_complete=true
+	profile_actual_grade=B
+	overall_confidence_percent=90
+	raw_dl_low=40000
+	raw_ul_low=8000
+	raw_control_json='{"available":false}'
+	fair_disable_available=false
+	dl_search_no_cake_effect=false
+	ul_search_no_cake_effect=false
+	auto_apply_eligible=false
+	manual_apply_eligible=false
+	build_result_proposals
+	printf '%s\n' "$proposals_json" > "$work/directional-download-only-proposals.json"
+	# Final simultaneous realization between the 50% hard boundary and the
+	# ordinary 80% confidence objective is reviewable, not invisible.
+	validation_safety_pass=true
+	bidirectional_safety_pass=true
+	validation_json='{"safety_pass":true}'
+	bidirectional_confirmation_json='{"tested":true,"safety_pass":true}'
+	profile_floor_infeasible=false
+	dl_runtime_minimum_valid=true
+	ul_runtime_minimum_valid=true
+	build_result_proposals
+	printf '%s\n' "$proposals_json" > "$work/directional-realization-advisory-proposals.json"
+	dl_runtime_minimum_valid=false
+	ul_runtime_minimum_valid=true
+	build_result_proposals
+	printf '%s\n' "$proposals_json" > "$work/directional-missing-minimum-proposals.json"
+)
+node - "$work/directional-download-only.json" "$work/directional-comparisons.json" "$work/directional-download-only-proposals.json" "$work/directional-missing-minimum-proposals.json" "$work/directional-realization-advisory-proposals.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const comparisons = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+const proposals = JSON.parse(fs.readFileSync(process.argv[4], 'utf8'));
+const missingMinimum = JSON.parse(fs.readFileSync(process.argv[5], 'utf8'));
+const realizationAdvisory = JSON.parse(fs.readFileSync(process.argv[6], 'utf8'));
+if (result.recommended_topology !== 'download_only_shaped' ||
+    result.reason !== 'repeatable-upload-bypass-benefit' || result.repeatable !== true ||
+    result.observations.length !== 2 || result.observations.some(item => item.candidate_pass !== true))
+	throw new Error('repeatable download-only evidence was not selected');
+if (comparisons.download_only.recommended_topology !== 'download_only_shaped' ||
+    comparisons.upload_only.recommended_topology !== 'manual_review')
+	throw new Error('both one-sided comparisons were not retained');
+if (proposals.length !== 2 || proposals[0].topology !== 'download_only_shaped' ||
+    proposals[0].evidence.recommendation !== 'directional_comparisons.download_only' ||
+    proposals[0].is_primary !== true)
+	throw new Error('download-only evidence was not emitted as a bound primary proposal');
+if (proposals[1].topology !== 'upload_only_shaped' ||
+    proposals[1].evidence.recommendation !== 'directional_comparisons.upload_only' ||
+    !proposals[1].unmet_objectives.includes('throughput-benefit-unproven'))
+	throw new Error('safe but non-beneficial upload-only alternative was hidden');
+if (missingMinimum.length !== 1 || missingMinimum[0].topology !== 'upload_only_shaped')
+	throw new Error('a one-sided topology did not require only its still-shaped direction runtime minimum');
+const shapedAdvisory = realizationAdvisory.find(item => item.topology === 'both_shaped');
+if (!shapedAdvisory || shapedAdvisory.hard_safety_pass !== true ||
+    !shapedAdvisory.unmet_objectives.includes('candidate-realization'))
+	throw new Error('a 50-80% final realization result was hidden instead of retained for explicit review');
+EOF
+
+# A clean full-raw control is a manual no-SQM proposal for every non-Fair
+# profile, even when it misses that profile's preferred grade. The per-profile
+# manual latency ceiling remains a hard bound; Fair continues to use its typed
+# fair_outcome comparison instead of this generic path.
+
+(
+	export CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1
+	# shellcheck disable=SC1090
+	. "$autotune"
+	worker_token=abcdef0123456789abcdef0123456789
+	calibration_strategy=full_raw
+	phase_evidence_complete=true
+	proposal='{"download":{"base_kbps":80000},"upload":{"base_kbps":8000}}'
+	effective_loaded_delta_ms=15
+	bidirectional_effective_delta_ms=15
+	profile_target_met=false
+	profile_capacity_floor_met=true
+	bidirectional_realization_pass=true
+	confidence_mode=normal
+	validation_safety_pass=false
+	bidirectional_safety_pass=false
+	profile_floor_infeasible=true
+	dl_runtime_minimum_valid=false
+	ul_runtime_minimum_valid=false
+	profile_actual_grade=A
+	overall_confidence_percent=90
+	shaped_dl=80000
+	shaped_ul=8000
+	raw_dl_low=100000
+	raw_ul_low=10000
+	raw_control_json='{"available":true,"measurement_evidence":{"valid":true,"reason":"ok","test_direction":"both","shaper_bypassed":true,"sqm_paused":true,"sqm_bypass_mode":"paused-managed"},"grade":"A","effective_delta_ms":10,"throughput":{"download_kbps":100000,"upload_kbps":10000},"icmp_latency":{"loss_percent":0},"forwarded_background":{"available":true,"contaminated":false,"download_kbps":0,"upload_kbps":0,"download_limit_kbps":1000,"upload_limit_kbps":1000}}'
+	fair_disable_available=false
+	dl_search_no_cake_effect=false
+	ul_search_no_cake_effect=false
+	directional_recommendation_json='{"recommended_topology":"both_shaped"}'
+	upload_only_recommendation_json=null
+	download_only_recommendation_json=null
+	for autotune_profile in gaming gaming_extreme best_overall variable_link; do
+		case "$autotune_profile" in
+			gaming|gaming_extreme) validation_manual_latency_review_max_ms=30 ;;
+			best_overall) validation_manual_latency_review_max_ms=60 ;;
+			variable_link) validation_manual_latency_review_max_ms=200 ;;
+		esac
+		validation_loss_max_percent=1
+		auto_apply_eligible=false
+		manual_apply_eligible=false
+		build_result_proposals
+		printf '%s\t%s\n' "$autotune_profile" "$proposals_json"
+	done > "$work/generic-no-sqm-proposals.tsv"
+	# Utility misses are explicit Review tradeoffs, not reasons to hide the only
+	# independently safe raw topology.
+	autotune_profile=best_overall
+	validation_manual_latency_review_max_ms=60
+	shaped_dl=110000
+	shaped_ul=11000
+	effective_loaded_delta_ms=1
+	bidirectional_effective_delta_ms=1
+	raw_control_json="$(printf '%s\n' "$raw_control_json" |
+		sed 's/\"effective_delta_ms\":10/\"effective_delta_ms\":12/')"
+	build_result_proposals
+	printf '%s\n' "$proposals_json" > "$work/generic-no-sqm-tradeoffs.json"
+	# Each hard-gate mutation must suppress the raw topology.
+	for raw_gate_case in invalid-bypass excessive-loss excessive-latency contaminated zero-throughput; do
+		case "$raw_gate_case" in
+			invalid-bypass) raw_control_json='{"available":true,"measurement_evidence":{"valid":true,"test_direction":"both","shaper_bypassed":false,"sqm_paused":true,"sqm_bypass_mode":"paused-managed"},"grade":"A","effective_delta_ms":10,"throughput":{"download_kbps":100000,"upload_kbps":10000},"icmp_latency":{"loss_percent":0},"forwarded_background":{"available":true,"contaminated":false,"download_kbps":0,"upload_kbps":0,"download_limit_kbps":1000,"upload_limit_kbps":1000}}' ;;
+			excessive-loss) raw_control_json='{"available":true,"measurement_evidence":{"valid":true,"test_direction":"both","shaper_bypassed":true,"sqm_paused":true,"sqm_bypass_mode":"paused-managed"},"grade":"A","effective_delta_ms":10,"throughput":{"download_kbps":100000,"upload_kbps":10000},"icmp_latency":{"loss_percent":2},"forwarded_background":{"available":true,"contaminated":false,"download_kbps":0,"upload_kbps":0,"download_limit_kbps":1000,"upload_limit_kbps":1000}}' ;;
+			excessive-latency) raw_control_json='{"available":true,"measurement_evidence":{"valid":true,"test_direction":"both","shaper_bypassed":true,"sqm_paused":true,"sqm_bypass_mode":"paused-managed"},"grade":"C","effective_delta_ms":61,"throughput":{"download_kbps":100000,"upload_kbps":10000},"icmp_latency":{"loss_percent":0},"forwarded_background":{"available":true,"contaminated":false,"download_kbps":0,"upload_kbps":0,"download_limit_kbps":1000,"upload_limit_kbps":1000}}' ;;
+			contaminated) raw_control_json='{"available":true,"measurement_evidence":{"valid":true,"test_direction":"both","shaper_bypassed":true,"sqm_paused":true,"sqm_bypass_mode":"paused-managed"},"grade":"A","effective_delta_ms":10,"throughput":{"download_kbps":100000,"upload_kbps":10000},"icmp_latency":{"loss_percent":0},"forwarded_background":{"available":true,"contaminated":true,"download_kbps":0,"upload_kbps":0,"download_limit_kbps":1000,"upload_limit_kbps":1000}}' ;;
+			zero-throughput) raw_control_json='{"available":true,"measurement_evidence":{"valid":true,"test_direction":"both","shaper_bypassed":true,"sqm_paused":true,"sqm_bypass_mode":"paused-managed"},"grade":"A","effective_delta_ms":10,"throughput":{"download_kbps":0,"upload_kbps":10000},"icmp_latency":{"loss_percent":0},"forwarded_background":{"available":true,"contaminated":false,"download_kbps":0,"upload_kbps":0,"download_limit_kbps":1000,"upload_limit_kbps":1000}}' ;;
+		esac
+		build_result_proposals
+		printf '%s\t%s\n' "$raw_gate_case" "$proposals_json"
+	done > "$work/generic-no-sqm-hard-gates.tsv"
+)
+node - "$work/generic-no-sqm-proposals.tsv" "$work/generic-no-sqm-tradeoffs.json" "$work/generic-no-sqm-hard-gates.tsv" <<'EOF'
+const fs = require('node:fs');
+for (const line of fs.readFileSync(process.argv[2], 'utf8').trim().split('\n')) {
+	const [profile, json] = line.split('\t');
+	const proposals = JSON.parse(json);
+	if (proposals.length !== 1 || proposals[0].topology !== 'no_sqm' ||
+	    proposals[0].action !== 'disable_sqm' || proposals[0].hard_safety_pass !== true)
+		throw new Error(`generic clean raw control was hidden behind an unsafe shaped search for ${profile}`);
+	const shouldMeetTarget = profile === 'best_overall' || profile === 'variable_link';
+	if (proposals[0].profile_target_met !== shouldMeetTarget)
+		throw new Error(`raw-control target classification is wrong for ${profile}`);
+}
+const tradeoffs = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+if (tradeoffs.length !== 1 || tradeoffs[0].topology !== 'no_sqm' ||
+    !tradeoffs[0].unmet_objectives.includes('throughput-benefit-unproven') ||
+    !tradeoffs[0].unmet_objectives.includes('latency-worse-than-shaped'))
+	throw new Error('safe no-SQM utility misses were hidden instead of exposed as tradeoffs');
+for (const line of fs.readFileSync(process.argv[4], 'utf8').trim().split('\n')) {
+	const [gate, json] = line.split('\t');
+	if (JSON.parse(json).length !== 0)
+		throw new Error(`unsafe raw control passed the ${gate} hard gate`);
+}
 EOF
 
 (
@@ -1103,8 +1617,10 @@ EOF
 	dl_base=45000
 	ul_base=9000
 	validation_delay_max_ms=30
+	validation_manual_latency_review_max_ms=60
 	validation_loss_max_percent=1
 	validation_candidate_realization_min_percent=80
+	validation_candidate_realization_max_percent=110
 	evaluate_upload_only_observation
 	[ "$upload_only_latency_pass" = true ]
 	[ "$upload_only_loss_pass" = true ]
@@ -1520,7 +2036,7 @@ unset CAKE_AUTORATE_SYS_CLASS_NET AUTOTUNE_MOCK_BLOCK_AT_COUNT AUTOTUNE_MOCK_BLO
 export AUTOTUNE_MOCK_BLOCK=1
 export AUTOTUNE_MOCK_RESTORE_MARKER="$work/restored"
 export AUTOTUNE_MOCK_BLOCK_STARTED="$work/block-started"
-"$autotune" cancelled lo start speedtest-go > "$work/cancel-start.json"
+"$autotune" cancelled lo start speedtest-go '' '' best_overall 0 '' 0 shaped_only > "$work/cancel-start.json"
 
 attempt=0
 while [ "$attempt" -lt 220 ]; do
@@ -1546,6 +2062,8 @@ grep -q 'status was not attached to this uplink' "$work/mismatched-live-status.j
 kill -0 "$(sed -n '1p' "$work/jobs/cancelled/pid")"
 
 "$autotune" cancelled lo cancel speedtest-go > "$work/cancel.json"
+grep -q '"requested_calibration_strategy":"shaped_only"' "$work/cancel.json"
+grep -q '"requested_target_interface":"lo"' "$work/cancel.json"
 attempt=0
 while [ "$attempt" -lt 220 ]; do
 	"$autotune" cancelled lo status speedtest-go > "$work/cancel-status.json"
@@ -1586,6 +2104,11 @@ grep -q '"state":"cancelled"' "$work/cancel-after-status.json"
 test -f "$work/restored-after-helper"
 wait_for_job_cleanup cancelledafter
 unset AUTOTUNE_MOCK_BLOCK_AT_COUNT AUTOTUNE_MOCK_RESTORE_MARKER AUTOTUNE_MOCK_BLOCK_STARTED
+
+fi
+
+if [ "$autotune_test_part" = all ] || [ "$autotune_test_part" = late ] ||
+   [ "$autotune_test_part" = late_core ]; then
 
 # Exercise the real monitor helpers rather than only the fixed shaped-test
 # fixture.  One invocation per second is the safety contract; -p on fping is
@@ -1672,6 +2195,17 @@ printf '%s\n' "$fair_outcome_json" | grep -q '"apply_sqm_available":true'
 printf '%s\n' "$fair_outcome_json" | grep -q '"disable_sqm_available":false'
 printf '%s\n' "$fair_outcome_json" | grep -q '"recommended_action":"apply_sqm"'
 printf '%s\n' "$fair_outcome_json" | grep -q '"comparison_reason":"historical-capacity-comparison-warning"'
+
+# A worse simultaneous DL+UL confirmation is the authoritative Fair verdict,
+# even when isolated directional validation still measured C below 200 ms.
+profile_safety_floor_met=true
+validation_actual_grade=C
+effective_loaded_delta_ms=191.5
+fair_control_json='{"available":false,"measurement_evidence":{"valid":false,"reason":"not-tested"}}'
+build_fair_outcome throughput-fallback safety-floor-met capacity-objective-missed D 224.2
+printf '%s\n' "$fair_outcome_json" | grep -q '"actual_grade":"D"'
+printf '%s\n' "$fair_outcome_json" | grep -q '"actual_effective_delta_ms":224.2'
+printf '%s\n' "$fair_outcome_json" | grep -q '"recommended_action":"apply_sqm"'
 
 # Aggregate CPU can hide a saturated packet-processing core. The effective
 # safety signal is therefore the worse of total utilization and the busiest
@@ -2271,11 +2805,102 @@ unset AUTOTUNE_MOCK_NFT_FAIL_LIST AUTOTUNE_MOCK_NFT_LOG
 export CAKE_AUTORATE_AUTOTUNE_TEST_PREFLIGHT=1
 export PATH="$original_path"
 
-# The complete worker pipeline reproduces the observed Fair boundary result:
-# the first candidate and the real upper bound retain less than Fair's 90%
-# objective, but remain above the 50% historical trust boundary with good
-# latency. Keep the fastest safe point for explicit review without silently
-# lowering the profile objective or writing configuration itself.
+fi
+
+if [ "$autotune_test_part" = all ] || [ "$autotune_test_part" = late ] ||
+   [ "$autotune_test_part" = late_workers ]; then
+
+# The worker-only split sources the same helpers in a fresh process group. This
+# keeps timeout/process-group regression tests independent from long-running
+# Variable Link workers when a test runner imposes a short session lifetime.
+if [ "$autotune_test_part" = late_workers ]; then
+	export CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1
+	. "$autotune"
+	unset CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY
+fi
+
+# Variable Link must terminate a flat, target-meeting direction without
+# cancelling the peer search. Upload reaches the typed no-effect fallback on
+# attempt three; download continues to a measured knee on attempt four. The
+# terminal proposal is manual-only and keeps both runtime minima tied to
+# actually evaluated candidates.
+: > "$work/counter"
+export AUTOTUNE_MOCK_VARIABLE_DIRECTIONAL_NO_EFFECT=1
+"$autotune" variabledirectional lo start speedtest-go '' '' variable_link > "$work/variabledirectional-start.json"
+attempt=0
+while [ "$attempt" -lt 500 ]; do
+	"$autotune" variabledirectional lo status speedtest-go '' '' variable_link > "$work/variabledirectional-status.json"
+	grep -q '"state":"complete"' "$work/variabledirectional-status.json" && break
+	attempt=$((attempt + 1))
+	sleep 0.05
+done
+node - "$work/variabledirectional-status.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const download = result.profile_search && result.profile_search.download;
+const upload = result.profile_search && result.profile_search.upload;
+if (result.state !== 'complete' || result.profile !== 'variable_link' ||
+    result.configuration_written !== false || result.auto_apply_eligible !== false ||
+    result.manual_apply_eligible !== true || result.phase_evidence_complete !== true ||
+    result.profile_outcome.mode !== 'directional-no-cake-effect-review' ||
+    !result.bidirectional_confirmation || result.bidirectional_confirmation.safety_pass !== true ||
+    !download || download.knee_detected !== true || download.no_cake_effect !== false ||
+    !upload || upload.action !== 'fallback' || upload.reason !== 'queue-outside-cake-control' ||
+    upload.knee_detected !== false || upload.no_cake_effect !== true ||
+    upload.selected.safety_pass !== true || upload.selected.target_met !== true ||
+    upload.selected.retention_percent < 50 ||
+    upload.runtime_minimum_kbps !== upload.selected.candidate_kbps ||
+    result.proposal.upload.minimum_kbps !== upload.runtime_minimum_kbps ||
+    download.evaluated.length <= upload.evaluated.length)
+	throw new Error('directional Variable-link no-effect fallback did not preserve the peer search');
+EOF
+wait_for_job_cleanup variabledirectional
+unset AUTOTUNE_MOCK_VARIABLE_DIRECTIONAL_NO_EFFECT AUTOTUNE_MOCK_CURRENT_DL_KBPS AUTOTUNE_MOCK_CURRENT_UL_KBPS
+
+# Directional evidence is not independently applicable when the final
+# simultaneous DL+UL confirmation exceeds the profile's manual safety limit.
+# Preserve the original reason for consumers, emit a typed terminal state, and
+# offer only an explicit new Fair measurement—not a proposal or topology hint.
+if CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
+	. "$1"
+	autotune_profile=variable_link
+	phase_contamination_seen=false
+	runs_json=
+	phase_background_runs_json=
+	validation_attempts_json=
+	dl_search_json=null
+	ul_search_json=null
+	pinger_plan=null
+	proposal=null
+	stage_terminal_json() { printf "%s\n" "$2"; }
+	route_diagnostics_json() { printf "{}"; }
+	background_json() { printf "{}"; }
+	baseline_diagnostics_json() { printf "{}"; }
+	measurement_inconclusive confirmation directional-manual-fallback-final-pair-unsafe
+' sh "$autotune" > "$work/joint-unsafe-variable.json"; then
+	echo "joint-unsafe measurement unexpectedly returned success" >&2
+	exit 1
+fi
+node - "$work/joint-unsafe-variable.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (result.state !== 'inconclusive' || result.stage !== 'confirmation' ||
+    result.search_state !== 'joint_unsafe' ||
+    result.reason !== 'directional-manual-fallback-final-pair-unsafe' ||
+    result.recommended_profile !== 'fair' || result.retryable !== true ||
+    result.auto_apply_eligible !== false || result.manual_apply_eligible !== false ||
+    result.configuration_written !== false || result.proposal !== null ||
+    !/simultaneous download and upload confirmation exceeded/.test(result.error))
+	throw new Error(`unsafe joint confirmation did not remain fail-closed: ${JSON.stringify(result)}`);
+EOF
+
+# The complete worker pipeline reproduces the observed Fair boundary result.
+# Its directional search retains more than 50% of historical capacity, while
+# the final simultaneous phase realizes less than 50% of the selected pair.
+# Keep those dimensions separate: historical trust remains true, but the hard
+# final-realization boundary refuses every shaped topology. A separately
+# measured clean raw control may still offer the exact no-SQM topology for
+# explicit review; it must not resurrect or invent a CAKE rate.
 : > "$work/counter"
 real_daemon="$CAKE_AUTORATE_DAEMON"
 export AUTOTUNE_REAL_DAEMON="$real_daemon"
@@ -2295,6 +2920,8 @@ const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const download = result.profile_search && result.profile_search.download;
 const upload = result.profile_search && result.profile_search.upload;
 const candidates = download && download.evaluated.map(item => item.candidate_kbps);
+const proposals = Array.isArray(result.proposals) ? result.proposals : [];
+const noSqm = proposals.find(item => item.topology === 'no_sqm');
 if (result.state !== 'complete' || result.profile !== 'fair' ||
     result.configuration_written !== false || result.validation.safety_pass !== true ||
     result.validation.quality_target_met !== true ||
@@ -2308,8 +2935,25 @@ if (result.state !== 'complete' || result.profile !== 'fair' ||
     download.selected.retention_percent < 50 ||
     download.selected.capacity_objective_met !== false ||
     upload.selected.candidate_kbps !== 900000 ||
-    upload.selected.retention_percent < 90 || upload.selected.capacity_objective_met !== true)
-	throw new Error('Fair bounded search did not preserve the fastest reviewable safe solution');
+    upload.selected.retention_percent < 90 || upload.selected.capacity_objective_met !== true ||
+    proposals.length !== 1 || !noSqm || noSqm.action !== 'disable_sqm' ||
+    noSqm.hard_safety_pass !== true || noSqm.configuration !== null ||
+    proposals.some(item => item.action === 'apply_sqm'))
+	throw new Error(`Fair bounded search did not preserve the fastest reviewable safe solution: ${JSON.stringify({
+		state: result.state,
+		profile: result.profile,
+		validation: result.validation && {
+			safety: result.validation.safety_pass,
+			quality: result.validation.quality_target_met,
+			objectives: result.validation.profile_objectives_met,
+		},
+		auto: result.auto_apply_eligible,
+		manual: result.manual_apply_eligible,
+		outcome: result.profile_outcome,
+		candidates,
+		download,
+		upload,
+	})}`);
 EOF
 grep -Eq '"config_fingerprint":"sha256:[0-9a-f]{64}"' "$work/fairboundary-status.json"
 wait_for_job_cleanup fairboundary
@@ -2364,5 +3008,7 @@ grep -q '"job_id":"largeterminal"' "$work/large-summary.json"
 [ -s "$work/jobs/largeterminal/terminal.integrity" ]
 "$autotune" largeterminal lo result speedtest-go > "$work/large-result.json"
 cmp "$work/jobs/largeterminal/result.json" "$work/large-result.json"
+
+fi
 
 printf '%s\n' 'autotune lifecycle tests passed'

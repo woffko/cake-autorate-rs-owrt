@@ -416,6 +416,24 @@ if grep -q '|LIVE|' "$work/strict-uci-context.log"; then
 	fail "strict recovery consulted mutable live UCI"
 fi
 
+# The immutable check form proves the exact snapshot topology under the same
+# inherited lock but never repairs it.  This closes the crash window where SQM
+# was already restored before the caller durably cleared its journal flags.
+before="$(action_count)"
+CAKE_TEST_UCI_CONTEXT_LOG="$work/strict-uci-context.log" \
+CAKE_TEST_MUTABLE_CAKE_UCI=1 CAKE_TEST_LIVE_SQM_SHOW_CHANGED=1 \
+	"$helper" wanb_sqm cake_wanb_sqm eth0 eth0 ifb4eth0 \
+	"$sqm_fingerprint" "$snapshot" check
+[ "$(action_count)" -eq "$before" ] || fail "healthy immutable check mutated SQM"
+printf '%s\n' wrong-bandwidth > "$work/tc-mode"
+expect_failure_rc_one "unhealthy immutable check" "$work/strict-check-bad.out" \
+	"$work/strict-check-bad.err" \
+	"$helper" wanb_sqm cake_wanb_sqm eth0 eth0 ifb4eth0 \
+	"$sqm_fingerprint" "$snapshot" check
+grep -q 'not an exact CAKE' "$work/strict-check-bad.err"
+[ "$(action_count)" -eq "$before" ] || fail "unhealthy immutable check repaired SQM"
+rm -f "$work/tc-mode"
+
 # Simulate the precise crash window: SQM is unhealthy and live UCI has changed
 # after the snapshot was journalled.  Recovery must still use the old snapshot,
 # restore the old shaper exactly, and leave both live UCI and snapshot alone.

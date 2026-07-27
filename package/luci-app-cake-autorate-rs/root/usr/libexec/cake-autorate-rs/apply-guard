@@ -79,6 +79,15 @@ safe_fingerprint() {
 	esac
 }
 
+safe_proposal_id() {
+	case "$1" in
+		p-????????????????????????)
+			case "${1#p-}" in *[!0-9a-f]*) return 1 ;; esac
+			;;
+		*) return 1 ;;
+	esac
+}
+
 safe_boot_id() {
 	case "$1" in
 		????????-????-????-????-????????????)
@@ -153,6 +162,13 @@ is_positive_rate() {
 is_decimal() {
 	case "$1" in
 		''|*[!0-9.]*|.*|*..*|*.) return 1 ;;
+	esac
+}
+
+is_signed_decimal() {
+	case "$1" in
+		-*) is_decimal "${1#-}" ;;
+		*) is_decimal "$1" ;;
 	esac
 }
 
@@ -547,6 +563,13 @@ load_profile_contract() {
 		numbers_equal "$validation_cpu" 85 &&
 		numbers_equal "$validation_icmp" "$validation_transport" ||
 		die "The Full Auto-Tune common validation policy is invalid."
+	case "$profile" in
+		gaming|gaming_extreme) validation_manual_latency_review=30 ;;
+		best_overall) validation_manual_latency_review=60 ;;
+		variable_link) validation_manual_latency_review=200 ;;
+		fair) validation_manual_latency_review=400 ;;
+		*) die "The Full Auto-Tune profile has no manual latency-review boundary." ;;
+	esac
 
 	for threshold_pair in \
 		"@.validation_thresholds.candidate_realization_min_percent:$validation_realization_min" \
@@ -554,6 +577,7 @@ load_profile_contract() {
 		"@.validation_thresholds.capacity_retention_min_percent:$validation_retention" \
 		"@.validation_thresholds.throughput_safety_floor_percent:50" \
 		"@.validation_thresholds.delay_max_ms:$validation_transport" \
+		"@.validation_thresholds.manual_latency_review_max_ms:$validation_manual_latency_review" \
 		"@.validation_thresholds.loss_max_percent:$validation_loss" \
 		"@.validation_thresholds.cpu_max_percent:$validation_cpu"; do
 		threshold_path="${threshold_pair%%:*}"
@@ -684,6 +708,7 @@ write_expected_apply_markers() {
 	expected_set "$marker_job" _autotune_apply_enabled "$marker_enabled"
 	expected_set "$marker_job" _autotune_apply_disable_adaptive "$marker_disable_adaptive"
 	expected_set "$marker_job" _autotune_apply_action "$marker_action"
+	expected_set "$marker_job" _autotune_apply_proposal_id "$proposal_id"
 	expected_set "$marker_job" _autotune_apply_token "$marker_token"
 	expected_set "$marker_job" _autotune_apply_expires "$marker_expires"
 	expected_set "$marker_job" _autotune_apply_boot_id "$marker_boot_id"
@@ -726,6 +751,7 @@ build_expected_manifest() {
 			die "The existing SQM queue is not owned by this instance."
 		expected_set "$job" enabled 0
 		expected_set "$job" sqm_enabled 0
+		expected_set "$job" sqm_direction_mode off
 		write_expected_apply_markers "$job" "$target" "$backend" "$route_mode" "$member" \
 			0 "$disable_adaptive" "$action" "$fingerprint" "$token" "$expires" "$boot_id"
 		uci_at "$token_dir/expected" -q commit cake-autorate || return 1
@@ -740,6 +766,42 @@ build_expected_manifest() {
 	fi
 
 	load_profile_contract
+	case "$selected_topology" in
+		both_shaped)
+			direction_mode=both
+			adjust_dl=1
+			adjust_ul=1
+			sqm_dl_rate_path=download
+			sqm_ul_rate_path=upload
+			;;
+		upload_only_shaped)
+			direction_mode=upload_only
+			adjust_dl=0
+			adjust_ul=1
+			sqm_dl_rate_path=disabled
+			sqm_ul_rate_path=upload
+			case "$(json_get "$result_copy" '@.directional_comparisons.upload_only.recommended_topology')" in
+				upload_only_shaped|manual_review) ;;
+				*) die "The selected upload-only topology is not backed by its directional evidence." ;;
+			esac
+			require_result_flag '@.directional_comparisons.upload_only.repeatable' true \
+				"The selected upload-only topology is not repeatable."
+			;;
+		download_only_shaped)
+			direction_mode=download_only
+			adjust_dl=1
+			adjust_ul=0
+			sqm_dl_rate_path=download
+			sqm_ul_rate_path=disabled
+			case "$(json_get "$result_copy" '@.directional_comparisons.download_only.recommended_topology')" in
+				download_only_shaped|manual_review) ;;
+				*) die "The selected download-only topology is not backed by its directional evidence." ;;
+			esac
+			require_result_flag '@.directional_comparisons.download_only.repeatable' true \
+				"The selected download-only topology is not repeatable."
+			;;
+		*) die "The selected SQM topology is unsupported." ;;
+	esac
 	# serde_json preserves integral floating-point policy values as e.g. 70.0
 	# and 5.0, while JavaScript String() stages the same numbers as 70 and 5.
 	# UCI compares strings, so canonicalize proposal policy numbers before
@@ -842,8 +904,9 @@ build_expected_manifest() {
 	if [ "$route_mode" = mwan3 ]; then expected_set "$job" mwan3_member "$member"; else expected_delete "cake-autorate.$job.mwan3_member"; fi
 	expected_delete "cake-autorate.$job.ping_prefix_string"
 	expected_set "$job" auto_interface_preset 1
-	expected_set "$job" adjust_dl_shaper_rate 1
-	expected_set "$job" adjust_ul_shaper_rate 1
+	expected_set "$job" sqm_direction_mode "$direction_mode"
+	expected_set "$job" adjust_dl_shaper_rate "$adjust_dl"
+	expected_set "$job" adjust_ul_shaper_rate "$adjust_ul"
 	expected_set "$job" manage_sqm 1
 	expected_set "$job" sqm_section "$sqm_section"
 	expected_set "$job" sqm_enabled "$enabled"
@@ -965,8 +1028,16 @@ build_expected_manifest() {
 	uci_at "$token_dir/expected" -q set "sqm.$sqm_section._cake_autorate_managed=$job"
 	uci_at "$token_dir/expected" -q set "sqm.$sqm_section.enabled=$enabled"
 	uci_at "$token_dir/expected" -q set "sqm.$sqm_section.interface=$resolved"
-	uci_at "$token_dir/expected" -q set "sqm.$sqm_section.download=$dl_base"
-	uci_at "$token_dir/expected" -q set "sqm.$sqm_section.upload=$ul_base"
+	if [ "$sqm_dl_rate_path" = download ]; then
+		uci_at "$token_dir/expected" -q set "sqm.$sqm_section.download=$dl_base"
+	else
+		uci_at "$token_dir/expected" -q set "sqm.$sqm_section.download=0"
+	fi
+	if [ "$sqm_ul_rate_path" = upload ]; then
+		uci_at "$token_dir/expected" -q set "sqm.$sqm_section.upload=$ul_base"
+	else
+		uci_at "$token_dir/expected" -q set "sqm.$sqm_section.upload=0"
+	fi
 	for tuple in \
 		"sqm_debug_logging:debug_logging:0" "sqm_verbosity:verbosity:5" \
 		"sqm_qdisc:qdisc:cake" "sqm_script:script:piece_of_cake.qos" \
@@ -1003,7 +1074,7 @@ build_expected_final_manifest() {
 	chmod 600 "$token_dir/expected-final/cake-autorate" "$token_dir/expected-final/sqm" || return 1
 	for final_option in _autotune_apply_guard _autotune_apply_fingerprint _autotune_apply_target \
 		_autotune_apply_backend _autotune_apply_route_mode _autotune_apply_mwan3_member \
-		_autotune_apply_enabled _autotune_apply_disable_adaptive _autotune_apply_action _autotune_apply_token \
+		_autotune_apply_enabled _autotune_apply_disable_adaptive _autotune_apply_action _autotune_apply_proposal_id _autotune_apply_token \
 		_autotune_apply_expires _autotune_apply_boot_id; do
 		if uci_at "$token_dir/expected-final" -q get "cake-autorate.$job.$final_option" >/dev/null 2>&1; then
 			uci_at "$token_dir/expected-final" -q delete "cake-autorate.$job.$final_option" || return 1
@@ -1040,6 +1111,23 @@ result_action_allowed() {
 		grep -F -x -- "$allowed_action" >/dev/null 2>&1
 }
 
+selected_proposal_objective_count() {
+	objective_code="$1"
+	json_get "$result_copy" "$selected_proposal_path.unmet_objectives[*]" 2>/dev/null |
+		awk -v expected="$objective_code" '$0 == expected { count++ } END { print count + 0 }'
+}
+
+require_selected_proposal_objective() {
+	objective_code="$1"
+	objective_expected="$2"
+	objective_message="$3"
+	objective_count="$(selected_proposal_objective_count "$objective_code")"
+	case "$objective_expected:$objective_count" in
+		true:1|false:0) ;;
+		*) die "$objective_message" ;;
+	esac
+}
+
 safe_run_id() {
 	case "$1" in
 		''|*[!A-Za-z0-9_-]*) return 1 ;;
@@ -1059,6 +1147,17 @@ quality_grade_rank() {
 	esac
 }
 
+quality_grade_for_delta() {
+	LC_ALL=C awk -v delta="$1" 'BEGIN {
+		if (delta < 5) print "A+"
+		else if (delta < 30) print "A"
+		else if (delta < 60) print "B"
+		else if (delta < 200) print "C"
+		else if (delta < 400) print "D"
+		else print "F"
+	}'
+}
+
 validate_profile_search_contract() {
 	search_direction="$1"
 	search_allow_unsafe="${2:-false}"
@@ -1073,21 +1172,28 @@ validate_profile_search_contract() {
 	require_result_flag "$search_root.direction" "$search_direction" "The profile-search direction changed."
 	search_action="$(require_result_value "$search_root.action")" ||
 		die "The profile-search terminal action is missing."
+	search_reason="$(json_get "$result_copy" "$search_root.reason")"
 	case "$search_action" in complete|fallback) ;; *) die "The profile search still has a pending or inconclusive action." ;; esac
 	search_selected_safety="$(require_result_value "$search_root.selected.safety_pass")" ||
 		die "The selected direction safety state is missing."
 	case "$search_selected_safety" in
 		true) ;;
 		false)
-			[ "$search_allow_unsafe" = true ] && [ "$search_action" = fallback ] ||
-				die "The selected direction did not preserve its safety floor."
-			search_reason="$(require_result_value "$search_root.reason")" ||
-				die "The unsafe profile-search reason is missing."
-			case "$search_reason" in
-				repeatable-compute-ceiling-below-capacity-floor|repeatable-shaper-ceiling-below-capacity-floor|repeatable-shaper-ceiling-below-safety-floor) ;;
-				*) die "The unsafe profile-search result has no proven repeatable ceiling." ;;
-			esac
-			profile_unsafe_direction_count=$((profile_unsafe_direction_count + 1))
+			[ -n "$search_reason" ] || die "The unsafe profile-search reason is missing."
+			if [ "$profile" = variable_link ] &&
+			   [ "$search_action" = fallback ] &&
+			   [ "$search_reason" = bounded-low-realization-review ]; then
+				require_result_flag "$search_root.selected.manual_reviewable" true \
+					"The bounded low-realization direction lost its manual-review evidence."
+			else
+				[ "$search_allow_unsafe" = true ] && [ "$search_action" = fallback ] ||
+					die "The selected direction did not preserve its safety floor."
+				case "$search_reason" in
+					repeatable-compute-ceiling-below-capacity-floor|repeatable-shaper-ceiling-below-capacity-floor|repeatable-shaper-ceiling-below-safety-floor) ;;
+					*) die "The unsafe profile-search result has no proven repeatable ceiling." ;;
+				esac
+				profile_unsafe_direction_count=$((profile_unsafe_direction_count + 1))
+			fi
 			;;
 		*) die "The selected direction safety state is invalid." ;;
 	esac
@@ -1102,10 +1208,76 @@ validate_profile_search_contract() {
 		numbers_equal "$selected_rate" "$validation_selected_rate" ||
 		die "The selected, proposed, and confirmed direction rates differ."
 	if [ "$profile" = variable_link ]; then
-		require_result_flag "$search_root.knee_detected" true "The Variable link result has no measured latency knee."
-		require_result_flag "$search_root.no_cake_effect" false "The Variable link result reports no CAKE-controlled queue."
-		require_result_flag "$search_root.noisy" false "The Variable link result remained noisy."
-		require_result_flag "$search_root.inconclusive" false "The Variable link result remained inconclusive."
+		[ -n "$search_reason" ] || die "The Variable link terminal reason is missing."
+		search_no_cake_effect="$(require_result_value "$search_root.no_cake_effect")" ||
+			die "The Variable link CAKE-effect state is missing."
+		case "$search_no_cake_effect" in true|false) ;; *) die "The Variable link CAKE-effect state is invalid." ;; esac
+		if [ "$search_no_cake_effect" = true ]; then
+			require_result_flag "$search_root.action" fallback "A no-effect direction must use the typed fallback action."
+			require_result_flag "$search_root.reason" queue-outside-cake-control "The no-effect direction reason changed."
+			require_result_flag "$search_root.knee_detected" false "A no-effect direction cannot also claim a measured knee."
+			require_result_flag "$search_root.noisy" false "A no-effect direction remained noisy."
+			require_result_flag "$search_root.inconclusive" false "A no-effect direction remained inconclusive."
+			require_result_flag "$search_root.selected.target_met" true "The no-effect fallback did not meet its quality target."
+			search_selected_retention="$(require_result_value "$search_root.selected.retention_percent")" ||
+				die "The no-effect fallback retention is missing."
+			is_percent "$search_selected_retention" &&
+				LC_ALL=C awk -v value="$search_selected_retention" 'BEGIN { exit(value >= 50 ? 0 : 1) }' ||
+				die "The no-effect fallback fell below the catastrophic throughput floor."
+			profile_no_cake_effect_count=$((profile_no_cake_effect_count + 1))
+		elif [ "$search_reason" = exploration-floor-reached ]; then
+			require_result_flag "$search_root.action" fallback "The exploration-floor direction must use the typed fallback action."
+			require_result_flag "$search_root.knee_detected" false "The exploration-floor direction cannot claim a measured knee."
+			require_result_flag "$search_root.noisy" false "The exploration-floor direction unexpectedly remained noisy."
+			require_result_flag "$search_root.inconclusive" false "The exploration-floor direction remained inconclusive."
+			require_result_flag "$search_root.selected.target_met" true "The exploration-floor fallback did not meet its quality target."
+			search_selected_retention="$(require_result_value "$search_root.selected.retention_percent")" ||
+				die "The exploration-floor fallback retention is missing."
+			is_percent "$search_selected_retention" &&
+				LC_ALL=C awk -v value="$search_selected_retention" 'BEGIN { exit(value >= 50 ? 0 : 1) }' ||
+				die "The exploration-floor fallback fell below the catastrophic throughput floor."
+			profile_variable_manual_fallback_count=$((profile_variable_manual_fallback_count + 1))
+		elif [ "$search_reason" = noisy-link-safe-review ]; then
+			require_result_flag "$search_root.action" fallback "The noisy direction must use the typed fallback action."
+			require_result_flag "$search_root.knee_detected" false "The noisy direction cannot claim a measured knee."
+			require_result_flag "$search_root.noisy" true "The noisy direction lost its diagnostic flag."
+			require_result_flag "$search_root.inconclusive" false "The noisy safe fallback remained inconclusive."
+			search_selected_retention="$(require_result_value "$search_root.selected.retention_percent")" ||
+				die "The noisy fallback retention is missing."
+			is_percent "$search_selected_retention" &&
+				LC_ALL=C awk -v value="$search_selected_retention" 'BEGIN { exit(value >= 50 ? 0 : 1) }' ||
+				die "The noisy fallback fell below the catastrophic throughput floor."
+			profile_variable_manual_fallback_count=$((profile_variable_manual_fallback_count + 1))
+		elif [ "$search_reason" = bounded-low-realization-review ]; then
+			require_result_flag "$search_root.action" fallback "The bounded low-realization direction must use the typed fallback action."
+			require_result_flag "$search_root.selected.safety_pass" false "The bounded low-realization direction unexpectedly claims strict CAKE control."
+			require_result_flag "$search_root.selected.manual_reviewable" true "The bounded low-realization direction is not manually reviewable."
+			require_result_flag "$search_root.knee_detected" false "The bounded low-realization direction cannot claim a measured knee."
+			require_result_flag "$search_root.no_cake_effect" false "The bounded low-realization direction cannot also claim no CAKE effect."
+			require_result_flag "$search_root.noisy" false "The bounded low-realization direction remained noisy."
+			require_result_flag "$search_root.inconclusive" false "The bounded low-realization direction remained inconclusive."
+			search_selected_realization="$(require_result_value "$search_root.selected.realization_percent")" ||
+				die "The bounded low-realization percentage is missing."
+			search_selected_retention="$(require_result_value "$search_root.selected.retention_percent")" ||
+				die "The bounded low-realization retention is missing."
+			search_strict_min="$(require_result_value '@.validation_thresholds.candidate_realization_min_percent')" ||
+				die "The strict realization threshold is missing."
+			search_strict_max="$(require_result_value '@.validation_thresholds.candidate_realization_max_percent')" ||
+				die "The maximum realization threshold is missing."
+			is_percent "$search_selected_realization" && is_percent "$search_selected_retention" &&
+				is_decimal "$search_strict_min" && is_decimal "$search_strict_max" &&
+				LC_ALL=C awk -v realization="$search_selected_realization" \
+					-v retention="$search_selected_retention" -v strict_min="$search_strict_min" \
+					-v strict_max="$search_strict_max" 'BEGIN {
+						exit(strict_min >= 0 && strict_min <= 100 && strict_max >= strict_min && strict_max <= 200 &&
+							realization >= 50 && realization < strict_min && realization <= strict_max && retention >= 50 ? 0 : 1)
+					}' || die "The bounded low-realization direction is outside the manual-review envelope."
+			profile_variable_manual_fallback_count=$((profile_variable_manual_fallback_count + 1))
+		else
+			require_result_flag "$search_root.knee_detected" true "The Variable link result has no measured latency knee."
+			require_result_flag "$search_root.noisy" false "The Variable link result remained noisy."
+			require_result_flag "$search_root.inconclusive" false "The Variable link result remained inconclusive."
+		fi
 		runtime_minimum="$(require_result_value "$search_root.runtime_minimum_kbps")" ||
 			die "The measured Variable link runtime minimum is missing."
 		runtime_minimum_index="$(require_result_value "$search_root.runtime_minimum_observation_index")" ||
@@ -1125,6 +1297,13 @@ validate_profile_search_contract() {
 			[ "$runtime_minimum" -ge "$exploration_minimum" ] &&
 			[ "$runtime_minimum" -le "$selected_rate" ] ||
 			die "The Variable link runtime minimum is not a tested, ordered search result."
+		if [ "$search_no_cake_effect" = true ] ||
+		   [ "$search_reason" = exploration-floor-reached ] ||
+		   [ "$search_reason" = noisy-link-safe-review ] ||
+		   [ "$search_reason" = bounded-low-realization-review ]; then
+			numbers_equal "$runtime_minimum" "$selected_rate" ||
+				die "The manual Variable link runtime minimum differs from its selected tested hold point."
+		fi
 	elif [ "$profile" = gaming_extreme ]; then
 		require_result_flag "$search_root.inconclusive" false "The Extreme A+ result remained inconclusive."
 		runtime_minimum="$(require_result_value "$search_root.runtime_minimum_kbps")" ||
@@ -1149,6 +1328,391 @@ validate_profile_search_contract() {
 	fi
 }
 
+validate_bidirectional_confirmation_contract() {
+	require_result_flag '@.bidirectional_confirmation.tested' true \
+		"The final bidirectional confirmation is missing."
+	bidirectional_dl_target="$(require_result_value '@.bidirectional_confirmation.target_rates_kbps.download')" ||
+		die "The final bidirectional download target is missing."
+	bidirectional_ul_target="$(require_result_value '@.bidirectional_confirmation.target_rates_kbps.upload')" ||
+		die "The final bidirectional upload target is missing."
+	bidirectional_dl_achieved="$(require_result_value '@.bidirectional_confirmation.achieved_kbps.download')" ||
+		die "The final bidirectional download result is missing."
+	bidirectional_ul_achieved="$(require_result_value '@.bidirectional_confirmation.achieved_kbps.upload')" ||
+		die "The final bidirectional upload result is missing."
+	bidirectional_dl_realization="$(require_result_value '@.bidirectional_confirmation.realization_percent.download')" ||
+		die "The final bidirectional download realization is missing."
+	bidirectional_ul_realization="$(require_result_value '@.bidirectional_confirmation.realization_percent.upload')" ||
+		die "The final bidirectional upload realization is missing."
+	bidirectional_delta="$(require_result_value '@.bidirectional_confirmation.effective_delta_ms')" ||
+		die "The final bidirectional loaded-latency result is missing."
+	bidirectional_loss="$(require_result_value '@.bidirectional_confirmation.loss_percent')" ||
+		die "The final bidirectional packet-loss result is missing."
+	for bidirectional_number in "$bidirectional_dl_target" "$bidirectional_ul_target" \
+		"$bidirectional_dl_achieved" "$bidirectional_ul_achieved" \
+		"$bidirectional_dl_realization" "$bidirectional_ul_realization" \
+		"$bidirectional_delta" "$bidirectional_loss"; do
+		is_decimal "$bidirectional_number" ||
+			die "The final bidirectional confirmation contains malformed numeric evidence."
+	done
+	proposal_dl_base="$(require_result_value '@.proposal.download.base_kbps')" ||
+		die "The proposed download rate is missing."
+	proposal_ul_base="$(require_result_value '@.proposal.upload.base_kbps')" ||
+		die "The proposed upload rate is missing."
+	numbers_equal "$bidirectional_dl_target" "$proposal_dl_base" &&
+		numbers_equal "$bidirectional_ul_target" "$proposal_ul_base" ||
+		die "The final bidirectional confirmation tested a different rate pair."
+	LC_ALL=C awk -v target="$bidirectional_dl_target" -v achieved="$bidirectional_dl_achieved" \
+		-v reported="$bidirectional_dl_realization" 'BEGIN {
+			if (target <= 0 || achieved < 0) exit 1
+			delta = reported - achieved * 100 / target
+			if (delta < 0) delta = -delta
+			exit(delta <= 0.2 ? 0 : 1)
+		}' || die "The final bidirectional download realization does not match its measurement."
+	LC_ALL=C awk -v target="$bidirectional_ul_target" -v achieved="$bidirectional_ul_achieved" \
+		-v reported="$bidirectional_ul_realization" 'BEGIN {
+			if (target <= 0 || achieved < 0) exit 1
+			delta = reported - achieved * 100 / target
+			if (delta < 0) delta = -delta
+			exit(delta <= 0.2 ? 0 : 1)
+		}' || die "The final bidirectional upload realization does not match its measurement."
+
+	bidirectional_latency_pass="$(LC_ALL=C awk -v actual="$bidirectional_delta" -v limit="$validation_transport" 'BEGIN {
+		print (actual <= limit) ? "true" : "false"
+	}')"
+	bidirectional_loss_pass="$(LC_ALL=C awk -v actual="$bidirectional_loss" -v limit="$validation_loss" 'BEGIN {
+		print (actual <= limit) ? "true" : "false"
+	}')"
+	bidirectional_latency_review_pass="$(LC_ALL=C awk -v actual="$bidirectional_delta" \
+		-v limit="$validation_manual_latency_review" 'BEGIN {
+		print (actual <= limit) ? "true" : "false"
+	}')"
+	bidirectional_realization_safety_pass="$(LC_ALL=C awk -v dl="$bidirectional_dl_realization" \
+		-v ul="$bidirectional_ul_realization" -v maximum="$validation_realization_max" 'BEGIN {
+		print (dl >= 50 && ul >= 50 && dl <= maximum && ul <= maximum) ? "true" : "false"
+	}')"
+	bidirectional_safety_pass=false
+	[ "$bidirectional_latency_review_pass" = true ] &&
+		[ "$bidirectional_realization_safety_pass" = true ] &&
+		[ "$bidirectional_loss_pass" = true ] &&
+		bidirectional_safety_pass=true
+	bidirectional_realization_pass="$(LC_ALL=C awk -v dl="$bidirectional_dl_realization" \
+		-v ul="$bidirectional_ul_realization" -v minimum="$validation_realization_min" 'BEGIN {
+		print (dl >= minimum && ul >= minimum) ? "true" : "false"
+	}')"
+	bidirectional_auto_apply_pass=false
+	[ "$bidirectional_latency_pass" = true ] && [ "$bidirectional_realization_pass" = true ] &&
+		bidirectional_auto_apply_pass=true
+	require_result_flag '@.bidirectional_confirmation.safety_pass' "$bidirectional_safety_pass" \
+		"The final bidirectional safety verdict does not match its hard evidence."
+	require_result_flag '@.bidirectional_confirmation.auto_apply_pass' "$bidirectional_auto_apply_pass" \
+		"The final bidirectional Auto-Apply verdict does not match its evidence."
+	for confirmation_field in tested safety_pass auto_apply_pass effective_delta_ms loss_percent; do
+		[ "$(json_get "$result_copy" "@.profile_outcome.bidirectional_confirmation.$confirmation_field")" = \
+		  "$(json_get "$result_copy" "@.bidirectional_confirmation.$confirmation_field")" ] ||
+			die "The profile outcome contains different final bidirectional evidence."
+	done
+}
+
+validate_selected_configuration_contract() {
+	# The proposal identity binds the candidate to the terminal result, but the
+	# apply path still reads the canonical top-level proposal.  Require every
+	# field which can reach UCI to be byte-for-byte identical before arming a
+	# rollback token.  This prevents a valid directional evidence object from
+	# selecting a different, unattested rate or CAKE policy.
+	for configuration_path in \
+		schema_version profile target_grade quality_target_required throughput_priority \
+		download.minimum_kbps download.base_kbps download.maximum_kbps download.absolute_cap_kbps \
+		download.observed_low_kbps download.observed_median_kbps \
+		upload.minimum_kbps upload.base_kbps upload.maximum_kbps upload.absolute_cap_kbps \
+		upload.observed_low_kbps upload.observed_median_kbps active_threshold_kbps \
+		thresholds_ms.adjust_up thresholds_ms.delay thresholds_ms.adjust_down \
+		adaptive_ceiling.enabled adaptive_ceiling.hold_s adaptive_ceiling.growth_percent \
+		adaptive_ceiling.probe_s adaptive_ceiling.cooldown_s adaptive_ceiling.failed_bound_ttl_s \
+		validation.candidate_realization_min_percent validation.candidate_realization_max_percent \
+		validation.capacity_retention_min_percent validation.icmp_delta_max_ms \
+		validation.transport_delta_max_ms validation.loss_max_percent validation.cpu_max_percent \
+		sqm.qdisc sqm.script sqm.classification sqm.squash_dscp sqm.squash_ingress \
+		sqm.ingress_ecn sqm.egress_ecn sqm.iqdisc_opts sqm.eqdisc_opts \
+		link.layer link.overhead link.mpu; do
+		configuration_terminal="$(json_get "$result_copy" "@.proposal.$configuration_path" 2>/dev/null)" ||
+			die "The canonical Full Auto-Tune proposal is incomplete."
+		configuration_selected="$(json_get "$result_copy" "$selected_proposal_path.configuration.$configuration_path" 2>/dev/null)" ||
+			die "The selected Full Auto-Tune proposal configuration is incomplete."
+		[ "$configuration_selected" = "$configuration_terminal" ] ||
+			die "The selected Full Auto-Tune proposal configuration differs from its measured canonical proposal."
+	done
+}
+
+validate_directional_proposal_contract() {
+	directional_topology="$1"
+	case "$directional_topology" in
+		upload_only_shaped)
+			directional_key=upload_only
+			directional_label=upload-only
+			directional_active=upload
+			directional_gain_direction=download
+			directional_realization_field=upload_realization_percent
+			directional_gain_field=download_gain_percent
+			directional_active_base="$proposal_ul_base"
+			directional_shaped_gain="$bidirectional_dl_achieved"
+			directional_bypass_mode=ingress-only-autotune
+			;;
+		download_only_shaped)
+			directional_key=download_only
+			directional_label=download-only
+			directional_active=download
+			directional_gain_direction=upload
+			directional_realization_field=download_realization_percent
+			directional_gain_field=upload_gain_percent
+			directional_active_base="$proposal_dl_base"
+			directional_shaped_gain="$bidirectional_ul_achieved"
+			directional_bypass_mode=egress-only-autotune
+			;;
+		*) die "The selected proposal is not a directional topology." ;;
+	esac
+	directional_comparison_path="@.directional_comparisons.$directional_key"
+	require_result_flag "$selected_proposal_path.evidence.recommendation" "directional_comparisons.$directional_key" \
+		"The $directional_label proposal is not bound to its directional evidence."
+	require_result_flag "$directional_comparison_path.tested" true \
+		"The $directional_label proposal has no directional comparison."
+	require_result_flag "$directional_comparison_path.repeatable" true \
+		"The selected $directional_label topology is not repeatable."
+	directional_material_benefit_proven=true
+	directional_realization_objective_met=true
+
+	for directional_index in 0 1; do
+		directional_path="$directional_comparison_path.observations[$directional_index]"
+		require_result_flag "$directional_path.hard_safety_pass" true \
+			"A $directional_label observation did not pass hard safety checks."
+		require_result_flag "$directional_path.observation.topology" "$directional_topology" \
+			"A $directional_label observation names a different topology."
+		require_result_flag "$directional_path.observation.direction" both \
+			"The $directional_label comparison did not load both directions."
+		require_result_flag "$directional_path.observation.measurement_evidence.valid" true \
+			"The $directional_label comparison contains invalid measurement evidence."
+		require_result_flag "$directional_path.observation.measurement_evidence.shaper_bypassed" true \
+			"The $directional_label comparison did not prove its one-sided bypass."
+		require_result_flag "$directional_path.observation.measurement_evidence.sqm_paused" false \
+			"The $directional_label comparison unexpectedly paused all SQM."
+		require_result_flag "$directional_path.observation.measurement_evidence.sqm_bypass_mode" "$directional_bypass_mode" \
+			"The $directional_label comparison has inconsistent bypass evidence."
+
+		directional_delta="$(require_result_value "$directional_path.effective_delta_ms")" ||
+			die "The $directional_label comparison delay is missing."
+		directional_loss="$(require_result_value "$directional_path.loss_percent")" ||
+			die "The $directional_label comparison loss is missing."
+		directional_realization="$(require_result_value "$directional_path.$directional_realization_field")" ||
+			die "The $directional_label realization is missing."
+		directional_gain="$(require_result_value "$directional_path.$directional_gain_field")" ||
+			die "The $directional_label opposite-direction gain is missing."
+		directional_delay_improvement="$(require_result_value "$directional_path.delay_improvement_ms")" ||
+			die "The $directional_label delay comparison is missing."
+		directional_active_throughput="$(require_result_value "$directional_path.observation.throughput_kbps.${directional_active}_kbps")" ||
+			die "The $directional_label active-direction measurement is missing."
+		directional_gain_throughput="$(require_result_value "$directional_path.observation.throughput_kbps.${directional_gain_direction}_kbps")" ||
+			die "The $directional_label opposite-direction measurement is missing."
+		directional_grade="$(require_result_value "$directional_path.grade")" ||
+			die "The $directional_label grade is missing."
+		for directional_number in "$directional_delta" "$directional_loss" "$directional_realization" \
+			"$directional_active_throughput" "$directional_gain_throughput"; do
+			is_decimal "$directional_number" ||
+				die "The $directional_label comparison contains malformed numeric evidence."
+		done
+		is_signed_decimal "$directional_gain" && is_signed_decimal "$directional_delay_improvement" ||
+			die "The $directional_label comparison contains malformed signed utility evidence."
+		is_positive_rate "$directional_active_throughput" && is_positive_rate "$directional_gain_throughput" ||
+			die "The $directional_label comparison contains no usable throughput."
+		directional_expected_grade="$(quality_grade_for_delta "$directional_delta")" ||
+			die "The $directional_label grade cannot be calculated."
+		[ "$directional_grade" = "$directional_expected_grade" ] ||
+			die "The $directional_label grade differs from its measured delay."
+		LC_ALL=C awk -v achieved="$directional_active_throughput" -v candidate="$directional_active_base" \
+			-v reported="$directional_realization" 'BEGIN {
+				if (candidate <= 0) exit 1
+				expected = achieved * 100 / candidate
+				exit((reported - expected < 0 ? expected - reported : reported - expected) <= 0.11 ? 0 : 1)
+			}' || die "The $directional_label realization differs from its throughput evidence."
+		LC_ALL=C awk -v achieved="$directional_gain_throughput" -v shaped="$directional_shaped_gain" \
+			-v reported="$directional_gain" 'BEGIN {
+				if (shaped <= 0) exit 1
+				expected = (achieved - shaped) * 100 / shaped
+				exit((reported - expected < 0 ? expected - reported : reported - expected) <= 0.11 ? 0 : 1)
+			}' || die "The $directional_label gain differs from its throughput evidence."
+		LC_ALL=C awk -v shaped="$bidirectional_delta" -v candidate="$directional_delta" \
+			-v reported="$directional_delay_improvement" 'BEGIN {
+				expected = shaped - candidate
+				exit((reported - expected < 0 ? expected - reported : reported - expected) <= 0.11 ? 0 : 1)
+			}' || die "The $directional_label delay improvement differs from its measurement evidence."
+		LC_ALL=C awk -v delay="$directional_delta" -v delay_limit="$validation_manual_latency_review" \
+			-v loss="$directional_loss" -v loss_limit="$validation_loss" \
+			-v realization="$directional_realization" -v maximum="$validation_realization_max" 'BEGIN {
+				exit(delay <= delay_limit && loss <= loss_limit && realization >= 50 && realization <= maximum ? 0 : 1)
+			}' || die "The $directional_label comparison exceeds a non-overridable safety boundary."
+		directional_material_benefit_expected="$(LC_ALL=C awk -v gain="$directional_gain" \
+			-v improvement="$directional_delay_improvement" 'BEGIN {
+				print (gain >= 2 && improvement >= -5) ? "true" : "false"
+			}')"
+		require_result_flag "$directional_path.material_benefit" "$directional_material_benefit_expected" \
+			"The $directional_label material-benefit verdict does not match its evidence."
+		require_result_flag "$directional_path.candidate_pass" "$directional_material_benefit_expected" \
+			"The $directional_label candidate verdict does not match its hard-safe utility evidence."
+		[ "$directional_material_benefit_expected" = true ] || directional_material_benefit_proven=false
+		LC_ALL=C awk -v realization="$directional_realization" -v minimum="$validation_realization_min" \
+			'BEGIN { exit(realization >= minimum ? 0 : 1) }' || directional_realization_objective_met=false
+
+		case "$directional_index" in
+			0)
+				directional_first_active="$directional_active_throughput"
+				directional_first_gain="$directional_gain_throughput"
+				directional_first_delta="$directional_delta"
+				;;
+			1)
+				directional_second_active="$directional_active_throughput"
+				directional_second_gain="$directional_gain_throughput"
+				directional_second_delta="$directional_delta"
+				;;
+		esac
+	done
+	LC_ALL=C awk -v dl1="$directional_first_active" -v dl2="$directional_second_active" \
+		-v ul1="$directional_first_gain" -v ul2="$directional_second_gain" \
+		-v delay1="$directional_first_delta" -v delay2="$directional_second_delta" 'BEGIN {
+		dlmax = dl1 > dl2 ? dl1 : dl2; ulmax = ul1 > ul2 ? ul1 : ul2
+		dldiff = dlmax > 0 ? ((dl1 > dl2 ? dl1 - dl2 : dl2 - dl1) * 100 / dlmax) : 100
+		uldiff = ulmax > 0 ? ((ul1 > ul2 ? ul1 - ul2 : ul2 - ul1) * 100 / ulmax) : 100
+		delaydiff = delay1 > delay2 ? delay1 - delay2 : delay2 - delay1
+		exit(dldiff <= 15 && uldiff <= 15 && delaydiff <= 10 ? 0 : 1)
+	}' || die "The $directional_label comparison is not repeatable."
+	directional_worst_delta="$(LC_ALL=C awk -v a="$directional_first_delta" -v b="$directional_second_delta" 'BEGIN {
+		print ((a + 0) > (b + 0) ? a : b)
+	}')"
+	directional_worst_grade="$(quality_grade_for_delta "$directional_worst_delta")" ||
+		die "The selected $directional_label grade cannot be calculated."
+	directional_expected_recommendation="$directional_topology"
+	[ "$directional_material_benefit_proven" = true ] || directional_expected_recommendation=manual_review
+	require_result_flag "$directional_comparison_path.recommended_topology" "$directional_expected_recommendation" \
+		"The selected $directional_label recommendation does not match its repeated evidence."
+	directional_shaped_reference_delta="$(require_result_value '@.validation.effective_delta_ms')" ||
+		die "The shaped directional validation delay is missing."
+	is_decimal "$directional_shaped_reference_delta" ||
+		die "The shaped directional validation delay is malformed."
+	directional_shaped_reference_delta="$(LC_ALL=C awk -v directional="$directional_shaped_reference_delta" \
+		-v simultaneous="$bidirectional_delta" 'BEGIN {
+			print ((directional + 0) > (simultaneous + 0) ? directional : simultaneous)
+		}')"
+	directional_latency_utility_met="$(LC_ALL=C awk -v candidate="$directional_worst_delta" \
+		-v shaped="$directional_shaped_reference_delta" 'BEGIN {
+			print (candidate <= shaped + 10) ? "true" : "false"
+		}')"
+	require_selected_proposal_objective candidate-realization \
+		"$([ "$directional_realization_objective_met" = true ] && printf false || printf true)" \
+		"The selected $directional_label candidate-realization acknowledgement does not match its repeated evidence."
+	require_selected_proposal_objective throughput-benefit-unproven \
+		"$([ "$directional_material_benefit_proven" = true ] && printf false || printf true)" \
+		"The selected $directional_label utility acknowledgement does not match its repeated evidence."
+	require_selected_proposal_objective latency-worse-than-shaped \
+		"$([ "$directional_latency_utility_met" = true ] && printf false || printf true)" \
+		"The selected $directional_label latency acknowledgement does not match its shaped reference."
+	require_result_flag "$selected_proposal_path.effective_delta_ms" "$directional_worst_delta" \
+		"The selected $directional_label delay differs from its repeated evidence."
+	require_result_flag "$selected_proposal_path.grade" "$directional_worst_grade" \
+		"The selected $directional_label grade differs from its repeated evidence."
+}
+
+validate_raw_no_sqm_proposal_contract() {
+	# A no-SQM proposal is a topology in its own right.  Its safety proof comes
+	# from the clean, routed, bidirectional raw control; shaped validation is
+	# neither a prerequisite nor a useful reference for this action.  In
+	# particular, do not turn shaped realization, throughput gain, or a relative
+	# delay comparison into hidden hard gates here.
+	require_result_flag "$selected_proposal_path.evidence.control" raw_control \
+		"The no-SQM proposal is not bound to its raw control."
+	selected_configuration="$(json_get "$result_copy" "$selected_proposal_path.configuration" 2>/dev/null || true)"
+	case "$selected_configuration" in
+		''|null) ;;
+		*) die "A no-SQM proposal must not contain an SQM configuration." ;;
+	esac
+	require_result_flag '@.raw_control.available' true "The raw no-SQM control is unavailable."
+	require_result_flag '@.raw_control.measurement_evidence.valid' true "The raw no-SQM control evidence is invalid."
+	require_result_flag '@.raw_control.measurement_evidence.reason' ok "The raw no-SQM control did not complete cleanly."
+	require_result_flag '@.raw_control.measurement_evidence.test_direction' both "The raw no-SQM control was not bidirectional."
+	require_result_flag '@.raw_control.measurement_evidence.shaper_bypassed' true "The raw no-SQM control did not prove SQM bypass."
+	raw_bypass_mode="$(require_result_value '@.raw_control.measurement_evidence.sqm_bypass_mode')" ||
+		die "The raw no-SQM control has no bypass mode."
+	raw_sqm_paused="$(require_result_value '@.raw_control.measurement_evidence.sqm_paused')" ||
+		die "The raw no-SQM control has no SQM pause evidence."
+	case "$raw_bypass_mode:$raw_sqm_paused" in
+		paused-managed:true|already-unshaped:false) ;;
+		*) die "The raw no-SQM control bypass evidence is inconsistent." ;;
+	esac
+
+	require_result_flag '@.raw_control.forwarded_background.available' true "The raw no-SQM control has no traffic evidence."
+	require_result_flag '@.raw_control.forwarded_background.contaminated' false "Background traffic contaminated the raw no-SQM control."
+	raw_background_dl="$(require_result_value '@.raw_control.forwarded_background.download_kbps')" ||
+		die "The raw no-SQM background download is missing."
+	raw_background_ul="$(require_result_value '@.raw_control.forwarded_background.upload_kbps')" ||
+		die "The raw no-SQM background upload is missing."
+	raw_background_dl_limit="$(require_result_value '@.raw_control.forwarded_background.download_limit_kbps')" ||
+		die "The raw no-SQM background download limit is missing."
+	raw_background_ul_limit="$(require_result_value '@.raw_control.forwarded_background.upload_limit_kbps')" ||
+		die "The raw no-SQM background upload limit is missing."
+	raw_delta="$(require_result_value '@.raw_control.effective_delta_ms')" ||
+		die "The raw no-SQM delay is missing."
+	raw_loss="$(require_result_value '@.raw_control.icmp_latency.loss_percent')" ||
+		die "The raw no-SQM packet-loss result is missing."
+	raw_dl="$(require_result_value '@.raw_control.throughput.download_kbps')" ||
+		die "The raw no-SQM download is missing."
+	raw_ul="$(require_result_value '@.raw_control.throughput.upload_kbps')" ||
+		die "The raw no-SQM upload is missing."
+	raw_grade="$(require_result_value '@.raw_control.grade')" ||
+		die "The raw no-SQM grade is missing."
+	raw_expected_grade="$(quality_grade_for_delta "$raw_delta")" ||
+		die "The raw no-SQM grade cannot be calculated."
+	[ "$raw_grade" = "$raw_expected_grade" ] ||
+		die "The raw no-SQM grade differs from its measured delay."
+	require_result_flag "$selected_proposal_path.effective_delta_ms" "$raw_delta" \
+		"The no-SQM proposal delay differs from its raw control."
+	require_result_flag "$selected_proposal_path.grade" "$raw_grade" \
+		"The no-SQM proposal grade differs from its raw control."
+	require_result_flag "$selected_proposal_path.confidence_percent" "$confidence_overall" \
+		"The no-SQM proposal confidence differs from its measured result."
+
+	for raw_number in "$raw_background_dl" "$raw_background_ul" \
+		"$raw_background_dl_limit" "$raw_background_ul_limit" "$raw_delta" "$raw_loss"; do
+		is_decimal "$raw_number" || die "The raw no-SQM control contains malformed numeric evidence."
+	done
+	is_positive_rate "$raw_dl" && is_positive_rate "$raw_ul" ||
+		die "The raw no-SQM control contains no usable bidirectional throughput."
+	LC_ALL=C awk -v delta="$raw_delta" -v delay_limit="$validation_manual_latency_review" \
+		-v loss="$raw_loss" -v loss_limit="$validation_loss" \
+		-v bg_dl="$raw_background_dl" -v bg_ul="$raw_background_ul" \
+		-v bg_dl_limit="$raw_background_dl_limit" -v bg_ul_limit="$raw_background_ul_limit" 'BEGIN {
+			exit(delta <= delay_limit && loss <= loss_limit &&
+				bg_dl <= bg_dl_limit && bg_ul <= bg_ul_limit ? 0 : 1)
+		}' || die "The raw no-SQM control exceeds a non-overridable safety boundary."
+
+	# Bind the raw phase to the same calibrated route identity that is attested
+	# live immediately before the token is armed.  The raw-control object is
+	# produced only after the speed-test supervisor checked this route.
+	raw_resolved="$(require_result_value '@.resolved_interface')" ||
+		die "The raw no-SQM result has no resolved interface."
+	raw_route_interface="$(require_result_value '@.route_interface')" ||
+		die "The raw no-SQM result has no route interface."
+	raw_source_ip="$(require_result_value '@.source_ip')" ||
+		die "The raw no-SQM result has no source address."
+	raw_external_ip="$(require_result_value '@.external_ip')" ||
+		die "The raw no-SQM result has no external address."
+	raw_route_identity="$(require_result_value '@.route_identity')" ||
+		die "The raw no-SQM result has no route identity."
+	safe_interface "$raw_resolved" && safe_interface "$raw_route_interface" ||
+		die "The raw no-SQM route interface is unsafe."
+	[ "$raw_route_interface" = "$raw_resolved" ] ||
+		die "The raw no-SQM control used a different resolved route interface."
+	case "$raw_route_identity" in
+		"$route_mode|$member|$raw_route_interface|$raw_source_ip|"*) ;;
+		*) die "The raw no-SQM route identity is inconsistent." ;;
+	esac
+}
+
 arm_guard() {
 	job="${1:-}"
 	target="${2:-}"
@@ -1159,6 +1723,8 @@ arm_guard() {
 	disable_adaptive="${7:-}"
 	action="${8:-}"
 	fingerprint="${9:-}"
+	shift 9
+	proposal_id="${1:-}"
 
 	safe_job "$job" || die "Unsafe Full Auto-Tune instance name."
 	safe_interface "$target" || die "Unsafe Full Auto-Tune target interface."
@@ -1170,6 +1736,7 @@ arm_guard() {
 		*) die "The Full Auto-Tune review action and enabled state are inconsistent." ;;
 	esac
 	safe_fingerprint "$fingerprint" || die "Invalid Full Auto-Tune result fingerprint."
+	safe_proposal_id "$proposal_id" || die "Invalid Full Auto-Tune proposal identity."
 	is_uint "$token_ttl_s" && [ "$token_ttl_s" -ge 30 ] && [ "$token_ttl_s" -le 900 ] || die "Invalid apply-guard TTL."
 	is_uint "$rollback_timeout_s" && [ "$rollback_timeout_s" -ge 10 ] && [ "$rollback_timeout_s" -le 120 ] ||
 		die "Invalid apply rollback timeout."
@@ -1210,6 +1777,31 @@ arm_guard() {
 	require_result_flag '@.runtime_restored' true "Full Auto-Tune runtime recovery is incomplete."
 	require_result_flag '@.recovery_pending' false "Full Auto-Tune recovery is still pending."
 	require_result_flag '@.configuration_written' false "The Full Auto-Tune result has unexpected write state."
+	selected_proposal_index=
+	proposal_index=0
+	while [ "$proposal_index" -lt 4 ]; do
+		candidate_id="$(json_get "$result_copy" "@.proposals[$proposal_index].proposal_id" 2>/dev/null || true)"
+		if [ "$candidate_id" = "$proposal_id" ]; then
+			[ -z "$selected_proposal_index" ] || die "The selected Full Auto-Tune proposal identity is duplicated."
+			selected_proposal_index="$proposal_index"
+		fi
+		proposal_index=$((proposal_index + 1))
+	done
+	[ -n "$selected_proposal_index" ] || die "The selected Full Auto-Tune proposal is not present in the result."
+	[ -z "$(json_get "$result_copy" '@.proposals[4].proposal_id' 2>/dev/null || true)" ] ||
+		die "The Full Auto-Tune result contains too many proposals."
+	selected_proposal_path="@.proposals[$selected_proposal_index]"
+	require_result_flag "$selected_proposal_path.schema_version" 1 "The selected proposal schema is invalid."
+	require_result_flag "$selected_proposal_path.proposal_id" "$proposal_id" "The selected proposal identity changed."
+	require_result_flag "$selected_proposal_path.action" "$action" "The selected proposal action changed."
+	require_result_flag "$selected_proposal_path.applicable" true "The selected proposal is not applicable."
+	require_result_flag "$selected_proposal_path.hard_safety_pass" true "The selected proposal did not pass hard safety checks."
+	selected_topology="$(require_result_value "$selected_proposal_path.topology")" ||
+		die "The selected proposal topology is missing."
+	case "$selected_topology:$action" in
+		both_shaped:apply_sqm|upload_only_shaped:apply_sqm|download_only_shaped:apply_sqm|no_sqm:disable_sqm) ;;
+		*) die "The selected Full Auto-Tune proposal topology and action are inconsistent." ;;
+	esac
 	result_class="$(require_result_value '@.result_class')" ||
 		die "The Full Auto-Tune result class is missing."
 	case "$result_class" in trusted|provisional|estimated) ;;
@@ -1261,13 +1853,31 @@ arm_guard() {
 	run_id="$(require_result_value '@.run_id')" || die "The Full Auto-Tune run identity is missing."
 	safe_run_id "$run_id" || die "The Full Auto-Tune run identity is unsafe."
 	load_profile_contract
+	raw_control_selected=false
+	if [ "$selected_topology" = no_sqm ] &&
+	   [ "$(json_get "$result_copy" "$selected_proposal_path.evidence.control" 2>/dev/null || true)" = raw_control ]; then
+		validate_raw_no_sqm_proposal_contract
+		raw_control_selected=true
+	fi
+	if [ "$raw_control_selected" != true ]; then
+	validate_bidirectional_confirmation_contract
+	if [ "$action" = apply_sqm ]; then
+		validate_selected_configuration_contract
+		case "$selected_topology" in
+			upload_only_shaped|download_only_shaped)
+				validate_directional_proposal_contract "$selected_topology"
+				;;
+		esac
+	fi
 	require_result_flag '@.validation.profile' "$profile" "The terminal validation profile differs from the proposal."
 	profile_outcome_mode="$(require_result_value '@.profile_outcome.mode')" ||
 		die "The profile outcome mode is missing."
 	profile_floor_infeasible=false
 	if [ "$profile_outcome_mode" = safety-floor-infeasible ]; then
-		[ "$profile" = fair ] && [ "$action" = disable_sqm ] ||
-			die "An infeasible capacity floor may only support an explicit Fair SQM-disable review."
+		case "$selected_topology:$action:$profile" in
+			upload_only_shaped:apply_sqm:*|download_only_shaped:apply_sqm:*|no_sqm:disable_sqm:fair) ;;
+			*) die "An infeasible capacity floor has no independently safe selected fallback." ;;
+		esac
 		profile_floor_infeasible=true
 		require_result_flag '@.validation.safety_pass' false "The capacity-floor fallback unexpectedly claims to be safe."
 		require_result_flag '@.profile_outcome.manual_only' true "The capacity-floor fallback must be manual-only."
@@ -1288,16 +1898,79 @@ arm_guard() {
 		die "The profile outcome and proposal capacity floors differ."
 	profile_target_met="$(require_result_value '@.profile_outcome.target_met')" ||
 		die "The profile outcome target state is missing."
-	[ "$profile_target_met" = "$(json_get "$result_copy" '@.validation.quality_target_met')" ] ||
-		die "The profile outcome and final validation target state differ."
+	validation_target_met="$(require_result_value '@.validation.quality_target_met')" ||
+		die "The directional validation target state is missing."
+	case "$validation_target_met" in true|false) ;; *) die "The directional validation target state is invalid." ;; esac
+	expected_profile_target_met="$validation_target_met"
+	[ "$bidirectional_latency_pass" = true ] || expected_profile_target_met=false
+	[ "$profile_target_met" = "$expected_profile_target_met" ] ||
+		die "The profile outcome target state does not match directional and final bidirectional latency evidence."
 	profile_objectives_met="$(require_result_value '@.validation.profile_objectives_met')" ||
 		die "The profile objective state is missing."
 	[ "$profile_objectives_met" = "$(json_get "$result_copy" '@.profile_outcome.capacity_floor_met')" ] ||
 		die "The profile outcome and validation retention-objective states differ."
+	if [ "$profile" = fair ]; then
+	validation_effective_delta="$(require_result_value '@.validation.effective_delta_ms')" ||
+		die "The directional validation delay is missing."
+	is_decimal "$validation_effective_delta" ||
+		die "The directional validation delay is malformed."
+	validation_actual_grade="$(require_result_value '@.validation.actual_grade')" ||
+		die "The directional validation grade is missing."
+	expected_validation_grade="$(quality_grade_for_delta "$validation_effective_delta")" ||
+		die "The directional validation grade cannot be calculated."
+	[ "$validation_actual_grade" = "$expected_validation_grade" ] ||
+		die "The directional validation grade does not match its measured delay."
+	bidirectional_actual_grade="$(require_result_value '@.bidirectional_confirmation.grade')" ||
+		die "The final bidirectional grade is missing."
+	expected_bidirectional_grade="$(quality_grade_for_delta "$bidirectional_delta")" ||
+		die "The final bidirectional grade cannot be calculated."
+	[ "$bidirectional_actual_grade" = "$expected_bidirectional_grade" ] ||
+		die "The final bidirectional grade does not match its measured delay."
+	validation_grade_rank="$(quality_grade_rank "$validation_actual_grade")" ||
+		die "The directional validation grade is invalid."
+	bidirectional_grade_rank="$(quality_grade_rank "$bidirectional_actual_grade")" ||
+		die "The final bidirectional grade is invalid."
+	authoritative_actual_grade="$validation_actual_grade"
+	[ "$bidirectional_grade_rank" -le "$validation_grade_rank" ] ||
+		authoritative_actual_grade="$bidirectional_actual_grade"
+	require_result_flag '@.profile_outcome.actual_grade' "$authoritative_actual_grade" \
+		"The profile outcome does not report the worst measured line grade."
+		fair_actual_grade="$(require_result_value '@.fair_outcome.actual_grade')" ||
+			die "The Fair outcome grade is missing."
+		[ "$fair_actual_grade" = "$authoritative_actual_grade" ] ||
+			die "The Fair outcome does not report the authoritative final grade."
+		fair_actual_delta="$(require_result_value '@.fair_outcome.actual_effective_delta_ms')" ||
+			die "The Fair outcome delay is missing."
+		authoritative_actual_delta="$(LC_ALL=C awk -v directional="$validation_effective_delta" \
+			-v simultaneous="$bidirectional_delta" 'BEGIN {
+			print (((directional + 0) > (simultaneous + 0)) ? directional : simultaneous)
+			}')"
+		is_decimal "$fair_actual_delta" &&
+			numbers_equal "$fair_actual_delta" "$authoritative_actual_delta" ||
+			die "The Fair outcome does not report the worst measured loaded delay."
+		require_result_flag '@.fair_outcome.capacity_floor_met' "$profile_objectives_met" \
+			"The Fair outcome and profile retention states differ."
+		require_result_flag '@.fair_outcome.throughput_safety_floor_met' "$profile_historical_trust_met" \
+			"The Fair outcome and profile historical-throughput states differ."
+		fair_mode="$(require_result_value '@.fair_outcome.mode')" ||
+			die "The Fair outcome mode is missing."
+		if [ "$profile_floor_infeasible" = true ]; then
+			case "$fair_mode" in throughput-fallback|sqm-disable-recommended) ;;
+				*) die "An infeasible Fair candidate has no recognized fail-closed outcome." ;;
+			esac
+		elif [ "$profile_target_met" = true ]; then
+			[ "$fair_mode" = quality-target-met ] ||
+				die "The Fair outcome mode ignores a proven final quality target."
+		else
+			case "$fair_mode" in throughput-fallback|sqm-disable-recommended) ;;
+				*) die "The Fair outcome mode ignores the final bidirectional quality miss." ;;
+			esac
+		fi
+	fi
 	profile_deep_runtime_minimum="$(require_result_value '@.profile_outcome.deep_runtime_minimum')" ||
 		die "The runtime-minimum retention state is missing."
 	case "$profile_deep_runtime_minimum" in true|false) ;; *) die "The runtime-minimum retention state is invalid." ;; esac
-	if [ "$profile" = gaming_extreme ]; then
+	if [ "$profile" = gaming_extreme ] && [ "$selected_topology" = both_shaped ]; then
 		extreme_dl_runtime_retention="$(require_result_value '@.profile_outcome.runtime_minimum_retention.download_percent')" ||
 			die "The Extreme A+ download runtime retention is missing."
 		extreme_ul_runtime_retention="$(require_result_value '@.profile_outcome.runtime_minimum_retention.upload_percent')" ||
@@ -1324,6 +1997,45 @@ arm_guard() {
 			numbers_equal "$extreme_reported_retention" "$extreme_expected_retention" ||
 				die "The Extreme A+ runtime-retention evidence does not match its tested rate."
 		done
+	elif [ "$profile" = gaming_extreme ] && [ "$selected_topology" = no_sqm ]; then
+		[ "$profile_deep_runtime_minimum" = false ] ||
+			die "A raw no-SQM proposal cannot claim an untested Extreme runtime minimum."
+		case "$(json_get "$result_copy" '@.profile_outcome.runtime_minimum_retention')" in
+			''|null) ;;
+			*) die "A raw no-SQM proposal contains unneeded Extreme runtime-retention evidence." ;;
+		esac
+	elif [ "$profile" = gaming_extreme ]; then
+		case "$selected_topology" in
+			upload_only_shaped) extreme_active_direction=upload ;;
+			download_only_shaped) extreme_active_direction=download ;;
+			*) die "The Extreme A+ proposal topology is invalid." ;;
+		esac
+		extreme_runtime_retention="$(json_get "$result_copy" "@.profile_outcome.runtime_minimum_retention.${extreme_active_direction}_percent" 2>/dev/null || true)"
+		case "$extreme_runtime_retention" in
+			''|null)
+				[ "$profile_deep_runtime_minimum" = false ] ||
+					die "A one-sided Extreme A+ proposal claims an unattested deep runtime minimum."
+				case "$(json_get "$result_copy" '@.profile_outcome.runtime_minimum_retention')" in
+					''|null) ;;
+					*) die "The one-sided Extreme A+ runtime-retention evidence is incomplete." ;;
+				esac
+				;;
+			*)
+				is_decimal "$extreme_runtime_retention" ||
+					die "The one-sided Extreme A+ runtime retention is malformed."
+				extreme_runtime_minimum="$(require_result_value "@.profile_search.$extreme_active_direction.runtime_minimum_kbps")" ||
+					die "The one-sided Extreme A+ runtime minimum is missing."
+				extreme_observed_low="$(require_result_value "@.proposal.$extreme_active_direction.observed_low_kbps")" ||
+					die "The one-sided Extreme A+ observed-low reference is missing."
+				extreme_expected_retention="$(LC_ALL=C awk -v minimum="$extreme_runtime_minimum" \
+					-v raw="$extreme_observed_low" 'BEGIN {
+						if (minimum <= 0 || raw <= 0) exit 1
+						printf "%.1f", minimum * 100 / raw
+					}')" || die "The one-sided Extreme A+ runtime-retention evidence is invalid."
+				numbers_equal "$extreme_runtime_retention" "$extreme_expected_retention" ||
+					die "The one-sided Extreme A+ runtime retention does not match its tested rate."
+				;;
+		esac
 	else
 		[ "$profile_deep_runtime_minimum" = false ] ||
 			die "A non-Extreme profile claims an Extreme runtime minimum."
@@ -1333,15 +2045,72 @@ arm_guard() {
 		esac
 	fi
 	profile_unsafe_direction_count=0
-	validate_profile_search_contract download "$profile_floor_infeasible"
-	validate_profile_search_contract upload "$profile_floor_infeasible"
-	if [ "$profile_floor_infeasible" = true ] && [ "$profile_unsafe_direction_count" -lt 1 ]; then
-		die "The capacity-floor fallback contains no direction with a proven repeatable ceiling."
+	profile_no_cake_effect_count=0
+	profile_variable_manual_fallback_count=0
+	case "$selected_topology" in
+		both_shaped)
+			validate_profile_search_contract download "$profile_floor_infeasible"
+			validate_profile_search_contract upload "$profile_floor_infeasible"
+			;;
+		upload_only_shaped)
+			validate_profile_search_contract upload false
+			;;
+		download_only_shaped)
+			validate_profile_search_contract download false
+			;;
+	esac
+	if [ "$selected_topology" = both_shaped ]; then
+		if [ "$profile_floor_infeasible" = true ] && [ "$profile_unsafe_direction_count" -lt 1 ]; then
+			die "The capacity-floor fallback contains no direction with a proven repeatable ceiling."
+		fi
+	fi
+	if [ "$profile_no_cake_effect_count" -gt 0 ]; then
+		[ "$profile" = variable_link ] && { [ "$action" = apply_sqm ] || [ "$action" = disable_sqm ]; } ||
+			die "A directional no-effect result may only review a Variable link SQM proposal."
+		require_result_flag '@.profile_outcome.mode' directional-no-cake-effect-review "The directional no-effect outcome mode changed."
+		require_result_flag '@.profile_outcome.manual_only' true "A directional no-effect result must remain manual-only."
+		require_result_flag '@.auto_apply_eligible' false "A directional no-effect result must never auto-apply."
+		require_result_flag '@.bidirectional_confirmation.tested' true "The directional no-effect result lacks simultaneous confirmation."
+		require_result_flag '@.profile_outcome.bidirectional_confirmation.tested' true "The outcome lost simultaneous confirmation."
+		if [ "$selected_topology" = both_shaped ]; then
+			require_result_flag '@.bidirectional_confirmation.safety_pass' true "The directional no-effect final pair is unsafe."
+			require_result_flag '@.profile_outcome.bidirectional_confirmation.safety_pass' true "The outcome contains an unsafe final pair."
+		fi
+	fi
+	if [ "$profile_variable_manual_fallback_count" -gt 0 ] &&
+	   [ "$profile_no_cake_effect_count" -eq 0 ]; then
+		[ "$profile" = variable_link ] && [ "$action" = apply_sqm ] ||
+			die "A bounded Variable link fallback may only review an SQM proposal."
+		require_result_flag '@.profile_outcome.mode' variable-link-bounded-evidence-review "The bounded Variable link outcome mode changed."
+		require_result_flag '@.profile_outcome.manual_only' true "A bounded Variable link fallback must remain manual-only."
+		require_result_flag '@.auto_apply_eligible' false "A bounded Variable link fallback must never auto-apply."
+		require_result_flag '@.bidirectional_confirmation.tested' true "The bounded Variable link fallback lacks simultaneous confirmation."
+		require_result_flag '@.profile_outcome.bidirectional_confirmation.tested' true "The outcome lost simultaneous confirmation."
+		if [ "$selected_topology" = both_shaped ]; then
+			require_result_flag '@.bidirectional_confirmation.safety_pass' true "The bounded Variable link final pair is unsafe."
+			require_result_flag '@.profile_outcome.bidirectional_confirmation.safety_pass' true "The outcome contains an unsafe final pair."
+		fi
 	fi
 	case "$action" in
 		apply_sqm)
-			if [ "$profile_target_met" = true ] && [ "$profile_objectives_met" = true ] &&
-			   [ "$profile_deep_runtime_minimum" = false ]; then
+			# A directional proposal is independently attested above.  Requiring
+			# the old both-shaped topology to be safe would erase the very
+			# fallback that the comparison proved.  Only the both-shaped proposal
+			# is bound to the simultaneous both-shaped safety verdict.
+			if [ "$selected_topology" = both_shaped ]; then
+				[ "$bidirectional_safety_pass" = true ] ||
+					die "The final bidirectional confirmation is outside the non-overridable SQM proposal boundaries."
+			fi
+			if [ "$profile_floor_infeasible" = true ] &&
+			   { [ "$selected_topology" = upload_only_shaped ] || [ "$selected_topology" = download_only_shaped ]; }; then
+				require_result_flag '@.auto_apply_eligible' false "An independently safe capacity-floor fallback must never auto-apply."
+				require_result_flag '@.profile_outcome.manual_only' true "An independently safe capacity-floor fallback must remain manual-only."
+			elif [ "$profile_no_cake_effect_count" -gt 0 ] ||
+			   [ "$profile_variable_manual_fallback_count" -gt 0 ]; then
+				: # The typed directional no-effect contract above is always explicit-review only.
+		elif [ "$profile_target_met" = true ] && [ "$profile_objectives_met" = true ] &&
+		   [ "$profile_deep_runtime_minimum" = false ] &&
+		   [ "$bidirectional_auto_apply_pass" = true ]; then
 				require_result_flag '@.profile_outcome.manual_only' false "A target-meeting outcome was marked manual-only."
 				if [ "$result_class" = trusted ]; then
 					require_result_flag '@.auto_apply_eligible' true "A trusted, fully passing proposal unexpectedly requires manual-only apply."
@@ -1354,6 +2123,12 @@ arm_guard() {
 				profile_outcome_mode="$(require_result_value '@.profile_outcome.mode')" ||
 					die "The profile fallback outcome is missing."
 				case "$profile:$profile_outcome_mode" in
+					gaming:target-a-plus-met|gaming_extreme:extreme-a-plus-met|best_overall:target-a-met|variable_link:target-b-measured-knee|fair:throughput-optimum-c-or-better)
+						[ "$profile_target_met" = true ] &&
+							[ "$profile_objectives_met" = true ] &&
+							[ "$bidirectional_realization_pass" = false ] ||
+							die "A target-meeting manual proposal has no final bidirectional realization shortfall."
+						;;
 					gaming:best-attainable-quality-fallback|best_overall:balanced-fallback|variable_link:measured-knee-quality-fallback) ;;
 					gaming:target-a-plus-throughput-advisory|best_overall:target-a-throughput-advisory) ;;
 					gaming_extreme:extreme-a-plus-throughput-sacrifice|gaming_extreme:extreme-best-attainable-quality-fallback|gaming_extreme:extreme-quality-and-throughput-review) ;;
@@ -1376,8 +2151,63 @@ arm_guard() {
 			fi
 			;;
 		disable_sqm)
-			[ "$profile" = fair ] || die "Only a Fair comparison may recommend disabling SQM."
-			require_result_flag '@.auto_apply_eligible' false "Disabling SQM must never be an automatic action."
+			if [ "$(json_get "$result_copy" "$selected_proposal_path.evidence.control")" = raw_control ]; then
+				require_result_flag "$selected_proposal_path.evidence.control" raw_control \
+					"The no-SQM proposal is not bound to its raw control."
+				case "$profile" in gaming|gaming_extreme|best_overall|variable_link) ;;
+					*) die "This calibration profile cannot use a generic raw no-SQM proposal." ;;
+				esac
+				require_result_flag '@.raw_control.available' true "The raw no-SQM control is unavailable."
+				require_result_flag '@.raw_control.measurement_evidence.valid' true "The raw no-SQM control evidence is invalid."
+				require_result_flag '@.raw_control.measurement_evidence.test_direction' both "The raw no-SQM control was not bidirectional."
+				require_result_flag '@.raw_control.measurement_evidence.shaper_bypassed' true "The raw no-SQM control did not prove SQM bypass."
+				raw_bypass_mode="$(require_result_value '@.raw_control.measurement_evidence.sqm_bypass_mode')" ||
+					die "The Variable link raw control has no bypass mode."
+				raw_sqm_paused="$(require_result_value '@.raw_control.measurement_evidence.sqm_paused')" ||
+					die "The Variable link raw control has no SQM pause evidence."
+				case "$raw_bypass_mode:$raw_sqm_paused" in paused-managed:true|already-unshaped:false) ;; *) die "The raw no-SQM control bypass evidence is inconsistent." ;; esac
+				require_result_flag '@.raw_control.forwarded_background.available' true "The raw no-SQM control has no traffic evidence."
+				require_result_flag '@.raw_control.forwarded_background.contaminated' false "Background traffic contaminated the raw no-SQM control."
+				raw_background_dl="$(require_result_value '@.raw_control.forwarded_background.download_kbps')" || die "The Variable link raw background download is missing."
+				raw_background_ul="$(require_result_value '@.raw_control.forwarded_background.upload_kbps')" || die "The Variable link raw background upload is missing."
+				raw_background_dl_limit="$(require_result_value '@.raw_control.forwarded_background.download_limit_kbps')" || die "The Variable link raw background download limit is missing."
+				raw_background_ul_limit="$(require_result_value '@.raw_control.forwarded_background.upload_limit_kbps')" || die "The Variable link raw background upload limit is missing."
+				raw_delta="$(require_result_value '@.raw_control.effective_delta_ms')" || die "The Variable link raw delay is missing."
+				require_result_flag "$selected_proposal_path.effective_delta_ms" "$raw_delta" "The no-SQM proposal delay differs from its raw control."
+				raw_grade="$(require_result_value '@.raw_control.grade')" || die "The raw no-SQM grade is missing."
+				require_result_flag "$selected_proposal_path.grade" "$raw_grade" "The no-SQM proposal grade differs from its raw control."
+				raw_loss="$(require_result_value '@.raw_control.icmp_latency.loss_percent')" || die "The Variable link raw loss is missing."
+				raw_dl="$(require_result_value '@.raw_control.throughput.download_kbps')" || die "The Variable link raw download is missing."
+				raw_ul="$(require_result_value '@.raw_control.throughput.upload_kbps')" || die "The Variable link raw upload is missing."
+				shaped_directional_delta="$(require_result_value '@.validation.effective_delta_ms')" ||
+					die "The shaped comparison delay is missing."
+				shaped_review_delta="$(LC_ALL=C awk -v directional="$shaped_directional_delta" \
+					-v simultaneous="$bidirectional_delta" 'BEGIN {
+						if (directional !~ /^[0-9]+([.][0-9]+)?$/ || simultaneous !~ /^[0-9]+([.][0-9]+)?$/) exit 1
+						print (((directional + 0) > (simultaneous + 0)) ? directional : simultaneous)
+					}')" || die "The shaped comparison delay is malformed."
+				shaped_dl="$(require_result_value '@.validation.throughput.download_kbps')" ||
+					die "The shaped comparison download is missing."
+				shaped_ul="$(require_result_value '@.validation.throughput.upload_kbps')" ||
+					die "The shaped comparison upload is missing."
+				is_decimal "$raw_delta" && is_decimal "$raw_loss" &&
+					is_positive_rate "$raw_dl" && is_positive_rate "$raw_ul" &&
+					is_positive_rate "$shaped_dl" && is_positive_rate "$shaped_ul" &&
+					is_decimal "$raw_background_dl" && is_decimal "$raw_background_ul" &&
+					is_decimal "$raw_background_dl_limit" && is_decimal "$raw_background_ul_limit" &&
+					awk -v delta="$raw_delta" -v delay_limit="$validation_manual_latency_review" \
+						-v loss="$raw_loss" -v loss_limit="$validation_loss" \
+						-v shaped_delta="$shaped_review_delta" -v raw_dl="$raw_dl" -v raw_ul="$raw_ul" \
+						-v shaped_dl="$shaped_dl" -v shaped_ul="$shaped_ul" \
+						-v bg_dl="$raw_background_dl" -v bg_ul="$raw_background_ul" \
+						-v bg_dl_limit="$raw_background_dl_limit" -v bg_ul_limit="$raw_background_ul_limit" \
+						'BEGIN {
+							exit(delta > delay_limit || loss > loss_limit || bg_dl > bg_dl_limit || bg_ul > bg_ul_limit ||
+								delta > shaped_delta + 10 || raw_dl < shaped_dl * 1.02 || raw_ul < shaped_ul * 1.02)
+						}' ||
+					die "The raw no-SQM control exceeds its manual safety boundary."
+			else
+				[ "$profile" = fair ] || die "Only a measured raw or Fair comparison may recommend disabling SQM."
 			if [ "$profile_floor_infeasible" = true ]; then
 				require_result_flag '@.validation.hard_pass' false "The infeasible Fair result unexpectedly passed all hard gates."
 				require_result_flag '@.fair_outcome.apply_sqm_available' false "The unsafe shaped candidate must not be applyable."
@@ -1425,29 +2255,33 @@ arm_guard() {
 				die "The no-SQM control exceeded its forwarded-traffic limits."
 			result_action_allowed disable_sqm ||
 				die "The Fair outcome does not allow disabling SQM."
-			fair_shaped_grade="$(require_result_value '@.validation.actual_grade')" ||
-				die "The shaped Fair grade is missing."
+			fair_shaped_grade="$(require_result_value '@.profile_outcome.actual_grade')" ||
+				die "The authoritative shaped Fair grade is missing."
 			fair_control_grade="$(require_result_value '@.fair_outcome.no_sqm_control.grade')" ||
 				die "The no-SQM grade is missing."
-			require_result_flag '@.fair_outcome.actual_grade' "$fair_shaped_grade" "The Fair outcome grade differs from validation."
+			require_result_flag '@.fair_outcome.actual_grade' "$fair_shaped_grade" "The Fair outcome grade differs from the final profile verdict."
 			fair_shaped_rank="$(quality_grade_rank "$fair_shaped_grade")" ||
 				die "The shaped Fair grade is invalid."
 			fair_control_rank="$(quality_grade_rank "$fair_control_grade")" ||
 				die "The no-SQM grade is invalid."
 			[ "$fair_control_rank" -le "$fair_shaped_rank" ] ||
 				die "The no-SQM control grade is worse than the shaped candidate."
-			fair_shaped_delta="$(require_result_value '@.validation.effective_delta_ms')" ||
-				die "The shaped Fair delay is missing."
+			fair_shaped_delta="$(require_result_value '@.fair_outcome.actual_effective_delta_ms')" ||
+				die "The authoritative shaped Fair delay is missing."
 			fair_control_delta="$(require_result_value '@.fair_outcome.no_sqm_control.effective_delta_ms')" ||
 				die "The no-SQM delay is missing."
+			fair_control_loss="$(require_result_value '@.fair_outcome.no_sqm_control.icmp_latency.loss_percent')" ||
+				die "The no-SQM packet-loss result is missing."
 			fair_outcome_delta="$(require_result_value '@.fair_outcome.actual_effective_delta_ms')" ||
 				die "The Fair outcome delay is missing."
 			is_decimal "$fair_shaped_delta" && is_decimal "$fair_control_delta" &&
+				is_decimal "$fair_control_loss" &&
 				is_decimal "$fair_outcome_delta" &&
 				numbers_equal "$fair_outcome_delta" "$fair_shaped_delta" &&
 				awk -v control="$fair_control_delta" -v shaped="$fair_shaped_delta" \
-					'BEGIN { exit(control > shaped + 10) }' ||
-				die "The no-SQM delay is materially worse than the shaped candidate."
+					-v loss="$fair_control_loss" -v loss_limit="$validation_loss" \
+					'BEGIN { exit(control > shaped + 10 || loss > loss_limit) }' ||
+				die "The no-SQM control exceeds its latency or packet-loss safety boundary."
 			fair_control_dl="$(require_result_value '@.fair_outcome.no_sqm_control.throughput.download_kbps')" ||
 				die "The no-SQM download measurement is missing."
 			fair_control_ul="$(require_result_value '@.fair_outcome.no_sqm_control.throughput.upload_kbps')" ||
@@ -1461,8 +2295,10 @@ arm_guard() {
 			is_decimal "$fair_dl_gain" && is_decimal "$fair_ul_gain" &&
 				awk -v dl="$fair_dl_gain" -v ul="$fair_ul_gain" 'BEGIN { exit(dl < 2 || ul < 2) }' ||
 				die "The no-SQM throughput benefit is below the explicit recommendation threshold."
+			fi
 			;;
 	esac
+	fi
 	[ "$(json_get "$result_copy" '@.job_id')" = "$job" ] || die "The Full Auto-Tune result belongs to a different instance."
 	[ "$(json_get "$result_copy" '@.target_interface')" = "$target" ] || die "The Full Auto-Tune result targets a different interface."
 	[ "$(json_get "$result_copy" '@.route_mode')" = "$route_mode" ] || die "The Full Auto-Tune result uses a different route mode."
@@ -1487,7 +2323,7 @@ arm_guard() {
 	original_cake_fingerprint="$(snapshot_fingerprint "$token_dir/original" cake-autorate)" || die "Unable to hash the original CAKE snapshot."
 	original_sqm_fingerprint="$(snapshot_fingerprint "$token_dir/original" sqm)" || die "Unable to hash the original SQM snapshot."
 	{
-		printf 'version=2\n'
+		printf 'version=3\n'
 		printf 'job=%s\n' "$job"
 		printf 'target=%s\n' "$target"
 		printf 'backend=%s\n' "$backend"
@@ -1496,6 +2332,8 @@ arm_guard() {
 		printf 'enabled=%s\n' "$enabled"
 		printf 'disable_adaptive=%s\n' "$disable_adaptive"
 		printf 'action=%s\n' "$action"
+		printf 'proposal_id=%s\n' "$proposal_id"
+		printf 'topology=%s\n' "$selected_topology"
 		printf 'run_id=%s\n' "$run_id"
 		printf 'result_fingerprint=%s\n' "$fingerprint"
 		printf 'expected_cake_fingerprint=%s\n' "$expected_cake_fingerprint"
@@ -1526,7 +2364,7 @@ load_token() {
 	token_dir="$guard_root/$token"
 	require_secure_directory "$token_dir" || die "The Full Auto-Tune apply token is missing, foreign-owned, or unsafe."
 	token_version="$(meta_get version "$token_dir")"
-	case "$token_version" in 1|2) ;; *) die "Unsupported Full Auto-Tune apply-token schema." ;; esac
+	case "$token_version" in 1|2|3) ;; *) die "Unsupported Full Auto-Tune apply-token schema." ;; esac
 	job="$(meta_get job "$token_dir")"
 	target="$(meta_get target "$token_dir")"
 	backend="$(meta_get backend "$token_dir")"
@@ -1535,6 +2373,8 @@ load_token() {
 	enabled="$(meta_get enabled "$token_dir")"
 	disable_adaptive="$(meta_get disable_adaptive "$token_dir")"
 	action="$(meta_get action "$token_dir")"
+	proposal_id="$(meta_get proposal_id "$token_dir" 2>/dev/null || true)"
+	selected_topology="$(meta_get topology "$token_dir" 2>/dev/null || true)"
 	run_id="$(meta_get run_id "$token_dir")"
 	expires="$(meta_get expires_epoch "$token_dir")"
 	token_boot_id="$(meta_get boot_id "$token_dir" 2>/dev/null || true)"
@@ -1545,8 +2385,15 @@ load_token() {
 		1:0:apply_sqm|1:1:apply_sqm|0:0:disable_sqm|0:1:disable_sqm) ;;
 		*) die "The Full Auto-Tune token action metadata is invalid." ;;
 	esac
+	if [ "$token_version" = 3 ]; then
+		safe_proposal_id "$proposal_id" || die "The Full Auto-Tune token proposal identity is invalid."
+		case "$selected_topology:$action" in
+			both_shaped:apply_sqm|upload_only_shaped:apply_sqm|download_only_shaped:apply_sqm|no_sqm:disable_sqm) ;;
+			*) die "The Full Auto-Tune token topology is invalid." ;;
+		esac
+	fi
 	safe_run_id "$run_id" || die "The Full Auto-Tune token run identity is invalid."
-	if [ "$token_version" = 2 ]; then
+	if [ "$token_version" = 2 ] || [ "$token_version" = 3 ]; then
 		safe_boot_id "$token_boot_id" || die "The Full Auto-Tune token boot identity is invalid."
 		[ "$token_boot_id" = "$(current_boot_id)" ] ||
 			die "The Full Auto-Tune token belongs to a previous boot."
@@ -1611,8 +2458,12 @@ verify_marker() {
 	[ "$(uci -q get "cake-autorate.$job._autotune_apply_enabled" 2>/dev/null)" = "$enabled" ] || die "The Full Auto-Tune marker enabled state does not match its token."
 	[ "$(uci -q get "cake-autorate.$job._autotune_apply_disable_adaptive" 2>/dev/null)" = "$disable_adaptive" ] || die "The Full Auto-Tune marker adaptive decision does not match its token."
 	[ "$(uci -q get "cake-autorate.$job._autotune_apply_action" 2>/dev/null)" = "$action" ] || die "The Full Auto-Tune marker action does not match its token."
+	if [ "$token_version" = 3 ]; then
+		[ "$(uci -q get "cake-autorate.$job._autotune_apply_proposal_id" 2>/dev/null)" = "$proposal_id" ] ||
+			die "The Full Auto-Tune marker proposal identity does not match its token."
+	fi
 	[ "$(uci -q get "cake-autorate.$job._autotune_apply_expires" 2>/dev/null)" = "$expires" ] || die "The Full Auto-Tune marker expiry does not match its token."
-	if [ "$token_version" = 2 ]; then
+	if [ "$token_version" = 2 ] || [ "$token_version" = 3 ]; then
 		[ "$(uci -q get "cake-autorate.$job._autotune_apply_boot_id" 2>/dev/null)" = "$token_boot_id" ] ||
 			die "The Full Auto-Tune marker boot identity does not match its token."
 	fi
@@ -1800,6 +2651,9 @@ recover_stale() {
 	recovery_enabled="$(persistent_uci -q get "cake-autorate.$recovery_job._autotune_apply_enabled" 2>/dev/null)"
 	recovery_disable_adaptive="$(persistent_uci -q get "cake-autorate.$recovery_job._autotune_apply_disable_adaptive" 2>/dev/null)"
 	recovery_action="$(persistent_uci -q get "cake-autorate.$recovery_job._autotune_apply_action" 2>/dev/null)"
+	recovery_proposal_id="$(persistent_uci -q get "cake-autorate.$recovery_job._autotune_apply_proposal_id" 2>/dev/null || true)"
+	[ -z "$recovery_proposal_id" ] || safe_proposal_id "$recovery_proposal_id" ||
+		die "The persistent Full Auto-Tune proposal identity is invalid."
 	case "$recovery_enabled:$recovery_disable_adaptive:$recovery_action" in
 		1:0:apply_sqm|1:1:apply_sqm|0:0:disable_sqm|0:1:disable_sqm) ;;
 		*) die "The persistent Full Auto-Tune marker action is inconsistent." ;;
@@ -1859,7 +2713,7 @@ recover_stale() {
 	persistent_uci -q commit sqm || die "Unable to commit stale SQM marker cleanup."
 	for recovery_option in _autotune_apply_guard _autotune_apply_fingerprint _autotune_apply_target \
 		_autotune_apply_backend _autotune_apply_route_mode _autotune_apply_mwan3_member \
-		_autotune_apply_enabled _autotune_apply_disable_adaptive _autotune_apply_action \
+		_autotune_apply_enabled _autotune_apply_disable_adaptive _autotune_apply_action _autotune_apply_proposal_id \
 		_autotune_apply_token _autotune_apply_expires _autotune_apply_boot_id; do
 		if persistent_uci -q get "cake-autorate.$recovery_job.$recovery_option" >/dev/null 2>&1; then
 			persistent_uci -q delete "cake-autorate.$recovery_job.$recovery_option" ||
@@ -1976,23 +2830,38 @@ postcheck() {
 		dl_if="$(uci -q get "cake-autorate.$job.dl_if" 2>/dev/null)"
 		safe_interface "$resolved" && safe_interface "$dl_if" || die "The validated SQM runtime interfaces are invalid."
 		[ -n "$tc_bin" ] && [ -x "$tc_bin" ] || die "tc is unavailable for the managed SQM runtime check."
-		[ -d "$sys_class_net/$resolved" ] && [ -d "$sys_class_net/$dl_if" ] ||
-			die "The validated SQM interfaces are not present after restart."
-		"$tc_bin" qdisc show dev "$resolved" 2>/dev/null | grep -Eq '^qdisc cake | qdisc cake ' ||
-			die "The validated upload CAKE qdisc is not active after restart."
-		"$tc_bin" qdisc show dev "$dl_if" 2>/dev/null | grep -Eq '^qdisc cake | qdisc cake ' ||
-			die "The validated download CAKE qdisc is not active after restart."
+		[ -d "$sys_class_net/$resolved" ] || die "The validated upload interface is not present after restart."
 		expected_ul="$(json_get "$result_copy" '@.proposal.upload.base_kbps')"
 		expected_dl="$(json_get "$result_copy" '@.proposal.download.base_kbps')"
-		[ "$(cake_root_bandwidth_kbps "$resolved")" = "$expected_ul" ] ||
-			die "The active upload CAKE bandwidth does not match the validated manifest."
-		[ "$(cake_root_bandwidth_kbps "$dl_if")" = "$expected_dl" ] ||
-			die "The active download CAKE bandwidth does not match the validated manifest."
-		"$tc_bin" qdisc show dev "$resolved" 2>/dev/null | grep -Eq '^qdisc ingress | qdisc ingress ' ||
-			die "The validated ingress qdisc is not active after restart."
-		"$tc_bin" filter show dev "$resolved" parent ffff: 2>/dev/null |
-			grep -Ei "mirred.*redirect.*(dev|device) $dl_if([^A-Za-z0-9_.:@-]|$)" >/dev/null ||
-			die "The validated ingress redirect does not target the expected IFB."
+		case "$selected_topology" in both_shaped|upload_only_shaped) upload_shaping=1 ;; *) upload_shaping=0 ;; esac
+		case "$selected_topology" in both_shaped|download_only_shaped) download_shaping=1 ;; *) download_shaping=0 ;; esac
+		if [ "$upload_shaping" = 1 ]; then
+			"$tc_bin" qdisc show dev "$resolved" 2>/dev/null | grep -Eq '^qdisc cake | qdisc cake ' ||
+				die "The validated upload CAKE qdisc is not active after restart."
+			[ "$(cake_root_bandwidth_kbps "$resolved")" = "$expected_ul" ] ||
+				die "The active upload CAKE bandwidth does not match the validated manifest."
+		else
+			! "$tc_bin" qdisc show dev "$resolved" 2>/dev/null | grep -Eq '^qdisc cake | qdisc cake ' ||
+				die "Upload CAKE remained active although this topology disables it."
+		fi
+		if [ "$download_shaping" = 1 ]; then
+			[ -d "$sys_class_net/$dl_if" ] || die "The validated download IFB is not present after restart."
+			"$tc_bin" qdisc show dev "$dl_if" 2>/dev/null | grep -Eq '^qdisc cake | qdisc cake ' ||
+				die "The validated download CAKE qdisc is not active after restart."
+			[ "$(cake_root_bandwidth_kbps "$dl_if")" = "$expected_dl" ] ||
+				die "The active download CAKE bandwidth does not match the validated manifest."
+			"$tc_bin" filter show dev "$resolved" parent ffff: 2>/dev/null |
+				grep -Ei "mirred.*redirect.*(dev|device) $dl_if([^A-Za-z0-9_.:@-]|$)" >/dev/null ||
+				die "The validated ingress redirect does not target the expected IFB."
+		else
+			if [ -d "$sys_class_net/$dl_if" ]; then
+				! "$tc_bin" qdisc show dev "$dl_if" 2>/dev/null | grep -Eq '^qdisc cake | qdisc cake ' ||
+					die "Download CAKE remained active although this topology disables it."
+			fi
+			! "$tc_bin" filter show dev "$resolved" parent ffff: 2>/dev/null |
+				grep -Ei "mirred.*redirect.*(dev|device) $dl_if([^A-Za-z0-9_.:@-]|$)" >/dev/null ||
+				die "The managed download redirect remained active although this topology disables it."
+		fi
 		current_daemon_identity="$(daemon_identity "$job")" || die "Unable to identify the validated daemon generation."
 		original_daemon_identity="$(meta_get original_daemon_identity "$token_dir")"
 		[ "$current_daemon_identity" != none ] || die "The validated autorate daemon generation is missing."
@@ -2045,7 +2914,7 @@ prepare_confirm() {
 	live_uci_transaction -q commit sqm || die "Unable to commit prepared SQM marker cleanup."
 	for option in _autotune_apply_guard _autotune_apply_fingerprint _autotune_apply_target \
 		_autotune_apply_backend _autotune_apply_route_mode _autotune_apply_mwan3_member \
-		_autotune_apply_enabled _autotune_apply_disable_adaptive _autotune_apply_action _autotune_apply_token \
+		_autotune_apply_enabled _autotune_apply_disable_adaptive _autotune_apply_action _autotune_apply_proposal_id _autotune_apply_token \
 		_autotune_apply_expires _autotune_apply_boot_id; do
 		if uci -q get "cake-autorate.$job.$option" >/dev/null 2>&1; then
 			live_uci_transaction -q delete "cake-autorate.$job.$option" ||

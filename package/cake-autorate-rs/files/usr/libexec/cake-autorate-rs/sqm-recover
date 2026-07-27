@@ -196,6 +196,24 @@ capture_health_policy() {
 	done
 }
 
+capture_direction_policy() {
+	private_direction_download="$(private_uci_raw_get "sqm.$sqm_section.download")"
+	private_direction_upload="$(private_uci_raw_get "sqm.$sqm_section.upload")"
+	case "$private_direction_download" in 0) shape_download=0 ;; *) is_positive_uint "$private_direction_download" || return 1; shape_download=1 ;; esac
+	case "$private_direction_upload" in 0) shape_upload=0 ;; *) is_positive_uint "$private_direction_upload" || return 1; shape_upload=1 ;; esac
+	case "$shape_download:$shape_upload" in
+		1:1) sqm_direction_mode=both ;;
+		0:1) sqm_direction_mode=upload_only ;;
+		1:0) sqm_direction_mode=download_only ;;
+		*) return 1 ;;
+	esac
+	if [ "$sqm_snapshot_recovery" != 1 ]; then
+		configured_direction_mode="$(uci_get sqm_direction_mode)"
+		[ -n "$configured_direction_mode" ] || configured_direction_mode=both
+		[ "$configured_direction_mode" = "$sqm_direction_mode" ] || return 1
+	fi
+}
+
 health_policy_snapshot_valid() {
 	[ "$recovery_mode" != 1 ] || return 0
 	[ "$(uci_get min_dl_shaper_rate_kbps)" = "$health_min_dl_raw" ] &&
@@ -265,7 +283,16 @@ load_sqm_runtime_identity() {
 	[ "$sqm_identity_iface" = "$target" ] || return 1
 	case "$sqm_identity_qdisc" in cake|cake_mq) ;; *) return 1 ;; esac
 	case "$sqm_identity_script" in ''|*[!A-Za-z0-9_.-]*) return 1 ;; esac
-	is_positive_uint "$sqm_identity_uplink" && is_positive_uint "$sqm_identity_downlink" || return 1
+	if [ "$shape_upload" = 1 ]; then
+		is_positive_uint "$sqm_identity_uplink" || return 1
+	else
+		[ "$sqm_identity_uplink" = 0 ] || return 1
+	fi
+	if [ "$shape_download" = 1 ]; then
+		is_positive_uint "$sqm_identity_downlink" || return 1
+	else
+		[ "$sqm_identity_downlink" = 0 ] || return 1
+	fi
 	case "$sqm_identity_linklayer" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac
 	case "$sqm_identity_llam" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac
 	is_signed_int "$sqm_identity_overhead" || return 1
@@ -329,10 +356,12 @@ health_rate_bounds() {
 	elif is_positive_uint "$health_max_ul_raw"; then
 		health_ul_max="$health_max_ul_raw"
 	fi
-	[ "$health_dl_min" -le "$sqm_identity_downlink" ] &&
-		[ "$sqm_identity_downlink" -le "$health_dl_max" ] &&
-		[ "$health_ul_min" -le "$sqm_identity_uplink" ] &&
-		[ "$sqm_identity_uplink" -le "$health_ul_max" ]
+	{ [ "$shape_download" != 1 ] ||
+		{ [ "$health_dl_min" -le "$sqm_identity_downlink" ] &&
+		  [ "$sqm_identity_downlink" -le "$health_dl_max" ]; }; } &&
+	{ [ "$shape_upload" != 1 ] ||
+		{ [ "$health_ul_min" -le "$sqm_identity_uplink" ] &&
+		  [ "$sqm_identity_uplink" -le "$health_ul_max" ]; }; }
 }
 
 cake_last_group_option() {
@@ -472,18 +501,26 @@ healthy() {
 		ifb*|veth*) ul_counter=rx_bytes ;;
 		*) ul_counter=tx_bytes ;;
 	esac
-	[ -f "$sys_class_net/$dl_if/statistics/$dl_counter" ] || return 1
+	if [ "$shape_download" = 1 ]; then
+		[ -f "$sys_class_net/$dl_if/statistics/$dl_counter" ] || return 1
+	else
+		[ -f "$sys_class_net/$target/statistics/rx_bytes" ] || return 1
+	fi
 	[ -f "$sys_class_net/$ul_if/statistics/$ul_counter" ] || return 1
 	load_sqm_runtime_identity || return 1
 	private_state_identity_matches || return 1
 	health_rate_bounds || return 1
-	cake_identity_matches "$dl_if" "$health_dl_min" "$health_dl_max" \
-		"$sqm_identity_ingress_opts $sqm_identity_iqdisc_opts" || return 1
-	cake_identity_matches "$ul_if" "$health_ul_min" "$health_ul_max" \
-		"$sqm_identity_egress_opts $sqm_identity_eqdisc_opts" || return 1
-	case "$dl_if" in
-		ifb*) ingress_qdisc_present && redirect_present || return 1 ;;
-	esac
+	if [ "$shape_download" = 1 ]; then
+		cake_identity_matches "$dl_if" "$health_dl_min" "$health_dl_max" \
+			"$sqm_identity_ingress_opts $sqm_identity_iqdisc_opts" || return 1
+		case "$dl_if" in
+			ifb*) ingress_qdisc_present && redirect_present || return 1 ;;
+		esac
+	fi
+	if [ "$shape_upload" = 1 ]; then
+		cake_identity_matches "$ul_if" "$health_ul_min" "$health_ul_max" \
+			"$sqm_identity_egress_opts $sqm_identity_eqdisc_opts" || return 1
+	fi
 	return 0
 }
 
@@ -543,6 +580,22 @@ case "$#" in
 		[ -n "$sqm_section" ] || sqm_section="cake_$section"
 		;;
 	7)
+		recovery_mode=1
+		sqm_snapshot_recovery=1
+		sqm_section="$expected_sqm_section"
+		target="$expected_target"
+		ul_if="$expected_ul_if"
+		dl_if="$expected_dl_if"
+		sqm_expected_fingerprint="$6"
+		sqm_recovery_snapshot="$7"
+		valid_sha256_fingerprint "$sqm_expected_fingerprint" ||
+			fail "Invalid managed SQM recovery fingerprint."
+		runtime_lock_ram_path "$sqm_recovery_snapshot" ||
+			fail "Invalid managed SQM recovery snapshot path."
+		;;
+	8)
+		[ "$8" = check ] || fail "Unknown immutable SQM recovery operation."
+		sqm_check_only=1
 		recovery_mode=1
 		sqm_snapshot_recovery=1
 		sqm_section="$expected_sqm_section"
@@ -660,6 +713,8 @@ fi
 health_policy_snapshot_valid || fail "CAKE/SQM health-policy bounds changed while locking $section."
 prepare_private_sqm_config ||
 	fail "Managed SQM configuration changed or could not be frozen safely while locking $section."
+capture_direction_policy ||
+	fail "Managed SQM direction topology is invalid or differs from frozen UCI."
 
 if [ "$sqm_check_only" = 1 ]; then
 	healthy || fail "Managed SQM on $target is not an exact CAKE, IFB, and ingress match."

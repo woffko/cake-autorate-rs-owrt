@@ -452,7 +452,7 @@ emit_custom_rules() {
 render_ruleset() {
 	local requested_ruleset="$1"
 	local instance instance_enabled rules_enabled defaults_profile defaults_option defaults_enabled
-	local manage_sqm sqm_enabled sqm_script sqm_eqdisc_opts
+	local manage_sqm sqm_enabled sqm_direction_mode sqm_script sqm_eqdisc_opts
 	local autotune_profile configured_profile legacy_traffic_profile
 	local chain_marker fragment seen_targets=""
 	ruleset_file="$requested_ruleset"
@@ -468,14 +468,17 @@ render_ruleset() {
 		instance_enabled="$("$uci_bin" -q get "cake-autorate.$instance.enabled" 2>/dev/null)"
 		manage_sqm="$("$uci_bin" -q get "cake-autorate.$instance.manage_sqm" 2>/dev/null)"
 		sqm_enabled="$("$uci_bin" -q get "cake-autorate.$instance.sqm_enabled" 2>/dev/null)"
+		sqm_direction_mode="$("$uci_bin" -q get "cake-autorate.$instance.sqm_direction_mode" 2>/dev/null)"
 		rules_enabled="$("$uci_bin" -q get "cake-autorate.$instance.traffic_rules_enabled" 2>/dev/null)"
 		[ -n "$manage_sqm" ] || manage_sqm=1
 		[ -n "$sqm_enabled" ] || sqm_enabled="$instance_enabled"
+		[ -n "$sqm_direction_mode" ] || sqm_direction_mode=both
 		# This is a new packet-policy feature, so an upgraded instance without
 		# an explicit choice remains untouched until the user opts in.
 		[ -n "$rules_enabled" ] || rules_enabled=0
 		[ "$instance_enabled" = 1 ] && [ "$manage_sqm" = 1 ] &&
-			[ "$sqm_enabled" = 1 ] && [ "$rules_enabled" = 1 ] || continue
+			[ "$sqm_enabled" = 1 ] && [ "$rules_enabled" = 1 ] &&
+			[ "$sqm_direction_mode" != download_only ] && [ "$sqm_direction_mode" != off ] || continue
 		autotune_profile="$(canonical_profile "$("$uci_bin" -q get "cake-autorate.$instance.autotune_profile" 2>/dev/null)")" ||
 			fail "Instance $instance has an unsupported Auto-Tune profile."
 		configured_profile="$("$uci_bin" -q get "cake-autorate.$instance.traffic_profile" 2>/dev/null)"

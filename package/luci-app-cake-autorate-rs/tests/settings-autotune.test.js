@@ -64,6 +64,12 @@ assert.match(source,
 	'Multi-WAN proposals must be guarded, applied and reloaded one at a time');
 assert.match(source, /Create & apply sequentially/,
 	'the Multi-WAN final action must describe that it applies the accepted proposals');
+assert.doesNotMatch(source,
+	/state\.multiwan_set\s*\?\s*E\('pre'[\s\S]*?\)\s*:\s*null/,
+	'the Multi-WAN plan must never pass a null child that LuCI renders as literal text');
+assert.match(source,
+	/E\('pre',\s*\{[\s\S]*?'style':\s*state\.multiwan_set\s*\?[\s\S]*?'display:none'[\s\S]*?\},\s*plan\)/,
+	'the inactive Multi-WAN plan must remain a real hidden DOM node');
 assert.match(source,
 	/pendingAutotuneApplyMarkers\(\)\.length[\s\S]*?cake_autorate_apply_guard[\s\S]*?refusing to mix it with disabled uplinks/,
 	'disabled fallback instances must never share a transaction with stale apply markers');
@@ -106,17 +112,23 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 			`topicTab, autorateSubcategory, autorateSubcategoryDefinitions, ` +
 			`canonicalAutotuneProfile, autotuneProfilePolicy, autotuneProfileDefinitions, ` +
 			`visibleAutotuneProfile, autotuneRunProfile, storedAutotuneProfile, ` +
+			`autotuneRunningRequestMatches, ` +
 			`autotuneAchievedGrade, autotuneGradeTone, ` +
-			`autotuneProposalMatchesProfile, ` +
-			`autotuneResultValidated, autotuneResultReviewable, ` +
+			`autotuneProposalMatchesProfile, autotuneProposalCandidates, ` +
+			`autotuneResultEnvelopeValidated, autotuneProfileOutcomeValidated, ` +
+			`autotuneFairOutcomeValidated, autotuneResultValidated, autotuneResultReviewable, ` +
+			`autotuneDirectionalProposalEvidenceValidated, autotuneCandidateAcknowledgementRequirements, ` +
+			`autotuneCandidateRealizationReconciled, ` +
+			`autotuneAcknowledgableGateFailures, autotuneGateAcknowledgementsComplete, ` +
 			`autotuneResultHasReviewChoice, autotuneDefaultReviewAction, ` +
 			`autotuneConfidence, autotuneResultClass, autotuneBackgroundAwareResult, ` +
 			`autotunePhaseEvidenceUsable, ` +
 			`autotuneConservativeAvailable, autotunePhaseEvidenceClean, ` +
 			`multiwanAutotuneItemAccepted, multiwanAutotuneItemDecided, multiwanAutotuneBatchDecided, ` +
 			`multiwanAutotuneItemCanSkip, ` +
-			`autotuneDisableSqmEvidenceValidated, ` +
+			`autotuneDisableSqmEvidenceValidated, autotuneRawNoSqmEvidenceValidated, ` +
 			`autotuneAttemptDiagnostics, autotuneDiagnostics, ` +
+			`autotuneRawControlRows, ` +
 			`autotuneCpuSustainedSummary, ` +
 			`autotuneRuntimeSettled, autotuneLegacyResult, ` +
 			`autotuneRecoveryPending, autotuneRecoveryProgress, ` +
@@ -127,7 +139,7 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 			`changedUciPackages, requireCleanUciTransaction, applyPlainRollbackTransaction, ` +
 			`runSequentialAutotuneApplies, ` +
 			`clearAutotuneProposalState, recordAutotuneTerminalFailure, ` +
-			`autotuneRetryableInconclusive, recordAutotuneRetryableInconclusive, ` +
+			`autotuneRetryableInconclusive, autotuneRecommendedProfile, recordAutotuneRetryableInconclusive, ` +
 				`adaptiveCeilingWritePlan, runAutotuneJob, cancelAutotuneJob, ` +
 			`setInterfaceContext: function(value) { interfaceContext = value; }, ` +
 			`setMwan3Context: function(value) { mwan3Context = value; } };`
@@ -139,10 +151,282 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 const helpers = compileHelpers({});
 assert.match(source, /Simultaneous DL\+UL confirmation/,
 	'Review must expose the final simultaneous direction confirmation');
-assert.match(source, /Directional CAKE finding/,
-	'Review must expose a repeatable upload-only CAKE finding');
-assert.match(source, /current proposal still shapes both directions/,
-	'directional evidence must not imply that LuCI silently applies a different runtime topology');
+assert.match(source, /Directional CAKE proposal/,
+	'Review must expose repeatable one-sided CAKE proposals');
+assert.match(source, /directional_comparisons/,
+	'Review must consume both upload-only and download-only comparisons');
+assert.match(source, /Raw capacity controls/,
+	'Review must expose the raw physical-capacity controls instead of hiding them in JSON');
+assert.match(source, /No measured throughput benefit from disabling SQM/,
+	'raw no-SQM throughput trade-offs must be rendered as user-facing text rather than backend codes');
+assert.match(source, /Unshaped loaded latency is worse than shaped/,
+	'raw no-SQM latency trade-offs must be rendered as user-facing text rather than backend codes');
+assert.match(source,
+	/selectedAutotuneAction === 'disable_sqm'[\s\S]*?disable_sqm_confirmed[\s\S]*?disables CAKE shaping/,
+	'every no-SQM proposal must retain an explicit disable-SQM acknowledgement');
+const typedProposalConfiguration = { download: { base_kbps: 100000 }, upload: { base_kbps: 20000 } };
+const typedCandidates = [ {
+	schema_version: 1,
+	proposal_id: 'p-0123456789abcdef01234567',
+	rank: 1,
+	action: 'apply_sqm',
+	topology: 'both_shaped',
+	is_primary: true,
+	applicable: true,
+	hard_safety_pass: true,
+	profile_target_met: false,
+	profile_objectives_met: true,
+	grade: 'B',
+	effective_delta_ms: 42,
+	confidence_percent: 73,
+	unmet_objectives: [ 'profile-target' ],
+	evidence: { validation: 'validation', confirmation: 'bidirectional_confirmation' },
+	configuration: typedProposalConfiguration,
+} ];
+assert.equal(helpers.autotuneProposalCandidates({
+	proposal: typedProposalConfiguration, proposals: typedCandidates,
+}), typedCandidates, 'a safe typed proposal list must retain its exact candidate objects');
+assert.equal(helpers.autotuneProposalCandidates({
+	proposal: typedProposalConfiguration,
+	proposals: [ { ...typedCandidates[0], hard_safety_pass: false } ],
+}), null, 'a candidate which fails hard safety must never enter the review list');
+assert.equal(helpers.autotuneProposalCandidates({
+	proposal: typedProposalConfiguration,
+	proposals: [ typedCandidates[0], { ...typedCandidates[0], rank: 2 } ],
+}), null, 'proposal identifiers must be unique within one immutable result');
+const uploadOnlyCandidate = {
+	...typedCandidates[0],
+	proposal_id: 'p-111111111111111111111111',
+	topology: 'upload_only_shaped',
+	grade: 'B',
+	effective_delta_ms: 35,
+	profile_objectives_met: false,
+	unmet_objectives: [ 'profile-target', 'retention-objective', 'download-sqm-disabled' ],
+	evidence: { recommendation: 'directional_comparisons.upload_only' },
+};
+const uploadOnlyResult = {
+	profile: 'best_overall',
+	proposal: {
+		...typedProposalConfiguration,
+		download: { ...typedProposalConfiguration.download, base_kbps: 100000 },
+		upload: { ...typedProposalConfiguration.upload, base_kbps: 20000 },
+	},
+	validation_thresholds: {
+		candidate_realization_min_percent: 80,
+		candidate_realization_max_percent: 110,
+		manual_latency_review_max_ms: 60,
+		loss_max_percent: 3,
+	},
+	validation: {
+		effective_delta_ms: 40,
+	},
+	bidirectional_confirmation: {
+		effective_delta_ms: 40,
+		achieved_kbps: { download: 80000, upload: 18000 },
+	},
+	directional_comparisons: {
+		upload_only: {
+			tested: true,
+			recommended_topology: 'upload_only_shaped',
+			repeatable: true,
+			observations: [
+				{
+					candidate_pass: true, hard_safety_pass: true, material_benefit: true, grade: 'B',
+					effective_delta_ms: 35, loss_percent: 0,
+					upload_realization_percent: 90, download_gain_percent: 10,
+					delay_improvement_ms: 5,
+					observation: {
+						topology: 'upload_only_shaped', direction: 'both',
+						throughput_kbps: { download_kbps: 88000, upload_kbps: 18000 },
+						measurement_evidence: { valid: true, shaper_bypassed: true,
+							sqm_paused: false, sqm_bypass_mode: 'ingress-only-autotune' },
+					},
+				},
+				{
+					candidate_pass: true, hard_safety_pass: true, material_benefit: true, grade: 'B',
+					effective_delta_ms: 34, loss_percent: 0,
+					upload_realization_percent: 91, download_gain_percent: 8.75,
+					delay_improvement_ms: 6,
+					observation: {
+						topology: 'upload_only_shaped', direction: 'both',
+						throughput_kbps: { download_kbps: 87000, upload_kbps: 18200 },
+						measurement_evidence: { valid: true, shaper_bypassed: true,
+							sqm_paused: false, sqm_bypass_mode: 'ingress-only-autotune' },
+					},
+				},
+			],
+		},
+	},
+};
+assert.equal(helpers.autotuneDirectionalProposalEvidenceValidated(
+	uploadOnlyResult, uploadOnlyCandidate), true,
+'repeatable one-sided evidence must independently validate its selected proposal');
+const tamperedUploadOnly = structuredClone(uploadOnlyResult);
+tamperedUploadOnly.directional_comparisons.upload_only.observations[1].upload_realization_percent = 100;
+assert.equal(helpers.autotuneDirectionalProposalEvidenceValidated(
+	tamperedUploadOnly, uploadOnlyCandidate), false,
+'reported directional realization must be recomputed from measured throughput');
+const safeNonBeneficialUpload = structuredClone(uploadOnlyResult);
+safeNonBeneficialUpload.directional_comparisons.upload_only.recommended_topology = 'manual_review';
+for (const item of safeNonBeneficialUpload.directional_comparisons.upload_only.observations) {
+	item.candidate_pass = false;
+	item.material_benefit = false;
+	item.download_gain_percent = 0;
+	item.observation.throughput_kbps.download_kbps = 80000;
+}
+const safeNonBeneficialCandidate = {
+	...uploadOnlyCandidate,
+	unmet_objectives: uploadOnlyCandidate.unmet_objectives.concat('throughput-benefit-unproven'),
+};
+assert.equal(helpers.autotuneDirectionalProposalEvidenceValidated(
+	safeNonBeneficialUpload, safeNonBeneficialCandidate), true,
+'a repeatable one-sided topology inside every hard gate must remain reviewable when utility benefit is unproven');
+assert.equal(helpers.autotuneDirectionalProposalEvidenceValidated(
+	safeNonBeneficialUpload, uploadOnlyCandidate), false,
+'the one-sided utility warning must be bound to the selected candidate');
+const higherValidationReferenceUpload = structuredClone(uploadOnlyResult);
+higherValidationReferenceUpload.validation.effective_delta_ms = 60;
+for (const item of higherValidationReferenceUpload.directional_comparisons.upload_only.observations) {
+	item.effective_delta_ms = item === higherValidationReferenceUpload.directional_comparisons.upload_only.observations[0] ? 55 : 54;
+	item.delay_improvement_ms =
+		higherValidationReferenceUpload.bidirectional_confirmation.effective_delta_ms - item.effective_delta_ms;
+}
+const higherValidationReferenceCandidate = {
+	...uploadOnlyCandidate,
+	effective_delta_ms: 55,
+	unmet_objectives: uploadOnlyCandidate.unmet_objectives.concat('throughput-benefit-unproven'),
+};
+assert.equal(helpers.autotuneDirectionalProposalEvidenceValidated(
+	higherValidationReferenceUpload, higherValidationReferenceCandidate), true,
+'the latency warning must use the worse shaped validation and bidirectional reference');
+const wrongImprovementReferenceUpload = structuredClone(higherValidationReferenceUpload);
+wrongImprovementReferenceUpload.directional_comparisons.upload_only.observations[0]
+	.delay_improvement_ms = 5;
+assert.equal(helpers.autotuneDirectionalProposalEvidenceValidated(
+	wrongImprovementReferenceUpload, higherValidationReferenceCandidate), false,
+'directional delay improvement must remain relative to the bidirectional confirmation');
+const lowRealizationUpload = structuredClone(uploadOnlyResult);
+lowRealizationUpload.directional_comparisons.upload_only.observations[0]
+	.upload_realization_percent = 70;
+lowRealizationUpload.directional_comparisons.upload_only.observations[0]
+	.observation.throughput_kbps.upload_kbps = 14000;
+lowRealizationUpload.directional_comparisons.upload_only.observations[1]
+	.upload_realization_percent = 71;
+lowRealizationUpload.directional_comparisons.upload_only.observations[1]
+	.observation.throughput_kbps.upload_kbps = 14200;
+const lowRealizationCandidate = {
+	...uploadOnlyCandidate,
+	unmet_objectives: uploadOnlyCandidate.unmet_objectives.concat('candidate-realization'),
+};
+assert.equal(helpers.autotuneDirectionalProposalEvidenceValidated(
+	lowRealizationUpload, lowRealizationCandidate), true,
+'a 50-80% one-sided realization must remain reviewable with an explicit acknowledgement');
+assert.equal(helpers.autotuneDirectionalProposalEvidenceValidated(
+	lowRealizationUpload, uploadOnlyCandidate), false,
+'a one-sided realization objective miss must not be accepted without its warning');
+const downloadOnlyCandidate = {
+	...uploadOnlyCandidate,
+	proposal_id: 'p-222222222222222222222222',
+	topology: 'download_only_shaped',
+	unmet_objectives: [ 'profile-target', 'retention-objective', 'upload-sqm-disabled' ],
+	evidence: { recommendation: 'directional_comparisons.download_only' },
+};
+const downloadOnlyResult = structuredClone(uploadOnlyResult);
+downloadOnlyResult.directional_comparisons = {
+	download_only: {
+		tested: true,
+		recommended_topology: 'download_only_shaped',
+		repeatable: true,
+		observations: [
+			{
+				candidate_pass: true, hard_safety_pass: true, material_benefit: true, grade: 'B',
+				effective_delta_ms: 35, loss_percent: 0,
+				download_realization_percent: 90, upload_gain_percent: 10,
+				delay_improvement_ms: 5,
+				observation: {
+					topology: 'download_only_shaped', direction: 'both',
+					throughput_kbps: { download_kbps: 90000, upload_kbps: 19800 },
+					measurement_evidence: { valid: true, shaper_bypassed: true,
+						sqm_paused: false, sqm_bypass_mode: 'egress-only-autotune' },
+				},
+			},
+			{
+				candidate_pass: true, hard_safety_pass: true, material_benefit: true, grade: 'B',
+				effective_delta_ms: 34, loss_percent: 0,
+				download_realization_percent: 91, upload_gain_percent: 8.89,
+				delay_improvement_ms: 6,
+				observation: {
+					topology: 'download_only_shaped', direction: 'both',
+					throughput_kbps: { download_kbps: 91000, upload_kbps: 19600 },
+					measurement_evidence: { valid: true, shaper_bypassed: true,
+						sqm_paused: false, sqm_bypass_mode: 'egress-only-autotune' },
+				},
+			},
+		],
+	},
+};
+assert.equal(helpers.autotuneDirectionalProposalEvidenceValidated(
+	downloadOnlyResult, downloadOnlyCandidate), true,
+'repeatable download-only evidence must receive the same independent validation');
+const fourTopologyCandidates = [
+	{ ...typedCandidates[0], rank: 1 },
+	{ ...uploadOnlyCandidate, rank: 2, is_primary: false },
+	{ ...downloadOnlyCandidate, rank: 3, is_primary: false },
+	{
+		...typedCandidates[0], proposal_id: 'p-333333333333333333333333', rank: 4,
+		action: 'disable_sqm', topology: 'no_sqm', is_primary: false,
+		unmet_objectives: [ 'profile-target' ],
+		evidence: { control: 'raw_control' }, configuration: null,
+	},
+];
+assert.equal(helpers.autotuneProposalCandidates({
+	proposal: typedProposalConfiguration, proposals: fourTopologyCandidates,
+}), fourTopologyCandidates, 'all four independently evidenced topologies must fit in Review');
+assert.equal(helpers.autotuneProposalCandidates({
+	proposal: typedProposalConfiguration,
+	proposals: fourTopologyCandidates.concat({
+		...fourTopologyCandidates[3], proposal_id: 'p-444444444444444444444444', rank: 5,
+	}),
+}), null, 'a fifth candidate must be rejected until the schema explicitly raises its bound');
+const candidateRequirements = helpers.autotuneCandidateAcknowledgementRequirements({
+	proposal: typedProposalConfiguration, proposals: [ uploadOnlyCandidate ],
+}, 'apply_sqm', uploadOnlyCandidate.proposal_id);
+assert.deepEqual(candidateRequirements.map((item) => item.code), [
+	'proposal-profile-target', 'proposal-retention-objective', 'proposal-download-sqm-disabled'
+], 'every selected proposal trade-off must require its own acknowledgement');
+const rawControlRows = helpers.autotuneRawControlRows({ runs: [
+	{
+		test_direction: 'both', download_kbps: 462580, upload_kbps: 57526,
+		shaper_bypassed: true, sqm_bypass_mode: 'paused-managed', sqm_paused: true,
+		route_traffic_proof: { available: true, passed: true },
+		backend_title: 'speedtest-go', server_name: 'Test server',
+	},
+	{
+		test_direction: 'download', download_kbps: 423205, upload_kbps: null,
+		shaper_bypassed: true, sqm_bypass_mode: 'ingress-only-managed', sqm_paused: false,
+		route_traffic_proof: { available: true, passed: true },
+		backend: 'speedtest-go', server_name: 'Test server',
+	},
+	{
+		test_direction: 'upload', download_kbps: null, upload_kbps: 59943,
+		shaper_bypassed: true, sqm_bypass_mode: 'egress-only-managed', sqm_paused: false,
+		route_traffic_proof: { available: true, passed: false },
+		backend: 'speedtest-go', server_name: 'Test server',
+	},
+	{ test_direction: 'download', download_kbps: null, upload_kbps: null },
+] });
+assert.deepEqual(rawControlRows.map(row => ({
+	direction: row.direction,
+	download_kbps: row.download_kbps,
+	upload_kbps: row.upload_kbps,
+	verified: row.verified,
+})), [
+	{ direction: 'both', download_kbps: 462580, upload_kbps: 57526, verified: true },
+	{ direction: 'download', download_kbps: 423205, upload_kbps: null, verified: true },
+	{ direction: 'upload', download_kbps: null, upload_kbps: 59943, verified: false },
+], 'raw controls must validate direction-specific bypass and route proof independently');
+assert.match(source, /no topology change is selected automatically/,
+	'directional evidence must require an explicit proposal selection before changing runtime topology');
 assert.match(source, /directional-bypass-not-authorized/,
 	'shaped-only calibration must explain why no raw directional comparison was attempted');
 assert.match(source, /Monthly traffic budget/,
@@ -151,7 +435,7 @@ assert.match(source, /Monthly traffic budget/,
 assert.equal(helpers.autotuneAchievedGrade({
 	validation: { actual_grade: 'b' },
 	profile_outcome: { actual_grade: 'A+' }
-}), 'B', 'the final validation grade must be the authoritative achieved class');
+}), 'A+', 'the final profile outcome must be the authoritative achieved class');
 assert.equal(helpers.autotuneAchievedGrade({
 	profile_outcome: { actual_grade: 'C' }
 }), 'C', 'the profile outcome may supply the achieved class when validation omitted it');
@@ -259,6 +543,20 @@ assert.equal(helpers.autotuneProfilePolicy('variable_link').targetGrade, 'B');
 assert.equal(helpers.autotuneProfilePolicy('variable_link').retentionPercent, 70);
 assert.equal(helpers.autotuneProfilePolicy('variable_link').delayMaxMs, 60);
 assert.equal(helpers.autotuneProfilePolicy('fair').retentionPercent, 90);
+assert.equal(helpers.autotuneRunningRequestMatches({
+	state: 'running', job_id: 'wan_sqm', requested_target_interface: 'pppoe-wan',
+	requested_backend: 'speedtest-go', requested_route_mode: 'mwan3',
+	requested_mwan3_member: 'wan', requested_profile: 'best_overall',
+	requested_conservative: false, requested_calibration_strategy: 'shaped_only',
+}, 'wan_sqm', 'pppoe-wan', 'speedtest-go', 'mwan3', 'wan', 'best_overall', false,
+'shaped_only'), true);
+assert.equal(helpers.autotuneRunningRequestMatches({
+	state: 'running', job_id: 'wan_sqm', requested_target_interface: 'pppoe-wan',
+	requested_backend: 'speedtest-go', requested_route_mode: 'mwan3',
+	requested_mwan3_member: 'wan', requested_profile: 'best_overall',
+	requested_conservative: false, requested_calibration_strategy: 'full_raw',
+}, 'wan_sqm', 'pppoe-wan', 'speedtest-go', 'mwan3', 'wan', 'best_overall', false,
+'shaped_only'), false, 'an ambiguous start must not attach to another calibration strategy');
 
 const proposal = {
 	schema_version: 3,
@@ -759,6 +1057,50 @@ const profileOutcomeFor = (profile, targetGrade, retention, candidate, targetMet
 		upload_kbps: candidate.upload.base_kbps,
 	},
 });
+const bidirectionalConfirmationFor = (candidate, options = {}) => {
+	const downloadRealization = options.downloadRealization ?? 100;
+	const uploadRealization = options.uploadRealization ?? 100;
+	const effectiveDelta = options.effectiveDelta ?? 10;
+	const loss = options.loss ?? 0;
+	const delayLimit = options.delayLimit ?? 30;
+	const lossLimit = options.lossLimit ?? 3;
+	const minimum = options.minimum ?? 80;
+	const maximum = options.maximum ?? 110;
+	const latencyPass = effectiveDelta <= delayLimit;
+	const lossPass = loss <= lossLimit;
+	const safetyPass = lossPass && downloadRealization >= 50 && uploadRealization >= 50 &&
+		downloadRealization <= maximum && uploadRealization <= maximum;
+	return {
+		tested: true,
+		safety_pass: safetyPass,
+		auto_apply_pass: safetyPass && latencyPass &&
+			downloadRealization >= minimum && uploadRealization >= minimum,
+		grade: effectiveDelta < 5 ? 'A+' : (effectiveDelta < 30 ? 'A' :
+			(effectiveDelta < 60 ? 'B' : (effectiveDelta < 200 ? 'C' :
+				(effectiveDelta < 400 ? 'D' : 'F')))),
+		target_rates_kbps: {
+			download: candidate.download.base_kbps,
+			upload: candidate.upload.base_kbps,
+		},
+		achieved_kbps: {
+			download: Math.round(candidate.download.base_kbps * downloadRealization / 100),
+			upload: Math.round(candidate.upload.base_kbps * uploadRealization / 100),
+		},
+		realization_percent: {
+			download: downloadRealization,
+			upload: uploadRealization,
+		},
+		effective_delta_ms: effectiveDelta,
+		icmp_delta_ms: effectiveDelta,
+		transport_delta_ms: effectiveDelta,
+		loss_percent: loss,
+		cpu_peak_percent: 50,
+		cpu_warning: false,
+		advisory_reason: safetyPass ? 'none' :
+			(latencyPass ? 'packet-loss-limit-exceeded' : 'loaded-latency-target-missed'),
+	};
+};
+const baseBidirectionalConfirmation = bidirectionalConfirmationFor(proposal);
 const validResult = {
 	state: 'complete',
 	job_id: 'wan_sqm',
@@ -798,12 +1140,17 @@ const validResult = {
 		capacity_retention_min_percent: 80,
 		throughput_safety_floor_percent: 50,
 		delay_max_ms: 30,
+		manual_latency_review_max_ms: 60,
 		loss_max_percent: 3,
 		cpu_max_percent: 85,
 	},
 	proposal,
-	profile_outcome: profileOutcomeFor('best_overall', 'A', 80, proposal),
+	profile_outcome: {
+		...profileOutcomeFor('best_overall', 'A', 80, proposal),
+		bidirectional_confirmation: baseBidirectionalConfirmation,
+	},
 	profile_search: profileSearchFor('best_overall', 'A', 80, proposal),
+	bidirectional_confirmation: baseBidirectionalConfirmation,
 	phase_background: [
 		{ phase: 'baseline', icmp_valid: true, transport_valid: true, forwarded_background: cleanBackground() },
 		{ phase: 'unshaped', sample: 1, forwarded_background: cleanBackground() },
@@ -848,6 +1195,120 @@ assert.equal(helpers.autotuneResultClass(legacyConfidenceResult), 'technical_fai
 	'legacy diagnostics without a typed result class must not inherit trust');
 assert.equal(helpers.autotuneResultReviewable(legacyConfidenceResult, 'apply_sqm'), false,
 	'legacy result schemas must remain read-only');
+assert.equal(helpers.autotuneResultReviewable({
+	...legacyConfidenceResult,
+	state: 'inconclusive',
+	manual_apply_eligible: true,
+	proposals: typedCandidates,
+}, 'apply_sqm', typedCandidates[0].proposal_id), false,
+	'a schema-7 inconclusive result must remain diagnostic-only even if it carries proposal-shaped data');
+
+const rawNoSqmCandidate = {
+	schema_version: 1,
+	proposal_id: 'p-555555555555555555555555',
+	rank: 1,
+	action: 'disable_sqm',
+	topology: 'no_sqm',
+	is_primary: true,
+	applicable: true,
+	hard_safety_pass: true,
+	profile_target_met: false,
+	profile_objectives_met: false,
+	grade: 'B',
+	effective_delta_ms: 45,
+	confidence_percent: 100,
+	unmet_objectives: [
+		'profile-target',
+		'throughput-benefit-unproven',
+		'latency-worse-than-shaped',
+	],
+	evidence: { control: 'raw_control' },
+	configuration: null,
+};
+const rawNoSqmResult = {
+	...validResult,
+	auto_apply_eligible: false,
+	proposals: [ rawNoSqmCandidate ],
+	raw_control: {
+		available: true,
+		grade: 'B',
+		effective_delta_ms: 45,
+		throughput: { download_kbps: 1000, upload_kbps: 100 },
+		icmp_latency: { loss_percent: 0 },
+		measurement_evidence: {
+			valid: true,
+			reason: 'ok',
+			test_direction: 'both',
+			shaper_bypassed: true,
+			sqm_paused: true,
+			sqm_bypass_mode: 'paused-managed',
+		},
+		forwarded_background: {
+			available: true,
+			contaminated: false,
+			download_kbps: 10,
+			upload_kbps: 2,
+			download_limit_kbps: 100,
+			upload_limit_kbps: 20,
+		},
+	},
+};
+assert.equal(helpers.autotuneRawNoSqmEvidenceValidated(
+	rawNoSqmResult, rawNoSqmCandidate), true,
+	'a raw no-SQM proposal must depend on its own hard safety gates, not a shaped +2% throughput or +10 ms utility comparison');
+assert.equal(helpers.autotuneResultReviewable(rawNoSqmResult, 'disable_sqm',
+	rawNoSqmCandidate.proposal_id), true,
+	'a clean independently safe raw proposal must remain reviewable despite advisory utility trade-offs');
+assert.deepEqual(helpers.autotuneCandidateAcknowledgementRequirements(rawNoSqmResult,
+	'disable_sqm', rawNoSqmCandidate.proposal_id).map(item => item.code), [
+	'proposal-profile-target',
+	'proposal-throughput-benefit-unproven',
+	'proposal-latency-worse-than-shaped',
+], 'raw utility trade-offs must be rendered as explicit proposal acknowledgements');
+assert.equal(helpers.autotuneResultReviewable(rawNoSqmResult, 'disable_sqm',
+	'p-666666666666666666666666'), false,
+	'Review must preserve the exact selected raw proposal ID');
+assert.equal(helpers.autotuneResultReviewable({
+	...rawNoSqmResult,
+	proposals: [],
+}, 'disable_sqm', rawNoSqmCandidate.proposal_id), false,
+	'an explicitly empty proposal list must never unlock Review');
+assert.equal(helpers.autotuneResultReviewable({
+	...rawNoSqmResult,
+	raw_control: {
+		...rawNoSqmResult.raw_control,
+		measurement_evidence: {
+			...rawNoSqmResult.raw_control.measurement_evidence,
+			reason: 'partial',
+		},
+	},
+}, 'disable_sqm', rawNoSqmCandidate.proposal_id), false,
+	'raw control with a non-clean completion reason must remain a hard blocker');
+assert.equal(helpers.autotuneResultReviewable({
+	...rawNoSqmResult,
+	raw_control: {
+		...rawNoSqmResult.raw_control,
+		forwarded_background: {
+			...rawNoSqmResult.raw_control.forwarded_background,
+			download_kbps: 101,
+		},
+	},
+}, 'disable_sqm', rawNoSqmCandidate.proposal_id), false,
+	'raw background traffic above its independently measured limit must remain a hard blocker');
+assert.equal(helpers.autotuneResultReviewable({
+	...rawNoSqmResult,
+	raw_control: {
+		...rawNoSqmResult.raw_control,
+		effective_delta_ms: 61,
+		grade: 'C',
+	},
+	proposals: [ {
+		...rawNoSqmCandidate,
+		effective_delta_ms: 61,
+		grade: 'C',
+	} ],
+}, 'disable_sqm', rawNoSqmCandidate.proposal_id), false,
+	'raw latency above the manual safety limit must remain a hard blocker');
 
 const backgroundAwareConfidence = {
 	overall_percent: 68,
@@ -1027,6 +1488,9 @@ assert.equal(helpers.multiwanAutotuneItemAccepted({
 	decision: 'accepted', state: { autotune_result: failedResult },
 }), false, 'a failed proposal must never become acceptable through UI state alone');
 const resultForProfile = (profile, targetGrade, retention, delay, loss, sqm) => {
+	const measuredDelta = profile === 'gaming' || profile === 'gaming_extreme' ? 4 : 10;
+	const reviewDelay = profile === 'gaming' || profile === 'gaming_extreme' ? 30 :
+		(profile === 'best_overall' ? 60 : (profile === 'variable_link' ? 200 : 400));
 	const candidateProposal = {
 		...proposal,
 		profile,
@@ -1042,6 +1506,9 @@ const resultForProfile = (profile, targetGrade, retention, delay, loss, sqm) => 
 		},
 		sqm,
 	};
+	const profileBidirectional = bidirectionalConfirmationFor(candidateProposal, {
+		delayLimit: delay, lossLimit: loss, effectiveDelta: Math.min(measuredDelta, delay),
+	});
 	return {
 		...validResult,
 		profile,
@@ -1049,6 +1516,7 @@ const resultForProfile = (profile, targetGrade, retention, delay, loss, sqm) => 
 			...validValidation,
 			profile,
 			actual_grade: profile === 'gaming' || profile === 'gaming_extreme' ? 'A+' : 'A',
+			effective_delta_ms: Math.min(measuredDelta, delay),
 			gates: validValidation.gates.map(gate => ({
 				...gate,
 				required: gate.code.endsWith('-cpu') ||
@@ -1064,16 +1532,370 @@ const resultForProfile = (profile, targetGrade, retention, delay, loss, sqm) => 
 			...validResult.validation_thresholds,
 			capacity_retention_min_percent: retention,
 			delay_max_ms: delay,
+			manual_latency_review_max_ms: reviewDelay,
 			loss_max_percent: loss,
 		},
 		proposal: candidateProposal,
 		profile_outcome: {
 			...profileOutcomeFor(profile, targetGrade, retention, candidateProposal),
 			actual_grade: profile === 'gaming' || profile === 'gaming_extreme' ? 'A+' : 'A',
+			bidirectional_confirmation: profileBidirectional,
 		},
 		profile_search: profileSearchFor(profile, targetGrade, retention, candidateProposal),
+		bidirectional_confirmation: profileBidirectional,
 	};
 };
+const variableBaseResult = resultForProfile('variable_link', 'B', 70, 60, 3, proposal.sqm);
+const variableProposal = {
+	...variableBaseResult.proposal,
+	download: {
+		...variableBaseResult.proposal.download,
+		minimum_kbps: variableBaseResult.proposal.download.base_kbps,
+	},
+	upload: {
+		...variableBaseResult.proposal.upload,
+		minimum_kbps: variableBaseResult.proposal.upload.base_kbps,
+	},
+};
+const variableDirection = (direction, noCakeEffect) => {
+	const rate = variableProposal[direction].base_kbps;
+	return {
+		schema_version: 2,
+		profile: 'variable_link',
+		direction,
+		target_grade: 'B',
+		capacity_floor_percent: 70,
+		action: noCakeEffect ? 'fallback' : 'complete',
+		reason: noCakeEffect ? 'queue-outside-cake-control' : 'latency-knee-confirmed',
+		selected: {
+			candidate_kbps: rate,
+			achieved_kbps: rate,
+			retention_percent: 70,
+			effective_delta_ms: 30,
+			grade: 'B',
+			safety_pass: true,
+			target_met: true,
+		},
+		exploration_minimum_kbps: Math.floor(rate * 0.35),
+		runtime_minimum_kbps: rate,
+		runtime_minimum_observation_index: 1,
+		knee_detected: !noCakeEffect,
+		no_cake_effect: noCakeEffect,
+		noisy: false,
+		inconclusive: false,
+		evaluated: [ { candidate_kbps: rate } ],
+	};
+};
+const variableBidirectional = bidirectionalConfirmationFor(variableProposal, {
+	delayLimit: 60,
+});
+const variableNoEffectResult = {
+	...variableBaseResult,
+	proposal: variableProposal,
+	auto_apply_eligible: false,
+	validation: {
+		...variableBaseResult.validation,
+		candidate_base: {
+			download_kbps: variableProposal.download.base_kbps,
+			upload_kbps: variableProposal.upload.base_kbps,
+		},
+	},
+	profile_search: {
+		download: variableDirection('download', false),
+		upload: variableDirection('upload', true),
+	},
+	bidirectional_confirmation: variableBidirectional,
+	profile_outcome: {
+		...variableBaseResult.profile_outcome,
+		mode: 'directional-no-cake-effect-review',
+		manual_only: true,
+		selected_pair: {
+			download_kbps: variableProposal.download.base_kbps,
+			upload_kbps: variableProposal.upload.base_kbps,
+		},
+		bidirectional_confirmation: variableBidirectional,
+	},
+};
+assert.equal(helpers.autotuneResultValidated(variableNoEffectResult), false,
+	'a directional no-effect result must never be Auto-Apply validated');
+assert.equal(helpers.autotuneResultReviewable(variableNoEffectResult, 'apply_sqm'), true,
+	'a safe target-meeting tested no-effect hold point must remain manually reviewable');
+assert.equal(helpers.autotuneResultReviewable({
+	...variableNoEffectResult,
+	profile_search: {
+		...variableNoEffectResult.profile_search,
+		upload: {
+			...variableNoEffectResult.profile_search.upload,
+			runtime_minimum_kbps: variableProposal.upload.base_kbps - 1,
+		},
+	},
+}, 'apply_sqm'), false, 'an untested no-effect runtime minimum must fail closed');
+assert.equal(helpers.autotuneResultReviewable({
+	...variableNoEffectResult,
+	profile_search: {
+		...variableNoEffectResult.profile_search,
+		upload: {
+			...variableNoEffectResult.profile_search.upload,
+			selected: { ...variableNoEffectResult.profile_search.upload.selected, target_met: false },
+		},
+	},
+}, 'apply_sqm'), false, 'a below-target no-effect point must not become a proposal');
+assert.equal(helpers.autotuneResultReviewable({
+	...variableNoEffectResult,
+	bidirectional_confirmation: { tested: true, safety_pass: false },
+}, 'apply_sqm'), false, 'an unsafe simultaneous final pair must reject the no-effect proposal');
+const variableFloorResult = {
+	...variableNoEffectResult,
+	profile_search: {
+		...variableNoEffectResult.profile_search,
+		upload: {
+			...variableNoEffectResult.profile_search.upload,
+			reason: 'exploration-floor-reached',
+			no_cake_effect: false,
+		},
+	},
+	profile_outcome: {
+		...variableNoEffectResult.profile_outcome,
+		mode: 'variable-link-bounded-evidence-review',
+	},
+};
+assert.equal(helpers.autotuneResultValidated(variableFloorResult), false,
+	'an exploration-floor result must never be Auto-Apply validated');
+assert.equal(helpers.autotuneResultReviewable(variableFloorResult, 'apply_sqm'), true,
+	'an exact tested target-meeting exploration-floor fallback must be manually reviewable');
+assert.equal(helpers.autotuneResultReviewable({
+	...variableFloorResult,
+	profile_search: {
+		...variableFloorResult.profile_search,
+		upload: {
+			...variableFloorResult.profile_search.upload,
+			runtime_minimum_kbps: variableProposal.upload.base_kbps - 1,
+		},
+	},
+}, 'apply_sqm'), false, 'an invented exploration-floor minimum must fail closed');
+const variableBoundedLowResult = JSON.parse(JSON.stringify(variableFloorResult));
+const variableBoundedSearch = variableBoundedLowResult.profile_search.upload;
+Object.assign(variableBoundedSearch, {
+	reason: 'bounded-low-realization-review',
+	knee_detected: false,
+	no_cake_effect: false,
+	noisy: false,
+	inconclusive: false,
+});
+Object.assign(variableBoundedSearch.selected, {
+	safety_pass: false,
+	manual_reviewable: true,
+	realization_percent: 75,
+	retention_percent: 70,
+});
+variableBoundedLowResult.auto_apply_eligible = false;
+variableBoundedLowResult.validation.pass = false;
+variableBoundedLowResult.validation.hard_pass = false;
+const variableBoundedGate = variableBoundedLowResult.validation.gates.find(gate =>
+	gate.code === 'upload-candidate-realization');
+variableBoundedGate.pass = false;
+variableBoundedGate.actual = 75;
+assert.equal(helpers.autotuneResultReviewable(variableBoundedLowResult, 'apply_sqm'), true,
+	'a typed exact-tested 50-80 percent Variable Link point may be reviewed manually');
+assert.deepEqual(helpers.autotuneAcknowledgableGateFailures(
+	variableBoundedLowResult, 'apply_sqm').map(gate => gate.code),
+	[ 'upload-candidate-realization' ],
+	'the bounded directional realization miss must have its own acknowledgement');
+assert.equal(helpers.autotuneGateAcknowledgementsComplete(
+	variableBoundedLowResult, 'apply_sqm', {}), false);
+assert.equal(helpers.autotuneGateAcknowledgementsComplete(
+	variableBoundedLowResult, 'apply_sqm', { 'upload-candidate-realization': true }), true);
+const variableSubFloor = JSON.parse(JSON.stringify(variableBoundedLowResult));
+Object.assign(variableSubFloor.profile_search.upload.selected, {
+	manual_reviewable: false,
+	realization_percent: 49,
+	retention_percent: 49,
+});
+assert.equal(helpers.autotuneResultReviewable(variableSubFloor, 'apply_sqm'), false,
+	'a Variable Link direction below 50 percent must remain non-overridable');
+const variableNoisyResult = {
+	...variableFloorResult,
+	validation: {
+		...variableFloorResult.validation,
+		quality_target_met: false,
+	},
+	profile_search: {
+		...variableFloorResult.profile_search,
+		upload: {
+			...variableFloorResult.profile_search.upload,
+			reason: 'noisy-link-safe-review',
+			noisy: true,
+			selected: {
+				...variableFloorResult.profile_search.upload.selected,
+				target_met: false,
+			},
+		},
+	},
+	profile_outcome: {
+		...variableFloorResult.profile_outcome,
+		target_met: false,
+	},
+};
+assert.equal(helpers.autotuneResultReviewable(variableNoisyResult, 'apply_sqm'), true,
+	'a target-unmet noisy direction may expose its best exact tested safe point for manual review');
+assert.equal(helpers.autotuneResultReviewable({
+	...variableNoisyResult,
+	profile_search: {
+		...variableNoisyResult.profile_search,
+		upload: {
+			...variableNoisyResult.profile_search.upload,
+			selected: {
+				...variableNoisyResult.profile_search.upload.selected,
+				retention_percent: 49.9,
+			},
+		},
+	},
+}, 'apply_sqm'), false, 'a noisy fallback below the 50 percent trust floor must fail closed');
+const acknowledgedAdvisoryResult = JSON.parse(JSON.stringify(variableNoisyResult));
+const advisoryGate = acknowledgedAdvisoryResult.validation.gates.find(gate =>
+	gate.code === 'download-transport-latency');
+advisoryGate.pass = false;
+advisoryGate.actual = advisoryGate.limit + 5;
+assert.equal(helpers.autotuneResultReviewable(acknowledgedAdvisoryResult, 'apply_sqm'), true,
+	'a typed manual proposal may remain reviewable when only a selected quality objective is missed');
+assert.deepEqual(helpers.autotuneAcknowledgableGateFailures(
+	acknowledgedAdvisoryResult, 'apply_sqm').map(gate => gate.code),
+	[ 'download-transport-latency' ]);
+assert.equal(helpers.autotuneGateAcknowledgementsComplete(
+	acknowledgedAdvisoryResult, 'apply_sqm', {}), false,
+	'the proposal action must stay disabled until every listed advisory is accepted');
+assert.equal(helpers.autotuneGateAcknowledgementsComplete(
+	acknowledgedAdvisoryResult, 'apply_sqm', { 'download-transport-latency': true }), true,
+	'explicitly accepting the exact listed advisory must unlock the manual proposal action');
+const reconciledDirectionalRealization = JSON.parse(JSON.stringify(variableNoisyResult));
+const reconciledDirectionalGate = reconciledDirectionalRealization.validation.gates.find(gate =>
+	gate.code === 'download-candidate-realization');
+Object.assign(reconciledDirectionalGate, { pass: false, actual: 73.1 });
+Object.assign(reconciledDirectionalRealization.validation, {
+	pass: false,
+	hard_pass: false,
+	safety_pass: true,
+});
+reconciledDirectionalRealization.profile_search.download.selected.realization_percent = 83.9;
+assert.equal(helpers.autotuneCandidateRealizationReconciled(
+	reconciledDirectionalRealization, 'download'), true,
+	'two independent exact-rate realization proofs must reconcile one noisy directional miss');
+assert.equal(helpers.autotuneResultReviewable(
+	reconciledDirectionalRealization, 'apply_sqm'), true,
+	'a reconciled directional realization outlier must remain an explicit manual proposal');
+assert.deepEqual(helpers.autotuneAcknowledgableGateFailures(
+	reconciledDirectionalRealization, 'apply_sqm').map(gate => gate.code),
+	[ 'download-candidate-realization' ],
+	'the reconciled outlier must remain visible as an explicit user acknowledgement');
+const unreconciledSearchRealization = JSON.parse(JSON.stringify(reconciledDirectionalRealization));
+unreconciledSearchRealization.profile_search.download.selected.realization_percent = 79.9;
+assert.equal(helpers.autotuneResultReviewable(
+	unreconciledSearchRealization, 'apply_sqm'), false,
+	'a failed directional phase without an independently passing search point must fail closed');
+const unreconciledConfirmationRealization = JSON.parse(JSON.stringify(reconciledDirectionalRealization));
+unreconciledConfirmationRealization.bidirectional_confirmation.realization_percent.download = 79.9;
+unreconciledConfirmationRealization.bidirectional_confirmation.safety_pass = false;
+unreconciledConfirmationRealization.profile_outcome.bidirectional_confirmation =
+	JSON.parse(JSON.stringify(unreconciledConfirmationRealization.bidirectional_confirmation));
+assert.equal(helpers.autotuneResultReviewable(
+	unreconciledConfirmationRealization, 'apply_sqm'), false,
+	'a failed directional phase without a passing simultaneous confirmation must fail closed');
+const subFloorDirectionalRealization = JSON.parse(JSON.stringify(reconciledDirectionalRealization));
+subFloorDirectionalRealization.validation.gates.find(gate =>
+	gate.code === 'download-candidate-realization').actual = 49.9;
+assert.equal(helpers.autotuneResultReviewable(
+	subFloorDirectionalRealization, 'apply_sqm'), false,
+	'a sub-50 percent directional realization must not be reconciled away');
+const finalLatencyMiss = resultForProfile('best_overall', 'A', 80, 30, 3, proposal.sqm);
+const finalLatencyConfirmation = bidirectionalConfirmationFor(finalLatencyMiss.proposal, {
+	effectiveDelta: 45, delayLimit: 30,
+});
+finalLatencyMiss.auto_apply_eligible = false;
+finalLatencyMiss.bidirectional_confirmation = finalLatencyConfirmation;
+Object.assign(finalLatencyMiss.profile_outcome, {
+	mode: 'balanced-fallback', target_met: false, actual_grade: 'B', manual_only: true,
+	bidirectional_confirmation: finalLatencyConfirmation,
+});
+assert.equal(helpers.autotuneResultReviewable(finalLatencyMiss, 'apply_sqm'), true,
+	'a finite final simultaneous latency miss may remain an explicit manual proposal');
+assert.deepEqual(helpers.autotuneAcknowledgableGateFailures(finalLatencyMiss, 'apply_sqm')
+	.map(gate => gate.code), [ 'bidirectional-latency-target' ],
+	'the final simultaneous latency miss must be exposed as its own acknowledgement');
+assert.equal(helpers.autotuneGateAcknowledgementsComplete(finalLatencyMiss, 'apply_sqm', {}), false);
+assert.equal(helpers.autotuneGateAcknowledgementsComplete(finalLatencyMiss, 'apply_sqm', {
+	'bidirectional-latency-target': true,
+}), true);
+const finalFarLatency = JSON.parse(JSON.stringify(finalLatencyMiss));
+Object.assign(finalFarLatency.bidirectional_confirmation, {
+	effective_delta_ms: 61, icmp_delta_ms: 61, transport_delta_ms: 61,
+});
+Object.assign(finalFarLatency.profile_outcome.bidirectional_confirmation, {
+	effective_delta_ms: 61,
+});
+assert.equal(helpers.autotuneResultReviewable(finalFarLatency, 'apply_sqm'), false,
+	'a Best overall miss worse than the adjacent B class must not be overrideable');
+const finalLowRealization = resultForProfile('best_overall', 'A', 80, 30, 3, proposal.sqm);
+const finalLowRealizationConfirmation = bidirectionalConfirmationFor(finalLowRealization.proposal, {
+	downloadRealization: 75, uploadRealization: 90, delayLimit: 30,
+});
+finalLowRealization.auto_apply_eligible = false;
+finalLowRealization.bidirectional_confirmation = finalLowRealizationConfirmation;
+Object.assign(finalLowRealization.profile_outcome, {
+	manual_only: true,
+	bidirectional_confirmation: finalLowRealizationConfirmation,
+});
+assert.equal(helpers.autotuneResultReviewable(finalLowRealization, 'apply_sqm'), true,
+	'low but bounded final simultaneous realization may be accepted manually');
+assert.deepEqual(helpers.autotuneAcknowledgableGateFailures(finalLowRealization, 'apply_sqm')
+	.map(gate => gate.code), [ 'bidirectional-download-realization' ]);
+const finalSub50Realization = JSON.parse(JSON.stringify(finalLowRealization));
+Object.assign(finalSub50Realization.bidirectional_confirmation, {
+	achieved_kbps: {
+		download: Math.round(finalSub50Realization.proposal.download.base_kbps * 0.49),
+		upload: finalSub50Realization.bidirectional_confirmation.achieved_kbps.upload,
+	},
+	realization_percent: { download: 49, upload: 90 },
+	safety_pass: false,
+});
+Object.assign(finalSub50Realization.profile_outcome.bidirectional_confirmation, {
+	safety_pass: false,
+});
+assert.equal(helpers.autotuneResultReviewable(finalSub50Realization, 'apply_sqm'), false,
+	'final realization below 50 percent must remain non-overridable');
+const finalLossFailure = resultForProfile('best_overall', 'A', 80, 30, 3, proposal.sqm);
+const finalLossConfirmation = bidirectionalConfirmationFor(finalLossFailure.proposal, {
+	loss: 4, lossLimit: 3, delayLimit: 30,
+});
+finalLossFailure.auto_apply_eligible = false;
+finalLossFailure.bidirectional_confirmation = finalLossConfirmation;
+Object.assign(finalLossFailure.profile_outcome, {
+	manual_only: true,
+	bidirectional_confirmation: finalLossConfirmation,
+});
+assert.equal(helpers.autotuneResultReviewable(finalLossFailure, 'apply_sqm'), false,
+	'final simultaneous packet loss must remain non-overridable');
+const finalBypassFailure = resultForProfile('best_overall', 'A', 80, 30, 3, proposal.sqm);
+const finalBypassConfirmation = bidirectionalConfirmationFor(finalBypassFailure.proposal, {
+	downloadRealization: 111, delayLimit: 30,
+});
+finalBypassFailure.auto_apply_eligible = false;
+finalBypassFailure.bidirectional_confirmation = finalBypassConfirmation;
+Object.assign(finalBypassFailure.profile_outcome, {
+	manual_only: true,
+	bidirectional_confirmation: finalBypassConfirmation,
+});
+assert.equal(helpers.autotuneResultReviewable(finalBypassFailure, 'apply_sqm'), false,
+	'excessive final realization must remain a non-overridable shaper-bypass failure');
+const belowTrustResult = JSON.parse(JSON.stringify(variableNoisyResult));
+for (const gate of belowTrustResult.validation.gates)
+	if (gate.code === 'download-throughput-safety-floor')
+		gate.pass = false;
+belowTrustResult.profile_outcome.throughput_safety_floor_met = false;
+assert.equal(helpers.autotuneResultReviewable(belowTrustResult, 'apply_sqm'), true,
+	'a missed historical trust comparison must remain manually reviewable when current hard safety passes');
+assert.ok(helpers.autotuneAcknowledgableGateFailures(belowTrustResult, 'apply_sqm').some(gate =>
+	gate.code === 'download-throughput-safety-floor'),
+	'the missed historical comparison must require explicit acknowledgement');
 const gamingResult = resultForProfile('gaming', 'A+', 70, 5, 1, {
 	qdisc: 'cake',
 	script: 'layer_cake.qos',
@@ -1105,6 +1927,7 @@ const extremeGamingResult = {
 	profile_outcome: {
 		...profileOutcomeFor('gaming_extreme', 'A+', 70, extremeProposal),
 		actual_grade: 'A+',
+		bidirectional_confirmation: gamingResult.bidirectional_confirmation,
 		runtime_minimum_retention: {
 			download_percent: Math.round(extremeProposal.download.minimum_kbps * 1000 /
 				extremeProposal.download.observed_low_kbps) / 10,
@@ -1200,6 +2023,10 @@ const extremeUntestedMinimum = {
 };
 assert.equal(helpers.autotuneResultReviewable(extremeUntestedMinimum, 'apply_sqm'), false,
 	'an Extreme A+ minimum absent from typed search evidence must fail closed');
+assert.equal(helpers.autotuneProfileOutcomeValidated(fairResult), true,
+	'Fair profile outcome fixture must match directional and simultaneous evidence');
+assert.equal(helpers.autotuneFairOutcomeValidated(fairResult), true,
+	'Fair typed outcome fixture must report the authoritative final grade and delay');
 assert.equal(helpers.autotuneResultValidated(fairResult), true);
 const gamingCpuWarning = {
 	...gamingResult,
@@ -1258,7 +2085,7 @@ const fairVariable5gReview = {
 assert.equal(helpers.autotuneResultValidated(fairVariable5gReview), false,
 	'variable 5G advisory result must not auto-apply');
 assert.equal(helpers.autotuneResultReviewable(fairVariable5gReview, 'apply_sqm'), true,
-	'latency-safe 5G throughput shortfall must be manually reviewable');
+	'a Fair result below the historical trust comparison must remain an explicit manual proposal');
 const fairCandidateRealizationShortfall = {
 	...fairVariable5gReview,
 	result_class: 'provisional',
@@ -1319,7 +2146,10 @@ assert.equal(helpers.autotuneResultReviewable({
 const fairFallback = {
 	...fairResult,
 	auto_apply_eligible: false,
-	profile_outcome: profileOutcomeFor('fair', 'C', 90, fairResult.proposal, false),
+	profile_outcome: {
+		...profileOutcomeFor('fair', 'C', 90, fairResult.proposal, false),
+		bidirectional_confirmation: fairResult.bidirectional_confirmation,
+	},
 	profile_search: profileSearchFor('fair', 'C', 90, fairResult.proposal, false, 'complete'),
 	validation: {
 		...fairResult.validation,
@@ -1348,12 +2178,76 @@ assert.equal(helpers.autotuneResultValidated(fairFallback), false,
 assert.equal(helpers.autotuneResultReviewable(fairFallback, 'apply_sqm'), true);
 assert.equal(helpers.autotuneResultReviewable(fairFallback, 'keep_current'), true);
 assert.equal(helpers.autotuneResultReviewable(fairFallback, 'disable_sqm'), false);
+const fairSimultaneousDegradationConfirmation = bidirectionalConfirmationFor(fairResult.proposal, {
+	effectiveDelta: 224.2,
+	delayLimit: 200,
+	lossLimit: 5,
+	downloadRealization: 91.7,
+	uploadRealization: 96.3,
+});
+const fairSimultaneousDegradation = {
+	...fairResult,
+	auto_apply_eligible: false,
+	validation: {
+		...fairResult.validation,
+		profile_objectives_met: false,
+		quality_target_met: true,
+		actual_grade: 'C',
+		effective_delta_ms: 191.5,
+		gates: fairResult.validation.gates.map(gate => {
+			if (gate.code === 'download-capacity-retention')
+				return { ...gate, required: false, pass: false, actual: 89.5, limit: 90 };
+			if (gate.code === 'upload-capacity-retention')
+				return { ...gate, required: false, pass: true, actual: 94.8, limit: 90 };
+			if (gate.code === 'download-throughput-safety-floor')
+				return { ...gate, required: false, pass: true, actual: 89.5, limit: 50 };
+			if (gate.code === 'upload-throughput-safety-floor')
+				return { ...gate, required: false, pass: true, actual: 94.8, limit: 50 };
+			if (gate.code.includes('latency'))
+				return { ...gate, required: false, pass: true, actual: 191.5, limit: 200 };
+			return { ...gate };
+		}),
+	},
+	bidirectional_confirmation: fairSimultaneousDegradationConfirmation,
+	profile_outcome: {
+		...fairResult.profile_outcome,
+		mode: 'quality-and-throughput-advisory-review',
+		target_met: false,
+		actual_grade: 'D',
+		capacity_floor_met: false,
+		manual_only: true,
+		bidirectional_confirmation: fairSimultaneousDegradationConfirmation,
+	},
+	fair_outcome: {
+		...fairResult.fair_outcome,
+		mode: 'throughput-fallback',
+		capacity_floor_met: false,
+		actual_grade: 'D',
+		actual_effective_delta_ms: 224.2,
+		comparison_reason: 'quality-target-unreachable-above-throughput-floor',
+	},
+};
+assert.equal(helpers.autotuneResultReviewable(fairSimultaneousDegradation, 'apply_sqm'), true,
+	'a Fair result degraded only by simultaneous load must remain an explicit bounded review choice');
+assert.equal(helpers.autotuneAchievedGrade(fairSimultaneousDegradation), 'D',
+	'the displayed class must include simultaneous DL+UL degradation');
+const legacyDirectionalOnlyFairOutcome = {
+	...fairSimultaneousDegradation,
+	fair_outcome: {
+		...fairSimultaneousDegradation.fair_outcome,
+		actual_grade: 'C',
+		actual_effective_delta_ms: 191.5,
+	},
+};
+assert.equal(helpers.autotuneResultHasReviewChoice(legacyDirectionalOnlyFairOutcome), false,
+	'an older schema-8 Fair outcome that omits simultaneous degradation must remain diagnostic-only');
 const gamingFallback = {
 	...gamingResult,
 	auto_apply_eligible: false,
 	profile_outcome: {
 		...profileOutcomeFor('gaming', 'A+', 70, gamingResult.proposal, false),
 		actual_grade: 'A',
+		bidirectional_confirmation: gamingResult.bidirectional_confirmation,
 	},
 	profile_search: profileSearchFor('gaming', 'A+', 70, gamingResult.proposal, false, 'fallback'),
 	validation: {
@@ -1363,6 +2257,7 @@ const gamingFallback = {
 		safety_pass: true,
 		quality_target_met: false,
 		actual_grade: 'A',
+		effective_delta_ms: 8,
 		gates: gamingResult.validation.gates.map(gate => gate.code.includes('latency') ?
 			{ ...gate, pass: false, actual: 8, limit: 5 } : { ...gate }),
 	},
@@ -1391,6 +2286,7 @@ const fairDisable = {
 			},
 			grade: 'D',
 			effective_delta_ms: 218,
+			icmp_latency: { loss_percent: 0 },
 			throughput: { download_kbps: 900000, upload_kbps: 850000 },
 			forwarded_background: {
 				available: true,
@@ -1423,6 +2319,51 @@ const fairAlreadyUnshaped = {
 assert.equal(helpers.autotuneDisableSqmEvidenceValidated(fairAlreadyUnshaped), true,
 	'a verified already-unshaped target must not pretend that an SQM queue was paused');
 assert.equal(helpers.autotuneResultReviewable(fairDisable, 'disable_sqm'), true);
+
+const fairDisableAfterUnsafeShapedConfirmation = {
+	...fairDisable,
+	bidirectional_confirmation: {
+		...fairDisable.bidirectional_confirmation,
+		safety_pass: false,
+		auto_apply_pass: false,
+		grade: 'F',
+		effective_delta_ms: 466,
+		transport_delta_ms: 466,
+	},
+	profile_outcome: {
+		...fairDisable.profile_outcome,
+		actual_grade: 'F',
+		bidirectional_confirmation: {
+			...fairDisable.profile_outcome.bidirectional_confirmation,
+			safety_pass: false,
+			auto_apply_pass: false,
+			grade: 'F',
+			effective_delta_ms: 466,
+			transport_delta_ms: 466,
+		},
+	},
+	fair_outcome: {
+		...fairDisable.fair_outcome,
+		actual_grade: 'F',
+		actual_effective_delta_ms: 466,
+	},
+};
+assert.equal(helpers.autotuneResultReviewable(
+	fairDisableAfterUnsafeShapedConfirmation, 'apply_sqm'), false,
+	'an unsafe shaped confirmation must never apply its SQM proposal');
+assert.equal(helpers.autotuneResultReviewable(
+	fairDisableAfterUnsafeShapedConfirmation, 'disable_sqm'), true,
+	'a clean independent no-SQM control must remain reviewable when shaped latency is unsafe');
+assert.equal(helpers.autotuneResultReviewable({
+	...fairDisableAfterUnsafeShapedConfirmation,
+	fair_outcome: {
+		...fairDisableAfterUnsafeShapedConfirmation.fair_outcome,
+		no_sqm_control: {
+			...fairDisableAfterUnsafeShapedConfirmation.fair_outcome.no_sqm_control,
+			icmp_latency: { loss_percent: 6 },
+		},
+	},
+}, 'disable_sqm'), false, 'no-SQM packet loss above the Fair limit must block disable');
 assert.equal(helpers.autotuneDefaultReviewAction(fairDisable), 'apply_sqm',
 	'disable SQM must never be preselected while a safe shaped candidate exists');
 assert.equal(helpers.autotuneResultReviewable({
@@ -1431,7 +2372,36 @@ assert.equal(helpers.autotuneResultReviewable({
 		...fairDisable.fair_outcome,
 		throughput_gain_without_sqm: { download_percent: 3, upload_percent: 1.9 },
 	},
-}, 'disable_sqm'), false, 'both no-SQM directions must improve by at least 2%');
+}, 'disable_sqm'), true,
+	'a Fair no-SQM utility shortfall must be advisory once its independent raw control is safe');
+const fairNoSqmUtilityTradeoffs = {
+	...fairDisable,
+	fair_outcome: {
+		...fairDisable.fair_outcome,
+		no_sqm_control: {
+			...fairDisable.fair_outcome.no_sqm_control,
+			grade: 'D',
+			effective_delta_ms: 250,
+			throughput: { download_kbps: 1000, upload_kbps: 100 },
+		},
+		throughput_gain_without_sqm: { download_percent: -50, upload_percent: -50 },
+	},
+};
+assert.equal(helpers.autotuneResultReviewable(
+	fairNoSqmUtilityTradeoffs, 'disable_sqm'), true,
+	'Fair raw throughput loss and latency more than 10 ms worse than shaped are ranking trade-offs, not hard eligibility gates');
+assert.equal(helpers.autotuneResultReviewable({
+	...fairNoSqmUtilityTradeoffs,
+	fair_outcome: {
+		...fairNoSqmUtilityTradeoffs.fair_outcome,
+		no_sqm_control: {
+			...fairNoSqmUtilityTradeoffs.fair_outcome.no_sqm_control,
+			grade: 'F',
+			effective_delta_ms: 401,
+		},
+	},
+}, 'disable_sqm'), false,
+	'Fair no-SQM latency beyond its independent manual safety limit must still be blocked');
 assert.equal(helpers.autotuneResultReviewable({
 	...fairDisable,
 	fair_outcome: {
@@ -1676,6 +2646,26 @@ assert.equal(inconclusiveState.autotune_diagnostics, inconclusiveResult);
 assert.equal(inconclusiveState.autotune_failure_message, '',
 	'inconclusive output must use warning/retry UX rather than terminal-failure state');
 
+const jointUnsafeVariableResult = {
+	state: 'inconclusive',
+	profile: 'variable_link',
+	retryable: true,
+	search_state: 'joint_unsafe',
+	reason: 'directional-manual-fallback-final-pair-unsafe',
+	recommended_profile: 'fair',
+	auto_apply_eligible: false,
+	manual_apply_eligible: false,
+};
+assert.equal(helpers.autotuneRecommendedProfile(jointUnsafeVariableResult), 'fair');
+assert.equal(helpers.autotuneResultValidated(jointUnsafeVariableResult), false);
+assert.equal(helpers.autotuneResultReviewable(jointUnsafeVariableResult, 'apply_sqm'), false);
+assert.equal(helpers.autotuneRecommendedProfile({
+	...jointUnsafeVariableResult, manual_apply_eligible: true,
+}), null, 'a recommendation must disappear if the fail-closed envelope is inconsistent');
+assert.equal(helpers.autotuneRecommendedProfile({
+	...jointUnsafeVariableResult, profile: 'fair',
+}), null, 'Fair must not recursively recommend itself from an unrelated result');
+
 const writtenBeforeRejectedStage = { ...written };
 assert.throws(() => helpers.writeWizardConfig('reject_missing_autotune', {
 	mode: 'autotune',
@@ -1873,9 +2863,11 @@ assert.match(source, /Failed gate reasons/);
 assert.match(source, /DL candidate realization maximum/);
 assert.match(source, /UL candidate realization maximum/);
 assert.match(source, /Calibration was inconclusive/);
+assert.match(source, /Suggested next test: Fair/);
+assert.match(source, /nothing is selected, disabled, or applied automatically/);
 assert.match(source, /alert-message %s.*warning/s,
 	'retryable inconclusive diagnostics must render as a warning, not a red failure');
-assert.match(source, /autotuneResultReviewable\(state\.autotune_result, selectedAction\)/);
+assert.match(source, /autotuneResultReviewable\(state\.autotune_result, selectedAction,\s*state\.autotune_proposal_id\)/);
 assert.match(source, /Disable autorate and SQM/);
 assert.match(source, /Keep current settings/);
 assert.match(source, /I understand that this disables CAKE shaping/);
@@ -2100,7 +3092,7 @@ async function testAutotuneTerminalPrecedence() {
 			state: 'running', job_id: 'wan_sqm', requested_target_interface: 'pppoe-wan',
 			requested_backend: 'speedtest-go', requested_route_mode: '',
 			requested_mwan3_member: '', requested_profile: 'best_overall',
-			requested_conservative: false,
+			requested_conservative: false, requested_calibration_strategy: 'shaped_only',
 		};
 		const timeoutPayloads = [ matchingRunning, {
 			state: 'complete', terminal_available: true, terminal_kind: 'result',
@@ -2370,9 +3362,34 @@ async function testApplyGuardTransaction() {
 				},
 			};
 			const helpers = compileHelpers(fakeFs, fakeUci, fakeL, fakeRpc);
+			const guardedResult = {
+				...validResult,
+				runs: [ { backend: 'speedtest-go' } ],
+				proposals: [ {
+					schema_version: 1,
+					proposal_id: `p-${'1'.repeat(24)}`,
+					rank: 1,
+					action: 'apply_sqm',
+					topology: 'both_shaped',
+					is_primary: true,
+					applicable: true,
+					hard_safety_pass: true,
+					profile_target_met: true,
+					profile_objectives_met: true,
+					grade: 'A',
+					effective_delta_ms: 10,
+					confidence_percent: 100,
+					unmet_objectives: [],
+					evidence: {
+						validation: 'validation',
+						confirmation: 'bidirectional_confirmation',
+					},
+					configuration: proposal,
+				} ],
+			};
 			if (options.preexistingGuard) {
 				assert.throws(() => helpers.stageAutotuneApplyMarker('wan_sqm', {
-					autotune_result: { ...validResult, runs: [ { backend: 'speedtest-go' } ] },
+					autotune_result: guardedResult,
 					speedtest_backend: 'speedtest-go', enabled: true,
 					adaptive_ceiling_disable_confirmed: false,
 				}), /already exists/);
@@ -2380,7 +3397,7 @@ async function testApplyGuardTransaction() {
 				return { helpers, calls, values };
 			}
 			helpers.stageAutotuneApplyMarker('wan_sqm', {
-			autotune_result: { ...validResult, runs: [ { backend: 'speedtest-go' } ] },
+			autotune_result: guardedResult,
 			speedtest_backend: 'speedtest-go', enabled: true,
 			adaptive_ceiling_disable_confirmed: false,
 		});

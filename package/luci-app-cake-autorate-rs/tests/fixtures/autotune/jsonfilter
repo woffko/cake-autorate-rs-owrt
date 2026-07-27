@@ -12,7 +12,7 @@ if [ -n "$input_file" ]; then
 else
 	input="$(sed -n '1p')"
 fi
-case "$input" in \{*\}) ;; *) exit 1 ;; esac
+case "$input" in \{*\}|\[*\]) ;; *) exit 1 ;; esac
 
 case "$expression" in
 	'@.pid'|'@.starttime')
@@ -47,6 +47,9 @@ case "$expression" in
 				exit
 			}
 		'
+		;;
+	'@[0].topology')
+		printf '%s\n' "$input" | sed -n 's/^\[.*"topology":"\([^"]*\)".*/\1/p'
 		;;
 	'@.producer')
 		printf '%s\n' "$input" | sed -n 's/.*"producer":"\([^"]*\)".*/\1/p'
@@ -117,6 +120,9 @@ case "$expression" in
 		;;
 	'@.upload_kbps')
 		printf '%s\n' "$input" | sed -n 's/.*"upload_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.icmp_latency.loss_percent')
+		printf '%s\n' "$input" | sed -n 's/.*"icmp_latency":{[^}]*"loss_percent":\([0-9.][0-9.]*\).*/\1/p'
 		;;
 	'@.download.base_kbps')
 		printf '%s\n' "$input" | sed -n 's/.*"download":{[^}]*"base_kbps":\([0-9][0-9]*\).*/\1/p'
@@ -280,6 +286,24 @@ case "$expression" in
 	'@.sqm_bypass_mode')
 		printf '%s\n' "$input" | sed -n 's/.*"sqm_bypass_mode":"\([^"]*\)".*/\1/p'
 		;;
+	'@.measurement_evidence.valid')
+		printf '%s\n' "$input" | sed -n 's/.*"measurement_evidence":{[^}]*"valid":\(true\|false\).*/\1/p'
+		;;
+	'@.measurement_evidence.reason')
+		printf '%s\n' "$input" | sed -n 's/.*"measurement_evidence":{[^}]*"reason":"\([^"]*\)".*/\1/p'
+		;;
+	'@.measurement_evidence.test_direction')
+		printf '%s\n' "$input" | sed -n 's/.*"measurement_evidence":{[^}]*"test_direction":"\([^"]*\)".*/\1/p'
+		;;
+	'@.measurement_evidence.shaper_bypassed')
+		printf '%s\n' "$input" | sed -n 's/.*"measurement_evidence":{[^}]*"shaper_bypassed":\(true\|false\).*/\1/p'
+		;;
+	'@.measurement_evidence.sqm_paused')
+		printf '%s\n' "$input" | sed -n 's/.*"measurement_evidence":{[^}]*"sqm_paused":\(true\|false\).*/\1/p'
+		;;
+	'@.measurement_evidence.sqm_bypass_mode')
+		printf '%s\n' "$input" | sed -n 's/.*"measurement_evidence":{[^}]*"sqm_bypass_mode":"\([^"]*\)".*/\1/p'
+		;;
 	'@.forwarded_background.available')
 		printf '%s\n' "$input" | sed -n 's/.*"forwarded_background":{[^}]*"available":\(true\|false\).*/\1/p'
 		;;
@@ -382,6 +406,46 @@ case "$expression" in
 	'@.reason')
 		printf '%s\n' "$input" | sed -n 's/^.*"reason":"\([^"]*\)".*/\1/p'
 		;;
+	'@.recommended_topology')
+		printf '%s\n' "$input" | sed -n 's/^.*"recommended_topology":"\([^"]*\)".*/\1/p'
+		;;
+	'@.repeatable')
+		printf '%s\n' "$input" | sed -n 's/^.*"repeatable":\(true\|false\).*/\1/p'
+		;;
+	'@.tested')
+		printf '%s\n' "$input" | sed -n 's/^.*"tested":\(true\|false\).*/\1/p'
+		;;
+	'@.confidence_percent')
+		printf '%s\n' "$input" | sed -n 's/^.*"confidence_percent":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.observations[0].effective_delta_ms'|'@.observations[1].effective_delta_ms'|\
+	'@.observations[0].download_realization_percent'|'@.observations[1].download_realization_percent'|\
+	'@.observations[0].upload_realization_percent'|'@.observations[1].upload_realization_percent'|\
+	'@.observations[0].observation.throughput_kbps.download_kbps'|'@.observations[1].observation.throughput_kbps.download_kbps'|\
+	'@.observations[0].observation.throughput_kbps.upload_kbps'|'@.observations[1].observation.throughput_kbps.upload_kbps')
+		JSONFILTER_FIXTURE_INPUT="$input" node -e '
+			const input = JSON.parse(process.env.JSONFILTER_FIXTURE_INPUT);
+			const match = process.argv[1].match(/^@\.observations\[([01])\]\.(.+)$/);
+			if (!match) process.exit(1);
+			let value = input.observations[Number(match[1])];
+			for (const key of match[2].split(".")) value = value?.[key];
+			if (typeof value !== "number") process.exit(1);
+			process.stdout.write(String(value) + "\n");
+		' "$expression"
+		;;
+	'@.observations[0].hard_safety_pass'|'@.observations[1].hard_safety_pass'|\
+	'@.observations[0].material_benefit'|'@.observations[1].material_benefit'|\
+	'@.observations[0].pass'|'@.observations[1].pass')
+		JSONFILTER_FIXTURE_INPUT="$input" node -e '
+			const input = JSON.parse(process.env.JSONFILTER_FIXTURE_INPUT);
+			const match = process.argv[1].match(/^@\.observations\[([01])\]\.(.+)$/);
+			if (!match) process.exit(1);
+			let value = input.observations[Number(match[1])];
+			for (const key of match[2].split(".")) value = value?.[key];
+			if (typeof value !== "boolean") process.exit(1);
+			process.stdout.write(String(value) + "\n");
+		' "$expression"
+		;;
 	'@.next_candidate_kbps')
 		printf '%s\n' "$input" | sed -n 's/^.*"next_candidate_kbps":\([0-9][0-9]*\).*/\1/p'
 		;;
@@ -391,11 +455,44 @@ case "$expression" in
 	'@.selected.safety_pass')
 		printf '%s\n' "$input" | sed -n 's/^.*"selected":{[^}]*"safety_pass":\(true\|false\).*/\1/p'
 		;;
+	'@.selected.manual_reviewable')
+		printf '%s\n' "$input" | sed -n 's/^.*"selected":{[^}]*"manual_reviewable":\(true\|false\).*/\1/p'
+		;;
+	'@.selected.realization_percent')
+		printf '%s\n' "$input" | sed -n 's/^.*"selected":{[^}]*"realization_percent":\([0-9.][0-9.]*\).*/\1/p'
+		;;
 	'@.selected.target_met')
 		printf '%s\n' "$input" | sed -n 's/^.*"selected":{[^}]*"target_met":\(true\|false\).*/\1/p'
 		;;
+	'@.selected.retention_percent')
+		printf '%s\n' "$input" | sed -n 's/^.*"selected":{[^}]*"retention_percent":\([0-9.][0-9.]*\).*/\1/p'
+		;;
 	'@.selected.grade')
 		printf '%s\n' "$input" | sed -n 's/^.*"selected":{[^}]*"grade":"\([^"]*\)".*/\1/p'
+		;;
+	'@.runtime_minimum_kbps'|'@.runtime_minimum_observation_index'|'@.exploration_minimum_kbps')
+		key="${expression#@.}"
+		printf '%s\n' "$input" | sed -n "s/^.*\"$key\":\([0-9][0-9]*\).*/\1/p"
+		;;
+	'@.knee_detected'|'@.no_cake_effect'|'@.noisy'|'@.inconclusive')
+		key="${expression#@.}"
+		printf '%s\n' "$input" | sed -n "s/^.*\"$key\":\(true\|false\).*/\1/p"
+		;;
+	@.evaluated\[*\].candidate_kbps)
+		index="${expression#@.evaluated[}"
+		index="${index%%]*}"
+		awk_index=$((index + 1))
+		printf '%s\n' "$input" | awk -v wanted="$awk_index" '
+			BEGIN { RS="{\"index\":" }
+			NR > 1 && ($0 + 0) == wanted {
+				value=$0
+				if (sub(/^.*\"candidate_kbps\":/, "", value)) {
+					sub(/[^0-9].*/, "", value)
+					print value
+					exit
+				}
+			}
+		'
 		;;
 	*)
 		exit 1

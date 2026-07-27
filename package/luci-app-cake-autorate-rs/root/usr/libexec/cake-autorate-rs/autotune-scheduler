@@ -8,6 +8,7 @@ route_helper="${CAKE_AUTOTUNE_ROUTE_HELPER:-/usr/libexec/cake-autorate-rs/speedt
 sqm_health_helper="${CAKE_AUTOTUNE_SQM_HEALTH_HELPER:-/usr/libexec/cake-autorate-rs/sqm-recover}"
 daemon_bin="${CAKE_AUTOTUNE_DAEMON:-/usr/sbin/cake-autorated}"
 proc_root="${CAKE_AUTOTUNE_PROC_ROOT:-/proc}"
+sys_class_net="${CAKE_AUTOTUNE_SYS_CLASS_NET:-/sys/class/net}"
 runtime_lock_lib="${CAKE_AUTORATE_RUNTIME_LOCK_LIB:-/usr/libexec/cake-autorate-rs/runtime-lock}"
 runtime_lock_available=0
 sleep_s=60
@@ -36,6 +37,73 @@ fi
 
 json_escape() {
 	printf '%s' "$1" | tr '\n\r\t' '   ' | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+# Byte counters and configured daily/monthly limits exceed signed 32-bit range
+# on ordinary OpenWrt deployments. Never use target-width shell arithmetic for
+# them. awk keeps every integer exact through 2^53 - 1; larger values fail
+# closed instead of wrapping into a negative or apparently disabled budget.
+uint53_normalize() {
+	local value="$1"
+	case "$value" in ''|*[!0-9]*) return 1 ;; esac
+	printf '%s\n' "$value" | awk '
+		{
+			sub(/^0+/, "", $0)
+			if ($0 == "") $0 = "0"
+			if (length($0) > 16 ||
+			    (length($0) == 16 && ("x" $0) > "x9007199254740991")) exit 1
+			print $0
+		}
+	'
+}
+
+uint53_compare() {
+	local lhs rhs operator="$2"
+	lhs="$(uint53_normalize "$1")" || return 1
+	rhs="$(uint53_normalize "$3")" || return 1
+	awk -v lhs="$lhs" -v rhs="$rhs" -v operator="$operator" 'BEGIN {
+		if (operator == "gt") exit !((lhs + 0) >  (rhs + 0))
+		if (operator == "ge") exit !((lhs + 0) >= (rhs + 0))
+		if (operator == "lt") exit !((lhs + 0) <  (rhs + 0))
+		if (operator == "le") exit !((lhs + 0) <= (rhs + 0))
+		exit 2
+	}'
+}
+
+uint53_add() {
+	local lhs rhs
+	lhs="$(uint53_normalize "$1")" || return 1
+	rhs="$(uint53_normalize "$2")" || return 1
+	awk -v lhs="$lhs" -v rhs="$rhs" 'BEGIN {
+		value = (lhs + 0) + (rhs + 0)
+		if (value > 9007199254740991) exit 1
+		printf "%.0f\n", value
+	}'
+}
+
+uint53_subtract() {
+	local lhs rhs
+	lhs="$(uint53_normalize "$1")" || return 1
+	rhs="$(uint53_normalize "$2")" || return 1
+	awk -v lhs="$lhs" -v rhs="$rhs" 'BEGIN {
+		if ((lhs + 0) < (rhs + 0)) exit 1
+		printf "%.0f\n", (lhs + 0) - (rhs + 0)
+	}'
+}
+
+uint53_multiply() {
+	local lhs rhs
+	lhs="$(uint53_normalize "$1")" || return 1
+	rhs="$(uint53_normalize "$2")" || return 1
+	awk -v lhs="$lhs" -v rhs="$rhs" 'BEGIN {
+		value = (lhs + 0) * (rhs + 0)
+		if (value > 9007199254740991) exit 1
+		printf "%.0f\n", value
+	}'
+}
+
+uint53_is_positive() {
+	uint53_compare "$1" gt 0
 }
 
 write_state() {
@@ -71,22 +139,22 @@ within_window() {
 
 interface_bytes() {
 	interface="$1"
-	rx="$(sed -n '1p' "/sys/class/net/$interface/statistics/rx_bytes" 2>/dev/null)"
-	tx="$(sed -n '1p' "/sys/class/net/$interface/statistics/tx_bytes" 2>/dev/null)"
+	rx="$(sed -n '1p' "$sys_class_net/$interface/statistics/rx_bytes" 2>/dev/null)"
+	tx="$(sed -n '1p' "$sys_class_net/$interface/statistics/tx_bytes" 2>/dev/null)"
 	case "$rx:$tx" in *[!0-9:]*) return 1 ;; esac
-	printf '%s' "$((rx + tx))"
+	uint53_add "$rx" "$tx"
 }
 
 resolve_interface() {
 	name="$1"
-	if [ -e "/sys/class/net/$name" ]; then
+	if [ -e "$sys_class_net/$name" ]; then
 		printf '%s' "$name"
 		return 0
 	fi
 	status="$(ubus call "network.interface.$name" status 2>/dev/null)"
 	device="$(printf '%s' "$status" | jsonfilter -e '@.l3_device' 2>/dev/null)"
 	[ -n "$device" ] || device="$(printf '%s' "$status" | jsonfilter -e '@.device' 2>/dev/null)"
-	[ -e "/sys/class/net/$device" ] || return 1
+	[ -e "$sys_class_net/$device" ] || return 1
 	printf '%s' "$device"
 }
 
@@ -107,8 +175,11 @@ idle_ready() {
 	elapsed="$((now - previous_at))"
 	[ "$elapsed" -ge "$window" ] || return 1
 	printf '%s %s\n' "$now" "$bytes" > "$sample"
-	[ "$bytes" -ge "$previous_bytes" ] || return 1
-	rate_kbps="$(((bytes - previous_bytes) * 8 / elapsed / 1000))"
+	delta_bytes="$(uint53_subtract "$bytes" "$previous_bytes")" || return 1
+	rate_kbps="$(awk -v bytes="$delta_bytes" -v elapsed="$elapsed" 'BEGIN {
+		if ((elapsed + 0) <= 0) exit 1
+		printf "%.0f\n", int((bytes + 0) * 8 / (elapsed + 0) / 1000)
+	}')" || return 1
 	[ "$rate_kbps" -le "$threshold" ]
 }
 
@@ -123,9 +194,10 @@ budget_remaining_bytes() {
 		[ "$saved_day" = "$day" ] || used=0
 	fi
 	case "$used" in ''|*[!0-9]*) return 1 ;; esac
-	limit_bytes="$((limit_mb * 1024 * 1024))"
-	[ "$used" -lt "$limit_bytes" ] || return 1
-	printf '%s\n' "$((limit_bytes - used))"
+	limit_bytes="$(uint53_multiply "$limit_mb" 1048576)" || return 1
+	remaining_bytes="$(uint53_subtract "$limit_bytes" "$used")" || return 1
+	uint53_is_positive "$remaining_bytes" || return 1
+	printf '%s\n' "$remaining_bytes"
 }
 
 monthly_budget_remaining_bytes() {
@@ -140,9 +212,10 @@ monthly_budget_remaining_bytes() {
 		[ "$saved_month" = "$month" ] || used=0
 	fi
 	case "$used" in ''|*[!0-9]*) return 1 ;; esac
-	limit_bytes="$((limit_mb * 1024 * 1024))"
-	[ "$used" -lt "$limit_bytes" ] || return 1
-	printf '%s\n' "$((limit_bytes - used))"
+	limit_bytes="$(uint53_multiply "$limit_mb" 1048576)" || return 1
+	remaining_bytes="$(uint53_subtract "$limit_bytes" "$used")" || return 1
+	uint53_is_positive "$remaining_bytes" || return 1
+	printf '%s\n' "$remaining_bytes"
 }
 
 prepare_budget_store() {
@@ -187,13 +260,18 @@ adjust_monthly_budget() {
 		*[!0-9:]*) adjust_ok=0 ;;
 		*) adjust_ok=1 ;;
 	esac
-	[ "$adjust_ok" = 1 ] && [ "$adjust_subtract" -le "$adjust_used" ] 2>/dev/null || adjust_ok=0
+	[ "$adjust_ok" = 1 ] &&
+		uint53_compare "$adjust_subtract" le "$adjust_used" || adjust_ok=0
 	if [ "$adjust_ok" = 1 ]; then
 		adjust_tmp="$budget_store_root/$adjust_section.monthly.$$"
 		[ ! -L "$adjust_tmp" ] || adjust_ok=0
 	fi
 	if [ "$adjust_ok" = 1 ]; then
-		printf '%s %s\n' "$adjust_month" "$((adjust_used - adjust_subtract + adjust_add))" > "$adjust_tmp" || adjust_ok=0
+		adjust_value="$(uint53_subtract "$adjust_used" "$adjust_subtract")" &&
+			adjust_value="$(uint53_add "$adjust_value" "$adjust_add")" || adjust_ok=0
+	fi
+	if [ "$adjust_ok" = 1 ]; then
+		printf '%s %s\n' "$adjust_month" "$adjust_value" > "$adjust_tmp" || adjust_ok=0
 	fi
 	if [ "$adjust_ok" = 1 ]; then
 		chmod 600 "$adjust_tmp" 2>/dev/null || true
@@ -241,7 +319,8 @@ record_budget() {
 	fi
 	case "$used:$consumed" in *[!0-9:]*) return 1 ;; esac
 	budget_tmp="$state_root/$section.budget.$$"
-	printf '%s %s\n' "$day" "$((used + consumed))" > "$budget_tmp" || return 1
+	new_used="$(uint53_add "$used" "$consumed")" || return 1
+	printf '%s %s\n' "$day" "$new_used" > "$budget_tmp" || return 1
 	mv "$budget_tmp" "$file"
 }
 
@@ -1238,8 +1317,7 @@ finish_attempt_accounting() {
 	attempt_bytes_after="$(interface_bytes "$attempt_interface" 2>/dev/null || true)"
 	case "$attempt_bytes_after" in ''|*[!0-9]*) attempt_bytes_after=invalid ;; esac
 	if [ "$attempt_bytes_after" != invalid ] &&
-	   [ "$attempt_bytes_after" -ge "$attempt_bytes_before" ] 2>/dev/null; then
-		attempt_consumed="$((attempt_bytes_after - attempt_bytes_before))"
+	   attempt_consumed="$(uint53_subtract "$attempt_bytes_after" "$attempt_bytes_before")"; then
 		attempt_daily_ok=true
 		record_budget "$attempt_section" "$attempt_consumed" || attempt_daily_ok=false
 		if settle_monthly_budget "$attempt_section" "$attempt_reserved_monthly" \
@@ -1266,8 +1344,8 @@ run_section() {
 	bytes_before="$4"
 	expected_fingerprint="$5"
 	traffic_budget_remaining="${6:-0}"
-	case "$traffic_budget_remaining" in ''|*[!0-9]*) traffic_budget_remaining=0 ;; esac
-	[ "$traffic_budget_remaining" -gt 0 ] 2>/dev/null || {
+	traffic_budget_remaining="$(uint53_normalize "$traffic_budget_remaining" 2>/dev/null || printf 0)"
+	uint53_is_positive "$traffic_budget_remaining" || {
 		write_state "$section" deferred "Scheduled Full Auto-Tune has no remaining traffic budget"
 		return
 	}
@@ -1437,7 +1515,7 @@ check_section() {
 		return
 	}
 	remaining_budget="$daily_remaining_budget"
-	[ "$monthly_remaining_budget" -ge "$remaining_budget" ] 2>/dev/null ||
+	uint53_compare "$monthly_remaining_budget" ge "$remaining_budget" ||
 		remaining_budget="$monthly_remaining_budget"
 	interface="$(uci -q get "cake-autorate.$section.wan_if" 2>/dev/null)"
 	[ -n "$interface" ] || interface="$(uci -q get "cake-autorate.$section.sqm_interface" 2>/dev/null)"
@@ -1473,11 +1551,17 @@ scheduler_status() {
 	status_month="$(date +%Y%m)"
 	status_daily_limit_mb="$(get_uint "$status_section" scheduled_autotune_max_traffic_mb_day 4096)"
 	status_monthly_limit_mb="$(get_uint "$status_section" scheduled_autotune_max_traffic_mb_month 16384)"
-	status_daily_limit="$((status_daily_limit_mb * 1024 * 1024))"
-	status_monthly_limit="$((status_monthly_limit_mb * 1024 * 1024))"
+	status_accounting_error=false
+	if ! status_daily_limit="$(uint53_multiply "$status_daily_limit_mb" 1048576 2>/dev/null)"; then
+		status_daily_limit=0
+		status_accounting_error=true
+	fi
+	if ! status_monthly_limit="$(uint53_multiply "$status_monthly_limit_mb" 1048576 2>/dev/null)"; then
+		status_monthly_limit=0
+		status_accounting_error=true
+	fi
 	status_daily_used=0
 	status_monthly_used=0
-	status_accounting_error=false
 
 	status_daily_file="$state_root/$status_section.budget"
 	if [ -s "$status_daily_file" ]; then
@@ -1485,6 +1569,10 @@ scheduler_status() {
 		[ "$status_saved_day" = "$status_day" ] || status_daily_used=0
 	fi
 	case "$status_daily_used" in ''|*[!0-9]*) status_daily_used=0; status_accounting_error=true ;; esac
+	if ! status_daily_used="$(uint53_normalize "$status_daily_used" 2>/dev/null)"; then
+		status_daily_used=0
+		status_accounting_error=true
+	fi
 
 	status_monthly_file="$budget_store_root/$status_section.monthly"
 	if [ -L "$budget_store_root" ] || [ -L "$status_monthly_file" ]; then
@@ -1494,12 +1582,14 @@ scheduler_status() {
 		[ "$status_saved_month" = "$status_month" ] || status_monthly_used=0
 	fi
 	case "$status_monthly_used" in ''|*[!0-9]*) status_monthly_used=0; status_accounting_error=true ;; esac
+	if ! status_monthly_used="$(uint53_normalize "$status_monthly_used" 2>/dev/null)"; then
+		status_monthly_used=0
+		status_accounting_error=true
+	fi
 	[ ! -e "$state_root/$status_section.budget-accounting-failed" ] || status_accounting_error=true
 
-	status_daily_remaining="$((status_daily_limit - status_daily_used))"
-	status_monthly_remaining="$((status_monthly_limit - status_monthly_used))"
-	[ "$status_daily_remaining" -ge 0 ] || status_daily_remaining=0
-	[ "$status_monthly_remaining" -ge 0 ] || status_monthly_remaining=0
+	status_daily_remaining="$(uint53_subtract "$status_daily_limit" "$status_daily_used" 2>/dev/null || printf 0)"
+	status_monthly_remaining="$(uint53_subtract "$status_monthly_limit" "$status_monthly_used" 2>/dev/null || printf 0)"
 
 	status_interval_h="$(get_uint "$status_section" scheduled_autotune_interval_hours 24)"
 	status_last=0

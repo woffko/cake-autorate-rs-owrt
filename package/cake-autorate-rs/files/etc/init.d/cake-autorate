@@ -22,6 +22,7 @@ SERVICE_RUNTIME_STOP_RELEASE_PENDING=0
 SQM_MANAGED=0
 CAKE_CONFIG_CHANGED=0
 SQM_INTERFACES=""
+SQM_INGRESS_INTERFACES=""
 SQM_CONFLICT_FILE="${CAKE_AUTORATE_SQM_CONFLICT_FILE:-/var/run/cake-autorate/sqm-conflicts}"
 RUNTIME_ROOT="${CAKE_AUTORATE_RUN_ROOT:-/var/run/cake-autorate}"
 BRIDGER_CONFIG_CHANGED=0
@@ -367,7 +368,7 @@ append_sqm_conflict() {
 }
 
 detect_managed_sqm_conflicts() {
-	local section enabled manage_sqm sqm_enabled target pair previous_target previous_section seen=""
+	local section enabled manage_sqm sqm_enabled sqm_direction_mode target pair previous_target previous_section seen=""
 
 	mkdir -p "$(dirname "$SQM_CONFLICT_FILE")"
 	: > "$SQM_CONFLICT_FILE"
@@ -375,7 +376,9 @@ detect_managed_sqm_conflicts() {
 		config_get_bool enabled "$section" enabled 0
 		config_get_bool manage_sqm "$section" manage_sqm 1
 		config_get_bool sqm_enabled "$section" sqm_enabled "$enabled"
-		[ "$enabled" -eq 1 ] && [ "$manage_sqm" -eq 1 ] && [ "$sqm_enabled" -eq 1 ] || continue
+		config_get sqm_direction_mode "$section" sqm_direction_mode both
+		[ "$enabled" -eq 1 ] && [ "$manage_sqm" -eq 1 ] && [ "$sqm_enabled" -eq 1 ] &&
+			[ "$sqm_direction_mode" != off ] || continue
 
 		config_get target "$section" sqm_interface
 		[ -n "$target" ] || config_get target "$section" ul_if
@@ -430,6 +433,13 @@ append_sqm_interface() {
 	SQM_INTERFACES="${SQM_INTERFACES:+$SQM_INTERFACES }$iface"
 }
 
+append_sqm_ingress_interface() {
+	local iface="$1"
+	[ -n "$iface" ] || return 0
+	case " $SQM_INGRESS_INTERFACES " in *" $iface "*) return 0 ;; esac
+	SQM_INGRESS_INTERFACES="${SQM_INGRESS_INTERFACES:+$SQM_INGRESS_INTERFACES }$iface"
+}
+
 disable_unmanaged_sqm_conflicts() {
 	local keep="$1"
 	local target="$2"
@@ -473,11 +483,11 @@ sync_bridger_blacklist() {
 	local iface
 
 	BRIDGER_CONFIG_CHANGED=0
-	[ -n "$SQM_INTERFACES" ] || return 0
+	[ -n "$SQM_INGRESS_INTERFACES" ] || return 0
 	[ -x /etc/init.d/bridger ] || return 0
 	uci -q get bridger.@defaults[0] >/dev/null || return 0
 
-	for iface in $SQM_INTERFACES; do
+	for iface in $SQM_INGRESS_INTERFACES; do
 		bridger_blacklist_contains "$iface" && continue
 		uci add_list "bridger.@defaults[0].blacklist=$iface"
 		logger -t cake-autorate "added SQM interface '$iface' to bridger blacklist"
@@ -519,7 +529,7 @@ prepare_sqm_ingress_interfaces() {
 	# persistent side effect until a later ordinary service start; the guarded
 	# postcheck still proves that both CAKE qdiscs are live before confirmation.
 	[ "$SERVICE_APPLY_GUARD_VERIFIED" -eq 1 ] || sync_bridger_blacklist
-	for iface in $SQM_INTERFACES; do
+	for iface in $SQM_INGRESS_INTERFACES; do
 		remove_empty_clsact "$iface" || true
 	done
 }
@@ -548,7 +558,7 @@ cleanup_stale_sqm_sections() {
 
 sync_sqm_instance() {
 	local section="$1"
-	local manage_sqm enabled sqm_enabled sqm_section value
+	local manage_sqm enabled sqm_enabled sqm_direction_mode sqm_section value
 
 	config_get_bool manage_sqm "$section" manage_sqm 1
 	if [ "$manage_sqm" -ne 1 ]; then
@@ -561,6 +571,18 @@ sync_sqm_instance() {
 
 	config_get_bool enabled "$section" enabled 0
 	config_get_bool sqm_enabled "$section" sqm_enabled "$enabled"
+	config_get sqm_direction_mode "$section" sqm_direction_mode both
+	case "$sqm_direction_mode" in
+		both|upload_only|download_only) ;;
+		off)
+			# `off` is an explicit no-SQM topology, not an enabled empty queue.
+			sqm_enabled=0
+			;;
+		*)
+			logger -t cake-autorate "not starting instance '$section': invalid SQM direction mode '$sqm_direction_mode'"
+			return 1
+			;;
+	esac
 	if section_has_sqm_conflict "$section"; then
 		config_get sqm_section "$section" sqm_section "cake_$section"
 		if uci -q get "$SQM_CONFIG.$sqm_section" >/dev/null; then
@@ -595,14 +617,17 @@ sync_sqm_instance() {
 	value="$(resolve_interface_device "$value")"
 	set_sqm_option "$sqm_section" interface "$value"
 	append_sqm_interface "$value"
+	[ "$sqm_direction_mode" = upload_only ] || append_sqm_ingress_interface "$value"
 	disable_unmanaged_sqm_conflicts "$sqm_section" "$value"
 
 	config_get value "$section" sqm_download
 	[ -n "$value" ] || config_get value "$section" base_dl_shaper_rate_kbps
+	[ "$sqm_direction_mode" != upload_only ] || value=0
 	set_sqm_option "$sqm_section" download "$value"
 
 	config_get value "$section" sqm_upload
 	[ -n "$value" ] || config_get value "$section" base_ul_shaper_rate_kbps
+	[ "$sqm_direction_mode" != download_only ] || value=0
 	set_sqm_option "$sqm_section" upload "$value"
 
 	config_get value "$section" sqm_debug_logging 0
@@ -660,6 +685,7 @@ sync_sqm_instance() {
 sync_sqm_config() {
 	SQM_MANAGED=0
 	SQM_INTERFACES=""
+	SQM_INGRESS_INTERFACES=""
 	config_foreach sync_sqm_instance cake_autorate
 	[ "$SQM_MANAGED" -eq 1 ] || return 0
 	uci commit "$SQM_CONFIG"
@@ -735,13 +761,14 @@ instance_has_enabled_sqm_backing() {
 
 instance_has_startable_config() {
 	local section="$1"
-	local manage_sqm sqm_enabled
+	local manage_sqm sqm_enabled sqm_direction_mode
 
 	config_get_bool manage_sqm "$section" manage_sqm 1
 	[ "$manage_sqm" -eq 1 ] || return 0
 	config_get_bool sqm_enabled "$section" sqm_enabled 0
+	config_get sqm_direction_mode "$section" sqm_direction_mode both
 
-	if [ "$sqm_enabled" -ne 1 ]; then
+	if [ "$sqm_enabled" -ne 1 ] || [ "$sqm_direction_mode" = off ]; then
 		logger -t cake-autorate "not starting instance '$section': managed SQM is disabled"
 		return 1
 	fi

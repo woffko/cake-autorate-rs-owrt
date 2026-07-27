@@ -281,6 +281,7 @@ emit_instance() {
 	enabled="$(uci_get enabled)"
 	manage_sqm="$(uci_get manage_sqm)"
 	sqm_enabled="$(uci_get sqm_enabled)"
+	sqm_direction_mode="$(uci_get sqm_direction_mode)"
 	traffic_rules_enabled="$(uci_get traffic_rules_enabled)"
 	autotune_profile="$(uci_get autotune_profile)"
 	[ "$enabled" = 1 ] || enabled=0
@@ -288,6 +289,17 @@ emit_instance() {
 	[ "$manage_sqm" = 1 ] || manage_sqm=0
 	[ -n "$sqm_enabled" ] || sqm_enabled="$enabled"
 	[ "$sqm_enabled" = 1 ] || sqm_enabled=0
+	[ -n "$sqm_direction_mode" ] || sqm_direction_mode=both
+	case "$sqm_direction_mode" in
+		both) shape_download=1; shape_upload=1 ;;
+		upload_only) shape_download=0; shape_upload=1 ;;
+		download_only) shape_download=1; shape_upload=0 ;;
+		off) shape_download=0; shape_upload=0 ;;
+		*)
+			shape_download=0; shape_upload=0
+			add_issue "The SQM direction mode is invalid."
+			;;
+	esac
 	[ -n "$traffic_rules_enabled" ] || traffic_rules_enabled=0
 	[ "$traffic_rules_enabled" = 1 ] || traffic_rules_enabled=0
 	case "$autotune_profile" in
@@ -404,25 +416,29 @@ emit_instance() {
 	ul_cake_kind="$cake_kind"
 	ul_cake_rate="$cake_rate"
 	ul_cake_mode="$cake_mode"
-	cake_ul_state="$(owned_runtime_state "$expected_runtime" "$ul_cake_count")"
+	ul_expected_runtime=0
+	[ "$expected_runtime" = 1 ] && [ "$shape_upload" = 1 ] && ul_expected_runtime=1
+	cake_ul_state="$(owned_runtime_state "$ul_expected_runtime" "$ul_cake_count")"
 
 	load_cake_info "$dl_if"
 	dl_cake_count="$cake_count"
 	dl_cake_kind="$cake_kind"
 	dl_cake_rate="$cake_rate"
 	dl_cake_mode="$cake_mode"
-	cake_dl_state="$(owned_runtime_state "$expected_runtime" "$dl_cake_count")"
+	dl_expected_runtime=0
+	[ "$expected_runtime" = 1 ] && [ "$shape_download" = 1 ] && dl_expected_runtime=1
+	cake_dl_state="$(owned_runtime_state "$dl_expected_runtime" "$dl_cake_count")"
 
 	if [ -e "$sys_class_net/$dl_if" ]; then
 		if [ "$manage_sqm" != 1 ]; then
 			ifb_state=EXTERNAL
-		elif [ "$expected_runtime" = 1 ]; then
+		elif [ "$dl_expected_runtime" = 1 ]; then
 			ifb_state=PRESENT
 		else
 			ifb_state=ORPHANED
 		fi
 	else
-		[ "$expected_runtime" = 1 ] && ifb_state=MISSING || ifb_state=ABSENT
+		[ "$dl_expected_runtime" = 1 ] && ifb_state=MISSING || ifb_state=ABSENT
 	fi
 
 	ingress_present=0
@@ -435,7 +451,7 @@ emit_instance() {
 		else
 			ingress_state=ABSENT
 		fi
-	elif [ "$expected_runtime" = 1 ]; then
+	elif [ "$dl_expected_runtime" = 1 ]; then
 		if [ "$ingress_present" = 1 ] && [ "$redirect_active" = 1 ]; then
 			ingress_state=ACTIVE
 		else
@@ -448,12 +464,12 @@ emit_instance() {
 	fi
 
 	case "$cake_ul_state" in
-		MISSING) [ "$suppress_runtime_issues" = 1 ] || add_issue "Upload CAKE qdisc is missing." ;;
+		MISSING) [ "$shape_upload" != 1 ] || [ "$suppress_runtime_issues" = 1 ] || add_issue "Upload CAKE qdisc is missing." ;;
 		DUPLICATE) add_issue "Multiple upload CAKE root qdiscs were detected." ;;
 		ORPHANED) add_issue "Upload CAKE still limits traffic although the instance is disabled." ;;
 	esac
 	case "$cake_dl_state" in
-		MISSING) [ "$suppress_runtime_issues" = 1 ] || add_issue "Download CAKE qdisc is missing." ;;
+		MISSING) [ "$shape_download" != 1 ] || [ "$suppress_runtime_issues" = 1 ] || add_issue "Download CAKE qdisc is missing." ;;
 		DUPLICATE) add_issue "Multiple download CAKE root qdiscs were detected." ;;
 		ORPHANED) add_issue "Download CAKE still limits traffic although the instance is disabled." ;;
 	esac
@@ -468,7 +484,7 @@ emit_instance() {
 
 	classifier_expected=0
 	if [ "$enabled" = 1 ] && [ "$manage_sqm" = 1 ] && [ "$sqm_enabled" = 1 ] &&
-	   [ "$traffic_rules_enabled" = 1 ]; then
+	   [ "$traffic_rules_enabled" = 1 ] && [ "$shape_upload" = 1 ]; then
 		classifier_expected=1
 	fi
 	classifier_instance_status=""
@@ -597,8 +613,10 @@ EOF
 		[ "$autorate_state" = RUNNING ] && overall_state=UNMANAGED || overall_state=DEGRADED
 	elif [ "$overall_state" = HEALTHY ] &&
 	     { [ "$autorate_state" != RUNNING ] || [ "$sqm_config_state" != ENABLED ] ||
-	     [ "$cake_ul_state" != ACTIVE ] || [ "$cake_dl_state" != ACTIVE ] ||
-	     [ "$ifb_state" != PRESENT ] || [ "$ingress_state" != ACTIVE ] ||
+	     { [ "$shape_upload" = 1 ] && [ "$cake_ul_state" != ACTIVE ]; } ||
+	     { [ "$shape_download" = 1 ] && [ "$cake_dl_state" != ACTIVE ]; } ||
+	     { [ "$shape_download" = 1 ] && [ "$ifb_state" != PRESENT ]; } ||
+	     { [ "$shape_download" = 1 ] && [ "$ingress_state" != ACTIVE ]; } ||
 	     [ "$classifier_state" = ORPHANED ] ||
 	     { [ "$classifier_expected" = 1 ] && [ "$classifier_state" != ACTIVE ]; }; }; then
 		case "$autorate_state:$sqm_config_state:$cake_ul_state:$cake_dl_state:$ifb_state:$ingress_state:$classifier_state" in
@@ -617,6 +635,7 @@ EOF
 	printf '"sqm_config_state":"%s","sqm_section":"%s","sqm_owner":"%s","sqm_target":"%s",' \
 		"$sqm_config_state" "$(json_escape "$sqm_section")" "$(json_escape "$sqm_owner")" \
 		"$(json_escape "$sqm_config_target")"
+	printf '"sqm_direction_mode":"%s",' "$(json_escape "$sqm_direction_mode")"
 	printf '"target_interface":"%s","target_state":"%s","ul_interface":"%s","dl_interface":"%s",' \
 		"$(json_escape "$resolved_target")" "$target_state" \
 		"$(json_escape "$ul_if")" "$(json_escape "$dl_if")"

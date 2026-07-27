@@ -140,6 +140,45 @@ model. It remains unreleased until a new release is published:
 - Run shaped candidates through the same transport-aware path, then confirm the
   selected DL/UL pair under simultaneous load. The worse corroborated ICMP or
   native transport delta is authoritative.
+- Build one ranked Review set from as many as four independently measured
+  runtime topologies: both directions shaped, upload-only shaping,
+  download-only shaping, and no SQM. Every card names its exact tested rates
+  and evidence; Auto-Tune never derives or invents an untested rate merely to
+  make a proposal available.
+- Keep profile class, retained-capacity objectives, and relative utility versus
+  another safe topology as policy judgements rather than technical failures.
+  A proposal that misses one of them remains selectable only after Review shows
+  the deviation and the user explicitly acknowledges that proposal's warning.
+- Keep measurement integrity, route identity, raw-bypass proof, complete
+  background accounting and contamination limits, loss, the manual-review
+  latency ceiling, and a proven 50–110% CAKE realization safety envelope for
+  every shaped direction as non-overridable hard gates. Historical-throughput
+  trust and the ordinary 80% realization objective remain explicit Review
+  warnings inside that envelope. Acknowledging a profile trade-off cannot
+  weaken the hard checks.
+- If shaped frontier search cannot produce a safe result but the independent
+  raw control is complete and passes every applicable hard gate, carry an exact
+  no-SQM fallback into Review instead of discarding the whole run. This is a
+  manual proposal backed by the measured raw topology, not permission to infer
+  missing shaped evidence.
+- Treat a flat latency curve as directional evidence. If one Variable-link
+  direction meets its quality target but lower tested CAKE rates provide no
+  repeatable latency improvement, hold that direction at its highest safe,
+  target-meeting tested point while the peer direction finishes its search.
+  Such a result is always manual-review only, requires a safe simultaneous
+  DL+UL confirmation, and never invents an untested runtime minimum.
+- When Variable-link reaches its 35% exploration boundary without proving a
+  knee, or bounded repeats remain nonmonotonic, keep the result useful without
+  overstating it: select the best exact-tested safe point at or above the 50%
+  trust boundary, use that same point as the runtime minimum, require a safe
+  simultaneous DL+UL confirmation, and expose it only for manual review.
+- Each close manual proposal lists every missed advisory/profile criterion in
+  Review. The user must acknowledge each deviation separately for that exact
+  topology before it can be staged. A final simultaneous latency miss is
+  reviewable only within the adjacent quality class: Gaming/Extreme A+ to A
+  (30 ms), Best overall A to B (60 ms), Variable link B to C (200 ms), and Fair
+  C to D (400 ms). Final simultaneous realization between 50% and the ordinary
+  80% proof threshold is also an explicit per-direction acknowledgement.
 - Grow passively by default only under proven saturation and clean transport
   evidence. Optional active probes can test above the safe bound; only a clean
   candidate promotes it.
@@ -192,8 +231,8 @@ matrix:
 The target is an APK ABI rather than one specific board. The authoritative
 choice is the value returned by `apk --print-arch`. Every daemon asset follows
 the name
-`cake-autorate-rs-1.0_rc27-r10_openwrt-25.12_<arch>.apk`; the shared
-`luci-app-cake-autorate-rs-1.0_rc27-r18_openwrt-25.12_all.apk` contains the
+`cake-autorate-rs-1.0_rc27-r17_openwrt-25.12_<arch>.apk`; the shared
+`luci-app-cake-autorate-rs-1.0_rc27-r32_openwrt-25.12_all.apk` contains the
 architecture-independent LuCI interface and SQM integration.
 
 RC27 adds background-aware Full Auto-Tune confidence without mixing forwarded
@@ -723,8 +762,8 @@ For example, when it prints `aarch64_generic`:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc27-r10_openwrt-25.12_aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc27-r18_openwrt-25.12_all.apk
+  /root/cake-autorate-rs-1.0_rc27-r17_openwrt-25.12_aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc27-r32_openwrt-25.12_all.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:

@@ -177,6 +177,63 @@ is_nonnegative_uint() {
 	return 0
 }
 
+# BusyBox ash arithmetic is target-width dependent. RX/TX counters and the
+# calibration traffic allowance routinely exceed signed 32-bit range, so keep
+# every byte operation inside awk's exact-integer range (IEEE-754 2^53 - 1).
+# Values outside that range fail closed instead of wrapping and disabling the
+# hard budget on 32-bit ARM/MIPS targets.
+uint53_normalize() {
+	local value="$1"
+	case "$value" in ''|*[!0-9]*) return 1 ;; esac
+	printf '%s\n' "$value" | awk '
+		{
+			sub(/^0+/, "", $0)
+			if ($0 == "") $0 = "0"
+			if (length($0) > 16 ||
+			    (length($0) == 16 && ("x" $0) > "x9007199254740991")) exit 1
+			print $0
+		}
+	'
+}
+
+uint53_compare() {
+	local lhs rhs operator="$2"
+	lhs="$(uint53_normalize "$1")" || return 1
+	rhs="$(uint53_normalize "$3")" || return 1
+	awk -v lhs="$lhs" -v rhs="$rhs" -v operator="$operator" 'BEGIN {
+		if (operator == "gt") exit !((lhs + 0) >  (rhs + 0))
+		if (operator == "ge") exit !((lhs + 0) >= (rhs + 0))
+		if (operator == "lt") exit !((lhs + 0) <  (rhs + 0))
+		if (operator == "le") exit !((lhs + 0) <= (rhs + 0))
+		exit 2
+	}'
+}
+
+uint53_add() {
+	local lhs rhs
+	lhs="$(uint53_normalize "$1")" || return 1
+	rhs="$(uint53_normalize "$2")" || return 1
+	awk -v lhs="$lhs" -v rhs="$rhs" 'BEGIN {
+		value = (lhs + 0) + (rhs + 0)
+		if (value > 9007199254740991) exit 1
+		printf "%.0f\n", value
+	}'
+}
+
+uint53_subtract() {
+	local lhs rhs
+	lhs="$(uint53_normalize "$1")" || return 1
+	rhs="$(uint53_normalize "$2")" || return 1
+	awk -v lhs="$lhs" -v rhs="$rhs" 'BEGIN {
+		if ((lhs + 0) < (rhs + 0)) exit 1
+		printf "%.0f\n", (lhs + 0) - (rhs + 0)
+	}'
+}
+
+uint53_is_positive() {
+	uint53_compare "$1" gt 0
+}
+
 is_uint_between() {
 	case "$1" in
 		''|*[!0-9]*) return 1 ;;
@@ -1139,7 +1196,7 @@ write_status() {
 	message="$3"
 	current_phase="$phase"
 	worker_trace "status phase=$phase progress=$progress message=$(json_escape "$message")"
-	atomic_write "$status_file" "{\"state\":\"running\",\"phase\":\"$(json_escape "$phase")\",\"progress\":$progress,\"message\":\"$(json_escape "$message")\",\"job_id\":\"$(json_escape "$job_name")\",\"run_id\":\"$(json_escape "${active_run_id:-${worker_token:-pending}}")\",\"requested_target_interface\":\"$(json_escape "$target_if_input")\",\"requested_backend\":\"$(json_escape "$backend_input")\",\"requested_route_mode\":\"$(json_escape "$route_mode_override")\",\"requested_mwan3_member\":\"$(json_escape "$mwan3_member_override")\",\"requested_profile\":\"$(json_escape "$autotune_profile")\",\"requested_conservative\":$([ "${conservative_mode:-0}" = 1 ] && printf true || printf false)}"
+	atomic_write "$status_file" "{\"state\":\"running\",\"phase\":\"$(json_escape "$phase")\",\"progress\":$progress,\"message\":\"$(json_escape "$message")\",\"job_id\":\"$(json_escape "$job_name")\",\"run_id\":\"$(json_escape "${active_run_id:-${worker_token:-pending}}")\",\"requested_target_interface\":\"$(json_escape "$target_if_input")\",\"requested_backend\":\"$(json_escape "$backend_input")\",\"requested_route_mode\":\"$(json_escape "$route_mode_override")\",\"requested_mwan3_member\":\"$(json_escape "$mwan3_member_override")\",\"requested_profile\":\"$(json_escape "$autotune_profile")\",\"requested_conservative\":$([ "${conservative_mode:-0}" = 1 ] && printf true || printf false),\"requested_calibration_strategy\":\"$(json_escape "$calibration_strategy")\"}"
 }
 
 # A short, RAM-only breadcrumb stream is deliberately written to the worker's
@@ -1179,6 +1236,13 @@ configure_validation_thresholds() {
 	validation_cpu_max_percent="$(extract_json "$proposal" '@.validation.cpu_max_percent')" || return 1
 	[ "$validation_icmp_delay_max_ms" = "$validation_transport_delay_max_ms" ] || return 1
 	validation_delay_max_ms="$validation_transport_delay_max_ms"
+	case "$autotune_profile" in
+		gaming|gaming_extreme) validation_manual_latency_review_max_ms=30 ;;
+		best_overall) validation_manual_latency_review_max_ms=60 ;;
+		variable_link) validation_manual_latency_review_max_ms=200 ;;
+		fair) validation_manual_latency_review_max_ms=400 ;;
+		*) return 1 ;;
+	esac
 }
 
 configured_rate_value() {
@@ -1824,7 +1888,11 @@ inspect_autotune_route() {
 	[ -n "$mwan3_member_override" ] && mwan3_member="$mwan3_member_override"
 	[ -n "$route_mode_configured" ] || route_mode_configured=auto
 	case "$route_mode_configured" in
-		main) route_mode=main ;;
+		# A main-table override is a complete route identity.  Never retain an
+		# mwan3 member inherited from the instance's persistent configuration;
+		# doing so creates contradictory diagnostics such as mode=main/member=wanb
+		# and can poison Review/attestation comparisons.
+		main) route_mode=main; mwan3_member="" ;;
 		mwan3) route_mode=mwan3 ;;
 		auto) [ -n "$mwan3_member" ] && route_mode=mwan3 || route_mode=main ;;
 		*) return 1 ;;
@@ -2096,30 +2164,58 @@ inspect_sqm_ownership() {
 		sqm_ownership_error="Existing instance $job_name manages ${resolved_sqm_if:-no resolved SQM interface}, not $target_if."
 		return 1
 	}
-	[ "$state_present" = true ] && [ "$root_kind" = cake ] && [ "$has_ingress" = true ] || {
-		sqm_ownership_error="Managed SQM for $job_name is not active as CAKE plus ingress on $target_if."
-		return 1
-	}
-	dl_if="$(uci -q get "cake-autorate.$job_name.dl_if" 2>/dev/null || true)"
-	[ -n "$dl_if" ] || dl_if="ifb4$target_if"
-	safe_interface_name "$dl_if" || {
-		sqm_ownership_error="Managed download IFB for $job_name is invalid."
-		return 1
-	}
-	[ -e "/sys/class/net/$dl_if" ] &&
-		[ "$(tc qdisc show dev "$dl_if" 2>/dev/null | awk '$4 == "root" { print $2; exit }')" = cake ] || {
-		sqm_ownership_error="Managed download IFB $dl_if is missing or does not have CAKE."
-		return 1
-	}
-	managed_redirect_state="$(tc filter show dev "$target_if" ingress 2>/dev/null)" || {
-		sqm_ownership_error="Unable to inspect the managed ingress redirect on $target_if."
-		return 1
-	}
-	printf '%s\n' "$managed_redirect_state" | grep -Fq "redirect dev $dl_if" ||
-		printf '%s\n' "$managed_redirect_state" | grep -Fq "Redirect to device $dl_if)" || {
-		sqm_ownership_error="Managed SQM ingress on $target_if does not redirect to the expected IFB $dl_if."
-		return 1
-	}
+	sqm_direction_mode="$(uci -q get "cake-autorate.$job_name.sqm_direction_mode" 2>/dev/null || true)"
+	[ -n "$sqm_direction_mode" ] || sqm_direction_mode=both
+
+	if [ "$sqm_direction_mode" = "upload_only" ]; then
+		[ "$state_present" = true ] && [ "$root_kind" = cake ] || {
+			sqm_ownership_error="Managed SQM for $job_name is not active as CAKE on $target_if."
+			return 1
+		}
+	elif [ "$sqm_direction_mode" = "download_only" ]; then
+		[ "$state_present" = true ] && [ "$has_ingress" = true ] || {
+			sqm_ownership_error="Managed SQM for $job_name is not active with ingress on $target_if."
+			return 1
+		}
+		dl_if="$(uci -q get "cake-autorate.$job_name.dl_if" 2>/dev/null || true)"
+		[ -n "$dl_if" ] || dl_if="ifb4$target_if"
+		safe_interface_name "$dl_if" || {
+			sqm_ownership_error="Managed download IFB for $job_name is invalid."
+			return 1
+		}
+		[ -e "/sys/class/net/$dl_if" ] &&
+			[ "$(tc qdisc show dev "$dl_if" 2>/dev/null | awk '$4 == "root" { print $2; exit }')" = cake ] || {
+			sqm_ownership_error="Managed download IFB $dl_if is missing or does not have CAKE."
+			return 1
+		}
+	else
+		[ "$state_present" = true ] && [ "$root_kind" = cake ] && [ "$has_ingress" = true ] || {
+			sqm_ownership_error="Managed SQM for $job_name is not active as CAKE plus ingress on $target_if."
+			return 1
+		}
+		dl_if="$(uci -q get "cake-autorate.$job_name.dl_if" 2>/dev/null || true)"
+		[ -n "$dl_if" ] || dl_if="ifb4$target_if"
+		safe_interface_name "$dl_if" || {
+			sqm_ownership_error="Managed download IFB for $job_name is invalid."
+			return 1
+		}
+		[ -e "/sys/class/net/$dl_if" ] &&
+			[ "$(tc qdisc show dev "$dl_if" 2>/dev/null | awk '$4 == "root" { print $2; exit }')" = cake ] || {
+			sqm_ownership_error="Managed download IFB $dl_if is missing or does not have CAKE."
+			return 1
+		}
+	fi
+	if [ "$sqm_direction_mode" != "upload_only" ]; then
+		managed_redirect_state="$(tc filter show dev "$target_if" ingress 2>/dev/null)" || {
+			sqm_ownership_error="Unable to inspect the managed ingress redirect on $target_if."
+			return 1
+		}
+		printf '%s\n' "$managed_redirect_state" | grep -Fq "redirect dev $dl_if" ||
+			printf '%s\n' "$managed_redirect_state" | grep -Fq "Redirect to device $dl_if)" || {
+			sqm_ownership_error="Managed SQM ingress on $target_if does not redirect to the expected IFB $dl_if."
+			return 1
+		}
+	fi
 	preflight_managed_sqm_active=1
 	return 0
 }
@@ -2322,6 +2418,29 @@ exact_ingress_redirect() {
 		printf '%s\n' "$filter_output" | grep -Fq "Redirect to device $temp_ifb)" || return 1
 }
 
+no_ingress_redirect() {
+	qdisc_output="$(tc qdisc show dev "$target_if" 2>/dev/null)" || return 1
+	! printf '%s\n' "$qdisc_output" | grep -Eq ' ingress | clsact '
+}
+
+no_temporary_egress_shaper() {
+	# Removing a root qdisc from a physical OpenWrt interface commonly exposes
+	# a kernel-owned handle-0 default (mq/noqueue/fq_codel/pfifo_fast).  Accept
+	# only that narrow set or no root at all.  In particular, absence of our
+	# random CAKE handle is not enough to authorize a foreign replacement.
+	qdisc_output="$(tc qdisc show dev "$target_if" 2>/dev/null)" || return 1
+	printf '%s\n' "$qdisc_output" | awk '
+		$1 == "qdisc" && $4 == "root" {
+			roots++
+			if ($3 == "0:" &&
+			    ($2 == "mq" || $2 == "noqueue" ||
+			     $2 == "fq_codel" || $2 == "pfifo_fast")) defaults++
+			else foreign++
+		}
+		END { exit(roots == 0 || (defaults == roots && foreign == 0) ? 0 : 1) }
+	'
+}
+
 exact_temp_ifb() {
 	[ -e "/sys/class/net/$temp_ifb" ] || return 1
 	[ "$(cat "/sys/class/net/$temp_ifb/ifalias" 2>/dev/null)" = "$temp_ifb_alias" ] || return 1
@@ -2332,6 +2451,8 @@ exact_temp_ifb() {
 temporary_shaper_owned() {
 	if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_SHAPER:-0}" = 1 ]; then
 		[ "${temp_shaper_active:-0}" = 1 ] || return 1
+		[ "${temp_ingress_active:-1}" = 1 ] || return 1
+		[ "${temp_egress_active:-1}" = 1 ] || return 1
 		is_positive_uint "${temp_download_kbps:-}" || return 1
 		is_positive_uint "${temp_upload_kbps:-}" || return 1
 		if [ -n "${AUTOTUNE_MOCK_SHAPER_OWNERSHIP_LOST_MARKER:-}" ] &&
@@ -2358,6 +2479,109 @@ temporary_shaper_owned() {
 		exact_root_qdisc "$target_if" "$temp_target_handle" "$temp_upload_kbps" upload &&
 		exact_root_qdisc "$temp_ifb" "$temp_ifb_handle" "$temp_download_kbps" download &&
 		exact_ingress_redirect
+}
+
+temporary_upload_only_shaper_owned() {
+	if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_SHAPER:-0}" = 1 ]; then
+		[ "${temp_shaper_active:-0}" = 1 ] || return 1
+		[ "${temp_ingress_active:-1}" = 0 ] || return 1
+		[ "${temp_egress_active:-1}" = 1 ] || return 1
+		is_positive_uint "${temp_download_kbps:-}" &&
+			is_positive_uint "${temp_upload_kbps:-}"
+		return
+	fi
+	[ "${recovery_shaper_started:-0}" = 1 ] || return 1
+	is_positive_uint "${temp_download_kbps:-}" || return 1
+	is_positive_uint "${temp_upload_kbps:-}" || return 1
+	exact_temp_ifb &&
+		exact_root_qdisc "$target_if" "$temp_target_handle" "$temp_upload_kbps" upload &&
+		exact_root_qdisc "$temp_ifb" "$temp_ifb_handle" "$temp_download_kbps" download &&
+		no_ingress_redirect
+}
+
+temporary_download_only_shaper_owned() {
+	if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_SHAPER:-0}" = 1 ]; then
+		[ "${temp_shaper_active:-0}" = 1 ] || return 1
+		[ "${temp_ingress_active:-1}" = 1 ] || return 1
+		[ "${temp_egress_active:-1}" = 0 ] || return 1
+		is_positive_uint "${temp_download_kbps:-}" &&
+			is_positive_uint "${temp_upload_kbps:-}"
+		return
+	fi
+	[ "${recovery_shaper_started:-0}" = 1 ] || return 1
+	is_positive_uint "${temp_download_kbps:-}" || return 1
+	is_positive_uint "${temp_upload_kbps:-}" || return 1
+	exact_temp_ifb &&
+		no_temporary_egress_shaper &&
+		exact_root_qdisc "$temp_ifb" "$temp_ifb_handle" "$temp_download_kbps" download &&
+		exact_ingress_redirect
+}
+
+bypass_temporary_ingress() {
+	temporary_shaper_owned || return 1
+	if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_SHAPER:-0}" = 1 ]; then
+		temp_ingress_active=0
+		return 0
+	fi
+	tc qdisc del dev "$target_if" ingress >/dev/null 2>&1 || return 1
+	temp_ingress_active=0
+	temporary_upload_only_shaper_owned
+}
+
+bypass_temporary_egress() {
+	temporary_shaper_owned || return 1
+	if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_SHAPER:-0}" = 1 ]; then
+		temp_egress_active=0
+		return 0
+	fi
+	tc qdisc del dev "$target_if" root >/dev/null 2>&1 || return 1
+	temp_egress_active=0
+	temporary_download_only_shaper_owned
+}
+
+attach_temporary_ingress() {
+	tc qdisc add dev "$target_if" handle "$temp_ingress_handle" ingress >/dev/null 2>&1 || return 1
+	if ! tc filter add dev "$target_if" parent "$temp_ingress_handle" protocol all \
+		pref "$temp_redirect_pref" u32 match u32 0 0 \
+		action mirred egress redirect dev "$temp_ifb" >/dev/null 2>&1; then
+		# Do not leave a third, partially-owned topology behind. A later cleanup
+		# can prove either the complete shaper or the intentional upload-only
+		# state, but it must never have to guess who owns a bare ingress qdisc.
+		tc qdisc del dev "$target_if" ingress >/dev/null 2>&1 || true
+		return 1
+	fi
+}
+
+restore_temporary_ingress() {
+	temporary_upload_only_shaper_owned || return 1
+	if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_SHAPER:-0}" = 1 ]; then
+		temp_ingress_active=1
+		return 0
+	fi
+	attach_temporary_ingress || return 1
+	temp_ingress_active=1
+	temporary_shaper_owned
+}
+
+restore_temporary_egress() {
+	temporary_download_only_shaper_owned || return 1
+	if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_SHAPER:-0}" = 1 ]; then
+		temp_egress_active=1
+		return 0
+	fi
+	replace_temporary_cake_qdisc "$target_if" "$temp_target_handle" "$temp_upload_kbps" upload ||
+		return 1
+	temp_egress_active=1
+	temporary_shaper_owned
+}
+
+temporary_phase_shaper_owned() {
+	case "$phase_topology" in
+		both_shaped) temporary_shaper_owned ;;
+		upload_only_shaped) temporary_upload_only_shaper_owned ;;
+		download_only_shaped) temporary_download_only_shaper_owned ;;
+		*) return 1 ;;
+	esac
 }
 
 temporary_qdisc_stats_json() {
@@ -2417,13 +2641,26 @@ restore_temp_shaper() {
 		[ -n "${AUTOTUNE_MOCK_SHAPER_RESTORE_MARKER:-}" ] &&
 			touch "$AUTOTUNE_MOCK_SHAPER_RESTORE_MARKER"
 		temp_shaper_active=0
+		temp_ingress_active=0
+		temp_egress_active=0
+		if [ "${recovery_shaper_started:-0}" = 1 ]; then
+			recovery_shaper_started=0
+			write_recovery_journal || return 1
+		fi
 		return 0
 	fi
 
 	if [ "${temp_shaper_active:-0}" = 1 ]; then
-		temporary_shaper_owned || return 1
-		tc qdisc del dev "$target_if" ingress >/dev/null 2>&1 || return 1
-		tc qdisc del dev "$target_if" root >/dev/null 2>&1 || return 1
+		if temporary_shaper_owned; then
+			tc qdisc del dev "$target_if" ingress >/dev/null 2>&1 || return 1
+			tc qdisc del dev "$target_if" root >/dev/null 2>&1 || return 1
+		elif temporary_upload_only_shaper_owned; then
+			tc qdisc del dev "$target_if" root >/dev/null 2>&1 || return 1
+		elif temporary_download_only_shaper_owned; then
+			tc qdisc del dev "$target_if" ingress >/dev/null 2>&1 || return 1
+		else
+			return 1
+		fi
 		tc qdisc del dev "$temp_ifb" root >/dev/null 2>&1 || return 1
 		if [ "${temp_ifb_created:-0}" = 1 ]; then
 			ip link set dev "$temp_ifb" down >/dev/null 2>&1 || return 1
@@ -2431,6 +2668,17 @@ restore_temp_shaper() {
 		fi
 		[ ! -e "/sys/class/net/$temp_ifb" ] || return 1
 		temp_shaper_active=0
+		temp_ingress_active=0
+		temp_egress_active=0
+		# The temporary topology is now provably absent.  Publish that durable
+		# transition before the recovery helper is allowed to recreate managed
+		# SQM.  Otherwise a crash after SQM start but before journal finalization
+		# makes the next recovery pass mistake our normal CAKE/IFB for a foreign
+		# replacement of the random temporary handles.
+		if [ "${recovery_shaper_started:-0}" = 1 ]; then
+			recovery_shaper_started=0
+			write_recovery_journal || return 1
+		fi
 	fi
 
 	# Managed SQM is intentionally not restarted here. The recovery helper owns
@@ -2459,9 +2707,33 @@ prepare_temp_shaper() {
 	upload_kbps="$2"
 
 	if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_SHAPER:-0}" = 1 ]; then
+		mock_shaper_was_active="${temp_shaper_active:-0}"
+		if [ "${temp_shaper_active:-0}" = 1 ]; then
+			if temporary_upload_only_shaper_owned; then
+				restore_temporary_ingress ||
+					fail "Unable to restore the mock ingress shaper between validation attempts."
+			elif temporary_download_only_shaper_owned; then
+				restore_temporary_egress ||
+					fail "Unable to restore the mock egress shaper between validation attempts."
+			else
+				temporary_shaper_owned ||
+					fail "Mock temporary shaper ownership changed between validation attempts."
+			fi
+		fi
 		temp_shaper_active=1
+		temp_ingress_active=1
+		temp_egress_active=1
 		temp_download_kbps="$download_kbps"
 		temp_upload_kbps="$upload_kbps"
+		# The lifecycle fixture can mirror the exact typed candidate instead of
+		# returning one fixed shaped rate for every bounded-search observation.
+		# These variables exist only in the explicit test-shaper path.
+		export AUTOTUNE_MOCK_CURRENT_DL_KBPS="$download_kbps"
+		export AUTOTUNE_MOCK_CURRENT_UL_KBPS="$upload_kbps"
+		if [ "$mock_shaper_was_active" != 1 ] && [ "${recovery_prepared:-0}" = 1 ]; then
+			recovery_shaper_started=1
+			write_recovery_journal || fail "Unable to journal the mock temporary shaper."
+		fi
 		return 0
 	fi
 
@@ -2473,7 +2745,15 @@ prepare_temp_shaper() {
 	if [ "${temp_shaper_active:-0}" = 1 ]; then
 		[ "${recovery_shaper_started:-0}" = 1 ] && [ "$recovery_temp_ifb" = "$temp_ifb" ] ||
 			fail "Temporary shaper identity changed between validation attempts."
-		temporary_shaper_owned || fail "Temporary shaper ownership changed between validation attempts."
+		if temporary_upload_only_shaper_owned; then
+			restore_temporary_ingress ||
+				fail "Unable to restore the temporary ingress shaper between validation attempts."
+		elif temporary_download_only_shaper_owned; then
+			restore_temporary_egress ||
+				fail "Unable to restore the temporary egress shaper between validation attempts."
+		else
+			temporary_shaper_owned || fail "Temporary shaper ownership changed between validation attempts."
+		fi
 		# Retain the same journal-owned shaper across a bounded correction/retry;
 		# only its rates change. Restarting managed SQM between attempts creates a
 		# larger crash window and used to make attempt two impossible.
@@ -2548,17 +2828,18 @@ prepare_temp_shaper() {
 	# Only a complete name+alias+ifindex tuple published in one atomic journal
 	# transition authorizes qdisc attachment or recovery-side deletion.
 	temp_shaper_active=1
+	temp_ingress_active=0
+	temp_egress_active=0
 	replace_temporary_cake_qdisc "$target_if" "$temp_target_handle" "$upload_kbps" upload ||
 		fail "Unable to attach temporary upload CAKE qdisc."
 	replace_temporary_cake_qdisc "$temp_ifb" "$temp_ifb_handle" "$download_kbps" download ||
 		fail "Unable to attach temporary download CAKE qdisc."
 	temp_download_kbps="$download_kbps"
 	temp_upload_kbps="$upload_kbps"
-	tc qdisc add dev "$target_if" handle ffff: ingress >/dev/null 2>&1 ||
-		fail "Unable to attach temporary ingress qdisc."
-	tc filter add dev "$target_if" parent ffff: protocol all pref "$temp_redirect_pref" u32 match u32 0 0 \
-		action mirred egress redirect dev "$temp_ifb" >/dev/null 2>&1 ||
-		fail "Unable to redirect ingress traffic into temporary IFB."
+	attach_temporary_ingress ||
+		fail "Unable to attach the temporary ingress redirect into the IFB."
+	temp_ingress_active=1
+	temp_egress_active=1
 	temporary_shaper_owned || fail "Temporary CAKE/IFB ownership postconditions failed."
 }
 
@@ -3674,17 +3955,16 @@ interface_total_bytes() {
 	budget_rx="$(sed -n '1p' "$sys_class_net/$budget_interface/statistics/rx_bytes" 2>/dev/null)"
 	budget_tx="$(sed -n '1p' "$sys_class_net/$budget_interface/statistics/tx_bytes" 2>/dev/null)"
 	case "$budget_rx:$budget_tx" in *[!0-9:]*) return 1 ;; esac
-	printf '%s\n' "$((budget_rx + budget_tx))"
+	uint53_add "$budget_rx" "$budget_tx"
 }
 
 traffic_budget_consumed_bytes() {
-	[ "${traffic_budget_bytes:-0}" -gt 0 ] 2>/dev/null || {
+	uint53_is_positive "${traffic_budget_bytes:-0}" || {
 		printf '%s\n' 0
 		return 0
 	}
 	current_budget_bytes="$(interface_total_bytes "$target_if")" || return 1
-	[ "$current_budget_bytes" -ge "${traffic_budget_start_bytes:-0}" ] 2>/dev/null || return 1
-	printf '%s\n' "$((current_budget_bytes - traffic_budget_start_bytes))"
+	uint53_subtract "$current_budget_bytes" "${traffic_budget_start_bytes:-0}"
 }
 
 finalize_speedtest_result() {
@@ -3939,7 +4219,7 @@ run_speedtest_with_timeout() {
 			}
 			break
 		fi
-		if [ "${traffic_budget_bytes:-0}" -gt 0 ] 2>/dev/null; then
+		if uint53_is_positive "${traffic_budget_bytes:-0}"; then
 			consumed_budget_bytes="$(traffic_budget_consumed_bytes)" || {
 				budget_counter_invalid=1
 				signal_test_group_until_gone "$test_pid" "$test_starttime" || {
@@ -3948,7 +4228,7 @@ run_speedtest_with_timeout() {
 				}
 				break
 			}
-			if [ "$consumed_budget_bytes" -ge "$traffic_budget_bytes" ] 2>/dev/null; then
+			if uint53_compare "$consumed_budget_bytes" ge "$traffic_budget_bytes"; then
 				budget_exhausted=1
 				signal_test_group_until_gone "$test_pid" "$test_starttime" || {
 					speedtest_supervisor_fail termination-failed 1
@@ -4116,12 +4396,13 @@ speedtest_supervisor_json() {
 }
 
 traffic_budget_json() {
-	if [ "${traffic_budget_bytes:-0}" -le 0 ] 2>/dev/null; then
+	if ! uint53_is_positive "${traffic_budget_bytes:-0}"; then
 		printf '%s' '{"enabled":false,"limit_bytes":0,"consumed_bytes":0,"poll_interval_seconds":1}'
 		return
 	fi
 	budget_consumed_json=null
-	if [ -n "${target_if:-}" ] && [ "${traffic_budget_start_bytes:-0}" -gt 0 ] 2>/dev/null; then
+	if [ -n "${target_if:-}" ] &&
+	   uint53_normalize "${traffic_budget_start_bytes:-0}" >/dev/null; then
 		budget_consumed_value="$(traffic_budget_consumed_bytes 2>/dev/null || true)"
 		case "$budget_consumed_value" in ''|*[!0-9]*) ;; *) budget_consumed_json="$budget_consumed_value" ;; esac
 	fi
@@ -4131,7 +4412,7 @@ traffic_budget_json() {
 
 fail() {
 	message="$1"
-	if [ -e "$cancel_file" ]; then
+	if [ -n "${cancel_file:-}" ] && [ -e "$cancel_file" ]; then
 		exit 130
 	fi
 	worker_trace "failure message=$(json_escape "$message")"
@@ -4152,8 +4433,16 @@ measurement_inconclusive() {
 	measurement_stage="$1"
 	measurement_reason="$2"
 	measurement_search_state=inconclusive
+	measurement_recommended_profile_json=
 	measurement_message="Measurement evidence remained invalid after a bounded retry; no candidate was accepted."
 	case "$measurement_reason" in
+		directional-manual-fallback-final-pair-unsafe)
+			measurement_search_state=joint_unsafe
+			measurement_message="The final simultaneous download and upload confirmation exceeded this profile's manual safety ceiling. Direction-only evidence is not a safe proposal; no settings can be applied from this result."
+			if [ "$autotune_profile" = variable_link ]; then
+				measurement_recommended_profile_json=',"recommended_profile":"fair"'
+			fi
+			;;
 		*queue-outside-cake-control*)
 			measurement_search_state=no_cake_effect
 			measurement_message="Reducing the tested CAKE rate did not produce a measurable latency improvement. The bottleneck appears to be outside CAKE control; no runtime minimum was invented."
@@ -4163,7 +4452,7 @@ measurement_inconclusive() {
 			measurement_message="The variable-link measurements did not converge after bounded repeats. No runtime minimum was invented."
 			;;
 	esac
-	stage_terminal_json error "{\"state\":\"inconclusive\",\"schema_version\":7,\"stage\":\"$(json_escape "$measurement_stage")\",\"search_state\":\"$measurement_search_state\",\"error\":\"$(json_escape "$measurement_message")\",\"reason\":\"$(json_escape "$measurement_reason")\",\"retryable\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"phase_contamination_seen\":${phase_contamination_seen:-false},\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[${phase_background_runs_json:-}],\"validation_attempts\":[${validation_attempts_json:-}],\"profile_search\":{\"download\":${dl_search_json:-null},\"upload\":${ul_search_json:-null}},\"pinger_plan\":${pinger_plan:-null},\"proposal\":${proposal:-null},\"configuration_written\":false}"
+	stage_terminal_json error "{\"state\":\"inconclusive\",\"schema_version\":7,\"stage\":\"$(json_escape "$measurement_stage")\",\"search_state\":\"$measurement_search_state\",\"error\":\"$(json_escape "$measurement_message")\",\"reason\":\"$(json_escape "$measurement_reason")\"${measurement_recommended_profile_json},\"retryable\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"phase_contamination_seen\":${phase_contamination_seen:-false},\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[${phase_background_runs_json:-}],\"validation_attempts\":[${validation_attempts_json:-}],\"profile_search\":{\"download\":${dl_search_json:-null},\"upload\":${ul_search_json:-null}},\"pinger_plan\":${pinger_plan:-null},\"proposal\":${proposal:-null},\"configuration_written\":false}"
 	exit 1
 }
 
@@ -4182,11 +4471,12 @@ run_measurement() {
 		phase_background_kind="$calibration_strategy"
 		start_phase_background_counter "$(phase_reference_rate dl)" "$(phase_reference_rate ul)"
 		fair_control_this_attempt=0
-		if [ "$autotune_profile" = fair ] && [ "$index" -eq 1 ]; then
+		if [ "$calibration_strategy" = full_raw ] && [ "$index" -eq 1 ]; then
 			if start_fair_control_monitors "$measurement_attempt"; then
 				fair_control_this_attempt=1
 			else
 				fair_control_json='{"available":false,"measurement_evidence":{"valid":false,"reason":"control-monitor-start-failed"}}'
+				raw_control_json="$fair_control_json"
 			fi
 		fi
 		measurement_result_file="$job_dir/unshaped-$index-$measurement_attempt.result"
@@ -4207,11 +4497,13 @@ run_measurement() {
 		if [ "$fair_control_this_attempt" -eq 1 ] &&
 		   ! stop_fair_control_monitors; then
 			fair_control_json='{"available":false,"measurement_evidence":{"valid":false,"reason":"control-monitor-stop-failed"}}'
+			raw_control_json="$fair_control_json"
 			fair_control_this_attempt=0
 		fi
 		stop_phase_background_counter
 		if [ "$fair_control_this_attempt" -eq 1 ]; then
 			evaluate_fair_control "$result"
+			raw_control_json="$fair_control_json"
 		fi
 		result_backend="$(extract_json "$result" '@.backend')"
 		[ "$result_backend" = "$backend" ] ||
@@ -4414,10 +4706,13 @@ calculate_proposal() {
 	dl_runtime_minimum="${3:-}"
 	ul_runtime_minimum="${4:-}"
 	set --
-	if [ -n "$dl_runtime_minimum" ] || [ -n "$ul_runtime_minimum" ]; then
-		is_positive_uint "$dl_runtime_minimum" && is_positive_uint "$ul_runtime_minimum" || return 1
-		set -- --dl-runtime-min-kbps "$dl_runtime_minimum" \
-			--ul-runtime-min-kbps "$ul_runtime_minimum"
+	if [ -n "$dl_runtime_minimum" ]; then
+		is_positive_uint "$dl_runtime_minimum" || return 1
+		set -- "$@" --dl-runtime-min-kbps "$dl_runtime_minimum"
+	fi
+	if [ -n "$ul_runtime_minimum" ]; then
+		is_positive_uint "$ul_runtime_minimum" || return 1
+		set -- "$@" --ul-runtime-min-kbps "$ul_runtime_minimum"
 	fi
 	if [ "${conservative_mode:-0}" = 1 ]; then
 		"$daemon_bin" --autotune-proposal \
@@ -4496,10 +4791,72 @@ quality_grade_rank() {
 	esac
 }
 
+# A no-SQM candidate is admitted only by evidence collected while the complete
+# managed shaper was demonstrably bypassed.  Whether it is faster than the
+# shaped candidate, or whether its latency is as good, is a utility judgement
+# shown in Review rather than a measurement-integrity gate.
+raw_control_hard_safety() {
+	raw_gate_control="$1"
+	raw_gate_available="$(extract_json "$raw_gate_control" '@.available' 2>/dev/null || true)"
+	raw_gate_valid="$(extract_json "$raw_gate_control" '@.measurement_evidence.valid' 2>/dev/null || true)"
+	raw_gate_reason="$(extract_json "$raw_gate_control" '@.measurement_evidence.reason' 2>/dev/null || true)"
+	raw_gate_direction="$(extract_json "$raw_gate_control" '@.measurement_evidence.test_direction' 2>/dev/null || true)"
+	raw_gate_bypassed="$(extract_json "$raw_gate_control" '@.measurement_evidence.shaper_bypassed' 2>/dev/null || true)"
+	raw_gate_paused="$(extract_json "$raw_gate_control" '@.measurement_evidence.sqm_paused' 2>/dev/null || true)"
+	raw_gate_bypass_mode="$(extract_json "$raw_gate_control" '@.measurement_evidence.sqm_bypass_mode' 2>/dev/null || true)"
+	raw_gate_delta="$(extract_json "$raw_gate_control" '@.effective_delta_ms' 2>/dev/null || true)"
+	raw_gate_grade="$(extract_json "$raw_gate_control" '@.grade' 2>/dev/null || true)"
+	raw_gate_loss="$(extract_json "$raw_gate_control" '@.icmp_latency.loss_percent' 2>/dev/null || true)"
+	raw_gate_dl="$(extract_json "$raw_gate_control" '@.throughput.download_kbps' 2>/dev/null || true)"
+	raw_gate_ul="$(extract_json "$raw_gate_control" '@.throughput.upload_kbps' 2>/dev/null || true)"
+	raw_gate_background_available="$(extract_json "$raw_gate_control" '@.forwarded_background.available' 2>/dev/null || true)"
+	raw_gate_background_contaminated="$(extract_json "$raw_gate_control" '@.forwarded_background.contaminated' 2>/dev/null || true)"
+	raw_gate_background_dl="$(extract_json "$raw_gate_control" '@.forwarded_background.download_kbps' 2>/dev/null || true)"
+	raw_gate_background_ul="$(extract_json "$raw_gate_control" '@.forwarded_background.upload_kbps' 2>/dev/null || true)"
+	raw_gate_background_dl_limit="$(extract_json "$raw_gate_control" '@.forwarded_background.download_limit_kbps' 2>/dev/null || true)"
+	raw_gate_background_ul_limit="$(extract_json "$raw_gate_control" '@.forwarded_background.upload_limit_kbps' 2>/dev/null || true)"
+
+	[ "${phase_evidence_complete:-false}" = true ] &&
+		[ "$raw_gate_available" = true ] &&
+		[ "$raw_gate_valid" = true ] &&
+		[ "$raw_gate_reason" = ok ] &&
+		[ "$raw_gate_direction" = both ] &&
+		[ "$raw_gate_bypassed" = true ] || return 1
+	case "$raw_gate_bypass_mode:$raw_gate_paused" in
+		paused-managed:true|already-unshaped:false) ;;
+		*) return 1 ;;
+	esac
+	raw_gate_expected_grade="$(quality_grade_for_delta "$raw_gate_delta" 2>/dev/null || true)"
+	[ -n "$raw_gate_expected_grade" ] && [ "$raw_gate_grade" = "$raw_gate_expected_grade" ] || return 1
+	awk -v delta="$raw_gate_delta" -v manual_limit="$validation_manual_latency_review_max_ms" \
+		-v loss="$raw_gate_loss" -v loss_limit="$validation_loss_max_percent" \
+		-v dl="$raw_gate_dl" -v ul="$raw_gate_ul" \
+		-v background_available="$raw_gate_background_available" \
+		-v contaminated="$raw_gate_background_contaminated" \
+		-v background_dl="$raw_gate_background_dl" -v background_ul="$raw_gate_background_ul" \
+		-v background_dl_limit="$raw_gate_background_dl_limit" \
+		-v background_ul_limit="$raw_gate_background_ul_limit" 'BEGIN {
+			number = "^[0-9]+([.][0-9]+)?$"
+			exit(!(delta ~ number && delta <= manual_limit &&
+				loss ~ number && loss <= loss_limit &&
+				dl ~ number && dl > 0 && ul ~ number && ul > 0 &&
+				background_available == "true" && contaminated == "false" &&
+				background_dl ~ number && background_dl_limit ~ number && background_dl <= background_dl_limit &&
+				background_ul ~ number && background_ul_limit ~ number && background_ul <= background_ul_limit))
+		}'
+}
+
 build_fair_outcome() {
 	fair_outcome_mode="$1"
 	fair_safety_state="${2:-safety-floor-met}"
 	fair_objective_state="${3:-capacity-objective-met}"
+	# Directional validation is not the final line-quality verdict.  The
+	# simultaneous DL+UL confirmation can expose ACK starvation or shared-path
+	# queueing which neither isolated phase saw.  Callers therefore pass the
+	# authoritative worst-case grade and delay; the defaults keep the standalone
+	# unit fixture useful without weakening the real result contract.
+	fair_actual_grade="${4:-$validation_actual_grade}"
+	fair_actual_effective_delta_ms="${5:-$effective_loaded_delta_ms}"
 	fair_apply_sqm_available=true
 	fair_recommended_action=apply_sqm
 	fair_disable_available=false
@@ -4507,6 +4864,12 @@ build_fair_outcome() {
 	fair_control_available="$(extract_json "$fair_control_json" '@.available' 2>/dev/null || true)"
 	fair_control_dl_gain_percent=0
 	fair_control_ul_gain_percent=0
+	# A clean raw control is always a manually reviewable alternative.  The
+	# comparison below may rank it first, but lack of a measured utility gain
+	# must not erase an otherwise safe topology from Review.
+	if raw_control_hard_safety "$fair_control_json"; then
+		fair_disable_available=true
+	fi
 
 	if [ "$fair_safety_state" = safety-floor-infeasible ]; then
 		fair_apply_sqm_available=false
@@ -4529,13 +4892,14 @@ build_fair_outcome() {
 			fair_control_delta_value="$(extract_json "$fair_control_json" '@.effective_delta_ms')"
 			fair_control_dl="$(extract_json "$fair_control_json" '@.throughput.download_kbps')"
 			fair_control_ul="$(extract_json "$fair_control_json" '@.throughput.upload_kbps')"
+			fair_control_loss="$(extract_json "$fair_control_json" '@.icmp_latency.loss_percent')"
 			fair_control_background_available="$(extract_json "$fair_control_json" '@.forwarded_background.available')"
 			fair_control_background_contaminated="$(extract_json "$fair_control_json" '@.forwarded_background.contaminated')"
 			fair_control_background_dl="$(extract_json "$fair_control_json" '@.forwarded_background.download_kbps')"
 			fair_control_background_ul="$(extract_json "$fair_control_json" '@.forwarded_background.upload_kbps')"
 			fair_control_background_dl_limit="$(extract_json "$fair_control_json" '@.forwarded_background.download_limit_kbps')"
 			fair_control_background_ul_limit="$(extract_json "$fair_control_json" '@.forwarded_background.upload_limit_kbps')"
-			fair_shaped_rank="$(quality_grade_rank "$validation_actual_grade")" || fair_shaped_rank=99
+			fair_shaped_rank="$(quality_grade_rank "$fair_actual_grade")" || fair_shaped_rank=99
 			fair_control_rank="$(quality_grade_rank "$fair_control_grade_value")" || fair_control_rank=99
 			fair_control_dl_gain_percent="$(awk -v control="$fair_control_dl" -v shaped="$shaped_dl" 'BEGIN {
 				if (control <= 0 || shaped <= 0) { print 0; exit }
@@ -4546,8 +4910,9 @@ build_fair_outcome() {
 				printf "%.3f", (control / shaped - 1) * 100
 			}')"
 			if awk -v control_rank="$fair_control_rank" -v shaped_rank="$fair_shaped_rank" \
-				-v control_delta="$fair_control_delta_value" -v shaped_delta="$effective_loaded_delta_ms" \
+				-v control_delta="$fair_control_delta_value" -v shaped_delta="$fair_actual_effective_delta_ms" \
 				-v dl_gain="$fair_control_dl_gain_percent" -v ul_gain="$fair_control_ul_gain_percent" \
+				-v control_loss="$fair_control_loss" -v loss_limit="$validation_loss_max_percent" \
 				-v background_available="$fair_control_background_available" \
 				-v background_contaminated="$fair_control_background_contaminated" \
 				-v background_dl="$fair_control_background_dl" -v background_ul="$fair_control_background_ul" \
@@ -4560,6 +4925,7 @@ build_fair_outcome() {
 						background_ul_limit ~ /^[0-9]+([.][0-9]+)?$/ &&
 						background_dl <= background_dl_limit &&
 						background_ul <= background_ul_limit &&
+						control_loss ~ /^[0-9]+([.][0-9]+)?$/ && control_loss <= loss_limit &&
 						control_rank <= shaped_rank &&
 						control_delta <= shaped_delta + 10 &&
 						dl_gain >= 2 && ul_gain >= 2))
@@ -4579,7 +4945,7 @@ build_fair_outcome() {
 	fi
 	[ "$fair_disable_available" = true ] &&
 		fair_allowed_actions="$fair_allowed_actions,\"disable_sqm\""
-	fair_outcome_json="{\"mode\":\"$(json_escape "$fair_outcome_mode")\",\"target_grade\":\"C\",\"target_delta_ms\":200,\"capacity_floor_percent\":90,\"capacity_floor_met\":$([ "$fair_objective_state" = capacity-objective-met ] && printf true || printf false),\"throughput_safety_floor_percent\":50,\"throughput_safety_floor_met\":$profile_safety_floor_met,\"actual_grade\":\"$(json_escape "$validation_actual_grade")\",\"actual_effective_delta_ms\":$effective_loaded_delta_ms,\"recommended_action\":\"$fair_recommended_action\",\"allowed_actions\":[$fair_allowed_actions],\"apply_sqm_available\":$fair_apply_sqm_available,\"disable_sqm_available\":$fair_disable_available,\"comparison_reason\":\"$(json_escape "$fair_comparison_reason")\",\"no_sqm_control\":$fair_control_json,\"throughput_gain_without_sqm\":{\"download_percent\":$fair_control_dl_gain_percent,\"upload_percent\":$fair_control_ul_gain_percent}}"
+	fair_outcome_json="{\"mode\":\"$(json_escape "$fair_outcome_mode")\",\"target_grade\":\"C\",\"target_delta_ms\":200,\"capacity_floor_percent\":90,\"capacity_floor_met\":$([ "$fair_objective_state" = capacity-objective-met ] && printf true || printf false),\"throughput_safety_floor_percent\":50,\"throughput_safety_floor_met\":$profile_safety_floor_met,\"actual_grade\":\"$(json_escape "$fair_actual_grade")\",\"actual_effective_delta_ms\":$fair_actual_effective_delta_ms,\"recommended_action\":\"$fair_recommended_action\",\"allowed_actions\":[$fair_allowed_actions],\"apply_sqm_available\":$fair_apply_sqm_available,\"disable_sqm_available\":$fair_disable_available,\"comparison_reason\":\"$(json_escape "$fair_comparison_reason")\",\"no_sqm_control\":$fair_control_json,\"throughput_gain_without_sqm\":{\"download_percent\":$fair_control_dl_gain_percent,\"upload_percent\":$fair_control_ul_gain_percent}}"
 }
 
 start_fair_control_monitors() {
@@ -4797,10 +5163,27 @@ run_validation_direction_phase() {
 			[ "$phase_direction" = both ] ||
 				fail "Upload-only topology evidence requires simultaneous download and upload load."
 			phase_kind=upload-only-shaped
-			phase_speedtest_mode=unshaped
+			phase_speedtest_mode=shaped
 			phase_status_topology="upload CAKE only; download ingress bypassed"
 			;;
+		download_only_shaped)
+			[ "$phase_direction" = both ] ||
+				fail "Download-only topology evidence requires simultaneous download and upload load."
+			phase_kind=download-only-shaped
+			phase_speedtest_mode=shaped
+			phase_status_topology="download CAKE only; upload egress bypassed"
+			;;
 		*) fail "Unknown validation topology $phase_topology." ;;
+	esac
+	case "$phase_topology" in
+		upload_only_shaped)
+			bypass_temporary_ingress ||
+				fail "Unable to establish the owned temporary upload-only CAKE topology."
+			;;
+		download_only_shaped)
+			bypass_temporary_egress ||
+				fail "Unable to establish the owned temporary download-only CAKE topology."
+			;;
 	esac
 	phase_background_attempt=1
 	while [ "$phase_background_attempt" -le 2 ]; do
@@ -4839,12 +5222,26 @@ run_validation_direction_phase() {
 			if [ "${AUTOTUNE_MOCK_ICMP_RATE_LIMIT:-0}" = 1 ]; then
 				printf '%s\n' '[5.00000] 1.1.1.1 : [4], timed out (NaN avg, 20% loss)' >> "$loaded_raw"
 			fi
-			if [ "${AUTOTUNE_MOCK_BIDI_HIGH_LATENCY:-0}" = 1 ] &&
+			if [ "${AUTOTUNE_MOCK_VARIABLE_DIRECTIONAL_NO_EFFECT:-0}" = 1 ]; then
+				printf '%s\n' 12.0 > "$cpu_values"
+				case "$phase_direction:$phase_validation_attempt" in
+					download:1) phase_test_transport_raw='[80.0,82.0,83.0,84.0]' ;;
+					download:2) phase_test_transport_raw='[40.0,42.0,43.0,44.0]' ;;
+					download:3) phase_test_transport_raw='[39.0,41.0,42.0,43.0]' ;;
+					download:*) phase_test_transport_raw='[38.0,40.0,41.0,42.0]' ;;
+					*) phase_test_transport_raw='[40.0,42.0,43.0,44.0]' ;;
+				esac
+			elif [ "${AUTOTUNE_MOCK_BIDI_HIGH_LATENCY:-0}" = 1 ] &&
 			   [ "$phase_direction" = both ] &&
 			   { [ "$phase_topology" = both_shaped ] ||
-			     [ "${AUTOTUNE_MOCK_UPLOAD_ONLY_SAFE:-0}" != 1 ]; }; then
+			     { [ "$phase_topology" = upload_only_shaped ] &&
+			       [ "${AUTOTUNE_MOCK_UPLOAD_ONLY_SAFE:-0}" != 1 ]; } ||
+			     { [ "$phase_topology" = download_only_shaped ] &&
+			       [ "${AUTOTUNE_MOCK_DOWNLOAD_ONLY_SAFE:-0}" != 1 ]; }; }; then
 				printf '%s\n' 35.0 > "$cpu_values"
-				phase_test_transport_raw='[230.0,240.0,250.0,480.0]'
+				# Miss Best overall's A target, but remain inside the adjacent
+				# B-grade manual-review envelope used by the lifecycle fixture.
+				phase_test_transport_raw='[35.0,40.0,45.0,55.0]'
 			elif [ "${AUTOTUNE_MOCK_COMPUTE_CEILING:-0}" = 1 ]; then
 				printf '%s\n' 97.0 > "$cpu_values"
 				phase_test_transport_raw='[20.0,22.0,23.0,24.0]'
@@ -4876,7 +5273,7 @@ run_validation_direction_phase() {
 
 		write_status shaped 87 "Running $phase_direction validation phase $phase_validation_attempt with $phase_status_topology on the pinned server (traffic check $phase_background_attempt)"
 		phase_background_kind="$phase_kind"
-		if ! temporary_shaper_owned; then
+		if ! temporary_phase_shaper_owned; then
 			stop_validation_monitors ||
 				fail "A validation monitor could not be terminated; crash recovery remains armed."
 			phase_evidence_complete=false
@@ -4885,15 +5282,9 @@ run_validation_direction_phase() {
 		start_phase_background_counter "$dl_base" "$ul_base"
 		phase_result_file="$job_dir/$phase_kind-$phase_direction-$phase_validation_attempt-$phase_background_attempt.result"
 		phase_speedtest_ok=true
-		if [ "$phase_topology" = upload_only_shaped ]; then
-			run_speedtest_with_bypass_scope ingress "$phase_result_file" \
-				"$job_name" "$target_if" run "$backend" "$phase_speedtest_mode" "$route_mode" "$mwan3_member" "$phase_direction" ||
-				phase_speedtest_ok=false
-		else
-			run_speedtest_with_timeout "$phase_result_file" \
-				"$job_name" "$target_if" run "$backend" "$phase_speedtest_mode" "$route_mode" "$mwan3_member" "$phase_direction" ||
-				phase_speedtest_ok=false
-		fi
+		run_speedtest_with_timeout "$phase_result_file" \
+			"$job_name" "$target_if" run "$backend" "$phase_speedtest_mode" "$route_mode" "$mwan3_member" "$phase_direction" ||
+			phase_speedtest_ok=false
 		if [ "$phase_speedtest_ok" != true ]; then
 			stop_phase_background_counter
 			stop_validation_monitors ||
@@ -4911,7 +5302,7 @@ run_validation_direction_phase() {
 			# fails closed; earlier candidate evidence is never silently reused.
 			case "$phase_failure_reason:$phase_background_attempt" in
 				helper-exit:*:1)
-					temporary_shaper_owned ||
+					temporary_phase_shaper_owned ||
 						fail "Temporary shaper ownership changed after a failed $phase_direction-only speed test."
 					if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_PREFLIGHT:-0}" != 1 ]; then
 						inspect_autotune_route ||
@@ -4925,7 +5316,7 @@ run_validation_direction_phase() {
 			esac
 			fail "The $phase_direction-only shaped validation speed test failed in the supervisor (${speedtest_supervisor_reason:-unknown})."
 		fi
-		if ! temporary_shaper_owned; then
+		if ! temporary_phase_shaper_owned; then
 			stop_phase_background_counter
 			stop_validation_monitors ||
 				fail "A validation monitor could not be terminated; crash recovery remains armed."
@@ -4945,9 +5336,12 @@ run_validation_direction_phase() {
 		phase_reported_direction="$(extract_json "$phase_result" '@.test_direction')"
 		[ "$phase_reported_direction" = "$phase_direction" ] ||
 			fail "Speed test helper reported ${phase_reported_direction:-no direction} for the requested $phase_direction-only validation phase."
-		phase_shaper_bypassed="$(extract_json "$phase_result" '@.shaper_bypassed')"
-		phase_sqm_paused="$(extract_json "$phase_result" '@.sqm_paused')"
-		phase_sqm_bypass_mode="$(extract_json "$phase_result" '@.sqm_bypass_mode')"
+		phase_helper_shaper_bypassed="$(extract_json "$phase_result" '@.shaper_bypassed')"
+		phase_helper_sqm_paused="$(extract_json "$phase_result" '@.sqm_paused')"
+		phase_helper_sqm_bypass_mode="$(extract_json "$phase_result" '@.sqm_bypass_mode')"
+		phase_shaper_bypassed="$phase_helper_shaper_bypassed"
+		phase_sqm_paused="$phase_helper_sqm_paused"
+		phase_sqm_bypass_mode="$phase_helper_sqm_bypass_mode"
 
 		case "$phase_direction" in
 			download) phase_achieved_kbps="$(extract_json "$phase_result" '@.download_kbps')" ;;
@@ -4968,16 +5362,35 @@ run_validation_direction_phase() {
 		phase_measurement_reason=ok
 		case "$phase_topology" in
 			both_shaped)
-				if [ "$phase_shaper_bypassed" != false ] || [ "$phase_sqm_paused" != false ]; then
+				if [ "$phase_helper_shaper_bypassed" != false ] || [ "$phase_helper_sqm_paused" != false ]; then
 					phase_measurement_valid=false
 					phase_measurement_reason=shaped-shaper-proof-invalid
 				fi
 				;;
 			upload_only_shaped)
-				if [ "$phase_shaper_bypassed" != true ] || [ "$phase_sqm_paused" != false ] ||
-				   [ "$phase_sqm_bypass_mode" != ingress-only-managed ]; then
+				if [ "$phase_helper_shaper_bypassed" != false ] ||
+				   [ "$phase_helper_sqm_paused" != false ] ||
+				   [ "$phase_helper_sqm_bypass_mode" != none ] ||
+				   ! temporary_upload_only_shaper_owned; then
 					phase_measurement_valid=false
 					phase_measurement_reason=upload-only-shaper-proof-invalid
+				else
+					phase_shaper_bypassed=true
+					phase_sqm_paused=false
+					phase_sqm_bypass_mode=ingress-only-autotune
+				fi
+				;;
+			download_only_shaped)
+				if [ "$phase_helper_shaper_bypassed" != false ] ||
+				   [ "$phase_helper_sqm_paused" != false ] ||
+				   [ "$phase_helper_sqm_bypass_mode" != none ] ||
+				   ! temporary_download_only_shaper_owned; then
+					phase_measurement_valid=false
+					phase_measurement_reason=download-only-shaper-proof-invalid
+				else
+					phase_shaper_bypassed=true
+					phase_sqm_paused=false
+					phase_sqm_bypass_mode=egress-only-autotune
 				fi
 				;;
 		esac
@@ -5122,6 +5535,16 @@ run_validation_direction_phase() {
 		fail "WAN route identity changed during $phase_direction-only shaped validation."
 	[ "$(extract_json "$phase_result" '@.external_ip_after')" = "$selected_external_ip" ] ||
 		fail "External IP changed during $phase_direction-only shaped validation."
+	case "$phase_topology" in
+		upload_only_shaped)
+			restore_temporary_ingress ||
+				fail "Unable to restore the owned temporary download CAKE ingress after comparison."
+			;;
+		download_only_shaped)
+			restore_temporary_egress ||
+				fail "Unable to restore the owned temporary upload CAKE egress after comparison."
+			;;
+	esac
 }
 
 run_shaped_validation() {
@@ -5306,11 +5729,21 @@ run_bidirectional_confirmation() {
 		-v ul="$bidirectional_upload_realization" -v minimum="$validation_candidate_realization_min_percent" 'BEGIN {
 		print (dl >= minimum && ul >= minimum) ? "true" : "false"
 	}')"
+	bidirectional_realization_safety_pass="$(awk -v dl="$bidirectional_download_realization" \
+		-v ul="$bidirectional_upload_realization" -v maximum="$validation_candidate_realization_max_percent" 'BEGIN {
+		print (dl >= 50 && ul >= 50 && dl <= maximum && ul <= maximum) ? "true" : "false"
+	}')"
+	bidirectional_latency_review_pass="$(awk -v actual="$bidirectional_effective_delta_ms" \
+		-v limit="$validation_manual_latency_review_max_ms" 'BEGIN {
+		print (actual <= limit) ? "true" : "false"
+	}')"
 	bidirectional_safety_pass=false
-	[ "$bidirectional_latency_pass" = true ] && [ "$bidirectional_loss_pass" = true ] &&
+	[ "$bidirectional_loss_pass" = true ] && [ "$bidirectional_realization_safety_pass" = true ] &&
+		[ "$bidirectional_latency_review_pass" = true ] &&
 		bidirectional_safety_pass=true
 	bidirectional_auto_apply_pass=false
-	[ "$bidirectional_safety_pass" = true ] && [ "$bidirectional_realization_pass" = true ] &&
+	[ "$bidirectional_safety_pass" = true ] && [ "$bidirectional_latency_pass" = true ] &&
+		[ "$bidirectional_realization_pass" = true ] &&
 		bidirectional_auto_apply_pass=true
 	bidirectional_cpu_warning="$(awk -v actual="$phase_cpu_peak" -v limit="$validation_cpu_max_percent" 'BEGIN {
 		print (actual > limit) ? "true" : "false"
@@ -5350,8 +5783,11 @@ evaluate_upload_only_observation() {
 	upload_only_loss_pass="$(awk -v actual="$phase_loss_percent" -v limit="$validation_loss_max_percent" 'BEGIN {
 		print (actual <= limit) ? "true" : "false"
 	}')"
-	upload_only_realization_pass="$(awk -v actual="$upload_only_ul_realization" -v minimum="$validation_candidate_realization_min_percent" 'BEGIN {
-		print (actual >= minimum) ? "true" : "false"
+	upload_only_realization_pass="$(awk -v actual="$upload_only_ul_realization" -v minimum="$validation_candidate_realization_min_percent" -v maximum="$validation_candidate_realization_max_percent" 'BEGIN {
+		print (actual >= minimum && actual <= maximum) ? "true" : "false"
+	}')"
+	upload_only_realization_safety_pass="$(awk -v actual="$upload_only_ul_realization" -v maximum="$validation_candidate_realization_max_percent" 'BEGIN {
+		print (actual >= 50 && actual <= maximum) ? "true" : "false"
 	}')"
 	upload_only_gain_pass="$(awk -v actual="$upload_only_dl_gain_percent" 'BEGIN {
 		print (actual >= 10) ? "true" : "false"
@@ -5374,12 +5810,91 @@ evaluate_upload_only_observation() {
 	[ "$upload_only_latency_pass" = true ] && [ "$upload_only_loss_pass" = true ] &&
 		[ "$upload_only_realization_pass" = true ] && [ "$upload_only_gain_pass" = true ] &&
 		[ "$upload_only_effect_pass" = true ] && upload_only_observation_pass=true
-	upload_only_evaluation_json="{\"pass\":$upload_only_observation_pass,\"grade\":\"$(json_escape "$upload_only_grade")\",\"effective_delta_ms\":$upload_only_effective_delta_ms,\"delay_improvement_ms\":$upload_only_delay_improvement_ms,\"loss_percent\":$phase_loss_percent,\"download_gain_percent\":$upload_only_dl_gain_percent,\"upload_realization_percent\":$upload_only_ul_realization,\"gates\":{\"latency\":$upload_only_latency_pass,\"loss\":$upload_only_loss_pass,\"upload_realization\":$upload_only_realization_pass,\"download_gain\":$upload_only_gain_pass,\"causal_effect\":$upload_only_effect_pass},\"observation\":$phase_observation_json}"
+	upload_only_manual_latency_pass="$(awk -v actual="$upload_only_effective_delta_ms" -v limit="$validation_manual_latency_review_max_ms" 'BEGIN {
+		print (actual <= limit) ? "true" : "false"
+	}')"
+	upload_only_material_benefit="$(awk -v gain="$upload_only_dl_gain_percent" -v delay="$upload_only_delay_improvement_ms" 'BEGIN {
+		print (gain >= 2 && delay >= -5) ? "true" : "false"
+	}')"
+	upload_only_hard_safety_pass=false
+	[ "$upload_only_loss_pass" = true ] && [ "$upload_only_realization_safety_pass" = true ] &&
+		[ "$upload_only_manual_latency_pass" = true ] && upload_only_hard_safety_pass=true
+	upload_only_candidate_pass=false
+	[ "$upload_only_hard_safety_pass" = true ] && [ "$upload_only_material_benefit" = true ] &&
+		upload_only_candidate_pass=true
+	upload_only_evaluation_json="{\"pass\":$upload_only_observation_pass,\"candidate_pass\":$upload_only_candidate_pass,\"hard_safety_pass\":$upload_only_hard_safety_pass,\"profile_target_met\":$upload_only_latency_pass,\"material_benefit\":$upload_only_material_benefit,\"grade\":\"$(json_escape "$upload_only_grade")\",\"effective_delta_ms\":$upload_only_effective_delta_ms,\"delay_improvement_ms\":$upload_only_delay_improvement_ms,\"loss_percent\":$phase_loss_percent,\"download_gain_percent\":$upload_only_dl_gain_percent,\"upload_realization_percent\":$upload_only_ul_realization,\"gates\":{\"latency\":$upload_only_latency_pass,\"manual_latency\":$upload_only_manual_latency_pass,\"loss\":$upload_only_loss_pass,\"upload_realization\":$upload_only_realization_pass,\"upload_realization_safety\":$upload_only_realization_safety_pass,\"download_gain\":$upload_only_gain_pass,\"causal_effect\":$upload_only_effect_pass},\"observation\":$phase_observation_json}"
+}
+
+evaluate_download_only_observation() {
+	download_only_effective_delta_ms="$(maximum_number "$phase_icmp_delta_ms" "$phase_transport_delta_ms")"
+	download_only_grade="$(quality_grade_for_delta "$download_only_effective_delta_ms")"
+	download_only_dl_realization="$(awk -v achieved="$phase_achieved_dl_kbps" -v candidate="$dl_base" 'BEGIN {
+		if (candidate <= 0) exit 1
+		printf "%.1f", achieved * 100 / candidate
+	}')" || fail "Unable to calculate download-only download realization."
+	download_only_ul_gain_percent="$(awk -v candidate="$phase_achieved_ul_kbps" -v shaped="$bidirectional_upload_kbps" 'BEGIN {
+		if (shaped <= 0) exit 1
+		printf "%.1f", (candidate - shaped) * 100 / shaped
+	}')" || fail "Unable to calculate download-only upload gain."
+	download_only_delay_improvement_ms="$(awk -v shaped="$bidirectional_effective_delta_ms" -v candidate="$download_only_effective_delta_ms" 'BEGIN {
+		printf "%.1f", shaped - candidate
+	}')"
+	download_only_latency_pass="$(awk -v actual="$download_only_effective_delta_ms" -v limit="$validation_delay_max_ms" 'BEGIN {
+		print (actual <= limit) ? "true" : "false"
+	}')"
+	download_only_loss_pass="$(awk -v actual="$phase_loss_percent" -v limit="$validation_loss_max_percent" 'BEGIN {
+		print (actual <= limit) ? "true" : "false"
+	}')"
+	download_only_realization_pass="$(awk -v actual="$download_only_dl_realization" -v minimum="$validation_candidate_realization_min_percent" -v maximum="$validation_candidate_realization_max_percent" 'BEGIN {
+		print (actual >= minimum && actual <= maximum) ? "true" : "false"
+	}')"
+	download_only_realization_safety_pass="$(awk -v actual="$download_only_dl_realization" -v maximum="$validation_candidate_realization_max_percent" 'BEGIN {
+		print (actual >= 50 && actual <= maximum) ? "true" : "false"
+	}')"
+	download_only_gain_pass="$(awk -v actual="$download_only_ul_gain_percent" 'BEGIN {
+		print (actual >= 10) ? "true" : "false"
+	}')"
+	download_only_effect_pass=true
+	if [ "$bidirectional_latency_pass" != true ]; then
+		download_only_effect_pass="$(awk -v actual="$download_only_delay_improvement_ms" 'BEGIN {
+			print (actual >= 5) ? "true" : "false"
+		}')"
+	else
+		download_only_effect_pass="$(awk -v candidate="$download_only_effective_delta_ms" -v shaped="$bidirectional_effective_delta_ms" 'BEGIN {
+			print (candidate <= shaped + 5) ? "true" : "false"
+		}')"
+	fi
+	download_only_observation_pass=false
+	[ "$download_only_latency_pass" = true ] && [ "$download_only_loss_pass" = true ] &&
+		[ "$download_only_realization_pass" = true ] && [ "$download_only_gain_pass" = true ] &&
+		[ "$download_only_effect_pass" = true ] && download_only_observation_pass=true
+	download_only_manual_latency_pass="$(awk -v actual="$download_only_effective_delta_ms" -v limit="$validation_manual_latency_review_max_ms" 'BEGIN {
+		print (actual <= limit) ? "true" : "false"
+	}')"
+	download_only_material_benefit="$(awk -v gain="$download_only_ul_gain_percent" -v delay="$download_only_delay_improvement_ms" 'BEGIN {
+		print (gain >= 2 && delay >= -5) ? "true" : "false"
+	}')"
+	download_only_hard_safety_pass=false
+	[ "$download_only_loss_pass" = true ] && [ "$download_only_realization_safety_pass" = true ] &&
+		[ "$download_only_manual_latency_pass" = true ] && download_only_hard_safety_pass=true
+	download_only_candidate_pass=false
+	[ "$download_only_hard_safety_pass" = true ] && [ "$download_only_material_benefit" = true ] &&
+		download_only_candidate_pass=true
+	download_only_evaluation_json="{\"pass\":$download_only_observation_pass,\"candidate_pass\":$download_only_candidate_pass,\"hard_safety_pass\":$download_only_hard_safety_pass,\"profile_target_met\":$download_only_latency_pass,\"material_benefit\":$download_only_material_benefit,\"grade\":\"$(json_escape "$download_only_grade")\",\"effective_delta_ms\":$download_only_effective_delta_ms,\"delay_improvement_ms\":$download_only_delay_improvement_ms,\"loss_percent\":$phase_loss_percent,\"upload_gain_percent\":$download_only_ul_gain_percent,\"download_realization_percent\":$download_only_dl_realization,\"gates\":{\"latency\":$download_only_latency_pass,\"manual_latency\":$download_only_manual_latency_pass,\"loss\":$download_only_loss_pass,\"download_realization\":$download_only_realization_pass,\"download_realization_safety\":$download_only_realization_safety_pass,\"upload_gain\":$download_only_gain_pass,\"causal_effect\":$download_only_effect_pass},\"observation\":$phase_observation_json}"
 }
 
 build_directional_recommendation() {
 	directional_recommendation_json="{\"tested\":false,\"current_topology\":\"both_shaped\",\"recommended_topology\":\"both_shaped\",\"manual_only\":false,\"reason\":\"both-shaped-confirmation-passed\",\"confidence_percent\":100,\"observations\":[]}"
-	if [ "$bidirectional_safety_pass" = true ] && [ "$bidirectional_realization_pass" = true ]; then
+	upload_only_recommendation_json=null
+	download_only_recommendation_json=null
+	directional_comparisons_json="{\"upload_only\":null,\"download_only\":null}"
+	# A merely reviewable adjacent-grade result is not the end of a full-raw
+	# calibration. Try the upload-only topology whenever the simultaneous pair
+	# missed any Auto-Apply objective; it may recover the requested latency or
+	# throughput without discarding the already safe shaped proposal.
+	if [ "${bidirectional_auto_apply_pass:-false}" = true ] &&
+	   [ "${validation_quality_target_met:-false}" = true ] &&
+	   [ "${validation_profile_objectives_met:-false}" = true ]; then
 		return 0
 	fi
 
@@ -5391,7 +5906,7 @@ build_directional_recommendation() {
 	write_status confirmation 95 "Comparing the selected pair with download ingress bypassed; no topology change will be applied"
 	run_validation_direction_phase both "$((bidirectional_attempt + 1))" upload_only_shaped
 	evaluate_upload_only_observation
-	upload_only_first_pass="$upload_only_observation_pass"
+	upload_only_first_pass="$upload_only_candidate_pass"
 	upload_only_first_dl="$phase_achieved_dl_kbps"
 	upload_only_first_ul="$phase_achieved_ul_kbps"
 	upload_only_first_delta="$upload_only_effective_delta_ms"
@@ -5399,7 +5914,7 @@ build_directional_recommendation() {
 
 	run_validation_direction_phase both "$((bidirectional_attempt + 2))" upload_only_shaped
 	evaluate_upload_only_observation
-	upload_only_second_pass="$upload_only_observation_pass"
+	upload_only_second_pass="$upload_only_candidate_pass"
 	upload_only_second_dl="$phase_achieved_dl_kbps"
 	upload_only_second_ul="$phase_achieved_ul_kbps"
 	upload_only_second_delta="$upload_only_effective_delta_ms"
@@ -5418,10 +5933,420 @@ build_directional_recommendation() {
 
 	if [ "$upload_only_first_pass" = true ] && [ "$upload_only_second_pass" = true ] &&
 	   [ "$upload_only_repeatable" = true ]; then
-		directional_recommendation_json="{\"tested\":true,\"current_topology\":\"both_shaped\",\"recommended_topology\":\"upload_only_shaped\",\"manual_only\":true,\"reason\":\"repeatable-download-bypass-benefit\",\"confidence_percent\":90,\"repeatable\":true,\"thresholds\":{\"minimum_download_gain_percent\":10,\"minimum_latency_improvement_ms\":5,\"maximum_repeat_throughput_spread_percent\":15,\"maximum_repeat_delay_spread_ms\":10},\"observations\":[$upload_only_first_json,$upload_only_second_json]}"
+		upload_only_recommendation_confidence=75
+		[ "$(extract_json "$upload_only_first_json" '@.pass')" = true ] &&
+			[ "$(extract_json "$upload_only_second_json" '@.pass')" = true ] &&
+			upload_only_recommendation_confidence=90
+		upload_only_recommendation_json="{\"tested\":true,\"current_topology\":\"both_shaped\",\"recommended_topology\":\"upload_only_shaped\",\"manual_only\":true,\"reason\":\"repeatable-download-bypass-benefit\",\"confidence_percent\":$upload_only_recommendation_confidence,\"repeatable\":true,\"thresholds\":{\"minimum_download_gain_percent\":2,\"minimum_latency_improvement_ms\":-5,\"maximum_repeat_throughput_spread_percent\":15,\"maximum_repeat_delay_spread_ms\":10},\"observations\":[$upload_only_first_json,$upload_only_second_json]}"
 	else
-		directional_recommendation_json="{\"tested\":true,\"current_topology\":\"both_shaped\",\"recommended_topology\":\"manual_review\",\"manual_only\":true,\"reason\":\"upload-only-benefit-not-repeatable\",\"confidence_percent\":40,\"repeatable\":$upload_only_repeatable,\"thresholds\":{\"minimum_download_gain_percent\":10,\"minimum_latency_improvement_ms\":5,\"maximum_repeat_throughput_spread_percent\":15,\"maximum_repeat_delay_spread_ms\":10},\"observations\":[$upload_only_first_json,$upload_only_second_json]}"
+		upload_only_recommendation_json="{\"tested\":true,\"current_topology\":\"both_shaped\",\"recommended_topology\":\"manual_review\",\"manual_only\":true,\"reason\":\"upload-only-benefit-not-repeatable\",\"confidence_percent\":40,\"repeatable\":$upload_only_repeatable,\"thresholds\":{\"minimum_download_gain_percent\":2,\"minimum_latency_improvement_ms\":-5,\"maximum_repeat_throughput_spread_percent\":15,\"maximum_repeat_delay_spread_ms\":10},\"observations\":[$upload_only_first_json,$upload_only_second_json]}"
 	fi
+
+	write_status confirmation 96 "Comparing the selected pair with upload egress bypassed; no topology change will be applied"
+	run_validation_direction_phase both "$((bidirectional_attempt + 3))" download_only_shaped
+	evaluate_download_only_observation
+	download_only_first_pass="$download_only_candidate_pass"
+	download_only_first_dl="$phase_achieved_dl_kbps"
+	download_only_first_ul="$phase_achieved_ul_kbps"
+	download_only_first_delta="$download_only_effective_delta_ms"
+	download_only_first_json="$download_only_evaluation_json"
+
+	run_validation_direction_phase both "$((bidirectional_attempt + 4))" download_only_shaped
+	evaluate_download_only_observation
+	download_only_second_pass="$download_only_candidate_pass"
+	download_only_second_dl="$phase_achieved_dl_kbps"
+	download_only_second_ul="$phase_achieved_ul_kbps"
+	download_only_second_delta="$download_only_effective_delta_ms"
+	download_only_second_json="$download_only_evaluation_json"
+	download_only_repeatable="$(awk \
+		-v dl1="$download_only_first_dl" -v dl2="$download_only_second_dl" \
+		-v ul1="$download_only_first_ul" -v ul2="$download_only_second_ul" \
+		-v delay1="$download_only_first_delta" -v delay2="$download_only_second_delta" 'BEGIN {
+		dlmax = (dl1 > dl2) ? dl1 : dl2
+		ulmax = (ul1 > ul2) ? ul1 : ul2
+		dldiff = (dlmax > 0) ? ((dl1 > dl2 ? dl1 - dl2 : dl2 - dl1) * 100 / dlmax) : 100
+		uldiff = (ulmax > 0) ? ((ul1 > ul2 ? ul1 - ul2 : ul2 - ul1) * 100 / ulmax) : 100
+		delaydiff = (delay1 > delay2) ? delay1 - delay2 : delay2 - delay1
+		print (dldiff <= 15 && uldiff <= 15 && delaydiff <= 10) ? "true" : "false"
+	}')"
+
+	if [ "$download_only_first_pass" = true ] && [ "$download_only_second_pass" = true ] &&
+	   [ "$download_only_repeatable" = true ]; then
+		download_only_recommendation_confidence=75
+		[ "$(extract_json "$download_only_first_json" '@.pass')" = true ] &&
+			[ "$(extract_json "$download_only_second_json" '@.pass')" = true ] &&
+			download_only_recommendation_confidence=90
+		download_only_recommendation_json="{\"tested\":true,\"current_topology\":\"both_shaped\",\"recommended_topology\":\"download_only_shaped\",\"manual_only\":true,\"reason\":\"repeatable-upload-bypass-benefit\",\"confidence_percent\":$download_only_recommendation_confidence,\"repeatable\":true,\"thresholds\":{\"minimum_upload_gain_percent\":2,\"minimum_latency_improvement_ms\":-5,\"maximum_repeat_throughput_spread_percent\":15,\"maximum_repeat_delay_spread_ms\":10},\"observations\":[$download_only_first_json,$download_only_second_json]}"
+	else
+		download_only_recommendation_json="{\"tested\":true,\"current_topology\":\"both_shaped\",\"recommended_topology\":\"manual_review\",\"manual_only\":true,\"reason\":\"download-only-benefit-not-repeatable\",\"confidence_percent\":40,\"repeatable\":$download_only_repeatable,\"thresholds\":{\"minimum_upload_gain_percent\":2,\"minimum_latency_improvement_ms\":-5,\"maximum_repeat_throughput_spread_percent\":15,\"maximum_repeat_delay_spread_ms\":10},\"observations\":[$download_only_first_json,$download_only_second_json]}"
+	fi
+	directional_comparisons_json="{\"upload_only\":$upload_only_recommendation_json,\"download_only\":$download_only_recommendation_json}"
+
+	upload_only_recommended=false
+	download_only_recommended=false
+	[ "$(extract_json "$upload_only_recommendation_json" '@.recommended_topology')" = upload_only_shaped ] &&
+		upload_only_recommended=true
+	[ "$(extract_json "$download_only_recommendation_json" '@.recommended_topology')" = download_only_shaped ] &&
+		download_only_recommended=true
+	case "$upload_only_recommended:$download_only_recommended" in
+		true:false) directional_recommendation_json="$upload_only_recommendation_json" ;;
+		false:true) directional_recommendation_json="$download_only_recommendation_json" ;;
+		true:true)
+			# First prefer the topology which met the full profile gates in both
+			# repeats (90% rather than manual-only 75% confidence), then the lower
+			# worst loaded delay. Stable ties keep upload shaping because ingress
+			# bypass is the older, more widely exercised runtime topology.
+			if awk -v upload_confidence="$upload_only_recommendation_confidence" \
+				-v download_confidence="$download_only_recommendation_confidence" \
+				-v upload_delay="$(maximum_number "$upload_only_first_delta" "$upload_only_second_delta")" \
+				-v download_delay="$(maximum_number "$download_only_first_delta" "$download_only_second_delta")" \
+				'BEGIN {
+					exit(download_confidence > upload_confidence ||
+					    (download_confidence == upload_confidence && download_delay < upload_delay) ? 0 : 1)
+				}'; then
+				directional_recommendation_json="$download_only_recommendation_json"
+			else
+				directional_recommendation_json="$upload_only_recommendation_json"
+			fi
+			;;
+		*)
+			directional_recommendation_json="{\"tested\":true,\"current_topology\":\"both_shaped\",\"recommended_topology\":\"manual_review\",\"manual_only\":true,\"reason\":\"one-sided-benefit-not-repeatable\",\"confidence_percent\":40,\"repeatable\":false,\"observations\":[]}"
+			;;
+	esac
+}
+
+proposal_identity() {
+	proposal_identity_topology="$1"
+	proposal_identity_action="$2"
+	proposal_identity_payload="$3"
+	proposal_identity_digest="$(printf '%s\n' \
+		"${worker_token:-unknown}|$proposal_identity_topology|$proposal_identity_action|$proposal_identity_payload" |
+		sha256sum 2>/dev/null | awk 'NR == 1 { print $1; exit }')"
+	case "$proposal_identity_digest" in
+		????????????????????????????????????????????????????????????????)
+			case "$proposal_identity_digest" in *[!0-9a-f]*) return 1 ;; esac
+			printf 'p-%s\n' "$(printf '%s' "$proposal_identity_digest" | cut -c1-24)"
+			;;
+		*) return 1 ;;
+	esac
+}
+
+append_unmet_objective() {
+	unmet_objective="$1"
+	escaped_unmet_objective="$(json_escape "$unmet_objective")"
+	if [ -n "${proposal_unmet_objectives:-}" ]; then
+		proposal_unmet_objectives="$proposal_unmet_objectives,\"$escaped_unmet_objective\""
+	else
+		proposal_unmet_objectives="\"$escaped_unmet_objective\""
+	fi
+}
+
+build_result_proposals() {
+	# Schema 1 is intentionally embedded in the current terminal envelope first.
+	# LuCI and apply-guard can validate it before the terminal schema is advanced,
+	# avoiding a release which displays a topology it cannot safely apply.
+	proposals_json=""
+	proposal_count=0
+	shaped_candidate=""
+	upload_only_candidate=""
+	download_only_candidate=""
+	no_sqm_candidate=""
+	no_sqm_target_met=false
+	proposal_effective_delta_ms="$(maximum_number "$effective_loaded_delta_ms" "$bidirectional_effective_delta_ms")"
+	proposal_unmet_objectives=""
+	[ "$profile_target_met" = true ] || append_unmet_objective profile-target
+	[ "$profile_capacity_floor_met" = true ] || append_unmet_objective retention-objective
+	[ "$bidirectional_realization_pass" = true ] || append_unmet_objective candidate-realization
+	[ "$confidence_mode" = normal ] || append_unmet_objective measurement-confidence
+
+	shaped_hard_safety_pass=false
+	[ "$validation_safety_pass" = true ] && [ "$bidirectional_safety_pass" = true ] &&
+		[ "$profile_floor_infeasible" != true ] &&
+		[ "${dl_runtime_minimum_valid:-true}" = true ] &&
+		[ "${ul_runtime_minimum_valid:-true}" = true ] &&
+		[ "$phase_evidence_complete" = true ] && shaped_hard_safety_pass=true
+	if [ "$shaped_hard_safety_pass" = true ]; then
+		shaped_proposal_id="$(proposal_identity both_shaped apply_sqm \
+			"$proposal|$validation_json|$bidirectional_confirmation_json")" ||
+			fail "Unable to bind the shaped proposal to its measurement evidence."
+		shaped_candidate="{\"schema_version\":1,\"proposal_id\":\"$shaped_proposal_id\",\"rank\":0,\"action\":\"apply_sqm\",\"topology\":\"both_shaped\",\"is_primary\":false,\"applicable\":true,\"hard_safety_pass\":true,\"profile_target_met\":$profile_target_met,\"profile_objectives_met\":$([ "$profile_target_met" = true ] && [ "$profile_capacity_floor_met" = true ] && printf true || printf false),\"grade\":\"$(json_escape "$profile_actual_grade")\",\"effective_delta_ms\":$proposal_effective_delta_ms,\"confidence_percent\":$overall_confidence_percent,\"unmet_objectives\":[${proposal_unmet_objectives:-}],\"evidence\":{\"validation\":\"validation\",\"confirmation\":\"bidirectional_confirmation\"},\"configuration\":$proposal}"
+	fi
+
+	if [ "$phase_evidence_complete" = true ] &&
+	   [ "${ul_runtime_minimum_valid:-true}" = true ] &&
+	   [ "$(extract_json "$upload_only_recommendation_json" '@.tested' 2>/dev/null || true)" = true ] &&
+	   [ "$(extract_json "$upload_only_recommendation_json" '@.repeatable' 2>/dev/null || true)" = true ] &&
+	   [ "$(extract_json "$upload_only_recommendation_json" '@.observations[0].hard_safety_pass' 2>/dev/null || true)" = true ] &&
+	   [ "$(extract_json "$upload_only_recommendation_json" '@.observations[1].hard_safety_pass' 2>/dev/null || true)" = true ]; then
+		upload_only_first_delta="$(extract_json "$upload_only_recommendation_json" '@.observations[0].effective_delta_ms')" ||
+			fail "The upload-only proposal lost its first delay observation."
+		upload_only_second_delta="$(extract_json "$upload_only_recommendation_json" '@.observations[1].effective_delta_ms')" ||
+			fail "The upload-only proposal lost its repeated delay observation."
+		upload_only_delta="$(maximum_number "$upload_only_first_delta" "$upload_only_second_delta")"
+		upload_only_grade="$(quality_grade_for_delta "$upload_only_delta")"
+		upload_only_target_met="$(awk -v actual="$upload_only_delta" -v limit="$validation_delay_max_ms" 'BEGIN {
+			print (actual <= limit) ? "true" : "false"
+		}')"
+		upload_only_first_dl="$(extract_json "$upload_only_recommendation_json" '@.observations[0].observation.throughput_kbps.download_kbps')" ||
+			fail "The upload-only proposal lost its first download observation."
+		upload_only_second_dl="$(extract_json "$upload_only_recommendation_json" '@.observations[1].observation.throughput_kbps.download_kbps')" ||
+			fail "The upload-only proposal lost its repeated download observation."
+		upload_only_first_ul="$(extract_json "$upload_only_recommendation_json" '@.observations[0].observation.throughput_kbps.upload_kbps')" ||
+			fail "The upload-only proposal lost its first upload observation."
+		upload_only_second_ul="$(extract_json "$upload_only_recommendation_json" '@.observations[1].observation.throughput_kbps.upload_kbps')" ||
+			fail "The upload-only proposal lost its repeated upload observation."
+		upload_only_capacity_met="$(awk \
+			-v dl1="$upload_only_first_dl" -v dl2="$upload_only_second_dl" \
+			-v ul1="$upload_only_first_ul" -v ul2="$upload_only_second_ul" \
+			-v raw_dl="$raw_dl_low" -v raw_ul="$raw_ul_low" \
+			-v floor="$profile_capacity_floor" 'BEGIN {
+			dl = (dl1 < dl2) ? dl1 : dl2
+			ul = (ul1 < ul2) ? ul1 : ul2
+			print (raw_dl > 0 && raw_ul > 0 && dl * 100 / raw_dl >= floor && ul * 100 / raw_ul >= floor) ? "true" : "false"
+		}')"
+		upload_only_unmet_objectives=""
+		proposal_unmet_objectives=""
+		[ "$upload_only_target_met" = true ] || append_unmet_objective profile-target
+		[ "$upload_only_capacity_met" = true ] || append_unmet_objective retention-objective
+		upload_only_first_realization="$(extract_json "$upload_only_recommendation_json" '@.observations[0].upload_realization_percent')" ||
+			fail "The upload-only proposal lost its first realization observation."
+		upload_only_second_realization="$(extract_json "$upload_only_recommendation_json" '@.observations[1].upload_realization_percent')" ||
+			fail "The upload-only proposal lost its repeated realization observation."
+		if awk -v first="$upload_only_first_realization" -v second="$upload_only_second_realization" \
+			-v objective="$validation_candidate_realization_min_percent" 'BEGIN {
+				exit(first < objective || second < objective ? 0 : 1)
+			}'; then
+			append_unmet_objective candidate-realization
+		fi
+		if [ "$(extract_json "$upload_only_recommendation_json" '@.observations[0].material_benefit')" != true ] ||
+		   [ "$(extract_json "$upload_only_recommendation_json" '@.observations[1].material_benefit')" != true ]; then
+			append_unmet_objective throughput-benefit-unproven
+		fi
+		if awk -v candidate="$upload_only_delta" -v shaped="$proposal_effective_delta_ms" 'BEGIN {
+			exit(candidate > shaped + 10 ? 0 : 1)
+		}'; then
+			append_unmet_objective latency-worse-than-shaped
+		fi
+		append_unmet_objective download-sqm-disabled
+		upload_only_unmet_objectives="$proposal_unmet_objectives"
+		upload_only_directional_confidence=75
+		[ "$(extract_json "$upload_only_recommendation_json" '@.observations[0].pass')" = true ] &&
+			[ "$(extract_json "$upload_only_recommendation_json" '@.observations[1].pass')" = true ] &&
+			upload_only_directional_confidence=90
+		upload_only_confidence="$(awk -v overall="$overall_confidence_percent" -v directional="$upload_only_directional_confidence" 'BEGIN {
+			printf "%d", (overall < directional) ? overall : directional
+		}')"
+		upload_only_proposal_id="$(proposal_identity upload_only_shaped apply_sqm \
+			"$proposal|$upload_only_recommendation_json")" ||
+			fail "Unable to bind the upload-only proposal to its measurement evidence."
+		upload_only_candidate="{\"schema_version\":1,\"proposal_id\":\"$upload_only_proposal_id\",\"rank\":0,\"action\":\"apply_sqm\",\"topology\":\"upload_only_shaped\",\"is_primary\":false,\"applicable\":true,\"hard_safety_pass\":true,\"profile_target_met\":$upload_only_target_met,\"profile_objectives_met\":$([ "$upload_only_target_met" = true ] && [ "$upload_only_capacity_met" = true ] && printf true || printf false),\"grade\":\"$(json_escape "$upload_only_grade")\",\"effective_delta_ms\":$upload_only_delta,\"confidence_percent\":$upload_only_confidence,\"unmet_objectives\":[${upload_only_unmet_objectives:-}],\"evidence\":{\"recommendation\":\"directional_comparisons.upload_only\"},\"configuration\":$proposal}"
+	fi
+
+	if [ "$phase_evidence_complete" = true ] &&
+	   [ "${dl_runtime_minimum_valid:-true}" = true ] &&
+	   [ "$(extract_json "$download_only_recommendation_json" '@.tested' 2>/dev/null || true)" = true ] &&
+	   [ "$(extract_json "$download_only_recommendation_json" '@.repeatable' 2>/dev/null || true)" = true ] &&
+	   [ "$(extract_json "$download_only_recommendation_json" '@.observations[0].hard_safety_pass' 2>/dev/null || true)" = true ] &&
+	   [ "$(extract_json "$download_only_recommendation_json" '@.observations[1].hard_safety_pass' 2>/dev/null || true)" = true ]; then
+		download_only_first_delta="$(extract_json "$download_only_recommendation_json" '@.observations[0].effective_delta_ms')" ||
+			fail "The download-only proposal lost its first delay observation."
+		download_only_second_delta="$(extract_json "$download_only_recommendation_json" '@.observations[1].effective_delta_ms')" ||
+			fail "The download-only proposal lost its repeated delay observation."
+		download_only_delta="$(maximum_number "$download_only_first_delta" "$download_only_second_delta")"
+		download_only_grade="$(quality_grade_for_delta "$download_only_delta")"
+		download_only_target_met="$(awk -v actual="$download_only_delta" -v limit="$validation_delay_max_ms" 'BEGIN {
+			print (actual <= limit) ? "true" : "false"
+		}')"
+		download_only_first_dl="$(extract_json "$download_only_recommendation_json" '@.observations[0].observation.throughput_kbps.download_kbps')" ||
+			fail "The download-only proposal lost its first download observation."
+		download_only_second_dl="$(extract_json "$download_only_recommendation_json" '@.observations[1].observation.throughput_kbps.download_kbps')" ||
+			fail "The download-only proposal lost its repeated download observation."
+		download_only_first_ul="$(extract_json "$download_only_recommendation_json" '@.observations[0].observation.throughput_kbps.upload_kbps')" ||
+			fail "The download-only proposal lost its first upload observation."
+		download_only_second_ul="$(extract_json "$download_only_recommendation_json" '@.observations[1].observation.throughput_kbps.upload_kbps')" ||
+			fail "The download-only proposal lost its repeated upload observation."
+		download_only_capacity_met="$(awk \
+			-v dl1="$download_only_first_dl" -v dl2="$download_only_second_dl" \
+			-v ul1="$download_only_first_ul" -v ul2="$download_only_second_ul" \
+			-v raw_dl="$raw_dl_low" -v raw_ul="$raw_ul_low" \
+			-v floor="$profile_capacity_floor" 'BEGIN {
+			dl = (dl1 < dl2) ? dl1 : dl2
+			ul = (ul1 < ul2) ? ul1 : ul2
+			print (raw_dl > 0 && raw_ul > 0 && dl * 100 / raw_dl >= floor && ul * 100 / raw_ul >= floor) ? "true" : "false"
+		}')"
+		proposal_unmet_objectives=""
+		[ "$download_only_target_met" = true ] || append_unmet_objective profile-target
+		[ "$download_only_capacity_met" = true ] || append_unmet_objective retention-objective
+		download_only_first_realization="$(extract_json "$download_only_recommendation_json" '@.observations[0].download_realization_percent')" ||
+			fail "The download-only proposal lost its first realization observation."
+		download_only_second_realization="$(extract_json "$download_only_recommendation_json" '@.observations[1].download_realization_percent')" ||
+			fail "The download-only proposal lost its repeated realization observation."
+		if awk -v first="$download_only_first_realization" -v second="$download_only_second_realization" \
+			-v objective="$validation_candidate_realization_min_percent" 'BEGIN {
+				exit(first < objective || second < objective ? 0 : 1)
+			}'; then
+			append_unmet_objective candidate-realization
+		fi
+		if [ "$(extract_json "$download_only_recommendation_json" '@.observations[0].material_benefit')" != true ] ||
+		   [ "$(extract_json "$download_only_recommendation_json" '@.observations[1].material_benefit')" != true ]; then
+			append_unmet_objective throughput-benefit-unproven
+		fi
+		if awk -v candidate="$download_only_delta" -v shaped="$proposal_effective_delta_ms" 'BEGIN {
+			exit(candidate > shaped + 10 ? 0 : 1)
+		}'; then
+			append_unmet_objective latency-worse-than-shaped
+		fi
+		append_unmet_objective upload-sqm-disabled
+		download_only_unmet_objectives="$proposal_unmet_objectives"
+		download_only_directional_confidence=75
+		[ "$(extract_json "$download_only_recommendation_json" '@.observations[0].pass')" = true ] &&
+			[ "$(extract_json "$download_only_recommendation_json" '@.observations[1].pass')" = true ] &&
+			download_only_directional_confidence=90
+		download_only_confidence="$(awk -v overall="$overall_confidence_percent" -v directional="$download_only_directional_confidence" 'BEGIN {
+			printf "%d", (overall < directional) ? overall : directional
+		}')"
+		download_only_proposal_id="$(proposal_identity download_only_shaped apply_sqm \
+			"$proposal|$download_only_recommendation_json")" ||
+			fail "Unable to bind the download-only proposal to its measurement evidence."
+		download_only_candidate="{\"schema_version\":1,\"proposal_id\":\"$download_only_proposal_id\",\"rank\":0,\"action\":\"apply_sqm\",\"topology\":\"download_only_shaped\",\"is_primary\":false,\"applicable\":true,\"hard_safety_pass\":true,\"profile_target_met\":$download_only_target_met,\"profile_objectives_met\":$([ "$download_only_target_met" = true ] && [ "$download_only_capacity_met" = true ] && printf true || printf false),\"grade\":\"$(json_escape "$download_only_grade")\",\"effective_delta_ms\":$download_only_delta,\"confidence_percent\":$download_only_confidence,\"unmet_objectives\":[${download_only_unmet_objectives:-}],\"evidence\":{\"recommendation\":\"directional_comparisons.download_only\"},\"configuration\":$proposal}"
+	fi
+
+	no_sqm_source=""
+	no_sqm_evidence_path=""
+	if [ "$calibration_strategy" = full_raw ] && raw_control_hard_safety "$raw_control_json"; then
+		no_sqm_source="$raw_control_json"
+		no_sqm_evidence_path=raw_control
+	elif [ "$autotune_profile" = fair ] && [ "${fair_disable_available:-false}" = true ] &&
+	     raw_control_hard_safety "$fair_control_json"; then
+		# Compatibility path for a typed Fair control retained separately from the
+		# generic raw-control field by an older producer.
+		no_sqm_source="$fair_control_json"
+		no_sqm_evidence_path=fair_outcome.no_sqm_control
+	fi
+	if [ -n "$no_sqm_source" ]; then
+		no_sqm_proposal_id="$(proposal_identity no_sqm disable_sqm "$no_sqm_source")" ||
+			fail "Unable to bind the no-SQM proposal to its measurement evidence."
+		no_sqm_grade="$(extract_json "$no_sqm_source" '@.grade')" ||
+			fail "The no-SQM proposal lost its measured grade."
+		no_sqm_delta="$(extract_json "$no_sqm_source" '@.effective_delta_ms')" ||
+			fail "The no-SQM proposal lost its measured delay."
+		case "$autotune_profile:$no_sqm_grade" in
+			fair:A+|fair:A|fair:B|fair:C) no_sqm_target_met=true ;;
+			gaming:A+|gaming_extreme:A+) no_sqm_target_met=true ;;
+			best_overall:A+|best_overall:A) no_sqm_target_met=true ;;
+			variable_link:A+|variable_link:A|variable_link:B) no_sqm_target_met=true ;;
+			*) no_sqm_target_met=false ;;
+		esac
+		proposal_unmet_objectives=""
+		[ "$no_sqm_target_met" = true ] || append_unmet_objective profile-target
+		no_sqm_raw_dl="$(extract_json "$no_sqm_source" '@.throughput.download_kbps')"
+		no_sqm_raw_ul="$(extract_json "$no_sqm_source" '@.throughput.upload_kbps')"
+		no_sqm_dl_gain="$(awk -v raw="$no_sqm_raw_dl" -v shaped="${shaped_dl:-0}" 'BEGIN {
+			if (raw <= 0 || shaped <= 0) { print -100; exit }
+			printf "%.3f", (raw / shaped - 1) * 100
+		}')"
+		no_sqm_ul_gain="$(awk -v raw="$no_sqm_raw_ul" -v shaped="${shaped_ul:-0}" 'BEGIN {
+			if (raw <= 0 || shaped <= 0) { print -100; exit }
+			printf "%.3f", (raw / shaped - 1) * 100
+		}')"
+		awk -v dl="$no_sqm_dl_gain" -v ul="$no_sqm_ul_gain" 'BEGIN { exit(dl >= 2 && ul >= 2 ? 0 : 1) }' ||
+			append_unmet_objective throughput-benefit-unproven
+		if awk -v raw_delta="$no_sqm_delta" -v shaped_delta="${proposal_effective_delta_ms:-}" 'BEGIN {
+			number = "^[0-9]+([.][0-9]+)?$"
+			exit(raw_delta ~ number && shaped_delta ~ number && raw_delta > shaped_delta + 10 ? 0 : 1)
+		}'; then
+			append_unmet_objective latency-worse-than-shaped
+		fi
+		no_sqm_unmet="$proposal_unmet_objectives"
+		no_sqm_candidate="{\"schema_version\":1,\"proposal_id\":\"$no_sqm_proposal_id\",\"rank\":0,\"action\":\"disable_sqm\",\"topology\":\"no_sqm\",\"is_primary\":false,\"applicable\":true,\"hard_safety_pass\":true,\"profile_target_met\":$no_sqm_target_met,\"profile_objectives_met\":$no_sqm_target_met,\"grade\":\"$(json_escape "$no_sqm_grade")\",\"effective_delta_ms\":$no_sqm_delta,\"confidence_percent\":$overall_confidence_percent,\"unmet_objectives\":[${no_sqm_unmet:-}],\"evidence\":{\"control\":\"$no_sqm_evidence_path\"},\"configuration\":null}"
+	fi
+
+	# Rank only after every independently evidenced topology is known. A clean
+	# Fair no-SQM recommendation is throughput-first; otherwise a repeatable
+	# one-sided recommendation outranks the both-shaped comparison it improved.
+	if [ "$autotune_profile" = fair ] && [ "${fair_recommended_action:-}" = disable_sqm ] &&
+	   [ -n "$no_sqm_candidate" ]; then
+		proposal_order="no_sqm upload_only download_only shaped"
+	elif [ "$autotune_profile" = variable_link ] && [ "$dl_search_no_cake_effect" = true ] &&
+	     [ "$ul_search_no_cake_effect" = true ] && [ -n "$no_sqm_candidate" ]; then
+		proposal_order="no_sqm upload_only download_only shaped"
+	elif [ "${no_sqm_target_met:-false}" = true ] && [ "${profile_target_met:-false}" != true ] &&
+	     [ -n "$no_sqm_candidate" ]; then
+		proposal_order="no_sqm upload_only download_only shaped"
+	else
+		case "$(extract_json "$directional_recommendation_json" '@.recommended_topology' 2>/dev/null || true)" in
+			upload_only_shaped) proposal_order="upload_only download_only shaped no_sqm" ;;
+			download_only_shaped) proposal_order="download_only upload_only shaped no_sqm" ;;
+			*) proposal_order="shaped upload_only download_only no_sqm" ;;
+		esac
+	fi
+	for candidate_name in $proposal_order; do
+		case "$candidate_name" in
+			shaped) ranked_candidate="$shaped_candidate" ;;
+			upload_only) ranked_candidate="$upload_only_candidate" ;;
+			download_only) ranked_candidate="$download_only_candidate" ;;
+			no_sqm) ranked_candidate="$no_sqm_candidate" ;;
+		esac
+		[ -n "$ranked_candidate" ] || continue
+		proposal_count=$((proposal_count + 1))
+		[ "$proposal_count" -le 4 ] || break
+		candidate_primary=false
+		[ "$proposal_count" -eq 1 ] && candidate_primary=true
+		ranked_candidate="$(printf '%s\n' "$ranked_candidate" |
+			sed "s/\"rank\":0/\"rank\":$proposal_count/;s/\"is_primary\":false/\"is_primary\":$candidate_primary/")"
+		proposals_json="${proposals_json:+$proposals_json,}$ranked_candidate"
+	done
+	if [ "$proposal_count" -gt 0 ]; then
+		manual_apply_eligible=true
+	else
+		manual_apply_eligible=false
+		auto_apply_eligible=false
+	fi
+	[ "$proposal_count" -le 4 ] || fail "Full Auto-Tune produced too many review proposals."
+	proposals_json="[$proposals_json]"
+}
+
+stage_complete_result() {
+	stage_terminal_json result "{\"state\":\"complete\",\"schema_version\":8,\"result_available\":true,\"result_class\":\"$result_class\",\"confidence\":$confidence_json,\"auto_apply_eligible\":$auto_apply_eligible,\"manual_apply_eligible\":$manual_apply_eligible,\"phase_evidence_complete\":$phase_evidence_complete,\"phase_contamination_seen\":$phase_contamination_seen,\"job_id\":\"$(json_escape "$job_name")\",\"target_interface\":\"$(json_escape "$target_if_input")\",\"resolved_interface\":\"$(json_escape "$target_if")\",\"source_ip\":\"$(json_escape "$source_ip")\",\"external_ip\":\"$(json_escape "$selected_external_ip")\",\"route_interface\":\"$(json_escape "$route_if")\",\"route_mode\":\"$(json_escape "$route_mode")\",\"mwan3_member\":\"$(json_escape "$mwan3_member")\",\"route_identity\":\"$(json_escape "$route_identity")\",\"link_kind\":\"$(json_escape "$link_kind")\",\"datapath\":$datapath_json,\"conservative\":$([ "$conservative_mode" = 1 ] && printf true || printf false),\"confidence_mode\":\"$confidence_mode\",\"background\":$(background_json),\"phase_background\":[$phase_background_runs_json],\"usable_directions\":{\"download\":${background_dl_usable:-true},\"upload\":${background_ul_usable:-true}},\"validation_thresholds\":{\"candidate_realization_min_percent\":$validation_candidate_realization_min_percent,\"candidate_realization_max_percent\":$validation_candidate_realization_max_percent,\"capacity_retention_min_percent\":$validation_capacity_retention_min_percent,\"throughput_safety_floor_percent\":50,\"delay_max_ms\":$validation_delay_max_ms,\"manual_latency_review_max_ms\":$validation_manual_latency_review_max_ms,\"loss_max_percent\":$validation_loss_max_percent,\"cpu_max_percent\":$validation_cpu_max_percent},\"baseline\":{\"median_ms\":$idle_median_ms,\"p95_ms\":$idle_p95_ms,\"samples\":$baseline_samples,\"transport_median_ms\":$transport_idle_median_ms,\"transport_p95_ms\":$transport_idle_p95_ms,\"transport_samples\":$transport_idle_samples,\"transport_backend\":\"$(json_escape "$transport_probe_backend")\",\"transport_endpoint\":\"$(json_escape "$transport_probe_endpoint")\"},\"runs\":[$runs_json],\"raw_control\":$raw_control_json,\"validation_attempts\":[$validation_attempts_json],\"validation\":$validation_json,\"bidirectional_confirmation\":$bidirectional_confirmation_json,\"directional_recommendation\":$directional_recommendation_json,\"directional_comparisons\":$directional_comparisons_json,\"profile_outcome\":$profile_outcome_json,\"profile_search\":{\"download\":$dl_search_json,\"upload\":$ul_search_json},\"fair_outcome\":$fair_outcome_json,\"pinger_plan\":$pinger_plan,\"proposal\":$proposal,\"proposals\":$proposals_json,\"configuration_written\":false}"
+}
+
+complete_raw_only_review() {
+	raw_only_reason="$1"
+	[ "$calibration_strategy" = full_raw ] || return 1
+	raw_control_hard_safety "$raw_control_json" || return 1
+
+	# No shaped rate is admitted here.  The reference proposal remains in the
+	# envelope only to bind profile policy and immutable run identity; the sole
+	# applicable candidate has configuration:null and is revalidated from raw.
+	validation_safety_pass=false
+	bidirectional_safety_pass=true
+	bidirectional_realization_pass=true
+	profile_floor_infeasible=true
+	profile_target_met=false
+	profile_capacity_floor_met=false
+	dl_runtime_minimum_valid=false
+	ul_runtime_minimum_valid=false
+	profile_actual_grade="$(extract_json "$raw_control_json" '@.grade')" || return 1
+	bidirectional_confirmation_json=null
+	directional_recommendation_json=null
+	directional_comparisons_json='{"upload_only":null,"download_only":null}'
+	fair_outcome_json=null
+	profile_target_grade="$(extract_json "$proposal" '@.target_grade')" || return 1
+	profile_outcome_json="{\"mode\":\"raw-only-safe-review\",\"objective\":\"independent-no-sqm-fallback\",\"target_grade\":\"$(json_escape "$profile_target_grade")\",\"target_met\":false,\"actual_grade\":\"$(json_escape "$profile_actual_grade")\",\"capacity_floor_met\":false,\"throughput_safety_floor_met\":false,\"manual_only\":true,\"shaped_search_available\":false,\"infeasible_reason\":\"$(json_escape "$raw_only_reason")\",\"download\":$dl_search_json,\"upload\":$ul_search_json}"
+	# The full-raw control itself is bidirectional, so missing shaped confirmation
+	# does not lower its independent quality evidence.  Candidate admission below
+	# still depends on the raw loss/latency/background/bypass hard gates.
+	dl_candidate_realization=""
+	ul_candidate_realization=""
+	build_autotune_confidence
+	confidence_mode=normal
+	[ "$overall_confidence_percent" -ge 85 ] || confidence_mode=low
+	auto_apply_eligible=false
+	manual_apply_eligible=false
+	build_result_proposals
+	[ "$proposal_count" -eq 1 ] || return 1
+	[ "$(extract_json "$proposals_json" '@[0].topology' 2>/dev/null || true)" = no_sqm ] || return 1
+	stage_complete_result
 }
 
 append_profile_search_observation() {
@@ -5494,20 +6419,33 @@ run_profile_direction_search() {
 	search_next="$(extract_json "$search_decision" '@.next_candidate_kbps' 2>/dev/null || true)"
 	search_selected="$(extract_json "$search_decision" '@.selected.candidate_kbps' 2>/dev/null || true)"
 	search_selected_safety="$(extract_json "$search_decision" '@.selected.safety_pass' 2>/dev/null || true)"
+	search_selected_manual_reviewable="$(extract_json "$search_decision" '@.selected.manual_reviewable' 2>/dev/null || true)"
+	search_selected_realization="$(extract_json "$search_decision" '@.selected.realization_percent' 2>/dev/null || true)"
 	search_selected_target="$(extract_json "$search_decision" '@.selected.target_met' 2>/dev/null || true)"
+	search_selected_retention="$(extract_json "$search_decision" '@.selected.retention_percent' 2>/dev/null || true)"
 	search_selected_grade="$(extract_json "$search_decision" '@.selected.grade' 2>/dev/null || true)"
 	search_runtime_minimum="$(extract_json "$search_decision" '@.runtime_minimum_kbps' 2>/dev/null || true)"
 	search_runtime_minimum_index="$(extract_json "$search_decision" '@.runtime_minimum_observation_index' 2>/dev/null || true)"
 	search_knee_detected="$(extract_json "$search_decision" '@.knee_detected' 2>/dev/null || true)"
+	search_no_cake_effect="$(extract_json "$search_decision" '@.no_cake_effect' 2>/dev/null || true)"
+	search_noisy="$(extract_json "$search_decision" '@.noisy' 2>/dev/null || true)"
+	search_inconclusive="$(extract_json "$search_decision" '@.inconclusive' 2>/dev/null || true)"
+	for search_boolean in "$search_knee_detected" "$search_no_cake_effect" "$search_noisy" "$search_inconclusive"; do
+		case "$search_boolean" in true|false) ;; *) return 1 ;; esac
+	done
+	[ "$search_knee_detected" != true ] || [ "$search_no_cake_effect" = false ] || return 1
+	[ "$search_knee_detected" != true ] || [ "$search_noisy" = false ] || return 1
 	case "$search_action" in
 		test) is_positive_uint "$search_next" || return 1 ;;
 		complete|fallback)
 			is_positive_uint "$search_selected" || return 1
 			case "$search_selected_safety" in true|false) ;; *) return 1 ;; esac
+			case "$search_selected_manual_reviewable" in true|false) ;; *) return 1 ;; esac
 			if [ "$search_selected_safety" != true ]; then
 				[ "$search_action" = fallback ] || return 1
 				case "$search_reason" in
 					repeatable-compute-ceiling-below-capacity-floor|repeatable-shaper-ceiling-below-capacity-floor|repeatable-shaper-ceiling-below-safety-floor) ;;
+					bounded-low-realization-review) [ "$autotune_profile" = variable_link ] || return 1 ;;
 					*) return 1 ;;
 				esac
 			fi
@@ -5519,7 +6457,60 @@ run_profile_direction_search() {
 				search_runtime_evaluated_index=$((search_runtime_minimum_index - 1))
 				search_runtime_evaluated_rate="$(extract_json "$search_decision" "@.evaluated[$search_runtime_evaluated_index].candidate_kbps" 2>/dev/null || true)"
 				[ "$search_runtime_evaluated_rate" = "$search_runtime_minimum" ] || return 1
-				[ "$search_knee_detected" = true ] || return 1
+				if [ "$search_no_cake_effect" = true ]; then
+					[ "$search_action" = fallback ] &&
+						[ "$search_reason" = queue-outside-cake-control ] &&
+						[ "$search_knee_detected" = false ] &&
+						[ "$search_noisy" = false ] &&
+						[ "$search_inconclusive" = false ] &&
+						[ "$search_selected_target" = true ] &&
+						[ "$search_runtime_minimum" = "$search_selected" ] || return 1
+					LC_ALL=C awk -v value="$search_selected_retention" 'BEGIN {
+						exit(value ~ /^[0-9]+([.][0-9]+)?$/ && value >= 50 && value <= 100 ? 0 : 1)
+					}' || return 1
+				elif [ "$search_reason" = exploration-floor-reached ]; then
+					[ "$search_action" = fallback ] &&
+						[ "$search_knee_detected" = false ] &&
+						[ "$search_noisy" = false ] &&
+						[ "$search_inconclusive" = false ] &&
+						[ "$search_selected_target" = true ] &&
+						[ "$search_runtime_minimum" = "$search_selected" ] || return 1
+					LC_ALL=C awk -v value="$search_selected_retention" 'BEGIN {
+						exit(value ~ /^[0-9]+([.][0-9]+)?$/ && value >= 50 && value <= 100 ? 0 : 1)
+					}' || return 1
+				elif [ "$search_reason" = noisy-link-safe-review ]; then
+					[ "$search_action" = fallback ] &&
+						[ "$search_knee_detected" = false ] &&
+						[ "$search_no_cake_effect" = false ] &&
+						[ "$search_noisy" = true ] &&
+						[ "$search_inconclusive" = false ] &&
+						[ "$search_runtime_minimum" = "$search_selected" ] || return 1
+					LC_ALL=C awk -v value="$search_selected_retention" 'BEGIN {
+						exit(value ~ /^[0-9]+([.][0-9]+)?$/ && value >= 50 && value <= 100 ? 0 : 1)
+					}' || return 1
+				elif [ "$search_reason" = bounded-low-realization-review ]; then
+					[ "$search_action" = fallback ] &&
+						[ "$search_selected_safety" = false ] &&
+						[ "$search_selected_manual_reviewable" = true ] &&
+						[ "$search_knee_detected" = false ] &&
+						[ "$search_no_cake_effect" = false ] &&
+						[ "$search_noisy" = false ] &&
+						[ "$search_inconclusive" = false ] &&
+						[ "$search_runtime_minimum" = "$search_selected" ] || return 1
+					LC_ALL=C awk -v realization="$search_selected_realization" \
+						-v retention="$search_selected_retention" \
+						-v strict_min="$validation_candidate_realization_min_percent" \
+						-v strict_max="$validation_candidate_realization_max_percent" 'BEGIN {
+							number = "^[0-9]+([.][0-9]+)?$"
+							exit(realization ~ number && retention ~ number && strict_min ~ number && strict_max ~ number &&
+								realization >= 50 && realization < strict_min && realization <= strict_max &&
+								retention >= 50 && retention <= 100 ? 0 : 1)
+						}' || return 1
+				else
+					[ "$search_knee_detected" = true ] &&
+						[ "$search_noisy" = false ] &&
+						[ "$search_inconclusive" = false ] || return 1
+				fi
 			elif [ "$autotune_profile" = gaming_extreme ]; then
 				is_positive_uint "$search_runtime_minimum" || return 1
 				is_positive_uint "$search_runtime_minimum_index" || return 1
@@ -5538,9 +6529,15 @@ run_profile_direction_search() {
 			dl_search_next="$search_next"
 			dl_search_selected="$search_selected"
 			dl_search_selected_safety="$search_selected_safety"
+			dl_search_selected_manual_reviewable="$search_selected_manual_reviewable"
 			dl_search_selected_target="$search_selected_target"
 			dl_search_selected_grade="$search_selected_grade"
 			dl_search_runtime_minimum="$search_runtime_minimum"
+			dl_search_no_cake_effect="$search_no_cake_effect"
+			case "$search_reason" in
+				exploration-floor-reached|noisy-link-safe-review|bounded-low-realization-review) dl_search_manual_fallback=true ;;
+				*) dl_search_manual_fallback=false ;;
+			esac
 			;;
 		upload)
 			ul_search_json="$search_decision"
@@ -5549,9 +6546,15 @@ run_profile_direction_search() {
 			ul_search_next="$search_next"
 			ul_search_selected="$search_selected"
 			ul_search_selected_safety="$search_selected_safety"
+			ul_search_selected_manual_reviewable="$search_selected_manual_reviewable"
 			ul_search_selected_target="$search_selected_target"
 			ul_search_selected_grade="$search_selected_grade"
 			ul_search_runtime_minimum="$search_runtime_minimum"
+			ul_search_no_cake_effect="$search_no_cake_effect"
+			case "$search_reason" in
+				exploration-floor-reached|noisy-link-safe-review|bounded-low-realization-review) ul_search_manual_fallback=true ;;
+				*) ul_search_manual_fallback=false ;;
+			esac
 			;;
 	esac
 	worker_trace "optimizer direction=$search_direction action=$search_action reason=$(json_escape "$search_reason") next=${search_next:-none} selected=${search_selected:-none} grade=${search_selected_grade:-none}"
@@ -5783,6 +6786,8 @@ run_job() {
 	conservative_mode="${conservative_override:-0}"
 	cancelled=0
 	temp_shaper_active=0
+	temp_ingress_active=0
+	temp_egress_active=0
 	temp_ifb_created=0
 	created_temp_ifb_ifindex=""
 	temp_download_kbps=""
@@ -5878,7 +6883,7 @@ run_job() {
 	[ "$worker_registered" = true ] || fail "Full Auto-Tune worker identity could not be registered safely."
 
 	preflight
-	if [ "$traffic_budget_bytes" -gt 0 ] 2>/dev/null; then
+	if uint53_is_positive "$traffic_budget_bytes"; then
 		traffic_budget_start_bytes="$(interface_total_bytes "$target_if")" ||
 			fail "Scheduled Full Auto-Tune could not read the selected uplink traffic counters."
 	fi
@@ -5948,6 +6953,7 @@ run_job() {
 	selected_server_id=""
 	selected_external_ip=""
 	fair_control_json=null
+	raw_control_json=null
 	fair_control_active=0
 	run_measurement 1
 	validate_deferred_baseline_capacity "$calibration_capacity_dl_kbps" "$calibration_capacity_ul_kbps"
@@ -5995,6 +7001,12 @@ run_job() {
 	ul_search_json=null
 	dl_search_selected_safety=""
 	ul_search_selected_safety=""
+	dl_search_selected_manual_reviewable=false
+	ul_search_selected_manual_reviewable=false
+	dl_search_no_cake_effect=false
+	ul_search_no_cake_effect=false
+	dl_search_manual_fallback=false
+	ul_search_manual_fallback=false
 	profile_search_inconclusive=false
 	profile_search_inconclusive_reason=""
 	fair_outcome_json=null
@@ -6049,8 +7061,15 @@ run_job() {
 		validation_attempt_number=$((validation_attempt_number + 1))
 	done
 	if [ "$profile_search_inconclusive" = true ] || [ "$dl_search_active" = true ] || [ "$ul_search_active" = true ]; then
+		profile_search_terminal_reason="profile-search-inconclusive:${profile_search_inconclusive_reason:-bounded-search-did-not-finish}"
+		# Optimizer uncertainty is not phase corruption.  When the independent
+		# full-raw control is clean, finish with that exact no-SQM topology rather
+		# than discarding useful evidence or inventing a shaped rate.
+		if complete_raw_only_review "$profile_search_terminal_reason"; then
+			return 0
+		fi
 		phase_evidence_complete=false
-		measurement_inconclusive validation "profile-search-inconclusive:${profile_search_inconclusive_reason:-bounded-search-did-not-finish}"
+		measurement_inconclusive validation "$profile_search_terminal_reason"
 	fi
 
 	selected_dl_candidate="$dl_search_selected"
@@ -6059,21 +7078,21 @@ run_job() {
 		fail "The bounded profile search found no candidate above the configured capacity safety floor."
 	profile_floor_infeasible=false
 	profile_floor_infeasible_reason=""
-	if [ "$dl_search_selected_safety" = false ]; then
+	if [ "$dl_search_selected_safety" = false ] &&
+	   [ "$dl_search_selected_manual_reviewable" != true ]; then
 		profile_floor_infeasible=true
 		profile_floor_infeasible_reason="download:$dl_search_reason"
 	fi
-	if [ "$ul_search_selected_safety" = false ]; then
+	if [ "$ul_search_selected_safety" = false ] &&
+	   [ "$ul_search_selected_manual_reviewable" != true ]; then
 		profile_floor_infeasible=true
 		[ -n "$profile_floor_infeasible_reason" ] &&
 			profile_floor_infeasible_reason="$profile_floor_infeasible_reason;"
 		profile_floor_infeasible_reason="${profile_floor_infeasible_reason}upload:$ul_search_reason"
 	fi
-	if [ "$profile_floor_infeasible" = true ] && [ "$autotune_profile" != fair ]; then
-		validation_error="The bounded search found no candidate that reliably controlled the current link (${profile_floor_infeasible_reason}); no configuration was written."
-		stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":7,\"stage\":\"validation\",\"error\":\"$(json_escape "$validation_error")\",\"reason\":\"profile-safety-floor-infeasible\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":$phase_evidence_complete,\"phase_contamination_seen\":$phase_contamination_seen,\"route_mode\":\"$(json_escape "$route_mode")\",\"route_interface\":\"$(json_escape "$route_if")\",\"route_identity\":\"$(json_escape "$route_identity")\",\"external_ip\":\"$(json_escape "$selected_external_ip")\",\"datapath\":$datapath_json,\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[$runs_json],\"phase_background\":[$phase_background_runs_json],\"validation_attempts\":[$validation_attempts_json],\"validation\":$validation_json,\"profile_search\":{\"download\":$dl_search_json,\"upload\":$ul_search_json},\"fair_outcome\":$fair_outcome_json,\"pinger_plan\":$pinger_plan,\"proposal\":$proposal,\"configuration_written\":false}"
-		exit 1
-	fi
+	# A shaped search miss invalidates only the shaped topology. Keep collecting
+	# independently attributable one-sided and raw evidence: on a variable radio
+	# link those may be the only safe, useful review choices.
 	current_dl_candidate="$(extract_json "$proposal" '@.download.base_kbps')"
 	current_ul_candidate="$(extract_json "$proposal" '@.upload.base_kbps')"
 	if [ "$current_dl_candidate" != "$selected_dl_candidate" ] ||
@@ -6091,21 +7110,33 @@ run_job() {
 		run_shaped_validation "$validation_attempt_number"
 		validation_attempts_json="$validation_attempts_json,$validation_json"
 	fi
-	if [ "$profile_floor_infeasible" != true ] && [ "$validation_safety_pass" != true ]; then
-		validation_error="Selected profile candidate failed final safety confirmation (DL realization ${dl_candidate_realization}%, capacity ${dl_retention}%; UL realization ${ul_candidate_realization}%, capacity ${ul_retention}%; max ICMP +${loaded_delta_ms} ms, transport +${transport_loaded_delta_ms} ms, loss ${loss_percent}%, effective CPU ${cpu_peak}%); no configuration was written."
-		stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":7,\"stage\":\"confirmation\",\"error\":\"$(json_escape "$validation_error")\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":$phase_evidence_complete,\"phase_contamination_seen\":$phase_contamination_seen,\"route_mode\":\"$(json_escape "$route_mode")\",\"route_interface\":\"$(json_escape "$route_if")\",\"route_identity\":\"$(json_escape "$route_identity")\",\"external_ip\":\"$(json_escape "$selected_external_ip")\",\"datapath\":$datapath_json,\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[$runs_json],\"phase_background\":[$phase_background_runs_json],\"validation_attempts\":[$validation_attempts_json],\"validation\":$validation_json,\"profile_search\":{\"download\":$dl_search_json,\"upload\":$ul_search_json},\"fair_outcome\":$fair_outcome_json,\"pinger_plan\":$pinger_plan,\"proposal\":$proposal,\"configuration_written\":false}"
-		exit 1
-	fi
+	# A repeatable final shaped failure excludes both_shaped later. It is not a
+	# terminal measurement failure and must not hide a topology with its own
+	# clean, repeated safety proof.
+	dl_runtime_minimum_valid=true
+	ul_runtime_minimum_valid=true
 	if [ "$autotune_profile" = variable_link ] || [ "$autotune_profile" = gaming_extreme ]; then
-		is_positive_uint "$dl_search_runtime_minimum" &&
-			is_positive_uint "$ul_search_runtime_minimum" ||
-			fail "Measured-minimum search completed without two tested runtime minima."
-		set_exact_profile_candidates "$selected_dl_candidate" "$selected_ul_candidate" \
-			"$dl_search_runtime_minimum" "$ul_search_runtime_minimum" ||
-			fail "Unable to preserve the measured runtime minima."
-		[ "$(extract_json "$proposal" '@.download.minimum_kbps')" = "$dl_search_runtime_minimum" ] &&
-			[ "$(extract_json "$proposal" '@.upload.minimum_kbps')" = "$ul_search_runtime_minimum" ] ||
-			fail "Measured runtime minima were not written to the final proposal."
+		dl_runtime_minimum_valid=false
+		ul_runtime_minimum_valid=false
+		is_positive_uint "$dl_search_runtime_minimum" && dl_runtime_minimum_valid=true
+		is_positive_uint "$ul_search_runtime_minimum" && ul_runtime_minimum_valid=true
+		if [ "$dl_runtime_minimum_valid" = true ] || [ "$ul_runtime_minimum_valid" = true ]; then
+			final_dl_runtime_minimum=""
+			final_ul_runtime_minimum=""
+			[ "$dl_runtime_minimum_valid" = true ] && final_dl_runtime_minimum="$dl_search_runtime_minimum"
+			[ "$ul_runtime_minimum_valid" = true ] && final_ul_runtime_minimum="$ul_search_runtime_minimum"
+			set_exact_profile_candidates "$selected_dl_candidate" "$selected_ul_candidate" \
+				"$final_dl_runtime_minimum" "$final_ul_runtime_minimum" ||
+				fail "Unable to preserve the measured runtime minima."
+			if [ "$dl_runtime_minimum_valid" = true ]; then
+				[ "$(extract_json "$proposal" '@.download.minimum_kbps')" = "$dl_search_runtime_minimum" ] ||
+					fail "The measured download runtime minimum was not written to the final proposal."
+			fi
+			if [ "$ul_runtime_minimum_valid" = true ]; then
+				[ "$(extract_json "$proposal" '@.upload.minimum_kbps')" = "$ul_search_runtime_minimum" ] ||
+					fail "The measured upload runtime minimum was not written to the final proposal."
+			fi
+		fi
 	fi
 
 	# Directional search intentionally isolates DL and UL so each frontier is
@@ -6114,6 +7145,15 @@ run_job() {
 	# multiplying the traffic cost of every search observation.
 	run_bidirectional_confirmation "$((validation_attempt_number + 1))"
 	build_directional_recommendation
+	directional_safe_alternative=false
+	case "$(extract_json "$directional_recommendation_json" '@.recommended_topology')" in
+		upload_only_shaped|download_only_shaped)
+			[ "$(extract_json "$directional_recommendation_json" '@.repeatable')" = true ] &&
+				directional_safe_alternative=true
+			;;
+	esac
+	# Do not terminate on an unsafe simultaneous shaped pair. Each candidate is
+	# admitted below only by its own topology-specific safety evidence.
 
 	profile_target_met="$validation_quality_target_met"
 	[ "$bidirectional_latency_pass" = true ] || profile_target_met=false
@@ -6121,7 +7161,9 @@ run_job() {
 	profile_capacity_floor_met="$validation_profile_objectives_met"
 	profile_deep_runtime_minimum=false
 	profile_runtime_minimum_retention_json=null
-	if [ "$autotune_profile" = gaming_extreme ]; then
+	if [ "$autotune_profile" = gaming_extreme ] &&
+	   [ "$dl_runtime_minimum_valid" = true ] &&
+	   [ "$ul_runtime_minimum_valid" = true ]; then
 		extreme_dl_runtime_retention="$(awk -v minimum="$dl_search_runtime_minimum" -v raw="$raw_dl_low" 'BEGIN {
 			if (raw <= 0) exit 1
 			printf "%.1f", minimum * 100 / raw
@@ -6177,6 +7219,15 @@ run_job() {
 			fair:false:false) profile_outcome_mode=quality-and-throughput-advisory-review; profile_manual_only=true ;;
 		esac
 	fi
+	if [ "$profile_floor_infeasible" != true ]; then
+		if [ "$dl_search_no_cake_effect" = true ] || [ "$ul_search_no_cake_effect" = true ]; then
+			profile_outcome_mode=directional-no-cake-effect-review
+			profile_manual_only=true
+		elif [ "$dl_search_manual_fallback" = true ] || [ "$ul_search_manual_fallback" = true ]; then
+			profile_outcome_mode=variable-link-bounded-evidence-review
+			profile_manual_only=true
+		fi
+	fi
 	[ "$bidirectional_auto_apply_pass" = true ] || profile_manual_only=true
 	profile_objective="$(extract_json "$dl_search_json" '@.objective')"
 	profile_target_grade="$(extract_json "$proposal" '@.target_grade')"
@@ -6185,23 +7236,29 @@ run_job() {
 	validation_grade_rank="$(quality_grade_rank "$validation_actual_grade")" || validation_grade_rank=99
 	bidirectional_grade_rank="$(quality_grade_rank "$bidirectional_grade")" || bidirectional_grade_rank=99
 	[ "$bidirectional_grade_rank" -le "$validation_grade_rank" ] || profile_actual_grade="$bidirectional_grade"
-	profile_outcome_json="{\"mode\":\"$profile_outcome_mode\",\"objective\":\"$(json_escape "$profile_objective")\",\"target_grade\":\"$(json_escape "$profile_target_grade")\",\"target_met\":$profile_target_met,\"actual_grade\":\"$(json_escape "$profile_actual_grade")\",\"capacity_floor_percent\":$profile_capacity_floor,\"capacity_floor_met\":$profile_capacity_floor_met,\"throughput_safety_floor_percent\":50,\"throughput_safety_floor_met\":$profile_safety_floor_met,\"deep_runtime_minimum\":$profile_deep_runtime_minimum,\"runtime_minimum_retention\":$profile_runtime_minimum_retention_json,\"infeasible_reason\":\"$(json_escape "$profile_floor_infeasible_reason")\",\"manual_only\":$profile_manual_only,\"selected_pair\":{\"download_kbps\":$selected_dl_candidate,\"upload_kbps\":$selected_ul_candidate},\"bidirectional_confirmation\":$bidirectional_confirmation_json,\"directional_recommendation\":$directional_recommendation_json,\"download\":$dl_search_json,\"upload\":$ul_search_json}"
+	profile_outcome_json="{\"mode\":\"$profile_outcome_mode\",\"objective\":\"$(json_escape "$profile_objective")\",\"target_grade\":\"$(json_escape "$profile_target_grade")\",\"target_met\":$profile_target_met,\"actual_grade\":\"$(json_escape "$profile_actual_grade")\",\"capacity_floor_percent\":$profile_capacity_floor,\"capacity_floor_met\":$profile_capacity_floor_met,\"throughput_safety_floor_percent\":50,\"throughput_safety_floor_met\":$profile_safety_floor_met,\"deep_runtime_minimum\":$profile_deep_runtime_minimum,\"runtime_minimum_retention\":$profile_runtime_minimum_retention_json,\"infeasible_reason\":\"$(json_escape "$profile_floor_infeasible_reason")\",\"manual_only\":$profile_manual_only,\"selected_pair\":{\"download_kbps\":$selected_dl_candidate,\"upload_kbps\":$selected_ul_candidate},\"bidirectional_confirmation\":$bidirectional_confirmation_json,\"directional_recommendation\":$directional_recommendation_json,\"directional_comparisons\":$directional_comparisons_json,\"download\":$dl_search_json,\"upload\":$ul_search_json}"
 	if [ "$autotune_profile" = fair ]; then
+		fair_actual_effective_delta_ms="$(maximum_number "$effective_loaded_delta_ms" "$bidirectional_effective_delta_ms")"
 		fair_safety_state=safety-floor-met
 		[ "$profile_safety_floor_met" = true ] || fair_safety_state=historical-trust-missed
 		if [ "$profile_floor_infeasible" = true ]; then
-			build_fair_outcome throughput-fallback safety-floor-infeasible capacity-objective-missed
+			build_fair_outcome throughput-fallback safety-floor-infeasible capacity-objective-missed \
+				"$profile_actual_grade" "$fair_actual_effective_delta_ms"
 		elif [ "$profile_target_met" = true ]; then
 			if [ "$profile_capacity_floor_met" = true ]; then
-				build_fair_outcome quality-target-met "$fair_safety_state" capacity-objective-met
+				build_fair_outcome quality-target-met "$fair_safety_state" capacity-objective-met \
+					"$profile_actual_grade" "$fair_actual_effective_delta_ms"
 			else
-				build_fair_outcome quality-target-met "$fair_safety_state" capacity-objective-missed
+				build_fair_outcome quality-target-met "$fair_safety_state" capacity-objective-missed \
+					"$profile_actual_grade" "$fair_actual_effective_delta_ms"
 			fi
 		else
 			if [ "$profile_capacity_floor_met" = true ]; then
-				build_fair_outcome throughput-fallback "$fair_safety_state" capacity-objective-met
+				build_fair_outcome throughput-fallback "$fair_safety_state" capacity-objective-met \
+					"$profile_actual_grade" "$fair_actual_effective_delta_ms"
 			else
-				build_fair_outcome throughput-fallback "$fair_safety_state" capacity-objective-missed
+				build_fair_outcome throughput-fallback "$fair_safety_state" capacity-objective-missed \
+					"$profile_actual_grade" "$fair_actual_effective_delta_ms"
 			fi
 		fi
 	fi
@@ -6219,7 +7276,20 @@ run_job() {
 			# clean bidirectional no-SQM proof in LuCI and apply-guard.
 			manual_apply_eligible=true
 		else
-			[ "$validation_safety_pass" = true ] && manual_apply_eligible=true
+			# Historical raw capacity is volatile on radio links.  Missing its
+			# 50% trust comparison lowers confidence and requires explicit Review,
+			# but it is not a datapath safety failure when the currently tested
+			# CAKE pair still passes loss, realization and loaded-latency safety.
+			[ "$validation_safety_pass" = true ] &&
+				[ "$bidirectional_safety_pass" = true ] && manual_apply_eligible=true
+			# Fair can independently prove that disabling SQM is the safer choice.
+			# A poor shaped confirmation must block applying that shaped proposal,
+			# but it must not hide a clean, bidirectional no-SQM control which the
+			# action-specific LuCI and apply-guard validators will verify again.
+			if [ "$autotune_profile" = fair ] &&
+			   [ "${fair_disable_available:-false}" = true ]; then
+				manual_apply_eligible=true
+			fi
 			[ "$result_class" = trusted ] && [ "$validation_safety_pass" = true ] &&
 				[ "$profile_target_met" = true ] &&
 				[ "$validation_profile_objectives_met" = true ] &&
@@ -6227,7 +7297,8 @@ run_job() {
 				auto_apply_eligible=true
 		fi
 	fi
-	stage_terminal_json result "{\"state\":\"complete\",\"schema_version\":8,\"result_available\":true,\"result_class\":\"$result_class\",\"confidence\":$confidence_json,\"auto_apply_eligible\":$auto_apply_eligible,\"manual_apply_eligible\":$manual_apply_eligible,\"phase_evidence_complete\":$phase_evidence_complete,\"phase_contamination_seen\":$phase_contamination_seen,\"job_id\":\"$(json_escape "$job_name")\",\"target_interface\":\"$(json_escape "$target_if_input")\",\"resolved_interface\":\"$(json_escape "$target_if")\",\"source_ip\":\"$(json_escape "$source_ip")\",\"external_ip\":\"$(json_escape "$selected_external_ip")\",\"route_interface\":\"$(json_escape "$route_if")\",\"route_mode\":\"$(json_escape "$route_mode")\",\"mwan3_member\":\"$(json_escape "$mwan3_member")\",\"route_identity\":\"$(json_escape "$route_identity")\",\"link_kind\":\"$(json_escape "$link_kind")\",\"datapath\":$datapath_json,\"conservative\":$([ "$conservative_mode" = 1 ] && printf true || printf false),\"confidence_mode\":\"$confidence_mode\",\"background\":$(background_json),\"phase_background\":[$phase_background_runs_json],\"usable_directions\":{\"download\":${background_dl_usable:-true},\"upload\":${background_ul_usable:-true}},\"validation_thresholds\":{\"candidate_realization_min_percent\":$validation_candidate_realization_min_percent,\"candidate_realization_max_percent\":$validation_candidate_realization_max_percent,\"capacity_retention_min_percent\":$validation_capacity_retention_min_percent,\"throughput_safety_floor_percent\":50,\"delay_max_ms\":$validation_delay_max_ms,\"loss_max_percent\":$validation_loss_max_percent,\"cpu_max_percent\":$validation_cpu_max_percent},\"baseline\":{\"median_ms\":$idle_median_ms,\"p95_ms\":$idle_p95_ms,\"samples\":$baseline_samples,\"transport_median_ms\":$transport_idle_median_ms,\"transport_p95_ms\":$transport_idle_p95_ms,\"transport_samples\":$transport_idle_samples,\"transport_backend\":\"$(json_escape "$transport_probe_backend")\",\"transport_endpoint\":\"$(json_escape "$transport_probe_endpoint")\"},\"runs\":[$runs_json],\"validation_attempts\":[$validation_attempts_json],\"validation\":$validation_json,\"bidirectional_confirmation\":$bidirectional_confirmation_json,\"directional_recommendation\":$directional_recommendation_json,\"profile_outcome\":$profile_outcome_json,\"profile_search\":{\"download\":$dl_search_json,\"upload\":$ul_search_json},\"fair_outcome\":$fair_outcome_json,\"pinger_plan\":$pinger_plan,\"proposal\":$proposal,\"configuration_written\":false}"
+	build_result_proposals
+	stage_complete_result
 }
 
 job_recovery_pending() {
@@ -6452,6 +7523,19 @@ cancel_job() {
 	if [ -s "$pid_file" ]; then
 		if worker_identity_matches; then
 			pid="$identity_pid"
+			# The cancelling RPC is a separate process and may omit the immutable
+			# route/profile/strategy arguments.  Keep the authenticated worker
+			# identity in status.json instead of publishing the cancel request's
+			# defaults, otherwise an ambiguous browser retry can observe a hybrid
+			# identity that never actually ran.
+			target_if_input="$identity_target"
+			backend_input="$identity_backend"
+			route_mode_override="$identity_route_mode"
+			mwan3_member_override="$identity_mwan3_member"
+			autotune_profile="$identity_profile"
+			conservative_mode="$identity_conservative"
+			traffic_budget_bytes="$identity_traffic_budget"
+			calibration_strategy="$identity_calibration_strategy"
 			: > "$cancel_file"
 			write_status cancelling 0 "Cancelling Full Auto-Tune and restoring temporary speed-test/SQM state"
 			kill -TERM "$pid" 2>/dev/null || true
@@ -6476,7 +7560,8 @@ safe_interface_name "$target_if_input" || json_error "Invalid target interface."
 resolve_autotune_profile || json_error "Unsupported Full Auto-Tune profile."
 resolve_calibration_strategy || json_error "Unsupported Full Auto-Tune calibration strategy."
 case "$conservative_override" in 0|1) ;; *) json_error "Invalid conservative Full Auto-Tune flag." ;; esac
-is_nonnegative_uint "$traffic_budget_bytes" || json_error "Invalid Full Auto-Tune traffic budget."
+traffic_budget_bytes="$(uint53_normalize "$traffic_budget_bytes")" ||
+	json_error "Invalid or out-of-range Full Auto-Tune traffic budget."
 job_paths
 prepare_job_storage || json_error "Unsafe or foreign-owned Full Auto-Tune state directory."
 

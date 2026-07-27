@@ -132,6 +132,7 @@ set_no_sqm_journal() {
 }
 
 expected_sqm_call="sqm-recover wan_sqm cake_wan_sqm eth0 eth0 ifb4eth0 sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $CAKE_AUTORATE_RUNTIME_LOCK_ROOT/sqm-snapshot.recoverytest"
+expected_sqm_check_call="$expected_sqm_call check"
 
 reset_case() {
 	rm -rf "$work/proc" "$work/sys" "$work/state" "$CAKE_AUTORATE_RUNTIME_LOCK_ROOT"
@@ -565,14 +566,32 @@ grep -Fqx "$expected_sqm_call" "$work/actions"
 reset_case
 write_journal "$work/foreign-root.journal" 675 102
 export CAKE_RECOVER_TC_FOREIGN_ROOT=1
+export CAKE_RECOVER_SQM_CHECK_FAIL=1
 if "$helper" recover "$work/foreign-root.journal"; then
 	echo 'foreign root qdisc unexpectedly passed recovery' >&2
 	exit 1
 fi
-unset CAKE_RECOVER_TC_FOREIGN_ROOT
+unset CAKE_RECOVER_TC_FOREIGN_ROOT CAKE_RECOVER_SQM_CHECK_FAIL
 grep -q 'ownership no longer matches' "$work/error.json"
-! grep -q '^sqm-recover ' "$work/actions"
+grep -Fqx "$expected_sqm_check_call" "$work/actions"
+[ "$(grep -c '^sqm-recover ' "$work/actions")" -eq 1 ]
 [ -e "$interface_record" ]
+
+# An older owner could restore the exact managed topology and die before
+# clearing shaper_started.  The immutable read-only attestation authorizes only
+# the journal transitions; no qdisc is deleted or restarted.
+reset_case
+write_journal "$work/managed-already-restored.journal" 675 103
+export CAKE_RECOVER_TC_FOREIGN_ROOT=1
+"$helper" recover "$work/managed-already-restored.journal"
+unset CAKE_RECOVER_TC_FOREIGN_ROOT
+grep -Fqx "$expected_sqm_check_call" "$work/actions"
+[ "$(grep -c '^sqm-recover ' "$work/actions")" -eq 1 ]
+! grep -q '^tc qdisc del ' "$work/actions"
+[ ! -e "$work/managed-already-restored.journal" ]
+[ ! -e "$interface_record" ]
+[ ! -e "$CAKE_AUTORATE_RUNTIME_LOCK_ROOT/sqm-snapshot.recoverytest" ]
+grep -q '"runtime_restored":true' "$work/error.json"
 
 # A complete temporary shaper is deleted only when its qdisc handles, redirect
 # preference, random-token IFB alias, and ifindex all match the journal.
@@ -589,6 +608,44 @@ export CAKE_RECOVER_TC_OWNED=1
 unset CAKE_RECOVER_TC_OWNED
 [ ! -e "$work/sys/$temp_fixture_ifb" ]
 [ "$(grep -c '^tc qdisc del dev ' "$work/actions")" -eq 3 ]
+
+# Auto-Tune may own an upload-only comparison topology when it dies: the
+# journal-owned roots and IFB remain exact, while its ingress qdisc/filter are
+# intentionally absent. Recovery must still remove the owned roots/IFB and
+# must not invent or require an ingress delete before restoring managed SQM.
+reset_case
+write_journal "$work/upload-only-owned.journal" 676 101
+create_temp_fixture_ifb
+: > "$work/tc-target-root"
+: > "$work/tc-ifb-root"
+export CAKE_RECOVER_TC_OWNED=1
+"$helper" recover "$work/upload-only-owned.journal"
+unset CAKE_RECOVER_TC_OWNED
+[ ! -e "$work/sys/$temp_fixture_ifb" ]
+[ "$(grep -c '^tc qdisc del dev ' "$work/actions")" -eq 2 ]
+! grep -q '^tc qdisc del dev eth0 ingress$' "$work/actions"
+grep -Fqx "$expected_sqm_call" "$work/actions"
+[ -e "$work/sqm-restored" ]
+
+# The symmetric download-only comparison retains the exact ingress redirect
+# and IFB CAKE but intentionally has no temporary target root. Recovery proves
+# the random IFB identity, removes only the remaining owned components and
+# then restores managed SQM.
+reset_case
+write_journal "$work/download-only-owned.journal" 676 102
+create_temp_fixture_ifb
+: > "$work/tc-ingress"
+: > "$work/tc-ifb-root"
+: > "$work/tc-filter"
+export CAKE_RECOVER_TC_OWNED=1
+"$helper" recover "$work/download-only-owned.journal"
+unset CAKE_RECOVER_TC_OWNED
+[ ! -e "$work/sys/$temp_fixture_ifb" ]
+[ "$(grep -c '^tc qdisc del dev ' "$work/actions")" -eq 2 ]
+! grep -q '^tc qdisc del dev eth0 root$' "$work/actions"
+grep -Fqx 'tc qdisc del dev eth0 ingress' "$work/actions"
+grep -Fqx "$expected_sqm_call" "$work/actions"
+[ -e "$work/sqm-restored" ]
 
 # A foreign replacement with the same conventional qdisc handles but a
 # different IFB ownership alias is never deleted.

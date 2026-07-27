@@ -918,6 +918,7 @@ inspect_temporary_shaper() {
 
 cleanup_temporary_state() {
 	[ -e "$cleanup_marker" ] && return 0
+	managed_restore_already_healthy=0
 
 	if [ "$shaper_started" = 1 ]; then
 		inspect_temporary_shaper
@@ -949,8 +950,18 @@ cleanup_temporary_state() {
 				add_error "temporary qdisc/IFB ownership state could not be read"
 				;;
 			*)
-				sqm_restore_safe=0
-				add_error "temporary qdisc/IFB ownership no longer matches the recovery journal"
+				# Backward-compatible crash window: an older worker could delete its
+				# random IFB, restore the exact immutable managed SQM snapshot, and die
+				# before clearing shaper_started.  Only the strict, read-only snapshot
+				# attestation may distinguish that state from a foreign replacement.
+				if [ "$temp_ifb_link_status" = absent ] &&
+				   [ "$sqm_was_active" = 1 ] && [ "$sqm_restore_required" = 1 ] &&
+				   check_recovered_managed_sqm >/dev/null 2>&1; then
+					managed_restore_already_healthy=1
+				else
+					sqm_restore_safe=0
+					add_error "temporary qdisc/IFB ownership no longer matches the recovery journal"
+				fi
 				;;
 		esac
 	fi
@@ -972,12 +983,29 @@ cleanup_temporary_state() {
 	fi
 
 	if [ "$shaper_started" = 1 ]; then
-		inspect_temporary_shaper
-		post_cleanup_state="$temporary_inspection"
-		if [ "$post_cleanup_state" != absent ]; then
-			sqm_restore_safe=0
-			add_error "temporary shaper postconditions are not clean after ownership-checked cleanup"
+		if [ "$managed_restore_already_healthy" = 1 ]; then
+			post_cleanup_state=managed-restored
+		else
+			inspect_temporary_shaper
+			post_cleanup_state="$temporary_inspection"
+			if [ "$post_cleanup_state" != absent ]; then
+				sqm_restore_safe=0
+				add_error "temporary shaper postconditions are not clean after ownership-checked cleanup"
+			fi
 		fi
+		if [ -z "$recovery_errors" ]; then
+			mark_shaper_cleanup_complete || {
+				sqm_restore_safe=0
+				add_error "temporary shaper was removed, but its durable recovery transition failed"
+			}
+		fi
+	fi
+
+	if [ -z "$recovery_errors" ] && [ "$managed_restore_already_healthy" = 1 ]; then
+		mark_sqm_restore_complete ||
+			add_error "managed SQM was healthy, but its durable recovery transition failed"
+		[ -n "$recovery_errors" ] || remove_recovery_sqm_snapshot ||
+			add_error "managed SQM was healthy, but its private snapshot could not be removed"
 	fi
 
 	[ -n "$recovery_errors" ] || : > "$cleanup_marker"
@@ -1102,6 +1130,38 @@ recover_managed_sqm() {
 	CAKE_AUTORATE_SPEEDTEST_LOCK_DIR="$sqm_lock_bypass" \
 		"$sqm_recover" "$section" "$sqm_section" "$sqm_target_if" "$sqm_ul_if" "$sqm_dl_if" \
 		"$sqm_config_fingerprint" "$sqm_config_snapshot"
+}
+
+check_recovered_managed_sqm() {
+	sqm_lock_bypass="$journal.sqm-lock-bypass"
+	CAKE_AUTORATE_SPEEDTEST_LOCK_DIR="$sqm_lock_bypass" \
+		"$sqm_recover" "$section" "$sqm_section" "$sqm_target_if" "$sqm_ul_if" "$sqm_dl_if" \
+		"$sqm_config_fingerprint" "$sqm_config_snapshot" check
+}
+
+mark_shaper_cleanup_complete() {
+	[ "$shaper_started" = 1 ] || return 0
+	journal_tmp="$journal.shaper-removed.$$"
+	[ ! -e "$journal_tmp" ] && [ ! -L "$journal_tmp" ] || return 1
+	awk '
+		BEGIN { seen = 0 }
+		/^shaper_started=/ {
+			if (seen++) exit 2
+			print "shaper_started=0"
+			next
+		}
+		{ print }
+		END { if (seen != 1) exit 3 }
+	' "$journal" > "$journal_tmp" || {
+		rm -f "$journal_tmp" 2>/dev/null || true
+		return 1
+	}
+	owned_regular_file "$journal_tmp" && chmod 600 "$journal_tmp" 2>/dev/null &&
+		mv "$journal_tmp" "$journal" && owned_regular_file "$journal" || {
+		rm -f "$journal_tmp" 2>/dev/null || true
+		return 1
+	}
+	shaper_started=0
 }
 
 mark_sqm_restore_complete() {

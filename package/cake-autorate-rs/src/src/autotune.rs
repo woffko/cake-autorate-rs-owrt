@@ -318,6 +318,30 @@ pub struct AutotuneProposal {
 }
 
 impl AutotuneProposal {
+    fn set_measured_runtime_minimum(
+        profile: AutotuneProfile,
+        name: &str,
+        measured: u64,
+        direction: &mut DirectionProposal,
+    ) -> Result<(), String> {
+        if !matches!(
+            profile,
+            AutotuneProfile::VariableLink | AutotuneProfile::GamingExtreme
+        ) {
+            return Err(
+                "measured runtime minimum overrides require variable_link or gaming_extreme"
+                    .to_string(),
+            );
+        }
+        if measured < direction.minimum_kbps || measured > direction.base_kbps {
+            return Err(format!(
+                "measured {name} runtime minimum must stay between the exploration minimum and selected base"
+            ));
+        }
+        direction.minimum_kbps = measured;
+        Ok(())
+    }
+
     pub fn revise_base_rates(&mut self, scale: f64) -> Result<(), String> {
         self.revise_base_rates_by_direction(scale, scale)
     }
@@ -347,27 +371,33 @@ impl AutotuneProposal {
         download_kbps: u64,
         upload_kbps: u64,
     ) -> Result<(), String> {
-        if !matches!(
+        Self::set_measured_runtime_minimum(
             self.profile,
-            AutotuneProfile::VariableLink | AutotuneProfile::GamingExtreme
-        ) {
-            return Err(
-                "measured runtime minimum overrides require variable_link or gaming_extreme"
-                    .to_string(),
-            );
-        }
-        for (name, measured, direction) in [
-            ("download", download_kbps, &mut self.download),
-            ("upload", upload_kbps, &mut self.upload),
-        ] {
-            if measured < direction.minimum_kbps || measured > direction.base_kbps {
-                return Err(format!(
-                    "measured {name} runtime minimum must stay between the exploration minimum and selected base"
-                ));
-            }
-            direction.minimum_kbps = measured;
-        }
+            "download",
+            download_kbps,
+            &mut self.download,
+        )?;
+        Self::set_measured_runtime_minimum(self.profile, "upload", upload_kbps, &mut self.upload)?;
         Ok(())
+    }
+
+    /// Bind only the still-shaped direction of a one-sided topology to its
+    /// exact tested runtime minimum. The bypassed peer direction deliberately
+    /// retains its exploratory floor because it is not controlled at runtime.
+    pub fn set_measured_download_runtime_minimum(
+        &mut self,
+        download_kbps: u64,
+    ) -> Result<(), String> {
+        Self::set_measured_runtime_minimum(
+            self.profile,
+            "download",
+            download_kbps,
+            &mut self.download,
+        )
+    }
+
+    pub fn set_measured_upload_runtime_minimum(&mut self, upload_kbps: u64) -> Result<(), String> {
+        Self::set_measured_runtime_minimum(self.profile, "upload", upload_kbps, &mut self.upload)
     }
 
     pub fn apply_conservative_constraints(
@@ -1911,6 +1941,7 @@ pub struct SearchObservationMetrics {
     pub effective_delta_ms: f64,
     pub grade: &'static str,
     pub measurement_reliable: bool,
+    pub manual_reviewable: bool,
     pub resource_safe: bool,
     pub safety_pass: bool,
     pub capacity_objective_met: bool,
@@ -1988,7 +2019,7 @@ impl ProfileSearchResult {
                         "\"realization_percent\":{:.3},\"retention_percent\":{:.3},",
                         "\"effective_delta_ms\":{:.3},",
                         "\"loss_percent\":{:.3},\"cpu_percent\":{:.3},",
-                        "\"grade\":\"{}\",\"safety_pass\":{},",
+                        "\"grade\":\"{}\",\"safety_pass\":{},\"manual_reviewable\":{},",
                         "\"capacity_objective_met\":{},\"target_met\":{}}}"
                     ),
                     index + 1,
@@ -2001,6 +2032,7 @@ impl ProfileSearchResult {
                     observation.cpu_percent,
                     metrics.grade,
                     metrics.safety_pass,
+                    metrics.manual_reviewable,
                     metrics.capacity_objective_met,
                     metrics.target_met,
                 )
@@ -2018,7 +2050,7 @@ impl ProfileSearchResult {
                         "\"realization_percent\":{:.3},\"retention_percent\":{:.3},",
                         "\"effective_delta_ms\":{:.3},\"grade\":\"{}\",",
                         "\"loss_percent\":{:.3},\"cpu_percent\":{:.3},",
-                        "\"measurement_reliable\":{},\"resource_safe\":{},",
+                        "\"measurement_reliable\":{},\"manual_reviewable\":{},\"resource_safe\":{},",
                         "\"safety_pass\":{},\"capacity_objective_met\":{},",
                         "\"target_met\":{},\"balanced_score\":{:.3}}}"
                     ),
@@ -2032,6 +2064,7 @@ impl ProfileSearchResult {
                     observation.loss_percent,
                     observation.cpu_percent,
                     metrics.measurement_reliable,
+                    metrics.manual_reviewable,
                     metrics.resource_safe,
                     metrics.safety_pass,
                     metrics.capacity_objective_met,
@@ -2193,6 +2226,15 @@ fn evaluate_search_observation(
         >= input.thresholds.candidate_realization_min_percent
         && realization_percent <= input.thresholds.candidate_realization_max_percent;
     let resource_safe = observation.loss_percent <= input.thresholds.loss_max_percent;
+    // A clean 50-80% realization is not proof that CAKE controlled the
+    // bottleneck, so it must never satisfy safety_pass or Auto-Apply.  It is,
+    // however, bounded enough to retain as explicit manual-review evidence
+    // after the search has tried a lower, exact CAKE rate.
+    let manual_reviewable = realization_percent >= THROUGHPUT_TRUST_FLOOR_PERCENT
+        && realization_percent < input.thresholds.candidate_realization_min_percent
+        && realization_percent <= input.thresholds.candidate_realization_max_percent
+        && retention_percent >= THROUGHPUT_TRUST_FLOOR_PERCENT
+        && resource_safe;
     // Historical retention is not a safety signal on a variable radio link,
     // but candidate realization is: CAKE cannot control a bottleneck below
     // its configured rate.  Only a sufficiently exercised candidate may be
@@ -2216,6 +2258,7 @@ fn evaluate_search_observation(
         effective_delta_ms,
         grade,
         measurement_reliable,
+        manual_reviewable,
         resource_safe,
         safety_pass,
         capacity_objective_met,
@@ -2246,6 +2289,52 @@ fn best_target_index(
                     .effective_delta_ms
                     .total_cmp(&metrics[*left_index].effective_delta_ms)
             })
+        })
+        .map(|(index, _)| index)
+}
+
+fn best_no_cake_effect_index(
+    observations: &[SearchObservation],
+    metrics: &[SearchObservationMetrics],
+) -> Option<usize> {
+    observations
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            metrics[*index].safety_pass
+                && metrics[*index].target_met
+                && metrics[*index].retention_percent >= THROUGHPUT_TRUST_FLOOR_PERCENT
+        })
+        .max_by(|(left_index, left), (right_index, right)| {
+            left.achieved_kbps.cmp(&right.achieved_kbps).then_with(|| {
+                metrics[*right_index]
+                    .effective_delta_ms
+                    .total_cmp(&metrics[*left_index].effective_delta_ms)
+            })
+        })
+        .map(|(index, _)| index)
+}
+
+fn best_trusted_quality_index(
+    observations: &[SearchObservation],
+    metrics: &[SearchObservationMetrics],
+) -> Option<usize> {
+    observations
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            metrics[*index].safety_pass
+                && metrics[*index].retention_percent >= THROUGHPUT_TRUST_FLOOR_PERCENT
+        })
+        .min_by(|(left_index, left), (right_index, right)| {
+            quality_grade_rank(metrics[*left_index].grade)
+                .cmp(&quality_grade_rank(metrics[*right_index].grade))
+                .then_with(|| {
+                    metrics[*left_index]
+                        .effective_delta_ms
+                        .total_cmp(&metrics[*right_index].effective_delta_ms)
+                })
+                .then_with(|| right.achieved_kbps.cmp(&left.achieved_kbps))
         })
         .map(|(index, _)| index)
 }
@@ -2327,6 +2416,47 @@ fn best_fair_index(
         .map(|(index, _)| index)
 }
 
+/// Select the best exact observation that passed the topology-independent
+/// search safety contract.  A terminal probe may be noisy, uncontrolled, or
+/// unsafe without invalidating an earlier controlled measurement.  Terminal
+/// search paths use this selector before declaring the whole direction
+/// inconclusive, so a tested safe point remains available for explicit review.
+fn best_safe_fallback_index(
+    input: &ProfileSearchInput,
+    metrics: &[SearchObservationMetrics],
+) -> Option<usize> {
+    match input.profile {
+        AutotuneProfile::Gaming | AutotuneProfile::GamingExtreme => {
+            best_target_index(&input.observations, metrics)
+                .or_else(|| best_quality_index(&input.observations, metrics))
+        }
+        AutotuneProfile::BestOverall | AutotuneProfile::VariableLink => {
+            best_target_index(&input.observations, metrics)
+                .or_else(|| best_balanced_index(&input.observations, metrics))
+        }
+        AutotuneProfile::Fair => best_fair_index(input, metrics),
+    }
+}
+
+fn resolve_terminal_safe_fallback(
+    input: &ProfileSearchInput,
+    metrics: &[SearchObservationMetrics],
+    action: ProfileSearchAction,
+    selected_index: Option<usize>,
+) -> (ProfileSearchAction, Option<usize>) {
+    if action != ProfileSearchAction::Inconclusive {
+        return (action, selected_index);
+    }
+    let selected_index = selected_index
+        .filter(|index| metrics[*index].safety_pass)
+        .or_else(|| best_safe_fallback_index(input, metrics));
+    if selected_index.is_some() {
+        (ProfileSearchAction::Fallback, selected_index)
+    } else {
+        (ProfileSearchAction::Inconclusive, None)
+    }
+}
+
 fn candidate_was_tested(observations: &[SearchObservation], candidate_kbps: u64) -> bool {
     observations
         .iter()
@@ -2343,7 +2473,57 @@ fn low_realization_evidence_eligible(
     profile: AutotuneProfile,
     metrics: SearchObservationMetrics,
 ) -> bool {
-    metrics.resource_safe && (profile == AutotuneProfile::Fair || metrics.target_met)
+    metrics.resource_safe
+        && (profile == AutotuneProfile::Fair
+            || metrics.target_met
+            || (profile == AutotuneProfile::VariableLink
+                && metrics.manual_reviewable
+                && metrics.effective_delta_ms <= 200.0))
+}
+
+fn variable_low_realization_review_index(
+    input: &ProfileSearchInput,
+    metrics: &[SearchObservationMetrics],
+    candidate_kbps: u64,
+) -> Option<usize> {
+    let indices = input
+        .observations
+        .iter()
+        .enumerate()
+        .filter(|(index, observation)| {
+            observation.candidate_kbps == candidate_kbps
+                && metrics[*index].manual_reviewable
+                && metrics[*index].effective_delta_ms <= 200.0
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if indices.len() < MAX_SAME_CANDIDATE_OBSERVATIONS {
+        return None;
+    }
+    let repeatable = indices.iter().enumerate().any(|(position, left)| {
+        indices.iter().skip(position + 1).any(|right| {
+            achieved_rates_repeatable(
+                input.observations[*left].achieved_kbps,
+                input.observations[*right].achieved_kbps,
+            )
+        })
+    });
+    if !repeatable {
+        return None;
+    }
+    // Prefer the worst clean latency sample, then the lowest achieved rate.
+    // This keeps the manually reviewable fallback conservative while the
+    // runtime minimum remains the exact tested CAKE candidate.
+    indices.into_iter().max_by(|left, right| {
+        metrics[*left]
+            .effective_delta_ms
+            .total_cmp(&metrics[*right].effective_delta_ms)
+            .then_with(|| {
+                input.observations[*right]
+                    .achieved_kbps
+                    .cmp(&input.observations[*left].achieved_kbps)
+            })
+    })
 }
 
 fn repeatable_low_realization_peer(
@@ -2527,45 +2707,58 @@ fn optimize_variable_link_direction(
                   plateau_improvement_ms: Option<f64>,
                   plateau_threshold_ms: f64,
                   no_cake_effect: bool,
-                  noisy: bool| ProfileSearchResult {
-        profile: input.profile,
-        direction: input.direction,
-        action,
-        reason,
-        next_candidate_kbps,
-        selected_index,
-        lower_target_pass_kbps: aggregates
-            .iter()
-            .filter(|aggregate| metrics[aggregate.representative_index].target_met)
-            .map(|aggregate| aggregate.candidate_kbps)
-            .max(),
-        upper_target_fail_kbps: None,
-        resolution_kbps: search_resolution(input.observed_low_kbps),
-        max_attempts: input.max_attempts,
-        metrics: metrics.to_vec(),
-        observations: input.observations.clone(),
-        exploration_minimum_kbps: input.minimum_kbps,
-        runtime_minimum_index,
-        knee_detected,
-        knee_confidence_percent,
-        plateau_improvement_ms,
-        plateau_threshold_ms,
-        repeat_count,
-        no_cake_effect,
-        noisy,
+                  noisy: bool| {
+        let requested_action = action;
+        let (action, selected_index) =
+            resolve_terminal_safe_fallback(input, metrics, action, selected_index);
+        let safe_fallback_index = (requested_action == ProfileSearchAction::Inconclusive
+            && action == ProfileSearchAction::Fallback)
+            .then_some(selected_index)
+            .flatten();
+        // Variable Link cannot invent a runtime floor.  When a terminal
+        // condition falls back to an earlier safe observation, bind the
+        // runtime minimum to that same exact tested point.
+        let runtime_minimum_index = if safe_fallback_index.is_some() {
+            safe_fallback_index
+        } else {
+            runtime_minimum_index
+        };
+        ProfileSearchResult {
+            profile: input.profile,
+            direction: input.direction,
+            action,
+            reason,
+            next_candidate_kbps,
+            selected_index,
+            lower_target_pass_kbps: aggregates
+                .iter()
+                .filter(|aggregate| metrics[aggregate.representative_index].target_met)
+                .map(|aggregate| aggregate.candidate_kbps)
+                .max(),
+            upper_target_fail_kbps: None,
+            resolution_kbps: search_resolution(input.observed_low_kbps),
+            max_attempts: input.max_attempts,
+            metrics: metrics.to_vec(),
+            observations: input.observations.clone(),
+            exploration_minimum_kbps: input.minimum_kbps,
+            runtime_minimum_index,
+            knee_detected,
+            knee_confidence_percent,
+            plateau_improvement_ms,
+            plateau_threshold_ms,
+            repeat_count,
+            no_cake_effect,
+            noisy,
+        }
     };
 
-    if !last_metrics.measurement_reliable || !last_metrics.resource_safe {
+    if !last_metrics.resource_safe {
         if duplicate_count < MAX_SAME_CANDIDATE_OBSERVATIONS
             && input.observations.len() < input.max_attempts
         {
             return finish(
                 ProfileSearchAction::Test,
-                if last_metrics.resource_safe {
-                    "repeat-uncontrolled-variable-candidate"
-                } else {
-                    "repeat-resource-unsafe-variable-candidate"
-                },
+                "repeat-resource-unsafe-variable-candidate",
                 Some(last.candidate_kbps),
                 None,
                 None,
@@ -2579,11 +2772,83 @@ fn optimize_variable_link_direction(
         }
         return finish(
             ProfileSearchAction::Inconclusive,
-            if last_metrics.resource_safe {
-                "variable-candidate-realization-inconclusive"
-            } else {
-                "variable-candidate-resource-safety-inconclusive"
-            },
+            "variable-candidate-resource-safety-inconclusive",
+            None,
+            None,
+            None,
+            false,
+            0,
+            None,
+            default_threshold,
+            false,
+            true,
+        );
+    }
+
+    if !last_metrics.measurement_reliable {
+        if low_realization_evidence_eligible(input.profile, last_metrics) {
+            if let Some(next) =
+                controlled_candidate_from_low_realization(input, metrics, last.candidate_kbps)
+            {
+                if next < last.candidate_kbps
+                    && !candidate_was_tested(&input.observations, next)
+                    && input.observations.len() < input.max_attempts
+                {
+                    return finish(
+                        ProfileSearchAction::Test,
+                        "lower-variable-candidate-to-establish-shaper-control",
+                        Some(next),
+                        None,
+                        None,
+                        false,
+                        0,
+                        None,
+                        default_threshold,
+                        false,
+                        false,
+                    );
+                }
+            }
+
+            if let Some(selected_index) =
+                variable_low_realization_review_index(input, metrics, last.candidate_kbps)
+            {
+                return finish(
+                    ProfileSearchAction::Fallback,
+                    "bounded-low-realization-review",
+                    None,
+                    Some(selected_index),
+                    Some(selected_index),
+                    false,
+                    0,
+                    None,
+                    default_threshold,
+                    false,
+                    false,
+                );
+            }
+        }
+
+        if duplicate_count < MAX_SAME_CANDIDATE_OBSERVATIONS
+            && input.observations.len() < input.max_attempts
+        {
+            return finish(
+                ProfileSearchAction::Test,
+                "repeat-uncontrolled-variable-candidate",
+                Some(last.candidate_kbps),
+                None,
+                None,
+                false,
+                0,
+                None,
+                default_threshold,
+                false,
+                true,
+            );
+        }
+        return finish(
+            ProfileSearchAction::Inconclusive,
+            "variable-candidate-realization-inconclusive",
             None,
             None,
             None,
@@ -2612,6 +2877,21 @@ fn optimize_variable_link_direction(
                     Some(last.candidate_kbps),
                     None,
                     None,
+                    false,
+                    0,
+                    None,
+                    noise_limit,
+                    false,
+                    true,
+                );
+            }
+            if let Some(selected_index) = best_trusted_quality_index(&input.observations, metrics) {
+                return finish(
+                    ProfileSearchAction::Fallback,
+                    "noisy-link-safe-review",
+                    None,
+                    Some(selected_index),
+                    Some(selected_index),
                     false,
                     0,
                     None,
@@ -2654,6 +2934,21 @@ fn optimize_variable_link_direction(
                     Some(lower.candidate_kbps),
                     None,
                     None,
+                    false,
+                    0,
+                    None,
+                    threshold,
+                    false,
+                    true,
+                );
+            }
+            if let Some(selected_index) = best_trusted_quality_index(&input.observations, metrics) {
+                return finish(
+                    ProfileSearchAction::Fallback,
+                    "noisy-link-safe-review",
+                    None,
+                    Some(selected_index),
+                    Some(selected_index),
                     false,
                     0,
                     None,
@@ -2708,9 +3003,32 @@ fn optimize_variable_link_direction(
                 .max_by(f64::total_cmp)
                 .unwrap_or(default_threshold);
             if !prior_useful {
+                if let Some(selected_index) =
+                    best_no_cake_effect_index(&input.observations, metrics)
+                {
+                    // A flat latency curve is directional evidence, not a
+                    // global calibration failure. Hold this direction at its
+                    // highest safe, target-meeting tested point and let the
+                    // peer direction continue. Using the selected observation
+                    // as the runtime minimum prevents destructive descent and
+                    // never manufactures an untested rate.
+                    return finish(
+                        ProfileSearchAction::Fallback,
+                        "queue-outside-cake-control",
+                        None,
+                        Some(selected_index),
+                        Some(selected_index),
+                        false,
+                        0,
+                        plateau_improvement_ms,
+                        plateau_threshold_ms,
+                        true,
+                        false,
+                    );
+                }
                 return finish(
                     ProfileSearchAction::Inconclusive,
-                    "queue-outside-cake-control",
+                    "queue-outside-cake-control-target-unmet",
                     None,
                     None,
                     None,
@@ -2765,6 +3083,21 @@ fn optimize_variable_link_direction(
         .map(|aggregate| aggregate.candidate_kbps)
         .unwrap_or(last.candidate_kbps);
     if lowest_tested <= input.minimum_kbps {
+        if let Some(selected_index) = best_no_cake_effect_index(&input.observations, metrics) {
+            return finish(
+                ProfileSearchAction::Fallback,
+                "exploration-floor-reached",
+                None,
+                Some(selected_index),
+                Some(selected_index),
+                false,
+                0,
+                None,
+                default_threshold,
+                false,
+                false,
+            );
+        }
         return finish(
             ProfileSearchAction::Inconclusive,
             "exploration-floor-reached-without-latency-knee",
@@ -2898,6 +3231,8 @@ pub fn optimize_profile_direction(
                   reason: &'static str,
                   next_candidate_kbps: Option<u64>|
      -> ProfileSearchResult {
+        let (action, selected_index) =
+            resolve_terminal_safe_fallback(&input, &metrics, action, selected_index);
         let runtime_minimum_index = if input.profile == AutotuneProfile::GamingExtreme
             && matches!(
                 action,
@@ -4482,6 +4817,47 @@ mod tests {
     }
 
     #[test]
+    fn one_sided_topology_binds_only_its_still_shaped_runtime_minimum() {
+        let mut upload_only = build_proposal_for_profile(
+            &[400_000.0, 400_000.0, 400_000.0],
+            &[60_000.0, 60_000.0, 60_000.0],
+            LatencyBaseline {
+                median_ms: 20.0,
+                p95_ms: 25.0,
+                samples: 10,
+            },
+            LinkKind::Cellular,
+            AutotuneProfile::VariableLink,
+        )
+        .unwrap();
+        let untouched_download_floor = upload_only.download.minimum_kbps;
+        upload_only
+            .set_measured_upload_runtime_minimum(45_000)
+            .unwrap();
+        assert_eq!(upload_only.download.minimum_kbps, untouched_download_floor);
+        assert_eq!(upload_only.upload.minimum_kbps, 45_000);
+
+        let mut download_only = build_proposal_for_profile(
+            &[1_000_000.0, 1_000_000.0, 1_000_000.0],
+            &[200_000.0, 200_000.0, 200_000.0],
+            LatencyBaseline {
+                median_ms: 2.0,
+                p95_ms: 3.0,
+                samples: 10,
+            },
+            LinkKind::Ethernet,
+            AutotuneProfile::GamingExtreme,
+        )
+        .unwrap();
+        let untouched_upload_floor = download_only.upload.minimum_kbps;
+        download_only
+            .set_measured_download_runtime_minimum(500_000)
+            .unwrap();
+        assert_eq!(download_only.download.minimum_kbps, 500_000);
+        assert_eq!(download_only.upload.minimum_kbps, untouched_upload_floor);
+    }
+
+    #[test]
     fn extreme_gaming_runtime_minimum_is_the_lowest_tested_a_plus_candidate() {
         let result = optimize_profile_direction(ProfileSearchInput {
             profile: AutotuneProfile::GamingExtreme,
@@ -4532,7 +4908,80 @@ mod tests {
     }
 
     #[test]
-    fn variable_link_flat_gradient_reports_queue_outside_cake_control() {
+    fn variable_link_retests_a_lower_exact_rate_before_manual_review() {
+        let result = profile_search(
+            AutotuneProfile::VariableLink,
+            425_000,
+            148_800,
+            vec![
+                search_observation(334_500, 262_970, 78.9),
+                search_observation(334_500, 264_000, 104.8),
+                search_observation(334_500, 264_173, 97.8),
+            ],
+        );
+        assert_eq!(result.action, ProfileSearchAction::Test);
+        assert_eq!(
+            result.reason,
+            "lower-variable-candidate-to-establish-shaper-control"
+        );
+        assert_eq!(result.next_candidate_kbps, Some(292_200));
+        assert!(result
+            .metrics
+            .iter()
+            .all(|metrics| { !metrics.safety_pass && metrics.manual_reviewable }));
+    }
+
+    #[test]
+    fn variable_link_bounded_low_realization_is_manual_only_at_tested_floor() {
+        let result = profile_search(
+            AutotuneProfile::VariableLink,
+            425_000,
+            292_200,
+            vec![
+                search_observation(292_200, 220_000, 95.0),
+                search_observation(292_200, 222_000, 100.0),
+                search_observation(292_200, 221_000, 105.0),
+            ],
+        );
+        assert_eq!(result.action, ProfileSearchAction::Fallback);
+        assert_eq!(result.reason, "bounded-low-realization-review");
+        assert!(!result.knee_detected);
+        assert!(!result.no_cake_effect);
+        assert!(!result.noisy);
+        let selected_index = result.selected_index.expect("manual review point");
+        assert_eq!(result.runtime_minimum_index, Some(selected_index));
+        assert_eq!(result.observations[selected_index].candidate_kbps, 292_200);
+        assert!(!result.metrics[selected_index].safety_pass);
+        assert!(result.metrics[selected_index].manual_reviewable);
+        let json = result.to_json();
+        assert!(json.contains("\"manual_reviewable\":true"));
+        assert!(json.contains("\"runtime_minimum_kbps\":292200"));
+        assert!(json.contains("\"action\":\"fallback\""));
+    }
+
+    #[test]
+    fn variable_link_sub_fifty_realization_remains_hard() {
+        let result = profile_search(
+            AutotuneProfile::VariableLink,
+            425_000,
+            292_200,
+            vec![
+                search_observation(292_200, 140_000, 95.0),
+                search_observation(292_200, 141_000, 100.0),
+                search_observation(292_200, 140_500, 105.0),
+            ],
+        );
+        assert_eq!(result.action, ProfileSearchAction::Inconclusive);
+        assert_eq!(result.reason, "variable-candidate-realization-inconclusive");
+        assert!(result.selected_index.is_none());
+        assert!(result
+            .metrics
+            .iter()
+            .all(|metrics| { !metrics.safety_pass && !metrics.manual_reviewable }));
+    }
+
+    #[test]
+    fn variable_link_flat_target_miss_returns_exact_tested_fallback() {
         let result = profile_search(
             AutotuneProfile::VariableLink,
             100_000,
@@ -4543,14 +4992,71 @@ mod tests {
                 search_observation(50_000, 48_000, 98.0),
             ],
         );
-        assert_eq!(result.action, ProfileSearchAction::Inconclusive);
-        assert_eq!(result.reason, "queue-outside-cake-control");
+        assert_eq!(result.action, ProfileSearchAction::Fallback);
+        assert_eq!(result.reason, "queue-outside-cake-control-target-unmet");
         assert!(result.no_cake_effect);
-        assert!(result.runtime_minimum_index.is_none());
+        let selected = result.selected_index.expect("tested safe fallback");
+        assert_eq!(result.runtime_minimum_index, Some(selected));
+        assert_eq!(result.observations[selected].candidate_kbps, 80_000);
+        assert!(result.metrics[selected].safety_pass);
+        assert!(!result.metrics[selected].target_met);
     }
 
     #[test]
-    fn variable_link_floor_without_plateau_does_not_invent_a_minimum() {
+    fn variable_link_target_met_flat_gradient_returns_tested_directional_fallback() {
+        let result = profile_search(
+            AutotuneProfile::VariableLink,
+            100_000,
+            35_000,
+            vec![
+                search_observation(80_000, 76_000, 50.0),
+                search_observation(65_000, 62_000, 49.0),
+                search_observation(50_000, 48_000, 48.0),
+            ],
+        );
+        assert_eq!(result.action, ProfileSearchAction::Fallback);
+        assert_eq!(result.reason, "queue-outside-cake-control");
+        assert!(result.no_cake_effect);
+        assert!(!result.knee_detected);
+        assert!(!result.noisy);
+        let selected_index = result.selected_index.unwrap();
+        let runtime_index = result.runtime_minimum_index.unwrap();
+        assert_eq!(selected_index, runtime_index);
+        assert_eq!(result.observations[selected_index].candidate_kbps, 80_000);
+        assert!(result.metrics[selected_index].safety_pass);
+        assert!(result.metrics[selected_index].target_met);
+        assert!(result.metrics[selected_index].retention_percent >= 50.0);
+        let json = result.to_json();
+        assert!(json.contains("\"action\":\"fallback\""));
+        assert!(json.contains("\"runtime_minimum_kbps\":80000"));
+        assert!(json.contains("\"no_cake_effect\":true"));
+        assert!(json.contains("\"inconclusive\":false"));
+    }
+
+    #[test]
+    fn variable_link_flat_gradient_below_retention_floor_remains_reviewable() {
+        let result = profile_search(
+            AutotuneProfile::VariableLink,
+            100_000,
+            35_000,
+            vec![
+                search_observation(49_000, 48_000, 50.0),
+                search_observation(42_000, 41_000, 49.0),
+                search_observation(35_000, 34_000, 48.0),
+            ],
+        );
+        assert_eq!(result.action, ProfileSearchAction::Fallback);
+        assert_eq!(result.reason, "queue-outside-cake-control-target-unmet");
+        assert!(result.no_cake_effect);
+        let selected = result.selected_index.expect("tested safe fallback");
+        assert_eq!(result.runtime_minimum_index, Some(selected));
+        assert_eq!(result.observations[selected].candidate_kbps, 49_000);
+        assert!(result.metrics[selected].safety_pass);
+        assert!(result.metrics[selected].retention_percent < 50.0);
+    }
+
+    #[test]
+    fn variable_link_floor_without_plateau_binds_exact_tested_fallback() {
         let result = profile_search(
             AutotuneProfile::VariableLink,
             100_000,
@@ -4562,17 +5068,49 @@ mod tests {
                 search_observation(35_000, 34_000, 30.0),
             ],
         );
-        assert_eq!(result.action, ProfileSearchAction::Inconclusive);
+        assert_eq!(result.action, ProfileSearchAction::Fallback);
         assert_eq!(
             result.reason,
             "exploration-floor-reached-without-latency-knee"
         );
         assert!(!result.knee_detected);
-        assert!(result.runtime_minimum_index.is_none());
+        let selected = result.selected_index.expect("tested safe fallback");
+        assert_eq!(result.runtime_minimum_index, Some(selected));
+        assert!(result.metrics[selected].safety_pass);
+        assert!(result
+            .observations
+            .iter()
+            .any(|observation| observation.candidate_kbps
+                == result.observations[selected].candidate_kbps));
     }
 
     #[test]
-    fn variable_link_retries_nonmonotonic_noise_three_times_then_fails_closed() {
+    fn variable_link_floor_without_knee_returns_exact_tested_manual_fallback() {
+        let result = profile_search(
+            AutotuneProfile::VariableLink,
+            100_000,
+            35_000,
+            vec![
+                search_observation(80_000, 76_000, 22.0),
+                search_observation(65_000, 62_000, 21.0),
+                search_observation(50_000, 48_000, 17.0),
+                search_observation(35_000, 34_000, 18.0),
+            ],
+        );
+        assert_eq!(result.action, ProfileSearchAction::Fallback);
+        assert_eq!(result.reason, "exploration-floor-reached");
+        assert!(!result.knee_detected);
+        assert!(!result.no_cake_effect);
+        assert!(!result.noisy);
+        let selected_index = result.selected_index.unwrap();
+        assert_eq!(result.runtime_minimum_index, Some(selected_index));
+        assert_eq!(result.observations[selected_index].candidate_kbps, 80_000);
+        assert!(result.metrics[selected_index].target_met);
+        assert!(result.metrics[selected_index].retention_percent >= 50.0);
+    }
+
+    #[test]
+    fn variable_link_retries_nonmonotonic_noise_then_returns_best_trusted_review() {
         let first = profile_search(
             AutotuneProfile::VariableLink,
             100_000,
@@ -4596,10 +5134,41 @@ mod tests {
                 search_observation(65_000, 61_800, 100.0),
             ],
         );
-        assert_eq!(exhausted.action, ProfileSearchAction::Inconclusive);
-        assert_eq!(exhausted.reason, "nonmonotonic-variable-link-after-retries");
+        assert_eq!(exhausted.action, ProfileSearchAction::Fallback);
+        assert_eq!(exhausted.reason, "noisy-link-safe-review");
         assert!(exhausted.noisy);
-        assert!(exhausted.runtime_minimum_index.is_none());
+        assert!(!exhausted.no_cake_effect);
+        let selected_index = exhausted.selected_index.unwrap();
+        assert_eq!(exhausted.runtime_minimum_index, Some(selected_index));
+        assert_eq!(
+            exhausted.observations[selected_index].candidate_kbps,
+            80_000
+        );
+        assert_eq!(exhausted.metrics[selected_index].grade, "C");
+        assert!(!exhausted.metrics[selected_index].target_met);
+        assert!(exhausted.metrics[selected_index].retention_percent >= 50.0);
+    }
+
+    #[test]
+    fn variable_link_noisy_points_below_trust_floor_keep_a_safe_fallback() {
+        let result = profile_search(
+            AutotuneProfile::VariableLink,
+            100_000,
+            35_000,
+            vec![
+                search_observation(49_000, 48_000, 80.0),
+                search_observation(42_000, 41_000, 100.0),
+                search_observation(42_000, 40_500, 100.0),
+                search_observation(42_000, 40_800, 100.0),
+            ],
+        );
+        assert_eq!(result.action, ProfileSearchAction::Fallback);
+        assert_eq!(result.reason, "nonmonotonic-variable-link-after-retries");
+        assert!(result.noisy);
+        let selected = result.selected_index.expect("tested safe fallback");
+        assert_eq!(result.runtime_minimum_index, Some(selected));
+        assert_eq!(result.observations[selected].candidate_kbps, 49_000);
+        assert!(result.metrics[selected].safety_pass);
     }
 
     #[test]
@@ -4953,6 +5522,142 @@ mod tests {
         );
         assert_eq!(inconclusive.action, ProfileSearchAction::Inconclusive);
         assert_eq!(inconclusive.reason, "resource-safety-failure-not-resolved");
+    }
+
+    #[test]
+    fn terminal_unsafe_probe_keeps_an_earlier_exact_safe_point() {
+        let unsafe_observation = |achieved_kbps| SearchObservation {
+            candidate_kbps: 100_000,
+            achieved_kbps,
+            icmp_delta_ms: 1.0,
+            transport_delta_ms: 1.0,
+            loss_percent: 10.0,
+            cpu_percent: 50.0,
+        };
+        let result = profile_search(
+            AutotuneProfile::BestOverall,
+            100_000,
+            70_000,
+            vec![
+                search_observation(70_000, 67_000, 20.0),
+                unsafe_observation(95_000),
+                unsafe_observation(95_500),
+                unsafe_observation(95_200),
+            ],
+        );
+        assert_eq!(result.action, ProfileSearchAction::Fallback);
+        assert_eq!(result.reason, "resource-safety-failure-not-resolved");
+        assert_eq!(result.selected_index, Some(0));
+        assert!(result.metrics[0].safety_pass);
+        assert!(!result.metrics[3].safety_pass);
+    }
+
+    #[test]
+    fn terminal_unreliable_probe_keeps_extreme_runtime_minimum_bound_to_safe_point() {
+        let result = profile_search(
+            AutotuneProfile::GamingExtreme,
+            100_000,
+            25_000,
+            vec![
+                search_observation(70_000, 67_000, 3.0),
+                search_observation(100_000, 120_000, 2.0),
+                search_observation(100_000, 121_000, 2.0),
+                search_observation(100_000, 122_000, 2.0),
+            ],
+        );
+        assert_eq!(result.action, ProfileSearchAction::Fallback);
+        assert_eq!(result.reason, "repeated-candidate-realization-unreliable");
+        assert_eq!(result.selected_index, Some(0));
+        assert_eq!(result.runtime_minimum_index, Some(0));
+        assert!(result.metrics[0].safety_pass);
+        assert!(!result.metrics[3].safety_pass);
+    }
+
+    #[test]
+    fn variable_attempt_limit_keeps_the_best_exact_safe_point() {
+        let result = profile_search(
+            AutotuneProfile::VariableLink,
+            100_000,
+            35_000,
+            vec![
+                search_observation(95_000, 90_000, 190.0),
+                search_observation(85_000, 81_000, 160.0),
+                search_observation(75_000, 71_000, 130.0),
+                search_observation(65_000, 62_000, 100.0),
+                search_observation(55_000, 52_000, 70.0),
+                search_observation(45_000, 43_000, 40.0),
+            ],
+        );
+        assert_eq!(result.action, ProfileSearchAction::Fallback);
+        assert_eq!(result.reason, "bounded-attempt-limit-before-latency-knee");
+        let selected = result.selected_index.expect("tested safe fallback");
+        assert_eq!(result.runtime_minimum_index, Some(selected));
+        assert_eq!(result.observations[selected].candidate_kbps, 45_000);
+        assert!(result.metrics[selected].safety_pass);
+    }
+
+    #[test]
+    fn variable_cannot_progress_terminal_resolution_keeps_a_safe_point() {
+        // The cannot-progress branch is a defensive guard for future search
+        // strategies. Exercise the shared terminal resolver directly so that
+        // this invariant cannot regress even though today's fixed descending
+        // step normally makes that branch unreachable for a valid history.
+        let input = ProfileSearchInput {
+            profile: AutotuneProfile::VariableLink,
+            direction: SearchDirection::Download,
+            observed_low_kbps: 100_000,
+            minimum_kbps: 35_000,
+            upper_kbps: 100_000,
+            thresholds: AutotuneProfile::VariableLink.validation_thresholds(),
+            uncertainty_percent: 1.5,
+            max_attempts: 6,
+            observations: vec![search_observation(80_000, 76_000, 80.0)],
+        };
+        let metrics = input
+            .observations
+            .iter()
+            .copied()
+            .map(|observation| evaluate_search_observation(&input, observation))
+            .collect::<Vec<_>>();
+        let (action, selected) = resolve_terminal_safe_fallback(
+            &input,
+            &metrics,
+            ProfileSearchAction::Inconclusive,
+            None,
+        );
+        assert_eq!(action, ProfileSearchAction::Fallback);
+        assert_eq!(selected, Some(0));
+        assert!(metrics[0].safety_pass);
+    }
+
+    #[test]
+    fn terminal_resolution_stays_inconclusive_when_no_safe_point_exists() {
+        let input = ProfileSearchInput {
+            profile: AutotuneProfile::VariableLink,
+            direction: SearchDirection::Download,
+            observed_low_kbps: 100_000,
+            minimum_kbps: 35_000,
+            upper_kbps: 100_000,
+            thresholds: AutotuneProfile::VariableLink.validation_thresholds(),
+            uncertainty_percent: 1.5,
+            max_attempts: 6,
+            observations: vec![search_observation(80_000, 30_000, 80.0)],
+        };
+        let metrics = input
+            .observations
+            .iter()
+            .copied()
+            .map(|observation| evaluate_search_observation(&input, observation))
+            .collect::<Vec<_>>();
+        let (action, selected) = resolve_terminal_safe_fallback(
+            &input,
+            &metrics,
+            ProfileSearchAction::Inconclusive,
+            None,
+        );
+        assert_eq!(action, ProfileSearchAction::Inconclusive);
+        assert_eq!(selected, None);
+        assert!(!metrics[0].safety_pass);
     }
 
     #[test]

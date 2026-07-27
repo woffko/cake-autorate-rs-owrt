@@ -284,6 +284,20 @@ export CAKE_AUTORATE_RUNTIME_LOCK_ROOT="$work/runtime-locks"
 set -- test eth0 '' '' '' '' ''
 CAKE_AUTORATE_SPEEDTEST_SOURCE_ONLY=1 . "$script"
 
+bypass_scope_matches_direction ingress both ||
+	fail_test "simultaneous load with the explicit ingress-only topology was rejected"
+bypass_scope_matches_direction ingress download ||
+	fail_test "download-only ingress bypass was rejected"
+bypass_scope_matches_direction egress upload ||
+	fail_test "upload-only egress bypass was rejected"
+bypass_scope_matches_direction full both ||
+	fail_test "full bidirectional bypass was rejected"
+if bypass_scope_matches_direction ingress upload ||
+   bypass_scope_matches_direction egress download ||
+   bypass_scope_matches_direction egress both; then
+	fail_test "an unsupported bypass-scope and speed-test-direction pair was accepted"
+fi
+
 # Directional raw controls must remove only the selected managed CAKE path.
 # The opposite direction remains shaped until immutable recovery restores the
 # complete SQM transaction after the measurement.
