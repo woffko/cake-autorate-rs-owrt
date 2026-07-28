@@ -71,12 +71,12 @@ explicit below.
 
 **Status** keeps the operational state in one place: uplink lifecycle,
 Autorate/SQM/classifier health, active profiles, current collection state and
-the last complete connection rating. The example below is a real completed
-automatic test on an isolated `test_instance`; it measured A+ for both download
-and upload without changing the configured CAKE limits. Results naturally
-depend on the tested link and load at that moment.
+the last complete connection rating. The anonymized example below shows two
+independently routed uplinks and the honest **WAITING FOR DATA** state. After a
+complete passive or guided capture, **LAST KNOWN** preserves that DL/UL grade;
+an incomplete or contaminated attempt never replaces it.
 
-[![Status overview with a completed A+ rating](docs/screenshots/status-overview.png)](docs/screenshots/status-overview.png)
+[![Status overview for two independently routed uplinks](docs/screenshots/status-overview.png)](docs/screenshots/status-overview.png)
 
 **Graphs** use an opt-in, bounded RAM-only history. Latency, transport delta,
 effective delay, CPU and synchronized download/upload traffic share the same
@@ -124,10 +124,9 @@ The following controlled OpenWrt cellular-link sample runs are anonymized benchm
 
 ICMP samples in this set stayed around **10–13 ms** while TCP/WebSocket samples were **72–190 ms**. This is a measurable risk signal that some providers/networks may prioritize or specially treat ICMP, so ICMP-only grading can understate user-traffic latency.
 
-### Transport-aware adaptive capacity (current development)
+### Transport-aware adaptive capacity
 
-The current development source implements the following controller and LuCI
-model. It remains unreleased until a new release is published:
+RC27 implements the following controller and LuCI model:
 
 - Keep raw capacity, current rate, measured runtime minimum, exploration
   minimum, safe ceiling, failed bound, confidence and route epoch independently
@@ -188,7 +187,10 @@ model. It remains unreleased until a new release is published:
 - Keep three user choices separate: calibration strategy (**Shaped only**,
   **Full raw capacity**, or **Reuse trusted bounds**), runtime learning
   (**Passive only**, **Periodic active probes**, or **Fixed bounds**), and
-  operating profile (Gaming, Best overall, Variable link, or Fair).
+  operating profile (Gaming, Best overall, Variable link, or Fair). Reuse is
+  enabled only after that instance has saved positive DL and UL P50 references;
+  an uncalibrated or stale reuse choice is explained and safely normalized to
+  Shaped only.
 - Keep scheduled traffic injection opt-in. The scheduler reserves and settles
   per-instance daily/monthly byte allowances in a crash-safe ledger, shows the
   next due run and remaining allowance, and stops before exceeding a hard
@@ -210,8 +212,7 @@ it does not by itself reject an otherwise safe candidate.
 
 ## Current package tree
 
-The current development tree builds the OpenWrt 25.12 daemon APK for this ABI
-matrix:
+The RC27 release builds the OpenWrt 25.12 daemon APK for this ABI matrix:
 
 | APK suffix | Representative OpenWrt target |
 |---|---|
@@ -231,8 +232,8 @@ matrix:
 The target is an APK ABI rather than one specific board. The authoritative
 choice is the value returned by `apk --print-arch`. Every daemon asset follows
 the name
-`cake-autorate-rs-1.0_rc27-r17_openwrt-25.12_<arch>.apk`; the shared
-`luci-app-cake-autorate-rs-1.0_rc27-r32_openwrt-25.12_all.apk` contains the
+`cake-autorate-rs-1.0_rc27-r20_openwrt-25.12_<arch>.apk`; the shared
+`luci-app-cake-autorate-rs-1.0_rc27-r40_openwrt-25.12_all.apk` contains the
 architecture-independent LuCI interface and SQM integration.
 
 RC27 adds background-aware Full Auto-Tune confidence without mixing forwarded
@@ -622,9 +623,10 @@ SQM integration:
   the legacy HTTP/built-in speed-test fallback. Full Auto-Tune transport
   validation uses the native Rust probe in the daemon package.
 - The LuCI package declares `PROVIDES:=luci-app-sqm` and `CONFLICTS:=luci-app-sqm`
-  as the replacement intent. OpenWrt 25.12 APK package generation currently emits
-  the provide metadata, but conflict metadata still needs verification in final
-  packages.
+  as the build-time replacement intent. Final OpenWrt 25.12 APK v3 metadata
+  verification confirms that the generator emits the provide but omits a
+  runtime conflict field. Remove the standalone `luci-app-sqm` before installing
+  this replacement; do not rely on the live APK solver to reject both UIs.
 - The UI includes the required `luci-app-sqm` settings: enable flag, interface,
   download/upload rates, debug logging, verbosity, qdisc, queue setup script,
   DSCP/ECN options, queue limits, latency targets, raw qdisc options, link layer
@@ -758,12 +760,19 @@ them together. Determine the daemon suffix first:
 apk --print-arch
 ```
 
+If the standalone SQM LuCI application is installed, remove only that UI
+package first; keep `sqm-scripts`, which is a required runtime dependency:
+
+```sh
+apk info -e luci-app-sqm && apk del luci-app-sqm
+```
+
 For example, when it prints `aarch64_generic`:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc27-r17_openwrt-25.12_aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc27-r32_openwrt-25.12_all.apk
+  /root/cake-autorate-rs-1.0_rc27-r20_openwrt-25.12_aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc27-r40_openwrt-25.12_all.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:

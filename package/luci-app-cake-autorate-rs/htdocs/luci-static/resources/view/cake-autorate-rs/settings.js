@@ -1575,8 +1575,17 @@ function autotuneRunProfile(state) {
 		'gaming_extreme' : profile;
 }
 
+function autotuneHasTrustedCapacityReferences(state) {
+	var dl = parsePositiveRate(state && state.throughput_reference_dl_p50_kbps);
+	var ul = parsePositiveRate(state && state.throughput_reference_ul_p50_kbps);
+
+	return dl != null && dl > 0 && ul != null && ul > 0;
+}
+
 function autotuneCalibrationStrategy(state) {
 	var strategy = state && state.autotune_calibration_strategy;
+	if (strategy === 'reuse_trusted' && !autotuneHasTrustedCapacityReferences(state))
+		return 'shaped_only';
 	return [ 'shaped_only', 'full_raw', 'reuse_trusted' ].indexOf(strategy) >= 0 ?
 		strategy : 'shaped_only';
 }
@@ -1594,12 +1603,17 @@ function autotuneResultCalibrationStrategy(result) {
 }
 
 function autotuneCalibrationStrategyControl(state, disabled, onChange) {
+	var reuseAvailable = autotuneHasTrustedCapacityReferences(state);
 	var descriptions = {
 		shaped_only: _('Keeps managed CAKE active while measuring. Safest default; it searches only inside capacity the current bounds can demonstrate.'),
 		full_raw: _('Temporarily bypasses only the direction being measured, under the recovery watchdog. This can consume more traffic and briefly removes shaping for that direction.'),
-		reuse_trusted: _('Revalidates the currently trusted/configured bounds without opening a raw-capacity path. It does not claim a new physical line rate.')
+		reuse_trusted: reuseAvailable ?
+			_('Revalidates the currently trusted/configured bounds without opening a raw-capacity path. It does not claim a new physical line rate.') :
+			_('Requires saved DL and UL P50 capacity references from a completed calibration. Run Shaped only or Full raw capacity first and apply its proposal.')
 	};
 	var selected = autotuneCalibrationStrategy(state);
+	if (state && state.autotune_calibration_strategy === 'reuse_trusted' && !reuseAvailable)
+		state.autotune_calibration_strategy = selected;
 	var help = E('div', { 'style': 'margin-top:6px;color:var(--text-color-medium,#777)' }, descriptions[selected]);
 	var select = E('select', {
 		'class': 'cbi-input-select',
@@ -1613,7 +1627,12 @@ function autotuneCalibrationStrategyControl(state, disabled, onChange) {
 	}, [
 		E('option', { 'value': 'shaped_only', 'selected': selected === 'shaped_only' ? 'selected' : null }, _('Shaped only (recommended)')),
 		E('option', { 'value': 'full_raw', 'selected': selected === 'full_raw' ? 'selected' : null }, _('Full raw capacity')),
-		E('option', { 'value': 'reuse_trusted', 'selected': selected === 'reuse_trusted' ? 'selected' : null }, _('Reuse current trusted bounds'))
+		E('option', {
+			'value': 'reuse_trusted',
+			'selected': selected === 'reuse_trusted' ? 'selected' : null,
+			'disabled': reuseAvailable ? null : 'disabled'
+		}, reuseAvailable ? _('Reuse current trusted bounds') :
+			_('Reuse current trusted bounds (requires prior calibration)'))
 	]);
 	return E('div', {}, [ select, help ]);
 }
@@ -6103,6 +6122,8 @@ function showCreateWizard(grid, name, existingName) {
 		sqm_direction_mode: 'both',
 		autotune_profile: 'best_overall',
 		autotune_calibration_strategy: 'shaped_only',
+		throughput_reference_dl_p50_kbps: '',
+		throughput_reference_ul_p50_kbps: '',
 		autotune_extreme_a_plus: false,
 		autotune_action: 'apply_sqm',
 		autune_proposal_id: '',
@@ -6145,6 +6166,10 @@ function showCreateWizard(grid, name, existingName) {
 			uci.get('cake-autorate', existingName, 'autotune_profile')) || 'best_overall';
 		state.autotune_calibration_strategy = uci.get('cake-autorate', existingName,
 			'autotune_calibration_strategy') || 'shaped_only';
+		state.throughput_reference_dl_p50_kbps = uci.get('cake-autorate', existingName,
+			'throughput_reference_dl_p50_kbps') || '';
+		state.throughput_reference_ul_p50_kbps = uci.get('cake-autorate', existingName,
+			'throughput_reference_ul_p50_kbps') || '';
 		state.speedtest_backend = uci.get('cake-autorate', existingName, 'speedtest_backend') || 'auto';
 		state.speedtest_go_server_id = uci.get('cake-autorate', existingName, 'speedtest_go_server_id') || '';
 		state.speedtest_apply_percent = uci.get('cake-autorate', existingName, 'speedtest_apply_percent') || '90';

@@ -2117,3 +2117,102 @@ Installed x86_64 packages used for this pass:
   `05dd9400a7cb38de4c8f4c09c6a70243d510ef91d5400b110d0a3360a50e4d65`;
 - `luci-app-cake-autorate-rs-1.0_rc27-r2.apk`, SHA256
   `fe49f1f85afcc7c180b4f00ed07c8c7f93f92316e7bed37da4fe5b48a69fe0ff`.
+
+## RC27 final directional-proposal and release-matrix gate (2026-07-28)
+
+The final RC27 producer, LuCI, and Apply Guard independently validate each
+measured topology. Both-shaped, upload-only, download-only, and no-SQM choices
+must carry their own observations and exact tested rates. A topology is never
+inferred from another candidate. Variable Link may retain an exact-tested
+manual proposal when noise prevents the strict CAKE-control objective, but it
+must remain above the hard realization floor and can never become an
+unattended apply. A stale route epoch, external address, proposal ID, instance,
+action, rate, or evidence hash fails closed.
+
+The final source gate passed 200 Rust tests, 21 shell suites, all 7 LuCI
+JavaScript suites, Rust formatting, shell and Node syntax checks, and
+`git diff --check`. The shell coverage includes lifecycle/recovery, guarded
+apply, scheduler, route ownership, one-sided CAKE/IFB handling, background
+confidence, quality state, graph history, status columns, speed-test routing,
+and managed-SQM survival after interrupted or repeated operations.
+
+A real anonymized cellular `Variable Link / full raw` run independently
+measured three choices: both directions shaped at class C, upload-only at class
+B with lower confidence, and raw/no-SQM at class C. The conservative
+both-shaped choice remained the default. The operator explicitly selected the
+upload-only review choice; the guard completed its armed, applying, verified,
+confirming, finalized, and complete states in about 23 seconds. The persisted
+mode had no download shaper, one healthy upload CAKE queue at the exact proposed
+rate, clean UCI, no stale guard directory, and healthy controller services.
+This demonstrates that a directional suggestion is actionable without
+pretending its lower-confidence result is automatic or universally superior.
+
+Fresh desktop and mobile Playwright contexts then audited all three test
+routers. Status preserved its mandatory instance, uplink, profile, quality,
+service, and rating-action fields without overlap. Long instance names wrapped
+instead of clipping the table. For every enabled history card, latency/CPU and
+DL/UL canvases remained horizontally synchronized while two fixed time axes
+were checked at the beginning, middle, and end of the scroll range. A router
+with history disabled for one instance rendered that state without inventing a
+graph. Settings mobile subnavigation stayed a two-column grid and wizard text
+did not split into unreadable fragments.
+
+The standard LuCI graph footer was exercised on both Multi-WAN routers. Each
+run staged an alternate interval, proved Reset restored the committed value,
+then completed two consecutive Save & Apply cycles and returned to the
+original interval. Both runs ended with clean UCI, no RPC/ACL/browser error, no
+false Unsaved Changes marker, and all independent autorate services running.
+The new-instance wizard was also opened on both routers with a disposable
+instance name and cancelled. Owned mwan3 members were unavailable for duplicate
+selection, Full Auto-Tune retained all four profiles and three strategies, and
+Cancel produced exactly zero UCI writes.
+
+The release payload was built with OpenWrt 25.12.5 SDKs for the same 12 APK
+architectures published by the referenced nftables mwan3 build: x86_64,
+aarch64_generic, three tuned AArch64 variants, five ARMv7 variants, and both
+MIPS 24kc endiannesses. Every daemon `1.0_rc27-r20` APK and the shared LuCI
+`1.0_rc27-r40` APK passed SDK-host integrity verification. Package metadata
+matched the expected name, version, ABI, and dependency set; extracted daemon
+ELFs matched the declared class, endianness, ARM float ABI or MIPS revision,
+and musl loader. The final `SHA256SUMS` manifest verifies all 13 APKs.
+
+The remaining live Multi-WAN publication gate is the explicit external-IP
+comparison through both active members. Internal member, mark, table, source
+address, L3-device, CAKE/IFB, service, and UCI checks already pass. The public
+echo requests are intentionally not run without operator consent because the
+endpoint observes each route's public address.
+
+### LuCI r40 live regression evidence
+
+LuCI r40 closes the last invalid bootstrap path for calibration-strategy
+selection. `Reuse current trusted bounds` is enabled only when both saved DL
+and UL P50 references are positive. A stale imported selection is normalized
+to Shaped only before launch. The focused JavaScript suite covers both the
+availability predicate and fallback; live Playwright verified that the primary
+Multi-WAN instance exposes reuse while the uncalibrated backup disables it with
+an explanatory label.
+
+The route-bound Re-run matrix completed all 15 valid profile/strategy pairs on
+the calibrated primary member and all 10 valid pairs on the uncalibrated backup
+member. Each run resolved to its expected mwan3 member and L3 device, then was
+cancelled at preflight with runtime restored, no pending recovery and no UCI
+write. The missing five backup combinations are precisely the now-disabled
+reuse strategy, not skipped failures.
+
+A fresh Best overall/reuse run on the primary member encountered real
+background traffic and took the explicit conservative path. It still produced
+an exact hard-safe both-shaped proposal. After acknowledging the one reported
+deviation, Apply Guard completed `armed -> applying -> verified -> confirming
+-> finalized -> complete` in 14 seconds. UCI was clean; the test-altered
+adaptive-ceiling setting was then restored from the pre-run backup and both
+configuration hashes exactly matched their recorded originals.
+
+Fresh no-cache desktop and mobile audits passed on all three routers with
+daemon r20 and LuCI r40. Two consecutive standard Save & Apply cycles passed on
+both Multi-WAN routers, including reset to the original graph interval, without
+RPC/ACL errors, false unsaved-change state or cross-instance service impact.
+The README screenshots were regenerated from r40 and manually inspected after
+anonymization. The Status capture deliberately shows `WAITING FOR DATA`: an
+automatic Get rating attempt refused safely at preflight while forwarded
+traffic remained around 45 Mbit/s in both directions, so no grade was fabricated
+for documentation.

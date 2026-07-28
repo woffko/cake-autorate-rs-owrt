@@ -18,7 +18,10 @@ instance only after identifying the intended uplink.
      start; **Full raw capacity** temporarily bypasses only the selected managed
      CAKE direction and can transfer several GiB on a fast link; **Reuse trusted
      bounds** avoids a new raw sweep only while route-bound evidence remains
-     valid.
+     valid. Reuse is available only after a completed calibration has stored
+     positive download and upload P50 references for that instance. Until then
+     the choice is disabled with an explanation; an imported stale reuse choice
+     safely falls back to Shaped only.
    - **Runtime learning:** **Passive only** learns from real saturated traffic;
      **Periodic active probes** is opt-in and consumes the configured
      daily/monthly allowance; **Fixed bounds** performs no synthetic growth
@@ -61,9 +64,12 @@ instance only after identifying the intended uplink.
 5. If background traffic blocks calibration, prefer **Retry when quiet**. The
    explicit **Continue conservatively** action applies to that run only: it
    subtracts measured background with an extra margin, never raises confirmed
-   maxima or adaptive caps, and retains a direction whose evidence is not
-   usable. The Review page labels such a result **LOW confidence** and keeps it
-   diagnostic-only: it cannot be applied or consumed by scheduled Auto-Apply.
+   maxima or adaptive caps, and lowers confidence in every affected direction.
+   If all hard route, measurement, SQM-ownership, latency/loss, realization and
+   restoration gates still pass, Review may offer the exact measured proposal
+   for explicit manual acceptance of every listed deviation. Otherwise it stays
+   diagnostic-only. Conservative evidence is never consumed by scheduled
+   Auto-Apply.
 6. Review the selected profile, proposed min/base/max rates, absolute
    adaptive-ceiling caps, link-layer overhead, latency thresholds, validation
    gates, exact CAKE class policy, and warnings. Nothing is written before
@@ -129,10 +135,12 @@ The search can repeat an unreliable candidate, test the observed-low upper
 bound, and bisect the measured quality boundary. It never silently lowers a
 profile's 70/80/90% Auto-Apply objective. A clean shortfall, including one
 below the common 50% historical trust boundary, can be offered only for
-explicit manual review. Failed, incomplete, strictly
-contaminated and conservative runs remain diagnostics and do not replace the
-current UCI configuration. A safe result below the Gaming or Best overall
-target is explicitly manual-only and scheduled Auto-Apply cannot consume it.
+explicit manual review. Failed or incomplete runs remain diagnostics. A
+conservative/contaminated run is applicable only when it still yields a
+complete hard-safe exact proposal and the operator explicitly acknowledges all
+deviations; otherwise it cannot replace the current UCI configuration. A safe
+result below the Gaming or Best overall target is explicitly manual-only and
+scheduled Auto-Apply cannot consume it.
 
 When repeated tests remain below the 50% historical trust boundary, Review
 identifies the result as unusually far from the earlier raw capacity. CPU and

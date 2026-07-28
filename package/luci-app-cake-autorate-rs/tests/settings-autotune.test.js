@@ -112,6 +112,7 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 			`topicTab, autorateSubcategory, autorateSubcategoryDefinitions, ` +
 			`canonicalAutotuneProfile, autotuneProfilePolicy, autotuneProfileDefinitions, ` +
 			`visibleAutotuneProfile, autotuneRunProfile, storedAutotuneProfile, ` +
+			`autotuneHasTrustedCapacityReferences, autotuneCalibrationStrategy, ` +
 			`autotuneRunningRequestMatches, ` +
 			`autotuneAchievedGrade, autotuneGradeTone, ` +
 			`autotuneProposalMatchesProfile, autotuneProposalCandidates, ` +
@@ -150,6 +151,37 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 }
 
 const helpers = compileHelpers({});
+assert.equal(helpers.autotuneHasTrustedCapacityReferences({}), false,
+	'reuse-trusted must stay unavailable without saved capacity references');
+assert.equal(helpers.autotuneHasTrustedCapacityReferences({
+	throughput_reference_dl_p50_kbps: '50000',
+}), false, 'a saved DL reference without UL must not enable reuse-trusted');
+assert.equal(helpers.autotuneHasTrustedCapacityReferences({
+	throughput_reference_ul_p50_kbps: '10000',
+}), false, 'a saved UL reference without DL must not enable reuse-trusted');
+assert.equal(helpers.autotuneHasTrustedCapacityReferences({
+	throughput_reference_dl_p50_kbps: '50000',
+	throughput_reference_ul_p50_kbps: '0',
+}), false, 'a non-positive directional reference must not enable reuse-trusted');
+assert.equal(helpers.autotuneHasTrustedCapacityReferences({
+	throughput_reference_dl_p50_kbps: '50000',
+	throughput_reference_ul_p50_kbps: '10000',
+}), true, 'positive saved DL and UL P50 references must enable reuse-trusted');
+assert.equal(helpers.autotuneCalibrationStrategy({
+	autotune_calibration_strategy: 'reuse_trusted',
+}), 'shaped_only', 'an unavailable reuse-trusted request must fail closed to shaped-only');
+assert.equal(helpers.autotuneCalibrationStrategy({
+	autotune_calibration_strategy: 'reuse_trusted',
+	throughput_reference_dl_p50_kbps: '50000',
+}), 'shaped_only', 'a partial reuse-trusted request must fail closed to shaped-only');
+assert.equal(helpers.autotuneCalibrationStrategy({
+	autotune_calibration_strategy: 'reuse_trusted',
+	throughput_reference_dl_p50_kbps: '50000',
+	throughput_reference_ul_p50_kbps: '10000',
+}), 'reuse_trusted', 'reuse-trusted must remain selected when both saved references exist');
+assert.match(source,
+	/'disabled': reuseAvailable \? null : 'disabled'[\s\S]*?Reuse current trusted bounds \(requires prior calibration\)/,
+	'the wizard must visibly disable reuse-trusted until prior calibration references exist');
 assert.match(source, /Simultaneous DL\+UL confirmation/,
 	'Review must expose the final simultaneous direction confirmation');
 assert.match(source, /Directional CAKE proposal/,

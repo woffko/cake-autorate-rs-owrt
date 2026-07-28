@@ -13,9 +13,10 @@ instance.
 
 When the creation wizard selects every unused mwan3 uplink, calibration is
 interactive and strictly sequential. Each uplink first gets its own Gaming,
-Best overall, or Fair profile, then runs only through that member, and stops on
-its own result. A safe shaped proposal may be accepted; any settled result may
-instead be skipped. Only after that explicit decision does the wizard move to
+Best overall, Variable link, or Fair profile, then runs only through that
+member, and stops on its own result. A safe shaped proposal may be accepted;
+any settled result may instead be skipped. Only after that explicit decision
+does the wizard move to
 the next uplink. A skipped uplink is shown in the aggregate Review and, if the
 user finally creates the set, is written disabled with `autotune_pending=1`.
 Failure, background traffic, or cancellation never auto-advances, and a member
@@ -38,10 +39,9 @@ accepted transaction has completed and no guard marker remains.
 > directly; terminal cleanup treats an absent or safely identified reused PID
 > as already stopped and never signals its new owner.
 
-## Transport-aware adaptive capacity (current development)
+## Transport-aware adaptive capacity
 
-The current development source implements this model. It is not published
-release behavior until a new release containing it is available:
+RC27 implements this model in the matching daemon and LuCI packages:
 
 - The loop is per direction (`dl` / `ul`) and keeps explicit state fields:
   - `safe_ceiling_{dir}`: highest proven safe runtime ceiling
@@ -70,6 +70,11 @@ release behavior until a new release containing it is available:
   shaped-only, or trusted-bound reuse), runtime learning (passive-only,
   periodic active probes, or fixed bounds), and operating profile (Gaming,
   Best overall, Variable link, or Fair).
+- Trusted-bound reuse is an evidence-backed shortcut, not a bootstrap mode. It
+  is selectable only when the same instance already has positive saved DL and
+  UL P50 capacity references. LuCI disables it for an uncalibrated instance;
+  a stale imported `reuse_trusted` value is normalized to `shaped_only` before
+  a job starts.
 - Fail-closed remains unchanged: identity loss, counter contamination, transport parse/continuity issues, or confidence collapse keep the direction closed to changes and force conservative reporting.
 - Confidence reporting stays explicit and directional
   (safe/provisional/limited) so policy and state transitions remain auditable.
