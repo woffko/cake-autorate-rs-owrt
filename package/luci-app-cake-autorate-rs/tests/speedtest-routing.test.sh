@@ -401,6 +401,7 @@ prepare_directional_sqm_bypass egress || fail_test "managed egress-only bypass f
 # it must still match the cached pre-mutation snapshot.
 (
 	section=wan
+	target_if=eth0
 	calibration_sqm_managed=1
 	calibration_sqm_section=cake_wan
 	calibration_sqm_target=eth0
@@ -411,7 +412,9 @@ prepare_directional_sqm_bypass egress || fail_test "managed egress-only bypass f
 	calibration_sqm_config_fingerprint=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 	test_live_direction_mode=upload_only
 	test_live_manage_sqm=1
+	test_live_target=eth0
 	test_live_ul_if=eth0
+	test_live_dl_if=ifb4eth0
 	managed_sqm_snapshot_path_valid() { return 0; }
 	uci_raw_get() {
 		case "$1" in
@@ -426,8 +429,9 @@ prepare_directional_sqm_bypass egress || fail_test "managed egress-only bypass f
 			enabled|sqm_enabled) printf '1\n' ;;
 			manage_sqm) printf '%s\n' "$test_live_manage_sqm" ;;
 			sqm_section) printf 'cake_wan\n' ;;
-			sqm_interface|ul_if) printf '%s\n' "$test_live_ul_if" ;;
-			dl_if) printf 'ifb4eth0\n' ;;
+			sqm_interface) printf '%s\n' "$test_live_target" ;;
+			ul_if) printf '%s\n' "$test_live_ul_if" ;;
+			dl_if) printf '%s\n' "$test_live_dl_if" ;;
 			sqm_direction_mode) printf '%s\n' "$test_live_direction_mode" ;;
 			*) return 1 ;;
 		esac
@@ -442,6 +446,10 @@ prepare_directional_sqm_bypass egress || fail_test "managed egress-only bypass f
 	test_live_manage_sqm=1
 	test_live_ul_if=eth9
 	if managed_sqm_snapshot_still_current; then exit 1; fi
+	test_live_target=""
+	test_live_ul_if=""
+	test_live_dl_if=""
+	managed_sqm_snapshot_still_current || exit 1
 ) || fail_test "live autorate direction drift was accepted before directional SQM mutation"
 
 # A harmless empty ingress qdisc is allowed, but duplicate or foreign mirred
