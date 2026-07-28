@@ -721,8 +721,10 @@ device_has_no_shaping_root() {
 		}
 		END {
 			if (root_count == 0) exit(unsafe_child ? 1 : 0)
-			if (root_count == 1 && root_kind == "noqueue" && !unsafe_child) exit 0
-			if (root_count == 1 && root_kind == "mq" && !unsafe_child) exit 0
+			if (root_count == 1 && !unsafe_child &&
+			    (root_kind == "noqueue" || root_kind == "mq" ||
+			     root_kind == "fq_codel" || root_kind == "pfifo_fast" ||
+			     root_kind == "fq")) exit 0
 			exit 1
 		}
 	'

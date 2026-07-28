@@ -382,11 +382,13 @@ prepare_directional_sqm_bypass egress || fail_test "managed egress-only bypass f
 (
 	tc() {
 		case "$*" in
-			'-details qdisc show dev eth0') printf 'qdisc fq_codel 0: root\n' ;;
+			'-details qdisc show dev eth0') printf 'qdisc htb 0: root\n' ;;
 			'-details qdisc show dev eth1') printf '%s\n' 'qdisc mq 0: root' 'qdisc fq_codel 0: parent :1' ;;
 			'-details qdisc show dev ifb4eth0') printf 'qdisc noqueue 0: root\n' ;;
 			'-details qdisc show dev eth2') printf '%s\n' 'qdisc mq 0: root' 'qdisc tbf 1: parent :1 rate 10Mbit' ;;
 			'-details qdisc show dev eth3') printf '%s\n' 'qdisc mq 0: root' 'qdisc fq 1: parent :1 maxrate 10Mbit' ;;
+			'-details qdisc show dev eth4') printf 'qdisc fq_codel 0: root\n' ;;
+			'-details qdisc show dev eth5') printf 'qdisc fq 0: root maxrate 10Mbit\n' ;;
 			*) return 1 ;;
 		esac
 	}
@@ -395,6 +397,8 @@ prepare_directional_sqm_bypass egress || fail_test "managed egress-only bypass f
 	device_has_no_shaping_root ifb4eth0 || exit 1
 	if device_has_no_shaping_root eth2; then exit 1; fi
 	if device_has_no_shaping_root eth3; then exit 1; fi
+	device_has_no_shaping_root eth4 || exit 1
+	if device_has_no_shaping_root eth5; then exit 1; fi
 ) || fail_test "non-CAKE shaping root was accepted as unshaped"
 
 # The autorate-side direction policy is outside the SQM section fingerprint;
