@@ -4595,8 +4595,18 @@ run_directional_control() {
 	control_label=unshaped
 	if [ "$calibration_strategy" = full_raw ]; then
 		case "$control_direction" in
-			download) speedtest_bypass_scope=ingress ;;
-			upload) speedtest_bypass_scope=egress ;;
+			download)
+				case "$sqm_direction_mode" in
+					upload_only) speedtest_bypass_scope=already-unshaped ;;
+					*) speedtest_bypass_scope=ingress ;;
+				esac
+				;;
+			upload)
+				case "$sqm_direction_mode" in
+					download_only) speedtest_bypass_scope=already-unshaped ;;
+					*) speedtest_bypass_scope=egress ;;
+				esac
+				;;
 		esac
 	else
 		speedtest_bypass_scope=full

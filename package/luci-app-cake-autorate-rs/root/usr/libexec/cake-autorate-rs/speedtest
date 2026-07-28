@@ -40,7 +40,7 @@ case "$direction_override" in
 esac
 
 case "$bypass_scope" in
-	full|ingress|egress) ;;
+	full|ingress|egress|already-unshaped) ;;
 	*) bypass_scope_invalid=1; bypass_scope=full ;;
 esac
 
@@ -1276,7 +1276,7 @@ bypass_scope_matches_direction() {
 		# download and upload load while bypassing ingress shaping only.  Keep
 		# this exact mixed topology explicit; every other directional bypass
 		# must still match the single transfer direction it measures.
-		ingress:download|ingress:both|egress:upload|full:*) return 0 ;;
+		ingress:download|ingress:both|egress:upload|full:*|already-unshaped:*) return 0 ;;
 		*) return 1 ;;
 	esac
 }
@@ -1398,6 +1398,11 @@ prepare_speedtest_calibration() {
 					restore_speedtest_calibration >/dev/null 2>&1 || true
 					return 1
 				fi
+				;;
+			already-unshaped)
+				calibration_sqm_paused="false"
+				calibration_sqm_bypass_mode="already-unshaped"
+				append_warning "SQM was intentionally left active because the target direction is naturally unshaped."
 				;;
 		esac
 	elif [ -x "$sqm_run_bin" ] && sqm_active_for_device "$target_if"; then
