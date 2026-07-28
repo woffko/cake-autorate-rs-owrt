@@ -422,6 +422,7 @@ function uploadObservation(download, upload, delta) {
 	const downloadGain = (download - 80000) * 100 / 80000;
 	const uploadRealization = upload * 100 / 20000;
 	return {
+		pass: true,
 		candidate_pass: true,
 		hard_safety_pass: true,
 		material_benefit: true,
@@ -515,6 +516,37 @@ function write(name, mutate) {
 }
 
 write('valid');
+write('nonrepeatable-review', result => {
+	const comparison = result.directional_comparisons.upload_only;
+	comparison.recommended_topology = 'manual_review';
+	comparison.reason = 'upload-only-benefit-not-repeatable';
+	comparison.repeatable = false;
+	comparison.observations[0].effective_delta_ms = 10;
+	comparison.observations[0].delay_improvement_ms = 51;
+	comparison.observations[0].grade = 'A';
+	comparison.observations[1].effective_delta_ms = 25;
+	comparison.observations[1].delay_improvement_ms = 36;
+	comparison.observations[1].grade = 'A';
+	result.proposals[0].effective_delta_ms = 25;
+	result.proposals[0].grade = 'A';
+	result.proposals[0].confidence_percent = 40;
+	result.proposals[0].unmet_objectives = [ 'measurement-confidence' ];
+});
+write('nonrepeatable-missing-ack', result => {
+	const comparison = result.directional_comparisons.upload_only;
+	comparison.recommended_topology = 'manual_review';
+	comparison.reason = 'upload-only-benefit-not-repeatable';
+	comparison.repeatable = false;
+	comparison.observations[0].effective_delta_ms = 10;
+	comparison.observations[0].delay_improvement_ms = 51;
+	comparison.observations[0].grade = 'A';
+	comparison.observations[1].effective_delta_ms = 25;
+	comparison.observations[1].delay_improvement_ms = 36;
+	comparison.observations[1].grade = 'A';
+	result.proposals[0].effective_delta_ms = 25;
+	result.proposals[0].grade = 'A';
+	result.proposals[0].confidence_percent = 40;
+});
 write('realization', result => {
 	result.directional_comparisons.upload_only.observations[0].upload_realization_percent = 99;
 });
@@ -582,6 +614,7 @@ write('utility-review', result => {
 		const delta = i === 0 ? 25 : 27;
 		observations[i].candidate_pass = false;
 		observations[i].material_benefit = false;
+		observations[i].pass = false;
 		observations[i].effective_delta_ms = delta;
 		observations[i].delay_improvement_ms = 10 - delta;
 		observations[i].grade = 'A';
@@ -598,6 +631,7 @@ write('utility-review-missing-benefit-ack', result => {
 	for (const observation of observations) {
 		observation.candidate_pass = false;
 		observation.material_benefit = false;
+		observation.pass = false;
 		observation.download_gain_percent = 0;
 		observation.observation.throughput_kbps.download_kbps = 80000;
 	}
@@ -614,7 +648,7 @@ upload_only_token="$(printf '%s\n' "$upload_only_arm" | sed -n 's/.*"token":"\([
 [ "${#upload_only_token}" -eq 64 ]
 $helper abort "$upload_only_token" >/dev/null
 
-for accepted_upload_only in realization-review utility-review; do
+for accepted_upload_only in realization-review utility-review nonrepeatable-review; do
 	cp "$work/upload-only-$accepted_upload_only.json" "$autotune/wan_sqm/result.json"
 	upload_only_review_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint")"
 	upload_only_review_token="$(printf '%s\n' "$upload_only_review_arm" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')"
@@ -624,7 +658,7 @@ done
 
 for rejected_upload_only in realization gain delay repeatability missing-active-search \
 	realization-review-missing-ack realization-review-duplicate-ack \
-	utility-review-missing-benefit-ack unexpected-utility-ack; do
+	utility-review-missing-benefit-ack unexpected-utility-ack nonrepeatable-missing-ack; do
 	cp "$work/upload-only-$rejected_upload_only.json" "$autotune/wan_sqm/result.json"
 	if $helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint" >/dev/null 2>&1; then
 		echo "apply guard accepted tampered upload-only evidence: $rejected_upload_only" >&2

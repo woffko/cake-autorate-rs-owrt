@@ -784,8 +784,6 @@ build_expected_manifest() {
 				upload_only_shaped|manual_review) ;;
 				*) die "The selected upload-only topology is not backed by its directional evidence." ;;
 			esac
-			require_result_flag '@.directional_comparisons.upload_only.repeatable' true \
-				"The selected upload-only topology is not repeatable."
 			;;
 		download_only_shaped)
 			direction_mode=download_only
@@ -797,8 +795,6 @@ build_expected_manifest() {
 				download_only_shaped|manual_review) ;;
 				*) die "The selected download-only topology is not backed by its directional evidence." ;;
 			esac
-			require_result_flag '@.directional_comparisons.download_only.repeatable' true \
-				"The selected download-only topology is not repeatable."
 			;;
 		*) die "The selected SQM topology is unsupported." ;;
 	esac
@@ -1475,10 +1471,12 @@ validate_directional_proposal_contract() {
 		"The $directional_label proposal is not bound to its directional evidence."
 	require_result_flag "$directional_comparison_path.tested" true \
 		"The $directional_label proposal has no directional comparison."
-	require_result_flag "$directional_comparison_path.repeatable" true \
-		"The selected $directional_label topology is not repeatable."
+	directional_repeatable="$(require_result_value "$directional_comparison_path.repeatable")" ||
+		die "The $directional_label repeatability state is missing."
+	case "$directional_repeatable" in true|false) ;; *) die "The $directional_label repeatability state is invalid." ;; esac
 	directional_material_benefit_proven=true
 	directional_realization_objective_met=true
+	directional_all_strict_pass=true
 
 	for directional_index in 0 1; do
 		directional_path="$directional_comparison_path.observations[$directional_index]"
@@ -1556,6 +1554,14 @@ validate_directional_proposal_contract() {
 			"The $directional_label material-benefit verdict does not match its evidence."
 		require_result_flag "$directional_path.candidate_pass" "$directional_material_benefit_expected" \
 			"The $directional_label candidate verdict does not match its hard-safe utility evidence."
+		directional_observation_pass_expected="$(LC_ALL=C awk -v benefit="$directional_material_benefit_expected" \
+			-v delay="$directional_delta" -v delay_limit="$validation_transport" \
+			-v realization="$directional_realization" -v minimum="$validation_realization_min" 'BEGIN {
+				print (benefit == "true" && delay <= delay_limit && realization >= minimum) ? "true" : "false"
+			}')"
+		require_result_flag "$directional_path.pass" "$directional_observation_pass_expected" \
+			"The $directional_label strict profile verdict does not match its evidence."
+		[ "$directional_observation_pass_expected" = true ] || directional_all_strict_pass=false
 		[ "$directional_material_benefit_expected" = true ] || directional_material_benefit_proven=false
 		LC_ALL=C awk -v realization="$directional_realization" -v minimum="$validation_realization_min" \
 			'BEGIN { exit(realization >= minimum ? 0 : 1) }' || directional_realization_objective_met=false
@@ -1573,22 +1579,40 @@ validate_directional_proposal_contract() {
 				;;
 		esac
 	done
-	LC_ALL=C awk -v dl1="$directional_first_active" -v dl2="$directional_second_active" \
+	directional_spread_repeatable="$(LC_ALL=C awk -v dl1="$directional_first_active" -v dl2="$directional_second_active" \
 		-v ul1="$directional_first_gain" -v ul2="$directional_second_gain" \
 		-v delay1="$directional_first_delta" -v delay2="$directional_second_delta" 'BEGIN {
 		dlmax = dl1 > dl2 ? dl1 : dl2; ulmax = ul1 > ul2 ? ul1 : ul2
 		dldiff = dlmax > 0 ? ((dl1 > dl2 ? dl1 - dl2 : dl2 - dl1) * 100 / dlmax) : 100
 		uldiff = ulmax > 0 ? ((ul1 > ul2 ? ul1 - ul2 : ul2 - ul1) * 100 / ulmax) : 100
 		delaydiff = delay1 > delay2 ? delay1 - delay2 : delay2 - delay1
-		exit(dldiff <= 15 && uldiff <= 15 && delaydiff <= 10 ? 0 : 1)
-	}' || die "The $directional_label comparison is not repeatable."
+		print (dldiff <= 15 && uldiff <= 15 && delaydiff <= 10) ? "true" : "false"
+	}')"
+	[ "$directional_spread_repeatable" = "$directional_repeatable" ] ||
+		die "The $directional_label repeatability flag does not match its repeated evidence."
 	directional_worst_delta="$(LC_ALL=C awk -v a="$directional_first_delta" -v b="$directional_second_delta" 'BEGIN {
 		print ((a + 0) > (b + 0) ? a : b)
 	}')"
 	directional_worst_grade="$(quality_grade_for_delta "$directional_worst_delta")" ||
 		die "The selected $directional_label grade cannot be calculated."
 	directional_expected_recommendation="$directional_topology"
-	[ "$directional_material_benefit_proven" = true ] || directional_expected_recommendation=manual_review
+	if [ "$directional_repeatable" = false ]; then
+		[ "$directional_all_strict_pass" = true ] ||
+			die "A non-repeatable $directional_label proposal did not pass both strict observations."
+		directional_expected_recommendation=manual_review
+		require_result_flag "$directional_comparison_path.reason" \
+			"$([ "$directional_topology" = upload_only_shaped ] && printf upload-only-benefit-not-repeatable || printf download-only-benefit-not-repeatable)" \
+			"The non-repeatable $directional_label reason is invalid."
+		require_selected_proposal_objective measurement-confidence true \
+			"A non-repeatable $directional_label proposal lacks its confidence acknowledgement."
+		directional_candidate_confidence="$(require_result_value "$selected_proposal_path.confidence_percent")" ||
+			die "The non-repeatable $directional_label confidence is missing."
+		is_percent "$directional_candidate_confidence" &&
+			LC_ALL=C awk -v value="$directional_candidate_confidence" 'BEGIN { exit(value <= 40 ? 0 : 1) }' ||
+			die "A non-repeatable $directional_label proposal overstates its confidence."
+	elif [ "$directional_material_benefit_proven" != true ]; then
+		directional_expected_recommendation=manual_review
+	fi
 	require_result_flag "$directional_comparison_path.recommended_topology" "$directional_expected_recommendation" \
 		"The selected $directional_label recommendation does not match its repeated evidence."
 	directional_shaped_reference_delta="$(require_result_value '@.validation.effective_delta_ms')" ||

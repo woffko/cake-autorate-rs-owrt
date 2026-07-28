@@ -115,7 +115,8 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 			`autotuneRunningRequestMatches, ` +
 			`autotuneAchievedGrade, autotuneGradeTone, ` +
 			`autotuneProposalMatchesProfile, autotuneProposalCandidates, ` +
-			`autotuneResultEnvelopeValidated, autotuneProfileOutcomeValidated, ` +
+			`autotuneResultEnvelopeValidated, autotuneResultEvidenceValidated, ` +
+			`autotuneValidationGatesComplete, autotuneProfileOutcomeValidated, ` +
 			`autotuneFairOutcomeValidated, autotuneResultValidated, autotuneResultReviewable, ` +
 			`autotuneDirectionalProposalEvidenceValidated, autotuneCandidateAcknowledgementRequirements, ` +
 			`autotuneCandidateRealizationReconciled, ` +
@@ -214,6 +215,7 @@ const uploadOnlyResult = {
 	validation_thresholds: {
 		candidate_realization_min_percent: 80,
 		candidate_realization_max_percent: 110,
+		delay_max_ms: 45,
 		manual_latency_review_max_ms: 60,
 		loss_max_percent: 3,
 	},
@@ -228,10 +230,11 @@ const uploadOnlyResult = {
 		upload_only: {
 			tested: true,
 			recommended_topology: 'upload_only_shaped',
+			reason: 'repeatable-download-bypass-benefit',
 			repeatable: true,
 			observations: [
 				{
-					candidate_pass: true, hard_safety_pass: true, material_benefit: true, grade: 'B',
+					pass: true, candidate_pass: true, hard_safety_pass: true, material_benefit: true, grade: 'B',
 					effective_delta_ms: 35, loss_percent: 0,
 					upload_realization_percent: 90, download_gain_percent: 10,
 					delay_improvement_ms: 5,
@@ -243,7 +246,7 @@ const uploadOnlyResult = {
 					},
 				},
 				{
-					candidate_pass: true, hard_safety_pass: true, material_benefit: true, grade: 'B',
+					pass: true, candidate_pass: true, hard_safety_pass: true, material_benefit: true, grade: 'B',
 					effective_delta_ms: 34, loss_percent: 0,
 					upload_realization_percent: 91, download_gain_percent: 8.75,
 					delay_improvement_ms: 6,
@@ -261,6 +264,45 @@ const uploadOnlyResult = {
 assert.equal(helpers.autotuneDirectionalProposalEvidenceValidated(
 	uploadOnlyResult, uploadOnlyCandidate), true,
 'repeatable one-sided evidence must independently validate its selected proposal');
+const nonRepeatableStrictUpload = structuredClone(uploadOnlyResult);
+const nonRepeatableComparison = nonRepeatableStrictUpload.directional_comparisons.upload_only;
+nonRepeatableComparison.recommended_topology = 'manual_review';
+nonRepeatableComparison.reason = 'upload-only-benefit-not-repeatable';
+nonRepeatableComparison.repeatable = false;
+nonRepeatableComparison.observations[0].effective_delta_ms = 10;
+nonRepeatableComparison.observations[0].grade = 'A';
+nonRepeatableComparison.observations[0].delay_improvement_ms = 30;
+nonRepeatableComparison.observations[0].pass = true;
+nonRepeatableComparison.observations[1].effective_delta_ms = 25;
+nonRepeatableComparison.observations[1].grade = 'A';
+nonRepeatableComparison.observations[1].delay_improvement_ms = 15;
+nonRepeatableComparison.observations[1].pass = true;
+const nonRepeatableStrictCandidate = {
+	...uploadOnlyCandidate,
+	grade: 'A',
+	effective_delta_ms: 25,
+	confidence_percent: 40,
+	unmet_objectives: uploadOnlyCandidate.unmet_objectives.concat('measurement-confidence'),
+};
+assert.equal(helpers.autotuneDirectionalProposalEvidenceValidated(
+	nonRepeatableStrictUpload, nonRepeatableStrictCandidate), true,
+	'two strict but latency-variable one-sided observations may be offered at low confidence');
+assert.equal(helpers.autotuneDirectionalProposalEvidenceValidated(
+	nonRepeatableStrictUpload, { ...nonRepeatableStrictCandidate,
+		unmet_objectives: uploadOnlyCandidate.unmet_objectives }), false,
+	'a non-repeatable one-sided proposal must require its measurement-confidence acknowledgement');
+assert.equal(helpers.autotuneDirectionalProposalEvidenceValidated(
+	nonRepeatableStrictUpload, { ...nonRepeatableStrictCandidate,
+		confidence_percent: null }), false,
+	'a non-repeatable one-sided proposal must carry an explicit bounded confidence');
+const forgedStrictPass = structuredClone(nonRepeatableStrictUpload);
+forgedStrictPass.directional_comparisons.upload_only.observations[1].effective_delta_ms = 50;
+forgedStrictPass.directional_comparisons.upload_only.observations[1].grade = 'B';
+forgedStrictPass.directional_comparisons.upload_only.observations[1].delay_improvement_ms = -10;
+assert.equal(helpers.autotuneDirectionalProposalEvidenceValidated(
+	forgedStrictPass, { ...nonRepeatableStrictCandidate,
+		grade: 'B', effective_delta_ms: 50 }), false,
+	'a copied strict-pass flag must not bypass the profile delay objective');
 const tamperedUploadOnly = structuredClone(uploadOnlyResult);
 tamperedUploadOnly.directional_comparisons.upload_only.observations[1].upload_realization_percent = 100;
 assert.equal(helpers.autotuneDirectionalProposalEvidenceValidated(
@@ -268,9 +310,11 @@ assert.equal(helpers.autotuneDirectionalProposalEvidenceValidated(
 'reported directional realization must be recomputed from measured throughput');
 const safeNonBeneficialUpload = structuredClone(uploadOnlyResult);
 safeNonBeneficialUpload.directional_comparisons.upload_only.recommended_topology = 'manual_review';
+safeNonBeneficialUpload.directional_comparisons.upload_only.reason = 'upload-only-benefit-not-repeatable';
 for (const item of safeNonBeneficialUpload.directional_comparisons.upload_only.observations) {
 	item.candidate_pass = false;
 	item.material_benefit = false;
+	item.pass = false;
 	item.download_gain_percent = 0;
 	item.observation.throughput_kbps.download_kbps = 80000;
 }
@@ -286,10 +330,15 @@ assert.equal(helpers.autotuneDirectionalProposalEvidenceValidated(
 'the one-sided utility warning must be bound to the selected candidate');
 const higherValidationReferenceUpload = structuredClone(uploadOnlyResult);
 higherValidationReferenceUpload.validation.effective_delta_ms = 60;
+higherValidationReferenceUpload.directional_comparisons.upload_only.recommended_topology = 'manual_review';
+higherValidationReferenceUpload.directional_comparisons.upload_only.reason = 'upload-only-benefit-not-repeatable';
 for (const item of higherValidationReferenceUpload.directional_comparisons.upload_only.observations) {
 	item.effective_delta_ms = item === higherValidationReferenceUpload.directional_comparisons.upload_only.observations[0] ? 55 : 54;
 	item.delay_improvement_ms =
 		higherValidationReferenceUpload.bidirectional_confirmation.effective_delta_ms - item.effective_delta_ms;
+	item.material_benefit = false;
+	item.candidate_pass = false;
+	item.pass = false;
 }
 const higherValidationReferenceCandidate = {
 	...uploadOnlyCandidate,
@@ -310,10 +359,12 @@ lowRealizationUpload.directional_comparisons.upload_only.observations[0]
 	.upload_realization_percent = 70;
 lowRealizationUpload.directional_comparisons.upload_only.observations[0]
 	.observation.throughput_kbps.upload_kbps = 14000;
+lowRealizationUpload.directional_comparisons.upload_only.observations[0].pass = false;
 lowRealizationUpload.directional_comparisons.upload_only.observations[1]
 	.upload_realization_percent = 71;
 lowRealizationUpload.directional_comparisons.upload_only.observations[1]
 	.observation.throughput_kbps.upload_kbps = 14200;
+lowRealizationUpload.directional_comparisons.upload_only.observations[1].pass = false;
 const lowRealizationCandidate = {
 	...uploadOnlyCandidate,
 	unmet_objectives: uploadOnlyCandidate.unmet_objectives.concat('candidate-realization'),
@@ -336,10 +387,11 @@ downloadOnlyResult.directional_comparisons = {
 	download_only: {
 		tested: true,
 		recommended_topology: 'download_only_shaped',
+		reason: 'repeatable-upload-bypass-benefit',
 		repeatable: true,
 		observations: [
 			{
-				candidate_pass: true, hard_safety_pass: true, material_benefit: true, grade: 'B',
+				pass: true, candidate_pass: true, hard_safety_pass: true, material_benefit: true, grade: 'B',
 				effective_delta_ms: 35, loss_percent: 0,
 				download_realization_percent: 90, upload_gain_percent: 10,
 				delay_improvement_ms: 5,
@@ -351,7 +403,7 @@ downloadOnlyResult.directional_comparisons = {
 				},
 			},
 			{
-				candidate_pass: true, hard_safety_pass: true, material_benefit: true, grade: 'B',
+				pass: true, candidate_pass: true, hard_safety_pass: true, material_benefit: true, grade: 'B',
 				effective_delta_ms: 34, loss_percent: 0,
 				download_realization_percent: 91, upload_gain_percent: 8.89,
 				delay_improvement_ms: 6,
@@ -1738,6 +1790,62 @@ const variableNoisyResult = {
 };
 assert.equal(helpers.autotuneResultReviewable(variableNoisyResult, 'apply_sqm'), true,
 	'a target-unmet noisy direction may expose its best exact tested safe point for manual review');
+const variableNoisyRealizationReview = JSON.parse(JSON.stringify(variableNoisyResult));
+const noisyDownloadSearch = variableNoisyRealizationReview.profile_search.download;
+Object.assign(noisyDownloadSearch, {
+	action: 'fallback',
+	reason: 'noisy-link-safe-review',
+	knee_detected: false,
+	noisy: true,
+	inconclusive: false,
+});
+Object.assign(noisyDownloadSearch.selected, {
+	realization_percent: 83,
+	retention_percent: 66,
+	safety_pass: true,
+	target_met: false,
+});
+const noisyRealizationGate = variableNoisyRealizationReview.validation.gates.find(gate =>
+	gate.code === 'download-candidate-realization');
+noisyRealizationGate.pass = false;
+noisyRealizationGate.actual = 76;
+variableNoisyRealizationReview.validation.pass = false;
+variableNoisyRealizationReview.validation.hard_pass = false;
+variableNoisyRealizationReview.validation.safety_pass = true;
+variableNoisyRealizationReview.validation.quality_target_met = false;
+const noisyFinalConfirmation = bidirectionalConfirmationFor(variableProposal, {
+	downloadRealization: 77,
+	uploadRealization: 87,
+	effectiveDelta: 67,
+	delayLimit: 60,
+});
+variableNoisyRealizationReview.bidirectional_confirmation = noisyFinalConfirmation;
+variableNoisyRealizationReview.profile_outcome.bidirectional_confirmation = noisyFinalConfirmation;
+variableNoisyRealizationReview.profile_outcome.target_met = false;
+variableNoisyRealizationReview.profile_outcome.actual_grade = 'C';
+assert.equal(helpers.autotuneCandidateRealizationReconciled(
+	variableNoisyRealizationReview, 'download'), true,
+	'a noisy Variable Link point above the 50 percent floor may reconcile a strict realization miss');
+assert.equal(helpers.autotuneResultEnvelopeValidated(variableNoisyRealizationReview), true,
+	'the noisy realization fixture must retain a valid result envelope');
+assert.equal(helpers.autotuneProfileOutcomeValidated(variableNoisyRealizationReview), true,
+	'the noisy realization fixture must retain a valid profile outcome');
+assert.equal(helpers.autotuneResultEvidenceValidated(variableNoisyRealizationReview), true,
+	'the noisy realization fixture must retain safe evidence');
+assert.equal(helpers.autotuneResultReviewable(variableNoisyRealizationReview, 'apply_sqm'), true,
+	'a safe noisy Variable Link candidate must remain manually reviewable below 80 percent realization');
+assert.equal(helpers.autotuneDefaultReviewAction(variableNoisyRealizationReview), 'apply_sqm',
+	'a safe shaped Variable Link candidate must remain the default ahead of disabling SQM');
+assert.equal(helpers.autotuneGateAcknowledgementsComplete(
+	variableNoisyRealizationReview, 'apply_sqm', {}), false,
+	'the relaxed realization objective must still require explicit consent');
+assert.equal(helpers.autotuneGateAcknowledgementsComplete(
+	variableNoisyRealizationReview, 'apply_sqm', {
+		'download-candidate-realization': true,
+		'bidirectional-latency-target': true,
+		'bidirectional-download-realization': true,
+	}), true,
+	'the safe noisy realization miss may be accepted explicitly');
 assert.equal(helpers.autotuneResultReviewable({
 	...variableNoisyResult,
 	profile_search: {

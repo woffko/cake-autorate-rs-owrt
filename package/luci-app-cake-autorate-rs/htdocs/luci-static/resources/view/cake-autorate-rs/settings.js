@@ -2986,6 +2986,11 @@ function autotuneCandidateRealizationReconciled(result, direction) {
 	var confirmationRealization = autotuneNumber(confirmation &&
 		confirmation.realization_percent && confirmation.realization_percent[direction]);
 	var failedActual = autotuneNumber(gate && gate.actual);
+	var profile = canonicalAutotuneProfile(result && result.profile);
+	var searchReason = search && search.reason;
+	var selectedRetention = autotuneNumber(selected && selected.retention_percent);
+	var strictEvidence;
+	var noisyVariableEvidence;
 
 	/* One noisy directional phase must not erase two independent proofs of the
 	 * exact selected rate: the profile search observation and the final
@@ -2993,17 +2998,33 @@ function autotuneCandidateRealizationReconciled(result, direction) {
 	 * an Auto-Apply shortcut.  The failed phase must still retain at least 50%
 	 * realization; sub-50% evidence remains a hard indication that this rate did
 	 * not control the path. */
-	return !!(result && result.manual_apply_eligible === true &&
+	if (!(result && result.manual_apply_eligible === true &&
 		result.auto_apply_eligible === false && validation &&
 		validation.safety_pass === true && gate && gate.pass === false &&
-		minimum != null && maximum != null && failedActual != null && failedActual >= 50 &&
+		minimum != null && maximum != null && failedActual != null &&
+		failedActual >= 50 && failedActual <= maximum &&
 		selected && selected.safety_pass === true && selectedRate != null &&
 		proposalRate === selectedRate && selectedRealization != null &&
-		selectedRealization >= minimum && selectedRealization <= maximum &&
+		selectedRealization >= 50 && selectedRealization <= maximum &&
 		confirmation && confirmation.tested === true && confirmation.safety_pass === true &&
 		confirmationContract && confirmationContract.lossPass === true &&
-		confirmationRealization != null && confirmationRealization >= minimum &&
-		confirmationRealization <= maximum);
+		confirmationRealization != null && confirmationRealization >= 50 &&
+		confirmationRealization <= maximum))
+		return false;
+
+	strictEvidence = selectedRealization >= minimum && confirmationRealization >= minimum;
+	/* A Variable Link noisy fallback is deliberately allowed to publish the best
+	 * exact-tested point above the 50% catastrophic floor. Its final directional
+	 * or simultaneous realization can then dip below the strict 80% CAKE-control
+	 * objective without turning the already safety-checked proposal into a hidden
+	 * no-SQM default. Keep this a typed, manual-only exception: the Review step
+	 * still requires an explicit candidate-realization acknowledgement. */
+	noisyVariableEvidence = profile === 'variable_link' && search.action === 'fallback' &&
+		searchReason === 'noisy-link-safe-review' && search.noisy === true &&
+		search.inconclusive === false && selectedRetention != null &&
+		selectedRetention >= 50;
+
+	return strictEvidence || noisyVariableEvidence;
 }
 
 function autotuneAcknowledgableGateFailures(result, action) {
@@ -4042,6 +4063,7 @@ function autotuneDirectionalProposalEvidenceValidated(result, candidate) {
 	var bypassMode = activeDirection === 'upload' ? 'ingress-only-autotune' :
 		'egress-only-autotune';
 	var manualLimit = autotuneNumber(thresholds && thresholds.manual_latency_review_max_ms);
+	var delayLimit = autotuneNumber(thresholds && thresholds.delay_max_ms);
 	var lossLimit = autotuneNumber(thresholds && thresholds.loss_max_percent);
 	var realizationMinimum = autotuneNumber(thresholds &&
 		thresholds.candidate_realization_min_percent);
@@ -4060,16 +4082,17 @@ function autotuneDirectionalProposalEvidenceValidated(result, candidate) {
 	var measured = [];
 	var materialBenefitProven = true;
 	var realizationObjectiveMet = true;
+	var allStrictPass = true;
 
 	if (!activeDirection || !recommendation || recommendation.tested !== true ||
 	    (recommendation.recommended_topology !== topology &&
 	     recommendation.recommended_topology !== 'manual_review') ||
-	    recommendation.repeatable !== true ||
+	    (recommendation.repeatable !== true && recommendation.repeatable !== false) ||
 	    !Array.isArray(observations) || observations.length !== 2 ||
 	    !candidate || candidate.hard_safety_pass !== true ||
 	    !candidate.evidence || candidate.evidence.recommendation !==
 		'directional_comparisons.' + comparisonKey ||
-	    manualLimit == null || lossLimit == null || realizationMinimum == null ||
+	    manualLimit == null || delayLimit == null || lossLimit == null || realizationMinimum == null ||
 	    realizationMaximum == null ||
 	    activeRate == null || activeRate <= 0 || shapedGainRate == null || shapedGainRate <= 0 ||
 	    shapedDelta == null)
@@ -4107,6 +4130,12 @@ function autotuneDirectionalProposalEvidenceValidated(result, candidate) {
 			materialBenefitProven = false;
 		if (realization < realizationMinimum)
 			realizationObjectiveMet = false;
+		var strictPass = item.material_benefit === true && gain >= 2 && improvement >= -5 &&
+			delta <= delayLimit && realization >= realizationMinimum;
+		if (item.pass !== strictPass)
+			return false;
+		if (!strictPass)
+			allStrictPass = false;
 		measured.push({
 			active: activeThroughput,
 			gain: gainThroughput,
@@ -4124,9 +4153,24 @@ function autotuneDirectionalProposalEvidenceValidated(result, candidate) {
 	var hasBenefitWarning = unmet.indexOf('throughput-benefit-unproven') >= 0;
 	var hasLatencyWarning = unmet.indexOf('latency-worse-than-shaped') >= 0;
 	var hasRealizationWarning = unmet.indexOf('candidate-realization') >= 0;
-	return spreadPercent(measured[0].active, measured[1].active) <= 15 &&
+	var hasMeasurementWarning = unmet.indexOf('measurement-confidence') >= 0;
+	var candidateConfidence = autotuneNumber(candidate.confidence_percent);
+	var spreadRepeatable = spreadPercent(measured[0].active, measured[1].active) <= 15 &&
 		spreadPercent(measured[0].gain, measured[1].gain) <= 15 &&
-		Math.abs(measured[0].delta - measured[1].delta) <= 10 &&
+		Math.abs(measured[0].delta - measured[1].delta) <= 10;
+	var repeatableReason = topology === 'upload_only_shaped' ?
+		'repeatable-download-bypass-benefit' : 'repeatable-upload-bypass-benefit';
+	var reviewReason = topology === 'upload_only_shaped' ?
+		'upload-only-benefit-not-repeatable' : 'download-only-benefit-not-repeatable';
+	var recommendationContract = recommendation.repeatable === true ?
+		(spreadRepeatable && recommendation.recommended_topology ===
+			(materialBenefitProven ? topology : 'manual_review') &&
+		 recommendation.reason === (materialBenefitProven ? repeatableReason : reviewReason)) :
+		(!spreadRepeatable && allStrictPass &&
+		 recommendation.recommended_topology === 'manual_review' &&
+		 recommendation.reason === reviewReason &&
+		 hasMeasurementWarning && candidateConfidence != null && candidateConfidence <= 40);
+	return recommendationContract &&
 		candidateDelta != null && Math.abs(candidateDelta - worstDelta) <= 0.001 &&
 		candidate.grade === autotuneGradeForDelta(worstDelta) &&
 		hasBenefitWarning === !materialBenefitProven &&
@@ -7489,13 +7533,20 @@ function showCreateWizard(grid, name, existingName) {
 				});
 				proposalCandidates.forEach(function(candidate) {
 					var diagnosticOnly = candidate.action === 'disable_sqm' && !rerun;
+					var candidateReviewable = autotuneResultReviewable(autotune,
+						candidate.action, candidate.proposal_id);
 					var selected = state.autotune_proposal_id === candidate.proposal_id;
 					var card = E('button', {
 						'type': 'button',
 						'class': selected ? 'cbi-button cbi-button-positive' : 'cbi-button',
-						'disabled': diagnosticOnly ? 'disabled' : null,
+						'disabled': diagnosticOnly || !candidateReviewable ? 'disabled' : null,
+						'aria-pressed': selected ? 'true' : 'false',
+						'data-proposal-id': candidate.proposal_id,
+						'data-proposal-action': candidate.action,
+						'data-proposal-topology': candidate.topology,
+						'data-proposal-primary': candidate.is_primary === true ? 'true' : 'false',
 						'style': 'text-align:left;white-space:normal;min-height:104px;padding:10px;border-width:1px' +
-							(diagnosticOnly ? ';opacity:.78' : '')
+							(diagnosticOnly || !candidateReviewable ? ';opacity:.62' : '')
 					}, [
 						E('strong', {}, _('#%d · %s').format(candidate.rank,
 							diagnosticOnly ? _('Leave unshaped; do not create this instance') :
@@ -7509,6 +7560,9 @@ function showCreateWizard(grid, name, existingName) {
 						diagnosticOnly ? E('div', {
 							'style': 'font-size:12px;margin-top:5px;color:#d99b00'
 						}, _('This measured outcome is a valid recommendation, but there is no existing managed SQM instance to disable. Cancel creation to keep the link unshaped.')) :
+						!candidateReviewable ? E('div', {
+							'style': 'font-size:12px;margin-top:5px;color:#d9534f'
+						}, _('Unavailable: this candidate did not retain the complete safety evidence required for staging.')) :
 						candidate.unmet_objectives.length ? E('div', {
 							'style': 'font-size:12px;margin-top:5px;color:#d99b00'
 						}, _('Needs review: %s').format(candidate.unmet_objectives.map(
@@ -7516,7 +7570,7 @@ function showCreateWizard(grid, name, existingName) {
 							E('div', { 'style': 'font-size:12px;margin-top:5px' }, _('All selected profile objectives met'))
 					]);
 					card.addEventListener('click', function() {
-						if (diagnosticOnly)
+						if (diagnosticOnly || !candidateReviewable)
 							return;
 						selectAutotuneProposalForState(state, autotune, candidate);
 						render();

@@ -1479,18 +1479,40 @@ EOF
 	ul_runtime_minimum_valid=true
 	build_result_proposals
 	printf '%s\n' "$proposals_json" > "$work/directional-realization-advisory-proposals.json"
+	upload_only_recommendation_json="$(node - "$work/directional-comparisons.json" <<'EOF'
+const fs = require('node:fs');
+const comparison = JSON.parse(fs.readFileSync(process.argv[2], 'utf8')).upload_only;
+comparison.recommended_topology = 'manual_review';
+comparison.reason = 'upload-only-benefit-not-repeatable';
+comparison.repeatable = false;
+for (let i = 0; i < comparison.observations.length; i++) {
+	const observation = comparison.observations[i];
+	observation.pass = true;
+	observation.candidate_pass = true;
+	observation.hard_safety_pass = true;
+	observation.material_benefit = true;
+	observation.effective_delta_ms = i === 0 ? 10 : 25;
+	observation.delay_improvement_ms = 50 - observation.effective_delta_ms;
+	observation.grade = 'A';
+}
+process.stdout.write(JSON.stringify(comparison));
+EOF
+)"
+	build_result_proposals
+	printf '%s\n' "$proposals_json" > "$work/directional-noisy-safe-proposals.json"
 	dl_runtime_minimum_valid=false
 	ul_runtime_minimum_valid=true
 	build_result_proposals
 	printf '%s\n' "$proposals_json" > "$work/directional-missing-minimum-proposals.json"
 )
-node - "$work/directional-download-only.json" "$work/directional-comparisons.json" "$work/directional-download-only-proposals.json" "$work/directional-missing-minimum-proposals.json" "$work/directional-realization-advisory-proposals.json" <<'EOF'
+node - "$work/directional-download-only.json" "$work/directional-comparisons.json" "$work/directional-download-only-proposals.json" "$work/directional-missing-minimum-proposals.json" "$work/directional-realization-advisory-proposals.json" "$work/directional-noisy-safe-proposals.json" <<'EOF'
 const fs = require('node:fs');
 const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const comparisons = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
 const proposals = JSON.parse(fs.readFileSync(process.argv[4], 'utf8'));
 const missingMinimum = JSON.parse(fs.readFileSync(process.argv[5], 'utf8'));
 const realizationAdvisory = JSON.parse(fs.readFileSync(process.argv[6], 'utf8'));
+const noisySafe = JSON.parse(fs.readFileSync(process.argv[7], 'utf8'));
 if (result.recommended_topology !== 'download_only_shaped' ||
     result.reason !== 'repeatable-upload-bypass-benefit' || result.repeatable !== true ||
     result.observations.length !== 2 || result.observations.some(item => item.candidate_pass !== true))
@@ -1512,6 +1534,12 @@ const shapedAdvisory = realizationAdvisory.find(item => item.topology === 'both_
 if (!shapedAdvisory || shapedAdvisory.hard_safety_pass !== true ||
     !shapedAdvisory.unmet_objectives.includes('candidate-realization'))
 	throw new Error('a 50-80% final realization result was hidden instead of retained for explicit review');
+const noisyUploadOnly = noisySafe.find(item => item.topology === 'upload_only_shaped');
+if (!noisyUploadOnly || noisyUploadOnly.applicable !== true ||
+    noisyUploadOnly.confidence_percent > 40 ||
+    !noisyUploadOnly.unmet_objectives.includes('measurement-confidence') ||
+    !noisyUploadOnly.unmet_objectives.includes('download-sqm-disabled'))
+	throw new Error('two strict but noisy upload-only observations were not retained as a low-confidence manual proposal');
 EOF
 
 # A clean full-raw control is a manual no-SQM proposal for every non-Fair

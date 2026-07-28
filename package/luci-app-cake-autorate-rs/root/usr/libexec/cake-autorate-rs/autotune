@@ -6085,7 +6085,9 @@ build_result_proposals() {
 	if [ "$phase_evidence_complete" = true ] &&
 	   [ "${ul_runtime_minimum_valid:-true}" = true ] &&
 	   [ "$(extract_json "$upload_only_recommendation_json" '@.tested' 2>/dev/null || true)" = true ] &&
-	   [ "$(extract_json "$upload_only_recommendation_json" '@.repeatable' 2>/dev/null || true)" = true ] &&
+	   { [ "$(extract_json "$upload_only_recommendation_json" '@.repeatable' 2>/dev/null || true)" = true ] ||
+	     { [ "$(extract_json "$upload_only_recommendation_json" '@.observations[0].pass' 2>/dev/null || true)" = true ] &&
+	       [ "$(extract_json "$upload_only_recommendation_json" '@.observations[1].pass' 2>/dev/null || true)" = true ]; }; } &&
 	   [ "$(extract_json "$upload_only_recommendation_json" '@.observations[0].hard_safety_pass' 2>/dev/null || true)" = true ] &&
 	   [ "$(extract_json "$upload_only_recommendation_json" '@.observations[1].hard_safety_pass' 2>/dev/null || true)" = true ]; then
 		upload_only_first_delta="$(extract_json "$upload_only_recommendation_json" '@.observations[0].effective_delta_ms')" ||
@@ -6137,12 +6139,18 @@ build_result_proposals() {
 		}'; then
 			append_unmet_objective latency-worse-than-shaped
 		fi
+		[ "$(extract_json "$upload_only_recommendation_json" '@.repeatable')" = true ] ||
+			append_unmet_objective measurement-confidence
 		append_unmet_objective download-sqm-disabled
 		upload_only_unmet_objectives="$proposal_unmet_objectives"
-		upload_only_directional_confidence=75
-		[ "$(extract_json "$upload_only_recommendation_json" '@.observations[0].pass')" = true ] &&
-			[ "$(extract_json "$upload_only_recommendation_json" '@.observations[1].pass')" = true ] &&
-			upload_only_directional_confidence=90
+		if [ "$(extract_json "$upload_only_recommendation_json" '@.repeatable')" = true ]; then
+			upload_only_directional_confidence=75
+			[ "$(extract_json "$upload_only_recommendation_json" '@.observations[0].pass')" = true ] &&
+				[ "$(extract_json "$upload_only_recommendation_json" '@.observations[1].pass')" = true ] &&
+				upload_only_directional_confidence=90
+		else
+			upload_only_directional_confidence=40
+		fi
 		upload_only_confidence="$(awk -v overall="$overall_confidence_percent" -v directional="$upload_only_directional_confidence" 'BEGIN {
 			printf "%d", (overall < directional) ? overall : directional
 		}')"
@@ -6155,7 +6163,9 @@ build_result_proposals() {
 	if [ "$phase_evidence_complete" = true ] &&
 	   [ "${dl_runtime_minimum_valid:-true}" = true ] &&
 	   [ "$(extract_json "$download_only_recommendation_json" '@.tested' 2>/dev/null || true)" = true ] &&
-	   [ "$(extract_json "$download_only_recommendation_json" '@.repeatable' 2>/dev/null || true)" = true ] &&
+	   { [ "$(extract_json "$download_only_recommendation_json" '@.repeatable' 2>/dev/null || true)" = true ] ||
+	     { [ "$(extract_json "$download_only_recommendation_json" '@.observations[0].pass' 2>/dev/null || true)" = true ] &&
+	       [ "$(extract_json "$download_only_recommendation_json" '@.observations[1].pass' 2>/dev/null || true)" = true ]; }; } &&
 	   [ "$(extract_json "$download_only_recommendation_json" '@.observations[0].hard_safety_pass' 2>/dev/null || true)" = true ] &&
 	   [ "$(extract_json "$download_only_recommendation_json" '@.observations[1].hard_safety_pass' 2>/dev/null || true)" = true ]; then
 		download_only_first_delta="$(extract_json "$download_only_recommendation_json" '@.observations[0].effective_delta_ms')" ||
@@ -6206,12 +6216,18 @@ build_result_proposals() {
 		}'; then
 			append_unmet_objective latency-worse-than-shaped
 		fi
+		[ "$(extract_json "$download_only_recommendation_json" '@.repeatable')" = true ] ||
+			append_unmet_objective measurement-confidence
 		append_unmet_objective upload-sqm-disabled
 		download_only_unmet_objectives="$proposal_unmet_objectives"
-		download_only_directional_confidence=75
-		[ "$(extract_json "$download_only_recommendation_json" '@.observations[0].pass')" = true ] &&
-			[ "$(extract_json "$download_only_recommendation_json" '@.observations[1].pass')" = true ] &&
-			download_only_directional_confidence=90
+		if [ "$(extract_json "$download_only_recommendation_json" '@.repeatable')" = true ]; then
+			download_only_directional_confidence=75
+			[ "$(extract_json "$download_only_recommendation_json" '@.observations[0].pass')" = true ] &&
+				[ "$(extract_json "$download_only_recommendation_json" '@.observations[1].pass')" = true ] &&
+				download_only_directional_confidence=90
+		else
+			download_only_directional_confidence=40
+		fi
 		download_only_confidence="$(awk -v overall="$overall_confidence_percent" -v directional="$download_only_directional_confidence" 'BEGIN {
 			printf "%d", (overall < directional) ? overall : directional
 		}')"
