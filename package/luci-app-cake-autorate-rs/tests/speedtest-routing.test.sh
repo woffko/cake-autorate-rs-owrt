@@ -313,7 +313,7 @@ state="$(sed -n '1p' "$CAKE_TEST_DIRECTIONAL_TC_STATE" 2>/dev/null)"
 case "$*" in
 	'-details qdisc show dev eth0')
 		[ "$state" = egress-bypassed ] || printf 'qdisc cake 8001: root bandwidth 80Mbit\n'
-		[ "$state" = egress-bypassed ] && printf 'qdisc fq_codel 0: root\n'
+		[ "$state" = egress-bypassed ] && printf 'qdisc mq 0: root\n'
 		[ "$state" = ingress-bypassed ] || printf 'qdisc ingress ffff: parent ffff:fff1\n'
 		;;
 	'-details qdisc show dev ifb4eth0')
@@ -335,19 +335,29 @@ esac
 EOF
 cat > "$work/bin/sqm-recover-check" <<'EOF'
 #!/bin/sh
-[ "$#" -eq 2 ] && [ "$1" = wan ] && [ "$2" = check ] || exit 1
+[ "$#" -eq 8 ] && [ "$1" = wan ] && [ "$2" = cake_wan ] &&
+	[ "$3" = eth0 ] && [ "$4" = eth0 ] && [ "$5" = ifb4eth0 ] &&
+	[ "$6" = sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ] &&
+	[ "$7" = /tmp/sqm-snapshot.test ] && [ "$8" = check ] || exit 1
 printf 'checked\n' >> "$CAKE_TEST_DIRECTIONAL_CHECK_LOG"
 EOF
 chmod +x "$work/bin/tc" "$work/bin/sqm-recover-check"
 export PATH="$work/bin:$PATH"
 export CAKE_TEST_DIRECTIONAL_TC_STATE="$work/directional-tc.state"
 export CAKE_TEST_DIRECTIONAL_CHECK_LOG="$work/directional-check.log"
+(
 section=wan
 target_if=eth0
 calibration_sqm_managed=1
 calibration_sqm_ul_if=eth0
 calibration_sqm_dl_if=ifb4eth0
+calibration_sqm_direction_mode=both
+calibration_sqm_section=cake_wan
+calibration_sqm_target=eth0
+calibration_sqm_config_fingerprint=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+calibration_sqm_config_snapshot=/tmp/sqm-snapshot.test
 sqm_recover_bin="$work/bin/sqm-recover-check"
+managed_sqm_snapshot_still_current() { return 0; }
 warning=""
 printf 'healthy\n' > "$CAKE_TEST_DIRECTIONAL_TC_STATE"
 prepare_directional_sqm_bypass ingress || fail_test "managed ingress-only bypass failed"
@@ -365,31 +375,166 @@ prepare_directional_sqm_bypass egress || fail_test "managed egress-only bypass f
 	fail_test "egress-only bypass evidence is inconsistent"
 [ "$(wc -l < "$CAKE_TEST_DIRECTIONAL_CHECK_LOG")" -eq 2 ] ||
 	fail_test "directional bypass skipped exact managed-SQM preflight"
+) || fail_test "managed directional bypass preflight failed"
+
+# Unshaped proof accepts only no root, noqueue, or mq. A non-CAKE shaper is
+# still a shaper and must not become positive bypass evidence.
+(
+	tc() {
+		case "$*" in
+			'-details qdisc show dev eth0') printf 'qdisc fq_codel 0: root\n' ;;
+			'-details qdisc show dev eth1') printf '%s\n' 'qdisc mq 0: root' 'qdisc fq_codel 0: parent :1' ;;
+			'-details qdisc show dev ifb4eth0') printf 'qdisc noqueue 0: root\n' ;;
+			'-details qdisc show dev eth2') printf '%s\n' 'qdisc mq 0: root' 'qdisc tbf 1: parent :1 rate 10Mbit' ;;
+			'-details qdisc show dev eth3') printf '%s\n' 'qdisc mq 0: root' 'qdisc fq 1: parent :1 maxrate 10Mbit' ;;
+			*) return 1 ;;
+		esac
+	}
+	if device_has_no_shaping_root eth0; then exit 1; fi
+	device_has_no_shaping_root eth1 || exit 1
+	device_has_no_shaping_root ifb4eth0 || exit 1
+	if device_has_no_shaping_root eth2; then exit 1; fi
+	if device_has_no_shaping_root eth3; then exit 1; fi
+) || fail_test "non-CAKE shaping root was accepted as unshaped"
+
+# The autorate-side direction policy is outside the SQM section fingerprint;
+# it must still match the cached pre-mutation snapshot.
+(
+	section=wan
+	calibration_sqm_managed=1
+	calibration_sqm_section=cake_wan
+	calibration_sqm_target=eth0
+	calibration_sqm_direction_mode=upload_only
+	calibration_sqm_config_snapshot=/tmp/sqm-snapshot.test
+	calibration_sqm_config_fingerprint=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+	test_live_direction_mode=upload_only
+	managed_sqm_snapshot_path_valid() { return 0; }
+	uci_raw_get() {
+		case "$1" in
+			sqm.cake_wan._cake_autorate_managed) printf 'wan\n' ;;
+			sqm.cake_wan.enabled) printf '1\n' ;;
+			sqm.cake_wan.interface) printf 'eth0\n' ;;
+			*) return 1 ;;
+		esac
+	}
+	uci_get() {
+		[ "$1" = sqm_direction_mode ] || return 1
+		printf '%s\n' "$test_live_direction_mode"
+	}
+	managed_sqm_config_fingerprint() { printf '%s\n' "$calibration_sqm_config_fingerprint"; }
+	managed_sqm_snapshot_still_current || exit 1
+	test_live_direction_mode=download_only
+	if managed_sqm_snapshot_still_current; then exit 1; fi
+) || fail_test "live autorate direction drift was accepted before directional SQM mutation"
+
+# A harmless empty ingress qdisc is allowed, but duplicate or foreign mirred
+# redirects make the topology ambiguous and must fail closed.
+(
+	target_if=eth0
+	calibration_sqm_dl_if=ifb4eth0
+	test_redirect_mode=expected
+	tc() {
+		case "$*" in
+			'-details qdisc show dev eth0') printf 'qdisc ingress ffff: parent ffff:fff1\n' ;;
+			'filter show dev eth0 ingress')
+				case "$test_redirect_mode" in
+					empty) : ;;
+					expected) printf 'action order 1: mirred (Egress Redirect to device ifb4eth0) stolen\n' ;;
+					poisoned) printf '%s\n' \
+						'action order 1: mirred (Egress Redirect to device ifb4stale) stolen' \
+						'action order 2: mirred (Egress Redirect to device ifb4eth0) stolen' ;;
+					foreign) printf '%s\n' \
+						'filter protocol all pref 10 u32 chain 0' \
+						'action order 1: mirred (Egress Redirect to device ifb4eth0) stolen' \
+						'action order 2: police 0x1 rate 1Mbit burst 10Kb drop' ;;
+				esac
+				;;
+			*) return 1 ;;
+		esac
+	}
+	managed_ingress_redirect_present || exit 1
+	test_redirect_mode=poisoned
+	if managed_ingress_redirect_present; then exit 1; fi
+	test_redirect_mode=foreign
+	if managed_ingress_redirect_present; then exit 1; fi
+	test_redirect_mode=empty
+	managed_ingress_redirect_absent || exit 1
+	test_redirect_mode=expected
+	if managed_ingress_redirect_absent; then exit 1; fi
+) || fail_test "managed ingress redirect proof accepted an ambiguous topology"
+
+# Full Auto-Tune must also bypass the one remaining shaped direction when the
+# opposite direction is already intentionally unshaped.
+(
+	section=wan
+	target_if=eth0
+	calibration_sqm_managed=1
+	calibration_sqm_ul_if=eth0
+	calibration_sqm_dl_if=ifb4eth0
+	calibration_sqm_section=cake_wan
+	calibration_sqm_target=eth0
+	calibration_sqm_config_fingerprint=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+	calibration_sqm_config_snapshot=/tmp/sqm-snapshot.test
+	sqm_recover_bin="$work/bin/sqm-recover-check"
+	managed_sqm_snapshot_still_current() { return 0; }
+	test_root_cake_devices=' eth0 '
+	test_redirect_state=absent
+	device_has_one_root_cake() {
+		case "$test_root_cake_devices" in *" $1 "*) return 0 ;; *) return 1 ;; esac
+	}
+	device_has_no_shaping_root() { ! device_has_one_root_cake "$1"; }
+	managed_ingress_redirect_present() { [ "$test_redirect_state" = present ]; }
+	managed_ingress_redirect_absent() { [ "$test_redirect_state" = absent ]; }
+	tc() {
+		case "$*" in
+			'qdisc del dev eth0 root') test_root_cake_devices=' ' ;;
+			'qdisc del dev eth0 ingress') test_redirect_state=absent ;;
+			*) return 1 ;;
+		esac
+	}
+	warning=""
+	calibration_sqm_paused=false
+	calibration_sqm_direction_mode=upload_only
+	prepare_directional_sqm_bypass egress || exit 1
+	[ "$calibration_sqm_bypass_mode" = egress-only-managed ] || exit 1
+	[ "$test_root_cake_devices" = ' ' ] && [ "$test_redirect_state" = absent ] || exit 1
+
+	test_root_cake_devices=' ifb4eth0 '
+	test_redirect_state=present
+	calibration_sqm_direction_mode=download_only
+	prepare_directional_sqm_bypass ingress || exit 1
+	[ "$calibration_sqm_bypass_mode" = ingress-only-managed ] || exit 1
+	[ "$test_root_cake_devices" = ' ifb4eth0 ' ] && [ "$test_redirect_state" = absent ] || exit 1
+) || fail_test "directional bypass rejected a valid one-direction managed SQM topology"
 
 # A direction may be labelled already-unshaped only after the configured mode,
 # immutable recovery check, and live kernel topology all prove the same fact.
 (
+	section=wan
+	target_if=eth0
 	calibration_sqm_managed=1
 	calibration_sqm_ul_if=eth0
 	calibration_sqm_dl_if=ifb4eth0
+	calibration_sqm_direction_mode=upload_only
+	calibration_sqm_section=cake_wan
+	calibration_sqm_target=eth0
+	calibration_sqm_config_fingerprint=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+	calibration_sqm_config_snapshot=/tmp/sqm-snapshot.test
 	sqm_recover_bin="$work/bin/sqm-recover-check"
-	test_sqm_direction_mode=upload_only
+	managed_sqm_snapshot_still_current() { return 0; }
 	test_root_cake_devices=' eth0 '
 	test_redirect_state=absent
-	uci_get() {
-		[ "$1" = sqm_direction_mode ] || return 1
-		printf '%s\n' "$test_sqm_direction_mode"
-	}
 	device_has_one_root_cake() {
 		case "$test_root_cake_devices" in *" $1 "*) return 0 ;; *) return 1 ;; esac
 	}
+	device_has_no_shaping_root() { ! device_has_one_root_cake "$1"; }
 	managed_ingress_redirect_present() { [ "$test_redirect_state" = present ]; }
 	managed_ingress_redirect_absent() { [ "$test_redirect_state" = absent ]; }
 	direction_override=download
 	verify_managed_already_unshaped_direction || exit 1
 	direction_override=upload
 	if verify_managed_already_unshaped_direction; then exit 1; fi
-	test_sqm_direction_mode=download_only
+	calibration_sqm_direction_mode=download_only
 	test_root_cake_devices=' ifb4eth0 '
 	test_redirect_state=present
 	direction_override=upload
@@ -835,13 +980,14 @@ esac
 EOF
 cat > "$work/bin/sqm-recover" <<'EOF'
 #!/bin/sh
-[ "$#" -ne 2 ] || {
-	[ "$1" = wan ] && [ "$2" = check ] || exit 1
-	[ "$(sed -n '1p' "$CAKE_TEST_DIRECTIONAL_TC_STATE" 2>/dev/null)" = healthy ]
-	exit $?
+check_only=0
+[ "$#" -ne 8 ] || {
+	[ "$8" = check ] || exit 1
+	check_only=1
 }
 printf '%s %s %s %s %s %s %s\n' "$1" "$2" "$3" "$4" "$5" "$6" "$7" >> "$CAKE_TEST_JOB_WORK/sqm-recover-args"
-[ "$#" -eq 7 ] && [ "$1" = wan ] && [ "$2" = cake_wan ] &&
+case "$#" in 7|8) ;; *) exit 1 ;; esac
+[ "$1" = wan ] && [ "$2" = cake_wan ] &&
 	[ "$3" = eth0 ] && [ "$4" = eth0 ] && [ "$5" = ifb4eth0 ] || exit 1
 case "$6" in sha256:????????????????????????????????????????????????????????????????) ;; *) exit 1 ;; esac
 case "${6#sha256:}" in *[!0-9a-f]*) exit 1 ;; esac
@@ -854,6 +1000,10 @@ digest="$(uci -q -c "$snapshot_dir" show "sqm.$2" | LC_ALL=C sort | sha256sum | 
 rm -f "$snapshot_dir/sqm"
 rmdir "$snapshot_dir"
 [ "$6" = "sha256:$digest" ] || exit 1
+[ "$check_only" -ne 1 ] || {
+	[ "$(sed -n '1p' "$CAKE_TEST_DIRECTIONAL_TC_STATE" 2>/dev/null)" = healthy ]
+	exit $?
+}
 [ -z "${CAKE_TEST_SQM_RECOVER_FAIL_COUNT_FILE:-}" ] || {
 	remaining="$(sed -n '1p' "$CAKE_TEST_SQM_RECOVER_FAIL_COUNT_FILE" 2>/dev/null)"
 	case "$remaining" in ''|*[!0-9]*) remaining=0 ;; esac

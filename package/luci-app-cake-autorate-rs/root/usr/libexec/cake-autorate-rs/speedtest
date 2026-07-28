@@ -700,6 +700,34 @@ device_has_one_root_cake() {
 	'
 }
 
+device_has_no_shaping_root() {
+	local device="$1" state
+
+	safe_route_name "$device" || return 1
+	state="$(tc -details qdisc show dev "$device" 2>/dev/null)" || return 1
+	printf '%s\n' "$state" | awk '
+		$1 == "qdisc" {
+			if ($2 == "fq") {
+				for (i = 1; i <= NF; i++) if ($i == "maxrate") unsafe_child = 1
+			}
+			if ($4 == "root") {
+				root_count++
+				root_kind = $2
+			} else if ($2 != "noqueue" && $2 != "fq_codel" &&
+			           $2 != "pfifo_fast" && $2 != "fq" &&
+			           $2 != "ingress" && $2 != "clsact") {
+				unsafe_child = 1
+			}
+		}
+		END {
+			if (root_count == 0) exit(unsafe_child ? 1 : 0)
+			if (root_count == 1 && root_kind == "noqueue" && !unsafe_child) exit 0
+			if (root_count == 1 && root_kind == "mq" && !unsafe_child) exit 0
+			exit 1
+		}
+	'
+}
+
 managed_ingress_redirect_present() {
 	local qdisc_state redirect_state
 
@@ -715,23 +743,73 @@ managed_ingress_redirect_present() {
 			return value
 		}
 		{
+			if ($1 == "filter") {
+				for (i = 1; i <= NF; i++) {
+					if ($i == "pref" && $(i + 1) != "") prefs[$(i + 1)] = 1
+					if ($i == "bpf" || $i == "flower" || $i == "matchall") foreign = 1
+					if ($i == "order") leaf_filters++
+				}
+			}
+			if ($1 == "match") match_lines++
+			if ($1 == "action") action_lines++
 			for (i = 1; i <= NF; i++) {
-				if ($i == "redirect" && $(i + 1) == "dev" && clean($(i + 2)) == expected)
-					found = 1
-				if ($i == "Redirect" && $(i + 1) == "to" && $(i + 2) == "device" && clean($(i + 3)) == expected)
-					found = 1
+				if ($i == "police" || $i == "drop" || $i == "gact" ||
+				    $i == "skbedit" || $i == "ct" || $i == "tunnel_key" ||
+				    $i == "sample") foreign = 1
+			}
+			for (i = 1; i <= NF; i++) {
+				if ($i == "redirect" && $(i + 1) == "dev") {
+					total++
+					if (clean($(i + 2)) == expected) matching++
+				}
+				if ($i == "Redirect" && $(i + 1) == "to" && $(i + 2) == "device") {
+					total++
+					if (clean($(i + 3)) == expected) matching++
+				}
 			}
 		}
-		END { exit(found ? 0 : 1) }
+		END {
+			for (p in prefs) pref_count++
+			exit(total == 1 && matching == 1 && action_lines == 1 &&
+			     pref_count <= 1 && leaf_filters <= 1 && match_lines <= 1 &&
+			     !foreign ? 0 : 1)
+		}
 	'
 }
 
 managed_ingress_redirect_absent() {
-	local qdisc_state
+	local redirect_state
 
-	qdisc_state="$(tc -details qdisc show dev "$target_if" 2>/dev/null)" || return 1
-	! printf '%s\n' "$qdisc_state" |
-		grep -Eq '^qdisc (ingress|clsact) '
+	redirect_state="$(tc filter show dev "$target_if" ingress 2>/dev/null)" || return 1
+	! printf '%s\n' "$redirect_state" | grep -q '[^[:space:]]'
+}
+
+managed_sqm_snapshot_still_current() {
+	local owner enabled configured_target current_fingerprint live_direction_mode
+
+	[ "${calibration_sqm_managed:-0}" = 1 ] || return 1
+	managed_sqm_snapshot_path_valid "$calibration_sqm_config_snapshot" 1 || return 1
+	owner="$(uci_raw_get "sqm.$calibration_sqm_section._cake_autorate_managed")"
+	enabled="$(uci_raw_get "sqm.$calibration_sqm_section.enabled")"
+	configured_target="$(uci_raw_get "sqm.$calibration_sqm_section.interface")"
+	[ "$owner" = "$section" ] && [ "$enabled" = 1 ] &&
+		[ "$configured_target" = "$calibration_sqm_target" ] || return 1
+	live_direction_mode="$(uci_get sqm_direction_mode)"
+	[ -n "$live_direction_mode" ] || live_direction_mode=both
+	case "$live_direction_mode" in both|upload_only|download_only) ;; *) return 1 ;; esac
+	[ "$live_direction_mode" = "$calibration_sqm_direction_mode" ] || return 1
+	current_fingerprint="$(managed_sqm_config_fingerprint "$calibration_sqm_section")" || return 1
+	[ "$current_fingerprint" = "$calibration_sqm_config_fingerprint" ]
+}
+
+managed_sqm_immutable_preflight() {
+	managed_sqm_snapshot_still_current || return 1
+	"$sqm_recover_bin" "$section" "$calibration_sqm_section" \
+		"$calibration_sqm_target" "$calibration_sqm_ul_if" \
+		"$calibration_sqm_dl_if" "$calibration_sqm_config_fingerprint" \
+		"$calibration_sqm_config_snapshot" check >/dev/null 2>&1 || return 1
+	# Detect a lock-bypassing UCI writer as close as possible to the mutation.
+	managed_sqm_snapshot_still_current
 }
 
 verify_managed_already_unshaped_direction() {
@@ -739,22 +817,23 @@ verify_managed_already_unshaped_direction() {
 
 	[ "${calibration_sqm_managed:-0}" = 1 ] && [ -x "$sqm_recover_bin" ] || return 1
 	command -v tc >/dev/null 2>&1 || return 1
-	configured_mode="$(uci_get sqm_direction_mode)"
+	configured_mode="${calibration_sqm_direction_mode:-}"
+	[ -n "$configured_mode" ] || configured_mode="$(uci_get sqm_direction_mode)"
 	[ -n "$configured_mode" ] || configured_mode=both
 	# sqm-recover validates the state file and the exact topology expected by
 	# the configured direction mode.  Repeat the direction-specific kernel
 	# checks here so an internal already-unshaped request cannot turn a stale or
 	# mismatched topology into positive bypass evidence.
-	"$sqm_recover_bin" "$section" check >/dev/null 2>&1 || return 1
+	managed_sqm_immutable_preflight || return 1
 
 	case "$configured_mode:$direction_override" in
 		upload_only:download)
 			device_has_one_root_cake "$calibration_sqm_ul_if" &&
-				! device_has_one_root_cake "$calibration_sqm_dl_if" &&
+				device_has_no_shaping_root "$calibration_sqm_dl_if" &&
 				managed_ingress_redirect_absent
 			;;
 		download_only:upload)
-			! device_has_one_root_cake "$calibration_sqm_ul_if" &&
+			device_has_no_shaping_root "$calibration_sqm_ul_if" &&
 				device_has_one_root_cake "$calibration_sqm_dl_if" &&
 				managed_ingress_redirect_present
 			;;
@@ -763,35 +842,76 @@ verify_managed_already_unshaped_direction() {
 }
 
 prepare_directional_sqm_bypass() {
-	local scope="$1"
+	local scope="$1" configured_mode
 
 	case "$scope" in ingress|egress) ;; *) return 1 ;; esac
 	[ "${calibration_sqm_managed:-0}" = 1 ] && [ -x "$sqm_recover_bin" ] || return 1
 	command -v tc >/dev/null 2>&1 || return 1
-	# This check validates the live state file, both managed CAKE roots, the
-	# exact ffff: ingress qdisc, and its redirect while borrowing the locks held
-	# by this transaction.  Never delete a qdisc based on UCI ownership alone.
-	"$sqm_recover_bin" "$section" check >/dev/null 2>&1 || return 1
-	device_has_one_root_cake "$calibration_sqm_ul_if" &&
-		device_has_one_root_cake "$calibration_sqm_dl_if" &&
-		managed_ingress_redirect_present || return 1
+	# This check validates the live state file and the exact configured
+	# directional topology while borrowing the locks held by this transaction.
+	# Never delete a qdisc based on UCI ownership alone.
+	managed_sqm_immutable_preflight || return 1
+	configured_mode="${calibration_sqm_direction_mode:-}"
+	[ -n "$configured_mode" ] || configured_mode="$(uci_get sqm_direction_mode)"
+	[ -n "$configured_mode" ] || configured_mode=both
+	case "$scope:$configured_mode" in
+		ingress:both|ingress:download_only|egress:both|egress:upload_only) ;;
+		*) return 1 ;;
+	esac
+	case "$configured_mode" in
+		both)
+			device_has_one_root_cake "$calibration_sqm_ul_if" &&
+				device_has_one_root_cake "$calibration_sqm_dl_if" &&
+				managed_ingress_redirect_present || return 1
+			;;
+		upload_only)
+			device_has_one_root_cake "$calibration_sqm_ul_if" &&
+				device_has_no_shaping_root "$calibration_sqm_dl_if" &&
+				managed_ingress_redirect_absent || return 1
+			;;
+		download_only)
+			device_has_no_shaping_root "$calibration_sqm_ul_if" &&
+				device_has_one_root_cake "$calibration_sqm_dl_if" &&
+				managed_ingress_redirect_present || return 1
+			;;
+		*) return 1 ;;
+	esac
 
 	case "$scope" in
 		ingress)
 			tc qdisc del dev "$target_if" ingress >/dev/null 2>&1 || return 1
 			managed_ingress_redirect_absent &&
-				device_has_one_root_cake "$calibration_sqm_ul_if" &&
 				device_has_one_root_cake "$calibration_sqm_dl_if" || return 1
+			case "$configured_mode" in
+				both) device_has_one_root_cake "$calibration_sqm_ul_if" || return 1 ;;
+				download_only) device_has_no_shaping_root "$calibration_sqm_ul_if" || return 1 ;;
+			esac
 			calibration_sqm_bypass_mode="ingress-only-managed"
-			append_warning "Temporarily bypassed only download SQM on $target_if; upload CAKE remained active."
+			if [ "$configured_mode" = download_only ]; then
+				append_warning "Temporarily bypassed download SQM on $target_if; upload was already intentionally unshaped."
+			else
+				append_warning "Temporarily bypassed only download SQM on $target_if; upload CAKE remained active."
+			fi
 			;;
 		egress)
 			tc qdisc del dev "$calibration_sqm_ul_if" root >/dev/null 2>&1 || return 1
-			! device_has_one_root_cake "$calibration_sqm_ul_if" &&
-				device_has_one_root_cake "$calibration_sqm_dl_if" &&
-				managed_ingress_redirect_present || return 1
+			device_has_no_shaping_root "$calibration_sqm_ul_if" || return 1
+			case "$configured_mode" in
+				both)
+					device_has_one_root_cake "$calibration_sqm_dl_if" &&
+						managed_ingress_redirect_present || return 1
+					;;
+				upload_only)
+					device_has_no_shaping_root "$calibration_sqm_dl_if" &&
+						managed_ingress_redirect_absent || return 1
+					;;
+			esac
 			calibration_sqm_bypass_mode="egress-only-managed"
-			append_warning "Temporarily bypassed only upload SQM on $calibration_sqm_ul_if; download CAKE remained active."
+			if [ "$configured_mode" = upload_only ]; then
+				append_warning "Temporarily bypassed upload SQM on $calibration_sqm_ul_if; download was already intentionally unshaped."
+			else
+				append_warning "Temporarily bypassed only upload SQM on $calibration_sqm_ul_if; download CAKE remained active."
+			fi
 			;;
 	esac
 	calibration_sqm_paused="false"
@@ -806,6 +926,7 @@ capture_managed_sqm_recovery_snapshot() {
 	calibration_sqm_target="$target_if"
 	calibration_sqm_ul_if=""
 	calibration_sqm_dl_if=""
+	calibration_sqm_direction_mode=""
 	calibration_sqm_config_fingerprint=""
 	# standalone_recovery_arm publishes the planned path before this copy. If
 	# SIGKILL lands while the snapshot is being prepared, its supervisor can
@@ -832,6 +953,12 @@ capture_managed_sqm_recovery_snapshot() {
 	[ -n "$calibration_sqm_ul_if" ] || calibration_sqm_ul_if="$target_if"
 	calibration_sqm_dl_if="$(uci_get dl_if)"
 	[ -n "$calibration_sqm_dl_if" ] || calibration_sqm_dl_if="ifb4$target_if"
+	calibration_sqm_direction_mode="$(uci_get sqm_direction_mode)"
+	[ -n "$calibration_sqm_direction_mode" ] || calibration_sqm_direction_mode=both
+	case "$calibration_sqm_direction_mode" in
+		both|upload_only|download_only) ;;
+		*) return 1 ;;
+	esac
 	safe_uci_name "$calibration_sqm_section" &&
 		safe_route_name "$calibration_sqm_target" &&
 		safe_route_name "$calibration_sqm_ul_if" &&
@@ -1243,6 +1370,7 @@ standalone_recovery_arm() {
 	calibration_sqm_target="$target_if"
 	calibration_sqm_ul_if=""
 	calibration_sqm_dl_if=""
+	calibration_sqm_direction_mode=""
 	calibration_sqm_config_fingerprint=""
 	calibration_sqm_config_snapshot="$runtime_lock_root/sqm-snapshot.${section}-$$-${runtime_interface_lock_token}"
 	managed_sqm_snapshot_path_valid "$calibration_sqm_config_snapshot" 0 || return 1
@@ -2913,6 +3041,7 @@ calibration_sqm_section=""
 calibration_sqm_target=""
 calibration_sqm_ul_if=""
 calibration_sqm_dl_if=""
+calibration_sqm_direction_mode=""
 calibration_sqm_config_fingerprint=""
 calibration_sqm_config_snapshot=""
 calibration_shaper_bypassed="false"
