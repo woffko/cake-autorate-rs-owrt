@@ -786,6 +786,7 @@ managed_ingress_redirect_absent() {
 
 managed_sqm_snapshot_still_current() {
 	local owner enabled configured_target current_fingerprint live_direction_mode
+	local live_manage_sqm live_sqm_enabled live_sqm_section live_target live_ul live_dl
 
 	[ "${calibration_sqm_managed:-0}" = 1 ] || return 1
 	managed_sqm_snapshot_path_valid "$calibration_sqm_config_snapshot" 1 || return 1
@@ -794,6 +795,23 @@ managed_sqm_snapshot_still_current() {
 	configured_target="$(uci_raw_get "sqm.$calibration_sqm_section.interface")"
 	[ "$owner" = "$section" ] && [ "$enabled" = 1 ] &&
 		[ "$configured_target" = "$calibration_sqm_target" ] || return 1
+	live_manage_sqm="$(uci_get manage_sqm)"
+	[ -n "$live_manage_sqm" ] || live_manage_sqm=1
+	live_sqm_enabled="$(uci_get sqm_enabled)"
+	bool_enabled "$(uci_get enabled)" && bool_enabled "$live_manage_sqm" &&
+		bool_enabled "$live_sqm_enabled" || return 1
+	live_sqm_section="$(uci_get sqm_section)"
+	[ -n "$live_sqm_section" ] || live_sqm_section="cake_$section"
+	live_target="$(uci_get sqm_interface)"
+	live_ul="$(uci_get ul_if)"
+	[ -n "$live_target" ] || live_target="$live_ul"
+	[ -n "$live_ul" ] || live_ul="$live_target"
+	live_dl="$(uci_get dl_if)"
+	[ -n "$live_dl" ] || live_dl="ifb4$live_target"
+	[ "$live_sqm_section" = "$calibration_sqm_section" ] &&
+		[ "$live_target" = "$calibration_sqm_target" ] &&
+		[ "$live_ul" = "$calibration_sqm_ul_if" ] &&
+		[ "$live_dl" = "$calibration_sqm_dl_if" ] || return 1
 	live_direction_mode="$(uci_get sqm_direction_mode)"
 	[ -n "$live_direction_mode" ] || live_direction_mode=both
 	case "$live_direction_mode" in both|upload_only|download_only) ;; *) return 1 ;; esac

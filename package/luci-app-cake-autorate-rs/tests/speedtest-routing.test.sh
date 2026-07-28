@@ -404,10 +404,14 @@ prepare_directional_sqm_bypass egress || fail_test "managed egress-only bypass f
 	calibration_sqm_managed=1
 	calibration_sqm_section=cake_wan
 	calibration_sqm_target=eth0
+	calibration_sqm_ul_if=eth0
+	calibration_sqm_dl_if=ifb4eth0
 	calibration_sqm_direction_mode=upload_only
 	calibration_sqm_config_snapshot=/tmp/sqm-snapshot.test
 	calibration_sqm_config_fingerprint=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 	test_live_direction_mode=upload_only
+	test_live_manage_sqm=1
+	test_live_ul_if=eth0
 	managed_sqm_snapshot_path_valid() { return 0; }
 	uci_raw_get() {
 		case "$1" in
@@ -418,12 +422,25 @@ prepare_directional_sqm_bypass egress || fail_test "managed egress-only bypass f
 		esac
 	}
 	uci_get() {
-		[ "$1" = sqm_direction_mode ] || return 1
-		printf '%s\n' "$test_live_direction_mode"
+		case "$1" in
+			enabled|sqm_enabled) printf '1\n' ;;
+			manage_sqm) printf '%s\n' "$test_live_manage_sqm" ;;
+			sqm_section) printf 'cake_wan\n' ;;
+			sqm_interface|ul_if) printf '%s\n' "$test_live_ul_if" ;;
+			dl_if) printf 'ifb4eth0\n' ;;
+			sqm_direction_mode) printf '%s\n' "$test_live_direction_mode" ;;
+			*) return 1 ;;
+		esac
 	}
 	managed_sqm_config_fingerprint() { printf '%s\n' "$calibration_sqm_config_fingerprint"; }
 	managed_sqm_snapshot_still_current || exit 1
 	test_live_direction_mode=download_only
+	if managed_sqm_snapshot_still_current; then exit 1; fi
+	test_live_direction_mode=upload_only
+	test_live_manage_sqm=0
+	if managed_sqm_snapshot_still_current; then exit 1; fi
+	test_live_manage_sqm=1
+	test_live_ul_if=eth9
 	if managed_sqm_snapshot_still_current; then exit 1; fi
 ) || fail_test "live autorate direction drift was accepted before directional SQM mutation"
 
@@ -968,10 +985,13 @@ case "$key" in
 		[ -n "$config_dir" ] || [ ! -s "$CAKE_TEST_JOB_WORK/sqm-config-drift" ] || cat "$CAKE_TEST_JOB_WORK/sqm-config-drift"
 		;;
 	cake-autorate.wan.manage_sqm) printf '%s\n' "${CAKE_TEST_MANAGE_SQM:-1}" ;;
+	cake-autorate.wan.enabled) printf '1\n' ;;
 	cake-autorate.wan.sqm_enabled) printf '1\n' ;;
 	cake-autorate.wan.sqm_section) printf 'cake_wan\n' ;;
+	cake-autorate.wan.sqm_interface) printf 'eth0\n' ;;
 	cake-autorate.wan.ul_if) printf 'eth0\n' ;;
 	cake-autorate.wan.dl_if) printf 'ifb4eth0\n' ;;
+	cake-autorate.wan.sqm_direction_mode) printf 'both\n' ;;
 	sqm.cake_wan._cake_autorate_managed) printf 'wan\n' ;;
 	sqm.cake_wan.enabled) printf '1\n' ;;
 	sqm.cake_wan.interface) printf 'eth0\n' ;;
