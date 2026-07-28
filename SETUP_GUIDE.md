@@ -89,6 +89,15 @@ instance only after identifying the intended uplink.
    and disappear on service stop or reboot. Start with the automatic memory
    budget and a 10-second interval.
 
+For manual one-sided shaping, open **Edit → SQM setup → CAKE directions**.
+**Upload only** removes the download/ingress CAKE and IFB; **Download only**
+removes upload/egress CAKE; **Both** restores the normal bidirectional topology.
+The unshaped direction has no local bufferbloat protection. This selector is
+different from **Adjust DL/UL**, which can leave CAKE present at a fixed rate
+while preventing autorate from changing that direction. Selecting a one-sided
+mode clears Adjust for the absent direction; restoring CAKE later deliberately
+does not overwrite that separate manual choice.
+
 For scale, one anonymized cellular Full raw run reached roughly 403/46 Mbit/s.
 A 2 GiB hard allowance stopped it safely after the first shaped point, restored
 SQM and left UCI untouched; completing the whole Variable-link frontier at that

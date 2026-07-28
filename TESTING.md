@@ -2216,3 +2216,41 @@ anonymization. The Status capture deliberately shows `WAITING FOR DATA`: an
 automatic Get rating attempt refused safely at preflight while forwarded
 traffic remained around 45 Mbit/s in both directions, so no grade was fabricated
 for documentation.
+
+### LuCI r42 manual-direction and Save & Apply regression (2026-07-28)
+
+LuCI r42 exposes the three running managed-SQM topologies directly under
+**Edit → SQM setup → CAKE directions**: both directions, upload only, and
+download only. The stopped/no-SQM topology remains an Auto-Tune review result
+instead of becoming an ambiguous manual selector. A one-sided selection clears
+the Autorate adjustment switch for the absent direction; restoring CAKE does
+not silently change that independent fixed-rate choice.
+
+The first live transition test found that LuCI can invoke the target-interface
+`onchange` handler while saving an otherwise unchanged form. The old handler
+treated that event as a real WAN change and imported the managed SQM runtime
+value `0`, which is the technical marker for an absent one-sided queue, as the
+user's logical link rate. The corrected handler imports interface rates only
+after an actual interface change or when a positive logical rate is missing;
+queue values less than one are never capacity presets. Focused JavaScript
+coverage reproduces the synthetic same-interface event and verifies that
+`108000/14500` remains intact when the managed queue reports `0/0`.
+
+The corrected r42 APK was then installed with daemon r21 on all three test
+routers. On the dual-WAN x86_64 router, Playwright exercised
+`upload_only → download_only → both` through the modal Save action and the
+standard LuCI footer Save & Apply. Every transition ended with clean UCI and
+preserved logical rates. Kernel inspection confirmed the exact intended
+topology: upload-only kept root CAKE and removed ingress redirect/IFB CAKE;
+download-only kept ingress redirect/IFB CAKE and removed root CAKE; both
+restored both paths. The original instance configuration was then restored
+byte-for-byte.
+
+Fresh desktop/mobile Playwright audits passed on the two x86_64 Multi-WAN
+routers and the aarch64 cellular router with daemon r21 and LuCI r42. Status,
+Settings, profile cards, version labels, optional graphs, fixed time axes and
+mobile scrolling had no browser/RPC errors or page overflow. Post-install UCI
+was clean on all three devices. Runtime health reported both active queues
+healthy on the primary router, the deliberately missing PPPoE link as
+`WAITING_LINK` on the negative-test router, and a healthy upload-only topology
+on the cellular router.

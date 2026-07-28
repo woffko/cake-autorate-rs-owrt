@@ -127,6 +127,7 @@ var optionDescriptions = {
 	ul_if: 'Interface whose TX byte counter represents upload traffic, usually the WAN device.',
 	manage_sqm: 'Mirror this instance into /etc/config/sqm and restart SQM before autorate starts.',
 	sqm_section: 'Name of the managed SQM queue section. Leave empty to use cake_<instance>.',
+	sqm_direction_mode: 'Choose which traffic directions receive managed CAKE. Upload only removes download/ingress CAKE and its IFB; Download only removes upload/egress CAKE. The unshaped direction has no local bufferbloat protection. Its Adjust switch is cleared; if you restore that CAKE direction later, choose separately whether Autorate may adjust it.',
 	sqm_interface: 'Network device where SQM should attach the CAKE queue.',
 	sqm_debug_logging: 'Enable SQM script debug logging for this queue.',
 	sqm_verbosity: 'Verbosity level passed to SQM scripts.',
@@ -1102,6 +1103,17 @@ function rateValue(value, fallback) {
 	return fallback;
 }
 
+function positiveRateValue(value) {
+	var parsed = parseInt(value, 10);
+
+	return !isNaN(parsed) && parsed > 0 ? String(value) : null;
+}
+
+function shouldImportInterfaceRates(previous, next, dl, ul) {
+	return normalizeInterfaceName(previous) !== normalizeInterfaceName(next) ||
+		!positiveRateValue(dl) || !positiveRateValue(ul);
+}
+
 function optionByName(section, key) {
 	if (!section || !section.children)
 		return null;
@@ -1152,14 +1164,12 @@ function halfRate(value) {
 
 function applyRatePreset(section_id, wan_if, replaceExisting, section) {
 	var queue = findSqmQueueForInterface(wan_if);
-	var currentDl = uci.get('cake-autorate', section_id, 'sqm_download');
-	var currentUl = uci.get('cake-autorate', section_id, 'sqm_upload');
-	var dl = rateValue(queue ? queue.download : null,
-		rateValue(currentDl,
-			rateValue(uci.get('cake-autorate', section_id, 'base_dl_shaper_rate_kbps'), '20000')));
-	var ul = rateValue(queue ? queue.upload : null,
-		rateValue(currentUl,
-			rateValue(uci.get('cake-autorate', section_id, 'base_ul_shaper_rate_kbps'), '20000')));
+	var currentDl = positiveRateValue(uci.get('cake-autorate', section_id, 'sqm_download'));
+	var currentUl = positiveRateValue(uci.get('cake-autorate', section_id, 'sqm_upload'));
+	var dl = positiveRateValue(queue ? queue.download : null) || currentDl ||
+		positiveRateValue(uci.get('cake-autorate', section_id, 'base_dl_shaper_rate_kbps')) || '20000';
+	var ul = positiveRateValue(queue ? queue.upload : null) || currentUl ||
+		positiveRateValue(uci.get('cake-autorate', section_id, 'base_ul_shaper_rate_kbps')) || '20000';
 
 	if (replaceExisting || !currentDl)
 		setCakeOption(section, section_id, 'sqm_download', dl);
@@ -8880,8 +8890,14 @@ function addSetupOptions(section) {
 		return selectedWan(null, section_id);
 	};
 	o.onchange = function(ev, section_id, value) {
+		value = normalizeInterfaceName(value);
+		var previous = selectedWan(null, section_id);
+		var importRates = shouldImportInterfaceRates(previous, value,
+			uci.get('cake-autorate', section_id, 'sqm_download'),
+			uci.get('cake-autorate', section_id, 'sqm_upload'));
+
 		if (autoInterfacePresetEnabled(this.section, section_id))
-			applyWanPreset(section_id, value, true, this.section);
+			applyWanPreset(section_id, value, importRates, this.section);
 
 		syncManagedSqmEnabled(this.section, section_id);
 		refreshSpeedtestSummaries(this.section, section_id);
@@ -8890,9 +8906,9 @@ function addSetupOptions(section) {
 		formvalue = normalizeInterfaceName(formvalue);
 
 		var previous = selectedWan(null, section_id);
-		var importRates = previous !== formvalue ||
-			!uci.get('cake-autorate', section_id, 'sqm_download') ||
-			!uci.get('cake-autorate', section_id, 'sqm_upload');
+		var importRates = shouldImportInterfaceRates(previous, formvalue,
+			uci.get('cake-autorate', section_id, 'sqm_download'),
+			uci.get('cake-autorate', section_id, 'sqm_upload'));
 
 		uci.set('cake-autorate', section_id, 'wan_if', formvalue);
 
@@ -9457,6 +9473,25 @@ function addAdvancedOptions(section) {
 	optionalValue(section, 'advanced', 'tx_bytes_path', _('TX bytes path'), null, '');
 }
 
+function manualSqmDirectionMode(value) {
+	return [ 'both', 'upload_only', 'download_only' ].indexOf(value) >= 0 ? value : 'both';
+}
+
+function writeManualSqmDirectionMode(section_id, selected) {
+	if ([ 'both', 'upload_only', 'download_only' ].indexOf(selected) < 0)
+		throw new TypeError(_('CAKE directions must be Both, Upload only, or Download only.'));
+
+	uci.set('cake-autorate', section_id, 'sqm_direction_mode', selected);
+
+	/* A missing CAKE direction cannot be adjusted by autorate. Preserve an
+	 * intentional fixed-rate choice on every active or restored direction. */
+	if (selected === 'upload_only')
+		uci.set('cake-autorate', section_id, 'adjust_dl_shaper_rate', '0');
+
+	if (selected === 'download_only')
+		uci.set('cake-autorate', section_id, 'adjust_ul_shaper_rate', '0');
+}
+
 function addSqmOptions(section, qdiscs, scripts) {
 	var o, seen;
 
@@ -9475,6 +9510,23 @@ function addSqmOptions(section, qdiscs, scripts) {
 	dependsManagedSqm(o);
 	o.validate = function(section_id) {
 		return validateSqmSectionUnique(validationSection(this), section_id);
+	};
+
+	o = listValue(section, 'sqm_basic', 'sqm_direction_mode', _('CAKE directions'), [
+		[ 'both', _('Both — download and upload') ],
+		[ 'upload_only', _('Upload only — no download/ingress CAKE') ],
+		[ 'download_only', _('Download only — no upload/egress CAKE') ]
+	], 'both');
+	dependsManagedSqm(o);
+	o.cfgvalue = function(section_id) {
+		return manualSqmDirectionMode(uci.get('cake-autorate', section_id, 'sqm_direction_mode'));
+	};
+	o.write = function(section_id, selected) {
+		writeManualSqmDirectionMode(section_id, selected);
+	};
+	o.validate = function(section_id, selected) {
+		return [ 'both', 'upload_only', 'download_only' ].indexOf(selected) >= 0 ? true :
+			_('CAKE directions must be Both, Upload only, or Download only.');
 	};
 
 	o = iface(section, 'sqm_basic', 'sqm_interface', _('SQM interface'));

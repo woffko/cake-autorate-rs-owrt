@@ -142,7 +142,9 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 			`runSequentialAutotuneApplies, ` +
 			`clearAutotuneProposalState, recordAutotuneTerminalFailure, ` +
 			`autotuneRetryableInconclusive, autotuneRecommendedProfile, recordAutotuneRetryableInconclusive, ` +
-				`adaptiveCeilingWritePlan, runAutotuneJob, cancelAutotuneJob, ` +
+			`manualSqmDirectionMode, writeManualSqmDirectionMode, ` +
+			`positiveRateValue, shouldImportInterfaceRates, applyRatePreset, ` +
+			`adaptiveCeilingWritePlan, runAutotuneJob, cancelAutotuneJob, ` +
 			`setInterfaceContext: function(value) { interfaceContext = value; }, ` +
 			`setMwan3Context: function(value) { mwan3Context = value; } };`
 	)(fsImpl || {}, {}, {}, uciImpl || uci, {}, {}, {}, rpcImpl || {
@@ -151,6 +153,100 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 }
 
 const helpers = compileHelpers({});
+assert.equal(helpers.manualSqmDirectionMode('both'), 'both');
+assert.equal(helpers.manualSqmDirectionMode('upload_only'), 'upload_only');
+assert.equal(helpers.manualSqmDirectionMode('download_only'), 'download_only');
+assert.equal(helpers.manualSqmDirectionMode('off'), 'both',
+	'the manual selector must not expose the stopped/no-SQM topology');
+assert.match(source,
+	/listValue\(section, 'sqm_basic', 'sqm_direction_mode', _\('CAKE directions'\)[\s\S]*?Upload only — no download\/ingress CAKE[\s\S]*?Download only — no upload\/egress CAKE/,
+	'Edit -> SQM setup must expose all three running direction topologies');
+
+const directionState = { sqm_direction_mode: 'both' };
+const directionHelpers = compileHelpers({}, {
+	set(config, section, key, value) {
+		assert.equal(config, 'cake-autorate');
+		directionState[key] = value;
+	},
+	unset(config, section, key) {
+		assert.equal(config, 'cake-autorate');
+		delete directionState[key];
+	},
+	get(config, section, key) {
+		assert.equal(config, 'cake-autorate');
+		return directionState[key] ?? null;
+	},
+	sections(config) {
+		return fixtureSections[config] || [];
+	},
+});
+directionHelpers.writeManualSqmDirectionMode('wan_sqm', 'upload_only');
+assert.equal(directionState.sqm_direction_mode, 'upload_only');
+assert.equal(directionState.adjust_dl_shaper_rate, '0',
+	'upload-only mode must disable download autorate adjustment');
+delete directionState.adjust_dl_shaper_rate;
+directionState.adjust_dl_shaper_rate = '0';
+directionHelpers.writeManualSqmDirectionMode('wan_sqm', 'both');
+assert.equal(directionState.adjust_dl_shaper_rate, '0',
+	'restoring download CAKE must preserve a manual fixed-rate choice');
+delete directionState.adjust_dl_shaper_rate;
+directionHelpers.writeManualSqmDirectionMode('wan_sqm', 'download_only');
+assert.equal(directionState.sqm_direction_mode, 'download_only');
+assert.equal(directionState.adjust_ul_shaper_rate, '0',
+	'download-only mode must disable upload autorate adjustment');
+delete directionState.adjust_ul_shaper_rate;
+directionState.adjust_ul_shaper_rate = '0';
+directionHelpers.writeManualSqmDirectionMode('wan_sqm', 'both');
+assert.equal(directionState.adjust_ul_shaper_rate, '0',
+	'restoring upload CAKE must preserve a manual fixed-rate choice');
+assert.throws(() => directionHelpers.writeManualSqmDirectionMode('wan_sqm', 'off'),
+	/CAKE directions must be Both, Upload only, or Download only/,
+	'the manual selector must fail closed instead of stopping SQM implicitly');
+
+assert.equal(helpers.shouldImportInterfaceRates('eth0', 'eth0', '108000', '14500'), false,
+	'a spurious LuCI onchange on the same interface must not re-import runtime SQM rates');
+assert.equal(helpers.shouldImportInterfaceRates('eth0', 'pppoe-wan', '108000', '14500'), true,
+	'a real interface change must import the new link rates');
+assert.equal(helpers.shouldImportInterfaceRates('eth0', 'eth0', '0', '14500'), true,
+	'a missing or zero logical direction rate must be repaired from a usable preset');
+
+const oneSidedRateState = {
+	sqm_download: '108000',
+	sqm_upload: '14500',
+	base_dl_shaper_rate_kbps: '108000',
+	base_ul_shaper_rate_kbps: '14500',
+};
+const oneSidedRateHelpers = compileHelpers({}, {
+	set(config, section, key, value) {
+		assert.equal(config, 'cake-autorate');
+		oneSidedRateState[key] = value;
+	},
+	unset() {},
+	get(config, section, key) {
+		return config === 'cake-autorate' ? oneSidedRateState[key] ?? null : null;
+	},
+	sections(config) {
+		return config === 'sqm' ? [{
+			'.name': 'cake_wanb_sqm',
+			'.type': 'queue',
+			interface: 'eth0',
+			download: '0',
+			upload: '0',
+			_cake_autorate_managed: 'wanb_sqm',
+		}] : [];
+	},
+});
+oneSidedRateHelpers.applyRatePreset('wanb_sqm', 'eth0', true, null);
+assert.equal(oneSidedRateState.sqm_download, '108000',
+	'a managed runtime download=0 must not overwrite the logical download capacity');
+assert.equal(oneSidedRateState.sqm_upload, '14500',
+	'a managed runtime upload=0 must not overwrite the logical upload capacity');
+assert.equal(oneSidedRateState.min_dl_shaper_rate_kbps, '54000');
+assert.equal(oneSidedRateState.min_ul_shaper_rate_kbps, '7250');
+assert.match(source,
+	/o\.onchange = function\(ev, section_id, value\)[\s\S]*?shouldImportInterfaceRates\(previous, value,[\s\S]*?applyWanPreset\(section_id, value, importRates/,
+	'Target interface onchange must distinguish widget toggles from real WAN changes');
+
 assert.equal(helpers.autotuneHasTrustedCapacityReferences({}), false,
 	'reuse-trusted must stay unavailable without saved capacity references');
 assert.equal(helpers.autotuneHasTrustedCapacityReferences({

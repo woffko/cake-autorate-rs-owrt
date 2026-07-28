@@ -160,6 +160,12 @@ RC27 implements the following controller and LuCI model:
   no-SQM fallback into Review instead of discarding the whole run. This is a
   manual proposal backed by the measured raw topology, not permission to infer
   missing shaped evidence.
+- The same running SQM topologies can be selected manually in **Edit → SQM
+  setup → CAKE directions**. One-sided mode removes CAKE from the unselected
+  direction; it is not the same as retaining CAKE at a fixed rate by disabling
+  Adjust DL or Adjust UL. Logical capacity values remain independent of the
+  managed SQM runtime `0` marker used for an absent direction, including across
+  the standard LuCI Save & Apply cycle.
 - Treat a flat latency curve as directional evidence. If one Variable-link
   direction meets its quality target but lower tested CAKE rates provide no
   repeatable latency improvement, hold that direction at its highest safe,
@@ -232,8 +238,8 @@ The RC27 release builds the OpenWrt 25.12 daemon APK for this ABI matrix:
 The target is an APK ABI rather than one specific board. The authoritative
 choice is the value returned by `apk --print-arch`. Every daemon asset follows
 the name
-`cake-autorate-rs-1.0_rc27-r20_openwrt-25.12_<arch>.apk`; the shared
-`luci-app-cake-autorate-rs-1.0_rc27-r40_openwrt-25.12_all.apk` contains the
+`cake-autorate-rs-1.0_rc27-r21_openwrt-25.12_<arch>.apk`; the shared
+`luci-app-cake-autorate-rs-1.0_rc27-r42_openwrt-25.12_all.apk` contains the
 architecture-independent LuCI interface and SQM integration.
 
 RC27 adds background-aware Full Auto-Tune confidence without mixing forwarded
@@ -326,11 +332,15 @@ representative examples rather than guarantees.
 
 ## Release history
 
-The README describes the current behavior rather than retaining a cumulative RC
-diary. Prior release notes remain available under
-[GitHub Releases](https://github.com/woffko/cake-autorate-rs-owrt/releases), and
-the detailed regression evidence and design chronology remain in
-[Testing](TESTING.md).
+The current public prerelease is **RC27 r21/r42**: daemon package r21 and LuCI
+package r42. It adds the manual per-direction CAKE selector and fixes a LuCI
+Save & Apply edge case in which a one-sided managed SQM runtime `0` could be
+mistaken for the configured link capacity. The focused live transition matrix,
+full browser audit, package ABI verification and design chronology are recorded
+in [Testing](TESTING.md). The README intentionally describes current behavior
+instead of retaining a cumulative RC diary; historical source points remain in
+Git tags while [GitHub Releases](https://github.com/woffko/cake-autorate-rs-owrt/releases)
+contains the current downloadable build.
 
 ## Repository Layout
 
@@ -771,8 +781,8 @@ For example, when it prints `aarch64_generic`:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc27-r20_openwrt-25.12_aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc27-r40_openwrt-25.12_all.apk
+  /root/cake-autorate-rs-1.0_rc27-r21_openwrt-25.12_aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc27-r42_openwrt-25.12_all.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:

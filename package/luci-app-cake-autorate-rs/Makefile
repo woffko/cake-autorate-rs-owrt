@@ -7,7 +7,7 @@ endif
 
 PKG_NAME:=luci-app-cake-autorate-rs
 PKG_VERSION:=1.0_rc27
-PKG_RELEASE:=40
+PKG_RELEASE:=42
 
 PKG_MAINTAINER:=woffko
 PKG_LICENSE:=Apache-2.0
