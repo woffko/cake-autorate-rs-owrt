@@ -3003,6 +3003,10 @@ for (const label of [ 'Connection & routing', 'Rate limits', 'Adaptive ceiling',
 	assert(source.includes(label), `missing Autorate subcategory: ${label}`);
 assert(source.includes("'class': 'cbi-tabmenu cake-autorate-subnav'"),
 	'Autorate subcategories must use native LuCI tab styling');
+assert(source.includes('grid-template-columns:repeat(2,minmax(0,1fr))'),
+	'Autorate subtabs must remain visibly reachable on narrow mobile dialogs');
+assert(source.includes('word-break:normal;overflow-wrap:break-word;hyphens:none'),
+	'wizard descriptions must not split ordinary words on narrow screens');
 assert(source.includes("tabItems[definition.id].className = active ? 'cbi-tab' : 'cbi-tab-disabled'"),
 	'Autorate subcategories must use native LuCI active/inactive tab states');
 assert(!source.includes("'btn cbi-button cbi-button-action' : 'btn cbi-button cbi-button-neutral'"),

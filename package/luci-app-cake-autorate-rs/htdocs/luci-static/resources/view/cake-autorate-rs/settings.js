@@ -6273,7 +6273,7 @@ function showCreateWizard(grid, name, existingName) {
 				}
 			}, [
 				E('strong', {}, mode[1]),
-				E('span', { 'style': 'font-size:12px;white-space:normal' }, mode[2])
+				E('span', { 'style': 'font-size:12px;white-space:normal;word-break:normal;overflow-wrap:break-word;hyphens:none' }, mode[2])
 			]);
 		});
 
@@ -8470,9 +8470,10 @@ function decorateAutorateSubcategories(section, sectionId, containers) {
 	autorateContainer.appendChild(E('style', {}, [
 		'.cake-autorate-subnav{margin:12px 0 14px;max-width:100%;overflow-x:auto;overflow-y:hidden;flex-wrap:nowrap;scrollbar-width:thin}',
 		'.cake-autorate-subnav>li{flex:0 0 auto}',
-		'.cake-autorate-subnav>li>a{white-space:nowrap}',
+		'.cake-autorate-subnav>li>a{white-space:nowrap;word-break:normal;overflow-wrap:normal;hyphens:none}',
 		'.cake-autorate-subpanel{min-width:0}',
-		'.cake-autorate-subdescription{margin:0 0 12px;color:var(--text-color-medium,#777)}'
+		'.cake-autorate-subdescription{margin:0 0 12px;color:var(--text-color-medium,#777)}',
+		'@media(max-width:600px){.cake-autorate-subnav{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;overflow:visible;padding:0}.cake-autorate-subnav>li{min-width:0;margin:0!important}.cake-autorate-subnav>li>a{display:flex;align-items:center;justify-content:center;min-height:42px;padding:6px!important;text-align:center;white-space:normal}}'
 	].join('')));
 	autorateContainer.appendChild(nav);
 	autorateContainer.appendChild(panelRoot);

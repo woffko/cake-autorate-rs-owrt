@@ -32,7 +32,7 @@ const uciStub = {
 };
 const loadHelpers = new Function('fs', 'poll', 'uci', 'ui', 'L', 'E', '_', 'window',
 	`${prefix}\nreturn { parseHistory, historyInterval, buildChartGeometry, nearestPoint, ` +
-		'bindHover, bindScroll, scrollState, scrollMaximum, formatMemoryKib, lineConnected, niceRateCeiling, ' +
+		'bindHover, bindScroll, scrollState, scrollMaximum, visibleTimeAxisLabels, formatMemoryKib, lineConnected, niceRateCeiling, ' +
 		'collectChartEvents, clusterChartEvents, chartEventClusters, eventLabelPlacement, layoutEventLabels, ' +
 		'setHistoryEnabled, setHistoryInterval, setHistoryBudget };');
 const helpers = loadHelpers({}, {}, uciStub, {}, {}, () => {}, value => value, windowStub);
@@ -44,6 +44,14 @@ function assert(condition, message) {
 
 assert(source.includes('.cake-graph-fixed-axis{position:absolute;left:0;right:0'),
 	'Y-axis labels must stay fixed while the data timeline scrolls');
+assert(source.includes('.cake-graph-time-axis{position:absolute;left:0;right:0'),
+	'time-axis labels must stay fixed while the data timeline scrolls');
+assert(source.includes('.cake-graph-time-axis-dated .cake-graph-time-middle{display:none}'),
+	'long date/time axes must suppress their middle label on narrow screens');
+assert(source.includes('max-width:32%;overflow:hidden;text-overflow:ellipsis'),
+	'fixed time labels must not overlap when localized date strings are long');
+assert(!source.includes('ctx.fillText(formatTime(timestamp'),
+	'time labels must not be painted into the scrolling canvas');
 assert(source.includes('.cake-graph-chart-title{position:sticky;left:0'),
 	'chart titles must stay fixed while the data timeline scrolls');
 assert(source.includes('GRAPH_EVENT_LABEL_LANES = 3'),
@@ -129,6 +137,37 @@ for (let index = 0; index < 2000; index++) {
 }
 const geometry = helpers.buildChartGeometry(longHistory, 1, { clientWidth: 900 });
 assert(geometry.width > 900, 'long history should require horizontal scrolling');
+const fixedTimeLabels = helpers.visibleTimeAxisLabels(geometry, {
+	clientWidth: 900,
+	scrollLeft: geometry.width - 900,
+});
+assert(fixedTimeLabels.length === 3 && fixedTimeLabels.every(Boolean),
+	'fixed time axis must expose complete left, middle and right labels');
+assert(new Set(fixedTimeLabels).size === 3,
+	'right-edge scrolling must expose three distinct visible timestamps');
+[ 0, Math.round((geometry.width - 900) / 2) ].forEach(scrollLeft => {
+	const labels = helpers.visibleTimeAxisLabels(geometry, { clientWidth: 900, scrollLeft });
+	assert(labels.every(Boolean) && new Set(labels).size === 3,
+		`fixed time axis must remain complete at scroll offset ${scrollLeft}`);
+});
+const singlePointGeometry = helpers.buildChartGeometry([ longHistory[0] ], 1, { clientWidth: 320 });
+const singlePointLabels = helpers.visibleTimeAxisLabels(singlePointGeometry, {
+	clientWidth: 320,
+	scrollLeft: 0,
+});
+assert(singlePointLabels[0] === '' && singlePointLabels[1] && singlePointLabels[2] === '',
+	'a single point must render one centered timestamp instead of three overlapping copies');
+const emptyLabels = helpers.visibleTimeAxisLabels(
+	helpers.buildChartGeometry([], 10, { clientWidth: 320 }),
+	{ clientWidth: 320, scrollLeft: 0 });
+assert(emptyLabels[0] === '' && emptyLabels[1] && emptyLabels[2] === '',
+	'an empty graph must render one centered current-time label');
+const datedGeometry = helpers.buildChartGeometry([
+	{ timestamp: now - 2 * 86400 }, { timestamp: now },
+], 60, { clientWidth: 390 });
+assert(datedGeometry.includeDate === true &&
+	helpers.visibleTimeAxisLabels(datedGeometry, { clientWidth: 390, scrollLeft: 0 }).every(Boolean),
+	'24-hour histories must produce a date-aware fixed axis');
 assert(helpers.nearestPoint(points, now - 1.1) === points[1], 'nearest hover sample failed');
 assert(helpers.lineConnected(
 	{ timestamp: 1, routeIdentity: 'route-a', uplinkState: 'ACTIVE' },

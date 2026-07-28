@@ -424,6 +424,10 @@ assert.doesNotMatch(source, /cake-status-root\{[^}]*100vw/,
 	'Status must not escape the LuCI content container through viewport units');
 assert.match(source, /cake-status-table-compact\{min-width:0;table-layout:fixed\}/,
 	'the five mandatory columns must use a compact fixed layout');
+assert.match(source, /cake-status-table-compact th,.cake-status-table-compact td\{min-width:0!important;max-width:none!important;box-sizing:border-box!important/,
+	'mandatory table cells must not expand past their assigned desktop columns');
+assert.match(source, /cake-status-table-compact \[data-column="instance"\] \*.*\[data-column="uplink"\] \*.*white-space:normal!important;overflow-wrap:anywhere/,
+	'inline no-wrap content must not bleed across compact mandatory columns');
 assert.match(source, /cake-status-table-expanded\{min-width:max-content;table-layout:auto\}/,
 	'optional columns must overflow only inside the table scroller');
 assert.match(source, /cake-quality-action\{min-width:145px;display:flex;flex-direction:column;align-items:flex-start;gap:5px\}/,

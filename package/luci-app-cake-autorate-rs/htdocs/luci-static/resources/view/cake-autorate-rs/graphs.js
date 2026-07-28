@@ -399,15 +399,11 @@ function drawChartGrid(ctx, geometry) {
 	for (var tick = 0; tick <= tickCount; tick++) {
 		var ratio = tick / tickCount;
 		var x = geometry.left + geometry.plotWidth * ratio;
-		var timestamp = geometry.firstTimestamp +
-			(geometry.lastTimestamp - geometry.firstTimestamp) * ratio;
 
 		ctx.beginPath();
 		ctx.moveTo(x, geometry.top);
 		ctx.lineTo(x, geometry.top + geometry.plotHeight);
 		ctx.stroke();
-		ctx.textAlign = tick === 0 ? 'left' : (tick === tickCount ? 'right' : 'center');
-		ctx.fillText(formatTime(timestamp, geometry.includeDate), x, geometry.height - 8);
 	}
 	ctx.textAlign = 'left';
 }
@@ -797,6 +793,60 @@ function fixedAxis(labels) {
 	return nodes;
 }
 
+function fixedTimeAxis() {
+	var nodes = {
+		left: E('span', { 'class': 'cake-graph-time-left' }, ''),
+		middle: E('span', { 'class': 'cake-graph-time-middle' }, ''),
+		right: E('span', { 'class': 'cake-graph-time-right' }, '')
+	};
+	nodes.root = E('div', { 'class': 'cake-graph-time-axis', 'aria-hidden': 'true' }, [
+		nodes.left, nodes.middle, nodes.right
+	]);
+	return nodes;
+}
+
+function visibleTimeAxisLabels(geometry, viewport) {
+	var scrollLeft = Math.max(0, Number(viewport.scrollLeft) || 0);
+	var viewportWidth = Math.max(1, Number(viewport.clientWidth) || geometry.width);
+	if (geometry.lastTimestamp <= geometry.firstTimestamp)
+		return [ '', formatTime(geometry.lastTimestamp, geometry.includeDate), '' ];
+	var visibleLeft = Math.max(geometry.left, scrollLeft + geometry.left);
+	var visibleRight = Math.min(geometry.width - geometry.right,
+		scrollLeft + viewportWidth - geometry.right);
+
+	if (visibleRight <= visibleLeft) {
+		visibleLeft = Math.max(geometry.left,
+			Math.min(geometry.width - geometry.right, scrollLeft));
+		return [ '', formatTime(timestampAt(visibleLeft), geometry.includeDate), '' ];
+	}
+
+	function timestampAt(x) {
+		if (geometry.lastTimestamp <= geometry.firstTimestamp || geometry.plotWidth <= 0)
+			return geometry.lastTimestamp;
+		var ratio = Math.max(0, Math.min(1,
+			(x - geometry.left) / geometry.plotWidth));
+		return geometry.firstTimestamp +
+			(geometry.lastTimestamp - geometry.firstTimestamp) * ratio;
+	}
+
+	return [ visibleLeft, (visibleLeft + visibleRight) / 2, visibleRight ].map(function(x) {
+		return formatTime(timestampAt(x), geometry.includeDate);
+	});
+}
+
+function updateFixedTimeAxis(axis, geometry, viewport, canvas) {
+	var labels = visibleTimeAxisLabels(geometry, viewport);
+	axis.root.className = 'cake-graph-time-axis' +
+		(geometry.includeDate ? ' cake-graph-time-axis-dated' : '');
+	axis.left.textContent = labels[0];
+	axis.middle.textContent = labels[1];
+	axis.right.textContent = labels[2];
+	axis.left.style.left = geometry.left + 'px';
+	axis.right.style.right = geometry.right + 'px';
+	axis.root.style.top = Math.max(0,
+		(canvas.offsetTop || 0) + geometry.height - 20) + 'px';
+}
+
 function nearestPoint(points, timestamp) {
 	var low = 0;
 	var high = points.length - 1;
@@ -892,11 +942,16 @@ function scrollMaximum(viewport) {
 		Math.max(viewport.clientWidth || 0, viewport.offsetWidth || 0));
 }
 
-function bindScroll(viewport, latestButton, section) {
+function bindScroll(viewport, latestButton, section, onScroll) {
 	var state = scrollState(section);
 
 	function updateButton() {
 		latestButton.disabled = state.followLatest;
+	}
+
+	function notifyScroll() {
+		if (typeof onScroll === 'function')
+			onScroll();
 	}
 
 	viewport.addEventListener('scroll', function() {
@@ -904,6 +959,7 @@ function bindScroll(viewport, latestButton, section) {
 		state.left = viewport.scrollLeft;
 		state.followLatest = maxScroll - viewport.scrollLeft <= 8;
 		updateButton();
+		notifyScroll();
 	});
 
 	latestButton.addEventListener('click', function() {
@@ -911,6 +967,7 @@ function bindScroll(viewport, latestButton, section) {
 		viewport.scrollLeft = scrollMaximum(viewport);
 		state.left = viewport.scrollLeft;
 		updateButton();
+		notifyScroll();
 	});
 
 	window.requestAnimationFrame(function() {
@@ -918,6 +975,7 @@ function bindScroll(viewport, latestButton, section) {
 		viewport.scrollLeft = state.followLatest ? maxScroll : Math.min(state.left, maxScroll);
 		state.left = viewport.scrollLeft;
 		updateButton();
+		notifyScroll();
 	});
 }
 
@@ -980,6 +1038,8 @@ function renderCard(instance) {
 		});
 		var latencyAxis = fixedAxis({ leftBottom: '0', rightTop: 'CPU 100%', rightBottom: '0%' });
 		var trafficAxis = fixedAxis({ leftBottom: '0' });
+		var latencyTimeAxis = fixedTimeAxis();
+		var trafficTimeAxis = fixedTimeAxis();
 		latencyAxis.root.className += ' cake-graph-latency-axis';
 		trafficAxis.root.className += ' cake-graph-traffic-axis';
 		var track = E('div', { 'class': 'cake-graph-track' }, [
@@ -992,7 +1052,9 @@ function renderCard(instance) {
 		var chartFrame = E('div', { 'class': 'cake-graph-frame' }, [
 			viewport,
 			latencyAxis.root,
-			trafficAxis.root
+			trafficAxis.root,
+			latencyTimeAxis.root,
+			trafficTimeAxis.root
 		]);
 		var floorToggle = E('input', { 'type': 'checkbox' });
 		floorToggle.checked = showFloors;
@@ -1074,7 +1136,11 @@ function renderCard(instance) {
 			});
 			bindHover(latencyCanvas, geometry, hoverInfo);
 			bindHover(trafficCanvas, geometry, hoverInfo);
-			bindScroll(viewport, latestButton, sectionName);
+			function updateTimeAxes() {
+				updateFixedTimeAxis(latencyTimeAxis, geometry, viewport, latencyCanvas);
+				updateFixedTimeAxis(trafficTimeAxis, geometry, viewport, trafficCanvas);
+			}
+			bindScroll(viewport, latestButton, sectionName, updateTimeAxes);
 		});
 	} else {
 		body = E('p', { 'class': 'cake-graph-disabled' },
@@ -1153,9 +1219,12 @@ return L.view.extend({
 				'.cake-graph-fixed-axis span{position:absolute;padding:1px 3px;border-radius:2px;background:var(--background-color-high,rgba(255,255,255,.82));white-space:nowrap}',
 				'.cake-graph-axis-left{left:1px}.cake-graph-axis-right{right:1px;text-align:right}',
 				'.cake-graph-axis-top{top:51px}.cake-graph-axis-bottom{top:205px}',
+				'.cake-graph-time-axis{position:absolute;left:0;right:0;z-index:3;height:0;pointer-events:none;font-size:12px;color:#777}',
+				'.cake-graph-time-axis span{position:absolute;max-width:32%;overflow:hidden;text-overflow:ellipsis;padding:1px 3px;border-radius:2px;background:var(--background-color-high,rgba(255,255,255,.82));white-space:nowrap}',
+				'.cake-graph-time-left{transform:none}.cake-graph-time-middle{left:50%;transform:translateX(-50%)}.cake-graph-time-right{text-align:right}',
 				'.cake-graph-canvas{display:block;max-width:none;height:244px}',
 				'.cake-graph-disabled{min-height:80px;display:flex;align-items:center;color:#777}',
-				'@media(max-width:600px){.cake-graphs-grid{grid-template-columns:minmax(0,1fr)}.cake-graph-card{padding:10px}.cake-graph-header{align-items:flex-start;flex-direction:column}.cake-graph-actions{width:100%;justify-content:space-between}.cake-graph-latest{margin-left:0}.cake-graph-memory-panel{align-items:stretch;flex-direction:column}.cake-graph-budget-select{width:100%}.cake-graph-legend{gap:10px}.cake-graph-fixed-axis{font-size:11px}}'
+				'@media(max-width:600px){.cake-graphs-grid{grid-template-columns:minmax(0,1fr)}.cake-graph-card{padding:10px}.cake-graph-header{align-items:flex-start;flex-direction:column}.cake-graph-actions{width:100%;justify-content:space-between}.cake-graph-latest{margin-left:0}.cake-graph-memory-panel{align-items:stretch;flex-direction:column}.cake-graph-budget-select{width:100%}.cake-graph-legend{gap:10px}.cake-graph-fixed-axis,.cake-graph-time-axis{font-size:11px}.cake-graph-time-axis-dated .cake-graph-time-middle{display:none}.cake-graph-time-axis-dated .cake-graph-time-left,.cake-graph-time-axis-dated .cake-graph-time-right{max-width:44%}}'
 			].join('')),
 			E('div', { 'class': 'alert-message warning cake-graphs-warning' }, [
 				E('strong', {}, _('Optional RAM history. ')),
