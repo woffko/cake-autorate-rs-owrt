@@ -26,6 +26,7 @@ case "$*" in
 	"-q get cake-autorate.wan_sqm.traffic_rules_enabled") printf '%s\n' "${RH_RULES_ENABLED-1}" ;;
 	"-q get cake-autorate.wan_sqm.autotune_profile") printf '%s\n' "${RH_PROFILE:-best_overall}" ;;
 	"-q get cake-autorate.wan_sqm.traffic_profile") printf '%s\n' "${RH_TRAFFIC_PROFILE:-auto}" ;;
+	"-q get cake-autorate.wan_sqm.sqm_direction_mode") printf '%s\n' "${RH_DIRECTION_MODE:-both}" ;;
 	"-q get cake-autorate.wan_sqm.wan_if") printf 'eth0\n' ;;
 	"-q get cake-autorate.wan_sqm.sqm_interface") printf 'eth0\n' ;;
 	"-q get cake-autorate.wan_sqm.ul_if") printf 'eth0\n' ;;
@@ -69,6 +70,17 @@ case "${RH_TC_MODE:-healthy}:$*" in
 			"qdisc ingress ffff: parent ffff:fff1"
 		;;
 	missing_dl:"filter show dev eth0 ingress")
+		printf '%s\n' "action order 1: mirred (Egress Redirect to device ifb4eth0) stolen"
+		;;
+	upload_only_artifact:"qdisc show dev eth0")
+		printf '%s\n' "qdisc cake 8001: root refcnt 2 bandwidth 100Mbit diffserv4"
+		;;
+	upload_only_stale_redirect:"qdisc show dev eth0")
+		printf '%s\n' \
+			"qdisc cake 8001: root refcnt 2 bandwidth 100Mbit diffserv4" \
+			"qdisc ingress ffff: parent ffff:fff1"
+		;;
+	upload_only_stale_redirect:"filter show dev eth0 ingress")
 		printf '%s\n' "action order 1: mirred (Egress Redirect to device ifb4eth0) stolen"
 		;;
 	*) : ;;
@@ -173,6 +185,22 @@ assert_field "$ROOT/healthy.json" traffic_profile_mode auto
 assert_field "$ROOT/healthy.json" traffic_profile_resolved best_overall
 assert_field "$ROOT/healthy.json" cake_ul_mode diffserv4
 assert_field "$ROOT/healthy.json" target_state PRESENT
+
+export RH_DIRECTION_MODE=upload_only RH_TC_MODE=upload_only_artifact
+"$HELPER" > "$ROOT/upload-only-artifact.json"
+assert_field "$ROOT/upload-only-artifact.json" overall_state HEALTHY
+assert_field "$ROOT/upload-only-artifact.json" cake_ul_state ACTIVE
+assert_field "$ROOT/upload-only-artifact.json" cake_dl_state ABSENT
+assert_field "$ROOT/upload-only-artifact.json" ifb_state IDLE
+assert_field "$ROOT/upload-only-artifact.json" ingress_state ABSENT
+assert_field_matches "$ROOT/upload-only-artifact.json" issues '^$'
+
+export RH_TC_MODE=upload_only_stale_redirect
+"$HELPER" > "$ROOT/upload-only-stale-redirect.json"
+assert_field "$ROOT/upload-only-stale-redirect.json" overall_state ORPHANED
+assert_field "$ROOT/upload-only-stale-redirect.json" ingress_state ORPHANED
+assert_field_matches "$ROOT/upload-only-stale-redirect.json" issues 'ingress redirect remains'
+export RH_DIRECTION_MODE=both RH_TC_MODE=healthy
 
 export RH_RULES_ENABLED='' RH_CLASSIFIER_STATE=inactive
 "$HELPER" > "$ROOT/rules-opt-in.json"

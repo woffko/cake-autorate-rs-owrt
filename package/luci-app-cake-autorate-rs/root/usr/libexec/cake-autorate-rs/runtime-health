@@ -434,6 +434,10 @@ emit_instance() {
 			ifb_state=EXTERNAL
 		elif [ "$dl_expected_runtime" = 1 ]; then
 			ifb_state=PRESENT
+		elif [ "$expected_runtime" = 1 ]; then
+			# sqm-scripts may keep an empty IFB device while download
+			# shaping is intentionally disabled for this managed instance.
+			ifb_state=IDLE
 		else
 			ifb_state=ORPHANED
 		fi
@@ -457,6 +461,10 @@ emit_instance() {
 		else
 			ingress_state=MISSING
 		fi
+	elif [ "$expected_runtime" = 1 ] && [ "$redirect_active" != 1 ]; then
+		# An unused ingress qdisc is harmless, but a redirect into the
+		# inactive download IFB remains a real stale-runtime condition.
+		[ "$ingress_present" = 1 ] && ingress_state=IDLE || ingress_state=ABSENT
 	elif [ "$ingress_present" = 1 ] || [ "$redirect_active" = 1 ]; then
 		ingress_state=ORPHANED
 	else
@@ -613,6 +621,8 @@ EOF
 		[ "$autorate_state" = RUNNING ] && overall_state=UNMANAGED || overall_state=DEGRADED
 	elif [ "$overall_state" = HEALTHY ] &&
 	     { [ "$autorate_state" != RUNNING ] || [ "$sqm_config_state" != ENABLED ] ||
+	     [ "$cake_ul_state" = ORPHANED ] || [ "$cake_dl_state" = ORPHANED ] ||
+	     [ "$ifb_state" = ORPHANED ] || [ "$ingress_state" = ORPHANED ] ||
 	     { [ "$shape_upload" = 1 ] && [ "$cake_ul_state" != ACTIVE ]; } ||
 	     { [ "$shape_download" = 1 ] && [ "$cake_dl_state" != ACTIVE ]; } ||
 	     { [ "$shape_download" = 1 ] && [ "$ifb_state" != PRESENT ]; } ||
