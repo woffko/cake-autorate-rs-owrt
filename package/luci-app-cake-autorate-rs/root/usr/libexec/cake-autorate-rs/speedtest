@@ -734,6 +734,34 @@ managed_ingress_redirect_absent() {
 		grep -Eq '^qdisc (ingress|clsact) '
 }
 
+verify_managed_already_unshaped_direction() {
+	local configured_mode
+
+	[ "${calibration_sqm_managed:-0}" = 1 ] && [ -x "$sqm_recover_bin" ] || return 1
+	command -v tc >/dev/null 2>&1 || return 1
+	configured_mode="$(uci_get sqm_direction_mode)"
+	[ -n "$configured_mode" ] || configured_mode=both
+	# sqm-recover validates the state file and the exact topology expected by
+	# the configured direction mode.  Repeat the direction-specific kernel
+	# checks here so an internal already-unshaped request cannot turn a stale or
+	# mismatched topology into positive bypass evidence.
+	"$sqm_recover_bin" "$section" check >/dev/null 2>&1 || return 1
+
+	case "$configured_mode:$direction_override" in
+		upload_only:download)
+			device_has_one_root_cake "$calibration_sqm_ul_if" &&
+				! device_has_one_root_cake "$calibration_sqm_dl_if" &&
+				managed_ingress_redirect_absent
+			;;
+		download_only:upload)
+			! device_has_one_root_cake "$calibration_sqm_ul_if" &&
+				device_has_one_root_cake "$calibration_sqm_dl_if" &&
+				managed_ingress_redirect_present
+			;;
+		*) return 1 ;;
+	esac
+}
+
 prepare_directional_sqm_bypass() {
 	local scope="$1"
 
@@ -1276,7 +1304,7 @@ bypass_scope_matches_direction() {
 		# download and upload load while bypassing ingress shaping only.  Keep
 		# this exact mixed topology explicit; every other directional bypass
 		# must still match the single transfer direction it measures.
-		ingress:download|ingress:both|egress:upload|full:*|already-unshaped:*) return 0 ;;
+		ingress:download|ingress:both|egress:upload|full:*|already-unshaped:download|already-unshaped:upload) return 0 ;;
 		*) return 1 ;;
 	esac
 }
@@ -1400,6 +1428,11 @@ prepare_speedtest_calibration() {
 				fi
 				;;
 			already-unshaped)
+				if ! verify_managed_already_unshaped_direction; then
+					append_warning "The requested naturally unshaped direction did not match the live managed SQM topology; the speed test was cancelled."
+					restore_speedtest_calibration >/dev/null 2>&1 || true
+					return 1
+				fi
 				calibration_sqm_paused="false"
 				calibration_sqm_bypass_mode="already-unshaped"
 				append_warning "SQM was intentionally left active because the target direction is naturally unshaped."

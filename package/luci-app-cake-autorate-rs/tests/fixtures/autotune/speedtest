@@ -70,6 +70,7 @@ case "$3" in
 		case "${CAKE_AUTORATE_SPEEDTEST_BYPASS_SCOPE:-full}" in
 			ingress) bypass_evidence='"sqm_paused":false,"sqm_bypass_mode":"ingress-only-managed"' ;;
 			egress) bypass_evidence='"sqm_paused":false,"sqm_bypass_mode":"egress-only-managed"' ;;
+			already-unshaped) bypass_evidence='"sqm_paused":false,"sqm_bypass_mode":"already-unshaped"' ;;
 			*) bypass_evidence='"sqm_paused":true,"sqm_bypass_mode":"paused-managed"' ;;
 		esac
 		[ "${AUTOTUNE_MOCK_MISSING_SERVER_ID:-0}" = 1 ] && server_id=""

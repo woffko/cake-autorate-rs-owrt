@@ -292,9 +292,14 @@ bypass_scope_matches_direction egress upload ||
 	fail_test "upload-only egress bypass was rejected"
 bypass_scope_matches_direction full both ||
 	fail_test "full bidirectional bypass was rejected"
+bypass_scope_matches_direction already-unshaped download ||
+	fail_test "naturally unshaped download direction was rejected"
+bypass_scope_matches_direction already-unshaped upload ||
+	fail_test "naturally unshaped upload direction was rejected"
 if bypass_scope_matches_direction ingress upload ||
    bypass_scope_matches_direction egress download ||
-   bypass_scope_matches_direction egress both; then
+   bypass_scope_matches_direction egress both ||
+   bypass_scope_matches_direction already-unshaped both; then
 	fail_test "an unsupported bypass-scope and speed-test-direction pair was accepted"
 fi
 
@@ -360,6 +365,41 @@ prepare_directional_sqm_bypass egress || fail_test "managed egress-only bypass f
 	fail_test "egress-only bypass evidence is inconsistent"
 [ "$(wc -l < "$CAKE_TEST_DIRECTIONAL_CHECK_LOG")" -eq 2 ] ||
 	fail_test "directional bypass skipped exact managed-SQM preflight"
+
+# A direction may be labelled already-unshaped only after the configured mode,
+# immutable recovery check, and live kernel topology all prove the same fact.
+(
+	calibration_sqm_managed=1
+	calibration_sqm_ul_if=eth0
+	calibration_sqm_dl_if=ifb4eth0
+	sqm_recover_bin="$work/bin/sqm-recover-check"
+	test_sqm_direction_mode=upload_only
+	test_root_cake_devices=' eth0 '
+	test_redirect_state=absent
+	uci_get() {
+		[ "$1" = sqm_direction_mode ] || return 1
+		printf '%s\n' "$test_sqm_direction_mode"
+	}
+	device_has_one_root_cake() {
+		case "$test_root_cake_devices" in *" $1 "*) return 0 ;; *) return 1 ;; esac
+	}
+	managed_ingress_redirect_present() { [ "$test_redirect_state" = present ]; }
+	managed_ingress_redirect_absent() { [ "$test_redirect_state" = absent ]; }
+	direction_override=download
+	verify_managed_already_unshaped_direction || exit 1
+	direction_override=upload
+	if verify_managed_already_unshaped_direction; then exit 1; fi
+	test_sqm_direction_mode=download_only
+	test_root_cake_devices=' ifb4eth0 '
+	test_redirect_state=present
+	direction_override=upload
+	verify_managed_already_unshaped_direction || exit 1
+	direction_override=download
+	if verify_managed_already_unshaped_direction; then exit 1; fi
+	direction_override=upload
+	test_redirect_state=absent
+	if verify_managed_already_unshaped_direction; then exit 1; fi
+) || fail_test "already-unshaped proof accepted a direction or topology mismatch"
 
 grep -qx 'trap cleanup EXIT' "$script" || fail_test "speedtest EXIT cleanup trap is missing"
 grep -qx "trap 'exit 129' HUP" "$script" || fail_test "speedtest HUP handler does not preserve cleanup"

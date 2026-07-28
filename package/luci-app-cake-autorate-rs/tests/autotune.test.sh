@@ -98,6 +98,18 @@ if grep -Eq '(^|[^A-Za-z0-9_])(od|cksum)([^A-Za-z0-9_]|$)' "$autotune"; then
 	exit 1
 fi
 
+# The mock contract must preserve the distinct proof emitted when the tested
+# direction is already raw because the opposite-only SQM profile is active.
+: > "$work/already-unshaped-counter"
+CAKE_AUTORATE_SPEEDTEST_BYPASS_SCOPE=already-unshaped \
+	AUTOTUNE_MOCK_COUNTER="$work/already-unshaped-counter" \
+	AUTOTUNE_MOCK_PIN_LOG= AUTOTUNE_MOCK_DIRECTION_LOG= \
+	"$fixtures/speedtest" proof lo run speedtest-go '' main '' download \
+	> "$work/already-unshaped.json"
+grep -q '"shaper_bypassed":true' "$work/already-unshaped.json"
+grep -q '"sqm_paused":false' "$work/already-unshaped.json"
+grep -q '"sqm_bypass_mode":"already-unshaped"' "$work/already-unshaped.json"
+
 # A pre-existing interface with the same candidate name is never reused or
 # removed. The bounded generator retries and fails while the foreign path
 # remains intact.

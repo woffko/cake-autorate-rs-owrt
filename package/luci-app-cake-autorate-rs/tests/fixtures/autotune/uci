@@ -50,6 +50,10 @@ case "$action:$key" in
 		[ -n "${AUTOTUNE_MOCK_MWAN3_MEMBER:-}" ] || exit 1
 		printf '%s\n' "$AUTOTUNE_MOCK_MWAN3_MEMBER"
 		;;
+	get:cake-autorate.*.sqm_direction_mode)
+		[ -n "${AUTOTUNE_MOCK_SQM_DIRECTION_MODE:-}" ] || exit 1
+		printf '%s\n' "$AUTOTUNE_MOCK_SQM_DIRECTION_MODE"
+		;;
 	get:sqm.cake_*._cake_autorate_managed)
 		[ "${AUTOTUNE_MOCK_UCI_ABSENT:-0}" != 1 ] || exit 1
 		instance="${key#sqm.cake_}"

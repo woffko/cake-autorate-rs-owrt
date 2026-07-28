@@ -22,6 +22,7 @@ mkdir -p "$work/runtime/automatic" "$work/runtime/client" "$work/runtime/concurr
 	"$work/runtime/delayed" "$work/runtime/publication" "$work/runtime/cancelrace" \
 	"$work/runtime/foreign" "$work/runtime/transient" "$work/runtime/postlock" \
 	"$work/runtime/postlockrelease" \
+	"$work/runtime/uploadonly" "$work/runtime/downloadonly" \
 	"$work/runtime/runtimeloss" "$work/jobs"
 baseline='{"uplink_state":"ACTIVE","route_active":true,"route_test_ready":true,"route_device":"lo","transport_probe_trusted":true,"quality_grade_baseline_ready":true,"quality_grade_baseline_samples":20,"quality_grade_baseline_required_samples":20,"quality_grade_dl_samples":0,"quality_grade_ul_samples":0,"quality_grade_required_samples":20,"quality_grade_state":"baseline_ready","rating_load_phase":"IDLE","rating_load_candidate":"IDLE","rating_load_smoothed_dl_percent":0,"rating_load_smoothed_ul_percent":0,"dl_achieved_rate_kbps":0,"ul_achieved_rate_kbps":0,"cake_dl_rate_kbps":100000,"cake_ul_rate_kbps":50000,"rating_capture_contaminated":false}'
 printf '%s\n' "$baseline" > "$work/runtime/automatic/status.json"
@@ -35,6 +36,9 @@ printf '%s\n' "$baseline" > "$work/runtime/foreign/status.json"
 printf '%s\n' "$baseline" > "$work/runtime/postlock/status.json"
 printf '%s\n' "$baseline" > "$work/runtime/postlockrelease/status.json"
 printf '%s\n' "$baseline" > "$work/runtime/runtimeloss/status.json"
+directional_reference='{"uplink_state":"ACTIVE","route_active":true,"route_test_ready":true,"route_device":"lo","transport_probe_trusted":true,"quality_grade_baseline_ready":true,"quality_grade_baseline_samples":20,"quality_grade_baseline_required_samples":20,"quality_grade_dl_samples":0,"quality_grade_ul_samples":0,"quality_grade_required_samples":20,"quality_grade_state":"baseline_ready","rating_load_phase":"IDLE","rating_load_candidate":"IDLE","rating_load_smoothed_dl_percent":0,"rating_load_smoothed_ul_percent":0,"dl_achieved_rate_kbps":0,"ul_achieved_rate_kbps":0,"cake_dl_rate_kbps":0,"cake_ul_rate_kbps":50000,"rating_load_reference_dl_kbps":100000,"rating_load_reference_ul_kbps":50000,"rating_capture_contaminated":false}'
+printf '%s\n' "$directional_reference" > "$work/runtime/uploadonly/status.json"
+printf '%s\n' "$(printf '%s' "$directional_reference" | sed 's/"cake_dl_rate_kbps":0,"cake_ul_rate_kbps":50000/"cake_dl_rate_kbps":100000,"cake_ul_rate_kbps":0/')" > "$work/runtime/downloadonly/status.json"
 standby='{"uplink_state":"STANDBY","route_active":false,"route_test_ready":true,"route_device":"lo","transport_probe_trusted":true,"quality_grade_baseline_ready":true,"quality_grade_baseline_samples":20,"quality_grade_baseline_required_samples":20,"quality_grade_dl_samples":0,"quality_grade_ul_samples":0,"quality_grade_required_samples":20,"quality_grade_state":"baseline_ready","rating_load_phase":"IDLE","rating_load_candidate":"IDLE","rating_load_smoothed_dl_percent":0,"rating_load_smoothed_ul_percent":0,"dl_achieved_rate_kbps":0,"ul_achieved_rate_kbps":0,"cake_dl_rate_kbps":100000,"cake_ul_rate_kbps":50000,"rating_capture_contaminated":false}'
 printf '%s\n' "$standby" > "$work/runtime/standbyauto/status.json"
 printf '%s\n' "$standby" > "$work/runtime/standbyclient/status.json"
@@ -243,6 +247,26 @@ grep -q '"grade":"A"' "$work/status.json"
 [ "$(sed -n '1p' "$work/jobs/speedtest-runs")" = 2 ]
 [ "$(sed -n '1p' "$work/jobs/speedtest-directions")" = "download upload" ]
 [ ! -e "$work/runtime/automatic/rating-capture" ]
+
+# Automatic rating must exercise both directions even when one CAKE direction
+# is intentionally disabled.  The raw/unmanaged side uses the daemon's stable
+# rating reference instead of treating a zero CAKE rate as missing capacity.
+for directional_instance in uploadonly downloadonly; do
+	printf '0\n' > "$work/jobs/speedtest-runs"
+	rm -f "$work/jobs/speedtest-directions"
+	"$helper" "$directional_instance" start automatic speedtest-go > "$work/$directional_instance-start.json"
+	grep -q '"state":"running"' "$work/$directional_instance-start.json"
+	attempt=0
+	while [ "$attempt" -lt 80 ]; do
+		"$helper" "$directional_instance" status > "$work/$directional_instance-status.json"
+		grep -q '"state":"complete"' "$work/$directional_instance-status.json" && break
+		attempt=$((attempt + 1))
+		sleep 0.25
+	done
+	grep -q '"grade":"A"' "$work/$directional_instance-status.json"
+	[ "$(sed -n '1p' "$work/jobs/speedtest-runs")" = 2 ]
+	[ "$(sed -n '1p' "$work/jobs/speedtest-directions")" = "download upload" ]
+done
 
 # A non-default mwan3 member remains eligible for router-originated automatic
 # load because the daemon has proved its isolated forced route. Guided LAN

@@ -4,6 +4,12 @@ section="$1"
 mode="$3"
 direction="${8:-both}"
 runtime="${CAKE_AUTORATE_RUNTIME_DIR:?}/$section/status.json"
+cake_dl=100000
+cake_ul=50000
+case "$section" in
+	uploadonly) cake_dl=0 ;;
+	downloadonly) cake_ul=0 ;;
+esac
 
 if [ "$mode" = route-status ]; then
 	printf '{"state":"ready","resolved_interface":"%s","route_interface":"%s","route_mode":"main","mwan3_member":"","source_ip":"192.0.2.1","external_ip":"203.0.113.1","route_fwmark":"","route_table":"main","route_identity":"main||%s|192.0.2.1||main","route_active":true,"member_status":"online"}\n' \
@@ -36,12 +42,12 @@ EOF
 		printf '{"download_kbps":800000,"upload_kbps":null,"test_direction":"%s","shaper_bypassed":false}\n' "$direction"
 		exit 0
 	fi
-	cat > "$runtime" <<'EOF'
-{"route_active":true,"route_device":"lo","transport_probe_trusted":true,"quality_grade_baseline_ready":true,"quality_grade_baseline_samples":20,"quality_grade_baseline_required_samples":20,"quality_grade_dl_samples":20,"quality_grade_ul_samples":0,"quality_grade_required_samples":20,"quality_grade_state":"collecting","rating_load_phase":"DL","rating_load_candidate":"DL","rating_load_smoothed_dl_percent":85,"rating_load_smoothed_ul_percent":2,"dl_achieved_rate_kbps":85000,"ul_achieved_rate_kbps":1000,"cake_dl_rate_kbps":100000,"cake_ul_rate_kbps":50000,"rating_capture_contaminated":false}
+	cat > "$runtime" <<EOF
+{"route_active":true,"route_device":"lo","transport_probe_trusted":true,"quality_grade_baseline_ready":true,"quality_grade_baseline_samples":20,"quality_grade_baseline_required_samples":20,"quality_grade_dl_samples":20,"quality_grade_ul_samples":0,"quality_grade_required_samples":20,"quality_grade_state":"collecting","rating_load_phase":"DL","rating_load_candidate":"DL","rating_load_smoothed_dl_percent":85,"rating_load_smoothed_ul_percent":2,"dl_achieved_rate_kbps":85000,"ul_achieved_rate_kbps":1000,"cake_dl_rate_kbps":$cake_dl,"cake_ul_rate_kbps":$cake_ul,"rating_load_reference_dl_kbps":100000,"rating_load_reference_ul_kbps":50000,"rating_capture_contaminated":false}
 EOF
 else
-	cat > "$runtime" <<'EOF'
-{"route_active":true,"route_device":"lo","transport_probe_trusted":true,"quality_grade_baseline_ready":true,"quality_grade_baseline_samples":20,"quality_grade_baseline_required_samples":20,"quality_grade_dl_samples":20,"quality_grade_ul_samples":20,"quality_grade_required_samples":20,"quality_grade_state":"final","rating_load_phase":"UL","rating_load_candidate":"UL","rating_load_smoothed_dl_percent":2,"rating_load_smoothed_ul_percent":85,"dl_achieved_rate_kbps":1000,"ul_achieved_rate_kbps":42500,"cake_dl_rate_kbps":100000,"cake_ul_rate_kbps":50000,"rating_capture_contaminated":false,"quality_grade_current":{"grade":"A","increase_ms":8.5,"started_at":9999999999,"completed_at":9999999999,"partial":false,"incomplete":false,"dl_samples":20,"ul_samples":20,"dl":{"grade":"A+"},"ul":{"grade":"A"}}}
+	cat > "$runtime" <<EOF
+{"route_active":true,"route_device":"lo","transport_probe_trusted":true,"quality_grade_baseline_ready":true,"quality_grade_baseline_samples":20,"quality_grade_baseline_required_samples":20,"quality_grade_dl_samples":20,"quality_grade_ul_samples":20,"quality_grade_required_samples":20,"quality_grade_state":"final","rating_load_phase":"UL","rating_load_candidate":"UL","rating_load_smoothed_dl_percent":2,"rating_load_smoothed_ul_percent":85,"dl_achieved_rate_kbps":1000,"ul_achieved_rate_kbps":42500,"cake_dl_rate_kbps":$cake_dl,"cake_ul_rate_kbps":$cake_ul,"rating_load_reference_dl_kbps":100000,"rating_load_reference_ul_kbps":50000,"rating_capture_contaminated":false,"quality_grade_current":{"grade":"A","increase_ms":8.5,"started_at":9999999999,"completed_at":9999999999,"partial":false,"incomplete":false,"dl_samples":20,"ul_samples":20,"dl":{"grade":"A+"},"ul":{"grade":"A"}}}
 EOF
 fi
 
