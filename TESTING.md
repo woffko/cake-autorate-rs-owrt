@@ -2254,3 +2254,40 @@ was clean on all three devices. Runtime health reported both active queues
 healthy on the primary router, the deliberately missing PPPoE link as
 `WAITING_LINK` on the negative-test router, and a healthy upload-only topology
 on the cellular router.
+
+### LuCI r43 bounded speed-test timeout regression (2026-07-29)
+
+LuCI r43 and its Auto-Tune helper treat a stalled speed-test transfer as an
+inconclusive measurement rather than a bad link-quality sample. One phase may
+make at most three attempts against the same pinned server. In automatic
+server mode only, exhausting those attempts may discard the complete raw
+series and restart it once while excluding the failed server. A configured
+server is never replaced. Exhausting the second series returns the typed
+`inconclusive` / `speedtest-timeout` terminal, restores runtime state, records
+no proposal, and exposes Retry instead of Apply.
+
+The deterministic lifecycle suite covers a recoverable first timeout and a
+persistent TCP-blackhole equivalent across both allowed raw series. It checks
+the six-attempt global bound, exact pinned-server sequence, discarded partial
+series, RAM-only diagnostics, process-group cleanup, restored SQM, clean UCI,
+and non-applyable terminal contract. The speed-test routing suite separately
+checks progress-file ownership and its allow-listed states. Quality Test and
+Apply Guard were run in isolation so their process-group cleanup could not
+interfere with one another.
+
+The repeated source gate passed all 200 Rust tests, all seven LuCI JavaScript
+suites, all three Auto-Tune lifecycle partitions, the remaining shell helper
+suites, Node and shell syntax checks, LSP cached diagnostics, and
+`git diff --check`. The noarch OpenWrt 25.12 LuCI APK passed `apk verify`, its
+metadata declared version `1.0_rc27-r43`, architecture `noarch`, and the
+expected seven runtime dependencies, and the staged 12-daemon-ABI release
+matrix plus LuCI APK passed its complete `SHA256SUMS` manifest.
+
+The r43 APK was installed over daemon r21 on the anonymized x86_64 dual-WAN
+router. Source, built-package, and installed helper hashes matched exactly.
+A real Best overall / Full raw run completed through Review without applying
+configuration, retained independently verified full-path and directional raw
+controls, restored both CAKE directions, left no worker or recovery residue,
+and ended with clean UCI. Fresh desktop and mobile Playwright checks covered
+Status, Graphs, Settings, and Auto-Tune start/cancel; all pages remained within
+their viewport and emitted no RPC or browser errors.

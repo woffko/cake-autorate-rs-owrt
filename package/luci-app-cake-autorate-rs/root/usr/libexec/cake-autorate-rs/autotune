@@ -1102,6 +1102,11 @@ stage_terminal_json() {
 	fi
 	if [ "$terminal_kind" = result ]; then
 		case "$payload" in
+			*'"speedtest_retries":'*) ;;
+			*'}') payload="${payload%?},\"speedtest_retries\":[${speedtest_retry_events_json:-}]}" ;;
+			*) return 1 ;;
+		esac
+		case "$payload" in
 			*'"traffic_budget":'*) ;;
 			*'}') payload="${payload%?},\"traffic_budget\":$(traffic_budget_json)}" ;;
 			*) return 1 ;;
@@ -4056,6 +4061,7 @@ run_speedtest_with_timeout() {
 	speedtest_supervisor_reason=precondition
 	speedtest_supervisor_rc=1
 	speedtest_supervisor_detail=""
+	speedtest_supervisor_elapsed_s=0
 	[ "${recovery_prepared:-0}" = 1 ] && [ "${recovery_armed:-0}" = 1 ] &&
 		[ -f "$recovery_journal" ] && [ -e "$recovery_heartbeat" ] || {
 			speedtest_supervisor_fail recovery-not-armed 1
@@ -4075,15 +4081,20 @@ run_speedtest_with_timeout() {
 	[ "$test_termination_grace_s" -ge 1 ] 2>/dev/null || test_termination_grace_s=3
 	[ "$test_termination_grace_s" -le 10 ] 2>/dev/null || test_termination_grace_s=10
 	test_output="$job_dir/speedtest-phase.raw"
-	rm -f "$test_output" "$speedtest_destination"
+	test_progress="$job_dir/speedtest-phase.progress"
+	rm -f "$test_output" "$test_progress" "$speedtest_destination"
 	launch_parent_group="$(proc_group "$$" 2>/dev/null)"
 	launch_parent_session="$(proc_session "$$" 2>/dev/null)"
 	if [ "$backend" = "speedtest-go" ] && is_positive_uint "${selected_server_id:-}"; then
 		CAKE_AUTORATE_SPEEDTEST_GO_SERVER_ID="$selected_server_id" \
+		CAKE_AUTORATE_SPEEDTEST_GO_EXCLUDE_SERVER_ID="${speedtest_excluded_server_id:-}" \
+		CAKE_AUTORATE_SPEEDTEST_PROGRESS_FILE="$test_progress" \
 		CAKE_AUTORATE_SPEEDTEST_BYPASS_SCOPE="${speedtest_bypass_scope:-full}" \
 		CAKE_AUTORATE_SPEEDTEST_START_STOPPED=1 CAKE_AUTORATE_SPEEDTEST_SETSID="$setsid_bin" \
 			"$speedtest_bin" "$@" > "$test_output" &
 	else
+		CAKE_AUTORATE_SPEEDTEST_GO_EXCLUDE_SERVER_ID="${speedtest_excluded_server_id:-}" \
+		CAKE_AUTORATE_SPEEDTEST_PROGRESS_FILE="$test_progress" \
 		CAKE_AUTORATE_SPEEDTEST_BYPASS_SCOPE="${speedtest_bypass_scope:-full}" \
 		CAKE_AUTORATE_SPEEDTEST_START_STOPPED=1 CAKE_AUTORATE_SPEEDTEST_SETSID="$setsid_bin" \
 			"$speedtest_bin" "$@" > "$test_output" &
@@ -4251,8 +4262,10 @@ run_speedtest_with_timeout() {
 			fi
 		fi
 		elapsed_seconds=$((elapsed_seconds + 1))
+		speedtest_supervisor_elapsed_s="$elapsed_seconds"
 		sleep 1
 	done
+	speedtest_supervisor_elapsed_s="$elapsed_seconds"
 	if wait "$test_pid"; then test_rc=0; else test_rc="$?"; fi
 	finalize_speedtest_result "$speedtest_destination" "$test_rc" "$timed_out" \
 		"$budget_exhausted" "$budget_counter_invalid"
@@ -4389,10 +4402,65 @@ speedtest_supervisor_json() {
 	else
 		supervisor_detail_json=null
 	fi
-	printf '{"reason":"%s","exit_code":%s,"raw_available":%s,"raw_bytes":%s,"detail":%s}' \
+	supervisor_progress_json=null
+	if [ -n "${test_progress:-}" ] && owned_regular_file "$test_progress"; then
+		supervisor_progress_payload="$(cat "$test_progress" 2>/dev/null || true)"
+		if strict_single_json_object "$supervisor_progress_payload"; then
+			supervisor_progress_stage="$(extract_json "$supervisor_progress_payload" '@.stage' 2>/dev/null || true)"
+			supervisor_progress_bytes="$(extract_json "$supervisor_progress_payload" '@.response_bytes' 2>/dev/null || true)"
+			case "$supervisor_progress_stage" in
+				route-verified|bypass-prepared|speedtest-go-started|speedtest-go-output-ready|speedtest-go-command-failed|speedtest-go-verified|backend-complete)
+					case "$supervisor_progress_bytes" in ''|*[!0-9]*) supervisor_progress_bytes=0 ;; esac
+					supervisor_progress_json="{\"stage\":\"$supervisor_progress_stage\",\"response_bytes\":$supervisor_progress_bytes}"
+					;;
+			esac
+		fi
+	fi
+	printf '{"reason":"%s","exit_code":%s,"timeout_seconds":%s,"elapsed_seconds":%s,"raw_available":%s,"raw_bytes":%s,"progress":%s,"detail":%s}' \
 		"$(json_escape "$speedtest_supervisor_reason")" \
-		"${speedtest_supervisor_rc:-1}" "$supervisor_raw_available" "$supervisor_raw_bytes" \
+		"${speedtest_supervisor_rc:-1}" "${test_timeout_s:-0}" "${speedtest_supervisor_elapsed_s:-0}" \
+		"$supervisor_raw_available" "$supervisor_raw_bytes" "$supervisor_progress_json" \
 		"$supervisor_detail_json"
+}
+
+speedtest_supervisor_retryable() {
+	case "${speedtest_supervisor_reason:-}" in
+		timeout) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+record_speedtest_retry_event() {
+	retry_context="$1"
+	retry_attempt="$2"
+	retry_event="{\"context\":\"$(json_escape "$retry_context")\",\"attempt\":$retry_attempt,\"supervisor\":$(speedtest_supervisor_json)}"
+	if [ -n "${speedtest_retry_events_json:-}" ]; then
+		speedtest_retry_events_json="$speedtest_retry_events_json,$retry_event"
+	else
+		speedtest_retry_events_json="$retry_event"
+	fi
+}
+
+speedtest_retry_backoff() {
+	retry_label="$1"
+	retry_seconds="${CAKE_AUTORATE_AUTOTUNE_SPEEDTEST_RETRY_BACKOFF_S:-8}"
+	case "$retry_seconds" in ''|*[!0-9]*) retry_seconds=8 ;; esac
+	[ "$retry_seconds" -le 30 ] 2>/dev/null || retry_seconds=30
+	write_status throughput "${current_progress:-45}" \
+		"$retry_label timed out; retrying after a bounded ${retry_seconds}s cooldown"
+	while [ "$retry_seconds" -gt 0 ] 2>/dev/null; do
+		[ -z "${cancel_file:-}" ] || [ ! -e "$cancel_file" ] || exit 130
+		sleep 1
+		retry_seconds=$((retry_seconds - 1))
+	done
+}
+
+speedtest_timeout_inconclusive() {
+	timeout_stage="$1"
+	timeout_context="$2"
+	timeout_message="The $timeout_context timed out after bounded retries. The verified measurements already collected remain diagnostic only; no proposal can be applied. Retry the calibration when the selected server is responsive."
+	stage_terminal_json error "{\"state\":\"inconclusive\",\"schema_version\":8,\"stage\":\"$(json_escape "$timeout_stage")\",\"search_state\":\"measurement_timeout\",\"error\":\"$(json_escape "$timeout_message")\",\"reason\":\"speedtest-timeout\",\"retryable\":true,\"speedtest_supervisor\":$(speedtest_supervisor_json),\"speedtest_retries\":[${speedtest_retry_events_json:-}],\"traffic_budget\":$(traffic_budget_json),\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"phase_contamination_seen\":${phase_contamination_seen:-false},\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[${phase_background_runs_json:-}],\"pinger_plan\":${pinger_plan:-null},\"proposal\":null,\"configuration_written\":false}"
+	exit 1
 }
 
 traffic_budget_json() {
@@ -4467,31 +4535,49 @@ run_measurement() {
 	fi
 	measurement_attempt=1
 	while [ "$measurement_attempt" -le 2 ]; do
-		write_status throughput 40 "Running the $measurement_label control (attempt $measurement_attempt)"
-		phase_background_kind="$calibration_strategy"
-		start_phase_background_counter "$(phase_reference_rate dl)" "$(phase_reference_rate ul)"
-		fair_control_this_attempt=0
-		if [ "$calibration_strategy" = full_raw ] && [ "$index" -eq 1 ]; then
-			if start_fair_control_monitors "$measurement_attempt"; then
-				fair_control_this_attempt=1
-			else
-				fair_control_json='{"available":false,"measurement_evidence":{"valid":false,"reason":"control-monitor-start-failed"}}'
-				raw_control_json="$fair_control_json"
+		measurement_network_attempt=1
+		measurement_network_max_attempts="${CAKE_AUTORATE_AUTOTUNE_SPEEDTEST_RETRY_ATTEMPTS:-3}"
+		case "$measurement_network_max_attempts" in ''|*[!0-9]*) measurement_network_max_attempts=3 ;; esac
+		[ "$measurement_network_max_attempts" -ge 1 ] 2>/dev/null || measurement_network_max_attempts=1
+		[ "$measurement_network_max_attempts" -le 3 ] 2>/dev/null || measurement_network_max_attempts=3
+		while [ "$measurement_network_attempt" -le "$measurement_network_max_attempts" ]; do
+			current_progress=40
+			write_status throughput 40 "Running the $measurement_label control (sample attempt $measurement_attempt, network attempt $measurement_network_attempt of $measurement_network_max_attempts)"
+			phase_background_kind="$calibration_strategy"
+			start_phase_background_counter "$(phase_reference_rate dl)" "$(phase_reference_rate ul)"
+			fair_control_this_attempt=0
+			if [ "$calibration_strategy" = full_raw ] && [ "$index" -eq 1 ]; then
+				fair_control_key=$((measurement_attempt * 10 + measurement_network_attempt))
+				if start_fair_control_monitors "$fair_control_key"; then
+					fair_control_this_attempt=1
+				else
+					fair_control_json='{"available":false,"measurement_evidence":{"valid":false,"reason":"control-monitor-start-failed"}}'
+					raw_control_json="$fair_control_json"
+				fi
 			fi
-		fi
-		measurement_result_file="$job_dir/unshaped-$index-$measurement_attempt.result"
-		if ! run_speedtest_with_timeout "$measurement_result_file" \
-			"$job_name" "$target_if" run "$backend" "$measurement_job_key" "$route_mode" "$mwan3_member"; then
+			measurement_result_file="$job_dir/unshaped-$index-$measurement_attempt-$measurement_network_attempt.result"
+			if run_speedtest_with_timeout "$measurement_result_file" \
+				"$job_name" "$target_if" run "$backend" "$measurement_job_key" "$route_mode" "$mwan3_member"; then
+				break
+			fi
 			[ "$fair_control_this_attempt" -eq 0 ] ||
 				stop_fair_control_monitors >/dev/null 2>&1 || true
 			stop_phase_background_counter
-			if [ -n "${speedtest_supervisor_detail:-}" ]; then
-				speedtest_failure_summary="${speedtest_supervisor_reason:-unknown}: $speedtest_supervisor_detail"
-			else
-				speedtest_failure_summary="${speedtest_supervisor_reason:-unknown}"
+			record_speedtest_retry_event "$measurement_label-control-$index" "$measurement_network_attempt"
+			if ! speedtest_supervisor_retryable; then
+				if [ -n "${speedtest_supervisor_detail:-}" ]; then
+					speedtest_failure_summary="${speedtest_supervisor_reason:-unknown}: $speedtest_supervisor_detail"
+				else
+					speedtest_failure_summary="${speedtest_supervisor_reason:-unknown}"
+				fi
+				fail "Throughput sample $index failed in the speed-test supervisor ($speedtest_failure_summary)."
 			fi
-			fail "Throughput sample $index failed in the speed-test supervisor ($speedtest_failure_summary)."
-		fi
+			if [ "$measurement_network_attempt" -ge "$measurement_network_max_attempts" ]; then
+				speedtest_timeout_inconclusive throughput "$measurement_label control"
+			fi
+			speedtest_retry_backoff "$measurement_label control"
+			measurement_network_attempt=$((measurement_network_attempt + 1))
+		done
 		result="$(cat "$measurement_result_file" 2>/dev/null)"
 		rm -f "$measurement_result_file"
 		if [ "$fair_control_this_attempt" -eq 1 ] &&
@@ -4530,7 +4616,7 @@ run_measurement() {
 			# client-traffic limit for this phase.
 			classify_phase_background "$download" "$upload"
 		fi
-		phase_entry="{\"phase\":\"$(json_escape "$calibration_strategy")\",\"sample\":$index,\"attempt\":$measurement_attempt,\"measured\":{\"download_kbps\":${download:-0},\"upload_kbps\":${upload:-0}},\"forwarded_background\":$(phase_background_json)}"
+		phase_entry="{\"phase\":\"$(json_escape "$calibration_strategy")\",\"sample\":$index,\"attempt\":$measurement_attempt,\"network_attempt\":$measurement_network_attempt,\"measured\":{\"download_kbps\":${download:-0},\"upload_kbps\":${upload:-0}},\"forwarded_background\":$(phase_background_json)}"
 		if [ -n "${phase_background_runs_json:-}" ]; then
 			phase_background_runs_json="$phase_background_runs_json,$phase_entry"
 		else
@@ -4619,16 +4705,34 @@ run_directional_control() {
 			download) control_progress=$((45 + control_index * 5)) ;;
 			upload) control_progress=$((60 + control_index * 5)) ;;
 		esac
-		write_status throughput "$control_progress" \
-			"Running $control_label $control_direction-only control $control_index of 2 (attempt $control_attempt)"
-		phase_background_kind="$calibration_strategy"
-		start_phase_background_counter "$(phase_reference_rate dl)" "$(phase_reference_rate ul)"
-		control_result_file="$job_dir/unshaped-$control_direction-$control_index-$control_attempt.result"
-		if ! run_speedtest_with_timeout "$control_result_file" \
-			"$job_name" "$target_if" run "$backend" "$control_job_key" "$route_mode" "$mwan3_member" "$control_direction"; then
+		current_progress="$control_progress"
+		control_network_attempt=1
+		control_network_max_attempts="${CAKE_AUTORATE_AUTOTUNE_SPEEDTEST_RETRY_ATTEMPTS:-3}"
+		case "$control_network_max_attempts" in ''|*[!0-9]*) control_network_max_attempts=3 ;; esac
+		[ "$control_network_max_attempts" -ge 1 ] 2>/dev/null || control_network_max_attempts=1
+		[ "$control_network_max_attempts" -le 3 ] 2>/dev/null || control_network_max_attempts=3
+		while [ "$control_network_attempt" -le "$control_network_max_attempts" ]; do
+			write_status throughput "$control_progress" \
+				"Running $control_label $control_direction-only control $control_index of 2 (sample attempt $control_attempt, network attempt $control_network_attempt of $control_network_max_attempts)"
+			phase_background_kind="$calibration_strategy"
+			start_phase_background_counter "$(phase_reference_rate dl)" "$(phase_reference_rate ul)"
+			control_result_file="$job_dir/unshaped-$control_direction-$control_index-$control_attempt-$control_network_attempt.result"
+			if run_speedtest_with_timeout "$control_result_file" \
+				"$job_name" "$target_if" run "$backend" "$control_job_key" "$route_mode" "$mwan3_member" "$control_direction"; then
+				break
+			fi
 			stop_phase_background_counter
-			fail "The unshaped $control_direction-only control failed in the speed-test supervisor (${speedtest_supervisor_reason:-unknown})."
-		fi
+			record_speedtest_retry_event "$control_label-$control_direction-control-$control_index" "$control_network_attempt"
+			if ! speedtest_supervisor_retryable; then
+				fail "The $control_label $control_direction-only control failed in the speed-test supervisor (${speedtest_supervisor_reason:-unknown})."
+			fi
+			if [ "$control_network_attempt" -ge "$control_network_max_attempts" ]; then
+				speedtest_retry_exhausted_context="$control_label $control_direction-only control $control_index"
+				return 75
+			fi
+			speedtest_retry_backoff "$control_label $control_direction-only control $control_index"
+			control_network_attempt=$((control_network_attempt + 1))
+		done
 		control_result="$(cat "$control_result_file" 2>/dev/null)"
 		rm -f "$control_result_file"
 		stop_phase_background_counter
@@ -4659,7 +4763,7 @@ run_directional_control() {
 		esac
 		is_positive_uint "$control_rate" ||
 			fail "The unshaped $control_direction-only control returned no rate."
-		control_entry="{\"phase\":\"unshaped-directional\",\"direction\":\"$control_direction\",\"sample\":$control_index,\"attempt\":$control_attempt,\"measured_kbps\":$control_rate,\"forwarded_background\":$(phase_background_json)}"
+		control_entry="{\"phase\":\"unshaped-directional\",\"direction\":\"$control_direction\",\"sample\":$control_index,\"attempt\":$control_attempt,\"network_attempt\":$control_network_attempt,\"measured_kbps\":$control_rate,\"forwarded_background\":$(phase_background_json)}"
 		phase_background_runs_json="$phase_background_runs_json,$control_entry"
 		if [ "$phase_background_contaminated" != true ]; then
 			break
@@ -5311,7 +5415,8 @@ run_validation_direction_phase() {
 			# the identical candidate, direction and pinned server. A second exit
 			# fails closed; earlier candidate evidence is never silently reused.
 			case "$phase_failure_reason:$phase_background_attempt" in
-				helper-exit:*:1)
+				timeout:1|helper-exit:*:1)
+				record_speedtest_retry_event "$phase_kind-$phase_direction-validation" "$phase_background_attempt"
 					temporary_phase_shaper_owned ||
 						fail "Temporary shaper ownership changed after a failed $phase_direction-only speed test."
 					if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_PREFLIGHT:-0}" != 1 ]; then
@@ -5320,10 +5425,18 @@ run_validation_direction_phase() {
 						[ "$route_identity" = "$calibration_route_identity" ] ||
 							fail "WAN route identity changed after a failed $phase_direction-only speed test."
 					fi
+					[ "$phase_failure_reason" != timeout ] || {
+						current_progress=87
+						speedtest_retry_backoff "$phase_direction-only shaped validation"
+					}
 					phase_background_attempt=$((phase_background_attempt + 1))
 					continue
 					;;
 			esac
+			[ "$phase_failure_reason" != timeout ] || {
+				record_speedtest_retry_event "$phase_kind-$phase_direction-validation" "$phase_background_attempt"
+				speedtest_timeout_inconclusive "shaped-$phase_direction" "$phase_direction-only shaped validation"
+			}
 			fail "The $phase_direction-only shaped validation speed test failed in the supervisor (${speedtest_supervisor_reason:-unknown})."
 		fi
 		if ! temporary_phase_shaper_owned; then
@@ -6971,22 +7084,48 @@ run_job() {
 	capture_idle_baseline
 	check_background_traffic
 
-	full_download_samples=""
-	full_upload_samples=""
-	download_samples=""
-	upload_samples=""
-	runs_json=""
-	selected_server_id=""
-	selected_external_ip=""
-	fair_control_json=null
-	raw_control_json=null
-	fair_control_active=0
-	run_measurement 1
-	validate_deferred_baseline_capacity "$calibration_capacity_dl_kbps" "$calibration_capacity_ul_kbps"
-	run_directional_control download 1
-	run_directional_control download 2
-	run_directional_control upload 1
-	run_directional_control upload 2
+	speedtest_excluded_server_id=""
+	speedtest_retry_events_json=""
+	raw_series_attempt=1
+	raw_series_max_attempts=2
+	phase_background_before_raw_series="$phase_background_runs_json"
+	configured_speedtest_server_id="$(uci -q get "cake-autorate.$job_name.speedtest_go_server_id" 2>/dev/null || true)"
+	while :; do
+		phase_background_runs_json="$phase_background_before_raw_series"
+		full_download_samples=""
+		full_upload_samples=""
+		download_samples=""
+		upload_samples=""
+		runs_json=""
+		selected_server_id=""
+		selected_external_ip=""
+		fair_control_json=null
+		raw_control_json=null
+		fair_control_active=0
+		run_measurement 1
+		validate_deferred_baseline_capacity "$calibration_capacity_dl_kbps" "$calibration_capacity_ul_kbps"
+
+		raw_series_control_rc=0
+		run_directional_control download 1 || raw_series_control_rc="$?"
+		[ "$raw_series_control_rc" -ne 0 ] || run_directional_control download 2 || raw_series_control_rc="$?"
+		[ "$raw_series_control_rc" -ne 0 ] || run_directional_control upload 1 || raw_series_control_rc="$?"
+		[ "$raw_series_control_rc" -ne 0 ] || run_directional_control upload 2 || raw_series_control_rc="$?"
+		[ "$raw_series_control_rc" -ne 0 ] || break
+
+		if [ "$raw_series_control_rc" -eq 75 ] &&
+		   [ "$calibration_strategy" = full_raw ] &&
+		   [ "$raw_series_attempt" -lt "$raw_series_max_attempts" ] &&
+		   [ -z "$configured_speedtest_server_id" ] &&
+		   is_positive_uint "$selected_server_id"; then
+			speedtest_excluded_server_id="$selected_server_id"
+			raw_series_attempt=$((raw_series_attempt + 1))
+			current_progress=45
+			speedtest_retry_backoff "The pinned server stalled repeatedly; restarting the complete raw-control series with another server"
+			continue
+		fi
+		speedtest_timeout_inconclusive "directional-control" \
+			"${speedtest_retry_exhausted_context:-direction-only speed-test control}"
+	done
 	if [ "$calibration_strategy" = reuse_trusted ]; then
 		# The live shaped controls above attest route/server/SQM health. The
 		# explicit trusted strategy then searches from the saved reference rather

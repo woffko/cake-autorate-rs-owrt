@@ -239,7 +239,7 @@ The target is an APK ABI rather than one specific board. The authoritative
 choice is the value returned by `apk --print-arch`. Every daemon asset follows
 the name
 `cake-autorate-rs-1.0_rc27-r21_openwrt-25.12_<arch>.apk`; the shared
-`luci-app-cake-autorate-rs-1.0_rc27-r42_openwrt-25.12_all.apk` contains the
+`luci-app-cake-autorate-rs-1.0_rc27-r43_openwrt-25.12_all.apk` contains the
 architecture-independent LuCI interface and SQM integration.
 
 RC27 adds background-aware Full Auto-Tune confidence without mixing forwarded
@@ -248,7 +248,12 @@ upload, quality and overall confidence, labels results trusted, provisional or
 estimated, and permits unattended apply only for clean trusted evidence. A
 strict busy-link stop can be retried or restarted once with conservative
 safeguards; a structurally safe lower-confidence proposal remains an explicit
-manual decision. CPU saturation is visible as a warning rather than a false
+manual decision. A stalled speed-test phase is retried with bounded cooldowns;
+an automatically chosen server may be replaced only by restarting the complete
+raw-control series, while an explicitly pinned server is never changed. An
+exhausted timeout is reported as retryable and inconclusive, preserves the
+verified diagnostics in RAM, and never exposes an Apply action. CPU saturation
+is visible as a warning rather than a false
 quality failure. The release retains the explicit Automatic/Gaming/Best
 overall/Fair/Custom traffic-profile model and sequential per-member Multi-WAN
 calibration. Direct APK assets are provided for all 12 daemon ABIs plus the
@@ -332,14 +337,16 @@ representative examples rather than guarantees.
 
 ## Release history
 
-The current public prerelease is **RC27 r21/r42**: daemon package r21 and LuCI
-package r42. It adds the manual per-direction CAKE selector and fixes a LuCI
-Save & Apply edge case in which a one-sided managed SQM runtime `0` could be
-mistaken for the configured link capacity. The focused live transition matrix,
-full browser audit, package ABI verification and design chronology are recorded
-in [Testing](TESTING.md). The README intentionally describes current behavior
-instead of retaining a cumulative RC diary; historical source points remain in
-Git tags while [GitHub Releases](https://github.com/woffko/cake-autorate-rs-owrt/releases)
+The current public prerelease is **RC27 r21/r43**: daemon package r21 and LuCI
+package r43. It retains the manual per-direction CAKE selector and Save & Apply
+fix from r42, then adds bounded speed-test timeout recovery: same-server retries,
+one complete-series fallback for automatically selected servers, typed
+non-applyable inconclusive results, and clearer retry diagnostics in LuCI. The
+focused live transition matrix, full browser audit, package ABI verification and
+design chronology are recorded in [Testing](TESTING.md). The README intentionally
+describes current behavior instead of retaining a cumulative RC diary;
+historical source points remain in Git tags while
+[GitHub Releases](https://github.com/woffko/cake-autorate-rs-owrt/releases)
 contains the current downloadable build.
 
 ## Repository Layout
@@ -782,7 +789,7 @@ For example, when it prints `aarch64_generic`:
 ```sh
 apk add --allow-untrusted \
   /root/cake-autorate-rs-1.0_rc27-r21_openwrt-25.12_aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc27-r42_openwrt-25.12_all.apk
+  /root/luci-app-cake-autorate-rs-1.0_rc27-r43_openwrt-25.12_all.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:

@@ -572,11 +572,13 @@ while [ "$attempt" -lt 220 ]; do
 	sleep 0.05
 done
 grep -q '"state":"failed"' "$work/nonzerojson-status.json"
-grep -q '"reason":"helper-exit:7","exit_code":7,"raw_available":true' "$work/nonzerojson-status.json"
+grep -q '"reason":"helper-exit:7"' "$work/nonzerojson-status.json"
 node - "$work/nonzerojson-status.json" <<'EOF'
 const fs = require('node:fs');
 const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
-if (result.speedtest_supervisor.raw_bytes < 2)
+if (result.speedtest_supervisor.exit_code !== 7 ||
+    result.speedtest_supervisor.raw_available !== true ||
+    result.speedtest_supervisor.raw_bytes < 2)
 	throw new Error('valid helper diagnostic was not retained');
 if (result.auto_apply_eligible !== false || result.manual_apply_eligible !== false)
 	throw new Error('failed helper result became reviewable');
@@ -615,6 +617,78 @@ EOF
 wait_for_job_cleanup helperdetail
 unset AUTOTUNE_MOCK_JSON_ERROR AUTOTUNE_MOCK_JSON_ERROR_AT_COUNT \
 	AUTOTUNE_MOCK_JSON_ERROR_EXIT_CODE
+
+# A stalled first direction-only transfer is a transient measurement failure,
+# not an immediate terminal error. The supervisor reaps the timed-out process
+# group, waits for the bounded backoff, and retries the identical pinned server.
+: > "$work/counter"
+: > "$work/server-pins"
+: > "$work/test-directions"
+export AUTOTUNE_MOCK_BLOCK_AT_COUNT=2
+export CAKE_AUTORATE_AUTOTUNE_SPEEDTEST_TIMEOUT_S=1
+export CAKE_AUTORATE_AUTOTUNE_SPEEDTEST_RETRY_BACKOFF_S=0
+"$autotune" transienttimeout lo start speedtest-go > "$work/transienttimeout-start.json"
+attempt=0
+while [ "$attempt" -lt 900 ]; do
+	"$autotune" transienttimeout lo status speedtest-go > "$work/transienttimeout-status.json"
+	grep -q '"state":"complete"' "$work/transienttimeout-status.json" && break
+	if grep -q '"state":"failed"' "$work/transienttimeout-status.json"; then
+		cat "$work/transienttimeout-status.json" >&2
+		exit 1
+	fi
+	attempt=$((attempt + 1))
+	sleep 0.02
+done
+grep -q '"state":"complete"' "$work/transienttimeout-status.json"
+test "$(sed -n '1p' "$work/server-pins")" = automatic
+test "$(sed -n '2p' "$work/server-pins")" = 17372
+test "$(sed -n '3p' "$work/server-pins")" = 17372
+test "$(sed -n '2p' "$work/test-directions")" = download
+test "$(sed -n '3p' "$work/test-directions")" = download
+wait_for_job_cleanup transienttimeout
+unset AUTOTUNE_MOCK_BLOCK_AT_COUNT
+
+# Repeated stalls first exhaust the same-server retries. Automatic server mode
+# then invalidates the complete raw series, excludes the stalled server, and
+# starts once from a new server. If that server also exhausts its retries, the
+# result is typed retryable/inconclusive and remains non-applyable.
+: > "$work/counter"
+: > "$work/server-pins"
+: > "$work/test-directions"
+export AUTOTUNE_MOCK_BLOCK_AT_COUNTS='2 3 4 6 7 8'
+export AUTOTUNE_MOCK_ALT_SERVER_ID=29062
+"$autotune" persistenttimeout lo start speedtest-go > "$work/persistenttimeout-start.json"
+attempt=0
+while [ "$attempt" -lt 1400 ]; do
+	"$autotune" persistenttimeout lo status speedtest-go > "$work/persistenttimeout-status.json"
+	grep -q '"reason":"speedtest-timeout"' "$work/persistenttimeout-status.json" && break
+	attempt=$((attempt + 1))
+	sleep 0.02
+done
+node - "$work/persistenttimeout-status.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (result.state !== 'inconclusive' || result.retryable !== true ||
+    result.search_state !== 'measurement_timeout' ||
+    result.reason !== 'speedtest-timeout' ||
+    result.auto_apply_eligible !== false || result.manual_apply_eligible !== false ||
+    result.configuration_written !== false || result.runtime_restored !== true ||
+    !result.speedtest_supervisor || result.speedtest_supervisor.reason !== 'timeout' ||
+    result.speedtest_supervisor.exit_code !== 124 ||
+    result.speedtest_supervisor.timeout_seconds !== 1 ||
+    !Array.isArray(result.speedtest_retries) || result.speedtest_retries.length !== 6)
+	throw new Error('persistent timeout did not remain a typed, restored, fail-closed result');
+EOF
+test "$(sed -n '1p' "$work/server-pins")" = automatic
+test "$(sed -n '2p' "$work/server-pins")" = 17372
+test "$(sed -n '3p' "$work/server-pins")" = 17372
+test "$(sed -n '4p' "$work/server-pins")" = 17372
+test "$(sed -n '5p' "$work/server-pins")" = automatic
+test "$(sed -n '6p' "$work/server-pins")" = 29062
+wait_for_job_cleanup persistenttimeout
+unset AUTOTUNE_MOCK_BLOCK_AT_COUNTS AUTOTUNE_MOCK_ALT_SERVER_ID
+unset CAKE_AUTORATE_AUTOTUNE_SPEEDTEST_TIMEOUT_S \
+	CAKE_AUTORATE_AUTOTUNE_SPEEDTEST_RETRY_BACKOFF_S
 
 # One remote helper reset during shaped validation is retried at the same
 # candidate, direction and pinned server. The failed attempt remains visible

@@ -141,7 +141,7 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 			`changedUciPackages, requireCleanUciTransaction, applyPlainRollbackTransaction, ` +
 			`runSequentialAutotuneApplies, ` +
 			`clearAutotuneProposalState, recordAutotuneTerminalFailure, ` +
-			`autotuneRetryableInconclusive, autotuneRecommendedProfile, recordAutotuneRetryableInconclusive, ` +
+			`autotuneRetryableInconclusive, autotuneMeasurementTimeout, autotuneRecommendedProfile, recordAutotuneRetryableInconclusive, ` +
 			`manualSqmDirectionMode, writeManualSqmDirectionMode, ` +
 			`positiveRateValue, shouldImportInterfaceRates, applyRatePreset, ` +
 			`adaptiveCeilingWritePlan, runAutotuneJob, cancelAutotuneJob, ` +
@@ -2863,6 +2863,15 @@ const inconclusiveResult = {
 };
 assert.equal(helpers.autotuneRetryableInconclusive(inconclusiveResult), true);
 assert.equal(helpers.autotuneRetryableInconclusive({ ...inconclusiveResult, retryable: false }), false);
+const timeoutResult = {
+	...inconclusiveResult,
+	reason: 'speedtest-timeout',
+	search_state: 'measurement_timeout',
+	speedtest_supervisor: { reason: 'timeout', exit_code: 124 },
+};
+assert.equal(helpers.autotuneMeasurementTimeout(timeoutResult), true);
+assert.equal(helpers.autotuneMeasurementTimeout({ ...timeoutResult, search_state: 'noisy' }), false);
+assert.equal(helpers.autotuneMeasurementTimeout({ ...timeoutResult, state: 'failed' }), false);
 assert.equal(helpers.autotuneResultValidated(inconclusiveResult), false,
 	'retryable inconclusive output must never unlock Review or Apply');
 const inconclusiveState = {
@@ -3099,6 +3108,9 @@ assert.match(source, /Failed gate reasons/);
 assert.match(source, /DL candidate realization maximum/);
 assert.match(source, /UL candidate realization maximum/);
 assert.match(source, /Calibration was inconclusive/);
+assert.match(source, /Speed test timed out/);
+assert.match(source, /Retry diagnostics/);
+assert.match(source, /Bounded retries were exhausted/);
 assert.match(source, /Suggested next test: Fair/);
 assert.match(source, /nothing is selected, disabled, or applied automatically/);
 assert.match(source, /alert-message %s.*warning/s,

@@ -12,6 +12,7 @@ bypass_scope="${CAKE_AUTORATE_SPEEDTEST_BYPASS_SCOPE:-full}"
 runtime_lock_lib="${CAKE_AUTORATE_RUNTIME_LOCK_LIB:-/usr/libexec/cake-autorate-rs/runtime-lock}"
 speedtest_self="${CAKE_AUTORATE_SPEEDTEST_SELF:-$0}"
 procd_job_bin="${CAKE_AUTORATE_PROCD_JOB:-/usr/libexec/cake-autorate-rs/procd-job}"
+speedtest_progress_file="${CAKE_AUTORATE_SPEEDTEST_PROGRESS_FILE:-}"
 
 # Full Auto-Tune can request a launch handshake for a separately supervised
 # process group.  Stop before backend discovery, route probing, SQM changes, or
@@ -87,6 +88,37 @@ json_escape() {
 json_error() {
 	printf '{"error":"%s"}\n' "$(json_escape "$1")"
 	exit 1
+}
+
+# Publish only bounded, allowlisted progress metadata. The Full Auto-Tune
+# supervisor owns the destination in tmpfs and uses this breadcrumb to
+# distinguish a backend stall from a helper which never reached the test.
+# Raw backend output is deliberately excluded because it may contain the
+# subscriber's public address or other identifying server text.
+speedtest_progress() {
+	local progress_stage progress_bytes progress_tmp
+	progress_stage="$1"
+	progress_bytes="${2:-0}"
+	[ -n "$speedtest_progress_file" ] || return 0
+	case "$progress_stage" in
+		route-verified|bypass-prepared|speedtest-go-started|speedtest-go-output-ready|speedtest-go-command-failed|speedtest-go-verified|backend-complete) ;;
+		*) return 1 ;;
+	esac
+	case "$progress_bytes" in ''|*[!0-9]*) progress_bytes=0 ;; esac
+	progress_tmp="${speedtest_progress_file}.tmp.$$"
+	umask 077
+	printf '{"stage":"%s","response_bytes":%s}\n' "$progress_stage" "$progress_bytes" > "$progress_tmp" || {
+		rm -f "$progress_tmp"
+		return 1
+	}
+	chmod 600 "$progress_tmp" 2>/dev/null || {
+		rm -f "$progress_tmp"
+		return 1
+	}
+	mv "$progress_tmp" "$speedtest_progress_file" || {
+		rm -f "$progress_tmp"
+		return 1
+	}
 }
 
 append_warning() {
@@ -2413,10 +2445,17 @@ run_speedtest_go_once() {
 	speedtest_route_rx_before="$(interface_byte_counter "$route_device" rx)" || return 1
 	speedtest_route_tx_before="$(interface_byte_counter "$route_device" tx)" || return 1
 	start="$(now_s)"
+	speedtest_progress speedtest-go-started 0 || return 1
 	if ! run_speedtest_go_command "$@" > "$tmp_response" 2>/dev/null; then
+		response_bytes="$(wc -c < "$tmp_response" 2>/dev/null)"
+		case "$response_bytes" in ''|*[!0-9]*) response_bytes=0 ;; esac
+		speedtest_progress speedtest-go-command-failed "$response_bytes" || true
 		return 1
 	fi
 	stop="$(now_s)"
+	response_bytes="$(wc -c < "$tmp_response" 2>/dev/null)"
+	case "$response_bytes" in ''|*[!0-9]*) response_bytes=0 ;; esac
+	speedtest_progress speedtest-go-output-ready "$response_bytes" || return 1
 
 	download_elapsed="$(elapsed_s "$start" "$stop")"
 	upload_elapsed="$download_elapsed"
@@ -2441,6 +2480,7 @@ run_speedtest_go_once() {
 		speedtest_route_proof_error="speedtest-go traffic did not traverse the selected interface $route_device"
 		return 1
 	fi
+	speedtest_progress speedtest-go-verified "$response_bytes" || return 1
 	return 0
 }
 
@@ -2470,7 +2510,7 @@ run_speedtest_go() {
 	max_attempts=3
 	cached_server="$(speedtest_go_cached_server)"
 
-	if is_positive_uint "$cached_server"; then
+	if is_positive_uint "$cached_server" && [ "$cached_server" != "$speedtest_go_exclude_server_id" ]; then
 		if run_speedtest_go_once "$cached_server" && speedtest_go_result_is_plausible; then
 			return 0
 		fi
@@ -2497,6 +2537,7 @@ run_speedtest_go() {
 		for candidate_id in $candidate_ids; do
 			[ "$attempts" -lt "$max_attempts" ] || break
 			[ "$candidate_id" = "$cached_server" ] && continue
+			[ "$candidate_id" = "$speedtest_go_exclude_server_id" ] && continue
 			attempts=$((attempts + 1))
 
 			if ! run_speedtest_go_once "$candidate_id"; then
@@ -3018,6 +3059,7 @@ route_probe="$(uci_get speedtest_route_probe)"
 iperf3_server="$(uci_get speedtest_iperf3_server)"
 iperf3_port="$(uci_get speedtest_iperf3_port)"
 speedtest_go_server_id="${CAKE_AUTORATE_SPEEDTEST_GO_SERVER_ID:-$(uci_get speedtest_go_server_id)}"
+speedtest_go_exclude_server_id="${CAKE_AUTORATE_SPEEDTEST_GO_EXCLUDE_SERVER_ID:-}"
 preferred_backend="$(uci_get speedtest_backend)"
 route_mode_configured="$(uci_get route_mode)"
 mwan3_member="$(uci_get mwan3_member)"
@@ -3035,6 +3077,7 @@ external_ip_url="$(uci_get speedtest_external_ip_url)"
 [ -n "$external_ip_url" ] || external_ip_url="https://api.ipify.org"
 [ -n "$backend_override" ] && preferred_backend="$backend_override"
 valid_backend "$preferred_backend" || preferred_backend="auto"
+case "$speedtest_go_exclude_server_id" in ''|*[!0-9]*) speedtest_go_exclude_server_id="" ;; esac
 
 if bool_enabled "$force_ipv4_enabled"; then
 	force_ipv4_arg="1"
@@ -3151,6 +3194,7 @@ acquire_interface_lock
 if ! inspect_selected_route; then
 	json_error "${route_error:-selected route is unavailable}"
 fi
+speedtest_progress route-verified 0 || json_error "Unable to publish safe speed-test progress."
 route_identity_before="$route_identity"
 external_ip_before="$(fetch_external_ip)"
 if [ -z "$external_ip_before" ]; then
@@ -3159,8 +3203,10 @@ fi
 if ! prepare_speedtest_calibration; then
 	json_error "Unable to establish a crash-safe unshaped speed-test calibration. ${warning}"
 fi
+speedtest_progress bypass-prepared 0 || json_error "Unable to publish safe speed-test progress."
 
 if run_preferred_backend; then
+	speedtest_progress backend-complete 0 || json_error "Unable to publish safe speed-test progress."
 	if ! restore_speedtest_calibration_bounded; then
 		json_error "Speed test finished, but SQM/autorate restoration is still being recovered."
 	fi

@@ -5048,6 +5048,12 @@ function autotuneRetryableInconclusive(result) {
 	return !!(result && result.state === 'inconclusive' && result.retryable === true);
 }
 
+function autotuneMeasurementTimeout(result) {
+	return !!(autotuneRetryableInconclusive(result) &&
+		result.reason === 'speedtest-timeout' &&
+		result.search_state === 'measurement_timeout');
+}
+
 function autotuneRecommendedProfile(result) {
 	if (!(result && result.state === 'inconclusive' && result.retryable === true &&
 	      result.search_state === 'joint_unsafe' &&
@@ -5612,6 +5618,7 @@ function renderAutotuneDiagnostics(result) {
 	var profileOutcome = diagnosticResult.profile_outcome;
 	var profileSearch = diagnosticResult.profile_search;
 	var retryableInconclusive = autotuneRetryableInconclusive(result);
+	var measurementTimeout = autotuneMeasurementTimeout(result);
 	var recommendedProfile = autotuneRecommendedProfile(diagnosticResult);
 	var finalAttempt = diagnostics.attempts.length ? diagnostics.attempts[diagnostics.attempts.length - 1] : null;
 	var cpuWarning = finalAttempt &&
@@ -5652,6 +5659,12 @@ function renderAutotuneDiagnostics(result) {
 		alertMessage = diagnostics.error ||
 			_('The requested rating was not reached, but the selected pair preserved every throughput and resource safety gate.');
 	}
+	else if (measurementTimeout) {
+		alertClass = 'warning';
+		alertTitle = _('Speed test timed out. ');
+		alertMessage = diagnostics.error ||
+			_('The selected server stopped responding. Bounded retries were exhausted, runtime was restored, and no proposal can be applied from this partial result.');
+	}
 	else if (retryableInconclusive) {
 		alertClass = 'warning';
 		alertTitle = _('Calibration was inconclusive. ');
@@ -5672,6 +5685,23 @@ function renderAutotuneDiagnostics(result) {
 		E('strong', {}, alertTitle),
 		alertMessage
 	]) ];
+	if (measurementTimeout) {
+		var supervisor = diagnosticResult.speedtest_supervisor || {};
+		var progress = supervisor.progress || {};
+		var retries = Array.isArray(diagnosticResult.speedtest_retries) ? diagnosticResult.speedtest_retries.length : 0;
+		nodes.push(E('div', {
+			'class': 'cake-autotune-timeout',
+			'style': 'margin:10px 0;padding:8px;border:1px solid rgba(127,127,127,.35);border-radius:4px'
+		}, [
+			E('strong', {}, _('Retry diagnostics')),
+			E('div', { 'style': 'margin-top:4px' }, _('Attempts: %s · deadline: %ss · elapsed: %ss · last stage: %s · captured response: %s bytes').format(
+				retries || 1,
+				autotuneMetric(supervisor.timeout_seconds),
+				autotuneMetric(supervisor.elapsed_seconds),
+				progress.stage || _('unknown'),
+				autotuneMetric(progress.response_bytes)))
+		]));
+	}
 	if (recommendedProfile === 'fair') {
 		nodes.push(E('div', {
 			'class': 'alert-message warning',
@@ -6791,7 +6821,8 @@ function showCreateWizard(grid, name, existingName) {
 			'disabled': state.autotune_running || item.recovery_pending ? 'disabled' : null,
 			'click': function() { return startCalibration(false); }
 		}, safeManualProposal ? _('Retry for higher confidence') :
-			(settledResult ? _('Run again') : _('Start Full Auto-Tune')));
+			(autotuneMeasurementTimeout(itemState.autotune_diagnostics) ? _('Retry calibration') :
+				(settledResult ? _('Run again') : _('Start Full Auto-Tune'))));
 		var conservativeButton = E('button', {
 			'type': 'button',
 			'class': 'btn cbi-button cbi-button-positive',
@@ -7141,10 +7172,11 @@ function showCreateWizard(grid, name, existingName) {
 			'click': function() {
 				return startCalibration(false);
 			}
-		}, state.autotune_result && autotuneResultClass(state.autotune_result) !== 'trusted' ?
+		}, autotuneMeasurementTimeout(state.autotune_diagnostics) ? _('Retry calibration') :
+			(state.autotune_result && autotuneResultClass(state.autotune_result) !== 'trusted' ?
 			_('Retry for higher confidence') :
 			(state.autotune_result || state.autotune_diagnostics || state.autotune_batch ?
-				_('Run again') : _('Start Full Auto-Tune')));
+				_('Run again') : _('Start Full Auto-Tune'))));
 		var conservativeButton = E('button', {
 			'type': 'button',
 			'class': 'btn cbi-button cbi-button-positive',

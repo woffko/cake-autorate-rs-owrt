@@ -211,6 +211,24 @@ cleanup_test() {
 }
 trap cleanup_test EXIT INT TERM
 
+# Progress breadcrumbs contain only allowlisted stages and byte counts. They
+# are atomic, mode 0600, and never copy raw speedtest-go output which may carry
+# subscriber or server identifying data.
+CAKE_AUTORATE_SPEEDTEST_SOURCE_ONLY=1 \
+CAKE_AUTORATE_SPEEDTEST_PROGRESS_FILE="$work/progress.json" \
+sh -c '
+	set -eu
+	script_path="$1"
+	progress_path="$2"
+	set -- test lo run speedtest-go "" main "" download
+	. "$script_path"
+	speedtest_progress speedtest-go-started 0
+	[ "$(cat "$progress_path")" = "{\"stage\":\"speedtest-go-started\",\"response_bytes\":0}" ]
+	[ "$(LC_ALL=C stat -c %a "$progress_path")" = 600 ]
+	if speedtest_progress unsafe-raw-output 99; then exit 1; fi
+	[ "$(cat "$progress_path")" = "{\"stage\":\"speedtest-go-started\",\"response_bytes\":0}" ]
+' sh "$script" "$work/progress.json"
+
 fail_test() {
 	printf '%s\n' "$*" >&2
 	exit 1

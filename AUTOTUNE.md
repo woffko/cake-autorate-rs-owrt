@@ -110,6 +110,20 @@ CPU is an advisory warning, not a standalone blocker.
   session. Timeout or cancel sends bounded TERM followed by KILL to the complete
   group. A helper exit code remains authoritative even when it printed valid
   JSON first.
+- A phase timeout is treated as a transport/backend failure rather than a bad
+  link-quality observation. The phase is retried on the same pinned server up
+  to three total attempts with a bounded cooldown. During an automatic
+  full-raw calibration only, repeated failure of that server may restart the
+  entire raw-control series once on a different automatically selected server;
+  already collected controls from the abandoned series are discarded. A
+  user-pinned server is never silently replaced. Exhausting the policy returns
+  typed `inconclusive` / `speedtest-timeout` evidence with no applicable
+  proposal and leaves the restored runtime unchanged.
+- The helper writes only an allow-listed, root-owned RAM progress breadcrumb
+  (route checked, bypass ready, backend started, output ready/failed, verified).
+  It does not retain backend output, command arguments, addresses, or secrets.
+  LuCI uses this breadcrumb, the deadline, elapsed time, and bounded retry
+  history to distinguish a remote-server stall from routing or SQM recovery.
 - Phase output is written to one root-owned bounded raw file in RAM. It is
   promoted atomically only after exact exit status zero and strict validation
   that it contains one JSON object. Failed raw output remains diagnostic and
