@@ -12,23 +12,60 @@ instance only after identifying the intended uplink.
    `wan — pppoe-wan — eth2`. For a normal single-WAN router use **Main routing
    table**. On nftables mwan3 select the member that resolves to this same L3
    device.
-3. Choose **Full Auto-Tune**, then select a calibration profile:
+3. Choose **Full Auto-Tune**, then choose calibration strategy and operating
+   profile. Variable Link opens an additional access/capacity mini-wizard:
 
-   - **Best overall** is recommended for most links. It finds the fastest safe
+   - **Calibration strategy:** **Shaped only** is the recommended low-disruption
+     start; **Full raw capacity** temporarily bypasses only the selected managed
+     CAKE direction and can transfer several GiB on a fast link; **Reuse trusted
+     bounds** avoids a new raw sweep only while route-bound evidence remains
+     valid. Reuse is available only after a completed calibration has stored
+     positive download and upload P50 references for that instance. Until then
+     the choice is disabled with an explanation; an imported stale reuse choice
+     safely falls back to Shaped only.
+   - **Operating profile:**
+
+     - **Best overall** is recommended for most links. It finds the fastest safe
      candidate that still proves A while retaining at least 80% of
      observed-low capacity. If A is unattainable, Review can show a balanced
      manual fallback.
-   - **Gaming** finds the fastest safe A+ candidate with a 70% throughput floor
+     - **Gaming** finds the fastest safe A+ candidate with a 70% throughput floor
      and configures CAKE
      `diffserv4`. The optional native Traffic priorities page can mark selected
      outbound game/interactive traffic without installing qosify or eBPF.
      Trusted WAN-ingress DSCP is still preserved, so use this profile only
      when downstream markings are acceptable. Enabling native rules resets
      upload DSCP to CS0 before applying the selected built-in/custom rules.
-   - **Fair** maximizes safe throughput with a 90% observed-low-capacity
+     For a deliberately time-limited latency-critical session, its
+     **Extreme A+ search** checkbox may test a wide link below 70%, down to 25%
+     on a 500+ Mbit/s direction. It keeps only measured A+ points, never runs
+     from the scheduler, and any result below 70% requires explicit manual
+     review. It is not recommended as a permanent household configuration.
+     - **Variable link** is intended for 4G/5G, satellite and other changing
+     links. Its mini-wizard shows the detected access medium and confidence,
+     but deliberately treats PPPoE/DHCP/Ethernet as inconclusive. Select
+     cellular, LEO/GEO satellite, fixed wireless/WISP, shared wired, or unknown
+     when Auto cannot prove it. Cellular/LEO explores to 35%, GEO/fixed
+     wireless to 40%, and shared/unknown to 50% only to locate the point at
+     which further CAKE reduction stops improving loaded latency. The runtime
+     minimum is written only from an actually tested point; noisy or
+     uncontrolled curves remain diagnostic-only.
+     - **Fair** maximizes safe throughput with a 90% observed-low-capacity
      objective. C is a soft goal: among candidates within 1.5% of
      the fastest result, lower loaded delay wins. This favors sustained large
      downloads/uploads over the strictest latency.
+
+   - **Variable Link runtime capacity learning:**
+
+     - **Validated ceiling only** never raises the exact tested ceiling and is
+       the automatic default when access detection is inconclusive.
+     - **Bounded learning from real traffic** probes upward only during real
+       sustained load with clean transport latency and useful throughput gain.
+     - **Bounded + scheduled active calibration** additionally reruns the
+       traffic-generating calibration in its maintenance window. Configure the
+       daily/monthly byte budgets first.
+     - **Explicit service hard caps** require both directions. Those caps may
+       tighten the measured raw limit but never expand it.
 
    Existing instances without a saved profile default to Best overall.
 4. Stop large downloads and uploads first. The
@@ -40,9 +77,12 @@ instance only after identifying the intended uplink.
 5. If background traffic blocks calibration, prefer **Retry when quiet**. The
    explicit **Continue conservatively** action applies to that run only: it
    subtracts measured background with an extra margin, never raises confirmed
-   maxima or adaptive caps, and retains a direction whose evidence is not
-   usable. The Review page labels such a result **LOW confidence** and keeps it
-   diagnostic-only: it cannot be applied or consumed by scheduled Auto-Apply.
+   maxima or adaptive caps, and lowers confidence in every affected direction.
+   If all hard route, measurement, SQM-ownership, latency/loss, realization and
+   restoration gates still pass, Review may offer the exact measured proposal
+   for explicit manual acceptance of every listed deviation. Otherwise it stays
+   diagnostic-only. Conservative evidence is never consumed by scheduled
+   Auto-Apply.
 6. Review the selected profile, proposed min/base/max rates, absolute
    adaptive-ceiling caps, link-layer overhead, latency thresholds, validation
    gates, exact CAKE class policy, and warnings. Nothing is written before
@@ -61,6 +101,22 @@ instance only after identifying the intended uplink.
 8. Enable **Graphs** only if RAM history is useful. Samples stay in `/var/run`
    and disappear on service stop or reboot. Start with the automatic memory
    budget and a 10-second interval.
+
+For manual one-sided shaping, open **Edit → SQM setup → CAKE directions**.
+**Upload only** removes the download/ingress CAKE and IFB; **Download only**
+removes upload/egress CAKE; **Both** restores the normal bidirectional topology.
+The unshaped direction has no local bufferbloat protection. This selector is
+different from **Adjust DL/UL**, which can leave CAKE present at a fixed rate
+while preventing autorate from changing that direction. Selecting a one-sided
+mode clears Adjust for the absent direction; restoring CAKE later deliberately
+does not overwrite that separate manual choice.
+
+For scale, one anonymized cellular Full raw run reached roughly 403/46 Mbit/s.
+A 2 GiB hard allowance stopped it safely after the first shaped point, restored
+SQM and left UCI untouched; completing the whole Variable-link frontier at that
+speed may need about 4.5-6 GiB. Choose the budget before starting or use Shaped
+only. A high CPU value is a warning for router capacity, not an Auto-Tune
+blocker by itself.
 
 ## Existing instances
 
@@ -101,10 +157,12 @@ The search can repeat an unreliable candidate, test the observed-low upper
 bound, and bisect the measured quality boundary. It never silently lowers a
 profile's 70/80/90% Auto-Apply objective. A clean shortfall, including one
 below the common 50% historical trust boundary, can be offered only for
-explicit manual review. Failed, incomplete, strictly
-contaminated and conservative runs remain diagnostics and do not replace the
-current UCI configuration. A safe result below the Gaming or Best overall
-target is explicitly manual-only and scheduled Auto-Apply cannot consume it.
+explicit manual review. Failed or incomplete runs remain diagnostics. A
+conservative/contaminated run is applicable only when it still yields a
+complete hard-safe exact proposal and the operator explicitly acknowledges all
+deviations; otherwise it cannot replace the current UCI configuration. A safe
+result below the Gaming or Best overall target is explicitly manual-only and
+scheduled Auto-Apply cannot consume it.
 
 When repeated tests remain below the 50% historical trust boundary, Review
 identifies the result as unusually far from the earlier raw capacity. CPU and

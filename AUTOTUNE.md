@@ -13,9 +13,10 @@ instance.
 
 When the creation wizard selects every unused mwan3 uplink, calibration is
 interactive and strictly sequential. Each uplink first gets its own Gaming,
-Best overall, or Fair profile, then runs only through that member, and stops on
-its own result. A safe shaped proposal may be accepted; any settled result may
-instead be skipped. Only after that explicit decision does the wizard move to
+Best overall, Variable link, or Fair profile, then runs only through that
+member, and stops on its own result. A safe shaped proposal may be accepted;
+any settled result may instead be skipped. Only after that explicit decision
+does the wizard move to
 the next uplink. A skipped uplink is shown in the aggregate Review and, if the
 user finally creates the set, is written disabled with `autotune_pending=1`.
 Failure, background traffic, or cancellation never auto-advances, and a member
@@ -38,9 +39,9 @@ accepted transaction has completed and no guard marker remains.
 > directly; terminal cleanup treats an absent or safely identified reused PID
 > as already stopped and never signals its new owner.
 
-## Planned transport-aware adaptive ceiling (proposal, not shipped)
+## Transport-aware adaptive capacity
 
-The following is a proposed next-step design and is not part of current runtime behavior:
+RC27 implements this model in the matching daemon and LuCI packages:
 
 - The loop is per direction (`dl` / `ul`) and keeps explicit state fields:
   - `safe_ceiling_{dir}`: highest proven safe runtime ceiling
@@ -57,19 +58,44 @@ The following is a proposed next-step design and is not part of current runtime 
   directionally isolated test. Raw results seed search bounds and are never an
   immediately applicable configuration.
 - Candidate progression is controlled by bounded shaped tests only; raw directional maxima set `safe_ceiling` search bounds, while failed shaped points update `failed_bound`.
-- Runtime growth is passive-only by default: growth is allowed only under proven sustained saturation plus clean transport-latency evidence. An explicitly enabled active mode may inject bounded traffic to test above the current ceiling.
-- Runtime reduction uses causal backoff: when delay does not improve after a controlled reduction, stop lowering and hold that direction in `hold`.
+- Runtime growth is policy-controlled. Bounded passive learning is allowed only
+  under proven sustained saturation, clean transport-latency evidence, and a
+  measurable achieved-throughput gain. Scheduled active learning reruns the
+  traffic-generating calibration inside explicit time and byte budgets; it
+  does not inject unaccounted daemon traffic between runs.
+- Runtime reduction uses causal backoff: two controlled reductions without a
+  meaningful transport improvement restore the last useful point and hold that
+  direction in `HOLD_NO_EFFECT`.
 - Keep both `runtime_minimum` and `exploration_minimum`; the former is the minimum operational rate, the latter gates exploratory retests.
-- Optional active probing is manual/opt-in and uses a strict periodic path. LuCI
-  must show estimated transfer per run/day/month, enforce a configured data
-  budget, and stop scheduling when the budget is exhausted.
+- Optional active probing is manual/opt-in and uses a strict periodic path.
+  LuCI shows the next run and remaining allowance; a crash-safe reservation and
+  settlement ledger enforces per-instance daily/monthly byte budgets.
 - User choice is split into calibration strategy (raw-capacity bypass,
-  shaped-only, or trusted-bound reuse), runtime learning (passive-only,
-  periodic active probes, or fixed bounds), and policy (latency-first,
-  balanced, throughput-first, or bypass recommendation).
+  shaped-only, or trusted-bound reuse), runtime learning (validated-only,
+  bounded passive, bounded plus scheduled active, or explicit service caps), and operating profile (Gaming,
+  Best overall, Variable link, or Fair).
+- Trusted-bound reuse is an evidence-backed shortcut, not a bootstrap mode. It
+  is selectable only when the same instance already has positive saved DL and
+  UL P50 capacity references. LuCI disables it for an uncalibrated instance;
+  a stale imported `reuse_trusted` value is normalized to `shaped_only` before
+  a job starts.
 - Fail-closed remains unchanged: identity loss, counter contamination, transport parse/continuity issues, or confidence collapse keep the direction closed to changes and force conservative reporting.
-- Confidence reporting should stay explicit and directional (safe/provisional/limited) so policy and state transitions remain auditable.
-- Scheduler/unlimited limitations: proposed adaptive-capacity control assumes finite bounded maxima and is intended for bounded/scheduled operation; unlimited mode remains excluded until bounded safety evidence is proven for both directions.
+- Confidence reporting stays explicit and directional
+  (safe/provisional/limited) so policy and state transitions remain auditable.
+
+Every frontier finishes with simultaneous DL+UL confirmation. If ordinary
+shaping is unsafe or poorly realized, Review can run a repeated upload-only
+shaped diagnostic with download ingress bypassed. It can recommend manual
+review, but it never silently removes a direction from the runtime topology.
+
+On an anonymized cellular link, a deliberate 2 GiB limit completed raw
+403/46 Mbit/s controls and a first shaped 220/30 Mbit/s point, then stopped
+before the next candidate with `traffic-budget-exhausted`. Runtime restoration
+was attested and no UCI was written. A complete Variable-link frontier at that
+capacity can require about 4.5-6 GiB. This is why synthetic probes are opt-in
+and budgeted. ICMP may look much cleaner than user transport on some networks;
+the worse corroborated ICMP or native transport delta remains authoritative.
+CPU is an advisory warning, not a standalone blocker.
 
 ## Safety contract
 
@@ -88,6 +114,20 @@ The following is a proposed next-step design and is not part of current runtime 
   session. Timeout or cancel sends bounded TERM followed by KILL to the complete
   group. A helper exit code remains authoritative even when it printed valid
   JSON first.
+- A phase timeout is treated as a transport/backend failure rather than a bad
+  link-quality observation. The phase is retried on the same pinned server up
+  to three total attempts with a bounded cooldown. During an automatic
+  full-raw calibration only, repeated failure of that server may restart the
+  entire raw-control series once on a different automatically selected server;
+  already collected controls from the abandoned series are discarded. A
+  user-pinned server is never silently replaced. Exhausting the policy returns
+  typed `inconclusive` / `speedtest-timeout` evidence with no applicable
+  proposal and leaves the restored runtime unchanged.
+- The helper writes only an allow-listed, root-owned RAM progress breadcrumb
+  (route checked, bypass ready, backend started, output ready/failed, verified).
+  It does not retain backend output, command arguments, addresses, or secrets.
+  LuCI uses this breadcrumb, the deadline, elapsed time, and bounded retry
+  history to distinguish a remote-server stall from routing or SQM recovery.
 - Phase output is written to one root-owned bounded raw file in RAM. It is
   promoted atomically only after exact exit status zero and strict validation
   that it contains one JSON object. Failed raw output remains diagnostic and
@@ -234,6 +274,45 @@ Best overall is the default for new jobs and for existing instances which do
 not yet have `autotune_profile`. The old `balanced` CLI value is accepted as an
 alias for `best_overall`, but all new results use the canonical name.
 
+## Variable Link access mini-wizard
+
+Selecting **Variable link** opens a separate access and capacity-learning
+panel. Encapsulation and physical access are intentionally independent:
+`pppoe-wan`, DHCP, or an Ethernet carrier does not prove fibre, cable, 5G,
+satellite, or WISP service.
+
+Auto-detection uses only bounded local OpenWrt evidence:
+
+| Evidence | Automatic result | Confidence |
+|---|---|---:|
+| direct QMI, MBIM, NCM, ModemManager, 3G, or 4G network protocol | 4G/5G cellular | 95% |
+| modem-like L3 interface name (`wwan`, `rmnet`, `wwp`, QMI/MBIM prefix) | 4G/5G cellular, review advised | 70% |
+| selected L3 device or its L2 carrier is a LuCI wireless device | fixed wireless/WISP, review advised | 65% |
+| PPPoE, DHCP, Ethernet, or no trustworthy local signal | unknown | 20% |
+
+LEO/GEO satellite cannot be proved reliably from a normal Ethernet handoff,
+so the user selects it explicitly. The same manual selector covers cellular,
+LEO satellite, GEO/high-latency satellite, fixed wireless/WISP, shared wired,
+or unknown access. An explicit choice has 100% provenance confidence; this is
+confidence in the classification source, not a quality score.
+
+The selected medium controls only conservative search depth and outer-loop
+timing:
+
+| Access medium | Exploration floor |
+|---|---:|
+| 4G/5G cellular or LEO satellite | 35% of conservative raw reference |
+| GEO satellite or fixed wireless/WISP | 40% |
+| shared wired or unknown | 50% |
+
+The floor authorizes measurement; it is never copied into the running
+configuration. `runtime_minimum_kbps` must still name an exact tested
+CAKE-controlled point. Auto-inconclusive access defaults to **Validated ceiling
+only**, while a trustworthy or explicit access choice defaults to **Bounded
+learning from real traffic**. The user may instead choose scheduled active
+calibration or two explicit service-plan hard caps. Service caps can only
+tighten measured capacity.
+
 With native traffic rules disabled, Gaming can use trusted client upload and
 WAN-ingress markings. The optional outbound rule editor instead establishes a
 deterministic upload policy: it resets outbound DSCP to CS0 and then matches
@@ -370,17 +449,19 @@ For each profile, the tuple below is
 |---|---|---|
 | Gaming | `(0.70, 0.82, 0.92, 1.02)` | `(0.70, 0.75, 1.20, 1.60)` |
 | Best overall | `(0.70, 0.88, 0.95, 1.05)` | `(0.40, 0.85, 1.25, 1.80)` |
-| Variable link | `(0.35, 0.80, 1.25, 1.80)` | `(0.35, 0.80, 1.25, 1.80)` |
+| Variable link | `(medium floor, 0.80, 1.00, 1.00)` | `(medium floor, 0.80, 1.00, 1.00)` |
 | Fair | `(0.35, 0.94, 0.98, 1.08)` | `(0.35, 0.92, 1.30, 1.90)` |
 
 Extreme A+ uses the Gaming upper factors and the capacity-aware exploration
 floor from the table above.
 
 Rates are rounded to 100 kbit/s and then constrained to
-`minimum <= base <= maximum <= cap`. The deliberately wide variable maximum is
-not the starting shaper: the shaper starts at `base`, while `maximum` and the
-absolute cap leave bounded room for the inner controller and adaptive-ceiling
-probes on a recovering radio link.
+`minimum <= base <= maximum <= absolute_cap <= exploration_cap`. For Variable
+Link, measured raw p90 is both the initial exploration cap and the outermost
+possible ceiling; no profile multiplier may manufacture capacity above it.
+An optional service-plan cap changes `absolute_cap` but preserves the raw
+`exploration_cap` as evidence. A final applyable shaped direction also binds
+`maximum` and `adaptive_ceiling_*_safe_kbps` to the exact selected tested point.
 
 Activity detection is one tenth of the weaker observed-low direction, rounded
 to 100 kbit/s and clamped to 500..20000 kbit/s. This keeps low-rate uploads
@@ -406,9 +487,12 @@ Fair:
   adjust-down = max(delay + 30, 60) ms
 ```
 
-Adaptive ceiling is enabled automatically only when either direction is
-variable. The proposed
-`hold / growth / observation / cooldown / failed-bound TTL` values are:
+For legacy/non-Variable callers without an explicit policy, adaptive ceiling
+is proposed when either direction is variable. The Variable Link mini-wizard
+always records one of `verified_only`, `passive_bounded`, `scheduled_active`,
+or `fixed_cap`. Only the two bounded-learning policies enable runtime growth.
+The proposed `hold / growth / observation / cooldown / failed-bound TTL`
+values include medium-specific Variable Link cadence:
 
 | Profile | Policy |
 |---|---|
@@ -416,6 +500,11 @@ variable. The proposed
 | Best overall, variable | `15 s / 3% / 8 s / 45 s / 900 s` |
 | Best overall, stable | `20 s / 3% / 8 s / 60 s / 1800 s`, disabled |
 | Fair | `10 s / 5% / 10 s / 30 s / 600 s` |
+| Variable, cellular | `20 s / 3% / 10 s / 60 s / 900 s` |
+| Variable, LEO satellite | `30 s / 2% / 15 s / 120 s / 1800 s` |
+| Variable, GEO satellite | `45 s / 1% / 20 s / 180 s / 3600 s` |
+| Variable, fixed wireless | `20 s / 3% / 10 s / 60 s / 1200 s` |
+| Variable, shared/unknown | `30 s / 2% / 10 s / 90 s / 1800 s` |
 
 Detected PPPoE uses Ethernet framing, overhead 44, and MPU 84. Plain Ethernet
 uses overhead 18 and MPU 64. Cellular links use raw/no-overhead defaults;
@@ -687,7 +776,7 @@ the unselected autorate/SQM instance continues running.
 
 `cake-autorate-autotune` is a lightweight procd service. Per-instance
 `scheduled_autotune_*` options select interval, local hour window, required
-quiet time, RAM-only daily traffic budget, and whether a validated result is
+quiet time, persistent daily/monthly traffic budgets, and whether a validated result is
 automatically applied. The feature defaults off, and auto-apply defaults off.
 The scheduler reuses the exact preflight, route identity, five raw controls,
 same-server directional search, selected-pair confirmation, cleanup, and fail-closed
