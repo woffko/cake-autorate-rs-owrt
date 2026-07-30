@@ -71,18 +71,20 @@ explicit below.
 
 **Status** keeps the operational state in one place: uplink lifecycle,
 Autorate/SQM/classifier health, active profiles, current collection state and
-the last complete connection rating. The example below is a real completed
-automatic test on an isolated `test_instance`; it measured A+ for both download
-and upload without changing the configured CAKE limits. Results naturally
-depend on the tested link and load at that moment.
+the last complete connection rating. The anonymized example below shows two
+independently routed uplinks and an honest **INCOMPLETE** current capture. After
+a complete passive or guided capture, **LAST KNOWN** preserves that DL/UL
+grade; an incomplete or contaminated attempt never replaces it. Until the
+first complete capture, the last-known field remains empty instead of
+presenting a stale or inferred grade.
 
-[![Status overview with a completed A+ rating](docs/screenshots/status-overview.png)](docs/screenshots/status-overview.png)
+[![Status overview for two independently routed uplinks](docs/screenshots/status-overview.png)](docs/screenshots/status-overview.png)
 
 **Graphs** use an opt-in, bounded RAM-only history. Latency, transport delta,
 effective delay, CPU and synchronized download/upload traffic share the same
 timeline; the oldest samples are discarded automatically and nothing is
-written to flash. This capture contains the load phases from the same rating
-test.
+written to flash. The live Multi-WAN capture also shows an adaptive backoff
+event on the shared time axis.
 
 [![RAM-only latency, CPU and traffic graphs](docs/screenshots/graphs-overview.png)](docs/screenshots/graphs-overview.png)
 
@@ -106,9 +108,22 @@ for wide links: it accepts only measured A+ minima, disables Auto-Apply below
 70% retained capacity, and warns that such a throughput sacrifice is intended
 for short latency-critical sessions rather than continuous household use.
 
+Variable link opens a small access/capacity wizard instead of guessing the
+provider medium from an Ethernet or PPPoE handoff. QMI/MBIM/NCM and modem-like
+devices can be identified with an explicit confidence value; cellular,
+LEO/GEO satellite, fixed wireless/WISP, shared wired and unknown access can
+always be selected manually. The choice sets only the bounded exploration
+floor and probe cadence. It never invents a runtime limit: only an exact tested
+CAKE point may become the minimum or safe ceiling. Runtime learning is a
+separate choice between **Validated ceiling only**, **Bounded learning from
+real traffic**, **Bounded + scheduled active calibration**, and **Explicit
+service hard caps**.
+
+[![Variable Link access and capacity-learning setup](docs/screenshots/variable-link-setup.png)](docs/screenshots/variable-link-setup.png)
+
 [![Full Auto-Tune calibration profiles](docs/screenshots/autotune-profiles.png)](docs/screenshots/autotune-profiles.png)
 
-### Controlled cellular observations (anonymized, not shipped behavior)
+### Controlled cellular observations (anonymized)
 
 The following controlled OpenWrt cellular-link sample runs are anonymized benchmark evidence and are **not** shipped behavior or guarantees.
 
@@ -124,35 +139,106 @@ The following controlled OpenWrt cellular-link sample runs are anonymized benchm
 
 ICMP samples in this set stayed around **10–13 ms** while TCP/WebSocket samples were **72–190 ms**. This is a measurable risk signal that some providers/networks may prioritize or specially treat ICMP, so ICMP-only grading can understate user-traffic latency.
 
-### Planned transport-aware adaptive ceiling (proposal, not shipped)
+### Transport-aware adaptive capacity
 
-Planned vNext behavior is scoped as a controlled runtime feature, separate from current release behavior:
+RC27 implements the following controller and LuCI model:
 
-- Add per-direction adaptive state fields: `safe_ceiling_dl`, `safe_ceiling_ul`, `failed_bound_dl`, `failed_bound_ul`, `runtime_minimum_dl`, `runtime_minimum_ul`, `exploration_minimum_dl`, and `exploration_minimum_ul`.
+- Keep raw capacity, current rate, measured runtime minimum, exploration
+  minimum, safe ceiling, failed bound, confidence and route epoch independently
+  for download and upload. A route/source/member change expires old evidence.
 - Offer an explicit raw-capacity calibration mode which transactionally removes
   only the managed download ingress CAKE/IFB path, measures the selected uplink,
   and restores the exact prior runtime through a watchdog even if the worker or
   browser disappears. Upload shaping may remain active when the selected test
   requires it.
-- Run shaped control candidates through the same transport-aware validation path before lowering or raising rates.
-- Increase passively by default only when saturation and transport latency evidence remain clean across both ICMP and native transport signals. Optional active probes may test above the current bound, but only clean candidate evidence may update `safe_ceiling`; route changes and proven capacity collapse invalidate stale bounds.
-- Apply causal backoff: stop further downward tuning when measured delay does not improve after a controlled reduction, and hold direction at last-known good value.
-- Expose two operation envelopes: `runtime_minimum` (hard floor for runtime behavior) and `exploration_minimum` (bounded search floor).
-- Add optional, scheduler-driven active-probing rounds with explicit opt-in,
-  estimated transfer per run/day/month, a configurable data budget, and a hard
-  stop when that budget is exhausted.
-- Keep three user choices separate: calibration strategy (raw-capacity bypass,
-  shaped-only, or reuse trusted bounds), runtime learning (passive-only,
-  periodic active probes, or fixed bounds), and operating policy
-  (latency-first, balanced, throughput-first, or bypass recommendation).
+- Run shaped candidates through the same transport-aware path, then confirm the
+  selected DL/UL pair under simultaneous load. The worse corroborated ICMP or
+  native transport delta is authoritative.
+- Build one ranked Review set from as many as four independently measured
+  runtime topologies: both directions shaped, upload-only shaping,
+  download-only shaping, and no SQM. Every card names its exact tested rates
+  and evidence; Auto-Tune never derives or invents an untested rate merely to
+  make a proposal available.
+- Keep profile class, retained-capacity objectives, and relative utility versus
+  another safe topology as policy judgements rather than technical failures.
+  A proposal that misses one of them remains selectable only after Review shows
+  the deviation and the user explicitly acknowledges that proposal's warning.
+- Keep measurement integrity, route identity, raw-bypass proof, complete
+  background accounting and contamination limits, loss, the manual-review
+  latency ceiling, and a proven 50–110% CAKE realization safety envelope for
+  every shaped direction as non-overridable hard gates. Historical-throughput
+  trust and the ordinary 80% realization objective remain explicit Review
+  warnings inside that envelope. Acknowledging a profile trade-off cannot
+  weaken the hard checks.
+- If shaped frontier search cannot produce a safe result but the independent
+  raw control is complete and passes every applicable hard gate, carry an exact
+  no-SQM fallback into Review instead of discarding the whole run. This is a
+  manual proposal backed by the measured raw topology, not permission to infer
+  missing shaped evidence.
+- The same running SQM topologies can be selected manually in **Edit → SQM
+  setup → CAKE directions**. One-sided mode removes CAKE from the unselected
+  direction; it is not the same as retaining CAKE at a fixed rate by disabling
+  Adjust DL or Adjust UL. Logical capacity values remain independent of the
+  managed SQM runtime `0` marker used for an absent direction, including across
+  the standard LuCI Save & Apply cycle.
+- Treat a flat latency curve as directional evidence. If one Variable-link
+  direction meets its quality target but lower tested CAKE rates provide no
+  repeatable latency improvement, hold that direction at its highest safe,
+  target-meeting tested point while the peer direction finishes its search.
+  Such a result is always manual-review only, requires a safe simultaneous
+  DL+UL confirmation, and never invents an untested runtime minimum.
+- When Variable-link reaches its medium-specific 35%, 40%, or 50%
+  exploration boundary without proving a knee, or bounded repeats remain
+  nonmonotonic, keep the result useful without
+  overstating it: select the best exact-tested safe point at or above the 50%
+  trust boundary, use that same point as the runtime minimum, require a safe
+  simultaneous DL+UL confirmation, and expose it only for manual review.
+- Each close manual proposal lists every missed advisory/profile criterion in
+  Review. The user must acknowledge each deviation separately for that exact
+  topology before it can be staged. A final simultaneous latency miss is
+  reviewable only within the adjacent quality class: Gaming/Extreme A+ to A
+  (30 ms), Best overall A to B (60 ms), Variable link B to C (200 ms), and Fair
+  C to D (400 ms). Final simultaneous realization between 50% and the ordinary
+  80% proof threshold is also an explicit per-direction acknowledgement.
+- Grow passively only under proven saturation, clean transport evidence and a
+  measurable throughput gain. The selected policy may instead freeze the
+  exact validated ceiling, add budgeted scheduled calibration, or enforce
+  explicit service caps. Variable Link never treats either policy choice as
+  evidence of capacity above its measured raw control.
+- Apply causal backoff: two reductions without meaningful latency improvement
+  restore the last useful point and enter `HOLD_NO_EFFECT` instead of destroying
+  throughput for radio/operator delay outside CAKE's control.
+- Keep three user choices separate: calibration strategy (**Shaped only**,
+  **Full raw capacity**, or **Reuse trusted bounds**), runtime learning
+  (**Validated ceiling only**, **Bounded learning from real traffic**,
+  **Bounded + scheduled active calibration**, or **Explicit service hard
+  caps**), and
+  operating profile (Gaming, Best overall, Variable link, or Fair). Reuse is
+  enabled only after that instance has saved positive DL and UL P50 references;
+  an uncalibrated or stale reuse choice is explained and safely normalized to
+  Shaped only.
+- Keep scheduled traffic injection opt-in. The scheduler reserves and settles
+  per-instance daily/monthly byte allowances in a crash-safe ledger, shows the
+  next due run and remaining allowance, and stops before exceeding a hard
+  budget.
+- Review may recommend a repeated upload-only-shaped experiment when evidence
+  suggests ingress CAKE is ineffective. This is a manual diagnostic result,
+  not a silent runtime topology change.
 - Keep fail-closed behavior unchanged: any integrity, identity, or contamination failure preserves last safe state and emits lower-confidence fallback instead of changing runtime rates.
 - Report confidence per direction and aggregate confidence with explicit provenance (`safe`, `provisional`, `limited`) so policy choice is auditable.
-- Current limitation under this proposal is scheduler-unbounded/`unlimited` paths: the adaptive ceiling should only run when an explicit bounded max is in place and must remain disabled for unlimited mode until bounded safety bounds are proven.
+
+One live high-capacity cellular development run intentionally used a 2 GiB hard
+limit. It completed raw measurements near **403/46 Mbps** and a first shaped
+point near **220/30 Mbps**, then stopped with typed
+`traffic-budget-exhausted`, restored the original SQM runtime and wrote no UCI.
+A complete Variable-link frontier at that capacity can consume roughly
+**4.5–6 GiB**, so periodic active testing must be enabled only with an
+appropriate data allowance. CPU saturation is reported as advisory evidence;
+it does not by itself reject an otherwise safe candidate.
 
 ## Current package tree
 
-The current development tree builds the OpenWrt 25.12 daemon APK for this ABI
-matrix:
+The RC27 release builds the OpenWrt 25.12 daemon APK for this ABI matrix:
 
 | APK suffix | Representative OpenWrt target |
 |---|---|
@@ -172,8 +258,8 @@ matrix:
 The target is an APK ABI rather than one specific board. The authoritative
 choice is the value returned by `apk --print-arch`. Every daemon asset follows
 the name
-`cake-autorate-rs-1.0_rc27-r1_openwrt-25.12_<arch>.apk`; the shared
-`luci-app-cake-autorate-rs-1.0_rc27-r2_openwrt-25.12_all.apk` contains the
+`cake-autorate-rs-1.0_rc27-r22_openwrt-25.12_<arch>.apk`; the shared
+`luci-app-cake-autorate-rs-1.0_rc27-r45_openwrt-25.12_all.apk` contains the
 architecture-independent LuCI interface and SQM integration.
 
 RC27 adds background-aware Full Auto-Tune confidence without mixing forwarded
@@ -182,7 +268,12 @@ upload, quality and overall confidence, labels results trusted, provisional or
 estimated, and permits unattended apply only for clean trusted evidence. A
 strict busy-link stop can be retried or restarted once with conservative
 safeguards; a structurally safe lower-confidence proposal remains an explicit
-manual decision. CPU saturation is visible as a warning rather than a false
+manual decision. A stalled speed-test phase is retried with bounded cooldowns;
+an automatically chosen server may be replaced only by restarting the complete
+raw-control series, while an explicitly pinned server is never changed. An
+exhausted timeout is reported as retryable and inconclusive, preserves the
+verified diagnostics in RAM, and never exposes an Apply action. CPU saturation
+is visible as a warning rather than a false
 quality failure. The release retains the explicit Automatic/Gaming/Best
 overall/Fair/Custom traffic-profile model and sequential per-member Multi-WAN
 calibration. Direct APK assets are provided for all 12 daemon ABIs plus the
@@ -221,10 +312,10 @@ that controller:
 | Configuration | Shell configuration files | UCI source of truth, procd lifecycle, rpcd ACLs, and an integrated LuCI interface |
 | SQM ownership | Works with an existing CAKE/SQM setup | Creates, synchronizes, verifies, repairs, and uniquely owns each managed SQM/CAKE/IFB/redirect path while leaving unrelated queues alone |
 | Multiple links | Multiple script instances are possible | Structured main-table or nftables mwan3 member routing, one isolated instance/state/queue per uplink, route identity checks, failover states, and cross-WAN ownership guards |
-| Initial tuning | User chooses min/base/max from observed link behavior | Manual wizard, backend-aware speed test, and Full Auto-Tune with separate Gaming, Best overall, and Fair throughput/latency objectives |
+| Initial tuning | User chooses min/base/max from observed link behavior | Manual wizard, backend-aware speed test, and Full Auto-Tune with separate Gaming, Best overall, Variable link, and Fair throughput/latency objectives |
 | Auto-Tune safety | Not an upstream feature | RAM-only jobs, background-traffic accounting, ICMP plus native transport evidence, bounded per-direction frontier search, typed validation, exact proposal review, crash recovery, and guarded UCI apply |
 | Quality | Delay drives the controller | LibreQoS-style complete DL/UL detected grades, passive client-traffic episodes, guided **Get rating**, CURRENT/LAST KNOWN semantics, and optional transport-aware ceiling control |
-| Maximum discovery | Configured maximum is fixed | Optional bounded adaptive ceiling learns a safe upper bound below explicit absolute caps without rewriting UCI |
+| Maximum discovery | Configured maximum is fixed | Optional bounded adaptive ceiling starts from exact shaped evidence and learns only below measured-raw and optional service caps, without rewriting UCI |
 | Observability | Detailed logs and external analysis tools | Live JSON status, component-level Services health, CPU/softirq and CAKE diagnostics, redacted export, and opt-in RAM-only synchronized latency/CPU/traffic graphs |
 | Traffic policy | Relies on the surrounding CAKE/SQM configuration | Optional outbound-only nftables DSCP profiles for Gaming, Best overall, Fair, and editable Custom rules, with runtime checksum attestation and no second qdisc owner |
 | Automation | Primarily controller runtime | Scheduled quiet-window Auto-Tune, per-instance speed-test server caching, package/backend checks, and safe review-only versus validated auto-apply modes |
@@ -259,16 +350,25 @@ and authenticated Playwright checks.
 [Mobile preset view](docs/screenshots/traffic-priorities-mobile.png) ·
 [staged Custom copy](docs/screenshots/traffic-priorities-custom.png)
 
-The screenshots use anonymized instance, interface, host and address labels;
-rates and diagnostics remain representative of the live RC27 interface.
+The screenshots use anonymized instance, interface, host and address labels.
+They combine a completed rating capture with the current RC27 Multi-WAN,
+graphs, Auto-Tune and traffic-priority interface; rates and diagnostics are
+representative examples rather than guarantees.
 
 ## Release history
 
-The README describes the current behavior rather than retaining a cumulative RC
-diary. Prior release notes remain available under
-[GitHub Releases](https://github.com/woffko/cake-autorate-rs-owrt/releases), and
-the detailed regression evidence and design chronology remain in
-[Testing](TESTING.md).
+The current public prerelease is **RC27 r22/r45**: daemon package r22 and LuCI
+package r45. It retains the manual per-direction CAKE selector and bounded
+speed-test timeout recovery, then adds a Variable Link access mini-wizard,
+medium-specific exploration floors, exact measured-raw/service cap provenance,
+and four explicit runtime capacity-learning policies. Adaptive growth now starts
+from an exact tested-safe rate and requires both clean latency and a measurable
+throughput gain. The focused live transition matrix, full browser audit, package
+ABI verification and design chronology are recorded in [Testing](TESTING.md). The README intentionally
+describes current behavior instead of retaining a cumulative RC diary;
+historical source points remain in Git tags while
+[GitHub Releases](https://github.com/woffko/cake-autorate-rs-owrt/releases)
+contains the current downloadable build.
 
 ## Repository Layout
 
@@ -322,15 +422,18 @@ Implemented:
   persistent pingers and scheduler separately, including short-lived child
   work waited by each daemon.
 - adaptive rate calculations using delay/load windows.
-- Optional Rust-only bounded-probe ceiling extension, disabled by default so
-  the upstream configured maximum remains a hard limit. When enabled, each
-  direction independently qualifies clean high load, briefly tests a higher
-  ceiling, promotes a clean target to its learned-safe bound, and remembers the
+- Optional Rust-only bounded-probe ceiling extension. **Validated ceiling
+  only** is the conservative default when link classification is inconclusive;
+  bounded passive/scheduled learning is an explicit policy. Each direction
+  starts from its exact tested-safe point, independently qualifies clean high
+  load, briefly tests a higher ceiling, promotes only a clean target with a
+  measurable throughput gain, and remembers the
   lowest target that caused confirmed bufferbloat. Later probes use the midpoint
   between safe and failed bounds. Short load/delay-classification fluctuations
   are tolerated, while sustained loss or a global probe-response gap rolls back
   without poisoning the safe/failed bounds; a stall resets runtime learning.
-  Absolute DL/UL caps remain hard safety limits, and UCI is never rewritten.
+  Measured-raw DL/UL caps and any tighter service caps remain hard safety
+  limits, and runtime learning never rewrites UCI.
   Status exposes the phase, safe ceiling, failed bound, probe target, and last
   transition reason. See [ADAPTIVE_CEILING.md](ADAPTIVE_CEILING.md) for the
   state machine and acceptance tests.
@@ -561,9 +664,10 @@ SQM integration:
   the legacy HTTP/built-in speed-test fallback. Full Auto-Tune transport
   validation uses the native Rust probe in the daemon package.
 - The LuCI package declares `PROVIDES:=luci-app-sqm` and `CONFLICTS:=luci-app-sqm`
-  as the replacement intent. OpenWrt 25.12 APK package generation currently emits
-  the provide metadata, but conflict metadata still needs verification in final
-  packages.
+  as the build-time replacement intent. Final OpenWrt 25.12 APK v3 metadata
+  verification confirms that the generator emits the provide but omits a
+  runtime conflict field. Remove the standalone `luci-app-sqm` before installing
+  this replacement; do not rely on the live APK solver to reject both UIs.
 - The UI includes the required `luci-app-sqm` settings: enable flag, interface,
   download/upload rates, debug logging, verbosity, qdisc, queue setup script,
   DSCP/ECN options, queue limits, latency targets, raw qdisc options, link layer
@@ -697,12 +801,19 @@ them together. Determine the daemon suffix first:
 apk --print-arch
 ```
 
+If the standalone SQM LuCI application is installed, remove only that UI
+package first; keep `sqm-scripts`, which is a required runtime dependency:
+
+```sh
+apk info -e luci-app-sqm && apk del luci-app-sqm
+```
+
 For example, when it prints `aarch64_generic`:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc27-r1_openwrt-25.12_aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc27-r2_openwrt-25.12_all.apk
+  /root/cake-autorate-rs-1.0_rc27-r22_openwrt-25.12_aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc27-r45_openwrt-25.12_all.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:
