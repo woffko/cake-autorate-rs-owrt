@@ -31,6 +31,22 @@ case "$profile_argument" in
 esac
 traffic_budget_bytes="${10:-0}"
 calibration_strategy_argument="${11:-}"
+access_medium_argument="${12:-}"
+access_source_argument="${13:-}"
+access_confidence_argument="${14:-}"
+capacity_learning_policy_argument="${15:-}"
+service_dl_cap_argument="${16:-}"
+service_ul_cap_argument="${17:-}"
+# Source-only unit tests and diagnostic callers exercise proposal math without
+# entering the main request resolver. Keep that path equivalent to a legacy,
+# inconclusive access context; normal start/worker requests overwrite every
+# field through resolve_access_context() before doing any measurement.
+access_medium=unknown
+access_source=legacy_default
+access_confidence_percent=0
+capacity_learning_policy=""
+service_dl_cap_kbps=""
+service_ul_cap_kbps=""
 reflector_scan_cooldown_s="${CAKE_AUTORATE_REFLECTOR_SCAN_COOLDOWN_S:-5}"
 baseline_retry_backoff_s="${CAKE_AUTORATE_BASELINE_RETRY_BACKOFF_S:-20}"
 autotune_result_schema=8
@@ -161,6 +177,117 @@ resolve_calibration_strategy() {
 		shaped_only|full_raw|reuse_trusted) return 0 ;;
 		*) return 1 ;;
 	esac
+}
+
+canonical_access_medium() {
+	case "$1" in
+		cellular|4g|5g) printf '%s\n' cellular ;;
+		leo_satellite|leo-satellite|leo) printf '%s\n' leo_satellite ;;
+		geo_satellite|geo-satellite|geo|high_latency_satellite) printf '%s\n' geo_satellite ;;
+		fixed_wireless|fixed-wireless|wisp|wifi_bridge) printf '%s\n' fixed_wireless ;;
+		shared_wired|shared-wired|shared) printf '%s\n' shared_wired ;;
+		unknown) printf '%s\n' unknown ;;
+		*) return 1 ;;
+	esac
+}
+
+canonical_access_source() {
+	case "$1" in
+		user_selected|network_protocol|device_type|interface_name|auto_inconclusive|legacy_default)
+			printf '%s\n' "$1"
+			;;
+		*) return 1 ;;
+	esac
+}
+
+canonical_capacity_learning_policy() {
+	case "$1" in
+		verified_only|verified-only) printf '%s\n' verified_only ;;
+		passive_bounded|passive-bounded|passive) printf '%s\n' passive_bounded ;;
+		scheduled_active|scheduled-active|periodic_active) printf '%s\n' scheduled_active ;;
+		fixed_cap|fixed-cap|fixed) printf '%s\n' fixed_cap ;;
+		'') printf '\n' ;;
+		*) return 1 ;;
+	esac
+}
+
+resolve_access_context() {
+	access_medium_candidate="$access_medium_argument"
+	[ -n "$access_medium_candidate" ] ||
+		access_medium_candidate="$(uci -q get "cake-autorate.$job_name.access_medium" 2>/dev/null || true)"
+	[ -n "$access_medium_candidate" ] || access_medium_candidate=unknown
+	access_medium="$(canonical_access_medium "$access_medium_candidate")" || return 1
+
+	access_source_candidate="$access_source_argument"
+	[ -n "$access_source_candidate" ] ||
+		access_source_candidate="$(uci -q get "cake-autorate.$job_name.access_medium_source" 2>/dev/null || true)"
+	[ -n "$access_source_candidate" ] || access_source_candidate=legacy_default
+	access_source="$(canonical_access_source "$access_source_candidate")" || return 1
+
+	access_confidence_percent="$access_confidence_argument"
+	[ -n "$access_confidence_percent" ] ||
+		access_confidence_percent="$(uci -q get "cake-autorate.$job_name.access_medium_confidence_percent" 2>/dev/null || true)"
+	[ -n "$access_confidence_percent" ] || access_confidence_percent=0
+	case "$access_confidence_percent" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$access_confidence_percent" -le 100 ] 2>/dev/null || return 1
+
+	capacity_learning_policy_candidate="$capacity_learning_policy_argument"
+	[ -n "$capacity_learning_policy_candidate" ] ||
+		capacity_learning_policy_candidate="$(uci -q get "cake-autorate.$job_name.capacity_learning_policy" 2>/dev/null || true)"
+	if [ -z "$capacity_learning_policy_candidate" ]; then
+		legacy_learning_mode="$(uci -q get "cake-autorate.$job_name.runtime_learning_mode" 2>/dev/null || true)"
+		case "$legacy_learning_mode" in
+			passive) capacity_learning_policy_candidate=passive_bounded ;;
+			periodic_active) capacity_learning_policy_candidate=scheduled_active ;;
+			# The legacy fixed mode meant "do not grow" and did not require
+			# provider-plan caps, so its safe schema-v4 equivalent is verified.
+			fixed) capacity_learning_policy_candidate=verified_only ;;
+		esac
+	fi
+	if [ -z "$capacity_learning_policy_candidate" ] &&
+	   [ "$(uci -q get "cake-autorate.$job_name.scheduled_autotune_enabled" 2>/dev/null)" = 1 ]; then
+		capacity_learning_policy_candidate=scheduled_active
+	fi
+	if [ -z "$capacity_learning_policy_candidate" ] &&
+	   [ "$(uci -q get "cake-autorate.$job_name.adaptive_ceiling_enabled" 2>/dev/null)" = 1 ]; then
+		capacity_learning_policy_candidate=passive_bounded
+	fi
+	# A legacy Variable Link request has no trustworthy physical-medium
+	# provenance. Do not silently turn that ambiguity into permission to grow
+	# beyond the tested ceiling. Strong local evidence or an explicit choice
+	# may retain the historical passive default.
+	if [ -z "$capacity_learning_policy_candidate" ] && [ "$autotune_profile" = variable_link ]; then
+		case "$access_source:$access_medium" in
+			user_selected:unknown|network_protocol:unknown|device_type:unknown|interface_name:unknown)
+				capacity_learning_policy_candidate=verified_only
+				;;
+			user_selected:*|network_protocol:*|device_type:*|interface_name:*)
+				if [ "$access_confidence_percent" -ge 50 ] 2>/dev/null; then
+					capacity_learning_policy_candidate=passive_bounded
+				else
+					capacity_learning_policy_candidate=verified_only
+				fi
+				;;
+			*) capacity_learning_policy_candidate=verified_only ;;
+		esac
+	fi
+	capacity_learning_policy="$(canonical_capacity_learning_policy "$capacity_learning_policy_candidate")" || return 1
+
+	service_dl_cap_kbps="$service_dl_cap_argument"
+	[ -n "$service_dl_cap_kbps" ] ||
+		service_dl_cap_kbps="$(uci -q get "cake-autorate.$job_name.service_dl_cap_kbps" 2>/dev/null || true)"
+	service_ul_cap_kbps="$service_ul_cap_argument"
+	[ -n "$service_ul_cap_kbps" ] ||
+		service_ul_cap_kbps="$(uci -q get "cake-autorate.$job_name.service_ul_cap_kbps" 2>/dev/null || true)"
+	if [ -n "$service_dl_cap_kbps" ]; then
+		is_uint_between "$service_dl_cap_kbps" 100 100000000 || return 1
+	fi
+	if [ -n "$service_ul_cap_kbps" ]; then
+		is_uint_between "$service_ul_cap_kbps" 100 100000000 || return 1
+	fi
+	if [ "$capacity_learning_policy" = fixed_cap ]; then
+		[ -n "$service_dl_cap_kbps" ] && [ -n "$service_ul_cap_kbps" ] || return 1
+	fi
 }
 
 is_positive_uint() {
@@ -689,6 +816,12 @@ read_worker_identity() {
 	identity_conservative=""
 	identity_traffic_budget=""
 	identity_calibration_strategy=""
+	identity_access_medium=""
+	identity_access_source=""
+	identity_access_confidence=""
+	identity_capacity_learning_policy=""
+	identity_service_dl_cap=""
+	identity_service_ul_cap=""
 	owned_regular_file "$pid_file" || return 1
 	identity_pid="$(sed -n '1p' "$pid_file" 2>/dev/null)"
 	identity_starttime="$(sed -n '2p' "$pid_file" 2>/dev/null)"
@@ -703,6 +836,15 @@ read_worker_identity() {
 	[ -n "$identity_traffic_budget" ] || identity_traffic_budget=0
 	identity_calibration_strategy="$(sed -n '11p' "$pid_file" 2>/dev/null)"
 	[ -n "$identity_calibration_strategy" ] || identity_calibration_strategy=full_raw
+	identity_access_medium="$(sed -n '12p' "$pid_file" 2>/dev/null)"
+	[ -n "$identity_access_medium" ] || identity_access_medium=unknown
+	identity_access_source="$(sed -n '13p' "$pid_file" 2>/dev/null)"
+	[ -n "$identity_access_source" ] || identity_access_source=legacy_default
+	identity_access_confidence="$(sed -n '14p' "$pid_file" 2>/dev/null)"
+	[ -n "$identity_access_confidence" ] || identity_access_confidence=0
+	identity_capacity_learning_policy="$(sed -n '15p' "$pid_file" 2>/dev/null)"
+	identity_service_dl_cap="$(sed -n '16p' "$pid_file" 2>/dev/null)"
+	identity_service_ul_cap="$(sed -n '17p' "$pid_file" 2>/dev/null)"
 }
 
 worker_identity_matches() {
@@ -756,7 +898,13 @@ worker_request_matches() {
 	[ "$expected_conservative" = any ] && return 0
 	[ "$identity_conservative" = "$expected_conservative" ] || return 1
 	[ "$identity_traffic_budget" = "$traffic_budget_bytes" ] &&
-		[ "$identity_calibration_strategy" = "$calibration_strategy" ]
+		[ "$identity_calibration_strategy" = "$calibration_strategy" ] &&
+		[ "$identity_access_medium" = "$access_medium" ] &&
+		[ "$identity_access_source" = "$access_source" ] &&
+		[ "$identity_access_confidence" = "$access_confidence_percent" ] &&
+		[ "$identity_capacity_learning_policy" = "$capacity_learning_policy" ] &&
+		[ "$identity_service_dl_cap" = "$service_dl_cap_kbps" ] &&
+		[ "$identity_service_ul_cap" = "$service_ul_cap_kbps" ]
 }
 
 remove_own_worker_identity() {
@@ -1201,7 +1349,7 @@ write_status() {
 	message="$3"
 	current_phase="$phase"
 	worker_trace "status phase=$phase progress=$progress message=$(json_escape "$message")"
-	atomic_write "$status_file" "{\"state\":\"running\",\"phase\":\"$(json_escape "$phase")\",\"progress\":$progress,\"message\":\"$(json_escape "$message")\",\"job_id\":\"$(json_escape "$job_name")\",\"run_id\":\"$(json_escape "${active_run_id:-${worker_token:-pending}}")\",\"requested_target_interface\":\"$(json_escape "$target_if_input")\",\"requested_backend\":\"$(json_escape "$backend_input")\",\"requested_route_mode\":\"$(json_escape "$route_mode_override")\",\"requested_mwan3_member\":\"$(json_escape "$mwan3_member_override")\",\"requested_profile\":\"$(json_escape "$autotune_profile")\",\"requested_conservative\":$([ "${conservative_mode:-0}" = 1 ] && printf true || printf false),\"requested_calibration_strategy\":\"$(json_escape "$calibration_strategy")\"}"
+	atomic_write "$status_file" "{\"state\":\"running\",\"phase\":\"$(json_escape "$phase")\",\"progress\":$progress,\"message\":\"$(json_escape "$message")\",\"job_id\":\"$(json_escape "$job_name")\",\"run_id\":\"$(json_escape "${active_run_id:-${worker_token:-pending}}")\",\"requested_target_interface\":\"$(json_escape "$target_if_input")\",\"requested_backend\":\"$(json_escape "$backend_input")\",\"requested_route_mode\":\"$(json_escape "$route_mode_override")\",\"requested_mwan3_member\":\"$(json_escape "$mwan3_member_override")\",\"requested_profile\":\"$(json_escape "$autotune_profile")\",\"requested_conservative\":$([ "${conservative_mode:-0}" = 1 ] && printf true || printf false),\"requested_calibration_strategy\":\"$(json_escape "$calibration_strategy")\",\"requested_access_medium\":\"$(json_escape "$access_medium")\",\"requested_access_source\":\"$(json_escape "$access_source")\",\"requested_access_confidence_percent\":$access_confidence_percent,\"requested_capacity_learning_policy\":\"$(json_escape "$capacity_learning_policy")\",\"requested_service_dl_cap_kbps\":\"$(json_escape "$service_dl_cap_kbps")\",\"requested_service_ul_cap_kbps\":\"$(json_escape "$service_ul_cap_kbps")\"}"
 }
 
 # A short, RAM-only breadcrumb stream is deliberately written to the worker's
@@ -3693,39 +3841,116 @@ proposal_json_valid() {
 	proposal_target_grade="$(extract_json "$proposal_candidate" '@.target_grade')" || return 1
 	proposal_quality_required="$(extract_json "$proposal_candidate" '@.quality_target_required')" || return 1
 	proposal_throughput_priority="$(extract_json "$proposal_candidate" '@.throughput_priority')" || return 1
-	[ "$proposal_schema" = 3 ] && [ "$proposal_profile" = "$autotune_profile" ] || return 1
+	[ "$proposal_schema" = 4 ] && [ "$proposal_profile" = "$autotune_profile" ] || return 1
 
 	proposal_dl_min="$(extract_json "$proposal_candidate" '@.download.minimum_kbps')" || return 1
+	proposal_dl_exploration_min="$(extract_json "$proposal_candidate" '@.download.exploration_minimum_kbps')" || return 1
+	proposal_dl_runtime_min="$(extract_json "$proposal_candidate" '@.download.runtime_minimum_kbps' 2>/dev/null || true)"
 	proposal_dl_base="$(extract_json "$proposal_candidate" '@.download.base_kbps')" || return 1
 	proposal_dl_max="$(extract_json "$proposal_candidate" '@.download.maximum_kbps')" || return 1
+	proposal_dl_tested_max="$(extract_json "$proposal_candidate" '@.download.tested_safe_maximum_kbps' 2>/dev/null || true)"
+	proposal_dl_exploration_cap="$(extract_json "$proposal_candidate" '@.download.exploration_cap_kbps')" || return 1
 	proposal_dl_cap="$(extract_json "$proposal_candidate" '@.download.absolute_cap_kbps')" || return 1
+	proposal_dl_service_cap="$(extract_json "$proposal_candidate" '@.download.service_hard_cap_kbps' 2>/dev/null || true)"
+	proposal_dl_ceiling_evidence="$(extract_json "$proposal_candidate" '@.download.ceiling_evidence')" || return 1
+	proposal_dl_cap_source="$(extract_json "$proposal_candidate" '@.download.cap_source')" || return 1
 	proposal_dl_low="$(extract_json "$proposal_candidate" '@.download.observed_low_kbps')" || return 1
 	proposal_dl_median="$(extract_json "$proposal_candidate" '@.download.observed_median_kbps')" || return 1
 	proposal_dl_high="$(extract_json "$proposal_candidate" '@.download.observed_high_kbps')" || return 1
 	proposal_ul_min="$(extract_json "$proposal_candidate" '@.upload.minimum_kbps')" || return 1
+	proposal_ul_exploration_min="$(extract_json "$proposal_candidate" '@.upload.exploration_minimum_kbps')" || return 1
+	proposal_ul_runtime_min="$(extract_json "$proposal_candidate" '@.upload.runtime_minimum_kbps' 2>/dev/null || true)"
 	proposal_ul_base="$(extract_json "$proposal_candidate" '@.upload.base_kbps')" || return 1
 	proposal_ul_max="$(extract_json "$proposal_candidate" '@.upload.maximum_kbps')" || return 1
+	proposal_ul_tested_max="$(extract_json "$proposal_candidate" '@.upload.tested_safe_maximum_kbps' 2>/dev/null || true)"
+	proposal_ul_exploration_cap="$(extract_json "$proposal_candidate" '@.upload.exploration_cap_kbps')" || return 1
 	proposal_ul_cap="$(extract_json "$proposal_candidate" '@.upload.absolute_cap_kbps')" || return 1
+	proposal_ul_service_cap="$(extract_json "$proposal_candidate" '@.upload.service_hard_cap_kbps' 2>/dev/null || true)"
+	proposal_ul_ceiling_evidence="$(extract_json "$proposal_candidate" '@.upload.ceiling_evidence')" || return 1
+	proposal_ul_cap_source="$(extract_json "$proposal_candidate" '@.upload.cap_source')" || return 1
 	proposal_ul_low="$(extract_json "$proposal_candidate" '@.upload.observed_low_kbps')" || return 1
 	proposal_ul_median="$(extract_json "$proposal_candidate" '@.upload.observed_median_kbps')" || return 1
 	proposal_ul_high="$(extract_json "$proposal_candidate" '@.upload.observed_high_kbps')" || return 1
 	for proposal_rate in \
-		"$proposal_dl_min" "$proposal_dl_base" "$proposal_dl_max" "$proposal_dl_cap" \
+		"$proposal_dl_min" "$proposal_dl_exploration_min" "$proposal_dl_base" \
+		"$proposal_dl_max" "$proposal_dl_exploration_cap" "$proposal_dl_cap" \
 		"$proposal_dl_low" "$proposal_dl_median" "$proposal_dl_high" \
-		"$proposal_ul_min" "$proposal_ul_base" "$proposal_ul_max" "$proposal_ul_cap" \
+		"$proposal_ul_min" "$proposal_ul_exploration_min" "$proposal_ul_base" \
+		"$proposal_ul_max" "$proposal_ul_exploration_cap" "$proposal_ul_cap" \
 		"$proposal_ul_low" "$proposal_ul_median" "$proposal_ul_high"; do
 		is_uint_between "$proposal_rate" 100 100000000 || return 1
 	done
-	[ "$proposal_dl_min" -le "$proposal_dl_base" ] &&
+	[ "$proposal_dl_exploration_min" -le "$proposal_dl_min" ] &&
+		[ "$proposal_dl_min" -le "$proposal_dl_base" ] &&
 		[ "$proposal_dl_base" -le "$proposal_dl_max" ] &&
 		[ "$proposal_dl_max" -le "$proposal_dl_cap" ] &&
+		[ "$proposal_dl_cap" -le "$proposal_dl_exploration_cap" ] &&
 		[ "$proposal_dl_low" -le "$proposal_dl_median" ] &&
 		[ "$proposal_dl_median" -le "$proposal_dl_high" ] || return 1
-	[ "$proposal_ul_min" -le "$proposal_ul_base" ] &&
+	[ "$proposal_ul_exploration_min" -le "$proposal_ul_min" ] &&
+		[ "$proposal_ul_min" -le "$proposal_ul_base" ] &&
 		[ "$proposal_ul_base" -le "$proposal_ul_max" ] &&
 		[ "$proposal_ul_max" -le "$proposal_ul_cap" ] &&
+		[ "$proposal_ul_cap" -le "$proposal_ul_exploration_cap" ] &&
 		[ "$proposal_ul_low" -le "$proposal_ul_median" ] &&
 		[ "$proposal_ul_median" -le "$proposal_ul_high" ] || return 1
+	for proposal_optional_rate in \
+		"$proposal_dl_runtime_min" "$proposal_dl_tested_max" "$proposal_dl_service_cap" \
+		"$proposal_ul_runtime_min" "$proposal_ul_tested_max" "$proposal_ul_service_cap"; do
+		[ -z "$proposal_optional_rate" ] || is_uint_between "$proposal_optional_rate" 100 100000000 || return 1
+	done
+	[ -z "$proposal_dl_runtime_min" ] || [ "$proposal_dl_runtime_min" = "$proposal_dl_min" ] || return 1
+	[ -z "$proposal_ul_runtime_min" ] || [ "$proposal_ul_runtime_min" = "$proposal_ul_min" ] || return 1
+	case "$proposal_dl_ceiling_evidence:$proposal_dl_tested_max" in
+		unvalidated_candidate:) ;;
+		shaped_validation:*|retained_configuration:*)
+			[ -n "$proposal_dl_tested_max" ] && [ "$proposal_dl_tested_max" = "$proposal_dl_max" ] || return 1
+			;;
+		*) return 1 ;;
+	esac
+	case "$proposal_ul_ceiling_evidence:$proposal_ul_tested_max" in
+		unvalidated_candidate:) ;;
+		shaped_validation:*|retained_configuration:*)
+			[ -n "$proposal_ul_tested_max" ] && [ "$proposal_ul_tested_max" = "$proposal_ul_max" ] || return 1
+			;;
+		*) return 1 ;;
+	esac
+	case "$proposal_dl_cap_source" in measured_raw|user_service_limit|retained_configuration) ;; *) return 1 ;; esac
+	case "$proposal_ul_cap_source" in measured_raw|user_service_limit|retained_configuration) ;; *) return 1 ;; esac
+	[ "$proposal_dl_cap_source" = retained_configuration ] ||
+		[ "$proposal_dl_high" -le "$proposal_dl_exploration_cap" ] || return 1
+	[ "$proposal_ul_cap_source" = retained_configuration ] ||
+		[ "$proposal_ul_high" -le "$proposal_ul_exploration_cap" ] || return 1
+	[ -z "$proposal_dl_service_cap" ] || [ "$proposal_dl_cap" -le "$proposal_dl_service_cap" ] || return 1
+	[ -z "$proposal_ul_service_cap" ] || [ "$proposal_ul_cap" -le "$proposal_ul_service_cap" ] || return 1
+	if [ "$proposal_dl_cap_source" = user_service_limit ]; then
+		[ -n "$proposal_dl_service_cap" ] &&
+			[ "$proposal_dl_cap" = "$proposal_dl_service_cap" ] || return 1
+	fi
+	if [ "$proposal_ul_cap_source" = user_service_limit ]; then
+		[ -n "$proposal_ul_service_cap" ] &&
+			[ "$proposal_ul_cap" = "$proposal_ul_service_cap" ] || return 1
+	fi
+	if [ "$proposal_profile" = variable_link ]; then
+		case "$proposal_dl_cap_source" in
+			measured_raw)
+				[ "$proposal_dl_cap" = "$proposal_dl_high" ] &&
+					[ "$proposal_dl_exploration_cap" = "$proposal_dl_high" ] || return 1
+				;;
+			user_service_limit)
+				[ "$proposal_dl_exploration_cap" = "$proposal_dl_high" ] || return 1
+				;;
+		esac
+		case "$proposal_ul_cap_source" in
+			measured_raw)
+				[ "$proposal_ul_cap" = "$proposal_ul_high" ] &&
+					[ "$proposal_ul_exploration_cap" = "$proposal_ul_high" ] || return 1
+				;;
+			user_service_limit)
+				[ "$proposal_ul_exploration_cap" = "$proposal_ul_high" ] || return 1
+				;;
+		esac
+	fi
 
 	proposal_active="$(extract_json "$proposal_candidate" '@.active_threshold_kbps')" || return 1
 	proposal_adjust_up="$(extract_json "$proposal_candidate" '@.thresholds_ms.adjust_up')" || return 1
@@ -3746,7 +3971,25 @@ proposal_json_valid() {
 	proposal_adaptive_probe="$(extract_json "$proposal_candidate" '@.adaptive_ceiling.probe_s')" || return 1
 	proposal_adaptive_cooldown="$(extract_json "$proposal_candidate" '@.adaptive_ceiling.cooldown_s')" || return 1
 	proposal_adaptive_ttl="$(extract_json "$proposal_candidate" '@.adaptive_ceiling.failed_bound_ttl_s')" || return 1
+	proposal_capacity_learning_policy="$(extract_json "$proposal_candidate" '@.adaptive_ceiling.policy')" || return 1
+	proposal_access_medium="$(extract_json "$proposal_candidate" '@.access.medium')" || return 1
+	proposal_access_source="$(extract_json "$proposal_candidate" '@.access.source')" || return 1
+	proposal_access_confidence="$(extract_json "$proposal_candidate" '@.access.confidence_percent')" || return 1
 	case "$proposal_adaptive_enabled" in true|false) ;; *) return 1 ;; esac
+	case "$proposal_capacity_learning_policy:$proposal_adaptive_enabled" in
+		passive_bounded:true|scheduled_active:true|verified_only:false|fixed_cap:false) ;;
+		*) return 1 ;;
+	esac
+	[ "$proposal_access_medium" = "$access_medium" ] &&
+		[ "$proposal_access_source" = "$access_source" ] &&
+		[ "$proposal_access_confidence" = "$access_confidence_percent" ] || return 1
+	if [ -n "$capacity_learning_policy" ]; then
+		[ "$proposal_capacity_learning_policy" = "$capacity_learning_policy" ] || return 1
+	fi
+	[ -z "$service_dl_cap_kbps" ] ||
+		[ "$proposal_dl_service_cap" = "$service_dl_cap_kbps" ] || return 1
+	[ -z "$service_ul_cap_kbps" ] ||
+		[ "$proposal_ul_service_cap" = "$service_ul_cap_kbps" ] || return 1
 	is_uint_between "$proposal_adaptive_hold" 1 86400 || return 1
 	is_decimal_between "$proposal_adaptive_growth" 0.1 10 || return 1
 	is_uint_between "$proposal_adaptive_probe" 1 3600 || return 1
@@ -4819,7 +5062,20 @@ calculate_proposal() {
 	ul_base_scale="${2:-$dl_base_scale}"
 	dl_runtime_minimum="${3:-}"
 	ul_runtime_minimum="${4:-}"
-	set --
+	dl_tested_safe_maximum="${5:-}"
+	ul_tested_safe_maximum="${6:-}"
+	set -- --access-medium "$access_medium" \
+		--access-source "$access_source" \
+		--access-confidence-percent "$access_confidence_percent"
+	if [ -n "$capacity_learning_policy" ]; then
+		set -- "$@" --capacity-learning-policy "$capacity_learning_policy"
+	fi
+	if [ -n "$service_dl_cap_kbps" ]; then
+		set -- "$@" --dl-service-cap-kbps "$service_dl_cap_kbps"
+	fi
+	if [ -n "$service_ul_cap_kbps" ]; then
+		set -- "$@" --ul-service-cap-kbps "$service_ul_cap_kbps"
+	fi
 	if [ -n "$dl_runtime_minimum" ]; then
 		is_positive_uint "$dl_runtime_minimum" || return 1
 		set -- "$@" --dl-runtime-min-kbps "$dl_runtime_minimum"
@@ -4827,6 +5083,14 @@ calculate_proposal() {
 	if [ -n "$ul_runtime_minimum" ]; then
 		is_positive_uint "$ul_runtime_minimum" || return 1
 		set -- "$@" --ul-runtime-min-kbps "$ul_runtime_minimum"
+	fi
+	if [ -n "$dl_tested_safe_maximum" ]; then
+		is_positive_uint "$dl_tested_safe_maximum" || return 1
+		set -- "$@" --dl-tested-safe-max-kbps "$dl_tested_safe_maximum"
+	fi
+	if [ -n "$ul_tested_safe_maximum" ]; then
+		is_positive_uint "$ul_tested_safe_maximum" || return 1
+		set -- "$@" --ul-tested-safe-max-kbps "$ul_tested_safe_maximum"
 	fi
 	if [ "${conservative_mode:-0}" = 1 ]; then
 		"$daemon_bin" --autotune-proposal \
@@ -6704,10 +6968,13 @@ set_exact_profile_candidates() {
 	desired_ul_kbps="$2"
 	desired_dl_runtime_minimum="${3:-}"
 	desired_ul_runtime_minimum="${4:-}"
+	desired_dl_tested_safe_maximum="${5:-}"
+	desired_ul_tested_safe_maximum="${6:-}"
 	dl_revision_scale="$(scale_for_reference_base "$desired_dl_kbps" "$reference_dl_base")" || return 1
 	ul_revision_scale="$(scale_for_reference_base "$desired_ul_kbps" "$reference_ul_base")" || return 1
 	proposal_candidate="$(calculate_proposal "$dl_revision_scale" "$ul_revision_scale" \
-		"$desired_dl_runtime_minimum" "$desired_ul_runtime_minimum")" || return 1
+		"$desired_dl_runtime_minimum" "$desired_ul_runtime_minimum" \
+		"$desired_dl_tested_safe_maximum" "$desired_ul_tested_safe_maximum")" || return 1
 	proposal_json_valid "$proposal_candidate" || return 1
 	proposal="$proposal_candidate"
 	realized_dl_candidate="$(extract_json "$proposal" '@.download.base_kbps')"
@@ -7011,7 +7278,13 @@ run_job() {
 			   [ "$identity_profile" = "$autotune_profile" ] &&
 			   [ "$identity_conservative" = "$conservative_mode" ] &&
 			   [ "$identity_traffic_budget" = "$traffic_budget_bytes" ] &&
-			   [ "$identity_calibration_strategy" = "$calibration_strategy" ]; then
+			   [ "$identity_calibration_strategy" = "$calibration_strategy" ] &&
+			   [ "$identity_access_medium" = "$access_medium" ] &&
+			   [ "$identity_access_source" = "$access_source" ] &&
+			   [ "$identity_access_confidence" = "$access_confidence_percent" ] &&
+			   [ "$identity_capacity_learning_policy" = "$capacity_learning_policy" ] &&
+			   [ "$identity_service_dl_cap" = "$service_dl_cap_kbps" ] &&
+			   [ "$identity_service_ul_cap" = "$service_ul_cap_kbps" ]; then
 				worker_registered=true
 				break
 			fi
@@ -7280,14 +7553,14 @@ run_job() {
 	# clean, repeated safety proof.
 	dl_runtime_minimum_valid=true
 	ul_runtime_minimum_valid=true
+	final_dl_runtime_minimum=""
+	final_ul_runtime_minimum=""
 	if [ "$autotune_profile" = variable_link ] || [ "$autotune_profile" = gaming_extreme ]; then
 		dl_runtime_minimum_valid=false
 		ul_runtime_minimum_valid=false
 		is_positive_uint "$dl_search_runtime_minimum" && dl_runtime_minimum_valid=true
 		is_positive_uint "$ul_search_runtime_minimum" && ul_runtime_minimum_valid=true
 		if [ "$dl_runtime_minimum_valid" = true ] || [ "$ul_runtime_minimum_valid" = true ]; then
-			final_dl_runtime_minimum=""
-			final_ul_runtime_minimum=""
 			[ "$dl_runtime_minimum_valid" = true ] && final_dl_runtime_minimum="$dl_search_runtime_minimum"
 			[ "$ul_runtime_minimum_valid" = true ] && final_ul_runtime_minimum="$ul_search_runtime_minimum"
 			set_exact_profile_candidates "$selected_dl_candidate" "$selected_ul_candidate" \
@@ -7309,6 +7582,19 @@ run_job() {
 	# ACK starvation, cross-direction interference, and joint bufferbloat without
 	# multiplying the traffic cost of every search observation.
 	run_bidirectional_confirmation "$((validation_attempt_number + 1))"
+	# Promote only exact candidates which already passed their independent
+	# directional safety gates.  Base selection alone is not ceiling evidence;
+	# rebuilding here keeps failed/uncontrolled points explicitly unvalidated.
+	final_dl_tested_safe_maximum=""
+	final_ul_tested_safe_maximum=""
+	[ "$dl_search_selected_safety" = true ] && final_dl_tested_safe_maximum="$selected_dl_candidate"
+	[ "$ul_search_selected_safety" = true ] && final_ul_tested_safe_maximum="$selected_ul_candidate"
+	if [ -n "$final_dl_tested_safe_maximum" ] || [ -n "$final_ul_tested_safe_maximum" ]; then
+		set_exact_profile_candidates "$selected_dl_candidate" "$selected_ul_candidate" \
+			"$final_dl_runtime_minimum" "$final_ul_runtime_minimum" \
+			"$final_dl_tested_safe_maximum" "$final_ul_tested_safe_maximum" ||
+			fail "Unable to bind the validated shaped candidates to their ceiling evidence."
+	fi
 	build_directional_recommendation
 	directional_safe_alternative=false
 	case "$(extract_json "$directional_recommendation_json" '@.recommended_topology')" in
@@ -7512,7 +7798,9 @@ start_job() {
 	launch_result="$($procd_job_bin launch "$procd_service_name" worker "$log_file" "$0" \
 		"$job_name" "$target_if_input" job-run "$backend" "$route_mode_override" \
 		"$mwan3_member_override" "$autotune_profile" "$start_conservative" "$new_token" \
-		"$traffic_budget_bytes" "$calibration_strategy" 2>/dev/null)" || {
+		"$traffic_budget_bytes" "$calibration_strategy" "$access_medium" "$access_source" \
+		"$access_confidence_percent" "$capacity_learning_policy" "$service_dl_cap_kbps" \
+		"$service_ul_cap_kbps" 2>/dev/null)" || {
 		launch_error="$(extract_json "$launch_result" '@.error' 2>/dev/null || true)"
 		json_error "${launch_error:-Unable to register the Full Auto-Tune worker with procd.}"
 	}
@@ -7524,10 +7812,12 @@ start_job() {
 			kill -TERM "$pid" 2>/dev/null || true
 		json_error "Unable to establish an isolated Full Auto-Tune worker process group."
 	fi
-	worker_identity="$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s' \
+	worker_identity="$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s' \
 		"$pid" "$launch_starttime" "$new_token" "$target_if_input" "$backend_input" \
 		"$route_mode_override" "$mwan3_member_override" "$autotune_profile" "$start_conservative" \
-		"$traffic_budget_bytes" "$calibration_strategy")"
+		"$traffic_budget_bytes" "$calibration_strategy" "$access_medium" "$access_source" \
+		"$access_confidence_percent" "$capacity_learning_policy" "$service_dl_cap_kbps" \
+		"$service_ul_cap_kbps")"
 	atomic_write "$pid_file" "$worker_identity" || {
 		[ "$(proc_starttime "$pid" 2>/dev/null)" = "$launch_starttime" ] &&
 			kill -TERM "$pid" 2>/dev/null || true
@@ -7701,6 +7991,12 @@ cancel_job() {
 			conservative_mode="$identity_conservative"
 			traffic_budget_bytes="$identity_traffic_budget"
 			calibration_strategy="$identity_calibration_strategy"
+			access_medium="$identity_access_medium"
+			access_source="$identity_access_source"
+			access_confidence_percent="$identity_access_confidence"
+			capacity_learning_policy="$identity_capacity_learning_policy"
+			service_dl_cap_kbps="$identity_service_dl_cap"
+			service_ul_cap_kbps="$identity_service_ul_cap"
 			: > "$cancel_file"
 			write_status cancelling 0 "Cancelling Full Auto-Tune and restoring temporary speed-test/SQM state"
 			kill -TERM "$pid" 2>/dev/null || true
@@ -7724,6 +8020,7 @@ safe_job_name "$job_name" || json_error "Invalid autotune job name."
 safe_interface_name "$target_if_input" || json_error "Invalid target interface."
 resolve_autotune_profile || json_error "Unsupported Full Auto-Tune profile."
 resolve_calibration_strategy || json_error "Unsupported Full Auto-Tune calibration strategy."
+resolve_access_context || json_error "Unsupported or incomplete Variable Link access context."
 case "$conservative_override" in 0|1) ;; *) json_error "Invalid conservative Full Auto-Tune flag." ;; esac
 traffic_budget_bytes="$(uint53_normalize "$traffic_budget_bytes")" ||
 	json_error "Invalid or out-of-range Full Auto-Tune traffic budget."

@@ -12,7 +12,8 @@ instance only after identifying the intended uplink.
    `wan — pppoe-wan — eth2`. For a normal single-WAN router use **Main routing
    table**. On nftables mwan3 select the member that resolves to this same L3
    device.
-3. Choose **Full Auto-Tune**, then make three independent choices:
+3. Choose **Full Auto-Tune**, then choose calibration strategy and operating
+   profile. Variable Link opens an additional access/capacity mini-wizard:
 
    - **Calibration strategy:** **Shaped only** is the recommended low-disruption
      start; **Full raw capacity** temporarily bypasses only the selected managed
@@ -22,10 +23,6 @@ instance only after identifying the intended uplink.
      positive download and upload P50 references for that instance. Until then
      the choice is disabled with an explanation; an imported stale reuse choice
      safely falls back to Shaped only.
-   - **Runtime learning:** **Passive only** learns from real saturated traffic;
-     **Periodic active probes** is opt-in and consumes the configured
-     daily/monthly allowance; **Fixed bounds** performs no synthetic growth
-     tests.
    - **Operating profile:**
 
      - **Best overall** is recommended for most links. It finds the fastest safe
@@ -45,14 +42,30 @@ instance only after identifying the intended uplink.
      from the scheduler, and any result below 70% requires explicit manual
      review. It is not recommended as a permanent household configuration.
      - **Variable link** is intended for 4G/5G, satellite and other changing
-     links. It explores down to 35% only to measure the point at which further
-     CAKE reduction stops improving loaded latency. The runtime minimum is
-     written only from an actually tested point; noisy or uncontrolled curves
-     remain diagnostic-only.
+     links. Its mini-wizard shows the detected access medium and confidence,
+     but deliberately treats PPPoE/DHCP/Ethernet as inconclusive. Select
+     cellular, LEO/GEO satellite, fixed wireless/WISP, shared wired, or unknown
+     when Auto cannot prove it. Cellular/LEO explores to 35%, GEO/fixed
+     wireless to 40%, and shared/unknown to 50% only to locate the point at
+     which further CAKE reduction stops improving loaded latency. The runtime
+     minimum is written only from an actually tested point; noisy or
+     uncontrolled curves remain diagnostic-only.
      - **Fair** maximizes safe throughput with a 90% observed-low-capacity
      objective. C is a soft goal: among candidates within 1.5% of
      the fastest result, lower loaded delay wins. This favors sustained large
      downloads/uploads over the strictest latency.
+
+   - **Variable Link runtime capacity learning:**
+
+     - **Validated ceiling only** never raises the exact tested ceiling and is
+       the automatic default when access detection is inconclusive.
+     - **Bounded learning from real traffic** probes upward only during real
+       sustained load with clean transport latency and useful throughput gain.
+     - **Bounded + scheduled active calibration** additionally reruns the
+       traffic-generating calibration in its maintenance window. Configure the
+       daily/monthly byte budgets first.
+     - **Explicit service hard caps** require both directions. Those caps may
+       tighten the measured raw limit but never expand it.
 
    Existing instances without a saved profile default to Best overall.
 4. Stop large downloads and uploads first. The

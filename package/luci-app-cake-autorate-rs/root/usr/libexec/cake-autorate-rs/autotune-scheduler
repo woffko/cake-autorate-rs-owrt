@@ -618,19 +618,33 @@ result_proposal_is_safe() {
 	proposal_target_grade="$(extract "$proposal_json" '@.proposal.target_grade')"
 	proposal_quality_required="$(extract "$proposal_json" '@.proposal.quality_target_required')"
 	proposal_throughput_priority="$(extract "$proposal_json" '@.proposal.throughput_priority')"
-	[ "$proposal_schema" = 3 ] && [ "$result_profile" = "$proposal_profile" ] || return 1
+	[ "$proposal_schema" = 4 ] && [ "$result_profile" = "$proposal_profile" ] || return 1
 	case "$result_profile" in gaming|best_overall|variable_link|fair) ;; *) return 1 ;; esac
 	dl_min="$(extract "$proposal_json" '@.proposal.download.minimum_kbps')"
+	dl_exploration_min="$(extract "$proposal_json" '@.proposal.download.exploration_minimum_kbps')"
+	dl_runtime_min="$(extract "$proposal_json" '@.proposal.download.runtime_minimum_kbps')"
 	dl_base="$(extract "$proposal_json" '@.proposal.download.base_kbps')"
 	dl_max="$(extract "$proposal_json" '@.proposal.download.maximum_kbps')"
+	dl_tested_max="$(extract "$proposal_json" '@.proposal.download.tested_safe_maximum_kbps')"
 	dl_cap="$(extract "$proposal_json" '@.proposal.download.absolute_cap_kbps')"
+	dl_exploration_cap="$(extract "$proposal_json" '@.proposal.download.exploration_cap_kbps')"
+	dl_service_cap="$(extract "$proposal_json" '@.proposal.download.service_hard_cap_kbps')"
+	dl_ceiling_evidence="$(extract "$proposal_json" '@.proposal.download.ceiling_evidence')"
+	dl_cap_source="$(extract "$proposal_json" '@.proposal.download.cap_source')"
 	dl_low="$(extract "$proposal_json" '@.proposal.download.observed_low_kbps')"
 	dl_median="$(extract "$proposal_json" '@.proposal.download.observed_median_kbps')"
 	dl_high="$(extract "$proposal_json" '@.proposal.download.observed_high_kbps')"
 	ul_min="$(extract "$proposal_json" '@.proposal.upload.minimum_kbps')"
+	ul_exploration_min="$(extract "$proposal_json" '@.proposal.upload.exploration_minimum_kbps')"
+	ul_runtime_min="$(extract "$proposal_json" '@.proposal.upload.runtime_minimum_kbps')"
 	ul_base="$(extract "$proposal_json" '@.proposal.upload.base_kbps')"
 	ul_max="$(extract "$proposal_json" '@.proposal.upload.maximum_kbps')"
+	ul_tested_max="$(extract "$proposal_json" '@.proposal.upload.tested_safe_maximum_kbps')"
 	ul_cap="$(extract "$proposal_json" '@.proposal.upload.absolute_cap_kbps')"
+	ul_exploration_cap="$(extract "$proposal_json" '@.proposal.upload.exploration_cap_kbps')"
+	ul_service_cap="$(extract "$proposal_json" '@.proposal.upload.service_hard_cap_kbps')"
+	ul_ceiling_evidence="$(extract "$proposal_json" '@.proposal.upload.ceiling_evidence')"
+	ul_cap_source="$(extract "$proposal_json" '@.proposal.upload.cap_source')"
 	ul_low="$(extract "$proposal_json" '@.proposal.upload.observed_low_kbps')"
 	ul_median="$(extract "$proposal_json" '@.proposal.upload.observed_median_kbps')"
 	ul_high="$(extract "$proposal_json" '@.proposal.upload.observed_high_kbps')"
@@ -643,6 +657,11 @@ result_proposal_is_safe() {
 	adaptive_probe="$(extract "$proposal_json" '@.proposal.adaptive_ceiling.probe_s')"
 	adaptive_cooldown="$(extract "$proposal_json" '@.proposal.adaptive_ceiling.cooldown_s')"
 	adaptive_ttl="$(extract "$proposal_json" '@.proposal.adaptive_ceiling.failed_bound_ttl_s')"
+	adaptive_enabled="$(extract "$proposal_json" '@.proposal.adaptive_ceiling.enabled')"
+	capacity_learning_policy="$(extract "$proposal_json" '@.proposal.adaptive_ceiling.policy')"
+	access_medium="$(extract "$proposal_json" '@.proposal.access.medium')"
+	access_source="$(extract "$proposal_json" '@.proposal.access.source')"
+	access_confidence="$(extract "$proposal_json" '@.proposal.access.confidence_percent')"
 	link_overhead="$(extract "$proposal_json" '@.proposal.link.overhead')"
 	link_mpu="$(extract "$proposal_json" '@.proposal.link.mpu')"
 	link_layer="$(extract "$proposal_json" '@.proposal.link.layer')"
@@ -670,15 +689,56 @@ result_proposal_is_safe() {
 	sqm_iqdisc_opts="$(extract "$proposal_json" '@.proposal.sqm.iqdisc_opts')"
 	sqm_eqdisc_opts="$(extract "$proposal_json" '@.proposal.sqm.eqdisc_opts')"
 
-	for rate_value in "$dl_min" "$dl_base" "$dl_max" "$dl_cap" "$dl_low" "$dl_median" "$dl_high" \
-		"$ul_min" "$ul_base" "$ul_max" "$ul_cap" "$ul_low" "$ul_median" "$ul_high"
+	for rate_value in "$dl_exploration_min" "$dl_min" "$dl_base" "$dl_max" "$dl_tested_max" \
+		"$dl_cap" "$dl_exploration_cap" "$dl_low" "$dl_median" "$dl_high" \
+		"$ul_exploration_min" "$ul_min" "$ul_base" "$ul_max" "$ul_tested_max" \
+		"$ul_cap" "$ul_exploration_cap" "$ul_low" "$ul_median" "$ul_high"
 	do
 		is_uint_between "$rate_value" 100 100000000 || return 1
 	done
-	[ "$dl_min" -le "$dl_base" ] && [ "$dl_base" -le "$dl_max" ] && [ "$dl_max" -le "$dl_cap" ] || return 1
-	[ "$ul_min" -le "$ul_base" ] && [ "$ul_base" -le "$ul_max" ] && [ "$ul_max" -le "$ul_cap" ] || return 1
-	[ "$dl_low" -le "$dl_median" ] && [ "$dl_median" -le "$dl_high" ] && [ "$dl_high" -le "$dl_cap" ] || return 1
-	[ "$ul_low" -le "$ul_median" ] && [ "$ul_median" -le "$ul_high" ] && [ "$ul_high" -le "$ul_cap" ] || return 1
+	[ "$dl_exploration_min" -le "$dl_min" ] && [ "$dl_min" -le "$dl_base" ] &&
+		[ "$dl_base" -le "$dl_max" ] && [ "$dl_max" -le "$dl_cap" ] &&
+		[ "$dl_cap" -le "$dl_exploration_cap" ] || return 1
+	[ "$ul_exploration_min" -le "$ul_min" ] && [ "$ul_min" -le "$ul_base" ] &&
+		[ "$ul_base" -le "$ul_max" ] && [ "$ul_max" -le "$ul_cap" ] &&
+		[ "$ul_cap" -le "$ul_exploration_cap" ] || return 1
+	[ -z "$dl_runtime_min" ] || { is_uint_between "$dl_runtime_min" 100 100000000 &&
+		[ "$dl_runtime_min" = "$dl_min" ] && [ "$dl_runtime_min" -ge "$dl_exploration_min" ]; } || return 1
+	[ -z "$ul_runtime_min" ] || { is_uint_between "$ul_runtime_min" 100 100000000 &&
+		[ "$ul_runtime_min" = "$ul_min" ] && [ "$ul_runtime_min" -ge "$ul_exploration_min" ]; } || return 1
+	[ "$dl_tested_max" = "$dl_max" ] && [ "$ul_tested_max" = "$ul_max" ] || return 1
+	case "$dl_ceiling_evidence" in shaped_validation|retained_configuration) ;; *) return 1 ;; esac
+	case "$ul_ceiling_evidence" in shaped_validation|retained_configuration) ;; *) return 1 ;; esac
+	case "$dl_cap_source" in measured_raw|user_service_limit|retained_configuration) ;; *) return 1 ;; esac
+	case "$ul_cap_source" in measured_raw|user_service_limit|retained_configuration) ;; *) return 1 ;; esac
+	[ -z "$dl_service_cap" ] || { is_uint_between "$dl_service_cap" 1 100000000 &&
+		[ "$dl_cap" -le "$dl_service_cap" ]; } || return 1
+	[ -z "$ul_service_cap" ] || { is_uint_between "$ul_service_cap" 1 100000000 &&
+		[ "$ul_cap" -le "$ul_service_cap" ]; } || return 1
+	[ "$dl_cap_source" != user_service_limit ] || { [ -n "$dl_service_cap" ] &&
+		[ "$dl_cap" = "$dl_service_cap" ]; } || return 1
+	[ "$ul_cap_source" != user_service_limit ] || { [ -n "$ul_service_cap" ] &&
+		[ "$ul_cap" = "$ul_service_cap" ]; } || return 1
+	[ "$dl_low" -le "$dl_median" ] && [ "$dl_median" -le "$dl_high" ] || return 1
+	[ "$ul_low" -le "$ul_median" ] && [ "$ul_median" -le "$ul_high" ] || return 1
+	[ "$dl_cap_source" = retained_configuration ] ||
+		[ "$dl_high" -le "$dl_exploration_cap" ] || return 1
+	[ "$ul_cap_source" = retained_configuration ] ||
+		[ "$ul_high" -le "$ul_exploration_cap" ] || return 1
+	if [ "$result_profile" = variable_link ]; then
+		case "$dl_cap_source" in
+			measured_raw)
+				[ "$dl_cap" = "$dl_high" ] && [ "$dl_exploration_cap" = "$dl_high" ] || return 1 ;;
+			user_service_limit)
+				[ "$dl_exploration_cap" = "$dl_high" ] || return 1 ;;
+		esac
+		case "$ul_cap_source" in
+			measured_raw)
+				[ "$ul_cap" = "$ul_high" ] && [ "$ul_exploration_cap" = "$ul_high" ] || return 1 ;;
+			user_service_limit)
+				[ "$ul_exploration_cap" = "$ul_high" ] || return 1 ;;
+		esac
+	fi
 	is_uint_between "$active_threshold" 1 20000 || return 1
 	[ "$active_threshold" -le "$dl_min" ] && [ "$active_threshold" -le "$ul_min" ] || return 1
 	is_uint_between "$adjust_up" 1 200 || return 1
@@ -690,6 +750,16 @@ result_proposal_is_safe() {
 	is_uint_between "$adaptive_probe" 1 3600 || return 1
 	is_uint_between "$adaptive_cooldown" 0 86400 || return 1
 	is_uint_between "$adaptive_ttl" 1 604800 || return 1
+	case "$access_medium" in cellular|leo_satellite|geo_satellite|fixed_wireless|shared_wired|unknown) ;; *) return 1 ;; esac
+	case "$access_source" in user_selected|network_protocol|device_type|interface_name|auto_inconclusive|legacy_default) ;; *) return 1 ;; esac
+	is_uint_between "$access_confidence" 0 100 || return 1
+	case "$capacity_learning_policy:$adaptive_enabled" in
+		passive_bounded:true|scheduled_active:true|verified_only:false|fixed_cap:false) ;;
+		*) return 1 ;;
+	esac
+	if [ "$capacity_learning_policy" = fixed_cap ]; then
+		[ -n "$dl_service_cap" ] && [ -n "$ul_service_cap" ] || return 1
+	fi
 	is_uint_between "$link_overhead" 0 1500 || return 1
 	is_uint_between "$link_mpu" 0 65535 || return 1
 	is_uint_between "$proposal_confidence" 1 100 || return 1
@@ -1195,13 +1265,21 @@ apply_result() (
 	dl_min="$(extract "$result" '@.proposal.download.minimum_kbps')"
 	dl_base="$(extract "$result" '@.proposal.download.base_kbps')"
 	dl_max="$(extract "$result" '@.proposal.download.maximum_kbps')"
+	dl_tested_max="$(extract "$result" '@.proposal.download.tested_safe_maximum_kbps')"
 	dl_cap="$(extract "$result" '@.proposal.download.absolute_cap_kbps')"
+	dl_service_cap="$(extract "$result" '@.proposal.download.service_hard_cap_kbps')"
+	dl_ceiling_evidence="$(extract "$result" '@.proposal.download.ceiling_evidence')"
+	dl_cap_source="$(extract "$result" '@.proposal.download.cap_source')"
 	dl_low="$(extract "$result" '@.proposal.download.observed_low_kbps')"
 	dl_median="$(extract "$result" '@.proposal.download.observed_median_kbps')"
 	ul_min="$(extract "$result" '@.proposal.upload.minimum_kbps')"
 	ul_base="$(extract "$result" '@.proposal.upload.base_kbps')"
 	ul_max="$(extract "$result" '@.proposal.upload.maximum_kbps')"
+	ul_tested_max="$(extract "$result" '@.proposal.upload.tested_safe_maximum_kbps')"
 	ul_cap="$(extract "$result" '@.proposal.upload.absolute_cap_kbps')"
+	ul_service_cap="$(extract "$result" '@.proposal.upload.service_hard_cap_kbps')"
+	ul_ceiling_evidence="$(extract "$result" '@.proposal.upload.ceiling_evidence')"
+	ul_cap_source="$(extract "$result" '@.proposal.upload.cap_source')"
 	ul_low="$(extract "$result" '@.proposal.upload.observed_low_kbps')"
 	ul_median="$(extract "$result" '@.proposal.upload.observed_median_kbps')"
 	profile="$(extract "$result" '@.profile')"
@@ -1215,6 +1293,11 @@ apply_result() (
 	sqm_egress_ecn="$(extract "$result" '@.proposal.sqm.egress_ecn')"
 	sqm_iqdisc_opts="$(extract "$result" '@.proposal.sqm.iqdisc_opts')"
 	sqm_eqdisc_opts="$(extract "$result" '@.proposal.sqm.eqdisc_opts')"
+	adaptive_enabled="$(extract "$result" '@.proposal.adaptive_ceiling.enabled')"
+	capacity_learning_policy="$(extract "$result" '@.proposal.adaptive_ceiling.policy')"
+	access_medium="$(extract "$result" '@.proposal.access.medium')"
+	access_source="$(extract "$result" '@.proposal.access.source')"
+	access_confidence="$(extract "$result" '@.proposal.access.confidence_percent')"
 	result_is_auto_apply_eligible "$result" || exit 1
 	configuration_has_pending_changes || exit 1
 	result_matches_apply_context "$section" "$expected_interface" "$expected_fingerprint" "$result" || exit 1
@@ -1228,6 +1311,52 @@ apply_result() (
 	stage_candidate_option sqm_upload "$ul_base" || exit 1
 	stage_candidate_option adaptive_ceiling_dl_cap_kbps "$dl_cap" || exit 1
 	stage_candidate_option adaptive_ceiling_ul_cap_kbps "$ul_cap" || exit 1
+	stage_candidate_option adaptive_ceiling_dl_safe_kbps "$dl_tested_max" || exit 1
+	stage_candidate_option adaptive_ceiling_ul_safe_kbps "$ul_tested_max" || exit 1
+	stage_candidate_option adaptive_ceiling_dl_evidence "$dl_ceiling_evidence" || exit 1
+	stage_candidate_option adaptive_ceiling_ul_evidence "$ul_ceiling_evidence" || exit 1
+	stage_candidate_option adaptive_ceiling_dl_cap_source "$dl_cap_source" || exit 1
+	stage_candidate_option adaptive_ceiling_ul_cap_source "$ul_cap_source" || exit 1
+	case "$adaptive_enabled" in
+		true) adaptive_flag=1 ;;
+		false) adaptive_flag=0 ;;
+		*) exit 1 ;;
+	esac
+	stage_candidate_option adaptive_ceiling_enabled "$adaptive_flag" || exit 1
+	stage_candidate_option capacity_learning_policy "$capacity_learning_policy" || exit 1
+	case "$capacity_learning_policy" in
+		scheduled_active)
+			stage_candidate_option runtime_learning_mode periodic_active || exit 1
+			stage_candidate_option scheduled_autotune_enabled 1 || exit 1
+			;;
+		passive_bounded)
+			stage_candidate_option runtime_learning_mode passive || exit 1
+			stage_candidate_option scheduled_autotune_enabled 0 || exit 1
+			;;
+		verified_only|fixed_cap)
+			stage_candidate_option runtime_learning_mode fixed || exit 1
+			stage_candidate_option scheduled_autotune_enabled 0 || exit 1
+			;;
+		*) exit 1 ;;
+	esac
+	if [ "$access_source" = user_selected ]; then
+		stage_candidate_option access_medium_selection "$access_medium" || exit 1
+	else
+		stage_candidate_option access_medium_selection auto || exit 1
+	fi
+	stage_candidate_option access_medium "$access_medium" || exit 1
+	stage_candidate_option access_medium_source "$access_source" || exit 1
+	stage_candidate_option access_medium_confidence_percent "$access_confidence" || exit 1
+	if [ -n "$dl_service_cap" ]; then
+		stage_candidate_option service_dl_cap_kbps "$dl_service_cap" || exit 1
+	else
+		stage_candidate_absent_option service_dl_cap_kbps || exit 1
+	fi
+	if [ -n "$ul_service_cap" ]; then
+		stage_candidate_option service_ul_cap_kbps "$ul_service_cap" || exit 1
+	else
+		stage_candidate_absent_option service_ul_cap_kbps || exit 1
+	fi
 	stage_candidate_option transport_latency_enabled 1 || exit 1
 	stage_candidate_option throughput_guard_enabled 1 || exit 1
 	stage_candidate_option autotune_profile "$profile" || exit 1

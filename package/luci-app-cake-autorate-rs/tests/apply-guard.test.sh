@@ -145,18 +145,27 @@ cat > "$autotune/wan_sqm/result.json" <<EOF
   "pinger_plan":{"recommended_method":"fping","recommended_no_pingers":3,
     "recommended_reflectors":["1.1.1.1","9.9.9.9","8.8.8.8"]},
   "proposal":{
-    "schema_version":3,"profile":"best_overall","target_grade":"A",
+    "schema_version":4,"profile":"best_overall","target_grade":"A",
     "quality_target_required":true,"throughput_priority":false,
-    "download":{"minimum_kbps":40000,"base_kbps":80000,"maximum_kbps":90000,
-      "absolute_cap_kbps":95000,"observed_low_kbps":85000,"observed_median_kbps":88000,
+    "download":{"minimum_kbps":40000,"exploration_minimum_kbps":40000,
+      "runtime_minimum_kbps":null,"base_kbps":80000,"maximum_kbps":80000,
+      "tested_safe_maximum_kbps":80000,"exploration_cap_kbps":95000,
+      "absolute_cap_kbps":95000,"service_hard_cap_kbps":null,
+      "ceiling_evidence":"shaped_validation","cap_source":"measured_raw",
+      "observed_low_kbps":85000,"observed_median_kbps":88000,
       "observed_high_kbps":92000},
-    "upload":{"minimum_kbps":10000,"base_kbps":20000,"maximum_kbps":24000,
-      "absolute_cap_kbps":25000,"observed_low_kbps":21000,"observed_median_kbps":23000,
+    "upload":{"minimum_kbps":10000,"exploration_minimum_kbps":10000,
+      "runtime_minimum_kbps":null,"base_kbps":20000,"maximum_kbps":20000,
+      "tested_safe_maximum_kbps":20000,"exploration_cap_kbps":25000,
+      "absolute_cap_kbps":25000,"service_hard_cap_kbps":null,
+      "ceiling_evidence":"shaped_validation","cap_source":"measured_raw",
+      "observed_low_kbps":21000,"observed_median_kbps":23000,
       "observed_high_kbps":24500},
     "active_threshold_kbps":2000,
     "thresholds_ms":{"adjust_up":6,"delay":15,"adjust_down":40},
-    "adaptive_ceiling":{"enabled":true,"hold_s":15,"growth_percent":3,
-      "probe_s":8,"cooldown_s":45,"failed_bound_ttl_s":900},
+	"adaptive_ceiling":{"enabled":true,"policy":"passive_bounded","hold_s":15,"growth_percent":3,
+	  "probe_s":8,"cooldown_s":45,"failed_bound_ttl_s":900},
+	"access":{"medium":"unknown","source":"legacy_default","confidence_percent":0},
     "validation":{"candidate_realization_min_percent":80,
       "candidate_realization_max_percent":110,"capacity_retention_min_percent":80,
       "icmp_delta_max_ms":30,"transport_delta_max_ms":30,
@@ -739,6 +748,10 @@ for (const direction of [ 'download', 'upload' ]) {
 	search.inconclusive = false;
 	search.evaluated = [ { candidate_kbps: rate } ];
 	result.proposal[direction].minimum_kbps = rate;
+	result.proposal[direction].exploration_cap_kbps =
+		result.proposal[direction].observed_high_kbps;
+	result.proposal[direction].absolute_cap_kbps =
+		result.proposal[direction].observed_high_kbps;
 }
 result.proposals[0].configuration = structuredClone(result.proposal);
 fs.writeFileSync(process.argv[3], JSON.stringify(result));
@@ -806,6 +819,10 @@ for (const direction of [ 'download', 'upload' ]) {
 	search.inconclusive = false;
 	search.evaluated = [ { candidate_kbps: rate } ];
 	result.proposal[direction].minimum_kbps = rate;
+	result.proposal[direction].exploration_cap_kbps =
+		result.proposal[direction].observed_high_kbps;
+	result.proposal[direction].absolute_cap_kbps =
+		result.proposal[direction].observed_high_kbps;
 }
 result.proposals[0].configuration = structuredClone(result.proposal);
 fs.writeFileSync(process.argv[3], JSON.stringify(result));
@@ -877,6 +894,10 @@ for (const direction of [ 'download', 'upload' ]) {
 	search.inconclusive = false;
 	search.evaluated = [ { candidate_kbps: rate } ];
 	result.proposal[direction].minimum_kbps = rate;
+	result.proposal[direction].exploration_cap_kbps =
+		result.proposal[direction].observed_high_kbps;
+	result.proposal[direction].absolute_cap_kbps =
+		result.proposal[direction].observed_high_kbps;
 }
 result.proposals[0].configuration = structuredClone(result.proposal);
 fs.writeFileSync(process.argv[3], JSON.stringify(result));

@@ -36,7 +36,9 @@ For one direction, let:
 - `L = 100 R / C` be load in percent;
 - `B` be the configured baseline rate;
 - `Rmin` be the configured hard minimum;
-- `M` be the configured maximum and initial ceiling;
+- `M` be the configured maximum selected from shaped evidence;
+- `V` be the exact tested-safe initial/reset ceiling (legacy unverified
+  sections use `min(B, M)`);
 - `E` be the effective runtime ceiling;
 - `S` be the highest ceiling confirmed safe by a completed probe;
 - `F` be the lowest remembered failed ceiling, if any;
@@ -209,9 +211,22 @@ cap     = factor_cap * H
 
 | Profile | Stable factors `(min, base, max, cap)` | Variable factors `(min, base, max, cap)` |
 |---|---|---|
-| Gaming | `(0.60, 0.82, 0.92, 1.02)` | `(0.35, 0.75, 1.20, 1.60)` |
+| Gaming | `(0.70, 0.82, 0.92, 1.02)` | `(0.70, 0.75, 1.20, 1.60)` |
 | Best overall | `(0.70, 0.88, 0.95, 1.05)` | `(0.40, 0.85, 1.25, 1.80)` |
+| Variable link | `(medium floor, 0.80, 1.00, 1.00)` | `(medium floor, 0.80, 1.00, 1.00)` |
 | Fair | `(0.35, 0.94, 0.98, 1.08)` | `(0.35, 0.92, 1.30, 1.90)` |
+
+Variable Link uses a 0.35 floor for cellular/LEO, 0.40 for GEO/fixed
+wireless, and 0.50 for shared/unknown access. Its raw p90 is the measured
+exploration cap; it is never multiplied above observed capacity. If `U` is an
+optional user service-plan cap, then
+
+```text
+exploration_cap = measured_raw_cap
+absolute_cap    = min(exploration_cap, U)   # when U is present
+```
+
+The raw cap remains visible as evidence even when the service cap is lower.
 
 A direction is variable when
 `(H - L) / max(median, 1) >= 0.15`; adaptive ceiling is proposed when either
@@ -624,10 +639,11 @@ state but does not issue the `tc qdisc change ... cake bandwidth ...` command.
 
 ## Bounded adaptive ceiling
 
-The outer controller starts with:
+The outer controller starts with the exact tested-safe value `V` recorded by
+Full Auto-Tune:
 
 ```text
-E = S = M
+E = S = V
 F = none
 ```
 
@@ -648,6 +664,11 @@ Full Auto-Tune chooses the outer-loop cadence from the selected profile:
 | Gaming | 30 s | 1% | 8 s | 90 s | 1800 s |
 | Best overall, variable | 15 s | 3% | 8 s | 45 s | 900 s |
 | Fair | 10 s | 5% | 10 s | 30 s | 600 s |
+| Variable, cellular | 20 s | 3% | 10 s | 60 s | 900 s |
+| Variable, LEO | 30 s | 2% | 15 s | 120 s | 1800 s |
+| Variable, GEO | 45 s | 1% | 20 s | 180 s | 3600 s |
+| Variable, fixed wireless | 20 s | 3% | 10 s | 60 s | 1200 s |
+| Variable, shared/unknown | 30 s | 2% | 10 s | 90 s | 1800 s |
 
 Stable Best overall proposals carry `20 s / 3% / 8 s / 60 s / 1800 s` but
 leave adaptive ceiling disabled. Existing instances retain the user's explicit
@@ -679,8 +700,21 @@ cruise -> qualify -> probe_ramp -> probe_observe -> backoff -> cruise
 ```
 
 - `probe_ramp` waits for the fast shaper to reach 98% of `P`.
-- A clean `probe_observe` lasting `probe_duration_s` promotes `P` to the new
-  safe bound: `S = E = P`.
+- A clean `probe_observe` lasting `probe_duration_s` promotes `P` only when
+  achieved throughput improved materially relative to the pre-probe baseline.
+  Let `R0` be the largest achieved rate during qualification and
+  `g = clamp(growth_percent / 2, 1%, 5%)`. The reachable requirement is:
+
+  ```text
+  gain_required = min(max(R0 * g / 100, 50 kbit/s),
+                      max((P - S) / 2, 1 kbit/s))
+  ```
+
+  Capping the noise floor at half the real probe step keeps a 3% probe usable
+  on narrow uplinks; a fixed 1 Mbit/s requirement would make growth impossible
+  below roughly 33 Mbit/s. When the requirement is met, `S = E = P`.
+  Otherwise the controller restores the previous `S`, records a
+  no-throughput-gain hold, and does not poison `F`.
 - Confirmed bufferbloat records the lowest failed target and immediately
   restores `E = S`.
 - Loss of eligibility receives a short response-deadline grace period. If it
@@ -688,7 +722,7 @@ cruise -> qualify -> probe_ramp -> probe_observe -> backoff -> cruise
 - A global probe-response gap also aborts without poisoning `F`.
 - `F` expires after `failed_bound_ttl_s`, allowing a recovered variable link
   to be explored again.
-- A stall or daemon restart resets learned bounds to `M`.
+- A stall or daemon restart resets learned bounds to verified `V`.
 
 ### Example
 
@@ -753,9 +787,9 @@ not left one gutter short.
   adaptive control adds little when available capacity does not move.
 - Variable LTE, cable, radio, overloaded-provider, or failover paths benefit
   from the fast controller because the safe rate changes over time.
-- Bounded adaptive ceiling is useful when the configured maximum is a safe
-  starting point rather than a known physical hard maximum. The absolute cap
-  must still reflect a credible line limit.
+- Bounded adaptive ceiling is useful when an exact tested-safe starting point
+  exists but the measured raw/service cap sometimes permits more. The
+  absolute cap must still reflect measured capacity or a tighter service limit.
 - Minimum rate is a hard floor. Set it low enough to remain bufferbloat-free in
   the worst expected condition; the algorithm cannot protect latency below
   that floor.

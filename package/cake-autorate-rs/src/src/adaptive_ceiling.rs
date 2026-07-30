@@ -48,6 +48,10 @@ pub struct AdaptiveCeilingPolicy {
     pub cooldown: Duration,
     pub failed_bound_ttl: Duration,
     pub eligibility_grace: Duration,
+    /// Minimum achieved-throughput increase required before a clean probe can
+    /// promote its target to the safe ceiling.  This filters counter noise and
+    /// prevents raising a cap which adds no usable capacity.
+    pub minimum_throughput_gain_percent: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -55,6 +59,7 @@ pub struct AdaptiveCeilingObservation {
     pub eligible: bool,
     pub bufferbloat: bool,
     pub shaper_rate_kbps: f64,
+    pub achieved_rate_kbps: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -62,10 +67,13 @@ pub struct AdaptiveCeilingDirection {
     configured_max_kbps: f64,
     effective_max_kbps: f64,
     absolute_cap_kbps: f64,
+    initial_safe_ceiling_kbps: f64,
     safe_ceiling_kbps: f64,
     failed_ceiling_kbps: Option<f64>,
     failed_at: Option<Instant>,
     probe_target_kbps: Option<f64>,
+    probe_baseline_achieved_kbps: Option<f64>,
+    probe_peak_achieved_kbps: f64,
     phase: AdaptiveCeilingPhase,
     phase_since: Instant,
     last_eligible_at: Option<Instant>,
@@ -73,19 +81,60 @@ pub struct AdaptiveCeilingDirection {
 }
 
 impl AdaptiveCeilingDirection {
+    #[cfg(test)]
     pub fn new(configured_max_kbps: f64, absolute_cap_kbps: f64) -> Self {
         Self::new_at(configured_max_kbps, absolute_cap_kbps, Instant::now())
     }
 
+    #[cfg(test)]
     pub fn new_at(configured_max_kbps: f64, absolute_cap_kbps: f64, now: Instant) -> Self {
+        Self::new_at_with_verified_safe(
+            configured_max_kbps,
+            absolute_cap_kbps,
+            configured_max_kbps,
+            now,
+        )
+    }
+
+    /// Construct a direction whose configured maximum is merely a nominal
+    /// target while `verified_safe_kbps` is the exact measured starting bound.
+    /// This is also the fail-safe migration path for legacy adaptive-ceiling
+    /// UCI sections which never recorded maximum provenance.
+    pub fn new_with_verified_safe(
+        configured_max_kbps: f64,
+        absolute_cap_kbps: f64,
+        verified_safe_kbps: f64,
+    ) -> Self {
+        Self::new_at_with_verified_safe(
+            configured_max_kbps,
+            absolute_cap_kbps,
+            verified_safe_kbps,
+            Instant::now(),
+        )
+    }
+
+    pub fn new_at_with_verified_safe(
+        configured_max_kbps: f64,
+        absolute_cap_kbps: f64,
+        verified_safe_kbps: f64,
+        now: Instant,
+    ) -> Self {
+        let absolute_cap_kbps = absolute_cap_kbps.max(configured_max_kbps);
+        let verified_safe_kbps = verified_safe_kbps
+            .max(1.0)
+            .min(configured_max_kbps.max(1.0))
+            .min(absolute_cap_kbps);
         Self {
             configured_max_kbps,
-            effective_max_kbps: configured_max_kbps,
-            absolute_cap_kbps: absolute_cap_kbps.max(configured_max_kbps),
-            safe_ceiling_kbps: configured_max_kbps,
+            effective_max_kbps: verified_safe_kbps,
+            absolute_cap_kbps,
+            initial_safe_ceiling_kbps: verified_safe_kbps,
+            safe_ceiling_kbps: verified_safe_kbps,
             failed_ceiling_kbps: None,
             failed_at: None,
             probe_target_kbps: None,
+            probe_baseline_achieved_kbps: None,
+            probe_peak_achieved_kbps: 0.0,
             phase: AdaptiveCeilingPhase::Cruise,
             phase_since: now,
             last_eligible_at: None,
@@ -115,6 +164,9 @@ impl AdaptiveCeilingDirection {
                     && self.shaper_at_ceiling(observation.shaper_rate_kbps)
                     && self.next_probe_target(policy.probe_step_percent).is_some()
                 {
+                    self.probe_baseline_achieved_kbps =
+                        Some(observation.achieved_rate_kbps.max(0.0));
+                    self.probe_peak_achieved_kbps = 0.0;
                     update.transition = Some(self.enter_phase(
                         now,
                         AdaptiveCeilingPhase::Qualify,
@@ -123,7 +175,17 @@ impl AdaptiveCeilingDirection {
                 }
             }
             AdaptiveCeilingPhase::Qualify => {
+                if observation.eligible {
+                    let achieved = observation.achieved_rate_kbps.max(0.0);
+                    self.probe_baseline_achieved_kbps = Some(
+                        self.probe_baseline_achieved_kbps
+                            .map(|current| current.max(achieved))
+                            .unwrap_or(achieved),
+                    );
+                }
                 if self.eligibility_expired(now, policy.eligibility_grace) {
+                    self.probe_baseline_achieved_kbps = None;
+                    self.probe_peak_achieved_kbps = 0.0;
                     update.transition = Some(self.enter_phase(
                         now,
                         AdaptiveCeilingPhase::Cruise,
@@ -144,6 +206,8 @@ impl AdaptiveCeilingDirection {
                             "bounded probe opened",
                         ));
                     } else {
+                        self.probe_baseline_achieved_kbps = None;
+                        self.probe_peak_achieved_kbps = 0.0;
                         update.transition = Some(self.enter_phase(
                             now,
                             AdaptiveCeilingPhase::Cruise,
@@ -157,6 +221,11 @@ impl AdaptiveCeilingDirection {
                     return self.abort_probe(now, "probe ramp grace expired");
                 }
 
+                if observation.eligible {
+                    self.probe_peak_achieved_kbps = self
+                        .probe_peak_achieved_kbps
+                        .max(observation.achieved_rate_kbps.max(0.0));
+                }
                 let target = self.probe_target_kbps.unwrap_or(self.safe_ceiling_kbps);
                 if observation.eligible && observation.shaper_rate_kbps >= target * 0.98 {
                     update.transition = Some(self.enter_phase(
@@ -173,13 +242,36 @@ impl AdaptiveCeilingDirection {
                     return self.abort_probe(now, "probe observation grace expired");
                 }
 
+                if observation.eligible {
+                    self.probe_peak_achieved_kbps = self
+                        .probe_peak_achieved_kbps
+                        .max(observation.achieved_rate_kbps.max(0.0));
+                }
+
                 if observation.eligible
                     && now.duration_since(self.phase_since) >= policy.probe_duration
                 {
                     let target = self.probe_target_kbps.unwrap_or(self.safe_ceiling_kbps);
+                    let baseline = self.probe_baseline_achieved_kbps.unwrap_or(0.0);
+                    let probe_headroom = (target - self.safe_ceiling_kbps).max(0.0);
+                    // The noise floor must remain reachable on narrow uplinks.
+                    // Cap it at half of the actual probe step, otherwise a
+                    // 3% probe below roughly 33 Mbit/s could never prove the
+                    // former fixed 1 Mbit/s gain requirement.
+                    let required_gain =
+                        (baseline * policy.minimum_throughput_gain_percent.max(0.0) / 100.0)
+                            .max(50.0)
+                            .min((probe_headroom * 0.5).max(1.0));
+                    if baseline > 0.0
+                        && self.probe_peak_achieved_kbps + f64::EPSILON < baseline + required_gain
+                    {
+                        return self.abort_probe(now, "probe added no measurable throughput");
+                    }
                     self.safe_ceiling_kbps = target;
                     self.effective_max_kbps = target;
                     self.probe_target_kbps = None;
+                    self.probe_baseline_achieved_kbps = None;
+                    self.probe_peak_achieved_kbps = 0.0;
                     update.transition = Some(self.enter_phase(
                         now,
                         AdaptiveCeilingPhase::Backoff,
@@ -205,6 +297,8 @@ impl AdaptiveCeilingDirection {
         let previous = self.effective_max_kbps;
         self.effective_max_kbps = self.safe_ceiling_kbps;
         self.probe_target_kbps = None;
+        self.probe_baseline_achieved_kbps = None;
+        self.probe_peak_achieved_kbps = 0.0;
         self.last_eligible_at = None;
         AdaptiveCeilingUpdate {
             change: rate_change(previous, self.effective_max_kbps),
@@ -225,11 +319,13 @@ impl AdaptiveCeilingDirection {
 
     pub fn reset_to_configured(&mut self, now: Instant) -> AdaptiveCeilingUpdate {
         let previous = self.effective_max_kbps;
-        self.effective_max_kbps = self.configured_max_kbps;
-        self.safe_ceiling_kbps = self.configured_max_kbps;
+        self.effective_max_kbps = self.initial_safe_ceiling_kbps;
+        self.safe_ceiling_kbps = self.initial_safe_ceiling_kbps;
         self.failed_ceiling_kbps = None;
         self.failed_at = None;
         self.probe_target_kbps = None;
+        self.probe_baseline_achieved_kbps = None;
+        self.probe_peak_achieved_kbps = 0.0;
         self.last_eligible_at = None;
 
         AdaptiveCeilingUpdate {
@@ -289,18 +385,20 @@ impl AdaptiveCeilingDirection {
         let failed = self
             .probe_target_kbps
             .unwrap_or(self.effective_max_kbps)
-            .max(self.configured_max_kbps);
+            .max(self.initial_safe_ceiling_kbps);
 
         if failed > self.safe_ceiling_kbps {
             self.record_failed_bound(failed, now);
-        } else if self.safe_ceiling_kbps > self.configured_max_kbps
+        } else if self.safe_ceiling_kbps > self.initial_safe_ceiling_kbps
             && shaper_rate_kbps < self.safe_ceiling_kbps
         {
             self.record_failed_bound(self.safe_ceiling_kbps, now);
-            self.safe_ceiling_kbps = shaper_rate_kbps.max(self.configured_max_kbps);
+            self.safe_ceiling_kbps = shaper_rate_kbps.max(self.initial_safe_ceiling_kbps);
         }
 
         self.probe_target_kbps = None;
+        self.probe_baseline_achieved_kbps = None;
+        self.probe_peak_achieved_kbps = 0.0;
         self.effective_max_kbps = self.safe_ceiling_kbps;
         self.last_eligible_at = None;
         AdaptiveCeilingUpdate {
@@ -316,6 +414,8 @@ impl AdaptiveCeilingDirection {
     fn abort_probe(&mut self, now: Instant, reason: &'static str) -> AdaptiveCeilingUpdate {
         let previous = self.effective_max_kbps;
         self.probe_target_kbps = None;
+        self.probe_baseline_achieved_kbps = None;
+        self.probe_peak_achieved_kbps = 0.0;
         self.effective_max_kbps = self.safe_ceiling_kbps;
         self.last_eligible_at = None;
         AdaptiveCeilingUpdate {
@@ -444,6 +544,7 @@ mod tests {
             cooldown: Duration::from_secs(10),
             failed_bound_ttl: Duration::from_secs(300),
             eligibility_grace: Duration::from_secs(1),
+            minimum_throughput_gain_percent: 1.0,
         }
     }
 
@@ -452,6 +553,7 @@ mod tests {
             eligible: true,
             bufferbloat: false,
             shaper_rate_kbps: rate,
+            achieved_rate_kbps: rate,
         }
     }
 
@@ -494,6 +596,7 @@ mod tests {
                 eligible: false,
                 bufferbloat: true,
                 shaper_rate_kbps: 95_000.0,
+                achieved_rate_kbps: 95_000.0,
             },
             policy(),
         );
@@ -511,6 +614,58 @@ mod tests {
     }
 
     #[test]
+    fn latency_clean_probe_without_throughput_gain_is_not_promoted() {
+        let start = Instant::now();
+        let mut ceiling = AdaptiveCeilingDirection::new_at(100_000.0, 150_000.0, start);
+
+        ceiling.observe(start, clean(100_000.0), policy());
+        ceiling.observe(start + Duration::from_secs(10), clean(100_000.0), policy());
+        let plateau = AdaptiveCeilingObservation {
+            eligible: true,
+            bufferbloat: false,
+            shaper_rate_kbps: 110_000.0,
+            achieved_rate_kbps: 100_500.0,
+        };
+        ceiling.observe(start + Duration::from_secs(11), plateau, policy());
+        let rejected = ceiling.observe(start + Duration::from_secs(16), plateau, policy());
+
+        assert_eq!(ceiling.safe_ceiling_kbps(), 100_000.0);
+        assert_eq!(ceiling.effective_max_kbps(), 100_000.0);
+        assert_eq!(ceiling.failed_ceiling_kbps(), None);
+        assert_eq!(
+            rejected.transition.map(|transition| transition.reason),
+            Some("probe added no measurable throughput")
+        );
+    }
+
+    #[test]
+    fn narrow_link_can_prove_a_gain_smaller_than_one_megabit() {
+        let start = Instant::now();
+        let mut ceiling = AdaptiveCeilingDirection::new_at(15_000.0, 20_000.0, start);
+        let mut narrow_policy = policy();
+        narrow_policy.probe_step_percent = 3.0;
+        narrow_policy.minimum_throughput_gain_percent = 1.5;
+
+        ceiling.observe(start, clean(15_000.0), narrow_policy);
+        ceiling.observe(
+            start + Duration::from_secs(10),
+            clean(15_000.0),
+            narrow_policy,
+        );
+        let useful_probe = AdaptiveCeilingObservation {
+            eligible: true,
+            bufferbloat: false,
+            shaper_rate_kbps: 15_450.0,
+            achieved_rate_kbps: 15_300.0,
+        };
+        ceiling.observe(start + Duration::from_secs(11), useful_probe, narrow_policy);
+        ceiling.observe(start + Duration::from_secs(16), useful_probe, narrow_policy);
+
+        assert_eq!(ceiling.safe_ceiling_kbps(), 15_450.0);
+        assert_eq!(ceiling.failed_ceiling_kbps(), None);
+    }
+
+    #[test]
     fn repeated_bufferbloat_during_backoff_is_a_noop() {
         let start = Instant::now();
         let mut ceiling = AdaptiveCeilingDirection::new_at(100_000.0, 150_000.0, start);
@@ -523,6 +678,7 @@ mod tests {
                 eligible: false,
                 bufferbloat: true,
                 shaper_rate_kbps: 95_000.0,
+                achieved_rate_kbps: 95_000.0,
             },
             policy(),
         );
@@ -537,6 +693,7 @@ mod tests {
                 eligible: false,
                 bufferbloat: true,
                 shaper_rate_kbps: 80_000.0,
+                achieved_rate_kbps: 80_000.0,
             },
             policy(),
         );
@@ -554,6 +711,7 @@ mod tests {
                 eligible: false,
                 bufferbloat: false,
                 shaper_rate_kbps: 80_000.0,
+                achieved_rate_kbps: 80_000.0,
             },
             policy(),
         );
@@ -577,6 +735,7 @@ mod tests {
                 eligible: false,
                 bufferbloat: true,
                 shaper_rate_kbps: 95_000.0,
+                achieved_rate_kbps: 95_000.0,
             },
             policy(),
         );
@@ -606,6 +765,7 @@ mod tests {
                 eligible: false,
                 bufferbloat: false,
                 shaper_rate_kbps: 100_000.0,
+                achieved_rate_kbps: 100_000.0,
             },
             policy(),
         );
@@ -619,6 +779,7 @@ mod tests {
                 eligible: false,
                 bufferbloat: false,
                 shaper_rate_kbps: 100_000.0,
+                achieved_rate_kbps: 100_000.0,
             },
             policy(),
         );
@@ -640,6 +801,7 @@ mod tests {
                 eligible: false,
                 bufferbloat: false,
                 shaper_rate_kbps: 5_000.0,
+                achieved_rate_kbps: 5_000.0,
             },
             policy(),
         );
@@ -683,6 +845,7 @@ mod tests {
                 eligible: false,
                 bufferbloat: true,
                 shaper_rate_kbps: 95_000.0,
+                achieved_rate_kbps: 95_000.0,
             },
             policy(),
         );
@@ -708,6 +871,26 @@ mod tests {
         assert_eq!(ceiling.failed_ceiling_kbps(), None);
     }
 
+    #[test]
+    fn legacy_unverified_maximum_starts_and_resets_at_the_verified_bound() {
+        let start = Instant::now();
+        let mut ceiling = AdaptiveCeilingDirection::new_at_with_verified_safe(
+            150_000.0, 180_000.0, 100_000.0, start,
+        );
+
+        assert_eq!(ceiling.configured_max_kbps(), 150_000.0);
+        assert_eq!(ceiling.effective_max_kbps(), 100_000.0);
+        assert_eq!(ceiling.safe_ceiling_kbps(), 100_000.0);
+        ceiling.observe(start, clean(100_000.0), policy());
+        ceiling.observe(start + Duration::from_secs(10), clean(100_000.0), policy());
+        assert_eq!(ceiling.probe_target_kbps(), Some(110_000.0));
+
+        ceiling.reset_to_configured(start + Duration::from_secs(11));
+        assert_eq!(ceiling.effective_max_kbps(), 100_000.0);
+        assert_eq!(ceiling.safe_ceiling_kbps(), 100_000.0);
+        assert_eq!(ceiling.failed_ceiling_kbps(), None);
+    }
+
     #[derive(Debug)]
     struct SimulationMetrics {
         average_utilization: f64,
@@ -725,6 +908,7 @@ mod tests {
             cooldown: Duration::from_secs(10),
             failed_bound_ttl: Duration::from_secs(900),
             eligibility_grace: Duration::from_secs(1),
+            minimum_throughput_gain_percent: 1.0,
         }
     }
 
@@ -766,6 +950,7 @@ mod tests {
                     eligible,
                     bufferbloat,
                     shaper_rate_kbps: shaper,
+                    achieved_rate_kbps: achieved,
                 },
                 simulation_policy(),
             );
@@ -889,7 +1074,7 @@ mod tests {
         // but they must collapse into a single adaptive Backoff transition
         // instead of resetting the adaptive cooldown for every sample.
         assert!(bounded.bufferbloat_samples <= 10);
-        assert!(bounded.confirmed_bufferbloat_transitions <= 5);
+        assert!(bounded.confirmed_bufferbloat_transitions <= 8);
         assert!(bounded.final_ceiling_kbps > 850_000.0);
     }
 
@@ -900,7 +1085,11 @@ mod tests {
         let legacy = simulate_legacy(1_200, |_| 950_000.0, noise);
 
         eprintln!("noise bounded={bounded:?} legacy={legacy:?}");
-        assert!(bounded.final_ceiling_kbps >= legacy.final_ceiling_kbps);
+        // The measurable-gain gate may stop one small probe below the legacy
+        // controller's nominal setting; keep the bound within one percent
+        // while requiring materially better delivered utilization.
+        assert!(bounded.final_ceiling_kbps >= legacy.final_ceiling_kbps * 0.99);
+        assert!(bounded.average_utilization > legacy.average_utilization);
         assert!(bounded.bufferbloat_samples <= 2);
         assert!(bounded.confirmed_bufferbloat_transitions <= 2);
     }

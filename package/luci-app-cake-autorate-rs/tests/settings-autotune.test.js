@@ -107,9 +107,11 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 		'fs', 'form', 'network', 'uci', 'ui', 'widgets', 'cakeUi', 'rpc', 'L', 'E', '_',
 		`${prefix}\ninterfaceContext = { deviceNames: { eth1: true }, deviceNetworks: {}, ` +
 			`networkDevices: {}, defaultDevice: 'eth1' };\nreturn { writeWizardConfig, validateTransportProbeUrl, ` +
-			`buildMwan3Context, uniqueMwan3Uplinks, managedUplinkOwner, availableMwan3Uplinks, ` +
+			`buildInterfaceContext, buildMwan3Context, uniqueMwan3Uplinks, managedUplinkOwner, availableMwan3Uplinks, ` +
 			`multiwanInstancePlans, wizardPlanConflicts, ` +
 			`topicTab, autorateSubcategory, autorateSubcategoryDefinitions, ` +
+			`formOrUci, accessMediumDefinitions, accessMediumTitle, accessMediumExplorationPercent, detectAccessMedium, resolvedAccessContext, ` +
+			`recommendedCapacityLearningPolicy, canonicalCapacityLearningPolicy, autotuneAccessRequest, ` +
 			`canonicalAutotuneProfile, autotuneProfilePolicy, autotuneProfileDefinitions, ` +
 			`visibleAutotuneProfile, autotuneRunProfile, storedAutotuneProfile, ` +
 			`autotuneHasTrustedCapacityReferences, autotuneCalibrationStrategy, ` +
@@ -153,6 +155,23 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 }
 
 const helpers = compileHelpers({});
+let coldUiLookupCalled = false;
+assert.equal(helpers.formOrUci({
+	map: {},
+	getUIElement() {
+		coldUiLookupCalled = true;
+		throw new Error('must not inspect a form before map.root exists');
+	},
+	formvalue() { return null; },
+}, 'wan_sqm', 'access_medium_selection'), null);
+assert.equal(coldUiLookupCalled, false,
+	'cfgvalue must fall back to staged/UCI data before LuCI assigns map.root');
+assert.equal(helpers.formOrUci({
+	map: { root: {} },
+	getUIElement() { return { getValue() { return 'cellular'; } }; },
+	formvalue() { return null; },
+}, 'wan_sqm', 'access_medium_selection'), 'cellular',
+	'live forms must still prefer their current UI value');
 assert.equal(helpers.manualSqmDirectionMode('both'), 'both');
 assert.equal(helpers.manualSqmDirectionMode('upload_only'), 'upload_only');
 assert.equal(helpers.manualSqmDirectionMode('download_only'), 'download_only');
@@ -723,6 +742,66 @@ assert.equal(helpers.autotuneProfilePolicy('variable_link').targetGrade, 'B');
 assert.equal(helpers.autotuneProfilePolicy('variable_link').retentionPercent, 70);
 assert.equal(helpers.autotuneProfilePolicy('variable_link').delayMaxMs, 60);
 assert.equal(helpers.autotuneProfilePolicy('fair').retentionPercent, 90);
+assert.equal(helpers.accessMediumExplorationPercent('cellular'), 35);
+assert.equal(helpers.accessMediumExplorationPercent('leo_satellite'), 35);
+assert.equal(helpers.accessMediumExplorationPercent('fixed_wireless'), 40);
+assert.equal(helpers.accessMediumExplorationPercent('shared_wired'), 50);
+assert.equal(helpers.accessMediumExplorationPercent('unknown'), 50);
+assert.equal(helpers.accessMediumTitle('leo_satellite'), 'LEO satellite');
+assert.deepEqual(helpers.detectAccessMedium('pppoe-wan', {
+	deviceProtocols: { 'pppoe-wan': [ 'pppoe' ] },
+	deviceTypes: { 'pppoe-wan': 'ethernet' },
+	networkDevices: {},
+}), {
+	medium: 'unknown',
+	source: 'auto_inconclusive',
+	confidence_percent: 20,
+	reason: 'No trustworthy physical-medium signal was found. Ethernet, DHCP and PPPoE are transport details, not proof of the provider medium.',
+}, 'PPPoE and Ethernet encapsulation must not be mistaken for a fixed provider medium');
+assert.deepEqual(helpers.detectAccessMedium('wwan0', {
+	deviceProtocols: { wwan0: [ 'qmi' ] },
+	deviceTypes: {},
+	networkDevices: {},
+}), {
+	medium: 'cellular',
+	source: 'network_protocol',
+	confidence_percent: 95,
+	reason: 'A direct cellular modem protocol was found for this interface.',
+}, 'a direct modem protocol is strong enough for automatic cellular classification');
+const qmiContext = helpers.buildInterfaceContext([
+	{ getName: () => 'wwan0', getType: () => 'ethernet', isUp: () => true },
+], [
+	{ getName: () => 'wwan', getIfname: () => 'wwan0', getProtocol: () => 'qmi',
+		getL2Device: () => null },
+]);
+assert.equal(helpers.detectAccessMedium('wwan', qmiContext).medium, 'cellular',
+	'a logical network selection must resolve to its direct modem protocol');
+const wirelessContext = helpers.buildInterfaceContext([
+	{ getName: () => 'wlan0', getType: () => 'wifi', isUp: () => true },
+	{ getName: () => 'uplink0', getType: () => 'network', isUp: () => true },
+], [
+	{ getName: () => 'wan', getIfname: () => 'uplink0', getProtocol: () => 'dhcp',
+		getL2Device: () => ({ getName: () => 'wlan0' }) },
+]);
+assert.equal(helpers.detectAccessMedium('wan', wirelessContext).medium, 'fixed_wireless',
+	'a wireless L2 carrier must be visible through its logical WAN device');
+assert.equal(helpers.recommendedCapacityLearningPolicy({
+	medium: 'unknown', confidence_percent: 20,
+}), 'verified_only');
+assert.equal(helpers.recommendedCapacityLearningPolicy({
+	medium: 'cellular', confidence_percent: 95,
+}), 'passive_bounded');
+assert.throws(() => helpers.autotuneAccessRequest({
+	autotune_profile: 'variable_link', access_medium_selection: 'cellular',
+	capacity_learning_policy: 'fixed_cap', service_dl_cap_kbps: '100000',
+}), /requires download and upload service caps between 100 and 100000000/,
+'fixed-cap Variable Link calibration must not start with a missing direction');
+assert.throws(() => helpers.autotuneAccessRequest({
+	autotune_profile: 'variable_link', access_medium_selection: 'cellular',
+	capacity_learning_policy: 'fixed_cap', service_dl_cap_kbps: '99',
+	service_ul_cap_kbps: '10000',
+}), /requires download and upload service caps between 100 and 100000000/,
+'fixed-cap Variable Link calibration must reject an unsupported tiny service cap');
 assert.equal(helpers.autotuneRunningRequestMatches({
 	state: 'running', job_id: 'wan_sqm', requested_target_interface: 'pppoe-wan',
 	requested_backend: 'speedtest-go', requested_route_mode: 'mwan3',
@@ -739,25 +818,39 @@ assert.equal(helpers.autotuneRunningRequestMatches({
 'shaped_only'), false, 'an ambiguous start must not attach to another calibration strategy');
 
 const proposal = {
-	schema_version: 3,
+	schema_version: 4,
 	profile: 'best_overall',
 	target_grade: 'A',
 	quality_target_required: true,
 	throughput_priority: false,
 	download: {
 		minimum_kbps: 16700,
+		exploration_minimum_kbps: 16700,
+		runtime_minimum_kbps: null,
 		base_kbps: 35500,
-		maximum_kbps: 141800,
+		maximum_kbps: 35500,
+		tested_safe_maximum_kbps: 35500,
+		exploration_cap_kbps: 204200,
 		absolute_cap_kbps: 204200,
+		service_hard_cap_kbps: null,
+		ceiling_evidence: 'shaped_validation',
+		cap_source: 'measured_raw',
 		observed_low_kbps: 41700,
 		observed_median_kbps: 95000,
 		observed_high_kbps: 170000,
 	},
 	upload: {
 		minimum_kbps: 6500,
+		exploration_minimum_kbps: 6500,
+		runtime_minimum_kbps: null,
 		base_kbps: 14300,
-		maximum_kbps: 17200,
+		maximum_kbps: 14300,
+		tested_safe_maximum_kbps: 14300,
+		exploration_cap_kbps: 19000,
 		absolute_cap_kbps: 19000,
+		service_hard_cap_kbps: null,
+		ceiling_evidence: 'shaped_validation',
+		cap_source: 'measured_raw',
 		observed_low_kbps: 16200,
 		observed_median_kbps: 16800,
 		observed_high_kbps: 18000,
@@ -766,11 +859,17 @@ const proposal = {
 	thresholds_ms: { adjust_up: 6, delay: 15, adjust_down: 40 },
 	adaptive_ceiling: {
 		enabled: true,
+		policy: 'passive_bounded',
 		hold_s: 15,
 		growth_percent: 3,
 		probe_s: 8,
 		cooldown_s: 45,
 		failed_bound_ttl_s: 900,
+	},
+	access: {
+		medium: 'unknown',
+		source: 'legacy_default',
+		confidence_percent: 0,
 	},
 	validation: {
 		candidate_realization_min_percent: 80,
@@ -822,17 +921,29 @@ assert.equal(written.sqm_download, '35500');
 assert.equal(written.sqm_upload, '14300');
 assert.equal(written.min_dl_shaper_rate_kbps, '16700');
 assert.equal(written.base_dl_shaper_rate_kbps, '35500');
-assert.equal(written.max_dl_shaper_rate_kbps, '141800');
+assert.equal(written.max_dl_shaper_rate_kbps, '35500');
 assert.equal(written.min_ul_shaper_rate_kbps, '6500');
 assert.equal(written.base_ul_shaper_rate_kbps, '14300');
-assert.equal(written.max_ul_shaper_rate_kbps, '17200');
+assert.equal(written.max_ul_shaper_rate_kbps, '14300');
 assert.equal(written.connection_active_thr_kbps, '1600');
 assert.equal(written.dl_avg_owd_delta_max_adjust_up_thr_ms, '6');
 assert.equal(written.ul_owd_delta_delay_thr_ms, '15');
 assert.equal(written.dl_avg_owd_delta_max_adjust_down_thr_ms, '40');
 assert.equal(written.adaptive_ceiling_enabled, '1');
+assert.equal(written.capacity_learning_policy, 'passive_bounded');
+assert.equal(written.runtime_learning_mode, 'passive');
+assert.equal(written.scheduled_autotune_enabled, '0');
+assert.equal(written.access_medium, 'unknown');
+assert.equal(written.access_medium_source, 'legacy_default');
+assert.equal(written.access_medium_confidence_percent, '0');
 assert.equal(written.adaptive_ceiling_dl_cap_kbps, '204200');
 assert.equal(written.adaptive_ceiling_ul_cap_kbps, '19000');
+assert.equal(written.adaptive_ceiling_dl_safe_kbps, '35500');
+assert.equal(written.adaptive_ceiling_ul_safe_kbps, '14300');
+assert.equal(written.adaptive_ceiling_dl_evidence, 'shaped_validation');
+assert.equal(written.adaptive_ceiling_ul_evidence, 'shaped_validation');
+assert.equal(written.adaptive_ceiling_dl_cap_source, 'measured_raw');
+assert.equal(written.adaptive_ceiling_ul_cap_source, 'measured_raw');
 assert.equal(written.adaptive_ceiling_cooldown_s, '45');
 assert.equal(written.transport_latency_enabled, '1');
 assert.equal(written.throughput_guard_enabled, '1');
@@ -1671,7 +1782,7 @@ const resultForProfile = (profile, targetGrade, retention, delay, loss, sqm) => 
 	const measuredDelta = profile === 'gaming' || profile === 'gaming_extreme' ? 4 : 10;
 	const reviewDelay = profile === 'gaming' || profile === 'gaming_extreme' ? 30 :
 		(profile === 'best_overall' ? 60 : (profile === 'variable_link' ? 200 : 400));
-	const candidateProposal = {
+	let candidateProposal = {
 		...proposal,
 		profile,
 		target_grade: targetGrade,
@@ -1686,6 +1797,21 @@ const resultForProfile = (profile, targetGrade, retention, delay, loss, sqm) => 
 		},
 		sqm,
 	};
+	if (profile === 'variable_link') {
+		candidateProposal = {
+			...candidateProposal,
+			download: {
+				...candidateProposal.download,
+				exploration_cap_kbps: candidateProposal.download.observed_high_kbps,
+				absolute_cap_kbps: candidateProposal.download.observed_high_kbps,
+			},
+			upload: {
+				...candidateProposal.upload,
+				exploration_cap_kbps: candidateProposal.upload.observed_high_kbps,
+				absolute_cap_kbps: candidateProposal.upload.observed_high_kbps,
+			},
+		};
+	}
 	const profileBidirectional = bidirectionalConfirmationFor(candidateProposal, {
 		delayLimit: delay, lossLimit: loss, effectiveDelta: Math.min(measuredDelta, delay),
 	});
@@ -2999,9 +3125,11 @@ const preserveAdaptive = helpers.adaptiveCeilingWritePlan({
 }, stableProposal);
 assert.equal(preserveAdaptive.enabled, true);
 assert.equal(preserveAdaptive.preserved, true);
-assert.equal(preserveAdaptive.dl_cap_kbps, 150000);
-assert.equal(preserveAdaptive.ul_cap_kbps, 17200,
-	'preserved cap must be raised only as far as the new maximum requires');
+assert.equal(preserveAdaptive.dl_cap_kbps, 204200);
+assert.equal(preserveAdaptive.ul_cap_kbps, 19000,
+	'a fresh measured cap must replace provenance-free legacy bounds');
+assert.equal(preserveAdaptive.dl_safe_kbps, 35500);
+assert.equal(preserveAdaptive.dl_evidence, 'shaped_validation');
 assert.equal(preserveAdaptive.hold_s, 60);
 const disableAdaptive = helpers.adaptiveCeilingWritePlan({
 	original_adaptive_ceiling: { enabled: true, dl_cap_kbps: '150000', ul_cap_kbps: '16000' },
@@ -3040,7 +3168,8 @@ helpers.writeWizardConfig('rerun_wwan', {
 });
 assert.equal(written.adaptive_ceiling_enabled, '1',
 	'Re-run must preserve an explicitly enabled adaptive ceiling by default');
-assert.equal(written.adaptive_ceiling_dl_cap_kbps, '150000');
+assert.equal(written.adaptive_ceiling_dl_cap_kbps, '204200');
+assert.equal(written.adaptive_ceiling_dl_safe_kbps, '35500');
 assert.equal(written.adaptive_ceiling_hold_time_s, '60');
 
 assert.equal(helpers.validateTransportProbeUrl('websocket', 'wss://ping-bufferbloat.libreqos.com/ws'), true);
@@ -3321,8 +3450,9 @@ async function testAutotuneTerminalPrecedence() {
 		assert.deepEqual(completed, validResult);
 		assert.deepEqual(successProgress, [ 87 ]);
 		assert.equal(successCalls.length, 3);
-		assert.deepEqual(successCalls[0].args.slice(8), [ '', '0', 'shaped_only' ],
-			'manual Auto-Tune must pass an explicit zero traffic budget and calibration strategy');
+		assert.deepEqual(successCalls[0].args.slice(8), [ '', '0', 'shaped_only',
+			'unknown', 'legacy_default', '0', '', '', '' ],
+			'manual Auto-Tune must pass explicit traffic, strategy, and access-context arguments');
 
 		timerDelays = [];
 		const compactCalls = [];
@@ -3345,6 +3475,9 @@ async function testAutotuneTerminalPrecedence() {
 			requested_backend: 'speedtest-go', requested_route_mode: '',
 			requested_mwan3_member: '', requested_profile: 'best_overall',
 			requested_conservative: false, requested_calibration_strategy: 'shaped_only',
+			requested_access_medium: 'unknown', requested_access_source: 'legacy_default',
+			requested_access_confidence_percent: 0, requested_capacity_learning_policy: '',
+			requested_service_dl_cap_kbps: '', requested_service_ul_cap_kbps: '',
 		};
 		const timeoutPayloads = [ matchingRunning, {
 			state: 'complete', terminal_available: true, terminal_kind: 'result',

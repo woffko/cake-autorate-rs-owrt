@@ -8,7 +8,7 @@ if (typeof String.prototype.format !== 'function') {
 	String.prototype.format = function() {
 		let index = 0;
 		const values = arguments;
-		return this.replace(/%[sd]/g, () => String(values[index++]));
+		return this.replace(/%%|%[sd]/g, token => token === '%%' ? '%' : String(values[index++]));
 	};
 }
 
@@ -23,6 +23,7 @@ const prefix = source.slice(0, source.indexOf('return L.view.extend'));
 const E = (tag, attrs, children) => ({ tag, attrs: attrs || {}, children: children || [] });
 const helpers = new Function('fs', 'poll', 'uci', 'ui', 'cakeUi', 'L', 'E', '_',
 	`${prefix}\nreturn { formatQuality, formatRoute, formatState, formatServices, qualityReadiness, qualityProgressText, ` +
+		`accessMediumLabel, capacityLearningLabel, ` +
 		`statusColumnSelection, selectedStatusColumns, formatShaperRate };`
 )({}, {}, {}, {}, {}, {}, E, value => value);
 
@@ -289,6 +290,32 @@ const profiledState = helpers.formatState({
 assert.equal(profiledState.children[2].children, 'Auto-Tune: Gaming');
 assert.equal(profiledState.children[3].children, 'Learning: Configured bounds');
 assert.equal(profiledState.children[4].children, 'Priorities: Gaming · linked');
+const variableState = helpers.formatState({
+	state: 'RUNNING', uplink_state: 'ACTIVE',
+}, true, {
+	autotune_profile: 'variable_link', traffic_rules_enabled: '0',
+	capacity_learning_policy: 'passive_bounded', access_medium: 'cellular',
+	access_medium_source: 'network_protocol', access_medium_confidence_percent: '95',
+}, null);
+assert.equal(variableState.children[2].children, 'Auto-Tune: Variable link');
+assert.equal(variableState.children[3].children, 'Learning: Bounded passive learning');
+assert.equal(variableState.children[4].children, 'Access: 4G / 5G cellular · 95% confidence');
+assert.match(variableState.children[4].attrs.title, /network_protocol/);
+const variableRuntimeState = helpers.formatState({
+	state: 'RUNNING', uplink_state: 'ACTIVE',
+}, true, {
+	autotune_profile: 'variable_link', traffic_rules_enabled: '0',
+	capacity_learning_policy: 'passive_bounded', access_medium: 'cellular',
+	access_medium_source: 'network_protocol', access_medium_confidence_percent: '95',
+}, {
+	capacity_learning_policy: 'scheduled_active', access_medium: 'fixed_wireless',
+	access_medium_source: 'device_type', access_medium_confidence_percent: 65,
+});
+assert.equal(variableRuntimeState.children[3].children,
+	'Learning: Passive + scheduled active');
+assert.equal(variableRuntimeState.children[4].children,
+	'Access: Fixed wireless / WISP · 65% confidence');
+assert.match(variableRuntimeState.children[4].attrs.title, /device_type/);
 const healthyServices = helpers.formatServices({
 	overall_state: 'HEALTHY',
 	autorate_state: 'RUNNING',

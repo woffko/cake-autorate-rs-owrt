@@ -284,6 +284,10 @@ emit_instance() {
 	sqm_direction_mode="$(uci_get sqm_direction_mode)"
 	traffic_rules_enabled="$(uci_get traffic_rules_enabled)"
 	autotune_profile="$(uci_get autotune_profile)"
+	access_medium="$(uci_get access_medium)"
+	access_medium_source="$(uci_get access_medium_source)"
+	access_medium_confidence_percent="$(uci_get access_medium_confidence_percent)"
+	capacity_learning_policy="$(uci_get capacity_learning_policy)"
 	[ "$enabled" = 1 ] || enabled=0
 	[ -n "$manage_sqm" ] || manage_sqm=1
 	[ "$manage_sqm" = 1 ] || manage_sqm=0
@@ -308,6 +312,30 @@ emit_instance() {
 		variable-link|variable) autotune_profile=variable_link ;;
 		best_overall|variable_link|fair) ;;
 		*) autotune_profile=unknown ;;
+	esac
+	case "$access_medium" in
+		cellular|leo_satellite|geo_satellite|fixed_wireless|shared_wired|unknown) ;;
+		*) access_medium=unknown ;;
+	esac
+	case "$access_medium_source" in
+		user_selected|network_protocol|device_type|interface_name|auto_inconclusive|legacy_default) ;;
+		*) access_medium_source=legacy_default ;;
+	esac
+	if ! is_uint "$access_medium_confidence_percent" ||
+	   [ "$access_medium_confidence_percent" -gt 100 ] 2>/dev/null; then
+		access_medium_confidence_percent=0
+	fi
+	case "$capacity_learning_policy" in
+		verified_only|passive_bounded|scheduled_active|fixed_cap) ;;
+		*)
+			if [ "$(uci_get scheduled_autotune_enabled)" = 1 ]; then
+				capacity_learning_policy=scheduled_active
+			elif [ "$(uci_get adaptive_ceiling_enabled)" = 1 ]; then
+				capacity_learning_policy=passive_bounded
+			else
+				capacity_learning_policy=verified_only
+			fi
+			;;
 	esac
 	traffic_profile_mode="$(uci_get traffic_profile)"
 	if [ -z "$traffic_profile_mode" ]; then
@@ -657,6 +685,9 @@ EOF
 		"$classifier_state" "$classifier_profile" "$classifier_global_state"
 	printf '"autotune_profile":"%s","traffic_profile_mode":"%s","traffic_profile_resolved":"%s",' \
 		"$autotune_profile" "$traffic_profile_mode" "$traffic_profile_resolved"
+	printf '"access_medium":"%s","access_medium_source":"%s","access_medium_confidence_percent":%s,' \
+		"$access_medium" "$access_medium_source" "$access_medium_confidence_percent"
+	printf '"capacity_learning_policy":"%s",' "$capacity_learning_policy"
 	printf '"classifier_target":"%s","classifier_applied_profile":"%s",' \
 		"$(json_escape "$classifier_applied_target")" "$(json_escape "$classifier_applied_profile")"
 	printf '"classifier_applied_autotune_profile":"%s","classifier_applied_configured_profile":"%s","classifier_applied_resolved_profile":"%s",' \

@@ -761,6 +761,33 @@ function trafficProfileLabel(value) {
 	}
 }
 
+function accessMediumLabel(value) {
+	switch (value) {
+	case 'cellular': return _('4G / 5G cellular');
+	case 'leo_satellite': return _('LEO satellite');
+	case 'geo_satellite': return _('GEO satellite');
+	case 'fixed_wireless': return _('Fixed wireless / WISP');
+	case 'shared_wired': return _('Shared wired');
+	default: return _('Unknown');
+	}
+}
+
+function capacityLearningLabel(sectionData, health) {
+	var policy = health && health.capacity_learning_policy ||
+		sectionData && sectionData.capacity_learning_policy;
+	switch (policy) {
+	case 'verified_only': return _('Validated ceiling only');
+	case 'passive_bounded': return _('Bounded passive learning');
+	case 'scheduled_active': return _('Passive + scheduled active');
+	case 'fixed_cap': return _('Explicit service caps');
+	}
+	if (sectionData && sectionData.scheduled_autotune_enabled === '1')
+		return _('Passive + scheduled active');
+	if (sectionData && sectionData.adaptive_ceiling_enabled === '1')
+		return _('Passive only');
+	return _('Configured bounds');
+}
+
 function formatState(status, enabled, sectionData, health) {
 	var value = status && (status.uplink_state || status.state);
 	var warning, autotuneProfile, priorities, priorityTitle, learningMode, lines, schedule;
@@ -795,12 +822,7 @@ function formatState(status, enabled, sectionData, health) {
 			_('Runtime classifier: %s').format(health.classifier_state) : '';
 	}
 	value = value ? String(value).toUpperCase() : (enabled ? '-' : _('DISABLED'));
-	if (sectionData && sectionData.scheduled_autotune_enabled === '1')
-		learningMode = _('Passive + scheduled active');
-	else if (sectionData && sectionData.adaptive_ceiling_enabled === '1')
-		learningMode = _('Passive only');
-	else
-		learningMode = _('Configured bounds');
+	learningMode = capacityLearningLabel(sectionData, health);
 	lines = [
 		E('strong', {}, value),
 		E('small', { 'style': 'display:block;white-space:nowrap' },
@@ -812,6 +834,21 @@ function formatState(status, enabled, sectionData, health) {
 		E('small', { 'style': 'display:block;white-space:nowrap', 'title': priorityTitle || '' },
 			_('Priorities: %s').format(priorities))
 	];
+	if (sectionData && sectionData.autotune_profile === 'variable_link') {
+		var accessMedium = health && health.access_medium || sectionData.access_medium;
+		var accessSource = health && health.access_medium_source ||
+			sectionData.access_medium_source || 'legacy_default';
+		var accessConfidence = Number(health && health.access_medium_confidence_percent != null ?
+			health.access_medium_confidence_percent :
+			(sectionData.access_medium_confidence_percent || 0));
+		if (!isFinite(accessConfidence) || accessConfidence < 0 || accessConfidence > 100)
+			accessConfidence = 0;
+		lines.splice(4, 0, E('small', {
+			'style': 'display:block;white-space:normal',
+			'title': _('Evidence source: %s').format(accessSource)
+		}, _('Access: %s · %d%% confidence').format(
+			accessMediumLabel(accessMedium), accessConfidence)));
+	}
 	schedule = status && status.scheduled_autotune;
 	if (schedule && schedule.enabled) {
 		var dailyRemaining = Number(schedule.daily && schedule.daily.remaining_bytes || 0);

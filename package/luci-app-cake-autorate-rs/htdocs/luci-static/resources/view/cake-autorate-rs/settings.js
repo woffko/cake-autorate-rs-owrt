@@ -76,6 +76,10 @@ var optionDescriptions = {
 	adaptive_ceiling_probe_duration_s: 'Time a candidate ceiling must carry clean high load before it is accepted as the new learned-safe ceiling.',
 	adaptive_ceiling_cooldown_s: 'Recovery pause after a successful or failed probe before qualification may start again.',
 	adaptive_ceiling_failed_bound_ttl_s: 'How long a failed upper ceiling remains remembered. It prevents repeatedly testing a known-bad value, but expires so the link can be relearned after conditions change.',
+	access_medium_selection: 'How Variable Link identifies the provider-facing access medium. Auto is intentionally conservative: Ethernet and PPPoE alone do not prove fibre, cellular, satellite, or shared wireless service.',
+	capacity_learning_policy: 'Choose whether runtime stays at validated bounds, learns from real sustained traffic, schedules traffic-generating recalibration, or obeys explicit service caps.',
+	service_dl_cap_kbps: 'Optional provider/service-plan download hard cap. It can only tighten a measured bound and is never used to invent capacity above a raw control.',
+	service_ul_cap_kbps: 'Optional provider/service-plan upload hard cap. It can only tighten a measured bound and is never used to invent capacity above a raw control.',
 	transport_latency_enabled: 'Measure real network RTT with a persistent native transport connection. DNS, process startup, and the TLS/WebSocket handshake are excluded. Rating is passive unless the controller is enabled separately.',
 	transport_controller_enabled: 'Allow confirmed transport RTT windows to reduce CAKE rates. Disabled by default for safe upgrades. A bad direction must be confirmed twice and can never cross the configured throughput floor.',
 	transport_probe_backend: 'WebSocket is the recommended LibreQoS-compatible persistent RTT method. TCP connect and persistent HTTP are comparison fallbacks. Legacy HTTP includes process and handshake overhead, is diagnostic-only, and cannot drive the controller.',
@@ -245,6 +249,8 @@ var interfaceContext = {
 	deviceNames: {},
 	deviceNetworks: {},
 	devicePhysical: {},
+	deviceTypes: {},
+	deviceProtocols: {},
 	networkDevices: {},
 	defaultDevice: 'wan'
 };
@@ -347,6 +353,8 @@ function buildInterfaceContext(devices, networks) {
 		deviceNames: {},
 		deviceNetworks: {},
 		devicePhysical: {},
+		deviceTypes: {},
+		deviceProtocols: {},
 		networkDevices: {},
 		defaultDevice: null
 	};
@@ -359,6 +367,7 @@ function buildInterfaceContext(devices, networks) {
 			continue;
 
 		ctx.deviceNames[devName] = true;
+		ctx.deviceTypes[devName] = devType || '';
 
 		if (!ctx.defaultDevice)
 			ctx.defaultDevice = devName;
@@ -372,6 +381,7 @@ function buildInterfaceContext(devices, networks) {
 		var ifName = networks[i].getIfname();
 		var l2Device = networks[i].getL2Device ? networks[i].getL2Device() : null;
 		var l2Name = l2Device && l2Device.getName ? l2Device.getName() : null;
+		var protocol = networks[i].getProtocol ? networks[i].getProtocol() : '';
 
 		if (!netName || !ifName)
 			continue;
@@ -380,6 +390,10 @@ function buildInterfaceContext(devices, networks) {
 			ifName = ifName.substring(1);
 
 		ctx.networkDevices[netName] = ifName;
+		if (!ctx.deviceProtocols[ifName])
+			ctx.deviceProtocols[ifName] = [];
+		if (protocol && ctx.deviceProtocols[ifName].indexOf(protocol) < 0)
+			ctx.deviceProtocols[ifName].push(protocol);
 		if (l2Name && l2Name !== ifName)
 			ctx.devicePhysical[ifName] = l2Name;
 	}
@@ -427,7 +441,7 @@ function buildInterfaceContext(devices, networks) {
 	return ctx;
 }
 
-function normalizeInterfaceName(name) {
+function normalizeInterfaceNameWithContext(name, context, seen) {
 	var mapped;
 
 	if (!name)
@@ -436,15 +450,124 @@ function normalizeInterfaceName(name) {
 	if (name.charAt(0) === '@')
 		name = name.substring(1);
 
-	mapped = interfaceContext.networkDevices[name];
+	context = context || interfaceContext;
+	seen = seen || {};
+	if (seen[name])
+		return name;
+	seen[name] = true;
+	mapped = context.networkDevices && context.networkDevices[name];
 	if (mapped && mapped !== name)
-		return normalizeInterfaceName(mapped);
+		return normalizeInterfaceNameWithContext(mapped, context, seen);
 
 	return name;
 }
 
+function normalizeInterfaceName(name) {
+	return normalizeInterfaceNameWithContext(name, interfaceContext);
+}
+
 function defaultTargetInterface() {
 	return normalizeInterfaceName(interfaceContext.defaultDevice || 'wan');
+}
+
+function accessMediumDefinitions() {
+	return [
+		[ 'auto', _('Auto (conservative when uncertain)') ],
+		[ 'cellular', _('4G / 5G cellular') ],
+		[ 'leo_satellite', _('LEO satellite') ],
+		[ 'geo_satellite', _('GEO / high-latency satellite') ],
+		[ 'fixed_wireless', _('WISP / fixed wireless / Wi-Fi bridge') ],
+		[ 'shared_wired', _('Shared wired access') ],
+		[ 'unknown', _('Other / unknown') ]
+	];
+}
+
+function accessMediumTitle(medium) {
+	var definitions = accessMediumDefinitions();
+	for (var i = 0; i < definitions.length; i++)
+		if (definitions[i][0] === medium)
+			return definitions[i][1];
+	return _('Other / unknown');
+}
+
+function accessMediumExplorationPercent(medium) {
+	switch (medium) {
+	case 'cellular':
+	case 'leo_satellite':
+		return 35;
+	case 'geo_satellite':
+	case 'fixed_wireless':
+		return 40;
+	case 'shared_wired':
+	case 'unknown':
+	default:
+		return 50;
+	}
+}
+
+function detectAccessMedium(device, context) {
+	context = context || interfaceContext;
+	device = normalizeInterfaceNameWithContext(device || '', context);
+	var protocols = context.deviceProtocols && context.deviceProtocols[device] || [];
+	var physicalDevice = context.devicePhysical && context.devicePhysical[device] || '';
+	var deviceType = context.deviceTypes ?
+		[ context.deviceTypes[device] || '', context.deviceTypes[physicalDevice] || '' ].join(' ') : '';
+	var joinedProtocols = protocols.join(' ').toLowerCase();
+	var lowerDevice = String(device || '').toLowerCase();
+
+	/* Direct modem protocols are strong evidence. PPPoE, DHCP and a physical
+	 * Ethernet carrier deliberately are not: all of them can sit in front of a
+	 * cellular modem, satellite terminal, WISP CPE, or ordinary wired service. */
+	if (/(^|\s)(qmi|mbim|ncm|3g|4g|modemmanager)(\s|$)/.test(joinedProtocols))
+		return { medium: 'cellular', source: 'network_protocol', confidence_percent: 95,
+			reason: _('A direct cellular modem protocol was found for this interface.') };
+	if (/^(wwan|rmnet|wwp|qmi|mbim|modem|cell)/.test(lowerDevice))
+		return { medium: 'cellular', source: 'interface_name', confidence_percent: 70,
+			reason: _('The interface name strongly resembles a cellular modem, but should still be reviewed.') };
+	if (/wifi|wireless|802\.11/i.test(deviceType))
+		return { medium: 'fixed_wireless', source: 'device_type', confidence_percent: 65,
+			reason: _('The selected WAN device is wireless; Auto cannot distinguish WISP from another Wi-Fi bridge.') };
+
+	return { medium: 'unknown', source: 'auto_inconclusive', confidence_percent: 20,
+		reason: _('No trustworthy physical-medium signal was found. Ethernet, DHCP and PPPoE are transport details, not proof of the provider medium.') };
+}
+
+function resolvedAccessContext(state, context) {
+	var selection = state && state.access_medium_selection || 'auto';
+	if (selection !== 'auto') {
+		return {
+			medium: accessMediumDefinitions().some(function(item) { return item[0] === selection; }) ?
+				selection : 'unknown',
+			source: 'user_selected',
+			confidence_percent: 100,
+			reason: _('Selected explicitly by the user.')
+		};
+	}
+	return detectAccessMedium(state && state.wan_if, context);
+}
+
+function recommendedCapacityLearningPolicy(access) {
+	if (!access || access.medium === 'unknown' || access.confidence_percent < 50)
+		return 'verified_only';
+	return 'passive_bounded';
+}
+
+function canonicalCapacityLearningPolicy(value) {
+	switch (value) {
+	case 'verified_only':
+		return 'verified_only';
+	case 'passive':
+	case 'passive_bounded':
+		return 'passive_bounded';
+	case 'periodic_active':
+	case 'scheduled_active':
+		return 'scheduled_active';
+	case 'fixed':
+	case 'fixed_cap':
+		return 'fixed_cap';
+	default:
+		return null;
+	}
 }
 
 function buildMwan3Context() {
@@ -636,7 +759,12 @@ function manualRateLimitsEnabled(section, section_id) {
 function formOrUci(section, section_id, key) {
 	var element, value;
 
-	if (section && typeof section.getUIElement == 'function') {
+	// cfgvalue() runs before form.Map.render() assigns map.root. Calling
+	// getUIElement() in that phase makes LuCI form.js dereference an undefined
+	// root through findElement(). Fall back to staged/UCI values until the map
+	// has a live DOM root.
+	if (section && section.map && section.map.root &&
+	    typeof section.getUIElement == 'function') {
 		element = section.getUIElement(section_id, key);
 
 		if (element && typeof element.getValue == 'function')
@@ -785,15 +913,42 @@ function adaptiveConfiguredMax(section, section_id, direction) {
 }
 
 function validateAdaptiveCeiling(section, section_id) {
-	var dlMax, ulMax, dlCap, ulCap;
+	var dlMax, ulMax, dlCap, ulCap, serviceDlCap, serviceUlCap;
 	var learningMode = formOrUci(section, section_id, 'runtime_learning_mode');
+	var learningPolicy = canonicalCapacityLearningPolicy(
+		formOrUci(section, section_id, 'capacity_learning_policy'));
 
-	if (learningMode === 'fixed' ||
-		(!learningMode && !checkedFormOrUci(section, section_id, 'adaptive_ceiling_enabled', false)))
-		return true;
+	if (!learningPolicy)
+		learningPolicy = learningMode === 'periodic_active' ? 'scheduled_active' :
+			(learningMode === 'passive' ||
+			 checkedFormOrUci(section, section_id, 'adaptive_ceiling_enabled', false) ?
+				'passive_bounded' : 'verified_only');
 
 	dlMax = adaptiveConfiguredMax(section, section_id, 'dl');
 	ulMax = adaptiveConfiguredMax(section, section_id, 'ul');
+
+	if (learningPolicy === 'fixed_cap') {
+		serviceDlCap = parsePositiveRate(formOrUci(section, section_id, 'service_dl_cap_kbps'));
+		serviceUlCap = parsePositiveRate(formOrUci(section, section_id, 'service_ul_cap_kbps'));
+
+		if (serviceDlCap == null || serviceDlCap <= 0)
+			return _('A positive download service hard cap is required for explicit fixed-cap learning.');
+
+		if (serviceUlCap == null || serviceUlCap <= 0)
+			return _('A positive upload service hard cap is required for explicit fixed-cap learning.');
+
+		if (dlMax != null && serviceDlCap < dlMax)
+			return _('Download service hard cap must be at least the configured maximum (%d kbit/s).').format(dlMax);
+
+		if (ulMax != null && serviceUlCap < ulMax)
+			return _('Upload service hard cap must be at least the configured maximum (%d kbit/s).').format(ulMax);
+
+		return true;
+	}
+
+	if (learningPolicy === 'verified_only')
+		return true;
+
 	dlCap = parsePositiveRate(formOrUci(section, section_id, 'adaptive_ceiling_dl_cap_kbps'));
 	ulCap = parsePositiveRate(formOrUci(section, section_id, 'adaptive_ceiling_ul_cap_kbps'));
 
@@ -1563,7 +1718,7 @@ function autotuneProfileDefinitions() {
 			id: 'variable_link',
 			title: _('Variable link'),
 			target: _('Measured knee · target B or better · under 60 ms'),
-			description: _('For 4G/5G, satellite, wireless, and other changing links. Explores down to 35% of the conservative raw reference, but writes a runtime minimum only when two consecutive reductions prove a latency plateau. Retaining 70% is the Auto-Apply objective; noisy or uncontrolled results fail closed.')
+			description: _('For 4G/5G, satellite, wireless, and other changing links. Uses a medium-specific 35–50% exploration floor, but writes a runtime minimum only when two consecutive reductions prove a latency plateau. Retaining 70% is the Auto-Apply objective; noisy or uncontrolled results fail closed.')
 		},
 		{
 			id: 'fair',
@@ -1598,6 +1753,33 @@ function autotuneCalibrationStrategy(state) {
 		return 'shaped_only';
 	return [ 'shaped_only', 'full_raw', 'reuse_trusted' ].indexOf(strategy) >= 0 ?
 		strategy : 'shaped_only';
+}
+
+function autotuneAccessRequest(state) {
+	if (visibleAutotuneProfile(state && state.autotune_profile) !== 'variable_link') {
+		return {
+			medium: 'unknown', source: 'legacy_default', confidence_percent: 0,
+			policy: '', service_dl_cap_kbps: '', service_ul_cap_kbps: ''
+		};
+	}
+	var access = resolvedAccessContext(state);
+	var policy = canonicalCapacityLearningPolicy(state.capacity_learning_policy) ||
+		recommendedCapacityLearningPolicy(access);
+	var dlCap = String(state.service_dl_cap_kbps || '');
+	var ulCap = String(state.service_ul_cap_kbps || '');
+	if (policy === 'fixed_cap' &&
+	    (!validatePositiveInteger(dlCap) || !validatePositiveInteger(ulCap) ||
+	     Number(dlCap) < 100 || Number(dlCap) > 100000000 ||
+	     Number(ulCap) < 100 || Number(ulCap) > 100000000))
+		throw new Error(_('Explicit fixed-cap learning requires download and upload service caps between 100 and 100000000 kbit/s.'));
+	return {
+		medium: access.medium,
+		source: access.source,
+		confidence_percent: access.confidence_percent,
+		policy: policy,
+		service_dl_cap_kbps: dlCap,
+		service_ul_cap_kbps: ulCap
+	};
 }
 
 function autotuneResultCalibrationStrategy(result) {
@@ -1686,6 +1868,96 @@ function autotuneProfileGrid(buttons) {
 	].concat(buttons));
 }
 
+function variableLinkContextControl(state, disabled, onChange) {
+	if (visibleAutotuneProfile(state && state.autotune_profile) !== 'variable_link')
+		return E('div', { 'style': 'display:none' });
+
+	var access = resolvedAccessContext(state);
+	state.access_medium = access.medium;
+	state.access_medium_source = access.source;
+	state.access_medium_confidence_percent = access.confidence_percent;
+	if (!canonicalCapacityLearningPolicy(state.capacity_learning_policy))
+		state.capacity_learning_policy = recommendedCapacityLearningPolicy(access);
+
+	var accessSelect = wizardSelectOptions(accessMediumDefinitions(),
+		state.access_medium_selection || 'auto');
+	accessSelect.disabled = disabled;
+	accessSelect.addEventListener('change', function() {
+		state.access_medium_selection = accessSelect.value;
+		var next = resolvedAccessContext(state);
+		state.access_medium = next.medium;
+		state.access_medium_source = next.source;
+		state.access_medium_confidence_percent = next.confidence_percent;
+		if (!state.capacity_learning_policy_touched)
+			state.capacity_learning_policy = recommendedCapacityLearningPolicy(next);
+		if (onChange)
+			onChange();
+	});
+
+	var policyDescriptions = {
+		verified_only: _('Keep the exact validated ceiling. Runtime may reduce rates for latency, but it will not promote a higher ceiling.'),
+		passive_bounded: _('Learn upward only while real sustained traffic proves both clean latency and a measurable throughput gain. No synthetic traffic is generated.'),
+		scheduled_active: _('Use passive bounded learning and periodically rerun traffic-generating Full Auto-Tune inside the configured maintenance window and traffic budgets.'),
+		fixed_cap: _('Use explicit provider/service-plan caps as hard upper bounds. Both directions are required; the caps may tighten but never expand measured capacity.')
+	};
+	var policySelect = wizardSelectOptions([
+		[ 'verified_only', _('Validated ceiling only (safest)') ],
+		[ 'passive_bounded', _('Bounded learning from real traffic') ],
+		[ 'scheduled_active', _('Bounded + scheduled active calibration') ],
+		[ 'fixed_cap', _('Explicit service hard caps') ]
+	], state.capacity_learning_policy);
+	policySelect.disabled = disabled;
+	policySelect.addEventListener('change', function() {
+		state.capacity_learning_policy = policySelect.value;
+		state.capacity_learning_policy_touched = true;
+		if (onChange)
+			onChange();
+	});
+
+	var capFields = [];
+	if (state.capacity_learning_policy === 'fixed_cap') {
+		var dlCap = wizardTextInput(state.service_dl_cap_kbps || '',
+			'and(uinteger,min(100),max(100000000))');
+		var ulCap = wizardTextInput(state.service_ul_cap_kbps || '',
+			'and(uinteger,min(100),max(100000000))');
+		dlCap.disabled = disabled;
+		ulCap.disabled = disabled;
+		dlCap.addEventListener('input', function() { state.service_dl_cap_kbps = dlCap.value; });
+		ulCap.addEventListener('input', function() { state.service_ul_cap_kbps = ulCap.value; });
+		capFields.push(
+			wizardField(_('Download service cap'), dlCap, optionDescriptions.service_dl_cap_kbps),
+			wizardField(_('Upload service cap'), ulCap, optionDescriptions.service_ul_cap_kbps)
+		);
+	}
+
+	var detectionTone = access.source === 'auto_inconclusive' ? 'warning' : 'notice';
+	var explorationPercent = accessMediumExplorationPercent(access.medium);
+	var children = [
+		E('div', { 'class': 'alert-message ' + detectionTone, 'style': 'margin:0 0 10px' }, [
+			E('strong', {}, _('Resolved access: %s · confidence %d%%. ').format(
+				accessMediumTitle(access.medium), access.confidence_percent)),
+			access.reason,
+			E('div', { 'style': 'margin-top:5px' },
+				_('Exploration floor: %d%% of the conservative raw reference. The runtime minimum is written only at an exact tested CAKE point.').format(explorationPercent))
+		]),
+		wizardField(_('Access medium'), accessSelect, optionDescriptions.access_medium_selection),
+		wizardField(_('Capacity learning'), E('div', {}, [
+			policySelect,
+			E('div', { 'class': 'cbi-value-description', 'style': 'margin-top:6px' },
+				policyDescriptions[state.capacity_learning_policy])
+		]), optionDescriptions.capacity_learning_policy)
+	].concat(capFields);
+
+	if (state.capacity_learning_policy === 'scheduled_active')
+		children.push(E('div', { 'class': 'alert-message warning', 'style': 'margin-top:8px' },
+			_('Traffic warning: scheduled active calibration performs repeated download and upload controls. It remains review-only unless Auto-Apply is enabled separately, and is bounded by the saved daily/monthly traffic budgets.')));
+
+	return E('div', {
+		'class': 'cake-variable-link-context',
+		'style': 'margin-top:10px;padding:10px;border:1px solid var(--border-color-medium,#bbb);border-radius:4px'
+	}, [ E('h4', { 'style': 'margin:0 0 8px' }, _('Variable Link setup')) ].concat(children));
+}
+
 function autotuneAchievedGrade(result) {
 	var validation = result && result.validation;
 	var outcome = result && result.profile_outcome;
@@ -1753,6 +2025,55 @@ function renderAutotuneAchievedClass(result) {
 	]);
 }
 
+function autotuneProposalDirectionValid(direction, profile) {
+	if (!direction)
+		return false;
+	var explorationMin = autotuneNumber(direction.exploration_minimum_kbps);
+	var minimum = autotuneNumber(direction.minimum_kbps);
+	var runtimeMin = direction.runtime_minimum_kbps == null ? null :
+		autotuneNumber(direction.runtime_minimum_kbps);
+	var base = autotuneNumber(direction.base_kbps);
+	var maximum = autotuneNumber(direction.maximum_kbps);
+	var tested = direction.tested_safe_maximum_kbps == null ? null :
+		autotuneNumber(direction.tested_safe_maximum_kbps);
+	var cap = autotuneNumber(direction.absolute_cap_kbps);
+	var explorationCap = autotuneNumber(direction.exploration_cap_kbps);
+	var serviceCap = direction.service_hard_cap_kbps == null ? null :
+		autotuneNumber(direction.service_hard_cap_kbps);
+	var observedLow = autotuneNumber(direction.observed_low_kbps);
+	var observedMedian = autotuneNumber(direction.observed_median_kbps);
+	var observedHigh = autotuneNumber(direction.observed_high_kbps);
+	if ([ explorationMin, minimum, base, maximum, cap, explorationCap ].some(function(value) {
+		return value == null || value <= 0 || value > 100000000;
+	}) || explorationMin > minimum || minimum > base || base > maximum ||
+	    maximum > cap || cap > explorationCap ||
+	    [ observedLow, observedMedian, observedHigh ].some(function(value) {
+		return value == null || value <= 0 || value > 100000000;
+	    }) || observedLow > observedMedian || observedMedian > observedHigh ||
+	    (direction.cap_source !== 'retained_configuration' && observedHigh > explorationCap) ||
+	    (runtimeMin != null && (runtimeMin !== minimum || runtimeMin < explorationMin)) ||
+	    (serviceCap != null && (serviceCap <= 0 || cap > serviceCap)) ||
+	    [ 'measured_raw', 'user_service_limit', 'retained_configuration' ].indexOf(
+		direction.cap_source) < 0 ||
+	    (direction.cap_source === 'user_service_limit' &&
+		(serviceCap == null || cap !== serviceCap)))
+		return false;
+	if (profile === 'variable_link') {
+		if (direction.cap_source === 'measured_raw' &&
+		    (cap !== observedHigh || explorationCap !== observedHigh))
+			return false;
+		if (direction.cap_source === 'user_service_limit' &&
+		    explorationCap !== observedHigh)
+			return false;
+	}
+	if (direction.ceiling_evidence === 'unvalidated_candidate')
+		return tested == null;
+	if (direction.ceiling_evidence === 'shaped_validation' ||
+	    direction.ceiling_evidence === 'retained_configuration')
+		return tested != null && tested === maximum;
+	return false;
+}
+
 function autotuneProposalMatchesProfile(result) {
 	var proposal = result && result.proposal;
 	var profile = canonicalAutotuneProfile(result && result.profile);
@@ -1760,18 +2081,36 @@ function autotuneProposalMatchesProfile(result) {
 	var validation = proposal && proposal.validation;
 	var thresholds = result && result.validation_thresholds;
 	var sqm = proposal && proposal.sqm;
+	var adaptive = proposal && proposal.adaptive_ceiling;
+	var access = proposal && proposal.access;
 	var sameNumber = function(first, second) {
 		first = autotuneNumber(first);
 		second = autotuneNumber(second);
 		return first != null && second != null && Math.abs(first - second) < 0.000001;
 	};
 
-	if (!proposal || !policy || autotuneNumber(proposal.schema_version) !== 3 ||
+	if (!proposal || !policy || autotuneNumber(proposal.schema_version) !== 4 ||
 	    canonicalAutotuneProfile(proposal.profile) !== profile ||
 	    proposal.target_grade !== policy.targetGrade ||
 	    proposal.quality_target_required !== policy.qualityTargetRequired ||
 	    proposal.throughput_priority !== policy.throughputPriority ||
-	    !validation || !thresholds || !sqm)
+	    !validation || !thresholds || !sqm || !adaptive || !access ||
+	    !autotuneProposalDirectionValid(proposal.download, profile) ||
+	    !autotuneProposalDirectionValid(proposal.upload, profile))
+		return false;
+	if ([ 'cellular', 'leo_satellite', 'geo_satellite', 'fixed_wireless',
+	     'shared_wired', 'unknown' ].indexOf(access.medium) < 0 ||
+	    [ 'user_selected', 'network_protocol', 'device_type', 'interface_name',
+	     'auto_inconclusive', 'legacy_default' ].indexOf(access.source) < 0 ||
+	    autotuneNumber(access.confidence_percent) == null ||
+	    access.confidence_percent < 0 || access.confidence_percent > 100 ||
+	    [ 'verified_only', 'passive_bounded', 'scheduled_active', 'fixed_cap' ].indexOf(
+		adaptive.policy) < 0 ||
+	    adaptive.enabled !== (adaptive.policy === 'passive_bounded' ||
+		adaptive.policy === 'scheduled_active') ||
+	    (adaptive.policy === 'fixed_cap' &&
+		(proposal.download.service_hard_cap_kbps == null ||
+		 proposal.upload.service_hard_cap_kbps == null)))
 		return false;
 
 	if (!sameNumber(validation.candidate_realization_min_percent, 80) ||
@@ -1934,7 +2273,8 @@ function autotuneExecWithRetry(command, args, attempts, delayMs) {
 }
 
 function autotuneRunningRequestMatches(result, section_id, wan, backend, routeMode,
-		mwan3Member, profile, conservative, calibrationStrategy) {
+		mwan3Member, profile, conservative, calibrationStrategy, accessRequest) {
+	accessRequest = accessRequest || autotuneAccessRequest({ autotune_profile: profile });
 	return !!(result && result.state === 'running' &&
 		result.job_id === section_id &&
 		normalizeInterfaceName(result.requested_target_interface) === normalizeInterfaceName(wan) &&
@@ -1943,7 +2283,13 @@ function autotuneRunningRequestMatches(result, section_id, wan, backend, routeMo
 		(result.requested_mwan3_member || '') === (mwan3Member || '') &&
 		canonicalAutotuneProfile(result.requested_profile) === canonicalAutotuneProfile(profile) &&
 		!!result.requested_conservative === !!conservative &&
-		(result.requested_calibration_strategy || 'full_raw') === calibrationStrategy);
+		(result.requested_calibration_strategy || 'full_raw') === calibrationStrategy &&
+		(result.requested_access_medium || 'unknown') === accessRequest.medium &&
+		(result.requested_access_source || 'legacy_default') === accessRequest.source &&
+		Number(result.requested_access_confidence_percent || 0) === Number(accessRequest.confidence_percent || 0) &&
+		(result.requested_capacity_learning_policy || '') === (accessRequest.policy || '') &&
+		String(result.requested_service_dl_cap_kbps || '') === String(accessRequest.service_dl_cap_kbps || '') &&
+		String(result.requested_service_ul_cap_kbps || '') === String(accessRequest.service_ul_cap_kbps || ''));
 }
 
 function autotuneRuntimeSettled(result) {
@@ -2031,18 +2377,28 @@ function runSpeedtestJob(section_id, wan, backend, onProgress, routeMode, mwan3M
 }
 
 function runAutotuneJob(section_id, wan, backend, onProgress, routeMode, mwan3Member,
-		profile, conservative, calibrationStrategy) {
+		profile, conservative, calibrationStrategy, accessRequest) {
 	var command = '/usr/libexec/cake-autorate-rs/autotune';
 	var action = conservative ? 'start-conservative' : 'start';
 	profile = canonicalAutotuneProfile(profile) || 'best_overall';
 	calibrationStrategy = [ 'shaped_only', 'full_raw', 'reuse_trusted' ].indexOf(calibrationStrategy) >= 0 ?
 		calibrationStrategy : 'shaped_only';
+	accessRequest = accessRequest || autotuneAccessRequest({ autotune_profile: profile });
 	var requestArgs = [ section_id, wan, action, backend, routeMode || '',
-		mwan3Member || '', profile, conservative ? '1' : '0', '', '0', calibrationStrategy ];
+		mwan3Member || '', profile, conservative ? '1' : '0', '', '0', calibrationStrategy,
+		accessRequest.medium, accessRequest.source, String(accessRequest.confidence_percent || 0),
+		accessRequest.policy || '', accessRequest.service_dl_cap_kbps || '',
+		accessRequest.service_ul_cap_kbps || '' ];
 	var summaryArgs = [ section_id, wan, 'status-summary', backend,
-		routeMode || '', mwan3Member || '', profile, conservative ? '1' : '0', '', '0', calibrationStrategy ];
+		routeMode || '', mwan3Member || '', profile, conservative ? '1' : '0', '', '0', calibrationStrategy,
+		accessRequest.medium, accessRequest.source, String(accessRequest.confidence_percent || 0),
+		accessRequest.policy || '', accessRequest.service_dl_cap_kbps || '',
+		accessRequest.service_ul_cap_kbps || '' ];
 	var resultArgs = [ section_id, wan, 'result', backend,
-		routeMode || '', mwan3Member || '', profile, conservative ? '1' : '0', '', '0', calibrationStrategy ];
+		routeMode || '', mwan3Member || '', profile, conservative ? '1' : '0', '', '0', calibrationStrategy,
+		accessRequest.medium, accessRequest.source, String(accessRequest.confidence_percent || 0),
+		accessRequest.policy || '', accessRequest.service_dl_cap_kbps || '',
+		accessRequest.service_ul_cap_kbps || '' ];
 
 	return fs.exec(command, requestArgs).then(parseExecJson).catch(function(error) {
 		/* A timed-out start is ambiguous: rpcd may have accepted the procd job.
@@ -2051,7 +2407,7 @@ function runAutotuneJob(section_id, wan, backend, onProgress, routeMode, mwan3Me
 			throw error;
 		return autotuneExecWithRetry(command, summaryArgs, 3, 1000).then(parseExecJson).then(function(summary) {
 			if (!autotuneRunningRequestMatches(summary, section_id, wan, backend,
-					routeMode, mwan3Member, profile, conservative, calibrationStrategy))
+					routeMode, mwan3Member, profile, conservative, calibrationStrategy, accessRequest))
 				throw error;
 			return summary;
 		});
@@ -2731,6 +3087,9 @@ function writeWizardConfig(section_id, state, allowUncalibrated) {
 		var adaptive = adaptiveCeilingWritePlan(state, proposal);
 		var validationPolicy = proposal.validation;
 		var sqmPolicy = proposal.sqm;
+		var access = proposal.access || { medium: 'unknown', source: 'legacy_default', confidence_percent: 0 };
+		var learningPolicy = canonicalCapacityLearningPolicy(adaptive.policy) ||
+			(adaptive.enabled ? 'passive_bounded' : 'verified_only');
 
 		uci.set('cake-autorate', section_id, 'min_dl_shaper_rate_kbps', String(dlProposal.minimum_kbps));
 		uci.set('cake-autorate', section_id, 'base_dl_shaper_rate_kbps', String(dlProposal.base_kbps));
@@ -2748,11 +3107,37 @@ function writeWizardConfig(section_id, state, allowUncalibrated) {
 		uci.set('cake-autorate', section_id, 'adaptive_ceiling_enabled', adaptive.enabled ? '1' : '0');
 		uci.set('cake-autorate', section_id, 'adaptive_ceiling_dl_cap_kbps', String(adaptive.dl_cap_kbps));
 		uci.set('cake-autorate', section_id, 'adaptive_ceiling_ul_cap_kbps', String(adaptive.ul_cap_kbps));
+		uci.set('cake-autorate', section_id, 'adaptive_ceiling_dl_safe_kbps', String(adaptive.dl_safe_kbps));
+		uci.set('cake-autorate', section_id, 'adaptive_ceiling_ul_safe_kbps', String(adaptive.ul_safe_kbps));
+		uci.set('cake-autorate', section_id, 'adaptive_ceiling_dl_evidence', adaptive.dl_evidence);
+		uci.set('cake-autorate', section_id, 'adaptive_ceiling_ul_evidence', adaptive.ul_evidence);
+		uci.set('cake-autorate', section_id, 'adaptive_ceiling_dl_cap_source', adaptive.dl_cap_source);
+		uci.set('cake-autorate', section_id, 'adaptive_ceiling_ul_cap_source', adaptive.ul_cap_source);
 		uci.set('cake-autorate', section_id, 'adaptive_ceiling_hold_time_s', String(adaptive.hold_s));
 		uci.set('cake-autorate', section_id, 'adaptive_ceiling_growth_percent', String(adaptive.growth_percent));
 		uci.set('cake-autorate', section_id, 'adaptive_ceiling_probe_duration_s', String(adaptive.probe_s));
 		uci.set('cake-autorate', section_id, 'adaptive_ceiling_cooldown_s', String(adaptive.cooldown_s));
 		uci.set('cake-autorate', section_id, 'adaptive_ceiling_failed_bound_ttl_s', String(adaptive.failed_bound_ttl_s));
+		uci.set('cake-autorate', section_id, 'access_medium_selection',
+			state.access_medium_selection || (access.source === 'user_selected' ? access.medium : 'auto'));
+		uci.set('cake-autorate', section_id, 'access_medium', access.medium);
+		uci.set('cake-autorate', section_id, 'access_medium_source', access.source);
+		uci.set('cake-autorate', section_id, 'access_medium_confidence_percent',
+			String(access.confidence_percent || 0));
+		uci.set('cake-autorate', section_id, 'capacity_learning_policy', learningPolicy);
+		uci.set('cake-autorate', section_id, 'runtime_learning_mode',
+			learningPolicy === 'scheduled_active' ? 'periodic_active' :
+				(learningPolicy === 'passive_bounded' ? 'passive' : 'fixed'));
+		uci.set('cake-autorate', section_id, 'scheduled_autotune_enabled',
+			learningPolicy === 'scheduled_active' ? '1' : '0');
+		if (dlProposal.service_hard_cap_kbps != null)
+			uci.set('cake-autorate', section_id, 'service_dl_cap_kbps', String(dlProposal.service_hard_cap_kbps));
+		else
+			uci.unset('cake-autorate', section_id, 'service_dl_cap_kbps');
+		if (ulProposal.service_hard_cap_kbps != null)
+			uci.set('cake-autorate', section_id, 'service_ul_cap_kbps', String(ulProposal.service_hard_cap_kbps));
+		else
+			uci.unset('cake-autorate', section_id, 'service_ul_cap_kbps');
 		uci.set('cake-autorate', section_id, 'transport_latency_enabled', '1');
 		uci.set('cake-autorate', section_id, 'throughput_guard_enabled', '1');
 		uci.set('cake-autorate', section_id, 'throughput_guard_retention_percent',
@@ -5391,23 +5776,35 @@ function adaptiveCeilingWritePlan(state, proposal) {
 	var original = state.original_adaptive_ceiling || {};
 	var preserve = original.enabled === true && adaptive.enabled === false &&
 		state.adaptive_ceiling_disable_confirmed !== true;
-	var maxRate = function(current, minimum, fallback) {
-		var currentNumber = autotuneNumber(current);
-		var minimumNumber = autotuneNumber(minimum);
-		var fallbackNumber = autotuneNumber(fallback);
-		var value = currentNumber != null ? currentNumber : fallbackNumber;
+	var directionEvidence = function(direction) {
+		var tested = autotuneNumber(direction.tested_safe_maximum_kbps);
+		var evidence = direction.ceiling_evidence;
 
-		if (minimumNumber != null && (value == null || value < minimumNumber))
-			value = minimumNumber;
-		return value;
+		return {
+			safe_kbps: tested != null ? tested : 0,
+			evidence: tested != null && (evidence === 'shaped_validation' ||
+				evidence === 'retained_configuration') ? evidence : 'legacy_unverified',
+			cap_source: direction.cap_source || 'measured_raw'
+		};
 	};
+	var dlEvidence = directionEvidence(dl);
+	var ulEvidence = directionEvidence(ul);
 
 	if (preserve) {
 		return {
 			enabled: true,
 			preserved: true,
-			dl_cap_kbps: maxRate(original.dl_cap_kbps, dl.maximum_kbps, dl.absolute_cap_kbps),
-			ul_cap_kbps: maxRate(original.ul_cap_kbps, ul.maximum_kbps, ul.absolute_cap_kbps),
+			policy: 'passive_bounded',
+			/* Keep the enabled mode and timings, but never carry an old
+			 * provenance-free cap into a freshly measured result. */
+			dl_cap_kbps: firstAutotuneNumber([ dl.absolute_cap_kbps, dl.maximum_kbps ]),
+			ul_cap_kbps: firstAutotuneNumber([ ul.absolute_cap_kbps, ul.maximum_kbps ]),
+			dl_safe_kbps: dlEvidence.safe_kbps,
+			ul_safe_kbps: ulEvidence.safe_kbps,
+			dl_evidence: dlEvidence.evidence,
+			ul_evidence: ulEvidence.evidence,
+			dl_cap_source: dlEvidence.cap_source,
+			ul_cap_source: ulEvidence.cap_source,
 			hold_s: firstAutotuneNumber([ original.hold_s, adaptive.hold_s ]),
 			growth_percent: firstAutotuneNumber([ original.growth_percent, adaptive.growth_percent ]),
 			probe_s: firstAutotuneNumber([ original.probe_s, adaptive.probe_s ]),
@@ -5421,8 +5818,16 @@ function adaptiveCeilingWritePlan(state, proposal) {
 	return {
 		enabled: adaptive.enabled === true,
 		preserved: false,
+		policy: canonicalCapacityLearningPolicy(adaptive.policy) ||
+			(adaptive.enabled === true ? 'passive_bounded' : 'verified_only'),
 		dl_cap_kbps: firstAutotuneNumber([ dl.absolute_cap_kbps, dl.maximum_kbps ]),
 		ul_cap_kbps: firstAutotuneNumber([ ul.absolute_cap_kbps, ul.maximum_kbps ]),
+		dl_safe_kbps: dlEvidence.safe_kbps,
+		ul_safe_kbps: ulEvidence.safe_kbps,
+		dl_evidence: dlEvidence.evidence,
+		ul_evidence: ulEvidence.evidence,
+		dl_cap_source: dlEvidence.cap_source,
+		ul_cap_source: ulEvidence.cap_source,
 		hold_s: autotuneNumber(adaptive.hold_s),
 		growth_percent: autotuneNumber(adaptive.growth_percent),
 		probe_s: autotuneNumber(adaptive.probe_s),
@@ -6162,6 +6567,14 @@ function showCreateWizard(grid, name, existingName) {
 		sqm_direction_mode: 'both',
 		autotune_profile: 'best_overall',
 		autotune_calibration_strategy: 'shaped_only',
+		access_medium_selection: 'auto',
+		access_medium: 'unknown',
+		access_medium_source: 'auto_inconclusive',
+		access_medium_confidence_percent: 20,
+		capacity_learning_policy: '',
+		capacity_learning_policy_touched: false,
+		service_dl_cap_kbps: '',
+		service_ul_cap_kbps: '',
 		throughput_reference_dl_p50_kbps: '',
 		throughput_reference_ul_p50_kbps: '',
 		autotune_extreme_a_plus: false,
@@ -6206,6 +6619,26 @@ function showCreateWizard(grid, name, existingName) {
 			uci.get('cake-autorate', existingName, 'autotune_profile')) || 'best_overall';
 		state.autotune_calibration_strategy = uci.get('cake-autorate', existingName,
 			'autotune_calibration_strategy') || 'shaped_only';
+		state.access_medium_selection = uci.get('cake-autorate', existingName,
+			'access_medium_selection') ||
+			(uci.get('cake-autorate', existingName, 'access_medium_source') === 'user_selected' ?
+				uci.get('cake-autorate', existingName, 'access_medium') : 'auto');
+		state.access_medium = uci.get('cake-autorate', existingName, 'access_medium') || 'unknown';
+		state.access_medium_source = uci.get('cake-autorate', existingName,
+			'access_medium_source') || 'legacy_default';
+		state.access_medium_confidence_percent = parseInt(uci.get('cake-autorate', existingName,
+			'access_medium_confidence_percent') || '0', 10);
+		state.capacity_learning_policy = canonicalCapacityLearningPolicy(
+			uci.get('cake-autorate', existingName, 'capacity_learning_policy')) ||
+			(uci.get('cake-autorate', existingName, 'scheduled_autotune_enabled') === '1' ?
+				'scheduled_active' :
+				(uci.get('cake-autorate', existingName, 'adaptive_ceiling_enabled') === '1' ?
+					'passive_bounded' : 'verified_only'));
+		state.capacity_learning_policy_touched = true;
+		state.service_dl_cap_kbps = uci.get('cake-autorate', existingName,
+			'service_dl_cap_kbps') || '';
+		state.service_ul_cap_kbps = uci.get('cake-autorate', existingName,
+			'service_ul_cap_kbps') || '';
 		state.throughput_reference_dl_p50_kbps = uci.get('cake-autorate', existingName,
 			'throughput_reference_dl_p50_kbps') || '';
 		state.throughput_reference_ul_p50_kbps = uci.get('cake-autorate', existingName,
@@ -6517,6 +6950,15 @@ function showCreateWizard(grid, name, existingName) {
 		targetState.autotune_extreme_a_plus =
 			canonicalAutotuneProfile(result.profile) === 'gaming_extreme';
 		targetState.autotune_profile = storedAutotuneProfile(result.profile) || 'best_overall';
+		if (proposal.access) {
+			targetState.access_medium = proposal.access.medium || 'unknown';
+			targetState.access_medium_source = proposal.access.source || 'legacy_default';
+			targetState.access_medium_confidence_percent = proposal.access.confidence_percent || 0;
+		}
+		if (proposal.adaptive_ceiling && proposal.adaptive_ceiling.policy)
+			targetState.capacity_learning_policy = proposal.adaptive_ceiling.policy;
+		targetState.service_dl_cap_kbps = proposal.download.service_hard_cap_kbps || '';
+		targetState.service_ul_cap_kbps = proposal.upload.service_hard_cap_kbps || '';
 		targetState.autotune_diagnostics = null;
 		targetState.autotune_failure_message = '';
 		targetState.adaptive_ceiling_disable_confirmed = false;
@@ -6733,9 +7175,17 @@ function showCreateWizard(grid, name, existingName) {
 					_('Calibration finished without an acceptable shaped proposal. Retry or skip this uplink.')) :
 				_('Select the quality profile for this uplink, then start its calibration.')));
 
-		var startCalibration = function(conservative) {
-			var generation = (state.autotune_generation || 0) + 1;
-			showError(null);
+			var startCalibration = function(conservative) {
+				var generation = (state.autotune_generation || 0) + 1;
+				var accessRequest;
+				try {
+					accessRequest = autotuneAccessRequest(itemState);
+				}
+				catch (error) {
+					showError(error.message || String(error));
+					return Promise.resolve();
+				}
+				showError(null);
 			resetMultiwanAutotuneItem(item);
 			state.autotune_generation = generation;
 			state.autotune_cancel_requested = false;
@@ -6766,7 +7216,7 @@ function showCreateWizard(grid, name, existingName) {
 					status.textContent = _('[%d/%d] %s: %s').format(index + 1, batch.length,
 						item.plan.member, job.message || job.phase || _('Full Auto-Tune is running...'));
 			}, 'mwan3', item.plan.member, autotuneRunProfile(itemState), conservative,
-				autotuneCalibrationStrategy(itemState))
+				autotuneCalibrationStrategy(itemState), accessRequest)
 				.then(function(result) {
 					if (generation !== state.autotune_generation || state.autotune_cancel_requested)
 						return;
@@ -6924,6 +7374,11 @@ function showCreateWizard(grid, name, existingName) {
 						state.autotune_running || item.recovery_pending, function() {
 							resetMultiwanAutotuneItem(item);
 							render();
+						}),
+					variableLinkContextControl(itemState,
+						state.autotune_running || item.recovery_pending, function() {
+							resetMultiwanAutotuneItem(item);
+							render();
 						})
 				]),
 				_('This choice applies only to the current uplink. Other uplinks may use different profiles.')),
@@ -7074,9 +7529,17 @@ function showCreateWizard(grid, name, existingName) {
 				(!state.autotune_running && state.autotune_diagnostics ? 'none' : 'block') +
 				';margin-top:8px'
 		});
-		var startCalibration = function(conservative) {
-			var generation = (state.autotune_generation || 0) + 1;
-			showError(null);
+			var startCalibration = function(conservative) {
+				var generation = (state.autotune_generation || 0) + 1;
+				var accessRequest;
+				try {
+					accessRequest = autotuneAccessRequest(state);
+				}
+				catch (error) {
+					showError(error.message || String(error));
+					return Promise.resolve();
+				}
+				showError(null);
 			state.autotune_generation = generation;
 			state.autotune_cancel_requested = false;
 			state.autotune_cancelled = false;
@@ -7108,7 +7571,7 @@ function showCreateWizard(grid, name, existingName) {
 			return runAutotuneJob(state.name, state.wan_if, state.speedtest_backend, function(job) {
 				progressCallback(job, '');
 			}, state.route_mode, state.mwan3_member, autotuneRunProfile(state), conservative,
-				autotuneCalibrationStrategy(state)).then(function(result) {
+				autotuneCalibrationStrategy(state), accessRequest).then(function(result) {
 				if (generation !== state.autotune_generation || state.autotune_cancel_requested)
 					return;
 				applyAutotuneResult(result);
@@ -7225,6 +7688,13 @@ function showCreateWizard(grid, name, existingName) {
 				E('div', {}, [
 					autotuneProfileGrid(profileButtons),
 					autotuneExtremeGamingControl(state, state.autotune_running, function() {
+						clearAutotuneProposalState(state);
+						state.autotune_diagnostics = null;
+						state.autotune_failure_message = '';
+						state.autotune_background_block = null;
+						render();
+					}),
+					variableLinkContextControl(state, state.autotune_running, function() {
 						clearAutotuneProposalState(state);
 						state.autotune_diagnostics = null;
 						state.autotune_failure_message = '';
@@ -8378,7 +8848,12 @@ function autorateSubcategory(tab, optionName) {
 		return 'limits';
 
 	if (tab === 'rates')
-		return optionName === 'runtime_learning_mode' || optionName.indexOf('adaptive_ceiling_') === 0 ? 'ceiling' : 'limits';
+		return optionName === 'runtime_learning_mode' ||
+			optionName === 'capacity_learning_policy' ||
+			optionName === 'access_medium_selection' ||
+			optionName === '_access_medium_status' ||
+			optionName.indexOf('service_') === 0 ||
+			optionName.indexOf('adaptive_ceiling_') === 0 ? 'ceiling' : 'limits';
 
 	if (tab === 'reflectors')
 		return 'probes';
@@ -8564,26 +9039,75 @@ function addRateOptions(section) {
 
 	value(section, 'rates', 'connection_active_thr_kbps', _('Active threshold'), 'uinteger', '2000');
 
-	o = listValue(section, 'rates', 'runtime_learning_mode', _('Runtime capacity learning'), [
-		[ 'passive', _('Passive only (recommended — no generated traffic)') ],
-		[ 'periodic_active', _('Passive + scheduled active calibration') ],
-		[ 'fixed', _('Configured bounds only') ]
-	], 'fixed');
+	o = listValue(section, 'rates', 'access_medium_selection', _('Variable Link access medium'),
+		accessMediumDefinitions(), 'auto');
+	o.depends('autotune_profile', 'variable_link');
+	o.write = function(section_id, selected) {
+		var detected = selected === 'auto' ? detectAccessMedium(
+			normalizeInterfaceName(formOrUci(section, section_id, 'wan_if'))) : {
+				medium: selected, source: 'user_selected', confidence_percent: 100
+			};
+		uci.set('cake-autorate', section_id, 'access_medium_selection', selected);
+		uci.set('cake-autorate', section_id, 'access_medium', detected.medium);
+		uci.set('cake-autorate', section_id, 'access_medium_source', detected.source);
+		uci.set('cake-autorate', section_id, 'access_medium_confidence_percent',
+			String(detected.confidence_percent));
+	};
+
+	o = section.taboption('rates', form.DummyValue, '_access_medium_status',
+		_('Resolved Variable Link context'));
+	modal(o);
+	o.rawhtml = true;
+	o.depends('autotune_profile', 'variable_link');
 	o.cfgvalue = function(section_id) {
-		if (uci.get('cake-autorate', section_id, 'scheduled_autotune_enabled') === '1')
-			return 'periodic_active';
-		if (uci.get('cake-autorate', section_id, 'adaptive_ceiling_enabled') === '1')
-			return 'passive';
-		return uci.get('cake-autorate', section_id, 'runtime_learning_mode') || 'fixed';
+		var selection = formOrUci(section, section_id, 'access_medium_selection') || 'auto';
+		var access = selection === 'auto' ? detectAccessMedium(
+			normalizeInterfaceName(formOrUci(section, section_id, 'wan_if'))) : {
+				medium: selection,
+				source: 'user_selected',
+				confidence_percent: 100,
+				reason: _('Selected explicitly by the user.')
+			};
+		return E('div', { 'class': 'alert-message ' +
+			(access.source === 'auto_inconclusive' ? 'warning' : 'notice') }, [
+			E('strong', {}, _('%s · %d%% confidence').format(
+				accessMediumTitle(access.medium), access.confidence_percent)),
+			E('div', { 'style': 'margin-top:4px' }, access.reason),
+			E('div', { 'style': 'margin-top:4px' },
+				_('Exploration floor: %d%%. PPPoE, DHCP, and Ethernet alone never prove the provider medium.').format(
+					accessMediumExplorationPercent(access.medium)))
+		]);
+	};
+	o.write = function() {};
+	o.remove = function() {};
+
+	o = listValue(section, 'rates', 'capacity_learning_policy', _('Runtime capacity learning'), [
+		[ 'verified_only', _('Validated ceiling only (safest)') ],
+		[ 'passive_bounded', _('Bounded learning from real traffic') ],
+		[ 'scheduled_active', _('Bounded + scheduled active calibration') ],
+		[ 'fixed_cap', _('Explicit service hard caps') ]
+	], 'verified_only');
+	o.depends('autotune_profile', 'variable_link');
+	o.cfgvalue = function(section_id) {
+		return canonicalCapacityLearningPolicy(
+			uci.get('cake-autorate', section_id, 'capacity_learning_policy')) ||
+			(uci.get('cake-autorate', section_id, 'scheduled_autotune_enabled') === '1' ?
+				'scheduled_active' :
+				(uci.get('cake-autorate', section_id, 'adaptive_ceiling_enabled') === '1' ?
+					'passive_bounded' : 'verified_only'));
 	};
 	o.write = function(section_id, selected) {
-		uci.set('cake-autorate', section_id, 'runtime_learning_mode', selected);
+		uci.set('cake-autorate', section_id, 'capacity_learning_policy', selected);
+		uci.set('cake-autorate', section_id, 'runtime_learning_mode',
+			selected === 'scheduled_active' ? 'periodic_active' :
+				(selected === 'passive_bounded' ? 'passive' : 'fixed'));
 		uci.set('cake-autorate', section_id, 'adaptive_ceiling_enabled',
-			selected === 'fixed' ? '0' : '1');
+			(selected === 'passive_bounded' || selected === 'scheduled_active') ? '1' : '0');
 		uci.set('cake-autorate', section_id, 'scheduled_autotune_enabled',
-			selected === 'periodic_active' ? '1' : '0');
+			selected === 'scheduled_active' ? '1' : '0');
 	};
 	o.remove = function(section_id) {
+		uci.unset('cake-autorate', section_id, 'capacity_learning_policy');
 		uci.unset('cake-autorate', section_id, 'runtime_learning_mode');
 		uci.set('cake-autorate', section_id, 'adaptive_ceiling_enabled', '0');
 		uci.set('cake-autorate', section_id, 'scheduled_autotune_enabled', '0');
@@ -8593,8 +9117,8 @@ function addRateOptions(section) {
 	};
 
 	o = value(section, 'rates', 'adaptive_ceiling_dl_cap_kbps', _('DL absolute cap'), 'and(uinteger,min(1))', '80000');
-	o.depends('runtime_learning_mode', 'passive');
-	o.depends('runtime_learning_mode', 'periodic_active');
+	o.depends('capacity_learning_policy', 'passive_bounded');
+	o.depends('capacity_learning_policy', 'scheduled_active');
 	o.cfgvalue = function(section_id) {
 		return rateValue(uci.get('cake-autorate', section_id, 'adaptive_ceiling_dl_cap_kbps'),
 			rateValue(uci.get('cake-autorate', section_id, 'max_dl_shaper_rate_kbps'), '80000'));
@@ -8604,8 +9128,8 @@ function addRateOptions(section) {
 	};
 
 	o = value(section, 'rates', 'adaptive_ceiling_ul_cap_kbps', _('UL absolute cap'), 'and(uinteger,min(1))', '35000');
-	o.depends('runtime_learning_mode', 'passive');
-	o.depends('runtime_learning_mode', 'periodic_active');
+	o.depends('capacity_learning_policy', 'passive_bounded');
+	o.depends('capacity_learning_policy', 'scheduled_active');
 	o.cfgvalue = function(section_id) {
 		return rateValue(uci.get('cake-autorate', section_id, 'adaptive_ceiling_ul_cap_kbps'),
 			rateValue(uci.get('cake-autorate', section_id, 'max_ul_shaper_rate_kbps'), '35000'));
@@ -8615,24 +9139,37 @@ function addRateOptions(section) {
 	};
 
 	o = value(section, 'rates', 'adaptive_ceiling_hold_time_s', _('Qualification time'), 'and(ufloat,min(1))', '20.0');
-	o.depends('runtime_learning_mode', 'passive');
-	o.depends('runtime_learning_mode', 'periodic_active');
+	o.depends('capacity_learning_policy', 'passive_bounded');
+	o.depends('capacity_learning_policy', 'scheduled_active');
 
 	o = value(section, 'rates', 'adaptive_ceiling_growth_percent', _('Open probe step'), 'and(ufloat,min(0.1),max(10))', '3.0');
-	o.depends('runtime_learning_mode', 'passive');
-	o.depends('runtime_learning_mode', 'periodic_active');
+	o.depends('capacity_learning_policy', 'passive_bounded');
+	o.depends('capacity_learning_policy', 'scheduled_active');
 
 	o = value(section, 'rates', 'adaptive_ceiling_probe_duration_s', _('Probe observation'), 'and(ufloat,min(1))', '8.0');
-	o.depends('runtime_learning_mode', 'passive');
-	o.depends('runtime_learning_mode', 'periodic_active');
+	o.depends('capacity_learning_policy', 'passive_bounded');
+	o.depends('capacity_learning_policy', 'scheduled_active');
 
 	o = value(section, 'rates', 'adaptive_ceiling_cooldown_s', _('Probe cooldown'), 'and(ufloat,min(0))', '30.0');
-	o.depends('runtime_learning_mode', 'passive');
-	o.depends('runtime_learning_mode', 'periodic_active');
+	o.depends('capacity_learning_policy', 'passive_bounded');
+	o.depends('capacity_learning_policy', 'scheduled_active');
 
 	o = value(section, 'rates', 'adaptive_ceiling_failed_bound_ttl_s', _('Failed-bound memory'), 'and(ufloat,min(1))', '900.0');
-	o.depends('runtime_learning_mode', 'passive');
-	o.depends('runtime_learning_mode', 'periodic_active');
+	o.depends('capacity_learning_policy', 'passive_bounded');
+	o.depends('capacity_learning_policy', 'scheduled_active');
+
+	o = value(section, 'rates', 'service_dl_cap_kbps', _('Download service hard cap'),
+		'and(uinteger,min(100),max(100000000))');
+	o.depends('capacity_learning_policy', 'fixed_cap');
+	o.validate = function(section_id) {
+		return validateAdaptiveCeiling(validationSection(this), section_id);
+	};
+	o = value(section, 'rates', 'service_ul_cap_kbps', _('Upload service hard cap'),
+		'and(uinteger,min(100),max(100000000))');
+	o.depends('capacity_learning_policy', 'fixed_cap');
+	o.validate = function(section_id) {
+		return validateAdaptiveCeiling(validationSection(this), section_id);
+	};
 }
 
 function addQualityOptions(section) {

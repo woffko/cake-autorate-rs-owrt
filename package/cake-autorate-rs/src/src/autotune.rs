@@ -29,6 +29,152 @@ impl LinkKind {
     }
 }
 
+/// Physical/service access medium is deliberately separate from `LinkKind`.
+/// PPPoE or Ethernet describes encapsulation, not whether the provider-facing
+/// path is fibre, cellular, satellite, or a shared wireless hop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccessMedium {
+    Cellular,
+    LeoSatellite,
+    GeoSatellite,
+    FixedWireless,
+    SharedWired,
+    Unknown,
+}
+
+impl AccessMedium {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "cellular" | "4g" | "5g" => Some(Self::Cellular),
+            "leo_satellite" | "leo-satellite" | "leo" => Some(Self::LeoSatellite),
+            "geo_satellite" | "geo-satellite" | "geo" | "high_latency_satellite" => {
+                Some(Self::GeoSatellite)
+            }
+            "fixed_wireless" | "fixed-wireless" | "wisp" | "wifi_bridge" => {
+                Some(Self::FixedWireless)
+            }
+            "shared_wired" | "shared-wired" | "shared" => Some(Self::SharedWired),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cellular => "cellular",
+            Self::LeoSatellite => "leo_satellite",
+            Self::GeoSatellite => "geo_satellite",
+            Self::FixedWireless => "fixed_wireless",
+            Self::SharedWired => "shared_wired",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn variable_exploration_floor(self) -> f64 {
+        match self {
+            // Radio scheduling and LEO handovers need the deepest bounded
+            // search.  The value remains an exploration boundary, never an
+            // inferred runtime minimum.
+            Self::Cellular | Self::LeoSatellite => 0.35,
+            Self::GeoSatellite | Self::FixedWireless => 0.40,
+            Self::SharedWired | Self::Unknown => 0.50,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccessEvidenceSource {
+    UserSelected,
+    NetworkProtocol,
+    DeviceType,
+    InterfaceName,
+    AutoInconclusive,
+    LegacyDefault,
+}
+
+impl AccessEvidenceSource {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "user_selected" => Some(Self::UserSelected),
+            "network_protocol" => Some(Self::NetworkProtocol),
+            "device_type" => Some(Self::DeviceType),
+            "interface_name" => Some(Self::InterfaceName),
+            "auto_inconclusive" => Some(Self::AutoInconclusive),
+            "legacy_default" => Some(Self::LegacyDefault),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UserSelected => "user_selected",
+            Self::NetworkProtocol => "network_protocol",
+            Self::DeviceType => "device_type",
+            Self::InterfaceName => "interface_name",
+            Self::AutoInconclusive => "auto_inconclusive",
+            Self::LegacyDefault => "legacy_default",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapacityLearningPolicy {
+    VerifiedOnly,
+    PassiveBounded,
+    ScheduledActive,
+    FixedCap,
+}
+
+impl CapacityLearningPolicy {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "verified_only" | "verified-only" => Some(Self::VerifiedOnly),
+            "passive_bounded" | "passive-bounded" | "passive" => Some(Self::PassiveBounded),
+            "scheduled_active" | "scheduled-active" | "periodic_active" => {
+                Some(Self::ScheduledActive)
+            }
+            "fixed_cap" | "fixed-cap" | "fixed" => Some(Self::FixedCap),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::VerifiedOnly => "verified_only",
+            Self::PassiveBounded => "passive_bounded",
+            Self::ScheduledActive => "scheduled_active",
+            Self::FixedCap => "fixed_cap",
+        }
+    }
+
+    fn adaptive_enabled(self) -> bool {
+        matches!(self, Self::PassiveBounded | Self::ScheduledActive)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProposalContext {
+    pub access_medium: Option<AccessMedium>,
+    pub access_source: AccessEvidenceSource,
+    pub access_confidence_percent: u64,
+    pub capacity_learning_policy: Option<CapacityLearningPolicy>,
+    pub download_service_cap_kbps: Option<u64>,
+    pub upload_service_cap_kbps: Option<u64>,
+}
+
+impl Default for ProposalContext {
+    fn default() -> Self {
+        Self {
+            access_medium: None,
+            access_source: AccessEvidenceSource::LegacyDefault,
+            access_confidence_percent: 0,
+            capacity_learning_policy: None,
+            download_service_cap_kbps: None,
+            upload_service_cap_kbps: None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AutotuneProfile {
     Gaming,
@@ -157,7 +303,11 @@ impl AutotuneProfile {
             // This minimum is an exploration boundary only. The runtime
             // minimum is accepted later solely from an actually measured
             // controlled CAKE point at the detected latency knee.
-            (Self::VariableLink, _) => (0.35, 0.80, 1.25, 1.80),
+            // Automatic Variable Link growth is bounded by the actually
+            // measured raw low/high interval.  Multiplying a clean raw sample
+            // by 1.25/1.80 manufactured an unverified gigabit-plus ceiling on
+            // sub-gigabit links and then made the runtime trust it at startup.
+            (Self::VariableLink, _) => (0.35, 0.80, 1.00, 1.00),
             (Self::Fair, true) => (0.35, 0.92, 1.30, 1.90),
             // A short cellular calibration can look stable even though the
             // radio scheduler moves materially before shaped validation.  A
@@ -275,12 +425,64 @@ pub const MAX_LATENCY_MS: f64 = 60_000.0;
 /// Auto-Apply, while clean latency/loss/route evidence may remain reviewable.
 pub const THROUGHPUT_TRUST_FLOOR_PERCENT: f64 = 50.0;
 
+/// Describes why a direction's configured maximum may be treated as a safe
+/// runtime starting point.  A proposal assembled from raw capacity samples is
+/// only a candidate: the shell supervisor promotes it to `ShapedValidation`
+/// after that exact CAKE rate has passed the directional validation gates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CeilingEvidence {
+    UnvalidatedCandidate,
+    ShapedValidation,
+    RetainedConfiguration,
+}
+
+impl CeilingEvidence {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::UnvalidatedCandidate => "unvalidated_candidate",
+            Self::ShapedValidation => "shaped_validation",
+            Self::RetainedConfiguration => "retained_configuration",
+        }
+    }
+}
+
+/// Identifies the upper-bound evidence.  Automatic calibration is deliberately
+/// bounded by measured raw capacity; a future user/service-plan hard cap can
+/// only tighten that boundary, never silently expand it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CeilingCapSource {
+    MeasuredRaw,
+    UserServiceLimit,
+    RetainedConfiguration,
+}
+
+impl CeilingCapSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MeasuredRaw => "measured_raw",
+            Self::UserServiceLimit => "user_service_limit",
+            Self::RetainedConfiguration => "retained_configuration",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DirectionProposal {
+    /// Backward-compatible effective runtime floor.  Before a measured knee is
+    /// available this equals `exploration_minimum_kbps`.
     pub minimum_kbps: u64,
+    pub exploration_minimum_kbps: u64,
+    pub runtime_minimum_kbps: Option<u64>,
     pub base_kbps: u64,
+    /// Backward-compatible configured maximum.  A final applyable proposal
+    /// must bind it to `tested_safe_maximum_kbps`.
     pub maximum_kbps: u64,
+    pub tested_safe_maximum_kbps: Option<u64>,
+    pub exploration_cap_kbps: u64,
     pub absolute_cap_kbps: u64,
+    pub service_hard_cap_kbps: Option<u64>,
+    pub ceiling_evidence: CeilingEvidence,
+    pub cap_source: CeilingCapSource,
     pub observed_low_kbps: u64,
     pub observed_median_kbps: u64,
     pub observed_high_kbps: u64,
@@ -305,6 +507,10 @@ pub struct AutotuneProposal {
     pub adaptive_probe_s: u64,
     pub adaptive_cooldown_s: u64,
     pub adaptive_failed_bound_ttl_s: u64,
+    pub capacity_learning_policy: CapacityLearningPolicy,
+    pub access_medium: AccessMedium,
+    pub access_source: AccessEvidenceSource,
+    pub access_confidence_percent: u64,
     pub link_kind: LinkKind,
     pub link_layer: &'static str,
     pub overhead: u64,
@@ -318,6 +524,33 @@ pub struct AutotuneProposal {
 }
 
 impl AutotuneProposal {
+    fn apply_service_cap(
+        name: &str,
+        service_cap_kbps: Option<u64>,
+        direction: &mut DirectionProposal,
+    ) -> Result<(), String> {
+        let Some(service_cap_kbps) = service_cap_kbps else {
+            return Ok(());
+        };
+        if !(100..=MAX_RATE_KBPS).contains(&service_cap_kbps) {
+            return Err(format!(
+                "{name} service hard cap must be between 100 and {MAX_RATE_KBPS} kbit/s"
+            ));
+        }
+
+        direction.service_hard_cap_kbps = Some(service_cap_kbps);
+        if service_cap_kbps <= direction.absolute_cap_kbps {
+            direction.absolute_cap_kbps = service_cap_kbps;
+            direction.maximum_kbps = direction.maximum_kbps.min(service_cap_kbps);
+            direction.base_kbps = direction.base_kbps.min(direction.maximum_kbps);
+            direction.exploration_minimum_kbps =
+                direction.exploration_minimum_kbps.min(direction.base_kbps);
+            direction.minimum_kbps = direction.minimum_kbps.min(direction.base_kbps);
+            direction.cap_source = CeilingCapSource::UserServiceLimit;
+        }
+        Ok(())
+    }
+
     fn set_measured_runtime_minimum(
         profile: AutotuneProfile,
         name: &str,
@@ -333,12 +566,58 @@ impl AutotuneProposal {
                     .to_string(),
             );
         }
-        if measured < direction.minimum_kbps || measured > direction.base_kbps {
+        if measured < direction.exploration_minimum_kbps || measured > direction.base_kbps {
             return Err(format!(
                 "measured {name} runtime minimum must stay between the exploration minimum and selected base"
             ));
         }
         direction.minimum_kbps = measured;
+        direction.runtime_minimum_kbps = Some(measured);
+        Ok(())
+    }
+
+    fn set_tested_safe_maximum(
+        name: &str,
+        measured: u64,
+        direction: &mut DirectionProposal,
+    ) -> Result<(), String> {
+        // Full Auto-Tune's final proposal is rebuilt with the selected exact
+        // candidate as its base.  Requiring equality prevents a caller from
+        // blessing an unobserved rate merely because it lies inside a broad
+        // numeric interval.
+        if measured != direction.base_kbps {
+            return Err(format!(
+                "tested-safe {name} maximum must equal the exact selected base candidate"
+            ));
+        }
+        if measured < direction.minimum_kbps || measured > direction.exploration_cap_kbps {
+            return Err(format!(
+                "tested-safe {name} maximum must stay inside the measured exploration bounds"
+            ));
+        }
+        direction.maximum_kbps = measured;
+        direction.tested_safe_maximum_kbps = Some(measured);
+        direction.ceiling_evidence = CeilingEvidence::ShapedValidation;
+        direction.absolute_cap_kbps = direction
+            .absolute_cap_kbps
+            .max(measured)
+            .min(direction.exploration_cap_kbps.max(measured));
+        Ok(())
+    }
+
+    /// Promote exact, already validated shaped candidates to runtime-safe
+    /// maxima.  This is intentionally separate from base-rate selection.
+    pub fn set_tested_safe_maximums(
+        &mut self,
+        download_kbps: Option<u64>,
+        upload_kbps: Option<u64>,
+    ) -> Result<(), String> {
+        if let Some(download_kbps) = download_kbps {
+            Self::set_tested_safe_maximum("download", download_kbps, &mut self.download)?;
+        }
+        if let Some(upload_kbps) = upload_kbps {
+            Self::set_tested_safe_maximum("upload", upload_kbps, &mut self.upload)?;
+        }
         Ok(())
     }
 
@@ -435,13 +714,16 @@ impl AutotuneProposal {
             .join(",");
         format!(
             concat!(
-                "{{\"schema_version\":3,\"profile\":\"{}\",\"target_grade\":\"{}\",",
+                "{{\"schema_version\":4,\"profile\":\"{}\",\"target_grade\":\"{}\",",
                 "\"quality_target_required\":{},\"throughput_priority\":{},",
                 "\"download\":{},\"upload\":{},",
                 "\"active_threshold_kbps\":{},",
                 "\"thresholds_ms\":{{\"adjust_up\":{},\"delay\":{},\"adjust_down\":{}}},",
                 "\"adaptive_ceiling\":{{\"enabled\":{},\"hold_s\":{},\"growth_percent\":{},",
-                "\"probe_s\":{},\"cooldown_s\":{},\"failed_bound_ttl_s\":{}}},",
+                "\"probe_s\":{},\"cooldown_s\":{},\"failed_bound_ttl_s\":{},",
+                "\"policy\":\"{}\"}},",
+                "\"access\":{{\"medium\":\"{}\",\"source\":\"{}\",",
+                "\"confidence_percent\":{}}},",
                 "\"validation\":{{\"candidate_realization_min_percent\":{:.1},",
                 "\"candidate_realization_max_percent\":{:.1},",
                 "\"capacity_retention_min_percent\":{:.1},",
@@ -470,6 +752,10 @@ impl AutotuneProposal {
             self.adaptive_probe_s,
             self.adaptive_cooldown_s,
             self.adaptive_failed_bound_ttl_s,
+            self.capacity_learning_policy.as_str(),
+            self.access_medium.as_str(),
+            self.access_source.as_str(),
+            self.access_confidence_percent,
             self.validation_thresholds.candidate_realization_min_percent,
             self.validation_thresholds.candidate_realization_max_percent,
             self.validation_thresholds.capacity_retention_min_percent,
@@ -1526,6 +1812,75 @@ fn checked_latency_threshold(value_ms: f64) -> Result<u64, String> {
     Ok(value_ms as u64)
 }
 
+fn adaptive_policy_parameters(
+    profile: AutotuneProfile,
+    variable: bool,
+    access_medium: Option<AccessMedium>,
+) -> (u64, u64, u64, u64, u64) {
+    if profile == AutotuneProfile::VariableLink {
+        if let Some(access_medium) = access_medium {
+            return match access_medium {
+                AccessMedium::Cellular => (20, 3, 10, 60, 900),
+                AccessMedium::LeoSatellite => (30, 2, 15, 120, 1800),
+                AccessMedium::GeoSatellite => (45, 1, 20, 180, 3600),
+                AccessMedium::FixedWireless => (20, 3, 10, 60, 1200),
+                AccessMedium::SharedWired | AccessMedium::Unknown => (30, 2, 10, 90, 1800),
+            };
+        }
+    }
+
+    let hold = match profile {
+        AutotuneProfile::Gaming | AutotuneProfile::GamingExtreme => 30,
+        AutotuneProfile::BestOverall => {
+            if variable {
+                15
+            } else {
+                20
+            }
+        }
+        AutotuneProfile::VariableLink => 12,
+        AutotuneProfile::Fair => 10,
+    };
+    let growth = match profile {
+        AutotuneProfile::Gaming | AutotuneProfile::GamingExtreme => 1,
+        AutotuneProfile::BestOverall => 3,
+        AutotuneProfile::VariableLink => 3,
+        AutotuneProfile::Fair => 5,
+    };
+    let probe = match profile {
+        AutotuneProfile::Fair => 10,
+        AutotuneProfile::Gaming
+        | AutotuneProfile::GamingExtreme
+        | AutotuneProfile::BestOverall
+        | AutotuneProfile::VariableLink => 8,
+    };
+    let cooldown = match profile {
+        AutotuneProfile::Gaming | AutotuneProfile::GamingExtreme => 90,
+        AutotuneProfile::BestOverall => {
+            if variable {
+                45
+            } else {
+                60
+            }
+        }
+        AutotuneProfile::VariableLink => 45,
+        AutotuneProfile::Fair => 30,
+    };
+    let ttl = match profile {
+        AutotuneProfile::Gaming | AutotuneProfile::GamingExtreme => 1800,
+        AutotuneProfile::BestOverall => {
+            if variable {
+                900
+            } else {
+                1800
+            }
+        }
+        AutotuneProfile::VariableLink => 900,
+        AutotuneProfile::Fair => 600,
+    };
+    (hold, growth, probe, cooldown, ttl)
+}
+
 #[cfg(test)]
 pub fn build_proposal(
     download_samples_kbps: &[f64],
@@ -1542,6 +1897,7 @@ pub fn build_proposal(
     )
 }
 
+#[cfg(test)]
 pub fn build_proposal_for_profile(
     download_samples_kbps: &[f64],
     upload_samples_kbps: &[f64],
@@ -1549,11 +1905,57 @@ pub fn build_proposal_for_profile(
     link_kind: LinkKind,
     profile: AutotuneProfile,
 ) -> Result<AutotuneProposal, String> {
+    build_proposal_for_profile_with_context(
+        download_samples_kbps,
+        upload_samples_kbps,
+        baseline,
+        link_kind,
+        profile,
+        ProposalContext::default(),
+    )
+}
+
+pub fn build_proposal_for_profile_with_context(
+    download_samples_kbps: &[f64],
+    upload_samples_kbps: &[f64],
+    baseline: LatencyBaseline,
+    link_kind: LinkKind,
+    profile: AutotuneProfile,
+    context: ProposalContext,
+) -> Result<AutotuneProposal, String> {
     validate_throughput_samples("download", download_samples_kbps)?;
     validate_throughput_samples("upload", upload_samples_kbps)?;
     validate_latency_baseline(baseline)?;
-    let download = propose_direction(download_samples_kbps, profile, SearchDirection::Download)?;
-    let upload = propose_direction(upload_samples_kbps, profile, SearchDirection::Upload)?;
+    if context.access_confidence_percent > 100 {
+        return Err("access-medium confidence must be between 0 and 100".to_string());
+    }
+    if context.capacity_learning_policy == Some(CapacityLearningPolicy::FixedCap)
+        && (context.download_service_cap_kbps.is_none()
+            || context.upload_service_cap_kbps.is_none())
+    {
+        return Err(
+            "fixed-cap capacity learning requires download and upload service hard caps"
+                .to_string(),
+        );
+    }
+    let mut download = propose_direction(
+        download_samples_kbps,
+        profile,
+        SearchDirection::Download,
+        context.access_medium,
+    )?;
+    let mut upload = propose_direction(
+        upload_samples_kbps,
+        profile,
+        SearchDirection::Upload,
+        context.access_medium,
+    )?;
+    AutotuneProposal::apply_service_cap(
+        "download",
+        context.download_service_cap_kbps,
+        &mut download,
+    )?;
+    AutotuneProposal::apply_service_cap("upload", context.upload_service_cap_kbps, &mut upload)?;
     let variable = download.variability >= 0.15 || upload.variability >= 0.15;
     let jitter_ms = (baseline.p95_ms - baseline.median_ms).max(0.0);
     let (adjust_up_threshold_ms, delay_threshold_ms, adjust_down_threshold_ms) =
@@ -1604,9 +2006,24 @@ pub fn build_proposal_for_profile(
         );
     }
     if profile == AutotuneProfile::VariableLink {
-        warnings.push(
-            "Variable link explores down to 35% of the conservative raw reference. Its runtime minimum is not trusted until Full Auto-Tune proves an actual CAKE-controlled latency knee.",
-        );
+        warnings.push(match context.access_medium {
+            Some(AccessMedium::Cellular | AccessMedium::LeoSatellite) | None =>
+                "Variable link may explore down to 35% of the conservative raw reference. Its runtime minimum is not trusted until Full Auto-Tune proves an actual CAKE-controlled latency knee.",
+            Some(AccessMedium::GeoSatellite | AccessMedium::FixedWireless) =>
+                "Variable link may explore down to 40% of the conservative raw reference for this access medium. Its runtime minimum is accepted only from a tested CAKE-controlled latency knee.",
+            Some(AccessMedium::SharedWired | AccessMedium::Unknown) =>
+                "Variable link keeps a 50% exploration floor because this shared or unknown access medium cannot safely justify a deeper automatic search.",
+        });
+        if context.access_source == AccessEvidenceSource::AutoInconclusive {
+            warnings.push(
+                "Access-medium auto-detection was inconclusive. Ethernet and PPPoE do not prove the provider medium; review the Variable Link access choice before applying scheduled learning.",
+            );
+        }
+        if context.capacity_learning_policy == Some(CapacityLearningPolicy::ScheduledActive) {
+            warnings.push(
+                "Scheduled active capacity learning generates substantial download and upload traffic. Configure explicit daily and monthly traffic budgets before enabling unattended runs.",
+            );
+        }
     }
     if profile == AutotuneProfile::GamingExtreme {
         warnings.push(
@@ -1635,6 +2052,23 @@ pub fn build_proposal_for_profile(
         15
     };
 
+    let default_adaptive = variable || profile == AutotuneProfile::VariableLink;
+    let capacity_learning_policy =
+        context
+            .capacity_learning_policy
+            .unwrap_or(if default_adaptive {
+                CapacityLearningPolicy::PassiveBounded
+            } else {
+                CapacityLearningPolicy::VerifiedOnly
+            });
+    let (
+        adaptive_hold_s,
+        adaptive_growth_percent,
+        adaptive_probe_s,
+        adaptive_cooldown_s,
+        adaptive_failed_bound_ttl_s,
+    ) = adaptive_policy_parameters(profile, variable, context.access_medium);
+
     Ok(AutotuneProposal {
         profile,
         target_grade: profile.target_grade(),
@@ -1646,56 +2080,16 @@ pub fn build_proposal_for_profile(
         adjust_up_threshold_ms,
         delay_threshold_ms,
         adjust_down_threshold_ms,
-        adaptive_ceiling_enabled: variable || profile == AutotuneProfile::VariableLink,
-        adaptive_hold_s: match profile {
-            AutotuneProfile::Gaming | AutotuneProfile::GamingExtreme => 30,
-            AutotuneProfile::BestOverall => {
-                if variable {
-                    15
-                } else {
-                    20
-                }
-            }
-            AutotuneProfile::VariableLink => 12,
-            AutotuneProfile::Fair => 10,
-        },
-        adaptive_growth_percent: match profile {
-            AutotuneProfile::Gaming | AutotuneProfile::GamingExtreme => 1,
-            AutotuneProfile::BestOverall => 3,
-            AutotuneProfile::VariableLink => 3,
-            AutotuneProfile::Fair => 5,
-        },
-        adaptive_probe_s: match profile {
-            AutotuneProfile::Fair => 10,
-            AutotuneProfile::Gaming
-            | AutotuneProfile::GamingExtreme
-            | AutotuneProfile::BestOverall
-            | AutotuneProfile::VariableLink => 8,
-        },
-        adaptive_cooldown_s: match profile {
-            AutotuneProfile::Gaming | AutotuneProfile::GamingExtreme => 90,
-            AutotuneProfile::BestOverall => {
-                if variable {
-                    45
-                } else {
-                    60
-                }
-            }
-            AutotuneProfile::VariableLink => 45,
-            AutotuneProfile::Fair => 30,
-        },
-        adaptive_failed_bound_ttl_s: match profile {
-            AutotuneProfile::Gaming | AutotuneProfile::GamingExtreme => 1800,
-            AutotuneProfile::BestOverall => {
-                if variable {
-                    900
-                } else {
-                    1800
-                }
-            }
-            AutotuneProfile::VariableLink => 900,
-            AutotuneProfile::Fair => 600,
-        },
+        adaptive_ceiling_enabled: capacity_learning_policy.adaptive_enabled(),
+        adaptive_hold_s,
+        adaptive_growth_percent,
+        adaptive_probe_s,
+        adaptive_cooldown_s,
+        adaptive_failed_bound_ttl_s,
+        capacity_learning_policy,
+        access_medium: context.access_medium.unwrap_or(AccessMedium::Unknown),
+        access_source: context.access_source,
+        access_confidence_percent: context.access_confidence_percent,
         link_kind,
         link_layer,
         overhead,
@@ -1711,6 +2105,7 @@ fn propose_direction(
     samples_kbps: &[f64],
     profile: AutotuneProfile,
     direction: SearchDirection,
+    access_medium: Option<AccessMedium>,
 ) -> Result<DirectionProposal, String> {
     let mut samples = samples_kbps.to_vec();
     samples.sort_by(f64::total_cmp);
@@ -1725,8 +2120,13 @@ fn propose_direction(
     let variability = ((high - low) / median.max(1.0)).max(0.0);
     let variable = variability >= 0.15;
 
-    let (minimum_factor, base_factor, maximum_factor, cap_factor) =
+    let (mut minimum_factor, base_factor, maximum_factor, cap_factor) =
         profile.direction_factors(variable, low, direction);
+    if profile == AutotuneProfile::VariableLink {
+        if let Some(access_medium) = access_medium {
+            minimum_factor = access_medium.variable_exploration_floor();
+        }
+    }
     let (minimum, base, maximum, cap) = (
         low * minimum_factor,
         low * base_factor,
@@ -1746,9 +2146,16 @@ fn propose_direction(
 
     Ok(DirectionProposal {
         minimum_kbps: minimum,
+        exploration_minimum_kbps: minimum,
+        runtime_minimum_kbps: None,
         base_kbps: base,
         maximum_kbps: maximum,
+        tested_safe_maximum_kbps: None,
+        exploration_cap_kbps: absolute_cap,
         absolute_cap_kbps: absolute_cap,
+        service_hard_cap_kbps: None,
+        ceiling_evidence: CeilingEvidence::UnvalidatedCandidate,
+        cap_source: CeilingCapSource::MeasuredRaw,
         observed_low_kbps: checked_rounded_rate(low)?,
         observed_median_kbps: checked_rounded_rate(median)?,
         observed_high_kbps: checked_rounded_rate(high)?,
@@ -1842,10 +2249,13 @@ fn rounded_rate(rate_kbps: f64) -> u64 {
 
 fn revise_direction_base(direction: &mut DirectionProposal, scale: f64, observed_low_ceiling: f64) {
     let upper = rounded_rate(direction.observed_low_kbps as f64 * observed_low_ceiling)
-        .min(direction.maximum_kbps);
+        .min(direction.exploration_cap_kbps);
     direction.base_kbps = rounded_rate(direction.base_kbps as f64 * scale)
         .max(direction.minimum_kbps)
         .min(upper.max(direction.minimum_kbps));
+    if direction.ceiling_evidence == CeilingEvidence::UnvalidatedCandidate {
+        direction.maximum_kbps = direction.maximum_kbps.max(direction.base_kbps);
+    }
 }
 
 fn constrain_direction(
@@ -1856,40 +2266,73 @@ fn constrain_direction(
 ) {
     if let Some(retained) = retained {
         *direction = retained;
+        direction.ceiling_evidence = CeilingEvidence::RetainedConfiguration;
+        direction.cap_source = CeilingCapSource::RetainedConfiguration;
     }
 
     let cap_bound = confirmed_cap.filter(|value| *value > 0).or(confirmed_max);
     if let Some(cap) = cap_bound {
         direction.absolute_cap_kbps = direction.absolute_cap_kbps.min(cap);
+        direction.exploration_cap_kbps = direction.exploration_cap_kbps.min(cap);
         direction.maximum_kbps = direction.maximum_kbps.min(direction.absolute_cap_kbps);
+        direction.tested_safe_maximum_kbps = direction
+            .tested_safe_maximum_kbps
+            .map(|value| value.min(direction.maximum_kbps));
         direction.base_kbps = direction.base_kbps.min(direction.maximum_kbps);
         direction.minimum_kbps = direction.minimum_kbps.min(direction.base_kbps);
+        direction.exploration_minimum_kbps = direction
+            .exploration_minimum_kbps
+            .min(direction.minimum_kbps);
+        direction.runtime_minimum_kbps = direction
+            .runtime_minimum_kbps
+            .map(|value| value.min(direction.base_kbps));
     }
     if let Some(maximum) = confirmed_max.filter(|value| *value > 0) {
         direction.maximum_kbps = direction.maximum_kbps.min(maximum);
         direction.base_kbps = direction.base_kbps.min(direction.maximum_kbps);
         direction.minimum_kbps = direction.minimum_kbps.min(direction.base_kbps);
+        direction.tested_safe_maximum_kbps = direction
+            .tested_safe_maximum_kbps
+            .map(|value| value.min(direction.maximum_kbps));
         direction.absolute_cap_kbps = direction.absolute_cap_kbps.max(direction.maximum_kbps);
+        direction.exploration_cap_kbps = direction.exploration_cap_kbps.max(direction.maximum_kbps);
     }
 }
 
 fn direction_json(direction: DirectionProposal) -> String {
     format!(
         concat!(
-            "{{\"minimum_kbps\":{},\"base_kbps\":{},\"maximum_kbps\":{},",
-            "\"absolute_cap_kbps\":{},\"observed_low_kbps\":{},",
+            "{{\"minimum_kbps\":{},\"exploration_minimum_kbps\":{},",
+            "\"runtime_minimum_kbps\":{},\"base_kbps\":{},\"maximum_kbps\":{},",
+            "\"tested_safe_maximum_kbps\":{},\"exploration_cap_kbps\":{},",
+            "\"absolute_cap_kbps\":{},\"service_hard_cap_kbps\":{},",
+            "\"ceiling_evidence\":\"{}\",\"cap_source\":\"{}\",",
+            "\"observed_low_kbps\":{},",
             "\"observed_median_kbps\":{},\"observed_high_kbps\":{},",
             "\"variability\":{:.4}}}"
         ),
         direction.minimum_kbps,
+        direction.exploration_minimum_kbps,
+        optional_u64_json(direction.runtime_minimum_kbps),
         direction.base_kbps,
         direction.maximum_kbps,
+        optional_u64_json(direction.tested_safe_maximum_kbps),
+        direction.exploration_cap_kbps,
         direction.absolute_cap_kbps,
+        optional_u64_json(direction.service_hard_cap_kbps),
+        direction.ceiling_evidence.as_str(),
+        direction.cap_source.as_str(),
         direction.observed_low_kbps,
         direction.observed_median_kbps,
         direction.observed_high_kbps,
         direction.variability,
     )
+}
+
+fn optional_u64_json(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string())
 }
 
 fn json_escape(value: &str) -> String {
@@ -3640,6 +4083,151 @@ mod tests {
     }
 
     #[test]
+    fn variable_access_medium_changes_only_the_exploration_policy() {
+        let baseline = LatencyBaseline {
+            median_ms: 25.0,
+            p95_ms: 35.0,
+            samples: 20,
+        };
+        let build = |medium| {
+            build_proposal_for_profile_with_context(
+                &[100_000.0, 102_000.0],
+                &[20_000.0, 20_400.0],
+                baseline,
+                LinkKind::Unknown,
+                AutotuneProfile::VariableLink,
+                ProposalContext {
+                    access_medium: Some(medium),
+                    access_source: AccessEvidenceSource::UserSelected,
+                    access_confidence_percent: 100,
+                    capacity_learning_policy: Some(CapacityLearningPolicy::VerifiedOnly),
+                    download_service_cap_kbps: None,
+                    upload_service_cap_kbps: None,
+                },
+            )
+            .unwrap()
+        };
+        let cellular = build(AccessMedium::Cellular);
+        let unknown = build(AccessMedium::Unknown);
+
+        assert_eq!(cellular.download.exploration_minimum_kbps, 35_000);
+        assert_eq!(unknown.download.exploration_minimum_kbps, 50_000);
+        assert_eq!(
+            cellular.download.observed_low_kbps,
+            unknown.download.observed_low_kbps
+        );
+        assert_eq!(
+            cellular.download.exploration_cap_kbps,
+            cellular.download.observed_high_kbps
+        );
+        assert!(!cellular.adaptive_ceiling_enabled);
+        assert_eq!(
+            cellular.capacity_learning_policy,
+            CapacityLearningPolicy::VerifiedOnly
+        );
+    }
+
+    #[test]
+    fn service_hard_cap_tightens_but_never_expands_measured_capacity() {
+        let proposal = build_proposal_for_profile_with_context(
+            &[100_000.0, 110_000.0],
+            &[20_000.0, 22_000.0],
+            LatencyBaseline {
+                median_ms: 10.0,
+                p95_ms: 12.0,
+                samples: 20,
+            },
+            LinkKind::Cellular,
+            AutotuneProfile::VariableLink,
+            ProposalContext {
+                access_medium: Some(AccessMedium::Cellular),
+                access_source: AccessEvidenceSource::NetworkProtocol,
+                access_confidence_percent: 95,
+                capacity_learning_policy: Some(CapacityLearningPolicy::PassiveBounded),
+                download_service_cap_kbps: Some(90_000),
+                upload_service_cap_kbps: Some(50_000),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            proposal.download.exploration_cap_kbps,
+            proposal.download.observed_high_kbps
+        );
+        assert_eq!(proposal.download.absolute_cap_kbps, 90_000);
+        assert_eq!(proposal.download.service_hard_cap_kbps, Some(90_000));
+        assert_eq!(
+            proposal.download.cap_source,
+            CeilingCapSource::UserServiceLimit
+        );
+        assert_eq!(
+            proposal.upload.exploration_cap_kbps,
+            proposal.upload.observed_high_kbps
+        );
+        assert_eq!(proposal.upload.service_hard_cap_kbps, Some(50_000));
+        assert_eq!(proposal.upload.cap_source, CeilingCapSource::MeasuredRaw);
+        assert!(proposal.adaptive_ceiling_enabled);
+        assert!(proposal.to_json().contains("\"medium\":\"cellular\""));
+        assert!(proposal
+            .to_json()
+            .contains("\"policy\":\"passive_bounded\""));
+    }
+
+    #[test]
+    fn fixed_cap_policy_requires_both_directional_caps() {
+        let result = build_proposal_for_profile_with_context(
+            &[100_000.0, 101_000.0],
+            &[20_000.0, 20_100.0],
+            LatencyBaseline {
+                median_ms: 10.0,
+                p95_ms: 12.0,
+                samples: 20,
+            },
+            LinkKind::Unknown,
+            AutotuneProfile::VariableLink,
+            ProposalContext {
+                access_medium: Some(AccessMedium::Unknown),
+                access_source: AccessEvidenceSource::AutoInconclusive,
+                access_confidence_percent: 10,
+                capacity_learning_policy: Some(CapacityLearningPolicy::FixedCap),
+                download_service_cap_kbps: Some(100_000),
+                upload_service_cap_kbps: None,
+            },
+        );
+
+        assert!(result
+            .unwrap_err()
+            .contains("requires download and upload service hard caps"));
+    }
+
+    #[test]
+    fn service_hard_cap_rejects_rates_below_supported_floor() {
+        let result = build_proposal_for_profile_with_context(
+            &[100_000.0, 101_000.0],
+            &[20_000.0, 20_100.0],
+            LatencyBaseline {
+                median_ms: 10.0,
+                p95_ms: 12.0,
+                samples: 20,
+            },
+            LinkKind::Unknown,
+            AutotuneProfile::VariableLink,
+            ProposalContext {
+                access_medium: Some(AccessMedium::Unknown),
+                access_source: AccessEvidenceSource::UserSelected,
+                access_confidence_percent: 100,
+                capacity_learning_policy: Some(CapacityLearningPolicy::VerifiedOnly),
+                download_service_cap_kbps: Some(99),
+                upload_service_cap_kbps: None,
+            },
+        );
+
+        assert!(result
+            .unwrap_err()
+            .contains("must be between 100 and 100000000 kbit/s"));
+    }
+
+    #[test]
     fn profiles_trade_latency_headroom_for_bounded_capacity() {
         let build = |profile| {
             build_proposal_for_profile(
@@ -3707,7 +4295,7 @@ mod tests {
         assert!(!proposal.sqm.squash_ingress);
         assert_eq!(proposal.sqm.iqdisc_opts, "diffserv4");
         assert_eq!(proposal.sqm.eqdisc_opts, "diffserv4");
-        assert!(json.contains("\"schema_version\":3"));
+        assert!(json.contains("\"schema_version\":4"));
         assert!(json.contains("\"profile\":\"gaming\""));
         assert!(json.contains("\"target_grade\":\"A+\""));
         assert!(json.contains("\"script\":\"layer_cake.qos\""));
@@ -3805,9 +4393,16 @@ mod tests {
         .unwrap();
         let retained_upload = DirectionProposal {
             minimum_kbps: 10_000,
+            exploration_minimum_kbps: 10_000,
+            runtime_minimum_kbps: Some(10_000),
             base_kbps: 20_000,
             maximum_kbps: 30_000,
+            tested_safe_maximum_kbps: Some(30_000),
+            exploration_cap_kbps: 35_000,
             absolute_cap_kbps: 35_000,
+            service_hard_cap_kbps: None,
+            ceiling_evidence: CeilingEvidence::RetainedConfiguration,
+            cap_source: CeilingCapSource::RetainedConfiguration,
             observed_low_kbps: proposal.upload.observed_low_kbps,
             observed_median_kbps: proposal.upload.observed_median_kbps,
             observed_high_kbps: proposal.upload.observed_high_kbps,
@@ -3849,9 +4444,16 @@ mod tests {
         .unwrap();
         let retained_download = DirectionProposal {
             minimum_kbps: 500_000,
+            exploration_minimum_kbps: 500_000,
+            runtime_minimum_kbps: Some(500_000),
             base_kbps: 650_000,
             maximum_kbps: 800_000,
+            tested_safe_maximum_kbps: Some(800_000),
+            exploration_cap_kbps: 900_000,
             absolute_cap_kbps: 900_000,
+            service_hard_cap_kbps: None,
+            ceiling_evidence: CeilingEvidence::RetainedConfiguration,
+            cap_source: CeilingCapSource::RetainedConfiguration,
             observed_low_kbps: proposal.download.observed_low_kbps,
             observed_median_kbps: proposal.download.observed_median_kbps,
             observed_high_kbps: proposal.download.observed_high_kbps,
@@ -3903,13 +4505,79 @@ mod tests {
         .unwrap()
         .to_json();
 
-        assert!(json.contains("\"schema_version\":3"));
+        assert!(json.contains("\"schema_version\":4"));
         assert!(json.contains("\"profile\":\"best_overall\""));
         assert!(json.contains("\"minimum_kbps\""));
+        assert!(json.contains("\"exploration_minimum_kbps\""));
+        assert!(json.contains("\"tested_safe_maximum_kbps\":null"));
+        assert!(json.contains("\"ceiling_evidence\":\"unvalidated_candidate\""));
         assert!(json.contains("\"adaptive_ceiling\""));
         assert!(json.contains("\"classification\":\"diffserv4\""));
         assert!(json.contains("\"overhead\":44"));
         assert!(json.contains("\"confidence\":"));
+    }
+
+    #[test]
+    fn variable_link_never_manufactures_capacity_above_the_raw_control() {
+        let mut proposal = build_proposal_for_profile(
+            &[908_900.0, 912_700.0, 915_800.0],
+            &[902_800.0, 904_500.0, 905_900.0],
+            LatencyBaseline {
+                median_ms: 1.5,
+                p95_ms: 2.0,
+                samples: 20,
+            },
+            LinkKind::Pppoe,
+            AutotuneProfile::VariableLink,
+        )
+        .unwrap();
+
+        assert!(proposal.download.maximum_kbps <= proposal.download.observed_high_kbps);
+        assert!(proposal.download.absolute_cap_kbps <= proposal.download.observed_high_kbps);
+        assert!(proposal.upload.maximum_kbps <= proposal.upload.observed_high_kbps);
+        assert!(proposal.upload.absolute_cap_kbps <= proposal.upload.observed_high_kbps);
+        assert_eq!(proposal.download.tested_safe_maximum_kbps, None);
+        assert_eq!(
+            proposal.download.ceiling_evidence,
+            CeilingEvidence::UnvalidatedCandidate
+        );
+
+        let selected_dl = proposal.download.base_kbps;
+        let selected_ul = proposal.upload.base_kbps;
+        proposal
+            .set_tested_safe_maximums(Some(selected_dl), Some(selected_ul))
+            .unwrap();
+        assert_eq!(proposal.download.maximum_kbps, selected_dl);
+        assert_eq!(
+            proposal.download.tested_safe_maximum_kbps,
+            Some(selected_dl)
+        );
+        assert_eq!(
+            proposal.download.ceiling_evidence,
+            CeilingEvidence::ShapedValidation
+        );
+    }
+
+    #[test]
+    fn tested_safe_maximum_must_be_the_exact_selected_candidate() {
+        let mut proposal = build_proposal_for_profile(
+            &[100_000.0, 101_000.0],
+            &[20_000.0, 21_000.0],
+            LatencyBaseline {
+                median_ms: 5.0,
+                p95_ms: 7.0,
+                samples: 20,
+            },
+            LinkKind::Cellular,
+            AutotuneProfile::VariableLink,
+        )
+        .unwrap();
+        let untested = proposal.download.base_kbps + 1;
+        let error = proposal
+            .set_tested_safe_maximums(Some(untested), None)
+            .unwrap_err();
+        assert!(error.contains("exact selected base candidate"));
+        assert_eq!(proposal.download.tested_safe_maximum_kbps, None);
     }
 
     #[test]

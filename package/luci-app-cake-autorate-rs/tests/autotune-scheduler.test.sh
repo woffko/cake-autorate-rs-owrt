@@ -39,7 +39,7 @@ case "$expression" in
 	@.profile) emit "${RESULT_PROFILE-best_overall}" ;;
 	@.run_id) emit "${RESULT_RUN_ID-scheduler-test-run}" ;;
 	@.validation.profile) emit "${RESULT_VALIDATION_PROFILE-${RESULT_PROFILE-best_overall}}" ;;
-	@.proposal.schema_version) emit "${RESULT_PROPOSAL_SCHEMA_VERSION-3}" ;;
+	@.proposal.schema_version) emit "${RESULT_PROPOSAL_SCHEMA_VERSION-4}" ;;
 	@.proposal.profile) emit "${RESULT_PROPOSAL_PROFILE-${RESULT_PROFILE-best_overall}}" ;;
 	@.proposal.target_grade) emit "${RESULT_TARGET_GRADE-A}" ;;
 	@.proposal.quality_target_required) emit "${RESULT_QUALITY_TARGET_REQUIRED-true}" ;;
@@ -128,10 +128,20 @@ case "$expression" in
 	@.proposal.sqm.egress_ecn) emit "${RESULT_SQM_EGRESS_ECN-NOECN}" ;;
 	@.proposal.sqm.iqdisc_opts) emit "${RESULT_SQM_IQDISC_OPTS-besteffort}" ;;
 	@.proposal.sqm.eqdisc_opts) emit "${RESULT_SQM_EQDISC_OPTS-diffserv4}" ;;
+	@.proposal.access.medium) emit "${RESULT_ACCESS_MEDIUM-unknown}" ;;
+	@.proposal.access.source) emit "${RESULT_ACCESS_SOURCE-legacy_default}" ;;
+	@.proposal.access.confidence_percent) emit "${RESULT_ACCESS_CONFIDENCE-0}" ;;
+	*.exploration_minimum_kbps) echo "${RESULT_EXPLORATION_MINIMUM_KBPS-5000}" ;;
+	*.runtime_minimum_kbps) echo "${RESULT_RUNTIME_MINIMUM_KBPS-}" ;;
 	*.minimum_kbps) echo "${RESULT_MINIMUM_KBPS-5000}" ;;
 	*.base_kbps) echo "${RESULT_BASE_KBPS-20000}" ;;
 	*.maximum_kbps) echo "${RESULT_MAXIMUM_KBPS-80000}" ;;
+	*.tested_safe_maximum_kbps) echo "${RESULT_TESTED_SAFE_MAXIMUM_KBPS-80000}" ;;
 	*.absolute_cap_kbps) echo "${RESULT_CAP_KBPS-90000}" ;;
+	*.exploration_cap_kbps) echo "${RESULT_EXPLORATION_CAP_KBPS-90000}" ;;
+	*.service_hard_cap_kbps) echo "${RESULT_SERVICE_HARD_CAP_KBPS-}" ;;
+	*.ceiling_evidence) echo "${RESULT_CEILING_EVIDENCE-shaped_validation}" ;;
+	*.cap_source) echo "${RESULT_CAP_SOURCE-measured_raw}" ;;
 	*.observed_low_kbps) echo "${RESULT_OBSERVED_LOW_KBPS-75000}" ;;
 	*.observed_median_kbps) echo "${RESULT_OBSERVED_MEDIAN_KBPS-80000}" ;;
 	*.observed_high_kbps) echo "${RESULT_OBSERVED_HIGH_KBPS-85000}" ;;
@@ -147,7 +157,8 @@ case "$expression" in
 	*.link.overhead) echo "${RESULT_LINK_OVERHEAD-44}" ;;
 	*.link.mpu) echo "${RESULT_LINK_MPU-84}" ;;
 	*.confidence) echo "${RESULT_CONFIDENCE-85}" ;;
-	*.adaptive_ceiling.enabled) echo "${RESULT_PROPOSAL_ADAPTIVE_ENABLED-false}" ;;
+	*.adaptive_ceiling.enabled) echo "${RESULT_PROPOSAL_ADAPTIVE_ENABLED-true}" ;;
+	*.adaptive_ceiling.policy) echo "${RESULT_CAPACITY_LEARNING_POLICY-passive_bounded}" ;;
 	*.link.layer) echo ethernet ;;
 	*) exit 1 ;;
 esac
@@ -467,14 +478,16 @@ reset_case() {
 	unset RESULT_CLASS RESULT_CONFIDENCE_OVERALL RESULT_CONFIDENCE_QUALITY
 	unset RESULT_REALIZATION_MIN_PERCENT RESULT_REALIZATION_MAX_PERCENT RESULT_RETENTION_PERCENT RESULT_ICMP_DELTA_MAX_MS RESULT_DELAY_MAX_MS RESULT_LOSS_MAX_PERCENT RESULT_CPU_MAX_PERCENT
 	unset RESULT_SQM_QDISC RESULT_SQM_SCRIPT RESULT_SQM_CLASSIFICATION RESULT_SQM_SQUASH_DSCP RESULT_SQM_SQUASH_INGRESS RESULT_SQM_INGRESS_ECN RESULT_SQM_EGRESS_ECN RESULT_SQM_IQDISC_OPTS RESULT_SQM_EQDISC_OPTS
+	unset RESULT_EXPLORATION_MINIMUM_KBPS RESULT_RUNTIME_MINIMUM_KBPS RESULT_TESTED_SAFE_MAXIMUM_KBPS RESULT_EXPLORATION_CAP_KBPS RESULT_SERVICE_HARD_CAP_KBPS RESULT_CEILING_EVIDENCE RESULT_CAP_SOURCE
 	unset RESULT_MINIMUM_KBPS RESULT_BASE_KBPS RESULT_MAXIMUM_KBPS RESULT_CAP_KBPS RESULT_OBSERVED_LOW_KBPS RESULT_OBSERVED_MEDIAN_KBPS RESULT_OBSERVED_HIGH_KBPS RESULT_ACTIVE_THRESHOLD_KBPS RESULT_ADJUST_UP_MS RESULT_DELAY_MS RESULT_ADJUST_DOWN_MS RESULT_HOLD_S RESULT_GROWTH_PERCENT RESULT_PROBE_S RESULT_COOLDOWN_S RESULT_TTL_S RESULT_LINK_OVERHEAD RESULT_LINK_MPU RESULT_CONFIDENCE
+	unset RESULT_PROPOSAL_ADAPTIVE_ENABLED RESULT_CAPACITY_LEARNING_POLICY RESULT_ACCESS_MEDIUM RESULT_ACCESS_SOURCE RESULT_ACCESS_CONFIDENCE
 	export RESULT_STATE=complete
 	export RESULT_SCHEMA_VERSION=8
 	export RESULT_PRODUCER=cake-autorate-rs-autotune
 	export RESULT_PROFILE=best_overall
 	export RESULT_RUN_ID=scheduler-test-run
 	export RESULT_VALIDATION_PROFILE=best_overall
-	export RESULT_PROPOSAL_SCHEMA_VERSION=3
+	export RESULT_PROPOSAL_SCHEMA_VERSION=4
 	export RESULT_PROPOSAL_PROFILE=best_overall
 	export RESULT_TARGET_GRADE=A
 	export RESULT_QUALITY_TARGET_REQUIRED=true
@@ -531,13 +544,16 @@ expect_gate_rejection() {
 }
 
 reset_case
-export RESULT_PROPOSAL_ADAPTIVE_ENABLED=false
 apply_result test '{}' "$fingerprint_a" eth0
 commit_line="$(sed -n '/^uci:commit:candidate$/=' "$log")"
 restart_line="$(sed -n '/^service:1:restart$/=' "$log")"
 [ -n "$commit_line" ] && [ -n "$restart_line" ] && [ "$commit_line" -lt "$restart_line" ]
 ! grep -q '^uci:revert$' "$log"
-! grep -q 'adaptive_ceiling_enabled' "$log"
+[ "$(uci -q get cake-autorate.test.adaptive_ceiling_enabled)" = 1 ]
+[ "$(uci -q get cake-autorate.test.capacity_learning_policy)" = passive_bounded ]
+[ "$(uci -q get cake-autorate.test.adaptive_ceiling_dl_safe_kbps)" = 80000 ]
+[ "$(uci -q get cake-autorate.test.adaptive_ceiling_dl_evidence)" = shaped_validation ]
+[ "$(uci -q get cake-autorate.test.access_medium)" = unknown ]
 ! grep -q 'lock-escaped' "$log"
 [ "$(cat "$route_count")" = 3 ]
 [ "$(cat "$health_count")" = 1 ]
@@ -579,11 +595,13 @@ apply_result test '{}' "$fingerprint_a" eth0
 [ "$(uci -q get cake-autorate.test.sqm_eqdisc_opts)" = diffserv4 ]
 assert_global_lock_released
 
-# Scheduled re-runs preserve the administrator's adaptive-ceiling choice.
+# Scheduled apply records the proposal's explicit, internally consistent
+# capacity-learning policy instead of relying on a hidden legacy toggle.
 reset_case
 export RESULT_PROPOSAL_ADAPTIVE_ENABLED=true
 apply_result test '{}' "$fingerprint_a" eth0
-! grep -q 'adaptive_ceiling_enabled' "$log"
+[ "$(uci -q get cake-autorate.test.adaptive_ceiling_enabled)" = 1 ]
+[ "$(uci -q get cake-autorate.test.capacity_learning_policy)" = passive_bounded ]
 
 reset_case; export RESULT_SCHEMA_VERSION=7; expect_gate_rejection 'legacy schema'
 reset_case; export RESULT_SCHEMA_VERSION=4; expect_gate_rejection 'older legacy schema'
@@ -593,7 +611,13 @@ reset_case; export RESULT_RUN_ID=__missing__; expect_gate_rejection 'missing imm
 reset_case; export RESULT_PROFILE=gaming; expect_gate_rejection 'profile/policy mismatch'
 reset_case; export RESULT_VALIDATION_PROFILE=fair; expect_gate_rejection 'validation profile mismatch'
 reset_case; export RESULT_PROPOSAL_SCHEMA_VERSION=2; expect_gate_rejection 'legacy proposal schema'
+reset_case; export RESULT_PROPOSAL_SCHEMA_VERSION=3; expect_gate_rejection 'previous proposal schema'
 reset_case; export RESULT_PROPOSAL_PROFILE=fair; expect_gate_rejection 'proposal profile mismatch'
+reset_case; export RESULT_TESTED_SAFE_MAXIMUM_KBPS=79999; expect_gate_rejection 'unverified proposal maximum'
+reset_case; export RESULT_CEILING_EVIDENCE=unvalidated_candidate; expect_gate_rejection 'unvalidated ceiling evidence'
+reset_case; export RESULT_CAP_SOURCE=user_service_limit; expect_gate_rejection 'missing user service cap'
+reset_case; export RESULT_CAPACITY_LEARNING_POLICY=verified_only; expect_gate_rejection 'learning policy and adaptive state mismatch'
+reset_case; export RESULT_ACCESS_SOURCE=forged; expect_gate_rejection 'invalid access-medium source'
 reset_case; export RESULT_QUALITY_TARGET_REQUIRED=false; expect_gate_rejection 'tampered quality-target policy'
 reset_case; export RESULT_THROUGHPUT_PRIORITY=true; expect_gate_rejection 'tampered throughput-priority policy'
 reset_case; export RESULT_STATE=failed; expect_gate_rejection 'non-complete result'

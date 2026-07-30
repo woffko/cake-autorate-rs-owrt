@@ -106,6 +106,19 @@ for wide links: it accepts only measured A+ minima, disables Auto-Apply below
 70% retained capacity, and warns that such a throughput sacrifice is intended
 for short latency-critical sessions rather than continuous household use.
 
+Variable link opens a small access/capacity wizard instead of guessing the
+provider medium from an Ethernet or PPPoE handoff. QMI/MBIM/NCM and modem-like
+devices can be identified with an explicit confidence value; cellular,
+LEO/GEO satellite, fixed wireless/WISP, shared wired and unknown access can
+always be selected manually. The choice sets only the bounded exploration
+floor and probe cadence. It never invents a runtime limit: only an exact tested
+CAKE point may become the minimum or safe ceiling. Runtime learning is a
+separate choice between **Validated ceiling only**, **Bounded learning from
+real traffic**, **Bounded + scheduled active calibration**, and **Explicit
+service hard caps**.
+
+[![Variable Link access and capacity-learning setup](docs/screenshots/variable-link-setup.png)](docs/screenshots/variable-link-setup.png)
+
 [![Full Auto-Tune calibration profiles](docs/screenshots/autotune-profiles.png)](docs/screenshots/autotune-profiles.png)
 
 ### Controlled cellular observations (anonymized)
@@ -172,8 +185,9 @@ RC27 implements the following controller and LuCI model:
   target-meeting tested point while the peer direction finishes its search.
   Such a result is always manual-review only, requires a safe simultaneous
   DL+UL confirmation, and never invents an untested runtime minimum.
-- When Variable-link reaches its 35% exploration boundary without proving a
-  knee, or bounded repeats remain nonmonotonic, keep the result useful without
+- When Variable-link reaches its medium-specific 35%, 40%, or 50%
+  exploration boundary without proving a knee, or bounded repeats remain
+  nonmonotonic, keep the result useful without
   overstating it: select the best exact-tested safe point at or above the 50%
   trust boundary, use that same point as the runtime minimum, require a safe
   simultaneous DL+UL confirmation, and expose it only for manual review.
@@ -184,15 +198,19 @@ RC27 implements the following controller and LuCI model:
   (30 ms), Best overall A to B (60 ms), Variable link B to C (200 ms), and Fair
   C to D (400 ms). Final simultaneous realization between 50% and the ordinary
   80% proof threshold is also an explicit per-direction acknowledgement.
-- Grow passively by default only under proven saturation and clean transport
-  evidence. Optional active probes can test above the safe bound; only a clean
-  candidate promotes it.
+- Grow passively only under proven saturation, clean transport evidence and a
+  measurable throughput gain. The selected policy may instead freeze the
+  exact validated ceiling, add budgeted scheduled calibration, or enforce
+  explicit service caps. Variable Link never treats either policy choice as
+  evidence of capacity above its measured raw control.
 - Apply causal backoff: two reductions without meaningful latency improvement
   restore the last useful point and enter `HOLD_NO_EFFECT` instead of destroying
   throughput for radio/operator delay outside CAKE's control.
 - Keep three user choices separate: calibration strategy (**Shaped only**,
   **Full raw capacity**, or **Reuse trusted bounds**), runtime learning
-  (**Passive only**, **Periodic active probes**, or **Fixed bounds**), and
+  (**Validated ceiling only**, **Bounded learning from real traffic**,
+  **Bounded + scheduled active calibration**, or **Explicit service hard
+  caps**), and
   operating profile (Gaming, Best overall, Variable link, or Fair). Reuse is
   enabled only after that instance has saved positive DL and UL P50 references;
   an uncalibrated or stale reuse choice is explained and safely normalized to
@@ -238,8 +256,8 @@ The RC27 release builds the OpenWrt 25.12 daemon APK for this ABI matrix:
 The target is an APK ABI rather than one specific board. The authoritative
 choice is the value returned by `apk --print-arch`. Every daemon asset follows
 the name
-`cake-autorate-rs-1.0_rc27-r21_openwrt-25.12_<arch>.apk`; the shared
-`luci-app-cake-autorate-rs-1.0_rc27-r43_openwrt-25.12_all.apk` contains the
+`cake-autorate-rs-1.0_rc27-r22_openwrt-25.12_<arch>.apk`; the shared
+`luci-app-cake-autorate-rs-1.0_rc27-r45_openwrt-25.12_all.apk` contains the
 architecture-independent LuCI interface and SQM integration.
 
 RC27 adds background-aware Full Auto-Tune confidence without mixing forwarded
@@ -295,7 +313,7 @@ that controller:
 | Initial tuning | User chooses min/base/max from observed link behavior | Manual wizard, backend-aware speed test, and Full Auto-Tune with separate Gaming, Best overall, Variable link, and Fair throughput/latency objectives |
 | Auto-Tune safety | Not an upstream feature | RAM-only jobs, background-traffic accounting, ICMP plus native transport evidence, bounded per-direction frontier search, typed validation, exact proposal review, crash recovery, and guarded UCI apply |
 | Quality | Delay drives the controller | LibreQoS-style complete DL/UL detected grades, passive client-traffic episodes, guided **Get rating**, CURRENT/LAST KNOWN semantics, and optional transport-aware ceiling control |
-| Maximum discovery | Configured maximum is fixed | Optional bounded adaptive ceiling learns a safe upper bound below explicit absolute caps without rewriting UCI |
+| Maximum discovery | Configured maximum is fixed | Optional bounded adaptive ceiling starts from exact shaped evidence and learns only below measured-raw and optional service caps, without rewriting UCI |
 | Observability | Detailed logs and external analysis tools | Live JSON status, component-level Services health, CPU/softirq and CAKE diagnostics, redacted export, and opt-in RAM-only synchronized latency/CPU/traffic graphs |
 | Traffic policy | Relies on the surrounding CAKE/SQM configuration | Optional outbound-only nftables DSCP profiles for Gaming, Best overall, Fair, and editable Custom rules, with runtime checksum attestation and no second qdisc owner |
 | Automation | Primarily controller runtime | Scheduled quiet-window Auto-Tune, per-instance speed-test server caching, package/backend checks, and safe review-only versus validated auto-apply modes |
@@ -337,13 +355,14 @@ representative examples rather than guarantees.
 
 ## Release history
 
-The current public prerelease is **RC27 r21/r43**: daemon package r21 and LuCI
-package r43. It retains the manual per-direction CAKE selector and Save & Apply
-fix from r42, then adds bounded speed-test timeout recovery: same-server retries,
-one complete-series fallback for automatically selected servers, typed
-non-applyable inconclusive results, and clearer retry diagnostics in LuCI. The
-focused live transition matrix, full browser audit, package ABI verification and
-design chronology are recorded in [Testing](TESTING.md). The README intentionally
+The current public prerelease is **RC27 r22/r45**: daemon package r22 and LuCI
+package r45. It retains the manual per-direction CAKE selector and bounded
+speed-test timeout recovery, then adds a Variable Link access mini-wizard,
+medium-specific exploration floors, exact measured-raw/service cap provenance,
+and four explicit runtime capacity-learning policies. Adaptive growth now starts
+from an exact tested-safe rate and requires both clean latency and a measurable
+throughput gain. The focused live transition matrix, full browser audit, package
+ABI verification and design chronology are recorded in [Testing](TESTING.md). The README intentionally
 describes current behavior instead of retaining a cumulative RC diary;
 historical source points remain in Git tags while
 [GitHub Releases](https://github.com/woffko/cake-autorate-rs-owrt/releases)
@@ -401,15 +420,18 @@ Implemented:
   persistent pingers and scheduler separately, including short-lived child
   work waited by each daemon.
 - adaptive rate calculations using delay/load windows.
-- Optional Rust-only bounded-probe ceiling extension, disabled by default so
-  the upstream configured maximum remains a hard limit. When enabled, each
-  direction independently qualifies clean high load, briefly tests a higher
-  ceiling, promotes a clean target to its learned-safe bound, and remembers the
+- Optional Rust-only bounded-probe ceiling extension. **Validated ceiling
+  only** is the conservative default when link classification is inconclusive;
+  bounded passive/scheduled learning is an explicit policy. Each direction
+  starts from its exact tested-safe point, independently qualifies clean high
+  load, briefly tests a higher ceiling, promotes only a clean target with a
+  measurable throughput gain, and remembers the
   lowest target that caused confirmed bufferbloat. Later probes use the midpoint
   between safe and failed bounds. Short load/delay-classification fluctuations
   are tolerated, while sustained loss or a global probe-response gap rolls back
   without poisoning the safe/failed bounds; a stall resets runtime learning.
-  Absolute DL/UL caps remain hard safety limits, and UCI is never rewritten.
+  Measured-raw DL/UL caps and any tighter service caps remain hard safety
+  limits, and runtime learning never rewrites UCI.
   Status exposes the phase, safe ceiling, failed bound, probe target, and last
   transition reason. See [ADAPTIVE_CEILING.md](ADAPTIVE_CEILING.md) for the
   state machine and acceptance tests.
@@ -788,8 +810,8 @@ For example, when it prints `aarch64_generic`:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc27-r21_openwrt-25.12_aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc27-r43_openwrt-25.12_all.apk
+  /root/cake-autorate-rs-1.0_rc27-r22_openwrt-25.12_aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc27-r45_openwrt-25.12_all.apk
 ```
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:

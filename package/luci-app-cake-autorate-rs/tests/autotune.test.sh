@@ -2404,6 +2404,81 @@ printf '%s\n' "$fair_proposal" | grep -q '"profile":"fair","target_grade":"C","q
 printf '%s\n' "$fair_proposal" | grep -q '"capacity_retention_min_percent":90.0'
 printf '%s\n' "$fair_proposal" | grep -q '"script":"layer_cake.qos","classification":"diffserv4"'
 printf '%s\n' "$fair_proposal" | grep -q '"iqdisc_opts":"besteffort","eqdisc_opts":"diffserv4"'
+autotune_profile=variable_link
+access_medium=cellular
+access_source=user_selected
+access_confidence_percent=100
+capacity_learning_policy=passive_bounded
+service_dl_cap_kbps=""
+service_ul_cap_kbps=""
+variable_proposal="$(calculate_proposal)"
+proposal_json_valid "$variable_proposal"
+node - "$variable_proposal" <<'EOF'
+const proposal = JSON.parse(process.argv[2]);
+for (const direction of [ 'download', 'upload' ]) {
+	const value = proposal[direction];
+	if (value.exploration_cap_kbps !== value.observed_high_kbps ||
+	    value.absolute_cap_kbps !== value.observed_high_kbps)
+		throw new Error(`Variable Link ${direction} invented capacity above its raw control`);
+}
+EOF
+tampered_variable_proposal="$(printf '%s\n' "$variable_proposal" | node -e '
+const fs = require("fs");
+const value = JSON.parse(fs.readFileSync(0, "utf8"));
+value.download.absolute_cap_kbps += 100;
+value.download.exploration_cap_kbps += 100;
+process.stdout.write(JSON.stringify(value));
+')"
+if proposal_json_valid "$tampered_variable_proposal"; then exit 1; fi
+service_dl_cap_kbps=80000
+service_ul_cap_kbps=15000
+capacity_learning_policy=fixed_cap
+service_capped_variable_proposal="$(calculate_proposal)"
+proposal_json_valid "$service_capped_variable_proposal"
+node - "$service_capped_variable_proposal" <<'EOF'
+const proposal = JSON.parse(process.argv[2]);
+if (proposal.download.exploration_cap_kbps !== proposal.download.observed_high_kbps ||
+    proposal.download.absolute_cap_kbps !== 80000 ||
+    proposal.upload.exploration_cap_kbps !== proposal.upload.observed_high_kbps ||
+    proposal.upload.absolute_cap_kbps !== 15000)
+	throw new Error('service caps must tighten the effective cap without replacing raw evidence');
+EOF
+
+# Legacy Variable Link callers have neither a physical-medium provenance nor
+# a capacity-learning policy. They must freeze the exact validated ceiling;
+# only strong local evidence (or an explicit user choice) may default to
+# bounded passive learning.
+saved_job_name="$job_name"
+job_name=variablecontext
+autotune_profile=variable_link
+access_medium_argument=""
+access_source_argument=""
+access_confidence_argument=""
+capacity_learning_policy_argument=""
+service_dl_cap_argument=""
+service_ul_cap_argument=""
+resolve_access_context
+test "$access_medium" = unknown
+test "$access_source" = legacy_default
+test "$capacity_learning_policy" = verified_only
+access_medium_argument=cellular
+access_source_argument=network_protocol
+access_confidence_argument=95
+resolve_access_context
+test "$capacity_learning_policy" = passive_bounded
+job_name="$saved_job_name"
+access_medium_argument=""
+access_source_argument=""
+access_confidence_argument=""
+capacity_learning_policy_argument=""
+service_dl_cap_argument=""
+service_ul_cap_argument=""
+service_dl_cap_kbps=""
+service_ul_cap_kbps=""
+capacity_learning_policy=""
+access_medium=unknown
+access_source=legacy_default
+access_confidence_percent=0
 autotune_profile=best_overall
 route_mode=main
 target_if=lo
@@ -2940,10 +3015,12 @@ fi
 # actually evaluated candidates.
 : > "$work/counter"
 export AUTOTUNE_MOCK_VARIABLE_DIRECTIONAL_NO_EFFECT=1
-"$autotune" variabledirectional lo start speedtest-go '' '' variable_link > "$work/variabledirectional-start.json"
+"$autotune" variabledirectional lo start speedtest-go '' '' variable_link 0 '' 0 full_raw \
+	cellular user_selected 100 passive_bounded > "$work/variabledirectional-start.json"
 attempt=0
 while [ "$attempt" -lt 500 ]; do
-	"$autotune" variabledirectional lo status speedtest-go '' '' variable_link > "$work/variabledirectional-status.json"
+	"$autotune" variabledirectional lo status speedtest-go '' '' variable_link 0 '' 0 full_raw \
+		cellular user_selected 100 passive_bounded > "$work/variabledirectional-status.json"
 	grep -q '"state":"complete"' "$work/variabledirectional-status.json" && break
 	attempt=$((attempt + 1))
 	sleep 0.05
@@ -3055,6 +3132,9 @@ if (result.state !== 'complete' || result.profile !== 'fair' ||
     proposals.some(item => item.action === 'apply_sqm'))
 	throw new Error(`Fair bounded search did not preserve the fastest reviewable safe solution: ${JSON.stringify({
 		state: result.state,
+		error: result.error,
+		stage: result.stage,
+		speedtestSupervisor: result.speedtest_supervisor,
 		profile: result.profile,
 		validation: result.validation && {
 			safety: result.validation.safety_pass,

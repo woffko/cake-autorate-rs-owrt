@@ -133,14 +133,56 @@ case "$expression" in
 	'@.download.minimum_kbps')
 		printf '%s\n' "$input" | sed -n 's/.*"download":{"minimum_kbps":\([0-9][0-9]*\).*/\1/p'
 		;;
+	'@.download.exploration_minimum_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"download":{[^}]*"exploration_minimum_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.download.runtime_minimum_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"download":{[^}]*"runtime_minimum_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
 	'@.upload.minimum_kbps')
 		printf '%s\n' "$input" | sed -n 's/.*"upload":{"minimum_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.upload.exploration_minimum_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"upload":{[^}]*"exploration_minimum_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.upload.runtime_minimum_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"upload":{[^}]*"runtime_minimum_kbps":\([0-9][0-9]*\).*/\1/p'
 		;;
 	'@.download.maximum_kbps')
 		printf '%s\n' "$input" | sed -n 's/.*"download":{[^}]*"maximum_kbps":\([0-9][0-9]*\).*/\1/p'
 		;;
+	'@.download.tested_safe_maximum_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"download":{[^}]*"tested_safe_maximum_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.download.exploration_cap_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"download":{[^}]*"exploration_cap_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.download.service_hard_cap_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"download":{[^}]*"service_hard_cap_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.download.ceiling_evidence')
+		printf '%s\n' "$input" | sed -n 's/.*"download":{[^}]*"ceiling_evidence":"\([^"]*\)".*/\1/p'
+		;;
+	'@.download.cap_source')
+		printf '%s\n' "$input" | sed -n 's/.*"download":{[^}]*"cap_source":"\([^"]*\)".*/\1/p'
+		;;
 	'@.upload.maximum_kbps')
 		printf '%s\n' "$input" | sed -n 's/.*"upload":{[^}]*"maximum_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.upload.tested_safe_maximum_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"upload":{[^}]*"tested_safe_maximum_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.upload.exploration_cap_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"upload":{[^}]*"exploration_cap_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.upload.service_hard_cap_kbps')
+		printf '%s\n' "$input" | sed -n 's/.*"upload":{[^}]*"service_hard_cap_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.upload.ceiling_evidence')
+		printf '%s\n' "$input" | sed -n 's/.*"upload":{[^}]*"ceiling_evidence":"\([^"]*\)".*/\1/p'
+		;;
+	'@.upload.cap_source')
+		printf '%s\n' "$input" | sed -n 's/.*"upload":{[^}]*"cap_source":"\([^"]*\)".*/\1/p'
 		;;
 	'@.download.observed_low_kbps')
 		printf '%s\n' "$input" | sed -n 's/.*"download":{[^}]*"observed_low_kbps":\([0-9][0-9]*\).*/\1/p'
@@ -181,6 +223,9 @@ case "$expression" in
 	'@.adaptive_ceiling.enabled')
 		printf '%s\n' "$input" | sed -n 's/.*"adaptive_ceiling":{"enabled":\(true\|false\).*/\1/p'
 		;;
+	'@.adaptive_ceiling.policy')
+		printf '%s\n' "$input" | sed -n 's/.*"adaptive_ceiling":{[^}]*"policy":"\([^"]*\)".*/\1/p'
+		;;
 	'@.adaptive_ceiling.hold_s')
 		printf '%s\n' "$input" | sed -n 's/.*"adaptive_ceiling":{[^}]*"hold_s":\([0-9][0-9]*\).*/\1/p'
 		;;
@@ -195,6 +240,15 @@ case "$expression" in
 		;;
 	'@.adaptive_ceiling.failed_bound_ttl_s')
 		printf '%s\n' "$input" | sed -n 's/.*"adaptive_ceiling":{[^}]*"failed_bound_ttl_s":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.access.medium')
+		printf '%s\n' "$input" | sed -n 's/.*"access":{"medium":"\([^"]*\)".*/\1/p'
+		;;
+	'@.access.source')
+		printf '%s\n' "$input" | sed -n 's/.*"access":{[^}]*"source":"\([^"]*\)".*/\1/p'
+		;;
+	'@.access.confidence_percent')
+		printf '%s\n' "$input" | sed -n 's/.*"access":{[^}]*"confidence_percent":\([0-9][0-9]*\).*/\1/p'
 		;;
 	'@.validation.candidate_realization_min_percent')
 		printf '%s\n' "$input" | sed -n 's/.*"validation":{"candidate_realization_min_percent":\([0-9.][0-9.]*\).*/\1/p'

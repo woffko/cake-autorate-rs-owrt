@@ -18,7 +18,9 @@ a competing replacement controller.
 
 ## Safety invariants
 
-- The configured maximum is the initial and reset ceiling.
+- The exact tested-safe ceiling recorded by Full Auto-Tune is the initial and
+  reset ceiling. A legacy section without provenance falls back to the lower of
+  its configured base and maximum instead of trusting an old enlarged cap.
 - The effective ceiling never exceeds the absolute cap.
 - Runtime learning never rewrites UCI.
 - Only confirmed bufferbloat creates a failed upper bound. Isolated load or
@@ -28,7 +30,10 @@ a competing replacement controller.
   target as failed. A missed response from one reflector does not count as a
   global gap while other reflectors continue producing valid samples.
 - A failed probe returns immediately to the last proven-safe ceiling.
-- A stall resets all learned state to the configured maximum.
+- A clean probe promotes its target only when achieved throughput also improves
+  beyond the configured noise threshold. Clean latency without useful capacity
+  gain keeps the previous safe ceiling.
+- A stall resets all learned state to the initial verified-safe ceiling.
 - A stale failed bound expires so a recovered variable-rate link can be probed
   again.
 
@@ -57,7 +62,12 @@ Each direction tracks these values independently:
    controller does not repeatedly touch an already-localized bottleneck.
 4. `probe_ramp -> probe_observe` once the shaper reaches 98% of the target.
 5. `probe_observe -> backoff` after the configured clean observation time. The
-   target becomes the new safe ceiling.
+   target becomes the new safe ceiling only when measured throughput improved
+   materially; otherwise it returns to the previous safe ceiling with
+   `no-throughput-gain` evidence. A no-gain result is not a failed upper bound:
+   only confirmed bufferbloat may poison that bound. The gain threshold scales
+   with both the baseline rate and the actual probe step so narrow uplinks can
+   still prove improvements smaller than 1 Mbit/s.
 6. Confirmed bufferbloat during a probe records the target as failed and enters
    backoff at the previous safe ceiling.
 7. Loss of high load or acceptable delay starts a short grace window. Recovery
@@ -65,7 +75,28 @@ Each direction tracks these values independently:
    aborts the probe to the safe ceiling without creating a failed bound.
 8. `backoff -> cruise` after the configured cooldown.
 9. A failed bound expires after its TTL. A stall or service restart resets all
-   state to the configured maximum.
+   state to the initial verified-safe ceiling.
+
+## Capacity-learning policies
+
+Variable Link records one explicit policy in UCI and proposal JSON:
+
+- `verified_only`: keep the exact validated ceiling; autorate may still reduce
+  toward its tested runtime minimum, but the outer controller cannot raise the
+  ceiling.
+- `passive_bounded`: observe real sustained traffic and open a bounded probe
+  only when load, transport latency, CAKE state, and route identity are clean.
+- `scheduled_active`: use the same bounded passive controller and also run
+  Full Auto-Tune in an opt-in maintenance window with crash-safe daily/monthly
+  traffic budgets.
+- `fixed_cap`: disable adaptive growth and retain explicit download/upload
+  service hard caps. A service cap may tighten measured raw capacity but can
+  never expand it.
+
+The Variable Link access choice adjusts search depth and cadence, not the
+safety contract. Cellular/LEO may explore to 35%, GEO/fixed wireless to 40%,
+and shared/unknown access to 50% of the conservative raw reference. A runtime
+minimum is accepted only from an exact tested CAKE point.
 
 ## Compatibility
 
@@ -76,6 +107,16 @@ The existing options remain valid:
 - `adaptive_ceiling_ul_cap_kbps`
 - `adaptive_ceiling_hold_time_s`
 - `adaptive_ceiling_growth_percent`
+
+New provenance/policy options written by current Full Auto-Tune include:
+
+- `adaptive_ceiling_{dl,ul}_safe_kbps`
+- `adaptive_ceiling_{dl,ul}_evidence`
+- `adaptive_ceiling_{dl,ul}_cap_source`
+- `capacity_learning_policy`
+- `access_medium_selection`, `access_medium`, `access_medium_source`, and
+  `access_medium_confidence_percent`
+- optional `service_{dl,ul}_cap_kbps`
 
 `adaptive_ceiling_growth_percent` becomes the maximum open-ended probe step.
 New optional values control observation duration, cooldown, and failed-bound

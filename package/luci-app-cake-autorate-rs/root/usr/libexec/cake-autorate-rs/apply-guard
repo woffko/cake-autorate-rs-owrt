@@ -156,7 +156,7 @@ is_int() {
 }
 
 is_positive_rate() {
-	is_uint "$1" && [ "$1" -gt 0 ] 2>/dev/null && [ "$1" -le 100000000 ] 2>/dev/null
+	is_uint "$1" && [ "$1" -ge 100 ] 2>/dev/null && [ "$1" -le 100000000 ] 2>/dev/null
 }
 
 is_decimal() {
@@ -535,7 +535,7 @@ load_profile_contract() {
 		die "The Full Auto-Tune quality-target policy is missing."
 	throughput_priority="$(require_result_value '@.proposal.throughput_priority')" ||
 		die "The Full Auto-Tune throughput-priority policy is missing."
-	[ "$proposal_schema" = 3 ] && [ "$proposal_profile" = "$profile" ] ||
+	[ "$proposal_schema" = 4 ] && [ "$proposal_profile" = "$profile" ] ||
 		die "The Full Auto-Tune proposal profile contract is invalid."
 
 	validation_realization_min="$(require_result_value '@.proposal.validation.candidate_realization_min_percent')" ||
@@ -808,22 +808,149 @@ build_expected_manifest() {
 		die "The Full Auto-Tune transport-latency policy cannot be normalized."
 
 	dl_min="$(proposal_rate '@.proposal.download.minimum_kbps')" || die "The Full Auto-Tune proposal contains an invalid download minimum."
+	dl_exploration_min="$(proposal_rate '@.proposal.download.exploration_minimum_kbps')" || die "The Full Auto-Tune proposal contains an invalid download exploration minimum."
+	dl_runtime_min="$(json_get "$result_copy" '@.proposal.download.runtime_minimum_kbps' 2>/dev/null || true)"
+	[ "$dl_runtime_min" = null ] && dl_runtime_min=""
 	dl_base="$(proposal_rate '@.proposal.download.base_kbps')" || die "The Full Auto-Tune proposal contains an invalid download base."
 	dl_max="$(proposal_rate '@.proposal.download.maximum_kbps')" || die "The Full Auto-Tune proposal contains an invalid download maximum."
+	dl_tested_max="$(json_get "$result_copy" '@.proposal.download.tested_safe_maximum_kbps' 2>/dev/null || true)"
+	[ "$dl_tested_max" = null ] && dl_tested_max=""
+	dl_exploration_cap="$(proposal_rate '@.proposal.download.exploration_cap_kbps')" || die "The Full Auto-Tune proposal contains an invalid download exploration cap."
 	dl_cap="$(proposal_rate '@.proposal.download.absolute_cap_kbps')" || die "The Full Auto-Tune proposal contains an invalid download cap."
+	dl_service_cap="$(json_get "$result_copy" '@.proposal.download.service_hard_cap_kbps' 2>/dev/null || true)"
+	[ "$dl_service_cap" = null ] && dl_service_cap=""
+	dl_ceiling_evidence="$(require_result_value '@.proposal.download.ceiling_evidence')" || die "The Full Auto-Tune proposal has no download ceiling evidence."
+	dl_cap_source="$(require_result_value '@.proposal.download.cap_source')" || die "The Full Auto-Tune proposal has no download cap source."
 	dl_low="$(proposal_rate '@.proposal.download.observed_low_kbps')" || die "The Full Auto-Tune proposal contains an invalid download reference."
 	dl_median="$(proposal_rate '@.proposal.download.observed_median_kbps')" || die "The Full Auto-Tune proposal contains an invalid download median."
+	dl_high="$(proposal_rate '@.proposal.download.observed_high_kbps')" || die "The Full Auto-Tune proposal contains an invalid download high reference."
 	ul_min="$(proposal_rate '@.proposal.upload.minimum_kbps')" || die "The Full Auto-Tune proposal contains an invalid upload minimum."
+	ul_exploration_min="$(proposal_rate '@.proposal.upload.exploration_minimum_kbps')" || die "The Full Auto-Tune proposal contains an invalid upload exploration minimum."
+	ul_runtime_min="$(json_get "$result_copy" '@.proposal.upload.runtime_minimum_kbps' 2>/dev/null || true)"
+	[ "$ul_runtime_min" = null ] && ul_runtime_min=""
 	ul_base="$(proposal_rate '@.proposal.upload.base_kbps')" || die "The Full Auto-Tune proposal contains an invalid upload base."
 	ul_max="$(proposal_rate '@.proposal.upload.maximum_kbps')" || die "The Full Auto-Tune proposal contains an invalid upload maximum."
+	ul_tested_max="$(json_get "$result_copy" '@.proposal.upload.tested_safe_maximum_kbps' 2>/dev/null || true)"
+	[ "$ul_tested_max" = null ] && ul_tested_max=""
+	ul_exploration_cap="$(proposal_rate '@.proposal.upload.exploration_cap_kbps')" || die "The Full Auto-Tune proposal contains an invalid upload exploration cap."
 	ul_cap="$(proposal_rate '@.proposal.upload.absolute_cap_kbps')" || die "The Full Auto-Tune proposal contains an invalid upload cap."
+	ul_service_cap="$(json_get "$result_copy" '@.proposal.upload.service_hard_cap_kbps' 2>/dev/null || true)"
+	[ "$ul_service_cap" = null ] && ul_service_cap=""
+	ul_ceiling_evidence="$(require_result_value '@.proposal.upload.ceiling_evidence')" || die "The Full Auto-Tune proposal has no upload ceiling evidence."
+	ul_cap_source="$(require_result_value '@.proposal.upload.cap_source')" || die "The Full Auto-Tune proposal has no upload cap source."
 	ul_low="$(proposal_rate '@.proposal.upload.observed_low_kbps')" || die "The Full Auto-Tune proposal contains an invalid upload reference."
 	ul_median="$(proposal_rate '@.proposal.upload.observed_median_kbps')" || die "The Full Auto-Tune proposal contains an invalid upload median."
+	ul_high="$(proposal_rate '@.proposal.upload.observed_high_kbps')" || die "The Full Auto-Tune proposal contains an invalid upload high reference."
 	active_threshold="$(proposal_rate '@.proposal.active_threshold_kbps')" || die "The Full Auto-Tune proposal contains an invalid active threshold."
-	[ "$dl_min" -le "$dl_base" ] && [ "$dl_base" -le "$dl_max" ] && [ "$dl_max" -le "$dl_cap" ] ||
+	[ "$dl_exploration_min" -le "$dl_min" ] && [ "$dl_min" -le "$dl_base" ] &&
+		[ "$dl_base" -le "$dl_max" ] && [ "$dl_max" -le "$dl_cap" ] &&
+		[ "$dl_cap" -le "$dl_exploration_cap" ] ||
 		die "The Full Auto-Tune download bounds are not monotonic."
-	[ "$ul_min" -le "$ul_base" ] && [ "$ul_base" -le "$ul_max" ] && [ "$ul_max" -le "$ul_cap" ] ||
+	[ "$ul_exploration_min" -le "$ul_min" ] && [ "$ul_min" -le "$ul_base" ] &&
+		[ "$ul_base" -le "$ul_max" ] && [ "$ul_max" -le "$ul_cap" ] &&
+		[ "$ul_cap" -le "$ul_exploration_cap" ] ||
 		die "The Full Auto-Tune upload bounds are not monotonic."
+	[ "$dl_low" -le "$dl_median" ] && [ "$dl_median" -le "$dl_high" ] ||
+		die "The Full Auto-Tune download observations are not monotonic."
+	[ "$ul_low" -le "$ul_median" ] && [ "$ul_median" -le "$ul_high" ] ||
+		die "The Full Auto-Tune upload observations are not monotonic."
+	for optional_rate in "$dl_runtime_min" "$dl_tested_max" "$dl_service_cap" \
+		"$ul_runtime_min" "$ul_tested_max" "$ul_service_cap"; do
+		[ -z "$optional_rate" ] || is_positive_rate "$optional_rate" ||
+			die "The Full Auto-Tune proposal contains malformed optional ceiling evidence."
+	done
+	[ -z "$dl_runtime_min" ] || [ "$dl_runtime_min" = "$dl_min" ] ||
+		die "The download runtime minimum is not the effective configured minimum."
+	[ -z "$ul_runtime_min" ] || [ "$ul_runtime_min" = "$ul_min" ] ||
+		die "The upload runtime minimum is not the effective configured minimum."
+	[ -z "$dl_service_cap" ] || [ "$dl_cap" -le "$dl_service_cap" ] ||
+		die "The download cap exceeds the declared service hard cap."
+	[ -z "$ul_service_cap" ] || [ "$ul_cap" -le "$ul_service_cap" ] ||
+		die "The upload cap exceeds the declared service hard cap."
+	case "$dl_cap_source" in measured_raw|user_service_limit|retained_configuration) ;; *) die "The download cap source is invalid." ;; esac
+	case "$ul_cap_source" in measured_raw|user_service_limit|retained_configuration) ;; *) die "The upload cap source is invalid." ;; esac
+	[ "$dl_cap_source" = retained_configuration ] || [ "$dl_high" -le "$dl_exploration_cap" ] ||
+		die "The download raw reference exceeds its declared exploration cap."
+	[ "$ul_cap_source" = retained_configuration ] || [ "$ul_high" -le "$ul_exploration_cap" ] ||
+		die "The upload raw reference exceeds its declared exploration cap."
+	case "$dl_ceiling_evidence" in
+		shaped_validation)
+			[ -n "$dl_tested_max" ] && [ "$dl_tested_max" = "$dl_max" ] ||
+				die "The download maximum is not bound to its exact shaped validation."
+			;;
+		retained_configuration)
+			[ -n "$dl_tested_max" ] && [ "$dl_tested_max" = "$dl_max" ] ||
+				die "The retained download maximum is malformed."
+			if [ "$adjust_dl" = 1 ]; then
+				[ "$(original_get "$job" min_dl_shaper_rate_kbps '')" = "$dl_min" ] &&
+					[ "$(original_get "$job" base_dl_shaper_rate_kbps '')" = "$dl_base" ] &&
+					[ "$(original_get "$job" max_dl_shaper_rate_kbps '')" = "$dl_max" ] &&
+					[ "$(original_get "$job" adaptive_ceiling_dl_cap_kbps "$dl_max")" = "$dl_cap" ] ||
+					die "A retained download ceiling may not change the live configuration."
+			fi
+			;;
+		unvalidated_candidate)
+			[ -z "$dl_tested_max" ] || die "An unvalidated download candidate claims a tested maximum."
+			[ "$adjust_dl" = 0 ] || die "The selected shaped download has no tested-safe ceiling evidence."
+			;;
+		*) die "The download ceiling evidence is invalid." ;;
+	esac
+	case "$ul_ceiling_evidence" in
+		shaped_validation)
+			[ -n "$ul_tested_max" ] && [ "$ul_tested_max" = "$ul_max" ] ||
+				die "The upload maximum is not bound to its exact shaped validation."
+			;;
+		retained_configuration)
+			[ -n "$ul_tested_max" ] && [ "$ul_tested_max" = "$ul_max" ] ||
+				die "The retained upload maximum is malformed."
+			if [ "$adjust_ul" = 1 ]; then
+				[ "$(original_get "$job" min_ul_shaper_rate_kbps '')" = "$ul_min" ] &&
+					[ "$(original_get "$job" base_ul_shaper_rate_kbps '')" = "$ul_base" ] &&
+					[ "$(original_get "$job" max_ul_shaper_rate_kbps '')" = "$ul_max" ] &&
+					[ "$(original_get "$job" adaptive_ceiling_ul_cap_kbps "$ul_max")" = "$ul_cap" ] ||
+					die "A retained upload ceiling may not change the live configuration."
+			fi
+			;;
+		unvalidated_candidate)
+			[ -z "$ul_tested_max" ] || die "An unvalidated upload candidate claims a tested maximum."
+			[ "$adjust_ul" = 0 ] || die "The selected shaped upload has no tested-safe ceiling evidence."
+			;;
+		*) die "The upload ceiling evidence is invalid." ;;
+	esac
+	[ "$dl_cap_source" != retained_configuration ] || [ "$dl_ceiling_evidence" = retained_configuration ] ||
+		die "The download cap claims retained provenance without retained limits."
+	[ "$ul_cap_source" != retained_configuration ] || [ "$ul_ceiling_evidence" = retained_configuration ] ||
+		die "The upload cap claims retained provenance without retained limits."
+	[ "$dl_cap_source" != user_service_limit ] || [ -n "$dl_service_cap" ] ||
+		die "The download service cap source has no declared hard cap."
+	[ "$ul_cap_source" != user_service_limit ] || [ -n "$ul_service_cap" ] ||
+		die "The upload service cap source has no declared hard cap."
+	[ "$dl_cap_source" != user_service_limit ] || [ "$dl_cap" = "$dl_service_cap" ] ||
+		die "The download service hard cap is not the effective proposal cap."
+	[ "$ul_cap_source" != user_service_limit ] || [ "$ul_cap" = "$ul_service_cap" ] ||
+		die "The upload service hard cap is not the effective proposal cap."
+	if [ "$proposal_profile" = variable_link ]; then
+		case "$dl_cap_source" in
+			measured_raw)
+				[ "$dl_cap" = "$dl_high" ] && [ "$dl_exploration_cap" = "$dl_high" ] ||
+					die "The Variable Link download cap is not bound to measured raw capacity."
+				;;
+			user_service_limit)
+				[ "$dl_exploration_cap" = "$dl_high" ] ||
+					die "The Variable Link download service cap does not tighten measured capacity."
+				;;
+		esac
+		case "$ul_cap_source" in
+			measured_raw)
+				[ "$ul_cap" = "$ul_high" ] && [ "$ul_exploration_cap" = "$ul_high" ] ||
+					die "The Variable Link upload cap is not bound to measured raw capacity."
+				;;
+			user_service_limit)
+				[ "$ul_exploration_cap" = "$ul_high" ] ||
+					die "The Variable Link upload service cap does not tighten measured capacity."
+				;;
+		esac
+	fi
 	adjust_up="$(proposal_uint '@.proposal.thresholds_ms.adjust_up')" || die "The Full Auto-Tune proposal contains an invalid adjust-up threshold."
 	delay="$(proposal_uint '@.proposal.thresholds_ms.delay')" || die "The Full Auto-Tune proposal contains an invalid delay threshold."
 	adjust_down="$(proposal_uint '@.proposal.thresholds_ms.adjust_down')" || die "The Full Auto-Tune proposal contains an invalid adjust-down threshold."
@@ -837,14 +964,40 @@ build_expected_manifest() {
 	adaptive_probe="$(proposal_uint '@.proposal.adaptive_ceiling.probe_s')" || die "The Full Auto-Tune adaptive probe duration is invalid."
 	adaptive_cooldown="$(proposal_uint '@.proposal.adaptive_ceiling.cooldown_s')" || die "The Full Auto-Tune adaptive cooldown is invalid."
 	adaptive_ttl="$(proposal_uint '@.proposal.adaptive_ceiling.failed_bound_ttl_s')" || die "The Full Auto-Tune adaptive failed-bound TTL is invalid."
+	capacity_learning_policy="$(require_result_value '@.proposal.adaptive_ceiling.policy')" ||
+		die "The Full Auto-Tune capacity-learning policy is missing."
+	access_medium="$(require_result_value '@.proposal.access.medium')" ||
+		die "The Full Auto-Tune access medium is missing."
+	access_source="$(require_result_value '@.proposal.access.source')" ||
+		die "The Full Auto-Tune access-medium source is missing."
+	access_confidence="$(json_get "$result_copy" '@.proposal.access.confidence_percent')"
+	case "$access_medium" in cellular|leo_satellite|geo_satellite|fixed_wireless|shared_wired|unknown) ;; *)
+		die "The Full Auto-Tune access medium is invalid." ;;
+	esac
+	case "$access_source" in user_selected|network_protocol|device_type|interface_name|auto_inconclusive|legacy_default) ;; *)
+		die "The Full Auto-Tune access-medium source is invalid." ;;
+	esac
+	is_uint "$access_confidence" && [ "$access_confidence" -le 100 ] 2>/dev/null ||
+		die "The Full Auto-Tune access-medium confidence is invalid."
+	case "$capacity_learning_policy:$adaptive_enabled" in
+		passive_bounded:true|scheduled_active:true|verified_only:false|fixed_cap:false) ;;
+		*) die "The Full Auto-Tune capacity-learning policy contradicts its adaptive-ceiling state." ;;
+	esac
+	if [ "$capacity_learning_policy" = fixed_cap ]; then
+		[ -n "$dl_service_cap" ] && [ -n "$ul_service_cap" ] ||
+			die "Fixed-cap learning requires both directional service hard caps."
+	fi
 	[ "$adaptive_hold" -gt 0 ] && [ "$adaptive_growth" -gt 0 ] && [ "$adaptive_probe" -gt 0 ] &&
 		[ "$adaptive_cooldown" -gt 0 ] && [ "$adaptive_ttl" -gt 0 ] ||
 		die "The Full Auto-Tune adaptive-ceiling timings must be positive."
 	old_adaptive="$(original_get "$job" adaptive_ceiling_enabled 0)"
 	if [ "$old_adaptive" = 1 ] && [ "$adaptive_enabled" = false ] && [ "$disable_adaptive" = 0 ]; then
 		adaptive_flag=1
-		dl_cap="$(max_rate "$(original_get "$job" adaptive_ceiling_dl_cap_kbps '')" "$dl_max" "$dl_cap")"
-		ul_cap="$(max_rate "$(original_get "$job" adaptive_ceiling_ul_cap_kbps '')" "$ul_max" "$ul_cap")"
+		effective_capacity_learning_policy=passive_bounded
+		# Preserve the user's enabled mode and timing policy, but never carry an
+		# old provenance-free cap into a freshly measured proposal.  Growth now
+		# restarts from the exact tested-safe maximum and remains bounded by this
+		# result's measured exploration cap.
 		adaptive_hold="$(normalized_number "$(original_get "$job" adaptive_ceiling_hold_time_s '')" "$adaptive_hold")"
 		adaptive_growth="$(normalized_number "$(original_get "$job" adaptive_ceiling_growth_percent '')" "$adaptive_growth")"
 		adaptive_probe="$(normalized_number "$(original_get "$job" adaptive_ceiling_probe_duration_s '')" "$adaptive_probe")"
@@ -852,6 +1005,7 @@ build_expected_manifest() {
 		adaptive_ttl="$(normalized_number "$(original_get "$job" adaptive_ceiling_failed_bound_ttl_s '')" "$adaptive_ttl")"
 	else
 		[ "$adaptive_enabled" = true ] && adaptive_flag=1 || adaptive_flag=0
+		effective_capacity_learning_policy="$capacity_learning_policy"
 	fi
 
 	link_layer="$(require_result_value '@.proposal.link.layer')" || die "The Full Auto-Tune link-layer proposal is missing."
@@ -960,11 +1114,60 @@ build_expected_manifest() {
 	expected_set "$job" adaptive_ceiling_enabled "$adaptive_flag"
 	expected_set "$job" adaptive_ceiling_dl_cap_kbps "$dl_cap"
 	expected_set "$job" adaptive_ceiling_ul_cap_kbps "$ul_cap"
+	if [ -n "$dl_tested_max" ]; then
+		expected_set "$job" adaptive_ceiling_dl_safe_kbps "$dl_tested_max"
+		expected_set "$job" adaptive_ceiling_dl_evidence "$dl_ceiling_evidence"
+	else
+		expected_set "$job" adaptive_ceiling_dl_safe_kbps 0
+		expected_set "$job" adaptive_ceiling_dl_evidence legacy_unverified
+	fi
+	if [ -n "$ul_tested_max" ]; then
+		expected_set "$job" adaptive_ceiling_ul_safe_kbps "$ul_tested_max"
+		expected_set "$job" adaptive_ceiling_ul_evidence "$ul_ceiling_evidence"
+	else
+		expected_set "$job" adaptive_ceiling_ul_safe_kbps 0
+		expected_set "$job" adaptive_ceiling_ul_evidence legacy_unverified
+	fi
+	expected_set "$job" adaptive_ceiling_dl_cap_source "$dl_cap_source"
+	expected_set "$job" adaptive_ceiling_ul_cap_source "$ul_cap_source"
 	expected_set "$job" adaptive_ceiling_hold_time_s "$adaptive_hold"
 	expected_set "$job" adaptive_ceiling_growth_percent "$adaptive_growth"
 	expected_set "$job" adaptive_ceiling_probe_duration_s "$adaptive_probe"
 	expected_set "$job" adaptive_ceiling_cooldown_s "$adaptive_cooldown"
 	expected_set "$job" adaptive_ceiling_failed_bound_ttl_s "$adaptive_ttl"
+	if [ "$access_source" = user_selected ]; then
+		expected_set "$job" access_medium_selection "$access_medium"
+	else
+		expected_set "$job" access_medium_selection auto
+	fi
+	expected_set "$job" access_medium "$access_medium"
+	expected_set "$job" access_medium_source "$access_source"
+	expected_set "$job" access_medium_confidence_percent "$access_confidence"
+	expected_set "$job" capacity_learning_policy "$effective_capacity_learning_policy"
+	case "$effective_capacity_learning_policy" in
+		scheduled_active)
+			expected_set "$job" runtime_learning_mode periodic_active
+			expected_set "$job" scheduled_autotune_enabled 1
+			;;
+		passive_bounded)
+			expected_set "$job" runtime_learning_mode passive
+			expected_set "$job" scheduled_autotune_enabled 0
+			;;
+		verified_only|fixed_cap)
+			expected_set "$job" runtime_learning_mode fixed
+			expected_set "$job" scheduled_autotune_enabled 0
+			;;
+	esac
+	if [ -n "$dl_service_cap" ]; then
+		expected_set "$job" service_dl_cap_kbps "$dl_service_cap"
+	else
+		expected_delete "cake-autorate.$job.service_dl_cap_kbps"
+	fi
+	if [ -n "$ul_service_cap" ]; then
+		expected_set "$job" service_ul_cap_kbps "$ul_service_cap"
+	else
+		expected_delete "cake-autorate.$job.service_ul_cap_kbps"
+	fi
 	expected_set "$job" transport_latency_enabled 1
 	expected_set "$job" throughput_guard_enabled 1
 	expected_set "$job" throughput_guard_retention_percent "$validation_retention_uci"
@@ -1278,7 +1481,7 @@ validate_profile_search_contract() {
 			die "The measured Variable link runtime minimum is missing."
 		runtime_minimum_index="$(require_result_value "$search_root.runtime_minimum_observation_index")" ||
 			die "The measured Variable link runtime observation is missing."
-		is_positive_rate "$runtime_minimum_index" ||
+		is_uint "$runtime_minimum_index" && [ "$runtime_minimum_index" -gt 0 ] 2>/dev/null ||
 			die "The measured Variable link runtime observation index is invalid."
 		runtime_evaluated_index=$((runtime_minimum_index - 1))
 		runtime_evaluated_rate="$(require_result_value "$search_root.evaluated[$runtime_evaluated_index].candidate_kbps")" ||
@@ -1306,7 +1509,7 @@ validate_profile_search_contract() {
 			die "The tested Extreme A+ runtime minimum is missing."
 		runtime_minimum_index="$(require_result_value "$search_root.runtime_minimum_observation_index")" ||
 			die "The tested Extreme A+ runtime observation is missing."
-		is_positive_rate "$runtime_minimum_index" ||
+		is_uint "$runtime_minimum_index" && [ "$runtime_minimum_index" -gt 0 ] 2>/dev/null ||
 			die "The tested Extreme A+ runtime observation index is invalid."
 		runtime_evaluated_index=$((runtime_minimum_index - 1))
 		runtime_evaluated_rate="$(require_result_value "$search_root.evaluated[$runtime_evaluated_index].candidate_kbps")" ||

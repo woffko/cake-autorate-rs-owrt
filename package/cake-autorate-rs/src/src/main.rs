@@ -115,6 +115,10 @@ struct Config {
     adaptive_ceiling_enabled: bool,
     adaptive_ceiling_dl_cap_kbps: f64,
     adaptive_ceiling_ul_cap_kbps: f64,
+    adaptive_ceiling_dl_safe_kbps: f64,
+    adaptive_ceiling_ul_safe_kbps: f64,
+    adaptive_ceiling_dl_evidence: String,
+    adaptive_ceiling_ul_evidence: String,
     adaptive_ceiling_hold_time_s: f64,
     adaptive_ceiling_growth_percent: f64,
     adaptive_ceiling_probe_duration_s: f64,
@@ -257,6 +261,10 @@ impl Config {
             adaptive_ceiling_enabled: false,
             adaptive_ceiling_dl_cap_kbps: 80000.0,
             adaptive_ceiling_ul_cap_kbps: 35000.0,
+            adaptive_ceiling_dl_safe_kbps: 0.0,
+            adaptive_ceiling_ul_safe_kbps: 0.0,
+            adaptive_ceiling_dl_evidence: "legacy_unverified".to_string(),
+            adaptive_ceiling_ul_evidence: "legacy_unverified".to_string(),
             adaptive_ceiling_hold_time_s: 20.0,
             adaptive_ceiling_growth_percent: 3.0,
             adaptive_ceiling_probe_duration_s: 8.0,
@@ -520,6 +528,26 @@ impl Config {
             "adaptive_ceiling_ul_cap_kbps",
             &mut cfg.adaptive_ceiling_ul_cap_kbps,
         )?;
+        set_f64(
+            &single,
+            "adaptive_ceiling_dl_safe_kbps",
+            &mut cfg.adaptive_ceiling_dl_safe_kbps,
+        )?;
+        set_f64(
+            &single,
+            "adaptive_ceiling_ul_safe_kbps",
+            &mut cfg.adaptive_ceiling_ul_safe_kbps,
+        )?;
+        set_string(
+            &single,
+            "adaptive_ceiling_dl_evidence",
+            &mut cfg.adaptive_ceiling_dl_evidence,
+        );
+        set_string(
+            &single,
+            "adaptive_ceiling_ul_evidence",
+            &mut cfg.adaptive_ceiling_ul_evidence,
+        );
         set_f64(
             &single,
             "adaptive_ceiling_hold_time_s",
@@ -1189,6 +1217,45 @@ impl Config {
             );
         }
         if self.adaptive_ceiling_enabled {
+            for (direction, safe, base, maximum, evidence) in [
+                (
+                    "download",
+                    self.adaptive_ceiling_dl_safe_kbps,
+                    self.base_dl_shaper_rate_kbps,
+                    self.max_dl_shaper_rate_kbps,
+                    self.adaptive_ceiling_dl_evidence.as_str(),
+                ),
+                (
+                    "upload",
+                    self.adaptive_ceiling_ul_safe_kbps,
+                    self.base_ul_shaper_rate_kbps,
+                    self.max_ul_shaper_rate_kbps,
+                    self.adaptive_ceiling_ul_evidence.as_str(),
+                ),
+            ] {
+                if !matches!(
+                    evidence,
+                    "legacy_unverified"
+                        | "shaped_validation"
+                        | "retained_configuration"
+                        | "user_configured"
+                ) {
+                    return Err(format!(
+                        "adaptive ceiling {direction} evidence is unsupported"
+                    ));
+                }
+                if evidence == "legacy_unverified" {
+                    if safe != 0.0 {
+                        return Err(format!(
+                            "legacy-unverified adaptive ceiling {direction} must not claim a safe rate"
+                        ));
+                    }
+                } else if !safe.is_finite() || safe < base || safe > maximum {
+                    return Err(format!(
+                        "adaptive ceiling {direction} safe rate must stay between base and maximum"
+                    ));
+                }
+            }
             if !self.adaptive_ceiling_dl_cap_kbps.is_finite()
                 || self.adaptive_ceiling_dl_cap_kbps < self.max_dl_shaper_rate_kbps
             {
@@ -3130,13 +3197,35 @@ impl Controller {
             cfg.base_dl_shaper_rate_kbps,
             cfg.base_ul_shaper_rate_kbps,
         );
-        let adaptive_dl = AdaptiveCeilingDirection::new(
+        let adaptive_dl_safe = if cfg.adaptive_ceiling_enabled
+            && cfg.adaptive_ceiling_dl_evidence == "legacy_unverified"
+        {
+            cfg.base_dl_shaper_rate_kbps
+                .min(cfg.max_dl_shaper_rate_kbps)
+        } else if cfg.adaptive_ceiling_enabled {
+            cfg.adaptive_ceiling_dl_safe_kbps
+        } else {
+            cfg.max_dl_shaper_rate_kbps
+        };
+        let adaptive_ul_safe = if cfg.adaptive_ceiling_enabled
+            && cfg.adaptive_ceiling_ul_evidence == "legacy_unverified"
+        {
+            cfg.base_ul_shaper_rate_kbps
+                .min(cfg.max_ul_shaper_rate_kbps)
+        } else if cfg.adaptive_ceiling_enabled {
+            cfg.adaptive_ceiling_ul_safe_kbps
+        } else {
+            cfg.max_ul_shaper_rate_kbps
+        };
+        let adaptive_dl = AdaptiveCeilingDirection::new_with_verified_safe(
             cfg.max_dl_shaper_rate_kbps,
             cfg.adaptive_ceiling_dl_cap_kbps,
+            adaptive_dl_safe,
         );
-        let adaptive_ul = AdaptiveCeilingDirection::new(
+        let adaptive_ul = AdaptiveCeilingDirection::new_with_verified_safe(
             cfg.max_ul_shaper_rate_kbps,
             cfg.adaptive_ceiling_ul_cap_kbps,
+            adaptive_ul_safe,
         );
         let throughput_floor_dl = throughput_floor(ThroughputGuardInput {
             enabled: cfg.transport_controller_enabled && cfg.throughput_guard_enabled,
@@ -4139,6 +4228,8 @@ impl Controller {
         self.update_adaptive_ceilings(
             dl_kind,
             ul_kind,
+            dl_rate,
+            ul_rate,
             dl_bb || (matches!(dl_kind, LoadKind::High) && transport_bloat),
             ul_bb || (matches!(ul_kind, LoadKind::High) && transport_bloat),
             dl_delay_count,
@@ -4547,6 +4638,8 @@ impl Controller {
         &mut self,
         dl_kind: LoadKind,
         ul_kind: LoadKind,
+        dl_achieved_rate_kbps: f64,
+        ul_achieved_rate_kbps: f64,
         dl_bufferbloat: bool,
         ul_bufferbloat: bool,
         dl_delay_count: usize,
@@ -4574,6 +4667,8 @@ impl Controller {
             eligibility_grace: Duration::from_secs_f64(
                 self.cfg.reflector_response_deadline_s.max(1.0),
             ),
+            minimum_throughput_gain_percent: (self.cfg.adaptive_ceiling_growth_percent * 0.5)
+                .clamp(1.0, 5.0),
         };
         let dl_eligible = self.cfg.adjust_dl_shaper_rate
             && matches!(dl_kind, LoadKind::High)
@@ -4595,6 +4690,7 @@ impl Controller {
                     eligible: dl_eligible,
                     bufferbloat: dl_bufferbloat,
                     shaper_rate_kbps: self.shaper_dl,
+                    achieved_rate_kbps: dl_achieved_rate_kbps,
                 },
                 policy,
             );
@@ -4607,6 +4703,7 @@ impl Controller {
                     eligible: ul_eligible,
                     bufferbloat: ul_bufferbloat,
                     shaper_rate_kbps: self.shaper_ul,
+                    achieved_rate_kbps: ul_achieved_rate_kbps,
                 },
                 policy,
             );
@@ -7452,9 +7549,16 @@ fn current_direction(
     }
     Ok(autotune::DirectionProposal {
         minimum_kbps: minimum,
+        exploration_minimum_kbps: minimum,
+        runtime_minimum_kbps: Some(minimum),
         base_kbps: base,
         maximum_kbps: maximum,
+        tested_safe_maximum_kbps: Some(maximum),
+        exploration_cap_kbps: cap,
         absolute_cap_kbps: cap,
+        service_hard_cap_kbps: None,
+        ceiling_evidence: autotune::CeilingEvidence::RetainedConfiguration,
+        cap_source: autotune::CeilingCapSource::RetainedConfiguration,
         observed_low_kbps: observed.observed_low_kbps,
         observed_median_kbps: observed.observed_median_kbps,
         observed_high_kbps: observed.observed_high_kbps,
@@ -7466,7 +7570,10 @@ fn run_autotune_proposal_cli<I>(args: I) -> Result<(), String>
 where
     I: Iterator<Item = String>,
 {
-    use autotune::{build_proposal_for_profile, AutotuneProfile, LatencyBaseline, LinkKind};
+    use autotune::{
+        build_proposal_for_profile_with_context, AccessEvidenceSource, AccessMedium,
+        AutotuneProfile, CapacityLearningPolicy, LatencyBaseline, LinkKind, ProposalContext,
+    };
 
     let mut download = None;
     let mut upload = None;
@@ -7478,8 +7585,16 @@ where
     let mut upload_base_scale = None;
     let mut download_runtime_minimum = None;
     let mut upload_runtime_minimum = None;
+    let mut download_tested_safe_maximum = None;
+    let mut upload_tested_safe_maximum = None;
     let mut link_kind = LinkKind::Unknown;
     let mut profile = AutotuneProfile::BestOverall;
+    let mut access_medium = None;
+    let mut access_source = AccessEvidenceSource::LegacyDefault;
+    let mut access_confidence_percent = 0;
+    let mut capacity_learning_policy = None;
+    let mut download_service_cap_kbps = None;
+    let mut upload_service_cap_kbps = None;
     let mut conservative_background_dl_kbps = None;
     let mut conservative_background_ul_kbps = None;
     let mut retain_dl = false;
@@ -7525,6 +7640,14 @@ where
                 upload_runtime_minimum =
                     Some(parse_cli_u64("measured upload runtime minimum", &value)?)
             }
+            "--dl-tested-safe-max-kbps" => {
+                download_tested_safe_maximum =
+                    Some(parse_cli_u64("tested-safe download maximum", &value)?)
+            }
+            "--ul-tested-safe-max-kbps" => {
+                upload_tested_safe_maximum =
+                    Some(parse_cli_u64("tested-safe upload maximum", &value)?)
+            }
             "--conservative-background-dl-kbps" => {
                 conservative_background_dl_kbps =
                     Some(parse_cli_f64("conservative download background", &value)?)
@@ -7551,6 +7674,36 @@ where
                 profile = AutotuneProfile::parse(&value)
                     .ok_or_else(|| format!("unsupported autotune profile: {value}"))?
             }
+            "--access-medium" => {
+                access_medium = Some(
+                    AccessMedium::parse(&value)
+                        .ok_or_else(|| format!("unsupported access medium: {value}"))?,
+                )
+            }
+            "--access-source" => {
+                access_source = AccessEvidenceSource::parse(&value)
+                    .ok_or_else(|| format!("unsupported access-medium source: {value}"))?
+            }
+            "--access-confidence-percent" => {
+                access_confidence_percent = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid access-medium confidence: {value}"))?;
+                if access_confidence_percent > 100 {
+                    return Err("access-medium confidence must be between 0 and 100".to_string());
+                }
+            }
+            "--capacity-learning-policy" => {
+                capacity_learning_policy = Some(
+                    CapacityLearningPolicy::parse(&value)
+                        .ok_or_else(|| format!("unsupported capacity-learning policy: {value}"))?,
+                )
+            }
+            "--dl-service-cap-kbps" => {
+                download_service_cap_kbps = Some(parse_cli_u64("download service cap", &value)?)
+            }
+            "--ul-service-cap-kbps" => {
+                upload_service_cap_kbps = Some(parse_cli_u64("upload service cap", &value)?)
+            }
             _ => return Err(format!("unsupported autotune option: {arg}")),
         }
     }
@@ -7562,7 +7715,7 @@ where
     let download = validated_conservative_samples(&download, conservative_background_dl_kbps)?;
     let upload = validated_conservative_samples(&upload, conservative_background_ul_kbps)?;
 
-    let mut proposal = build_proposal_for_profile(
+    let mut proposal = build_proposal_for_profile_with_context(
         &download,
         &upload,
         LatencyBaseline {
@@ -7572,6 +7725,14 @@ where
         },
         link_kind,
         profile,
+        ProposalContext {
+            access_medium,
+            access_source,
+            access_confidence_percent,
+            capacity_learning_policy,
+            download_service_cap_kbps,
+            upload_service_cap_kbps,
+        },
     )?;
     if download_base_scale.is_none() && upload_base_scale.is_none() {
         proposal.revise_base_rates(base_scale)?;
@@ -7621,6 +7782,7 @@ where
         (None, Some(upload)) => proposal.set_measured_upload_runtime_minimum(upload)?,
         (None, None) => {}
     }
+    proposal.set_tested_safe_maximums(download_tested_safe_maximum, upload_tested_safe_maximum)?;
     println!("{}", proposal.to_json());
     Ok(())
 }

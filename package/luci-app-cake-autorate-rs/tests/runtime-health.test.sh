@@ -25,6 +25,12 @@ case "$*" in
 	"-q get cake-autorate.wan_sqm.sqm_enabled") printf '%s\n' "${RH_SQM_ENABLED:-1}" ;;
 	"-q get cake-autorate.wan_sqm.traffic_rules_enabled") printf '%s\n' "${RH_RULES_ENABLED-1}" ;;
 	"-q get cake-autorate.wan_sqm.autotune_profile") printf '%s\n' "${RH_PROFILE:-best_overall}" ;;
+	"-q get cake-autorate.wan_sqm.access_medium") printf '%s\n' "${RH_ACCESS_MEDIUM:-unknown}" ;;
+	"-q get cake-autorate.wan_sqm.access_medium_source") printf '%s\n' "${RH_ACCESS_SOURCE:-auto_inconclusive}" ;;
+	"-q get cake-autorate.wan_sqm.access_medium_confidence_percent") printf '%s\n' "${RH_ACCESS_CONFIDENCE:-20}" ;;
+	"-q get cake-autorate.wan_sqm.capacity_learning_policy") printf '%s\n' "${RH_CAPACITY_POLICY:-verified_only}" ;;
+	"-q get cake-autorate.wan_sqm.scheduled_autotune_enabled") printf '%s\n' "${RH_SCHEDULED_AUTOTUNE:-0}" ;;
+	"-q get cake-autorate.wan_sqm.adaptive_ceiling_enabled") printf '%s\n' "${RH_ADAPTIVE_CEILING:-0}" ;;
 	"-q get cake-autorate.wan_sqm.traffic_profile") printf '%s\n' "${RH_TRAFFIC_PROFILE:-auto}" ;;
 	"-q get cake-autorate.wan_sqm.sqm_direction_mode") printf '%s\n' "${RH_DIRECTION_MODE:-both}" ;;
 	"-q get cake-autorate.wan_sqm.wan_if") printf 'eth0\n' ;;
@@ -181,6 +187,10 @@ assert_field "$ROOT/healthy.json" ingress_state ACTIVE
 assert_field "$ROOT/healthy.json" classifier_state ACTIVE
 assert_field "$ROOT/healthy.json" classifier_profile best_overall
 assert_field "$ROOT/healthy.json" autotune_profile best_overall
+assert_field "$ROOT/healthy.json" access_medium unknown
+assert_field "$ROOT/healthy.json" access_medium_source auto_inconclusive
+assert_field "$ROOT/healthy.json" access_medium_confidence_percent 20
+assert_field "$ROOT/healthy.json" capacity_learning_policy verified_only
 assert_field "$ROOT/healthy.json" traffic_profile_mode auto
 assert_field "$ROOT/healthy.json" traffic_profile_resolved best_overall
 assert_field "$ROOT/healthy.json" cake_ul_mode diffserv4

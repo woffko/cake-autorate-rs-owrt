@@ -2291,3 +2291,74 @@ controls, restored both CAKE directions, left no worker or recovery residue,
 and ended with clean UCI. Fresh desktop and mobile Playwright checks covered
 Status, Graphs, Settings, and Auto-Tune start/cancel; all pages remained within
 their viewport and emitted no RPC or browser errors.
+
+### RC27 r22/r45 Variable Link access and ceiling-provenance gate (2026-07-30)
+
+Daemon r22 and LuCI r45 replace the ambiguous Variable Link ceiling default
+with three independent facts: physical access classification, measured capacity
+evidence, and the chosen runtime learning policy. The wizard may identify a
+direct QMI/MBIM/NCM/ModemManager path, a modem-like L3 device, or a wireless L2
+carrier with an explicit confidence value. PPPoE, DHCP, and Ethernet remain
+deliberately inconclusive because they do not prove whether the provider access
+is fibre, cable, cellular, satellite, or fixed wireless. The user can always
+select cellular, LEO, GEO, fixed wireless, shared wired, or unknown explicitly.
+
+Proposal schema 4 records separate exploration minimum, tested runtime minimum,
+tested-safe maximum, measured-raw exploration cap, optional tighter service cap,
+ceiling evidence, and cap provenance for each direction. Variable Link never
+multiplies its measured raw high sample into a larger synthetic capacity. Apply
+Guard, the scheduled worker, LuCI, and the producer independently reject a
+proposal whose raw cap, service cap, tested point, observation index, policy, or
+access provenance is inconsistent. Legacy instances without trustworthy access
+evidence default to `verified_only` instead of silently enabling upward growth.
+
+The adaptive controller starts from the exact tested-safe maximum. A clean
+latency observation without measurable throughput gain is neutral: it neither
+promotes the ceiling nor poisons the failed-capacity bound. The gain threshold
+is bounded by the remaining interval, allowing a narrow link to prove a useful
+increase smaller than 1 Mbit/s. Bufferbloat remains the event that records a
+failed upper bound and rolls back to the previous safe rate.
+
+The final local gate passed 209 Rust tests, all 21 shell suites, all four
+isolated Auto-Tune lifecycle partitions, the full isolated Apply Guard
+transaction suite, and all seven LuCI JavaScript suites. Shell and Node syntax,
+Rust formatting, LSP diagnostics for every changed Rust/LuCI source, and
+`git diff --check` were clean. The gate also caught and corrected two test-path
+regressions without weakening production checks: a missing optional UCI key
+under `set -e`, and an observation index accidentally validated as a minimum
+100-kbit/s rate after rate validation was tightened.
+
+The first no-cache Playwright deployment gate on the dual-WAN x86_64 router
+also exposed a LuCI render-order bug before publication: the new resolved-access
+summary queried a form widget while `form.Map.root` was still undefined. LuCI
+therefore failed in `form.js::findElements()` before the instance table could
+render. r45 guards the live-widget path until the map owns a DOM root and falls
+back to staged/UCI data during `cfgvalue()`. A dedicated cold-map/live-map unit
+test and the repeated browser run both pass; the latter reports no console or
+RPC failures and no horizontal overflow at 1500 pixels.
+
+The final r22/r45 deployment gate covered all three anonymized lab topologies.
+On the primary x86_64 Multi-WAN router the main instance remained `ACTIVE`, the
+backup remained `STANDBY`, both owned CAKE/IFB paths were unchanged, and UCI was
+clean. The second x86_64 router retained the expected negative case: its absent
+PPPoE path remained waiting while the Ethernet backup and its graph stayed
+active. The aarch64 cellular router retained its deliberate upload-only CAKE
+topology and resolved the provider access as direct 4G/5G cellular with 95%
+confidence and a 35% exploration floor. No deployment created a new instance
+or altered a saved rate.
+
+Fresh no-cache desktop/mobile Playwright audits passed Status, Graphs,
+Settings, and Re-run Auto-Tune on every router. Separate form-path runs covered
+Edit Save/Reset, Traffic Priorities Save/Reset, and Settings Save/Reset; each
+ended with clean UCI and no RPC, console, overflow, or false unsaved-change
+error. The documentation capture of the Variable Link mini-wizard was made in
+a separate read-only browser context, with hostname, instance, and address text
+replaced before the screenshot was written.
+
+The release matrix contains exactly 12 daemon APK architectures plus one
+`noarch` LuCI APK. Every artifact passed the matching OpenWrt 25.12.5 SDK's
+`apk verify --allow-untrusted` and `apk adbdump`; daemon metadata declared the
+six intended dependencies, LuCI declared seven, and extracted ELF files
+matched x86_64, aarch64, ARM EABI/float ABI, or MIPS32r2 endianness as named.
+The final 13-file `SHA256SUMS` manifest was then verified from the clean release
+staging directory.
