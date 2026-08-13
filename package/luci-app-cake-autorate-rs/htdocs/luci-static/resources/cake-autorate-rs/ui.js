@@ -23,27 +23,54 @@ function invalidateLegacyPrioritiesMenu() {
 		ui.menu.flushCache();
 }
 
-function ensureAppHeader() {
-	window.requestAnimationFrame(function insertHeader() {
-		invalidateLegacyPrioritiesMenu();
-		var tabs = document.querySelector('.cbi-tabmenu, ul.tabs');
+var appHeaderObserver = null;
 
-		if (!tabs || !tabs.parentNode) {
-			window.setTimeout(insertHeader, 50);
+function stopAppHeaderObserver() {
+	if (!appHeaderObserver)
+		return;
+
+	appHeaderObserver.disconnect();
+	appHeaderObserver = null;
+}
+
+function insertAppHeader() {
+	invalidateLegacyPrioritiesMenu();
+	var tabs = document.querySelector('.cbi-tabmenu, ul.tabs');
+
+	if (document.getElementById('cake-autorate-app-header'))
+		return true;
+	if (!tabs || !tabs.parentNode)
+		return false;
+
+	tabs.parentNode.insertBefore(E('div', {
+		'id': 'cake-autorate-app-header',
+		'style': 'margin:0 0 16px'
+	}, [
+		E('h2', { 'style': 'margin:0 0 4px' }, _('CAKE Autorate SQM')),
+		E('p', { 'style': 'margin:0;color:var(--text-color-medium,#666)' },
+			_('Adaptive bandwidth control and SQM management for low latency under load.'))
+	]), tabs);
+	return true;
+}
+
+function ensureAppHeader() {
+	window.requestAnimationFrame(function() {
+		if (insertAppHeader()) {
+			stopAppHeaderObserver();
 			return;
 		}
-
-		if (document.getElementById('cake-autorate-app-header'))
+		if (appHeaderObserver || typeof window.MutationObserver !== 'function')
 			return;
 
-		tabs.parentNode.insertBefore(E('div', {
-			'id': 'cake-autorate-app-header',
-			'style': 'margin:0 0 16px'
-		}, [
-			E('h2', { 'style': 'margin:0 0 4px' }, _('CAKE Autorate SQM')),
-			E('p', { 'style': 'margin:0;color:var(--text-color-medium,#666)' },
-				_('Adaptive bandwidth control and SQM management for low latency under load.'))
-		]), tabs);
+		appHeaderObserver = new window.MutationObserver(function() {
+			if (insertAppHeader())
+				stopAppHeaderObserver();
+		});
+		appHeaderObserver.observe(document.documentElement || document.body, {
+			'childList': true,
+			'subtree': true
+		});
+		window.addEventListener('pagehide', stopAppHeaderObserver, { 'once': true });
 	});
 }
 

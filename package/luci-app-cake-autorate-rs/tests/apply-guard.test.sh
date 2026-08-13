@@ -5,7 +5,7 @@ base="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 helper_real="$base/root/usr/libexec/cake-autorate-rs/apply-guard"
 fixtures="$base/tests/fixtures/apply-guard"
 runtime_lock="$(CDPATH= cd -- "$base/../cake-autorate-rs/files/usr/libexec/cake-autorate-rs" && pwd)/runtime-lock"
-work="${TMPDIR:-/tmp}/cake-apply-guard-test.$$"
+work="$(mktemp -d "${TMPDIR:-/tmp}/cake-apply-guard-test.XXXXXX")"
 helper="$work/apply-guard-wrapper"
 config="$work/config"
 autotune="$work/autotune"
@@ -23,6 +23,10 @@ exec "$helper_real" "\$@"
 EOF
 chmod 700 "$helper"
 cleanup_test_work() {
+	for cleanup_pid in ${lock_owner_pid:-} ${locked_arm_pid:-}; do
+		kill "$cleanup_pid" >/dev/null 2>&1 || true
+		wait "$cleanup_pid" >/dev/null 2>&1 || true
+	done
 	if [ "${CAKE_AUTORATE_KEEP_TEST_WORK:-0}" = 1 ]; then
 		printf 'Preserved apply-guard test workspace: %s\n' "$work" >&2
 	else
@@ -41,6 +45,8 @@ export CAKE_AUTORATE_AUTOTUNE="$fixtures/autotune"
 export CAKE_AUTORATE_SPEEDTEST="$fixtures/speedtest"
 export CAKE_AUTORATE_JSONFILTER="$fixtures/jsonfilter"
 export CAKE_AUTORATE_RUNTIME_LOCK_LIB="$runtime_lock"
+export CAKE_AUTORATE_RUNTIME_LOCK_ROOT="$work/runtime-lock"
+export CAKE_AUTORATE_NATIVE_APPLY_RECOVERY_ROOT="$work/native-apply-recovery"
 export CAKE_AUTORATE_DAEMON=/usr/sbin/cake-autorated
 export CAKE_AUTORATE_TC="$fixtures/tc"
 export CAKE_AUTORATE_SYS_CLASS_NET="$work/sys"
@@ -138,10 +144,18 @@ cat > "$autotune/wan_sqm/result.json" <<EOF
 	  "effective_delta_ms":10,"icmp_delta_ms":5,"transport_delta_ms":10,
 	  "loss_percent":0,"cpu_peak_percent":40,"cpu_warning":false,"advisory_reason":"none"},
   "profile_search":{
-    "download":{"schema_version":2,"profile":"best_overall","direction":"download",
-      "action":"complete","selected":{"candidate_kbps":80000,"safety_pass":true,"target_met":true}},
-    "upload":{"schema_version":2,"profile":"best_overall","direction":"upload",
-      "action":"complete","selected":{"candidate_kbps":20000,"safety_pass":true,"target_met":true}}},
+    "download":{"schema_version":3,"profile":"best_overall","direction":"download",
+      "action":"complete","selected":{"candidate_kbps":80000,"safety_pass":true,"target_met":true},
+      "review_options":[{"role":"recommended","observation_index":1,"candidate_kbps":80000,
+        "conservative_achieved_kbps":80000,"worst_delta_ms":10,"grade":"A","controlled":true,
+        "manual_reviewable":true,"target_met":true,"capacity_objective_met":true,
+        "auto_apply_candidate":true,"direction_candidate_only":true,"pair_confirmation_required":true}]},
+    "upload":{"schema_version":3,"profile":"best_overall","direction":"upload",
+      "action":"complete","selected":{"candidate_kbps":20000,"safety_pass":true,"target_met":true},
+      "review_options":[{"role":"recommended","observation_index":1,"candidate_kbps":20000,
+        "conservative_achieved_kbps":20000,"worst_delta_ms":10,"grade":"A","controlled":true,
+        "manual_reviewable":true,"target_met":true,"capacity_objective_met":true,
+        "auto_apply_candidate":true,"direction_candidate_only":true,"pair_confirmation_required":true}]}},
   "pinger_plan":{"recommended_method":"fping","recommended_no_pingers":3,
     "recommended_reflectors":["1.1.1.1","9.9.9.9","8.8.8.8"]},
   "proposal":{
@@ -188,6 +202,148 @@ EOF
 chmod 600 "$autotune/wan_sqm/result.json"
 
 cp "$autotune/wan_sqm/result.json" "$work/result.valid"
+
+# A native/heavy runtime owner must win before legacy Apply publishes a token.
+# Coordinate by FIFOs rather than elapsed sleeps so the assertion observes the
+# kernel lock-owner event itself.
+mkfifo "$work/lock-ready" "$work/lock-release"
+exec 4<> "$work/lock-release"
+(
+	exec 3> "$work/lock-ready"
+	. "$runtime_lock"
+	if runtime_lock_acquire_global_exclusive; then
+		printf 'ready\n' >&3
+	else
+		printf 'failed:%s\n' "$?" >&3
+		exit 1
+	fi
+	read -r _ < "$work/lock-release"
+	runtime_lock_release_global
+) &
+lock_owner_pid=$!
+if ! read -r lock_owner_state < "$work/lock-ready"; then
+	wait "$lock_owner_pid" >/dev/null 2>&1 || true
+	lock_owner_pid=
+	echo "runtime-lock fixture exited before reporting its owner state" >&2
+	exit 1
+fi
+[ "$lock_owner_state" = ready ] || {
+	printf 'runtime-lock fixture failed before ownership: %s\n' "$lock_owner_state" >&2
+	exit 1
+}
+busy_arm_rc=0
+busy_arm_output="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint" 2>&1)" || busy_arm_rc=$?
+printf 'release\n' >&4
+wait "$lock_owner_pid"
+lock_owner_pid=
+exec 4>&-
+rm -f "$work/lock-ready" "$work/lock-release"
+[ "$busy_arm_rc" -ne 0 ] || {
+	echo "apply guard armed while another runtime transaction owned the global lock" >&2
+	exit 1
+}
+printf '%s\n' "$busy_arm_output" | grep -q 'owns the runtime lock' || {
+	echo "busy apply guard failure did not identify the competing runtime owner" >&2
+	exit 1
+}
+if [ -d "$guard" ] && find "$guard" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
+	echo "busy apply guard failure leaked a token" >&2
+	exit 1
+fi
+
+# Flash-durable native recovery is a competing owner even after its kernel
+# lock was released by a crash.
+mkdir -p "$CAKE_AUTORATE_NATIVE_APPLY_RECOVERY_ROOT/current"
+native_recovery_arm_rc=0
+native_recovery_arm="$($helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint" 2>&1)" || native_recovery_arm_rc=$?
+rmdir "$CAKE_AUTORATE_NATIVE_APPLY_RECOVERY_ROOT/current"
+rmdir "$CAKE_AUTORATE_NATIVE_APPLY_RECOVERY_ROOT"
+[ "$native_recovery_arm_rc" -ne 0 ] || {
+	echo "apply guard armed across a pending native recovery transaction" >&2
+	exit 1
+}
+printf '%s\n' "$native_recovery_arm" | grep -q 'native Apply recovery transaction' || {
+	echo "native recovery ownership failure was not diagnosed" >&2
+	exit 1
+}
+if [ -d "$guard" ] && find "$guard" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
+	echo "native recovery ownership failure leaked a token" >&2
+	exit 1
+fi
+
+# At the final live attestation, arm must still own runtime.guard until its
+# complete token is published.  The blocking fixture exposes that boundary
+# without a timeout or polling loop.
+mkfifo "$work/attest-ready" "$work/attest-release"
+exec 4<> "$work/attest-release"
+cat > "$work/blocking-autotune" <<EOF
+#!/bin/sh
+printf 'ready\n' >&3
+read -r _ < "$work/attest-release"
+exec "$fixtures/autotune" "\$@"
+EOF
+chmod 700 "$work/blocking-autotune"
+(
+	exec 3> "$work/attest-ready"
+	CAKE_AUTORATE_AUTOTUNE="$work/blocking-autotune" \
+		exec "$helper" arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint"
+) > "$work/locked-arm.json" &
+locked_arm_pid=$!
+if ! read -r locked_arm_state < "$work/attest-ready"; then
+	wait "$locked_arm_pid" >/dev/null 2>&1 || true
+	locked_arm_pid=
+	echo "apply guard exited before reaching its locked live attestation" >&2
+	exit 1
+fi
+[ "$locked_arm_state" = ready ] || {
+	printf 'apply guard reported an unexpected attestation state: %s\n' "$locked_arm_state" >&2
+	exit 1
+}
+contender_rc=0
+(
+	. "$runtime_lock"
+	runtime_lock_acquire_global_exclusive
+) || contender_rc=$?
+printf 'release\n' >&4
+wait "$locked_arm_pid"
+locked_arm_pid=
+exec 4>&-
+rm -f "$work/attest-ready" "$work/attest-release"
+[ "$contender_rc" -eq 75 ] || {
+	echo "apply guard did not retain the global lock through token publication" >&2
+	exit 1
+}
+locked_arm_token="$("$CAKE_AUTORATE_JSONFILTER" -i "$work/locked-arm.json" -e '@.token')"
+$helper abort "$locked_arm_token" >/dev/null
+if find "$guard" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
+	echo "locked publication test did not clean its token" >&2
+	exit 1
+fi
+
+# Version skew or a missing recommended direction option must be rejected
+# before a root-owned token is created.  The legacy path may not silently
+# reinterpret schema-2 profile evidence as the additive schema-3 contract.
+for broken_contract in stale-schema missing-review; do
+	node - "$work/result.valid" "$autotune/wan_sqm/result.json" "$broken_contract" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (process.argv[4] === 'stale-schema')
+	result.profile_search.download.schema_version = 2;
+else
+	delete result.profile_search.download.review_options;
+fs.writeFileSync(process.argv[3], JSON.stringify(result));
+EOF
+	if $helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint" >/dev/null 2>&1; then
+		echo "apply guard accepted invalid profile-search contract: $broken_contract" >&2
+		exit 1
+	fi
+	if find "$guard" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
+		echo "rejected profile-search contract leaked an apply token: $broken_contract" >&2
+		exit 1
+	fi
+done
+cp "$work/result.valid" "$autotune/wan_sqm/result.json"
+
 sed -i 's/"base_kbps":80000/"base_kbps":0/' "$autotune/wan_sqm/result.json"
 if $helper arm wan_sqm pppoe-wan speedtest-go main '' 1 0 apply_sqm "$fingerprint" >/dev/null 2>&1; then
 	echo "apply guard armed an invalid proposal" >&2
@@ -1585,10 +1741,18 @@ result.profile_outcome = {
 	bidirectional_confirmation: structuredClone(result.bidirectional_confirmation)
 };
 result.profile_search = {
-	download: { schema_version: 2, profile: 'fair', direction: 'download', action: 'complete',
-		selected: { candidate_kbps: 80000, safety_pass: true, target_met: false } },
-	upload: { schema_version: 2, profile: 'fair', direction: 'upload', action: 'complete',
-		selected: { candidate_kbps: 20000, safety_pass: true, target_met: false } }
+	download: { schema_version: 3, profile: 'fair', direction: 'download', action: 'complete',
+		selected: { candidate_kbps: 80000, safety_pass: true, target_met: false },
+		review_options: [ { role: 'recommended', observation_index: 1, candidate_kbps: 80000,
+			conservative_achieved_kbps: 80000, worst_delta_ms: 10, grade: 'A', controlled: true,
+			manual_reviewable: true, target_met: false, capacity_objective_met: true,
+			auto_apply_candidate: false, direction_candidate_only: true, pair_confirmation_required: true } ] },
+	upload: { schema_version: 3, profile: 'fair', direction: 'upload', action: 'complete',
+		selected: { candidate_kbps: 20000, safety_pass: true, target_met: false },
+		review_options: [ { role: 'recommended', observation_index: 1, candidate_kbps: 20000,
+			conservative_achieved_kbps: 20000, worst_delta_ms: 10, grade: 'A', controlled: true,
+			manual_reviewable: true, target_met: false, capacity_objective_met: true,
+			auto_apply_candidate: false, direction_candidate_only: true, pair_confirmation_required: true } ] }
 };
 result.fair_outcome = {
 	mode: 'sqm-disable-recommended',

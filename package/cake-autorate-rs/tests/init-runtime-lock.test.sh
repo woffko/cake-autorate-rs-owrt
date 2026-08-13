@@ -34,7 +34,9 @@ harness_main() {
 	ownership="${4:-standalone}"
 	CAKE_AUTORATE_RUNTIME_LOCK_LIB="$lock_lib"
 	CAKE_AUTORATE_RUNTIME_LOCK_ROOT="$root"
+	CAKE_AUTORATE_NATIVE_APPLY_RECOVERY_ROOT="$root/native-apply-recovery"
 	export CAKE_AUTORATE_RUNTIME_LOCK_LIB CAKE_AUTORATE_RUNTIME_LOCK_ROOT
+	export CAKE_AUTORATE_NATIVE_APPLY_RECOVERY_ROOT
 	. "$init_script"
 
 	assert_exclusive_lock() {
@@ -197,7 +199,7 @@ case "${1:-}" in
 		;;
 esac
 
-work="${TMPDIR:-/tmp}/cake-init-runtime-lock-test.$$"
+work="$(mktemp -d "${TMPDIR:-/tmp}/cake-init-runtime-lock-test.XXXXXX")"
 root="$work/locks"
 ready="$work/holder.ready"
 release="$work/holder.release"
@@ -251,6 +253,39 @@ sh "$0" harness "$root" "$log" upgrade-start
 	echo "upgrade start guard did not remain side-effect free" >&2
 	exit 1
 }
+
+# A durable native-Apply transaction must stop the ordinary service before it
+# acquires the global lock or mutates SQM.  Only the transaction owner may
+# borrow the init path while restoring the exact saved configuration.
+mkdir -p "$root/native-apply-recovery"
+: > "$root/native-apply-recovery/current"
+: > "$log"
+if sh "$0" harness "$root" "$log" start >/dev/null 2>&1; then
+	echo "ordinary start ignored a pending native Apply recovery transaction" >&2
+	exit 1
+fi
+[ ! -s "$log" ] || {
+	echo "ordinary start mutated runtime state before the native Apply recovery guard" >&2
+	exit 1
+}
+
+CAKE_AUTORATE_NATIVE_APPLY_RECOVERY=1 \
+	sh "$0" harness "$root" "$log" start
+expected_start="config-load
+sync-presets
+detect-conflicts
+sync-sqm
+prepare-ingress
+start-sqm
+start-instances"
+actual="$(cat "$log")"
+[ "$actual" = "$expected_start" ] || {
+	echo "native Apply recovery owner could not use the guarded init path" >&2
+	printf 'expected:\n%s\nactual:\n%s\n' "$expected_start" "$actual" >&2
+	exit 1
+}
+rm -f "$root/native-apply-recovery/current"
+: > "$log"
 
 sh "$0" harness "$root" "$log" reload
 

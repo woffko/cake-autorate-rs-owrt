@@ -2,7 +2,7 @@
 set -eu
 
 base="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-work="${TMPDIR:-/tmp}/cake-init-multiwan-test.$$"
+work="$(mktemp -d "${TMPDIR:-/tmp}/cake-init-multiwan-test.XXXXXX")"
 mkdir -p "$work"
 trap 'rm -rf "$work"' EXIT INT TERM
 

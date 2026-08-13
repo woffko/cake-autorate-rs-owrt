@@ -5,7 +5,7 @@ test_dir="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
 helper="$test_dir/../files/usr/libexec/cake-autorate-rs/sqm-recover"
 runtime_lock_lib="$test_dir/../files/usr/libexec/cake-autorate-rs/runtime-lock"
 fixtures="$test_dir/fixtures/sqm-recover"
-work="${TMPDIR:-/tmp}/cake-sqm-recover.$$"
+work="$(mktemp -d "${TMPDIR:-/tmp}/cake-sqm-recover.XXXXXX")"
 holder_pid=""
 
 fail() {
@@ -207,6 +207,22 @@ grep -q 'changed while locking' "$work/config-race.err"
 [ "$(action_count)" -eq "$before" ] || fail "configuration race mutated SQM"
 assert_no_interface_record
 : > "$work/uci.log"
+
+# A non-zero sqm-run status is not authoritative if the command has already
+# installed the complete frozen topology.  Exact postcondition attestation
+# accepts that state without a second start, while the existing hard-failure
+# case below proves that a non-zero status without exact health still fails.
+rm -f "$work/healthy" "$work/sys/ifb4eth0/statistics/tx_bytes" \
+	"$work/state/eth0.state"
+before="$(action_count)"
+CAKE_TEST_SQM_START_FAIL_AFTER_HEALTH=1 "$helper" wanb_sqm
+[ "$(action_count)" -eq $((before + 1)) ] ||
+	fail "postcondition recovery retried a completed non-zero SQM start"
+[ -f "$work/healthy" ] || fail "non-zero SQM start postcondition was not retained"
+"$helper" wanb_sqm check
+[ "$(action_count)" -eq $((before + 1)) ] ||
+	fail "postcondition recovery was not exact on read-only recheck"
+assert_no_interface_record
 
 # Failure after lock acquisition must still release the interface record and
 # global kernel lock through the EXIT trap.

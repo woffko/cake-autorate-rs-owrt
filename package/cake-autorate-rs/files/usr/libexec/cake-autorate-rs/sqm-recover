@@ -732,14 +732,24 @@ elif [ -e "$sqm_runtime_state" ]; then
 	UCI_CONFIG_DIR="$sqm_private_config_dir" "$sqm_run" stop "$target" >/dev/null 2>&1 || true
 fi
 rm -f "$sqm_state_dir/$target.state" 2>/dev/null || fail "Unable to clear stale SQM state for $target."
+sqm_start_rc=0
 UCI_CONFIG_DIR="$sqm_private_config_dir" "$sqm_run" start "$target" >/dev/null 2>&1 ||
-	fail "Failed to start managed SQM on $target."
+	sqm_start_rc="$?"
+
+# sqm-scripts may return a non-zero status after it has already installed the
+# complete requested topology.  The command status is not sufficient evidence
+# either way: accept only the same exact frozen-state postcondition used by the
+# normal recovery path.  A genuine failed start still fails immediately and
+# retains its distinct diagnostic; do not wait on a timer for an unsuccessful
+# command to become valid later.
+healthy && exit 0
+[ "$sqm_start_rc" -eq 0 ] || fail "Failed to start managed SQM on $target."
 
 attempt=0
 while [ "$attempt" -lt 10 ]; do
-	healthy && exit 0
 	attempt=$((attempt + 1))
 	sleep 1
+	healthy && exit 0
 done
 
 fail "Managed SQM on $target did not restore CAKE, IFB, and ingress redirect."

@@ -1,0 +1,17 @@
+{
+	"luci-app-cake-autorate-rs-lite": {
+		"description": "Grant access to the minimal manual CAKE Autorate RS interface",
+		"read": {
+			"file": {
+				"/var/run/cake-autorate/*/status.json": [ "read" ]
+			},
+			"uci": [ "cake-autorate", "sqm", "network", "mwan3" ]
+		},
+		"write": {
+			"ubus": {
+				"uci": [ "revert" ]
+			},
+			"uci": [ "cake-autorate", "sqm" ]
+		}
+	}
+}

@@ -3,7 +3,7 @@ set -eu
 
 test_dir="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
 lib="$test_dir/../files/usr/libexec/cake-autorate-rs/runtime-lock"
-work="${TMPDIR:-/tmp}/cake-runtime-lock-test.$$"
+work="$(mktemp -d "${TMPDIR:-/tmp}/cake-runtime-lock-test.XXXXXX")"
 holder_pid=""
 
 fail() {

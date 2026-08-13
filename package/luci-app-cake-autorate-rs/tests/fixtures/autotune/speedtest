@@ -123,13 +123,22 @@ case "$3" in
 		elif [ "${AUTOTUNE_MOCK_VARIABLE_DIRECTIONAL_NO_EFFECT:-0}" = 1 ]; then
 			mock_dl=$((AUTOTUNE_MOCK_CURRENT_DL_KBPS * 95 / 100))
 			mock_ul=$((AUTOTUNE_MOCK_CURRENT_UL_KBPS * 95 / 100))
+			case "${AUTOTUNE_MOCK_PHASE_TOPOLOGY:-both_shaped}" in
+				upload_only_shaped) mock_dl=50000 ;;
+				download_only_shaped) mock_ul=10000 ;;
+			esac
 			case "$reported_direction" in
 				download) mock_ul=0 ;;
 				upload) mock_dl=0 ;;
 			esac
 			printf '{"download_kbps":%s,"upload_kbps":%s,"backend":"%s","test_direction":"%s","server_id":"%s","server_sponsor":"Variable directional fixture","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.1","shaper_bypassed":false,"sqm_paused":false,"sqm_bypass_mode":"none"}\n' "$mock_dl" "$mock_ul" "$result_backend" "$reported_direction" "$server_id"
 		elif [ "${AUTOTUNE_MOCK_REALIZATION_OVERSHOOT:-0}" = 1 ]; then
-			printf '{"download_kbps":50000,"upload_kbps":10000,"backend":"%s","test_direction":"%s","server_id":"%s","server_sponsor":"Test Server","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.1","shaper_bypassed":false,"sqm_paused":false,"sqm_bypass_mode":"none"}\n' "$result_backend" "$reported_direction" "$server_id"
+			# Track the candidate selected by the current algorithm.  Fixed
+			# 50/10 Mbit values stopped being an overshoot once the legacy
+			# pre-search haircut was removed and merely produced 100% realization.
+			mock_dl=$(((${AUTOTUNE_MOCK_CURRENT_DL_KBPS:-50000} * 120 + 99) / 100))
+			mock_ul=$(((${AUTOTUNE_MOCK_CURRENT_UL_KBPS:-10000} * 120 + 99) / 100))
+			printf '{"download_kbps":%s,"upload_kbps":%s,"backend":"%s","test_direction":"%s","server_id":"%s","server_sponsor":"Test Server","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.1","shaper_bypassed":false,"sqm_paused":false,"sqm_bypass_mode":"none"}\n' "$mock_dl" "$mock_ul" "$result_backend" "$reported_direction" "$server_id"
 		elif [ "${AUTOTUNE_MOCK_REALIZATION_ADVISORY:-0}" = 1 ]; then
 			printf '{"download_kbps":30000,"upload_kbps":6000,"backend":"%s","test_direction":"%s","server_id":"%s","server_sponsor":"Test Server","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.1","shaper_bypassed":false,"sqm_paused":false,"sqm_bypass_mode":"none"}\n' "$result_backend" "$reported_direction" "$server_id"
 		elif [ "${AUTOTUNE_MOCK_REALIZATION_LOW:-0}" = 1 ]; then
@@ -145,7 +154,16 @@ case "$3" in
 		elif [ "${AUTOTUNE_MOCK_DIRECTIONAL_CORRECT:-0}" = 1 ] && [ "$count" -eq 6 ]; then
 			printf '{"download_kbps":39000,"upload_kbps":10000,"backend":"speedtest-go","test_direction":"%s","server_id":"17372","server_sponsor":"Test Server","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.1","shaper_bypassed":false,"sqm_paused":false,"sqm_bypass_mode":"none"}\n' "$reported_direction"
 		elif [ "${AUTOTUNE_MOCK_CORRECT:-0}" = 1 ] && [ "$count" -eq 6 ]; then
-			printf '{"download_kbps":20000,"upload_kbps":4000,"backend":"speedtest-go","test_direction":"%s","server_id":"17372","server_sponsor":"Test Server","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.1","shaper_bypassed":false,"sqm_paused":false,"sqm_bypass_mode":"none"}\n' "$reported_direction"
+			mock_dl=$((${AUTOTUNE_MOCK_CURRENT_DL_KBPS:-50000} * 20 / 100))
+			printf '{"download_kbps":%s,"upload_kbps":0,"backend":"speedtest-go","test_direction":"%s","server_id":"17372","server_sponsor":"Test Server","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.1","shaper_bypassed":false,"sqm_paused":false,"sqm_bypass_mode":"none"}\n' "$mock_dl" "$reported_direction"
+		elif [ "${AUTOTUNE_MOCK_CORRECT:-0}" = 1 ]; then
+			mock_dl=$((${AUTOTUNE_MOCK_CURRENT_DL_KBPS:-50000} * 84 / 100))
+			mock_ul=$((${AUTOTUNE_MOCK_CURRENT_UL_KBPS:-10000} * 80 / 100))
+			case "$reported_direction" in
+				download) mock_ul=0 ;;
+				upload) mock_dl=0 ;;
+			esac
+			printf '{"download_kbps":%s,"upload_kbps":%s,"backend":"speedtest-go","test_direction":"%s","server_id":"17372","server_sponsor":"Test Server","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.1","shaper_bypassed":false,"sqm_paused":false,"sqm_bypass_mode":"none"}\n' "$mock_dl" "$mock_ul" "$reported_direction"
 		else
 			printf '{"download_kbps":42000,"upload_kbps":8000,"backend":"%s","test_direction":"%s","server_id":"%s","server_sponsor":"Test Server","route_mode":"main","mwan3_member":"","route_interface":"lo","route_source_ip":"192.0.2.1","route_fwmark":"","route_table":"main","external_ip_after":"203.0.113.1","shaper_bypassed":false,"sqm_paused":false,"sqm_bypass_mode":"none"}\n' "$result_backend" "$reported_direction" "$server_id"
 		fi

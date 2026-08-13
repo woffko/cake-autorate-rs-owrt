@@ -1,4 +1,5 @@
 handoff.md
+migration.md
 
 # Local OpenWrt SDK/build output
 openwrt-*/
@@ -13,6 +14,8 @@ logs/
 # Rust local build artifacts
 target/
 **/target/
+**/node_modules/
+**/*.tsbuildinfo
 
 # Local downloads/tools used during experiments
 downloads/

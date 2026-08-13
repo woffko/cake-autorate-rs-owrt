@@ -19,7 +19,7 @@ impl LinkKind {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Ethernet => "ethernet",
             Self::Pppoe => "pppoe",
@@ -152,6 +152,22 @@ impl CapacityLearningPolicy {
     }
 }
 
+pub fn validate_capacity_learning_service_caps(
+    policy: Option<CapacityLearningPolicy>,
+    download_service_cap_kbps: Option<u64>,
+    upload_service_cap_kbps: Option<u64>,
+) -> Result<(), String> {
+    if policy == Some(CapacityLearningPolicy::FixedCap)
+        && (download_service_cap_kbps.is_none() || upload_service_cap_kbps.is_none())
+    {
+        return Err(
+            "fixed-cap capacity learning requires download and upload service hard caps"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProposalContext {
     pub access_medium: Option<AccessMedium>,
@@ -269,52 +285,40 @@ impl AutotuneProfile {
         }
     }
 
-    fn direction_factors(
+    fn exploration_minimum_factor(
         self,
         variable: bool,
         observed_low_kbps: f64,
         direction: SearchDirection,
-    ) -> (f64, f64, f64, f64) {
+    ) -> f64 {
         match (self, variable) {
             // Standard Gaming never explores below its 70% retention
             // objective. Deeper sacrifices require the explicit Extreme A+
             // opt-in and remain manual-only below this boundary.
-            (Self::Gaming, true) => (0.70, 0.75, 1.20, 1.60),
-            (Self::Gaming, false) => (0.70, 0.82, 0.92, 1.02),
-            (Self::GamingExtreme, _) => {
-                let minimum = match direction {
-                    SearchDirection::Download if observed_low_kbps >= 500_000.0 => 0.25,
-                    SearchDirection::Download if observed_low_kbps >= 100_000.0 => 0.40,
-                    SearchDirection::Download if observed_low_kbps >= 25_000.0 => 0.55,
-                    SearchDirection::Download => 0.70,
-                    SearchDirection::Upload if observed_low_kbps >= 500_000.0 => 0.25,
-                    SearchDirection::Upload if observed_low_kbps >= 100_000.0 => 0.30,
-                    SearchDirection::Upload if observed_low_kbps >= 20_000.0 => 0.50,
-                    SearchDirection::Upload => 0.70,
-                };
-                if variable {
-                    (minimum, 0.75, 1.20, 1.60)
-                } else {
-                    (minimum, 0.82, 0.92, 1.02)
-                }
-            }
-            (Self::BestOverall, true) => (0.40, 0.85, 1.25, 1.80),
-            (Self::BestOverall, false) => (0.70, 0.88, 0.95, 1.05),
+            (Self::Gaming, _) => 0.70,
+            (Self::GamingExtreme, _) => match direction {
+                SearchDirection::Download if observed_low_kbps >= 500_000.0 => 0.25,
+                SearchDirection::Download if observed_low_kbps >= 100_000.0 => 0.40,
+                SearchDirection::Download if observed_low_kbps >= 25_000.0 => 0.55,
+                SearchDirection::Download => 0.70,
+                SearchDirection::Upload if observed_low_kbps >= 500_000.0 => 0.25,
+                SearchDirection::Upload if observed_low_kbps >= 100_000.0 => 0.30,
+                SearchDirection::Upload if observed_low_kbps >= 20_000.0 => 0.50,
+                SearchDirection::Upload => 0.70,
+            },
+            (Self::BestOverall, true) => 0.40,
+            (Self::BestOverall, false) => 0.70,
             // This minimum is an exploration boundary only. The runtime
             // minimum is accepted later solely from an actually measured
             // controlled CAKE point at the detected latency knee.
-            // Automatic Variable Link growth is bounded by the actually
-            // measured raw low/high interval.  Multiplying a clean raw sample
-            // by 1.25/1.80 manufactured an unverified gigabit-plus ceiling on
-            // sub-gigabit links and then made the runtime trust it at startup.
-            (Self::VariableLink, _) => (0.35, 0.80, 1.00, 1.00),
-            (Self::Fair, true) => (0.35, 0.92, 1.30, 1.90),
+            (Self::VariableLink, _) => 0.35,
+            (Self::Fair, true) => 0.35,
             // A short cellular calibration can look stable even though the
             // radio scheduler moves materially before shaped validation.  A
             // 35% search/configuration minimum gives the bounded search room
             // to establish an actually enforced CAKE rate; the 90% Fair
             // retention objective still controls unattended Auto-Apply.
-            (Self::Fair, false) => (0.35, 0.94, 0.98, 1.08),
+            (Self::Fair, false) => 0.35,
         }
     }
 
@@ -437,7 +441,7 @@ pub enum CeilingEvidence {
 }
 
 impl CeilingEvidence {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::UnvalidatedCandidate => "unvalidated_candidate",
             Self::ShapedValidation => "shaped_validation",
@@ -457,7 +461,7 @@ pub enum CeilingCapSource {
 }
 
 impl CeilingCapSource {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::MeasuredRaw => "measured_raw",
             Self::UserServiceLimit => "user_service_limit",
@@ -598,6 +602,12 @@ impl AutotuneProposal {
         direction.maximum_kbps = measured;
         direction.tested_safe_maximum_kbps = Some(measured);
         direction.ceiling_evidence = CeilingEvidence::ShapedValidation;
+        // Intentionally allow absolute_cap_kbps to grow up to exploration_cap
+        // when shaped validation confirms a candidate above the previous ceiling.
+        // The .max(measured) is deliberate: the caller has already proved this
+        // exact rate is safe under load, so it is legitimate to raise the cap.
+        // The outer .min(exploration_cap.max(measured)) prevents it from
+        // escaping the measured exploration boundary.
         direction.absolute_cap_kbps = direction
             .absolute_cap_kbps
             .max(measured)
@@ -638,6 +648,38 @@ impl AutotuneProposal {
         let observed_low_ceiling = 1.0;
         revise_direction_base(&mut self.download, download_scale, observed_low_ceiling);
         revise_direction_base(&mut self.upload, upload_scale, observed_low_ceiling);
+        Ok(())
+    }
+
+    /// Select an exact pair of CAKE rates for a measurement. Unlike a
+    /// base-rate revision, this may move above observed-low up to the measured
+    /// exploration maximum. The caller still has to validate the pair under
+    /// load before it can become a tested-safe runtime configuration.
+    pub fn set_measurement_base_rates(
+        &mut self,
+        download_kbps: u64,
+        upload_kbps: u64,
+    ) -> Result<(), String> {
+        fn validate(
+            name: &str,
+            candidate_kbps: u64,
+            direction: &DirectionProposal,
+        ) -> Result<(), String> {
+            if candidate_kbps < direction.exploration_minimum_kbps
+                || candidate_kbps > direction.maximum_kbps
+            {
+                return Err(format!(
+                    "{name} measurement base must stay within the measured exploration interval"
+                ));
+            }
+            Ok(())
+        }
+
+        // Validate the whole pair before mutating either direction.
+        validate("download", download_kbps, &self.download)?;
+        validate("upload", upload_kbps, &self.upload)?;
+        self.download.base_kbps = download_kbps;
+        self.upload.base_kbps = upload_kbps;
         Ok(())
     }
 
@@ -793,6 +835,7 @@ fn validate_base_scale(scale: f64) -> Result<(), String> {
 pub struct DirectionValidationInput {
     pub observed_low_kbps: u64,
     pub candidate_kbps: u64,
+    pub realized_kbps: u64,
     pub achieved_kbps: u64,
     pub minimum_kbps: u64,
     pub maximum_kbps: u64,
@@ -1263,14 +1306,19 @@ fn validate_direction_validation_input(
     name: &str,
     input: DirectionValidationInput,
 ) -> Result<(), String> {
-    if input.observed_low_kbps == 0 || input.candidate_kbps == 0 || input.achieved_kbps == 0 {
+    if input.observed_low_kbps == 0
+        || input.candidate_kbps == 0
+        || input.realized_kbps == 0
+        || input.achieved_kbps == 0
+    {
         return Err(format!(
-            "{name} observed, candidate, and achieved rates must be positive"
+            "{name} observed, candidate, realized, and achieved rates must be positive"
         ));
     }
     for (rate_name, value) in [
         ("observed", input.observed_low_kbps),
         ("candidate", input.candidate_kbps),
+        ("realized", input.realized_kbps),
         ("achieved", input.achieved_kbps),
         ("minimum", input.minimum_kbps),
         ("maximum", input.maximum_kbps),
@@ -1294,7 +1342,7 @@ fn validate_direction_validation_input(
 
 fn validation_metrics(input: DirectionValidationInput) -> DirectionValidationMetrics {
     DirectionValidationMetrics {
-        candidate_realization_percent: input.achieved_kbps as f64 * 100.0
+        candidate_realization_percent: input.realized_kbps as f64 * 100.0
             / input.candidate_kbps as f64,
         capacity_retention_percent: input.achieved_kbps as f64 * 100.0
             / input.observed_low_kbps as f64,
@@ -1929,15 +1977,11 @@ pub fn build_proposal_for_profile_with_context(
     if context.access_confidence_percent > 100 {
         return Err("access-medium confidence must be between 0 and 100".to_string());
     }
-    if context.capacity_learning_policy == Some(CapacityLearningPolicy::FixedCap)
-        && (context.download_service_cap_kbps.is_none()
-            || context.upload_service_cap_kbps.is_none())
-    {
-        return Err(
-            "fixed-cap capacity learning requires download and upload service hard caps"
-                .to_string(),
-        );
-    }
+    validate_capacity_learning_service_caps(
+        context.capacity_learning_policy,
+        context.download_service_cap_kbps,
+        context.upload_service_cap_kbps,
+    )?;
     let mut download = propose_direction(
         download_samples_kbps,
         profile,
@@ -1964,8 +2008,10 @@ pub fn build_proposal_for_profile_with_context(
     // Using a percentage of the proposed minimum is too high when one
     // direction looked stable during a short, otherwise variable calibration.
     let smallest_observed = download.observed_low_kbps.min(upload.observed_low_kbps);
-    let active_threshold_kbps =
-        checked_rounded_rate(smallest_observed as f64 / 10.0)?.clamp(500, 20_000);
+    let smallest_minimum = download.minimum_kbps.min(upload.minimum_kbps);
+    let active_threshold_kbps = checked_rounded_rate(smallest_observed as f64 / 10.0)?
+        .clamp(1, 20_000)
+        .min(smallest_minimum);
     let (link_layer, overhead, mpu) = match link_kind {
         LinkKind::Pppoe => ("ethernet", 44, 84),
         LinkKind::Ethernet => ("ethernet", 18, 64),
@@ -2120,29 +2166,22 @@ fn propose_direction(
     let variability = ((high - low) / median.max(1.0)).max(0.0);
     let variable = variability >= 0.15;
 
-    let (mut minimum_factor, base_factor, maximum_factor, cap_factor) =
-        profile.direction_factors(variable, low, direction);
+    let mut minimum_factor = profile.exploration_minimum_factor(variable, low, direction);
     if profile == AutotuneProfile::VariableLink {
         if let Some(access_medium) = access_medium {
             minimum_factor = access_medium.variable_exploration_floor();
         }
     }
-    let (minimum, base, maximum, cap) = (
-        low * minimum_factor,
-        low * base_factor,
-        high * maximum_factor,
-        high * cap_factor,
-    );
-    let minimum = checked_rounded_rate(minimum)?;
-    let base = checked_rounded_rate(base)?.max(minimum);
-    // Profile multipliers are starting hints only.  The bounded search must
-    // be able to prove a faster candidate up to observed-low instead of
-    // declaring the target impossible behind an artificial 0.92/0.95/0.98
-    // ceiling.
-    let maximum = checked_rounded_rate(maximum)?
-        .max(checked_rounded_rate(low)?)
-        .max(base);
-    let absolute_cap = checked_rounded_rate(cap)?.max(maximum);
+    let minimum = checked_rounded_rate(low * minimum_factor)?;
+    // Profile policy may choose how deeply to explore, but it must never
+    // manufacture an unconditional initial haircut. The conservative raw low
+    // is the starting/base candidate and measured raw high is the exploration
+    // cap. A later shaped search either proves the highest passing candidate
+    // or records an explicit lower tested point; retention remains an
+    // Auto-Apply/Review objective, not a rate multiplier.
+    let base = checked_rounded_rate(low)?.max(minimum);
+    let maximum = checked_rounded_rate(high)?.max(base);
+    let absolute_cap = maximum;
 
     Ok(DirectionProposal {
         minimum_kbps: minimum,
@@ -2340,9 +2379,37 @@ fn json_escape(value: &str) -> String {
 }
 
 pub const MAX_PROFILE_SEARCH_OBSERVATIONS: usize = 12;
+pub const MAX_PROFILE_REVIEW_OPTIONS: usize = 3;
+pub const PHYSICAL_CAPACITY_BELOW_CAKE_CANDIDATE_REVIEW_REASON: &str =
+    "physical-capacity-below-cake-candidate-review";
 const MAX_SAME_CANDIDATE_OBSERVATIONS: usize = 3;
 const VARIABLE_LINK_EXPLORATION_STEP_PERCENT: f64 = 15.0;
 const VARIABLE_LINK_PLATEAU_MINIMUM_MS: f64 = 3.0;
+
+/// Return the next exact Variable Link candidate after a candidate produced no
+/// admissible loaded observation at all.  This uses the same fixed step as the
+/// measured Variable Link descent, but deliberately does not claim that the
+/// failed candidate was measured.  `None` means that the authorized
+/// exploration floor has already been reached.
+pub fn next_variable_link_unobserved_candidate(
+    observed_low_kbps: u64,
+    minimum_kbps: u64,
+    current_kbps: u64,
+) -> Result<Option<u64>, String> {
+    if observed_low_kbps == 0
+        || observed_low_kbps > MAX_RATE_KBPS
+        || minimum_kbps == 0
+        || minimum_kbps > current_kbps
+        || current_kbps > MAX_RATE_KBPS
+    {
+        return Err("variable-link unobserved search bounds are invalid".to_string());
+    }
+    let step = rounded_search_rate(
+        observed_low_kbps as f64 * VARIABLE_LINK_EXPLORATION_STEP_PERCENT / 100.0,
+    );
+    let next = current_kbps.saturating_sub(step).max(minimum_kbps);
+    Ok((next < current_kbps).then_some(next))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchDirection {
@@ -2370,9 +2437,13 @@ impl SearchDirection {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SearchObservation {
     pub candidate_kbps: u64,
+    pub realized_kbps: u64,
     pub achieved_kbps: u64,
     pub icmp_delta_ms: f64,
     pub transport_delta_ms: f64,
+    /// The transport value is a verified lower bound from an exhausted
+    /// deadline, not an exact RTT sample.
+    pub transport_censored: bool,
     pub loss_percent: f64,
     pub cpu_percent: f64,
 }
@@ -2383,6 +2454,7 @@ pub struct SearchObservationMetrics {
     pub retention_percent: f64,
     pub effective_delta_ms: f64,
     pub grade: &'static str,
+    pub transport_censored: bool,
     pub measurement_reliable: bool,
     pub manual_reviewable: bool,
     pub resource_safe: bool,
@@ -2413,6 +2485,57 @@ pub enum ProfileSearchAction {
     Inconclusive,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProfileSearchOptionRole {
+    Recommended,
+    QualityFirst,
+    ThroughputFirst,
+    BalancedAlternative,
+}
+
+impl ProfileSearchOptionRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Recommended => "recommended",
+            Self::QualityFirst => "quality_first",
+            Self::ThroughputFirst => "throughput_first",
+            Self::BalancedAlternative => "balanced_alternative",
+        }
+    }
+}
+
+/// One exact direction-level candidate retained from measured search
+/// evidence.  It is deliberately not an apply contract: a download and
+/// upload candidate must still be combined and re-measured as one exact pair
+/// before any whole-link option can be offered to LuCI.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ProfileSearchOption {
+    pub role: ProfileSearchOptionRole,
+    pub selected_index: usize,
+    pub candidate_kbps: u64,
+    pub conservative_achieved_kbps: u64,
+    pub worst_delta_ms: f64,
+    pub grade: &'static str,
+    pub transport_censored: bool,
+    pub controlled: bool,
+    pub manual_reviewable: bool,
+    pub target_met: bool,
+    pub capacity_objective_met: bool,
+    pub auto_apply_candidate: bool,
+}
+
+/// One unconfirmed whole-link coordinate assembled only from exact measured
+/// direction candidates.  It becomes an operator-visible option solely after
+/// the exact pair receives its own pair-confirmation measurement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProfilePairCandidate {
+    pub role: ProfileSearchOptionRole,
+    pub download_index: usize,
+    pub upload_index: usize,
+    pub download_kbps: u64,
+    pub upload_kbps: u64,
+}
+
 impl ProfileSearchAction {
     fn as_str(self) -> &'static str {
         match self {
@@ -2428,6 +2551,7 @@ impl ProfileSearchAction {
 pub struct ProfileSearchResult {
     pub profile: AutotuneProfile,
     pub direction: SearchDirection,
+    pub observed_low_kbps: u64,
     pub action: ProfileSearchAction,
     pub reason: &'static str,
     pub next_candidate_kbps: Option<u64>,
@@ -2450,6 +2574,24 @@ pub struct ProfileSearchResult {
 }
 
 impl ProfileSearchResult {
+    pub fn review_options(&self) -> Vec<ProfileSearchOption> {
+        profile_search_review_options(self)
+    }
+
+    pub fn physical_capacity_limited_review_for(&self, candidate_kbps: u64) -> bool {
+        self.action == ProfileSearchAction::Fallback
+            && self.reason == PHYSICAL_CAPACITY_BELOW_CAKE_CANDIDATE_REVIEW_REASON
+            && self.selected_index.is_some_and(|index| {
+                self.observations
+                    .get(index)
+                    .is_some_and(|observation| observation.candidate_kbps == candidate_kbps)
+                    && self
+                        .metrics
+                        .get(index)
+                        .is_some_and(|metrics| metrics.manual_reviewable && !metrics.safety_pass)
+            })
+    }
+
     pub fn to_json(&self) -> String {
         let selected = self.selected_index.map_or_else(
             || "null".to_string(),
@@ -2458,19 +2600,21 @@ impl ProfileSearchResult {
                 let metrics = self.metrics[index];
                 format!(
                     concat!(
-                        "{{\"index\":{},\"candidate_kbps\":{},\"achieved_kbps\":{},",
+                        "{{\"index\":{},\"candidate_kbps\":{},\"realized_kbps\":{},\"achieved_kbps\":{},",
                         "\"realization_percent\":{:.3},\"retention_percent\":{:.3},",
-                        "\"effective_delta_ms\":{:.3},",
+                        "\"effective_delta_ms\":{:.3},\"transport_censored\":{},",
                         "\"loss_percent\":{:.3},\"cpu_percent\":{:.3},",
                         "\"grade\":\"{}\",\"safety_pass\":{},\"manual_reviewable\":{},",
                         "\"capacity_objective_met\":{},\"target_met\":{}}}"
                     ),
                     index + 1,
                     observation.candidate_kbps,
+                    observation.realized_kbps,
                     observation.achieved_kbps,
                     metrics.realization_percent,
                     metrics.retention_percent,
                     metrics.effective_delta_ms,
+                    observation.transport_censored,
                     observation.loss_percent,
                     observation.cpu_percent,
                     metrics.grade,
@@ -2489,9 +2633,10 @@ impl ProfileSearchResult {
             .map(|(index, (observation, metrics))| {
                 format!(
                     concat!(
-                        "{{\"index\":{},\"candidate_kbps\":{},\"achieved_kbps\":{},",
+                        "{{\"index\":{},\"candidate_kbps\":{},\"realized_kbps\":{},\"achieved_kbps\":{},",
                         "\"realization_percent\":{:.3},\"retention_percent\":{:.3},",
                         "\"effective_delta_ms\":{:.3},\"grade\":\"{}\",",
+                        "\"transport_censored\":{},",
                         "\"loss_percent\":{:.3},\"cpu_percent\":{:.3},",
                         "\"measurement_reliable\":{},\"manual_reviewable\":{},\"resource_safe\":{},",
                         "\"safety_pass\":{},\"capacity_objective_met\":{},",
@@ -2499,11 +2644,13 @@ impl ProfileSearchResult {
                     ),
                     index + 1,
                     observation.candidate_kbps,
+                    observation.realized_kbps,
                     observation.achieved_kbps,
                     metrics.realization_percent,
                     metrics.retention_percent,
                     metrics.effective_delta_ms,
                     metrics.grade,
+                    metrics.transport_censored,
                     observation.loss_percent,
                     observation.cpu_percent,
                     metrics.measurement_reliable,
@@ -2517,12 +2664,45 @@ impl ProfileSearchResult {
             })
             .collect::<Vec<_>>()
             .join(",");
+        let review_options = self
+            .review_options()
+            .into_iter()
+            .map(|option| {
+                format!(
+                    concat!(
+                        "{{\"role\":\"{}\",\"observation_index\":{},",
+                        "\"candidate_kbps\":{},\"conservative_achieved_kbps\":{},",
+                        "\"worst_delta_ms\":{:.3},\"grade\":\"{}\",",
+                        "\"transport_censored\":{},",
+                        "\"controlled\":{},\"manual_reviewable\":{},",
+                        "\"target_met\":{},\"capacity_objective_met\":{},",
+                        "\"auto_apply_candidate\":{},",
+                        "\"direction_candidate_only\":true,",
+                        "\"pair_confirmation_required\":true}}"
+                    ),
+                    option.role.as_str(),
+                    option.selected_index + 1,
+                    option.candidate_kbps,
+                    option.conservative_achieved_kbps,
+                    option.worst_delta_ms,
+                    option.grade,
+                    option.transport_censored,
+                    option.controlled,
+                    option.manual_reviewable,
+                    option.target_met,
+                    option.capacity_objective_met,
+                    option.auto_apply_candidate,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         let optional_rate = |value: Option<u64>| {
             value.map_or_else(|| "null".to_string(), |value| value.to_string())
         };
         format!(
             concat!(
-                "{{\"schema_version\":2,\"profile\":\"{}\",\"direction\":\"{}\",",
+                "{{\"schema_version\":4,\"profile\":\"{}\",\"direction\":\"{}\",",
+                "\"observed_low_kbps\":{},",
                 "\"objective\":\"{}\",\"target_grade\":\"{}\",",
                 "\"capacity_floor_percent\":{:.1},\"capacity_objective_percent\":{:.1},",
                 "\"retention_objective_percent\":{:.1},",
@@ -2537,10 +2717,12 @@ impl ProfileSearchResult {
                 "\"reason\":\"{}\",\"next_candidate_kbps\":{},",
                 "\"selected\":{},\"bounds\":{{\"lower_target_pass_kbps\":{},",
                 "\"upper_target_fail_kbps\":{},\"resolution_kbps\":{}}},",
-                "\"attempts\":{},\"max_attempts\":{},\"evaluated\":[{}]}}"
+                "\"attempts\":{},\"max_attempts\":{},",
+                "\"review_options\":[{}],\"evaluated\":[{}]}}"
             ),
             self.profile.as_str(),
             self.direction.as_str(),
+            self.observed_low_kbps,
             self.profile.objective(),
             self.profile.target_grade(),
             self.profile.capacity_floor_percent(),
@@ -2576,6 +2758,7 @@ impl ProfileSearchResult {
             self.resolution_kbps,
             self.observations.len(),
             self.max_attempts,
+            review_options,
             evaluated,
         )
     }
@@ -2585,11 +2768,18 @@ fn validate_profile_search_input(input: &ProfileSearchInput) -> Result<(), Strin
     if input.observed_low_kbps == 0 || input.observed_low_kbps > MAX_RATE_KBPS {
         return Err("search observed-low rate is outside the supported range".to_string());
     }
+    // `observed_low_kbps` is achieved payload, while `upper_kbps` is an
+    // applied CAKE candidate.  Protocol overhead and backend behaviour mean a
+    // healthy candidate can legitimately be greater than achieved payload.
+    // Comparing the two as the same quantity caused a passing retained CAKE
+    // ceiling to be discarded and penalised a second time by profile factors.
     if input.minimum_kbps == 0
         || input.minimum_kbps > input.upper_kbps
-        || input.upper_kbps > input.observed_low_kbps
+        || input.upper_kbps > MAX_RATE_KBPS
     {
-        return Err("search bounds must satisfy 0 < minimum <= upper <= observed-low".to_string());
+        return Err(
+            "search bounds must satisfy 0 < minimum <= upper <= global maximum".to_string(),
+        );
     }
     if input.observations.is_empty() || input.observations.len() > MAX_PROFILE_SEARCH_OBSERVATIONS {
         return Err(format!(
@@ -2624,6 +2814,8 @@ fn validate_profile_search_input(input: &ProfileSearchInput) -> Result<(), Strin
     for (index, observation) in input.observations.iter().enumerate() {
         if observation.candidate_kbps < input.minimum_kbps
             || observation.candidate_kbps > input.upper_kbps
+            || observation.realized_kbps == 0
+            || observation.realized_kbps > MAX_RATE_KBPS
             || observation.achieved_kbps == 0
             || observation.achieved_kbps > MAX_RATE_KBPS
         {
@@ -2658,15 +2850,15 @@ fn evaluate_search_observation(
     observation: SearchObservation,
 ) -> SearchObservationMetrics {
     let realization_percent =
-        observation.achieved_kbps as f64 * 100.0 / observation.candidate_kbps as f64;
+        observation.realized_kbps as f64 * 100.0 / observation.candidate_kbps as f64;
     let retention_percent =
         observation.achieved_kbps as f64 * 100.0 / input.observed_low_kbps as f64;
     let effective_delta_ms = observation
         .icmp_delta_ms
         .max(observation.transport_delta_ms);
     let grade = classify_quality(Some(effective_delta_ms)).as_str();
-    let measurement_reliable = realization_percent
-        >= input.thresholds.candidate_realization_min_percent
+    let measurement_reliable = !observation.transport_censored
+        && realization_percent >= input.thresholds.candidate_realization_min_percent
         && realization_percent <= input.thresholds.candidate_realization_max_percent;
     let resource_safe = observation.loss_percent <= input.thresholds.loss_max_percent;
     // A clean 50-80% realization is not proof that CAKE controlled the
@@ -2674,10 +2866,11 @@ fn evaluate_search_observation(
     // however, bounded enough to retain as explicit manual-review evidence
     // after the search has tried a lower, exact CAKE rate.
     let manual_reviewable = realization_percent >= THROUGHPUT_TRUST_FLOOR_PERCENT
-        && realization_percent < input.thresholds.candidate_realization_min_percent
         && realization_percent <= input.thresholds.candidate_realization_max_percent
         && retention_percent >= THROUGHPUT_TRUST_FLOOR_PERCENT
-        && resource_safe;
+        && resource_safe
+        && (observation.transport_censored
+            || realization_percent < input.thresholds.candidate_realization_min_percent);
     // Historical retention is not a safety signal on a variable radio link,
     // but candidate realization is: CAKE cannot control a bottleneck below
     // its configured rate.  Only a sufficiently exercised candidate may be
@@ -2687,7 +2880,8 @@ fn evaluate_search_observation(
         retention_percent >= input.thresholds.capacity_retention_min_percent;
     // Grade boundaries are exclusive at A+/A/B/C, matching the runtime
     // classifier exactly.  A 5.000 ms increase is A, not A+.
-    let target_met = effective_delta_ms < input.profile.target_delta_ms();
+    let target_met =
+        !observation.transport_censored && effective_delta_ms < input.profile.target_delta_ms();
     let throughput_component = (retention_percent / 100.0).clamp(0.0, 1.0);
     let quality_component = if effective_delta_ms <= 0.0 {
         1.0
@@ -2700,6 +2894,7 @@ fn evaluate_search_observation(
         retention_percent,
         effective_delta_ms,
         grade,
+        transport_censored: observation.transport_censored,
         measurement_reliable,
         manual_reviewable,
         resource_safe,
@@ -2780,6 +2975,20 @@ fn best_trusted_quality_index(
                 .then_with(|| right.achieved_kbps.cmp(&left.achieved_kbps))
         })
         .map(|(index, _)| index)
+}
+
+fn best_variable_operating_ceiling_index(
+    observations: &[SearchObservation],
+    metrics: &[SearchObservationMetrics],
+) -> Option<usize> {
+    // Variable Link may descend past an already acceptable operating point to
+    // learn a distinct runtime minimum. Noise during that exploration must not
+    // turn extra quality above the requested grade into an implicit throughput
+    // haircut: retain the highest-throughput safe target-passing observation.
+    // The quality-first selector remains the explicit fallback only when no
+    // tested observation met the requested class.
+    best_target_index(observations, metrics)
+        .or_else(|| best_trusted_quality_index(observations, metrics))
 }
 
 fn best_quality_index(
@@ -2900,6 +3109,34 @@ fn resolve_terminal_safe_fallback(
     }
 }
 
+/// Select a bounded Review-only point whose transport latency is a verified
+/// lower bound rather than an exact RTT.  Each such observation already
+/// represents the capture-level minimum of three attested deadline flights;
+/// it must never become a target pass or an Auto-Apply candidate.
+fn best_censored_review_index(
+    input: &ProfileSearchInput,
+    metrics: &[SearchObservationMetrics],
+) -> Option<usize> {
+    input
+        .observations
+        .iter()
+        .enumerate()
+        .filter(|(index, observation)| {
+            observation.transport_censored && metrics[*index].manual_reviewable
+        })
+        .max_by(|(left_index, left), (right_index, right)| {
+            left.achieved_kbps
+                .cmp(&right.achieved_kbps)
+                .then_with(|| left.candidate_kbps.cmp(&right.candidate_kbps))
+                .then_with(|| {
+                    metrics[*right_index]
+                        .effective_delta_ms
+                        .total_cmp(&metrics[*left_index].effective_delta_ms)
+                })
+        })
+        .map(|(index, _)| index)
+}
+
 fn candidate_was_tested(observations: &[SearchObservation], candidate_kbps: u64) -> bool {
     observations
         .iter()
@@ -2910,6 +3147,115 @@ fn achieved_rates_repeatable(left_kbps: u64, right_kbps: u64) -> bool {
     let high = left_kbps.max(right_kbps) as f64;
     let low = left_kbps.min(right_kbps) as f64;
     high > 0.0 && (high - low) * 100.0 / high <= 5.0
+}
+
+fn rate_ratio_within(
+    numerator_kbps: u64,
+    denominator_kbps: u64,
+    minimum_percent: f64,
+    maximum_percent: f64,
+) -> bool {
+    denominator_kbps > 0
+        && (numerator_kbps as f64 * 100.0 / denominator_kbps as f64) >= minimum_percent
+        && (numerator_kbps as f64 * 100.0 / denominator_kbps as f64) <= maximum_percent
+}
+
+/// A terminal Variable-link probe may lose its lower retest when the radio
+/// capacity changes underneath the exact measurement window.  In that narrow
+/// case, preserve a prior *configured and measured* CAKE ceiling only when two
+/// observations independently prove that CAKE wire bytes tracked backend
+/// goodput even though the physical bottleneck sat below the configured rate.
+///
+/// This is deliberately not part of ordinary search evaluation.  It cannot
+/// satisfy `safety_pass`, cannot establish a runtime minimum, and cannot be
+/// selected until the lower exact retest has terminated at a measured boundary.
+fn physical_capacity_limited_review_indices(
+    input: &ProfileSearchInput,
+    metrics: &[SearchObservationMetrics],
+) -> Option<Vec<usize>> {
+    if input.profile != AutotuneProfile::VariableLink {
+        return None;
+    }
+
+    let mut candidates = input
+        .observations
+        .iter()
+        .map(|observation| observation.candidate_kbps)
+        .collect::<Vec<_>>();
+    candidates.sort_unstable();
+    candidates.dedup();
+
+    candidates
+        .into_iter()
+        .filter_map(|candidate_kbps| {
+            let indices = input
+                .observations
+                .iter()
+                .enumerate()
+                .filter(|(_, observation)| observation.candidate_kbps == candidate_kbps)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            if indices.len() < 2
+                || candidate_kbps <= input.minimum_kbps
+                || indices.iter().any(|index| {
+                    let observation = input.observations[*index];
+                    let metric = metrics[*index];
+                    observation.transport_censored
+                        || !metric.resource_safe
+                        || !metric.target_met
+                        || observation.cpu_percent > input.thresholds.cpu_max_percent
+                        || metric.realization_percent
+                            >= input.thresholds.candidate_realization_min_percent
+                        || metric.realization_percent
+                            > input.thresholds.candidate_realization_max_percent
+                        || observation.realized_kbps < input.minimum_kbps
+                        || !rate_ratio_within(
+                            observation.realized_kbps,
+                            observation.achieved_kbps,
+                            input.thresholds.candidate_realization_min_percent,
+                            input.thresholds.candidate_realization_max_percent,
+                        )
+                })
+            {
+                return None;
+            }
+
+            let repeatable_indices = indices
+                .iter()
+                .copied()
+                .filter(|left| {
+                    indices.iter().copied().any(|right| {
+                        left != &right
+                            && achieved_rates_repeatable(
+                                input.observations[*left].achieved_kbps,
+                                input.observations[right].achieved_kbps,
+                            )
+                            && achieved_rates_repeatable(
+                                input.observations[*left].realized_kbps,
+                                input.observations[right].realized_kbps,
+                            )
+                    })
+                })
+                .collect::<Vec<_>>();
+            (repeatable_indices.len() >= 2).then_some(repeatable_indices)
+        })
+        .max_by(|left, right| {
+            let left_achieved = left
+                .iter()
+                .map(|index| input.observations[*index].achieved_kbps)
+                .min()
+                .unwrap_or(0);
+            let right_achieved = right
+                .iter()
+                .map(|index| input.observations[*index].achieved_kbps)
+                .min()
+                .unwrap_or(0);
+            left_achieved.cmp(&right_achieved).then_with(|| {
+                input.observations[left[0]]
+                    .candidate_kbps
+                    .cmp(&input.observations[right[0]].candidate_kbps)
+            })
+        })
 }
 
 fn low_realization_evidence_eligible(
@@ -2924,11 +3270,42 @@ fn low_realization_evidence_eligible(
                 && metrics.effective_delta_ms <= 200.0))
 }
 
-fn variable_low_realization_review_index(
+/// Decide whether a low-realization observation may contribute only to the
+/// next exact diagnostic candidate.  This is deliberately weaker than manual
+/// Review eligibility for Variable Link: a clean, repeatable point below the
+/// 50% trust floor may show that the physical bottleneck sits far below the
+/// requested CAKE rate, but it must never itself become selectable evidence.
+fn low_realization_descent_evidence_eligible(
+    input: &ProfileSearchInput,
+    metrics: &[SearchObservationMetrics],
+    index: usize,
+) -> bool {
+    let metric = metrics[index];
+    let observation = input.observations[index];
+    if input.profile == AutotuneProfile::VariableLink
+        && metric.realization_percent < THROUGHPUT_TRUST_FLOOR_PERCENT
+    {
+        return metric.resource_safe
+            && !metric.transport_censored
+            && observation.cpu_percent <= input.thresholds.cpu_max_percent;
+    }
+    low_realization_evidence_eligible(input.profile, metric)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LowRealizationReviewCandidate {
+    selected_index: usize,
+    candidate_kbps: u64,
+    conservative_achieved_kbps: u64,
+    target_met: bool,
+    worst_delta_ms: f64,
+}
+
+fn low_realization_review_candidate(
     input: &ProfileSearchInput,
     metrics: &[SearchObservationMetrics],
     candidate_kbps: u64,
-) -> Option<usize> {
+) -> Option<LowRealizationReviewCandidate> {
     let indices = input
         .observations
         .iter()
@@ -2940,24 +3317,44 @@ fn variable_low_realization_review_index(
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    if indices.len() < MAX_SAME_CANDIDATE_OBSERVATIONS {
+    // The descent logic deliberately moves on after two achieved-rate
+    // samples corroborate one another within the repeatability bound.  Review
+    // must use the same evidence contract: requiring all three retry slots
+    // here erased the exact two-sample candidate which authorized the lower
+    // probe.  The pairwise filter below still rejects a singleton or two
+    // disagreeing samples, and `manual_reviewable` keeps the 50% trust floor.
+    if indices.len() < 2 {
         return None;
     }
-    let repeatable = indices.iter().enumerate().any(|(position, left)| {
-        indices.iter().skip(position + 1).any(|right| {
-            achieved_rates_repeatable(
-                input.observations[*left].achieved_kbps,
-                input.observations[*right].achieved_kbps,
-            )
+    // A candidate group is admissible only through observations that were
+    // themselves corroborated by another achieved-rate sample.  Merely
+    // having one repeatable pair must not allow an unrelated latency or
+    // throughput outlier from the same exact CAKE rate to become the point
+    // shown to the operator.
+    let repeatable_indices = indices
+        .iter()
+        .copied()
+        .filter(|left| {
+            indices.iter().copied().any(|right| {
+                left != &right
+                    && achieved_rates_repeatable(
+                        input.observations[*left].achieved_kbps,
+                        input.observations[right].achieved_kbps,
+                    )
+            })
         })
-    });
-    if !repeatable {
+        .collect::<Vec<_>>();
+    if repeatable_indices.len() < 2 {
         return None;
     }
+    let conservative_achieved_kbps = repeatable_indices
+        .iter()
+        .map(|index| input.observations[*index].achieved_kbps)
+        .min()?;
     // Prefer the worst clean latency sample, then the lowest achieved rate.
     // This keeps the manually reviewable fallback conservative while the
     // runtime minimum remains the exact tested CAKE candidate.
-    indices.into_iter().max_by(|left, right| {
+    let selected_index = repeatable_indices.into_iter().max_by(|left, right| {
         metrics[*left]
             .effective_delta_ms
             .total_cmp(&metrics[*right].effective_delta_ms)
@@ -2966,7 +3363,422 @@ fn variable_low_realization_review_index(
                     .achieved_kbps
                     .cmp(&input.observations[*left].achieved_kbps)
             })
+    })?;
+    Some(LowRealizationReviewCandidate {
+        selected_index,
+        candidate_kbps,
+        conservative_achieved_kbps,
+        target_met: metrics[selected_index].target_met,
+        worst_delta_ms: metrics[selected_index].effective_delta_ms,
     })
+}
+
+/// Retain the best bounded manual-review point across the entire descent.
+/// Variable Link deliberately explores below an already useful operating
+/// point in order to look for CAKE control or a latency knee. A later noisy or
+/// sub-trust-floor point must not erase an earlier repeatable exact candidate.
+fn best_low_realization_review_index(
+    input: &ProfileSearchInput,
+    metrics: &[SearchObservationMetrics],
+) -> Option<usize> {
+    let mut candidates = input
+        .observations
+        .iter()
+        .map(|observation| observation.candidate_kbps)
+        .collect::<Vec<_>>();
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
+        .into_iter()
+        .filter_map(|candidate_kbps| {
+            low_realization_review_candidate(input, metrics, candidate_kbps)
+        })
+        .max_by(|left, right| {
+            left.target_met
+                .cmp(&right.target_met)
+                .then_with(|| {
+                    left.conservative_achieved_kbps
+                        .cmp(&right.conservative_achieved_kbps)
+                })
+                .then_with(|| left.candidate_kbps.cmp(&right.candidate_kbps))
+                // `max_by` is used, so reverse the latency comparison: lower
+                // worst-case latency wins an otherwise equal choice.
+                .then_with(|| right.worst_delta_ms.total_cmp(&left.worst_delta_ms))
+        })
+        .map(|candidate| candidate.selected_index)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReviewCandidate {
+    selected_index: usize,
+    candidate_kbps: u64,
+    conservative_achieved_kbps: u64,
+    worst_delta_ms: f64,
+    transport_censored: bool,
+    controlled: bool,
+    target_met: bool,
+    capacity_objective_met: bool,
+}
+
+impl ReviewCandidate {
+    fn as_option(self, role: ProfileSearchOptionRole) -> ProfileSearchOption {
+        let auto_apply_candidate = self.controlled
+            && !self.transport_censored
+            && self.target_met
+            && self.capacity_objective_met;
+        ProfileSearchOption {
+            role,
+            selected_index: self.selected_index,
+            candidate_kbps: self.candidate_kbps,
+            conservative_achieved_kbps: self.conservative_achieved_kbps,
+            worst_delta_ms: self.worst_delta_ms,
+            grade: classify_quality(Some(self.worst_delta_ms)).as_str(),
+            transport_censored: self.transport_censored,
+            controlled: self.controlled,
+            manual_reviewable: !auto_apply_candidate,
+            target_met: self.target_met,
+            capacity_objective_met: self.capacity_objective_met,
+            auto_apply_candidate,
+        }
+    }
+}
+
+fn review_candidate_for_rate(
+    result: &ProfileSearchResult,
+    candidate_kbps: u64,
+) -> Option<ReviewCandidate> {
+    let exact_indices = result
+        .observations
+        .iter()
+        .enumerate()
+        .filter(|(_, observation)| observation.candidate_kbps == candidate_kbps)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    // A repeated loss/resource failure at the same exact rate invalidates
+    // that direction-level option.  CPU is advisory and is intentionally not
+    // part of resource_safe.
+    if exact_indices.is_empty()
+        || exact_indices
+            .iter()
+            .any(|index| !result.metrics[*index].resource_safe)
+    {
+        return None;
+    }
+    let controlled_indices = exact_indices
+        .iter()
+        .copied()
+        .filter(|index| result.metrics[*index].safety_pass)
+        .collect::<Vec<_>>();
+    let (indices, controlled) = if controlled_indices.is_empty() {
+        let censored_indices = exact_indices
+            .iter()
+            .copied()
+            .filter(|index| {
+                result.observations[*index].transport_censored
+                    && result.metrics[*index].manual_reviewable
+            })
+            .collect::<Vec<_>>();
+        if !censored_indices.is_empty() {
+            (censored_indices, false)
+        } else {
+            let input = ProfileSearchInput {
+                profile: result.profile,
+                direction: result.direction,
+                observed_low_kbps: result.observed_low_kbps,
+                minimum_kbps: result.exploration_minimum_kbps,
+                upper_kbps: result
+                    .observations
+                    .iter()
+                    .map(|observation| observation.candidate_kbps)
+                    .max()?,
+                thresholds: result.profile.validation_thresholds(),
+                uncertainty_percent: 0.0,
+                max_attempts: result.max_attempts,
+                observations: result.observations.clone(),
+            };
+            let candidate =
+                low_realization_review_candidate(&input, &result.metrics, candidate_kbps)?;
+            let corroborated = exact_indices
+                .iter()
+                .copied()
+                .filter(|left| {
+                    result.metrics[*left].manual_reviewable
+                        && result.metrics[*left].effective_delta_ms <= 200.0
+                        && exact_indices.iter().copied().any(|right| {
+                            left != &right
+                                && result.metrics[right].manual_reviewable
+                                && achieved_rates_repeatable(
+                                    result.observations[*left].achieved_kbps,
+                                    result.observations[right].achieved_kbps,
+                                )
+                        })
+                })
+                .collect::<Vec<_>>();
+            debug_assert_eq!(
+                candidate.conservative_achieved_kbps,
+                corroborated
+                    .iter()
+                    .map(|index| result.observations[*index].achieved_kbps)
+                    .min()
+                    .unwrap_or(candidate.conservative_achieved_kbps)
+            );
+            (corroborated, false)
+        }
+    } else {
+        (controlled_indices, true)
+    };
+    if indices.is_empty() {
+        return None;
+    }
+    let conservative_achieved_kbps = indices
+        .iter()
+        .map(|index| result.observations[*index].achieved_kbps)
+        .min()?;
+    let selected_index = indices.into_iter().max_by(|left, right| {
+        result.metrics[*left]
+            .effective_delta_ms
+            .total_cmp(&result.metrics[*right].effective_delta_ms)
+            .then_with(|| {
+                result.observations[*right]
+                    .achieved_kbps
+                    .cmp(&result.observations[*left].achieved_kbps)
+            })
+    })?;
+    let worst_delta_ms = result.metrics[selected_index].effective_delta_ms;
+    let retention_percent =
+        conservative_achieved_kbps as f64 * 100.0 / result.observed_low_kbps as f64;
+    Some(ReviewCandidate {
+        selected_index,
+        candidate_kbps,
+        conservative_achieved_kbps,
+        worst_delta_ms,
+        transport_censored: result.observations[selected_index].transport_censored,
+        controlled,
+        target_met: result.metrics[selected_index].target_met,
+        capacity_objective_met: retention_percent >= result.profile.capacity_floor_percent(),
+    })
+}
+
+fn profile_search_review_options(result: &ProfileSearchResult) -> Vec<ProfileSearchOption> {
+    if !matches!(
+        result.action,
+        ProfileSearchAction::Complete | ProfileSearchAction::Fallback
+    ) {
+        return Vec::new();
+    }
+    let mut rates = result
+        .observations
+        .iter()
+        .map(|observation| observation.candidate_kbps)
+        .collect::<Vec<_>>();
+    rates.sort_unstable();
+    rates.dedup();
+    let candidates = rates
+        .into_iter()
+        .filter_map(|rate| review_candidate_for_rate(result, rate))
+        .collect::<Vec<_>>();
+    let frontier = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            !candidates.iter().any(|other| {
+                other.candidate_kbps != candidate.candidate_kbps
+                    && other.controlled >= candidate.controlled
+                    && other.conservative_achieved_kbps >= candidate.conservative_achieved_kbps
+                    && other.worst_delta_ms <= candidate.worst_delta_ms
+                    && (other.controlled != candidate.controlled
+                        || other.conservative_achieved_kbps > candidate.conservative_achieved_kbps
+                        || other.worst_delta_ms < candidate.worst_delta_ms)
+            })
+        })
+        .collect::<Vec<_>>();
+    if frontier.is_empty() {
+        return Vec::new();
+    }
+    let throughput = frontier.iter().copied().max_by(|left, right| {
+        left.conservative_achieved_kbps
+            .cmp(&right.conservative_achieved_kbps)
+            .then_with(|| right.worst_delta_ms.total_cmp(&left.worst_delta_ms))
+            .then_with(|| left.candidate_kbps.cmp(&right.candidate_kbps))
+    });
+    let quality = frontier.iter().copied().min_by(|left, right| {
+        left.worst_delta_ms
+            .total_cmp(&right.worst_delta_ms)
+            .then_with(|| {
+                right
+                    .conservative_achieved_kbps
+                    .cmp(&left.conservative_achieved_kbps)
+            })
+            .then_with(|| right.candidate_kbps.cmp(&left.candidate_kbps))
+    });
+    let selected_rate = result
+        .selected_index
+        .and_then(|index| result.observations.get(index))
+        .map(|observation| observation.candidate_kbps);
+    let recommended = selected_rate
+        .and_then(|rate| {
+            frontier
+                .iter()
+                .copied()
+                .find(|candidate| candidate.candidate_kbps == rate)
+        })
+        .or_else(|| match result.profile {
+            AutotuneProfile::Fair => throughput,
+            AutotuneProfile::Gaming
+            | AutotuneProfile::GamingExtreme
+            | AutotuneProfile::VariableLink => frontier.iter().copied().max_by(|left, right| {
+                left.target_met
+                    .cmp(&right.target_met)
+                    .then_with(|| {
+                        left.conservative_achieved_kbps
+                            .cmp(&right.conservative_achieved_kbps)
+                    })
+                    .then_with(|| right.worst_delta_ms.total_cmp(&left.worst_delta_ms))
+            }),
+            AutotuneProfile::BestOverall => frontier.iter().copied().max_by(|left, right| {
+                review_candidate_balanced_score(result, *left)
+                    .total_cmp(&review_candidate_balanced_score(result, *right))
+                    .then_with(|| {
+                        left.conservative_achieved_kbps
+                            .cmp(&right.conservative_achieved_kbps)
+                    })
+            }),
+        });
+    let mut options = Vec::with_capacity(MAX_PROFILE_REVIEW_OPTIONS);
+    for (role, candidate) in [
+        (ProfileSearchOptionRole::Recommended, recommended),
+        (ProfileSearchOptionRole::QualityFirst, quality),
+        (ProfileSearchOptionRole::ThroughputFirst, throughput),
+    ] {
+        if let Some(candidate) = candidate {
+            if !options.iter().any(|option: &ProfileSearchOption| {
+                option.candidate_kbps == candidate.candidate_kbps
+            }) {
+                options.push(candidate.as_option(role));
+            }
+        }
+    }
+    if options.len() < MAX_PROFILE_REVIEW_OPTIONS {
+        let mut remaining = frontier
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                !options
+                    .iter()
+                    .any(|option| option.candidate_kbps == candidate.candidate_kbps)
+            })
+            .collect::<Vec<_>>();
+        remaining.sort_by(|left, right| {
+            review_candidate_balanced_score(result, *right)
+                .total_cmp(&review_candidate_balanced_score(result, *left))
+                .then_with(|| {
+                    right
+                        .conservative_achieved_kbps
+                        .cmp(&left.conservative_achieved_kbps)
+                })
+        });
+        for candidate in remaining {
+            options.push(candidate.as_option(ProfileSearchOptionRole::BalancedAlternative));
+            if options.len() == MAX_PROFILE_REVIEW_OPTIONS {
+                break;
+            }
+        }
+    }
+    options.truncate(MAX_PROFILE_REVIEW_OPTIONS);
+    options
+}
+
+fn review_candidate_balanced_score(
+    result: &ProfileSearchResult,
+    candidate: ReviewCandidate,
+) -> f64 {
+    let throughput = (candidate.conservative_achieved_kbps as f64
+        / result.observed_low_kbps as f64)
+        .clamp(0.0, 1.0);
+    let quality =
+        (result.profile.target_delta_ms() / candidate.worst_delta_ms.max(0.001)).clamp(0.0, 1.0);
+    throughput + quality
+}
+
+pub fn profile_pair_candidates(
+    download: &ProfileSearchResult,
+    upload: &ProfileSearchResult,
+) -> Result<Vec<ProfilePairCandidate>, String> {
+    if download.profile != upload.profile
+        || download.direction != SearchDirection::Download
+        || upload.direction != SearchDirection::Upload
+    {
+        return Err(
+            "profile pair candidates require matching download and upload searches".to_string(),
+        );
+    }
+    let download_options = download.review_options();
+    let upload_options = upload.review_options();
+    if download_options.is_empty() || upload_options.is_empty() {
+        return Err(
+            "profile pair candidates require reviewable evidence in both directions".to_string(),
+        );
+    }
+    let pick = |options: &[ProfileSearchOption], role: ProfileSearchOptionRole| match role {
+        ProfileSearchOptionRole::Recommended => options
+            .iter()
+            .copied()
+            .find(|option| option.role == ProfileSearchOptionRole::Recommended)
+            .or_else(|| options.first().copied()),
+        ProfileSearchOptionRole::QualityFirst => options.iter().copied().min_by(|left, right| {
+            left.worst_delta_ms
+                .total_cmp(&right.worst_delta_ms)
+                .then_with(|| {
+                    right
+                        .conservative_achieved_kbps
+                        .cmp(&left.conservative_achieved_kbps)
+                })
+        }),
+        ProfileSearchOptionRole::ThroughputFirst => {
+            options.iter().copied().max_by(|left, right| {
+                left.conservative_achieved_kbps
+                    .cmp(&right.conservative_achieved_kbps)
+                    .then_with(|| right.worst_delta_ms.total_cmp(&left.worst_delta_ms))
+            })
+        }
+        ProfileSearchOptionRole::BalancedAlternative => options
+            .iter()
+            .copied()
+            .find(|option| option.role == ProfileSearchOptionRole::BalancedAlternative)
+            .or_else(|| options.get(1).copied())
+            .or_else(|| options.first().copied()),
+    };
+    let mut pairs = Vec::with_capacity(MAX_PROFILE_REVIEW_OPTIONS);
+    for role in [
+        ProfileSearchOptionRole::Recommended,
+        ProfileSearchOptionRole::QualityFirst,
+        ProfileSearchOptionRole::ThroughputFirst,
+        ProfileSearchOptionRole::BalancedAlternative,
+    ] {
+        let dl = pick(&download_options, role)
+            .ok_or_else(|| "download profile option selection failed".to_string())?;
+        let ul = pick(&upload_options, role)
+            .ok_or_else(|| "upload profile option selection failed".to_string())?;
+        if pairs.iter().any(|pair: &ProfilePairCandidate| {
+            pair.download_kbps == dl.candidate_kbps && pair.upload_kbps == ul.candidate_kbps
+        }) {
+            continue;
+        }
+        pairs.push(ProfilePairCandidate {
+            role,
+            download_index: dl.selected_index,
+            upload_index: ul.selected_index,
+            download_kbps: dl.candidate_kbps,
+            upload_kbps: ul.candidate_kbps,
+        });
+        if pairs.len() == MAX_PROFILE_REVIEW_OPTIONS {
+            break;
+        }
+    }
+    if pairs.is_empty() {
+        return Err("profile pair candidate set is empty".to_string());
+    }
+    Ok(pairs)
 }
 
 fn repeatable_low_realization_peer(
@@ -3013,7 +3825,7 @@ fn controlled_candidate_from_low_realization(
         || candidate_indices.iter().any(|index| {
             metrics[*index].realization_percent
                 >= input.thresholds.candidate_realization_min_percent
-                || !low_realization_evidence_eligible(input.profile, metrics[*index])
+                || !low_realization_descent_evidence_eligible(input, metrics, *index)
         })
     {
         return None;
@@ -3151,24 +3963,37 @@ fn optimize_variable_link_direction(
                   plateau_threshold_ms: f64,
                   no_cake_effect: bool,
                   noisy: bool| {
-        let requested_action = action;
-        let (action, selected_index) =
+        let (mut action, mut selected_index) =
             resolve_terminal_safe_fallback(input, metrics, action, selected_index);
-        let safe_fallback_index = (requested_action == ProfileSearchAction::Inconclusive
-            && action == ProfileSearchAction::Fallback)
-            .then_some(selected_index)
-            .flatten();
-        // Variable Link cannot invent a runtime floor.  When a terminal
-        // condition falls back to an earlier safe observation, bind the
-        // runtime minimum to that same exact tested point.
-        let runtime_minimum_index = if safe_fallback_index.is_some() {
-            safe_fallback_index
-        } else {
-            runtime_minimum_index
-        };
+        let mut reason = reason;
+        // A controlled safety-pass remains stronger than manual evidence and
+        // is selected first by `resolve_terminal_safe_fallback`. If no such
+        // point exists, preserve the best repeatable 50-80% realization point
+        // from any earlier candidate as an explicit Review-only fallback.
+        if action == ProfileSearchAction::Inconclusive {
+            if let Some(index) = best_low_realization_review_index(input, metrics) {
+                action = ProfileSearchAction::Fallback;
+                selected_index = Some(index);
+                reason = "bounded-low-realization-review";
+            }
+        }
+        if action == ProfileSearchAction::Inconclusive {
+            if let Some(index) = best_censored_review_index(input, metrics) {
+                action = ProfileSearchAction::Fallback;
+                selected_index = Some(index);
+                reason = "transport-deadline-censored-review";
+            }
+        }
+        // A selected operating ceiling and an autorate runtime minimum are
+        // independent quantities.  Only a measured latency knee proves the
+        // latter.  A safe/noisy/no-effect fallback may still select a ceiling,
+        // but must leave the runtime minimum unresolved instead of silently
+        // turning that ceiling into a floor.
+        let runtime_minimum_index = knee_detected.then_some(runtime_minimum_index).flatten();
         ProfileSearchResult {
             profile: input.profile,
             direction: input.direction,
+            observed_low_kbps: input.observed_low_kbps,
             action,
             reason,
             next_candidate_kbps,
@@ -3229,33 +4054,31 @@ fn optimize_variable_link_direction(
     }
 
     if !last_metrics.measurement_reliable {
-        if low_realization_evidence_eligible(input.profile, last_metrics) {
-            if let Some(next) =
-                controlled_candidate_from_low_realization(input, metrics, last.candidate_kbps)
+        if let Some(next) =
+            controlled_candidate_from_low_realization(input, metrics, last.candidate_kbps)
+        {
+            if next < last.candidate_kbps
+                && !candidate_was_tested(&input.observations, next)
+                && input.observations.len() < input.max_attempts
             {
-                if next < last.candidate_kbps
-                    && !candidate_was_tested(&input.observations, next)
-                    && input.observations.len() < input.max_attempts
-                {
-                    return finish(
-                        ProfileSearchAction::Test,
-                        "lower-variable-candidate-to-establish-shaper-control",
-                        Some(next),
-                        None,
-                        None,
-                        false,
-                        0,
-                        None,
-                        default_threshold,
-                        false,
-                        false,
-                    );
-                }
+                return finish(
+                    ProfileSearchAction::Test,
+                    "lower-variable-candidate-to-establish-shaper-control",
+                    Some(next),
+                    None,
+                    None,
+                    false,
+                    0,
+                    None,
+                    default_threshold,
+                    false,
+                    false,
+                );
             }
+        }
 
-            if let Some(selected_index) =
-                variable_low_realization_review_index(input, metrics, last.candidate_kbps)
-            {
+        if low_realization_evidence_eligible(input.profile, last_metrics) {
+            if let Some(selected_index) = best_low_realization_review_index(input, metrics) {
                 return finish(
                     ProfileSearchAction::Fallback,
                     "bounded-low-realization-review",
@@ -3328,7 +4151,9 @@ fn optimize_variable_link_direction(
                     true,
                 );
             }
-            if let Some(selected_index) = best_trusted_quality_index(&input.observations, metrics) {
+            if let Some(selected_index) =
+                best_variable_operating_ceiling_index(&input.observations, metrics)
+            {
                 return finish(
                     ProfileSearchAction::Fallback,
                     "noisy-link-safe-review",
@@ -3385,7 +4210,9 @@ fn optimize_variable_link_direction(
                     true,
                 );
             }
-            if let Some(selected_index) = best_trusted_quality_index(&input.observations, metrics) {
+            if let Some(selected_index) =
+                best_variable_operating_ceiling_index(&input.observations, metrics)
+            {
                 return finish(
                     ProfileSearchAction::Fallback,
                     "noisy-link-safe-review",
@@ -3452,9 +4279,8 @@ fn optimize_variable_link_direction(
                     // A flat latency curve is directional evidence, not a
                     // global calibration failure. Hold this direction at its
                     // highest safe, target-meeting tested point and let the
-                    // peer direction continue. Using the selected observation
-                    // as the runtime minimum prevents destructive descent and
-                    // never manufactures an untested rate.
+                    // peer direction continue. No latency knee was proven, so
+                    // the runtime minimum remains explicitly unresolved.
                     return finish(
                         ProfileSearchAction::Fallback,
                         "queue-outside-cake-control",
@@ -3571,11 +4397,27 @@ fn optimize_variable_link_direction(
         );
     }
 
-    let step = rounded_search_rate(
-        input.observed_low_kbps as f64 * VARIABLE_LINK_EXPLORATION_STEP_PERCENT / 100.0,
-    );
-    let next = lowest_tested.saturating_sub(step).max(input.minimum_kbps);
-    if next >= lowest_tested || candidate_was_tested(&input.observations, next) {
+    let Some(next) = next_variable_link_unobserved_candidate(
+        input.observed_low_kbps,
+        input.minimum_kbps,
+        lowest_tested,
+    )
+    .expect("validated Variable Link search bounds") else {
+        return finish(
+            ProfileSearchAction::Inconclusive,
+            "variable-link-search-cannot-make-progress",
+            None,
+            None,
+            None,
+            false,
+            0,
+            None,
+            default_threshold,
+            false,
+            false,
+        );
+    };
+    if candidate_was_tested(&input.observations, next) {
         return finish(
             ProfileSearchAction::Inconclusive,
             "variable-link-search-cannot-make-progress",
@@ -3674,8 +4516,28 @@ pub fn optimize_profile_direction(
                   reason: &'static str,
                   next_candidate_kbps: Option<u64>|
      -> ProfileSearchResult {
-        let (action, selected_index) =
+        let (mut action, mut selected_index) =
             resolve_terminal_safe_fallback(&input, &metrics, action, selected_index);
+        let mut reason = reason;
+        // Every profile may preserve a repeatable, bounded 50-80% realization
+        // point for explicit Review when no controlled candidate survived.
+        // This does not make the point an Auto-Apply success: pair
+        // confirmation and explicit acceptance of every missed objective are
+        // still required, and the sub-50% trust floor remains fail-closed.
+        if action == ProfileSearchAction::Inconclusive {
+            if let Some(index) = best_low_realization_review_index(&input, &metrics) {
+                action = ProfileSearchAction::Fallback;
+                selected_index = Some(index);
+                reason = "bounded-low-realization-review";
+            }
+        }
+        if action == ProfileSearchAction::Inconclusive {
+            if let Some(index) = best_censored_review_index(&input, &metrics) {
+                action = ProfileSearchAction::Fallback;
+                selected_index = Some(index);
+                reason = "transport-deadline-censored-review";
+            }
+        }
         let runtime_minimum_index = if input.profile == AutotuneProfile::GamingExtreme
             && matches!(
                 action,
@@ -3688,13 +4550,13 @@ pub fn optimize_profile_direction(
                 .filter(|(index, _)| metrics[*index].safety_pass && metrics[*index].target_met)
                 .min_by_key(|(_, observation)| observation.candidate_kbps)
                 .map(|(index, _)| index)
-                .or(selected_index)
         } else {
             None
         };
         ProfileSearchResult {
             profile: input.profile,
             direction: input.direction,
+            observed_low_kbps: input.observed_low_kbps,
             action,
             reason,
             next_candidate_kbps,
@@ -4059,6 +4921,96 @@ pub fn optimize_profile_direction(
     ))
 }
 
+/// Stop a deterministic search at its last measured boundary without
+/// manufacturing an observation for the candidate which could not be
+/// measured.  This is deliberately narrower than `optimize_profile_direction`:
+/// callers may use it only after the measurement apparatus remained admitted
+/// but the loaded latency streams did not reach their bounded sample minimum.
+///
+/// The selected point is therefore drawn exclusively from prior exact
+/// observations.  Controlled safe points win; when none exists, the existing
+/// corroborated 50-80% realization contract, or one capture-corroborated
+/// censored transport point, may retain a manual-review-only point.  Variable
+/// Link has one narrower terminal-only exception: repeatable CAKE wire/goodput
+/// evidence above the authorized exploration floor may identify a physical
+/// bottleneck below the configured CAKE ceiling.  That exact tested ceiling is
+/// Review-only, never a controlled point or an inferred runtime minimum.
+pub fn terminate_profile_direction_at_measured_boundary(
+    input: ProfileSearchInput,
+    reason: &'static str,
+) -> Result<ProfileSearchResult, String> {
+    validate_profile_search_input(&input)?;
+    let mut result = optimize_profile_direction(input.clone())?;
+    if matches!(
+        result.action,
+        ProfileSearchAction::Complete | ProfileSearchAction::Fallback
+    ) {
+        return Ok(result);
+    }
+
+    let mut metrics = result.metrics.clone();
+    let (mut action, mut selected_index) =
+        resolve_terminal_safe_fallback(&input, &metrics, ProfileSearchAction::Inconclusive, None);
+    if action == ProfileSearchAction::Inconclusive {
+        if let Some(index) = best_low_realization_review_index(&input, &metrics) {
+            action = ProfileSearchAction::Fallback;
+            selected_index = Some(index);
+        }
+    }
+    if action == ProfileSearchAction::Inconclusive {
+        if let Some(index) = best_censored_review_index(&input, &metrics) {
+            action = ProfileSearchAction::Fallback;
+            selected_index = Some(index);
+        }
+    }
+    if action == ProfileSearchAction::Inconclusive {
+        if let Some(indices) = physical_capacity_limited_review_indices(&input, &metrics) {
+            let selected = indices
+                .iter()
+                .copied()
+                .max_by(|left, right| {
+                    metrics[*left]
+                        .effective_delta_ms
+                        .total_cmp(&metrics[*right].effective_delta_ms)
+                        .then_with(|| {
+                            input.observations[*right]
+                                .achieved_kbps
+                                .cmp(&input.observations[*left].achieved_kbps)
+                        })
+                })
+                .expect("capacity-limited review indices are non-empty");
+            for index in indices {
+                metrics[index].manual_reviewable = true;
+            }
+            action = ProfileSearchAction::Fallback;
+            selected_index = Some(selected);
+            result.reason = PHYSICAL_CAPACITY_BELOW_CAKE_CANDIDATE_REVIEW_REASON;
+        }
+    }
+
+    result.action = action;
+    if result.reason != PHYSICAL_CAPACITY_BELOW_CAKE_CANDIDATE_REVIEW_REASON {
+        result.reason = reason;
+    }
+    result.next_candidate_kbps = None;
+    result.selected_index = selected_index;
+    result.metrics = metrics.clone();
+    result.runtime_minimum_index = if input.profile == AutotuneProfile::GamingExtreme
+        && action == ProfileSearchAction::Fallback
+    {
+        input
+            .observations
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| metrics[*index].safety_pass && metrics[*index].target_met)
+            .min_by_key(|(_, observation)| observation.candidate_kbps)
+            .map(|(index, _)| index)
+    } else {
+        None
+    };
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4228,7 +5180,7 @@ mod tests {
     }
 
     #[test]
-    fn profiles_trade_latency_headroom_for_bounded_capacity() {
+    fn profiles_share_the_raw_start_and_trade_only_policy_objectives() {
         let build = |profile| {
             build_proposal_for_profile(
                 &[100_000.0, 101_000.0, 99_000.0],
@@ -4247,8 +5199,19 @@ mod tests {
         let best = build(AutotuneProfile::BestOverall);
         let fair = build(AutotuneProfile::Fair);
 
-        assert!(gaming.download.base_kbps < best.download.base_kbps);
-        assert!(best.download.base_kbps < fair.download.base_kbps);
+        assert_eq!(gaming.download.base_kbps, gaming.download.observed_low_kbps);
+        assert_eq!(best.download.base_kbps, best.download.observed_low_kbps);
+        assert_eq!(fair.download.base_kbps, fair.download.observed_low_kbps);
+        assert_eq!(gaming.download.base_kbps, best.download.base_kbps);
+        assert_eq!(best.download.base_kbps, fair.download.base_kbps);
+        assert_eq!(gaming.download.maximum_kbps, best.download.maximum_kbps);
+        assert_eq!(best.download.maximum_kbps, fair.download.maximum_kbps);
+        assert_eq!(
+            gaming.download.maximum_kbps,
+            gaming.download.absolute_cap_kbps
+        );
+        assert_eq!(best.download.maximum_kbps, best.download.absolute_cap_kbps);
+        assert_eq!(fair.download.maximum_kbps, fair.download.absolute_cap_kbps);
         assert_eq!(
             gaming.validation_thresholds.capacity_retention_min_percent,
             70.0
@@ -4271,6 +5234,88 @@ mod tests {
         assert!(best.adjust_up_threshold_ms <= fair.adjust_up_threshold_ms);
         assert_eq!(gaming.delay_threshold_ms, 5);
         assert!(gaming.adjust_up_threshold_ms <= gaming.delay_threshold_ms);
+    }
+
+    #[test]
+    fn activity_threshold_stays_inside_low_rate_directional_minimums() {
+        for profile in [
+            AutotuneProfile::Gaming,
+            AutotuneProfile::GamingExtreme,
+            AutotuneProfile::BestOverall,
+            AutotuneProfile::VariableLink,
+            AutotuneProfile::Fair,
+        ] {
+            let proposal = build_proposal_for_profile(
+                &[391.0, 302.0],
+                &[885.0, 1_018.0],
+                LatencyBaseline {
+                    median_ms: 12.065,
+                    p95_ms: 30.100,
+                    samples: 14,
+                },
+                LinkKind::Ethernet,
+                profile,
+            )
+            .unwrap();
+
+            assert_eq!(proposal.active_threshold_kbps, 100);
+            assert!(proposal.active_threshold_kbps <= proposal.download.minimum_kbps);
+            assert!(proposal.active_threshold_kbps <= proposal.upload.minimum_kbps);
+        }
+    }
+
+    #[test]
+    fn activity_threshold_retains_the_high_rate_safety_cap() {
+        let proposal = build_proposal_for_profile(
+            &[500_000.0, 510_000.0],
+            &[300_000.0, 310_000.0],
+            LatencyBaseline {
+                median_ms: 2.0,
+                p95_ms: 3.0,
+                samples: 20,
+            },
+            LinkKind::Ethernet,
+            AutotuneProfile::Fair,
+        )
+        .unwrap();
+
+        assert_eq!(proposal.active_threshold_kbps, 20_000);
+        assert!(proposal.active_threshold_kbps <= proposal.download.minimum_kbps);
+        assert!(proposal.active_threshold_kbps <= proposal.upload.minimum_kbps);
+    }
+
+    #[test]
+    fn no_profile_applies_an_unmeasured_initial_rate_haircut_or_growth() {
+        for samples in [
+            vec![99_000.0, 100_000.0, 101_000.0],
+            vec![40_000.0, 80_000.0, 120_000.0],
+        ] {
+            for profile in [
+                AutotuneProfile::Gaming,
+                AutotuneProfile::GamingExtreme,
+                AutotuneProfile::BestOverall,
+                AutotuneProfile::VariableLink,
+                AutotuneProfile::Fair,
+            ] {
+                let proposal = build_proposal_for_profile(
+                    &samples,
+                    &samples,
+                    LatencyBaseline {
+                        median_ms: 5.0,
+                        p95_ms: 7.0,
+                        samples: 20,
+                    },
+                    LinkKind::Cellular,
+                    profile,
+                )
+                .unwrap();
+                for direction in [proposal.download, proposal.upload] {
+                    assert_eq!(direction.base_kbps, direction.observed_low_kbps);
+                    assert_eq!(direction.maximum_kbps, direction.observed_high_kbps);
+                    assert_eq!(direction.absolute_cap_kbps, direction.observed_high_kbps);
+                }
+            }
+        }
     }
 
     #[test]
@@ -4320,8 +5365,12 @@ mod tests {
         .unwrap();
 
         assert!(!proposal.adaptive_ceiling_enabled);
-        assert_eq!(proposal.download.base_kbps, 788_500);
-        assert_eq!(proposal.download.maximum_kbps, 896_000);
+        assert_eq!(proposal.download.base_kbps, 896_000);
+        assert_eq!(proposal.download.maximum_kbps, 903_200);
+        assert_eq!(
+            proposal.download.maximum_kbps,
+            proposal.download.absolute_cap_kbps
+        );
         assert_eq!(proposal.overhead, 44);
         assert_eq!(proposal.mpu, 84);
         assert!(proposal.download.minimum_kbps <= proposal.download.base_kbps);
@@ -4330,7 +5379,7 @@ mod tests {
     }
 
     #[test]
-    fn variable_cellular_proposal_uses_low_sample_for_base_and_bounded_growth() {
+    fn variable_cellular_proposal_uses_measured_raw_bounds_without_growth() {
         let proposal = build_proposal(
             &[41_800.0, 108_260.0, 114_770.0],
             &[16_200.0, 17_430.0, 18_250.0],
@@ -4345,9 +5394,9 @@ mod tests {
 
         assert!(proposal.adaptive_ceiling_enabled);
         assert_eq!(proposal.download.minimum_kbps, 16_700);
-        assert_eq!(proposal.download.base_kbps, 35_500);
-        assert_eq!(proposal.download.maximum_kbps, 141_800);
-        assert_eq!(proposal.download.absolute_cap_kbps, 204_200);
+        assert_eq!(proposal.download.base_kbps, 41_800);
+        assert_eq!(proposal.download.maximum_kbps, 113_500);
+        assert_eq!(proposal.download.absolute_cap_kbps, 113_500);
         assert_eq!(proposal.active_threshold_kbps, 1_600);
         assert_eq!(proposal.adjust_up_threshold_ms, 6);
         assert_eq!(proposal.delay_threshold_ms, 15);
@@ -4602,8 +5651,55 @@ mod tests {
         assert!(proposal.download.minimum_kbps <= proposal.download.base_kbps);
 
         proposal.revise_base_rates(1.2).unwrap();
-        assert!(proposal.download.base_kbps <= proposal.download.observed_low_kbps * 95 / 100);
+        assert_eq!(
+            proposal.download.base_kbps,
+            proposal.download.observed_low_kbps
+        );
         assert!(proposal.revise_base_rates(0.1).is_err());
+    }
+
+    #[test]
+    fn exact_measurement_base_can_test_the_measured_maximum_atomically() {
+        let mut proposal = build_proposal(
+            &[40_000.0, 100_000.0],
+            &[10_000.0, 20_000.0],
+            LatencyBaseline {
+                median_ms: 10.0,
+                p95_ms: 15.0,
+                samples: 10,
+            },
+            LinkKind::Cellular,
+        )
+        .unwrap();
+        let original = proposal.clone();
+        assert!(proposal.download.maximum_kbps > proposal.download.observed_low_kbps);
+        assert!(proposal.upload.maximum_kbps > proposal.upload.observed_low_kbps);
+
+        proposal
+            .set_measurement_base_rates(
+                proposal.download.maximum_kbps,
+                proposal.upload.maximum_kbps,
+            )
+            .unwrap();
+        assert_eq!(proposal.download.base_kbps, proposal.download.maximum_kbps);
+        assert_eq!(proposal.upload.base_kbps, proposal.upload.maximum_kbps);
+        assert_eq!(
+            proposal.download.observed_low_kbps,
+            original.download.observed_low_kbps
+        );
+        assert_eq!(
+            proposal.download.maximum_kbps,
+            original.download.maximum_kbps
+        );
+
+        let before_rejection = proposal.clone();
+        assert!(proposal
+            .set_measurement_base_rates(
+                proposal.download.maximum_kbps + 100,
+                proposal.upload.exploration_minimum_kbps,
+            )
+            .is_err());
+        assert_eq!(proposal, before_rejection);
     }
 
     fn validation_input(
@@ -4632,6 +5728,7 @@ mod tests {
             DirectionValidationInput {
                 observed_low_kbps: 883_500,
                 candidate_kbps: 738_500,
+                realized_kbps: 683_153,
                 achieved_kbps: 683_153,
                 minimum_kbps: 618_400,
                 maximum_kbps: 840_100,
@@ -4639,6 +5736,7 @@ mod tests {
             DirectionValidationInput {
                 observed_low_kbps: 903_800,
                 candidate_kbps: 755_500,
+                realized_kbps: 698_955,
                 achieved_kbps: 698_955,
                 minimum_kbps: 632_600,
                 maximum_kbps: 859_700,
@@ -4657,6 +5755,29 @@ mod tests {
         assert!(result
             .warnings()
             .any(|gate| gate.code == "download-capacity-retention"));
+
+        let mut lower_goodput = validation_input(
+            DirectionValidationInput {
+                observed_low_kbps: 883_500,
+                candidate_kbps: 738_500,
+                realized_kbps: 683_153,
+                achieved_kbps: 500_000,
+                minimum_kbps: 618_400,
+                maximum_kbps: 840_100,
+            },
+            DirectionValidationInput {
+                observed_low_kbps: 903_800,
+                candidate_kbps: 755_500,
+                realized_kbps: 698_955,
+                achieved_kbps: 500_000,
+                minimum_kbps: 632_600,
+                maximum_kbps: 859_700,
+            },
+        );
+        lower_goodput.profile = AutotuneProfile::Fair;
+        let lower_goodput = validate_shaped_candidate(lower_goodput).unwrap();
+        assert!((lower_goodput.download.candidate_realization_percent - 92.505).abs() < 0.01);
+        assert!(lower_goodput.download.capacity_retention_percent < 57.0);
     }
 
     #[test]
@@ -4665,6 +5786,7 @@ mod tests {
             DirectionValidationInput {
                 observed_low_kbps: 883_500,
                 candidate_kbps: 777_400,
+                realized_kbps: 673_424,
                 achieved_kbps: 673_424,
                 minimum_kbps: 618_400,
                 maximum_kbps: 840_100,
@@ -4672,6 +5794,7 @@ mod tests {
             DirectionValidationInput {
                 observed_low_kbps: 903_800,
                 candidate_kbps: 795_300,
+                realized_kbps: 738_447,
                 achieved_kbps: 738_447,
                 minimum_kbps: 632_600,
                 maximum_kbps: 859_700,
@@ -4695,6 +5818,7 @@ mod tests {
             DirectionValidationInput {
                 observed_low_kbps: 883_500,
                 candidate_kbps: 738_500,
+                realized_kbps: 683_153,
                 achieved_kbps: 683_153,
                 minimum_kbps: 618_400,
                 maximum_kbps: 840_100,
@@ -4702,6 +5826,7 @@ mod tests {
             DirectionValidationInput {
                 observed_low_kbps: 903_800,
                 candidate_kbps: 755_500,
+                realized_kbps: 698_955,
                 achieved_kbps: 698_955,
                 minimum_kbps: 632_600,
                 maximum_kbps: 859_700,
@@ -4741,6 +5866,7 @@ mod tests {
             let direction = DirectionValidationInput {
                 observed_low_kbps: 100_000,
                 candidate_kbps: candidate,
+                realized_kbps: candidate,
                 achieved_kbps: candidate,
                 minimum_kbps: 10_000,
                 maximum_kbps: 110_000,
@@ -4788,6 +5914,7 @@ mod tests {
         let direction = DirectionValidationInput {
             observed_low_kbps: 100_000,
             candidate_kbps: 90_000,
+            realized_kbps: 90_000,
             achieved_kbps: 90_000,
             minimum_kbps: 60_000,
             maximum_kbps: 100_000,
@@ -4825,6 +5952,7 @@ mod tests {
         let direction = DirectionValidationInput {
             observed_low_kbps: 100_000,
             candidate_kbps: 94_000,
+            realized_kbps: 88_360,
             achieved_kbps: 88_360,
             minimum_kbps: 80_000,
             maximum_kbps: 98_000,
@@ -4859,6 +5987,7 @@ mod tests {
         let direction = DirectionValidationInput {
             observed_low_kbps: 100_000,
             candidate_kbps: 90_000,
+            realized_kbps: 85_500,
             achieved_kbps: 85_500,
             minimum_kbps: 40_000,
             maximum_kbps: 110_000,
@@ -4891,6 +6020,7 @@ mod tests {
                 let direction = DirectionValidationInput {
                     observed_low_kbps: observed,
                     candidate_kbps: candidate,
+                    realized_kbps: achieved,
                     achieved_kbps: achieved,
                     minimum_kbps: 400_000,
                     maximum_kbps: 1_100_000,
@@ -4926,6 +6056,7 @@ mod tests {
         let direction = DirectionValidationInput {
             observed_low_kbps: 100_000,
             candidate_kbps: 74_800,
+            realized_kbps: 74_800,
             achieved_kbps: 74_800,
             minimum_kbps: 40_000,
             maximum_kbps: 105_000,
@@ -4946,6 +6077,7 @@ mod tests {
         let direction = DirectionValidationInput {
             observed_low_kbps: 100_000,
             candidate_kbps: 90_000,
+            realized_kbps: 60_000,
             achieved_kbps: 60_000,
             minimum_kbps: 40_000,
             maximum_kbps: 105_000,
@@ -4968,6 +6100,7 @@ mod tests {
         let direction = DirectionValidationInput {
             observed_low_kbps: 1_000_000,
             candidate_kbps: 800_000,
+            realized_kbps: 1_000_000,
             achieved_kbps: 1_000_000,
             minimum_kbps: 20_000,
             maximum_kbps: 1_000_000,
@@ -5001,6 +6134,7 @@ mod tests {
         let maximum_limited = DirectionValidationInput {
             observed_low_kbps: 100_000,
             candidate_kbps: 49_000,
+            realized_kbps: 45_000,
             achieved_kbps: 45_000,
             minimum_kbps: 40_000,
             maximum_kbps: 85_000,
@@ -5025,6 +6159,7 @@ mod tests {
         let direction = DirectionValidationInput {
             observed_low_kbps: 100_000,
             candidate_kbps: 90_000,
+            realized_kbps: 85_000,
             achieved_kbps: 85_000,
             minimum_kbps: 40_000,
             maximum_kbps: 105_000,
@@ -5086,6 +6221,7 @@ mod tests {
         let direction = DirectionValidationInput {
             observed_low_kbps: 100_000,
             candidate_kbps: 90_000,
+            realized_kbps: 85_000,
             achieved_kbps: 85_000,
             minimum_kbps: 40_000,
             maximum_kbps: 105_000,
@@ -5113,6 +6249,7 @@ mod tests {
         let direction = DirectionValidationInput {
             observed_low_kbps: 917_600,
             candidate_kbps: 694_700,
+            realized_kbps: 642_360,
             achieved_kbps: 642_360,
             minimum_kbps: 100_000,
             maximum_kbps: 917_600,
@@ -5166,6 +6303,7 @@ mod tests {
         let direction = DirectionValidationInput {
             observed_low_kbps: 100_000,
             candidate_kbps: 90_000,
+            realized_kbps: 85_000,
             achieved_kbps: 85_000,
             minimum_kbps: 40_000,
             maximum_kbps: 105_000,
@@ -5295,6 +6433,7 @@ mod tests {
         let direction = DirectionValidationInput {
             observed_low_kbps: MAX_RATE_KBPS + 1,
             candidate_kbps: 90_000,
+            realized_kbps: 85_000,
             achieved_kbps: 85_000,
             minimum_kbps: 40_000,
             maximum_kbps: 105_000,
@@ -5307,6 +6446,7 @@ mod tests {
         let direction = DirectionValidationInput {
             observed_low_kbps: MAX_RATE_KBPS,
             candidate_kbps: MAX_RATE_KBPS,
+            realized_kbps: 1,
             achieved_kbps: 1,
             minimum_kbps: 1,
             maximum_kbps: MAX_RATE_KBPS,
@@ -5339,9 +6479,11 @@ mod tests {
     ) -> SearchObservation {
         SearchObservation {
             candidate_kbps,
+            realized_kbps: achieved_kbps,
             achieved_kbps,
             icmp_delta_ms: 0.0,
             transport_delta_ms: effective_delta_ms,
+            transport_censored: false,
             loss_percent: 0.0,
             cpu_percent,
         }
@@ -5365,6 +6507,253 @@ mod tests {
             observations,
         })
         .unwrap()
+    }
+
+    fn censored_search_observation(
+        candidate_kbps: u64,
+        achieved_kbps: u64,
+        lower_bound_ms: f64,
+    ) -> SearchObservation {
+        SearchObservation {
+            candidate_kbps,
+            realized_kbps: achieved_kbps,
+            achieved_kbps,
+            icmp_delta_ms: 8.0,
+            transport_delta_ms: lower_bound_ms,
+            transport_censored: true,
+            loss_percent: 0.0,
+            cpu_percent: 40.0,
+        }
+    }
+
+    #[test]
+    fn censored_transport_drives_descent_but_only_returns_manual_review() {
+        let profile = AutotuneProfile::BestOverall;
+        let upper = censored_search_observation(100_000, 95_000, 4_990.0);
+        let first = optimize_profile_direction(ProfileSearchInput {
+            profile,
+            direction: SearchDirection::Download,
+            observed_low_kbps: 100_000,
+            minimum_kbps: 70_000,
+            upper_kbps: 100_000,
+            thresholds: profile.validation_thresholds(),
+            uncertainty_percent: 1.5,
+            max_attempts: 2,
+            observations: vec![upper],
+        })
+        .unwrap();
+        assert_eq!(first.action, ProfileSearchAction::Test);
+        assert!(!first.metrics[0].measurement_reliable);
+        assert!(!first.metrics[0].safety_pass);
+        assert!(!first.metrics[0].target_met);
+        assert!(first.metrics[0].manual_reviewable);
+        assert!(first.next_candidate_kbps.is_some());
+
+        let terminal = optimize_profile_direction(ProfileSearchInput {
+            profile,
+            direction: SearchDirection::Download,
+            observed_low_kbps: 100_000,
+            minimum_kbps: 70_000,
+            upper_kbps: 100_000,
+            thresholds: profile.validation_thresholds(),
+            uncertainty_percent: 1.5,
+            max_attempts: 2,
+            observations: vec![upper, censored_search_observation(70_000, 67_000, 4_990.0)],
+        })
+        .unwrap();
+        assert_eq!(terminal.action, ProfileSearchAction::Fallback);
+        assert_eq!(terminal.reason, "transport-deadline-censored-review");
+        let selected = terminal.selected_index.expect("censored Review point");
+        assert_eq!(terminal.observations[selected].candidate_kbps, 100_000);
+        assert!(terminal.observations[selected].transport_censored);
+        assert!(!terminal.metrics[selected].target_met);
+        let options = terminal.review_options();
+        assert!(!options.is_empty());
+        assert!(options[0].transport_censored);
+        assert!(options[0].manual_reviewable);
+        assert!(!options[0].auto_apply_candidate);
+        let json = terminal.to_json();
+        assert!(json.contains("\"schema_version\":4"));
+        assert!(json.contains("\"transport_censored\":true"));
+    }
+
+    #[test]
+    fn exact_safe_search_point_outranks_higher_censored_throughput() {
+        let profile = AutotuneProfile::BestOverall;
+        let result = optimize_profile_direction(ProfileSearchInput {
+            profile,
+            direction: SearchDirection::Download,
+            observed_low_kbps: 100_000,
+            minimum_kbps: 70_000,
+            upper_kbps: 100_000,
+            thresholds: profile.validation_thresholds(),
+            uncertainty_percent: 1.5,
+            max_attempts: 2,
+            observations: vec![
+                censored_search_observation(100_000, 95_000, 4_990.0),
+                search_observation(70_000, 67_000, 20.0),
+            ],
+        })
+        .unwrap();
+        let selected = result.selected_index.expect("exact safe point");
+        assert_eq!(result.observations[selected].candidate_kbps, 70_000);
+        assert!(!result.observations[selected].transport_censored);
+        assert!(result.metrics[selected].safety_pass);
+        assert!(result.metrics[selected].target_met);
+        assert!(!result.review_options()[0].transport_censored);
+    }
+
+    #[test]
+    fn every_profile_retains_a_bounded_pareto_set_of_exact_direction_candidates() {
+        let observations = vec![
+            search_observation(100_000, 95_000, 50.0),
+            search_observation(80_000, 78_000, 20.0),
+            search_observation(60_000, 59_000, 4.0),
+        ];
+        for profile in [
+            AutotuneProfile::Gaming,
+            AutotuneProfile::GamingExtreme,
+            AutotuneProfile::BestOverall,
+            AutotuneProfile::VariableLink,
+            AutotuneProfile::Fair,
+        ] {
+            let result = optimize_profile_direction(ProfileSearchInput {
+                profile,
+                direction: SearchDirection::Download,
+                observed_low_kbps: 100_000,
+                minimum_kbps: 60_000,
+                upper_kbps: 100_000,
+                thresholds: profile.validation_thresholds(),
+                uncertainty_percent: 1.5,
+                max_attempts: observations.len(),
+                observations: observations.clone(),
+            })
+            .unwrap();
+            assert_ne!(result.action, ProfileSearchAction::Test, "{profile:?}");
+            assert_ne!(
+                result.action,
+                ProfileSearchAction::Inconclusive,
+                "{profile:?}"
+            );
+            let options = result.review_options();
+            assert_eq!(options.len(), MAX_PROFILE_REVIEW_OPTIONS, "{profile:?}");
+            assert_eq!(options[0].role, ProfileSearchOptionRole::Recommended);
+            let rates = options
+                .iter()
+                .map(|option| option.candidate_kbps)
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(rates.len(), options.len(), "{profile:?}");
+            assert!(rates.iter().all(|rate| {
+                observations
+                    .iter()
+                    .any(|observation| observation.candidate_kbps == *rate)
+            }));
+            let json = result.to_json();
+            assert!(json.contains("\"schema_version\":4"));
+            assert_eq!(
+                json.matches("\"pair_confirmation_required\":true").count(),
+                3
+            );
+        }
+    }
+
+    #[test]
+    fn every_profile_whole_link_candidates_are_bounded_deduplicated_and_exact() {
+        for profile in [
+            AutotuneProfile::Gaming,
+            AutotuneProfile::GamingExtreme,
+            AutotuneProfile::BestOverall,
+            AutotuneProfile::VariableLink,
+            AutotuneProfile::Fair,
+        ] {
+            let search = |direction, observations: Vec<SearchObservation>| {
+                optimize_profile_direction(ProfileSearchInput {
+                    profile,
+                    direction,
+                    observed_low_kbps: 100_000,
+                    minimum_kbps: 60_000,
+                    upper_kbps: 100_000,
+                    thresholds: profile.validation_thresholds(),
+                    uncertainty_percent: 1.5,
+                    max_attempts: observations.len(),
+                    observations,
+                })
+                .unwrap()
+            };
+            let download = search(
+                SearchDirection::Download,
+                vec![
+                    search_observation(100_000, 95_000, 50.0),
+                    search_observation(80_000, 78_000, 20.0),
+                    search_observation(60_000, 59_000, 4.0),
+                ],
+            );
+            let upload = search(
+                SearchDirection::Upload,
+                vec![
+                    search_observation(100_000, 94_000, 55.0),
+                    search_observation(80_000, 77_000, 22.0),
+                    search_observation(60_000, 58_000, 3.0),
+                ],
+            );
+
+            let pairs = profile_pair_candidates(&download, &upload).unwrap();
+            assert_eq!(pairs.len(), MAX_PROFILE_REVIEW_OPTIONS, "{profile:?}");
+            assert_eq!(
+                pairs[0].role,
+                ProfileSearchOptionRole::Recommended,
+                "{profile:?}"
+            );
+            let exact_pairs = pairs
+                .iter()
+                .map(|pair| (pair.download_kbps, pair.upload_kbps))
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(exact_pairs.len(), pairs.len(), "{profile:?}");
+            assert!(
+                pairs.iter().all(|pair| {
+                    download.observations[pair.download_index].candidate_kbps == pair.download_kbps
+                        && upload.observations[pair.upload_index].candidate_kbps == pair.upload_kbps
+                }),
+                "{profile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_profile_can_preserve_repeatable_manual_only_evidence() {
+        for profile in [
+            AutotuneProfile::Gaming,
+            AutotuneProfile::GamingExtreme,
+            AutotuneProfile::BestOverall,
+            AutotuneProfile::VariableLink,
+            AutotuneProfile::Fair,
+        ] {
+            let result = optimize_profile_direction(ProfileSearchInput {
+                profile,
+                direction: SearchDirection::Upload,
+                observed_low_kbps: 100_000,
+                minimum_kbps: 100_000,
+                upper_kbps: 100_000,
+                thresholds: profile.validation_thresholds(),
+                uncertainty_percent: 1.5,
+                max_attempts: 3,
+                observations: vec![
+                    search_observation(100_000, 60_000, 100.0),
+                    search_observation(100_000, 61_000, 95.0),
+                    search_observation(100_000, 62_000, 90.0),
+                ],
+            })
+            .unwrap();
+            assert_eq!(result.action, ProfileSearchAction::Fallback, "{profile:?}");
+            assert_eq!(result.reason, "bounded-low-realization-review");
+            let options = result.review_options();
+            assert_eq!(options.len(), 1, "{profile:?}");
+            assert_eq!(options[0].candidate_kbps, 100_000);
+            assert!(!options[0].controlled);
+            assert!(options[0].manual_reviewable);
+            assert!(!options[0].auto_apply_candidate);
+            assert_eq!(result.runtime_minimum_index, None);
+        }
     }
 
     #[test]
@@ -5467,7 +6856,7 @@ mod tests {
         assert_eq!(proposal.download.minimum_kbps, 500_000);
         assert_eq!(proposal.upload.minimum_kbps, 100_000);
         assert!(proposal
-            .set_measured_runtime_minimums(900_000, 100_000)
+            .set_measured_runtime_minimums(1_000_100, 100_000)
             .is_err());
 
         // The supervisor first moves base to the exact selected search point,
@@ -5600,7 +6989,7 @@ mod tests {
     }
 
     #[test]
-    fn variable_link_bounded_low_realization_is_manual_only_at_tested_floor() {
+    fn variable_link_bounded_low_realization_does_not_invent_a_runtime_floor() {
         let result = profile_search(
             AutotuneProfile::VariableLink,
             425_000,
@@ -5617,27 +7006,165 @@ mod tests {
         assert!(!result.no_cake_effect);
         assert!(!result.noisy);
         let selected_index = result.selected_index.expect("manual review point");
-        assert_eq!(result.runtime_minimum_index, Some(selected_index));
+        assert_eq!(result.runtime_minimum_index, None);
         assert_eq!(result.observations[selected_index].candidate_kbps, 292_200);
         assert!(!result.metrics[selected_index].safety_pass);
         assert!(result.metrics[selected_index].manual_reviewable);
         let json = result.to_json();
         assert!(json.contains("\"manual_reviewable\":true"));
-        assert!(json.contains("\"runtime_minimum_kbps\":292200"));
+        assert!(json.contains("\"runtime_minimum_kbps\":null"));
         assert!(json.contains("\"action\":\"fallback\""));
     }
 
     #[test]
+    fn variable_link_preserves_an_earlier_manual_fallback_after_deeper_descent() {
+        // Exact shape of the r101 disposable-VM failure: 52.4 Mbit/s had a
+        // repeatable, target-passing, bounded manual-review result. Deeper
+        // exploration then fell below the 50% trust floor. The later points
+        // must not erase the earlier exact candidate.
+        let result = optimize_profile_direction(ProfileSearchInput {
+            profile: AutotuneProfile::VariableLink,
+            direction: SearchDirection::Download,
+            observed_low_kbps: 57_900,
+            minimum_kbps: 28_900,
+            upper_kbps: 85_000,
+            thresholds: AutotuneProfile::VariableLink.validation_thresholds(),
+            uncertainty_percent: 1.5,
+            max_attempts: 12,
+            observations: vec![
+                search_observation(85_000, 49_862, 6.669),
+                search_observation(85_000, 59_783, 5.272),
+                search_observation(85_000, 47_129, 3.074),
+                search_observation(52_400, 34_753, 9.178),
+                search_observation(52_400, 32_997, 4.629),
+                search_observation(52_400, 33_587, 1.610),
+                search_observation(36_700, 19_551, 5.528),
+                search_observation(36_700, 20_873, 3.942),
+                search_observation(36_700, 21_519, 2.454),
+                search_observation(28_900, 14_891, 7.980),
+                search_observation(28_900, 18_231, 2.996),
+                search_observation(28_900, 15_805, 6.268),
+            ],
+        })
+        .unwrap();
+
+        assert_eq!(result.action, ProfileSearchAction::Fallback);
+        assert_eq!(result.reason, "bounded-low-realization-review");
+        assert!(!result.knee_detected);
+        assert_eq!(result.runtime_minimum_index, None);
+        let selected_index = result.selected_index.expect("earlier manual fallback");
+        assert_eq!(result.observations[selected_index].candidate_kbps, 52_400);
+        assert!(result.metrics[selected_index].manual_reviewable);
+        assert!(result.metrics[selected_index].target_met);
+        assert!(!result.metrics[selected_index].safety_pass);
+        assert!(result.observations[selected_index].achieved_kbps >= 32_997);
+    }
+
+    #[test]
+    fn variable_link_preserves_a_two_sample_hardware_fallback_after_deeper_descent() {
+        // Exact evidence shape from the r107 disposable-VM gate: the useful
+        // 61.3 Mbit/s candidate had two corroborating 50-80% realization
+        // samples.  Their agreement correctly authorized deeper exploration,
+        // whose later points retained less than half of the raw reference.
+        // Exhausting that descent must not erase the earlier exact rate.
+        let result = optimize_profile_direction(ProfileSearchInput {
+            profile: AutotuneProfile::VariableLink,
+            direction: SearchDirection::Download,
+            observed_low_kbps: 53_000,
+            minimum_kbps: 26_500,
+            upper_kbps: 85_000,
+            thresholds: AutotuneProfile::VariableLink.validation_thresholds(),
+            uncertainty_percent: 1.5,
+            max_attempts: 8,
+            observations: vec![
+                search_observation(61_300, 34_962, 20.0),
+                search_observation(61_300, 36_655, 22.0),
+                search_observation(38_900, 22_796, 25.0),
+                search_observation(38_900, 20_579, 28.0),
+                search_observation(38_900, 22_398, 30.0),
+                search_observation(26_500, 16_544, 35.0),
+                search_observation(26_500, 14_363, 38.0),
+                search_observation(26_500, 14_864, 40.0),
+            ],
+        })
+        .unwrap();
+
+        assert_eq!(result.action, ProfileSearchAction::Fallback);
+        assert_eq!(result.reason, "bounded-low-realization-review");
+        assert_eq!(result.runtime_minimum_index, None);
+        let selected_index = result.selected_index.expect("two-sample fallback");
+        assert_eq!(result.observations[selected_index].candidate_kbps, 61_300);
+        assert!(result.metrics[selected_index].manual_reviewable);
+        let options = result.review_options();
+        assert!(!options.is_empty());
+        assert!(options.iter().any(|option| {
+            option.candidate_kbps == 61_300
+                && option.manual_reviewable
+                && !option.controlled
+                && !option.auto_apply_candidate
+        }));
+    }
+
+    #[test]
+    fn two_sample_manual_fallback_still_requires_rate_corroboration() {
+        let result = optimize_profile_direction(ProfileSearchInput {
+            profile: AutotuneProfile::VariableLink,
+            direction: SearchDirection::Download,
+            observed_low_kbps: 53_000,
+            minimum_kbps: 26_500,
+            upper_kbps: 61_300,
+            thresholds: AutotuneProfile::VariableLink.validation_thresholds(),
+            uncertainty_percent: 1.5,
+            max_attempts: 2,
+            observations: vec![
+                search_observation(61_300, 34_000, 20.0),
+                search_observation(61_300, 40_000, 22.0),
+            ],
+        })
+        .unwrap();
+
+        assert_eq!(result.action, ProfileSearchAction::Inconclusive);
+        assert!(result.selected_index.is_none());
+        assert!(result.review_options().is_empty());
+    }
+
+    #[test]
+    fn variable_link_never_selects_an_uncorroborated_group_outlier() {
+        let result = profile_search(
+            AutotuneProfile::VariableLink,
+            70_000,
+            70_000,
+            vec![
+                // The first two achieved rates corroborate one another.  The
+                // third observation has the worst latency but is an achieved-
+                // rate outlier, so it cannot represent this manual option.
+                search_observation(70_000, 50_000, 20.0),
+                search_observation(70_000, 51_000, 25.0),
+                search_observation(70_000, 40_000, 55.0),
+            ],
+        );
+
+        assert_eq!(result.action, ProfileSearchAction::Fallback);
+        assert_eq!(result.reason, "bounded-low-realization-review");
+        let selected_index = result.selected_index.expect("corroborated fallback");
+        assert_eq!(result.observations[selected_index].achieved_kbps, 51_000);
+        assert_eq!(result.metrics[selected_index].effective_delta_ms, 25.0);
+        assert!(result.metrics[selected_index].manual_reviewable);
+        assert_eq!(result.runtime_minimum_index, None);
+    }
+
+    #[test]
     fn variable_link_sub_fifty_realization_remains_hard() {
+        let observations = vec![
+            search_observation(292_200, 140_000, 95.0),
+            search_observation(292_200, 141_000, 100.0),
+            search_observation(292_200, 140_500, 105.0),
+        ];
         let result = profile_search(
             AutotuneProfile::VariableLink,
             425_000,
             292_200,
-            vec![
-                search_observation(292_200, 140_000, 95.0),
-                search_observation(292_200, 141_000, 100.0),
-                search_observation(292_200, 140_500, 105.0),
-            ],
+            observations.clone(),
         );
         assert_eq!(result.action, ProfileSearchAction::Inconclusive);
         assert_eq!(result.reason, "variable-candidate-realization-inconclusive");
@@ -5646,6 +7173,126 @@ mod tests {
             .metrics
             .iter()
             .all(|metrics| { !metrics.safety_pass && !metrics.manual_reviewable }));
+        assert!(result.review_options().is_empty());
+
+        let terminal = terminate_profile_direction_at_measured_boundary(
+            ProfileSearchInput {
+                profile: AutotuneProfile::VariableLink,
+                direction: SearchDirection::Download,
+                observed_low_kbps: 425_000,
+                minimum_kbps: 292_200,
+                upper_kbps: 292_200,
+                thresholds: AutotuneProfile::VariableLink.validation_thresholds(),
+                uncertainty_percent: 1.5,
+                max_attempts: 3,
+                observations,
+            },
+            "candidate-observation-starved",
+        )
+        .unwrap();
+        assert_eq!(terminal.action, ProfileSearchAction::Inconclusive);
+        assert_eq!(terminal.reason, "candidate-observation-starved");
+        assert!(terminal.selected_index.is_none());
+        assert!(terminal.review_options().is_empty());
+    }
+
+    #[test]
+    fn variable_link_repeated_subtrust_measurements_descend_to_an_exact_lower_candidate() {
+        // Exact rate shape from the r213 disposable-VM failure.  All three
+        // measurements are below the 50% review trust floor, so none may
+        // become a proposal.  Their achieved and realized rates nevertheless
+        // corroborate one another and may authorize one lower exact probe.
+        let result = optimize_profile_direction(ProfileSearchInput {
+            profile: AutotuneProfile::VariableLink,
+            direction: SearchDirection::Download,
+            observed_low_kbps: 324_500,
+            minimum_kbps: 162_200,
+            upper_kbps: 344_900,
+            thresholds: AutotuneProfile::VariableLink.validation_thresholds(),
+            uncertainty_percent: 1.5,
+            max_attempts: 12,
+            observations: vec![
+                SearchObservation {
+                    candidate_kbps: 344_900,
+                    realized_kbps: 166_340,
+                    achieved_kbps: 160_039,
+                    icmp_delta_ms: 15.180,
+                    transport_delta_ms: 67.762,
+                    transport_censored: false,
+                    loss_percent: 0.0,
+                    cpu_percent: 70.691,
+                },
+                SearchObservation {
+                    candidate_kbps: 344_900,
+                    realized_kbps: 160_549,
+                    achieved_kbps: 154_486,
+                    icmp_delta_ms: 12.890,
+                    transport_delta_ms: 18.466,
+                    transport_censored: false,
+                    loss_percent: 0.0,
+                    cpu_percent: 69.517,
+                },
+                SearchObservation {
+                    candidate_kbps: 344_900,
+                    realized_kbps: 164_705,
+                    achieved_kbps: 158_520,
+                    icmp_delta_ms: 11.490,
+                    transport_delta_ms: 44.415,
+                    transport_censored: false,
+                    loss_percent: 0.0,
+                    cpu_percent: 69.479,
+                },
+            ],
+        })
+        .unwrap();
+
+        assert_eq!(result.action, ProfileSearchAction::Test);
+        assert_eq!(
+            result.reason,
+            "lower-variable-candidate-to-establish-shaper-control"
+        );
+        assert_eq!(result.next_candidate_kbps, Some(171_700));
+        assert!(result.selected_index.is_none());
+        assert!(result
+            .metrics
+            .iter()
+            .all(|metrics| { !metrics.safety_pass && !metrics.manual_reviewable }));
+        assert!(result.review_options().is_empty());
+    }
+
+    #[test]
+    fn variable_link_subtrust_diagnostic_descent_rejects_cpu_saturation() {
+        let observations = [94.0, 95.0, 96.0]
+            .into_iter()
+            .map(|cpu_percent| SearchObservation {
+                candidate_kbps: 344_900,
+                realized_kbps: 162_000,
+                achieved_kbps: 156_000,
+                icmp_delta_ms: 15.0,
+                transport_delta_ms: 20.0,
+                transport_censored: false,
+                loss_percent: 0.0,
+                cpu_percent,
+            })
+            .collect();
+        let result = optimize_profile_direction(ProfileSearchInput {
+            profile: AutotuneProfile::VariableLink,
+            direction: SearchDirection::Download,
+            observed_low_kbps: 324_500,
+            minimum_kbps: 162_200,
+            upper_kbps: 344_900,
+            thresholds: AutotuneProfile::VariableLink.validation_thresholds(),
+            uncertainty_percent: 1.5,
+            max_attempts: 12,
+            observations,
+        })
+        .unwrap();
+
+        assert_eq!(result.action, ProfileSearchAction::Inconclusive);
+        assert_eq!(result.reason, "variable-candidate-realization-inconclusive");
+        assert!(result.next_candidate_kbps.is_none());
+        assert!(result.selected_index.is_none());
+        assert!(result.review_options().is_empty());
     }
 
     #[test]
@@ -5664,7 +7311,7 @@ mod tests {
         assert_eq!(result.reason, "queue-outside-cake-control-target-unmet");
         assert!(result.no_cake_effect);
         let selected = result.selected_index.expect("tested safe fallback");
-        assert_eq!(result.runtime_minimum_index, Some(selected));
+        assert_eq!(result.runtime_minimum_index, None);
         assert_eq!(result.observations[selected].candidate_kbps, 80_000);
         assert!(result.metrics[selected].safety_pass);
         assert!(!result.metrics[selected].target_met);
@@ -5688,17 +7335,75 @@ mod tests {
         assert!(!result.knee_detected);
         assert!(!result.noisy);
         let selected_index = result.selected_index.unwrap();
-        let runtime_index = result.runtime_minimum_index.unwrap();
-        assert_eq!(selected_index, runtime_index);
+        assert_eq!(result.runtime_minimum_index, None);
         assert_eq!(result.observations[selected_index].candidate_kbps, 80_000);
         assert!(result.metrics[selected_index].safety_pass);
         assert!(result.metrics[selected_index].target_met);
         assert!(result.metrics[selected_index].retention_percent >= 50.0);
         let json = result.to_json();
         assert!(json.contains("\"action\":\"fallback\""));
-        assert!(json.contains("\"runtime_minimum_kbps\":80000"));
+        assert!(json.contains("\"runtime_minimum_kbps\":null"));
         assert!(json.contains("\"no_cake_effect\":true"));
         assert!(json.contains("\"inconclusive\":false"));
+    }
+
+    #[test]
+    fn variable_link_preserves_a_higher_passing_cake_ceiling_than_payload() {
+        let result = optimize_profile_direction(ProfileSearchInput {
+            profile: AutotuneProfile::VariableLink,
+            direction: SearchDirection::Download,
+            // Payload reference from repeated shaped controls.
+            observed_low_kbps: 666_400,
+            minimum_kbps: 333_200,
+            // Exact applied CAKE candidate; it legitimately exceeds payload.
+            upper_kbps: 723_100,
+            thresholds: AutotuneProfile::VariableLink.validation_thresholds(),
+            uncertainty_percent: 1.5,
+            max_attempts: 12,
+            observations: vec![
+                search_observation(723_100, 666_427, 2.0),
+                search_observation(623_100, 575_000, 1.2),
+                search_observation(523_100, 483_000, 1.0),
+            ],
+        })
+        .unwrap();
+
+        assert_eq!(result.action, ProfileSearchAction::Fallback);
+        assert_eq!(result.reason, "queue-outside-cake-control");
+        assert!(result.no_cake_effect);
+        assert!(!result.knee_detected);
+        let selected = result.selected_index.expect("passing CAKE ceiling");
+        assert_eq!(result.observations[selected].candidate_kbps, 723_100);
+        assert_eq!(result.observations[selected].achieved_kbps, 666_427);
+        assert!(result.metrics[selected].target_met);
+        assert_eq!(result.runtime_minimum_index, None);
+        let json = result.to_json();
+        assert!(json.contains("\"candidate_kbps\":723100"));
+        assert!(json.contains("\"achieved_kbps\":666427"));
+        assert!(json.contains("\"runtime_minimum_kbps\":null"));
+    }
+
+    #[test]
+    fn variable_link_unobserved_descent_uses_the_same_fixed_step_to_the_exact_floor() {
+        let observed_low = 357_400;
+        let minimum = 178_700;
+        let mut current = 377_800;
+        let mut candidates = Vec::new();
+        while let Some(next) =
+            next_variable_link_unobserved_candidate(observed_low, minimum, current).unwrap()
+        {
+            candidates.push(next);
+            current = next;
+        }
+        assert_eq!(candidates, vec![324_100, 270_400, 216_700, 178_700]);
+        assert_eq!(
+            next_variable_link_unobserved_candidate(observed_low, minimum, minimum).unwrap(),
+            None
+        );
+        assert!(next_variable_link_unobserved_candidate(0, minimum, current).is_err());
+        assert!(
+            next_variable_link_unobserved_candidate(observed_low, current + 1, current).is_err()
+        );
     }
 
     #[test]
@@ -5717,14 +7422,14 @@ mod tests {
         assert_eq!(result.reason, "queue-outside-cake-control-target-unmet");
         assert!(result.no_cake_effect);
         let selected = result.selected_index.expect("tested safe fallback");
-        assert_eq!(result.runtime_minimum_index, Some(selected));
+        assert_eq!(result.runtime_minimum_index, None);
         assert_eq!(result.observations[selected].candidate_kbps, 49_000);
         assert!(result.metrics[selected].safety_pass);
         assert!(result.metrics[selected].retention_percent < 50.0);
     }
 
     #[test]
-    fn variable_link_floor_without_plateau_binds_exact_tested_fallback() {
+    fn variable_link_floor_without_plateau_keeps_runtime_minimum_unresolved() {
         let result = profile_search(
             AutotuneProfile::VariableLink,
             100_000,
@@ -5743,7 +7448,7 @@ mod tests {
         );
         assert!(!result.knee_detected);
         let selected = result.selected_index.expect("tested safe fallback");
-        assert_eq!(result.runtime_minimum_index, Some(selected));
+        assert_eq!(result.runtime_minimum_index, None);
         assert!(result.metrics[selected].safety_pass);
         assert!(result
             .observations
@@ -5771,7 +7476,7 @@ mod tests {
         assert!(!result.no_cake_effect);
         assert!(!result.noisy);
         let selected_index = result.selected_index.unwrap();
-        assert_eq!(result.runtime_minimum_index, Some(selected_index));
+        assert_eq!(result.runtime_minimum_index, None);
         assert_eq!(result.observations[selected_index].candidate_kbps, 80_000);
         assert!(result.metrics[selected_index].target_met);
         assert!(result.metrics[selected_index].retention_percent >= 50.0);
@@ -5807,7 +7512,7 @@ mod tests {
         assert!(exhausted.noisy);
         assert!(!exhausted.no_cake_effect);
         let selected_index = exhausted.selected_index.unwrap();
-        assert_eq!(exhausted.runtime_minimum_index, Some(selected_index));
+        assert_eq!(exhausted.runtime_minimum_index, None);
         assert_eq!(
             exhausted.observations[selected_index].candidate_kbps,
             80_000
@@ -5815,6 +7520,73 @@ mod tests {
         assert_eq!(exhausted.metrics[selected_index].grade, "C");
         assert!(!exhausted.metrics[selected_index].target_met);
         assert!(exhausted.metrics[selected_index].retention_percent >= 50.0);
+    }
+
+    #[test]
+    fn variable_link_noisy_fallback_preserves_a_passing_high_throughput_ceiling() {
+        let result = optimize_profile_direction(ProfileSearchInput {
+            profile: AutotuneProfile::VariableLink,
+            direction: SearchDirection::Download,
+            observed_low_kbps: 668_200,
+            minimum_kbps: 334_100,
+            upper_kbps: 723_100,
+            thresholds: AutotuneProfile::VariableLink.validation_thresholds(),
+            uncertainty_percent: 1.5,
+            max_attempts: 12,
+            observations: vec![
+                search_observation(723_100, 668_517, 52.469),
+                search_observation(622_800, 575_359, 6.358),
+                search_observation(522_500, 482_501, 5.569),
+                search_observation(422_200, 389_255, 26.765),
+                search_observation(422_200, 389_175, 20.594),
+                search_observation(422_200, 389_198, 12.954),
+            ],
+        })
+        .unwrap();
+
+        assert_eq!(result.action, ProfileSearchAction::Fallback);
+        assert_eq!(result.reason, "noisy-link-safe-review");
+        assert!(result.noisy);
+        assert!(!result.knee_detected);
+        assert_eq!(result.runtime_minimum_index, None);
+        let selected = result.selected_index.expect("target-passing ceiling");
+        assert_eq!(result.observations[selected].candidate_kbps, 723_100);
+        assert_eq!(result.observations[selected].achieved_kbps, 668_517);
+        assert!(result.metrics[selected].safety_pass);
+        assert!(result.metrics[selected].target_met);
+        assert!(result.metrics[selected].capacity_objective_met);
+    }
+
+    #[test]
+    fn variable_link_nonmonotonic_fallback_preserves_a_passing_ceiling() {
+        let result = optimize_profile_direction(ProfileSearchInput {
+            profile: AutotuneProfile::VariableLink,
+            direction: SearchDirection::Download,
+            observed_low_kbps: 668_200,
+            minimum_kbps: 334_100,
+            upper_kbps: 723_100,
+            thresholds: AutotuneProfile::VariableLink.validation_thresholds(),
+            uncertainty_percent: 1.5,
+            max_attempts: 12,
+            observations: vec![
+                search_observation(723_100, 668_500, 52.0),
+                search_observation(622_800, 575_000, 6.0),
+                search_observation(522_500, 482_500, 30.0),
+                search_observation(522_500, 482_400, 30.0),
+                search_observation(522_500, 482_600, 30.0),
+            ],
+        })
+        .unwrap();
+
+        assert_eq!(result.action, ProfileSearchAction::Fallback);
+        assert_eq!(result.reason, "noisy-link-safe-review");
+        assert!(result.noisy);
+        assert!(!result.knee_detected);
+        assert_eq!(result.runtime_minimum_index, None);
+        let selected = result.selected_index.expect("target-passing ceiling");
+        assert_eq!(result.observations[selected].candidate_kbps, 723_100);
+        assert_eq!(result.observations[selected].achieved_kbps, 668_500);
+        assert!(result.metrics[selected].target_met);
     }
 
     #[test]
@@ -5834,7 +7606,7 @@ mod tests {
         assert_eq!(result.reason, "nonmonotonic-variable-link-after-retries");
         assert!(result.noisy);
         let selected = result.selected_index.expect("tested safe fallback");
-        assert_eq!(result.runtime_minimum_index, Some(selected));
+        assert_eq!(result.runtime_minimum_index, None);
         assert_eq!(result.observations[selected].candidate_kbps, 49_000);
         assert!(result.metrics[selected].safety_pass);
     }
@@ -5958,6 +7730,65 @@ mod tests {
     }
 
     #[test]
+    fn observation_starvation_retains_only_a_prior_corroborated_manual_point() {
+        let observation = |realized_kbps, achieved_kbps, delta_ms| SearchObservation {
+            candidate_kbps: 1_000,
+            realized_kbps,
+            achieved_kbps,
+            icmp_delta_ms: 6.0,
+            transport_delta_ms: delta_ms,
+            transport_censored: false,
+            loss_percent: 0.0,
+            cpu_percent: 8.0,
+        };
+        let input = ProfileSearchInput {
+            profile: AutotuneProfile::Fair,
+            direction: SearchDirection::Download,
+            observed_low_kbps: 300,
+            minimum_kbps: 100,
+            upper_kbps: 1_000,
+            thresholds: AutotuneProfile::Fair.validation_thresholds(),
+            uncertainty_percent: 1.5,
+            max_attempts: 8,
+            observations: vec![observation(729, 250, 10.0), observation(771, 239, 11.0)],
+        };
+        let open = optimize_profile_direction(input.clone()).unwrap();
+        assert_eq!(open.action, ProfileSearchAction::Test);
+        assert_eq!(open.next_candidate_kbps, Some(300));
+
+        let terminal = terminate_profile_direction_at_measured_boundary(
+            input.clone(),
+            "candidate-observation-starved",
+        )
+        .unwrap();
+        assert_eq!(terminal.action, ProfileSearchAction::Fallback);
+        assert_eq!(terminal.reason, "candidate-observation-starved");
+        assert_eq!(terminal.next_candidate_kbps, None);
+        assert_eq!(terminal.observations.len(), 2);
+        let selected = terminal.selected_index.expect("manual fallback");
+        assert_eq!(terminal.observations[selected].candidate_kbps, 1_000);
+        assert!(terminal.metrics[selected].manual_reviewable);
+        assert!(!terminal.metrics[selected].safety_pass);
+        let options = terminal.review_options();
+        assert_eq!(options.len(), 1);
+        assert!(options[0].manual_reviewable);
+        assert!(!options[0].controlled);
+        assert!(!options[0].auto_apply_candidate);
+
+        let singleton = terminate_profile_direction_at_measured_boundary(
+            ProfileSearchInput {
+                observations: vec![observation(729, 250, 10.0)],
+                ..input
+            },
+            "candidate-observation-starved",
+        )
+        .unwrap();
+        assert_eq!(singleton.action, ProfileSearchAction::Inconclusive);
+        assert_eq!(singleton.selected_index, None);
+        assert!(singleton.review_options().is_empty());
+    }
+
+    #[test]
     fn repeated_upper_low_realization_still_requires_a_controlled_retest() {
         let result = profile_search(
             AutotuneProfile::Fair,
@@ -6042,6 +7873,7 @@ mod tests {
         let download = DirectionValidationInput {
             observed_low_kbps: 140_200,
             candidate_kbps: 131_800,
+            realized_kbps: 98_101,
             achieved_kbps: 98_101,
             minimum_kbps: 112_100,
             maximum_kbps: 140_200,
@@ -6049,6 +7881,7 @@ mod tests {
         let upload = DirectionValidationInput {
             observed_low_kbps: 19_500,
             candidate_kbps: 19_500,
+            realized_kbps: 16_259,
             achieved_kbps: 16_259,
             minimum_kbps: 15_600,
             maximum_kbps: 19_500,
@@ -6163,9 +7996,11 @@ mod tests {
     fn repeated_non_cpu_resource_failure_is_inconclusive_not_null_fallback() {
         let observation = |achieved_kbps| SearchObservation {
             candidate_kbps: 100_000,
+            realized_kbps: achieved_kbps,
             achieved_kbps,
             icmp_delta_ms: 1.0,
             transport_delta_ms: 1.0,
+            transport_censored: false,
             loss_percent: 10.0,
             cpu_percent: 50.0,
         };
@@ -6196,9 +8031,11 @@ mod tests {
     fn terminal_unsafe_probe_keeps_an_earlier_exact_safe_point() {
         let unsafe_observation = |achieved_kbps| SearchObservation {
             candidate_kbps: 100_000,
+            realized_kbps: achieved_kbps,
             achieved_kbps,
             icmp_delta_ms: 1.0,
             transport_delta_ms: 1.0,
+            transport_censored: false,
             loss_percent: 10.0,
             cpu_percent: 50.0,
         };
@@ -6259,7 +8096,7 @@ mod tests {
         assert_eq!(result.action, ProfileSearchAction::Fallback);
         assert_eq!(result.reason, "bounded-attempt-limit-before-latency-knee");
         let selected = result.selected_index.expect("tested safe fallback");
-        assert_eq!(result.runtime_minimum_index, Some(selected));
+        assert_eq!(result.runtime_minimum_index, None);
         assert_eq!(result.observations[selected].candidate_kbps, 45_000);
         assert!(result.metrics[selected].safety_pass);
     }
@@ -6404,9 +8241,11 @@ mod tests {
     fn repeatable_advisory_rejects_an_unsafe_peer() {
         let unsafe_observation = |achieved_kbps| SearchObservation {
             candidate_kbps: 752_000,
+            realized_kbps: achieved_kbps,
             achieved_kbps,
             icmp_delta_ms: 2.0,
             transport_delta_ms: 2.0,
+            transport_censored: false,
             loss_percent: 10.0,
             cpu_percent: 50.0,
         };

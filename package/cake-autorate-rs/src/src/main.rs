@@ -1,18 +1,26 @@
 use std::collections::{HashMap, VecDeque};
 use std::env;
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::os::fd::{AsRawFd, OwnedFd};
+#[cfg(feature = "calibration")]
+use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod adaptive_ceiling;
+#[cfg_attr(not(feature = "calibration"), allow(dead_code))]
 mod autotune;
+#[allow(dead_code)]
+mod operations;
 mod quality_grade;
 mod rating_load;
 mod routing;
@@ -41,49 +49,28 @@ const GRAPH_HISTORY_BUDGET_REFRESH_S: u64 = 30;
 const GRAPH_HISTORY_CRITICAL_AVAILABLE_KIB: u64 = 16 * 1024;
 const SQM_RUNTIME_HEALTH_CHECK_FAST_S: u64 = 3;
 const SQM_RUNTIME_HEALTH_CHECK_HEALTHY_S: u64 = 15;
-const SQM_RUNTIME_RECOVERY_COOLDOWN_S: u64 = 30;
-const SQM_BOOTSTRAP_HOTPLUG_GRACE_S: u64 = 12;
-const SQM_BOOTSTRAP_RECOVERY_BACKOFF_INITIAL_S: u64 = 5;
-const SQM_BOOTSTRAP_RECOVERY_BACKOFF_MAX_S: u64 = 60;
 const STATUS_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 const CAKE_GROWTH_UPDATE_MIN_INTERVAL: Duration = Duration::from_millis(100);
 const TRANSPORT_BASELINE_LEARNING_INTERVAL_S: f64 = 1.0;
-
-const UPSTREAM_DEFAULT_REFLECTORS: &[&str] = &[
-    "1.1.1.1",
-    "1.0.0.1",
-    "8.8.8.8",
-    "8.8.4.4",
-    "9.9.9.9",
-    "9.9.9.10",
-    "9.9.9.11",
-    "94.140.14.15",
-    "94.140.14.140",
-    "94.140.14.141",
-    "94.140.15.15",
-    "94.140.15.16",
-    "64.6.65.6",
-    "156.154.70.1",
-    "156.154.70.2",
-    "156.154.70.3",
-    "156.154.70.4",
-    "156.154.70.5",
-    "156.154.71.1",
-    "156.154.71.2",
-    "156.154.71.3",
-    "156.154.71.4",
-    "156.154.71.5",
-    "208.67.220.2",
-    "208.67.220.123",
-    "208.67.220.220",
-    "208.67.222.2",
-    "208.67.222.123",
-    "185.228.168.9",
-    "185.228.168.10",
-];
+#[cfg(feature = "calibration")]
+const AUTOTUNE_TRANSPORT_MIN_LOADED_COVERAGE_PERCENT: u128 = 70;
+#[cfg(feature = "calibration")]
+const AUTOTUNE_CAPTURE_REATTEST_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(feature = "calibration")]
+const AUTOTUNE_CAPTURE_ATTESTATION_MAX_AGE: Duration = Duration::from_secs(3);
+const SQM_RUNTIME_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+const SQM_RUNTIME_STOP_OUTPUT_LIMIT: usize = 8 * 1024;
 
 extern "C" fn handle_signal(_: i32) {
     TERMINATE.store(true, Ordering::SeqCst);
+    operations::event_loop::wake_from_signal();
+}
+
+fn install_signal_handlers() {
+    unsafe {
+        signal(2, handle_signal);
+        signal(15, handle_signal);
+    }
 }
 
 extern "C" {
@@ -98,12 +85,13 @@ struct Config {
     manage_sqm: bool,
     sqm_enabled: bool,
     sqm_direction_mode: String,
+    sqm_section: String,
     sqm_interface: String,
     dl_if: String,
     ul_if: String,
     route_mode: String,
     mwan3_member: String,
-    route_stability_s: f64,
+    speedtest_backend: String,
     route_check_interval_s: f64,
     rx_bytes_path: String,
     tx_bytes_path: String,
@@ -145,6 +133,10 @@ struct Config {
     rating_capture_peak_factor: f64,
     rating_capture_contamination_ratio: f64,
     rating_capture_ack_ratio: f64,
+    rating_capture_quiet_s: usize,
+    rating_capture_quiet_timeout_s: usize,
+    rating_capture_quiet_ratio: f64,
+    rating_capture_quiet_min_kbps: f64,
     rating_episode_gap_s: f64,
     quality_target_delay_ms: f64,
     quality_search_max_steps: usize,
@@ -238,18 +230,20 @@ struct Config {
 
 impl Config {
     fn defaults(instance: String) -> Self {
+        let sqm_section = format!("cake_{instance}");
         Self {
             instance,
             enabled: false,
             manage_sqm: true,
             sqm_enabled: false,
             sqm_direction_mode: "both".to_string(),
+            sqm_section,
             sqm_interface: String::new(),
             dl_if: "ifb-wan".to_string(),
             ul_if: "wan".to_string(),
             route_mode: "auto".to_string(),
             mwan3_member: String::new(),
-            route_stability_s: 5.0,
+            speedtest_backend: "auto".to_string(),
             route_check_interval_s: 2.0,
             rx_bytes_path: String::new(),
             tx_bytes_path: String::new(),
@@ -295,6 +289,10 @@ impl Config {
             rating_capture_peak_factor: 0.35,
             rating_capture_contamination_ratio: 0.10,
             rating_capture_ack_ratio: 0.08,
+            rating_capture_quiet_s: 5,
+            rating_capture_quiet_timeout_s: 30,
+            rating_capture_quiet_ratio: 0.05,
+            rating_capture_quiet_min_kbps: 1000.0,
             rating_episode_gap_s: 30.0,
             quality_target_delay_ms: 30.0,
             quality_search_max_steps: 3,
@@ -430,12 +428,13 @@ impl Config {
         cfg.sqm_enabled = cfg.enabled;
         set_bool(&single, "sqm_enabled", &mut cfg.sqm_enabled)?;
         set_string(&single, "sqm_direction_mode", &mut cfg.sqm_direction_mode);
+        set_string(&single, "sqm_section", &mut cfg.sqm_section);
         set_string(&single, "sqm_interface", &mut cfg.sqm_interface);
         set_string(&single, "dl_if", &mut cfg.dl_if);
         set_string(&single, "ul_if", &mut cfg.ul_if);
         set_string(&single, "route_mode", &mut cfg.route_mode);
         set_string(&single, "mwan3_member", &mut cfg.mwan3_member);
-        set_f64(&single, "route_stability_s", &mut cfg.route_stability_s)?;
+        set_string(&single, "speedtest_backend", &mut cfg.speedtest_backend);
         set_f64(
             &single,
             "route_check_interval_s",
@@ -668,6 +667,26 @@ impl Config {
             &single,
             "rating_capture_ack_ratio",
             &mut cfg.rating_capture_ack_ratio,
+        )?;
+        set_usize(
+            &single,
+            "rating_capture_quiet_s",
+            &mut cfg.rating_capture_quiet_s,
+        )?;
+        set_usize(
+            &single,
+            "rating_capture_quiet_timeout_s",
+            &mut cfg.rating_capture_quiet_timeout_s,
+        )?;
+        set_f64(
+            &single,
+            "rating_capture_quiet_ratio",
+            &mut cfg.rating_capture_quiet_ratio,
+        )?;
+        set_f64(
+            &single,
+            "rating_capture_quiet_min_kbps",
+            &mut cfg.rating_capture_quiet_min_kbps,
         )?;
         set_f64(
             &single,
@@ -1135,11 +1154,11 @@ impl Config {
     }
 
     fn download_shaping_enabled(&self) -> bool {
-        matches!(self.sqm_direction_mode.as_str(), "both" | "download_only")
+        self.sqm_enabled && matches!(self.sqm_direction_mode.as_str(), "both" | "download_only")
     }
 
     fn upload_shaping_enabled(&self) -> bool {
-        matches!(self.sqm_direction_mode.as_str(), "both" | "upload_only")
+        self.sqm_enabled && matches!(self.sqm_direction_mode.as_str(), "both" | "upload_only")
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -1154,9 +1173,6 @@ impl Config {
         }
         if self.sqm_enabled && self.sqm_direction_mode == "off" {
             return Err("sqm_direction_mode off requires sqm_enabled=0".to_string());
-        }
-        if !(1.0..=300.0).contains(&self.route_stability_s) {
-            return Err("route_stability_s must be between 1 and 300".to_string());
         }
         if !(1.0..=60.0).contains(&self.route_check_interval_s) {
             return Err("route_check_interval_s must be between 1 and 60".to_string());
@@ -1440,6 +1456,22 @@ impl Config {
             {
                 return Err("rating_capture_ack_ratio must be between 0.01 and 0.25".to_string());
             }
+            if !(2..=30).contains(&self.rating_capture_quiet_s) {
+                return Err("rating_capture_quiet_s must be between 2 and 30".to_string());
+            }
+            if !(5..=120).contains(&self.rating_capture_quiet_timeout_s) {
+                return Err("rating_capture_quiet_timeout_s must be between 5 and 120".to_string());
+            }
+            if !self.rating_capture_quiet_ratio.is_finite()
+                || !(0.01..=0.25).contains(&self.rating_capture_quiet_ratio)
+            {
+                return Err("rating_capture_quiet_ratio must be between 0.01 and 0.25".to_string());
+            }
+            if !self.rating_capture_quiet_min_kbps.is_finite()
+                || self.rating_capture_quiet_min_kbps < 0.0
+            {
+                return Err("rating_capture_quiet_min_kbps must not be negative".to_string());
+            }
             if !self.rating_episode_gap_s.is_finite()
                 || !(5.0..=120.0).contains(&self.rating_episode_gap_s)
             {
@@ -1618,8 +1650,24 @@ impl Config {
         self.run_dir().join("history.csv")
     }
 
+    #[cfg(feature = "calibration")]
     fn rating_capture_path(&self) -> PathBuf {
         self.run_dir().join("rating-capture")
+    }
+
+    #[cfg(feature = "calibration")]
+    fn autotune_capture_request_path(&self) -> PathBuf {
+        self.run_dir().join("autotune-capture-request")
+    }
+
+    #[cfg(feature = "calibration")]
+    fn autotune_capture_snapshot_path(&self) -> PathBuf {
+        self.run_dir().join("autotune-capture-snapshot")
+    }
+
+    #[cfg(feature = "calibration")]
+    fn autotune_load_evidence_path(&self) -> PathBuf {
+        self.run_dir().join("autotune-load-evidence")
     }
 }
 
@@ -2017,6 +2065,163 @@ struct RateSample {
     dl_kbps: f64,
     ul_kbps: f64,
     fresh: bool,
+    #[cfg(feature = "calibration")]
+    dl_observed_at: Instant,
+    #[cfg(feature = "calibration")]
+    ul_observed_at: Instant,
+}
+
+#[cfg(feature = "calibration")]
+struct SpeedtestCounterRateMonitor {
+    tracker: operations::autotune_counter::AutotuneCounterRateTracker,
+}
+
+#[cfg(feature = "calibration")]
+struct AutotuneSpeedtestRateMonitor {
+    request: operations::full_autotune::AutotuneCaptureRequest,
+    counter_epoch: u64,
+    monitor: SpeedtestCounterRateMonitor,
+}
+
+#[cfg(feature = "calibration")]
+#[derive(Clone, Debug)]
+struct IdentityBoundRateSample {
+    request: operations::full_autotune::AutotuneCaptureRequest,
+    sample: RateSample,
+}
+
+#[cfg(feature = "calibration")]
+#[derive(Clone, Debug)]
+struct IdentityBoundCounterDelta {
+    request: operations::full_autotune::AutotuneCaptureRequest,
+    delta: operations::autotune_counter::AutotuneCounterDelta,
+}
+
+#[cfg(feature = "calibration")]
+#[derive(Clone, Debug)]
+struct IdentityBoundIdleRateReference {
+    request: operations::full_autotune::AutotuneCaptureRequest,
+    download_kbps: f64,
+    upload_kbps: f64,
+}
+
+#[cfg(feature = "calibration")]
+impl AutotuneSpeedtestRateMonitor {
+    fn matches(&self, request: &operations::full_autotune::AutotuneCaptureRequest) -> bool {
+        &self.request == request
+    }
+}
+
+#[cfg(feature = "calibration")]
+fn autotune_counter_completion_matches(
+    request: &operations::full_autotune::AutotuneCaptureRequest,
+    monitor: &AutotuneSpeedtestRateMonitor,
+    completion: &operations::autotune_counter::AutotuneCounterCompletion,
+) -> bool {
+    &completion.request == request && completion.epoch == monitor.counter_epoch
+}
+
+#[cfg(feature = "calibration")]
+fn autotune_counter_completion_is_timely(
+    request: &operations::full_autotune::AutotuneCaptureRequest,
+    completion: &operations::autotune_counter::AutotuneCounterCompletion,
+) -> bool {
+    completion.completed_boot_ms > 0 && completion.completed_boot_ms <= request.deadline_boot_ms
+}
+
+#[cfg(feature = "calibration")]
+fn autotune_capture_uses_identity_bound_speedtest_counters(
+    request: &operations::full_autotune::AutotuneCaptureRequest,
+) -> bool {
+    // The ordinary RateMonitor is already normalized to the exact managed
+    // baseline: a disabled direction uses the physical SQM-interface counter
+    // while an enabled direction uses its shaped counter.  Idle capture must
+    // include all background traffic and runs before a controlled speed-test
+    // flight exists, so requiring job-owned nft counters here would starve a
+    // valid directional baseline forever.
+    //
+    // Every loaded measurement runs under a permit-scoped runtime topology.
+    // Its IFB may deliberately replace the configured SQM IFB, so the ordinary
+    // shaped counter path is not a stable identity even for ShapedBoth. Only
+    // the job-owned counters follow the exact controlled flight across every
+    // loaded topology.
+    request.phase == operations::full_autotune::AutotuneCapturePhase::LoadedMeasurement
+}
+
+#[cfg(feature = "calibration")]
+fn select_autotune_capture_rates(
+    topology: operations::full_autotune::MeasurementTopology,
+    controlled: Option<RateSample>,
+) -> Result<RateSample, String> {
+    controlled.ok_or_else(|| {
+        format!(
+            "native Auto-Tune identity-bound speedtest counter sample is unavailable for {}",
+            topology.as_str()
+        )
+    })
+}
+
+#[cfg(feature = "calibration")]
+fn rate_sample_is_recent(sample: RateSample, now: Instant, max_age: Duration) -> bool {
+    now.checked_duration_since(sample.dl_observed_at)
+        .is_some_and(|age| age <= max_age)
+        && now
+            .checked_duration_since(sample.ul_observed_at)
+            .is_some_and(|age| age <= max_age)
+}
+
+#[cfg(feature = "calibration")]
+fn autotune_transport_control_phase(
+    request: &operations::full_autotune::AutotuneCaptureRequest,
+    rates: Option<RateSample>,
+    now: Instant,
+    max_age: Duration,
+    configured_threshold_kbps: f64,
+    ack_ratio: f64,
+) -> Result<Option<(bool, bool)>, String> {
+    let Some(rates) = rates else {
+        return Ok(None);
+    };
+    if !rate_sample_is_recent(rates, now, max_age) {
+        return Ok(None);
+    }
+    operations::autotune_capture::bounded_directional_load_phase(
+        request,
+        rates.dl_kbps,
+        rates.ul_kbps,
+        configured_threshold_kbps,
+        ack_ratio,
+    )
+    .map(Some)
+}
+
+#[cfg(feature = "calibration")]
+fn autotune_transport_delta_phase(
+    request: &operations::full_autotune::AutotuneCaptureRequest,
+    delta: operations::autotune_counter::AutotuneCounterDelta,
+    maximum_span: Duration,
+    configured_threshold_kbps: f64,
+    ack_ratio: f64,
+) -> Result<Option<(bool, bool)>, String> {
+    if !delta.within_maximum_span || delta.observed_end <= delta.observed_start {
+        return Ok(None);
+    }
+    let elapsed_duration = delta.observed_end.duration_since(delta.observed_start);
+    if elapsed_duration > maximum_span {
+        return Ok(None);
+    }
+    let elapsed = elapsed_duration.as_secs_f64();
+    if !elapsed.is_finite() || elapsed <= 0.0 {
+        return Ok(None);
+    }
+    operations::autotune_capture::bounded_directional_load_phase(
+        request,
+        delta.download_bytes as f64 * 8.0 / elapsed / 1_000.0,
+        delta.upload_bytes as f64 * 8.0 / elapsed / 1_000.0,
+        configured_threshold_kbps,
+        ack_ratio,
+    )
+    .map(Some)
 }
 
 impl RateMonitor {
@@ -2025,27 +2230,34 @@ impl RateMonitor {
             rx_path: PathBuf::from(rx_path),
             tx_path: PathBuf::from(tx_path),
             min_interval: Duration::from_millis(interval_ms.max(25)),
-            prev_rx: read_u64_file(rx_path).unwrap_or(0),
-            prev_tx: read_u64_file(tx_path).unwrap_or(0),
+            prev_rx: read_u64_file(rx_path)?,
+            prev_tx: read_u64_file(tx_path)?,
             last: Instant::now(),
             last_dl_kbps: 0.0,
             last_ul_kbps: 0.0,
         })
     }
 
-    fn sample(&mut self) -> RateSample {
-        let now = Instant::now();
+    fn try_sample(&mut self) -> io::Result<RateSample> {
+        self.try_sample_at(Instant::now())
+    }
+
+    fn try_sample_at(&mut self, now: Instant) -> io::Result<RateSample> {
         let interval = now.duration_since(self.last);
         if interval < self.min_interval {
-            return RateSample {
+            return Ok(RateSample {
                 dl_kbps: self.last_dl_kbps,
                 ul_kbps: self.last_ul_kbps,
                 fresh: false,
-            };
+                #[cfg(feature = "calibration")]
+                dl_observed_at: self.last,
+                #[cfg(feature = "calibration")]
+                ul_observed_at: self.last,
+            });
         }
         let elapsed = interval.as_secs_f64();
-        let rx = read_u64_file(&self.rx_path).unwrap_or(self.prev_rx);
-        let tx = read_u64_file(&self.tx_path).unwrap_or(self.prev_tx);
+        let rx = read_u64_file(&self.rx_path)?;
+        let tx = read_u64_file(&self.tx_path)?;
         let dl = rx.saturating_sub(self.prev_rx) as f64 * 8.0 / elapsed / 1000.0;
         let ul = tx.saturating_sub(self.prev_tx) as f64 * 8.0 / elapsed / 1000.0;
         self.prev_rx = rx;
@@ -2053,15 +2265,86 @@ impl RateMonitor {
         self.last = now;
         self.last_dl_kbps = dl;
         self.last_ul_kbps = ul;
-        RateSample {
+        Ok(RateSample {
             dl_kbps: dl,
             ul_kbps: ul,
             fresh: true,
-        }
+            #[cfg(feature = "calibration")]
+            dl_observed_at: now,
+            #[cfg(feature = "calibration")]
+            ul_observed_at: now,
+        })
+    }
+
+    fn sample(&mut self) -> RateSample {
+        self.try_sample().unwrap_or(RateSample {
+            dl_kbps: self.last_dl_kbps,
+            ul_kbps: self.last_ul_kbps,
+            fresh: false,
+            #[cfg(feature = "calibration")]
+            dl_observed_at: self.last,
+            #[cfg(feature = "calibration")]
+            ul_observed_at: self.last,
+        })
     }
 }
 
-fn qdisc_output_has_cake(output: &str) -> bool {
+#[cfg(feature = "calibration")]
+impl SpeedtestCounterRateMonitor {
+    fn new(interval_ms: u64) -> Self {
+        Self {
+            tracker: operations::autotune_counter::AutotuneCounterRateTracker::new(interval_ms),
+        }
+    }
+
+    fn reset(&mut self, now: Instant) {
+        self.tracker.reset(now);
+    }
+
+    fn sample_due(&self, now: Instant) -> bool {
+        self.tracker.sample_due(now)
+    }
+
+    fn cached_sample(&self) -> Option<RateSample> {
+        self.tracker.cached_sample().map(|sample| RateSample {
+            dl_kbps: sample.download_kbps,
+            ul_kbps: sample.upload_kbps,
+            fresh: sample.fresh,
+            dl_observed_at: sample.observed_end,
+            ul_observed_at: sample.observed_end,
+        })
+    }
+
+    #[cfg(test)]
+    fn observe_counters(
+        &mut self,
+        now: Instant,
+        current: Option<operations::speedtest::SpeedtestTrafficCounters>,
+    ) -> Option<RateSample> {
+        self.observe_counters_with_delta(now, current).0
+    }
+
+    fn observe_counters_with_delta(
+        &mut self,
+        now: Instant,
+        current: Option<operations::speedtest::SpeedtestTrafficCounters>,
+    ) -> (
+        Option<RateSample>,
+        Option<operations::autotune_counter::AutotuneCounterDelta>,
+    ) {
+        let observation = self.tracker.observe_counters_with_delta(now, current);
+        let rate = observation.rate_window.map(|sample| RateSample {
+            dl_kbps: sample.download_kbps,
+            ul_kbps: sample.upload_kbps,
+            fresh: sample.fresh,
+            dl_observed_at: sample.observed_end,
+            ul_observed_at: sample.observed_end,
+        });
+        (rate, observation.delta)
+    }
+}
+
+fn root_cake_qdisc_count(output: &str) -> usize {
     output
         .lines()
         .filter(|line| {
@@ -2074,30 +2357,50 @@ fn qdisc_output_has_cake(output: &str) -> bool {
                 && fields.contains(&"root")
         })
         .count()
-        == 1
 }
 
-fn ingress_output_targets_ifb(output: &str, ifb: &str) -> bool {
+#[cfg(test)]
+fn qdisc_output_has_cake(output: &str) -> bool {
+    root_cake_qdisc_count(output) == 1
+}
+
+fn ingress_redirect_targets(output: &str) -> Vec<String> {
     fn clean(value: &str) -> &str {
         value.trim_matches(|character: char| matches!(character, '(' | ')' | '[' | ']' | ',' | ';'))
     }
 
-    if ifb.is_empty() {
-        return false;
-    }
-    output.lines().any(|line| {
+    let mut targets = Vec::new();
+    for line in output.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
-        fields.windows(3).any(|window| {
-            window[0].eq_ignore_ascii_case("redirect")
-                && window[1].eq_ignore_ascii_case("dev")
-                && clean(window[2]) == ifb
-        }) || fields.windows(4).any(|window| {
-            window[0].eq_ignore_ascii_case("redirect")
-                && window[1].eq_ignore_ascii_case("to")
-                && window[2].eq_ignore_ascii_case("device")
-                && clean(window[3]) == ifb
-        })
-    })
+        let target = fields
+            .windows(3)
+            .find(|window| {
+                window[0].eq_ignore_ascii_case("redirect") && window[1].eq_ignore_ascii_case("dev")
+            })
+            .map(|window| clean(window[2]))
+            .or_else(|| {
+                fields.windows(4).find_map(|window| {
+                    (window[0].eq_ignore_ascii_case("redirect")
+                        && window[1].eq_ignore_ascii_case("to")
+                        && window[2].eq_ignore_ascii_case("device"))
+                    .then(|| clean(window[3]))
+                })
+            });
+        if let Some(target) = target {
+            if !target.is_empty() && !targets.iter().any(|known| known == target) {
+                targets.push(target.to_string());
+            }
+        }
+    }
+    targets
+}
+
+#[cfg(test)]
+fn ingress_output_targets_ifb(output: &str, ifb: &str) -> bool {
+    !ifb.is_empty()
+        && ingress_redirect_targets(output)
+            .iter()
+            .any(|target| target == ifb)
 }
 
 fn tc_output(args: &[&str]) -> Result<String, String> {
@@ -2117,69 +2420,490 @@ fn tc_output(args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn inspect_sqm_topology(cfg: &Config) -> Result<(), String> {
-    if !Path::new(&cfg.rx_bytes_path).is_file() {
-        return Err(format!("download counter is missing for {}", cfg.dl_if));
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CakeQdiscKind {
+    Cake,
+    CakeMq,
+}
+
+impl CakeQdiscKind {
+    fn as_tc_kind(self) -> &'static str {
+        match self {
+            Self::Cake => "cake",
+            Self::CakeMq => "cake_mq",
+        }
     }
-    if !Path::new(&cfg.tx_bytes_path).is_file() {
-        return Err(format!("upload counter is missing for {}", cfg.ul_if));
+}
+
+impl From<CakeQdiscKind> for operations::autotune_runtime::RuntimeQdiscKind {
+    fn from(value: CakeQdiscKind) -> Self {
+        match value {
+            CakeQdiscKind::Cake => Self::Cake,
+            CakeQdiscKind::CakeMq => Self::CakeMq,
+        }
+    }
+}
+
+#[cfg(feature = "calibration")]
+fn published_runtime_qdisc_kind(
+    shaping_enabled: bool,
+    observed: Option<CakeQdiscKind>,
+) -> Option<operations::autotune_runtime::RuntimeQdiscKind> {
+    if shaping_enabled {
+        observed.map(Into::into)
+    } else {
+        None
+    }
+}
+
+fn change_cake_rate(
+    interface: &str,
+    rate_kbps: u64,
+    qdisc_kind: CakeQdiscKind,
+) -> Result<(), String> {
+    if interface.is_empty() || rate_kbps < 100 || rate_kbps > autotune::MAX_RATE_KBPS {
+        return Err("requested CAKE rate is outside the supported range".to_string());
+    }
+    let tc = env::var("CAKE_AUTORATE_TC").unwrap_or_else(|_| "tc".to_string());
+    let output = Command::new(&tc)
+        .arg("qdisc")
+        .arg("change")
+        .arg("root")
+        .arg("dev")
+        .arg(interface)
+        .arg(qdisc_kind.as_tc_kind())
+        .arg("bandwidth")
+        .arg(format!("{rate_kbps}Kbit"))
+        .output()
+        .map_err(|error| format!("failed to execute {tc}: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if stderr.is_empty() {
+        format!(
+            "tc rate change for {interface} failed with {}",
+            output.status
+        )
+    } else {
+        stderr
+    })
+}
+
+fn delete_qdisc(interface: &str, location: &str) -> Result<(), String> {
+    if interface.is_empty() || !matches!(location, "root" | "ingress") {
+        return Err("requested qdisc deletion is invalid".to_string());
+    }
+    let tc = env::var("CAKE_AUTORATE_TC").unwrap_or_else(|_| "tc".to_string());
+    let output = Command::new(&tc)
+        .args(["qdisc", "del", "dev", interface, location])
+        .output()
+        .map_err(|error| format!("failed to execute {tc}: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if stderr.is_empty() {
+        format!(
+            "tc qdisc deletion on {interface} failed with {}",
+            output.status
+        )
+    } else {
+        stderr
+    })
+}
+
+#[cfg(test)]
+fn root_cake_bandwidth_kbps(output: &str) -> Result<u64, String> {
+    root_cake_qdisc(output).map(|(_, rate)| rate)
+}
+
+fn root_cake_qdisc(output: &str) -> Result<(CakeQdiscKind, u64), String> {
+    let mut qdiscs = Vec::new();
+    for line in output.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.first() != Some(&"qdisc") || !fields.contains(&"root") {
+            continue;
+        }
+        let kind = match fields.get(1).copied() {
+            Some("cake") => CakeQdiscKind::Cake,
+            Some("cake_mq") => CakeQdiscKind::CakeMq,
+            _ => continue,
+        };
+        let token = fields
+            .windows(2)
+            .find_map(|pair| (pair[0] == "bandwidth").then_some(pair[1]))
+            .ok_or_else(|| "root CAKE qdisc has no bandwidth".to_string())?;
+        qdiscs.push((kind, parse_tc_bandwidth_kbps(token)?));
+    }
+    match qdiscs.as_slice() {
+        [qdisc] => Ok(*qdisc),
+        [] => Err("root CAKE qdisc is missing".to_string()),
+        _ => Err("multiple root CAKE qdiscs are present".to_string()),
+    }
+}
+
+fn parse_tc_bandwidth_kbps(value: &str) -> Result<u64, String> {
+    let (number, multiplier, divisor) = if let Some(number) = value.strip_suffix("Kbit") {
+        (number, 1u64, 1u64)
+    } else if let Some(number) = value.strip_suffix("Mbit") {
+        (number, 1_000u64, 1u64)
+    } else if let Some(number) = value.strip_suffix("Gbit") {
+        (number, 1_000_000u64, 1u64)
+    } else if let Some(number) = value.strip_suffix("bit") {
+        (number, 1u64, 1_000u64)
+    } else {
+        return Err("CAKE bandwidth unit is unsupported".to_string());
+    };
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    if whole.is_empty()
+        || whole.bytes().any(|byte| !byte.is_ascii_digit())
+        || fraction.len() > 6
+        || fraction.bytes().any(|byte| !byte.is_ascii_digit())
+    {
+        return Err("CAKE bandwidth is not a bounded decimal".to_string());
+    }
+    let whole = whole
+        .parse::<u64>()
+        .map_err(|_| "CAKE bandwidth overflows".to_string())?;
+    let fractional_scale = 10u64.pow(fraction.len() as u32);
+    let fraction = if fraction.is_empty() {
+        0
+    } else {
+        fraction
+            .parse::<u64>()
+            .map_err(|_| "CAKE bandwidth fraction is invalid".to_string())?
+    };
+    let numerator = whole
+        .checked_mul(fractional_scale)
+        .and_then(|value| value.checked_add(fraction))
+        .and_then(|value| value.checked_mul(multiplier))
+        .ok_or_else(|| "CAKE bandwidth overflows".to_string())?;
+    let denominator = fractional_scale
+        .checked_mul(divisor)
+        .ok_or_else(|| "CAKE bandwidth divisor overflows".to_string())?;
+    let rounded = numerator
+        .checked_add(denominator / 2)
+        .ok_or_else(|| "CAKE bandwidth rounding overflows".to_string())?
+        / denominator;
+    if !(100..=autotune::MAX_RATE_KBPS).contains(&rounded) {
+        return Err("CAKE bandwidth is outside the supported range".to_string());
+    }
+    Ok(rounded)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SqmTopologyErrorKind {
+    Settling,
+    Unsafe,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SqmTopologyError {
+    pub kind: SqmTopologyErrorKind,
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl SqmTopologyError {
+    fn settling(code: &'static str, message: String) -> Self {
+        Self {
+            kind: SqmTopologyErrorKind::Settling,
+            code,
+            message,
+        }
     }
 
-    if cfg.download_shaping_enabled() {
-        let dl_qdisc = tc_output(&["qdisc", "show", "dev", &cfg.dl_if])?;
-        if !qdisc_output_has_cake(&dl_qdisc) {
-            return Err(format!("CAKE qdisc is missing on {}", cfg.dl_if));
+    fn unsafe_state(code: &'static str, message: String) -> Self {
+        Self {
+            kind: SqmTopologyErrorKind::Unsafe,
+            code,
+            message,
         }
-    } else if tc_output(&["qdisc", "show", "dev", &cfg.dl_if])
-        .map(|output| qdisc_output_has_cake(&output))
-        .unwrap_or(false)
-    {
-        return Err(format!(
-            "CAKE qdisc remains on disabled download interface {}",
-            cfg.dl_if
-        ));
     }
-    if cfg.upload_shaping_enabled() {
-        let ul_qdisc = tc_output(&["qdisc", "show", "dev", &cfg.ul_if])?;
-        if !qdisc_output_has_cake(&ul_qdisc) {
-            return Err(format!("CAKE qdisc is missing on {}", cfg.ul_if));
-        }
-    } else if tc_output(&["qdisc", "show", "dev", &cfg.ul_if])
-        .map(|output| qdisc_output_has_cake(&output))
-        .unwrap_or(false)
-    {
-        return Err(format!(
-            "CAKE qdisc remains on disabled upload interface {}",
-            cfg.ul_if
-        ));
+}
+
+impl std::fmt::Display for SqmTopologyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
     }
-    if cfg.download_shaping_enabled() && cfg.dl_if.starts_with("ifb") {
-        let ingress = tc_output(&["filter", "show", "dev", &cfg.sqm_interface, "ingress"])?;
-        if !ingress_output_targets_ifb(&ingress, &cfg.dl_if) {
-            return Err(format!(
-                "ingress redirect from {} to {} is missing",
-                cfg.sqm_interface, cfg.dl_if
-            ));
-        }
-    } else if !cfg.download_shaping_enabled() && cfg.dl_if.starts_with("ifb") {
-        let redirect_remains = tc_output(&["filter", "show", "dev", &cfg.sqm_interface, "ingress"])
-            .map(|output| ingress_output_targets_ifb(&output, &cfg.dl_if))
-            .unwrap_or(false);
-        if redirect_remains {
-            return Err(format!(
-                "ingress redirect from {} to disabled download interface {} remains",
-                cfg.sqm_interface, cfg.dl_if
-            ));
-        }
+}
+
+fn topology_tc_output(args: &[&str]) -> Result<String, SqmTopologyError> {
+    tc_output(args).map_err(|error| {
+        SqmTopologyError::unsafe_state(
+            "tc-query-failed",
+            format!("tc {} could not be inspected: {error}", args.join(" ")),
+        )
+    })
+}
+
+fn attest_cake_direction(
+    output: &str,
+    enabled: bool,
+    direction: &'static str,
+    interface: &str,
+) -> Result<(), SqmTopologyError> {
+    let count = root_cake_qdisc_count(output);
+    match (enabled, count) {
+        (true, 1) | (false, 0) => Ok(()),
+        (true, 0) => Err(SqmTopologyError::settling(
+            if direction == "download" {
+                "download-cake-missing"
+            } else {
+                "upload-cake-missing"
+            },
+            format!("CAKE qdisc is missing on {interface}"),
+        )),
+        (true, count) => Err(SqmTopologyError::unsafe_state(
+            if direction == "download" {
+                "download-cake-ambiguous"
+            } else {
+                "upload-cake-ambiguous"
+            },
+            format!("{count} root CAKE qdiscs were found on {interface}"),
+        )),
+        (false, _) => Err(SqmTopologyError::unsafe_state(
+            if direction == "download" {
+                "disabled-download-cake-remains"
+            } else {
+                "disabled-upload-cake-remains"
+            },
+            format!("CAKE qdisc remains on disabled {direction} interface {interface}"),
+        )),
+    }
+}
+
+fn attest_download_redirect(
+    output: &str,
+    enabled: bool,
+    source_interface: &str,
+    download_interface: &str,
+) -> Result<(), SqmTopologyError> {
+    if !download_interface.starts_with("ifb") {
+        return Ok(());
+    }
+    let targets = ingress_redirect_targets(output);
+    let expected = targets.iter().any(|target| target == download_interface);
+    if !enabled {
+        return if expected {
+            Err(SqmTopologyError::unsafe_state(
+                "disabled-download-redirect-remains",
+                format!(
+                    "ingress redirect from {source_interface} to disabled download interface {download_interface} remains"
+                ),
+            ))
+        } else {
+            Ok(())
+        };
+    }
+    if !expected {
+        let message =
+            format!("ingress redirect from {source_interface} to {download_interface} is missing");
+        return Err(if targets.is_empty() {
+            SqmTopologyError::settling("download-redirect-missing", message)
+        } else {
+            SqmTopologyError::unsafe_state("download-redirect-mismatch", message)
+        });
+    }
+    if targets.iter().any(|target| target != download_interface) {
+        return Err(SqmTopologyError::unsafe_state(
+            "download-redirect-ambiguous",
+            format!(
+                "ingress on {source_interface} redirects to multiple devices: {}",
+                targets.join(", ")
+            ),
+        ));
     }
     Ok(())
 }
 
-fn inspect_managed_sqm(cfg: &Config) -> Result<(), String> {
-    if !cfg.manage_sqm || !cfg.sqm_enabled {
-        return Ok(());
+fn attest_exclusive_sqm_ingress(
+    output: &str,
+    source_interface: &str,
+    download_interface: &str,
+) -> Result<(), SqmTopologyError> {
+    attest_download_redirect(output, true, source_interface, download_interface)?;
+
+    let mut base_headers = 0usize;
+    let mut table_headers = 0usize;
+    let mut rule_headers = 0usize;
+    let mut match_lines = 0usize;
+    let mut action_lines = 0usize;
+    let mut preference: Option<&str> = None;
+
+    for line in output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.first() == Some(&"filter") {
+            let field = |name: &str| {
+                fields
+                    .windows(2)
+                    .find_map(|pair| (pair[0] == name).then_some(pair[1]))
+            };
+            let valid_parent = field("parent") == Some("ffff:");
+            let valid_protocol = field("protocol") == Some("all");
+            let valid_kind = fields.contains(&"u32");
+            let valid_chain = field("chain").is_none_or(|value| value == "0");
+            let Some(pref) = field("pref") else {
+                return Err(SqmTopologyError::unsafe_state(
+                    "download-ingress-not-exclusive",
+                    format!("ingress filter on {source_interface} has no preference"),
+                ));
+            };
+            if !valid_parent
+                || !valid_protocol
+                || !valid_kind
+                || !valid_chain
+                || preference.is_some_and(|known| known != pref)
+            {
+                return Err(SqmTopologyError::unsafe_state(
+                    "download-ingress-not-exclusive",
+                    format!(
+                        "ingress on {source_interface} contains a filter outside the standard SQM redirect"
+                    ),
+                ));
+            }
+            preference = Some(pref);
+            match field("fh") {
+                None => base_headers += 1,
+                Some(handle) if handle.matches(':').count() >= 2 && fields.contains(&"order") => {
+                    rule_headers += 1;
+                }
+                Some(_) if fields.windows(2).any(|pair| pair == ["ht", "divisor"]) => {
+                    table_headers += 1;
+                }
+                Some(_) => {
+                    return Err(SqmTopologyError::unsafe_state(
+                        "download-ingress-not-exclusive",
+                        format!(
+                            "ingress on {source_interface} contains an unrecognized u32 filter"
+                        ),
+                    ));
+                }
+            }
+        } else if fields.first() == Some(&"match") {
+            if fields.get(1) != Some(&"00000000/00000000") || fields.get(2) != Some(&"at") {
+                return Err(SqmTopologyError::unsafe_state(
+                    "download-ingress-not-exclusive",
+                    format!("ingress on {source_interface} contains an extra match"),
+                ));
+            }
+            match_lines += 1;
+        } else if fields.first() == Some(&"action") {
+            if !fields
+                .iter()
+                .any(|field| field.eq_ignore_ascii_case("mirred"))
+            {
+                return Err(SqmTopologyError::unsafe_state(
+                    "download-ingress-not-exclusive",
+                    format!("ingress on {source_interface} contains a non-SQM action"),
+                ));
+            }
+            action_lines += 1;
+        } else if fields.first() != Some(&"index") {
+            return Err(SqmTopologyError::unsafe_state(
+                "download-ingress-not-exclusive",
+                format!("ingress on {source_interface} contains unrecognized filter state"),
+            ));
+        }
     }
-    inspect_sqm_topology(cfg)
+
+    if base_headers != 1
+        || table_headers != 1
+        || rule_headers != 1
+        || match_lines != 1
+        || action_lines != 1
+    {
+        return Err(SqmTopologyError::unsafe_state(
+            "download-ingress-not-exclusive",
+            format!(
+                "ingress on {source_interface} is not exclusively the single standard SQM redirect to {download_interface}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn inspect_sqm_topology_for(
+    cfg: &Config,
+    download_enabled: bool,
+    upload_enabled: bool,
+) -> Result<(), SqmTopologyError> {
+    if !Path::new(&cfg.rx_bytes_path).is_file() {
+        return Err(SqmTopologyError::settling(
+            "download-counter-missing",
+            format!("download counter is missing for {}", cfg.dl_if),
+        ));
+    }
+    if !Path::new(&cfg.tx_bytes_path).is_file() {
+        return Err(SqmTopologyError::settling(
+            "upload-counter-missing",
+            format!("upload counter is missing for {}", cfg.ul_if),
+        ));
+    }
+
+    let dl_output = topology_direction_qdisc_output(&cfg.dl_if, download_enabled, "download")?;
+    attest_cake_direction(&dl_output, download_enabled, "download", &cfg.dl_if)?;
+    let ul_output = topology_direction_qdisc_output(&cfg.ul_if, upload_enabled, "upload")?;
+    attest_cake_direction(&ul_output, upload_enabled, "upload", &cfg.ul_if)?;
+
+    if cfg.dl_if.starts_with("ifb") {
+        let ingress =
+            topology_tc_output(&["filter", "show", "dev", &cfg.sqm_interface, "ingress"])?;
+        attest_download_redirect(&ingress, download_enabled, &cfg.sqm_interface, &cfg.dl_if)?;
+    }
+    Ok(())
+}
+
+fn topology_direction_qdisc_output(
+    interface: &str,
+    enabled: bool,
+    direction: &'static str,
+) -> Result<String, SqmTopologyError> {
+    let interface_path = sqm_sys_class_net().join(interface);
+    if !interface_path.exists() {
+        return if enabled {
+            Err(SqmTopologyError::settling(
+                if direction == "download" {
+                    "download-device-missing"
+                } else {
+                    "upload-device-missing"
+                },
+                format!("{direction} shaping device {interface} is missing"),
+            ))
+        } else {
+            // A direction which is deliberately unshaped need not retain its
+            // SQM-created IFB.  The source-interface ingress state is still
+            // inspected below, so a stale redirect cannot be hidden here.
+            Ok(String::new())
+        };
+    }
+
+    match topology_tc_output(&["qdisc", "show", "dev", interface]) {
+        Ok(output) => Ok(output),
+        Err(_) if !interface_path.exists() && !enabled => Ok(String::new()),
+        Err(_) if !interface_path.exists() => Err(SqmTopologyError::settling(
+            if direction == "download" {
+                "download-device-missing"
+            } else {
+                "upload-device-missing"
+            },
+            format!("{direction} shaping device {interface} disappeared during inspection"),
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn inspect_sqm_topology(cfg: &Config) -> Result<(), SqmTopologyError> {
+    inspect_sqm_topology_for(
+        cfg,
+        cfg.download_shaping_enabled(),
+        cfg.upload_shaping_enabled(),
+    )
 }
 
 fn managed_sqm_target_ready(cfg: &Config) -> bool {
@@ -2188,6 +2912,58 @@ fn managed_sqm_target_ready(cfg: &Config) -> bool {
         .unwrap_or_else(|| PathBuf::from("/sys/class/net"));
 
     sys_class_net.join(&cfg.sqm_interface).exists() || Path::new(&cfg.tx_bytes_path).is_file()
+}
+
+fn sqm_sys_class_net() -> PathBuf {
+    env::var_os("CAKE_AUTORATE_SYS_CLASS_NET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/sys/class/net"))
+}
+
+fn sqm_interface_ifindex(interface: &str) -> Option<u64> {
+    fs::read_to_string(sqm_sys_class_net().join(interface).join("ifindex"))
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+fn sqm_topology_query_signature(args: &[&str]) -> u64 {
+    match topology_tc_output(args) {
+        Ok(output) => stable_hash(&format!("ok\n{output}")),
+        Err(error) => stable_hash(&format!("error\n{}\n{}", error.code, error.message)),
+    }
+}
+
+fn sqm_topology_generation(
+    cfg: &Config,
+    topology: &Result<(), SqmTopologyError>,
+) -> operations::sqm_recovery::SqmTopologyGeneration {
+    use operations::sqm_recovery::{SqmObservedTopologyState, SqmTopologyGeneration};
+
+    let observed_topology = match topology {
+        Ok(()) => SqmObservedTopologyState::Healthy,
+        Err(error) if error.kind == SqmTopologyErrorKind::Settling => {
+            SqmObservedTopologyState::Settling(error.code.to_string())
+        }
+        Err(error) => SqmObservedTopologyState::Unsafe(error.code.to_string()),
+    };
+    SqmTopologyGeneration {
+        target_present: managed_sqm_target_ready(cfg),
+        target_ifindex: sqm_interface_ifindex(&cfg.sqm_interface),
+        upload_ifindex: sqm_interface_ifindex(&cfg.ul_if),
+        download_ifindex: sqm_interface_ifindex(&cfg.dl_if),
+        download_counter_present: Path::new(&cfg.rx_bytes_path).is_file(),
+        upload_counter_present: Path::new(&cfg.tx_bytes_path).is_file(),
+        download_qdisc_signature: sqm_topology_query_signature(&[
+            "qdisc", "show", "dev", &cfg.dl_if,
+        ]),
+        upload_qdisc_signature: sqm_topology_query_signature(&["qdisc", "show", "dev", &cfg.ul_if]),
+        ingress_signature: cfg.dl_if.starts_with("ifb").then(|| {
+            sqm_topology_query_signature(&["filter", "show", "dev", &cfg.sqm_interface, "ingress"])
+        }),
+        topology: observed_topology,
+    }
 }
 
 #[derive(Debug)]
@@ -2284,31 +3060,49 @@ fn run_sqm_helper(cfg: &Config, operation: Option<&str>) -> Result<(), SqmRecove
 
 fn attest_managed_sqm(cfg: &Config) -> Result<(), SqmRecoveryError> {
     run_sqm_helper(cfg, Some("check"))?;
-    inspect_sqm_topology(cfg).map_err(SqmRecoveryError::Failed)
+    inspect_sqm_topology(cfg).map_err(|error| SqmRecoveryError::Failed(error.to_string()))
 }
 
 fn recover_managed_sqm(cfg: &Config) -> Result<(), SqmRecoveryError> {
     run_sqm_helper(cfg, None)?;
-    inspect_sqm_topology(cfg).map_err(SqmRecoveryError::Failed)
+    inspect_sqm_topology(cfg).map_err(|error| SqmRecoveryError::Failed(error.to_string()))
 }
 
 #[derive(Clone, Debug)]
 struct TransportProbeRequest {
+    #[cfg(feature = "calibration")]
+    probe_id: u64,
     control_valid: bool,
     dl_loaded: bool,
     ul_loaded: bool,
     rating_phase: RatingPhase,
+    #[cfg(feature = "calibration")]
+    autotune_capture: Option<operations::full_autotune::AutotuneCaptureRequest>,
 }
 
 #[derive(Clone, Debug)]
 struct TransportProbeResult {
+    #[cfg(feature = "calibration")]
+    probe_id: u64,
+    #[cfg(feature = "calibration")]
+    started_at: Instant,
+    #[cfg(feature = "calibration")]
+    completed_at: Instant,
     control_valid: bool,
+    #[cfg(feature = "calibration")]
+    capture_interval_valid: Option<bool>,
     endpoint: String,
     dl_loaded: bool,
     ul_loaded: bool,
     rating_phase: RatingPhase,
+    #[cfg(feature = "calibration")]
+    autotune_capture: Option<operations::full_autotune::AutotuneCaptureRequest>,
     latency_ms: Option<f64>,
     error: Option<String>,
+    #[cfg(feature = "calibration")]
+    failure_kind: Option<transport_probe::TransportProbeFailureKind>,
+    #[cfg(feature = "calibration")]
+    failure_deadline_us: Option<u64>,
     route_identity: Option<String>,
     backend: String,
     trusted: bool,
@@ -2318,6 +3112,590 @@ struct TransportProbeResult {
     connection_reused: bool,
 }
 
+#[cfg(feature = "calibration")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AutotuneTransportCaptureKey {
+    capture_id: String,
+    request_sequence: u32,
+    route_identity: String,
+}
+
+#[cfg(feature = "calibration")]
+impl AutotuneTransportCaptureKey {
+    fn new(
+        request: &operations::full_autotune::AutotuneCaptureRequest,
+        route_identity: &str,
+    ) -> Self {
+        Self {
+            capture_id: request.capture_id.clone(),
+            request_sequence: request.sequence,
+            route_identity: route_identity.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "calibration")]
+#[derive(Clone, Copy, Debug)]
+struct AutotuneTransportPhaseObservation {
+    at: Instant,
+    phase: Option<(bool, bool)>,
+}
+
+#[cfg(feature = "calibration")]
+#[derive(Clone, Copy, Debug)]
+struct AutotuneTransportDeltaObservation {
+    start: Instant,
+    end: Instant,
+    phase: Option<(bool, bool)>,
+}
+
+#[cfg(feature = "calibration")]
+#[derive(Clone, Debug)]
+struct AutotuneTransportFlight {
+    probe_id: u64,
+    key: AutotuneTransportCaptureKey,
+    expected_phase: (bool, bool),
+    control_valid: bool,
+    submitted_at: Instant,
+    physical_delta_required: bool,
+}
+
+#[cfg(feature = "calibration")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AutotuneTransportCoverage {
+    total: Duration,
+    matching: Duration,
+    longest_mismatch: Duration,
+}
+
+#[cfg(feature = "calibration")]
+#[derive(Clone, Copy, Debug)]
+struct AutotuneTransportAttestation {
+    valid: bool,
+    reason: &'static str,
+    coverage: Option<AutotuneTransportCoverage>,
+}
+
+#[cfg(feature = "calibration")]
+#[derive(Clone, Copy, Debug)]
+enum AutotuneTransportSettlement {
+    Pending(&'static str),
+    Final(AutotuneTransportAttestation),
+}
+
+#[cfg(feature = "calibration")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AutotuneTransportReadiness {
+    phase: (bool, bool),
+    ready: bool,
+    reason: &'static str,
+}
+
+#[cfg(feature = "calibration")]
+#[derive(Clone, Debug, Default)]
+struct AutotuneTransportControl {
+    key: Option<AutotuneTransportCaptureKey>,
+    observations: VecDeque<AutotuneTransportPhaseObservation>,
+    physical_deltas: VecDeque<AutotuneTransportDeltaObservation>,
+    candidate_phase: (bool, bool),
+    candidate_since: Option<Instant>,
+    last_candidate_seen: Option<Instant>,
+}
+
+#[cfg(feature = "calibration")]
+impl AutotuneTransportControl {
+    fn reset(&mut self) {
+        self.key = None;
+        self.observations.clear();
+        self.physical_deltas.clear();
+        self.candidate_phase = (false, false);
+        self.candidate_since = None;
+        self.last_candidate_seen = None;
+    }
+
+    fn observe_physical_delta(
+        &mut self,
+        key: &AutotuneTransportCaptureKey,
+        delta: operations::autotune_counter::AutotuneCounterDelta,
+        phase: Option<(bool, bool)>,
+        history_window: Duration,
+    ) -> Result<(), String> {
+        if self.key.as_ref() != Some(key) {
+            return Err("native Auto-Tune transport counter identity changed".to_string());
+        }
+        if delta.observed_end <= delta.observed_start {
+            return Err("native Auto-Tune transport counter delta is not causal".to_string());
+        }
+        if let Some(previous) = self.physical_deltas.back() {
+            if delta.observed_start < previous.end {
+                return Err(
+                    "native Auto-Tune transport counter deltas overlap or move backwards"
+                        .to_string(),
+                );
+            }
+        }
+        self.physical_deltas
+            .push_back(AutotuneTransportDeltaObservation {
+                start: delta.observed_start,
+                end: delta.observed_end,
+                phase,
+            });
+        if let Some(cutoff) = delta.observed_end.checked_sub(history_window) {
+            while self
+                .physical_deltas
+                .front()
+                .is_some_and(|observation| observation.end <= cutoff)
+            {
+                self.physical_deltas.pop_front();
+            }
+        }
+        Ok(())
+    }
+
+    fn observe(
+        &mut self,
+        key: AutotuneTransportCaptureKey,
+        phase: Option<(bool, bool)>,
+        expected: (bool, bool),
+        now: Instant,
+        dropout: Duration,
+        history_window: Duration,
+    ) {
+        if self.key.as_ref() != Some(&key) {
+            self.reset();
+            self.key = Some(key.clone());
+        }
+
+        if expected != (false, false) && phase == Some(expected) {
+            if self.candidate_phase != expected {
+                self.candidate_phase = expected;
+                self.candidate_since = Some(now);
+            }
+            self.last_candidate_seen = Some(now);
+        } else {
+            let dropout_exceeded = self
+                .last_candidate_seen
+                .and_then(|seen| now.checked_duration_since(seen))
+                .map_or(true, |elapsed| elapsed > dropout);
+            if dropout_exceeded {
+                self.candidate_phase = (false, false);
+                self.candidate_since = None;
+                self.last_candidate_seen = None;
+            }
+        }
+
+        if let Some(last) = self.observations.back_mut() {
+            if last.at == now {
+                last.phase = phase;
+            } else if last.at < now {
+                self.observations
+                    .push_back(AutotuneTransportPhaseObservation { at: now, phase });
+            } else {
+                self.reset();
+                self.key = Some(key);
+                self.observations
+                    .push_back(AutotuneTransportPhaseObservation { at: now, phase });
+            }
+        } else {
+            self.observations
+                .push_back(AutotuneTransportPhaseObservation { at: now, phase });
+        }
+
+        if let Some(cutoff) = now.checked_sub(history_window) {
+            while self.observations.len() > 1
+                && self
+                    .observations
+                    .get(1)
+                    .is_some_and(|next| next.at <= cutoff)
+            {
+                self.observations.pop_front();
+            }
+        }
+    }
+
+    fn expected_phase(
+        request: &operations::full_autotune::AutotuneCaptureRequest,
+    ) -> Result<(bool, bool), String> {
+        use operations::full_autotune::AutotuneCapturePhase;
+        use operations::protocol::SpeedtestDirection;
+
+        match (request.phase, request.direction) {
+            (AutotuneCapturePhase::IdleBaseline, None) => Ok((false, false)),
+            (AutotuneCapturePhase::LoadedMeasurement, Some(SpeedtestDirection::Download)) => {
+                Ok((true, false))
+            }
+            (AutotuneCapturePhase::LoadedMeasurement, Some(SpeedtestDirection::Upload)) => {
+                Ok((false, true))
+            }
+            (AutotuneCapturePhase::LoadedMeasurement, Some(SpeedtestDirection::Both)) => {
+                Ok((true, true))
+            }
+            _ => Err("native Auto-Tune transport capture direction is invalid".to_string()),
+        }
+    }
+
+    fn ready_phase(
+        &self,
+        request: &operations::full_autotune::AutotuneCaptureRequest,
+        key: &AutotuneTransportCaptureKey,
+        now: Instant,
+        hold: Duration,
+        dropout: Duration,
+    ) -> Result<((bool, bool), bool), String> {
+        let readiness = self.ready_phase_diagnostic(request, key, now, hold, dropout)?;
+        Ok((readiness.phase, readiness.ready))
+    }
+
+    fn ready_phase_diagnostic(
+        &self,
+        request: &operations::full_autotune::AutotuneCaptureRequest,
+        key: &AutotuneTransportCaptureKey,
+        now: Instant,
+        hold: Duration,
+        dropout: Duration,
+    ) -> Result<AutotuneTransportReadiness, String> {
+        let expected = Self::expected_phase(request)?;
+        let blocked = |reason| AutotuneTransportReadiness {
+            phase: expected,
+            ready: false,
+            reason,
+        };
+        if self.key.as_ref() != Some(key) {
+            return Ok(blocked("capture-key-mismatch"));
+        }
+        let Some(current) = self.observations.back() else {
+            return Ok(blocked("phase-observation-missing"));
+        };
+        let Some(observation_age) = now.checked_duration_since(current.at) else {
+            return Ok(blocked("phase-observation-from-future"));
+        };
+        if observation_age > dropout {
+            return Ok(blocked("phase-observation-stale"));
+        };
+        if expected == (false, false) {
+            return Ok(if current.phase == Some(expected) {
+                AutotuneTransportReadiness {
+                    phase: expected,
+                    ready: true,
+                    reason: "idle-phase-ready",
+                }
+            } else {
+                blocked("idle-phase-mismatch")
+            });
+        }
+        if let Some(delta) = self.physical_deltas.back() {
+            let Some(delta_age) = now.checked_duration_since(delta.end) else {
+                return Ok(blocked("loaded-physical-delta-from-future"));
+            };
+            if delta_age <= dropout && delta.phase == Some(expected) {
+                // This only authorizes a speculative probe.  Loaded evidence
+                // is admitted later from the complete non-overlapping physical
+                // counter-delta chain which brackets the probe flight.  The
+                // rolling window is never used as post-flight proof.
+                return Ok(AutotuneTransportReadiness {
+                    phase: expected,
+                    ready: true,
+                    reason: "loaded-physical-delta-ready",
+                });
+            }
+        }
+        if current.phase != Some(expected) || self.candidate_phase != expected {
+            return Ok(blocked("loaded-phase-mismatch"));
+        }
+        let Some(candidate_since) = self.candidate_since else {
+            return Ok(blocked("loaded-phase-candidate-missing"));
+        };
+        let Some(window_start) = now.checked_sub(hold) else {
+            return Ok(blocked("loaded-phase-hold-clock-invalid"));
+        };
+        if candidate_since > window_start {
+            return Ok(blocked("loaded-phase-hold-pending"));
+        }
+        let Some(coverage) = self.coverage(window_start, now, expected) else {
+            return Ok(blocked("loaded-phase-coverage-missing"));
+        };
+        if coverage.longest_mismatch > dropout {
+            return Ok(blocked("loaded-phase-dropout-exceeded"));
+        }
+        if !loaded_coverage_sufficient(coverage) {
+            return Ok(blocked("loaded-phase-coverage-insufficient"));
+        }
+        Ok(AutotuneTransportReadiness {
+            phase: expected,
+            ready: true,
+            reason: "loaded-phase-ready",
+        })
+    }
+
+    #[cfg(test)]
+    fn attest(
+        &self,
+        flight: &AutotuneTransportFlight,
+        result: &TransportProbeResult,
+        dropout: Duration,
+    ) -> bool {
+        self.attest_diagnostic(flight, result, dropout).valid
+    }
+
+    fn attest_diagnostic(
+        &self,
+        flight: &AutotuneTransportFlight,
+        result: &TransportProbeResult,
+        dropout: Duration,
+    ) -> AutotuneTransportAttestation {
+        let invalid = |reason| AutotuneTransportAttestation {
+            valid: false,
+            reason,
+            coverage: None,
+        };
+        if !flight.control_valid {
+            return invalid("control-invalid");
+        }
+        if flight.probe_id != result.probe_id {
+            return invalid("probe-identity-mismatch");
+        }
+        if self.key.as_ref() != Some(&flight.key) {
+            return invalid("capture-identity-changed");
+        }
+        if result.started_at < flight.submitted_at {
+            return invalid("noncausal-start");
+        }
+        if result.completed_at <= result.started_at {
+            return invalid("invalid-flight-interval");
+        }
+        let Some(coverage) = self.coverage(
+            result.started_at,
+            result.completed_at,
+            flight.expected_phase,
+        ) else {
+            return invalid("missing-flight-history");
+        };
+        let (valid, reason) = if flight.expected_phase == (false, false) {
+            if coverage.matching == coverage.total {
+                (true, "idle-flight-valid")
+            } else {
+                (false, "idle-flight-contaminated")
+            }
+        } else if coverage.longest_mismatch > dropout {
+            (false, "flight-dropout-exceeded")
+        } else if !loaded_coverage_sufficient(coverage) {
+            (false, "flight-coverage-insufficient")
+        } else {
+            (true, "loaded-flight-valid")
+        };
+        AutotuneTransportAttestation {
+            valid,
+            reason,
+            coverage: Some(coverage),
+        }
+    }
+
+    fn settle_diagnostic(
+        &self,
+        flight: &AutotuneTransportFlight,
+        result: &TransportProbeResult,
+        dropout: Duration,
+    ) -> AutotuneTransportSettlement {
+        if !flight.physical_delta_required {
+            return AutotuneTransportSettlement::Final(
+                self.attest_diagnostic(flight, result, dropout),
+            );
+        }
+        self.settle_physical_interval_diagnostic(
+            flight,
+            result.probe_id,
+            result.started_at,
+            result.completed_at,
+            dropout,
+        )
+    }
+
+    fn settle_physical_interval_diagnostic(
+        &self,
+        flight: &AutotuneTransportFlight,
+        probe_id: u64,
+        started_at: Instant,
+        completed_at: Instant,
+        dropout: Duration,
+    ) -> AutotuneTransportSettlement {
+        let invalid = |reason| {
+            AutotuneTransportSettlement::Final(AutotuneTransportAttestation {
+                valid: false,
+                reason,
+                coverage: None,
+            })
+        };
+        if !flight.control_valid {
+            return invalid("control-invalid");
+        }
+        if flight.probe_id != probe_id {
+            return invalid("probe-identity-mismatch");
+        }
+        if self.key.as_ref() != Some(&flight.key) {
+            return invalid("capture-identity-changed");
+        }
+        if started_at < flight.submitted_at {
+            return invalid("noncausal-start");
+        }
+        if completed_at <= started_at {
+            return invalid("invalid-flight-interval");
+        }
+        let Some(horizon) = self.physical_deltas.back().map(|delta| delta.end) else {
+            return AutotuneTransportSettlement::Pending("physical-delta-missing");
+        };
+        if horizon < completed_at {
+            return AutotuneTransportSettlement::Pending("physical-bracket-pending");
+        }
+        let Some(coverage) =
+            self.physical_coverage(started_at, completed_at, flight.expected_phase)
+        else {
+            return invalid("physical-flight-history-missing");
+        };
+        let (valid, reason) = if coverage.longest_mismatch > dropout {
+            (false, "physical-flight-dropout-exceeded")
+        } else if !loaded_coverage_sufficient(coverage) {
+            (false, "physical-flight-coverage-insufficient")
+        } else {
+            (true, "physical-loaded-flight-valid")
+        };
+        AutotuneTransportSettlement::Final(AutotuneTransportAttestation {
+            valid,
+            reason,
+            coverage: Some(coverage),
+        })
+    }
+
+    fn physical_coverage(
+        &self,
+        start: Instant,
+        end: Instant,
+        expected: (bool, bool),
+    ) -> Option<AutotuneTransportCoverage> {
+        if end <= start || self.physical_deltas.is_empty() {
+            return None;
+        }
+        let mut cursor = start;
+        let mut coverage = AutotuneTransportCoverage::default();
+        let mut mismatch = Duration::ZERO;
+        for observation in &self.physical_deltas {
+            if observation.end <= cursor {
+                continue;
+            }
+            if observation.start >= end {
+                break;
+            }
+            let segment_start = observation.start.max(start);
+            if segment_start > cursor {
+                accumulate_autotune_transport_coverage(
+                    &mut coverage,
+                    &mut mismatch,
+                    None,
+                    expected,
+                    segment_start.duration_since(cursor),
+                );
+                cursor = segment_start;
+            }
+            let segment_end = observation.end.min(end);
+            if segment_end > cursor {
+                accumulate_autotune_transport_coverage(
+                    &mut coverage,
+                    &mut mismatch,
+                    observation.phase,
+                    expected,
+                    segment_end.duration_since(cursor),
+                );
+                cursor = segment_end;
+            }
+            if cursor >= end {
+                break;
+            }
+        }
+        if cursor < end {
+            accumulate_autotune_transport_coverage(
+                &mut coverage,
+                &mut mismatch,
+                None,
+                expected,
+                end.duration_since(cursor),
+            );
+        }
+        Some(coverage)
+    }
+
+    fn coverage(
+        &self,
+        start: Instant,
+        end: Instant,
+        expected: (bool, bool),
+    ) -> Option<AutotuneTransportCoverage> {
+        if end <= start {
+            return None;
+        }
+        let mut active = None;
+        let mut future = Vec::new();
+        for observation in &self.observations {
+            if observation.at <= start {
+                active = Some(observation.phase);
+            } else if observation.at < end {
+                future.push(*observation);
+            } else {
+                break;
+            }
+        }
+        let mut phase = active?;
+        let mut cursor = start;
+        let mut coverage = AutotuneTransportCoverage::default();
+        let mut mismatch = Duration::ZERO;
+        for observation in future {
+            accumulate_autotune_transport_coverage(
+                &mut coverage,
+                &mut mismatch,
+                phase,
+                expected,
+                observation.at.duration_since(cursor),
+            );
+            cursor = observation.at;
+            phase = observation.phase;
+        }
+        accumulate_autotune_transport_coverage(
+            &mut coverage,
+            &mut mismatch,
+            phase,
+            expected,
+            end.duration_since(cursor),
+        );
+        Some(coverage)
+    }
+}
+
+#[cfg(feature = "calibration")]
+fn accumulate_autotune_transport_coverage(
+    coverage: &mut AutotuneTransportCoverage,
+    mismatch: &mut Duration,
+    phase: Option<(bool, bool)>,
+    expected: (bool, bool),
+    elapsed: Duration,
+) {
+    coverage.total = coverage.total.saturating_add(elapsed);
+    if phase == Some(expected) {
+        coverage.matching = coverage.matching.saturating_add(elapsed);
+        *mismatch = Duration::ZERO;
+    } else {
+        *mismatch = mismatch.saturating_add(elapsed);
+        coverage.longest_mismatch = coverage.longest_mismatch.max(*mismatch);
+    }
+}
+
+#[cfg(feature = "calibration")]
+fn loaded_coverage_sufficient(coverage: AutotuneTransportCoverage) -> bool {
+    coverage.total > Duration::ZERO
+        && coverage.matching.as_nanos().saturating_mul(100)
+            >= coverage
+                .total
+                .as_nanos()
+                .saturating_mul(AUTOTUNE_TRANSPORT_MIN_LOADED_COVERAGE_PERCENT)
+}
+
 struct TransportProbeRuntime {
     requests: SyncSender<TransportProbeRequest>,
     results: Receiver<TransportProbeResult>,
@@ -2325,6 +3703,16 @@ struct TransportProbeRuntime {
     last_started: Instant,
     load_candidate: (bool, bool),
     load_candidate_since: Instant,
+    #[cfg(feature = "calibration")]
+    next_probe_id: u64,
+    #[cfg(feature = "calibration")]
+    capture_control: AutotuneTransportControl,
+    #[cfg(feature = "calibration")]
+    in_flight_capture: Option<AutotuneTransportFlight>,
+    #[cfg(feature = "calibration")]
+    pending_capture_result: Option<TransportProbeResult>,
+    #[cfg(feature = "calibration")]
+    pending_capture_wait_reason: Option<&'static str>,
 }
 
 #[derive(Clone, Debug)]
@@ -2346,6 +3734,43 @@ fn transport_result_matches_route(
     current_identity: Option<&str>,
 ) -> bool {
     result_identity.is_some() && result_identity == current_identity
+}
+
+#[cfg(feature = "calibration")]
+fn censored_autotune_transport_observation(
+    result: &TransportProbeResult,
+    active_capture: Option<&operations::full_autotune::AutotuneCaptureRequest>,
+    current_route_identity: Option<&str>,
+    baseline_ms: Option<f64>,
+) -> Result<Option<operations::autotune_capture::AutotuneCaptureObservationKind>, String> {
+    if result.failure_kind != Some(transport_probe::TransportProbeFailureKind::DeadlineExceeded) {
+        return Ok(None);
+    }
+    if result.error.is_none() || result.latency_ms.is_some() || result.failure_deadline_us.is_none()
+    {
+        return Err("typed transport deadline result is internally inconsistent".to_string());
+    }
+    let Some(active_capture) = active_capture else {
+        return Ok(None);
+    };
+    if result.autotune_capture.as_ref() != Some(active_capture)
+        || result.capture_interval_valid != Some(true)
+        || !result.control_valid
+        || !transport_result_matches_route(result.route_identity.as_deref(), current_route_identity)
+        || !result.trusted
+        || result.backend != "websocket"
+    {
+        return Ok(None);
+    }
+    operations::autotune_capture::transport_deadline_observation_kind(
+        active_capture,
+        result
+            .failure_deadline_us
+            .expect("typed deadline duration checked above"),
+        baseline_ms,
+        result.dl_loaded,
+        result.ul_loaded,
+    )
 }
 
 fn uplink_error_code(state: UplinkState, reason: &str) -> Option<&'static str> {
@@ -2394,8 +3819,13 @@ impl TransportProbeRuntime {
             let mut engine: Option<(String, TransportProbeEngine)> = None;
             let mut route_inspector = RouteInspector::new(route_spec.clone());
             while let Ok(request) = request_rx.recv() {
+                #[cfg(feature = "calibration")]
+                let started_at = Instant::now();
                 let before = route_inspector.inspect();
-                let measurement = match before.as_ref() {
+                let measurement: Result<
+                    transport_probe::TransportProbeSample,
+                    transport_probe::TransportProbeFailure,
+                > = match before.as_ref() {
                     Ok(snapshot) if snapshot.online => {
                         let identity = snapshot.stable_key();
                         if backend == TransportProbeBackend::LegacyHttp {
@@ -2411,10 +3841,15 @@ impl TransportProbeRuntime {
                                     trusted: false,
                                     connection_reused: false,
                                 }),
-                                Err(error) => Err(error),
+                                Err(error) => {
+                                    Err(transport_probe::TransportProbeFailure::other(error))
+                                }
                             }
                         } else {
-                            (|| -> Result<transport_probe::TransportProbeSample, String> {
+                            (|| -> Result<
+                                transport_probe::TransportProbeSample,
+                                transport_probe::TransportProbeFailure,
+                            > {
                                 let replace = engine
                                     .as_ref()
                                     .map(|(key, _)| key != &identity)
@@ -2432,23 +3867,32 @@ impl TransportProbeRuntime {
                                             endpoint.clone(),
                                             binding,
                                             Duration::from_secs(timeout_s),
+                                        )
+                                        .map_err(
+                                            transport_probe::TransportProbeFailure::other,
                                         )?,
                                     ));
                                 }
                                 engine
                                     .as_mut()
-                                    .ok_or_else(|| "transport engine is unavailable".to_string())?
+                                    .ok_or_else(|| {
+                                        transport_probe::TransportProbeFailure::other(
+                                            "transport engine is unavailable".to_string(),
+                                        )
+                                    })?
                                     .1
-                                    .probe()
+                                    .probe_classified()
                             })()
                         }
                     }
-                    Ok(snapshot) => Err(if snapshot.reason.is_empty() {
-                        "transport route is offline".to_string()
-                    } else {
-                        snapshot.reason.clone()
-                    }),
-                    Err(error) => Err(error.clone()),
+                    Ok(snapshot) => Err(transport_probe::TransportProbeFailure::other(
+                        if snapshot.reason.is_empty() {
+                            "transport route is offline".to_string()
+                        } else {
+                            snapshot.reason.clone()
+                        },
+                    )),
+                    Err(error) => Err(transport_probe::TransportProbeFailure::other(error.clone())),
                 };
                 let after = route_inspector.inspect();
                 let stable_identity = match (&before, &after) {
@@ -2464,15 +3908,19 @@ impl TransportProbeRuntime {
                 let (
                     latency_ms,
                     error,
+                    _failure_kind,
+                    _failure_deadline_us,
                     backend_name,
                     trusted,
                     raw_samples_ms,
                     discarded_samples,
                     server_processing_ms,
                     connection_reused,
-                ) = match measurement {
-                    Ok(sample) if stable_identity.is_some() => (
+                ) = match (measurement, stable_identity.is_some()) {
+                    (Ok(sample), true) => (
                         Some(sample.rtt_ms),
+                        None,
+                        None,
                         None,
                         sample.backend.as_str().to_string(),
                         sample.trusted,
@@ -2481,9 +3929,11 @@ impl TransportProbeRuntime {
                         sample.server_processing_ms,
                         sample.connection_reused,
                     ),
-                    Ok(_) => (
+                    (Ok(_), false) | (Err(_), false) => (
                         None,
                         Some("route changed during native transport probe".to_string()),
+                        Some(transport_probe::TransportProbeFailureKind::Other),
+                        None,
                         backend.as_str().to_string(),
                         false,
                         Vec::new(),
@@ -2491,26 +3941,44 @@ impl TransportProbeRuntime {
                         0.0,
                         false,
                     ),
-                    Err(error) => (
+                    (Err(failure), true) => (
                         None,
-                        Some(error),
+                        Some(failure.message().to_string()),
+                        Some(failure.kind()),
+                        failure.deadline_us(),
                         backend.as_str().to_string(),
-                        false,
+                        backend.trusted(),
                         Vec::new(),
                         0,
                         0.0,
                         false,
                     ),
                 };
+                #[cfg(feature = "calibration")]
+                let completed_at = Instant::now();
                 if result_tx
                     .send(TransportProbeResult {
+                        #[cfg(feature = "calibration")]
+                        probe_id: request.probe_id,
+                        #[cfg(feature = "calibration")]
+                        started_at,
+                        #[cfg(feature = "calibration")]
+                        completed_at,
                         control_valid: request.control_valid,
+                        #[cfg(feature = "calibration")]
+                        capture_interval_valid: None,
                         endpoint: endpoint.clone(),
                         dl_loaded: request.dl_loaded,
                         ul_loaded: request.ul_loaded,
                         rating_phase: request.rating_phase,
+                        #[cfg(feature = "calibration")]
+                        autotune_capture: request.autotune_capture,
                         latency_ms,
                         error,
+                        #[cfg(feature = "calibration")]
+                        failure_kind: _failure_kind,
+                        #[cfg(feature = "calibration")]
+                        failure_deadline_us: _failure_deadline_us,
                         route_identity: stable_identity,
                         backend: backend_name,
                         trusted,
@@ -2535,62 +4003,341 @@ impl TransportProbeRuntime {
                 .unwrap_or_else(Instant::now),
             load_candidate: (false, false),
             load_candidate_since: Instant::now(),
+            #[cfg(feature = "calibration")]
+            next_probe_id: 1,
+            #[cfg(feature = "calibration")]
+            capture_control: AutotuneTransportControl::default(),
+            #[cfg(feature = "calibration")]
+            in_flight_capture: None,
+            #[cfg(feature = "calibration")]
+            pending_capture_result: None,
+            #[cfg(feature = "calibration")]
+            pending_capture_wait_reason: None,
         }
     }
 
-    fn drain(&mut self, controller: &mut Controller) {
+    #[cfg(feature = "calibration")]
+    fn observe_autotune_capture_phase(
+        &mut self,
+        cfg: &Config,
+        rates: Option<RateSample>,
+        counter_delta: Option<operations::autotune_counter::AutotuneCounterDelta>,
+        capture: Option<&operations::full_autotune::AutotuneCaptureRequest>,
+        route_identity: Option<&str>,
+        now: Instant,
+    ) -> Result<(), String> {
+        let (Some(capture), Some(route_identity)) = (capture, route_identity) else {
+            self.capture_control.reset();
+            return Ok(());
+        };
+        let key = AutotuneTransportCaptureKey::new(capture, route_identity);
+        let phase = autotune_transport_control_phase(
+            capture,
+            rates,
+            now,
+            monitor_tick_timeout(cfg).saturating_mul(3),
+            cfg.connection_active_thr_kbps,
+            cfg.rating_capture_ack_ratio,
+        )?;
+        let expected = AutotuneTransportControl::expected_phase(capture)?;
+        let dropout = autotune_transport_dropout(cfg);
+        let history_window = Duration::from_secs(cfg.transport_probe_timeout_s)
+            .saturating_add(Duration::from_secs_f64(cfg.transport_load_hold_s))
+            .saturating_add(dropout)
+            .saturating_add(monitor_tick_timeout(cfg).saturating_mul(3));
+        self.capture_control
+            .observe(key.clone(), phase, expected, now, dropout, history_window);
+        if let Some(delta) = counter_delta {
+            let delta_phase = autotune_transport_delta_phase(
+                capture,
+                delta,
+                dropout,
+                cfg.connection_active_thr_kbps,
+                cfg.rating_capture_ack_ratio,
+            )?;
+            self.capture_control.observe_physical_delta(
+                &key,
+                delta,
+                delta_phase,
+                history_window,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "calibration")]
+    fn drain(&mut self, controller: &mut Controller, cfg: &Config) {
+        while let Ok(mut result) = self.results.try_recv() {
+            self.in_flight = false;
+            if result.autotune_capture.is_some() {
+                if self.pending_capture_result.is_some() {
+                    result.capture_interval_valid = Some(false);
+                    controller.on_transport_probe(result);
+                } else {
+                    self.pending_capture_result = Some(result);
+                    self.pending_capture_wait_reason = None;
+                }
+            } else {
+                self.in_flight_capture = None;
+                result.capture_interval_valid = None;
+                controller.on_transport_probe(result);
+            }
+        }
+        self.settle_pending_capture(controller, cfg);
+    }
+
+    #[cfg(feature = "calibration")]
+    fn settle_pending_capture(&mut self, controller: &mut Controller, cfg: &Config) {
+        let Some(result) = self.pending_capture_result.as_ref() else {
+            return;
+        };
+        let settlement = self.in_flight_capture.as_ref().map_or(
+            AutotuneTransportSettlement::Final(AutotuneTransportAttestation {
+                valid: false,
+                reason: "missing-flight",
+                coverage: None,
+            }),
+            |flight| {
+                self.capture_control.settle_diagnostic(
+                    flight,
+                    result,
+                    autotune_transport_dropout(cfg),
+                )
+            },
+        );
+        let attestation = match settlement {
+            AutotuneTransportSettlement::Pending(reason) => {
+                if cfg.debug && self.pending_capture_wait_reason != Some(reason) {
+                    controller.log(
+                        "DEBUG",
+                        &format!(
+                            "native Auto-Tune transport result probe={} pending reason={reason}",
+                            result.probe_id,
+                        ),
+                    );
+                }
+                self.pending_capture_wait_reason = Some(reason);
+                return;
+            }
+            AutotuneTransportSettlement::Final(attestation) => attestation,
+        };
+        let mut result = self
+            .pending_capture_result
+            .take()
+            .expect("pending capture result was checked above");
+        self.in_flight_capture = None;
+        self.pending_capture_wait_reason = None;
+        result.capture_interval_valid = Some(attestation.valid);
+        if cfg.debug {
+            let coverage = attestation.coverage.unwrap_or_default();
+            controller.log(
+                "DEBUG",
+                &format!(
+                    "native Auto-Tune transport result probe={} valid={} reason={} total_ms={} matching_ms={} longest_mismatch_ms={}",
+                    result.probe_id,
+                    attestation.valid,
+                    attestation.reason,
+                    coverage.total.as_millis(),
+                    coverage.matching.as_millis(),
+                    coverage.longest_mismatch.as_millis(),
+                ),
+            );
+        }
+        controller.on_transport_probe(result);
+    }
+
+    #[cfg(feature = "calibration")]
+    fn maybe_start(
+        &mut self,
+        cfg: &Config,
+        rates: Option<RateSample>,
+        shaper_rates: (f64, f64),
+        rating: &RatingLoadSnapshot,
+        quality_baseline_ready: bool,
+        autotune_capture: Option<operations::full_autotune::AutotuneCaptureRequest>,
+        route_identity: Option<&str>,
+        now: Instant,
+    ) -> Result<(), String> {
+        let (dl_shaper, ul_shaper) = shaper_rates;
+        let (phase, control_valid, capture_key) = match autotune_capture.as_ref() {
+            Some(request) => {
+                let Some(route_identity) = route_identity else {
+                    return Ok(());
+                };
+                let key = AutotuneTransportCaptureKey::new(request, route_identity);
+                let (phase, valid) = self.capture_control.ready_phase(
+                    request,
+                    &key,
+                    now,
+                    Duration::from_secs_f64(cfg.transport_load_hold_s),
+                    autotune_transport_dropout(cfg),
+                )?;
+                (phase, valid, Some(key))
+            }
+            None => {
+                let Some(rates) = rates else {
+                    return Ok(());
+                };
+                let high_load_phase = (
+                    percent(rates.dl_kbps, dl_shaper) >= cfg.high_load_thr * 100.0,
+                    percent(rates.ul_kbps, ul_shaper) >= cfg.high_load_thr * 100.0,
+                );
+                if high_load_phase != self.load_candidate {
+                    self.load_candidate = high_load_phase;
+                    self.load_candidate_since = now;
+                }
+                let raw_loaded = high_load_phase.0 || high_load_phase.1;
+                let valid = !raw_loaded
+                    || now.duration_since(self.load_candidate_since)
+                        >= Duration::from_secs_f64(cfg.transport_load_hold_s);
+                (high_load_phase, valid, None)
+            }
+        };
+        let raw_loaded = phase.0 || phase.1;
+        if self.in_flight
+            || self.pending_capture_result.is_some()
+            || !transport_probe_control_allows_start(
+                autotune_capture.is_some(),
+                raw_loaded,
+                control_valid,
+                rating.phase.loaded(),
+            )
+        {
+            return Ok(());
+        }
+        let dl_loaded = control_valid && phase.0;
+        let ul_loaded = control_valid && phase.1;
+        let loaded = dl_loaded || ul_loaded;
+        let any_loaded = loaded || rating.phase.loaded();
+        let interval = transport_probe_interval_s(cfg, any_loaded, quality_baseline_ready);
+        if self.last_started.elapsed() < Duration::from_secs_f64(interval) {
+            return Ok(());
+        }
+
+        let probe_id = self.next_probe_id;
+        let Some(next_probe_id) = self.next_probe_id.checked_add(1) else {
+            return Err("native transport probe sequence exhausted".to_string());
+        };
+        let request_capture_present = autotune_capture.is_some();
+        if self
+            .requests
+            .try_send(TransportProbeRequest {
+                probe_id,
+                control_valid,
+                dl_loaded,
+                ul_loaded,
+                rating_phase: rating.phase,
+                autotune_capture,
+            })
+            .is_ok()
+        {
+            self.next_probe_id = next_probe_id;
+            self.in_flight = true;
+            self.last_started = now;
+            self.in_flight_capture = capture_key.map(|key| AutotuneTransportFlight {
+                probe_id,
+                key,
+                expected_phase: phase,
+                control_valid,
+                submitted_at: now,
+                physical_delta_required: phase != (false, false),
+            });
+            debug_assert_eq!(request_capture_present, self.in_flight_capture.is_some());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "calibration"))]
+    fn drain(&mut self, controller: &mut Controller, _cfg: &Config) {
         while let Ok(result) = self.results.try_recv() {
             self.in_flight = false;
             controller.on_transport_probe(result);
         }
     }
 
+    #[cfg(not(feature = "calibration"))]
     fn maybe_start(
         &mut self,
         cfg: &Config,
-        dl_rate: f64,
-        ul_rate: f64,
+        rates: Option<RateSample>,
         shaper_rates: (f64, f64),
         rating: &RatingLoadSnapshot,
         quality_baseline_ready: bool,
-    ) {
+        now: Instant,
+    ) -> Result<(), String> {
+        let Some(rates) = rates else {
+            return Ok(());
+        };
         let (dl_shaper, ul_shaper) = shaper_rates;
-        let raw_dl_loaded = percent(dl_rate, dl_shaper) >= cfg.high_load_thr * 100.0;
-        let raw_ul_loaded = percent(ul_rate, ul_shaper) >= cfg.high_load_thr * 100.0;
-        let phase = (raw_dl_loaded, raw_ul_loaded);
+        let phase = (
+            percent(rates.dl_kbps, dl_shaper) >= cfg.high_load_thr * 100.0,
+            percent(rates.ul_kbps, ul_shaper) >= cfg.high_load_thr * 100.0,
+        );
         if phase != self.load_candidate {
             self.load_candidate = phase;
-            self.load_candidate_since = Instant::now();
+            self.load_candidate_since = now;
         }
-        let raw_loaded = raw_dl_loaded || raw_ul_loaded;
+        let raw_loaded = phase.0 || phase.1;
         let control_valid = !raw_loaded
-            || self.load_candidate_since.elapsed()
+            || now.duration_since(self.load_candidate_since)
                 >= Duration::from_secs_f64(cfg.transport_load_hold_s);
-        if self.in_flight || (raw_loaded && !control_valid && !rating.phase.loaded()) {
-            return;
+        if self.in_flight
+            || !transport_probe_control_allows_start(
+                false,
+                raw_loaded,
+                control_valid,
+                rating.phase.loaded(),
+            )
+        {
+            return Ok(());
         }
-        let dl_loaded = control_valid && raw_dl_loaded;
-        let ul_loaded = control_valid && raw_ul_loaded;
-        let loaded = dl_loaded || ul_loaded;
-        let any_loaded = loaded || rating.phase.loaded();
-        let interval = transport_probe_interval_s(cfg, any_loaded, quality_baseline_ready);
+        let loaded = control_valid && raw_loaded;
+        let interval = transport_probe_interval_s(
+            cfg,
+            loaded || rating.phase.loaded(),
+            quality_baseline_ready,
+        );
         if self.last_started.elapsed() < Duration::from_secs_f64(interval) {
-            return;
+            return Ok(());
         }
-
         if self
             .requests
             .try_send(TransportProbeRequest {
                 control_valid,
-                dl_loaded,
-                ul_loaded,
+                dl_loaded: control_valid && phase.0,
+                ul_loaded: control_valid && phase.1,
                 rating_phase: rating.phase,
             })
             .is_ok()
         {
             self.in_flight = true;
-            self.last_started = Instant::now();
+            self.last_started = now;
         }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "calibration")]
+fn autotune_transport_dropout(cfg: &Config) -> Duration {
+    let hold = Duration::from_secs_f64(cfg.transport_load_hold_s);
+    monitor_tick_timeout(cfg)
+        .saturating_mul(3)
+        .min(hold.div_f64(2.0))
+}
+
+fn transport_probe_control_allows_start(
+    autotune_capture_present: bool,
+    raw_loaded: bool,
+    control_valid: bool,
+    rating_loaded: bool,
+) -> bool {
+    if autotune_capture_present {
+        // A native Auto-Tune capture is an exclusive measurement contract.
+        // Its topology-specific phase and hold must be valid in their own
+        // right; the concurrent rating state must never bypass that gate.
+        control_valid
+    } else {
+        !raw_loaded || control_valid || rating_loaded
     }
 }
 
@@ -3079,10 +4826,34 @@ impl LogFile {
     }
 }
 
+#[cfg(feature = "calibration")]
+fn autotune_capture_attestation_lease_valid(
+    last_attested: Instant,
+    now: Instant,
+    attested: &operations::full_autotune::AutotuneCaptureRequest,
+    published: Option<&operations::full_autotune::AutotuneCaptureRequest>,
+    current_boot_ms: u64,
+) -> bool {
+    now.checked_duration_since(last_attested)
+        .is_some_and(|age| age < AUTOTUNE_CAPTURE_ATTESTATION_MAX_AGE)
+        && published == Some(attested)
+        && current_boot_ms <= attested.deadline_boot_ms
+}
+
 struct Controller {
     cfg: Config,
     log: Option<LogFile>,
     rate_monitor: RateMonitor,
+    #[cfg(feature = "calibration")]
+    autotune_counter_sampler: Option<operations::autotune_counter::AutotuneCounterSampler>,
+    #[cfg(feature = "calibration")]
+    autotune_speedtest_rate_monitor: Option<AutotuneSpeedtestRateMonitor>,
+    #[cfg(feature = "calibration")]
+    autotune_capture_rate_sample: Option<IdentityBoundRateSample>,
+    #[cfg(feature = "calibration")]
+    autotune_capture_counter_delta: Option<IdentityBoundCounterDelta>,
+    #[cfg(feature = "calibration")]
+    autotune_idle_rate_reference: Option<IdentityBoundIdleRateReference>,
     cpu_monitor: Option<CpuMonitor>,
     dl_baseline_us: HashMap<String, f64>,
     ul_baseline_us: HashMap<String, f64>,
@@ -3102,6 +4873,7 @@ struct Controller {
     quality_grade: QualityGradeTracker,
     rating_load: RatingLoadDetector,
     rating_load_snapshot: RatingLoadSnapshot,
+    rating_load_observed_unix_ms: u64,
     quality_search_dl: QualitySearchDirection,
     quality_search_ul: QualitySearchDirection,
     quality_dl_class: QualityClass,
@@ -3134,6 +4906,8 @@ struct Controller {
     history_sample_count: u64,
     cpu_total_percent: Option<f64>,
     cpu_core_percentages: Vec<f64>,
+    #[cfg(feature = "calibration")]
+    runtime_generation: u64,
     started_at: f64,
     run_state: String,
     uplink_state: UplinkState,
@@ -3145,11 +4919,77 @@ struct Controller {
     sqm_runtime_healthy: bool,
     sqm_runtime_reason: String,
     sqm_recovery_attempts: u64,
-    sqm_last_recovery_attempt: Option<Instant>,
     sqm_last_recovery_at: Option<f64>,
-    sqm_topology_missing_since: Option<Instant>,
+    sqm_recovery_gate: operations::sqm_recovery::SqmRecoveryGate,
+    runtime_override_active: bool,
+    #[cfg(feature = "calibration")]
+    autotune_capture_request: Option<operations::full_autotune::AutotuneCaptureRequest>,
+    #[cfg(feature = "calibration")]
+    autotune_capture_session: operations::autotune_capture_session::AutotuneCaptureSession,
+    #[cfg(feature = "calibration")]
+    autotune_capture_error: Option<String>,
+    #[cfg(feature = "calibration")]
+    autotune_capture_last_attestation: Instant,
+    dl_qdisc_kind: Option<CakeQdiscKind>,
+    ul_qdisc_kind: Option<CakeQdiscKind>,
     last_status: Option<StatusSnapshot>,
     last_status_publish: Instant,
+    #[cfg(feature = "calibration")]
+    rating_runtime_faulted: bool,
+    #[cfg(feature = "calibration")]
+    last_rejected_rating_capture_token: Option<String>,
+}
+
+#[cfg(test)]
+fn loaded_autotune_traffic_observation_after_read<E, F>(
+    request: &operations::full_autotune::AutotuneCaptureRequest,
+    evidence: &E,
+    monotonic_now: F,
+) -> Result<operations::autotune_capture::AutotuneCaptureObservationKind, String>
+where
+    E: operations::full_autotune::AutotuneLoadProof + ?Sized,
+    F: FnOnce() -> Result<u64, String>,
+{
+    let current_boot_ms = monotonic_now().map_err(|error| {
+        format!(
+            "unable to sample monotonic time after reading native Auto-Tune load evidence: {error}"
+        )
+    })?;
+    operations::autotune_capture::loaded_traffic_observation_kind(
+        request,
+        evidence,
+        current_boot_ms,
+    )
+}
+
+#[cfg(test)]
+fn reject_autotune_capture_after_io_with_clock<F>(
+    accumulator: &mut operations::autotune_capture::AutotuneCaptureAccumulator,
+    diagnostic_code: &str,
+    monotonic_now: F,
+) -> Option<operations::full_autotune::AutotuneCaptureSnapshot>
+where
+    F: FnOnce() -> Result<u64, String>,
+{
+    let rejection_boot_ms = monotonic_now().ok()?;
+    accumulator
+        .reject_current(diagnostic_code, rejection_boot_ms)
+        .ok()
+}
+
+#[cfg(feature = "calibration")]
+fn rating_capture_request_is_admissible(
+    token: &str,
+    mode: &str,
+    deadline: Option<f64>,
+    now_epoch: f64,
+) -> bool {
+    operations::rating::capture_job_id_is_valid(token)
+        && matches!(mode, "automatic" | "client")
+        && now_epoch.is_finite()
+        && deadline
+            .map(|value| value.is_finite() && value > now_epoch)
+            .unwrap_or(false)
 }
 
 impl Controller {
@@ -3190,6 +5030,8 @@ impl Controller {
             }
         };
         let now = Instant::now();
+        #[cfg(feature = "calibration")]
+        let runtime_generation = operations::identity::ProcessIdentity::current()?.starttime_ticks;
         let rating_load = RatingLoadDetector::new(now);
         let rating_load_snapshot = rating_load.snapshot(
             now,
@@ -3197,6 +5039,7 @@ impl Controller {
             cfg.base_dl_shaper_rate_kbps,
             cfg.base_ul_shaper_rate_kbps,
         );
+        let rating_load_observed_unix_ms = (epoch_secs() * 1000.0).round() as u64;
         let adaptive_dl_safe = if cfg.adaptive_ceiling_enabled
             && cfg.adaptive_ceiling_dl_evidence == "legacy_unverified"
         {
@@ -3259,6 +5102,7 @@ impl Controller {
             quality_grade: QualityGradeTracker::new(cfg.rating_episode_gap_s),
             rating_load,
             rating_load_snapshot,
+            rating_load_observed_unix_ms,
             quality_search_dl: QualitySearchDirection::new(),
             quality_search_ul: QualitySearchDirection::new(),
             quality_dl_class: QualityClass::Learning,
@@ -3291,6 +5135,8 @@ impl Controller {
             history_sample_count: 0,
             cpu_total_percent: None,
             cpu_core_percentages: Vec::new(),
+            #[cfg(feature = "calibration")]
+            runtime_generation,
             run_state: "RUNNING".to_string(),
             uplink_state: UplinkState::Offline,
             uplink_reason: "route not checked".to_string(),
@@ -3305,11 +5151,28 @@ impl Controller {
             sqm_runtime_healthy: true,
             sqm_runtime_reason: String::new(),
             sqm_recovery_attempts: 0,
-            sqm_last_recovery_attempt: None,
             sqm_last_recovery_at: None,
-            sqm_topology_missing_since: None,
+            sqm_recovery_gate: operations::sqm_recovery::SqmRecoveryGate::default(),
+            runtime_override_active: false,
+            #[cfg(feature = "calibration")]
+            autotune_capture_request: None,
+            #[cfg(feature = "calibration")]
+            autotune_capture_session:
+                operations::autotune_capture_session::AutotuneCaptureSession::new(),
+            #[cfg(feature = "calibration")]
+            autotune_capture_error: None,
+            #[cfg(feature = "calibration")]
+            autotune_capture_last_attestation: now
+                .checked_sub(AUTOTUNE_CAPTURE_ATTESTATION_MAX_AGE)
+                .unwrap_or(now),
+            dl_qdisc_kind: None,
+            ul_qdisc_kind: None,
             last_status: None,
             last_status_publish: now.checked_sub(STATUS_PUBLISH_INTERVAL).unwrap_or(now),
+            #[cfg(feature = "calibration")]
+            rating_runtime_faulted: false,
+            #[cfg(feature = "calibration")]
+            last_rejected_rating_capture_token: None,
             dl_baseline_us: HashMap::new(),
             ul_baseline_us: HashMap::new(),
             dl_ewma_us: HashMap::new(),
@@ -3322,6 +5185,16 @@ impl Controller {
             cfg,
             log,
             rate_monitor,
+            #[cfg(feature = "calibration")]
+            autotune_counter_sampler: None,
+            #[cfg(feature = "calibration")]
+            autotune_speedtest_rate_monitor: None,
+            #[cfg(feature = "calibration")]
+            autotune_capture_rate_sample: None,
+            #[cfg(feature = "calibration")]
+            autotune_capture_counter_delta: None,
+            #[cfg(feature = "calibration")]
+            autotune_idle_rate_reference: None,
             cpu_monitor,
         })
     }
@@ -3333,7 +5206,219 @@ impl Controller {
     }
 
     fn sample_rates(&mut self) -> RateSample {
-        self.rate_monitor.sample()
+        let shaped = self.rate_monitor.sample();
+        #[cfg(feature = "calibration")]
+        self.update_autotune_capture_rates(shaped);
+        shaped
+    }
+
+    #[cfg(feature = "calibration")]
+    fn invalidate_autotune_counter_sampler(&mut self) {
+        let failed = self
+            .autotune_counter_sampler
+            .as_mut()
+            .is_some_and(|sampler| {
+                sampler.invalidate_current();
+                sampler.try_take().is_err()
+            });
+        if failed {
+            self.autotune_counter_sampler = None;
+        }
+    }
+
+    #[cfg(feature = "calibration")]
+    fn update_autotune_capture_rates(&mut self, shaped: RateSample) {
+        self.autotune_capture_rate_sample = None;
+        self.autotune_capture_counter_delta = None;
+        // Phase tracking is scheduling evidence, not an admitted measurement.
+        // Keep it bound to the already admitted capture identity while a slow
+        // periodic re-attestation is in progress; otherwise one synthetic
+        // missing rate sample after every lease lapse resets the three-second
+        // transport hold forever.  Every ICMP, transport, traffic, and CPU
+        // observation still passes through active_autotune_observation_request
+        // and therefore remains fail-closed on the fresh attestation lease.
+        let Some(request) = self.autotune_capture_control_request() else {
+            self.invalidate_autotune_counter_sampler();
+            self.autotune_speedtest_rate_monitor = None;
+            return;
+        };
+        if !autotune_capture_uses_identity_bound_speedtest_counters(&request) {
+            self.invalidate_autotune_counter_sampler();
+            self.autotune_speedtest_rate_monitor = None;
+            self.autotune_capture_rate_sample = Some(IdentityBoundRateSample {
+                request,
+                sample: shaped,
+            });
+            return;
+        }
+
+        if self.autotune_counter_sampler.is_none() {
+            match operations::autotune_counter::AutotuneCounterSampler::new() {
+                Ok(sampler) => self.autotune_counter_sampler = Some(sampler),
+                Err(error) => {
+                    self.reject_autotune_observations(
+                        "capture-speedtest-counters-unavailable",
+                        &format!("native Auto-Tune cannot start its counter worker: {error}"),
+                    );
+                    return;
+                }
+            }
+        }
+
+        let monitor_matches = self
+            .autotune_speedtest_rate_monitor
+            .as_ref()
+            .is_some_and(|monitor| monitor.matches(&request));
+        if !monitor_matches {
+            let sampler = self
+                .autotune_counter_sampler
+                .as_mut()
+                .expect("counter sampler was initialized");
+            sampler.invalidate_current();
+            self.autotune_speedtest_rate_monitor = Some(AutotuneSpeedtestRateMonitor {
+                request: request.clone(),
+                counter_epoch: sampler.current_epoch(),
+                monitor: SpeedtestCounterRateMonitor::new(
+                    self.cfg.monitor_achieved_rates_interval_ms,
+                ),
+            });
+        }
+
+        let completion = match self
+            .autotune_counter_sampler
+            .as_mut()
+            .expect("counter sampler was initialized")
+            .try_take()
+        {
+            Ok(result) => result,
+            Err(error) => {
+                self.reject_autotune_observations(
+                    "capture-speedtest-counters-unavailable",
+                    &format!("native Auto-Tune counter worker failed: {error}"),
+                );
+                return;
+            }
+        };
+        let mut newest_controlled = None;
+        if let Some(completion) = completion {
+            let completion_matches =
+                self.autotune_speedtest_rate_monitor
+                    .as_ref()
+                    .is_some_and(|monitor| {
+                        autotune_counter_completion_matches(&request, monitor, &completion)
+                    });
+            if completion_matches {
+                if !autotune_counter_completion_is_timely(&request, &completion) {
+                    self.autotune_speedtest_rate_monitor
+                        .as_mut()
+                        .expect("speedtest rate monitor was initialized")
+                        .monitor
+                        .reset(completion.completed_at);
+                    self.reject_autotune_observations(
+                        "capture-speedtest-counters-expired",
+                        "native Auto-Tune speedtest counters completed outside the request deadline",
+                    );
+                    return;
+                }
+                match completion.outcome {
+                    Ok(counters) => {
+                        let (rate, delta) = self
+                            .autotune_speedtest_rate_monitor
+                            .as_mut()
+                            .expect("speedtest rate monitor was initialized")
+                            .monitor
+                            .observe_counters_with_delta(completion.completed_at, counters);
+                        newest_controlled = rate;
+                        if let Some(delta) = delta {
+                            self.autotune_capture_counter_delta = Some(IdentityBoundCounterDelta {
+                                request: request.clone(),
+                                delta,
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        self.autotune_speedtest_rate_monitor
+                            .as_mut()
+                            .expect("speedtest rate monitor was initialized")
+                            .monitor
+                            .reset(completion.completed_at);
+                        self.reject_autotune_observations(
+                            "capture-speedtest-counters-unavailable",
+                            &format!(
+                                "native Auto-Tune cannot sample identity-bound speedtest counters: {error}"
+                            ),
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+
+        let counter_read_due = self
+            .autotune_speedtest_rate_monitor
+            .as_ref()
+            .expect("speedtest rate monitor was initialized")
+            .monitor
+            .sample_due(Instant::now());
+        if counter_read_due {
+            if let Err(error) = self
+                .autotune_counter_sampler
+                .as_mut()
+                .expect("counter sampler was initialized")
+                .try_schedule(&request)
+            {
+                self.reject_autotune_observations(
+                    "capture-speedtest-counters-unavailable",
+                    &format!("native Auto-Tune cannot schedule its counter worker: {error}"),
+                );
+                return;
+            }
+        }
+
+        let controlled = newest_controlled.or_else(|| {
+            self.autotune_speedtest_rate_monitor
+                .as_ref()
+                .expect("speedtest rate monitor was initialized")
+                .monitor
+                .cached_sample()
+        });
+        let Some(controlled) = controlled else {
+            return;
+        };
+        match select_autotune_capture_rates(request.topology, Some(controlled)) {
+            Ok(sample) => {
+                self.autotune_capture_rate_sample =
+                    Some(IdentityBoundRateSample { request, sample })
+            }
+            Err(error) => {
+                self.reject_autotune_observations("capture-speedtest-counters-unavailable", &error)
+            }
+        }
+    }
+
+    #[cfg(feature = "calibration")]
+    fn autotune_observation_rates(&self, shaped: RateSample) -> Option<RateSample> {
+        let Some(request) = self.autotune_capture_request.as_ref() else {
+            return Some(shaped);
+        };
+        let now = Instant::now();
+        let max_age = monitor_tick_timeout(&self.cfg).saturating_mul(3);
+        self.autotune_capture_rate_sample
+            .as_ref()
+            .filter(|sample| &sample.request == request)
+            .map(|sample| sample.sample)
+            .filter(|sample| rate_sample_is_recent(*sample, now, max_age))
+    }
+
+    #[cfg(feature = "calibration")]
+    fn autotune_transport_counter_delta(
+        &self,
+    ) -> Option<operations::autotune_counter::AutotuneCounterDelta> {
+        let request = self.autotune_capture_control_request()?;
+        self.autotune_capture_counter_delta
+            .as_ref()
+            .filter(|sample| sample.request == request)
+            .map(|sample| sample.delta)
     }
 
     fn set_sqm_runtime_status(&mut self, state: &str, healthy: bool, reason: &str) {
@@ -3361,14 +5446,24 @@ impl Controller {
     }
 
     fn accept_recovered_sqm(&mut self, reason: &str) -> Result<(), String> {
+        self.sqm_recovery_gate.observe_healthy();
         self.rate_monitor = RateMonitor::new(
             &self.cfg.rx_bytes_path,
             &self.cfg.tx_bytes_path,
             self.cfg.monitor_achieved_rates_interval_ms,
         )
         .map_err(|error| format!("failed to reset interface counters: {error}"))?;
+        #[cfg(feature = "calibration")]
+        {
+            self.invalidate_autotune_counter_sampler();
+            self.autotune_speedtest_rate_monitor = None;
+            self.autotune_capture_rate_sample = None;
+            self.autotune_idle_rate_reference = None;
+        }
         self.last_set_dl = 0;
         self.last_set_ul = 0;
+        self.dl_qdisc_kind = None;
+        self.ul_qdisc_kind = None;
         self.quality_grade.reset();
         self.reset_uplink_learning(reason);
         self.sqm_last_recovery_at = Some(epoch_secs());
@@ -3380,15 +5475,25 @@ impl Controller {
     }
 
     fn ensure_managed_sqm(&mut self) -> (bool, bool) {
+        use operations::sqm_recovery::SqmRecoveryAdmission;
+
+        #[cfg(feature = "calibration")]
+        if self.runtime_override_active {
+            self.set_sqm_runtime_status(
+                "WAITING_OPERATION",
+                true,
+                "runtime topology is owned by native Auto-Tune",
+            );
+            return (true, false);
+        }
         if !self.cfg.manage_sqm || !self.cfg.sqm_enabled {
-            self.sqm_topology_missing_since = None;
+            self.sqm_recovery_gate.observe_healthy();
             self.set_sqm_runtime_status("UNMANAGED", true, "");
             return (true, false);
         }
 
         if !managed_sqm_target_ready(&self.cfg) {
-            self.sqm_topology_missing_since = None;
-            self.sqm_last_recovery_attempt = None;
+            self.sqm_recovery_gate.observe_target_missing();
             let reason = format!(
                 "target interface {} is unavailable; waiting for link and native SQM hotplug",
                 self.cfg.sqm_interface
@@ -3398,62 +5503,40 @@ impl Controller {
             return (false, false);
         }
 
-        match inspect_managed_sqm(&self.cfg) {
+        let topology = inspect_sqm_topology(&self.cfg);
+        match &topology {
             Ok(()) if self.sqm_runtime_healthy => {
-                self.sqm_topology_missing_since = None;
+                self.sqm_recovery_gate.observe_healthy();
                 (true, false)
             }
-            Ok(()) => match self.accept_recovered_sqm("runtime recovered externally") {
-                Ok(()) => {
-                    self.sqm_topology_missing_since = None;
-                    (true, true)
-                }
-                Err(error) => {
-                    self.set_sqm_runtime_status("ERROR", false, &error);
-                    self.set_run_state("ERROR");
-                    (false, false)
-                }
-            },
-            Err(initial_reason) => {
-                let now = Instant::now();
-                let missing_since = *self.sqm_topology_missing_since.get_or_insert(now);
-                let grace = bootstrap_hotplug_grace();
-                if now.saturating_duration_since(missing_since) < grace {
-                    let reason =
-                        format!("{initial_reason}; allowing the native SQM hotplug path to settle");
-                    self.set_sqm_runtime_status("WAITING_SQM", false, &reason);
-                    self.set_run_state("WAITING_SQM");
-                    return (false, false);
-                }
-                if self
-                    .sqm_last_recovery_attempt
-                    .map(|attempt| {
-                        attempt.elapsed() < Duration::from_secs(SQM_RUNTIME_RECOVERY_COOLDOWN_S)
-                    })
-                    .unwrap_or(false)
-                {
-                    self.set_sqm_runtime_status("ERROR", false, &initial_reason);
-                    self.set_run_state("ERROR");
-                    return (false, false);
-                }
-                self.sqm_last_recovery_attempt = Some(Instant::now());
-                self.sqm_recovery_attempts = self.sqm_recovery_attempts.saturating_add(1);
-                self.set_sqm_runtime_status("RECOVERING", false, &initial_reason);
-                self.set_run_state("RECOVERING");
-                match recover_managed_sqm(&self.cfg) {
-                    Ok(()) => match self.accept_recovered_sqm("automatic SQM recovery completed") {
-                        Ok(()) => {
-                            self.sqm_topology_missing_since = None;
-                            (true, true)
+            _ => {
+                let initial_reason = topology
+                    .as_ref()
+                    .err()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "managed SQM failed exact attestation".to_string());
+                match attest_managed_sqm(&self.cfg) {
+                    Ok(()) if inspect_sqm_topology(&self.cfg).is_ok() => {
+                        match self.accept_recovered_sqm("runtime recovered externally") {
+                            Ok(()) => (true, true),
+                            Err(error) => {
+                                self.set_sqm_runtime_status("ERROR", false, &error);
+                                self.set_run_state("ERROR");
+                                (false, false)
+                            }
                         }
-                        Err(error) => {
-                            self.set_sqm_runtime_status("ERROR", false, &error);
-                            self.set_run_state("ERROR");
-                            (false, false)
-                        }
-                    },
+                    }
+                    Ok(()) => {
+                        let reason = format!(
+                            "{initial_reason}; exact SQM check observed a concurrent topology transition; re-reading current state"
+                        );
+                        self.set_sqm_runtime_status("WAITING_SQM", false, &reason);
+                        self.set_run_state("WAITING_SQM");
+                        (false, false)
+                    }
                     Err(SqmRecoveryError::Busy(error)) => {
-                        let reason = format!("{initial_reason}; recovery deferred: {error}");
+                        let reason =
+                            format!("{initial_reason}; waiting for SQM operation: {error}");
                         self.set_sqm_runtime_status("WAITING_OPERATION", false, &reason);
                         self.set_run_state("WAITING_OPERATION");
                         (false, false)
@@ -3462,17 +5545,72 @@ impl Controller {
                         self.set_sqm_runtime_status(
                             "STOPPING",
                             false,
-                            "termination requested during SQM recovery",
+                            "termination requested while observing SQM recovery ownership",
                         );
                         self.set_run_state("STOPPING");
                         (false, false)
                     }
-                    Err(error @ SqmRecoveryError::Failed(_)) => {
-                        let reason =
-                            format!("{initial_reason}; recovery failed: {}", error.message());
-                        self.set_sqm_runtime_status("ERROR", false, &reason);
-                        self.set_run_state("ERROR");
-                        (false, false)
+                    Err(SqmRecoveryError::Failed(check_error)) => {
+                        let generation = sqm_topology_generation(&self.cfg, &topology);
+                        if self.sqm_recovery_gate.admission(&generation)
+                            == SqmRecoveryAdmission::WaitForStateChange
+                        {
+                            let reason = format!(
+                                "{initial_reason}; previous recovery failed and the observed link/SQM topology is unchanged: {check_error}"
+                            );
+                            self.set_sqm_runtime_status("WAITING_SQM", false, &reason);
+                            self.set_run_state("WAITING_SQM");
+                            return (false, false);
+                        }
+
+                        self.sqm_recovery_attempts = self.sqm_recovery_attempts.saturating_add(1);
+                        let reason = format!(
+                            "{initial_reason}; exact read-only check is unhealthy: {check_error}"
+                        );
+                        self.set_sqm_runtime_status("RECOVERING", false, &reason);
+                        self.set_run_state("RECOVERING");
+                        match recover_managed_sqm(&self.cfg) {
+                            Ok(()) => {
+                                match self.accept_recovered_sqm("automatic SQM recovery completed")
+                                {
+                                    Ok(()) => (true, true),
+                                    Err(error) => {
+                                        self.set_sqm_runtime_status("ERROR", false, &error);
+                                        self.set_run_state("ERROR");
+                                        (false, false)
+                                    }
+                                }
+                            }
+                            Err(SqmRecoveryError::Busy(error)) => {
+                                let reason =
+                                    format!("{initial_reason}; recovery deferred: {error}");
+                                self.set_sqm_runtime_status("WAITING_OPERATION", false, &reason);
+                                self.set_run_state("WAITING_OPERATION");
+                                (false, false)
+                            }
+                            Err(SqmRecoveryError::Terminated) => {
+                                self.set_sqm_runtime_status(
+                                    "STOPPING",
+                                    false,
+                                    "termination requested during SQM recovery",
+                                );
+                                self.set_run_state("STOPPING");
+                                (false, false)
+                            }
+                            Err(error @ SqmRecoveryError::Failed(_)) => {
+                                let post_topology = inspect_sqm_topology(&self.cfg);
+                                let failed_generation =
+                                    sqm_topology_generation(&self.cfg, &post_topology);
+                                self.sqm_recovery_gate.record_failed(failed_generation);
+                                let reason = format!(
+                                    "{initial_reason}; recovery failed and is blocked until observed topology changes: {}",
+                                    error.message()
+                                );
+                                self.set_sqm_runtime_status("ERROR", false, &reason);
+                                self.set_run_state("ERROR");
+                                (false, false)
+                            }
+                        }
                     }
                 }
             }
@@ -3485,7 +5623,7 @@ impl Controller {
         dl_rate: f64,
         ul_rate: f64,
     ) -> RatingLoadSnapshot {
-        self.sync_rating_capture(now);
+        let was_contaminated = self.rating_load_snapshot.capture_contaminated;
         self.rating_load_snapshot = self.rating_load.observe(
             now,
             dl_rate,
@@ -3494,11 +5632,50 @@ impl Controller {
             self.shaper_ul,
             self.cfg.rating_load_config(),
         );
+        if !was_contaminated && self.rating_load_snapshot.capture_contaminated {
+            self.log(
+                "ERROR",
+                &format!(
+                    "Rating capture contaminated: reason={}, requested_phase={}, effective_dl_kbps={:.3}, effective_ul_kbps={:.3}, background_dl_kbps={:.3}, background_ul_kbps={:.3}",
+                    self.rating_load_snapshot.capture_contamination_reason,
+                    self.rating_load_snapshot.capture_requested_phase,
+                    self.rating_load_snapshot.effective_dl_rate_kbps,
+                    self.rating_load_snapshot.effective_ul_rate_kbps,
+                    self.rating_load_snapshot.capture_background_dl_kbps,
+                    self.rating_load_snapshot.capture_background_ul_kbps,
+                ),
+            );
+        }
+        self.rating_load_observed_unix_ms = (epoch_secs() * 1000.0).round() as u64;
         self.rating_load_snapshot.clone()
     }
 
+    #[cfg(feature = "calibration")]
+    fn refresh_rating_load_snapshot(&mut self, now: Instant) -> RatingLoadSnapshot {
+        self.rating_load_snapshot = self.rating_load.snapshot(
+            now,
+            self.cfg.rating_load_config(),
+            self.shaper_dl,
+            self.shaper_ul,
+        );
+        self.rating_load_observed_unix_ms = (epoch_secs() * 1000.0).round() as u64;
+        self.rating_load_snapshot.clone()
+    }
+
+    #[cfg(feature = "calibration")]
     fn sync_rating_capture(&mut self, now: Instant) {
-        let content = fs::read_to_string(self.cfg.rating_capture_path()).unwrap_or_default();
+        let capture_path = self.cfg.rating_capture_path();
+        let content = match fs::read_to_string(&capture_path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(error) => {
+                self.log(
+                    "ERROR",
+                    &format!("unable to inspect rating capture request: {error}"),
+                );
+                return;
+            }
+        };
         let mut fields = content.trim().split('|');
         let token = fields.next().unwrap_or("");
         let mode = fields.next().unwrap_or("");
@@ -3512,10 +5689,8 @@ impl Controller {
             .next()
             .and_then(|value| value.parse::<f64>().ok())
             .unwrap_or(0.0);
-        if !token.is_empty()
-            && matches!(mode, "automatic" | "client")
-            && deadline.map(|value| value > epoch_secs()).unwrap_or(false)
-        {
+        if rating_capture_request_is_admissible(token, mode, deadline, epoch_secs()) {
+            self.last_rejected_rating_capture_token = None;
             let capture_started = self.rating_load.set_capture(
                 Some(token),
                 Some(mode),
@@ -3525,22 +5700,602 @@ impl Controller {
                 now,
             );
             if capture_started {
-                self.quality_grade.begin_capture(epoch_secs());
+                let (job_id, generation) = self
+                    .rating_load
+                    .capture_identity()
+                    .map(|(job_id, generation)| (job_id.to_string(), generation))
+                    .expect("a started rating capture has an identity");
+                self.quality_grade
+                    .begin_capture(epoch_secs(), &job_id, generation);
             }
         } else {
-            if self.rating_load_snapshot.capture_active {
-                if self.rating_load_snapshot.capture_contaminated {
-                    self.quality_grade.cancel_capture();
+            if !token.is_empty() && !operations::rating::capture_job_id_is_valid(token) {
+                let rejection_key = if token.len() <= 64 {
+                    token.to_string()
                 } else {
-                    self.quality_grade.end_capture(epoch_secs());
+                    "oversized".to_string()
+                };
+                if self.last_rejected_rating_capture_token.as_deref()
+                    != Some(rejection_key.as_str())
+                {
+                    self.log(
+                        "ERROR",
+                        "rejected a rating capture request with an invalid job identity",
+                    );
+                    self.last_rejected_rating_capture_token = Some(rejection_key);
                 }
             }
-            self.rating_load
-                .set_capture(None, None, None, 0.0, 0.0, now);
-            if !content.is_empty() {
-                let _ = fs::remove_file(self.cfg.rating_capture_path());
+            if self.rating_load.capture_active() {
+                let outcome = if self.rating_load.capture_contaminated() {
+                    self.quality_grade.cancel_capture();
+                    "contaminated"
+                } else if content.is_empty() {
+                    self.quality_grade.end_capture(epoch_secs());
+                    "removed"
+                } else {
+                    self.quality_grade.end_capture(epoch_secs());
+                    "expired"
+                };
+                let finalized = self.rating_load.finalize_capture_with_outcome(outcome, now);
+                debug_assert!(finalized);
+            }
+            if !content.is_empty() && operations::rating::capture_job_id_is_valid(token) {
+                let _ = operations::rating::remove_matching_capture(&capture_path, token);
             }
         }
+        self.refresh_rating_load_snapshot(now);
+    }
+
+    #[cfg(feature = "calibration")]
+    fn sync_autotune_capture_admission(&mut self) {
+        let request_path = self.cfg.autotune_capture_request_path();
+        let snapshot_path = self.cfg.autotune_capture_snapshot_path();
+        match fs::symlink_metadata(&request_path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if self.autotune_capture_request.take().is_some() {
+                    let _ = fs::remove_file(&snapshot_path);
+                }
+                self.autotune_capture_session.clear();
+                self.autotune_idle_rate_reference = None;
+                self.autotune_capture_error = None;
+                return;
+            }
+            Err(error) => {
+                self.autotune_capture_request = None;
+                self.autotune_capture_session.clear();
+                self.autotune_idle_rate_reference = None;
+                self.record_autotune_capture_error(format!(
+                    "unable to inspect native Auto-Tune capture request: {error}"
+                ));
+                return;
+            }
+            Ok(_) => {}
+        }
+        let request = match operations::full_autotune::read_capture_request(&request_path) {
+            Ok(request) => request,
+            Err(error) => {
+                self.autotune_capture_request = None;
+                self.autotune_capture_session.clear();
+                self.autotune_idle_rate_reference = None;
+                self.record_autotune_capture_error(error);
+                return;
+            }
+        };
+        if self.autotune_capture_request.as_ref() != Some(&request) {
+            self.autotune_idle_rate_reference = None;
+        }
+        if self.autotune_capture_request.as_ref() == Some(&request)
+            && self
+                .autotune_idle_rate_reference
+                .as_ref()
+                .is_some_and(|reference| reference.request == request)
+            && fs::symlink_metadata(&snapshot_path).is_ok()
+            && self.autotune_capture_last_attestation.elapsed() < AUTOTUNE_CAPTURE_REATTEST_INTERVAL
+            && self.autotune_capture_error.is_none()
+        {
+            return;
+        }
+        let boot_ms = match operations::identity::monotonic_boot_ms() {
+            Ok(value) => value,
+            Err(error) => {
+                self.record_autotune_capture_error(error);
+                return;
+            }
+        };
+        let admission = self.attest_autotune_capture(&request, boot_ms);
+        let (snapshot, idle_rate_reference) = match admission {
+            Ok(idle_rate_reference) => {
+                match self.autotune_capture_session.admit(&request, boot_ms) {
+                    Ok(_) => {
+                        if let Err(error) = self.consume_autotune_load_evidence(&request) {
+                            let rejected = operations::identity::monotonic_boot_ms().ok().and_then(
+                                |rejection_boot_ms| {
+                                    self.autotune_capture_session
+                                        .reject("capture-load-evidence-invalid", rejection_boot_ms)
+                                        .ok()
+                                },
+                            );
+                            self.record_autotune_capture_error(error);
+                            match rejected {
+                                Some(snapshot) => (snapshot, None),
+                                None => return,
+                            }
+                        } else {
+                            match self.autotune_capture_session.snapshot() {
+                                Ok(snapshot) => (snapshot, Some(idle_rate_reference)),
+                                Err(error) => {
+                                    self.autotune_capture_session.clear();
+                                    self.autotune_idle_rate_reference = None;
+                                    self.record_autotune_capture_error(error);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        self.autotune_capture_session.clear();
+                        self.autotune_idle_rate_reference = None;
+                        self.record_autotune_capture_error(error);
+                        return;
+                    }
+                }
+            }
+            Err((code, detail)) => {
+                self.autotune_capture_session.clear();
+                self.autotune_idle_rate_reference = None;
+                self.record_autotune_capture_error(detail);
+                (
+                    operations::full_autotune::AutotuneCaptureSnapshot {
+                        request: request.clone(),
+                        state: operations::full_autotune::AutotuneCaptureState::Rejected,
+                        updated_boot_ms: boot_ms.min(request.deadline_boot_ms),
+                        icmp_samples: 0,
+                        transport_samples: 0,
+                        transport_timeout_count: 0,
+                        transport_timeout_total_us: 0,
+                        transport_censored: false,
+                        cpu_samples: 0,
+                        idle_median_us: None,
+                        idle_p95_us: None,
+                        icmp_delta_us: None,
+                        transport_delta_us: None,
+                        loss_ppm: None,
+                        cpu_milli_percent: None,
+                        background_confidence_percent: None,
+                        contaminated: false,
+                        diagnostic_code: Some(code.to_string()),
+                    },
+                    None,
+                )
+            }
+        };
+        if let Err(error) =
+            operations::full_autotune::publish_capture_snapshot(&snapshot_path, &snapshot)
+        {
+            self.record_autotune_capture_error(error);
+            return;
+        }
+        // Start the lease only after the synchronous identity/SQM checks and
+        // atomic snapshot publication have completed.  On a busy low-end
+        // router those operations can exceed the short lease duration; using
+        // the entry timestamp would publish a lease that was already stale.
+        self.autotune_capture_last_attestation = Instant::now();
+        let capture_accepts_reference = matches!(
+            snapshot.state,
+            operations::full_autotune::AutotuneCaptureState::Collecting
+                | operations::full_autotune::AutotuneCaptureState::Complete
+        );
+        self.autotune_capture_request = Some(request);
+        self.autotune_idle_rate_reference = capture_accepts_reference
+            .then_some(idle_rate_reference)
+            .flatten()
+            .map(
+                |(download_kbps, upload_kbps)| IdentityBoundIdleRateReference {
+                    request: self
+                        .autotune_capture_request
+                        .as_ref()
+                        .expect("capture request was just published")
+                        .clone(),
+                    download_kbps: download_kbps as f64,
+                    upload_kbps: upload_kbps as f64,
+                },
+            );
+        if capture_accepts_reference {
+            self.autotune_capture_error = None;
+        }
+    }
+
+    #[cfg(feature = "calibration")]
+    fn consume_autotune_load_evidence(
+        &mut self,
+        request: &operations::full_autotune::AutotuneCaptureRequest,
+    ) -> Result<(), String> {
+        if request.phase != operations::full_autotune::AutotuneCapturePhase::LoadedMeasurement {
+            return Ok(());
+        }
+        let path = self.cfg.autotune_load_evidence_path();
+        let evidence = match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(format!(
+                    "unable to inspect native Auto-Tune load evidence: {error}"
+                ))
+            }
+            Ok(_) => operations::full_autotune::read_controlled_load_evidence(&path)?,
+        };
+        // The evidence writer samples `published_boot_ms` before its atomic
+        // publication.  Sample the reader's clock only after that publication
+        // has been opened and decoded: the loop-start timestamp may precede a
+        // valid record that appeared during admission I/O.
+        let current_boot_ms = operations::identity::monotonic_boot_ms().map_err(|error| {
+            format!(
+                "unable to sample monotonic time after reading native Auto-Tune load evidence: {error}"
+            )
+        })?;
+        let _ = self.autotune_capture_session.observe_load_evidence(
+            request,
+            &evidence,
+            current_boot_ms,
+        )?;
+        Ok(())
+    }
+
+    #[cfg(feature = "calibration")]
+    fn attest_autotune_capture(
+        &mut self,
+        request: &operations::full_autotune::AutotuneCaptureRequest,
+        boot_ms: u64,
+    ) -> Result<(u64, u64), (&'static str, String)> {
+        if request.instance_name != self.cfg.instance {
+            return Err((
+                "capture-instance-mismatch",
+                "native Auto-Tune capture belongs to another instance".to_string(),
+            ));
+        }
+        let store =
+            operations::autotune_runtime_store::RuntimeOverrideStore::open(&self.cfg.run_dir())
+                .map_err(|error| ("capture-runtime-unavailable", error))?;
+        let permit = store
+            .read_permit()
+            .map_err(|error| ("capture-runtime-unavailable", error))?
+            .ok_or_else(|| {
+                (
+                    "capture-permit-missing",
+                    "native Auto-Tune capture has no runtime permit".to_string(),
+                )
+            })?;
+        let control = store
+            .read_control()
+            .map_err(|error| ("capture-runtime-unavailable", error))?;
+        let ack = store
+            .read_ack()
+            .map_err(|error| ("capture-runtime-unavailable", error))?;
+        operations::full_autotune::attest_capture_admission(
+            request,
+            &permit,
+            control.as_ref(),
+            ack.as_ref(),
+            boot_ms,
+        )
+        .map_err(|error| ("capture-runtime-mismatch", error))?;
+        if !permit
+            .worker
+            .still_matches(Path::new(operations::identity::DEFAULT_PROC_ROOT))
+            .map_err(|error| ("capture-worker-unavailable", error))?
+        {
+            return Err((
+                "capture-worker-unavailable",
+                "native Auto-Tune capture worker identity is no longer live".to_string(),
+            ));
+        }
+        if self.route_identity.as_deref() != Some(permit.route_identity.as_str()) {
+            return Err((
+                "capture-route-mismatch",
+                "native Auto-Tune capture route changed after admission".to_string(),
+            ));
+        }
+        let live_sqm = operations::sqm_identity::managed_sqm_identity_fingerprint(
+            &self.cfg.instance,
+            &self.cfg.sqm_section,
+            &self.cfg.sqm_interface,
+        )
+        .map_err(|error| ("capture-sqm-mismatch", error))?;
+        if live_sqm != request.sqm_fingerprint {
+            return Err((
+                "capture-sqm-mismatch",
+                "native Auto-Tune capture SQM identity changed".to_string(),
+            ));
+        }
+        let expected = operations::autotune_runtime::RuntimeSnapshot {
+            target_interface: permit.target_interface.clone(),
+            route_fingerprint: permit.route_fingerprint.clone(),
+            sqm_fingerprint: permit.sqm_fingerprint.clone(),
+            topology: request.topology,
+            download_kbps: request.candidate_dl_kbps,
+            upload_kbps: request.candidate_ul_kbps,
+            download_qdisc_kind: None,
+            upload_qdisc_kind: None,
+        };
+        let actual = match request.phase {
+            operations::full_autotune::AutotuneCapturePhase::IdleBaseline => {
+                if store
+                    .read_checkpoint()
+                    .map_err(|error| ("capture-runtime-unavailable", error))?
+                    .is_some()
+                {
+                    return Err((
+                        "capture-runtime-mismatch",
+                        "idle Auto-Tune capture observed a private runtime checkpoint".to_string(),
+                    ));
+                }
+                attest_rate_only_runtime(self, &expected)
+            }
+            operations::full_autotune::AutotuneCapturePhase::LoadedMeasurement => {
+                let checkpoint = store
+                    .read_checkpoint()
+                    .map_err(|error| ("capture-runtime-unavailable", error))?
+                    .ok_or_else(|| {
+                        (
+                            "capture-runtime-mismatch",
+                            "loaded Auto-Tune capture has no private runtime checkpoint"
+                                .to_string(),
+                        )
+                    })?;
+                attest_loaded_capture_runtime(&self.cfg, &permit, &expected, &checkpoint)
+            }
+        }
+        .map_err(|error| ("capture-runtime-mismatch", error))?;
+        if actual.target_interface != expected.target_interface
+            || actual.route_fingerprint != expected.route_fingerprint
+            || actual.sqm_fingerprint != expected.sqm_fingerprint
+            || actual.topology != expected.topology
+            || actual.download_kbps != expected.download_kbps
+            || actual.upload_kbps != expected.upload_kbps
+        {
+            return Err((
+                "capture-runtime-mismatch",
+                "native Auto-Tune capture runtime differs from its requested topology".to_string(),
+            ));
+        }
+        Ok((permit.initial_download_kbps, permit.initial_upload_kbps))
+    }
+
+    #[cfg(feature = "calibration")]
+    fn record_autotune_capture_error(&mut self, error: String) {
+        if self.autotune_capture_error.as_deref() != Some(error.as_str()) {
+            self.log(
+                "ERROR",
+                &format!("native Auto-Tune capture rejected: {error}"),
+            );
+            self.autotune_capture_error = Some(error);
+        }
+    }
+
+    #[cfg(feature = "calibration")]
+    fn active_autotune_observation_request(
+        &self,
+    ) -> Option<operations::full_autotune::AutotuneCaptureRequest> {
+        if self.autotune_capture_error.is_some()
+            || !self.autotune_capture_session.accepting_observations()
+        {
+            return None;
+        }
+        let request = self.autotune_capture_session.active_request()?;
+        let now = Instant::now();
+        let boot_ms = operations::identity::monotonic_boot_ms().ok()?;
+        let published = operations::full_autotune::read_capture_request(
+            &self.cfg.autotune_capture_request_path(),
+        )
+        .ok();
+        (self.autotune_capture_request.as_ref() == Some(request)
+            && autotune_capture_attestation_lease_valid(
+                self.autotune_capture_last_attestation,
+                now,
+                request,
+                published.as_ref(),
+                boot_ms,
+            ))
+        .then(|| request.clone())
+    }
+
+    /// Return the admitted capture identity even while its short attestation
+    /// lease is being refreshed.  Transport phase history belongs to the
+    /// capture epoch, not to one successful filesystem poll: resetting it on
+    /// a transient re-attestation gap can starve the next transport probe for
+    /// the remainder of an otherwise valid loaded measurement.
+    #[cfg(feature = "calibration")]
+    fn autotune_capture_control_request(
+        &self,
+    ) -> Option<operations::full_autotune::AutotuneCaptureRequest> {
+        if self.autotune_capture_error.is_some()
+            || !self.autotune_capture_session.accepting_observations()
+        {
+            return None;
+        }
+        let request = self.autotune_capture_session.active_request()?;
+        (self.autotune_capture_request.as_ref() == Some(request)).then(|| request.clone())
+    }
+
+    #[cfg(feature = "calibration")]
+    fn record_autotune_observation(
+        &mut self,
+        request: &operations::full_autotune::AutotuneCaptureRequest,
+        kind: operations::autotune_capture::AutotuneCaptureObservationKind,
+    ) {
+        let boot_ms = match operations::identity::monotonic_boot_ms() {
+            Ok(value) => value,
+            Err(error) => {
+                self.reject_autotune_observations("capture-clock-unavailable", &error);
+                return;
+            }
+        };
+        match self
+            .autotune_capture_session
+            .observe(request, kind, boot_ms)
+        {
+            Ok(_) => {}
+            Err(error) => self.reject_autotune_observations("capture-observation-invalid", &error),
+        }
+    }
+
+    #[cfg(feature = "calibration")]
+    fn reject_autotune_observations(&mut self, code: &str, detail: &str) {
+        let boot_ms = operations::identity::monotonic_boot_ms()
+            .ok()
+            .and_then(|value| {
+                self.autotune_capture_session
+                    .active_request()
+                    .map(|request| value.min(request.deadline_boot_ms))
+            });
+        let _ = match boot_ms {
+            Some(boot_ms) => self.autotune_capture_session.reject(code, boot_ms),
+            None => self.autotune_capture_session.reject_at_last_update(code),
+        };
+        self.record_autotune_capture_error(detail.to_string());
+    }
+
+    #[cfg(feature = "calibration")]
+    fn reject_autotune_capture_measurement_basis(&mut self, reason: &str) {
+        if self.autotune_capture_session.accepting_observations() {
+            self.reject_autotune_observations(
+                operations::full_autotune::CAPTURE_MEASUREMENT_BASIS_RESET,
+                &format!("native Auto-Tune measurement basis reset: {reason}"),
+            );
+        }
+    }
+
+    #[cfg(feature = "calibration")]
+    fn observe_autotune_icmp(
+        &mut self,
+        sample: &Sample,
+        dl_delta_us: f64,
+        ul_delta_us: f64,
+        download_kbps: f64,
+        upload_kbps: f64,
+    ) {
+        let Some(request) = self.active_autotune_observation_request() else {
+            return;
+        };
+        let (download_loaded, upload_loaded) =
+            match operations::autotune_capture::bounded_directional_load_phase(
+                &request,
+                download_kbps,
+                upload_kbps,
+                self.cfg.connection_active_thr_kbps,
+                self.cfg.rating_capture_ack_ratio,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.reject_autotune_observations("capture-load-phase-invalid", &error);
+                    return;
+                }
+            };
+        match operations::autotune_capture::icmp_observation_kind(
+            &request,
+            sample.rtt_ms,
+            dl_delta_us,
+            ul_delta_us,
+            download_loaded,
+            upload_loaded,
+        ) {
+            Ok(Some(kind)) => self.record_autotune_observation(&request, kind),
+            Ok(None) => {}
+            Err(error) => self.reject_autotune_observations("capture-icmp-invalid", &error),
+        }
+    }
+
+    #[cfg(feature = "calibration")]
+    fn observe_autotune_icmp_timeout(&mut self) {
+        let Some(request) = self.active_autotune_observation_request() else {
+            return;
+        };
+        self.record_autotune_observation(
+            &request,
+            operations::autotune_capture::AutotuneCaptureObservationKind::IcmpTimeout,
+        );
+    }
+
+    #[cfg(feature = "calibration")]
+    fn observe_autotune_transport(
+        &mut self,
+        latency_ms: f64,
+        baseline_ms: Option<f64>,
+        download_loaded: bool,
+        upload_loaded: bool,
+    ) {
+        let Some(request) = self.active_autotune_observation_request() else {
+            return;
+        };
+        match operations::autotune_capture::transport_observation_kind(
+            &request,
+            latency_ms,
+            baseline_ms,
+            download_loaded,
+            upload_loaded,
+        ) {
+            Ok(Some(kind)) => self.record_autotune_observation(&request, kind),
+            Ok(None) => {}
+            Err(error) => self.reject_autotune_observations("capture-transport-invalid", &error),
+        }
+    }
+
+    #[cfg(feature = "calibration")]
+    fn observe_autotune_traffic(&mut self, rates: RateSample) {
+        if !rates.fresh {
+            return;
+        }
+        let Some(request) = self.active_autotune_observation_request() else {
+            return;
+        };
+        if request.phase != operations::full_autotune::AutotuneCapturePhase::IdleBaseline {
+            return;
+        }
+        let reference = self
+            .autotune_idle_rate_reference
+            .as_ref()
+            .filter(|reference| reference.request == request)
+            .map(|reference| (reference.download_kbps, reference.upload_kbps));
+        let Some((download_reference_kbps, upload_reference_kbps)) = reference else {
+            self.reject_autotune_observations(
+                "capture-idle-reference-missing",
+                "native Auto-Tune idle capture has no identity-bound rate reference",
+            );
+            return;
+        };
+        match operations::autotune_capture::idle_traffic_observation_kind(
+            &request,
+            rates.dl_kbps,
+            rates.ul_kbps,
+            download_reference_kbps,
+            upload_reference_kbps,
+        ) {
+            Ok(Some(kind)) => self.record_autotune_observation(&request, kind),
+            Ok(None) => {}
+            Err(error) => self.reject_autotune_observations("capture-traffic-invalid", &error),
+        }
+    }
+
+    #[cfg(feature = "calibration")]
+    fn observe_autotune_cpu(&mut self, total_percent: f64) {
+        let Some(request) = self.active_autotune_observation_request() else {
+            return;
+        };
+        if request.phase != operations::full_autotune::AutotuneCapturePhase::LoadedMeasurement {
+            return;
+        }
+        if !total_percent.is_finite() || !(0.0..=100.0).contains(&total_percent) {
+            self.reject_autotune_observations(
+                "capture-cpu-invalid",
+                "native Auto-Tune CPU observation is invalid",
+            );
+            return;
+        }
+        self.record_autotune_observation(
+            &request,
+            operations::autotune_capture::AutotuneCaptureObservationKind::Cpu {
+                milli_percent: (total_percent * 1_000.0).round() as u32,
+            },
+        );
     }
 
     fn record_transport_rejection(&mut self, reason: &str) {
@@ -3601,6 +6356,26 @@ impl Controller {
         self.transport_connection_reused = result.connection_reused;
         self.transport_rejected_reason = None;
 
+        #[cfg(feature = "calibration")]
+        {
+            let active_capture = self.active_autotune_observation_request();
+            let baseline_ms = self.transport_latency.snapshot(now, true).baseline_ms;
+            match censored_autotune_transport_observation(
+                &result,
+                active_capture.as_ref(),
+                self.route_identity.as_deref(),
+                baseline_ms,
+            ) {
+                Ok(Some(kind)) => {
+                    self.record_autotune_observation(active_capture.as_ref().unwrap(), kind)
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.reject_autotune_observations("capture-transport-deadline-invalid", &error)
+                }
+            }
+        }
+
         if let Some(error) = result.error.as_deref() {
             self.record_transport_rejection("probe_error");
             self.transport_latency.observe_failure(error);
@@ -3639,6 +6414,70 @@ impl Controller {
             let _ = self.refresh_status_from_last_sample();
             return;
         };
+        let samples = if result.raw_samples_ms.is_empty() {
+            vec![latency_ms]
+        } else {
+            result.raw_samples_ms.clone()
+        };
+        let status_rates = self.last_status.as_ref().map(|status| {
+            (
+                status.dl_rate,
+                status.ul_rate,
+                status.dl_load_pct,
+                status.ul_load_pct,
+            )
+        });
+        #[cfg(feature = "calibration")]
+        let active_autotune_capture = self.active_autotune_observation_request();
+        #[cfg(feature = "calibration")]
+        let autotune_capture_present = result.autotune_capture.is_some();
+        #[cfg(feature = "calibration")]
+        let autotune_capture_matches = result.autotune_capture.is_some()
+            && result.autotune_capture.as_ref() == active_autotune_capture.as_ref();
+        #[cfg(feature = "calibration")]
+        let controller_phase_valid = if autotune_capture_present {
+            if !autotune_capture_matches {
+                self.record_transport_rejection("capture_identity_changed");
+                false
+            } else if result.capture_interval_valid != Some(true) {
+                self.record_transport_rejection("capture_interval_invalid");
+                false
+            } else {
+                result.control_valid
+            }
+        } else {
+            let current_control_phase = status_rates.map(|(_, _, dl_load_pct, ul_load_pct)| {
+                (
+                    dl_load_pct >= self.cfg.high_load_thr * 100.0,
+                    ul_load_pct >= self.cfg.high_load_thr * 100.0,
+                )
+            });
+            result.control_valid
+                && current_control_phase == Some((result.dl_loaded, result.ul_loaded))
+        };
+        #[cfg(not(feature = "calibration"))]
+        let controller_phase_valid = {
+            let current_control_phase = status_rates.map(|(_, _, dl_load_pct, ul_load_pct)| {
+                (
+                    dl_load_pct >= self.cfg.high_load_thr * 100.0,
+                    ul_load_pct >= self.cfg.high_load_thr * 100.0,
+                )
+            });
+            result.control_valid
+                && current_control_phase == Some((result.dl_loaded, result.ul_loaded))
+        };
+        #[cfg(feature = "calibration")]
+        if controller_phase_valid && autotune_capture_matches {
+            let baseline_ms = self.transport_latency.snapshot(now, true).baseline_ms;
+            for sample_ms in samples.iter().copied() {
+                self.observe_autotune_transport(
+                    sample_ms,
+                    baseline_ms,
+                    result.dl_loaded,
+                    result.ul_loaded,
+                );
+            }
+        }
         if self
             .cpu_total_percent
             .map(|cpu| cpu > self.cfg.transport_cpu_max_percent)
@@ -3652,14 +6491,6 @@ impl Controller {
             let _ = self.refresh_status_from_last_sample();
             return;
         }
-        let current_control_phase = self.last_status.as_ref().map(|status| {
-            (
-                status.dl_load_pct >= self.cfg.high_load_thr * 100.0,
-                status.ul_load_pct >= self.cfg.high_load_thr * 100.0,
-            )
-        });
-        let controller_phase_valid = result.control_valid
-            && current_control_phase == Some((result.dl_loaded, result.ul_loaded));
         let rating_phase_valid = self.rating_load_snapshot.phase == result.rating_phase;
         if !rating_phase_valid {
             self.record_transport_rejection("rating_phase_changed");
@@ -3673,11 +6504,6 @@ impl Controller {
             return;
         }
 
-        let samples = if result.raw_samples_ms.is_empty() {
-            vec![latency_ms]
-        } else {
-            result.raw_samples_ms.clone()
-        };
         let grade_route = self.quality_grade_route_key();
         let mut confirmed_delta = None;
         let mut confirmed_dl_delta = None;
@@ -3754,7 +6580,8 @@ impl Controller {
             .as_ref()
             .map(|status| (status.avg_dl_delta, status.avg_ul_delta))
             .unwrap_or((0.0, 0.0));
-        let controller_enabled = self.cfg.transport_controller_enabled;
+        let controller_enabled =
+            self.cfg.transport_controller_enabled && !self.runtime_override_active;
         let target_ms = self.cfg.quality_target_delay_ms;
         if let Some(dl_delta_ms) = confirmed_dl_delta {
             self.quality_dl_class = classify_quality(Some(effective_latency_delta_ms(
@@ -3964,6 +6791,8 @@ impl Controller {
     }
 
     fn reset_uplink_learning(&mut self, reason: &str) {
+        #[cfg(feature = "calibration")]
+        self.reject_autotune_capture_measurement_basis(reason);
         self.dl_baseline_us.clear();
         self.ul_baseline_us.clear();
         self.dl_ewma_us.clear();
@@ -4005,6 +6834,8 @@ impl Controller {
         let changed_existing = !self.route_external_ip.is_empty() && !value.is_empty();
         self.route_external_ip = value;
         if changed_existing {
+            #[cfg(feature = "calibration")]
+            self.reject_autotune_capture_measurement_basis("external route address changed");
             self.transport_latency.reset();
             self.transport_latency_dl.reset();
             self.transport_latency_ul.reset();
@@ -4124,8 +6955,12 @@ impl Controller {
     ) -> RateSample {
         let now = Instant::now();
         let rate_sample = self.rate_monitor.sample();
+        #[cfg(feature = "calibration")]
+        self.update_autotune_capture_rates(rate_sample);
         let dl_rate = rate_sample.dl_kbps;
         let ul_rate = rate_sample.ul_kbps;
+        #[cfg(feature = "calibration")]
+        let autotune_rates = self.autotune_observation_rates(rate_sample);
         let dl_load_pct = percent(dl_rate, self.shaper_dl);
         let ul_load_pct = percent(ul_rate, self.shaper_ul);
 
@@ -4213,6 +7048,16 @@ impl Controller {
             self.cfg.connection_active_thr_kbps,
             high_load_pct,
         );
+        #[cfg(feature = "calibration")]
+        if let Some(autotune_rates) = autotune_rates {
+            self.observe_autotune_icmp(
+                &sample,
+                dl_delta_us,
+                ul_delta_us,
+                autotune_rates.dl_kbps,
+                autotune_rates.ul_kbps,
+            );
+        }
 
         let transport_clean = self.transport_clean_for_growth(now);
         let transport_delta_ms = self
@@ -4223,25 +7068,27 @@ impl Controller {
             && transport_delta_ms
                 .map(|delta| delta > self.cfg.quality_target_delay_ms)
                 .unwrap_or(false);
-        self.update_direction(true, dl_kind, dl_bb, avg_dl_delta, transport_clean, now);
-        self.update_direction(false, ul_kind, ul_bb, avg_ul_delta, transport_clean, now);
-        self.update_adaptive_ceilings(
-            dl_kind,
-            ul_kind,
-            dl_rate,
-            ul_rate,
-            dl_bb || (matches!(dl_kind, LoadKind::High) && transport_bloat),
-            ul_bb || (matches!(ul_kind, LoadKind::High) && transport_bloat),
-            dl_delay_count,
-            ul_delay_count,
-            avg_dl_delta,
-            avg_ul_delta,
-            transport_clean,
-            now,
-        );
-        self.clamp_rates();
-        self.apply_shaper("dl");
-        self.apply_shaper("ul");
+        if !self.runtime_override_active {
+            self.update_direction(true, dl_kind, dl_bb, avg_dl_delta, transport_clean, now);
+            self.update_direction(false, ul_kind, ul_bb, avg_ul_delta, transport_clean, now);
+            self.update_adaptive_ceilings(
+                dl_kind,
+                ul_kind,
+                dl_rate,
+                ul_rate,
+                dl_bb || (matches!(dl_kind, LoadKind::High) && transport_bloat),
+                ul_bb || (matches!(ul_kind, LoadKind::High) && transport_bloat),
+                dl_delay_count,
+                ul_delay_count,
+                avg_dl_delta,
+                avg_ul_delta,
+                transport_clean,
+                now,
+            );
+            self.clamp_rates();
+            self.apply_shaper("dl");
+            self.apply_shaper("ul");
+        }
 
         if self.cfg.output_processing_stats {
             let dl_ewma_us = self
@@ -4367,6 +7214,8 @@ impl Controller {
 
         self.cpu_total_percent = Some(stats.total_percent);
         self.cpu_core_percentages = stats.core_percentages.clone();
+        #[cfg(feature = "calibration")]
+        self.observe_autotune_cpu(stats.total_percent);
 
         if self.cfg.output_cpu_raw_stats {
             for raw_line in stats.raw_lines {
@@ -4727,6 +7576,9 @@ impl Controller {
     }
 
     fn apply_shaper(&mut self, direction: &str) {
+        if self.runtime_override_active {
+            return;
+        }
         let is_dl = direction == "dl";
         let (interface, adjust, rate, last, last_attempt_elapsed) = if is_dl {
             (
@@ -4761,41 +7613,63 @@ impl Controller {
             self.last_shaper_attempt_ul = Instant::now();
         }
 
+        let qdisc_kind = match self.qdisc_kind(is_dl, &interface) {
+            Ok(kind) => kind,
+            Err(error) => {
+                self.log(
+                    "ERROR",
+                    &format!("unable to identify CAKE qdisc on {interface}: {error}"),
+                );
+                return;
+            }
+        };
+
         if self.cfg.output_cake_changes {
             self.log(
                 "SHAPER",
-                &format!("tc qdisc change root dev {interface} cake bandwidth {rounded}Kbit"),
+                &format!(
+                    "tc qdisc change root dev {interface} {} bandwidth {rounded}Kbit",
+                    qdisc_kind.as_tc_kind()
+                ),
             );
         }
 
-        let status = Command::new("tc")
-            .arg("qdisc")
-            .arg("change")
-            .arg("root")
-            .arg("dev")
-            .arg(&interface)
-            .arg("cake")
-            .arg("bandwidth")
-            .arg(format!("{rounded}Kbit"))
-            .status();
-
-        match status {
-            Ok(s) if s.success() => {
+        match change_cake_rate(&interface, rounded, qdisc_kind) {
+            Ok(()) => {
                 if is_dl {
                     self.last_set_dl = rounded;
                 } else {
                     self.last_set_ul = rounded;
                 }
             }
-            Ok(s) => self.log(
-                "ERROR",
-                &format!("tc failed for {interface} with status {s}"),
-            ),
-            Err(e) => self.log(
-                "ERROR",
-                &format!("failed to execute tc for {interface}: {e}"),
-            ),
+            Err(error) => {
+                if is_dl {
+                    self.dl_qdisc_kind = None;
+                } else {
+                    self.ul_qdisc_kind = None;
+                }
+                self.log("ERROR", &format!("tc failed for {interface}: {error}"));
+            }
         }
+    }
+
+    fn qdisc_kind(&mut self, download: bool, interface: &str) -> Result<CakeQdiscKind, String> {
+        let cached = if download {
+            self.dl_qdisc_kind
+        } else {
+            self.ul_qdisc_kind
+        };
+        if let Some(kind) = cached {
+            return Ok(kind);
+        }
+        let output = tc_output(&["qdisc", "show", "dev", interface])?;
+        let (kind, _) = root_cake_qdisc(&output)?;
+        if download {
+            self.dl_qdisc_kind = Some(kind);
+        } else {
+            self.ul_qdisc_kind = Some(kind);
+        }
+        Ok(kind)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5192,6 +8066,100 @@ impl Controller {
             adaptive_capacity,
         )?;
         fs::rename(tmp, path)?;
+        #[cfg(feature = "calibration")]
+        {
+            let runtime_rating = quality_grade
+                .capture_result
+                .as_ref()
+                .or(quality_grade.current.as_ref());
+            let current_rating =
+                runtime_rating.map(|current| operations::rating::RatingResultSnapshot {
+                    grade: current.class.as_str().to_string(),
+                    increase_ms: current.increase_ms,
+                    started_unix_ms: (current.started_at.max(0.0) * 1000.0).round() as u64,
+                    partial: current.partial,
+                    incomplete: current.incomplete,
+                    dl_grade: current
+                        .dl
+                        .as_ref()
+                        .map(|metric| metric.class.as_str().to_string())
+                        .unwrap_or_default(),
+                    ul_grade: current
+                        .ul
+                        .as_ref()
+                        .map(|metric| metric.class.as_str().to_string())
+                        .unwrap_or_default(),
+                    dl_samples: current.dl_samples as u64,
+                    ul_samples: current.ul_samples as u64,
+                });
+            let updated_unix_ms = (epoch_secs() * 1000.0).round() as u64;
+            let rating_runtime = operations::rating::RatingRuntimeSnapshot {
+                updated_unix_ms,
+                capture_observed_unix_ms: self.rating_load_observed_unix_ms.min(updated_unix_ms),
+                runtime_generation: self.runtime_generation,
+                uplink_state: self.uplink_state.as_str().to_string(),
+                route_active,
+                route_test_ready,
+                sqm_runtime_managed: self.cfg.manage_sqm && self.cfg.sqm_enabled,
+                sqm_runtime_healthy: self.sqm_runtime_healthy,
+                transport_probe_trusted: self.transport_trusted,
+                baseline_ready: quality_grade.baseline_ready,
+                baseline_samples: quality_grade.baseline_samples as u64,
+                baseline_required_samples: quality_grade.baseline_required_samples as u64,
+                required_samples: quality_grade.required_samples as u64,
+                dl_samples: quality_grade.dl_samples as u64,
+                ul_samples: quality_grade.ul_samples as u64,
+                dl_achieved_kbps: dl_rate,
+                ul_achieved_kbps: ul_rate,
+                cake_dl_kbps: reported_cake_dl,
+                cake_ul_kbps: reported_cake_ul,
+                download_qdisc_kind: published_runtime_qdisc_kind(
+                    self.cfg.download_shaping_enabled(),
+                    self.dl_qdisc_kind,
+                ),
+                upload_qdisc_kind: published_runtime_qdisc_kind(
+                    self.cfg.upload_shaping_enabled(),
+                    self.ul_qdisc_kind,
+                ),
+                reference_dl_kbps: self.rating_load_snapshot.reference_dl_kbps,
+                reference_ul_kbps: self.rating_load_snapshot.reference_ul_kbps,
+                capture_active: self.rating_load_snapshot.capture_active,
+                capture_job_id: self.rating_load_snapshot.capture_job_id.clone(),
+                capture_generation: self.rating_load_snapshot.capture_generation,
+                finalized_job_id: self.rating_load_snapshot.finalized_job_id.clone(),
+                finalized_generation: self.rating_load_snapshot.finalized_generation,
+                finalized_outcome: self.rating_load_snapshot.finalized_outcome.clone(),
+                capture_phase: self
+                    .rating_load_snapshot
+                    .capture_requested_phase
+                    .to_string(),
+                capture_contaminated: self.rating_load_snapshot.capture_contaminated,
+                current_capture_job_id: runtime_rating
+                    .map(|current| current.capture_job_id.clone())
+                    .unwrap_or_default(),
+                current_capture_generation: runtime_rating
+                    .map(|current| current.capture_generation)
+                    .unwrap_or(0),
+                current: current_rating,
+            };
+            match rating_runtime.write_atomic(&self.cfg.run_dir().join("rating-runtime")) {
+                Ok(()) => {
+                    if self.rating_runtime_faulted {
+                        self.log("INFO", "rating runtime publication recovered");
+                    }
+                    self.rating_runtime_faulted = false;
+                }
+                Err(error) => {
+                    if !self.rating_runtime_faulted {
+                        self.log(
+                            "ERROR",
+                            &format!("rating runtime publication failed closed: {error}"),
+                        );
+                    }
+                    self.rating_runtime_faulted = true;
+                }
+            }
+        }
         self.last_status_publish = Instant::now();
         Ok(())
     }
@@ -5277,11 +8245,1505 @@ impl Controller {
     }
 }
 
+fn configured_measurement_topology(cfg: &Config) -> operations::full_autotune::MeasurementTopology {
+    use operations::full_autotune::MeasurementTopology;
+    match (cfg.download_shaping_enabled(), cfg.upload_shaping_enabled()) {
+        (true, true) => MeasurementTopology::ShapedBoth,
+        (true, false) => MeasurementTopology::DownloadOnlyShaped,
+        (false, true) => MeasurementTopology::UploadOnlyShaped,
+        (false, false) => MeasurementTopology::RawBoth,
+    }
+}
+
+fn measurement_topology_directions(
+    topology: operations::full_autotune::MeasurementTopology,
+) -> (bool, bool) {
+    use operations::full_autotune::MeasurementTopology;
+    let download = matches!(
+        topology,
+        MeasurementTopology::ShapedBoth
+            | MeasurementTopology::RawUpload
+            | MeasurementTopology::DownloadOnlyShaped
+    );
+    let upload = matches!(
+        topology,
+        MeasurementTopology::ShapedBoth
+            | MeasurementTopology::RawDownload
+            | MeasurementTopology::UploadOnlyShaped
+    );
+    (download, upload)
+}
+
+fn topology_is_supported_by_config(
+    cfg: &Config,
+    topology: operations::full_autotune::MeasurementTopology,
+) -> bool {
+    let (download, upload) = measurement_topology_directions(topology);
+    (!download || cfg.download_shaping_enabled()) && (!upload || cfg.upload_shaping_enabled())
+}
+
+fn attest_rate_only_runtime(
+    controller: &mut Controller,
+    expected: &operations::autotune_runtime::RuntimeSnapshot,
+) -> Result<operations::autotune_runtime::RuntimeSnapshot, String> {
+    if expected.target_interface != controller.cfg.sqm_interface
+        || !topology_is_supported_by_config(&controller.cfg, expected.topology)
+    {
+        return Err(
+            "runtime attestation requests shaping outside the configured SQM topology".to_string(),
+        );
+    }
+    let current_sqm_fingerprint = operations::sqm_identity::managed_sqm_identity_fingerprint(
+        &controller.cfg.instance,
+        &controller.cfg.sqm_section,
+        &controller.cfg.sqm_interface,
+    )?;
+    if current_sqm_fingerprint != expected.sqm_fingerprint {
+        return Err("live SQM configuration fingerprint changed".to_string());
+    }
+    let (download_shaped, upload_shaped) = measurement_topology_directions(expected.topology);
+    inspect_sqm_topology_for(&controller.cfg, download_shaped, upload_shaped)
+        .map_err(|error| error.to_string())?;
+    let download_kbps = if download_shaped {
+        let output = topology_tc_output(&["qdisc", "show", "dev", &controller.cfg.dl_if])
+            .map_err(|error| error.to_string())?;
+        let (kind, rate) = root_cake_qdisc(&output)?;
+        controller.dl_qdisc_kind = Some(kind);
+        Some(rate)
+    } else {
+        controller.dl_qdisc_kind = None;
+        None
+    };
+    let upload_kbps = if upload_shaped {
+        let output = topology_tc_output(&["qdisc", "show", "dev", &controller.cfg.ul_if])
+            .map_err(|error| error.to_string())?;
+        let (kind, rate) = root_cake_qdisc(&output)?;
+        controller.ul_qdisc_kind = Some(kind);
+        Some(rate)
+    } else {
+        controller.ul_qdisc_kind = None;
+        None
+    };
+    Ok(operations::autotune_runtime::RuntimeSnapshot {
+        target_interface: controller.cfg.sqm_interface.clone(),
+        route_fingerprint: expected.route_fingerprint.clone(),
+        sqm_fingerprint: expected.sqm_fingerprint.clone(),
+        topology: expected.topology,
+        download_kbps,
+        upload_kbps,
+        download_qdisc_kind: controller.dl_qdisc_kind.map(Into::into),
+        upload_qdisc_kind: controller.ul_qdisc_kind.map(Into::into),
+    })
+}
+
+#[cfg(feature = "calibration")]
+fn attest_loaded_capture_runtime(
+    cfg: &Config,
+    permit: &operations::autotune_runtime::AutotuneRuntimePermit,
+    expected: &operations::autotune_runtime::RuntimeSnapshot,
+    checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
+) -> Result<operations::autotune_runtime::RuntimeSnapshot, String> {
+    use operations::autotune_runtime::TemporaryTopologyStage;
+
+    // Bind the complete durable owner before consulting any live interface.
+    // A loaded capture is never allowed to fall back to the persistent UCI
+    // dl_if/ul_if pair: its CAKE objects belong to the permit-owned temporary
+    // topology and may intentionally replace a directional managed baseline.
+    checkpoint.validate_against(permit)?;
+    if checkpoint.temporary_stage != TemporaryTopologyStage::Active {
+        return Err(format!(
+            "loaded capture runtime is not active (temporary stage {})",
+            checkpoint.temporary_stage.as_str()
+        ));
+    }
+    attest_private_runtime(&cfg.sqm_interface, expected, checkpoint)
+}
+
+struct OpenWrtRateOverrideActuator<'a> {
+    controller: &'a mut Controller,
+    boot_ms: u64,
+}
+
+fn unsafe_runtime_actuator_error(
+    message: impl Into<String>,
+) -> operations::autotune_runtime_driver::RuntimeActuatorError {
+    operations::autotune_runtime_driver::RuntimeActuatorError::Unsafe(message.into())
+}
+
+fn target_unavailable_runtime_blocker(
+    cfg: &Config,
+    message: impl Into<String>,
+) -> operations::autotune_runtime_driver::RuntimeActuatorError {
+    operations::autotune_runtime_driver::RuntimeActuatorError::Blocked(
+        operations::autotune_runtime_driver::RuntimeRestoreBlocker::TargetUnavailable {
+            target_interface: cfg.sqm_interface.clone(),
+            detail: message.into(),
+        },
+    )
+}
+
+fn sqm_recovery_busy_runtime_blocker(
+    cfg: &Config,
+    message: impl Into<String>,
+) -> operations::autotune_runtime_driver::RuntimeActuatorError {
+    operations::autotune_runtime_driver::RuntimeActuatorError::Blocked(
+        operations::autotune_runtime_driver::RuntimeRestoreBlocker::SqmRecoveryBusy {
+            target_interface: cfg.sqm_interface.clone(),
+            detail: message.into(),
+        },
+    )
+}
+
+fn topology_settling_runtime_blocker(
+    cfg: &Config,
+    message: impl Into<String>,
+) -> operations::autotune_runtime_driver::RuntimeActuatorError {
+    operations::autotune_runtime_driver::RuntimeActuatorError::Blocked(
+        operations::autotune_runtime_driver::RuntimeRestoreBlocker::TopologySettling {
+            target_interface: cfg.sqm_interface.clone(),
+            detail: message.into(),
+        },
+    )
+}
+
+fn recovery_interrupted_runtime_blocker(
+    cfg: &Config,
+    message: impl Into<String>,
+) -> operations::autotune_runtime_driver::RuntimeActuatorError {
+    operations::autotune_runtime_driver::RuntimeActuatorError::Blocked(
+        operations::autotune_runtime_driver::RuntimeRestoreBlocker::RecoveryInterrupted {
+            target_interface: cfg.sqm_interface.clone(),
+            detail: message.into(),
+        },
+    )
+}
+
+fn classify_sqm_recovery_error(
+    cfg: &Config,
+    error: SqmRecoveryError,
+) -> operations::autotune_runtime_driver::RuntimeActuatorError {
+    match error {
+        SqmRecoveryError::Busy(message) => sqm_recovery_busy_runtime_blocker(cfg, message),
+        SqmRecoveryError::Failed(message) if !managed_sqm_target_ready(cfg) => {
+            target_unavailable_runtime_blocker(cfg, message)
+        }
+        SqmRecoveryError::Failed(message) => unsafe_runtime_actuator_error(message),
+        SqmRecoveryError::Terminated => {
+            recovery_interrupted_runtime_blocker(cfg, "managed SQM recovery was interrupted")
+        }
+    }
+}
+
+fn classify_topology_error(
+    cfg: &Config,
+    error: SqmTopologyError,
+) -> operations::autotune_runtime_driver::RuntimeActuatorError {
+    match error.kind {
+        SqmTopologyErrorKind::Settling => topology_settling_runtime_blocker(cfg, error.to_string()),
+        SqmTopologyErrorKind::Unsafe => unsafe_runtime_actuator_error(error.to_string()),
+    }
+}
+
+fn classify_tc_mutation_error(
+    cfg: &Config,
+    message: String,
+) -> operations::autotune_runtime_driver::RuntimeActuatorError {
+    if managed_sqm_target_ready(cfg) {
+        unsafe_runtime_actuator_error(message)
+    } else {
+        target_unavailable_runtime_blocker(cfg, message)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrivateRootState {
+    AbsentOrKernelDefault,
+    Exact(u64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrivateIngressState {
+    Absent,
+    Exact,
+}
+
+fn runtime_ip_output(args: &[&str]) -> Result<String, String> {
+    let ip = env::var("CAKE_AUTORATE_IP").unwrap_or_else(|_| "ip".to_string());
+    let output = Command::new(&ip)
+        .args(args)
+        .output()
+        .map_err(|error| format!("failed to execute {ip}: {error}"))?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if detail.is_empty() {
+        format!("ip {} failed with {}", args.join(" "), output.status)
+    } else {
+        detail
+    })
+}
+
+fn runtime_tc_output(args: &[String]) -> Result<String, String> {
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    tc_output(&refs)
+}
+
+fn private_profile_matches(
+    line: &str,
+    profile: crate::autotune::AutotuneProfile,
+    download: bool,
+) -> bool {
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    let has = |value: &str| fields.contains(&value);
+    if !has("nat") {
+        return false;
+    }
+    match profile {
+        crate::autotune::AutotuneProfile::Gaming
+        | crate::autotune::AutotuneProfile::GamingExtreme => has("diffserv4") && !has("wash"),
+        crate::autotune::AutotuneProfile::BestOverall
+        | crate::autotune::AutotuneProfile::VariableLink
+        | crate::autotune::AutotuneProfile::Fair => {
+            if download {
+                has("besteffort") && has("wash")
+            } else {
+                has("diffserv4") && !has("wash")
+            }
+        }
+    }
+}
+
+fn private_link_matches(line: &str, link_kind: crate::autotune::LinkKind) -> bool {
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    let value_after = |name: &str| {
+        fields
+            .windows(2)
+            .find_map(|pair| (pair[0] == name).then_some(pair[1]))
+    };
+    match link_kind {
+        crate::autotune::LinkKind::Pppoe => {
+            fields.contains(&"noatm")
+                && !fields.contains(&"raw")
+                && value_after("overhead") == Some("44")
+                && value_after("mpu") == Some("84")
+        }
+        crate::autotune::LinkKind::Ethernet => {
+            fields.contains(&"noatm")
+                && !fields.contains(&"raw")
+                && value_after("overhead") == Some("18")
+                && value_after("mpu") == Some("64")
+        }
+        crate::autotune::LinkKind::Cellular | crate::autotune::LinkKind::Unknown => {
+            fields.contains(&"raw")
+        }
+    }
+}
+
+fn inspect_private_root(
+    device: &str,
+    handle: &str,
+    profile: crate::autotune::AutotuneProfile,
+    link_kind: crate::autotune::LinkKind,
+    download: bool,
+) -> Result<PrivateRootState, String> {
+    let output = tc_output(&["qdisc", "show", "dev", device])?;
+    parse_private_root_output(&output, device, handle, profile, link_kind, download)
+}
+
+fn parse_private_root_output(
+    output: &str,
+    device: &str,
+    handle: &str,
+    profile: crate::autotune::AutotuneProfile,
+    link_kind: crate::autotune::LinkKind,
+    download: bool,
+) -> Result<PrivateRootState, String> {
+    let mut exact = None;
+    let mut foreign = Vec::new();
+    for line in output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.first() != Some(&"qdisc") || !fields.contains(&"root") {
+            continue;
+        }
+        let kind = fields.get(1).copied().unwrap_or_default();
+        let found_handle = fields.get(2).copied().unwrap_or_default();
+        if kind == "cake" && found_handle == handle {
+            if exact.is_some()
+                || !private_profile_matches(line, profile, download)
+                || !private_link_matches(line, link_kind)
+            {
+                return Err(format!(
+                    "private CAKE qdisc on {device} is duplicated or has unexpected policy"
+                ));
+            }
+            exact = Some(root_cake_qdisc(line)?.1);
+        } else if !(found_handle == "0:"
+            && matches!(kind, "mq" | "noqueue" | "fq_codel" | "pfifo_fast"))
+        {
+            foreign.push(line.to_string());
+        }
+    }
+    if !foreign.is_empty() {
+        return Err(format!(
+            "refusing to replace foreign root qdisc state on {device}"
+        ));
+    }
+    Ok(exact
+        .map(PrivateRootState::Exact)
+        .unwrap_or(PrivateRootState::AbsentOrKernelDefault))
+}
+
+fn inspect_private_ingress(
+    target: &str,
+    checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
+) -> Result<PrivateIngressState, String> {
+    let qdiscs = tc_output(&["qdisc", "show", "dev", target])?;
+    let filters = tc_output(&["filter", "show", "dev", target, "ingress"])?;
+    parse_private_ingress_output(&qdiscs, &filters, target, checkpoint)
+}
+
+fn parse_private_ingress_output(
+    qdiscs: &str,
+    filters: &str,
+    target: &str,
+    checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
+) -> Result<PrivateIngressState, String> {
+    let ingress = qdiscs
+        .lines()
+        .filter(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            fields.first() == Some(&"qdisc")
+                && (fields.get(1) == Some(&"ingress") || fields.get(1) == Some(&"clsact"))
+        })
+        .collect::<Vec<_>>();
+    if ingress.is_empty() && filters.trim().is_empty() {
+        return Ok(PrivateIngressState::Absent);
+    }
+    if ingress.len() != 1 {
+        return Err(format!(
+            "refusing to replace ambiguous ingress state on {target}"
+        ));
+    }
+    let qdisc_fields = ingress[0].split_whitespace().collect::<Vec<_>>();
+    if qdisc_fields.get(1) != Some(&"ingress")
+        || qdisc_fields.get(2).copied() != Some(checkpoint.temporary.ingress_qdisc_handle.as_str())
+    {
+        return Err(format!("refusing to replace foreign ingress on {target}"));
+    }
+    checkpoint.temporary.validate()?;
+    let preference = checkpoint.temporary.redirect_preference.to_string();
+    let filter_handle = checkpoint.temporary.redirect_filter_tc_handle()?;
+    let action_index = checkpoint.temporary.redirect_action_index.to_string();
+    let action_cookie = checkpoint.temporary.redirect_action_cookie.as_str();
+    let mut filter_headers = 0_u8;
+    let mut root_tables = 0_u8;
+    let mut filter_nodes = 0_u8;
+    let mut matches = 0_u8;
+    let mut redirects = 0_u8;
+    let mut action_indexes = 0_u8;
+    let mut action_cookies = 0_u8;
+    for line in filters
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.first() == Some(&"filter") {
+            let line_pref = fields
+                .windows(2)
+                .find_map(|pair| (pair[0] == "pref").then_some(pair[1]));
+            if line_pref != Some(preference.as_str()) {
+                return Err(format!(
+                    "refusing to replace foreign ingress filter on {target}"
+                ));
+            }
+            filter_headers = filter_headers.saturating_add(1);
+            if let Some(handle) = fields
+                .windows(2)
+                .find_map(|pair| (pair[0] == "fh").then_some(pair[1]))
+            {
+                if handle == "800:" {
+                    if !fields.windows(3).any(|part| part == ["ht", "divisor", "1"]) {
+                        return Err(format!(
+                            "temporary ingress u32 root is not canonical on {target}"
+                        ));
+                    }
+                    root_tables = root_tables.saturating_add(1);
+                } else if handle == filter_handle {
+                    if !fields.contains(&"terminal") {
+                        return Err(format!(
+                            "temporary ingress u32 node is not terminal on {target}"
+                        ));
+                    }
+                    filter_nodes = filter_nodes.saturating_add(1);
+                } else {
+                    return Err(format!(
+                        "refusing to replace foreign ingress filter on {target}"
+                    ));
+                }
+            }
+        }
+        if fields.first() == Some(&"match") {
+            if line != "match 00000000/00000000 at 0" {
+                return Err(format!(
+                    "temporary ingress classifier is not an exact match-all rule on {target}"
+                ));
+            }
+            matches = matches.saturating_add(1);
+        }
+        if fields.first() == Some(&"action") {
+            let expected = format!(
+                "mirred (Egress Redirect to device {})",
+                checkpoint.temporary.ifb_name
+            );
+            if !line.contains(&expected) {
+                return Err(format!(
+                    "temporary ingress action is not the owned redirect on {target}"
+                ));
+            }
+            redirects = redirects.saturating_add(1);
+        }
+        if fields.first() == Some(&"index") {
+            if fields.get(1).copied() != Some(action_index.as_str()) {
+                return Err(format!(
+                    "temporary ingress action index is foreign on {target}"
+                ));
+            }
+            action_indexes = action_indexes.saturating_add(1);
+        }
+        if fields.first() == Some(&"cookie") {
+            if fields.get(1).copied() != Some(action_cookie) {
+                return Err(format!(
+                    "temporary ingress action cookie is foreign on {target}"
+                ));
+            }
+            action_cookies = action_cookies.saturating_add(1);
+        }
+    }
+    if filter_headers != 3
+        || root_tables != 1
+        || filter_nodes != 1
+        || matches != 1
+        || redirects != 1
+        || action_indexes != 1
+        || action_cookies != 1
+    {
+        return Err(format!(
+            "temporary ingress ownership could not be attested on {target}"
+        ));
+    }
+    Ok(PrivateIngressState::Exact)
+}
+
+fn private_ingress_filter_args(
+    target: &str,
+    checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
+) -> Result<Vec<String>, String> {
+    checkpoint.temporary.validate()?;
+    Ok(vec![
+        "filter".to_string(),
+        "add".to_string(),
+        "dev".to_string(),
+        target.to_string(),
+        "parent".to_string(),
+        checkpoint.temporary.ingress_qdisc_handle.clone(),
+        "protocol".to_string(),
+        "all".to_string(),
+        "pref".to_string(),
+        checkpoint.temporary.redirect_preference.to_string(),
+        "handle".to_string(),
+        checkpoint.temporary.redirect_filter_tc_handle()?,
+        "u32".to_string(),
+        "match".to_string(),
+        "u32".to_string(),
+        "0".to_string(),
+        "0".to_string(),
+        "action".to_string(),
+        "mirred".to_string(),
+        "egress".to_string(),
+        "redirect".to_string(),
+        "index".to_string(),
+        checkpoint.temporary.redirect_action_index.to_string(),
+        "dev".to_string(),
+        checkpoint.temporary.ifb_name.clone(),
+        "cookie".to_string(),
+        checkpoint.temporary.redirect_action_cookie.clone(),
+    ])
+}
+
+fn exact_private_ifb(
+    checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
+    require_ifindex: bool,
+) -> Result<bool, String> {
+    let root = sqm_sys_class_net();
+    let path = root.join(&checkpoint.temporary.ifb_name);
+    if !path.exists() {
+        return Ok(false);
+    }
+    let alias = fs::read_to_string(path.join("ifalias"))
+        .map_err(|error| format!("unable to read temporary IFB alias: {error}"))?;
+    if alias.trim() != checkpoint.temporary.ifb_alias {
+        return Err("temporary IFB alias does not match durable ownership".to_string());
+    }
+    let ifindex = fs::read_to_string(path.join("ifindex"))
+        .map_err(|error| format!("unable to read temporary IFB ifindex: {error}"))?
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| "temporary IFB ifindex is invalid".to_string())?;
+    if require_ifindex && checkpoint.temporary.ifb_ifindex != Some(ifindex) {
+        return Err("temporary IFB ifindex does not match durable ownership".to_string());
+    }
+    let details = runtime_ip_output(&[
+        "-details",
+        "link",
+        "show",
+        "dev",
+        &checkpoint.temporary.ifb_name,
+    ])?;
+    if !details.split_whitespace().any(|field| field == "ifb") {
+        return Err("temporary owned link is not an IFB".to_string());
+    }
+    Ok(true)
+}
+
+fn replace_private_cake(
+    device: &str,
+    handle: &str,
+    rate_kbps: u64,
+    profile: crate::autotune::AutotuneProfile,
+    link_kind: crate::autotune::LinkKind,
+    download: bool,
+) -> Result<(), String> {
+    runtime_tc_output(&private_cake_args(
+        device, handle, rate_kbps, profile, link_kind, download,
+    )?)
+    .map(|_| ())
+}
+
+fn private_cake_args(
+    device: &str,
+    handle: &str,
+    rate_kbps: u64,
+    profile: crate::autotune::AutotuneProfile,
+    link_kind: crate::autotune::LinkKind,
+    download: bool,
+) -> Result<Vec<String>, String> {
+    if !(100..=autotune::MAX_RATE_KBPS).contains(&rate_kbps) {
+        return Err("private CAKE rate is outside the supported range".to_string());
+    }
+    let mut args = vec![
+        "qdisc".to_string(),
+        "replace".to_string(),
+        "dev".to_string(),
+        device.to_string(),
+        "root".to_string(),
+        "handle".to_string(),
+        handle.to_string(),
+        "cake".to_string(),
+        "bandwidth".to_string(),
+        format!("{rate_kbps}kbit"),
+    ];
+    match profile {
+        crate::autotune::AutotuneProfile::Gaming
+        | crate::autotune::AutotuneProfile::GamingExtreme => {
+            args.extend(["diffserv4", "nat"].map(str::to_string));
+        }
+        crate::autotune::AutotuneProfile::BestOverall
+        | crate::autotune::AutotuneProfile::VariableLink
+        | crate::autotune::AutotuneProfile::Fair => {
+            if download {
+                args.extend(["besteffort", "nat", "wash"].map(str::to_string));
+            } else {
+                args.extend(["diffserv4", "nat"].map(str::to_string));
+            }
+        }
+    }
+    match link_kind {
+        crate::autotune::LinkKind::Pppoe => {
+            args.extend(["ethernet", "overhead", "44", "mpu", "84"].map(str::to_string));
+        }
+        crate::autotune::LinkKind::Ethernet => {
+            args.extend(["ethernet", "overhead", "18", "mpu", "64"].map(str::to_string));
+        }
+        crate::autotune::LinkKind::Cellular | crate::autotune::LinkKind::Unknown => {
+            args.push("raw".to_string());
+        }
+    }
+    Ok(args)
+}
+
+fn delete_private_root_if_present(
+    device: &str,
+    handle: &str,
+    profile: crate::autotune::AutotuneProfile,
+    link_kind: crate::autotune::LinkKind,
+    download: bool,
+) -> Result<(), String> {
+    match inspect_private_root(device, handle, profile, link_kind, download)? {
+        PrivateRootState::AbsentOrKernelDefault => Ok(()),
+        PrivateRootState::Exact(_) => delete_qdisc(device, "root"),
+    }
+}
+
+fn attach_private_ingress(
+    target: &str,
+    checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
+) -> Result<(), String> {
+    match inspect_private_ingress(target, checkpoint)? {
+        PrivateIngressState::Exact => return Ok(()),
+        PrivateIngressState::Absent => {}
+    }
+    let qdisc = vec![
+        "qdisc".to_string(),
+        "add".to_string(),
+        "dev".to_string(),
+        target.to_string(),
+        "handle".to_string(),
+        checkpoint.temporary.ingress_qdisc_handle.clone(),
+        "ingress".to_string(),
+    ];
+    runtime_tc_output(&qdisc)?;
+    let filter = private_ingress_filter_args(target, checkpoint)?;
+    if let Err(error) = runtime_tc_output(&filter) {
+        let _ = delete_qdisc(target, "ingress");
+        return Err(error);
+    }
+    if inspect_private_ingress(target, checkpoint)? != PrivateIngressState::Exact {
+        return Err("temporary ingress postcondition failed".to_string());
+    }
+    Ok(())
+}
+
+fn delete_private_ingress_if_present(
+    target: &str,
+    checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
+) -> Result<(), String> {
+    match inspect_private_ingress(target, checkpoint)? {
+        PrivateIngressState::Absent => Ok(()),
+        PrivateIngressState::Exact => delete_qdisc(target, "ingress"),
+    }
+}
+
+fn stop_managed_sqm_with<F>(
+    helper: &Path,
+    target_interface: &str,
+    timeout: Duration,
+    should_cancel: F,
+) -> Result<(), String>
+where
+    F: Fn() -> bool,
+{
+    let spec = operations::process::SpawnSpec {
+        program: helper.to_path_buf(),
+        arguments: vec![OsString::from("stop"), OsString::from(target_interface)],
+        environment: Vec::new(),
+    };
+    let output = operations::process::run_bounded_command_output(
+        &spec,
+        timeout,
+        SQM_RUNTIME_STOP_OUTPUT_LIMIT,
+        should_cancel,
+    )
+    .map_err(|error| format!("managed SQM stop helper failed safely: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if detail.is_empty() {
+        format!("managed SQM stop failed with {}", output.status)
+    } else {
+        detail
+    })
+}
+
+fn stop_managed_sqm_for_runtime(cfg: &Config) -> Result<(), String> {
+    let helper = env::var_os("CAKE_AUTORATE_SQM_RUN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/usr/lib/sqm/run.sh"));
+    stop_managed_sqm_with(
+        &helper,
+        &cfg.sqm_interface,
+        SQM_RUNTIME_STOP_TIMEOUT,
+        || TERMINATE.load(Ordering::SeqCst),
+    )
+}
+
+fn create_private_ifb(
+    checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
+) -> Result<u32, String> {
+    if exact_private_ifb(checkpoint, false)? {
+        return Err("refusing to reuse an existing temporary IFB".to_string());
+    }
+    runtime_ip_output(&[
+        "link",
+        "add",
+        "name",
+        &checkpoint.temporary.ifb_name,
+        "type",
+        "ifb",
+    ])?;
+    if let Err(error) = runtime_ip_output(&[
+        "link",
+        "set",
+        "dev",
+        &checkpoint.temporary.ifb_name,
+        "alias",
+        &checkpoint.temporary.ifb_alias,
+    ]) {
+        let _ = runtime_ip_output(&[
+            "link",
+            "delete",
+            "dev",
+            &checkpoint.temporary.ifb_name,
+            "type",
+            "ifb",
+        ]);
+        return Err(error);
+    }
+    runtime_ip_output(&["link", "set", "dev", &checkpoint.temporary.ifb_name, "up"])?;
+    let ifindex = fs::read_to_string(
+        sqm_sys_class_net()
+            .join(&checkpoint.temporary.ifb_name)
+            .join("ifindex"),
+    )
+    .map_err(|error| format!("unable to read created temporary IFB ifindex: {error}"))?
+    .trim()
+    .parse::<u32>()
+    .map_err(|_| "created temporary IFB ifindex is invalid".to_string())?;
+    if ifindex == 0 || !exact_private_ifb(checkpoint, false)? {
+        return Err("created temporary IFB ownership could not be attested".to_string());
+    }
+    Ok(ifindex)
+}
+
+fn delete_private_ifb(
+    checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
+    require_ifindex: bool,
+) -> Result<(), String> {
+    if !exact_private_ifb(checkpoint, require_ifindex)? {
+        return Ok(());
+    }
+    runtime_ip_output(&["link", "set", "dev", &checkpoint.temporary.ifb_name, "down"])?;
+    runtime_ip_output(&[
+        "link",
+        "delete",
+        "dev",
+        &checkpoint.temporary.ifb_name,
+        "type",
+        "ifb",
+    ])?;
+    if sqm_sys_class_net()
+        .join(&checkpoint.temporary.ifb_name)
+        .exists()
+    {
+        return Err("temporary IFB remains after deletion".to_string());
+    }
+    Ok(())
+}
+
+fn apply_private_runtime_topology(
+    target: &str,
+    control: &operations::full_autotune::AutotuneRuntimeControl,
+    checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
+) -> Result<(), String> {
+    if checkpoint.temporary_stage != operations::autotune_runtime::TemporaryTopologyStage::LinkOwned
+        && checkpoint.temporary_stage
+            != operations::autotune_runtime::TemporaryTopologyStage::Active
+    {
+        return Err("private runtime topology is not owned for mutation".to_string());
+    }
+    if !exact_private_ifb(checkpoint, true)? {
+        return Err("owned temporary IFB is missing".to_string());
+    }
+    let ifb = checkpoint.temporary.ifb_name.as_str();
+    let upload_state = inspect_private_root(
+        target,
+        &checkpoint.temporary.target_qdisc_handle,
+        checkpoint.profile,
+        checkpoint.link_kind,
+        false,
+    )?;
+    let download_state = inspect_private_root(
+        ifb,
+        &checkpoint.temporary.ifb_qdisc_handle,
+        checkpoint.profile,
+        checkpoint.link_kind,
+        true,
+    )?;
+    let _ = (upload_state, download_state);
+
+    if let Some(rate) = control.upload_kbps {
+        replace_private_cake(
+            target,
+            &checkpoint.temporary.target_qdisc_handle,
+            rate,
+            checkpoint.profile,
+            checkpoint.link_kind,
+            false,
+        )?;
+    } else {
+        delete_private_root_if_present(
+            target,
+            &checkpoint.temporary.target_qdisc_handle,
+            checkpoint.profile,
+            checkpoint.link_kind,
+            false,
+        )?;
+    }
+    if let Some(rate) = control.download_kbps {
+        replace_private_cake(
+            ifb,
+            &checkpoint.temporary.ifb_qdisc_handle,
+            rate,
+            checkpoint.profile,
+            checkpoint.link_kind,
+            true,
+        )?;
+        attach_private_ingress(target, checkpoint)?;
+    } else {
+        delete_private_ingress_if_present(target, checkpoint)?;
+        delete_private_root_if_present(
+            ifb,
+            &checkpoint.temporary.ifb_qdisc_handle,
+            checkpoint.profile,
+            checkpoint.link_kind,
+            true,
+        )?;
+    }
+    Ok(())
+}
+
+fn attest_private_runtime(
+    target: &str,
+    expected: &operations::autotune_runtime::RuntimeSnapshot,
+    checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
+) -> Result<operations::autotune_runtime::RuntimeSnapshot, String> {
+    if !exact_private_ifb(checkpoint, true)? {
+        return Err("owned temporary IFB is missing during attestation".to_string());
+    }
+    let upload = inspect_private_root(
+        target,
+        &checkpoint.temporary.target_qdisc_handle,
+        checkpoint.profile,
+        checkpoint.link_kind,
+        false,
+    )?;
+    let download = inspect_private_root(
+        &checkpoint.temporary.ifb_name,
+        &checkpoint.temporary.ifb_qdisc_handle,
+        checkpoint.profile,
+        checkpoint.link_kind,
+        true,
+    )?;
+    let ingress = inspect_private_ingress(target, checkpoint)?;
+    let download_kbps = match (expected.download_kbps, download, ingress) {
+        (Some(expected_rate), PrivateRootState::Exact(actual), PrivateIngressState::Exact)
+            if actual == expected_rate =>
+        {
+            Some(actual)
+        }
+        (None, PrivateRootState::AbsentOrKernelDefault, PrivateIngressState::Absent) => None,
+        _ => return Err("private download topology does not match expected control".to_string()),
+    };
+    let upload_kbps = match (expected.upload_kbps, upload) {
+        (Some(expected_rate), PrivateRootState::Exact(actual)) if actual == expected_rate => {
+            Some(actual)
+        }
+        (None, PrivateRootState::AbsentOrKernelDefault) => None,
+        _ => return Err("private upload topology does not match expected control".to_string()),
+    };
+    Ok(operations::autotune_runtime::RuntimeSnapshot {
+        target_interface: expected.target_interface.clone(),
+        route_fingerprint: expected.route_fingerprint.clone(),
+        sqm_fingerprint: expected.sqm_fingerprint.clone(),
+        topology: expected.topology,
+        download_kbps,
+        upload_kbps,
+        download_qdisc_kind: download_kbps
+            .map(|_| operations::autotune_runtime::RuntimeQdiscKind::Cake),
+        upload_qdisc_kind: upload_kbps
+            .map(|_| operations::autotune_runtime::RuntimeQdiscKind::Cake),
+    })
+}
+
+fn remove_private_runtime_topology(
+    target: &str,
+    checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
+) -> Result<(), String> {
+    use operations::autotune_runtime::TemporaryTopologyStage;
+
+    if checkpoint.temporary_stage == TemporaryTopologyStage::Planned {
+        if exact_private_ifb(checkpoint, false)? {
+            return Err("temporary IFB appeared before managed SQM suspension".to_string());
+        }
+        return Ok(());
+    }
+    if matches!(
+        checkpoint.temporary_stage,
+        TemporaryTopologyStage::TemporaryAbsent | TemporaryTopologyStage::BaselineRestored
+    ) {
+        return Ok(());
+    }
+    let require_ifindex = matches!(
+        checkpoint.temporary_stage,
+        TemporaryTopologyStage::LinkOwned | TemporaryTopologyStage::Active
+    );
+    let ifb_exists = exact_private_ifb(checkpoint, require_ifindex)?;
+    delete_private_ingress_if_present(target, checkpoint)?;
+    delete_private_root_if_present(
+        target,
+        &checkpoint.temporary.target_qdisc_handle,
+        checkpoint.profile,
+        checkpoint.link_kind,
+        false,
+    )?;
+    if ifb_exists {
+        delete_private_root_if_present(
+            &checkpoint.temporary.ifb_name,
+            &checkpoint.temporary.ifb_qdisc_handle,
+            checkpoint.profile,
+            checkpoint.link_kind,
+            true,
+        )?;
+        delete_private_ifb(checkpoint, require_ifindex)?;
+    }
+    if exact_private_ifb(checkpoint, require_ifindex)? {
+        return Err("temporary topology remains after cleanup".to_string());
+    }
+    Ok(())
+}
+
+impl operations::autotune_runtime_driver::RuntimeOverrideActuator
+    for OpenWrtRateOverrideActuator<'_>
+{
+    fn current_boot_ms(&self) -> u64 {
+        self.boot_ms
+    }
+
+    fn capture_baseline(
+        &mut self,
+        permit: &operations::autotune_runtime::AutotuneRuntimePermit,
+    ) -> Result<operations::autotune_runtime::RuntimeRestoreBaseline, String> {
+        if permit.instance_name != self.controller.cfg.instance
+            || permit.target_interface != self.controller.cfg.sqm_interface
+            || self.controller.route_identity.as_deref() != Some(permit.route_identity.as_str())
+        {
+            return Err("runtime permit does not match the live instance route".to_string());
+        }
+        let current_sqm_fingerprint = operations::sqm_identity::managed_sqm_identity_fingerprint(
+            &self.controller.cfg.instance,
+            &self.controller.cfg.sqm_section,
+            &self.controller.cfg.sqm_interface,
+        )?;
+        if current_sqm_fingerprint != permit.sqm_fingerprint {
+            return Err("runtime permit does not match the live SQM configuration".to_string());
+        }
+        let expected = operations::autotune_runtime::RuntimeSnapshot {
+            target_interface: permit.target_interface.clone(),
+            route_fingerprint: permit.route_fingerprint.clone(),
+            sqm_fingerprint: permit.sqm_fingerprint.clone(),
+            topology: configured_measurement_topology(&self.controller.cfg),
+            download_kbps: self
+                .controller
+                .cfg
+                .download_shaping_enabled()
+                .then_some(self.controller.shaper_dl.round().max(100.0) as u64),
+            upload_kbps: self
+                .controller
+                .cfg
+                .upload_shaping_enabled()
+                .then_some(self.controller.shaper_ul.round().max(100.0) as u64),
+            download_qdisc_kind: None,
+            upload_qdisc_kind: None,
+        };
+        attest_rate_only_runtime(self.controller, &expected)
+            .map(operations::autotune_runtime::RuntimeBaseline::Managed)
+    }
+
+    fn current_route_identity(&mut self) -> Result<String, String> {
+        self.controller
+            .route_identity
+            .clone()
+            .ok_or_else(|| "live route identity is unavailable".to_string())
+    }
+
+    fn baseline_ready_for_apply(
+        &mut self,
+        permit: &operations::autotune_runtime::AutotuneRuntimePermit,
+    ) -> Result<bool, String> {
+        if !matches!(
+            &permit.baseline,
+            operations::autotune_runtime::RuntimeBaseline::Managed(_)
+        ) {
+            return Ok(false);
+        }
+        Ok(operations::sqm_identity::managed_sqm_identity_fingerprint(
+            &self.controller.cfg.instance,
+            &self.controller.cfg.sqm_section,
+            &self.controller.cfg.sqm_interface,
+        )? == permit.sqm_fingerprint)
+    }
+
+    fn active_identity_matches(
+        &mut self,
+        permit: &operations::autotune_runtime::AutotuneRuntimePermit,
+    ) -> Result<bool, String> {
+        self.baseline_ready_for_apply(permit)
+    }
+
+    fn worker_identity_matches(&self, worker: &operations::identity::ProcessIdentity) -> bool {
+        worker
+            .still_matches(Path::new(operations::identity::DEFAULT_PROC_ROOT))
+            .unwrap_or(false)
+    }
+
+    fn runtime_matches(
+        &mut self,
+        expected: &operations::autotune_runtime::RuntimeSnapshot,
+        checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
+    ) -> Result<bool, String> {
+        let attested = if checkpoint.temporary_stage
+            == operations::autotune_runtime::TemporaryTopologyStage::Active
+        {
+            attest_private_runtime(&self.controller.cfg.sqm_interface, expected, checkpoint)?
+        } else {
+            attest_rate_only_runtime(self.controller, expected)?
+        };
+        Ok(attested == *expected)
+    }
+
+    fn prepare_baseline(
+        &mut self,
+        checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
+    ) -> Result<(), operations::autotune_runtime_driver::RuntimeActuatorError> {
+        let baseline = checkpoint
+            .managed_baseline()
+            .map_err(unsafe_runtime_actuator_error)?;
+        if checkpoint.temporary_stage
+            != operations::autotune_runtime::TemporaryTopologyStage::Planned
+            || baseline.topology != configured_measurement_topology(&self.controller.cfg)
+            || baseline.target_interface != self.controller.cfg.sqm_interface
+        {
+            return Err(unsafe_runtime_actuator_error(
+                "temporary calibration suspension checkpoint is stale",
+            ));
+        }
+        let attested = attest_rate_only_runtime(self.controller, baseline)
+            .map_err(unsafe_runtime_actuator_error)?;
+        if attested != *baseline {
+            return Err(unsafe_runtime_actuator_error(
+                "managed SQM changed before temporary calibration suspension",
+            ));
+        }
+        if exact_private_ifb(checkpoint, false).map_err(unsafe_runtime_actuator_error)? {
+            return Err(unsafe_runtime_actuator_error(
+                "temporary calibration IFB already exists before suspension",
+            ));
+        }
+        self.controller.runtime_override_active = true;
+        stop_managed_sqm_for_runtime(&self.controller.cfg)
+            .map_err(|error| classify_tc_mutation_error(&self.controller.cfg, error))?;
+        if inspect_private_root(
+            &self.controller.cfg.sqm_interface,
+            &checkpoint.temporary.target_qdisc_handle,
+            checkpoint.profile,
+            checkpoint.link_kind,
+            false,
+        )
+        .map_err(|error| classify_tc_mutation_error(&self.controller.cfg, error))?
+            != PrivateRootState::AbsentOrKernelDefault
+        {
+            return Err(unsafe_runtime_actuator_error(
+                "temporary upload qdisc exists immediately after managed SQM suspension",
+            ));
+        }
+        if inspect_private_ingress(&self.controller.cfg.sqm_interface, checkpoint)
+            .map_err(|error| classify_tc_mutation_error(&self.controller.cfg, error))?
+            != PrivateIngressState::Absent
+        {
+            return Err(unsafe_runtime_actuator_error(
+                "managed SQM ingress remains after suspension",
+            ));
+        }
+        self.controller.dl_qdisc_kind = None;
+        self.controller.ul_qdisc_kind = None;
+        Ok(())
+    }
+
+    fn create_temporary_ifb(
+        &mut self,
+        checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
+    ) -> Result<u32, operations::autotune_runtime_driver::RuntimeActuatorError> {
+        if checkpoint.temporary_stage
+            != operations::autotune_runtime::TemporaryTopologyStage::ManagedSqmSuspended
+        {
+            return Err(unsafe_runtime_actuator_error(
+                "temporary IFB creation was requested from the wrong checkpoint stage",
+            ));
+        }
+        create_private_ifb(checkpoint)
+            .map_err(|error| classify_tc_mutation_error(&self.controller.cfg, error))
+    }
+
+    fn apply_override(
+        &mut self,
+        control: &operations::full_autotune::AutotuneRuntimeControl,
+        expected: &operations::autotune_runtime::RuntimeSnapshot,
+        checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
+    ) -> Result<(), operations::autotune_runtime_driver::RuntimeActuatorError> {
+        if !managed_sqm_target_ready(&self.controller.cfg) {
+            return Err(target_unavailable_runtime_blocker(
+                &self.controller.cfg,
+                "managed SQM target is temporarily unavailable",
+            ));
+        }
+        self.controller.runtime_override_active = true;
+        apply_private_runtime_topology(&self.controller.cfg.sqm_interface, control, checkpoint)
+            .map_err(|error| classify_tc_mutation_error(&self.controller.cfg, error))?;
+        let attested =
+            attest_private_runtime(&self.controller.cfg.sqm_interface, expected, checkpoint)
+                .map_err(|error| classify_tc_mutation_error(&self.controller.cfg, error))?;
+        if attested != *expected {
+            return Err(unsafe_runtime_actuator_error(
+                "private calibration topology postcondition failed",
+            ));
+        }
+        if let Some(rate) = control.download_kbps {
+            self.controller.shaper_dl = rate as f64;
+            self.controller.last_set_dl = rate;
+        }
+        if let Some(rate) = control.upload_kbps {
+            self.controller.shaper_ul = rate as f64;
+            self.controller.last_set_ul = rate;
+        }
+        Ok(())
+    }
+
+    fn remove_temporary_topology(
+        &mut self,
+        checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
+    ) -> Result<(), operations::autotune_runtime_driver::RuntimeActuatorError> {
+        remove_private_runtime_topology(&self.controller.cfg.sqm_interface, checkpoint)
+            .map_err(|error| classify_tc_mutation_error(&self.controller.cfg, error))
+    }
+
+    fn restore_baseline(
+        &mut self,
+        baseline: &operations::autotune_runtime::RuntimeRestoreBaseline,
+    ) -> Result<(), operations::autotune_runtime_driver::RuntimeActuatorError> {
+        let baseline = baseline
+            .managed_snapshot()
+            .map_err(unsafe_runtime_actuator_error)?;
+        if !managed_sqm_target_ready(&self.controller.cfg) {
+            return Err(target_unavailable_runtime_blocker(
+                &self.controller.cfg,
+                "managed SQM target is temporarily unavailable during restore",
+            ));
+        }
+        if baseline.topology != configured_measurement_topology(&self.controller.cfg) {
+            return Err(unsafe_runtime_actuator_error(
+                "saved baseline topology no longer matches this instance",
+            ));
+        }
+        let current_sqm_fingerprint = operations::sqm_identity::managed_sqm_identity_fingerprint(
+            &self.controller.cfg.instance,
+            &self.controller.cfg.sqm_section,
+            &self.controller.cfg.sqm_interface,
+        )
+        .map_err(unsafe_runtime_actuator_error)?;
+        if current_sqm_fingerprint != baseline.sqm_fingerprint {
+            return Err(unsafe_runtime_actuator_error(
+                "saved baseline SQM fingerprint no longer matches current UCI; stale restore refused"
+                    .to_string(),
+            ));
+        }
+        self.controller.runtime_override_active = true;
+        let (download_shaped, upload_shaped) = measurement_topology_directions(baseline.topology);
+        match inspect_sqm_topology_for(&self.controller.cfg, download_shaped, upload_shaped) {
+            Ok(()) => {}
+            Err(error) if error.kind == SqmTopologyErrorKind::Settling => {
+                recover_managed_sqm(&self.controller.cfg)
+                    .map_err(|error| classify_sqm_recovery_error(&self.controller.cfg, error))?;
+                self.controller.dl_qdisc_kind = None;
+                self.controller.ul_qdisc_kind = None;
+            }
+            Err(error) => return Err(classify_topology_error(&self.controller.cfg, error)),
+        }
+        if let Some(rate) = baseline.download_kbps {
+            let interface = self.controller.cfg.dl_if.clone();
+            let kind = self
+                .controller
+                .qdisc_kind(true, &interface)
+                .map_err(unsafe_runtime_actuator_error)?;
+            change_cake_rate(&interface, rate, kind)
+                .map_err(|error| classify_tc_mutation_error(&self.controller.cfg, error))?;
+        }
+        if let Some(rate) = baseline.upload_kbps {
+            let interface = self.controller.cfg.ul_if.clone();
+            let kind = self
+                .controller
+                .qdisc_kind(false, &interface)
+                .map_err(unsafe_runtime_actuator_error)?;
+            change_cake_rate(&interface, rate, kind)
+                .map_err(|error| classify_tc_mutation_error(&self.controller.cfg, error))?;
+        }
+        if let Some(rate) = baseline.download_kbps {
+            self.controller.shaper_dl = rate as f64;
+            self.controller.last_set_dl = rate;
+        }
+        if let Some(rate) = baseline.upload_kbps {
+            self.controller.shaper_ul = rate as f64;
+            self.controller.last_set_ul = rate;
+        }
+        Ok(())
+    }
+
+    fn observe_restore_blocker(
+        &mut self,
+        blocker: &operations::autotune_runtime_driver::RuntimeRestoreBlocker,
+        baseline: &operations::autotune_runtime::RuntimeRestoreBaseline,
+    ) -> Result<operations::autotune_runtime_driver::RuntimeRestoreObservation, String> {
+        use operations::autotune_runtime_driver::{
+            RuntimeActuatorError, RuntimeRestoreBlocker, RuntimeRestoreObservation,
+        };
+
+        let baseline = baseline.managed_snapshot()?;
+        if baseline.target_interface != self.controller.cfg.sqm_interface {
+            return Err("runtime restore blocker belongs to another target interface".to_string());
+        }
+        let blocker_target = match blocker {
+            RuntimeRestoreBlocker::TargetUnavailable {
+                target_interface, ..
+            }
+            | RuntimeRestoreBlocker::SqmRecoveryBusy {
+                target_interface, ..
+            }
+            | RuntimeRestoreBlocker::TopologySettling {
+                target_interface, ..
+            }
+            | RuntimeRestoreBlocker::RecoveryInterrupted {
+                target_interface, ..
+            } => target_interface,
+        };
+        if blocker_target != &baseline.target_interface {
+            return Err("runtime restore blocker target identity changed".to_string());
+        }
+        let current_sqm_fingerprint = operations::sqm_identity::managed_sqm_identity_fingerprint(
+            &self.controller.cfg.instance,
+            &self.controller.cfg.sqm_section,
+            &self.controller.cfg.sqm_interface,
+        )?;
+        if current_sqm_fingerprint != baseline.sqm_fingerprint {
+            return Err(
+                "saved baseline SQM fingerprint changed while restore was blocked".to_string(),
+            );
+        }
+
+        match blocker {
+            RuntimeRestoreBlocker::TargetUnavailable { .. } => {
+                if managed_sqm_target_ready(&self.controller.cfg) {
+                    Ok(RuntimeRestoreObservation::Ready)
+                } else {
+                    Ok(RuntimeRestoreObservation::Blocked(blocker.clone()))
+                }
+            }
+            RuntimeRestoreBlocker::SqmRecoveryBusy { .. } => {
+                // The native operation owns the interface lock while it is
+                // restoring. Re-entering sqm-recover merely to observe that
+                // restore can therefore return EX_TEMPFAIL forever even after
+                // the helper has already installed the exact baseline. Inspect
+                // the live topology directly under the existing owner instead
+                // of trying to acquire the same lock recursively.
+                let (download_shaped, upload_shaped) =
+                    measurement_topology_directions(baseline.topology);
+                match inspect_sqm_topology_for(&self.controller.cfg, download_shaped, upload_shaped)
+                {
+                    Ok(()) => {
+                        let attested = attest_rate_only_runtime(self.controller, baseline)?;
+                        if attested == *baseline {
+                            Ok(RuntimeRestoreObservation::Ready)
+                        } else {
+                            Err(
+                                "restored runtime does not exactly match the durable baseline"
+                                    .to_string(),
+                            )
+                        }
+                    }
+                    Err(error) if error.kind == SqmTopologyErrorKind::Settling => {
+                        let RuntimeActuatorError::Blocked(current) =
+                            topology_settling_runtime_blocker(
+                                &self.controller.cfg,
+                                error.to_string(),
+                            )
+                        else {
+                            unreachable!()
+                        };
+                        Ok(RuntimeRestoreObservation::Blocked(current))
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+            RuntimeRestoreBlocker::TopologySettling { .. } => {
+                let (download_shaped, upload_shaped) =
+                    measurement_topology_directions(baseline.topology);
+                match inspect_sqm_topology_for(&self.controller.cfg, download_shaped, upload_shaped)
+                {
+                    Ok(()) => {
+                        let attested = attest_rate_only_runtime(self.controller, baseline)?;
+                        if attested == *baseline {
+                            Ok(RuntimeRestoreObservation::Ready)
+                        } else {
+                            Err(
+                                "settled runtime does not exactly match the durable baseline"
+                                    .to_string(),
+                            )
+                        }
+                    }
+                    Err(error) if error.kind == SqmTopologyErrorKind::Settling => {
+                        let RuntimeActuatorError::Blocked(current) =
+                            topology_settling_runtime_blocker(
+                                &self.controller.cfg,
+                                error.to_string(),
+                            )
+                        else {
+                            unreachable!()
+                        };
+                        Ok(RuntimeRestoreObservation::Blocked(current))
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+            RuntimeRestoreBlocker::RecoveryInterrupted { .. } => {
+                if TERMINATE.load(Ordering::SeqCst) {
+                    Ok(RuntimeRestoreObservation::Blocked(blocker.clone()))
+                } else {
+                    Ok(RuntimeRestoreObservation::Ready)
+                }
+            }
+        }
+    }
+
+    fn attest_runtime(
+        &mut self,
+        expected: &operations::autotune_runtime::RuntimeSnapshot,
+        checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
+    ) -> Result<
+        operations::autotune_runtime::RuntimeSnapshot,
+        operations::autotune_runtime_driver::RuntimeActuatorError,
+    > {
+        if !managed_sqm_target_ready(&self.controller.cfg) {
+            return Err(target_unavailable_runtime_blocker(
+                &self.controller.cfg,
+                "managed SQM target is temporarily unavailable during attestation",
+            ));
+        }
+        if checkpoint.temporary_stage
+            == operations::autotune_runtime::TemporaryTopologyStage::Active
+        {
+            attest_private_runtime(&self.controller.cfg.sqm_interface, expected, checkpoint)
+                .map_err(unsafe_runtime_actuator_error)
+        } else if checkpoint.temporary_stage
+            == operations::autotune_runtime::TemporaryTopologyStage::BaselineRestored
+        {
+            let (download_shaped, upload_shaped) =
+                measurement_topology_directions(expected.topology);
+            inspect_sqm_topology_for(&self.controller.cfg, download_shaped, upload_shaped)
+                .map_err(|error| classify_topology_error(&self.controller.cfg, error))?;
+            attest_rate_only_runtime(self.controller, expected)
+                .map_err(unsafe_runtime_actuator_error)
+        } else {
+            Err(unsafe_runtime_actuator_error(format!(
+                "runtime attestation is not valid at temporary stage {}",
+                checkpoint.temporary_stage.as_str()
+            )))
+        }
+    }
+
+    fn attest_restored_baseline(
+        &mut self,
+        baseline: &operations::autotune_runtime::RuntimeRestoreBaseline,
+        checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
+    ) -> Result<
+        operations::autotune_runtime::RuntimeRestoreBaseline,
+        operations::autotune_runtime_driver::RuntimeActuatorError,
+    > {
+        let managed = baseline
+            .managed_snapshot()
+            .map_err(unsafe_runtime_actuator_error)?;
+        self.attest_runtime(managed, checkpoint)
+            .map(operations::autotune_runtime::RuntimeBaseline::Managed)
+    }
+
+    fn finish_restored(&mut self) {
+        self.controller.runtime_override_active = false;
+        self.controller.last_shaper_attempt_dl = Instant::now();
+        self.controller.last_shaper_attempt_ul = Instant::now();
+    }
+
+    fn recover_safe_configuration(&mut self) -> Result<(), String> {
+        self.controller.runtime_override_active = true;
+        let fresh_cfg = Config::from_uci(&self.controller.cfg.instance)
+            .map_err(|error| format!("unable to reload current UCI for safe recovery: {error}"))?;
+        if fresh_cfg.manage_sqm {
+            recover_managed_sqm(&fresh_cfg).map_err(|error| error.message().to_string())?;
+        }
+        self.controller.set_sqm_runtime_status(
+            "RECOVERY_REQUIRED",
+            false,
+            "native Auto-Tune restored current UCI and remains latched",
+        );
+        self.controller.set_run_state("RECOVERY_REQUIRED");
+        // Keep the ordinary controller frozen.  The runtime driver remains
+        // latched until an explicit recovery path resolves and removes the
+        // untrusted ownership checkpoint; it must not resume with stale Config.
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MainState {
     Running,
     Idle,
     Stall,
+}
+
+fn probe_loop_required(connection_active: bool, operation_capture_active: bool) -> bool {
+    connection_active || operation_capture_active
+}
+
+#[cfg(feature = "calibration")]
+fn bounded_operation_capture_active(
+    autotune_capture_active: bool,
+    rating_capture_active: bool,
+) -> bool {
+    autotune_capture_active || rating_capture_active
+}
+
+fn idle_sleep_due(
+    enable_sleep_function: bool,
+    uplink_learning: bool,
+    connection_active: bool,
+    operation_capture_active: bool,
+    idle_elapsed: Duration,
+    idle_timeout: Duration,
+) -> bool {
+    enable_sleep_function
+        && !uplink_learning
+        && !probe_loop_required(connection_active, operation_capture_active)
+        && idle_elapsed >= idle_timeout
+}
+
+fn idle_wake_due(
+    connection_active: bool,
+    operation_capture_active: bool,
+    route_probes_allowed: bool,
+) -> bool {
+    route_probes_allowed && probe_loop_required(connection_active, operation_capture_active)
 }
 
 fn pinger_response_interval_s(cfg: &Config) -> f64 {
@@ -5318,11 +9780,15 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
 
     if cfg.startup_wait_s > 0.0 {
         if !interruptible_wait(Duration::from_secs_f64(cfg.startup_wait_s)) {
-            return Err("terminated during startup wait".to_string());
+            return Ok(());
         }
     }
     cfg.refresh_wire_packet_sizes();
-    wait_for_runtime_topology(&cfg)?;
+    match wait_for_runtime_topology(&cfg) {
+        Ok(()) => {}
+        Err(RuntimeTopologyWaitError::Terminated) => return Ok(()),
+        Err(RuntimeTopologyWaitError::Failed(error)) => return Err(error),
+    }
 
     let mut controller = Controller::new(cfg.clone())?;
     let route_spec = cfg.route_spec();
@@ -5333,15 +9799,12 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
         Ok(snapshot) => (Some(snapshot), None),
         Err(error) => (None, Some(error)),
     };
-    let initial_transition = uplink_lifecycle.observe(
-        current_route_snapshot.as_ref().map(Ok).unwrap_or_else(|| {
+    let initial_transition =
+        uplink_lifecycle.observe(current_route_snapshot.as_ref().map(Ok).unwrap_or_else(|| {
             Err(initial_route_error
                 .as_deref()
                 .unwrap_or("route unavailable"))
-        }),
-        Instant::now(),
-        Duration::from_secs_f64(cfg.route_stability_s),
-    );
+        }));
     controller.set_uplink_route(
         current_route_snapshot.clone(),
         initial_transition.state,
@@ -5368,6 +9831,27 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
         return Ok(());
     }
 
+    // The driver is part of the normal instance safety boundary even while
+    // native operation admission remains disabled.  With no exact private
+    // permit/control records it is inert; gating its construction would also
+    // disable restart recovery for an override admitted before an instance
+    // daemon restart.
+    #[cfg(feature = "calibration")]
+    let mut runtime_override_driver =
+        operations::autotune_runtime_driver::RuntimeOverrideDriver::open(
+            cfg.instance.clone(),
+            &cfg.run_dir(),
+        )
+        .map_err(|error| format!("unable to initialize runtime override driver: {error}"))?;
+    #[cfg(feature = "calibration")]
+    let runtime_override_poll_interval = Duration::from_millis(100);
+    #[cfg(feature = "calibration")]
+    let mut last_runtime_override_poll = Instant::now()
+        .checked_sub(runtime_override_poll_interval)
+        .unwrap_or_else(Instant::now);
+    #[cfg(feature = "calibration")]
+    let mut last_runtime_override_error: Option<String> = None;
+
     let mut pinger: Option<PingerRuntime> = None;
     let mut transport_probe = cfg
         .transport_latency_enabled
@@ -5382,7 +9866,6 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
     let global_timeout = Duration::from_secs_f64(cfg.global_ping_response_timeout_s.max(0.1));
     let idle_timeout = Duration::from_secs_f64(cfg.sustained_idle_sleep_thr_s.max(0.0));
     let route_check_interval = Duration::from_secs_f64(cfg.route_check_interval_s);
-    let route_stability = Duration::from_secs_f64(cfg.route_stability_s);
     let mut last_route_check = Instant::now();
     let sqm_health_fast_interval = Duration::from_secs(SQM_RUNTIME_HEALTH_CHECK_FAST_S);
     let sqm_health_healthy_interval = Duration::from_secs(SQM_RUNTIME_HEALTH_CHECK_HEALTHY_S);
@@ -5393,6 +9876,28 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
     external_ip_probe.maybe_start(route_probes_allowed);
 
     while !TERMINATE.load(Ordering::SeqCst) {
+        #[cfg(feature = "calibration")]
+        if last_runtime_override_poll.elapsed() >= runtime_override_poll_interval {
+            last_runtime_override_poll = Instant::now();
+            let boot_ms = operations::identity::monotonic_boot_ms().unwrap_or(0);
+            let mut actuator = OpenWrtRateOverrideActuator {
+                controller: &mut controller,
+                boot_ms,
+            };
+            match runtime_override_driver.poll(&mut actuator) {
+                Ok(_) => last_runtime_override_error = None,
+                Err(error) => {
+                    if last_runtime_override_error.as_deref() != Some(error.as_str()) {
+                        controller.log(
+                            "ERROR",
+                            &format!("native Auto-Tune runtime control failed: {error}"),
+                        );
+                        last_runtime_override_error = Some(error);
+                    }
+                }
+            }
+            controller.sync_autotune_capture_admission();
+        }
         let sqm_health_interval = if controller.sqm_runtime_healthy {
             sqm_health_healthy_interval
         } else {
@@ -5429,11 +9934,8 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
         if last_route_check.elapsed() >= route_check_interval {
             last_route_check = Instant::now();
             let inspected = route_inspector.inspect();
-            let transition = uplink_lifecycle.observe(
-                inspected.as_ref().map_err(|error| error.as_str()),
-                last_route_check,
-                route_stability,
-            );
+            let transition =
+                uplink_lifecycle.observe(inspected.as_ref().map_err(|error| error.as_str()));
             let must_stop = transition.became_offline
                 || transition.identity_changed
                 || (route_probes_allowed && !transition.probes_allowed);
@@ -5473,9 +9975,6 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                 pinger = Some(PingerRuntime::spawn(&cfg, &active_reflectors)?);
                 last_reflector_response = Instant::now();
             }
-        }
-        if let Some(runtime) = transport_probe.as_mut() {
-            runtime.drain(&mut controller);
         }
         let mut sampled_rates = None;
         if pinger.is_some() {
@@ -5525,6 +10024,9 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                                 false,
                             );
                         }
+                    } else if pinger_line_is_timeout(&cfg.pinger_method, &line.line) {
+                        #[cfg(feature = "calibration")]
+                        controller.observe_autotune_icmp_timeout();
                     }
                 }
                 Ok(Err(e)) => {
@@ -5539,11 +10041,8 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                     if let Some(mut old) = pinger.take() {
                         old.stop();
                     }
-                    let transition = uplink_lifecycle.observe(
-                        inspected.as_ref().map_err(|error| error.as_str()),
-                        Instant::now(),
-                        route_stability,
-                    );
+                    let transition = uplink_lifecycle
+                        .observe(inspected.as_ref().map_err(|error| error.as_str()));
                     current_route_snapshot = inspected.ok();
                     route_probes_allowed = false;
                     controller.set_uplink_route(
@@ -5586,11 +10085,8 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                     if let Some(mut old) = pinger.take() {
                         old.stop();
                     }
-                    let transition = uplink_lifecycle.observe(
-                        inspected.as_ref().map_err(|error| error.as_str()),
-                        Instant::now(),
-                        route_stability,
-                    );
+                    let transition = uplink_lifecycle
+                        .observe(inspected.as_ref().map_err(|error| error.as_str()));
                     current_route_snapshot = inspected.ok();
                     route_probes_allowed = false;
                     controller.set_uplink_route(
@@ -5615,14 +10111,78 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
         let rate_sample = sampled_rates.unwrap_or_else(|| controller.sample_rates());
         let dl_rate = rate_sample.dl_kbps;
         let ul_rate = rate_sample.ul_kbps;
+        #[cfg(feature = "calibration")]
+        let autotune_rate_sample = controller.autotune_observation_rates(rate_sample);
+        #[cfg(feature = "calibration")]
+        if let Some(autotune_rate_sample) = autotune_rate_sample {
+            controller.observe_autotune_traffic(autotune_rate_sample);
+        }
+        #[cfg(feature = "calibration")]
+        controller.sync_rating_capture(now);
         let rating_load = if rate_sample.fresh {
             controller.update_rating_load(now, dl_rate, ul_rate)
         } else {
             controller.rating_load_snapshot.clone()
         };
-        if route_probes_allowed {
-            if let Some(runtime) = transport_probe.as_mut() {
-                runtime.drain(&mut controller);
+        #[cfg(feature = "calibration")]
+        if let Some(runtime) = transport_probe.as_mut() {
+            let capture_control = controller.autotune_capture_control_request();
+            let autotune_capture = controller.active_autotune_observation_request();
+            let route_identity = controller.route_identity.clone();
+            let transport_rates = if capture_control.is_some() {
+                autotune_rate_sample
+            } else {
+                Some(rate_sample)
+            };
+            let transport_counter_delta = controller.autotune_transport_counter_delta();
+            if let Err(error) = runtime.observe_autotune_capture_phase(
+                &cfg,
+                transport_rates,
+                transport_counter_delta,
+                capture_control.as_ref(),
+                route_identity.as_deref(),
+                now,
+            ) {
+                controller
+                    .reject_autotune_observations("capture-transport-load-phase-invalid", &error);
+            }
+            // Drain only after this loop has refreshed and appended the
+            // topology-specific phase observation.  Capture results are
+            // admitted from their whole identity-bound flight interval, not
+            // from a single rate sample taken after completion.
+            runtime.drain(&mut controller, &cfg);
+            if capture_control.is_some() && autotune_capture.is_none() {
+                controller.record_transport_rejection("capture_attestation_lapsed");
+            } else if autotune_capture.is_some() && transport_rates.is_none() {
+                controller.record_transport_rejection("capture_rates_unavailable");
+            }
+            if route_probes_allowed && !(capture_control.is_some() && autotune_capture.is_none()) {
+                let (dl_shaper, ul_shaper) = controller.shaper_rates();
+                let quality_baseline_ready = controller
+                    .quality_grade
+                    .snapshot(epoch_secs())
+                    .baseline_ready;
+                if let Err(error) = runtime.maybe_start(
+                    &cfg,
+                    transport_rates,
+                    (dl_shaper, ul_shaper),
+                    &rating_load,
+                    quality_baseline_ready,
+                    autotune_capture,
+                    route_identity.as_deref(),
+                    now,
+                ) {
+                    controller.reject_autotune_observations(
+                        "capture-transport-load-phase-invalid",
+                        &error,
+                    );
+                }
+            }
+        }
+        #[cfg(not(feature = "calibration"))]
+        if let Some(runtime) = transport_probe.as_mut() {
+            runtime.drain(&mut controller, &cfg);
+            if route_probes_allowed {
                 let (dl_shaper, ul_shaper) = controller.shaper_rates();
                 let quality_baseline_ready = controller
                     .quality_grade
@@ -5630,12 +10190,12 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                     .baseline_ready;
                 runtime.maybe_start(
                     &cfg,
-                    dl_rate,
-                    ul_rate,
+                    Some(rate_sample),
                     (dl_shaper, ul_shaper),
                     &rating_load,
                     quality_baseline_ready,
-                );
+                    now,
+                )?;
             }
         }
         if controller.maybe_sample_cpu() {
@@ -5644,17 +10204,38 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
         controller.maybe_record_graph_history(dl_rate, ul_rate);
         let connection_active =
             dl_rate > cfg.connection_active_thr_kbps || ul_rate > cfg.connection_active_thr_kbps;
+        // An admitted bounded operation capture is an identity-bound
+        // measurement contract. Keep the configured probe loop awake even
+        // when the link itself is quiet; otherwise the ordinary sustained-idle
+        // transition can stop pingers before the capture reaches its bounded
+        // sample minimum. Invalid, stale, or completed captures do not inhibit
+        // sleep because neither capture source remains active.
+        #[cfg(feature = "calibration")]
+        let autotune_capture_active = controller.active_autotune_observation_request().is_some();
+        #[cfg(feature = "calibration")]
+        let operation_capture_active =
+            bounded_operation_capture_active(autotune_capture_active, rating_load.capture_active);
+        #[cfg(not(feature = "calibration"))]
+        let operation_capture_active = false;
+        let probes_required = probe_loop_required(connection_active, operation_capture_active);
         let stall_load_active =
             dl_rate > cfg.connection_stall_thr_kbps && ul_rate > cfg.connection_stall_thr_kbps;
 
         match main_state {
             MainState::Running => {
                 if cfg.enable_sleep_function && uplink_lifecycle.state() != UplinkState::Learning {
-                    if connection_active {
+                    if probes_required {
                         idle_since = None;
                     } else {
                         let idle_start = *idle_since.get_or_insert(now);
-                        if now.duration_since(idle_start) >= idle_timeout {
+                        if idle_sleep_due(
+                            cfg.enable_sleep_function,
+                            uplink_lifecycle.state() == UplinkState::Learning,
+                            connection_active,
+                            operation_capture_active,
+                            now.duration_since(idle_start),
+                            idle_timeout,
+                        ) {
                             controller.log("DEBUG", "Connection idle. Waiting for minimum load.");
                             if cfg.min_shaper_rates_enforcement {
                                 controller.set_min_shaper_rates("sustained idle");
@@ -5716,16 +10297,27 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                 }
             }
             MainState::Idle => {
-                if connection_active && route_probes_allowed {
-                    controller.log(
-                        "DEBUG",
-                        &format!(
-                            "dl achieved rate: {:.0} kbps or ul achieved rate: {:.0} kbps exceeded connection active threshold: {:.0} kbps. Resuming normal operation.",
-                            dl_rate,
-                            ul_rate,
-                            cfg.connection_active_thr_kbps
-                        ),
-                    );
+                if idle_wake_due(
+                    connection_active,
+                    operation_capture_active,
+                    route_probes_allowed,
+                ) {
+                    if connection_active {
+                        controller.log(
+                            "DEBUG",
+                            &format!(
+                                "dl achieved rate: {:.0} kbps or ul achieved rate: {:.0} kbps exceeded connection active threshold: {:.0} kbps. Resuming normal operation.",
+                                dl_rate,
+                                ul_rate,
+                                cfg.connection_active_thr_kbps
+                            ),
+                        );
+                    } else {
+                        controller.log(
+                            "DEBUG",
+                            "Native Auto-Tune capture admitted. Resuming latency probes.",
+                        );
+                    }
                     main_state = MainState::Running;
                     controller.set_run_state("RUNNING");
                     last_reflector_response = Instant::now();
@@ -5791,17 +10383,98 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
 struct PingerLine {
     line: String,
     reflector: String,
+    #[cfg(feature = "calibration")]
+    observed_at: Instant,
+    #[cfg(feature = "calibration")]
+    observed_epoch_secs: f64,
 }
 
 struct PingerRuntime {
     children: Vec<Child>,
     readers: Vec<JoinHandle<()>>,
     lines: Receiver<Result<PingerLine, String>>,
+    #[cfg(feature = "calibration")]
+    wake: Option<Arc<OwnedFd>>,
 }
 
 impl PingerRuntime {
     fn spawn(cfg: &Config, active_reflectors: &[String]) -> Result<Self, String> {
-        let mut children = spawn_pingers(cfg, active_reflectors)?;
+        let children = spawn_pingers(cfg, active_reflectors)?;
+        Self::from_children(children, cfg.pinger_method.clone(), active_reflectors, None)
+    }
+
+    #[cfg(feature = "calibration")]
+    fn spawn_bootstrap(request: &operations::protocol::OperationRequest) -> Result<Self, String> {
+        request.validate()?;
+        if request.target_state != operations::protocol::OperationTargetState::AbsentBootstrap {
+            return Err("bootstrap pinger requires an absent target request".to_string());
+        }
+        let policy = request
+            .capture_policy
+            .ok_or_else(|| "bootstrap pinger has no capture policy".to_string())?
+            .expand()?;
+        if policy.pinger_method() != "fping" {
+            return Err("bootstrap capture policy requires an unsupported pinger".to_string());
+        }
+        let active_reflectors = policy
+            .reflectors()
+            .iter()
+            .take(usize::from(policy.active_pingers()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if active_reflectors.is_empty() {
+            return Err("bootstrap capture policy has no active reflectors".to_string());
+        }
+        let route_spec = RouteSpec::new(
+            request.route.mode.as_str(),
+            request.route.mwan3_member.as_deref().unwrap_or(""),
+            &request.route.l3_device,
+        );
+        route_spec.validate()?;
+        let period_ms = u64::from(policy.reflector_ping_interval_ms());
+        let interval_ms = (period_ms / active_reflectors.len() as u64).max(1);
+        let mut command = routing::routed_command(&route_spec, "", "fping")?;
+        command
+            .arg("-I")
+            .arg(&request.route.l3_device)
+            .arg("--timestamp")
+            .arg("--loop")
+            .arg("--period")
+            .arg(period_ms.to_string())
+            .arg("--interval")
+            .arg(interval_ms.to_string())
+            .arg("--timeout")
+            .arg(policy.pinger_timeout_ms().to_string())
+            .args(&active_reflectors)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let child = command
+            .spawn()
+            .map_err(|error| format!("failed to start bootstrap fping: {error}"))?;
+        let raw_wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if raw_wake < 0 {
+            let mut child = child;
+            stop_child(&mut child);
+            return Err(format!(
+                "failed to create bootstrap pinger wake descriptor: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(raw_wake) });
+        Self::from_children(
+            vec![child],
+            policy.pinger_method().to_string(),
+            &active_reflectors,
+            Some(wake),
+        )
+    }
+
+    fn from_children(
+        mut children: Vec<Child>,
+        method: String,
+        active_reflectors: &[String],
+        wake: Option<Arc<OwnedFd>>,
+    ) -> Result<Self, String> {
         let (tx, lines) = mpsc::channel();
         let mut readers = Vec::new();
 
@@ -5812,11 +10485,12 @@ impl PingerRuntime {
                     for child in &mut children {
                         stop_child(child);
                     }
-                    return Err(format!("failed to capture {} stdout", cfg.pinger_method));
+                    return Err(format!("failed to capture {method} stdout"));
                 }
             };
             let tx = tx.clone();
-            let method = cfg.pinger_method.clone();
+            let method = method.clone();
+            let wake_writer = wake.clone();
             let reflector = if method == "ping" || method == "irtt" {
                 active_reflectors.get(idx).cloned().unwrap_or_default()
             } else {
@@ -5830,13 +10504,19 @@ impl PingerRuntime {
                             let event = PingerLine {
                                 line,
                                 reflector: reflector.clone(),
+                                #[cfg(feature = "calibration")]
+                                observed_at: Instant::now(),
+                                #[cfg(feature = "calibration")]
+                                observed_epoch_secs: epoch_secs(),
                             };
                             if tx.send(Ok(event)).is_err() {
                                 break;
                             }
+                            notify_pinger_wake(wake_writer.as_deref());
                         }
                         Err(e) => {
                             let _ = tx.send(Err(format!("failed to read {method} output: {e}")));
+                            notify_pinger_wake(wake_writer.as_deref());
                             break;
                         }
                     }
@@ -5848,7 +10528,45 @@ impl PingerRuntime {
             children,
             readers,
             lines,
+            #[cfg(feature = "calibration")]
+            wake,
         })
+    }
+
+    #[cfg(feature = "calibration")]
+    fn wake_fd(&self) -> RawFd {
+        self.wake.as_ref().map_or(-1, |wake| wake.as_raw_fd())
+    }
+
+    #[cfg(feature = "calibration")]
+    fn drain_wake(&self) -> Result<(), String> {
+        let Some(wake) = self.wake.as_ref() else {
+            return Ok(());
+        };
+        loop {
+            let mut value = 0_u64;
+            let read = unsafe {
+                libc::read(
+                    wake.as_raw_fd(),
+                    (&mut value as *mut u64).cast::<libc::c_void>(),
+                    std::mem::size_of::<u64>(),
+                )
+            };
+            if read == std::mem::size_of::<u64>() as isize {
+                continue;
+            }
+            if read < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    return Ok(());
+                }
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(format!("failed to drain bootstrap pinger wake: {error}"));
+            }
+            return Err("bootstrap pinger wake descriptor returned a short read".to_string());
+        }
     }
 
     fn stop(&mut self) {
@@ -5859,6 +10577,20 @@ impl PingerRuntime {
             let _ = reader.join();
         }
     }
+}
+
+fn notify_pinger_wake(wake: Option<&OwnedFd>) {
+    let Some(wake) = wake else {
+        return;
+    };
+    let value = 1_u64;
+    let _ = unsafe {
+        libc::write(
+            wake.as_raw_fd(),
+            (&value as *const u64).cast::<libc::c_void>(),
+            std::mem::size_of::<u64>(),
+        )
+    };
 }
 
 fn spawn_pingers(cfg: &Config, active_reflectors: &[String]) -> Result<Vec<Child>, String> {
@@ -6034,6 +10766,14 @@ fn parse_sample_line(cfg: &Config, line: &str, ping_reflector: &str) -> Option<S
         "fping-ts" => parse_fping_ts_line(line),
         "tsping" => parse_tsping_line(line),
         _ => parse_fping_line(line),
+    }
+}
+
+fn pinger_line_is_timeout(method: &str, line: &str) -> bool {
+    match method {
+        "fping" | "fping-ts" => line.contains("timed out") && line.contains("100% loss"),
+        "ping" => line.contains("no answer yet"),
+        _ => false,
     }
 }
 
@@ -6428,23 +11168,6 @@ fn ensure_run_dir(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
-fn bootstrap_recovery_backoff(attempt: u64) -> Duration {
-    let shift = attempt.saturating_sub(1).min(6) as u32;
-    let seconds = SQM_BOOTSTRAP_RECOVERY_BACKOFF_INITIAL_S
-        .saturating_mul(1_u64 << shift)
-        .min(SQM_BOOTSTRAP_RECOVERY_BACKOFF_MAX_S);
-    Duration::from_secs(seconds)
-}
-
-fn bootstrap_hotplug_grace() -> Duration {
-    let seconds = env::var("CAKE_AUTORATE_SQM_BOOTSTRAP_GRACE_S")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value <= 300)
-        .unwrap_or(SQM_BOOTSTRAP_HOTPLUG_GRACE_S);
-    Duration::from_secs(seconds)
-}
-
 fn interruptible_wait(duration: Duration) -> bool {
     let deadline = Instant::now() + duration;
     while !TERMINATE.load(Ordering::SeqCst) {
@@ -6502,23 +11225,35 @@ fn write_bootstrap_status(
     fs::rename(tmp, path)
 }
 
-fn wait_for_runtime_topology(cfg: &Config) -> Result<(), String> {
+#[derive(Debug, PartialEq, Eq)]
+enum RuntimeTopologyWaitError {
+    Terminated,
+    Failed(String),
+}
+
+impl From<String> for RuntimeTopologyWaitError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+fn wait_for_runtime_topology(cfg: &Config) -> Result<(), RuntimeTopologyWaitError> {
+    use operations::sqm_recovery::{SqmRecoveryAdmission, SqmRecoveryGate};
+
     let started_at = epoch_secs();
     let poll_interval = Duration::from_secs_f64(cfg.if_up_check_interval_s.clamp(1.0, 10.0));
-    let mut target_seen_at: Option<Instant> = None;
-    let mut next_recovery_at: Option<Instant> = None;
     let mut recovery_attempts = 0_u64;
     let mut last_report = (String::new(), String::new());
+    let mut recovery_gate = SqmRecoveryGate::default();
 
     loop {
         if TERMINATE.load(Ordering::SeqCst) {
-            return Err("terminated while waiting for WAN/SQM runtime".to_string());
+            return Err(RuntimeTopologyWaitError::Terminated);
         }
 
         let target_ready = managed_sqm_target_ready(cfg);
         if !target_ready {
-            target_seen_at = None;
-            next_recovery_at = None;
+            recovery_gate.observe_target_missing();
             let state = "WAITING_LINK";
             let reason = format!(
                 "waiting for target interface {} and its counters",
@@ -6531,19 +11266,58 @@ fn wait_for_runtime_topology(cfg: &Config) -> Result<(), String> {
             write_bootstrap_status(cfg, state, state, &reason, recovery_attempts, started_at)
                 .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
             if !interruptible_wait(poll_interval) {
-                return Err("terminated while waiting for target interface".to_string());
+                return Err(RuntimeTopologyWaitError::Terminated);
             }
             continue;
         }
 
-        let now = Instant::now();
-        let target_since = *target_seen_at.get_or_insert(now);
-        let initial_reason = match inspect_sqm_topology(cfg) {
-            Ok(()) if !cfg.manage_sqm || !cfg.sqm_enabled => return Ok(()),
-            Ok(()) => match attest_managed_sqm(cfg) {
-                Ok(()) => return Ok(()),
-                Err(SqmRecoveryError::Busy(reason)) => {
-                    let state = "WAITING_OPERATION";
+        let topology = inspect_sqm_topology(cfg);
+        let initial_reason = topology
+            .as_ref()
+            .err()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "managed SQM failed exact attestation".to_string());
+
+        if !cfg.manage_sqm || !cfg.sqm_enabled {
+            if topology.is_ok() {
+                recovery_gate.observe_healthy();
+                return Ok(());
+            }
+            let state = "WAITING_EXTERNAL_SQM";
+            if last_report != (state.to_string(), initial_reason.clone()) {
+                eprintln!("{state}: {initial_reason}");
+                last_report = (state.to_string(), initial_reason.clone());
+            }
+            write_bootstrap_status(
+                cfg,
+                state,
+                state,
+                &initial_reason,
+                recovery_attempts,
+                started_at,
+            )
+            .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
+            if !interruptible_wait(poll_interval) {
+                return Err(RuntimeTopologyWaitError::Terminated);
+            }
+            continue;
+        }
+
+        let check_error = match attest_managed_sqm(cfg) {
+            Ok(()) if topology.is_ok() => {
+                recovery_gate.observe_healthy();
+                return Ok(());
+            }
+            Ok(()) => match inspect_sqm_topology(cfg) {
+                Ok(()) => {
+                    recovery_gate.observe_healthy();
+                    return Ok(());
+                }
+                Err(current) => {
+                    let state = "WAITING_SQM";
+                    let reason = format!(
+                        "{current}; exact SQM check observed a concurrent topology transition; re-reading current state"
+                    );
                     if last_report != (state.to_string(), reason.clone()) {
                         eprintln!("{state}: {reason}");
                         last_report = (state.to_string(), reason.clone());
@@ -6558,149 +11332,97 @@ fn wait_for_runtime_topology(cfg: &Config) -> Result<(), String> {
                     )
                     .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
                     if !interruptible_wait(poll_interval) {
-                        return Err(
-                            "terminated while waiting for the SQM operation lock".to_string()
-                        );
+                        return Err(RuntimeTopologyWaitError::Terminated);
                     }
                     continue;
                 }
-                Err(SqmRecoveryError::Failed(reason)) => reason,
-                Err(SqmRecoveryError::Terminated) => {
-                    return Err("terminated while attesting managed SQM".to_string());
-                }
             },
-            Err(initial_reason) => initial_reason,
-        };
-
-        {
-            if !cfg.manage_sqm || !cfg.sqm_enabled {
-                let state = "WAITING_EXTERNAL_SQM";
-                if last_report != (state.to_string(), initial_reason.clone()) {
-                    eprintln!("{state}: {initial_reason}");
-                    last_report = (state.to_string(), initial_reason.clone());
-                }
-                write_bootstrap_status(
-                    cfg,
-                    state,
-                    state,
-                    &initial_reason,
-                    recovery_attempts,
-                    started_at,
-                )
-                .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
-                if !interruptible_wait(poll_interval) {
-                    return Err("terminated while waiting for external SQM".to_string());
-                }
-                continue;
-            }
-
-            let grace = bootstrap_hotplug_grace();
-            if now.saturating_duration_since(target_since) < grace {
-                let state = "WAITING_SQM";
-                let reason =
-                    format!("{initial_reason}; allowing the native SQM hotplug path to settle");
+            Err(SqmRecoveryError::Busy(reason)) => {
+                let state = "WAITING_OPERATION";
                 if last_report != (state.to_string(), reason.clone()) {
                     eprintln!("{state}: {reason}");
                     last_report = (state.to_string(), reason.clone());
                 }
                 write_bootstrap_status(cfg, state, state, &reason, recovery_attempts, started_at)
                     .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
-                if !interruptible_wait(
-                    poll_interval
-                        .min(grace.saturating_sub(now.saturating_duration_since(target_since))),
-                ) {
-                    return Err("terminated while waiting for SQM hotplug".to_string());
-                }
-                continue;
-            }
-
-            if next_recovery_at
-                .map(|deadline| now < deadline)
-                .unwrap_or(false)
-            {
-                let state = "WAITING_SQM";
-                if last_report != (state.to_string(), initial_reason.clone()) {
-                    eprintln!("{state}: {initial_reason}");
-                    last_report = (state.to_string(), initial_reason.clone());
-                }
-                write_bootstrap_status(
-                    cfg,
-                    state,
-                    state,
-                    &initial_reason,
-                    recovery_attempts,
-                    started_at,
-                )
-                .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
                 if !interruptible_wait(poll_interval) {
-                    return Err("terminated while backing off SQM recovery".to_string());
+                    return Err(RuntimeTopologyWaitError::Terminated);
                 }
                 continue;
             }
+            Err(SqmRecoveryError::Failed(reason)) => reason,
+            Err(SqmRecoveryError::Terminated) => {
+                return Err(RuntimeTopologyWaitError::Terminated);
+            }
+        };
 
-            recovery_attempts = recovery_attempts.saturating_add(1);
-            let recovering_reason = format!(
-                "{initial_reason}; starting owned SQM recovery attempt {recovery_attempts}"
+        let generation = sqm_topology_generation(cfg, &topology);
+        if recovery_gate.admission(&generation) == SqmRecoveryAdmission::WaitForStateChange {
+            let state = "WAITING_SQM";
+            let reason = format!(
+                "{initial_reason}; previous recovery failed and the observed link/SQM topology is unchanged: {check_error}"
             );
-            write_bootstrap_status(
-                cfg,
-                "RECOVERING",
-                "RECOVERING",
-                &recovering_reason,
-                recovery_attempts,
-                started_at,
-            )
-            .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
-            match recover_managed_sqm(cfg) {
-                Ok(()) => return Ok(()),
-                Err(SqmRecoveryError::Busy(reason)) => {
-                    let state = "WAITING_OPERATION";
-                    if last_report != (state.to_string(), reason.clone()) {
-                        eprintln!("{state}: {reason}");
-                        last_report = (state.to_string(), reason.clone());
-                    }
-                    write_bootstrap_status(
-                        cfg,
-                        state,
-                        state,
-                        &reason,
-                        recovery_attempts,
-                        started_at,
-                    )
-                    .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
-                    next_recovery_at = Some(
-                        Instant::now()
-                            + Duration::from_secs(SQM_BOOTSTRAP_RECOVERY_BACKOFF_INITIAL_S),
-                    );
-                }
-                Err(SqmRecoveryError::Failed(reason)) => {
-                    let delay = bootstrap_recovery_backoff(recovery_attempts);
-                    let state = "WAITING_SQM";
-                    let detail = format!(
-                            "{initial_reason}; recovery attempt {recovery_attempts} failed: {reason}; retrying in {}s",
-                            delay.as_secs()
-                        );
+            if last_report != (state.to_string(), reason.clone()) {
+                eprintln!("{state}: {reason}");
+                last_report = (state.to_string(), reason.clone());
+            }
+            write_bootstrap_status(cfg, state, state, &reason, recovery_attempts, started_at)
+                .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
+            if !interruptible_wait(poll_interval) {
+                return Err(RuntimeTopologyWaitError::Terminated);
+            }
+            continue;
+        }
+
+        recovery_attempts = recovery_attempts.saturating_add(1);
+        let recovering_reason = format!(
+            "{initial_reason}; exact read-only check is unhealthy: {check_error}; starting state-authorized recovery attempt {recovery_attempts}"
+        );
+        write_bootstrap_status(
+            cfg,
+            "RECOVERING",
+            "RECOVERING",
+            &recovering_reason,
+            recovery_attempts,
+            started_at,
+        )
+        .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
+        match recover_managed_sqm(cfg) {
+            Ok(()) => {
+                recovery_gate.observe_healthy();
+                return Ok(());
+            }
+            Err(SqmRecoveryError::Busy(reason)) => {
+                let state = "WAITING_OPERATION";
+                let detail = format!("{initial_reason}; recovery deferred: {reason}");
+                if last_report != (state.to_string(), detail.clone()) {
                     eprintln!("{state}: {detail}");
                     last_report = (state.to_string(), detail.clone());
-                    write_bootstrap_status(
-                        cfg,
-                        state,
-                        state,
-                        &detail,
-                        recovery_attempts,
-                        started_at,
-                    )
+                }
+                write_bootstrap_status(cfg, state, state, &detail, recovery_attempts, started_at)
                     .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
-                    next_recovery_at = Some(Instant::now() + delay);
+            }
+            Err(SqmRecoveryError::Failed(reason)) => {
+                let post_topology = inspect_sqm_topology(cfg);
+                recovery_gate.record_failed(sqm_topology_generation(cfg, &post_topology));
+                let state = "WAITING_SQM";
+                let detail = format!(
+                    "{initial_reason}; recovery attempt {recovery_attempts} failed: {reason}; no retry until observed topology changes"
+                );
+                if last_report != (state.to_string(), detail.clone()) {
+                    eprintln!("{state}: {detail}");
+                    last_report = (state.to_string(), detail.clone());
                 }
-                Err(SqmRecoveryError::Terminated) => {
-                    return Err("terminated during managed SQM recovery".to_string());
-                }
+                write_bootstrap_status(cfg, state, state, &detail, recovery_attempts, started_at)
+                    .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
+            }
+            Err(SqmRecoveryError::Terminated) => {
+                return Err(RuntimeTopologyWaitError::Terminated);
             }
         }
 
         if !interruptible_wait(poll_interval) {
-            return Err("terminated while waiting for SQM recovery".to_string());
+            return Err(RuntimeTopologyWaitError::Terminated);
         }
     }
 }
@@ -7308,10 +12030,7 @@ fn json_f64_array(values: &[f64], precision: usize) -> String {
 }
 
 fn default_reflectors() -> Vec<String> {
-    UPSTREAM_DEFAULT_REFLECTORS
-        .iter()
-        .map(|reflector| (*reflector).to_string())
-        .collect()
+    operations::autotune_capture_policy::standard_v1_reflectors()
 }
 
 fn json_bool(value: bool) -> &'static str {
@@ -7422,17 +12141,60 @@ fn reflector_health_json(
     format!("[{}]", out.join(","))
 }
 
+#[cfg(feature = "calibration")]
+const CALIBRATIONCTL_SCHEDULER_STATUS_USAGE: &str =
+    "       cake-autorated --calibrationctl [--state-dir RAM_PATH] scheduler-status";
+
 fn print_usage() {
     eprintln!("usage: cake-autorated [--instance NAME] [--once] [--dump-config]");
-    eprintln!(
-        "       cake-autorated --autotune-proposal --dl-samples LIST --ul-samples LIST \\\n         --idle-median-ms N --idle-p95-ms N --idle-samples N [--link-kind KIND] \\\n         [--profile gaming|best_overall|variable_link|fair] \\\n         [--base-scale N | --dl-base-scale N --ul-base-scale N] \\\n         [--dl-runtime-min-kbps N] [--ul-runtime-min-kbps N]"
-    );
-    eprintln!("       cake-autorated --autotune-validate [--profile gaming|gaming_extreme|best_overall|variable_link|fair] --dl-observed-low-kbps N --ul-observed-low-kbps N --dl-candidate-kbps N --ul-candidate-kbps N --dl-achieved-kbps N --ul-achieved-kbps N --dl-min-kbps N --ul-min-kbps N --dl-max-kbps N --ul-max-kbps N --icmp-delta-ms N --transport-delta-ms N --loss-percent N --cpu-percent N");
-    eprintln!("         [--dl-icmp-delta-ms N --ul-icmp-delta-ms N --dl-transport-delta-ms N --ul-transport-delta-ms N --dl-loss-percent N --ul-loss-percent N --dl-cpu-percent N --ul-cpu-percent N]");
-    eprintln!("       cake-autorated --autotune-optimize-direction --profile gaming|gaming_extreme|best_overall|variable_link|fair --direction download|upload --observed-low-kbps N --minimum-kbps N --upper-kbps N --observations C,A,I,T,L,P[;...] [--uncertainty-percent N] [--max-attempts N]");
+    #[cfg(feature = "calibration")]
+    print_calibration_usage();
     eprintln!("       cake-autorated --transport-probe --backend websocket|tcp|http|legacy-http [--endpoint URL] [--device IFACE] [--source-ip IPv4] [--fwmark HEX] [--count N] [--timeout SEC] [--interval-ms N]");
 }
 
+#[cfg(feature = "calibration")]
+fn print_calibration_usage() {
+    eprintln!("       cake-autorated --calibrationd [--state-dir RAM_PATH] [--native-rating] [--native-speedtest] [--native-autotune]");
+    eprintln!("         production scheduler: --native-scheduler --scheduler-store-dir /etc/cake-autorate-rs-scheduler");
+    eprintln!("         laboratory only: [--lab-rust-rating] [--lab-rust-speedtest] [--lab-rust-autotune]");
+    eprintln!(
+        "         isolated scheduler: --lab-rust-scheduler --scheduler-store-dir PRIVATE_PATH"
+    );
+    eprintln!("       cake-autorated --calibrationctl [--state-dir RAM_PATH] ping|summary|start REQUEST|status REQUEST|result REQUEST|cancel REQUEST");
+    eprintln!("       cake-autorated --calibrationctl [--state-dir RAM_PATH] scheduler-acknowledge-accounting INSTANCE");
+    eprintln!("{CALIBRATIONCTL_SCHEDULER_STATUS_USAGE}");
+    eprintln!("       cake-autorated --calibrationctl [--state-dir RAM_PATH] autotune-inspect OPTIONS | autotune-start OPTIONS | autotune-bootstrap-start SQM_SECTION OPTIONS | autotune-status JOB_ID | autotune-result JOB_ID | autotune-cancel JOB_ID");
+    eprintln!("       cake-autorated --bootstrap-runtime-owner --request PATH --runtime-dir PATH --worker-run-id HEX");
+    eprintln!("       cake-autorated --calibrationctl [--state-dir RAM_PATH] rating-start OPTIONS | rating-current INSTANCE | rating-status JOB_ID | rating-result JOB_ID | rating-cancel JOB_ID");
+    eprintln!("       cake-autorated --calibrationctl [--state-dir RAM_PATH] speedtest-start OPTIONS | speedtest-current INSTANCE | speedtest-status JOB_ID | speedtest-result JOB_ID | speedtest-cancel JOB_ID");
+    eprintln!("       cake-autorated --calibrationctl [--state-dir RAM_PATH] autotune-apply-check JOB_ID [OPTION_ID]");
+    eprintln!("       cake-autorated --calibrationctl [--state-dir RAM_PATH] autotune-apply JOB_ID OPTION_ID REVIEW_SHA256 MANIFEST_SHA256 [--ack CODE]...");
+    eprintln!("       cake-autorated --native-apply-recover");
+    eprintln!("       cake-autorated --calibration-capabilities");
+    eprintln!(
+        "       cake-autorated --autotune-proposal --dl-samples LIST --ul-samples LIST \\\n         --idle-median-ms N --idle-p95-ms N --idle-samples N [--link-kind KIND] \\\n         [--profile gaming|best_overall|variable_link|fair] \\\n         [--base-scale N | --dl-base-scale N --ul-base-scale N] \\\n         [--dl-runtime-min-kbps N] [--ul-runtime-min-kbps N] \\\n         [--dl-measurement-base-kbps N --ul-measurement-base-kbps N]"
+    );
+    eprintln!("       cake-autorated --autotune-validate [--profile gaming|gaming_extreme|best_overall|variable_link|fair] --dl-observed-low-kbps N --ul-observed-low-kbps N --dl-candidate-kbps N --ul-candidate-kbps N --dl-achieved-kbps N --ul-achieved-kbps N --dl-min-kbps N --ul-min-kbps N --dl-max-kbps N --ul-max-kbps N --icmp-delta-ms N --transport-delta-ms N --loss-percent N --cpu-percent N");
+    eprintln!("         [--dl-icmp-delta-ms N --ul-icmp-delta-ms N --dl-transport-delta-ms N --ul-transport-delta-ms N --dl-loss-percent N --ul-loss-percent N --dl-cpu-percent N --ul-cpu-percent N]");
+    eprintln!("       cake-autorated --autotune-optimize-direction --profile gaming|gaming_extreme|best_overall|variable_link|fair --direction download|upload --observed-low-kbps N --minimum-kbps N --upper-kbps N --observations C,A,I,T,L,P[;...] [--uncertainty-percent N] [--max-attempts N] [--terminate-at-measured-boundary candidate-transfer-unmeasurable]");
+}
+
+#[cfg(feature = "calibration")]
+const CALIBRATION_CAPABILITIES_V3: &str =
+    "cake-autorate-calibration-capabilities 3 native-autotune native-rating native-scheduler native-speedtest";
+
+#[cfg(feature = "calibration")]
+fn calibration_capabilities<I>(mut args: I) -> Result<&'static str, String>
+where
+    I: Iterator<Item = String>,
+{
+    if args.next().is_some() {
+        return Err("calibration-capabilities accepts no options".to_string());
+    }
+    Ok(CALIBRATION_CAPABILITIES_V3)
+}
+
+#[cfg(feature = "calibration")]
 fn parse_rate_samples(value: &str) -> Result<Vec<f64>, String> {
     if value.trim().is_empty() {
         return Err("rate sample list must not be empty".to_string());
@@ -7464,6 +12226,7 @@ fn parse_rate_samples(value: &str) -> Result<Vec<f64>, String> {
     Ok(samples)
 }
 
+#[cfg(feature = "calibration")]
 fn parse_optional_rate(value: &str) -> Result<Option<u64>, String> {
     let rate = value
         .parse::<u64>()
@@ -7477,6 +12240,7 @@ fn parse_optional_rate(value: &str) -> Result<Option<u64>, String> {
     Ok((rate > 0).then_some(rate))
 }
 
+#[cfg(feature = "calibration")]
 fn parse_cli_u64(name: &str, value: &str) -> Result<u64, String> {
     let parsed = value
         .parse::<u64>()
@@ -7490,6 +12254,7 @@ fn parse_cli_u64(name: &str, value: &str) -> Result<u64, String> {
     Ok(parsed)
 }
 
+#[cfg(feature = "calibration")]
 fn parse_cli_f64(name: &str, value: &str) -> Result<f64, String> {
     let parsed = value
         .parse::<f64>()
@@ -7500,6 +12265,7 @@ fn parse_cli_f64(name: &str, value: &str) -> Result<f64, String> {
     Ok(parsed)
 }
 
+#[cfg(feature = "calibration")]
 fn parse_strict_bool(name: &str, value: &str) -> Result<bool, String> {
     match value {
         "0" => Ok(false),
@@ -7511,6 +12277,7 @@ fn parse_strict_bool(name: &str, value: &str) -> Result<bool, String> {
 /// Validate background metadata without changing the isolated speed-test
 /// samples. The speed-test helper reports only its own flow rate; forwarded
 /// client traffic is measured separately and must not be subtracted here.
+#[cfg(feature = "calibration")]
 fn validated_conservative_samples(
     samples: &[f64],
     background_kbps: Option<f64>,
@@ -7529,6 +12296,7 @@ fn validated_conservative_samples(
     Ok(samples)
 }
 
+#[cfg(feature = "calibration")]
 fn current_direction(
     minimum: Option<u64>,
     base: Option<u64>,
@@ -7566,6 +12334,7 @@ fn current_direction(
     })
 }
 
+#[cfg(feature = "calibration")]
 fn run_autotune_proposal_cli<I>(args: I) -> Result<(), String>
 where
     I: Iterator<Item = String>,
@@ -7583,6 +12352,8 @@ where
     let mut base_scale = 1.0;
     let mut download_base_scale = None;
     let mut upload_base_scale = None;
+    let mut download_measurement_base = None;
+    let mut upload_measurement_base = None;
     let mut download_runtime_minimum = None;
     let mut upload_runtime_minimum = None;
     let mut download_tested_safe_maximum = None;
@@ -7631,6 +12402,13 @@ where
             }
             "--ul-base-scale" => {
                 upload_base_scale = Some(parse_cli_f64("upload base-rate scale", &value)?)
+            }
+            "--dl-measurement-base-kbps" => {
+                download_measurement_base =
+                    Some(parse_cli_u64("download measurement base", &value)?)
+            }
+            "--ul-measurement-base-kbps" => {
+                upload_measurement_base = Some(parse_cli_u64("upload measurement base", &value)?)
             }
             "--dl-runtime-min-kbps" => {
                 download_runtime_minimum =
@@ -7774,6 +12552,15 @@ where
             current_ul_cap,
         );
     }
+    match (download_measurement_base, upload_measurement_base) {
+        (Some(download), Some(upload)) => proposal.set_measurement_base_rates(download, upload)?,
+        (None, None) => {}
+        _ => {
+            return Err(
+                "download and upload measurement bases must be supplied together".to_string(),
+            )
+        }
+    }
     match (download_runtime_minimum, upload_runtime_minimum) {
         (Some(download), Some(upload)) => {
             proposal.set_measured_runtime_minimums(download, upload)?
@@ -7787,6 +12574,7 @@ where
     Ok(())
 }
 
+#[cfg(feature = "calibration")]
 fn run_autotune_validation_cli<I>(args: I) -> Result<(), String>
 where
     I: Iterator<Item = String>,
@@ -7932,6 +12720,7 @@ where
         download: DirectionValidationInput {
             observed_low_kbps: required_rate(dl_observed_low, "dl-observed-low-kbps")?,
             candidate_kbps: required_rate(dl_candidate, "dl-candidate-kbps")?,
+            realized_kbps: required_rate(dl_achieved, "dl-achieved-kbps")?,
             achieved_kbps: required_rate(dl_achieved, "dl-achieved-kbps")?,
             minimum_kbps: required_rate(dl_minimum, "dl-min-kbps")?,
             maximum_kbps: required_rate(dl_maximum, "dl-max-kbps")?,
@@ -7939,6 +12728,7 @@ where
         upload: DirectionValidationInput {
             observed_low_kbps: required_rate(ul_observed_low, "ul-observed-low-kbps")?,
             candidate_kbps: required_rate(ul_candidate, "ul-candidate-kbps")?,
+            realized_kbps: required_rate(ul_achieved, "ul-achieved-kbps")?,
             achieved_kbps: required_rate(ul_achieved, "ul-achieved-kbps")?,
             minimum_kbps: required_rate(ul_minimum, "ul-min-kbps")?,
             maximum_kbps: required_rate(ul_maximum, "ul-max-kbps")?,
@@ -7969,6 +12759,7 @@ where
     Ok(())
 }
 
+#[cfg(feature = "calibration")]
 fn parse_search_observations(value: &str) -> Result<Vec<autotune::SearchObservation>, String> {
     if value.is_empty() {
         return Err("search observation list must not be empty".to_string());
@@ -7988,11 +12779,15 @@ fn parse_search_observations(value: &str) -> Result<Vec<autotune::SearchObservat
                 index + 1
             ));
         }
+        let candidate_kbps = parse_cli_u64("search candidate rate", fields[0])?;
+        let achieved_kbps = parse_cli_u64("search achieved rate", fields[1])?;
         observations.push(autotune::SearchObservation {
-            candidate_kbps: parse_cli_u64("search candidate rate", fields[0])?,
-            achieved_kbps: parse_cli_u64("search achieved rate", fields[1])?,
+            candidate_kbps,
+            realized_kbps: achieved_kbps,
+            achieved_kbps,
             icmp_delta_ms: parse_cli_f64("search ICMP delta", fields[2])?,
             transport_delta_ms: parse_cli_f64("search transport delta", fields[3])?,
+            transport_censored: false,
             loss_percent: parse_cli_f64("search loss percent", fields[4])?,
             cpu_percent: parse_cli_f64("search CPU percent", fields[5])?,
         });
@@ -8000,12 +12795,14 @@ fn parse_search_observations(value: &str) -> Result<Vec<autotune::SearchObservat
     Ok(observations)
 }
 
+#[cfg(feature = "calibration")]
 fn run_autotune_optimize_direction_cli<I>(args: I) -> Result<(), String>
 where
     I: Iterator<Item = String>,
 {
     use autotune::{
-        optimize_profile_direction, AutotuneProfile, ProfileSearchInput, SearchDirection,
+        optimize_profile_direction, terminate_profile_direction_at_measured_boundary,
+        AutotuneProfile, ProfileSearchInput, SearchDirection,
     };
 
     let mut profile = AutotuneProfile::BestOverall;
@@ -8021,6 +12818,7 @@ where
     let mut retention_min = None;
     let mut loss_max = None;
     let mut cpu_max = None;
+    let mut terminal_reason = None;
     let mut args = args;
 
     while let Some(arg) = args.next() {
@@ -8063,6 +12861,12 @@ where
             }
             "--loss-max-percent" => loss_max = Some(parse_cli_f64("packet loss maximum", &value)?),
             "--cpu-max-percent" => cpu_max = Some(parse_cli_f64("CPU maximum", &value)?),
+            "--terminate-at-measured-boundary" => {
+                if value != "candidate-transfer-unmeasurable" {
+                    return Err(format!("unsupported measured-boundary reason: {value}"));
+                }
+                terminal_reason = Some("candidate-transfer-unmeasurable");
+            }
             _ => return Err(format!("unsupported Auto-Tune search option: {arg}")),
         }
     }
@@ -8083,7 +12887,7 @@ where
     if let Some(value) = cpu_max {
         thresholds.cpu_max_percent = value;
     }
-    let result = optimize_profile_direction(ProfileSearchInput {
+    let input = ProfileSearchInput {
         profile,
         direction: direction.ok_or_else(|| "--direction is required".to_string())?,
         observed_low_kbps: observed_low_kbps
@@ -8094,7 +12898,11 @@ where
         uncertainty_percent,
         max_attempts,
         observations: observations.ok_or_else(|| "--observations is required".to_string())?,
-    })?;
+    };
+    let result = match terminal_reason {
+        Some(reason) => terminate_profile_direction_at_measured_boundary(input, reason)?,
+        None => optimize_profile_direction(input)?,
+    };
     println!("{}", result.to_json());
     Ok(())
 }
@@ -8219,6 +13027,7 @@ fn main() {
     let mut initial_args = env::args();
     let _program = initial_args.next();
     match initial_args.next().as_deref() {
+        #[cfg(feature = "calibration")]
         Some("--autotune-proposal") => {
             if let Err(error) = run_autotune_proposal_cli(initial_args) {
                 eprintln!("ERROR: {error}");
@@ -8226,6 +13035,7 @@ fn main() {
             }
             return;
         }
+        #[cfg(feature = "calibration")]
         Some("--autotune-validate") => {
             if let Err(error) = run_autotune_validation_cli(initial_args) {
                 eprintln!("ERROR: {error}");
@@ -8233,6 +13043,7 @@ fn main() {
             }
             return;
         }
+        #[cfg(feature = "calibration")]
         Some("--autotune-optimize-direction") => {
             if let Err(error) = run_autotune_optimize_direction_cli(initial_args) {
                 eprintln!("ERROR: {error}");
@@ -8247,13 +13058,90 @@ fn main() {
             }
             return;
         }
+        #[cfg(feature = "calibration")]
+        Some("--calibrationd") => {
+            install_signal_handlers();
+            if let Err(error) = operations::coordinator::run_calibrationd(initial_args, &TERMINATE)
+            {
+                eprintln!("ERROR: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(feature = "calibration")]
+        Some("--calibrationctl") => {
+            if let Err(error) = operations::coordinator::run_calibrationctl(initial_args) {
+                eprintln!("ERROR: {error}");
+                std::process::exit(2);
+            }
+            return;
+        }
+        #[cfg(feature = "calibration")]
+        Some("--native-apply-recover") => {
+            if let Err(error) = operations::coordinator::run_native_apply_recovery(initial_args) {
+                eprintln!("ERROR: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(feature = "calibration")]
+        Some("--calibration-capabilities") => {
+            match calibration_capabilities(initial_args) {
+                Ok(capabilities) => println!("{capabilities}"),
+                Err(error) => {
+                    eprintln!("ERROR: {error}");
+                    std::process::exit(2);
+                }
+            }
+            return;
+        }
+        #[cfg(feature = "calibration")]
+        Some("--rating-worker") => {
+            install_signal_handlers();
+            if let Err(error) = operations::rating::run_rating_worker(initial_args, &TERMINATE) {
+                eprintln!("ERROR: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(feature = "calibration")]
+        Some("--speedtest-worker") => {
+            install_signal_handlers();
+            if let Err(error) =
+                operations::speedtest::run_speedtest_worker(initial_args, &TERMINATE)
+            {
+                eprintln!("ERROR: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(feature = "calibration")]
+        Some("--autotune-worker") => {
+            install_signal_handlers();
+            if let Err(error) =
+                operations::full_autotune::run_autotune_worker(initial_args, &TERMINATE)
+            {
+                eprintln!("ERROR: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(feature = "calibration")]
+        Some("--bootstrap-runtime-owner") => {
+            install_signal_handlers();
+            if let Err(error) = operations::bootstrap_runtime_owner::run_bootstrap_runtime_owner(
+                initial_args,
+                &TERMINATE,
+            ) {
+                eprintln!("ERROR: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
         _ => {}
     }
 
-    unsafe {
-        signal(2, handle_signal);
-        signal(15, handle_signal);
-    }
+    install_signal_handlers();
 
     let mut instance = "primary".to_string();
     let mut once = false;
@@ -8301,25 +13189,43 @@ fn main() {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "calibration"))]
 mod tests {
     use super::{
-        adaptive_capacity_status_json, autotune, bootstrap_recovery_backoff,
-        compact_graph_history_data, compact_graph_history_file, compute_history_budget,
-        default_reflectors, graph_history_line, history_safe_max_kib, ingress_output_targets_ifb,
-        irtt_target_arg, max_wire_packet_size_bits_from_mtu, monitor_tick_timeout,
-        next_spare_reflector, packet_compensation_us, parse_cli_f64, parse_fping_line,
-        parse_fping_ts_line, parse_irtt_duration_us, parse_irtt_line, parse_rate_samples,
-        parse_reflector_candidates, parse_strict_bool, parse_tc_linklayer_overhead,
-        parse_tsping_line, parse_uci_values, pinger_command, pinger_response_interval_s,
-        qdisc_output_has_cake, reflector_bad_reflectors, reflector_health_json,
-        reflector_spare_reflectors, run_sqm_helper, sample_is_stale, shaper_update_due,
-        stall_detection_timeout, status_publish_due, throughput_floor, transport_error_code,
-        transport_probe_interval_s, transport_result_matches_route, uplink_error_code,
-        validated_conservative_samples, wait_for_runtime_topology, AdaptiveCapacityStatusContext,
-        AdaptiveCeilingDirection, Config, Controller, MemoryInfo, RateMonitor, ReflectorHealth,
-        ReflectorState, Sample, SqmRecoveryError, ThroughputGuardInput, UplinkState,
-        CAKE_GROWTH_UPDATE_MIN_INTERVAL, STATUS_PUBLISH_INTERVAL, TERMINATE,
+        adaptive_capacity_status_json, attest_cake_direction, attest_download_redirect,
+        attest_exclusive_sqm_ingress, autotune, autotune_capture_attestation_lease_valid,
+        autotune_capture_uses_identity_bound_speedtest_counters,
+        autotune_counter_completion_is_timely, autotune_counter_completion_matches,
+        autotune_transport_control_phase, autotune_transport_delta_phase,
+        bounded_operation_capture_active, calibration_capabilities,
+        censored_autotune_transport_observation, compact_graph_history_data,
+        compact_graph_history_file, compute_history_budget, default_reflectors, graph_history_line,
+        history_safe_max_kib, idle_sleep_due, idle_wake_due, ingress_output_targets_ifb,
+        irtt_target_arg, loaded_autotune_traffic_observation_after_read,
+        max_wire_packet_size_bits_from_mtu, monitor_tick_timeout, next_spare_reflector,
+        packet_compensation_us, parse_cli_f64, parse_fping_line, parse_fping_ts_line,
+        parse_irtt_duration_us, parse_irtt_line, parse_private_ingress_output,
+        parse_private_root_output, parse_rate_samples, parse_reflector_candidates,
+        parse_strict_bool, parse_tc_bandwidth_kbps, parse_tc_linklayer_overhead, parse_tsping_line,
+        parse_uci_values, pinger_command, pinger_line_is_timeout, pinger_response_interval_s,
+        private_cake_args, probe_loop_required, published_runtime_qdisc_kind,
+        qdisc_output_has_cake, rate_sample_is_recent, rating_capture_request_is_admissible,
+        reflector_bad_reflectors, reflector_health_json, reflector_spare_reflectors,
+        reject_autotune_capture_after_io_with_clock, root_cake_bandwidth_kbps, root_cake_qdisc,
+        run, run_autotune_proposal_cli, run_sqm_helper, sample_is_stale,
+        select_autotune_capture_rates, shaper_update_due, stall_detection_timeout,
+        status_publish_due, stop_managed_sqm_with, throughput_floor, transport_error_code,
+        transport_probe_control_allows_start, transport_probe_interval_s,
+        transport_result_matches_route, uplink_error_code, validated_conservative_samples,
+        wait_for_runtime_topology, AdaptiveCapacityStatusContext, AdaptiveCeilingDirection,
+        AutotuneSpeedtestRateMonitor, AutotuneTransportCaptureKey, AutotuneTransportControl,
+        AutotuneTransportFlight, AutotuneTransportReadiness, AutotuneTransportSettlement,
+        CakeQdiscKind, Config, Controller, MemoryInfo, PrivateIngressState, PrivateRootState,
+        RateMonitor, RateSample, ReflectorHealth, ReflectorState, Sample,
+        SpeedtestCounterRateMonitor, SqmRecoveryError, SqmTopologyErrorKind, ThroughputGuardInput,
+        TransportProbeResult, UplinkState, AUTOTUNE_CAPTURE_ATTESTATION_MAX_AGE,
+        CAKE_GROWTH_UPDATE_MIN_INTERVAL, CALIBRATIONCTL_SCHEDULER_STATUS_USAGE,
+        CALIBRATION_CAPABILITIES_V3, STATUS_PUBLISH_INTERVAL, TERMINATE,
         TRANSPORT_BASELINE_LEARNING_INTERVAL_S,
     };
     use std::env;
@@ -8332,6 +13238,63 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     static HELPER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn scheduler_status_usage_is_an_exact_zero_argument_batch_contract() {
+        assert!(CALIBRATIONCTL_SCHEDULER_STATUS_USAGE.ends_with(" scheduler-status"));
+        assert!(!CALIBRATIONCTL_SCHEDULER_STATUS_USAGE.contains("INSTANCE"));
+        assert!(!CALIBRATIONCTL_SCHEDULER_STATUS_USAGE.ends_with(" *"));
+    }
+
+    #[test]
+    fn rating_capture_admission_requires_exact_identity_mode_and_live_deadline() {
+        let token = "0123456789abcdef0123456789abcdef";
+        assert!(rating_capture_request_is_admissible(
+            token,
+            "client",
+            Some(101.0),
+            100.0
+        ));
+        assert!(rating_capture_request_is_admissible(
+            token,
+            "automatic",
+            Some(101.0),
+            100.0
+        ));
+        assert!(!rating_capture_request_is_admissible(
+            "100-42",
+            "client",
+            Some(101.0),
+            100.0
+        ));
+        assert!(!rating_capture_request_is_admissible(
+            token,
+            "manual",
+            Some(101.0),
+            100.0
+        ));
+        assert!(!rating_capture_request_is_admissible(
+            token,
+            "client",
+            Some(100.0),
+            100.0
+        ));
+        assert!(!rating_capture_request_is_admissible(
+            token,
+            "client",
+            Some(f64::NAN),
+            100.0
+        ));
+    }
+
+    #[test]
+    fn calibration_capability_protocol_is_exact_and_rejects_options() {
+        assert_eq!(
+            calibration_capabilities(std::iter::empty()).unwrap(),
+            CALIBRATION_CAPABILITIES_V3
+        );
+        assert!(calibration_capabilities(vec!["unexpected".to_string()].into_iter()).is_err());
+    }
 
     #[test]
     fn adaptive_capacity_status_exposes_passive_transport_and_causal_state() {
@@ -8430,6 +13393,25 @@ mod tests {
     fn ignores_fping_timeout_line() {
         let line = "[1783743970.24147] 1.1.1.1 : [0], timed out (NaN avg, 100% loss)";
         assert!(parse_fping_line(line).is_none());
+        assert!(pinger_line_is_timeout("fping", line));
+        assert!(pinger_line_is_timeout("fping-ts", line));
+        assert!(!pinger_line_is_timeout("tsping", line));
+    }
+
+    #[test]
+    fn recognizes_only_explicit_ping_timeout_output() {
+        assert!(pinger_line_is_timeout(
+            "ping",
+            "no answer yet for icmp_seq=18"
+        ));
+        assert!(!pinger_line_is_timeout(
+            "ping",
+            "64 bytes from 1.1.1.1: icmp_seq=18 ttl=57 time=2.1 ms"
+        ));
+        assert!(!pinger_line_is_timeout(
+            "fping",
+            "warning: timed out while parsing unrelated output"
+        ));
     }
 
     #[test]
@@ -8532,6 +13514,38 @@ mod tests {
         assert_eq!(cfg.global_ping_response_timeout_s, 10.0);
         assert!((pinger_response_interval_s(&cfg) - 0.05).abs() < 0.000001);
         assert!((stall_detection_timeout(&cfg).as_secs_f64() - 0.25).abs() < 0.000001);
+    }
+
+    #[test]
+    fn bounded_operation_capture_keeps_idle_probe_loop_awake() {
+        let timeout = Duration::from_secs(60);
+
+        assert!(!bounded_operation_capture_active(false, false));
+        assert!(bounded_operation_capture_active(true, false));
+        assert!(bounded_operation_capture_active(false, true));
+        assert!(bounded_operation_capture_active(true, true));
+        assert!(!probe_loop_required(false, false));
+        assert!(probe_loop_required(true, false));
+        assert!(probe_loop_required(false, true));
+        assert!(probe_loop_required(true, true));
+        assert!(idle_sleep_due(true, false, false, false, timeout, timeout));
+        assert!(!idle_sleep_due(true, false, false, true, timeout, timeout));
+        assert!(!idle_sleep_due(
+            true,
+            false,
+            false,
+            false,
+            timeout - Duration::from_millis(1),
+            timeout,
+        ));
+        assert!(!idle_sleep_due(true, true, false, false, timeout, timeout));
+        assert!(!idle_sleep_due(
+            false, false, false, false, timeout, timeout
+        ));
+        assert!(idle_wake_due(false, true, true));
+        assert!(idle_wake_due(true, false, true));
+        assert!(!idle_wake_due(false, true, false));
+        assert!(!idle_wake_due(false, false, true));
     }
 
     #[test]
@@ -8972,6 +13986,633 @@ mod tests {
     }
 
     #[test]
+    fn cake_bandwidth_parser_attests_one_exact_root_rate() {
+        assert_eq!(parse_tc_bandwidth_kbps("100000Kbit").unwrap(), 100_000);
+        assert_eq!(parse_tc_bandwidth_kbps("723.4Mbit").unwrap(), 723_400);
+        assert_eq!(parse_tc_bandwidth_kbps("1Gbit").unwrap(), 1_000_000);
+        assert_eq!(
+            root_cake_bandwidth_kbps(
+                "qdisc cake 8001: root refcnt 2 bandwidth 723400Kbit besteffort"
+            )
+            .unwrap(),
+            723_400
+        );
+        assert_eq!(
+            root_cake_bandwidth_kbps(
+                "qdisc cake_mq 8002: root refcnt 2 bandwidth 1Gbit besteffort"
+            )
+            .unwrap(),
+            1_000_000
+        );
+        assert_eq!(
+            root_cake_qdisc("qdisc cake_mq 8002: root refcnt 2 bandwidth 1Gbit besteffort")
+                .unwrap(),
+            (CakeQdiscKind::CakeMq, 1_000_000)
+        );
+        assert_eq!(
+            published_runtime_qdisc_kind(true, Some(CakeQdiscKind::CakeMq)),
+            Some(crate::operations::autotune_runtime::RuntimeQdiscKind::CakeMq)
+        );
+        assert_eq!(
+            published_runtime_qdisc_kind(false, Some(CakeQdiscKind::CakeMq)),
+            None
+        );
+        assert!(root_cake_bandwidth_kbps("qdisc noqueue 0: root refcnt 2").is_err());
+        assert!(root_cake_bandwidth_kbps(
+            "qdisc cake 1: root bandwidth 10Mbit\nqdisc cake 2: root bandwidth 20Mbit"
+        )
+        .is_err());
+        assert!(parse_tc_bandwidth_kbps("NaNMbit").is_err());
+    }
+
+    #[test]
+    fn sqm_topology_classifies_off_and_one_sided_directions_without_text_matching() {
+        let cake = "qdisc cake 8010: root refcnt 2 bandwidth 100Mbit";
+        let none = "qdisc noqueue 0: root refcnt 2";
+        let redirect = "action order 1: mirred (Egress Redirect to device ifb4wan)";
+
+        // Fully disabled is valid only when neither direction nor ingress
+        // still contains a managed CAKE artifact.
+        assert!(attest_cake_direction(none, false, "download", "ifb4wan").is_ok());
+        assert!(attest_cake_direction(none, false, "upload", "wan").is_ok());
+        assert!(attest_download_redirect("", false, "wan", "ifb4wan").is_ok());
+
+        // Download-only and upload-only are independently valid topologies.
+        assert!(attest_cake_direction(cake, true, "download", "ifb4wan").is_ok());
+        assert!(attest_cake_direction(none, false, "upload", "wan").is_ok());
+        assert!(attest_download_redirect(redirect, true, "wan", "ifb4wan").is_ok());
+        assert!(attest_cake_direction(none, false, "download", "ifb4wan").is_ok());
+        assert!(attest_cake_direction(cake, true, "upload", "wan").is_ok());
+        assert!(attest_download_redirect("", false, "wan", "ifb4wan").is_ok());
+
+        assert_eq!(
+            attest_cake_direction(cake, false, "download", "ifb4wan")
+                .unwrap_err()
+                .kind,
+            SqmTopologyErrorKind::Unsafe
+        );
+        assert_eq!(
+            attest_download_redirect(redirect, false, "wan", "ifb4wan")
+                .unwrap_err()
+                .kind,
+            SqmTopologyErrorKind::Unsafe
+        );
+        assert_eq!(
+            attest_cake_direction(none, true, "upload", "wan")
+                .unwrap_err()
+                .kind,
+            SqmTopologyErrorKind::Settling
+        );
+    }
+
+    #[test]
+    fn download_bypass_requires_exclusive_standard_sqm_ingress_ownership() {
+        let standard = "filter parent ffff: protocol all pref 10 u32 chain 0\n\
+filter parent ffff: protocol all pref 10 u32 chain 0 fh 800: ht divisor 1\n\
+filter parent ffff: protocol all pref 10 u32 chain 0 fh 800::800 order 2048 key ht 800 bkt 0 flowid 1:1 not_in_hw\n\
+  match 00000000/00000000 at 0\n\
+ action order 1: mirred (Egress Redirect to device ifb4wan) stolen\n\
+ index 2 ref 1 bind 1\n";
+        assert!(attest_exclusive_sqm_ingress(standard, "wan", "ifb4wan").is_ok());
+
+        let with_foreign_filter =
+            format!("{standard}filter parent ffff: protocol ip pref 20 flower chain 0\n");
+        let error =
+            attest_exclusive_sqm_ingress(&with_foreign_filter, "wan", "ifb4wan").unwrap_err();
+        assert_eq!(error.kind, SqmTopologyErrorKind::Unsafe);
+        assert_eq!(error.code, "download-ingress-not-exclusive");
+
+        let with_foreign_action = standard.replace(
+            "index 2 ref 1 bind 1",
+            "action order 2: police rate 1Gbit\nindex 2 ref 1 bind 1",
+        );
+        assert!(attest_exclusive_sqm_ingress(&with_foreign_action, "wan", "ifb4wan").is_err());
+    }
+
+    #[test]
+    fn private_calibration_parsers_accept_only_exact_job_owned_state() {
+        use crate::autotune::{AutotuneProfile, LinkKind};
+        use crate::operations::autotune_runtime::{
+            AutotuneRuntimePermit, RuntimeBaseline, RuntimeQdiscKind, RuntimeRateBounds,
+            RuntimeSnapshot,
+        };
+        use crate::operations::autotune_runtime_store::RuntimeOverrideCheckpoint;
+        use crate::operations::full_autotune::MeasurementTopology;
+        use crate::operations::identity::ProcessIdentity;
+
+        let permit = AutotuneRuntimePermit {
+            kind: crate::operations::autotune_runtime::RuntimePermitKind::Autotune,
+            permit_id: "77".repeat(16),
+            job_id: "11".repeat(16),
+            worker_run_id: "22".repeat(16),
+            boot_id: "33".repeat(16),
+            coordinator_generation: "44".repeat(16),
+            worker: ProcessIdentity {
+                pid: 100,
+                process_group: 100,
+                starttime_ticks: 500,
+            },
+            instance_name: "wan_sqm".to_string(),
+            target_interface: "pppoe-wan".to_string(),
+            route_identity: "main||pppoe-wan|192.0.2.1||254".to_string(),
+            route_fingerprint: "55".repeat(32),
+            sqm_fingerprint: "66".repeat(32),
+            deadline_boot_ms: 60_000,
+            maximum_sequence: 32,
+            profile: AutotuneProfile::VariableLink,
+            link_kind: LinkKind::Pppoe,
+            baseline: RuntimeBaseline::Managed(MeasurementTopology::UploadOnlyShaped),
+            initial_download_kbps: 100_000,
+            initial_upload_kbps: 50_000,
+            download_qdisc_kind: RuntimeQdiscKind::Cake,
+            upload_qdisc_kind: RuntimeQdiscKind::Cake,
+            allow_bypass_download: true,
+            allow_bypass_upload: true,
+            download_bounds: RuntimeRateBounds {
+                minimum_kbps: 10_000,
+                maximum_kbps: 1_000_000,
+            },
+            upload_bounds: RuntimeRateBounds {
+                minimum_kbps: 5_000,
+                maximum_kbps: 500_000,
+            },
+        };
+        let baseline = RuntimeSnapshot {
+            target_interface: permit.target_interface.clone(),
+            route_fingerprint: permit.route_fingerprint.clone(),
+            sqm_fingerprint: permit.sqm_fingerprint.clone(),
+            topology: MeasurementTopology::UploadOnlyShaped,
+            download_kbps: None,
+            upload_kbps: Some(45_000),
+            download_qdisc_kind: None,
+            upload_qdisc_kind: Some(RuntimeQdiscKind::Cake),
+        };
+        let checkpoint =
+            RuntimeOverrideCheckpoint::new(&permit, 1_000, RuntimeBaseline::Managed(baseline))
+                .unwrap();
+        let upload = "qdisc cake a777: root refcnt 2 bandwidth 50Mbit diffserv4 nat noatm overhead 44 mpu 84";
+        assert_eq!(
+            parse_private_root_output(
+                upload,
+                "pppoe-wan",
+                &checkpoint.temporary.target_qdisc_handle,
+                checkpoint.profile,
+                checkpoint.link_kind,
+                false,
+            )
+            .unwrap(),
+            PrivateRootState::Exact(50_000)
+        );
+        let download = "qdisc cake b777: root refcnt 2 bandwidth 100Mbit besteffort nat wash noatm overhead 44 mpu 84";
+        assert_eq!(
+            parse_private_root_output(
+                download,
+                &checkpoint.temporary.ifb_name,
+                &checkpoint.temporary.ifb_qdisc_handle,
+                checkpoint.profile,
+                checkpoint.link_kind,
+                true,
+            )
+            .unwrap(),
+            PrivateRootState::Exact(100_000)
+        );
+        assert_eq!(
+            parse_private_root_output(
+                "qdisc mq 0: root\nqdisc fq_codel 0: parent :1",
+                "pppoe-wan",
+                &checkpoint.temporary.target_qdisc_handle,
+                checkpoint.profile,
+                checkpoint.link_kind,
+                false,
+            )
+            .unwrap(),
+            PrivateRootState::AbsentOrKernelDefault
+        );
+        assert!(parse_private_root_output(
+            "qdisc cake 8001: root bandwidth 50Mbit diffserv4 nat",
+            "pppoe-wan",
+            &checkpoint.temporary.target_qdisc_handle,
+            checkpoint.profile,
+            checkpoint.link_kind,
+            false,
+        )
+        .is_err());
+        assert!(parse_private_root_output(
+            "qdisc cake a777: root bandwidth 50Mbit diffserv4 nat noatm overhead 18 mpu 64",
+            "pppoe-wan",
+            &checkpoint.temporary.target_qdisc_handle,
+            checkpoint.profile,
+            checkpoint.link_kind,
+            false,
+        )
+        .is_err());
+
+        let variable_download = private_cake_args(
+            &checkpoint.temporary.ifb_name,
+            &checkpoint.temporary.ifb_qdisc_handle,
+            100_000,
+            AutotuneProfile::VariableLink,
+            LinkKind::Pppoe,
+            true,
+        )
+        .unwrap();
+        assert!(variable_download
+            .windows(3)
+            .any(|part| part == ["besteffort", "nat", "wash"]));
+        assert!(variable_download
+            .windows(5)
+            .any(|part| part == ["ethernet", "overhead", "44", "mpu", "84"]));
+        let gaming_upload = private_cake_args(
+            "eth0",
+            &checkpoint.temporary.target_qdisc_handle,
+            50_000,
+            AutotuneProfile::Gaming,
+            LinkKind::Ethernet,
+            false,
+        )
+        .unwrap();
+        assert!(gaming_upload
+            .windows(2)
+            .any(|part| part == ["diffserv4", "nat"]));
+        assert!(!gaming_upload.iter().any(|part| part == "wash"));
+        assert!(gaming_upload
+            .windows(5)
+            .any(|part| part == ["ethernet", "overhead", "18", "mpu", "64"]));
+
+        let qdisc = "qdisc ingress ffff: parent ffff:fff1";
+        let filter = format!(
+            "filter parent ffff: protocol all pref {} u32 chain 0\n\
+filter parent ffff: protocol all pref {} u32 chain 0 fh 800: ht divisor 1\n\
+filter parent ffff: protocol all pref {} u32 chain 0 fh {} order 1911 key ht 800 bkt 0 terminal flowid not_in_hw\n\
+  match 00000000/00000000 at 0\n\
+ action order 1: mirred (Egress Redirect to device {}) stolen\n\
+ index {} ref 1 bind 1\n\
+ cookie {}\n",
+            checkpoint.temporary.redirect_preference,
+            checkpoint.temporary.redirect_preference,
+            checkpoint.temporary.redirect_preference,
+            checkpoint.temporary.redirect_filter_tc_handle().unwrap(),
+            checkpoint.temporary.ifb_name,
+            checkpoint.temporary.redirect_action_index,
+            checkpoint.temporary.redirect_action_cookie,
+        );
+        assert_eq!(
+            parse_private_ingress_output(qdisc, &filter, "pppoe-wan", &checkpoint).unwrap(),
+            PrivateIngressState::Exact
+        );
+        assert_eq!(
+            parse_private_ingress_output("", "", "pppoe-wan", &checkpoint).unwrap(),
+            PrivateIngressState::Absent
+        );
+        let foreign = filter.replace(
+            &checkpoint.temporary.redirect_preference.to_string(),
+            "1234",
+        );
+        assert!(parse_private_ingress_output(qdisc, &foreign, "pppoe-wan", &checkpoint).is_err());
+        let foreign_handle = filter.replace(
+            &checkpoint.temporary.redirect_filter_tc_handle().unwrap(),
+            "800::123",
+        );
+        assert!(
+            parse_private_ingress_output(qdisc, &foreign_handle, "pppoe-wan", &checkpoint).is_err()
+        );
+        let foreign_index = filter.replace(
+            &checkpoint.temporary.redirect_action_index.to_string(),
+            "123",
+        );
+        assert!(
+            parse_private_ingress_output(qdisc, &foreign_index, "pppoe-wan", &checkpoint).is_err()
+        );
+        let foreign_cookie = filter.replace(
+            &checkpoint.temporary.redirect_action_cookie,
+            "00112233445566778899aabbccddeeff",
+        );
+        assert!(
+            parse_private_ingress_output(qdisc, &foreign_cookie, "pppoe-wan", &checkpoint).is_err()
+        );
+    }
+
+    #[test]
+    fn private_calibration_commands_are_exact_and_refuse_foreign_runtime_state() {
+        use crate::autotune::{AutotuneProfile, LinkKind};
+        use crate::operations::autotune_runtime::{
+            AutotuneRuntimePermit, RuntimeBaseline, RuntimeQdiscKind, RuntimeRateBounds,
+            RuntimeSnapshot, TemporaryTopologyStage,
+        };
+        use crate::operations::autotune_runtime_store::RuntimeOverrideCheckpoint;
+        use crate::operations::full_autotune::{AutotuneRuntimeControl, MeasurementTopology};
+        use crate::operations::identity::ProcessIdentity;
+
+        let _guard = HELPER_TEST_LOCK.lock().unwrap();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "cake-private-topology-{}-{unique}",
+            std::process::id()
+        ));
+        let bin = root.join("bin");
+        let sys = root.join("sys/class/net");
+        let state = root.join("tc-state");
+        let tc_log = root.join("tc.log");
+        let ip_log = root.join("ip.log");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&sys).unwrap();
+        fs::create_dir_all(&state).unwrap();
+
+        let fake_ip = bin.join("ip");
+        fs::write(
+            &fake_ip,
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >> \"$FAKE_IP_LOG\"\ncase \"$1:$2\" in\n\
+link:add) name=\"$4\"; mkdir -p \"$FAKE_SYS/$name\"; printf '42\\n' > \"$FAKE_SYS/$name/ifindex\"; : > \"$FAKE_SYS/$name/ifalias\" ;;\n\
+link:set) name=\"$4\"; if [ \"${5:-}\" = alias ]; then printf '%s\\n' \"$6\" > \"$FAKE_SYS/$name/ifalias\"; fi ;;\n\
+-details:link) name=\"$5\"; [ -d \"$FAKE_SYS/$name\" ]; printf '42: %s: <UP> mtu 1500\\n    ifb\\n' \"$name\" ;;\n\
+*) if [ \"$1:$2\" = link:delete ]; then rm -rf \"$FAKE_SYS/$4\"; else exit 2; fi ;;\n\
+esac\n",
+        )
+        .unwrap();
+        let fake_tc = bin.join("tc");
+        fs::write(
+            &fake_tc,
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >> \"$FAKE_TC_LOG\"\ncase \"$1:$2\" in\n\
+qdisc:show) dev=\"$4\"; [ ! -f \"$FAKE_TC_STATE/root.$dev\" ] || cat \"$FAKE_TC_STATE/root.$dev\"; [ ! -f \"$FAKE_TC_STATE/ingress.$dev\" ] || cat \"$FAKE_TC_STATE/ingress.$dev\" ;;\n\
+filter:show) dev=\"$4\"; [ ! -f \"$FAKE_TC_STATE/filter.$dev\" ] || cat \"$FAKE_TC_STATE/filter.$dev\" ;;\n\
+qdisc:replace) dev=\"$4\"; handle=\"$7\"; rate=\"${10}\"; rate=\"${rate%kbit}Kbit\"; case \" $* \" in *' besteffort '*) policy='besteffort nat wash' ;; *) policy='diffserv4 nat' ;; esac; case \" $* \" in *' overhead 44 mpu 84 '*) link='noatm overhead 44 mpu 84' ;; *' overhead 18 mpu 64 '*) link='noatm overhead 18 mpu 64' ;; *) link='raw' ;; esac; printf 'qdisc cake %s root bandwidth %s %s %s\\n' \"$handle\" \"$rate\" \"$policy\" \"$link\" > \"$FAKE_TC_STATE/root.$dev\" ;;\n\
+qdisc:add) dev=\"$4\"; printf 'qdisc ingress %s parent ffff:fff1\\n' \"$6\" > \"$FAKE_TC_STATE/ingress.$dev\" ;;\n\
+filter:add) dev=\"$4\"; pref=''; handle=''; redirect=''; index=''; cookie=''; while [ \"$#\" -gt 0 ]; do case \"$1\" in pref) pref=\"$2\"; shift 2; continue ;; handle) handle=\"$2\"; shift 2; continue ;; redirect) [ \"$2\" = index ]; index=\"$3\"; [ \"$4\" = dev ]; redirect=\"$5\"; shift 5; continue ;; cookie) cookie=\"$2\"; shift 2; continue ;; esac; shift; done; printf 'filter parent ffff: protocol all pref %s u32 chain 0\\nfilter parent ffff: protocol all pref %s u32 chain 0 fh 800: ht divisor 1\\nfilter parent ffff: protocol all pref %s u32 chain 0 fh %s order 1911 key ht 800 bkt 0 terminal flowid not_in_hw\\n  match 00000000/00000000 at 0\\n action order 1: mirred (Egress Redirect to device %s) stolen\\n index %s ref 1 bind 1\\n cookie %s\\n' \"$pref\" \"$pref\" \"$pref\" \"$handle\" \"$redirect\" \"$index\" \"$cookie\" > \"$FAKE_TC_STATE/filter.$dev\" ;;\n\
+qdisc:del) dev=\"$4\"; case \"$5\" in root) rm -f \"$FAKE_TC_STATE/root.$dev\" ;; ingress) rm -f \"$FAKE_TC_STATE/ingress.$dev\" \"$FAKE_TC_STATE/filter.$dev\" ;; *) exit 3 ;; esac ;;\n\
+*) exit 4 ;;\n\
+esac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_ip, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&fake_tc, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let variable_names = [
+            "CAKE_AUTORATE_IP",
+            "CAKE_AUTORATE_TC",
+            "CAKE_AUTORATE_SYS_CLASS_NET",
+            "FAKE_IP_LOG",
+            "FAKE_TC_LOG",
+            "FAKE_SYS",
+            "FAKE_TC_STATE",
+        ];
+        let previous_values: Vec<_> = variable_names
+            .iter()
+            .map(|name| env::var_os(name))
+            .collect();
+        env::set_var("CAKE_AUTORATE_IP", &fake_ip);
+        env::set_var("CAKE_AUTORATE_TC", &fake_tc);
+        env::set_var("CAKE_AUTORATE_SYS_CLASS_NET", &sys);
+        env::set_var("FAKE_IP_LOG", &ip_log);
+        env::set_var("FAKE_TC_LOG", &tc_log);
+        env::set_var("FAKE_SYS", &sys);
+        env::set_var("FAKE_TC_STATE", &state);
+
+        let permit = AutotuneRuntimePermit {
+            kind: crate::operations::autotune_runtime::RuntimePermitKind::Autotune,
+            permit_id: "77".repeat(16),
+            job_id: "11".repeat(16),
+            worker_run_id: "22".repeat(16),
+            boot_id: "33".repeat(16),
+            coordinator_generation: "44".repeat(16),
+            worker: ProcessIdentity {
+                pid: 100,
+                process_group: 100,
+                starttime_ticks: 500,
+            },
+            instance_name: "wan_sqm".to_string(),
+            target_interface: "pppoe-wan".to_string(),
+            route_identity: "main||pppoe-wan|192.0.2.1||254".to_string(),
+            route_fingerprint: "55".repeat(32),
+            sqm_fingerprint: "66".repeat(32),
+            deadline_boot_ms: 60_000,
+            maximum_sequence: 32,
+            profile: AutotuneProfile::VariableLink,
+            link_kind: LinkKind::Pppoe,
+            baseline: RuntimeBaseline::Managed(MeasurementTopology::UploadOnlyShaped),
+            initial_download_kbps: 100_000,
+            initial_upload_kbps: 50_000,
+            download_qdisc_kind: RuntimeQdiscKind::Cake,
+            upload_qdisc_kind: RuntimeQdiscKind::Cake,
+            allow_bypass_download: true,
+            allow_bypass_upload: true,
+            download_bounds: RuntimeRateBounds {
+                minimum_kbps: 10_000,
+                maximum_kbps: 1_000_000,
+            },
+            upload_bounds: RuntimeRateBounds {
+                minimum_kbps: 5_000,
+                maximum_kbps: 500_000,
+            },
+        };
+        let baseline = RuntimeSnapshot {
+            target_interface: permit.target_interface.clone(),
+            route_fingerprint: permit.route_fingerprint.clone(),
+            sqm_fingerprint: permit.sqm_fingerprint.clone(),
+            topology: MeasurementTopology::UploadOnlyShaped,
+            download_kbps: None,
+            upload_kbps: Some(45_000),
+            download_qdisc_kind: None,
+            upload_qdisc_kind: Some(RuntimeQdiscKind::Cake),
+        };
+        let planned =
+            RuntimeOverrideCheckpoint::new(&permit, 1_000, RuntimeBaseline::Managed(baseline))
+                .unwrap();
+        let suspended = planned
+            .advance_temporary_stage(TemporaryTopologyStage::ManagedSqmSuspended, None)
+            .unwrap();
+        let ifindex = super::create_private_ifb(&suspended).unwrap();
+        let owned = suspended
+            .advance_temporary_stage(TemporaryTopologyStage::LinkOwned, Some(ifindex))
+            .unwrap();
+        let control = AutotuneRuntimeControl {
+            permit_id: permit.permit_id.clone(),
+            job_id: permit.job_id.clone(),
+            worker_run_id: permit.worker_run_id.clone(),
+            boot_id: permit.boot_id.clone(),
+            coordinator_generation: permit.coordinator_generation.clone(),
+            worker: permit.worker.clone(),
+            sequence: 1,
+            deadline_boot_ms: 30_000,
+            target_interface: permit.target_interface.clone(),
+            route_fingerprint: permit.route_fingerprint.clone(),
+            sqm_fingerprint: permit.sqm_fingerprint.clone(),
+            topology: MeasurementTopology::ShapedBoth,
+            download_kbps: Some(100_000),
+            upload_kbps: Some(50_000),
+        };
+        super::apply_private_runtime_topology(&permit.target_interface, &control, &owned).unwrap();
+        let expected = RuntimeSnapshot {
+            target_interface: permit.target_interface.clone(),
+            route_fingerprint: permit.route_fingerprint.clone(),
+            sqm_fingerprint: permit.sqm_fingerprint.clone(),
+            topology: MeasurementTopology::ShapedBoth,
+            download_kbps: control.download_kbps,
+            upload_kbps: control.upload_kbps,
+            download_qdisc_kind: Some(RuntimeQdiscKind::Cake),
+            upload_qdisc_kind: Some(RuntimeQdiscKind::Cake),
+        };
+        assert_eq!(
+            super::attest_private_runtime(&permit.target_interface, &expected, &owned,).unwrap(),
+            expected
+        );
+        let configured_ifb = "ifb4configured-must-not-be-read".to_string();
+        let capture_cfg = Config {
+            sqm_interface: permit.target_interface.clone(),
+            ul_if: permit.target_interface.clone(),
+            dl_if: configured_ifb.clone(),
+            ..Config::defaults("wan_sqm".to_string())
+        };
+        let tc_bytes_before_stage_rejection = fs::read(&tc_log).unwrap().len();
+        assert!(
+            super::attest_loaded_capture_runtime(&capture_cfg, &permit, &expected, &owned,)
+                .unwrap_err()
+                .contains("temporary stage link_owned")
+        );
+        assert_eq!(
+            fs::read(&tc_log).unwrap().len(),
+            tc_bytes_before_stage_rejection,
+            "checkpoint validation and stage binding must precede live tc reads"
+        );
+        let active = owned
+            .advance_temporary_stage(TemporaryTopologyStage::Active, None)
+            .unwrap();
+        assert_eq!(
+            super::attest_loaded_capture_runtime(&capture_cfg, &permit, &expected, &active,)
+                .unwrap(),
+            expected
+        );
+        assert!(!fs::read_to_string(&tc_log)
+            .unwrap()
+            .contains(&configured_ifb));
+        super::remove_private_runtime_topology(&permit.target_interface, &active).unwrap();
+        assert!(!sys.join(&active.temporary.ifb_name).exists());
+
+        let ifindex = super::create_private_ifb(&suspended).unwrap();
+        let owned = suspended
+            .advance_temporary_stage(TemporaryTopologyStage::LinkOwned, Some(ifindex))
+            .unwrap();
+        super::apply_private_runtime_topology(&permit.target_interface, &control, &owned).unwrap();
+        let active = owned
+            .advance_temporary_stage(TemporaryTopologyStage::Active, None)
+            .unwrap();
+        let foreign =
+            "qdisc cake 8001: root bandwidth 1Mbit diffserv4 nat noatm overhead 44 mpu 84\n";
+        fs::write(state.join("root.pppoe-wan"), foreign).unwrap();
+        assert!(
+            super::remove_private_runtime_topology(&permit.target_interface, &active,).is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(state.join("root.pppoe-wan")).unwrap(),
+            foreign
+        );
+        assert!(sys.join(&active.temporary.ifb_name).exists());
+
+        let tc_commands = fs::read_to_string(&tc_log).unwrap();
+        assert!(tc_commands.contains(&format!(
+            "qdisc replace dev pppoe-wan root handle {} cake bandwidth 50000kbit",
+            active.temporary.target_qdisc_handle
+        )));
+        assert!(tc_commands.contains(&format!(
+            "handle {} u32 match u32 0 0 action mirred egress redirect index {} dev {} cookie {}",
+            active.temporary.redirect_filter_tc_handle().unwrap(),
+            active.temporary.redirect_action_index,
+            active.temporary.ifb_name,
+            active.temporary.redirect_action_cookie
+        )));
+        assert!(!tc_commands.contains("uci"));
+
+        for (name, value) in variable_names.iter().zip(previous_values) {
+            if let Some(value) = value {
+                env::set_var(name, value);
+            } else {
+                env::remove_var(name);
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directional_topology_accepts_only_an_absent_disabled_device() {
+        let _guard = HELPER_TEST_LOCK.lock().unwrap();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "cake-directional-topology-{}-{unique}",
+            std::process::id()
+        ));
+        let sys = root.join("sys/class/net");
+        let target_stats = sys.join("eth0/statistics");
+        let tc = root.join("tc");
+        let tc_log = root.join("tc.log");
+        fs::create_dir_all(&target_stats).unwrap();
+        fs::write(target_stats.join("rx_bytes"), "0\n").unwrap();
+        fs::write(target_stats.join("tx_bytes"), "0\n").unwrap();
+        fs::write(
+            &tc,
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >> \"$FAKE_TC_LOG\"\ncase \"$*\" in\n\
+'qdisc show dev eth0') printf '%s\\n' 'qdisc cake 8001: root bandwidth 1Mbit' ;;\n\
+'qdisc show dev ifb4eth0') printf '%s\\n' 'qdisc cake 8002: root bandwidth 1Mbit' ;;\n\
+'filter show dev eth0 ingress') : ;;\n\
+*) exit 91 ;;\n\
+esac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&tc, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let variable_names = [
+            "CAKE_AUTORATE_TC",
+            "CAKE_AUTORATE_SYS_CLASS_NET",
+            "FAKE_TC_LOG",
+        ];
+        let previous_values: Vec<_> = variable_names
+            .iter()
+            .map(|name| env::var_os(name))
+            .collect();
+        env::set_var("CAKE_AUTORATE_TC", &tc);
+        env::set_var("CAKE_AUTORATE_SYS_CLASS_NET", &sys);
+        env::set_var("FAKE_TC_LOG", &tc_log);
+
+        let mut cfg = Config::defaults("upload_only".to_string());
+        cfg.sqm_interface = "eth0".to_string();
+        cfg.ul_if = "eth0".to_string();
+        cfg.dl_if = "ifb4eth0".to_string();
+        cfg.rx_bytes_path = target_stats.join("rx_bytes").to_string_lossy().into_owned();
+        cfg.tx_bytes_path = target_stats.join("tx_bytes").to_string_lossy().into_owned();
+
+        super::inspect_sqm_topology_for(&cfg, false, true).unwrap();
+        let log = fs::read_to_string(&tc_log).unwrap();
+        assert!(log.contains("qdisc show dev eth0"));
+        assert!(log.contains("filter show dev eth0 ingress"));
+        assert!(!log.contains("qdisc show dev ifb4eth0"));
+
+        let missing_enabled = super::inspect_sqm_topology_for(&cfg, true, true).unwrap_err();
+        assert_eq!(missing_enabled.kind, SqmTopologyErrorKind::Settling);
+        assert_eq!(missing_enabled.code, "download-device-missing");
+        assert!(!fs::read_to_string(&tc_log)
+            .unwrap()
+            .contains("qdisc show dev ifb4eth0"));
+
+        fs::create_dir_all(sys.join("ifb4eth0")).unwrap();
+        let stale_disabled = super::inspect_sqm_topology_for(&cfg, false, true).unwrap_err();
+        assert_eq!(stale_disabled.kind, SqmTopologyErrorKind::Unsafe);
+        assert_eq!(stale_disabled.code, "disabled-download-cake-remains");
+
+        for (name, value) in variable_names.iter().zip(previous_values) {
+            if let Some(value) = value {
+                env::set_var(name, value);
+            } else {
+                env::remove_var(name);
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn direction_mode_disables_only_the_unshaped_controller_and_counter_path() {
         let mut upload_only = Config::defaults("upload_only".to_string());
         upload_only.sqm_enabled = true;
@@ -9001,14 +14642,40 @@ mod tests {
         assert!(invalid.validate().is_err());
         invalid.sqm_enabled = false;
         assert!(invalid.validate().is_ok());
+
+        let mut disabled = Config::defaults("disabled".to_string());
+        disabled.sqm_enabled = false;
+        disabled.sqm_direction_mode = "both".to_string();
+        disabled.sqm_interface = "eth0".to_string();
+        disabled.ul_if = "eth0".to_string();
+        disabled.dl_if = "ifb4eth0".to_string();
+        disabled.normalize_paths();
+        assert!(!disabled.download_shaping_enabled());
+        assert!(!disabled.upload_shaping_enabled());
+        assert_eq!(
+            disabled.rx_bytes_path,
+            "/sys/class/net/eth0/statistics/rx_bytes"
+        );
     }
 
     #[test]
-    fn bootstrap_recovery_backoff_is_bounded() {
-        let seconds: Vec<u64> = (1..=7)
-            .map(|attempt| bootstrap_recovery_backoff(attempt).as_secs())
-            .collect();
-        assert_eq!(seconds, vec![5, 10, 20, 40, 60, 60, 60]);
+    fn sigterm_while_waiting_for_target_is_a_clean_shutdown() {
+        let _guard = HELPER_TEST_LOCK.lock().unwrap();
+        let mut cfg = Config::defaults("offline_shutdown".to_string());
+        cfg.manage_sqm = true;
+        cfg.sqm_enabled = true;
+        cfg.sqm_interface = "definitely-missing-interface".to_string();
+        cfg.ul_if = cfg.sqm_interface.clone();
+        cfg.dl_if = "ifb4definitely-missing-interface".to_string();
+        cfg.tx_bytes_path = "/definitely/missing/tx_bytes".to_string();
+        cfg.rx_bytes_path = "/definitely/missing/rx_bytes".to_string();
+        cfg.startup_wait_s = 0.0;
+
+        TERMINATE.store(true, Ordering::SeqCst);
+        let result = run(cfg, true);
+        TERMINATE.store(false, Ordering::SeqCst);
+
+        assert_eq!(result, Ok(()));
     }
 
     #[test]
@@ -9090,6 +14757,63 @@ mod tests {
     }
 
     #[test]
+    fn timed_out_runtime_sqm_stop_kills_the_entire_helper_group() {
+        let _guard = HELPER_TEST_LOCK.lock().unwrap();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "cake-autorate-runtime-stop-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let helper = root.join("sqm-run");
+        let child_pid_path = root.join("child.pid");
+        fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = stop ] || exit 9\n[ \"$2\" = pppoe-wan ] || exit 10\nsleep 30 &\nprintf '%s\\n' \"$!\" > '{}'\nwait\n",
+                child_pid_path.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error =
+            stop_managed_sqm_with(&helper, "pppoe-wan", Duration::from_millis(150), || false)
+                .expect_err("the deliberately stalled SQM stop must time out");
+        assert!(error.contains("bounded-command-timeout"));
+
+        let child_pid: u32 = fs::read_to_string(&child_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let proc_stat = PathBuf::from(format!("/proc/{child_pid}/stat"));
+        for _ in 0..20 {
+            let running = fs::read_to_string(&proc_stat)
+                .ok()
+                .and_then(|stat| stat.rsplit_once(')').map(|(_, rest)| rest.to_string()))
+                .and_then(|rest| rest.split_whitespace().next().map(str::to_string))
+                .map(|state| state != "Z")
+                .unwrap_or(false);
+            if !running {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        let still_running = fs::read_to_string(&proc_stat)
+            .ok()
+            .and_then(|stat| stat.rsplit_once(')').map(|(_, rest)| rest.to_string()))
+            .and_then(|rest| rest.split_whitespace().next().map(str::to_string))
+            .map(|state| state != "Z")
+            .unwrap_or(false);
+        assert!(!still_running, "timed-out SQM stop left a child running");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn delayed_topology_recovers_once_then_requires_attestation() {
         let _guard = HELPER_TEST_LOCK.lock().unwrap();
         let unique = SystemTime::now()
@@ -9126,8 +14850,9 @@ mod tests {
         fs::write(
             &helper,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n: > '{}'\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"${{2:-}}\" = check ]; then [ -e '{}' ]; exit; fi\n: > '{}'\n",
                 helper_log.display(),
+                healthy.display(),
                 healthy.display()
             ),
         )
@@ -9140,7 +14865,6 @@ mod tests {
             "CAKE_AUTORATE_SYS_CLASS_NET",
             "CAKE_AUTORATE_TC",
             "CAKE_AUTORATE_SQM_RECOVER",
-            "CAKE_AUTORATE_SQM_BOOTSTRAP_GRACE_S",
         ];
         let previous_values: Vec<_> = variable_names
             .iter()
@@ -9150,7 +14874,6 @@ mod tests {
         env::set_var("CAKE_AUTORATE_SYS_CLASS_NET", &sys);
         env::set_var("CAKE_AUTORATE_TC", &tc);
         env::set_var("CAKE_AUTORATE_SQM_RECOVER", &helper);
-        env::set_var("CAKE_AUTORATE_SQM_BOOTSTRAP_GRACE_S", "0");
         TERMINATE.store(false, Ordering::SeqCst);
 
         let mut cfg = Config::defaults("late_wan".to_string());
@@ -9164,7 +14887,10 @@ mod tests {
         cfg.if_up_check_interval_s = 1.0;
 
         wait_for_runtime_topology(&cfg).unwrap();
-        assert_eq!(fs::read_to_string(&helper_log).unwrap(), "late_wan\n");
+        assert_eq!(
+            fs::read_to_string(&helper_log).unwrap(),
+            "late_wan check\nlate_wan\n"
+        );
         fs::write(&helper_log, "").unwrap();
         wait_for_runtime_topology(&cfg).unwrap();
         assert_eq!(fs::read_to_string(&helper_log).unwrap(), "late_wan check\n");
@@ -9180,7 +14906,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_link_loss_waits_for_hotplug_before_owned_recovery() {
+    fn runtime_link_loss_uses_lock_state_instead_of_a_hotplug_grace() {
         let _guard = HELPER_TEST_LOCK.lock().unwrap();
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -9216,8 +14942,9 @@ mod tests {
         fs::write(
             &helper,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n: > '{}'\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"${{2:-}}\" = check ]; then [ -e '{}' ]; exit; fi\n: > '{}'\n",
                 helper_log.display(),
+                healthy.display(),
                 healthy.display()
             ),
         )
@@ -9230,7 +14957,6 @@ mod tests {
             "CAKE_AUTORATE_SYS_CLASS_NET",
             "CAKE_AUTORATE_TC",
             "CAKE_AUTORATE_SQM_RECOVER",
-            "CAKE_AUTORATE_SQM_BOOTSTRAP_GRACE_S",
         ];
         let previous_values: Vec<_> = variable_names
             .iter()
@@ -9240,7 +14966,6 @@ mod tests {
         env::set_var("CAKE_AUTORATE_SYS_CLASS_NET", &sys);
         env::set_var("CAKE_AUTORATE_TC", &tc);
         env::set_var("CAKE_AUTORATE_SQM_RECOVER", &helper);
-        env::set_var("CAKE_AUTORATE_SQM_BOOTSTRAP_GRACE_S", "60");
 
         let mut cfg = Config::defaults("runtime_link_loss".to_string());
         cfg.manage_sqm = true;
@@ -9266,25 +14991,26 @@ mod tests {
         fs::create_dir_all(&target).unwrap();
         fs::write(target.join("tx_bytes"), "0\n").unwrap();
         let (ready, recovered) = controller.ensure_managed_sqm();
-        assert!(!ready && !recovered);
-        assert_eq!(controller.sqm_runtime_state, "WAITING_SQM");
-        assert_eq!(controller.sqm_recovery_attempts, 0);
-        assert!(!helper_log.exists());
-
-        fs::write(&healthy, "").unwrap();
-        let (ready, recovered) = controller.ensure_managed_sqm();
         assert!(ready && recovered);
         assert_eq!(controller.sqm_runtime_state, "HEALTHY");
-        assert!(!helper_log.exists());
-
-        fs::remove_file(&healthy).unwrap();
-        env::set_var("CAKE_AUTORATE_SQM_BOOTSTRAP_GRACE_S", "0");
-        let (ready, recovered) = controller.ensure_managed_sqm();
-        assert!(ready && recovered);
         assert_eq!(controller.sqm_recovery_attempts, 1);
         assert_eq!(
             fs::read_to_string(&helper_log).unwrap(),
-            "runtime_link_loss\n"
+            "runtime_link_loss check\nruntime_link_loss\n"
+        );
+
+        fs::write(&helper_log, "").unwrap();
+        let (ready, recovered) = controller.ensure_managed_sqm();
+        assert!(ready && !recovered);
+        assert!(fs::read_to_string(&helper_log).unwrap().is_empty());
+
+        fs::remove_file(&healthy).unwrap();
+        let (ready, recovered) = controller.ensure_managed_sqm();
+        assert!(ready && recovered);
+        assert_eq!(controller.sqm_recovery_attempts, 2);
+        assert_eq!(
+            fs::read_to_string(&helper_log).unwrap(),
+            "runtime_link_loss check\nruntime_link_loss\n"
         );
 
         for (name, value) in variable_names.iter().zip(previous_values) {
@@ -9295,6 +15021,176 @@ mod tests {
             }
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unchanged_failed_sqm_generation_never_retries_until_topology_changes() {
+        let _guard = HELPER_TEST_LOCK.lock().unwrap();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "cake-autorate-sqm-generation-gate-{}-{unique}",
+            std::process::id()
+        ));
+        let sys = root.join("sys");
+        let target = sys.join("eth0/statistics");
+        let ifb = sys.join("ifb4eth0/statistics");
+        let healthy = root.join("healthy");
+        let helper_mode = root.join("helper-mode");
+        let tc_generation = root.join("tc-generation");
+        let helper_log = root.join("helper.log");
+        let tc = root.join("tc");
+        let helper = root.join("sqm-recover");
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(&ifb).unwrap();
+        fs::write(target.join("tx_bytes"), "0\n").unwrap();
+        fs::write(ifb.join("tx_bytes"), "0\n").unwrap();
+        fs::write(&tc_generation, "1\n").unwrap();
+        fs::write(
+            &tc,
+            format!(
+                "#!/bin/sh\nif [ -e '{}' ]; then\ncase \"$*\" in\n\
+                 'qdisc show dev eth0') printf '%s\\n' 'qdisc cake 8001: root bandwidth 100Mbit' ;;\n\
+                 'qdisc show dev ifb4eth0') printf '%s\\n' 'qdisc cake 8002: root bandwidth 500Mbit' ;;\n\
+                 'filter show dev eth0 ingress') printf '%s\\n' 'action order 1: mirred (Egress Redirect to device ifb4eth0)' ;;\n\
+                 esac\nelse\ngeneration=$(sed -n '1p' '{}')\ncase \"$*\" in\n\
+                 'qdisc show dev eth0'|'qdisc show dev ifb4eth0') printf 'qdisc fq_codel %s: root\\n' \"$generation\" ;;\n\
+                 esac\nfi\n",
+                healthy.display(),
+                tc_generation.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nmode=$(sed -n '1p' '{}')\nif [ \"${{2:-}}\" = check ]; then\n[ -e '{}' ] && exit 0\n[ \"$mode\" = busy ] && exit 75\nexit 1\nfi\n[ \"$mode\" = busy ] && exit 75\n[ \"$mode\" = fail ] && exit 1\n: > '{}'\n",
+                helper_log.display(),
+                helper_mode.display(),
+                healthy.display(),
+                healthy.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tc, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let variable_names = [
+            "CAKE_AUTORATE_RUN_ROOT",
+            "CAKE_AUTORATE_SYS_CLASS_NET",
+            "CAKE_AUTORATE_TC",
+            "CAKE_AUTORATE_SQM_RECOVER",
+        ];
+        let previous_values: Vec<_> = variable_names
+            .iter()
+            .map(|name| env::var_os(name))
+            .collect();
+        env::set_var("CAKE_AUTORATE_RUN_ROOT", root.join("run"));
+        env::set_var("CAKE_AUTORATE_SYS_CLASS_NET", &sys);
+        env::set_var("CAKE_AUTORATE_TC", &tc);
+        env::set_var("CAKE_AUTORATE_SQM_RECOVER", &helper);
+        TERMINATE.store(false, Ordering::SeqCst);
+
+        let mut cfg = Config::defaults("generation_gate".to_string());
+        cfg.manage_sqm = true;
+        cfg.sqm_enabled = true;
+        cfg.sqm_interface = "eth0".to_string();
+        cfg.ul_if = "eth0".to_string();
+        cfg.dl_if = "ifb4eth0".to_string();
+        cfg.tx_bytes_path = target.join("tx_bytes").to_string_lossy().into_owned();
+        cfg.rx_bytes_path = ifb.join("tx_bytes").to_string_lossy().into_owned();
+        cfg.log_to_file = false;
+        cfg.adjust_dl_shaper_rate = false;
+        cfg.adjust_ul_shaper_rate = false;
+        let mut controller = Controller::new(cfg).unwrap();
+
+        fs::write(&helper_mode, "busy\n").unwrap();
+        for _ in 0..8 {
+            let (ready, recovered) = controller.ensure_managed_sqm();
+            assert!(!ready && !recovered);
+        }
+        assert_eq!(controller.sqm_recovery_attempts, 0);
+        let busy_log = fs::read_to_string(&helper_log).unwrap();
+        assert_eq!(
+            busy_log
+                .lines()
+                .filter(|line| line.ends_with(" check"))
+                .count(),
+            8
+        );
+        assert_eq!(
+            busy_log
+                .lines()
+                .filter(|line| *line == "generation_gate")
+                .count(),
+            0
+        );
+
+        fs::write(&helper_mode, "fail\n").unwrap();
+        let (ready, recovered) = controller.ensure_managed_sqm();
+        assert!(!ready && !recovered);
+        assert_eq!(controller.sqm_recovery_attempts, 1);
+        for _ in 0..64 {
+            let (ready, recovered) = controller.ensure_managed_sqm();
+            assert!(!ready && !recovered);
+        }
+        let failed_log = fs::read_to_string(&helper_log).unwrap();
+        assert_eq!(
+            failed_log
+                .lines()
+                .filter(|line| *line == "generation_gate")
+                .count(),
+            1
+        );
+        assert_eq!(controller.sqm_recovery_attempts, 1);
+        assert_eq!(controller.sqm_runtime_state, "WAITING_SQM");
+
+        fs::write(&tc_generation, "2\n").unwrap();
+        fs::write(&helper_mode, "recover\n").unwrap();
+        let (ready, recovered) = controller.ensure_managed_sqm();
+        assert!(ready && recovered);
+        assert_eq!(controller.sqm_recovery_attempts, 2);
+        let recovered_log = fs::read_to_string(&helper_log).unwrap();
+        assert_eq!(
+            recovered_log
+                .lines()
+                .filter(|line| *line == "generation_gate")
+                .count(),
+            2
+        );
+
+        for (name, value) in variable_names.iter().zip(previous_values) {
+            if let Some(value) = value {
+                env::set_var(name, value);
+            } else {
+                env::remove_var(name);
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sqm_recovery_source_has_no_time_authorized_grace_backoff_or_cooldown() {
+        let source = include_str!("main.rs");
+        for forbidden in [
+            concat!("SQM_BOOTSTRAP_", "HOTPLUG_GRACE_S"),
+            concat!("SQM_BOOTSTRAP_RECOVERY_", "BACKOFF_INITIAL_S"),
+            concat!("SQM_BOOTSTRAP_RECOVERY_", "BACKOFF_MAX_S"),
+            concat!("SQM_RUNTIME_RECOVERY_", "COOLDOWN_S"),
+            concat!("bootstrap_recovery_", "backoff"),
+            concat!("bootstrap_hotplug_", "grace"),
+            concat!("sqm_last_recovery_", "attempt"),
+            concat!("sqm_topology_missing_", "since"),
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "managed SQM recovery still contains timer-owned state: {forbidden}"
+            );
+        }
+        assert!(source.contains("SqmRecoveryGate"));
+        assert!(source.contains("WaitForStateChange"));
     }
 
     #[test]
@@ -9317,19 +15213,1875 @@ mod tests {
 
         fs::write(&rx, "1000000\n").unwrap();
         fs::write(&tx, "500000\n").unwrap();
-        monitor.last = Instant::now();
-        let stale = monitor.sample();
+        let base = Instant::now();
+        monitor.last = base;
+        let stale = monitor
+            .try_sample_at(base + Duration::from_millis(199))
+            .unwrap();
         assert!(!stale.fresh);
         assert_eq!((stale.dl_kbps, stale.ul_kbps), (0.0, 0.0));
 
-        thread::sleep(Duration::from_millis(210));
-        let fresh = monitor.sample();
+        let fresh = monitor
+            .try_sample_at(base + Duration::from_millis(200))
+            .unwrap();
         assert!(fresh.fresh);
         let dl = fresh.dl_kbps;
         let ul = fresh.ul_kbps;
         assert!(dl > 30_000.0, "download delta was not retained: {dl}");
         assert!(ul > 15_000.0, "upload delta was not retained: {ul}");
         assert!((dl / ul - 2.0).abs() < 0.01);
+
+        fs::write(&rx, "2000000\n").unwrap();
+        fs::write(&tx, "1000000\n").unwrap();
+        let cached = monitor
+            .try_sample_at(base + Duration::from_millis(399))
+            .unwrap();
+        assert!(!cached.fresh);
+        assert_eq!(cached.dl_kbps, fresh.dl_kbps);
+        assert_eq!(cached.ul_kbps, fresh.ul_kbps);
+        assert_eq!(cached.dl_observed_at, fresh.dl_observed_at);
+        assert_eq!(cached.ul_observed_at, fresh.ul_observed_at);
+        let next = monitor
+            .try_sample_at(base + Duration::from_millis(400))
+            .unwrap();
+        assert!(next.fresh, "an exact cadence tick must not phase-jitter");
+        assert!((next.dl_kbps / next.ul_kbps - 2.0).abs() < 0.01);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn test_autotune_capture_request(
+        sequence: u32,
+        phase: crate::operations::full_autotune::AutotuneCapturePhase,
+        topology: crate::operations::full_autotune::MeasurementTopology,
+        direction: Option<crate::operations::protocol::SpeedtestDirection>,
+    ) -> crate::operations::full_autotune::AutotuneCaptureRequest {
+        crate::operations::full_autotune::AutotuneCaptureRequest {
+            capture_id: format!("{:032x}", sequence),
+            job_id: "b".repeat(32),
+            worker_run_id: "c".repeat(32),
+            permit_id: "d".repeat(32),
+            instance_name: "wan_sqm".to_string(),
+            sequence,
+            control_sequence: sequence,
+            deadline_boot_ms: 100_000,
+            phase,
+            topology,
+            direction,
+            candidate_dl_kbps: None,
+            candidate_ul_kbps: Some(723_400),
+            load_reference_kbps: Some(900_000),
+            route_fingerprint: "e".repeat(64),
+            sqm_fingerprint: "f".repeat(64),
+        }
+    }
+
+    #[test]
+    fn load_evidence_published_during_admission_uses_post_read_monotonic_time() {
+        use crate::operations::autotune_capture::AutotuneCaptureObservationKind;
+        use crate::operations::full_autotune::{
+            AutotuneCapturePhase, AutotuneLoadEvidence, MeasurementTopology,
+        };
+        use crate::operations::protocol::SpeedtestDirection;
+
+        let request = test_autotune_capture_request(
+            41,
+            AutotuneCapturePhase::LoadedMeasurement,
+            MeasurementTopology::RawDownload,
+            Some(SpeedtestDirection::Download),
+        );
+        let evidence = AutotuneLoadEvidence {
+            request: request.clone(),
+            published_boot_ms: 20_100,
+            run_count: 1,
+            aggregate_rx_bytes: 1_100_000,
+            aggregate_tx_bytes: 50_000,
+            confidence_total_bytes: 1_100_000,
+            controlled_wire_bytes: 1_000_000,
+            controlled_payload_bytes: 1_000_000,
+            counter_elapsed_ms: 10_000,
+            direction_elapsed_ms: 10_000,
+            backend_reported_kbps: 800,
+            backend_consistent_runs: 1,
+            backend_payload_only_runs: 0,
+            realized_kbps: 800,
+            goodput_kbps: 800,
+        };
+
+        assert!(
+            loaded_autotune_traffic_observation_after_read(&request, &evidence, || { Ok(20_000) })
+                .unwrap_err()
+                .contains("outside its monotonic lifetime")
+        );
+        assert_eq!(
+            loaded_autotune_traffic_observation_after_read(&request, &evidence, || Ok(20_200))
+                .unwrap(),
+            AutotuneCaptureObservationKind::Traffic {
+                background_confidence_percent: 90,
+                contaminated: false,
+            }
+        );
+        assert!(
+            loaded_autotune_traffic_observation_after_read(&request, &evidence, || {
+                Ok(request.deadline_boot_ms + 1)
+            })
+            .unwrap_err()
+            .contains("outside its monotonic lifetime")
+        );
+        let mut wrong = evidence.clone();
+        wrong.request.capture_id = "9".repeat(32);
+        assert!(
+            loaded_autotune_traffic_observation_after_read(&request, &wrong, || Ok(20_200))
+                .unwrap_err()
+                .contains("identity mismatch")
+        );
+        assert!(
+            loaded_autotune_traffic_observation_after_read(&request, &evidence, || {
+                Err("clock unavailable".to_string())
+            })
+            .unwrap_err()
+            .contains("after reading")
+        );
+    }
+
+    #[test]
+    fn load_evidence_rejection_uses_fresh_time_without_clamping() {
+        use crate::operations::autotune_capture::AutotuneCaptureAccumulator;
+        use crate::operations::full_autotune::{AutotuneCapturePhase, MeasurementTopology};
+        use crate::operations::protocol::SpeedtestDirection;
+
+        let request = test_autotune_capture_request(
+            41,
+            AutotuneCapturePhase::LoadedMeasurement,
+            MeasurementTopology::RawDownload,
+            Some(SpeedtestDirection::Download),
+        );
+        let mut accumulator = AutotuneCaptureAccumulator::new();
+        accumulator.admit(&request, 20_000).unwrap();
+        let rejected = reject_autotune_capture_after_io_with_clock(
+            &mut accumulator,
+            "capture-load-evidence-invalid",
+            || Ok(20_200),
+        )
+        .unwrap();
+        assert_eq!(rejected.updated_boot_ms, 20_200);
+
+        let mut no_clock = AutotuneCaptureAccumulator::new();
+        no_clock.admit(&request, 20_000).unwrap();
+        assert!(reject_autotune_capture_after_io_with_clock(
+            &mut no_clock,
+            "capture-load-evidence-invalid",
+            || Err("clock unavailable".to_string()),
+        )
+        .is_none());
+        assert!(no_clock.accepting_observations());
+
+        let mut expired = AutotuneCaptureAccumulator::new();
+        expired.admit(&request, 20_000).unwrap();
+        assert!(reject_autotune_capture_after_io_with_clock(
+            &mut expired,
+            "capture-load-evidence-invalid",
+            || Ok(request.deadline_boot_ms + 1),
+        )
+        .is_none());
+        assert!(expired.accepting_observations());
+    }
+
+    #[test]
+    fn autotune_counter_completion_requires_full_identity_and_current_epoch() {
+        use crate::operations::autotune_counter::AutotuneCounterCompletion;
+        use crate::operations::full_autotune::{AutotuneCapturePhase, MeasurementTopology};
+        use crate::operations::protocol::SpeedtestDirection;
+
+        let request = test_autotune_capture_request(
+            41,
+            AutotuneCapturePhase::LoadedMeasurement,
+            MeasurementTopology::RawDownload,
+            Some(SpeedtestDirection::Download),
+        );
+        let monitor = AutotuneSpeedtestRateMonitor {
+            request: request.clone(),
+            counter_epoch: 2,
+            monitor: SpeedtestCounterRateMonitor::new(200),
+        };
+        let completion = AutotuneCounterCompletion {
+            request: request.clone(),
+            epoch: 1,
+            completed_at: Instant::now(),
+            completed_boot_ms: 99_000,
+            outcome: Ok(None),
+        };
+        assert!(
+            !autotune_counter_completion_matches(&request, &monitor, &completion),
+            "an exact request replay from an invalidated sampler epoch must remain stale"
+        );
+        let current = AutotuneCounterCompletion {
+            epoch: 2,
+            ..completion
+        };
+        assert!(autotune_counter_completion_matches(
+            &request, &monitor, &current
+        ));
+        assert!(autotune_counter_completion_is_timely(&request, &current));
+        let late = AutotuneCounterCompletion {
+            request: request.clone(),
+            epoch: 2,
+            completed_at: Instant::now(),
+            completed_boot_ms: request.deadline_boot_ms + 1,
+            outcome: Ok(None),
+        };
+        assert!(!autotune_counter_completion_is_timely(&request, &late));
+        let rotated = test_autotune_capture_request(
+            42,
+            AutotuneCapturePhase::LoadedMeasurement,
+            MeasurementTopology::RawDownload,
+            Some(SpeedtestDirection::Download),
+        );
+        assert!(!autotune_counter_completion_matches(
+            &rotated, &monitor, &current
+        ));
+    }
+
+    #[test]
+    fn autotune_capture_attestation_lease_bridges_one_slow_read_but_expires_fail_closed() {
+        use crate::operations::full_autotune::{AutotuneCapturePhase, MeasurementTopology};
+        use crate::operations::protocol::SpeedtestDirection;
+
+        let request = test_autotune_capture_request(
+            41,
+            AutotuneCapturePhase::LoadedMeasurement,
+            MeasurementTopology::RawDownload,
+            Some(SpeedtestDirection::Download),
+        );
+        let mut rotated = request.clone();
+        rotated.capture_id = "9".repeat(32);
+        let attested_at = Instant::now();
+
+        let slow_attestation_started = attested_at;
+        let slow_attestation_completed = slow_attestation_started
+            + AUTOTUNE_CAPTURE_ATTESTATION_MAX_AGE
+            + Duration::from_secs(1);
+        let first_observation = slow_attestation_completed + Duration::from_millis(1);
+        assert!(autotune_capture_attestation_lease_valid(
+            slow_attestation_completed,
+            first_observation,
+            &request,
+            Some(&request),
+            request.deadline_boot_ms,
+        ));
+        assert!(!autotune_capture_attestation_lease_valid(
+            slow_attestation_started,
+            first_observation,
+            &request,
+            Some(&request),
+            request.deadline_boot_ms,
+        ));
+
+        assert!(autotune_capture_attestation_lease_valid(
+            attested_at,
+            attested_at + Duration::from_millis(1_250),
+            &request,
+            Some(&request),
+            request.deadline_boot_ms,
+        ));
+        assert!(!autotune_capture_attestation_lease_valid(
+            attested_at,
+            attested_at + AUTOTUNE_CAPTURE_ATTESTATION_MAX_AGE,
+            &request,
+            Some(&request),
+            request.deadline_boot_ms,
+        ));
+        assert!(!autotune_capture_attestation_lease_valid(
+            attested_at,
+            attested_at + Duration::from_millis(1_250),
+            &request,
+            None,
+            request.deadline_boot_ms,
+        ));
+        assert!(!autotune_capture_attestation_lease_valid(
+            attested_at,
+            attested_at + Duration::from_millis(1_250),
+            &request,
+            Some(&rotated),
+            request.deadline_boot_ms,
+        ));
+        assert!(!autotune_capture_attestation_lease_valid(
+            attested_at,
+            attested_at + Duration::from_millis(1_250),
+            &request,
+            Some(&request),
+            request.deadline_boot_ms + 1,
+        ));
+    }
+
+    fn test_transport_result(
+        request: &crate::operations::full_autotune::AutotuneCaptureRequest,
+        probe_id: u64,
+        started_at: Instant,
+        completed_at: Instant,
+        phase: (bool, bool),
+    ) -> TransportProbeResult {
+        TransportProbeResult {
+            probe_id,
+            started_at,
+            completed_at,
+            control_valid: true,
+            capture_interval_valid: None,
+            endpoint: "wss://example.invalid/latency".to_string(),
+            dl_loaded: phase.0,
+            ul_loaded: phase.1,
+            rating_phase: crate::rating_load::RatingPhase::Idle,
+            autotune_capture: Some(request.clone()),
+            latency_ms: Some(42.0),
+            error: None,
+            failure_kind: None,
+            failure_deadline_us: None,
+            route_identity: Some("mwan3|wan|pppoe-wan|192.0.2.2|0x100|100".to_string()),
+            backend: "websocket".to_string(),
+            trusted: true,
+            raw_samples_ms: vec![42.0],
+            discarded_samples: 0,
+            server_processing_ms: 0.0,
+            connection_reused: true,
+        }
+    }
+
+    fn test_transport_delta(
+        start: Instant,
+        end: Instant,
+    ) -> crate::operations::autotune_counter::AutotuneCounterDelta {
+        crate::operations::autotune_counter::AutotuneCounterDelta {
+            download_bytes: 0,
+            upload_bytes: 0,
+            observed_start: start,
+            observed_end: end,
+            within_maximum_span: true,
+        }
+    }
+
+    #[test]
+    fn autotune_transport_physical_delta_starts_speculative_probe_before_hold() {
+        use crate::operations::full_autotune::{AutotuneCapturePhase, MeasurementTopology};
+        use crate::operations::protocol::SpeedtestDirection;
+
+        let request = test_autotune_capture_request(
+            51,
+            AutotuneCapturePhase::LoadedMeasurement,
+            MeasurementTopology::RawUpload,
+            Some(SpeedtestDirection::Upload),
+        );
+        let key = AutotuneTransportCaptureKey::new(&request, "route-a");
+        let base = Instant::now();
+        let end = base + Duration::from_millis(800);
+        let dropout = Duration::from_millis(600);
+        let mut control = AutotuneTransportControl::default();
+        control.observe(
+            key.clone(),
+            None,
+            (false, true),
+            end,
+            dropout,
+            Duration::from_secs(10),
+        );
+        control
+            .observe_physical_delta(
+                &key,
+                test_transport_delta(base, end),
+                Some((false, true)),
+                Duration::from_secs(10),
+            )
+            .unwrap();
+
+        let readiness = control
+            .ready_phase_diagnostic(&request, &key, end, Duration::from_secs(3), dropout)
+            .unwrap();
+        assert!(readiness.ready);
+        assert_eq!(readiness.reason, "loaded-physical-delta-ready");
+    }
+
+    #[test]
+    fn autotune_transport_physical_delta_rejects_a_span_beyond_dropout() {
+        use crate::operations::full_autotune::{AutotuneCapturePhase, MeasurementTopology};
+        use crate::operations::protocol::SpeedtestDirection;
+
+        let request = test_autotune_capture_request(
+            54,
+            AutotuneCapturePhase::LoadedMeasurement,
+            MeasurementTopology::RawUpload,
+            Some(SpeedtestDirection::Upload),
+        );
+        let base = Instant::now();
+        let mut bounded = test_transport_delta(base, base + Duration::from_millis(200));
+        bounded.upload_bytes = 30_000_000;
+        assert_eq!(
+            autotune_transport_delta_phase(
+                &request,
+                bounded,
+                Duration::from_millis(600),
+                100.0,
+                0.05,
+            )
+            .unwrap(),
+            Some((false, true))
+        );
+
+        let mut overlong = test_transport_delta(base, base + Duration::from_millis(601));
+        overlong.upload_bytes = 90_000_000;
+        assert_eq!(
+            autotune_transport_delta_phase(
+                &request,
+                overlong,
+                Duration::from_millis(600),
+                100.0,
+                0.05,
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn autotune_transport_result_waits_for_physical_bracket_then_accepts() {
+        use crate::operations::full_autotune::{AutotuneCapturePhase, MeasurementTopology};
+        use crate::operations::protocol::SpeedtestDirection;
+
+        let request = test_autotune_capture_request(
+            52,
+            AutotuneCapturePhase::LoadedMeasurement,
+            MeasurementTopology::RawUpload,
+            Some(SpeedtestDirection::Upload),
+        );
+        let key = AutotuneTransportCaptureKey::new(&request, "route-a");
+        let base = Instant::now();
+        let first_end = base + Duration::from_millis(800);
+        let dropout = Duration::from_millis(600);
+        let mut control = AutotuneTransportControl::default();
+        control.observe(
+            key.clone(),
+            Some((false, true)),
+            (false, true),
+            first_end,
+            dropout,
+            Duration::from_secs(10),
+        );
+        control
+            .observe_physical_delta(
+                &key,
+                test_transport_delta(base, first_end),
+                Some((false, true)),
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        let flight = AutotuneTransportFlight {
+            probe_id: 52,
+            key: key.clone(),
+            expected_phase: (false, true),
+            control_valid: true,
+            submitted_at: first_end,
+            physical_delta_required: true,
+        };
+        let result = test_transport_result(
+            &request,
+            52,
+            first_end + Duration::from_millis(20),
+            first_end + Duration::from_millis(300),
+            (false, true),
+        );
+        assert!(matches!(
+            control.settle_diagnostic(&flight, &result, dropout),
+            AutotuneTransportSettlement::Pending("physical-bracket-pending")
+        ));
+
+        control
+            .observe_physical_delta(
+                &key,
+                test_transport_delta(first_end, first_end + Duration::from_millis(400)),
+                Some((false, true)),
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        let AutotuneTransportSettlement::Final(attestation) =
+            control.settle_diagnostic(&flight, &result, dropout)
+        else {
+            panic!("bracketed result remained pending");
+        };
+        assert!(attestation.valid);
+        assert_eq!(attestation.reason, "physical-loaded-flight-valid");
+    }
+
+    #[test]
+    fn autotune_transport_rolling_overhang_cannot_validate_idle_physical_flight() {
+        use crate::operations::full_autotune::{AutotuneCapturePhase, MeasurementTopology};
+        use crate::operations::protocol::SpeedtestDirection;
+
+        let request = test_autotune_capture_request(
+            53,
+            AutotuneCapturePhase::LoadedMeasurement,
+            MeasurementTopology::RawUpload,
+            Some(SpeedtestDirection::Upload),
+        );
+        let key = AutotuneTransportCaptureKey::new(&request, "route-a");
+        let base = Instant::now();
+        let first_end = base + Duration::from_millis(800);
+        let dropout = Duration::from_millis(600);
+        let mut control = AutotuneTransportControl::default();
+        control.observe(
+            key.clone(),
+            Some((false, true)),
+            (false, true),
+            first_end,
+            dropout,
+            Duration::from_secs(10),
+        );
+        control
+            .observe_physical_delta(
+                &key,
+                test_transport_delta(base, first_end),
+                Some((false, true)),
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        let flight = AutotuneTransportFlight {
+            probe_id: 53,
+            key: key.clone(),
+            expected_phase: (false, true),
+            control_valid: true,
+            submitted_at: first_end,
+            physical_delta_required: true,
+        };
+        let result = test_transport_result(
+            &request,
+            53,
+            first_end + Duration::from_millis(20),
+            first_end + Duration::from_millis(300),
+            (false, true),
+        );
+        // The smoothed rate still says upload-loaded, but the exact next
+        // physical delta is idle.  Only the physical interval may settle the
+        // completed probe.
+        control.observe(
+            key.clone(),
+            Some((false, true)),
+            (false, true),
+            first_end + Duration::from_millis(400),
+            dropout,
+            Duration::from_secs(10),
+        );
+        control
+            .observe_physical_delta(
+                &key,
+                test_transport_delta(first_end, first_end + Duration::from_millis(400)),
+                Some((false, false)),
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        let AutotuneTransportSettlement::Final(attestation) =
+            control.settle_diagnostic(&flight, &result, dropout)
+        else {
+            panic!("bracketed idle result remained pending");
+        };
+        assert!(!attestation.valid);
+        assert_eq!(attestation.reason, "physical-flight-coverage-insufficient");
+    }
+
+    #[test]
+    fn autotune_transport_physical_coverage_is_exact_and_gaps_fail_closed() {
+        use crate::operations::full_autotune::{AutotuneCapturePhase, MeasurementTopology};
+        use crate::operations::protocol::SpeedtestDirection;
+
+        let request = test_autotune_capture_request(
+            55,
+            AutotuneCapturePhase::LoadedMeasurement,
+            MeasurementTopology::RawDownload,
+            Some(SpeedtestDirection::Download),
+        );
+        let key = AutotuneTransportCaptureKey::new(&request, "route-a");
+        let base = Instant::now();
+        let end = base + Duration::from_secs(1);
+        let dropout = Duration::from_millis(600);
+        let flight = AutotuneTransportFlight {
+            probe_id: 55,
+            key: key.clone(),
+            expected_phase: (true, false),
+            control_valid: true,
+            submitted_at: base,
+            physical_delta_required: true,
+        };
+        let result = test_transport_result(&request, 55, base, end, (true, false));
+
+        let mut exact = AutotuneTransportControl::default();
+        exact.observe(
+            key.clone(),
+            Some((true, false)),
+            (true, false),
+            base,
+            dropout,
+            Duration::from_secs(10),
+        );
+        exact
+            .observe_physical_delta(
+                &key,
+                test_transport_delta(base, base + Duration::from_millis(700)),
+                Some((true, false)),
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        exact
+            .observe_physical_delta(
+                &key,
+                test_transport_delta(base + Duration::from_millis(700), end),
+                Some((false, false)),
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        let AutotuneTransportSettlement::Final(attestation) =
+            exact.settle_diagnostic(&flight, &result, dropout)
+        else {
+            panic!("fully bracketed exact-threshold result remained pending");
+        };
+        assert!(attestation.valid, "exact 70% coverage must be accepted");
+
+        let mut gap = AutotuneTransportControl::default();
+        gap.observe(
+            key.clone(),
+            Some((true, false)),
+            (true, false),
+            base,
+            dropout,
+            Duration::from_secs(10),
+        );
+        gap.observe_physical_delta(
+            &key,
+            test_transport_delta(base, base + Duration::from_millis(100)),
+            Some((true, false)),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        gap.observe_physical_delta(
+            &key,
+            test_transport_delta(base + Duration::from_millis(701), end),
+            Some((true, false)),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        let AutotuneTransportSettlement::Final(attestation) =
+            gap.settle_diagnostic(&flight, &result, dropout)
+        else {
+            panic!("fully bracketed gap result remained pending");
+        };
+        assert!(!attestation.valid);
+        assert_eq!(attestation.reason, "physical-flight-dropout-exceeded");
+
+        assert!(gap
+            .observe_physical_delta(
+                &key,
+                test_transport_delta(base + Duration::from_millis(900), end),
+                Some((true, false)),
+                Duration::from_secs(10),
+            )
+            .unwrap_err()
+            .contains("overlap"));
+    }
+
+    #[test]
+    fn managed_transport_deadline_requires_exact_capture_route_and_flight_attestation() {
+        use crate::operations::autotune_capture::AutotuneCaptureObservationKind;
+        use crate::operations::full_autotune::{AutotuneCapturePhase, MeasurementTopology};
+        use crate::operations::protocol::SpeedtestDirection;
+        use crate::transport_probe::TransportProbeFailureKind;
+
+        let request = test_autotune_capture_request(
+            1,
+            AutotuneCapturePhase::LoadedMeasurement,
+            MeasurementTopology::RawDownload,
+            Some(SpeedtestDirection::Download),
+        );
+        let started_at = Instant::now();
+        let mut result = test_transport_result(
+            &request,
+            1,
+            started_at,
+            started_at + Duration::from_secs(5),
+            (true, false),
+        );
+        result.latency_ms = None;
+        result.raw_samples_ms.clear();
+        result.error = Some("transport deadline exceeded".to_string());
+        result.failure_kind = Some(TransportProbeFailureKind::DeadlineExceeded);
+        result.failure_deadline_us = Some(5_000_000);
+        result.capture_interval_valid = Some(true);
+        let route = result.route_identity.clone().unwrap();
+        assert_eq!(
+            censored_autotune_transport_observation(
+                &result,
+                Some(&request),
+                Some(&route),
+                Some(10.0),
+            )
+            .unwrap(),
+            Some(AutotuneCaptureObservationKind::TransportDeadlineExceeded {
+                deadline_us: 5_000_000,
+                delta_lower_bound_us: 4_990_000,
+            })
+        );
+
+        let mut invalid_flight = result.clone();
+        invalid_flight.capture_interval_valid = Some(false);
+        assert_eq!(
+            censored_autotune_transport_observation(
+                &invalid_flight,
+                Some(&request),
+                Some(&route),
+                Some(10.0),
+            )
+            .unwrap(),
+            None
+        );
+        let mut ordinary_failure = result.clone();
+        ordinary_failure.failure_kind = Some(TransportProbeFailureKind::Other);
+        ordinary_failure.failure_deadline_us = None;
+        assert_eq!(
+            censored_autotune_transport_observation(
+                &ordinary_failure,
+                Some(&request),
+                Some(&route),
+                Some(10.0),
+            )
+            .unwrap(),
+            None
+        );
+        let mut malformed = result;
+        malformed.failure_deadline_us = None;
+        assert!(censored_autotune_transport_observation(
+            &malformed,
+            Some(&request),
+            Some(&route),
+            Some(10.0),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn autotune_transport_hold_tolerates_bounded_bursty_download_dropouts() {
+        use crate::operations::full_autotune::{AutotuneCapturePhase, MeasurementTopology};
+        use crate::operations::protocol::SpeedtestDirection;
+
+        let request = test_autotune_capture_request(
+            1,
+            AutotuneCapturePhase::LoadedMeasurement,
+            MeasurementTopology::RawDownload,
+            Some(SpeedtestDirection::Download),
+        );
+        let key = AutotuneTransportCaptureKey::new(&request, "route-a");
+        let base = Instant::now();
+        let hold = Duration::from_secs(3);
+        let dropout = Duration::from_millis(600);
+        let mut control = AutotuneTransportControl::default();
+
+        for tick in 0..=20 {
+            let phase = if tick % 5 == 4 {
+                Some((false, false))
+            } else {
+                Some((true, false))
+            };
+            control.observe(
+                key.clone(),
+                phase,
+                (true, false),
+                base + Duration::from_millis(tick * 200),
+                dropout,
+                Duration::from_secs(10),
+            );
+        }
+        assert_eq!(
+            control
+                .ready_phase(&request, &key, base + Duration::from_secs(4), hold, dropout,)
+                .unwrap(),
+            ((true, false), true),
+            "short raw TCP gaps must not restart the whole three-second hold"
+        );
+    }
+
+    #[test]
+    fn autotune_transport_hold_tolerates_a_short_missing_rate_sample() {
+        use crate::operations::full_autotune::{AutotuneCapturePhase, MeasurementTopology};
+        use crate::operations::protocol::SpeedtestDirection;
+
+        let request = test_autotune_capture_request(
+            13,
+            AutotuneCapturePhase::LoadedMeasurement,
+            MeasurementTopology::ShapedBoth,
+            Some(SpeedtestDirection::Download),
+        );
+        let key = AutotuneTransportCaptureKey::new(&request, "route-a");
+        let base = Instant::now();
+        let hold = Duration::from_secs(3);
+        let dropout = Duration::from_millis(600);
+        let mut control = AutotuneTransportControl::default();
+
+        for tick in 0..=20 {
+            let phase = if tick == 14 {
+                None
+            } else {
+                Some((true, false))
+            };
+            control.observe(
+                key.clone(),
+                phase,
+                (true, false),
+                base + Duration::from_millis(tick * 200),
+                dropout,
+                Duration::from_secs(10),
+            );
+        }
+        assert_eq!(
+            control
+                .ready_phase(&request, &key, base + Duration::from_secs(4), hold, dropout)
+                .unwrap(),
+            ((true, false), true),
+            "a missing rate sample shorter than dropout must not restart the capture hold"
+        );
+    }
+
+    #[test]
+    fn autotune_transport_hold_survives_a_slow_reattest_without_synthetic_idle() {
+        use crate::operations::full_autotune::{AutotuneCapturePhase, MeasurementTopology};
+        use crate::operations::protocol::SpeedtestDirection;
+
+        let request = test_autotune_capture_request(
+            14,
+            AutotuneCapturePhase::LoadedMeasurement,
+            MeasurementTopology::ShapedBoth,
+            Some(SpeedtestDirection::Download),
+        );
+        let key = AutotuneTransportCaptureKey::new(&request, "route-a");
+        let base = Instant::now();
+        let hold = Duration::from_secs(3);
+        let dropout = Duration::from_millis(600);
+        let mut control = AutotuneTransportControl::default();
+
+        control.observe(
+            key.clone(),
+            Some((true, false)),
+            (true, false),
+            base,
+            dropout,
+            Duration::from_secs(10),
+        );
+        // A synchronous identity/SQM re-attestation can keep the main loop
+        // busy for longer than the hold.  No observation during that interval
+        // is not evidence of idle traffic; the first post-attestation sample
+        // remains explicitly loaded and identity-bound.
+        let after_reattest = base + Duration::from_secs(4);
+        control.observe(
+            key.clone(),
+            Some((true, false)),
+            (true, false),
+            after_reattest,
+            dropout,
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            control
+                .ready_phase(&request, &key, after_reattest, hold, dropout)
+                .unwrap(),
+            ((true, false), true)
+        );
+
+        control.observe(
+            key.clone(),
+            None,
+            (true, false),
+            after_reattest + Duration::from_millis(1),
+            dropout,
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            control
+                .ready_phase(
+                    &request,
+                    &key,
+                    after_reattest + Duration::from_secs(1),
+                    hold,
+                    dropout,
+                )
+                .unwrap(),
+            ((true, false), false),
+            "a real missing rate observation must still fail closed"
+        );
+    }
+
+    #[test]
+    fn autotune_transport_pair_requires_a_simultaneous_bidirectional_hold() {
+        use crate::operations::full_autotune::{AutotuneCapturePhase, MeasurementTopology};
+        use crate::operations::protocol::SpeedtestDirection;
+
+        let request = test_autotune_capture_request(
+            12,
+            AutotuneCapturePhase::LoadedMeasurement,
+            MeasurementTopology::ShapedBoth,
+            Some(SpeedtestDirection::Both),
+        );
+        assert_eq!(
+            AutotuneTransportControl::expected_phase(&request).unwrap(),
+            (true, true)
+        );
+        let key = AutotuneTransportCaptureKey::new(&request, "route-a");
+        let base = Instant::now();
+        let hold = Duration::from_secs(3);
+        let dropout = Duration::from_millis(600);
+        let mut control = AutotuneTransportControl::default();
+        for tick in 0..=20 {
+            control.observe(
+                key.clone(),
+                Some((true, true)),
+                (true, true),
+                base + Duration::from_millis(tick * 200),
+                dropout,
+                Duration::from_secs(10),
+            );
+        }
+        assert_eq!(
+            control
+                .ready_phase(&request, &key, base + Duration::from_secs(4), hold, dropout)
+                .unwrap(),
+            ((true, true), true)
+        );
+
+        let mut one_sided = AutotuneTransportControl::default();
+        for tick in 0..=20 {
+            one_sided.observe(
+                key.clone(),
+                Some((true, false)),
+                (true, true),
+                base + Duration::from_millis(tick * 200),
+                dropout,
+                Duration::from_secs(10),
+            );
+        }
+        assert_eq!(
+            one_sided
+                .ready_phase(&request, &key, base + Duration::from_secs(4), hold, dropout)
+                .unwrap(),
+            ((true, true), false),
+            "pair confirmation must not accept a one-sided loaded interval"
+        );
+    }
+
+    #[test]
+    fn autotune_transport_hold_tolerates_bounded_adjacent_phase_bursts() {
+        use crate::operations::full_autotune::{AutotuneCapturePhase, MeasurementTopology};
+        use crate::operations::protocol::SpeedtestDirection;
+
+        let request = test_autotune_capture_request(
+            7,
+            AutotuneCapturePhase::LoadedMeasurement,
+            MeasurementTopology::RawDownload,
+            Some(SpeedtestDirection::Download),
+        );
+        let key = AutotuneTransportCaptureKey::new(&request, "route-a");
+        let base = Instant::now();
+        let hold = Duration::from_secs(3);
+        let dropout = Duration::from_millis(600);
+        let mut control = AutotuneTransportControl::default();
+
+        for tick in 0..=20 {
+            let phase = if tick % 5 == 4 {
+                Some((true, true))
+            } else {
+                Some((true, false))
+            };
+            control.observe(
+                key.clone(),
+                phase,
+                (true, false),
+                base + Duration::from_millis(tick * 200),
+                dropout,
+                Duration::from_secs(10),
+            );
+        }
+        assert_eq!(
+            control
+                .ready_phase(&request, &key, base + Duration::from_secs(4), hold, dropout,)
+                .unwrap(),
+            ((true, false), true),
+            "short reverse-direction bursts must not restart the expected-direction hold"
+        );
+    }
+
+    #[test]
+    fn autotune_transport_hold_resets_after_adjacent_phase_dropout_bound() {
+        use crate::operations::full_autotune::{AutotuneCapturePhase, MeasurementTopology};
+        use crate::operations::protocol::SpeedtestDirection;
+
+        let request = test_autotune_capture_request(
+            8,
+            AutotuneCapturePhase::LoadedMeasurement,
+            MeasurementTopology::RawDownload,
+            Some(SpeedtestDirection::Download),
+        );
+        let key = AutotuneTransportCaptureKey::new(&request, "route-a");
+        let base = Instant::now();
+        let hold = Duration::from_secs(3);
+        let dropout = Duration::from_millis(600);
+        let mut control = AutotuneTransportControl::default();
+
+        for tick in 0..=24 {
+            let phase = if (6..=10).contains(&tick) {
+                Some((true, true))
+            } else {
+                Some((true, false))
+            };
+            control.observe(
+                key.clone(),
+                phase,
+                (true, false),
+                base + Duration::from_millis(tick * 200),
+                dropout,
+                Duration::from_secs(10),
+            );
+        }
+        assert_eq!(
+            control
+                .ready_phase(
+                    &request,
+                    &key,
+                    base + Duration::from_millis(4_800),
+                    hold,
+                    dropout,
+                )
+                .unwrap(),
+            ((true, false), false),
+            "a sustained adjacent phase must force a fresh expected-direction hold"
+        );
+    }
+
+    #[test]
+    fn autotune_transport_capture_cannot_bypass_control_with_rating_load() {
+        assert!(!transport_probe_control_allows_start(
+            true, true, false, true
+        ));
+        assert!(transport_probe_control_allows_start(
+            true, true, true, false
+        ));
+
+        // Preserve the independent normal-rating fallback outside a native
+        // capture: its smoothed loaded phase may legitimately keep probing
+        // while the instantaneous control hold is being re-established.
+        assert!(transport_probe_control_allows_start(
+            false, true, false, true
+        ));
+        assert!(!transport_probe_control_allows_start(
+            false, true, false, false
+        ));
+        assert!(transport_probe_control_allows_start(
+            false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn autotune_transport_hold_resets_after_dropout_bound() {
+        use crate::operations::full_autotune::{AutotuneCapturePhase, MeasurementTopology};
+        use crate::operations::protocol::SpeedtestDirection;
+
+        let request = test_autotune_capture_request(
+            2,
+            AutotuneCapturePhase::LoadedMeasurement,
+            MeasurementTopology::RawDownload,
+            Some(SpeedtestDirection::Download),
+        );
+        let key = AutotuneTransportCaptureKey::new(&request, "route-a");
+        let base = Instant::now();
+        let hold = Duration::from_secs(3);
+        let dropout = Duration::from_millis(600);
+        let mut control = AutotuneTransportControl::default();
+
+        for tick in 0..=5 {
+            control.observe(
+                key.clone(),
+                Some((true, false)),
+                (true, false),
+                base + Duration::from_millis(tick * 200),
+                dropout,
+                Duration::from_secs(10),
+            );
+        }
+        for tick in 6..=9 {
+            control.observe(
+                key.clone(),
+                None,
+                (true, false),
+                base + Duration::from_millis(tick * 200),
+                dropout,
+                Duration::from_secs(10),
+            );
+        }
+        for tick in 10..=24 {
+            control.observe(
+                key.clone(),
+                Some((true, false)),
+                (true, false),
+                base + Duration::from_millis(tick * 200),
+                dropout,
+                Duration::from_secs(10),
+            );
+        }
+        assert_eq!(
+            control
+                .ready_phase(
+                    &request,
+                    &key,
+                    base + Duration::from_millis(4_800),
+                    hold,
+                    dropout,
+                )
+                .unwrap(),
+            ((true, false), false),
+            "a long counter gap must force a fresh hold"
+        );
+        control.observe(
+            key.clone(),
+            Some((true, false)),
+            (true, false),
+            base + Duration::from_secs(5),
+            dropout,
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            control
+                .ready_phase(&request, &key, base + Duration::from_secs(5), hold, dropout,)
+                .unwrap(),
+            ((true, false), true)
+        );
+    }
+
+    #[test]
+    fn autotune_transport_attests_the_loaded_flight_not_the_completion_tick() {
+        use crate::operations::full_autotune::{AutotuneCapturePhase, MeasurementTopology};
+        use crate::operations::protocol::SpeedtestDirection;
+
+        let request = test_autotune_capture_request(
+            3,
+            AutotuneCapturePhase::LoadedMeasurement,
+            MeasurementTopology::RawDownload,
+            Some(SpeedtestDirection::Download),
+        );
+        let key = AutotuneTransportCaptureKey::new(&request, "route-a");
+        let base = Instant::now();
+        let dropout = Duration::from_millis(600);
+        let mut control = AutotuneTransportControl::default();
+        control.observe(
+            key.clone(),
+            Some((true, false)),
+            (true, false),
+            base,
+            dropout,
+            Duration::from_secs(10),
+        );
+        for (millis, phase) in [
+            (200, Some((true, false))),
+            (400, Some((true, false))),
+            (600, Some((false, false))),
+            (800, Some((true, false))),
+            (1_000, Some((false, false))),
+        ] {
+            control.observe(
+                key.clone(),
+                phase,
+                (true, false),
+                base + Duration::from_millis(millis),
+                dropout,
+                Duration::from_secs(10),
+            );
+        }
+        let flight = AutotuneTransportFlight {
+            probe_id: 9,
+            key,
+            expected_phase: (true, false),
+            control_valid: true,
+            submitted_at: base,
+            physical_delta_required: false,
+        };
+        let result = test_transport_result(
+            &request,
+            9,
+            base + Duration::from_millis(50),
+            base + Duration::from_millis(950),
+            (true, false),
+        );
+        assert!(
+            control.attest(&flight, &result, dropout),
+            "one completion-adjacent idle tick inside the dropout bound must not erase a loaded flight"
+        );
+        assert_eq!(result.latency_ms, Some(42.0));
+    }
+
+    #[test]
+    fn autotune_transport_rejects_idle_flight_and_identity_rotation() {
+        use crate::operations::full_autotune::{AutotuneCapturePhase, MeasurementTopology};
+        use crate::operations::protocol::SpeedtestDirection;
+
+        let loaded = test_autotune_capture_request(
+            4,
+            AutotuneCapturePhase::LoadedMeasurement,
+            MeasurementTopology::RawDownload,
+            Some(SpeedtestDirection::Download),
+        );
+        let idle = test_autotune_capture_request(
+            5,
+            AutotuneCapturePhase::IdleBaseline,
+            MeasurementTopology::ShapedBoth,
+            None,
+        );
+        let base = Instant::now();
+        let dropout = Duration::from_millis(600);
+        let key = AutotuneTransportCaptureKey::new(&loaded, "route-a");
+        let mut control = AutotuneTransportControl::default();
+        control.observe(
+            key.clone(),
+            Some((true, false)),
+            (true, false),
+            base,
+            dropout,
+            Duration::from_secs(10),
+        );
+        control.observe(
+            key.clone(),
+            Some((false, false)),
+            (true, false),
+            base + Duration::from_millis(200),
+            dropout,
+            Duration::from_secs(10),
+        );
+        control.observe(
+            key.clone(),
+            Some((false, false)),
+            (true, false),
+            base + Duration::from_millis(900),
+            dropout,
+            Duration::from_secs(10),
+        );
+        let flight = AutotuneTransportFlight {
+            probe_id: 10,
+            key: key.clone(),
+            expected_phase: (true, false),
+            control_valid: true,
+            submitted_at: base,
+            physical_delta_required: false,
+        };
+        let result = test_transport_result(
+            &loaded,
+            10,
+            base + Duration::from_millis(50),
+            base + Duration::from_millis(850),
+            (true, false),
+        );
+        assert!(!control.attest(&flight, &result, dropout));
+
+        let rotated_key = AutotuneTransportCaptureKey::new(&idle, "route-b");
+        control.observe(
+            rotated_key,
+            Some((false, false)),
+            (false, false),
+            base + Duration::from_secs(1),
+            dropout,
+            Duration::from_secs(10),
+        );
+        assert!(
+            !control.attest(&flight, &result, dropout),
+            "capture or route rotation must invalidate an old flight"
+        );
+    }
+
+    #[test]
+    fn autotune_transport_idle_readiness_is_fresh_and_typed() {
+        use crate::operations::full_autotune::{AutotuneCapturePhase, MeasurementTopology};
+
+        let request = test_autotune_capture_request(
+            19,
+            AutotuneCapturePhase::IdleBaseline,
+            MeasurementTopology::RawBoth,
+            None,
+        );
+        let key = AutotuneTransportCaptureKey::new(&request, "route-a");
+        let foreign = AutotuneTransportCaptureKey::new(&request, "route-b");
+        let base = Instant::now();
+        let dropout = Duration::from_millis(600);
+        let mut control = AutotuneTransportControl::default();
+        control.observe(
+            key.clone(),
+            Some((false, false)),
+            (false, false),
+            base,
+            dropout,
+            Duration::from_secs(10),
+        );
+
+        assert_eq!(
+            control
+                .ready_phase_diagnostic(
+                    &request,
+                    &key,
+                    base + Duration::from_millis(600),
+                    Duration::from_secs(3),
+                    dropout,
+                )
+                .unwrap(),
+            AutotuneTransportReadiness {
+                phase: (false, false),
+                ready: true,
+                reason: "idle-phase-ready",
+            }
+        );
+        assert_eq!(
+            control
+                .ready_phase_diagnostic(
+                    &request,
+                    &key,
+                    base + Duration::from_millis(601),
+                    Duration::from_secs(3),
+                    dropout,
+                )
+                .unwrap()
+                .reason,
+            "phase-observation-stale"
+        );
+        assert_eq!(
+            control
+                .ready_phase_diagnostic(&request, &foreign, base, Duration::from_secs(3), dropout,)
+                .unwrap()
+                .reason,
+            "capture-key-mismatch"
+        );
+    }
+
+    #[test]
+    fn autotune_transport_idle_baseline_requires_an_entirely_idle_flight() {
+        use crate::operations::full_autotune::{AutotuneCapturePhase, MeasurementTopology};
+
+        let request = test_autotune_capture_request(
+            6,
+            AutotuneCapturePhase::IdleBaseline,
+            MeasurementTopology::ShapedBoth,
+            None,
+        );
+        let key = AutotuneTransportCaptureKey::new(&request, "route-a");
+        let base = Instant::now();
+        let dropout = Duration::from_millis(600);
+        let mut control = AutotuneTransportControl::default();
+        control.observe(
+            key.clone(),
+            Some((false, false)),
+            (false, false),
+            base,
+            dropout,
+            Duration::from_secs(10),
+        );
+        control.observe(
+            key.clone(),
+            Some((true, false)),
+            (false, false),
+            base + Duration::from_millis(400),
+            dropout,
+            Duration::from_secs(10),
+        );
+        control.observe(
+            key.clone(),
+            Some((false, false)),
+            (false, false),
+            base + Duration::from_millis(600),
+            dropout,
+            Duration::from_secs(10),
+        );
+        let flight = AutotuneTransportFlight {
+            probe_id: 11,
+            key,
+            expected_phase: (false, false),
+            control_valid: true,
+            submitted_at: base,
+            physical_delta_required: false,
+        };
+        let result = test_transport_result(
+            &request,
+            11,
+            base + Duration::from_millis(100),
+            base + Duration::from_millis(900),
+            (false, false),
+        );
+        assert!(!control.attest(&flight, &result, dropout));
+    }
+
+    fn capture_request_for_counter_policy(
+        sequence: u32,
+        phase: crate::operations::full_autotune::AutotuneCapturePhase,
+        topology: crate::operations::full_autotune::MeasurementTopology,
+    ) -> crate::operations::full_autotune::AutotuneCaptureRequest {
+        use crate::operations::full_autotune::AutotuneCapturePhase;
+        use crate::operations::protocol::SpeedtestDirection;
+
+        let direction = match (phase, topology) {
+            (AutotuneCapturePhase::IdleBaseline, _) => None,
+            (
+                AutotuneCapturePhase::LoadedMeasurement,
+                crate::operations::full_autotune::MeasurementTopology::RawDownload,
+            ) => Some(SpeedtestDirection::Download),
+            (
+                AutotuneCapturePhase::LoadedMeasurement,
+                crate::operations::full_autotune::MeasurementTopology::RawUpload,
+            ) => Some(SpeedtestDirection::Upload),
+            (AutotuneCapturePhase::LoadedMeasurement, _) => Some(SpeedtestDirection::Both),
+        };
+        let request = crate::operations::full_autotune::AutotuneCaptureRequest {
+            capture_id: format!("{sequence:032x}"),
+            job_id: "b".repeat(32),
+            worker_run_id: "c".repeat(32),
+            permit_id: "d".repeat(32),
+            instance_name: "wan_sqm".to_string(),
+            sequence,
+            control_sequence: match phase {
+                AutotuneCapturePhase::IdleBaseline => 0,
+                AutotuneCapturePhase::LoadedMeasurement => sequence,
+            },
+            deadline_boot_ms: 100_000,
+            phase,
+            topology,
+            direction,
+            candidate_dl_kbps: topology.download_is_shaped().then_some(100_000),
+            candidate_ul_kbps: topology.upload_is_shaped().then_some(20_000),
+            load_reference_kbps: match phase {
+                AutotuneCapturePhase::IdleBaseline => None,
+                AutotuneCapturePhase::LoadedMeasurement => Some(100_000),
+            },
+            route_fingerprint: "e".repeat(64),
+            sqm_fingerprint: "f".repeat(64),
+        };
+        request.validate().unwrap();
+        request
+    }
+
+    #[test]
+    fn idle_baselines_use_managed_counters_before_any_speedtest_flight() {
+        use crate::operations::full_autotune::{AutotuneCapturePhase, MeasurementTopology};
+
+        for (sequence, topology) in [
+            MeasurementTopology::ShapedBoth,
+            MeasurementTopology::DownloadOnlyShaped,
+            MeasurementTopology::UploadOnlyShaped,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request = capture_request_for_counter_policy(
+                sequence as u32 + 1,
+                AutotuneCapturePhase::IdleBaseline,
+                topology,
+            );
+            assert!(
+                !autotune_capture_uses_identity_bound_speedtest_counters(&request),
+                "{} idle baseline must use its topology-aware managed counters",
+                topology.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn every_loaded_capture_requires_job_owned_counters() {
+        use crate::operations::full_autotune::{AutotuneCapturePhase, MeasurementTopology};
+
+        for (sequence, topology) in [
+            MeasurementTopology::ShapedBoth,
+            MeasurementTopology::RawBoth,
+            MeasurementTopology::RawDownload,
+            MeasurementTopology::RawUpload,
+            MeasurementTopology::DownloadOnlyShaped,
+            MeasurementTopology::UploadOnlyShaped,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request = capture_request_for_counter_policy(
+                sequence as u32 + 10,
+                AutotuneCapturePhase::LoadedMeasurement,
+                topology,
+            );
+            assert_eq!(
+                autotune_capture_uses_identity_bound_speedtest_counters(&request),
+                true,
+                "{} loaded counter policy",
+                topology.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn autotune_capture_rates_follow_each_runtime_topology_without_cross_direction_fallback() {
+        use crate::operations::autotune_capture::bounded_directional_load_phase;
+        use crate::operations::full_autotune::{
+            AutotuneCapturePhase, AutotuneCaptureRequest, MeasurementTopology,
+        };
+        use crate::operations::protocol::SpeedtestDirection;
+
+        let observed_at = Instant::now();
+        let physical_observed_at = observed_at.checked_add(Duration::from_millis(1)).unwrap();
+        let shaped_poison = RateSample {
+            dl_kbps: f64::MAX,
+            ul_kbps: f64::MAX,
+            fresh: true,
+            dl_observed_at: observed_at,
+            ul_observed_at: observed_at,
+        };
+        let vanished_ifb_cache = RateSample {
+            dl_kbps: 4_000.0,
+            ul_kbps: 99_000.0,
+            fresh: false,
+            dl_observed_at: observed_at,
+            ul_observed_at: observed_at,
+        };
+        let physical = RateSample {
+            dl_kbps: 90_000.0,
+            ul_kbps: 1_500.0,
+            fresh: true,
+            dl_observed_at: physical_observed_at,
+            ul_observed_at: physical_observed_at,
+        };
+        for topology in [
+            MeasurementTopology::ShapedBoth,
+            MeasurementTopology::RawBoth,
+            MeasurementTopology::RawDownload,
+            MeasurementTopology::RawUpload,
+            MeasurementTopology::DownloadOnlyShaped,
+            MeasurementTopology::UploadOnlyShaped,
+        ] {
+            let selected = select_autotune_capture_rates(topology, Some(physical)).unwrap();
+            assert_eq!(selected.dl_kbps, 90_000.0, "{} DL", topology.as_str());
+            assert_eq!(selected.ul_kbps, 1_500.0, "{} UL", topology.as_str());
+            assert!(selected.fresh, "{} freshness", topology.as_str());
+            assert_ne!(selected.dl_kbps, shaped_poison.dl_kbps);
+            assert_ne!(selected.ul_kbps, shaped_poison.ul_kbps);
+        }
+
+        let raw_download = AutotuneCaptureRequest {
+            capture_id: "a".repeat(32),
+            job_id: "b".repeat(32),
+            worker_run_id: "c".repeat(32),
+            permit_id: "d".repeat(32),
+            instance_name: "wan_sqm".to_string(),
+            sequence: 1,
+            control_sequence: 1,
+            deadline_boot_ms: 100_000,
+            phase: AutotuneCapturePhase::LoadedMeasurement,
+            topology: MeasurementTopology::RawDownload,
+            direction: Some(SpeedtestDirection::Download),
+            candidate_dl_kbps: None,
+            candidate_ul_kbps: Some(723_400),
+            load_reference_kbps: Some(900_000),
+            route_fingerprint: "e".repeat(64),
+            sqm_fingerprint: "f".repeat(64),
+        };
+        let selected =
+            select_autotune_capture_rates(MeasurementTopology::RawDownload, Some(physical))
+                .unwrap();
+        assert_eq!(selected.dl_observed_at, physical_observed_at);
+        assert_eq!(selected.ul_observed_at, physical_observed_at);
+        assert_eq!(
+            bounded_directional_load_phase(
+                &raw_download,
+                selected.dl_kbps,
+                selected.ul_kbps,
+                50_000.0,
+                0.08,
+            )
+            .unwrap(),
+            (true, false)
+        );
+        assert_eq!(
+            bounded_directional_load_phase(
+                &raw_download,
+                vanished_ifb_cache.dl_kbps,
+                vanished_ifb_cache.ul_kbps,
+                50_000.0,
+                0.08,
+            )
+            .unwrap(),
+            (false, false),
+            "the old IFB-only sample must remain an explicit fail-closed negative control"
+        );
+        assert_eq!(
+            autotune_transport_control_phase(
+                &raw_download,
+                Some(selected),
+                physical_observed_at,
+                Duration::from_millis(600),
+                50_000.0,
+                0.08,
+            )
+            .unwrap(),
+            Some((true, false)),
+            "transport result re-attestation must use the same topology-aware counters"
+        );
+        assert_eq!(
+            autotune_transport_control_phase(
+                &raw_download,
+                Some(RateSample {
+                    fresh: false,
+                    ..selected
+                }),
+                physical_observed_at,
+                Duration::from_millis(600),
+                50_000.0,
+                0.08,
+            )
+            .unwrap(),
+            Some((true, false)),
+            "a recently cached counter sample remains valid for asynchronous re-attestation"
+        );
+        let expired_at = physical_observed_at
+            .checked_sub(Duration::from_millis(601))
+            .unwrap();
+        assert_eq!(
+            autotune_transport_control_phase(
+                &raw_download,
+                Some(RateSample {
+                    fresh: false,
+                    ul_observed_at: expired_at,
+                    ..selected
+                }),
+                physical_observed_at,
+                Duration::from_millis(600),
+                50_000.0,
+                0.08,
+            )
+            .unwrap(),
+            None,
+            "one expired hybrid direction must fail the whole re-attestation"
+        );
+        assert_eq!(
+            autotune_transport_control_phase(
+                &raw_download,
+                Some(RateSample {
+                    fresh: false,
+                    dl_observed_at: expired_at,
+                    ul_observed_at: expired_at,
+                    ..selected
+                }),
+                physical_observed_at,
+                Duration::from_millis(600),
+                50_000.0,
+                0.08,
+            )
+            .unwrap(),
+            None,
+            "an expired cached counter sample must fail closed"
+        );
+        assert_eq!(
+            autotune_transport_control_phase(
+                &raw_download,
+                None,
+                physical_observed_at,
+                Duration::from_millis(600),
+                50_000.0,
+                0.08,
+            )
+            .unwrap(),
+            None,
+            "missing counter evidence must fail closed"
+        );
+    }
+
+    #[test]
+    fn autotune_capture_rate_selection_requires_identity_bound_counter_evidence() {
+        use crate::operations::full_autotune::MeasurementTopology;
+
+        let observed_at = Instant::now();
+        let stale_controlled = RateSample {
+            dl_kbps: 100_000.0,
+            ul_kbps: 200_000.0,
+            fresh: false,
+            dl_observed_at: observed_at,
+            ul_observed_at: observed_at,
+        };
+        assert!(select_autotune_capture_rates(MeasurementTopology::RawDownload, None).is_err());
+        assert!(
+            !select_autotune_capture_rates(MeasurementTopology::RawBoth, Some(stale_controlled))
+                .unwrap()
+                .fresh
+        );
+        assert!(
+            !select_autotune_capture_rates(
+                MeasurementTopology::RawDownload,
+                Some(stale_controlled)
+            )
+            .unwrap()
+            .fresh
+        );
+        assert!(select_autotune_capture_rates(MeasurementTopology::ShapedBoth, None).is_err());
+    }
+
+    #[test]
+    fn autotune_rate_sample_recency_is_direction_symmetric() {
+        let now = Instant::now();
+        let max_age = Duration::from_millis(600);
+        let recent = now.checked_sub(Duration::from_millis(600)).unwrap();
+        let stale = now.checked_sub(Duration::from_millis(601)).unwrap();
+        let sample = RateSample {
+            dl_kbps: 90_000.0,
+            ul_kbps: 1_500.0,
+            fresh: false,
+            dl_observed_at: recent,
+            ul_observed_at: recent,
+        };
+        assert!(rate_sample_is_recent(sample, now, max_age));
+        assert!(!rate_sample_is_recent(
+            RateSample {
+                dl_observed_at: stale,
+                ..sample
+            },
+            now,
+            max_age
+        ));
+        assert!(!rate_sample_is_recent(
+            RateSample {
+                ul_observed_at: stale,
+                ..sample
+            },
+            now,
+            max_age
+        ));
+    }
+
+    #[test]
+    fn speedtest_counter_monitor_is_exact_and_resets_fail_closed() {
+        use crate::operations::speedtest::SpeedtestTrafficCounters;
+
+        let mut monitor = SpeedtestCounterRateMonitor::new(200);
+        let started = Instant::now();
+        assert!(monitor
+            .observe_counters(
+                started,
+                Some(SpeedtestTrafficCounters {
+                    rx_bytes: 1_000,
+                    tx_bytes: 2_000,
+                })
+            )
+            .is_none());
+        for quarter in 1..4 {
+            assert!(monitor
+                .observe_counters(
+                    started + Duration::from_millis(quarter * 250),
+                    Some(SpeedtestTrafficCounters {
+                        rx_bytes: 1_000 + quarter * 25_000_000,
+                        tx_bytes: 2_000 + quarter * 250_000,
+                    }),
+                )
+                .is_none());
+        }
+        let loaded = monitor
+            .observe_counters(
+                started + Duration::from_millis(1_000),
+                Some(SpeedtestTrafficCounters {
+                    rx_bytes: 100_001_000,
+                    tx_bytes: 1_002_000,
+                }),
+            )
+            .unwrap();
+        assert!((loaded.dl_kbps - 800_000.0).abs() < 0.1);
+        assert!((loaded.ul_kbps - 8_000.0).abs() < 0.1);
+        assert!(loaded.fresh);
+
+        assert!(monitor
+            .observe_counters(started + Duration::from_millis(1_250), None)
+            .is_none());
+        assert!(monitor.tracker.is_empty());
+        assert!(monitor
+            .observe_counters(
+                started + Duration::from_millis(1_500),
+                Some(SpeedtestTrafficCounters {
+                    rx_bytes: 10,
+                    tx_bytes: 20,
+                })
+            )
+            .is_none());
+        assert!(monitor
+            .observe_counters(
+                started + Duration::from_millis(1_750),
+                Some(SpeedtestTrafficCounters {
+                    rx_bytes: 9,
+                    tx_bytes: 21,
+                })
+            )
+            .is_none());
+        assert!(monitor.tracker.cached_sample().is_none());
+    }
+
+    #[test]
+    fn speedtest_counter_window_smooths_bursts_and_expires_true_idle() {
+        use crate::operations::speedtest::SpeedtestTrafficCounters;
+
+        let mut monitor = SpeedtestCounterRateMonitor::new(200);
+        let started = Instant::now();
+        let points = [
+            (0, 0),
+            (200, 0),
+            (400, 40_000_000),
+            (600, 40_000_000),
+            (800, 80_000_000),
+            (1_000, 100_000_000),
+        ];
+        let mut loaded = None;
+        for (millis, rx_bytes) in points {
+            loaded = monitor.observe_counters(
+                started + Duration::from_millis(millis),
+                Some(SpeedtestTrafficCounters {
+                    rx_bytes,
+                    tx_bytes: rx_bytes / 100,
+                }),
+            );
+        }
+        let loaded = loaded.expect("one-second burst window should produce a rate");
+        assert!(loaded.dl_kbps > 20_000.0);
+
+        let flat = SpeedtestTrafficCounters {
+            rx_bytes: 100_000_000,
+            tx_bytes: 1_000_000,
+        };
+        for millis in [1_200, 1_400, 1_600, 1_800] {
+            assert!(monitor
+                .observe_counters(started + Duration::from_millis(millis), Some(flat))
+                .is_some_and(|sample| sample.dl_kbps > 0.0));
+        }
+        let idle = monitor
+            .observe_counters(started + Duration::from_millis(2_000), Some(flat))
+            .expect("bounded history should continue reporting an exact zero rate");
+        assert_eq!(idle.dl_kbps, 0.0);
+        assert_eq!(idle.ul_kbps, 0.0);
+        assert!(monitor
+            .observe_counters(started + Duration::from_millis(2_200), None)
+            .is_none());
+        assert!(monitor.tracker.is_empty());
+    }
+
+    #[test]
+    fn rate_monitor_does_not_invent_zero_counters_when_a_source_is_missing() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cake-autorate-missing-rate-monitor-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let rx = root.join("rx_bytes");
+        let tx = root.join("tx_bytes");
+        fs::write(&rx, "0\n").unwrap();
+        assert!(RateMonitor::new(rx.to_str().unwrap(), tx.to_str().unwrap(), 25).is_err());
+        fs::write(&tx, "0\n").unwrap();
+        let mut monitor = RateMonitor::new(rx.to_str().unwrap(), tx.to_str().unwrap(), 25).unwrap();
+        fs::remove_file(&rx).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        assert!(monitor.try_sample().is_err());
+        let fallback = monitor.sample();
+        assert!(!fallback.fresh);
+        assert_eq!((fallback.dl_kbps, fallback.ul_kbps), (0.0, 0.0));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -9409,6 +17161,31 @@ mod tests {
         ] {
             assert!(validated_conservative_samples(&[1_000.0], Some(invalid)).is_err());
         }
+    }
+
+    #[test]
+    fn autotune_cli_rejects_a_one_sided_measurement_base() {
+        let args = [
+            "--dl-samples",
+            "1000,1100",
+            "--ul-samples",
+            "500,550",
+            "--idle-median-ms",
+            "10",
+            "--idle-p95-ms",
+            "15",
+            "--idle-samples",
+            "10",
+            "--dl-measurement-base-kbps",
+            "1000",
+        ]
+        .into_iter()
+        .map(str::to_string);
+
+        assert_eq!(
+            run_autotune_proposal_cli(args),
+            Err("download and upload measurement bases must be supplied together".to_string())
+        );
     }
 
     #[test]

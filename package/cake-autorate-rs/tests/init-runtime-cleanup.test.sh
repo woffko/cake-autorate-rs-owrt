@@ -4,7 +4,7 @@ set -eu
 base="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 init_script="$base/files/etc/init.d/cake-autorate"
 lock_lib="$base/files/usr/libexec/cake-autorate-rs/runtime-lock"
-work="${TMPDIR:-/tmp}/cake-init-runtime-cleanup-test.$$"
+work="$(mktemp -d "${TMPDIR:-/tmp}/cake-init-runtime-cleanup-test.XXXXXX")"
 runtime="$work/run"
 outside="$work/outside"
 log="$work/actions.log"

@@ -94,29 +94,280 @@ function readRuntimeHealth() {
 	);
 }
 
-function readSchedulerStatus(section) {
-	return L.resolveDefault(
-		fs.exec('/usr/libexec/cake-autorate-rs/autotune-scheduler', [ 'status', section ])
-			.then(parseExecJson),
-		null
-	);
+function schedulerStatusSource(section, schedulerEngine, calibrationSummary) {
+	if (schedulerEngine === 'native' && calibrationSummary &&
+	    calibrationSummary.native_scheduler === true)
+		return {
+			owner: 'native',
+			command: '/usr/sbin/cake-autorated',
+			args: [ '--calibrationctl', 'scheduler-status' ]
+		};
+	if (schedulerEngine === 'legacy' && calibrationSummary &&
+	    calibrationSummary.native_scheduler === false)
+		return {
+			owner: 'legacy',
+			command: '/usr/libexec/cake-autorate-rs/autotune-scheduler',
+			args: [ 'status', section ]
+		};
+	return null;
 }
 
-function readInstanceStatus(section) {
-	return Promise.all([
-		readStatus(section),
-		readSchedulerStatus(section)
-	]).then(function(result) {
-		var status = Object.assign({}, result[0] || {});
-		status.scheduled_autotune = result[1];
-		return status;
+function schedulerUnavailableStatus(sectionData, owner) {
+	return {
+		owner: owner || 'unconfigured',
+		available: false,
+		instance: sectionData['.name'],
+		enabled: sectionData.scheduled_autotune_enabled === '1',
+		state: 'unavailable',
+		message: owner === 'native' ?
+			_('Native scheduler status is unavailable; legacy accounting was not substituted.') :
+			(owner === 'legacy' ?
+				_('Legacy scheduler ownership could not be attested; native accounting was not substituted.') :
+				_('Scheduler ownership is missing or invalid; no accounting source was selected.')),
+		accounting_error: false,
+		initialized: false,
+		budget_authoritative: false,
+		warning: null,
+		source: 'none'
+	};
+}
+
+function nativeSchedulerStatusValidated(result, section) {
+	var states = [ 'disabled', 'initializing', 'deferred', 'idle', 'running', 'blocked', 'error' ];
+	function uintValid(value) {
+		return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+	}
+
+	function budgetValid(value) {
+		return !!value && [ 'limit_bytes', 'used_bytes', 'reserved_bytes', 'remaining_bytes' ]
+			.every(function(key) {
+				return uintValid(value[key]);
+			});
+	}
+
+	return !!result && result.instance === section && typeof result.enabled === 'boolean' &&
+		typeof result.initialized === 'boolean' &&
+		typeof result.budget_authoritative === 'boolean' &&
+		states.indexOf(result.state) >= 0 && typeof result.message === 'string' &&
+		result.message.length <= 512 && !/[\u0000-\u001f\u007f]/.test(result.message) &&
+		(result.warning === null || (typeof result.warning === 'string' && result.warning &&
+		 result.warning.length <= 512 && !/[\u0000-\u001f\u007f]/.test(result.warning))) &&
+		uintValid(result.observed_at) && uintValid(result.updated_at) &&
+		uintValid(result.next_due_at) && uintValid(result.last_success_at) &&
+		uintValid(result.last_failure_due_at) && !!result.window &&
+		uintValid(result.window.start_hour) && result.window.start_hour <= 23 &&
+		uintValid(result.window.end_hour) && result.window.end_hour <= 23 &&
+		budgetValid(result.daily) && budgetValid(result.monthly) &&
+		typeof result.accounting_error === 'boolean';
+}
+
+function nativeSchedulerBatchValidated(result) {
+	var seen = Object.create(null);
+
+	if (!result || result.schema_version !== 1 || result.owner !== 'native' ||
+	    result.available !== true ||
+	    typeof result.observed_at !== 'number' || !Number.isSafeInteger(result.observed_at) ||
+	    result.observed_at < 0 ||
+	    typeof result.stale !== 'boolean' ||
+	    (result.stale ?
+		(typeof result.global_error !== 'string' || !result.global_error ||
+		 result.global_error.length > 512 || /[\u0000-\u001f\u007f]/.test(result.global_error)) :
+		result.global_error !== null) ||
+	    !Array.isArray(result.instances) || !Array.isArray(result.issues) ||
+	    result.instances.length + result.issues.length > 128)
+		return false;
+
+	return result.instances.concat(result.issues).every(function(instance) {
+		var name = instance && instance.instance;
+		if (typeof name !== 'string' || !name ||
+		    Object.prototype.hasOwnProperty.call(seen, name) ||
+		    instance.observed_at !== result.observed_at ||
+		    !nativeSchedulerStatusValidated(instance, name))
+			return false;
+		seen[name] = true;
+		return true;
 	});
 }
 
-function qualityTestExec(section, action, mode, backend) {
-	return fs.exec('/usr/libexec/cake-autorate-rs/quality-test', [
-		section, action, mode || 'client', backend || 'auto'
-	]).then(parseExecJson);
+function legacySchedulerStatusValidated(result, section) {
+	function uintValid(value) {
+		return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+	}
+
+	function budgetValid(value) {
+		return !!value && [ 'limit_bytes', 'used_bytes', 'remaining_bytes' ].every(function(key) {
+			return uintValid(value[key]);
+		});
+	}
+
+	return !!result && result.instance === section && typeof result.enabled === 'boolean' &&
+		typeof result.state === 'string' && typeof result.message === 'string' &&
+		uintValid(result.updated_at) && uintValid(result.next_due_at) &&
+		uintValid(result.window_start_hour) && result.window_start_hour <= 23 &&
+		uintValid(result.window_end_hour) && result.window_end_hour <= 23 &&
+		budgetValid(result.daily) && budgetValid(result.monthly) &&
+		typeof result.accounting_error === 'boolean';
+}
+
+function normalizeLegacySchedulerStatus(result) {
+	return Object.assign(Object.create(null), result, {
+		owner: 'legacy',
+		available: true,
+		source: 'legacy_scheduler_helper',
+		initialized: true,
+		budget_authoritative: !result.accounting_error,
+		warning: null,
+		window: {
+			start_hour: Number(result.window_start_hour),
+			end_hour: Number(result.window_end_hour)
+		},
+		daily: Object.assign(Object.create(null), { reserved_bytes: 0 }, result.daily),
+		monthly: Object.assign(Object.create(null), { reserved_bytes: 0 }, result.monthly)
+	});
+}
+
+function readSchedulerStatuses(sections, schedulerEngine, calibrationSummary) {
+	var unavailable = sections.map(function(section) {
+		return schedulerUnavailableStatus(section, schedulerEngine);
+	});
+	var source = schedulerStatusSource('', schedulerEngine, calibrationSummary);
+
+	if (!source)
+		return Promise.resolve({ rows: unavailable, diagnostics: [] });
+
+	if (source.owner === 'native') {
+		return L.resolveDefault(
+			fs.exec(source.command, source.args).then(parseExecJson).then(function(result) {
+				var byInstance = Object.create(null);
+				var configured = Object.create(null);
+				var diagnostics = [];
+				if (!nativeSchedulerBatchValidated(result))
+					throw new Error(_('Native scheduler returned an invalid batch status contract.'));
+				if (result.stale) {
+					diagnostics.push({
+						instance: _('Native scheduler'),
+						message: result.global_error
+					});
+				}
+				sections.forEach(function(section) { configured[section['.name']] = true; });
+				result.instances.concat(result.issues).forEach(function(instance) {
+					byInstance[instance.instance] = Object.assign(Object.create(null), instance, {
+						owner: 'native', schema_version: result.schema_version,
+						available: true, source: 'native_scheduler_snapshot',
+						stale: result.stale, global_error: result.global_error
+					});
+				});
+				return {
+					rows: sections.map(function(section, index) {
+						return Object.prototype.hasOwnProperty.call(byInstance, section['.name']) ?
+							byInstance[section['.name']] : unavailable[index];
+					}),
+					diagnostics: diagnostics.concat(result.issues.filter(function(issue) {
+						return !Object.prototype.hasOwnProperty.call(configured, issue.instance);
+					}).map(function(issue) {
+						return { instance: issue.instance, message: issue.message };
+					}))
+				};
+			}),
+			{ rows: unavailable, diagnostics: [] }
+		);
+	}
+
+	return Promise.all(sections.map(function(section, index) {
+		var sectionSource = schedulerStatusSource(section['.name'], schedulerEngine,
+			calibrationSummary);
+		return L.resolveDefault(
+			fs.exec(sectionSource.command, sectionSource.args).then(parseExecJson).then(function(result) {
+				if (!legacySchedulerStatusValidated(result, section['.name']))
+					throw new Error(_('Legacy scheduler returned an invalid status contract.'));
+				return normalizeLegacySchedulerStatus(result);
+			}),
+			unavailable[index]
+		);
+	})).then(function(rows) { return { rows: rows, diagnostics: [] }; });
+}
+
+function readInstanceStatuses(sections, schedulerEngine, calibrationSummary) {
+	return Promise.all([
+		Promise.all(sections.map(function(section) { return readStatus(section['.name']); })),
+		readSchedulerStatuses(sections, schedulerEngine, calibrationSummary)
+	]).then(function(result) {
+		return {
+			rows: sections.map(function(section, index) {
+				var status = Object.assign({}, result[0][index] || {});
+				status.scheduled_autotune = result[1].rows[index];
+				return status;
+			}),
+			diagnostics: result[1].diagnostics
+		};
+	});
+}
+
+var CALIBRATION_DAEMON = '/usr/sbin/cake-autorated';
+
+function calibrationExec(args) {
+	return fs.exec(CALIBRATION_DAEMON, [ '--calibrationctl' ].concat(args))
+		.then(parseExecJson);
+}
+
+function readCalibrationSummary() {
+	return L.resolveDefault(calibrationExec([ 'summary' ]), {
+		state: 'unavailable', native_rating: false, native_scheduler: null
+	});
+}
+
+function nativeRatingRoute(section) {
+	var configured = String(section.route_mode || 'auto');
+	var member = String(section.mwan3_member || '');
+	var mode = configured === 'auto' ? (member ? 'mwan3' : 'main') : configured;
+
+	return { mode: mode, member: mode === 'mwan3' ? member : '' };
+}
+
+function nativeRatingStartArgs(section, mode) {
+	var route = nativeRatingRoute(section);
+	var target = section.sqm_interface || section.ul_if || section.wan_if || '';
+	var automatic = mode === 'automatic';
+	var args = [
+		'rating-start',
+		'--instance', section['.name'],
+		'--expected-target', target,
+		'--mode', automatic ? 'automatic' : 'client',
+		'--backend', automatic ? 'speedtest-go' : 'client',
+		'--route-mode', route.mode
+	];
+
+	if (route.mode === 'mwan3')
+		args.push('--mwan3-member', route.member);
+	return args;
+}
+
+function nativeRatingProgress(status, job) {
+	status = status || {};
+	return Object.assign({}, job || {}, {
+		phase: status.rating_load_phase || 'IDLE',
+		requested_phase: status.rating_capture_requested_phase || 'AUTO',
+		message: status.quality_grade_state || (job && job.diagnostic) || _('Collecting rating samples.'),
+		baseline_samples: Number(status.quality_grade_baseline_samples || 0),
+		baseline_required: Number(status.quality_grade_baseline_required_samples || 20),
+		dl_samples: Number(status.quality_grade_dl_samples || 0),
+		ul_samples: Number(status.quality_grade_ul_samples || 0),
+		required_samples: Number(status.quality_grade_required_samples || 20),
+		finalize_remaining_s: status.quality_grade_finalize_remaining_s,
+		smoothed_dl_percent: Number(status.rating_load_smoothed_dl_percent || 0),
+		smoothed_ul_percent: Number(status.rating_load_smoothed_ul_percent || 0),
+		effective_dl_kbps: Number(status.rating_load_effective_dl_kbps || 0),
+		effective_ul_kbps: Number(status.rating_load_effective_ul_kbps || 0),
+		reference_dl_kbps: Number(status.rating_load_reference_dl_kbps || 0),
+		reference_ul_kbps: Number(status.rating_load_reference_ul_kbps || 0),
+		enter_dl_kbps: Number(status.rating_load_enter_dl_kbps || 0),
+		enter_ul_kbps: Number(status.rating_load_enter_ul_kbps || 0),
+		background_dl_kbps: Number(status.rating_capture_background_dl_kbps || 0),
+		background_ul_kbps: Number(status.rating_capture_background_ul_kbps || 0),
+		contaminated: status.rating_capture_contaminated === true,
+		contamination_reason: status.rating_capture_contamination_reason || '',
+		last_rejected_reason: status.transport_probe_last_rejected_reason || ''
+	});
 }
 
 function qualityTestDelay() {
@@ -125,11 +376,16 @@ function qualityTestDelay() {
 	});
 }
 
-function qualityReadiness(section, status, mode) {
+function qualityReadiness(section, status, mode, calibrationSummary) {
 	var uplinkState = String(status && status.uplink_state || '').toUpperCase();
 	var testMode = mode || 'automatic';
 	var routeTestReady;
 
+	if (calibrationSummary && calibrationSummary.native_rating !== true)
+		return {
+			ready: false,
+			reason: _('Native Rating is unavailable in the installed daemon. Upgrade both the daemon and LuCI package, then restart the calibration service.')
+		};
 	if (String(section.enabled || '0') !== '1')
 		return { ready: false, reason: _('Autorate instance is disabled.') };
 	if (String(section.sqm_enabled || '0') !== '1')
@@ -206,9 +462,9 @@ function qualityProgressText(job) {
 	return parts.join(' · ');
 }
 
-function showQualityTest(section, status) {
+function showQualityTest(section, status, calibrationSummary) {
 	var instance = section['.name'];
-	var readiness = qualityReadiness(section, status, 'automatic');
+	var readiness = qualityReadiness(section, status, 'automatic', calibrationSummary);
 	var mode = E('select', { 'class': 'cbi-input-select' }, [
 		E('option', { 'value': 'automatic' }, _('Automatic router-side test')),
 		E('option', { 'value': 'client' }, _('Guided client capture'))
@@ -220,6 +476,7 @@ function showQualityTest(section, status) {
 	var starting = false;
 	var closed = false;
 	var readinessPolling = false;
+	var jobId = null;
 	var startButton;
 	var closeButton;
 
@@ -246,7 +503,9 @@ function showQualityTest(section, status) {
 	}
 
 	function refreshReadiness(announce) {
-		return readStatus(instance).then(function(freshStatus) {
+		return Promise.all([ readStatus(instance), readCalibrationSummary() ]).then(function(result) {
+			var freshStatus = result[0];
+			calibrationSummary = result[1];
 			if (!freshStatus) {
 				readiness = {
 					ready: false,
@@ -258,7 +517,7 @@ function showQualityTest(section, status) {
 					setState(readiness.reason, false);
 				return readiness;
 			}
-			readiness = qualityReadiness(section, freshStatus, mode.value);
+			readiness = qualityReadiness(section, freshStatus, mode.value, calibrationSummary);
 			if (!running && !starting && startButton)
 				startButton.disabled = !readiness.ready;
 			if (announce && !running && !starting && !closed)
@@ -295,16 +554,25 @@ function showQualityTest(section, status) {
 	}
 
 	function pollJob() {
-		if (!running || closed)
+		if (!running || closed || !jobId)
 			return Promise.resolve();
 		return qualityTestDelay().then(function() {
-			return qualityTestExec(instance, 'status');
+			return calibrationExec([ 'rating-status', jobId ]);
 		}).then(function(job) {
-			if (job.state === 'running') {
-				setState((job.message || _('Collecting rating samples.')) + '\n' + qualityProgressText(job), false);
-				return pollJob();
-			}
-			finish(job);
+			if (job.state === 'completed')
+				return calibrationExec([ 'rating-result', jobId ]).then(finish);
+			if (job.state === 'queued' || job.state === 'starting' || job.state === 'running' ||
+			    job.state === 'cancelling' || job.state === 'recovering')
+				return readStatus(instance).then(function(freshStatus) {
+					var progress = nativeRatingProgress(freshStatus, job);
+					setState((progress.message || _('Collecting rating samples.')) + '\n' +
+						qualityProgressText(progress), false);
+					return pollJob();
+				});
+			finish({
+				state: job.state,
+				error: job.diagnostic || job.error || _('Rating capture did not complete.')
+			});
 		}).catch(function(error) {
 			finish({ state: 'error', error: error.message || String(error) });
 		});
@@ -331,10 +599,12 @@ function showQualityTest(section, status) {
 			mode.disabled = true;
 			closeButton.textContent = _('Cancel');
 			setState(_('Starting rating capture…'), false);
-			return qualityTestExec(instance, 'start', mode.value,
-				section.speedtest_backend || 'auto').then(function(job) {
-				if (job.error)
-					throw new Error(job.error);
+			return calibrationExec(nativeRatingStartArgs(section, mode.value)).then(function(job) {
+				if (job.state === 'error' || job.error)
+					throw new Error(job.error || job.error_code || _('Unable to start native Rating.'));
+				jobId = job.job_id;
+				if (!jobId)
+					throw new Error(_('Native Rating returned no job ID.'));
 				return pollJob();
 			});
 		}).catch(function(error) {
@@ -346,8 +616,8 @@ function showQualityTest(section, status) {
 	function close() {
 		closed = true;
 		starting = false;
-		if (running)
-			return qualityTestExec(instance, 'cancel').catch(function() {}).then(function() {
+		if (running && jobId)
+			return calibrationExec([ 'rating-cancel', jobId ]).catch(function() {}).then(function() {
 				ui.hideModal();
 			});
 		ui.hideModal();
@@ -382,14 +652,28 @@ function showQualityTest(section, status) {
 		E('div', { 'class': 'right' }, [ startButton, ' ', closeButton ])
 	]);
 
-	qualityTestExec(instance, 'status').then(function(job) {
-		if (job.state === 'running' && !closed) {
+	calibrationExec([ 'rating-current', instance ]).then(function(job) {
+		if (job.operation === 'automatic_rating')
+			mode.value = 'automatic';
+		else if (job.operation === 'guided_rating')
+			mode.value = 'client';
+		if (job.state === 'completed' && job.job_id && !closed) {
+			jobId = job.job_id;
+			return calibrationExec([ 'rating-result', jobId ]).then(finish);
+		}
+		if ((job.state === 'queued' || job.state === 'starting' || job.state === 'running' ||
+		     job.state === 'cancelling' || job.state === 'recovering') && !closed) {
+			jobId = job.job_id;
 			running = true;
 			startButton.disabled = true;
 			mode.disabled = true;
 			closeButton.textContent = _('Cancel');
-			setState((job.message || _('Collecting rating samples.')) + '\n' + qualityProgressText(job), false);
-			pollJob();
+			return readStatus(instance).then(function(freshStatus) {
+				var progress = nativeRatingProgress(freshStatus, job);
+				setState((progress.message || _('Collecting rating samples.')) + '\n' +
+					qualityProgressText(progress), false);
+				return pollJob();
+			});
 		} else if (!closed) {
 			return refreshReadiness(true).then(ensureReadinessPoll);
 		}
@@ -850,7 +1134,33 @@ function formatState(status, enabled, sectionData, health) {
 			accessMediumLabel(accessMedium), accessConfidence)));
 	}
 	schedule = status && status.scheduled_autotune;
-	if (schedule && schedule.enabled) {
+	var scheduleVisible = schedule && (schedule.enabled ||
+		(sectionData && sectionData.scheduled_autotune_enabled === '1'));
+	if (scheduleVisible && schedule.available === false) {
+		lines.push(E('small', {
+			'style': 'display:block;color:#f66;white-space:normal',
+			'class': 'cake-schedule-error'
+		}, schedule.message || _('Scheduled Auto-Tune status is unavailable.')));
+	}
+	else if (scheduleVisible && schedule.accounting_error) {
+		lines.push(E('small', {
+			'style': 'display:block;color:#f66;white-space:normal',
+			'class': 'cake-schedule-error'
+		}, schedule.message || _('Scheduled traffic accounting is blocked until it is repaired.')));
+	}
+	else if (scheduleVisible && schedule.state === 'error') {
+		lines.push(E('small', {
+			'style': 'display:block;color:#f66;white-space:normal',
+			'class': 'cake-schedule-error'
+		}, schedule.message || _('Native scheduler status is invalid for this instance.')));
+	}
+	else if (scheduleVisible && schedule.budget_authoritative === false) {
+		lines.push(E('small', {
+			'style': 'display:block;color:#d08b20;white-space:normal',
+			'class': 'cake-schedule-initializing'
+		}, schedule.message || _('Scheduled traffic accounting is initializing.')));
+	}
+	else if (scheduleVisible) {
 		var dailyRemaining = Number(schedule.daily && schedule.daily.remaining_bytes || 0);
 		var monthlyRemaining = Number(schedule.monthly && schedule.monthly.remaining_bytes || 0);
 		var nextDue = Number(schedule.next_due_at || 0);
@@ -861,12 +1171,15 @@ function formatState(status, enabled, sectionData, health) {
 			scheduleText += ' · ' + _('due %s').format(new Date(nextDue * 1000).toLocaleString());
 		lines.push(E('small', {
 			'style': 'display:block;white-space:normal',
-			'class': schedule.accounting_error ? 'cake-schedule-error' : '',
+			'class': '',
 			'title': schedule.message || ''
 		}, scheduleText));
-		if (schedule.accounting_error)
-			lines.push(E('small', { 'style': 'display:block;color:#f66;white-space:normal' },
-				_('Scheduled traffic accounting is blocked until it is repaired.')));
+		if (schedule.warning) {
+			lines.push(E('small', {
+				'style': 'display:block;color:#d08b20;white-space:normal',
+				'class': 'cake-schedule-warning'
+			}, schedule.warning));
+		}
 	}
 	if (status && status.sqm_runtime_managed && !status.sqm_runtime_healthy) {
 		var pending = sqmRuntimePending(status);
@@ -1099,17 +1412,18 @@ function reflectorSummary(status) {
 	]);
 }
 
-function renderQualityAction(section, status, enabled) {
-	var readiness = qualityReadiness(section, status);
+function renderQualityAction(section, status, enabled, calibrationSummary) {
+	var readiness = qualityReadiness(section, status, 'automatic', calibrationSummary);
+	var available = enabled && calibrationSummary && calibrationSummary.native_rating === true;
 
 	return E('div', { 'class': 'cake-quality-action' }, [
 		E('button', {
 			'type': 'button',
 			'class': 'btn cbi-button cbi-button-action',
-			'disabled': enabled ? null : '',
+			'disabled': available ? null : '',
 			'title': readiness.reason,
 			'click': ui.createHandlerFn(null, function() {
-				showQualityTest(section, status);
+				showQualityTest(section, status, calibrationSummary);
 			})
 		}, _('Get rating')),
 		E('small', { 'class': readiness.ready ? 'cake-quality-ready' : 'cake-quality-not-ready' },
@@ -1117,7 +1431,7 @@ function renderQualityAction(section, status, enabled) {
 	]);
 }
 
-function statusCell(column, sectionData, status, enabled, health) {
+function statusCell(column, sectionData, status, enabled, health, calibrationSummary) {
 	var section = sectionData['.name'];
 
 	if (!enabled && column.key !== 'instance' && column.key !== 'uplink' &&
@@ -1129,7 +1443,7 @@ function statusCell(column, sectionData, status, enabled, health) {
 	case 'uplink': return formatState(status, enabled, sectionData, health);
 	case 'services': return formatServices(health);
 	case 'quality': return enabled ? formatQuality(status) : '-';
-	case 'rating': return renderQualityAction(sectionData, status, enabled);
+	case 'rating': return renderQualityAction(sectionData, status, enabled, calibrationSummary);
 	case 'route': return formatRoute(status);
 	case 'updated':
 		return status.updated_at ? E('div', { 'class': 'cake-status-timestamp' }, [
@@ -1148,7 +1462,7 @@ function statusCell(column, sectionData, status, enabled, health) {
 	}
 }
 
-function renderTable(sections, statuses, selectedKeys, runtimeHealth) {
+function renderTable(sections, statuses, selectedKeys, runtimeHealth, calibrationSummary) {
 	var columns = selectedStatusColumns(selectedKeys);
 	var children = [ E('tr', { 'class': 'tr table-titles' }, columns.map(function(column) {
 		return E('th', { 'class': 'th', 'data-column': column.key }, column.title);
@@ -1169,7 +1483,7 @@ function renderTable(sections, statuses, selectedKeys, runtimeHealth) {
 				'class': 'td cake-status-cell cake-status-column-' + column.key,
 				'data-title': column.title,
 				'data-column': column.key
-			}, statusCell(column, sectionData, status, enabled, health));
+			}, statusCell(column, sectionData, status, enabled, health, calibrationSummary));
 		})));
 	});
 
@@ -1180,7 +1494,7 @@ function renderTable(sections, statuses, selectedKeys, runtimeHealth) {
 	}, children);
 }
 
-function renderCards(sections, statuses, selectedKeys, runtimeHealth) {
+function renderCards(sections, statuses, selectedKeys, runtimeHealth, calibrationSummary) {
 	var columns = selectedStatusColumns(selectedKeys);
 
 	if (!sections.length)
@@ -1194,18 +1508,33 @@ function renderCards(sections, statuses, selectedKeys, runtimeHealth) {
 			return E('div', { 'class': 'cake-status-card-field cake-status-card-' + column.key }, [
 				E('strong', { 'class': 'cake-status-card-label' }, column.title),
 				E('div', { 'class': 'cake-status-card-value' },
-					statusCell(column, sectionData, status, enabled, health))
+					statusCell(column, sectionData, status, enabled, health, calibrationSummary))
 			]);
 		}));
 	}));
 }
 
-function renderStatusData(sections, statuses, selectedKeys, runtimeHealth) {
-	return E('div', { 'class': 'cake-status-data' }, [
+function renderStatusData(sections, statuses, selectedKeys, runtimeHealth, calibrationSummary,
+    schedulerDiagnostics) {
+	var children = [];
+
+	if (schedulerDiagnostics && schedulerDiagnostics.length) {
+		children.push(E('div', {
+			'class': 'alert-message warning cake-scheduler-diagnostics'
+		}, [
+			E('strong', {}, _('Native scheduler diagnostics')),
+			E('div', {}, schedulerDiagnostics.map(function(issue) {
+				return E('small', { 'style': 'display:block;white-space:normal' },
+					_('%s: %s').format(issue.instance, issue.message));
+			}))
+		]));
+	}
+	children.push(
 		E('div', { 'class': 'cake-status-table-scroll' },
-			renderTable(sections, statuses, selectedKeys, runtimeHealth)),
-		renderCards(sections, statuses, selectedKeys, runtimeHealth)
-	]);
+			renderTable(sections, statuses, selectedKeys, runtimeHealth, calibrationSummary)),
+		renderCards(sections, statuses, selectedKeys, runtimeHealth, calibrationSummary)
+	);
+	return E('div', { 'class': 'cake-status-data' }, children);
 }
 
 function renderColumnChooser(globalSection, selectedKeys, onChange) {
@@ -1270,15 +1599,20 @@ return L.view.extend({
 	load: function() {
 		return uci.load('cake-autorate').then(function() {
 			var sections = uci.sections('cake-autorate', 'cake_autorate');
-			var globalSection = uci.sections('cake-autorate', 'globals')[0] || { '.name': 'globals' };
+			var globalSection = uci.sections('cake-autorate', 'globals').filter(function(section) {
+				return section['.name'] === 'globals';
+			})[0] || { '.name': 'globals' };
+			var schedulerEngine = String(
+				uci.get('cake-autorate', 'globals', 'autotune_scheduler_engine') || '');
 			return Promise.all([
-				Promise.all(sections.map(function(section) {
-					return readInstanceStatus(section['.name']);
-				})),
 				readPackageVersions(),
-				readRuntimeHealth()
+				readRuntimeHealth(),
+				readCalibrationSummary()
 			]).then(function(result) {
-				return [ sections, result[0], result[1], globalSection, result[2] ];
+				return readInstanceStatuses(sections, schedulerEngine, result[2]).then(function(status) {
+					return [ sections, status.rows, result[0], globalSection, result[1], result[2],
+						status.diagnostics, schedulerEngine ];
+				});
 			});
 		});
 	},
@@ -1290,15 +1624,25 @@ return L.view.extend({
 		var versions = data[2] || {};
 		var globalSection = data[3] || { '.name': 'globals' };
 		var runtimeHealth = data[4] || {};
+		var calibrationSummary = data[5] || { state: 'unavailable', native_rating: false };
+		var schedulerDiagnostics = data[6] || [];
+		var schedulerEngine = data[7] || '';
 		var visibleColumns = statusColumnSelection(globalSection);
-		var statusData = renderStatusData(sections, statuses, visibleColumns, runtimeHealth);
+		var statusData = renderStatusData(sections, statuses, visibleColumns, runtimeHealth,
+			calibrationSummary, schedulerDiagnostics);
 		var columnChooser;
-		var replaceStatusData = function(nextStatuses, nextColumns, nextRuntimeHealth) {
+		var replaceStatusData = function(nextStatuses, nextColumns, nextRuntimeHealth,
+		    nextCalibrationSummary, nextSchedulerDiagnostics) {
 			statuses = nextStatuses || statuses;
 			visibleColumns = nextColumns || visibleColumns;
 			if (nextRuntimeHealth != null)
 				runtimeHealth = nextRuntimeHealth;
-			var nextData = renderStatusData(sections, statuses, visibleColumns, runtimeHealth);
+			if (nextCalibrationSummary != null)
+				calibrationSummary = nextCalibrationSummary;
+			if (nextSchedulerDiagnostics != null)
+				schedulerDiagnostics = nextSchedulerDiagnostics;
+			var nextData = renderStatusData(sections, statuses, visibleColumns, runtimeHealth,
+				calibrationSummary, schedulerDiagnostics);
 			if (statusData.parentNode) {
 				statusData.parentNode.replaceChild(nextData, statusData);
 				statusData = nextData;
@@ -1310,12 +1654,12 @@ return L.view.extend({
 
 		poll.add(function() {
 			return Promise.all([
-				Promise.all(sections.map(function(section) {
-					return readInstanceStatus(section['.name']);
-				})),
-				readRuntimeHealth()
+				readRuntimeHealth(),
+				readCalibrationSummary()
 			]).then(function(result) {
-				replaceStatusData(result[0], null, result[1]);
+				return readInstanceStatuses(sections, schedulerEngine, result[1]).then(function(status) {
+					replaceStatusData(status.rows, null, result[0], result[1], status.diagnostics);
+				});
 			});
 		}, 5);
 

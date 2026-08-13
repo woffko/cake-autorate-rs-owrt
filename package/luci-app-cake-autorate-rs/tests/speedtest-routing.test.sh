@@ -11,7 +11,7 @@ if [ "${1:-}" = job-start-harness ]; then
 	export CAKE_AUTORATE_RUNTIME_LOCK_ROOT="$harness_work/runtime-locks"
 	export CAKE_AUTORATE_SPEEDTEST_JOB_DIR="$harness_work/jobs"
 	export CAKE_AUTORATE_SPEEDTEST_SELF="$harness_work/bin/job-worker"
-	export PATH="$base/tests/fixtures/quality-test:$PATH"
+	export PATH="$base/tests/fixtures/speedtest-routing:$PATH"
 	: > "$harness_work/caller-$label.ready"
 	while [ ! -e "$harness_work/callers.go" ]; do sleep 0.01; done
 	set -- wan eth0 '' '' '' '' '' ''
@@ -187,7 +187,7 @@ if [ "${1:-}" = stop-failure-worker ]; then
 	exit 0
 fi
 
-work="${TMPDIR:-/tmp}/cake-speedtest-routing-test.$$"
+work="$(mktemp -d "${TMPDIR:-/tmp}/cake-speedtest-routing-test.XXXXXX")"
 mkdir -p "$work/bin"
 job_worker_pid=""
 recovery_worker_pid=""
@@ -803,14 +803,18 @@ runtime_lock_release_global
 cat > "$work/bin/speedtest-go" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$@" > "$CAKE_TEST_SPEEDTEST_ARGV"
-printf '%s\n' '{"dl_speed":100000000,"ul_speed":80000000,"server":{"id":"1","name":"test","sponsor":"test"}}'
+if [ "${CAKE_TEST_SPEEDTEST_LOW_RATE:-0}" = 1 ]; then
+	printf '%s\n' '{"dl_speed":0.3001399059302496,"ul_speed":0,"server":{"id":"1","name":"test","sponsor":"test"}}'
+else
+	printf '%s\n' '{"dl_speed":100000000,"ul_speed":80000000,"server":{"id":"1","name":"test","sponsor":"test"}}'
+fi
 EOF
 chmod +x "$work/bin/speedtest-go"
 route_exec() {
 	"$@"
 }
 speedtest_go_bin="$work/bin/speedtest-go"
-jsonfilter_bin="$base/tests/fixtures/quality-test/jsonfilter"
+jsonfilter_bin="$base/tests/fixtures/speedtest-routing/jsonfilter"
 speedtest_go_server_id=1
 upload_bytes=4000000
 bind_interface_enabled=0
@@ -848,6 +852,19 @@ if grep -qx -- '--no-upload' "$work/speedtest-argv"; then
 	echo "upload-only speedtest incorrectly disabled upload" >&2
 	exit 1
 fi
+
+direction_override=download
+speedtest_progress_file="$work/low-rate-progress.json"
+export CAKE_TEST_SPEEDTEST_LOW_RATE=1
+if run_speedtest_go_once 1; then
+	fail_test "a below-resolution download result became measurement evidence"
+fi
+[ "$speedtest_backend_error" = speedtest-direction-result-unavailable ] ||
+	fail_test "a below-resolution download result lost its typed error"
+[ "$(cat "$speedtest_progress_file")" = '{"stage":"speedtest-go-direction-unavailable","response_bytes":96}' ] ||
+	fail_test "a below-resolution download result lost its bounded progress state"
+unset CAKE_TEST_SPEEDTEST_LOW_RATE
+speedtest_progress_file=""
 
 download_kbps=900000
 upload_kbps=700000
@@ -905,8 +922,11 @@ if grep -q '^[[:space:]]*local .*route_mark_mask' "$script"; then
 fi
 grep -q 'speedtest_route_proof_error="the isolated speedtest-go route pin was not initialized by its parent"' "$script" ||
 	fail_test "speedtest-go commands can still acquire mwan3 routing from a subshell"
-grep -q 'USERID:=cake-speedtest:cake-speedtest' "$base/Makefile" ||
-	fail_test "package-owned speedtest route user is missing"
+grep -q 'USERID:=cake-speedtest:cake-speedtest' "$base/../cake-autorate-rs/Makefile" ||
+	fail_test "daemon package-owned speedtest route user is missing"
+if grep -q 'USERID:=cake-speedtest:cake-speedtest' "$base/Makefile"; then
+	fail_test "LuCI package still owns the daemon speedtest route user"
+fi
 
 # Two simultaneous LuCI job-start RPCs must publish and resume exactly one
 # verified worker. The second caller observes the same immutable PID/start

@@ -3,25 +3,39 @@
 if [ "${1:-}" = --autotune-proposal ]; then
 	dl_scale=1
 	ul_scale=1
+	dl_exact=
+	ul_exact=
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
 			--dl-base-scale) dl_scale="$2"; shift 2 ;;
 			--ul-base-scale) ul_scale="$2"; shift 2 ;;
+			--dl-measurement-base-kbps) dl_exact="$2"; shift 2 ;;
+			--ul-measurement-base-kbps) ul_exact="$2"; shift 2 ;;
 			*) shift ;;
 		esac
 	done
-	dl_base="$(awk -v scale="$dl_scale" 'BEGIN {
+	if [ -n "$dl_exact" ] || [ -n "$ul_exact" ]; then
+		case "$dl_exact:$ul_exact" in
+			''|*:|:*) exit 1 ;;
+		esac
+		[ "$dl_exact" -ge 722100 ] && [ "$dl_exact" -le 902700 ] || exit 1
+		[ "$ul_exact" -ge 720000 ] && [ "$ul_exact" -le 900000 ] || exit 1
+		dl_base="$dl_exact"
+		ul_base="$ul_exact"
+	else
+		dl_base="$(awk -v scale="$dl_scale" 'BEGIN {
 		value = int((848500 * scale + 50) / 100) * 100
 		if (value < 722100) value = 722100
 		if (value > 902700) value = 902700
 		printf "%.0f", value
-	}')"
-	ul_base="$(awk -v scale="$ul_scale" 'BEGIN {
+		}')"
+		ul_base="$(awk -v scale="$ul_scale" 'BEGIN {
 		value = int((900000 * scale + 50) / 100) * 100
 		if (value < 720000) value = 720000
 		if (value > 900000) value = 900000
 		printf "%.0f", value
-	}')"
+		}')"
+	fi
 	printf '%s\n' "{\"schema_version\":4,\"profile\":\"fair\",\"target_grade\":\"C\",\"quality_target_required\":false,\"throughput_priority\":true,\"download\":{\"minimum_kbps\":722100,\"exploration_minimum_kbps\":722100,\"runtime_minimum_kbps\":null,\"base_kbps\":$dl_base,\"maximum_kbps\":902700,\"tested_safe_maximum_kbps\":null,\"exploration_cap_kbps\":950000,\"absolute_cap_kbps\":950000,\"service_hard_cap_kbps\":null,\"ceiling_evidence\":\"unvalidated_candidate\",\"cap_source\":\"measured_raw\",\"observed_low_kbps\":902700,\"observed_median_kbps\":910000,\"observed_high_kbps\":920000,\"variability\":0.0190},\"upload\":{\"minimum_kbps\":720000,\"exploration_minimum_kbps\":720000,\"runtime_minimum_kbps\":null,\"base_kbps\":$ul_base,\"maximum_kbps\":900000,\"tested_safe_maximum_kbps\":null,\"exploration_cap_kbps\":930000,\"absolute_cap_kbps\":930000,\"service_hard_cap_kbps\":null,\"ceiling_evidence\":\"unvalidated_candidate\",\"cap_source\":\"measured_raw\",\"observed_low_kbps\":900000,\"observed_median_kbps\":905000,\"observed_high_kbps\":910000,\"variability\":0.0110},\"active_threshold_kbps\":20000,\"thresholds_ms\":{\"adjust_up\":6,\"delay\":30,\"adjust_down\":60},\"adaptive_ceiling\":{\"enabled\":false,\"hold_s\":10,\"growth_percent\":5,\"probe_s\":10,\"cooldown_s\":30,\"failed_bound_ttl_s\":600,\"policy\":\"verified_only\"},\"access\":{\"medium\":\"unknown\",\"source\":\"legacy_default\",\"confidence_percent\":0},\"validation\":{\"candidate_realization_min_percent\":80.0,\"candidate_realization_max_percent\":110.0,\"capacity_retention_min_percent\":90.0,\"icmp_delta_max_ms\":200.0,\"transport_delta_max_ms\":200.0,\"loss_max_percent\":5.0,\"cpu_max_percent\":85.0},\"sqm\":{\"qdisc\":\"cake\",\"script\":\"layer_cake.qos\",\"classification\":\"diffserv4\",\"squash_dscp\":true,\"squash_ingress\":true,\"ingress_ecn\":\"ECN\",\"egress_ecn\":\"NOECN\",\"iqdisc_opts\":\"besteffort\",\"eqdisc_opts\":\"diffserv4\"},\"link\":{\"kind\":\"pppoe\",\"layer\":\"ethernet\",\"overhead\":44,\"mpu\":84},\"confidence\":80,\"warnings\":[]}"
 	exit 0
 fi

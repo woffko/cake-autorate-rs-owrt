@@ -1,0 +1,38 @@
+{
+	"admin/network/cake-autorate-rs": {
+		"title": "CAKE Autorate SQM",
+		"order": 80,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"uci": {
+				"cake-autorate": true
+			}
+		}
+	},
+
+	"admin/network/cake-autorate-rs/status": {
+		"title": "Status",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "cake-autorate-rs/status"
+		},
+		"depends": {
+			"acl": [ "luci-app-cake-autorate-rs-lite" ]
+		}
+	},
+
+	"admin/network/cake-autorate-rs/settings": {
+		"title": "Manual settings",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "cake-autorate-rs/settings"
+		},
+		"depends": {
+			"acl": [ "luci-app-cake-autorate-rs-lite" ]
+		}
+	}
+}

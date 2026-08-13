@@ -316,8 +316,14 @@ value=$((value + 1))
 echo "$value" > "$TEST_COUNT"
 echo "service:$value:$*" >> "$TEST_LOG"
 if [ "${KILL_CALLER_ON_RESTART:-0}" = 1 ] && [ "$value" -eq 1 ]; then
-	kill -KILL "$PPID"
-	exit 0
+	[ -p "$TEST_KILL_READY_FIFO" ] || exit 92
+	[ -p "$TEST_KILL_PARK_FIFO" ] || exit 93
+	printf '%s\n' "$$" > "$TEST_KILL_READY_FIFO"
+	# Park the mock at the exact post-commit restart boundary. The test harness
+	# first proves that this PID belongs to its isolated Apply process group and
+	# then kills that whole group. Elapsed time never authorizes the crash.
+	read -r _release < "$TEST_KILL_PARK_FIFO"
+	exit 94
 fi
 if [ "$value" -eq 1 ] && [ -n "${SERVICE_MUTATE_KEY:-}" ]; then
 	printf 'S|%s|%s\n' "$SERVICE_MUTATE_KEY" "${SERVICE_MUTATE_VALUE:-admin}" >> "$TEST_COMMITTED"
@@ -860,28 +866,97 @@ assert_global_lock_released
 # verifies runtime before removing the obligation.
 reset_case
 export KILL_CALLER_ON_RESTART=1
-(
-	# Keep an actual subshell between the mock service and the test harness.
-	# Some /bin/sh implementations tail-exec the final background command,
-	# which would make the deliberate SIGKILL hit this entire test script.
-	apply_result test '{}' "$fingerprint_a" eth0
-	crash_status="$?"
-	:
-	exit "$crash_status"
-) &
+export TEST_KILL_READY_FIFO="$tmp/restart-ready.fifo"
+export TEST_KILL_PARK_FIFO="$tmp/restart-park.fifo"
+rm -f "$TEST_KILL_READY_FIFO" "$TEST_KILL_PARK_FIFO"
+mkfifo "$TEST_KILL_READY_FIFO" "$TEST_KILL_PARK_FIFO"
+# apply_result() deliberately owns an inner subshell. Backgrounding that shell
+# function directly would make $! identify only the outer asynchronous shell,
+# allowing the transaction owner and restart child to survive its SIGKILL.
+# Run the complete call in a new session instead, so one verified process group
+# contains the runner, apply owner and every command started by the transaction.
+setsid sh -c '
+	set -eu
+	health_count="$1"
+	scheduler="$2"
+	expected_fingerprint="$3"
+	. "$scheduler"
+	runtime_health_exact() {
+		health_value=0
+		[ ! -s "$health_count" ] || health_value="$(cat "$health_count")"
+		health_value=$((health_value + 1))
+		printf "%s\n" "$health_value" > "$health_count"
+		[ "${FAIL_HEALTH_AT:-0}" -ne "$health_value" ]
+	}
+	apply_result test "{}" "$expected_fingerprint" eth0
+' sh "$health_count" "$root/root/usr/libexec/cake-autorate-rs/autotune-scheduler" "$fingerprint_a" &
 crashed_apply_pid="$!"
+if ! crashed_mock_pid="$(timeout 15 cat "$TEST_KILL_READY_FIFO")"; then
+	/bin/kill -KILL -- "-$crashed_apply_pid" 2>/dev/null || true
+	wait "$crashed_apply_pid" 2>/dev/null || true
+	echo 'SIGKILL apply harness never reached the restart rendezvous' >&2
+	exit 1
+fi
+case "$crashed_mock_pid" in
+	''|*[!0-9]*)
+		/bin/kill -KILL -- "-$crashed_apply_pid" 2>/dev/null || true
+		wait "$crashed_apply_pid" 2>/dev/null || true
+		echo 'SIGKILL restart rendezvous returned an invalid mock PID' >&2
+		exit 1
+		;;
+esac
+crashed_apply_pgid="$(ps -o pgid= -p "$crashed_apply_pid" | tr -d ' ')"
+crashed_mock_pgid="$(ps -o pgid= -p "$crashed_mock_pid" | tr -d ' ')"
+if [ "$crashed_apply_pgid" != "$crashed_apply_pid" ] ||
+   [ "$crashed_mock_pgid" != "$crashed_apply_pid" ]; then
+	/bin/kill -KILL -- "-$crashed_apply_pid" 2>/dev/null || true
+	wait "$crashed_apply_pid" 2>/dev/null || true
+	echo 'SIGKILL apply harness did not isolate the complete transaction process group' >&2
+	exit 1
+fi
+/bin/kill -KILL -- "-$crashed_apply_pid"
 if wait "$crashed_apply_pid" 2>/dev/null; then
 	echo 'SIGKILL apply harness unexpectedly succeeded' >&2
 	exit 1
 fi
-recovery_transactions_pending
-[ "$(uci -q get cake-autorate.test.base_dl_shaper_rate_kbps)" = 20000 ]
+if ! timeout 15 sh -c '
+	pid="$1"
+	while kill -0 "$pid" 2>/dev/null; do sleep 0.01; done
+' sh "$crashed_mock_pid"; then
+	echo 'SIGKILL restart mock survived its isolated transaction process group' >&2
+	exit 1
+fi
+rm -f "$TEST_KILL_READY_FIFO" "$TEST_KILL_PARK_FIFO"
+unset TEST_KILL_READY_FIFO TEST_KILL_PARK_FIFO
+if ! recovery_transactions_pending; then
+	echo 'SIGKILL apply harness did not leave a durable recovery obligation' >&2
+	exit 1
+fi
+if [ "$(uci -q get cake-autorate.test.base_dl_shaper_rate_kbps)" != 20000 ]; then
+	echo 'SIGKILL apply harness did not preserve the committed candidate before recovery' >&2
+	exit 1
+fi
 unset KILL_CALLER_ON_RESTART
-recover_pending_transactions
-[ "$(uci -q get cake-autorate.test.base_dl_shaper_rate_kbps)" = 111 ]
-! recovery_transactions_pending
-grep -q '"state":"recovered"' "$state_root/test.json"
-assert_global_lock_released
+if ! recover_pending_transactions; then
+	echo 'SIGKILL apply recovery did not settle the durable transaction' >&2
+	exit 1
+fi
+if [ "$(uci -q get cake-autorate.test.base_dl_shaper_rate_kbps)" != 111 ]; then
+	echo 'SIGKILL apply recovery did not restore the exact preimage' >&2
+	exit 1
+fi
+if recovery_transactions_pending; then
+	echo 'SIGKILL apply recovery left a durable transaction behind' >&2
+	exit 1
+fi
+if ! grep -q '"state":"recovered"' "$state_root/test.json"; then
+	echo 'SIGKILL apply recovery did not publish the recovered terminal state' >&2
+	exit 1
+fi
+if ! assert_global_lock_released; then
+	echo 'SIGKILL apply recovery did not release the global runtime lock' >&2
+	exit 1
+fi
 
 # Rollback commit and rollback restart failures remain explicit obligations;
 # they are never swallowed or reported as a clean failure.

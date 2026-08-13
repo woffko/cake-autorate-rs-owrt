@@ -7,12 +7,21 @@ const path = require('node:path');
 const sourcePath = path.join(__dirname, '..', 'htdocs', 'luci-static', 'resources',
 	'view', 'cake-autorate-rs', 'settings.js');
 const source = fs.readFileSync(sourcePath, 'utf8');
+assert.equal((source.match(/window\.setTimeout\(/g) || []).length, 3,
+	'settings timers are limited to speedtest, Auto-Tune and guarded-apply polling helpers');
+for (const helper of [ 'speedtestJobDelay', 'autotuneJobDelay', 'applyGuardDelay' ]) {
+	assert.match(source, new RegExp('function ' + helper + '\\([^)]*\\)\\s*\\{[\\s\\S]*?window\\.setTimeout\\('),
+		`${helper} must remain an explicit polling/watchdog cadence helper`);
+}
 const prefix = source.slice(0, source.indexOf('return L.view.extend'));
 assert.match(source, /function modal\(option\)\s*\{[\s\S]*?option\.modalonly = true;[\s\S]*?option\.retain = true;/,
 	'all modal settings must retain dependency-hidden values instead of staging unrelated deletions');
 assert.match(source,
 	/return uci\.save\(\)\.then\(function\(\) \{ return created; \}\);/,
 	'the wizard must persist its exact staged proposal without reparsing stale GridSection widgets');
+assert.match(source,
+	/requireCleanUciTransaction\(_\('Apply or revert existing pending changes before staging a Full Auto-Tune proposal\.'\)\)/,
+	'single-WAN guarded Auto-Tune must refuse to stage on top of stale pending UCI deltas');
 assert.doesNotMatch(source,
 	/return grid\.map\.save\(null, true\)\.then\(function\(\) \{ return created; \}\);/,
 	'the wizard must not overwrite its staged proposal from stale modal widgets');
@@ -32,6 +41,8 @@ assert.match(source,
 	'the equal four-card row must collapse safely on narrow screens');
 assert.equal((source.match(/autotuneProfileGrid\(profileButtons\)/g) || []).length, 2,
 	'single-WAN and sequential Multi-WAN profile selectors must use the same layout');
+assert.equal((source.match(/diagnosticsNode\.style\.display = 'none'/g) || []).length, 2,
+	'a repeated single-WAN or Multi-WAN run must hide stale diagnostics without replacing the live progress DOM');
 assert.match(source,
 	/o = iface\(section, 'interfaces', 'dl_if',[\s\S]*?o\.depends\('auto_interface_preset', '0'\);\s*o\.retain = true;/,
 	'hidden automatic download interface must survive modal saves');
@@ -106,13 +117,16 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 	return new Function(
 		'fs', 'form', 'network', 'uci', 'ui', 'widgets', 'cakeUi', 'rpc', 'L', 'E', '_',
 		`${prefix}\ninterfaceContext = { deviceNames: { eth1: true }, deviceNetworks: {}, ` +
-			`networkDevices: {}, defaultDevice: 'eth1' };\nreturn { writeWizardConfig, validateTransportProbeUrl, ` +
-			`buildInterfaceContext, buildMwan3Context, uniqueMwan3Uplinks, managedUplinkOwner, availableMwan3Uplinks, ` +
-			`multiwanInstancePlans, wizardPlanConflicts, ` +
+			`networkDevices: {}, defaultDevice: 'eth1' };\nreturn { writeWizardConfig, validateTransportProbeUrl, parseExecJson, ` +
+			`buildInterfaceContext, buildMwan3Context, uniqueMwan3Uplinks, managedUplinkOwner, managedTargetOwner, availableMwan3Uplinks, ` +
+			`targetInterfaceChoices, targetInterfaceChoiceOptions, defaultWizardTarget, ` +
+			`multiwanInstancePlans, wizardPlanConflicts, wizardSingleTargetConflicts, ` +
 			`topicTab, autorateSubcategory, autorateSubcategoryDefinitions, ` +
 			`formOrUci, accessMediumDefinitions, accessMediumTitle, accessMediumExplorationPercent, detectAccessMedium, resolvedAccessContext, ` +
 			`recommendedCapacityLearningPolicy, canonicalCapacityLearningPolicy, autotuneAccessRequest, ` +
 			`canonicalAutotuneProfile, autotuneProfilePolicy, autotuneProfileDefinitions, ` +
+			`nativeAutotunePublicResultValidated, nativeAutotuneAcknowledgementLabel, nativeAutotuneApplyCheckValidated, ` +
+			`nativeAutotuneApplyReceiptValidated, runNativeAutotuneApplyCheck, runNativeAutotuneApply, ` +
 			`visibleAutotuneProfile, autotuneRunProfile, storedAutotuneProfile, ` +
 			`autotuneHasTrustedCapacityReferences, autotuneCalibrationStrategy, ` +
 			`autotuneRunningRequestMatches, ` +
@@ -128,7 +142,9 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 			`autotuneConfidence, autotuneResultClass, autotuneBackgroundAwareResult, ` +
 			`autotunePhaseEvidenceUsable, ` +
 			`autotuneConservativeAvailable, autotunePhaseEvidenceClean, ` +
-			`multiwanAutotuneItemAccepted, multiwanAutotuneItemDecided, multiwanAutotuneBatchDecided, ` +
+			`multiwanAutotuneItemNativeApplied, multiwanAutotuneItemAccepted, ` +
+			`multiwanAutotuneItemDecided, multiwanAutotuneBatchDecided, ` +
+			`multiwanAutotunePendingPlans, multiwanAutotunePendingStagedApplyItems, ` +
 			`multiwanAutotuneItemCanSkip, ` +
 			`autotuneDisableSqmEvidenceValidated, autotuneRawNoSqmEvidenceValidated, ` +
 			`autotuneAttemptDiagnostics, autotuneDiagnostics, ` +
@@ -140,13 +156,20 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 			`stageAutotuneApplyMarker, pendingAutotuneApplyMarkers, ` +
 			`armAutotuneApplyGuards, runGuardedSaveApply, discardStagedUciPackages, ` +
 			`reconcileConfirmedUciPackages, ` +
-			`changedUciPackages, requireCleanUciTransaction, applyPlainRollbackTransaction, ` +
+			`changedUciPackages, validateAutotuneStagedTransaction, requireCleanUciTransaction, applyPlainRollbackTransaction, ` +
 			`runSequentialAutotuneApplies, ` +
 			`clearAutotuneProposalState, recordAutotuneTerminalFailure, ` +
 			`autotuneRetryableInconclusive, autotuneMeasurementTimeout, autotuneRecommendedProfile, recordAutotuneRetryableInconclusive, ` +
 			`manualSqmDirectionMode, writeManualSqmDirectionMode, ` +
 			`positiveRateValue, shouldImportInterfaceRates, applyRatePreset, ` +
 			`adaptiveCeilingWritePlan, runAutotuneJob, cancelAutotuneJob, ` +
+			`runSpeedtestJob, nativeSpeedtestCapabilityValidated, nativeSpeedtestLaunchArgs, nativeSpeedtestResultValidated, ` +
+			`nativeAutotuneCapabilityValidated, nativeBootstrapAutotuneCapabilityValidated, ` +
+			`nativeAutotuneIntentSupported, nativeAutotuneLaunchArgs, nativeAutotuneResultMatchesRequest, ` +
+			`runPreferredAutotuneJob, cancelPreferredAutotuneJob, ` +
+			`replaceNodeContent, ` +
+			`setNativeAutotuneJob: function(section, jobId) { nativeAutotuneJobs[section] = jobId; autotuneTransportModes[section] = 'native'; }, ` +
+			`setLegacyAutotuneJob: function(section, runId) { legacyAutotuneJobs[section] = runId; autotuneTransportModes[section] = 'legacy'; }, ` +
 			`setInterfaceContext: function(value) { interfaceContext = value; }, ` +
 			`setMwan3Context: function(value) { mwan3Context = value; } };`
 	)(fsImpl || {}, {}, {}, uciImpl || uci, {}, {}, {}, rpcImpl || {
@@ -155,6 +178,711 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 }
 
 const helpers = compileHelpers({});
+const replacementA = { id: 'a' };
+const replacementB = { id: 'b' };
+const replaceTarget = {
+	children: null,
+	replaceChildren() {
+		this.children = Array.from(arguments);
+	},
+	removeChild() {
+		throw new Error('replaceNodeContent used the re-entrant removeChild path');
+	}
+};
+helpers.replaceNodeContent(replaceTarget, [ replacementA, replacementB ]);
+assert.deepEqual(replaceTarget.children, [ replacementA, replacementB ],
+	'wizard re-render must use one native replacement instead of a re-entrant removeChild loop');
+const legacyOldChild = { parentNode: null };
+const legacyTarget = {
+	children: [ legacyOldChild ],
+	get firstChild() {
+		return this.children[0] || null;
+	},
+	removeChild(child) {
+		assert.equal(child, legacyOldChild);
+		this.children.shift();
+		child.parentNode = null;
+		const error = new Error('removed by nested blur render');
+		error.name = 'NotFoundError';
+		throw error;
+	},
+	appendChild(child) {
+		this.children.push(child);
+		child.parentNode = this;
+	}
+};
+legacyOldChild.parentNode = legacyTarget;
+helpers.replaceNodeContent(legacyTarget, replacementA);
+assert.deepEqual(legacyTarget.children, [ replacementA ],
+	'legacy fallback must ignore only a proven stale-child NotFoundError and finish replacement');
+const unexpectedError = new Error('unexpected DOM failure');
+unexpectedError.name = 'HierarchyRequestError';
+const brokenLegacyTarget = {
+	firstChild: { parentNode: null },
+	removeChild() { throw unexpectedError; },
+	appendChild() {}
+};
+assert.throws(() => helpers.replaceNodeContent(brokenLegacyTarget, []),
+	error => error === unexpectedError,
+	'legacy fallback must not hide DOM errors other than a proven stale-child NotFoundError');
+assert.deepEqual(helpers.parseExecJson({ code: 0, stdout: '{"state":"ok"}', stderr: '' }),
+	{ state: 'ok' });
+assert.throws(() => helpers.parseExecJson({ code: 1, stdout: '', stderr: 'ERROR: target is already managed\nignored' }),
+	/target is already managed/);
+assert.throws(() => helpers.parseExecJson({ code: 1, stdout: '{"state":"ok"}', stderr: '' }),
+	/failed without a usable diagnostic/,
+	'a non-zero native command must never promote a partial success payload');
+assert.throws(() => helpers.parseExecJson({ code: 0, stdout: '', stderr: '' }),
+	/returned no JSON result/);
+assert.throws(() => helpers.parseExecJson({ code: 0, stdout: 'not-json', stderr: '' }),
+	/returned malformed JSON/);
+let boundedExecError;
+try {
+	helpers.parseExecJson({ code: 2, stdout: '', stderr: `ERROR:\u0001${'x'.repeat(400)}` });
+} catch (error) {
+	boundedExecError = error;
+}
+assert.ok(boundedExecError);
+assert.ok(boundedExecError.message.length <= 240);
+assert.doesNotMatch(boundedExecError.message, /[\x00-\x1f\x7f]/,
+	'native stderr exposed to LuCI must be bounded and control-free');
+
+function nativePublicFixture() {
+	const names = [ 'proposal', 'download_search', 'upload_search',
+		'pair_confirmation', 'topology_comparison' ];
+	const schemas = [ 4, 4, 4, 6, 2 ];
+	const artifacts = {};
+	for (let i = 0; i < names.length; i++)
+		artifacts[names[i]] = { sha256: String(i + 1).repeat(64), value: { schema_version: schemas[i] } };
+	artifacts.proposal.value = {
+		schema_version: 4,
+		profile: 'variable_link',
+		download: { base_kbps: 904900 },
+		upload: { base_kbps: 915600 },
+	};
+	artifacts.download_search.value = {
+		schema_version: 4, profile: 'variable_link', direction: 'download',
+		action: 'complete', reason: 'latency-knee-confirmed',
+		selected: {
+			index: 1, candidate_kbps: 904900, transport_censored: false,
+			manual_reviewable: true, safety_pass: true, target_met: true,
+		},
+		evaluated: [ {
+			index: 1, candidate_kbps: 904900, transport_censored: false,
+			measurement_reliable: true, manual_reviewable: true,
+			safety_pass: true, target_met: true,
+		} ],
+		review_options: [ {
+			role: 'recommended', observation_index: 1, candidate_kbps: 904900,
+			transport_censored: false, manual_reviewable: true,
+			target_met: true, auto_apply_candidate: true,
+		} ],
+	};
+	artifacts.upload_search.value = {
+		schema_version: 4, profile: 'variable_link', direction: 'upload',
+		action: 'complete', reason: 'latency-knee-confirmed',
+		selected: {
+			index: 1, candidate_kbps: 915600, transport_censored: false,
+			manual_reviewable: true, safety_pass: true, target_met: true,
+		},
+		evaluated: [ {
+			index: 1, candidate_kbps: 915600, transport_censored: false,
+			measurement_reliable: true, manual_reviewable: true,
+			safety_pass: true, target_met: true,
+		} ],
+		review_options: [ {
+			role: 'recommended', observation_index: 1, candidate_kbps: 915600,
+			transport_censored: false, manual_reviewable: true,
+			target_met: true, auto_apply_candidate: true,
+		} ],
+	};
+	artifacts.pair_confirmation.value = {
+		schema_version: 6,
+		topology: 'both_shaped',
+		target_rates_kbps: { download: 904900, upload: 915600 },
+		achieved_kbps: { download: 839356, upload: 851212 },
+		transport_censored: false,
+		transport_timeout_count: 0,
+		transport_timeout_total_us: 0,
+		measurement_reliable: true,
+		safety_pass: true,
+		auto_apply_pass: false,
+		options: [
+			{
+				option_id: 'recommended',
+				target_rates_kbps: { download: 904900, upload: 915600 },
+				achieved_kbps: { download: 839356, upload: 851212 },
+				transport_censored: false, transport_timeout_count: 0,
+				transport_timeout_total_us: 0, measurement_reliable: true,
+				safety_pass: true, auto_apply_pass: false,
+				physical_capacity_limited_review: { download: false, upload: false },
+				physical_capacity_alignment_confirmed: { download: false, upload: false },
+				manual_apply_eligible: true, manual_review_required: true,
+				validation: { actual_grade: 'B' },
+			},
+			{
+				option_id: 'quality_first',
+				target_rates_kbps: { download: 710000, upload: 720000 },
+				achieved_kbps: { download: 700000, upload: 710000 },
+				transport_censored: false, transport_timeout_count: 0,
+				transport_timeout_total_us: 0, measurement_reliable: true,
+				safety_pass: true, auto_apply_pass: true,
+				physical_capacity_limited_review: { download: false, upload: false },
+				physical_capacity_alignment_confirmed: { download: false, upload: false },
+				manual_apply_eligible: true, manual_review_required: false,
+				validation: { actual_grade: 'A' },
+			},
+		],
+		unavailable_options: [],
+	};
+	artifacts.topology_comparison.value = {
+		schema_version: 2,
+		selected_topology: 'upload_only_shaped',
+		selected_rates_kbps: { download: null, upload: 915600 },
+		auto_apply_pass: false,
+		manual_review_required: true,
+		download: {
+			choice: 'unshaped',
+			shaped: { achieved_kbps: 839356, grade: 'B', transport_censored: false },
+			unshaped: {
+				achieved_kbps: 900000, grade: 'B', transport_censored: false,
+				target_met: true, measurement_reliable: true, safety_pass: true,
+			},
+		},
+		upload: {
+			choice: 'shaped',
+			shaped: { achieved_kbps: 851212, grade: 'B', transport_censored: false },
+			unshaped: {
+				achieved_kbps: null, grade: null, transport_censored: false,
+				target_met: false, measurement_reliable: false, safety_pass: false,
+			},
+		},
+	};
+	return {
+		native_public_schema_version: 3,
+		state: 'review_ready',
+		producer: 'cake-autorated-native-autotune',
+		source_review_sha256: 'a'.repeat(64),
+		public_apply_contract: {
+			schema_version: 3,
+			state: 'selection_ready',
+			executor_available: true,
+			explicit_confirmation_required: true,
+			native_job_id: 'b'.repeat(32),
+			worker_run_id: 'c'.repeat(32),
+			source_review_sha256: 'a'.repeat(64),
+			selection_contract: 'option_id_plus_review_and_manifest_digests_and_acknowledgements',
+			options: [
+				{
+					option_id: 'recommended', preferred: false,
+					manifest_sha256: '8'.repeat(64),
+					selected_topology: 'both_shaped', action: 'apply_sqm',
+					sqm_direction_mode: 'both',
+					target_rates_kbps: { download: 904900, upload: 915600 },
+					auto_apply_evidence_pass: false, manual_review_required: true,
+					required_acknowledgements: [ 'download-capacity-retention' ],
+				},
+				{
+					option_id: 'quality_first', preferred: false,
+					manifest_sha256: '7'.repeat(64),
+					selected_topology: 'both_shaped', action: 'apply_sqm',
+					sqm_direction_mode: 'both',
+					target_rates_kbps: { download: 710000, upload: 720000 },
+					auto_apply_evidence_pass: true, manual_review_required: false,
+					required_acknowledgements: [],
+				},
+				{
+					option_id: 'bypass_download', preferred: true,
+					manifest_sha256: '9'.repeat(64),
+					selected_topology: 'upload_only_shaped', action: 'apply_sqm',
+					sqm_direction_mode: 'upload_only',
+					target_rates_kbps: { download: null, upload: 915600 },
+					auto_apply_evidence_pass: false, manual_review_required: true,
+					required_acknowledgements: [ 'download-shaping-bypassed' ],
+				},
+			],
+		},
+		auto_apply_eligible: false,
+		manual_apply_eligible: true,
+		configuration_written: false,
+		runtime_restored: true,
+		recovery_pending: false,
+		throughput_unit: 'kbit/s',
+		proposal_rate_transform: 'none',
+		native_job_id: 'b'.repeat(32),
+		job_id: 'wan_sqm',
+		run_id: 'c'.repeat(32),
+		target_interface: 'pppoe-wan',
+		resolved_interface: 'pppoe-wan',
+		route_mode: 'main',
+		mwan3_member: null,
+		source_ip: '192.0.2.10',
+		route_fingerprint: `sha256:${'d'.repeat(64)}`,
+		config_fingerprint: `sha256:${'e'.repeat(64)}`,
+		sqm_fingerprint: `sha256:${'f'.repeat(64)}`,
+		profile: 'variable_link',
+		calibration_strategy: 'full_raw',
+		consumed_traffic_bytes: 17741550972,
+		artifacts,
+	};
+}
+
+function nativeRawFallbackPublicFixture() {
+	const result = nativePublicFixture();
+	const acknowledgements = [
+		'download-shaping-bypassed',
+		'upload-shaping-bypassed',
+		'sqm-disabled',
+	];
+	const sample = (topology, achieved, delta) => ({
+		topology,
+		achieved_kbps: achieved,
+		effective_delta_ms: delta,
+		grade: 'A',
+		transport_censored: false,
+		loss_ppm: 0,
+		cpu_milli_percent: 1200,
+		background_confidence_percent: 95,
+		contaminated: false,
+	});
+	const direction = (name, topologies, rates, deltas) => ({
+		direction: name,
+		sample_count: 2,
+		representative_achieved_kbps: Math.min(rates[0], rates[1]),
+		effective_delta_ms: Math.max(deltas[0], deltas[1]),
+		grade: 'A',
+		rate_consistent: true,
+		target_status_consistent: true,
+		target_met: true,
+		measurement_reliable: true,
+		contaminated: false,
+		safety_pass: true,
+		samples: [
+			sample(topologies[0], rates[0], deltas[0]),
+			sample(topologies[1], rates[1], deltas[1]),
+		],
+	});
+	result.native_public_schema_version = 4;
+	result.artifacts = {
+		proposal: result.artifacts.proposal,
+		raw_fallback: {
+			sha256: '6'.repeat(64),
+			value: {
+				schema_version: 1,
+				selected_topology: 'no_sqm',
+				reason: 'incomplete-shaped-search',
+				failed_direction: 'download',
+				unobserved_candidates_kbps: [ 904900, 724000, 543000 ],
+				discarded_shaped_observation_count: 0,
+				target_grade: 'B',
+				auto_apply_pass: false,
+				manual_review_required: true,
+				download: direction('download', [ 'download_unshaped', 'no_sqm' ],
+					[ 920000, 910000 ], [ 8.25, 9.5 ]),
+				upload: direction('upload', [ 'upload_unshaped', 'no_sqm' ],
+					[ 100000, 98000 ], [ 7.75, 9.5 ]),
+				required_acknowledgements: acknowledgements.slice(),
+			},
+		},
+	};
+	result.public_apply_contract.options = [ {
+		option_id: 'no_sqm',
+		preferred: true,
+		manifest_sha256: '9'.repeat(64),
+		selected_topology: 'no_sqm',
+		action: 'disable_sqm',
+		sqm_direction_mode: 'off',
+		target_rates_kbps: { download: null, upload: null },
+		auto_apply_evidence_pass: false,
+		manual_review_required: true,
+		required_acknowledgements: acknowledgements.slice(),
+	} ];
+	return result;
+}
+
+function nativeCensoredPublicFixture() {
+	const result = nativePublicFixture();
+	const pair = result.artifacts.pair_confirmation.value;
+	const topology = result.artifacts.topology_comparison.value;
+	const recommended = result.public_apply_contract.options[0];
+
+	[ result.artifacts.download_search.value,
+		result.artifacts.upload_search.value ].forEach(search => {
+		search.action = 'fallback';
+		search.reason = 'transport-deadline-censored-review';
+		Object.assign(search.selected, {
+			transport_censored: true, manual_reviewable: true,
+			safety_pass: false, target_met: false,
+		});
+		Object.assign(search.evaluated[0], {
+			transport_censored: true, measurement_reliable: false,
+			manual_reviewable: true, safety_pass: false, target_met: false,
+		});
+		Object.assign(search.review_options[0], {
+			transport_censored: true, manual_reviewable: true,
+			target_met: false, auto_apply_candidate: false,
+		});
+	});
+	Object.assign(pair, {
+		transport_censored: true,
+		transport_timeout_count: 6,
+		transport_timeout_total_us: 30000000,
+		measurement_reliable: false,
+		safety_pass: false,
+		auto_apply_pass: false,
+	});
+	Object.assign(pair.options[0], {
+		transport_censored: true,
+		transport_timeout_count: 6,
+		transport_timeout_total_us: 30000000,
+		measurement_reliable: false,
+		safety_pass: false,
+		auto_apply_pass: false,
+		manual_apply_eligible: true,
+		manual_review_required: true,
+	});
+	result.public_apply_contract.options.forEach(option => { option.preferred = false; });
+	recommended.preferred = true;
+	recommended.required_acknowledgements = [
+		'download-capacity-retention', 'measurement-confidence',
+	];
+	result.public_apply_contract.options[2].required_acknowledgements.push(
+		'measurement-confidence');
+	topology.selected_topology = 'both_shaped';
+	topology.selected_rates_kbps = { download: 904900, upload: 915600 };
+	topology.download.choice = 'shaped';
+	topology.upload.choice = 'shaped';
+	topology.download.shaped.transport_censored = true;
+	topology.upload.shaped.transport_censored = true;
+	topology.auto_apply_pass = false;
+	topology.manual_review_required = true;
+	return result;
+}
+
+const nativePublic = nativePublicFixture();
+Object.defineProperty(nativePublic, '_native_target_state', {
+	value: 'existing_managed', enumerable: false,
+});
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativePublic), true,
+	'a digest-bound diagnostic native Review must pass its isolated public contract');
+assert.equal(nativePublic.artifacts.proposal.value.download.base_kbps, 904900,
+	'the native public contract must preserve the exact download proposal rate');
+assert.equal(nativePublic.artifacts.proposal.value.upload.base_kbps, 915600,
+	'the native public contract must preserve the exact upload proposal rate');
+assert.equal(nativePublic.manual_apply_eligible, true,
+	'the confirmation contract must expose the crash-safe native executor');
+const nativeTrafficBudgetLimited = nativePublicFixture();
+const limitedTopology = nativeTrafficBudgetLimited.artifacts.topology_comparison.value;
+limitedTopology.selected_topology = 'both_shaped';
+limitedTopology.selected_rates_kbps = { download: 904900, upload: 915600 };
+limitedTopology.download.choice = 'shaped';
+limitedTopology.download.reason = 'shaped-quality-preferred';
+limitedTopology.upload.reason = 'traffic-budget-limited';
+Object.assign(limitedTopology.upload.unshaped, {
+	needs_repeat: false,
+	retry_exhausted: true,
+});
+limitedTopology.auto_apply_pass = false;
+limitedTopology.manual_review_required = true;
+nativeTrafficBudgetLimited.public_apply_contract.options.splice(2, 1);
+nativeTrafficBudgetLimited.public_apply_contract.options[0].preferred = true;
+for (const option of nativeTrafficBudgetLimited.public_apply_contract.options) {
+	option.auto_apply_evidence_pass = false;
+	option.manual_review_required = true;
+	option.required_acknowledgements.push('topology-comparison-traffic-budget');
+}
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeTrafficBudgetLimited), true,
+	'a conservative raw-repeat budget limit must preserve every verified shaped option as manual Review');
+assert.match(helpers.nativeAutotuneAcknowledgementLabel('topology-comparison-traffic-budget'),
+	/fully verified shaped proposal/,
+	'the explicit confirmation must explain that no raw result was inferred');
+const nativeTrafficBudgetMissingAcknowledgement = JSON.parse(
+	JSON.stringify(nativeTrafficBudgetLimited));
+nativeTrafficBudgetMissingAcknowledgement.public_apply_contract.options[1]
+	.required_acknowledgements.pop();
+assert.equal(helpers.nativeAutotunePublicResultValidated(
+	nativeTrafficBudgetMissingAcknowledgement), false,
+	'every shaped option must retain the topology traffic-budget acknowledgement');
+const nativeTrafficBudgetInventedAcknowledgement = nativePublicFixture();
+nativeTrafficBudgetInventedAcknowledgement.public_apply_contract.options[0]
+	.required_acknowledgements.push('topology-comparison-traffic-budget');
+assert.equal(helpers.nativeAutotunePublicResultValidated(
+	nativeTrafficBudgetInventedAcknowledgement), false,
+	'the browser must reject a traffic-budget acknowledgement without matching Rust evidence');
+const nativeTrafficBudgetAutoApply = JSON.parse(JSON.stringify(nativeTrafficBudgetLimited));
+nativeTrafficBudgetAutoApply.artifacts.topology_comparison.value.auto_apply_pass = true;
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeTrafficBudgetAutoApply), false,
+	'a budget-limited optional comparison can never be relabelled for Auto-Apply');
+const nativeTrafficBudgetWithoutManualReview = JSON.parse(
+	JSON.stringify(nativeTrafficBudgetLimited));
+nativeTrafficBudgetWithoutManualReview.public_apply_contract.options[0]
+	.manual_review_required = false;
+assert.equal(helpers.nativeAutotunePublicResultValidated(
+	nativeTrafficBudgetWithoutManualReview), false,
+	'a budget-limited shaped option must never omit explicit manual Review');
+const nativePartialPair = nativePublicFixture();
+nativePartialPair.artifacts.pair_confirmation.value.unavailable_options = [ {
+	target_rates_kbps: { download: 600000, upload: 610000 },
+	failed_direction: 'download', reason: 'observation_starved', run_count: 3,
+	traffic_debit_count: { download: 3, upload: 0 },
+	samples: { icmp: 273, transport: 5, cpu: 3 },
+} ];
+nativePartialPair.artifacts.pair_confirmation.value.options.pop();
+nativePartialPair.public_apply_contract.options.splice(1, 1);
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativePartialPair), true,
+	'a valid primary pair must remain selectable when one optional pair is unavailable');
+const nativePartialPairDuplicate = JSON.parse(JSON.stringify(nativePartialPair));
+nativePartialPairDuplicate.artifacts.pair_confirmation.value.unavailable_options[0]
+	.target_rates_kbps = { download: 904900, upload: 915600 };
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativePartialPairDuplicate), false,
+	'an unavailable pair cannot duplicate a selectable exact rate pair');
+const nativePartialPairImpossibleDebits = JSON.parse(JSON.stringify(nativePartialPair));
+nativePartialPairImpossibleDebits.artifacts.pair_confirmation.value.unavailable_options[0]
+	.traffic_debit_count.upload = 1;
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativePartialPairImpossibleDebits), false,
+	'a failed download pair must not claim upload traffic debits');
+const nativePartialPairCompleteObservation = JSON.parse(JSON.stringify(nativePartialPair));
+nativePartialPairCompleteObservation.artifacts.pair_confirmation.value.unavailable_options[0]
+	.samples = { icmp: 15, transport: 15, cpu: 1 };
+assert.equal(helpers.nativeAutotunePublicResultValidated(
+	nativePartialPairCompleteObservation), false,
+	'a complete pair observation cannot be relabelled as starved');
+const nativeRawFallbackPublic = nativeRawFallbackPublicFixture();
+Object.defineProperty(nativeRawFallbackPublic, '_native_target_state', {
+	value: 'absent_bootstrap', enumerable: false,
+});
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeRawFallbackPublic), true,
+	'a raw-only Review must expose one exact manual SQM-off option');
+const nativeMeasuredRawFallback = nativeRawFallbackPublicFixture();
+Object.assign(nativeMeasuredRawFallback.artifacts.raw_fallback.value, {
+	schema_version: 2,
+	reason: 'measured-shaped-search-inconclusive',
+	terminal_boundary: { kind: 'loaded_observation_starved', candidate_kbps: 724000 },
+});
+delete nativeMeasuredRawFallback.artifacts.raw_fallback.value.unobserved_candidates_kbps;
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeMeasuredRawFallback), true,
+	'a measured directional starvation may expose the exact manual no-SQM fallback');
+const nativePairExhaustedRawFallback = nativeRawFallbackPublicFixture();
+Object.assign(nativePairExhaustedRawFallback.artifacts.raw_fallback.value, {
+	schema_version: 3,
+	reason: 'shaped-pair-options-exhausted',
+	failed_direction: null,
+	terminal_boundary: { kind: 'pair_options_exhausted', candidate_count: 3 },
+});
+delete nativePairExhaustedRawFallback.artifacts.raw_fallback.value.unobserved_candidates_kbps;
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativePairExhaustedRawFallback), true,
+	'an exhausted shaped pair set may expose the exact manual no-SQM fallback');
+const nativePairExhaustedInventedDirection = JSON.parse(
+	JSON.stringify(nativePairExhaustedRawFallback));
+nativePairExhaustedInventedDirection.artifacts.raw_fallback.value.failed_direction = 'download';
+assert.equal(helpers.nativeAutotunePublicResultValidated(
+	nativePairExhaustedInventedDirection), false,
+	'pair exhaustion must not invent one failed direction');
+const nativeRawWithRate = nativeRawFallbackPublicFixture();
+nativeRawWithRate.public_apply_contract.options[0].target_rates_kbps.download = 900000;
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeRawWithRate), false,
+	'a disabled raw fallback must never invent a shaped target rate');
+const nativeRawMissingAck = nativeRawFallbackPublicFixture();
+nativeRawMissingAck.public_apply_contract.options[0].required_acknowledgements.pop();
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeRawMissingAck), false,
+	'the public raw evidence and exact mandatory acknowledgements must stay bound');
+const nativeRawWrongTopology = nativeRawFallbackPublicFixture();
+nativeRawWrongTopology.artifacts.raw_fallback.value.download.samples[0].topology = 'shaped_both';
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeRawWrongTopology), false,
+	'raw fallback cannot accept shaped evidence as a no-SQM control');
+const nativeRawInternalTopologyAlias = nativeRawFallbackPublicFixture();
+nativeRawInternalTopologyAlias.artifacts.raw_fallback.value.download.samples[0].topology =
+	'raw_download';
+nativeRawInternalTopologyAlias.artifacts.raw_fallback.value.download.samples[1].topology =
+	'raw_both';
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeRawInternalTopologyAlias), false,
+	'raw fallback must use the canonical public topology names emitted by Rust');
+const nativeCensoredPublic = nativeCensoredPublicFixture();
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeCensoredPublic), true,
+	'a count-and-coverage-bound transport deadline may remain an explicit manual Review');
+const nativePhysicalCapacityReview = nativePublicFixture();
+Object.assign(nativePhysicalCapacityReview.artifacts.pair_confirmation.value.options[0], {
+	physical_capacity_limited_review: { download: true, upload: false },
+	physical_capacity_alignment_confirmed: { download: true, upload: false },
+});
+nativePhysicalCapacityReview.public_apply_contract.options[0].required_acknowledgements = [
+	'download-capacity-retention',
+	'download-throughput-safety-floor',
+	'download-physical-capacity-limited',
+];
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativePhysicalCapacityReview), true,
+	'a repeatable physical-capacity ceiling must remain an explicit manual-only native Review');
+const nativePhysicalCapacityWithoutAcknowledgement = JSON.parse(
+	JSON.stringify(nativePhysicalCapacityReview));
+nativePhysicalCapacityWithoutAcknowledgement.public_apply_contract.options[0]
+	.required_acknowledgements.pop();
+assert.equal(helpers.nativeAutotunePublicResultValidated(
+	nativePhysicalCapacityWithoutAcknowledgement), false,
+	'the physical-capacity exception must retain its direction-specific acknowledgement');
+const nativeInventedPhysicalCapacityAcknowledgement = nativePublicFixture();
+nativeInventedPhysicalCapacityAcknowledgement.public_apply_contract.options[0]
+	.required_acknowledgements.push('download-physical-capacity-limited');
+assert.equal(helpers.nativeAutotunePublicResultValidated(
+	nativeInventedPhysicalCapacityAcknowledgement), false,
+	'a physical-capacity acknowledgement must be bound to exact pair evidence');
+const nativeUnalignedThroughputOverride = JSON.parse(JSON.stringify(nativePhysicalCapacityReview));
+nativeUnalignedThroughputOverride.artifacts.pair_confirmation.value.options[0]
+	.physical_capacity_alignment_confirmed.download = false;
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeUnalignedThroughputOverride), false,
+	'a sub-floor throughput acknowledgement must require independent wire/goodput alignment');
+const nativeAlignedWithoutCapacityOrigin = nativePublicFixture();
+nativeAlignedWithoutCapacityOrigin.artifacts.pair_confirmation.value.options[0]
+	.physical_capacity_alignment_confirmed.download = true;
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeAlignedWithoutCapacityOrigin), false,
+	'pair alignment cannot invent a physical-capacity-limited search origin');
+const nativePairAutoApplyMismatch = nativePublicFixture();
+nativePairAutoApplyMismatch.artifacts.pair_confirmation.value.auto_apply_pass = true;
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativePairAutoApplyMismatch), false,
+	'the pair summary cannot promote a manual primary option to Auto-Apply');
+const nativeCensoredWithoutAcknowledgement = nativeCensoredPublicFixture();
+nativeCensoredWithoutAcknowledgement.public_apply_contract.options[0].required_acknowledgements = [
+	'download-capacity-retention',
+];
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeCensoredWithoutAcknowledgement), false,
+	'a censored selected option must retain the measurement-confidence acknowledgement');
+const nativeCensoredShortCoverage = nativeCensoredPublicFixture();
+nativeCensoredShortCoverage.artifacts.pair_confirmation.value.transport_timeout_total_us = 14999999;
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeCensoredShortCoverage), false,
+	'three timeout flights without the exact cumulative coverage floor must fail closed');
+const nativeCensoredInventedTarget = nativeCensoredPublicFixture();
+nativeCensoredInventedTarget.artifacts.download_search.value.selected.target_met = true;
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeCensoredInventedTarget), false,
+	'a lower-bound timeout must never be presented as satisfying a latency target');
+const nativeCensoredUnshapedWin = nativeCensoredPublicFixture();
+Object.assign(nativeCensoredUnshapedWin.artifacts.topology_comparison.value.download, {
+	choice: 'unshaped',
+});
+Object.assign(nativeCensoredUnshapedWin.artifacts.topology_comparison.value.download.unshaped, {
+	transport_censored: true,
+	target_met: false,
+	measurement_reliable: false,
+	safety_pass: false,
+});
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeCensoredUnshapedWin), false,
+	'a censored raw direction must never win the topology comparison');
+const nativeManifestMismatch = nativePublicFixture();
+nativeManifestMismatch.public_apply_contract.source_review_sha256 = '0'.repeat(64);
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeManifestMismatch), false,
+	'the public confirmation contract must remain bound to the exact private Review digest');
+const nativeTopologyMismatch = nativePublicFixture();
+nativeTopologyMismatch.public_apply_contract.options[2].sqm_direction_mode = 'both';
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeTopologyMismatch), false,
+	'the public confirmation contract must match the selected native topology exactly');
+const nativeInjectedApplyValue = nativePublicFixture();
+nativeInjectedApplyValue.public_apply_contract.options[0].download_kbps = 1;
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeInjectedApplyValue), false,
+	'the browser confirmation contract must reject injected proposal values');
+const nativeRateMismatch = nativePublicFixture();
+nativeRateMismatch.public_apply_contract.options[0].target_rates_kbps.download = 723920;
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeRateMismatch), false,
+	'a transformed or mismatched pair target must fail closed');
+const nativeDuplicateOption = nativePublicFixture();
+nativeDuplicateOption.public_apply_contract.options[1].option_id = 'recommended';
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeDuplicateOption), false,
+	'duplicate option IDs must never create ambiguous Apply authority');
+const nativeMissingAcknowledgement = nativePublicFixture();
+nativeMissingAcknowledgement.public_apply_contract.options[0].required_acknowledgements = [];
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeMissingAcknowledgement), false,
+	'manual-review eligibility must remain bound to a non-empty acknowledgement list');
+const nativeUnknownAcknowledgement = nativePublicFixture();
+nativeUnknownAcknowledgement.public_apply_contract.options[0].required_acknowledgements = [ 'invented' ];
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeUnknownAcknowledgement), false,
+	'unknown native acknowledgement codes must fail closed');
+const nativeDuplicateAcknowledgement = nativePublicFixture();
+nativeDuplicateAcknowledgement.public_apply_contract.options[0].required_acknowledgements = [
+	'download-capacity-retention', 'download-capacity-retention',
+];
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeDuplicateAcknowledgement), false,
+	'duplicate native acknowledgement codes must fail closed');
+const nativeNoPreferredOption = nativePublicFixture();
+nativeNoPreferredOption.public_apply_contract.options[2].preferred = false;
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeNoPreferredOption), false,
+	'the bounded option set must retain one exact preferred option');
+const nativeInventedPair = nativePublicFixture();
+nativeInventedPair.public_apply_contract.options[1].target_rates_kbps = {
+	download: 710000,
+	upload: 915600,
+};
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeInventedPair), false,
+	'the browser must not cross-combine independently measured direction candidates');
+const nativeTransform = nativePublicFixture();
+nativeTransform.proposal_rate_transform = '0.8';
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeTransform), false,
+	'any second native proposal rate transform must fail closed');
+const nativeExtraArtifact = nativePublicFixture();
+nativeExtraArtifact.artifacts.unbound = { sha256: '0'.repeat(64), value: { schema_version: 1 } };
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeExtraArtifact), false,
+	'unbound public Review artifacts must fail closed');
+const nativeSelected = nativePublic.public_apply_contract.options[2];
+const nativeConfirmation = {
+	state: 'confirmation_ready',
+	apply_enabled: true,
+	validation_only: false,
+	runtime_attested: true,
+	already_applied: false,
+	job_id: nativePublic.native_job_id,
+	worker_run_id: nativePublic.run_id,
+	option_id: nativeSelected.option_id,
+	review_sha256: nativePublic.source_review_sha256,
+	source_manifest_sha256: nativeSelected.manifest_sha256,
+	manifest_sha256: nativeSelected.manifest_sha256,
+	manifest_schema_version: 4,
+	target_state: 'existing_managed',
+	required_acknowledgements: nativeSelected.required_acknowledgements.slice(),
+};
+assert.equal(helpers.nativeAutotuneApplyCheckValidated(
+	nativeConfirmation, nativePublic, nativeSelected), true,
+	'the Apply check must bind the source Review to one effective server manifest');
+assert.equal(helpers.nativeAutotuneApplyCheckValidated({
+	...nativeConfirmation, target_state: 'absent_bootstrap',
+}, nativePublic, nativeSelected), false,
+	'an absent target cannot reuse the existing-instance v4 manifest schema');
+assert.equal(helpers.nativeAutotuneApplyCheckValidated({
+	...nativeConfirmation, source_manifest_sha256: '0'.repeat(64),
+}, nativePublic, nativeSelected), false,
+	'the effective manifest must remain bound to the selected public source manifest');
+const nativeReceipt = {
+	state: 'applied',
+	configuration_written: true,
+	recovery_cleared: true,
+	job_id: nativePublic.native_job_id,
+	worker_run_id: nativePublic.run_id,
+	option_id: nativeSelected.option_id,
+	review_sha256: nativePublic.source_review_sha256,
+	source_manifest_sha256: nativeSelected.manifest_sha256,
+	manifest_sha256: nativeSelected.manifest_sha256,
+	manifest_schema_version: 4,
+	target_state: 'existing_managed',
+	acknowledged: nativeSelected.required_acknowledgements.slice(),
+};
+assert.equal(helpers.nativeAutotuneApplyReceiptValidated(
+	nativeReceipt, nativePublic, nativeSelected, nativeConfirmation), true,
+	'the native Apply receipt must bind the exact job, run, option, Review, manifest and ACK list');
+assert.equal(helpers.nativeAutotuneApplyReceiptValidated({
+	...nativeReceipt, manifest_sha256: '0'.repeat(64),
+}, nativePublic, nativeSelected, nativeConfirmation), false,
+	'a receipt for another manifest must never be accepted');
+assert.equal(helpers.nativeAutotuneApplyReceiptValidated({
+	...nativeReceipt, acknowledged: [],
+}, nativePublic, nativeSelected, nativeConfirmation), false,
+	'a receipt that omits a required acknowledgement must never be accepted');
+const nativeApplyTransportSource = source.slice(
+	source.indexOf('function runNativeAutotuneApply'),
+	source.indexOf('function runNativeAutotuneJob'));
+assert.match(nativeApplyTransportSource,
+	/\[ '--calibrationctl', 'autotune-apply-check', result\.native_job_id,\s*option\.option_id \]/,
+	'LuCI must obtain the effective server manifest before native Apply');
+assert.match(nativeApplyTransportSource,
+	/option\.option_id, result\.source_review_sha256, confirmation\.manifest_sha256 \]/,
+	'LuCI native Apply must send only identities and the server-confirmed effective manifest before ACK codes');
+assert.doesNotMatch(nativeApplyTransportSource, /target_rates|download_kbps|upload_kbps|uci\./,
+	'LuCI native Apply transport must never send browser rates or UCI values');
+
 let coldUiLookupCalled = false;
 assert.equal(helpers.formOrUci({
 	map: {},
@@ -295,7 +1023,7 @@ assert.equal(helpers.autotuneCalibrationStrategy({
 	throughput_reference_ul_p50_kbps: '10000',
 }), 'reuse_trusted', 'reuse-trusted must remain selected when both saved references exist');
 assert.match(source,
-	/'disabled': reuseAvailable \? null : 'disabled'[\s\S]*?Reuse current trusted bounds \(requires prior calibration\)/,
+	/'disabled': reuseAvailable && bootstrapRequired !== true \? null : 'disabled'[\s\S]*?Reuse current trusted bounds \(requires prior calibration\)/,
 	'the wizard must visibly disable reuse-trusted until prior calibration references exist');
 assert.match(source, /Simultaneous DL\+UL confirmation/,
 	'Review must expose the final simultaneous direction confirmation');
@@ -703,6 +1431,87 @@ async function testSequentialMultiwanTransactions() {
 		'rollback cleanup must revert both packages in the active browser RPC session');
 	assert.deepEqual(cacheEvents, [ [ 'unload', [ 'cake-autorate', 'sqm' ] ] ],
 		'rollback cleanup must unload the rejected local UCI cache before reload');
+
+	const dirtyGuard = compileHelpers({}, {
+		changes() {
+			return Promise.resolve({
+				'cake-autorate': [
+					[ 'set', 'wan_sqm', 'min_dl_shaper_rate_kbps', '620900' ],
+				],
+			});
+		},
+	}, {}, {
+		declare() { return () => Promise.resolve(0); },
+	});
+	await assert.rejects(
+		dirtyGuard.requireCleanUciTransaction('clean transaction required'),
+		/clean transaction required/,
+		'single-WAN Full Auto-Tune staging must stop before mixing with stale UCI deltas'
+	);
+
+	const disableMarker = {
+		job: 'wan_sqm',
+		target: 'pppoe-wan',
+		backend: 'speedtest-go',
+		routeMode: 'main',
+		member: '',
+		enabled: '0',
+		disableAdaptive: '0',
+		action: 'disable_sqm',
+		proposalId: `p-${'3'.repeat(24)}`,
+		fingerprint: `sha256:${'4'.repeat(64)}`,
+		token: '5'.repeat(64),
+		expires: '2000000000',
+		bootId: '11111111-2222-3333-4444-555555555555',
+	};
+	assert.doesNotThrow(() => helpers.validateAutotuneStagedTransaction([ disableMarker ], {
+		'cake-autorate': [
+			[ 'set', 'cake-autorate', 'wan_sqm', 'enabled', '0' ],
+			[ 'set', 'wan_sqm', 'sqm_enabled', '0' ],
+			[ 'set', 'wan_sqm', 'sqm_direction_mode', 'off' ],
+			[ 'set', 'wan_sqm', '_autotune_apply_guard', '1' ],
+			[ 'set', 'wan_sqm', '_autotune_apply_fingerprint', disableMarker.fingerprint ],
+			[ 'set', 'wan_sqm', '_autotune_apply_target', 'pppoe-wan' ],
+			[ 'set', 'wan_sqm', '_autotune_apply_backend', 'speedtest-go' ],
+			[ 'set', 'wan_sqm', '_autotune_apply_route_mode', 'main' ],
+			[ 'delete', 'wan_sqm', '_autotune_apply_mwan3_member' ],
+			[ 'set', 'wan_sqm', '_autotune_apply_enabled', '0' ],
+			[ 'set', 'wan_sqm', '_autotune_apply_disable_adaptive', '0' ],
+			[ 'set', 'wan_sqm', '_autotune_apply_action', 'disable_sqm' ],
+			[ 'set', 'wan_sqm', '_autotune_apply_proposal_id', disableMarker.proposalId ],
+			[ 'set', 'wan_sqm', '_autotune_apply_token', disableMarker.token ],
+			[ 'set', 'wan_sqm', '_autotune_apply_expires', '2000000000' ],
+			[ 'set', 'wan_sqm', '_autotune_apply_boot_id', disableMarker.bootId ],
+		],
+		sqm: [
+			[ 'add', 'sqm', 'cake_autorate_apply_guard', 'cake_autorate_apply_wan_sqm' ],
+			[ 'set', 'cake_autorate_apply_wan_sqm', '_autotune_apply_guard', '1' ],
+			[ 'set', 'cake_autorate_apply_wan_sqm', '_autotune_apply_job', 'wan_sqm' ],
+			[ 'set', 'cake_autorate_apply_wan_sqm', '_autotune_apply_fingerprint', disableMarker.fingerprint ],
+			[ 'set', 'cake_autorate_apply_wan_sqm', '_autotune_apply_token', disableMarker.token ],
+		],
+	}), 'the exact disable-SQM browser transaction must pass the client allowlist');
+	assert.throws(() => helpers.validateAutotuneStagedTransaction([ disableMarker ], {
+		'cake-autorate': [
+			[ 'set', 'wan_sqm', 'enabled', '0' ],
+			[ 'set', 'wan_sqm', 'sqm_enabled', '0' ],
+			[ 'set', 'wan_sqm', 'sqm_direction_mode', 'off' ],
+			[ 'set', 'wan_sqm', 'min_dl_shaper_rate_kbps', '620900' ],
+		],
+		sqm: [],
+	}), /unrelated CAKE change/,
+	'a stale shaped-proposal rate delta must never ride inside a disable-SQM transaction');
+	assert.throws(() => helpers.validateAutotuneStagedTransaction([ disableMarker ], {
+		'cake-autorate': [
+			[ 'set', 'wan_sqm', 'enabled', '0' ],
+			[ 'set', 'wan_sqm', 'sqm_enabled', '0' ],
+			[ 'set', 'wan_sqm', 'sqm_direction_mode', 'off' ],
+		],
+		sqm: [
+			[ 'set', 'cake_wan_sqm', 'enabled', '0' ],
+		],
+	}), /unrelated SQM change/,
+	'only the rollback guard marker may touch the SQM package before service apply');
 }
 
 assert.equal(helpers.topicTab('setup'), 'autorate');
@@ -726,6 +1535,9 @@ assert.equal(helpers.canonicalAutotuneProfile('unknown'), null);
 assert.deepEqual(helpers.autotuneProfileDefinitions().map(profile => profile.id),
 	[ 'gaming', 'gaming_extreme', 'best_overall', 'variable_link', 'fair' ]);
 assert.equal(helpers.autotuneProfileDefinitions()[1].hidden, true);
+assert.equal(helpers.autotuneProfileDefinitions().every(profile =>
+	/(?:no|without a) fixed/i.test(profile.description)), true,
+	'profile help must say that retention and exploration policy do not pre-cut the initial rate');
 assert.equal(helpers.autotuneProfilePolicy('gaming').sqm.classification, 'diffserv4');
 assert.equal(helpers.autotuneProfilePolicy('gaming').delayMaxMs, 5);
 assert.equal(helpers.autotuneProfilePolicy('gaming_extreme').retentionPercent, 70);
@@ -802,6 +1614,17 @@ assert.throws(() => helpers.autotuneAccessRequest({
 	service_ul_cap_kbps: '10000',
 }), /requires download and upload service caps between 100 and 100000000/,
 'fixed-cap Variable Link calibration must reject an unsupported tiny service cap');
+assert.throws(() => helpers.autotuneAccessRequest({
+	autotune_profile: 'best_overall', service_dl_cap_kbps: '100000',
+}, true), /Creating a native Auto-Tune instance requires download and upload service caps/,
+'bootstrap authority must require both caps for every profile, not only Variable Link');
+assert.deepEqual(helpers.autotuneAccessRequest({
+	autotune_profile: 'best_overall', service_dl_cap_kbps: '100000',
+	service_ul_cap_kbps: '50000',
+}, true), {
+	medium: 'unknown', source: 'legacy_default', confidence_percent: 0,
+	policy: '', service_dl_cap_kbps: '100000', service_ul_cap_kbps: '50000',
+}, 'ordinary profiles must preserve explicit bootstrap caps as policy authority');
 assert.equal(helpers.autotuneRunningRequestMatches({
 	state: 'running', job_id: 'wan_sqm', requested_target_interface: 'pppoe-wan',
 	requested_backend: 'speedtest-go', requested_route_mode: 'mwan3',
@@ -1267,9 +2090,24 @@ const validValidation = {
 		upload: cleanDirectionPhase('upload'),
 	},
 };
+const profileSearchReviewOptions = (candidateKbps, targetMet, grade, deltaMs) => [ {
+	role: 'recommended',
+	observation_index: 1,
+	candidate_kbps: candidateKbps,
+	conservative_achieved_kbps: candidateKbps,
+	worst_delta_ms: deltaMs,
+	grade,
+	controlled: true,
+	manual_reviewable: true,
+	target_met: targetMet,
+	capacity_objective_met: true,
+	auto_apply_candidate: targetMet,
+	direction_candidate_only: true,
+	pair_confirmation_required: true,
+} ];
 const profileSearchFor = (profile, targetGrade, retention, candidate, targetMet = true, action = 'complete') => ({
 	download: {
-		schema_version: 2,
+		schema_version: 3,
 		profile,
 		direction: 'download',
 		target_grade: targetGrade,
@@ -1285,6 +2123,8 @@ const profileSearchFor = (profile, targetGrade, retention, candidate, targetMet 
 			safety_pass: true,
 			target_met: targetMet,
 		},
+		review_options: profileSearchReviewOptions(candidate.download.base_kbps,
+			targetMet, targetMet ? 'A' : 'D', targetMet ? 10 : 220),
 		evaluated: [],
 		...(profile === 'gaming_extreme' ? {
 			exploration_minimum_kbps: Math.floor(candidate.download.base_kbps / 2),
@@ -1295,7 +2135,7 @@ const profileSearchFor = (profile, targetGrade, retention, candidate, targetMet 
 		} : {}),
 	},
 	upload: {
-		schema_version: 2,
+		schema_version: 3,
 		profile,
 		direction: 'upload',
 		target_grade: targetGrade,
@@ -1311,6 +2151,8 @@ const profileSearchFor = (profile, targetGrade, retention, candidate, targetMet 
 			safety_pass: true,
 			target_met: targetMet,
 		},
+		review_options: profileSearchReviewOptions(candidate.upload.base_kbps,
+			targetMet, targetMet ? 'A' : 'D', targetMet ? 10 : 220),
 		evaluated: [],
 		...(profile === 'gaming_extreme' ? {
 			exploration_minimum_kbps: Math.floor(candidate.upload.base_kbps / 2),
@@ -1392,6 +2234,20 @@ const bidirectionalConfirmationFor = (candidate, options = {}) => {
 	};
 };
 const baseBidirectionalConfirmation = bidirectionalConfirmationFor(proposal);
+const legacyRunId = 'd'.repeat(32);
+function legacyRunningFixture(overrides = {}) {
+	return {
+		state: 'running', run_id: legacyRunId, progress: 0,
+		job_id: 'wan_sqm', requested_target_interface: 'pppoe-wan',
+		requested_backend: 'speedtest-go', requested_route_mode: 'main',
+		requested_mwan3_member: '', requested_profile: 'best_overall',
+		requested_conservative: false, requested_calibration_strategy: 'shaped_only',
+		requested_access_medium: 'unknown', requested_access_source: 'legacy_default',
+		requested_access_confidence_percent: 0, requested_capacity_learning_policy: '',
+		requested_service_dl_cap_kbps: '', requested_service_ul_cap_kbps: '',
+		...overrides,
+	};
+}
 const validResult = {
 	state: 'complete',
 	job_id: 'wan_sqm',
@@ -1405,7 +2261,7 @@ const validResult = {
 	external_ip: '192.0.2.20',
 	schema_version: 8,
 	producer: 'cake-autorate-rs-autotune',
-	run_id: 'settings-test-run',
+	run_id: legacyRunId,
 	profile: 'best_overall',
 	result_class: 'trusted',
 	confidence: {
@@ -1467,6 +2323,14 @@ const validAttestation = {
 assert.equal(helpers.autotuneResultValidated(validResult), true);
 assert.equal(helpers.autotuneResultClass(validResult), 'trusted',
 	'a complete schema-8 confidence envelope must keep its trusted classification');
+const staleProfileSearchResult = structuredClone(validResult);
+staleProfileSearchResult.profile_search.download.schema_version = 2;
+assert.equal(helpers.autotuneProfileOutcomeValidated(staleProfileSearchResult), false,
+	'a stale direction-search schema must not satisfy the current profile outcome contract');
+const missingRecommendedSearchResult = structuredClone(validResult);
+delete missingRecommendedSearchResult.profile_search.download.review_options;
+assert.equal(helpers.autotuneProfileOutcomeValidated(missingRecommendedSearchResult), false,
+	'a terminal direction search without its recommended measured option must fail closed');
 const legacyConfidenceResult = {
 	...validResult,
 	schema_version: 7,
@@ -1755,13 +2619,69 @@ assert.equal(helpers.autotuneConservativeAvailable({
 }), true, 'measured throughput contamination may retain explicit conservative review');
 const acceptedWan = {
 	decision: 'accepted', uncalibrated: false,
+	plan: { name: 'wan_sqm' },
 	state: { autotune_profile: 'gaming', autotune_result: validResult },
 };
 const skippedWan = {
 	decision: 'skipped', uncalibrated: true,
+	plan: { name: 'wanb_sqm' },
 	state: { autotune_profile: 'fair', autotune_result: null },
 };
+const nativeMultiwanResult = nativePublicFixture();
+Object.defineProperty(nativeMultiwanResult, '_native_target_state', {
+	value: 'absent_bootstrap', enumerable: false,
+});
+const nativeAcceptedWan = {
+	decision: 'accepted', uncalibrated: false,
+	plan: { name: 'wanc_sqm' },
+	state: { autotune_profile: 'variable_link', autotune_diagnostics: nativeMultiwanResult },
+	diagnostics: nativeMultiwanResult,
+	native_apply_receipt: {
+		...nativeReceipt,
+		target_state: 'absent_bootstrap',
+		manifest_schema_version: 7,
+	},
+};
 assert.equal(helpers.multiwanAutotuneItemAccepted(acceptedWan), true);
+assert.equal(helpers.multiwanAutotuneItemNativeApplied(nativeAcceptedWan), true);
+assert.equal(helpers.multiwanAutotuneItemAccepted(nativeAcceptedWan), true,
+	'a strictly validated bootstrap receipt must count as the per-uplink Accept decision');
+assert.equal(helpers.multiwanAutotuneItemNativeApplied({
+	...nativeAcceptedWan,
+	native_apply_receipt: { ...nativeAcceptedWan.native_apply_receipt, manifest_schema_version: 8 },
+}), false, 'a shaped bootstrap result must not accept the raw/no-SQM manifest schema');
+const nativeRawMultiwanResult = nativeRawFallbackPublicFixture();
+Object.defineProperty(nativeRawMultiwanResult, '_native_target_state', {
+	value: 'absent_bootstrap', enumerable: false,
+});
+const nativeRawAcceptedWan = {
+	decision: 'accepted', uncalibrated: false,
+	plan: { name: 'wand_sqm' },
+	state: { autotune_profile: 'variable_link', autotune_diagnostics: nativeRawMultiwanResult },
+	diagnostics: nativeRawMultiwanResult,
+	native_apply_receipt: {
+		...nativeReceipt,
+		job_id: nativeRawMultiwanResult.native_job_id,
+		worker_run_id: nativeRawMultiwanResult.run_id,
+		target_state: 'absent_bootstrap',
+		manifest_schema_version: 8,
+	},
+};
+assert.equal(helpers.multiwanAutotuneItemNativeApplied(nativeRawAcceptedWan), true,
+	'a validated raw/no-SQM bootstrap receipt must use schema 8 and count as already applied');
+assert.equal(helpers.multiwanAutotuneItemNativeApplied({
+	...nativeRawAcceptedWan,
+	native_apply_receipt: { ...nativeRawAcceptedWan.native_apply_receipt, manifest_schema_version: 7 },
+}), false, 'a raw/no-SQM bootstrap result must not accept the shaped manifest schema');
+assert.deepEqual(helpers.multiwanAutotunePendingPlans([
+	{ name: 'wan_sqm' }, { name: 'wanb_sqm' }, { name: 'wanc_sqm' }, { name: 'wand_sqm' },
+], [ acceptedWan, skippedWan, nativeAcceptedWan, nativeRawAcceptedWan ]).map(plan => plan.name),
+[ 'wan_sqm', 'wanb_sqm' ],
+'already-created shaped and raw/no-SQM native instances must be removed from the final conflict/staging set');
+assert.deepEqual(helpers.multiwanAutotunePendingStagedApplyItems([
+	acceptedWan, skippedWan, nativeAcceptedWan, nativeRawAcceptedWan,
+]), [ acceptedWan ],
+'final sequential staging must contain neither skipped nor either kind of already-applied native item');
 assert.equal(helpers.multiwanAutotuneItemDecided(skippedWan), true);
 assert.equal(helpers.multiwanAutotuneBatchDecided([ acceptedWan, skippedWan ]), true,
 	'independent profiles and Accept/Skip decisions must complete the batch');
@@ -1866,7 +2786,7 @@ const variableProposal = {
 const variableDirection = (direction, noCakeEffect) => {
 	const rate = variableProposal[direction].base_kbps;
 	return {
-		schema_version: 2,
+		schema_version: 3,
 		profile: 'variable_link',
 		direction,
 		target_grade: 'B',
@@ -1882,6 +2802,10 @@ const variableDirection = (direction, noCakeEffect) => {
 			safety_pass: true,
 			target_met: true,
 		},
+		review_options: [ {
+			...profileSearchReviewOptions(rate, true, 'B', 30)[0],
+			auto_apply_candidate: !noCakeEffect,
+		} ],
 		exploration_minimum_kbps: Math.floor(rate * 0.35),
 		runtime_minimum_kbps: rate,
 		runtime_minimum_observation_index: 1,
@@ -2830,6 +3754,10 @@ assert.equal(helpers.autotuneResultReviewable(fairComputeCeiling, 'disable_sqm')
 	'a clean no-SQM comparison may support explicit disable after a proven compute ceiling');
 assert.equal(helpers.autotuneDefaultReviewAction(fairComputeCeiling), 'keep_current',
 	'an unsafe compute-ceiling candidate must default to the non-writing action');
+const staleFairComputeCeiling = structuredClone(fairComputeCeiling);
+staleFairComputeCeiling.profile_search.download.schema_version = 2;
+assert.equal(helpers.autotuneResultReviewable(staleFairComputeCeiling, 'disable_sqm'), false,
+	'a stale direction-search schema must not authorize the Fair no-SQM alternative');
 assert.equal(helpers.autotuneResultReviewable({
 	...fairComputeCeiling,
 	profile_search: {
@@ -3103,7 +4031,7 @@ assert.throws(() => helpers.writeWizardConfig('invalid_uncalibrated', {
 	...disabledFallback,
 	autotune_result: validResult,
 	autotune_proposal: proposal,
-}, true), /Invalid disabled, uncalibrated Multi-WAN fallback state/,
+}, true), /Invalid disabled, uncalibrated fallback state/,
 	'a disabled fallback must never carry a stale proposal');
 
 const stableProposal = {
@@ -3211,6 +4139,24 @@ fixtureSections['cake-autorate'] = [
 ];
 assert.match(helpers.wizardPlanConflicts(plans, true).join(' '), /old_wanb.*eth0/);
 assert.equal(helpers.managedUplinkOwner(mwan3.byName.wanb), 'old_wanb');
+assert.equal(helpers.managedTargetOwner('eth0'), 'old_wanb');
+assert.equal(helpers.managedTargetOwner('eth0', 'old_wanb'), '',
+	'a rerun must retain authority to select its own target');
+assert.match(helpers.targetInterfaceChoiceOptions().find(option => option[0] === 'eth0')[1],
+	/already managed by instance "old_wanb"/,
+	'an occupied target remains visible but must identify its exact owner');
+assert.match(helpers.wizardSingleTargetConflicts({
+	name: 'new_wanb', wan_if: 'eth0', enabled: true,
+}).join(' '), /old_wanb.*eth0/,
+	'a new single-WAN wizard must reject an occupied target before calibration');
+assert.deepEqual(helpers.wizardSingleTargetConflicts({
+	name: 'old_wanb', wan_if: 'eth0', enabled: true,
+}, 'old_wanb'), [], 'a rerun must not conflict with itself');
+fixtureSections['cake-autorate'][0].manage_sqm = '0';
+assert.deepEqual(helpers.wizardSingleTargetConflicts({
+	name: 'new_wanb', wan_if: 'eth0', enabled: true,
+}), [], 'an instance with manage_sqm=0 owns no CAKE target');
+fixtureSections['cake-autorate'][0].manage_sqm = '1';
 assert.deepEqual(helpers.availableMwan3Uplinks().map(member => member.name), [ 'wan' ],
 	'an uplink already reserved by another instance must not be selectable again');
 assert.deepEqual(helpers.availableMwan3Uplinks('old_wanb').map(member => member.name),
@@ -3218,10 +4164,56 @@ assert.deepEqual(helpers.availableMwan3Uplinks('old_wanb').map(member => member.
 const duplicatePlans = [ plans[0], { ...plans[1], name: 'primary_sqm' } ];
 assert.match(helpers.wizardPlanConflicts(duplicatePlans, false).join(' '), /duplicated/);
 
+const savedCakeSections = fixtureSections['cake-autorate'];
+helpers.setInterfaceContext({
+	deviceNames: { eth0: true, eth1: true, eth2: true, 'br-lan': true },
+	deviceNetworks: { eth1: [ 'wan' ], eth2: [ 'wan2' ], 'br-lan': [ 'lan' ] },
+	devicePhysical: {},
+	networkDevices: { wan: 'eth1', wan2: 'eth2', lan: 'br-lan' },
+	defaultDevice: 'eth1',
+});
+fixtureSections['cake-autorate'] = [
+	{ '.name': 'existing_wan', enabled: '1', manage_sqm: '1', wan_if: 'eth1' },
+	{ '.name': 'existing_lan', enabled: '1', manage_sqm: '1', wan_if: 'br-lan' },
+];
+helpers.setMwan3Context({
+	members: [ { name: 'wan2', device: 'eth2', label: 'wan2 — eth2' } ],
+	byName: { wan2: { name: 'wan2', device: 'eth2', label: 'wan2 — eth2' } },
+});
+assert.equal(helpers.defaultWizardTarget(), 'eth2',
+	'a new wizard must prefer a free configured uplink over an unconfigured raw device');
+assert.deepEqual(helpers.targetInterfaceChoices(), [ 'eth1', 'br-lan', 'eth0', 'eth2' ],
+	'occupied targets remain visible so the validation error is explicit rather than hidden');
+fixtureSections['cake-autorate'] = savedCakeSections;
+helpers.setMwan3Context(mwan3);
+helpers.setInterfaceContext({
+	deviceNames: { 'pppoe-wan': true, eth0: true },
+	deviceNetworks: { 'pppoe-wan': [ 'wan', 'wan6' ], eth0: [ 'wanb', 'wanb6' ] },
+	devicePhysical: { 'pppoe-wan': 'eth2' },
+	networkDevices: { wan: 'pppoe-wan', wan6: 'pppoe-wan', wanb: 'eth0', wanb6: 'eth0' },
+	defaultDevice: 'pppoe-wan',
+});
+
 assert.doesNotMatch(source, /state\.multiwan_set = multiwan\.checked;[\s\S]{0,120}state\.mode = 'manual'/,
 	'enabling Multi-WAN must not silently replace Full Auto-Tune with Manual');
+assert.match(source, /autotune_calibration_strategy: rerun \? 'shaped_only' : 'full_raw'/,
+	'a new instance must default to the only bootstrap strategy with raw-capacity authority');
+assert.match(source, /speedtest_backend: rerun \? 'auto' : 'speedtest-go'/,
+	'a new instance must default to the native backend instead of the shell auto selector');
+assert.match(source,
+	/function validateStep\(step\)[\s\S]*?step === 0[\s\S]*?wizardSingleTargetConflicts\(state,[\s\S]*?return false;/,
+	'an occupied single-WAN target must be rejected while leaving the Interface step, before any calibration RPC');
+assert.match(source, /nativeBootstrapCapacityControl\(itemState, rerun/,
+	'each sequential Multi-WAN item must request its own explicit service caps');
+assert.match(source, /Skip calibration and create disabled/,
+	'a new single-WAN native Review must retain the requested uncalibrated fallback');
+assert.match(source,
+	/state\.native_autotune_skipped = true;[\s\S]*?state\.enabled = false;[\s\S]*?state\.sqm_enabled = false;/,
+	'the single-WAN Skip path must be explicit disabled state, not an implicit default proposal');
+assert.match(source, /uncalibrated: state\.native_autotune_skipped === true/,
+	'final staging must persist the skipped native instance as uncalibrated');
 assert.match(source, /Create and calibrate every unused detected uplink sequentially/);
-assert.match(source, /runAutotuneJob\(item\.plan\.name, item\.plan\.device/,
+assert.match(source, /runPreferredAutotuneJob\(item\.plan\.name, item\.plan\.device/,
 	'batch Auto-Tune must launch one route-bound job per uplink instead of cloning one proposal');
 assert.match(source, /item\.state\.enabled = false;[\s\S]*item\.state\.sqm_enabled = false;/,
 	'failed batch members must remain disabled and uncalibrated');
@@ -3287,13 +4279,38 @@ async function testAutotuneTerminalPrecedence() {
 	const previousWindow = global.window;
 	let timerDelays = [];
 	global.window = { setTimeout(resolve, delayMs) { timerDelays.push(delayMs); resolve(); } };
+	const legacyRpcArgs = call => call.command === '/usr/libexec/cake-autorate-rs/rpcd-helper' ?
+		call.args.slice(1) : call.args;
 
 	function pollingHelpers(payloads, calls) {
 		return compileHelpers({
 			exec(command, args) {
 				calls.push({ command, args });
 				assert(payloads.length, 'unexpected extra Auto-Tune poll');
-				return Promise.resolve({ stdout: JSON.stringify(payloads.shift()) });
+				let payload = payloads.shift();
+				const legacyArgs = command === '/usr/libexec/cake-autorate-rs/rpcd-helper' ?
+					args.slice(1) : args;
+				if (payload && typeof payload === 'object' && !Array.isArray(payload) &&
+				    [ 'start', 'start-conservative', 'status-summary', 'result', 'cancel' ].includes(legacyArgs[2])) {
+					payload = { ...payload, run_id: payload.run_id || legacyRunId };
+					if ((legacyArgs[2] === 'start' || legacyArgs[2] === 'start-conservative') && payload.state === 'running') {
+						payload = {
+							job_id: legacyArgs[0], requested_target_interface: legacyArgs[1],
+							requested_backend: legacyArgs[3], requested_route_mode: legacyArgs[4] || '',
+							requested_mwan3_member: legacyArgs[5] || '', requested_profile: legacyArgs[6],
+							requested_conservative: legacyArgs[2] === 'start-conservative',
+							requested_calibration_strategy: legacyArgs[10] || 'shaped_only',
+							requested_access_medium: legacyArgs[11] || 'unknown',
+							requested_access_source: legacyArgs[12] || 'legacy_default',
+							requested_access_confidence_percent: Number(legacyArgs[13] || 0),
+							requested_capacity_learning_policy: legacyArgs[14] || '',
+							requested_service_dl_cap_kbps: legacyArgs[15] || '',
+							requested_service_ul_cap_kbps: legacyArgs[16] || '',
+							...payload,
+						};
+					}
+				}
+				return Promise.resolve({ stdout: JSON.stringify(payload) });
 			},
 		});
 	}
@@ -3305,13 +4322,13 @@ async function testAutotuneTerminalPrecedence() {
 			'wan_sqm', 'pppoe-wan', 'speedtest-go', validResult, 'main', ''), validResult);
 		assert.deepEqual(freshCalls, [
 			{
-				command: '/usr/libexec/cake-autorate-rs/autotune',
-				args: [ 'wan_sqm', 'pppoe-wan', 'status', 'speedtest-go',
+				command: '/usr/libexec/cake-autorate-rs/rpcd-helper',
+				args: [ 'autotune-status', 'wan_sqm', 'pppoe-wan', 'status', 'speedtest-go',
 					'main', '', 'best_overall' ],
 			},
 			{
-				command: '/usr/libexec/cake-autorate-rs/autotune',
-				args: [ 'wan_sqm', 'pppoe-wan', 'attest', 'speedtest-go',
+				command: '/usr/libexec/cake-autorate-rs/rpcd-helper',
+				args: [ 'autotune-attest', 'wan_sqm', 'pppoe-wan', 'attest', 'speedtest-go',
 					'main', '', 'best_overall' ],
 			},
 		], 'proposal staging must re-read the terminal result and recompute live UCI/route identity');
@@ -3450,7 +4467,7 @@ async function testAutotuneTerminalPrecedence() {
 		assert.deepEqual(completed, validResult);
 		assert.deepEqual(successProgress, [ 87 ]);
 		assert.equal(successCalls.length, 3);
-		assert.deepEqual(successCalls[0].args.slice(8), [ '', '0', 'shaped_only',
+		assert.deepEqual(legacyRpcArgs(successCalls[0]).slice(8), [ '', '0', 'shaped_only',
 			'unknown', 'legacy_default', '0', '', '', '' ],
 			'manual Auto-Tune must pass explicit traffic, strategy, and access-context arguments');
 
@@ -3464,14 +4481,15 @@ async function testAutotuneTerminalPrecedence() {
 		], compactCalls);
 		assert.deepEqual(await compactHelpers.runAutotuneJob(
 			'wan_sqm', 'pppoe-wan', 'speedtest-go', null), validResult);
-		assert.deepEqual(compactCalls.map(call => call.args[2]),
+		assert.deepEqual(compactCalls.map(call => legacyRpcArgs(call)[2]),
 			[ 'start', 'status-summary', 'result' ],
 			'a compact terminal poll must fetch the large result exactly once');
 
 		timerDelays = [];
 		const timeoutCalls = [];
 		const matchingRunning = {
-			state: 'running', job_id: 'wan_sqm', requested_target_interface: 'pppoe-wan',
+			state: 'running', run_id: legacyRunId,
+			job_id: 'wan_sqm', requested_target_interface: 'pppoe-wan',
 			requested_backend: 'speedtest-go', requested_route_mode: '',
 			requested_mwan3_member: '', requested_profile: 'best_overall',
 			requested_conservative: false, requested_calibration_strategy: 'shaped_only',
@@ -3481,6 +4499,7 @@ async function testAutotuneTerminalPrecedence() {
 		};
 		const timeoutPayloads = [ matchingRunning, {
 			state: 'complete', terminal_available: true, terminal_kind: 'result',
+			run_id: legacyRunId,
 			runtime_restored: true, recovery_pending: false,
 		}, validResult ];
 		let firstStart = true;
@@ -3497,7 +4516,7 @@ async function testAutotuneTerminalPrecedence() {
 		});
 		assert.deepEqual(await timeoutHelpers.runAutotuneJob(
 			'wan_sqm', 'pppoe-wan', 'speedtest-go', null), validResult);
-		assert.deepEqual(timeoutCalls.map(call => call.args[2]),
+		assert.deepEqual(timeoutCalls.map(call => legacyRpcArgs(call)[2]),
 			[ 'start', 'status-summary', 'status-summary', 'result' ],
 			'an ambiguous start timeout must reattach only through the exact request identity');
 
@@ -3505,22 +4524,39 @@ async function testAutotuneTerminalPrecedence() {
 		const cancelCalls = [];
 		const cancelledTerminal = {
 			state: 'cancelled',
+			run_id: legacyRunId,
 			error: 'Full Auto-Tune was cancelled; no configuration was written.',
 			runtime_restored: true,
 			recovery_pending: false,
 		};
 		const cancelHelpers = pollingHelpers([
-			{ state: 'cancelling', runtime_restored: false, recovery_pending: true },
+			{ state: 'cancelling', run_id: legacyRunId,
+				runtime_restored: false, recovery_pending: true },
 			cancelledTerminal,
 		], cancelCalls);
+		cancelHelpers.setLegacyAutotuneJob('wan_sqm', legacyRunId);
 		assert.deepEqual(await cancelHelpers.cancelAutotuneJob(
 			'wan_sqm', 'pppoe-wan', 'speedtest-go', 'best_overall', 'mwan3', 'wan'),
 		cancelledTerminal, 'user cancellation must wait for runtime restoration and return neutrally');
-		assert.deepEqual(cancelCalls.map(call => call.args), [
+		assert.deepEqual(cancelCalls.map(legacyRpcArgs), [
 			[ 'wan_sqm', 'pppoe-wan', 'cancel', 'speedtest-go', '', '', 'best_overall' ],
 			[ 'wan_sqm', 'pppoe-wan', 'status-summary', 'speedtest-go', 'mwan3', 'wan', 'best_overall' ],
 		]);
 		assert.deepEqual(timerDelays, [ 2000 ]);
+		await assert.rejects(cancelHelpers.cancelAutotuneJob(
+			'wan_sqm', 'pppoe-wan', 'speedtest-go', 'best_overall', 'mwan3', 'wan'),
+			/still registering/,
+			'a settled cancellation must consume its authenticated legacy handle');
+
+		const mismatchedCancelHelpers = pollingHelpers([
+			{ state: 'cancelling', run_id: 'e'.repeat(32),
+				runtime_restored: false, recovery_pending: true },
+		], []);
+		mismatchedCancelHelpers.setLegacyAutotuneJob('wan_sqm', legacyRunId);
+		await assert.rejects(mismatchedCancelHelpers.cancelAutotuneJob(
+			'wan_sqm', 'pppoe-wan', 'speedtest-go', 'best_overall', 'mwan3', 'wan'),
+			/different calibration run/,
+			'legacy cancellation must never accept restored evidence from another generation');
 
 		timerDelays = [];
 		const delayedResultCalls = [];
@@ -3587,6 +4623,355 @@ async function testAutotuneTerminalPrecedence() {
 			'recovery polling must stop at its deterministic bound');
 		assert.deepEqual(timerDelays,
 			[ 1000, 2000, 4000, 5000, 5000, 5000, 5000, 5000, 5000, 5000, 5000, 5000 ]);
+	}
+	finally {
+		if (previousWindow === undefined)
+			delete global.window;
+		else
+			global.window = previousWindow;
+	}
+}
+
+async function testNativeAutotuneTransport() {
+	const previousWindow = global.window;
+	const delays = [];
+	global.window = { setTimeout(resolve, delayMs) { delays.push(delayMs); resolve(); } };
+	const publicJobId = 'b'.repeat(32);
+	const capability = {
+		state: 'idle',
+		protocol_version: 2,
+		admission_enabled: true,
+		native_full_autotune: true,
+		native_bootstrap_autotune: true,
+		native_public_result_version: 4,
+	};
+	const access = {
+		medium: 'cellular',
+		source: 'user_selected',
+		confidence_percent: 100,
+		policy: 'scheduled_active',
+		service_dl_cap_kbps: '1000000',
+		service_ul_cap_kbps: '500000',
+	};
+
+	try {
+		assert.equal(helpers.nativeAutotuneCapabilityValidated(capability), true);
+		assert.equal(helpers.nativeBootstrapAutotuneCapabilityValidated(capability), true);
+		assert.equal(helpers.nativeAutotuneCapabilityValidated({
+			...capability,
+			admission_enabled: false,
+		}), false, 'native routing must remain dormant until admission is explicitly advertised');
+
+		const launchArgs = helpers.nativeAutotuneLaunchArgs(
+			'wan_sqm', 'pppoe-wan', 'speedtest-go', 'main', '',
+			'variable_link', true, 'full_raw', access, true, 'cake_wan_sqm');
+		assert.deepEqual(launchArgs.slice(0, 2), [ '--calibrationctl', 'autotune-start' ]);
+		assert.equal(launchArgs[launchArgs.indexOf('--traffic-budget-bytes') + 1], '32000000000',
+			'interactive native calibration must always carry the hard traffic budget');
+		assert(launchArgs.includes('--allow-sqm-disable'));
+		assert(launchArgs.includes('--allow-active-traffic'));
+		assert(!launchArgs.includes('--mwan3-member'),
+			'main routing must not carry an empty mwan3 member');
+		assert(!launchArgs.some(arg => /token|fingerprint|job-id/i.test(arg)),
+			'LuCI launch intent must contain no capability, job ID, or attestation hash');
+		const bootstrapLaunchArgs = helpers.nativeAutotuneLaunchArgs(
+			'new_sqm', 'eth1', 'speedtest-go', 'main', '',
+			'best_overall', false, 'full_raw', access, false, 'cake_new_sqm');
+		assert.deepEqual(bootstrapLaunchArgs.slice(0, 3),
+			[ '--calibrationctl', 'autotune-bootstrap-start', 'cake_new_sqm' ]);
+		assert.equal(helpers.nativeAutotuneIntentSupported(
+			'speedtest-go', 'main', false, 'full_raw', access), true);
+		assert.equal(helpers.nativeAutotuneIntentSupported(
+			'speedtest-go', 'main', false, 'shaped_only', access), false,
+			'a missing managed baseline must never enter shaped-only bootstrap');
+
+		const bootstrapManifest = 'a'.repeat(64);
+		const bootstrapApplyResult = nativePublicFixture();
+		Object.defineProperty(bootstrapApplyResult, '_native_target_state', {
+			value: 'absent_bootstrap', enumerable: false,
+		});
+		const bootstrapConfirmation = {
+			...nativeConfirmation,
+			target_state: 'absent_bootstrap',
+			manifest_schema_version: 7,
+			manifest_sha256: bootstrapManifest,
+		};
+		const bootstrapReceipt = {
+			...nativeReceipt,
+			target_state: 'absent_bootstrap',
+			manifest_schema_version: 7,
+			manifest_sha256: bootstrapManifest,
+		};
+		const applyCalls = [];
+		const applyPayloads = [ bootstrapConfirmation, bootstrapReceipt ];
+		const applyHelpers = compileHelpers({
+			exec(command, args) {
+				applyCalls.push({ command, args });
+				return Promise.resolve({ stdout: JSON.stringify(applyPayloads.shift()) });
+			},
+		});
+		assert.deepEqual(await applyHelpers.runNativeAutotuneApply(
+			bootstrapApplyResult, nativeSelected),
+			bootstrapReceipt);
+		assert.deepEqual(applyCalls.map(call => call.args.slice(0, 2)), [
+			[ '--calibrationctl', 'autotune-apply-check' ],
+			[ '--calibrationctl', 'autotune-apply' ],
+		]);
+		assert.equal(applyCalls[1].args[5], bootstrapManifest,
+			'Apply must use the effective v7 manifest returned by the server check');
+
+		const nativeCalls = [];
+		const nativePayloads = [
+			capability,
+			{ state: 'queued', job_id: publicJobId },
+			{ state: 'review_ready', job_id: publicJobId,
+				runtime_mutated: false, recovery_required: false },
+			nativePublic,
+		];
+		const nativeHelpers = compileHelpers({
+			exec(command, args) {
+				nativeCalls.push({ command, args });
+				assert(nativePayloads.length, 'unexpected native transport request');
+				return Promise.resolve({ stdout: JSON.stringify(nativePayloads.shift()) });
+			},
+		});
+		const nativeResult = await nativeHelpers.runPreferredAutotuneJob(
+			'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '',
+			'variable_link', false, 'full_raw', access, true);
+		assert.deepEqual(nativeResult, nativePublic);
+		assert.deepEqual(nativeCalls.map(call => [ call.command, call.args.slice(0, 2) ]), [
+			[ '/usr/sbin/cake-autorated', [ '--calibrationctl', 'summary' ] ],
+			[ '/usr/sbin/cake-autorated', [ '--calibrationctl', 'autotune-start' ] ],
+			[ '/usr/sbin/cake-autorated', [ '--calibrationctl', 'autotune-status' ] ],
+			[ '/usr/sbin/cake-autorated', [ '--calibrationctl', 'autotune-result' ] ],
+		], 'advertised native capability must route the whole authenticated lifecycle through Rust');
+		assert(!nativeCalls.some(call => call.command.endsWith('/autotune')),
+			'a native start must never be followed by a legacy helper launch');
+
+		const recoveryCalls = [];
+		const recoveryHelpers = compileHelpers({
+			exec(command, args) {
+				recoveryCalls.push({ command, args });
+				return Promise.resolve({ stdout: JSON.stringify({
+					...capability,
+					state: 'recovery_required',
+					admission_enabled: false,
+				}) });
+			},
+		});
+		await assert.rejects(recoveryHelpers.runPreferredAutotuneJob(
+			'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '',
+			'best_overall', false, 'shaped_only', null, true),
+			/restoring an earlier runtime transaction/);
+		assert.equal(recoveryCalls.length, 1);
+		assert.equal(recoveryCalls[0].command, '/usr/sbin/cake-autorated');
+		assert(!recoveryCalls.some(call => call.command.endsWith('/autotune')),
+			'native recovery must fail closed instead of launching the legacy mutator');
+
+		const bootstrapCalls = [];
+		const bootstrapResult = nativePublicFixture();
+		bootstrapResult.job_id = 'new_sqm';
+		bootstrapResult.target_interface = 'eth1';
+		bootstrapResult.resolved_interface = 'eth1';
+		bootstrapResult.profile = 'best_overall';
+		bootstrapResult.artifacts.proposal.value.profile = 'best_overall';
+		bootstrapResult.artifacts.download_search.value.profile = 'best_overall';
+		bootstrapResult.artifacts.upload_search.value.profile = 'best_overall';
+		const bootstrapPayloads = [
+			capability,
+			{ state: 'queued', job_id: publicJobId },
+			{ state: 'review_ready', job_id: publicJobId,
+				runtime_mutated: false, recovery_required: false },
+			bootstrapResult,
+		];
+		const bootstrapHelpers = compileHelpers({
+			exec(command, args) {
+				bootstrapCalls.push({ command, args });
+				return Promise.resolve({ stdout: JSON.stringify(bootstrapPayloads.shift()) });
+			},
+		});
+		const bootstrapResultReturned = await bootstrapHelpers.runPreferredAutotuneJob(
+			'new_sqm', 'eth1', 'speedtest-go', null, 'main', '',
+			'best_overall', false, 'full_raw', access, false, 'cake_new_sqm');
+		assert.deepEqual(bootstrapResultReturned, bootstrapResult);
+		assert(bootstrapCalls.every(call => call.command === '/usr/sbin/cake-autorated'),
+			'new/unpersisted native instances must never launch the shell bootstrap mutator');
+		assert.deepEqual(bootstrapCalls.map(call => call.args.slice(0, 3)), [
+			[ '--calibrationctl', 'summary' ],
+			[ '--calibrationctl', 'autotune-bootstrap-start', 'cake_new_sqm' ],
+			[ '--calibrationctl', 'autotune-status', publicJobId ],
+			[ '--calibrationctl', 'autotune-result', publicJobId ],
+		], 'new-instance calibration must use the exact Rust bootstrap lifecycle');
+
+		const timeoutCalls = [];
+		const timeoutHelpers = compileHelpers({
+			exec(command, args) {
+				timeoutCalls.push({ command, args });
+				if (args[1] === 'summary')
+					return Promise.resolve({ stdout: JSON.stringify(capability) });
+				return Promise.reject(new Error('XHR request timed out'));
+			},
+		});
+		await assert.rejects(timeoutHelpers.runPreferredAutotuneJob(
+			'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '',
+			'variable_link', false, 'full_raw', access, true), err => {
+			assert.equal(err.nativeAutotuneStartAttempted, true);
+			return true;
+		});
+		assert.equal(timeoutCalls.length, 2,
+			'an ambiguous native start timeout must not retry with the legacy mutating backend');
+
+		const mismatched = nativePublicFixture();
+		mismatched.target_interface = 'eth9';
+		assert.equal(helpers.nativeAutotunePublicResultValidated(mismatched), true,
+			'the public schema alone deliberately does not know the active dialog');
+		assert.equal(helpers.nativeAutotuneResultMatchesRequest(mismatched, publicJobId,
+			'wan_sqm', 'pppoe-wan', 'main', '', 'variable_link', 'full_raw'), false,
+			'the transport must independently bind a valid public result to the active dialog');
+		const mismatchPayloads = [ capability,
+			{ state: 'queued', job_id: publicJobId },
+			{ state: 'review_ready', job_id: publicJobId,
+				runtime_mutated: false, recovery_required: false },
+			mismatched ];
+		const mismatchHelpers = compileHelpers({
+			exec() {
+				assert(mismatchPayloads.length, 'an invalid terminal result must not trigger another RPC');
+				return Promise.resolve({ stdout: JSON.stringify(mismatchPayloads.shift()) });
+			},
+		});
+		await assert.rejects(mismatchHelpers.runPreferredAutotuneJob(
+			'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '',
+			'variable_link', false, 'full_raw', access, true),
+			/no longer matches this calibration request/);
+		await assert.rejects(mismatchHelpers.cancelPreferredAutotuneJob(
+			'wan_sqm', 'pppoe-wan', 'speedtest-go', 'variable_link', 'main', ''),
+			/No authenticated native calibration handle/,
+			'a terminal invalid result must not leave a stale cancellable native handle');
+
+		delays.length = 0;
+		const cancelCalls = [];
+		const cancelPayloads = [
+			{ state: 'cancelling', job_id: publicJobId,
+				runtime_mutated: true, recovery_required: false },
+			{ state: 'recovering', job_id: publicJobId,
+				runtime_mutated: true, recovery_required: true },
+			{ state: 'cancelled', job_id: publicJobId,
+				runtime_mutated: false, recovery_required: false },
+		];
+		const cancelHelpers = compileHelpers({
+			exec(command, args) {
+				cancelCalls.push({ command, args });
+				return Promise.resolve({ stdout: JSON.stringify(cancelPayloads.shift()) });
+			},
+		});
+		cancelHelpers.setNativeAutotuneJob('wan_sqm', publicJobId);
+		assert.equal((await cancelHelpers.cancelPreferredAutotuneJob(
+			'wan_sqm', 'pppoe-wan', 'speedtest-go', 'variable_link', 'main', '')).state,
+		'cancelled');
+		assert.deepEqual(cancelCalls.map(call => call.args[1]),
+			[ 'autotune-cancel', 'autotune-status', 'autotune-status' ]);
+		assert.deepEqual(delays, [ 2000, 4000 ],
+			'native cancellation must wait with bounded backoff until exact restoration is published');
+	}
+	finally {
+		if (previousWindow === undefined)
+			delete global.window;
+		else
+			global.window = previousWindow;
+	}
+}
+
+async function testNativeSpeedtestTransport() {
+	const previousWindow = global.window;
+	global.window = { setTimeout(resolve) { resolve(); } };
+	const publicJobId = 'c'.repeat(32);
+	const capability = {
+		state: 'idle',
+		protocol_version: 2,
+		admission_enabled: true,
+		native_speedtest: true,
+		native_public_result_version: 4,
+	};
+	const result = {
+		state: 'complete', job_id: publicJobId,
+		backend: 'speedtest-go', calibration: 'unshaped',
+		shaper_bypassed: true, runtime_mutated: false, runtime_restored: true,
+		limits_changed: false, download_kbps: 900000, upload_kbps: 800000,
+	};
+
+	try {
+		assert.equal(helpers.nativeSpeedtestCapabilityValidated(capability), true);
+		assert.equal(helpers.nativeSpeedtestCapabilityValidated({
+			...capability, native_speedtest: false,
+		}), false);
+		assert.deepEqual(helpers.nativeSpeedtestLaunchArgs(
+			'wanb_sqm', 'eth1', 'mwan3', 'wanb', '42', 'unshaped'), [
+			'--calibrationctl', 'speedtest-start', '--instance', 'wanb_sqm',
+			'--expected-target', 'eth1', '--backend', 'speedtest-go',
+			'--direction', 'both', '--topology', 'unshaped', '--route-mode', 'mwan3',
+			'--mwan3-member', 'wanb', '--server-id', '42',
+		]);
+		assert.equal(helpers.nativeSpeedtestResultValidated(result, publicJobId, 'unshaped'), true);
+		assert.equal(helpers.nativeSpeedtestResultValidated({
+			...result, calibration: 'current', shaper_bypassed: false, runtime_restored: false,
+		}, publicJobId, 'current'), true);
+
+		const calls = [];
+		const payloads = [ capability, { state: 'queued', job_id: publicJobId },
+			{ state: 'completed', job_id: publicJobId }, result ];
+		const nativeHelpers = compileHelpers({
+			exec(command, args) {
+				calls.push({ command, args });
+				return Promise.resolve({ stdout: JSON.stringify(payloads.shift()) });
+			},
+		});
+		const response = await nativeHelpers.runSpeedtestJob(
+			'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '', '', true, 'unshaped');
+		assert.deepEqual(JSON.parse(response.stdout), result);
+		assert.deepEqual(calls.map(call => [ call.command, call.args[1] ]), [
+			[ '/usr/sbin/cake-autorated', 'summary' ],
+			[ '/usr/sbin/cake-autorated', 'speedtest-start' ],
+			[ '/usr/sbin/cake-autorated', 'speedtest-status' ],
+			[ '/usr/sbin/cake-autorated', 'speedtest-result' ],
+		]);
+		assert(!calls.some(call => call.command.endsWith('/speedtest')),
+			'native admission must own the complete lifecycle');
+
+		const failedCalls = [];
+		const failedHelpers = compileHelpers({
+			exec(command, args) {
+				failedCalls.push({ command, args });
+				if (args[1] === 'summary')
+					return Promise.resolve({ stdout: JSON.stringify(capability) });
+				return Promise.reject(new Error('XHR request timed out'));
+			},
+		});
+		await assert.rejects(failedHelpers.runSpeedtestJob(
+			'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '', '', true, 'unshaped'), err => {
+			assert.equal(err.nativeSpeedtestStartAttempted, true);
+			return true;
+		});
+		assert.equal(failedCalls.length, 2,
+			'an ambiguous native start must never be replayed through the legacy helper');
+
+		const legacyCalls = [];
+		const legacyPayloads = [
+			{ state: 'running' },
+			{ state: 'complete', download_kbps: 100000, upload_kbps: 20000 },
+		];
+		const legacyHelpers = compileHelpers({
+			exec(command, args) {
+				legacyCalls.push({ command, args });
+				return Promise.resolve({ stdout: JSON.stringify(legacyPayloads.shift()) });
+			},
+		});
+		await legacyHelpers.runSpeedtestJob(
+			'wan_sqm', 'pppoe-wan', 'librespeed-cli', null, 'main', '', '', true);
+		assert(legacyCalls.every(call => call.command === '/usr/libexec/cake-autorate-rs/rpcd-helper'),
+			'an explicitly selected legacy backend must retain the established helper path');
+		assert.deepEqual(legacyCalls.map(call => call.args[0]), [
+			'speedtest-job-start', 'speedtest-job-status',
+		], 'legacy Speed Test must use only pinned rpcd dispatcher operations');
 	}
 	finally {
 		if (previousWindow === undefined)
@@ -3680,8 +5065,23 @@ async function testApplyGuardTransaction() {
 		const token = 'b'.repeat(64);
 		const fakeFs = {
 			exec(command, args) {
-				const operation = args[0];
-				calls.push(`${command}:${operation}`);
+				const rpcOperation = args[0];
+				const operation = rpcOperation.replace(/^apply-guard-/, '');
+				calls.push(`${command}:${rpcOperation}`);
+				if (operation === 'arm') {
+					const marker = values['cake-autorate'].wan_sqm;
+					assert.deepEqual(args, [
+						'apply-guard-arm', 'wan_sqm', marker._autotune_apply_target,
+						marker._autotune_apply_backend, marker._autotune_apply_route_mode,
+						marker._autotune_apply_mwan3_member || '', marker._autotune_apply_enabled,
+						marker._autotune_apply_disable_adaptive, marker._autotune_apply_action,
+						marker._autotune_apply_fingerprint, marker._autotune_apply_proposal_id,
+					], 'LuCI Apply Guard argv must preserve the staged positional contract');
+				}
+				else if (rpcOperation.startsWith('apply-guard-')) {
+					assert.deepEqual(args.slice(1), [ token ],
+						'non-arm Apply Guard operations must carry exactly one authenticated token');
+				}
 				if (operation === 'arm')
 					return Promise.resolve({ code: 0, stdout: JSON.stringify({
 						state: 'armed', schema_version: 1, token, expires_epoch: 2000000000,
@@ -3811,13 +5211,13 @@ async function testApplyGuardTransaction() {
 		assert.equal(success.values['cake-autorate'].wan_sqm.sqm_enabled, '1',
 			'guarded apply must preserve the wizard-staged enabled service state');
 		assert.deepEqual(success.calls, [
-			'/usr/libexec/cake-autorate-rs/apply-guard:arm',
+			'/usr/libexec/cake-autorate-rs/rpcd-helper:apply-guard-arm',
 			'uci.save-token',
 			'callApply:30:true',
-			'/usr/libexec/cake-autorate-rs/apply-guard:status',
+			'/usr/libexec/cake-autorate-rs/rpcd-helper:apply-guard-status',
 			'callConfirm',
-			'/usr/libexec/cake-autorate-rs/apply-guard:finalize',
-			'/usr/libexec/cake-autorate-rs/apply-guard:status',
+			'/usr/libexec/cake-autorate-rs/rpcd-helper:apply-guard-finalize',
+			'/usr/libexec/cake-autorate-rs/rpcd-helper:apply-guard-status',
 			'uci.revert:cake-autorate',
 			'uci.revert:sqm',
 			'uci.unload:cake-autorate,sqm',
@@ -3826,11 +5226,11 @@ async function testApplyGuardTransaction() {
 		const cleanupFailure = transactionFixture({ cleanupReject: true });
 		await assert.rejects(cleanupFailure.helpers.runGuardedSaveApply(cleanupFailure.view, {}),
 			/applied and confirmed, but the browser UCI transaction could not be cleared/);
-		assert(cleanupFailure.calls.includes('/usr/libexec/cake-autorate-rs/apply-guard:finalize'),
+		assert(cleanupFailure.calls.includes('/usr/libexec/cake-autorate-rs/rpcd-helper:apply-guard-finalize'),
 			'cleanup is attempted only after authoritative guard finalization');
-		assert(!cleanupFailure.calls.some(call => call.endsWith(':verify-rollback')),
+		assert(!cleanupFailure.calls.some(call => call.endsWith(':apply-guard-verify-rollback')),
 			'a browser reconciliation failure must not roll back a confirmed configuration');
-		assert(!cleanupFailure.calls.includes('/usr/libexec/cake-autorate-rs/apply-guard:abort'),
+		assert(!cleanupFailure.calls.includes('/usr/libexec/cake-autorate-rs/rpcd-helper:apply-guard-abort'),
 			'a finalized guard must not be aborted after a browser reconciliation failure');
 		assert.deepEqual(cleanupFailure.calls.slice(-3), [
 			'uci.revert:cake-autorate',
@@ -3850,11 +5250,11 @@ async function testApplyGuardTransaction() {
 			/apply response lost/);
 		assert.equal(global.window.location, 'https://router/settings',
 			'exact client-side rollback must discard the staged LuCI model by reloading');
-		assert.equal(lostApply.calls[0], '/usr/libexec/cake-autorate-rs/apply-guard:arm');
+		assert.equal(lostApply.calls[0], '/usr/libexec/cake-autorate-rs/rpcd-helper:apply-guard-arm');
 		assert(!lostApply.calls.includes('view.handleSave'),
 			'a staged exact proposal must not be rewritten through hidden modal fields');
-		assert.equal(lostApply.calls.filter(call => call.endsWith(':verify-rollback')).length, 2);
-		assert(lostApply.calls.includes('/usr/libexec/cake-autorate-rs/apply-guard:abort'),
+		assert.equal(lostApply.calls.filter(call => call.endsWith(':apply-guard-verify-rollback')).length, 2);
+		assert(lostApply.calls.includes('/usr/libexec/cake-autorate-rs/rpcd-helper:apply-guard-abort'),
 			'an unknown apply response must retain snapshots until exact rollback is proven');
 
 		const serverRollback = transactionFixture({ serverRolledBack: true });
@@ -3862,16 +5262,16 @@ async function testApplyGuardTransaction() {
 			/server rolled-back/);
 		assert.equal(global.window.location, 'https://router/settings',
 			'an authoritative server rollback must reload the marker-free configuration');
-		assert.equal(serverRollback.calls[0], '/usr/libexec/cake-autorate-rs/apply-guard:arm');
-		assert(!serverRollback.calls.some(call => call.endsWith(':verify-rollback')),
+		assert.equal(serverRollback.calls[0], '/usr/libexec/cake-autorate-rs/rpcd-helper:apply-guard-arm');
+		assert(!serverRollback.calls.some(call => call.endsWith(':apply-guard-verify-rollback')),
 			'a server rollback receipt is already authoritative');
-		assert(!serverRollback.calls.includes('/usr/libexec/cake-autorate-rs/apply-guard:abort'),
+		assert(!serverRollback.calls.includes('/usr/libexec/cake-autorate-rs/rpcd-helper:apply-guard-abort'),
 			'the server supervisor owns token cleanup');
 
 		const serverIndeterminate = transactionFixture({ serverIndeterminate: true });
 		await assert.rejects(serverIndeterminate.helpers.runGuardedSaveApply(serverIndeterminate.view, {}),
 			/confirmation outcome remains unknown/);
-		assert(!serverIndeterminate.calls.includes('/usr/libexec/cake-autorate-rs/apply-guard:abort'),
+		assert(!serverIndeterminate.calls.includes('/usr/libexec/cake-autorate-rs/rpcd-helper:apply-guard-abort'),
 			'an indeterminate server state must retain its proof for recovery');
 		assert.equal(global.window.location.href, 'https://router/settings#pending',
 			'an indeterminate confirmation must remain visible instead of navigating away');
@@ -3881,7 +5281,7 @@ async function testApplyGuardTransaction() {
 			/only its exact CAKE and SQM changes/);
 		assert(!unrelated.calls.some(call => call.startsWith('callApply:')),
 			'unrelated pending UCI packages must be rejected before apply');
-		assert(unrelated.calls.includes('/usr/libexec/cake-autorate-rs/apply-guard:abort'));
+		assert(unrelated.calls.includes('/usr/libexec/cake-autorate-rs/rpcd-helper:apply-guard-abort'));
 	}
 	finally {
 		if (previousWindow === undefined)
@@ -3892,6 +5292,7 @@ async function testApplyGuardTransaction() {
 }
 
 testSequentialMultiwanTransactions().then(() => testAutotuneTerminalPrecedence()).then(() =>
+	testNativeSpeedtestTransport()).then(() => testNativeAutotuneTransport()).then(() =>
 	testApplyGuardTransaction()).then(() => {
 	console.log('settings autotune tests passed');
 }).catch(err => {

@@ -29,6 +29,8 @@ pub struct QualityGradeResult {
     pub ul_samples: usize,
     pub bidirectional_samples: usize,
     pub completion_reason: String,
+    pub capture_job_id: String,
+    pub capture_generation: u64,
     pub dl: Option<QualityGradeMetric>,
     pub ul: Option<QualityGradeMetric>,
     pub bidirectional: Option<QualityGradeMetric>,
@@ -45,6 +47,8 @@ pub struct QualityGradeSnapshot {
     pub state: &'static str,
     pub current: Option<QualityGradeResult>,
     pub last_known: Option<QualityGradeResult>,
+    #[cfg_attr(not(feature = "calibration"), allow(dead_code))]
+    pub capture_result: Option<QualityGradeResult>,
     pub collected_samples: usize,
     pub required_samples: usize,
     pub baseline_samples: usize,
@@ -65,19 +69,28 @@ struct ActiveWindow {
     started_at: f64,
     last_loaded_at: f64,
     route_identity: String,
+    capture_job_id: String,
+    capture_generation: u64,
     dl: Vec<f64>,
     ul: Vec<f64>,
     bidirectional: Vec<f64>,
 }
 
 impl ActiveWindow {
-    fn new(started_at: f64, route_identity: &str) -> Self {
+    fn new(
+        started_at: f64,
+        route_identity: &str,
+        capture_job_id: &str,
+        capture_generation: u64,
+    ) -> Self {
         Self {
             endpoint: None,
             baseline_p5_ms: None,
             started_at,
             last_loaded_at: started_at,
             route_identity: route_identity.to_string(),
+            capture_job_id: capture_job_id.to_string(),
+            capture_generation,
             dl: Vec::new(),
             ul: Vec::new(),
             bidirectional: Vec::new(),
@@ -140,6 +153,8 @@ impl ActiveWindow {
             ul_samples: self.ul.len(),
             bidirectional_samples: self.bidirectional.len(),
             completion_reason: completion_reason.to_string(),
+            capture_job_id: self.capture_job_id.clone(),
+            capture_generation: self.capture_generation,
             dl,
             ul,
             bidirectional,
@@ -153,6 +168,9 @@ pub struct QualityGradeTracker {
     active: Option<ActiveWindow>,
     latest: Option<QualityGradeResult>,
     last_known: Option<QualityGradeResult>,
+    capture_result: Option<QualityGradeResult>,
+    capture_job_id: String,
+    capture_generation: u64,
     route_identity: String,
     session_grace_s: f64,
 }
@@ -164,6 +182,9 @@ impl QualityGradeTracker {
             active: None,
             latest: None,
             last_known: None,
+            capture_result: None,
+            capture_job_id: String::new(),
+            capture_generation: 0,
             route_identity: String::new(),
             session_grace_s: session_grace_s.max(1.0),
         }
@@ -174,6 +195,9 @@ impl QualityGradeTracker {
         self.active = None;
         self.latest = None;
         self.last_known = None;
+        self.capture_result = None;
+        self.capture_job_id.clear();
+        self.capture_generation = 0;
         self.route_identity.clear();
     }
 
@@ -185,20 +209,35 @@ impl QualityGradeTracker {
         self.baselines.clear();
         self.active = None;
         self.latest = None;
+        self.capture_result = None;
+        self.capture_job_id.clear();
+        self.capture_generation = 0;
     }
 
-    pub fn begin_capture(&mut self, timestamp: f64) {
+    #[cfg(any(feature = "calibration", test))]
+    pub fn begin_capture(&mut self, timestamp: f64, job_id: &str, generation: u64) {
         self.finish_active(timestamp);
         self.latest = None;
+        self.capture_result = None;
+        self.capture_job_id.clear();
+        self.capture_job_id.push_str(job_id);
+        self.capture_generation = generation;
     }
 
+    #[cfg(any(feature = "calibration", test))]
     pub fn cancel_capture(&mut self) {
         self.active = None;
         self.latest = None;
+        self.capture_result = None;
+        self.capture_job_id.clear();
+        self.capture_generation = 0;
     }
 
+    #[cfg(any(feature = "calibration", test))]
     pub fn end_capture(&mut self, timestamp: f64) {
         self.finish_active(timestamp);
+        self.capture_job_id.clear();
+        self.capture_generation = 0;
     }
 
     pub fn observe(
@@ -242,9 +281,15 @@ impl QualityGradeTracker {
         }
 
         let baseline = self.baseline_p5(endpoint);
-        let active = self
-            .active
-            .get_or_insert_with(|| ActiveWindow::new(timestamp, route_identity));
+        if self.active.is_none() {
+            self.active = Some(ActiveWindow::new(
+                timestamp,
+                route_identity,
+                &self.capture_job_id,
+                self.capture_generation,
+            ));
+        }
+        let active = self.active.as_mut().expect("active window was initialized");
         if active.endpoint.is_none() {
             if let Some(baseline_p5_ms) = baseline {
                 active.endpoint = Some(endpoint.to_string());
@@ -292,6 +337,7 @@ impl QualityGradeTracker {
             ("learning_baseline", None, 0)
         };
         let last_known = self.last_known.clone();
+        let capture_result = self.capture_result.clone();
         let current_stale = current
             .as_ref()
             .map(|result| result.route_identity != self.route_identity)
@@ -317,6 +363,7 @@ impl QualityGradeTracker {
             state,
             current,
             last_known,
+            capture_result,
             collected_samples,
             required_samples: MIN_LOADED_SAMPLES,
             baseline_samples,
@@ -342,7 +389,10 @@ impl QualityGradeTracker {
             return;
         };
         if !result.partial && !result.incomplete {
-            self.last_known = Some(result);
+            self.last_known = Some(result.clone());
+            if !result.capture_job_id.is_empty() && result.capture_generation > 0 {
+                self.capture_result = Some(result);
+            }
             self.latest = None;
         } else {
             self.latest = Some(result);
@@ -518,7 +568,7 @@ mod tests {
         }
         assert_eq!(tracker.snapshot(40.0).dl_samples, 8);
 
-        tracker.begin_capture(41.0);
+        tracker.begin_capture(41.0, "capture-a", 1);
         let snapshot = tracker.snapshot(41.0);
         assert_eq!(snapshot.dl_samples, 0);
         assert_eq!(snapshot.ul_samples, 0);
@@ -542,7 +592,7 @@ mod tests {
             QualityClass::B
         );
 
-        tracker.begin_capture(120.0);
+        tracker.begin_capture(120.0, "capture-b", 2);
         for index in 0..MIN_LOADED_SAMPLES {
             tracker.observe(
                 "endpoint",
@@ -577,7 +627,7 @@ mod tests {
     fn clean_capture_end_commits_a_complete_result() {
         let mut tracker = QualityGradeTracker::new(30.0);
         seed_baseline(&mut tracker, "endpoint", "route-a");
-        tracker.begin_capture(30.0);
+        tracker.begin_capture(30.0, "capture-c", 3);
         for index in 0..MIN_LOADED_SAMPLES {
             tracker.observe(
                 "endpoint",
@@ -602,6 +652,44 @@ mod tests {
         assert_eq!(snapshot.state, "baseline_ready");
         assert!(snapshot.current.is_none());
         assert_eq!(snapshot.last_known.as_ref().unwrap().class, QualityClass::B);
+        let capture = snapshot.capture_result.as_ref().unwrap();
+        assert_eq!(capture.capture_job_id, "capture-c");
+        assert_eq!(capture.capture_generation, 3);
+        assert!(!capture.partial);
+        assert!(!capture.incomplete);
+    }
+
+    #[test]
+    fn grace_closed_complete_capture_remains_identity_bound_for_ack() {
+        let mut tracker = QualityGradeTracker::new(5.0);
+        seed_baseline(&mut tracker, "endpoint", "route-a");
+        tracker.begin_capture(30.0, "capture-grace", 9);
+        for index in 0..MIN_LOADED_SAMPLES {
+            tracker.observe(
+                "endpoint",
+                20.0,
+                true,
+                false,
+                31.0 + index as f64 * 0.1,
+                "route-a",
+            );
+            tracker.observe(
+                "endpoint",
+                40.0,
+                false,
+                true,
+                34.0 + index as f64 * 0.1,
+                "route-a",
+            );
+        }
+        tracker.observe("endpoint", 11.0, false, false, 42.0, "route-a");
+        let snapshot = tracker.snapshot(42.0);
+        assert!(snapshot.current.is_none());
+        let capture = snapshot.capture_result.as_ref().unwrap();
+        assert_eq!(capture.capture_job_id, "capture-grace");
+        assert_eq!(capture.capture_generation, 9);
+        assert!(!capture.partial);
+        assert!(!capture.incomplete);
     }
 
     #[test]
@@ -632,6 +720,8 @@ mod tests {
             started_at: 1.0,
             last_loaded_at: 20.0,
             route_identity: "route-a".to_string(),
+            capture_job_id: String::new(),
+            capture_generation: 0,
             dl: vec![12.0; MIN_LOADED_SAMPLES],
             ul: vec![100.0; MIN_LOADED_SAMPLES],
             bidirectional: Vec::new(),

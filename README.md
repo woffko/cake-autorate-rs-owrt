@@ -254,11 +254,20 @@ The RC27 release builds the OpenWrt 25.12 daemon APK for this ABI matrix:
 | `mipsel_24kc` | little-endian 24Kc targets |
 
 The target is an APK ABI rather than one specific board. The authoritative
-choice is the value returned by `apk --print-arch`. Every daemon asset follows
-the name
-`cake-autorate-rs-1.0_rc27-r22_openwrt-25.12_<arch>.apk`; the shared
-`luci-app-cake-autorate-rs-1.0_rc27-r45_openwrt-25.12_all.apk` contains the
-architecture-independent LuCI interface and SQM integration.
+choice is the value returned by `apk --print-arch`. Every full daemon asset
+follows the name
+`cake-autorate-rs-1.0_rc27-r235_openwrt-25.12_<arch>.apk`; the shared
+`luci-app-cake-autorate-rs-1.0_rc27-r85_openwrt-25.12_all.apk` contains the
+architecture-independent full LuCI interface and SQM integration.
+
+The same release also contains a separately compiled **Lite** pair for every
+ABI: `cake-autorate-rs-lite-1.0_rc27-r235_...apk` and
+`luci-app-cake-autorate-rs-lite-1.0_rc27-r3_...apk`. Lite keeps the manual
+controller, routing, latency probes, directional SQM and bounded adaptive
+ceiling, but deliberately omits Get rating, speed-test calibration, Full
+Auto-Tune and scheduled calibration. Full and Lite are mutually exclusive;
+install both packages from one pair, never mix a Full daemon with Lite LuCI or
+the other way around.
 
 RC27 adds background-aware Full Auto-Tune confidence without mixing forwarded
 traffic into the isolated speed-test result. It reports separate download,
@@ -275,7 +284,8 @@ is visible as a warning rather than a false
 quality failure. The release retains the explicit Automatic/Gaming/Best
 overall/Fair/Custom traffic-profile model and sequential per-member Multi-WAN
 calibration. Direct APK assets are provided for all 12 daemon ABIs plus the
-architecture-independent LuCI APK. Dependencies resolve through the router's
+Full and Lite architecture-independent LuCI APKs. Each ABI has a separately
+compiled Full and Lite daemon. Dependencies resolve through the router's
 configured OpenWrt package feeds; no offline bundle is attached.
 
 ## Relationship to upstream cake-autorate
@@ -355,16 +365,17 @@ representative examples rather than guarantees.
 
 ## Release history
 
-The current public prerelease is **RC27 r22/r45**: daemon package r22 and LuCI
-package r45. It retains the manual per-direction CAKE selector and bounded
-speed-test timeout recovery, then adds a Variable Link access mini-wizard,
-medium-specific exploration floors, exact measured-raw/service cap provenance,
-and four explicit runtime capacity-learning policies. Adaptive growth now starts
-from an exact tested-safe rate and requires both clean latency and a measurable
-throughput gain. The focused live transition matrix, full browser audit, package
-ABI verification and design chronology are recorded in [Testing](TESTING.md). The README intentionally
-describes current behavior instead of retaining a cumulative RC diary;
-historical source points remain in Git tags while
+The current public prerelease is **RC27 r235/r85**: daemon package r235 and
+Full LuCI package r85, with the parallel manual-only Lite pair r235/r3. The
+release completes the native Rust rating, speed-test, Full Auto-Tune,
+scheduler, Review and Apply authority path while retaining exact guarded
+restoration of managed CAKE/SQM state. A bounded parse-only retry fixes the
+last real high-speed calibration blocker without retrying route, counter,
+ownership or other authority failures. The focused live transition matrix,
+full browser audit, Full/Lite 12-ABI verification and design chronology are
+recorded in [Testing](TESTING.md). The README intentionally describes current
+behavior instead of retaining a cumulative RC diary; historical source points
+remain in Git tags while
 [GitHub Releases](https://github.com/woffko/cake-autorate-rs-owrt/releases)
 contains the current downloadable build.
 
@@ -699,6 +710,12 @@ LuCI package dependencies:
 - `jsonfilter`
 - `nftables-json`
 
+Lite uses the same daemon-side runtime dependency set because the manual
+controller still owns routing, probes, nftables-aware isolation and managed
+SQM. Lite LuCI depends only on `cake-autorate-rs-lite`, `luci-base`, and
+`sqm-scripts`; it ships no root helper or ACL surface for rating, speed tests,
+Auto-Tune, scheduling, graph history or Apply Guard.
+
 Native WebSocket and persistent-HTTP probes, including Full Auto-Tune
 transport validation, use statically linked rustls and webpki roots and add no
 dynamic APK dependency. `legacy-http` and the built-in speed-test fallback can
@@ -774,6 +791,17 @@ make package/cake-autorate-rs/compile V=s -j1
 make package/luci-app-cake-autorate-rs/compile V=s -j1
 ```
 
+For the manual-only variant, select/build `cake-autorate-rs-lite` and
+`luci-app-cake-autorate-rs-lite` instead. The daemon is compiled with Rust
+default features disabled, so this is a real smaller binary rather than only a
+hidden menu:
+
+```sh
+./scripts/feeds install cake-autorate-rs-lite luci-app-cake-autorate-rs-lite
+make package/cake-autorate-rs/compile V=s -j1
+make package/luci-app-cake-autorate-rs-lite/compile V=s -j1
+```
+
 Overlay workflow during local development:
 
 ```sh
@@ -810,9 +838,22 @@ For example, when it prints `aarch64_generic`:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc27-r22_openwrt-25.12_aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc27-r45_openwrt-25.12_all.apk
+  /root/cake-autorate-rs-1.0_rc27-r235_openwrt-25.12_aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc27-r85_openwrt-25.12_all.apk
 ```
+
+For a small manual-only installation, use the matching Lite pair instead:
+
+```sh
+apk add --allow-untrusted \
+  /root/cake-autorate-rs-lite-1.0_rc27-r235_openwrt-25.12_aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-lite-1.0_rc27-r3_openwrt-25.12_all.apk
+```
+
+Changing variants is a package replacement, not an in-place feature toggle.
+Back up `/etc/config/cake-autorate`, simulate the exact transaction first, and
+install one complete pair. Moving to Lite preserves manual instance settings
+but intentionally removes the rating/Auto-Tune services and their LuCI pages.
 
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:
 

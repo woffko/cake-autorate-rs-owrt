@@ -1,0 +1,11 @@
+{
+  "name": "luci-app-cake-autorate-rs-development",
+  "private": true,
+  "scripts": {
+    "check:types": "tsc -p tsconfig.json && tsc -p tests/tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "26.1.2",
+    "typescript": "6.0.3"
+  }
+}

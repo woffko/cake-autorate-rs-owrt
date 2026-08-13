@@ -15,6 +15,14 @@ if (typeof String.prototype.format !== 'function') {
 const sourcePath = path.join(__dirname, '..', 'htdocs', 'luci-static', 'resources',
 	'view', 'cake-autorate-rs', 'status.js');
 const source = fs.readFileSync(sourcePath, 'utf8');
+assert.equal((source.match(/window\.setTimeout\(/g) || []).length, 2,
+	'status timers are limited to job polling cadence and deferred Blob URL cleanup');
+assert.match(source,
+	/function qualityTestDelay\(\)\s*\{[\s\S]*?window\.setTimeout\(resolve, 1000\);[\s\S]*?\}/,
+	'Get Rating may use a polling cadence but not a timer-owned success transition');
+assert.match(source,
+	/function downloadText\([\s\S]*?window\.setTimeout\(function\(\)\s*\{[\s\S]*?URL\.revokeObjectURL\(url\);/,
+	'the only non-polling status timer is bounded browser resource cleanup');
 for (const [index, button] of source.split("E('button', {").slice(1).entries()) {
 	assert.match(button.slice(0, 160), /'type': 'button'/,
 		`custom status button ${index + 1} must never act as a form submitter`);
@@ -24,8 +32,127 @@ const E = (tag, attrs, children) => ({ tag, attrs: attrs || {}, children: childr
 const helpers = new Function('fs', 'poll', 'uci', 'ui', 'cakeUi', 'L', 'E', '_',
 	`${prefix}\nreturn { formatQuality, formatRoute, formatState, formatServices, qualityReadiness, qualityProgressText, ` +
 		`accessMediumLabel, capacityLearningLabel, ` +
-		`statusColumnSelection, selectedStatusColumns, formatShaperRate };`
+		`statusColumnSelection, selectedStatusColumns, formatShaperRate, ` +
+		`nativeRatingRoute, nativeRatingStartArgs, nativeRatingProgress, ` +
+		`schedulerStatusSource, schedulerUnavailableStatus, nativeSchedulerStatusValidated, ` +
+		`nativeSchedulerBatchValidated, legacySchedulerStatusValidated, normalizeLegacySchedulerStatus, ` +
+		`readSchedulerStatuses, renderStatusData };`
 )({}, {}, {}, {}, {}, {}, E, value => value);
+
+assert.deepEqual(helpers.schedulerStatusSource('wan_sqm', 'native', { native_scheduler: true }), {
+	owner: 'native',
+	command: '/usr/sbin/cake-autorated',
+	args: [ '--calibrationctl', 'scheduler-status' ],
+}, 'native scheduler ownership must use one batch request and never query the legacy ledger');
+assert.deepEqual(helpers.schedulerStatusSource('wan_sqm', 'legacy', { native_scheduler: false }), {
+	owner: 'legacy',
+	command: '/usr/libexec/cake-autorate-rs/autotune-scheduler',
+	args: [ 'status', 'wan_sqm' ],
+}, 'an explicit legacy owner must keep its existing status source');
+assert.equal(helpers.schedulerStatusSource('wan_sqm', '', { native_scheduler: false }), null,
+	'missing scheduler ownership must not silently fall back to legacy');
+assert.equal(helpers.schedulerStatusSource('wan_sqm', 'native', { native_scheduler: false }), null,
+	'a UCI/native runtime-owner mismatch must fail closed without querying either ledger');
+assert.equal(helpers.schedulerStatusSource('wan_sqm', 'legacy', { native_scheduler: true }), null,
+	'a UCI/legacy runtime-owner mismatch must fail closed without querying either ledger');
+assert.equal(helpers.schedulerStatusSource('wan_sqm', 'native', null), null,
+	'an unavailable runtime attestation must not guess scheduler ownership');
+const nativeSchedule = {
+	instance: 'wan_sqm', enabled: true, initialized: true, budget_authoritative: true,
+	observed_at: 1200,
+	state: 'deferred', message: 'quiet-window-pending', updated_at: 1000,
+	next_due_at: 1100, window: { start_hour: 2, end_hour: 5 },
+	daily: { limit_bytes: 10000, used_bytes: 2000, reserved_bytes: 1000, remaining_bytes: 7000 },
+	monthly: { limit_bytes: 50000, used_bytes: 4000, reserved_bytes: 1000, remaining_bytes: 45000 },
+	accounting_error: false, warning: null, last_success_at: 900, last_failure_due_at: 0,
+};
+assert.equal(helpers.nativeSchedulerStatusValidated(nativeSchedule, 'wan_sqm'), true);
+assert.equal(helpers.nativeSchedulerBatchValidated({
+	schema_version: 1, owner: 'native', available: true, observed_at: 1200,
+	stale: false, global_error: null,
+	instances: [ nativeSchedule ], issues: [],
+}), true, 'one canonical batch must carry all native per-instance scheduler status');
+assert.equal(helpers.nativeSchedulerBatchValidated({
+	schema_version: 1, owner: 'native', available: true, observed_at: 1200,
+	stale: false, global_error: null,
+	instances: [ nativeSchedule ], issues: [ Object.assign({}, nativeSchedule) ],
+}), false, 'a duplicate instance in the native batch must fail closed');
+assert.equal(helpers.nativeSchedulerBatchValidated({
+	schema_version: 1, owner: 'native', available: true, observed_at: 1200,
+	stale: false, global_error: null,
+	instances: [ Object.assign({}, nativeSchedule, { instance: 'constructor' }) ], issues: [],
+}), true, 'valid UCI names must not collide with JavaScript object prototype properties');
+assert.equal(helpers.nativeSchedulerBatchValidated({
+	schema_version: 1, owner: 'native', available: true, observed_at: 1200,
+	stale: true, global_error: 'Native scheduler refresh failed; showing the last complete snapshot.',
+	instances: [ nativeSchedule ], issues: [],
+}), true, 'a stale last-good snapshot must carry one explicit bounded global warning');
+assert.equal(helpers.nativeSchedulerBatchValidated({
+	schema_version: 1, owner: 'native', available: true, observed_at: 1200,
+	stale: true, global_error: null, instances: [ nativeSchedule ], issues: [],
+}), false, 'stale budgets without an explicit global warning must fail closed');
+assert.equal(helpers.nativeSchedulerBatchValidated({
+	schema_version: 1, owner: 'native', available: true, observed_at: 1200,
+	stale: false, global_error: null,
+	instances: [ Object.assign({}, nativeSchedule, { observed_at: 1199 }) ], issues: [],
+}), false, 'every native row must belong to the same observed batch epoch');
+assert.equal(helpers.nativeSchedulerBatchValidated({
+	schema_version: 1, owner: 'legacy', available: true, observed_at: 1200,
+	stale: false, global_error: null, instances: [ nativeSchedule ], issues: [],
+}), false, 'the native batch validator must reject a different owner');
+assert.equal(helpers.nativeSchedulerBatchValidated({
+	schema_version: 1, owner: 'native', available: false, observed_at: 1200,
+	stale: false, global_error: null, instances: [ nativeSchedule ], issues: [],
+}), false, 'an unavailable payload cannot be accepted as an authoritative native snapshot');
+assert.equal(helpers.nativeSchedulerStatusValidated(Object.assign({}, nativeSchedule, {
+	observed_at: -1,
+}), 'wan_sqm'), false, 'negative or malformed native timestamps must fail closed');
+assert.equal(helpers.nativeSchedulerStatusValidated(Object.assign({}, nativeSchedule, {
+	updated_at: 1.5,
+}), 'wan_sqm'), false, 'fractional native timestamps must fail closed');
+assert.equal(helpers.nativeSchedulerStatusValidated(Object.assign({}, nativeSchedule, {
+	window: { start_hour: 24, end_hour: 5 },
+}), 'wan_sqm'), false, 'native quiet-window hours must remain inside the clock domain');
+assert.equal(helpers.nativeSchedulerStatusValidated(Object.assign({}, nativeSchedule, {
+	message: 'invalid\nmessage',
+}), 'wan_sqm'), false, 'native status messages must reject control characters');
+assert.equal(helpers.nativeSchedulerStatusValidated(Object.assign({}, nativeSchedule, {
+	warning: 'invalid\twarning',
+}), 'wan_sqm'), false, 'native status warnings must reject control characters');
+assert.equal(helpers.nativeSchedulerBatchValidated({
+	schema_version: 1, owner: 'native', available: true, observed_at: 1200,
+	stale: true, global_error: 'invalid\nglobal warning',
+	instances: [ nativeSchedule ], issues: [],
+}), false, 'native global warnings must reject control characters');
+assert.equal(helpers.nativeSchedulerStatusValidated(Object.assign({}, nativeSchedule, {
+	daily: Object.assign({}, nativeSchedule.daily, { remaining_bytes: -1 }),
+}), 'wan_sqm'), false, 'negative or malformed native budgets must fail closed');
+assert.equal(helpers.nativeSchedulerStatusValidated(Object.assign({}, nativeSchedule, {
+	daily: Object.assign({}, nativeSchedule.daily, { remaining_bytes: '7000' }),
+}), 'wan_sqm'), false, 'numeric-looking strings must not satisfy the versioned JSON contract');
+const unavailableSchedule = helpers.schedulerUnavailableStatus({
+	'.name': 'wan_sqm', scheduled_autotune_enabled: '1',
+}, 'native');
+assert.equal(unavailableSchedule.available, false);
+assert.equal(unavailableSchedule.accounting_error, false,
+	'unavailable ownership must not be mislabeled as a durable traffic-ledger block');
+assert.match(unavailableSchedule.message, /legacy accounting was not substituted/);
+const legacySchedule = {
+	instance: 'wan_sqm', enabled: true, state: 'idle', message: '', updated_at: 1000,
+	next_due_at: 1100, window_start_hour: 2, window_end_hour: 5,
+	daily: { limit_bytes: 10000, used_bytes: 2000, remaining_bytes: 8000 },
+	monthly: { limit_bytes: 50000, used_bytes: 4000, remaining_bytes: 46000 },
+	accounting_error: false,
+};
+assert.equal(helpers.legacySchedulerStatusValidated(legacySchedule, 'wan_sqm'), true);
+assert.equal(helpers.normalizeLegacySchedulerStatus(legacySchedule).owner, 'legacy');
+assert.equal(helpers.normalizeLegacySchedulerStatus(legacySchedule).source,
+	'legacy_scheduler_helper');
+assert.equal(helpers.normalizeLegacySchedulerStatus(legacySchedule).daily.reserved_bytes, 0);
+assert.equal(helpers.normalizeLegacySchedulerStatus(legacySchedule).warning, null);
+assert.equal(helpers.legacySchedulerStatusValidated(Object.assign({}, legacySchedule, {
+	instance: 'wanb_sqm',
+}), 'wan_sqm'), false, 'legacy status from another instance must never be merged');
 
 const passiveCapacity = helpers.formatShaperRate({
 	configured_max_dl_shaper_rate_kbps: 100000,
@@ -188,6 +315,18 @@ const ready = helpers.qualityReadiness({ enabled: '1', sqm_enabled: '1' }, {
 	quality_grade_baseline_ready: true,
 });
 assert.equal(ready.ready, true);
+const nativeRatingUnavailable = helpers.qualityReadiness(
+	{ enabled: '1', sqm_enabled: '1' },
+	{
+		uplink_state: 'ACTIVE', transport_latency_enabled: true,
+		route_active: true, route_test_ready: true, transport_probe_trusted: true,
+		quality_grade_baseline_ready: true,
+	},
+	'automatic',
+	{ state: 'idle', native_rating: false },
+);
+assert.equal(nativeRatingUnavailable.ready, false);
+assert.match(nativeRatingUnavailable.reason, /Native Rating is unavailable/);
 const standbyAutomatic = helpers.qualityReadiness({ enabled: '1', sqm_enabled: '1' }, {
 	uplink_state: 'STANDBY',
 	transport_latency_enabled: true,
@@ -270,6 +409,65 @@ const scheduledState = helpers.formatState({
 }, null);
 assert.match(JSON.stringify(scheduledState), /Active budget: 1\.00 GiB today.*8\.00 GiB this month/);
 assert.match(JSON.stringify(scheduledState), /due/);
+const unavailableScheduledState = helpers.formatState({
+	state: 'RUNNING', uplink_state: 'ACTIVE',
+	scheduled_autotune: unavailableSchedule,
+}, true, {
+	autotune_profile: 'best_overall', traffic_rules_enabled: '0',
+	scheduled_autotune_enabled: '1',
+}, null);
+assert.match(JSON.stringify(unavailableScheduledState), /legacy accounting was not substituted/);
+assert.doesNotMatch(JSON.stringify(unavailableScheduledState), /Active budget/,
+	'an unavailable native ledger must not render plausible zero traffic budgets');
+const initializingScheduledState = helpers.formatState({
+	state: 'RUNNING', uplink_state: 'ACTIVE',
+	scheduled_autotune: Object.assign({}, nativeSchedule, {
+		available: true, initialized: false, budget_authoritative: false,
+		state: 'initializing', message: 'Native scheduler state is initializing.',
+		daily: { limit_bytes: 10000, used_bytes: 0, reserved_bytes: 0, remaining_bytes: 0 },
+		monthly: { limit_bytes: 50000, used_bytes: 0, reserved_bytes: 0, remaining_bytes: 0 },
+	}),
+}, true, {
+	autotune_profile: 'best_overall', traffic_rules_enabled: '0',
+	scheduled_autotune_enabled: '1',
+}, null);
+assert.match(JSON.stringify(initializingScheduledState), /scheduler state is initializing/i);
+assert.doesNotMatch(JSON.stringify(initializingScheduledState), /Active budget/,
+	'non-authoritative initialization must never render a plausible zero budget');
+const invalidScheduledState = helpers.formatState({
+	state: 'RUNNING', uplink_state: 'ACTIVE',
+	scheduled_autotune: Object.assign({}, nativeSchedule, {
+		available: true, initialized: false, budget_authoritative: false,
+		state: 'error', message: 'Native scheduler configuration is invalid.',
+		accounting_error: false,
+	}),
+}, true, {
+	autotune_profile: 'best_overall', traffic_rules_enabled: '0',
+	scheduled_autotune_enabled: '1',
+}, null);
+assert.match(JSON.stringify(invalidScheduledState), /configuration is invalid/i);
+assert.doesNotMatch(JSON.stringify(invalidScheduledState), /initializing/i,
+	'an instance-local scheduler error must not be disguised as initialization');
+const reviewWarningState = helpers.formatState({
+	state: 'RUNNING', uplink_state: 'ACTIVE',
+	scheduled_autotune: Object.assign({}, nativeSchedule, {
+		available: true, state: 'idle',
+		message: 'Native scheduler is ready.',
+		warning: 'Scheduled result requires explicit Review.',
+	}),
+}, true, {
+	autotune_profile: 'best_overall', traffic_rules_enabled: '0',
+	scheduled_autotune_enabled: '1',
+}, null);
+assert.match(JSON.stringify(reviewWarningState), /Active budget/);
+assert.match(JSON.stringify(reviewWarningState), /requires explicit Review/,
+	'a successful calibration awaiting manual Review must be a warning, not scheduler failure');
+const globalSchedulerDiagnostic = helpers.renderStatusData([], [], [], {}, {}, [ {
+	instance: 'retired_sqm', message: 'Durable state has no current UCI configuration.',
+} ]);
+assert.match(JSON.stringify(globalSchedulerDiagnostic), /Native scheduler diagnostics/);
+assert.match(JSON.stringify(globalSchedulerDiagnostic), /retired_sqm/,
+	'orphan durable state must remain visible even without a matching Status row');
 const waitingLinkState = helpers.formatState({
 	state: 'WAITING_LINK', uplink_state: 'OFFLINE',
 	sqm_runtime_managed: true, sqm_runtime_healthy: false,
@@ -420,11 +618,48 @@ assert.match(helpers.qualityProgressText({
 	contamination_reason: 'unexpected_upload_during_download',
 }), /CONTAMINATED: unexpected_upload_during_download/);
 
+const automaticRatingArgs = helpers.nativeRatingStartArgs({
+	'.name': 'wan_sqm', sqm_interface: 'pppoe-wan', route_mode: 'auto',
+	mwan3_member: 'wan_member',
+}, 'automatic');
+assert.deepEqual(automaticRatingArgs, [
+	'rating-start', '--instance', 'wan_sqm', '--expected-target', 'pppoe-wan',
+	'--mode', 'automatic', '--backend', 'speedtest-go', '--route-mode', 'mwan3',
+	'--mwan3-member', 'wan_member',
+]);
+const guidedRatingArgs = helpers.nativeRatingStartArgs({
+	'.name': 'wan_sqm', sqm_interface: 'pppoe-wan', route_mode: 'main',
+}, 'client');
+assert.deepEqual(guidedRatingArgs, [
+	'rating-start', '--instance', 'wan_sqm', '--expected-target', 'pppoe-wan',
+	'--mode', 'client', '--backend', 'client', '--route-mode', 'main',
+]);
+assert.deepEqual(helpers.nativeRatingProgress({
+	quality_grade_baseline_samples: 20,
+	quality_grade_dl_samples: 9,
+	quality_grade_ul_samples: 7,
+	quality_grade_required_samples: 20,
+	rating_load_phase: 'DL',
+	rating_capture_requested_phase: 'DL',
+	rating_load_effective_dl_kbps: 700000,
+	rating_capture_contaminated: true,
+	rating_capture_contamination_reason: 'opposite-direction-load',
+}, { state: 'running', job_id: 'a'.repeat(32) }).dl_samples, 9);
+
+for (const command of [ 'rating-current', 'rating-status', 'rating-result', 'rating-cancel' ])
+	assert.match(source, new RegExp("calibrationExec\\(\\[ '" + command));
+assert.match(source, /CALIBRATION_DAEMON = '\/usr\/sbin\/cake-autorated'/);
+assert.match(source, /readCalibrationSummary\(\)[\s\S]*native_rating: false/,
+	'a missing or old daemon capability must disable native Rating fail-closed');
+assert.match(source, /job\.state === 'completed'[\s\S]*rating-result/,
+	'a completed journal must be converted through the identity-checked native Rating result');
+
 assert.match(source, /cake-status-table td\{vertical-align:top!important/);
 assert.match(source, /cake-status-table th\{vertical-align:bottom!important/);
-assert.match(source, /quality-test/);
+assert.doesNotMatch(source, /\/usr\/libexec\/cake-autorate-rs\/quality-test/,
+	'Get rating must not invoke the competing shell Rating supervisor');
 assert.match(source, /Get rating/);
-assert.match(source, /refreshReadiness\(false\)[\s\S]*qualityTestExec\(instance, 'start'/,
+assert.match(source, /refreshReadiness\(false\)[\s\S]*calibrationExec\(nativeRatingStartArgs\(section, mode\.value\)\)/,
 	'Get rating must refresh daemon readiness immediately before launching a job');
 assert.match(source, /refreshReadiness\(false\)\.then\(function\(freshReadiness\) \{\s*if \(closed\)/,
 	'closing during the final readiness read must prevent a background rating launch');
@@ -438,6 +673,9 @@ assert.match(source, /\/usr\/libexec\/cake-autorate-rs\/status-columns/,
 	'column preferences must use the isolated persistence helper');
 assert.match(source, /\/usr\/libexec\/cake-autorate-rs\/runtime-health/,
 	'Status must reconcile configured intent with actual daemon and kernel state');
+assert.match(source,
+	/return \[ sections, status\.rows,[\s\S]*status\.diagnostics, schedulerEngine \][\s\S]*var schedulerEngine = data\[7\] \|\| ''[\s\S]*readInstanceStatuses\(sections, schedulerEngine, result\[1\]\)/,
+	'initial load and polling must use the same captured committed scheduler owner');
 assert.doesNotMatch(source, /return uci\.save\(\)/,
 	'Status preferences must not leave an uncommitted LuCI UCI transaction');
 assert.match(source, /column\.mandatory \? '' : null/,
@@ -480,4 +718,156 @@ assert.match(route.attrs.title, /Routing table: 2/);
 assert.match(route.attrs.title, /Uplink error code: member_offline/);
 assert.equal(route.children[0].children, 'wanb → eth0');
 
-console.log('status.js tests passed');
+function schedulerReader(fsMock) {
+	return new Function('fs', 'poll', 'uci', 'ui', 'cakeUi', 'L', 'E', '_',
+		`${prefix}\nreturn { readSchedulerStatuses };`
+	)(fsMock, {}, {}, {}, {}, {
+		resolveDefault: function(promise, fallback) {
+			return Promise.resolve(promise).catch(function() { return fallback; });
+		},
+	}, E, value => value).readSchedulerStatuses;
+}
+
+async function schedulerReadTests() {
+	const sections = [
+		{ '.name': 'constructor', scheduled_autotune_enabled: '1' },
+		{ '.name': 'wanb_sqm', scheduled_autotune_enabled: '1' },
+	];
+	const nativeCalls = [];
+	const nativeBatch = {
+		schema_version: 1, owner: 'native', available: true, observed_at: 1200,
+		stale: false, global_error: null,
+		instances: [ Object.assign({}, nativeSchedule, {
+			instance: 'constructor', owner: 'legacy', source: 'untrusted', available: false,
+		}) ],
+		issues: [ Object.assign({}, nativeSchedule, {
+			instance: 'wanb_sqm', initialized: false, budget_authoritative: false,
+			state: 'error', message: 'Native scheduler configuration is invalid.',
+			accounting_error: false,
+		}), Object.assign({}, nativeSchedule, {
+			instance: 'retired_sqm', initialized: false, budget_authoritative: false,
+			state: 'error', message: 'Durable state has no current UCI configuration.',
+			accounting_error: false,
+		}) ],
+	};
+	const nativeRead = schedulerReader({
+		exec: function(command, args) {
+			nativeCalls.push([ command, args ]);
+			return Promise.resolve({ stdout: JSON.stringify(nativeBatch) });
+		},
+	});
+	const nativeResult = await nativeRead(sections, 'native', { native_scheduler: true });
+	const nativeRows = nativeResult.rows;
+	assert.equal(nativeCalls.length, 1, 'one Status refresh must execute one native batch call');
+	assert.deepEqual(nativeCalls[0], [ '/usr/sbin/cake-autorated',
+		[ '--calibrationctl', 'scheduler-status' ] ]);
+	assert.equal(nativeRows[0].owner, 'native', 'nested data must not override the attested owner');
+	assert.equal(nativeRows[0].source, 'native_scheduler_snapshot',
+		'nested data must not override the pinned source');
+	assert.equal(nativeRows[0].available, true,
+		'nested data must not override batch availability');
+	assert.equal(nativeRows[1].state, 'error',
+		'an invalid WAN must remain isolated without hiding independent native rows');
+	assert.deepEqual(nativeResult.diagnostics, [ {
+		instance: 'retired_sqm', message: 'Durable state has no current UCI configuration.',
+	} ], 'orphan durable state must remain visible as a global scheduler diagnostic');
+
+	const orphanOnlyCalls = [];
+	const orphanOnlyResult = await schedulerReader({
+		exec: function(command, args) {
+			orphanOnlyCalls.push([ command, args ]);
+			return Promise.resolve({ stdout: JSON.stringify({
+				schema_version: 1, owner: 'native', available: true, observed_at: 1200,
+				stale: false, global_error: null, instances: [],
+				issues: [ Object.assign({}, nativeSchedule, {
+					instance: 'retired_sqm', initialized: false,
+					budget_authoritative: false, state: 'error',
+					message: 'Durable state has no current UCI configuration.',
+				}) ],
+			}) });
+		},
+	})([], 'native', { native_scheduler: true });
+	assert.deepEqual(orphanOnlyResult.rows, [],
+		'a native batch with no configured instances must not invent a Status row');
+	assert.deepEqual(orphanOnlyResult.diagnostics, [ {
+		instance: 'retired_sqm', message: 'Durable state has no current UCI configuration.',
+	} ], 'an orphan diagnostic must survive even when zero instances are configured');
+	assert.equal(orphanOnlyCalls.length, 1,
+		'zero configured instances must still use exactly one native batch read');
+	assert.deepEqual(orphanOnlyCalls[0], [ '/usr/sbin/cake-autorated',
+		[ '--calibrationctl', 'scheduler-status' ] ]);
+	assert.equal(orphanOnlyCalls.filter(function(call) {
+		return call[0] === '/usr/libexec/cake-autorate-rs/autotune-scheduler';
+	}).length, 0, 'an orphan-only native refresh must never query the legacy helper');
+	const staleMessage = 'Native scheduler refresh failed; showing the last complete snapshot.';
+	const staleResult = await schedulerReader({
+		exec: function() {
+			return Promise.resolve({ stdout: JSON.stringify(Object.assign({}, nativeBatch, {
+				stale: true, global_error: staleMessage,
+			})) });
+		},
+	})(sections, 'native', { native_scheduler: true });
+	assert.equal(staleResult.rows[0].stale, true);
+	assert.deepEqual(staleResult.diagnostics[0], {
+		instance: 'Native scheduler', message: staleMessage,
+	}, 'stale cached budgets must be accompanied by a visible global warning');
+
+	let failedCalls = 0;
+	const failedRead = schedulerReader({
+		exec: function() {
+			failedCalls += 1;
+			return Promise.reject(new Error('native status unavailable'));
+		},
+	});
+	const failedRows = (await failedRead(sections, 'native', { native_scheduler: true })).rows;
+	assert.equal(failedCalls, 1);
+	assert(failedRows.every(row => row.source === 'none' && row.available === false),
+		'a failed native batch must never fall back to the legacy ledger');
+
+	const invalidCalls = [];
+	const invalidResult = await schedulerReader({
+		exec: function(command, args) {
+			invalidCalls.push([ command, args ]);
+			return Promise.resolve({ stdout: JSON.stringify(Object.assign({}, nativeBatch, {
+				owner: 'legacy',
+			})) });
+		},
+	})(sections, 'native', { native_scheduler: true });
+	assert.equal(invalidCalls.length, 1,
+		'an invalid native contract must stop after one batch attempt');
+	assert.deepEqual(invalidCalls[0], [ '/usr/sbin/cake-autorated',
+		[ '--calibrationctl', 'scheduler-status' ] ]);
+	assert(invalidResult.rows.every(function(row) {
+		return row.source === 'none' && row.available === false;
+	}), 'an invalid native contract must yield unavailable rows without legacy substitution');
+	assert.deepEqual(invalidResult.diagnostics, []);
+
+	let mismatchCalls = 0;
+	const mismatchRows = (await schedulerReader({
+		exec: function() { mismatchCalls += 1; return Promise.resolve({}); },
+	})(sections, 'native', { native_scheduler: false })).rows;
+	assert.equal(mismatchCalls, 0, 'an owner mismatch must not execute either scheduler backend');
+	assert(mismatchRows.every(row => row.source === 'none'));
+
+	const legacyCalls = [];
+	const legacyRead = schedulerReader({
+		exec: function(command, args) {
+			legacyCalls.push([ command, args ]);
+			return Promise.resolve({ stdout: JSON.stringify(Object.assign({}, legacySchedule, {
+				instance: args[1],
+			})) });
+		},
+	});
+	const legacyRows = (await legacyRead(sections, 'legacy', { native_scheduler: false })).rows;
+	assert.equal(legacyCalls.length, 2,
+		'explicit legacy ownership keeps one instance-scoped helper read per configured WAN');
+	assert(legacyRows.every(row => row.owner === 'legacy' &&
+		row.source === 'legacy_scheduler_helper'));
+}
+
+schedulerReadTests().then(function() {
+	console.log('status.js tests passed');
+}).catch(function(error) {
+	console.error(error);
+	process.exitCode = 1;
+});

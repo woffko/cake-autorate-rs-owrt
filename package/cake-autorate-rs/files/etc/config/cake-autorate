@@ -6,3 +6,8 @@ config globals 'globals'
 	# to select a conservative value from MemAvailable, or one of the LuCI
 	# presets from 256 KiB through 102400 KiB (100 MiB).
 	option graph_history_ram_budget_kib 'auto'
+	# Scheduler ownership is intentionally absent from the static conffile. The
+	# package's one-shot UCI-defaults decision preserves every existing explicit
+	# owner, keeps an older configuration on legacy during upgrade, and selects
+	# native on a genuinely fresh installation only after an exact daemon
+	# capability check. The init service refuses a missing or invalid owner.

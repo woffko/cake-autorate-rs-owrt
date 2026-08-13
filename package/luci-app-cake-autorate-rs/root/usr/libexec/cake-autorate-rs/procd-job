@@ -46,8 +46,7 @@ safe_log_path() {
 safe_worker_command() {
 	case "$1" in
 		/usr/libexec/cake-autorate-rs/autotune|\
-		/usr/libexec/cake-autorate-rs/speedtest|\
-		/usr/libexec/cake-autorate-rs/quality-test) return 0 ;;
+		/usr/libexec/cake-autorate-rs/speedtest) return 0 ;;
 	esac
 	case "${CAKE_AUTORATE_PROCD_JOB_TEST_COMMAND_ROOT:-}" in
 		'') return 1 ;;

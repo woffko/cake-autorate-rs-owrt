@@ -1,6 +1,9 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+const CONTAMINATION_CONFIRMATION_SAMPLES: u8 = 3;
+const SLOW_LINK_CONTAMINATION_FLOOR_RATIO: f64 = 0.50;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RatingPhase {
     Idle,
@@ -32,6 +35,7 @@ impl RatingPhase {
         }
     }
 
+    #[cfg(any(feature = "calibration", test))]
     pub fn from_capture(value: &str) -> Option<Self> {
         match value {
             "IDLE" => Some(Self::Idle),
@@ -79,6 +83,16 @@ pub struct RatingLoadSnapshot {
     pub enter_ul_kbps: f64,
     pub phase_age_s: f64,
     pub capture_active: bool,
+    #[cfg_attr(not(feature = "calibration"), allow(dead_code))]
+    pub capture_job_id: String,
+    #[cfg_attr(not(feature = "calibration"), allow(dead_code))]
+    pub capture_generation: u64,
+    #[cfg_attr(not(feature = "calibration"), allow(dead_code))]
+    pub finalized_job_id: String,
+    #[cfg_attr(not(feature = "calibration"), allow(dead_code))]
+    pub finalized_generation: u64,
+    #[cfg_attr(not(feature = "calibration"), allow(dead_code))]
+    pub finalized_outcome: String,
     pub capture_mode: &'static str,
     pub capture_requested_phase: &'static str,
     pub capture_background_dl_kbps: f64,
@@ -113,7 +127,11 @@ pub struct RatingLoadDetector {
     candidate: RatingPhase,
     candidate_since: Instant,
     unsupported_since: Option<Instant>,
-    capture_token: String,
+    capture_job_id: String,
+    capture_generation: u64,
+    finalized_job_id: String,
+    finalized_generation: u64,
+    finalized_outcome: String,
     capture_mode: String,
     capture_requested_phase: Option<RatingPhase>,
     capture_background_dl_kbps: f64,
@@ -122,6 +140,8 @@ pub struct RatingLoadDetector {
     capture_peak_ul_ratio: f64,
     capture_contaminated: bool,
     capture_contamination_reason: &'static str,
+    capture_direction_started: bool,
+    capture_contamination_streak: u8,
     candidate_enter_dl_ratio: f64,
     candidate_enter_ul_ratio: f64,
     latched_exit_dl_ratio: f64,
@@ -137,7 +157,11 @@ impl RatingLoadDetector {
             candidate: RatingPhase::Idle,
             candidate_since: now,
             unsupported_since: None,
-            capture_token: String::new(),
+            capture_job_id: String::new(),
+            capture_generation: 0,
+            finalized_job_id: String::new(),
+            finalized_generation: 0,
+            finalized_outcome: String::new(),
             capture_mode: String::new(),
             capture_requested_phase: None,
             capture_background_dl_kbps: 0.0,
@@ -146,6 +170,8 @@ impl RatingLoadDetector {
             capture_peak_ul_ratio: 0.0,
             capture_contaminated: false,
             capture_contamination_reason: "",
+            capture_direction_started: false,
+            capture_contamination_streak: 0,
             candidate_enter_dl_ratio: 0.0,
             candidate_enter_ul_ratio: 0.0,
             latched_exit_dl_ratio: 0.0,
@@ -153,26 +179,42 @@ impl RatingLoadDetector {
         }
     }
 
+    #[cfg(any(feature = "calibration", test))]
     pub fn set_capture(
         &mut self,
-        token: Option<&str>,
+        job_id: Option<&str>,
         mode: Option<&str>,
         requested_phase: Option<RatingPhase>,
         background_dl_kbps: f64,
         background_ul_kbps: f64,
         now: Instant,
     ) -> bool {
-        let token = token.unwrap_or("");
-        let new_token = self.capture_token != token;
+        let job_id = job_id.unwrap_or("");
+        let new_job = self.capture_job_id != job_id;
         let phase_changed = self.capture_requested_phase != requested_phase;
-        if !new_token && !phase_changed {
+        if !new_job && !phase_changed {
             self.capture_background_dl_kbps = finite_nonnegative(background_dl_kbps);
             self.capture_background_ul_kbps = finite_nonnegative(background_ul_kbps);
             return false;
         }
-        if new_token {
-            self.capture_token.clear();
-            self.capture_token.push_str(token);
+        if new_job {
+            if job_id.is_empty() && !self.capture_job_id.is_empty() {
+                self.finalized_job_id.clear();
+                self.finalized_job_id.push_str(&self.capture_job_id);
+                self.finalized_generation = self.capture_generation;
+                self.finalized_outcome.clear();
+                self.finalized_outcome
+                    .push_str(if self.capture_contaminated {
+                        "contaminated"
+                    } else {
+                        "removed"
+                    });
+            }
+            if !job_id.is_empty() {
+                self.capture_generation = self.capture_generation.saturating_add(1);
+            }
+            self.capture_job_id.clear();
+            self.capture_job_id.push_str(job_id);
             self.capture_mode.clear();
             self.capture_mode.push_str(mode.unwrap_or(""));
             self.capture_peak_dl_ratio = 0.0;
@@ -181,11 +223,57 @@ impl RatingLoadDetector {
             self.capture_contamination_reason = "";
         }
         self.capture_requested_phase = requested_phase;
+        self.capture_direction_started = false;
+        self.capture_contamination_streak = 0;
         self.capture_background_dl_kbps = finite_nonnegative(background_dl_kbps);
         self.capture_background_ul_kbps = finite_nonnegative(background_ul_kbps);
         self.samples.clear();
         self.transition(RatingPhase::Idle, now);
-        new_token && !token.is_empty()
+        new_job && !job_id.is_empty()
+    }
+
+    #[cfg(any(feature = "calibration", test))]
+    pub fn capture_active(&self) -> bool {
+        !self.capture_job_id.is_empty()
+    }
+
+    #[cfg(any(feature = "calibration", test))]
+    pub fn capture_contaminated(&self) -> bool {
+        self.capture_contaminated
+    }
+
+    #[cfg(any(feature = "calibration", test))]
+    pub fn capture_identity(&self) -> Option<(&str, u64)> {
+        self.capture_active()
+            .then_some((self.capture_job_id.as_str(), self.capture_generation))
+    }
+
+    #[cfg(any(feature = "calibration", test))]
+    pub fn finalize_capture_with_outcome(&mut self, outcome: &str, now: Instant) -> bool {
+        if !self.capture_active() {
+            return false;
+        }
+        debug_assert!(matches!(outcome, "removed" | "contaminated" | "expired"));
+        self.finalized_job_id.clear();
+        self.finalized_job_id.push_str(&self.capture_job_id);
+        self.finalized_generation = self.capture_generation;
+        self.finalized_outcome.clear();
+        self.finalized_outcome.push_str(outcome);
+
+        self.capture_job_id.clear();
+        self.capture_mode.clear();
+        self.capture_requested_phase = None;
+        self.capture_peak_dl_ratio = 0.0;
+        self.capture_peak_ul_ratio = 0.0;
+        self.capture_contaminated = false;
+        self.capture_contamination_reason = "";
+        self.capture_direction_started = false;
+        self.capture_contamination_streak = 0;
+        self.capture_background_dl_kbps = 0.0;
+        self.capture_background_ul_kbps = 0.0;
+        self.samples.clear();
+        self.transition(RatingPhase::Idle, now);
+        true
     }
 
     pub fn observe(
@@ -199,7 +287,7 @@ impl RatingLoadDetector {
     ) -> RatingLoadSnapshot {
         let aggregate_dl_rate_kbps = finite_nonnegative(dl_rate_kbps);
         let aggregate_ul_rate_kbps = finite_nonnegative(ul_rate_kbps);
-        let capture_active = !self.capture_token.is_empty();
+        let capture_active = !self.capture_job_id.is_empty();
         let dl_rate_kbps = if capture_active {
             (aggregate_dl_rate_kbps - self.capture_background_dl_kbps).max(0.0)
         } else {
@@ -256,6 +344,14 @@ impl RatingLoadDetector {
         } else {
             learned_exit_ul
         };
+        let enter_dl_min_rate =
+            effective_min_rate_kbps(cfg.min_rate_kbps, dl_shaper_kbps, enter_dl);
+        let enter_ul_min_rate =
+            effective_min_rate_kbps(cfg.min_rate_kbps, ul_shaper_kbps, enter_ul);
+        let exit_dl_min_rate =
+            effective_min_rate_kbps(cfg.min_rate_kbps * 0.5, dl_shaper_kbps, exit_dl);
+        let exit_ul_min_rate =
+            effective_min_rate_kbps(cfg.min_rate_kbps * 0.5, ul_shaper_kbps, exit_ul);
 
         let smoothed_signal = LoadSignal {
             dl_ratio: smoothed_dl,
@@ -269,13 +365,28 @@ impl RatingLoadDetector {
             dl_rate_kbps: entry_dl_rate,
             ul_rate_kbps: entry_ul_rate,
         };
-        self.detect_contamination(smoothed_signal, cfg);
-        let target = self.classify_for_capture(entry_signal, enter_dl, enter_ul, cfg);
+        self.detect_contamination(
+            smoothed_signal,
+            enter_dl_min_rate,
+            enter_ul_min_rate,
+            dl_shaper_kbps,
+            ul_shaper_kbps,
+            cfg,
+        );
+        let target = self.classify_for_capture(
+            entry_signal,
+            enter_dl,
+            enter_ul,
+            enter_dl_min_rate,
+            enter_ul_min_rate,
+            cfg,
+        );
         let supported = classify(
             smoothed_signal,
             exit_dl,
             exit_ul,
-            cfg.min_rate_kbps * 0.5,
+            exit_dl_min_rate,
+            exit_ul_min_rate,
             cfg.dominance_ratio,
         );
 
@@ -303,6 +414,11 @@ impl RatingLoadDetector {
                 .saturating_duration_since(self.phase_since)
                 .as_secs_f64(),
             capture_active,
+            capture_job_id: self.capture_job_id.clone(),
+            capture_generation: self.capture_generation,
+            finalized_job_id: self.finalized_job_id.clone(),
+            finalized_generation: self.finalized_generation,
+            finalized_outcome: self.finalized_outcome.clone(),
             capture_mode: if capture_active {
                 if self.capture_mode == "automatic" {
                     "automatic"
@@ -331,7 +447,7 @@ impl RatingLoadDetector {
     ) -> RatingLoadSnapshot {
         let (dl_rate, ul_rate, dl, ul) = self.smoothed();
         let (enter_dl, enter_ul) = self.learned_enter_thresholds(cfg);
-        let capture_active = !self.capture_token.is_empty();
+        let capture_active = !self.capture_job_id.is_empty();
         let exit_dl = exit_threshold(enter_dl, capture_active, cfg);
         let exit_ul = exit_threshold(enter_ul, capture_active, cfg);
         RatingLoadSnapshot {
@@ -365,6 +481,11 @@ impl RatingLoadDetector {
                 .saturating_duration_since(self.phase_since)
                 .as_secs_f64(),
             capture_active,
+            capture_job_id: self.capture_job_id.clone(),
+            capture_generation: self.capture_generation,
+            finalized_job_id: self.finalized_job_id.clone(),
+            finalized_generation: self.finalized_generation,
+            finalized_outcome: self.finalized_outcome.clone(),
             capture_mode: if !capture_active {
                 "passive"
             } else if self.capture_mode == "automatic" {
@@ -383,7 +504,7 @@ impl RatingLoadDetector {
     }
 
     fn learned_enter_thresholds(&self, cfg: RatingLoadConfig) -> (f64, f64) {
-        if self.capture_token.is_empty() {
+        if self.capture_job_id.is_empty() {
             return (cfg.enter_ratio, cfg.enter_ratio);
         }
         (
@@ -404,6 +525,8 @@ impl RatingLoadDetector {
         signal: LoadSignal,
         dl_threshold: f64,
         ul_threshold: f64,
+        dl_min_rate_kbps: f64,
+        ul_min_rate_kbps: f64,
         cfg: RatingLoadConfig,
     ) -> RatingPhase {
         if self.capture_contaminated {
@@ -412,14 +535,14 @@ impl RatingLoadDetector {
         match self.capture_requested_phase {
             Some(RatingPhase::Idle) => RatingPhase::Idle,
             Some(RatingPhase::Download) => {
-                if signal.dl_ratio >= dl_threshold && signal.dl_rate_kbps >= cfg.min_rate_kbps {
+                if signal.dl_ratio >= dl_threshold && signal.dl_rate_kbps >= dl_min_rate_kbps {
                     RatingPhase::Download
                 } else {
                     RatingPhase::Idle
                 }
             }
             Some(RatingPhase::Upload) => {
-                if signal.ul_ratio >= ul_threshold && signal.ul_rate_kbps >= cfg.min_rate_kbps {
+                if signal.ul_ratio >= ul_threshold && signal.ul_rate_kbps >= ul_min_rate_kbps {
                     RatingPhase::Upload
                 } else {
                     RatingPhase::Idle
@@ -429,39 +552,83 @@ impl RatingLoadDetector {
                 signal,
                 dl_threshold,
                 ul_threshold,
-                cfg.min_rate_kbps,
+                dl_min_rate_kbps,
+                ul_min_rate_kbps,
                 cfg.dominance_ratio,
             ),
         }
     }
 
-    fn detect_contamination(&mut self, signal: LoadSignal, cfg: RatingLoadConfig) {
-        if self.capture_token.is_empty() || self.capture_contaminated {
+    fn detect_contamination(
+        &mut self,
+        signal: LoadSignal,
+        expected_dl_min_rate_kbps: f64,
+        expected_ul_min_rate_kbps: f64,
+        dl_shaper_kbps: f64,
+        ul_shaper_kbps: f64,
+        cfg: RatingLoadConfig,
+    ) {
+        if self.capture_job_id.is_empty() || self.capture_contaminated {
             return;
         }
-        let min_rate = cfg.min_rate_kbps * 0.5;
-        match self.capture_requested_phase {
+        let unexpected_dl_min_rate_kbps = effective_contamination_min_rate_kbps(
+            cfg.min_rate_kbps * 0.5,
+            dl_shaper_kbps,
+            cfg.capture_contamination_ratio,
+        );
+        let unexpected_ul_min_rate_kbps = effective_contamination_min_rate_kbps(
+            cfg.min_rate_kbps * 0.5,
+            ul_shaper_kbps,
+            cfg.capture_contamination_ratio,
+        );
+        if !self.capture_direction_started {
+            let requested_direction_started = match self.capture_requested_phase {
+                Some(RatingPhase::Download) => {
+                    signal.dl_ratio >= cfg.capture_min_enter_ratio
+                        && signal.dl_rate_kbps >= expected_dl_min_rate_kbps
+                }
+                Some(RatingPhase::Upload) => {
+                    signal.ul_ratio >= cfg.capture_min_enter_ratio
+                        && signal.ul_rate_kbps >= expected_ul_min_rate_kbps
+                }
+                _ => false,
+            };
+            self.capture_contamination_streak = 0;
+            if requested_direction_started {
+                self.capture_direction_started = true;
+            }
+            return;
+        }
+
+        let reason = match self.capture_requested_phase {
             Some(RatingPhase::Download)
                 if signal.dl_ratio >= cfg.capture_min_enter_ratio
-                    && signal.dl_rate_kbps >= cfg.min_rate_kbps
+                    && signal.dl_rate_kbps >= expected_dl_min_rate_kbps
                     && signal.ul_ratio >= cfg.capture_contamination_ratio
-                    && signal.ul_rate_kbps >= min_rate
+                    && signal.ul_rate_kbps >= unexpected_ul_min_rate_kbps
                     && signal.ul_rate_kbps > signal.dl_rate_kbps * cfg.capture_ack_ratio =>
             {
-                self.capture_contaminated = true;
-                self.capture_contamination_reason = "unexpected_upload_during_download";
+                Some("unexpected_upload_during_download")
             }
             Some(RatingPhase::Upload)
                 if signal.ul_ratio >= cfg.capture_min_enter_ratio
-                    && signal.ul_rate_kbps >= cfg.min_rate_kbps
+                    && signal.ul_rate_kbps >= expected_ul_min_rate_kbps
                     && signal.dl_ratio >= cfg.capture_contamination_ratio
-                    && signal.dl_rate_kbps >= min_rate
+                    && signal.dl_rate_kbps >= unexpected_dl_min_rate_kbps
                     && signal.dl_rate_kbps > signal.ul_rate_kbps * cfg.capture_ack_ratio =>
             {
-                self.capture_contaminated = true;
-                self.capture_contamination_reason = "unexpected_download_during_upload";
+                Some("unexpected_download_during_upload")
             }
-            _ => {}
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            self.capture_contamination_streak = self.capture_contamination_streak.saturating_add(1);
+            if self.capture_contamination_streak >= CONTAMINATION_CONFIRMATION_SAMPLES {
+                self.capture_contaminated = true;
+                self.capture_contamination_reason = reason;
+            }
+        } else {
+            self.capture_contamination_streak = 0;
         }
     }
 
@@ -549,7 +716,7 @@ impl RatingLoadDetector {
         }
         if now.saturating_duration_since(self.candidate_since) >= cfg.hold {
             if target.loaded() {
-                let capture_active = !self.capture_token.is_empty();
+                let capture_active = !self.capture_job_id.is_empty();
                 self.latched_exit_dl_ratio =
                     exit_threshold(self.candidate_enter_dl_ratio, capture_active, cfg);
                 self.latched_exit_ul_ratio =
@@ -599,6 +766,24 @@ fn learned_capture_threshold(peak: f64, cfg: RatingLoadConfig) -> f64 {
         .min((peak.clamp(0.0, 1.5) * cfg.capture_peak_factor).max(cfg.capture_min_enter_ratio))
 }
 
+fn effective_min_rate_kbps(absolute_kbps: f64, shaper_kbps: f64, ratio: f64) -> f64 {
+    let absolute_kbps = finite_nonnegative(absolute_kbps);
+    let relative_kbps = finite_nonnegative(shaper_kbps) * ratio.clamp(0.0, 1.0);
+    if absolute_kbps == 0.0 || relative_kbps == 0.0 {
+        absolute_kbps
+    } else {
+        absolute_kbps.min(relative_kbps)
+    }
+}
+
+fn effective_contamination_min_rate_kbps(absolute_kbps: f64, shaper_kbps: f64, ratio: f64) -> f64 {
+    let shaper_kbps = finite_nonnegative(shaper_kbps);
+    let relative_kbps = shaper_kbps * ratio.clamp(0.0, 1.0);
+    let bounded_absolute_kbps =
+        finite_nonnegative(absolute_kbps).min(shaper_kbps * SLOW_LINK_CONTAMINATION_FLOOR_RATIO);
+    relative_kbps.max(bounded_absolute_kbps)
+}
+
 fn exit_threshold(enter: f64, capture_active: bool, cfg: RatingLoadConfig) -> f64 {
     if capture_active {
         cfg.exit_ratio
@@ -612,11 +797,12 @@ fn classify(
     signal: LoadSignal,
     dl_threshold: f64,
     ul_threshold: f64,
-    min_rate: f64,
+    dl_min_rate_kbps: f64,
+    ul_min_rate_kbps: f64,
     dominance: f64,
 ) -> RatingPhase {
-    let dl = signal.dl_ratio >= dl_threshold && signal.dl_rate_kbps >= min_rate;
-    let ul = signal.ul_ratio >= ul_threshold && signal.ul_rate_kbps >= min_rate;
+    let dl = signal.dl_ratio >= dl_threshold && signal.dl_rate_kbps >= dl_min_rate_kbps;
+    let ul = signal.ul_ratio >= ul_threshold && signal.ul_rate_kbps >= ul_min_rate_kbps;
     match (dl, ul) {
         (false, false) => RatingPhase::Idle,
         (true, false) => RatingPhase::Download,
@@ -892,6 +1078,150 @@ mod tests {
     }
 
     #[test]
+    fn forced_capture_enters_on_a_saturated_slow_link() {
+        let start = Instant::now();
+        for shaper_kbps in [500.0, 1_000.0, 2_000.0, 8_000.0, 100_000.0] {
+            let mut detector = RatingLoadDetector::new(start);
+            detector.set_capture(
+                Some("token-slow-link"),
+                Some("automatic"),
+                Some(RatingPhase::Download),
+                0.0,
+                0.0,
+                start,
+            );
+            let mut snapshot = detector.snapshot(start, cfg(), shaper_kbps, shaper_kbps);
+            for index in 0..20 {
+                snapshot = detector.observe(
+                    start + Duration::from_millis(index * 200),
+                    shaper_kbps * 0.95,
+                    0.0,
+                    shaper_kbps,
+                    shaper_kbps,
+                    cfg(),
+                );
+            }
+            assert_eq!(
+                snapshot.phase,
+                RatingPhase::Download,
+                "a saturated {shaper_kbps} kbit/s link must enter forced download capture"
+            );
+        }
+    }
+
+    #[test]
+    fn shaper_relative_floor_keeps_ratio_gate_and_fast_link_floor() {
+        let start = Instant::now();
+        for (shaper_kbps, observed_kbps) in [(1_000.0, 100.0), (100_000.0, 1_500.0)] {
+            let mut detector = RatingLoadDetector::new(start);
+            detector.set_capture(
+                Some("token-below-gate"),
+                Some("automatic"),
+                Some(RatingPhase::Download),
+                0.0,
+                0.0,
+                start,
+            );
+            let mut snapshot = detector.snapshot(start, cfg(), shaper_kbps, shaper_kbps);
+            for index in 0..20 {
+                snapshot = detector.observe(
+                    start + Duration::from_millis(index * 200),
+                    observed_kbps,
+                    0.0,
+                    shaper_kbps,
+                    shaper_kbps,
+                    cfg(),
+                );
+            }
+            assert_eq!(snapshot.phase, RatingPhase::Idle);
+            assert!(!snapshot.capture_contaminated);
+        }
+    }
+
+    #[test]
+    fn forced_download_detects_contamination_on_a_slow_link() {
+        let start = Instant::now();
+        let mut detector = RatingLoadDetector::new(start);
+        detector.set_capture(
+            Some("token-slow-contamination"),
+            Some("automatic"),
+            Some(RatingPhase::Download),
+            0.0,
+            0.0,
+            start,
+        );
+        let mut snapshot = detector.snapshot(start, cfg(), 1_000.0, 1_000.0);
+        for index in 0..20 {
+            snapshot = detector.observe(
+                start + Duration::from_millis(index * 200),
+                950.0,
+                600.0,
+                1_000.0,
+                1_000.0,
+                cfg(),
+            );
+        }
+        assert_eq!(snapshot.phase, RatingPhase::Idle);
+        assert!(snapshot.capture_contaminated);
+        assert_eq!(
+            snapshot.capture_contamination_reason,
+            "unexpected_upload_during_download"
+        );
+    }
+
+    #[test]
+    fn forced_capture_does_not_latch_a_transient_opposite_direction_burst() {
+        let start = Instant::now();
+        let mut detector = RatingLoadDetector::new(start);
+        detector.set_capture(
+            Some("token-transient-contamination"),
+            Some("automatic"),
+            Some(RatingPhase::Download),
+            0.0,
+            0.0,
+            start,
+        );
+        for index in 0..3 {
+            let snapshot = detector.observe(
+                start + Duration::from_millis(index * 200),
+                950.0,
+                600.0,
+                1_000.0,
+                1_000.0,
+                cfg(),
+            );
+            assert!(!snapshot.capture_contaminated);
+        }
+    }
+
+    #[test]
+    fn slow_link_control_traffic_below_half_the_reverse_shaper_is_not_contamination() {
+        let start = Instant::now();
+        let mut detector = RatingLoadDetector::new(start);
+        detector.set_capture(
+            Some("token-slow-control"),
+            Some("automatic"),
+            Some(RatingPhase::Download),
+            0.0,
+            0.0,
+            start,
+        );
+        let mut snapshot = detector.snapshot(start, cfg(), 1_000.0, 1_000.0);
+        for index in 0..20 {
+            snapshot = detector.observe(
+                start + Duration::from_millis(index * 200),
+                950.0,
+                450.0,
+                1_000.0,
+                1_000.0,
+                cfg(),
+            );
+        }
+        assert_eq!(snapshot.phase, RatingPhase::Download);
+        assert!(!snapshot.capture_contaminated);
+    }
+
+    #[test]
     fn forced_download_allows_expected_tcp_ack_traffic_on_asymmetric_link() {
         let start = Instant::now();
         let mut detector = RatingLoadDetector::new(start);
@@ -954,5 +1284,33 @@ mod tests {
         );
         assert_eq!(snapshot.phase, RatingPhase::Idle);
         assert_eq!(snapshot.capture_requested_phase, "IDLE");
+    }
+
+    #[test]
+    fn explicit_finalization_is_exact_and_idempotent() {
+        let start = Instant::now();
+        let mut detector = RatingLoadDetector::new(start);
+        assert!(detector.set_capture(
+            Some("capture-finalize"),
+            Some("client"),
+            None,
+            0.0,
+            0.0,
+            start,
+        ));
+        assert_eq!(detector.capture_identity(), Some(("capture-finalize", 1)));
+        assert!(detector.finalize_capture_with_outcome("removed", start + Duration::from_secs(1)));
+        let finalized =
+            detector.snapshot(start + Duration::from_secs(1), cfg(), 900_000.0, 860_000.0);
+        assert!(!finalized.capture_active);
+        assert_eq!(finalized.finalized_job_id, "capture-finalize");
+        assert_eq!(finalized.finalized_generation, 1);
+        assert_eq!(finalized.finalized_outcome, "removed");
+        assert!(!detector.finalize_capture_with_outcome("expired", start + Duration::from_secs(2)));
+        let unchanged =
+            detector.snapshot(start + Duration::from_secs(2), cfg(), 900_000.0, 860_000.0);
+        assert_eq!(unchanged.finalized_job_id, "capture-finalize");
+        assert_eq!(unchanged.finalized_generation, 1);
+        assert_eq!(unchanged.finalized_outcome, "removed");
     }
 }

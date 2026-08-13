@@ -7,7 +7,7 @@ test -x "$init_script" || {
 	echo 'independent apply-guard init script is not executable' >&2
 	exit 1
 }
-work="${TMPDIR:-/tmp}/cake-apply-guard-init-test.$$"
+work="$(mktemp -d "${TMPDIR:-/tmp}/cake-apply-guard-init-test.XXXXXX")"
 helper="$work/apply-guard"
 log="$work/procd"
 mkdir -p "$work"

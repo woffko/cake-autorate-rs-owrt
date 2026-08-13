@@ -855,10 +855,100 @@ procd_log="$work/procd.log"
 procd_open_instance() { printf 'open %s\n' "$1" >> "$procd_log"; }
 procd_set_param() { printf 'param %s\n' "$*" >> "$procd_log"; }
 procd_close_instance() { printf 'close\n' >> "$procd_log"; }
+logger() { :; }
+
+# Boot recovery is a fail-closed prerequisite.  If the daemon cannot restore
+# a durable native Apply transaction, no coordinator, scheduler, or legacy
+# recovery monitor may be admitted.
+if (
+	CAKE_AUTORATE_DAEMON=/bin/false
+	export CAKE_AUTORATE_DAEMON
+	. "$test_dir/../root/etc/init.d/cake-autorate-autotune"
+	start_service
+); then
+	echo 'autotune init unexpectedly continued after native recovery failure' >&2
+	exit 1
+fi
+[ ! -s "$procd_log" ] || {
+	echo 'autotune init admitted procd instances before native recovery succeeded' >&2
+	exit 1
+}
+
+CAKE_AUTORATE_DAEMON=/bin/true
+export CAKE_AUTORATE_DAEMON
 . "$test_dir/../root/etc/init.d/cake-autorate-autotune"
+read_scheduler_engine() { printf '%s\n' legacy; }
 start_service
 grep -q '^open scheduler$' "$procd_log"
 grep -q '^open recovery$' "$procd_log"
 grep -q 'autotune-recover monitor /tmp/cake-autorate-autotune/recovery' "$procd_log"
+
+# Native scheduler ownership is mutually exclusive with the legacy shell
+# scheduler and shares the one Rust coordinator.  The ledger path is
+# persistent, while the independently supervised legacy recovery monitor stays
+# available until the remaining compatibility workers are removed.
+native_daemon="$work/native-daemon"
+cat > "$native_daemon" <<'EOF'
+#!/bin/sh
+case "${1:-}" in
+	--native-apply-recover) exit 0 ;;
+	--calibration-capabilities)
+		printf '%s\n' 'cake-autorate-calibration-capabilities 3 native-autotune native-rating native-scheduler native-speedtest'
+		exit 0
+		;;
+	*) exit 0 ;;
+esac
+EOF
+chmod 700 "$native_daemon"
+: > "$procd_log"
+CAKE_AUTORATE_DAEMON="$native_daemon"
+export CAKE_AUTORATE_DAEMON
+. "$test_dir/../root/etc/init.d/cake-autorate-autotune"
+read_scheduler_engine() { printf '%s\n' native; }
+start_service
+grep -q '^open coordinator$' "$procd_log"
+grep -q '^open recovery$' "$procd_log"
+if grep -q '^open scheduler$' "$procd_log"; then
+	echo 'native scheduler mode admitted the competing shell scheduler' >&2
+	exit 1
+fi
+grep -q -- '--calibrationd --native-rating --native-speedtest --native-autotune --native-scheduler --scheduler-store-dir /etc/cake-autorate-rs-scheduler' "$procd_log"
+
+# Usage text is not a capability protocol. A daemon that merely mentions the
+# production flags in --help must leave native mode with zero admitted procd
+# instances rather than silently starting a coordinator with no scheduler.
+help_only_daemon="$work/help-only-daemon"
+cat > "$help_only_daemon" <<'EOF'
+#!/bin/sh
+case "${1:-}" in
+	--native-apply-recover) exit 0 ;;
+	--help) printf '%s\n' '--native-autotune --native-scheduler'; exit 0 ;;
+	*) exit 2 ;;
+esac
+EOF
+chmod 700 "$help_only_daemon"
+: > "$procd_log"
+CAKE_AUTORATE_DAEMON="$help_only_daemon"
+export CAKE_AUTORATE_DAEMON
+. "$test_dir/../root/etc/init.d/cake-autorate-autotune"
+read_scheduler_engine() { printf '%s\n' native; }
+if start_service; then
+	echo 'help-only daemon was accepted as production scheduler capable' >&2
+	exit 1
+fi
+[ ! -s "$procd_log" ]
+
+# Once package migration has made ownership explicit, a missing option must
+# not silently revert a native ledger to the legacy shell scheduler.
+if (
+	. "$test_dir/../root/etc/init.d/cake-autorate-autotune"
+	config_load() { return 0; }
+	config_get() { eval "$1="; }
+	logger() { :; }
+	read_scheduler_engine
+); then
+	echo 'missing scheduler engine unexpectedly defaulted to legacy' >&2
+	exit 1
+fi
 
 echo 'autotune crash-recovery helper tests passed'

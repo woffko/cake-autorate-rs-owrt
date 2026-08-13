@@ -101,7 +101,7 @@ speedtest_progress() {
 	progress_bytes="${2:-0}"
 	[ -n "$speedtest_progress_file" ] || return 0
 	case "$progress_stage" in
-		route-verified|bypass-prepared|speedtest-go-started|speedtest-go-output-ready|speedtest-go-command-failed|speedtest-go-verified|backend-complete) ;;
+		route-verified|bypass-prepared|speedtest-go-started|speedtest-go-output-ready|speedtest-go-command-failed|speedtest-go-direction-unavailable|speedtest-go-verified|backend-complete) ;;
 		*) return 1 ;;
 	esac
 	case "$progress_bytes" in ''|*[!0-9]*) progress_bytes=0 ;; esac
@@ -531,9 +531,18 @@ verify_speedtest_go_route_bytes() {
 	if is_positive_uint "$download_kbps"; then
 		speedtest_route_rx_required="$(minimum_proof_bytes "$download_kbps" "$download_elapsed")"
 		[ "$speedtest_route_rx_delta" -ge "$speedtest_route_rx_required" ] || return 1
+	elif [ "$direction_override" = download ]; then
+		# A very low shaped candidate can make speedtest-go round the selected
+		# direction to zero. It is a measured search boundary only after the
+		# selected route still proves a meaningful transfer independently.
+		speedtest_route_rx_required=1048576
+		[ "$speedtest_route_rx_delta" -ge "$speedtest_route_rx_required" ] || return 1
 	fi
 	if is_positive_uint "$upload_kbps"; then
 		speedtest_route_tx_required="$(minimum_proof_bytes "$upload_kbps" "$upload_elapsed")"
+		[ "$speedtest_route_tx_delta" -ge "$speedtest_route_tx_required" ] || return 1
+	elif [ "$direction_override" = upload ]; then
+		speedtest_route_tx_required=1048576
 		[ "$speedtest_route_tx_delta" -ge "$speedtest_route_tx_required" ] || return 1
 	fi
 	speedtest_route_traffic_proved=true
@@ -2408,6 +2417,7 @@ run_speedtest_go_once() {
 	local server_id="$1" start stop dl_bytes_per_s ul_bytes_per_s source_ip value
 
 	reset_result
+	speedtest_backend_error=""
 	backend="speedtest-go"
 	source="speedtest-go"
 
@@ -2475,9 +2485,13 @@ run_speedtest_go_once() {
 	download_size="0"
 	upload_size="0"
 
-	direction_result_available || return 1
 	if ! verify_speedtest_go_route_bytes; then
 		speedtest_route_proof_error="speedtest-go traffic did not traverse the selected interface $route_device"
+		return 1
+	fi
+	if ! direction_result_available; then
+		speedtest_backend_error="speedtest-direction-result-unavailable"
+		speedtest_progress speedtest-go-direction-unavailable "$response_bytes" || return 1
 		return 1
 	fi
 	speedtest_progress speedtest-go-verified "$response_bytes" || return 1
@@ -2749,6 +2763,7 @@ run_preferred_backend() {
 		return 0
 	fi
 	[ -z "$speedtest_route_proof_error" ] || json_error "$speedtest_route_proof_error"
+	[ -z "${speedtest_backend_error:-}" ] || json_error "$speedtest_backend_error"
 
 	json_error "$(backend_title "$preferred_backend") backend failed"
 }

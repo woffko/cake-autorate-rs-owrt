@@ -357,6 +357,13 @@ uint53_subtract() {
 	}'
 }
 
+monotonic_counter_delta() {
+	counter_after="$(uint53_normalize "${1:-}" 2>/dev/null)" || return 1
+	counter_before="$(uint53_normalize "${2:-}" 2>/dev/null)" || return 1
+	uint53_compare "$counter_after" ge "$counter_before" || return 1
+	uint53_subtract "$counter_after" "$counter_before"
+}
+
 uint53_is_positive() {
 	uint53_compare "$1" gt 0
 }
@@ -554,7 +561,11 @@ prepare_job_storage() {
 remove_history_run() {
 	history_remove_dir="$1"
 	case "$history_remove_dir" in "$history_dir"/*) ;; *) return 1 ;; esac
-	[ -d "$history_remove_dir" ] && [ ! -L "$history_remove_dir" ] || return 1
+	# Another parallel prune may have already removed this directory.
+	# Treat a missing directory as success rather than propagating a spurious
+	# error that would abort the calling prune_history loop.
+	[ -d "$history_remove_dir" ] || return 0
+	[ ! -L "$history_remove_dir" ] || return 1
 	runtime_lock_path_owned_by_euid "$history_remove_dir" || return 1
 	[ -z "$(find "$history_remove_dir" -type l -print -quit 2>/dev/null)" ] || return 1
 	find "$history_remove_dir" -type f -exec rm -f {} \; 2>/dev/null || return 1
@@ -833,6 +844,9 @@ read_worker_identity() {
 	identity_profile="$(sed -n '8p' "$pid_file" 2>/dev/null)"
 	identity_conservative="$(sed -n '9p' "$pid_file" 2>/dev/null)"
 	identity_traffic_budget="$(sed -n '10p' "$pid_file" 2>/dev/null)"
+	# Strip leading zeros so numeric comparison with traffic_budget_bytes
+	# works even if the pid file was written with zero-padded values.
+	identity_traffic_budget="$(printf '%s' "${identity_traffic_budget:-0}" | sed 's/^0*//; s/^$/0/')"
 	[ -n "$identity_traffic_budget" ] || identity_traffic_budget=0
 	identity_calibration_strategy="$(sed -n '11p' "$pid_file" 2>/dev/null)"
 	[ -n "$identity_calibration_strategy" ] || identity_calibration_strategy=full_raw
@@ -946,6 +960,21 @@ atomic_write() {
 	[ ! -L "$file" ] || return 1
 	[ ! -e "$tmp" ] && [ ! -L "$tmp" ] || return 1
 	printf '%s\n' "$*" > "$tmp" &&
+		owned_regular_file "$tmp" && chmod 600 "$tmp" 2>/dev/null &&
+		mv "$tmp" "$file" && owned_regular_file "$file"
+}
+
+atomic_write_worker_identity() {
+	file="$1"
+	shift
+	[ "$#" -eq 17 ] || return 1
+	tmp="$file.$$"
+	[ ! -L "$file" ] || return 1
+	[ ! -e "$tmp" ] && [ ! -L "$tmp" ] || return 1
+	# Write positional fields directly. Command substitution removes every
+	# trailing newline and would collapse empty optional fields 16 and 17.
+	printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+		"$@" > "$tmp" &&
 		owned_regular_file "$tmp" && chmod 600 "$tmp" 2>/dev/null &&
 		mv "$tmp" "$file" && owned_regular_file "$file"
 }
@@ -1215,7 +1244,7 @@ config_fingerprint_matches() {
 }
 
 config_changed_inconclusive() {
-	stage_terminal_json error "{\"state\":\"inconclusive\",\"schema_version\":7,\"stage\":\"config-changed\",\"error\":\"Managed CAKE Autorate/SQM configuration changed during calibration; all measurements are stale.\",\"reason\":\"config-changed\",\"retryable\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"configuration_written\":false}"
+	stage_terminal_json error "{\"state\":\"inconclusive\",\"schema_version\":8,\"stage\":\"config-changed\",\"error\":\"Managed CAKE Autorate/SQM configuration changed during calibration; all measurements are stale.\",\"reason\":\"config-changed\",\"retryable\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"configuration_written\":false}"
 	exit 1
 }
 
@@ -1238,11 +1267,9 @@ terminal_json_valid() {
 stage_terminal_json() {
 	terminal_kind="$1"
 	payload="$2"
-	# Schema 8 adds evidence-derived confidence and result-class semantics. Keep
-	# the numerous fail-closed terminal construction sites readable while
-	# normalising their single top-level schema field at the publication gate.
-	# Nested daemon/proposal schemas are deliberately left unchanged.
-	payload="$(printf '%s\n' "$payload" | sed 's/"schema_version":7/"schema_version":8/')"
+	# All terminal construction sites now emit schema_version:8 directly.
+	# The sed migration shim has been removed; nested daemon/proposal schemas
+	# are deliberately independent and left unchanged.
 	if [ "${config_fingerprint_captured:-false}" = true ] &&
 	   ! config_fingerprint_matches; then
 		payload="{\"state\":\"inconclusive\",\"schema_version\":8,\"stage\":\"config-changed\",\"error\":\"Managed CAKE Autorate/SQM configuration changed during calibration; all measurements are stale.\",\"reason\":\"config-changed\",\"retryable\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"configuration_written\":false}"
@@ -1258,9 +1285,23 @@ stage_terminal_json() {
 			*'"traffic_budget":'*) ;;
 			*'}') payload="${payload%?},\"traffic_budget\":$(traffic_budget_json)}" ;;
 			*) return 1 ;;
-		esac
+		 esac
 	fi
 	terminal_json_shape_valid "$payload" || return 1
+	# Bind every terminal object to the instance before it reaches the pending
+	# file.  This happens before atomic publication, so status-summary can never
+	# observe a current-schema result/error in the gap between publication and
+	# identity injection.  Existing producers that already carry job_id must
+	# agree with the immutable worker instance; silently overwriting a mismatch
+	# would make stale cross-instance evidence appear trustworthy.
+	case "$payload" in
+		*'"job_id":'*)
+			terminal_payload_job_id="$(extract_json "$payload" '@.job_id')" || return 1
+			[ "$terminal_payload_job_id" = "$job_name" ] || return 1
+			;;
+		*'}') payload="${payload%?},\"job_id\":\"$(json_escape "$job_name")\"}" ;;
+		*) return 1 ;;
+	esac
 	case "$payload" in
 		*'}') payload="${payload%?},\"producer\":\"$autotune_result_producer\",\"profile\":\"$autotune_profile\",\"run_id\":\"$(json_escape "${worker_token:-unknown}")\",\"config_fingerprint\":\"$(json_escape "${config_fingerprint:-}")\",\"runtime_restored\":false,\"recovery_pending\":true}" ;;
 		*) return 1 ;;
@@ -1292,7 +1333,11 @@ publish_staged_terminal() {
 	else
 		return 1
 	fi
-	pending_payload="$(cat "$pending_source" 2>/dev/null)" || return 1
+	# Read atomically and guard against TOCTOU: the pending file could be
+	# removed between the [ -s ] check above and the cat below. An empty
+	# result (file gone or truncated) is treated identically to a missing file.
+	pending_payload="$(cat "$pending_source" 2>/dev/null)"
+	[ -n "$pending_payload" ] || return 1
 	terminal_json_valid "$pending_payload" || return 1
 	case "$pending_payload" in *'"runtime_restored":false,"recovery_pending":true}') ;; *) return 1 ;; esac
 	terminal_payload="$(printf '%s\n' "$pending_payload" |
@@ -1563,9 +1608,14 @@ build_autotune_confidence() {
 			"Simultaneous download and upload missed the selected profile's latency or loss target."
 	fi
 
-	overall_confidence_percent="$capacity_download_confidence_percent"
-	[ "$capacity_upload_confidence_percent" -ge "$overall_confidence_percent" ] ||
-		overall_confidence_percent="$capacity_upload_confidence_percent"
+	overall_confidence_percent=100
+	if [ "${sqm_direction_mode:-both}" != "upload_only" ]; then
+		overall_confidence_percent="$capacity_download_confidence_percent"
+	fi
+	if [ "${sqm_direction_mode:-both}" != "download_only" ]; then
+		[ "$capacity_upload_confidence_percent" -ge "$overall_confidence_percent" ] ||
+			overall_confidence_percent="$capacity_upload_confidence_percent"
+	fi
 	[ "$quality_confidence_percent" -ge "$overall_confidence_percent" ] ||
 		overall_confidence_percent="$quality_confidence_percent"
 
@@ -1588,6 +1638,8 @@ measure_background_traffic() {
 		background_dl_kbps="${CAKE_AUTORATE_AUTOTUNE_BACKGROUND_DL_KBPS:-0}"
 		background_ul_kbps="${CAKE_AUTORATE_AUTOTUNE_BACKGROUND_UL_KBPS:-0}"
 	else
+		background_dl_counter_valid=true
+		background_ul_counter_valid=true
 		duration="${CAKE_AUTORATE_AUTOTUNE_BACKGROUND_SAMPLE_S:-3}"
 		case "$duration" in ''|*[!0-9]*) duration=3 ;; esac
 		[ "$duration" -ge 1 ] 2>/dev/null || duration=3
@@ -1596,8 +1648,20 @@ measure_background_traffic() {
 		sleep "$duration"
 		rx_after="$(sed -n '1p' "/sys/class/net/$target_if/statistics/rx_bytes" 2>/dev/null)"
 		tx_after="$(sed -n '1p' "/sys/class/net/$target_if/statistics/tx_bytes" 2>/dev/null)"
-		background_dl_kbps="$(awk -v a="${rx_after:-0}" -v b="${rx_before:-0}" -v s="$duration" 'BEGIN { d=a-b; if (d<0)d=0; printf "%.0f", d*8/s/1000 }')"
-		background_ul_kbps="$(awk -v a="${tx_after:-0}" -v b="${tx_before:-0}" -v s="$duration" 'BEGIN { d=a-b; if (d<0)d=0; printf "%.0f", d*8/s/1000 }')"
+		# Linux exposes monotonic 64-bit link statistics through sysfs, including
+		# on 32-bit OpenWrt targets. A missing, malformed, or regressing counter
+		# means an interface reset/race, not a 32-bit wrap; fail the quiet proof
+		# closed instead of inventing either 0 bytes or a 4-GiB burst.
+		_bg_dl_bytes="$(monotonic_counter_delta "$rx_after" "$rx_before")" || {
+			background_dl_counter_valid=false
+			_bg_dl_bytes=0
+		}
+		_bg_ul_bytes="$(monotonic_counter_delta "$tx_after" "$tx_before")" || {
+			background_ul_counter_valid=false
+			_bg_ul_bytes=0
+		}
+		background_dl_kbps="$(awk -v d="${_bg_dl_bytes:-0}" -v s="$duration" 'BEGIN { printf "%.0f", d*8/s/1000 }')"
+		background_ul_kbps="$(awk -v d="${_bg_ul_bytes:-0}" -v s="$duration" 'BEGIN { printf "%.0f", d*8/s/1000 }')"
 	fi
 
 	dl_reference="$(phase_reference_rate dl)"
@@ -1624,12 +1688,16 @@ measure_background_traffic() {
 		background_reference_deferred=true
 	fi
 	background_blocked=false
+	[ "${background_dl_counter_valid:-true}" = true ] || background_blocked=true
+	[ "${background_ul_counter_valid:-true}" = true ] || background_blocked=true
 	[ "$background_dl_reference_known" != true ] ||
 		! background_rate_exceeds "$background_dl_kbps" "$background_dl_limit" || background_blocked=true
 	[ "$background_ul_reference_known" != true ] ||
 		! background_rate_exceeds "$background_ul_kbps" "$background_ul_limit" || background_blocked=true
 	background_dl_usable=true
 	background_ul_usable=true
+	[ "${background_dl_counter_valid:-true}" = true ] || background_dl_usable=false
+	[ "${background_ul_counter_valid:-true}" = true ] || background_ul_usable=false
 	[ "$background_dl_reference_known" != true ] ||
 		! background_rate_exceeds "$background_dl_kbps" "$background_dl_hard" || background_dl_usable=false
 	[ "$background_ul_reference_known" != true ] ||
@@ -1746,7 +1814,7 @@ check_background_traffic() {
 	prethroughput_background_ul_kbps="${background_ul_kbps:-0}"
 	prethroughput_background_reference_deferred="${background_reference_deferred:-false}"
 	if [ "$background_blocked" = true ] && [ "${conservative_mode:-0}" != 1 ]; then
-		stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":7,\"error\":\"Background traffic is above the strict calibration limit. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"quiet-check\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"phase_contamination_seen\":false,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
+		stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":8,\"error\":\"Background traffic is above the strict calibration limit. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"quiet-check\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"phase_contamination_seen\":false,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
 		exit 1
 	fi
 	if [ "${conservative_mode:-0}" = 1 ] && [ "$background_blocked" = true ]; then
@@ -3342,7 +3410,7 @@ capture_idle_baseline() {
 				baseline_phase_attempt=$((baseline_phase_attempt + 1))
 				continue
 			fi
-			stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":7,\"stage\":\"baseline\",\"error\":\"The uplink was busy before both idle baseline attempts. Retry when quiet or explicitly rerun with background-aware conservative safeguards.\",\"background_blocked\":true,\"retryable\":true,\"conservative_available\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
+			stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":8,\"stage\":\"baseline\",\"error\":\"The uplink was busy before both idle baseline attempts. Retry when quiet or explicitly rerun with background-aware conservative safeguards.\",\"background_blocked\":true,\"retryable\":true,\"conservative_available\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
 			exit 1
 		fi
 
@@ -3512,7 +3580,7 @@ validate_deferred_baseline_capacity() {
 	background_ul_hard="$(strict_background_limit "$retrospective_ul_capacity" 0.35 5000)"
 	if [ "$retrospective_pass" != true ] && [ "${conservative_mode:-0}" != 1 ]; then
 		phase_contamination_seen=true
-		stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":7,\"stage\":\"baseline-retrospective\",\"reason\":\"baseline-retrospectively-contaminated\",\"error\":\"The provisional idle baseline carried too much traffic relative to the measured link capacity. Retry when quieter or explicitly rerun with background-aware conservative safeguards.\",\"background_blocked\":true,\"retryable\":true,\"conservative_available\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"baseline_traffic\":$retrospective_entry,\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
+		stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":8,\"stage\":\"baseline-retrospective\",\"reason\":\"baseline-retrospectively-contaminated\",\"error\":\"The provisional idle baseline carried too much traffic relative to the measured link capacity. Retry when quieter or explicitly rerun with background-aware conservative safeguards.\",\"background_blocked\":true,\"retryable\":true,\"conservative_available\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"baseline_traffic\":$retrospective_entry,\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
 		exit 1
 	fi
 	if [ "$retrospective_pass" != true ]; then
@@ -3814,15 +3882,6 @@ typed_json_fragment() {
 		correction) printf '%s\n' "$typed_json" | sed -n 's/^.*"correction":\(.*\)}$/\1/p' ;;
 		*) return 1 ;;
 	esac
-}
-
-scale_for_reference_base() {
-	desired_kbps="$1"
-	reference_kbps="$2"
-	awk -v desired="$desired_kbps" -v reference="$reference_kbps" 'BEGIN {
-		if (desired <= 0 || reference <= 0) exit 1
-		printf "%.9f", desired / reference
-	}'
 }
 
 extract_json() {
@@ -4652,7 +4711,7 @@ speedtest_supervisor_json() {
 			supervisor_progress_stage="$(extract_json "$supervisor_progress_payload" '@.stage' 2>/dev/null || true)"
 			supervisor_progress_bytes="$(extract_json "$supervisor_progress_payload" '@.response_bytes' 2>/dev/null || true)"
 			case "$supervisor_progress_stage" in
-				route-verified|bypass-prepared|speedtest-go-started|speedtest-go-output-ready|speedtest-go-command-failed|speedtest-go-verified|backend-complete)
+				route-verified|bypass-prepared|speedtest-go-started|speedtest-go-output-ready|speedtest-go-command-failed|speedtest-go-direction-unavailable|speedtest-go-verified|backend-complete)
 					case "$supervisor_progress_bytes" in ''|*[!0-9]*) supervisor_progress_bytes=0 ;; esac
 					supervisor_progress_json="{\"stage\":\"$supervisor_progress_stage\",\"response_bytes\":$supervisor_progress_bytes}"
 					;;
@@ -4667,9 +4726,36 @@ speedtest_supervisor_json() {
 }
 
 speedtest_supervisor_retryable() {
+	# Structured helper errors are authoritative local diagnostics. Retry only
+	# a small allowlist of explicitly transient network wording; configuration,
+	# routing, SQM restore, locking and dependency failures must fail closed.
+	# The Rust migration replaces this temporary text boundary with typed error
+	# codes. Until then, a missing or unknown structured detail is never
+	# retried: absence of diagnostic evidence cannot prove a network failure.
 	case "${speedtest_supervisor_reason:-}" in
-		timeout) return 0 ;;
-		*) return 1 ;;
+		timeout)
+			# Supervisor wall-clock timeout: always transient.
+			return 0
+			;;
+		helper-exit:[1-9]|helper-exit:[1-9][0-9]|helper-exit:[1-9][0-9][0-9])
+			[ -n "${speedtest_supervisor_detail:-}" ] || return 1
+			case "$speedtest_supervisor_detail" in
+				speedtest-direction-result-unavailable)
+					return 0
+					;;
+				*[Tt]imed\ out*|*[Tt]imeout*|*[Tt]emporarily\ unavailable*|\
+				*[Tt]emporary\ failure*|*[Cc]onnection\ reset*|*[Cc]onnection\ refused*|\
+				*[Nn]ame\ resolution*|*[Rr]esolve*|*DNS*|*[Ss]erver\ unavailable*)
+					return 0
+					;;
+				*) return 1 ;;
+			esac
+			;;
+		*)
+			# Supervisor-level failures (launch, journal, identity, setsid,
+			# budget, termination) are not retryable at the network level.
+			return 1
+			;;
 	esac
 }
 
@@ -4727,7 +4813,7 @@ fail() {
 		exit 130
 	fi
 	worker_trace "failure message=$(json_escape "$message")"
-	failure_payload="{\"state\":\"failed\",\"schema_version\":7,\"stage\":\"$(json_escape "${current_phase:-unknown}")\",\"error\":\"$(json_escape "$message")\",\"speedtest_supervisor\":$(speedtest_supervisor_json),\"traffic_budget\":$(traffic_budget_json),\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":${phase_contamination_seen:-false},\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[${phase_background_runs_json:-}],\"validation_attempts\":[${validation_attempts_json:-}],\"validation\":${validation_json:-null},\"pinger_plan\":${pinger_plan:-null},\"proposal\":${proposal:-null},\"configuration_written\":false}"
+	failure_payload="{\"state\":\"failed\",\"schema_version\":8,\"stage\":\"$(json_escape "${current_phase:-unknown}")\",\"error\":\"$(json_escape "$message")\",\"speedtest_supervisor\":$(speedtest_supervisor_json),\"traffic_budget\":$(traffic_budget_json),\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":${phase_contamination_seen:-false},\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[${phase_background_runs_json:-}],\"validation_attempts\":[${validation_attempts_json:-}],\"validation\":${validation_json:-null},\"pinger_plan\":${pinger_plan:-null},\"proposal\":${proposal:-null},\"configuration_written\":false}"
 	if ! stage_terminal_json error "$failure_payload"; then
 		# Route loss and helper failures can leave one optional diagnostics
 		# fragment unavailable. Never let that erase the authoritative reason:
@@ -4735,7 +4821,7 @@ fail() {
 		# runtime restoration. The detailed breadcrumb remains RAM-only in
 		# job.log and contains no command output or UCI values.
 		worker_trace "detailed failure terminal rejected; staging compact terminal"
-		stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":7,\"stage\":\"$(json_escape "${current_phase:-unknown}")\",\"error\":\"$(json_escape "$message")\",\"traffic_budget\":$(traffic_budget_json),\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"phase_contamination_seen\":${phase_contamination_seen:-false},\"configuration_written\":false}" || true
+		stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":8,\"stage\":\"$(json_escape "${current_phase:-unknown}")\",\"error\":\"$(json_escape "$message")\",\"traffic_budget\":$(traffic_budget_json),\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"phase_contamination_seen\":${phase_contamination_seen:-false},\"configuration_written\":false}" || true
 	fi
 	exit 1
 }
@@ -4763,7 +4849,7 @@ measurement_inconclusive() {
 			measurement_message="The variable-link measurements did not converge after bounded repeats. No runtime minimum was invented."
 			;;
 	esac
-	stage_terminal_json error "{\"state\":\"inconclusive\",\"schema_version\":7,\"stage\":\"$(json_escape "$measurement_stage")\",\"search_state\":\"$measurement_search_state\",\"error\":\"$(json_escape "$measurement_message")\",\"reason\":\"$(json_escape "$measurement_reason")\"${measurement_recommended_profile_json},\"retryable\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"phase_contamination_seen\":${phase_contamination_seen:-false},\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[${phase_background_runs_json:-}],\"validation_attempts\":[${validation_attempts_json:-}],\"profile_search\":{\"download\":${dl_search_json:-null},\"upload\":${ul_search_json:-null}},\"pinger_plan\":${pinger_plan:-null},\"proposal\":${proposal:-null},\"configuration_written\":false}"
+	stage_terminal_json error "{\"state\":\"inconclusive\",\"schema_version\":8,\"stage\":\"$(json_escape "$measurement_stage")\",\"search_state\":\"$measurement_search_state\",\"error\":\"$(json_escape "$measurement_message")\",\"reason\":\"$(json_escape "$measurement_reason")\"${measurement_recommended_profile_json},\"retryable\":true,\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":false,\"phase_contamination_seen\":${phase_contamination_seen:-false},\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[${phase_background_runs_json:-}],\"validation_attempts\":[${validation_attempts_json:-}],\"profile_search\":{\"download\":${dl_search_json:-null},\"upload\":${ul_search_json:-null}},\"pinger_plan\":${pinger_plan:-null},\"proposal\":${proposal:-null},\"configuration_written\":false}"
 	exit 1
 }
 
@@ -4879,7 +4965,7 @@ run_measurement() {
 				upload_background_unresolved=true
 				break
 			fi
-			stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":7,\"error\":\"Forwarded WAN traffic contaminated both attempts of unshaped sample $index. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"throughput\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
+			stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":8,\"error\":\"Forwarded WAN traffic contaminated both attempts of unshaped sample $index. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"throughput\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
 			exit 1
 		fi
 		measurement_attempt=$((measurement_attempt + 1))
@@ -5017,7 +5103,7 @@ run_directional_control() {
 				fail "Forwarded-traffic evidence was unavailable for both $control_direction-only control attempts."
 			fi
 			if [ "${conservative_mode:-0}" != 1 ]; then
-				stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":7,\"error\":\"Forwarded WAN traffic contaminated both $control_direction-only controls. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"directional-control-$control_direction\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
+				stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":8,\"error\":\"Forwarded WAN traffic contaminated both $control_direction-only controls. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"directional-control-$control_direction\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"configuration_written\":false}"
 				exit 1
 			fi
 			unresolved_background_contamination=true
@@ -5064,6 +5150,8 @@ calculate_proposal() {
 	ul_runtime_minimum="${4:-}"
 	dl_tested_safe_maximum="${5:-}"
 	ul_tested_safe_maximum="${6:-}"
+	dl_measurement_base="${7:-}"
+	ul_measurement_base="${8:-}"
 	set -- --access-medium "$access_medium" \
 		--access-source "$access_source" \
 		--access-confidence-percent "$access_confidence_percent"
@@ -5092,6 +5180,17 @@ calculate_proposal() {
 		is_positive_uint "$ul_tested_safe_maximum" || return 1
 		set -- "$@" --ul-tested-safe-max-kbps "$ul_tested_safe_maximum"
 	fi
+	case "$dl_measurement_base:$ul_measurement_base" in
+		:) ;;
+		*:|:*) return 1 ;;
+		*)
+			is_positive_uint "$dl_measurement_base" &&
+				is_positive_uint "$ul_measurement_base" || return 1
+			set -- "$@" \
+				--dl-measurement-base-kbps "$dl_measurement_base" \
+				--ul-measurement-base-kbps "$ul_measurement_base"
+			;;
+	esac
 	if [ "${conservative_mode:-0}" = 1 ]; then
 		"$daemon_bin" --autotune-proposal \
 			--dl-samples "$download_samples" \
@@ -5602,11 +5701,12 @@ run_validation_direction_phase() {
 			fi
 			if [ "${AUTOTUNE_MOCK_VARIABLE_DIRECTIONAL_NO_EFFECT:-0}" = 1 ]; then
 				printf '%s\n' 12.0 > "$cpu_values"
-				case "$phase_direction:$phase_validation_attempt" in
-					download:1) phase_test_transport_raw='[80.0,82.0,83.0,84.0]' ;;
-					download:2) phase_test_transport_raw='[40.0,42.0,43.0,44.0]' ;;
-					download:3) phase_test_transport_raw='[39.0,41.0,42.0,43.0]' ;;
-					download:*) phase_test_transport_raw='[38.0,40.0,41.0,42.0]' ;;
+				case "$phase_direction:$phase_topology:$phase_validation_attempt" in
+					download:*:1) phase_test_transport_raw='[80.0,82.0,83.0,84.0]' ;;
+					download:*:2) phase_test_transport_raw='[40.0,42.0,43.0,44.0]' ;;
+					download:*:3) phase_test_transport_raw='[39.0,41.0,42.0,43.0]' ;;
+					download:*:*) phase_test_transport_raw='[38.0,40.0,41.0,42.0]' ;;
+					both:upload_only_shaped:*) phase_test_transport_raw='[80.0,82.0,83.0,84.0]' ;;
 					*) phase_test_transport_raw='[40.0,42.0,43.0,44.0]' ;;
 				esac
 			elif [ "${AUTOTUNE_MOCK_BIDI_HIGH_LATENCY:-0}" = 1 ] &&
@@ -5660,9 +5760,15 @@ run_validation_direction_phase() {
 		start_phase_background_counter "$dl_base" "$ul_base"
 		phase_result_file="$job_dir/$phase_kind-$phase_direction-$phase_validation_attempt-$phase_background_attempt.result"
 		phase_speedtest_ok=true
+		if [ "${CAKE_AUTORATE_AUTOTUNE_TEST_SHAPER:-0}" = 1 ]; then
+			# Expose only the mock topology to the host fixture. Production helpers
+			# attest the real qdisc state and never consume this test-only value.
+			export AUTOTUNE_MOCK_PHASE_TOPOLOGY="$phase_topology"
+		fi
 		run_speedtest_with_timeout "$phase_result_file" \
 			"$job_name" "$target_if" run "$backend" "$phase_speedtest_mode" "$route_mode" "$mwan3_member" "$phase_direction" ||
 			phase_speedtest_ok=false
+		[ "${CAKE_AUTORATE_AUTOTUNE_TEST_SHAPER:-0}" != 1 ] || unset AUTOTUNE_MOCK_PHASE_TOPOLOGY
 		if [ "$phase_speedtest_ok" != true ]; then
 			stop_phase_background_counter
 			stop_validation_monitors ||
@@ -5697,6 +5803,26 @@ run_validation_direction_phase() {
 					continue
 					;;
 			esac
+			if [ "$phase_topology" = both_shaped ] &&
+			   [ "$phase_background_attempt" -eq 2 ] &&
+			   [ "${speedtest_supervisor_detail:-}" = speedtest-direction-result-unavailable ]; then
+				temporary_phase_shaper_owned ||
+					fail "Temporary shaper ownership changed at the unmeasurable $phase_direction search boundary."
+				if [ "${AUTOTUNE_MOCK_VARIABLE_DIRECTIONAL_NO_EFFECT:-0}" != 1 ] &&
+				   [ "${AUTOTUNE_MOCK_RC16:-0}" != 1 ] &&
+				   [ "${CAKE_AUTORATE_AUTOTUNE_TEST_PREFLIGHT:-0}" != 1 ]; then
+					inspect_autotune_route ||
+						fail "Selected route went offline at the unmeasurable $phase_direction search boundary."
+					[ "$route_identity" = "$calibration_route_identity" ] ||
+						fail "WAN route identity changed at the unmeasurable $phase_direction search boundary."
+				fi
+				profile_search_unmeasurable_direction="$phase_direction"
+				profile_search_unmeasurable_candidate="$(extract_json "$proposal" "@.$phase_direction.base_kbps" 2>/dev/null || true)"
+				is_positive_uint "$profile_search_unmeasurable_candidate" ||
+					fail "The unmeasurable search boundary has no exact candidate."
+				worker_trace "unmeasurable-transfer direction=$phase_direction candidate=$profile_search_unmeasurable_candidate retries=2"
+				return 76
+			fi
 			[ "$phase_failure_reason" != timeout ] || {
 				record_speedtest_retry_event "$phase_kind-$phase_direction-validation" "$phase_background_attempt"
 				speedtest_timeout_inconclusive "shaped-$phase_direction" "$phase_direction-only shaped validation"
@@ -5896,7 +6022,7 @@ run_validation_direction_phase() {
 			continue
 		fi
 		if [ "${conservative_mode:-0}" != 1 ]; then
-			stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":7,\"error\":\"Forwarded WAN traffic contaminated both $phase_direction-only shaped validation attempts. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"shaped-$phase_direction\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"proposal\":$proposal,\"configuration_written\":false}"
+			stage_terminal_json error "{\"state\":\"background-blocked\",\"schema_version\":8,\"error\":\"Forwarded WAN traffic contaminated both $phase_direction-only shaped validation attempts. Retry when quiet or explicitly continue conservatively.\",\"background_blocked\":true,\"retryable\":true,\"stage\":\"shaped-$phase_direction\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"phase_evidence_complete\":${phase_evidence_complete:-false},\"phase_contamination_seen\":true,\"route\":$(route_diagnostics_json),\"background\":$(background_json),\"baseline\":$(baseline_diagnostics_json),\"runs\":[${runs_json:-}],\"phase_background\":[$phase_background_runs_json],\"pinger_plan\":${pinger_plan:-null},\"proposal\":$proposal,\"configuration_written\":false}"
 			exit 1
 		fi
 		if [ "$phase_background_available" != true ]; then
@@ -5954,7 +6080,9 @@ run_shaped_validation() {
 	prepare_temp_shaper "$dl_base" "$ul_base"
 	validation_contaminated=false
 
-	run_validation_direction_phase download "$validation_attempt"
+	validation_phase_rc=0
+	run_validation_direction_phase download "$validation_attempt" || validation_phase_rc="$?"
+	[ "$validation_phase_rc" -eq 0 ] || return "$validation_phase_rc"
 	shaped_dl="$phase_achieved_kbps"
 	download_phase_observation_json="$phase_observation_json"
 	dl_loaded_median_ms="$phase_loaded_median_ms"
@@ -5973,7 +6101,9 @@ run_shaped_validation() {
 	dl_cpu_core_peak="$phase_cpu_core_peak"
 	dl_softirq_peak="$phase_softirq_peak"
 
-	run_validation_direction_phase upload "$validation_attempt"
+	validation_phase_rc=0
+	run_validation_direction_phase upload "$validation_attempt" || validation_phase_rc="$?"
+	[ "$validation_phase_rc" -eq 0 ] || return "$validation_phase_rc"
 	shaped_ul="$phase_achieved_kbps"
 	upload_phase_observation_json="$phase_observation_json"
 	ul_loaded_median_ms="$phase_loaded_median_ms"
@@ -6281,7 +6411,9 @@ build_directional_recommendation() {
 	# throughput without discarding the already safe shaped proposal.
 	if [ "${bidirectional_auto_apply_pass:-false}" = true ] &&
 	   [ "${validation_quality_target_met:-false}" = true ] &&
-	   [ "${validation_profile_objectives_met:-false}" = true ]; then
+	   [ "${validation_profile_objectives_met:-false}" = true ] &&
+	   [ "${dl_search_no_cake_effect:-false}" != true ] &&
+	   [ "${ul_search_no_cake_effect:-false}" != true ]; then
 		return 0
 	fi
 
@@ -6777,25 +6909,24 @@ append_profile_search_observation() {
 
 run_profile_direction_search() {
 	search_direction="$1"
+	search_terminal_reason="${2:-}"
 	case "$search_direction" in
 		download)
 			search_observed_low="$raw_dl_low"
 			search_minimum="$dl_minimum"
 			search_upper="$dl_maximum"
-			[ "$search_upper" -le "$search_observed_low" ] 2>/dev/null || search_upper="$search_observed_low"
 			search_observations="$dl_search_observations"
 			;;
 		upload)
 			search_observed_low="$raw_ul_low"
 			search_minimum="$ul_minimum"
 			search_upper="$ul_maximum"
-			[ "$search_upper" -le "$search_observed_low" ] 2>/dev/null || search_upper="$search_observed_low"
 			search_observations="$ul_search_observations"
 			;;
 		*) return 1 ;;
 	esac
 
-	search_decision="$("$daemon_bin" --autotune-optimize-direction \
+	set -- "$daemon_bin" --autotune-optimize-direction \
 		--profile "$autotune_profile" \
 		--direction "$search_direction" \
 		--observed-low-kbps "$search_observed_low" \
@@ -6808,14 +6939,22 @@ run_profile_direction_search() {
 		--candidate-realization-max-percent "$validation_candidate_realization_max_percent" \
 		--capacity-retention-min-percent "$validation_capacity_retention_min_percent" \
 		--loss-max-percent "$validation_loss_max_percent" \
-		--cpu-max-percent "$validation_cpu_max_percent")" || return 1
+		--cpu-max-percent "$validation_cpu_max_percent"
+	case "$search_terminal_reason" in
+		'') ;;
+		candidate-transfer-unmeasurable)
+			set -- "$@" --terminate-at-measured-boundary "$search_terminal_reason"
+			;;
+		*) return 1 ;;
+	esac
+	search_decision="$("$@")" || return 1
 	strict_single_json_object "$search_decision" || return 1
 	search_schema="$(extract_json "$search_decision" '@.schema_version')" || return 1
 	search_profile="$(extract_json "$search_decision" '@.profile')" || return 1
 	search_result_direction="$(extract_json "$search_decision" '@.direction')" || return 1
 	search_action="$(extract_json "$search_decision" '@.action')" || return 1
 	search_reason="$(extract_json "$search_decision" '@.reason')" || return 1
-	[ "$search_schema" = 2 ] && [ "$search_profile" = "$autotune_profile" ] &&
+	[ "$search_schema" = 3 ] && [ "$search_profile" = "$autotune_profile" ] &&
 		[ "$search_result_direction" = "$search_direction" ] || return 1
 	case "$search_action" in test|complete|fallback|inconclusive) ;; *) return 1 ;; esac
 
@@ -6842,6 +6981,14 @@ run_profile_direction_search() {
 		test) is_positive_uint "$search_next" || return 1 ;;
 		complete|fallback)
 			is_positive_uint "$search_selected" || return 1
+			search_recommended_role="$(extract_json "$search_decision" '@.review_options[0].role' 2>/dev/null || true)"
+			search_recommended_rate="$(extract_json "$search_decision" '@.review_options[0].candidate_kbps' 2>/dev/null || true)"
+			search_recommended_direction_only="$(extract_json "$search_decision" '@.review_options[0].direction_candidate_only' 2>/dev/null || true)"
+			search_recommended_pair_required="$(extract_json "$search_decision" '@.review_options[0].pair_confirmation_required' 2>/dev/null || true)"
+			[ "$search_recommended_role" = recommended ] &&
+				[ "$search_recommended_rate" = "$search_selected" ] &&
+				[ "$search_recommended_direction_only" = true ] &&
+				[ "$search_recommended_pair_required" = true ] || return 1
 			case "$search_selected_safety" in true|false) ;; *) return 1 ;; esac
 			case "$search_selected_manual_reviewable" in true|false) ;; *) return 1 ;; esac
 			if [ "$search_selected_safety" != true ]; then
@@ -6849,17 +6996,17 @@ run_profile_direction_search() {
 				case "$search_reason" in
 					repeatable-compute-ceiling-below-capacity-floor|repeatable-shaper-ceiling-below-capacity-floor|repeatable-shaper-ceiling-below-safety-floor) ;;
 					bounded-low-realization-review) [ "$autotune_profile" = variable_link ] || return 1 ;;
+					candidate-transfer-unmeasurable) ;;
 					*) return 1 ;;
 				esac
 			fi
 			case "$search_selected_target" in true|false) ;; *) return 1 ;; esac
 			case "$search_selected_grade" in A+|A|B|C|D|F) ;; *) return 1 ;; esac
-			if [ "$autotune_profile" = variable_link ]; then
-				is_positive_uint "$search_runtime_minimum" || return 1
-				is_positive_uint "$search_runtime_minimum_index" || return 1
-				search_runtime_evaluated_index=$((search_runtime_minimum_index - 1))
-				search_runtime_evaluated_rate="$(extract_json "$search_decision" "@.evaluated[$search_runtime_evaluated_index].candidate_kbps" 2>/dev/null || true)"
-				[ "$search_runtime_evaluated_rate" = "$search_runtime_minimum" ] || return 1
+			if [ "$search_reason" = candidate-transfer-unmeasurable ]; then
+				[ "$search_action" = fallback ] &&
+					[ "$search_no_cake_effect" = false ] &&
+					[ "$search_inconclusive" = false ] || return 1
+			elif [ "$autotune_profile" = variable_link ]; then
 				if [ "$search_no_cake_effect" = true ]; then
 					[ "$search_action" = fallback ] &&
 						[ "$search_reason" = queue-outside-cake-control ] &&
@@ -6867,11 +7014,19 @@ run_profile_direction_search() {
 						[ "$search_noisy" = false ] &&
 						[ "$search_inconclusive" = false ] &&
 						[ "$search_selected_target" = true ] &&
-						[ "$search_runtime_minimum" = "$search_selected" ] || return 1
+						[ -z "$search_runtime_minimum" ] &&
+						[ -z "$search_runtime_minimum_index" ] || return 1
 					LC_ALL=C awk -v value="$search_selected_retention" 'BEGIN {
 						exit(value ~ /^[0-9]+([.][0-9]+)?$/ && value >= 50 && value <= 100 ? 0 : 1)
 					}' || return 1
-				elif [ "$search_reason" = exploration-floor-reached ]; then
+				else
+					is_positive_uint "$search_runtime_minimum" || return 1
+					is_positive_uint "$search_runtime_minimum_index" || return 1
+					search_runtime_evaluated_index=$((search_runtime_minimum_index - 1))
+					search_runtime_evaluated_rate="$(extract_json "$search_decision" "@.evaluated[$search_runtime_evaluated_index].candidate_kbps" 2>/dev/null || true)"
+					[ "$search_runtime_evaluated_rate" = "$search_runtime_minimum" ] || return 1
+				fi
+				if [ "$search_no_cake_effect" != true ] && [ "$search_reason" = exploration-floor-reached ]; then
 					[ "$search_action" = fallback ] &&
 						[ "$search_knee_detected" = false ] &&
 						[ "$search_noisy" = false ] &&
@@ -6881,7 +7036,7 @@ run_profile_direction_search() {
 					LC_ALL=C awk -v value="$search_selected_retention" 'BEGIN {
 						exit(value ~ /^[0-9]+([.][0-9]+)?$/ && value >= 50 && value <= 100 ? 0 : 1)
 					}' || return 1
-				elif [ "$search_reason" = noisy-link-safe-review ]; then
+				elif [ "$search_no_cake_effect" != true ] && [ "$search_reason" = noisy-link-safe-review ]; then
 					[ "$search_action" = fallback ] &&
 						[ "$search_knee_detected" = false ] &&
 						[ "$search_no_cake_effect" = false ] &&
@@ -6891,7 +7046,7 @@ run_profile_direction_search() {
 					LC_ALL=C awk -v value="$search_selected_retention" 'BEGIN {
 						exit(value ~ /^[0-9]+([.][0-9]+)?$/ && value >= 50 && value <= 100 ? 0 : 1)
 					}' || return 1
-				elif [ "$search_reason" = bounded-low-realization-review ]; then
+				elif [ "$search_no_cake_effect" != true ] && [ "$search_reason" = bounded-low-realization-review ]; then
 					[ "$search_action" = fallback ] &&
 						[ "$search_selected_safety" = false ] &&
 						[ "$search_selected_manual_reviewable" = true ] &&
@@ -6909,7 +7064,7 @@ run_profile_direction_search() {
 								realization >= 50 && realization < strict_min && realization <= strict_max &&
 								retention >= 50 && retention <= 100 ? 0 : 1)
 						}' || return 1
-				else
+				elif [ "$search_no_cake_effect" != true ]; then
 					[ "$search_knee_detected" = true ] &&
 						[ "$search_noisy" = false ] &&
 						[ "$search_inconclusive" = false ] || return 1
@@ -6938,7 +7093,7 @@ run_profile_direction_search() {
 			dl_search_runtime_minimum="$search_runtime_minimum"
 			dl_search_no_cake_effect="$search_no_cake_effect"
 			case "$search_reason" in
-				exploration-floor-reached|noisy-link-safe-review|bounded-low-realization-review) dl_search_manual_fallback=true ;;
+				exploration-floor-reached|noisy-link-safe-review|bounded-low-realization-review|candidate-transfer-unmeasurable) dl_search_manual_fallback=true ;;
 				*) dl_search_manual_fallback=false ;;
 			esac
 			;;
@@ -6955,7 +7110,7 @@ run_profile_direction_search() {
 			ul_search_runtime_minimum="$search_runtime_minimum"
 			ul_search_no_cake_effect="$search_no_cake_effect"
 			case "$search_reason" in
-				exploration-floor-reached|noisy-link-safe-review|bounded-low-realization-review) ul_search_manual_fallback=true ;;
+				exploration-floor-reached|noisy-link-safe-review|bounded-low-realization-review|candidate-transfer-unmeasurable) ul_search_manual_fallback=true ;;
 				*) ul_search_manual_fallback=false ;;
 			esac
 			;;
@@ -6970,11 +7125,10 @@ set_exact_profile_candidates() {
 	desired_ul_runtime_minimum="${4:-}"
 	desired_dl_tested_safe_maximum="${5:-}"
 	desired_ul_tested_safe_maximum="${6:-}"
-	dl_revision_scale="$(scale_for_reference_base "$desired_dl_kbps" "$reference_dl_base")" || return 1
-	ul_revision_scale="$(scale_for_reference_base "$desired_ul_kbps" "$reference_ul_base")" || return 1
-	proposal_candidate="$(calculate_proposal "$dl_revision_scale" "$ul_revision_scale" \
+	proposal_candidate="$(calculate_proposal 1.0 1.0 \
 		"$desired_dl_runtime_minimum" "$desired_ul_runtime_minimum" \
-		"$desired_dl_tested_safe_maximum" "$desired_ul_tested_safe_maximum")" || return 1
+		"$desired_dl_tested_safe_maximum" "$desired_ul_tested_safe_maximum" \
+		"$desired_dl_kbps" "$desired_ul_kbps")" || return 1
 	proposal_json_valid "$proposal_candidate" || return 1
 	proposal="$proposal_candidate"
 	realized_dl_candidate="$(extract_json "$proposal" '@.download.base_kbps')"
@@ -7145,9 +7299,9 @@ worker_cleanup() {
 
 	if [ ! -s "$pending_result_file" ] && [ ! -s "$pending_error_file" ]; then
 		if [ "$worker_rc" -eq 130 ] || [ -e "$cancel_file" ]; then
-			stage_terminal_json error "{\"state\":\"cancelled\",\"schema_version\":7,\"stage\":\"$(json_escape "$worker_exit_phase")\",\"error\":\"Full Auto-Tune was cancelled; no configuration was written.\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"configuration_written\":false}" || true
+			stage_terminal_json error "{\"state\":\"cancelled\",\"schema_version\":8,\"stage\":\"$(json_escape "$worker_exit_phase")\",\"error\":\"Full Auto-Tune was cancelled; no configuration was written.\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"configuration_written\":false}" || true
 		else
-			stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":7,\"stage\":\"$(json_escape "$worker_exit_phase")\",\"worker_exit_code\":$worker_rc,\"error\":\"Full Auto-Tune worker exited without a complete diagnostic result.\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"configuration_written\":false}" || true
+			stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":8,\"stage\":\"$(json_escape "$worker_exit_phase")\",\"worker_exit_code\":$worker_rc,\"error\":\"Full Auto-Tune worker exited without a complete diagnostic result.\",\"auto_apply_eligible\":false,\"manual_apply_eligible\":false,\"configuration_written\":false}" || true
 		fi
 	fi
 
@@ -7165,13 +7319,17 @@ worker_cleanup() {
 		fi
 	else
 		# No network mutation is allowed before the heartbeat is armed.
-		if release_autotune_interface_lock; then
+		# The lightweight pre-heartbeat path must obey the same restoration
+		# evidence gate as journal finalize.  Child/monitor termination can fail
+		# even before the recovery heartbeat appears; never promote its pending
+		# terminal to runtime_restored=true in that case.
+		if [ "$cleanup_runtime_ok" = 1 ] && release_autotune_interface_lock; then
 			[ -z "${recovery_sqm_config_snapshot:-}" ] || rm -f "$recovery_sqm_config_snapshot" 2>/dev/null || true
 			[ -n "${recovery_journal:-}" ] && rm -f "$recovery_journal" "${recovery_journal}.cleanup-done" 2>/dev/null || true
 			publish_staged_terminal || true
 		else
-			# Keep the prepared journal for dead-owner garbage collection if a
-			# partial lock reservation could not be removed synchronously.
+			# Keep the pending terminal private when cleanup or partial lock release
+			# did not complete synchronously.
 			rm -f "$status_file"
 		fi
 	fi
@@ -7365,6 +7523,9 @@ run_job() {
 	configured_speedtest_server_id="$(uci -q get "cake-autorate.$job_name.speedtest_go_server_id" 2>/dev/null || true)"
 	while :; do
 		phase_background_runs_json="$phase_background_before_raw_series"
+		# Phase samples are restarted when automatic selection excludes a stalled
+		# server, but supervisor failures are job-level evidence. Preserve them so
+		# the terminal result explains every consumed retry and server restart.
 		full_download_samples=""
 		full_upload_samples=""
 		download_samples=""
@@ -7400,6 +7561,18 @@ run_job() {
 			"${speedtest_retry_exhausted_context:-direction-only speed-test control}"
 	done
 	if [ "$calibration_strategy" = reuse_trusted ]; then
+		# Guard: verify that the trusted result was produced on the same route
+		# and access medium as the current run. A changed uplink, gateway, or
+		# medium type (e.g. Ethernet → cellular) would make the saved capacity
+		# invalid for the current topology.
+		trusted_route_identity="$(extract_json "$trusted_result" '@.route.identity' 2>/dev/null || true)"
+		if [ -n "$trusted_route_identity" ] && [ "$trusted_route_identity" != "$route_identity" ]; then
+			fail "reuse_trusted: route identity changed since the trusted result was saved. Run a full calibration to establish a new baseline."
+		fi
+		trusted_medium="$(extract_json "$trusted_result" '@.proposal.access.medium' 2>/dev/null || true)"
+		if [ -n "$trusted_medium" ] && [ "$trusted_medium" != "$access_medium" ]; then
+			fail "reuse_trusted: access medium changed ($trusted_medium → $access_medium) since the trusted result was saved. Run a full calibration."
+		fi
 		# The live shaped controls above attest route/server/SQM health. The
 		# explicit trusted strategy then searches from the saved reference rather
 		# than relabelling current shaped throughput as a new raw line capacity.
@@ -7413,17 +7586,18 @@ run_job() {
 	reference_proposal_candidate="$(calculate_proposal 1.0 1.0)" || fail "Autotune reference proposal calculation failed."
 	proposal_json_valid "$reference_proposal_candidate" || fail "Autotune reference proposal returned malformed JSON."
 	reference_proposal="$reference_proposal_candidate"
-	reference_dl_base="$(extract_json "$reference_proposal" '@.download.base_kbps')"
-	reference_ul_base="$(extract_json "$reference_proposal" '@.upload.base_kbps')"
-	is_positive_uint "$reference_dl_base" || fail "Reference proposal returned no download base."
-	is_positive_uint "$reference_ul_base" || fail "Reference proposal returned no upload base."
-	if [ "$conservative_mode" = 1 ]; then
-		proposal_candidate="$(calculate_proposal 0.85 0.85)" || fail "Conservative autotune proposal calculation failed."
-		proposal_json_valid "$proposal_candidate" || fail "Conservative autotune proposal returned malformed JSON."
-		proposal="$proposal_candidate"
-	else
-		proposal="$reference_proposal"
-	fi
+	reference_dl_maximum="$(extract_json "$reference_proposal" '@.download.maximum_kbps')"
+	reference_ul_maximum="$(extract_json "$reference_proposal" '@.upload.maximum_kbps')"
+	is_positive_uint "$reference_dl_maximum" || fail "Reference proposal returned no download maximum."
+	is_positive_uint "$reference_ul_maximum" || fail "Reference proposal returned no upload maximum."
+	# Conservative continuation changes confidence and application policy, not
+	# the rate before it is measured. An unconditional 0.85 multiplier hid the
+	# actual raw/shaped boundary and could make a clean target-passing link lose
+	# capacity without evidence. Every mode now starts from the same measured
+	# reference; only a tested adverse loaded signal may select a lower point.
+	proposal="$reference_proposal"
+	set_exact_profile_candidates "$reference_dl_maximum" "$reference_ul_maximum" ||
+		fail "Reference proposal could not realize its measured upper candidate pair exactly."
 	configure_validation_thresholds ||
 		fail "Autotune proposal returned an invalid or mismatched profile policy."
 
@@ -7447,9 +7621,60 @@ run_job() {
 	ul_search_manual_fallback=false
 	profile_search_inconclusive=false
 	profile_search_inconclusive_reason=""
+	profile_search_unmeasurable_direction=""
+	profile_search_unmeasurable_candidate=""
 	fair_outcome_json=null
 	while [ "$validation_attempt_number" -le "$profile_search_max_attempts" ]; do
-		run_shaped_validation "$validation_attempt_number"
+		profile_search_unmeasurable_direction=""
+		profile_search_unmeasurable_candidate=""
+		validation_run_rc=0
+		run_shaped_validation "$validation_attempt_number" || validation_run_rc="$?"
+		if [ "$validation_run_rc" -eq 76 ]; then
+			case "$profile_search_unmeasurable_direction" in
+				download) [ "$dl_search_active" = true ] || fail "An inactive download search became unmeasurable." ;;
+				upload) [ "$ul_search_active" = true ] || fail "An inactive upload search became unmeasurable." ;;
+				*) fail "The unmeasurable profile-search boundary has no direction." ;;
+			esac
+			# Recompute the open optimizer action from prior exact observations and
+			# prove that the failed transfer was exactly its deterministic next
+			# candidate. Only then may Rust terminalize at the measured boundary.
+			run_profile_direction_search "$profile_search_unmeasurable_direction" ||
+				fail "The typed optimizer rejected prior evidence at an unmeasurable transfer boundary."
+			[ "$search_action" = test ] &&
+				[ "$search_next" = "$profile_search_unmeasurable_candidate" ] ||
+				fail "The unmeasurable transfer did not match the deterministic next profile-search candidate."
+			run_profile_direction_search "$profile_search_unmeasurable_direction" candidate-transfer-unmeasurable ||
+				fail "The typed optimizer could not retain the last measured profile-search boundary."
+			case "$search_action" in
+				complete|fallback)
+					case "$profile_search_unmeasurable_direction" in
+						download) dl_search_active=false ;;
+						upload) ul_search_active=false ;;
+					esac
+					;;
+				inconclusive)
+					profile_search_inconclusive=true
+					profile_search_inconclusive_reason="$profile_search_unmeasurable_direction:candidate-transfer-unmeasurable"
+					;;
+				*) fail "The measured-boundary optimizer remained open after a bounded transfer failure." ;;
+			esac
+			[ "$profile_search_inconclusive" = false ] || break
+			if [ "$dl_search_active" = false ] && [ "$ul_search_active" = false ]; then
+				break
+			fi
+			next_dl_candidate="$dl_search_selected"
+			next_ul_candidate="$ul_search_selected"
+			[ "$dl_search_active" = true ] && next_dl_candidate="$dl_search_next"
+			[ "$ul_search_active" = true ] && next_ul_candidate="$ul_search_next"
+			is_positive_uint "$next_dl_candidate" && is_positive_uint "$next_ul_candidate" ||
+				fail "The profile optimizer returned no continuation after an unmeasurable transfer boundary."
+			set_exact_profile_candidates "$next_dl_candidate" "$next_ul_candidate" ||
+				fail "Proposal constraints could not realize the post-boundary candidate exactly."
+			validation_attempt_number=$((validation_attempt_number + 1))
+			continue
+		fi
+		[ "$validation_run_rc" -eq 0 ] ||
+			fail "Directional validation stopped with an unsupported internal result ($validation_run_rc)."
 		write_status search 89 "Evaluating directional profile-search observation $validation_attempt_number"
 		if [ -n "$validation_attempts_json" ]; then
 			validation_attempts_json="$validation_attempts_json,$validation_json"
@@ -7763,6 +7988,7 @@ job_recovery_pending() {
 
 start_job() {
 	start_conservative="${1:-0}"
+	coordinator_run_id="${2:-}"
 	[ -x "$procd_job_bin" ] || json_error "The procd job launcher is required for Full Auto-Tune."
 	prepare_job_storage || json_error "Unsafe or foreign-owned Full Auto-Tune job directory."
 	start_guard="$job_dir/start.guard"
@@ -7788,8 +8014,14 @@ start_job() {
 
 	archive_previous_terminal ||
 		json_error "Unable to archive and bound the previous Full Auto-Tune diagnostics in RAM."
-	new_token="$(new_unique_worker_token)" ||
-		json_error "Unable to generate a unique 32-hex Full Auto-Tune worker identity from the kernel random UUID source."
+	if [ -n "$coordinator_run_id" ]; then
+		safe_worker_token "$coordinator_run_id" ||
+			json_error "The coordinator supplied an invalid Full Auto-Tune worker identity."
+		new_token="$coordinator_run_id"
+	else
+		new_token="$(new_unique_worker_token)" ||
+			json_error "Unable to generate a unique 32-hex Full Auto-Tune worker identity from the kernel random UUID source."
+	fi
 	active_run_id="$new_token"
 	rm -f "$pid_file" "$status_file" "$result_file" "$error_file" "$pending_result_file" \
 		"$pending_error_file" "$cancel_file" "$log_file" "$terminal_integrity_file"
@@ -7812,13 +8044,12 @@ start_job() {
 			kill -TERM "$pid" 2>/dev/null || true
 		json_error "Unable to establish an isolated Full Auto-Tune worker process group."
 	fi
-	worker_identity="$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s' \
+	atomic_write_worker_identity "$pid_file" \
 		"$pid" "$launch_starttime" "$new_token" "$target_if_input" "$backend_input" \
 		"$route_mode_override" "$mwan3_member_override" "$autotune_profile" "$start_conservative" \
 		"$traffic_budget_bytes" "$calibration_strategy" "$access_medium" "$access_source" \
 		"$access_confidence_percent" "$capacity_learning_policy" "$service_dl_cap_kbps" \
-		"$service_ul_cap_kbps")"
-	atomic_write "$pid_file" "$worker_identity" || {
+		"$service_ul_cap_kbps" || {
 		[ "$(proc_starttime "$pid" 2>/dev/null)" = "$launch_starttime" ] &&
 			kill -TERM "$pid" 2>/dev/null || true
 		json_error "Unable to publish the Full Auto-Tune worker identity."
@@ -7867,6 +8098,17 @@ emit_terminal_summary() {
 	terminal_summary_recovery="$("$jsonfilter_bin" -i "$terminal_summary_file" -e '@.recovery_pending' 2>/dev/null | sed -n '1p')"
 	case "$terminal_summary_runtime" in true|false) ;; *) terminal_summary_runtime=true ;; esac
 	case "$terminal_summary_recovery" in true|false) ;; *) terminal_summary_recovery=false ;; esac
+	# Compatibility for an already-running pre-fix worker: old error terminals
+	# may omit job_id.  The file is integrity-checked above, and the Rust
+	# coordinator separately requires the exact 32-hex run_id it journalled
+	# before spawn.  Never replace a present (possibly mismatching) identity.
+	if [ -z "$terminal_summary_job_id" ]; then
+		safe_worker_token "$terminal_summary_run_id" || {
+			printf '{"state":"legacy","terminal_available":false,"runtime_restored":false,"recovery_pending":true}\n'
+			return 0
+		}
+		terminal_summary_job_id="$job_name"
+	fi
 	printf '{"state":"%s","terminal_available":true,"terminal_kind":"%s","run_id":"%s","job_id":"%s","runtime_restored":%s,"recovery_pending":%s}\n' \
 		"$(json_escape "${terminal_summary_state:-failed}")" \
 		"$(json_escape "$terminal_summary_kind")" \
@@ -7975,6 +8217,24 @@ attest_job() {
 }
 
 cancel_job() {
+	# Serialize cancellation with start_job until the newly launched worker has
+	# published its authenticated pid/starttime/run identity.  Without this
+	# guard, a fast Cancel RPC can observe the deliberate pre-publication gap,
+	# return a synthetic idle state, and let the already admitted worker continue
+	# into an unshaped speed test after LuCI reports successful restoration.
+	cancel_start_guard="$job_dir/start.guard"
+	[ ! -L "$cancel_start_guard" ] || json_error "Unsafe Full Auto-Tune start lock."
+	exec 6>>"$cancel_start_guard" || json_error "Unable to open the Full Auto-Tune start lock."
+	cancel_flock_bin="${runtime_lock_flock_bin:-flock}"
+	command -v "$cancel_flock_bin" >/dev/null 2>&1 || json_error "flock is required for Full Auto-Tune."
+	cancel_guard_attempt=0
+	while ! "$cancel_flock_bin" -n 6; do
+		cancel_guard_attempt=$((cancel_guard_attempt + 1))
+		[ "$cancel_guard_attempt" -lt 30 ] ||
+			json_error "Full Auto-Tune startup did not settle before cancellation."
+		sleep 1
+	done
+
 	if [ -s "$pid_file" ]; then
 		if worker_identity_matches; then
 			pid="$identity_pid"
@@ -7997,6 +8257,7 @@ cancel_job() {
 			capacity_learning_policy="$identity_capacity_learning_policy"
 			service_dl_cap_kbps="$identity_service_dl_cap"
 			service_ul_cap_kbps="$identity_service_ul_cap"
+			active_run_id="$identity_token"
 			: > "$cancel_file"
 			write_status cancelling 0 "Cancelling Full Auto-Tune and restoring temporary speed-test/SQM state"
 			kill -TERM "$pid" 2>/dev/null || true
@@ -8009,7 +8270,10 @@ cancel_job() {
 		status_job
 		return 0
 	fi
-	printf '{"state":"idle"}\n'
+	# A worker may have completed between the user's click and acquisition of
+	# the start guard.  Return its exact terminal identity when available; an
+	# actually empty slot remains idle and cannot satisfy an identity-bound UI.
+	status_summary_job
 }
 
 if [ "${CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY:-0}" = 1 ]; then
@@ -8030,6 +8294,10 @@ prepare_job_storage || json_error "Unsafe or foreign-owned Full Auto-Tune state 
 case "$mode" in
 	start) start_job 0 ;;
 	start-conservative) start_job 1 ;;
+	start-coordinated)
+		safe_worker_token "$worker_token" || json_error "Invalid coordinator Full Auto-Tune worker identity."
+		start_job "$conservative_override" "$worker_token"
+		;;
 	status) status_job ;;
 	status-summary) status_summary_job ;;
 	result) status_job ;;

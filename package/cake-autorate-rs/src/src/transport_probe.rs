@@ -15,6 +15,7 @@ use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{client_tls_with_config, Message, WebSocket};
 
 const DEFAULT_STREAMS: usize = 4;
+pub(crate) const LOADED_AUTOTUNE_WS_STREAMS: usize = 5;
 const STREAM_DELAY: Duration = Duration::from_millis(50);
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HTTP_TOTAL_BYTES: usize = 64 * 1024;
@@ -97,6 +98,60 @@ pub struct TransportProbeSample {
     pub server_processing_ms: f64,
     pub trusted: bool,
     pub connection_reused: bool,
+}
+
+/// Machine-readable terminal class for one bounded transport probe.
+///
+/// A deadline exhaustion is deliberately distinct from DNS, routing,
+/// connection, protocol and apparatus failures.  Only the former can prove
+/// that no trusted transport reply arrived before the configured deadline;
+/// callers must still bind that interval to their own route/load authority
+/// before treating it as censored latency evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportProbeFailureKind {
+    DeadlineExceeded,
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransportProbeFailure {
+    kind: TransportProbeFailureKind,
+    message: String,
+    deadline_us: Option<u64>,
+}
+
+impl TransportProbeFailure {
+    pub(crate) fn other(message: String) -> Self {
+        Self {
+            kind: TransportProbeFailureKind::Other,
+            message,
+            deadline_us: None,
+        }
+    }
+
+    fn deadline_exceeded(message: String, timeout: Duration) -> Self {
+        Self {
+            kind: TransportProbeFailureKind::DeadlineExceeded,
+            message,
+            deadline_us: Some(u64::try_from(timeout.as_micros()).unwrap_or(u64::MAX)),
+        }
+    }
+
+    pub fn kind(&self) -> TransportProbeFailureKind {
+        self.kind
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub fn deadline_us(&self) -> Option<u64> {
+        self.deadline_us
+    }
+
+    fn into_message(self) -> String {
+        self.message
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -188,6 +243,10 @@ impl ProbeDeadline {
 
     fn ensure(self, operation: &str) -> Result<(), String> {
         self.remaining(operation).map(|_| ())
+    }
+
+    fn exhausted(self) -> bool {
+        Instant::now() >= self.0
     }
 }
 
@@ -437,7 +496,46 @@ impl TransportProbeEngine {
     }
 
     pub fn probe(&mut self) -> Result<TransportProbeSample, String> {
-        let deadline = ProbeDeadline::after(self.timeout)?;
+        self.probe_classified()
+            .map_err(TransportProbeFailure::into_message)
+    }
+
+    pub fn probe_classified(&mut self) -> Result<TransportProbeSample, TransportProbeFailure> {
+        self.probe_classified_with_websocket_streams(DEFAULT_STREAMS)
+    }
+
+    #[cfg(any(feature = "calibration", test))]
+    pub(crate) fn probe_classified_loaded_autotune(
+        &mut self,
+    ) -> Result<TransportProbeSample, TransportProbeFailure> {
+        if self.backend != TransportProbeBackend::WebSocket {
+            return Err(TransportProbeFailure::other(
+                "loaded Auto-Tune transport requires the WebSocket backend".to_string(),
+            ));
+        }
+        self.probe_classified_with_websocket_streams(LOADED_AUTOTUNE_WS_STREAMS)
+    }
+
+    fn probe_classified_with_websocket_streams(
+        &mut self,
+        websocket_streams: usize,
+    ) -> Result<TransportProbeSample, TransportProbeFailure> {
+        let deadline = ProbeDeadline::after(self.timeout).map_err(TransportProbeFailure::other)?;
+        self.probe_with_deadline(deadline, websocket_streams)
+            .map_err(|message| {
+                if deadline.exhausted() {
+                    TransportProbeFailure::deadline_exceeded(message, self.timeout)
+                } else {
+                    TransportProbeFailure::other(message)
+                }
+            })
+    }
+
+    fn probe_with_deadline(
+        &mut self,
+        deadline: ProbeDeadline,
+        websocket_streams: usize,
+    ) -> Result<TransportProbeSample, String> {
         if self.backend == TransportProbeBackend::LegacyHttp {
             return probe_legacy_http(&self.endpoint, deadline);
         }
@@ -447,7 +545,7 @@ impl TransportProbeEngine {
                 .websocket
                 .as_mut()
                 .ok_or_else(|| "websocket probe is unavailable".to_string())?
-                .probe(&addresses, deadline),
+                .probe(&addresses, deadline, websocket_streams),
             TransportProbeBackend::TcpConnect => probe_tcp_batch(
                 &self.endpoint,
                 &addresses,
@@ -551,7 +649,11 @@ impl WebSocketProbe {
         &mut self,
         addresses: &[SocketAddr],
         deadline: ProbeDeadline,
+        streams: usize,
     ) -> Result<TransportProbeSample, String> {
+        if !(1..=LOADED_AUTOTUNE_WS_STREAMS).contains(&streams) {
+            return Err("WebSocket stream count is outside the supported range".to_string());
+        }
         let connection_reused = self.stream.is_some();
         self.deadline.set(deadline);
         let result = (|| {
@@ -565,7 +667,7 @@ impl WebSocketProbe {
                     .as_mut()
                     .ok_or_else(|| "WebSocket is disconnected".to_string())?,
                 &mut self.sequence,
-                DEFAULT_STREAMS,
+                streams,
                 deadline,
             )?;
             let (rtt_ms, evidence, discarded_samples) = summarize_probe_samples(&raw)
@@ -1459,6 +1561,42 @@ mod tests {
     }
 
     #[test]
+    fn loaded_autotune_websocket_uses_five_samples_without_changing_the_default() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut websocket = tungstenite::accept(stream).unwrap();
+            // One warmup plus the five loaded Auto-Tune measurements.
+            for _ in 0..=LOADED_AUTOTUNE_WS_STREAMS {
+                let Message::Text(text) = websocket.read().unwrap() else {
+                    continue;
+                };
+                let token = json_number(&text, "timestamp").unwrap() as u64;
+                websocket
+                    .send(Message::Text(
+                        format!(
+                            "{{\"type\":\"pong\",\"clientTime\":{token},\"serverProcessingTime\":0}}"
+                        )
+                        .into(),
+                    ))
+                    .unwrap();
+            }
+        });
+        let endpoint = format!("ws://{address}/ws");
+        let mut engine = TransportProbeEngine::new(
+            TransportProbeBackend::WebSocket,
+            endpoint,
+            RouteBinding::default(),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let sample = engine.probe_classified_loaded_autotune().unwrap();
+        assert_eq!(sample.raw_samples_ms.len(), LOADED_AUTOTUNE_WS_STREAMS);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn persistent_http_is_https_only_in_the_engine() {
         let error = TransportProbeEngine::new(
             TransportProbeBackend::PersistentHttp,
@@ -1531,12 +1669,27 @@ mod tests {
 
     #[test]
     fn connect_uses_remaining_budget_across_multiple_addresses() {
-        let closed = TcpListener::bind("127.0.0.1:0").unwrap();
-        let closed_address = closed.local_addr().unwrap();
-        drop(closed);
+        // Port zero is never a connectable remote service and cannot be
+        // reassigned to an unrelated parallel test between setup and use.
+        let closed_address = SocketAddr::from(([127, 0, 0, 1], 0));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let live_address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || listener.accept().unwrap());
+        let server = thread::spawn(move || {
+            let accept_deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match listener.accept() {
+                    Ok(accepted) => return accepted,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < accept_deadline =>
+                    {
+                        thread::yield_now();
+                    }
+                    Err(error) => panic!("bounded test listener failed: {error}"),
+                }
+            }
+        });
         let deadline = ProbeDeadline::after(Duration::from_millis(300)).unwrap();
         let (stream, _) = connect_route_aware(
             &[closed_address, live_address],
@@ -1668,7 +1821,9 @@ mod tests {
         )
         .unwrap();
         let started = Instant::now();
-        assert!(engine.probe().is_err());
+        let failure = engine.probe_classified().unwrap_err();
+        assert_eq!(failure.kind(), TransportProbeFailureKind::DeadlineExceeded);
+        assert_eq!(failure.deadline_us(), Some(170_000));
         let elapsed = started.elapsed();
         assert!(elapsed < Duration::from_millis(300), "elapsed={elapsed:?}");
         assert!(engine.websocket.as_ref().unwrap().stream.is_none());
@@ -1692,7 +1847,9 @@ mod tests {
             Duration::from_millis(300),
         )
         .unwrap();
-        assert!(engine.probe().is_err());
+        let failure = engine.probe_classified().unwrap_err();
+        assert_eq!(failure.kind(), TransportProbeFailureKind::Other);
+        assert_eq!(failure.deadline_us(), None);
         assert!(engine.websocket.as_ref().unwrap().stream.is_none());
         drop(engine);
         server.join().unwrap();

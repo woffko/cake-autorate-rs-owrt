@@ -524,6 +524,18 @@ case "$expression" in
 	'@.selected.grade')
 		printf '%s\n' "$input" | sed -n 's/^.*"selected":{[^}]*"grade":"\([^"]*\)".*/\1/p'
 		;;
+	'@.review_options[0].role')
+		printf '%s\n' "$input" | sed -n 's/^.*"review_options":\[{"role":"\([^"]*\)".*/\1/p'
+		;;
+	'@.review_options[0].candidate_kbps')
+		printf '%s\n' "$input" | sed -n 's/^.*"review_options":\[{[^}]*"candidate_kbps":\([0-9][0-9]*\).*/\1/p'
+		;;
+	'@.review_options[0].direction_candidate_only')
+		printf '%s\n' "$input" | sed -n 's/^.*"review_options":\[{[^}]*"direction_candidate_only":\(true\|false\).*/\1/p'
+		;;
+	'@.review_options[0].pair_confirmation_required')
+		printf '%s\n' "$input" | sed -n 's/^.*"review_options":\[{[^}]*"pair_confirmation_required":\(true\|false\).*/\1/p'
+		;;
 	'@.runtime_minimum_kbps'|'@.runtime_minimum_observation_index'|'@.exploration_minimum_kbps')
 		key="${expression#@.}"
 		printf '%s\n' "$input" | sed -n "s/^.*\"$key\":\([0-9][0-9]*\).*/\1/p"
@@ -536,11 +548,15 @@ case "$expression" in
 		index="${expression#@.evaluated[}"
 		index="${index%%]*}"
 		awk_index=$((index + 1))
-		printf '%s\n' "$input" | awk -v wanted="$awk_index" '
+		# Ignore the top-level selected object and review-option indices.  The
+		# dynamic expression is specifically relative to the evaluated array;
+		# without this boundary an observation index greater than one can match
+		# selected.index first and greedily return an unrelated candidate.
+		printf '%s\n' "$input" | sed 's/^.*"evaluated":\[//' | awk -v wanted="$awk_index" '
 			BEGIN { RS="{\"index\":" }
 			NR > 1 && ($0 + 0) == wanted {
 				value=$0
-				if (sub(/^.*\"candidate_kbps\":/, "", value)) {
+				if (sub(/^.*"candidate_kbps":/, "", value)) {
 					sub(/[^0-9].*/, "", value)
 					print value
 					exit

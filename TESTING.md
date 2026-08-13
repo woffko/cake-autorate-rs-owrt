@@ -2362,3 +2362,48 @@ six intended dependencies, LuCI declared seven, and extracted ELF files
 matched x86_64, aarch64, ARM EABI/float ABI, or MIPS32r2 endianness as named.
 The final 13-file `SHA256SUMS` manifest was then verified from the clean release
 staging directory.
+
+## RC27 r235/r85 native migration and Full/Lite release gate (2026-08-13)
+
+The accepted source gate passed 1,031 serialized Rust tests for the Full
+daemon and 787 for the feature-reduced Lite daemon. Every daemon and LuCI shell
+suite, the four serialized Auto-Tune partitions, all JavaScript suites, both
+TypeScript projects, shell syntax, locked Rust checks, formatting, whitespace
+checks and relevant LSP diagnostics also passed. The source manifest SHA-256
+is `fe318d48a5883a2ef8403307a031fcf47135acf15e240711323718463578a687`.
+
+The OpenWrt 25.12.5 matrix contains 12 Full daemon APKs, 12 separately compiled
+Lite daemon APKs, Full LuCI r85 and Lite LuCI r3. All 26 APKs passed their
+matching SDK's `apk verify --allow-untrusted`, metadata and extracted-ELF
+inspection. The final `SHA256SUMS` file verifies all assets and has SHA-256
+`3224f724433b868c261d592b3870ad2ec85d5973e71393b41981353077d05294`.
+Across the matrix, Full daemons are approximately 2.0--2.3 MiB and Lite daemons
+0.86--1.12 MiB; Lite LuCI is about 7 KiB because it intentionally contains
+only Status and manual Settings.
+
+Daemon r235 was then installed on both anonymized x86_64 Multi-WAN routers and
+the anonymized aarch64 cellular router. On the primary x86_64 router a
+cache-disabled Variable Link / Shaped Only job reached a real runtime mutation,
+accepted typed Cancel and restored the exact four CAKE rates and all
+configuration files. On the secondary x86_64 router the same gate used the
+active backup WAN while the primary WAN remained administratively down; Full
+Raw reached mutation, Cancel restored the exact one-live-WAN topology, and no
+false missing-interface stop was emitted. Both routers ended with clean UCI
+and an idle coordinator.
+
+The final cellular gate used Variable Link / Full Raw and completed the real
+native Review path. It offered two immutable manifest-bound proposals. The
+recommended both-shaped option measured 277,789/24,203 Kbit/s at class B and
+requested 367,700/26,900 Kbit/s CAKE, with one explicit download-realization
+acknowledgement. Accepting that trade-off enabled native Apply; independent
+inspection found exactly 367,700 Kbit/s on `ifb4wwan0` and 26,900 Kbit/s on
+`wwan0`, clean UCI and no pending recovery. The original upload-only
+29,200-Kbit/s topology and every configuration file were then restored exactly.
+
+This live run confirms the last bounded retry fix: a structurally successful
+speed-test process whose first output cannot be parsed as a complete
+measurement may be repeated once. Route identity, UID/wire counters, SQM
+ownership, contamination, timeout and all other apparatus/authority failures
+remain non-retryable and fail closed. Marker-bounded logs on all three routers
+contained no output-rejection, panic, fatal, unsafe-recovery or residual-worker
+signature after restoration.

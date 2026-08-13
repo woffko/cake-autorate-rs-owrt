@@ -14,6 +14,7 @@ autotune_root="${CAKE_AUTORATE_AUTOTUNE_DIR:-/tmp/cake-autorate-autotune}"
 autotune_bin="${CAKE_AUTORATE_AUTOTUNE:-/usr/libexec/cake-autorate-rs/autotune}"
 speedtest_bin="${CAKE_AUTORATE_SPEEDTEST:-/usr/libexec/cake-autorate-rs/speedtest}"
 runtime_lock_lib="${CAKE_AUTORATE_RUNTIME_LOCK_LIB:-/usr/libexec/cake-autorate-rs/runtime-lock}"
+native_apply_recovery_root="${CAKE_AUTORATE_NATIVE_APPLY_RECOVERY_ROOT:-/etc/cake-autorate-rs/native-apply-recovery}"
 jsonfilter_bin="${CAKE_AUTORATE_JSONFILTER:-$(command -v jsonfilter 2>/dev/null)}"
 daemon_bin="${CAKE_AUTORATE_DAEMON:-/usr/sbin/cake-autorated}"
 tc_bin="${CAKE_AUTORATE_TC:-$(command -v tc 2>/dev/null)}"
@@ -44,6 +45,10 @@ die() {
 		find "$recovery_cleanup_dir" -type f -exec rm -f {} \; 2>/dev/null || true
 		find "$recovery_cleanup_dir" -depth -type d -exec rmdir {} \; 2>/dev/null || true
 		recovery_cleanup_dir=""
+	fi
+	if [ "${arm_runtime_lock_owned:-0}" = 1 ]; then
+		runtime_lock_abort_global_claim >/dev/null 2>&1 || true
+		arm_runtime_lock_owned=0
 	fi
 	printf '{"state":"failed","error":"%s"}\n' "$(json_escape "$error_message")"
 	exit 1
@@ -218,6 +223,47 @@ require_secure_directory() {
 
 prepare_root() {
 	secure_directory "$guard_root" || die "The Full Auto-Tune apply guard directory is unsafe or not tmpfs-backed."
+}
+
+arm_acquire_runtime_lock() {
+	command -v runtime_lock_acquire_global_exclusive >/dev/null 2>&1 ||
+		die "The shared CAKE runtime lock helper is unavailable."
+	if runtime_lock_acquire_global_exclusive; then
+		arm_runtime_lock_owned=1
+		return 0
+	else
+		arm_lock_rc=$?
+	fi
+	case "$arm_lock_rc" in
+		75) die "Another CAKE/SQM transaction owns the runtime lock; retry after it completes." ;;
+		*) die "Unable to acquire the shared CAKE runtime lock for Full Auto-Tune Apply." ;;
+	esac
+}
+
+arm_release_runtime_lock() {
+	[ "${arm_runtime_lock_owned:-0}" = 1 ] || return 0
+	runtime_lock_release_global ||
+		die "Unable to release the shared CAKE runtime lock after arming Full Auto-Tune Apply."
+	arm_runtime_lock_owned=0
+}
+
+native_apply_recovery_idle() {
+	command -v runtime_lock_path_owned_by_euid >/dev/null 2>&1 || return 1
+	case "$native_apply_recovery_root" in
+		/*) ;;
+		*) return 1 ;;
+	esac
+	case "$native_apply_recovery_root" in
+		*'/../'*|*'/..'|*'//'*|*[!A-Za-z0-9_./:@-]*) return 1 ;;
+	esac
+	[ ! -L "$native_apply_recovery_root" ] || return 1
+	if [ ! -e "$native_apply_recovery_root" ]; then
+		return 0
+	fi
+	[ -d "$native_apply_recovery_root" ] || return 1
+	runtime_lock_path_owned_by_euid "$native_apply_recovery_root" || return 1
+	[ ! -e "$native_apply_recovery_root/current" ] &&
+		[ ! -L "$native_apply_recovery_root/current" ]
 }
 
 prepare_receipt_root() {
@@ -1366,7 +1412,7 @@ validate_profile_search_contract() {
 		*) return 1 ;;
 	esac
 	search_root="@.profile_search.$search_direction"
-	require_result_flag "$search_root.schema_version" 2 "The profile-search schema is invalid."
+	require_result_flag "$search_root.schema_version" 3 "The profile-search schema is invalid."
 	require_result_flag "$search_root.profile" "$profile" "The profile-search profile changed."
 	require_result_flag "$search_root.direction" "$search_direction" "The profile-search direction changed."
 	search_action="$(require_result_value "$search_root.action")" ||
@@ -1398,6 +1444,14 @@ validate_profile_search_contract() {
 	esac
 	selected_rate="$(require_result_value "$search_root.selected.candidate_kbps")" ||
 		die "The selected profile-search rate is missing."
+	require_result_flag "$search_root.review_options[0].role" recommended \
+		"The profile-search recommended option is missing."
+	require_result_flag "$search_root.review_options[0].candidate_kbps" "$selected_rate" \
+		"The profile-search recommended option changed its selected rate."
+	require_result_flag "$search_root.review_options[0].direction_candidate_only" true \
+		"The profile-search option incorrectly claims whole-link authority."
+	require_result_flag "$search_root.review_options[0].pair_confirmation_required" true \
+		"The profile-search option no longer requires pair confirmation."
 	proposal_selected_rate="$(require_result_value "@.proposal.$search_rate_path.base_kbps")" ||
 		die "The proposal base rate is missing."
 	validation_selected_rate="$(require_result_value "@.validation.candidate_base.${search_direction}_kbps")" ||
@@ -1974,7 +2028,7 @@ arm_guard() {
 	if uci -q get "sqm.$sqm_guard" >/dev/null 2>&1; then
 		die "The reserved SQM rollback section already exists; reconcile or remove it before applying."
 	fi
-	if uci -q show cake-autorate 2>/dev/null | grep -q '\._autotune_apply_'; then
+	if any_apply_marker_lines; then
 		die "A persistent Full Auto-Tune apply marker already exists; reconcile it before applying another proposal."
 	fi
 
@@ -2533,6 +2587,17 @@ arm_guard() {
 	[ "$(json_get "$result_copy" '@.config_fingerprint')" = "$fingerprint" ] || die "The Full Auto-Tune result fingerprint changed."
 
 	snapshot_configs || die "Unable to snapshot the pre-apply configuration into tmpfs."
+	# Expensive result validation and snapshot construction happen before the
+	# global lock.  The incomplete private token directory is already a
+	# fail-closed sentinel for native Apply.  Acquire the authoritative lock only
+	# for the final live-state recheck and complete token publication.
+	arm_acquire_runtime_lock
+	native_apply_recovery_idle ||
+		die "A native Apply recovery transaction is pending or its recovery root is unsafe."
+	any_apply_marker_lines &&
+		die "A persistent Full Auto-Tune apply marker appeared while arming the proposal."
+	snapshot_state_matches "$token_dir/original" ||
+		die "The protected CAKE/SQM configuration changed while the proposal was being armed."
 	attest_route "$job" "$target" "$backend" "$route_mode" "$member" "$fingerprint"
 	now="$(date +%s)"
 	is_uint "$now" || die "Unable to establish the apply-token clock."
@@ -2580,6 +2645,7 @@ arm_guard() {
 	} > "$token_dir/meta" || die "Unable to write the Full Auto-Tune token metadata."
 	chmod 600 "$token_dir/meta" || die "Unable to protect the Full Auto-Tune token metadata."
 	owned_regular "$token_dir/meta" || die "The Full Auto-Tune token metadata is unsafe."
+	arm_release_runtime_lock
 	arm_cleanup_dir=""
 	printf '{"state":"armed","schema_version":1,"token":"%s","expires_epoch":%s,"boot_id":"%s"}\n' "$token" "$expires" "$boot_id"
 }

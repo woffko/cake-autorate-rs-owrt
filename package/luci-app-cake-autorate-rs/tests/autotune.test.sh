@@ -11,6 +11,8 @@ export PATH
 
 cleanup() {
 	[ -n "${blocking_pid:-}" ] && kill "$blocking_pid" 2>/dev/null || true
+	[ -n "${start_rpc_pid:-}" ] && kill "$start_rpc_pid" 2>/dev/null || true
+	[ -n "${cancel_rpc_pid:-}" ] && kill "$cancel_rpc_pid" 2>/dev/null || true
 	[ "${AUTOTUNE_TEST_KEEP_WORK:-0}" = 1 ] || rm -rf "$work"
 }
 trap cleanup EXIT INT TERM
@@ -66,12 +68,112 @@ shift
 setsid "$command" "$@" </dev/null >>"$log_file" 2>&1 6>&- &
 pid="$!"
 start="$(sed 's/^.*) //' "/proc/$pid/stat" | awk '{ print $20; exit }')"
+if [ -n "${AUTOTUNE_MOCK_PROCD_LAUNCH_MARKER:-}" ]; then
+	: > "$AUTOTUNE_MOCK_PROCD_LAUNCH_MARKER"
+	while [ -e "${AUTOTUNE_MOCK_PROCD_LAUNCH_HOLD:-}" ]; do sleep 0.05; done
+fi
 printf '{"pid":%s,"starttime":%s}\n' "$pid" "$start"
 EOF
 chmod +x "$work/procd-job"
 export CAKE_AUTORATE_PROCD_JOB="$work/procd-job"
 
 if [ "$autotune_test_part" = all ] || [ "$autotune_test_part" = early ]; then
+
+# The Rust coordinator must be able to journal a run identity before spawn.
+# Its private start mode uses that exact token rather than generating a second
+# identity inside the shell launcher, and normal cancel/recovery still applies.
+coordinated_token=abcdef0123456789abcdef0123456789
+"$autotune" coordinated lo start-coordinated speedtest-go '' '' best_overall 0 \
+	"$coordinated_token" 0 shaped_only > "$work/coordinated-start.json"
+test "$(sed -n '3p' "$work/jobs/coordinated/pid")" = "$coordinated_token"
+test "$(wc -l < "$work/jobs/coordinated/pid")" -eq 17
+test -z "$(sed -n '16p' "$work/jobs/coordinated/pid")"
+test -z "$(sed -n '17p' "$work/jobs/coordinated/pid")"
+"$autotune" coordinated lo cancel speedtest-go > "$work/coordinated-cancel.json"
+wait_for_job_cleanup coordinated
+
+# Every terminal producer must emit the current schema directly.  The staging
+# path intentionally does not rewrite old payloads, because doing so used to
+# hide stale construction sites until LuCI received an incompatible result.
+if grep -q 'schema_version\\\":7' "$autotune"; then
+	echo "autotune still contains a schema_version 7 terminal payload" >&2
+	exit 1
+fi
+
+# A terminal profile-search result is a strict schema-3 contract.  Version
+# skew and a nominal schema-3 result without the recommended measured option
+# must both fail closed before their candidate can enter pair confirmation.
+cat > "$work/profile-search-contract" <<'EOF'
+#!/bin/sh
+case "${FAKE_PROFILE_SEARCH_CONTRACT:-}" in
+	stale)
+		schema=2
+		review=',"review_options":[{"role":"recommended","candidate_kbps":50000,"direction_candidate_only":true,"pair_confirmation_required":true}]'
+		;;
+	missing-review)
+		schema=3
+		review=''
+		;;
+	*) exit 2 ;;
+esac
+printf '{"schema_version":%s,"profile":"best_overall","direction":"download","action":"complete","reason":"maximum-target-grade-confirmed","selected":{"candidate_kbps":50000,"safety_pass":true,"manual_reviewable":true,"realization_percent":100,"retention_percent":100,"target_met":true,"grade":"A"},"knee_detected":false,"no_cake_effect":false,"noisy":false,"inconclusive":false%s}\n' "$schema" "$review"
+EOF
+chmod +x "$work/profile-search-contract"
+for profile_search_contract in stale missing-review; do
+	FAKE_PROFILE_SEARCH_CONTRACT="$profile_search_contract" \
+	CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
+		set -eu
+		. "$1"
+		daemon_bin="$2"
+		autotune_profile=best_overall
+		raw_dl_low=50000
+		dl_minimum=20000
+		dl_maximum=50000
+		dl_search_observations="50000,50000,5,10,0,20"
+		profile_search_max_attempts=6
+		validation_candidate_realization_min_percent=80
+		validation_candidate_realization_max_percent=110
+		validation_capacity_retention_min_percent=80
+		validation_loss_max_percent=3
+		validation_cpu_max_percent=85
+		if run_profile_direction_search download; then
+			echo "autotune accepted invalid profile-search contract: $FAKE_PROFILE_SEARCH_CONTRACT" >&2
+			exit 1
+		fi
+	' sh "$autotune" "$work/profile-search-contract"
+done
+
+# A CAKE candidate is a shaper rate, while observed-low is payload evidence.
+# The profile search must keep the proposal's tested maximum as its upper
+# bound instead of clamping it a second time to the lower payload sample.
+cat > "$work/profile-search-arguments" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@" > "$FAKE_PROFILE_SEARCH_ARGUMENTS"
+printf '%s\n' '{"schema_version":3,"profile":"fair","direction":"download","action":"test","reason":"test-upper-bound","next_candidate_kbps":300,"knee_detected":false,"no_cake_effect":false,"noisy":false,"inconclusive":false}'
+EOF
+chmod +x "$work/profile-search-arguments"
+FAKE_PROFILE_SEARCH_ARGUMENTS="$work/profile-search-arguments.log" \
+CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
+	set -eu
+	. "$1"
+	daemon_bin="$2"
+	autotune_profile=fair
+	raw_dl_low=200
+	dl_minimum=100
+	dl_maximum=300
+	dl_search_observations=""
+	profile_search_max_attempts=8
+	validation_candidate_realization_min_percent=80
+	validation_candidate_realization_max_percent=110
+	validation_capacity_retention_min_percent=90
+	validation_loss_max_percent=5
+	validation_cpu_max_percent=85
+	run_profile_direction_search download
+	[ "$search_action" = test ]
+	[ "$search_next" = 300 ]
+' sh "$autotune" "$work/profile-search-arguments"
+test "$(awk 'previous == "--observed-low-kbps" { print; exit } { previous = $0 }' "$work/profile-search-arguments.log")" = 200
+test "$(awk 'previous == "--upper-kbps" { print; exit } { previous = $0 }' "$work/profile-search-arguments.log")" = 300
 
 # Minimal OpenWrt images such as the production x86 Multi-WAN router provide
 # neither od nor cksum. Worker/shaper identity must come directly from the
@@ -201,6 +303,17 @@ CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
 	inspect_autotune_route >/dev/null 2>&1 || true
 	[ "$route_mode" = main ]
 	[ -z "$mwan3_member" ]
+' sh "$autotune"
+
+# Sysfs link counters are monotonic 64-bit values even on 32-bit OpenWrt.
+# Crossing 2^32 is ordinary, while a regression/reset must invalidate the
+# quiet-window proof rather than being mistaken for wrap-around or zero load.
+CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
+	set -eu
+	. "$1"
+	[ "$(monotonic_counter_delta 4294967300 4294967290)" = 10 ]
+	! monotonic_counter_delta 5 4294967290 >/dev/null
+	! monotonic_counter_delta "" 100 >/dev/null
 ' sh "$autotune"
 
 # A scheduled run measures the selected uplink's aggregate RX+TX counters from
@@ -426,7 +539,7 @@ grep -q '"validation":{"profile":"best_overall","pass":true' "$work/status.json"
 grep -q '"manual_apply_eligible":true' "$work/status.json"
 grep -q '"comparison":"direction-matched-observed-low"' "$work/status.json"
 grep -q '"profile_outcome":{"mode":"target-a-met"' "$work/status.json"
-grep -q '"profile_search":{"download":{"schema_version":2' "$work/status.json"
+grep -q '"profile_search":{"download":{"schema_version":3' "$work/status.json"
 grep -q '"bidirectional_confirmation":{"tested":true,"safety_pass":true,"auto_apply_pass":true' "$work/status.json"
 grep -q '"auto_apply_eligible":true' "$work/status.json"
 grep -q '"phase_evidence_complete":true' "$work/status.json"
@@ -476,6 +589,10 @@ unset AUTOTUNE_MOCK_CALIBRATION_SHAPED
 # fresh conservative run whose actual evidence is clean and whose final
 # validation scores 100/100 must remain manually applicable (and may regain
 # trusted/auto eligibility).
+if grep -q 'calculate_proposal 0\.85 0\.85' "$autotune"; then
+	echo "conservative continuation still applies an unmeasured rate haircut" >&2
+	exit 1
+fi
 : > "$work/counter"
 export AUTOTUNE_MOCK_CONSERVATIVE_PHASE=1
 "$autotune" conservativeclean lo start-conservative speedtest-go > "$work/conservativeclean-start.json"
@@ -510,6 +627,12 @@ if (result.schema_version !== 8 || result.state !== 'complete' ||
 	primary.action !== 'apply_sqm' ||
 	primary.topology !== 'both_shaped' ||
 	primary.hard_safety_pass !== true ||
+	result.proposal.download.base_kbps !== result.profile_search.download.selected.candidate_kbps ||
+	result.proposal.upload.base_kbps !== result.profile_search.upload.selected.candidate_kbps ||
+	!result.profile_search.download.evaluated.some(item =>
+		item.candidate_kbps === result.proposal.download.base_kbps) ||
+	!result.profile_search.upload.evaluated.some(item =>
+		item.candidate_kbps === result.proposal.upload.base_kbps) ||
 	JSON.stringify(primary.configuration) !== JSON.stringify(result.proposal))
 	throw new Error('clean conservative continuation remained ineligible or lost trusted confidence');
 EOF
@@ -557,34 +680,65 @@ node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$work
 wait_for_job_cleanup malformedplan
 unset AUTOTUNE_MOCK_MALFORMED_PINGER
 
-# A helper exit code remains authoritative even when the helper managed to
-# print a well-formed result first. The raw diagnostic is retained in RAM, but
-# it must never be promoted to a successful measurement.
+# A helper exit without a structured .error is not evidence of a transient
+# network fault, even when the helper printed well-formed measurement JSON.
+# Fail on the first attempt instead of blindly retrying an unknown local error.
 : > "$work/counter"
 export AUTOTUNE_MOCK_VALID_JSON_EXIT_CODE=7
 export AUTOTUNE_MOCK_VALID_JSON_EXIT_AT_COUNT=1
+export CAKE_AUTORATE_AUTOTUNE_SPEEDTEST_RETRY_BACKOFF_S=0
 "$autotune" nonzerojson lo start speedtest-go > "$work/nonzerojson-start.json"
 attempt=0
 while [ "$attempt" -lt 220 ]; do
 	"$autotune" nonzerojson lo status speedtest-go > "$work/nonzerojson-status.json"
-	grep -q '"reason":"helper-exit:7"' "$work/nonzerojson-status.json" && break
+	grep -q '"state":"failed"' "$work/nonzerojson-status.json" && break
 	attempt=$((attempt + 1))
 	sleep 0.05
 done
-grep -q '"state":"failed"' "$work/nonzerojson-status.json"
-grep -q '"reason":"helper-exit:7"' "$work/nonzerojson-status.json"
+test "$(sed -n '1p' "$work/counter")" = 1
 node - "$work/nonzerojson-status.json" <<'EOF'
 const fs = require('node:fs');
 const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
-if (result.speedtest_supervisor.exit_code !== 7 ||
+if (result.state !== 'failed' || !result.speedtest_supervisor ||
+    result.speedtest_supervisor.reason !== 'helper-exit:7' ||
+    result.speedtest_supervisor.exit_code !== 7 ||
+    result.speedtest_supervisor.detail !== null ||
     result.speedtest_supervisor.raw_available !== true ||
     result.speedtest_supervisor.raw_bytes < 2)
-	throw new Error('valid helper diagnostic was not retained');
-if (result.auto_apply_eligible !== false || result.manual_apply_eligible !== false)
-	throw new Error('failed helper result became reviewable');
+	throw new Error('unknown helper exit did not fail closed on its first attempt');
 EOF
 wait_for_job_cleanup nonzerojson
-unset AUTOTUNE_MOCK_VALID_JSON_EXIT_CODE AUTOTUNE_MOCK_VALID_JSON_EXIT_AT_COUNT
+unset AUTOTUNE_MOCK_VALID_JSON_EXIT_CODE AUTOTUNE_MOCK_VALID_JSON_EXIT_AT_COUNT \
+	CAKE_AUTORATE_AUTOTUNE_SPEEDTEST_RETRY_BACKOFF_S
+
+# An overlong helper error is deliberately not trusted as a structured
+# diagnostic. It must follow the same fail-closed, no-retry path as a missing
+# detail rather than bypassing the transient-network allowlist.
+: > "$work/counter"
+AUTOTUNE_MOCK_JSON_ERROR="$(awk 'BEGIN { for (i = 0; i < 1030; i++) printf "x" }')"
+export AUTOTUNE_MOCK_JSON_ERROR
+export AUTOTUNE_MOCK_JSON_ERROR_AT_COUNT=1
+export AUTOTUNE_MOCK_JSON_ERROR_EXIT_CODE=8
+"$autotune" overlongdetail lo start speedtest-go > "$work/overlongdetail-start.json"
+attempt=0
+while [ "$attempt" -lt 220 ]; do
+	"$autotune" overlongdetail lo status speedtest-go > "$work/overlongdetail-status.json"
+	grep -q '"state":"failed"' "$work/overlongdetail-status.json" && break
+	attempt=$((attempt + 1))
+	sleep 0.05
+done
+test "$(sed -n '1p' "$work/counter")" = 1
+node - "$work/overlongdetail-status.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (result.state !== 'failed' || !result.speedtest_supervisor ||
+    result.speedtest_supervisor.reason !== 'helper-exit:8' ||
+    result.speedtest_supervisor.detail !== null)
+	throw new Error('overlong helper detail bypassed fail-closed retry policy');
+EOF
+wait_for_job_cleanup overlongdetail
+unset AUTOTUNE_MOCK_JSON_ERROR AUTOTUNE_MOCK_JSON_ERROR_AT_COUNT \
+	AUTOTUNE_MOCK_JSON_ERROR_EXIT_CODE
 
 # A structured speed-test helper error must survive the supervisor boundary.
 # This is the actionable reason shown by Full Auto-Tune instead of a bare
@@ -617,6 +771,36 @@ EOF
 wait_for_job_cleanup helperdetail
 unset AUTOTUNE_MOCK_JSON_ERROR AUTOTUNE_MOCK_JSON_ERROR_AT_COUNT \
 	AUTOTUNE_MOCK_JSON_ERROR_EXIT_CODE
+
+# A structured detail is retryable only when it matches the explicit transient
+# network allowlist. The failed attempt remains visible even after recovery.
+: > "$work/counter"
+export AUTOTUNE_MOCK_JSON_ERROR="Connection timed out while reaching the selected server."
+export AUTOTUNE_MOCK_JSON_ERROR_AT_COUNT=1
+export AUTOTUNE_MOCK_JSON_ERROR_EXIT_CODE=28
+export CAKE_AUTORATE_AUTOTUNE_SPEEDTEST_RETRY_BACKOFF_S=0
+"$autotune" transientdetail lo start speedtest-go > "$work/transientdetail-start.json"
+attempt=0
+while [ "$attempt" -lt 800 ]; do
+	"$autotune" transientdetail lo status speedtest-go > "$work/transientdetail-status.json"
+	grep -q '"state":"complete"' "$work/transientdetail-status.json" && break
+	attempt=$((attempt + 1))
+	sleep 0.02
+done
+node - "$work/transientdetail-status.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (result.state !== 'complete')
+	throw new Error(`transient structured error did not recover: ${result.state}`);
+if (!Array.isArray(result.speedtest_retries) ||
+    !result.speedtest_retries.some(entry => entry.supervisor &&
+        entry.supervisor.reason === 'helper-exit:28' &&
+        /Connection timed out/.test(entry.supervisor.detail || '')))
+	throw new Error('structured transient retry evidence was lost');
+EOF
+wait_for_job_cleanup transientdetail
+unset AUTOTUNE_MOCK_JSON_ERROR AUTOTUNE_MOCK_JSON_ERROR_AT_COUNT \
+	AUTOTUNE_MOCK_JSON_ERROR_EXIT_CODE CAKE_AUTORATE_AUTOTUNE_SPEEDTEST_RETRY_BACKOFF_S
 
 # A stalled first direction-only transfer is a transient measurement failure,
 # not an immediate terminal error. The supervisor reaps the timed-out process
@@ -772,7 +956,9 @@ if (result.state !== 'complete' || result.auto_apply_eligible !== true ||
     !first.reasons.some(reason => reason.code === 'download-candidate-realization') ||
     !first.warnings.some(warning => warning.code === 'download-throughput-safety-floor') ||
     result.validation.pass !== true || result.validation.profile_objectives_met !== true)
-	throw new Error('realization did not block the unsafe candidate while trust remained advisory');
+	throw new Error(`realization did not block the unsafe candidate while trust remained advisory: ${JSON.stringify({
+		state: result.state, auto: result.auto_apply_eligible, first, final: result.validation,
+	})}`);
 EOF
 wait_for_job_cleanup corrected
 unset AUTOTUNE_MOCK_CORRECT
@@ -785,12 +971,16 @@ unset AUTOTUNE_MOCK_CORRECT
 export AUTOTUNE_MOCK_FAIR_SHAPED_BAD=1
 "$autotune" fairdisable lo start speedtest-go '' '' fair > "$work/fairdisable-start.json"
 attempt=0
-while [ "$attempt" -lt 260 ]; do
+while [ "$attempt" -lt 800 ]; do
 	"$autotune" fairdisable lo status speedtest-go '' '' fair > "$work/fairdisable-status.json"
 	grep -Eq '"state":"(complete|failed|inconclusive)"' "$work/fairdisable-status.json" && break
 	attempt=$((attempt + 1))
 	sleep 0.05
 done
+if ! grep -Eq '"state":"(complete|failed|inconclusive)"' "$work/fairdisable-status.json"; then
+	cat "$work/fairdisable-status.json" >&2
+	exit 1
+fi
 grep -q '"profile":"fair"' "$work/fairdisable-status.json"
 grep -q '"auto_apply_eligible":false' "$work/fairdisable-status.json"
 grep -q '"manual_apply_eligible":true' "$work/fairdisable-status.json"
@@ -833,17 +1023,33 @@ unset AUTOTUNE_MOCK_FAIR_SHAPED_BAD
 export AUTOTUNE_MOCK_REALIZATION_OVERSHOOT=1
 "$autotune" overshoot lo start speedtest-go > "$work/overshoot-start.json"
 attempt=0
-while [ "$attempt" -lt 260 ]; do
+while [ "$attempt" -lt 800 ]; do
 	"$autotune" overshoot lo status speedtest-go > "$work/overshoot-status.json"
 	grep -Eq '"state":"(complete|failed|inconclusive)"' "$work/overshoot-status.json" && break
 	attempt=$((attempt + 1))
 	sleep 0.05
 done
+if ! grep -Eq '"state":"(complete|failed|inconclusive)"' "$work/overshoot-status.json"; then
+	cat "$work/overshoot-status.json" >&2
+	exit 1
+fi
 node - "$work/overshoot-status.json" <<'EOF'
 const fs = require('node:fs');
 const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 if (result.configuration_written !== false)
 	throw new Error('overshoot calibration changed configuration');
+const maximumGates = result.validation && Array.isArray(result.validation.gates) ?
+	result.validation.gates.filter(item => item.code.endsWith('-candidate-realization-maximum')) : [];
+if (maximumGates.length !== 2 || maximumGates.some(item =>
+	item.pass !== false || !(item.actual > item.limit)))
+	throw new Error('overshoot fixture did not exercise the independent realization-maximum gate');
+for (const direction of [ 'download', 'upload' ]) {
+	const search = result.profile_search && result.profile_search[direction];
+	const evaluated = search && Array.isArray(search.evaluated) ? search.evaluated : [];
+	if (!evaluated.some(item => item.realization_percent > 110 &&
+	    item.safety_pass === false && item.manual_reviewable === false))
+		throw new Error(`${direction} optimizer did not reject the measured overshoot`);
+}
 const proposals = Array.isArray(result.proposals) ? result.proposals : [];
 if (proposals.some(item => item.action === 'apply_sqm'))
 	throw new Error('an unproven overshoot CAKE candidate remained applyable');
@@ -864,12 +1070,16 @@ unset AUTOTUNE_MOCK_REALIZATION_OVERSHOOT
 export AUTOTUNE_MOCK_COMPUTE_CEILING=1
 "$autotune" cpuadvisory lo start speedtest-go > "$work/cpuadvisory-start.json"
 attempt=0
-while [ "$attempt" -lt 260 ]; do
+while [ "$attempt" -lt 800 ]; do
 	"$autotune" cpuadvisory lo status speedtest-go > "$work/cpuadvisory-status.json"
 	grep -q '"state":"complete"' "$work/cpuadvisory-status.json" && break
 	attempt=$((attempt + 1))
 	sleep 0.05
 done
+if ! grep -q '"state":"complete"' "$work/cpuadvisory-status.json"; then
+	cat "$work/cpuadvisory-status.json" >&2
+	exit 1
+fi
 node - "$work/cpuadvisory-status.json" <<'EOF'
 const fs = require('node:fs');
 const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
@@ -909,12 +1119,16 @@ export AUTOTUNE_MOCK_BIDI_HIGH_LATENCY=1
 export AUTOTUNE_MOCK_UPLOAD_ONLY_SAFE=1
 "$autotune" bidilatency lo start speedtest-go > "$work/bidilatency-start.json"
 attempt=0
-while [ "$attempt" -lt 260 ]; do
+while [ "$attempt" -lt 800 ]; do
 	"$autotune" bidilatency lo status speedtest-go > "$work/bidilatency-status.json"
 	grep -q '"state":"complete"' "$work/bidilatency-status.json" && break
 	attempt=$((attempt + 1))
 	sleep 0.05
 done
+if ! grep -q '"state":"complete"' "$work/bidilatency-status.json"; then
+	cat "$work/bidilatency-status.json" >&2
+	exit 1
+fi
 node - "$work/bidilatency-status.json" <<'EOF'
 const fs = require('node:fs');
 const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
@@ -1132,32 +1346,47 @@ test "$(wc -l < "$work/fping-restart.calls" | tr -d ' ')" = 1
 wait_for_job_cleanup ratelimitedreflector
 unset AUTOTUNE_MOCK_ICMP_RATE_LIMIT AUTOTUNE_MOCK_FPING_CALLS
 
-# A clean, safety-floor-passing capacity shortfall tests the raw upper bound
-# directly. The independent typed searches must not leak the DL scale into UL
-# evidence or treat the advisory profile objective as a safety failure.
+# A clean, safety-floor-passing capacity shortfall starts download at its own
+# measured exploration maximum and descends to the first controlled boundary.
+# Upload independently completes at its own maximum; neither typed search may
+# leak the peer direction's scale into its evidence.
 : > "$work/counter"
 export AUTOTUNE_MOCK_DIRECTIONAL_CORRECT=1
 "$autotune" directional lo start speedtest-go > "$work/directional-start.json"
 attempt=0
-while [ "$attempt" -lt 220 ]; do
+while [ "$attempt" -lt 800 ]; do
 	"$autotune" directional lo status speedtest-go > "$work/directional-status.json"
 	grep -q '"state":"complete"' "$work/directional-status.json" && break
 	attempt=$((attempt + 1))
 	sleep 0.05
 done
-grep -q '"state":"complete"' "$work/directional-status.json"
+if ! grep -q '"state":"complete"' "$work/directional-status.json"; then
+	cat "$work/directional-status.json" >&2
+	exit 1
+fi
 node - "$work/directional-status.json" <<'EOF'
 const fs = require('node:fs');
 const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const dl = result.profile_search.download.evaluated;
 const ul = result.profile_search.upload.evaluated;
+const dlRecommended = result.profile_search.download.review_options[0];
+const ulRecommended = result.profile_search.upload.review_options[0];
 if (JSON.stringify(dl.map(item => item.candidate_kbps)) !==
-      JSON.stringify([42500, 50000]) ||
-    JSON.stringify(ul.map(item => item.candidate_kbps)) !==
-      JSON.stringify([8800, 10000]) ||
-    dl[0].safety_pass !== true || dl[0].capacity_objective_met !== false ||
-    ul[0].safety_pass !== true ||
-    result.validation.candidate_base.download_kbps !== 50000 ||
+	  JSON.stringify([104000, 104000, 104000, 43400]) ||
+	JSON.stringify(dl.map(item => item.safety_pass)) !==
+	  JSON.stringify([false, false, false, true]) ||
+	JSON.stringify(dl.map(item => item.capacity_objective_met)) !==
+	  JSON.stringify([false, true, true, true]) ||
+	JSON.stringify(ul.map(item => item.candidate_kbps)) !==
+	  JSON.stringify([10000]) ||
+	JSON.stringify(ul.map(item => item.safety_pass)) !== JSON.stringify([true]) ||
+	dlRecommended.candidate_kbps !== 43400 ||
+	ulRecommended.candidate_kbps !== 10000 ||
+    dlRecommended.direction_candidate_only !== true ||
+    ulRecommended.direction_candidate_only !== true ||
+    dlRecommended.pair_confirmation_required !== true ||
+    ulRecommended.pair_confirmation_required !== true ||
+	result.validation.candidate_base.download_kbps !== 43400 ||
     result.validation.candidate_base.upload_kbps !== 10000)
 	throw new Error('directional profile search crossed DL and UL candidates');
 EOF
@@ -1346,8 +1575,8 @@ EOF
 	raw_dl_low=100000
 	raw_ul_low=10000
 	raw_control_json='{"available":true,"measurement_evidence":{"valid":true,"reason":"ok","test_direction":"both","shaper_bypassed":true,"sqm_paused":true,"sqm_bypass_mode":"paused-managed"},"grade":"C","effective_delta_ms":150,"throughput":{"download_kbps":100000,"upload_kbps":10000},"icmp_latency":{"loss_percent":0},"forwarded_background":{"available":true,"contaminated":false,"download_kbps":0,"upload_kbps":0,"download_limit_kbps":1000,"upload_limit_kbps":1000}}'
-	dl_search_json='{"schema_version":2,"profile":"variable_link","direction":"download","action":"inconclusive","reason":"no-safe-observation"}'
-	ul_search_json='{"schema_version":2,"profile":"variable_link","direction":"upload","action":"inconclusive","reason":"no-safe-observation"}'
+	dl_search_json='{"schema_version":3,"profile":"variable_link","direction":"download","action":"inconclusive","reason":"no-safe-observation","review_options":[]}'
+	ul_search_json='{"schema_version":3,"profile":"variable_link","direction":"upload","action":"inconclusive","reason":"no-safe-observation","review_options":[]}'
 	validation_attempts_json='{"safety_pass":false}'
 	runs_json='{}'
 	fair_disable_available=false
@@ -1781,7 +2010,7 @@ export AUTOTUNE_MOCK_AUTO_SELECTED_BACKEND=librespeed-cli
 export AUTOTUNE_MOCK_STATUS_BACKEND_LOG="$work/status-backends"
 "$autotune" autoresolve lo start auto > "$work/autoresolve-start.json"
 attempt=0
-while [ "$attempt" -lt 260 ]; do
+while [ "$attempt" -lt 800 ]; do
 	"$autotune" autoresolve lo status auto > "$work/autoresolve-status.json"
 	grep -q '"state":"complete"' "$work/autoresolve-status.json" && break
 	attempt=$((attempt + 1))
@@ -1842,7 +2071,7 @@ unset AUTOTUNE_MOCK_NFT_FLOWTABLE
 export CAKE_AUTORATE_AUTOTUNE_TEST_BASELINE_BACKGROUND_FIRST_DL_KBPS=999999
 "$autotune" baselineretry lo start speedtest-go > "$work/baselineretry-start.json"
 attempt=0
-while [ "$attempt" -lt 260 ]; do
+while [ "$attempt" -lt 800 ]; do
 	"$autotune" baselineretry lo status speedtest-go > "$work/baselineretry-status.json"
 	grep -q '"state":"complete"' "$work/baselineretry-status.json" && break
 	attempt=$((attempt + 1))
@@ -1880,7 +2109,7 @@ export AUTOTUNE_MOCK_FPING_SPARSE_FIRST_ONLY=1
 export AUTOTUNE_MOCK_FPING_SPARSE_MARKER="$work/sparse-first.marker"
 "$autotune" sparsefirst lo start speedtest-go > "$work/sparsefirst-start.json"
 attempt=0
-while [ "$attempt" -lt 260 ]; do
+while [ "$attempt" -lt 800 ]; do
 	"$autotune" sparsefirst lo status speedtest-go > "$work/sparsefirst-status.json"
 	grep -q '"state":"complete"' "$work/sparsefirst-status.json" && break
 	attempt=$((attempt + 1))
@@ -2150,6 +2379,58 @@ unset CAKE_AUTORATE_SYS_CLASS_NET AUTOTUNE_MOCK_BLOCK_AT_COUNT AUTOTUNE_MOCK_BLO
 export AUTOTUNE_MOCK_BLOCK=1
 export AUTOTUNE_MOCK_RESTORE_MARKER="$work/restored"
 export AUTOTUNE_MOCK_BLOCK_STARTED="$work/block-started"
+
+# Cancel may arrive after procd admitted the worker but before start_job has
+# published pid/starttime/run_id.  It must wait on start.guard, then cancel the
+# exact new generation; returning idle or a stale restored terminal here would
+# leave an unshaped worker running after LuCI reports success.
+export AUTOTUNE_MOCK_PROCD_LAUNCH_MARKER="$work/start-gap-procd-launched"
+export AUTOTUNE_MOCK_PROCD_LAUNCH_HOLD="$work/start-gap-procd-hold"
+: > "$AUTOTUNE_MOCK_PROCD_LAUNCH_HOLD"
+"$autotune" cancelstartgap lo start speedtest-go '' '' best_overall 0 '' 0 shaped_only \
+	> "$work/cancel-start-gap-start.json" &
+start_rpc_pid=$!
+attempt=0
+while [ "$attempt" -lt 220 ]; do
+	[ -e "$AUTOTUNE_MOCK_PROCD_LAUNCH_MARKER" ] && break
+	attempt=$((attempt + 1))
+	sleep 0.05
+done
+[ -e "$AUTOTUNE_MOCK_PROCD_LAUNCH_MARKER" ]
+"$autotune" cancelstartgap lo cancel speedtest-go > "$work/cancel-start-gap-cancel.json" &
+cancel_rpc_pid=$!
+sleep 0.1
+if [ -s "$work/cancel-start-gap-cancel.json" ]; then
+	echo 'cancel escaped the startup guard before worker identity publication' >&2
+	exit 1
+fi
+rm -f "$AUTOTUNE_MOCK_PROCD_LAUNCH_HOLD"
+wait "$start_rpc_pid"
+start_rpc_pid=""
+wait "$cancel_rpc_pid"
+cancel_rpc_pid=""
+start_gap_run_id="$(sed -n 's/.*"run_id":"\([0-9a-f][0-9a-f]*\)".*/\1/p' "$work/cancel-start-gap-start.json")"
+cancel_gap_run_id="$(sed -n 's/.*"run_id":"\([0-9a-f][0-9a-f]*\)".*/\1/p' "$work/cancel-start-gap-cancel.json")"
+test "${#start_gap_run_id}" -eq 32
+test "$cancel_gap_run_id" = "$start_gap_run_id"
+if grep -q '"run_id":"pending"' "$work/cancel-start-gap-cancel.json"; then
+	echo 'cancel response lost the authenticated worker run_id' >&2
+	exit 1
+fi
+attempt=0
+while [ "$attempt" -lt 220 ]; do
+	"$autotune" cancelstartgap lo status-summary speedtest-go > "$work/cancel-start-gap-status.json"
+	grep -q '"state":"cancelled"' "$work/cancel-start-gap-status.json" && break
+	attempt=$((attempt + 1))
+	sleep 0.05
+done
+grep -q '"state":"cancelled"' "$work/cancel-start-gap-status.json"
+grep -q '"runtime_restored":true' "$work/cancel-start-gap-status.json"
+grep -q '"recovery_pending":false' "$work/cancel-start-gap-status.json"
+wait_for_job_cleanup cancelstartgap
+unset AUTOTUNE_MOCK_PROCD_LAUNCH_MARKER AUTOTUNE_MOCK_PROCD_LAUNCH_HOLD
+rm -f "$AUTOTUNE_MOCK_BLOCK_STARTED" "$AUTOTUNE_MOCK_RESTORE_MARKER"
+
 "$autotune" cancelled lo start speedtest-go '' '' best_overall 0 '' 0 shaped_only > "$work/cancel-start.json"
 
 attempt=0
@@ -2230,6 +2511,71 @@ if [ "$autotune_test_part" = all ] || [ "$autotune_test_part" = late ] ||
 export CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1
 . "$autotune"
 unset CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY
+
+# The pre-heartbeat cleanup path is still evidence-bearing: failure to stop an
+# owner-session child must keep the terminal private and pending, even when no
+# qdisc recovery journal has been armed yet.
+CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
+	. "$1"
+	job_name=cleanupgatefail
+	target_if_input=lo
+	backend_input=speedtest-go
+	route_mode_override=""
+	mwan3_member_override=""
+	autotune_profile=best_overall
+	worker_token=11111111111111111111111111111111
+	current_phase=pre-heartbeat-test
+	recovery_armed=0
+	cleanup_started=0
+	recovery_heartbeat=""
+	recovery_sqm_config_snapshot=""
+	recovery_journal=""
+	job_paths
+	mkdir -p "$job_dir"
+	stop_transport_latency_monitor() { return 0; }
+	terminate_owner_session_children() { return 1; }
+	cleanup_phase_background_counter() { return 0; }
+	cleanup_stale_phase_background_tables() { return 0; }
+	restore_temp_shaper() { return 0; }
+	release_autotune_interface_lock() { return 0; }
+	remove_own_worker_identity() { return 0; }
+	worker_trace() { return 0; }
+	worker_cleanup 130
+	[ -s "$pending_error_file" ]
+	[ ! -s "$error_file" ]
+	grep -q "\"runtime_restored\":false,\"recovery_pending\":true" "$pending_error_file"
+' sh "$autotune"
+
+# The same unarmed path may publish only after every cleanup check succeeds.
+CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
+	. "$1"
+	job_name=cleanupgatesuccess
+	target_if_input=lo
+	backend_input=speedtest-go
+	route_mode_override=""
+	mwan3_member_override=""
+	autotune_profile=best_overall
+	worker_token=22222222222222222222222222222222
+	current_phase=pre-heartbeat-test
+	recovery_armed=0
+	cleanup_started=0
+	recovery_heartbeat=""
+	recovery_sqm_config_snapshot=""
+	recovery_journal=""
+	job_paths
+	mkdir -p "$job_dir"
+	stop_transport_latency_monitor() { return 0; }
+	terminate_owner_session_children() { return 0; }
+	cleanup_phase_background_counter() { return 0; }
+	cleanup_stale_phase_background_tables() { return 0; }
+	restore_temp_shaper() { return 0; }
+	release_autotune_interface_lock() { return 0; }
+	remove_own_worker_identity() { return 0; }
+	worker_trace() { return 0; }
+	worker_cleanup 130
+	[ ! -e "$pending_error_file" ]
+	grep -q "\"runtime_restored\":true,\"recovery_pending\":false" "$error_file"
+' sh "$autotune"
 
 # Marker-driven monitors normally exit by themselves.  If the child vanishes
 # between the first state check and the pre-signal identity guard, cleanup must
@@ -3011,8 +3357,9 @@ fi
 # Variable Link must terminate a flat, target-meeting direction without
 # cancelling the peer search. Upload reaches the typed no-effect fallback on
 # attempt three; download continues to a measured knee on attempt four. The
-# terminal proposal is manual-only and keeps both runtime minima tied to
-# actually evaluated candidates.
+# terminal proposal is manual-only. The measured download knee is retained as
+# its runtime minimum; the flat upload direction remains explicitly unresolved
+# and is offered only through directional bypass review.
 : > "$work/counter"
 export AUTOTUNE_MOCK_VARIABLE_DIRECTIONAL_NO_EFFECT=1
 "$autotune" variabledirectional lo start speedtest-go '' '' variable_link 0 '' 0 full_raw \
@@ -3036,17 +3383,67 @@ if (result.state !== 'complete' || result.profile !== 'variable_link' ||
     result.profile_outcome.mode !== 'directional-no-cake-effect-review' ||
     !result.bidirectional_confirmation || result.bidirectional_confirmation.safety_pass !== true ||
     !download || download.knee_detected !== true || download.no_cake_effect !== false ||
-    !upload || upload.action !== 'fallback' || upload.reason !== 'queue-outside-cake-control' ||
-    upload.knee_detected !== false || upload.no_cake_effect !== true ||
-    upload.selected.safety_pass !== true || upload.selected.target_met !== true ||
-    upload.selected.retention_percent < 50 ||
-    upload.runtime_minimum_kbps !== upload.selected.candidate_kbps ||
-    result.proposal.upload.minimum_kbps !== upload.runtime_minimum_kbps ||
-    download.evaluated.length <= upload.evaluated.length)
+	!upload || upload.action !== 'fallback' || upload.reason !== 'queue-outside-cake-control' ||
+	upload.knee_detected !== false || upload.no_cake_effect !== true ||
+	upload.selected.safety_pass !== true || upload.selected.target_met !== true ||
+	upload.selected.retention_percent < 50 ||
+	upload.runtime_minimum_kbps !== null || upload.runtime_minimum_observation_index !== null ||
+	result.proposal.upload.runtime_minimum_kbps !== null ||
+	result.proposal.upload.minimum_kbps !== result.proposal.upload.exploration_minimum_kbps ||
+	result.directional_recommendation.recommended_topology !== 'download_only_shaped' ||
+	download.evaluated.length <= upload.evaluated.length)
 	throw new Error('directional Variable-link no-effect fallback did not preserve the peer search');
 EOF
 wait_for_job_cleanup variabledirectional
 unset AUTOTUNE_MOCK_VARIABLE_DIRECTIONAL_NO_EFFECT AUTOTUNE_MOCK_CURRENT_DL_KBPS AUTOTUNE_MOCK_CURRENT_UL_KBPS
+
+# A backend can become unable to express a positive rate at a very deep
+# directional candidate even though the pinned route and temporary CAKE pair
+# remain healthy. Retry that exact point once, then terminate only the affected
+# direction at the last measured boundary. The failed candidate must not enter
+# evaluated[] or replace the earlier proposal.
+: > "$work/counter"
+export AUTOTUNE_MOCK_VARIABLE_DIRECTIONAL_NO_EFFECT=1
+export AUTOTUNE_MOCK_JSON_ERROR=speedtest-direction-result-unavailable
+export AUTOTUNE_MOCK_JSON_ERROR_AT_COUNT=8
+export AUTOTUNE_MOCK_JSON_ERROR_AT_COUNT_2=9
+"$autotune" unmeasurableboundary lo start speedtest-go '' '' variable_link 0 '' 0 full_raw \
+	cellular user_selected 100 passive_bounded > "$work/unmeasurableboundary-start.json"
+attempt=0
+while [ "$attempt" -lt 600 ]; do
+	"$autotune" unmeasurableboundary lo status speedtest-go '' '' variable_link 0 '' 0 full_raw \
+		cellular user_selected 100 passive_bounded > "$work/unmeasurableboundary-status.json"
+	grep -q '"state":"complete"' "$work/unmeasurableboundary-status.json" && break
+	if grep -q '"state":"failed"' "$work/unmeasurableboundary-status.json"; then
+		cat "$work/unmeasurableboundary-status.json" >&2
+		exit 1
+	fi
+	attempt=$((attempt + 1))
+	sleep 0.05
+done
+node - "$work/unmeasurableboundary-status.json" <<'EOF'
+const fs = require('node:fs');
+const result = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const download = result.profile_search && result.profile_search.download;
+if (result.state !== 'complete' || result.profile !== 'variable_link' ||
+    !download || download.action !== 'fallback' ||
+    download.reason !== 'candidate-transfer-unmeasurable' ||
+    !download.selected || download.evaluated.length !== 1 ||
+    download.selected.candidate_kbps !== download.evaluated[0].candidate_kbps ||
+    !Array.isArray(result.speedtest_retries) ||
+    !result.speedtest_retries.some(entry => entry.supervisor &&
+        entry.supervisor.detail === 'speedtest-direction-result-unavailable'))
+	throw new Error(`unmeasurable directional probe did not preserve the last exact candidate: ${JSON.stringify({
+		state: result.state,
+		error: result.error,
+		download,
+		retries: result.speedtest_retries,
+	})}`);
+EOF
+wait_for_job_cleanup unmeasurableboundary
+unset AUTOTUNE_MOCK_VARIABLE_DIRECTIONAL_NO_EFFECT AUTOTUNE_MOCK_JSON_ERROR \
+	AUTOTUNE_MOCK_JSON_ERROR_AT_COUNT AUTOTUNE_MOCK_JSON_ERROR_AT_COUNT_2 \
+	AUTOTUNE_MOCK_CURRENT_DL_KBPS AUTOTUNE_MOCK_CURRENT_UL_KBPS
 
 # Directional evidence is not independently applicable when the final
 # simultaneous DL+UL confirmation exceeds the profile's manual safety limit.
@@ -3121,7 +3518,7 @@ if (result.state !== 'complete' || result.profile !== 'fair' ||
     result.profile_outcome.mode !== 'latency-safe-throughput-advisory' ||
     result.profile_outcome.capacity_floor_met !== false ||
     result.profile_outcome.throughput_safety_floor_met !== true ||
-    JSON.stringify(candidates) !== JSON.stringify([848500, 902700]) ||
+    JSON.stringify(candidates) !== JSON.stringify([902700]) ||
     download.selected.candidate_kbps !== 902700 ||
     download.selected.retention_percent < 50 ||
     download.selected.capacity_objective_met !== false ||
@@ -3202,6 +3599,47 @@ grep -q '"job_id":"largeterminal"' "$work/large-summary.json"
 [ -s "$work/jobs/largeterminal/terminal.integrity" ]
 "$autotune" largeterminal lo result speedtest-go > "$work/large-result.json"
 cmp "$work/jobs/largeterminal/result.json" "$work/large-result.json"
+
+# All newly staged terminals are atomically instance-bound, including the
+# generic failure paths that historically omitted job_id.  A producer may not
+# overwrite a conflicting identity supplied by its caller.
+CAKE_AUTORATE_AUTOTUNE_SOURCE_ONLY=1 sh -c '
+	set -eu
+	. "$1"
+	job_name=terminalbound
+	worker_token=0123456789abcdef0123456789abcdef
+	autotune_profile=best_overall
+	config_fingerprint=
+	config_fingerprint_captured=false
+	pending_result_file="$2/pending-result.json"
+	pending_error_file="$2/pending-error.json"
+	stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":8,\"error\":\"bounded\"}"
+	grep -q '\''"job_id":"terminalbound"'\'' "$pending_error_file"
+	rm -f "$pending_error_file"
+	if stage_terminal_json error "{\"state\":\"failed\",\"schema_version\":8,\"job_id\":\"another\",\"error\":\"stale\"}"; then
+		exit 1
+	fi
+	[ ! -e "$pending_error_file" ]
+' sh "$autotune" "$work"
+
+# Reconcile only the narrow pre-fix form: an integrity-protected terminal with
+# an exact 32-hex run_id but no job_id.  Missing run identity remains unsafe.
+mkdir -p "$work/jobs/legacybound"
+cat > "$work/jobs/legacybound/error.json" <<'EOF'
+{"state":"failed","schema_version":8,"producer":"cake-autorate-rs-autotune","run_id":"abcdef0123456789abcdef0123456789","runtime_restored":true,"recovery_pending":false}
+EOF
+"$autotune" legacybound lo status-summary speedtest-go > "$work/legacybound-summary.json"
+grep -q '"terminal_available":true' "$work/legacybound-summary.json"
+grep -q '"run_id":"abcdef0123456789abcdef0123456789"' "$work/legacybound-summary.json"
+grep -q '"job_id":"legacybound"' "$work/legacybound-summary.json"
+
+mkdir -p "$work/jobs/legacyunbound"
+cat > "$work/jobs/legacyunbound/error.json" <<'EOF'
+{"state":"failed","schema_version":8,"producer":"cake-autorate-rs-autotune","runtime_restored":true,"recovery_pending":false}
+EOF
+"$autotune" legacyunbound lo status-summary speedtest-go > "$work/legacyunbound-summary.json"
+grep -q '"terminal_available":false' "$work/legacyunbound-summary.json"
+grep -q '"recovery_pending":true' "$work/legacyunbound-summary.json"
 
 fi
 

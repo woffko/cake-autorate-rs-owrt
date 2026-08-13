@@ -3,7 +3,7 @@ set -eu
 
 base="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 init_script="$base/files/etc/init.d/cake-autorate"
-work="${TMPDIR:-/tmp}/cake-init-apply-guard-test.$$"
+work="$(mktemp -d "${TMPDIR:-/tmp}/cake-init-apply-guard-test.XXXXXX")"
 log="$work/mutations"
 helper="$work/apply-guard"
 classifier="$work/traffic-classifier"

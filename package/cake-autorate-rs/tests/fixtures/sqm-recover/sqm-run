@@ -31,4 +31,5 @@ if [ "$1" = start ]; then
 		printf 'IGNORE_DSCP_INGRESS="0"\n'
 	} > "$CAKE_AUTORATE_SQM_STATE_DIR/eth0.state"
 	: > "$CAKE_TEST_ROOT/healthy"
+	[ "${CAKE_TEST_SQM_START_FAIL_AFTER_HEALTH:-0}" != 1 ] || exit 1
 fi

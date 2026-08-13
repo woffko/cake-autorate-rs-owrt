@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": false,
+    "lib": ["ES2022", "DOM"],
+    "module": "ES2022",
+    "moduleDetection": "force",
+    "noEmit": true,
+    "noImplicitAny": false,
+    "skipLibCheck": true,
+    "target": "ES2022",
+    "types": []
+  },
+  "include": [
+    "htdocs/luci-static/resources/**/*.js",
+    "../luci-app-cake-autorate-rs/types/luci-env.d.ts"
+  ],
+  "exclude": ["tests"]
+}

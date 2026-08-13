@@ -3,10 +3,6 @@ use std::io;
 use std::path::Path;
 use std::process::{Command, Output};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
-
-const ROUTE_IDENTITY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
-const ROUTE_INSPECTION_ERROR_GRACE: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RouteMode {
@@ -109,55 +105,25 @@ pub struct RouteSnapshot {
 
 pub struct RouteInspector {
     spec: RouteSpec,
-    cached: Option<RouteSnapshot>,
-    default_policy: Option<String>,
-    last_full_refresh: Option<Instant>,
 }
 
 impl RouteInspector {
     pub fn new(spec: RouteSpec) -> Self {
-        Self {
-            spec,
-            cached: None,
-            default_policy: None,
-            last_full_refresh: None,
-        }
+        Self { spec }
     }
 
     pub fn inspect(&mut self) -> Result<RouteSnapshot, String> {
-        let full_refresh_due = self
-            .last_full_refresh
-            .map(|last| last.elapsed() >= ROUTE_IDENTITY_REFRESH_INTERVAL)
-            .unwrap_or(true);
-        if full_refresh_due || self.cached.is_none() {
-            return self.inspect_fresh();
-        }
-
-        let cached = self.cached.as_ref().expect("cached route checked above");
-        let snapshot = match self.spec.effective_mode()? {
-            RouteMode::Main => inspect_main_cached(&self.spec, cached),
-            RouteMode::Mwan3 => {
-                inspect_mwan3_cached(&self.spec, cached, self.default_policy.as_deref())
-            }
-        }?;
-        self.cached = Some(snapshot.clone());
-        Ok(snapshot)
+        self.inspect_fresh()
     }
 
     pub fn inspect_fresh(&mut self) -> Result<RouteSnapshot, String> {
-        let snapshot = match self.spec.effective_mode()? {
-            RouteMode::Main => {
-                self.default_policy = None;
-                inspect_main(&self.spec)?
-            }
+        match self.spec.effective_mode()? {
+            RouteMode::Main => inspect_main(&self.spec),
             RouteMode::Mwan3 => {
-                self.default_policy = mwan3_default_policy();
-                inspect_mwan3_with_policy(&self.spec, self.default_policy.as_deref())?
+                let default_policy = mwan3_default_policy()?;
+                inspect_mwan3_with_policy(&self.spec, default_policy.as_deref())
             }
-        };
-        self.last_full_refresh = Some(Instant::now());
-        self.cached = Some(snapshot.clone());
-        Ok(snapshot)
+        }
     }
 }
 
@@ -196,11 +162,11 @@ pub struct UplinkTransition {
 pub struct UplinkLifecycle {
     state: UplinkState,
     identity: Option<String>,
-    online_since: Option<Instant>,
+    confirmation_candidate: Option<String>,
+    route_confirmed: bool,
     learned: bool,
     learning_samples: usize,
     active_route: bool,
-    inspection_error_since: Option<Instant>,
     reason: String,
 }
 
@@ -209,85 +175,104 @@ impl UplinkLifecycle {
         Self {
             state: UplinkState::Offline,
             identity: None,
-            online_since: None,
+            confirmation_candidate: None,
+            route_confirmed: false,
             learned: false,
             learning_samples: 0,
             active_route: false,
-            inspection_error_since: None,
             reason: "route not checked".to_string(),
         }
     }
 
-    pub fn observe(
-        &mut self,
-        snapshot: Result<&RouteSnapshot, &str>,
-        now: Instant,
-        stability: Duration,
-    ) -> UplinkTransition {
+    pub fn observe(&mut self, snapshot: Result<&RouteSnapshot, &str>) -> UplinkTransition {
         let previous_state = self.state;
-        let mut identity_changed = false;
 
         let snapshot = match snapshot {
             Ok(snapshot) if snapshot.online => snapshot,
+            Ok(snapshot) if Self::transient_member_state(snapshot) => {
+                // A connecting/disconnecting status is not proof that the
+                // route is offline.  Revoke probe admission until a fresh,
+                // exact route snapshot arrives, but preserve the learned
+                // baseline and the last confirmed identity.
+                self.confirmation_candidate = None;
+                self.state = UplinkState::Rechecking;
+                self.reason = if snapshot.reason.is_empty() {
+                    format!(
+                        "member {} is {}; waiting for an exact route observation",
+                        snapshot.identity.member, snapshot.member_status
+                    )
+                } else {
+                    snapshot.reason.clone()
+                };
+                return self.transition(previous_state, false, false, false);
+            }
             Ok(snapshot) => {
-                self.inspection_error_since = None;
+                // Only an explicit, successfully inspected offline snapshot
+                // may assert OFFLINE.  Elapsed time and repeated inspection
+                // failures must never manufacture this state.
+                let reset_learning = self.route_confirmed
+                    || self.learned
+                    || self.confirmation_candidate.is_some()
+                    || previous_state != UplinkState::Offline;
                 self.state = UplinkState::Offline;
-                self.online_since = None;
+                self.confirmation_candidate = None;
+                self.route_confirmed = false;
                 self.learned = false;
                 self.learning_samples = 0;
+                self.active_route = false;
                 self.reason = if snapshot.reason.is_empty() {
                     format!("member {} is offline", snapshot.identity.member)
                 } else {
                     snapshot.reason.clone()
                 };
-                return self.transition(previous_state, false, false);
+                return self.transition(previous_state, false, reset_learning, false);
             }
             Err(error) => {
-                if self.identity.is_some() && self.learned {
-                    let error_since = *self.inspection_error_since.get_or_insert(now);
-                    if now.saturating_duration_since(error_since) < ROUTE_INSPECTION_ERROR_GRACE {
-                        self.state = UplinkState::Rechecking;
-                        self.reason = format!("route status temporarily unavailable: {error}");
-                        return self.transition(previous_state, false, false);
-                    }
-                }
-                self.inspection_error_since = None;
-                self.state = UplinkState::Offline;
-                self.online_since = None;
-                self.learned = false;
-                self.learning_samples = 0;
-                self.reason = error.to_string();
-                return self.transition(previous_state, false, false);
+                // An inspection error proves only that the route is unknown.
+                // It immediately closes probe admission, but it neither
+                // destroys a learned baseline nor becomes OFFLINE after an
+                // arbitrary number of observations.
+                self.confirmation_candidate = None;
+                self.state = UplinkState::Rechecking;
+                self.reason = format!("route status unavailable: {error}");
+                return self.transition(previous_state, false, false, false);
             }
         };
 
-        self.inspection_error_since = None;
-
         let identity = snapshot.stable_key();
-        if self.identity.as_deref() != Some(&identity) {
-            self.identity = Some(identity);
-            self.online_since = Some(now);
-            self.learned = false;
-            self.learning_samples = 0;
-            identity_changed = true;
-        } else if previous_state == UplinkState::Offline || self.online_since.is_none() {
-            self.online_since = Some(now);
-            self.learned = false;
-            self.learning_samples = 0;
-        }
+        let identity_changed = self.identity.as_deref() != Some(identity.as_str());
         self.active_route = snapshot.active;
 
-        let stable = self
-            .online_since
-            .map(|since| now.saturating_duration_since(since) >= stability)
-            .unwrap_or(false);
-        if !stable || !self.learned {
+        if identity_changed {
+            self.identity = Some(identity.clone());
+            self.confirmation_candidate = Some(identity);
+            self.route_confirmed = false;
+            self.learned = false;
+            self.learning_samples = 0;
             self.state = UplinkState::Learning;
-            self.reason = if stable {
-                "learning latency baseline".to_string()
-            } else {
-                "waiting for route stability".to_string()
-            };
+            self.reason = "waiting for repeated matching route identity".to_string();
+            return self.transition(previous_state, true, true, false);
+        }
+
+        if !self.route_confirmed {
+            if self.confirmation_candidate.as_deref() != Some(identity.as_str()) {
+                self.confirmation_candidate = Some(identity);
+                self.state = UplinkState::Learning;
+                self.reason = "waiting for repeated matching route identity".to_string();
+                return self.transition(
+                    previous_state,
+                    false,
+                    previous_state == UplinkState::Offline,
+                    false,
+                );
+            }
+            self.confirmation_candidate = None;
+            self.route_confirmed = true;
+        }
+
+        if !self.learned {
+            self.state = UplinkState::Learning;
+            self.reason = "learning latency baseline".to_string();
         } else {
             self.state = if snapshot.active {
                 UplinkState::Active
@@ -297,11 +282,11 @@ impl UplinkLifecycle {
             self.reason = snapshot.reason.clone();
         }
 
-        self.transition(previous_state, identity_changed, stable)
+        self.transition(previous_state, false, false, true)
     }
 
     pub fn record_learning_sample(&mut self, required_samples: usize) -> bool {
-        if self.state != UplinkState::Learning {
+        if self.state != UplinkState::Learning || !self.route_confirmed {
             return false;
         }
         self.learning_samples = self.learning_samples.saturating_add(1);
@@ -326,6 +311,13 @@ impl UplinkLifecycle {
         self.state
     }
 
+    fn transient_member_state(snapshot: &RouteSnapshot) -> bool {
+        matches!(
+            snapshot.member_status.as_str(),
+            "connecting" | "disconnecting"
+        )
+    }
+
     pub fn reason(&self) -> &str {
         &self.reason
     }
@@ -334,6 +326,7 @@ impl UplinkLifecycle {
         &self,
         previous_state: UplinkState,
         identity_changed: bool,
+        reset_learning: bool,
         probes_allowed: bool,
     ) -> UplinkTransition {
         UplinkTransition {
@@ -342,9 +335,7 @@ impl UplinkLifecycle {
             identity_changed,
             became_offline: self.state == UplinkState::Offline
                 && previous_state != UplinkState::Offline,
-            reset_learning: identity_changed
-                || (self.state == UplinkState::Offline && previous_state != UplinkState::Offline)
-                || (previous_state == UplinkState::Offline && self.state != UplinkState::Offline),
+            reset_learning,
             probes_allowed,
         }
     }
@@ -394,7 +385,7 @@ pub fn inspect_route(spec: &RouteSpec) -> Result<RouteSnapshot, String> {
     match spec.effective_mode()? {
         RouteMode::Main => inspect_main(spec),
         RouteMode::Mwan3 => {
-            let default_policy = mwan3_default_policy();
+            let default_policy = mwan3_default_policy()?;
             inspect_mwan3_with_policy(spec, default_policy.as_deref())
         }
     }
@@ -426,13 +417,48 @@ pub fn external_ipv4(spec: &RouteSpec, timeout_s: u64) -> Result<String, String>
 fn inspect_main(spec: &RouteSpec) -> Result<RouteSnapshot, String> {
     let device_path = format!("/sys/class/net/{}", spec.expected_device);
     let device_online = Path::new(&device_path).exists();
-    let source_ip = interface_source_ip(&spec.expected_device).unwrap_or_default();
-    let default_device = default_route_device().unwrap_or_default();
+    if !device_online {
+        return Ok(RouteSnapshot {
+            identity: RouteIdentity {
+                mode: RouteMode::Main.as_str().to_string(),
+                member: String::new(),
+                device: spec.expected_device.clone(),
+                source_ip: String::new(),
+                fwmark: String::new(),
+                table: "main".to_string(),
+            },
+            online: false,
+            active: false,
+            member_status: "offline".to_string(),
+            reason: format!("interface {} is unavailable", spec.expected_device),
+        });
+    }
+
+    let source_ip = interface_source_ip(&spec.expected_device)?.unwrap_or_default();
+    if source_ip.is_empty() {
+        return Ok(RouteSnapshot {
+            identity: RouteIdentity {
+                mode: RouteMode::Main.as_str().to_string(),
+                member: String::new(),
+                device: spec.expected_device.clone(),
+                source_ip,
+                fwmark: String::new(),
+                table: "main".to_string(),
+            },
+            online: false,
+            active: false,
+            member_status: "connecting".to_string(),
+            reason: format!(
+                "interface {} has no IPv4 source address; waiting for route identity",
+                spec.expected_device
+            ),
+        });
+    }
+
+    let default_device = default_route_device()?.unwrap_or_default();
     let active = device_online && default_device == spec.expected_device;
     let online = active;
-    let reason = if !device_online {
-        format!("interface {} is unavailable", spec.expected_device)
-    } else if !active {
+    let reason = if !active {
         format!("main default route uses {default_device}")
     } else {
         String::new()
@@ -447,30 +473,6 @@ fn inspect_main(spec: &RouteSpec) -> Result<RouteSnapshot, String> {
             fwmark: String::new(),
             table: "main".to_string(),
         },
-        online,
-        active,
-        member_status: if online { "online" } else { "route_mismatch" }.to_string(),
-        reason,
-    })
-}
-
-fn inspect_main_cached(spec: &RouteSpec, cached: &RouteSnapshot) -> Result<RouteSnapshot, String> {
-    let device_path = format!("/sys/class/net/{}", spec.expected_device);
-    let device_online = Path::new(&device_path).exists();
-    let default_device = default_route_device().unwrap_or_default();
-    let active = device_online && default_device == spec.expected_device;
-    let online = active;
-    let reason = if !device_online {
-        format!("interface {} is unavailable", spec.expected_device)
-    } else if !active {
-        format!("main default route uses {default_device}")
-    } else {
-        String::new()
-    };
-    let mut identity = cached.identity.clone();
-    identity.device = spec.expected_device.clone();
-    Ok(RouteSnapshot {
-        identity,
         online,
         active,
         member_status: if online { "online" } else { "route_mismatch" }.to_string(),
@@ -494,10 +496,14 @@ fn inspect_mwan3_with_policy(
         ));
     }
     let mwan_json = String::from_utf8_lossy(&mwan_status.stdout);
-    let member_status = json_string_value(&mwan_json, "status").unwrap_or_default();
-    let running = json_bool_value(&mwan_json, "running").unwrap_or(false);
-    let member_up = json_bool_value(&mwan_json, "up").unwrap_or(false);
-    let enabled = json_bool_value(&mwan_json, "enabled").unwrap_or(false);
+    let member_status = json_string_value(&mwan_json, "status")
+        .ok_or_else(|| format!("mwan3 status for {} has no status field", spec.member))?;
+    let running = json_bool_value(&mwan_json, "running")
+        .ok_or_else(|| format!("mwan3 status for {} has no running field", spec.member))?;
+    let member_up = json_bool_value(&mwan_json, "up")
+        .ok_or_else(|| format!("mwan3 status for {} has no up field", spec.member))?;
+    let enabled = json_bool_value(&mwan_json, "enabled")
+        .ok_or_else(|| format!("mwan3 status for {} has no enabled field", spec.member))?;
 
     let network_object = format!("network.interface.{}", spec.member);
     let network_status = run_output("ubus", &["call", &network_object, "status"])
@@ -510,10 +516,41 @@ fn inspect_mwan3_with_policy(
         ));
     }
     let network_json = String::from_utf8_lossy(&network_status.stdout);
-    let network_up = json_bool_value(&network_json, "up").unwrap_or(false);
+    let network_up = json_bool_value(&network_json, "up")
+        .ok_or_else(|| format!("network status for {} has no up field", spec.member))?;
     let network_device = json_string_value(&network_json, "l3_device")
         .or_else(|| json_string_value(&network_json, "device"))
         .unwrap_or_default();
+
+    if !(enabled && running && member_up && network_up && member_status == "online") {
+        let reason = if !enabled {
+            format!("member {} is disabled", spec.member)
+        } else if matches!(member_status.as_str(), "connecting" | "disconnecting") {
+            format!("member {} is {member_status}", spec.member)
+        } else if !running || !network_up {
+            format!("member {} interface is down", spec.member)
+        } else {
+            format!("member {} is {member_status}", spec.member)
+        };
+        return Ok(RouteSnapshot {
+            identity: RouteIdentity {
+                mode: RouteMode::Mwan3.as_str().to_string(),
+                member: spec.member.clone(),
+                device: if network_device.is_empty() {
+                    spec.expected_device.clone()
+                } else {
+                    network_device
+                },
+                source_ip: String::new(),
+                fwmark: String::new(),
+                table: String::new(),
+            },
+            online: false,
+            active: false,
+            member_status,
+            reason,
+        });
+    }
 
     let environment = run_output("mwan3", &["use", &spec.member, "exec", "env"])
         .map_err(|error| format!("failed to resolve mwan3 route {}: {error}", spec.member))?;
@@ -526,10 +563,18 @@ fn inspect_mwan3_with_policy(
     }
     let environment = String::from_utf8_lossy(&environment.stdout);
     let device = env_value(&environment, "DEVICE").unwrap_or(network_device);
-    let source_ip = env_value(&environment, "SRCIP").unwrap_or_default();
+    if device.is_empty() {
+        return Err(format!(
+            "mwan3 route {} has no resolved device",
+            spec.member
+        ));
+    }
+    let source_ip = env_value(&environment, "SRCIP")
+        .filter(|value| valid_ipv4(value))
+        .ok_or_else(|| format!("mwan3 route {} has no valid IPv4 source", spec.member))?;
     let wrapper_mask = env_value(&environment, "FWMARK").unwrap_or_default();
     let (fwmark, table) =
-        routing_for_device(&device).unwrap_or_else(|| (wrapper_mask, String::new()));
+        routing_for_device(&device)?.unwrap_or_else(|| (wrapper_mask, String::new()));
 
     let device_matches = device == spec.expected_device;
     let online = enabled
@@ -538,9 +583,13 @@ fn inspect_mwan3_with_policy(
         && network_up
         && member_status == "online"
         && device_matches;
-    let default_device = default_route_device().unwrap_or_default();
     let policy_percent = default_policy
         .and_then(|policy| json_policy_member_percent(&mwan_json, policy, &spec.member));
+    let default_device = if policy_percent.is_none() {
+        default_route_device()?.unwrap_or_default()
+    } else {
+        String::new()
+    };
     let active = online
         && policy_percent
             .map(|percent| percent > 0)
@@ -581,82 +630,6 @@ fn inspect_mwan3_with_policy(
         member_status,
         reason,
     })
-}
-
-fn inspect_mwan3_cached(
-    spec: &RouteSpec,
-    cached: &RouteSnapshot,
-    default_policy: Option<&str>,
-) -> Result<RouteSnapshot, String> {
-    ensure_nft_mwan3()?;
-    let request = format!(r#"{{"interface":"{}"}}"#, spec.member);
-    let mwan_status = run_output("ubus", &["call", "mwan3", "status", &request])
-        .map_err(|error| format!("failed to inspect mwan3 member {}: {error}", spec.member))?;
-    if !mwan_status.status.success() {
-        return Err(format!(
-            "mwan3 status failed for {}: {}",
-            spec.member,
-            output_error(&mwan_status)
-        ));
-    }
-    let mwan_json = String::from_utf8_lossy(&mwan_status.stdout);
-    Ok(mwan3_snapshot_from_cached_status(
-        spec,
-        cached,
-        default_policy,
-        &mwan_json,
-    ))
-}
-
-fn mwan3_snapshot_from_cached_status(
-    spec: &RouteSpec,
-    cached: &RouteSnapshot,
-    default_policy: Option<&str>,
-    mwan_json: &str,
-) -> RouteSnapshot {
-    let member_status = json_string_value(mwan_json, "status").unwrap_or_default();
-    let running = json_bool_value(mwan_json, "running").unwrap_or(false);
-    let member_up = json_bool_value(mwan_json, "up").unwrap_or(false);
-    let enabled = json_bool_value(mwan_json, "enabled").unwrap_or(false);
-    let device_matches = cached.identity.device == spec.expected_device;
-    let online = enabled && running && member_up && member_status == "online" && device_matches;
-    let policy_percent = default_policy
-        .and_then(|policy| json_policy_member_percent(mwan_json, policy, &spec.member));
-    let active = online
-        && policy_percent
-            .map(|percent| percent > 0)
-            .unwrap_or_else(|| {
-                default_route_device().as_deref() == Some(cached.identity.device.as_str())
-            });
-    let reason = if !device_matches {
-        format!(
-            "route mismatch: member {} uses {}, expected {}",
-            spec.member, cached.identity.device, spec.expected_device
-        )
-    } else if !enabled {
-        format!("member {} is disabled", spec.member)
-    } else if !running {
-        format!("member {} interface is down", spec.member)
-    } else if !member_up || member_status != "online" {
-        format!("member {} is {member_status}", spec.member)
-    } else if !active {
-        match (default_policy, policy_percent) {
-            (Some(policy), Some(percent)) => {
-                format!("standby: mwan3 policy {policy} assigns {percent}%")
-            }
-            _ => "standby: selected mwan3 member is not default-active".to_string(),
-        }
-    } else {
-        String::new()
-    };
-
-    RouteSnapshot {
-        identity: cached.identity.clone(),
-        online,
-        active,
-        member_status,
-        reason,
-    }
 }
 
 fn ensure_nft_mwan3() -> Result<(), String> {
@@ -715,6 +688,18 @@ fn command_available(binary: &str) -> bool {
 
 fn run_output(binary: &str, args: &[&str]) -> io::Result<Output> {
     Command::new(binary).args(args).output()
+}
+
+fn checked_output(binary: &str, args: &[&str], purpose: &str) -> Result<Output, String> {
+    let output = run_output(binary, args)
+        .map_err(|error| format!("{purpose}: failed to execute {binary}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{purpose}: {binary} failed: {}",
+            output_error(&output)
+        ));
+    }
+    Ok(output)
 }
 
 fn output_error(output: &Output) -> String {
@@ -777,12 +762,15 @@ fn json_policy_member_percent(json: &str, policy: &str, member: &str) -> Option<
     })
 }
 
-fn mwan3_default_policy() -> Option<String> {
-    let output = run_output("uci", &["-q", "show", "mwan3"]).ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_mwan3_default_policy(&String::from_utf8_lossy(&output.stdout))
+fn mwan3_default_policy() -> Result<Option<String>, String> {
+    let output = checked_output(
+        "uci",
+        &["-q", "show", "mwan3"],
+        "failed to resolve the default mwan3 policy",
+    )?;
+    Ok(parse_mwan3_default_policy(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
 }
 
 fn parse_mwan3_default_policy(config: &str) -> Option<String> {
@@ -833,17 +821,20 @@ fn env_value(environment: &str, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn default_route_device() -> Option<String> {
+fn default_route_device() -> Result<Option<String>, String> {
     if let Ok(routes) = std::fs::read_to_string("/proc/net/route") {
         if let Some(device) = parse_proc_default_route_device(&routes) {
-            return Some(device);
+            return Ok(Some(device));
         }
     }
-    let output = run_output("ip", &["-4", "route", "show", "default"]).ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_default_route_device(&String::from_utf8_lossy(&output.stdout))
+    let output = checked_output(
+        "ip",
+        &["-4", "route", "show", "default"],
+        "failed to inspect the IPv4 default route",
+    )?;
+    Ok(parse_default_route_device(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
 }
 
 fn parse_proc_default_route_device(routes: &str) -> Option<String> {
@@ -868,32 +859,35 @@ fn parse_default_route_device(routes: &str) -> Option<String> {
     })
 }
 
-fn interface_source_ip(device: &str) -> Option<String> {
-    let output = run_output(
+fn interface_source_ip(device: &str) -> Result<Option<String>, String> {
+    let output = checked_output(
         "ip",
         &["-4", "-o", "addr", "show", "dev", device, "scope", "global"],
-    )
-    .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+        &format!("failed to inspect IPv4 addresses on {device}"),
+    )?;
     let text = String::from_utf8_lossy(&output.stdout);
-    text.split_whitespace()
+    Ok(text
+        .split_whitespace()
         .skip_while(|word| *word != "inet")
         .nth(1)
         .and_then(|value| value.split('/').next())
-        .map(str::to_string)
+        .filter(|value| valid_ipv4(value))
+        .map(str::to_string))
 }
 
-fn routing_for_device(device: &str) -> Option<(String, String)> {
+fn routing_for_device(device: &str) -> Result<Option<(String, String)>, String> {
     if device.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let output = run_output("ip", &["-4", "rule", "show"]).ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_routing_for_device(&String::from_utf8_lossy(&output.stdout), device)
+    let output = checked_output(
+        "ip",
+        &["-4", "rule", "show"],
+        &format!("failed to inspect IPv4 routing rules for {device}"),
+    )?;
+    Ok(parse_routing_for_device(
+        &String::from_utf8_lossy(&output.stdout),
+        device,
+    ))
 }
 
 fn parse_routing_for_device(rules: &str, device: &str) -> Option<(String, String)> {
@@ -983,6 +977,18 @@ mod tests {
     }
 
     #[test]
+    fn checked_output_propagates_execution_failure() {
+        let error = checked_output(
+            "/definitely-not-a-cake-autorate-command",
+            &[],
+            "route inspection",
+        )
+        .unwrap_err();
+        assert!(error.contains("route inspection"));
+        assert!(error.contains("failed to execute"));
+    }
+
+    #[test]
     fn parses_member_metadata() {
         let status = r#"{"status":"online","running":true,"up":true}"#;
         assert_eq!(
@@ -1022,35 +1028,6 @@ mwan3.default_rule_v4.use_policy='wan_then_wan2'\n";
             json_policy_member_percent(status, "wan_then_wan2", "wan2"),
             Some(100)
         );
-
-        let spec = RouteSpec::new("mwan3", "wan2", "eth0");
-        let cached = RouteSnapshot {
-            identity: RouteIdentity {
-                mode: "mwan3".to_string(),
-                member: "wan2".to_string(),
-                device: "eth0".to_string(),
-                source_ip: "192.0.2.101".to_string(),
-                fwmark: "0x200".to_string(),
-                table: "2".to_string(),
-            },
-            online: true,
-            active: false,
-            member_status: "online".to_string(),
-            reason: String::new(),
-        };
-        let online = r#"{"status":"online","running":true,"up":true,"enabled":true,
-            "policies":{"ipv4":{"wan_then_wan2":[{"interface":"wan2","percent":100}]}}}"#;
-        let snapshot =
-            mwan3_snapshot_from_cached_status(&spec, &cached, Some("wan_then_wan2"), online);
-        assert!(snapshot.online);
-        assert!(snapshot.active);
-        assert_eq!(snapshot.stable_key(), cached.stable_key());
-
-        let offline = r#"{"status":"offline","running":true,"up":false,"enabled":true}"#;
-        let snapshot =
-            mwan3_snapshot_from_cached_status(&spec, &cached, Some("wan_then_wan2"), offline);
-        assert!(!snapshot.online);
-        assert!(!snapshot.active);
     }
 
     #[test]
@@ -1100,19 +1077,17 @@ mwan3.default_rule_v4.use_policy='wan_then_wan2'\n";
     }
 
     #[test]
-    fn lifecycle_waits_for_stability_and_learning() {
-        let start = Instant::now();
+    fn lifecycle_requires_repeated_matching_identity_before_learning() {
         let route = snapshot(false, "192.0.2.101");
         let mut lifecycle = UplinkLifecycle::new();
-        let first = lifecycle.observe(Ok(&route), start, Duration::from_secs(5));
+        let first = lifecycle.observe(Ok(&route));
         assert_eq!(first.state, UplinkState::Learning);
         assert!(!first.probes_allowed);
-        let stable = lifecycle.observe(
-            Ok(&route),
-            start + Duration::from_secs(5),
-            Duration::from_secs(5),
-        );
-        assert!(stable.probes_allowed);
+        assert!(!lifecycle.record_learning_sample(1));
+
+        let confirmed = lifecycle.observe(Ok(&route));
+        assert_eq!(confirmed.state, UplinkState::Learning);
+        assert!(confirmed.probes_allowed);
         assert!(!lifecycle.record_learning_sample(3));
         assert!(!lifecycle.record_learning_sample(3));
         assert!(lifecycle.record_learning_sample(3));
@@ -1121,89 +1096,149 @@ mwan3.default_rule_v4.use_policy='wan_then_wan2'\n";
 
     #[test]
     fn lifecycle_resets_after_ip_change_and_offline_recovery() {
-        let start = Instant::now();
         let first_route = snapshot(true, "198.51.100.1");
         let second_route = snapshot(true, "198.51.100.2");
         let mut lifecycle = UplinkLifecycle::new();
-        lifecycle.observe(Ok(&first_route), start, Duration::ZERO);
+        lifecycle.observe(Ok(&first_route));
+        lifecycle.observe(Ok(&first_route));
         lifecycle.record_learning_sample(1);
         assert_eq!(lifecycle.state(), UplinkState::Active);
 
-        let changed = lifecycle.observe(
-            Ok(&second_route),
-            start + Duration::from_secs(1),
-            Duration::ZERO,
-        );
+        let changed = lifecycle.observe(Ok(&second_route));
         assert!(changed.identity_changed);
         assert_eq!(changed.state, UplinkState::Learning);
+        assert!(!changed.probes_allowed);
+        assert!(lifecycle.observe(Ok(&second_route)).probes_allowed);
 
         let offline_route = RouteSnapshot {
             online: false,
             reason: "member offline".to_string(),
             ..second_route.clone()
         };
-        let offline = lifecycle.observe(
-            Ok(&offline_route),
-            start + Duration::from_secs(2),
-            Duration::ZERO,
-        );
+        let offline = lifecycle.observe(Ok(&offline_route));
         assert!(offline.became_offline);
         assert!(offline.reset_learning);
         assert_eq!(offline.state, UplinkState::Offline);
-        let recovered = lifecycle.observe(
-            Ok(&second_route),
-            start + Duration::from_secs(3),
-            Duration::ZERO,
-        );
+
+        let recovered = lifecycle.observe(Ok(&second_route));
         assert!(!recovered.identity_changed);
         assert!(recovered.reset_learning);
         assert_eq!(recovered.state, UplinkState::Learning);
+        assert!(!recovered.probes_allowed);
+        assert!(lifecycle.observe(Ok(&second_route)).probes_allowed);
     }
 
     #[test]
-    fn lifecycle_debounces_transient_route_inspection_errors() {
-        let start = Instant::now();
+    fn lifecycle_never_turns_inspection_errors_into_offline() {
         let route = snapshot(false, "192.0.2.101");
         let mut lifecycle = UplinkLifecycle::new();
-        lifecycle.observe(Ok(&route), start, Duration::ZERO);
+        lifecycle.observe(Ok(&route));
+        lifecycle.observe(Ok(&route));
         lifecycle.record_learning_sample(1);
         assert_eq!(lifecycle.state(), UplinkState::Standby);
 
-        let transient = lifecycle.observe(
-            Err("mwan3 status failed: Command failed: Not found"),
-            start + Duration::from_secs(1),
-            Duration::ZERO,
-        );
-        assert_eq!(transient.state, UplinkState::Rechecking);
-        assert!(!transient.became_offline);
-        assert!(!transient.reset_learning);
-        assert!(!transient.probes_allowed);
+        for error in [
+            "mwan3 status failed",
+            "ubus still unavailable",
+            "route inspector remains unavailable",
+            "another failure",
+        ] {
+            let unknown = lifecycle.observe(Err(error));
+            assert_eq!(unknown.state, UplinkState::Rechecking);
+            assert!(!unknown.became_offline);
+            assert!(!unknown.reset_learning);
+            assert!(!unknown.probes_allowed);
+        }
 
-        let recovered =
-            lifecycle.observe(Ok(&route), start + Duration::from_secs(2), Duration::ZERO);
+        let recovered = lifecycle.observe(Ok(&route));
         assert_eq!(recovered.state, UplinkState::Standby);
         assert!(!recovered.reset_learning);
         assert!(recovered.probes_allowed);
     }
 
     #[test]
-    fn lifecycle_marks_route_offline_after_inspection_grace_expires() {
-        let start = Instant::now();
+    fn lifecycle_requires_consecutive_identity_evidence_after_unknown_start() {
         let route = snapshot(true, "198.51.100.1");
         let mut lifecycle = UplinkLifecycle::new();
-        lifecycle.observe(Ok(&route), start, Duration::ZERO);
+        assert!(!lifecycle.observe(Ok(&route)).probes_allowed);
+        assert_eq!(
+            lifecycle.observe(Err("ubus unavailable")).state,
+            UplinkState::Rechecking
+        );
+        assert!(!lifecycle.observe(Ok(&route)).probes_allowed);
+        assert!(lifecycle.observe(Ok(&route)).probes_allowed);
+    }
+
+    #[test]
+    fn lifecycle_rechecks_a_new_identity_after_an_inspection_error() {
+        let first_route = snapshot(true, "198.51.100.1");
+        let second_route = snapshot(true, "198.51.100.2");
+        let mut lifecycle = UplinkLifecycle::new();
+        lifecycle.observe(Ok(&first_route));
+        lifecycle.observe(Ok(&first_route));
+        assert!(lifecycle.record_learning_sample(1));
+        assert_eq!(lifecycle.state(), UplinkState::Active);
+
+        assert_eq!(
+            lifecycle.observe(Err("route inspector unavailable")).state,
+            UplinkState::Rechecking
+        );
+        let changed = lifecycle.observe(Ok(&second_route));
+        assert!(changed.identity_changed);
+        assert!(changed.reset_learning);
+        assert!(!changed.probes_allowed);
+        assert!(!lifecycle.record_learning_sample(1));
+
+        let confirmed = lifecycle.observe(Ok(&second_route));
+        assert!(!confirmed.identity_changed);
+        assert!(confirmed.probes_allowed);
+        assert!(lifecycle.record_learning_sample(1));
+        assert_eq!(lifecycle.state(), UplinkState::Active);
+    }
+
+    #[test]
+    fn lifecycle_preserves_learning_across_persistent_mwan3_transition_state() {
+        let route = snapshot(true, "198.51.100.1");
+        let mut lifecycle = UplinkLifecycle::new();
+        lifecycle.observe(Ok(&route));
+        lifecycle.observe(Ok(&route));
         lifecycle.record_learning_sample(1);
 
-        lifecycle.observe(
-            Err("ubus temporarily unavailable"),
-            start + Duration::from_secs(1),
-            Duration::ZERO,
-        );
-        let offline = lifecycle.observe(
-            Err("ubus still unavailable"),
-            start + Duration::from_secs(12),
-            Duration::ZERO,
-        );
+        let disconnecting = RouteSnapshot {
+            online: false,
+            member_status: "disconnecting".to_string(),
+            reason: "member wanb is disconnecting".to_string(),
+            ..route.clone()
+        };
+        for _ in 0..8 {
+            let transition = lifecycle.observe(Ok(&disconnecting));
+            assert_eq!(transition.state, UplinkState::Rechecking);
+            assert!(!transition.became_offline);
+            assert!(!transition.reset_learning);
+            assert!(!transition.probes_allowed);
+        }
+
+        let recovered = lifecycle.observe(Ok(&route));
+        assert_eq!(recovered.state, UplinkState::Active);
+        assert!(!recovered.reset_learning);
+        assert!(recovered.probes_allowed);
+    }
+
+    #[test]
+    fn lifecycle_accepts_offline_only_from_an_explicit_snapshot() {
+        let route = snapshot(true, "198.51.100.1");
+        let mut lifecycle = UplinkLifecycle::new();
+        lifecycle.observe(Ok(&route));
+        lifecycle.observe(Ok(&route));
+        lifecycle.record_learning_sample(1);
+
+        let offline_route = RouteSnapshot {
+            online: false,
+            member_status: "offline".to_string(),
+            reason: "member wanb is offline".to_string(),
+            ..route
+        };
+        let offline = lifecycle.observe(Ok(&offline_route));
         assert_eq!(offline.state, UplinkState::Offline);
         assert!(offline.became_offline);
         assert!(offline.reset_learning);
