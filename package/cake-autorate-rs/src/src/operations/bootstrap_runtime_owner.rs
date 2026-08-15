@@ -91,7 +91,6 @@ impl BootstrapIdleBaseline {
     fn from_snapshot(
         snapshot: &AutotuneCaptureSnapshot,
         policy: &super::autotune_capture_policy::AutotuneCapturePolicy,
-        transport_baseline_ms: f64,
     ) -> Result<Self, String> {
         snapshot.validate()?;
         if snapshot.state != super::full_autotune::AutotuneCaptureState::Complete
@@ -102,7 +101,9 @@ impl BootstrapIdleBaseline {
         let icmp_baseline_us = snapshot
             .idle_median_us
             .ok_or_else(|| "bootstrap idle capture has no ICMP baseline".to_string())?;
-        let transport_baseline_us = milliseconds_to_baseline_us(transport_baseline_ms)?;
+        let transport_baseline_us = snapshot
+            .idle_transport_baseline_us
+            .ok_or_else(|| "bootstrap idle capture has no transport baseline".to_string())?;
         let value = Self {
             capture_id: snapshot.request.capture_id.clone(),
             job_id: snapshot.request.job_id.clone(),
@@ -185,6 +186,7 @@ impl BootstrapIdleBaseline {
             || self.observed_boot_ms > request.deadline_boot_ms
             || self.policy_id != policy.id().as_str()
             || self.policy_sha256 != policy.canonical_sha256()?
+            || request.transport_baseline_us != Some(self.transport_baseline_us)
         {
             return Err(
                 "bootstrap idle baseline does not authorize this loaded capture".to_string(),
@@ -298,14 +300,6 @@ impl BootstrapIdleBaseline {
         }
         Ok(value)
     }
-}
-
-fn milliseconds_to_baseline_us(value: f64) -> Result<u64, String> {
-    let value = value * 1_000.0;
-    if !value.is_finite() || value <= 0.0 || value > MAX_IDLE_BASELINE_US as f64 {
-        return Err("bootstrap transport baseline is invalid".to_string());
-    }
-    Ok(value.round().max(1.0) as u64)
 }
 
 fn idle_baseline_field<'a>(
@@ -2607,22 +2601,8 @@ impl BootstrapCaptureRuntime {
                 "bootstrap capture policy is not initialized".to_string(),
             )
         })?;
-        let transport_baseline_ms = self
-            .idle_transport_baseline_ms
-            .or_else(|| {
-                self.transport
-                    .as_ref()
-                    .and_then(|transport| transport.idle_baseline_ms)
-            })
-            .ok_or_else(|| {
-                (
-                    "capture-idle-baseline-unavailable",
-                    "bootstrap idle transport baseline is unavailable".to_string(),
-                )
-            })?;
-        let baseline =
-            BootstrapIdleBaseline::from_snapshot(snapshot, policy, transport_baseline_ms)
-                .map_err(|error| ("capture-idle-baseline-invalid", error))?;
+        let baseline = BootstrapIdleBaseline::from_snapshot(snapshot, policy)
+            .map_err(|error| ("capture-idle-baseline-invalid", error))?;
         publish_idle_baseline(runtime_dir, &baseline)
             .map_err(|error| ("capture-idle-baseline-unavailable", error))?;
         self.idle_icmp_baseline_ms = Some(baseline.icmp_baseline_us as f64 / 1_000.0);
@@ -2710,6 +2690,7 @@ impl BootstrapCaptureRuntime {
             || baseline.policy_id != policy.id().as_str()
             || baseline.policy_sha256 != policy.canonical_sha256()?
             || snapshot.idle_median_us != Some(baseline.icmp_baseline_us)
+            || snapshot.idle_transport_baseline_us != Some(baseline.transport_baseline_us)
             || snapshot.updated_boot_ms != baseline.observed_boot_ms
         {
             return Err("complete bootstrap idle baseline is not authoritative".to_string());
@@ -3729,11 +3710,6 @@ impl BootstrapCaptureRuntime {
                 }
                 continue;
             }
-            let baseline = self
-                .transport
-                .as_ref()
-                .expect("bootstrap transport runtime was initialized")
-                .idle_baseline_ms;
             if let Some(failure) = deadline_failure {
                 // An idle timeout cannot establish the exact baseline needed
                 // to interpret later loaded lower bounds.
@@ -3749,7 +3725,6 @@ impl BootstrapCaptureRuntime {
                 let kind = super::autotune_capture::transport_deadline_observation_kind(
                     &active,
                     deadline_us,
-                    baseline,
                     expected_phase.0,
                     expected_phase.1,
                 )
@@ -3788,7 +3763,6 @@ impl BootstrapCaptureRuntime {
                 let kind = super::autotune_capture::transport_observation_kind(
                     &active,
                     latency_ms,
-                    baseline,
                     expected_phase.0,
                     expected_phase.1,
                 )
@@ -5825,6 +5799,7 @@ mod tests {
             candidate_dl_kbps: None,
             candidate_ul_kbps: None,
             load_reference_kbps: None,
+            transport_baseline_us: None,
             route_fingerprint: "33".repeat(32),
             sqm_fingerprint: "55".repeat(32),
         }
@@ -5841,6 +5816,7 @@ mod tests {
         request.candidate_dl_kbps = Some(100_000);
         request.candidate_ul_kbps = Some(50_000);
         request.load_reference_kbps = Some(100_000);
+        request.transport_baseline_us = Some(9_500);
         request
     }
 
@@ -5977,6 +5953,7 @@ mod tests {
             cpu_samples: 0,
             idle_median_us: Some(8_000),
             idle_p95_us: Some(12_000),
+            idle_transport_baseline_us: Some(9_500),
             icmp_delta_us: None,
             transport_delta_us: None,
             loss_ppm: None,
@@ -6539,7 +6516,7 @@ mod tests {
         let directory = private_dir("idle-baseline-roundtrip");
         let policy = request().capture_policy.unwrap().expand().unwrap();
         let baseline =
-            BootstrapIdleBaseline::from_snapshot(&complete_idle_snapshot(), &policy, 9.5).unwrap();
+            BootstrapIdleBaseline::from_snapshot(&complete_idle_snapshot(), &policy).unwrap();
         let encoded = baseline.encode().unwrap();
         assert_eq!(BootstrapIdleBaseline::decode(&encoded).unwrap(), baseline);
         publish_idle_baseline(&directory, &baseline).unwrap();
@@ -6556,6 +6533,16 @@ mod tests {
         baseline.attest_loaded(&loaded, &policy).unwrap();
         let mut capture = BootstrapCaptureRuntime::new(Arc::new(AtomicBool::new(true)));
         capture.policy = Some(policy.clone());
+        capture.idle_transport_baseline_ms = Some(99.0);
+        capture
+            .persist_completed_idle_baseline(&directory, &complete_idle_snapshot())
+            .unwrap();
+        assert_eq!(
+            read_idle_baseline(&directory).unwrap(),
+            Some(baseline.clone()),
+            "the terminal capture snapshot, not a later local tracker value, owns the durable baseline"
+        );
+        assert_eq!(capture.idle_transport_baseline_ms, Some(9.5));
         capture
             .restore_loaded_idle_baseline(&directory, &loaded)
             .unwrap();
@@ -6565,6 +6552,12 @@ mod tests {
         let mut foreign = loaded.clone();
         foreign.route_fingerprint = "aa".repeat(32);
         assert!(baseline.attest_loaded(&foreign, &policy).is_err());
+        let mut drifted = loaded.clone();
+        drifted.transport_baseline_us = Some(baseline.transport_baseline_us + 1);
+        assert!(baseline.attest_loaded(&drifted, &policy).is_err());
+        assert!(capture
+            .restore_loaded_idle_baseline(&directory, &drifted)
+            .is_err());
         let mut regressed = loaded;
         regressed.sequence = baseline.idle_sequence;
         assert!(baseline.attest_loaded(&regressed, &policy).is_err());
@@ -6580,7 +6573,7 @@ mod tests {
         let directory = private_dir("idle-baseline-ownership");
         let policy = request().capture_policy.unwrap().expand().unwrap();
         let baseline =
-            BootstrapIdleBaseline::from_snapshot(&complete_idle_snapshot(), &policy, 9.5).unwrap();
+            BootstrapIdleBaseline::from_snapshot(&complete_idle_snapshot(), &policy).unwrap();
         publish_idle_baseline(&directory, &baseline).unwrap();
 
         let mut next = idle_capture_request();
@@ -6608,6 +6601,7 @@ mod tests {
         collecting.state = AutotuneCaptureState::Collecting;
         collecting.idle_median_us = None;
         collecting.idle_p95_us = None;
+        collecting.idle_transport_baseline_us = None;
         collecting.background_confidence_percent = None;
         collecting.validate().unwrap();
         assert!(BootstrapCaptureRuntime::publish_if_changed(&directory, &collecting).is_err());

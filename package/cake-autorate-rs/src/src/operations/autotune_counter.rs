@@ -468,6 +468,7 @@ mod tests {
             candidate_dl_kbps: None,
             candidate_ul_kbps: Some(100_000),
             load_reference_kbps: Some(100_000),
+            transport_baseline_us: Some(10_000),
             route_fingerprint: "e".repeat(64),
             sqm_fingerprint: "f".repeat(64),
         }

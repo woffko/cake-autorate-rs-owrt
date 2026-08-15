@@ -15,6 +15,11 @@ if (typeof String.prototype.format !== 'function') {
 const sourcePath = path.join(__dirname, '..', 'htdocs', 'luci-static', 'resources',
 	'view', 'cake-autorate-rs', 'status.js');
 const source = fs.readFileSync(sourcePath, 'utf8');
+const QUALITY_GRADE_METHOD = 'worst_of_direction_bound_icmp_and_transport_v5';
+assert.doesNotMatch(source, /transport_rtt_p90_loaded_minus_p5_idle_v4/,
+	'stale transport-only Rating metadata must not remain in the UI');
+assert.match(source, /job\.rating_method !== QUALITY_GRADE_METHOD/,
+	'a completed Rating receipt must be bound to the current evidence contract');
 assert.equal((source.match(/window\.setTimeout\(/g) || []).length, 2,
 	'status timers are limited to job polling cadence and deferred Blob URL cleanup');
 assert.match(source,
@@ -199,6 +204,7 @@ assert.match(quality.children[1].children, /Waiting for loaded traffic.*50%/);
 const detected = helpers.formatQuality({
 	transport_latency_enabled: true,
 	quality_grade_state: 'provisional',
+	quality_grade_method: QUALITY_GRADE_METHOD,
 	quality_grade_collected_samples: 5,
 	quality_grade_required_samples: 3,
 	quality_grade_current: {
@@ -238,6 +244,7 @@ assert.match(detected.attrs.title, /Current triggers: DL 135000 kbps \(15\.0%\)/
 const collecting = helpers.formatQuality({
 	transport_latency_enabled: true,
 	quality_grade_state: 'collecting',
+	quality_grade_method: QUALITY_GRADE_METHOD,
 	quality_grade_collected_samples: 2,
 	quality_grade_required_samples: 3,
 	quality_grade_dl_samples: 2,
@@ -255,6 +262,7 @@ assert.equal(collecting.children[1].children[1].children, 'A');
 const waitingWithLastKnown = helpers.formatQuality({
 	transport_latency_enabled: true,
 	quality_grade_state: 'baseline_ready',
+	quality_grade_method: QUALITY_GRADE_METHOD,
 	quality_grade_collected_samples: 0,
 	quality_grade_required_samples: 20,
 	quality_grade_current: null,
@@ -270,6 +278,7 @@ assert.equal(waitingWithLastKnown.children[1].children[1].children, 'B');
 const noLastKnown = helpers.formatQuality({
 	transport_latency_enabled: true,
 	quality_grade_state: 'learning_baseline',
+	quality_grade_method: QUALITY_GRADE_METHOD,
 	quality_grade_collected_samples: 0,
 	quality_grade_required_samples: 3,
 	quality_grade_current: null,
@@ -283,6 +292,7 @@ assert.equal(noLastKnown.children[1].children[2].children, 'No complete rating k
 const incomplete = helpers.formatQuality({
 	transport_latency_enabled: true,
 	quality_grade_state: 'final',
+	quality_grade_method: QUALITY_GRADE_METHOD,
 	quality_grade_current: {
 		grade: 'LEARNING', increase_ms: 0, completed_at: Date.now() / 1000,
 		partial: false, incomplete: true, dl_samples: 4, ul_samples: 0,
@@ -295,9 +305,39 @@ const incomplete = helpers.formatQuality({
 assert.equal(incomplete.children[0].children[1].children, 'INCOMPLETE');
 assert.equal(incomplete.children[1].children[1].children, 'A');
 
+const exactObservedPartial = helpers.formatQuality({
+	transport_latency_enabled: true,
+	quality_grade_method: QUALITY_GRADE_METHOD,
+	quality_grade_state: 'final',
+	quality_grade_current: {
+		grade: 'A', increase_ms: 14.308, completed_at: Date.now() / 1000,
+		partial: true, incomplete: false, completion_reason: 'download_incomplete',
+		dl_samples: 0, ul_samples: 28, dl: null, ul: { grade: 'A' },
+	},
+	quality_grade_last_known: null,
+	quality_class: 'LEARNING',
+	quality_controller_class: 'A',
+});
+assert.equal(exactObservedPartial.children[0].children[1].children, 'PARTIAL');
+assert.doesNotMatch(exactObservedPartial.children[0].attrs.class, /cake-quality-grade-a(?:\s|$)/,
+	'the observed one-direction A must never receive final-grade styling');
+assert.equal(exactObservedPartial.children[1].children[1].children, '-');
+
+const unsupportedRatingContract = helpers.formatQuality({
+	transport_latency_enabled: true,
+	quality_grade_method: 'transport_rtt_p90_loaded_minus_p5_idle_v4',
+	quality_grade_state: 'final',
+	quality_grade_current: {
+		grade: 'A', partial: false, incomplete: false,
+	},
+});
+assert.equal(unsupportedRatingContract.children, 'UNAVAILABLE');
+assert.match(unsupportedRatingContract.attrs.title, /unsupported evidence contract/);
+
 const rejectedLastKnown = helpers.formatQuality({
 	transport_latency_enabled: true,
 	quality_grade_state: 'final',
+	quality_grade_method: QUALITY_GRADE_METHOD,
 	quality_grade_current: null,
 	quality_grade_last_known: {
 		grade: 'B', increase_ms: 50, completed_at: Date.now() / 1000 - 30,
@@ -326,7 +366,7 @@ const nativeRatingUnavailable = helpers.qualityReadiness(
 	{ state: 'idle', native_rating: false },
 );
 assert.equal(nativeRatingUnavailable.ready, false);
-assert.match(nativeRatingUnavailable.reason, /Native Rating is unavailable/);
+assert.match(nativeRatingUnavailable.reason, /Rating is unavailable/);
 const standbyAutomatic = helpers.qualityReadiness({ enabled: '1', sqm_enabled: '1' }, {
 	uplink_state: 'STANDBY',
 	transport_latency_enabled: true,
@@ -465,7 +505,7 @@ assert.match(JSON.stringify(reviewWarningState), /requires explicit Review/,
 const globalSchedulerDiagnostic = helpers.renderStatusData([], [], [], {}, {}, [ {
 	instance: 'retired_sqm', message: 'Durable state has no current UCI configuration.',
 } ]);
-assert.match(JSON.stringify(globalSchedulerDiagnostic), /Native scheduler diagnostics/);
+assert.match(JSON.stringify(globalSchedulerDiagnostic), /Calibration scheduler diagnostics/);
 assert.match(JSON.stringify(globalSchedulerDiagnostic), /retired_sqm/,
 	'orphan durable state must remain visible even without a matching Status row');
 const waitingLinkState = helpers.formatState({
@@ -809,7 +849,7 @@ async function schedulerReadTests() {
 	})(sections, 'native', { native_scheduler: true });
 	assert.equal(staleResult.rows[0].stale, true);
 	assert.deepEqual(staleResult.diagnostics[0], {
-		instance: 'Native scheduler', message: staleMessage,
+		instance: 'Calibration scheduler', message: staleMessage,
 	}, 'stale cached budgets must be accompanied by a visible global warning');
 
 	let failedCalls = 0;

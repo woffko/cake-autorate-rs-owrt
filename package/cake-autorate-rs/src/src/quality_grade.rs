@@ -4,6 +4,8 @@ use crate::transport_quality::{classify_quality, QualityClass};
 
 pub const MIN_BASELINE_SAMPLES: usize = 20;
 pub const MIN_LOADED_SAMPLES: usize = 20;
+pub const QUALITY_GRADE_METHOD: &str = "worst_of_direction_bound_icmp_and_transport_v5";
+pub const QUALITY_GRADE_EVIDENCE_SOURCE: &str = "worst_of_icmp_and_transport";
 const BASELINE_WINDOW: usize = 120;
 
 #[derive(Clone, Debug)]
@@ -12,6 +14,11 @@ pub struct QualityGradeMetric {
     pub increase_ms: f64,
     pub loaded_p90_ms: f64,
     pub samples: usize,
+    pub evidence_source: &'static str,
+    pub icmp_increase_ms: f64,
+    pub transport_increase_ms: f64,
+    pub icmp_samples: usize,
+    pub transport_samples: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -62,18 +69,62 @@ pub struct QualityGradeSnapshot {
     pub last_known_stale: bool,
 }
 
+impl QualityGradeSnapshot {
+    /// Return the only grade that may be published as the overall connection
+    /// rating. Provisional, partial, incomplete and route-stale evidence stays
+    /// visible in the detailed Rating payload but must never populate the
+    /// compatibility `quality_class` fields.
+    pub fn authoritative_complete_result(&self) -> Option<&QualityGradeResult> {
+        let result = self.last_known.as_ref()?;
+        (!self.last_known_stale
+            && result.completed_at.is_some()
+            && !result.partial
+            && !result.incomplete
+            && result.dl.is_some()
+            && result.ul.is_some())
+        .then_some(result)
+    }
+
+    pub fn authoritative_classes(&self) -> (QualityClass, QualityClass, QualityClass) {
+        let Some(result) = self.authoritative_complete_result() else {
+            return (
+                QualityClass::Learning,
+                QualityClass::Learning,
+                QualityClass::Learning,
+            );
+        };
+        (
+            result.class,
+            result
+                .dl
+                .as_ref()
+                .map(|metric| metric.class)
+                .unwrap_or(QualityClass::Learning),
+            result
+                .ul
+                .as_ref()
+                .map(|metric| metric.class)
+                .unwrap_or(QualityClass::Learning),
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ActiveWindow {
     endpoint: Option<String>,
     baseline_p5_ms: Option<f64>,
     started_at: f64,
-    last_loaded_at: f64,
+    last_transport_loaded_at: Option<f64>,
+    last_icmp_loaded_at: Option<f64>,
     route_identity: String,
     capture_job_id: String,
     capture_generation: u64,
     dl: Vec<f64>,
     ul: Vec<f64>,
     bidirectional: Vec<f64>,
+    icmp_dl: Vec<f64>,
+    icmp_ul: Vec<f64>,
+    icmp_bidirectional: Vec<f64>,
 }
 
 impl ActiveWindow {
@@ -87,13 +138,17 @@ impl ActiveWindow {
             endpoint: None,
             baseline_p5_ms: None,
             started_at,
-            last_loaded_at: started_at,
+            last_transport_loaded_at: None,
+            last_icmp_loaded_at: None,
             route_identity: route_identity.to_string(),
             capture_job_id: capture_job_id.to_string(),
             capture_generation,
             dl: Vec::new(),
             ul: Vec::new(),
             bidirectional: Vec::new(),
+            icmp_dl: Vec::new(),
+            icmp_ul: Vec::new(),
+            icmp_bidirectional: Vec::new(),
         }
     }
 
@@ -101,12 +156,30 @@ impl ActiveWindow {
         self.dl.len() + self.ul.len() + self.bidirectional.len()
     }
 
+    fn evidence_expired(&self, now: f64, grace_s: f64) -> bool {
+        let transport_at = self.last_transport_loaded_at.unwrap_or(self.started_at);
+        let icmp_at = self.last_icmp_loaded_at.unwrap_or(self.started_at);
+        now - transport_at >= grace_s || now - icmp_at >= grace_s
+    }
+
+    fn finalize_remaining_s(&self, now: f64, grace_s: f64) -> f64 {
+        let transport_at = self.last_transport_loaded_at.unwrap_or(self.started_at);
+        let icmp_at = self.last_icmp_loaded_at.unwrap_or(self.started_at);
+        (grace_s - (now - transport_at))
+            .min(grace_s - (now - icmp_at))
+            .max(0.0)
+    }
+
     fn result(&self, completed_at: Option<f64>) -> Option<QualityGradeResult> {
         let endpoint = self.endpoint.as_ref()?;
         let baseline_p5_ms = self.baseline_p5_ms?;
-        let dl = metric(&self.dl, baseline_p5_ms);
-        let ul = metric(&self.ul, baseline_p5_ms);
-        let bidirectional = metric(&self.bidirectional, baseline_p5_ms);
+        let dl = combined_metric(&self.dl, &self.icmp_dl, baseline_p5_ms);
+        let ul = combined_metric(&self.ul, &self.icmp_ul, baseline_p5_ms);
+        let bidirectional = combined_metric(
+            &self.bidirectional,
+            &self.icmp_bidirectional,
+            baseline_p5_ms,
+        );
 
         let (class, increase_ms, partial, incomplete, completion_reason) = match (&dl, &ul) {
             (Some(dl), Some(ul)) => {
@@ -263,7 +336,7 @@ impl QualityGradeTracker {
             if self
                 .active
                 .as_ref()
-                .map(|active| timestamp - active.last_loaded_at >= self.session_grace_s)
+                .map(|active| active.evidence_expired(timestamp, self.session_grace_s))
                 .unwrap_or(false)
             {
                 self.finish_active(timestamp);
@@ -274,7 +347,7 @@ impl QualityGradeTracker {
         if self
             .active
             .as_ref()
-            .map(|active| timestamp - active.last_loaded_at >= self.session_grace_s)
+            .map(|active| active.evidence_expired(timestamp, self.session_grace_s))
             .unwrap_or(false)
         {
             self.finish_active(timestamp);
@@ -299,7 +372,7 @@ impl QualityGradeTracker {
         if active.endpoint.as_deref() != Some(endpoint) {
             return;
         }
-        active.last_loaded_at = timestamp;
+        active.last_transport_loaded_at = Some(timestamp);
 
         if dl_loaded && ul_loaded {
             active.bidirectional.push(latency_ms);
@@ -307,6 +380,63 @@ impl QualityGradeTracker {
             active.dl.push(latency_ms);
         } else {
             active.ul.push(latency_ms);
+        }
+    }
+
+    /// Record the controller's direction-bound ICMP increase for the same
+    /// rating episode.  Transport and ICMP are independent evidence sources:
+    /// a direction is reviewable only after both reach their bounded sample
+    /// floor, and its published class uses the worse increase.  This mirrors
+    /// Full Auto-Tune's effective-latency rule instead of allowing a
+    /// provider-prioritised ICMP path or an unusually favourable transport
+    /// endpoint to promote the other source silently.  The ICMP input is the
+    /// controller's reflector-specific adaptive-baseline delta; transport is
+    /// independently reduced against its endpoint idle p5.  Both bases are
+    /// published explicitly because the maxima are comparable delay increases
+    /// but intentionally come from independent measurement planes.
+    pub fn observe_icmp_delta(
+        &mut self,
+        dl_delta_ms: f64,
+        ul_delta_ms: f64,
+        dl_loaded: bool,
+        ul_loaded: bool,
+        timestamp: f64,
+        route_identity: &str,
+    ) {
+        if !timestamp.is_finite()
+            || !dl_delta_ms.is_finite()
+            || !ul_delta_ms.is_finite()
+            || (!dl_loaded && !ul_loaded)
+        {
+            return;
+        }
+        self.set_route(route_identity);
+        if self
+            .active
+            .as_ref()
+            .map(|active| active.evidence_expired(timestamp, self.session_grace_s))
+            .unwrap_or(false)
+        {
+            self.finish_active(timestamp);
+        }
+        if self.active.is_none() {
+            self.active = Some(ActiveWindow::new(
+                timestamp,
+                route_identity,
+                &self.capture_job_id,
+                self.capture_generation,
+            ));
+        }
+        let active = self.active.as_mut().expect("active window was initialized");
+        active.last_icmp_loaded_at = Some(timestamp);
+        let dl_delta_ms = dl_delta_ms.max(0.0);
+        let ul_delta_ms = ul_delta_ms.max(0.0);
+        if dl_loaded && ul_loaded {
+            active.icmp_bidirectional.push(dl_delta_ms.max(ul_delta_ms));
+        } else if dl_loaded {
+            active.icmp_dl.push(dl_delta_ms);
+        } else {
+            active.icmp_ul.push(ul_delta_ms);
         }
     }
 
@@ -354,7 +484,7 @@ impl QualityGradeTracker {
                     active.dl.len(),
                     active.ul.len(),
                     active.bidirectional.len(),
-                    Some((self.session_grace_s - (now - active.last_loaded_at)).max(0.0)),
+                    Some(active.finalize_remaining_s(now, self.session_grace_s)),
                 )
             })
             .unwrap_or((0, 0, 0, None));
@@ -408,22 +538,52 @@ impl QualityGradeTracker {
     }
 }
 
-fn metric(samples: &[f64], baseline_p5_ms: f64) -> Option<QualityGradeMetric> {
+fn transport_metric(samples: &[f64], baseline_p5_ms: f64) -> Option<(f64, f64)> {
     if samples.len() < MIN_LOADED_SAMPLES {
         return None;
     }
     let loaded_p90_ms = percentile(samples.iter().copied(), 90.0)?;
-    let raw_increase = loaded_p90_ms - baseline_p5_ms;
-    let increase_ms = if raw_increase.abs() < 2.0 {
+    let increase_ms = clamp_increase_ms(loaded_p90_ms - baseline_p5_ms);
+    Some((increase_ms, loaded_p90_ms))
+}
+
+fn icmp_metric(samples: &[f64]) -> Option<f64> {
+    if samples.len() < MIN_LOADED_SAMPLES {
+        return None;
+    }
+    Some(clamp_increase_ms(percentile(
+        samples.iter().copied(),
+        90.0,
+    )?))
+}
+
+fn clamp_increase_ms(increase_ms: f64) -> f64 {
+    if increase_ms.abs() < 2.0 {
         0.0
     } else {
-        raw_increase.max(0.0)
-    };
+        increase_ms.max(0.0)
+    }
+}
+
+fn combined_metric(
+    transport_samples: &[f64],
+    icmp_samples: &[f64],
+    baseline_p5_ms: f64,
+) -> Option<QualityGradeMetric> {
+    let (transport_increase_ms, loaded_p90_ms) =
+        transport_metric(transport_samples, baseline_p5_ms)?;
+    let icmp_increase_ms = icmp_metric(icmp_samples)?;
+    let increase_ms = transport_increase_ms.max(icmp_increase_ms);
     Some(QualityGradeMetric {
         class: classify_quality(Some(increase_ms)),
         increase_ms,
         loaded_p90_ms,
-        samples: samples.len(),
+        samples: transport_samples.len().min(icmp_samples.len()),
+        evidence_source: QUALITY_GRADE_EVIDENCE_SOURCE,
+        icmp_increase_ms,
+        transport_increase_ms,
+        icmp_samples: icmp_samples.len(),
+        transport_samples: transport_samples.len(),
     })
 }
 
@@ -495,11 +655,27 @@ mod tests {
                 started_at + index as f64,
                 route,
             );
+            tracker.observe_icmp_delta(
+                (dl_latency_ms - 10.0).max(0.0),
+                0.0,
+                true,
+                false,
+                started_at + index as f64,
+                route,
+            );
         }
         for index in 0..MIN_LOADED_SAMPLES {
             tracker.observe(
                 endpoint,
                 ul_latency_ms,
+                false,
+                true,
+                started_at + MIN_LOADED_SAMPLES as f64 + index as f64,
+                route,
+            );
+            tracker.observe_icmp_delta(
+                0.0,
+                (ul_latency_ms - 10.0).max(0.0),
                 false,
                 true,
                 started_at + MIN_LOADED_SAMPLES as f64 + index as f64,
@@ -537,18 +713,60 @@ mod tests {
                 180.0 + index as f64,
                 "route-a",
             );
+            tracker.observe_icmp_delta(2.0, 0.0, true, false, 180.0 + index as f64, "route-a");
         }
         tracker.observe("endpoint", 11.0, false, false, 240.0, "route-a");
         let partial = tracker.snapshot(245.0);
         assert!(partial.current.as_ref().unwrap().partial);
         assert_eq!(partial.current.as_ref().unwrap().class, QualityClass::APlus);
         assert_eq!(partial.last_known.as_ref().unwrap().class, QualityClass::B);
+        assert_eq!(
+            partial.authoritative_classes(),
+            (QualityClass::B, QualityClass::APlus, QualityClass::B),
+            "a partial A+ must not replace the last complete B rating"
+        );
 
         complete_result(&mut tracker, "endpoint", "route-a", 260.0, 12.0, 100.0);
         let replacement = tracker.snapshot(345.0);
         assert_eq!(
             replacement.last_known.as_ref().unwrap().class,
             QualityClass::C
+        );
+    }
+
+    #[test]
+    fn partial_only_or_route_stale_evidence_publishes_learning_not_its_grade() {
+        let mut tracker = QualityGradeTracker::new(30.0);
+        seed_baseline(&mut tracker, "endpoint", "route-a");
+        for index in 0..MIN_LOADED_SAMPLES {
+            let timestamp = 31.0 + index as f64;
+            tracker.observe("endpoint", 24.0, false, true, timestamp, "route-a");
+            tracker.observe_icmp_delta(0.0, 14.0, false, true, timestamp, "route-a");
+        }
+        tracker.observe("endpoint", 11.0, false, false, 90.0, "route-a");
+        let partial = tracker.snapshot(91.0);
+        assert_eq!(partial.current.as_ref().unwrap().class, QualityClass::A);
+        assert!(partial.current.as_ref().unwrap().partial);
+        assert_eq!(
+            partial.authoritative_classes(),
+            (
+                QualityClass::Learning,
+                QualityClass::Learning,
+                QualityClass::Learning,
+            )
+        );
+
+        complete_result(&mut tracker, "endpoint", "route-a", 100.0, 12.0, 40.0);
+        tracker.set_route("route-b");
+        let stale = tracker.snapshot(200.0);
+        assert!(stale.last_known_stale);
+        assert_eq!(
+            stale.authoritative_classes(),
+            (
+                QualityClass::Learning,
+                QualityClass::Learning,
+                QualityClass::Learning,
+            )
         );
     }
 
@@ -602,6 +820,7 @@ mod tests {
                 121.0 + index as f64,
                 "route-a",
             );
+            tracker.observe_icmp_delta(90.0, 0.0, true, false, 121.0 + index as f64, "route-a");
             tracker.observe(
                 "endpoint",
                 100.0,
@@ -610,6 +829,7 @@ mod tests {
                 141.0 + index as f64,
                 "route-a",
             );
+            tracker.observe_icmp_delta(0.0, 90.0, false, true, 141.0 + index as f64, "route-a");
         }
         assert_eq!(
             tracker.snapshot(165.0).current.as_ref().unwrap().class,
@@ -637,6 +857,7 @@ mod tests {
                 31.0 + index as f64,
                 "route-a",
             );
+            tracker.observe_icmp_delta(10.0, 0.0, true, false, 31.0 + index as f64, "route-a");
             tracker.observe(
                 "endpoint",
                 40.0,
@@ -645,6 +866,7 @@ mod tests {
                 51.0 + index as f64,
                 "route-a",
             );
+            tracker.observe_icmp_delta(0.0, 30.0, false, true, 51.0 + index as f64, "route-a");
         }
 
         tracker.end_capture(75.0);
@@ -673,9 +895,25 @@ mod tests {
                 31.0 + index as f64 * 0.1,
                 "route-a",
             );
+            tracker.observe_icmp_delta(
+                10.0,
+                0.0,
+                true,
+                false,
+                31.0 + index as f64 * 0.1,
+                "route-a",
+            );
             tracker.observe(
                 "endpoint",
                 40.0,
+                false,
+                true,
+                34.0 + index as f64 * 0.1,
+                "route-a",
+            );
+            tracker.observe_icmp_delta(
+                0.0,
+                30.0,
                 false,
                 true,
                 34.0 + index as f64 * 0.1,
@@ -718,19 +956,95 @@ mod tests {
             endpoint: Some("endpoint".to_string()),
             baseline_p5_ms: Some(10.0),
             started_at: 1.0,
-            last_loaded_at: 20.0,
+            last_transport_loaded_at: Some(20.0),
+            last_icmp_loaded_at: Some(20.0),
             route_identity: "route-a".to_string(),
             capture_job_id: String::new(),
             capture_generation: 0,
             dl: vec![12.0; MIN_LOADED_SAMPLES],
             ul: vec![100.0; MIN_LOADED_SAMPLES],
             bidirectional: Vec::new(),
+            icmp_dl: vec![2.0; MIN_LOADED_SAMPLES],
+            icmp_ul: vec![90.0; MIN_LOADED_SAMPLES],
+            icmp_bidirectional: Vec::new(),
         };
         let result = active.result(Some(20.0)).unwrap();
         assert_eq!(result.dl.as_ref().unwrap().class, QualityClass::APlus);
         assert_eq!(result.ul.as_ref().unwrap().class, QualityClass::C);
         assert_eq!(result.class, QualityClass::C);
         assert!(!result.partial);
+    }
+
+    #[test]
+    fn rating_uses_worse_icmp_evidence_and_never_promotes_a_missing_source() {
+        let with_both = combined_metric(
+            &[12.0; MIN_LOADED_SAMPLES],
+            &[120.0; MIN_LOADED_SAMPLES],
+            10.0,
+        )
+        .unwrap();
+        assert_eq!(with_both.transport_increase_ms, 2.0);
+        assert_eq!(with_both.icmp_increase_ms, 120.0);
+        assert_eq!(with_both.increase_ms, 120.0);
+        assert_eq!(with_both.class, QualityClass::C);
+        assert_eq!(with_both.evidence_source, "worst_of_icmp_and_transport");
+
+        assert!(combined_metric(&[12.0; MIN_LOADED_SAMPLES], &[], 10.0).is_none());
+        assert!(combined_metric(&[], &[120.0; MIN_LOADED_SAMPLES], 10.0).is_none());
+        assert!(combined_metric(
+            &[12.0; MIN_LOADED_SAMPLES],
+            &[120.0; MIN_LOADED_SAMPLES - 1],
+            10.0,
+        )
+        .is_none());
+        assert!(combined_metric(
+            &[12.0; MIN_LOADED_SAMPLES - 1],
+            &[120.0; MIN_LOADED_SAMPLES],
+            10.0,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn icmp_samples_are_bound_to_exactly_one_latched_direction() {
+        let mut tracker = QualityGradeTracker::new(30.0);
+        tracker.observe_icmp_delta(5.0, 6.0, false, false, 1.0, "route-a");
+        assert!(
+            tracker.active.is_none(),
+            "idle ICMP must not open a rating window"
+        );
+
+        tracker.observe_icmp_delta(5.0, 99.0, true, false, 2.0, "route-a");
+        tracker.observe_icmp_delta(99.0, 6.0, false, true, 3.0, "route-a");
+        tracker.observe_icmp_delta(7.0, 8.0, true, true, 4.0, "route-a");
+        let active = tracker.active.as_ref().unwrap();
+        assert_eq!(active.icmp_dl, vec![5.0]);
+        assert_eq!(active.icmp_ul, vec![6.0]);
+        assert_eq!(active.icmp_bidirectional, vec![8.0]);
+    }
+
+    #[test]
+    fn either_evidence_plane_expiring_closes_the_previous_window() {
+        let mut tracker = QualityGradeTracker::new(5.0);
+        seed_baseline(&mut tracker, "endpoint", "route-a");
+        tracker.begin_capture(30.0, "capture-plane-expiry", 4);
+        for index in 0..MIN_LOADED_SAMPLES {
+            let timestamp = 31.0 + index as f64 * 0.1;
+            tracker.observe("endpoint", 20.0, true, false, timestamp, "route-a");
+            tracker.observe_icmp_delta(10.0, 0.0, true, false, timestamp, "route-a");
+        }
+
+        tracker.observe_icmp_delta(10.0, 0.0, true, false, 34.0, "route-a");
+        tracker.observe_icmp_delta(10.0, 0.0, true, false, 36.0, "route-a");
+        tracker.observe_icmp_delta(10.0, 0.0, true, false, 38.0, "route-a");
+
+        let closed = tracker.latest.as_ref().unwrap();
+        assert_eq!(closed.capture_job_id, "capture-plane-expiry");
+        assert!(closed.partial);
+        assert_eq!(closed.completion_reason, "upload_incomplete");
+        let replacement = tracker.active.as_ref().unwrap();
+        assert!(replacement.dl.is_empty());
+        assert_eq!(replacement.icmp_dl, vec![10.0]);
     }
 
     #[test]
@@ -763,7 +1077,12 @@ mod tests {
 
     #[test]
     fn tiny_delta_is_clamped_and_percentiles_are_interpolated() {
-        let metric = metric(&[11.0; MIN_LOADED_SAMPLES], 11.0).unwrap();
+        let metric = combined_metric(
+            &[11.0; MIN_LOADED_SAMPLES],
+            &[0.5; MIN_LOADED_SAMPLES],
+            11.0,
+        )
+        .unwrap();
         assert_eq!(metric.increase_ms, 0.0);
         assert_eq!(metric.class, QualityClass::APlus);
         assert_eq!(percentile([0.0, 10.0], 90.0), Some(9.0));

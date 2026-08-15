@@ -1519,9 +1519,13 @@ run_section() {
 		return
 	}
 
-	deadline="$((now + job_timeout_s))"
+	# A successful Start must be followed by at least one authoritative status
+	# observation.  The deadline bounds subsequent waiting; it must not suppress
+	# the first read merely because an integer wall-clock second rolled during
+	# preflight or helper startup.
+	deadline="$(( $(date +%s) + job_timeout_s ))"
 	state=running
-	while [ "$(date +%s)" -lt "$deadline" ]; do
+	while :; do
 		if ! result="$("$helper" "$section" "$interface" status "$backend" "" "" "$profile" 0 "" \
 			"$traffic_budget_remaining" "$calibration_strategy" 2>/dev/null)"; then
 			finish_attempt_accounting "$section" "$interface" "$bytes_before" "$reserved_monthly_budget" "$reserved_monthly_month"
@@ -1532,8 +1536,7 @@ run_section() {
 		case "$state" in
 			complete) break ;;
 			running|recovery-pending)
-				sleep "$poll_interval_s"
-				continue
+				:
 				;;
 			inconclusive|background-blocked)
 				finish_attempt_accounting "$section" "$interface" "$bytes_before" "$reserved_monthly_budget" "$reserved_monthly_month"
@@ -1567,6 +1570,8 @@ run_section() {
 				return
 				;;
 		esac
+		[ "$(date +%s)" -lt "$deadline" ] || break
+		sleep "$poll_interval_s"
 	done
 	[ "$state" = complete ] || {
 		if [ "$state" = recovery-pending ]; then

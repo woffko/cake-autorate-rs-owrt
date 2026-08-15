@@ -429,6 +429,33 @@ impl AutotuneRuntimePermit {
         }
     }
 
+    /// Authorize the exact live rates which an existing instance will hold
+    /// while its idle baseline is captured.  `initial_*` records the rate at
+    /// coordinator admission, but the ordinary controller may complete one
+    /// already-in-flight update before it observes the permit.  The capture
+    /// therefore binds the freshly attested held rate, within the immutable
+    /// permit bounds, rather than pretending the historical seed is still
+    /// installed.
+    pub fn authorizes_idle_baseline(
+        &self,
+        topology: MeasurementTopology,
+        download_kbps: Option<u64>,
+        upload_kbps: Option<u64>,
+    ) -> Result<(), String> {
+        self.validate()?;
+        if topology != self.capture_baseline_topology() {
+            return Err("idle runtime topology does not match its permit baseline".to_string());
+        }
+        validate_topology_rates(topology, download_kbps, upload_kbps)?;
+        if download_kbps.is_some_and(|rate| !self.download_bounds.contains(rate)) {
+            return Err("idle download rate is outside its permitted range".to_string());
+        }
+        if upload_kbps.is_some_and(|rate| !self.upload_bounds.contains(rate)) {
+            return Err("idle upload rate is outside its permitted range".to_string());
+        }
+        Ok(())
+    }
+
     fn speedtest_unshaped_topology(&self) -> Option<MeasurementTopology> {
         match (self.allow_bypass_download, self.allow_bypass_upload) {
             (true, false) => Some(MeasurementTopology::RawDownload),

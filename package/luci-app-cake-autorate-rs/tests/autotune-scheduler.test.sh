@@ -3,8 +3,23 @@ set -eu
 
 root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 REAL_UCI_BIN="$(command -v uci 2>/dev/null || true)"
-tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT INT TERM
+tmp="$(mktemp -d)" || {
+	printf '%s\n' 'autotune scheduler test could not create its temporary root' >&2
+	exit 1
+}
+test_checkpoint=setup
+cleanup() {
+	rc=$?
+	trap - EXIT INT TERM
+	if [ "$rc" -ne 0 ]; then
+		printf 'autotune scheduler test failed during: %s\n' "$test_checkpoint" >&2
+	fi
+	rm -rf "$tmp"
+	exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 mkdir -p "$tmp/bin" "$tmp/state" "$tmp/locks" "$tmp/sys/class/net/eth0/statistics"
 log="$tmp/commands.log"
 count="$tmp/service-count"
@@ -362,12 +377,14 @@ export CAKE_AUTORATE_RUNTIME_LOCK_ROOT="$tmp/locks"
 export CAKE_AUTORATE_RUNTIME_LOCK_LIB="$root/../cake-autorate-rs/files/usr/libexec/cake-autorate-rs/runtime-lock"
 export CAKE_AUTOTUNE_SCHEDULER_SOURCE_ONLY=1
 . "$root/root/usr/libexec/cake-autorate-rs/autotune-scheduler"
+test_checkpoint=source-contract
 
 [ "$daemon_bin" = /usr/sbin/cake-autorated ] || {
 	echo 'scheduler default daemon path does not match the installed binary' >&2
 	exit 1
 }
 
+test_checkpoint=monthly-accounting
 # Monthly accounting is atomic, persistent outside /var/run, and contributes a
 # second hard bound independently of the RAM-only daily counter.
 record_monthly_budget test 1234
@@ -411,6 +428,7 @@ case "$scheduler_snapshot" in
 	*) printf '%s\n' "unexpected scheduler status: $scheduler_snapshot" >&2; exit 1 ;;
 esac
 
+test_checkpoint=daemon-identity
 # Exercise the production daemon identity check against a synthetic /proc
 # tree before replacing health probes with deterministic apply-test stubs.
 mkdir -p "$tmp/proc/123"
@@ -570,6 +588,7 @@ restart_line="$(sed -n '/^service:1:restart$/=' "$log")"
 [ "$(uci -q get cake-autorate.test.sqm_eqdisc_opts)" = diffserv4 ]
 assert_global_lock_released
 
+test_checkpoint=gaming-policy
 # Gaming is a complete policy, not just a label: scheduled apply must atomically
 # switch to layer_cake + diffserv4, preserve DSCP and stage the A+ validation
 # targets under the same rollback journal.
@@ -601,6 +620,7 @@ apply_result test '{}' "$fingerprint_a" eth0
 [ "$(uci -q get cake-autorate.test.sqm_eqdisc_opts)" = diffserv4 ]
 assert_global_lock_released
 
+test_checkpoint=capacity-learning-policy
 # Scheduled apply records the proposal's explicit, internally consistent
 # capacity-learning policy instead of relying on a hidden legacy toggle.
 reset_case
@@ -666,6 +686,7 @@ reset_case; export RESULT_GATE_ACTUALS='90 90 111 90 90 90 90 90 10 10 0 40 10 1
 reset_case; export RESULT_GATE_COMPARISONS='minimum minimum minimum maximum minimum minimum minimum minimum maximum maximum maximum maximum maximum maximum maximum maximum'; expect_gate_rejection 'mislabeled gate comparison'
 reset_case; export RESULT_GATE_ACTUALS='90 90 90 90 90 90 90 90 30 10 0 40 10 10 0 40'; expect_gate_rejection 'quality exactly on exclusive grade boundary'
 
+test_checkpoint=eligibility-gates
 # CPU is diagnostic: an exact failed CPU gate must not block an otherwise
 # auto-eligible result, but its false value must still match actual > limit.
 reset_case
@@ -829,6 +850,7 @@ grep -q '^uci:stage:set:' "$log"
 ! grep -q '^uci:commit:' "$log"
 assert_global_lock_released
 
+test_checkpoint=failed-lifecycle-rollback
 # A failed lifecycle validation rolls back only scheduler-owned committed
 # values, while the same exclusive descriptor remains held for both restarts.
 reset_case
@@ -845,6 +867,7 @@ grep -q '^service:2:restart$' "$log"
 [ "$(uci -q get cake-autorate.test.min_dl_shaper_rate_kbps)" = 111 ]
 assert_global_lock_released
 
+test_checkpoint=missing-preimage-rollback
 # A missing preimage is restored as absence, but only after the complete owned
 # set has passed candidate/preimage classification.
 reset_case
@@ -861,6 +884,7 @@ fi
 ! recovery_transactions_pending
 assert_global_lock_released
 
+test_checkpoint=sigkill-recovery
 # SIGKILL after candidate commit leaves a tmpfs journal. A later scheduler
 # startup/check acquires the exclusive lock, restores the full preimage and
 # verifies runtime before removing the obligation.
@@ -958,6 +982,7 @@ if ! assert_global_lock_released; then
 	exit 1
 fi
 
+test_checkpoint=rollback-failures
 # Rollback commit and rollback restart failures remain explicit obligations;
 # they are never swallowed or reported as a clean failure.
 reset_case
@@ -988,6 +1013,7 @@ recover_pending_transactions
 ! recovery_transactions_pending
 assert_global_lock_released
 
+test_checkpoint=foreign-mutation-recovery
 # If another actor changed one candidate after commit, recovery is atomic and
 # fail-closed: it restores none of the set, leaves an explicit RAM obligation,
 # and blocks later tuning rather than producing a mixed candidate/preimage.
@@ -1007,6 +1033,7 @@ recovery_transactions_pending
 ! grep -q '^uci:revert$' "$log"
 assert_global_lock_released
 
+test_checkpoint=fingerprint-drift
 # The scheduler snapshot is taken before launching the helper.  If the current
 # instance/SQM fingerprint no longer equals that snapshot, no measurement is
 # started and therefore no terminal result can ever reach staging.
@@ -1023,6 +1050,7 @@ run_section test eth0 "$(date +%s)" 0 "$fingerprint_b"
 [ ! -e "$helper_called" ]
 grep -q '"state":"deferred"' "$state_root/test.json"
 
+test_checkpoint=polling-outcomes
 # Exhaustive polling: recovery is transient, retryable measurement outcomes
 # finish immediately as deferred, unknown states fail closed, and every
 # started attempt consumes budget + advances the RAM retry throttle.
@@ -1092,6 +1120,7 @@ assert_attempt_accounted() {
 	[ -n "$budget_day" ] && [ "$budget_bytes" = 2000 ]
 }
 
+test_checkpoint=poll-recovery-then-complete
 prepare_poll_case
 printf '%s\n' recovery-pending complete > "$TEST_POLL_SEQUENCE"
 run_section test eth0 "$(date +%s)" 1000 "$fingerprint_a" 4096
@@ -1099,6 +1128,7 @@ grep -q '"state":"proposal_ready"' "$state_root/test.json"
 [ "$(cat "$TEST_POLL_COUNT")" = 2 ]
 assert_attempt_accounted
 
+test_checkpoint=poll-background-blocked
 prepare_poll_case
 printf '%s\n' background-blocked > "$TEST_POLL_SEQUENCE"
 run_section test eth0 "$(date +%s)" 1000 "$fingerprint_a" 4096
@@ -1106,6 +1136,7 @@ grep -q '"state":"deferred"' "$state_root/test.json"
 [ "$(cat "$TEST_POLL_COUNT")" = 1 ]
 assert_attempt_accounted
 
+test_checkpoint=poll-inconclusive
 prepare_poll_case
 export POLL_REASON=config-changed
 printf '%s\n' inconclusive > "$TEST_POLL_SEQUENCE"
@@ -1114,6 +1145,7 @@ grep -q 'config-changed' "$state_root/test.json"
 grep -q '"state":"deferred"' "$state_root/test.json"
 assert_attempt_accounted
 
+test_checkpoint=poll-unknown-state
 prepare_poll_case
 printf '%s\n' future-unknown-state > "$TEST_POLL_SEQUENCE"
 run_section test eth0 "$(date +%s)" 1000 "$fingerprint_a" 4096
@@ -1121,12 +1153,14 @@ grep -q '"state":"failed"' "$state_root/test.json"
 grep -q 'unknown state' "$state_root/test.json"
 assert_attempt_accounted
 
+test_checkpoint=poll-command-error
 prepare_poll_case
 printf '%s\n' command-error > "$TEST_POLL_SEQUENCE"
 run_section test eth0 "$(date +%s)" 1000 "$fingerprint_a" 4096
 grep -q 'status could not be read' "$state_root/test.json"
 assert_attempt_accounted
 
+test_checkpoint=poll-start-error
 prepare_poll_case
 export POLL_START_RC=1
 printf '%s\n' complete > "$TEST_POLL_SEQUENCE"
@@ -1136,6 +1170,7 @@ grep -q 'Unable to start' "$state_root/test.json"
 assert_attempt_accounted
 
 for terminal_state in failed cancelled idle; do
+	test_checkpoint="poll-terminal-$terminal_state"
 	prepare_poll_case
 	printf '%s\n' "$terminal_state" > "$TEST_POLL_SEQUENCE"
 	run_section test eth0 "$(date +%s)" 1000 "$fingerprint_a" 4096
@@ -1144,6 +1179,7 @@ for terminal_state in failed cancelled idle; do
 	assert_attempt_accounted
 done
 
+test_checkpoint=poll-running-timeout
 prepare_poll_case
 job_timeout_s=1
 printf '%s\n' running > "$TEST_POLL_SEQUENCE"
@@ -1153,11 +1189,15 @@ grep -qx cancel "$TEST_POLL_LOG"
 assert_attempt_accounted
 job_timeout_s=1800
 
+test_checkpoint=poll-recovery-pending-timeout
 prepare_poll_case
-job_timeout_s=1
+# Zero makes the deadline already due and proves that a successful Start still
+# receives one authoritative status read before timeout policy is evaluated.
+job_timeout_s=0
 printf '%s\n' recovery-pending > "$TEST_POLL_SEQUENCE"
 run_section test eth0 "$(date +%s)" 1000 "$fingerprint_a" 4096
 grep -q '"state":"recovery-pending"' "$state_root/test.json"
+[ "$(cat "$TEST_POLL_COUNT")" -ge 1 ]
 if grep -qx cancel "$TEST_POLL_LOG"; then
 	echo 'scheduler cancelled a recovery-pending helper' >&2
 	exit 1
@@ -1165,6 +1205,7 @@ fi
 assert_attempt_accounted
 job_timeout_s=1800
 
+test_checkpoint=retry-throttle
 # check_section uses last-attempt for retry throttling independently of the
 # successful-calibration interval and refuses to run while any recovery
 # transaction remains.
@@ -1198,6 +1239,7 @@ check_section test
 [ ! -e "$scheduled_called" ]
 grep -q '"state":"recovery-pending"' "$state_root/test.json"
 
+test_checkpoint=real-uci-integration
 # If a real libuci CLI exists on the test host, exercise private -P deltas
 # against an isolated config directory. CI hosts without uci explicitly skip.
 if [ -n "${REAL_UCI_BIN:-}" ] && [ -x "$REAL_UCI_BIN" ]; then

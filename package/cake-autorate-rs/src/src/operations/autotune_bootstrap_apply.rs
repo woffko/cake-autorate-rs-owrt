@@ -279,6 +279,9 @@ impl NativeBootstrapApplyPlan {
             NativeApplyAuthorityIdentity::RawFallbackV5(_) => {
                 NATIVE_RAW_FALLBACK_BOOTSTRAP_APPLY_MANIFEST_SCHEMA_VERSION
             }
+            NativeApplyAuthorityIdentity::DirectionalRawFallbackV6(_) => {
+                unreachable!("directional raw fallback is rejected by bootstrap construction")
+            }
         }
     }
 
@@ -291,6 +294,9 @@ impl NativeBootstrapApplyPlan {
             NativeApplyAuthorityIdentity::ShapedV4(_) => NativeBootstrapApplyMode::ShapedRuntime,
             NativeApplyAuthorityIdentity::RawFallbackV5(_) => {
                 NativeBootstrapApplyMode::DisabledInactive
+            }
+            NativeApplyAuthorityIdentity::DirectionalRawFallbackV6(_) => {
+                unreachable!("directional raw fallback is rejected by bootstrap construction")
             }
         }
     }
@@ -306,6 +312,14 @@ impl NativeBootstrapApplyPlan {
             NativeApplyAuthorityIdentity::RawFallbackV5(_)
         ) {
             return self.canonical_raw_fallback_manifest_bytes();
+        }
+        if matches!(
+            &self.source_authority,
+            NativeApplyAuthorityIdentity::DirectionalRawFallbackV6(_)
+        ) {
+            return Err(
+                "directional raw fallback is not yet a bootstrap Apply authority".to_string(),
+            );
         }
         let NativeApplyAuthorityIdentity::ShapedV4(source_v4) = &self.source_authority else {
             unreachable!("raw fallback returned above")
@@ -562,6 +576,9 @@ fn composite_candidate_id(
             RAW_FALLBACK_BOOTSTRAP_CANDIDATE_DOMAIN_V4,
             "source_apply_v5_manifest_sha256",
         ),
+        NativeApplyAuthorityIdentity::DirectionalRawFallbackV6(_) => {
+            unreachable!("directional raw fallback is rejected by bootstrap construction")
+        }
     };
     let seed = format!(
         concat!(

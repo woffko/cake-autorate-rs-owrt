@@ -2407,3 +2407,50 @@ ownership, contamination, timeout and all other apparatus/authority failures
 remain non-retryable and fail closed. Marker-bounded logs on all three routers
 contained no output-rejection, panic, fatal, unsafe-recovery or residual-worker
 signature after restoration.
+
+## RC27 r249/r97 Rating, directional Review, and release matrix gate (2026-08-15)
+
+The corrected Rating contract was first exercised in a comparable cellular
+window. A complete capture collected 36 download and 36 upload transport
+samples and returned overall class C, with download B and upload C. The old
+class A symptom was traced to partial upload-only evidence with zero download
+transport samples. Current Rating publishes a top-level class only for a fresh,
+finalized, non-partial result with complete direction-bound ICMP and transport
+evidence; incomplete records remain diagnostic and cannot replace a complete
+grade.
+
+The accepted r249/r97 Variable Link / Full raw run then reported monotonic
+3--100% progress through named raw-control, directional-search, pair,
+download-bypass, restoration and proposal stages. Review contained four
+applicable immutable options: recommended both-shaped class C at
+273800/30600 kbit/s, throughput-first class B at 273800/35900, upload without
+shaping, and the explicitly requested mobile **Download without shaping**
+topology. The latter kept upload CAKE at 30600 kbit/s and disabled download
+shaping. All four measured trade-offs were listed behind one aggregate
+confirmation checkbox.
+
+Applying the download-bypass option produced exactly one Apply RPC, verified
+the resulting upload-only CAKE topology, and automatically returned to a fresh
+Settings page showing controller 322000/30600 and SQM 0/30600. There was no
+Reload button, stale Applying state, Unsaved Changes warning, tab switch,
+console error, or failed response. The original 322000/39600 configuration and
+both CAKE directions were then restored byte-for-byte; UCI remained clean and
+the coordinator returned to idle with no active, queued, recovery, or lease
+state. Equivalent install and cache-disabled Settings gates passed on the two
+anonymized x86_64 Multi-WAN routers.
+
+The final OpenWrt 25.12.5 matrix contains 12 Full r249 daemon APKs, 12
+separately compiled Lite r249 daemon APKs, Full LuCI r97, and Lite LuCI r3.
+All 26 APKs passed exact source-sync, matching-SDK verification and metadata,
+provider/dependency, extracted-mode, source-payload, ELF architecture,
+endianness, ARM float-ABI or MIPS o32 checks. Lite and Full binaries were
+proved distinct and Lite contained neither the Full Auto-Tune marker nor the
+scheduler seed. The independently verified `SHA256SUMS` has SHA-256
+`323c9b7d0827feff4738bab3585ad1682499f01790982e767ed51cd99b6082a7`;
+the machine-readable matrix report has SHA-256
+`252af0e41b6c3936d1fafa3b17f7f779958ee91fe94d250045f371a3ac60da01`.
+
+After this main release, the next planned stage is a source cleanup/refactor
+with frozen behavior and package-size regression gates, followed by a separate
+smallest practical manual-only Lite design with Rating, speed testing,
+Auto-Tune, scheduling, associated ACLs, and their runtime surfaces absent.

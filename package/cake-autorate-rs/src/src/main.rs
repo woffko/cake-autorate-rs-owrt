@@ -1220,13 +1220,17 @@ impl Config {
         if self.no_pingers > self.reflectors.len() {
             return Err("no_pingers cannot exceed reflector count".to_string());
         }
-        if self.connection_active_thr_kbps > self.min_dl_shaper_rate_kbps {
+        if self.adjust_dl_shaper_rate
+            && self.connection_active_thr_kbps > self.min_dl_shaper_rate_kbps
+        {
             return Err(
                 "connection_active_thr_kbps cannot be greater than min_dl_shaper_rate_kbps"
                     .to_string(),
             );
         }
-        if self.connection_active_thr_kbps > self.min_ul_shaper_rate_kbps {
+        if self.adjust_ul_shaper_rate
+            && self.connection_active_thr_kbps > self.min_ul_shaper_rate_kbps
+        {
             return Err(
                 "connection_active_thr_kbps cannot be greater than min_ul_shaper_rate_kbps"
                     .to_string(),
@@ -2453,6 +2457,14 @@ fn published_runtime_qdisc_kind(
         observed.map(Into::into)
     } else {
         None
+    }
+}
+
+fn published_applied_cake_rate_kbps(shaping_enabled: bool, last_applied_kbps: u64) -> f64 {
+    if shaping_enabled {
+        last_applied_kbps as f64
+    } else {
+        0.0
     }
 }
 
@@ -3736,12 +3748,35 @@ fn transport_result_matches_route(
     result_identity.is_some() && result_identity == current_identity
 }
 
+/// Bind positive and negative transport outcomes separately.
+///
+/// A successful latency sample requires the route to remain online before
+/// and after the whole probe.  A failed probe is already adverse evidence, so
+/// it may retain the original route identity when the same device/source
+/// identity became offline during the flight.  This lets an exact deadline
+/// exhaustion remain censored negative evidence instead of being rewritten as
+/// an untyped route-change result.  It never turns a successful sample from an
+/// offline or failed-over route into latency evidence.
+fn transport_probe_route_identities(
+    before: Option<&RouteSnapshot>,
+    after: Option<&RouteSnapshot>,
+) -> (Option<String>, Option<String>) {
+    let (Some(before), Some(after)) = (before, after) else {
+        return (None, None);
+    };
+    if !before.online || before.stable_key() != after.stable_key() {
+        return (None, None);
+    }
+    let failed = Some(before.stable_key());
+    let successful = after.online.then(|| after.stable_key());
+    (successful, failed)
+}
+
 #[cfg(feature = "calibration")]
 fn censored_autotune_transport_observation(
     result: &TransportProbeResult,
     active_capture: Option<&operations::full_autotune::AutotuneCaptureRequest>,
     current_route_identity: Option<&str>,
-    baseline_ms: Option<f64>,
 ) -> Result<Option<operations::autotune_capture::AutotuneCaptureObservationKind>, String> {
     if result.failure_kind != Some(transport_probe::TransportProbeFailureKind::DeadlineExceeded) {
         return Ok(None);
@@ -3767,7 +3802,6 @@ fn censored_autotune_transport_observation(
         result
             .failure_deadline_us
             .expect("typed deadline duration checked above"),
-        baseline_ms,
         result.dl_loaded,
         result.ul_loaded,
     )
@@ -3895,16 +3929,8 @@ impl TransportProbeRuntime {
                     Err(error) => Err(transport_probe::TransportProbeFailure::other(error.clone())),
                 };
                 let after = route_inspector.inspect();
-                let stable_identity = match (&before, &after) {
-                    (Ok(before), Ok(after))
-                        if before.online
-                            && after.online
-                            && before.stable_key() == after.stable_key() =>
-                    {
-                        Some(after.stable_key())
-                    }
-                    _ => None,
-                };
+                let (successful_route_identity, failed_route_identity) =
+                    transport_probe_route_identities(before.as_ref().ok(), after.as_ref().ok());
                 let (
                     latency_ms,
                     error,
@@ -3916,8 +3942,9 @@ impl TransportProbeRuntime {
                     discarded_samples,
                     server_processing_ms,
                     connection_reused,
-                ) = match (measurement, stable_identity.is_some()) {
-                    (Ok(sample), true) => (
+                    result_route_identity,
+                ) = match (measurement, successful_route_identity) {
+                    (Ok(sample), Some(route_identity)) => (
                         Some(sample.rtt_ms),
                         None,
                         None,
@@ -3928,8 +3955,9 @@ impl TransportProbeRuntime {
                         sample.discarded_samples,
                         sample.server_processing_ms,
                         sample.connection_reused,
+                        Some(route_identity),
                     ),
-                    (Ok(_), false) | (Err(_), false) => (
+                    (Ok(_), None) => (
                         None,
                         Some("route changed during native transport probe".to_string()),
                         Some(transport_probe::TransportProbeFailureKind::Other),
@@ -3940,19 +3968,39 @@ impl TransportProbeRuntime {
                         0,
                         0.0,
                         false,
-                    ),
-                    (Err(failure), true) => (
                         None,
-                        Some(failure.message().to_string()),
-                        Some(failure.kind()),
-                        failure.deadline_us(),
-                        backend.as_str().to_string(),
-                        backend.trusted(),
-                        Vec::new(),
-                        0,
-                        0.0,
-                        false,
                     ),
+                    (Err(failure), _) => {
+                        let route_identity = failed_route_identity;
+                        match route_identity {
+                            Some(route_identity) => (
+                                None,
+                                Some(failure.message().to_string()),
+                                Some(failure.kind()),
+                                failure.deadline_us(),
+                                backend.as_str().to_string(),
+                                backend.trusted(),
+                                Vec::new(),
+                                0,
+                                0.0,
+                                false,
+                                Some(route_identity),
+                            ),
+                            None => (
+                                None,
+                                Some("route changed during native transport probe".to_string()),
+                                Some(transport_probe::TransportProbeFailureKind::Other),
+                                None,
+                                backend.as_str().to_string(),
+                                false,
+                                Vec::new(),
+                                0,
+                                0.0,
+                                false,
+                                None,
+                            ),
+                        }
+                    }
                 };
                 #[cfg(feature = "calibration")]
                 let completed_at = Instant::now();
@@ -3979,7 +4027,7 @@ impl TransportProbeRuntime {
                         failure_kind: _failure_kind,
                         #[cfg(feature = "calibration")]
                         failure_deadline_us: _failure_deadline_us,
-                        route_identity: stable_identity,
+                        route_identity: result_route_identity,
                         backend: backend_name,
                         trusted,
                         raw_samples_ms,
@@ -4922,6 +4970,11 @@ struct Controller {
     sqm_last_recovery_at: Option<f64>,
     sqm_recovery_gate: operations::sqm_recovery::SqmRecoveryGate,
     runtime_override_active: bool,
+    /// A durable calibration owner is live even before a temporary topology
+    /// is applied. Holding ordinary controller writes while the driver waits
+    /// for its first control closes the permit-to-idle-capture rate race
+    /// without changing the managed qdisc merely to freeze it.
+    runtime_operation_active: bool,
     #[cfg(feature = "calibration")]
     autotune_capture_request: Option<operations::full_autotune::AutotuneCaptureRequest>,
     #[cfg(feature = "calibration")]
@@ -4993,6 +5046,22 @@ fn rating_capture_request_is_admissible(
 }
 
 impl Controller {
+    fn runtime_rate_control_suspended(&self) -> bool {
+        self.runtime_override_active || self.runtime_operation_active
+    }
+
+    fn remember_attested_cake_rates(
+        &mut self,
+        snapshot: &operations::autotune_runtime::RuntimeSnapshot,
+    ) {
+        if let Some(rate) = snapshot.download_kbps {
+            self.last_set_dl = rate;
+        }
+        if let Some(rate) = snapshot.upload_kbps {
+            self.last_set_ul = rate;
+        }
+    }
+
     fn new(mut cfg: Config) -> Result<Self, String> {
         ensure_run_dir(&cfg.run_dir())
             .map_err(|e| format!("failed to create run directory: {e}"))?;
@@ -5154,6 +5223,7 @@ impl Controller {
             sqm_last_recovery_at: None,
             sqm_recovery_gate: operations::sqm_recovery::SqmRecoveryGate::default(),
             runtime_override_active: false,
+            runtime_operation_active: false,
             #[cfg(feature = "calibration")]
             autotune_capture_request: None,
             #[cfg(feature = "calibration")]
@@ -5478,7 +5548,7 @@ impl Controller {
         use operations::sqm_recovery::SqmRecoveryAdmission;
 
         #[cfg(feature = "calibration")]
-        if self.runtime_override_active {
+        if self.runtime_rate_control_suspended() {
             self.set_sqm_runtime_status(
                 "WAITING_OPERATION",
                 true,
@@ -5857,6 +5927,7 @@ impl Controller {
                         cpu_samples: 0,
                         idle_median_us: None,
                         idle_p95_us: None,
+                        idle_transport_baseline_us: None,
                         icmp_delta_us: None,
                         transport_delta_us: None,
                         loss_ppm: None,
@@ -6045,16 +6116,60 @@ impl Controller {
             }
         }
         .map_err(|error| ("capture-runtime-mismatch", error))?;
+        let (authorized_download_kind, authorized_upload_kind) = match request.phase {
+            operations::full_autotune::AutotuneCapturePhase::IdleBaseline => {
+                (permit.download_qdisc_kind, permit.upload_qdisc_kind)
+            }
+            operations::full_autotune::AutotuneCapturePhase::LoadedMeasurement => (
+                operations::autotune_runtime::RuntimeQdiscKind::Cake,
+                operations::autotune_runtime::RuntimeQdiscKind::Cake,
+            ),
+        };
+        let expected_download_qdisc_kind =
+            request.candidate_dl_kbps.map(|_| authorized_download_kind);
+        let expected_upload_qdisc_kind = request.candidate_ul_kbps.map(|_| authorized_upload_kind);
+        if actual.download_qdisc_kind != expected_download_qdisc_kind
+            || actual.upload_qdisc_kind != expected_upload_qdisc_kind
+        {
+            return Err((
+                "capture-runtime-mismatch",
+                "native Auto-Tune capture qdisc kind differs from its runtime permit".to_string(),
+            ));
+        }
         if actual.target_interface != expected.target_interface
             || actual.route_fingerprint != expected.route_fingerprint
             || actual.sqm_fingerprint != expected.sqm_fingerprint
             || actual.topology != expected.topology
-            || actual.download_kbps != expected.download_kbps
-            || actual.upload_kbps != expected.upload_kbps
         {
             return Err((
                 "capture-runtime-mismatch",
                 "native Auto-Tune capture runtime differs from its requested topology".to_string(),
+            ));
+        }
+        if actual.download_kbps != expected.download_kbps
+            || actual.upload_kbps != expected.upload_kbps
+        {
+            let code =
+                if request.phase == operations::full_autotune::AutotuneCapturePhase::IdleBaseline {
+                    // `attest_rate_only_runtime` has refreshed the applied-rate
+                    // cache from this exact tc read.  Publish it immediately so
+                    // the worker's event-driven retry cannot reuse the stale
+                    // candidate merely because the ordinary status cadence has
+                    // not elapsed yet.
+                    let _ = self.refresh_status_from_last_sample();
+                    "capture-rate-drift"
+                } else {
+                    "capture-runtime-mismatch"
+                };
+            return Err((
+                code,
+                format!(
+                    "native Auto-Tune capture rate drifted (requested dl={:?}, ul={:?}; live dl={:?}, ul={:?})",
+                    expected.download_kbps,
+                    expected.upload_kbps,
+                    actual.download_kbps,
+                    actual.upload_kbps
+                ),
             ));
         }
         Ok((permit.initial_download_kbps, permit.initial_upload_kbps))
@@ -6219,7 +6334,6 @@ impl Controller {
     fn observe_autotune_transport(
         &mut self,
         latency_ms: f64,
-        baseline_ms: Option<f64>,
         download_loaded: bool,
         upload_loaded: bool,
     ) {
@@ -6229,7 +6343,6 @@ impl Controller {
         match operations::autotune_capture::transport_observation_kind(
             &request,
             latency_ms,
-            baseline_ms,
             download_loaded,
             upload_loaded,
         ) {
@@ -6359,12 +6472,10 @@ impl Controller {
         #[cfg(feature = "calibration")]
         {
             let active_capture = self.active_autotune_observation_request();
-            let baseline_ms = self.transport_latency.snapshot(now, true).baseline_ms;
             match censored_autotune_transport_observation(
                 &result,
                 active_capture.as_ref(),
                 self.route_identity.as_deref(),
-                baseline_ms,
             ) {
                 Ok(Some(kind)) => {
                     self.record_autotune_observation(active_capture.as_ref().unwrap(), kind)
@@ -6468,14 +6579,8 @@ impl Controller {
         };
         #[cfg(feature = "calibration")]
         if controller_phase_valid && autotune_capture_matches {
-            let baseline_ms = self.transport_latency.snapshot(now, true).baseline_ms;
             for sample_ms in samples.iter().copied() {
-                self.observe_autotune_transport(
-                    sample_ms,
-                    baseline_ms,
-                    result.dl_loaded,
-                    result.ul_loaded,
-                );
+                self.observe_autotune_transport(sample_ms, result.dl_loaded, result.ul_loaded);
             }
         }
         if self
@@ -6581,7 +6686,7 @@ impl Controller {
             .map(|status| (status.avg_dl_delta, status.avg_ul_delta))
             .unwrap_or((0.0, 0.0));
         let controller_enabled =
-            self.cfg.transport_controller_enabled && !self.runtime_override_active;
+            self.cfg.transport_controller_enabled && !self.runtime_rate_control_suspended();
         let target_ms = self.cfg.quality_target_delay_ms;
         if let Some(dl_delta_ms) = confirmed_dl_delta {
             self.quality_dl_class = classify_quality(Some(effective_latency_delta_ms(
@@ -7035,6 +7140,18 @@ impl Controller {
         let ul_bb = ul_delay_count >= self.cfg.bufferbloat_detection_thr;
         let avg_dl_delta = average(&self.dl_delta_us);
         let avg_ul_delta = average(&self.ul_delta_us);
+        let rating_flags = self.rating_load_snapshot.phase.direction_flags();
+        if rating_flags.0 || rating_flags.1 {
+            let grade_route = self.quality_grade_route_key();
+            self.quality_grade.observe_icmp_delta(
+                dl_delta_us / 1_000.0,
+                ul_delta_us / 1_000.0,
+                rating_flags.0,
+                rating_flags.1,
+                epoch_secs(),
+                &grade_route,
+            );
+        }
         let high_load_pct = self.cfg.high_load_thr * 100.0;
         let dl_kind = classify_load(
             dl_load_pct,
@@ -7068,7 +7185,7 @@ impl Controller {
             && transport_delta_ms
                 .map(|delta| delta > self.cfg.quality_target_delay_ms)
                 .unwrap_or(false);
-        if !self.runtime_override_active {
+        if !self.runtime_rate_control_suspended() {
             self.update_direction(true, dl_kind, dl_bb, avg_dl_delta, transport_clean, now);
             self.update_direction(false, ul_kind, ul_bb, avg_ul_delta, transport_clean, now);
             self.update_adaptive_ceilings(
@@ -7576,7 +7693,7 @@ impl Controller {
     }
 
     fn apply_shaper(&mut self, direction: &str) {
-        if self.runtime_override_active {
+        if self.runtime_rate_control_suspended() {
             return;
         }
         let is_dl = direction == "dl";
@@ -7775,12 +7892,12 @@ impl Controller {
             .snapshot(adaptive_now, self.cfg.transport_latency_enabled);
         let effective_delta_ms =
             effective_latency_delta_ms(avg_dl_delta, avg_ul_delta, transport.delta_ms);
-        let quality_class = if transport.confirmed {
+        let controller_quality_class = if transport.confirmed {
             classify_quality(Some(effective_delta_ms))
         } else {
             QualityClass::Learning
         };
-        let quality_reason = if !self.cfg.transport_controller_enabled {
+        let controller_quality_reason = if !self.cfg.transport_controller_enabled {
             "detected_only_controller_disabled"
         } else if self.quality_search_dl.limited() {
             self.quality_search_dl.last_reason()
@@ -7792,16 +7909,38 @@ impl Controller {
             transport.status
         };
         let quality_grade = self.quality_grade.snapshot(epoch_secs());
-        let reported_cake_dl = if self.cfg.download_shaping_enabled() {
-            self.shaper_dl
+        let (quality_class, quality_dl_class, quality_ul_class) =
+            quality_grade.authoritative_classes();
+        let quality_reason = if quality_grade.authoritative_complete_result().is_some() {
+            "complete_direction_bound_icmp_and_transport"
+        } else if quality_grade.last_known_stale {
+            "last_complete_rating_route_stale"
+        } else if quality_grade
+            .current
+            .as_ref()
+            .map(|result| result.partial)
+            .unwrap_or(false)
+        {
+            "partial_directional_rating"
+        } else if quality_grade
+            .current
+            .as_ref()
+            .map(|result| result.incomplete)
+            .unwrap_or(false)
+        {
+            "incomplete_directional_rating"
         } else {
-            0.0
+            quality_grade.state
         };
-        let reported_cake_ul = if self.cfg.upload_shaping_enabled() {
-            self.shaper_ul
-        } else {
-            0.0
-        };
+        // `shaper_*` is controller intent and can be fractional or newer than
+        // the coalesced tc write.  Status and calibration must expose the last
+        // successfully applied integer CAKE rate instead.  The idle capture
+        // handshake still reads tc back and proves that this candidate is the
+        // live qdisc rate before collecting any measurement evidence.
+        let reported_cake_dl =
+            published_applied_cake_rate_kbps(self.cfg.download_shaping_enabled(), self.last_set_dl);
+        let reported_cake_ul =
+            published_applied_cake_rate_kbps(self.cfg.upload_shaping_enabled(), self.last_set_ul);
         let mut file = File::create(&tmp)?;
         writeln!(
             file,
@@ -7865,7 +8004,7 @@ impl Controller {
         file.seek(SeekFrom::End(-2))?;
         writeln!(
             file,
-            ",\"transport_latency_enabled\":{},\"transport_controller_enabled\":{},\"transport_probe_method\":\"network_rtt_v3\",\"transport_probe_backend\":\"{}\",\"transport_probe_trusted\":{},\"transport_probe_raw_samples\":{},\"transport_probe_discarded_samples\":{},\"transport_probe_server_processing_ms\":{:.3},\"transport_probe_connection_reused\":{},\"transport_probe_rejected_reason\":{},\"transport_probe_last_rejected_reason\":{},\"transport_probe_last_rejected_at\":{},\"transport_status\":\"{}\",\"transport_endpoint\":{},\"transport_latency_ms\":{},\"transport_baseline_ms\":{},\"transport_delta_ms\":{},\"transport_sample_age_s\":{},\"transport_confidence\":{},\"transport_successful_samples\":{},\"transport_failed_samples\":{},\"transport_last_error\":{},\"effective_latency_delta_ms\":{:.3},\"quality_estimated\":true,\"quality_class\":\"{}\",\"quality_dl_class\":\"{}\",\"quality_ul_class\":\"{}\",\"quality_confidence\":{},\"quality_reason\":\"{}\",\"throughput_guard_enabled\":{},\"throughput_floor_dl_kbps\":{:.0},\"throughput_floor_ul_kbps\":{:.0},\"quality_limited\":{},\"quality_limited_dl\":{},\"quality_limited_ul\":{}}}",
+            ",\"transport_latency_enabled\":{},\"transport_controller_enabled\":{},\"transport_probe_method\":\"network_rtt_v3\",\"transport_probe_backend\":\"{}\",\"transport_probe_trusted\":{},\"transport_probe_raw_samples\":{},\"transport_probe_discarded_samples\":{},\"transport_probe_server_processing_ms\":{:.3},\"transport_probe_connection_reused\":{},\"transport_probe_rejected_reason\":{},\"transport_probe_last_rejected_reason\":{},\"transport_probe_last_rejected_at\":{},\"transport_status\":\"{}\",\"transport_endpoint\":{},\"transport_latency_ms\":{},\"transport_baseline_ms\":{},\"transport_delta_ms\":{},\"transport_sample_age_s\":{},\"transport_confidence\":{},\"transport_successful_samples\":{},\"transport_failed_samples\":{},\"transport_last_error\":{},\"effective_latency_delta_ms\":{:.3},\"quality_estimated\":false,\"quality_class\":\"{}\",\"quality_dl_class\":\"{}\",\"quality_ul_class\":\"{}\",\"quality_confidence\":{},\"quality_reason\":\"{}\",\"quality_controller_class\":\"{}\",\"quality_controller_dl_class\":\"{}\",\"quality_controller_ul_class\":\"{}\",\"quality_controller_confidence\":{},\"quality_controller_reason\":\"{}\",\"throughput_guard_enabled\":{},\"throughput_floor_dl_kbps\":{:.0},\"throughput_floor_ul_kbps\":{:.0},\"quality_limited\":{},\"quality_limited_dl\":{},\"quality_limited_ul\":{}}}",
             self.cfg.transport_latency_enabled,
             self.cfg.transport_controller_enabled,
             json_escape(&self.transport_backend),
@@ -7889,10 +8028,19 @@ impl Controller {
             json_string_or_null(transport.last_error.as_deref()),
             effective_delta_ms,
             quality_class.as_str(),
+            quality_dl_class.as_str(),
+            quality_ul_class.as_str(),
+            if quality_grade.authoritative_complete_result().is_some() {
+                100
+            } else {
+                0
+            },
+            json_escape(quality_reason),
+            controller_quality_class.as_str(),
             self.quality_dl_class.as_str(),
             self.quality_ul_class.as_str(),
             transport.confidence,
-            json_escape(quality_reason),
+            json_escape(controller_quality_reason),
             self.cfg.transport_controller_enabled && self.cfg.throughput_guard_enabled,
             self.throughput_floor_dl,
             self.throughput_floor_ul,
@@ -7903,7 +8051,8 @@ impl Controller {
         file.seek(SeekFrom::End(-2))?;
         write!(
             file,
-            ",\"quality_grade_method\":\"transport_rtt_p90_loaded_minus_p5_idle_v4\",\"quality_grade_state\":\"{}\",\"quality_grade_collected_samples\":{},\"quality_grade_required_samples\":{},\"quality_grade_baseline_ready\":{},\"quality_grade_baseline_samples\":{},\"quality_grade_baseline_required_samples\":{},\"quality_grade_dl_samples\":{},\"quality_grade_ul_samples\":{},\"quality_grade_bidirectional_samples\":{},\"quality_grade_finalize_remaining_s\":{},\"quality_grade_current\":{},\"quality_grade_last_known\":{},\"rating_load_phase\":\"{}\",\"rating_load_candidate\":\"{}\",\"rating_load_raw_dl_percent\":{:.3},\"rating_load_raw_ul_percent\":{:.3},\"rating_load_smoothed_dl_percent\":{:.3},\"rating_load_smoothed_ul_percent\":{:.3},\"rating_load_aggregate_dl_kbps\":{:.3},\"rating_load_aggregate_ul_kbps\":{:.3},\"rating_load_effective_dl_kbps\":{:.3},\"rating_load_effective_ul_kbps\":{:.3},\"rating_load_reference_dl_kbps\":{:.3},\"rating_load_reference_ul_kbps\":{:.3},\"rating_load_enter_percent\":{:.3},\"rating_load_exit_percent\":{:.3},\"rating_load_enter_dl_percent\":{:.3},\"rating_load_enter_ul_percent\":{:.3},\"rating_load_exit_dl_percent\":{:.3},\"rating_load_exit_ul_percent\":{:.3},\"rating_load_enter_dl_kbps\":{:.3},\"rating_load_enter_ul_kbps\":{:.3},\"rating_load_phase_age_s\":{:.3},\"rating_capture_active\":{},\"rating_capture_mode\":\"{}\",\"rating_capture_requested_phase\":\"{}\",\"rating_capture_background_dl_kbps\":{:.3},\"rating_capture_background_ul_kbps\":{:.3},\"rating_capture_peak_dl_percent\":{:.3},\"rating_capture_peak_ul_percent\":{:.3},\"rating_capture_contaminated\":{},\"rating_capture_contamination_reason\":\"{}\",\"graph_history_enabled\":{},\"graph_history_budget_mode\":\"{}\",\"graph_history_configured_budget_kib\":{},\"graph_history_safe_max_kib\":{},\"graph_history_effective_total_kib\":{},\"graph_history_instance_budget_kib\":{},\"graph_history_used_total_kib\":{},\"graph_history_used_instance_kib\":{},\"graph_history_stored_samples\":{},\"graph_history_instances\":{},\"graph_history_mem_total_kib\":{},\"graph_history_mem_available_kib\":{},\"graph_history_paused_low_memory\":{}",
+            ",\"quality_grade_method\":\"{}\",\"quality_grade_state\":\"{}\",\"quality_grade_collected_samples\":{},\"quality_grade_required_samples\":{},\"quality_grade_baseline_ready\":{},\"quality_grade_baseline_samples\":{},\"quality_grade_baseline_required_samples\":{},\"quality_grade_dl_samples\":{},\"quality_grade_ul_samples\":{},\"quality_grade_bidirectional_samples\":{},\"quality_grade_finalize_remaining_s\":{},\"quality_grade_current\":{},\"quality_grade_last_known\":{},\"rating_load_phase\":\"{}\",\"rating_load_candidate\":\"{}\",\"rating_load_raw_dl_percent\":{:.3},\"rating_load_raw_ul_percent\":{:.3},\"rating_load_smoothed_dl_percent\":{:.3},\"rating_load_smoothed_ul_percent\":{:.3},\"rating_load_aggregate_dl_kbps\":{:.3},\"rating_load_aggregate_ul_kbps\":{:.3},\"rating_load_effective_dl_kbps\":{:.3},\"rating_load_effective_ul_kbps\":{:.3},\"rating_load_reference_dl_kbps\":{:.3},\"rating_load_reference_ul_kbps\":{:.3},\"rating_load_enter_percent\":{:.3},\"rating_load_exit_percent\":{:.3},\"rating_load_enter_dl_percent\":{:.3},\"rating_load_enter_ul_percent\":{:.3},\"rating_load_exit_dl_percent\":{:.3},\"rating_load_exit_ul_percent\":{:.3},\"rating_load_enter_dl_kbps\":{:.3},\"rating_load_enter_ul_kbps\":{:.3},\"rating_load_phase_age_s\":{:.3},\"rating_capture_active\":{},\"rating_capture_mode\":\"{}\",\"rating_capture_requested_phase\":\"{}\",\"rating_capture_background_dl_kbps\":{:.3},\"rating_capture_background_ul_kbps\":{:.3},\"rating_capture_peak_dl_percent\":{:.3},\"rating_capture_peak_ul_percent\":{:.3},\"rating_capture_contaminated\":{},\"rating_capture_contamination_reason\":\"{}\",\"graph_history_enabled\":{},\"graph_history_budget_mode\":\"{}\",\"graph_history_configured_budget_kib\":{},\"graph_history_safe_max_kib\":{},\"graph_history_effective_total_kib\":{},\"graph_history_instance_budget_kib\":{},\"graph_history_used_total_kib\":{},\"graph_history_used_instance_kib\":{},\"graph_history_stored_samples\":{},\"graph_history_instances\":{},\"graph_history_mem_total_kib\":{},\"graph_history_mem_available_kib\":{},\"graph_history_paused_low_memory\":{}",
+            quality_grade::QUALITY_GRADE_METHOD,
             json_escape(quality_grade.state),
             quality_grade.collected_samples,
             quality_grade.required_samples,
@@ -8074,7 +8223,11 @@ impl Controller {
                 .or(quality_grade.current.as_ref());
             let current_rating =
                 runtime_rating.map(|current| operations::rating::RatingResultSnapshot {
-                    grade: current.class.as_str().to_string(),
+                    grade: if current.partial || current.incomplete {
+                        QualityClass::Learning.as_str().to_string()
+                    } else {
+                        current.class.as_str().to_string()
+                    },
                     increase_ms: current.increase_ms,
                     started_unix_ms: (current.started_at.max(0.0) * 1000.0).round() as u64,
                     partial: current.partial,
@@ -8107,6 +8260,8 @@ impl Controller {
                 baseline_samples: quality_grade.baseline_samples as u64,
                 baseline_required_samples: quality_grade.baseline_required_samples as u64,
                 required_samples: quality_grade.required_samples as u64,
+                evidence_contract:
+                    operations::rating::RatingEvidenceContract::WorstOfDirectionBoundIcmpAndTransport,
                 dl_samples: quality_grade.dl_samples as u64,
                 ul_samples: quality_grade.ul_samples as u64,
                 dl_achieved_kbps: dl_rate,
@@ -8324,7 +8479,7 @@ fn attest_rate_only_runtime(
         controller.ul_qdisc_kind = None;
         None
     };
-    Ok(operations::autotune_runtime::RuntimeSnapshot {
+    let snapshot = operations::autotune_runtime::RuntimeSnapshot {
         target_interface: controller.cfg.sqm_interface.clone(),
         route_fingerprint: expected.route_fingerprint.clone(),
         sqm_fingerprint: expected.sqm_fingerprint.clone(),
@@ -8333,7 +8488,14 @@ fn attest_rate_only_runtime(
         upload_kbps,
         download_qdisc_kind: controller.dl_qdisc_kind.map(Into::into),
         upload_qdisc_kind: controller.ul_qdisc_kind.map(Into::into),
-    })
+    };
+    // The desired controller rate deliberately remains unchanged: once a
+    // calibration owner releases the hold, ordinary control may still apply
+    // its newer target.  Only refresh the cache that describes the qdisc rate
+    // most recently proven by tc.  This makes a rate-drift retry converge
+    // without turning an observation into a controller decision.
+    controller.remember_attested_cake_rates(&snapshot);
+    Ok(snapshot)
 }
 
 #[cfg(feature = "calibration")]
@@ -9724,6 +9886,25 @@ fn bounded_operation_capture_active(
     autotune_capture_active || rating_capture_active
 }
 
+#[cfg(feature = "calibration")]
+fn transport_probe_runtime_required(
+    configured: bool,
+    autotune_capture_published: bool,
+    rating_capture_active: bool,
+) -> bool {
+    configured || autotune_capture_published || rating_capture_active
+}
+
+#[cfg(feature = "calibration")]
+fn runtime_driver_holds_controller(
+    result: &Result<operations::autotune_runtime_driver::RuntimeDriverOutcome, String>,
+) -> bool {
+    !matches!(
+        result,
+        Ok(operations::autotune_runtime_driver::RuntimeDriverOutcome::Idle)
+    )
+}
+
 fn idle_sleep_due(
     enable_sleep_function: bool,
     uplink_learning: bool,
@@ -9884,9 +10065,14 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                 controller: &mut controller,
                 boot_ms,
             };
-            match runtime_override_driver.poll(&mut actuator) {
+            let runtime_poll = runtime_override_driver.poll(&mut actuator);
+            controller.runtime_operation_active = runtime_driver_holds_controller(&runtime_poll);
+            match runtime_poll {
                 Ok(_) => last_runtime_override_error = None,
                 Err(error) => {
+                    // An unreadable runtime owner is not proof that ordinary
+                    // control may resume. The helper above keeps writes held
+                    // until a later successful poll proves exact Idle state.
                     if last_runtime_override_error.as_deref() != Some(error.as_str()) {
                         controller.log(
                             "ERROR",
@@ -10124,6 +10310,24 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
         } else {
             controller.rating_load_snapshot.clone()
         };
+        #[cfg(feature = "calibration")]
+        {
+            // Rating and Full Auto-Tune require direction-bound transport
+            // evidence even when continuous transport monitoring is disabled.
+            // Own the probe runtime only for the exact published capture and
+            // drop it again after cleanup; this never changes UCI or enables
+            // the ordinary transport controller.
+            let required = transport_probe_runtime_required(
+                cfg.transport_latency_enabled,
+                controller.autotune_capture_request.is_some(),
+                rating_load.capture_active,
+            );
+            if required && transport_probe.is_none() {
+                transport_probe = Some(TransportProbeRuntime::spawn(&cfg));
+            } else if !required && transport_probe.is_some() {
+                transport_probe = None;
+            }
+        }
         #[cfg(feature = "calibration")]
         if let Some(runtime) = transport_probe.as_mut() {
             let capture_control = controller.autotune_capture_control_request();
@@ -11846,11 +12050,24 @@ fn quality_grade_metric_json(metric: Option<&QualityGradeMetric>) -> String {
         return "null".to_string();
     };
     format!(
-        "{{\"grade\":\"{}\",\"increase_ms\":{:.3},\"loaded_p90_ms\":{:.3},\"samples\":{}}}",
+        concat!(
+            "{{\"grade\":\"{}\",\"increase_ms\":{:.3},",
+            "\"loaded_p90_ms\":{:.3},\"samples\":{},",
+            "\"evidence_source\":\"{}\",",
+            "\"icmp_basis\":\"controller_reflector_adaptive_baseline\",",
+            "\"transport_basis\":\"endpoint_loaded_p90_minus_idle_p5\",",
+            "\"icmp_increase_ms\":{:.3},\"transport_increase_ms\":{:.3},",
+            "\"icmp_samples\":{},\"transport_samples\":{}}}"
+        ),
         metric.class.as_str(),
         metric.increase_ms,
         metric.loaded_p90_ms,
         metric.samples,
+        metric.evidence_source,
+        metric.icmp_increase_ms,
+        metric.transport_increase_ms,
+        metric.icmp_samples,
+        metric.transport_samples,
     )
 }
 
@@ -11858,9 +12075,14 @@ fn quality_grade_result_json(result: Option<&QualityGradeResult>, stale: bool) -
     let Some(result) = result else {
         return "null".to_string();
     };
+    let published_class = if result.partial || result.incomplete {
+        QualityClass::Learning
+    } else {
+        result.class
+    };
     format!(
         "{{\"grade\":\"{}\",\"increase_ms\":{:.3},\"baseline_p5_ms\":{:.3},\"endpoint\":\"{}\",\"started_at\":{:.3},\"completed_at\":{},\"route_identity\":\"{}\",\"partial\":{},\"incomplete\":{},\"completion_reason\":\"{}\",\"stale\":{},\"samples\":{},\"dl_samples\":{},\"ul_samples\":{},\"bidirectional_samples\":{},\"dl\":{},\"ul\":{},\"bidirectional\":{}}}",
-        result.class.as_str(),
+        published_class.as_str(),
         result.increase_ms,
         result.baseline_p5_ms,
         json_escape(&result.endpoint),
@@ -12165,7 +12387,7 @@ fn print_calibration_usage() {
     eprintln!("{CALIBRATIONCTL_SCHEDULER_STATUS_USAGE}");
     eprintln!("       cake-autorated --calibrationctl [--state-dir RAM_PATH] autotune-inspect OPTIONS | autotune-start OPTIONS | autotune-bootstrap-start SQM_SECTION OPTIONS | autotune-status JOB_ID | autotune-result JOB_ID | autotune-cancel JOB_ID");
     eprintln!("       cake-autorated --bootstrap-runtime-owner --request PATH --runtime-dir PATH --worker-run-id HEX");
-    eprintln!("       cake-autorated --calibrationctl [--state-dir RAM_PATH] rating-start OPTIONS | rating-current INSTANCE | rating-status JOB_ID | rating-result JOB_ID | rating-cancel JOB_ID");
+    eprintln!("       cake-autorated --calibrationctl [--state-dir RAM_PATH] autotune-current INSTANCE | rating-start OPTIONS | rating-current INSTANCE | rating-status JOB_ID | rating-result JOB_ID | rating-cancel JOB_ID");
     eprintln!("       cake-autorated --calibrationctl [--state-dir RAM_PATH] speedtest-start OPTIONS | speedtest-current INSTANCE | speedtest-status JOB_ID | speedtest-result JOB_ID | speedtest-cancel JOB_ID");
     eprintln!("       cake-autorated --calibrationctl [--state-dir RAM_PATH] autotune-apply-check JOB_ID [OPTION_ID]");
     eprintln!("       cake-autorated --calibrationctl [--state-dir RAM_PATH] autotune-apply JOB_ID OPTION_ID REVIEW_SHA256 MANIFEST_SHA256 [--ack CODE]...");
@@ -13191,6 +13413,7 @@ fn main() {
 
 #[cfg(all(test, feature = "calibration"))]
 mod tests {
+    use super::routing::RouteIdentity;
     use super::{
         adaptive_capacity_status_json, attest_cake_direction, attest_download_redirect,
         attest_exclusive_sqm_ingress, autotune, autotune_capture_attestation_lease_valid,
@@ -13208,25 +13431,27 @@ mod tests {
         parse_private_root_output, parse_rate_samples, parse_reflector_candidates,
         parse_strict_bool, parse_tc_bandwidth_kbps, parse_tc_linklayer_overhead, parse_tsping_line,
         parse_uci_values, pinger_command, pinger_line_is_timeout, pinger_response_interval_s,
-        private_cake_args, probe_loop_required, published_runtime_qdisc_kind,
-        qdisc_output_has_cake, rate_sample_is_recent, rating_capture_request_is_admissible,
-        reflector_bad_reflectors, reflector_health_json, reflector_spare_reflectors,
+        private_cake_args, probe_loop_required, published_applied_cake_rate_kbps,
+        published_runtime_qdisc_kind, qdisc_output_has_cake, quality_grade_result_json,
+        rate_sample_is_recent, rating_capture_request_is_admissible, reflector_bad_reflectors,
+        reflector_health_json, reflector_spare_reflectors,
         reject_autotune_capture_after_io_with_clock, root_cake_bandwidth_kbps, root_cake_qdisc,
-        run, run_autotune_proposal_cli, run_sqm_helper, sample_is_stale,
-        select_autotune_capture_rates, shaper_update_due, stall_detection_timeout,
+        run, run_autotune_proposal_cli, run_sqm_helper, runtime_driver_holds_controller,
+        sample_is_stale, select_autotune_capture_rates, shaper_update_due, stall_detection_timeout,
         status_publish_due, stop_managed_sqm_with, throughput_floor, transport_error_code,
         transport_probe_control_allows_start, transport_probe_interval_s,
+        transport_probe_route_identities, transport_probe_runtime_required,
         transport_result_matches_route, uplink_error_code, validated_conservative_samples,
         wait_for_runtime_topology, AdaptiveCapacityStatusContext, AdaptiveCeilingDirection,
         AutotuneSpeedtestRateMonitor, AutotuneTransportCaptureKey, AutotuneTransportControl,
         AutotuneTransportFlight, AutotuneTransportReadiness, AutotuneTransportSettlement,
         CakeQdiscKind, Config, Controller, MemoryInfo, PrivateIngressState, PrivateRootState,
-        RateMonitor, RateSample, ReflectorHealth, ReflectorState, Sample,
+        RateMonitor, RateSample, ReflectorHealth, ReflectorState, RouteSnapshot, Sample,
         SpeedtestCounterRateMonitor, SqmRecoveryError, SqmTopologyErrorKind, ThroughputGuardInput,
-        TransportProbeResult, UplinkState, AUTOTUNE_CAPTURE_ATTESTATION_MAX_AGE,
-        CAKE_GROWTH_UPDATE_MIN_INTERVAL, CALIBRATIONCTL_SCHEDULER_STATUS_USAGE,
-        CALIBRATION_CAPABILITIES_V3, STATUS_PUBLISH_INTERVAL, TERMINATE,
-        TRANSPORT_BASELINE_LEARNING_INTERVAL_S,
+        TransportLatencyTracker, TransportProbeResult, UplinkState,
+        AUTOTUNE_CAPTURE_ATTESTATION_MAX_AGE, CAKE_GROWTH_UPDATE_MIN_INTERVAL,
+        CALIBRATIONCTL_SCHEDULER_STATUS_USAGE, CALIBRATION_CAPABILITIES_V3,
+        STATUS_PUBLISH_INTERVAL, TERMINATE, TRANSPORT_BASELINE_LEARNING_INTERVAL_S,
     };
     use std::env;
     use std::fs;
@@ -13244,6 +13469,46 @@ mod tests {
         assert!(CALIBRATIONCTL_SCHEDULER_STATUS_USAGE.ends_with(" scheduler-status"));
         assert!(!CALIBRATIONCTL_SCHEDULER_STATUS_USAGE.contains("INSTANCE"));
         assert!(!CALIBRATIONCTL_SCHEDULER_STATUS_USAGE.ends_with(" *"));
+    }
+
+    #[test]
+    fn partial_directional_rating_json_masks_the_overall_grade() {
+        let upload = super::quality_grade::QualityGradeMetric {
+            class: super::transport_quality::QualityClass::A,
+            increase_ms: 14.308,
+            loaded_p90_ms: 26.047,
+            samples: 28,
+            evidence_source: super::quality_grade::QUALITY_GRADE_EVIDENCE_SOURCE,
+            icmp_increase_ms: 12.0,
+            transport_increase_ms: 14.308,
+            icmp_samples: 28,
+            transport_samples: 28,
+        };
+        let partial = super::quality_grade::QualityGradeResult {
+            class: super::transport_quality::QualityClass::A,
+            increase_ms: 14.308,
+            baseline_p5_ms: 11.739,
+            endpoint: "test-endpoint".to_string(),
+            started_at: 1.0,
+            completed_at: Some(2.0),
+            route_identity: "route-a".to_string(),
+            partial: true,
+            incomplete: false,
+            dl_samples: 0,
+            ul_samples: 28,
+            bidirectional_samples: 0,
+            completion_reason: "download_incomplete".to_string(),
+            capture_job_id: String::new(),
+            capture_generation: 0,
+            dl: None,
+            ul: Some(upload),
+            bidirectional: None,
+        };
+        let json = quality_grade_result_json(Some(&partial), false);
+        assert!(json.contains("\"grade\":\"LEARNING\""));
+        assert!(json.contains("\"partial\":true"));
+        assert!(json.contains("\"completion_reason\":\"download_incomplete\""));
+        assert!(json.contains("\"ul\":{\"grade\":\"A\""));
     }
 
     #[test]
@@ -13543,6 +13808,29 @@ mod tests {
             false, false, false, false, timeout, timeout
         ));
         assert!(idle_wake_due(false, true, true));
+        assert!(!transport_probe_runtime_required(false, false, false));
+        assert!(transport_probe_runtime_required(true, false, false));
+        assert!(transport_probe_runtime_required(false, true, false));
+        assert!(transport_probe_runtime_required(false, false, true));
+        assert!(transport_probe_runtime_required(false, true, true));
+        use crate::operations::autotune_runtime_driver::RuntimeDriverOutcome;
+        assert!(!runtime_driver_holds_controller(&Ok(
+            RuntimeDriverOutcome::Idle
+        )));
+        for outcome in [
+            RuntimeDriverOutcome::PermitAwaitingControl,
+            RuntimeDriverOutcome::Applying,
+            RuntimeDriverOutcome::Applied,
+            RuntimeDriverOutcome::Restoring,
+            RuntimeDriverOutcome::Restored,
+            RuntimeDriverOutcome::Rejected,
+            RuntimeDriverOutcome::UnsafeRecoveryRequired,
+        ] {
+            assert!(runtime_driver_holds_controller(&Ok(outcome)));
+        }
+        assert!(runtime_driver_holds_controller(&Err(
+            "unreadable runtime owner".to_string()
+        )));
         assert!(idle_wake_due(true, false, true));
         assert!(!idle_wake_due(false, true, false));
         assert!(!idle_wake_due(false, false, true));
@@ -13783,12 +14071,74 @@ mod tests {
     }
 
     #[test]
-    fn rejects_active_threshold_above_minimum_rates() {
+    fn rejects_active_threshold_above_active_download_minimum() {
         let mut cfg = Config::defaults("test".to_string());
         cfg.connection_active_thr_kbps = 6000.0;
+        cfg.min_dl_shaper_rate_kbps = 5000.0;
+        cfg.min_ul_shaper_rate_kbps = 7000.0;
 
         let err = cfg.validate().expect_err("expected active threshold guard");
-        assert!(err.contains("connection_active_thr_kbps"));
+        assert!(err.contains("min_dl_shaper_rate_kbps"));
+    }
+
+    #[test]
+    fn rejects_active_threshold_above_active_upload_minimum() {
+        let mut cfg = Config::defaults("test".to_string());
+        cfg.connection_active_thr_kbps = 6000.0;
+        cfg.min_dl_shaper_rate_kbps = 7000.0;
+        cfg.min_ul_shaper_rate_kbps = 5000.0;
+
+        let err = cfg.validate().expect_err("expected active threshold guard");
+        assert!(err.contains("min_ul_shaper_rate_kbps"));
+    }
+
+    #[test]
+    fn upload_only_ignores_dormant_download_minimum_but_keeps_upload_guard() {
+        let mut cfg = Config::defaults("upload_only".to_string());
+        cfg.sqm_enabled = true;
+        cfg.sqm_direction_mode = "upload_only".to_string();
+        cfg.adjust_dl_shaper_rate = false;
+        cfg.adjust_ul_shaper_rate = true;
+        cfg.connection_active_thr_kbps = 7200.0;
+        cfg.min_dl_shaper_rate_kbps = 5000.0;
+        cfg.min_ul_shaper_rate_kbps = 25100.0;
+        assert!(cfg.validate().is_ok());
+
+        cfg.min_ul_shaper_rate_kbps = 7000.0;
+        let err = cfg
+            .validate()
+            .expect_err("active upload minimum must remain guarded");
+        assert!(err.contains("min_ul_shaper_rate_kbps"));
+    }
+
+    #[test]
+    fn download_only_ignores_dormant_upload_minimum_but_keeps_download_guard() {
+        let mut cfg = Config::defaults("download_only".to_string());
+        cfg.sqm_enabled = true;
+        cfg.sqm_direction_mode = "download_only".to_string();
+        cfg.adjust_dl_shaper_rate = true;
+        cfg.adjust_ul_shaper_rate = false;
+        cfg.connection_active_thr_kbps = 7200.0;
+        cfg.min_dl_shaper_rate_kbps = 25100.0;
+        cfg.min_ul_shaper_rate_kbps = 5000.0;
+        assert!(cfg.validate().is_ok());
+
+        cfg.min_dl_shaper_rate_kbps = 7000.0;
+        let err = cfg
+            .validate()
+            .expect_err("active download minimum must remain guarded");
+        assert!(err.contains("min_dl_shaper_rate_kbps"));
+    }
+
+    #[test]
+    fn inactive_rate_controllers_do_not_constrain_connection_threshold() {
+        let mut cfg = Config::defaults("manual".to_string());
+        cfg.adjust_dl_shaper_rate = false;
+        cfg.adjust_ul_shaper_rate = false;
+        cfg.connection_active_thr_kbps = 7200.0;
+        cfg.min_dl_shaper_rate_kbps = 5000.0;
+        cfg.min_ul_shaper_rate_kbps = 5000.0;
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
@@ -13871,6 +14221,51 @@ mod tests {
             Some("mwan3|wanb|eth0|192.0.2.101|0x200|2")
         ));
         assert!(!transport_result_matches_route(None, Some("main|||")));
+    }
+
+    #[test]
+    fn route_loss_preserves_only_negative_transport_identity() {
+        let snapshot = |online: bool, source_ip: &str| RouteSnapshot {
+            identity: RouteIdentity {
+                mode: "mwan3".to_string(),
+                member: "wan".to_string(),
+                device: "eth1".to_string(),
+                source_ip: source_ip.to_string(),
+                fwmark: "0x100".to_string(),
+                table: "1".to_string(),
+            },
+            online,
+            active: online,
+            member_status: if online { "online" } else { "offline" }.to_string(),
+            reason: String::new(),
+        };
+        let before = snapshot(true, "192.0.2.2");
+        let online = snapshot(true, "192.0.2.2");
+        let offline = snapshot(false, "192.0.2.2");
+        let changed = snapshot(false, "192.0.2.3");
+        let initially_offline = snapshot(false, "192.0.2.2");
+        let expected = Some(before.stable_key());
+
+        assert_eq!(
+            transport_probe_route_identities(Some(&before), Some(&online)),
+            (expected.clone(), expected.clone())
+        );
+        assert_eq!(
+            transport_probe_route_identities(Some(&before), Some(&offline)),
+            (None, expected)
+        );
+        assert_eq!(
+            transport_probe_route_identities(Some(&before), Some(&changed)),
+            (None, None)
+        );
+        assert_eq!(
+            transport_probe_route_identities(Some(&initially_offline), Some(&online)),
+            (None, None)
+        );
+        assert_eq!(
+            transport_probe_route_identities(Some(&before), None),
+            (None, None)
+        );
     }
 
     #[test]
@@ -14017,12 +14412,99 @@ mod tests {
             published_runtime_qdisc_kind(false, Some(CakeQdiscKind::CakeMq)),
             None
         );
+        assert_eq!(published_applied_cake_rate_kbps(true, 19_999), 19_999.0);
+        assert_eq!(published_applied_cake_rate_kbps(false, 19_999), 0.0);
         assert!(root_cake_bandwidth_kbps("qdisc noqueue 0: root refcnt 2").is_err());
         assert!(root_cake_bandwidth_kbps(
             "qdisc cake 1: root bandwidth 10Mbit\nqdisc cake 2: root bandwidth 20Mbit"
         )
         .is_err());
         assert!(parse_tc_bandwidth_kbps("NaNMbit").is_err());
+    }
+
+    #[test]
+    fn published_cake_rate_uses_applied_integer_not_fractional_controller_intent() {
+        let desired_controller_rate = 19_999.375;
+        let last_successfully_applied_rate = 20_000;
+
+        let published = published_applied_cake_rate_kbps(true, last_successfully_applied_rate);
+        assert_eq!(published, 20_000.0);
+        assert_ne!(published, desired_controller_rate);
+        assert_eq!(
+            published_applied_cake_rate_kbps(false, last_successfully_applied_rate),
+            0.0
+        );
+    }
+
+    #[test]
+    fn attested_rate_refresh_preserves_intent_and_publishes_live_integer() {
+        use crate::operations::autotune_runtime::{RuntimeQdiscKind, RuntimeSnapshot};
+        use crate::operations::full_autotune::MeasurementTopology;
+        use crate::operations::rating::RatingRuntimeSnapshot;
+
+        let _guard = HELPER_TEST_LOCK.lock().unwrap();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "cake-attested-rate-publication-{}-{unique}",
+            std::process::id()
+        ));
+        let counters = root.join("counters");
+        fs::create_dir_all(&counters).unwrap();
+        let rx = counters.join("rx_bytes");
+        let tx = counters.join("tx_bytes");
+        fs::write(&rx, "0\n").unwrap();
+        fs::write(&tx, "0\n").unwrap();
+
+        let previous_run_root = env::var_os("CAKE_AUTORATE_RUN_ROOT");
+        env::set_var("CAKE_AUTORATE_RUN_ROOT", root.join("run"));
+        let mut cfg = Config::defaults("attested_rate".to_string());
+        cfg.rx_bytes_path = rx.to_string_lossy().into_owned();
+        cfg.tx_bytes_path = tx.to_string_lossy().into_owned();
+        cfg.manage_sqm = true;
+        cfg.sqm_enabled = true;
+        cfg.log_to_file = false;
+        let mut controller = Controller::new(cfg).unwrap();
+        controller.write_initial_status(&[], None).unwrap();
+
+        controller.shaper_dl = 20_000.625;
+        controller.shaper_ul = 19_999.375;
+        controller.last_set_dl = 20_000;
+        controller.last_set_ul = 20_000;
+        controller.dl_qdisc_kind = Some(CakeQdiscKind::Cake);
+        controller.ul_qdisc_kind = Some(CakeQdiscKind::Cake);
+        let actual = RuntimeSnapshot {
+            target_interface: controller.cfg.sqm_interface.clone(),
+            route_fingerprint: "11".repeat(32),
+            sqm_fingerprint: "22".repeat(32),
+            topology: MeasurementTopology::ShapedBoth,
+            download_kbps: Some(19_750),
+            upload_kbps: Some(19_500),
+            download_qdisc_kind: Some(RuntimeQdiscKind::Cake),
+            upload_qdisc_kind: Some(RuntimeQdiscKind::Cake),
+        };
+        controller.remember_attested_cake_rates(&actual);
+        controller.refresh_status_from_last_sample().unwrap();
+
+        assert_eq!(controller.shaper_dl, 20_000.625);
+        assert_eq!(controller.shaper_ul, 19_999.375);
+        assert_eq!(controller.last_set_dl, 19_750);
+        assert_eq!(controller.last_set_ul, 19_500);
+        let published = RatingRuntimeSnapshot::decode(
+            &fs::read_to_string(controller.cfg.run_dir().join("rating-runtime")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(published.cake_dl_kbps, 19_750.0);
+        assert_eq!(published.cake_ul_kbps, 19_500.0);
+
+        if let Some(value) = previous_run_root {
+            env::set_var("CAKE_AUTORATE_RUN_ROOT", value);
+        } else {
+            env::remove_var("CAKE_AUTORATE_RUN_ROOT");
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -14981,7 +15463,15 @@ esac\n",
         cfg.adjust_ul_shaper_rate = false;
         let mut controller = Controller::new(cfg).unwrap();
 
+        controller.runtime_operation_active = true;
         fs::remove_dir_all(sys.join("eth0")).unwrap();
+        let (ready, recovered) = controller.ensure_managed_sqm();
+        assert!(ready && !recovered);
+        assert_eq!(controller.sqm_runtime_state, "WAITING_OPERATION");
+        assert_eq!(controller.sqm_recovery_attempts, 0);
+        assert!(!helper_log.exists());
+
+        controller.runtime_operation_active = false;
         let (ready, recovered) = controller.ensure_managed_sqm();
         assert!(!ready && !recovered);
         assert_eq!(controller.sqm_runtime_state, "WAITING_LINK");
@@ -15270,6 +15760,9 @@ esac\n",
             candidate_dl_kbps: None,
             candidate_ul_kbps: Some(723_400),
             load_reference_kbps: Some(900_000),
+            transport_baseline_us: (phase
+                == crate::operations::full_autotune::AutotuneCapturePhase::LoadedMeasurement)
+                .then_some(10_000),
             route_fingerprint: "e".repeat(64),
             sqm_fingerprint: "f".repeat(64),
         }
@@ -15911,13 +16404,8 @@ esac\n",
         result.capture_interval_valid = Some(true);
         let route = result.route_identity.clone().unwrap();
         assert_eq!(
-            censored_autotune_transport_observation(
-                &result,
-                Some(&request),
-                Some(&route),
-                Some(10.0),
-            )
-            .unwrap(),
+            censored_autotune_transport_observation(&result, Some(&request), Some(&route),)
+                .unwrap(),
             Some(AutotuneCaptureObservationKind::TransportDeadlineExceeded {
                 deadline_us: 5_000_000,
                 delta_lower_bound_us: 4_990_000,
@@ -15927,13 +16415,8 @@ esac\n",
         let mut invalid_flight = result.clone();
         invalid_flight.capture_interval_valid = Some(false);
         assert_eq!(
-            censored_autotune_transport_observation(
-                &invalid_flight,
-                Some(&request),
-                Some(&route),
-                Some(10.0),
-            )
-            .unwrap(),
+            censored_autotune_transport_observation(&invalid_flight, Some(&request), Some(&route),)
+                .unwrap(),
             None
         );
         let mut ordinary_failure = result.clone();
@@ -15944,20 +16427,52 @@ esac\n",
                 &ordinary_failure,
                 Some(&request),
                 Some(&route),
-                Some(10.0),
             )
             .unwrap(),
             None
         );
         let mut malformed = result;
         malformed.failure_deadline_us = None;
-        assert!(censored_autotune_transport_observation(
-            &malformed,
-            Some(&request),
-            Some(&route),
-            Some(10.0),
-        )
-        .is_err());
+        assert!(
+            censored_autotune_transport_observation(&malformed, Some(&request), Some(&route),)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn autotune_loaded_transport_uses_its_request_baseline_before_the_runtime_tracker_is_ready() {
+        use crate::operations::autotune_capture::{
+            transport_observation_kind, AutotuneCaptureObservationKind,
+        };
+        use crate::operations::full_autotune::{AutotuneCapturePhase, MeasurementTopology};
+        use crate::operations::protocol::SpeedtestDirection;
+
+        let now = Instant::now();
+        let mut runtime_tracker = TransportLatencyTracker::new();
+        for index in 0..15 {
+            runtime_tracker.observe_success(
+                "wss://example.invalid/probe",
+                10.0 + f64::from(index) / 100.0,
+                false,
+                now,
+            );
+        }
+        assert_eq!(runtime_tracker.snapshot(now, true).baseline_ms, None);
+
+        let request = test_autotune_capture_request(
+            1,
+            AutotuneCapturePhase::LoadedMeasurement,
+            MeasurementTopology::RawDownload,
+            Some(SpeedtestDirection::Download),
+        );
+        assert_eq!(request.transport_baseline_us, Some(10_000));
+        assert_eq!(
+            transport_observation_kind(&request, 45.0, true, false).unwrap(),
+            Some(AutotuneCaptureObservationKind::TransportSuccess {
+                latency_us: None,
+                delta_us: Some(35_000),
+            })
+        );
     }
 
     #[test]
@@ -16651,6 +17166,10 @@ esac\n",
                 AutotuneCapturePhase::IdleBaseline => None,
                 AutotuneCapturePhase::LoadedMeasurement => Some(100_000),
             },
+            transport_baseline_us: match phase {
+                AutotuneCapturePhase::IdleBaseline => None,
+                AutotuneCapturePhase::LoadedMeasurement => Some(10_000),
+            },
             route_fingerprint: "e".repeat(64),
             sqm_fingerprint: "f".repeat(64),
         };
@@ -16774,6 +17293,7 @@ esac\n",
             candidate_dl_kbps: None,
             candidate_ul_kbps: Some(723_400),
             load_reference_kbps: Some(900_000),
+            transport_baseline_us: Some(10_000),
             route_fingerprint: "e".repeat(64),
             sqm_fingerprint: "f".repeat(64),
         };

@@ -197,6 +197,10 @@ impl LeaseTable {
     pub fn job_count(&self) -> usize {
         self.jobs.len()
     }
+
+    pub fn contains_job(&self, job_id: &str) -> bool {
+        self.jobs.contains_key(job_id)
+    }
 }
 
 #[cfg(test)]

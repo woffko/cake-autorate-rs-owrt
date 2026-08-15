@@ -39,6 +39,39 @@ accepted transaction has completed and no guard marker remains.
 > directly; terminal cleanup treats an absent or safely identified reused PID
 > as already stopped and never signals its new owner.
 
+## Progress, Review, and Apply
+
+The running dialog consumes an identity-bound progress record rather than an
+elapsed-time animation. It displays a monotonic percentage and a user-facing
+operation such as route preparation, idle-latency measurement, raw download or
+upload capacity, shaped rate search, candidate confirmation, mobile
+download-bypass comparison, runtime restoration, or proposal preparation.
+Completed evidence units and attempt numbers are shown when available. A
+missing or malformed progress record falls back to a bounded generic status;
+it cannot manufacture completion. The UI shows 100% only after the previous
+runtime is restored and a usable Review has been published.
+
+Review ranks as many as four independently measured topologies: both shaped,
+download shaped only, upload shaped only, and no SQM. Every advisory mismatch
+for the selected card is listed together with its stable code. The user then
+uses one **I accept all listed trade-offs** checkbox; internally the complete
+code set remains bound to that exact immutable proposal and Apply manifest.
+Hard route, ownership, measurement, loss, contamination, and runtime-safety
+failures remain non-overridable.
+
+For explicitly selected cellular, LEO/GEO satellite, or fixed-wireless access,
+Full raw capacity attempts one terminal download-unshaped/upload-shaped
+confirmation. A safe result becomes a separate manual Review option. If the
+traffic budget, sample coverage, measurement integrity, or safety gates cannot
+prove it, Review keeps an unavailable card with the exact reason instead of
+inventing a topology.
+
+After a verified Apply receipt, LuCI unloads and reloads both relevant UCI
+packages and navigates to a fresh Settings view automatically. There is no
+second Reload button: new direction mode and DL/UL values must be visible
+without switching tabs, while an ambiguous response is reconciled through the
+same durable receipt before the page is refreshed.
+
 ## Transport-aware adaptive capacity
 
 RC27 implements this model in the matching daemon and LuCI packages:
@@ -83,10 +116,12 @@ RC27 implements this model in the matching daemon and LuCI packages:
 - Confidence reporting stays explicit and directional
   (safe/provisional/limited) so policy and state transitions remain auditable.
 
-Every frontier finishes with simultaneous DL+UL confirmation. If ordinary
-shaping is unsafe or poorly realized, Review can run a repeated upload-only
-shaped diagnostic with download ingress bypassed. It can recommend manual
-review, but it never silently removes a direction from the runtime topology.
+Every frontier finishes with simultaneous DL+UL confirmation. For a
+user-selected cellular, satellite, or fixed-wireless link, Full raw also runs
+a bounded terminal upload-only-shaped diagnostic with download ingress
+bypassed. A verified result can be offered for manual review; otherwise its
+disabled card explains why the exact topology is unavailable. It never
+silently removes a direction from the runtime topology.
 
 On an anonymized cellular link, a deliberate 2 GiB limit completed raw
 403/46 Mbit/s controls and a first shaped 220/30 Mbit/s point, then stopped

@@ -11,8 +11,8 @@
 use super::autotune_apply::{
     NativeApplyAcknowledgement, NativeApplyAction, NativeApplyArtifactDigests,
     NativeApplyDirectionInput, NativeApplyDirectionMode, NativeApplyExecutionPlan,
-    NativeApplyManifestInput, NativeRawFallbackApplyManifestInput, NativeSqmDirectionMode,
-    MAX_NATIVE_APPLY_MANIFEST_BYTES,
+    NativeApplyManifestInput, NativeDirectionalRawFallbackApplyManifestInput,
+    NativeRawFallbackApplyManifestInput, NativeSqmDirectionMode, MAX_NATIVE_APPLY_MANIFEST_BYTES,
 };
 use super::autotune_apply_openwrt::{
     validate_bootstrap_request_baseline, OpenWrtNativeApplyBackend,
@@ -51,12 +51,13 @@ use super::sqm_identity;
 use crate::autotune::{
     build_proposal_for_profile_with_context, next_variable_link_unobserved_candidate,
     optimize_profile_direction, profile_pair_candidates,
-    terminate_profile_direction_at_measured_boundary, validate_shaped_candidate, AutotuneProfile,
-    AutotuneProposal, CeilingCapSource, DirectionLoadInput, DirectionProposal,
-    DirectionValidationInput, LatencyBaseline, LinkKind, ProfilePairCandidate, ProfileSearchAction,
-    ProfileSearchInput, ProfileSearchOptionRole, ProfileSearchResult, ProposalContext,
-    SearchDirection, SearchObservation, ValidationInput, ValidationResult, ValidationThresholds,
-    MAX_PROFILE_REVIEW_OPTIONS, MAX_PROFILE_SEARCH_OBSERVATIONS, MAX_RATE_KBPS,
+    terminate_profile_direction_at_measured_boundary, validate_shaped_candidate,
+    AccessEvidenceSource, AccessMedium, AutotuneProfile, AutotuneProposal, CeilingCapSource,
+    DirectionLoadInput, DirectionProposal, DirectionValidationInput, LatencyBaseline, LinkKind,
+    ProfilePairCandidate, ProfileSearchAction, ProfileSearchInput, ProfileSearchOptionRole,
+    ProfileSearchResult, ProposalContext, SearchDirection, SearchObservation, ValidationInput,
+    ValidationResult, ValidationThresholds, MAX_PROFILE_REVIEW_OPTIONS,
+    MAX_PROFILE_SEARCH_OBSERVATIONS, MAX_RATE_KBPS,
 };
 use crate::transport_quality::classify_quality;
 use crate::Config;
@@ -75,25 +76,27 @@ use std::time::{Duration, Instant};
 pub const MAX_AUTOTUNE_EVIDENCE_RECORDS: usize = 256;
 pub const MAX_AUTOTUNE_EVIDENCE_BYTES: usize = 4 * 1024;
 pub const MAX_AUTOTUNE_REVIEW_BYTES: usize = 512 * 1024;
-const EVIDENCE_HEADER: &str = "cake-autorate-autotune-evidence\t10";
+const EVIDENCE_HEADER: &str = "cake-autorate-autotune-evidence\t11";
+const PROGRESS_HEADER: &str = "cake-autorate-autotune-progress\t1";
+const MAX_AUTOTUNE_PROGRESS_BYTES: usize = 2 * 1024;
 const RUNTIME_CONTROL_HEADER: &str = "cake-autorate-autotune-runtime-control\t1";
 const RUNTIME_ACK_HEADER: &str = "cake-autorate-autotune-runtime-ack\t1";
 const TERMINAL_HEADER: &str = "cake-autorate-autotune-terminal\t2";
 const TRAFFIC_BUDGET_INCONCLUSIVE: &str = "traffic-budget-exhausted";
 const MAX_OPERATION_TRAFFIC_BUDGET_BYTES: u64 = 1 << 40;
-const CAPTURE_REQUEST_HEADER: &str = "cake-autorate-autotune-capture\t2\trequest";
-const CAPTURE_SNAPSHOT_HEADER: &str = "cake-autorate-autotune-capture\t3\tsnapshot";
+const CAPTURE_REQUEST_HEADER: &str = "cake-autorate-autotune-capture\t3\trequest";
+const CAPTURE_SNAPSHOT_HEADER: &str = "cake-autorate-autotune-capture\t4\tsnapshot";
 const LOAD_EVIDENCE_HEADER_PREFIX: &str = "cake-autorate-autotune-load-evidence\t";
 const BIDIRECTIONAL_LOAD_EVIDENCE_HEADER_PREFIX: &str =
     "cake-autorate-autotune-bidirectional-load-evidence\t";
-const LOAD_EVIDENCE_SCHEMA_VERSION: u64 = 5;
-const BIDIRECTIONAL_LOAD_EVIDENCE_SCHEMA_VERSION: u64 = 4;
-const LOAD_EVIDENCE_HEADER: &str = "cake-autorate-autotune-load-evidence\t5";
+const LOAD_EVIDENCE_SCHEMA_VERSION: u64 = 6;
+const BIDIRECTIONAL_LOAD_EVIDENCE_SCHEMA_VERSION: u64 = 5;
+const LOAD_EVIDENCE_HEADER: &str = "cake-autorate-autotune-load-evidence\t6";
 const BIDIRECTIONAL_LOAD_EVIDENCE_HEADER: &str =
-    "cake-autorate-autotune-bidirectional-load-evidence\t4";
-const PREVIOUS_LOAD_EVIDENCE_HEADER: &str = "cake-autorate-autotune-load-evidence\t4";
+    "cake-autorate-autotune-bidirectional-load-evidence\t5";
+const PREVIOUS_LOAD_EVIDENCE_HEADER: &str = "cake-autorate-autotune-load-evidence\t5";
 const PREVIOUS_BIDIRECTIONAL_LOAD_EVIDENCE_HEADER: &str =
-    "cake-autorate-autotune-bidirectional-load-evidence\t3";
+    "cake-autorate-autotune-bidirectional-load-evidence\t4";
 const EVIDENCE_DIR: &str = "autotune-evidence";
 const PROPOSAL_FILE: &str = "autotune-proposal.json";
 const DOWNLOAD_SEARCH_FILE: &str = "autotune-search-download.json";
@@ -101,6 +104,7 @@ const UPLOAD_SEARCH_FILE: &str = "autotune-search-upload.json";
 const PAIR_CONFIRMATION_FILE: &str = "autotune-pair-confirmation.json";
 const TOPOLOGY_COMPARISON_FILE: &str = "autotune-topology-comparison.json";
 const RAW_FALLBACK_FILE: &str = "autotune-raw-fallback.json";
+const PROGRESS_FILE_PREFIX: &str = "autotune-progress-";
 const PROFILE_SEARCH_UNCERTAINTY_PERCENT: f64 = 1.5;
 const DEFAULT_PROFILE_SEARCH_ATTEMPTS: usize = 8;
 const MAX_TOPOLOGY_REPEAT_ATTEMPTS_PER_DIRECTION: u8 = 2;
@@ -117,6 +121,7 @@ pub(crate) const MIN_AUTOTUNE_TRANSPORT_TIMEOUTS: u32 = 3;
 pub(crate) const MIN_AUTOTUNE_TRANSPORT_TIMEOUT_COVERAGE_US: u64 = 15_000_000;
 const MAX_AUTOTUNE_TRANSPORT_TIMEOUTS: u32 = 32;
 const MAX_AUTOTUNE_TRANSPORT_TIMEOUT_US: u64 = 60_000_000;
+pub(crate) const MAX_AUTOTUNE_TRANSPORT_BASELINE_US: u64 = 60_000_000;
 const MAX_MEASUREMENT_TRANSPORT_TIMEOUTS: u32 = MAX_AUTOTUNE_TRANSPORT_TIMEOUTS * 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,10 +158,13 @@ pub(crate) fn native_autotune_runtime_permit_policy(
     } else {
         0
     };
+    let mobile_download_bypass_sequence =
+        u32::from(allow_directional_bypass && mobile_download_bypass_required(request));
     let maximum_sequence = raw_control_sequences
         .checked_add(search_sequences)
         .and_then(|value| value.checked_add(pair_sequences))
         .and_then(|value| value.checked_add(topology_repeat_sequences))
+        .and_then(|value| value.checked_add(mobile_download_bypass_sequence))
         .and_then(|value| value.checked_add(MAX_RUNTIME_ROUTE_REARMS))
         .ok_or_else(|| "native Auto-Tune runtime sequence bound overflow".to_string())?;
     let bounds = |service_cap_kbps: Option<u64>, direction: &str| {
@@ -397,6 +405,18 @@ where
     Ok(value.to_string())
 }
 
+fn progress_number<'a, I, T>(lines: &mut I, expected: &str) -> Result<T, String>
+where
+    I: Iterator<Item = &'a str>,
+    T: TryFrom<u64>,
+{
+    terminal_field(lines, expected)?
+        .parse::<u64>()
+        .ok()
+        .and_then(|value| T::try_from(value).ok())
+        .ok_or_else(|| format!("Auto-Tune progress {expected} is invalid"))
+}
+
 fn require_terminal_code(value: &str) -> Result<(), String> {
     if value.is_empty()
         || value.len() > 96
@@ -453,6 +473,227 @@ impl AutotunePhase {
             "complete" => Some(Self::Complete),
             _ => None,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeAutotuneProgressStep {
+    WaitingForSlot,
+    StartingCalibration,
+    PreparingRoute,
+    MeasuringIdleLatency,
+    PreparingMeasurements,
+    MeasuringDownloadWithoutSqm,
+    MeasuringUploadWithoutSqm,
+    MeasuringFullCapacityDownload,
+    MeasuringFullCapacityUpload,
+    MeasuringShapedDownload,
+    MeasuringShapedUpload,
+    PreparingSearch,
+    SearchingDownloadLimit,
+    SearchingUploadLimit,
+    ConfirmingCandidate,
+    ConfirmingMobileDownloadBypass,
+    ComparingDownloadWithoutSqm,
+    ComparingUploadWithoutSqm,
+    PreparingRawProposal,
+    RestoringSettings,
+    PreparingProposals,
+    ProposalsReady,
+}
+
+impl NativeAutotuneProgressStep {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::WaitingForSlot => "waiting_for_slot",
+            Self::StartingCalibration => "starting_calibration",
+            Self::PreparingRoute => "preparing_route",
+            Self::MeasuringIdleLatency => "measuring_idle_latency",
+            Self::PreparingMeasurements => "preparing_measurements",
+            Self::MeasuringDownloadWithoutSqm => "measuring_download_without_sqm",
+            Self::MeasuringUploadWithoutSqm => "measuring_upload_without_sqm",
+            Self::MeasuringFullCapacityDownload => "measuring_full_capacity_download",
+            Self::MeasuringFullCapacityUpload => "measuring_full_capacity_upload",
+            Self::MeasuringShapedDownload => "measuring_shaped_download",
+            Self::MeasuringShapedUpload => "measuring_shaped_upload",
+            Self::PreparingSearch => "preparing_search",
+            Self::SearchingDownloadLimit => "searching_download_limit",
+            Self::SearchingUploadLimit => "searching_upload_limit",
+            Self::ConfirmingCandidate => "confirming_candidate",
+            Self::ConfirmingMobileDownloadBypass => "confirming_mobile_download_bypass",
+            Self::ComparingDownloadWithoutSqm => "comparing_download_without_sqm",
+            Self::ComparingUploadWithoutSqm => "comparing_upload_without_sqm",
+            Self::PreparingRawProposal => "preparing_raw_proposal",
+            Self::RestoringSettings => "restoring_settings",
+            Self::PreparingProposals => "preparing_proposals",
+            Self::ProposalsReady => "proposals_ready",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "waiting_for_slot" => Self::WaitingForSlot,
+            "starting_calibration" => Self::StartingCalibration,
+            "preparing_route" => Self::PreparingRoute,
+            "measuring_idle_latency" => Self::MeasuringIdleLatency,
+            "preparing_measurements" => Self::PreparingMeasurements,
+            "measuring_download_without_sqm" => Self::MeasuringDownloadWithoutSqm,
+            "measuring_upload_without_sqm" => Self::MeasuringUploadWithoutSqm,
+            "measuring_full_capacity_download" => Self::MeasuringFullCapacityDownload,
+            "measuring_full_capacity_upload" => Self::MeasuringFullCapacityUpload,
+            "measuring_shaped_download" => Self::MeasuringShapedDownload,
+            "measuring_shaped_upload" => Self::MeasuringShapedUpload,
+            "preparing_search" => Self::PreparingSearch,
+            "searching_download_limit" => Self::SearchingDownloadLimit,
+            "searching_upload_limit" => Self::SearchingUploadLimit,
+            "confirming_candidate" => Self::ConfirmingCandidate,
+            "confirming_mobile_download_bypass" => Self::ConfirmingMobileDownloadBypass,
+            "comparing_download_without_sqm" => Self::ComparingDownloadWithoutSqm,
+            "comparing_upload_without_sqm" => Self::ComparingUploadWithoutSqm,
+            "preparing_raw_proposal" => Self::PreparingRawProposal,
+            "restoring_settings" => Self::RestoringSettings,
+            "preparing_proposals" => Self::PreparingProposals,
+            "proposals_ready" => Self::ProposalsReady,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NativeAutotuneProgress {
+    pub(crate) job_id: String,
+    pub(crate) worker_run_id: String,
+    pub(crate) evidence_sequence: u32,
+    pub(crate) step: NativeAutotuneProgressStep,
+    pub(crate) progress_percent: u8,
+    pub(crate) stage_index: u8,
+    pub(crate) stage_total: u8,
+    pub(crate) completed_units: u32,
+    pub(crate) total_units: u32,
+    pub(crate) direction: Option<SpeedtestDirection>,
+    pub(crate) attempt: Option<u32>,
+}
+
+impl NativeAutotuneProgress {
+    pub(crate) fn coordinator_state(
+        step: NativeAutotuneProgressStep,
+        progress_percent: u8,
+    ) -> Self {
+        Self {
+            job_id: String::new(),
+            worker_run_id: String::new(),
+            evidence_sequence: 0,
+            step,
+            progress_percent,
+            stage_index: if step == NativeAutotuneProgressStep::ProposalsReady {
+                10
+            } else {
+                1
+            },
+            stage_total: 10,
+            completed_units: 0,
+            total_units: 0,
+            direction: None,
+            attempt: None,
+        }
+    }
+
+    fn validate(&self, persisted: bool) -> Result<(), String> {
+        if persisted {
+            require_hex("Auto-Tune progress job id", &self.job_id, 32)?;
+            require_hex("Auto-Tune progress worker run id", &self.worker_run_id, 32)?;
+        }
+        if persisted
+            && (self.evidence_sequence == 0
+                || self.evidence_sequence as usize > MAX_AUTOTUNE_EVIDENCE_RECORDS)
+        {
+            return Err("Auto-Tune progress evidence sequence is outside its bound".to_string());
+        }
+        if self.progress_percent == 0 || self.progress_percent > 99 {
+            return Err("Auto-Tune progress percentage is outside its active bound".to_string());
+        }
+        if self.stage_index == 0 || self.stage_total == 0 || self.stage_index > self.stage_total {
+            return Err("Auto-Tune progress stage is outside its bound".to_string());
+        }
+        if (self.total_units == 0 && self.completed_units != 0)
+            || (self.total_units > 0 && self.completed_units > self.total_units)
+        {
+            return Err("Auto-Tune progress units are inconsistent".to_string());
+        }
+        if self
+            .attempt
+            .is_some_and(|attempt| attempt == 0 || attempt > 256)
+        {
+            return Err("Auto-Tune progress attempt is outside its bound".to_string());
+        }
+        Ok(())
+    }
+
+    fn encode(&self) -> Result<String, String> {
+        self.validate(true)?;
+        Ok(format!(
+            "{PROGRESS_HEADER}\njob_id={}\nworker_run_id={}\nevidence_sequence={}\nstep={}\nprogress_percent={}\nstage_index={}\nstage_total={}\ncompleted_units={}\ntotal_units={}\ndirection={}\nattempt={}\n",
+            self.job_id,
+            self.worker_run_id,
+            self.evidence_sequence,
+            self.step.as_str(),
+            self.progress_percent,
+            self.stage_index,
+            self.stage_total,
+            self.completed_units,
+            self.total_units,
+            self.direction.map(SpeedtestDirection::as_str).unwrap_or(""),
+            self.attempt.unwrap_or(0),
+        ))
+    }
+
+    fn decode(input: &str) -> Result<Self, String> {
+        if input.len() > MAX_AUTOTUNE_PROGRESS_BYTES || !input.ends_with('\n') {
+            return Err("Auto-Tune progress is oversized or unterminated".to_string());
+        }
+        let mut lines = input.lines();
+        if lines.next() != Some(PROGRESS_HEADER) {
+            return Err("Auto-Tune progress header is unsupported".to_string());
+        }
+        let job_id = terminal_field(&mut lines, "job_id")?;
+        let worker_run_id = terminal_field(&mut lines, "worker_run_id")?;
+        let evidence_sequence = progress_number(&mut lines, "evidence_sequence")?;
+        let step = NativeAutotuneProgressStep::parse(&terminal_field(&mut lines, "step")?)
+            .ok_or_else(|| "Auto-Tune progress step is unsupported".to_string())?;
+        let progress_percent = progress_number(&mut lines, "progress_percent")?;
+        let stage_index = progress_number(&mut lines, "stage_index")?;
+        let stage_total = progress_number(&mut lines, "stage_total")?;
+        let completed_units = progress_number(&mut lines, "completed_units")?;
+        let total_units = progress_number(&mut lines, "total_units")?;
+        let direction = optional_parsed(
+            terminal_field(&mut lines, "direction")?,
+            SpeedtestDirection::parse,
+        )?;
+        let attempt = match progress_number::<_, u32>(&mut lines, "attempt")? {
+            0 => None,
+            value => Some(value),
+        };
+        if lines.next().is_some() {
+            return Err("Auto-Tune progress contains unknown fields".to_string());
+        }
+        let progress = Self {
+            job_id,
+            worker_run_id,
+            evidence_sequence,
+            step,
+            progress_percent,
+            stage_index,
+            stage_total,
+            completed_units,
+            total_units,
+            direction,
+            attempt,
+        };
+        progress.validate(true)?;
+        if progress.encode()? != input {
+            return Err("Auto-Tune progress is not canonical".to_string());
+        }
+        Ok(progress)
     }
 }
 
@@ -553,6 +794,7 @@ pub struct AutotuneCaptureRequest {
     pub candidate_dl_kbps: Option<u64>,
     pub candidate_ul_kbps: Option<u64>,
     pub load_reference_kbps: Option<u64>,
+    pub transport_baseline_us: Option<u64>,
     pub route_fingerprint: String,
     pub sqm_fingerprint: String,
 }
@@ -595,13 +837,20 @@ impl AutotuneCaptureRequest {
         {
             return Err("native Auto-Tune capture load reference is invalid".to_string());
         }
+        if self
+            .transport_baseline_us
+            .is_some_and(|value| value == 0 || value > MAX_AUTOTUNE_TRANSPORT_BASELINE_US)
+        {
+            return Err("native Auto-Tune transport baseline is invalid".to_string());
+        }
         match self.phase {
             AutotuneCapturePhase::IdleBaseline
                 if self.control_sequence == 0
                     && self.direction.is_none()
                     && (self.topology.is_managed_baseline()
                         || self.topology == MeasurementTopology::RawBoth)
-                    && self.load_reference_kbps.is_none() => {}
+                    && self.load_reference_kbps.is_none()
+                    && self.transport_baseline_us.is_none() => {}
             AutotuneCapturePhase::LoadedMeasurement
                 if self.control_sequence > 0
                     && matches!(
@@ -612,7 +861,8 @@ impl AutotuneCaptureRequest {
                                 | SpeedtestDirection::Both
                         )
                     )
-                    && self.load_reference_kbps.is_some() => {}
+                    && self.load_reference_kbps.is_some()
+                    && self.transport_baseline_us.is_some() => {}
             _ => {
                 return Err(
                     "native Auto-Tune capture phase contradicts its control or direction"
@@ -647,6 +897,7 @@ impl AutotuneCaptureRequest {
                 "sequence={}\ncontrol_sequence={}\ndeadline_boot_ms={}\n",
                 "phase={}\ntopology={}\ndirection={}\n",
                 "candidate_dl_kbps={}\ncandidate_ul_kbps={}\nload_reference_kbps={}\n",
+                "transport_baseline_us={}\n",
                 "route_fingerprint={}\nsqm_fingerprint={}\n"
             ),
             CAPTURE_REQUEST_HEADER,
@@ -664,6 +915,7 @@ impl AutotuneCaptureRequest {
             optional_number(self.candidate_dl_kbps),
             optional_number(self.candidate_ul_kbps),
             optional_number(self.load_reference_kbps),
+            optional_number(self.transport_baseline_us),
             self.route_fingerprint,
             self.sqm_fingerprint,
         ))
@@ -708,6 +960,10 @@ impl AutotuneCaptureRequest {
             "capture load_reference_kbps",
             reader.field("load_reference_kbps")?,
         )?;
+        let transport_baseline_us = optional_u64(
+            "capture transport_baseline_us",
+            reader.field("transport_baseline_us")?,
+        )?;
         let route_fingerprint = reader.field("route_fingerprint")?;
         let sqm_fingerprint = reader.field("sqm_fingerprint")?;
         reader.finish()?;
@@ -726,6 +982,7 @@ impl AutotuneCaptureRequest {
             candidate_dl_kbps,
             candidate_ul_kbps,
             load_reference_kbps,
+            transport_baseline_us,
             route_fingerprint,
             sqm_fingerprint,
         };
@@ -1038,7 +1295,7 @@ impl AutotuneLoadEvidence {
                 "capture_id={}\njob_id={}\nworker_run_id={}\npermit_id={}\ninstance_name={}\n",
                 "request_sequence={}\ncontrol_sequence={}\ndeadline_boot_ms={}\n",
                 "topology={}\ndirection={}\ncandidate_dl_kbps={}\ncandidate_ul_kbps={}\n",
-                "load_reference_kbps={}\n",
+                "load_reference_kbps={}\ntransport_baseline_us={}\n",
                 "route_fingerprint={}\nsqm_fingerprint={}\n",
                 "published_boot_ms={}\nrun_count={}\naggregate_rx_bytes={}\naggregate_tx_bytes={}\n",
                 "confidence_total_bytes={}\ncontrolled_wire_bytes={}\n",
@@ -1060,6 +1317,7 @@ impl AutotuneLoadEvidence {
             optional_number(self.request.candidate_dl_kbps),
             optional_number(self.request.candidate_ul_kbps),
             optional_number(self.request.load_reference_kbps),
+            optional_number(self.request.transport_baseline_us),
             self.request.route_fingerprint,
             self.request.sqm_fingerprint,
             self.published_boot_ms,
@@ -1115,6 +1373,10 @@ impl AutotuneLoadEvidence {
         let load_reference_kbps = optional_u64(
             "load evidence load_reference_kbps",
             reader.field("load_reference_kbps")?,
+        )?;
+        let transport_baseline_us = optional_u64(
+            "load evidence transport_baseline_us",
+            reader.field("transport_baseline_us")?,
         )?;
         let route_fingerprint = reader.field("route_fingerprint")?;
         let sqm_fingerprint = reader.field("sqm_fingerprint")?;
@@ -1185,6 +1447,7 @@ impl AutotuneLoadEvidence {
                 candidate_dl_kbps,
                 candidate_ul_kbps,
                 load_reference_kbps,
+                transport_baseline_us,
                 route_fingerprint,
                 sqm_fingerprint,
             },
@@ -1469,7 +1732,8 @@ impl AutotuneBidirectionalLoadEvidence {
                 "capture_id={}\njob_id={}\nworker_run_id={}\npermit_id={}\ninstance_name={}\n",
                 "request_sequence={}\ncontrol_sequence={}\ndeadline_boot_ms={}\n",
                 "topology={}\ndirection={}\ncandidate_dl_kbps={}\ncandidate_ul_kbps={}\n",
-                "load_reference_kbps={}\nroute_fingerprint={}\nsqm_fingerprint={}\n",
+                "load_reference_kbps={}\ntransport_baseline_us={}\n",
+                "route_fingerprint={}\nsqm_fingerprint={}\n",
                 "published_boot_ms={}\nrun_count={}\naggregate_rx_bytes={}\naggregate_tx_bytes={}\n",
                 "confidence_rx_bytes={}\nconfidence_tx_bytes={}\n",
                 "controlled_rx_wire_bytes={}\ncontrolled_tx_wire_bytes={}\n",
@@ -1494,6 +1758,7 @@ impl AutotuneBidirectionalLoadEvidence {
             optional_number(self.request.candidate_dl_kbps),
             optional_number(self.request.candidate_ul_kbps),
             optional_number(self.request.load_reference_kbps),
+            optional_number(self.request.transport_baseline_us),
             self.request.route_fingerprint,
             self.request.sqm_fingerprint,
             self.published_boot_ms,
@@ -1560,6 +1825,10 @@ impl AutotuneBidirectionalLoadEvidence {
         let load_reference_kbps = optional_u64(
             "bidirectional load load_reference_kbps",
             reader.field("load_reference_kbps")?,
+        )?;
+        let transport_baseline_us = optional_u64(
+            "bidirectional load transport_baseline_us",
+            reader.field("transport_baseline_us")?,
         )?;
         let route_fingerprint = reader.field("route_fingerprint")?;
         let sqm_fingerprint = reader.field("sqm_fingerprint")?;
@@ -1661,6 +1930,7 @@ impl AutotuneBidirectionalLoadEvidence {
                 candidate_dl_kbps,
                 candidate_ul_kbps,
                 load_reference_kbps,
+                transport_baseline_us,
                 route_fingerprint,
                 sqm_fingerprint,
             },
@@ -1825,6 +2095,7 @@ pub struct AutotuneCaptureSnapshot {
     pub cpu_samples: u32,
     pub idle_median_us: Option<u64>,
     pub idle_p95_us: Option<u64>,
+    pub idle_transport_baseline_us: Option<u64>,
     pub icmp_delta_us: Option<u64>,
     pub transport_delta_us: Option<u64>,
     pub loss_ppm: Option<u32>,
@@ -1844,6 +2115,9 @@ impl AutotuneCaptureSnapshot {
             || self
                 .background_confidence_percent
                 .is_some_and(|value| value > 100)
+            || self
+                .idle_transport_baseline_us
+                .is_some_and(|value| value == 0 || value > MAX_AUTOTUNE_TRANSPORT_BASELINE_US)
             || self.transport_censored != (self.transport_timeout_count > 0)
             || (self.transport_timeout_count == 0) != (self.transport_timeout_total_us == 0)
             || self.transport_timeout_count > MAX_AUTOTUNE_TRANSPORT_TIMEOUTS
@@ -1883,8 +2157,13 @@ impl AutotuneCaptureSnapshot {
                         let p95 = self
                             .idle_p95_us
                             .ok_or_else(|| "complete idle capture has no p95".to_string())?;
+                        let transport_baseline =
+                            self.idle_transport_baseline_us.ok_or_else(|| {
+                                "complete idle capture has no transport baseline".to_string()
+                            })?;
                         if median == 0
                             || p95 < median
+                            || transport_baseline == 0
                             || self.icmp_samples < MIN_AUTOTUNE_IDLE_ICMP_SAMPLES
                             || self.transport_samples < MIN_AUTOTUNE_TRANSPORT_SAMPLES
                             || self.transport_timeout_count != 0
@@ -1910,6 +2189,7 @@ impl AutotuneCaptureSnapshot {
                             || self.cpu_samples == 0
                             || self.idle_median_us.is_some()
                             || self.idle_p95_us.is_some()
+                            || self.idle_transport_baseline_us.is_some()
                             || self.icmp_delta_us.is_none()
                             || self.transport_delta_us.is_none()
                             || self.loss_ppm.is_none()
@@ -1931,6 +2211,7 @@ impl AutotuneCaptureSnapshot {
     fn has_terminal_metrics(&self) -> bool {
         self.idle_median_us.is_some()
             || self.idle_p95_us.is_some()
+            || self.idle_transport_baseline_us.is_some()
             || self.icmp_delta_us.is_some()
             || self.transport_delta_us.is_some()
             || self.loss_ppm.is_some()
@@ -1965,11 +2246,13 @@ impl AutotuneCaptureSnapshot {
                 "sequence={}\ncontrol_sequence={}\ndeadline_boot_ms={}\n",
                 "phase={}\ntopology={}\ndirection={}\n",
                 "candidate_dl_kbps={}\ncandidate_ul_kbps={}\nload_reference_kbps={}\n",
+                "transport_baseline_us={}\n",
                 "route_fingerprint={}\nsqm_fingerprint={}\n",
                 "state={}\nupdated_boot_ms={}\nicmp_samples={}\n",
                 "transport_samples={}\ntransport_timeout_count={}\n",
                 "transport_timeout_total_us={}\ntransport_censored={}\ncpu_samples={}\n",
-                "idle_median_us={}\nidle_p95_us={}\nicmp_delta_us={}\n",
+                "idle_median_us={}\nidle_p95_us={}\nidle_transport_baseline_us={}\n",
+                "icmp_delta_us={}\n",
                 "transport_delta_us={}\nloss_ppm={}\ncpu_milli_percent={}\n",
                 "background_confidence_percent={}\ncontaminated={}\ndiagnostic_code={}\n"
             ),
@@ -1988,6 +2271,7 @@ impl AutotuneCaptureSnapshot {
             optional_number(self.request.candidate_dl_kbps),
             optional_number(self.request.candidate_ul_kbps),
             optional_number(self.request.load_reference_kbps),
+            optional_number(self.request.transport_baseline_us),
             self.request.route_fingerprint,
             self.request.sqm_fingerprint,
             self.state.as_str(),
@@ -2000,6 +2284,7 @@ impl AutotuneCaptureSnapshot {
             self.cpu_samples,
             optional_number(self.idle_median_us),
             optional_number(self.idle_p95_us),
+            optional_number(self.idle_transport_baseline_us),
             optional_number(self.icmp_delta_us),
             optional_number(self.transport_delta_us),
             optional_number(self.loss_ppm.map(u64::from)),
@@ -2049,6 +2334,10 @@ impl AutotuneCaptureSnapshot {
             "capture load_reference_kbps",
             reader.field("load_reference_kbps")?,
         )?;
+        let transport_baseline_us = optional_u64(
+            "capture transport_baseline_us",
+            reader.field("transport_baseline_us")?,
+        )?;
         let route_fingerprint = reader.field("route_fingerprint")?;
         let sqm_fingerprint = reader.field("sqm_fingerprint")?;
         let state = AutotuneCaptureState::parse(&reader.field("state")?)
@@ -2082,6 +2371,10 @@ impl AutotuneCaptureSnapshot {
         let idle_median_us =
             optional_u64("capture idle_median_us", reader.field("idle_median_us")?)?;
         let idle_p95_us = optional_u64("capture idle_p95_us", reader.field("idle_p95_us")?)?;
+        let idle_transport_baseline_us = optional_u64(
+            "capture idle_transport_baseline_us",
+            reader.field("idle_transport_baseline_us")?,
+        )?;
         let icmp_delta_us = optional_u64("capture icmp_delta_us", reader.field("icmp_delta_us")?)?;
         let transport_delta_us = optional_u64(
             "capture transport_delta_us",
@@ -2119,6 +2412,7 @@ impl AutotuneCaptureSnapshot {
                 candidate_dl_kbps,
                 candidate_ul_kbps,
                 load_reference_kbps,
+                transport_baseline_us,
                 route_fingerprint,
                 sqm_fingerprint,
             },
@@ -2132,6 +2426,7 @@ impl AutotuneCaptureSnapshot {
             cpu_samples,
             idle_median_us,
             idle_p95_us,
+            idle_transport_baseline_us,
             icmp_delta_us,
             transport_delta_us,
             loss_ppm,
@@ -2314,21 +2609,11 @@ pub fn attest_capture_admission(
                     "idle Auto-Tune capture requires an unmutated runtime permit".to_string(),
                 );
             }
-            let baseline_topology = permit.capture_baseline_topology();
-            let expected_download_kbps = baseline_topology
-                .download_is_shaped()
-                .then_some(permit.initial_download_kbps);
-            let expected_upload_kbps = baseline_topology
-                .upload_is_shaped()
-                .then_some(permit.initial_upload_kbps);
-            if request.topology != baseline_topology
-                || request.candidate_dl_kbps != expected_download_kbps
-                || request.candidate_ul_kbps != expected_upload_kbps
-            {
-                return Err(
-                    "idle Auto-Tune capture does not match its runtime baseline".to_string()
-                );
-            }
+            permit.authorizes_idle_baseline(
+                request.topology,
+                request.candidate_dl_kbps,
+                request.candidate_ul_kbps,
+            )?;
         }
         AutotuneCapturePhase::LoadedMeasurement => {
             let control = control.ok_or_else(|| {
@@ -2880,9 +3165,103 @@ pub struct SearchProbeUnmeasurableEvidence {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchInconclusiveReason {
+    VariableCandidateResourceSafety,
+    VariableCandidateRealization,
+    NoisyLinkCandidate,
+    NonmonotonicVariableLink,
+    QueueOutsideCakeControlTargetUnmet,
+    ExplorationFloorWithoutLatencyKnee,
+    BoundedAttemptBeforeLatencyKnee,
+    VariableLinkCannotProgress,
+    RepeatedCandidateRealizationUnreliable,
+    LowCandidateRealizationNotRepeatable,
+    UnableToEstablishControlledShaperCandidate,
+    ResourceSafetyFailureNotResolved,
+    BoundedAttemptWithoutSafeCandidate,
+    ThroughputSearchWithoutSafeCandidate,
+    ProfileSearchWithoutSafeCandidate,
+}
+
+impl SearchInconclusiveReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::VariableCandidateResourceSafety => {
+                "variable-candidate-resource-safety-inconclusive"
+            }
+            Self::VariableCandidateRealization => "variable-candidate-realization-inconclusive",
+            Self::NoisyLinkCandidate => "noisy-link-candidate-did-not-converge",
+            Self::NonmonotonicVariableLink => "nonmonotonic-variable-link-after-retries",
+            Self::QueueOutsideCakeControlTargetUnmet => "queue-outside-cake-control-target-unmet",
+            Self::ExplorationFloorWithoutLatencyKnee => {
+                "exploration-floor-reached-without-latency-knee"
+            }
+            Self::BoundedAttemptBeforeLatencyKnee => "bounded-attempt-limit-before-latency-knee",
+            Self::VariableLinkCannotProgress => "variable-link-search-cannot-make-progress",
+            Self::RepeatedCandidateRealizationUnreliable => {
+                "repeated-candidate-realization-unreliable"
+            }
+            Self::LowCandidateRealizationNotRepeatable => {
+                "low-candidate-realization-not-repeatable"
+            }
+            Self::UnableToEstablishControlledShaperCandidate => {
+                "unable-to-establish-controlled-shaper-candidate"
+            }
+            Self::ResourceSafetyFailureNotResolved => "resource-safety-failure-not-resolved",
+            Self::BoundedAttemptWithoutSafeCandidate => {
+                "bounded-attempt-limit-without-safe-candidate"
+            }
+            Self::ThroughputSearchWithoutSafeCandidate => "throughput-search-has-no-safe-candidate",
+            Self::ProfileSearchWithoutSafeCandidate => "profile-search-has-no-safe-candidate",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "variable-candidate-resource-safety-inconclusive" => {
+                Self::VariableCandidateResourceSafety
+            }
+            "variable-candidate-realization-inconclusive" => Self::VariableCandidateRealization,
+            "noisy-link-candidate-did-not-converge" => Self::NoisyLinkCandidate,
+            "nonmonotonic-variable-link-after-retries" => Self::NonmonotonicVariableLink,
+            "queue-outside-cake-control-target-unmet" => Self::QueueOutsideCakeControlTargetUnmet,
+            "exploration-floor-reached-without-latency-knee" => {
+                Self::ExplorationFloorWithoutLatencyKnee
+            }
+            "bounded-attempt-limit-before-latency-knee" => Self::BoundedAttemptBeforeLatencyKnee,
+            "variable-link-search-cannot-make-progress" => Self::VariableLinkCannotProgress,
+            "repeated-candidate-realization-unreliable" => {
+                Self::RepeatedCandidateRealizationUnreliable
+            }
+            "low-candidate-realization-not-repeatable" => {
+                Self::LowCandidateRealizationNotRepeatable
+            }
+            "unable-to-establish-controlled-shaper-candidate" => {
+                Self::UnableToEstablishControlledShaperCandidate
+            }
+            "resource-safety-failure-not-resolved" => Self::ResourceSafetyFailureNotResolved,
+            "bounded-attempt-limit-without-safe-candidate" => {
+                Self::BoundedAttemptWithoutSafeCandidate
+            }
+            "throughput-search-has-no-safe-candidate" => Self::ThroughputSearchWithoutSafeCandidate,
+            "profile-search-has-no-safe-candidate" => Self::ProfileSearchWithoutSafeCandidate,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchInconclusiveEvidence {
+    pub direction: EvidenceDirection,
+    pub observation_count: u32,
+    pub reason: SearchInconclusiveReason,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PairOptionUnavailableReason {
     ObservationStarved,
     TransferUnmeasurable,
+    TrafficBudget,
 }
 
 impl PairOptionUnavailableReason {
@@ -2890,6 +3269,7 @@ impl PairOptionUnavailableReason {
         match self {
             Self::ObservationStarved => "observation_starved",
             Self::TransferUnmeasurable => "transfer_unmeasurable",
+            Self::TrafficBudget => "traffic_budget",
         }
     }
 
@@ -2897,6 +3277,7 @@ impl PairOptionUnavailableReason {
         match value {
             "observation_starved" => Some(Self::ObservationStarved),
             "transfer_unmeasurable" => Some(Self::TransferUnmeasurable),
+            "traffic_budget" => Some(Self::TrafficBudget),
             _ => None,
         }
     }
@@ -2915,6 +3296,22 @@ pub struct PairOptionUnavailableEvidence {
     pub run_count: u8,
     pub download_debit_count: u32,
     pub upload_debit_count: u32,
+    pub icmp_samples: u32,
+    pub transport_samples: u32,
+    pub cpu_samples: u32,
+}
+
+/// An explicitly requested mobile/fixed-wireless download-bypass control
+/// which could not produce both exact directional measurements.  A zero-run
+/// traffic-budget result is recorded before starting a backend transfer;
+/// measured failures bind and settle their exact preceding traffic debits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectionalBypassUnavailableEvidence {
+    pub candidate_ul_kbps: u64,
+    pub failed_direction: SpeedtestDirection,
+    pub reason: PairOptionUnavailableReason,
+    pub run_count: u8,
+    pub debit_count: u32,
     pub icmp_samples: u32,
     pub transport_samples: u32,
     pub cpu_samples: u32,
@@ -2952,7 +3349,9 @@ pub enum AutotuneEvidence {
     Measurement(MeasurementEvidence),
     SearchObservationStarved(SearchObservationStarvedEvidence),
     SearchProbeUnmeasurable(SearchProbeUnmeasurableEvidence),
+    SearchInconclusive(SearchInconclusiveEvidence),
     PairOptionUnavailable(PairOptionUnavailableEvidence),
+    DirectionalBypassUnavailable(DirectionalBypassUnavailableEvidence),
     ProposalBuilt {
         digest: String,
     },
@@ -2998,7 +3397,9 @@ enum EvidenceKind {
     Measurement,
     SearchObservationStarved,
     SearchProbeUnmeasurable,
+    SearchInconclusive,
     PairOptionUnavailable,
+    DirectionalBypassUnavailable,
     Proposal,
     SearchComplete,
     PairConfirmed,
@@ -3019,7 +3420,9 @@ impl EvidenceKind {
             Self::Measurement => "measurement",
             Self::SearchObservationStarved => "search_observation_starved",
             Self::SearchProbeUnmeasurable => "search_probe_unmeasurable",
+            Self::SearchInconclusive => "search_inconclusive",
             Self::PairOptionUnavailable => "pair_option_unavailable",
+            Self::DirectionalBypassUnavailable => "directional_bypass_unavailable",
             Self::Proposal => "proposal",
             Self::SearchComplete => "search_complete",
             Self::PairConfirmed => "pair_confirmed",
@@ -3040,7 +3443,9 @@ impl EvidenceKind {
             "measurement" => Some(Self::Measurement),
             "search_observation_starved" => Some(Self::SearchObservationStarved),
             "search_probe_unmeasurable" => Some(Self::SearchProbeUnmeasurable),
+            "search_inconclusive" => Some(Self::SearchInconclusive),
             "pair_option_unavailable" => Some(Self::PairOptionUnavailable),
+            "directional_bypass_unavailable" => Some(Self::DirectionalBypassUnavailable),
             "proposal" => Some(Self::Proposal),
             "search_complete" => Some(Self::SearchComplete),
             "pair_confirmed" => Some(Self::PairConfirmed),
@@ -3124,6 +3529,12 @@ impl AutotuneEvidenceRecord {
                 payload.debit_count = Some(value.debit_count);
                 EvidenceKind::SearchProbeUnmeasurable
             }
+            AutotuneEvidence::SearchInconclusive(value) => {
+                payload.evidence_direction = Some(value.direction);
+                payload.search_inconclusive_reason = Some(value.reason);
+                payload.observation_count = Some(value.observation_count);
+                EvidenceKind::SearchInconclusive
+            }
             AutotuneEvidence::PairOptionUnavailable(value) => {
                 payload.speedtest_direction = Some(value.failed_direction);
                 payload.pair_unavailable_reason = Some(value.reason);
@@ -3136,6 +3547,17 @@ impl AutotuneEvidenceRecord {
                 payload.transport_samples = Some(value.transport_samples);
                 payload.cpu_samples = Some(value.cpu_samples);
                 EvidenceKind::PairOptionUnavailable
+            }
+            AutotuneEvidence::DirectionalBypassUnavailable(value) => {
+                payload.speedtest_direction = Some(value.failed_direction);
+                payload.pair_unavailable_reason = Some(value.reason);
+                payload.candidate_ul_kbps = Some(value.candidate_ul_kbps);
+                payload.run_count = Some(value.run_count);
+                payload.debit_count = Some(value.debit_count);
+                payload.icmp_samples = Some(value.icmp_samples);
+                payload.transport_samples = Some(value.transport_samples);
+                payload.cpu_samples = Some(value.cpu_samples);
+                EvidenceKind::DirectionalBypassUnavailable
             }
             AutotuneEvidence::ProposalBuilt { digest } => {
                 payload.digest = Some(digest.clone());
@@ -3207,6 +3629,14 @@ impl AutotuneEvidenceRecord {
                     payload
                         .pair_unavailable_reason
                         .map(PairOptionUnavailableReason::as_str),
+                ),
+            ),
+            (
+                "search_inconclusive_reason",
+                optional_enum(
+                    payload
+                        .search_inconclusive_reason
+                        .map(SearchInconclusiveReason::as_str),
                 ),
             ),
             ("idle_median_us", optional_number(payload.idle_median_us)),
@@ -3300,6 +3730,10 @@ impl AutotuneEvidenceRecord {
                 optional_number(payload.run_count.map(u64::from)),
             ),
             (
+                "observation_count",
+                optional_number(payload.observation_count.map(u64::from)),
+            ),
+            (
                 "debit_count",
                 optional_number(payload.debit_count.map(u64::from)),
             ),
@@ -3375,6 +3809,10 @@ impl AutotuneEvidenceRecord {
             reader.field("pair_unavailable_reason")?,
             PairOptionUnavailableReason::parse,
         )?;
+        let search_inconclusive_reason = optional_parsed(
+            reader.field("search_inconclusive_reason")?,
+            SearchInconclusiveReason::parse,
+        )?;
         let idle_median_us = optional_u64("idle_median_us", reader.field("idle_median_us")?)?;
         let idle_p95_us = optional_u64("idle_p95_us", reader.field("idle_p95_us")?)?;
         let baseline_samples =
@@ -3435,6 +3873,8 @@ impl AutotuneEvidenceRecord {
             _ => return Err("native Auto-Tune contaminated flag is invalid".to_string()),
         };
         let run_count = optional_narrow("run_count", reader.field("run_count")?)?;
+        let observation_count =
+            optional_narrow("observation_count", reader.field("observation_count")?)?;
         let debit_count = optional_narrow("debit_count", reader.field("debit_count")?)?;
         let download_debit_count = optional_narrow(
             "download_debit_count",
@@ -3460,6 +3900,7 @@ impl AutotuneEvidenceRecord {
             evidence_direction,
             traffic_debit_purpose,
             pair_unavailable_reason,
+            search_inconclusive_reason,
             idle_median_us,
             idle_p95_us,
             baseline_samples,
@@ -3487,6 +3928,7 @@ impl AutotuneEvidenceRecord {
             background_confidence_percent,
             contaminated,
             run_count,
+            observation_count,
             debit_count,
             download_debit_count,
             upload_debit_count,
@@ -3523,6 +3965,7 @@ impl AutotuneEvidenceRecord {
 }
 
 pub struct AutotuneEvidenceStore {
+    job_directory: PathBuf,
     directory: PathBuf,
 }
 
@@ -3541,7 +3984,10 @@ impl AutotuneEvidenceStore {
             }
         }
         ensure_private_directory(&directory)?;
-        Ok(Self { directory })
+        Ok(Self {
+            job_directory: job_directory.to_path_buf(),
+            directory,
+        })
     }
 
     pub fn append(&self, record: &AutotuneEvidenceRecord) -> Result<(), String> {
@@ -3635,10 +4081,63 @@ impl AutotuneEvidenceStore {
         Ok(records)
     }
 
+    fn publish_progress(&self, progress: &NativeAutotuneProgress) -> Result<(), String> {
+        let path = autotune_progress_path(&self.job_directory, &progress.worker_run_id)?;
+        let encoded = progress.encode()?;
+        atomic_private_write(&path, encoded.as_bytes())?;
+        let stored = NativeAutotuneProgress::decode(&read_private_bounded(
+            &path,
+            MAX_AUTOTUNE_PROGRESS_BYTES,
+        )?)?;
+        if stored != *progress {
+            return Err("Auto-Tune persisted progress changed canonical content".to_string());
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn directory(&self) -> &Path {
         &self.directory
     }
+}
+
+fn autotune_progress_path(job_directory: &Path, worker_run_id: &str) -> Result<PathBuf, String> {
+    require_hex("Auto-Tune progress worker run id", worker_run_id, 32)?;
+    Ok(job_directory.join(format!("{PROGRESS_FILE_PREFIX}{worker_run_id}")))
+}
+
+pub(crate) fn read_native_autotune_progress(
+    job_directory: &Path,
+    expected_job_id: &str,
+    expected_worker_run_id: &str,
+) -> Result<NativeAutotuneProgress, String> {
+    require_hex("Auto-Tune progress job id", expected_job_id, 32)?;
+    require_hex(
+        "Auto-Tune progress worker run id",
+        expected_worker_run_id,
+        32,
+    )?;
+    ensure_private_directory(job_directory)?;
+    let path = autotune_progress_path(job_directory, expected_worker_run_id)?;
+    let progress =
+        NativeAutotuneProgress::decode(&read_private_bounded(&path, MAX_AUTOTUNE_PROGRESS_BYTES)?)?;
+    if progress.job_id != expected_job_id || progress.worker_run_id != expected_worker_run_id {
+        return Err("Auto-Tune progress identity changed".to_string());
+    }
+    let evidence_path = job_directory
+        .join(EVIDENCE_DIR)
+        .join(evidence_name(progress.evidence_sequence)?);
+    let evidence = AutotuneEvidenceRecord::decode(&read_private_bounded(
+        &evidence_path,
+        MAX_AUTOTUNE_EVIDENCE_BYTES,
+    )?)?;
+    if evidence.job_id != progress.job_id
+        || evidence.worker_run_id != progress.worker_run_id
+        || evidence.sequence != progress.evidence_sequence
+    {
+        return Err("Auto-Tune progress is not bound to its durable evidence".to_string());
+    }
+    Ok(progress)
 }
 
 fn ensure_private_directory(path: &Path) -> Result<(), String> {
@@ -3700,6 +4199,7 @@ struct EvidencePayload {
     evidence_direction: Option<EvidenceDirection>,
     traffic_debit_purpose: Option<TrafficDebitPurpose>,
     pair_unavailable_reason: Option<PairOptionUnavailableReason>,
+    search_inconclusive_reason: Option<SearchInconclusiveReason>,
     idle_median_us: Option<u64>,
     idle_p95_us: Option<u64>,
     baseline_samples: Option<u32>,
@@ -3727,6 +4227,7 @@ struct EvidencePayload {
     background_confidence_percent: Option<u8>,
     contaminated: Option<bool>,
     run_count: Option<u8>,
+    observation_count: Option<u32>,
     debit_count: Option<u32>,
     download_debit_count: Option<u32>,
     upload_debit_count: Option<u32>,
@@ -3815,6 +4316,16 @@ impl EvidencePayload {
                     debit_count: required(self.debit_count, "debit_count")?,
                 })
             }
+            EvidenceKind::SearchInconclusive => {
+                AutotuneEvidence::SearchInconclusive(SearchInconclusiveEvidence {
+                    direction: required(self.evidence_direction, "evidence_direction")?,
+                    observation_count: required(self.observation_count, "observation_count")?,
+                    reason: required(
+                        self.search_inconclusive_reason,
+                        "search_inconclusive_reason",
+                    )?,
+                })
+            }
             EvidenceKind::PairOptionUnavailable => {
                 AutotuneEvidence::PairOptionUnavailable(PairOptionUnavailableEvidence {
                     candidate_dl_kbps: required(self.candidate_dl_kbps, "candidate_dl_kbps")?,
@@ -3831,6 +4342,23 @@ impl EvidencePayload {
                     transport_samples: required(self.transport_samples, "transport_samples")?,
                     cpu_samples: required(self.cpu_samples, "cpu_samples")?,
                 })
+            }
+            EvidenceKind::DirectionalBypassUnavailable => {
+                AutotuneEvidence::DirectionalBypassUnavailable(
+                    DirectionalBypassUnavailableEvidence {
+                        candidate_ul_kbps: required(self.candidate_ul_kbps, "candidate_ul_kbps")?,
+                        failed_direction: required(
+                            self.speedtest_direction,
+                            "speedtest_direction",
+                        )?,
+                        reason: required(self.pair_unavailable_reason, "pair_unavailable_reason")?,
+                        run_count: required(self.run_count, "run_count")?,
+                        debit_count: required(self.debit_count, "debit_count")?,
+                        icmp_samples: required(self.icmp_samples, "icmp_samples")?,
+                        transport_samples: required(self.transport_samples, "transport_samples")?,
+                        cpu_samples: required(self.cpu_samples, "cpu_samples")?,
+                    },
+                )
             }
             EvidenceKind::Proposal => AutotuneEvidence::ProposalBuilt {
                 digest: required(self.digest, "digest")?,
@@ -3934,6 +4462,11 @@ impl EvidencePayload {
                 self.run_count = Some(value.run_count);
                 self.debit_count = Some(value.debit_count);
             }
+            AutotuneEvidence::SearchInconclusive(value) => {
+                self.evidence_direction = Some(value.direction);
+                self.search_inconclusive_reason = Some(value.reason);
+                self.observation_count = Some(value.observation_count);
+            }
             AutotuneEvidence::PairOptionUnavailable(value) => {
                 self.speedtest_direction = Some(value.failed_direction);
                 self.pair_unavailable_reason = Some(value.reason);
@@ -3942,6 +4475,16 @@ impl EvidencePayload {
                 self.run_count = Some(value.run_count);
                 self.download_debit_count = Some(value.download_debit_count);
                 self.upload_debit_count = Some(value.upload_debit_count);
+                self.icmp_samples = Some(value.icmp_samples);
+                self.transport_samples = Some(value.transport_samples);
+                self.cpu_samples = Some(value.cpu_samples);
+            }
+            AutotuneEvidence::DirectionalBypassUnavailable(value) => {
+                self.speedtest_direction = Some(value.failed_direction);
+                self.pair_unavailable_reason = Some(value.reason);
+                self.candidate_ul_kbps = Some(value.candidate_ul_kbps);
+                self.run_count = Some(value.run_count);
+                self.debit_count = Some(value.debit_count);
                 self.icmp_samples = Some(value.icmp_samples);
                 self.transport_samples = Some(value.transport_samples);
                 self.cpu_samples = Some(value.cpu_samples);
@@ -4107,6 +4650,7 @@ pub enum AutotuneAction {
     Search(EvidenceDirection),
     BuildRawFallback,
     ConfirmPair,
+    ConfirmMobileDownloadBypass,
     CompareTopologies,
     RestoreRuntime,
     PublishReview,
@@ -4280,6 +4824,7 @@ pub struct AutotuneReplayState {
     strategy: CalibrationStrategy,
     profile: AutotuneProfile,
     allow_sqm_disable: bool,
+    mobile_download_bypass_required: bool,
     traffic_budget_bytes: u64,
     pub phase: AutotunePhase,
     pub last_sequence: u32,
@@ -4309,12 +4854,17 @@ pub struct AutotuneReplayState {
     search_upload_starved: Option<SearchObservationStarvedEvidence>,
     search_download_unmeasurable: Option<SearchProbeUnmeasurableEvidence>,
     search_upload_unmeasurable: Option<SearchProbeUnmeasurableEvidence>,
+    search_download_inconclusive: Option<SearchInconclusiveEvidence>,
+    search_upload_inconclusive: Option<SearchInconclusiveEvidence>,
     selected_download_kbps: Option<u64>,
     selected_upload_kbps: Option<u64>,
     pair_confirmed: bool,
     pair_measurements: Vec<(u64, u64)>,
     pair_unavailable: Vec<PairOptionUnavailableEvidence>,
     pair_exhausted: bool,
+    mobile_bypass_download_complete: bool,
+    mobile_bypass_upload_complete: bool,
+    mobile_bypass_unavailable: Option<DirectionalBypassUnavailableEvidence>,
     topology_download_repeat_count: u8,
     topology_upload_repeat_count: u8,
     topologies_compared: bool,
@@ -4338,6 +4888,7 @@ impl AutotuneReplayState {
                 .profile
                 .ok_or_else(|| "Full Auto-Tune request has no profile".to_string())?,
             allow_sqm_disable: request.allow_sqm_disable,
+            mobile_download_bypass_required: mobile_download_bypass_required(request),
             traffic_budget_bytes: request.traffic_budget_bytes,
             phase: AutotunePhase::Preflight,
             last_sequence: 0,
@@ -4367,12 +4918,17 @@ impl AutotuneReplayState {
             search_upload_starved: None,
             search_download_unmeasurable: None,
             search_upload_unmeasurable: None,
+            search_download_inconclusive: None,
+            search_upload_inconclusive: None,
             selected_download_kbps: None,
             selected_upload_kbps: None,
             pair_confirmed: false,
             pair_measurements: Vec::new(),
             pair_unavailable: Vec::new(),
             pair_exhausted: false,
+            mobile_bypass_download_complete: false,
+            mobile_bypass_upload_complete: false,
+            mobile_bypass_unavailable: None,
             topology_download_repeat_count: 0,
             topology_upload_repeat_count: 0,
             topologies_compared: false,
@@ -4417,6 +4973,7 @@ impl AutotuneReplayState {
                     | AutotuneEvidence::SearchObservationStarved(_)
                     | AutotuneEvidence::SearchProbeUnmeasurable(_)
                     | AutotuneEvidence::PairOptionUnavailable(_)
+                    | AutotuneEvidence::DirectionalBypassUnavailable(_)
             )
         {
             return Err(
@@ -4432,6 +4989,14 @@ impl AutotuneReplayState {
                 self.search_download_unmeasurable
                     .or(self.search_upload_unmeasurable)
                     .map(|value| value.direction)
+            })
+            .or_else(|| {
+                self.search_download_inconclusive
+                    .or(self.search_upload_inconclusive)
+                    .map(|value| match value.direction {
+                        EvidenceDirection::Download => SpeedtestDirection::Download,
+                        EvidenceDirection::Upload => SpeedtestDirection::Upload,
+                    })
             });
         if let Some(unsettled_direction) = unsettled_direction {
             let expected_direction = match unsettled_direction {
@@ -4439,15 +5004,19 @@ impl AutotuneReplayState {
                 SpeedtestDirection::Upload => EvidenceDirection::Upload,
                 SpeedtestDirection::Both => unreachable!("search boundary shape was validated"),
             };
-            let settles_search = matches!(
-                &record.evidence,
-                AutotuneEvidence::SearchComplete { direction, .. }
-                    if *direction == expected_direction
-            ) || matches!(
-                &record.evidence,
-                AutotuneEvidence::RawFallbackBuilt { .. }
-                    if self.raw_fallback_available()
-            );
+            let inconclusive = self.search_download_inconclusive.is_some()
+                || self.search_upload_inconclusive.is_some();
+            let settles_search = (!inconclusive
+                && matches!(
+                    &record.evidence,
+                    AutotuneEvidence::SearchComplete { direction, .. }
+                        if *direction == expected_direction
+                ))
+                || matches!(
+                    &record.evidence,
+                    AutotuneEvidence::RawFallbackBuilt { .. }
+                        if self.raw_fallback_available()
+                );
             if !settles_search {
                 return Err("native Auto-Tune search boundary must settle immediately".to_string());
             }
@@ -4475,6 +5044,9 @@ impl AutotuneReplayState {
             AutotuneEvidence::SearchProbeUnmeasurable(value) => {
                 self.apply_search_probe_unmeasurable(*value)?
             }
+            AutotuneEvidence::SearchInconclusive(value) => {
+                self.apply_search_inconclusive(*value)?
+            }
             AutotuneEvidence::PairOptionUnavailable(value) => {
                 self.apply_pair_option_unavailable(*value)?
             }
@@ -4495,6 +5067,9 @@ impl AutotuneReplayState {
             },
             AutotuneEvidence::PairConfirmed { .. } => self.pair_confirmed = true,
             AutotuneEvidence::PairExhausted { .. } => self.pair_exhausted = true,
+            AutotuneEvidence::DirectionalBypassUnavailable(value) => {
+                self.apply_directional_bypass_unavailable(*value)?
+            }
             AutotuneEvidence::TopologiesCompared { .. } => self.topologies_compared = true,
             AutotuneEvidence::RawFallbackBuilt { .. } => {
                 self.raw_fallback_built = true;
@@ -4502,6 +5077,8 @@ impl AutotuneReplayState {
                 self.search_upload_starved = None;
                 self.search_download_unmeasurable = None;
                 self.search_upload_unmeasurable = None;
+                self.search_download_inconclusive = None;
+                self.search_upload_inconclusive = None;
             }
             AutotuneEvidence::RuntimeRestored => self.runtime_restored = true,
             AutotuneEvidence::ReviewReady { result_digest } => {
@@ -4559,8 +5136,16 @@ impl AutotuneReplayState {
                     AutotuneEvidence::SearchProbeUnmeasurable(_)
                 )
                 | (
+                    AutotunePhase::DirectionalSearch,
+                    AutotuneEvidence::SearchInconclusive(_)
+                )
+                | (
                     AutotunePhase::PairConfirmation,
                     AutotuneEvidence::PairOptionUnavailable(_)
+                )
+                | (
+                    AutotunePhase::TopologyComparison,
+                    AutotuneEvidence::DirectionalBypassUnavailable(_)
                 )
                 | (
                     AutotunePhase::DirectionalSearch,
@@ -4701,6 +5286,16 @@ impl AutotuneReplayState {
                             .to_string(),
                     );
                 }
+                let inconclusive = match direction {
+                    EvidenceDirection::Download => self.search_download_inconclusive,
+                    EvidenceDirection::Upload => self.search_upload_inconclusive,
+                };
+                if inconclusive.is_some() {
+                    return Err(
+                        "native Auto-Tune inconclusive search cannot publish a shaped completion"
+                            .to_string(),
+                    );
+                }
             }
             AutotuneEvidence::PairConfirmed { .. }
                 if self.pair_confirmed
@@ -4831,6 +5426,7 @@ impl AutotuneReplayState {
         validate_measurement(value)?;
         let mut search_candidate = None;
         let mut topology_repeat_direction = None;
+        let mut mobile_bypass_direction = None;
         if phase == AutotunePhase::RawControls {
             let expected = self.next_action()?;
             if expected
@@ -4952,15 +5548,48 @@ impl AutotuneReplayState {
                 );
             }
         } else if phase == AutotunePhase::TopologyComparison {
-            if !self.pair_confirmed
-                || self.strategy != CalibrationStrategy::FullRaw
-                || !self.allow_sqm_disable
-            {
+            if self.strategy != CalibrationStrategy::FullRaw || !self.allow_sqm_disable {
                 return Err(
                     "native Auto-Tune topology repeat lacks an eligible confirmed pair".to_string(),
                 );
             }
-            match value.direction {
+            if self.pair_exhausted && self.mobile_download_bypass_required {
+                if self.mobile_bypass_unavailable.is_some()
+                    || value.topology != MeasurementTopology::UploadOnlyShaped
+                    || value.candidate_dl_kbps.is_some()
+                    || value.candidate_ul_kbps != self.selected_upload_kbps
+                {
+                    return Err(
+                        "native Auto-Tune mobile download-bypass measurement contradicts its exact terminal control"
+                            .to_string(),
+                    );
+                }
+                match value.direction {
+                    SpeedtestDirection::Download
+                        if !self.mobile_bypass_download_complete
+                            && !self.mobile_bypass_upload_complete
+                            && value.achieved_dl_kbps.is_some()
+                            && value.realized_dl_kbps == value.achieved_dl_kbps =>
+                    {
+                        mobile_bypass_direction = Some(EvidenceDirection::Download);
+                    }
+                    SpeedtestDirection::Upload
+                        if self.mobile_bypass_download_complete
+                            && !self.mobile_bypass_upload_complete
+                            && value.realized_ul_kbps.is_some()
+                            && value.load_reference_ul_kbps == self.selected_upload_kbps =>
+                    {
+                        mobile_bypass_direction = Some(EvidenceDirection::Upload);
+                    }
+                    _ => {
+                        return Err(
+                            "native Auto-Tune mobile download-bypass measurements are out of order"
+                                .to_string(),
+                        )
+                    }
+                }
+            } else if self.pair_confirmed {
+                match value.direction {
                 SpeedtestDirection::Download
                     if value.topology == MeasurementTopology::RawDownload
                         && value.candidate_dl_kbps.is_none()
@@ -4986,6 +5615,12 @@ impl AutotuneReplayState {
                             .to_string(),
                     )
                 }
+                }
+            } else {
+                return Err(
+                    "native Auto-Tune topology measurement lacks confirmed pair or directional fallback authority"
+                        .to_string(),
+                );
             }
         }
 
@@ -5011,6 +5646,13 @@ impl AutotuneReplayState {
                 EvidenceDirection::Upload => {
                     self.topology_upload_repeat_count += 1;
                 }
+            }
+        }
+
+        if let Some(direction) = mobile_bypass_direction {
+            match direction {
+                EvidenceDirection::Download => self.mobile_bypass_download_complete = true,
+                EvidenceDirection::Upload => self.mobile_bypass_upload_complete = true,
             }
         }
 
@@ -5266,6 +5908,50 @@ impl AutotuneReplayState {
         Ok(())
     }
 
+    fn apply_search_inconclusive(
+        &mut self,
+        value: SearchInconclusiveEvidence,
+    ) -> Result<(), String> {
+        if !self.mutation_armed
+            || !self.proposal_seen
+            || !self.raw_fallback_controls_available()
+            || value.observation_count == 0
+            || value.observation_count as usize > MAX_PROFILE_SEARCH_OBSERVATIONS
+            || !self.pending_measurement_debits.is_empty()
+        {
+            return Err("native Auto-Tune inconclusive search boundary is invalid".to_string());
+        }
+        match value.direction {
+            EvidenceDirection::Download
+                if !self.download_search_complete
+                    && !self.upload_search_complete
+                    && self.search_download_starved.is_none()
+                    && self.search_download_unmeasurable.is_none()
+                    && self.search_download_inconclusive.is_none()
+                    && self.search_download_candidates.len()
+                        == value.observation_count as usize =>
+            {
+                self.search_download_inconclusive = Some(value);
+            }
+            EvidenceDirection::Upload
+                if self.download_search_complete
+                    && !self.upload_search_complete
+                    && self.search_upload_starved.is_none()
+                    && self.search_upload_unmeasurable.is_none()
+                    && self.search_upload_inconclusive.is_none()
+                    && self.search_upload_candidates.len() == value.observation_count as usize =>
+            {
+                self.search_upload_inconclusive = Some(value);
+            }
+            _ => {
+                return Err(
+                    "native Auto-Tune inconclusive search boundary is out of order".to_string(),
+                )
+            }
+        }
+        Ok(())
+    }
+
     fn apply_pair_option_unavailable(
         &mut self,
         value: PairOptionUnavailableEvidence,
@@ -5359,6 +6045,78 @@ impl AutotuneReplayState {
         Ok(())
     }
 
+    fn apply_directional_bypass_unavailable(
+        &mut self,
+        value: DirectionalBypassUnavailableEvidence,
+    ) -> Result<(), String> {
+        if !self.mutation_armed
+            || !self.pair_exhausted
+            || !self.mobile_download_bypass_required
+            || self.mobile_bypass_download_complete
+                && value.failed_direction == SpeedtestDirection::Download
+            || self.mobile_bypass_upload_complete
+            || self.mobile_bypass_unavailable.is_some()
+            || self.selected_upload_kbps != Some(value.candidate_ul_kbps)
+        {
+            return Err(
+                "native Auto-Tune unavailable mobile download-bypass control is invalid or duplicate"
+                    .to_string(),
+            );
+        }
+        match value.reason {
+            PairOptionUnavailableReason::TrafficBudget
+                if value.run_count == 0
+                    && value.debit_count == 0
+                    && value.icmp_samples == 0
+                    && value.transport_samples == 0
+                    && value.cpu_samples == 0
+                    && self.pending_measurement_debits.is_empty() => {}
+            PairOptionUnavailableReason::ObservationStarved
+                if matches!(
+                    value.failed_direction,
+                    SpeedtestDirection::Download | SpeedtestDirection::Upload
+                ) && value.run_count > 0
+                    && value.run_count <= MAX_DIRECTIONAL_LOAD_RUNS
+                    && value.debit_count >= u32::from(value.run_count)
+                    && self
+                        .pending_measurement_debits
+                        .single_count(value.failed_direction)
+                        == Some(value.debit_count)
+                    && (value.icmp_samples < MIN_AUTOTUNE_LOADED_ICMP_SAMPLES
+                        || value.transport_samples < MIN_AUTOTUNE_TRANSPORT_SAMPLES
+                        || value.cpu_samples < 1) => {}
+            PairOptionUnavailableReason::TransferUnmeasurable
+                if matches!(
+                    value.failed_direction,
+                    SpeedtestDirection::Download | SpeedtestDirection::Upload
+                ) && value.run_count > 0
+                    && value.run_count <= MAX_DIRECTIONAL_RESULT_UNAVAILABLE_RUNS
+                    && value.debit_count >= u32::from(value.run_count)
+                    && self
+                        .pending_measurement_debits
+                        .single_count(value.failed_direction)
+                        == Some(value.debit_count)
+                    && value.icmp_samples == 0
+                    && value.transport_samples == 0
+                    && value.cpu_samples == 0 => {}
+            _ => return Err(
+                "native Auto-Tune mobile download-bypass failure contradicts its bounded evidence"
+                    .to_string(),
+            ),
+        }
+        if value.failed_direction == SpeedtestDirection::Upload
+            && !self.mobile_bypass_download_complete
+        {
+            return Err(
+                "native Auto-Tune mobile upload-bypass failure lacks its preceding download control"
+                    .to_string(),
+            );
+        }
+        self.mobile_bypass_unavailable = Some(value);
+        self.pending_measurement_debits = PendingMeasurementDebits::None;
+        Ok(())
+    }
+
     pub fn next_action(&self) -> Result<AutotuneAction, String> {
         if self.review_digest.is_some() {
             return Ok(AutotuneAction::Complete);
@@ -5370,6 +6128,12 @@ impl AutotuneReplayState {
             return Ok(AutotuneAction::RestoreRuntime);
         }
         if self.pair_exhausted {
+            if self.mobile_download_bypass_required
+                && self.mobile_bypass_unavailable.is_none()
+                && !(self.mobile_bypass_download_complete && self.mobile_bypass_upload_complete)
+            {
+                return Ok(AutotuneAction::ConfirmMobileDownloadBypass);
+            }
             return if self.raw_fallback_available() {
                 Ok(AutotuneAction::BuildRawFallback)
             } else {
@@ -5455,16 +6219,265 @@ impl AutotuneReplayState {
         Err("native Auto-Tune replay reached an inconsistent state".to_string())
     }
 
+    pub(crate) fn progress(&self) -> Result<NativeAutotuneProgress, String> {
+        let action = self.next_action()?;
+        let progress = match action {
+            AutotuneAction::AttestPreflight => self.progress_record(
+                NativeAutotuneProgressStep::PreparingRoute,
+                3,
+                1,
+                0,
+                0,
+                None,
+                None,
+            ),
+            AutotuneAction::CaptureIdleBaseline => self.progress_record(
+                NativeAutotuneProgressStep::MeasuringIdleLatency,
+                6,
+                2,
+                0,
+                0,
+                None,
+                None,
+            ),
+            AutotuneAction::ArmRuntimeMutation => self.progress_record(
+                NativeAutotuneProgressStep::PreparingMeasurements,
+                10,
+                3,
+                0,
+                0,
+                None,
+                None,
+            ),
+            AutotuneAction::Measure {
+                topology,
+                direction,
+            } => {
+                let completed = u32::from(self.control_download_count + self.control_upload_count);
+                let step = match (topology, direction) {
+                    (MeasurementTopology::RawDownload, SpeedtestDirection::Download) => {
+                        NativeAutotuneProgressStep::MeasuringDownloadWithoutSqm
+                    }
+                    (MeasurementTopology::RawUpload, SpeedtestDirection::Upload) => {
+                        NativeAutotuneProgressStep::MeasuringUploadWithoutSqm
+                    }
+                    (MeasurementTopology::RawBoth, SpeedtestDirection::Download) => {
+                        NativeAutotuneProgressStep::MeasuringFullCapacityDownload
+                    }
+                    (MeasurementTopology::RawBoth, SpeedtestDirection::Upload) => {
+                        NativeAutotuneProgressStep::MeasuringFullCapacityUpload
+                    }
+                    (MeasurementTopology::ShapedBoth, SpeedtestDirection::Download) => {
+                        NativeAutotuneProgressStep::MeasuringShapedDownload
+                    }
+                    (MeasurementTopology::ShapedBoth, SpeedtestDirection::Upload) => {
+                        NativeAutotuneProgressStep::MeasuringShapedUpload
+                    }
+                    _ => {
+                        return Err(
+                            "Auto-Tune progress encountered an unsupported control".to_string()
+                        )
+                    }
+                };
+                self.progress_record(
+                    step,
+                    scaled_progress(12, 28, completed, 4),
+                    3,
+                    completed,
+                    4,
+                    Some(direction),
+                    Some(completed.saturating_add(1).min(4)),
+                )
+            }
+            AutotuneAction::BuildProposal => self.progress_record(
+                NativeAutotuneProgressStep::PreparingSearch,
+                29,
+                4,
+                0,
+                0,
+                None,
+                None,
+            ),
+            AutotuneAction::Search(direction) => {
+                let (completed, start, end, step, speedtest_direction, stage_index) =
+                    match direction {
+                        EvidenceDirection::Download => (
+                            self.search_download_candidates.len()
+                                + self.search_download_unobserved_candidates.len()
+                                + usize::from(self.search_download_starved.is_some())
+                                + usize::from(self.search_download_unmeasurable.is_some()),
+                            32,
+                            50,
+                            NativeAutotuneProgressStep::SearchingDownloadLimit,
+                            SpeedtestDirection::Download,
+                            5,
+                        ),
+                        EvidenceDirection::Upload => (
+                            self.search_upload_candidates.len()
+                                + self.search_upload_unobserved_candidates.len()
+                                + usize::from(self.search_upload_starved.is_some())
+                                + usize::from(self.search_upload_unmeasurable.is_some()),
+                            52,
+                            69,
+                            NativeAutotuneProgressStep::SearchingUploadLimit,
+                            SpeedtestDirection::Upload,
+                            6,
+                        ),
+                    };
+                let completed = u32::try_from(completed)
+                    .map_err(|_| "Auto-Tune progress search count overflowed".to_string())?;
+                let total = u32::try_from(MAX_PROFILE_SEARCH_OBSERVATIONS)
+                    .map_err(|_| "Auto-Tune progress search bound overflowed".to_string())?;
+                self.progress_record(
+                    step,
+                    scaled_progress(start, end, completed, total),
+                    stage_index,
+                    completed,
+                    total,
+                    Some(speedtest_direction),
+                    Some(completed.saturating_add(1).min(total)),
+                )
+            }
+            AutotuneAction::ConfirmPair => {
+                let completed =
+                    u32::try_from(self.pair_measurements.len() + self.pair_unavailable.len())
+                        .map_err(|_| "Auto-Tune progress pair count overflowed".to_string())?;
+                let total = u32::try_from(MAX_PROFILE_REVIEW_OPTIONS)
+                    .map_err(|_| "Auto-Tune progress pair bound overflowed".to_string())?;
+                self.progress_record(
+                    NativeAutotuneProgressStep::ConfirmingCandidate,
+                    scaled_progress(72, 82, completed, total),
+                    7,
+                    completed,
+                    total,
+                    Some(SpeedtestDirection::Both),
+                    Some(completed.saturating_add(1).min(total)),
+                )
+            }
+            AutotuneAction::ConfirmMobileDownloadBypass => {
+                let completed = u32::from(self.mobile_bypass_download_complete)
+                    + u32::from(self.mobile_bypass_upload_complete);
+                self.progress_record(
+                    NativeAutotuneProgressStep::ConfirmingMobileDownloadBypass,
+                    scaled_progress(83, 91, completed, 2),
+                    8,
+                    completed,
+                    2,
+                    Some(if self.mobile_bypass_download_complete {
+                        SpeedtestDirection::Upload
+                    } else {
+                        SpeedtestDirection::Download
+                    }),
+                    Some(completed + 1),
+                )
+            }
+            AutotuneAction::CompareTopologies => {
+                let completed = u32::from(
+                    self.topology_download_repeat_count + self.topology_upload_repeat_count,
+                );
+                let total = u32::from(MAX_TOPOLOGY_REPEAT_ATTEMPTS_PER_DIRECTION) * 2;
+                let (step, direction) = if self.topology_download_repeat_count
+                    < MAX_TOPOLOGY_REPEAT_ATTEMPTS_PER_DIRECTION
+                {
+                    (
+                        NativeAutotuneProgressStep::ComparingDownloadWithoutSqm,
+                        SpeedtestDirection::Download,
+                    )
+                } else {
+                    (
+                        NativeAutotuneProgressStep::ComparingUploadWithoutSqm,
+                        SpeedtestDirection::Upload,
+                    )
+                };
+                self.progress_record(
+                    step,
+                    scaled_progress(84, 91, completed, total),
+                    8,
+                    completed,
+                    total,
+                    Some(direction),
+                    Some(completed.saturating_add(1).min(total)),
+                )
+            }
+            AutotuneAction::BuildRawFallback => self.progress_record(
+                NativeAutotuneProgressStep::PreparingRawProposal,
+                91,
+                8,
+                0,
+                0,
+                None,
+                None,
+            ),
+            AutotuneAction::RestoreRuntime => self.progress_record(
+                NativeAutotuneProgressStep::RestoringSettings,
+                94,
+                9,
+                0,
+                0,
+                None,
+                None,
+            ),
+            AutotuneAction::PublishReview => self.progress_record(
+                NativeAutotuneProgressStep::PreparingProposals,
+                98,
+                10,
+                0,
+                0,
+                None,
+                None,
+            ),
+            AutotuneAction::Complete => self.progress_record(
+                NativeAutotuneProgressStep::PreparingProposals,
+                99,
+                10,
+                0,
+                0,
+                None,
+                None,
+            ),
+        };
+        progress.validate(true)?;
+        Ok(progress)
+    }
+
+    fn progress_record(
+        &self,
+        step: NativeAutotuneProgressStep,
+        progress_percent: u8,
+        stage_index: u8,
+        completed_units: u32,
+        total_units: u32,
+        direction: Option<SpeedtestDirection>,
+        attempt: Option<u32>,
+    ) -> NativeAutotuneProgress {
+        NativeAutotuneProgress {
+            job_id: self.job_id.clone(),
+            worker_run_id: self.worker_run_id.clone(),
+            evidence_sequence: self.last_sequence,
+            step,
+            progress_percent,
+            stage_index,
+            stage_total: 10,
+            completed_units,
+            total_units,
+            direction,
+            attempt,
+        }
+    }
+
     fn raw_controls_complete(&self) -> bool {
         self.control_download_count == 2 && self.control_upload_count == 2
     }
 
     fn raw_fallback_available(&self) -> bool {
+        self.raw_fallback_controls_available() && self.raw_fallback_boundary().is_some()
+    }
+
+    fn raw_fallback_controls_available(&self) -> bool {
         uses_full_raw_controls(self.strategy, self.allow_sqm_disable)
             && self.raw_controls_complete()
             && self.raw_both_download_seen
             && self.raw_both_upload_seen
-            && self.raw_fallback_boundary().is_some()
     }
 
     fn raw_fallback_boundary(
@@ -5483,7 +6496,8 @@ impl AutotuneReplayState {
             |direction: EvidenceDirection,
              unobserved_exhausted: bool,
              starved: Option<SearchObservationStarvedEvidence>,
-             unmeasurable: Option<SearchProbeUnmeasurableEvidence>| {
+             unmeasurable: Option<SearchProbeUnmeasurableEvidence>,
+             inconclusive: Option<SearchInconclusiveEvidence>| {
                 if unobserved_exhausted {
                     Some((Some(direction), NativeRawFallbackBoundary::UnobservedFloor))
                 } else if let Some(value) = starved {
@@ -5496,15 +6510,23 @@ impl AutotuneReplayState {
                             },
                         },
                     ))
+                } else if let Some(value) = unmeasurable {
+                    Some((
+                        Some(direction),
+                        NativeRawFallbackBoundary::TransferUnmeasurable {
+                            candidate_kbps: match direction {
+                                EvidenceDirection::Download => value.candidate_dl_kbps,
+                                EvidenceDirection::Upload => value.candidate_ul_kbps,
+                            },
+                        },
+                    ))
                 } else {
-                    unmeasurable.map(|value| {
+                    inconclusive.map(|value| {
                         (
                             Some(direction),
-                            NativeRawFallbackBoundary::TransferUnmeasurable {
-                                candidate_kbps: match direction {
-                                    EvidenceDirection::Download => value.candidate_dl_kbps,
-                                    EvidenceDirection::Upload => value.candidate_ul_kbps,
-                                },
+                            NativeRawFallbackBoundary::SearchInconclusive {
+                                observation_count: u64::from(value.observation_count),
+                                reason: value.reason,
                             },
                         )
                     })
@@ -5517,6 +6539,7 @@ impl AutotuneReplayState {
                 self.search_download_unobserved_exhausted,
                 self.search_download_starved,
                 self.search_download_unmeasurable,
+                self.search_download_inconclusive,
             );
         }
         if !self.upload_search_complete {
@@ -5525,6 +6548,7 @@ impl AutotuneReplayState {
                 self.search_upload_unobserved_exhausted,
                 self.search_upload_starved,
                 self.search_upload_unmeasurable,
+                self.search_upload_inconclusive,
             );
         }
         None
@@ -5536,6 +6560,13 @@ impl AutotuneReplayState {
             && self.raw_both_upload_seen
             && self.topologies_compared
     }
+}
+
+fn scaled_progress(start: u8, end: u8, completed: u32, total: u32) -> u8 {
+    debug_assert!(start <= end && end < 100 && total > 0 && completed <= total);
+    let width = u32::from(end - start);
+    let offset = width.saturating_mul(completed) / total;
+    u8::try_from(u32::from(start) + offset).expect("progress bands are below 100")
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -6297,6 +7328,38 @@ fn native_profile_search_result(
                         .to_string()
                 })?;
             }
+            continue;
+        }
+        if let AutotuneEvidence::SearchInconclusive(value) = &record.evidence {
+            if value.direction != direction {
+                continue;
+            }
+            if record.phase != AutotunePhase::DirectionalSearch
+                || terminal_boundary_seen
+                || completion_seen
+            {
+                return Err(
+                    "native Auto-Tune inconclusive search evidence is duplicated or out of order"
+                        .to_string(),
+                );
+            }
+            let current = latest_result.as_ref().ok_or_else(|| {
+                "native Auto-Tune inconclusive search boundary has no observation".to_string()
+            })?;
+            if current.action != ProfileSearchAction::Inconclusive
+                || current.selected_index.is_some()
+                || current.next_candidate_kbps.is_some()
+                || !current.review_options().is_empty()
+                || current.observations.len() != value.observation_count as usize
+                || SearchInconclusiveReason::parse(current.reason) != Some(value.reason)
+            {
+                return Err(
+                    "native Auto-Tune inconclusive search boundary contradicts its optimizer result"
+                        .to_string(),
+                );
+            }
+            terminal_seen = true;
+            terminal_boundary_seen = true;
             continue;
         }
         if matches!(
@@ -7302,7 +8365,10 @@ fn verify_native_pair_exhaustion_transaction(
         })?;
     let transaction_records = &records[..=terminal_index];
     let replay = AutotuneReplayState::replay(request, worker_run_id, transaction_records)?;
-    if replay.next_action()? != AutotuneAction::BuildRawFallback {
+    if !matches!(
+        replay.next_action()?,
+        AutotuneAction::BuildRawFallback | AutotuneAction::ConfirmMobileDownloadBypass
+    ) {
         return Err("native Auto-Tune pair-exhaustion transaction is incomplete".to_string());
     }
     let digest = match &transaction_records
@@ -7621,9 +8687,19 @@ impl NativeRawFallbackDirectionResult {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeRawFallbackBoundary {
     UnobservedFloor,
-    ObservationStarved { candidate_kbps: u64 },
-    TransferUnmeasurable { candidate_kbps: u64 },
-    PairExhausted { candidate_count: u64 },
+    ObservationStarved {
+        candidate_kbps: u64,
+    },
+    TransferUnmeasurable {
+        candidate_kbps: u64,
+    },
+    SearchInconclusive {
+        observation_count: u64,
+        reason: SearchInconclusiveReason,
+    },
+    PairExhausted {
+        candidate_count: u64,
+    },
 }
 
 impl NativeRawFallbackBoundary {
@@ -7632,6 +8708,7 @@ impl NativeRawFallbackBoundary {
             Self::UnobservedFloor => "unobserved_floor_exhaustion",
             Self::ObservationStarved { .. } => "loaded_observation_starved",
             Self::TransferUnmeasurable { .. } => "candidate_transfer_unmeasurable",
+            Self::SearchInconclusive { .. } => "shaped_search_inconclusive",
             Self::PairExhausted { .. } => "pair_options_exhausted",
         }
     }
@@ -7641,7 +8718,106 @@ impl NativeRawFallbackBoundary {
             Self::UnobservedFloor => None,
             Self::ObservationStarved { candidate_kbps }
             | Self::TransferUnmeasurable { candidate_kbps } => Some(candidate_kbps),
+            Self::SearchInconclusive { .. } => None,
             Self::PairExhausted { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct NativeMobileDownloadBypassResult {
+    selected_ul_kbps: u64,
+    runtime_minimum_ul_kbps: Option<u64>,
+    download: MeasurementEvidence,
+    upload: MeasurementEvidence,
+    upload_candidate_realization_percent: f64,
+    upload_capacity_retention_percent: f64,
+    upload_capacity_alignment_confirmed: bool,
+    manual_apply_eligible: bool,
+    required_acknowledgements: Vec<NativeApplyAcknowledgement>,
+}
+
+impl NativeMobileDownloadBypassResult {
+    fn to_json(&self) -> String {
+        let acknowledgements = self
+            .required_acknowledgements
+            .iter()
+            .map(|value| json_string(value.as_str()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let optional_rate = |value: Option<u64>| {
+            value.map_or_else(|| "null".to_string(), |value| value.to_string())
+        };
+        format!(
+            concat!(
+                "{{\"available\":true,\"selected_topology\":\"upload_only_shaped\",",
+                "\"selected_ul_kbps\":{},\"runtime_minimum_ul_kbps\":{},",
+                "\"download\":{{\"achieved_kbps\":{},\"effective_delta_ms\":{:.3},",
+                "\"loss_ppm\":{},\"background_confidence_percent\":{},",
+                "\"contaminated\":{},\"transport_censored\":{}}},",
+                "\"upload\":{{\"achieved_kbps\":{},\"realized_kbps\":{},",
+                "\"effective_delta_ms\":{:.3},\"candidate_realization_percent\":{:.3},",
+                "\"capacity_retention_percent\":{:.3},\"loss_ppm\":{},",
+                "\"background_confidence_percent\":{},\"contaminated\":{},",
+                "\"transport_censored\":{},\"capacity_alignment_confirmed\":{}}},",
+                "\"manual_apply_eligible\":{},\"required_acknowledgements\":[{}]}}"
+            ),
+            self.selected_ul_kbps,
+            optional_rate(self.runtime_minimum_ul_kbps),
+            self.download
+                .achieved_dl_kbps
+                .expect("mobile bypass download measurement has achieved rate"),
+            measurement_effective_delta_ms(self.download),
+            self.download.loss_ppm,
+            self.download.background_confidence_percent,
+            self.download.contaminated,
+            self.download.transport_censored,
+            self.upload
+                .achieved_ul_kbps
+                .expect("mobile bypass upload measurement has achieved rate"),
+            self.upload
+                .realized_ul_kbps
+                .expect("mobile bypass upload measurement has realized rate"),
+            measurement_effective_delta_ms(self.upload),
+            self.upload_candidate_realization_percent,
+            self.upload_capacity_retention_percent,
+            self.upload.loss_ppm,
+            self.upload.background_confidence_percent,
+            self.upload.contaminated,
+            self.upload.transport_censored,
+            self.upload_capacity_alignment_confirmed,
+            self.manual_apply_eligible,
+            acknowledgements,
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum NativeMobileDownloadBypassOutcome {
+    Confirmed(NativeMobileDownloadBypassResult),
+    Unavailable(DirectionalBypassUnavailableEvidence),
+}
+
+impl NativeMobileDownloadBypassOutcome {
+    fn to_json(&self) -> String {
+        match self {
+            Self::Confirmed(value) => value.to_json(),
+            Self::Unavailable(value) => format!(
+                concat!(
+                    "{{\"available\":false,\"selected_topology\":\"upload_only_shaped\",",
+                    "\"candidate_ul_kbps\":{},\"failed_direction\":\"{}\",",
+                    "\"reason\":\"{}\",\"run_count\":{},\"debit_count\":{},",
+                    "\"samples\":{{\"icmp\":{},\"transport\":{},\"cpu\":{}}}}}"
+                ),
+                value.candidate_ul_kbps,
+                value.failed_direction.as_str(),
+                value.reason.as_str(),
+                value.run_count,
+                value.debit_count,
+                value.icmp_samples,
+                value.transport_samples,
+                value.cpu_samples,
+            ),
         }
     }
 }
@@ -7656,6 +8832,7 @@ struct NativeRawFallbackResult {
     download: NativeRawFallbackDirectionResult,
     upload: NativeRawFallbackDirectionResult,
     required_acknowledgements: Vec<NativeApplyAcknowledgement>,
+    mobile_download_bypass: Option<NativeMobileDownloadBypassOutcome>,
 }
 
 impl NativeRawFallbackResult {
@@ -7722,26 +8899,65 @@ impl NativeRawFallbackResult {
                 self.upload.to_json(),
                 acknowledgements,
             ),
-            NativeRawFallbackBoundary::PairExhausted { candidate_count } => format!(
+            NativeRawFallbackBoundary::SearchInconclusive {
+                observation_count,
+                reason,
+            } => format!(
                 concat!(
-                    "{{\"schema_version\":3,\"selected_topology\":\"no_sqm\",",
-                    "\"reason\":\"shaped-pair-options-exhausted\",",
-                    "\"failed_direction\":null,",
-                    "\"terminal_boundary\":{{\"kind\":\"pair_options_exhausted\",",
-                    "\"candidate_count\":{}}},",
+                    "{{\"schema_version\":4,\"selected_topology\":\"no_sqm\",",
+                    "\"reason\":\"shaped-search-inconclusive\",",
+                    "\"failed_direction\":\"{}\",",
+                    "\"terminal_boundary\":{{\"kind\":\"shaped_search_inconclusive\",",
+                    "\"observation_count\":{},\"optimizer_reason\":\"{}\"}},",
                     "\"discarded_shaped_observation_count\":{},",
                     "\"target_grade\":\"{}\",\"auto_apply_pass\":false,",
                     "\"manual_review_required\":true,",
                     "\"download\":{},\"upload\":{},",
                     "\"required_acknowledgements\":[{}]}}"
                 ),
-                candidate_count,
+                self.failed_direction
+                    .expect("inconclusive raw fallback has a failed direction")
+                    .as_str(),
+                observation_count,
+                reason.as_str(),
                 self.discarded_shaped_observation_count,
                 self.target_grade,
                 self.download.to_json(),
                 self.upload.to_json(),
                 acknowledgements,
             ),
+            NativeRawFallbackBoundary::PairExhausted { candidate_count } => {
+                let directional_suffix = self.mobile_download_bypass.as_ref().map_or_else(
+                    || "}".to_string(),
+                    |value| format!(",\"mobile_download_bypass\":{}}}", value.to_json()),
+                );
+                format!(
+                    concat!(
+                        "{{\"schema_version\":{},\"selected_topology\":\"no_sqm\",",
+                        "\"reason\":\"shaped-pair-options-exhausted\",",
+                        "\"failed_direction\":null,",
+                        "\"terminal_boundary\":{{\"kind\":\"pair_options_exhausted\",",
+                        "\"candidate_count\":{}}},",
+                        "\"discarded_shaped_observation_count\":{},",
+                        "\"target_grade\":\"{}\",\"auto_apply_pass\":false,",
+                        "\"manual_review_required\":true,",
+                        "\"download\":{},\"upload\":{},",
+                        "\"required_acknowledgements\":[{}]{}"
+                    ),
+                    if self.mobile_download_bypass.is_some() {
+                        5
+                    } else {
+                        3
+                    },
+                    candidate_count,
+                    self.discarded_shaped_observation_count,
+                    self.target_grade,
+                    self.download.to_json(),
+                    self.upload.to_json(),
+                    acknowledgements,
+                    directional_suffix,
+                )
+            }
         }
     }
 }
@@ -7873,15 +9089,182 @@ fn raw_fallback_acknowledgements(
     values
 }
 
-fn native_raw_fallback_result(
+fn native_mobile_download_bypass_outcome(
+    request: &OperationRequest,
+    proposal: &AutotuneProposal,
+    records: &[AutotuneEvidenceRecord],
+) -> Result<Option<NativeMobileDownloadBypassOutcome>, String> {
+    if !mobile_download_bypass_required(request) {
+        return Ok(None);
+    }
+    let replay_worker_run_id = records
+        .first()
+        .map(|record| record.worker_run_id.as_str())
+        .ok_or_else(|| "native mobile download-bypass has no replay identity".to_string())?;
+    let replay = AutotuneReplayState::replay(request, replay_worker_run_id, records)?;
+    if !replay.pair_exhausted {
+        return Ok(None);
+    }
+    if let Some(value) = replay.mobile_bypass_unavailable {
+        return Ok(Some(NativeMobileDownloadBypassOutcome::Unavailable(value)));
+    }
+    let measurements = records
+        .iter()
+        .filter_map(|record| match record.evidence {
+            AutotuneEvidence::Measurement(value)
+                if record.phase == AutotunePhase::TopologyComparison
+                    && value.topology == MeasurementTopology::UploadOnlyShaped =>
+            {
+                Some(value)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if measurements.len() != 2
+        || measurements[0].direction != SpeedtestDirection::Download
+        || measurements[1].direction != SpeedtestDirection::Upload
+    {
+        return Err(
+            "native mobile download-bypass requires exact sequential download and upload controls"
+                .to_string(),
+        );
+    }
+    let download = measurements[0];
+    let upload = measurements[1];
+    let upload_search = native_profile_search_result(proposal, EvidenceDirection::Upload, records)?;
+    let (selected_ul_kbps, runtime_minimum_ul_kbps) =
+        selected_profile_search_point(&upload_search)?;
+    if download.candidate_dl_kbps.is_some()
+        || upload.candidate_dl_kbps.is_some()
+        || download.candidate_ul_kbps != Some(selected_ul_kbps)
+        || upload.candidate_ul_kbps != Some(selected_ul_kbps)
+        || upload.load_reference_ul_kbps != Some(selected_ul_kbps)
+    {
+        return Err(
+            "native mobile download-bypass measurements changed their selected upload rate"
+                .to_string(),
+        );
+    }
+    let download_achieved = download
+        .achieved_dl_kbps
+        .ok_or_else(|| "native mobile download-bypass has no achieved download rate".to_string())?;
+    let upload_achieved = upload
+        .achieved_ul_kbps
+        .ok_or_else(|| "native mobile download-bypass has no achieved upload rate".to_string())?;
+    let upload_realized = upload
+        .realized_ul_kbps
+        .ok_or_else(|| "native mobile download-bypass has no realized upload rate".to_string())?;
+    let thresholds = proposal.validation_thresholds;
+    let realization_percent = upload_realized as f64 * 100.0 / selected_ul_kbps as f64;
+    let retention_percent =
+        upload_achieved as f64 * 100.0 / proposal.upload.observed_low_kbps as f64;
+    let upload_target_met = !upload.transport_censored
+        && upload.icmp_delta_us as f64 / 1_000.0 < thresholds.icmp_delta_max_ms
+        && upload.transport_delta_us as f64 / 1_000.0 < thresholds.transport_delta_max_ms;
+    let upload_capacity_limited_review =
+        upload_search.physical_capacity_limited_review_for(selected_ul_kbps);
+    let wire_to_goodput_percent = upload_realized as f64 * 100.0 / upload_achieved as f64;
+    let upload_capacity_alignment_confirmed = upload_capacity_limited_review
+        && upload_realized >= proposal.upload.exploration_minimum_kbps
+        && !upload.transport_censored
+        && !upload.contaminated
+        && upload.background_confidence_percent >= 80
+        && upload.loss_ppm as f64 / 10_000.0 <= thresholds.loss_max_percent
+        && upload.cpu_milli_percent as f64 / 1_000.0 <= thresholds.cpu_max_percent
+        && upload_target_met
+        && realization_percent < thresholds.candidate_realization_min_percent
+        && wire_to_goodput_percent >= thresholds.candidate_realization_min_percent
+        && wire_to_goodput_percent <= thresholds.candidate_realization_max_percent;
+    let throughput_floor = crate::autotune::THROUGHPUT_TRUST_FLOOR_PERCENT;
+    let normal_throughput =
+        realization_percent >= throughput_floor && retention_percent >= throughput_floor;
+    let hard_safety_pass = download_achieved > 0
+        && upload_achieved > 0
+        && upload_realized > 0
+        && realization_percent <= thresholds.candidate_realization_max_percent
+        && download.loss_ppm as f64 / 10_000.0 <= thresholds.loss_max_percent
+        && upload.loss_ppm as f64 / 10_000.0 <= thresholds.loss_max_percent;
+    let manual_apply_eligible =
+        hard_safety_pass && (normal_throughput || upload_capacity_alignment_confirmed);
+
+    let mut acknowledgements = vec![NativeApplyAcknowledgement::DownloadShapingBypassed];
+    if download.contaminated {
+        acknowledgements.push(NativeApplyAcknowledgement::DownloadRawContaminated);
+    }
+    if download.transport_censored || download.background_confidence_percent < 80 {
+        acknowledgements.push(NativeApplyAcknowledgement::DownloadRawConfidence);
+    }
+    if download.transport_censored
+        || measurement_effective_delta_ms(download) >= proposal.profile.target_delta_ms()
+    {
+        acknowledgements.push(NativeApplyAcknowledgement::DownloadRawQualityTarget);
+    }
+    if realization_percent < thresholds.candidate_realization_min_percent {
+        acknowledgements.push(NativeApplyAcknowledgement::UploadCandidateRealization);
+    }
+    if retention_percent < thresholds.capacity_retention_min_percent {
+        acknowledgements.push(NativeApplyAcknowledgement::UploadCapacityRetention);
+    }
+    if upload_capacity_alignment_confirmed && !normal_throughput {
+        acknowledgements.push(NativeApplyAcknowledgement::UploadThroughputSafetyFloor);
+    }
+    if upload.icmp_delta_us as f64 / 1_000.0 >= thresholds.icmp_delta_max_ms {
+        acknowledgements.push(NativeApplyAcknowledgement::UploadIcmpLatency);
+    }
+    if upload.transport_censored
+        || upload.transport_delta_us as f64 / 1_000.0 >= thresholds.transport_delta_max_ms
+    {
+        acknowledgements.push(NativeApplyAcknowledgement::UploadTransportLatency);
+    }
+    if upload.contaminated {
+        acknowledgements.push(NativeApplyAcknowledgement::MeasurementContaminated);
+    }
+    if upload.transport_censored || upload.background_confidence_percent < 80 {
+        acknowledgements.push(NativeApplyAcknowledgement::MeasurementConfidence);
+    }
+    if upload_capacity_limited_review {
+        acknowledgements.push(NativeApplyAcknowledgement::UploadPhysicalCapacityLimited);
+    }
+    acknowledgements.sort_unstable();
+    acknowledgements.dedup();
+    Ok(Some(NativeMobileDownloadBypassOutcome::Confirmed(
+        NativeMobileDownloadBypassResult {
+            selected_ul_kbps,
+            runtime_minimum_ul_kbps,
+            download,
+            upload,
+            upload_candidate_realization_percent: realization_percent,
+            upload_capacity_retention_percent: retention_percent,
+            upload_capacity_alignment_confirmed,
+            manual_apply_eligible,
+            required_acknowledgements: acknowledgements,
+        },
+    )))
+}
+
+fn native_raw_fallback_result_with_mobile_confirmation(
     request: &OperationRequest,
     worker_run_id: &str,
     proposal: &AutotuneProposal,
     records: &[AutotuneEvidenceRecord],
+    require_mobile_confirmation: bool,
 ) -> Result<NativeRawFallbackResult, String> {
     let replay = AutotuneReplayState::replay(request, worker_run_id, records)?;
-    if replay.next_action()? != AutotuneAction::BuildRawFallback {
+    let next_action = replay.next_action()?;
+    if require_mobile_confirmation && next_action != AutotuneAction::BuildRawFallback {
         return Err("native raw fallback requires an exhausted shaped search".to_string());
+    }
+    if !require_mobile_confirmation
+        && (next_action != AutotuneAction::ConfirmMobileDownloadBypass
+            || !mobile_download_bypass_required(request)
+            || replay.mobile_bypass_download_complete
+            || replay.mobile_bypass_upload_complete
+            || replay.mobile_bypass_unavailable.is_some())
+    {
+        return Err(
+            "legacy native raw fallback is not an untouched mobile pair-exhaustion transaction"
+                .to_string(),
+        );
     }
     let (failed_direction, boundary) = replay
         .raw_fallback_boundary()
@@ -7909,6 +9292,28 @@ fn native_raw_fallback_result(
             {
                 return Err(
                     "native raw fallback terminal boundary still has a shaped selection"
+                        .to_string(),
+                );
+            }
+            Vec::new()
+        }
+        NativeRawFallbackBoundary::SearchInconclusive {
+            observation_count,
+            reason,
+        } => {
+            let failed_direction = failed_direction.ok_or_else(|| {
+                "native raw fallback inconclusive boundary has no failed direction".to_string()
+            })?;
+            let decision = native_profile_search_result(proposal, failed_direction, records)?;
+            if decision.action != ProfileSearchAction::Inconclusive
+                || decision.selected_index.is_some()
+                || decision.next_candidate_kbps.is_some()
+                || !decision.review_options().is_empty()
+                || decision.observations.len() as u64 != observation_count
+                || SearchInconclusiveReason::parse(decision.reason) != Some(reason)
+            {
+                return Err(
+                    "native raw fallback inconclusive boundary contradicts its measured optimizer result"
                         .to_string(),
                 );
             }
@@ -7946,6 +9351,13 @@ fn native_raw_fallback_result(
     let upload =
         native_raw_fallback_direction_result(proposal, records, EvidenceDirection::Upload)?;
     let required_acknowledgements = raw_fallback_acknowledgements(&download, &upload);
+    let mobile_download_bypass = if require_mobile_confirmation
+        && matches!(boundary, NativeRawFallbackBoundary::PairExhausted { .. })
+    {
+        native_mobile_download_bypass_outcome(request, proposal, records)?
+    } else {
+        None
+    };
     Ok(NativeRawFallbackResult {
         failed_direction,
         boundary,
@@ -7963,7 +9375,23 @@ fn native_raw_fallback_result(
         download,
         upload,
         required_acknowledgements,
+        mobile_download_bypass,
     })
+}
+
+fn native_raw_fallback_result(
+    request: &OperationRequest,
+    worker_run_id: &str,
+    proposal: &AutotuneProposal,
+    records: &[AutotuneEvidenceRecord],
+) -> Result<NativeRawFallbackResult, String> {
+    native_raw_fallback_result_with_mobile_confirmation(
+        request,
+        worker_run_id,
+        proposal,
+        records,
+        true,
+    )
 }
 
 fn canonical_raw_fallback_bytes(result: &NativeRawFallbackResult) -> Result<Vec<u8>, String> {
@@ -8024,13 +9452,27 @@ fn verify_native_raw_fallback_transaction(
         _ => return Err("native raw-fallback terminal evidence is invalid".to_string()),
     };
     require_hex("native raw-fallback digest", digest, 64)?;
-    let result = native_raw_fallback_result(request, worker_run_id, proposal, source_records)?;
+    let stored = read_private_bounded(result_path, MAX_AUTOTUNE_REVIEW_BYTES)?;
+    let result = match native_raw_fallback_result(request, worker_run_id, proposal, source_records)
+    {
+        Ok(result) => result,
+        Err(strict_error) if stored.as_bytes().starts_with(b"{\"schema_version\":3,") => {
+            native_raw_fallback_result_with_mobile_confirmation(
+                request,
+                worker_run_id,
+                proposal,
+                source_records,
+                false,
+            )
+            .map_err(|_| strict_error)?
+        }
+        Err(error) => return Err(error),
+    };
     let replay = AutotuneReplayState::replay(request, worker_run_id, transaction_records)?;
     if replay.next_action()? != AutotuneAction::RestoreRuntime {
         return Err("native raw-fallback transaction did not reach restore".to_string());
     }
     let bytes = canonical_raw_fallback_bytes(&result)?;
-    let stored = read_private_bounded(result_path, MAX_AUTOTUNE_REVIEW_BYTES)?;
     if stored.as_bytes() != bytes || sqm_identity::sha256sum(stored.as_bytes())? != digest.as_str()
     {
         return Err("native raw-fallback digest mismatch".to_string());
@@ -8388,17 +9830,18 @@ fn topology_comparison_traffic_budget_limited(topology: &NativeTopologyCompariso
 fn native_topology_apply_acknowledgements(
     pair: &NativePairConfirmationResult,
     topology: &NativeTopologyComparisonResult,
+    selected_topology: MeasurementTopology,
 ) -> Result<Vec<NativeApplyAcknowledgement>, String> {
     let primary = pair.options.first().ok_or_else(|| {
         "native Apply topology has no confirmed shaped reference option".to_string()
     })?;
     let mut values = primary.required_acknowledgements()?;
     let download_shaped = matches!(
-        topology.selected_topology,
+        selected_topology,
         MeasurementTopology::ShapedBoth | MeasurementTopology::DownloadOnlyShaped
     );
     let upload_shaped = matches!(
-        topology.selected_topology,
+        selected_topology,
         MeasurementTopology::ShapedBoth | MeasurementTopology::UploadOnlyShaped
     );
     values.retain(|value| match value {
@@ -8419,41 +9862,46 @@ fn native_topology_apply_acknowledgements(
         _ => false,
     });
 
-    let mut append_raw = |direction: EvidenceDirection, result: &NativeTopologyDirectionResult| {
-        if result.choice != TopologyDirectionChoice::Unshaped {
-            return;
-        }
-        match direction {
-            EvidenceDirection::Download => {
-                if result.contaminated {
-                    values.push(NativeApplyAcknowledgement::DownloadRawContaminated);
+    let mut append_raw =
+        |direction: EvidenceDirection, bypassed: bool, result: &NativeTopologyDirectionResult| {
+            if !bypassed {
+                return;
+            }
+            match direction {
+                EvidenceDirection::Download => {
+                    if result.contaminated {
+                        values.push(NativeApplyAcknowledgement::DownloadRawContaminated);
+                    }
+                    if !result.measurement_reliable {
+                        values.push(NativeApplyAcknowledgement::DownloadRawConfidence);
+                    }
+                    if !result.raw_target_met {
+                        values.push(NativeApplyAcknowledgement::DownloadRawQualityTarget);
+                    }
                 }
-                if !result.measurement_reliable {
-                    values.push(NativeApplyAcknowledgement::DownloadRawConfidence);
-                }
-                if !result.raw_target_met {
-                    values.push(NativeApplyAcknowledgement::DownloadRawQualityTarget);
+                EvidenceDirection::Upload => {
+                    if result.contaminated {
+                        values.push(NativeApplyAcknowledgement::UploadRawContaminated);
+                    }
+                    if !result.measurement_reliable {
+                        values.push(NativeApplyAcknowledgement::UploadRawConfidence);
+                    }
+                    if !result.raw_target_met {
+                        values.push(NativeApplyAcknowledgement::UploadRawQualityTarget);
+                    }
                 }
             }
-            EvidenceDirection::Upload => {
-                if result.contaminated {
-                    values.push(NativeApplyAcknowledgement::UploadRawContaminated);
-                }
-                if !result.measurement_reliable {
-                    values.push(NativeApplyAcknowledgement::UploadRawConfidence);
-                }
-                if !result.raw_target_met {
-                    values.push(NativeApplyAcknowledgement::UploadRawQualityTarget);
-                }
-            }
-        }
-    };
-    append_raw(EvidenceDirection::Download, &topology.download);
-    append_raw(EvidenceDirection::Upload, &topology.upload);
+        };
+    append_raw(
+        EvidenceDirection::Download,
+        !download_shaped,
+        &topology.download,
+    );
+    append_raw(EvidenceDirection::Upload, !upload_shaped, &topology.upload);
     if topology_comparison_traffic_budget_limited(topology) {
         values.push(NativeApplyAcknowledgement::TopologyComparisonTrafficBudget);
     }
-    match topology.selected_topology {
+    match selected_topology {
         MeasurementTopology::DownloadOnlyShaped => {
             values.push(NativeApplyAcknowledgement::UploadShapingBypassed)
         }
@@ -8469,6 +9917,31 @@ fn native_topology_apply_acknowledgements(
     values.sort_unstable();
     values.dedup();
     Ok(values)
+}
+
+const MAX_NATIVE_APPLY_REVIEW_OPTIONS: usize = 4;
+
+fn mobile_download_bypass_required(request: &OperationRequest) -> bool {
+    request.strategy == Some(CalibrationStrategy::FullRaw)
+        && request.allow_sqm_disable
+        && request.access_source == Some(AccessEvidenceSource::UserSelected)
+        && matches!(
+            request.access_medium,
+            Some(
+                AccessMedium::Cellular
+                    | AccessMedium::LeoSatellite
+                    | AccessMedium::GeoSatellite
+                    | AccessMedium::FixedWireless
+            )
+        )
+}
+
+fn download_bypass_evidence_reviewable(topology: &NativeTopologyComparisonResult) -> bool {
+    topology.comparison_available
+        && topology.download.raw_achieved_kbps.is_some()
+        && topology.download.raw_sample_count > 0
+        && topology.download.safety_pass
+        && !topology.download.needs_repeat
 }
 
 fn native_pair_apply_acknowledgements(
@@ -8639,11 +10112,14 @@ fn native_review_digests(
     let proposal = proposal
         .ok_or_else(|| "native Auto-Tune Review has no proposal digest evidence".to_string())?;
     if let Some(raw_fallback) = raw_fallback {
-        if download_search.is_some()
-            || upload_search.is_some()
-            || pair_confirmation.is_some()
-            || topology_comparison.is_some()
-        {
+        // A raw fallback can be reached after one completed directional
+        // search, or after both directional searches when every confirmed
+        // pair is non-reviewable.  Those search artifacts are deliberately
+        // discarded by the typed raw-fallback result and remain useful audit
+        // evidence; they are not competing Apply authority.  A confirmed
+        // pair or completed topology comparison would, however, establish a
+        // shaped Review path and must never coexist with a raw fallback.
+        if pair_confirmation.is_some() || topology_comparison.is_some() {
             return Err(
                 "native Auto-Tune Review mixed raw-fallback and shaped artifacts".to_string(),
             );
@@ -8953,6 +10429,29 @@ struct NativeApplyOptionPlan {
     plan: NativeApplyExecutionPlan,
 }
 
+fn validate_native_apply_option_catalog(plans: &[NativeApplyOptionPlan]) -> Result<(), String> {
+    if plans.is_empty()
+        || plans.len() > MAX_NATIVE_APPLY_REVIEW_OPTIONS
+        || plans
+            .iter()
+            .filter(|option| option.legacy_preferred)
+            .count()
+            != 1
+    {
+        return Err("native Apply option catalog has no unique preferred plan".to_string());
+    }
+    let mut ids = plans
+        .iter()
+        .map(|option| option.option_id.as_str())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.len() != plans.len() {
+        return Err("native Apply option catalog has duplicate option IDs".to_string());
+    }
+    Ok(())
+}
+
 fn native_apply_execution_plans_transaction(
     request_path: &Path,
     review_path: &Path,
@@ -9035,11 +10534,40 @@ fn native_apply_execution_plans_transaction(
                 raw_fallback_digest,
             },
         )?;
-        return Ok(vec![NativeApplyOptionPlan {
+        let mut plans = vec![NativeApplyOptionPlan {
             option_id: "no_sqm".to_string(),
             legacy_preferred: true,
             plan,
-        }]);
+        }];
+        if let Some(NativeMobileDownloadBypassOutcome::Confirmed(directional)) =
+            &raw_fallback.mobile_download_bypass
+        {
+            if directional.manual_apply_eligible {
+                let plan = NativeApplyExecutionPlan::from_verified_directional_raw_fallback(
+                    NativeDirectionalRawFallbackApplyManifestInput {
+                        option_id: "bypass_download",
+                        request: &request,
+                        worker_run_id: expected_worker_run_id,
+                        review_digest: expected_review_digest,
+                        coordinator_boot_id,
+                        coordinator_generation,
+                        proposal: &proposal,
+                        selected_ul_kbps: directional.selected_ul_kbps,
+                        runtime_minimum_ul_kbps: directional.runtime_minimum_ul_kbps,
+                        required_acknowledgements: &directional.required_acknowledgements,
+                        proposal_digest,
+                        raw_fallback_digest,
+                    },
+                )?;
+                plans.push(NativeApplyOptionPlan {
+                    option_id: "bypass_download".to_string(),
+                    legacy_preferred: false,
+                    plan,
+                });
+            }
+        }
+        validate_native_apply_option_catalog(&plans)?;
+        return Ok(plans);
     }
     let NativeReviewDigests::Shaped {
         proposal: proposal_digest,
@@ -9128,9 +10656,20 @@ fn native_apply_execution_plans_transaction(
             artifacts: artifacts.clone(),
         })
     };
+    let selected_topology_option = topology.selected_topology != MeasurementTopology::ShapedBoth;
+    let mobile_download_bypass =
+        mobile_download_bypass_required(&request) && download_bypass_evidence_reviewable(&topology);
+    let distinct_mobile_download_bypass = mobile_download_bypass
+        && topology.selected_topology != MeasurementTopology::UploadOnlyShaped;
+    let reserved_topology_options =
+        usize::from(selected_topology_option) + usize::from(distinct_mobile_download_bypass);
+    let pair_option_limit = MAX_NATIVE_APPLY_REVIEW_OPTIONS
+        .checked_sub(reserved_topology_options)
+        .ok_or_else(|| "native Apply option catalog exceeded its topology reserve".to_string())?;
     let mut plans = pair
         .options
         .iter()
+        .take(pair_option_limit)
         .map(|option| {
             let required_acknowledgements = native_pair_apply_acknowledgements(option, &topology)?;
             Ok(NativeApplyOptionPlan {
@@ -9161,7 +10700,8 @@ fn native_apply_execution_plans_transaction(
                 return Err("native Apply topology option is not terminal".to_string())
             }
         };
-        let required_acknowledgements = native_topology_apply_acknowledgements(&pair, &topology)?;
+        let required_acknowledgements =
+            native_topology_apply_acknowledgements(&pair, &topology, topology.selected_topology)?;
         plans.push(NativeApplyOptionPlan {
             option_id: option_id.to_string(),
             legacy_preferred: true,
@@ -9176,24 +10716,28 @@ fn native_apply_execution_plans_transaction(
             )?,
         });
     }
-    if plans.is_empty()
-        || plans
-            .iter()
-            .filter(|option| option.legacy_preferred)
-            .count()
-            != 1
-    {
-        return Err("native Apply option catalog has no unique preferred plan".to_string());
+    if distinct_mobile_download_bypass {
+        let primary = pair.options.first().ok_or_else(|| {
+            "native mobile download-bypass option has no confirmed shaped reference".to_string()
+        })?;
+        let selected_topology = MeasurementTopology::UploadOnlyShaped;
+        let required_acknowledgements =
+            native_topology_apply_acknowledgements(&pair, &topology, selected_topology)?;
+        plans.push(NativeApplyOptionPlan {
+            option_id: "bypass_download".to_string(),
+            legacy_preferred: false,
+            plan: build(
+                "bypass_download",
+                selected_topology,
+                None,
+                Some(primary.selected_ul_kbps),
+                None,
+                primary.runtime_minimum_ul_kbps,
+                required_acknowledgements,
+            )?,
+        });
     }
-    let mut ids = plans
-        .iter()
-        .map(|option| option.option_id.as_str())
-        .collect::<Vec<_>>();
-    ids.sort_unstable();
-    ids.dedup();
-    if ids.len() != plans.len() {
-        return Err("native Apply option catalog has duplicate option IDs".to_string());
-    }
+    validate_native_apply_option_catalog(&plans)?;
     Ok(plans)
 }
 
@@ -9808,6 +11352,10 @@ impl CaptureWaitError {
     fn requires_route_rearm(&self) -> bool {
         matches!(self, Self::Rejected(code) if code == "capture-runtime-mismatch")
     }
+
+    fn is_idle_rate_drift(&self) -> bool {
+        matches!(self, Self::Rejected(code) if code == "capture-rate-drift")
+    }
 }
 
 impl From<String> for CaptureWaitError {
@@ -9870,11 +11418,75 @@ fn capture_state_satisfies(target: CaptureWaitTarget, state: AutotuneCaptureStat
         )
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AutotuneTransportBaselineAuthority {
+    job_id: String,
+    worker_run_id: String,
+    permit_id: String,
+    instance_name: String,
+    idle_sequence: u32,
+    route_fingerprint: String,
+    sqm_fingerprint: String,
+    baseline_us: u64,
+}
+
+impl AutotuneTransportBaselineAuthority {
+    fn from_completed_idle(
+        request: &AutotuneCaptureRequest,
+        snapshot: &AutotuneCaptureSnapshot,
+    ) -> Result<Self, String> {
+        snapshot.validate()?;
+        if snapshot.request != *request
+            || snapshot.state != AutotuneCaptureState::Complete
+            || request.phase != AutotuneCapturePhase::IdleBaseline
+        {
+            return Err(
+                "native Auto-Tune transport baseline requires the exact complete idle capture"
+                    .to_string(),
+            );
+        }
+        let baseline_us = snapshot.idle_transport_baseline_us.ok_or_else(|| {
+            "native Auto-Tune complete idle capture has no transport baseline".to_string()
+        })?;
+        Ok(Self {
+            job_id: request.job_id.clone(),
+            worker_run_id: request.worker_run_id.clone(),
+            permit_id: request.permit_id.clone(),
+            instance_name: request.instance_name.clone(),
+            idle_sequence: request.sequence,
+            route_fingerprint: request.route_fingerprint.clone(),
+            sqm_fingerprint: request.sqm_fingerprint.clone(),
+            baseline_us,
+        })
+    }
+
+    fn attests_loaded(&self, request: &AutotuneCaptureRequest) -> Result<(), String> {
+        request.validate()?;
+        if request.phase != AutotuneCapturePhase::LoadedMeasurement
+            || self.job_id != request.job_id
+            || self.worker_run_id != request.worker_run_id
+            || self.permit_id != request.permit_id
+            || self.instance_name != request.instance_name
+            || self.idle_sequence >= request.sequence
+            || self.route_fingerprint != request.route_fingerprint
+            || self.sqm_fingerprint != request.sqm_fingerprint
+            || request.transport_baseline_us != Some(self.baseline_us)
+        {
+            return Err(
+                "native Auto-Tune loaded capture is not bound to its completed idle transport baseline"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 struct AutotuneCaptureGuard {
     request_path: PathBuf,
     snapshot_path: PathBuf,
     load_evidence_path: PathBuf,
     capture_id: Option<String>,
+    transport_baseline: Option<AutotuneTransportBaselineAuthority>,
 }
 
 impl AutotuneCaptureGuard {
@@ -9884,14 +11496,69 @@ impl AutotuneCaptureGuard {
             snapshot_path: run_dir.join("autotune-capture-snapshot"),
             load_evidence_path: run_dir.join("autotune-load-evidence"),
             capture_id: None,
+            transport_baseline: None,
         }
     }
 
     fn publish(&mut self, request: &AutotuneCaptureRequest) -> Result<(), String> {
+        match request.phase {
+            AutotuneCapturePhase::IdleBaseline => {
+                self.transport_baseline = None;
+            }
+            AutotuneCapturePhase::LoadedMeasurement => self
+                .transport_baseline
+                .as_ref()
+                .ok_or_else(|| {
+                    "native Auto-Tune loaded capture has no completed idle transport baseline"
+                        .to_string()
+                })?
+                .attests_loaded(request)?,
+        }
         self.cleanup_owned_load_evidence();
         publish_capture_request(&self.request_path, request)?;
         self.capture_id = Some(request.capture_id.clone());
         Ok(())
+    }
+
+    fn bind_completed_idle_transport_baseline(
+        &mut self,
+        request: &AutotuneCaptureRequest,
+        snapshot: &AutotuneCaptureSnapshot,
+    ) -> Result<(), String> {
+        if self.capture_id.as_deref() != Some(request.capture_id.as_str()) {
+            return Err(
+                "native Auto-Tune idle transport baseline is not owned by the active capture"
+                    .to_string(),
+            );
+        }
+        self.transport_baseline = Some(AutotuneTransportBaselineAuthority::from_completed_idle(
+            request, snapshot,
+        )?);
+        Ok(())
+    }
+
+    fn loaded_transport_baseline_us(
+        &self,
+        permit: &AutotuneRuntimePermit,
+        sequence: u32,
+    ) -> Result<u64, String> {
+        let baseline = self.transport_baseline.as_ref().ok_or_else(|| {
+            "native Auto-Tune loaded capture has no completed idle transport baseline".to_string()
+        })?;
+        if baseline.job_id != permit.job_id
+            || baseline.worker_run_id != permit.worker_run_id
+            || baseline.permit_id != permit.permit_id
+            || baseline.instance_name != permit.instance_name
+            || baseline.route_fingerprint != permit.route_fingerprint
+            || baseline.sqm_fingerprint != permit.sqm_fingerprint
+            || baseline.idle_sequence >= sequence
+        {
+            return Err(
+                "native Auto-Tune idle transport baseline does not match its runtime permit"
+                    .to_string(),
+            );
+        }
+        Ok(baseline.baseline_us)
     }
 
     fn cleanup(&mut self) {
@@ -11001,6 +12668,7 @@ fn append_replay_evidence(
     if replayed != projected {
         return Err("native Auto-Tune persisted evidence replay diverged".to_string());
     }
+    store.publish_progress(&replayed.progress()?)?;
     Ok(replayed)
 }
 
@@ -11407,9 +13075,7 @@ fn runtime_measurement_basis_ready(
             && matches!(snapshot.uplink_state.as_str(), "ACTIVE" | "STANDBY")
             && snapshot.route_test_ready
             && snapshot.sqm_runtime_managed
-            && snapshot.sqm_runtime_healthy
-            && snapshot.transport_probe_trusted
-            && snapshot.baseline_ready,
+            && snapshot.sqm_runtime_healthy,
     )
 }
 
@@ -11698,8 +13364,11 @@ fn idle_baseline_capture_request(
     permit: &AutotuneRuntimePermit,
     capture_id: String,
     sequence: u32,
+    candidate_dl_kbps: Option<u64>,
+    candidate_ul_kbps: Option<u64>,
 ) -> Result<AutotuneCaptureRequest, String> {
     let baseline_topology = permit.capture_baseline_topology();
+    permit.authorizes_idle_baseline(baseline_topology, candidate_dl_kbps, candidate_ul_kbps)?;
     Ok(AutotuneCaptureRequest {
         capture_id,
         job_id: permit.job_id.clone(),
@@ -11712,16 +13381,79 @@ fn idle_baseline_capture_request(
         phase: AutotuneCapturePhase::IdleBaseline,
         topology: baseline_topology,
         direction: None,
-        candidate_dl_kbps: baseline_topology
-            .download_is_shaped()
-            .then_some(permit.initial_download_kbps),
-        candidate_ul_kbps: baseline_topology
-            .upload_is_shaped()
-            .then_some(permit.initial_upload_kbps),
+        candidate_dl_kbps,
+        candidate_ul_kbps,
         load_reference_kbps: None,
+        transport_baseline_us: None,
         route_fingerprint: permit.route_fingerprint.clone(),
         sqm_fingerprint: permit.sqm_fingerprint.clone(),
     })
+}
+
+fn exact_idle_runtime_rate(label: &str, value: f64) -> Result<u64, String> {
+    if !value.is_finite() || value < NATIVE_AUTOTUNE_RUNTIME_MINIMUM_KBPS as f64 {
+        return Err(format!("native Auto-Tune {label} held rate is invalid"));
+    }
+    let rounded = value.round();
+    if (value - rounded).abs() > 0.000_1 || rounded > MAX_RATE_KBPS as f64 {
+        return Err(format!(
+            "native Auto-Tune {label} held rate is not an exact supported kbit/s value"
+        ));
+    }
+    Ok(rounded as u64)
+}
+
+fn idle_baseline_runtime_rates(
+    operation: &OperationRequest,
+    permit: &AutotuneRuntimePermit,
+    runtime_snapshot_path: &Path,
+) -> Result<(Option<u64>, Option<u64>), String> {
+    let topology = permit.capture_baseline_topology();
+    match measurement_basis_authority(operation, permit)? {
+        MeasurementBasisAuthority::BootstrapCaptureOwner => {
+            let download = topology
+                .download_is_shaped()
+                .then_some(permit.initial_download_kbps);
+            let upload = topology
+                .upload_is_shaped()
+                .then_some(permit.initial_upload_kbps);
+            permit.authorizes_idle_baseline(topology, download, upload)?;
+            Ok((download, upload))
+        }
+        MeasurementBasisAuthority::ExistingInstanceRuntime => {
+            let snapshot = read_rating_snapshot(runtime_snapshot_path)?;
+            if !runtime_measurement_basis_ready(&snapshot, epoch_ms()?)? {
+                return Err(
+                    "native Auto-Tune runtime measurement basis changed before idle capture"
+                        .to_string(),
+                );
+            }
+            let download = if topology.download_is_shaped() {
+                if snapshot.download_qdisc_kind != Some(permit.download_qdisc_kind) {
+                    return Err(
+                        "native Auto-Tune download qdisc kind changed before idle capture"
+                            .to_string(),
+                    );
+                }
+                Some(exact_idle_runtime_rate("download", snapshot.cake_dl_kbps)?)
+            } else {
+                None
+            };
+            let upload = if topology.upload_is_shaped() {
+                if snapshot.upload_qdisc_kind != Some(permit.upload_qdisc_kind) {
+                    return Err(
+                        "native Auto-Tune upload qdisc kind changed before idle capture"
+                            .to_string(),
+                    );
+                }
+                Some(exact_idle_runtime_rate("upload", snapshot.cake_ul_kbps)?)
+            } else {
+                None
+            };
+            permit.authorizes_idle_baseline(topology, download, upload)?;
+            Ok((download, upload))
+        }
+    }
 }
 
 fn run_idle_baseline_with_recovery(
@@ -11739,10 +13471,14 @@ fn run_idle_baseline_with_recovery(
             .checked_add(1)
             .filter(|value| *value as usize <= MAX_AUTOTUNE_EVIDENCE_RECORDS)
             .ok_or_else(|| "native Auto-Tune capture sequence exhausted".to_string())?;
+        let (candidate_dl_kbps, candidate_ul_kbps) =
+            idle_baseline_runtime_rates(operation, permit, &runtime_snapshot_path)?;
         let request = idle_baseline_capture_request(
             permit,
             read_kernel_uuid(Path::new(DEFAULT_RANDOM_UUID_PATH), "Auto-Tune capture ID")?,
             *capture_sequence,
+            candidate_dl_kbps,
+            candidate_ul_kbps,
         )?;
         capture.publish(&request)?;
         match wait_for_capture_state(
@@ -11753,6 +13489,7 @@ fn run_idle_baseline_with_recovery(
         ) {
             Ok(snapshot) => return Ok((request, snapshot)),
             Err(error) if error.is_restartable_measurement_basis_loss() => continue,
+            Err(error) if error.is_idle_rate_drift() => continue,
             Err(error) => return Err(error.into()),
         }
     }
@@ -11816,6 +13553,9 @@ fn run_directional_measurement_with_recovery(
             candidate_dl_kbps: control.download_kbps,
             candidate_ul_kbps: control.upload_kbps,
             load_reference_kbps: Some(load_reference_kbps),
+            transport_baseline_us: Some(
+                capture.loaded_transport_baseline_us(permit, *capture_sequence)?,
+            ),
             route_fingerprint: permit.route_fingerprint.clone(),
             sqm_fingerprint: permit.sqm_fingerprint.clone(),
         };
@@ -12050,6 +13790,240 @@ fn run_topology_repeat_capture(
     .map_err(String::from)
 }
 
+fn append_mobile_download_bypass_unavailable_from_error(
+    evidence_store: &AutotuneEvidenceStore,
+    operation: &OperationRequest,
+    worker_run_id: &str,
+    candidate_ul_kbps: u64,
+    expected_direction: SpeedtestDirection,
+    error: CaptureWaitError,
+) -> Result<AutotuneReplayState, String> {
+    let (failed_direction, reason, run_count, icmp_samples, transport_samples, cpu_samples) =
+        match error {
+            CaptureWaitError::ObservationStarved {
+                topology,
+                direction,
+                run_count,
+                icmp_samples,
+                transport_samples,
+                cpu_samples,
+            } if topology == MeasurementTopology::UploadOnlyShaped
+                && direction == expected_direction =>
+            {
+                (
+                    direction,
+                    PairOptionUnavailableReason::ObservationStarved,
+                    run_count,
+                    icmp_samples,
+                    transport_samples,
+                    cpu_samples,
+                )
+            }
+            CaptureWaitError::TransferUnmeasurable {
+                topology,
+                direction,
+                run_count,
+            } if topology == MeasurementTopology::UploadOnlyShaped
+                && direction == expected_direction =>
+            {
+                (
+                    direction,
+                    PairOptionUnavailableReason::TransferUnmeasurable,
+                    run_count,
+                    0,
+                    0,
+                    0,
+                )
+            }
+            other => return Err(String::from(other)),
+        };
+    let records = evidence_store.load()?;
+    let replay = AutotuneReplayState::replay(operation, worker_run_id, &records)?;
+    let debit_count = replay
+        .pending_measurement_debits
+        .single_count(failed_direction)
+        .ok_or_else(|| {
+            "native mobile download-bypass failure has no exact traffic debit".to_string()
+        })?;
+    append_replay_evidence(
+        evidence_store,
+        operation,
+        worker_run_id,
+        AutotunePhase::TopologyComparison,
+        AutotuneEvidence::DirectionalBypassUnavailable(DirectionalBypassUnavailableEvidence {
+            candidate_ul_kbps,
+            failed_direction,
+            reason,
+            run_count,
+            debit_count,
+            icmp_samples,
+            transport_samples,
+            cpu_samples,
+        }),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_native_mobile_download_bypass_confirmation(
+    session: &mut EmbeddedSpeedtestSession,
+    request: &OperationRequest,
+    worker_run_id: &str,
+    permit: &AutotuneRuntimePermit,
+    store: &RuntimeOverrideStore,
+    evidence_store: &AutotuneEvidenceStore,
+    proposal: &AutotuneProposal,
+    capture: &mut AutotuneCaptureGuard,
+    capture_sequence: &mut u32,
+    control_sequence: &mut u32,
+    remaining_traffic_budget: &mut u64,
+    terminate: &AtomicBool,
+) -> Result<NativeMobileDownloadBypassOutcome, String> {
+    let records = evidence_store.load()?;
+    let replay = AutotuneReplayState::replay(request, worker_run_id, &records)?;
+    if replay.next_action()? != AutotuneAction::ConfirmMobileDownloadBypass {
+        return Err(
+            "native mobile download-bypass confirmation lacks pair-exhaustion authority"
+                .to_string(),
+        );
+    }
+    let upload_search =
+        native_profile_search_result(proposal, EvidenceDirection::Upload, &records)?;
+    let (selected_ul_kbps, _) = selected_profile_search_point(&upload_search)?;
+    let required_download = minimum_speedtest_traffic_budget_bytes(
+        SpeedtestDirection::Download,
+        proposal.download.maximum_kbps,
+        0,
+    );
+    let required_upload =
+        minimum_speedtest_traffic_budget_bytes(SpeedtestDirection::Upload, 0, selected_ul_kbps);
+    let required_total = required_download
+        .checked_add(required_upload)
+        .ok_or_else(|| "native mobile download-bypass traffic bound overflowed".to_string())?;
+    if *remaining_traffic_budget < required_total {
+        let replay = append_replay_evidence(
+            evidence_store,
+            request,
+            worker_run_id,
+            AutotunePhase::TopologyComparison,
+            AutotuneEvidence::DirectionalBypassUnavailable(DirectionalBypassUnavailableEvidence {
+                candidate_ul_kbps: selected_ul_kbps,
+                failed_direction: SpeedtestDirection::Both,
+                reason: PairOptionUnavailableReason::TrafficBudget,
+                run_count: 0,
+                debit_count: 0,
+                icmp_samples: 0,
+                transport_samples: 0,
+                cpu_samples: 0,
+            }),
+        )?;
+        if replay.next_action()? != AutotuneAction::BuildRawFallback {
+            return Err(
+                "native mobile download-bypass traffic boundary did not settle".to_string(),
+            );
+        }
+        return Ok(NativeMobileDownloadBypassOutcome::Unavailable(
+            replay.mobile_bypass_unavailable.ok_or_else(|| {
+                "native mobile download-bypass traffic boundary disappeared".to_string()
+            })?,
+        ));
+    }
+    *control_sequence = control_sequence
+        .checked_add(1)
+        .filter(|value| *value <= permit.maximum_sequence)
+        .ok_or_else(|| {
+            "native mobile download-bypass runtime control sequence exhausted".to_string()
+        })?;
+    let mut control = AutotuneRuntimeControl {
+        permit_id: permit.permit_id.clone(),
+        job_id: permit.job_id.clone(),
+        worker_run_id: permit.worker_run_id.clone(),
+        boot_id: permit.boot_id.clone(),
+        coordinator_generation: permit.coordinator_generation.clone(),
+        worker: permit.worker.clone(),
+        sequence: *control_sequence,
+        deadline_boot_ms: permit.deadline_boot_ms,
+        target_interface: permit.target_interface.clone(),
+        route_fingerprint: permit.route_fingerprint.clone(),
+        sqm_fingerprint: permit.sqm_fingerprint.clone(),
+        topology: MeasurementTopology::UploadOnlyShaped,
+        download_kbps: None,
+        upload_kbps: Some(selected_ul_kbps),
+    };
+    permit.authorizes(&request.identity.instance, &control, monotonic_boot_ms()?)?;
+    transition_runtime_after_capture_cleanup(capture, || store.publish_control(&control))?;
+    wait_for_runtime_applied(store, permit, &control, terminate)?;
+    for (direction, load_reference_kbps) in [
+        (SpeedtestDirection::Download, proposal.download.maximum_kbps),
+        (SpeedtestDirection::Upload, selected_ul_kbps),
+    ] {
+        let measurement = match run_directional_measurement_with_recovery(
+            session,
+            request,
+            worker_run_id,
+            evidence_store,
+            AutotunePhase::TopologyComparison,
+            permit,
+            store,
+            capture,
+            capture_sequence,
+            &mut control,
+            control_sequence,
+            direction,
+            load_reference_kbps,
+            remaining_traffic_budget,
+            terminate,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                let replay = append_mobile_download_bypass_unavailable_from_error(
+                    evidence_store,
+                    request,
+                    worker_run_id,
+                    selected_ul_kbps,
+                    direction,
+                    error,
+                )?;
+                capture.cleanup();
+                if replay.next_action()? != AutotuneAction::BuildRawFallback {
+                    return Err(
+                        "native mobile download-bypass unavailable result did not settle"
+                            .to_string(),
+                    );
+                }
+                return Ok(NativeMobileDownloadBypassOutcome::Unavailable(
+                    replay.mobile_bypass_unavailable.ok_or_else(|| {
+                        "native mobile download-bypass unavailable result disappeared".to_string()
+                    })?,
+                ));
+            }
+        };
+        let replay = append_replay_evidence(
+            evidence_store,
+            request,
+            worker_run_id,
+            AutotunePhase::TopologyComparison,
+            AutotuneEvidence::Measurement(measurement),
+        )?;
+        capture.cleanup();
+        let expected = if direction == SpeedtestDirection::Download {
+            AutotuneAction::ConfirmMobileDownloadBypass
+        } else {
+            AutotuneAction::BuildRawFallback
+        };
+        if replay.next_action()? != expected {
+            return Err(
+                "native mobile download-bypass measurement did not advance deterministically"
+                    .to_string(),
+            );
+        }
+    }
+    let records = evidence_store.load()?;
+    match native_mobile_download_bypass_outcome(request, proposal, &records)? {
+        Some(value) => Ok(value),
+        None => Err("native mobile download-bypass result disappeared".to_string()),
+    }
+}
+
 fn commit_native_profile_search(
     request: &OperationRequest,
     worker_run_id: &str,
@@ -12108,17 +14082,69 @@ enum NativeDirectionSearchOutcome {
 fn native_inconclusive_search_outcome(
     request: &OperationRequest,
     worker_run_id: &str,
-    records: &[AutotuneEvidenceRecord],
+    evidence_store: &AutotuneEvidenceStore,
+    proposal: &AutotuneProposal,
+    direction: EvidenceDirection,
     decision: ProfileSearchResult,
 ) -> Result<NativeDirectionSearchOutcome, String> {
-    if decision.action != ProfileSearchAction::Inconclusive {
+    if decision.action != ProfileSearchAction::Inconclusive
+        || decision.selected_index.is_some()
+        || decision.next_candidate_kbps.is_some()
+        || !decision.review_options().is_empty()
+    {
         return Err("native search fallback decision is not inconclusive".to_string());
     }
-    let replay = AutotuneReplayState::replay(request, worker_run_id, records)?;
+    let source_records = evidence_store.load()?;
+    let replay = AutotuneReplayState::replay(request, worker_run_id, &source_records)?;
+    if replay.raw_fallback_available() {
+        return Ok(NativeDirectionSearchOutcome::RawFallbackRequired);
+    }
+    if !replay.raw_fallback_controls_available() {
+        return Ok(NativeDirectionSearchOutcome::Complete(decision));
+    }
+    let exact = native_profile_search_result(proposal, direction, &source_records)?;
+    if exact != decision {
+        return Err(
+            "native inconclusive search decision changed before durable settlement".to_string(),
+        );
+    }
+    let reason = SearchInconclusiveReason::parse(decision.reason)
+        .ok_or_else(|| "native inconclusive search reason is unsupported".to_string())?;
+    let existing = match direction {
+        EvidenceDirection::Download => replay.search_download_inconclusive,
+        EvidenceDirection::Upload => replay.search_upload_inconclusive,
+    };
+    let boundary = SearchInconclusiveEvidence {
+        direction,
+        observation_count: decision
+            .observations
+            .len()
+            .try_into()
+            .map_err(|_| "native inconclusive observation count is too large".to_string())?,
+        reason,
+    };
+    if let Some(existing) = existing {
+        if existing != boundary {
+            return Err("native inconclusive search boundary changed after replay".to_string());
+        }
+    } else {
+        let _ = append_replay_evidence(
+            evidence_store,
+            request,
+            worker_run_id,
+            AutotunePhase::DirectionalSearch,
+            AutotuneEvidence::SearchInconclusive(boundary),
+        )?;
+    }
+    let records = evidence_store.load()?;
+    if native_profile_search_result(proposal, direction, &records)? != decision {
+        return Err("native inconclusive search boundary is not replay-stable".to_string());
+    }
+    let replay = AutotuneReplayState::replay(request, worker_run_id, &records)?;
     if replay.raw_fallback_available() {
         Ok(NativeDirectionSearchOutcome::RawFallbackRequired)
     } else {
-        Ok(NativeDirectionSearchOutcome::Complete(decision))
+        Err("native inconclusive search lost raw fallback authority".to_string())
     }
 }
 
@@ -12203,7 +14229,9 @@ fn run_native_direction_search(
                 return native_inconclusive_search_outcome(
                     request,
                     worker_run_id,
-                    &initial_records,
+                    evidence_store,
+                    proposal,
+                    direction,
                     decision.clone(),
                 )
             }
@@ -12381,7 +14409,9 @@ fn run_native_direction_search(
                     return native_inconclusive_search_outcome(
                         request,
                         worker_run_id,
-                        &records,
+                        evidence_store,
+                        proposal,
+                        direction,
                         decision,
                     );
                 }
@@ -12486,7 +14516,9 @@ fn run_native_direction_search(
                     return native_inconclusive_search_outcome(
                         request,
                         worker_run_id,
-                        &records,
+                        evidence_store,
+                        proposal,
+                        direction,
                         decision,
                     );
                 }
@@ -12539,7 +14571,9 @@ fn run_native_direction_search(
                 return native_inconclusive_search_outcome(
                     request,
                     worker_run_id,
-                    &records,
+                    evidence_store,
+                    proposal,
+                    direction,
                     decision,
                 )
             }
@@ -12818,6 +14852,7 @@ where
             &mut capture_sequence,
             terminate,
         )?;
+        capture.bind_completed_idle_transport_baseline(&baseline_request, &baseline_snapshot)?;
         let _ = append_replay_evidence(
             &evidence_store,
             &request,
@@ -13409,7 +15444,11 @@ where
                                 digest: exhaustion_digest,
                             },
                         )?;
-                        if pair_replay.next_action()? != AutotuneAction::BuildRawFallback {
+                        if !matches!(
+                            pair_replay.next_action()?,
+                            AutotuneAction::BuildRawFallback
+                                | AutotuneAction::ConfirmMobileDownloadBypass
+                        ) {
                             return Err(
                                 "native Auto-Tune pair exhaustion did not reach raw fallback"
                                     .to_string(),
@@ -13428,11 +15467,29 @@ where
                                     .to_string(),
                             );
                         }
+                        if pair_replay.next_action()? == AutotuneAction::ConfirmMobileDownloadBypass
+                        {
+                            let _ = run_native_mobile_download_bypass_confirmation(
+                                &mut speedtest_session,
+                                &request,
+                                &worker_run_id,
+                                &permit,
+                                &store,
+                                &evidence_store,
+                                &proposal,
+                                &mut capture,
+                                &mut capture_sequence,
+                                &mut runtime_control_sequence,
+                                &mut remaining_traffic_budget,
+                                terminate,
+                            )?;
+                        }
+                        let raw_records = evidence_store.load()?;
                         let raw_fallback = native_raw_fallback_result(
                             &request,
                             &worker_run_id,
                             &proposal,
-                            &pair_records,
+                            &raw_records,
                         )?;
                         let (raw_fallback_path, raw_fallback_digest) =
                             publish_native_raw_fallback(job_directory, &raw_fallback)?;
@@ -14195,6 +16252,8 @@ mod tests {
             baseline_samples: 20,
             baseline_required_samples: 20,
             required_samples: 20,
+            evidence_contract:
+                super::super::rating::RatingEvidenceContract::WorstOfDirectionBoundIcmpAndTransport,
             dl_samples: 0,
             ul_samples: 0,
             dl_achieved_kbps: 0.0,
@@ -14383,9 +16442,15 @@ mod tests {
     }
 
     #[test]
-    fn measurement_basis_requires_current_route_transport_and_managed_sqm_state() {
+    fn measurement_basis_requires_current_route_and_managed_sqm_state() {
         let runtime = ready_rating_runtime();
         assert!(runtime_measurement_basis_ready(&runtime, 100_000).unwrap());
+
+        let mut calibration_owned_baseline = runtime.clone();
+        calibration_owned_baseline.transport_probe_trusted = false;
+        calibration_owned_baseline.baseline_ready = false;
+        calibration_owned_baseline.baseline_samples = 0;
+        assert!(runtime_measurement_basis_ready(&calibration_owned_baseline, 100_000).unwrap());
 
         let mut selected_standby = runtime.clone();
         selected_standby.uplink_state = "STANDBY".to_string();
@@ -14395,10 +16460,6 @@ mod tests {
         let mut stale = runtime.clone();
         stale.updated_unix_ms = 94_999;
         assert!(!runtime_measurement_basis_ready(&stale, 100_000).unwrap());
-
-        let mut learning = runtime.clone();
-        learning.baseline_ready = false;
-        assert!(!runtime_measurement_basis_ready(&learning, 100_000).unwrap());
 
         let mut route_offline = runtime.clone();
         route_offline.route_test_ready = false;
@@ -14411,6 +16472,49 @@ mod tests {
         let mut future = runtime;
         future.updated_unix_ms = 105_001;
         assert!(runtime_measurement_basis_ready(&future, 100_000).is_err());
+    }
+
+    #[test]
+    fn existing_idle_baseline_binds_the_fresh_held_rates_without_mutating_the_permit() {
+        let mut operation = request(CalibrationStrategy::FullRaw, 1_000_000);
+        operation.service_dl_cap_kbps = Some(900_000);
+        operation.service_ul_cap_kbps = Some(800_000);
+        let permit = measurement_basis_permit(
+            &operation,
+            RuntimeBaseline::Managed(MeasurementTopology::ShapedBoth),
+        );
+        let original_permit = permit.clone();
+        let directory = private_temp_directory("held-idle-rates");
+        let runtime_path = directory.join("rating-runtime");
+        let mut runtime = ready_rating_runtime();
+        runtime.updated_unix_ms = epoch_ms().unwrap();
+        runtime.cake_dl_kbps = 123_456.0;
+        runtime.cake_ul_kbps = 54_321.0;
+        atomic_private_write(&runtime_path, runtime.encode().unwrap().as_bytes()).unwrap();
+
+        assert_eq!(
+            idle_baseline_runtime_rates(&operation, &permit, &runtime_path).unwrap(),
+            (Some(123_456), Some(54_321))
+        );
+        assert_eq!(permit, original_permit);
+
+        runtime.upload_qdisc_kind = Some(RuntimeQdiscKind::CakeMq);
+        atomic_private_write(&runtime_path, runtime.encode().unwrap().as_bytes()).unwrap();
+        assert!(
+            idle_baseline_runtime_rates(&operation, &permit, &runtime_path)
+                .unwrap_err()
+                .contains("qdisc kind changed")
+        );
+
+        runtime.upload_qdisc_kind = Some(RuntimeQdiscKind::Cake);
+        runtime.cake_ul_kbps = 900_000.0;
+        atomic_private_write(&runtime_path, runtime.encode().unwrap().as_bytes()).unwrap();
+        assert!(
+            idle_baseline_runtime_rates(&operation, &permit, &runtime_path)
+                .unwrap_err()
+                .contains("outside its permitted range")
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -14430,6 +16534,11 @@ mod tests {
         assert!(
             !CaptureWaitError::Failure("capture-route-mismatch".to_string())
                 .is_restartable_measurement_basis_loss()
+        );
+        assert!(CaptureWaitError::Rejected("capture-rate-drift".to_string()).is_idle_rate_drift());
+        assert!(
+            !CaptureWaitError::Rejected("capture-runtime-mismatch".to_string())
+                .is_idle_rate_drift()
         );
     }
 
@@ -14748,6 +16857,78 @@ mod tests {
             append_completed_search(&mut records, &proposal, EvidenceDirection::Download);
         let upload = append_completed_search(&mut records, &proposal, EvidenceDirection::Upload);
         (operation, proposal, records, download, upload)
+    }
+
+    fn append_measured_pair_exhaustion(
+        proposal: &AutotuneProposal,
+        records: &mut Vec<AutotuneEvidenceRecord>,
+        download: &ProfileSearchResult,
+        upload: &ProfileSearchResult,
+    ) -> NativePairExhaustionResult {
+        let candidate = profile_pair_candidates(download, upload).unwrap()[0];
+        let mut pair = measurement(
+            MeasurementTopology::ShapedBoth,
+            SpeedtestDirection::Both,
+            2_000_000,
+        );
+        pair.candidate_dl_kbps = Some(candidate.download_kbps);
+        pair.candidate_ul_kbps = Some(candidate.upload_kbps);
+        pair.achieved_dl_kbps = Some((candidate.download_kbps / 4).max(1));
+        pair.achieved_ul_kbps = Some((candidate.upload_kbps / 4).max(1));
+        pair.realized_dl_kbps = pair.achieved_dl_kbps;
+        pair.realized_ul_kbps = pair.achieved_ul_kbps;
+        pair.load_reference_dl_kbps = Some(candidate.download_kbps);
+        pair.load_reference_ul_kbps = Some(candidate.upload_kbps);
+        push_measurement_record(records, AutotunePhase::PairConfirmation, pair);
+        let NativePairConfirmationOutcome::Exhausted(exhaustion) =
+            native_pair_confirmation_outcome(proposal, records).unwrap()
+        else {
+            panic!("a sub-floor measured pair must exhaust shaped options");
+        };
+        records.push(record(
+            records.len() as u32 + 1,
+            AutotunePhase::PairConfirmation,
+            AutotuneEvidence::PairExhausted {
+                digest: native_pair_exhaustion_digest(&exhaustion).unwrap(),
+            },
+        ));
+        exhaustion
+    }
+
+    fn append_mobile_download_bypass_measurements(
+        proposal: &AutotuneProposal,
+        records: &mut Vec<AutotuneEvidenceRecord>,
+        upload: &ProfileSearchResult,
+    ) -> u64 {
+        let (selected_ul_kbps, _) = selected_profile_search_point(upload).unwrap();
+        let mut download = measurement(
+            MeasurementTopology::UploadOnlyShaped,
+            SpeedtestDirection::Download,
+            2_000_000,
+        );
+        download.candidate_dl_kbps = None;
+        download.candidate_ul_kbps = Some(selected_ul_kbps);
+        download.achieved_dl_kbps = Some(proposal.download.observed_low_kbps.max(1));
+        download.realized_dl_kbps = download.achieved_dl_kbps;
+        download.load_reference_dl_kbps = Some(proposal.download.maximum_kbps);
+        push_measurement_record(records, AutotunePhase::TopologyComparison, download);
+
+        let mut upload_measurement = measurement(
+            MeasurementTopology::UploadOnlyShaped,
+            SpeedtestDirection::Upload,
+            1_000_000,
+        );
+        upload_measurement.candidate_dl_kbps = None;
+        upload_measurement.candidate_ul_kbps = Some(selected_ul_kbps);
+        upload_measurement.achieved_ul_kbps = Some((selected_ul_kbps * 90 / 100).max(1));
+        upload_measurement.realized_ul_kbps = upload_measurement.achieved_ul_kbps;
+        upload_measurement.load_reference_ul_kbps = Some(selected_ul_kbps);
+        push_measurement_record(
+            records,
+            AutotunePhase::TopologyComparison,
+            upload_measurement,
+        );
+        selected_ul_kbps
     }
 
     fn topology_ready_records() -> (
@@ -15589,11 +17770,24 @@ mod tests {
             replay.next_action().unwrap(),
             AutotuneAction::BuildRawFallback
         );
+        let root = private_temp_directory("measured-starved-outcome");
+        let evidence_store = AutotuneEvidenceStore::open(&root).unwrap();
+        for value in &records {
+            evidence_store.append(value).unwrap();
+        }
         assert_eq!(
-            native_inconclusive_search_outcome(&operation, &worker_run_id, &records, terminal,)
-                .unwrap(),
+            native_inconclusive_search_outcome(
+                &operation,
+                &worker_run_id,
+                &evidence_store,
+                &proposal,
+                EvidenceDirection::Download,
+                terminal,
+            )
+            .unwrap(),
             NativeDirectionSearchOutcome::RawFallbackRequired
         );
+        fs::remove_dir_all(&root).unwrap();
 
         let raw =
             native_raw_fallback_result(&operation, &worker_run_id, &proposal, &records).unwrap();
@@ -15675,6 +17869,122 @@ mod tests {
         assert!(text.contains(
             "\"terminal_boundary\":{\"kind\":\"candidate_transfer_unmeasurable\",\"candidate_kbps\":167200}"
         ));
+    }
+
+    #[test]
+    fn measured_search_inconclusive_is_durable_and_builds_manual_raw_fallback() {
+        let operation = request(CalibrationStrategy::FullRaw, 32_000_000_000);
+        let worker_run_id = "66".repeat(16);
+        let mut records = proposal_ready_records(CalibrationStrategy::FullRaw);
+        let mut proposal = build_native_proposal_from_evidence(
+            &operation,
+            &worker_run_id,
+            &records,
+            LinkKind::Ethernet,
+        )
+        .unwrap();
+        proposal.download.exploration_minimum_kbps = proposal.download.maximum_kbps;
+        records.push(record(
+            records.len() as u32 + 1,
+            AutotunePhase::Proposal,
+            AutotuneEvidence::ProposalBuilt {
+                digest: "ab".repeat(32),
+            },
+        ));
+
+        let candidate = proposal.download.maximum_kbps;
+        let peer = proposal.upload.maximum_kbps;
+        for achieved in [
+            candidate * 45 / 100,
+            candidate * 46 / 100,
+            candidate * 45 / 100,
+        ] {
+            push_measurement_record(
+                &mut records,
+                AutotunePhase::DirectionalSearch,
+                search_measurement(SpeedtestDirection::Download, candidate, peer, achieved),
+            );
+        }
+        let decision =
+            native_profile_search_result(&proposal, EvidenceDirection::Download, &records).unwrap();
+        assert_eq!(decision.action, ProfileSearchAction::Inconclusive);
+        assert_eq!(
+            decision.reason,
+            "variable-candidate-realization-inconclusive"
+        );
+        assert!(decision.selected_index.is_none());
+        assert!(decision.review_options().is_empty());
+
+        let root = private_temp_directory("measured-inconclusive-outcome");
+        let evidence_store = AutotuneEvidenceStore::open(&root).unwrap();
+        for value in &records {
+            evidence_store.append(value).unwrap();
+        }
+        assert_eq!(
+            native_inconclusive_search_outcome(
+                &operation,
+                &worker_run_id,
+                &evidence_store,
+                &proposal,
+                EvidenceDirection::Download,
+                decision.clone(),
+            )
+            .unwrap(),
+            NativeDirectionSearchOutcome::RawFallbackRequired
+        );
+        let bounded = evidence_store.load().unwrap();
+        let boundary = bounded.last().unwrap();
+        assert_eq!(
+            boundary.evidence,
+            AutotuneEvidence::SearchInconclusive(SearchInconclusiveEvidence {
+                direction: EvidenceDirection::Download,
+                observation_count: 3,
+                reason: SearchInconclusiveReason::VariableCandidateRealization,
+            })
+        );
+        let encoded = boundary.encode().unwrap();
+        assert!(encoded.starts_with("cake-autorate-autotune-evidence\t11\n"));
+        assert!(encoded
+            .contains("search_inconclusive_reason=variable-candidate-realization-inconclusive\n"));
+        assert!(encoded.contains("observation_count=3\n"));
+        assert_eq!(AutotuneEvidenceRecord::decode(&encoded).unwrap(), *boundary);
+        let unknown_reason = encoded.replace(
+            "search_inconclusive_reason=variable-candidate-realization-inconclusive\n",
+            "search_inconclusive_reason=untrusted-backend-reason\n",
+        );
+        assert!(AutotuneEvidenceRecord::decode(&unknown_reason).is_err());
+        let replay = AutotuneReplayState::replay(&operation, &worker_run_id, &bounded).unwrap();
+        assert_eq!(
+            replay.next_action().unwrap(),
+            AutotuneAction::BuildRawFallback
+        );
+
+        let raw =
+            native_raw_fallback_result(&operation, &worker_run_id, &proposal, &bounded).unwrap();
+        assert_eq!(
+            raw.boundary,
+            NativeRawFallbackBoundary::SearchInconclusive {
+                observation_count: 3,
+                reason: SearchInconclusiveReason::VariableCandidateRealization,
+            }
+        );
+        let text = String::from_utf8(canonical_raw_fallback_bytes(&raw).unwrap()).unwrap();
+        assert!(text.starts_with(
+            "{\"schema_version\":4,\"selected_topology\":\"no_sqm\",\"reason\":\"shaped-search-inconclusive\""
+        ));
+        assert!(text.contains(
+            "\"terminal_boundary\":{\"kind\":\"shaped_search_inconclusive\",\"observation_count\":3,\"optimizer_reason\":\"variable-candidate-realization-inconclusive\"}"
+        ));
+        assert!(text.contains("\"auto_apply_pass\":false,\"manual_review_required\":true"));
+
+        let mut forged = bounded.clone();
+        if let AutotuneEvidence::SearchInconclusive(value) =
+            &mut forged.last_mut().unwrap().evidence
+        {
+            value.observation_count = 2;
+        }
+        assert!(AutotuneReplayState::replay(&operation, &worker_run_id, &forged).is_err());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -17027,7 +19337,8 @@ mod tests {
 
     #[test]
     fn unavailable_pair_option_settles_exact_directional_debits_and_exhausts_to_raw() {
-        let (operation, proposal, mut records, download, upload) = pair_search_records();
+        let (mut operation, proposal, mut records, download, upload) = pair_search_records();
+        operation.access_medium = Some(AccessMedium::SharedWired);
         let candidates = profile_pair_candidates(&download, &upload).unwrap();
         assert_eq!(candidates.len(), 1);
         let candidate = candidates[0];
@@ -17058,7 +19369,7 @@ mod tests {
             AutotuneEvidence::PairOptionUnavailable(unavailable),
         );
         let encoded = unavailable_record.encode().unwrap();
-        assert!(encoded.starts_with("cake-autorate-autotune-evidence\t10\n"));
+        assert!(encoded.starts_with("cake-autorate-autotune-evidence\t11\n"));
         assert_eq!(
             AutotuneEvidenceRecord::decode(&encoded).unwrap(),
             unavailable_record
@@ -17162,7 +19473,8 @@ mod tests {
 
     #[test]
     fn measured_but_unreviewable_pair_exhausts_to_raw_without_inventing_a_failure_direction() {
-        let (operation, proposal, mut records, download, upload) = pair_search_records();
+        let (mut operation, proposal, mut records, download, upload) = pair_search_records();
+        operation.access_medium = Some(AccessMedium::SharedWired);
         let candidate = profile_pair_candidates(&download, &upload).unwrap()[0];
         let directional_measurements_before = records
             .iter()
@@ -17208,6 +19520,537 @@ mod tests {
             raw.discarded_shaped_observation_count,
             directional_measurements_before + 1
         );
+
+        let raw_digest = "ee".repeat(32);
+        records.push(record(
+            records.len() as u32 + 1,
+            AutotunePhase::TopologyComparison,
+            AutotuneEvidence::RawFallbackBuilt {
+                digest: raw_digest.clone(),
+            },
+        ));
+        let replay = AutotuneReplayState::replay(&operation, &"66".repeat(16), &records).unwrap();
+        assert_eq!(
+            replay.next_action().unwrap(),
+            AutotuneAction::RestoreRuntime
+        );
+        assert_eq!(
+            native_review_digests(&records).unwrap(),
+            NativeReviewDigests::RawFallback {
+                proposal: "cc".repeat(32),
+                raw_fallback: raw_digest,
+            }
+        );
+
+        let mut mixed_authority = records;
+        mixed_authority.push(record(
+            mixed_authority.len() as u32 + 1,
+            AutotunePhase::PairConfirmation,
+            AutotuneEvidence::PairConfirmed {
+                digest: "ff".repeat(32),
+            },
+        ));
+        assert!(native_review_digests(&mixed_authority)
+            .unwrap_err()
+            .contains("mixed raw-fallback and shaped artifacts"));
+    }
+
+    #[test]
+    fn mobile_pair_exhaustion_requires_an_exact_terminal_download_bypass_control() {
+        let (operation, proposal, mut records, download, upload) = pair_search_records();
+        append_measured_pair_exhaustion(&proposal, &mut records, &download, &upload);
+        let replay = AutotuneReplayState::replay(&operation, &"66".repeat(16), &records).unwrap();
+        assert_eq!(
+            replay.next_action().unwrap(),
+            AutotuneAction::ConfirmMobileDownloadBypass
+        );
+        assert!(
+            native_raw_fallback_result(&operation, &"66".repeat(16), &proposal, &records)
+                .unwrap_err()
+                .contains("requires an exhausted shaped search")
+        );
+
+        let selected_ul_kbps = selected_profile_search_point(&upload).unwrap().0;
+        let unavailable = DirectionalBypassUnavailableEvidence {
+            candidate_ul_kbps: selected_ul_kbps,
+            failed_direction: SpeedtestDirection::Download,
+            reason: PairOptionUnavailableReason::TrafficBudget,
+            run_count: 0,
+            debit_count: 0,
+            icmp_samples: 0,
+            transport_samples: 0,
+            cpu_samples: 0,
+        };
+        let unavailable_record = record(
+            records.len() as u32 + 1,
+            AutotunePhase::TopologyComparison,
+            AutotuneEvidence::DirectionalBypassUnavailable(unavailable),
+        );
+        assert_eq!(
+            AutotuneEvidenceRecord::decode(&unavailable_record.encode().unwrap()).unwrap(),
+            unavailable_record
+        );
+        records.push(unavailable_record);
+        let replay = AutotuneReplayState::replay(&operation, &"66".repeat(16), &records).unwrap();
+        assert_eq!(
+            replay.next_action().unwrap(),
+            AutotuneAction::BuildRawFallback
+        );
+        let raw =
+            native_raw_fallback_result(&operation, &"66".repeat(16), &proposal, &records).unwrap();
+        assert_eq!(
+            raw.mobile_download_bypass,
+            Some(NativeMobileDownloadBypassOutcome::Unavailable(unavailable))
+        );
+        let json = raw.to_json();
+        assert!(json.starts_with("{\"schema_version\":5,"));
+        assert!(json.contains("\"reason\":\"traffic_budget\""));
+    }
+
+    #[test]
+    fn shaped_only_mobile_pair_exhaustion_never_requests_an_unshaped_control() {
+        let mut operation = request(CalibrationStrategy::ShapedOnly, 1_000_000_000);
+        operation.profile = Some(AutotuneProfile::BestOverall);
+        operation.allow_sqm_disable = false;
+        let mut records = proposal_ready_records(CalibrationStrategy::ShapedOnly);
+        let proposal = build_native_proposal_from_evidence(
+            &operation,
+            &"66".repeat(16),
+            &records,
+            LinkKind::Pppoe,
+        )
+        .unwrap();
+        records.push(record(
+            records.len() as u32 + 1,
+            AutotunePhase::Proposal,
+            AutotuneEvidence::ProposalBuilt {
+                digest: "cc".repeat(32),
+            },
+        ));
+        let download =
+            append_completed_search(&mut records, &proposal, EvidenceDirection::Download);
+        let upload = append_completed_search(&mut records, &proposal, EvidenceDirection::Upload);
+        append_measured_pair_exhaustion(&proposal, &mut records, &download, &upload);
+        let replay = AutotuneReplayState::replay(&operation, &"66".repeat(16), &records).unwrap();
+        assert!(!replay.mobile_download_bypass_required);
+        assert!(replay
+            .next_action()
+            .unwrap_err()
+            .contains("without raw fallback authority"));
+    }
+
+    #[test]
+    fn mobile_pair_exhaustion_can_offer_upload_only_sqm_as_a_manual_schema_v6_option() {
+        let (operation, proposal, mut records, download, upload) = pair_search_records();
+        append_measured_pair_exhaustion(&proposal, &mut records, &download, &upload);
+        let selected_ul_kbps =
+            append_mobile_download_bypass_measurements(&proposal, &mut records, &upload);
+        let replay = AutotuneReplayState::replay(&operation, &"66".repeat(16), &records).unwrap();
+        assert_eq!(
+            replay.next_action().unwrap(),
+            AutotuneAction::BuildRawFallback
+        );
+
+        let Some(NativeMobileDownloadBypassOutcome::Confirmed(directional)) =
+            native_mobile_download_bypass_outcome(&operation, &proposal, &records).unwrap()
+        else {
+            panic!("exact upload-only control must produce a directional result");
+        };
+        assert_eq!(directional.selected_ul_kbps, selected_ul_kbps);
+        assert!(directional.manual_apply_eligible);
+        assert!(directional
+            .required_acknowledgements
+            .contains(&NativeApplyAcknowledgement::DownloadShapingBypassed));
+        assert!(!directional
+            .required_acknowledgements
+            .contains(&NativeApplyAcknowledgement::UploadShapingBypassed));
+        assert!(!directional
+            .required_acknowledgements
+            .contains(&NativeApplyAcknowledgement::SqmDisabled));
+
+        let raw =
+            native_raw_fallback_result(&operation, &"66".repeat(16), &proposal, &records).unwrap();
+        let raw_bytes = canonical_raw_fallback_bytes(&raw).unwrap();
+        assert_eq!(raw_bytes.len(), 2_482);
+        assert_eq!(
+            sqm_identity::sha256sum(&raw_bytes).unwrap(),
+            "6b881c53ab1fce8626f81924b5d590c4679fb8991ff48ed6939d939ec2a6d6e6"
+        );
+        assert!(String::from_utf8(raw_bytes)
+            .unwrap()
+            .starts_with("{\"schema_version\":5,"));
+        let plan = NativeApplyExecutionPlan::from_verified_directional_raw_fallback(
+            NativeDirectionalRawFallbackApplyManifestInput {
+                option_id: "bypass_download",
+                request: &operation,
+                worker_run_id: &"66".repeat(16),
+                review_digest: &"77".repeat(32),
+                coordinator_boot_id: "boot-id",
+                coordinator_generation: &"88".repeat(16),
+                proposal: &proposal,
+                selected_ul_kbps,
+                runtime_minimum_ul_kbps: directional.runtime_minimum_ul_kbps,
+                required_acknowledgements: &directional.required_acknowledgements,
+                proposal_digest: &"99".repeat(32),
+                raw_fallback_digest: &"aa".repeat(32),
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.action, NativeApplyAction::ApplySqm);
+        assert_eq!(plan.sqm_direction_mode, NativeSqmDirectionMode::UploadOnly);
+        assert_eq!(plan.download.mode, NativeApplyDirectionMode::Bypass);
+        assert_eq!(plan.upload.mode, NativeApplyDirectionMode::Shaped);
+        let manifest = String::from_utf8(plan.canonical_manifest_bytes().unwrap()).unwrap();
+        assert!(manifest.starts_with("{\"native_apply_manifest_schema_version\":6,"));
+        assert!(manifest.contains("\"selected_topology\":\"upload_only_shaped\""));
+    }
+
+    #[test]
+    fn mobile_pair_exhaustion_review_publishes_no_sqm_and_download_bypass_options() {
+        let (operation, proposal, mut records, download, upload) = pair_search_records();
+        let worker_run_id = "66".repeat(16);
+        let root = private_temp_directory("mobile-pair-exhaustion-review");
+        let request_path = root.join("request");
+        atomic_private_write(&request_path, operation.encode().unwrap().as_bytes()).unwrap();
+        let (_, proposal_digest) = publish_native_proposal(&root, &proposal).unwrap();
+        for record in &mut records {
+            if let AutotuneEvidence::ProposalBuilt { digest } = &mut record.evidence {
+                *digest = proposal_digest.clone();
+            }
+        }
+
+        append_measured_pair_exhaustion(&proposal, &mut records, &download, &upload);
+        append_mobile_download_bypass_measurements(&proposal, &mut records, &upload);
+        let raw =
+            native_raw_fallback_result(&operation, &worker_run_id, &proposal, &records).unwrap();
+        assert!(matches!(
+            raw.mobile_download_bypass,
+            Some(NativeMobileDownloadBypassOutcome::Confirmed(
+                NativeMobileDownloadBypassResult {
+                    manual_apply_eligible: true,
+                    ..
+                }
+            ))
+        ));
+        let (_, raw_digest) = publish_native_raw_fallback(&root, &raw).unwrap();
+        records.push(record(
+            records.len() as u32 + 1,
+            AutotunePhase::TopologyComparison,
+            AutotuneEvidence::RawFallbackBuilt { digest: raw_digest },
+        ));
+        records.push(record(
+            records.len() as u32 + 1,
+            AutotunePhase::Restore,
+            AutotuneEvidence::RuntimeRestored,
+        ));
+
+        let review_path = root.join(format!("review-{worker_run_id}.json"));
+        let review_bytes =
+            canonical_native_review_bytes(&operation, &worker_run_id, &records, &root).unwrap();
+        let review_digest = publish_native_review(&review_path, &review_bytes).unwrap();
+        let evidence_store = AutotuneEvidenceStore::open(&root).unwrap();
+        for value in &records {
+            evidence_store.append(value).unwrap();
+        }
+        let coordinator_generation = "77".repeat(16);
+        let options = publish_native_apply_option_manifests_transaction(
+            &request_path,
+            &review_path,
+            &operation.identity.job_id,
+            &worker_run_id,
+            &review_digest,
+            "boot-id",
+            &coordinator_generation,
+        )
+        .unwrap();
+        assert_eq!(
+            options
+                .iter()
+                .map(|option| option.option_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["no_sqm", "bypass_download"]
+        );
+        let no_sqm = options
+            .iter()
+            .find(|option| option.option_id == "no_sqm")
+            .unwrap();
+        assert!(String::from_utf8(fs::read(&no_sqm.path).unwrap())
+            .unwrap()
+            .starts_with("{\"native_apply_manifest_schema_version\":5,"));
+        let bypass = options
+            .iter()
+            .find(|option| option.option_id == "bypass_download")
+            .unwrap();
+        let bypass_text = String::from_utf8(fs::read(&bypass.path).unwrap()).unwrap();
+        assert!(bypass_text.starts_with("{\"native_apply_manifest_schema_version\":6,"));
+        let (bypass_plan, _, bypass_digest) =
+            verified_native_apply_execution_plan_for_option_transaction(
+                &request_path,
+                &review_path,
+                &bypass.path,
+                &operation.identity.job_id,
+                &worker_run_id,
+                &review_digest,
+                "boot-id",
+                &coordinator_generation,
+                "bypass_download",
+            )
+            .unwrap();
+        assert_eq!(bypass_digest, bypass.digest);
+        assert_eq!(
+            bypass_plan.sqm_direction_mode,
+            NativeSqmDirectionMode::UploadOnly
+        );
+
+        records.push(record(
+            records.len() as u32 + 1,
+            AutotunePhase::Review,
+            AutotuneEvidence::ReviewReady {
+                result_digest: review_digest.clone(),
+            },
+        ));
+        evidence_store.append(records.last().unwrap()).unwrap();
+        let public = String::from_utf8(
+            canonical_native_public_result_transaction(
+                &request_path,
+                &review_path,
+                &no_sqm.path,
+                &operation.identity.job_id,
+                &worker_run_id,
+                &review_digest,
+                "boot-id",
+                &coordinator_generation,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(public.contains("\"option_id\":\"bypass_download\""));
+        assert!(public.contains("\"selected_topology\":\"upload_only_shaped\""));
+        assert!(public.contains("\"manual_apply_eligible\":true"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unsafe_mobile_download_bypass_measurement_remains_diagnostic_only() {
+        let (operation, proposal, mut records, download, upload) = pair_search_records();
+        append_measured_pair_exhaustion(&proposal, &mut records, &download, &upload);
+        append_mobile_download_bypass_measurements(&proposal, &mut records, &upload);
+        let AutotuneEvidence::Measurement(measurement) = &mut records.last_mut().unwrap().evidence
+        else {
+            panic!("last record must be the upload control");
+        };
+        measurement.loss_ppm = 1_000_000;
+        let Some(NativeMobileDownloadBypassOutcome::Confirmed(result)) =
+            native_mobile_download_bypass_outcome(&operation, &proposal, &records).unwrap()
+        else {
+            panic!("unsafe evidence must remain visible as a measured diagnostic");
+        };
+        assert!(!result.manual_apply_eligible);
+        let raw =
+            native_raw_fallback_result(&operation, &"66".repeat(16), &proposal, &records).unwrap();
+        assert!(matches!(
+            &raw.mobile_download_bypass,
+            Some(NativeMobileDownloadBypassOutcome::Confirmed(
+                NativeMobileDownloadBypassResult {
+                    manual_apply_eligible: false,
+                    ..
+                }
+            ))
+        ));
+
+        let root = private_temp_directory("unsafe-mobile-bypass-review");
+        let request_path = root.join("request");
+        atomic_private_write(&request_path, operation.encode().unwrap().as_bytes()).unwrap();
+        let (_, proposal_digest) = publish_native_proposal(&root, &proposal).unwrap();
+        for record in &mut records {
+            if let AutotuneEvidence::ProposalBuilt { digest } = &mut record.evidence {
+                *digest = proposal_digest.clone();
+            }
+        }
+        let (_, raw_digest) = publish_native_raw_fallback(&root, &raw).unwrap();
+        records.push(record(
+            records.len() as u32 + 1,
+            AutotunePhase::TopologyComparison,
+            AutotuneEvidence::RawFallbackBuilt { digest: raw_digest },
+        ));
+        records.push(record(
+            records.len() as u32 + 1,
+            AutotunePhase::Restore,
+            AutotuneEvidence::RuntimeRestored,
+        ));
+        let review_path = root.join(format!("review-{}.json", "66".repeat(16)));
+        let review_bytes =
+            canonical_native_review_bytes(&operation, &"66".repeat(16), &records, &root).unwrap();
+        let review_digest = publish_native_review(&review_path, &review_bytes).unwrap();
+        let store = AutotuneEvidenceStore::open(&root).unwrap();
+        for value in &records {
+            store.append(value).unwrap();
+        }
+        let plans = native_apply_execution_plans_transaction(
+            &request_path,
+            &review_path,
+            &operation.identity.job_id,
+            &"66".repeat(16),
+            &review_digest,
+            "boot-id",
+            &"77".repeat(16),
+        )
+        .unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].option_id, "no_sqm");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mobile_download_bypass_replay_rejects_upload_before_download() {
+        let (operation, proposal, mut records, download, upload) = pair_search_records();
+        append_measured_pair_exhaustion(&proposal, &mut records, &download, &upload);
+        let selected_ul_kbps = selected_profile_search_point(&upload).unwrap().0;
+        let mut measurement = measurement(
+            MeasurementTopology::UploadOnlyShaped,
+            SpeedtestDirection::Upload,
+            1_000_000,
+        );
+        measurement.candidate_dl_kbps = None;
+        measurement.candidate_ul_kbps = Some(selected_ul_kbps);
+        measurement.achieved_ul_kbps = Some((selected_ul_kbps * 90 / 100).max(1));
+        measurement.realized_ul_kbps = measurement.achieved_ul_kbps;
+        measurement.load_reference_ul_kbps = Some(selected_ul_kbps);
+        push_measurement_record(&mut records, AutotunePhase::TopologyComparison, measurement);
+        assert!(
+            AutotuneReplayState::replay(&operation, &"66".repeat(16), &records)
+                .unwrap_err()
+                .contains("out of order")
+        );
+    }
+
+    #[test]
+    fn mobile_download_bypass_accepts_capture_derived_unshaped_download_rate_identity() {
+        let (operation, proposal, mut records, download, upload) = pair_search_records();
+        append_measured_pair_exhaustion(&proposal, &mut records, &download, &upload);
+        let selected_ul_kbps = selected_profile_search_point(&upload).unwrap().0;
+        let mut capture = capture_request();
+        capture.topology = MeasurementTopology::UploadOnlyShaped;
+        capture.candidate_dl_kbps = None;
+        capture.candidate_ul_kbps = Some(selected_ul_kbps);
+        capture.load_reference_kbps = Some(proposal.download.maximum_kbps);
+        let snapshot = AutotuneCaptureSnapshot {
+            request: capture.clone(),
+            state: AutotuneCaptureState::Complete,
+            updated_boot_ms: 123_200,
+            icmp_samples: 15,
+            transport_samples: 15,
+            transport_timeout_count: 0,
+            transport_timeout_total_us: 0,
+            transport_censored: false,
+            cpu_samples: 2,
+            idle_median_us: None,
+            idle_p95_us: None,
+            idle_transport_baseline_us: None,
+            icmp_delta_us: Some(5_000),
+            transport_delta_us: Some(8_000),
+            loss_ppm: Some(0),
+            cpu_milli_percent: Some(72_000),
+            background_confidence_percent: Some(100),
+            contaminated: false,
+            diagnostic_code: None,
+        };
+        let load = AutotuneLoadEvidence {
+            request: capture,
+            published_boot_ms: 123_100,
+            run_count: 1,
+            aggregate_rx_bytes: 1_200_000,
+            aggregate_tx_bytes: 60_000,
+            confidence_total_bytes: 1_200_000,
+            controlled_wire_bytes: 1_100_000,
+            controlled_payload_bytes: 1_100_000,
+            counter_elapsed_ms: 10_050,
+            direction_elapsed_ms: 10_050,
+            backend_reported_kbps: 875,
+            backend_consistent_runs: 1,
+            backend_payload_only_runs: 0,
+            realized_kbps: 875,
+            goodput_kbps: 875,
+        };
+        let measurement = measurement_evidence_from_capture(&snapshot, &load).unwrap();
+        assert_eq!(measurement.realized_dl_kbps, measurement.achieved_dl_kbps);
+        assert!(measurement.realized_dl_kbps.is_some());
+        push_measurement_record(&mut records, AutotunePhase::TopologyComparison, measurement);
+        let replay = AutotuneReplayState::replay(&operation, &"66".repeat(16), &records).unwrap();
+        assert!(replay.mobile_bypass_download_complete);
+        assert!(!replay.mobile_bypass_upload_complete);
+        assert_eq!(
+            replay.next_action().unwrap(),
+            AutotuneAction::ConfirmMobileDownloadBypass
+        );
+    }
+
+    #[test]
+    fn mobile_download_bypass_rejects_noncanonical_unshaped_realization() {
+        let (operation, proposal, records, download, upload) = pair_search_records();
+        let selected_ul_kbps = selected_profile_search_point(&upload).unwrap().0;
+        for realized_dl_kbps in [None, Some(proposal.download.observed_low_kbps + 1)] {
+            let mut candidate_records = records.clone();
+            append_measured_pair_exhaustion(&proposal, &mut candidate_records, &download, &upload);
+            let mut measurement = measurement(
+                MeasurementTopology::UploadOnlyShaped,
+                SpeedtestDirection::Download,
+                2_000_000,
+            );
+            measurement.candidate_dl_kbps = None;
+            measurement.candidate_ul_kbps = Some(selected_ul_kbps);
+            measurement.achieved_dl_kbps = Some(proposal.download.observed_low_kbps.max(1));
+            measurement.realized_dl_kbps = realized_dl_kbps;
+            measurement.load_reference_dl_kbps = Some(proposal.download.maximum_kbps);
+            push_measurement_record(
+                &mut candidate_records,
+                AutotunePhase::TopologyComparison,
+                measurement,
+            );
+            assert!(
+                AutotuneReplayState::replay(&operation, &"66".repeat(16), &candidate_records,)
+                    .unwrap_err()
+                    .contains("out of order")
+            );
+        }
+    }
+
+    #[test]
+    fn pre_upgrade_mobile_pair_exhaustion_schema_v3_remains_verifiable_only_from_stored_bytes() {
+        let (operation, proposal, mut records, download, upload) = pair_search_records();
+        append_measured_pair_exhaustion(&proposal, &mut records, &download, &upload);
+        let legacy = native_raw_fallback_result_with_mobile_confirmation(
+            &operation,
+            &"66".repeat(16),
+            &proposal,
+            &records,
+            false,
+        )
+        .unwrap();
+        assert!(legacy.to_json().starts_with("{\"schema_version\":3,"));
+        assert!(
+            native_raw_fallback_result(&operation, &"66".repeat(16), &proposal, &records).is_err()
+        );
+
+        let root = private_temp_directory("legacy-mobile-raw-fallback");
+        let (path, digest) = publish_native_raw_fallback(&root, &legacy).unwrap();
+        records.push(record(
+            records.len() as u32 + 1,
+            AutotunePhase::TopologyComparison,
+            AutotuneEvidence::RawFallbackBuilt { digest },
+        ));
+        assert_eq!(
+            verify_native_raw_fallback_transaction(
+                &operation,
+                &"66".repeat(16),
+                &proposal,
+                &records,
+                &path,
+            )
+            .unwrap(),
+            legacy
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -17448,8 +20291,18 @@ mod tests {
         assert_eq!(result.selected_ul_kbps, None);
         let pair = native_pair_confirmation_result(&proposal, &records).unwrap();
         assert_eq!(
-            native_topology_apply_acknowledgements(&pair, &result).unwrap(),
+            native_topology_apply_acknowledgements(&pair, &result, result.selected_topology,)
+                .unwrap(),
             vec![NativeApplyAcknowledgement::SqmDisabled]
+        );
+        assert_eq!(
+            native_topology_apply_acknowledgements(
+                &pair,
+                &result,
+                MeasurementTopology::UploadOnlyShaped,
+            )
+            .unwrap(),
+            vec![NativeApplyAcknowledgement::DownloadShapingBypassed]
         );
 
         let root = private_temp_directory("topology-comparison");
@@ -17497,6 +20350,28 @@ mod tests {
         .unwrap_err()
         .contains("digest mismatch"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn only_explicitly_selected_mobile_media_reserve_the_download_bypass_card() {
+        let mut operation = request(CalibrationStrategy::FullRaw, 1_000_000_000);
+        for medium in [
+            AccessMedium::Cellular,
+            AccessMedium::LeoSatellite,
+            AccessMedium::GeoSatellite,
+            AccessMedium::FixedWireless,
+        ] {
+            operation.access_medium = Some(medium);
+            operation.access_source = Some(AccessEvidenceSource::UserSelected);
+            assert!(mobile_download_bypass_required(&operation));
+            operation.access_source = Some(AccessEvidenceSource::AutoInconclusive);
+            assert!(!mobile_download_bypass_required(&operation));
+        }
+        operation.access_source = Some(AccessEvidenceSource::UserSelected);
+        for medium in [AccessMedium::SharedWired, AccessMedium::Unknown] {
+            operation.access_medium = Some(medium);
+            assert!(!mobile_download_bypass_required(&operation));
+        }
     }
 
     #[test]
@@ -17696,9 +20571,45 @@ mod tests {
         )
         .unwrap();
         assert!(published_options.len() >= 2);
+        assert!(published_options.len() <= MAX_NATIVE_APPLY_REVIEW_OPTIONS);
         assert!(published_options
             .iter()
             .any(|option| option.option_id == "no_sqm"));
+        let bypass_download_option = published_options
+            .iter()
+            .find(|option| option.option_id == "bypass_download")
+            .expect("explicitly selected cellular access must retain upload-only SQM");
+        let (bypass_download_plan, _, bypass_download_digest) =
+            verified_native_apply_execution_plan_for_option_transaction(
+                &request_path,
+                &review_path,
+                &bypass_download_option.path,
+                &operation.identity.job_id,
+                &"66".repeat(16),
+                &review_digest,
+                "boot-id",
+                &coordinator_generation,
+                "bypass_download",
+            )
+            .unwrap();
+        assert_eq!(bypass_download_digest, bypass_download_option.digest);
+        assert_eq!(
+            bypass_download_plan.sqm_direction_mode,
+            NativeSqmDirectionMode::UploadOnly
+        );
+        assert_eq!(
+            bypass_download_plan.download.mode,
+            NativeApplyDirectionMode::Bypass
+        );
+        assert_eq!(
+            bypass_download_plan.upload.mode,
+            NativeApplyDirectionMode::Shaped
+        );
+        assert_eq!(bypass_download_plan.download.maximum_kbps, None);
+        assert!(bypass_download_plan.upload.maximum_kbps.is_some());
+        assert!(bypass_download_plan
+            .required_acknowledgements
+            .contains(&NativeApplyAcknowledgement::DownloadShapingBypassed));
         let no_sqm_option = published_options
             .iter()
             .find(|option| option.option_id == "no_sqm")
@@ -17991,7 +20902,9 @@ mod tests {
             replay_remaining_traffic_budget(&operation, &records).unwrap(),
             required - 1
         );
-        let acknowledgements = native_topology_apply_acknowledgements(&pair, &result).unwrap();
+        let acknowledgements =
+            native_topology_apply_acknowledgements(&pair, &result, result.selected_topology)
+                .unwrap();
         assert!(
             acknowledgements.contains(&NativeApplyAcknowledgement::TopologyComparisonTrafficBudget)
         );
@@ -18414,6 +21327,7 @@ mod tests {
             candidate_dl_kbps: None,
             candidate_ul_kbps: Some(50_000),
             load_reference_kbps: Some(100_000),
+            transport_baseline_us: Some(10_000),
             route_fingerprint: "33".repeat(32),
             sqm_fingerprint: "55".repeat(32),
         }
@@ -18484,6 +21398,7 @@ mod tests {
         qualification.direction = None;
         qualification.control_sequence = 0;
         qualification.load_reference_kbps = None;
+        qualification.transport_baseline_us = None;
         qualification.validate().unwrap();
         assert_eq!(
             capture_traffic_safety_reserve_bytes(
@@ -18501,6 +21416,12 @@ mod tests {
         let request = capture_request();
         let encoded = request.encode().unwrap();
         assert_eq!(AutotuneCaptureRequest::decode(&encoded).unwrap(), request);
+        assert!(AutotuneCaptureRequest::decode(&encoded.replacen(
+            "cake-autorate-autotune-capture\t3\trequest",
+            "cake-autorate-autotune-capture\t2\trequest",
+            1,
+        ))
+        .is_err());
         assert!(AutotuneCaptureRequest::decode(&(encoded + "unknown=1\n")).is_err());
 
         let loaded_encoded = capture_request().encode().unwrap();
@@ -18549,6 +21470,7 @@ mod tests {
 
         let mut valid_idle = idle_with_reference;
         valid_idle.load_reference_kbps = None;
+        valid_idle.transport_baseline_us = None;
         valid_idle.candidate_dl_kbps = Some(100_000);
         let idle_encoded = valid_idle.encode().unwrap();
         assert!(AutotuneCaptureRequest::decode(
@@ -18558,12 +21480,63 @@ mod tests {
     }
 
     #[test]
+    fn loaded_transport_baseline_is_exactly_bound_to_the_completed_idle_capture() {
+        let loaded = capture_request();
+        let mut idle = loaded.clone();
+        idle.capture_id = "79".repeat(16);
+        idle.sequence = 1;
+        idle.control_sequence = 0;
+        idle.phase = AutotuneCapturePhase::IdleBaseline;
+        idle.topology = MeasurementTopology::RawBoth;
+        idle.direction = None;
+        idle.candidate_dl_kbps = None;
+        idle.candidate_ul_kbps = None;
+        idle.load_reference_kbps = None;
+        idle.transport_baseline_us = None;
+        let snapshot = AutotuneCaptureSnapshot {
+            request: idle.clone(),
+            state: AutotuneCaptureState::Complete,
+            updated_boot_ms: 122_900,
+            icmp_samples: MIN_AUTOTUNE_IDLE_ICMP_SAMPLES,
+            transport_samples: MIN_AUTOTUNE_TRANSPORT_SAMPLES,
+            transport_timeout_count: 0,
+            transport_timeout_total_us: 0,
+            transport_censored: false,
+            cpu_samples: 0,
+            idle_median_us: Some(8_000),
+            idle_p95_us: Some(12_000),
+            idle_transport_baseline_us: Some(10_000),
+            icmp_delta_us: None,
+            transport_delta_us: None,
+            loss_ppm: None,
+            cpu_milli_percent: None,
+            background_confidence_percent: Some(100),
+            contaminated: false,
+            diagnostic_code: None,
+        };
+        let authority =
+            AutotuneTransportBaselineAuthority::from_completed_idle(&idle, &snapshot).unwrap();
+        authority.attests_loaded(&loaded).unwrap();
+
+        let mut drifted = loaded.clone();
+        drifted.transport_baseline_us = Some(10_001);
+        assert!(authority.attests_loaded(&drifted).is_err());
+        drifted = loaded.clone();
+        drifted.route_fingerprint = "99".repeat(32);
+        assert!(authority.attests_loaded(&drifted).is_err());
+        drifted = loaded;
+        drifted.sequence = idle.sequence;
+        assert!(authority.attests_loaded(&drifted).is_err());
+    }
+
+    #[test]
     fn managed_and_absent_idle_baselines_are_exactly_distinguished() {
         let mut idle = capture_request();
         idle.phase = AutotuneCapturePhase::IdleBaseline;
         idle.control_sequence = 0;
         idle.direction = None;
         idle.load_reference_kbps = None;
+        idle.transport_baseline_us = None;
 
         for (topology, download_kbps, upload_kbps) in [
             (MeasurementTopology::ShapedBoth, Some(100_000), Some(50_000)),
@@ -18636,8 +21609,8 @@ mod tests {
         let encoded = evidence.encode().unwrap();
         assert_eq!(AutotuneLoadEvidence::decode(&encoded).unwrap(), evidence);
         assert!(AutotuneLoadEvidence::decode(&encoded.replacen(
+            "cake-autorate-autotune-load-evidence\t6",
             "cake-autorate-autotune-load-evidence\t5",
-            "cake-autorate-autotune-load-evidence\t4",
             1,
         ))
         .is_err());
@@ -19027,8 +22000,8 @@ mod tests {
             evidence
         );
         assert!(AutotuneBidirectionalLoadEvidence::decode(&encoded.replacen(
+            "cake-autorate-autotune-bidirectional-load-evidence\t5",
             "cake-autorate-autotune-bidirectional-load-evidence\t4",
-            "cake-autorate-autotune-bidirectional-load-evidence\t3",
             1,
         ))
         .is_err());
@@ -19110,6 +22083,43 @@ mod tests {
         let request_path = directory.join("autotune-capture-request");
         let mut capture = AutotuneCaptureGuard::new(&directory);
         let owned = capture_request();
+        let mut idle = owned.clone();
+        idle.capture_id = "78".repeat(16);
+        idle.sequence = 1;
+        idle.control_sequence = 0;
+        idle.phase = AutotuneCapturePhase::IdleBaseline;
+        idle.topology = MeasurementTopology::RawBoth;
+        idle.direction = None;
+        idle.candidate_dl_kbps = None;
+        idle.candidate_ul_kbps = None;
+        idle.load_reference_kbps = None;
+        idle.transport_baseline_us = None;
+        capture.publish(&idle).unwrap();
+        let idle_snapshot = AutotuneCaptureSnapshot {
+            request: idle.clone(),
+            state: AutotuneCaptureState::Complete,
+            updated_boot_ms: 122_900,
+            icmp_samples: MIN_AUTOTUNE_IDLE_ICMP_SAMPLES,
+            transport_samples: MIN_AUTOTUNE_TRANSPORT_SAMPLES,
+            transport_timeout_count: 0,
+            transport_timeout_total_us: 0,
+            transport_censored: false,
+            cpu_samples: 0,
+            idle_median_us: Some(8_000),
+            idle_p95_us: Some(12_000),
+            idle_transport_baseline_us: Some(10_000),
+            icmp_delta_us: None,
+            transport_delta_us: None,
+            loss_ppm: None,
+            cpu_milli_percent: None,
+            background_confidence_percent: Some(100),
+            contaminated: false,
+            diagnostic_code: None,
+        };
+        capture
+            .bind_completed_idle_transport_baseline(&idle, &idle_snapshot)
+            .unwrap();
+        capture.cleanup();
         capture.publish(&owned).unwrap();
 
         let mut transition_observed = false;
@@ -19584,6 +22594,7 @@ mod tests {
         request.candidate_dl_kbps = Some(100_000);
         request.candidate_ul_kbps = Some(50_000);
         request.load_reference_kbps = None;
+        request.transport_baseline_us = None;
         request.validate().unwrap();
 
         let directory = private_temp_directory("capture-request");
@@ -19612,6 +22623,7 @@ mod tests {
             cpu_samples: 0,
             idle_median_us: None,
             idle_p95_us: None,
+            idle_transport_baseline_us: None,
             icmp_delta_us: None,
             transport_delta_us: None,
             loss_ppm: None,
@@ -19764,6 +22776,7 @@ mod tests {
             cpu_samples: 2,
             idle_median_us: None,
             idle_p95_us: None,
+            idle_transport_baseline_us: None,
             icmp_delta_us: Some(5_000),
             transport_delta_us: Some(8_000),
             loss_ppm: Some(1_000),
@@ -19773,11 +22786,11 @@ mod tests {
             diagnostic_code: None,
         };
         let encoded = snapshot.encode().unwrap();
-        assert!(encoded.starts_with("cake-autorate-autotune-capture\t3\tsnapshot\n"));
+        assert!(encoded.starts_with("cake-autorate-autotune-capture\t4\tsnapshot\n"));
         assert_eq!(AutotuneCaptureSnapshot::decode(&encoded).unwrap(), snapshot);
         assert!(AutotuneCaptureSnapshot::decode(&encoded.replacen(
+            "cake-autorate-autotune-capture\t4\tsnapshot",
             "cake-autorate-autotune-capture\t3\tsnapshot",
-            "cake-autorate-autotune-capture\t2\tsnapshot",
             1,
         ))
         .is_err());
@@ -19809,6 +22822,7 @@ mod tests {
             cpu_samples: 0,
             idle_median_us: None,
             idle_p95_us: None,
+            idle_transport_baseline_us: None,
             icmp_delta_us: None,
             transport_delta_us: None,
             loss_ppm: None,
@@ -19861,6 +22875,7 @@ mod tests {
             cpu_samples: 2,
             idle_median_us: None,
             idle_p95_us: None,
+            idle_transport_baseline_us: None,
             icmp_delta_us: Some(5_000),
             transport_delta_us: Some(8_000),
             loss_ppm: Some(1_000),
@@ -19915,6 +22930,7 @@ mod tests {
             cpu_samples: 2,
             idle_median_us: None,
             idle_p95_us: None,
+            idle_transport_baseline_us: None,
             icmp_delta_us: Some(5_000),
             transport_delta_us: Some(8_000),
             loss_ppm: Some(1_000),
@@ -20047,6 +23063,7 @@ mod tests {
         prior_request.direction = None;
         prior_request.candidate_dl_kbps = Some(100_000);
         prior_request.load_reference_kbps = None;
+        prior_request.transport_baseline_us = None;
         let prior = AutotuneCaptureSnapshot {
             request: prior_request,
             state: AutotuneCaptureState::Collecting,
@@ -20059,6 +23076,7 @@ mod tests {
             cpu_samples: 0,
             idle_median_us: None,
             idle_p95_us: None,
+            idle_transport_baseline_us: None,
             icmp_delta_us: None,
             transport_delta_us: None,
             loss_ppm: None,
@@ -20127,6 +23145,7 @@ mod tests {
         request.candidate_dl_kbps = Some(100_000);
         request.candidate_ul_kbps = Some(50_000);
         request.load_reference_kbps = None;
+        request.transport_baseline_us = None;
         let snapshot = AutotuneCaptureSnapshot {
             request,
             state: AutotuneCaptureState::Complete,
@@ -20139,6 +23158,7 @@ mod tests {
             cpu_samples: 0,
             idle_median_us: Some(5_000),
             idle_p95_us: Some(8_000),
+            idle_transport_baseline_us: Some(4_000),
             icmp_delta_us: None,
             transport_delta_us: None,
             loss_ppm: None,
@@ -20257,6 +23277,31 @@ mod tests {
         )
         .unwrap_err()
         .contains("identity mismatch"));
+    }
+
+    #[test]
+    fn only_explicit_mobile_full_raw_reserves_one_terminal_bypass_sequence() {
+        let mut operation = request(CalibrationStrategy::FullRaw, 1_000_000_000);
+        let mobile = native_autotune_runtime_permit_policy(&operation).unwrap();
+
+        operation.access_medium = Some(AccessMedium::SharedWired);
+        let shared_wired = native_autotune_runtime_permit_policy(&operation).unwrap();
+        assert_eq!(mobile.maximum_sequence, shared_wired.maximum_sequence + 1);
+
+        operation.access_medium = Some(AccessMedium::Cellular);
+        operation.access_source = Some(AccessEvidenceSource::AutoInconclusive);
+        let inferred_mobile = native_autotune_runtime_permit_policy(&operation).unwrap();
+        assert_eq!(
+            inferred_mobile.maximum_sequence,
+            shared_wired.maximum_sequence
+        );
+
+        operation.access_source = Some(AccessEvidenceSource::UserSelected);
+        operation.strategy = Some(CalibrationStrategy::ShapedOnly);
+        operation.allow_sqm_disable = false;
+        let shaped_only = native_autotune_runtime_permit_policy(&operation).unwrap();
+        assert!(!shaped_only.allow_directional_bypass);
+        assert!(shaped_only.maximum_sequence < shared_wired.maximum_sequence);
     }
 
     #[test]
@@ -20542,6 +23587,7 @@ mod tests {
         idle.candidate_dl_kbps = Some(99_000);
         idle.candidate_ul_kbps = Some(50_000);
         idle.load_reference_kbps = None;
+        idle.transport_baseline_us = None;
         attest_capture_admission(&idle, &permit, None, None, 123_000).unwrap();
         assert!(
             attest_capture_admission(&idle, &permit, Some(&control), Some(&ack), 123_000,).is_err()
@@ -20550,8 +23596,14 @@ mod tests {
         let mut upload_only_permit = permit.clone();
         upload_only_permit.baseline =
             RuntimeBaseline::Managed(MeasurementTopology::UploadOnlyShaped);
-        let upload_only_idle =
-            idle_baseline_capture_request(&upload_only_permit, "cd".repeat(16), 1).unwrap();
+        let upload_only_idle = idle_baseline_capture_request(
+            &upload_only_permit,
+            "cd".repeat(16),
+            1,
+            None,
+            Some(50_000),
+        )
+        .unwrap();
         assert_eq!(upload_only_idle.candidate_dl_kbps, None);
         assert_eq!(upload_only_idle.candidate_ul_kbps, Some(50_000));
         attest_capture_admission(&upload_only_idle, &upload_only_permit, None, None, 123_000)
@@ -20560,8 +23612,14 @@ mod tests {
         let mut download_only_permit = permit.clone();
         download_only_permit.baseline =
             RuntimeBaseline::Managed(MeasurementTopology::DownloadOnlyShaped);
-        let download_only_idle =
-            idle_baseline_capture_request(&download_only_permit, "ef".repeat(16), 1).unwrap();
+        let download_only_idle = idle_baseline_capture_request(
+            &download_only_permit,
+            "ef".repeat(16),
+            1,
+            Some(99_000),
+            None,
+        )
+        .unwrap();
         assert_eq!(download_only_idle.candidate_dl_kbps, Some(99_000));
         assert_eq!(download_only_idle.candidate_ul_kbps, None);
         attest_capture_admission(
@@ -20587,7 +23645,7 @@ mod tests {
         });
         absent_permit.validate().unwrap();
         let absent_idle =
-            idle_baseline_capture_request(&absent_permit, "ac".repeat(16), 1).unwrap();
+            idle_baseline_capture_request(&absent_permit, "ac".repeat(16), 1, None, None).unwrap();
         assert_eq!(absent_idle.topology, MeasurementTopology::RawBoth);
         assert_eq!(absent_idle.candidate_dl_kbps, None);
         assert_eq!(absent_idle.candidate_ul_kbps, None);
@@ -20606,7 +23664,7 @@ mod tests {
             123_000,
         )
         .unwrap_err()
-        .contains("runtime baseline"));
+        .contains("permit baseline"));
     }
 
     fn restore_test_owner(
@@ -20926,7 +23984,7 @@ mod tests {
     }
 
     #[test]
-    fn starved_search_evidence_is_v10_and_canonical() {
+    fn starved_search_evidence_is_v11_and_canonical() {
         let evidence = SearchObservationStarvedEvidence {
             topology: MeasurementTopology::ShapedBoth,
             direction: SpeedtestDirection::Download,
@@ -20946,7 +24004,7 @@ mod tests {
         )
         .encode()
         .unwrap();
-        assert!(encoded.starts_with("cake-autorate-autotune-evidence\t10\n"));
+        assert!(encoded.starts_with("cake-autorate-autotune-evidence\t11\n"));
         assert_eq!(
             AutotuneEvidenceRecord::decode(&encoded).unwrap().evidence,
             AutotuneEvidence::SearchObservationStarved(evidence)
@@ -20960,7 +24018,7 @@ mod tests {
     }
 
     #[test]
-    fn unmeasurable_search_probe_is_v10_canonical_and_has_no_latency_claim() {
+    fn unmeasurable_search_probe_is_v11_canonical_and_has_no_latency_claim() {
         let evidence = SearchProbeUnmeasurableEvidence {
             topology: MeasurementTopology::ShapedBoth,
             direction: SpeedtestDirection::Download,
@@ -20977,7 +24035,7 @@ mod tests {
         )
         .encode()
         .unwrap();
-        assert!(encoded.starts_with("cake-autorate-autotune-evidence\t10\n"));
+        assert!(encoded.starts_with("cake-autorate-autotune-evidence\t11\n"));
         assert!(encoded.contains("kind=search_probe_unmeasurable\n"));
         assert!(encoded.contains("run_count=2\n"));
         assert!(encoded.contains("debit_count=2\n"));
@@ -21651,8 +24709,8 @@ mod tests {
         assert!(encoded.len() < MAX_AUTOTUNE_EVIDENCE_BYTES);
         assert_eq!(AutotuneEvidenceRecord::decode(&encoded).unwrap(), value);
         assert!(AutotuneEvidenceRecord::decode(&encoded.replacen(
+            "cake-autorate-autotune-evidence\t11",
             "cake-autorate-autotune-evidence\t10",
-            "cake-autorate-autotune-evidence\t9",
             1,
         ))
         .is_err());
@@ -21664,7 +24722,7 @@ mod tests {
     }
 
     #[test]
-    fn censored_transport_evidence_is_v10_explicit_and_round_trips() {
+    fn censored_transport_evidence_is_v11_explicit_and_round_trips() {
         let mut measurement = measurement(
             MeasurementTopology::ShapedBoth,
             SpeedtestDirection::Download,
@@ -21680,14 +24738,14 @@ mod tests {
             AutotuneEvidence::Measurement(measurement),
         );
         let encoded = value.encode().unwrap();
-        assert!(encoded.starts_with("cake-autorate-autotune-evidence\t10\n"));
+        assert!(encoded.starts_with("cake-autorate-autotune-evidence\t11\n"));
         assert!(encoded.contains("transport_censored=1\n"));
         assert!(encoded.contains("transport_timeout_count=3\n"));
         assert!(encoded.contains("transport_timeout_total_us=15000000\n"));
         assert_eq!(AutotuneEvidenceRecord::decode(&encoded).unwrap(), value);
         assert!(AutotuneEvidenceRecord::decode(&encoded.replacen(
+            "cake-autorate-autotune-evidence\t11",
             "cake-autorate-autotune-evidence\t10",
-            "cake-autorate-autotune-evidence\t9",
             1,
         ))
         .is_err());
@@ -21732,6 +24790,109 @@ mod tests {
         assert_eq!(store.load().unwrap(), vec![first, second]);
         assert!(!abandoned.exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn progress_is_canonical_identity_bound_and_never_reaches_terminal_percent() {
+        let root = private_temp_directory("progress");
+        let store = AutotuneEvidenceStore::open(&root).unwrap();
+        let request = request(CalibrationStrategy::FullRaw, 1_000_000);
+        let worker_run_id = "66".repeat(16);
+
+        let preflight = append_replay_evidence(
+            &store,
+            &request,
+            &worker_run_id,
+            AutotunePhase::Preflight,
+            AutotuneEvidence::PreflightAttested,
+        )
+        .unwrap();
+        let first = preflight.progress().unwrap();
+        assert_eq!(first.step, NativeAutotuneProgressStep::MeasuringIdleLatency);
+        assert_eq!(first.progress_percent, 6);
+        assert_eq!(
+            NativeAutotuneProgress::decode(&first.encode().unwrap()).unwrap(),
+            first
+        );
+        assert_eq!(
+            read_native_autotune_progress(&root, &request.identity.job_id, &worker_run_id,)
+                .unwrap(),
+            first
+        );
+
+        let baseline = append_replay_evidence(
+            &store,
+            &request,
+            &worker_run_id,
+            AutotunePhase::IdleBaseline,
+            AutotuneEvidence::Baseline(baseline()),
+        )
+        .unwrap()
+        .progress()
+        .unwrap();
+        assert_eq!(
+            baseline.step,
+            NativeAutotuneProgressStep::PreparingMeasurements
+        );
+        assert!(baseline.progress_percent > first.progress_percent);
+        assert!(baseline.progress_percent < 100);
+
+        let path = autotune_progress_path(&root, &worker_run_id).unwrap();
+        let forged = baseline
+            .encode()
+            .unwrap()
+            .replace(&worker_run_id, &"77".repeat(16));
+        atomic_private_write(&path, forged.as_bytes()).unwrap();
+        assert!(
+            read_native_autotune_progress(&root, &request.identity.job_id, &worker_run_id,)
+                .unwrap_err()
+                .contains("identity")
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn progress_bands_are_monotonic_and_active_projection_rejects_one_hundred() {
+        let values = [
+            scaled_progress(12, 28, 0, 4),
+            scaled_progress(12, 28, 1, 4),
+            scaled_progress(12, 28, 4, 4),
+            scaled_progress(32, 50, 0, 12),
+            scaled_progress(32, 50, 12, 12),
+            scaled_progress(52, 69, 0, 12),
+            scaled_progress(52, 69, 12, 12),
+            scaled_progress(72, 82, 0, 3),
+            scaled_progress(72, 82, 3, 3),
+            scaled_progress(84, 91, 0, 4),
+            scaled_progress(84, 91, 4, 4),
+        ];
+        assert!(values.windows(2).all(|pair| pair[0] <= pair[1]));
+        let mobile = [
+            scaled_progress(83, 91, 0, 2),
+            scaled_progress(83, 91, 1, 2),
+            scaled_progress(83, 91, 2, 2),
+        ];
+        assert!(mobile.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(mobile[0] >= values[7]);
+        assert!(mobile[2] <= 91);
+
+        let mut invalid = NativeAutotuneProgress {
+            job_id: "11".repeat(16),
+            worker_run_id: "66".repeat(16),
+            evidence_sequence: 1,
+            step: NativeAutotuneProgressStep::PreparingProposals,
+            progress_percent: 100,
+            stage_index: 10,
+            stage_total: 10,
+            completed_units: 0,
+            total_units: 0,
+            direction: None,
+            attempt: None,
+        };
+        assert!(invalid.encode().unwrap_err().contains("active bound"));
+        invalid.progress_percent = 99;
+        assert!(invalid.encode().is_ok());
     }
 
     #[test]

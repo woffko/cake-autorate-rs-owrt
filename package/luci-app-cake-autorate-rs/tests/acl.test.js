@@ -89,6 +89,7 @@ for (const command of [
 	'/usr/sbin/cake-autorated --calibrationctl speedtest-current *',
 	'/usr/sbin/cake-autorated --calibrationctl speedtest-status *',
 	'/usr/sbin/cake-autorated --calibrationctl speedtest-result *',
+	'/usr/sbin/cake-autorated --calibrationctl autotune-current *',
 	'/usr/sbin/cake-autorated --calibrationctl autotune-status *',
 	'/usr/sbin/cake-autorated --calibrationctl autotune-result *',
 	'/usr/sbin/cake-autorated --calibrationctl autotune-apply-check *',

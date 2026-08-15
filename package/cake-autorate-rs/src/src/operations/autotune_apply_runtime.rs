@@ -2280,6 +2280,8 @@ mod tests {
             .mode(mode)
             .open(path)
             .unwrap();
+        file.set_permissions(fs::Permissions::from_mode(mode))
+            .unwrap();
         file.write_all(bytes).unwrap();
         file.sync_all().unwrap();
     }

@@ -7,12 +7,16 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 const RUNTIME_OWNER_JOURNAL_HEADER: &str = "cake-autorate-calibration\t3\tjournal";
+const PUBLICATION_JOURNAL_HEADER: &str = "cake-autorate-calibration\t4\tjournal";
 const JOURNAL_HEADER: &str = "cake-autorate-calibration\t2\tjournal";
 const LEGACY_JOURNAL_HEADER: &str = "cake-autorate-calibration\t1\tjournal";
-const MAX_JOURNAL_JOBS: usize = 64;
+pub(crate) const MAX_JOURNAL_JOBS: usize = 64;
+pub(crate) const JOURNAL_RETENTION_TARGET: usize = 48;
+const MAX_JOURNAL_DIRECTORY_ENTRIES: usize = 256;
 const JOBS_DIR: &str = "jobs";
 const REQUEST_FILE: &str = "request";
 const STATE_FILE: &str = "state";
+const RETIRED_JOB_PREFIX: &str = ".retired-";
 
 pub(crate) fn bootstrap_runtime_directory(
     job_dir: &Path,
@@ -54,6 +58,8 @@ pub struct JobJournal {
     pub worker_run_id: Option<String>,
     pub terminal_kind: Option<String>,
     pub terminal_state: Option<String>,
+    pub publication_boot_id: Option<String>,
+    pub publication_generation: Option<String>,
     pub diagnostic_code: Option<String>,
     pub reconcile_attempts: u32,
     pub runtime_mutated: bool,
@@ -83,6 +89,8 @@ impl JobJournal {
             worker_run_id: None,
             terminal_kind: None,
             terminal_state: None,
+            publication_boot_id: None,
+            publication_generation: None,
             diagnostic_code: None,
             reconcile_attempts: 0,
             runtime_mutated: false,
@@ -155,7 +163,43 @@ impl JobJournal {
         if self.terminal_kind.is_some() && !state::terminal(self.state) {
             return Err("journal terminal evidence requires a terminal state".to_string());
         }
+        match (
+            self.publication_boot_id.as_deref(),
+            self.publication_generation.as_deref(),
+        ) {
+            (None, None) => {}
+            (Some(boot_id), Some(generation)) => {
+                require_lower_hex("publication_boot_id", boot_id, 32)?;
+                require_lower_hex("publication_generation", generation, 32)?;
+                if !matches!(
+                    self.state,
+                    OperationState::ReviewReady | OperationState::Completed
+                ) || self.terminal_kind.as_deref() != Some("result")
+                    || self.terminal_state.as_deref() != Some("complete")
+                    || self.runtime_mutated
+                    || self.recovery_required
+                    || self.process.is_some()
+                    || self.runtime_owner_process.is_some()
+                {
+                    return Err(
+                        "native publication identity requires an inert completed Review"
+                            .to_string(),
+                    );
+                }
+            }
+            _ => return Err("native publication identity is partial".to_string()),
+        }
         Ok(())
+    }
+
+    pub fn publication_identity(&self) -> Result<(&str, &str), String> {
+        match (
+            self.publication_boot_id.as_deref(),
+            self.publication_generation.as_deref(),
+        ) {
+            (Some(boot_id), Some(generation)) => Ok((boot_id, generation)),
+            _ => Err("native Review has no immutable publication identity".to_string()),
+        }
     }
 
     pub fn transition(&mut self, next: OperationState) -> Result<(), String> {
@@ -611,6 +655,13 @@ impl JobJournal {
         self.transition(next)?;
         self.terminal_kind = Some(terminal_kind.to_string());
         self.terminal_state = Some(terminal_state.to_string());
+        if terminal_state == "complete" && diagnostic_code.is_none() {
+            self.publication_boot_id = Some(self.boot_id.clone());
+            self.publication_generation = Some(self.coordinator_generation.clone());
+        } else {
+            self.publication_boot_id = None;
+            self.publication_generation = None;
+        }
         self.runtime_mutated = false;
         self.recovery_required = false;
         self.heavy_lease_acquired = false;
@@ -686,7 +737,9 @@ impl JobJournal {
     }
 
     pub fn encode(&self) -> Result<String, String> {
-        let schema = if self.runtime_owner_process.is_some() {
+        let schema = if self.publication_boot_id.is_some() {
+            4
+        } else if self.runtime_owner_process.is_some() {
             3
         } else {
             2
@@ -696,7 +749,7 @@ impl JobJournal {
 
     fn encode_for_schema(&self, schema: u8) -> Result<String, String> {
         self.validate()?;
-        if schema != 2 && schema != 3 {
+        if !matches!(schema, 2..=4) {
             return Err("unsupported journal encoding schema".to_string());
         }
         if schema == 2 && self.runtime_owner_process.is_some() {
@@ -704,6 +757,20 @@ impl JobJournal {
         }
         if schema == 3 && self.runtime_owner_process.is_none() {
             return Err("journal schema 3 requires a runtime owner".to_string());
+        }
+        if schema == 4
+            && (self.runtime_owner_process.is_some()
+                || self.publication_boot_id.is_none()
+                || self.publication_generation.is_none())
+        {
+            return Err(
+                "journal schema 4 requires an inert native publication identity".to_string(),
+            );
+        }
+        if schema != 4
+            && (self.publication_boot_id.is_some() || self.publication_generation.is_some())
+        {
+            return Err("journal schema 2/3 cannot encode native publication identity".to_string());
         }
         let (pid, process_group, starttime) = match &self.process {
             Some(process) => (
@@ -769,11 +836,27 @@ impl JobJournal {
                 ("runtime_owner_group", owner.process_group.to_string()),
                 ("runtime_owner_starttime", owner.starttime_ticks.to_string()),
             ]);
+        } else if schema == 4 {
+            fields.extend([
+                (
+                    "publication_boot_id",
+                    self.publication_boot_id
+                        .clone()
+                        .expect("schema 4 publication boot ID was validated"),
+                ),
+                (
+                    "publication_generation",
+                    self.publication_generation
+                        .clone()
+                        .expect("schema 4 publication generation was validated"),
+                ),
+            ]);
         }
-        let mut output = String::from(if schema == 3 {
-            RUNTIME_OWNER_JOURNAL_HEADER
-        } else {
-            JOURNAL_HEADER
+        let mut output = String::from(match schema {
+            2 => JOURNAL_HEADER,
+            3 => RUNTIME_OWNER_JOURNAL_HEADER,
+            4 => PUBLICATION_JOURNAL_HEADER,
+            _ => unreachable!("journal schema was validated"),
         });
         output.push('\n');
         for (name, value) in fields {
@@ -800,6 +883,7 @@ impl JobJournal {
             LEGACY_JOURNAL_HEADER => 1,
             JOURNAL_HEADER => 2,
             RUNTIME_OWNER_JOURNAL_HEADER => 3,
+            PUBLICATION_JOURNAL_HEADER => 4,
             _ => return Err("unsupported journal record header".to_string()),
         };
         let legacy = schema == 1;
@@ -844,6 +928,14 @@ impl JobJournal {
         } else {
             None
         };
+        let (publication_boot_id, publication_generation) = if schema == 4 {
+            (
+                Some(field(&mut lines, "publication_boot_id")?),
+                Some(field(&mut lines, "publication_generation")?),
+            )
+        } else {
+            (None, None)
+        };
         if lines.next().is_some() {
             return Err("journal record contains unknown fields".to_string());
         }
@@ -876,6 +968,8 @@ impl JobJournal {
             worker_run_id,
             terminal_kind,
             terminal_state,
+            publication_boot_id,
+            publication_generation,
             diagnostic_code,
             reconcile_attempts,
             runtime_mutated,
@@ -922,10 +1016,12 @@ impl JournalStore {
     pub fn open(state_dir: &Path, coordinator: CoordinatorIdentity) -> Result<Self, String> {
         let jobs_dir = state_dir.join(JOBS_DIR);
         ensure_secure_dir(&jobs_dir)?;
-        Ok(Self {
+        let store = Self {
             jobs_dir,
             coordinator,
-        })
+        };
+        store.finish_interrupted_retirements()?;
+        Ok(store)
     }
 
     pub fn create(&self, request: &OperationRequest, journal: &JobJournal) -> Result<(), String> {
@@ -1070,10 +1166,10 @@ impl JournalStore {
         let entries = fs::read_dir(&self.jobs_dir)
             .map_err(|error| format!("unable to scan calibration journals: {error}"))?;
         for (index, entry) in entries.enumerate() {
-            if index >= MAX_JOURNAL_JOBS {
-                scan.unsafe_entries
-                    .push("journal job count exceeds its bound".to_string());
-                break;
+            if index >= MAX_JOURNAL_DIRECTORY_ENTRIES {
+                return Err(
+                    "journal directory entry count exceeds its hard safety bound".to_string(),
+                );
             }
             let entry = match entry {
                 Ok(entry) => entry,
@@ -1106,6 +1202,76 @@ impl JournalStore {
                 .then_with(|| left.journal.job_id.cmp(&right.journal.job_id))
         });
         Ok(scan)
+    }
+
+    pub fn retire_settled_job(
+        &self,
+        expected: &ScannedJob,
+        proc_root: &Path,
+    ) -> Result<(), String> {
+        if expected.disposition != JournalDisposition::Settled
+            || !state::terminal(expected.journal.state)
+            || expected.journal.runtime_mutated
+            || expected.journal.recovery_required
+            || expected.journal.heavy_lease_acquired
+            || expected.journal.process.is_some()
+            || expected.journal.runtime_owner_process.is_some()
+        {
+            return Err("only an inert settled journal can be retired".to_string());
+        }
+        let job_dir = self.jobs_dir.join(&expected.journal.job_id);
+        secure_existing_job_dir(&job_dir)?;
+        let current = self.scan_one(&job_dir, &expected.journal.job_id, proc_root)?;
+        if current.request != expected.request
+            || current.journal != expected.journal
+            || current.disposition != JournalDisposition::Settled
+        {
+            return Err("journal changed while retirement was being prepared".to_string());
+        }
+        let retired = self
+            .jobs_dir
+            .join(format!("{RETIRED_JOB_PREFIX}{}", expected.journal.job_id));
+        match fs::symlink_metadata(&retired) {
+            Ok(_) => return Err("journal retirement staging path already exists".to_string()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "unable to inspect journal retirement staging path: {error}"
+                ));
+            }
+        }
+        fs::rename(&job_dir, &retired)
+            .map_err(|error| format!("unable to stage settled journal retirement: {error}"))?;
+        sync_directory(&self.jobs_dir)?;
+        fs::remove_dir_all(&retired)
+            .map_err(|error| format!("unable to remove retired settled journal: {error}"))?;
+        sync_directory(&self.jobs_dir)
+    }
+
+    fn finish_interrupted_retirements(&self) -> Result<(), String> {
+        let entries = fs::read_dir(&self.jobs_dir)
+            .map_err(|error| format!("unable to inspect journal retirements: {error}"))?;
+        for entry in entries {
+            let entry = entry
+                .map_err(|error| format!("unable to inspect journal retirement entry: {error}"))?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| "journal retirement entry name is not UTF-8".to_string())?;
+            let Some(job_id) = name.strip_prefix(RETIRED_JOB_PREFIX) else {
+                continue;
+            };
+            if require_lower_hex("retired job directory", job_id, 32).is_err() {
+                continue;
+            }
+            let path = entry.path();
+            secure_existing_job_dir(&path)?;
+            fs::remove_dir_all(&path).map_err(|error| {
+                format!("unable to finish interrupted journal retirement: {error}")
+            })?;
+            sync_directory(&self.jobs_dir)?;
+        }
+        Ok(())
     }
 
     fn scan_one(
@@ -1177,6 +1343,12 @@ fn ensure_secure_dir(path: &Path) -> Result<(), String> {
     }
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
         .map_err(|error| format!("unable to secure {}: {error}", path.display()))
+}
+
+fn sync_directory(path: &Path) -> Result<(), String> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("unable to sync journal directory: {error}"))
 }
 
 fn secure_existing_job_dir(path: &Path) -> Result<(), String> {
@@ -1653,6 +1825,137 @@ mod tests {
     }
 
     #[test]
+    fn scanner_classifies_more_than_the_retention_limit_without_truncation() {
+        let root = temp_root("complete-over-retention-scan");
+        cleanup(&root);
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let coordinator = coordinator();
+        let store = JournalStore::open(&root, coordinator.clone()).unwrap();
+        for index in 0..=MAX_JOURNAL_JOBS {
+            let mut request = request();
+            request.identity.job_id = format!("{index:032x}");
+            request.identity.job_token = format!("{index:064x}");
+            request.created_unix_ms = index as u64 + 1;
+            request.deadline_unix_ms = index as u64 + 2;
+            let mut journal = JobJournal::queued(&request, &coordinator, true).unwrap();
+            store.create(&request, &journal).unwrap();
+            journal.state = OperationState::Cancelled;
+            journal.sequence += 1;
+            store.update(&journal).unwrap();
+        }
+        let proc_root = root.join("proc");
+        fs::create_dir(&proc_root).unwrap();
+        let scan = store.scan(&proc_root).unwrap();
+        assert!(scan.unsafe_entries.is_empty());
+        assert_eq!(scan.jobs.len(), MAX_JOURNAL_JOBS + 1);
+        assert!(scan
+            .jobs
+            .iter()
+            .all(|job| job.disposition == JournalDisposition::Settled));
+        cleanup(&root);
+    }
+
+    #[test]
+    fn scanner_never_hides_recovery_behind_settled_history() {
+        let root = temp_root("complete-recovery-scan");
+        cleanup(&root);
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let coordinator = coordinator();
+        let store = JournalStore::open(&root, coordinator.clone()).unwrap();
+        for index in 0..=MAX_JOURNAL_JOBS {
+            let mut request = request();
+            request.identity.job_id = format!("{index:032x}");
+            request.identity.job_token = format!("{index:064x}");
+            let mut journal = JobJournal::queued(&request, &coordinator, true).unwrap();
+            store.create(&request, &journal).unwrap();
+            if index == MAX_JOURNAL_JOBS {
+                journal.arm_runtime_mutation("f".repeat(32)).unwrap();
+                journal
+                    .require_recovery("startup-reconciliation-required")
+                    .unwrap();
+            } else {
+                journal.state = OperationState::Cancelled;
+                journal.sequence += 1;
+            }
+            store.update(&journal).unwrap();
+        }
+        let proc_root = root.join("proc");
+        fs::create_dir(&proc_root).unwrap();
+        let scan = store.scan(&proc_root).unwrap();
+        assert!(scan.unsafe_entries.is_empty());
+        assert_eq!(scan.jobs.len(), MAX_JOURNAL_JOBS + 1);
+        assert_eq!(
+            scan.jobs
+                .iter()
+                .filter(|job| job.disposition == JournalDisposition::RecoveryRequired)
+                .count(),
+            1
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn settled_retirement_is_revalidated_and_interrupted_staging_is_idempotent() {
+        let root = temp_root("settled-retirement");
+        cleanup(&root);
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let coordinator = coordinator();
+        let store = JournalStore::open(&root, coordinator.clone()).unwrap();
+        let first_request = request();
+        let mut journal = JobJournal::queued(&first_request, &coordinator, true).unwrap();
+        store.create(&first_request, &journal).unwrap();
+        journal.state = OperationState::Cancelled;
+        journal.sequence += 1;
+        store.update(&journal).unwrap();
+        let proc_root = root.join("proc");
+        fs::create_dir(&proc_root).unwrap();
+        let settled = store.scan(&proc_root).unwrap().jobs.remove(0);
+        store.retire_settled_job(&settled, &proc_root).unwrap();
+        assert!(!root.join(JOBS_DIR).join(&journal.job_id).exists());
+
+        let mut second_request = request();
+        second_request.identity.job_id = "a".repeat(32);
+        second_request.identity.job_token = "b".repeat(64);
+        let mut second = JobJournal::queued(&second_request, &coordinator, true).unwrap();
+        store.create(&second_request, &second).unwrap();
+        second.state = OperationState::Cancelled;
+        second.sequence += 1;
+        store.update(&second).unwrap();
+        let original = root.join(JOBS_DIR).join(&second.job_id);
+        let staged = root
+            .join(JOBS_DIR)
+            .join(format!("{RETIRED_JOB_PREFIX}{}", second.job_id));
+        fs::rename(&original, &staged).unwrap();
+        drop(store);
+        let reopened = JournalStore::open(&root, coordinator).unwrap();
+        assert!(!staged.exists());
+        assert!(reopened.scan(&proc_root).unwrap().jobs.is_empty());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn retirement_never_removes_a_nonterminal_or_mutated_job() {
+        let root = temp_root("unsafe-retirement");
+        cleanup(&root);
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let coordinator = coordinator();
+        let store = JournalStore::open(&root, coordinator.clone()).unwrap();
+        let request = request();
+        let journal = JobJournal::queued(&request, &coordinator, true).unwrap();
+        store.create(&request, &journal).unwrap();
+        let proc_root = root.join("proc");
+        fs::create_dir(&proc_root).unwrap();
+        let queued = store.scan(&proc_root).unwrap().jobs.remove(0);
+        assert!(store.retire_settled_job(&queued, &proc_root).is_err());
+        assert!(root.join(JOBS_DIR).join(&journal.job_id).exists());
+        cleanup(&root);
+    }
+
+    #[test]
     fn cancelled_job_without_runtime_mutation_is_settled() {
         let root = temp_root("settled");
         cleanup(&root);
@@ -1977,6 +2280,17 @@ mod tests {
         assert!(!journal.heavy_lease_acquired);
         assert!(journal.diagnostic_code.is_none());
         assert_eq!(
+            journal.publication_identity().unwrap(),
+            (
+                "11111111111111111111111111111111",
+                "22222222222222222222222222222222"
+            )
+        );
+        assert!(journal
+            .encode()
+            .unwrap()
+            .starts_with(PUBLICATION_JOURNAL_HEADER));
+        assert_eq!(
             JobJournal::decode(&journal.encode().unwrap()).unwrap(),
             journal
         );
@@ -2057,6 +2371,52 @@ mod tests {
         let adopted = second_store.adopt_generation(&journal).unwrap();
         assert_eq!(adopted.coordinator_generation, second.generation);
         assert_eq!(adopted.sequence, journal.sequence + 1);
+        second_store.update(&adopted).unwrap();
+        cleanup(&root);
+    }
+
+    #[test]
+    fn native_review_publication_identity_survives_generation_adoption() {
+        let root = temp_root("review-generation-adoption");
+        cleanup(&root);
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let first = coordinator();
+        let first_store = JournalStore::open(&root, first.clone()).unwrap();
+        let request = request();
+        let mut journal = JobJournal::queued(&request, &first, true).unwrap();
+        journal.mark_heavy_lease_acquired().unwrap();
+        journal.arm_runtime_mutation("a".repeat(32)).unwrap();
+        journal
+            .attach_running_process(
+                ProcessIdentity {
+                    pid: 44,
+                    process_group: 44,
+                    starttime_ticks: 102,
+                },
+                "a".repeat(32),
+            )
+            .unwrap();
+        journal
+            .require_recovery("native-runtime-worker-exited")
+            .unwrap();
+        journal
+            .settle_native_runtime_terminal("complete", None)
+            .unwrap();
+        first_store.create(&request, &journal).unwrap();
+
+        let publication = journal.publication_identity().unwrap();
+        assert_eq!(publication, (&first.boot_id[..], &first.generation[..]));
+        let mut second = first.clone();
+        second.generation = "99999999999999999999999999999999".to_string();
+        let second_store = JournalStore::open(&root, second.clone()).unwrap();
+        let adopted = second_store.adopt_generation(&journal).unwrap();
+        assert_eq!(adopted.coordinator_generation, second.generation);
+        assert_eq!(adopted.publication_identity().unwrap(), publication);
+        assert!(adopted
+            .encode()
+            .unwrap()
+            .starts_with(PUBLICATION_JOURNAL_HEADER));
         second_store.update(&adopted).unwrap();
         cleanup(&root);
     }

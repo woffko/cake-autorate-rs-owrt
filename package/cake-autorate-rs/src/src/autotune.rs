@@ -3285,9 +3285,15 @@ fn low_realization_descent_evidence_eligible(
     if input.profile == AutotuneProfile::VariableLink
         && metric.realization_percent < THROUGHPUT_TRUST_FLOOR_PERCENT
     {
-        return metric.resource_safe
-            && !metric.transport_censored
-            && observation.cpu_percent <= input.thresholds.cpu_max_percent;
+        // This observation can never become a selectable result.  It is used
+        // only to choose a lower, exact diagnostic rate which is measured
+        // again.  CPU saturation is therefore a reason to descend, not a
+        // reason to repeat the same expensive upper candidate forever.
+        // Loss and censored transport still block this achieved-rate-derived
+        // step; the generic fixed-step descent below remains available after
+        // a bounded repeat.
+        return observation.loss_percent <= input.thresholds.loss_max_percent
+            && !metric.transport_censored;
     }
     low_realization_evidence_eligible(input.profile, metric)
 }
@@ -4021,6 +4027,37 @@ fn optimize_variable_link_direction(
     };
 
     if !last_metrics.resource_safe {
+        if duplicate_count >= 2 && input.observations.len() < input.max_attempts {
+            let next =
+                controlled_candidate_from_low_realization(input, metrics, last.candidate_kbps)
+                    .or_else(|| {
+                        next_variable_link_unobserved_candidate(
+                            input.observed_low_kbps,
+                            input.minimum_kbps,
+                            last.candidate_kbps,
+                        )
+                        .ok()
+                        .flatten()
+                    });
+            if let Some(next) = next.filter(|candidate| {
+                *candidate < last.candidate_kbps
+                    && !candidate_was_tested(&input.observations, *candidate)
+            }) {
+                return finish(
+                    ProfileSearchAction::Test,
+                    "lower-variable-candidate-after-resource-limit",
+                    Some(next),
+                    None,
+                    None,
+                    false,
+                    0,
+                    None,
+                    default_threshold,
+                    false,
+                    true,
+                );
+            }
+        }
         if duplicate_count < MAX_SAME_CANDIDATE_OBSERVATIONS
             && input.observations.len() < input.max_attempts
         {
@@ -7261,7 +7298,7 @@ mod tests {
     }
 
     #[test]
-    fn variable_link_subtrust_diagnostic_descent_rejects_cpu_saturation() {
+    fn variable_link_subtrust_diagnostic_descent_uses_cpu_saturation_to_lower_the_probe() {
         let observations = [94.0, 95.0, 96.0]
             .into_iter()
             .map(|cpu_percent| SearchObservation {
@@ -7288,11 +7325,15 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(result.action, ProfileSearchAction::Inconclusive);
-        assert_eq!(result.reason, "variable-candidate-realization-inconclusive");
-        assert!(result.next_candidate_kbps.is_none());
+        assert_eq!(result.action, ProfileSearchAction::Test);
+        assert_eq!(
+            result.reason,
+            "lower-variable-candidate-to-establish-shaper-control"
+        );
+        assert_eq!(result.next_candidate_kbps, Some(173_400));
         assert!(result.selected_index.is_none());
         assert!(result.review_options().is_empty());
+        assert!(result.metrics.iter().all(|metrics| metrics.resource_safe));
     }
 
     #[test]

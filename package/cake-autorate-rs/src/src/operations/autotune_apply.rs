@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 
 pub(crate) const NATIVE_APPLY_MANIFEST_SCHEMA_VERSION: u8 = 4;
 pub(crate) const NATIVE_RAW_FALLBACK_APPLY_MANIFEST_SCHEMA_VERSION: u8 = 5;
+pub(crate) const NATIVE_DIRECTIONAL_RAW_FALLBACK_APPLY_MANIFEST_SCHEMA_VERSION: u8 = 6;
 pub(crate) const MAX_NATIVE_APPLY_MANIFEST_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_NATIVE_APPLY_UCI_MUTATIONS: usize = 96;
 pub(crate) const MAX_NATIVE_APPLY_ACKNOWLEDGEMENTS: usize = 24;
@@ -207,6 +208,21 @@ pub(crate) struct NativeRawFallbackApplyManifestInput<'a> {
     pub raw_fallback_digest: &'a str,
 }
 
+pub(crate) struct NativeDirectionalRawFallbackApplyManifestInput<'a> {
+    pub option_id: &'a str,
+    pub request: &'a OperationRequest,
+    pub worker_run_id: &'a str,
+    pub review_digest: &'a str,
+    pub coordinator_boot_id: &'a str,
+    pub coordinator_generation: &'a str,
+    pub proposal: &'a AutotuneProposal,
+    pub selected_ul_kbps: u64,
+    pub runtime_minimum_ul_kbps: Option<u64>,
+    pub required_acknowledgements: &'a [NativeApplyAcknowledgement],
+    pub proposal_digest: &'a str,
+    pub raw_fallback_digest: &'a str,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CanonicalDirection {
     pub(crate) mode: NativeApplyDirectionMode,
@@ -317,6 +333,10 @@ pub(crate) enum NativeApplyArtifactDigestsOwned {
         topology_comparison: String,
     },
     RawFallbackV5 {
+        proposal: String,
+        raw_fallback: String,
+    },
+    DirectionalRawFallbackV6 {
         proposal: String,
         raw_fallback: String,
     },
@@ -465,10 +485,13 @@ pub(crate) struct NativeApplyV5Identity {
     pub(crate) manifest_sha256: String,
 }
 
+pub(crate) type NativeApplyV6Identity = NativeApplyV5Identity;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum NativeApplyAuthorityIdentity {
     ShapedV4(NativeApplyV4Identity),
     RawFallbackV5(NativeApplyV5Identity),
+    DirectionalRawFallbackV6(NativeApplyV6Identity),
 }
 
 impl NativeApplyAuthorityIdentity {
@@ -476,6 +499,7 @@ impl NativeApplyAuthorityIdentity {
         match self {
             Self::ShapedV4(value) => value.schema_version,
             Self::RawFallbackV5(value) => value.schema_version,
+            Self::DirectionalRawFallbackV6(value) => value.schema_version,
         }
     }
 
@@ -483,6 +507,7 @@ impl NativeApplyAuthorityIdentity {
         match self {
             Self::ShapedV4(value) => &value.job_id,
             Self::RawFallbackV5(value) => &value.job_id,
+            Self::DirectionalRawFallbackV6(value) => &value.job_id,
         }
     }
 
@@ -490,6 +515,7 @@ impl NativeApplyAuthorityIdentity {
         match self {
             Self::ShapedV4(value) => &value.worker_run_id,
             Self::RawFallbackV5(value) => &value.worker_run_id,
+            Self::DirectionalRawFallbackV6(value) => &value.worker_run_id,
         }
     }
 
@@ -497,6 +523,7 @@ impl NativeApplyAuthorityIdentity {
         match self {
             Self::ShapedV4(value) => &value.option_id,
             Self::RawFallbackV5(value) => &value.option_id,
+            Self::DirectionalRawFallbackV6(value) => &value.option_id,
         }
     }
 
@@ -504,6 +531,7 @@ impl NativeApplyAuthorityIdentity {
         match self {
             Self::ShapedV4(value) => &value.source_review_sha256,
             Self::RawFallbackV5(value) => &value.source_review_sha256,
+            Self::DirectionalRawFallbackV6(value) => &value.source_review_sha256,
         }
     }
 
@@ -511,6 +539,7 @@ impl NativeApplyAuthorityIdentity {
         match self {
             Self::ShapedV4(value) => &value.candidate_id,
             Self::RawFallbackV5(value) => &value.candidate_id,
+            Self::DirectionalRawFallbackV6(value) => &value.candidate_id,
         }
     }
 
@@ -518,6 +547,7 @@ impl NativeApplyAuthorityIdentity {
         match self {
             Self::ShapedV4(value) => &value.manifest_sha256,
             Self::RawFallbackV5(value) => &value.manifest_sha256,
+            Self::DirectionalRawFallbackV6(value) => &value.manifest_sha256,
         }
     }
 }
@@ -530,6 +560,9 @@ impl NativeApplyExecutionPlan {
             }
             NativeApplyArtifactDigestsOwned::RawFallbackV5 { .. } => {
                 NATIVE_RAW_FALLBACK_APPLY_MANIFEST_SCHEMA_VERSION
+            }
+            NativeApplyArtifactDigestsOwned::DirectionalRawFallbackV6 { .. } => {
+                NATIVE_DIRECTIONAL_RAW_FALLBACK_APPLY_MANIFEST_SCHEMA_VERSION
             }
         }
     }
@@ -728,6 +761,81 @@ impl NativeApplyExecutionPlan {
         Ok(value)
     }
 
+    pub(crate) fn from_verified_directional_raw_fallback(
+        input: NativeDirectionalRawFallbackApplyManifestInput<'_>,
+    ) -> Result<Self, String> {
+        if input.option_id != "bypass_download"
+            || input.selected_ul_kbps == 0
+            || input
+                .runtime_minimum_ul_kbps
+                .is_some_and(|minimum| minimum == 0 || minimum > input.selected_ul_kbps)
+        {
+            return Err(
+                "native directional raw-fallback Apply input is not upload-shaped".to_string(),
+            );
+        }
+        for (label, digest) in [
+            ("proposal", input.proposal_digest),
+            ("raw fallback", input.raw_fallback_digest),
+        ] {
+            require_lower_hex(&format!("native Apply {label} digest"), digest, 64)?;
+        }
+        let mut acknowledgements = input.required_acknowledgements.to_vec();
+        acknowledgements.sort_unstable();
+        acknowledgements.dedup();
+        if acknowledgements != input.required_acknowledgements
+            || !acknowledgements.contains(&NativeApplyAcknowledgement::DownloadShapingBypassed)
+            || acknowledgements.contains(&NativeApplyAcknowledgement::UploadShapingBypassed)
+            || acknowledgements.contains(&NativeApplyAcknowledgement::SqmDisabled)
+        {
+            return Err(
+                "native directional raw-fallback Apply acknowledgements are not canonical"
+                    .to_string(),
+            );
+        }
+        let placeholder = NativeApplyArtifactDigests {
+            proposal: input.proposal_digest,
+            download_search: input.raw_fallback_digest,
+            upload_search: input.raw_fallback_digest,
+            pair_confirmation: input.raw_fallback_digest,
+            topology_comparison: input.raw_fallback_digest,
+        };
+        let mut value = Self::from_verified_input(NativeApplyManifestInput {
+            option_id: input.option_id,
+            request: input.request,
+            worker_run_id: input.worker_run_id,
+            review_digest: input.review_digest,
+            coordinator_boot_id: input.coordinator_boot_id,
+            coordinator_generation: input.coordinator_generation,
+            selected_topology: "upload_only_shaped",
+            action: NativeApplyAction::ApplySqm,
+            sqm_direction_mode: NativeSqmDirectionMode::UploadOnly,
+            download: NativeApplyDirectionInput {
+                mode: NativeApplyDirectionMode::Bypass,
+                selected_kbps: None,
+                measured_runtime_minimum_kbps: None,
+                proposal: input.proposal.download,
+            },
+            upload: NativeApplyDirectionInput {
+                mode: NativeApplyDirectionMode::Shaped,
+                selected_kbps: Some(input.selected_ul_kbps),
+                measured_runtime_minimum_kbps: input.runtime_minimum_ul_kbps,
+                proposal: input.proposal.upload,
+            },
+            proposal: input.proposal,
+            auto_apply_evidence_pass: false,
+            manual_review_required: true,
+            required_acknowledgements: input.required_acknowledgements,
+            artifacts: placeholder,
+        })?;
+        value.artifacts = NativeApplyArtifactDigestsOwned::DirectionalRawFallbackV6 {
+            proposal: input.proposal_digest.to_string(),
+            raw_fallback: input.raw_fallback_digest.to_string(),
+        };
+        value.constructor_seal_sha256 = value.current_constructor_seal_sha256()?;
+        Ok(value)
+    }
+
     /// Re-run the sole typed constructor over the currently held fields and
     /// require its complete projection to remain byte-for-byte equivalent at
     /// the type level. `NativeApplyExecutionPlan` is still crate-visible during
@@ -799,6 +907,27 @@ impl NativeApplyExecutionPlan {
                 proposal_digest: proposal,
                 raw_fallback_digest: raw_fallback,
             })?,
+            NativeApplyArtifactDigestsOwned::DirectionalRawFallbackV6 {
+                proposal,
+                raw_fallback,
+            } => Self::from_verified_directional_raw_fallback(
+                NativeDirectionalRawFallbackApplyManifestInput {
+                    option_id: &self.option_id,
+                    request: &self.request,
+                    worker_run_id: &self.worker_run_id,
+                    review_digest: &self.review_digest,
+                    coordinator_boot_id: &self.coordinator_boot_id,
+                    coordinator_generation: &self.coordinator_generation,
+                    proposal: &self.proposal,
+                    selected_ul_kbps: self.upload.base_kbps.ok_or_else(|| {
+                        "native directional raw-fallback plan lost selected upload rate".to_string()
+                    })?,
+                    runtime_minimum_ul_kbps: self.upload.measured_runtime_minimum_kbps,
+                    required_acknowledgements: &self.required_acknowledgements,
+                    proposal_digest: proposal,
+                    raw_fallback_digest: raw_fallback,
+                },
+            )?,
         };
         if reconstructed != *self {
             return Err(
@@ -851,6 +980,10 @@ impl NativeApplyExecutionPlan {
                 json_string(topology_comparison),
             ),
             NativeApplyArtifactDigestsOwned::RawFallbackV5 {
+                proposal,
+                raw_fallback,
+            }
+            | NativeApplyArtifactDigestsOwned::DirectionalRawFallbackV6 {
                 proposal,
                 raw_fallback,
             } => format!(
@@ -915,6 +1048,26 @@ impl NativeApplyExecutionPlan {
         })
     }
 
+    pub(crate) fn v6_identity(&self) -> Result<NativeApplyV6Identity, String> {
+        if !matches!(
+            self.artifacts,
+            NativeApplyArtifactDigestsOwned::DirectionalRawFallbackV6 { .. }
+        ) {
+            return Err("native Apply plan has no directional schema-v6 identity".to_string());
+        }
+        let candidate_id = self.v4_candidate_id()?;
+        let manifest = self.canonical_manifest_bytes()?;
+        Ok(NativeApplyV6Identity {
+            schema_version: NATIVE_DIRECTIONAL_RAW_FALLBACK_APPLY_MANIFEST_SCHEMA_VERSION,
+            job_id: self.request.identity.job_id.clone(),
+            worker_run_id: self.worker_run_id.clone(),
+            option_id: self.option_id.clone(),
+            source_review_sha256: self.review_digest.clone(),
+            candidate_id,
+            manifest_sha256: sqm_identity::sha256sum(&manifest)?,
+        })
+    }
+
     pub(crate) fn authority_identity(&self) -> Result<NativeApplyAuthorityIdentity, String> {
         match &self.artifacts {
             NativeApplyArtifactDigestsOwned::ShapedV4 { .. } => {
@@ -922,6 +1075,9 @@ impl NativeApplyExecutionPlan {
             }
             NativeApplyArtifactDigestsOwned::RawFallbackV5 { .. } => Ok(
                 NativeApplyAuthorityIdentity::RawFallbackV5(self.v5_identity()?),
+            ),
+            NativeApplyArtifactDigestsOwned::DirectionalRawFallbackV6 { .. } => Ok(
+                NativeApplyAuthorityIdentity::DirectionalRawFallbackV6(self.v6_identity()?),
             ),
         }
     }
@@ -933,6 +1089,13 @@ impl NativeApplyExecutionPlan {
         } = &self.artifacts
         {
             return self.canonical_raw_fallback_manifest_bytes(proposal, raw_fallback);
+        }
+        if let NativeApplyArtifactDigestsOwned::DirectionalRawFallbackV6 {
+            proposal,
+            raw_fallback,
+        } = &self.artifacts
+        {
+            return self.canonical_directional_raw_fallback_manifest_bytes(proposal, raw_fallback);
         }
         let NativeApplyArtifactDigestsOwned::ShapedV4 {
             proposal: proposal_digest,
@@ -1079,6 +1242,43 @@ impl NativeApplyExecutionPlan {
         {
             return Err("native raw-fallback Apply plan is not manual SQM-off".to_string());
         }
+        self.canonical_raw_fallback_family_manifest_bytes(
+            NATIVE_RAW_FALLBACK_APPLY_MANIFEST_SCHEMA_VERSION,
+            proposal_digest,
+            raw_fallback_digest,
+        )
+    }
+
+    fn canonical_directional_raw_fallback_manifest_bytes(
+        &self,
+        proposal_digest: &str,
+        raw_fallback_digest: &str,
+    ) -> Result<Vec<u8>, String> {
+        if self.action != NativeApplyAction::ApplySqm
+            || self.sqm_direction_mode != NativeSqmDirectionMode::UploadOnly
+            || self.download.mode != NativeApplyDirectionMode::Bypass
+            || self.upload.mode != NativeApplyDirectionMode::Shaped
+            || self.auto_apply_evidence_pass
+            || !self.manual_review_required
+        {
+            return Err(
+                "native directional raw-fallback Apply plan is not manual upload-only SQM"
+                    .to_string(),
+            );
+        }
+        self.canonical_raw_fallback_family_manifest_bytes(
+            NATIVE_DIRECTIONAL_RAW_FALLBACK_APPLY_MANIFEST_SCHEMA_VERSION,
+            proposal_digest,
+            raw_fallback_digest,
+        )
+    }
+
+    fn canonical_raw_fallback_family_manifest_bytes(
+        &self,
+        schema_version: u8,
+        proposal_digest: &str,
+        raw_fallback_digest: &str,
+    ) -> Result<Vec<u8>, String> {
         let candidate = self.canonical_candidate_json();
         let candidate_id = self.candidate_id_for_json(&candidate)?;
         let required_acknowledgements = acknowledgement_json(&self.required_acknowledgements);
@@ -1104,7 +1304,7 @@ impl NativeApplyExecutionPlan {
                 "\"artifacts\":{{\"proposal\":{},\"raw_fallback\":{}}},",
                 "\"candidate_id\":{},\"candidate\":{}}}\n"
             ),
-            NATIVE_RAW_FALLBACK_APPLY_MANIFEST_SCHEMA_VERSION,
+            schema_version,
             json_string(&self.option_id),
             json_string(&self.request.identity.job_id),
             json_string(&self.worker_run_id),
@@ -2036,6 +2236,120 @@ mod tests {
             },
         );
         assert!(missing_disable_ack.is_err());
+    }
+
+    #[test]
+    fn directional_raw_fallback_is_manual_upload_only_schema_v6_authority() {
+        let operation = request();
+        let proposal = proposal();
+        let acknowledgements = [NativeApplyAcknowledgement::DownloadShapingBypassed];
+        let plan = NativeApplyExecutionPlan::from_verified_directional_raw_fallback(
+            NativeDirectionalRawFallbackApplyManifestInput {
+                option_id: "bypass_download",
+                request: &operation,
+                worker_run_id: &"66".repeat(16),
+                review_digest: REVIEW_DIGEST,
+                coordinator_boot_id: "boot-id",
+                coordinator_generation: &"77".repeat(16),
+                proposal: &proposal,
+                selected_ul_kbps: proposal.upload.base_kbps,
+                runtime_minimum_ul_kbps: Some(proposal.upload.minimum_kbps),
+                required_acknowledgements: &acknowledgements,
+                proposal_digest: PROPOSAL_DIGEST,
+                raw_fallback_digest: DOWNLOAD_DIGEST,
+            },
+        )
+        .unwrap();
+        plan.validate_exact_invariants().unwrap();
+        assert!(!plan.unattended_scheduler_eligible());
+        assert_eq!(plan.action, NativeApplyAction::ApplySqm);
+        assert_eq!(plan.sqm_direction_mode, NativeSqmDirectionMode::UploadOnly);
+        assert_eq!(plan.download.mode, NativeApplyDirectionMode::Bypass);
+        assert_eq!(plan.upload.mode, NativeApplyDirectionMode::Shaped);
+        assert_eq!(plan.download.maximum_kbps, None);
+        assert_eq!(plan.upload.maximum_kbps, Some(proposal.upload.base_kbps));
+        assert_eq!(
+            mutation_value(&plan, "sqm_direction_mode"),
+            Some("upload_only")
+        );
+        assert_eq!(mutation_value(&plan, "sqm_download"), None);
+        assert!(!plan
+            .uci_mutations
+            .iter()
+            .any(|mutation| mutation.option == "sqm_download"));
+        let expected_upload = proposal.upload.base_kbps.to_string();
+        assert_eq!(
+            mutation_value(&plan, "sqm_upload"),
+            Some(expected_upload.as_str())
+        );
+        let bytes = plan.canonical_manifest_bytes().unwrap();
+        let json = String::from_utf8(bytes.clone()).unwrap();
+        assert_eq!(bytes.len(), 9_429);
+        assert_eq!(
+            native_apply_sha256_hex(&bytes),
+            "8ad07538a98e7cb4d572e437888ebe37a3ea49ac76f81c855ce7df30fdd0122c"
+        );
+        assert!(json.starts_with("{\"native_apply_manifest_schema_version\":6,"));
+        assert!(json.contains("\"selected_topology\":\"upload_only_shaped\""));
+        assert!(json.contains("\"required_acknowledgements\":[\"download-shaping-bypassed\"]"));
+        assert!(plan.v4_identity().is_err());
+        assert!(plan.v6_identity().is_ok());
+
+        let invalid_acknowledgements = [
+            NativeApplyAcknowledgement::DownloadShapingBypassed,
+            NativeApplyAcknowledgement::SqmDisabled,
+        ];
+        assert!(
+            NativeApplyExecutionPlan::from_verified_directional_raw_fallback(
+                NativeDirectionalRawFallbackApplyManifestInput {
+                    required_acknowledgements: &invalid_acknowledgements,
+                    option_id: "bypass_download",
+                    request: &operation,
+                    worker_run_id: &"66".repeat(16),
+                    review_digest: REVIEW_DIGEST,
+                    coordinator_boot_id: "boot-id",
+                    coordinator_generation: &"77".repeat(16),
+                    proposal: &proposal,
+                    selected_ul_kbps: proposal.upload.base_kbps,
+                    runtime_minimum_ul_kbps: Some(proposal.upload.minimum_kbps),
+                    proposal_digest: PROPOSAL_DIGEST,
+                    raw_fallback_digest: DOWNLOAD_DIGEST,
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn raw_fallback_schema_v5_bytes_are_frozen_across_directional_v6_support() {
+        let operation = request();
+        let proposal = proposal();
+        let acknowledgements = [
+            NativeApplyAcknowledgement::DownloadShapingBypassed,
+            NativeApplyAcknowledgement::UploadShapingBypassed,
+            NativeApplyAcknowledgement::SqmDisabled,
+        ];
+        let plan = NativeApplyExecutionPlan::from_verified_raw_fallback(
+            NativeRawFallbackApplyManifestInput {
+                option_id: "no_sqm",
+                request: &operation,
+                worker_run_id: &"66".repeat(16),
+                review_digest: REVIEW_DIGEST,
+                coordinator_boot_id: "boot-id",
+                coordinator_generation: &"77".repeat(16),
+                proposal: &proposal,
+                required_acknowledgements: &acknowledgements,
+                proposal_digest: PROPOSAL_DIGEST,
+                raw_fallback_digest: DOWNLOAD_DIGEST,
+            },
+        )
+        .unwrap();
+        let bytes = plan.canonical_manifest_bytes().unwrap();
+        assert_eq!(bytes.len(), 2_677);
+        assert_eq!(
+            native_apply_sha256_hex(&bytes),
+            "a24f989a0a2cef38624c16e3da2533823c2a826de791536a416a9f9a11677639"
+        );
     }
 
     #[test]

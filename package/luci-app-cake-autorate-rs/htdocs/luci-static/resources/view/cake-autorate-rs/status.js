@@ -5,6 +5,8 @@
 'require ui';
 'require cake-autorate-rs.ui as cakeUi';
 
+var QUALITY_GRADE_METHOD = 'worst_of_direction_bound_icmp_and_transport_v5';
+
 var STATUS_COLUMN_DEFINITIONS = [
 	{ key: 'instance', title: _('Instance'), mandatory: true },
 	{ key: 'uplink', title: _('Uplink / state'), mandatory: true },
@@ -120,7 +122,7 @@ function schedulerUnavailableStatus(sectionData, owner) {
 		enabled: sectionData.scheduled_autotune_enabled === '1',
 		state: 'unavailable',
 		message: owner === 'native' ?
-			_('Native scheduler status is unavailable; legacy accounting was not substituted.') :
+			_('Scheduled calibration status is unavailable; legacy accounting was not substituted.') :
 			(owner === 'legacy' ?
 				_('Legacy scheduler ownership could not be attested; native accounting was not substituted.') :
 				_('Scheduler ownership is missing or invalid; no accounting source was selected.')),
@@ -242,10 +244,10 @@ function readSchedulerStatuses(sections, schedulerEngine, calibrationSummary) {
 				var configured = Object.create(null);
 				var diagnostics = [];
 				if (!nativeSchedulerBatchValidated(result))
-					throw new Error(_('Native scheduler returned an invalid batch status contract.'));
+					throw new Error(_('The calibration scheduler returned an invalid batch status contract.'));
 				if (result.stale) {
 					diagnostics.push({
-						instance: _('Native scheduler'),
+						instance: _('Calibration scheduler'),
 						message: result.global_error
 					});
 				}
@@ -384,7 +386,7 @@ function qualityReadiness(section, status, mode, calibrationSummary) {
 	if (calibrationSummary && calibrationSummary.native_rating !== true)
 		return {
 			ready: false,
-			reason: _('Native Rating is unavailable in the installed daemon. Upgrade both the daemon and LuCI package, then restart the calibration service.')
+			reason: _('Rating is unavailable in the installed daemon. Upgrade both the daemon and LuCI package, then restart the calibration service.')
 		};
 	if (String(section.enabled || '0') !== '1')
 		return { ready: false, reason: _('Autorate instance is disabled.') };
@@ -492,7 +494,12 @@ function showQualityTest(section, status, calibrationSummary) {
 		mode.disabled = false;
 		closeButton.textContent = _('Close');
 		if (job.state === 'complete') {
-			setState(_('Rating %s complete: +%s ms · DL %s · UL %s. Limits were not changed.').format(
+			if (job.partial !== false || job.incomplete !== false ||
+			    job.rating_method !== QUALITY_GRADE_METHOD) {
+				setState(_('Rating result is incomplete or uses an unsupported evidence contract.'), true);
+				return;
+			}
+			setState(_('Rating %s complete: +%s ms · DL %s · UL %s. The grade uses the worse of direction-bound ICMP and transport latency. Limits were not changed.').format(
 				job.grade || '-', Number(job.increase_ms || 0).toFixed(1),
 				job.dl_grade || '-', job.ul_grade || '-'), false);
 		} else if (job.state === 'cancelled') {
@@ -604,7 +611,7 @@ function showQualityTest(section, status, calibrationSummary) {
 					throw new Error(job.error || job.error_code || _('Unable to start native Rating.'));
 				jobId = job.job_id;
 				if (!jobId)
-					throw new Error(_('Native Rating returned no job ID.'));
+					throw new Error(_('Rating returned no job ID.'));
 				return pollJob();
 			});
 		}).catch(function(error) {
@@ -906,13 +913,15 @@ function formatQuality(status) {
 		return E('span', { 'title': _('Transport-aware estimation is disabled.') }, '-');
 
 	if (status.quality_grade_state) {
+		if (status.quality_grade_method !== QUALITY_GRADE_METHOD)
+			return E('span', { 'title': _('Rating data uses an unsupported evidence contract.') }, _('UNAVAILABLE'));
 		var current = status.quality_grade_current || null;
 		var lastKnown = status.quality_grade_last_known || null;
 		if (lastKnown && (lastKnown.partial || lastKnown.incomplete))
 			lastKnown = null;
 		var state = String(status.quality_grade_state || 'learning_baseline');
 		var title = [
-			_('Detected rating uses network RTT loaded p90 minus the preceding idle p5. DNS, process startup, and connection handshake time are excluded.'),
+			_('Detected rating uses the worse of controller ICMP delay increase and transport RTT loaded p90 minus the preceding idle p5. ICMP uses the controller reflector baseline; transport excludes DNS, process startup, and connection handshake time.'),
 			_('Download and upload are scored independently; the worse grade is shown.'),
 			_('A one-direction result is labeled PARTIAL and is never presented as the final connection rating.'),
 			_('Bidirectional latency is diagnostic and does not affect the total grade.'),
@@ -947,7 +956,7 @@ function formatQuality(status) {
 				Number(status.transport_confidence || 0)),
 			_('Controller: %s · signal: %s · effective delta: %s ms').format(
 				status.transport_controller_enabled ? _('enabled') : _('disabled'),
-				status.quality_class || 'LEARNING',
+				status.quality_controller_class || 'LEARNING',
 				status.effective_latency_delta_ms == null ? '-' : Number(status.effective_latency_delta_ms).toFixed(1)),
 			_('Rejected sample: %s').format(status.transport_probe_rejected_reason || '-'),
 			_('Last rejected sample: %s').format(status.transport_probe_last_rejected_reason || '-'),
@@ -1152,7 +1161,7 @@ function formatState(status, enabled, sectionData, health) {
 		lines.push(E('small', {
 			'style': 'display:block;color:#f66;white-space:normal',
 			'class': 'cake-schedule-error'
-		}, schedule.message || _('Native scheduler status is invalid for this instance.')));
+		}, schedule.message || _('Calibration scheduler status is invalid for this instance.')));
 	}
 	else if (scheduleVisible && schedule.budget_authoritative === false) {
 		lines.push(E('small', {
@@ -1522,7 +1531,7 @@ function renderStatusData(sections, statuses, selectedKeys, runtimeHealth, calib
 		children.push(E('div', {
 			'class': 'alert-message warning cake-scheduler-diagnostics'
 		}, [
-			E('strong', {}, _('Native scheduler diagnostics')),
+			E('strong', {}, _('Calibration scheduler diagnostics')),
 			E('div', {}, schedulerDiagnostics.map(function(issue) {
 				return E('small', { 'style': 'display:block;white-space:normal' },
 					_('%s: %s').format(issue.instance, issue.message));

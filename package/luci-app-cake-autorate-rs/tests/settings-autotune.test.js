@@ -84,6 +84,18 @@ assert.match(source,
 assert.match(source,
 	/pendingAutotuneApplyMarkers\(\)\.length[\s\S]*?cake_autorate_apply_guard[\s\S]*?refusing to mix it with disabled uplinks/,
 	'disabled fallback instances must never share a transaction with stale apply markers');
+assert.match(source, /I accept all listed trade-offs\./,
+	'Native Review must use one aggregate acknowledgement for the fully listed trade-offs');
+assert.doesNotMatch(source, /Reload settings/,
+	'a successful Apply must refresh committed settings without another user click');
+assert.match(source,
+	/function reloadAppliedUciPackages\(\)[\s\S]*?uci\.unload\('cake-autorate'\)[\s\S]*?uci\.unload\('sqm'\)[\s\S]*?uci\.load\('cake-autorate'\)[\s\S]*?uci\.load\('sqm'\)/,
+	'post-Apply refresh must invalidate both LuCI UCI caches before reloading them');
+assert.match(source,
+	/nativeMobileDownloadBypassRequested\(proposal\)[\s\S]*?bypass_download_unavailable[\s\S]*?Unavailable for this run/,
+	'explicit mobile access must keep a visible disabled download-bypass card when evidence is unavailable');
+assert.doesNotMatch(source, /Rust calibration|Rust preserved|Rust did not infer/,
+	'customer-facing Auto-Tune diagnostics must describe the work, not its implementation language');
 for (const [index, button] of source.split("E('button', {").slice(1).entries()) {
 	assert.match(button.slice(0, 180), /'type': 'button'/,
 		`custom settings button ${index + 1} must not submit the surrounding LuCI form`);
@@ -113,7 +125,7 @@ const uci = {
 		return fixtureSections[config] || [];
 	},
 };
-function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
+function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl, eImpl) {
 	return new Function(
 		'fs', 'form', 'network', 'uci', 'ui', 'widgets', 'cakeUi', 'rpc', 'L', 'E', '_',
 		`${prefix}\ninterfaceContext = { deviceNames: { eth1: true }, deviceNetworks: {}, ` +
@@ -125,8 +137,8 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 			`formOrUci, accessMediumDefinitions, accessMediumTitle, accessMediumExplorationPercent, detectAccessMedium, resolvedAccessContext, ` +
 			`recommendedCapacityLearningPolicy, canonicalCapacityLearningPolicy, autotuneAccessRequest, ` +
 			`canonicalAutotuneProfile, autotuneProfilePolicy, autotuneProfileDefinitions, ` +
-			`nativeAutotunePublicResultValidated, nativeAutotuneAcknowledgementLabel, nativeAutotuneApplyCheckValidated, ` +
-			`nativeAutotuneApplyReceiptValidated, runNativeAutotuneApplyCheck, runNativeAutotuneApply, ` +
+			`nativeAutotunePublicResultValidated, nativeAutotuneAcknowledgementLabel, nativeMobileDownloadBypassRequested, nativeDownloadBypassUnavailableReason, renderNativeAutotuneDiagnostics, nativeAutotuneApplyCheckValidated, ` +
+			`nativeAutotuneApplyReceiptValidated, runNativeAutotuneApplyCheck, runNativeAutotuneApply, reloadAppliedUciPackages, ` +
 			`visibleAutotuneProfile, autotuneRunProfile, storedAutotuneProfile, ` +
 			`autotuneHasTrustedCapacityReferences, autotuneCalibrationStrategy, ` +
 			`autotuneRunningRequestMatches, ` +
@@ -166,7 +178,8 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 			`runSpeedtestJob, nativeSpeedtestCapabilityValidated, nativeSpeedtestLaunchArgs, nativeSpeedtestResultValidated, ` +
 			`nativeAutotuneCapabilityValidated, nativeBootstrapAutotuneCapabilityValidated, ` +
 			`nativeAutotuneIntentSupported, nativeAutotuneLaunchArgs, nativeAutotuneResultMatchesRequest, ` +
-			`runPreferredAutotuneJob, cancelPreferredAutotuneJob, ` +
+			`nativeAutotuneProgressStepLabel, nativeAutotuneProgress, ` +
+			`currentNativeAutotuneJob, runPreferredAutotuneJob, cancelPreferredAutotuneJob, ` +
 			`replaceNodeContent, ` +
 			`setNativeAutotuneJob: function(section, jobId) { nativeAutotuneJobs[section] = jobId; autotuneTransportModes[section] = 'native'; }, ` +
 			`setLegacyAutotuneJob: function(section, runId) { legacyAutotuneJobs[section] = runId; autotuneTransportModes[section] = 'legacy'; }, ` +
@@ -174,10 +187,40 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl) {
 			`setMwan3Context: function(value) { mwan3Context = value; } };`
 	)(fsImpl || {}, {}, {}, uciImpl || uci, {}, {}, {}, rpcImpl || {
 		declare() { return () => Promise.resolve(0); },
-	}, lImpl || {}, () => ({}), value => value);
+	}, lImpl || {}, eImpl || (() => ({})), value => value);
 }
 
 const helpers = compileHelpers({});
+assert.equal(helpers.nativeMobileDownloadBypassRequested({
+	access: { medium: 'cellular', source: 'user_selected' },
+}), true);
+assert.equal(helpers.nativeMobileDownloadBypassRequested({
+	access: { medium: 'cellular', source: 'network_protocol' },
+}), false, 'an inferred mobile medium must not reserve a mandatory manual bypass card');
+assert.equal(helpers.nativeMobileDownloadBypassRequested({
+	access: { medium: 'shared_wired', source: 'user_selected' },
+}), false);
+assert.equal(helpers.nativeMobileDownloadBypassRequested({
+	access_medium: 'cellular', access_source: 'user_selected',
+}), false, 'the UI must consume the nested public proposal access contract');
+assert.match(helpers.nativeDownloadBypassUnavailableReason({
+	download: { reason: 'traffic-budget-limited' },
+}), /traffic budget/);
+assert.match(helpers.nativeDownloadBypassUnavailableReason({
+	download: { reason: 'comparison-not-requested' },
+}), /Full raw capacity/);
+assert.match(helpers.nativeDownloadBypassUnavailableReason({
+	download: { reason: 'future-backend-reason' },
+}), /future-backend-reason/,
+	'an unknown backend reason must remain visible instead of collapsing to a generic message');
+assert.match(helpers.nativeDownloadBypassUnavailableReason(null, {
+	mobile_download_bypass: { available: false, reason: 'traffic_budget' },
+}), /traffic allowance/,
+	'the UI must expose the exact bounded reason why the mobile terminal control did not run');
+assert.match(helpers.nativeDownloadBypassUnavailableReason(null, {
+	mobile_download_bypass: { available: true, manual_apply_eligible: false },
+}), /diagnostic only/,
+	'a measured but unsafe mobile control must not be mislabeled as missing upload evidence');
 const replacementA = { id: 'a' };
 const replacementB = { id: 'b' };
 const replaceTarget = {
@@ -257,6 +300,7 @@ function nativePublicFixture() {
 	artifacts.proposal.value = {
 		schema_version: 4,
 		profile: 'variable_link',
+		access: { medium: 'cellular', source: 'user_selected', confidence_percent: 100 },
 		download: { base_kbps: 904900 },
 		upload: { base_kbps: 915600 },
 	};
@@ -426,6 +470,51 @@ function nativePublicFixture() {
 		artifacts,
 	};
 }
+
+function testUnavailableMobileDownloadBypassCardRenders() {
+	const result = nativePublicFixture();
+	result.public_apply_contract.options = result.public_apply_contract.options.slice(0, 2);
+	result.public_apply_contract.options[0].preferred = true;
+	result.artifacts.topology_comparison.value.selected_topology = 'both_shaped';
+	result.artifacts.topology_comparison.value.selected_rates_kbps = {
+		download: 904900, upload: 915600,
+	};
+	result.artifacts.topology_comparison.value.download.choice = 'shaped';
+	result.artifacts.topology_comparison.value.download.reason = 'inconclusive-raw-evidence';
+	result.artifacts.topology_comparison.value.upload.choice = 'shaped';
+	assert.equal(helpers.nativeAutotunePublicResultValidated(result), true,
+		'the unavailable-card fixture must remain a valid public result');
+
+	function element(tag, attrs, children) {
+		return {
+			tag,
+			attrs: attrs || {},
+			children: Array.isArray(children) ? children : children == null ? [] : [ children ],
+			replaceChildren() { this.children = Array.from(arguments); },
+		};
+	}
+	function find(node, predicate) {
+		if (!node || typeof node !== 'object')
+			return null;
+		if (predicate(node))
+			return node;
+		for (const child of node.children || []) {
+			const match = find(child, predicate);
+			if (match)
+				return match;
+		}
+		return null;
+	}
+	const renderHelpers = compileHelpers({}, null, null, null, element);
+	const rendered = renderHelpers.renderNativeAutotuneDiagnostics(result);
+	const card = find(rendered, node =>
+		node.attrs && node.attrs['data-option-id'] === 'bypass_download_unavailable');
+	assert.ok(card, 'the disabled mobile download-bypass card must be in the rendered tree');
+	assert.equal(card.attrs['aria-disabled'], 'true');
+	assert.match(JSON.stringify(card), /noisy or incomplete/);
+}
+
+testUnavailableMobileDownloadBypassCardRenders();
 
 function nativeRawFallbackPublicFixture() {
 	const result = nativePublicFixture();
@@ -653,6 +742,40 @@ Object.defineProperty(nativeRawFallbackPublic, '_native_target_state', {
 });
 assert.equal(helpers.nativeAutotunePublicResultValidated(nativeRawFallbackPublic), true,
 	'a raw-only Review must expose one exact manual SQM-off option');
+
+function testRawFallbackMobileDownloadBypassUnavailableCardRenders() {
+	function element(tag, attrs, children) {
+		return {
+			tag, attrs: attrs || {},
+			children: Array.isArray(children) ? children : children == null ? [] : [ children ],
+			replaceChildren() { this.children = Array.from(arguments); },
+		};
+	}
+	function find(node, predicate) {
+		if (!node || typeof node !== 'object')
+			return null;
+		if (predicate(node))
+			return node;
+		for (const child of node.children || []) {
+			const match = find(child, predicate);
+			if (match)
+				return match;
+		}
+		return null;
+	}
+	const result = nativeRawFallbackPublicFixture();
+	const renderHelpers = compileHelpers({}, null, null, null, element);
+	const rendered = renderHelpers.renderNativeAutotuneDiagnostics(result);
+	const card = find(rendered, node =>
+		node.attrs && node.attrs['data-option-id'] === 'bypass_download_unavailable');
+	assert.ok(card,
+		'a selected mobile medium must retain an explicit download-bypass card on raw fallback');
+	assert.equal(card.attrs['aria-disabled'], 'true');
+	assert.match(JSON.stringify(card), /verified upload-shaped rate/);
+	assert.match(JSON.stringify(card), /incomplete-shaped-search/);
+}
+
+testRawFallbackMobileDownloadBypassUnavailableCardRenders();
 const nativeMeasuredRawFallback = nativeRawFallbackPublicFixture();
 Object.assign(nativeMeasuredRawFallback.artifacts.raw_fallback.value, {
 	schema_version: 2,
@@ -672,6 +795,142 @@ Object.assign(nativePairExhaustedRawFallback.artifacts.raw_fallback.value, {
 delete nativePairExhaustedRawFallback.artifacts.raw_fallback.value.unobserved_candidates_kbps;
 assert.equal(helpers.nativeAutotunePublicResultValidated(nativePairExhaustedRawFallback), true,
 	'an exhausted shaped pair set may expose the exact manual no-SQM fallback');
+const nativeDirectionalRawFallback = JSON.parse(JSON.stringify(nativePairExhaustedRawFallback));
+nativeDirectionalRawFallback.native_public_schema_version = 5;
+nativeDirectionalRawFallback.artifacts.raw_fallback.value.schema_version = 5;
+nativeDirectionalRawFallback.artifacts.raw_fallback.value.mobile_download_bypass = {
+	available: true,
+	selected_topology: 'upload_only_shaped',
+	selected_ul_kbps: 915600,
+	runtime_minimum_ul_kbps: 700000,
+	download: {
+		achieved_kbps: 920000, effective_delta_ms: 9.5, loss_ppm: 0,
+		background_confidence_percent: 95, contaminated: false,
+		transport_censored: false,
+	},
+	upload: {
+		achieved_kbps: 900000, realized_kbps: 890000, effective_delta_ms: 8.5,
+		candidate_realization_percent: 97.205, capacity_retention_percent: 98.0,
+		loss_ppm: 0, background_confidence_percent: 95, contaminated: false,
+		transport_censored: false, capacity_alignment_confirmed: false,
+	},
+	manual_apply_eligible: true,
+	required_acknowledgements: [ 'download-shaping-bypassed' ],
+};
+nativeDirectionalRawFallback.public_apply_contract.options.push({
+	option_id: 'bypass_download',
+	preferred: false,
+	manifest_sha256: '8'.repeat(64),
+	selected_topology: 'upload_only_shaped',
+	action: 'apply_sqm',
+	sqm_direction_mode: 'upload_only',
+	target_rates_kbps: { download: null, upload: 915600 },
+	auto_apply_evidence_pass: false,
+	manual_review_required: true,
+	required_acknowledgements: [ 'download-shaping-bypassed' ],
+});
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeDirectionalRawFallback), true,
+	'a verified mobile raw fallback may expose no-SQM plus one manual upload-only SQM option');
+
+function testDirectionalRawFallbackRendersBothEvidenceCards() {
+	function element(tag, attrs, children) {
+		return {
+			tag, attrs: attrs || {},
+			children: Array.isArray(children) ? children : children == null ? [] : [ children ],
+			replaceChildren() { this.children = Array.from(arguments); },
+		};
+	}
+	function find(node, predicate) {
+		if (!node || typeof node !== 'object')
+			return null;
+		if (predicate(node))
+			return node;
+		for (const child of node.children || []) {
+			const match = find(child, predicate);
+			if (match)
+				return match;
+		}
+		return null;
+	}
+	const renderHelpers = compileHelpers({}, null, null, null, element);
+	const rendered = renderHelpers.renderNativeAutotuneDiagnostics(
+		JSON.parse(JSON.stringify(nativeDirectionalRawFallback)));
+	const noSqm = find(rendered, node =>
+		node.attrs && node.attrs['data-option-id'] === 'no_sqm');
+	const bypassDownload = find(rendered, node =>
+		node.attrs && node.attrs['data-option-id'] === 'bypass_download');
+	assert.ok(noSqm, 'schema-5 raw Review must render its no-SQM option');
+	assert.ok(bypassDownload,
+		'schema-5 raw Review must render its verified download-bypass option');
+	assert.match(JSON.stringify(noSqm), /910000/,
+		'no-SQM card must use the exact raw download aggregate');
+	assert.match(JSON.stringify(noSqm), /98000/,
+		'no-SQM card must use the exact raw upload aggregate');
+	assert.match(JSON.stringify(bypassDownload), /920000/,
+		'download-bypass card must use its exact terminal download evidence');
+	assert.match(JSON.stringify(bypassDownload), /900000/,
+		'download-bypass card must use its exact terminal upload evidence');
+}
+
+testDirectionalRawFallbackRendersBothEvidenceCards();
+const nativeDirectionalPublicWithLegacyArtifact = JSON.parse(
+	JSON.stringify(nativeDirectionalRawFallback));
+nativeDirectionalPublicWithLegacyArtifact.artifacts.raw_fallback.value.schema_version = 3;
+delete nativeDirectionalPublicWithLegacyArtifact.artifacts.raw_fallback.value
+	.mobile_download_bypass;
+assert.equal(helpers.nativeAutotunePublicResultValidated(
+	nativeDirectionalPublicWithLegacyArtifact), false,
+	'public schema 5 cannot invent a directional option from a legacy raw artifact');
+const nativeLegacyPublicWithDirectionalOption = JSON.parse(
+	JSON.stringify(nativeDirectionalRawFallback));
+nativeLegacyPublicWithDirectionalOption.native_public_schema_version = 4;
+assert.equal(helpers.nativeAutotunePublicResultValidated(
+	nativeLegacyPublicWithDirectionalOption), false,
+	'public schema 4 must retain its exact one-option compatibility contract');
+const nativeDirectionalRawFallbackMissingOption = JSON.parse(
+	JSON.stringify(nativeDirectionalRawFallback));
+nativeDirectionalRawFallbackMissingOption.public_apply_contract.options.pop();
+assert.equal(helpers.nativeAutotunePublicResultValidated(
+	nativeDirectionalRawFallbackMissingOption), false,
+	'public schema 5 must not hide its evidence-bound directional option');
+const nativeDirectionalRawFallbackAckDrift = JSON.parse(
+	JSON.stringify(nativeDirectionalRawFallback));
+nativeDirectionalRawFallbackAckDrift.public_apply_contract.options[1]
+	.required_acknowledgements.push('sqm-disabled');
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeDirectionalRawFallbackAckDrift), false,
+	'the directional option acknowledgements must remain exact and cannot disable all SQM');
+const nativeUnavailableDirectionalRawFallback = JSON.parse(
+	JSON.stringify(nativePairExhaustedRawFallback));
+nativeUnavailableDirectionalRawFallback.artifacts.raw_fallback.value.schema_version = 5;
+nativeUnavailableDirectionalRawFallback.artifacts.raw_fallback.value.mobile_download_bypass = {
+	available: false, selected_topology: 'upload_only_shaped', candidate_ul_kbps: 915600,
+	failed_direction: 'download', reason: 'traffic_budget', run_count: 0, debit_count: 0,
+	samples: { icmp: 0, transport: 0, cpu: 0 },
+};
+assert.equal(helpers.nativeAutotunePublicResultValidated(
+	nativeUnavailableDirectionalRawFallback), true,
+	'a bounded unavailable mobile control must remain visible without inventing a proposal');
+const nativeInconclusiveRawFallback = nativeRawFallbackPublicFixture();
+Object.assign(nativeInconclusiveRawFallback.artifacts.raw_fallback.value, {
+	schema_version: 4,
+	reason: 'shaped-search-inconclusive',
+	terminal_boundary: {
+		kind: 'shaped_search_inconclusive', observation_count: 3,
+		optimizer_reason: 'variable-candidate-realization-inconclusive',
+	},
+});
+delete nativeInconclusiveRawFallback.artifacts.raw_fallback.value.unobserved_candidates_kbps;
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeInconclusiveRawFallback), true,
+	'a measured optimizer dead end may expose only the exact manual no-SQM fallback');
+const nativeInconclusiveWrongReason = JSON.parse(JSON.stringify(nativeInconclusiveRawFallback));
+nativeInconclusiveWrongReason.artifacts.raw_fallback.value.terminal_boundary.optimizer_reason =
+	'arbitrary-inconclusive';
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeInconclusiveWrongReason), false,
+	'the browser must reject an optimizer reason outside the Rust allowlist');
+const nativeInconclusiveWrongCount = JSON.parse(JSON.stringify(nativeInconclusiveRawFallback));
+nativeInconclusiveWrongCount.artifacts.raw_fallback.value.terminal_boundary.observation_count = 0;
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeInconclusiveWrongCount), false,
+	'the browser must reject an empty shaped-search boundary');
 const nativePairExhaustedInventedDirection = JSON.parse(
 	JSON.stringify(nativePairExhaustedRawFallback));
 nativePairExhaustedInventedDirection.artifacts.raw_fallback.value.failed_direction = 'download';
@@ -846,6 +1105,25 @@ assert.equal(helpers.nativeAutotuneApplyCheckValidated({
 	...nativeConfirmation, source_manifest_sha256: '0'.repeat(64),
 }, nativePublic, nativeSelected), false,
 	'the effective manifest must remain bound to the selected public source manifest');
+const nativeDirectionalSelected = nativeDirectionalRawFallback.public_apply_contract.options[1];
+const nativeDirectionalConfirmation = {
+	...nativeConfirmation,
+	job_id: nativeDirectionalRawFallback.native_job_id,
+	worker_run_id: nativeDirectionalRawFallback.run_id,
+	option_id: nativeDirectionalSelected.option_id,
+	review_sha256: nativeDirectionalRawFallback.source_review_sha256,
+	source_manifest_sha256: nativeDirectionalSelected.manifest_sha256,
+	manifest_sha256: nativeDirectionalSelected.manifest_sha256,
+	manifest_schema_version: 6,
+	required_acknowledgements: nativeDirectionalSelected.required_acknowledgements.slice(),
+};
+assert.equal(helpers.nativeAutotuneApplyCheckValidated(
+	nativeDirectionalConfirmation, nativeDirectionalRawFallback, nativeDirectionalSelected), true,
+	'the exact existing-instance download-bypass option must require manifest schema 6');
+assert.equal(helpers.nativeAutotuneApplyCheckValidated({
+	...nativeDirectionalConfirmation, manifest_schema_version: 4,
+}, nativeDirectionalRawFallback, nativeDirectionalSelected), false,
+	'a directional existing-instance option cannot be downgraded to shaped manifest schema 4');
 const nativeReceipt = {
 	state: 'applied',
 	configuration_written: true,
@@ -4643,7 +4921,7 @@ async function testNativeAutotuneTransport() {
 		admission_enabled: true,
 		native_full_autotune: true,
 		native_bootstrap_autotune: true,
-		native_public_result_version: 4,
+		native_public_result_version: 5,
 	};
 	const access = {
 		medium: 'cellular',
@@ -4655,6 +4933,71 @@ async function testNativeAutotuneTransport() {
 	};
 
 	try {
+		const refreshCalls = [];
+		const refreshHelpers = compileHelpers({}, {
+			unload(packageName) { refreshCalls.push([ 'unload', packageName ]); },
+			load(packageName) {
+				refreshCalls.push([ 'load', packageName ]);
+				return Promise.resolve(packageName);
+			},
+		}, { resolveDefault(value) { return value; } });
+		await refreshHelpers.reloadAppliedUciPackages();
+		assert.deepEqual(refreshCalls, [
+			[ 'unload', 'cake-autorate' ], [ 'unload', 'sqm' ],
+			[ 'load', 'cake-autorate' ], [ 'load', 'sqm' ],
+		]);
+
+		const queuedProgress = helpers.nativeAutotuneProgress({ state: 'queued' }, 0);
+		assert.equal(queuedProgress.progress, 1);
+		assert.match(queuedProgress.message, /Waiting for the calibration slot/);
+		const downloadProgress = helpers.nativeAutotuneProgress({
+			state: 'running', progress_schema_version: 1, progress_percent: 37,
+			progress_step: 'searching_download_limit', progress_completed_units: 4,
+			progress_total_units: 12, progress_direction: 'download', progress_attempt: 5,
+		}, queuedProgress.progress);
+		assert.equal(downloadProgress.progress, 37);
+		assert.match(downloadProgress.message, /best download limit/);
+		assert.match(downloadProgress.message, /Completed 4 of 12/);
+		const mobileBypassProgress = helpers.nativeAutotuneProgress({
+			state: 'running', progress_schema_version: 1, progress_percent: 87,
+			progress_step: 'confirming_mobile_download_bypass', progress_completed_units: 1,
+			progress_total_units: 2, progress_direction: 'upload', progress_attempt: 2,
+		}, downloadProgress.progress);
+		assert.equal(mobileBypassProgress.progress, 87);
+		assert.match(mobileBypassProgress.message, /download without shaping/);
+		assert.match(mobileBypassProgress.message, /Completed 1 of 2/);
+		const regressedProgress = helpers.nativeAutotuneProgress({
+			state: 'running', progress_schema_version: 1, progress_percent: 12,
+			progress_step: 'measuring_idle_latency', progress_completed_units: 0,
+			progress_total_units: 0,
+		}, downloadProgress.progress);
+		assert.equal(regressedProgress.progress, 37,
+			'a malformed or stale active projection must not move the visible bar backward');
+		assert.match(regressedProgress.message, /Preparing the test connection/);
+		const cappedProgress = helpers.nativeAutotuneProgress({
+			state: 'running', progress_schema_version: 1, progress_percent: 100,
+			progress_step: 'preparing_proposals', progress_completed_units: 0,
+			progress_total_units: 0,
+		}, regressedProgress.progress);
+		assert.equal(cappedProgress.progress, 99,
+			'an active worker must never publish terminal 100 percent');
+		const readyProgress = helpers.nativeAutotuneProgress({
+			state: 'review_ready', progress_schema_version: 1, progress_percent: 99,
+			progress_step: 'proposals_ready', progress_completed_units: 0,
+			progress_total_units: 0,
+		}, cappedProgress.progress);
+		assert.equal(readyProgress.progress, 100);
+		assert.match(readyProgress.message, /Proposals are ready/);
+		for (const progressResult of [ queuedProgress, downloadProgress, mobileBypassProgress, regressedProgress,
+			cappedProgress, readyProgress ])
+			assert.doesNotMatch(progressResult.message, /native|rust|worker|coordinator/i);
+		const unknownProgress = helpers.nativeAutotuneProgress({
+			state: 'running', progress_schema_version: 1, progress_percent: 'NaN',
+			progress_step: 'internal_variant_name', progress_attempt: -1,
+		}, 0);
+		assert.equal(unknownProgress.progress, 3);
+		assert.match(unknownProgress.message, /detailed progress is temporarily unavailable/);
+
 		assert.equal(helpers.nativeAutotuneCapabilityValidated(capability), true);
 		assert.equal(helpers.nativeBootstrapAutotuneCapabilityValidated(capability), true);
 		assert.equal(helpers.nativeAutotuneCapabilityValidated({
@@ -4720,9 +5063,94 @@ async function testNativeAutotuneTransport() {
 		assert.equal(applyCalls[1].args[5], bootstrapManifest,
 			'Apply must use the effective v7 manifest returned by the server check');
 
+		const replayCalls = [];
+		const replayTimeouts = [];
+		const replayL = { env: { rpctimeout: 90 } };
+		const replayReceipt = { ...bootstrapReceipt, state: 'already_applied' };
+		const replayHelpers = compileHelpers({
+			exec(command, args) {
+				replayCalls.push({ command, args });
+				replayTimeouts.push(replayL.env.rpctimeout);
+				if (replayCalls.length === 1)
+					return Promise.resolve({ stdout: JSON.stringify(bootstrapConfirmation) });
+				if (replayCalls.length === 2)
+					return Promise.reject(new Error('truncated Apply transport'));
+				return Promise.resolve({ stdout: JSON.stringify(replayReceipt) });
+			},
+		}, null, replayL);
+		assert.deepEqual(await replayHelpers.runNativeAutotuneApply(
+			bootstrapApplyResult, nativeSelected), replayReceipt,
+			'a lost Apply response must reconcile through one exact idempotent replay');
+		assert.equal(replayCalls.length, 3);
+		assert.deepEqual(replayCalls[1].args, replayCalls[2].args,
+			'the uncertain delivery retry must reuse the exact job, option, digests and ACKs');
+		assert.deepEqual(replayTimeouts, [ 180, 30, 180 ],
+			'the first mutation response gets an exact short bound and the replay keeps the full recovery bound');
+		assert.equal(replayL.env.rpctimeout, 90,
+			'every Apply phase must restore the caller RPC timeout');
+
+		const truncatedCalls = [];
+		const truncatedHelpers = compileHelpers({
+			exec(command, args) {
+				truncatedCalls.push({ command, args });
+				if (truncatedCalls.length === 1)
+					return Promise.resolve({ stdout: JSON.stringify(bootstrapConfirmation) });
+				if (truncatedCalls.length === 2)
+					return Promise.resolve({ code: 0, stdout: '{"state":"already_' });
+				return Promise.resolve({ stdout: JSON.stringify(replayReceipt) });
+			},
+		});
+		assert.deepEqual(await truncatedHelpers.runNativeAutotuneApply(
+			bootstrapApplyResult, nativeSelected), replayReceipt,
+			'a truncated code-zero Apply receipt must use the same bounded exact replay');
+		assert.deepEqual(truncatedCalls[1].args, truncatedCalls[2].args);
+
+		const exhaustedCalls = [];
+		const exhaustedHelpers = compileHelpers({
+			exec(command, args) {
+				exhaustedCalls.push({ command, args });
+				if (exhaustedCalls.length === 1)
+					return Promise.resolve({ stdout: JSON.stringify(bootstrapConfirmation) });
+				return Promise.reject(new Error('response connection interrupted'));
+			},
+		});
+		let exhaustedError;
+		try {
+			await exhaustedHelpers.runNativeAutotuneApply(
+				bootstrapApplyResult, nativeSelected);
+		}
+		catch (error) {
+			exhaustedError = error;
+		}
+		assert(exhaustedError, 'two uncertain Apply deliveries must remain distinguishable');
+		assert.equal(exhaustedError.nativeApplyReloadRequired, true,
+			'two uncertain deliveries must request an authoritative fresh-page reconciliation');
+		assert.equal(exhaustedCalls.length, 3);
+		assert.deepEqual(exhaustedCalls[1].args, exhaustedCalls[2].args,
+			'the final uncertain result must still follow an exact single replay');
+		assert.match(source,
+			/if \(error\.nativeApplyReloadRequired\)\s*return reloadAppliedSettingsPage\(\);/,
+			'the Review UI must reload authoritative UCI after both Apply responses are lost');
+
+		const logicalFailureCalls = [];
+		const logicalFailureHelpers = compileHelpers({
+			exec(command, args) {
+				logicalFailureCalls.push({ command, args });
+				if (logicalFailureCalls.length === 1)
+					return Promise.resolve({ stdout: JSON.stringify(bootstrapConfirmation) });
+				return Promise.resolve({ code: 1, stderr: 'unsafe Apply state' });
+			},
+		});
+		await assert.rejects(
+			logicalFailureHelpers.runNativeAutotuneApply(bootstrapApplyResult, nativeSelected),
+			/unsafe Apply state/);
+		assert.equal(logicalFailureCalls.length, 2,
+			'a structured server rejection must fail closed without replay');
+
 		const nativeCalls = [];
 		const nativePayloads = [
 			capability,
+			{ state: 'idle', instance: 'wan_sqm' },
 			{ state: 'queued', job_id: publicJobId },
 			{ state: 'review_ready', job_id: publicJobId,
 				runtime_mutated: false, recovery_required: false },
@@ -4741,12 +5169,118 @@ async function testNativeAutotuneTransport() {
 		assert.deepEqual(nativeResult, nativePublic);
 		assert.deepEqual(nativeCalls.map(call => [ call.command, call.args.slice(0, 2) ]), [
 			[ '/usr/sbin/cake-autorated', [ '--calibrationctl', 'summary' ] ],
+			[ '/usr/sbin/cake-autorated', [ '--calibrationctl', 'autotune-current' ] ],
 			[ '/usr/sbin/cake-autorated', [ '--calibrationctl', 'autotune-start' ] ],
 			[ '/usr/sbin/cake-autorated', [ '--calibrationctl', 'autotune-status' ] ],
 			[ '/usr/sbin/cake-autorated', [ '--calibrationctl', 'autotune-result' ] ],
 		], 'advertised native capability must route the whole authenticated lifecycle through Rust');
 		assert(!nativeCalls.some(call => call.command.endsWith('/autotune')),
 			'a native start must never be followed by a legacy helper launch');
+
+		const resumedReviewCalls = [];
+		const resumedReviewPayloads = [
+			capability,
+			{ state: 'review_ready', job_id: publicJobId, instance: 'wan_sqm',
+				runtime_mutated: false, recovery_required: false,
+				progress_schema_version: 1, progress_percent: 100,
+				progress_step: 'proposals_ready' },
+			nativePublic,
+		];
+		const resumedReviewHelpers = compileHelpers({
+			exec(command, args) {
+				resumedReviewCalls.push({ command, args });
+				return Promise.resolve({ stdout: JSON.stringify(resumedReviewPayloads.shift()) });
+			},
+		});
+		assert.deepEqual(await resumedReviewHelpers.runPreferredAutotuneJob(
+			'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '',
+			'variable_link', false, 'full_raw', access, true), nativePublic,
+			'a matching durable Review must reopen after page reload without another traffic job');
+		assert.deepEqual(resumedReviewCalls.map(call => call.args.slice(0, 2)), [
+			[ '--calibrationctl', 'summary' ],
+			[ '--calibrationctl', 'autotune-current' ],
+			[ '--calibrationctl', 'autotune-result' ],
+		]);
+		assert(!resumedReviewCalls.some(call => call.args[1] === 'autotune-start'));
+
+		const resumedActiveCalls = [];
+		const resumedActivePayloads = [
+			capability,
+			{ state: 'running', job_id: publicJobId, instance: 'wan_sqm',
+				runtime_mutated: true, recovery_required: true,
+				progress_schema_version: 1, progress_percent: 40,
+				progress_step: 'searching_download_limit' },
+			{ state: 'review_ready', job_id: publicJobId, instance: 'wan_sqm',
+				runtime_mutated: false, recovery_required: false },
+			nativePublic,
+		];
+		const resumedActiveHelpers = compileHelpers({
+			exec(command, args) {
+				resumedActiveCalls.push({ command, args });
+				return Promise.resolve({ stdout: JSON.stringify(resumedActivePayloads.shift()) });
+			},
+		});
+		assert.deepEqual(await resumedActiveHelpers.runPreferredAutotuneJob(
+			'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '',
+			'variable_link', false, 'full_raw', access, true), nativePublic);
+		assert.deepEqual(resumedActiveCalls.map(call => call.args[1]),
+			[ 'summary', 'autotune-current', 'autotune-status', 'autotune-result' ]);
+		assert(!resumedActiveCalls.some(call => call.args[1] === 'autotune-start'),
+			'an in-flight matching-instance operation must be observed rather than duplicated');
+
+		const staleReview = nativePublicFixture();
+		staleReview.target_interface = 'eth9';
+		const changedIntentCalls = [];
+		const changedIntentPayloads = [
+			capability,
+			{ state: 'review_ready', job_id: publicJobId, instance: 'wan_sqm',
+				runtime_mutated: false, recovery_required: false },
+			staleReview,
+			{ state: 'queued', job_id: publicJobId },
+			{ state: 'review_ready', job_id: publicJobId,
+				runtime_mutated: false, recovery_required: false },
+			nativePublic,
+		];
+		const changedIntentHelpers = compileHelpers({
+			exec(command, args) {
+				changedIntentCalls.push({ command, args });
+				return Promise.resolve({ stdout: JSON.stringify(changedIntentPayloads.shift()) });
+			},
+		});
+		assert.deepEqual(await changedIntentHelpers.runPreferredAutotuneJob(
+			'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '',
+			'variable_link', false, 'full_raw', access, true), nativePublic);
+		assert.deepEqual(changedIntentCalls.map(call => call.args[1]), [
+			'summary', 'autotune-current', 'autotune-result',
+			'autotune-start', 'autotune-status', 'autotune-result',
+		], 'a valid Review for another exact request must not be silently reused');
+
+		const invalidSavedReviewCalls = [];
+		const invalidSavedReviewPayloads = [
+			capability,
+			{ state: 'review_ready', job_id: publicJobId, instance: 'wan_sqm',
+				runtime_mutated: false, recovery_required: false },
+			{ state: 'error', error_code: 'result-verification-failed',
+				error: 'saved Review is no longer canonical' },
+			{ state: 'queued', job_id: publicJobId },
+			{ state: 'review_ready', job_id: publicJobId,
+				runtime_mutated: false, recovery_required: false },
+			nativePublic,
+		];
+		const invalidSavedReviewHelpers = compileHelpers({
+			exec(command, args) {
+				invalidSavedReviewCalls.push({ command, args });
+				return Promise.resolve({ stdout: JSON.stringify(invalidSavedReviewPayloads.shift()) });
+			},
+		});
+		assert.deepEqual(await invalidSavedReviewHelpers.runPreferredAutotuneJob(
+			'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '',
+			'variable_link', false, 'full_raw', access, true), nativePublic,
+			'a Review invalidated between discovery and hydration must not block a new admission');
+		assert.deepEqual(invalidSavedReviewCalls.map(call => call.args[1]), [
+			'summary', 'autotune-current', 'autotune-result',
+			'autotune-start', 'autotune-status', 'autotune-result',
+		]);
 
 		const recoveryCalls = [];
 		const recoveryHelpers = compileHelpers({
@@ -4762,7 +5296,7 @@ async function testNativeAutotuneTransport() {
 		await assert.rejects(recoveryHelpers.runPreferredAutotuneJob(
 			'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '',
 			'best_overall', false, 'shaped_only', null, true),
-			/restoring an earlier runtime transaction/);
+			/restoring an earlier settings transaction/);
 		assert.equal(recoveryCalls.length, 1);
 		assert.equal(recoveryCalls[0].command, '/usr/sbin/cake-autorated');
 		assert(!recoveryCalls.some(call => call.command.endsWith('/autotune')),
@@ -4809,6 +5343,10 @@ async function testNativeAutotuneTransport() {
 				timeoutCalls.push({ command, args });
 				if (args[1] === 'summary')
 					return Promise.resolve({ stdout: JSON.stringify(capability) });
+				if (args[1] === 'autotune-current')
+					return Promise.resolve({ stdout: JSON.stringify({
+						state: 'idle', instance: 'wan_sqm',
+					}) });
 				return Promise.reject(new Error('XHR request timed out'));
 			},
 		});
@@ -4818,7 +5356,7 @@ async function testNativeAutotuneTransport() {
 			assert.equal(err.nativeAutotuneStartAttempted, true);
 			return true;
 		});
-		assert.equal(timeoutCalls.length, 2,
+		assert.equal(timeoutCalls.length, 3,
 			'an ambiguous native start timeout must not retry with the legacy mutating backend');
 
 		const mismatched = nativePublicFixture();
@@ -4829,6 +5367,7 @@ async function testNativeAutotuneTransport() {
 			'wan_sqm', 'pppoe-wan', 'main', '', 'variable_link', 'full_raw'), false,
 			'the transport must independently bind a valid public result to the active dialog');
 		const mismatchPayloads = [ capability,
+			{ state: 'idle', instance: 'wan_sqm' },
 			{ state: 'queued', job_id: publicJobId },
 			{ state: 'review_ready', job_id: publicJobId,
 				runtime_mutated: false, recovery_required: false },
@@ -4842,10 +5381,10 @@ async function testNativeAutotuneTransport() {
 		await assert.rejects(mismatchHelpers.runPreferredAutotuneJob(
 			'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '',
 			'variable_link', false, 'full_raw', access, true),
-			/no longer matches this calibration request/);
+			/no longer matches this request/);
 		await assert.rejects(mismatchHelpers.cancelPreferredAutotuneJob(
 			'wan_sqm', 'pppoe-wan', 'speedtest-go', 'variable_link', 'main', ''),
-			/No authenticated native calibration handle/,
+			/No authenticated calibration handle/,
 			'a terminal invalid result must not leave a stale cancellable native handle');
 
 		delays.length = 0;
@@ -4890,7 +5429,7 @@ async function testNativeSpeedtestTransport() {
 		protocol_version: 2,
 		admission_enabled: true,
 		native_speedtest: true,
-		native_public_result_version: 4,
+		native_public_result_version: 5,
 	};
 	const result = {
 		state: 'complete', job_id: publicJobId,

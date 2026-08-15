@@ -121,6 +121,22 @@ service hard caps**.
 
 [![Full Auto-Tune calibration profiles](docs/screenshots/autotune-profiles.png)](docs/screenshots/autotune-profiles.png)
 
+During a run, the dialog reports an evidence-backed percentage and the current
+operation, such as idle-latency measurement, raw capacity, download/upload
+search, candidate confirmation, directional comparison, restoration, or
+proposal preparation. Progress is monotonic but is never advanced by an
+elapsed-time animation; 100% is reserved for a published Review after the
+previous runtime has been restored.
+
+Review can present several independently measured choices. Every trade-off for
+the selected card is listed, followed by one aggregate **I accept all listed
+trade-offs** confirmation. For explicitly selected cellular, satellite, and
+fixed-wireless access, Full raw capacity also attempts a download-unshaped /
+upload-shaped result. If that control cannot satisfy the hard evidence gates,
+the card remains visible but disabled with its exact reason.
+
+[![Full Auto-Tune Review with four measured options and one aggregate confirmation](docs/screenshots/autotune-review-options.png)](docs/screenshots/autotune-review-options.png)
+
 ### Controlled cellular observations (anonymized)
 
 The following controlled OpenWrt cellular-link sample runs are anonymized benchmark evidence and are **not** shipped behavior or guarantees.
@@ -192,8 +208,9 @@ RC27 implements the following controller and LuCI model:
   trust boundary, use that same point as the runtime minimum, require a safe
   simultaneous DL+UL confirmation, and expose it only for manual review.
 - Each close manual proposal lists every missed advisory/profile criterion in
-  Review. The user must acknowledge each deviation separately for that exact
-  topology before it can be staged. A final simultaneous latency miss is
+  Review. One aggregate checkbox accepts the complete displayed set for that
+  exact topology; the individual codes remain bound to Apply and cannot be
+  hidden or changed after confirmation. A final simultaneous latency miss is
   reviewable only within the adjacent quality class: Gaming/Extreme A+ to A
   (30 ms), Best overall A to B (60 ms), Variable link B to C (200 ms), and Fair
   C to D (400 ms). Final simultaneous realization between 50% and the ordinary
@@ -219,9 +236,11 @@ RC27 implements the following controller and LuCI model:
   per-instance daily/monthly byte allowances in a crash-safe ledger, shows the
   next due run and remaining allowance, and stops before exceeding a hard
   budget.
-- Review may recommend a repeated upload-only-shaped experiment when evidence
-  suggests ingress CAKE is ineffective. This is a manual diagnostic result,
-  not a silent runtime topology change.
+- For explicitly selected cellular, satellite, and fixed-wireless access,
+  Full raw capacity attempts a repeated upload-only-shaped experiment with
+  download ingress bypassed. A verified result becomes a separate manual
+  option; unavailable or unsafe evidence remains an explained disabled card,
+  never a silent runtime topology change.
 - Keep fail-closed behavior unchanged: any integrity, identity, or contamination failure preserves last safe state and emits lower-confidence fallback instead of changing runtime rates.
 - Report confidence per direction and aggregate confidence with explicit provenance (`safe`, `provisional`, `limited`) so policy choice is auditable.
 
@@ -256,12 +275,12 @@ The RC27 release builds the OpenWrt 25.12 daemon APK for this ABI matrix:
 The target is an APK ABI rather than one specific board. The authoritative
 choice is the value returned by `apk --print-arch`. Every full daemon asset
 follows the name
-`cake-autorate-rs-1.0_rc27-r235_openwrt-25.12_<arch>.apk`; the shared
-`luci-app-cake-autorate-rs-1.0_rc27-r85_openwrt-25.12_all.apk` contains the
+`cake-autorate-rs-1.0_rc27-r249_openwrt-25.12_<arch>.apk`; the shared
+`luci-app-cake-autorate-rs-1.0_rc27-r97_openwrt-25.12_all.apk` contains the
 architecture-independent full LuCI interface and SQM integration.
 
 The same release also contains a separately compiled **Lite** pair for every
-ABI: `cake-autorate-rs-lite-1.0_rc27-r235_...apk` and
+ABI: `cake-autorate-rs-lite-1.0_rc27-r249_...apk` and
 `luci-app-cake-autorate-rs-lite-1.0_rc27-r3_...apk`. Lite keeps the manual
 controller, routing, latency probes, directional SQM and bounded adaptive
 ceiling, but deliberately omits Get rating, speed-test calibration, Full
@@ -365,17 +384,17 @@ representative examples rather than guarantees.
 
 ## Release history
 
-The current public prerelease is **RC27 r235/r85**: daemon package r235 and
-Full LuCI package r85, with the parallel manual-only Lite pair r235/r3. The
-release completes the native Rust rating, speed-test, Full Auto-Tune,
-scheduler, Review and Apply authority path while retaining exact guarded
-restoration of managed CAKE/SQM state. A bounded parse-only retry fixes the
-last real high-speed calibration blocker without retrying route, counter,
-ownership or other authority failures. The focused live transition matrix,
-full browser audit, Full/Lite 12-ABI verification and design chronology are
-recorded in [Testing](TESTING.md). The README intentionally describes current
-behavior instead of retaining a cumulative RC diary; historical source points
-remain in Git tags while
+This release is **RC27 r249/r97**: daemon package r249 and Full LuCI package
+r97, with the parallel manual-only Lite pair r249/r3. It adds complete
+two-direction Rating authority, truthful staged Auto-Tune progress, a ranked
+four-option Review including the measured mobile download-bypass topology, one
+aggregate trade-off confirmation, and an Apply flow which verifies the runtime
+and immediately reloads authoritative UCI without another button or tab
+switch. The focused live transition matrix, full browser audit, Full/Lite
+12-ABI verification and design chronology are recorded in
+[Testing](TESTING.md). The README intentionally describes current behavior
+instead of retaining a cumulative RC diary; historical source points remain in
+Git tags while
 [GitHub Releases](https://github.com/woffko/cake-autorate-rs-owrt/releases)
 contains the current downloadable build.
 
@@ -462,7 +481,10 @@ Implemented:
   counters. Optional `Get rating` automatic/client capture uses the same
   detector and supplies a bounded per-direction trigger; it never bypasses
   shaping. Automatic capture first enforces a quiet window and runs separate
-  download-only and upload-only load phases.
+  download-only and upload-only load phases. The top-level grade is published
+  only from a fresh finalized capture containing trusted ICMP and transport
+  evidence for both directions. Partial, stale, compatibility, or one-sided
+  evidence remains diagnostic and cannot replace the last complete grade.
 - The controller, rating detector, transport scheduler, and RAM graph history
   reuse one atomic per-interval RX/TX counter sample. This prevents either
   direction from disappearing because another consumer already advanced the
@@ -838,15 +860,15 @@ For example, when it prints `aarch64_generic`:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc27-r235_openwrt-25.12_aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc27-r85_openwrt-25.12_all.apk
+  /root/cake-autorate-rs-1.0_rc27-r249_openwrt-25.12_aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc27-r97_openwrt-25.12_all.apk
 ```
 
 For a small manual-only installation, use the matching Lite pair instead:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-lite-1.0_rc27-r235_openwrt-25.12_aarch64_generic.apk \
+  /root/cake-autorate-rs-lite-1.0_rc27-r249_openwrt-25.12_aarch64_generic.apk \
   /root/luci-app-cake-autorate-rs-lite-1.0_rc27-r3_openwrt-25.12_all.apk
 ```
 

@@ -106,7 +106,6 @@ pub fn icmp_observation_kind(
 pub fn transport_observation_kind(
     request: &AutotuneCaptureRequest,
     latency_ms: f64,
-    baseline_ms: Option<f64>,
     download_loaded: bool,
     upload_loaded: bool,
 ) -> Result<Option<AutotuneCaptureObservationKind>, String> {
@@ -131,10 +130,9 @@ pub fn transport_observation_kind(
             if !phase_matches {
                 return Ok(None);
             }
-            let Some(baseline_ms) = baseline_ms else {
-                return Ok(None);
-            };
-            let baseline_us = positive_us(baseline_ms * 1_000.0)?;
+            let baseline_us = request.transport_baseline_us.ok_or_else(|| {
+                "loaded Auto-Tune transport observation has no bound idle baseline".to_string()
+            })?;
             Ok(Some(AutotuneCaptureObservationKind::TransportSuccess {
                 latency_us: None,
                 delta_us: Some(latency_us.saturating_sub(baseline_us)),
@@ -152,7 +150,6 @@ pub fn transport_observation_kind(
 pub fn transport_deadline_observation_kind(
     request: &AutotuneCaptureRequest,
     deadline_us: u64,
-    baseline_ms: Option<f64>,
     download_loaded: bool,
     upload_loaded: bool,
 ) -> Result<Option<AutotuneCaptureObservationKind>, String> {
@@ -171,10 +168,9 @@ pub fn transport_deadline_observation_kind(
     if !phase_matches {
         return Ok(None);
     }
-    let Some(baseline_ms) = baseline_ms else {
-        return Ok(None);
-    };
-    let baseline_us = positive_us(baseline_ms * 1_000.0)?;
+    let baseline_us = request.transport_baseline_us.ok_or_else(|| {
+        "loaded Auto-Tune transport deadline has no bound idle baseline".to_string()
+    })?;
     let delta_lower_bound_us = deadline_us.saturating_sub(baseline_us);
     if delta_lower_bound_us == 0 {
         return Err("transport deadline does not exceed its idle baseline".to_string());
@@ -555,6 +551,7 @@ impl AutotuneCaptureAccumulator {
             cpu_samples: self.cpu_milli_percent.len() as u32,
             idle_median_us: None,
             idle_p95_us: None,
+            idle_transport_baseline_us: None,
             icmp_delta_us: None,
             transport_delta_us: None,
             loss_ppm: None,
@@ -568,6 +565,8 @@ impl AutotuneCaptureAccumulator {
                 AutotuneCapturePhase::IdleBaseline => {
                     snapshot.idle_median_us = percentile_u64(&self.icmp_values_us, 50);
                     snapshot.idle_p95_us = percentile_u64(&self.icmp_values_us, 95);
+                    snapshot.idle_transport_baseline_us =
+                        percentile_u64(&self.transport_values_us, 5);
                 }
                 AutotuneCapturePhase::LoadedMeasurement => {
                     snapshot.icmp_delta_us = percentile_u64(&self.icmp_values_us, 95);
@@ -845,6 +844,7 @@ mod tests {
             candidate_dl_kbps: Some(100_000),
             candidate_ul_kbps: Some(50_000),
             load_reference_kbps: loaded.then_some(100_000),
+            transport_baseline_us: loaded.then_some(10_000),
             route_fingerprint: "55".repeat(32),
             sqm_fingerprint: "66".repeat(32),
         }
@@ -966,6 +966,7 @@ mod tests {
         assert_eq!(snapshot.transport_samples, 15);
         assert_eq!(snapshot.idle_median_us, Some(10_004));
         assert_eq!(snapshot.idle_p95_us, Some(10_008));
+        assert_eq!(snapshot.idle_transport_baseline_us, Some(20_000));
         assert_eq!(snapshot.background_confidence_percent, Some(97));
     }
 
@@ -1123,23 +1124,22 @@ mod tests {
     #[test]
     fn timeout_never_creates_idle_evidence_and_mixed_loaded_evidence_stays_censored() {
         let idle = request(AutotuneCapturePhase::IdleBaseline, "1");
-        assert!(
-            transport_deadline_observation_kind(&idle, 5_000_000, Some(10.0), false, false)
-                .is_err()
-        );
+        assert!(transport_deadline_observation_kind(&idle, 5_000_000, false, false).is_err());
 
         let loaded = request(AutotuneCapturePhase::LoadedMeasurement, "a");
         assert_eq!(
-            transport_deadline_observation_kind(&loaded, 5_000_000, Some(10.0), true, false)
-                .unwrap(),
+            transport_deadline_observation_kind(&loaded, 5_000_000, true, false).unwrap(),
             Some(AutotuneCaptureObservationKind::TransportDeadlineExceeded {
                 deadline_us: 5_000_000,
                 delta_lower_bound_us: 4_990_000,
             })
         );
-        assert_eq!(
-            transport_deadline_observation_kind(&loaded, 5_000_000, None, true, false).unwrap(),
-            None
+        let mut missing_baseline = loaded.clone();
+        missing_baseline.transport_baseline_us = None;
+        assert!(
+            transport_deadline_observation_kind(&missing_baseline, 5_000_000, true, false)
+                .unwrap_err()
+                .contains("no bound idle baseline")
         );
 
         let mut accumulator = AutotuneCaptureAccumulator::new();
@@ -1533,7 +1533,7 @@ mod tests {
                 delta_us: None,
             })
         );
-        assert!(transport_observation_kind(&idle, 20.0, None, true, false)
+        assert!(transport_observation_kind(&idle, 20.0, true, false)
             .unwrap()
             .is_none());
 
@@ -1552,17 +1552,15 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            transport_observation_kind(&loaded, 45.0, Some(20.0), true, false).unwrap(),
+            transport_observation_kind(&loaded, 45.0, true, false).unwrap(),
             Some(AutotuneCaptureObservationKind::TransportSuccess {
                 latency_us: None,
-                delta_us: Some(25_000),
+                delta_us: Some(35_000),
             })
         );
-        assert!(
-            transport_observation_kind(&loaded, 45.0, Some(20.0), false, true)
-                .unwrap()
-                .is_none()
-        );
+        assert!(transport_observation_kind(&loaded, 45.0, false, true)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

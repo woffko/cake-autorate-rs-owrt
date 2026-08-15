@@ -32,7 +32,10 @@ use super::{
     event_loop::{install_child_signal_handler, CalibrationEventLoop},
     full_autotune::{self, AutotuneTerminal, RuntimeAckState},
     identity::{monotonic_boot_ms, CoordinatorIdentity, ProcessIdentity, DEFAULT_PROC_ROOT},
-    journal::{JobJournal, JournalDisposition, JournalStore, NativeJobPaths, ScannedJob},
+    journal::{
+        JobJournal, JournalDisposition, JournalStore, NativeJobPaths, ScannedJob,
+        JOURNAL_RETENTION_TARGET, MAX_JOURNAL_JOBS,
+    },
     lease::{requires_heavy_traffic, LeaseRequest, LeaseTable},
     process::{signal_adopted_group, ManagedChild, SpawnSpec},
     rating::{self, RatingTerminal},
@@ -619,6 +622,25 @@ where
         }
         return Ok(());
     }
+    if command_name == "autotune-current" {
+        let instance = args
+            .next()
+            .ok_or_else(|| "calibrationctl autotune-current requires an instance".to_string())?;
+        if args.next().is_some() {
+            return Err("calibrationctl received unexpected arguments".to_string());
+        }
+        match find_current_autotune_operation(&state_dir, &instance)? {
+            Some(operation) => print!(
+                "{}",
+                send_operation_control(&state_dir, ControlCommand::Status, operation)?
+            ),
+            None => print!(
+                "{{\"state\":\"idle\",\"instance\":\"{}\"}}\n",
+                json_escape(&instance)
+            ),
+        }
+        return Ok(());
+    }
     if command_name == "autotune-apply-check" {
         let job_id = args.next().ok_or_else(|| {
             "calibrationctl autotune-apply-check requires a public job ID".to_string()
@@ -1089,6 +1111,178 @@ fn scan_current_speedtest_operation(
     Ok(selected.map(|(_, operation)| operation))
 }
 
+fn find_current_autotune_operation(
+    state_dir: &Path,
+    instance: &str,
+) -> Result<Option<OperationRequest>, String> {
+    let _ = Config::from_uci(instance)?;
+    scan_current_autotune_operation(state_dir, instance)
+}
+
+fn scan_current_autotune_operation(
+    state_dir: &Path,
+    instance: &str,
+) -> Result<Option<OperationRequest>, String> {
+    scan_current_autotune_operation_with_review_validator(
+        state_dir,
+        instance,
+        |operation, journal| canonical_current_autotune_review(state_dir, operation, journal),
+    )
+}
+
+fn canonical_current_autotune_review(
+    state_dir: &Path,
+    operation: &OperationRequest,
+    journal: &JobJournal,
+) -> bool {
+    verified_native_autotune_public_result(state_dir, operation, journal).is_ok()
+}
+
+fn verified_native_autotune_public_result(
+    state_dir: &Path,
+    operation: &OperationRequest,
+    journal: &JobJournal,
+) -> Result<String, String> {
+    if operation.identity.operation != OperationKind::FullAutotune
+        || operation.identity.job_id != journal.job_id
+        || !matches!(
+            journal.state,
+            super::protocol::OperationState::ReviewReady
+                | super::protocol::OperationState::Completed
+        )
+        || journal.runtime_mutated
+        || journal.recovery_required
+        || journal.process.is_some()
+        || journal.runtime_owner_process.is_some()
+        || journal.terminal_kind.as_deref() != Some("result")
+        || journal.terminal_state.as_deref() != Some("complete")
+    {
+        return Err("native Full Auto-Tune result is not an inert completed Review".to_string());
+    }
+    let worker_run_id = journal
+        .worker_run_id
+        .as_deref()
+        .ok_or_else(|| "native Full Auto-Tune Review has no worker identity".to_string())?;
+    if !public_job_id_valid(worker_run_id) {
+        return Err("native Full Auto-Tune Review worker identity is invalid".to_string());
+    }
+    let job_dir = state_dir.join("jobs").join(&journal.job_id);
+    let request_path = job_dir.join("request");
+    let terminal_path = job_dir.join(format!("terminal-{worker_run_id}"));
+    let review_path = job_dir.join(format!("review-{worker_run_id}.json"));
+    let apply_manifest_path = job_dir.join(format!("apply-manifest-{worker_run_id}.json"));
+    let public_result_path = job_dir.join(format!("public-review-{worker_run_id}.json"));
+    let terminal = full_autotune::read_terminal_file(&terminal_path)?;
+    if terminal.job_id != operation.identity.job_id || terminal.worker_run_id != worker_run_id {
+        return Err("native Full Auto-Tune terminal identity changed".to_string());
+    }
+    let AutotuneTerminal::Complete { review_digest } = terminal.terminal else {
+        return Err("native Full Auto-Tune terminal has no complete Review".to_string());
+    };
+    let (publication_boot_id, publication_generation) = journal.publication_identity()?;
+    let canonical = full_autotune::canonical_native_public_result_transaction(
+        &request_path,
+        &review_path,
+        &apply_manifest_path,
+        &operation.identity.job_id,
+        worker_run_id,
+        &review_digest,
+        publication_boot_id,
+        publication_generation,
+    )?;
+    let stored = rating::read_private_bounded(&public_result_path, MAX_RESULT_RESPONSE_BYTES)?;
+    if stored.as_bytes() != canonical.as_slice() {
+        return Err(
+            "published native Full Auto-Tune result differs from canonical evidence".to_string(),
+        );
+    }
+    Ok(stored)
+}
+
+fn scan_current_autotune_operation_with_review_validator<F>(
+    state_dir: &Path,
+    instance: &str,
+    mut review_valid: F,
+) -> Result<Option<OperationRequest>, String>
+where
+    F: FnMut(&OperationRequest, &JobJournal) -> bool,
+{
+    let jobs_root = state_dir.join("jobs");
+    let entries = match fs::read_dir(&jobs_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "unable to list private calibration jobs for Auto-Tune: {error}"
+            ))
+        }
+    };
+    // An in-flight operation always wins over an older Review.  Collect
+    // structurally eligible Reviews separately so their potentially expensive
+    // evidence replay is never performed while active work exists.
+    let mut active: Option<(u64, String, OperationRequest)> = None;
+    let mut reviews = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let Ok(job_id) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !public_job_id_valid(&job_id) {
+            continue;
+        }
+        let Ok(operation) = read_private_job_operation(state_dir, &job_id) else {
+            continue;
+        };
+        if operation.identity.instance != instance
+            || operation.identity.operation != OperationKind::FullAutotune
+        {
+            continue;
+        }
+        let Ok(journal) = read_private_job_journal(state_dir, &job_id) else {
+            continue;
+        };
+        if !state::terminal(journal.state) {
+            let candidate = (
+                operation.created_unix_ms,
+                operation.identity.job_id.clone(),
+                operation,
+            );
+            if active.as_ref().is_none_or(|selected| {
+                candidate.0 > selected.0 || candidate.0 == selected.0 && candidate.1 > selected.1
+            }) {
+                active = Some(candidate);
+            }
+        } else if journal.state == super::protocol::OperationState::ReviewReady
+            && !journal.runtime_mutated
+            && !journal.recovery_required
+            && journal.process.is_none()
+            && journal.runtime_owner_process.is_none()
+            && journal.terminal_kind.as_deref() == Some("result")
+            && journal.terminal_state.as_deref() == Some("complete")
+        {
+            reviews.push((
+                operation.created_unix_ms,
+                operation.identity.job_id.clone(),
+                operation,
+                journal,
+            ));
+        }
+    }
+    if let Some((_, _, operation)) = active {
+        return Ok(Some(operation));
+    }
+    reviews.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+    Ok(reviews.into_iter().find_map(|(_, _, operation, journal)| {
+        review_valid(&operation, &journal).then_some(operation)
+    }))
+}
+
 struct VerifiedNativeApplyContext {
     request: OperationRequest,
     worker_run_id: String,
@@ -1209,6 +1403,7 @@ fn verified_native_autotune_apply_context(
         AutotuneTerminal::Complete { review_digest } => review_digest,
         _ => return Err("native Apply terminal has no complete Review".to_string()),
     };
+    let (publication_boot_id, publication_generation) = journal.publication_identity()?;
     let (plan, manifest, manifest_digest) = match requested_option_id {
         Some(option_id) => {
             full_autotune::verified_native_apply_execution_plan_for_option_transaction(
@@ -1218,8 +1413,8 @@ fn verified_native_autotune_apply_context(
                 job_id,
                 worker_run_id,
                 &review_digest,
-                &journal.boot_id,
-                &journal.coordinator_generation,
+                publication_boot_id,
+                publication_generation,
                 option_id,
             )?
         }
@@ -1230,8 +1425,8 @@ fn verified_native_autotune_apply_context(
             job_id,
             worker_run_id,
             &review_digest,
-            &journal.boot_id,
-            &journal.coordinator_generation,
+            publication_boot_id,
+            publication_generation,
         )?,
     };
     if plan.request != request {
@@ -2257,6 +2452,13 @@ impl CalibrationDaemon {
             job_errors: BTreeMap::new(),
         };
         daemon.resume_journalled_cancellations();
+        if daemon.startup_issues.is_empty() {
+            if let Err(error) = daemon.prune_settled_history() {
+                daemon
+                    .startup_issues
+                    .push(format!("unable to prune settled journal history: {error}"));
+            }
+        }
         Ok(daemon)
     }
 
@@ -5580,6 +5782,51 @@ impl CalibrationDaemon {
             })
     }
 
+    fn prune_settled_history(&mut self) -> Result<usize, String> {
+        let excess = self.jobs.len().saturating_sub(JOURNAL_RETENTION_TARGET);
+        if excess == 0 {
+            return Ok(0);
+        }
+        let mut candidates = self
+            .jobs
+            .iter()
+            .filter(|job| {
+                job.disposition == JournalDisposition::Settled
+                    && !self.leases.contains_job(&job.journal.job_id)
+                    && !self.native_children.contains_key(&job.journal.job_id)
+                    && !self
+                        .bootstrap_runtime_children
+                        .contains_key(&job.journal.job_id)
+                    && !self.cancellations.contains_key(&job.journal.job_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            left.request
+                .created_unix_ms
+                .cmp(&right.request.created_unix_ms)
+                .then_with(|| left.journal.job_id.cmp(&right.journal.job_id))
+        });
+        candidates.truncate(excess);
+        let mut retired_count = 0usize;
+        for job in candidates {
+            self.journal_store
+                .retire_settled_job(&job, Path::new(DEFAULT_PROC_ROOT))?;
+            let job_id = job.journal.job_id;
+            self.jobs
+                .retain(|retained| retained.journal.job_id != job_id);
+            self.job_errors.remove(&job_id);
+            retired_count += 1;
+        }
+        if self.jobs.len() > MAX_JOURNAL_JOBS {
+            return Err(format!(
+                "{} journals remain after safe retention; maximum is {MAX_JOURNAL_JOBS}",
+                self.jobs.len()
+            ));
+        }
+        Ok(retired_count)
+    }
+
     fn start_job(&mut self, message: &ControlMessage) -> String {
         if !self.admission_available() {
             return error_response(
@@ -5611,6 +5858,9 @@ impl CalibrationDaemon {
                 "job-id-conflict",
                 "job_id is already bound to a different immutable request",
             );
+        }
+        if let Err(error) = self.prune_settled_history() {
+            return error_response("journal-retention-failed", &error);
         }
 
         let lease_request = match LeaseRequest::local_from_operation(request) {
@@ -5648,11 +5898,57 @@ impl CalibrationDaemon {
         let Some(job) = self.authorized_job(message) else {
             return error_response("job-not-found", "no job matches the supplied identity");
         };
-        job_status_response(
+        let progress = self.native_autotune_status_progress(job);
+        job_status_response_with_progress(
             job,
             true,
             self.job_errors.get(&job.journal.job_id).map(String::as_str),
+            progress.as_ref(),
         )
+    }
+
+    fn native_autotune_status_progress(
+        &self,
+        job: &ScannedJob,
+    ) -> Option<full_autotune::NativeAutotuneProgress> {
+        use super::full_autotune::{NativeAutotuneProgress, NativeAutotuneProgressStep};
+        use super::protocol::OperationState;
+
+        if job.request.identity.operation != OperationKind::FullAutotune {
+            return None;
+        }
+        let fixed = |step, percent| NativeAutotuneProgress::coordinator_state(step, percent);
+        Some(match job.journal.state {
+            OperationState::Queued => fixed(NativeAutotuneProgressStep::WaitingForSlot, 1),
+            OperationState::Starting => fixed(NativeAutotuneProgressStep::StartingCalibration, 2),
+            OperationState::Running => {
+                let Some(worker_run_id) = job.journal.worker_run_id.as_deref() else {
+                    return Some(fixed(NativeAutotuneProgressStep::StartingCalibration, 3));
+                };
+                let Ok(paths) = self
+                    .journal_store
+                    .native_job_paths(&job.journal.job_id, worker_run_id)
+                else {
+                    return Some(fixed(NativeAutotuneProgressStep::StartingCalibration, 3));
+                };
+                let Some(job_directory) = paths.request.parent() else {
+                    return Some(fixed(NativeAutotuneProgressStep::StartingCalibration, 3));
+                };
+                full_autotune::read_native_autotune_progress(
+                    job_directory,
+                    &job.journal.job_id,
+                    worker_run_id,
+                )
+                .unwrap_or_else(|_| fixed(NativeAutotuneProgressStep::StartingCalibration, 3))
+            }
+            OperationState::Cancelling | OperationState::Recovering => {
+                fixed(NativeAutotuneProgressStep::RestoringSettings, 96)
+            }
+            OperationState::ReviewReady | OperationState::Completed => {
+                fixed(NativeAutotuneProgressStep::ProposalsReady, 100)
+            }
+            OperationState::Cancelled | OperationState::Failed => return None,
+        })
     }
 
     fn result_job(&self, message: &ControlMessage) -> String {
@@ -5757,63 +6053,10 @@ impl CalibrationDaemon {
                 "the native Full Auto-Tune public result is not complete",
             );
         }
-        let Some(worker_run_id) = job.journal.worker_run_id.as_deref() else {
-            return error_response(
-                "result-identity-missing",
-                "the completed native Full Auto-Tune job has no worker identity",
-            );
-        };
-        let paths = match self
-            .journal_store
-            .native_job_paths(&job.journal.job_id, worker_run_id)
-        {
-            Ok(paths) => paths,
-            Err(error) => return error_response("result-path-invalid", &error),
-        };
-        let terminal = match full_autotune::read_terminal_file(&paths.terminal) {
-            Ok(terminal) => terminal,
-            Err(error) => return error_response("result-terminal-invalid", &error),
-        };
-        if terminal.job_id != job.journal.job_id || terminal.worker_run_id != worker_run_id {
-            return error_response(
-                "result-terminal-identity-mismatch",
-                "the native Full Auto-Tune terminal identity changed",
-            );
-        }
-        let review_digest = match terminal.terminal {
-            AutotuneTerminal::Complete { review_digest } => review_digest,
-            _ => {
-                return error_response(
-                    "result-terminal-incomplete",
-                    "the native Full Auto-Tune terminal has no complete Review",
-                )
-            }
-        };
-        let canonical = match full_autotune::canonical_native_public_result_transaction(
-            &paths.request,
-            &paths.review,
-            &paths.apply_manifest,
-            &job.journal.job_id,
-            worker_run_id,
-            &review_digest,
-            &job.journal.boot_id,
-            &job.journal.coordinator_generation,
-        ) {
+        match verified_native_autotune_public_result(&self.state_dir, &job.request, &job.journal) {
             Ok(result) => result,
-            Err(error) => return error_response("result-verification-failed", &error),
-        };
-        let stored =
-            match rating::read_private_bounded(&paths.public_result, MAX_RESULT_RESPONSE_BYTES) {
-                Ok(result) => result,
-                Err(error) => return error_response("result-publication-missing", &error),
-            };
-        if stored.as_bytes() != canonical {
-            return error_response(
-                "result-publication-mismatch",
-                "the published native Full Auto-Tune result differs from canonical evidence",
-            );
+            Err(error) => error_response("result-verification-failed", &error),
         }
-        stored
     }
 
     fn cancel_job(&mut self, message: &ControlMessage) -> String {
@@ -6977,6 +7220,15 @@ fn job_response(job: &ScannedJob, idempotent: bool) -> String {
 }
 
 fn job_status_response(job: &ScannedJob, idempotent: bool, diagnostic: Option<&str>) -> String {
+    job_status_response_with_progress(job, idempotent, diagnostic, None)
+}
+
+fn job_status_response_with_progress(
+    job: &ScannedJob,
+    idempotent: bool,
+    diagnostic: Option<&str>,
+    progress: Option<&full_autotune::NativeAutotuneProgress>,
+) -> String {
     let prefix = format!(
         "{{\"state\":\"{}\",\"job_id\":\"{}\",\"operation\":\"{}\",\"instance\":\"{}\",\"sequence\":{},\"idempotent\":{},\"runtime_mutated\":{},\"recovery_required\":{}",
         job.journal.state.as_str(),
@@ -6988,9 +7240,36 @@ fn job_status_response(job: &ScannedJob, idempotent: bool, diagnostic: Option<&s
         bool_json(job.journal.runtime_mutated),
         bool_json(job.journal.recovery_required),
     );
+    let progress = progress.map_or_else(String::new, |progress| {
+        format!(
+            concat!(
+                ",\"progress_schema_version\":1,",
+                "\"progress_percent\":{},\"progress_step\":\"{}\",",
+                "\"progress_stage_index\":{},\"progress_stage_total\":{},",
+                "\"progress_completed_units\":{},\"progress_total_units\":{},",
+                "\"progress_direction\":{},\"progress_attempt\":{}"
+            ),
+            progress.progress_percent,
+            progress.step.as_str(),
+            progress.stage_index,
+            progress.stage_total,
+            progress.completed_units,
+            progress.total_units,
+            progress.direction.map_or_else(
+                || "null".to_string(),
+                |direction| format!("\"{}\"", direction.as_str())
+            ),
+            progress
+                .attempt
+                .map_or_else(|| "null".to_string(), |attempt| attempt.to_string()),
+        )
+    });
     match diagnostic {
-        Some(value) => format!("{prefix},\"diagnostic\":\"{}\"}}\n", json_escape(value)),
-        None => format!("{prefix}}}\n"),
+        Some(value) => format!(
+            "{prefix}{progress},\"diagnostic\":\"{}\"}}\n",
+            json_escape(value)
+        ),
+        None => format!("{prefix}{progress}}}\n"),
     }
 }
 
@@ -7003,12 +7282,32 @@ fn error_response(code: &str, message: &str) -> String {
 }
 
 fn rating_public_result_response(job_id: &str, result: &rating::RatingResultSnapshot) -> String {
+    if result.partial
+        || result.incomplete
+        || result.grade.is_empty()
+        || result.grade == "LEARNING"
+        || result.dl_grade.is_empty()
+        || result.ul_grade.is_empty()
+        || result.dl_samples == 0
+        || result.ul_samples == 0
+    {
+        return error_response(
+            "result-terminal-incomplete",
+            "the Rating result is not a complete two-direction measurement",
+        );
+    }
     format!(
         concat!(
             "{{\"state\":\"complete\",\"job_id\":\"{}\",",
             "\"grade\":\"{}\",\"increase_ms\":{},",
             "\"dl_grade\":\"{}\",\"ul_grade\":\"{}\",",
             "\"dl_samples\":{},\"ul_samples\":{},",
+            "\"partial\":false,\"incomplete\":false,",
+            "\"rating_method\":\"{}\",",
+            "\"evidence_source\":\"worst_of_icmp_and_transport\",",
+            "\"icmp_basis\":\"controller_reflector_adaptive_baseline\",",
+            "\"transport_basis\":\"endpoint_loaded_p90_minus_idle_p5\",",
+            "\"confidence\":\"high\",",
             "\"limits_changed\":false}}\n"
         ),
         json_escape(job_id),
@@ -7018,6 +7317,7 @@ fn rating_public_result_response(job_id: &str, result: &rating::RatingResultSnap
         json_escape(&result.ul_grade),
         result.dl_samples,
         result.ul_samples,
+        rating::RATING_EVIDENCE_CONTRACT,
     )
 }
 
@@ -7170,7 +7470,7 @@ mod tests {
     use crate::operations::lease::LeaseKey;
     use crate::operations::protocol::{
         CalibrationStrategy, OperationIdentity, OperationKind, OperationOrigin, OperationRequest,
-        OperationRouteIdentity, OperationRouteMode,
+        OperationRouteIdentity, OperationRouteMode, OperationState,
     };
     use crate::operations::scheduler::{
         BudgetLedger, FailedAttemptFence, ScheduleCursor, SchedulerInstanceState,
@@ -8343,10 +8643,11 @@ mod tests {
         let raw_policy = full_autotune::native_autotune_runtime_permit_policy(&full_raw).unwrap();
         assert_eq!(
             raw_policy.maximum_sequence,
-            // Three raw controls, up to three confirmed-pair controls, and at most two
+            // Three raw controls, one explicit-mobile terminal download-bypass
+            // control, up to three confirmed-pair controls, and at most two
             // topology-repeat controls per direction surround the bounded
             // independent DL/UL searches.
-            7 + crate::autotune::MAX_PROFILE_REVIEW_OPTIONS as u32
+            8 + crate::autotune::MAX_PROFILE_REVIEW_OPTIONS as u32
                 + (crate::autotune::MAX_PROFILE_SEARCH_OBSERVATIONS * 2) as u32
                 + full_autotune::MAX_RUNTIME_ROUTE_REARMS
         );
@@ -8821,6 +9122,8 @@ mod tests {
             baseline_samples: 20,
             baseline_required_samples: 20,
             required_samples: 20,
+            evidence_contract:
+                rating::RatingEvidenceContract::WorstOfDirectionBoundIcmpAndTransport,
             dl_samples: 20,
             ul_samples: 20,
             dl_achieved_kbps: 80_000.0,
@@ -10516,13 +10819,21 @@ mod tests {
         let mut legacy = snapshot.clone();
         legacy.download_qdisc_kind = None;
         legacy.upload_qdisc_kind = None;
-        let legacy_v3 = legacy
-            .encode()
-            .unwrap()
+        let current = legacy.encode().unwrap();
+        assert!(current.starts_with("cake-autorate-rating-runtime\t5\n"));
+        assert!(current.contains(&format!(
+            "evidence_contract={}\n",
+            rating::RATING_EVIDENCE_CONTRACT
+        )));
+        let legacy_v3 = current
             .replacen(
-                "cake-autorate-rating-runtime\t4",
+                "cake-autorate-rating-runtime\t5",
                 "cake-autorate-rating-runtime\t3",
                 1,
+            )
+            .replace(
+                &format!("evidence_contract={}\n", rating::RATING_EVIDENCE_CONTRACT),
+                "",
             )
             .replace("download_qdisc_kind=\n", "")
             .replace("upload_qdisc_kind=\n", "");
@@ -10704,8 +11015,39 @@ mod tests {
         assert!(response.contains("\"increase_ms\":4.25"));
         assert!(response.contains("\"dl_samples\":24"));
         assert!(response.contains("\"ul_samples\":21"));
+        assert!(response.contains("\"partial\":false"));
+        assert!(response.contains("\"incomplete\":false"));
+        assert!(response.contains(&format!(
+            "\"rating_method\":\"{}\"",
+            rating::RATING_EVIDENCE_CONTRACT
+        )));
+        assert!(response.contains("\"evidence_source\":\"worst_of_icmp_and_transport\""));
+        assert!(response.contains("\"icmp_basis\":\"controller_reflector_adaptive_baseline\""));
+        assert!(response.contains("\"transport_basis\":\"endpoint_loaded_p90_minus_idle_p5\""));
         assert!(response.contains("\"limits_changed\":false"));
         assert!(response.len() < MAX_RESPONSE_BYTES);
+
+        let mut partial = rating::RatingResultSnapshot {
+            grade: "A".to_string(),
+            increase_ms: 14.308,
+            started_unix_ms: 1_000,
+            partial: true,
+            incomplete: false,
+            dl_grade: String::new(),
+            ul_grade: "A".to_string(),
+            dl_samples: 0,
+            ul_samples: 28,
+        };
+        let rejected = rating_public_result_response(&"b".repeat(32), &partial);
+        assert!(rejected.contains("\"error_code\":\"result-terminal-incomplete\""));
+        assert!(!rejected.contains("\"state\":\"complete\""));
+
+        partial.partial = false;
+        partial.dl_grade = "A".to_string();
+        partial.dl_samples = 20;
+        partial.incomplete = true;
+        let rejected = rating_public_result_response(&"c".repeat(32), &partial);
+        assert!(rejected.contains("\"error_code\":\"result-terminal-incomplete\""));
     }
 
     #[test]
@@ -10937,6 +11279,155 @@ mod tests {
         assert!(scan_current_speedtest_operation(&state_dir, "wan")
             .unwrap()
             .is_none());
+
+        drop(daemon);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn current_autotune_scan_prefers_active_then_exact_inert_review() {
+        let state_dir = temp_path("current-autotune-scan");
+        let daemon = CalibrationDaemon::bind_with_admission(&state_dir, true).unwrap();
+
+        let mut review = operation_request('a', 'b', "wan");
+        review.created_unix_ms = 2;
+        let mut review_journal = JobJournal::queued(&review, &daemon.coordinator, true).unwrap();
+        review_journal.state = super::super::protocol::OperationState::ReviewReady;
+        review_journal.worker_run_id = Some("1".repeat(32));
+        review_journal.terminal_kind = Some("result".to_string());
+        review_journal.terminal_state = Some("complete".to_string());
+        review_journal.heavy_lease_acquired = false;
+        daemon
+            .journal_store
+            .create(&review, &review_journal)
+            .unwrap();
+
+        assert!(
+            scan_current_autotune_operation(&state_dir, "wan")
+                .unwrap()
+                .is_none(),
+            "a Review-shaped journal without canonical evidence must stay hidden"
+        );
+        let current = scan_current_autotune_operation_with_review_validator(
+            &state_dir,
+            "wan",
+            |operation, _| operation.identity.job_id == review.identity.job_id,
+        )
+        .unwrap()
+        .expect("a canonically validated inert Review must remain discoverable");
+        assert_eq!(current.identity.job_id, review.identity.job_id);
+
+        let mut active = operation_request('c', 'd', "wan");
+        active.created_unix_ms = 3;
+        let active_journal = JobJournal::queued(&active, &daemon.coordinator, true).unwrap();
+        daemon
+            .journal_store
+            .create(&active, &active_journal)
+            .unwrap();
+
+        let selected =
+            scan_current_autotune_operation_with_review_validator(&state_dir, "wan", |_, _| {
+                panic!("Review validation must not run while active work exists")
+            })
+            .unwrap()
+            .expect("an in-flight operation must take priority over an older Review");
+        assert_eq!(selected.identity.job_id, active.identity.job_id);
+
+        let mut foreign = mwan3_rating_operation('e', 'f', "wan");
+        foreign.created_unix_ms = 999;
+        let foreign_journal = JobJournal::queued(&foreign, &daemon.coordinator, true).unwrap();
+        daemon
+            .journal_store
+            .create(&foreign, &foreign_journal)
+            .unwrap();
+        assert_eq!(
+            scan_current_autotune_operation_with_review_validator(
+                &state_dir,
+                "wan",
+                |_, _| panic!("foreign work must not force Review validation"),
+            )
+            .unwrap()
+            .unwrap()
+            .identity
+            .job_id,
+            active.identity.job_id,
+            "a newer foreign operation kind must never become Auto-Tune authority"
+        );
+
+        fs::remove_dir_all(state_dir.join("jobs").join(&active.identity.job_id)).unwrap();
+        assert_eq!(
+            scan_current_autotune_operation_with_review_validator(
+                &state_dir,
+                "wan",
+                |operation, _| operation.identity.job_id == review.identity.job_id,
+            )
+            .unwrap()
+            .unwrap()
+            .identity
+            .job_id,
+            review.identity.job_id,
+            "the safe Review must become current again after the active job disappears"
+        );
+
+        let mut stale_review = operation_request('1', '2', "wan");
+        stale_review.created_unix_ms = 4;
+        let mut stale_journal =
+            JobJournal::queued(&stale_review, &daemon.coordinator, true).unwrap();
+        stale_journal.state = super::super::protocol::OperationState::ReviewReady;
+        stale_journal.worker_run_id = Some("2".repeat(32));
+        stale_journal.terminal_kind = Some("result".to_string());
+        stale_journal.terminal_state = Some("complete".to_string());
+        stale_journal.heavy_lease_acquired = false;
+        daemon
+            .journal_store
+            .create(&stale_review, &stale_journal)
+            .unwrap();
+        assert_eq!(
+            scan_current_autotune_operation_with_review_validator(
+                &state_dir,
+                "wan",
+                |operation, _| operation.identity.job_id == review.identity.job_id,
+            )
+            .unwrap()
+            .unwrap()
+            .identity
+            .job_id,
+            review.identity.job_id,
+            "a newer stale Review must not hide an older canonical Review"
+        );
+
+        let mut unsafe_review = operation_request('3', '4', "wan");
+        unsafe_review.created_unix_ms = 5;
+        let mut unsafe_journal =
+            JobJournal::queued(&unsafe_review, &daemon.coordinator, true).unwrap();
+        unsafe_journal.state = super::super::protocol::OperationState::ReviewReady;
+        unsafe_journal.worker_run_id = Some("2".repeat(32));
+        unsafe_journal.terminal_kind = Some("result".to_string());
+        unsafe_journal.terminal_state = Some("failed".to_string());
+        unsafe_journal.heavy_lease_acquired = false;
+        daemon
+            .journal_store
+            .create(&unsafe_review, &unsafe_journal)
+            .unwrap();
+        assert_eq!(
+            scan_current_autotune_operation_with_review_validator(
+                &state_dir,
+                "wan",
+                |operation, _| {
+                    assert_ne!(
+                        operation.identity.job_id, unsafe_review.identity.job_id,
+                        "an incomplete Review must be rejected before evidence replay"
+                    );
+                    operation.identity.job_id == review.identity.job_id
+                },
+            )
+            .unwrap()
+            .unwrap()
+            .identity
+            .job_id,
+            review.identity.job_id,
+            "a ReviewReady journal without exact result authority must remain hidden"
+        );
 
         drop(daemon);
         fs::remove_dir_all(state_dir).unwrap();
@@ -12164,6 +12655,122 @@ mod tests {
     }
 
     #[test]
+    fn startup_prunes_oldest_settled_history_without_disabling_admission() {
+        let dir = temp_path("settled-retention");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let coordinator = CoordinatorIdentity::current().unwrap();
+        let store = JournalStore::open(&dir, coordinator.clone()).unwrap();
+        for index in 0..=MAX_JOURNAL_JOBS {
+            let mut operation = operation_request('a', 'b', "wan");
+            operation.identity.job_id = format!("{index:032x}");
+            operation.identity.job_token = format!("{index:064x}");
+            operation.created_unix_ms = index as u64 + 1;
+            let mut journal = JobJournal::queued(&operation, &coordinator, true).unwrap();
+            store.create(&operation, &journal).unwrap();
+            journal.state = OperationState::Cancelled;
+            journal.sequence += 1;
+            store.update(&journal).unwrap();
+        }
+        drop(store);
+
+        let daemon = CalibrationDaemon::bind_with_admission(&dir, true).unwrap();
+        assert!(daemon.startup_issues.is_empty());
+        assert!(daemon.admission_available());
+        assert_eq!(daemon.jobs.len(), JOURNAL_RETENTION_TARGET);
+        assert_eq!(
+            daemon
+                .jobs
+                .iter()
+                .map(|job| job.request.created_unix_ms)
+                .min(),
+            Some(18)
+        );
+        assert_eq!(
+            fs::read_dir(dir.join("jobs")).unwrap().count(),
+            JOURNAL_RETENTION_TARGET
+        );
+        drop(daemon);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn partial_retirement_failure_keeps_memory_aligned_and_retries_cleanly() {
+        let dir = temp_path("partial-settled-retention");
+        let mut daemon = CalibrationDaemon::bind_with_admission(&dir, true).unwrap();
+        for index in 0..(JOURNAL_RETENTION_TARGET + 2) {
+            let mut operation = operation_request('a', 'b', "wan");
+            operation.identity.job_id = format!("{index:032x}");
+            operation.identity.job_token = format!("{index:064x}");
+            operation.created_unix_ms = index as u64 + 1;
+            let mut journal = JobJournal::queued(&operation, &daemon.coordinator, true).unwrap();
+            daemon.journal_store.create(&operation, &journal).unwrap();
+            journal.state = OperationState::Cancelled;
+            journal.sequence += 1;
+            daemon.journal_store.update(&journal).unwrap();
+            daemon.jobs.push(ScannedJob {
+                request: operation,
+                journal,
+                disposition: JournalDisposition::Settled,
+            });
+        }
+        let first = format!("{:032x}", 0);
+        let second = format!("{:032x}", 1);
+        let second_dir = dir.join("jobs").join(&second);
+        fs::set_permissions(&second_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(daemon.prune_settled_history().is_err());
+        assert!(!daemon.jobs.iter().any(|job| job.journal.job_id == first));
+        assert!(daemon.jobs.iter().any(|job| job.journal.job_id == second));
+        assert!(!dir.join("jobs").join(first).exists());
+        assert!(second_dir.exists());
+
+        fs::set_permissions(&second_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(daemon.prune_settled_history().unwrap(), 1);
+        assert_eq!(daemon.jobs.len(), JOURNAL_RETENTION_TARGET);
+        assert!(daemon.admission_available());
+        drop(daemon);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn start_prunes_old_history_before_publishing_the_new_job() {
+        let dir = temp_path("start-settled-retention");
+        let mut daemon = CalibrationDaemon::bind_with_admission(&dir, true).unwrap();
+        daemon.native_autotune = true;
+        for index in 0..=JOURNAL_RETENTION_TARGET {
+            let mut operation = operation_request('a', 'b', "wan");
+            operation.identity.job_id = format!("{index:032x}");
+            operation.identity.job_token = format!("{index:064x}");
+            operation.created_unix_ms = index as u64 + 1;
+            let mut journal = JobJournal::queued(&operation, &daemon.coordinator, true).unwrap();
+            daemon.journal_store.create(&operation, &journal).unwrap();
+            journal.state = OperationState::Cancelled;
+            journal.sequence += 1;
+            daemon.journal_store.update(&journal).unwrap();
+            daemon.jobs.push(ScannedJob {
+                request: operation,
+                journal,
+                disposition: JournalDisposition::Settled,
+            });
+        }
+        let new_job = operation_request('f', 'e', "wan");
+        let response = daemon.handle(&job_message(ControlCommand::Start, &new_job));
+        assert!(response.contains("\"state\":\"queued\""));
+        assert_eq!(daemon.jobs.len(), JOURNAL_RETENTION_TARGET + 1);
+        assert!(!daemon
+            .jobs
+            .iter()
+            .any(|job| job.journal.job_id == format!("{:032x}", 0)));
+        assert!(daemon
+            .jobs
+            .iter()
+            .any(|job| job.journal.job_id == new_job.identity.job_id));
+        drop(daemon);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn daemon_answers_bounded_ping_and_summary() {
         let dir = temp_path("ping");
         let thread = serve_one(CalibrationDaemon::bind(&dir).unwrap());
@@ -12240,7 +12847,7 @@ mod tests {
         );
         daemon.jobs[0].journal.state = super::super::protocol::OperationState::ReviewReady;
         let review_ready = daemon.handle(&job_message(ControlCommand::Result, &operation));
-        assert!(review_ready.contains("\"error_code\":\"result-identity-missing\""));
+        assert!(review_ready.contains("\"error_code\":\"result-verification-failed\""));
         assert!(!review_ready.contains("\"error_code\":\"result-not-ready\""));
 
         drop(daemon);

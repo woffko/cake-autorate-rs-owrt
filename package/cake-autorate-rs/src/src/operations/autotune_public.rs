@@ -11,8 +11,9 @@ use super::sqm_identity;
 
 pub(crate) const NATIVE_PUBLIC_RESULT_SCHEMA_VERSION: u8 = 3;
 pub(crate) const NATIVE_RAW_FALLBACK_PUBLIC_RESULT_SCHEMA_VERSION: u8 = 4;
+pub(crate) const NATIVE_DIRECTIONAL_RAW_FALLBACK_PUBLIC_RESULT_SCHEMA_VERSION: u8 = 5;
 pub(crate) const NATIVE_PUBLIC_RESULT_MAX_SCHEMA_VERSION: u8 =
-    NATIVE_RAW_FALLBACK_PUBLIC_RESULT_SCHEMA_VERSION;
+    NATIVE_DIRECTIONAL_RAW_FALLBACK_PUBLIC_RESULT_SCHEMA_VERSION;
 const NATIVE_PUBLIC_APPLY_CONTRACT_SCHEMA_VERSION: u8 = 3;
 const NATIVE_PUBLIC_RESULT_PRODUCER: &str = "cake-autorated-native-autotune";
 const MAX_NATIVE_PUBLIC_RESULT_BYTES: usize = 256 * 1024;
@@ -232,17 +233,60 @@ pub(crate) fn canonical_native_public_result_bytes(
             .zip(raw_fallback)
             .all(|(artifact, kind)| artifact.kind == kind)
     {
-        if input.apply_confirmations.len() != 1
-            || input.apply_confirmations[0].action != "disable_sqm"
-            || input.apply_confirmations[0].sqm_direction_mode != "off"
-            || input.apply_confirmations[0].auto_apply_evidence_pass
-            || !input.apply_confirmations[0].manual_review_required
+        let preferred = input
+            .apply_confirmations
+            .iter()
+            .find(|confirmation| confirmation.preferred)
+            .ok_or_else(|| "native public raw fallback has no preferred option".to_string())?;
+        if preferred.option_id != "no_sqm"
+            || preferred.selected_topology != "no_sqm"
+            || preferred.action != "disable_sqm"
+            || preferred.sqm_direction_mode != "off"
+            || preferred.auto_apply_evidence_pass
+            || !preferred.manual_review_required
         {
             return Err(
-                "native public raw fallback is not a unique manual SQM-off option".to_string(),
+                "native public raw fallback has no exact manual SQM-off preference".to_string(),
             );
         }
-        NATIVE_RAW_FALLBACK_PUBLIC_RESULT_SCHEMA_VERSION
+        match input.apply_confirmations.len() {
+            1 => NATIVE_RAW_FALLBACK_PUBLIC_RESULT_SCHEMA_VERSION,
+            2 => {
+                let directional = input
+                    .apply_confirmations
+                    .iter()
+                    .find(|confirmation| !confirmation.preferred)
+                    .ok_or_else(|| {
+                        "native public directional raw fallback has no secondary option".to_string()
+                    })?;
+                if directional.option_id != "bypass_download"
+                    || directional.selected_topology != "upload_only_shaped"
+                    || directional.action != "apply_sqm"
+                    || directional.sqm_direction_mode != "upload_only"
+                    || directional.auto_apply_evidence_pass
+                    || !directional.manual_review_required
+                    || directional.download_kbps.is_some()
+                    || directional.upload_kbps.is_none()
+                    || !directional
+                        .required_acknowledgements
+                        .contains(&NativeApplyAcknowledgement::DownloadShapingBypassed)
+                    || directional
+                        .required_acknowledgements
+                        .contains(&NativeApplyAcknowledgement::UploadShapingBypassed)
+                    || directional
+                        .required_acknowledgements
+                        .contains(&NativeApplyAcknowledgement::SqmDisabled)
+                {
+                    return Err(
+                        "native public directional raw fallback option is invalid".to_string()
+                    );
+                }
+                NATIVE_DIRECTIONAL_RAW_FALLBACK_PUBLIC_RESULT_SCHEMA_VERSION
+            }
+            _ => {
+                return Err("native public raw fallback has an unsupported option count".to_string())
+            }
+        }
     } else {
         return Err("native public result has an unsupported Review artifact set".to_string());
     };

@@ -1573,14 +1573,14 @@ function parseExecJson(res) {
 	var failed = !isFinite(code) || code !== 0;
 
 	if (failed)
-		throw new Error(stderr || _('Native command failed without a usable diagnostic.'));
+		throw new Error(stderr || _('The calibration service failed without a usable diagnostic.'));
 	if (!stdout)
-		throw new Error(stderr || _('Native command returned no JSON result.'));
+		throw new Error(stderr || _('The calibration service returned no JSON result.'));
 
 	try {
 		return JSON.parse(stdout);
 	} catch (error) {
-		throw new Error(stderr || _('Native command returned malformed JSON.'));
+		throw new Error(stderr || _('The calibration service returned malformed JSON.'));
 	}
 }
 
@@ -1591,6 +1591,20 @@ function withRpcTimeout(minimum, callback) {
 
 	if (isNaN(timeout) || timeout < minimum)
 		rpcEnv.rpctimeout = minimum;
+
+	return Promise.resolve().then(callback).then(function(result) {
+		rpcEnv.rpctimeout = previous;
+		return result;
+	}, function(err) {
+		rpcEnv.rpctimeout = previous;
+		throw err;
+	});
+}
+
+function withExactRpcTimeout(timeout, callback) {
+	var rpcEnv = L.env || (L.env = {});
+	var previous = rpcEnv.rpctimeout;
+	rpcEnv.rpctimeout = timeout;
 
 	return Promise.resolve().then(callback).then(function(result) {
 		rpcEnv.rpctimeout = previous;
@@ -1616,12 +1630,14 @@ var AUTOTUNE_RECOVERY_MAX_DELAY_MS = 5000;
 var AUTOTUNE_RESULT_SCHEMA_VERSION = 8;
 var AUTOTUNE_RESULT_PRODUCER = 'cake-autorate-rs-autotune';
 /* Highest public result schema advertised by the native coordinator. */
-var NATIVE_AUTOTUNE_PUBLIC_SCHEMA_VERSION = 4;
+var NATIVE_AUTOTUNE_PUBLIC_SCHEMA_VERSION = 5;
 var NATIVE_AUTOTUNE_APPLY_CONTRACT_SCHEMA_VERSION = 3;
 var NATIVE_AUTOTUNE_PUBLIC_PRODUCER = 'cake-autorated-native-autotune';
 var NATIVE_AUTOTUNE_COMMAND = '/usr/sbin/cake-autorated';
 var NATIVE_AUTOTUNE_PROTOCOL_VERSION = 2;
 var NATIVE_AUTOTUNE_INTERACTIVE_TRAFFIC_BUDGET_BYTES = 32000000000;
+var NATIVE_AUTOTUNE_APPLY_FIRST_RPC_TIMEOUT_S = 30;
+var NATIVE_AUTOTUNE_APPLY_RETRY_RPC_TIMEOUT_S = 180;
 var nativeAutotuneJobs = {};
 var legacyAutotuneJobs = {};
 var autotuneTransportModes = {};
@@ -1863,7 +1879,7 @@ function nativeAutotuneTopologyTransportValidated(topology) {
 		(topology.auto_apply_pass === false && topology.manual_review_required === true);
 }
 
-function nativeAutotuneRawFallbackValidated(raw, option) {
+function nativeAutotuneRawFallbackValidated(raw, option, directionalOption) {
 	var commonRawFields = [ 'schema_version', 'selected_topology', 'reason',
 		'failed_direction',
 		'discarded_shaped_observation_count', 'target_grade', 'auto_apply_pass',
@@ -1878,6 +1894,84 @@ function nativeAutotuneRawFallbackValidated(raw, option) {
 	var grades = { 'A+': true, A: true, B: true, C: true, D: true, F: true };
 	var digestAck = function(values) {
 		return Array.isArray(values) && values.join('\n');
+	};
+	var scalarMeasurement = function(value, upload) {
+		var fields = upload ? [ 'achieved_kbps', 'realized_kbps', 'effective_delta_ms',
+			'candidate_realization_percent', 'capacity_retention_percent', 'loss_ppm',
+			'background_confidence_percent', 'contaminated', 'transport_censored',
+			'capacity_alignment_confirmed' ] : [ 'achieved_kbps', 'effective_delta_ms',
+			'loss_ppm', 'background_confidence_percent', 'contaminated',
+			'transport_censored' ];
+		if (!value || typeof value !== 'object' || Array.isArray(value) ||
+		    Object.keys(value).sort().join(',') !== fields.slice().sort().join(',') ||
+		    !Number.isSafeInteger(value.achieved_kbps) || value.achieved_kbps < 1 ||
+		    typeof value.effective_delta_ms !== 'number' ||
+		    !Number.isFinite(value.effective_delta_ms) || value.effective_delta_ms < 0 ||
+		    !Number.isSafeInteger(value.loss_ppm) || value.loss_ppm < 0 ||
+		    !Number.isSafeInteger(value.background_confidence_percent) ||
+		    value.background_confidence_percent < 0 ||
+		    value.background_confidence_percent > 100 ||
+		    typeof value.contaminated !== 'boolean' ||
+		    typeof value.transport_censored !== 'boolean')
+			return false;
+		return !upload || (Number.isSafeInteger(value.realized_kbps) && value.realized_kbps >= 1 &&
+			typeof value.candidate_realization_percent === 'number' &&
+			Number.isFinite(value.candidate_realization_percent) &&
+			value.candidate_realization_percent >= 0 &&
+			typeof value.capacity_retention_percent === 'number' &&
+			Number.isFinite(value.capacity_retention_percent) &&
+			value.capacity_retention_percent >= 0 &&
+			typeof value.capacity_alignment_confirmed === 'boolean');
+	};
+	var mobileBypassValidated = function(value, directionalOption) {
+		if (!value || typeof value !== 'object' || Array.isArray(value) ||
+		    value.selected_topology !== 'upload_only_shaped' ||
+		    typeof value.available !== 'boolean')
+			return false;
+		if (value.available === false) {
+			var unavailableFields = [ 'available', 'selected_topology', 'candidate_ul_kbps',
+				'failed_direction', 'reason', 'run_count', 'debit_count', 'samples' ];
+			var samples = value.samples;
+			return directionalOption == null &&
+				Object.keys(value).sort().join(',') === unavailableFields.sort().join(',') &&
+				Number.isSafeInteger(value.candidate_ul_kbps) && value.candidate_ul_kbps >= 100 &&
+				(value.failed_direction === 'download' || value.failed_direction === 'upload') &&
+				[ 'traffic_budget', 'observation_starved', 'transfer_unmeasurable' ].indexOf(value.reason) >= 0 &&
+				Number.isSafeInteger(value.run_count) && value.run_count >= 0 && value.run_count <= 3 &&
+				Number.isSafeInteger(value.debit_count) && value.debit_count >= value.run_count &&
+				samples && typeof samples === 'object' && !Array.isArray(samples) &&
+				Object.keys(samples).sort().join(',') === 'cpu,icmp,transport' &&
+				[ samples.icmp, samples.transport, samples.cpu ].every(function(sample) {
+					return Number.isSafeInteger(sample) && sample >= 0;
+				});
+		}
+		var confirmedFields = [ 'available', 'selected_topology', 'selected_ul_kbps',
+			'runtime_minimum_ul_kbps', 'download', 'upload', 'manual_apply_eligible',
+			'required_acknowledgements' ];
+		if (Object.keys(value).sort().join(',') !== confirmedFields.sort().join(',') ||
+		    !Number.isSafeInteger(value.selected_ul_kbps) || value.selected_ul_kbps < 100 ||
+		    value.runtime_minimum_ul_kbps !== null &&
+			(!Number.isSafeInteger(value.runtime_minimum_ul_kbps) ||
+			 value.runtime_minimum_ul_kbps < 100 ||
+			 value.runtime_minimum_ul_kbps > value.selected_ul_kbps) ||
+		    !scalarMeasurement(value.download, false) || !scalarMeasurement(value.upload, true) ||
+		    typeof value.manual_apply_eligible !== 'boolean' ||
+		    !Array.isArray(value.required_acknowledgements) ||
+		    value.required_acknowledgements.length < 1 ||
+		    value.required_acknowledgements.length > 24 ||
+		    value.required_acknowledgements.indexOf('download-shaping-bypassed') < 0 ||
+		    value.required_acknowledgements.indexOf('upload-shaping-bypassed') >= 0 ||
+		    value.required_acknowledgements.indexOf('sqm-disabled') >= 0)
+			return false;
+		for (var i = 0; i < value.required_acknowledgements.length; i++)
+			if (!NATIVE_AUTOTUNE_ACKNOWLEDGEMENT_CODES[value.required_acknowledgements[i]] ||
+			    value.required_acknowledgements.indexOf(value.required_acknowledgements[i]) !== i)
+				return false;
+		return value.manual_apply_eligible === (directionalOption != null) &&
+			(!directionalOption ||
+			 (directionalOption.target_rates_kbps.upload === value.selected_ul_kbps &&
+			  digestAck(directionalOption.required_acknowledgements) ===
+				digestAck(value.required_acknowledgements)));
 	};
 	var directionValidated = function(value, direction, topologies) {
 		if (!value || typeof value !== 'object' || Array.isArray(value) ||
@@ -1967,6 +2061,50 @@ function nativeAutotuneRawFallbackValidated(raw, option) {
 		    v3Boundary.candidate_count < 1 || v3Boundary.candidate_count > 3)
 			return false;
 	}
+	else if (raw.schema_version === 4) {
+		var v4Fields = commonRawFields.concat([ 'terminal_boundary' ]);
+		var v4Boundary = raw.terminal_boundary;
+		var v4Reasons = {
+			'variable-candidate-resource-safety-inconclusive': true,
+			'variable-candidate-realization-inconclusive': true,
+			'noisy-link-candidate-did-not-converge': true,
+			'nonmonotonic-variable-link-after-retries': true,
+			'queue-outside-cake-control-target-unmet': true,
+			'exploration-floor-reached-without-latency-knee': true,
+			'bounded-attempt-limit-before-latency-knee': true,
+			'variable-link-search-cannot-make-progress': true,
+			'repeated-candidate-realization-unreliable': true,
+			'low-candidate-realization-not-repeatable': true,
+			'unable-to-establish-controlled-shaper-candidate': true,
+			'resource-safety-failure-not-resolved': true,
+			'bounded-attempt-limit-without-safe-candidate': true,
+			'throughput-search-has-no-safe-candidate': true,
+			'profile-search-has-no-safe-candidate': true
+		};
+		if (Object.keys(raw).sort().join(',') !== v4Fields.sort().join(',') ||
+		    raw.reason !== 'shaped-search-inconclusive' ||
+		    (raw.failed_direction !== 'download' && raw.failed_direction !== 'upload') ||
+		    !v4Boundary || typeof v4Boundary !== 'object' || Array.isArray(v4Boundary) ||
+		    Object.keys(v4Boundary).sort().join(',') !== 'kind,observation_count,optimizer_reason' ||
+		    v4Boundary.kind !== 'shaped_search_inconclusive' ||
+		    !Number.isSafeInteger(v4Boundary.observation_count) ||
+		    v4Boundary.observation_count < 1 || v4Boundary.observation_count > 12 ||
+		    !v4Reasons[v4Boundary.optimizer_reason])
+			return false;
+	}
+	else if (raw.schema_version === 5) {
+		var v5Fields = commonRawFields.concat([ 'terminal_boundary', 'mobile_download_bypass' ]);
+		var v5Boundary = raw.terminal_boundary;
+		if (Object.keys(raw).sort().join(',') !== v5Fields.sort().join(',') ||
+		    raw.reason !== 'shaped-pair-options-exhausted' || raw.failed_direction !== null ||
+		    !v5Boundary || typeof v5Boundary !== 'object' || Array.isArray(v5Boundary) ||
+		    Object.keys(v5Boundary).sort().join(',') !== 'candidate_count,kind' ||
+		    v5Boundary.kind !== 'pair_options_exhausted' ||
+		    !Number.isSafeInteger(v5Boundary.candidate_count) ||
+		    v5Boundary.candidate_count < 1 || v5Boundary.candidate_count > 3 ||
+		    !mobileBypassValidated(raw.mobile_download_bypass, directionalOption || null))
+			return false;
+	}
 	else {
 		return false;
 	}
@@ -1984,7 +2122,8 @@ function nativeAutotuneRawFallbackValidated(raw, option) {
 }
 
 function nativeAutotunePublicResultValidated(result) {
-	var rawPublicResult = result && result.native_public_schema_version === 4;
+	var rawPublicResult = result &&
+		(result.native_public_schema_version === 4 || result.native_public_schema_version === 5);
 	var artifactNames = rawPublicResult ? [ 'proposal', 'raw_fallback' ] :
 		[ 'proposal', 'download_search', 'upload_search',
 			'pair_confirmation', 'topology_comparison' ];
@@ -2003,6 +2142,7 @@ function nativeAutotunePublicResultValidated(result) {
 	var digest = /^[0-9a-f]{64}$/;
 
 	if (!result || (result.native_public_schema_version !== 3 &&
+	    result.native_public_schema_version !== 4 &&
 	    result.native_public_schema_version !== NATIVE_AUTOTUNE_PUBLIC_SCHEMA_VERSION) ||
 	    result.state !== 'review_ready' || result.producer !== NATIVE_AUTOTUNE_PUBLIC_PRODUCER ||
 	    !digest.test(result.source_review_sha256 || '') ||
@@ -2046,7 +2186,7 @@ function nativeAutotunePublicResultValidated(result) {
 		    !artifact.value || typeof artifact.value !== 'object' ||
 		    Array.isArray(artifact.value) ||
 		    (rawPublicResult && artifactNames[i] === 'raw_fallback' ?
-			    [ 1, 2, 3 ].indexOf(artifact.value.schema_version) < 0 :
+			    [ 1, 2, 3, 4, 5 ].indexOf(artifact.value.schema_version) < 0 :
 			    artifact.value.schema_version !== artifactSchemas[i]))
 			return false;
 	}
@@ -2054,15 +2194,56 @@ function nativeAutotunePublicResultValidated(result) {
 	if (canonicalAutotuneProfile(proposal.profile) !== canonicalAutotuneProfile(result.profile))
 		return false;
 	if (rawPublicResult) {
-		var rawOption = contract.options.length === 1 ? contract.options[0] : null;
+		var rawContractOptionValidated = function(option) {
+			if (!option || typeof option !== 'object' || Array.isArray(option) ||
+			    Object.keys(option).sort().join(',') !== optionFields.slice().sort().join(',') ||
+			    !optionId.test(option.option_id || '') || !digest.test(option.manifest_sha256 || '') ||
+			    typeof option.preferred !== 'boolean' ||
+			    option.auto_apply_evidence_pass !== false ||
+			    option.manual_review_required !== true ||
+			    !Array.isArray(option.required_acknowledgements) ||
+			    option.required_acknowledgements.length < 1 ||
+			    option.required_acknowledgements.length > 24)
+				return false;
+			for (var index = 0; index < option.required_acknowledgements.length; index++) {
+				var acknowledgement = option.required_acknowledgements[index];
+				if (!NATIVE_AUTOTUNE_ACKNOWLEDGEMENT_CODES[acknowledgement] ||
+				    option.required_acknowledgements.indexOf(acknowledgement) !== index)
+					return false;
+			}
+			return true;
+		};
+		var rawOption = contract.options.filter(function(option) {
+			return option && option.option_id === 'no_sqm';
+		})[0] || null;
+		var directionalOption = contract.options.filter(function(option) {
+			return option && option.option_id === 'bypass_download';
+		})[0] || null;
 		var rawRates = rawOption && rawOption.target_rates_kbps;
-		return !!rawOption && rawOption.option_id === 'no_sqm' && rawOption.preferred === true &&
+		var directionalRates = directionalOption && directionalOption.target_rates_kbps;
+		var exactOptionCount = result.native_public_schema_version === 5 ? 2 : 1;
+		return contract.options.length === exactOptionCount &&
+			(result.native_public_schema_version !== 5 ||
+			 artifacts.raw_fallback.value.schema_version === 5) &&
+			rawContractOptionValidated(rawOption) &&
+			rawOption.option_id === 'no_sqm' && rawOption.preferred === true &&
 			rawOption.selected_topology === 'no_sqm' && rawOption.action === 'disable_sqm' &&
 			rawOption.sqm_direction_mode === 'off' && rawOption.auto_apply_evidence_pass === false &&
 			rawOption.manual_review_required === true && rawRates &&
 			Object.keys(rawRates).sort().join(',') === 'download,upload' &&
 			rawRates.download === null && rawRates.upload === null &&
-			nativeAutotuneRawFallbackValidated(artifacts.raw_fallback.value, rawOption);
+			(result.native_public_schema_version === 4 ? directionalOption == null :
+			 rawContractOptionValidated(directionalOption) && directionalOption.preferred === false &&
+			 directionalOption.selected_topology === 'upload_only_shaped' &&
+			 directionalOption.action === 'apply_sqm' &&
+			 directionalOption.sqm_direction_mode === 'upload_only' &&
+			 directionalOption.auto_apply_evidence_pass === false &&
+			 directionalOption.manual_review_required === true && directionalRates &&
+			 Object.keys(directionalRates).sort().join(',') === 'download,upload' &&
+			 directionalRates.download === null &&
+			 Number.isSafeInteger(directionalRates.upload) && directionalRates.upload >= 100) &&
+			nativeAutotuneRawFallbackValidated(
+				artifacts.raw_fallback.value, rawOption, directionalOption);
 	}
 	var download = artifacts.download_search.value;
 	var upload = artifacts.upload_search.value;
@@ -2136,6 +2317,13 @@ function nativeAutotunePublicResultValidated(result) {
 				return false;
 			seenAcknowledgements[acknowledgement] = true;
 		}
+		if ((option.selected_topology === 'upload_only_shaped') !==
+		    (seenAcknowledgements['download-shaping-bypassed'] === true) ||
+		    (option.selected_topology === 'download_only_shaped') !==
+		    (seenAcknowledgements['upload-shaping-bypassed'] === true) ||
+		    (option.selected_topology === 'no_sqm') !==
+		    (seenAcknowledgements['sqm-disabled'] === true))
+			return false;
 		if ((seenAcknowledgements['topology-comparison-traffic-budget'] === true) !==
 		    topologyTrafficBudgetLimited)
 			return false;
@@ -2260,8 +2448,77 @@ function nativeAutotuneAcknowledgementLabel(code) {
 	}
 }
 
+function reloadAppliedUciPackages() {
+	if (typeof uci.unload === 'function') {
+		uci.unload('cake-autorate');
+		uci.unload('sqm');
+	}
+	return Promise.all([
+		uci.load('cake-autorate'),
+		L.resolveDefault(uci.load('sqm'), null)
+	]);
+}
+
+function reloadAppliedSettingsPage() {
+	return reloadAppliedUciPackages().then(function() {
+		window.location.reload();
+	}, function() {
+		/* Apply is already verified and must never be presented as failed merely
+		 * because LuCI could not rebuild its client-side UCI cache. */
+		window.location.reload();
+	});
+}
+
+function nativeMobileDownloadBypassRequested(proposal) {
+	var access = proposal && proposal.access || {};
+	return access.source === 'user_selected' &&
+		[ 'cellular', 'leo_satellite', 'geo_satellite', 'fixed_wireless' ]
+			.indexOf(access.medium) >= 0;
+}
+
+function nativeDownloadBypassUnavailableReason(topology, rawFallback) {
+	if (rawFallback) {
+		var mobile = rawFallback.mobile_download_bypass;
+		if (mobile && mobile.available === false) {
+			switch (mobile.reason) {
+			case 'traffic_budget':
+				return _('The remaining traffic allowance could not fund the final download-without-shaping and upload-shaped check. The full SQM-disabled result is still available.');
+			case 'observation_starved':
+				return _('The final mobile-link check ran, but did not collect enough latency or CPU samples for a safe download-bypass proposal.');
+			case 'transfer_unmeasurable':
+				return _('The final mobile-link transfer could not produce a trustworthy directional result, so download bypass is not offered.');
+			}
+		}
+		if (mobile && mobile.available === true && mobile.manual_apply_eligible === false)
+			return _('Download without shaping and upload with shaping were both measured, but the result failed the hard loss, rate-realization, or throughput safety checks. It remains diagnostic only.');
+		var rawReason = String(rawFallback.reason || 'missing-reason')
+			.replace(/[\x00-\x1f\x7f]/g, '?').slice(0, 80);
+		return _('Only the full SQM-disabled raw fallback was verified in this run (%s). A download-only bypass also needs a verified upload-shaped rate, so it cannot be applied safely.').format(rawReason);
+	}
+	var download = topology && topology.download || {};
+	switch (download.reason) {
+	case 'comparison-not-requested':
+		return _('This run did not measure download without shaping. Rerun with Full raw capacity to make this option reviewable.');
+	case 'traffic-budget-limited':
+		return _('The traffic budget could not fund enough download-without-shaping measurements. Rerun with a larger traffic allowance.');
+	case 'repeat-required':
+		return _('Download-without-shaping measurements disagreed and require another repeat before this option can be reviewed.');
+	case 'inconclusive-raw-evidence':
+		return _('Download-without-shaping evidence remained noisy or incomplete after the allowed repeats.');
+	case 'no-material-throughput-gain':
+		return _('Download without shaping did not provide a material throughput advantage in this run.');
+	case 'shaped-quality-preferred':
+		return _('The measured download-without-shaping result was worse than the shaped result.');
+	default:
+		var exactReason = String(download.reason || 'missing-reason')
+			.replace(/[\x00-\x1f\x7f]/g, '?').slice(0, 80);
+		return _('A verified download-without-shaping comparison is not available (%s).').format(exactReason);
+	}
+}
+
 function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 	var artifacts = result.artifacts;
+	var proposal = artifacts.proposal && artifacts.proposal.value;
 	var pair = artifacts.pair_confirmation && artifacts.pair_confirmation.value;
 	var topology = artifacts.topology_comparison && artifacts.topology_comparison.value;
 	var rawFallback = artifacts.raw_fallback && artifacts.raw_fallback.value;
@@ -2303,7 +2560,7 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 		}) || preferred;
 	};
 	var optionEvidence = function(option) {
-		if (disabledFallback && option.selected_topology === 'no_sqm') {
+		if (rawFallback && option.selected_topology === 'no_sqm') {
 			var rawDownload = rawFallback.download || {};
 			var rawUpload = rawFallback.upload || {};
 			var rawSamples = (rawDownload.samples || []).concat(rawUpload.samples || []);
@@ -2318,6 +2575,22 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 				})
 			};
 		}
+		if (rawFallback && option.option_id === 'bypass_download') {
+			var mobileBypass = rawFallback.mobile_download_bypass || {};
+			var bypassDownload = mobileBypass.download || {};
+			var bypassUpload = mobileBypass.upload || {};
+			var downloadGrade = autotuneGradeForDelta(bypassDownload.effective_delta_ms);
+			var uploadGrade = autotuneGradeForDelta(bypassUpload.effective_delta_ms);
+			return {
+				achieved: {
+					download: bypassDownload.achieved_kbps,
+					upload: bypassUpload.achieved_kbps
+				},
+				grade: _('%s / %s').format(downloadGrade || '-', uploadGrade || '-'),
+				transportCensored: bypassDownload.transport_censored === true ||
+					bypassUpload.transport_censored === true
+			};
+		}
 		var pairEvidence = pairOptions.find(function(candidate) {
 			return candidate.option_id === option.option_id;
 		});
@@ -2328,7 +2601,7 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 				transportCensored: pairEvidence.transport_censored === true
 			};
 		var directionValue = function(direction) {
-			var comparison = topology[direction] || {};
+			var comparison = topology && topology[direction] || {};
 			var choice = comparison.choice === 'unshaped' ? comparison.unshaped : comparison.shaped;
 			return choice || {};
 		};
@@ -2352,16 +2625,11 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 		if (state.receipt) {
 			root.className = 'alert-message success cake-autotune-native-review';
 			replaceNodeContent(root, [
-				E('strong', {}, state.receipt.state === 'already_applied' ?
-					_('Native Apply was already complete') : _('Native Apply completed')),
+			E('strong', {}, state.receipt.state === 'already_applied' ?
+					_('The selected settings were already applied') : _('Settings applied successfully')),
 				E('p', {}, disabledFallback ?
 					_('The digest-bound disabled instance was written and verified without starting a controller or creating an SQM queue. No LuCI UCI changes were staged.') :
-					_('The selected digest-bound option was written and the selected instance was restarted and verified. No LuCI UCI changes were staged.')),
-				E('button', {
-					'type': 'button',
-					'class': 'btn cbi-button cbi-button-action important',
-					'click': function() { window.location.reload(); }
-				}, _('Reload settings'))
+					_('The selected digest-bound option was written and the selected instance was restarted and verified. Refreshing the committed settings now...'))
 			]);
 			return;
 		}
@@ -2411,27 +2679,45 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 				E('small', { 'style': 'display:block;margin-top:5px' }, flags.join(' · '))
 			]);
 		});
+		var hasDownloadBypass = contract.options.some(function(candidate) {
+			return candidate.option_id === 'bypass_download';
+		});
+		if (nativeMobileDownloadBypassRequested(proposal) && !hasDownloadBypass) {
+			optionCards.push(E('div', {
+				'class': 'cake-autotune-native-option cake-autotune-native-option-unavailable',
+				'data-option-id': 'bypass_download_unavailable',
+				'aria-disabled': 'true',
+				'style': 'min-width:210px;flex:1 1 240px;padding:10px;border:2px dashed rgba(127,127,127,.4);border-radius:6px;opacity:.8'
+			}, [
+				E('strong', {}, _('Download without shaping')),
+				E('div', { 'style': 'margin-top:5px' }, _('Unavailable for this run')),
+				E('p', { 'style': 'margin:5px 0' }, nativeDownloadBypassUnavailableReason(
+					topology, disabledFallback ? rawFallback : null)),
+				E('small', {}, _('No untested rate or topology can be applied from this card.'))
+			]));
+		}
 
 		var acknowledgementNodes = required.length ? [
 			E('strong', {}, _('Confirm measured trade-offs for this option:')),
 			E('div', { 'style': 'display:flex;flex-direction:column;gap:7px;margin-top:7px' },
-				required.map(function(code) {
+				[ E('ul', { 'style': 'margin:0 0 4px 20px' }, required.map(function(code) {
+					return E('li', {}, [ nativeAutotuneAcknowledgementLabel(code),
+						E('small', { 'style': 'display:block;opacity:.75' }, code) ]);
+				})), (function() {
 					var checkbox = E('input', {
 						'type': 'checkbox',
-						'checked': accepted[code] ? 'checked' : null,
+						'checked': allAccepted ? 'checked' : null,
 						'disabled': state.pending ? 'disabled' : null,
 						'change': function() {
-							accepted[code] = checkbox.checked;
+							required.forEach(function(code) { accepted[code] = checkbox.checked; });
 							state.acknowledged[option.option_id] = accepted;
 							render();
 						}
 					});
 					return E('label', { 'style': 'display:flex;gap:8px;align-items:flex-start' }, [
-						checkbox,
-						E('span', {}, [ nativeAutotuneAcknowledgementLabel(code),
-							E('small', { 'style': 'display:block;opacity:.75' }, code) ])
+						checkbox, E('strong', {}, _('I accept all listed trade-offs.'))
 					]);
-				})
+				})() ]
 			)
 		] : [ E('span', {}, _('All automatic evidence gates passed; clicking Apply is still an explicit confirmation.')) ];
 
@@ -2448,7 +2734,7 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 					state.receipt = receipt;
 					if (typeof onApplied !== 'function') {
 						render();
-						return receipt;
+						return reloadAppliedSettingsPage().then(function() { return receipt; });
 					}
 					try {
 						return Promise.resolve(onApplied(receipt, option)).catch(function(error) {
@@ -2465,6 +2751,8 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 						return receipt;
 					}
 				}, function(error) {
+					if (error.nativeApplyReloadRequired)
+						return reloadAppliedSettingsPage();
 					state.pending = false;
 					state.error = error.message || String(error);
 					render();
@@ -2491,10 +2779,10 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 		}
 
 		var nodes = [
-			E('strong', {}, _('Native Rust Review · ready to apply')),
+			E('strong', {}, _('Full Auto-Tune Review · ready to apply')),
 			E('p', {}, disabledFallback ?
-				_('The shaped search could not produce an observable candidate. Rust preserved the verified raw controls and can create one disabled, uncalibrated instance. No rate is invented and SQM remains absent until you calibrate or configure it later.') :
-				_('The Rust calibration completed and restored runtime state. Every option is reconstructed from private evidence and bound to its own manifest; browser rate values are never Apply authority.')),
+				_('The shaped search could not produce an observable candidate. The verified raw controls were preserved and can create one disabled, uncalibrated instance. No rate is invented and SQM remains absent until you calibrate or configure it later.') :
+				_('Calibration completed and restored runtime state. Every option is reconstructed from private evidence and bound to its own manifest; browser rate values are never Apply authority.')),
 		];
 		if (selectedEvidence.transportCensored) {
 			nodes.push(E('div', {
@@ -2509,7 +2797,7 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 			nodes.push(E('div', {
 				'class': 'alert-message warning',
 				'style': 'margin:8px 0'
-			}, _('The conservative traffic budget could not safely fund another unshaped comparison for: %s. Rust did not infer a raw result: it kept the fully verified shaped proposal and restored runtime. Applying requires explicit confirmation; rerun Full raw with a larger traffic allowance if you want to retry the bypass comparison.').format(limitedDirectionLabels.join(', '))));
+			}, _('The conservative traffic budget could not safely fund another unshaped comparison for: %s. No raw result was inferred: the fully verified shaped proposal was kept and runtime was restored. Applying requires explicit confirmation; rerun Full raw with a larger traffic allowance if you want to retry the bypass comparison.').format(limitedDirectionLabels.join(', '))));
 		}
 		nodes.push(
 			E('div', { 'style': 'display:flex;flex-wrap:wrap;gap:8px;margin-top:8px' }, optionCards),
@@ -2829,7 +3117,7 @@ function nativeBootstrapCapacityControl(state, existingInstance, disabled, onCha
 	}, [
 		E('div', { 'class': 'alert-message warning', 'style': 'margin:0 0 10px' }, [
 			E('strong', {}, _('New-instance measurement authority. ')),
-			_('Enter the service-plan or other defensible hard maximum for both directions. Native Auto-Tune measures raw capacity first and derives every proposed rate from test evidence; these values only bound exploration and can never become measurements by themselves.')
+			_('Enter the service-plan or other defensible hard maximum for both directions. Full Auto-Tune measures raw capacity first and derives every proposed rate from test evidence; these values only bound exploration and can never become measurements by themselves.')
 		]),
 		wizardField(_('Download service cap'), dlCap, optionDescriptions.service_dl_cap_kbps),
 		wizardField(_('Upload service cap'), ulCap, optionDescriptions.service_ul_cap_kbps)
@@ -3429,7 +3717,7 @@ function runNativeSpeedtestJob(section_id, wan, onProgress, routeMode, mwan3Memb
 		if (started.error)
 			throw new Error(started.error);
 		if (!/^[0-9a-f]{32}$/.test(started.job_id || ''))
-			throw new Error(_('The native coordinator returned no valid Speed Test job ID.'));
+			throw new Error(_('The measurement service returned no valid Speed Test job ID.'));
 		publicJobId = started.job_id;
 
 		var poll = function() {
@@ -3438,7 +3726,7 @@ function runNativeSpeedtestJob(section_id, wan, onProgress, routeMode, mwan3Memb
 					[ '--calibrationctl', 'speedtest-status', publicJobId ], 3, 1000);
 			}).then(parseExecJson).then(function(status) {
 				if (status.job_id !== publicJobId)
-					throw new Error(_('The native coordinator changed the Speed Test job identity.'));
+					throw new Error(_('The measurement service changed the Speed Test job identity.'));
 				if ([ 'queued', 'starting', 'running', 'cancelling', 'recovering' ].indexOf(status.state) >= 0) {
 					if (onProgress)
 						onProgress(status);
@@ -3446,7 +3734,7 @@ function runNativeSpeedtestJob(section_id, wan, onProgress, routeMode, mwan3Memb
 				}
 				if (status.state !== 'completed')
 					throw new Error(status.diagnostic || status.error ||
-						_('Native Speed Test ended without a usable result.'));
+						_('Speed Test ended without a usable result.'));
 				return autotuneExecWithRetry(NATIVE_AUTOTUNE_COMMAND,
 					[ '--calibrationctl', 'speedtest-result', publicJobId ], 2, 1000)
 					.then(parseExecJson).then(function(result) {
@@ -3532,7 +3820,7 @@ function nativeAutotuneLaunchArgs(section_id, wan, backend, routeMode, mwan3Memb
 	var mode = routeMode || 'main';
 	var bootstrap = existingInstance !== true;
 	if (bootstrap && !/^[A-Za-z0-9_]+$/.test(plannedSqmSection || ''))
-		throw new Error(_('Native new-instance calibration requires an exact planned SQM section.'));
+		throw new Error(_('New-instance calibration requires an exact planned SQM section.'));
 	var args = [ '--calibrationctl', bootstrap ? 'autotune-bootstrap-start' : 'autotune-start' ];
 	if (bootstrap)
 		args.push(plannedSqmSection);
@@ -3562,17 +3850,70 @@ function nativeAutotuneLaunchArgs(section_id, wan, backend, routeMode, mwan3Memb
 	return args;
 }
 
-function nativeAutotuneProgress(status) {
+function nativeAutotuneProgressStepLabel(step) {
+	var labels = {
+		waiting_for_slot: _('Waiting for the calibration slot...'),
+		starting_calibration: _('Starting Full Auto-Tune...'),
+		preparing_route: _('Checking the selected route and current settings...'),
+		measuring_idle_latency: _('Preparing the test connection and measuring idle latency...'),
+		preparing_measurements: _('Preparing controlled measurements...'),
+		measuring_download_without_sqm: _('Measuring download without SQM...'),
+		measuring_upload_without_sqm: _('Measuring upload without SQM...'),
+		measuring_full_capacity_download: _('Measuring full download capacity...'),
+		measuring_full_capacity_upload: _('Measuring full upload capacity...'),
+		measuring_shaped_download: _('Measuring shaped download...'),
+		measuring_shaped_upload: _('Measuring shaped upload...'),
+		preparing_search: _('Preparing the rate search...'),
+		searching_download_limit: _('Searching for the best download limit...'),
+		searching_upload_limit: _('Searching for the best upload limit...'),
+		confirming_candidate: _('Confirming a candidate configuration...'),
+		confirming_mobile_download_bypass: _('Checking download without shaping while upload shaping stays active...'),
+		comparing_download_without_sqm: _('Comparing download without SQM...'),
+		comparing_upload_without_sqm: _('Comparing upload without SQM...'),
+		preparing_raw_proposal: _('Preparing the best unshaped alternative...'),
+		restoring_settings: _('Restoring the previous runtime settings...'),
+		preparing_proposals: _('Preparing verified proposals...'),
+		proposals_ready: _('Proposals are ready for review.')
+	};
+	return labels[step] || null;
+}
+
+function nativeAutotuneProgress(status, previousPercent) {
 	var state = status && status.state || 'running';
-	var progress = state === 'queued' ? 1 : state === 'starting' ? 2 :
-		(state === 'recovering' || state === 'cancelling') ? 95 : 5;
+	var terminalReady = state === 'review_ready' || state === 'completed';
+	var fallback = state === 'queued' ? 1 : state === 'starting' ? 2 :
+		(state === 'recovering' || state === 'cancelling') ? 96 : 3;
+	var validSchema = status && status.progress_schema_version === 1;
+	var backendPercent = validSchema && typeof status.progress_percent === 'number' &&
+		Number.isInteger(status.progress_percent) && status.progress_percent >= 1 &&
+		status.progress_percent <= 100 ? status.progress_percent : null;
+	var step = validSchema && typeof status.progress_step === 'string' &&
+		nativeAutotuneProgressStepLabel(status.progress_step) ? status.progress_step : null;
+	var progress = terminalReady ? 100 : Math.min(99, backendPercent == null ? fallback : backendPercent);
+	if (!terminalReady && Number.isInteger(previousPercent))
+		progress = Math.max(Math.min(99, previousPercent), progress);
+
+	var message = step ? nativeAutotuneProgressStepLabel(step) :
+		state === 'queued' ? _('Waiting for the calibration slot...') :
+		(state === 'recovering' || state === 'cancelling') ?
+			_('Restoring the previous runtime settings...') :
+			_('Full Auto-Tune is working; detailed progress is temporarily unavailable.');
+	var completed = validSchema && Number.isInteger(status.progress_completed_units) &&
+		status.progress_completed_units >= 0 ? status.progress_completed_units : null;
+	var total = validSchema && Number.isInteger(status.progress_total_units) &&
+		status.progress_total_units > 0 ? status.progress_total_units : null;
+	var attempt = validSchema && Number.isInteger(status.progress_attempt) &&
+		status.progress_attempt > 0 ? status.progress_attempt : null;
+	if (completed != null && total != null && completed <= total)
+		message += ' ' + _('Completed %d of %d.').format(completed, total);
+	else if (attempt != null)
+		message += ' ' + _('Attempt %d.').format(attempt);
+
 	return {
 		state: state,
-		phase: 'native-' + state,
+		phase: step || 'calibration_progress_unavailable',
 		progress: progress,
-		message: state === 'recovering' ? _('Restoring the previous runtime state...') :
-			state === 'queued' ? _('Native Rust calibration is queued...') :
-			_('Native Rust calibration is running...')
+		message: message
 	};
 }
 
@@ -3591,7 +3932,8 @@ function nativeAutotuneApplyCheckValidated(confirmation, result, option) {
 	var expectedTargetState = result && result._native_target_state;
 	var disabled = option && option.action === 'disable_sqm';
 	var targetSchema = confirmation && confirmation.target_state === 'existing_managed' ?
-		(disabled ? 5 : 4) :
+		(disabled ? 5 : (result && result.native_public_schema_version === 5 &&
+			option && option.option_id === 'bypass_download' ? 6 : 4)) :
 		(confirmation && confirmation.target_state === 'absent_bootstrap' ?
 			(disabled ? 8 : 7) : null);
 	return !!confirmation && confirmation.state === 'confirmation_ready' &&
@@ -3643,6 +3985,29 @@ function runNativeAutotuneApplyCheck(result, option) {
 	});
 }
 
+function runNativeAutotuneApplyAttempt(args, timeout, exactTimeout) {
+	var withTimeout = exactTimeout ? withExactRpcTimeout : withRpcTimeout;
+	return withTimeout(timeout, function() {
+		return fs.exec(NATIVE_AUTOTUNE_COMMAND, args);
+	}).then(function(response) {
+		var code = response && response.code == null ? 0 : Number(response && response.code);
+		if (!isFinite(code) || code !== 0)
+			return parseExecJson(response);
+		try {
+			return parseExecJson(response);
+		}
+		catch (error) {
+			error.nativeApplyDeliveryUncertain = true;
+			throw error;
+		}
+	}, function(error) {
+		var uncertain = new Error(error && error.message ||
+			_('The Apply response connection ended before a verified receipt arrived.'));
+		uncertain.nativeApplyDeliveryUncertain = true;
+		throw uncertain;
+	});
+}
+
 function runNativeAutotuneApply(result, option) {
 	return runNativeAutotuneApplyCheck(result, option).then(function(confirmation) {
 		var args = [ '--calibrationctl', 'autotune-apply', result.native_job_id,
@@ -3650,14 +4015,79 @@ function runNativeAutotuneApply(result, option) {
 		(option.required_acknowledgements || []).forEach(function(code) {
 			args.push('--ack', code);
 		});
-		return withRpcTimeout(180, function() {
-			return fs.exec(NATIVE_AUTOTUNE_COMMAND, args);
-		}).then(parseExecJson).then(function(receipt) {
+		return runNativeAutotuneApplyAttempt(args,
+			NATIVE_AUTOTUNE_APPLY_FIRST_RPC_TIMEOUT_S, true).catch(function(error) {
+			if (!error.nativeApplyDeliveryUncertain)
+				throw error;
+			/* The exact command is replay-safe. If the first request completed but
+			 * its HTTP reply crossed the interface being reconfigured, the server
+			 * returns an already_applied receipt without repeating the mutation. If
+			 * it did not complete, the durable Apply journal resumes the same exact
+			 * manifest rather than creating a second authority. */
+			return runNativeAutotuneApplyAttempt(args,
+				NATIVE_AUTOTUNE_APPLY_RETRY_RPC_TIMEOUT_S).catch(function(retryError) {
+				if (retryError.nativeApplyDeliveryUncertain)
+					retryError.nativeApplyReloadRequired = true;
+				throw retryError;
+			});
+		}).then(function(receipt) {
 			if (receipt.error)
 				throw new Error(receipt.error);
 			if (!nativeAutotuneApplyReceiptValidated(receipt, result, option, confirmation))
 				throw new Error(_('The native Apply receipt failed its identity and digest contract.'));
 			return receipt;
+		});
+	});
+}
+
+function bindNativeAutotuneTargetState(result, existingInstance) {
+	Object.defineProperty(result, '_native_target_state', {
+		value: existingInstance === true ? 'existing_managed' : 'absent_bootstrap',
+		enumerable: false
+	});
+	return result;
+}
+
+function currentNativeAutotuneJob(section_id, wan, routeMode, mwan3Member, profile,
+		calibrationStrategy, existingInstance) {
+	if (existingInstance !== true)
+		return Promise.resolve(null);
+	return fs.exec(NATIVE_AUTOTUNE_COMMAND,
+		[ '--calibrationctl', 'autotune-current', section_id ]).then(parseExecJson).then(function(status) {
+		if (status.error)
+			throw new Error(status.error);
+		if (status.state === 'idle') {
+			if (status.instance !== section_id)
+				throw new Error(_('The calibration service returned an invalid idle identity.'));
+			return null;
+		}
+		if (!/^[0-9a-f]{32}$/.test(status.job_id || '') || status.instance !== section_id)
+			throw new Error(_('The calibration service returned an invalid current job identity.'));
+		if ([ 'queued', 'starting', 'running', 'cancelling', 'recovering' ].indexOf(status.state) >= 0)
+			return { status: status, result: null };
+		if (status.state !== 'review_ready' || status.runtime_mutated === true ||
+		    status.recovery_required === true)
+			throw new Error(_('The calibration service returned an unsafe current Review state.'));
+
+		return withRpcTimeout(180, function() {
+			return autotuneExecWithRetry(NATIVE_AUTOTUNE_COMMAND,
+				[ '--calibrationctl', 'autotune-result', status.job_id ], 2, 1000);
+		}).then(parseExecJson).then(function(result) {
+			if (!nativeAutotunePublicResultValidated(result)) {
+				/* The daemon re-verifies a saved Review before returning it.  A
+				 * restart or concurrent retirement between current/status/result is
+				 * still possible, so an explicitly rejected stale result is treated
+				 * like a mismatched historical Review and admission decides whether
+				 * a new calibration may start.  Transport errors remain fatal. */
+				return null;
+			}
+			if (!nativeAutotuneResultMatchesRequest(result, status.job_id, section_id, wan,
+					routeMode, mwan3Member, profile, calibrationStrategy))
+				return null;
+			return {
+				status: status,
+				result: bindNativeAutotuneTargetState(result, existingInstance)
+			};
 		});
 	});
 }
@@ -3669,67 +4099,93 @@ function runNativeAutotuneJob(section_id, wan, backend, onProgress, routeMode, m
 		mwan3Member, profile, conservative, calibrationStrategy, accessRequest,
 		existingInstance, plannedSqmSection);
 	var publicJobId;
+	var lastProgress = 0;
+	var startAttempted = false;
 
-	return fs.exec(NATIVE_AUTOTUNE_COMMAND, launchArgs).then(parseExecJson).then(function(started) {
-		if (started.error)
-			throw new Error(started.error);
-		if (!/^[0-9a-f]{32}$/.test(started.job_id || ''))
-			throw new Error(_('The native coordinator returned no valid public job ID.'));
-		publicJobId = started.job_id;
+	var poll = function() {
+		return autotuneJobDelay(1000).then(function() {
+			return autotuneExecWithRetry(NATIVE_AUTOTUNE_COMMAND,
+				[ '--calibrationctl', 'autotune-status', publicJobId ], 3, 1000);
+		}).then(parseExecJson).then(function(status) {
+			if (status.job_id !== publicJobId)
+				throw new Error(_('The calibration service changed the job identity.'));
+			if ([ 'queued', 'starting', 'running', 'cancelling', 'recovering' ].indexOf(status.state) >= 0) {
+				if (onProgress) {
+					var projected = nativeAutotuneProgress(status, lastProgress);
+					lastProgress = projected.progress;
+					onProgress(projected);
+				}
+				return poll();
+			}
+			if (status.state === 'review_ready' || status.state === 'completed') {
+				if (onProgress)
+					onProgress(nativeAutotuneProgress(status, lastProgress));
+				return withRpcTimeout(180, function() {
+					return autotuneExecWithRetry(NATIVE_AUTOTUNE_COMMAND,
+						[ '--calibrationctl', 'autotune-result', publicJobId ], 2, 1000);
+				}).then(parseExecJson).then(function(result) {
+					if (!nativeAutotunePublicResultValidated(result)) {
+						delete nativeAutotuneJobs[section_id];
+						var invalid = new Error(_('The calibration result failed its verification contract.'));
+						invalid.autotuneResult = result;
+						throw invalid;
+					}
+					if (!nativeAutotuneResultMatchesRequest(result, publicJobId, section_id, wan,
+							routeMode, mwan3Member, profile, calibrationStrategy)) {
+						delete nativeAutotuneJobs[section_id];
+						var mismatched = new Error(_('The calibration result no longer matches this request.'));
+						mismatched.autotuneResult = result;
+						throw mismatched;
+					}
+					delete nativeAutotuneJobs[section_id];
+					return bindNativeAutotuneTargetState(result, existingInstance);
+				});
+			}
+
+			delete nativeAutotuneJobs[section_id];
+			var terminal = new Error(status.diagnostic || status.error ||
+				_('Full Auto-Tune ended without a reviewable result.'));
+			terminal.autotuneResult = status;
+			throw terminal;
+		});
+	};
+
+	var attach = function(status) {
+		publicJobId = status.job_id;
 		nativeAutotuneJobs[section_id] = publicJobId;
 		autotuneTransportModes[section_id] = 'native';
-
-		var poll = function() {
-			return autotuneJobDelay(1000).then(function() {
-				return autotuneExecWithRetry(NATIVE_AUTOTUNE_COMMAND,
-					[ '--calibrationctl', 'autotune-status', publicJobId ], 3, 1000);
-			}).then(parseExecJson).then(function(status) {
-				if (status.job_id !== publicJobId)
-					throw new Error(_('The native coordinator changed the public job identity.'));
-				if ([ 'queued', 'starting', 'running', 'cancelling', 'recovering' ].indexOf(status.state) >= 0) {
-					if (onProgress)
-						onProgress(nativeAutotuneProgress(status));
-					return poll();
-				}
-				if (status.state === 'review_ready' || status.state === 'completed')
-					return withRpcTimeout(180, function() {
-						return autotuneExecWithRetry(NATIVE_AUTOTUNE_COMMAND,
-							[ '--calibrationctl', 'autotune-result', publicJobId ], 2, 1000);
-					}).then(parseExecJson).then(function(result) {
-						if (!nativeAutotunePublicResultValidated(result)) {
-							delete nativeAutotuneJobs[section_id];
-							var invalid = new Error(_('The native Rust result failed its read-only public contract.'));
-							invalid.autotuneResult = result;
-							throw invalid;
-						}
-						if (!nativeAutotuneResultMatchesRequest(result, publicJobId, section_id, wan,
-								routeMode, mwan3Member, profile, calibrationStrategy)) {
-							delete nativeAutotuneJobs[section_id];
-							var mismatched = new Error(_('The native Rust result no longer matches this calibration request.'));
-							mismatched.autotuneResult = result;
-							throw mismatched;
-						}
-						Object.defineProperty(result, '_native_target_state', {
-							value: existingInstance === true ? 'existing_managed' : 'absent_bootstrap',
-							enumerable: false
-						});
-						delete nativeAutotuneJobs[section_id];
-						return result;
-					});
-
-				delete nativeAutotuneJobs[section_id];
-				var terminal = new Error(status.diagnostic || status.error ||
-					_('Native Rust calibration ended without a reviewable result.'));
-				terminal.autotuneResult = status;
-				throw terminal;
-			});
-		};
-
+		if (onProgress) {
+			var projected = nativeAutotuneProgress(status, lastProgress);
+			lastProgress = projected.progress;
+			onProgress(projected);
+		}
 		return poll();
+	};
+
+	return currentNativeAutotuneJob(section_id, wan, routeMode, mwan3Member, profile,
+		calibrationStrategy, existingInstance).then(function(current) {
+		if (current && current.result) {
+			autotuneTransportModes[section_id] = 'native';
+			if (onProgress)
+				onProgress(nativeAutotuneProgress(current.status, lastProgress));
+			return current.result;
+		}
+		if (current)
+			return attach(current.status);
+
+		startAttempted = true;
+		return fs.exec(NATIVE_AUTOTUNE_COMMAND, launchArgs).then(parseExecJson).then(function(started) {
+			if (started.error)
+				throw new Error(started.error);
+			if (!/^[0-9a-f]{32}$/.test(started.job_id || ''))
+				throw new Error(_('The calibration service returned no valid job ID.'));
+			return attach(started);
+		});
 	}).catch(function(error) {
 		/* Once a native start was attempted, never fall through to legacy: a
 		 * timeout is ambiguous and a second backend could mutate the same SQM. */
-		error.nativeAutotuneStartAttempted = true;
+		if (startAttempted)
+			error.nativeAutotuneStartAttempted = true;
 		throw error;
 	});
 }
@@ -3746,7 +4202,7 @@ function runPreferredAutotuneJob(section_id, wan, backend, onProgress, routeMode
 		(!routeMode || routeMode === 'main' || routeMode === 'mwan3') &&
 		!nativeAutotuneIntentSupported(backend, routeMode, existingInstance,
 			calibrationStrategy, accessRequest)) {
-		return Promise.reject(new Error(_('Native new-instance calibration requires Full raw capacity and explicit download/upload service caps.')));
+		return Promise.reject(new Error(_('New-instance calibration requires Full raw capacity and explicit download/upload service caps.')));
 	}
 
 	if (!nativeAutotuneIntentSupported(backend, routeMode, existingInstance,
@@ -3764,12 +4220,12 @@ function runPreferredAutotuneJob(section_id, wan, backend, onProgress, routeMode
 			autotuneTransportModes[section_id] = 'native';
 			if (nativeAutotuneCoordinatorRecognized(summary) &&
 			    summary.state === 'recovery_required')
-				throw new Error(_('Native Rust calibration is restoring an earlier runtime transaction. Legacy Auto-Tune was not started.'));
+				throw new Error(_('Full Auto-Tune is restoring an earlier settings transaction. No second calibration was started.'));
 			if (nativeAutotuneCoordinatorRecognized(summary) && summary.admission_enabled !== true)
-				throw new Error(_('Native Rust calibration is temporarily not accepting work. Legacy Auto-Tune was not started.'));
+				throw new Error(_('Full Auto-Tune is temporarily not accepting work. No second calibration was started.'));
 			throw new Error(existingInstance === true ?
-				_('Native Rust Full Auto-Tune is unavailable or has an incompatible protocol. Legacy Auto-Tune was not started.') :
-				_('Native Rust new-instance Auto-Tune is unavailable or has an incompatible protocol. Legacy Auto-Tune was not started.'));
+				_('Full Auto-Tune is unavailable or has an incompatible protocol. No fallback calibration was started.') :
+				_('New-instance Full Auto-Tune is unavailable or has an incompatible protocol. No fallback calibration was started.'));
 		}
 		return runNativeAutotuneJob(section_id, wan, backend, onProgress, routeMode,
 			mwan3Member, profile, conservative, calibrationStrategy, accessRequest,
@@ -3780,7 +4236,7 @@ function runPreferredAutotuneJob(section_id, wan, backend, onProgress, routeMode
 function cancelNativeAutotuneJob(section_id) {
 	var publicJobId = nativeAutotuneJobs[section_id];
 	if (!/^[0-9a-f]{32}$/.test(publicJobId || ''))
-		return Promise.reject(new Error(_('No authenticated native calibration handle is available in this page.')));
+		return Promise.reject(new Error(_('No authenticated calibration handle is available on this page.')));
 
 	return fs.exec(NATIVE_AUTOTUNE_COMMAND,
 		[ '--calibrationctl', 'autotune-cancel', publicJobId ]).then(parseExecJson).then(function(cancelled) {
@@ -3790,7 +4246,7 @@ function cancelNativeAutotuneJob(section_id) {
 		var polls = 0;
 		var waitForSettlement = function(status) {
 			if (status.job_id !== publicJobId)
-				throw new Error(_('The native coordinator changed the public job identity during cancellation.'));
+				throw new Error(_('The calibration service changed the job identity during cancellation.'));
 
 			if ([ 'cancelled', 'failed', 'review_ready', 'completed' ].indexOf(status.state) >= 0 &&
 			    status.runtime_mutated !== true && status.recovery_required !== true) {
@@ -3799,7 +4255,7 @@ function cancelNativeAutotuneJob(section_id) {
 			}
 
 			if (polls++ >= AUTOTUNE_RECOVERY_MAX_POLLS) {
-				var pending = new Error(_('Native cancellation was requested, but runtime recovery is still pending.'));
+				var pending = new Error(_('Cancellation was requested, but runtime recovery is still pending.'));
 				pending.autotuneRecoveryPending = true;
 				pending.autotuneRecoveryStatus = status;
 				throw pending;
@@ -8837,7 +9293,7 @@ function showCreateWizard(grid, name, existingName) {
 			profile: _('Choose profile'),
 			running: _('Running'),
 			review: _('Awaiting decision'),
-			diagnostic: _('Native Review'),
+			diagnostic: _('Calibration Review'),
 			accepted: _('Accepted'),
 			skipped: _('Skipped'),
 			recovery: _('Restoring runtime')
@@ -8897,7 +9353,7 @@ function showCreateWizard(grid, name, existingName) {
 		});
 		var status = E('div', { 'style': 'margin-top:8px;white-space:normal' },
 			item.error || (item.status === 'diagnostic' ?
-				_('Native Rust Review is ready. Choose an exact option below, confirm its trade-offs, and apply it; or skip this uplink.') :
+				_('Full Auto-Tune Review is ready. Choose an exact option below, confirm its trade-offs, and apply it; or skip this uplink.') :
 			(item.status === 'review' ?
 				(proposalReviewable ? (itemAcknowledgementsComplete ?
 					_('Calibration finished. Accept the safe proposal or skip this uplink.') :
@@ -8947,8 +9403,9 @@ function showCreateWizard(grid, name, existingName) {
 					state.autotune_progress = job.progress || 0;
 					cancelButton.disabled = false;
 					progress.value = state.autotune_progress;
-					status.textContent = _('[%d/%d] %s: %s').format(index + 1, batch.length,
-						item.plan.member, job.message || job.phase || _('Full Auto-Tune is running...'));
+					status.textContent = _('[%d/%d] %s · %d%% · %s').format(index + 1, batch.length,
+						item.plan.member, state.autotune_progress,
+						job.message || _('Full Auto-Tune is working...'));
 			}, 'mwan3', item.plan.member, autotuneRunProfile(itemState), conservative,
 				autotuneCalibrationStrategy(itemState), accessRequest, rerun,
 				item.plan.sqmSection)
@@ -9270,7 +9727,7 @@ function showCreateWizard(grid, name, existingName) {
 				autotuneResultClassLabel(state.autotune_result)) :
 				(state.autotune_diagnostics ?
 					(nativeAutotunePublicResultValidated(state.autotune_diagnostics) ?
-						_('Native Rust Review is ready. Choose an exact option and confirm its listed trade-offs below.') :
+						_('Full Auto-Tune Review is ready. Choose an exact option and confirm its listed trade-offs below.') :
 					(autotuneLegacyResult(state.autotune_diagnostics) ?
 						_('Saved diagnostics use an older result schema. Review them if useful, then run calibration again.') :
 					(autotuneRetryableInconclusive(state.autotune_diagnostics) ?
@@ -9335,8 +9792,9 @@ function showCreateWizard(grid, name, existingName) {
 				state.autotune_progress = job.progress || 0;
 				cancelButton.disabled = false;
 				progress.value = state.autotune_progress;
-				status.textContent = (prefix || '') +
-					(job.message || job.phase || _('Full Auto-Tune is running...'));
+				status.textContent = (prefix || '') + _('%d%% · %s').format(
+					state.autotune_progress,
+					job.message || _('Full Auto-Tune is working...'));
 			};
 
 			return runPreferredAutotuneJob(state.name, state.wan_if, state.speedtest_backend, function(job) {
@@ -10368,14 +10826,7 @@ function showCreateWizard(grid, name, existingName) {
 	}
 
 	function reloadWizardUci() {
-		if (typeof uci.unload === 'function') {
-			uci.unload('cake-autorate');
-			uci.unload('sqm');
-		}
-		return Promise.all([
-			uci.load('cake-autorate'),
-			L.resolveDefault(uci.load('sqm'), null)
-		]);
+		return reloadAppliedUciPackages();
 	}
 
 	function applySequentialMultiwanPlan(config_name, planItems) {

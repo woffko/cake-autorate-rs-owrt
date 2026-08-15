@@ -591,6 +591,8 @@ mod tests {
             baseline_samples: 4,
             baseline_required_samples: 4,
             required_samples: 4,
+            evidence_contract:
+                crate::operations::rating::RatingEvidenceContract::WorstOfDirectionBoundIcmpAndTransport,
             dl_samples: 4,
             ul_samples: 4,
             dl_achieved_kbps: rate,

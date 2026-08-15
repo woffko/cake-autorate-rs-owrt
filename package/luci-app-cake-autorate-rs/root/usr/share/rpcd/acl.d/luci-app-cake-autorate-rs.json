@@ -26,6 +26,7 @@
 				"/usr/sbin/cake-autorated --calibrationctl speedtest-current *": [ "exec" ],
 				"/usr/sbin/cake-autorated --calibrationctl speedtest-status *": [ "exec" ],
 				"/usr/sbin/cake-autorated --calibrationctl speedtest-result *": [ "exec" ],
+				"/usr/sbin/cake-autorated --calibrationctl autotune-current *": [ "exec" ],
 				"/usr/sbin/cake-autorated --calibrationctl autotune-status *": [ "exec" ],
 				"/usr/sbin/cake-autorated --calibrationctl autotune-result *": [ "exec" ],
 				"/usr/sbin/cake-autorated --calibrationctl autotune-apply-check *": [ "exec" ],
