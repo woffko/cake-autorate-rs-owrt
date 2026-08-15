@@ -357,6 +357,9 @@ impl MirredDirection {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ActionTarget {
+    // Non-mirred actions have no interface target; the current strict reader
+    // emits only the supported mirred subset outside tests.
+    #[allow(dead_code)]
     None,
     Mirred {
         direction: MirredDirection,
@@ -654,6 +657,7 @@ pub enum KernelTopologyStagePolicy {
     /// No planned resource or slot may already be occupied.
     BarePreflight(ExpectedOwnedTopology),
     /// Every colliding resource must exactly equal the complete expected set.
+    #[allow(dead_code)]
     TemporaryOwned(ExpectedOwnedTopology),
 }
 
@@ -884,10 +888,6 @@ pub trait KernelTopologyReadBackend {
 pub struct KernelTopologyDigest([u8; 32]);
 
 impl KernelTopologyDigest {
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-
     pub fn to_hex(self) -> String {
         const HEX: &[u8; 16] = b"0123456789abcdef";
         let mut output = String::with_capacity(64);
@@ -911,6 +911,7 @@ impl KernelTopologyWitness {
         &self.snapshot
     }
 
+    #[cfg(test)]
     pub fn canonical_bytes(&self) -> &[u8] {
         &self.canonical
     }
@@ -919,6 +920,7 @@ impl KernelTopologyWitness {
         self.digest
     }
 
+    #[cfg(test)]
     pub fn ensure_exact_reattestation(&self, current: &Self) -> Result<(), KernelTopologyError> {
         if self.canonical == current.canonical && self.digest == current.digest {
             Ok(())
@@ -1402,14 +1404,6 @@ impl CanonicalWriter {
         self.u32(checked_u32(values.len(), "u16 identity count")?)?;
         for value in values {
             self.u16(*value)?;
-        }
-        Ok(())
-    }
-
-    fn byte_vectors(&mut self, values: &[Vec<u8>]) -> Result<(), KernelTopologyError> {
-        self.u32(checked_u32(values.len(), "byte vector count")?)?;
-        for value in values {
-            self.bytes(value)?;
         }
         Ok(())
     }

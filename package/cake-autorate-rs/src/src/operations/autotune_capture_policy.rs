@@ -187,10 +187,6 @@ impl AutotuneCapturePolicy {
         self.transport_load_hold_ms
     }
 
-    pub fn transport_min_loaded_coverage_percent(&self) -> u8 {
-        self.transport_min_loaded_coverage_percent
-    }
-
     pub fn rate_sample_interval_ms(&self) -> u32 {
         self.rate_sample_interval_ms
     }

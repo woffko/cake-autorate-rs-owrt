@@ -4048,8 +4048,7 @@ function bindNativeAutotuneTargetState(result, existingInstance) {
 	return result;
 }
 
-function currentNativeAutotuneJob(section_id, wan, routeMode, mwan3Member, profile,
-		calibrationStrategy, existingInstance) {
+function currentActiveNativeAutotuneJob(section_id, existingInstance) {
 	if (existingInstance !== true)
 		return Promise.resolve(null);
 	return fs.exec(NATIVE_AUTOTUNE_COMMAND,
@@ -4065,30 +4064,17 @@ function currentNativeAutotuneJob(section_id, wan, routeMode, mwan3Member, profi
 			throw new Error(_('The calibration service returned an invalid current job identity.'));
 		if ([ 'queued', 'starting', 'running', 'cancelling', 'recovering' ].indexOf(status.state) >= 0)
 			return { status: status, result: null };
+		if (status.state === 'review_ready' && status.runtime_mutated !== true &&
+		    status.recovery_required !== true) {
+			/* This function is called only after an explicit Start/Run again click.
+			 * A completed Review is historical output, not an in-flight operation to
+			 * resume.  Let admission create a fresh job; otherwise Run again merely
+			 * reopens the old proposals without performing any measurements. */
+			return null;
+		}
 		if (status.state !== 'review_ready' || status.runtime_mutated === true ||
 		    status.recovery_required === true)
 			throw new Error(_('The calibration service returned an unsafe current Review state.'));
-
-		return withRpcTimeout(180, function() {
-			return autotuneExecWithRetry(NATIVE_AUTOTUNE_COMMAND,
-				[ '--calibrationctl', 'autotune-result', status.job_id ], 2, 1000);
-		}).then(parseExecJson).then(function(result) {
-			if (!nativeAutotunePublicResultValidated(result)) {
-				/* The daemon re-verifies a saved Review before returning it.  A
-				 * restart or concurrent retirement between current/status/result is
-				 * still possible, so an explicitly rejected stale result is treated
-				 * like a mismatched historical Review and admission decides whether
-				 * a new calibration may start.  Transport errors remain fatal. */
-				return null;
-			}
-			if (!nativeAutotuneResultMatchesRequest(result, status.job_id, section_id, wan,
-					routeMode, mwan3Member, profile, calibrationStrategy))
-				return null;
-			return {
-				status: status,
-				result: bindNativeAutotuneTargetState(result, existingInstance)
-			};
-		});
 	});
 }
 
@@ -4162,14 +4148,7 @@ function runNativeAutotuneJob(section_id, wan, backend, onProgress, routeMode, m
 		return poll();
 	};
 
-	return currentNativeAutotuneJob(section_id, wan, routeMode, mwan3Member, profile,
-		calibrationStrategy, existingInstance).then(function(current) {
-		if (current && current.result) {
-			autotuneTransportModes[section_id] = 'native';
-			if (onProgress)
-				onProgress(nativeAutotuneProgress(current.status, lastProgress));
-			return current.result;
-		}
+	return currentActiveNativeAutotuneJob(section_id, existingInstance).then(function(current) {
 		if (current)
 			return attach(current.status);
 
@@ -10218,7 +10197,7 @@ function showCreateWizard(grid, name, existingName) {
 				})[0];
 				if (multiwanAutotuneItemAccepted(item) && item.native_apply_receipt) {
 					rows.push([ _('Result: %s').format(item.plan.member),
-						_('APPLIED BY NATIVE RUST · %s · option %s · manifest v%d').format(
+						_('APPLIED · %s · option %s · manifest v%d').format(
 							profile ? profile.title : item.state.autotune_profile,
 							item.native_option_id || item.native_apply_receipt.option_id,
 							item.native_apply_receipt.manifest_schema_version) ]);

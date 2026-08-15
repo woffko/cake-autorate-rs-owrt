@@ -157,14 +157,17 @@ impl NativeUciMaterializationPlan {
         Ok(plan)
     }
 
+    #[cfg(test)]
     pub(crate) fn managed_config_sha256(&self) -> &str {
         &self.managed_config_sha256
     }
 
+    #[cfg(test)]
     pub(crate) fn logical_action_count(&self) -> usize {
         self.logical_action_count
     }
 
+    #[cfg(test)]
     pub(crate) fn command_count(&self) -> usize {
         self.commands.len()
     }

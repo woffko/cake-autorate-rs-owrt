@@ -15,6 +15,7 @@ const SNAPSHOT_HEADER: &str = "cake-autorate-rating-runtime\t5";
 const PREVIOUS_SNAPSHOT_HEADER: &str = "cake-autorate-rating-runtime\t4";
 const LEGACY_SNAPSHOT_HEADER: &str = "cake-autorate-rating-runtime\t3";
 const TERMINAL_HEADER: &str = "cake-autorate-rating-terminal\t2";
+#[cfg(test)]
 const LEGACY_TERMINAL_HEADER: &str = "cake-autorate-rating-terminal\t1";
 pub const RATING_EVIDENCE_CONTRACT: &str = QUALITY_GRADE_METHOD;
 const MAX_SNAPSHOT_BYTES: usize = 8 * 1024;

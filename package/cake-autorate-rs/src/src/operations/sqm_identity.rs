@@ -168,12 +168,6 @@ struct ParsedUciPackage {
     sections: BTreeMap<String, ParsedUciSection>,
 }
 
-pub fn managed_sqm_config_fingerprint(section: &str) -> Result<String, String> {
-    let raw = read_uci_section(section)?;
-    let canonical = canonicalize_uci_show(&raw)?;
-    sha256sum(&canonical)
-}
-
 /// Bind a native calibration request to the complete UCI configuration which
 /// can affect its recommendation.  This is the Rust equivalent of the legacy
 /// Full Auto-Tune fingerprint: the instance, its owned SQM section, and every

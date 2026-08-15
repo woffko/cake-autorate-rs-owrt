@@ -60,6 +60,8 @@ assert.equal(fs.existsSync(retiredQualityTest), false,
 	'the retired shell Rating worker body must not remain in the source payload');
 assert.doesNotMatch(procdJob, /\/usr\/libexec\/cake-autorate-rs\/quality-test/,
 	'the procd launcher must not retain an allowlist entry for an unshipped worker');
+assert.doesNotMatch(procdJob, /cake-autorate-quality/,
+	'the procd launcher must not retain the retired shell Rating log namespace');
 assert.match(rpcdHelper, /case "\$operation" in/,
 	'legacy LuCI fallback operations must pass through the positionally pinned rpcd dispatcher');
 assert.doesNotMatch(rpcdHelper, /eval|sh -c|\$\{operation\}.*exec/,

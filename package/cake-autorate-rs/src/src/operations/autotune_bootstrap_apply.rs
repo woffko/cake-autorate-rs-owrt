@@ -301,6 +301,7 @@ impl NativeBootstrapApplyPlan {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn canonical_manifest_sha256(&self) -> Result<String, String> {
         Ok(sha256_hex(&self.canonical_manifest_bytes()?))
     }

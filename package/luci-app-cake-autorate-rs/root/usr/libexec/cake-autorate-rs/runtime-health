@@ -15,6 +15,9 @@ sys_class_net="${CAKE_AUTORATE_SYS_CLASS_NET:-/sys/class/net}"
 proc_root="${CAKE_AUTORATE_PROC_ROOT:-/proc}"
 runtime_root="${CAKE_AUTORATE_RUNTIME_ROOT:-/var/run/cake-autorate}"
 autotune_root="${CAKE_AUTORATE_AUTOTUNE_DIR:-/tmp/cake-autorate-autotune}"
+# Read-only upgrade compatibility: current packages cannot launch the retired
+# shell Rating worker, but an in-flight PID from an older package may still be
+# visible while runtime state is reconciled.
 quality_root="${CAKE_AUTORATE_QUALITY_DIR:-/tmp/cake-autorate-quality}"
 speedtest_root="${CAKE_AUTORATE_SPEEDTEST_JOB_DIR:-/tmp/cake-autorate-speedtest}"
 apply_root="${CAKE_AUTORATE_APPLY_GUARD_DIR:-/tmp/cake-autorate-apply-guard}"

@@ -27,6 +27,7 @@ pub fn validate_transition(from: OperationState, to: OperationState) -> Result<(
     }
 }
 
+#[cfg(test)]
 pub fn owns_runtime(state: OperationState) -> bool {
     matches!(
         state,

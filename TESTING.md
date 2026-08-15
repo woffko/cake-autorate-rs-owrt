@@ -2454,3 +2454,44 @@ After this main release, the next planned stage is a source cleanup/refactor
 with frozen behavior and package-size regression gates, followed by a separate
 smallest practical manual-only Lite design with Rating, speed testing,
 Auto-Tune, scheduling, associated ACLs, and their runtime surfaces absent.
+
+## RC27 r250/r98 cleanup, Re-run, and release matrix gate (2026-08-15)
+
+The post-r249 cleanup retained the accepted runtime behavior while removing
+roughly 190 net source lines, narrowing retired helper authority, and moving
+the read-only scheduler-status projection out of the mutable coordinator
+module. The complete serial source gate passed 1074 Rust tests, every daemon
+and LuCI shell suite, the four serialized Auto-Tune partitions, all seven Full
+LuCI JavaScript suites, both TypeScript projects, Full and no-default-feature
+checks, formatting, shell syntax, and diff checks.
+
+The explicit **Run again** path received an additional regression gate. An
+inert historical `review_ready` result is no longer treated as an active job;
+only queued, starting, running, cancelling, or recovering work may be attached.
+On the disposable VM, clicking Run again created a new job identity and began
+new measurements. A complete Variable Link / Full raw browser run then reached
+Review, accepted the single aggregate trade-off acknowledgement, applied the
+selected topology exactly once, returned automatically to Settings, and showed
+fresh authoritative rate and SQM-direction values without Reload, a tab switch,
+or an Unsaved Changes warning.
+
+Upgrade and fresh-Settings gates passed on both anonymized x86_64 Multi-WAN
+routers and the anonymized aarch64 cellular router. Package revisions, UCI,
+service topology and exact CAKE rates were checked after install. The cellular
+run produced three applicable choices including the independently measured
+**Download without shaping** option; applying it left upload CAKE active and
+download CAKE absent. Every router and the VM were restored to their exact
+preflight configuration with clean UCI and no active coordinator recovery or
+lease state.
+
+The final OpenWrt 25.12.5 staging directory contains 12 Full r250 daemon APKs,
+12 separately compiled Lite r250 daemon APKs, Full LuCI r98, and Lite LuCI r3.
+All 26 APKs passed source-sync, APK integrity, metadata, dependencies/providers,
+installed modes, source-payload identity, Full/Lite separation, and ELF machine,
+endianness, ARM float-ABI or MIPS o32 checks. OpenWrt APK v3 correctly reports
+the architecture-independent LuCI packages as `noarch` even though their
+package Makefiles use `PKGARCH:=all`. The independently rechecked manifest has
+SHA-256
+`f2a897ae52755894bad56f5cac19aec9ea65b3a8461d8fcc4f99b083cbe81bb2`;
+the machine-readable matrix report has SHA-256
+`117e6a3f8ec849e726976d1553f0412855635d5a35cdc8d75f7cee25e98ca42e`.

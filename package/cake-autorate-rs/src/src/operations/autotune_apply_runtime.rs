@@ -647,6 +647,7 @@ pub(crate) fn execute_native_apply_commit_with_fault<B: NativeApplyTransactionBa
 
 /// Execute the first hardware-gate mode.  Even a fully verified Apply is
 /// deliberately rolled back; this function has no commit-success branch.
+#[cfg(test)]
 pub(crate) fn execute_native_apply_forced_rollback<B: NativeApplyTransactionBackend>(
     plan: &NativeApplyExecutionPlan,
     manifest: &[u8],

@@ -31,6 +31,7 @@ const MAX_NATIVE_BOOTSTRAP_CONFIG_ACTIONS: usize = 128;
 const MAX_NATIVE_UCI_LIST_ITEMS: usize = 64;
 const MAX_NATIVE_UCI_LIST_ITEM_BYTES: usize = 1024;
 const MAX_NATIVE_UCI_LIST_TOTAL_BYTES: usize = 16 * 1024;
+#[cfg(test)]
 const SPEEDTEST_APPLY_PERCENT_V1: u8 = 90;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +65,7 @@ impl NativeBootstrapPersistPolicy {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn defaults_v1() -> Self {
         Self {
             speedtest_apply_percent: SPEEDTEST_APPLY_PERCENT_V1,
@@ -140,8 +142,13 @@ impl BoundedUciList {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NativeBootstrapPingerMethod {
     Fping,
+    // Kept in the typed managed-config contract even though the frozen
+    // capture policy currently selects only fping.
+    #[allow(dead_code)]
     FpingTs,
+    #[allow(dead_code)]
     Tsping,
+    #[allow(dead_code)]
     Ping,
     Irtt,
 }
@@ -310,6 +317,7 @@ impl NativeManagedUciSectionPlan {
         &self.options
     }
 
+    #[cfg(test)]
     pub(crate) fn scalar_value(&self, option: &str) -> Option<&str> {
         match self.options.get(option) {
             Some(NativeManagedUciValue::Scalar(value)) => Some(value),
@@ -317,6 +325,7 @@ impl NativeManagedUciSectionPlan {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn list_value(&self, option: &str) -> Option<&[String]> {
         match self.options.get(option) {
             Some(NativeManagedUciValue::ReplaceList(value)) => Some(value.values()),

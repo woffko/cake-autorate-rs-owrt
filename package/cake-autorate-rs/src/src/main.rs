@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod adaptive_ceiling;
 #[cfg_attr(not(feature = "calibration"), allow(dead_code))]
 mod autotune;
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "calibration"), allow(dead_code))]
 mod operations;
 mod quality_grade;
 mod rating_load;

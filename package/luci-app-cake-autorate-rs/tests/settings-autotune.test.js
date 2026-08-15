@@ -7,6 +7,8 @@ const path = require('node:path');
 const sourcePath = path.join(__dirname, '..', 'htdocs', 'luci-static', 'resources',
 	'view', 'cake-autorate-rs', 'settings.js');
 const source = fs.readFileSync(sourcePath, 'utf8');
+assert.doesNotMatch(source, /APPLIED BY NATIVE RUST/,
+	'Auto-Tune user-facing receipts must describe the result, not the implementation language');
 assert.equal((source.match(/window\.setTimeout\(/g) || []).length, 3,
 	'settings timers are limited to speedtest, Auto-Tune and guarded-apply polling helpers');
 for (const helper of [ 'speedtestJobDelay', 'autotuneJobDelay', 'applyGuardDelay' ]) {
@@ -179,7 +181,7 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl, eImpl) {
 			`nativeAutotuneCapabilityValidated, nativeBootstrapAutotuneCapabilityValidated, ` +
 			`nativeAutotuneIntentSupported, nativeAutotuneLaunchArgs, nativeAutotuneResultMatchesRequest, ` +
 			`nativeAutotuneProgressStepLabel, nativeAutotuneProgress, ` +
-			`currentNativeAutotuneJob, runPreferredAutotuneJob, cancelPreferredAutotuneJob, ` +
+			`currentActiveNativeAutotuneJob, runPreferredAutotuneJob, cancelPreferredAutotuneJob, ` +
 			`replaceNodeContent, ` +
 			`setNativeAutotuneJob: function(section, jobId) { nativeAutotuneJobs[section] = jobId; autotuneTransportModes[section] = 'native'; }, ` +
 			`setLegacyAutotuneJob: function(section, runId) { legacyAutotuneJobs[section] = runId; autotuneTransportModes[section] = 'legacy'; }, ` +
@@ -5177,31 +5179,40 @@ async function testNativeAutotuneTransport() {
 		assert(!nativeCalls.some(call => call.command.endsWith('/autotune')),
 			'a native start must never be followed by a legacy helper launch');
 
-		const resumedReviewCalls = [];
-		const resumedReviewPayloads = [
+		const rerunReviewCalls = [];
+		const freshPublicJobId = 'a'.repeat(32);
+		const freshNativePublic = nativePublicFixture();
+		freshNativePublic.native_job_id = freshPublicJobId;
+		freshNativePublic.public_apply_contract.native_job_id = freshPublicJobId;
+		const rerunReviewPayloads = [
 			capability,
 			{ state: 'review_ready', job_id: publicJobId, instance: 'wan_sqm',
 				runtime_mutated: false, recovery_required: false,
 				progress_schema_version: 1, progress_percent: 100,
 				progress_step: 'proposals_ready' },
-			nativePublic,
+			{ state: 'queued', job_id: freshPublicJobId },
+			{ state: 'review_ready', job_id: freshPublicJobId,
+				runtime_mutated: false, recovery_required: false },
+			freshNativePublic,
 		];
-		const resumedReviewHelpers = compileHelpers({
+		const rerunReviewHelpers = compileHelpers({
 			exec(command, args) {
-				resumedReviewCalls.push({ command, args });
-				return Promise.resolve({ stdout: JSON.stringify(resumedReviewPayloads.shift()) });
+				rerunReviewCalls.push({ command, args });
+				return Promise.resolve({ stdout: JSON.stringify(rerunReviewPayloads.shift()) });
 			},
 		});
-		assert.deepEqual(await resumedReviewHelpers.runPreferredAutotuneJob(
+		assert.deepEqual(await rerunReviewHelpers.runPreferredAutotuneJob(
 			'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '',
-			'variable_link', false, 'full_raw', access, true), nativePublic,
-			'a matching durable Review must reopen after page reload without another traffic job');
-		assert.deepEqual(resumedReviewCalls.map(call => call.args.slice(0, 2)), [
+			'variable_link', false, 'full_raw', access, true), freshNativePublic,
+			'an explicit Run again must not return a matching historical Review');
+		assert.deepEqual(rerunReviewCalls.map(call => call.args.slice(0, 2)), [
 			[ '--calibrationctl', 'summary' ],
 			[ '--calibrationctl', 'autotune-current' ],
+			[ '--calibrationctl', 'autotune-start' ],
+			[ '--calibrationctl', 'autotune-status' ],
 			[ '--calibrationctl', 'autotune-result' ],
 		]);
-		assert(!resumedReviewCalls.some(call => call.args[1] === 'autotune-start'));
+		assert.equal(rerunReviewCalls[2].args[1], 'autotune-start');
 
 		const resumedActiveCalls = [];
 		const resumedActivePayloads = [
@@ -5227,60 +5238,6 @@ async function testNativeAutotuneTransport() {
 			[ 'summary', 'autotune-current', 'autotune-status', 'autotune-result' ]);
 		assert(!resumedActiveCalls.some(call => call.args[1] === 'autotune-start'),
 			'an in-flight matching-instance operation must be observed rather than duplicated');
-
-		const staleReview = nativePublicFixture();
-		staleReview.target_interface = 'eth9';
-		const changedIntentCalls = [];
-		const changedIntentPayloads = [
-			capability,
-			{ state: 'review_ready', job_id: publicJobId, instance: 'wan_sqm',
-				runtime_mutated: false, recovery_required: false },
-			staleReview,
-			{ state: 'queued', job_id: publicJobId },
-			{ state: 'review_ready', job_id: publicJobId,
-				runtime_mutated: false, recovery_required: false },
-			nativePublic,
-		];
-		const changedIntentHelpers = compileHelpers({
-			exec(command, args) {
-				changedIntentCalls.push({ command, args });
-				return Promise.resolve({ stdout: JSON.stringify(changedIntentPayloads.shift()) });
-			},
-		});
-		assert.deepEqual(await changedIntentHelpers.runPreferredAutotuneJob(
-			'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '',
-			'variable_link', false, 'full_raw', access, true), nativePublic);
-		assert.deepEqual(changedIntentCalls.map(call => call.args[1]), [
-			'summary', 'autotune-current', 'autotune-result',
-			'autotune-start', 'autotune-status', 'autotune-result',
-		], 'a valid Review for another exact request must not be silently reused');
-
-		const invalidSavedReviewCalls = [];
-		const invalidSavedReviewPayloads = [
-			capability,
-			{ state: 'review_ready', job_id: publicJobId, instance: 'wan_sqm',
-				runtime_mutated: false, recovery_required: false },
-			{ state: 'error', error_code: 'result-verification-failed',
-				error: 'saved Review is no longer canonical' },
-			{ state: 'queued', job_id: publicJobId },
-			{ state: 'review_ready', job_id: publicJobId,
-				runtime_mutated: false, recovery_required: false },
-			nativePublic,
-		];
-		const invalidSavedReviewHelpers = compileHelpers({
-			exec(command, args) {
-				invalidSavedReviewCalls.push({ command, args });
-				return Promise.resolve({ stdout: JSON.stringify(invalidSavedReviewPayloads.shift()) });
-			},
-		});
-		assert.deepEqual(await invalidSavedReviewHelpers.runPreferredAutotuneJob(
-			'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '',
-			'variable_link', false, 'full_raw', access, true), nativePublic,
-			'a Review invalidated between discovery and hydration must not block a new admission');
-		assert.deepEqual(invalidSavedReviewCalls.map(call => call.args[1]), [
-			'summary', 'autotune-current', 'autotune-result',
-			'autotune-start', 'autotune-status', 'autotune-result',
-		]);
 
 		const recoveryCalls = [];
 		const recoveryHelpers = compileHelpers({

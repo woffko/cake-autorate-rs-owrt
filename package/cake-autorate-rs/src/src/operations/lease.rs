@@ -190,6 +190,7 @@ impl LeaseTable {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn owner(&self, key: &LeaseKey) -> Option<&str> {
         self.owners.get(key).map(String::as_str)
     }

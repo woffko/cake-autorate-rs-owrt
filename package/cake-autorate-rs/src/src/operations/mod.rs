@@ -30,6 +30,7 @@ pub mod event_loop;
 pub mod full_autotune;
 pub mod identity;
 pub mod journal;
+pub(crate) mod json_wire;
 pub mod kernel_topology;
 pub(crate) mod kernel_topology_netlink;
 pub mod lease;
@@ -41,6 +42,7 @@ pub mod runtime;
 pub mod scheduler;
 pub mod scheduler_config;
 pub mod scheduler_runtime;
+pub(crate) mod scheduler_status;
 pub mod scheduler_store;
 pub mod speedtest;
 pub mod speedtest_request;
@@ -113,6 +115,7 @@ mod timer_ownership_tests {
         ("full_autotune", include_str!("full_autotune.rs")),
         ("identity", include_str!("identity.rs")),
         ("journal", include_str!("journal.rs")),
+        ("json_wire", include_str!("json_wire.rs")),
         ("kernel_topology", include_str!("kernel_topology.rs")),
         (
             "kernel_topology_netlink",
@@ -127,6 +130,7 @@ mod timer_ownership_tests {
         ("scheduler", include_str!("scheduler.rs")),
         ("scheduler_config", include_str!("scheduler_config.rs")),
         ("scheduler_runtime", include_str!("scheduler_runtime.rs")),
+        ("scheduler_status", include_str!("scheduler_status.rs")),
         ("scheduler_store", include_str!("scheduler_store.rs")),
         ("speedtest", include_str!("speedtest.rs")),
         ("speedtest_request", include_str!("speedtest_request.rs")),
@@ -184,7 +188,13 @@ mod timer_ownership_tests {
         );
 
         for (module, source) in SOURCES {
-            let production = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+            // Individual production-area helpers may be test-only observation
+            // seams.  Stop only at the actual unit-test module; cutting at the
+            // first `#[cfg(test)]` silently hid all later production waits.
+            let production = source
+                .split("\n#[cfg(test)]\nmod tests")
+                .next()
+                .unwrap_or(source);
             let mut actual = production
                 .lines()
                 .map(str::trim)

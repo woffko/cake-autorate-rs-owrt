@@ -791,25 +791,6 @@ pub enum RuntimeRestoreReason {
     InstanceRestarted,
 }
 
-impl RuntimeRestoreReason {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ApplyFailed => "apply-failed",
-            Self::AppliedAttestationMismatch => "applied-attestation-mismatch",
-            Self::ControlMissing => "control-missing",
-            Self::PermitMissing => "permit-missing",
-            Self::DeadlineExpired => "deadline-expired",
-            Self::WorkerIdentityMismatch => "worker-identity-mismatch",
-            Self::RouteDrift => "route-drift",
-            Self::BaselineAttestationUnavailable => "baseline-attestation-unavailable",
-            Self::SqmDrift => "sqm-drift",
-            Self::RuntimeDrift => "runtime-drift",
-            Self::SequenceConflict => "sequence-conflict",
-            Self::InstanceRestarted => "instance-restarted",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeIdentityHealth {
     Matches,

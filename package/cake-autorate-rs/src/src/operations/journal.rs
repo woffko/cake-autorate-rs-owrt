@@ -291,6 +291,7 @@ impl JobJournal {
         self.validate()
     }
 
+    #[cfg(test)]
     pub fn arm_runtime_mutation(&mut self, worker_run_id: String) -> Result<(), String> {
         self.transition(OperationState::Starting)?;
         require_lower_hex("worker_run_id", &worker_run_id, 32)?;
@@ -464,33 +465,6 @@ impl JobJournal {
         self.validate()
     }
 
-    pub fn attach_native_cancelling(
-        &mut self,
-        process: ProcessIdentity,
-        worker_run_id: String,
-    ) -> Result<(), String> {
-        if self.state != OperationState::Cancelling
-            || self.runtime_mutated
-            || self.recovery_required
-            || self.process.is_some()
-        {
-            return Err(
-                "native worker can attach to cancellation only before runtime mutation".to_string(),
-            );
-        }
-        if self.worker_run_id.as_deref() != Some(&worker_run_id) {
-            return Err(
-                "cancelled native worker identity differs from the armed journal".to_string(),
-            );
-        }
-        self.sequence = self
-            .sequence
-            .checked_add(1)
-            .ok_or_else(|| "journal sequence overflow".to_string())?;
-        self.process = Some(process);
-        self.validate()
-    }
-
     pub fn settle_native_terminal(
         &mut self,
         terminal_state: &str,
@@ -528,6 +502,7 @@ impl JobJournal {
         self.validate()
     }
 
+    #[cfg(test)]
     pub fn attach_running_process(
         &mut self,
         process: ProcessIdentity,
@@ -548,6 +523,7 @@ impl JobJournal {
         self.validate()
     }
 
+    #[cfg(test)]
     pub fn attach_cancelling_process(
         &mut self,
         process: ProcessIdentity,
@@ -573,6 +549,7 @@ impl JobJournal {
         self.validate()
     }
 
+    #[cfg(test)]
     pub fn settle_legacy_terminal(
         &mut self,
         terminal_kind: &str,
@@ -598,6 +575,7 @@ impl JobJournal {
         self.validate()
     }
 
+    #[cfg(test)]
     pub fn settle_runtime_recovery(
         &mut self,
         cancelled: bool,
@@ -720,6 +698,7 @@ impl JobJournal {
         self.validate()
     }
 
+    #[cfg(test)]
     pub fn record_reconciliation_failure(&mut self, diagnostic_code: &str) -> Result<(), String> {
         if self.state != OperationState::Recovering || !self.recovery_required {
             return Err("only a recovering journal can record reconciliation failure".to_string());

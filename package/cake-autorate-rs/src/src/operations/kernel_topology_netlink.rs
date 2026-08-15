@@ -114,7 +114,6 @@ const IFLA_GSO_IPV4_MAX_SIZE: u16 = 63;
 const IFLA_GRO_IPV4_MAX_SIZE: u16 = 64;
 const IFLA_DPLL_PIN: u16 = 65;
 const IFLA_INFO_KIND: u16 = 1;
-const IFLA_INFO_DATA: u16 = 2;
 const IFLA_XDP_ATTACHED: u16 = 2;
 const XDP_ATTACHED_NONE: u8 = 0;
 
@@ -525,6 +524,7 @@ impl<I: NetlinkIo> NetlinkTopologyReader<I> {
         }
     }
 
+    #[cfg(test)]
     pub fn with_limits(io: I, limits: NetlinkReadLimits) -> Result<Self, KernelTopologyError> {
         limits.validate()?;
         Ok(Self {

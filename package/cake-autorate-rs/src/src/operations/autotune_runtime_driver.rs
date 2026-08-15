@@ -162,6 +162,7 @@ impl RuntimeOverrideDriver {
         })
     }
 
+    #[cfg(test)]
     pub fn phase(&self) -> RuntimeOverridePhase {
         self.tracker.phase()
     }

@@ -275,12 +275,12 @@ The RC27 release builds the OpenWrt 25.12 daemon APK for this ABI matrix:
 The target is an APK ABI rather than one specific board. The authoritative
 choice is the value returned by `apk --print-arch`. Every full daemon asset
 follows the name
-`cake-autorate-rs-1.0_rc27-r249_openwrt-25.12_<arch>.apk`; the shared
-`luci-app-cake-autorate-rs-1.0_rc27-r97_openwrt-25.12_all.apk` contains the
+`cake-autorate-rs-1.0_rc27-r250_openwrt-25.12_<arch>.apk`; the shared
+`luci-app-cake-autorate-rs-1.0_rc27-r98_openwrt-25.12_all.apk` contains the
 architecture-independent full LuCI interface and SQM integration.
 
 The same release also contains a separately compiled **Lite** pair for every
-ABI: `cake-autorate-rs-lite-1.0_rc27-r249_...apk` and
+ABI: `cake-autorate-rs-lite-1.0_rc27-r250_...apk` and
 `luci-app-cake-autorate-rs-lite-1.0_rc27-r3_...apk`. Lite keeps the manual
 controller, routing, latency probes, directional SQM and bounded adaptive
 ceiling, but deliberately omits Get rating, speed-test calibration, Full
@@ -384,13 +384,17 @@ representative examples rather than guarantees.
 
 ## Release history
 
-This release is **RC27 r249/r97**: daemon package r249 and Full LuCI package
-r97, with the parallel manual-only Lite pair r249/r3. It adds complete
+This release is **RC27 r250/r98**: daemon package r250 and Full LuCI package
+r98, with the parallel manual-only Lite pair r250/r3. It retains the complete
 two-direction Rating authority, truthful staged Auto-Tune progress, a ranked
 four-option Review including the measured mobile download-bypass topology, one
 aggregate trade-off confirmation, and an Apply flow which verifies the runtime
 and immediately reloads authoritative UCI without another button or tab
-switch. The focused live transition matrix, full browser audit, Full/Lite
+switch. This maintenance revision removes retired internal paths, isolates the
+read-only scheduler-status projection from coordinator-owned mutation state,
+removes remaining implementation-language wording from the UI, and ensures
+that an explicit **Run again** starts a new calibration instead of reopening an
+inert historical Review. The focused live transition matrix, full browser audit, Full/Lite
 12-ABI verification and design chronology are recorded in
 [Testing](TESTING.md). The README intentionally describes current behavior
 instead of retaining a cumulative RC diary; historical source points remain in
@@ -860,15 +864,15 @@ For example, when it prints `aarch64_generic`:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc27-r249_openwrt-25.12_aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc27-r97_openwrt-25.12_all.apk
+  /root/cake-autorate-rs-1.0_rc27-r250_openwrt-25.12_aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc27-r98_openwrt-25.12_all.apk
 ```
 
 For a small manual-only installation, use the matching Lite pair instead:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-lite-1.0_rc27-r249_openwrt-25.12_aarch64_generic.apk \
+  /root/cake-autorate-rs-lite-1.0_rc27-r250_openwrt-25.12_aarch64_generic.apk \
   /root/luci-app-cake-autorate-rs-lite-1.0_rc27-r3_openwrt-25.12_all.apk
 ```
 

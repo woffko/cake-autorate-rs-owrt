@@ -164,6 +164,7 @@ impl NativeBootstrapApplyRecoveryRecord {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn recovery_direction(&self) -> NativeBootstrapRecoveryDirection {
         if self.state == NativeBootstrapApplyRecoveryState::CommitAccepted {
             NativeBootstrapRecoveryDirection::RollForward

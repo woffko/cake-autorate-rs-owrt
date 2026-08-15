@@ -107,6 +107,7 @@ impl AutotuneCounterRateTracker {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn observe_counters(
         &mut self,
         now: Instant,

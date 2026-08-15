@@ -45,6 +45,7 @@ const MAX_AUTOMATIC_SERVER_ATTEMPTS: usize = 3;
 const MAX_RATE_PAYLOAD_TIMING_RATIO_PERCENT: u128 = 135;
 pub(crate) const SPEEDTEST_RATE_PAYLOAD_TIMING_MISMATCH: &str =
     "speedtest-rate-payload-timing-mismatch";
+#[cfg(test)]
 const MAX_UPLOAD_COUNTER_LAG_PERCENT: u128 = 5;
 const MIN_QUALIFICATION_COUNTER_CONFIDENCE_PERCENT: u128 = 80;
 const MIN_SHAPED_UPLOAD_PAYLOAD_WIRE_PERCENT: u128 = 60;
@@ -264,10 +265,12 @@ impl SpeedtestAccountingPlan {
         Self { download, upload }
     }
 
+    #[cfg(test)]
     pub(crate) fn download_uses_cake(&self) -> bool {
         self.download.is_some()
     }
 
+    #[cfg(test)]
     pub(crate) fn upload_uses_cake(&self) -> bool {
         self.upload.is_some()
     }
@@ -1087,18 +1090,6 @@ pub(crate) fn qualify_embedded_speedtest_server_in_session(
     Err(format!("speedtest-qualification-{reason}-after-{rejected}"))
 }
 
-fn run_speedtest_go_server_list_with_pin(
-    request: &OperationRequest,
-    terminate: &AtomicBool,
-    scratch_path: &Path,
-    credentials: BackendCredentials,
-) -> Result<Vec<u64>, String> {
-    retry_unmeasured_route_operation(
-        || run_speedtest_go_server_list_attempt(request, terminate, scratch_path, credentials),
-        || wait_for_route_ready(request, terminate).map(|_| ()),
-    )
-}
-
 fn run_speedtest_go_server_list_attempt(
     request: &OperationRequest,
     terminate: &AtomicBool,
@@ -1173,6 +1164,7 @@ fn run_speedtest_go_server_list_attempt(
 /// wait on current route state, and start discovery from scratch.  The wait
 /// owns no retry count or private deadline; cancellation and the enclosing
 /// operation deadline remain the only terminal conditions.
+#[cfg(test)]
 fn retry_unmeasured_route_operation<T, Attempt, Wait>(
     mut attempt: Attempt,
     mut wait_until_ready: Wait,
@@ -1203,6 +1195,7 @@ where
 /// resets, static route errors, cancellation, deadline expiry, debit failures,
 /// and budget exhaustion stay fail-closed.  No sleep or retry timer is owned by
 /// this helper.
+#[cfg(test)]
 fn retry_budgeted_route_measurement_on_loss<T, Counters, Attempt>(
     remaining_traffic_budget: &mut u64,
     minimum_attempt_budget: u64,
@@ -1393,6 +1386,7 @@ pub(crate) fn bounded_achieved_kbps(
     Ok(bounded)
 }
 
+#[cfg(test)]
 fn upload_counter_lag_is_bounded(interface_bytes: u64, payload_bytes: u64) -> bool {
     if interface_bytes >= payload_bytes {
         return true;
@@ -1490,6 +1484,7 @@ fn speedtest_qualification_rejection(
     None
 }
 
+#[cfg(test)]
 fn speedtest_qualification_is_plausible(
     result: &SpeedtestResult,
     sample: &SpeedtestLoadSample,
@@ -2685,6 +2680,7 @@ fn read_bounded_file(file: &mut File, limit: usize) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| "speedtest-output-not-utf8".to_string())
 }
 
+#[cfg(test)]
 fn parse_speedtest_go(
     output: &str,
     direction: SpeedtestDirection,

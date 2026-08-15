@@ -8,11 +8,13 @@ worker_pid=""
 
 cleanup() {
 	[ -z "$worker_pid" ] || kill "$worker_pid" 2>/dev/null || true
-	rm -rf "$work" /tmp/cake-autorate-speedtest/procd-job-test.log
+	rm -rf "$work" /tmp/cake-autorate-speedtest/procd-job-test.log \
+		/tmp/cake-autorate-quality/procd-job-test
 }
 trap cleanup EXIT INT TERM
 
-mkdir -p "$work/bin" /tmp/cake-autorate-speedtest
+mkdir -p "$work/bin" /tmp/cake-autorate-speedtest \
+	/tmp/cake-autorate-quality/procd-job-test
 cat > "$work/bin/test-worker" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*"
@@ -79,6 +81,12 @@ stat_tail="$(sed 's/^.*) //' "/proc/$worker_pid/stat")"
 if "$helper" launch cake-autorate-test worker /tmp/not-allowed.log \
 	"$work/bin/test-worker" >/dev/null 2>&1; then
 	echo "unsafe procd log path was accepted" >&2
+	exit 1
+fi
+if "$helper" launch cake-autorate-test worker \
+	/tmp/cake-autorate-quality/procd-job-test/job.log \
+	"$work/bin/test-worker" >/dev/null 2>&1; then
+	echo "retired quality-test log path was accepted" >&2
 	exit 1
 fi
 if "$helper" launch cake-autorate-test worker \

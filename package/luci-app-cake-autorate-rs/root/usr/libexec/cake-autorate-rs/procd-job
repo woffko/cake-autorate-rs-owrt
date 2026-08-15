@@ -34,8 +34,7 @@ safe_instance_name() {
 safe_log_path() {
 	case "$1" in
 		/tmp/cake-autorate-autotune/*/job.log|\
-		/tmp/cake-autorate-speedtest/*.log|\
-		/tmp/cake-autorate-quality/*/job.log) ;;
+		/tmp/cake-autorate-speedtest/*.log) ;;
 		*) return 1 ;;
 	esac
 	log_parent="${1%/*}"

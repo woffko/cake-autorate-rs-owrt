@@ -1080,6 +1080,7 @@ enum PendingIcmpDisposition {
     Observe(super::autotune_capture::AutotuneCaptureObservationKind),
 }
 
+#[cfg(test)]
 fn loaded_phase_window(
     request: &AutotuneCaptureRequest,
     sample: super::autotune_counter::AutotuneCounterRateWindow,

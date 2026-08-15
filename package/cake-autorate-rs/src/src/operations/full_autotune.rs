@@ -94,7 +94,7 @@ const BIDIRECTIONAL_LOAD_EVIDENCE_SCHEMA_VERSION: u64 = 5;
 const LOAD_EVIDENCE_HEADER: &str = "cake-autorate-autotune-load-evidence\t6";
 const BIDIRECTIONAL_LOAD_EVIDENCE_HEADER: &str =
     "cake-autorate-autotune-bidirectional-load-evidence\t5";
-const PREVIOUS_LOAD_EVIDENCE_HEADER: &str = "cake-autorate-autotune-load-evidence\t5";
+#[cfg(test)]
 const PREVIOUS_BIDIRECTIONAL_LOAD_EVIDENCE_HEADER: &str =
     "cake-autorate-autotune-bidirectional-load-evidence\t4";
 const EVIDENCE_DIR: &str = "autotune-evidence";
@@ -1474,6 +1474,7 @@ impl AutotuneLoadEvidence {
     }
 }
 
+#[cfg(test)]
 pub fn read_load_evidence(path: &Path) -> Result<AutotuneLoadEvidence, String> {
     AutotuneLoadEvidence::decode(&read_private_bounded(path, MAX_AUTOTUNE_EVIDENCE_BYTES)?)
 }
@@ -2018,10 +2019,6 @@ impl AutotuneLoadProof for AutotuneControlledLoadEvidence {
 }
 
 impl AutotuneControlledLoadEvidence {
-    pub fn is_immediately_prior_to(&self, request: &AutotuneCaptureRequest) -> bool {
-        self.load_is_immediately_prior_to(request)
-    }
-
     fn request(&self) -> &AutotuneCaptureRequest {
         match self {
             Self::Directional(value) => &value.request,
@@ -2049,6 +2046,7 @@ pub fn read_controlled_load_evidence(
     decode_controlled_load_evidence(&read_private_bounded(path, MAX_AUTOTUNE_EVIDENCE_BYTES)?)
 }
 
+#[cfg(test)]
 pub fn publish_bidirectional_load_evidence(
     path: &Path,
     evidence: &AutotuneBidirectionalLoadEvidence,
@@ -2687,14 +2685,6 @@ impl AutotuneRuntimeControl {
         require_interface(&self.target_interface)?;
         validate_topology_rates(self.topology, self.download_kbps, self.upload_kbps)?;
         Ok(())
-    }
-
-    pub fn download_shaped(&self) -> bool {
-        self.topology.download_is_shaped()
-    }
-
-    pub fn upload_shaped(&self) -> bool {
-        self.topology.upload_is_shaped()
     }
 
     pub fn encode(&self) -> Result<String, String> {
@@ -4684,6 +4674,7 @@ impl PendingMeasurementDebits {
         self == Self::None
     }
 
+    #[cfg(test)]
     fn total_count(self) -> u32 {
         match self {
             Self::None => 0,
@@ -6554,6 +6545,7 @@ impl AutotuneReplayState {
         None
     }
 
+    #[cfg(test)]
     pub fn sqm_disable_comparison_allowed(&self) -> bool {
         uses_full_raw_controls(self.strategy, self.allow_sqm_disable)
             && self.raw_both_download_seen
@@ -8008,6 +8000,7 @@ fn native_pair_confirmation_outcome(
     )
 }
 
+#[cfg(test)]
 fn build_native_pair_confirmation_result(
     proposal: &AutotuneProposal,
     download_search: &ProfileSearchResult,
@@ -10798,29 +10791,6 @@ pub(crate) fn native_apply_execution_plan_for_option_transaction(
     .ok_or_else(|| "native Apply option ID is not present in the verified Review".to_string())
 }
 
-pub(crate) fn canonical_native_apply_option_manifest_transaction(
-    request_path: &Path,
-    review_path: &Path,
-    expected_job_id: &str,
-    expected_worker_run_id: &str,
-    expected_review_digest: &str,
-    coordinator_boot_id: &str,
-    coordinator_generation: &str,
-    option_id: &str,
-) -> Result<Vec<u8>, String> {
-    native_apply_execution_plan_for_option_transaction(
-        request_path,
-        review_path,
-        expected_job_id,
-        expected_worker_run_id,
-        expected_review_digest,
-        coordinator_boot_id,
-        coordinator_generation,
-        option_id,
-    )?
-    .canonical_manifest_bytes()
-}
-
 pub(crate) fn canonical_native_apply_manifest_transaction(
     request_path: &Path,
     review_path: &Path,
@@ -11829,6 +11799,7 @@ impl DirectionalLoadAggregate {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Default)]
 struct BidirectionalLoadAggregate {
     run_count: u8,
@@ -11849,6 +11820,7 @@ struct BidirectionalLoadAggregate {
     backend_ul_payload_only_runs: u8,
 }
 
+#[cfg(test)]
 impl BidirectionalLoadAggregate {
     fn add(
         &mut self,
@@ -12505,6 +12477,7 @@ fn measurement_evidence_from_capture(
     Ok(measurement)
 }
 
+#[cfg(test)]
 fn measurement_evidence_from_bidirectional_capture(
     snapshot: &AutotuneCaptureSnapshot,
     load: &AutotuneBidirectionalLoadEvidence,
@@ -12930,130 +12903,6 @@ fn run_directional_capture_load_with_session(
     }
     let evidence = aggregate.evidence(request, monotonic_boot_ms()?)?;
     publish_load_evidence(&capture.load_evidence_path, &evidence)?;
-    let snapshot = wait_for_capture_state(
-        &capture.snapshot_path,
-        request,
-        CaptureWaitTarget::Complete,
-        terminate,
-    )?;
-    Ok((snapshot, evidence))
-}
-
-fn run_bidirectional_capture_load(
-    session: &mut EmbeddedSpeedtestSession,
-    operation: &OperationRequest,
-    worker_run_id: &str,
-    evidence_store: &AutotuneEvidenceStore,
-    evidence_phase: AutotunePhase,
-    capture: &AutotuneCaptureGuard,
-    request: &AutotuneCaptureRequest,
-    accounting: &SpeedtestAccountingPlan,
-    attest_accounting_epoch: &mut dyn FnMut() -> Result<(), String>,
-    remaining_traffic_budget: &mut u64,
-    terminate: &AtomicBool,
-) -> Result<(AutotuneCaptureSnapshot, AutotuneBidirectionalLoadEvidence), CaptureWaitError> {
-    if request.direction != Some(SpeedtestDirection::Both)
-        || request.topology != MeasurementTopology::ShapedBoth
-    {
-        return Err(CaptureWaitError::Failure(
-            "native Auto-Tune pair capture request is not both-shaped".to_string(),
-        ));
-    }
-    let mut aggregate = BidirectionalLoadAggregate::default();
-    let traffic_safety_reserve_bytes =
-        capture_traffic_safety_reserve_bytes(operation, request, SpeedtestDirection::Both)?;
-    let mut thresholds_met = false;
-    let mut last_progress = None;
-    for run_index in 0..MAX_DIRECTIONAL_LOAD_RUNS {
-        let run_started_boot_ms = monotonic_boot_ms()?;
-        let mut bounded_request = operation.clone();
-        bounded_request.traffic_budget_bytes = *remaining_traffic_budget;
-        let scratch_path = capture.load_evidence_path.with_file_name(format!(
-            "autotune-speedtest-{}-{}-pair-{}",
-            worker_run_id,
-            request.sequence,
-            run_index + 1
-        ));
-        let mut record_debit = |debit| {
-            append_traffic_debit_evidence(
-                evidence_store,
-                operation,
-                worker_run_id,
-                evidence_phase,
-                TrafficDebitPurpose::Measurement,
-                SpeedtestDirection::Both,
-                debit,
-            )
-        };
-        let (terminal, sample) = run_embedded_speedtest_with_accounting_in_session_and_debit(
-            session,
-            &bounded_request,
-            worker_run_id,
-            SpeedtestDirection::Both,
-            accounting,
-            attest_accounting_epoch,
-            traffic_safety_reserve_bytes,
-            remaining_traffic_budget,
-            terminate,
-            &scratch_path,
-            &mut record_debit,
-        )?;
-        let result = match terminal {
-            SpeedtestTerminal::Complete(result) => result,
-            SpeedtestTerminal::Cancelled => {
-                return Err(CaptureWaitError::Failure(
-                    "native Auto-Tune pair load was cancelled".to_string(),
-                ))
-            }
-            SpeedtestTerminal::Failed { code } => {
-                return Err(CaptureWaitError::Failure(format!(
-                    "native Auto-Tune pair load failed: {code}"
-                )))
-            }
-        };
-        let sample = sample.ok_or_else(|| {
-            "native Auto-Tune pair load returned no private byte evidence".to_string()
-        })?;
-        aggregate.add(&result, &sample)?;
-        let progress = wait_for_capture_progress(
-            &capture.snapshot_path,
-            request,
-            run_started_boot_ms,
-            terminate,
-        )?;
-        if loaded_sample_thresholds_met(&progress) {
-            thresholds_met = true;
-            last_progress = Some(progress);
-            break;
-        }
-        last_progress = Some(progress);
-    }
-    if aggregate.run_count == 0 {
-        return Err(CaptureWaitError::Failure(
-            "native Auto-Tune pair load produced no valid measurement".to_string(),
-        ));
-    }
-    if !thresholds_met {
-        let detail = last_progress
-            .as_ref()
-            .map(|snapshot| {
-                format!(
-                    "icmp={}/{}, transport={}/{}, cpu={}/1",
-                    snapshot.icmp_samples,
-                    MIN_AUTOTUNE_LOADED_ICMP_SAMPLES,
-                    snapshot.transport_samples,
-                    MIN_AUTOTUNE_TRANSPORT_SAMPLES,
-                    snapshot.cpu_samples
-                )
-            })
-            .unwrap_or_else(|| "no capture progress snapshot".to_string());
-        return Err(CaptureWaitError::Failure(format!(
-            "native Auto-Tune pair capture sample thresholds were not met after {} runs ({detail})",
-            MAX_DIRECTIONAL_LOAD_RUNS
-        )));
-    }
-    let evidence = aggregate.evidence(request, monotonic_boot_ms()?)?;
-    publish_bidirectional_load_evidence(&capture.load_evidence_path, &evidence)?;
     let snapshot = wait_for_capture_state(
         &capture.snapshot_path,
         request,

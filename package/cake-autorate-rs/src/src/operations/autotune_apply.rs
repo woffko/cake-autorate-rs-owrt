@@ -1369,6 +1369,7 @@ pub(crate) fn validate_native_apply_option_id(option_id: &str) -> Result<(), Str
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn canonical_native_apply_manifest_bytes(
     input: NativeApplyManifestInput<'_>,
 ) -> Result<Vec<u8>, String> {
