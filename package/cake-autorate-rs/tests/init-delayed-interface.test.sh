@@ -2,110 +2,50 @@
 set -eu
 
 base="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-. "$base/files/etc/init.d/cake-autorate"
+work="$(mktemp -d "${TMPDIR:-/tmp}/cake-init-delayed-interface-test.XXXXXX")"
+daemon="$work/cake-autorated"
+trap 'rm -rf "$work"' EXIT INT TERM
 
-events=""
-managed=1
-sqm_enabled=1
-backing=1
-conflict=0
+cat >"$daemon" <<'EOF'
+#!/bin/sh
+if [ "${CAKE_TEST_LITE:-0}" = 1 ]; then
+	printf '%s\n' 'service-start-v1 delayed'
+else
+	printf '%s\n' 'service-start-v2 delayed -'
+fi
+EOF
+chmod +x "$daemon"
 
-config_get_bool() {
-	variable="$1"
-	option="$3"
-	fallback="${4:-0}"
-	value="$fallback"
-	case "$option" in
-		enabled) value=1 ;;
-		manage_sqm) value="$managed" ;;
-		sqm_enabled) value="$sqm_enabled" ;;
-	esac
-	eval "$variable=\$value"
-}
+for variant in full lite; do
+	init_script="$work/cake-autorate.$variant"
+	events="$work/events.$variant"
+	sh "$base/scripts/render-init-variant.sh" "$variant" \
+		"$base/files/etc/init.d/cake-autorate" "$init_script"
 
-config_get() {
-	variable="$1"
-	option="$3"
-	fallback="${4:-}"
-	value="$fallback"
-	case "$option" in
-		sqm_interface|ul_if|wan_if) value=missing-wan ;;
-		sqm_section) value=cake_delayed ;;
-	esac
-	eval "$variable=\$value"
-}
-
-section_has_sqm_conflict() {
-	[ "$conflict" -eq 1 ]
-}
-
-instance_has_enabled_sqm_backing() {
-	[ "$backing" -eq 1 ]
-}
-
-procd_open_instance() { events="${events}${events:+ }open:$1"; }
-procd_set_param() { events="${events}${events:+ }set:$1"; }
-procd_close_instance() { events="${events}${events:+ }close"; }
-logger() { :; }
-
-# Runtime devices, IFB and redirect are deliberately absent. A valid enabled
-# instance must still be represented in procd so the daemon can wait and
-# recover after a delayed WWAN/PPPoE link appears.
-start_instance delayed
-case " $events " in
-	*" open:delayed "*) ;;
-	*)
-		echo "delayed interface prevented procd instance registration: $events" >&2
+	grep -Fq '"$DAEMON" --service-lifecycle prepare-start' "$init_script"
+	if grep -Eq '^start_instance\(\)|^instance_has_(startable_config|enabled_sqm_backing)\(\)|^section_has_sqm_conflict\(\)' "$init_script"; then
+		echo "$variant init still owns delayed-interface admission decisions" >&2
 		exit 1
-		;;
-esac
-case " $events " in *" set:command "*) ;; *)
-	echo "delayed instance omitted its daemon command: $events" >&2
-	exit 1
-esac
-case " $events " in *" close "*) ;; *)
-	echo "delayed instance did not close its procd registration: $events" >&2
-	exit 1
-esac
+	fi
 
-# A managed instance with its SQM half disabled remains a configuration error,
-# not a transient runtime wait.
-events=""
-sqm_enabled=0
-start_instance delayed
-[ -z "$events" ] || {
-	echo "managed instance started while its SQM queue was disabled" >&2
-	exit 1
-}
+	(
+		. "$init_script"
+		DAEMON="$daemon"
+		[ "$variant" != lite ] || CAKE_TEST_LITE=1
+		export CAKE_TEST_LITE
+		logger() { :; }
+		procd_open_instance() { printf 'open:%s\n' "$1" >> "$events"; }
+		procd_set_param() { :; }
+		procd_close_instance() { printf '%s\n' close >> "$events"; }
+		start_service_locked
+	)
 
-# Unmanaged mode may wait for externally owned topology but must never require
-# a cake-autorate-owned SQM section.
-events=""
-managed=0
-backing=0
-start_instance delayed
-case " $events " in
-	*" open:delayed "*) ;;
-	*)
-		echo "unmanaged delayed instance was not registered: $events" >&2
+	[ "$(cat "$events")" = 'open:delayed
+close' ] || {
+		echo "$variant init second-guessed the native delayed-interface plan" >&2
+		cat "$events" >&2
 		exit 1
-		;;
-esac
-case " $events " in *" close "*) ;; *)
-	echo "unmanaged delayed instance registration was incomplete: $events" >&2
-	exit 1
-esac
+	}
+done
 
-# Static ownership conflicts remain fail-closed.
-events=""
-managed=1
-sqm_enabled=1
-backing=1
-conflict=1
-start_instance delayed
-[ -z "$events" ] || {
-	echo "conflicting managed instance was registered" >&2
-	exit 1
-}
-
-echo "init delayed-interface tests passed"
+echo "init delayed-interface bridge tests passed"

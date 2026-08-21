@@ -114,6 +114,7 @@ const IFLA_GSO_IPV4_MAX_SIZE: u16 = 63;
 const IFLA_GRO_IPV4_MAX_SIZE: u16 = 64;
 const IFLA_DPLL_PIN: u16 = 65;
 const IFLA_INFO_KIND: u16 = 1;
+const IFLA_INFO_DATA: u16 = 2;
 const IFLA_XDP_ATTACHED: u16 = 2;
 const XDP_ATTACHED_NONE: u8 = 0;
 
@@ -1074,11 +1075,31 @@ impl ParsedPass {
         let target_ifindex = self.target_ifindex()?;
         let relevant =
             header.ifindex == target_ifindex || self.private_links.contains_key(&header.ifindex);
-        let parsed =
-            parse_tc_attributes(&payload[TCMSG_LEN..], TopologyObject::Qdisc, budget, limits)?;
         if !relevant {
             return Ok(());
         }
+        let owned_slot = header.parent == TC_H_ROOT
+            || (header.ifindex == target_ifindex && header.parent == TC_H_INGRESS);
+        if !owned_slot {
+            if self
+                .query
+                .private_namespace
+                .qdisc_handles
+                .contains(&header.handle)
+            {
+                return Err(KernelTopologyError::Invalid(
+                    "non-owned qdisc attachment collides with a reserved handle".to_string(),
+                ));
+            }
+            // Multi-queue physical interfaces expose one kernel-managed leaf
+            // qdisc per TX queue.  Bootstrap owns only the root and target
+            // ingress/clsact slots represented by KernelTopologySnapshot; a
+            // non-reserved leaf cannot collide with either ownership slot and
+            // is therefore deliberately outside the canonical witness.
+            return Ok(());
+        }
+        let parsed =
+            parse_tc_attributes(&payload[TCMSG_LEN..], TopologyObject::Qdisc, budget, limits)?;
         let kind = parsed.kind.ok_or_else(|| {
             KernelTopologyError::Invalid("relevant qdisc is missing TCA_KIND".to_string())
         })?;
@@ -2130,6 +2151,7 @@ fn parse_link_info(
     limits: &NetlinkReadLimits,
 ) -> Result<(Option<String>, Vec<Vec<u16>>), KernelTopologyError> {
     let mut kind = None;
+    let mut info_data = None;
     let mut unsupported = Vec::new();
     let mut cursor = AttributeCursor::new(payload);
     while let Some(attribute) = cursor.next(budget, limits)? {
@@ -2141,7 +2163,24 @@ fn parse_link_info(
                     "IFLA_INFO_KIND",
                 )?;
             }
+            IFLA_INFO_DATA if attribute.flags & !NLA_F_NESTED == 0 => {
+                if info_data.replace(attribute.payload.is_empty()).is_some() {
+                    return Err(KernelTopologyError::Invalid(
+                        "netlink object contains duplicate IFLA_INFO_DATA".to_string(),
+                    ));
+                }
+            }
             other => unsupported.push(vec![IFLA_LINKINFO, other]),
+        }
+    }
+    if let Some(empty) = info_data {
+        // Linux emits an empty IFLA_INFO_DATA nest for a PPP link even though
+        // no kind-specific ownership state is present (iproute2 renders only
+        // `info_kind: ppp`).  Accept exactly that empty, typed shape. Any PPP
+        // payload, or INFO_DATA for a kind with real configurable topology,
+        // remains ownership-relevant and fail-closed.
+        if kind.as_deref() != Some("ppp") || !empty {
+            unsupported.push(vec![IFLA_LINKINFO, IFLA_INFO_DATA]);
         }
     }
     Ok((kind, unsupported))
@@ -3066,6 +3105,16 @@ mod tests {
         payload
     }
 
+    fn link_with_info_data(ifindex: u32, kind: &str, data: &[u8]) -> Vec<u8> {
+        let mut payload = custom_link_payload(ifindex, "eth0", None, false);
+        let mut encoded_kind = kind.as_bytes().to_vec();
+        encoded_kind.push(0);
+        let mut nested = nla(IFLA_INFO_KIND, &encoded_kind);
+        nested.extend_from_slice(&nla(IFLA_INFO_DATA | NLA_F_NESTED, data));
+        payload.extend_from_slice(&nla(IFLA_LINKINFO | NLA_F_NESTED, &nested));
+        payload
+    }
+
     fn qdisc_payload(options: bool) -> Vec<u8> {
         let mut payload = vec![0u8; TCMSG_LEN];
         payload[4..8].copy_from_slice(&10i32.to_ne_bytes());
@@ -3079,6 +3128,21 @@ mod tests {
 
     fn fq_codel_qdisc_payload(ifindex: u32) -> Vec<u8> {
         fq_codel_qdisc_payload_with_offload(ifindex, &[0])
+    }
+
+    fn mq_qdisc_payload(ifindex: u32) -> Vec<u8> {
+        let mut payload = vec![0u8; TCMSG_LEN];
+        payload[4..8].copy_from_slice(&(ifindex as i32).to_ne_bytes());
+        payload[12..16].copy_from_slice(&TC_H_ROOT.to_ne_bytes());
+        payload.extend_from_slice(&nla(TCA_KIND, b"mq\0"));
+        payload
+    }
+
+    fn fq_codel_leaf_qdisc_payload(ifindex: u32, parent: u32, handle: u32) -> Vec<u8> {
+        let mut payload = fq_codel_qdisc_payload(ifindex);
+        payload[8..12].copy_from_slice(&handle.to_ne_bytes());
+        payload[12..16].copy_from_slice(&parent.to_ne_bytes());
+        payload
     }
 
     fn fq_codel_qdisc_payload_with_offload(ifindex: u32, offload: &[u8]) -> Vec<u8> {
@@ -3501,6 +3565,33 @@ mod tests {
     }
 
     #[test]
+    fn only_empty_ppp_info_data_is_observation_only() {
+        let empty_ppp = link_with_info_data(10, "ppp", &[]);
+        let fake = FakeNetlinkIo::new(stable_replies_for_link(&empty_ppp, false));
+        let mut reader = NetlinkTopologyReader::new(fake);
+        let read = reader.read_topology(&query()).unwrap();
+        assert!(read.unknown_ownership_attributes.is_empty());
+        assert_eq!(
+            read.snapshot.target.kind,
+            KernelLinkKind::Named("ppp".to_string())
+        );
+
+        for payload in [
+            link_with_info_data(10, "ppp", &[1, 0, 0, 0]),
+            link_with_info_data(10, "vlan", &[]),
+        ] {
+            let fake = FakeNetlinkIo::new(stable_replies_for_link(&payload, false));
+            let mut reader = NetlinkTopologyReader::new(fake);
+            let read = reader.read_topology(&query()).unwrap();
+            assert_eq!(read.unknown_ownership_attributes.len(), 1);
+            assert_eq!(
+                read.unknown_ownership_attributes[0].nested_path,
+                vec![IFLA_LINKINFO, IFLA_INFO_DATA]
+            );
+        }
+    }
+
+    #[test]
     fn only_exact_unattached_xdp_state_is_accepted() {
         for outer_flags in [0, NLA_F_NESTED] {
             let mut unattached = link_payload(10, false);
@@ -3623,6 +3714,49 @@ mod tests {
             pass.parse_qdisc(&unsupported, &mut budget, &limits),
             Err(KernelTopologyError::Invalid(message)) if message.contains("duplicate TCA_OPTIONS")
         ));
+    }
+
+    #[test]
+    fn physical_multi_queue_leaves_are_outside_ownership_but_reserved_handles_fail_closed() {
+        let link = ordinary_openwrt_link_payload(10);
+        let limits = NetlinkReadLimits::default();
+        let query = typed_query();
+        let mut pass = ParsedPass::new(&query, NETNS_COOKIE);
+        let mut budget = ReadBudget::default();
+        pass.parse_link(&link, &mut budget, &limits).unwrap();
+        pass.parse_qdisc(&mq_qdisc_payload(10), &mut budget, &limits)
+            .unwrap();
+
+        for parent in 1..=4 {
+            pass.parse_qdisc(
+                &fq_codel_leaf_qdisc_payload(10, parent, 0),
+                &mut budget,
+                &limits,
+            )
+            .unwrap();
+        }
+        assert_eq!(pass.root_qdiscs.len(), 1);
+        assert_eq!(pass.root_qdiscs[0].kind, "mq");
+        assert!(pass.ingress_qdiscs.is_empty());
+        assert!(pass.unknown.is_empty());
+
+        let reserved_handle = query.private_namespace.qdisc_handles[0];
+        let error = pass
+            .parse_qdisc(
+                &fq_codel_leaf_qdisc_payload(10, 1, reserved_handle),
+                &mut budget,
+                &limits,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            KernelTopologyError::Invalid(message) if message.contains("reserved handle")
+        ));
+
+        let mut malformed_unowned = fq_codel_leaf_qdisc_payload(10, 2, 0);
+        malformed_unowned.extend_from_slice(&nla(TCA_OPTIONS, &[1, 2, 3, 4]));
+        pass.parse_qdisc(&malformed_unowned, &mut budget, &limits)
+            .unwrap();
     }
 
     #[test]

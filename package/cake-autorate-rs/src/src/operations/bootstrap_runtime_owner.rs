@@ -64,7 +64,6 @@ const MAX_PENDING_ICMP_WAIT: Duration = Duration::from_secs(4);
 const MAX_LOADED_COUNTER_BURST_COMPLETIONS: u8 = 32;
 const MAX_LOADED_TRANSPORT_FLIGHTS_PER_BURST: u8 = 4;
 const MAX_LOADED_TRANSPORT_DIAGNOSTICS: u8 = MAX_LOADED_TRANSPORT_FLIGHTS_PER_BURST;
-const MAX_LOADED_COUNTER_BURST_WALL: Duration = Duration::from_secs(8);
 const PROBE_STOPPING_DETAIL: &str =
     "bootstrap capture probes are still stopping before private topology removal";
 
@@ -935,23 +934,18 @@ enum LoadedCounterBurstState {
     Priming {
         remaining_completions: u8,
         remaining_flights: u8,
-        deadline: Instant,
     },
     BracketingFlight {
         remaining_completions: u8,
         remaining_flights: u8,
-        deadline: Instant,
     },
 }
 
 impl LoadedCounterBurstState {
-    fn begin(now: Instant) -> Self {
+    fn begin() -> Self {
         Self::Priming {
             remaining_completions: MAX_LOADED_COUNTER_BURST_COMPLETIONS,
             remaining_flights: MAX_LOADED_TRANSPORT_FLIGHTS_PER_BURST,
-            deadline: now
-                .checked_add(MAX_LOADED_COUNTER_BURST_WALL)
-                .unwrap_or(now),
         }
     }
 
@@ -963,22 +957,12 @@ impl LoadedCounterBurstState {
         matches!(self, Self::BracketingFlight { .. })
     }
 
-    fn deadline(self) -> Option<Instant> {
-        match self {
-            Self::Idle => None,
-            Self::Priming { deadline, .. } | Self::BracketingFlight { deadline, .. } => {
-                Some(deadline)
-            }
-        }
-    }
-
     fn after_reactor(
         self,
         accepting_observations: bool,
         counter_completed: bool,
         counter_active: bool,
         transport_active: bool,
-        now: Instant,
     ) -> Self {
         if !accepting_observations {
             return Self::Idle;
@@ -988,48 +972,40 @@ impl LoadedCounterBurstState {
             Self::Priming {
                 mut remaining_completions,
                 remaining_flights,
-                deadline,
             } => {
                 if counter_completed {
                     remaining_completions = remaining_completions.saturating_sub(1);
                 }
                 if transport_active {
-                    // Dispatch may cross the wall while its mandatory durable
-                    // attestation is in progress. Once the worker accepted
-                    // the flight, retain its exact post-counter settlement
-                    // fence; the BracketingFlight branch yields immediately
-                    // after that settlement when the wall or completion
-                    // budget is exhausted.
+                    // Once the worker accepts the flight, retain its exact
+                    // post-counter settlement fence.  The bounded completion
+                    // and flight budgets decide when fairness yields; variable
+                    // attestation latency is never a transition source.
                     Self::BracketingFlight {
                         remaining_completions,
                         remaining_flights,
-                        deadline,
                     }
                 } else if counter_active {
-                    // The exact counter read was admitted before the fairness
-                    // wall.  Keep its immutable read-purpose/cycle pair until
-                    // the completion is consumed; resetting the cycle here
-                    // would turn that legitimate completion into an identity
+                    // Keep the immutable read-purpose/cycle pair until the
+                    // completion is consumed; resetting the cycle here would
+                    // turn that legitimate completion into an identity
                     // mismatch.  This branch never admits another read.
                     Self::Priming {
                         remaining_completions,
                         remaining_flights,
-                        deadline,
                     }
-                } else if now >= deadline || remaining_completions == 0 {
+                } else if remaining_completions == 0 {
                     Self::Idle
                 } else {
                     Self::Priming {
                         remaining_completions,
                         remaining_flights,
-                        deadline,
                     }
                 }
             }
             Self::BracketingFlight {
                 mut remaining_completions,
                 remaining_flights,
-                deadline,
             } => {
                 if counter_completed {
                     remaining_completions = remaining_completions.saturating_sub(1);
@@ -1038,10 +1014,9 @@ impl LoadedCounterBurstState {
                     return Self::BracketingFlight {
                         remaining_completions,
                         remaining_flights,
-                        deadline,
                     };
                 }
-                if now >= deadline || remaining_completions == 0 || remaining_flights <= 1 {
+                if remaining_completions == 0 || remaining_flights <= 1 {
                     Self::Idle
                 } else {
                     // The post-flight physical endpoint may become the exact
@@ -1052,7 +1027,6 @@ impl LoadedCounterBurstState {
                     Self::Priming {
                         remaining_completions,
                         remaining_flights: remaining_flights - 1,
-                        deadline,
                     }
                 }
             }
@@ -2261,17 +2235,12 @@ impl BootstrapCaptureRuntime {
         let mut transport_active = self.loaded_transport_work_active();
         let counter_active = self.pending_counter_fence.is_some();
 
-        // A FlightEvidence read admitted before the fairness wall may finish
-        // after it because the immutable full-topology attestation preceding
-        // the Rebase is intentionally synchronous and outside the measured
-        // byte interval.  Consume that just-completed, single-use authority
-        // before applying the wall.  Otherwise `after_reactor()` yields to
-        // Idle and the cleanup below erases a valid exact endpoint before it
-        // can dispatch anything.  This is not a timer-created transition: the
-        // positive event is the exact FlightEvidence completion, scheduling
-        // still repeats durable authority/readiness checks, and a successful
-        // dispatch enters BracketingFlight so its mandatory FlightPost fence
-        // must settle before fairness can yield.
+        // Consume the just-completed single-use FlightEvidence authority
+        // before applying the event budgets.  The positive event is the exact
+        // counter completion; scheduling still repeats durable authority and
+        // readiness checks, and a successful dispatch enters
+        // BracketingFlight so its mandatory FlightPost fence must settle
+        // before fairness can yield.
         if burst_before.active()
             && counter_completed
             && self.loaded_counter_cycle == LoadedCounterCycleState::FlightReady
@@ -2292,7 +2261,6 @@ impl BootstrapCaptureRuntime {
             counter_completed,
             counter_active,
             transport_active,
-            Instant::now(),
         );
         if self.loaded_counter_burst.active()
             && self.loaded_counter_cycle == LoadedCounterCycleState::FlightReady
@@ -2311,7 +2279,6 @@ impl BootstrapCaptureRuntime {
                     false,
                     false,
                     true,
-                    Instant::now(),
                 );
             } else {
                 self.loaded_topology_attestation = None;
@@ -2425,17 +2392,6 @@ impl BootstrapCaptureRuntime {
             ));
         }
         let now = Instant::now();
-        if self
-            .loaded_counter_burst
-            .deadline()
-            .is_some_and(|deadline| now >= deadline)
-            && !self.loaded_transport_work_active()
-        {
-            self.loaded_counter_burst = LoadedCounterBurstState::Idle;
-            self.loaded_topology_attestation = None;
-            self.loaded_transport_authority = None;
-            return Ok(LoadedCounterReactorWait::Inactive);
-        }
         if self.loaded_counter_cycle == LoadedCounterCycleState::FlightReady {
             self.try_schedule_transport(runtime_dir, store, actuator)?;
             if self.loaded_transport_work_active() {
@@ -2445,7 +2401,6 @@ impl BootstrapCaptureRuntime {
                     false,
                     false,
                     true,
-                    Instant::now(),
                 );
                 return Ok(LoadedCounterReactorWait::TransportCompletion);
             }
@@ -2468,13 +2423,9 @@ impl BootstrapCaptureRuntime {
             // the stronger durable authority attestation before it can use
             // the resulting endpoint.  Therefore the cadence itself carries
             // no authority and must perform no synchronous work.
-            let cadence = self.next_rate_sample.saturating_duration_since(now);
-            let bounded = self
-                .loaded_counter_burst
-                .deadline()
-                .map(|deadline| deadline.saturating_duration_since(now))
-                .map_or(cadence, |deadline| cadence.min(deadline));
-            return Ok(LoadedCounterReactorWait::SamplingCadence(bounded));
+            return Ok(LoadedCounterReactorWait::SamplingCadence(
+                self.next_rate_sample.saturating_duration_since(now),
+            ));
         }
         if self.schedule_loaded_counter(runtime_dir, store, actuator)? {
             return Ok(LoadedCounterReactorWait::CounterCompletion);
@@ -3158,7 +3109,6 @@ impl BootstrapCaptureRuntime {
                 if now < self.next_rate_sample {
                     return Ok(());
                 }
-                self.next_rate_sample = now.checked_add(interval).unwrap_or(now);
                 self.reset_counter_identity(request);
                 let rates = self
                     .rate_monitor
@@ -3177,9 +3127,9 @@ impl BootstrapCaptureRuntime {
                     // readiness freshness bound revokes it; writing a
                     // synthetic `None` here aliases scheduler jitter into a
                     // false phase change and can suppress the next probe.
+                    self.next_rate_sample = now.checked_add(interval).unwrap_or(now);
                     return Ok(());
                 }
-                self.observe_transport_phase(request, Some((false, false)), &policy, now)?;
                 let (download_reference, upload_reference) =
                     self.idle_rate_reference.ok_or_else(|| {
                         (
@@ -3198,6 +3148,37 @@ impl BootstrapCaptureRuntime {
                 if let Some(kind) = kind {
                     self.record_attested_observation(runtime_dir, store, actuator, request, kind)?;
                 }
+                // Traffic observation publication performs exact UCI, route
+                // and kernel-topology attestation. On real routers that work
+                // can exceed the immutable transport phase freshness wall.
+                // Never retimestamp the pre-attestation sample: re-read the
+                // physical counters after the attestation and authorize the
+                // phase only from that positive, fresh measurement event.
+                let attested_at = Instant::now();
+                let freshness = BootstrapTransportRuntime::dropout(&policy);
+                let phase_observed_at =
+                    post_attestation_idle_phase_time(now, attested_at, freshness, || {
+                        self.rate_monitor
+                            .as_mut()
+                            .expect("bootstrap physical rate monitor was initialized")
+                            .try_sample_at(attested_at)
+                            .map(|sample| sample.fresh)
+                            .map_err(|error| ("capture-rate-unavailable", error.to_string()))
+                    })?;
+                let Some(phase_observed_at) = phase_observed_at else {
+                    self.next_rate_sample =
+                        attested_at.checked_add(interval).unwrap_or(attested_at);
+                    return Ok(());
+                };
+                self.observe_transport_phase(
+                    request,
+                    Some((false, false)),
+                    &policy,
+                    phase_observed_at,
+                )?;
+                self.next_rate_sample = phase_observed_at
+                    .checked_add(interval)
+                    .unwrap_or(phase_observed_at);
             }
             AutotuneCapturePhase::LoadedMeasurement => {
                 self.reset_counter_identity(request);
@@ -3304,6 +3285,20 @@ impl BootstrapCaptureRuntime {
             .try_schedule(&request)
             .map_err(|error| ("capture-speedtest-counters-unavailable", error))?;
         if scheduled {
+            if purpose == LoadedCounterReadPurpose::Rebase {
+                // The durable attestation immediately preceding Rebase is the
+                // causal topology fence for the next physical delta. Rebase
+                // establishes the byte baseline after this timestamp;
+                // FlightEvidence therefore measures only later traffic. Do
+                // not retain the older Evidence attestation across a slow
+                // OpenWrt UCI/route/netlink pass.
+                self.loaded_topology_attestation = Some(LoadedTopologyAttestation {
+                    request: request.clone(),
+                    epoch: self.counter_epoch,
+                    attested_at: scheduled_at,
+                });
+                self.loaded_transport_authority = None;
+            }
             self.pending_counter_fence = Some(CounterReadFence {
                 request,
                 epoch: self.counter_epoch,
@@ -3316,7 +3311,7 @@ impl BootstrapCaptureRuntime {
 
     /// Start one bounded loaded counter burst only after every unrelated
     /// synchronous observation in the normal owner turn has completed.  The
-    /// burst may continue across only the explicit completion, flight and wall
+    /// burst may continue across only the explicit completion and flight
     /// bounds; it must then yield back to CPU, ICMP and runtime health.
     fn schedule_loaded_counter_after_observations<A: BootstrapCaptureAuthority>(
         &mut self,
@@ -3325,7 +3320,7 @@ impl BootstrapCaptureRuntime {
         actuator: &mut A,
     ) -> CaptureRuntimeResult {
         if self.schedule_loaded_counter(runtime_dir, store, actuator)? {
-            self.loaded_counter_burst = LoadedCounterBurstState::begin(Instant::now());
+            self.loaded_counter_burst = LoadedCounterBurstState::begin();
         }
         Ok(())
     }
@@ -3484,6 +3479,48 @@ impl BootstrapCaptureRuntime {
         } else {
             now
         };
+        if readiness.ready && request.phase == AutotuneCapturePhase::IdleBaseline {
+            // The dispatch attestation above is intentionally stronger than
+            // the rolling rate observation, and on physical routers its UCI,
+            // route and netlink reads may outlive the immutable phase
+            // freshness wall. Never retimestamp the earlier observation.
+            // Re-read physical counters after attestation and, when the
+            // minimum counter interval has elapsed, replace phase authority
+            // with this new positive measurement before try_schedule()
+            // re-evaluates readiness.
+            let refreshed = self
+                .rate_monitor
+                .as_mut()
+                .ok_or_else(|| {
+                    (
+                        "capture-rate-unavailable",
+                        "bootstrap physical rate monitor is not initialized".to_string(),
+                    )
+                })?
+                .try_sample_at(schedule_at)
+                .map_err(|error| ("capture-rate-unavailable", error.to_string()))?;
+            let phase_authority = dispatch_idle_phase_time(
+                now,
+                schedule_at,
+                BootstrapTransportRuntime::dropout(&policy),
+                refreshed.fresh,
+            );
+            if phase_authority == Some(schedule_at) && refreshed.fresh {
+                self.observe_transport_phase(&request, Some((false, false)), &policy, schedule_at)?;
+                let interval = Duration::from_millis(u64::from(policy.rate_sample_interval_ms()));
+                self.next_rate_sample = schedule_at.checked_add(interval).unwrap_or(schedule_at);
+            } else if phase_authority.is_none() {
+                self.transport
+                    .as_mut()
+                    .expect("bootstrap transport runtime was initialized")
+                    .record_readiness(crate::AutotuneTransportReadiness {
+                        phase: readiness.phase,
+                        ready: false,
+                        reason: "post-attestation-rate-sample-unavailable",
+                    });
+                return Ok(());
+            }
+        }
         if readiness.ready && request.phase == AutotuneCapturePhase::LoadedMeasurement {
             let freshness = BootstrapTransportRuntime::dropout(&policy);
             let authorized = self
@@ -3852,12 +3889,19 @@ impl BootstrapCaptureRuntime {
                 if &existing == snapshot {
                     return Ok(());
                 }
-                if existing.request != snapshot.request {
+                let same_request = existing.request == snapshot.request;
+                if !capture_snapshot_matches_or_immediately_precedes_request(
+                    &existing,
+                    &snapshot.request,
+                    snapshot.updated_boot_ms,
+                ) {
                     return Err(
                         "bootstrap capture snapshot belongs to a different request".to_string()
                     );
                 }
-                if existing.state != super::full_autotune::AutotuneCaptureState::Collecting {
+                if same_request
+                    && existing.state != super::full_autotune::AutotuneCaptureState::Collecting
+                {
                     return Err(
                         "bootstrap capture snapshot cannot rewrite a terminal result".to_string(),
                     );
@@ -5108,6 +5152,19 @@ fn read_request(path: &Path) -> Result<OperationRequest, String> {
     )?)
 }
 
+fn capture_snapshot_matches_or_immediately_precedes_request(
+    snapshot: &AutotuneCaptureSnapshot,
+    request: &AutotuneCaptureRequest,
+    current_boot_ms: u64,
+) -> bool {
+    snapshot.request == *request
+        || super::full_autotune::is_immediately_prior_capture_snapshot(
+            snapshot,
+            request,
+            current_boot_ms,
+        )
+}
+
 fn synchronize_bootstrap_capture(
     runtime_dir: &Path,
     store: &RuntimeOverrideStore,
@@ -5138,12 +5195,17 @@ fn synchronize_bootstrap_capture(
     match fs::symlink_metadata(&snapshot_path) {
         Ok(_) => {
             let snapshot = read_capture_snapshot(&snapshot_path)?;
-            if snapshot.request != request {
+            let same_request = snapshot.request == request;
+            if !capture_snapshot_matches_or_immediately_precedes_request(
+                &snapshot, &request, boot_ms,
+            ) {
                 return Err(
                     "bootstrap capture snapshot does not match its active request".to_string(),
                 );
             }
-            if snapshot.state != super::full_autotune::AutotuneCaptureState::Collecting {
+            if same_request
+                && snapshot.state != super::full_autotune::AutotuneCaptureState::Collecting
+            {
                 if snapshot.state == super::full_autotune::AutotuneCaptureState::Complete
                     && request.phase == AutotuneCapturePhase::IdleBaseline
                 {
@@ -5201,6 +5263,36 @@ fn synchronize_bootstrap_capture(
             capture.reject(runtime_dir, &request, code, boot_ms)?;
             Err(detail)
         }
+    }
+}
+
+fn post_attestation_idle_phase_time<E, F>(
+    sampled_at: Instant,
+    attested_at: Instant,
+    freshness: Duration,
+    refresh: F,
+) -> Result<Option<Instant>, E>
+where
+    F: FnOnce() -> Result<bool, E>,
+{
+    if attested_at.saturating_duration_since(sampled_at) <= freshness {
+        return Ok(Some(sampled_at));
+    }
+    refresh().map(|fresh| fresh.then_some(attested_at))
+}
+
+fn dispatch_idle_phase_time(
+    sampled_at: Instant,
+    attested_at: Instant,
+    freshness: Duration,
+    refreshed: bool,
+) -> Option<Instant> {
+    if refreshed {
+        Some(attested_at)
+    } else if attested_at.saturating_duration_since(sampled_at) <= freshness {
+        Some(sampled_at)
+    } else {
+        None
     }
 }
 
@@ -5399,6 +5491,15 @@ where
                 return Ok(());
             }
         }
+        /* A worker-published restore intent is a durable revocation event.  It
+         * must outrank every loaded counter/transport completion and its early
+         * reactor continue; otherwise a long burst can starve RuntimeDriver
+         * restore until the worker's safety deadline expires. */
+        let restore_intent_present = store.read_restore_intent()?.is_some();
+        if restore_intent_present && !restore_requested {
+            restore_requested = true;
+            capture.stop_probes();
+        }
 
         // A loaded completion is already bound to the exact request, epoch
         // and exact counter-read fence. Consume it before driver/runtime
@@ -5474,8 +5575,6 @@ where
             let _ = events.wait(capture.poll_fd(), timeout)?;
             continue;
         }
-
-        let restore_intent_present = store.read_restore_intent()?.is_some();
         let preflight_permit = store.read_permit()?;
         let preflight_control = store.read_control()?;
         let preflight_checkpoint = store.read_checkpoint()?;
@@ -6093,7 +6192,7 @@ mod tests {
         let mut capture = BootstrapCaptureRuntime::new(Arc::new(AtomicBool::new(true)));
         let snapshot = capture.session.admit(&request, 1_000).unwrap();
         BootstrapCaptureRuntime::publish_if_changed(&directory, &snapshot).unwrap();
-        capture.loaded_counter_burst = LoadedCounterBurstState::begin(Instant::now());
+        capture.loaded_counter_burst = LoadedCounterBurstState::begin();
         assert!(!capture
             .clear_if_private_request_removed(&directory)
             .unwrap());
@@ -6116,6 +6215,57 @@ mod tests {
         request.direction = None;
         request.candidate_dl_kbps = Some(100_000);
         assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn slow_idle_attestation_requires_a_fresh_post_attestation_rate_sample() {
+        let sampled_at = Instant::now();
+        let freshness = Duration::from_millis(600);
+        let refresh_calls = Cell::new(0_u32);
+        let fast = post_attestation_idle_phase_time::<(), _>(
+            sampled_at,
+            sampled_at + freshness,
+            freshness,
+            || {
+                refresh_calls.set(refresh_calls.get() + 1);
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(fast, Some(sampled_at));
+        assert_eq!(refresh_calls.get(), 0);
+
+        let attested_at = sampled_at + freshness + Duration::from_millis(1);
+        let refreshed =
+            post_attestation_idle_phase_time::<(), _>(sampled_at, attested_at, freshness, || {
+                refresh_calls.set(refresh_calls.get() + 1);
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(refreshed, Some(attested_at));
+        assert_eq!(refresh_calls.get(), 1);
+
+        let unavailable =
+            post_attestation_idle_phase_time::<(), _>(sampled_at, attested_at, freshness, || {
+                refresh_calls.set(refresh_calls.get() + 1);
+                Ok(false)
+            })
+            .unwrap();
+        assert_eq!(unavailable, None);
+        assert_eq!(refresh_calls.get(), 2);
+
+        assert_eq!(
+            dispatch_idle_phase_time(sampled_at, sampled_at + freshness, freshness, false),
+            Some(sampled_at)
+        );
+        assert_eq!(
+            dispatch_idle_phase_time(sampled_at, attested_at, freshness, true),
+            Some(attested_at)
+        );
+        assert_eq!(
+            dispatch_idle_phase_time(sampled_at, attested_at, freshness, false),
+            None
+        );
     }
 
     #[test]
@@ -6618,6 +6768,75 @@ mod tests {
     }
 
     #[test]
+    fn exact_adjacent_capture_replaces_a_prior_terminal_snapshot_only() {
+        let directory = private_dir("adjacent-capture-transition");
+        let prior_request = loaded_capture_request();
+        let mut prior_session = AutotuneCaptureSession::new();
+        prior_session.admit(&prior_request, 1_000).unwrap();
+        let prior = prior_session
+            .reject("capture-runtime-mismatch", 1_001)
+            .unwrap();
+        publish_capture_snapshot(&directory.join(CAPTURE_SNAPSHOT_FILE), &prior).unwrap();
+
+        let mut next_request = prior_request.clone();
+        next_request.capture_id = "aa".repeat(16);
+        next_request.sequence += 1;
+        next_request.direction = Some(SpeedtestDirection::Upload);
+        let mut next_session = AutotuneCaptureSession::new();
+        let next = next_session.admit(&next_request, 1_002).unwrap();
+        assert!(capture_snapshot_matches_or_immediately_precedes_request(
+            &prior,
+            &next_request,
+            1_002,
+        ));
+        BootstrapCaptureRuntime::publish_if_changed(&directory, &next).unwrap();
+        assert_eq!(
+            read_capture_snapshot(&directory.join(CAPTURE_SNAPSHOT_FILE)).unwrap(),
+            next,
+        );
+
+        let same_request_terminal = next_session
+            .reject("capture-runtime-mismatch", 1_003)
+            .unwrap();
+        publish_capture_snapshot(
+            &directory.join(CAPTURE_SNAPSHOT_FILE),
+            &same_request_terminal,
+        )
+        .unwrap();
+        assert!(BootstrapCaptureRuntime::publish_if_changed(&directory, &next).is_err());
+
+        let mut skipped_request = prior_request.clone();
+        skipped_request.capture_id = "bb".repeat(16);
+        skipped_request.sequence += 2;
+        let mut skipped_session = AutotuneCaptureSession::new();
+        let skipped = skipped_session.admit(&skipped_request, 1_004).unwrap();
+        assert!(!capture_snapshot_matches_or_immediately_precedes_request(
+            &prior,
+            &skipped_request,
+            1_004,
+        ));
+
+        let foreign_directory = private_dir("foreign-adjacent-capture-transition");
+        publish_capture_snapshot(&foreign_directory.join(CAPTURE_SNAPSHOT_FILE), &prior).unwrap();
+        assert!(BootstrapCaptureRuntime::publish_if_changed(&foreign_directory, &skipped).is_err());
+
+        let mut foreign_request = next_request;
+        foreign_request.capture_id = "cc".repeat(16);
+        foreign_request.route_fingerprint = "dd".repeat(32);
+        let mut foreign_session = AutotuneCaptureSession::new();
+        let foreign = foreign_session.admit(&foreign_request, 1_005).unwrap();
+        assert!(!capture_snapshot_matches_or_immediately_precedes_request(
+            &prior,
+            &foreign_request,
+            1_005,
+        ));
+        assert!(BootstrapCaptureRuntime::publish_if_changed(&foreign_directory, &foreign).is_err());
+
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(foreign_directory).unwrap();
+    }
+
+    #[test]
     fn transport_stop_request_is_nonblocking_and_keeps_its_wake_fence() {
         let raw_wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         assert!(raw_wake >= 0);
@@ -6777,6 +6996,12 @@ mod tests {
         let termination = owner_loop
             .find("if terminate.load(Ordering::SeqCst) && !restore_requested")
             .unwrap();
+        let runtime_preflight = owner_loop
+            .find("let restore_intent_present = store.read_restore_intent()")
+            .unwrap();
+        let loaded_work_gate = owner_loop
+            .find("if !terminate.load(Ordering::SeqCst) && !restore_requested")
+            .unwrap();
         let early_completion = owner_loop
             .find("capture.poll_loaded_completion_before_owner_poll(")
             .unwrap();
@@ -6786,8 +7011,8 @@ mod tests {
         let barrier_start = owner_loop
             .find("if loaded_counter_wait != LoadedCounterReactorWait::Inactive")
             .unwrap();
-        let runtime_preflight = owner_loop
-            .find("let restore_intent_present = store.read_restore_intent()")
+        let driver_preflight = owner_loop
+            .find("let preflight_permit = store.read_permit()")
             .unwrap();
         let driver_poll = owner_loop.find("let outcome = driver.poll(").unwrap();
         let wake = owner_loop.find("capture.drain_probe_wake()").unwrap();
@@ -6803,10 +7028,13 @@ mod tests {
             .unwrap();
         assert!(
             termination < early_completion
+                && termination < runtime_preflight
+                && runtime_preflight < loaded_work_gate
+                && loaded_work_gate < early_completion
                 && early_completion < burst_drive
                 && burst_drive < barrier_start
-                && barrier_start < runtime_preflight
-                && runtime_preflight < driver_poll
+                && barrier_start < driver_preflight
+                && driver_preflight < driver_poll
                 && driver_poll < wake
                 && wake < rate
                 && rate < transport
@@ -6815,7 +7043,10 @@ mod tests {
                 && icmp < next_counter
                 && next_counter < outcome
         );
-        let barrier = &owner_loop[barrier_start..runtime_preflight];
+        let revocation = &owner_loop[runtime_preflight..early_completion];
+        assert!(revocation.contains("restore_requested = true"));
+        assert!(revocation.contains("capture.stop_probes()"));
+        let barrier = &owner_loop[barrier_start..driver_preflight];
         assert!(barrier.contains("events.refresh_processes"));
         assert!(barrier.contains("owner_authority_deadline"));
         assert!(barrier.contains("LoadedCounterReactorWait::SamplingCadence"));
@@ -6989,7 +7220,7 @@ mod tests {
 
         let mut capture = BootstrapCaptureRuntime::new(Arc::new(AtomicBool::new(false)));
         capture.session.admit(&request, boot_ms).unwrap();
-        capture.loaded_counter_burst = LoadedCounterBurstState::begin(Instant::now());
+        capture.loaded_counter_burst = LoadedCounterBurstState::begin();
         capture.loaded_counter_cycle = LoadedCounterCycleState::BaselineReady;
         capture.next_rate_sample = Instant::now() + Duration::from_millis(200);
 
@@ -7014,7 +7245,7 @@ mod tests {
 
         let mut flight_capture = BootstrapCaptureRuntime::new(Arc::new(AtomicBool::new(false)));
         flight_capture.session.admit(&request, boot_ms).unwrap();
-        flight_capture.loaded_counter_burst = LoadedCounterBurstState::begin(Instant::now());
+        flight_capture.loaded_counter_burst = LoadedCounterBurstState::begin();
         flight_capture.loaded_counter_cycle = LoadedCounterCycleState::NeedFlightEvidence;
         flight_capture.loaded_topology_attestation = Some(LoadedTopologyAttestation {
             request: request.clone(),
@@ -7141,7 +7372,7 @@ mod tests {
             .unwrap(),
         );
         capture.loaded_counter_cycle = LoadedCounterCycleState::NeedRebase;
-        capture.loaded_counter_burst = LoadedCounterBurstState::begin(Instant::now());
+        capture.loaded_counter_burst = LoadedCounterBurstState::begin();
 
         let mut authority = FakeCaptureAuthority::default();
         assert_eq!(
@@ -7157,35 +7388,53 @@ mod tests {
             .pending_counter_fence
             .as_ref()
             .is_some_and(|fence| fence.purpose == LoadedCounterReadPurpose::Rebase));
+        let rebase_fence = capture
+            .pending_counter_fence
+            .as_ref()
+            .expect("Rebase must retain its exact read fence");
+        let topology_fence = capture
+            .loaded_topology_attestation
+            .as_ref()
+            .expect("Rebase must publish a fresh causal topology fence");
+        assert_eq!(topology_fence.request, request);
+        assert_eq!(topology_fence.epoch, capture.counter_epoch);
+        assert_eq!(topology_fence.attested_at, rebase_fence.scheduled_at);
+        let delta_start = rebase_fence.scheduled_at + Duration::from_millis(1);
+        let delta_end = delta_start + Duration::from_millis(200);
+        let causal_delta = LoadedPhysicalDelta {
+            delta: super::super::autotune_counter::AutotuneCounterDelta {
+                download_bytes: 20_000_000,
+                upload_bytes: 200_000,
+                observed_start: delta_start,
+                observed_end: delta_end,
+                within_maximum_span: true,
+            },
+            phase: Some((true, false)),
+        };
+        assert!(topology_fence
+            .authorize(
+                &request,
+                capture.counter_epoch,
+                &causal_delta,
+                (true, false),
+                Duration::from_millis(600),
+            )
+            .is_some());
         assert_eq!(
             capture.loaded_counter_cycle,
             LoadedCounterCycleState::NeedRebase
         );
-        let expired = match capture.loaded_counter_burst {
-            LoadedCounterBurstState::Priming {
-                remaining_completions,
-                remaining_flights,
-                ..
-            } => LoadedCounterBurstState::Priming {
-                remaining_completions,
-                remaining_flights,
-                deadline: Instant::now()
-                    .checked_sub(Duration::from_millis(1))
-                    .unwrap(),
-            },
-            state => panic!("unexpected burst state after Rebase scheduling: {state:?}"),
-        };
-        capture.loaded_counter_burst = expired;
+        let pending = capture.loaded_counter_burst;
         capture
             .advance_loaded_counter_burst_after_poll(
                 &directory,
                 &store,
                 &mut authority,
-                expired,
+                pending,
                 false,
             )
             .unwrap();
-        assert_eq!(capture.loaded_counter_burst, expired);
+        assert_eq!(capture.loaded_counter_burst, pending);
         assert_eq!(
             capture.loaded_counter_cycle,
             LoadedCounterCycleState::NeedRebase,
@@ -7238,7 +7487,7 @@ mod tests {
             .unwrap(),
         );
         capture.loaded_counter_cycle = LoadedCounterCycleState::NeedFlightEvidence;
-        capture.loaded_counter_burst = LoadedCounterBurstState::begin(Instant::now());
+        capture.loaded_counter_burst = LoadedCounterBurstState::begin();
         capture.loaded_topology_attestation = Some(LoadedTopologyAttestation {
             request: request.clone(),
             epoch: capture.counter_epoch,
@@ -7516,78 +7765,59 @@ mod tests {
     }
 
     #[test]
-    fn loaded_counter_burst_collects_a_bounded_multi_flight_batch_then_yields() {
-        let now = Instant::now();
-        let deadline = now + MAX_LOADED_COUNTER_BURST_WALL;
-        let priming = LoadedCounterBurstState::begin(now);
+    fn loaded_counter_burst_collects_a_bounded_event_batch_then_yields() {
+        let priming = LoadedCounterBurstState::begin();
         assert_eq!(
             priming,
             LoadedCounterBurstState::Priming {
                 remaining_completions: MAX_LOADED_COUNTER_BURST_COMPLETIONS,
                 remaining_flights: MAX_LOADED_TRANSPORT_FLIGHTS_PER_BURST,
-                deadline,
             }
         );
 
-        let priming = priming.after_reactor(true, true, false, false, now);
+        let priming = priming.after_reactor(true, true, false, false);
         assert_eq!(
             priming,
             LoadedCounterBurstState::Priming {
                 remaining_completions: MAX_LOADED_COUNTER_BURST_COMPLETIONS - 1,
                 remaining_flights: MAX_LOADED_TRANSPORT_FLIGHTS_PER_BURST,
-                deadline,
             },
-            "an immutable cadence/hold gate is advanced by counter completions, not a timer"
+            "counter completions, not elapsed time, advance the bounded batch"
         );
-        let bracketing = priming.after_reactor(true, false, false, true, now);
+        let bracketing = priming.after_reactor(true, false, false, true);
         assert!(bracketing.bracketing_flight());
         assert_eq!(
-            bracketing.after_reactor(true, false, false, true, deadline),
+            bracketing.after_reactor(true, false, false, true),
             bracketing,
-            "an in-flight probe must retain its post-counter settlement fence past the wall"
+            "an in-flight probe must retain its post-counter settlement fence"
         );
         assert_eq!(
-            priming.after_reactor(true, false, true, false, deadline),
+            priming.after_reactor(true, false, true, false),
             priming,
-            "an exact counter read admitted before the wall must retain its cycle identity"
+            "an exact pending counter read must retain its cycle identity"
         );
         assert_eq!(
             priming
-                .after_reactor(true, false, true, false, deadline)
-                .after_reactor(true, true, false, false, deadline),
-            LoadedCounterBurstState::Idle,
-            "the retained counter read must settle exactly once before fairness yields"
-        );
-        assert_eq!(
-            bracketing.after_reactor(true, false, true, false, deadline),
-            bracketing,
-            "a post-flight counter read must retain the bracketing state past the wall"
-        );
-        let crossed_during_dispatch = LoadedCounterBurstState::Priming {
-            remaining_completions: 8,
-            remaining_flights: 2,
-            deadline,
-        }
-        .after_reactor(true, false, false, true, deadline);
-        assert!(crossed_during_dispatch.bracketing_flight());
-        assert_eq!(
-            crossed_during_dispatch.after_reactor(true, true, false, false, deadline),
-            LoadedCounterBurstState::Idle,
-            "a dispatch which crosses the wall must settle exactly once before fairness"
-        );
-        assert_eq!(
-            bracketing.after_reactor(true, true, false, false, deadline),
-            LoadedCounterBurstState::Idle,
-            "the first event after an over-wall flight settles it and forces fairness"
+                .after_reactor(true, false, true, false)
+                .after_reactor(true, true, false, false),
+            LoadedCounterBurstState::Priming {
+                remaining_completions: MAX_LOADED_COUNTER_BURST_COMPLETIONS - 2,
+                remaining_flights: MAX_LOADED_TRANSPORT_FLIGHTS_PER_BURST,
+            },
+            "the retained counter read settles exactly once and the event budget remains"
         );
 
-        let priming = bracketing.after_reactor(true, true, false, false, now);
+        assert_eq!(
+            bracketing.after_reactor(true, false, true, false),
+            bracketing,
+            "a post-flight counter read must retain the bracketing state"
+        );
+        let priming = bracketing.after_reactor(true, true, false, false);
         assert_eq!(
             priming,
             LoadedCounterBurstState::Priming {
                 remaining_completions: MAX_LOADED_COUNTER_BURST_COMPLETIONS - 2,
                 remaining_flights: MAX_LOADED_TRANSPORT_FLIGHTS_PER_BURST - 1,
-                deadline,
             },
             "the post-flight endpoint remains inside the same bounded batch"
         );
@@ -7595,10 +7825,9 @@ mod tests {
         let last_flight = LoadedCounterBurstState::BracketingFlight {
             remaining_completions: 8,
             remaining_flights: 1,
-            deadline,
         };
         assert_eq!(
-            last_flight.after_reactor(true, true, false, false, now),
+            last_flight.after_reactor(true, true, false, false),
             LoadedCounterBurstState::Idle,
             "the fourth flight forces a CPU/ICMP/runtime fairness turn"
         );
@@ -7606,19 +7835,13 @@ mod tests {
             LoadedCounterBurstState::Priming {
                 remaining_completions: 1,
                 remaining_flights: 3,
-                deadline,
             }
-            .after_reactor(true, true, false, false, now),
+            .after_reactor(true, true, false, false),
             LoadedCounterBurstState::Idle,
             "the completion budget is an independent hard bound"
         );
         assert_eq!(
-            priming.after_reactor(true, false, false, false, deadline),
-            LoadedCounterBurstState::Idle,
-            "the wall bound yields only at an event boundary"
-        );
-        assert_eq!(
-            bracketing.after_reactor(false, false, false, true, now),
+            bracketing.after_reactor(false, false, false, true),
             LoadedCounterBurstState::Idle,
             "capture completion or rejection terminates the batch immediately"
         );
@@ -7626,14 +7849,14 @@ mod tests {
 
     #[test]
     fn three_proven_loaded_flights_reach_the_transport_threshold() {
-        let started = Instant::now();
-        let mut at = started + Duration::from_millis(840);
-        let mut burst = LoadedCounterBurstState::begin(started);
+        let mut burst = LoadedCounterBurstState::begin();
 
         // The first VM-shaped interval is longer than the unchanged 600 ms
-        // authority wall. It advances the bounded reactor but intentionally
-        // cannot dispatch a transport flight.
-        burst = burst.after_reactor(true, true, false, false, at);
+        // authority wall. It advances the event budget but intentionally
+        // cannot dispatch a transport flight.  Wall-clock duration is not an
+        // input to this state machine, so slow attestations cannot consume the
+        // four-flight budget.
+        burst = burst.after_reactor(true, true, false, false);
         assert!(matches!(burst, LoadedCounterBurstState::Priming { .. }));
 
         let mut transport_samples = 0_u32;
@@ -7641,12 +7864,10 @@ mod tests {
         for flight in 0..proven_flights {
             // A following short exact delta mints the single-use pre-flight
             // authority. The consecutive post-flight endpoint settles it.
-            at += Duration::from_millis(200);
-            burst = burst.after_reactor(true, true, false, true, at);
+            burst = burst.after_reactor(true, true, false, true);
             assert!(burst.bracketing_flight());
 
-            at += Duration::from_millis(500);
-            burst = burst.after_reactor(true, true, false, false, at);
+            burst = burst.after_reactor(true, true, false, false);
             transport_samples +=
                 u32::try_from(crate::transport_probe::LOADED_AUTOTUNE_WS_STREAMS).unwrap();
             if flight + 1 < proven_flights {
@@ -7655,7 +7876,6 @@ mod tests {
         }
 
         assert!(burst.active());
-        assert!(at < started + MAX_LOADED_COUNTER_BURST_WALL);
         let samples_per_flight =
             u32::try_from(crate::transport_probe::LOADED_AUTOTUNE_WS_STREAMS).unwrap();
         assert!(
@@ -7834,7 +8054,7 @@ mod tests {
             .unwrap();
 
         let mut authority = FakeCaptureAuthority::default();
-        capture.loaded_counter_burst = LoadedCounterBurstState::begin(Instant::now());
+        capture.loaded_counter_burst = LoadedCounterBurstState::begin();
         capture
             .try_schedule_transport(&directory, &store, &mut authority)
             .unwrap();
@@ -7843,7 +8063,6 @@ mod tests {
             true,
             false,
             capture.loaded_transport_work_active(),
-            Instant::now(),
         );
         assert!(capture.loaded_counter_burst.bracketing_flight());
 
@@ -9611,7 +9830,7 @@ mod tests {
     }
 
     #[test]
-    fn over_wall_flight_evidence_dispatches_once_and_requires_flight_post() {
+    fn flight_evidence_dispatches_once_and_requires_flight_post() {
         let mut request = loaded_capture_request();
         let boot_ms = monotonic_boot_ms().unwrap();
         request.deadline_boot_ms = boot_ms + 60_000;
@@ -9711,15 +9930,11 @@ mod tests {
         assert_eq!(readiness.reason, "loaded-physical-delta-ready");
         assert!(readiness.ready);
 
-        let directory = private_dir("flight-evidence-crosses-fairness-wall");
+        let directory = private_dir("flight-evidence-event-bounded");
         let store = RuntimeOverrideStore::open(&directory).unwrap();
-        let deadline = Instant::now()
-            .checked_sub(Duration::from_millis(1))
-            .unwrap();
         let burst_before = LoadedCounterBurstState::Priming {
             remaining_completions: 8,
             remaining_flights: 2,
-            deadline,
         };
         capture.loaded_counter_burst = burst_before;
         let mut actuator = FakeCaptureAuthority::default();
@@ -9747,7 +9962,7 @@ mod tests {
                 .drive_loaded_counter_burst(&directory, &store, &mut actuator)
                 .unwrap(),
             LoadedCounterReactorWait::TransportCompletion,
-            "an over-wall authority dispatch must wait for its exact FlightPost settlement"
+            "an authority dispatch must wait for its exact FlightPost settlement"
         );
 
         drop(capture);

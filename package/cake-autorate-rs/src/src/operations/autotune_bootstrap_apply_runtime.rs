@@ -24,10 +24,6 @@ use super::sqm_identity;
 /// observation.  Implementations must never turn a timeout, retry count or
 /// unchanged elapsed period into authority to mutate or recover state.
 pub(crate) trait NativeBootstrapApplyBackend {
-    /// Assert that neither the legacy Apply guard nor its persistent rollback
-    /// marker owns the shared configuration boundary.
-    fn attest_legacy_apply_idle(&mut self) -> Result<(), String>;
-
     /// Prove that the exact accepted candidate is already installed and live.
     /// This is the only idempotent success path after recovery evidence has
     /// been cleared; a merely existing instance is not sufficient.
@@ -119,7 +115,6 @@ pub(crate) fn execute_native_bootstrap_apply_commit<B: NativeBootstrapApplyBacke
     require_exact_manifest(plan, manifest)?;
     let manifest_sha256 = sqm_identity::sha256sum(manifest)?;
     let lock = NativeApplyGlobalLock::acquire(paths.global_lock)?;
-    backend.attest_legacy_apply_idle()?;
     let store = NativeBootstrapApplyRecoveryStore::new(paths.recovery_root);
     store.discard_incomplete_staging()?;
     store.discard_completed()?;
@@ -316,9 +311,6 @@ pub(crate) fn recover_native_bootstrap_apply<B: NativeBootstrapApplyBackend>(
     };
     let initial_request = store.read_request()?;
     let _ = absent_baseline_from_record(&initial_request, &initial_record)?;
-    backend.attest_legacy_apply_idle().map_err(|error| {
-        format!("bootstrap Apply recovery found competing legacy Apply ownership: {error}")
-    })?;
     store.discard_incomplete_staging()?;
     store.discard_completed()?;
     let record = store
@@ -654,10 +646,6 @@ mod tests {
     }
 
     impl NativeBootstrapApplyBackend for FakeBackend {
-        fn attest_legacy_apply_idle(&mut self) -> Result<(), String> {
-            self.event("legacy_idle")
-        }
-
         fn candidate_already_applied(
             &mut self,
             _plan: &NativeBootstrapApplyPlan,
@@ -799,7 +787,6 @@ mod tests {
         assert_eq!(
             backend.events,
             vec![
-                "legacy_idle",
                 "candidate_already",
                 "absent",
                 "absent",
@@ -852,11 +839,7 @@ mod tests {
         assert_eq!(fs::read(&fixture.sqm).unwrap(), fixture.sqm_original);
         assert_eq!(
             backend.events,
-            vec![
-                "legacy_idle",
-                "discard_pending",
-                "verify_recovered_disabled_candidate",
-            ]
+            vec!["discard_pending", "verify_recovered_disabled_candidate",]
         );
         assert!(!backend.events.contains(&"restart"));
         assert!(!backend
@@ -909,7 +892,6 @@ mod tests {
         assert_eq!(
             backend.events,
             vec![
-                "legacy_idle",
                 "candidate_already",
                 "absent",
                 "absent",
@@ -983,7 +965,6 @@ mod tests {
         assert_eq!(
             backend.events,
             vec![
-                "legacy_idle",
                 "discard_pending",
                 "quiesce_candidate",
                 "discard_pending",
@@ -1035,7 +1016,7 @@ mod tests {
         assert!(receipt.recovery_cleared);
         assert_eq!(fs::read(&fixture.cake).unwrap(), fixture.cake_original);
         assert_eq!(fs::read(&fixture.sqm).unwrap(), fixture.sqm_original);
-        assert_eq!(backend.events, vec!["legacy_idle", "verify_absent"]);
+        assert_eq!(backend.events, vec!["verify_absent"]);
     }
 
     #[test]
@@ -1058,7 +1039,7 @@ mod tests {
         let error = recover_native_bootstrap_apply(fixture.paths(), &mut backend).unwrap_err();
         assert!(error.contains("injected verify_absent failure"));
         assert!(error.contains("containment was not invoked"));
-        assert_eq!(backend.events, vec!["legacy_idle", "verify_absent"]);
+        assert_eq!(backend.events, vec!["verify_absent"]);
         assert!(!backend.events.contains(&"discard_pending"));
         assert!(!backend.events.contains(&"contain"));
         assert_eq!(
@@ -1116,7 +1097,6 @@ mod tests {
         assert_eq!(
             backend.events,
             vec![
-                "legacy_idle",
                 "discard_pending",
                 "recovery_before_rollforward_restart",
                 "restart",
@@ -1198,7 +1178,7 @@ mod tests {
             receipt.disposition,
             NativeApplyCommitDisposition::AlreadyApplied
         );
-        assert_eq!(backend.events, vec!["legacy_idle", "candidate_already"]);
+        assert_eq!(backend.events, vec!["candidate_already"]);
         assert!(fixture.store().read_record().unwrap().is_none());
         assert_eq!(fs::read(&fixture.cake).unwrap(), fixture.cake_original);
         assert_eq!(fs::read(&fixture.sqm).unwrap(), fixture.sqm_original);

@@ -98,6 +98,13 @@ instance only after identifying the intended uplink.
    hover text if any daemon, queue, IFB, redirect, traffic rule, operation, or
    apply transaction is degraded. Use **Get rating** while the link is
    otherwise quiet to obtain a complete download/upload grade.
+   Automatic mode generates its own route-bound DL/UL load. Guided client
+   capture waits for sequential traffic from a LAN client. The dialog first
+   verifies whether that exact instance already has a Rating job; another tab
+   reconnects to it and keeps Start disabled. Do not press Start repeatedly.
+   A completed Automatic run and a following Guided run intentionally use
+   different job/worker identities, while closing before a Start receipt still
+   cancels the exact admitted job when its receipt arrives.
 8. Enable **Graphs** only if RAM history is useful. Samples stay in `/var/run`
    and disappear on service stop or reboot. Start with the automatic memory
    budget and a 10-second interval.
@@ -262,14 +269,14 @@ PPPoE, CAKE and network softirq work are intentionally included. To distinguish
 that data-plane load from the control application, run:
 
 ```sh
-/usr/libexec/cake-autorate-rs/cpu-profile 30
+/usr/sbin/cake-autorated --cpu-profile 30
 ```
 
-The report shows router busy/softirq percentages and each autorate daemon,
-pinger and Auto-Tune scheduler both as a percentage of one logical CPU and of
-the router's total logical-CPU capacity. The helper is read-only, samples for
-5–300 seconds, uses only a temporary file under `/tmp`, and does not enable
-logging or write to flash.
+The report shows router busy/softirq percentages and each autorate daemon and
+pinger both as a percentage of one logical CPU and of the router's total
+logical-CPU capacity. The native profiler is read-only, samples for 5–300
+seconds with an event-driven monotonic timer, and does not enable logging or
+write to flash.
 
 ### Packet Steering and the RPS warning
 

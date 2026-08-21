@@ -1,8 +1,12 @@
+#[cfg(feature = "calibration")]
 use super::identity::ProcessIdentity;
 use std::ffi::OsString;
-use std::fs::{self, File};
+use std::fs;
+#[cfg(feature = "calibration")]
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -16,6 +20,7 @@ const MAX_ENVIRONMENT_ENTRIES: usize = 32;
 const MAX_TOTAL_ENVIRONMENT_BYTES: usize = 8 * 1024;
 const MAX_STDIN_BYTES: usize = 256 * 1024;
 const WAIT_INTERVAL: Duration = Duration::from_millis(20);
+#[cfg(feature = "calibration")]
 const SIGTERM: i32 = 15;
 const SIGKILL: i32 = 9;
 
@@ -74,12 +79,14 @@ impl SpawnSpec {
     }
 }
 
+#[cfg(feature = "calibration")]
 pub struct ManagedChild {
     child: Child,
     pub identity: ProcessIdentity,
     terminate_on_drop: bool,
 }
 
+#[cfg(feature = "calibration")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminationOutcome {
     Exited,
@@ -168,6 +175,7 @@ impl Drop for OwnedProcessGroupChild {
     }
 }
 
+#[cfg(feature = "calibration")]
 impl ManagedChild {
     pub fn spawn(
         spec: &SpawnSpec,
@@ -277,6 +285,7 @@ impl ManagedChild {
     }
 }
 
+#[cfg(feature = "calibration")]
 impl Drop for ManagedChild {
     fn drop(&mut self) {
         if !self.terminate_on_drop {
@@ -502,6 +511,7 @@ fn join_bounded_reader(
         .map_err(|error| format!("unable to read bounded command {stream}: {error}"))
 }
 
+#[cfg(feature = "calibration")]
 pub fn signal_adopted_group(
     identity: &ProcessIdentity,
     proc_root: &Path,
@@ -517,6 +527,7 @@ pub fn signal_adopted_group(
     Ok(true)
 }
 
+#[cfg(feature = "calibration")]
 fn signal_group(identity: &ProcessIdentity, signal: i32) -> Result<(), String> {
     let process_group = i32::try_from(identity.process_group)
         .map_err(|_| "operation process group is out of range".to_string())?;
@@ -542,10 +553,18 @@ fn validate_program(program: &Path) -> Result<(), String> {
     {
         return Err("operation worker program must be absolute and normalized".to_string());
     }
-    let metadata = fs::symlink_metadata(program)
+    // OpenWrt intentionally exposes several trusted utilities through stable
+    // symlinks (for example /sbin/tc -> /usr/libexec/tc-tiny). Validate the
+    // resolved target, but execute the original path so multi-call binaries
+    // keep their argv[0] dispatch semantics.
+    let resolved = fs::canonicalize(program)
+        .map_err(|error| format!("unable to resolve operation worker program: {error}"))?;
+    let metadata = fs::symlink_metadata(&resolved)
         .map_err(|error| format!("unable to inspect operation worker program: {error}"))?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err("operation worker program is not a regular file".to_string());
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.mode() & 0o022 != 0 {
+        return Err(
+            "operation worker program target is not owner-controlled regular file".to_string(),
+        );
     }
     if program.as_os_str().as_bytes().contains(&0) {
         return Err("operation worker program path contains NUL".to_string());
@@ -556,12 +575,16 @@ fn validate_program(program: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "calibration")]
     use std::fs::OpenOptions;
     use std::io::Cursor;
+    #[cfg(feature = "calibration")]
     use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
+    #[cfg(feature = "calibration")]
     fn log_file(name: &str) -> File {
         let path =
             std::env::temp_dir().join(format!("cake-process-{}-{name}.log", std::process::id()));
@@ -592,6 +615,35 @@ mod tests {
     }
 
     #[test]
+    fn trusted_program_symlink_preserves_the_original_exec_path() {
+        let root =
+            std::env::temp_dir().join(format!("cake-process-symlink-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let target = root.join("real-tool");
+        fs::write(&target, b"#!/bin/sh\nprintf '%s' \"$0\"\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        let link = root.join("tc");
+        symlink(&target, &link).unwrap();
+
+        let spec = SpawnSpec {
+            program: link.clone(),
+            arguments: Vec::new(),
+            environment: Vec::new(),
+        };
+        let output =
+            run_bounded_command_output(&spec, Duration::from_secs(2), 1024, || false).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, link.as_os_str().as_bytes());
+
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o720)).unwrap();
+        assert!(spec.validate().is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "calibration")]
+    #[test]
     fn spawned_worker_has_an_attested_private_group_and_is_terminated() {
         let spec = SpawnSpec {
             program: PathBuf::from("/bin/bash"),
@@ -612,6 +664,7 @@ mod tests {
         assert!(!child.identity.still_matches(Path::new("/proc")).unwrap());
     }
 
+    #[cfg(feature = "calibration")]
     #[test]
     fn independently_restoring_child_survives_handle_drop_until_explicit_signal() {
         let spec = SpawnSpec {
@@ -636,6 +689,7 @@ mod tests {
         assert!(!identity.still_matches(Path::new("/proc")).unwrap());
     }
 
+    #[cfg(feature = "calibration")]
     #[test]
     fn adopted_group_is_not_signalled_after_pid_identity_changes() {
         let identity = ProcessIdentity {

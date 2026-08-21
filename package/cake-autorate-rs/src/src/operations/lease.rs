@@ -1,5 +1,6 @@
 use super::protocol::{OperationKind, OperationRequest, OperationTargetState};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 const MAX_LEASE_KEYS_PER_JOB: usize = 5;
 
@@ -13,6 +14,62 @@ pub enum LeaseKey {
     /// Existing managed requests deliberately retain their historical lease
     /// set; only the v5 target-state authority may introduce this key.
     ManagedSqmSection(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LeaseAcquireError {
+    JobAlreadyOwns { job_id: String },
+    Conflict { key: LeaseKey, owner_job_id: String },
+}
+
+impl LeaseAcquireError {
+    pub fn conflict_kind(&self) -> Option<&'static str> {
+        let Self::Conflict { key, .. } = self else {
+            return None;
+        };
+        Some(match key {
+            LeaseKey::HeavyTraffic => "heavy-traffic",
+            LeaseKey::Instance(_) => "instance",
+            LeaseKey::TargetInterface(_) => "target-interface",
+            LeaseKey::SqmFingerprint(_) => "managed-sqm",
+            LeaseKey::ManagedSqmSection(_) => "managed-sqm-section",
+        })
+    }
+
+    pub fn owner_job_id(&self) -> Option<&str> {
+        match self {
+            Self::Conflict { owner_job_id, .. } => Some(owner_job_id),
+            Self::JobAlreadyOwns { .. } => None,
+        }
+    }
+
+    pub fn user_message(&self) -> &'static str {
+        match self {
+            Self::JobAlreadyOwns { .. } => "this operation already owns runtime resources",
+            Self::Conflict {
+                key: LeaseKey::HeavyTraffic,
+                ..
+            } => "another traffic-intensive operation is already running",
+            Self::Conflict {
+                key: LeaseKey::Instance(_),
+                ..
+            } => "another operation is already active for this instance",
+            Self::Conflict {
+                key: LeaseKey::TargetInterface(_),
+                ..
+            } => "another operation is already using this target interface",
+            Self::Conflict {
+                key: LeaseKey::SqmFingerprint(_) | LeaseKey::ManagedSqmSection(_),
+                ..
+            } => "another operation is already using this managed SQM runtime",
+        }
+    }
+}
+
+impl fmt::Display for LeaseAcquireError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.user_message())
+    }
 }
 
 impl LeaseKey {
@@ -94,18 +151,21 @@ pub struct LeaseTable {
 }
 
 impl LeaseTable {
-    pub fn acquire(&mut self, request: LeaseRequest) -> Result<(), String> {
+    pub fn acquire(&mut self, request: LeaseRequest) -> Result<(), LeaseAcquireError> {
         if self.jobs.contains_key(&request.job_id) {
-            return Err(format!("job {} already owns leases", request.job_id));
+            return Err(LeaseAcquireError::JobAlreadyOwns {
+                job_id: request.job_id,
+            });
         }
         if let Some((key, owner)) = request
             .keys
             .iter()
             .find_map(|key| self.owners.get(key).map(|owner| (key, owner)))
         {
-            return Err(format!(
-                "runtime lease {key:?} is already owned by job {owner}"
-            ));
+            return Err(LeaseAcquireError::Conflict {
+                key: key.clone(),
+                owner_job_id: owner.clone(),
+            });
         }
 
         // Conflict validation above covers the entire set, so acquisition is
@@ -291,11 +351,47 @@ mod tests {
         table
             .acquire(request("job-a", "wan", "pppoe-wan", "sqm-a"))
             .unwrap();
-        assert!(table
+        let conflict = table
             .acquire(request("job-b", "wanb", "eth0", "sqm-b"))
-            .is_err());
+            .unwrap_err();
+        assert_eq!(
+            conflict,
+            LeaseAcquireError::Conflict {
+                key: LeaseKey::HeavyTraffic,
+                owner_job_id: "job-a".to_string(),
+            }
+        );
+        assert_eq!(conflict.conflict_kind(), Some("heavy-traffic"));
+        assert_eq!(conflict.owner_job_id(), Some("job-a"));
         assert_eq!(table.job_count(), 1);
         assert_eq!(table.owner(&LeaseKey::Instance("wanb".to_string())), None);
+    }
+
+    #[test]
+    fn instance_conflict_is_typed_without_debug_formatted_identity() {
+        let mut table = LeaseTable::default();
+        let mut first = request("job-a", "wan", "pppoe-wan", "sqm-a");
+        first.keys.remove(&LeaseKey::HeavyTraffic);
+        table.acquire(first).unwrap();
+
+        let mut second = request("job-b", "wan", "eth0", "sqm-b");
+        second.keys.remove(&LeaseKey::HeavyTraffic);
+        let conflict = table.acquire(second).unwrap_err();
+        assert_eq!(
+            conflict,
+            LeaseAcquireError::Conflict {
+                key: LeaseKey::Instance("wan".to_string()),
+                owner_job_id: "job-a".to_string(),
+            }
+        );
+        assert_eq!(conflict.conflict_kind(), Some("instance"));
+        assert_eq!(
+            conflict.user_message(),
+            "another operation is already active for this instance"
+        );
+        assert!(!conflict.to_string().contains("Instance("));
+        assert!(!conflict.to_string().contains("job-a"));
+        assert_eq!(table.job_count(), 1);
     }
 
     #[test]

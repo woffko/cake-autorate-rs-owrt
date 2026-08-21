@@ -65,7 +65,7 @@ function readStatus(section) {
 
 function readPackageVersions() {
 	return L.resolveDefault(
-		fs.exec('/usr/libexec/cake-autorate-rs/package-versions', []).then(function(result) {
+		fs.exec('/usr/sbin/cake-autorated', [ '--package-versions' ]).then(function(result) {
 			var rows = JSON.parse(result && result.stdout || '[]');
 			var versions = {};
 
@@ -89,43 +89,31 @@ function parseExecJson(result) {
 
 function readRuntimeHealth() {
 	return L.resolveDefault(
-		fs.exec('/usr/libexec/cake-autorate-rs/runtime-health', []).then(parseExecJson).then(function(result) {
+		fs.exec('/usr/sbin/cake-autorated', [ '--runtime-health' ]).then(parseExecJson).then(function(result) {
 			return result && result.instances || {};
 		}),
 		{}
 	);
 }
 
-function schedulerStatusSource(section, schedulerEngine, calibrationSummary) {
-	if (schedulerEngine === 'native' && calibrationSummary &&
-	    calibrationSummary.native_scheduler === true)
+function schedulerStatusSource(calibrationSummary) {
+	if (calibrationSummary && calibrationSummary.native_scheduler === true)
 		return {
 			owner: 'native',
 			command: '/usr/sbin/cake-autorated',
 			args: [ '--calibrationctl', 'scheduler-status' ]
 		};
-	if (schedulerEngine === 'legacy' && calibrationSummary &&
-	    calibrationSummary.native_scheduler === false)
-		return {
-			owner: 'legacy',
-			command: '/usr/libexec/cake-autorate-rs/autotune-scheduler',
-			args: [ 'status', section ]
-		};
 	return null;
 }
 
-function schedulerUnavailableStatus(sectionData, owner) {
+function schedulerUnavailableStatus(sectionData) {
 	return {
-		owner: owner || 'unconfigured',
+		owner: 'native',
 		available: false,
 		instance: sectionData['.name'],
 		enabled: sectionData.scheduled_autotune_enabled === '1',
 		state: 'unavailable',
-		message: owner === 'native' ?
-			_('Scheduled calibration status is unavailable; legacy accounting was not substituted.') :
-			(owner === 'legacy' ?
-				_('Legacy scheduler ownership could not be attested; native accounting was not substituted.') :
-				_('Scheduler ownership is missing or invalid; no accounting source was selected.')),
+		message: _('Scheduled calibration status is unavailable; no accounting source was substituted.'),
 		accounting_error: false,
 		initialized: false,
 		budget_authoritative: false,
@@ -191,54 +179,16 @@ function nativeSchedulerBatchValidated(result) {
 	});
 }
 
-function legacySchedulerStatusValidated(result, section) {
-	function uintValid(value) {
-		return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
-	}
-
-	function budgetValid(value) {
-		return !!value && [ 'limit_bytes', 'used_bytes', 'remaining_bytes' ].every(function(key) {
-			return uintValid(value[key]);
-		});
-	}
-
-	return !!result && result.instance === section && typeof result.enabled === 'boolean' &&
-		typeof result.state === 'string' && typeof result.message === 'string' &&
-		uintValid(result.updated_at) && uintValid(result.next_due_at) &&
-		uintValid(result.window_start_hour) && result.window_start_hour <= 23 &&
-		uintValid(result.window_end_hour) && result.window_end_hour <= 23 &&
-		budgetValid(result.daily) && budgetValid(result.monthly) &&
-		typeof result.accounting_error === 'boolean';
-}
-
-function normalizeLegacySchedulerStatus(result) {
-	return Object.assign(Object.create(null), result, {
-		owner: 'legacy',
-		available: true,
-		source: 'legacy_scheduler_helper',
-		initialized: true,
-		budget_authoritative: !result.accounting_error,
-		warning: null,
-		window: {
-			start_hour: Number(result.window_start_hour),
-			end_hour: Number(result.window_end_hour)
-		},
-		daily: Object.assign(Object.create(null), { reserved_bytes: 0 }, result.daily),
-		monthly: Object.assign(Object.create(null), { reserved_bytes: 0 }, result.monthly)
-	});
-}
-
-function readSchedulerStatuses(sections, schedulerEngine, calibrationSummary) {
+function readSchedulerStatuses(sections, calibrationSummary) {
 	var unavailable = sections.map(function(section) {
-		return schedulerUnavailableStatus(section, schedulerEngine);
+		return schedulerUnavailableStatus(section);
 	});
-	var source = schedulerStatusSource('', schedulerEngine, calibrationSummary);
+	var source = schedulerStatusSource(calibrationSummary);
 
 	if (!source)
 		return Promise.resolve({ rows: unavailable, diagnostics: [] });
 
-	if (source.owner === 'native') {
-		return L.resolveDefault(
+	return L.resolveDefault(
 			fs.exec(source.command, source.args).then(parseExecJson).then(function(result) {
 				var byInstance = Object.create(null);
 				var configured = Object.create(null);
@@ -273,26 +223,12 @@ function readSchedulerStatuses(sections, schedulerEngine, calibrationSummary) {
 			}),
 			{ rows: unavailable, diagnostics: [] }
 		);
-	}
-
-	return Promise.all(sections.map(function(section, index) {
-		var sectionSource = schedulerStatusSource(section['.name'], schedulerEngine,
-			calibrationSummary);
-		return L.resolveDefault(
-			fs.exec(sectionSource.command, sectionSource.args).then(parseExecJson).then(function(result) {
-				if (!legacySchedulerStatusValidated(result, section['.name']))
-					throw new Error(_('Legacy scheduler returned an invalid status contract.'));
-				return normalizeLegacySchedulerStatus(result);
-			}),
-			unavailable[index]
-		);
-	})).then(function(rows) { return { rows: rows, diagnostics: [] }; });
 }
 
-function readInstanceStatuses(sections, schedulerEngine, calibrationSummary) {
+function readInstanceStatuses(sections, calibrationSummary) {
 	return Promise.all([
 		Promise.all(sections.map(function(section) { return readStatus(section['.name']); })),
-		readSchedulerStatuses(sections, schedulerEngine, calibrationSummary)
+		readSchedulerStatuses(sections, calibrationSummary)
 	]).then(function(result) {
 		return {
 			rows: sections.map(function(section, index) {
@@ -316,6 +252,41 @@ function readCalibrationSummary() {
 	return L.resolveDefault(calibrationExec([ 'summary' ]), {
 		state: 'unavailable', native_rating: false, native_scheduler: null
 	});
+}
+
+function runtimeHealthWithNativeOperations(runtimeHealth, calibrationSummary) {
+	var merged = Object.create(null);
+	var operations = calibrationSummary && calibrationSummary.active_operations;
+	var operationLabels = {
+		full_autotune: 'AUTOTUNE',
+		automatic_rating: 'RATING',
+		guided_rating: 'RATING',
+		speedtest: 'SPEEDTEST'
+	};
+	var states = {
+		queued: true, starting: true, running: true,
+		cancelling: true, recovering: true
+	};
+
+	Object.keys(runtimeHealth || {}).forEach(function(instance) {
+		merged[instance] = Object.assign({}, runtimeHealth[instance]);
+	});
+	if (!Array.isArray(operations) || operations.length > 64)
+		return merged;
+	operations.forEach(function(operation) {
+		if (!operation || !/^[A-Za-z0-9_]{1,64}$/.test(operation.instance || '') ||
+		    !operationLabels[operation.operation] || !states[operation.state] ||
+		    typeof operation.runtime_mutated !== 'boolean')
+			return;
+		var health = merged[operation.instance];
+		if (!health)
+			return;
+		health.operation_state = '%s/%s'.format(
+			operationLabels[operation.operation], operation.state.toUpperCase());
+		if (operation.runtime_mutated === true)
+			health.apply_state = 'NATIVE';
+	});
+	return merged;
 }
 
 function nativeRatingRoute(section) {
@@ -372,6 +343,47 @@ function nativeRatingProgress(status, job) {
 	});
 }
 
+function nativeRatingStatusMatchesRequest(status, section, operation, jobId) {
+	var instance = section && section['.name'];
+	var target = section && (section.sqm_interface || section.ul_if || section.wan_if || '');
+	var route = nativeRatingRoute(section || {});
+	var operationMatches = operation == null ?
+		(status && (status.operation === 'automatic_rating' ||
+			status.operation === 'guided_rating')) : status && status.operation === operation;
+	var effectiveOperation = operation == null && status ? status.operation : operation;
+	var expectedBackend = effectiveOperation === 'automatic_rating' ? 'speedtest-go' : 'client';
+	return !!status && operationMatches && status.instance === instance &&
+		(jobId == null || status.job_id === jobId) &&
+		(jobId == null || /^[0-9a-f]{32}$/.test(status.job_id || '')) &&
+		status.request_identity_schema_version === 1 && status.target_interface === target &&
+		status.backend === expectedBackend && status.speedtest_direction === null &&
+		status.speedtest_server_id === null && status.speedtest_topology === null &&
+		status.route_mode === route.mode &&
+		status.mwan3_member === (route.mode === 'mwan3' ? route.member : null) &&
+		status.target_state === 'existing_managed' && status.origin === 'luci';
+}
+
+function nativeRatingWorkerRunId(status, previousWorkerRunId, requirePublished) {
+	var candidate = status && status.worker_run_id;
+	if (candidate == null)
+		return previousWorkerRunId == null && requirePublished !== true ? null : undefined;
+	if (!/^[0-9a-f]{32}$/.test(candidate) ||
+	    (previousWorkerRunId != null && candidate !== previousWorkerRunId))
+		return undefined;
+	return candidate;
+}
+
+function nativeRatingResultValidated(result, jobId) {
+	return !!result && result.state === 'complete' && result.job_id === jobId &&
+		result.partial === false && result.incomplete === false &&
+		result.rating_method === QUALITY_GRADE_METHOD &&
+		typeof result.grade === 'string' && result.grade.length > 0 &&
+		typeof result.dl_grade === 'string' && result.dl_grade.length > 0 &&
+		typeof result.ul_grade === 'string' && result.ul_grade.length > 0 &&
+		Number(result.dl_samples) > 0 && Number(result.ul_samples) > 0 &&
+		result.limits_changed === false;
+}
+
 function qualityTestDelay() {
 	return new Promise(function(resolve) {
 		window.setTimeout(resolve, 1000);
@@ -382,12 +394,28 @@ function qualityReadiness(section, status, mode, calibrationSummary) {
 	var uplinkState = String(status && status.uplink_state || '').toUpperCase();
 	var testMode = mode || 'automatic';
 	var routeTestReady;
+	var activeOperation = Array.isArray(calibrationSummary && calibrationSummary.active_operations) ?
+		calibrationSummary.active_operations.find(function(operation) {
+			return operation && operation.instance === section['.name'] &&
+				[ 'queued', 'starting', 'running', 'cancelling', 'recovering' ]
+					.includes(operation.state);
+		}) : null;
 
-	if (calibrationSummary && calibrationSummary.native_rating !== true)
+	if (calibrationSummary && (calibrationSummary.native_rating !== true ||
+	    calibrationSummary.native_operation_status_identity_version !== 1))
 		return {
 			ready: false,
 			reason: _('Rating is unavailable in the installed daemon. Upgrade both the daemon and LuCI package, then restart the calibration service.')
 		};
+	if (activeOperation) {
+		if (activeOperation.operation === 'automatic_rating' ||
+		    activeOperation.operation === 'guided_rating')
+			return { ready: false, reason: _('A Rating operation is already active for this instance. This dialog will reconnect to it.') };
+		return {
+			ready: false,
+			reason: _('Another calibration operation is already active for this instance. Wait for it to finish or cancel it before starting Rating.')
+		};
+	}
 	if (String(section.enabled || '0') !== '1')
 		return { ready: false, reason: _('Autorate instance is disabled.') };
 	if (String(section.sqm_enabled || '0') !== '1')
@@ -471,14 +499,18 @@ function showQualityTest(section, status, calibrationSummary) {
 		E('option', { 'value': 'automatic' }, _('Automatic router-side test')),
 		E('option', { 'value': 'client' }, _('Guided client capture'))
 	]);
-	var state = E('div', { 'class': 'alert-message notice cake-quality-job-state' }, readiness.reason);
+	var state = E('div', { 'class': 'alert-message notice cake-quality-job-state' },
+		_('Checking for an active Rating operation…'));
 	var detail = E('div', { 'class': 'cake-quality-job-detail' },
 		_('Automatic mode first waits for a quiet link, measures background traffic, then runs explicit download-only and upload-only phases through this uplink. Unexpected opposite-direction traffic rejects a contaminated phase. It may take 1–3 passes and transfer several gigabytes on a fast line. Guided mode uses independent download and upload triggers while you run a sequential test from a LAN client. Triggers are percentages of the current CAKE rates, not the physical link or adaptive ceiling caps. Neither mode disables SQM or autorate, changes CAKE limits, or writes samples to flash.'));
 	var running = false;
 	var starting = false;
 	var closed = false;
 	var readinessPolling = false;
+	var currentAttestation = 'pending';
 	var jobId = null;
+	var jobOperation = null;
+	var workerRunId = null;
 	var startButton;
 	var closeButton;
 
@@ -490,12 +522,11 @@ function showQualityTest(section, status, calibrationSummary) {
 	function finish(job) {
 		running = false;
 		starting = false;
-		startButton.disabled = !readiness.ready;
+		startButton.disabled = currentAttestation !== 'settled' || !readiness.ready;
 		mode.disabled = false;
 		closeButton.textContent = _('Close');
 		if (job.state === 'complete') {
-			if (job.partial !== false || job.incomplete !== false ||
-			    job.rating_method !== QUALITY_GRADE_METHOD) {
+			if (!nativeRatingResultValidated(job, jobId)) {
 				setState(_('Rating result is incomplete or uses an unsupported evidence contract.'), true);
 				return;
 			}
@@ -526,8 +557,8 @@ function showQualityTest(section, status, calibrationSummary) {
 			}
 			readiness = qualityReadiness(section, freshStatus, mode.value, calibrationSummary);
 			if (!running && !starting && startButton)
-				startButton.disabled = !readiness.ready;
-			if (announce && !running && !starting && !closed)
+				startButton.disabled = currentAttestation !== 'settled' || !readiness.ready;
+			if (announce && currentAttestation === 'settled' && !running && !starting && !closed)
 				setState(readiness.reason, false);
 			return readiness;
 		}).catch(function(error) {
@@ -537,7 +568,7 @@ function showQualityTest(section, status, calibrationSummary) {
 			};
 			if (startButton)
 				startButton.disabled = true;
-			if (announce && !running && !starting)
+			if (announce && currentAttestation === 'settled' && !running && !starting)
 				setState(readiness.reason, false);
 			return readiness;
 		});
@@ -554,7 +585,8 @@ function showQualityTest(section, status, calibrationSummary) {
 	}
 
 	function ensureReadinessPoll() {
-		if (!readinessPolling && !closed && !running && !starting) {
+		if (!readinessPolling && currentAttestation === 'settled' &&
+		    !closed && !running && !starting) {
 			readinessPolling = true;
 			pollReadiness();
 		}
@@ -566,6 +598,11 @@ function showQualityTest(section, status, calibrationSummary) {
 		return qualityTestDelay().then(function() {
 			return calibrationExec([ 'rating-status', jobId ]);
 		}).then(function(job) {
+			if (!nativeRatingStatusMatchesRequest(job, section, jobOperation, jobId))
+				throw new Error(_('The Rating service changed the active request identity.'));
+			workerRunId = nativeRatingWorkerRunId(job, workerRunId, job.state === 'completed');
+			if (workerRunId === undefined)
+				throw new Error(_('The Rating service changed the active worker identity.'));
 			if (job.state === 'completed')
 				return calibrationExec([ 'rating-result', jobId ]).then(finish);
 			if (job.state === 'queued' || job.state === 'starting' || job.state === 'running' ||
@@ -586,7 +623,7 @@ function showQualityTest(section, status, calibrationSummary) {
 	}
 
 	function start() {
-		if (running || starting)
+		if (running || starting || currentAttestation !== 'settled')
 			return Promise.resolve();
 		starting = true;
 		startButton.disabled = true;
@@ -602,22 +639,123 @@ function showQualityTest(section, status, calibrationSummary) {
 				return;
 			}
 			starting = false;
+			jobId = null;
+			workerRunId = null;
+			jobOperation = mode.value === 'automatic' ? 'automatic_rating' : 'guided_rating';
 			running = true;
 			mode.disabled = true;
 			closeButton.textContent = _('Cancel');
 			setState(_('Starting rating capture…'), false);
 			return calibrationExec(nativeRatingStartArgs(section, mode.value)).then(function(job) {
-				if (job.state === 'error' || job.error)
-					throw new Error(job.error || job.error_code || _('Unable to start native Rating.'));
+				if (job.state === 'error' || job.error) {
+					if (job.error_code === 'lease-conflict')
+						return recoverRatingConflict();
+					throw new Error(job.error_code ?
+						_('Unable to start Rating (%s).').format(job.error_code) :
+						_('Unable to start Rating.'));
+				}
 				jobId = job.job_id;
-				if (!jobId)
-					throw new Error(_('Rating returned no job ID.'));
+				if (closed)
+					return calibrationExec([ 'rating-cancel', jobId ]).then(function(cancelled) {
+						if (cancelled.state === 'error')
+							throw new Error(cancelled.error_code || _('Unable to cancel Rating after closing the dialog.'));
+					});
+				if (!nativeRatingStatusMatchesRequest(job, section, jobOperation, jobId))
+					throw new Error(_('Rating returned a job for a different request.'));
+				workerRunId = nativeRatingWorkerRunId(job, workerRunId, false);
+				if (workerRunId === undefined)
+					throw new Error(_('Rating returned an invalid worker identity.'));
 				return pollJob();
 			});
 		}).catch(function(error) {
 			if (!closed)
 				finish({ state: 'error', error: error.message || String(error) });
 		});
+	}
+
+	function currentRatingMismatch() {
+		var error = new Error(_('A different Rating request is already active for this instance. Wait for it to finish in the session that started it.'));
+		error.ratingActiveRequestMismatch = true;
+		return error;
+	}
+
+	function handleCurrentRating(job) {
+		if (closed)
+			return Promise.resolve();
+		if (job.state !== 'idle' &&
+		    !nativeRatingStatusMatchesRequest(job, section, null, job.job_id))
+			throw currentRatingMismatch();
+		if (job.state !== 'idle') {
+			workerRunId = nativeRatingWorkerRunId(job, workerRunId, job.state === 'completed');
+			if (workerRunId === undefined)
+				throw new Error(_('Rating returned an invalid current worker identity.'));
+		}
+		if (job.operation === 'automatic_rating')
+			mode.value = 'automatic';
+		else if (job.operation === 'guided_rating')
+			mode.value = 'client';
+		if (job.state === 'idle') {
+			jobId = null;
+			workerRunId = null;
+		}
+		jobOperation = job.operation || null;
+		currentAttestation = 'settled';
+		if (job.state === 'completed' && job.job_id) {
+			jobId = job.job_id;
+			return calibrationExec([ 'rating-result', jobId ]).then(finish);
+		}
+		if (job.state === 'queued' || job.state === 'starting' || job.state === 'running' ||
+		    job.state === 'cancelling' || job.state === 'recovering') {
+			jobId = job.job_id;
+			running = true;
+			starting = false;
+			startButton.disabled = true;
+			mode.disabled = true;
+			closeButton.textContent = _('Cancel');
+			return readStatus(instance).then(function(freshStatus) {
+				var progress = nativeRatingProgress(freshStatus, job);
+				setState((progress.message || _('Collecting rating samples.')) + '\n' +
+					qualityProgressText(progress), false);
+				return pollJob();
+			});
+		}
+		starting = false;
+		mode.disabled = false;
+		closeButton.textContent = _('Close');
+		return refreshReadiness(true).then(ensureReadinessPoll);
+	}
+
+	function attestCurrentRating() {
+		currentAttestation = 'pending';
+		startButton.disabled = true;
+		return calibrationExec([ 'rating-current', instance ]).then(handleCurrentRating).catch(function(error) {
+			currentAttestation = 'failed';
+			starting = false;
+			running = false;
+			startButton.disabled = true;
+			mode.disabled = false;
+			closeButton.textContent = _('Close');
+			if (!closed && error && error.ratingActiveRequestMismatch) {
+				readiness = { ready: false, reason: error.message };
+				setState(error.message, true);
+				return;
+			}
+			if (!closed)
+				setState(_('Unable to verify the current Rating operation. Close and reopen this dialog before trying again.'), true);
+		});
+	}
+
+	function recoverRatingConflict() {
+		running = false;
+		starting = true;
+		jobId = null;
+		jobOperation = null;
+		workerRunId = null;
+		startButton.disabled = true;
+		mode.disabled = true;
+		closeButton.textContent = _('Close');
+		setState(_('Another operation became active first. Reconnecting to the current Rating operation…'), false);
+		return attestCurrentRating();
 	}
 
 	function close() {
@@ -634,7 +772,7 @@ function showQualityTest(section, status, calibrationSummary) {
 	startButton = E('button', {
 		'type': 'button',
 		'class': 'btn cbi-button cbi-button-action',
-		'disabled': readiness.ready ? null : '',
+		'disabled': '',
 		'click': ui.createHandlerFn(null, start)
 	}, _('Start rating'));
 	closeButton = E('button', {
@@ -643,7 +781,7 @@ function showQualityTest(section, status, calibrationSummary) {
 		'click': ui.createHandlerFn(null, close)
 	}, _('Close'));
 	mode.addEventListener('change', function() {
-		if (!running && !starting && !closed)
+		if (currentAttestation === 'settled' && !running && !starting && !closed)
 			refreshReadiness(true);
 	});
 
@@ -659,35 +797,7 @@ function showQualityTest(section, status, calibrationSummary) {
 		E('div', { 'class': 'right' }, [ startButton, ' ', closeButton ])
 	]);
 
-	calibrationExec([ 'rating-current', instance ]).then(function(job) {
-		if (job.operation === 'automatic_rating')
-			mode.value = 'automatic';
-		else if (job.operation === 'guided_rating')
-			mode.value = 'client';
-		if (job.state === 'completed' && job.job_id && !closed) {
-			jobId = job.job_id;
-			return calibrationExec([ 'rating-result', jobId ]).then(finish);
-		}
-		if ((job.state === 'queued' || job.state === 'starting' || job.state === 'running' ||
-		     job.state === 'cancelling' || job.state === 'recovering') && !closed) {
-			jobId = job.job_id;
-			running = true;
-			startButton.disabled = true;
-			mode.disabled = true;
-			closeButton.textContent = _('Cancel');
-			return readStatus(instance).then(function(freshStatus) {
-				var progress = nativeRatingProgress(freshStatus, job);
-				setState((progress.message || _('Collecting rating samples.')) + '\n' +
-					qualityProgressText(progress), false);
-				return pollJob();
-			});
-		} else if (!closed) {
-			return refreshReadiness(true).then(ensureReadinessPoll);
-		}
-	}).catch(function() {
-		if (!closed)
-			return refreshReadiness(true).then(ensureReadinessPoll);
-	});
+	attestCurrentRating();
 }
 
 function renderVersions(versions) {
@@ -700,20 +810,7 @@ function renderVersions(versions) {
 }
 
 function serviceAction(action) {
-	var mqttAction = function() {
-		if (action === 'start' || action === 'restart')
-			return L.resolveDefault(fs.exec('/etc/init.d/cake-autorate-mqtt', [ 'enable' ]), null)
-				.then(function() {
-					return L.resolveDefault(fs.exec('/etc/init.d/cake-autorate-mqtt', [ action ]), null);
-				});
-
-		if (action === 'stop')
-			return L.resolveDefault(fs.exec('/etc/init.d/cake-autorate-mqtt', [ action ]), null);
-
-		return Promise.resolve();
-	};
-
-	return fs.exec('/etc/init.d/cake-autorate', [ action ]).then(mqttAction).then(function() {
+	return fs.exec('/etc/init.d/cake-autorate', [ action ]).then(function() {
 		ui.addNotification(null, E('p', _('Service action completed.')));
 	});
 }
@@ -738,7 +835,7 @@ function exportLogs(ev) {
 
 	button.disabled = true;
 
-	return fs.exec('/usr/libexec/cake-autorate-rs/log-bundle', [ 'all' ]).then(function(res) {
+	return fs.exec('/usr/sbin/cake-autorated', [ '--log-bundle', 'all' ]).then(function(res) {
 		var stdout = res && res.stdout ? res.stdout : '';
 		var stamp = new Date().toISOString().replace(/[:.]/g, '-');
 
@@ -1090,18 +1187,7 @@ function formatState(status, enabled, sectionData, health) {
 	if (!sectionData || sectionData.traffic_rules_enabled !== '1') {
 		priorities = _('Off');
 	} else {
-		var sectionAutotune = (function(value) {
-			switch (value) {
-			case 'gaming':
-			case 'gaming-extreme':
-			case 'extreme_gaming':
-			case 'gaming_extreme': return 'gaming';
-			case 'fair': return 'fair';
-			default: return 'best_overall';
-			}
-		})(sectionData.autotune_profile);
-		var mode = health && health.traffic_profile_mode || sectionData.traffic_profile ||
-			(sectionData['traffic_defaults_' + sectionAutotune] === '0' ? 'custom' : 'auto');
+		var mode = health && health.traffic_profile_mode || sectionData.traffic_profile || 'auto';
 		var resolved = health && health.traffic_profile_resolved ||
 			(mode === 'auto' ?
 				(sectionData.autotune_profile === 'variable_link' ? 'best_overall' :
@@ -1572,11 +1658,12 @@ function renderColumnChooser(globalSection, selectedKeys, onChange) {
 		var storedKeys = keys.filter(function(key) {
 			return STATUS_DEFAULT_COLUMNS.indexOf(key) < 0;
 		});
-		var args = [ reset ? 'reset' : 'set' ].concat(reset ? [] : storedKeys);
+		var args = [ '--status-columns', reset ? 'reset' : 'set' ]
+			.concat(reset ? [] : storedKeys);
 
-		return fs.exec('/usr/libexec/cake-autorate-rs/status-columns', args).then(function(result) {
+		return fs.exec('/usr/sbin/cake-autorated', args).then(function(result) {
 			if (!result || result.code !== 0)
-				throw new Error(result && result.stderr || _('status-columns helper failed'));
+				throw new Error(result && result.stderr || _('Unable to commit Status columns.'));
 			details.open = false;
 			onChange(keys);
 		}).catch(function(error) {
@@ -1611,16 +1698,14 @@ return L.view.extend({
 			var globalSection = uci.sections('cake-autorate', 'globals').filter(function(section) {
 				return section['.name'] === 'globals';
 			})[0] || { '.name': 'globals' };
-			var schedulerEngine = String(
-				uci.get('cake-autorate', 'globals', 'autotune_scheduler_engine') || '');
 			return Promise.all([
 				readPackageVersions(),
 				readRuntimeHealth(),
 				readCalibrationSummary()
 			]).then(function(result) {
-				return readInstanceStatuses(sections, schedulerEngine, result[2]).then(function(status) {
+				return readInstanceStatuses(sections, result[2]).then(function(status) {
 					return [ sections, status.rows, result[0], globalSection, result[1], result[2],
-						status.diagnostics, schedulerEngine ];
+						status.diagnostics ];
 				});
 			});
 		});
@@ -1634,8 +1719,8 @@ return L.view.extend({
 		var globalSection = data[3] || { '.name': 'globals' };
 		var runtimeHealth = data[4] || {};
 		var calibrationSummary = data[5] || { state: 'unavailable', native_rating: false };
+		runtimeHealth = runtimeHealthWithNativeOperations(runtimeHealth, calibrationSummary);
 		var schedulerDiagnostics = data[6] || [];
-		var schedulerEngine = data[7] || '';
 		var visibleColumns = statusColumnSelection(globalSection);
 		var statusData = renderStatusData(sections, statuses, visibleColumns, runtimeHealth,
 			calibrationSummary, schedulerDiagnostics);
@@ -1650,6 +1735,7 @@ return L.view.extend({
 				calibrationSummary = nextCalibrationSummary;
 			if (nextSchedulerDiagnostics != null)
 				schedulerDiagnostics = nextSchedulerDiagnostics;
+			runtimeHealth = runtimeHealthWithNativeOperations(runtimeHealth, calibrationSummary);
 			var nextData = renderStatusData(sections, statuses, visibleColumns, runtimeHealth,
 				calibrationSummary, schedulerDiagnostics);
 			if (statusData.parentNode) {
@@ -1666,7 +1752,7 @@ return L.view.extend({
 				readRuntimeHealth(),
 				readCalibrationSummary()
 			]).then(function(result) {
-				return readInstanceStatuses(sections, schedulerEngine, result[1]).then(function(status) {
+				return readInstanceStatuses(sections, result[1]).then(function(status) {
 					replaceStatusData(status.rows, null, result[0], result[1], status.diagnostics);
 				});
 			});

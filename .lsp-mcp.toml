@@ -1,0 +1,16 @@
+schema_version = 1
+
+[project]
+workspaces = [
+  "package/luci-app-cake-autorate-rs",
+  "package/luci-app-cake-autorate-rs-lite",
+  "package/cake-autorate-rs/src",
+]
+
+[backends.rust]
+enabled = true
+required = false
+
+[backends.typescript]
+enabled = true
+required = false

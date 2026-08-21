@@ -20,9 +20,8 @@ assert.match(makefile, /\+cake-autorate-rs-lite/);
 assert.match(makefile, /PROVIDES:=luci-app-cake-autorate-rs luci-app-sqm/);
 assert.doesNotMatch(makefile, /uclient-fetch|jsonfilter|nftables-json/);
 assert.match(makefile, /cake-autorate-autotune disable/);
-assert.match(makefile, /cake-autorate-apply-guard disable/);
 assert.match(makefile, /rm -f \/etc\/rc\.d\/S\*cake-autorate-autotune \/etc\/rc\.d\/K\*cake-autorate-autotune/);
-assert.match(makefile, /rm -f \/etc\/rc\.d\/S\*cake-autorate-apply-guard \/etc\/rc\.d\/K\*cake-autorate-apply-guard/);
+assert.doesNotMatch(makefile, /cake-autorate-apply-guard/);
 
 assert.deepEqual(Object.keys(menu).sort(), [
 	'admin/network/cake-autorate-rs',
@@ -39,7 +38,8 @@ assert.match(status, /cake_ul_rate_kbps/);
 
 [
 	'calibrationctl', 'rpcd-helper', 'autotune-start', 'rating-start', 'speedtest-start',
-	'autotune-scheduler', 'apply-guard', 'graph-history', 'runtime-health'
+	'autotune-scheduler', 'apply-guard', 'graph-history', 'runtime-health',
+	'transport-probe', 'transport_latency', 'irtt'
 ].forEach((forbidden) => assert.doesNotMatch(uiSource, new RegExp(forbidden, 'i')));
 
 console.log('lite LuCI package tests passed');

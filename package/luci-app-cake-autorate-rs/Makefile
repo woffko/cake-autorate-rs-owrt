@@ -7,7 +7,7 @@ endif
 
 PKG_NAME:=luci-app-cake-autorate-rs
 PKG_VERSION:=1.0_rc27
-PKG_RELEASE:=98
+PKG_RELEASE:=120
 
 PKG_MAINTAINER:=woffko
 PKG_LICENSE:=Apache-2.0
@@ -35,21 +35,7 @@ define Package/luci-app-cake-autorate-rs/postinst
 	rm -f /tmp/luci-indexcache /tmp/luci-indexcache.*; \
 	rm -rf /tmp/luci-modulecache /tmp/luci-modulecache.*; \
 	/etc/init.d/rpcd reload >/dev/null 2>&1 || true; \
-	/etc/init.d/cake-autorate-apply-guard disable >/dev/null 2>&1 || true; \
-	/etc/init.d/cake-autorate-autotune enable >/dev/null 2>&1 || true; \
-	/etc/init.d/cake-autorate-autotune start >/dev/null 2>&1 || true; \
 	exit 0; \
-}
-endef
-
-define Package/luci-app-cake-autorate-rs/prerm
-[ -n "$${IPKG_INSTROOT}" ] || { \
-	/etc/init.d/cake-autorate-autotune stop >/dev/null 2>&1 || true; \
-	/etc/init.d/cake-autorate-autotune disable >/dev/null 2>&1 || true; \
-	/etc/init.d/cake-autorate-apply-guard stop >/dev/null 2>&1 || true; \
-	/etc/init.d/cake-autorate-apply-guard disable >/dev/null 2>&1 || true; \
-	rm -f /etc/rc.d/S*cake-autorate-autotune /etc/rc.d/K*cake-autorate-autotune; \
-	rm -f /etc/rc.d/S*cake-autorate-apply-guard /etc/rc.d/K*cake-autorate-apply-guard; \
 }
 endef
 
@@ -61,7 +47,6 @@ define Package/luci-app-cake-autorate-rs/install
 	$(CP) ./htdocs/* $(1)/www/
 	$(INSTALL_DIR) $(1)/
 	$(CP) ./root/* $(1)/
-	$(RM) $(1)/usr/libexec/cake-autorate-rs/quality-test
 endef
 
 $(eval $(call BuildPackage,luci-app-cake-autorate-rs))

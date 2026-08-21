@@ -11,17 +11,13 @@ pub const MAX_CONTROL_MESSAGE_BYTES: usize = MAX_OPERATION_RECORD_BYTES * 2;
 const MAX_TRAFFIC_BUDGET_BYTES: u64 = 1 << 40;
 
 // Request schema v6 binds a versioned capture policy to an absent bootstrap
-// target without enabling its admission. Existing managed requests continue
-// to encode byte-for-byte as v5. Schema v4 adds explicit standalone Speed Test
-// topology. Schema v3 adds immutable scheduled Auto-Apply intent. The public
-// coordinator control/status protocol remains v2: this private request file
-// has its own backward-compatible decoder so an in-place upgrade can recover
-// an already queued v2/v3/v4/v5 job without granting new authority.
+// target. Existing managed requests use v5 and the public existing-instance
+// launcher uses v4. The coordinator control/status protocol remains v2. Older
+// private request schemas are deliberately rejected by the post-cleanup
+// release rather than translated into new authority.
 const REQUEST_HEADER: &str = "cake-autorate-operation\t6\trequest";
-const LEGACY_V5_REQUEST_HEADER: &str = "cake-autorate-operation\t5\trequest";
-const LEGACY_V4_REQUEST_HEADER: &str = "cake-autorate-operation\t4\trequest";
-const LEGACY_V3_REQUEST_HEADER: &str = "cake-autorate-operation\t3\trequest";
-const LEGACY_V2_REQUEST_HEADER: &str = "cake-autorate-operation\t2\trequest";
+const MANAGED_REQUEST_HEADER: &str = "cake-autorate-operation\t5\trequest";
+const PUBLIC_EXISTING_REQUEST_HEADER: &str = "cake-autorate-operation\t4\trequest";
 const CONTROL_HEADER: &str = "cake-autorate-operation\t2\tcontrol";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -437,10 +433,7 @@ impl ControlMessage {
         if let Some(operation) = &message.operation {
             let header = operation_record.lines().next().unwrap_or_default();
             let wire_matches_target = match operation.target_state {
-                OperationTargetState::ExistingManaged => matches!(
-                    header,
-                    LEGACY_V2_REQUEST_HEADER | LEGACY_V3_REQUEST_HEADER | LEGACY_V4_REQUEST_HEADER
-                ),
+                OperationTargetState::ExistingManaged => header == PUBLIC_EXISTING_REQUEST_HEADER,
                 OperationTargetState::AbsentBootstrap => header == REQUEST_HEADER,
             };
             if !wire_matches_target {
@@ -591,9 +584,13 @@ impl OperationRequest {
             );
         }
         if self.target_state == OperationTargetState::AbsentBootstrap {
-            if self.identity.operation != OperationKind::FullAutotune {
+            if !matches!(
+                self.identity.operation,
+                OperationKind::FullAutotune | OperationKind::Speedtest
+            ) {
                 return Err(
-                    "absent bootstrap target state is valid only for Full Auto-Tune".to_string(),
+                    "absent bootstrap target state is valid only for Full Auto-Tune or Speedtest"
+                        .to_string(),
                 );
             }
             if self.origin != OperationOrigin::Luci {
@@ -669,6 +666,20 @@ impl OperationRequest {
                     );
                 }
                 self.reject_autotune_context()?;
+                if self.identity.operation == OperationKind::AutomaticRating
+                    && self.managed_sqm_section.is_some()
+                {
+                    return Err("Rating must not carry a managed SQM section".to_string());
+                }
+                if self.identity.operation == OperationKind::Speedtest
+                    && self.target_state == OperationTargetState::ExistingManaged
+                    && self.managed_sqm_section.is_some()
+                {
+                    return Err(
+                        "existing-instance Speedtest must not carry a planned SQM section"
+                            .to_string(),
+                    );
+                }
                 if !matches!(self.route.source_ip, Some(IpAddr::V4(_))) {
                     return Err(
                         "generated-traffic operation requires an explicit IPv4 source".to_string(),
@@ -704,6 +715,9 @@ impl OperationRequest {
                     return Err("only Full Auto-Tune may allow SQM disable".to_string());
                 }
                 self.reject_autotune_context()?;
+                if self.managed_sqm_section.is_some() {
+                    return Err("Rating must not carry a managed SQM section".to_string());
+                }
                 if self.speedtest_direction.is_some()
                     || self.speedtest_server_id.is_some()
                     || self.speedtest_topology.is_some()
@@ -744,27 +758,45 @@ impl OperationRequest {
         }
         if self.backend != "speedtest-go" {
             return Err(
-                "absent bootstrap Full Auto-Tune requires the native speedtest-go backend"
-                    .to_string(),
-            );
-        }
-        if self.strategy != Some(CalibrationStrategy::FullRaw) || !self.allow_sqm_disable {
-            return Err(
-                "absent bootstrap Full Auto-Tune requires Full Raw controls and directional SQM bypass authority"
-                    .to_string(),
+                "absent bootstrap operation requires the native speedtest-go backend".to_string(),
             );
         }
         if !matches!(self.route.source_ip, Some(IpAddr::V4(_))) {
             return Err(
-                "absent bootstrap Full Auto-Tune requires an explicit IPv4 route source"
-                    .to_string(),
+                "absent bootstrap operation requires an explicit IPv4 route source".to_string(),
             );
         }
-        if self.service_dl_cap_kbps.is_none() || self.service_ul_cap_kbps.is_none() {
-            return Err(
-                "absent bootstrap Full Auto-Tune requires explicit download and upload service caps as search authority"
-                    .to_string(),
-            );
+        match self.identity.operation {
+            OperationKind::FullAutotune => {
+                if self.strategy != Some(CalibrationStrategy::FullRaw) || !self.allow_sqm_disable {
+                    return Err(
+                        "absent bootstrap Full Auto-Tune requires Full Raw controls and directional SQM bypass authority"
+                            .to_string(),
+                    );
+                }
+                if self.service_dl_cap_kbps.is_none() || self.service_ul_cap_kbps.is_none() {
+                    return Err(
+                        "absent bootstrap Full Auto-Tune requires explicit download and upload service caps as search authority"
+                            .to_string(),
+                    );
+                }
+            }
+            OperationKind::Speedtest => {
+                if self.speedtest_topology != Some(SpeedtestTopology::Unshaped)
+                    || self.allow_sqm_disable
+                    || self.allow_active_traffic
+                {
+                    return Err(
+                        "absent bootstrap Speedtest requires a read-only unshaped policy"
+                            .to_string(),
+                    );
+                }
+            }
+            _ => {
+                return Err(
+                    "absent bootstrap operation kind is unsupported for admission".to_string(),
+                )
+            }
         }
         Ok(())
     }
@@ -776,7 +808,6 @@ impl OperationRequest {
             || self.capacity_learning_policy.is_some()
             || self.service_dl_cap_kbps.is_some()
             || self.service_ul_cap_kbps.is_some()
-            || self.managed_sqm_section.is_some()
         {
             return Err("only Full Auto-Tune may carry access context".to_string());
         }
@@ -792,31 +823,25 @@ impl OperationRequest {
     }
 
     fn encode_for_schema(&self, schema: u8) -> Result<String, String> {
-        if !(2..=6).contains(&schema) {
+        if !(4..=6).contains(&schema) {
             return Err("unsupported operation request schema".to_string());
         }
         self.validate()?;
         if schema < 6 && self.target_state != OperationTargetState::ExistingManaged {
             return Err(
-                "legacy operation request schema cannot represent absent bootstrap authority"
+                "managed operation request schema cannot represent absent bootstrap authority"
                     .to_string(),
             );
         }
         if schema < 6 && self.capture_policy.is_some() {
             return Err(
-                "legacy operation request schema cannot represent capture policy authority"
+                "managed operation request schema cannot represent capture policy authority"
                     .to_string(),
             );
         }
         if schema == 6 && self.target_state != OperationTargetState::AbsentBootstrap {
             return Err(
                 "operation request schema v6 is reserved for absent bootstrap authority"
-                    .to_string(),
-            );
-        }
-        if schema < 4 && self.speedtest_topology == Some(SpeedtestTopology::Unshaped) {
-            return Err(
-                "legacy operation request schema cannot represent unshaped Speed Test authority"
                     .to_string(),
             );
         }
@@ -842,14 +867,12 @@ impl OperationRequest {
                     .unwrap_or_default(),
             ),
         ];
-        if schema >= 4 {
-            fields.push((
-                "speedtest_topology",
-                self.speedtest_topology
-                    .map(|value| value.as_str().to_string())
-                    .unwrap_or_default(),
-            ));
-        }
+        fields.push((
+            "speedtest_topology",
+            self.speedtest_topology
+                .map(|value| value.as_str().to_string())
+                .unwrap_or_default(),
+        ));
         fields.push(("target_interface", self.identity.target_interface.clone()));
         if schema >= 5 {
             fields.push(("target_state", self.target_state.as_str().to_string()));
@@ -954,21 +977,17 @@ impl OperationRequest {
                 bool_text(self.allow_active_traffic).to_string(),
             ),
         ]);
-        if schema >= 3 {
-            fields.push((
-                "scheduled_auto_apply_requested",
-                bool_text(self.scheduled_auto_apply_requested).to_string(),
-            ));
-        }
+        fields.push((
+            "scheduled_auto_apply_requested",
+            bool_text(self.scheduled_auto_apply_requested).to_string(),
+        ));
         fields.push((
             "traffic_budget_bytes",
             self.traffic_budget_bytes.to_string(),
         ));
         let header = match schema {
-            2 => LEGACY_V2_REQUEST_HEADER,
-            3 => LEGACY_V3_REQUEST_HEADER,
-            4 => LEGACY_V4_REQUEST_HEADER,
-            5 => LEGACY_V5_REQUEST_HEADER,
+            4 => PUBLIC_EXISTING_REQUEST_HEADER,
+            5 => MANAGED_REQUEST_HEADER,
             6 => REQUEST_HEADER,
             _ => unreachable!(),
         };
@@ -983,17 +1002,13 @@ impl OperationRequest {
     pub fn decode(input: &str) -> Result<Self, String> {
         let schema = match input.lines().next() {
             Some(REQUEST_HEADER) => 6,
-            Some(LEGACY_V5_REQUEST_HEADER) => 5,
-            Some(LEGACY_V4_REQUEST_HEADER) => 4,
-            Some(LEGACY_V3_REQUEST_HEADER) => 3,
-            Some(LEGACY_V2_REQUEST_HEADER) => 2,
+            Some(MANAGED_REQUEST_HEADER) => 5,
+            Some(PUBLIC_EXISTING_REQUEST_HEADER) => 4,
             _ => return Err("operation record header mismatch".to_string()),
         };
         let header = match schema {
-            2 => LEGACY_V2_REQUEST_HEADER,
-            3 => LEGACY_V3_REQUEST_HEADER,
-            4 => LEGACY_V4_REQUEST_HEADER,
-            5 => LEGACY_V5_REQUEST_HEADER,
+            4 => PUBLIC_EXISTING_REQUEST_HEADER,
+            5 => MANAGED_REQUEST_HEADER,
             6 => REQUEST_HEADER,
             _ => unreachable!(),
         };
@@ -1015,17 +1030,11 @@ impl OperationRequest {
         )?;
         let speedtest_server_id =
             optional_parsed("speedtest_server_id", reader.field("speedtest_server_id")?)?;
-        let speedtest_topology = if schema >= 4 {
-            parse_optional_enum(
-                reader.field("speedtest_topology")?,
-                SpeedtestTopology::parse,
-                "speed-test topology",
-            )?
-        } else if operation == OperationKind::Speedtest {
-            Some(SpeedtestTopology::Current)
-        } else {
-            None
-        };
+        let speedtest_topology = parse_optional_enum(
+            reader.field("speedtest_topology")?,
+            SpeedtestTopology::parse,
+            "speed-test topology",
+        )?;
         let target_interface = reader.field("target_interface")?;
         let target_state = if schema >= 5 {
             OperationTargetState::parse(&reader.field("target_state")?)
@@ -1098,11 +1107,8 @@ impl OperationRequest {
             optional_parsed("service_ul_cap_kbps", reader.field("service_ul_cap_kbps")?)?;
         let allow_sqm_disable = parse_bool(&reader.field("allow_sqm_disable")?)?;
         let allow_active_traffic = parse_bool(&reader.field("allow_active_traffic")?)?;
-        let scheduled_auto_apply_requested = if schema < 3 {
-            false
-        } else {
-            parse_bool(&reader.field("scheduled_auto_apply_requested")?)?
-        };
+        let scheduled_auto_apply_requested =
+            parse_bool(&reader.field("scheduled_auto_apply_requested")?)?;
         let traffic_budget_bytes = parse_u64(
             "traffic_budget_bytes",
             &reader.field("traffic_budget_bytes")?,
@@ -1462,7 +1468,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v4_request_has_frozen_encoding_and_decodes_as_existing_managed() {
+    fn public_existing_v4_request_has_frozen_encoding_and_decodes_exactly() {
         let expected = request();
         let encoded = expected.encode_for_schema(4).unwrap();
         let frozen = concat!(
@@ -1509,56 +1515,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v2_request_decodes_without_auto_apply_authority() {
-        let expected = request();
-        let encoded = expected.encode_for_schema(2).unwrap();
-        assert!(encoded.starts_with("cake-autorate-operation\t2\trequest\n"));
-        assert!(!encoded.contains("scheduled_auto_apply_requested"));
-        assert!(!encoded.contains("speedtest_topology"));
-        let decoded = OperationRequest::decode(&encoded).unwrap();
-        assert_eq!(decoded.target_state, OperationTargetState::ExistingManaged);
-        assert_eq!(decoded, expected);
-    }
-
-    #[test]
-    fn legacy_v3_request_decodes_without_speedtest_topology_authority() {
-        let expected = request();
-        let encoded = expected.encode_for_schema(3).unwrap();
-        assert!(encoded.starts_with("cake-autorate-operation\t3\trequest\n"));
-        assert!(encoded.contains("scheduled_auto_apply_requested=0\n"));
-        assert!(!encoded.contains("speedtest_topology"));
-        let decoded = OperationRequest::decode(&encoded).unwrap();
-        assert_eq!(decoded.target_state, OperationTargetState::ExistingManaged);
-        assert_eq!(decoded, expected);
-
-        let mut legacy_speedtest = expected;
-        legacy_speedtest.identity.operation = OperationKind::Speedtest;
-        legacy_speedtest.speedtest_direction = Some(SpeedtestDirection::Both);
-        legacy_speedtest.speedtest_topology = Some(SpeedtestTopology::Current);
-        legacy_speedtest.managed_sqm_section = None;
-        legacy_speedtest.profile = None;
-        legacy_speedtest.strategy = None;
-        legacy_speedtest.access_medium = None;
-        legacy_speedtest.access_source = None;
-        legacy_speedtest.access_confidence_percent = 0;
-        legacy_speedtest.capacity_learning_policy = None;
-        legacy_speedtest.service_dl_cap_kbps = None;
-        legacy_speedtest.service_ul_cap_kbps = None;
-        legacy_speedtest.allow_sqm_disable = false;
-        let encoded_speedtest = legacy_speedtest.encode_for_schema(3).unwrap();
-        assert_eq!(
-            OperationRequest::decode(&encoded_speedtest).unwrap(),
-            legacy_speedtest
-        );
-
-        legacy_speedtest.speedtest_topology = Some(SpeedtestTopology::Unshaped);
-        assert!(legacy_speedtest
-            .encode_for_schema(3)
-            .unwrap_err()
-            .contains("cannot represent unshaped Speed Test authority"));
-    }
-
-    #[test]
     fn absent_bootstrap_v6_admission_is_exact_and_does_not_weaken_existing_requests() {
         let mut value = request();
         value.target_state = OperationTargetState::AbsentBootstrap;
@@ -1590,11 +1546,11 @@ mod tests {
             "{tampered_error}"
         );
 
-        let legacy_absent = encoded
-            .replacen(REQUEST_HEADER, LEGACY_V5_REQUEST_HEADER, 1)
+        let managed_absent = encoded
+            .replacen(REQUEST_HEADER, MANAGED_REQUEST_HEADER, 1)
             .replace("capture_policy=standard_v1\n", "")
             .replace(&format!("capture_policy_sha256={policy_digest}\n"), "");
-        assert!(OperationRequest::decode(&legacy_absent)
+        assert!(OperationRequest::decode(&managed_absent)
             .unwrap_err()
             .contains("requires an explicit capture policy"));
 
@@ -1613,9 +1569,9 @@ mod tests {
             .unwrap_err()
             .contains("explicit download and upload service caps"));
 
-        let mut legacy_backend = value.clone();
-        legacy_backend.backend = "auto".to_string();
-        assert!(legacy_backend
+        let mut unsupported_backend = value.clone();
+        unsupported_backend.backend = "auto".to_string();
+        assert!(unsupported_backend
             .validate_admission_policy()
             .unwrap_err()
             .contains("native speedtest-go backend"));
@@ -1644,11 +1600,7 @@ mod tests {
 
     #[test]
     fn absent_bootstrap_structural_authority_is_narrowly_bound() {
-        for operation in [
-            OperationKind::AutomaticRating,
-            OperationKind::GuidedRating,
-            OperationKind::Speedtest,
-        ] {
+        for operation in [OperationKind::AutomaticRating, OperationKind::GuidedRating] {
             let mut value = request();
             value.target_state = OperationTargetState::AbsentBootstrap;
             value.capture_policy = Some(AutotuneCapturePolicyId::StandardV1);
@@ -1658,6 +1610,32 @@ mod tests {
                 .unwrap_err()
                 .contains("valid only for Full Auto-Tune"));
         }
+
+        let mut speedtest = request();
+        speedtest.identity.operation = OperationKind::Speedtest;
+        speedtest.target_state = OperationTargetState::AbsentBootstrap;
+        speedtest.capture_policy = Some(AutotuneCapturePolicyId::StandardV2);
+        speedtest.profile = None;
+        speedtest.strategy = None;
+        speedtest.access_medium = None;
+        speedtest.access_source = None;
+        speedtest.access_confidence_percent = 0;
+        speedtest.capacity_learning_policy = None;
+        speedtest.service_dl_cap_kbps = None;
+        speedtest.service_ul_cap_kbps = None;
+        speedtest.allow_sqm_disable = false;
+        speedtest.allow_active_traffic = false;
+        speedtest.speedtest_direction = Some(SpeedtestDirection::Both);
+        speedtest.speedtest_topology = Some(SpeedtestTopology::Unshaped);
+        speedtest.validate().unwrap();
+        speedtest.validate_admission_policy().unwrap();
+
+        let mut shaped_bootstrap_speedtest = speedtest.clone();
+        shaped_bootstrap_speedtest.speedtest_topology = Some(SpeedtestTopology::Current);
+        assert!(shaped_bootstrap_speedtest
+            .validate_admission_policy()
+            .unwrap_err()
+            .contains("read-only unshaped policy"));
 
         for origin in [
             OperationOrigin::Scheduler,
@@ -1696,9 +1674,9 @@ mod tests {
 
         // Existing managed requests retain the historical hyphen-compatible
         // syntax; only the new Absent bootstrap authority is narrowed.
-        let mut existing_legacy_section = request();
-        existing_legacy_section.managed_sqm_section = Some("wan-sqm".to_string());
-        existing_legacy_section.validate().unwrap();
+        let mut existing_hyphenated_section = request();
+        existing_hyphenated_section.managed_sqm_section = Some("wan-sqm".to_string());
+        existing_hyphenated_section.validate().unwrap();
 
         let mut scheduled_apply = request();
         scheduled_apply.target_state = OperationTargetState::AbsentBootstrap;
@@ -1927,12 +1905,8 @@ mod tests {
         assert!(!encoded.contains("target_state="));
         assert_eq!(ControlMessage::decode(&encoded).unwrap(), message);
 
-        let legacy_v2 = format!(
-            "{}{}",
-            message.control.encode().unwrap(),
-            operation.encode_for_schema(2).unwrap()
-        );
-        assert_eq!(ControlMessage::decode(&legacy_v2).unwrap(), message);
+        assert!(operation.encode_for_test_schema(2).is_err());
+        assert!(operation.encode_for_test_schema(3).is_err());
 
         let noncanonical_existing_v5 = format!(
             "{}{}",

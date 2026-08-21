@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 const RUNTIME_OWNER_JOURNAL_HEADER: &str = "cake-autorate-calibration\t3\tjournal";
 const PUBLICATION_JOURNAL_HEADER: &str = "cake-autorate-calibration\t4\tjournal";
 const JOURNAL_HEADER: &str = "cake-autorate-calibration\t2\tjournal";
-const LEGACY_JOURNAL_HEADER: &str = "cake-autorate-calibration\t1\tjournal";
 pub(crate) const MAX_JOURNAL_JOBS: usize = 64;
 pub(crate) const JOURNAL_RETENTION_TARGET: usize = 48;
 const MAX_JOURNAL_DIRECTORY_ENTRIES: usize = 256;
@@ -516,9 +515,9 @@ impl JobJournal {
         }
         self.transition(OperationState::Running)?;
         self.process = Some(process);
-        // A live legacy worker may already own temporary SQM, nftables, route,
-        // or autorate state.  Recovery remains armed until a separately
-        // attested terminal result confirms restoration.
+        // A live worker may already own temporary SQM, nftables, route, or
+        // autorate state. Recovery remains armed until a separately attested
+        // terminal result confirms restoration.
         self.recovery_required = true;
         self.validate()
     }
@@ -546,32 +545,6 @@ impl JobJournal {
             .ok_or_else(|| "journal sequence overflow".to_string())?;
         self.process = Some(process);
         self.recovery_required = true;
-        self.validate()
-    }
-
-    #[cfg(test)]
-    pub fn settle_legacy_terminal(
-        &mut self,
-        terminal_kind: &str,
-        terminal_state: &str,
-    ) -> Result<(), String> {
-        if !self.runtime_mutated || !self.recovery_required || self.worker_run_id.is_none() {
-            return Err("legacy terminal cannot settle an unarmed journal".to_string());
-        }
-        let next = match (terminal_kind, terminal_state) {
-            ("result", "complete") => OperationState::ReviewReady,
-            ("error", "cancelled") => OperationState::Cancelled,
-            ("error", _) => OperationState::Failed,
-            _ => return Err("legacy terminal kind/state combination is unsupported".to_string()),
-        };
-        self.transition(next)?;
-        self.process = None;
-        self.terminal_kind = Some(terminal_kind.to_string());
-        self.terminal_state = Some(terminal_state.to_string());
-        self.runtime_mutated = false;
-        self.recovery_required = false;
-        self.heavy_lease_acquired = false;
-        self.diagnostic_code = None;
         self.validate()
     }
 
@@ -694,23 +667,6 @@ impl JobJournal {
         self.process = None;
         self.runtime_mutated = true;
         self.recovery_required = true;
-        self.diagnostic_code = Some(diagnostic_code.to_string());
-        self.validate()
-    }
-
-    #[cfg(test)]
-    pub fn record_reconciliation_failure(&mut self, diagnostic_code: &str) -> Result<(), String> {
-        if self.state != OperationState::Recovering || !self.recovery_required {
-            return Err("only a recovering journal can record reconciliation failure".to_string());
-        }
-        self.sequence = self
-            .sequence
-            .checked_add(1)
-            .ok_or_else(|| "journal sequence overflow".to_string())?;
-        self.reconcile_attempts = self
-            .reconcile_attempts
-            .checked_add(1)
-            .ok_or_else(|| "reconciliation attempt count overflow".to_string())?;
         self.diagnostic_code = Some(diagnostic_code.to_string());
         self.validate()
     }
@@ -859,13 +815,11 @@ impl JobJournal {
             .next()
             .ok_or_else(|| "journal record header is missing".to_string())?;
         let schema = match header {
-            LEGACY_JOURNAL_HEADER => 1,
             JOURNAL_HEADER => 2,
             RUNTIME_OWNER_JOURNAL_HEADER => 3,
             PUBLICATION_JOURNAL_HEADER => 4,
             _ => return Err("unsupported journal record header".to_string()),
         };
-        let legacy = schema == 1;
         let job_id = field(&mut lines, "job_id")?;
         let boot_id = field(&mut lines, "boot_id")?;
         let coordinator_generation = field(&mut lines, "coordinator_generation")?;
@@ -873,12 +827,7 @@ impl JobJournal {
             .ok_or_else(|| "unsupported journal state".to_string())?;
         let sequence = parse_u64("sequence", &field(&mut lines, "sequence")?)?;
         let heavy_traffic = parse_bool(&field(&mut lines, "heavy_traffic")?)?;
-        let heavy_lease_acquired = if legacy {
-            // Version 1 acquired the heavy lease at admission time.
-            heavy_traffic
-        } else {
-            parse_bool(&field(&mut lines, "heavy_lease_acquired")?)?
-        };
+        let heavy_lease_acquired = parse_bool(&field(&mut lines, "heavy_lease_acquired")?)?;
         let instance = field(&mut lines, "instance")?;
         let target_interface = field(&mut lines, "target_interface")?;
         let sqm_fingerprint = field(&mut lines, "sqm_fingerprint")?;
@@ -955,7 +904,7 @@ impl JobJournal {
             recovery_required,
         };
         journal.validate()?;
-        if !legacy && journal.encode_for_schema(schema)? != input {
+        if journal.encode_for_schema(schema)? != input {
             return Err("journal record is not canonically encoded".to_string());
         }
         Ok(journal)
@@ -1684,7 +1633,7 @@ mod tests {
     }
 
     #[test]
-    fn staged_heavy_lease_is_durable_and_version_one_is_conservatively_adopted() {
+    fn staged_heavy_lease_is_durable() {
         let coordinator = coordinator();
         let request = request();
         let mut journal = JobJournal::queued(&request, &coordinator, true).unwrap();
@@ -1697,14 +1646,12 @@ mod tests {
                 .heavy_lease_acquired
         );
 
-        let legacy = journal
+        let retired_v1 = journal
             .encode()
             .unwrap()
-            .replacen(JOURNAL_HEADER, LEGACY_JOURNAL_HEADER, 1)
+            .replacen(JOURNAL_HEADER, "cake-autorate-calibration\t1\tjournal", 1)
             .replace("heavy_lease_acquired=1\n", "");
-        let adopted = JobJournal::decode(&legacy).unwrap();
-        assert!(adopted.heavy_traffic);
-        assert!(adopted.heavy_lease_acquired);
+        assert!(JobJournal::decode(&retired_v1).is_err());
     }
 
     #[test]
@@ -2143,49 +2090,6 @@ mod tests {
             journal.diagnostic_code.as_deref(),
             Some("worker-permit-timeout")
         );
-    }
-
-    #[test]
-    fn attested_legacy_terminal_clears_runtime_only_after_exact_settlement() {
-        let mut journal = JobJournal::queued(&request(), &coordinator(), true).unwrap();
-        journal.arm_runtime_mutation("8".repeat(32)).unwrap();
-        journal
-            .attach_running_process(
-                ProcessIdentity {
-                    pid: 42,
-                    process_group: 42,
-                    starttime_ticks: 100,
-                },
-                "8".repeat(32),
-            )
-            .unwrap();
-        journal.require_recovery("worker-exited").unwrap();
-        assert!(journal.runtime_mutated);
-        assert!(journal.recovery_required);
-        journal
-            .record_reconciliation_failure("terminal-missing")
-            .unwrap();
-        journal
-            .record_reconciliation_failure("terminal-missing")
-            .unwrap();
-        assert_eq!(journal.reconcile_attempts, 2);
-        assert_eq!(
-            JobJournal::decode(&journal.encode().unwrap())
-                .unwrap()
-                .reconcile_attempts,
-            2
-        );
-        journal
-            .settle_legacy_terminal("result", "complete")
-            .unwrap();
-        assert_eq!(journal.state, OperationState::ReviewReady);
-        assert!(!journal.runtime_mutated);
-        assert!(!journal.recovery_required);
-        assert_eq!(
-            journal.worker_run_id.as_deref(),
-            Some("88888888888888888888888888888888")
-        );
-        assert_eq!(journal.terminal_kind.as_deref(), Some("result"));
     }
 
     #[test]

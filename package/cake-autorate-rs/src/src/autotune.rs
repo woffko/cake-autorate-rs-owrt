@@ -418,7 +418,7 @@ pub struct LatencyBaseline {
 /// Hard input/output bound shared by the proposal and validation paths.
 /// 100 Tbit/s is deliberately far above current OpenWrt targets while still
 /// keeping every floating-point rate calculation and integer conversion sane.
-pub const MAX_RATE_KBPS: u64 = 100_000_000;
+pub use crate::rate_limits::MAX_RATE_KBPS;
 pub const MAX_THROUGHPUT_SAMPLES: usize = 1_024;
 pub const MAX_BASELINE_SAMPLES: usize = 1_000_000;
 pub const MAX_LATENCY_MS: f64 = 60_000.0;
@@ -2380,6 +2380,7 @@ fn json_escape(value: &str) -> String {
 
 pub const MAX_PROFILE_SEARCH_OBSERVATIONS: usize = 12;
 pub const MAX_PROFILE_REVIEW_OPTIONS: usize = 3;
+pub const PROFILE_SEARCH_SCHEMA_VERSION: u32 = 4;
 pub const PHYSICAL_CAPACITY_BELOW_CAKE_CANDIDATE_REVIEW_REASON: &str =
     "physical-capacity-below-cake-candidate-review";
 const MAX_SAME_CANDIDATE_OBSERVATIONS: usize = 3;
@@ -2578,6 +2579,51 @@ impl ProfileSearchResult {
         profile_search_review_options(self)
     }
 
+    pub fn validate_review_alignment(&self) -> Result<(), String> {
+        if !matches!(
+            self.action,
+            ProfileSearchAction::Complete | ProfileSearchAction::Fallback
+        ) {
+            return Ok(());
+        }
+        let selected_index = self
+            .selected_index
+            .ok_or_else(|| "terminal profile search has no selected observation".to_string())?;
+        let options = self.review_options();
+        let recommended = options.first().ok_or_else(|| {
+            "terminal profile search has no recommended Review candidate".to_string()
+        })?;
+        if recommended.role != ProfileSearchOptionRole::Recommended
+            || recommended.selected_index != selected_index
+            || self
+                .observations
+                .get(selected_index)
+                .is_none_or(|observation| {
+                    observation.candidate_kbps != recommended.candidate_kbps
+                        || observation.transport_censored != recommended.transport_censored
+                })
+        {
+            return Err(
+                "terminal profile-search selected observation does not match its recommended Review candidate"
+                    .to_string(),
+            );
+        }
+        let selected_metrics = self
+            .metrics
+            .get(selected_index)
+            .ok_or_else(|| "terminal profile-search selected metrics are missing".to_string())?;
+        if self.action == ProfileSearchAction::Complete
+            && (!selected_metrics.safety_pass
+                || (self.profile != AutotuneProfile::Fair && !selected_metrics.target_met))
+        {
+            return Err(
+                "terminal profile search claims Complete for a conservative candidate that did not satisfy its required objective"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     pub fn physical_capacity_limited_review_for(&self, candidate_kbps: u64) -> bool {
         self.action == ProfileSearchAction::Fallback
             && self.reason == PHYSICAL_CAPACITY_BELOW_CAKE_CANDIDATE_REVIEW_REASON
@@ -2701,7 +2747,7 @@ impl ProfileSearchResult {
         };
         format!(
             concat!(
-                "{{\"schema_version\":4,\"profile\":\"{}\",\"direction\":\"{}\",",
+                "{{\"schema_version\":{},\"profile\":\"{}\",\"direction\":\"{}\",",
                 "\"observed_low_kbps\":{},",
                 "\"objective\":\"{}\",\"target_grade\":\"{}\",",
                 "\"capacity_floor_percent\":{:.1},\"capacity_objective_percent\":{:.1},",
@@ -2720,6 +2766,7 @@ impl ProfileSearchResult {
                 "\"attempts\":{},\"max_attempts\":{},",
                 "\"review_options\":[{}],\"evaluated\":[{}]}}"
             ),
+            PROFILE_SEARCH_SCHEMA_VERSION,
             self.profile.as_str(),
             self.direction.as_str(),
             self.observed_low_kbps,
@@ -3694,6 +3741,35 @@ fn profile_search_review_options(result: &ProfileSearchResult) -> Vec<ProfileSea
     options
 }
 
+/// Make the terminal search summary and the first operator-visible Review
+/// option share one candidate-level authority.  Direction optimizers may use
+/// individual observations while deciding whether another measurement is
+/// needed, but a terminal noisy group must never publish its lucky best repeat
+/// as `selected` while the conservative repeated-candidate frontier recommends
+/// another rate.
+fn align_terminal_selection_with_recommended(
+    mut result: ProfileSearchResult,
+) -> ProfileSearchResult {
+    if matches!(
+        result.action,
+        ProfileSearchAction::Complete | ProfileSearchAction::Fallback
+    ) {
+        if let Some(recommended) = profile_search_review_options(&result).first() {
+            result.selected_index = Some(recommended.selected_index);
+            if result.action == ProfileSearchAction::Complete {
+                let selected_metrics = result.metrics[recommended.selected_index];
+                if !selected_metrics.safety_pass
+                    || (result.profile != AutotuneProfile::Fair && !selected_metrics.target_met)
+                {
+                    result.action = ProfileSearchAction::Fallback;
+                    result.reason = "conservative-review-downgrade";
+                }
+            }
+        }
+    }
+    result
+}
+
 fn review_candidate_balanced_score(
     result: &ProfileSearchResult,
     candidate: ReviewCandidate,
@@ -3996,7 +4072,7 @@ fn optimize_variable_link_direction(
         // but must leave the runtime minimum unresolved instead of silently
         // turning that ceiling into a floor.
         let runtime_minimum_index = knee_detected.then_some(runtime_minimum_index).flatten();
-        ProfileSearchResult {
+        align_terminal_selection_with_recommended(ProfileSearchResult {
             profile: input.profile,
             direction: input.direction,
             observed_low_kbps: input.observed_low_kbps,
@@ -4023,7 +4099,7 @@ fn optimize_variable_link_direction(
             repeat_count,
             no_cake_effect,
             noisy,
-        }
+        })
     };
 
     if !last_metrics.resource_safe {
@@ -4590,7 +4666,7 @@ pub fn optimize_profile_direction(
         } else {
             None
         };
-        ProfileSearchResult {
+        align_terminal_selection_with_recommended(ProfileSearchResult {
             profile: input.profile,
             direction: input.direction,
             observed_low_kbps: input.observed_low_kbps,
@@ -4620,7 +4696,7 @@ pub fn optimize_profile_direction(
             ),
             no_cake_effect: false,
             noisy: false,
-        }
+        })
     };
 
     if !last_metrics.measurement_reliable {
@@ -5045,7 +5121,7 @@ pub fn terminate_profile_direction_at_measured_boundary(
     } else {
         None
     };
-    Ok(result)
+    Ok(align_terminal_selection_with_recommended(result))
 }
 
 #[cfg(test)]
@@ -6675,6 +6751,12 @@ mod tests {
             let options = result.review_options();
             assert_eq!(options.len(), MAX_PROFILE_REVIEW_OPTIONS, "{profile:?}");
             assert_eq!(options[0].role, ProfileSearchOptionRole::Recommended);
+            assert_eq!(
+                result.selected_index,
+                Some(options[0].selected_index),
+                "terminal selected observation must be the recommended candidate for {profile:?}"
+            );
+            result.validate_review_alignment().unwrap();
             let rates = options
                 .iter()
                 .map(|option| option.candidate_kbps)
@@ -7561,6 +7643,96 @@ mod tests {
         assert_eq!(exhausted.metrics[selected_index].grade, "C");
         assert!(!exhausted.metrics[selected_index].target_met);
         assert!(exhausted.metrics[selected_index].retention_percent >= 50.0);
+    }
+
+    #[test]
+    fn variable_link_noisy_outlier_cannot_diverge_from_conservative_recommended_candidate() {
+        let result = optimize_profile_direction(ProfileSearchInput {
+            profile: AutotuneProfile::VariableLink,
+            direction: SearchDirection::Download,
+            observed_low_kbps: 94_100,
+            minimum_kbps: 47_100,
+            upper_kbps: 95_000,
+            thresholds: AutotuneProfile::VariableLink.validation_thresholds(),
+            uncertainty_percent: 10.0,
+            max_attempts: 12,
+            observations: vec![
+                search_observation(95_000, 83_669, 139.845),
+                search_observation(80_800, 71_937, 167.649),
+                search_observation(80_800, 71_157, 165.766),
+                search_observation(80_800, 70_416, 94.072),
+            ],
+        })
+        .unwrap();
+
+        assert_eq!(result.action, ProfileSearchAction::Fallback);
+        assert_eq!(result.reason, "noisy-link-safe-review");
+        assert!(result.noisy);
+        let options = result.review_options();
+        let recommended = options.first().expect("conservative Review candidate");
+        assert_eq!(recommended.role, ProfileSearchOptionRole::Recommended);
+        assert_eq!(recommended.candidate_kbps, 95_000);
+        assert_eq!(recommended.selected_index, 0);
+        assert_eq!(result.selected_index, Some(recommended.selected_index));
+        result.validate_review_alignment().unwrap();
+
+        let json = result.to_json();
+        assert!(json.contains("\"selected\":{\"index\":1,\"candidate_kbps\":95000"));
+        assert!(json.contains(
+            "\"review_options\":[{\"role\":\"recommended\",\"observation_index\":1,\"candidate_kbps\":95000"
+        ));
+        assert!(!json.contains("\"selected\":{\"index\":4,\"candidate_kbps\":80800"));
+    }
+
+    #[test]
+    fn conservative_representative_downgrades_a_false_complete_claim() {
+        let result = optimize_profile_direction(ProfileSearchInput {
+            profile: AutotuneProfile::BestOverall,
+            direction: SearchDirection::Download,
+            observed_low_kbps: 100_000,
+            minimum_kbps: 80_000,
+            upper_kbps: 80_000,
+            thresholds: AutotuneProfile::BestOverall.validation_thresholds(),
+            uncertainty_percent: 1.5,
+            max_attempts: 2,
+            observations: vec![
+                search_observation(80_000, 80_000, 20.0),
+                search_observation(80_000, 80_000, 50.0),
+            ],
+        })
+        .unwrap();
+
+        assert_eq!(result.action, ProfileSearchAction::Fallback);
+        assert_eq!(result.reason, "conservative-review-downgrade");
+        assert_eq!(result.selected_index, Some(1));
+        assert!(!result.metrics[1].target_met);
+        assert!(result.metrics[1].safety_pass);
+        result.validate_review_alignment().unwrap();
+    }
+
+    #[test]
+    fn fair_keeps_complete_for_a_safe_conservative_representative_below_soft_quality_target() {
+        let result = optimize_profile_direction(ProfileSearchInput {
+            profile: AutotuneProfile::Fair,
+            direction: SearchDirection::Download,
+            observed_low_kbps: 100_000,
+            minimum_kbps: 80_000,
+            upper_kbps: 80_000,
+            thresholds: AutotuneProfile::Fair.validation_thresholds(),
+            uncertainty_percent: 1.5,
+            max_attempts: 2,
+            observations: vec![
+                search_observation(80_000, 80_000, 100.0),
+                search_observation(80_000, 80_000, 250.0),
+            ],
+        })
+        .unwrap();
+
+        assert_eq!(result.action, ProfileSearchAction::Complete);
+        assert_eq!(result.selected_index, Some(1));
+        assert!(!result.metrics[1].target_met);
+        assert!(result.metrics[1].safety_pass);
+        result.validate_review_alignment().unwrap();
     }
 
     #[test]

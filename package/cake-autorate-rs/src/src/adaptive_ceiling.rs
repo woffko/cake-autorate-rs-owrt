@@ -81,7 +81,7 @@ pub struct AdaptiveCeilingDirection {
 }
 
 impl AdaptiveCeilingDirection {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "calibration"))]
     pub fn new(configured_max_kbps: f64, absolute_cap_kbps: f64) -> Self {
         Self::new_at(configured_max_kbps, absolute_cap_kbps, Instant::now())
     }

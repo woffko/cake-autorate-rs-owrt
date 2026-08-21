@@ -2,93 +2,26 @@
 set -eu
 
 base="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-. "$base/files/etc/init.d/cake-autorate"
+work="$(mktemp -d "${TMPDIR:-/tmp}/cake-init-traffic-profile-test.XXXXXX")"
+full_script="$work/cake-autorate.full"
+lite_script="$work/cake-autorate.lite"
+trap 'rm -rf "$work"' EXIT INT TERM
 
-[ "$(canonical_traffic_autotune_profile gaming_extreme)" = gaming ]
-[ "$(canonical_traffic_autotune_profile gaming-extreme)" = gaming ]
+sh "$base/scripts/render-init-variant.sh" full \
+	"$base/files/etc/init.d/cake-autorate" "$full_script"
+sh "$base/scripts/render-init-variant.sh" lite \
+	"$base/files/etc/init.d/cake-autorate" "$lite_script"
 
-traffic_profile=""
-traffic_profile_migrated=""
-autotune_profile=gaming
-defaults_value=""
-rule_active_profile=gaming
-rule_inactive_profile=fair
-changes=""
+for rendered in "$full_script" "$lite_script"; do
+	grep -Fq '"$DAEMON" --service-lifecycle prepare-start' "$rendered"
+	! grep -Fq '"$DAEMON" --sync-presets' "$rendered"
+	! grep -Fq 'sync_interface_presets' "$rendered"
+	! grep -Fq 'migrate_legacy_route_instance' "$rendered"
+	! grep -Fq 'sync_rate_preset_instance' "$rendered"
+	! grep -Fq 'set_cake_option_if_changed' "$rendered"
+done
 
-config_get() {
-	local variable="$1" section="$2" option="$3" fallback="${4:-}" value
-	value="$fallback"
-	case "$section.$option" in
-		wan.traffic_profile) value="$traffic_profile" ;;
-		wan.traffic_profile_migrated) value="$traffic_profile_migrated" ;;
-	esac
-	eval "$variable=\$value"
-}
+! grep -Fq 'migrate_traffic_profile_instance' "$full_script"
+! grep -Fq 'canonical_traffic_autotune_profile' "$full_script"
 
-uci() {
-	case "$*" in
-		"-q get cake-autorate.wan.autotune_profile") printf '%s\n' "$autotune_profile" ;;
-		"-q get cake-autorate.wan.traffic_defaults_gaming")
-			[ -n "$defaults_value" ] && printf '%s\n' "$defaults_value" || true
-			;;
-		"-q show cake-autorate")
-			printf '%s\n' \
-				'cake-autorate.active_rule=traffic_rule' \
-				'cake-autorate.inactive_rule=traffic_rule'
-			;;
-		"-q get cake-autorate.active_rule.instance"|"-q get cake-autorate.inactive_rule.instance") printf 'wan\n' ;;
-		"-q get cake-autorate.active_rule.profile") printf '%s\n' "$rule_active_profile" ;;
-		"-q get cake-autorate.inactive_rule.profile") printf '%s\n' "$rule_inactive_profile" ;;
-		"set cake-autorate.wan.traffic_profile=auto") traffic_profile=auto; changes="${changes}profile=auto\n" ;;
-		"set cake-autorate.wan.traffic_profile=custom") traffic_profile=custom; changes="${changes}profile=custom\n" ;;
-		"set cake-autorate.wan.traffic_profile_migrated=1") traffic_profile_migrated=1; changes="${changes}migrated=1\n" ;;
-		"set cake-autorate.active_rule.profile=custom") rule_active_profile=custom; changes="${changes}active=custom\n" ;;
-		"set cake-autorate.inactive_rule.profile=custom") rule_inactive_profile=custom; changes="${changes}inactive=custom\n" ;;
-		*) return 1 ;;
-	esac
-}
-
-logger() { :; }
-
-CAKE_CONFIG_CHANGED=0
-migrate_traffic_profile_instance wan
-[ "$traffic_profile" = auto ]
-[ "$traffic_profile_migrated" = 1 ]
-[ "$CAKE_CONFIG_CHANGED" -eq 1 ]
-[ "$rule_active_profile" = gaming ]
-[ "$rule_inactive_profile" = fair ]
-
-traffic_profile=""
-traffic_profile_migrated=""
-defaults_value=0
-rule_active_profile=""
-rule_inactive_profile=fair
-changes=""
-CAKE_CONFIG_CHANGED=0
-migrate_traffic_profile_instance wan
-[ "$traffic_profile" = custom ]
-[ "$traffic_profile_migrated" = 1 ]
-[ "$rule_active_profile" = custom ]
-[ "$rule_inactive_profile" = fair ]
-
-changes=""
-CAKE_CONFIG_CHANGED=0
-migrate_traffic_profile_instance wan
-[ -z "$changes" ]
-[ "$CAKE_CONFIG_CHANGED" -eq 0 ]
-
-# A LuCI-written Custom selection must not bypass the old rule migration when
-# the one-time marker is still absent.
-traffic_profile=custom
-traffic_profile_migrated=""
-defaults_value=0
-rule_active_profile=gaming
-rule_inactive_profile=fair
-changes=""
-CAKE_CONFIG_CHANGED=0
-migrate_traffic_profile_instance wan
-[ "$rule_active_profile" = custom ]
-[ "$rule_inactive_profile" = fair ]
-[ "$traffic_profile_migrated" = 1 ]
-
-printf '%s\n' 'init traffic-profile migration tests passed'
+printf '%s\n' 'init native lifecycle preset-migration boundary tests passed'

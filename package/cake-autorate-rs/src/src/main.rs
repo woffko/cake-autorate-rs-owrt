@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::env;
+#[cfg(feature = "calibration")]
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -7,6 +8,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 #[cfg(feature = "calibration")]
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
+#[cfg(test)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -17,24 +19,35 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod adaptive_ceiling;
-#[cfg_attr(not(feature = "calibration"), allow(dead_code))]
+#[cfg(feature = "calibration")]
 mod autotune;
-#[cfg_attr(not(feature = "calibration"), allow(dead_code))]
 mod operations;
+#[cfg(feature = "transport-probes")]
 mod quality_grade;
+mod rate_limits;
+#[cfg(feature = "transport-probes")]
 mod rating_load;
+mod reflector_defaults;
 mod routing;
+#[cfg(feature = "transport-probes")]
 mod transport_probe;
+#[cfg(any(feature = "transport-probes", test))]
 mod transport_quality;
 
 use adaptive_ceiling::{
     AdaptiveCeilingChange, AdaptiveCeilingDirection, AdaptiveCeilingObservation,
     AdaptiveCeilingPolicy, AdaptiveCeilingUpdate,
 };
+#[cfg(feature = "transport-probes")]
 use quality_grade::{QualityGradeMetric, QualityGradeResult, QualityGradeTracker};
+#[cfg(feature = "transport-probes")]
 use rating_load::{RatingLoadConfig, RatingLoadDetector, RatingLoadSnapshot, RatingPhase};
-use routing::{RouteInspector, RouteMode, RouteSnapshot, RouteSpec, UplinkLifecycle, UplinkState};
+#[cfg(feature = "transport-probes")]
+use routing::RouteMode;
+use routing::{RouteInspector, RouteSnapshot, RouteSpec, UplinkLifecycle, UplinkState};
+#[cfg(feature = "transport-probes")]
 use transport_probe::{RouteBinding, TransportProbeBackend, TransportProbeEngine};
+#[cfg(feature = "transport-probes")]
 use transport_quality::{
     classify_quality, effective_latency_delta_ms, throughput_floor, transport_allows_growth,
     QualityClass, QualitySearchDirection, QualitySearchPolicy, ThroughputGuardInput,
@@ -51,6 +64,7 @@ const SQM_RUNTIME_HEALTH_CHECK_FAST_S: u64 = 3;
 const SQM_RUNTIME_HEALTH_CHECK_HEALTHY_S: u64 = 15;
 const STATUS_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 const CAKE_GROWTH_UPDATE_MIN_INTERVAL: Duration = Duration::from_millis(100);
+#[cfg(feature = "transport-probes")]
 const TRANSPORT_BASELINE_LEARNING_INTERVAL_S: f64 = 1.0;
 #[cfg(feature = "calibration")]
 const AUTOTUNE_TRANSPORT_MIN_LOADED_COVERAGE_PERCENT: u128 = 70;
@@ -58,11 +72,14 @@ const AUTOTUNE_TRANSPORT_MIN_LOADED_COVERAGE_PERCENT: u128 = 70;
 const AUTOTUNE_CAPTURE_REATTEST_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(feature = "calibration")]
 const AUTOTUNE_CAPTURE_ATTESTATION_MAX_AGE: Duration = Duration::from_secs(3);
+#[cfg(feature = "calibration")]
 const SQM_RUNTIME_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(feature = "calibration")]
 const SQM_RUNTIME_STOP_OUTPUT_LIMIT: usize = 8 * 1024;
 
 extern "C" fn handle_signal(_: i32) {
     TERMINATE.store(true, Ordering::SeqCst);
+    #[cfg(feature = "calibration")]
     operations::event_loop::wake_from_signal();
 }
 
@@ -75,6 +92,7 @@ fn install_signal_handlers() {
 
 extern "C" {
     fn signal(signum: i32, handler: extern "C" fn(i32)) -> extern "C" fn(i32);
+    #[cfg(test)]
     fn kill(pid: i32, signal: i32) -> i32;
 }
 
@@ -91,6 +109,7 @@ struct Config {
     ul_if: String,
     route_mode: String,
     mwan3_member: String,
+    #[cfg(feature = "calibration")]
     speedtest_backend: String,
     route_check_interval_s: f64,
     rx_bytes_path: String,
@@ -112,43 +131,81 @@ struct Config {
     adaptive_ceiling_probe_duration_s: f64,
     adaptive_ceiling_cooldown_s: f64,
     adaptive_ceiling_failed_bound_ttl_s: f64,
+    #[cfg(feature = "transport-probes")]
     transport_latency_enabled: bool,
+    #[cfg(feature = "transport-probes")]
     transport_controller_enabled: bool,
+    #[cfg(feature = "transport-probes")]
     transport_probe_backend: String,
+    #[cfg(feature = "transport-probes")]
     transport_probe_endpoint: String,
+    #[cfg(feature = "transport-probes")]
     transport_probe_urls: Vec<String>,
+    #[cfg(feature = "transport-probes")]
     transport_probe_idle_interval_s: f64,
+    #[cfg(feature = "transport-probes")]
     transport_probe_loaded_interval_s: f64,
+    #[cfg(feature = "transport-probes")]
     transport_probe_timeout_s: u64,
+    #[cfg(feature = "transport-probes")]
     transport_load_hold_s: f64,
+    #[cfg(feature = "transport-probes")]
     transport_cpu_max_percent: f64,
+    #[cfg(feature = "transport-probes")]
     rating_load_window_s: f64,
+    #[cfg(feature = "transport-probes")]
     rating_load_enter_ratio: f64,
+    #[cfg(feature = "transport-probes")]
     rating_load_exit_ratio: f64,
+    #[cfg(feature = "transport-probes")]
     rating_load_hold_s: f64,
+    #[cfg(feature = "transport-probes")]
     rating_load_dropout_s: f64,
+    #[cfg(feature = "transport-probes")]
     rating_load_min_kbps: f64,
+    #[cfg(feature = "transport-probes")]
     rating_load_dominance_ratio: f64,
+    #[cfg(feature = "transport-probes")]
     rating_capture_min_enter_ratio: f64,
+    #[cfg(feature = "transport-probes")]
     rating_capture_peak_factor: f64,
+    #[cfg(feature = "transport-probes")]
     rating_capture_contamination_ratio: f64,
+    #[cfg(feature = "transport-probes")]
     rating_capture_ack_ratio: f64,
+    #[cfg(feature = "transport-probes")]
     rating_capture_quiet_s: usize,
+    #[cfg(feature = "transport-probes")]
     rating_capture_quiet_timeout_s: usize,
+    #[cfg(feature = "transport-probes")]
     rating_capture_quiet_ratio: f64,
+    #[cfg(feature = "transport-probes")]
     rating_capture_quiet_min_kbps: f64,
+    #[cfg(feature = "transport-probes")]
     rating_episode_gap_s: f64,
+    #[cfg(feature = "transport-probes")]
     quality_target_delay_ms: f64,
+    #[cfg(feature = "transport-probes")]
     quality_search_max_steps: usize,
+    #[cfg(feature = "transport-probes")]
     quality_search_observe_s: f64,
+    #[cfg(feature = "transport-probes")]
     quality_search_cooldown_s: f64,
+    #[cfg(feature = "transport-probes")]
     throughput_guard_enabled: bool,
+    #[cfg(feature = "transport-probes")]
     throughput_guard_retention_percent: f64,
+    #[cfg(feature = "transport-probes")]
     throughput_guard_dl_floor_kbps: f64,
+    #[cfg(feature = "transport-probes")]
     throughput_guard_ul_floor_kbps: f64,
+    #[cfg(feature = "transport-probes")]
     throughput_reference_dl_p20_kbps: f64,
+    #[cfg(feature = "transport-probes")]
     throughput_reference_dl_p50_kbps: f64,
+    #[cfg(feature = "transport-probes")]
     throughput_reference_ul_p20_kbps: f64,
+    #[cfg(feature = "transport-probes")]
     throughput_reference_ul_p50_kbps: f64,
     min_ul_shaper_rate_kbps: f64,
     base_ul_shaper_rate_kbps: f64,
@@ -164,7 +221,9 @@ struct Config {
     ping_extra_args: String,
     ping_prefix_string: String,
     reflectors: Vec<String>,
+    #[cfg(feature = "calibration")]
     irtt_servers: Vec<String>,
+    #[cfg(feature = "calibration")]
     irtt_session_duration_m: f64,
     reflectors_url: String,
     reflectors_url_skip_lines: usize,
@@ -243,18 +302,19 @@ impl Config {
             ul_if: "wan".to_string(),
             route_mode: "auto".to_string(),
             mwan3_member: String::new(),
+            #[cfg(feature = "calibration")]
             speedtest_backend: "auto".to_string(),
             route_check_interval_s: 2.0,
             rx_bytes_path: String::new(),
             tx_bytes_path: String::new(),
             adjust_dl_shaper_rate: true,
             adjust_ul_shaper_rate: true,
-            min_dl_shaper_rate_kbps: 5000.0,
-            base_dl_shaper_rate_kbps: 20000.0,
-            max_dl_shaper_rate_kbps: 80000.0,
+            min_dl_shaper_rate_kbps: rate_limits::DEFAULT_MIN_DL_SHAPER_RATE_KBPS as f64,
+            base_dl_shaper_rate_kbps: rate_limits::DEFAULT_BASE_DL_SHAPER_RATE_KBPS as f64,
+            max_dl_shaper_rate_kbps: rate_limits::DEFAULT_MAX_DL_SHAPER_RATE_KBPS as f64,
             adaptive_ceiling_enabled: false,
-            adaptive_ceiling_dl_cap_kbps: 80000.0,
-            adaptive_ceiling_ul_cap_kbps: 35000.0,
+            adaptive_ceiling_dl_cap_kbps: rate_limits::DEFAULT_MAX_DL_SHAPER_RATE_KBPS as f64,
+            adaptive_ceiling_ul_cap_kbps: rate_limits::DEFAULT_MAX_UL_SHAPER_RATE_KBPS as f64,
             adaptive_ceiling_dl_safe_kbps: 0.0,
             adaptive_ceiling_ul_safe_kbps: 0.0,
             adaptive_ceiling_dl_evidence: "legacy_unverified".to_string(),
@@ -264,51 +324,89 @@ impl Config {
             adaptive_ceiling_probe_duration_s: 8.0,
             adaptive_ceiling_cooldown_s: 30.0,
             adaptive_ceiling_failed_bound_ttl_s: 900.0,
+            #[cfg(feature = "transport-probes")]
             transport_latency_enabled: false,
+            #[cfg(feature = "transport-probes")]
             transport_controller_enabled: false,
+            #[cfg(feature = "transport-probes")]
             transport_probe_backend: "websocket".to_string(),
+            #[cfg(feature = "transport-probes")]
             transport_probe_endpoint: "wss://ping-bufferbloat.libreqos.com/ws".to_string(),
+            #[cfg(feature = "transport-probes")]
             transport_probe_urls: vec![
                 "https://speed.cloudflare.com/__down?bytes=0".to_string(),
                 "https://www.google.com/generate_204".to_string(),
                 "https://connectivitycheck.gstatic.com/generate_204".to_string(),
             ],
+            #[cfg(feature = "transport-probes")]
             transport_probe_idle_interval_s: 15.0,
+            #[cfg(feature = "transport-probes")]
             transport_probe_loaded_interval_s: 1.0,
+            #[cfg(feature = "transport-probes")]
             transport_probe_timeout_s: 5,
+            #[cfg(feature = "transport-probes")]
             transport_load_hold_s: 3.0,
+            #[cfg(feature = "transport-probes")]
             transport_cpu_max_percent: 85.0,
+            #[cfg(feature = "transport-probes")]
             rating_load_window_s: 2.0,
+            #[cfg(feature = "transport-probes")]
             rating_load_enter_ratio: 0.60,
+            #[cfg(feature = "transport-probes")]
             rating_load_exit_ratio: 0.40,
+            #[cfg(feature = "transport-probes")]
             rating_load_hold_s: 1.0,
+            #[cfg(feature = "transport-probes")]
             rating_load_dropout_s: 1.5,
+            #[cfg(feature = "transport-probes")]
             rating_load_min_kbps: 2000.0,
+            #[cfg(feature = "transport-probes")]
             rating_load_dominance_ratio: 1.5,
+            #[cfg(feature = "transport-probes")]
             rating_capture_min_enter_ratio: 0.15,
+            #[cfg(feature = "transport-probes")]
             rating_capture_peak_factor: 0.35,
+            #[cfg(feature = "transport-probes")]
             rating_capture_contamination_ratio: 0.10,
+            #[cfg(feature = "transport-probes")]
             rating_capture_ack_ratio: 0.08,
+            #[cfg(feature = "transport-probes")]
             rating_capture_quiet_s: 5,
+            #[cfg(feature = "transport-probes")]
             rating_capture_quiet_timeout_s: 30,
+            #[cfg(feature = "transport-probes")]
             rating_capture_quiet_ratio: 0.05,
+            #[cfg(feature = "transport-probes")]
             rating_capture_quiet_min_kbps: 1000.0,
+            #[cfg(feature = "transport-probes")]
             rating_episode_gap_s: 30.0,
+            #[cfg(feature = "transport-probes")]
             quality_target_delay_ms: 30.0,
+            #[cfg(feature = "transport-probes")]
             quality_search_max_steps: 3,
+            #[cfg(feature = "transport-probes")]
             quality_search_observe_s: 6.0,
+            #[cfg(feature = "transport-probes")]
             quality_search_cooldown_s: 900.0,
+            #[cfg(feature = "transport-probes")]
             throughput_guard_enabled: true,
+            #[cfg(feature = "transport-probes")]
             throughput_guard_retention_percent: 80.0,
+            #[cfg(feature = "transport-probes")]
             throughput_guard_dl_floor_kbps: 0.0,
+            #[cfg(feature = "transport-probes")]
             throughput_guard_ul_floor_kbps: 0.0,
+            #[cfg(feature = "transport-probes")]
             throughput_reference_dl_p20_kbps: 0.0,
+            #[cfg(feature = "transport-probes")]
             throughput_reference_dl_p50_kbps: 0.0,
+            #[cfg(feature = "transport-probes")]
             throughput_reference_ul_p20_kbps: 0.0,
+            #[cfg(feature = "transport-probes")]
             throughput_reference_ul_p50_kbps: 0.0,
-            min_ul_shaper_rate_kbps: 5000.0,
-            base_ul_shaper_rate_kbps: 20000.0,
-            max_ul_shaper_rate_kbps: 35000.0,
+            min_ul_shaper_rate_kbps: rate_limits::DEFAULT_MIN_UL_SHAPER_RATE_KBPS as f64,
+            base_ul_shaper_rate_kbps: rate_limits::DEFAULT_BASE_UL_SHAPER_RATE_KBPS as f64,
+            max_ul_shaper_rate_kbps: rate_limits::DEFAULT_MAX_UL_SHAPER_RATE_KBPS as f64,
             connection_active_thr_kbps: 2000.0,
             enable_sleep_function: true,
             sustained_idle_sleep_thr_s: 60.0,
@@ -320,7 +418,9 @@ impl Config {
             ping_extra_args: String::new(),
             ping_prefix_string: String::new(),
             reflectors: default_reflectors(),
+            #[cfg(feature = "calibration")]
             irtt_servers: Vec::new(),
+            #[cfg(feature = "calibration")]
             irtt_session_duration_m: 10.0,
             reflectors_url: String::new(),
             reflectors_url_skip_lines: 1,
@@ -434,6 +534,7 @@ impl Config {
         set_string(&single, "ul_if", &mut cfg.ul_if);
         set_string(&single, "route_mode", &mut cfg.route_mode);
         set_string(&single, "mwan3_member", &mut cfg.mwan3_member);
+        #[cfg(feature = "calibration")]
         set_string(&single, "speedtest_backend", &mut cfg.speedtest_backend);
         set_f64(
             &single,
@@ -572,187 +673,190 @@ impl Config {
             "adaptive_ceiling_failed_bound_ttl_s",
             &mut cfg.adaptive_ceiling_failed_bound_ttl_s,
         )?;
-        set_bool(
-            &single,
-            "transport_latency_enabled",
-            &mut cfg.transport_latency_enabled,
-        )?;
-        set_bool(
-            &single,
-            "transport_controller_enabled",
-            &mut cfg.transport_controller_enabled,
-        )?;
-        set_string(
-            &single,
-            "transport_probe_backend",
-            &mut cfg.transport_probe_backend,
-        );
-        set_string(
-            &single,
-            "transport_probe_endpoint",
-            &mut cfg.transport_probe_endpoint,
-        );
-        set_f64(
-            &single,
-            "transport_probe_idle_interval_s",
-            &mut cfg.transport_probe_idle_interval_s,
-        )?;
-        set_f64(
-            &single,
-            "transport_probe_loaded_interval_s",
-            &mut cfg.transport_probe_loaded_interval_s,
-        )?;
-        set_u64(
-            &single,
-            "transport_probe_timeout_s",
-            &mut cfg.transport_probe_timeout_s,
-        )?;
-        set_f64(
-            &single,
-            "transport_load_hold_s",
-            &mut cfg.transport_load_hold_s,
-        )?;
-        set_f64(
-            &single,
-            "transport_cpu_max_percent",
-            &mut cfg.transport_cpu_max_percent,
-        )?;
-        set_f64(
-            &single,
-            "rating_load_window_s",
-            &mut cfg.rating_load_window_s,
-        )?;
-        set_f64(
-            &single,
-            "rating_load_enter_ratio",
-            &mut cfg.rating_load_enter_ratio,
-        )?;
-        set_f64(
-            &single,
-            "rating_load_exit_ratio",
-            &mut cfg.rating_load_exit_ratio,
-        )?;
-        set_f64(&single, "rating_load_hold_s", &mut cfg.rating_load_hold_s)?;
-        set_f64(
-            &single,
-            "rating_load_dropout_s",
-            &mut cfg.rating_load_dropout_s,
-        )?;
-        set_f64(
-            &single,
-            "rating_load_min_kbps",
-            &mut cfg.rating_load_min_kbps,
-        )?;
-        set_f64(
-            &single,
-            "rating_load_dominance_ratio",
-            &mut cfg.rating_load_dominance_ratio,
-        )?;
-        set_f64(
-            &single,
-            "rating_capture_min_enter_ratio",
-            &mut cfg.rating_capture_min_enter_ratio,
-        )?;
-        set_f64(
-            &single,
-            "rating_capture_peak_factor",
-            &mut cfg.rating_capture_peak_factor,
-        )?;
-        set_f64(
-            &single,
-            "rating_capture_contamination_ratio",
-            &mut cfg.rating_capture_contamination_ratio,
-        )?;
-        set_f64(
-            &single,
-            "rating_capture_ack_ratio",
-            &mut cfg.rating_capture_ack_ratio,
-        )?;
-        set_usize(
-            &single,
-            "rating_capture_quiet_s",
-            &mut cfg.rating_capture_quiet_s,
-        )?;
-        set_usize(
-            &single,
-            "rating_capture_quiet_timeout_s",
-            &mut cfg.rating_capture_quiet_timeout_s,
-        )?;
-        set_f64(
-            &single,
-            "rating_capture_quiet_ratio",
-            &mut cfg.rating_capture_quiet_ratio,
-        )?;
-        set_f64(
-            &single,
-            "rating_capture_quiet_min_kbps",
-            &mut cfg.rating_capture_quiet_min_kbps,
-        )?;
-        set_f64(
-            &single,
-            "rating_episode_gap_s",
-            &mut cfg.rating_episode_gap_s,
-        )?;
-        set_f64(
-            &single,
-            "quality_target_delay_ms",
-            &mut cfg.quality_target_delay_ms,
-        )?;
-        set_usize(
-            &single,
-            "quality_search_max_steps",
-            &mut cfg.quality_search_max_steps,
-        )?;
-        set_f64(
-            &single,
-            "quality_search_observe_s",
-            &mut cfg.quality_search_observe_s,
-        )?;
-        set_f64(
-            &single,
-            "quality_search_cooldown_s",
-            &mut cfg.quality_search_cooldown_s,
-        )?;
-        set_bool(
-            &single,
-            "throughput_guard_enabled",
-            &mut cfg.throughput_guard_enabled,
-        )?;
-        set_f64(
-            &single,
-            "throughput_guard_retention_percent",
-            &mut cfg.throughput_guard_retention_percent,
-        )?;
-        set_f64(
-            &single,
-            "throughput_guard_dl_floor_kbps",
-            &mut cfg.throughput_guard_dl_floor_kbps,
-        )?;
-        set_f64(
-            &single,
-            "throughput_guard_ul_floor_kbps",
-            &mut cfg.throughput_guard_ul_floor_kbps,
-        )?;
-        set_f64(
-            &single,
-            "throughput_reference_dl_p20_kbps",
-            &mut cfg.throughput_reference_dl_p20_kbps,
-        )?;
-        set_f64(
-            &single,
-            "throughput_reference_dl_p50_kbps",
-            &mut cfg.throughput_reference_dl_p50_kbps,
-        )?;
-        set_f64(
-            &single,
-            "throughput_reference_ul_p20_kbps",
-            &mut cfg.throughput_reference_ul_p20_kbps,
-        )?;
-        set_f64(
-            &single,
-            "throughput_reference_ul_p50_kbps",
-            &mut cfg.throughput_reference_ul_p50_kbps,
-        )?;
+        #[cfg(feature = "transport-probes")]
+        {
+            set_bool(
+                &single,
+                "transport_latency_enabled",
+                &mut cfg.transport_latency_enabled,
+            )?;
+            set_bool(
+                &single,
+                "transport_controller_enabled",
+                &mut cfg.transport_controller_enabled,
+            )?;
+            set_string(
+                &single,
+                "transport_probe_backend",
+                &mut cfg.transport_probe_backend,
+            );
+            set_string(
+                &single,
+                "transport_probe_endpoint",
+                &mut cfg.transport_probe_endpoint,
+            );
+            set_f64(
+                &single,
+                "transport_probe_idle_interval_s",
+                &mut cfg.transport_probe_idle_interval_s,
+            )?;
+            set_f64(
+                &single,
+                "transport_probe_loaded_interval_s",
+                &mut cfg.transport_probe_loaded_interval_s,
+            )?;
+            set_u64(
+                &single,
+                "transport_probe_timeout_s",
+                &mut cfg.transport_probe_timeout_s,
+            )?;
+            set_f64(
+                &single,
+                "transport_load_hold_s",
+                &mut cfg.transport_load_hold_s,
+            )?;
+            set_f64(
+                &single,
+                "transport_cpu_max_percent",
+                &mut cfg.transport_cpu_max_percent,
+            )?;
+            set_f64(
+                &single,
+                "rating_load_window_s",
+                &mut cfg.rating_load_window_s,
+            )?;
+            set_f64(
+                &single,
+                "rating_load_enter_ratio",
+                &mut cfg.rating_load_enter_ratio,
+            )?;
+            set_f64(
+                &single,
+                "rating_load_exit_ratio",
+                &mut cfg.rating_load_exit_ratio,
+            )?;
+            set_f64(&single, "rating_load_hold_s", &mut cfg.rating_load_hold_s)?;
+            set_f64(
+                &single,
+                "rating_load_dropout_s",
+                &mut cfg.rating_load_dropout_s,
+            )?;
+            set_f64(
+                &single,
+                "rating_load_min_kbps",
+                &mut cfg.rating_load_min_kbps,
+            )?;
+            set_f64(
+                &single,
+                "rating_load_dominance_ratio",
+                &mut cfg.rating_load_dominance_ratio,
+            )?;
+            set_f64(
+                &single,
+                "rating_capture_min_enter_ratio",
+                &mut cfg.rating_capture_min_enter_ratio,
+            )?;
+            set_f64(
+                &single,
+                "rating_capture_peak_factor",
+                &mut cfg.rating_capture_peak_factor,
+            )?;
+            set_f64(
+                &single,
+                "rating_capture_contamination_ratio",
+                &mut cfg.rating_capture_contamination_ratio,
+            )?;
+            set_f64(
+                &single,
+                "rating_capture_ack_ratio",
+                &mut cfg.rating_capture_ack_ratio,
+            )?;
+            set_usize(
+                &single,
+                "rating_capture_quiet_s",
+                &mut cfg.rating_capture_quiet_s,
+            )?;
+            set_usize(
+                &single,
+                "rating_capture_quiet_timeout_s",
+                &mut cfg.rating_capture_quiet_timeout_s,
+            )?;
+            set_f64(
+                &single,
+                "rating_capture_quiet_ratio",
+                &mut cfg.rating_capture_quiet_ratio,
+            )?;
+            set_f64(
+                &single,
+                "rating_capture_quiet_min_kbps",
+                &mut cfg.rating_capture_quiet_min_kbps,
+            )?;
+            set_f64(
+                &single,
+                "rating_episode_gap_s",
+                &mut cfg.rating_episode_gap_s,
+            )?;
+            set_f64(
+                &single,
+                "quality_target_delay_ms",
+                &mut cfg.quality_target_delay_ms,
+            )?;
+            set_usize(
+                &single,
+                "quality_search_max_steps",
+                &mut cfg.quality_search_max_steps,
+            )?;
+            set_f64(
+                &single,
+                "quality_search_observe_s",
+                &mut cfg.quality_search_observe_s,
+            )?;
+            set_f64(
+                &single,
+                "quality_search_cooldown_s",
+                &mut cfg.quality_search_cooldown_s,
+            )?;
+            set_bool(
+                &single,
+                "throughput_guard_enabled",
+                &mut cfg.throughput_guard_enabled,
+            )?;
+            set_f64(
+                &single,
+                "throughput_guard_retention_percent",
+                &mut cfg.throughput_guard_retention_percent,
+            )?;
+            set_f64(
+                &single,
+                "throughput_guard_dl_floor_kbps",
+                &mut cfg.throughput_guard_dl_floor_kbps,
+            )?;
+            set_f64(
+                &single,
+                "throughput_guard_ul_floor_kbps",
+                &mut cfg.throughput_guard_ul_floor_kbps,
+            )?;
+            set_f64(
+                &single,
+                "throughput_reference_dl_p20_kbps",
+                &mut cfg.throughput_reference_dl_p20_kbps,
+            )?;
+            set_f64(
+                &single,
+                "throughput_reference_dl_p50_kbps",
+                &mut cfg.throughput_reference_dl_p50_kbps,
+            )?;
+            set_f64(
+                &single,
+                "throughput_reference_ul_p20_kbps",
+                &mut cfg.throughput_reference_ul_p20_kbps,
+            )?;
+            set_f64(
+                &single,
+                "throughput_reference_ul_p50_kbps",
+                &mut cfg.throughput_reference_ul_p50_kbps,
+            )?;
+        }
         if !adaptive_dl_cap_configured {
             cfg.adaptive_ceiling_dl_cap_kbps = cfg.max_dl_shaper_rate_kbps;
         }
@@ -793,6 +897,7 @@ impl Config {
         set_string(&single, "pinger_method", &mut cfg.pinger_method);
         set_string(&single, "ping_extra_args", &mut cfg.ping_extra_args);
         set_string(&single, "ping_prefix_string", &mut cfg.ping_prefix_string);
+        #[cfg(feature = "calibration")]
         set_f64(
             &single,
             "irtt_session_duration_m",
@@ -1048,38 +1153,46 @@ impl Config {
                 .map(str::to_string)
                 .collect();
         }
-        if let Some(values) = lists.get("transport_probe_url") {
-            cfg.transport_probe_urls = values
-                .iter()
-                .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
-                .cloned()
-                .collect();
-        } else if let Some(value) = single.get("transport_probe_urls") {
-            cfg.transport_probe_urls = value
-                .split_whitespace()
-                .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
-                .map(str::to_string)
-                .collect();
-        }
-        if let Some(values) = lists.get("irtt_server") {
-            cfg.irtt_servers = values.iter().filter(|v| !v.is_empty()).cloned().collect();
-        } else if let Some(value) = single
-            .get("irtt_servers")
-            .or_else(|| single.get("irtt_server"))
+        #[cfg(feature = "transport-probes")]
         {
-            cfg.irtt_servers = value
-                .split(|c: char| c == ',' || c.is_whitespace())
-                .filter(|v| !v.is_empty())
-                .map(str::to_string)
-                .collect();
+            if let Some(values) = lists.get("transport_probe_url") {
+                cfg.transport_probe_urls = values
+                    .iter()
+                    .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
+                    .cloned()
+                    .collect();
+            } else if let Some(value) = single.get("transport_probe_urls") {
+                cfg.transport_probe_urls = value
+                    .split_whitespace()
+                    .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+                    .map(str::to_string)
+                    .collect();
+            }
         }
-        deduplicate_list(&mut cfg.irtt_servers);
+        #[cfg(feature = "calibration")]
+        {
+            if let Some(values) = lists.get("irtt_server") {
+                cfg.irtt_servers = values.iter().filter(|v| !v.is_empty()).cloned().collect();
+            } else if let Some(value) = single
+                .get("irtt_servers")
+                .or_else(|| single.get("irtt_server"))
+            {
+                cfg.irtt_servers = value
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+                    .collect();
+            }
+            deduplicate_list(&mut cfg.irtt_servers);
+        }
         cfg.load_reflectors_url();
         cfg.deduplicate_reflectors();
         if cfg.randomize_reflectors {
             randomize_reflectors(&mut cfg.reflectors);
+            #[cfg(feature = "calibration")]
             randomize_reflectors(&mut cfg.irtt_servers);
         }
+        #[cfg(feature = "calibration")]
         if cfg.pinger_method == "irtt" {
             cfg.reflectors = cfg.irtt_servers.clone();
         }
@@ -1177,6 +1290,7 @@ impl Config {
         if !(1.0..=60.0).contains(&self.route_check_interval_s) {
             return Err("route_check_interval_s must be between 1 and 60".to_string());
         }
+        #[cfg(feature = "calibration")]
         if self.pinger_method != "fping"
             && self.pinger_method != "fping-ts"
             && self.pinger_method != "tsping"
@@ -1188,12 +1302,25 @@ impl Config {
                 self.pinger_method
             ));
         }
+        #[cfg(not(feature = "calibration"))]
+        if self.pinger_method != "fping"
+            && self.pinger_method != "fping-ts"
+            && self.pinger_method != "tsping"
+            && self.pinger_method != "ping"
+        {
+            return Err(format!(
+                "pinger_method={} is configured, but Lite supports fping, fping-ts, tsping, and ping",
+                self.pinger_method
+            ));
+        }
+        #[cfg(feature = "calibration")]
         if self.pinger_method == "irtt" && self.irtt_servers.is_empty() {
             return Err("pinger_method=irtt requires at least one irtt_server".to_string());
         }
         if self.reflectors.is_empty() {
             return Err("at least one reflector is required".to_string());
         }
+        #[cfg(feature = "calibration")]
         if self.pinger_method == "irtt" {
             if self
                 .reflectors
@@ -1326,11 +1453,13 @@ impl Config {
                 );
             }
         }
+        #[cfg(feature = "transport-probes")]
         if self.transport_controller_enabled && !self.transport_latency_enabled {
             return Err(
                 "transport_controller_enabled requires transport_latency_enabled".to_string(),
             );
         }
+        #[cfg(feature = "transport-probes")]
         if self.transport_latency_enabled {
             let backend = TransportProbeBackend::parse(&self.transport_probe_backend)
                 .ok_or_else(|| "transport_probe_backend is unsupported".to_string())?;
@@ -1500,39 +1629,42 @@ impl Config {
                 return Err("quality_search_cooldown_s must be between 30 and 86400".to_string());
             }
         }
-        if !(50.0..=100.0).contains(&self.throughput_guard_retention_percent) {
-            return Err(
-                "throughput_guard_retention_percent must be between 50 and 100".to_string(),
-            );
-        }
-        for (name, value) in [
-            (
-                "throughput_guard_dl_floor_kbps",
-                self.throughput_guard_dl_floor_kbps,
-            ),
-            (
-                "throughput_guard_ul_floor_kbps",
-                self.throughput_guard_ul_floor_kbps,
-            ),
-            (
-                "throughput_reference_dl_p20_kbps",
-                self.throughput_reference_dl_p20_kbps,
-            ),
-            (
-                "throughput_reference_dl_p50_kbps",
-                self.throughput_reference_dl_p50_kbps,
-            ),
-            (
-                "throughput_reference_ul_p20_kbps",
-                self.throughput_reference_ul_p20_kbps,
-            ),
-            (
-                "throughput_reference_ul_p50_kbps",
-                self.throughput_reference_ul_p50_kbps,
-            ),
-        ] {
-            if !value.is_finite() || value < 0.0 {
-                return Err(format!("{name} must not be negative"));
+        #[cfg(feature = "transport-probes")]
+        {
+            if !(50.0..=100.0).contains(&self.throughput_guard_retention_percent) {
+                return Err(
+                    "throughput_guard_retention_percent must be between 50 and 100".to_string(),
+                );
+            }
+            for (name, value) in [
+                (
+                    "throughput_guard_dl_floor_kbps",
+                    self.throughput_guard_dl_floor_kbps,
+                ),
+                (
+                    "throughput_guard_ul_floor_kbps",
+                    self.throughput_guard_ul_floor_kbps,
+                ),
+                (
+                    "throughput_reference_dl_p20_kbps",
+                    self.throughput_reference_dl_p20_kbps,
+                ),
+                (
+                    "throughput_reference_dl_p50_kbps",
+                    self.throughput_reference_dl_p50_kbps,
+                ),
+                (
+                    "throughput_reference_ul_p20_kbps",
+                    self.throughput_reference_ul_p20_kbps,
+                ),
+                (
+                    "throughput_reference_ul_p50_kbps",
+                    self.throughput_reference_ul_p50_kbps,
+                ),
+            ] {
+                if !value.is_finite() || value < 0.0 {
+                    return Err(format!("{name} must not be negative"));
+                }
             }
         }
         if self.sustained_idle_sleep_thr_s < 0.0 {
@@ -1547,6 +1679,7 @@ impl Config {
         if self.global_ping_response_timeout_s <= 0.0 {
             return Err("global_ping_response_timeout_s must be greater than zero".to_string());
         }
+        #[cfg(feature = "calibration")]
         if self.pinger_method == "irtt" && self.irtt_session_duration_m <= 0.0 {
             return Err("irtt_session_duration_m must be greater than zero".to_string());
         }
@@ -1618,6 +1751,7 @@ impl Config {
         RouteSpec::new(&self.route_mode, &self.mwan3_member, &self.ul_if)
     }
 
+    #[cfg(feature = "transport-probes")]
     fn rating_load_config(&self) -> RatingLoadConfig {
         RatingLoadConfig {
             window: Duration::from_secs_f64(self.rating_load_window_s),
@@ -2068,6 +2202,7 @@ struct RateMonitor {
 struct RateSample {
     dl_kbps: f64,
     ul_kbps: f64,
+    #[cfg(feature = "transport-probes")]
     fresh: bool,
     #[cfg(feature = "calibration")]
     dl_observed_at: Instant,
@@ -2252,6 +2387,7 @@ impl RateMonitor {
             return Ok(RateSample {
                 dl_kbps: self.last_dl_kbps,
                 ul_kbps: self.last_ul_kbps,
+                #[cfg(feature = "transport-probes")]
                 fresh: false,
                 #[cfg(feature = "calibration")]
                 dl_observed_at: self.last,
@@ -2272,6 +2408,7 @@ impl RateMonitor {
         Ok(RateSample {
             dl_kbps: dl,
             ul_kbps: ul,
+            #[cfg(feature = "transport-probes")]
             fresh: true,
             #[cfg(feature = "calibration")]
             dl_observed_at: now,
@@ -2284,6 +2421,7 @@ impl RateMonitor {
         self.try_sample().unwrap_or(RateSample {
             dl_kbps: self.last_dl_kbps,
             ul_kbps: self.last_ul_kbps,
+            #[cfg(feature = "transport-probes")]
             fresh: false,
             #[cfg(feature = "calibration")]
             dl_observed_at: self.last,
@@ -2363,12 +2501,12 @@ fn root_cake_qdisc_count(output: &str) -> usize {
         .count()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "calibration"))]
 fn qdisc_output_has_cake(output: &str) -> bool {
     root_cake_qdisc_count(output) == 1
 }
 
-fn ingress_redirect_targets(output: &str) -> Vec<String> {
+pub(crate) fn ingress_redirect_targets(output: &str) -> Vec<String> {
     fn clean(value: &str) -> &str {
         value.trim_matches(|character: char| matches!(character, '(' | ')' | '[' | ']' | ',' | ';'))
     }
@@ -2399,7 +2537,7 @@ fn ingress_redirect_targets(output: &str) -> Vec<String> {
     targets
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "calibration"))]
 fn ingress_output_targets_ifb(output: &str, ifb: &str) -> bool {
     !ifb.is_empty()
         && ingress_redirect_targets(output)
@@ -2439,6 +2577,7 @@ impl CakeQdiscKind {
     }
 }
 
+#[cfg(feature = "calibration")]
 impl From<CakeQdiscKind> for operations::autotune_runtime::RuntimeQdiscKind {
     fn from(value: CakeQdiscKind) -> Self {
         match value {
@@ -2473,7 +2612,7 @@ fn change_cake_rate(
     rate_kbps: u64,
     qdisc_kind: CakeQdiscKind,
 ) -> Result<(), String> {
-    if interface.is_empty() || rate_kbps < 100 || rate_kbps > autotune::MAX_RATE_KBPS {
+    if interface.is_empty() || rate_kbps < 100 || rate_kbps > rate_limits::MAX_RATE_KBPS {
         return Err("requested CAKE rate is outside the supported range".to_string());
     }
     let tc = env::var("CAKE_AUTORATE_TC").unwrap_or_else(|_| "tc".to_string());
@@ -2502,6 +2641,7 @@ fn change_cake_rate(
     })
 }
 
+#[cfg(feature = "calibration")]
 fn delete_qdisc(interface: &str, location: &str) -> Result<(), String> {
     if interface.is_empty() || !matches!(location, "root" | "ingress") {
         return Err("requested qdisc deletion is invalid".to_string());
@@ -2525,7 +2665,7 @@ fn delete_qdisc(interface: &str, location: &str) -> Result<(), String> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "calibration"))]
 fn root_cake_bandwidth_kbps(output: &str) -> Result<u64, String> {
     root_cake_qdisc(output).map(|(_, rate)| rate)
 }
@@ -2555,7 +2695,7 @@ fn root_cake_qdisc(output: &str) -> Result<(CakeQdiscKind, u64), String> {
     }
 }
 
-fn parse_tc_bandwidth_kbps(value: &str) -> Result<u64, String> {
+pub(crate) fn parse_tc_bandwidth_kbps(value: &str) -> Result<u64, String> {
     let (number, multiplier, divisor) = if let Some(number) = value.strip_suffix("Kbit") {
         (number, 1u64, 1u64)
     } else if let Some(number) = value.strip_suffix("Mbit") {
@@ -2598,7 +2738,7 @@ fn parse_tc_bandwidth_kbps(value: &str) -> Result<u64, String> {
         .checked_add(denominator / 2)
         .ok_or_else(|| "CAKE bandwidth rounding overflows".to_string())?
         / denominator;
-    if !(100..=autotune::MAX_RATE_KBPS).contains(&rounded) {
+    if !(100..=rate_limits::MAX_RATE_KBPS).contains(&rounded) {
         return Err("CAKE bandwidth is outside the supported range".to_string());
     }
     Ok(rounded)
@@ -2730,6 +2870,7 @@ fn attest_download_redirect(
     Ok(())
 }
 
+#[cfg(feature = "calibration")]
 fn attest_exclusive_sqm_ingress(
     output: &str,
     source_interface: &str,
@@ -2994,6 +3135,7 @@ impl SqmRecoveryError {
     }
 }
 
+#[cfg(test)]
 fn terminate_helper_process_group(child: &mut Child) {
     let process_group = -(child.id() as i32);
     unsafe {
@@ -3013,6 +3155,7 @@ fn terminate_helper_process_group(child: &mut Child) {
     let _ = child.wait();
 }
 
+#[cfg(test)]
 fn run_sqm_helper(cfg: &Config, operation: Option<&str>) -> Result<(), SqmRecoveryError> {
     let helper = env::var("CAKE_AUTORATE_SQM_RECOVER")
         .unwrap_or_else(|_| "/usr/libexec/cake-autorate-rs/sqm-recover".to_string());
@@ -3071,16 +3214,109 @@ fn run_sqm_helper(cfg: &Config, operation: Option<&str>) -> Result<(), SqmRecove
 }
 
 fn attest_managed_sqm(cfg: &Config) -> Result<(), SqmRecoveryError> {
-    run_sqm_helper(cfg, Some("check"))?;
+    #[cfg(test)]
+    if env::var_os("CAKE_AUTORATE_SQM_RECOVER").is_some() {
+        // Controller generation-gate tests inject a tiny external
+        // Busy/Failed/Recovered seam. Production has no such branch; native
+        // OpenWrt attestation is exercised separately with a complete fake
+        // UCI/state/tc topology.
+        run_sqm_helper(cfg, Some("check"))?;
+        return inspect_sqm_topology(cfg)
+            .map_err(|error| SqmRecoveryError::Failed(error.to_string()));
+    }
+    let spec = managed_sqm_attestation_spec(cfg)?;
+    operations::sqm_recovery_openwrt::attest_managed_sqm(&spec).map_err(map_native_sqm_error)?;
     inspect_sqm_topology(cfg).map_err(|error| SqmRecoveryError::Failed(error.to_string()))
 }
 
+fn managed_sqm_attestation_spec(
+    cfg: &Config,
+) -> Result<operations::sqm_recovery_openwrt::ManagedSqmAttestationSpec, SqmRecoveryError> {
+    let mut policy_options = std::collections::BTreeMap::new();
+    for (key, value) in [
+        ("min_dl_shaper_rate_kbps", cfg.min_dl_shaper_rate_kbps),
+        ("max_dl_shaper_rate_kbps", cfg.max_dl_shaper_rate_kbps),
+        ("min_ul_shaper_rate_kbps", cfg.min_ul_shaper_rate_kbps),
+        ("max_ul_shaper_rate_kbps", cfg.max_ul_shaper_rate_kbps),
+        (
+            "adaptive_ceiling_dl_cap_kbps",
+            cfg.adaptive_ceiling_dl_cap_kbps,
+        ),
+        (
+            "adaptive_ceiling_ul_cap_kbps",
+            cfg.adaptive_ceiling_ul_cap_kbps,
+        ),
+    ] {
+        policy_options.insert(key.to_string(), value.to_string());
+    }
+    policy_options.insert(
+        "adaptive_ceiling_enabled".to_string(),
+        if cfg.adaptive_ceiling_enabled {
+            "1"
+        } else {
+            "0"
+        }
+        .to_string(),
+    );
+    let policy =
+        operations::sqm_recovery_openwrt::managed_sqm_rate_policy_from_options(&policy_options)
+            .map_err(map_native_sqm_error)?;
+    Ok(
+        operations::sqm_recovery_openwrt::ManagedSqmAttestationSpec {
+            instance: cfg.instance.clone(),
+            sqm_section: cfg.sqm_section.clone(),
+            target_interface: cfg.sqm_interface.clone(),
+            upload_interface: cfg.ul_if.clone(),
+            download_interface: cfg.dl_if.clone(),
+            direction_mode: cfg.sqm_direction_mode.clone(),
+            minimum_download_kbps: policy.minimum_download_kbps,
+            maximum_download_kbps: policy.maximum_download_kbps,
+            minimum_upload_kbps: policy.minimum_upload_kbps,
+            maximum_upload_kbps: policy.maximum_upload_kbps,
+        },
+    )
+}
+
+fn map_native_sqm_error(
+    error: operations::sqm_recovery_openwrt::NativeSqmAttestationError,
+) -> SqmRecoveryError {
+    match error {
+        operations::sqm_recovery_openwrt::NativeSqmAttestationError::Busy(message) => {
+            SqmRecoveryError::Busy(message)
+        }
+        operations::sqm_recovery_openwrt::NativeSqmAttestationError::Terminated => {
+            SqmRecoveryError::Terminated
+        }
+        operations::sqm_recovery_openwrt::NativeSqmAttestationError::Failed(message) => {
+            SqmRecoveryError::Failed(message)
+        }
+    }
+}
+
 fn recover_managed_sqm(cfg: &Config) -> Result<(), SqmRecoveryError> {
-    run_sqm_helper(cfg, None)?;
+    #[cfg(test)]
+    if env::var_os("CAKE_AUTORATE_SQM_RECOVER").is_some() {
+        run_sqm_helper(cfg, None)?;
+        return inspect_sqm_topology(cfg)
+            .map_err(|error| SqmRecoveryError::Failed(error.to_string()));
+    }
+    if let Err(error) = inspect_sqm_topology(cfg) {
+        if error.kind == SqmTopologyErrorKind::Unsafe {
+            return Err(SqmRecoveryError::Failed(format!(
+                "unsafe managed SQM topology cannot be replaced automatically: {error}"
+            )));
+        }
+    }
+    let spec = managed_sqm_attestation_spec(cfg)?;
+    operations::sqm_recovery_openwrt::recover_managed_sqm(&spec, || {
+        TERMINATE.load(Ordering::SeqCst)
+    })
+    .map_err(map_native_sqm_error)?;
     inspect_sqm_topology(cfg).map_err(|error| SqmRecoveryError::Failed(error.to_string()))
 }
 
 #[derive(Clone, Debug)]
+#[cfg(feature = "transport-probes")]
 struct TransportProbeRequest {
     #[cfg(feature = "calibration")]
     probe_id: u64,
@@ -3093,6 +3329,7 @@ struct TransportProbeRequest {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(feature = "transport-probes")]
 struct TransportProbeResult {
     #[cfg(feature = "calibration")]
     probe_id: u64,
@@ -3708,6 +3945,7 @@ fn loaded_coverage_sufficient(coverage: AutotuneTransportCoverage) -> bool {
                 .saturating_mul(AUTOTUNE_TRANSPORT_MIN_LOADED_COVERAGE_PERCENT)
 }
 
+#[cfg(feature = "transport-probes")]
 struct TransportProbeRuntime {
     requests: SyncSender<TransportProbeRequest>,
     results: Receiver<TransportProbeResult>,
@@ -3757,6 +3995,7 @@ fn transport_result_matches_route(
 /// exhaustion remain censored negative evidence instead of being rewritten as
 /// an untyped route-change result.  It never turns a successful sample from an
 /// offline or failed-over route into latency evidence.
+#[cfg(feature = "transport-probes")]
 fn transport_probe_route_identities(
     before: Option<&RouteSnapshot>,
     after: Option<&RouteSnapshot>,
@@ -3781,10 +4020,6 @@ fn censored_autotune_transport_observation(
     if result.failure_kind != Some(transport_probe::TransportProbeFailureKind::DeadlineExceeded) {
         return Ok(None);
     }
-    if result.error.is_none() || result.latency_ms.is_some() || result.failure_deadline_us.is_none()
-    {
-        return Err("typed transport deadline result is internally inconsistent".to_string());
-    }
     let Some(active_capture) = active_capture else {
         return Ok(None);
     };
@@ -3796,6 +4031,10 @@ fn censored_autotune_transport_observation(
         || result.backend != "websocket"
     {
         return Ok(None);
+    }
+    if result.error.is_none() || result.latency_ms.is_some() || result.failure_deadline_us.is_none()
+    {
+        return Err("typed transport deadline result is internally inconsistent".to_string());
     }
     operations::autotune_capture::transport_deadline_observation_kind(
         active_capture,
@@ -3829,6 +4068,7 @@ fn uplink_error_code(state: UplinkState, reason: &str) -> Option<&'static str> {
     }
 }
 
+#[cfg(feature = "transport-probes")]
 fn transport_error_code(error: Option<&str>) -> Option<&'static str> {
     let error = error?.to_ascii_lowercase();
     if error.contains("timeout") || error.contains("timed out") {
@@ -3840,6 +4080,7 @@ fn transport_error_code(error: Option<&str>) -> Option<&'static str> {
     }
 }
 
+#[cfg(feature = "transport-probes")]
 impl TransportProbeRuntime {
     fn spawn(cfg: &Config) -> Self {
         let (request_tx, request_rx) = mpsc::sync_channel::<TransportProbeRequest>(1);
@@ -4373,6 +4614,7 @@ fn autotune_transport_dropout(cfg: &Config) -> Duration {
         .min(hold.div_f64(2.0))
 }
 
+#[cfg(feature = "transport-probes")]
 fn transport_probe_control_allows_start(
     autotune_capture_present: bool,
     raw_loaded: bool,
@@ -4389,6 +4631,7 @@ fn transport_probe_control_allows_start(
     }
 }
 
+#[cfg(feature = "transport-probes")]
 fn transport_probe_interval_s(cfg: &Config, any_loaded: bool, baseline_ready: bool) -> f64 {
     if any_loaded {
         cfg.transport_probe_loaded_interval_s
@@ -4491,6 +4734,7 @@ fn run_external_ip_probe(
     Ok((value, after))
 }
 
+#[cfg(feature = "transport-probes")]
 fn run_transport_probe(
     route_spec: &RouteSpec,
     timeout_s: u64,
@@ -4636,13 +4880,18 @@ struct MemoryInfo {
 
 #[derive(Clone, Debug, Default)]
 struct HistoryBudgetSnapshot {
+    #[cfg(feature = "transport-probes")]
     configured_kib: Option<u64>,
+    #[cfg(feature = "transport-probes")]
     safe_max_kib: u64,
+    #[cfg(feature = "transport-probes")]
     effective_total_kib: u64,
     instance_budget_kib: u64,
     used_total_kib: u64,
     used_instance_kib: u64,
+    #[cfg(feature = "transport-probes")]
     memory: MemoryInfo,
+    #[cfg(feature = "transport-probes")]
     instances: usize,
     paused_low_memory: bool,
 }
@@ -4747,13 +4996,18 @@ fn compute_history_budget(
     };
 
     HistoryBudgetSnapshot {
+        #[cfg(feature = "transport-probes")]
         configured_kib,
+        #[cfg(feature = "transport-probes")]
         safe_max_kib,
+        #[cfg(feature = "transport-probes")]
         effective_total_kib,
         instance_budget_kib: effective_total_kib / instances as u64,
         used_total_kib,
         used_instance_kib,
+        #[cfg(feature = "transport-probes")]
         memory,
+        #[cfg(feature = "transport-probes")]
         instances,
         paused_low_memory,
     }
@@ -4915,27 +5169,49 @@ struct Controller {
     shaper_ul: f64,
     adaptive_dl: AdaptiveCeilingDirection,
     adaptive_ul: AdaptiveCeilingDirection,
+    #[cfg(feature = "transport-probes")]
     transport_latency: TransportLatencyTracker,
+    #[cfg(feature = "transport-probes")]
     transport_latency_dl: TransportLatencyTracker,
+    #[cfg(feature = "transport-probes")]
     transport_latency_ul: TransportLatencyTracker,
+    #[cfg(feature = "transport-probes")]
     quality_grade: QualityGradeTracker,
+    #[cfg(feature = "transport-probes")]
     rating_load: RatingLoadDetector,
+    #[cfg(feature = "transport-probes")]
     rating_load_snapshot: RatingLoadSnapshot,
+    #[cfg(feature = "transport-probes")]
     rating_load_observed_unix_ms: u64,
+    #[cfg(feature = "transport-probes")]
     quality_search_dl: QualitySearchDirection,
+    #[cfg(feature = "transport-probes")]
     quality_search_ul: QualitySearchDirection,
+    #[cfg(feature = "transport-probes")]
     quality_dl_class: QualityClass,
+    #[cfg(feature = "transport-probes")]
     quality_ul_class: QualityClass,
+    #[cfg(feature = "transport-probes")]
     transport_backend: String,
+    #[cfg(feature = "transport-probes")]
     transport_trusted: bool,
+    #[cfg(feature = "transport-probes")]
     transport_raw_samples: usize,
+    #[cfg(feature = "transport-probes")]
     transport_discarded_samples: usize,
+    #[cfg(feature = "transport-probes")]
     transport_server_processing_ms: f64,
+    #[cfg(feature = "transport-probes")]
     transport_connection_reused: bool,
+    #[cfg(feature = "transport-probes")]
     transport_rejected_reason: Option<String>,
+    #[cfg(feature = "transport-probes")]
     transport_last_rejected_reason: Option<String>,
+    #[cfg(feature = "transport-probes")]
     transport_last_rejected_at: Option<f64>,
+    #[cfg(feature = "transport-probes")]
     transport_bad_windows_dl: u8,
+    #[cfg(feature = "transport-probes")]
     transport_bad_windows_ul: u8,
     throughput_floor_dl: f64,
     throughput_floor_ul: f64,
@@ -4993,7 +5269,7 @@ struct Controller {
     last_rejected_rating_capture_token: Option<String>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "calibration"))]
 fn loaded_autotune_traffic_observation_after_read<E, F>(
     request: &operations::full_autotune::AutotuneCaptureRequest,
     evidence: &E,
@@ -5015,7 +5291,7 @@ where
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "calibration"))]
 fn reject_autotune_capture_after_io_with_clock<F>(
     accumulator: &mut operations::autotune_capture::AutotuneCaptureAccumulator,
     diagnostic_code: &str,
@@ -5050,6 +5326,7 @@ impl Controller {
         self.runtime_override_active || self.runtime_operation_active
     }
 
+    #[cfg(feature = "calibration")]
     fn remember_attested_cake_rates(
         &mut self,
         snapshot: &operations::autotune_runtime::RuntimeSnapshot,
@@ -5101,13 +5378,16 @@ impl Controller {
         let now = Instant::now();
         #[cfg(feature = "calibration")]
         let runtime_generation = operations::identity::ProcessIdentity::current()?.starttime_ticks;
+        #[cfg(feature = "transport-probes")]
         let rating_load = RatingLoadDetector::new(now);
+        #[cfg(feature = "transport-probes")]
         let rating_load_snapshot = rating_load.snapshot(
             now,
             cfg.rating_load_config(),
             cfg.base_dl_shaper_rate_kbps,
             cfg.base_ul_shaper_rate_kbps,
         );
+        #[cfg(feature = "transport-probes")]
         let rating_load_observed_unix_ms = (epoch_secs() * 1000.0).round() as u64;
         let adaptive_dl_safe = if cfg.adaptive_ceiling_enabled
             && cfg.adaptive_ceiling_dl_evidence == "legacy_unverified"
@@ -5139,6 +5419,7 @@ impl Controller {
             cfg.adaptive_ceiling_ul_cap_kbps,
             adaptive_ul_safe,
         );
+        #[cfg(feature = "transport-probes")]
         let throughput_floor_dl = throughput_floor(ThroughputGuardInput {
             enabled: cfg.transport_controller_enabled && cfg.throughput_guard_enabled,
             configured_min_kbps: cfg.min_dl_shaper_rate_kbps,
@@ -5149,6 +5430,9 @@ impl Controller {
             retention_percent: cfg.throughput_guard_retention_percent,
         })
         .min(adaptive_dl.absolute_cap_kbps());
+        #[cfg(not(feature = "transport-probes"))]
+        let throughput_floor_dl = cfg.min_dl_shaper_rate_kbps.max(1.0);
+        #[cfg(feature = "transport-probes")]
         let throughput_floor_ul = throughput_floor(ThroughputGuardInput {
             enabled: cfg.transport_controller_enabled && cfg.throughput_guard_enabled,
             configured_min_kbps: cfg.min_ul_shaper_rate_kbps,
@@ -5159,33 +5443,57 @@ impl Controller {
             retention_percent: cfg.throughput_guard_retention_percent,
         })
         .min(adaptive_ul.absolute_cap_kbps());
+        #[cfg(not(feature = "transport-probes"))]
+        let throughput_floor_ul = cfg.min_ul_shaper_rate_kbps.max(1.0);
 
         Ok(Self {
             shaper_dl: cfg.base_dl_shaper_rate_kbps,
             shaper_ul: cfg.base_ul_shaper_rate_kbps,
             adaptive_dl,
             adaptive_ul,
+            #[cfg(feature = "transport-probes")]
             transport_latency: TransportLatencyTracker::new(),
+            #[cfg(feature = "transport-probes")]
             transport_latency_dl: TransportLatencyTracker::new(),
+            #[cfg(feature = "transport-probes")]
             transport_latency_ul: TransportLatencyTracker::new(),
+            #[cfg(feature = "transport-probes")]
             quality_grade: QualityGradeTracker::new(cfg.rating_episode_gap_s),
+            #[cfg(feature = "transport-probes")]
             rating_load,
+            #[cfg(feature = "transport-probes")]
             rating_load_snapshot,
+            #[cfg(feature = "transport-probes")]
             rating_load_observed_unix_ms,
+            #[cfg(feature = "transport-probes")]
             quality_search_dl: QualitySearchDirection::new(),
+            #[cfg(feature = "transport-probes")]
             quality_search_ul: QualitySearchDirection::new(),
+            #[cfg(feature = "transport-probes")]
             quality_dl_class: QualityClass::Learning,
+            #[cfg(feature = "transport-probes")]
             quality_ul_class: QualityClass::Learning,
+            #[cfg(feature = "transport-probes")]
             transport_backend: cfg.transport_probe_backend.clone(),
+            #[cfg(feature = "transport-probes")]
             transport_trusted: false,
+            #[cfg(feature = "transport-probes")]
             transport_raw_samples: 0,
+            #[cfg(feature = "transport-probes")]
             transport_discarded_samples: 0,
+            #[cfg(feature = "transport-probes")]
             transport_server_processing_ms: 0.0,
+            #[cfg(feature = "transport-probes")]
             transport_connection_reused: false,
+            #[cfg(feature = "transport-probes")]
             transport_rejected_reason: None,
+            #[cfg(feature = "transport-probes")]
             transport_last_rejected_reason: None,
+            #[cfg(feature = "transport-probes")]
             transport_last_rejected_at: None,
+            #[cfg(feature = "transport-probes")]
             transport_bad_windows_dl: 0,
+            #[cfg(feature = "transport-probes")]
             transport_bad_windows_ul: 0,
             throughput_floor_dl,
             throughput_floor_ul,
@@ -5534,6 +5842,7 @@ impl Controller {
         self.last_set_ul = 0;
         self.dl_qdisc_kind = None;
         self.ul_qdisc_kind = None;
+        #[cfg(feature = "transport-probes")]
         self.quality_grade.reset();
         self.reset_uplink_learning(reason);
         self.sqm_last_recovery_at = Some(epoch_secs());
@@ -5687,6 +5996,7 @@ impl Controller {
         }
     }
 
+    #[cfg(feature = "transport-probes")]
     fn update_rating_load(
         &mut self,
         now: Instant,
@@ -6411,16 +6721,19 @@ impl Controller {
         );
     }
 
+    #[cfg(feature = "transport-probes")]
     fn record_transport_rejection(&mut self, reason: &str) {
         self.transport_rejected_reason = Some(reason.to_string());
         self.transport_last_rejected_reason = Some(reason.to_string());
         self.transport_last_rejected_at = Some(epoch_secs());
     }
 
+    #[cfg(feature = "transport-probes")]
     fn shaper_rates(&self) -> (f64, f64) {
         (self.shaper_dl, self.shaper_ul)
     }
 
+    #[cfg(feature = "transport-probes")]
     fn transport_max_age(&self) -> Duration {
         Duration::from_secs_f64(
             self.cfg.transport_probe_loaded_interval_s * 3.0
@@ -6428,6 +6741,7 @@ impl Controller {
         )
     }
 
+    #[cfg(feature = "transport-probes")]
     fn transport_clean_for_growth(&mut self, now: Instant) -> bool {
         if !self.cfg.transport_controller_enabled {
             return true;
@@ -6445,6 +6759,7 @@ impl Controller {
         )
     }
 
+    #[cfg(feature = "transport-probes")]
     fn quality_policy(&self, is_dl: bool) -> QualitySearchPolicy {
         QualitySearchPolicy {
             target_delay_ms: self.cfg.quality_target_delay_ms,
@@ -6459,6 +6774,7 @@ impl Controller {
         }
     }
 
+    #[cfg(feature = "transport-probes")]
     fn on_transport_probe(&mut self, result: TransportProbeResult) {
         let now = Instant::now();
         self.transport_backend = result.backend.clone();
@@ -6871,8 +7187,11 @@ impl Controller {
         self.route_identity = snapshot.as_ref().map(RouteSnapshot::stable_key);
         self.route_snapshot = snapshot;
 
-        let grade_route = self.quality_grade_route_key();
-        self.quality_grade.set_route(&grade_route);
+        #[cfg(feature = "transport-probes")]
+        {
+            let grade_route = self.quality_grade_route_key();
+            self.quality_grade.set_route(&grade_route);
+        }
 
         if reset_learning {
             self.reset_uplink_learning("uplink route identity changed");
@@ -6906,25 +7225,28 @@ impl Controller {
         self.ul_delays = filled_bool_window(self.cfg.bufferbloat_detection_window);
         self.dl_delta_us = filled_f64_window(self.cfg.bufferbloat_detection_window);
         self.ul_delta_us = filled_f64_window(self.cfg.bufferbloat_detection_window);
-        self.transport_latency.reset();
-        self.transport_latency_dl.reset();
-        self.transport_latency_ul.reset();
-        let grade_route = self.quality_grade_route_key();
-        self.quality_grade.set_route(&grade_route);
-        self.quality_search_dl.reset();
-        self.quality_search_ul.reset();
-        self.transport_bad_windows_dl = 0;
-        self.transport_bad_windows_ul = 0;
-        self.quality_dl_class = QualityClass::Learning;
-        self.quality_ul_class = QualityClass::Learning;
         let now = Instant::now();
-        self.rating_load = RatingLoadDetector::new(now);
-        self.rating_load_snapshot = self.rating_load.snapshot(
-            now,
-            self.cfg.rating_load_config(),
-            self.shaper_dl,
-            self.shaper_ul,
-        );
+        #[cfg(feature = "transport-probes")]
+        {
+            self.transport_latency.reset();
+            self.transport_latency_dl.reset();
+            self.transport_latency_ul.reset();
+            let grade_route = self.quality_grade_route_key();
+            self.quality_grade.set_route(&grade_route);
+            self.quality_search_dl.reset();
+            self.quality_search_ul.reset();
+            self.transport_bad_windows_dl = 0;
+            self.transport_bad_windows_ul = 0;
+            self.quality_dl_class = QualityClass::Learning;
+            self.quality_ul_class = QualityClass::Learning;
+            self.rating_load = RatingLoadDetector::new(now);
+            self.rating_load_snapshot = self.rating_load.snapshot(
+                now,
+                self.cfg.rating_load_config(),
+                self.shaper_dl,
+                self.shaper_ul,
+            );
+        }
         let dl_update = self.adaptive_dl.reset_to_configured(now);
         let ul_update = self.adaptive_ul.reset_to_configured(now);
         self.log_adaptive_update("DL", dl_update);
@@ -6941,25 +7263,32 @@ impl Controller {
         if changed_existing {
             #[cfg(feature = "calibration")]
             self.reject_autotune_capture_measurement_basis("external route address changed");
-            self.transport_latency.reset();
-            self.transport_latency_dl.reset();
-            self.transport_latency_ul.reset();
-            self.quality_search_dl.reset();
-            self.quality_search_ul.reset();
-            self.transport_bad_windows_dl = 0;
-            self.transport_bad_windows_ul = 0;
-            self.quality_dl_class = QualityClass::Learning;
-            self.quality_ul_class = QualityClass::Learning;
-            self.log(
-                "INFO",
-                "Reset transport and displayed quality learning after external IP change",
-            );
+            #[cfg(feature = "transport-probes")]
+            {
+                self.transport_latency.reset();
+                self.transport_latency_dl.reset();
+                self.transport_latency_ul.reset();
+                self.quality_search_dl.reset();
+                self.quality_search_ul.reset();
+                self.transport_bad_windows_dl = 0;
+                self.transport_bad_windows_ul = 0;
+                self.quality_dl_class = QualityClass::Learning;
+                self.quality_ul_class = QualityClass::Learning;
+                self.log(
+                    "INFO",
+                    "Reset transport and displayed quality learning after external IP change",
+                );
+            }
         }
-        let grade_route = self.quality_grade_route_key();
-        self.quality_grade.set_route(&grade_route);
+        #[cfg(feature = "transport-probes")]
+        {
+            let grade_route = self.quality_grade_route_key();
+            self.quality_grade.set_route(&grade_route);
+        }
         let _ = self.refresh_status_from_last_sample();
     }
 
+    #[cfg(feature = "transport-probes")]
     fn quality_grade_route_key(&self) -> String {
         format!(
             "{}|external={}",
@@ -7140,17 +7469,20 @@ impl Controller {
         let ul_bb = ul_delay_count >= self.cfg.bufferbloat_detection_thr;
         let avg_dl_delta = average(&self.dl_delta_us);
         let avg_ul_delta = average(&self.ul_delta_us);
-        let rating_flags = self.rating_load_snapshot.phase.direction_flags();
-        if rating_flags.0 || rating_flags.1 {
-            let grade_route = self.quality_grade_route_key();
-            self.quality_grade.observe_icmp_delta(
-                dl_delta_us / 1_000.0,
-                ul_delta_us / 1_000.0,
-                rating_flags.0,
-                rating_flags.1,
-                epoch_secs(),
-                &grade_route,
-            );
+        #[cfg(feature = "transport-probes")]
+        {
+            let rating_flags = self.rating_load_snapshot.phase.direction_flags();
+            if rating_flags.0 || rating_flags.1 {
+                let grade_route = self.quality_grade_route_key();
+                self.quality_grade.observe_icmp_delta(
+                    dl_delta_us / 1_000.0,
+                    ul_delta_us / 1_000.0,
+                    rating_flags.0,
+                    rating_flags.1,
+                    epoch_secs(),
+                    &grade_route,
+                );
+            }
         }
         let high_load_pct = self.cfg.high_load_thr * 100.0;
         let dl_kind = classify_load(
@@ -7176,15 +7508,23 @@ impl Controller {
             );
         }
 
+        #[cfg(feature = "transport-probes")]
         let transport_clean = self.transport_clean_for_growth(now);
-        let transport_delta_ms = self
-            .transport_latency
-            .snapshot(now, self.cfg.transport_latency_enabled)
-            .delta_ms;
-        let transport_bloat = self.cfg.transport_latency_enabled
-            && transport_delta_ms
-                .map(|delta| delta > self.cfg.quality_target_delay_ms)
-                .unwrap_or(false);
+        #[cfg(not(feature = "transport-probes"))]
+        let transport_clean = true;
+        #[cfg(feature = "transport-probes")]
+        let transport_bloat = {
+            let transport_delta_ms = self
+                .transport_latency
+                .snapshot(now, self.cfg.transport_latency_enabled)
+                .delta_ms;
+            self.cfg.transport_latency_enabled
+                && transport_delta_ms
+                    .map(|delta| delta > self.cfg.quality_target_delay_ms)
+                    .unwrap_or(false)
+        };
+        #[cfg(not(feature = "transport-probes"))]
+        let transport_bloat = false;
         if !self.runtime_rate_control_suspended() {
             self.update_direction(true, dl_kind, dl_bb, avg_dl_delta, transport_clean, now);
             self.update_direction(false, ul_kind, ul_bb, avg_ul_delta, transport_clean, now);
@@ -7401,42 +7741,72 @@ impl Controller {
                 None
             }
         });
-        let transport = self
-            .transport_latency
-            .snapshot(Instant::now(), self.cfg.transport_latency_enabled);
-        let effective_delta_ms = self.last_status.as_ref().map(|snapshot| {
-            effective_latency_delta_ms(
-                snapshot.avg_dl_delta,
-                snapshot.avg_ul_delta,
+        #[cfg(feature = "transport-probes")]
+        let line = {
+            let transport = self
+                .transport_latency
+                .snapshot(Instant::now(), self.cfg.transport_latency_enabled);
+            let effective_delta_ms = self.last_status.as_ref().map(|snapshot| {
+                effective_latency_delta_ms(
+                    snapshot.avg_dl_delta,
+                    snapshot.avg_ul_delta,
+                    transport.delta_ms,
+                )
+            });
+            let grade_snapshot = self.quality_grade.snapshot(epoch_secs());
+            let grade_result = grade_snapshot.last_known.as_ref();
+            graph_history_line(
+                now,
+                rtt_ms,
+                self.cpu_total_percent,
+                dl_rate_kbps,
+                ul_rate_kbps,
                 transport.delta_ms,
+                effective_delta_ms,
+                Some(self.throughput_floor_dl),
+                Some(self.throughput_floor_ul),
+                self.uplink_state.as_str(),
+                self.route_identity.as_deref().unwrap_or(""),
+                grade_result.map(|result| result.class.as_str()),
+                grade_snapshot.state,
+                grade_result.map(|result| result.increase_ms),
+                self.rating_load_snapshot.phase.as_str(),
+                grade_snapshot.dl_samples,
+                grade_snapshot.ul_samples,
+                self.adaptive_dl.phase().as_str(),
+                self.adaptive_ul.phase().as_str(),
+                self.adaptive_dl.last_transition_reason(),
+                self.adaptive_ul.last_transition_reason(),
+                self.quality_search_dl.causal_state(),
+                self.quality_search_ul.causal_state(),
+                &self.sqm_runtime_state,
             )
-        });
-        let grade_snapshot = self.quality_grade.snapshot(epoch_secs());
-        let grade_result = grade_snapshot.last_known.as_ref();
+        };
+        #[cfg(not(feature = "transport-probes"))]
         let line = graph_history_line(
             now,
             rtt_ms,
             self.cpu_total_percent,
             dl_rate_kbps,
             ul_rate_kbps,
-            transport.delta_ms,
-            effective_delta_ms,
             Some(self.throughput_floor_dl),
             Some(self.throughput_floor_ul),
+            None,
+            None,
             self.uplink_state.as_str(),
             self.route_identity.as_deref().unwrap_or(""),
-            grade_result.map(|result| result.class.as_str()),
-            grade_snapshot.state,
-            grade_result.map(|result| result.increase_ms),
-            self.rating_load_snapshot.phase.as_str(),
-            grade_snapshot.dl_samples,
-            grade_snapshot.ul_samples,
+            None,
+            "disabled",
+            None,
+            "IDLE",
+            0,
+            0,
             self.adaptive_dl.phase().as_str(),
             self.adaptive_ul.phase().as_str(),
             self.adaptive_dl.last_transition_reason(),
             self.adaptive_ul.last_transition_reason(),
-            self.quality_search_dl.causal_state(),
-            self.quality_search_ul.causal_state(),
+            "not_available",
+            "not_available",
             &self.sqm_runtime_state,
         );
         let path = self.cfg.graph_history_path();
@@ -7881,22 +8251,28 @@ impl Controller {
         let ul_phase_elapsed_s = adaptive_now
             .saturating_duration_since(self.adaptive_ul.phase_since())
             .as_secs_f64();
+        #[cfg(feature = "transport-probes")]
         let transport = self
             .transport_latency
             .snapshot(adaptive_now, self.cfg.transport_latency_enabled);
+        #[cfg(feature = "transport-probes")]
         let transport_dl = self
             .transport_latency_dl
             .snapshot(adaptive_now, self.cfg.transport_latency_enabled);
+        #[cfg(feature = "transport-probes")]
         let transport_ul = self
             .transport_latency_ul
             .snapshot(adaptive_now, self.cfg.transport_latency_enabled);
+        #[cfg(feature = "transport-probes")]
         let effective_delta_ms =
             effective_latency_delta_ms(avg_dl_delta, avg_ul_delta, transport.delta_ms);
+        #[cfg(feature = "transport-probes")]
         let controller_quality_class = if transport.confirmed {
             classify_quality(Some(effective_delta_ms))
         } else {
             QualityClass::Learning
         };
+        #[cfg(feature = "transport-probes")]
         let controller_quality_reason = if !self.cfg.transport_controller_enabled {
             "detected_only_controller_disabled"
         } else if self.quality_search_dl.limited() {
@@ -7908,9 +8284,12 @@ impl Controller {
         } else {
             transport.status
         };
+        #[cfg(feature = "transport-probes")]
         let quality_grade = self.quality_grade.snapshot(epoch_secs());
+        #[cfg(feature = "transport-probes")]
         let (quality_class, quality_dl_class, quality_ul_class) =
             quality_grade.authoritative_classes();
+        #[cfg(feature = "transport-probes")]
         let quality_reason = if quality_grade.authoritative_complete_result().is_some() {
             "complete_direction_bound_icmp_and_transport"
         } else if quality_grade.last_known_stale {
@@ -8001,8 +8380,10 @@ impl Controller {
             json_string_array(&bad_reflectors),
             reflector_health
         )?;
-        file.seek(SeekFrom::End(-2))?;
-        writeln!(
+        #[cfg(feature = "transport-probes")]
+        {
+            file.seek(SeekFrom::End(-2))?;
+            writeln!(
             file,
             ",\"transport_latency_enabled\":{},\"transport_controller_enabled\":{},\"transport_probe_method\":\"network_rtt_v3\",\"transport_probe_backend\":\"{}\",\"transport_probe_trusted\":{},\"transport_probe_raw_samples\":{},\"transport_probe_discarded_samples\":{},\"transport_probe_server_processing_ms\":{:.3},\"transport_probe_connection_reused\":{},\"transport_probe_rejected_reason\":{},\"transport_probe_last_rejected_reason\":{},\"transport_probe_last_rejected_at\":{},\"transport_status\":\"{}\",\"transport_endpoint\":{},\"transport_latency_ms\":{},\"transport_baseline_ms\":{},\"transport_delta_ms\":{},\"transport_sample_age_s\":{},\"transport_confidence\":{},\"transport_successful_samples\":{},\"transport_failed_samples\":{},\"transport_last_error\":{},\"effective_latency_delta_ms\":{:.3},\"quality_estimated\":false,\"quality_class\":\"{}\",\"quality_dl_class\":\"{}\",\"quality_ul_class\":\"{}\",\"quality_confidence\":{},\"quality_reason\":\"{}\",\"quality_controller_class\":\"{}\",\"quality_controller_dl_class\":\"{}\",\"quality_controller_ul_class\":\"{}\",\"quality_controller_confidence\":{},\"quality_controller_reason\":\"{}\",\"throughput_guard_enabled\":{},\"throughput_floor_dl_kbps\":{:.0},\"throughput_floor_ul_kbps\":{:.0},\"quality_limited\":{},\"quality_limited_dl\":{},\"quality_limited_ul\":{}}}",
             self.cfg.transport_latency_enabled,
@@ -8047,9 +8428,9 @@ impl Controller {
             self.quality_search_dl.limited() || self.quality_search_ul.limited(),
             self.quality_search_dl.limited(),
             self.quality_search_ul.limited(),
-        )?;
-        file.seek(SeekFrom::End(-2))?;
-        write!(
+            )?;
+            file.seek(SeekFrom::End(-2))?;
+            write!(
             file,
             ",\"quality_grade_method\":\"{}\",\"quality_grade_state\":\"{}\",\"quality_grade_collected_samples\":{},\"quality_grade_required_samples\":{},\"quality_grade_baseline_ready\":{},\"quality_grade_baseline_samples\":{},\"quality_grade_baseline_required_samples\":{},\"quality_grade_dl_samples\":{},\"quality_grade_ul_samples\":{},\"quality_grade_bidirectional_samples\":{},\"quality_grade_finalize_remaining_s\":{},\"quality_grade_current\":{},\"quality_grade_last_known\":{},\"rating_load_phase\":\"{}\",\"rating_load_candidate\":\"{}\",\"rating_load_raw_dl_percent\":{:.3},\"rating_load_raw_ul_percent\":{:.3},\"rating_load_smoothed_dl_percent\":{:.3},\"rating_load_smoothed_ul_percent\":{:.3},\"rating_load_aggregate_dl_kbps\":{:.3},\"rating_load_aggregate_ul_kbps\":{:.3},\"rating_load_effective_dl_kbps\":{:.3},\"rating_load_effective_ul_kbps\":{:.3},\"rating_load_reference_dl_kbps\":{:.3},\"rating_load_reference_ul_kbps\":{:.3},\"rating_load_enter_percent\":{:.3},\"rating_load_exit_percent\":{:.3},\"rating_load_enter_dl_percent\":{:.3},\"rating_load_enter_ul_percent\":{:.3},\"rating_load_exit_dl_percent\":{:.3},\"rating_load_exit_ul_percent\":{:.3},\"rating_load_enter_dl_kbps\":{:.3},\"rating_load_enter_ul_kbps\":{:.3},\"rating_load_phase_age_s\":{:.3},\"rating_capture_active\":{},\"rating_capture_mode\":\"{}\",\"rating_capture_requested_phase\":\"{}\",\"rating_capture_background_dl_kbps\":{:.3},\"rating_capture_background_ul_kbps\":{:.3},\"rating_capture_peak_dl_percent\":{:.3},\"rating_capture_peak_ul_percent\":{:.3},\"rating_capture_contaminated\":{},\"rating_capture_contamination_reason\":\"{}\",\"graph_history_enabled\":{},\"graph_history_budget_mode\":\"{}\",\"graph_history_configured_budget_kib\":{},\"graph_history_safe_max_kib\":{},\"graph_history_effective_total_kib\":{},\"graph_history_instance_budget_kib\":{},\"graph_history_used_total_kib\":{},\"graph_history_used_instance_kib\":{},\"graph_history_stored_samples\":{},\"graph_history_instances\":{},\"graph_history_mem_total_kib\":{},\"graph_history_mem_available_kib\":{},\"graph_history_paused_low_memory\":{}",
             quality_grade::QUALITY_GRADE_METHOD,
@@ -8121,8 +8502,9 @@ impl Controller {
             self.history_budget.memory.total_kib,
             self.history_budget.memory.available_kib,
             self.history_budget.paused_low_memory,
-        )?;
-        writeln!(file, "}}")?;
+            )?;
+            writeln!(file, "}}")?;
+        }
         let route_mode = self
             .route_snapshot
             .as_ref()
@@ -8175,7 +8557,11 @@ impl Controller {
             })
             .unwrap_or(false);
         let uplink_error = uplink_error_code(self.uplink_state, &self.uplink_reason);
+        #[cfg(feature = "transport-probes")]
         let transport_error = transport_error_code(transport.last_error.as_deref());
+        #[cfg(not(feature = "transport-probes"))]
+        let transport_error: Option<&'static str> = None;
+        #[cfg(feature = "transport-probes")]
         let adaptive_capacity = adaptive_capacity_status_json(AdaptiveCapacityStatusContext {
             enabled: self.cfg.adaptive_ceiling_enabled,
             route_epoch: self.route_identity.as_deref(),
@@ -8191,6 +8577,23 @@ impl Controller {
             no_cake_effect_upload: self.quality_search_ul.no_cake_effect(),
             causal_state_download: self.quality_search_dl.causal_state(),
             causal_state_upload: self.quality_search_ul.causal_state(),
+        });
+        #[cfg(not(feature = "transport-probes"))]
+        let adaptive_capacity = adaptive_capacity_status_json(AdaptiveCapacityStatusContext {
+            enabled: self.cfg.adaptive_ceiling_enabled,
+            route_epoch: self.route_identity.as_deref(),
+            download: &self.adaptive_dl,
+            upload: &self.adaptive_ul,
+            current_download_kbps: self.shaper_dl,
+            current_upload_kbps: self.shaper_ul,
+            runtime_minimum_download_kbps: self.cfg.min_dl_shaper_rate_kbps,
+            runtime_minimum_upload_kbps: self.cfg.min_ul_shaper_rate_kbps,
+            transport_confidence_download: 0,
+            transport_confidence_upload: 0,
+            no_cake_effect_download: None,
+            no_cake_effect_upload: None,
+            causal_state_download: "not_available",
+            causal_state_upload: "not_available",
         });
         file.seek(SeekFrom::End(-2))?;
         writeln!(
@@ -8400,6 +8803,7 @@ impl Controller {
     }
 }
 
+#[cfg(feature = "calibration")]
 fn configured_measurement_topology(cfg: &Config) -> operations::full_autotune::MeasurementTopology {
     use operations::full_autotune::MeasurementTopology;
     match (cfg.download_shaping_enabled(), cfg.upload_shaping_enabled()) {
@@ -8410,6 +8814,7 @@ fn configured_measurement_topology(cfg: &Config) -> operations::full_autotune::M
     }
 }
 
+#[cfg(feature = "calibration")]
 fn measurement_topology_directions(
     topology: operations::full_autotune::MeasurementTopology,
 ) -> (bool, bool) {
@@ -8429,6 +8834,7 @@ fn measurement_topology_directions(
     (download, upload)
 }
 
+#[cfg(feature = "calibration")]
 fn topology_is_supported_by_config(
     cfg: &Config,
     topology: operations::full_autotune::MeasurementTopology,
@@ -8437,6 +8843,7 @@ fn topology_is_supported_by_config(
     (!download || cfg.download_shaping_enabled()) && (!upload || cfg.upload_shaping_enabled())
 }
 
+#[cfg(feature = "calibration")]
 fn attest_rate_only_runtime(
     controller: &mut Controller,
     expected: &operations::autotune_runtime::RuntimeSnapshot,
@@ -8521,17 +8928,20 @@ fn attest_loaded_capture_runtime(
     attest_private_runtime(&cfg.sqm_interface, expected, checkpoint)
 }
 
+#[cfg(feature = "calibration")]
 struct OpenWrtRateOverrideActuator<'a> {
     controller: &'a mut Controller,
     boot_ms: u64,
 }
 
+#[cfg(feature = "calibration")]
 fn unsafe_runtime_actuator_error(
     message: impl Into<String>,
 ) -> operations::autotune_runtime_driver::RuntimeActuatorError {
     operations::autotune_runtime_driver::RuntimeActuatorError::Unsafe(message.into())
 }
 
+#[cfg(feature = "calibration")]
 fn target_unavailable_runtime_blocker(
     cfg: &Config,
     message: impl Into<String>,
@@ -8544,6 +8954,7 @@ fn target_unavailable_runtime_blocker(
     )
 }
 
+#[cfg(feature = "calibration")]
 fn sqm_recovery_busy_runtime_blocker(
     cfg: &Config,
     message: impl Into<String>,
@@ -8556,6 +8967,7 @@ fn sqm_recovery_busy_runtime_blocker(
     )
 }
 
+#[cfg(feature = "calibration")]
 fn topology_settling_runtime_blocker(
     cfg: &Config,
     message: impl Into<String>,
@@ -8568,6 +8980,7 @@ fn topology_settling_runtime_blocker(
     )
 }
 
+#[cfg(feature = "calibration")]
 fn recovery_interrupted_runtime_blocker(
     cfg: &Config,
     message: impl Into<String>,
@@ -8580,6 +8993,7 @@ fn recovery_interrupted_runtime_blocker(
     )
 }
 
+#[cfg(feature = "calibration")]
 fn classify_sqm_recovery_error(
     cfg: &Config,
     error: SqmRecoveryError,
@@ -8596,6 +9010,7 @@ fn classify_sqm_recovery_error(
     }
 }
 
+#[cfg(feature = "calibration")]
 fn classify_topology_error(
     cfg: &Config,
     error: SqmTopologyError,
@@ -8606,6 +9021,7 @@ fn classify_topology_error(
     }
 }
 
+#[cfg(feature = "calibration")]
 fn classify_tc_mutation_error(
     cfg: &Config,
     message: String,
@@ -8618,17 +9034,20 @@ fn classify_tc_mutation_error(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(feature = "calibration")]
 enum PrivateRootState {
     AbsentOrKernelDefault,
     Exact(u64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(feature = "calibration")]
 enum PrivateIngressState {
     Absent,
     Exact,
 }
 
+#[cfg(feature = "calibration")]
 fn runtime_ip_output(args: &[&str]) -> Result<String, String> {
     let ip = env::var("CAKE_AUTORATE_IP").unwrap_or_else(|_| "ip".to_string());
     let output = Command::new(&ip)
@@ -8646,11 +9065,13 @@ fn runtime_ip_output(args: &[&str]) -> Result<String, String> {
     })
 }
 
+#[cfg(feature = "calibration")]
 fn runtime_tc_output(args: &[String]) -> Result<String, String> {
     let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
     tc_output(&refs)
 }
 
+#[cfg(feature = "calibration")]
 fn private_profile_matches(
     line: &str,
     profile: crate::autotune::AutotuneProfile,
@@ -8676,6 +9097,7 @@ fn private_profile_matches(
     }
 }
 
+#[cfg(feature = "calibration")]
 fn private_link_matches(line: &str, link_kind: crate::autotune::LinkKind) -> bool {
     let fields = line.split_whitespace().collect::<Vec<_>>();
     let value_after = |name: &str| {
@@ -8702,6 +9124,7 @@ fn private_link_matches(line: &str, link_kind: crate::autotune::LinkKind) -> boo
     }
 }
 
+#[cfg(feature = "calibration")]
 fn inspect_private_root(
     device: &str,
     handle: &str,
@@ -8713,6 +9136,7 @@ fn inspect_private_root(
     parse_private_root_output(&output, device, handle, profile, link_kind, download)
 }
 
+#[cfg(feature = "calibration")]
 fn parse_private_root_output(
     output: &str,
     device: &str,
@@ -8760,6 +9184,7 @@ fn parse_private_root_output(
         .unwrap_or(PrivateRootState::AbsentOrKernelDefault))
 }
 
+#[cfg(feature = "calibration")]
 fn inspect_private_ingress(
     target: &str,
     checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
@@ -8769,6 +9194,7 @@ fn inspect_private_ingress(
     parse_private_ingress_output(&qdiscs, &filters, target, checkpoint)
 }
 
+#[cfg(feature = "calibration")]
 fn parse_private_ingress_output(
     qdiscs: &str,
     filters: &str,
@@ -8902,6 +9328,7 @@ fn parse_private_ingress_output(
     Ok(PrivateIngressState::Exact)
 }
 
+#[cfg(feature = "calibration")]
 fn private_ingress_filter_args(
     target: &str,
     checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
@@ -8938,6 +9365,7 @@ fn private_ingress_filter_args(
     ])
 }
 
+#[cfg(feature = "calibration")]
 fn exact_private_ifb(
     checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
     require_ifindex: bool,
@@ -8973,6 +9401,7 @@ fn exact_private_ifb(
     Ok(true)
 }
 
+#[cfg(feature = "calibration")]
 fn replace_private_cake(
     device: &str,
     handle: &str,
@@ -8987,6 +9416,7 @@ fn replace_private_cake(
     .map(|_| ())
 }
 
+#[cfg(feature = "calibration")]
 fn private_cake_args(
     device: &str,
     handle: &str,
@@ -9039,6 +9469,7 @@ fn private_cake_args(
     Ok(args)
 }
 
+#[cfg(feature = "calibration")]
 fn delete_private_root_if_present(
     device: &str,
     handle: &str,
@@ -9052,6 +9483,7 @@ fn delete_private_root_if_present(
     }
 }
 
+#[cfg(feature = "calibration")]
 fn attach_private_ingress(
     target: &str,
     checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
@@ -9081,6 +9513,7 @@ fn attach_private_ingress(
     Ok(())
 }
 
+#[cfg(feature = "calibration")]
 fn delete_private_ingress_if_present(
     target: &str,
     checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
@@ -9091,6 +9524,7 @@ fn delete_private_ingress_if_present(
     }
 }
 
+#[cfg(feature = "calibration")]
 fn stop_managed_sqm_with<F>(
     helper: &Path,
     target_interface: &str,
@@ -9123,6 +9557,7 @@ where
     })
 }
 
+#[cfg(feature = "calibration")]
 fn stop_managed_sqm_for_runtime(cfg: &Config) -> Result<(), String> {
     let helper = env::var_os("CAKE_AUTORATE_SQM_RUN")
         .map(PathBuf::from)
@@ -9135,6 +9570,7 @@ fn stop_managed_sqm_for_runtime(cfg: &Config) -> Result<(), String> {
     )
 }
 
+#[cfg(feature = "calibration")]
 fn create_private_ifb(
     checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
 ) -> Result<u32, String> {
@@ -9183,6 +9619,7 @@ fn create_private_ifb(
     Ok(ifindex)
 }
 
+#[cfg(feature = "calibration")]
 fn delete_private_ifb(
     checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
     require_ifindex: bool,
@@ -9208,6 +9645,7 @@ fn delete_private_ifb(
     Ok(())
 }
 
+#[cfg(feature = "calibration")]
 fn apply_private_runtime_topology(
     target: &str,
     control: &operations::full_autotune::AutotuneRuntimeControl,
@@ -9280,6 +9718,7 @@ fn apply_private_runtime_topology(
     Ok(())
 }
 
+#[cfg(feature = "calibration")]
 fn attest_private_runtime(
     target: &str,
     expected: &operations::autotune_runtime::RuntimeSnapshot,
@@ -9333,6 +9772,7 @@ fn attest_private_runtime(
     })
 }
 
+#[cfg(feature = "calibration")]
 fn remove_private_runtime_topology(
     target: &str,
     checkpoint: &operations::autotune_runtime_store::RuntimeOverrideCheckpoint,
@@ -9380,6 +9820,7 @@ fn remove_private_runtime_topology(
     Ok(())
 }
 
+#[cfg(feature = "calibration")]
 impl operations::autotune_runtime_driver::RuntimeOverrideActuator
     for OpenWrtRateOverrideActuator<'_>
 {
@@ -9716,11 +10157,9 @@ impl operations::autotune_runtime_driver::RuntimeOverrideActuator
             }
             RuntimeRestoreBlocker::SqmRecoveryBusy { .. } => {
                 // The native operation owns the interface lock while it is
-                // restoring. Re-entering sqm-recover merely to observe that
-                // restore can therefore return EX_TEMPFAIL forever even after
-                // the helper has already installed the exact baseline. Inspect
-                // the live topology directly under the existing owner instead
-                // of trying to acquire the same lock recursively.
+                // restoring. Re-entering the recovery owner merely to observe
+                // that restore would recursively acquire the same lock. Inspect
+                // the live topology directly under the existing owner instead.
                 let (download_shaped, upload_shaped) =
                     measurement_topology_directions(baseline.topology);
                 match inspect_sqm_topology_for(&self.controller.cfg, download_shaped, upload_shaped)
@@ -10034,6 +10473,7 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
     let mut last_runtime_override_error: Option<String> = None;
 
     let mut pinger: Option<PingerRuntime> = None;
+    #[cfg(feature = "transport-probes")]
     let mut transport_probe = cfg
         .transport_latency_enabled
         .then(|| TransportProbeRuntime::spawn(&cfg));
@@ -10245,6 +10685,7 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                         break;
                     }
 
+                    #[cfg(feature = "calibration")]
                     if cfg.pinger_method == "irtt" {
                         controller.note_probe_gap();
                         controller.log(
@@ -10305,6 +10746,7 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
         }
         #[cfg(feature = "calibration")]
         controller.sync_rating_capture(now);
+        #[cfg(any(feature = "calibration", feature = "transport-probes"))]
         let rating_load = if rate_sample.fresh {
             controller.update_rating_load(now, dl_rate, ul_rate)
         } else {
@@ -10383,7 +10825,7 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                 }
             }
         }
-        #[cfg(not(feature = "calibration"))]
+        #[cfg(all(not(feature = "calibration"), feature = "transport-probes"))]
         if let Some(runtime) = transport_probe.as_mut() {
             runtime.drain(&mut controller, &cfg);
             if route_probes_allowed {
@@ -10695,7 +11137,10 @@ impl PingerRuntime {
             let tx = tx.clone();
             let method = method.clone();
             let wake_writer = wake.clone();
-            let reflector = if method == "ping" || method == "irtt" {
+            let indexed_reflector = method == "ping";
+            #[cfg(feature = "calibration")]
+            let indexed_reflector = indexed_reflector || method == "irtt";
+            let reflector = if indexed_reflector {
                 active_reflectors.get(idx).cloned().unwrap_or_default()
             } else {
                 String::new()
@@ -10802,6 +11247,7 @@ fn spawn_pingers(cfg: &Config, active_reflectors: &[String]) -> Result<Vec<Child
         "fping" => Ok(vec![spawn_fping(cfg, active_reflectors, false)?]),
         "fping-ts" => Ok(vec![spawn_fping(cfg, active_reflectors, true)?]),
         "tsping" => Ok(vec![spawn_tsping(cfg, active_reflectors)?]),
+        #[cfg(feature = "calibration")]
         "irtt" => spawn_irtt(cfg, active_reflectors),
         "ping" => spawn_ping(cfg, active_reflectors),
         other => Err(format!("unsupported pinger_method={other}")),
@@ -10917,6 +11363,7 @@ fn spawn_ping_child(cfg: &Config, target: &str) -> Result<Child, String> {
         .map_err(|e| format!("failed to start ping: {e}"))
 }
 
+#[cfg(feature = "calibration")]
 fn spawn_irtt(cfg: &Config, active_reflectors: &[String]) -> Result<Vec<Child>, String> {
     if active_reflectors.is_empty() {
         return Err("at least one irtt_server is required".to_string());
@@ -10966,6 +11413,7 @@ fn stop_child(child: &mut Child) {
 fn parse_sample_line(cfg: &Config, line: &str, ping_reflector: &str) -> Option<Sample> {
     match cfg.pinger_method.as_str() {
         "ping" => parse_ping_line(line, ping_reflector),
+        #[cfg(feature = "calibration")]
         "irtt" => parse_irtt_line(line, ping_reflector),
         "fping-ts" => parse_fping_ts_line(line),
         "tsping" => parse_tsping_line(line),
@@ -11068,6 +11516,7 @@ fn parse_tsping_line(line: &str) -> Option<Sample> {
     })
 }
 
+#[cfg(feature = "calibration")]
 fn parse_irtt_line(line: &str, reflector: &str) -> Option<Sample> {
     if reflector.is_empty()
         || !line.contains("seq=")
@@ -11152,6 +11601,7 @@ fn parse_ping_token_after(line: &str, marker: &str) -> Option<String> {
     }
 }
 
+#[cfg(feature = "calibration")]
 fn parse_irtt_token<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
     line.split_whitespace()
         .map(|token| token.trim_matches(|ch| matches!(ch, ',' | ';' | ')' | '(')))
@@ -11160,6 +11610,7 @@ fn parse_irtt_token<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
+#[cfg(feature = "calibration")]
 fn parse_irtt_duration_us(value: &str) -> Option<f64> {
     if value.starts_with('-') {
         return None;
@@ -11259,6 +11710,7 @@ fn is_valid_reflector_candidate(value: &str) -> bool {
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | ':'))
 }
 
+#[cfg(feature = "calibration")]
 fn is_valid_irtt_server_candidate(value: &str) -> bool {
     if value.is_empty() || value.len() > 253 || value.contains("://") {
         return false;
@@ -11281,6 +11733,7 @@ fn deduplicate_list(values: &mut Vec<String>) {
     });
 }
 
+#[cfg(feature = "calibration")]
 fn irtt_target_arg(target: &str) -> String {
     let colon_count = target
         .as_bytes()
@@ -12045,6 +12498,7 @@ fn adaptive_capacity_status_json(context: AdaptiveCapacityStatusContext<'_>) -> 
     )
 }
 
+#[cfg(feature = "transport-probes")]
 fn quality_grade_metric_json(metric: Option<&QualityGradeMetric>) -> String {
     let Some(metric) = metric else {
         return "null".to_string();
@@ -12071,6 +12525,7 @@ fn quality_grade_metric_json(metric: Option<&QualityGradeMetric>) -> String {
     )
 }
 
+#[cfg(feature = "transport-probes")]
 fn quality_grade_result_json(result: Option<&QualityGradeResult>, stale: bool) -> String {
     let Some(result) = result else {
         return "null".to_string();
@@ -12166,7 +12621,7 @@ fn graph_history_line(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "calibration"))]
 fn compact_graph_history_data(data: &str, max_bytes: usize) -> String {
     let mut newest = Vec::new();
     let mut bytes = 0usize;
@@ -12252,7 +12707,7 @@ fn json_f64_array(values: &[f64], precision: usize) -> String {
 }
 
 fn default_reflectors() -> Vec<String> {
-    operations::autotune_capture_policy::standard_v1_reflectors()
+    reflector_defaults::standard_reflectors()
 }
 
 fn json_bool(value: bool) -> &'static str {
@@ -12369,8 +12824,35 @@ const CALIBRATIONCTL_SCHEDULER_STATUS_USAGE: &str =
 
 fn print_usage() {
     eprintln!("usage: cake-autorated [--instance NAME] [--once] [--dump-config]");
+    eprintln!("       cake-autorated --runtime-health");
+    eprintln!("       cake-autorated --sync-presets");
+    eprintln!("       cake-autorated --sqm-project dry-run|apply [all|INSTANCE]");
+    #[cfg(feature = "calibration")]
+    eprintln!(
+        "       cake-autorated --service-lifecycle prepare-start|confirm-started|execute-stop"
+    );
+    #[cfg(not(feature = "calibration"))]
+    eprintln!("       cake-autorated --service-lifecycle prepare-start|execute-stop");
+    eprintln!("       cake-autorated --cpu-profile [SECONDS]");
+    #[cfg(feature = "calibration")]
+    eprintln!("       cake-autorated --package-versions | --mwan3-info | --graph-history INSTANCE read [OFFSET LIMIT] | stats");
+    #[cfg(feature = "calibration")]
+    eprintln!("       cake-autorated --status-columns set [COLUMN ...] | reset");
+    #[cfg(feature = "calibration")]
+    eprintln!("       cake-autorated --mqtt-status INSTANCE [status]");
+    #[cfg(feature = "calibration")]
+    eprintln!("       cake-autorated --mqtt-publisher INSTANCE");
+    #[cfg(feature = "calibration")]
+    eprintln!("       cake-autorated --log-bundle [all|INSTANCE]");
+    #[cfg(feature = "calibration")]
+    eprintln!(
+        "       cake-autorated --traffic-classifier render|apply|clear|presets|status [INSTANCE]"
+    );
+    #[cfg(feature = "calibration")]
+    eprintln!("       cake-autorated --pinger-plan SECTION status|scan|install [BACKEND] [ROUTE_MODE] [MWAN3_MEMBER]");
     #[cfg(feature = "calibration")]
     print_calibration_usage();
+    #[cfg(feature = "transport-probes")]
     eprintln!("       cake-autorated --transport-probe --backend websocket|tcp|http|legacy-http [--endpoint URL] [--device IFACE] [--source-ip IPv4] [--fwmark HEX] [--count N] [--timeout SEC] [--interval-ms N]");
 }
 
@@ -12388,10 +12870,19 @@ fn print_calibration_usage() {
     eprintln!("       cake-autorated --calibrationctl [--state-dir RAM_PATH] autotune-inspect OPTIONS | autotune-start OPTIONS | autotune-bootstrap-start SQM_SECTION OPTIONS | autotune-status JOB_ID | autotune-result JOB_ID | autotune-cancel JOB_ID");
     eprintln!("       cake-autorated --bootstrap-runtime-owner --request PATH --runtime-dir PATH --worker-run-id HEX");
     eprintln!("       cake-autorated --calibrationctl [--state-dir RAM_PATH] autotune-current INSTANCE | rating-start OPTIONS | rating-current INSTANCE | rating-status JOB_ID | rating-result JOB_ID | rating-cancel JOB_ID");
-    eprintln!("       cake-autorated --calibrationctl [--state-dir RAM_PATH] speedtest-start OPTIONS | speedtest-current INSTANCE | speedtest-status JOB_ID | speedtest-result JOB_ID | speedtest-cancel JOB_ID");
+    eprintln!("       cake-autorated --calibrationctl [--state-dir RAM_PATH] speedtest-start OPTIONS | speedtest-bootstrap-start SQM_SECTION OPTIONS | speedtest-current INSTANCE | speedtest-status JOB_ID | speedtest-result JOB_ID | speedtest-cancel JOB_ID");
     eprintln!("       cake-autorated --calibrationctl [--state-dir RAM_PATH] autotune-apply-check JOB_ID [OPTION_ID]");
-    eprintln!("       cake-autorated --calibrationctl [--state-dir RAM_PATH] autotune-apply JOB_ID OPTION_ID REVIEW_SHA256 MANIFEST_SHA256 [--ack CODE]...");
+    eprintln!("       cake-autorated --calibrationctl [--state-dir RAM_PATH] autotune-apply-start JOB_ID OPTION_ID REVIEW_SHA256 MANIFEST_SHA256 [--ack CODE]...");
+    eprintln!("       cake-autorated --calibrationctl [--state-dir RAM_PATH] autotune-apply-status APPLY_JOB_ID APPLY_JOB_TOKEN");
+    eprintln!("       cake-autorated --calibrationctl [--state-dir RAM_PATH] autotune-apply-watch APPLY_JOB_ID APPLY_JOB_TOKEN OBSERVED_GENERATION");
+    eprintln!("       cake-autorated --calibrationctl [--state-dir RAM_PATH] autotune-apply-result APPLY_JOB_ID APPLY_JOB_TOKEN");
     eprintln!("       cake-autorated --native-apply-recover");
+    eprintln!(
+        "       cake-autorated --native-apply-worker --state-dir RAM_PATH --apply-job-id HEX"
+    );
+    eprintln!(
+        "       cake-autorated --calibration-service prepare-start|prepare-stop|confirm-started|confirm-stopped"
+    );
     eprintln!("       cake-autorated --calibration-capabilities");
     eprintln!(
         "       cake-autorated --autotune-proposal --dl-samples LIST --ul-samples LIST \\\n         --idle-median-ms N --idle-p95-ms N --idle-samples N [--link-kind KIND] \\\n         [--profile gaming|best_overall|variable_link|fair] \\\n         [--base-scale N | --dl-base-scale N --ul-base-scale N] \\\n         [--dl-runtime-min-kbps N] [--ul-runtime-min-kbps N] \\\n         [--dl-measurement-base-kbps N --ul-measurement-base-kbps N]"
@@ -13129,6 +13620,7 @@ where
     Ok(())
 }
 
+#[cfg(feature = "transport-probes")]
 fn run_transport_probe_cli<I>(args: I) -> Result<(), String>
 where
     I: Iterator<Item = String>,
@@ -13249,6 +13741,160 @@ fn main() {
     let mut initial_args = env::args();
     let _program = initial_args.next();
     match initial_args.next().as_deref() {
+        Some("--runtime-health") => {
+            match operations::runtime_health::run_runtime_health(initial_args) {
+                Ok(output) => print!("{output}"),
+                Err(error) => {
+                    eprintln!("ERROR: {error}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        Some("--sync-presets") => {
+            match operations::service_config::run_sync_presets(initial_args) {
+                Ok(output) => print!("{output}"),
+                Err(error) => {
+                    eprintln!("ERROR: {error}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        Some("--sqm-project") => {
+            match operations::sqm_projection::run_sqm_project(initial_args) {
+                Ok(output) => print!("{output}"),
+                Err(error) => {
+                    eprintln!("ERROR: {error}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        Some("--service-lifecycle") => {
+            match operations::service_lifecycle::run_service_lifecycle(initial_args) {
+                Ok(output) => print!("{output}"),
+                Err(error) => {
+                    eprintln!("ERROR: {error}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        #[cfg(feature = "calibration")]
+        Some("--package-versions") => {
+            match operations::luci_readouts::run_package_versions(initial_args) {
+                Ok(output) => print!("{output}"),
+                Err(error) => {
+                    eprintln!("ERROR: {error}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        #[cfg(feature = "calibration")]
+        Some("--mwan3-info") => {
+            match operations::luci_readouts::run_mwan3_info(initial_args) {
+                Ok(output) => print!("{output}"),
+                Err(error) => {
+                    eprintln!("ERROR: {error}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        #[cfg(feature = "calibration")]
+        Some("--graph-history") => {
+            match operations::luci_readouts::run_graph_history(initial_args) {
+                Ok(output) => {
+                    use std::io::Write as _;
+                    if let Err(error) = std::io::stdout().write_all(&output) {
+                        eprintln!("ERROR: unable to write graph history: {error}");
+                        std::process::exit(1);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("ERROR: {error}");
+                    std::process::exit(2);
+                }
+            }
+            return;
+        }
+        #[cfg(feature = "calibration")]
+        Some("--status-columns") => {
+            if let Err(error) = operations::luci_config::run_status_columns(initial_args) {
+                eprintln!("ERROR: {error}");
+                std::process::exit(2);
+            }
+            return;
+        }
+        Some("--cpu-profile") => {
+            match operations::cpu_profile::run_cpu_profile(initial_args) {
+                Ok(output) => print!("{output}"),
+                Err(error) => {
+                    eprintln!("ERROR: {error}");
+                    std::process::exit(2);
+                }
+            }
+            return;
+        }
+        #[cfg(feature = "calibration")]
+        Some("--mqtt-status") => {
+            match operations::mqtt_control::run_mqtt_status(initial_args) {
+                Ok(output) => print!("{output}"),
+                Err(error) => {
+                    eprintln!("ERROR: {error}");
+                    std::process::exit(2);
+                }
+            }
+            return;
+        }
+        #[cfg(feature = "calibration")]
+        Some("--mqtt-publisher") => {
+            if let Err(error) = operations::mqtt_publisher::run_mqtt_publisher(initial_args) {
+                eprintln!("ERROR: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(feature = "calibration")]
+        Some("--log-bundle") => {
+            match operations::log_bundle::run_log_bundle(initial_args) {
+                Ok(output) => {
+                    if let Err(error) = std::io::stdout().write_all(&output) {
+                        eprintln!("ERROR: unable to write diagnostic bundle: {error}");
+                        std::process::exit(1);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("ERROR: {error}");
+                    std::process::exit(2);
+                }
+            }
+            return;
+        }
+        #[cfg(feature = "calibration")]
+        Some("--traffic-classifier") => {
+            match operations::traffic_classifier::run_traffic_classifier(initial_args) {
+                Ok(output) => print!("{output}"),
+                Err(error) => {
+                    eprintln!("ERROR: {error}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        #[cfg(feature = "calibration")]
+        Some("--pinger-plan") => {
+            match operations::pinger_plan::run_pinger_plan(initial_args) {
+                Ok(output) => print!("{output}"),
+                Err(error) => {
+                    print!("{}", operations::pinger_plan::error_json(&error));
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
         #[cfg(feature = "calibration")]
         Some("--autotune-proposal") => {
             if let Err(error) = run_autotune_proposal_cli(initial_args) {
@@ -13273,6 +13919,7 @@ fn main() {
             }
             return;
         }
+        #[cfg(feature = "transport-probes")]
         Some("--transport-probe") => {
             if let Err(error) = run_transport_probe_cli(initial_args) {
                 eprintln!("ERROR: {error}");
@@ -13303,6 +13950,25 @@ fn main() {
             if let Err(error) = operations::coordinator::run_native_apply_recovery(initial_args) {
                 eprintln!("ERROR: {error}");
                 std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(feature = "calibration")]
+        Some("--native-apply-worker") => {
+            if let Err(error) = operations::coordinator::run_native_apply_worker(initial_args) {
+                eprintln!("ERROR: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(feature = "calibration")]
+        Some("--calibration-service") => {
+            match operations::calibration_service::run_calibration_service(initial_args) {
+                Ok(output) => print!("{output}"),
+                Err(error) => {
+                    eprintln!("ERROR: {error}");
+                    std::process::exit(1);
+                }
             }
             return;
         }
@@ -16431,6 +17097,24 @@ esac\n",
             .unwrap(),
             None
         );
+        let mut stale = result.clone();
+        stale.failure_deadline_us = None;
+        let stale_request = test_autotune_capture_request(
+            2,
+            AutotuneCapturePhase::LoadedMeasurement,
+            MeasurementTopology::RawDownload,
+            Some(SpeedtestDirection::Download),
+        );
+        assert_eq!(
+            censored_autotune_transport_observation(&stale, Some(&stale_request), Some(&route),)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            censored_autotune_transport_observation(&stale, None, Some(&route)).unwrap(),
+            None
+        );
+
         let mut malformed = result;
         malformed.failure_deadline_us = None;
         assert!(

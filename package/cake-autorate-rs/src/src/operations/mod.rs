@@ -1,56 +1,204 @@
 //! Long-running calibration operations.
 //!
-//! The production coordinator owns native Full Auto-Tune and is progressively
-//! taking ownership of Rating, speed-test and scheduled calibration through
-//! separately gated request builders. Legacy helpers remain only where their
-//! production engine has not yet passed the same operation-specific gates.
+//! The production coordinator owns Full Auto-Tune, Rating, speed-test and
+//! scheduled calibration through separately gated native request builders.
 
+#[cfg(feature = "calibration")]
 pub mod autotune_apply;
+#[cfg(feature = "calibration")]
 pub mod autotune_apply_openwrt;
+#[cfg(feature = "calibration")]
 pub mod autotune_apply_runtime;
+#[cfg(feature = "calibration")]
 pub(crate) mod autotune_bootstrap_apply;
+#[cfg(feature = "calibration")]
 pub(crate) mod autotune_bootstrap_apply_recovery;
+#[cfg(feature = "calibration")]
 pub(crate) mod autotune_bootstrap_apply_runtime;
+#[cfg(feature = "calibration")]
 pub mod autotune_capture;
+#[cfg(feature = "calibration")]
 pub mod autotune_capture_policy;
+#[cfg(feature = "calibration")]
 pub mod autotune_capture_session;
+#[cfg(feature = "calibration")]
 pub mod autotune_counter;
+#[cfg(feature = "calibration")]
 pub mod autotune_managed_config;
+#[cfg(feature = "calibration")]
 pub mod autotune_public;
+#[cfg(feature = "calibration")]
 pub mod autotune_request;
+#[cfg(feature = "calibration")]
 pub mod autotune_runtime;
+#[cfg(feature = "calibration")]
 pub mod autotune_runtime_driver;
+#[cfg(feature = "calibration")]
 pub mod autotune_runtime_store;
+#[cfg(feature = "calibration")]
 pub(crate) mod autotune_uci_materialization;
 #[cfg(feature = "calibration")]
 pub(crate) mod bootstrap_runtime_owner;
 #[cfg(feature = "calibration")]
+pub(crate) mod calibration_service;
+#[cfg(feature = "calibration")]
 pub mod coordinator;
+pub(crate) mod cpu_profile;
+#[cfg(feature = "calibration")]
 pub mod event_loop;
+#[cfg(feature = "calibration")]
 pub mod full_autotune;
+#[cfg(feature = "calibration")]
 pub mod identity;
+#[cfg(feature = "calibration")]
 pub mod journal;
 pub(crate) mod json_wire;
+#[cfg(feature = "calibration")]
 pub mod kernel_topology;
+#[cfg(feature = "calibration")]
 pub(crate) mod kernel_topology_netlink;
+#[cfg(feature = "calibration")]
 pub mod lease;
+#[cfg(feature = "calibration")]
+pub(crate) mod log_bundle;
+#[cfg(feature = "calibration")]
+pub(crate) mod luci_config;
+#[cfg(feature = "calibration")]
+pub(crate) mod luci_readouts;
+#[cfg(feature = "calibration")]
+pub(crate) mod mqtt_control;
+#[cfg(feature = "calibration")]
+pub(crate) mod mqtt_publisher;
+#[cfg(feature = "calibration")]
+pub(crate) mod native_apply_coordinator;
+#[cfg(feature = "calibration")]
+pub(crate) mod native_apply_lifecycle;
+#[cfg(feature = "calibration")]
+pub(crate) mod pinger_plan;
+pub(crate) mod procd_control;
 pub mod process;
+#[cfg(feature = "calibration")]
 pub mod protocol;
+#[cfg(feature = "calibration")]
 pub mod rating;
+#[cfg(feature = "calibration")]
 pub mod rating_request;
+#[cfg(feature = "calibration")]
 pub mod runtime;
+pub(crate) mod runtime_health;
+#[cfg(feature = "calibration")]
 pub mod scheduler;
+#[cfg(feature = "calibration")]
 pub mod scheduler_config;
+#[cfg(feature = "calibration")]
+pub(crate) mod scheduler_owner;
+#[cfg(feature = "calibration")]
 pub mod scheduler_runtime;
+#[cfg(feature = "calibration")]
 pub(crate) mod scheduler_status;
+#[cfg(feature = "calibration")]
 pub mod scheduler_store;
+pub(crate) mod service_config;
+pub(crate) mod service_lifecycle;
+#[cfg(feature = "calibration")]
 pub mod speedtest;
+#[cfg(feature = "calibration")]
 pub mod speedtest_request;
+#[cfg(feature = "calibration")]
 pub mod sqm_identity;
+pub(crate) mod sqm_projection;
 pub mod sqm_recovery;
+pub(crate) mod sqm_recovery_openwrt;
+#[cfg(feature = "calibration")]
 pub mod state;
+#[cfg(feature = "calibration")]
+pub(crate) mod traffic_classifier;
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "calibration")))]
+mod lite_boundary_tests {
+    const SOURCE: &str = include_str!("mod.rs");
+
+    #[test]
+    fn lite_compiles_only_the_manual_runtime_operation_gate() {
+        let calibration_modules = [
+            "autotune_apply",
+            "autotune_apply_openwrt",
+            "autotune_apply_runtime",
+            "autotune_bootstrap_apply",
+            "autotune_bootstrap_apply_recovery",
+            "autotune_bootstrap_apply_runtime",
+            "autotune_capture",
+            "autotune_capture_policy",
+            "autotune_capture_session",
+            "autotune_counter",
+            "autotune_managed_config",
+            "autotune_public",
+            "autotune_request",
+            "autotune_runtime",
+            "autotune_runtime_driver",
+            "autotune_runtime_store",
+            "autotune_uci_materialization",
+            "bootstrap_runtime_owner",
+            "calibration_service",
+            "coordinator",
+            "event_loop",
+            "full_autotune",
+            "journal",
+            "kernel_topology",
+            "kernel_topology_netlink",
+            "lease",
+            "luci_config",
+            "luci_readouts",
+            "log_bundle",
+            "mqtt_control",
+            "mqtt_publisher",
+            "native_apply_lifecycle",
+            "pinger_plan",
+            "protocol",
+            "rating",
+            "rating_request",
+            "runtime",
+            "scheduler",
+            "scheduler_config",
+            "scheduler_owner",
+            "scheduler_runtime",
+            "scheduler_status",
+            "scheduler_store",
+            "speedtest",
+            "speedtest_request",
+            "sqm_identity",
+            "state",
+            "traffic_classifier",
+        ];
+        for module in calibration_modules {
+            let public = format!("#[cfg(feature = \"calibration\")]\npub mod {module};");
+            let crate_private =
+                format!("#[cfg(feature = \"calibration\")]\npub(crate) mod {module};");
+            let crate_private_allowed = format!(
+                "#[cfg(feature = \"calibration\")]\n#[allow(dead_code)]\npub(crate) mod {module};"
+            );
+            assert!(
+                SOURCE.contains(&public)
+                    || SOURCE.contains(&crate_private)
+                    || SOURCE.contains(&crate_private_allowed),
+                "calibration module {module} is not structurally feature-gated"
+            );
+        }
+
+        assert!(SOURCE.contains("pub mod sqm_recovery;"));
+        assert!(!SOURCE.contains("#[cfg(feature = \"calibration\")]\npub mod sqm_recovery;"));
+        assert!(SOURCE.contains("pub(crate) mod sqm_recovery_openwrt;"));
+        assert!(SOURCE.contains("pub(crate) mod json_wire;"));
+        assert!(SOURCE.contains("pub(crate) mod cpu_profile;"));
+        assert!(SOURCE.contains("pub(crate) mod runtime_health;"));
+        assert!(SOURCE.contains("pub mod process;"));
+        assert!(SOURCE.contains("pub(crate) mod procd_control;"));
+        assert!(SOURCE.contains("pub(crate) mod service_config;"));
+        assert!(SOURCE.contains("pub(crate) mod sqm_projection;"));
+    }
+}
+
+#[cfg(all(test, feature = "calibration"))]
 mod timer_ownership_tests {
     use std::collections::BTreeSet;
     use std::path::Path;
@@ -107,10 +255,19 @@ mod timer_ownership_tests {
             include_str!("autotune_uci_materialization.rs"),
         ),
         (
+            "native_apply_coordinator",
+            include_str!("native_apply_coordinator.rs"),
+        ),
+        (
             "bootstrap_runtime_owner",
             include_str!("bootstrap_runtime_owner.rs"),
         ),
+        (
+            "calibration_service",
+            include_str!("calibration_service.rs"),
+        ),
         ("coordinator", include_str!("coordinator.rs")),
+        ("cpu_profile", include_str!("cpu_profile.rs")),
         ("event_loop", include_str!("event_loop.rs")),
         ("full_autotune", include_str!("full_autotune.rs")),
         ("identity", include_str!("identity.rs")),
@@ -122,13 +279,29 @@ mod timer_ownership_tests {
             include_str!("kernel_topology_netlink.rs"),
         ),
         ("lease", include_str!("lease.rs")),
+        ("luci_config", include_str!("luci_config.rs")),
+        ("luci_readouts", include_str!("luci_readouts.rs")),
+        ("log_bundle", include_str!("log_bundle.rs")),
+        ("mqtt_control", include_str!("mqtt_control.rs")),
+        ("mqtt_publisher", include_str!("mqtt_publisher.rs")),
+        (
+            "native_apply_lifecycle",
+            include_str!("native_apply_lifecycle.rs"),
+        ),
         ("process", include_str!("process.rs")),
+        ("procd_control", include_str!("procd_control.rs")),
+        ("pinger_plan", include_str!("pinger_plan.rs")),
         ("protocol", include_str!("protocol.rs")),
         ("rating", include_str!("rating.rs")),
         ("rating_request", include_str!("rating_request.rs")),
         ("runtime", include_str!("runtime.rs")),
+        ("runtime_health", include_str!("runtime_health.rs")),
+        ("service_config", include_str!("service_config.rs")),
+        ("service_lifecycle", include_str!("service_lifecycle.rs")),
+        ("sqm_projection", include_str!("sqm_projection.rs")),
         ("scheduler", include_str!("scheduler.rs")),
         ("scheduler_config", include_str!("scheduler_config.rs")),
+        ("scheduler_owner", include_str!("scheduler_owner.rs")),
         ("scheduler_runtime", include_str!("scheduler_runtime.rs")),
         ("scheduler_status", include_str!("scheduler_status.rs")),
         ("scheduler_store", include_str!("scheduler_store.rs")),
@@ -136,7 +309,12 @@ mod timer_ownership_tests {
         ("speedtest_request", include_str!("speedtest_request.rs")),
         ("sqm_identity", include_str!("sqm_identity.rs")),
         ("sqm_recovery", include_str!("sqm_recovery.rs")),
+        (
+            "sqm_recovery_openwrt",
+            include_str!("sqm_recovery_openwrt.rs"),
+        ),
         ("state", include_str!("state.rs")),
+        ("traffic_classifier", include_str!("traffic_classifier.rs")),
     ];
 
     fn allowed_sleeps(module: &str) -> Vec<&'static str> {
@@ -147,6 +325,9 @@ mod timer_ownership_tests {
             "process" => vec![
                 "thread::sleep(WAIT_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));",
                 "thread::sleep(WAIT_INTERVAL.min(deadline.saturating_duration_since(now)));",
+            ],
+            "sqm_recovery_openwrt" => vec![
+                "thread::sleep(PROCESS_WAIT_INTERVAL.min(deadline.saturating_duration_since(now)));",
             ],
             "rating" => vec![
                 "thread::sleep(PERMIT_POLL_INTERVAL);",

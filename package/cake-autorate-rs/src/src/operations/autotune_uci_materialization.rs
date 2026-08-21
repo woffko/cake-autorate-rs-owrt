@@ -719,6 +719,55 @@ struct ParsedUciTargetSection {
     options: BTreeMap<Vec<u8>, ParsedUciValue>,
 }
 
+/// Compare one named scalar-only section against the exact committed config
+/// bytes that will be handed to a service runner.  This deliberately parses
+/// the file instead of calling `uci show`: the latter can merge an unrelated
+/// default savedir and therefore need not describe the bytes a private
+/// `UCI_CONFIG_DIR` consumer will enact.
+pub(crate) fn verify_scalar_uci_section(
+    config: &[u8],
+    section: &str,
+    expected: Option<(&str, &BTreeMap<String, String>)>,
+) -> Result<(), String> {
+    let actual = UciConfigParser::new(config, section.as_bytes())?.parse_optional()?;
+    let Some((expected_type, expected_options)) = expected else {
+        return if actual.is_none() {
+            Ok(())
+        } else {
+            Err("native UCI scalar target section unexpectedly exists".to_string())
+        };
+    };
+    let actual = actual.ok_or_else(|| "native UCI scalar target section is missing".to_string())?;
+    if actual.section_type.as_slice() != expected_type.as_bytes() {
+        return Err("native UCI scalar target section has the wrong type".to_string());
+    }
+    if actual.options.len() != expected_options.len() {
+        return Err("native UCI scalar target section has a missing or extra option".to_string());
+    }
+    for (option, expected_value) in expected_options {
+        match actual.options.get(option.as_bytes()) {
+            Some(ParsedUciValue::Scalar(actual_value))
+                if actual_value.as_slice() == expected_value.as_bytes() => {}
+            Some(ParsedUciValue::List(_)) => {
+                return Err(format!(
+                    "native UCI scalar target option {option} is a list"
+                ));
+            }
+            Some(ParsedUciValue::Scalar(_)) => {
+                return Err(format!(
+                    "native UCI scalar target option {option} has a different value"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "native UCI scalar target section is missing option {option}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_parsed_uci_name(label: &str, value: &[u8]) -> Result<(), String> {
     if value.is_empty()
         || value.len() > 64
@@ -1332,17 +1381,17 @@ mod tests {
     }
 
     #[test]
-    fn golden_125_action_plan_is_bound_ordered_and_deterministic() {
+    fn golden_124_action_plan_is_bound_ordered_and_deterministic() {
         let managed = managed_config(AutotuneProfile::BestOverall);
-        assert_eq!(managed.action_count(), 125);
+        assert_eq!(managed.action_count(), 124);
         assert_eq!(
             managed.canonical_sha256().unwrap(),
-            "3d146bba907d91f8900825066ac72db4383047b0bd562a181c75cd769b502474"
+            "78532dec5274f18e4c3380f18855d066585b0bfde7340e117c3ecf6fd826a0fa"
         );
 
         let plan = NativeUciMaterializationPlan::from_managed_config(&managed).unwrap();
-        assert_eq!(plan.logical_action_count(), 125);
-        assert_eq!(plan.command_count(), 157);
+        assert_eq!(plan.logical_action_count(), 124);
+        assert_eq!(plan.command_count(), 156);
         assert_eq!(
             plan.managed_config_sha256(),
             managed.canonical_sha256().unwrap()
@@ -1385,7 +1434,7 @@ mod tests {
         );
         assert_eq!(
             plan.canonical_sha256().unwrap(),
-            "820b1bd627e767307819e23e2fd2bebe72c061f148b42311cfd5f0aa867a217f"
+            "2553e5416db742b7888804c64974fb62e2dd791d4042d6781e302552b4eca56c"
         );
     }
 
@@ -1715,6 +1764,24 @@ mod tests {
                 .parse()
                 .is_err());
         }
+    }
+
+    #[test]
+    fn scalar_section_verifier_binds_committed_bytes_and_absence_exactly() {
+        let config = b"config queue 'cake_wan_sqm'\n\toption enabled '1'\n\toption interface 'wwan0'\nconfig queue 'foreign'\n\tlist item 'one'\n";
+        let expected = BTreeMap::from([
+            ("enabled".to_string(), "1".to_string()),
+            ("interface".to_string(), "wwan0".to_string()),
+        ]);
+        verify_scalar_uci_section(config, "cake_wan_sqm", Some(("queue", &expected))).unwrap();
+        verify_scalar_uci_section(config, "missing", None).unwrap();
+
+        let mut drifted = expected.clone();
+        drifted.insert("enabled".to_string(), "0".to_string());
+        assert!(
+            verify_scalar_uci_section(config, "cake_wan_sqm", Some(("queue", &drifted)),).is_err()
+        );
+        assert!(verify_scalar_uci_section(config, "cake_wan_sqm", None).is_err());
     }
 
     #[test]

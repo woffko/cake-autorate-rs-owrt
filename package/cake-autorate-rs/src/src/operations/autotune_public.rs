@@ -12,8 +12,9 @@ use super::sqm_identity;
 pub(crate) const NATIVE_PUBLIC_RESULT_SCHEMA_VERSION: u8 = 3;
 pub(crate) const NATIVE_RAW_FALLBACK_PUBLIC_RESULT_SCHEMA_VERSION: u8 = 4;
 pub(crate) const NATIVE_DIRECTIONAL_RAW_FALLBACK_PUBLIC_RESULT_SCHEMA_VERSION: u8 = 5;
+pub(crate) const NATIVE_SHAPED_CAPACITY_FALLBACK_PUBLIC_RESULT_SCHEMA_VERSION: u8 = 6;
 pub(crate) const NATIVE_PUBLIC_RESULT_MAX_SCHEMA_VERSION: u8 =
-    NATIVE_DIRECTIONAL_RAW_FALLBACK_PUBLIC_RESULT_SCHEMA_VERSION;
+    NATIVE_SHAPED_CAPACITY_FALLBACK_PUBLIC_RESULT_SCHEMA_VERSION;
 const NATIVE_PUBLIC_APPLY_CONTRACT_SCHEMA_VERSION: u8 = 3;
 const NATIVE_PUBLIC_RESULT_PRODUCER: &str = "cake-autorated-native-autotune";
 const MAX_NATIVE_PUBLIC_RESULT_BYTES: usize = 256 * 1024;
@@ -238,53 +239,76 @@ pub(crate) fn canonical_native_public_result_bytes(
             .iter()
             .find(|confirmation| confirmation.preferred)
             .ok_or_else(|| "native public raw fallback has no preferred option".to_string())?;
-        if preferred.option_id != "no_sqm"
-            || preferred.selected_topology != "no_sqm"
-            || preferred.action != "disable_sqm"
-            || preferred.sqm_direction_mode != "off"
-            || preferred.auto_apply_evidence_pass
-            || !preferred.manual_review_required
-        {
-            return Err(
-                "native public raw fallback has no exact manual SQM-off preference".to_string(),
-            );
-        }
-        match input.apply_confirmations.len() {
-            1 => NATIVE_RAW_FALLBACK_PUBLIC_RESULT_SCHEMA_VERSION,
-            2 => {
-                let directional = input
-                    .apply_confirmations
-                    .iter()
-                    .find(|confirmation| !confirmation.preferred)
-                    .ok_or_else(|| {
-                        "native public directional raw fallback has no secondary option".to_string()
-                    })?;
-                if directional.option_id != "bypass_download"
-                    || directional.selected_topology != "upload_only_shaped"
-                    || directional.action != "apply_sqm"
-                    || directional.sqm_direction_mode != "upload_only"
-                    || directional.auto_apply_evidence_pass
-                    || !directional.manual_review_required
-                    || directional.download_kbps.is_some()
-                    || directional.upload_kbps.is_none()
-                    || !directional
-                        .required_acknowledgements
-                        .contains(&NativeApplyAcknowledgement::DownloadShapingBypassed)
-                    || directional
-                        .required_acknowledgements
-                        .contains(&NativeApplyAcknowledgement::UploadShapingBypassed)
-                    || directional
-                        .required_acknowledgements
-                        .contains(&NativeApplyAcknowledgement::SqmDisabled)
-                {
-                    return Err(
-                        "native public directional raw fallback option is invalid".to_string()
-                    );
-                }
-                NATIVE_DIRECTIONAL_RAW_FALLBACK_PUBLIC_RESULT_SCHEMA_VERSION
+        if preferred.option_id == "capacity_only_shaped" {
+            if input.apply_confirmations.len() != 1
+                || preferred.selected_topology != "both_shaped"
+                || preferred.action != "apply_sqm"
+                || preferred.sqm_direction_mode != "both"
+                || preferred.auto_apply_evidence_pass
+                || !preferred.manual_review_required
+                || preferred.download_kbps.is_none()
+                || preferred.upload_kbps.is_none()
+                || preferred.required_acknowledgements
+                    != [
+                        NativeApplyAcknowledgement::LoadedLatencyUnobservable,
+                        NativeApplyAcknowledgement::ShapedValidationIncomplete,
+                    ]
+            {
+                return Err("native public shaped-capacity fallback option is invalid".to_string());
             }
-            _ => {
-                return Err("native public raw fallback has an unsupported option count".to_string())
+            NATIVE_SHAPED_CAPACITY_FALLBACK_PUBLIC_RESULT_SCHEMA_VERSION
+        } else {
+            if preferred.option_id != "no_sqm"
+                || preferred.selected_topology != "no_sqm"
+                || preferred.action != "disable_sqm"
+                || preferred.sqm_direction_mode != "off"
+                || preferred.auto_apply_evidence_pass
+                || !preferred.manual_review_required
+            {
+                return Err(
+                    "native public raw fallback has no exact manual SQM-off preference".to_string(),
+                );
+            }
+            match input.apply_confirmations.len() {
+                1 => NATIVE_RAW_FALLBACK_PUBLIC_RESULT_SCHEMA_VERSION,
+                2 => {
+                    let directional = input
+                        .apply_confirmations
+                        .iter()
+                        .find(|confirmation| !confirmation.preferred)
+                        .ok_or_else(|| {
+                            "native public directional raw fallback has no secondary option"
+                                .to_string()
+                        })?;
+                    if directional.option_id != "bypass_download"
+                        || directional.selected_topology != "upload_only_shaped"
+                        || directional.action != "apply_sqm"
+                        || directional.sqm_direction_mode != "upload_only"
+                        || directional.auto_apply_evidence_pass
+                        || !directional.manual_review_required
+                        || directional.download_kbps.is_some()
+                        || directional.upload_kbps.is_none()
+                        || !directional
+                            .required_acknowledgements
+                            .contains(&NativeApplyAcknowledgement::DownloadShapingBypassed)
+                        || directional
+                            .required_acknowledgements
+                            .contains(&NativeApplyAcknowledgement::UploadShapingBypassed)
+                        || directional
+                            .required_acknowledgements
+                            .contains(&NativeApplyAcknowledgement::SqmDisabled)
+                    {
+                        return Err(
+                            "native public directional raw fallback option is invalid".to_string()
+                        );
+                    }
+                    NATIVE_DIRECTIONAL_RAW_FALLBACK_PUBLIC_RESULT_SCHEMA_VERSION
+                }
+                _ => {
+                    return Err(
+                        "native public raw fallback has an unsupported option count".to_string()
+                    )
+                }
             }
         }
     } else {
@@ -652,6 +676,19 @@ mod tests {
         }
     }
 
+    fn raw_fallback_artifacts(schema_version: u8) -> Vec<VerifiedNativeArtifact> {
+        vec![
+            artifact(
+                NativeArtifactKind::Proposal,
+                r#"{"schema_version":4,"download":{"base_kbps":904900},"upload":{"base_kbps":915600}}"#,
+            ),
+            artifact(
+                NativeArtifactKind::RawFallback,
+                &format!("{{\"schema_version\":{schema_version}}}"),
+            ),
+        ]
+    }
+
     #[test]
     fn public_projection_is_confirmation_ready_and_preserves_exact_rates() {
         let request = request();
@@ -692,6 +729,93 @@ mod tests {
         assert!(output.contains("\"transport_timeout_total_us\":15000000"));
         assert!(!output.contains("723920"));
         assert!(!output.contains("732480"));
+    }
+
+    #[test]
+    fn shaped_capacity_fallback_has_an_exact_public_schema_six_contract() {
+        let request = request();
+        let artifacts = raw_fallback_artifacts(6);
+        let mut confirmation = confirmation();
+        confirmation.option_id = "capacity_only_shaped".to_string();
+        confirmation.selected_topology = "both_shaped".to_string();
+        confirmation.action = "apply_sqm";
+        confirmation.sqm_direction_mode = "both";
+        confirmation.required_acknowledgements = vec![
+            NativeApplyAcknowledgement::LoadedLatencyUnobservable,
+            NativeApplyAcknowledgement::ShapedValidationIncomplete,
+        ];
+        confirmation.download_kbps = Some(892_100);
+        confirmation.upload_kbps = Some(910_000);
+
+        let bytes = canonical_native_public_result_bytes(NativePublicResultInput {
+            request: &request,
+            worker_run_id: &"66".repeat(16),
+            review_digest: &"77".repeat(32),
+            apply_confirmations: std::slice::from_ref(&confirmation),
+            consumed_traffic_bytes: 1,
+            artifacts: &artifacts,
+        })
+        .unwrap();
+        let output = String::from_utf8(bytes).unwrap();
+        assert!(output.contains("\"native_public_schema_version\":6"));
+        assert!(output.contains("\"option_id\":\"capacity_only_shaped\""));
+        assert!(output.contains("\"target_rates_kbps\":{\"download\":892100,\"upload\":910000}"));
+        assert!(output.contains(concat!(
+            "\"required_acknowledgements\":[",
+            "\"loaded-latency-unobservable\",",
+            "\"shaped-validation-incomplete\"]"
+        )));
+
+        let mut missing_acknowledgement = confirmation.clone();
+        missing_acknowledgement.required_acknowledgements.pop();
+        assert!(
+            canonical_native_public_result_bytes(NativePublicResultInput {
+                request: &request,
+                worker_run_id: &"66".repeat(16),
+                review_digest: &"77".repeat(32),
+                apply_confirmations: std::slice::from_ref(&missing_acknowledgement),
+                consumed_traffic_bytes: 1,
+                artifacts: &artifacts,
+            })
+            .unwrap_err()
+            .contains("shaped-capacity fallback")
+        );
+
+        let mut wrong_topology = confirmation.clone();
+        wrong_topology.selected_topology = "upload_only_shaped".to_string();
+        assert!(
+            canonical_native_public_result_bytes(NativePublicResultInput {
+                request: &request,
+                worker_run_id: &"66".repeat(16),
+                review_digest: &"77".repeat(32),
+                apply_confirmations: std::slice::from_ref(&wrong_topology),
+                consumed_traffic_bytes: 1,
+                artifacts: &artifacts,
+            })
+            .is_err()
+        );
+
+        let mut extra = confirmation.clone();
+        extra.option_id = "no_sqm".to_string();
+        extra.preferred = false;
+        extra.selected_topology = "no_sqm".to_string();
+        extra.action = "disable_sqm";
+        extra.sqm_direction_mode = "off";
+        extra.required_acknowledgements = vec![NativeApplyAcknowledgement::SqmDisabled];
+        extra.download_kbps = None;
+        extra.upload_kbps = None;
+        assert!(
+            canonical_native_public_result_bytes(NativePublicResultInput {
+                request: &request,
+                worker_run_id: &"66".repeat(16),
+                review_digest: &"77".repeat(32),
+                apply_confirmations: &[confirmation, extra],
+                consumed_traffic_bytes: 1,
+                artifacts: &artifacts,
+            })
+            .unwrap_err()
+            .contains("shaped-capacity fallback")
+        );
     }
 
     #[test]

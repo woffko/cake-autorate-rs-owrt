@@ -25,7 +25,7 @@ const settingsSource = fs.readFileSync(path.join(
 	'cake-autorate-rs',
 	'settings.js',
 ), 'utf8');
-const rpcdHelperSource = fs.readFileSync(path.join(
+const retiredRpcdHelper = path.join(
 	__dirname,
 	'..',
 	'root',
@@ -33,16 +33,7 @@ const rpcdHelperSource = fs.readFileSync(path.join(
 	'libexec',
 	'cake-autorate-rs',
 	'rpcd-helper',
-), 'utf8');
-const applyGuardSource = fs.readFileSync(path.join(
-	__dirname,
-	'..',
-	'root',
-	'usr',
-	'libexec',
-	'cake-autorate-rs',
-	'apply-guard',
-), 'utf8');
+);
 const group = document['luci-app-cake-autorate-rs'];
 
 assert(group, 'CAKE Autorate ACL group is missing');
@@ -62,25 +53,67 @@ assert.deepStrictEqual(
 	'Guarded apply reconciliation needs per-package revert while the write.uci scope confines it to cake-autorate and sqm',
 );
 assert.deepStrictEqual(
-	group.read.file['/usr/libexec/cake-autorate-rs/runtime-health'],
+	group.read.file['/usr/sbin/cake-autorated --runtime-health'],
 	[ 'exec' ],
-	'Status must have read-only execution access to the runtime reconciliation helper',
+	'Status must have exact read-only execution access to native runtime reconciliation',
 );
+assert.equal(group.read.file['/usr/libexec/cake-autorate-rs/runtime-health'], undefined,
+	'the retired shell runtime-health helper must have no browser ACL authority');
+for (const command of [
+	'/usr/sbin/cake-autorated --package-versions',
+	'/usr/sbin/cake-autorated --mwan3-info',
+	'/usr/sbin/cake-autorated --graph-history *',
+	'/usr/sbin/cake-autorated --log-bundle *',
+])
+	assert.deepStrictEqual(group.read.file[command], [ 'exec' ],
+		`native LuCI readout ACL is missing: ${command}`);
+for (const command of [
+	'/usr/libexec/cake-autorate-rs/package-versions',
+	'/usr/libexec/cake-autorate-rs/mwan3-info',
+	'/usr/libexec/cake-autorate-rs/graph-history *',
+	'/usr/libexec/cake-autorate-rs/log-bundle *',
+]) {
+	assert.equal(group.read.file[command], undefined,
+		`retired LuCI readout retains read authority: ${command}`);
+	assert.equal(group.write.file[command], undefined,
+		`retired LuCI readout retains write authority: ${command}`);
+}
+assert.equal(group.write.file['/usr/libexec/cake-autorate-rs/status-columns *'], undefined,
+	'the retired Status column helper must not retain root-exec authority');
+assert.deepStrictEqual(group.write.file['/usr/sbin/cake-autorated --status-columns *'],
+	[ 'exec' ], 'Status columns must use the native bounded commit endpoint');
+assert.deepStrictEqual(group.read.file['/usr/sbin/cake-autorated --mqtt-status *'],
+	[ 'exec' ], 'MQTT readiness must use the native read-only endpoint');
+assert.equal(group.write.file['/usr/sbin/cake-autorated --mqtt-status *'], undefined,
+	'MQTT readiness no longer needs package-install or write authority');
+assert.equal(group.write.file['/usr/libexec/cake-autorate-rs/mqtt-status *'], undefined,
+	'the retired MQTT shell helper must not retain root-exec authority');
+for (const command of Object.keys(group.write.file).concat(Object.keys(group.read.file)))
+	assert.doesNotMatch(command, /cake-autorate-mqtt/,
+		'the retired second MQTT init service must have no browser ACL authority');
+assert.equal(group.read.file['/usr/libexec/cake-autorate-rs/autotune-scheduler status *'],
+	undefined, 'the retired shell scheduler must have no browser ACL authority');
+assert.deepStrictEqual(group.write.file['/usr/sbin/cake-autorated --pinger-plan *'],
+	[ 'exec' ], 'the pinger wizard must use the native bounded planner');
+assert.equal(group.write.file['/usr/libexec/cake-autorate-rs/pinger-plan *'], undefined,
+	'the retired shell pinger planner must have no browser ACL authority');
 assert.deepStrictEqual(
-	group.read.file['/usr/libexec/cake-autorate-rs/autotune-scheduler status *'],
-	[ 'exec' ],
-	'Status must be able to read scheduler state and traffic budgets without write access',
-);
-assert.deepStrictEqual(
-	group.read.file['/usr/libexec/cake-autorate-rs/traffic-classifier status'],
+	group.read.file['/usr/sbin/cake-autorated --traffic-classifier status'],
 	[ 'exec' ],
 	'Traffic priorities must retain read-only global classifier diagnostics',
 );
 assert.deepStrictEqual(
-	group.read.file['/usr/libexec/cake-autorate-rs/traffic-classifier status *'],
+	group.read.file['/usr/sbin/cake-autorated --traffic-classifier status *'],
 	[ 'exec' ],
 	'Traffic priorities must only receive read-only access to instance-scoped classifier status',
 );
+for (const retired of [
+	'/usr/libexec/cake-autorate-rs/traffic-classifier presets',
+	'/usr/libexec/cake-autorate-rs/traffic-classifier status',
+	'/usr/libexec/cake-autorate-rs/traffic-classifier status *',
+])
+	assert.equal(group.read.file[retired], undefined,
+		'the retired shell classifier must have no browser ACL authority');
 for (const command of [
 	'/usr/sbin/cake-autorated --calibrationctl summary',
 	'/usr/sbin/cake-autorated --calibrationctl rating-current *',
@@ -93,6 +126,9 @@ for (const command of [
 	'/usr/sbin/cake-autorated --calibrationctl autotune-status *',
 	'/usr/sbin/cake-autorated --calibrationctl autotune-result *',
 	'/usr/sbin/cake-autorated --calibrationctl autotune-apply-check *',
+	'/usr/sbin/cake-autorated --calibrationctl autotune-apply-status *',
+	'/usr/sbin/cake-autorated --calibrationctl autotune-apply-watch *',
+	'/usr/sbin/cake-autorated --calibrationctl autotune-apply-result *',
 	'/usr/sbin/cake-autorated --calibrationctl scheduler-status',
 ]) {
 	assert.deepStrictEqual(group.read.file[command], [ 'exec' ],
@@ -102,10 +138,11 @@ for (const command of [
 	'/usr/sbin/cake-autorated --calibrationctl autotune-start *',
 	'/usr/sbin/cake-autorated --calibrationctl autotune-bootstrap-start *',
 	'/usr/sbin/cake-autorated --calibrationctl autotune-cancel *',
-	'/usr/sbin/cake-autorated --calibrationctl autotune-apply *',
+	'/usr/sbin/cake-autorated --calibrationctl autotune-apply-start *',
 	'/usr/sbin/cake-autorated --calibrationctl rating-start *',
 	'/usr/sbin/cake-autorated --calibrationctl rating-cancel *',
 	'/usr/sbin/cake-autorated --calibrationctl speedtest-start *',
+	'/usr/sbin/cake-autorated --calibrationctl speedtest-bootstrap-start *',
 	'/usr/sbin/cake-autorated --calibrationctl speedtest-cancel *',
 	'/usr/sbin/cake-autorated --calibrationctl scheduler-acknowledge-accounting *',
 ]) {
@@ -118,68 +155,12 @@ assert.equal(group.read.file['/usr/sbin/cake-autorated --calibrationctl schedule
 	'Native scheduler status is one exact zero-argument batch read, never an instance wildcard');
 assert.equal(group.write.file['/usr/sbin/cake-autorated --calibrationctl *'], undefined,
 	'Native coordinator write access must never use a broad calibrationctl wildcard');
+assert.equal(group.write.file['/usr/sbin/cake-autorated --calibrationctl autotune-apply *'], undefined,
+	'the retired synchronous Apply command must have no browser mutation authority');
 assert.equal(group.write.file['/usr/libexec/cake-autorate-rs/quality-test *'], undefined,
 	'LuCI must not retain a competing shell Rating mutation path after native cutover');
-const rpcdCommands = [
-	'/usr/libexec/cake-autorate-rs/rpcd-helper speedtest-job-start *',
-	'/usr/libexec/cake-autorate-rs/rpcd-helper speedtest-job-status *',
-	'/usr/libexec/cake-autorate-rs/rpcd-helper speedtest-status *',
-	'/usr/libexec/cake-autorate-rs/rpcd-helper speedtest-install *',
-	'/usr/libexec/cake-autorate-rs/rpcd-helper autotune-start *',
-	'/usr/libexec/cake-autorate-rs/rpcd-helper autotune-start-conservative *',
-	'/usr/libexec/cake-autorate-rs/rpcd-helper autotune-status-summary *',
-	'/usr/libexec/cake-autorate-rs/rpcd-helper autotune-result *',
-	'/usr/libexec/cake-autorate-rs/rpcd-helper autotune-cancel *',
-	'/usr/libexec/cake-autorate-rs/rpcd-helper autotune-status *',
-	'/usr/libexec/cake-autorate-rs/rpcd-helper autotune-attest *',
-	'/usr/libexec/cake-autorate-rs/rpcd-helper apply-guard-arm *',
-	'/usr/libexec/cake-autorate-rs/rpcd-helper apply-guard-abort *',
-	'/usr/libexec/cake-autorate-rs/rpcd-helper apply-guard-verify-rollback *',
-	'/usr/libexec/cake-autorate-rs/rpcd-helper apply-guard-finalize *',
-	'/usr/libexec/cake-autorate-rs/rpcd-helper apply-guard-reconcile *',
-	'/usr/libexec/cake-autorate-rs/rpcd-helper apply-guard-status *',
-];
-for (const command of rpcdCommands) {
-	assert.deepStrictEqual(group.write.file[command], [ 'exec' ],
-		`Required gradual-cutover helper verb is missing: ${command}`);
-	const operation = command.split(' ')[1];
-	assert.match(settingsSource, new RegExp(`["']${operation}["']`),
-		`ACL operation has no LuCI caller: ${operation}`);
-}
-const aclOperations = rpcdCommands.map(command => command.split(' ')[1]).sort();
-const dispatcherOperations = Array.from(rpcdHelperSource.matchAll(
-	/^\t([a-z][a-z0-9-]*)\)\n/gm,
-), match => match[1]).sort();
-assert.deepStrictEqual(dispatcherOperations, aclOperations,
-	'every dispatcher operation must have exactly one matching ACL entry and vice versa');
-const expectedApplyGuardOperations = [
-	'apply-guard-abort',
-	'apply-guard-arm',
-	'apply-guard-finalize',
-	'apply-guard-reconcile',
-	'apply-guard-status',
-	'apply-guard-verify-rollback',
-];
-assert.deepStrictEqual(
-	aclOperations.filter(operation => operation.startsWith('apply-guard-')),
-	expectedApplyGuardOperations,
-	'ACL must expose exactly the six browser-owned Apply Guard operations',
-);
-assert.deepStrictEqual(
-	dispatcherOperations.filter(operation => operation.startsWith('apply-guard-')),
-	expectedApplyGuardOperations,
-	'dispatcher must expose exactly the six browser-owned Apply Guard operations',
-);
-const dispatcherApplyBackends = rpcdHelperSource.match(
-	/case "\$\{3:-\}" in ([A-Za-z0-9|-]+)\)/,
-);
-const guardApplyBackends = applyGuardSource.match(
-	/safe_backend\(\) \{\s*case "\$1" in ([A-Za-z0-9|-]+)\)/,
-);
-assert(dispatcherApplyBackends && guardApplyBackends,
-	'Apply Guard backend allowlists must remain structurally visible');
-assert.equal(dispatcherApplyBackends[1], guardApplyBackends[1],
-	'rpcd dispatcher and Apply Guard must accept the same backend set');
+assert.equal(fs.existsSync(retiredRpcdHelper), false,
+	'the retired one-operation rpcd shell dispatcher must not remain shipped');
 assert.equal(group.write.file['/usr/libexec/cake-autorate-rs/speedtest *'], undefined,
 	'Legacy Speed Test must not expose worker, recovery, or arbitrary helper verbs');
 assert.equal(group.write.file['/usr/libexec/cake-autorate-rs/autotune *'], undefined,
@@ -187,12 +168,12 @@ assert.equal(group.write.file['/usr/libexec/cake-autorate-rs/autotune *'], undef
 assert.equal(group.write.file['/usr/libexec/cake-autorate-rs/apply-guard *'], undefined,
 	'LuCI must not expose internal Apply Guard recovery and supervisor verbs');
 assert.equal(group.write.file['/usr/libexec/cake-autorate-rs/rpcd-helper *'], undefined,
-	'The rpcd dispatcher operation must be pinned before any wildcard');
+	'the retired rpcd dispatcher must not retain wildcard authority');
 assert.deepStrictEqual(
 	Object.keys(group.write.file).filter((command) =>
 		command.startsWith('/usr/libexec/cake-autorate-rs/rpcd-helper ')).sort(),
-	rpcdCommands.slice().sort(),
-	'Only reviewed and positionally pinned migration operations may remain reachable through rpcd',
+	[],
+	'no retired shell migration operation may remain reachable through rpcd',
 );
 assert.deepStrictEqual(
 	Object.keys(group.write.file).filter(command =>
@@ -203,5 +184,9 @@ assert.deepStrictEqual(
 assert.doesNotMatch(settingsSource,
 	/fs\.exec\(['"]\/usr\/libexec\/cake-autorate-rs\/(?:speedtest|autotune|apply-guard)['"]/,
 	'LuCI must not bypass the positionally pinned rpcd dispatcher');
+assert.match(settingsSource, /fs\.exec\('\/usr\/sbin\/cake-autorated', \[\n\s*'--pinger-plan'/,
+	'LuCI must call the native pinger planner directly');
+assert.doesNotMatch(settingsSource, /\/usr\/libexec\/cake-autorate-rs\/pinger-plan/,
+	'LuCI must not retain the retired shell pinger planner path');
 
 console.log('ACL tests passed');

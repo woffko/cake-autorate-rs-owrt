@@ -17,6 +17,7 @@ use std::sync::{Mutex, OnceLock};
 
 use super::scheduler::{validate_scheduler_instance, SchedulerInstanceState};
 
+pub(crate) const PRODUCTION_SCHEDULER_STORE_ROOT: &str = "/etc/cake-autorate-rs-scheduler";
 const LOCK_FILE: &str = ".scheduler.lock";
 const STATE_PREFIX: &str = "instance-";
 const RECORD_SUFFIX: &str = ".state";

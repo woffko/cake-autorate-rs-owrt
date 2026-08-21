@@ -15,6 +15,7 @@ use std::collections::BTreeSet;
 pub(crate) const NATIVE_APPLY_MANIFEST_SCHEMA_VERSION: u8 = 4;
 pub(crate) const NATIVE_RAW_FALLBACK_APPLY_MANIFEST_SCHEMA_VERSION: u8 = 5;
 pub(crate) const NATIVE_DIRECTIONAL_RAW_FALLBACK_APPLY_MANIFEST_SCHEMA_VERSION: u8 = 6;
+pub(crate) const NATIVE_SHAPED_CAPACITY_FALLBACK_APPLY_MANIFEST_SCHEMA_VERSION: u8 = 9;
 pub(crate) const MAX_NATIVE_APPLY_MANIFEST_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_NATIVE_APPLY_UCI_MUTATIONS: usize = 96;
 pub(crate) const MAX_NATIVE_APPLY_ACKNOWLEDGEMENTS: usize = 24;
@@ -47,6 +48,9 @@ pub(crate) enum NativeApplyAcknowledgement {
     UploadShapingBypassed,
     SqmDisabled,
     TopologyComparisonTrafficBudget,
+    LoadedLatencyUnobservable,
+    ShapedValidationIncomplete,
+    TopologyComparisonUnmeasurable,
 }
 
 impl NativeApplyAcknowledgement {
@@ -76,6 +80,9 @@ impl NativeApplyAcknowledgement {
             Self::UploadShapingBypassed => "upload-shaping-bypassed",
             Self::SqmDisabled => "sqm-disabled",
             Self::TopologyComparisonTrafficBudget => "topology-comparison-traffic-budget",
+            Self::LoadedLatencyUnobservable => "loaded-latency-unobservable",
+            Self::ShapedValidationIncomplete => "shaped-validation-incomplete",
+            Self::TopologyComparisonUnmeasurable => "topology-comparison-unmeasurable",
         }
     }
 
@@ -105,6 +112,9 @@ impl NativeApplyAcknowledgement {
             "upload-shaping-bypassed" => Self::UploadShapingBypassed,
             "sqm-disabled" => Self::SqmDisabled,
             "topology-comparison-traffic-budget" => Self::TopologyComparisonTrafficBudget,
+            "loaded-latency-unobservable" => Self::LoadedLatencyUnobservable,
+            "shaped-validation-incomplete" => Self::ShapedValidationIncomplete,
+            "topology-comparison-unmeasurable" => Self::TopologyComparisonUnmeasurable,
             _ => return None,
         })
     }
@@ -223,6 +233,21 @@ pub(crate) struct NativeDirectionalRawFallbackApplyManifestInput<'a> {
     pub raw_fallback_digest: &'a str,
 }
 
+pub(crate) struct NativeShapedCapacityFallbackApplyManifestInput<'a> {
+    pub option_id: &'a str,
+    pub request: &'a OperationRequest,
+    pub worker_run_id: &'a str,
+    pub review_digest: &'a str,
+    pub coordinator_boot_id: &'a str,
+    pub coordinator_generation: &'a str,
+    pub proposal: &'a AutotuneProposal,
+    pub selected_dl_kbps: u64,
+    pub selected_ul_kbps: u64,
+    pub required_acknowledgements: &'a [NativeApplyAcknowledgement],
+    pub proposal_digest: &'a str,
+    pub fallback_digest: &'a str,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CanonicalDirection {
     pub(crate) mode: NativeApplyDirectionMode,
@@ -339,6 +364,10 @@ pub(crate) enum NativeApplyArtifactDigestsOwned {
     DirectionalRawFallbackV6 {
         proposal: String,
         raw_fallback: String,
+    },
+    ShapedCapacityFallbackV9 {
+        proposal: String,
+        fallback: String,
     },
 }
 
@@ -486,12 +515,14 @@ pub(crate) struct NativeApplyV5Identity {
 }
 
 pub(crate) type NativeApplyV6Identity = NativeApplyV5Identity;
+pub(crate) type NativeApplyV9Identity = NativeApplyV5Identity;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum NativeApplyAuthorityIdentity {
     ShapedV4(NativeApplyV4Identity),
     RawFallbackV5(NativeApplyV5Identity),
     DirectionalRawFallbackV6(NativeApplyV6Identity),
+    ShapedCapacityFallbackV9(NativeApplyV9Identity),
 }
 
 impl NativeApplyAuthorityIdentity {
@@ -500,6 +531,7 @@ impl NativeApplyAuthorityIdentity {
             Self::ShapedV4(value) => value.schema_version,
             Self::RawFallbackV5(value) => value.schema_version,
             Self::DirectionalRawFallbackV6(value) => value.schema_version,
+            Self::ShapedCapacityFallbackV9(value) => value.schema_version,
         }
     }
 
@@ -508,6 +540,7 @@ impl NativeApplyAuthorityIdentity {
             Self::ShapedV4(value) => &value.job_id,
             Self::RawFallbackV5(value) => &value.job_id,
             Self::DirectionalRawFallbackV6(value) => &value.job_id,
+            Self::ShapedCapacityFallbackV9(value) => &value.job_id,
         }
     }
 
@@ -516,6 +549,7 @@ impl NativeApplyAuthorityIdentity {
             Self::ShapedV4(value) => &value.worker_run_id,
             Self::RawFallbackV5(value) => &value.worker_run_id,
             Self::DirectionalRawFallbackV6(value) => &value.worker_run_id,
+            Self::ShapedCapacityFallbackV9(value) => &value.worker_run_id,
         }
     }
 
@@ -524,6 +558,7 @@ impl NativeApplyAuthorityIdentity {
             Self::ShapedV4(value) => &value.option_id,
             Self::RawFallbackV5(value) => &value.option_id,
             Self::DirectionalRawFallbackV6(value) => &value.option_id,
+            Self::ShapedCapacityFallbackV9(value) => &value.option_id,
         }
     }
 
@@ -532,6 +567,7 @@ impl NativeApplyAuthorityIdentity {
             Self::ShapedV4(value) => &value.source_review_sha256,
             Self::RawFallbackV5(value) => &value.source_review_sha256,
             Self::DirectionalRawFallbackV6(value) => &value.source_review_sha256,
+            Self::ShapedCapacityFallbackV9(value) => &value.source_review_sha256,
         }
     }
 
@@ -540,6 +576,7 @@ impl NativeApplyAuthorityIdentity {
             Self::ShapedV4(value) => &value.candidate_id,
             Self::RawFallbackV5(value) => &value.candidate_id,
             Self::DirectionalRawFallbackV6(value) => &value.candidate_id,
+            Self::ShapedCapacityFallbackV9(value) => &value.candidate_id,
         }
     }
 
@@ -548,6 +585,7 @@ impl NativeApplyAuthorityIdentity {
             Self::ShapedV4(value) => &value.manifest_sha256,
             Self::RawFallbackV5(value) => &value.manifest_sha256,
             Self::DirectionalRawFallbackV6(value) => &value.manifest_sha256,
+            Self::ShapedCapacityFallbackV9(value) => &value.manifest_sha256,
         }
     }
 }
@@ -563,6 +601,9 @@ impl NativeApplyExecutionPlan {
             }
             NativeApplyArtifactDigestsOwned::DirectionalRawFallbackV6 { .. } => {
                 NATIVE_DIRECTIONAL_RAW_FALLBACK_APPLY_MANIFEST_SCHEMA_VERSION
+            }
+            NativeApplyArtifactDigestsOwned::ShapedCapacityFallbackV9 { .. } => {
+                NATIVE_SHAPED_CAPACITY_FALLBACK_APPLY_MANIFEST_SCHEMA_VERSION
             }
         }
     }
@@ -836,6 +877,104 @@ impl NativeApplyExecutionPlan {
         Ok(value)
     }
 
+    pub(crate) fn from_verified_shaped_capacity_fallback(
+        input: NativeShapedCapacityFallbackApplyManifestInput<'_>,
+    ) -> Result<Self, String> {
+        if input.option_id != "capacity_only_shaped"
+            || input.selected_dl_kbps == 0
+            || input.selected_ul_kbps == 0
+        {
+            return Err(
+                "native shaped-capacity fallback input is not an exact shaped pair".to_string(),
+            );
+        }
+        for (label, digest) in [
+            ("proposal", input.proposal_digest),
+            ("shaped capacity fallback", input.fallback_digest),
+        ] {
+            require_lower_hex(&format!("native Apply {label} digest"), digest, 64)?;
+        }
+        let mut acknowledgements = input.required_acknowledgements.to_vec();
+        acknowledgements.sort_unstable();
+        acknowledgements.dedup();
+        if acknowledgements != input.required_acknowledgements
+            || acknowledgements
+                != [
+                    NativeApplyAcknowledgement::LoadedLatencyUnobservable,
+                    NativeApplyAcknowledgement::ShapedValidationIncomplete,
+                ]
+            || acknowledgements.iter().any(|value| {
+                matches!(
+                    value,
+                    NativeApplyAcknowledgement::DownloadShapingBypassed
+                        | NativeApplyAcknowledgement::UploadShapingBypassed
+                        | NativeApplyAcknowledgement::SqmDisabled
+                )
+            })
+        {
+            return Err(
+                "native shaped-capacity fallback acknowledgements are not exact".to_string(),
+            );
+        }
+        let placeholder = NativeApplyArtifactDigests {
+            proposal: input.proposal_digest,
+            download_search: input.fallback_digest,
+            upload_search: input.fallback_digest,
+            pair_confirmation: input.fallback_digest,
+            topology_comparison: input.fallback_digest,
+        };
+        let mut value = Self::from_verified_input(NativeApplyManifestInput {
+            option_id: input.option_id,
+            request: input.request,
+            worker_run_id: input.worker_run_id,
+            review_digest: input.review_digest,
+            coordinator_boot_id: input.coordinator_boot_id,
+            coordinator_generation: input.coordinator_generation,
+            selected_topology: "both_shaped",
+            action: NativeApplyAction::ApplySqm,
+            sqm_direction_mode: NativeSqmDirectionMode::Both,
+            download: NativeApplyDirectionInput {
+                mode: NativeApplyDirectionMode::Shaped,
+                selected_kbps: Some(input.selected_dl_kbps),
+                measured_runtime_minimum_kbps: None,
+                proposal: input.proposal.download,
+            },
+            upload: NativeApplyDirectionInput {
+                mode: NativeApplyDirectionMode::Shaped,
+                selected_kbps: Some(input.selected_ul_kbps),
+                measured_runtime_minimum_kbps: None,
+                proposal: input.proposal.upload,
+            },
+            proposal: input.proposal,
+            auto_apply_evidence_pass: false,
+            manual_review_required: true,
+            required_acknowledgements: input.required_acknowledgements,
+            artifacts: placeholder,
+        })?;
+        for direction in [&mut value.download, &mut value.upload] {
+            let selected = direction.base_kbps.ok_or_else(|| {
+                "native shaped-capacity fallback lost its selected rate".to_string()
+            })?;
+            direction.tested_safe_maximum_kbps = Some(0);
+            direction.adaptive_cap_kbps = Some(selected);
+            direction.ceiling_evidence = Some("legacy_unverified");
+        }
+        value.artifacts = NativeApplyArtifactDigestsOwned::ShapedCapacityFallbackV9 {
+            proposal: input.proposal_digest.to_string(),
+            fallback: input.fallback_digest.to_string(),
+        };
+        value.uci_mutations = native_apply_uci_mutations(
+            &value.request,
+            value.action,
+            value.sqm_direction_mode,
+            &value.download,
+            &value.upload,
+            &value.proposal,
+        )?;
+        value.constructor_seal_sha256 = value.current_constructor_seal_sha256()?;
+        Ok(value)
+    }
+
     /// Re-run the sole typed constructor over the currently held fields and
     /// require its complete projection to remain byte-for-byte equivalent at
     /// the type level. `NativeApplyExecutionPlan` is still crate-visible during
@@ -928,6 +1067,28 @@ impl NativeApplyExecutionPlan {
                     raw_fallback_digest: raw_fallback,
                 },
             )?,
+            NativeApplyArtifactDigestsOwned::ShapedCapacityFallbackV9 { proposal, fallback } => {
+                Self::from_verified_shaped_capacity_fallback(
+                    NativeShapedCapacityFallbackApplyManifestInput {
+                        option_id: &self.option_id,
+                        request: &self.request,
+                        worker_run_id: &self.worker_run_id,
+                        review_digest: &self.review_digest,
+                        coordinator_boot_id: &self.coordinator_boot_id,
+                        coordinator_generation: &self.coordinator_generation,
+                        proposal: &self.proposal,
+                        selected_dl_kbps: self.download.base_kbps.ok_or_else(|| {
+                            "native shaped-capacity fallback lost download rate".to_string()
+                        })?,
+                        selected_ul_kbps: self.upload.base_kbps.ok_or_else(|| {
+                            "native shaped-capacity fallback lost upload rate".to_string()
+                        })?,
+                        required_acknowledgements: &self.required_acknowledgements,
+                        proposal_digest: proposal,
+                        fallback_digest: fallback,
+                    },
+                )?
+            }
         };
         if reconstructed != *self {
             return Err(
@@ -991,6 +1152,13 @@ impl NativeApplyExecutionPlan {
                 json_string(proposal),
                 json_string(raw_fallback),
             ),
+            NativeApplyArtifactDigestsOwned::ShapedCapacityFallbackV9 { proposal, fallback } => {
+                format!(
+                    "{{\"proposal\":{},\"shaped_capacity_fallback\":{}}}",
+                    json_string(proposal),
+                    json_string(fallback),
+                )
+            }
         };
         let candidate_seed = format!(
             "{{\"option_id\":{},\"source_review_sha256\":{},\"artifacts\":{},\"required_acknowledgements\":{},\"candidate\":{}}}",
@@ -1068,6 +1236,26 @@ impl NativeApplyExecutionPlan {
         })
     }
 
+    pub(crate) fn v9_identity(&self) -> Result<NativeApplyV9Identity, String> {
+        if !matches!(
+            self.artifacts,
+            NativeApplyArtifactDigestsOwned::ShapedCapacityFallbackV9 { .. }
+        ) {
+            return Err("native Apply plan has no shaped-capacity schema-v9 identity".to_string());
+        }
+        let candidate_id = self.v4_candidate_id()?;
+        let manifest = self.canonical_manifest_bytes()?;
+        Ok(NativeApplyV9Identity {
+            schema_version: NATIVE_SHAPED_CAPACITY_FALLBACK_APPLY_MANIFEST_SCHEMA_VERSION,
+            job_id: self.request.identity.job_id.clone(),
+            worker_run_id: self.worker_run_id.clone(),
+            option_id: self.option_id.clone(),
+            source_review_sha256: self.review_digest.clone(),
+            candidate_id,
+            manifest_sha256: sqm_identity::sha256sum(&manifest)?,
+        })
+    }
+
     pub(crate) fn authority_identity(&self) -> Result<NativeApplyAuthorityIdentity, String> {
         match &self.artifacts {
             NativeApplyArtifactDigestsOwned::ShapedV4 { .. } => {
@@ -1078,6 +1266,9 @@ impl NativeApplyExecutionPlan {
             ),
             NativeApplyArtifactDigestsOwned::DirectionalRawFallbackV6 { .. } => Ok(
                 NativeApplyAuthorityIdentity::DirectionalRawFallbackV6(self.v6_identity()?),
+            ),
+            NativeApplyArtifactDigestsOwned::ShapedCapacityFallbackV9 { .. } => Ok(
+                NativeApplyAuthorityIdentity::ShapedCapacityFallbackV9(self.v9_identity()?),
             ),
         }
     }
@@ -1096,6 +1287,11 @@ impl NativeApplyExecutionPlan {
         } = &self.artifacts
         {
             return self.canonical_directional_raw_fallback_manifest_bytes(proposal, raw_fallback);
+        }
+        if let NativeApplyArtifactDigestsOwned::ShapedCapacityFallbackV9 { proposal, fallback } =
+            &self.artifacts
+        {
+            return self.canonical_shaped_capacity_fallback_manifest_bytes(proposal, fallback);
         }
         let NativeApplyArtifactDigestsOwned::ShapedV4 {
             proposal: proposal_digest,
@@ -1271,6 +1467,86 @@ impl NativeApplyExecutionPlan {
             proposal_digest,
             raw_fallback_digest,
         )
+    }
+
+    fn canonical_shaped_capacity_fallback_manifest_bytes(
+        &self,
+        proposal_digest: &str,
+        fallback_digest: &str,
+    ) -> Result<Vec<u8>, String> {
+        if self.action != NativeApplyAction::ApplySqm
+            || self.sqm_direction_mode != NativeSqmDirectionMode::Both
+            || self.download.mode != NativeApplyDirectionMode::Shaped
+            || self.upload.mode != NativeApplyDirectionMode::Shaped
+            || self.auto_apply_evidence_pass
+            || !self.manual_review_required
+            || self.download.tested_safe_maximum_kbps != Some(0)
+            || self.upload.tested_safe_maximum_kbps != Some(0)
+            || self.download.ceiling_evidence != Some("legacy_unverified")
+            || self.upload.ceiling_evidence != Some("legacy_unverified")
+            || self.download.adaptive_cap_kbps != self.download.maximum_kbps
+            || self.upload.adaptive_cap_kbps != self.upload.maximum_kbps
+        {
+            return Err(
+                "native shaped-capacity fallback is not a hard-capped manual pair".to_string(),
+            );
+        }
+        let candidate = self.canonical_candidate_json();
+        let candidate_id = self.candidate_id_for_json(&candidate)?;
+        let required_acknowledgements = acknowledgement_json(&self.required_acknowledgements);
+        let managed_sqm_section = self
+            .request
+            .managed_sqm_section
+            .as_deref()
+            .ok_or_else(|| "native Apply request has no managed SQM section".to_string())?;
+        let mut output = format!(
+            concat!(
+                "{{\"native_apply_manifest_schema_version\":{},",
+                "\"state\":\"confirmation_ready\",\"apply_enabled\":true,",
+                "\"auto_apply_enabled\":false,\"manual_apply_enabled\":true,",
+                "\"option_id\":{},\"job_id\":{},\"worker_run_id\":{},",
+                "\"source_review_sha256\":{},\"coordinator_boot_id\":{},",
+                "\"coordinator_generation\":{},\"instance\":{},",
+                "\"target_interface\":{},\"managed_sqm_section\":{},",
+                "\"route_fingerprint\":{},\"config_fingerprint\":{},",
+                "\"sqm_fingerprint\":{},\"auto_apply_evidence_pass\":false,",
+                "\"manual_review_required\":true,",
+                "\"required_acknowledgements\":{},",
+                "\"proposal_rate_transform\":\"none\",",
+                "\"artifacts\":{{\"proposal\":{},\"shaped_capacity_fallback\":{}}},",
+                "\"candidate_id\":{},\"candidate\":{}}}\n"
+            ),
+            NATIVE_SHAPED_CAPACITY_FALLBACK_APPLY_MANIFEST_SCHEMA_VERSION,
+            json_string(&self.option_id),
+            json_string(&self.request.identity.job_id),
+            json_string(&self.worker_run_id),
+            json_string(&self.review_digest),
+            json_string(&self.coordinator_boot_id),
+            json_string(&self.coordinator_generation),
+            json_string(&self.request.identity.instance),
+            json_string(&self.request.identity.target_interface),
+            json_string(managed_sqm_section),
+            json_string(&self.request.identity.route_fingerprint),
+            json_string(&self.request.identity.config_fingerprint),
+            json_string(&self.request.identity.sqm_fingerprint),
+            required_acknowledgements,
+            json_string(proposal_digest),
+            json_string(fallback_digest),
+            json_string(&candidate_id),
+            candidate,
+        );
+        if output.len() > MAX_NATIVE_APPLY_MANIFEST_BYTES {
+            return Err(
+                "native shaped-capacity fallback Apply manifest exceeds its size bound".to_string(),
+            );
+        }
+        if output.matches('\n').count() != 1 || !output.ends_with('\n') {
+            return Err(
+                "native shaped-capacity fallback Apply manifest is not one canonical line"
+                    .to_string(),
+            );
+        }
+        Ok(std::mem::take(&mut output).into_bytes())
     }
 
     fn canonical_raw_fallback_family_manifest_bytes(
@@ -2354,7 +2630,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_set_delete_json_bytes_are_frozen() {
+    fn existing_v4_set_delete_json_bytes_are_frozen() {
         assert_eq!(
             NativeUciMutation::set("wan_sqm", "enabled", "1")
                 .unwrap()
@@ -2370,7 +2646,7 @@ mod tests {
     }
 
     #[test]
-    fn production_plans_still_emit_only_the_legacy_set_delete_contract() {
+    fn existing_v4_plans_emit_only_the_set_delete_contract() {
         let request = request();
         let proposal = proposal();
         let plan = execution_plan(

@@ -66,14 +66,14 @@ pub(crate) struct LiveRequestContext {
 /// rechecks every value copied into the immutable request and rejects drift.
 /// This context is not an admission or kernel-topology proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct BootstrapRequestContext {
-    target_interface: String,
-    planned_sqm_section: String,
-    route_identity: RouteIdentity,
-    route_fingerprint: String,
-    config_fingerprint: String,
-    sqm_fingerprint: String,
-    absence_identity: BootstrapAbsenceIdentity,
+pub(crate) struct BootstrapRequestContext {
+    pub target_interface: String,
+    pub planned_sqm_section: String,
+    pub route_identity: RouteIdentity,
+    pub route_fingerprint: String,
+    pub config_fingerprint: String,
+    pub sqm_fingerprint: String,
+    pub absence_identity: BootstrapAbsenceIdentity,
 }
 
 /// Parse a deliberately small flag vocabulary. Unknown, duplicate, empty, or
@@ -383,24 +383,39 @@ fn attest_bootstrap_launch_context(
     intent: &AutotuneLaunchIntent,
     planned_sqm_section: &str,
 ) -> Result<BootstrapRequestContext, String> {
-    let route_spec = RouteSpec::new(
+    attest_bootstrap_operation_context(
+        &intent.instance,
+        &intent.expected_target_interface,
         &intent.route_mode,
         &intent.mwan3_member,
-        &intent.expected_target_interface,
-    );
+        planned_sqm_section,
+    )
+}
+
+pub(crate) fn attest_bootstrap_operation_context(
+    instance: &str,
+    expected_target_interface: &str,
+    route_mode: &str,
+    mwan3_member: &str,
+    planned_sqm_section: &str,
+) -> Result<BootstrapRequestContext, String> {
+    let route_spec = RouteSpec::new(route_mode, mwan3_member, expected_target_interface);
     let snapshot = inspect_route(&route_spec)?;
     if !snapshot.online {
         return Err(format!("selected route is not online: {}", snapshot.reason));
     }
     let route_fingerprint = sha256sum(snapshot.stable_key().as_bytes())?;
     let absence_identity = attest_bootstrap_uci_absence(
-        &intent.instance,
+        instance,
         planned_sqm_section,
-        &intent.expected_target_interface,
+        expected_target_interface,
         &route_fingerprint,
     );
-    bootstrap_context_from_attestation(
-        intent,
+    bootstrap_context_from_operation_attestation(
+        instance,
+        expected_target_interface,
+        route_mode,
+        mwan3_member,
         planned_sqm_section,
         snapshot.identity,
         route_fingerprint,
@@ -408,8 +423,32 @@ fn attest_bootstrap_launch_context(
     )
 }
 
+#[cfg(test)]
 fn bootstrap_context_from_attestation(
     intent: &AutotuneLaunchIntent,
+    planned_sqm_section: &str,
+    route_identity: RouteIdentity,
+    route_fingerprint: String,
+    absence_identity: Result<BootstrapAbsenceIdentity, String>,
+) -> Result<BootstrapRequestContext, String> {
+    bootstrap_context_from_operation_attestation(
+        &intent.instance,
+        &intent.expected_target_interface,
+        &intent.route_mode,
+        &intent.mwan3_member,
+        planned_sqm_section,
+        route_identity,
+        route_fingerprint,
+        absence_identity,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bootstrap_context_from_operation_attestation(
+    instance: &str,
+    expected_target_interface: &str,
+    route_mode: &str,
+    mwan3_member: &str,
     planned_sqm_section: &str,
     route_identity: RouteIdentity,
     route_fingerprint: String,
@@ -418,7 +457,7 @@ fn bootstrap_context_from_attestation(
     let absence_identity = absence_identity
         .map_err(|error| format!("bootstrap UCI absence witness is unavailable: {error}"))?;
     let context = BootstrapRequestContext {
-        target_interface: intent.expected_target_interface.clone(),
+        target_interface: expected_target_interface.to_string(),
         planned_sqm_section: planned_sqm_section.to_string(),
         route_identity,
         route_fingerprint,
@@ -426,7 +465,13 @@ fn bootstrap_context_from_attestation(
         sqm_fingerprint: absence_identity.sqm_fingerprint().to_string(),
         absence_identity,
     };
-    validate_bootstrap_request_context(intent, &context)?;
+    validate_bootstrap_operation_context(
+        instance,
+        expected_target_interface,
+        route_mode,
+        mwan3_member,
+        &context,
+    )?;
     Ok(context)
 }
 
@@ -434,21 +479,37 @@ fn validate_bootstrap_request_context(
     intent: &AutotuneLaunchIntent,
     context: &BootstrapRequestContext,
 ) -> Result<OperationRouteIdentity, String> {
-    if context.target_interface != intent.expected_target_interface {
+    validate_bootstrap_operation_context(
+        &intent.instance,
+        &intent.expected_target_interface,
+        &intent.route_mode,
+        &intent.mwan3_member,
+        context,
+    )
+}
+
+fn validate_bootstrap_operation_context(
+    instance: &str,
+    expected_target_interface: &str,
+    route_mode: &str,
+    mwan3_member: &str,
+    context: &BootstrapRequestContext,
+) -> Result<OperationRouteIdentity, String> {
+    if context.target_interface != expected_target_interface {
         return Err("bootstrap target changed after absence attestation".to_string());
     }
     if context.route_identity.device != context.target_interface {
         return Err("bootstrap route no longer resolves to the target interface".to_string());
     }
     let route = operation_route_identity(&context.route_identity)?;
-    operation_route_matches_config(&intent.route_mode, &intent.mwan3_member, &route)
+    operation_route_matches_config(route_mode, mwan3_member, &route)
         .map_err(|error| format!("selected bootstrap route changed: {error}"))?;
     let expected_route_fingerprint = sha256sum(context.route_identity.stable_key().as_bytes())?;
     if expected_route_fingerprint != context.route_fingerprint {
         return Err("bootstrap route fingerprint changed after attestation".to_string());
     }
     context.absence_identity.ensure_request_binding(
-        &intent.instance,
+        instance,
         &context.planned_sqm_section,
         &context.target_interface,
         &context.route_fingerprint,
@@ -1120,7 +1181,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_builder_v4_wire_and_semantics_remain_legacy_compatible() {
+    fn existing_builder_v4_public_wire_and_semantics_remain_stable() {
         let intent = intent();
         let request = build_request(
             &intent,

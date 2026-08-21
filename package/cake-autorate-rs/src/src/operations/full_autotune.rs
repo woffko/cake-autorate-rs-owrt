@@ -12,7 +12,8 @@ use super::autotune_apply::{
     NativeApplyAcknowledgement, NativeApplyAction, NativeApplyArtifactDigests,
     NativeApplyDirectionInput, NativeApplyDirectionMode, NativeApplyExecutionPlan,
     NativeApplyManifestInput, NativeDirectionalRawFallbackApplyManifestInput,
-    NativeRawFallbackApplyManifestInput, NativeSqmDirectionMode, MAX_NATIVE_APPLY_MANIFEST_BYTES,
+    NativeRawFallbackApplyManifestInput, NativeShapedCapacityFallbackApplyManifestInput,
+    NativeSqmDirectionMode, MAX_NATIVE_APPLY_MANIFEST_BYTES,
 };
 use super::autotune_apply_openwrt::{
     validate_bootstrap_request_baseline, OpenWrtNativeApplyBackend,
@@ -76,13 +77,15 @@ use std::time::{Duration, Instant};
 pub const MAX_AUTOTUNE_EVIDENCE_RECORDS: usize = 256;
 pub const MAX_AUTOTUNE_EVIDENCE_BYTES: usize = 4 * 1024;
 pub const MAX_AUTOTUNE_REVIEW_BYTES: usize = 512 * 1024;
-const EVIDENCE_HEADER: &str = "cake-autorate-autotune-evidence\t11";
+const EVIDENCE_HEADER: &str = "cake-autorate-autotune-evidence\t13";
 const PROGRESS_HEADER: &str = "cake-autorate-autotune-progress\t1";
 const MAX_AUTOTUNE_PROGRESS_BYTES: usize = 2 * 1024;
 const RUNTIME_CONTROL_HEADER: &str = "cake-autorate-autotune-runtime-control\t1";
 const RUNTIME_ACK_HEADER: &str = "cake-autorate-autotune-runtime-ack\t1";
 const TERMINAL_HEADER: &str = "cake-autorate-autotune-terminal\t2";
 const TRAFFIC_BUDGET_INCONCLUSIVE: &str = "traffic-budget-exhausted";
+const PAIR_OPTIONS_UNREVIEWABLE: &str = "pair-options-unreviewable";
+const SEARCH_OPTIONS_UNREVIEWABLE: &str = "search-options-unreviewable";
 const MAX_OPERATION_TRAFFIC_BUDGET_BYTES: u64 = 1 << 40;
 const CAPTURE_REQUEST_HEADER: &str = "cake-autorate-autotune-capture\t3\trequest";
 const CAPTURE_SNAPSHOT_HEADER: &str = "cake-autorate-autotune-capture\t4\tsnapshot";
@@ -350,6 +353,9 @@ fn worker_failure_terminal_code(error: &str) -> String {
     if error.contains("candidate observation starved") {
         return "native-candidate-observation-starved".to_string();
     }
+    if error.contains("candidate transfer was unmeasurable") {
+        return CANDIDATE_TRANSFER_UNMEASURABLE_REASON.to_string();
+    }
     "native-autotune-worker-failed".to_string()
 }
 
@@ -498,6 +504,7 @@ pub(crate) enum NativeAutotuneProgressStep {
     ComparingUploadWithoutSqm,
     PreparingRawProposal,
     RestoringSettings,
+    PreparingDiagnostics,
     PreparingProposals,
     ProposalsReady,
 }
@@ -525,6 +532,7 @@ impl NativeAutotuneProgressStep {
             Self::ComparingUploadWithoutSqm => "comparing_upload_without_sqm",
             Self::PreparingRawProposal => "preparing_raw_proposal",
             Self::RestoringSettings => "restoring_settings",
+            Self::PreparingDiagnostics => "preparing_diagnostics",
             Self::PreparingProposals => "preparing_proposals",
             Self::ProposalsReady => "proposals_ready",
         }
@@ -552,6 +560,7 @@ impl NativeAutotuneProgressStep {
             "comparing_upload_without_sqm" => Self::ComparingUploadWithoutSqm,
             "preparing_raw_proposal" => Self::PreparingRawProposal,
             "restoring_settings" => Self::RestoringSettings,
+            "preparing_diagnostics" => Self::PreparingDiagnostics,
             "preparing_proposals" => Self::PreparingProposals,
             "proposals_ready" => Self::ProposalsReady,
             _ => return None,
@@ -3087,6 +3096,34 @@ pub struct MeasurementEvidence {
     pub contaminated: bool,
 }
 
+/// Capacity proof retained from a completed, byte-attested raw control whose
+/// loaded latency streams did not reach their minimum sample count.  It is
+/// deliberately not a `MeasurementEvidence`: it can seed the later shaped
+/// search, but can never grade latency or authorize a raw/no-SQM topology.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawControlCapacityEvidence {
+    pub topology: MeasurementTopology,
+    pub direction: SpeedtestDirection,
+    pub achieved_kbps: u64,
+    pub backend_payload_only: bool,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub elapsed_ms: u64,
+    pub confidence_total_bytes: u64,
+    pub controlled_wire_bytes: u64,
+    pub controlled_payload_bytes: u64,
+    pub backend_reported_kbps: u64,
+    pub backend_consistent_runs: u8,
+    pub backend_payload_only_runs: u8,
+    pub run_count: u8,
+    pub debit_count: u32,
+    pub icmp_samples: u32,
+    pub transport_samples: u32,
+    pub transport_timeout_count: u32,
+    pub transport_timeout_total_us: u64,
+    pub cpu_samples: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrafficDebitPurpose {
     Qualification,
@@ -3307,6 +3344,21 @@ pub struct DirectionalBypassUnavailableEvidence {
     pub cpu_samples: u32,
 }
 
+/// One Full Raw direction whose optional no-shaping comparison spent bounded,
+/// exactly charged traffic but could not produce reviewable measurement
+/// evidence.  The verified shaped pair remains authoritative; no raw rate or
+/// latency is inferred for this direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TopologyDirectionUnavailableEvidence {
+    pub direction: EvidenceDirection,
+    pub reason: PairOptionUnavailableReason,
+    pub run_count: u8,
+    pub debit_count: u32,
+    pub icmp_samples: u32,
+    pub transport_samples: u32,
+    pub cpu_samples: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EvidenceDirection {
     Download,
@@ -3337,11 +3389,13 @@ pub enum AutotuneEvidence {
     RuntimeMutationArmed,
     TrafficDebit(TrafficDebitEvidence),
     Measurement(MeasurementEvidence),
+    RawControlCapacity(RawControlCapacityEvidence),
     SearchObservationStarved(SearchObservationStarvedEvidence),
     SearchProbeUnmeasurable(SearchProbeUnmeasurableEvidence),
     SearchInconclusive(SearchInconclusiveEvidence),
     PairOptionUnavailable(PairOptionUnavailableEvidence),
     DirectionalBypassUnavailable(DirectionalBypassUnavailableEvidence),
+    TopologyDirectionUnavailable(TopologyDirectionUnavailableEvidence),
     ProposalBuilt {
         digest: String,
     },
@@ -3385,11 +3439,13 @@ enum EvidenceKind {
     MutationArmed,
     TrafficDebit,
     Measurement,
+    RawControlCapacity,
     SearchObservationStarved,
     SearchProbeUnmeasurable,
     SearchInconclusive,
     PairOptionUnavailable,
     DirectionalBypassUnavailable,
+    TopologyDirectionUnavailable,
     Proposal,
     SearchComplete,
     PairConfirmed,
@@ -3408,11 +3464,13 @@ impl EvidenceKind {
             Self::MutationArmed => "mutation_armed",
             Self::TrafficDebit => "traffic_debit",
             Self::Measurement => "measurement",
+            Self::RawControlCapacity => "raw_control_capacity",
             Self::SearchObservationStarved => "search_observation_starved",
             Self::SearchProbeUnmeasurable => "search_probe_unmeasurable",
             Self::SearchInconclusive => "search_inconclusive",
             Self::PairOptionUnavailable => "pair_option_unavailable",
             Self::DirectionalBypassUnavailable => "directional_bypass_unavailable",
+            Self::TopologyDirectionUnavailable => "topology_direction_unavailable",
             Self::Proposal => "proposal",
             Self::SearchComplete => "search_complete",
             Self::PairConfirmed => "pair_confirmed",
@@ -3431,11 +3489,13 @@ impl EvidenceKind {
             "mutation_armed" => Some(Self::MutationArmed),
             "traffic_debit" => Some(Self::TrafficDebit),
             "measurement" => Some(Self::Measurement),
+            "raw_control_capacity" => Some(Self::RawControlCapacity),
             "search_observation_starved" => Some(Self::SearchObservationStarved),
             "search_probe_unmeasurable" => Some(Self::SearchProbeUnmeasurable),
             "search_inconclusive" => Some(Self::SearchInconclusive),
             "pair_option_unavailable" => Some(Self::PairOptionUnavailable),
             "directional_bypass_unavailable" => Some(Self::DirectionalBypassUnavailable),
+            "topology_direction_unavailable" => Some(Self::TopologyDirectionUnavailable),
             "proposal" => Some(Self::Proposal),
             "search_complete" => Some(Self::SearchComplete),
             "pair_confirmed" => Some(Self::PairConfirmed),
@@ -3496,6 +3556,38 @@ impl AutotuneEvidenceRecord {
                 payload.contaminated = Some(value.contaminated);
                 EvidenceKind::Measurement
             }
+            AutotuneEvidence::RawControlCapacity(value) => {
+                payload.topology = Some(value.topology);
+                payload.speedtest_direction = Some(value.direction);
+                match value.direction {
+                    SpeedtestDirection::Download => {
+                        payload.achieved_dl_kbps = Some(value.achieved_kbps);
+                        payload.backend_dl_payload_only = Some(value.backend_payload_only);
+                    }
+                    SpeedtestDirection::Upload => {
+                        payload.achieved_ul_kbps = Some(value.achieved_kbps);
+                        payload.backend_ul_payload_only = Some(value.backend_payload_only);
+                    }
+                    SpeedtestDirection::Both => {}
+                }
+                payload.rx_bytes = Some(value.rx_bytes);
+                payload.tx_bytes = Some(value.tx_bytes);
+                payload.elapsed_ms = Some(value.elapsed_ms);
+                payload.confidence_total_bytes = Some(value.confidence_total_bytes);
+                payload.controlled_wire_bytes = Some(value.controlled_wire_bytes);
+                payload.controlled_payload_bytes = Some(value.controlled_payload_bytes);
+                payload.backend_reported_kbps = Some(value.backend_reported_kbps);
+                payload.backend_consistent_runs = Some(value.backend_consistent_runs);
+                payload.backend_payload_only_runs = Some(value.backend_payload_only_runs);
+                payload.run_count = Some(value.run_count);
+                payload.debit_count = Some(value.debit_count);
+                payload.icmp_samples = Some(value.icmp_samples);
+                payload.transport_samples = Some(value.transport_samples);
+                payload.transport_timeout_count = Some(value.transport_timeout_count);
+                payload.transport_timeout_total_us = Some(value.transport_timeout_total_us);
+                payload.cpu_samples = Some(value.cpu_samples);
+                EvidenceKind::RawControlCapacity
+            }
             AutotuneEvidence::SearchObservationStarved(value) => {
                 payload.topology = Some(value.topology);
                 payload.speedtest_direction = Some(value.direction);
@@ -3548,6 +3640,16 @@ impl AutotuneEvidenceRecord {
                 payload.transport_samples = Some(value.transport_samples);
                 payload.cpu_samples = Some(value.cpu_samples);
                 EvidenceKind::DirectionalBypassUnavailable
+            }
+            AutotuneEvidence::TopologyDirectionUnavailable(value) => {
+                payload.evidence_direction = Some(value.direction);
+                payload.pair_unavailable_reason = Some(value.reason);
+                payload.run_count = Some(value.run_count);
+                payload.debit_count = Some(value.debit_count);
+                payload.icmp_samples = Some(value.icmp_samples);
+                payload.transport_samples = Some(value.transport_samples);
+                payload.cpu_samples = Some(value.cpu_samples);
+                EvidenceKind::TopologyDirectionUnavailable
             }
             AutotuneEvidence::ProposalBuilt { digest } => {
                 payload.digest = Some(digest.clone());
@@ -3709,6 +3811,30 @@ impl AutotuneEvidenceRecord {
                 optional_number(payload.background_confidence_percent.map(u64::from)),
             ),
             (
+                "confidence_total_bytes",
+                optional_number(payload.confidence_total_bytes),
+            ),
+            (
+                "controlled_wire_bytes",
+                optional_number(payload.controlled_wire_bytes),
+            ),
+            (
+                "controlled_payload_bytes",
+                optional_number(payload.controlled_payload_bytes),
+            ),
+            (
+                "backend_reported_kbps",
+                optional_number(payload.backend_reported_kbps),
+            ),
+            (
+                "backend_consistent_runs",
+                optional_number(payload.backend_consistent_runs.map(u64::from)),
+            ),
+            (
+                "backend_payload_only_runs",
+                optional_number(payload.backend_payload_only_runs.map(u64::from)),
+            ),
+            (
                 "contaminated",
                 payload
                     .contaminated
@@ -3856,6 +3982,30 @@ impl AutotuneEvidenceRecord {
             "background_confidence_percent",
             reader.field("background_confidence_percent")?,
         )?;
+        let confidence_total_bytes = optional_u64(
+            "confidence_total_bytes",
+            reader.field("confidence_total_bytes")?,
+        )?;
+        let controlled_wire_bytes = optional_u64(
+            "controlled_wire_bytes",
+            reader.field("controlled_wire_bytes")?,
+        )?;
+        let controlled_payload_bytes = optional_u64(
+            "controlled_payload_bytes",
+            reader.field("controlled_payload_bytes")?,
+        )?;
+        let backend_reported_kbps = optional_u64(
+            "backend_reported_kbps",
+            reader.field("backend_reported_kbps")?,
+        )?;
+        let backend_consistent_runs = optional_narrow(
+            "backend_consistent_runs",
+            reader.field("backend_consistent_runs")?,
+        )?;
+        let backend_payload_only_runs = optional_narrow(
+            "backend_payload_only_runs",
+            reader.field("backend_payload_only_runs")?,
+        )?;
         let contaminated = match reader.field("contaminated")?.as_str() {
             "" => None,
             "0" => Some(false),
@@ -3916,6 +4066,12 @@ impl AutotuneEvidenceRecord {
             loss_ppm,
             cpu_milli_percent,
             background_confidence_percent,
+            confidence_total_bytes,
+            controlled_wire_bytes,
+            controlled_payload_bytes,
+            backend_reported_kbps,
+            backend_consistent_runs,
+            backend_payload_only_runs,
             contaminated,
             run_count,
             observation_count,
@@ -3949,6 +4105,13 @@ impl AutotuneEvidenceRecord {
         require_hex("native Auto-Tune worker run id", &self.worker_run_id, 32)?;
         if self.sequence == 0 || self.sequence as usize > MAX_AUTOTUNE_EVIDENCE_RECORDS {
             return Err("native Auto-Tune evidence sequence is outside its bound".to_string());
+        }
+        if matches!(self.evidence, AutotuneEvidence::RawControlCapacity(_))
+            && self.phase != AutotunePhase::RawControls
+        {
+            return Err(
+                "native Auto-Tune raw capacity evidence is outside Raw Controls".to_string(),
+            );
         }
         validate_digest_fields(&self.evidence)
     }
@@ -4215,6 +4378,12 @@ struct EvidencePayload {
     loss_ppm: Option<u32>,
     cpu_milli_percent: Option<u32>,
     background_confidence_percent: Option<u8>,
+    confidence_total_bytes: Option<u64>,
+    controlled_wire_bytes: Option<u64>,
+    controlled_payload_bytes: Option<u64>,
+    backend_reported_kbps: Option<u64>,
+    backend_consistent_runs: Option<u8>,
+    backend_payload_only_runs: Option<u8>,
     contaminated: Option<bool>,
     run_count: Option<u8>,
     observation_count: Option<u32>,
@@ -4281,6 +4450,70 @@ impl EvidencePayload {
                 )?,
                 contaminated: required(self.contaminated, "contaminated")?,
             }),
+            EvidenceKind::RawControlCapacity => {
+                let direction = required(self.speedtest_direction, "speedtest_direction")?;
+                let (achieved_kbps, backend_payload_only) = match direction {
+                    SpeedtestDirection::Download => (
+                        required(self.achieved_dl_kbps, "achieved_dl_kbps")?,
+                        required(self.backend_dl_payload_only, "backend_dl_payload_only")?,
+                    ),
+                    SpeedtestDirection::Upload => (
+                        required(self.achieved_ul_kbps, "achieved_ul_kbps")?,
+                        required(self.backend_ul_payload_only, "backend_ul_payload_only")?,
+                    ),
+                    SpeedtestDirection::Both => {
+                        return Err(
+                            "native Auto-Tune raw capacity evidence is not directional".to_string()
+                        )
+                    }
+                };
+                AutotuneEvidence::RawControlCapacity(RawControlCapacityEvidence {
+                    topology: required(self.topology, "topology")?,
+                    direction,
+                    achieved_kbps,
+                    backend_payload_only,
+                    rx_bytes: required(self.rx_bytes, "rx_bytes")?,
+                    tx_bytes: required(self.tx_bytes, "tx_bytes")?,
+                    elapsed_ms: required(self.elapsed_ms, "elapsed_ms")?,
+                    confidence_total_bytes: required(
+                        self.confidence_total_bytes,
+                        "confidence_total_bytes",
+                    )?,
+                    controlled_wire_bytes: required(
+                        self.controlled_wire_bytes,
+                        "controlled_wire_bytes",
+                    )?,
+                    controlled_payload_bytes: required(
+                        self.controlled_payload_bytes,
+                        "controlled_payload_bytes",
+                    )?,
+                    backend_reported_kbps: required(
+                        self.backend_reported_kbps,
+                        "backend_reported_kbps",
+                    )?,
+                    backend_consistent_runs: required(
+                        self.backend_consistent_runs,
+                        "backend_consistent_runs",
+                    )?,
+                    backend_payload_only_runs: required(
+                        self.backend_payload_only_runs,
+                        "backend_payload_only_runs",
+                    )?,
+                    run_count: required(self.run_count, "run_count")?,
+                    debit_count: required(self.debit_count, "debit_count")?,
+                    icmp_samples: required(self.icmp_samples, "icmp_samples")?,
+                    transport_samples: required(self.transport_samples, "transport_samples")?,
+                    transport_timeout_count: required(
+                        self.transport_timeout_count,
+                        "transport_timeout_count",
+                    )?,
+                    transport_timeout_total_us: required(
+                        self.transport_timeout_total_us,
+                        "transport_timeout_total_us",
+                    )?,
+                    cpu_samples: required(self.cpu_samples, "cpu_samples")?,
+                })
+            }
             EvidenceKind::SearchObservationStarved => {
                 AutotuneEvidence::SearchObservationStarved(SearchObservationStarvedEvidence {
                     topology: required(self.topology, "topology")?,
@@ -4341,6 +4574,19 @@ impl EvidencePayload {
                             self.speedtest_direction,
                             "speedtest_direction",
                         )?,
+                        reason: required(self.pair_unavailable_reason, "pair_unavailable_reason")?,
+                        run_count: required(self.run_count, "run_count")?,
+                        debit_count: required(self.debit_count, "debit_count")?,
+                        icmp_samples: required(self.icmp_samples, "icmp_samples")?,
+                        transport_samples: required(self.transport_samples, "transport_samples")?,
+                        cpu_samples: required(self.cpu_samples, "cpu_samples")?,
+                    },
+                )
+            }
+            EvidenceKind::TopologyDirectionUnavailable => {
+                AutotuneEvidence::TopologyDirectionUnavailable(
+                    TopologyDirectionUnavailableEvidence {
+                        direction: required(self.evidence_direction, "evidence_direction")?,
                         reason: required(self.pair_unavailable_reason, "pair_unavailable_reason")?,
                         run_count: required(self.run_count, "run_count")?,
                         debit_count: required(self.debit_count, "debit_count")?,
@@ -4431,6 +4677,37 @@ impl EvidencePayload {
                 self.background_confidence_percent = Some(value.background_confidence_percent);
                 self.contaminated = Some(value.contaminated);
             }
+            AutotuneEvidence::RawControlCapacity(value) => {
+                self.topology = Some(value.topology);
+                self.speedtest_direction = Some(value.direction);
+                match value.direction {
+                    SpeedtestDirection::Download => {
+                        self.achieved_dl_kbps = Some(value.achieved_kbps);
+                        self.backend_dl_payload_only = Some(value.backend_payload_only);
+                    }
+                    SpeedtestDirection::Upload => {
+                        self.achieved_ul_kbps = Some(value.achieved_kbps);
+                        self.backend_ul_payload_only = Some(value.backend_payload_only);
+                    }
+                    SpeedtestDirection::Both => {}
+                }
+                self.rx_bytes = Some(value.rx_bytes);
+                self.tx_bytes = Some(value.tx_bytes);
+                self.elapsed_ms = Some(value.elapsed_ms);
+                self.confidence_total_bytes = Some(value.confidence_total_bytes);
+                self.controlled_wire_bytes = Some(value.controlled_wire_bytes);
+                self.controlled_payload_bytes = Some(value.controlled_payload_bytes);
+                self.backend_reported_kbps = Some(value.backend_reported_kbps);
+                self.backend_consistent_runs = Some(value.backend_consistent_runs);
+                self.backend_payload_only_runs = Some(value.backend_payload_only_runs);
+                self.run_count = Some(value.run_count);
+                self.debit_count = Some(value.debit_count);
+                self.icmp_samples = Some(value.icmp_samples);
+                self.transport_samples = Some(value.transport_samples);
+                self.transport_timeout_count = Some(value.transport_timeout_count);
+                self.transport_timeout_total_us = Some(value.transport_timeout_total_us);
+                self.cpu_samples = Some(value.cpu_samples);
+            }
             AutotuneEvidence::SearchObservationStarved(value) => {
                 self.topology = Some(value.topology);
                 self.speedtest_direction = Some(value.direction);
@@ -4473,6 +4750,15 @@ impl EvidencePayload {
                 self.speedtest_direction = Some(value.failed_direction);
                 self.pair_unavailable_reason = Some(value.reason);
                 self.candidate_ul_kbps = Some(value.candidate_ul_kbps);
+                self.run_count = Some(value.run_count);
+                self.debit_count = Some(value.debit_count);
+                self.icmp_samples = Some(value.icmp_samples);
+                self.transport_samples = Some(value.transport_samples);
+                self.cpu_samples = Some(value.cpu_samples);
+            }
+            AutotuneEvidence::TopologyDirectionUnavailable(value) => {
+                self.evidence_direction = Some(value.direction);
+                self.pair_unavailable_reason = Some(value.reason);
                 self.run_count = Some(value.run_count);
                 self.debit_count = Some(value.debit_count);
                 self.icmp_samples = Some(value.icmp_samples);
@@ -4643,6 +4929,9 @@ pub enum AutotuneAction {
     ConfirmMobileDownloadBypass,
     CompareTopologies,
     RestoreRuntime,
+    PublishInconclusive {
+        code: &'static str,
+    },
     PublishReview,
     Complete,
 }
@@ -4858,6 +5147,8 @@ pub struct AutotuneReplayState {
     mobile_bypass_unavailable: Option<DirectionalBypassUnavailableEvidence>,
     topology_download_repeat_count: u8,
     topology_upload_repeat_count: u8,
+    topology_download_unavailable: Option<TopologyDirectionUnavailableEvidence>,
+    topology_upload_unavailable: Option<TopologyDirectionUnavailableEvidence>,
     topologies_compared: bool,
     raw_fallback_built: bool,
 }
@@ -4922,6 +5213,8 @@ impl AutotuneReplayState {
             mobile_bypass_unavailable: None,
             topology_download_repeat_count: 0,
             topology_upload_repeat_count: 0,
+            topology_download_unavailable: None,
+            topology_upload_unavailable: None,
             topologies_compared: false,
             raw_fallback_built: false,
         })
@@ -4961,10 +5254,12 @@ impl AutotuneReplayState {
                     purpose: TrafficDebitPurpose::Measurement,
                     ..
                 }) | AutotuneEvidence::Measurement(_)
+                    | AutotuneEvidence::RawControlCapacity(_)
                     | AutotuneEvidence::SearchObservationStarved(_)
                     | AutotuneEvidence::SearchProbeUnmeasurable(_)
                     | AutotuneEvidence::PairOptionUnavailable(_)
                     | AutotuneEvidence::DirectionalBypassUnavailable(_)
+                    | AutotuneEvidence::TopologyDirectionUnavailable(_)
             )
         {
             return Err(
@@ -5029,6 +5324,9 @@ impl AutotuneReplayState {
                 self.apply_traffic_debit(record.phase, *value)?
             }
             AutotuneEvidence::Measurement(value) => self.apply_measurement(record.phase, *value)?,
+            AutotuneEvidence::RawControlCapacity(value) => {
+                self.apply_raw_control_capacity(record.phase, *value)?
+            }
             AutotuneEvidence::SearchObservationStarved(value) => {
                 self.apply_search_observation_starved(*value)?
             }
@@ -5050,16 +5348,23 @@ impl AutotuneReplayState {
                 EvidenceDirection::Download => {
                     self.download_search_complete = true;
                     self.selected_download_kbps = Some(*selected_kbps);
+                    self.search_download_starved = None;
+                    self.search_download_unmeasurable = None;
                 }
                 EvidenceDirection::Upload => {
                     self.upload_search_complete = true;
                     self.selected_upload_kbps = Some(*selected_kbps);
+                    self.search_upload_starved = None;
+                    self.search_upload_unmeasurable = None;
                 }
             },
             AutotuneEvidence::PairConfirmed { .. } => self.pair_confirmed = true,
             AutotuneEvidence::PairExhausted { .. } => self.pair_exhausted = true,
             AutotuneEvidence::DirectionalBypassUnavailable(value) => {
                 self.apply_directional_bypass_unavailable(*value)?
+            }
+            AutotuneEvidence::TopologyDirectionUnavailable(value) => {
+                self.apply_topology_direction_unavailable(*value)?
             }
             AutotuneEvidence::TopologiesCompared { .. } => self.topologies_compared = true,
             AutotuneEvidence::RawFallbackBuilt { .. } => {
@@ -5115,6 +5420,10 @@ impl AutotuneReplayState {
                     AutotuneEvidence::Measurement(_)
                 )
                 | (
+                    AutotunePhase::RawControls,
+                    AutotuneEvidence::RawControlCapacity(_)
+                )
+                | (
                     AutotunePhase::Proposal,
                     AutotuneEvidence::ProposalBuilt { .. }
                 )
@@ -5137,6 +5446,10 @@ impl AutotuneReplayState {
                 | (
                     AutotunePhase::TopologyComparison,
                     AutotuneEvidence::DirectionalBypassUnavailable(_)
+                )
+                | (
+                    AutotunePhase::TopologyComparison,
+                    AutotuneEvidence::TopologyDirectionUnavailable(_)
                 )
                 | (
                     AutotunePhase::DirectionalSearch,
@@ -5169,7 +5482,9 @@ impl AutotuneReplayState {
         }
         if matches!(evidence, AutotuneEvidence::RuntimeRestored)
             && (!self.mutation_armed
-                || (!self.topologies_compared && !self.raw_fallback_built)
+                || (!self.topologies_compared
+                    && !self.raw_fallback_built
+                    && self.unreviewable_terminal_code().is_none())
                 || self.runtime_restored)
         {
             return Err("native Auto-Tune runtime restore is premature or duplicated".to_string());
@@ -5585,6 +5900,7 @@ impl AutotuneReplayState {
                     if value.topology == MeasurementTopology::RawDownload
                         && value.candidate_dl_kbps.is_none()
                         && value.candidate_ul_kbps == self.selected_upload_kbps
+                        && self.topology_download_unavailable.is_none()
                         && self.topology_upload_repeat_count == 0
                         && self.topology_download_repeat_count
                             < MAX_TOPOLOGY_REPEAT_ATTEMPTS_PER_DIRECTION =>
@@ -5595,6 +5911,7 @@ impl AutotuneReplayState {
                     if value.topology == MeasurementTopology::RawUpload
                         && value.candidate_dl_kbps == self.selected_download_kbps
                         && value.candidate_ul_kbps.is_none()
+                        && self.topology_upload_unavailable.is_none()
                         && self.topology_upload_repeat_count
                             < MAX_TOPOLOGY_REPEAT_ATTEMPTS_PER_DIRECTION =>
                 {
@@ -5668,6 +5985,56 @@ impl AutotuneReplayState {
                     .candidate_ul_kbps
                     .expect("pair shape validated before mutation"),
             ));
+        }
+        self.pending_measurement_debits = PendingMeasurementDebits::None;
+        Ok(())
+    }
+
+    fn apply_raw_control_capacity(
+        &mut self,
+        phase: AutotunePhase,
+        value: RawControlCapacityEvidence,
+    ) -> Result<(), String> {
+        if phase != AutotunePhase::RawControls
+            || !self.mutation_armed
+            || !uses_full_raw_controls(self.strategy, self.allow_sqm_disable)
+        {
+            return Err(
+                "native Auto-Tune raw capacity evidence lacks Full Raw authority".to_string(),
+            );
+        }
+        validate_raw_control_capacity(value)?;
+        if self
+            .pending_measurement_debits
+            .single_count(value.direction)
+            != Some(value.debit_count)
+        {
+            return Err(
+                "native Auto-Tune raw capacity evidence does not settle its exact traffic debits"
+                    .to_string(),
+            );
+        }
+        if self.next_action()?
+            != (AutotuneAction::Measure {
+                topology: value.topology,
+                direction: value.direction,
+            })
+        {
+            return Err(
+                "native Auto-Tune raw capacity evidence is out of order or contradicts its control"
+                    .to_string(),
+            );
+        }
+        match value.direction {
+            SpeedtestDirection::Download => {
+                self.control_download_count += 1;
+                self.raw_both_download_seen |= value.topology == MeasurementTopology::RawBoth;
+            }
+            SpeedtestDirection::Upload => {
+                self.control_upload_count += 1;
+                self.raw_both_upload_seen |= value.topology == MeasurementTopology::RawBoth;
+            }
+            SpeedtestDirection::Both => unreachable!("raw capacity was validated as directional"),
         }
         self.pending_measurement_debits = PendingMeasurementDebits::None;
         Ok(())
@@ -6108,11 +6475,118 @@ impl AutotuneReplayState {
         Ok(())
     }
 
+    fn apply_topology_direction_unavailable(
+        &mut self,
+        value: TopologyDirectionUnavailableEvidence,
+    ) -> Result<(), String> {
+        if !self.mutation_armed
+            || !self.pair_confirmed
+            || self.pair_exhausted
+            || self.topologies_compared
+        {
+            return Err(
+                "native Auto-Tune unavailable topology direction lacks confirmed-pair authority"
+                    .to_string(),
+            );
+        }
+        let speedtest_direction = match value.direction {
+            EvidenceDirection::Download => SpeedtestDirection::Download,
+            EvidenceDirection::Upload => SpeedtestDirection::Upload,
+        };
+        let order_valid = match value.direction {
+            EvidenceDirection::Download => {
+                self.topology_download_unavailable.is_none()
+                    && self.topology_upload_unavailable.is_none()
+                    && self.topology_upload_repeat_count == 0
+                    && self.topology_download_repeat_count
+                        < MAX_TOPOLOGY_REPEAT_ATTEMPTS_PER_DIRECTION
+            }
+            EvidenceDirection::Upload => {
+                self.topology_upload_unavailable.is_none()
+                    && self.topology_upload_repeat_count
+                        < MAX_TOPOLOGY_REPEAT_ATTEMPTS_PER_DIRECTION
+            }
+        };
+        if !order_valid {
+            return Err(
+                "native Auto-Tune unavailable topology direction is out of order or duplicate"
+                    .to_string(),
+            );
+        }
+        match value.reason {
+            PairOptionUnavailableReason::TrafficBudget
+                if value.run_count == 0
+                    && value.debit_count == 0
+                    && value.icmp_samples == 0
+                    && value.transport_samples == 0
+                    && value.cpu_samples == 0
+                    && self.pending_measurement_debits.is_empty() => {}
+            PairOptionUnavailableReason::ObservationStarved
+                if value.run_count > 0
+                    && value.run_count <= MAX_DIRECTIONAL_LOAD_RUNS
+                    && value.debit_count >= u32::from(value.run_count)
+                    && self
+                        .pending_measurement_debits
+                        .single_count(speedtest_direction)
+                        == Some(value.debit_count)
+                    && (value.icmp_samples < MIN_AUTOTUNE_LOADED_ICMP_SAMPLES
+                        || value.transport_samples < MIN_AUTOTUNE_TRANSPORT_SAMPLES
+                        || value.cpu_samples < 1) => {}
+            PairOptionUnavailableReason::TransferUnmeasurable
+                if value.run_count > 0
+                    && value.run_count <= MAX_DIRECTIONAL_RESULT_UNAVAILABLE_RUNS
+                    && value.debit_count >= u32::from(value.run_count)
+                    && self
+                        .pending_measurement_debits
+                        .single_count(speedtest_direction)
+                        == Some(value.debit_count)
+                    && value.icmp_samples == 0
+                    && value.transport_samples == 0
+                    && value.cpu_samples == 0 => {}
+            _ => return Err(
+                "native Auto-Tune unavailable topology direction contradicts its bounded evidence"
+                    .to_string(),
+            ),
+        }
+        match value.direction {
+            EvidenceDirection::Download => self.topology_download_unavailable = Some(value),
+            EvidenceDirection::Upload => self.topology_upload_unavailable = Some(value),
+        }
+        self.pending_measurement_debits = PendingMeasurementDebits::None;
+        Ok(())
+    }
+
+    fn unreviewable_terminal_code(&self) -> Option<&'static str> {
+        if self.raw_fallback_built {
+            return None;
+        }
+        if self.pair_exhausted {
+            return Some(PAIR_OPTIONS_UNREVIEWABLE);
+        }
+        if self.proposal_seen && self.search_terminal_boundary_reached() {
+            return Some(SEARCH_OPTIONS_UNREVIEWABLE);
+        }
+        None
+    }
+
+    fn search_terminal_boundary_reached(&self) -> bool {
+        if !self.download_search_complete {
+            self.search_download_unobserved_exhausted || self.search_download_inconclusive.is_some()
+        } else if !self.upload_search_complete {
+            self.search_upload_unobserved_exhausted || self.search_upload_inconclusive.is_some()
+        } else {
+            false
+        }
+    }
+
     pub fn next_action(&self) -> Result<AutotuneAction, String> {
         if self.review_digest.is_some() {
             return Ok(AutotuneAction::Complete);
         }
         if self.runtime_restored {
+            if let Some(code) = self.unreviewable_terminal_code() {
+                return Ok(AutotuneAction::PublishInconclusive { code });
+            }
             return Ok(AutotuneAction::PublishReview);
         }
         if self.topologies_compared || self.raw_fallback_built {
@@ -6128,10 +6602,7 @@ impl AutotuneReplayState {
             return if self.raw_fallback_available() {
                 Ok(AutotuneAction::BuildRawFallback)
             } else {
-                Err(
-                    "native Auto-Tune exhausted every shaped pair without raw fallback authority"
-                        .to_string(),
-                )
+                Ok(AutotuneAction::RestoreRuntime)
             };
         }
         if self.pair_confirmed {
@@ -6144,16 +6615,11 @@ impl AutotuneReplayState {
             if self.raw_fallback_available() {
                 return Ok(AutotuneAction::BuildRawFallback);
             }
-            if (!self.download_search_complete && self.search_download_unobserved_exhausted)
-                || (self.download_search_complete && self.search_upload_unobserved_exhausted)
-            {
+            if self.search_terminal_boundary_reached() {
                 return if self.raw_fallback_available() {
                     Ok(AutotuneAction::BuildRawFallback)
                 } else {
-                    Err(
-                        "native Auto-Tune search exhausted its floor without raw fallback authority"
-                            .to_string(),
-                    )
+                    Ok(AutotuneAction::RestoreRuntime)
                 };
             }
             return Ok(AutotuneAction::Search(if self.download_search_complete {
@@ -6363,12 +6829,21 @@ impl AutotuneReplayState {
                 )
             }
             AutotuneAction::CompareTopologies => {
-                let completed = u32::from(
-                    self.topology_download_repeat_count + self.topology_upload_repeat_count,
-                );
+                let download_completed = if self.topology_download_unavailable.is_some() {
+                    MAX_TOPOLOGY_REPEAT_ATTEMPTS_PER_DIRECTION
+                } else {
+                    self.topology_download_repeat_count
+                };
+                let upload_completed = if self.topology_upload_unavailable.is_some() {
+                    MAX_TOPOLOGY_REPEAT_ATTEMPTS_PER_DIRECTION
+                } else {
+                    self.topology_upload_repeat_count
+                };
+                let completed = u32::from(download_completed + upload_completed);
                 let total = u32::from(MAX_TOPOLOGY_REPEAT_ATTEMPTS_PER_DIRECTION) * 2;
-                let (step, direction) = if self.topology_download_repeat_count
-                    < MAX_TOPOLOGY_REPEAT_ATTEMPTS_PER_DIRECTION
+                let (step, direction) = if self.topology_download_unavailable.is_none()
+                    && self.topology_download_repeat_count
+                        < MAX_TOPOLOGY_REPEAT_ATTEMPTS_PER_DIRECTION
                 {
                     (
                         NativeAutotuneProgressStep::ComparingDownloadWithoutSqm,
@@ -6403,6 +6878,15 @@ impl AutotuneReplayState {
                 NativeAutotuneProgressStep::RestoringSettings,
                 94,
                 9,
+                0,
+                0,
+                None,
+                None,
+            ),
+            AutotuneAction::PublishInconclusive { .. } => self.progress_record(
+                NativeAutotuneProgressStep::PreparingDiagnostics,
+                98,
+                10,
                 0,
                 0,
                 None,
@@ -6675,6 +7159,24 @@ fn proposal_inputs_from_evidence(
                     SpeedtestDirection::Both => {
                         return Err(
                             "native Auto-Tune proposal cannot use a bidirectional control"
+                                .to_string(),
+                        )
+                    }
+                }
+            }
+            AutotuneEvidence::RawControlCapacity(value)
+                if record.phase == AutotunePhase::RawControls =>
+            {
+                match value.direction {
+                    SpeedtestDirection::Download => {
+                        download_samples_kbps.push(value.achieved_kbps as f64)
+                    }
+                    SpeedtestDirection::Upload => {
+                        upload_samples_kbps.push(value.achieved_kbps as f64)
+                    }
+                    SpeedtestDirection::Both => {
+                        return Err(
+                            "native Auto-Tune proposal cannot use bidirectional raw capacity"
                                 .to_string(),
                         )
                     }
@@ -7450,6 +7952,7 @@ fn native_profile_search_result(
 }
 
 fn canonical_profile_search_bytes(result: &ProfileSearchResult) -> Result<Vec<u8>, String> {
+    result.validate_review_alignment()?;
     let mut bytes = result.to_json().into_bytes();
     bytes.push(b'\n');
     if bytes.len() > MAX_AUTOTUNE_REVIEW_BYTES {
@@ -8433,7 +8936,7 @@ struct NativeTopologyDirectionResult {
 
 impl NativeTopologyDirectionResult {
     fn auto_apply_eligible(&self) -> bool {
-        self.choice == TopologyDirectionChoice::Shaped
+        self.choice == TopologyDirectionChoice::Shaped && self.reason != "comparison-unmeasurable"
             || (self.measurement_reliable && self.raw_target_met && self.safety_pass)
     }
 
@@ -8826,6 +9329,82 @@ struct NativeRawFallbackResult {
     upload: NativeRawFallbackDirectionResult,
     required_acknowledgements: Vec<NativeApplyAcknowledgement>,
     mobile_download_bypass: Option<NativeMobileDownloadBypassOutcome>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NativeShapedCapacityFallbackResult {
+    failed_direction: EvidenceDirection,
+    boundary: NativeRawFallbackBoundary,
+    selected_dl_kbps: u64,
+    selected_ul_kbps: u64,
+    raw_download_capacity_kbps: Vec<u64>,
+    raw_upload_capacity_kbps: Vec<u64>,
+    required_acknowledgements: Vec<NativeApplyAcknowledgement>,
+}
+
+impl NativeShapedCapacityFallbackResult {
+    fn to_json(&self) -> String {
+        let rates = |values: &[u64]| {
+            values
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let acknowledgements = self
+            .required_acknowledgements
+            .iter()
+            .map(|value| json_string(value.as_str()))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            concat!(
+                "{{\"schema_version\":6,\"selected_topology\":\"both_shaped\",",
+                "\"reason\":\"loaded-latency-unobservable\",",
+                "\"failed_direction\":\"{}\",",
+                "\"terminal_boundary\":{{\"kind\":\"{}\",\"candidate_kbps\":{}}},",
+                "\"selected_rates_kbps\":{{\"download\":{},\"upload\":{}}},",
+                "\"raw_capacity_kbps\":{{\"download\":[{}],\"upload\":[{}]}},",
+                "\"latency_grade\":null,\"auto_apply_pass\":false,",
+                "\"manual_review_required\":true,",
+                "\"adaptive_ceiling\":{{\"download\":{{\"safe_kbps\":0,",
+                "\"cap_kbps\":{},\"evidence\":\"legacy_unverified\"}},",
+                "\"upload\":{{\"safe_kbps\":0,\"cap_kbps\":{},",
+                "\"evidence\":\"legacy_unverified\"}}}},",
+                "\"required_acknowledgements\":[{}]}}"
+            ),
+            self.failed_direction.as_str(),
+            self.boundary.kind(),
+            self.boundary
+                .candidate_kbps()
+                .unwrap_or_else(|| match self.failed_direction {
+                    EvidenceDirection::Download => self.selected_dl_kbps,
+                    EvidenceDirection::Upload => self.selected_ul_kbps,
+                }),
+            self.selected_dl_kbps,
+            self.selected_ul_kbps,
+            rates(&self.raw_download_capacity_kbps),
+            rates(&self.raw_upload_capacity_kbps),
+            self.selected_dl_kbps,
+            self.selected_ul_kbps,
+            acknowledgements,
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum NativeTerminalFallbackResult {
+    Raw(NativeRawFallbackResult),
+    ShapedCapacity(NativeShapedCapacityFallbackResult),
+}
+
+impl NativeTerminalFallbackResult {
+    fn to_json(&self) -> String {
+        match self {
+            Self::Raw(value) => value.to_json(),
+            Self::ShapedCapacity(value) => value.to_json(),
+        }
+    }
 }
 
 impl NativeRawFallbackResult {
@@ -9235,29 +9814,16 @@ fn native_mobile_download_bypass_outcome(
     )))
 }
 
-fn native_raw_fallback_result_with_mobile_confirmation(
+fn native_raw_fallback_result(
     request: &OperationRequest,
     worker_run_id: &str,
     proposal: &AutotuneProposal,
     records: &[AutotuneEvidenceRecord],
-    require_mobile_confirmation: bool,
 ) -> Result<NativeRawFallbackResult, String> {
     let replay = AutotuneReplayState::replay(request, worker_run_id, records)?;
     let next_action = replay.next_action()?;
-    if require_mobile_confirmation && next_action != AutotuneAction::BuildRawFallback {
+    if next_action != AutotuneAction::BuildRawFallback {
         return Err("native raw fallback requires an exhausted shaped search".to_string());
-    }
-    if !require_mobile_confirmation
-        && (next_action != AutotuneAction::ConfirmMobileDownloadBypass
-            || !mobile_download_bypass_required(request)
-            || replay.mobile_bypass_download_complete
-            || replay.mobile_bypass_upload_complete
-            || replay.mobile_bypass_unavailable.is_some())
-    {
-        return Err(
-            "legacy native raw fallback is not an untouched mobile pair-exhaustion transaction"
-                .to_string(),
-        );
     }
     let (failed_direction, boundary) = replay
         .raw_fallback_boundary()
@@ -9344,7 +9910,7 @@ fn native_raw_fallback_result_with_mobile_confirmation(
     let upload =
         native_raw_fallback_direction_result(proposal, records, EvidenceDirection::Upload)?;
     let required_acknowledgements = raw_fallback_acknowledgements(&download, &upload);
-    let mobile_download_bypass = if require_mobile_confirmation
+    let mobile_download_bypass = if mobile_download_bypass_required(request)
         && matches!(boundary, NativeRawFallbackBoundary::PairExhausted { .. })
     {
         native_mobile_download_bypass_outcome(request, proposal, records)?
@@ -9372,19 +9938,222 @@ fn native_raw_fallback_result_with_mobile_confirmation(
     })
 }
 
-fn native_raw_fallback_result(
+fn native_shaped_capacity_fallback_result(
     request: &OperationRequest,
     worker_run_id: &str,
     proposal: &AutotuneProposal,
     records: &[AutotuneEvidenceRecord],
-) -> Result<NativeRawFallbackResult, String> {
-    native_raw_fallback_result_with_mobile_confirmation(
-        request,
-        worker_run_id,
-        proposal,
-        records,
-        true,
-    )
+) -> Result<NativeShapedCapacityFallbackResult, String> {
+    let replay = AutotuneReplayState::replay(request, worker_run_id, records)?;
+    if replay.next_action()? != AutotuneAction::BuildRawFallback {
+        return Err(
+            "native shaped-capacity fallback requires an exhausted shaped search".to_string(),
+        );
+    }
+    let (failed_direction, boundary) = replay
+        .raw_fallback_boundary()
+        .ok_or_else(|| "native shaped-capacity fallback has no terminal boundary".to_string())?;
+    let failed_direction = failed_direction
+        .ok_or_else(|| "native shaped-capacity fallback has no failed direction".to_string())?;
+    if !matches!(
+        boundary,
+        NativeRawFallbackBoundary::UnobservedFloor
+            | NativeRawFallbackBoundary::ObservationStarved { .. }
+            | NativeRawFallbackBoundary::TransferUnmeasurable { .. }
+    ) {
+        return Err(
+            "native shaped-capacity fallback boundary is not a latency-starved search".to_string(),
+        );
+    }
+    let terminal_candidate = records
+        .iter()
+        .rev()
+        .find_map(|record| {
+            if record.phase != AutotunePhase::DirectionalSearch {
+                return None;
+            }
+            match record.evidence {
+                AutotuneEvidence::SearchObservationStarved(value) => Some((
+                    value.topology,
+                    value.direction,
+                    value.candidate_dl_kbps,
+                    value.candidate_ul_kbps,
+                    value.next_candidate_kbps,
+                )),
+                AutotuneEvidence::SearchProbeUnmeasurable(value) => Some((
+                    value.topology,
+                    value.direction,
+                    value.candidate_dl_kbps,
+                    value.candidate_ul_kbps,
+                    value.next_candidate_kbps,
+                )),
+                _ => None,
+            }
+        })
+        .ok_or_else(|| {
+            "native shaped-capacity fallback has no exact failed candidate".to_string()
+        })?;
+    let failed_speedtest_direction = match failed_direction {
+        EvidenceDirection::Download => SpeedtestDirection::Download,
+        EvidenceDirection::Upload => SpeedtestDirection::Upload,
+    };
+    if terminal_candidate.0 != MeasurementTopology::ShapedBoth
+        || terminal_candidate.1 != failed_speedtest_direction
+        || terminal_candidate.4.is_some()
+        || boundary.candidate_kbps().is_some_and(|candidate| {
+            candidate
+                != match failed_direction {
+                    EvidenceDirection::Download => terminal_candidate.2,
+                    EvidenceDirection::Upload => terminal_candidate.3,
+                }
+        })
+    {
+        return Err(
+            "native shaped-capacity fallback candidate contradicts its terminal boundary"
+                .to_string(),
+        );
+    }
+    let capacity_only_count = records
+        .iter()
+        .filter(|record| {
+            record.phase == AutotunePhase::RawControls
+                && matches!(record.evidence, AutotuneEvidence::RawControlCapacity(_))
+        })
+        .count();
+    if capacity_only_count == 0 {
+        return Err(
+            "native shaped-capacity fallback requires capacity-only raw evidence".to_string(),
+        );
+    }
+    let capacities = records
+        .iter()
+        .filter_map(|record| match record.evidence {
+            AutotuneEvidence::RawControlCapacity(value)
+                if record.phase == AutotunePhase::RawControls =>
+            {
+                Some((value.topology, value.direction, value.achieved_kbps))
+            }
+            AutotuneEvidence::Measurement(value) if record.phase == AutotunePhase::RawControls => {
+                let achieved_kbps = match value.direction {
+                    SpeedtestDirection::Download => value.achieved_dl_kbps,
+                    SpeedtestDirection::Upload => value.achieved_ul_kbps,
+                    SpeedtestDirection::Both => None,
+                }?;
+                Some((value.topology, value.direction, achieved_kbps))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let expected = [
+        (
+            MeasurementTopology::RawDownload,
+            SpeedtestDirection::Download,
+        ),
+        (MeasurementTopology::RawUpload, SpeedtestDirection::Upload),
+        (MeasurementTopology::RawBoth, SpeedtestDirection::Download),
+        (MeasurementTopology::RawBoth, SpeedtestDirection::Upload),
+    ];
+    if capacities.len() != expected.len()
+        || capacities
+            .iter()
+            .zip(expected)
+            .any(|(value, expected)| (value.0, value.1) != expected)
+    {
+        return Err("native shaped-capacity fallback requires four exact raw controls".to_string());
+    }
+    let raw_download_capacity_kbps = capacities
+        .iter()
+        .filter(|value| value.1 == SpeedtestDirection::Download)
+        .map(|value| value.2)
+        .collect::<Vec<_>>();
+    let raw_upload_capacity_kbps = capacities
+        .iter()
+        .filter(|value| value.1 == SpeedtestDirection::Upload)
+        .map(|value| value.2)
+        .collect::<Vec<_>>();
+    let (selected_dl_kbps, selected_ul_kbps) = (terminal_candidate.2, terminal_candidate.3);
+    for (label, selected, direction_proposal) in [
+        ("download", selected_dl_kbps, proposal.download),
+        ("upload", selected_ul_kbps, proposal.upload),
+    ] {
+        if selected < direction_proposal.exploration_minimum_kbps
+            || selected > direction_proposal.exploration_cap_kbps
+            || selected > direction_proposal.absolute_cap_kbps
+            || direction_proposal
+                .service_hard_cap_kbps
+                .is_some_and(|cap| selected > cap)
+        {
+            return Err(format!(
+                "native shaped-capacity fallback {label} rate escaped the proposal"
+            ));
+        }
+    }
+    Ok(NativeShapedCapacityFallbackResult {
+        failed_direction,
+        boundary,
+        selected_dl_kbps,
+        selected_ul_kbps,
+        raw_download_capacity_kbps,
+        raw_upload_capacity_kbps,
+        required_acknowledgements: vec![
+            NativeApplyAcknowledgement::LoadedLatencyUnobservable,
+            NativeApplyAcknowledgement::ShapedValidationIncomplete,
+        ],
+    })
+}
+
+fn native_terminal_fallback_result(
+    request: &OperationRequest,
+    worker_run_id: &str,
+    proposal: &AutotuneProposal,
+    records: &[AutotuneEvidenceRecord],
+) -> Result<NativeTerminalFallbackResult, String> {
+    if records.iter().any(|record| {
+        record.phase == AutotunePhase::RawControls
+            && matches!(record.evidence, AutotuneEvidence::RawControlCapacity(_))
+    }) {
+        native_shaped_capacity_fallback_result(request, worker_run_id, proposal, records)
+            .map(NativeTerminalFallbackResult::ShapedCapacity)
+    } else {
+        native_raw_fallback_result(request, worker_run_id, proposal, records)
+            .map(NativeTerminalFallbackResult::Raw)
+    }
+}
+
+fn canonical_terminal_fallback_bytes(
+    result: &NativeTerminalFallbackResult,
+) -> Result<Vec<u8>, String> {
+    let mut bytes = result.to_json().into_bytes();
+    bytes.push(b'\n');
+    if bytes.len() > MAX_AUTOTUNE_REVIEW_BYTES {
+        return Err("native terminal fallback exceeds its size bound".to_string());
+    }
+    Ok(bytes)
+}
+
+fn publish_native_terminal_fallback(
+    job_directory: &Path,
+    result: &NativeTerminalFallbackResult,
+) -> Result<(PathBuf, String), String> {
+    ensure_private_directory(job_directory)?;
+    let path = job_directory.join(RAW_FALLBACK_FILE);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => return Err("native terminal fallback already exists".to_string()),
+        Err(error) => {
+            return Err(format!(
+                "unable to inspect native terminal-fallback destination: {error}"
+            ))
+        }
+    }
+    let bytes = canonical_terminal_fallback_bytes(result)?;
+    let digest = sqm_identity::sha256sum(&bytes)?;
+    atomic_private_write(&path, &bytes)?;
+    let stored = read_private_bounded(&path, MAX_AUTOTUNE_REVIEW_BYTES)?;
+    if stored.as_bytes() != bytes || sqm_identity::sha256sum(stored.as_bytes())? != digest {
+        return Err("native terminal-fallback publication mismatch".to_string());
+    }
+    Ok((path, digest))
 }
 
 fn canonical_raw_fallback_bytes(result: &NativeRawFallbackResult) -> Result<Vec<u8>, String> {
@@ -9396,6 +10165,7 @@ fn canonical_raw_fallback_bytes(result: &NativeRawFallbackResult) -> Result<Vec<
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn publish_native_raw_fallback(
     job_directory: &Path,
     result: &NativeRawFallbackResult,
@@ -9446,21 +10216,7 @@ fn verify_native_raw_fallback_transaction(
     };
     require_hex("native raw-fallback digest", digest, 64)?;
     let stored = read_private_bounded(result_path, MAX_AUTOTUNE_REVIEW_BYTES)?;
-    let result = match native_raw_fallback_result(request, worker_run_id, proposal, source_records)
-    {
-        Ok(result) => result,
-        Err(strict_error) if stored.as_bytes().starts_with(b"{\"schema_version\":3,") => {
-            native_raw_fallback_result_with_mobile_confirmation(
-                request,
-                worker_run_id,
-                proposal,
-                source_records,
-                false,
-            )
-            .map_err(|_| strict_error)?
-        }
-        Err(error) => return Err(error),
-    };
+    let result = native_raw_fallback_result(request, worker_run_id, proposal, source_records)?;
     let replay = AutotuneReplayState::replay(request, worker_run_id, transaction_records)?;
     if replay.next_action()? != AutotuneAction::RestoreRuntime {
         return Err("native raw-fallback transaction did not reach restore".to_string());
@@ -9471,6 +10227,61 @@ fn verify_native_raw_fallback_transaction(
         return Err("native raw-fallback digest mismatch".to_string());
     }
     Ok(result)
+}
+
+fn verify_native_terminal_fallback_transaction(
+    request: &OperationRequest,
+    worker_run_id: &str,
+    proposal: &AutotuneProposal,
+    records: &[AutotuneEvidenceRecord],
+    result_path: &Path,
+) -> Result<NativeTerminalFallbackResult, String> {
+    let stored = read_private_bounded(result_path, MAX_AUTOTUNE_REVIEW_BYTES)?;
+    if !stored
+        .as_bytes()
+        .starts_with(b"{\"schema_version\":6,\"selected_topology\":\"both_shaped\",")
+    {
+        return verify_native_raw_fallback_transaction(
+            request,
+            worker_run_id,
+            proposal,
+            records,
+            result_path,
+        )
+        .map(NativeTerminalFallbackResult::Raw);
+    }
+    let terminal_index = records
+        .iter()
+        .position(|record| matches!(record.evidence, AutotuneEvidence::RawFallbackBuilt { .. }))
+        .ok_or_else(|| {
+            "native terminal-fallback transaction has no completion evidence".to_string()
+        })?;
+    let transaction_records = &records[..=terminal_index];
+    let (terminal, source_records) = transaction_records
+        .split_last()
+        .ok_or_else(|| "native terminal-fallback transaction has no evidence".to_string())?;
+    let digest = match &terminal.evidence {
+        AutotuneEvidence::RawFallbackBuilt { digest }
+            if terminal.phase == AutotunePhase::TopologyComparison =>
+        {
+            digest
+        }
+        _ => return Err("native terminal-fallback evidence is invalid".to_string()),
+    };
+    require_hex("native terminal-fallback digest", digest, 64)?;
+    let result =
+        native_shaped_capacity_fallback_result(request, worker_run_id, proposal, source_records)?;
+    let replay = AutotuneReplayState::replay(request, worker_run_id, transaction_records)?;
+    if replay.next_action()? != AutotuneAction::RestoreRuntime {
+        return Err("native terminal-fallback transaction did not reach restore".to_string());
+    }
+    let typed = NativeTerminalFallbackResult::ShapedCapacity(result);
+    let bytes = canonical_terminal_fallback_bytes(&typed)?;
+    if stored.as_bytes() != bytes || sqm_identity::sha256sum(stored.as_bytes())? != digest.as_str()
+    {
+        return Err("native terminal-fallback digest mismatch".to_string());
+    }
+    Ok(typed)
 }
 
 fn topology_repeat_count(records: &[AutotuneEvidenceRecord], direction: EvidenceDirection) -> u8 {
@@ -9530,6 +10341,7 @@ fn native_topology_direction_result(
     records: &[AutotuneEvidenceRecord],
     direction: EvidenceDirection,
     comparison_available: bool,
+    comparison_unavailable: bool,
     repeat_budget_available: bool,
 ) -> Result<NativeTopologyDirectionResult, String> {
     let (shaped_achieved_kbps, shaped_rate) = match direction {
@@ -9573,6 +10385,33 @@ fn native_topology_direction_result(
             retry_exhausted: false,
             material_gain_percent: 0.0,
             reason: "comparison-not-requested",
+        });
+    }
+    if comparison_unavailable {
+        return Ok(NativeTopologyDirectionResult {
+            direction,
+            choice: TopologyDirectionChoice::Shaped,
+            shaped_achieved_kbps,
+            shaped_effective_delta_ms,
+            shaped_grade,
+            shaped_transport_censored: pair.measurement.transport_censored,
+            raw_achieved_kbps: None,
+            raw_effective_delta_ms: None,
+            raw_grade: None,
+            raw_transport_censored: false,
+            raw_sample_count: 0,
+            clean_sample_count: 0,
+            repeat_count: topology_repeat_count(records, direction),
+            rate_consistent: false,
+            target_status_consistent: false,
+            raw_target_met: false,
+            measurement_reliable: false,
+            contaminated: false,
+            safety_pass: false,
+            needs_repeat: false,
+            retry_exhausted: true,
+            material_gain_percent: 0.0,
+            reason: "comparison-unmeasurable",
         });
     }
 
@@ -9733,6 +10572,24 @@ fn native_topology_comparison_result(
         request.allow_sqm_disable,
     );
     let remaining_traffic_budget = replay_remaining_traffic_budget(request, records)?;
+    let topology_download_unavailable = records.iter().any(|record| {
+        matches!(
+            record.evidence,
+            AutotuneEvidence::TopologyDirectionUnavailable(TopologyDirectionUnavailableEvidence {
+                direction: EvidenceDirection::Download,
+                ..
+            })
+        )
+    });
+    let topology_upload_unavailable = records.iter().any(|record| {
+        matches!(
+            record.evidence,
+            AutotuneEvidence::TopologyDirectionUnavailable(TopologyDirectionUnavailableEvidence {
+                direction: EvidenceDirection::Upload,
+                ..
+            })
+        )
+    });
     let repeat_budget_available = |direction| {
         let bound = match direction {
             EvidenceDirection::Download => request.service_dl_cap_kbps.unwrap_or(MAX_RATE_KBPS),
@@ -9754,6 +10611,7 @@ fn native_topology_comparison_result(
         records,
         EvidenceDirection::Download,
         comparison_available,
+        topology_download_unavailable,
         repeat_budget_available(EvidenceDirection::Download),
     )?;
     let upload = native_topology_direction_result(
@@ -9762,6 +10620,7 @@ fn native_topology_comparison_result(
         records,
         EvidenceDirection::Upload,
         comparison_available,
+        topology_upload_unavailable,
         repeat_budget_available(EvidenceDirection::Upload),
     )?;
     let selected_topology = match (download.choice, upload.choice) {
@@ -9818,6 +10677,11 @@ fn native_topology_comparison_result(
 fn topology_comparison_traffic_budget_limited(topology: &NativeTopologyComparisonResult) -> bool {
     topology.download.reason == "traffic-budget-limited"
         || topology.upload.reason == "traffic-budget-limited"
+}
+
+fn topology_comparison_unmeasurable(topology: &NativeTopologyComparisonResult) -> bool {
+    topology.download.reason == "comparison-unmeasurable"
+        || topology.upload.reason == "comparison-unmeasurable"
 }
 
 fn native_topology_apply_acknowledgements(
@@ -9894,6 +10758,9 @@ fn native_topology_apply_acknowledgements(
     if topology_comparison_traffic_budget_limited(topology) {
         values.push(NativeApplyAcknowledgement::TopologyComparisonTrafficBudget);
     }
+    if topology_comparison_unmeasurable(topology) {
+        values.push(NativeApplyAcknowledgement::TopologyComparisonUnmeasurable);
+    }
     match selected_topology {
         MeasurementTopology::DownloadOnlyShaped => {
             values.push(NativeApplyAcknowledgement::UploadShapingBypassed)
@@ -9944,6 +10811,9 @@ fn native_pair_apply_acknowledgements(
     let mut values = option.required_acknowledgements()?;
     if topology_comparison_traffic_budget_limited(topology) {
         values.push(NativeApplyAcknowledgement::TopologyComparisonTrafficBudget);
+    }
+    if topology_comparison_unmeasurable(topology) {
+        values.push(NativeApplyAcknowledgement::TopologyComparisonUnmeasurable);
     }
     values.sort_unstable();
     values.dedup();
@@ -10418,18 +11288,14 @@ fn native_proposal_transaction_prefix(
 #[derive(Clone, Debug, PartialEq)]
 struct NativeApplyOptionPlan {
     option_id: String,
-    legacy_preferred: bool,
+    preferred: bool,
     plan: NativeApplyExecutionPlan,
 }
 
 fn validate_native_apply_option_catalog(plans: &[NativeApplyOptionPlan]) -> Result<(), String> {
     if plans.is_empty()
         || plans.len() > MAX_NATIVE_APPLY_REVIEW_OPTIONS
-        || plans
-            .iter()
-            .filter(|option| option.legacy_preferred)
-            .count()
-            != 1
+        || plans.iter().filter(|option| option.preferred).count() != 1
     {
         return Err("native Apply option catalog has no unique preferred plan".to_string());
     }
@@ -10506,59 +11372,88 @@ fn native_apply_execution_plans_transaction(
         raw_fallback: raw_fallback_digest,
     } = &digests
     {
-        let raw_fallback = verify_native_raw_fallback_transaction(
+        let terminal_fallback = verify_native_terminal_fallback_transaction(
             &request,
             expected_worker_run_id,
             &proposal,
             &records,
             &job_directory.join(RAW_FALLBACK_FILE),
         )?;
-        let plan = NativeApplyExecutionPlan::from_verified_raw_fallback(
-            NativeRawFallbackApplyManifestInput {
-                option_id: "no_sqm",
-                request: &request,
-                worker_run_id: expected_worker_run_id,
-                review_digest: expected_review_digest,
-                coordinator_boot_id,
-                coordinator_generation,
-                proposal: &proposal,
-                required_acknowledgements: &raw_fallback.required_acknowledgements,
-                proposal_digest,
-                raw_fallback_digest,
-            },
-        )?;
-        let mut plans = vec![NativeApplyOptionPlan {
-            option_id: "no_sqm".to_string(),
-            legacy_preferred: true,
-            plan,
-        }];
-        if let Some(NativeMobileDownloadBypassOutcome::Confirmed(directional)) =
-            &raw_fallback.mobile_download_bypass
-        {
-            if directional.manual_apply_eligible {
-                let plan = NativeApplyExecutionPlan::from_verified_directional_raw_fallback(
-                    NativeDirectionalRawFallbackApplyManifestInput {
-                        option_id: "bypass_download",
+        let plans = match &terminal_fallback {
+            NativeTerminalFallbackResult::Raw(raw_fallback) => {
+                let plan = NativeApplyExecutionPlan::from_verified_raw_fallback(
+                    NativeRawFallbackApplyManifestInput {
+                        option_id: "no_sqm",
                         request: &request,
                         worker_run_id: expected_worker_run_id,
                         review_digest: expected_review_digest,
                         coordinator_boot_id,
                         coordinator_generation,
                         proposal: &proposal,
-                        selected_ul_kbps: directional.selected_ul_kbps,
-                        runtime_minimum_ul_kbps: directional.runtime_minimum_ul_kbps,
-                        required_acknowledgements: &directional.required_acknowledgements,
+                        required_acknowledgements: &raw_fallback.required_acknowledgements,
                         proposal_digest,
                         raw_fallback_digest,
                     },
                 )?;
-                plans.push(NativeApplyOptionPlan {
-                    option_id: "bypass_download".to_string(),
-                    legacy_preferred: false,
+                let mut values = vec![NativeApplyOptionPlan {
+                    option_id: "no_sqm".to_string(),
+                    preferred: true,
                     plan,
-                });
+                }];
+                if let Some(NativeMobileDownloadBypassOutcome::Confirmed(directional)) =
+                    &raw_fallback.mobile_download_bypass
+                {
+                    if directional.manual_apply_eligible {
+                        let plan =
+                            NativeApplyExecutionPlan::from_verified_directional_raw_fallback(
+                                NativeDirectionalRawFallbackApplyManifestInput {
+                                    option_id: "bypass_download",
+                                    request: &request,
+                                    worker_run_id: expected_worker_run_id,
+                                    review_digest: expected_review_digest,
+                                    coordinator_boot_id,
+                                    coordinator_generation,
+                                    proposal: &proposal,
+                                    selected_ul_kbps: directional.selected_ul_kbps,
+                                    runtime_minimum_ul_kbps: directional.runtime_minimum_ul_kbps,
+                                    required_acknowledgements: &directional
+                                        .required_acknowledgements,
+                                    proposal_digest,
+                                    raw_fallback_digest,
+                                },
+                            )?;
+                        values.push(NativeApplyOptionPlan {
+                            option_id: "bypass_download".to_string(),
+                            preferred: false,
+                            plan,
+                        });
+                    }
+                }
+                values
             }
-        }
+            NativeTerminalFallbackResult::ShapedCapacity(fallback) => {
+                vec![NativeApplyOptionPlan {
+                    option_id: "capacity_only_shaped".to_string(),
+                    preferred: true,
+                    plan: NativeApplyExecutionPlan::from_verified_shaped_capacity_fallback(
+                        NativeShapedCapacityFallbackApplyManifestInput {
+                            option_id: "capacity_only_shaped",
+                            request: &request,
+                            worker_run_id: expected_worker_run_id,
+                            review_digest: expected_review_digest,
+                            coordinator_boot_id,
+                            coordinator_generation,
+                            proposal: &proposal,
+                            selected_dl_kbps: fallback.selected_dl_kbps,
+                            selected_ul_kbps: fallback.selected_ul_kbps,
+                            required_acknowledgements: &fallback.required_acknowledgements,
+                            proposal_digest,
+                            fallback_digest: raw_fallback_digest,
+                        },
+                    )?,
+                }]
+            }
+        };
         validate_native_apply_option_catalog(&plans)?;
         return Ok(plans);
     }
@@ -10667,7 +11562,7 @@ fn native_apply_execution_plans_transaction(
             let required_acknowledgements = native_pair_apply_acknowledgements(option, &topology)?;
             Ok(NativeApplyOptionPlan {
                 option_id: option.role.as_str().to_string(),
-                legacy_preferred: topology.selected_topology == MeasurementTopology::ShapedBoth
+                preferred: topology.selected_topology == MeasurementTopology::ShapedBoth
                     && Some(option.selected_dl_kbps) == topology.selected_dl_kbps
                     && Some(option.selected_ul_kbps) == topology.selected_ul_kbps,
                 plan: build(
@@ -10697,7 +11592,7 @@ fn native_apply_execution_plans_transaction(
             native_topology_apply_acknowledgements(&pair, &topology, topology.selected_topology)?;
         plans.push(NativeApplyOptionPlan {
             option_id: option_id.to_string(),
-            legacy_preferred: true,
+            preferred: true,
             plan: build(
                 option_id,
                 topology.selected_topology,
@@ -10718,7 +11613,7 @@ fn native_apply_execution_plans_transaction(
             native_topology_apply_acknowledgements(&pair, &topology, selected_topology)?;
         plans.push(NativeApplyOptionPlan {
             option_id: "bypass_download".to_string(),
-            legacy_preferred: false,
+            preferred: false,
             plan: build(
                 "bypass_download",
                 selected_topology,
@@ -10753,7 +11648,7 @@ pub(crate) fn native_apply_execution_plan_transaction(
         coordinator_generation,
     )?
     .into_iter()
-    .find(|option| option.legacy_preferred)
+    .find(|option| option.preferred)
     .map(|option| option.plan)
     .ok_or_else(|| "native Apply option catalog lost its preferred plan".to_string())
 }
@@ -11100,7 +11995,7 @@ pub(crate) fn canonical_native_public_result_transaction(
     )?;
     if option_plans
         .iter()
-        .find(|option| option.legacy_preferred)
+        .find(|option| option.preferred)
         .map(|option| &option.plan)
         != Some(&apply_plan)
     {
@@ -11108,7 +12003,7 @@ pub(crate) fn canonical_native_public_result_transaction(
     }
     let mut apply_confirmations = Vec::with_capacity(option_plans.len());
     for option in option_plans {
-        let (path, digest) = if option.legacy_preferred {
+        let (path, digest) = if option.preferred {
             (manifest_path.to_path_buf(), apply_manifest_digest.clone())
         } else {
             let path = job_directory.join(format!(
@@ -11131,7 +12026,7 @@ pub(crate) fn canonical_native_public_result_transaction(
         }
         apply_confirmations.push(NativePublicApplyConfirmation::from_verified_plan(
             &option.option_id,
-            option.legacy_preferred,
+            option.preferred,
             &option.plan,
             &digest,
         )?);
@@ -11263,7 +12158,7 @@ pub(crate) fn publish_native_public_result_transaction(
 const RUNTIME_ACK_POLL: Duration = Duration::from_millis(100);
 const LOADED_CAPTURE_PROGRESS_WAIT: Duration = Duration::from_secs(5);
 const MAX_DIRECTIONAL_LOAD_RUNS: u8 = 3;
-const MAX_DIRECTIONAL_RESULT_UNAVAILABLE_RUNS: u8 = 2;
+const MAX_DIRECTIONAL_RESULT_UNAVAILABLE_RUNS: u8 = 3;
 const CANDIDATE_OBSERVATION_STARVED_REASON: &str = "candidate-observation-starved";
 const CANDIDATE_TRANSFER_UNMEASURABLE_REASON: &str = "candidate-transfer-unmeasurable";
 const CANDIDATE_UNOBSERVED_ATTEMPT_LIMIT_REASON: &str =
@@ -11273,11 +12168,11 @@ const CANDIDATE_UNOBSERVED_ATTEMPT_LIMIT_REASON: &str =
 enum CaptureWaitError {
     Rejected(String),
     ObservationStarved {
-        topology: MeasurementTopology,
-        direction: SpeedtestDirection,
-        run_count: u8,
+        load: Box<AutotuneLoadEvidence>,
         icmp_samples: u32,
         transport_samples: u32,
+        transport_timeout_count: u32,
+        transport_timeout_total_us: u64,
         cpu_samples: u32,
     },
     TransferUnmeasurable {
@@ -11299,7 +12194,14 @@ fn directional_load_error_disposition(
     error: &str,
     prior_unmeasurable_runs: u8,
 ) -> DirectionalLoadErrorDisposition {
-    if !completed_speedtest_output_is_unmeasurable(error) {
+    // The outer route-counter wrapper has already stopped/reaped the backend,
+    // read the closing counters, charged the exact traffic debit and invoked
+    // the durable debit callback before this error is interpreted.  A bounded
+    // backend timeout therefore proves spent traffic but no usable rate, just
+    // like completed malformed output.  Keep deadline, route, accounting and
+    // authority failures fatal; only this exact timeout joins the existing
+    // one-retry then TransferUnmeasurable path.
+    if !completed_speedtest_output_is_unmeasurable(error) && error != "speedtest-timeout" {
         return DirectionalLoadErrorDisposition::Fatal;
     }
     let unmeasurable_runs = prior_unmeasurable_runs.saturating_add(1);
@@ -11341,21 +12243,22 @@ impl From<CaptureWaitError> for String {
                 format!("native Auto-Tune capture was rejected: {code}")
             }
             CaptureWaitError::ObservationStarved {
-                topology,
-                direction,
-                run_count,
+                load,
                 icmp_samples,
                 transport_samples,
+                transport_timeout_count: _,
+                transport_timeout_total_us: _,
                 cpu_samples,
             } => format!(
                 "native Auto-Tune candidate observation starved after {run_count} runs (topology={}, direction={}; icmp={}/{}, transport={}/{}, cpu={}/1)",
-                topology.as_str(),
-                direction.as_str(),
+                load.request.topology.as_str(),
+                load.request.direction.expect("starved load is directional").as_str(),
                 icmp_samples,
                 MIN_AUTOTUNE_LOADED_ICMP_SAMPLES,
                 transport_samples,
                 MIN_AUTOTUNE_TRANSPORT_SAMPLES,
-                cpu_samples
+                cpu_samples,
+                run_count = load.run_count,
             ),
             CaptureWaitError::TransferUnmeasurable {
                 topology,
@@ -11580,25 +12483,6 @@ fn transition_runtime_after_capture_cleanup<T>(
 ) -> Result<T, String> {
     capture.cleanup();
     transition()
-}
-
-fn cleanup_legacy_load_sidecars(load_evidence_path: &Path) -> Result<(), String> {
-    for path in [
-        load_evidence_path.with_extension("backend-output"),
-        load_evidence_path.with_extension("backend-stderr"),
-    ] {
-        match fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "unable to remove legacy Auto-Tune speedtest sidecar {}: {error}",
-                    path.display()
-                ))
-            }
-        }
-    }
-    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -12861,6 +13745,7 @@ fn run_directional_capture_load_with_session(
             "native Auto-Tune controlled load produced no valid measurement".to_string(),
         ));
     }
+    let evidence = aggregate.evidence(request, monotonic_boot_ms()?)?;
     if !thresholds_met {
         if let Some(snapshot) = last_progress.as_ref() {
             // A non-zero CPU count proves that this exact capture identity was
@@ -12872,11 +13757,11 @@ fn run_directional_capture_load_with_session(
             // typed Rejected path above and can never reach this branch.
             if loaded_observation_starved(snapshot) {
                 return Err(CaptureWaitError::ObservationStarved {
-                    topology: request.topology,
-                    direction,
-                    run_count: aggregate.run_count,
+                    load: Box::new(evidence),
                     icmp_samples: snapshot.icmp_samples,
                     transport_samples: snapshot.transport_samples,
+                    transport_timeout_count: snapshot.transport_timeout_count,
+                    transport_timeout_total_us: snapshot.transport_timeout_total_us,
                     cpu_samples: snapshot.cpu_samples,
                 });
             }
@@ -12901,7 +13786,6 @@ fn run_directional_capture_load_with_session(
             direction.as_str()
         )));
     }
-    let evidence = aggregate.evidence(request, monotonic_boot_ms()?)?;
     publish_load_evidence(&capture.load_evidence_path, &evidence)?;
     let snapshot = wait_for_capture_state(
         &capture.snapshot_path,
@@ -13532,17 +14416,19 @@ fn append_pair_option_unavailable_from_error(
     let (failed_direction, reason, run_count, icmp_samples, transport_samples, cpu_samples) =
         match error {
             CaptureWaitError::ObservationStarved {
-                topology,
-                direction,
-                run_count,
+                load,
                 icmp_samples,
                 transport_samples,
+                transport_timeout_count: _,
+                transport_timeout_total_us: _,
                 cpu_samples,
-            } if topology == MeasurementTopology::ShapedBoth && direction == expected_direction => {
+            } if load.request.topology == MeasurementTopology::ShapedBoth
+                && load.request.direction == Some(expected_direction) =>
+            {
                 (
-                    direction,
+                    expected_direction,
                     PairOptionUnavailableReason::ObservationStarved,
-                    run_count,
+                    load.run_count,
                     icmp_samples,
                     transport_samples,
                     cpu_samples,
@@ -13607,7 +14493,7 @@ fn run_topology_repeat_capture(
     load_reference_kbps: u64,
     remaining_traffic_budget: &mut u64,
     terminate: &AtomicBool,
-) -> Result<MeasurementEvidence, String> {
+) -> Result<MeasurementEvidence, CaptureWaitError> {
     let speedtest_direction = match direction {
         EvidenceDirection::Download => SpeedtestDirection::Download,
         EvidenceDirection::Upload => SpeedtestDirection::Upload,
@@ -13617,7 +14503,9 @@ fn run_topology_repeat_capture(
         EvidenceDirection::Upload => MeasurementTopology::RawUpload,
     };
     if control.topology != expected_topology || load_reference_kbps == 0 {
-        return Err("native Auto-Tune topology repeat control is invalid".to_string());
+        return Err("native Auto-Tune topology repeat control is invalid"
+            .to_string()
+            .into());
     }
     run_directional_measurement_with_recovery(
         session,
@@ -13636,7 +14524,78 @@ fn run_topology_repeat_capture(
         remaining_traffic_budget,
         terminate,
     )
-    .map_err(String::from)
+}
+
+fn append_topology_direction_unavailable_from_error(
+    evidence_store: &AutotuneEvidenceStore,
+    operation: &OperationRequest,
+    worker_run_id: &str,
+    direction: EvidenceDirection,
+    error: CaptureWaitError,
+) -> Result<AutotuneReplayState, String> {
+    let expected_speedtest_direction = match direction {
+        EvidenceDirection::Download => SpeedtestDirection::Download,
+        EvidenceDirection::Upload => SpeedtestDirection::Upload,
+    };
+    let expected_topology = match direction {
+        EvidenceDirection::Download => MeasurementTopology::RawDownload,
+        EvidenceDirection::Upload => MeasurementTopology::RawUpload,
+    };
+    let (reason, run_count, icmp_samples, transport_samples, cpu_samples) = match error {
+        CaptureWaitError::ObservationStarved {
+            load,
+            icmp_samples,
+            transport_samples,
+            transport_timeout_count: _,
+            transport_timeout_total_us: _,
+            cpu_samples,
+        } if load.request.topology == expected_topology
+            && load.request.direction == Some(expected_speedtest_direction) =>
+        {
+            (
+                PairOptionUnavailableReason::ObservationStarved,
+                load.run_count,
+                icmp_samples,
+                transport_samples,
+                cpu_samples,
+            )
+        }
+        CaptureWaitError::TransferUnmeasurable {
+            topology,
+            direction: failed_direction,
+            run_count,
+        } if topology == expected_topology && failed_direction == expected_speedtest_direction => (
+            PairOptionUnavailableReason::TransferUnmeasurable,
+            run_count,
+            0,
+            0,
+            0,
+        ),
+        other => return Err(String::from(other)),
+    };
+    let records = evidence_store.load()?;
+    let replay = AutotuneReplayState::replay(operation, worker_run_id, &records)?;
+    let debit_count = replay
+        .pending_measurement_debits
+        .single_count(expected_speedtest_direction)
+        .ok_or_else(|| {
+            "native Auto-Tune unavailable topology direction has no exact traffic debit".to_string()
+        })?;
+    append_replay_evidence(
+        evidence_store,
+        operation,
+        worker_run_id,
+        AutotunePhase::TopologyComparison,
+        AutotuneEvidence::TopologyDirectionUnavailable(TopologyDirectionUnavailableEvidence {
+            direction,
+            reason,
+            run_count,
+            debit_count,
+            icmp_samples,
+            transport_samples,
+            cpu_samples,
+        }),
+    )
 }
 
 fn append_mobile_download_bypass_unavailable_from_error(
@@ -13650,19 +14609,19 @@ fn append_mobile_download_bypass_unavailable_from_error(
     let (failed_direction, reason, run_count, icmp_samples, transport_samples, cpu_samples) =
         match error {
             CaptureWaitError::ObservationStarved {
-                topology,
-                direction,
-                run_count,
+                load,
                 icmp_samples,
                 transport_samples,
+                transport_timeout_count: _,
+                transport_timeout_total_us: _,
                 cpu_samples,
-            } if topology == MeasurementTopology::UploadOnlyShaped
-                && direction == expected_direction =>
+            } if load.request.topology == MeasurementTopology::UploadOnlyShaped
+                && load.request.direction == Some(expected_direction) =>
             {
                 (
-                    direction,
+                    expected_direction,
                     PairOptionUnavailableReason::ObservationStarved,
-                    run_count,
+                    load.run_count,
                     icmp_samples,
                     transport_samples,
                     cpu_samples,
@@ -13765,7 +14724,10 @@ fn run_native_mobile_download_bypass_confirmation(
                 cpu_samples: 0,
             }),
         )?;
-        if replay.next_action()? != AutotuneAction::BuildRawFallback {
+        if !matches!(
+            replay.next_action()?,
+            AutotuneAction::BuildRawFallback | AutotuneAction::RestoreRuntime
+        ) {
             return Err(
                 "native mobile download-bypass traffic boundary did not settle".to_string(),
             );
@@ -13833,7 +14795,10 @@ fn run_native_mobile_download_bypass_confirmation(
                     error,
                 )?;
                 capture.cleanup();
-                if replay.next_action()? != AutotuneAction::BuildRawFallback {
+                if !matches!(
+                    replay.next_action()?,
+                    AutotuneAction::BuildRawFallback | AutotuneAction::RestoreRuntime
+                ) {
                     return Err(
                         "native mobile download-bypass unavailable result did not settle"
                             .to_string(),
@@ -13854,12 +14819,15 @@ fn run_native_mobile_download_bypass_confirmation(
             AutotuneEvidence::Measurement(measurement),
         )?;
         capture.cleanup();
-        let expected = if direction == SpeedtestDirection::Download {
-            AutotuneAction::ConfirmMobileDownloadBypass
-        } else {
-            AutotuneAction::BuildRawFallback
-        };
-        if replay.next_action()? != expected {
+        let next = replay.next_action()?;
+        let expected = direction == SpeedtestDirection::Download
+            && next == AutotuneAction::ConfirmMobileDownloadBypass
+            || direction == SpeedtestDirection::Upload
+                && matches!(
+                    next,
+                    AutotuneAction::BuildRawFallback | AutotuneAction::RestoreRuntime
+                );
+        if !expected {
             return Err(
                 "native mobile download-bypass measurement did not advance deterministically"
                     .to_string(),
@@ -13925,7 +14893,7 @@ fn commit_native_profile_search(
 #[derive(Clone, Debug, PartialEq)]
 enum NativeDirectionSearchOutcome {
     Complete(ProfileSearchResult),
-    RawFallbackRequired,
+    TerminalBoundary,
 }
 
 fn native_inconclusive_search_outcome(
@@ -13946,10 +14914,7 @@ fn native_inconclusive_search_outcome(
     let source_records = evidence_store.load()?;
     let replay = AutotuneReplayState::replay(request, worker_run_id, &source_records)?;
     if replay.raw_fallback_available() {
-        return Ok(NativeDirectionSearchOutcome::RawFallbackRequired);
-    }
-    if !replay.raw_fallback_controls_available() {
-        return Ok(NativeDirectionSearchOutcome::Complete(decision));
+        return Ok(NativeDirectionSearchOutcome::TerminalBoundary);
     }
     let exact = native_profile_search_result(proposal, direction, &source_records)?;
     if exact != decision {
@@ -13990,10 +14955,11 @@ fn native_inconclusive_search_outcome(
         return Err("native inconclusive search boundary is not replay-stable".to_string());
     }
     let replay = AutotuneReplayState::replay(request, worker_run_id, &records)?;
-    if replay.raw_fallback_available() {
-        Ok(NativeDirectionSearchOutcome::RawFallbackRequired)
-    } else {
-        Err("native inconclusive search lost raw fallback authority".to_string())
+    match replay.next_action()? {
+        AutotuneAction::BuildRawFallback | AutotuneAction::RestoreRuntime => {
+            Ok(NativeDirectionSearchOutcome::TerminalBoundary)
+        }
+        _ => Err("native inconclusive search did not reach a terminal boundary".to_string()),
     }
 }
 
@@ -14163,11 +15129,11 @@ fn run_native_direction_search(
         ) {
             Ok(measurement) => measurement,
             Err(CaptureWaitError::ObservationStarved {
-                topology,
-                direction: starved_direction,
-                run_count,
+                load,
                 icmp_samples,
                 transport_samples,
+                transport_timeout_count: _,
+                transport_timeout_total_us: _,
                 cpu_samples,
             }) => {
                 // The current candidate has no admissible loaded latency
@@ -14175,8 +15141,8 @@ fn run_native_direction_search(
                 // Stop only this descent and select exclusively from earlier
                 // exact measurements.  Apparatus failures use other typed
                 // variants and remain fatal above this boundary.
-                if topology != MeasurementTopology::ShapedBoth
-                    || starved_direction != speedtest_direction
+                if load.request.topology != MeasurementTopology::ShapedBoth
+                    || load.request.direction != Some(speedtest_direction)
                 {
                     return Err(
                         "native Auto-Tune starvation identity contradicted its search control"
@@ -14188,7 +15154,7 @@ fn run_native_direction_search(
                     AutotuneReplayState::replay(request, worker_run_id, &pre_starvation_records)?;
                 let pending_debit_count = replay
                     .pending_measurement_debits
-                    .single_count(starved_direction)
+                    .single_count(speedtest_direction)
                     .ok_or_else(|| {
                         "native Auto-Tune starvation contradicted its durable debit direction"
                             .to_string()
@@ -14198,7 +15164,7 @@ fn run_native_direction_search(
                         &record.evidence,
                         AutotuneEvidence::Measurement(value)
                             if record.phase == AutotunePhase::DirectionalSearch
-                                && value.direction == starved_direction
+                                && value.direction == speedtest_direction
                     )
                 });
                 let next_candidate_kbps = if has_prior_exact {
@@ -14221,7 +15187,7 @@ fn run_native_direction_search(
                         candidate_kbps,
                     )?
                 };
-                if pending_debit_count < u32::from(run_count) {
+                if pending_debit_count < u32::from(load.run_count) {
                     return Err(
                         "native Auto-Tune starvation contradicted its durable search state"
                             .to_string(),
@@ -14233,12 +15199,12 @@ fn run_native_direction_search(
                     worker_run_id,
                     AutotunePhase::DirectionalSearch,
                     AutotuneEvidence::SearchObservationStarved(SearchObservationStarvedEvidence {
-                        topology,
-                        direction: starved_direction,
+                        topology: load.request.topology,
+                        direction: speedtest_direction,
                         candidate_dl_kbps: download_kbps,
                         candidate_ul_kbps: upload_kbps,
                         next_candidate_kbps,
-                        run_count,
+                        run_count: load.run_count,
                         debit_count: pending_debit_count,
                         icmp_samples,
                         transport_samples,
@@ -14250,7 +15216,7 @@ fn run_native_direction_search(
                     continue;
                 }
                 if !has_prior_exact {
-                    return Ok(NativeDirectionSearchOutcome::RawFallbackRequired);
+                    return Ok(NativeDirectionSearchOutcome::TerminalBoundary);
                 }
                 let records = evidence_store.load()?;
                 let decision = native_profile_search_result(proposal, direction, &records)?;
@@ -14357,7 +15323,7 @@ fn run_native_direction_search(
                     continue;
                 }
                 if !has_prior_exact {
-                    return Ok(NativeDirectionSearchOutcome::RawFallbackRequired);
+                    return Ok(NativeDirectionSearchOutcome::TerminalBoundary);
                 }
                 let records = evidence_store.load()?;
                 let decision = native_profile_search_result(proposal, direction, &records)?;
@@ -14507,7 +15473,7 @@ fn run_native_topology_comparison(
             permit.authorizes(&request.identity.instance, &control, monotonic_boot_ms()?)?;
             transition_runtime_after_capture_cleanup(capture, || store.publish_control(&control))?;
             wait_for_runtime_applied(store, permit, &control, terminate)?;
-            let measurement = run_topology_repeat_capture(
+            let measurement = match run_topology_repeat_capture(
                 session,
                 request,
                 worker_run_id,
@@ -14522,7 +15488,26 @@ fn run_native_topology_comparison(
                 load_reference_kbps,
                 remaining_traffic_budget,
                 terminate,
-            )?;
+            ) {
+                Ok(measurement) => measurement,
+                Err(error) => {
+                    let unavailable_replay = append_topology_direction_unavailable_from_error(
+                        evidence_store,
+                        request,
+                        worker_run_id,
+                        direction,
+                        error,
+                    )?;
+                    if unavailable_replay.next_action()? != AutotuneAction::CompareTopologies {
+                        return Err(
+                            "native Auto-Tune unavailable topology direction did not preserve comparison state"
+                                .to_string(),
+                        );
+                    }
+                    capture.cleanup();
+                    continue;
+                }
+            };
             let _ = append_replay_evidence(
                 evidence_store,
                 request,
@@ -14692,7 +15677,6 @@ where
             AutotuneEvidence::PreflightAttested,
         )?;
         let mut capture = AutotuneCaptureGuard::new(&runtime_directory);
-        cleanup_legacy_load_sidecars(&capture.load_evidence_path)?;
         let mut capture_sequence = 0_u32;
         let (baseline_request, baseline_snapshot) = run_idle_baseline_with_recovery(
             &request,
@@ -14829,7 +15813,7 @@ where
                         "native Auto-Tune loaded capture has no verified directional reference"
                             .to_string()
                     })?;
-                    let measurement = run_directional_measurement_with_recovery(
+                    let evidence = match run_directional_measurement_with_recovery(
                         &mut speedtest_session,
                         &request,
                         &worker_run_id,
@@ -14845,13 +15829,54 @@ where
                         load_reference_kbps,
                         &mut remaining_traffic_budget,
                         terminate,
-                    )?;
+                    ) {
+                        Ok(measurement) => AutotuneEvidence::Measurement(measurement),
+                        Err(CaptureWaitError::ObservationStarved {
+                            load,
+                            icmp_samples,
+                            transport_samples,
+                            transport_timeout_count,
+                            transport_timeout_total_us,
+                            cpu_samples,
+                        }) if uses_full_raw_controls(
+                            request.strategy.ok_or_else(|| {
+                                "Full Auto-Tune request has no strategy".to_string()
+                            })?,
+                            request.allow_sqm_disable,
+                        ) && load.request.topology == control.topology
+                            && load.request.direction == Some(*direction) =>
+                        {
+                            let pending = AutotuneReplayState::replay(
+                                &request,
+                                &worker_run_id,
+                                &evidence_store.load()?,
+                            )?
+                            .pending_measurement_debits
+                            .single_count(*direction)
+                            .ok_or_else(|| {
+                                "native Auto-Tune starved raw control has no exact traffic debit"
+                                    .to_string()
+                            })?;
+                            AutotuneEvidence::RawControlCapacity(
+                                raw_control_capacity_from_starved_load(
+                                    &load,
+                                    pending,
+                                    icmp_samples,
+                                    transport_samples,
+                                    transport_timeout_count,
+                                    transport_timeout_total_us,
+                                    cpu_samples,
+                                )?,
+                            )
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
                     replay = append_replay_evidence(
                         &evidence_store,
                         &request,
                         &worker_run_id,
                         AutotunePhase::RawControls,
-                        AutotuneEvidence::Measurement(measurement),
+                        evidence,
                     )?;
                 }
             }
@@ -14915,63 +15940,68 @@ where
         )?;
         let raw_fallback_required = matches!(
             download_outcome,
-            NativeDirectionSearchOutcome::RawFallbackRequired
+            NativeDirectionSearchOutcome::TerminalBoundary
         );
         let download_search = match download_outcome {
             NativeDirectionSearchOutcome::Complete(result) => {
                 if result.action == ProfileSearchAction::Inconclusive {
-                    capture.cleanup();
-                    publish_terminal_file(
-                        &terminal_path,
-                        &AutotuneTerminalRecord {
-                            job_id: request.identity.job_id.clone(),
-                            worker_run_id: worker_run_id.clone(),
-                            consumed_traffic_bytes: request
-                                .traffic_budget_bytes
-                                .checked_sub(remaining_traffic_budget)
-                                .ok_or_else(|| {
-                                    "native Auto-Tune traffic accounting underflow".to_string()
-                                })?,
-                            terminal: AutotuneTerminal::Inconclusive {
-                                code: "native-download-search-inconclusive".to_string(),
-                            },
-                        },
-                    )?;
-                    return Ok(());
+                    return Err(
+                        "native download search inconclusive escaped its restore boundary"
+                            .to_string(),
+                    );
                 }
                 Some(result)
             }
-            NativeDirectionSearchOutcome::RawFallbackRequired => None,
+            NativeDirectionSearchOutcome::TerminalBoundary => None,
         };
         if raw_fallback_required {
             capture.cleanup();
             let source_records = evidence_store.load()?;
-            let raw_fallback =
-                native_raw_fallback_result(&request, &worker_run_id, &proposal, &source_records)?;
-            let (raw_fallback_path, raw_fallback_digest) =
-                publish_native_raw_fallback(job_directory, &raw_fallback)?;
-            let replay = append_replay_evidence(
-                &evidence_store,
-                &request,
-                &worker_run_id,
-                AutotunePhase::TopologyComparison,
-                AutotuneEvidence::RawFallbackBuilt {
-                    digest: raw_fallback_digest,
-                },
-            )?;
-            if replay.next_action()? != AutotuneAction::RestoreRuntime {
-                return Err("native raw fallback did not reach restore".to_string());
-            }
-            let records = evidence_store.load()?;
-            let verified = verify_native_raw_fallback_transaction(
-                &request,
-                &worker_run_id,
-                &proposal,
-                &records,
-                &raw_fallback_path,
-            )?;
-            if verified != raw_fallback {
-                return Err("native raw-fallback replay changed canonical output".to_string());
+            match AutotuneReplayState::replay(&request, &worker_run_id, &source_records)?
+                .next_action()?
+            {
+                AutotuneAction::RestoreRuntime => {}
+                AutotuneAction::BuildRawFallback => {
+                    let raw_fallback = native_terminal_fallback_result(
+                        &request,
+                        &worker_run_id,
+                        &proposal,
+                        &source_records,
+                    )?;
+                    let (raw_fallback_path, raw_fallback_digest) =
+                        publish_native_terminal_fallback(job_directory, &raw_fallback)?;
+                    let replay = append_replay_evidence(
+                        &evidence_store,
+                        &request,
+                        &worker_run_id,
+                        AutotunePhase::TopologyComparison,
+                        AutotuneEvidence::RawFallbackBuilt {
+                            digest: raw_fallback_digest,
+                        },
+                    )?;
+                    if replay.next_action()? != AutotuneAction::RestoreRuntime {
+                        return Err("native raw fallback did not reach restore".to_string());
+                    }
+                    let records = evidence_store.load()?;
+                    let verified = verify_native_terminal_fallback_transaction(
+                        &request,
+                        &worker_run_id,
+                        &proposal,
+                        &records,
+                        &raw_fallback_path,
+                    )?;
+                    if verified != raw_fallback {
+                        return Err(
+                            "native raw-fallback replay changed canonical output".to_string()
+                        );
+                    }
+                }
+                _ => {
+                    return Err(
+                        "native download search boundary did not reach raw fallback or restore"
+                            .to_string(),
+                    )
+                }
             }
         } else {
             let download_search = download_search
@@ -14994,67 +16024,68 @@ where
             )?;
             if matches!(
                 upload_search,
-                NativeDirectionSearchOutcome::RawFallbackRequired
+                NativeDirectionSearchOutcome::TerminalBoundary
             ) {
                 capture.cleanup();
                 let source_records = evidence_store.load()?;
-                let raw_fallback = native_raw_fallback_result(
-                    &request,
-                    &worker_run_id,
-                    &proposal,
-                    &source_records,
-                )?;
-                let (raw_fallback_path, raw_fallback_digest) =
-                    publish_native_raw_fallback(job_directory, &raw_fallback)?;
-                let replay = append_replay_evidence(
-                    &evidence_store,
-                    &request,
-                    &worker_run_id,
-                    AutotunePhase::TopologyComparison,
-                    AutotuneEvidence::RawFallbackBuilt {
-                        digest: raw_fallback_digest,
-                    },
-                )?;
-                if replay.next_action()? != AutotuneAction::RestoreRuntime {
-                    return Err("native raw fallback did not reach restore".to_string());
-                }
-                let records = evidence_store.load()?;
-                let verified = verify_native_raw_fallback_transaction(
-                    &request,
-                    &worker_run_id,
-                    &proposal,
-                    &records,
-                    &raw_fallback_path,
-                )?;
-                if verified != raw_fallback {
-                    return Err("native raw-fallback replay changed canonical output".to_string());
+                match AutotuneReplayState::replay(&request, &worker_run_id, &source_records)?
+                    .next_action()?
+                {
+                    AutotuneAction::RestoreRuntime => {}
+                    AutotuneAction::BuildRawFallback => {
+                        let raw_fallback = native_terminal_fallback_result(
+                            &request,
+                            &worker_run_id,
+                            &proposal,
+                            &source_records,
+                        )?;
+                        let (raw_fallback_path, raw_fallback_digest) =
+                            publish_native_terminal_fallback(job_directory, &raw_fallback)?;
+                        let replay = append_replay_evidence(
+                            &evidence_store,
+                            &request,
+                            &worker_run_id,
+                            AutotunePhase::TopologyComparison,
+                            AutotuneEvidence::RawFallbackBuilt {
+                                digest: raw_fallback_digest,
+                            },
+                        )?;
+                        if replay.next_action()? != AutotuneAction::RestoreRuntime {
+                            return Err("native raw fallback did not reach restore".to_string());
+                        }
+                        let records = evidence_store.load()?;
+                        let verified = verify_native_terminal_fallback_transaction(
+                            &request,
+                            &worker_run_id,
+                            &proposal,
+                            &records,
+                            &raw_fallback_path,
+                        )?;
+                        if verified != raw_fallback {
+                            return Err(
+                                "native raw-fallback replay changed canonical output".to_string()
+                            );
+                        }
+                    }
+                    _ => {
+                        return Err(
+                            "native upload search boundary did not reach raw fallback or restore"
+                                .to_string(),
+                        )
+                    }
                 }
             } else {
                 let upload_search = match upload_search {
                     NativeDirectionSearchOutcome::Complete(result) => result,
-                    NativeDirectionSearchOutcome::RawFallbackRequired => {
+                    NativeDirectionSearchOutcome::TerminalBoundary => {
                         unreachable!("handled above")
                     }
                 };
                 if upload_search.action == ProfileSearchAction::Inconclusive {
-                    capture.cleanup();
-                    publish_terminal_file(
-                        &terminal_path,
-                        &AutotuneTerminalRecord {
-                            job_id: request.identity.job_id.clone(),
-                            worker_run_id: worker_run_id.clone(),
-                            consumed_traffic_bytes: request
-                                .traffic_budget_bytes
-                                .checked_sub(remaining_traffic_budget)
-                                .ok_or_else(|| {
-                                    "native Auto-Tune traffic accounting underflow".to_string()
-                                })?,
-                            terminal: AutotuneTerminal::Inconclusive {
-                                code: "native-upload-search-inconclusive".to_string(),
-                            },
-                        },
-                    )?;
-                    return Ok(());
+                    return Err(
+                        "native upload search inconclusive escaped its restore boundary"
+                            .to_string(),
+                    );
                 }
                 capture.cleanup();
                 let completed_records = evidence_store.load()?;
@@ -15293,13 +16324,15 @@ where
                                 digest: exhaustion_digest,
                             },
                         )?;
+                        let pair_next_action = pair_replay.next_action()?;
                         if !matches!(
-                            pair_replay.next_action()?,
+                            pair_next_action,
                             AutotuneAction::BuildRawFallback
                                 | AutotuneAction::ConfirmMobileDownloadBypass
+                                | AutotuneAction::RestoreRuntime
                         ) {
                             return Err(
-                                "native Auto-Tune pair exhaustion did not reach raw fallback"
+                                "native Auto-Tune pair exhaustion did not reach a bounded terminal path"
                                     .to_string(),
                             );
                         }
@@ -15316,8 +16349,7 @@ where
                                     .to_string(),
                             );
                         }
-                        if pair_replay.next_action()? == AutotuneAction::ConfirmMobileDownloadBypass
-                        {
+                        if pair_next_action == AutotuneAction::ConfirmMobileDownloadBypass {
                             let _ = run_native_mobile_download_bypass_confirmation(
                                 &mut speedtest_session,
                                 &request,
@@ -15334,38 +16366,58 @@ where
                             )?;
                         }
                         let raw_records = evidence_store.load()?;
-                        let raw_fallback = native_raw_fallback_result(
+                        match AutotuneReplayState::replay(
                             &request,
                             &worker_run_id,
-                            &proposal,
                             &raw_records,
-                        )?;
-                        let (raw_fallback_path, raw_fallback_digest) =
-                            publish_native_raw_fallback(job_directory, &raw_fallback)?;
-                        let raw_replay = append_replay_evidence(
-                            &evidence_store,
-                            &request,
-                            &worker_run_id,
-                            AutotunePhase::TopologyComparison,
-                            AutotuneEvidence::RawFallbackBuilt {
-                                digest: raw_fallback_digest,
-                            },
-                        )?;
-                        if raw_replay.next_action()? != AutotuneAction::RestoreRuntime {
-                            return Err("native raw fallback did not reach restore".to_string());
-                        }
-                        let records = evidence_store.load()?;
-                        let verified = verify_native_raw_fallback_transaction(
-                            &request,
-                            &worker_run_id,
-                            &proposal,
-                            &records,
-                            &raw_fallback_path,
-                        )?;
-                        if verified != raw_fallback {
-                            return Err(
-                                "native raw-fallback replay changed canonical output".to_string()
-                            );
+                        )?
+                        .next_action()?
+                        {
+                            AutotuneAction::RestoreRuntime => {}
+                            AutotuneAction::BuildRawFallback => {
+                                let raw_fallback = native_terminal_fallback_result(
+                                    &request,
+                                    &worker_run_id,
+                                    &proposal,
+                                    &raw_records,
+                                )?;
+                                let (raw_fallback_path, raw_fallback_digest) =
+                                    publish_native_terminal_fallback(job_directory, &raw_fallback)?;
+                                let raw_replay = append_replay_evidence(
+                                    &evidence_store,
+                                    &request,
+                                    &worker_run_id,
+                                    AutotunePhase::TopologyComparison,
+                                    AutotuneEvidence::RawFallbackBuilt {
+                                        digest: raw_fallback_digest,
+                                    },
+                                )?;
+                                if raw_replay.next_action()? != AutotuneAction::RestoreRuntime {
+                                    return Err(
+                                        "native raw fallback did not reach restore".to_string()
+                                    );
+                                }
+                                let records = evidence_store.load()?;
+                                let verified = verify_native_terminal_fallback_transaction(
+                                    &request,
+                                    &worker_run_id,
+                                    &proposal,
+                                    &records,
+                                    &raw_fallback_path,
+                                )?;
+                                if verified != raw_fallback {
+                                    return Err(
+                                        "native raw-fallback replay changed canonical output"
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                            _ => {
+                                return Err(
+                                    "native Auto-Tune pair exhaustion changed terminal path after replay"
+                                        .to_string(),
+                                )
+                            }
                         }
                     }
                 }
@@ -15391,8 +16443,32 @@ where
             AutotunePhase::Restore,
             AutotuneEvidence::RuntimeRestored,
         )?;
-        if restored_replay.next_action()? != AutotuneAction::PublishReview {
-            return Err("native Auto-Tune runtime restoration did not unlock Review".to_string());
+        let consumed_traffic_bytes = request
+            .traffic_budget_bytes
+            .checked_sub(remaining_traffic_budget)
+            .ok_or_else(|| "native Auto-Tune traffic accounting underflow".to_string())?;
+        match restored_replay.next_action()? {
+            AutotuneAction::PublishInconclusive { code } => {
+                publish_terminal_file(
+                    &terminal_path,
+                    &AutotuneTerminalRecord {
+                        job_id: request.identity.job_id.clone(),
+                        worker_run_id: worker_run_id.clone(),
+                        consumed_traffic_bytes,
+                        terminal: AutotuneTerminal::Inconclusive {
+                            code: code.to_string(),
+                        },
+                    },
+                )?;
+                return Ok(());
+            }
+            AutotuneAction::PublishReview => {}
+            _ => {
+                return Err(
+                    "native Auto-Tune runtime restoration did not unlock a terminal publication"
+                        .to_string(),
+                )
+            }
         }
         let restored_records = evidence_store.load()?;
         let review_bytes = canonical_native_review_bytes(
@@ -15445,10 +16521,7 @@ where
             &AutotuneTerminalRecord {
                 job_id: request.identity.job_id.clone(),
                 worker_run_id: worker_run_id.clone(),
-                consumed_traffic_bytes: request
-                    .traffic_budget_bytes
-                    .checked_sub(remaining_traffic_budget)
-                    .ok_or_else(|| "native Auto-Tune traffic accounting underflow".to_string())?,
+                consumed_traffic_bytes,
                 terminal: AutotuneTerminal::Complete { review_digest },
             },
         )?;
@@ -15564,7 +16637,7 @@ fn wait_for_capture_state(
     }
 }
 
-fn is_immediately_prior_capture_snapshot(
+pub(crate) fn is_immediately_prior_capture_snapshot(
     snapshot: &AutotuneCaptureSnapshot,
     request: &AutotuneCaptureRequest,
     current_boot_ms: u64,
@@ -15883,8 +16956,126 @@ fn validate_measurement(value: MeasurementEvidence) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_raw_control_capacity(value: RawControlCapacityEvidence) -> Result<(), String> {
+    let direction_is_raw = match value.direction {
+        SpeedtestDirection::Download => !value.topology.download_is_shaped(),
+        SpeedtestDirection::Upload => !value.topology.upload_is_shaped(),
+        SpeedtestDirection::Both => false,
+    };
+    let route_bytes = match value.direction {
+        SpeedtestDirection::Download => value.rx_bytes,
+        SpeedtestDirection::Upload => value.tx_bytes,
+        SpeedtestDirection::Both => 0,
+    };
+    let confidence_source_is_exact = value.confidence_total_bytes == route_bytes;
+    let wire_is_consistent = match value.direction {
+        SpeedtestDirection::Download => {
+            value.confidence_total_bytes >= value.controlled_wire_bytes
+                && value.controlled_wire_bytes >= value.controlled_payload_bytes
+        }
+        SpeedtestDirection::Upload => {
+            upload_counter_lag_is_bounded(value.confidence_total_bytes, value.controlled_wire_bytes)
+                && upload_payload_is_plausible(
+                    value.controlled_wire_bytes,
+                    value.controlled_payload_bytes,
+                )
+        }
+        SpeedtestDirection::Both => false,
+    };
+    let latency_complete = value.icmp_samples >= MIN_AUTOTUNE_LOADED_ICMP_SAMPLES
+        && (value.transport_samples >= MIN_AUTOTUNE_TRANSPORT_SAMPLES
+            || (value.transport_timeout_count >= MIN_AUTOTUNE_TRANSPORT_TIMEOUTS
+                && value.transport_timeout_total_us >= MIN_AUTOTUNE_TRANSPORT_TIMEOUT_COVERAGE_US))
+        && value.cpu_samples > 0;
+    let maximum_elapsed_ms = 180_000_u64.saturating_mul(u64::from(value.run_count));
+    let expected_goodput = bounded_goodput_kbps(
+        value.backend_reported_kbps,
+        value.controlled_payload_bytes,
+        value.controlled_wire_bytes,
+        value.elapsed_ms,
+        value.backend_payload_only,
+        "raw capacity goodput",
+    )?;
+    if !direction_is_raw
+        || value.achieved_kbps == 0
+        || value.achieved_kbps > MAX_RATE_KBPS
+        || value.achieved_kbps != expected_goodput
+        || value.rx_bytes.saturating_add(value.tx_bytes) == 0
+        || value.elapsed_ms == 0
+        || value.elapsed_ms > maximum_elapsed_ms
+        || value.confidence_total_bytes < MIN_DIRECTIONAL_LOAD_BYTES
+        || value.controlled_wire_bytes < MIN_DIRECTIONAL_LOAD_BYTES
+        || value.controlled_payload_bytes < MIN_DIRECTIONAL_LOAD_BYTES
+        || route_bytes < MIN_DIRECTIONAL_LOAD_BYTES
+        || !confidence_source_is_exact
+        || !wire_is_consistent
+        || value.backend_reported_kbps == 0
+        || value.backend_reported_kbps > 100_000_000_000
+        || value.run_count == 0
+        || value.run_count > MAX_DIRECTIONAL_LOAD_RUNS
+        || value.debit_count < u32::from(value.run_count)
+        || value
+            .backend_consistent_runs
+            .checked_add(value.backend_payload_only_runs)
+            != Some(value.run_count)
+        || value.backend_payload_only != (value.backend_payload_only_runs > 0)
+        || value.cpu_samples == 0
+        || latency_complete
+        || value.transport_timeout_count > MAX_AUTOTUNE_TRANSPORT_TIMEOUTS
+        || value.transport_timeout_total_us
+            > u64::from(value.transport_timeout_count)
+                .saturating_mul(MAX_AUTOTUNE_TRANSPORT_TIMEOUT_US)
+        || (value.transport_timeout_count == 0) != (value.transport_timeout_total_us == 0)
+    {
+        return Err("native Auto-Tune raw control capacity evidence is invalid".to_string());
+    }
+    Ok(())
+}
+
+fn raw_control_capacity_from_starved_load(
+    load: &AutotuneLoadEvidence,
+    debit_count: u32,
+    icmp_samples: u32,
+    transport_samples: u32,
+    transport_timeout_count: u32,
+    transport_timeout_total_us: u64,
+    cpu_samples: u32,
+) -> Result<RawControlCapacityEvidence, String> {
+    load.validate()?;
+    let direction = load
+        .request
+        .direction
+        .filter(|value| *value != SpeedtestDirection::Both)
+        .ok_or_else(|| "native Auto-Tune starved raw load is not directional".to_string())?;
+    let value = RawControlCapacityEvidence {
+        topology: load.request.topology,
+        direction,
+        achieved_kbps: load.goodput_kbps,
+        backend_payload_only: load.backend_payload_only_runs > 0,
+        rx_bytes: load.aggregate_rx_bytes,
+        tx_bytes: load.aggregate_tx_bytes,
+        elapsed_ms: load.direction_elapsed_ms,
+        confidence_total_bytes: load.confidence_total_bytes,
+        controlled_wire_bytes: load.controlled_wire_bytes,
+        controlled_payload_bytes: load.controlled_payload_bytes,
+        backend_reported_kbps: load.backend_reported_kbps,
+        backend_consistent_runs: load.backend_consistent_runs,
+        backend_payload_only_runs: load.backend_payload_only_runs,
+        run_count: load.run_count,
+        debit_count,
+        icmp_samples,
+        transport_samples,
+        transport_timeout_count,
+        transport_timeout_total_us,
+        cpu_samples,
+    };
+    validate_raw_control_capacity(value)?;
+    Ok(value)
+}
+
 fn validate_digest_fields(evidence: &AutotuneEvidence) -> Result<(), String> {
     match evidence {
+        AutotuneEvidence::RawControlCapacity(value) => validate_raw_control_capacity(*value),
         AutotuneEvidence::ProposalBuilt { digest }
         | AutotuneEvidence::PairConfirmed { digest }
         | AutotuneEvidence::TopologiesCompared { digest }
@@ -15978,7 +17169,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn completed_output_rejections_retry_twice_then_become_unmeasurable() {
+    fn backend_measurement_gaps_use_all_three_bounded_attempts() {
         assert_eq!(
             directional_load_error_disposition("speedtest-json-missing", 0),
             DirectionalLoadErrorDisposition::Retry {
@@ -15987,8 +17178,14 @@ mod tests {
         );
         assert_eq!(
             directional_load_error_disposition("speedtest-json-missing", 1),
-            DirectionalLoadErrorDisposition::TransferUnmeasurable {
+            DirectionalLoadErrorDisposition::Retry {
                 unmeasurable_runs: 2
+            }
+        );
+        assert_eq!(
+            directional_load_error_disposition("speedtest-json-missing", 2),
+            DirectionalLoadErrorDisposition::TransferUnmeasurable {
+                unmeasurable_runs: 3
             }
         );
         assert_eq!(
@@ -15997,13 +17194,31 @@ mod tests {
                 unmeasurable_runs: 1
             }
         );
+        assert_eq!(
+            directional_load_error_disposition("speedtest-timeout", 0),
+            DirectionalLoadErrorDisposition::Retry {
+                unmeasurable_runs: 1
+            }
+        );
+        assert_eq!(
+            directional_load_error_disposition("speedtest-timeout", 1),
+            DirectionalLoadErrorDisposition::Retry {
+                unmeasurable_runs: 2
+            }
+        );
+        assert_eq!(
+            directional_load_error_disposition("speedtest-timeout", 2),
+            DirectionalLoadErrorDisposition::TransferUnmeasurable {
+                unmeasurable_runs: 3
+            }
+        );
     }
 
     #[test]
     fn apparatus_and_authority_failures_never_enter_measurement_retry() {
         for error in [
             "speedtest-backend-failed",
-            "speedtest-timeout",
+            "speedtest-deadline-expired",
             "speedtest-route-drift",
             "speedtest-server-identity-mismatch",
             "speedtest-output-not-utf8",
@@ -16432,6 +17647,60 @@ mod tests {
             background_confidence_percent: 100,
             contaminated: false,
         }
+    }
+
+    fn raw_capacity(
+        topology: MeasurementTopology,
+        direction: SpeedtestDirection,
+        achieved_kbps: u64,
+    ) -> RawControlCapacityEvidence {
+        let elapsed_ms = 10_000;
+        let controlled_bytes = achieved_kbps * elapsed_ms / 8;
+        let (rx_bytes, tx_bytes) = match direction {
+            SpeedtestDirection::Download => (controlled_bytes, 1_000),
+            SpeedtestDirection::Upload => (1_000, controlled_bytes),
+            SpeedtestDirection::Both => (controlled_bytes, controlled_bytes),
+        };
+        RawControlCapacityEvidence {
+            topology,
+            direction,
+            achieved_kbps,
+            backend_payload_only: false,
+            rx_bytes,
+            tx_bytes,
+            elapsed_ms,
+            confidence_total_bytes: controlled_bytes,
+            controlled_wire_bytes: controlled_bytes,
+            controlled_payload_bytes: controlled_bytes,
+            backend_reported_kbps: achieved_kbps,
+            backend_consistent_runs: 1,
+            backend_payload_only_runs: 0,
+            run_count: 1,
+            debit_count: 1,
+            icmp_samples: MIN_AUTOTUNE_LOADED_ICMP_SAMPLES,
+            transport_samples: 0,
+            transport_timeout_count: 0,
+            transport_timeout_total_us: 0,
+            cpu_samples: 1,
+        }
+    }
+
+    fn push_raw_capacity_record(
+        records: &mut Vec<AutotuneEvidenceRecord>,
+        value: RawControlCapacityEvidence,
+    ) {
+        push_measurement_debit(
+            records,
+            AutotunePhase::RawControls,
+            value.direction,
+            value.rx_bytes,
+            value.tx_bytes,
+        );
+        records.push(record(
+            records.len() as u32 + 1,
+            AutotunePhase::RawControls,
+            AutotuneEvidence::RawControlCapacity(value),
+        ));
     }
 
     fn push_measurement_record(
@@ -17367,7 +18636,7 @@ mod tests {
         assert!(text.contains("\"manual_review_required\":true"));
 
         let mut unmeasurable = records;
-        for _ in 0..2 {
+        for _ in 0..3 {
             push_measurement_debit(
                 &mut unmeasurable,
                 AutotunePhase::DirectionalSearch,
@@ -17385,8 +18654,8 @@ mod tests {
                 candidate_dl_kbps: candidate,
                 candidate_ul_kbps: proposal.upload.maximum_kbps,
                 next_candidate_kbps: None,
-                run_count: 2,
-                debit_count: 2,
+                run_count: 3,
+                debit_count: 3,
             }),
         ));
         let replay =
@@ -17402,6 +18671,71 @@ mod tests {
         let text = String::from_utf8(canonical_raw_fallback_bytes(&raw).unwrap()).unwrap();
         assert!(text.contains("\"auto_apply_pass\":false"));
         assert!(text.contains("\"manual_review_required\":true"));
+    }
+
+    #[test]
+    fn shaped_only_unobserved_search_exhaustion_restores_before_inconclusive() {
+        let mut operation = request(CalibrationStrategy::ShapedOnly, 1_000_000_000);
+        operation.profile = Some(AutotuneProfile::BestOverall);
+        operation.allow_sqm_disable = false;
+        let worker_run_id = "66".repeat(16);
+        let mut records = proposal_ready_records(CalibrationStrategy::ShapedOnly);
+        let proposal = build_native_proposal_from_evidence(
+            &operation,
+            &worker_run_id,
+            &records,
+            LinkKind::Ethernet,
+        )
+        .unwrap();
+        records.push(record(
+            records.len() as u32 + 1,
+            AutotunePhase::Proposal,
+            AutotuneEvidence::ProposalBuilt {
+                digest: "ab".repeat(32),
+            },
+        ));
+        for _ in 0..3 {
+            push_measurement_debit(
+                &mut records,
+                AutotunePhase::DirectionalSearch,
+                SpeedtestDirection::Download,
+                10_000,
+                1_000,
+            );
+        }
+        records.push(record(
+            records.len() as u32 + 1,
+            AutotunePhase::DirectionalSearch,
+            AutotuneEvidence::SearchObservationStarved(SearchObservationStarvedEvidence {
+                topology: MeasurementTopology::ShapedBoth,
+                direction: SpeedtestDirection::Download,
+                candidate_dl_kbps: proposal.download.maximum_kbps,
+                candidate_ul_kbps: proposal.upload.maximum_kbps,
+                next_candidate_kbps: None,
+                run_count: 3,
+                debit_count: 3,
+                icmp_samples: MIN_AUTOTUNE_LOADED_ICMP_SAMPLES - 1,
+                transport_samples: MIN_AUTOTUNE_TRANSPORT_SAMPLES,
+                cpu_samples: 1,
+            }),
+        ));
+        let replay = AutotuneReplayState::replay(&operation, &worker_run_id, &records).unwrap();
+        assert_eq!(
+            replay.next_action().unwrap(),
+            AutotuneAction::RestoreRuntime
+        );
+        records.push(record(
+            records.len() as u32 + 1,
+            AutotunePhase::Restore,
+            AutotuneEvidence::RuntimeRestored,
+        ));
+        let restored = AutotuneReplayState::replay(&operation, &worker_run_id, &records).unwrap();
+        assert_eq!(
+            restored.next_action().unwrap(),
+            AutotuneAction::PublishInconclusive {
+                code: SEARCH_OPTIONS_UNREVIEWABLE,
+            }
+        );
     }
 
     #[test]
@@ -17634,7 +18968,7 @@ mod tests {
                 terminal,
             )
             .unwrap(),
-            NativeDirectionSearchOutcome::RawFallbackRequired
+            NativeDirectionSearchOutcome::TerminalBoundary
         );
         fs::remove_dir_all(&root).unwrap();
 
@@ -17779,7 +19113,7 @@ mod tests {
                 decision.clone(),
             )
             .unwrap(),
-            NativeDirectionSearchOutcome::RawFallbackRequired
+            NativeDirectionSearchOutcome::TerminalBoundary
         );
         let bounded = evidence_store.load().unwrap();
         let boundary = bounded.last().unwrap();
@@ -17792,7 +19126,7 @@ mod tests {
             })
         );
         let encoded = boundary.encode().unwrap();
-        assert!(encoded.starts_with("cake-autorate-autotune-evidence\t11\n"));
+        assert!(encoded.starts_with("cake-autorate-autotune-evidence\t13\n"));
         assert!(encoded
             .contains("search_inconclusive_reason=variable-candidate-realization-inconclusive\n"));
         assert!(encoded.contains("observation_count=3\n"));
@@ -18856,6 +20190,12 @@ mod tests {
         let bytes = canonical_profile_search_bytes(&terminal).unwrap();
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(sqm_identity::sha256sum(&bytes).unwrap(), digest);
+
+        let mut forged = terminal.clone();
+        forged.selected_index = Some(forged.observations.len());
+        assert!(canonical_profile_search_bytes(&forged)
+            .unwrap_err()
+            .contains("selected observation does not match"));
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -19191,26 +20531,33 @@ mod tests {
         let candidates = profile_pair_candidates(&download, &upload).unwrap();
         assert_eq!(candidates.len(), 1);
         let candidate = candidates[0];
+        push_measurement_debit(
+            &mut records,
+            AutotunePhase::PairConfirmation,
+            SpeedtestDirection::Download,
+            1_000,
+            100,
+        );
         for _ in 0..3 {
             push_measurement_debit(
                 &mut records,
                 AutotunePhase::PairConfirmation,
-                SpeedtestDirection::Download,
-                1_000,
+                SpeedtestDirection::Upload,
                 100,
+                1_000,
             );
         }
         let unavailable = PairOptionUnavailableEvidence {
             candidate_dl_kbps: candidate.download_kbps,
             candidate_ul_kbps: candidate.upload_kbps,
-            failed_direction: SpeedtestDirection::Download,
-            reason: PairOptionUnavailableReason::ObservationStarved,
+            failed_direction: SpeedtestDirection::Upload,
+            reason: PairOptionUnavailableReason::TransferUnmeasurable,
             run_count: 3,
-            download_debit_count: 3,
-            upload_debit_count: 0,
-            icmp_samples: 273,
-            transport_samples: 5,
-            cpu_samples: 3,
+            download_debit_count: 1,
+            upload_debit_count: 3,
+            icmp_samples: 0,
+            transport_samples: 0,
+            cpu_samples: 0,
         };
         let unavailable_record = record(
             records.len() as u32 + 1,
@@ -19218,7 +20565,7 @@ mod tests {
             AutotuneEvidence::PairOptionUnavailable(unavailable),
         );
         let encoded = unavailable_record.encode().unwrap();
-        assert!(encoded.starts_with("cake-autorate-autotune-evidence\t11\n"));
+        assert!(encoded.starts_with("cake-autorate-autotune-evidence\t13\n"));
         assert_eq!(
             AutotuneEvidenceRecord::decode(&encoded).unwrap(),
             unavailable_record
@@ -19309,7 +20656,7 @@ mod tests {
             wrong_upload_shape.len() as u32 + 1,
             AutotunePhase::PairConfirmation,
             AutotuneEvidence::PairOptionUnavailable(PairOptionUnavailableEvidence {
-                failed_direction: SpeedtestDirection::Upload,
+                failed_direction: SpeedtestDirection::Download,
                 ..unavailable
             }),
         ));
@@ -19482,10 +20829,30 @@ mod tests {
         append_measured_pair_exhaustion(&proposal, &mut records, &download, &upload);
         let replay = AutotuneReplayState::replay(&operation, &"66".repeat(16), &records).unwrap();
         assert!(!replay.mobile_download_bypass_required);
-        assert!(replay
-            .next_action()
-            .unwrap_err()
-            .contains("without raw fallback authority"));
+        assert_eq!(
+            replay.next_action().unwrap(),
+            AutotuneAction::RestoreRuntime
+        );
+        assert_eq!(
+            replay.progress().unwrap().step,
+            NativeAutotuneProgressStep::RestoringSettings
+        );
+        records.push(record(
+            records.len() as u32 + 1,
+            AutotunePhase::Restore,
+            AutotuneEvidence::RuntimeRestored,
+        ));
+        let restored = AutotuneReplayState::replay(&operation, &"66".repeat(16), &records).unwrap();
+        assert_eq!(
+            restored.next_action().unwrap(),
+            AutotuneAction::PublishInconclusive {
+                code: PAIR_OPTIONS_UNREVIEWABLE,
+            }
+        );
+        assert_eq!(
+            restored.progress().unwrap().step,
+            NativeAutotuneProgressStep::PreparingDiagnostics
+        );
     }
 
     #[test]
@@ -19865,44 +21232,6 @@ mod tests {
     }
 
     #[test]
-    fn pre_upgrade_mobile_pair_exhaustion_schema_v3_remains_verifiable_only_from_stored_bytes() {
-        let (operation, proposal, mut records, download, upload) = pair_search_records();
-        append_measured_pair_exhaustion(&proposal, &mut records, &download, &upload);
-        let legacy = native_raw_fallback_result_with_mobile_confirmation(
-            &operation,
-            &"66".repeat(16),
-            &proposal,
-            &records,
-            false,
-        )
-        .unwrap();
-        assert!(legacy.to_json().starts_with("{\"schema_version\":3,"));
-        assert!(
-            native_raw_fallback_result(&operation, &"66".repeat(16), &proposal, &records).is_err()
-        );
-
-        let root = private_temp_directory("legacy-mobile-raw-fallback");
-        let (path, digest) = publish_native_raw_fallback(&root, &legacy).unwrap();
-        records.push(record(
-            records.len() as u32 + 1,
-            AutotunePhase::TopologyComparison,
-            AutotuneEvidence::RawFallbackBuilt { digest },
-        ));
-        assert_eq!(
-            verify_native_raw_fallback_transaction(
-                &operation,
-                &"66".repeat(16),
-                &proposal,
-                &records,
-                &path,
-            )
-            .unwrap(),
-            legacy
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn sequential_pair_debits_reject_reversed_reentered_and_incomplete_batches() {
         let (operation, _, base, download, upload) = pair_search_records();
         let (selected_dl_kbps, _) = selected_profile_search_point(&download).unwrap();
@@ -20199,6 +21528,95 @@ mod tests {
         .unwrap_err()
         .contains("digest mismatch"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn topology_unmeasurable_upload_preserves_verified_download_and_shaped_upload() {
+        let (operation, proposal, mut records, _) = topology_ready_records();
+        records.retain(|record| {
+            !matches!(
+                record.evidence,
+                AutotuneEvidence::Measurement(MeasurementEvidence {
+                    topology: MeasurementTopology::RawUpload,
+                    direction: SpeedtestDirection::Upload,
+                    ..
+                }) if record.phase == AutotunePhase::TopologyComparison
+            )
+        });
+        for (index, record) in records.iter_mut().enumerate() {
+            record.sequence = u32::try_from(index + 1).unwrap();
+        }
+        for _ in 0..3 {
+            push_measurement_debit(
+                &mut records,
+                AutotunePhase::TopologyComparison,
+                SpeedtestDirection::Upload,
+                100,
+                1_000,
+            );
+        }
+        let unavailable = TopologyDirectionUnavailableEvidence {
+            direction: EvidenceDirection::Upload,
+            reason: PairOptionUnavailableReason::TransferUnmeasurable,
+            run_count: 3,
+            debit_count: 3,
+            icmp_samples: 0,
+            transport_samples: 0,
+            cpu_samples: 0,
+        };
+        let unavailable_record = record(
+            records.len() as u32 + 1,
+            AutotunePhase::TopologyComparison,
+            AutotuneEvidence::TopologyDirectionUnavailable(unavailable),
+        );
+        let encoded = unavailable_record.encode().unwrap();
+        assert!(encoded.starts_with("cake-autorate-autotune-evidence\t13\n"));
+        assert_eq!(
+            AutotuneEvidenceRecord::decode(&encoded).unwrap(),
+            unavailable_record
+        );
+        assert!(AutotuneEvidenceRecord::decode(&encoded.replacen(
+            "cake-autorate-autotune-evidence\t13",
+            "cake-autorate-autotune-evidence\t12",
+            1,
+        ))
+        .is_err());
+        records.push(unavailable_record);
+
+        let replay = AutotuneReplayState::replay(&operation, &"66".repeat(16), &records).unwrap();
+        assert!(replay.pending_measurement_debits.is_empty());
+        assert_eq!(replay.topology_upload_unavailable, Some(unavailable));
+        assert_eq!(
+            replay.next_action().unwrap(),
+            AutotuneAction::CompareTopologies
+        );
+
+        let result = native_topology_comparison_result(&operation, &proposal, &records).unwrap();
+        assert!(result.comparison_available);
+        assert_eq!(result.download.choice, TopologyDirectionChoice::Unshaped);
+        assert_eq!(result.upload.choice, TopologyDirectionChoice::Shaped);
+        assert_eq!(
+            result.selected_topology,
+            MeasurementTopology::UploadOnlyShaped
+        );
+        assert_eq!(result.upload.raw_achieved_kbps, None);
+        assert_eq!(result.upload.raw_effective_delta_ms, None);
+        assert!(!result.upload.measurement_reliable);
+        assert!(!result.upload.safety_pass);
+        assert!(!result.upload.needs_repeat);
+        assert!(result.upload.retry_exhausted);
+        assert_eq!(result.upload.reason, "comparison-unmeasurable");
+        assert!(!result.auto_apply_pass);
+        assert!(result.manual_review_required);
+        let pair = native_pair_confirmation_result(&proposal, &records).unwrap();
+        assert!(
+            native_topology_apply_acknowledgements(&pair, &result, result.selected_topology,)
+                .unwrap()
+                .contains(&NativeApplyAcknowledgement::TopologyComparisonUnmeasurable)
+        );
+        let json = result.to_json();
+        assert!(json.contains("\"reason\":\"comparison-unmeasurable\""));
+        assert!(json.contains("\"upload\":{\"choice\":\"shaped\""));
     }
 
     #[test]
@@ -20939,6 +22357,15 @@ mod tests {
             worker_error_terminal("native-load-byte-evidence-invalid", false),
             AutotuneTerminal::Failed {
                 code: "native-load-byte-evidence-invalid".to_string(),
+            }
+        );
+        assert_eq!(
+            worker_error_terminal(
+                "native Auto-Tune candidate transfer was unmeasurable after 3 runs",
+                false,
+            ),
+            AutotuneTerminal::Failed {
+                code: CANDIDATE_TRANSFER_UNMEASURABLE_REASON.to_string(),
             }
         );
     }
@@ -21905,23 +23332,6 @@ mod tests {
         assert!(evidence
             .attests(&request, request.deadline_boot_ms + 1)
             .is_err());
-
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn legacy_backend_sidecars_are_removed_without_wildcards() {
-        let directory = private_temp_directory("legacy-load-sidecars");
-        let evidence = directory.join("autotune-load-evidence");
-        let output = evidence.with_extension("backend-output");
-        let stderr = evidence.with_extension("backend-stderr");
-        fs::write(&output, b"old output").unwrap();
-        fs::write(&stderr, b"old stderr").unwrap();
-
-        cleanup_legacy_load_sidecars(&evidence).unwrap();
-        assert!(!output.exists());
-        assert!(!stderr.exists());
-        cleanup_legacy_load_sidecars(&evidence).unwrap();
 
         fs::remove_dir_all(directory).unwrap();
     }
@@ -23833,7 +25243,7 @@ mod tests {
     }
 
     #[test]
-    fn starved_search_evidence_is_v11_and_canonical() {
+    fn starved_search_evidence_is_v13_and_canonical() {
         let evidence = SearchObservationStarvedEvidence {
             topology: MeasurementTopology::ShapedBoth,
             direction: SpeedtestDirection::Download,
@@ -23853,7 +25263,7 @@ mod tests {
         )
         .encode()
         .unwrap();
-        assert!(encoded.starts_with("cake-autorate-autotune-evidence\t11\n"));
+        assert!(encoded.starts_with("cake-autorate-autotune-evidence\t13\n"));
         assert_eq!(
             AutotuneEvidenceRecord::decode(&encoded).unwrap().evidence,
             AutotuneEvidence::SearchObservationStarved(evidence)
@@ -23867,7 +25277,7 @@ mod tests {
     }
 
     #[test]
-    fn unmeasurable_search_probe_is_v11_canonical_and_has_no_latency_claim() {
+    fn unmeasurable_search_probe_is_v13_canonical_and_has_no_latency_claim() {
         let evidence = SearchProbeUnmeasurableEvidence {
             topology: MeasurementTopology::ShapedBoth,
             direction: SpeedtestDirection::Download,
@@ -23884,7 +25294,7 @@ mod tests {
         )
         .encode()
         .unwrap();
-        assert!(encoded.starts_with("cake-autorate-autotune-evidence\t11\n"));
+        assert!(encoded.starts_with("cake-autorate-autotune-evidence\t13\n"));
         assert!(encoded.contains("kind=search_probe_unmeasurable\n"));
         assert!(encoded.contains("run_count=2\n"));
         assert!(encoded.contains("debit_count=2\n"));
@@ -23971,6 +25381,31 @@ mod tests {
                 .unwrap_err()
                 .contains("exact traffic debits")
         );
+
+        let mut settled_then_upload = records.clone();
+        settled_then_upload.push(record(
+            settled_then_upload.len() as u32 + 1,
+            AutotunePhase::DirectionalSearch,
+            AutotuneEvidence::SearchComplete {
+                direction: EvidenceDirection::Download,
+                selected_kbps: 100_000,
+                runtime_minimum_kbps: None,
+                digest: "aa".repeat(32),
+            },
+        ));
+        push_measurement_record(
+            &mut settled_then_upload,
+            AutotunePhase::DirectionalSearch,
+            measurement(
+                MeasurementTopology::ShapedBoth,
+                SpeedtestDirection::Upload,
+                1_000,
+            ),
+        );
+        let settled =
+            AutotuneReplayState::replay(&request, &"66".repeat(16), &settled_then_upload).unwrap();
+        assert!(settled.search_download_unmeasurable.is_none());
+        assert_eq!(settled.search_upload_candidates, vec![50_000]);
 
         let mut untested_selection = records;
         untested_selection.push(record(
@@ -24094,6 +25529,31 @@ mod tests {
                 .contains("starved search observation is invalid"),
             "a fully observed candidate cannot be forged into a starvation boundary"
         );
+
+        let mut settled_then_upload = records.clone();
+        settled_then_upload.push(record(
+            settled_then_upload.len() as u32 + 1,
+            AutotunePhase::DirectionalSearch,
+            AutotuneEvidence::SearchComplete {
+                direction: EvidenceDirection::Download,
+                selected_kbps: 100_000,
+                runtime_minimum_kbps: None,
+                digest: "aa".repeat(32),
+            },
+        ));
+        push_measurement_record(
+            &mut settled_then_upload,
+            AutotunePhase::DirectionalSearch,
+            measurement(
+                MeasurementTopology::ShapedBoth,
+                SpeedtestDirection::Upload,
+                1_000,
+            ),
+        );
+        let settled =
+            AutotuneReplayState::replay(&request, &"66".repeat(16), &settled_then_upload).unwrap();
+        assert!(settled.search_download_starved.is_none());
+        assert_eq!(settled.search_upload_candidates, vec![50_000]);
 
         let mut untested_selection = records;
         untested_selection.push(record(
@@ -24558,8 +26018,8 @@ mod tests {
         assert!(encoded.len() < MAX_AUTOTUNE_EVIDENCE_BYTES);
         assert_eq!(AutotuneEvidenceRecord::decode(&encoded).unwrap(), value);
         assert!(AutotuneEvidenceRecord::decode(&encoded.replacen(
-            "cake-autorate-autotune-evidence\t11",
-            "cake-autorate-autotune-evidence\t10",
+            "cake-autorate-autotune-evidence\t13",
+            "cake-autorate-autotune-evidence\t12",
             1,
         ))
         .is_err());
@@ -24571,7 +26031,425 @@ mod tests {
     }
 
     #[test]
-    fn censored_transport_evidence_is_v11_explicit_and_round_trips() {
+    fn raw_control_capacity_is_v13_canonical_and_rejects_forged_byte_authority() {
+        let value = raw_capacity(
+            MeasurementTopology::RawDownload,
+            SpeedtestDirection::Download,
+            90_000,
+        );
+        let encoded_record = record(
+            4,
+            AutotunePhase::RawControls,
+            AutotuneEvidence::RawControlCapacity(value),
+        );
+        let encoded = encoded_record.encode().unwrap();
+        assert!(encoded.starts_with("cake-autorate-autotune-evidence\t13\n"));
+        assert!(encoded.contains("kind=raw_control_capacity\n"));
+        assert!(encoded.contains("achieved_dl_kbps=90000\n"));
+        assert!(encoded.contains("transport_delta_us=\n"));
+        assert_eq!(
+            AutotuneEvidenceRecord::decode(&encoded).unwrap(),
+            encoded_record
+        );
+
+        let old_header = encoded.replacen(
+            "cake-autorate-autotune-evidence\t13",
+            "cake-autorate-autotune-evidence\t12",
+            1,
+        );
+        assert!(AutotuneEvidenceRecord::decode(&old_header).is_err());
+        let forged_rate = encoded.replace("achieved_dl_kbps=90000\n", "achieved_dl_kbps=90001\n");
+        assert!(AutotuneEvidenceRecord::decode(&forged_rate).is_err());
+        let forged_peer = encoded.replace("achieved_ul_kbps=\n", "achieved_ul_kbps=90000\n");
+        assert!(AutotuneEvidenceRecord::decode(&forged_peer).is_err());
+        let unknown = encoded.replace("digest=\n", "digest=\nfuture_field=1\n");
+        assert!(AutotuneEvidenceRecord::decode(&unknown).is_err());
+
+        assert!(record(
+            4,
+            AutotunePhase::TopologyComparison,
+            AutotuneEvidence::RawControlCapacity(value),
+        )
+        .encode()
+        .is_err());
+
+        let mut shaped = value;
+        shaped.topology = MeasurementTopology::ShapedBoth;
+        assert!(record(
+            4,
+            AutotunePhase::RawControls,
+            AutotuneEvidence::RawControlCapacity(shaped),
+        )
+        .encode()
+        .is_err());
+
+        let mut zero_elapsed = value;
+        zero_elapsed.elapsed_ms = 0;
+        assert!(record(
+            4,
+            AutotunePhase::RawControls,
+            AutotuneEvidence::RawControlCapacity(zero_elapsed),
+        )
+        .encode()
+        .is_err());
+
+        let mut fully_observed = value;
+        fully_observed.transport_samples = MIN_AUTOTUNE_TRANSPORT_SAMPLES;
+        assert!(record(
+            4,
+            AutotunePhase::RawControls,
+            AutotuneEvidence::RawControlCapacity(fully_observed),
+        )
+        .encode()
+        .is_err());
+    }
+
+    #[test]
+    fn raw_control_capacity_builds_capacity_proposal_without_raw_latency_authority() {
+        let request = request(CalibrationStrategy::FullRaw, 5_000_000_000);
+        let worker_run_id = "66".repeat(16);
+        let mut records = vec![
+            record(
+                1,
+                AutotunePhase::Preflight,
+                AutotuneEvidence::PreflightAttested,
+            ),
+            record(
+                2,
+                AutotunePhase::IdleBaseline,
+                AutotuneEvidence::Baseline(baseline()),
+            ),
+            record(
+                3,
+                AutotunePhase::RawControls,
+                AutotuneEvidence::RuntimeMutationArmed,
+            ),
+        ];
+        for value in [
+            raw_capacity(
+                MeasurementTopology::RawDownload,
+                SpeedtestDirection::Download,
+                900_000,
+            ),
+            raw_capacity(
+                MeasurementTopology::RawUpload,
+                SpeedtestDirection::Upload,
+                90_000,
+            ),
+            raw_capacity(
+                MeasurementTopology::RawBoth,
+                SpeedtestDirection::Download,
+                880_000,
+            ),
+            raw_capacity(
+                MeasurementTopology::RawBoth,
+                SpeedtestDirection::Upload,
+                88_000,
+            ),
+        ] {
+            push_raw_capacity_record(&mut records, value);
+        }
+
+        let replay = AutotuneReplayState::replay(&request, &worker_run_id, &records).unwrap();
+        assert_eq!(replay.next_action().unwrap(), AutotuneAction::BuildProposal);
+        let inputs = proposal_inputs_from_evidence(&request, &worker_run_id, &records).unwrap();
+        assert_eq!(inputs.download_samples_kbps, vec![900_000.0, 880_000.0]);
+        assert_eq!(inputs.upload_samples_kbps, vec![90_000.0, 88_000.0]);
+        assert_eq!(inputs.shaped_download_candidate_kbps, None);
+        assert_eq!(inputs.shaped_upload_candidate_kbps, None);
+        assert!(raw_topology_measurements(&records, EvidenceDirection::Download).is_empty());
+        assert!(raw_topology_measurements(&records, EvidenceDirection::Upload).is_empty());
+    }
+
+    #[test]
+    fn raw_control_capacity_requires_the_exact_pending_debit_and_full_raw_phase() {
+        let request = request(CalibrationStrategy::FullRaw, 1_000_000_000);
+        let value = raw_capacity(
+            MeasurementTopology::RawDownload,
+            SpeedtestDirection::Download,
+            90_000,
+        );
+        let mut records = vec![
+            record(
+                1,
+                AutotunePhase::Preflight,
+                AutotuneEvidence::PreflightAttested,
+            ),
+            record(
+                2,
+                AutotunePhase::IdleBaseline,
+                AutotuneEvidence::Baseline(baseline()),
+            ),
+            record(
+                3,
+                AutotunePhase::RawControls,
+                AutotuneEvidence::RuntimeMutationArmed,
+            ),
+        ];
+        push_measurement_debit(
+            &mut records,
+            AutotunePhase::RawControls,
+            value.direction,
+            value.rx_bytes,
+            value.tx_bytes,
+        );
+        records.push(record(
+            records.len() as u32 + 1,
+            AutotunePhase::RawControls,
+            AutotuneEvidence::RawControlCapacity(RawControlCapacityEvidence {
+                debit_count: 2,
+                ..value
+            }),
+        ));
+        assert!(
+            AutotuneReplayState::replay(&request, &"66".repeat(16), &records)
+                .unwrap_err()
+                .contains("exact traffic debits")
+        );
+
+        let mut shaped_only = request.clone();
+        shaped_only.strategy = Some(CalibrationStrategy::ShapedOnly);
+        shaped_only.allow_sqm_disable = false;
+        assert!(AutotuneReplayState::replay(&shaped_only, &"66".repeat(16), &records).is_err());
+    }
+
+    #[test]
+    fn r289_capacity_only_raw_controls_yield_a_manual_hard_capped_shaped_option() {
+        let mut operation = request(CalibrationStrategy::FullRaw, 100_000_000_000);
+        operation.profile = Some(AutotuneProfile::Gaming);
+        let worker_run_id = "66".repeat(16);
+        let mut records = vec![
+            record(
+                1,
+                AutotunePhase::Preflight,
+                AutotuneEvidence::PreflightAttested,
+            ),
+            record(
+                2,
+                AutotunePhase::IdleBaseline,
+                AutotuneEvidence::Baseline(baseline()),
+            ),
+            record(
+                3,
+                AutotunePhase::RawControls,
+                AutotuneEvidence::RuntimeMutationArmed,
+            ),
+        ];
+        for value in [
+            raw_capacity(
+                MeasurementTopology::RawDownload,
+                SpeedtestDirection::Download,
+                884_000,
+            ),
+            raw_capacity(
+                MeasurementTopology::RawUpload,
+                SpeedtestDirection::Upload,
+                908_000,
+            ),
+            raw_capacity(
+                MeasurementTopology::RawBoth,
+                SpeedtestDirection::Download,
+                893_000,
+            ),
+            raw_capacity(
+                MeasurementTopology::RawBoth,
+                SpeedtestDirection::Upload,
+                908_000,
+            ),
+        ] {
+            push_raw_capacity_record(&mut records, value);
+        }
+        let proposal = build_native_proposal_from_evidence(
+            &operation,
+            &worker_run_id,
+            &records,
+            LinkKind::Cellular,
+        )
+        .unwrap();
+        records.push(record(
+            records.len() as u32 + 1,
+            AutotunePhase::Proposal,
+            AutotuneEvidence::ProposalBuilt {
+                digest: "99".repeat(32),
+            },
+        ));
+        for _ in 0..3 {
+            push_measurement_debit(
+                &mut records,
+                AutotunePhase::DirectionalSearch,
+                SpeedtestDirection::Download,
+                1_000_000,
+                100_000,
+            );
+        }
+        records.push(record(
+            records.len() as u32 + 1,
+            AutotunePhase::DirectionalSearch,
+            AutotuneEvidence::SearchObservationStarved(SearchObservationStarvedEvidence {
+                topology: MeasurementTopology::ShapedBoth,
+                direction: SpeedtestDirection::Download,
+                candidate_dl_kbps: proposal.download.maximum_kbps,
+                candidate_ul_kbps: proposal.upload.maximum_kbps,
+                next_candidate_kbps: None,
+                run_count: 3,
+                debit_count: 3,
+                icmp_samples: 343,
+                transport_samples: 5,
+                cpu_samples: 4,
+            }),
+        ));
+        assert_eq!(
+            AutotuneReplayState::replay(&operation, &worker_run_id, &records)
+                .unwrap()
+                .next_action()
+                .unwrap(),
+            AutotuneAction::BuildRawFallback
+        );
+        let fallback =
+            native_terminal_fallback_result(&operation, &worker_run_id, &proposal, &records)
+                .unwrap();
+        let NativeTerminalFallbackResult::ShapedCapacity(fallback_value) = &fallback else {
+            panic!("capacity-only raw controls must not authorize no-SQM");
+        };
+        assert_eq!(
+            fallback_value.required_acknowledgements,
+            vec![
+                NativeApplyAcknowledgement::LoadedLatencyUnobservable,
+                NativeApplyAcknowledgement::ShapedValidationIncomplete,
+            ]
+        );
+        let json = fallback_value.to_json();
+        assert!(json.contains("\"selected_topology\":\"both_shaped\""));
+        assert!(json.contains("\"latency_grade\":null"));
+        assert!(json.contains("\"safe_kbps\":0"));
+        assert!(!json.contains("no_sqm"));
+
+        let mut mixed_records = records.clone();
+        let mixed_record = mixed_records
+            .iter_mut()
+            .find(|record| {
+                matches!(
+                    record.evidence,
+                    AutotuneEvidence::RawControlCapacity(RawControlCapacityEvidence {
+                        topology: MeasurementTopology::RawDownload,
+                        direction: SpeedtestDirection::Download,
+                        ..
+                    })
+                )
+            })
+            .unwrap();
+        let raw = match &mixed_record.evidence {
+            AutotuneEvidence::RawControlCapacity(raw) => *raw,
+            _ => unreachable!(),
+        };
+        let mut measured = measurement(raw.topology, raw.direction, raw.rx_bytes);
+        measured.achieved_dl_kbps = Some(raw.achieved_kbps);
+        measured.realized_dl_kbps = Some(raw.achieved_kbps);
+        measured.load_reference_dl_kbps = Some(raw.achieved_kbps);
+        measured.rx_bytes = raw.rx_bytes;
+        measured.tx_bytes = raw.tx_bytes;
+        measured.elapsed_ms = raw.elapsed_ms;
+        mixed_record.evidence = AutotuneEvidence::Measurement(measured);
+        let NativeTerminalFallbackResult::ShapedCapacity(mixed_fallback) =
+            native_terminal_fallback_result(&operation, &worker_run_id, &proposal, &mixed_records)
+                .unwrap()
+        else {
+            panic!("mixed measured/capacity raw controls must stay shaped-only");
+        };
+        assert_eq!(mixed_fallback.raw_download_capacity_kbps.len(), 2);
+        assert_eq!(mixed_fallback.raw_upload_capacity_kbps.len(), 2);
+        assert!(mixed_fallback
+            .raw_download_capacity_kbps
+            .contains(&raw.achieved_kbps));
+
+        let root = private_temp_directory("r289-shaped-capacity-fallback");
+        let (path, digest) = publish_native_terminal_fallback(&root, &fallback).unwrap();
+        records.push(record(
+            records.len() as u32 + 1,
+            AutotunePhase::TopologyComparison,
+            AutotuneEvidence::RawFallbackBuilt { digest },
+        ));
+        assert_eq!(
+            verify_native_terminal_fallback_transaction(
+                &operation,
+                &worker_run_id,
+                &proposal,
+                &records,
+                &path,
+            )
+            .unwrap(),
+            fallback
+        );
+
+        let plan = NativeApplyExecutionPlan::from_verified_shaped_capacity_fallback(
+            NativeShapedCapacityFallbackApplyManifestInput {
+                option_id: "capacity_only_shaped",
+                request: &operation,
+                worker_run_id: &worker_run_id,
+                review_digest: &"aa".repeat(32),
+                coordinator_boot_id: &"bb".repeat(16),
+                coordinator_generation: &"cc".repeat(16),
+                proposal: &proposal,
+                selected_dl_kbps: fallback_value.selected_dl_kbps,
+                selected_ul_kbps: fallback_value.selected_ul_kbps,
+                required_acknowledgements: &fallback_value.required_acknowledgements,
+                proposal_digest: &"99".repeat(32),
+                fallback_digest: &"dd".repeat(32),
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.manifest_schema_version(), 9);
+        assert_eq!(plan.download.tested_safe_maximum_kbps, Some(0));
+        assert_eq!(plan.upload.tested_safe_maximum_kbps, Some(0));
+        assert_eq!(plan.download.adaptive_cap_kbps, plan.download.maximum_kbps);
+        assert_eq!(plan.upload.adaptive_cap_kbps, plan.upload.maximum_kbps);
+        assert_eq!(plan.download.ceiling_evidence, Some("legacy_unverified"));
+        assert_eq!(plan.upload.ceiling_evidence, Some("legacy_unverified"));
+        plan.validate_exact_invariants().unwrap();
+
+        let manifest_digest =
+            sqm_identity::sha256sum(&plan.canonical_manifest_bytes().unwrap()).unwrap();
+        let confirmation = NativePublicApplyConfirmation::from_verified_plan(
+            "capacity_only_shaped",
+            true,
+            &plan,
+            &manifest_digest,
+        )
+        .unwrap();
+        let proposal_bytes = canonical_proposal_bytes(&proposal).unwrap();
+        let proposal_digest = sqm_identity::sha256sum(&proposal_bytes).unwrap();
+        let fallback_bytes = read_private_bounded(&path, MAX_AUTOTUNE_REVIEW_BYTES).unwrap();
+        let artifacts = vec![
+            VerifiedNativeArtifact::from_canonical_file(
+                NativeArtifactKind::Proposal,
+                &proposal_bytes,
+                &proposal_digest,
+            )
+            .unwrap(),
+            VerifiedNativeArtifact::from_canonical_file(
+                NativeArtifactKind::RawFallback,
+                fallback_bytes.as_bytes(),
+                &sqm_identity::sha256sum(fallback_bytes.as_bytes()).unwrap(),
+            )
+            .unwrap(),
+        ];
+        let public = canonical_native_public_result_bytes(NativePublicResultInput {
+            request: &operation,
+            worker_run_id: &worker_run_id,
+            review_digest: &"aa".repeat(32),
+            apply_confirmations: std::slice::from_ref(&confirmation),
+            consumed_traffic_bytes: 1,
+            artifacts: &artifacts,
+        })
+        .unwrap();
+        assert!(std::str::from_utf8(&public)
+            .unwrap()
+            .contains("\"native_public_schema_version\":6"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn censored_transport_evidence_is_v13_explicit_and_round_trips() {
         let mut measurement = measurement(
             MeasurementTopology::ShapedBoth,
             SpeedtestDirection::Download,
@@ -24587,14 +26465,14 @@ mod tests {
             AutotuneEvidence::Measurement(measurement),
         );
         let encoded = value.encode().unwrap();
-        assert!(encoded.starts_with("cake-autorate-autotune-evidence\t11\n"));
+        assert!(encoded.starts_with("cake-autorate-autotune-evidence\t13\n"));
         assert!(encoded.contains("transport_censored=1\n"));
         assert!(encoded.contains("transport_timeout_count=3\n"));
         assert!(encoded.contains("transport_timeout_total_us=15000000\n"));
         assert_eq!(AutotuneEvidenceRecord::decode(&encoded).unwrap(), value);
         assert!(AutotuneEvidenceRecord::decode(&encoded.replacen(
-            "cake-autorate-autotune-evidence\t11",
-            "cake-autorate-autotune-evidence\t10",
+            "cake-autorate-autotune-evidence\t13",
+            "cake-autorate-autotune-evidence\t12",
             1,
         ))
         .is_err());

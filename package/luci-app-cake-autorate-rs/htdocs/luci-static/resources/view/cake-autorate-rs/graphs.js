@@ -109,8 +109,8 @@ function readHistory(section, enabled, offset, total) {
 		return Promise.resolve([]);
 
 	offset = Math.max(0, Number(offset || 0));
-	return fs.exec('/usr/libexec/cake-autorate-rs/graph-history', [
-		section, 'read', String(offset), String(HISTORY_PAGE_SAMPLES)
+	return fs.exec('/usr/sbin/cake-autorated', [
+		'--graph-history', section, 'read', String(offset), String(HISTORY_PAGE_SAMPLES)
 	]).then(function(result) {
 		if (result.code !== 0)
 			throw new Error(result.stderr || 'history helper failed');

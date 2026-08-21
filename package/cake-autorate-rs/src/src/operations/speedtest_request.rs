@@ -4,7 +4,11 @@
 //! restore-first runtime request; it never reuses persistent SQM-disable or
 //! Auto-Tune Apply authority.
 
-use super::autotune_request::{attest_live_operation_context, LiveRequestContext};
+use super::autotune_capture_policy::AutotuneCapturePolicyId;
+use super::autotune_request::{
+    attest_bootstrap_operation_context, attest_live_operation_context, operation_route_identity,
+    BootstrapRequestContext, LiveRequestContext,
+};
 use super::identity::{read_kernel_uuid, DEFAULT_RANDOM_UUID_PATH};
 use super::protocol::{
     OperationIdentity, OperationKind, OperationOrigin, OperationRequest, OperationTargetState,
@@ -19,6 +23,7 @@ const NATIVE_SPEEDTEST_BACKEND_RUNTIME_MS: u128 = 180 * 1_000;
 const NATIVE_SPEEDTEST_CURRENT_HEADROOM_PERCENT: u128 = 125;
 const NATIVE_SPEEDTEST_UNSHAPED_HEADROOM_PERCENT: u128 = 200;
 const NATIVE_SPEEDTEST_MAX_TRAFFIC_BUDGET_BYTES: u64 = 256 * 1024 * 1024 * 1024;
+const NATIVE_SPEEDTEST_BOOTSTRAP_TRAFFIC_BUDGET_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const _: () = assert!(NATIVE_SPEEDTEST_BACKEND_RUNTIME_MS <= NATIVE_SPEEDTEST_DEADLINE_MS as u128);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -142,6 +147,109 @@ pub fn build_live_speedtest_request(
     )
 }
 
+/// Build a read-only unshaped measurement for a UCI-absent instance.  The
+/// worker proves that the target remains free of managed UCI and kernel SQM
+/// ownership immediately before and after traffic; it never creates an SQM
+/// section or runtime override.
+pub fn build_bootstrap_speedtest_request(
+    intent: &SpeedtestLaunchIntent,
+    planned_sqm_section: &str,
+) -> Result<OperationRequest, String> {
+    validate_speedtest_intent(intent)?;
+    if intent.topology != SpeedtestTopology::Unshaped {
+        return Err("bootstrap Speed Test requires unshaped topology".to_string());
+    }
+    let context = attest_bootstrap_operation_context(
+        &intent.instance,
+        &intent.expected_target_interface,
+        &intent.route_mode,
+        &intent.mwan3_member,
+        planned_sqm_section,
+    )?;
+    let created_unix_ms = epoch_ms()?;
+    let job_id = read_kernel_uuid(
+        Path::new(DEFAULT_RANDOM_UUID_PATH),
+        "native bootstrap Speed Test job ID",
+    )?;
+    let token_a = read_kernel_uuid(
+        Path::new(DEFAULT_RANDOM_UUID_PATH),
+        "native bootstrap Speed Test job token",
+    )?;
+    let token_b = read_kernel_uuid(
+        Path::new(DEFAULT_RANDOM_UUID_PATH),
+        "native bootstrap Speed Test job token",
+    )?;
+    build_bootstrap_speedtest_request_from_context(
+        intent,
+        context,
+        job_id,
+        format!("{token_a}{token_b}"),
+        created_unix_ms,
+    )
+}
+
+fn build_bootstrap_speedtest_request_from_context(
+    intent: &SpeedtestLaunchIntent,
+    context: BootstrapRequestContext,
+    job_id: String,
+    job_token: String,
+    created_unix_ms: u64,
+) -> Result<OperationRequest, String> {
+    validate_speedtest_intent(intent)?;
+    if intent.topology != SpeedtestTopology::Unshaped {
+        return Err("bootstrap Speed Test requires unshaped topology".to_string());
+    }
+    let route = operation_route_identity(&context.route_identity)?;
+    let deadline_unix_ms = created_unix_ms
+        .checked_add(NATIVE_SPEEDTEST_DEADLINE_MS)
+        .ok_or_else(|| "native bootstrap Speed Test deadline overflow".to_string())?;
+    let request = OperationRequest {
+        identity: OperationIdentity {
+            job_id,
+            job_token,
+            instance: intent.instance.clone(),
+            operation: OperationKind::Speedtest,
+            target_interface: context.target_interface,
+            route_fingerprint: context.route_fingerprint,
+            config_fingerprint: context.config_fingerprint,
+            sqm_fingerprint: context.sqm_fingerprint,
+        },
+        created_unix_ms,
+        deadline_unix_ms,
+        origin: OperationOrigin::Luci,
+        backend: intent.backend.clone(),
+        speedtest_direction: Some(intent.direction),
+        speedtest_server_id: intent.server_id,
+        speedtest_topology: Some(intent.topology),
+        route,
+        target_state: OperationTargetState::AbsentBootstrap,
+        capture_policy: Some(AutotuneCapturePolicyId::StandardV2),
+        managed_sqm_section: Some(context.planned_sqm_section),
+        profile: None,
+        strategy: None,
+        access_medium: None,
+        access_source: None,
+        access_confidence_percent: 0,
+        capacity_learning_policy: None,
+        service_dl_cap_kbps: None,
+        service_ul_cap_kbps: None,
+        allow_sqm_disable: false,
+        allow_active_traffic: false,
+        scheduled_auto_apply_requested: false,
+        traffic_budget_bytes: NATIVE_SPEEDTEST_BOOTSTRAP_TRAFFIC_BUDGET_BYTES,
+    };
+    request.validate()?;
+    context.absence_identity.ensure_request_binding(
+        &request.identity.instance,
+        request.managed_sqm_section.as_deref().unwrap_or_default(),
+        &request.identity.target_interface,
+        &request.identity.route_fingerprint,
+        &request.identity.config_fingerprint,
+        &request.identity.sqm_fingerprint,
+    )?;
+    Ok(request)
+}
+
 fn build_speedtest_request(
     intent: &SpeedtestLaunchIntent,
     context: LiveRequestContext,
@@ -149,7 +257,9 @@ fn build_speedtest_request(
     job_token: String,
     created_unix_ms: u64,
 ) -> Result<OperationRequest, String> {
-    if context.configured_speedtest_backend != intent.backend {
+    if resolve_native_speedtest_backend(&context.configured_speedtest_backend)
+        != Some(intent.backend.as_str())
+    {
         return Err(
             "native Speed Test backend does not match the instance configuration".to_string(),
         );
@@ -197,6 +307,16 @@ fn build_speedtest_request(
     };
     request.validate()?;
     Ok(request)
+}
+
+/// Resolve the user-facing automatic backend policy before it enters the
+/// immutable native request.  Recovery and status identities therefore name
+/// the concrete worker implementation, never the mutable selection policy.
+pub(crate) fn resolve_native_speedtest_backend(backend: &str) -> Option<&'static str> {
+    match backend {
+        "auto" | "speedtest-go" => Some("speedtest-go"),
+        _ => None,
+    }
 }
 
 fn native_speedtest_traffic_budget_bytes(
@@ -268,7 +388,9 @@ fn validate_speedtest_intent(intent: &SpeedtestLaunchIntent) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::super::protocol::{OperationRouteIdentity, OperationRouteMode};
+    use super::super::sqm_identity::{sha256sum, BootstrapAbsenceIdentity};
     use super::*;
+    use crate::routing::RouteIdentity;
     use std::net::{IpAddr, Ipv4Addr};
 
     fn intent() -> SpeedtestLaunchIntent {
@@ -304,6 +426,36 @@ mod tests {
             route_fingerprint: "a".repeat(64),
             config_fingerprint: "b".repeat(64),
             sqm_fingerprint: "c".repeat(64),
+        }
+    }
+
+    fn bootstrap_context(intent: &SpeedtestLaunchIntent) -> BootstrapRequestContext {
+        let route_identity = RouteIdentity {
+            mode: "main".to_string(),
+            member: String::new(),
+            device: intent.expected_target_interface.clone(),
+            source_ip: "192.0.2.2".to_string(),
+            fwmark: String::new(),
+            table: "main".to_string(),
+        };
+        let route_fingerprint = sha256sum(route_identity.stable_key().as_bytes()).unwrap();
+        let absence_identity = BootstrapAbsenceIdentity::from_raw(
+            &intent.instance,
+            "cake_wan_sqm",
+            &intent.expected_target_interface,
+            &route_fingerprint,
+            b"cake-autorate.globals=globals\n",
+            b"",
+        )
+        .unwrap();
+        BootstrapRequestContext {
+            target_interface: intent.expected_target_interface.clone(),
+            planned_sqm_section: "cake_wan_sqm".to_string(),
+            route_identity,
+            route_fingerprint,
+            config_fingerprint: absence_identity.config_fingerprint().to_string(),
+            sqm_fingerprint: absence_identity.sqm_fingerprint().to_string(),
+            absence_identity,
         }
     }
 
@@ -498,14 +650,68 @@ mod tests {
     }
 
     #[test]
-    fn builder_rejects_cli_backend_override_of_live_instance_configuration() {
+    fn builder_resolves_auto_but_rejects_an_incompatible_live_backend() {
+        let mut automatic = context();
+        automatic.configured_speedtest_backend = "auto".to_string();
+        let request =
+            build_speedtest_request(&intent(), automatic, "d".repeat(32), "e".repeat(64), 1_000)
+                .unwrap();
+        assert_eq!(request.backend, "speedtest-go");
+
         let mut mismatched = context();
-        mismatched.configured_speedtest_backend = "auto".to_string();
+        mismatched.configured_speedtest_backend = "librespeed-cli".to_string();
         assert_eq!(
             build_speedtest_request(&intent(), mismatched, "d".repeat(32), "e".repeat(64), 1_000,)
                 .unwrap_err(),
             "native Speed Test backend does not match the instance configuration"
         );
+        assert_eq!(
+            resolve_native_speedtest_backend("auto"),
+            Some("speedtest-go")
+        );
+        assert_eq!(
+            resolve_native_speedtest_backend("speedtest-go"),
+            Some("speedtest-go")
+        );
+        assert_eq!(resolve_native_speedtest_backend("iperf3"), None);
+    }
+
+    #[test]
+    fn bootstrap_builder_is_read_only_unshaped_and_binds_the_absence_witness() {
+        let mut launch = intent();
+        launch.topology = SpeedtestTopology::Unshaped;
+        let request = build_bootstrap_speedtest_request_from_context(
+            &launch,
+            bootstrap_context(&launch),
+            "a".repeat(32),
+            "b".repeat(64),
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(request.target_state, OperationTargetState::AbsentBootstrap);
+        assert_eq!(request.managed_sqm_section.as_deref(), Some("cake_wan_sqm"));
+        assert_eq!(
+            request.speedtest_topology,
+            Some(SpeedtestTopology::Unshaped)
+        );
+        assert!(!request.allow_sqm_disable);
+        assert!(!request.allow_active_traffic);
+        assert_eq!(
+            request.traffic_budget_bytes,
+            NATIVE_SPEEDTEST_BOOTSTRAP_TRAFFIC_BUDGET_BYTES
+        );
+        request.validate_admission_policy().unwrap();
+
+        launch.topology = SpeedtestTopology::Current;
+        assert!(build_bootstrap_speedtest_request_from_context(
+            &launch,
+            bootstrap_context(&launch),
+            "c".repeat(32),
+            "d".repeat(64),
+            1_000,
+        )
+        .unwrap_err()
+        .contains("requires unshaped topology"));
     }
 
     #[test]

@@ -811,8 +811,9 @@ while reductions remain immediate. Multi-WAN member state is still inspected at
 the configured route interval, with the validated device/source/mark/table
 identity refreshed every 30 seconds or immediately on an error.
 
-A read-only `/usr/libexec/cake-autorate-rs/cpu-profile` helper was used before
-and after the upgrade on the same four-core x86_64 Multi-WAN router. It reads
+A read-only shell CPU profiler (now replaced by
+`/usr/sbin/cake-autorated --cpu-profile`) was used before and after the upgrade
+on the same four-core x86_64 Multi-WAN router. It reads
 `/proc/stat` and per-process self plus waited-child ticks, uses only a temporary
 file in `/tmp`, and reports both one-CPU and total-capacity percentages. The
 30-second RC15 baseline attributed about 6.20% of one CPU to the primary
@@ -2495,3 +2496,71 @@ SHA-256
 `f2a897ae52755894bad56f5cac19aec9ea65b3a8461d8fcc4f99b083cbe81bb2`;
 the machine-readable matrix report has SHA-256
 `117e6a3f8ec849e726976d1553f0412855635d5a35cdc8d75f7cee25e98ca42e`.
+
+## RC27 r306/r120 Rust migration and final release gate (2026-08-21)
+
+The final post-migration source gate passed 1,249 Full Rust tests, 110 Lite
+Rust tests, every retained native lifecycle/shell bridge test, all Full/Lite
+LuCI JavaScript and TypeScript suites, formatting, shell syntax and diff
+checks. Longrun `7690000d7a3748e181175e2c12047b20` is the accepted final
+source gate.
+
+The last browser findings were two connected Rating client-state bugs. A
+Guided job continued in the backend after LuCI compared its new worker ID with
+the worker from a preceding completed Automatic job and displayed `Rating
+returned an invalid worker identity`. The durable Guided terminal nevertheless
+proved a complete class C result with DL C, UL A, 80 DL samples, 20 UL samples,
+`runtime_mutated=0` and no recovery. A repeated Start then reached the correct
+instance lease guard but exposed its raw Rust `LeaseKey` debug string.
+
+r305/r120 resets job and worker identity before every new Rating, keeps Start
+disabled until exact `rating-current` attestation, reconnects another browser
+session to a matching active Rating, maps lease conflicts to a typed safe JSON
+contract, and cancels a job whose Start receipt arrives after the dialog has
+already closed. The live two-session Playwright gate covered four separate
+boundaries:
+
+1. Close while `rating-start` was deliberately held in flight; the returned
+   job was immediately cancelled.
+2. Automatic completed, then Guided started in the same modal with a distinct
+   worker and reached live progress without an identity error.
+3. A second session opened while Guided was active and a deliberately delayed
+   `rating-current` kept Start disabled; no second Start RPC was sent.
+4. Another session won after an idle attestation but before the losing Start;
+   exactly one losing RPC received `lease-conflict`, re-attested, adopted the
+   winning job and never rendered `Instance(...)` or an owner debug string.
+
+Every test job settled `runtime_mutated=false`, `recovery_required=false`, and
+the final `rating-current` returned idle. The accepted Playwright artifact is
+`/tmp/r305-rating-full-concurrency-100-1/result.json`; Longrun
+`bf8b8c897ae347258d030b4492b1b93e` passed.
+
+The complete release matrix then exposed a separate 32-bit portability issue:
+MIPS 24Kc has no `AtomicU64`, while four migrated Rust modules used 64-bit
+atomics only as process-local temporary-file counters. r306 uses portable
+`AtomicU32` counters with the same PID plus `create_new`/bounded-collision
+contract. Dedicated ath79 big-endian and ramips little-endian Full/Lite builds,
+APK extraction and ELF checks passed under Longrun
+`f2cda82943ba4288bdcbf57cad5458d1` before the full matrix was retried.
+
+Daemon r306 and Full LuCI r120 are installed on the disposable VM, both
+anonymized x86_64 Multi-WAN routers and the anonymized aarch64 cellular router.
+Exact package/binary/config/UCI/process/coordinator and stable CAKE topology
+checks pass on all four. The Full LuCI desktop/mobile Status, Graphs, Settings,
+Re-run and Edit gates were accepted on r120; the final daemon-only r306 change
+does not touch browser or Rating state-machine code.
+
+The final OpenWrt 25.12.5 matrix contains 12 Full r306 daemon APKs, 12
+separately compiled Lite r306 daemon APKs, Full LuCI r120 and Lite LuCI r4.
+All 26 APKs passed source-sync, APK integrity, metadata,
+dependencies/providers, installed modes, source-payload identity,
+Full/Lite separation, ELF machine, endianness, ARM float ABI and MIPS o32
+checks. Architecture-independent LuCI was built once in the clean x86 SDK and
+verified as APK v3 `noarch`; daemon variants were built independently in all
+12 SDKs. Longrun `541bea190b1c411dbfb857d1af7c7918` passed 12/12.
+
+Independent `sha256sum -c` verification passed for all 26 staged artifacts.
+`SHA256SUMS` has SHA-256
+`11e4939e0d2af8e620ffa2750f93cd6b5792af9c87f8c7b02abd2b30dc2ffd79`;
+the machine-readable matrix report has SHA-256
+`40c9ec1fc8d17fcf0577d5eff826eb594efd2d3efec936f50d27ac24dbd5a907`.

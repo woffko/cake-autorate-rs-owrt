@@ -1,7 +1,7 @@
 use super::protocol::{
     ControlCommand, ControlMessage, ControlRequest, OperationKind, OperationOrigin,
-    OperationRequest, OperationRouteMode, OperationTargetState, MAX_CONTROL_MESSAGE_BYTES,
-    MAX_OPERATION_RECORD_BYTES, OPERATION_PROTOCOL_VERSION,
+    OperationRequest, OperationRouteMode, OperationState, OperationTargetState,
+    MAX_CONTROL_MESSAGE_BYTES, MAX_OPERATION_RECORD_BYTES, OPERATION_PROTOCOL_VERSION,
 };
 use super::{
     autotune_apply::{
@@ -11,7 +11,7 @@ use super::{
     autotune_apply_runtime::{
         execute_native_apply_commit, execute_native_apply_commit_with_fault,
         execute_native_apply_forced_rollback_with_fault, recover_native_apply,
-        NativeApplyCommitDisposition, NativeApplyLabFaultInjection,
+        NativeApplyCommitDisposition, NativeApplyLabFaultInjection, NativeApplyTransactionBackend,
     },
     autotune_bootstrap_apply::{NativeBootstrapApplyPlan, NativeBootstrapApplyPolicy},
     autotune_bootstrap_apply_recovery::NativeBootstrapApplyRecoveryStore,
@@ -37,7 +37,13 @@ use super::{
         JOURNAL_RETENTION_TARGET, MAX_JOURNAL_JOBS,
     },
     json_wire::{bool_json, json_escape},
-    lease::{requires_heavy_traffic, LeaseRequest, LeaseTable},
+    lease::{requires_heavy_traffic, LeaseAcquireError, LeaseRequest, LeaseTable},
+    native_apply_coordinator::{
+        NativeApplyAdmission, NativeApplyControlCommand, NativeApplyControlRequest,
+        NativeApplyCoordinatorStore, NativeApplyDispatchRecord, NativeApplyDispatchState,
+        NativeApplyTerminalOutcome, NativeApplyTerminalRecord, NativeApplyVerifiedDispatchIdentity,
+        NativeApplyWorkerClaim,
+    },
     process::{signal_adopted_group, ManagedChild, SpawnSpec},
     rating::{self, RatingTerminal},
     rating_request::{build_live_rating_request, parse_rating_launch_intent},
@@ -49,6 +55,7 @@ use super::{
         load_scheduled_instances, scheduled_configuration_committed, ScheduledInstanceConfig,
         SchedulerConfigSnapshot,
     },
+    scheduler_owner::{SchedulerOwnerLock, PRODUCTION_SCHEDULER_OWNER_LOCK},
     scheduler_runtime::{
         acknowledge_scheduled_accounting_unknown, attest_no_competing_calibration_processes,
         load_or_initialize_state, local_calendar, mark_scheduled_accounting_unknown,
@@ -62,8 +69,12 @@ use super::{
         MAX_SCHEDULER_STATUS_RESPONSE_BYTES, SCHEDULER_STATUS_GLOBAL_ERROR,
     },
     scheduler_store::SchedulerStore,
+    scheduler_store::PRODUCTION_SCHEDULER_STORE_ROOT as PRODUCTION_SCHEDULER_STORE_DIR,
     speedtest::{self, SpeedtestTerminal},
-    speedtest_request::{build_live_speedtest_request, parse_speedtest_launch_intent},
+    speedtest_request::{
+        build_bootstrap_speedtest_request, build_live_speedtest_request,
+        parse_speedtest_launch_intent,
+    },
     state,
 };
 use crate::Config;
@@ -108,11 +119,15 @@ fn native_autotune_rate_bounds(
 }
 
 const DEFAULT_STATE_DIR: &str = "/var/run/cake-autorate-calibration";
-const PRODUCTION_SCHEDULER_STORE_DIR: &str = "/etc/cake-autorate-rs-scheduler";
+pub(crate) const PRODUCTION_CALIBRATION_STATE_DIR: &str = DEFAULT_STATE_DIR;
+const NATIVE_OPERATION_STATUS_IDENTITY_VERSION: u32 = 1;
 const SCHEDULER_ACK_HEADER: &str = "cake-autorate-scheduler\t1\tacknowledge-accounting";
 const SCHEDULER_STATUS_HEADER: &str = "cake-autorate-scheduler\t1\tstatus";
 const CONTROL_SOCKET_NAME: &str = "control.sock";
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
+const NATIVE_APPLY_WATCH_HOLD: Duration = Duration::from_secs(25);
+const NATIVE_APPLY_WATCH_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_PENDING_NATIVE_APPLY_WATCHES: usize = 32;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024;
 const MAX_RESULT_RESPONSE_BYTES: usize = 512 * 1024;
 const WORKER_CANCEL_GRACE: Duration = Duration::from_secs(15);
@@ -217,6 +232,7 @@ fn operation_uses_native_route_pin(request: &OperationRequest) -> bool {
 fn request_requires_native_runtime(request: &OperationRequest) -> bool {
     request.identity.operation == OperationKind::FullAutotune
         || (request.identity.operation == OperationKind::Speedtest
+            && request.target_state == OperationTargetState::ExistingManaged
             && request.speedtest_topology == Some(super::protocol::SpeedtestTopology::Unshaped))
 }
 
@@ -406,6 +422,7 @@ struct SchedulerStatusRequest {
 
 enum CoordinatorControlRequest {
     Operation(ControlMessage),
+    NativeApply(NativeApplyControlRequest),
     SchedulerAccountingAcknowledgement(SchedulerAccountingAcknowledgement),
     SchedulerStatus(SchedulerStatusRequest),
 }
@@ -428,6 +445,17 @@ where
     I: Iterator<Item = String>,
 {
     let options = parse_daemon_args(args)?;
+    let _scheduler_owner = options
+        .native_scheduler
+        .then(|| SchedulerOwnerLock::open(Path::new(PRODUCTION_SCHEDULER_OWNER_LOCK)))
+        .transpose()?;
+    if options.native_scheduler {
+        // procd respawn re-executes calibrationd without rerunning rc.common
+        // start_service. Settle any interrupted native Apply transaction on
+        // every production coordinator launch before binding the control
+        // socket or admitting new work.
+        let _ = native_autotune_apply_recovery()?;
+    }
     let mut daemon = CalibrationDaemon::bind(&options.state_dir)?;
     if options.native_rating || options.lab_rust_rating {
         daemon.admission_requested = true;
@@ -587,6 +615,18 @@ where
         );
         return Ok(());
     }
+    if command_name == "speedtest-bootstrap-start" {
+        let planned_sqm_section = args.next().ok_or_else(|| {
+            "calibrationctl speedtest-bootstrap-start requires a planned SQM section".to_string()
+        })?;
+        let intent = parse_speedtest_launch_intent(args)?;
+        let operation = build_bootstrap_speedtest_request(&intent, &planned_sqm_section)?;
+        print!(
+            "{}",
+            send_operation_control(&state_dir, ControlCommand::Start, operation)?
+        );
+        return Ok(());
+    }
     if command_name == "rating-current" {
         let instance = args
             .next()
@@ -658,32 +698,86 @@ where
         );
         return Ok(());
     }
-    if command_name == "autotune-apply" {
-        let job_id = args
-            .next()
-            .ok_or_else(|| "calibrationctl autotune-apply requires a public job ID".to_string())?;
-        let option_id = args
-            .next()
-            .ok_or_else(|| "calibrationctl autotune-apply requires an option ID".to_string())?;
+    if command_name == "autotune-apply-start" {
+        let job_id = args.next().ok_or_else(|| {
+            "calibrationctl autotune-apply-start requires a public job ID".to_string()
+        })?;
+        let option_id = args.next().ok_or_else(|| {
+            "calibrationctl autotune-apply-start requires an option ID".to_string()
+        })?;
         let expected_review = args.next().ok_or_else(|| {
-            "calibrationctl autotune-apply requires the expected Review digest".to_string()
+            "calibrationctl autotune-apply-start requires the expected Review digest".to_string()
         })?;
         let expected_manifest = args.next().ok_or_else(|| {
-            "calibrationctl autotune-apply requires the expected manifest digest".to_string()
+            "calibrationctl autotune-apply-start requires the expected manifest digest".to_string()
         })?;
         let acknowledgements = parse_native_apply_acknowledgements(args)?;
-        print!(
-            "{}",
-            native_autotune_apply(
-                &state_dir,
-                &job_id,
-                &option_id,
-                &expected_review,
-                &expected_manifest,
-                &acknowledgements,
-            )?
+        let request = NativeApplyControlRequest::start(
+            kernel_request_id()?,
+            job_id,
+            option_id,
+            expected_review,
+            expected_manifest,
+            acknowledgements,
         );
+        print!("{}", send_native_apply_control(&state_dir, &request)?);
         return Ok(());
+    }
+    if command_name == "autotune-apply-watch" {
+        let apply_job_id = args.next().ok_or_else(|| {
+            "calibrationctl autotune-apply-watch requires an Apply job ID".to_string()
+        })?;
+        let apply_job_token = args.next().ok_or_else(|| {
+            "calibrationctl autotune-apply-watch requires an Apply job token".to_string()
+        })?;
+        let observed_generation = args
+            .next()
+            .ok_or_else(|| {
+                "calibrationctl autotune-apply-watch requires an observed generation".to_string()
+            })?
+            .parse::<u64>()
+            .map_err(|_| "calibrationctl autotune-apply-watch generation is invalid".to_string())?;
+        if args.next().is_some() {
+            return Err("calibrationctl received unexpected arguments".to_string());
+        }
+        let request = NativeApplyControlRequest::watch(
+            kernel_request_id()?,
+            apply_job_id,
+            apply_job_token,
+            observed_generation,
+        );
+        print!("{}", send_native_apply_control(&state_dir, &request)?);
+        return Ok(());
+    }
+    if command_name == "autotune-apply-status" || command_name == "autotune-apply-result" {
+        let apply_job_id = args
+            .next()
+            .ok_or_else(|| format!("calibrationctl {command_name} requires an Apply job ID"))?;
+        let apply_job_token = args
+            .next()
+            .ok_or_else(|| format!("calibrationctl {command_name} requires an Apply job token"))?;
+        if args.next().is_some() {
+            return Err("calibrationctl received unexpected arguments".to_string());
+        }
+        let command = if command_name == "autotune-apply-status" {
+            NativeApplyControlCommand::Status
+        } else {
+            NativeApplyControlCommand::Result
+        };
+        let request = NativeApplyControlRequest::query(
+            kernel_request_id()?,
+            command,
+            apply_job_id,
+            apply_job_token,
+        );
+        print!("{}", send_native_apply_control(&state_dir, &request)?);
+        return Ok(());
+    }
+    if command_name == "autotune-apply" {
+        return Err(
+            "synchronous native Apply is retired; use autotune-apply-start/status/result"
+                .to_string(),
+        );
     }
     if command_name == "autotune-apply-lab-rollback" {
         let fault = require_native_apply_lab_rollback_mode()?;
@@ -900,6 +994,75 @@ where
     }
     print!("{}", native_autotune_apply_recovery()?);
     Ok(())
+}
+
+pub fn run_native_apply_worker<I>(mut args: I) -> Result<(), String>
+where
+    I: Iterator<Item = String>,
+{
+    if euid() != 0 {
+        return Err("native Apply worker requires root".to_string());
+    }
+    if args.next().as_deref() != Some("--state-dir") {
+        return Err("native Apply worker requires --state-dir".to_string());
+    }
+    let state_dir = PathBuf::from(
+        args.next()
+            .ok_or_else(|| "native Apply worker requires a state path".to_string())?,
+    );
+    if args.next().as_deref() != Some("--apply-job-id") {
+        return Err("native Apply worker requires --apply-job-id".to_string());
+    }
+    let apply_job_id = args
+        .next()
+        .ok_or_else(|| "native Apply worker requires an Apply job ID".to_string())?;
+    if args.next().is_some() {
+        return Err("native Apply worker received trailing arguments".to_string());
+    }
+    validate_state_path(&state_dir)?;
+    if apply_job_id.len() != 32
+        || !apply_job_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("native Apply worker job ID is invalid".to_string());
+    }
+    let store = NativeApplyCoordinatorStore::new(default_native_apply_paths().recovery_root);
+    let active = store
+        .read_active()?
+        .ok_or_else(|| "native Apply worker has no durable dispatch".to_string())?;
+    if active.apply_job_id != apply_job_id
+        || !matches!(
+            active.state,
+            NativeApplyDispatchState::Validating | NativeApplyDispatchState::Applying
+        )
+    {
+        return Err("native Apply worker dispatch identity is not executable".to_string());
+    }
+    let claim = NativeApplyWorkerClaim::for_process(&active, ProcessIdentity::current()?)?;
+    if let Some(existing) = store.claim_worker(&active, &claim)? {
+        if existing == claim {
+            // An exec-retry of the exact process may continue.
+        } else if existing
+            .process
+            .still_matches(Path::new(DEFAULT_PROC_ROOT))?
+        {
+            return Err("native Apply dispatch is already owned by a live worker".to_string());
+        } else {
+            store.remove_worker_claim(&existing)?;
+            if store.claim_worker(&active, &claim)?.is_some() {
+                return Err("native Apply worker claim raced with another owner".to_string());
+            }
+        }
+    }
+
+    let result = execute_native_apply_worker(&state_dir, &store, active);
+    let cleanup = store.remove_worker_claim(&claim);
+    match (result, cleanup) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 fn send_operation_control(
@@ -1519,7 +1682,7 @@ fn execute_native_scheduled_auto_apply(
     ))
 }
 
-fn native_apply_recovery_markers_present() -> Result<(bool, bool), String> {
+pub(crate) fn native_apply_recovery_markers_present() -> Result<(bool, bool), String> {
     let current = default_native_apply_paths().recovery_root.join("current");
     let existing = match fs::symlink_metadata(&current) {
         Ok(_) => true,
@@ -1540,9 +1703,136 @@ fn native_apply_recovery_markers_present() -> Result<(bool, bool), String> {
     Ok((existing, bootstrap))
 }
 
+pub(crate) fn attest_native_apply_idle_for_service_stop() -> Result<(), String> {
+    let store = NativeApplyCoordinatorStore::new(default_native_apply_paths().recovery_root);
+    // A recovery marker without an active dispatch/worker must not deadlock an
+    // upgrade: the package lifecycle stops this service before invoking the
+    // dedicated native recovery command. Active ownership remains fail-closed.
+    attest_native_apply_store_idle_for_service_stop(&store)
+}
+
+fn attest_native_apply_store_idle_for_service_stop(
+    store: &NativeApplyCoordinatorStore,
+) -> Result<(), String> {
+    if let Some(active) = store.read_active()? {
+        return Err(format!(
+            "calibration service stop is deferred while native Apply is {} at generation {}",
+            active.state.as_str(),
+            active.generation
+        ));
+    }
+    if store.read_worker_claim()?.is_some() {
+        return Err(
+            "calibration service stop is deferred until the native Apply worker claim is settled"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn native_apply_recovery_marker_present() -> Result<bool, String> {
     let (existing, bootstrap) = native_apply_recovery_markers_present()?;
     Ok(existing || bootstrap)
+}
+
+fn existing_native_apply_check_result<F>(
+    candidate_already_applied: bool,
+    attest_runtime: F,
+) -> Result<bool, String>
+where
+    F: FnOnce() -> RuntimeAttestation,
+{
+    if candidate_already_applied {
+        return Ok(true);
+    }
+    match attest_runtime() {
+        RuntimeAttestation::Ready => Ok(false),
+        RuntimeAttestation::Waiting { code, message }
+        | RuntimeAttestation::Unsafe { code, message } => Err(format!(
+            "native Apply live attestation failed ({code}): {message}"
+        )),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeApplyLiveState {
+    Candidate,
+    Original,
+}
+
+type NativeApplyLiveStateAttestor =
+    fn(&Path, &str, Option<&str>) -> Result<NativeApplyLiveState, String>;
+
+fn attest_verified_native_apply_live_state(
+    authority: &VerifiedNativeApplyAuthority,
+) -> Result<NativeApplyLiveState, String> {
+    if native_apply_recovery_marker_present()? {
+        return Err("native Apply recovery remains pending".to_string());
+    }
+    if let Some(bootstrap) = authority.bootstrap.as_ref() {
+        let mut backend = OpenWrtNativeApplyBackend::new();
+        let already =
+            <OpenWrtNativeApplyBackend as NativeBootstrapApplyBackend>::candidate_already_applied(
+                &mut backend,
+                &bootstrap.plan,
+            )?;
+        if already {
+            return Ok(NativeApplyLiveState::Candidate);
+        }
+        <OpenWrtNativeApplyBackend as NativeBootstrapApplyBackend>::attest_absent_before_mutation(
+            &mut backend,
+            &bootstrap.plan,
+        )?;
+        return Ok(NativeApplyLiveState::Original);
+    }
+
+    let mut backend = OpenWrtNativeApplyBackend::new();
+    let candidate_already_applied = NativeApplyTransactionBackend::candidate_already_applied(
+        &mut backend,
+        &authority.source.plan,
+    )?;
+    existing_native_apply_check_result(candidate_already_applied, || {
+        attest_openwrt_runtime(&authority.source.request)
+    })
+    .map(|already| {
+        if already {
+            NativeApplyLiveState::Candidate
+        } else {
+            NativeApplyLiveState::Original
+        }
+    })
+}
+
+fn native_autotune_apply_live_state(
+    state_dir: &Path,
+    job_id: &str,
+    option_id: Option<&str>,
+) -> Result<NativeApplyLiveState, String> {
+    let authority = verified_native_autotune_apply_authority(state_dir, job_id, option_id)?;
+    attest_verified_native_apply_live_state(&authority)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeApplyTerminalRetry {
+    Reuse,
+    Rearm,
+}
+
+fn native_apply_terminal_retry(
+    terminal: &NativeApplyTerminalRecord,
+    live: NativeApplyLiveState,
+) -> Result<NativeApplyTerminalRetry, String> {
+    terminal.validate()?;
+    if !terminal.recovery_cleared {
+        return Err(
+            "native Apply terminal cannot be retried while recovery remains pending".to_string(),
+        );
+    }
+    if terminal.outcome.success() && live == NativeApplyLiveState::Candidate {
+        Ok(NativeApplyTerminalRetry::Reuse)
+    } else {
+        Ok(NativeApplyTerminalRetry::Rearm)
+    }
 }
 
 fn native_autotune_apply_check(
@@ -1551,35 +1841,8 @@ fn native_autotune_apply_check(
     option_id: Option<&str>,
 ) -> Result<String, String> {
     let authority = verified_native_autotune_apply_authority(state_dir, job_id, option_id)?;
-    let already_applied = if let Some(bootstrap) = authority.bootstrap.as_ref() {
-        let mut backend = OpenWrtNativeApplyBackend::new();
-        <OpenWrtNativeApplyBackend as NativeBootstrapApplyBackend>::attest_legacy_apply_idle(
-            &mut backend,
-        )?;
-        let already =
-            <OpenWrtNativeApplyBackend as NativeBootstrapApplyBackend>::candidate_already_applied(
-                &mut backend,
-                &bootstrap.plan,
-            )?;
-        if !already {
-            <OpenWrtNativeApplyBackend as NativeBootstrapApplyBackend>::attest_absent_before_mutation(
-                &mut backend,
-                &bootstrap.plan,
-            )?;
-        }
-        already
-    } else {
-        match attest_openwrt_runtime(&authority.source.request) {
-            RuntimeAttestation::Ready => {}
-            RuntimeAttestation::Waiting { code, message }
-            | RuntimeAttestation::Unsafe { code, message } => {
-                return Err(format!(
-                    "native Apply live attestation failed ({code}): {message}"
-                ))
-            }
-        }
-        false
-    };
+    let already_applied =
+        attest_verified_native_apply_live_state(&authority)? == NativeApplyLiveState::Candidate;
     Ok(format!(
         concat!(
             "{{\"state\":\"confirmation_ready\",\"apply_enabled\":true,",
@@ -1615,24 +1878,26 @@ where
     while let Some(flag) = args.next() {
         if flag != "--ack" {
             return Err(
-                "calibrationctl autotune-apply received an unexpected argument".to_string(),
+                "calibrationctl autotune-apply-start received an unexpected argument".to_string(),
             );
         }
-        let code = args
-            .next()
-            .ok_or_else(|| "calibrationctl autotune-apply --ack requires a code".to_string())?;
+        let code = args.next().ok_or_else(|| {
+            "calibrationctl autotune-apply-start --ack requires a code".to_string()
+        })?;
         let acknowledgement =
             NativeApplyAcknowledgement::from_public_code(&code).ok_or_else(|| {
-                "calibrationctl autotune-apply acknowledgement code is unknown".to_string()
+                "calibrationctl autotune-apply-start acknowledgement code is unknown".to_string()
             })?;
         if !values.insert(acknowledgement) {
             return Err(
-                "calibrationctl autotune-apply acknowledgement code is duplicated".to_string(),
+                "calibrationctl autotune-apply-start acknowledgement code is duplicated"
+                    .to_string(),
             );
         }
         if values.len() > MAX_NATIVE_APPLY_ACKNOWLEDGEMENTS {
             return Err(
-                "calibrationctl autotune-apply acknowledgement set exceeds its bound".to_string(),
+                "calibrationctl autotune-apply-start acknowledgement set exceeds its bound"
+                    .to_string(),
             );
         }
     }
@@ -1661,32 +1926,83 @@ fn require_exact_native_apply_acknowledgements(
     }
 }
 
-fn native_autotune_apply(
+fn bounded_native_apply_diagnostic(error: &str) -> String {
+    error
+        .bytes()
+        .map(|value| {
+            if value == b' ' || value.is_ascii_graphic() {
+                value as char
+            } else {
+                ' '
+            }
+        })
+        .take(480)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn verified_native_apply_dispatch_identity(
     state_dir: &Path,
-    job_id: &str,
-    option_id: &str,
-    expected_review: &str,
-    expected_manifest: &str,
-    acknowledged: &[NativeApplyAcknowledgement],
-) -> Result<String, String> {
-    if euid() != 0 {
-        return Err("native Apply requires root".to_string());
+    dispatch: &NativeApplyDispatchRecord,
+) -> Result<NativeApplyVerifiedDispatchIdentity, String> {
+    if !matches!(
+        dispatch.state,
+        NativeApplyDispatchState::Validating | NativeApplyDispatchState::Applying
+    ) {
+        return Err("native Apply authority verification requires validating state".to_string());
     }
-    require_native_apply_digest("Review", expected_review)?;
-    require_native_apply_digest("manifest", expected_manifest)?;
-    let authority = verified_native_autotune_apply_authority(state_dir, job_id, Some(option_id))?;
-    if authority.source.review_digest != expected_review {
+    let authority = verified_native_autotune_apply_authority(
+        state_dir,
+        &dispatch.source_job_id,
+        Some(&dispatch.option_id),
+    )?;
+    if authority.source.review_digest != dispatch.review_sha256 {
         return Err("native Apply Review confirmation mismatch".to_string());
     }
-    if authority.effective_manifest_digest() != expected_manifest {
+    if authority.effective_manifest_digest() != dispatch.manifest_sha256 {
         return Err("native Apply manifest confirmation mismatch".to_string());
     }
     require_exact_native_apply_acknowledgements(
         &authority.source.plan.required_acknowledgements,
-        acknowledged,
+        &dispatch.acknowledgements,
     )?;
-    let required_acknowledgements =
-        native_apply_acknowledgements_json(&authority.source.plan.required_acknowledgements);
+    let manifest_schema_version = authority.effective_manifest_schema_version();
+    let target_state = authority.target_state_name().to_string();
+    Ok(NativeApplyVerifiedDispatchIdentity {
+        worker_run_id: authority.source.worker_run_id,
+        source_manifest_sha256: authority.source.manifest_digest,
+        manifest_schema_version,
+        target_state,
+    })
+}
+
+fn execute_native_apply_dispatch(
+    state_dir: &Path,
+    dispatch: &NativeApplyDispatchRecord,
+) -> Result<(NativeApplyTerminalOutcome, bool), String> {
+    if euid() != 0 {
+        return Err("native Apply requires root".to_string());
+    }
+    dispatch.validate()?;
+    let authority = verified_native_autotune_apply_authority(
+        state_dir,
+        &dispatch.source_job_id,
+        Some(&dispatch.option_id),
+    )?;
+    if authority.source.worker_run_id != dispatch.worker_run_id
+        || authority.source.option_id != dispatch.option_id
+        || authority.source.review_digest != dispatch.review_sha256
+        || authority.source.manifest_digest != dispatch.source_manifest_sha256
+        || authority.effective_manifest_digest() != dispatch.manifest_sha256
+        || authority.effective_manifest_schema_version() != dispatch.manifest_schema_version
+        || authority.target_state_name() != dispatch.target_state
+        || authority.source.plan.required_acknowledgements != dispatch.acknowledgements
+    {
+        return Err(
+            "native Apply durable dispatch no longer matches its verified Review".to_string(),
+        );
+    }
     let mut backend = OpenWrtNativeApplyBackend::new();
     let receipt = if let Some(bootstrap) = authority.bootstrap.as_ref() {
         execute_native_bootstrap_apply_commit(
@@ -1704,10 +2020,214 @@ fn native_autotune_apply(
         )?
     };
     let disposition = match receipt.disposition {
-        NativeApplyCommitDisposition::Applied => "applied",
-        NativeApplyCommitDisposition::AlreadyApplied => "already_applied",
+        NativeApplyCommitDisposition::Applied => NativeApplyTerminalOutcome::Applied,
+        NativeApplyCommitDisposition::AlreadyApplied => NativeApplyTerminalOutcome::AlreadyApplied,
     };
-    Ok(format!(
+    if receipt.job_id != dispatch.source_job_id
+        || receipt.worker_run_id != dispatch.worker_run_id
+        || receipt.manifest_sha256 != dispatch.manifest_sha256
+    {
+        return Err(
+            "native Apply transaction receipt changed its durable dispatch identity".to_string(),
+        );
+    }
+    Ok((disposition, receipt.recovery_cleared))
+}
+
+fn execute_native_apply_worker(
+    state_dir: &Path,
+    store: &NativeApplyCoordinatorStore,
+    dispatch: NativeApplyDispatchRecord,
+) -> Result<(), String> {
+    let applying = if dispatch.state == NativeApplyDispatchState::Validating {
+        let verified = match verified_native_apply_dispatch_identity(state_dir, &dispatch) {
+            Ok(value) => value,
+            Err(error) => {
+                store.complete(&NativeApplyTerminalRecord {
+                    dispatch,
+                    outcome: NativeApplyTerminalOutcome::Failed,
+                    recovery_cleared: true,
+                    diagnostic: bounded_native_apply_diagnostic(&error),
+                })?;
+                return Ok(());
+            }
+        };
+        store.mark_applying(&dispatch, verified)?
+    } else if dispatch.state == NativeApplyDispatchState::Applying {
+        dispatch
+    } else {
+        return Err("native Apply worker received a non-executable dispatch".to_string());
+    };
+
+    let (existing_pending, bootstrap_pending) = native_apply_recovery_markers_present()?;
+    if existing_pending || bootstrap_pending {
+        return settle_native_apply_recovery_attempt(
+            store,
+            &applying,
+            None,
+            recover_native_apply_outcome(),
+        );
+    }
+
+    match execute_native_apply_dispatch(state_dir, &applying) {
+        Ok((outcome, recovery_cleared)) => store.complete(&NativeApplyTerminalRecord {
+            dispatch: applying,
+            outcome,
+            recovery_cleared,
+            diagnostic: String::new(),
+        }),
+        Err(error) => {
+            let (existing_pending, bootstrap_pending) = native_apply_recovery_markers_present()?;
+            if existing_pending || bootstrap_pending {
+                settle_native_apply_recovery_attempt(
+                    store,
+                    &applying,
+                    Some(&error),
+                    recover_native_apply_outcome(),
+                )
+            } else {
+                store.complete(&NativeApplyTerminalRecord {
+                    dispatch: applying,
+                    outcome: NativeApplyTerminalOutcome::Failed,
+                    recovery_cleared: true,
+                    diagnostic: bounded_native_apply_diagnostic(&error),
+                })
+            }
+        }
+    }
+}
+
+fn settle_native_apply_recovery_attempt(
+    store: &NativeApplyCoordinatorStore,
+    dispatch: &NativeApplyDispatchRecord,
+    apply_error: Option<&str>,
+    recovery: Result<NativeApplyRecoveryOutcome, String>,
+) -> Result<(), String> {
+    match recovery {
+        Ok(outcome) => settle_native_apply_store_recovery(store, &outcome),
+        Err(recovery_error) => {
+            let diagnostic = match apply_error {
+                Some(apply_error) => format!(
+                    "native Apply failed: {apply_error}; recovery remains pending: {recovery_error}"
+                ),
+                None => format!("native Apply recovery remains pending: {recovery_error}"),
+            };
+            // The exact recovery authority remains on disk.  Publishing a
+            // failed interactive terminal removes only the coordinator's
+            // executable dispatch, so an unchanged failure cannot hot-respawn
+            // workers.  A later explicit Apply, service recovery, or package
+            // lifecycle re-enters recovery from that durable authority.
+            store.complete(&NativeApplyTerminalRecord {
+                dispatch: dispatch.clone(),
+                outcome: NativeApplyTerminalOutcome::Failed,
+                recovery_cleared: false,
+                diagnostic: bounded_native_apply_diagnostic(&diagnostic),
+            })
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NativeApplyWorkerReadiness {
+    Idle,
+    Live(ProcessIdentity),
+    Launch(NativeApplyDispatchRecord),
+}
+
+fn reconcile_native_apply_worker(
+    store: &NativeApplyCoordinatorStore,
+    proc_root: &Path,
+) -> Result<NativeApplyWorkerReadiness, String> {
+    let Some(active) = store.read_active()? else {
+        if let Some(claim) = store.read_worker_claim()? {
+            if claim.process.still_matches(proc_root)? {
+                return Ok(NativeApplyWorkerReadiness::Live(claim.process));
+            }
+            store.remove_worker_claim(&claim)?;
+        }
+        return Ok(NativeApplyWorkerReadiness::Idle);
+    };
+    let executable = match active.state {
+        NativeApplyDispatchState::Accepted => store.mark_validating(&active)?,
+        NativeApplyDispatchState::Validating | NativeApplyDispatchState::Applying => active,
+    };
+    if let Some(claim) = store.read_worker_claim()? {
+        if claim.process.still_matches(proc_root)? {
+            if !claim.matches_dispatch(&executable) {
+                return Err(
+                    "live native Apply worker claim differs from active dispatch".to_string(),
+                );
+            }
+            return Ok(NativeApplyWorkerReadiness::Live(claim.process));
+        }
+        store.remove_worker_claim(&claim)?;
+    }
+    Ok(NativeApplyWorkerReadiness::Launch(executable))
+}
+
+fn native_apply_accepted_response(record: &NativeApplyDispatchRecord) -> String {
+    format!(
+        concat!(
+            "{{\"state\":\"accepted\",\"apply_job_id\":\"{}\",",
+            "\"apply_job_token\":\"{}\",\"job_id\":\"{}\",",
+            "\"option_id\":\"{}\",\"generation\":{}}}\n"
+        ),
+        record.apply_job_id,
+        record.apply_job_token,
+        record.source_job_id,
+        record.option_id,
+        record.generation,
+    )
+}
+
+fn native_apply_status_response(record: &NativeApplyDispatchRecord) -> String {
+    format!(
+        concat!(
+            "{{\"state\":\"{}\",\"terminal\":false,",
+            "\"apply_job_id\":\"{}\",\"job_id\":\"{}\",",
+            "\"option_id\":\"{}\",\"generation\":{}}}\n"
+        ),
+        match record.state {
+            NativeApplyDispatchState::Accepted => "accepted",
+            NativeApplyDispatchState::Validating => "validating",
+            NativeApplyDispatchState::Applying => "applying",
+        },
+        record.apply_job_id,
+        record.source_job_id,
+        record.option_id,
+        record.generation,
+    )
+}
+
+fn native_apply_terminal_status_response(record: &NativeApplyTerminalRecord) -> String {
+    format!(
+        concat!(
+            "{{\"state\":\"{}\",\"terminal\":true,",
+            "\"apply_job_id\":\"{}\",\"job_id\":\"{}\",",
+            "\"option_id\":\"{}\",\"generation\":{},",
+            "\"recovery_cleared\":{}}}\n"
+        ),
+        record.outcome.as_str(),
+        record.dispatch.apply_job_id,
+        record.dispatch.source_job_id,
+        record.dispatch.option_id,
+        record.dispatch.generation.saturating_add(1),
+        bool_json(record.recovery_cleared),
+    )
+}
+
+fn native_apply_terminal_result_response(record: &NativeApplyTerminalRecord) -> String {
+    if !record.outcome.success() {
+        return error_response(
+            record.outcome.as_str(),
+            if record.diagnostic.is_empty() {
+                "native Apply did not commit its selected configuration"
+            } else {
+                &record.diagnostic
+            },
+        );
+    }
+    format!(
         concat!(
             "{{\"state\":\"{}\",\"configuration_written\":true,",
             "\"job_id\":\"{}\",\"worker_run_id\":\"{}\",",
@@ -1715,20 +2235,22 @@ fn native_autotune_apply(
             "\"source_manifest_sha256\":\"{}\",",
             "\"manifest_sha256\":\"{}\",\"manifest_schema_version\":{},",
             "\"target_state\":\"{}\",",
-            "\"acknowledged\":{},\"recovery_cleared\":{}}}\n"
+            "\"acknowledged\":{},\"generation\":{},",
+            "\"recovery_cleared\":{}}}\n"
         ),
-        disposition,
-        receipt.job_id,
-        receipt.worker_run_id,
-        authority.source.option_id,
-        authority.source.review_digest,
-        authority.source.manifest_digest,
-        receipt.manifest_sha256,
-        authority.effective_manifest_schema_version(),
-        authority.target_state_name(),
-        required_acknowledgements,
-        receipt.recovery_cleared,
-    ))
+        record.outcome.as_str(),
+        record.dispatch.source_job_id,
+        record.dispatch.worker_run_id,
+        record.dispatch.option_id,
+        record.dispatch.review_sha256,
+        record.dispatch.source_manifest_sha256,
+        record.dispatch.manifest_sha256,
+        record.dispatch.manifest_schema_version,
+        record.dispatch.target_state,
+        native_apply_acknowledgements_json(&record.dispatch.acknowledgements),
+        record.dispatch.generation.saturating_add(1),
+        bool_json(record.recovery_cleared),
+    )
 }
 
 fn require_native_apply_lab_rollback_mode() -> Result<NativeApplyLabFaultInjection, String> {
@@ -1890,40 +2412,132 @@ fn native_autotune_apply_lab_recover() -> Result<String, String> {
     native_autotune_apply_recovery()
 }
 
-fn native_autotune_apply_recovery() -> Result<String, String> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NativeApplyRecoveryOutcome {
+    None,
+    Recovered {
+        authority: &'static str,
+        job_id: String,
+        worker_run_id: String,
+        recovery_cleared: bool,
+        rolled_forward: bool,
+    },
+}
+
+impl NativeApplyRecoveryOutcome {
+    fn response(&self) -> String {
+        match self {
+            Self::None => "{\"state\":\"no_pending_recovery\"}\n".to_string(),
+            Self::Recovered {
+                authority,
+                job_id,
+                worker_run_id,
+                recovery_cleared,
+                rolled_forward,
+            } => format!(
+                concat!(
+                    "{{\"state\":\"recovered\",\"authority\":\"{}\",",
+                    "\"job_id\":\"{}\",\"worker_run_id\":\"{}\",",
+                    "\"recovery_cleared\":{},\"rolled_forward\":{}}}\n"
+                ),
+                authority,
+                job_id,
+                worker_run_id,
+                bool_json(*recovery_cleared),
+                bool_json(*rolled_forward),
+            ),
+        }
+    }
+}
+
+pub(crate) fn native_autotune_apply_recovery() -> Result<String, String> {
     if euid() != 0 {
         return Err("native Apply recovery requires root".to_string());
     }
+    let outcome = recover_native_apply_outcome()?;
+    settle_native_apply_coordinator_recovery(&outcome)?;
+    Ok(outcome.response())
+}
+
+fn recover_native_apply_outcome() -> Result<NativeApplyRecoveryOutcome, String> {
     let (existing_pending, bootstrap_pending) = native_apply_recovery_markers_present()?;
     let mut backend = OpenWrtNativeApplyBackend::new();
     if existing_pending {
         let receipt = recover_native_apply(default_native_apply_paths(), &mut backend)?
             .ok_or_else(|| "existing native Apply recovery marker disappeared".to_string())?;
-        return Ok(format!(
-            concat!(
-                "{{\"state\":\"recovered\",\"authority\":\"existing_v4\",",
-                "\"job_id\":\"{}\",\"worker_run_id\":\"{}\",",
-                "\"recovery_cleared\":{},\"rolled_forward\":{}}}\n"
-            ),
-            receipt.job_id, receipt.worker_run_id, receipt.recovery_cleared, receipt.rolled_forward,
-        ));
+        return Ok(NativeApplyRecoveryOutcome::Recovered {
+            authority: "existing_v4",
+            job_id: receipt.job_id,
+            worker_run_id: receipt.worker_run_id,
+            recovery_cleared: receipt.recovery_cleared,
+            rolled_forward: receipt.rolled_forward,
+        });
     }
     if bootstrap_pending {
         let receipt =
             recover_native_bootstrap_apply(default_native_apply_paths(), &mut backend)?
                 .ok_or_else(|| "bootstrap native Apply recovery marker disappeared".to_string())?;
-        return Ok(format!(
-            concat!(
-                "{{\"state\":\"recovered\",\"authority\":\"bootstrap_v7\",",
-                "\"job_id\":\"{}\",\"worker_run_id\":\"{}\",",
-                "\"recovery_cleared\":{},\"rolled_forward\":{}}}\n"
-            ),
-            receipt.job_id, receipt.worker_run_id, receipt.recovery_cleared, receipt.rolled_forward,
-        ));
+        return Ok(NativeApplyRecoveryOutcome::Recovered {
+            authority: "bootstrap_v7",
+            job_id: receipt.job_id,
+            worker_run_id: receipt.worker_run_id,
+            recovery_cleared: receipt.recovery_cleared,
+            rolled_forward: receipt.rolled_forward,
+        });
     }
     let _ = recover_native_apply(default_native_apply_paths(), &mut backend)?;
     let _ = recover_native_bootstrap_apply(default_native_apply_paths(), &mut backend)?;
-    Ok("{\"state\":\"no_pending_recovery\"}\n".to_string())
+    Ok(NativeApplyRecoveryOutcome::None)
+}
+
+fn settle_native_apply_coordinator_recovery(
+    outcome: &NativeApplyRecoveryOutcome,
+) -> Result<(), String> {
+    let store = NativeApplyCoordinatorStore::new(default_native_apply_paths().recovery_root);
+    settle_native_apply_store_recovery(&store, outcome)
+}
+
+fn settle_native_apply_store_recovery(
+    store: &NativeApplyCoordinatorStore,
+    outcome: &NativeApplyRecoveryOutcome,
+) -> Result<(), String> {
+    let NativeApplyRecoveryOutcome::Recovered {
+        job_id,
+        worker_run_id,
+        recovery_cleared,
+        rolled_forward,
+        ..
+    } = outcome
+    else {
+        return Ok(());
+    };
+    let Some(active) = store.read_active()? else {
+        // Scheduled Auto-Apply and explicit recovery commands legitimately use
+        // the same transaction engine without an interactive coordinator job.
+        return Ok(());
+    };
+    if active.state != NativeApplyDispatchState::Applying {
+        return Err("native Apply recovery exists before verified mutation authority".to_string());
+    }
+    if active.source_job_id != *job_id || active.worker_run_id != *worker_run_id {
+        return Err(
+            "native Apply recovery identity differs from its coordinator dispatch".to_string(),
+        );
+    }
+    let (outcome, diagnostic) = if *rolled_forward {
+        (NativeApplyTerminalOutcome::Applied, String::new())
+    } else {
+        (
+            NativeApplyTerminalOutcome::RolledBack,
+            "native Apply was rolled back during coordinator recovery".to_string(),
+        )
+    };
+    store.complete(&NativeApplyTerminalRecord {
+        dispatch: active,
+        outcome,
+        recovery_cleared: *recovery_cleared,
+        diagnostic,
+    })
 }
 
 fn read_operation_request(path: &Path) -> Result<OperationRequest, String> {
@@ -2227,6 +2841,11 @@ struct CalibrationDaemon {
     route_pin_cleaner: RoutePinCleaner,
     cancellations: BTreeMap<String, PendingWorkerCancellation>,
     job_errors: BTreeMap<String, String>,
+    native_apply_store: NativeApplyCoordinatorStore,
+    native_apply_live_state_attestor: NativeApplyLiveStateAttestor,
+    native_apply_child: Option<ManagedChild>,
+    native_apply_worker_identity: Option<ProcessIdentity>,
+    native_apply_watches: Vec<PendingNativeApplyWatch>,
 }
 
 struct NativeSchedulerRuntime {
@@ -2312,6 +2931,13 @@ struct PendingWorkerCancellation {
     kill_after: Instant,
 }
 
+struct PendingNativeApplyWatch {
+    stream: UnixStream,
+    request: NativeApplyControlRequest,
+    observed_generation: u64,
+    deadline: Instant,
+}
+
 impl CalibrationDaemon {
     fn bind(state_dir: &Path) -> Result<Self, String> {
         Self::bind_with_components(state_dir, false, Some(attest_openwrt_runtime))
@@ -2392,7 +3018,7 @@ impl CalibrationDaemon {
                 &job.request,
                 job.journal.heavy_lease_acquired,
             )
-            .and_then(|request| leases.acquire(request))
+            .and_then(|request| leases.acquire(request).map_err(|error| error.to_string()))
             {
                 Ok(()) => {}
                 Err(error) => startup_issues.push(format!(
@@ -2439,6 +3065,13 @@ impl CalibrationDaemon {
             route_pin_cleaner: speedtest::cleanup_route_pin,
             cancellations: BTreeMap::new(),
             job_errors: BTreeMap::new(),
+            native_apply_store: NativeApplyCoordinatorStore::new(
+                default_native_apply_paths().recovery_root,
+            ),
+            native_apply_live_state_attestor: native_autotune_apply_live_state,
+            native_apply_child: None,
+            native_apply_worker_identity: None,
+            native_apply_watches: Vec::new(),
         };
         daemon.resume_journalled_cancellations();
         if daemon.startup_issues.is_empty() {
@@ -2465,6 +3098,11 @@ impl CalibrationDaemon {
             .map_err(|error| format!("unable to set control write timeout: {error}"))?;
         let (response, effect) = match peer_credentials(&stream) {
             Ok(credentials) if credentials.uid == euid() => match read_request(&mut stream) {
+                Ok(CoordinatorControlRequest::NativeApply(request))
+                    if request.command == NativeApplyControlCommand::Watch =>
+                {
+                    return self.serve_native_apply_watch(stream, request).map(Some);
+                }
                 Ok(request) => self.dispatch_control_request(request),
                 Err(error) => (
                     error_response("invalid-request", &error),
@@ -2489,12 +3127,125 @@ impl CalibrationDaemon {
         Ok(Some(effect))
     }
 
+    fn serve_native_apply_watch(
+        &mut self,
+        mut stream: UnixStream,
+        request: NativeApplyControlRequest,
+    ) -> Result<ControlEffect, String> {
+        if let Err(error) = request.validate() {
+            stream
+                .write_all(error_response("native-apply-watch-invalid", &error).as_bytes())
+                .map_err(|error| format!("unable to write native Apply watch error: {error}"))?;
+            return Ok(ControlEffect::ReadOnly);
+        }
+        let observed_generation = request
+            .observed_generation
+            .expect("validated native Apply watch has an observed generation");
+        match self.native_apply_watch_response(&request, observed_generation) {
+            Ok(Some(response)) => {
+                stream.write_all(response.as_bytes()).map_err(|error| {
+                    format!("unable to write native Apply watch response: {error}")
+                })?;
+            }
+            Ok(None) if self.native_apply_watches.len() < MAX_PENDING_NATIVE_APPLY_WATCHES => {
+                self.native_apply_watches.push(PendingNativeApplyWatch {
+                    stream,
+                    request,
+                    observed_generation,
+                    deadline: Instant::now() + NATIVE_APPLY_WATCH_HOLD,
+                });
+            }
+            Ok(None) => {
+                stream
+                    .write_all(
+                        error_response(
+                            "native-apply-watch-capacity",
+                            "native Apply watch capacity is exhausted",
+                        )
+                        .as_bytes(),
+                    )
+                    .map_err(|error| {
+                        format!("unable to write native Apply watch capacity error: {error}")
+                    })?;
+            }
+            Err(error) => {
+                stream
+                    .write_all(error_response("native-apply-watch-invalid", &error).as_bytes())
+                    .map_err(|error| {
+                        format!("unable to write native Apply watch lookup error: {error}")
+                    })?;
+            }
+        }
+        Ok(ControlEffect::ReadOnly)
+    }
+
+    fn native_apply_watch_response(
+        &self,
+        request: &NativeApplyControlRequest,
+        observed_generation: u64,
+    ) -> Result<Option<String>, String> {
+        let (generation, terminal, response) = self.native_apply_current_status(request)?;
+        if !terminal && observed_generation > generation {
+            return Err(
+                "native Apply watch generation is ahead of the durable dispatch".to_string(),
+            );
+        }
+        Ok((terminal || generation > observed_generation).then_some(response))
+    }
+
+    fn native_apply_current_status(
+        &self,
+        request: &NativeApplyControlRequest,
+    ) -> Result<(u64, bool, String), String> {
+        if let Some(active) = self.native_apply_store.authorized_active(request)? {
+            return Ok((
+                active.generation,
+                false,
+                native_apply_status_response(&active),
+            ));
+        }
+        if let Some(terminal) = self.native_apply_store.authorized_terminal(request)? {
+            return Ok((
+                terminal.dispatch.generation.saturating_add(1),
+                true,
+                native_apply_terminal_status_response(&terminal),
+            ));
+        }
+        Err("no native Apply matches the supplied watch handle".to_string())
+    }
+
+    fn flush_native_apply_watches(&mut self) {
+        let now = Instant::now();
+        let pending = std::mem::take(&mut self.native_apply_watches);
+        for mut watch in pending {
+            let response =
+                match self.native_apply_watch_response(&watch.request, watch.observed_generation) {
+                    Ok(Some(response)) => Some(response),
+                    Ok(None) if watch.deadline <= now => self
+                        .native_apply_current_status(&watch.request)
+                        .map(|(_, _, response)| response)
+                        .ok(),
+                    Ok(None) => {
+                        self.native_apply_watches.push(watch);
+                        continue;
+                    }
+                    Err(error) => Some(error_response("native-apply-watch-invalid", &error)),
+                };
+            if let Some(response) = response {
+                let _ = watch.stream.write_all(response.as_bytes());
+            }
+        }
+    }
+
     fn dispatch_control_request(
         &mut self,
         request: CoordinatorControlRequest,
     ) -> (String, ControlEffect) {
         match request {
             CoordinatorControlRequest::Operation(request) => self.handle_with_effect(&request),
+            CoordinatorControlRequest::NativeApply(request) => {
+                self.handle_native_apply_control(&request)
+            }
             CoordinatorControlRequest::SchedulerAccountingAcknowledgement(request) => {
                 self.handle_scheduler_accounting_acknowledgement_with_effect(&request)
             }
@@ -2575,6 +3326,7 @@ impl CalibrationDaemon {
                     .into_iter()
                     .flatten()
             }))
+            .chain(self.native_apply_worker_identity.clone())
             .collect();
         events.refresh_processes(&processes, Path::new(DEFAULT_PROC_ROOT))
     }
@@ -2586,6 +3338,7 @@ impl CalibrationDaemon {
             .cancellations
             .values()
             .map(|pending| pending.kill_after)
+            .chain(self.native_apply_watches.iter().map(|watch| watch.deadline))
         {
             if deadline > now {
                 reduce_timeout(&mut timeout, deadline.duration_since(now));
@@ -2615,6 +3368,7 @@ impl CalibrationDaemon {
     }
 
     fn tick(&mut self) {
+        self.drive_native_apply();
         self.poll_native_children();
         self.poll_bootstrap_runtime_owners();
         self.poll_worker_cancellations();
@@ -2623,6 +3377,7 @@ impl CalibrationDaemon {
         self.poll_native_runtime_recoveries();
         self.poll_native_scheduler();
         self.dispatch_next_queued();
+        self.flush_native_apply_watches();
     }
 
     fn poll_native_scheduler(&mut self) {
@@ -3065,6 +3820,7 @@ impl CalibrationDaemon {
         match self.exact_scheduled_terminal_traffic(index, &reservation.job_id) {
             Ok((consumed, settlement)) => {
                 let mut auto_apply_error = None;
+                persisted.operator_warning = None;
                 if settlement == ScheduledSettlement::Success {
                     match auto_apply(&self.state_dir, &reservation.job_id) {
                         Ok(NativeScheduledAutoApplyOutcome::NotRequested) => {
@@ -3077,6 +3833,7 @@ impl CalibrationDaemon {
                             scheduler
                                 .auto_apply_warnings
                                 .insert(instance.to_string(), message.clone());
+                            persisted.operator_warning = Some(message);
                         }
                         Ok(NativeScheduledAutoApplyOutcome::Applied(disposition)) => {
                             scheduler.auto_apply_errors.remove(instance);
@@ -3212,6 +3969,7 @@ impl CalibrationDaemon {
             .enumerate()
             .filter_map(|(index, job)| {
                 (job.request.target_state == OperationTargetState::AbsentBootstrap
+                    && request_requires_native_runtime(&job.request)
                     && !state::terminal(job.journal.state)
                     && matches!(
                         job.journal.state,
@@ -3940,7 +4698,17 @@ impl CalibrationDaemon {
             }
             OperationKind::Speedtest => {
                 self.native_speedtest
-                    && request.target_state == OperationTargetState::ExistingManaged
+                    && request.backend == "speedtest-go"
+                    && matches!(
+                        request.route.mode,
+                        OperationRouteMode::Main | OperationRouteMode::Mwan3
+                    )
+                    && match request.target_state {
+                        OperationTargetState::ExistingManaged => true,
+                        OperationTargetState::AbsentBootstrap => {
+                            request.validate_admission_policy().is_ok()
+                        }
+                    }
             }
             OperationKind::FullAutotune => {
                 self.native_autotune
@@ -5375,6 +6143,7 @@ impl CalibrationDaemon {
         let Some(index) = queued_indices.into_iter().find(|index| {
             self.runtime_preflight_ready(*index)
                 && (self.jobs[*index].request.target_state == OperationTargetState::AbsentBootstrap
+                    && request_requires_native_runtime(&self.jobs[*index].request)
                     || self.acquire_heavy_lease_if_needed(*index))
         }) else {
             return;
@@ -5395,12 +6164,14 @@ impl CalibrationDaemon {
             return false;
         }
         let mut staged_journal = self.jobs[index].journal.clone();
-        let mark_result =
-            if self.jobs[index].request.target_state == OperationTargetState::AbsentBootstrap {
-                staged_journal.mark_bootstrap_heavy_lease_acquired()
-            } else {
-                staged_journal.mark_heavy_lease_acquired()
-            };
+        let mark_result = if self.jobs[index].request.target_state
+            == OperationTargetState::AbsentBootstrap
+            && request_requires_native_runtime(&self.jobs[index].request)
+        {
+            staged_journal.mark_bootstrap_heavy_lease_acquired()
+        } else {
+            staged_journal.mark_heavy_lease_acquired()
+        };
         if let Err(error) = mark_result.and_then(|_| self.journal_store.update(&staged_journal)) {
             self.startup_issues.push(format!(
                 "unable to durably acquire heavy-traffic lease for {job_id}: {error}"
@@ -5631,6 +6402,265 @@ impl CalibrationDaemon {
         }
     }
 
+    fn handle_native_apply_control(
+        &mut self,
+        request: &NativeApplyControlRequest,
+    ) -> (String, ControlEffect) {
+        if let Err(error) = request.validate() {
+            return (
+                error_response("native-apply-control-invalid", &error),
+                ControlEffect::ReadOnly,
+            );
+        }
+        match request.command {
+            NativeApplyControlCommand::Start => {
+                let source_job_id = request
+                    .source_job_id
+                    .as_deref()
+                    .expect("validated native Apply start has a source job ID");
+                let option_id = request
+                    .option_id
+                    .as_deref()
+                    .expect("validated native Apply start has an option ID");
+                let review_sha256 = request
+                    .review_sha256
+                    .as_deref()
+                    .expect("validated native Apply start has a Review digest");
+                let manifest_sha256 = request
+                    .manifest_sha256
+                    .as_deref()
+                    .expect("validated native Apply start has a manifest digest");
+                let apply_job_id = match kernel_request_id() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return (
+                            error_response("native-apply-identity-unavailable", &error),
+                            ControlEffect::ReadOnly,
+                        )
+                    }
+                };
+                let apply_job_token = match kernel_request_id()
+                    .and_then(|first| kernel_request_id().map(|second| format!("{first}{second}")))
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return (
+                            error_response("native-apply-identity-unavailable", &error),
+                            ControlEffect::ReadOnly,
+                        )
+                    }
+                };
+                let candidate = NativeApplyDispatchRecord {
+                    state: NativeApplyDispatchState::Accepted,
+                    generation: 1,
+                    apply_job_id,
+                    apply_job_token,
+                    source_job_id: source_job_id.to_string(),
+                    worker_run_id: "none".to_string(),
+                    option_id: option_id.to_string(),
+                    review_sha256: review_sha256.to_string(),
+                    source_manifest_sha256: "none".to_string(),
+                    manifest_sha256: manifest_sha256.to_string(),
+                    manifest_schema_version: 0,
+                    target_state: "none".to_string(),
+                    acknowledgements: request.acknowledgements.clone(),
+                };
+                match self.native_apply_store.admit(request, candidate.clone()) {
+                    Ok(NativeApplyAdmission::Created(record)) => (
+                        native_apply_accepted_response(&record),
+                        ControlEffect::StateChanged,
+                    ),
+                    Ok(NativeApplyAdmission::Existing(record)) => (
+                        native_apply_accepted_response(&record),
+                        ControlEffect::ReadOnly,
+                    ),
+                    Ok(NativeApplyAdmission::Terminal(record)) => {
+                        let retry = if !record.recovery_cleared {
+                            Err("native Apply recovery remains pending; the prior receipt was preserved"
+                                .to_string())
+                        } else {
+                            (self.native_apply_live_state_attestor)(
+                                &self.state_dir,
+                                source_job_id,
+                                Some(option_id),
+                            )
+                            .and_then(|live| native_apply_terminal_retry(&record, live))
+                        };
+                        match retry {
+                            Ok(NativeApplyTerminalRetry::Reuse) => (
+                                native_apply_accepted_response(&record.dispatch),
+                                ControlEffect::ReadOnly,
+                            ),
+                            Ok(NativeApplyTerminalRetry::Rearm) => {
+                                match self
+                                    .native_apply_store
+                                    .rearm_terminal(request, &record, candidate)
+                                {
+                                    Ok(rearmed) => (
+                                        native_apply_accepted_response(&rearmed),
+                                        ControlEffect::StateChanged,
+                                    ),
+                                    Err(error) => (
+                                        error_response(
+                                            "native-apply-terminal-rearm-failed",
+                                            &error,
+                                        ),
+                                        ControlEffect::ReadOnly,
+                                    ),
+                                }
+                            }
+                            Err(error) => (
+                                error_response("native-apply-terminal-revalidation-failed", &error),
+                                ControlEffect::ReadOnly,
+                            ),
+                        }
+                    }
+                    Err(error) => (
+                        error_response("native-apply-admission-failed", &error),
+                        ControlEffect::ReadOnly,
+                    ),
+                }
+            }
+            NativeApplyControlCommand::Status | NativeApplyControlCommand::Watch => {
+                match self.native_apply_store.authorized_active(request) {
+                    Ok(Some(record)) => (
+                        native_apply_status_response(&record),
+                        ControlEffect::ReadOnly,
+                    ),
+                    Ok(None) => match self.native_apply_store.authorized_terminal(request) {
+                        Ok(Some(record)) => (
+                            native_apply_terminal_status_response(&record),
+                            ControlEffect::ReadOnly,
+                        ),
+                        Ok(None) => (
+                            error_response(
+                                "native-apply-not-found",
+                                "no native Apply matches the supplied handle",
+                            ),
+                            ControlEffect::ReadOnly,
+                        ),
+                        Err(error) => (
+                            error_response("native-apply-status-invalid", &error),
+                            ControlEffect::ReadOnly,
+                        ),
+                    },
+                    Err(error) => (
+                        error_response("native-apply-status-invalid", &error),
+                        ControlEffect::ReadOnly,
+                    ),
+                }
+            }
+            NativeApplyControlCommand::Result => {
+                match self.native_apply_store.authorized_terminal(request) {
+                    Ok(Some(record)) => (
+                        native_apply_terminal_result_response(&record),
+                        ControlEffect::ReadOnly,
+                    ),
+                    Ok(None) => match self.native_apply_store.authorized_active(request) {
+                        Ok(Some(_)) => (
+                            error_response(
+                                "native-apply-result-not-ready",
+                                "native Apply has not reached a terminal state",
+                            ),
+                            ControlEffect::ReadOnly,
+                        ),
+                        Ok(None) => (
+                            error_response(
+                                "native-apply-not-found",
+                                "no native Apply matches the supplied handle",
+                            ),
+                            ControlEffect::ReadOnly,
+                        ),
+                        Err(error) => (
+                            error_response("native-apply-result-invalid", &error),
+                            ControlEffect::ReadOnly,
+                        ),
+                    },
+                    Err(error) => (
+                        error_response("native-apply-result-invalid", &error),
+                        ControlEffect::ReadOnly,
+                    ),
+                }
+            }
+        }
+    }
+
+    fn drive_native_apply(&mut self) {
+        if let Err(error) = self.drive_native_apply_inner() {
+            eprintln!("native Apply coordinator drive remains pending: {error}");
+        }
+    }
+
+    fn drive_native_apply_inner(&mut self) -> Result<(), String> {
+        if let Some(child) = self.native_apply_child.as_mut() {
+            if child.try_wait()?.is_none() {
+                self.native_apply_worker_identity = Some(child.identity.clone());
+                return Ok(());
+            }
+            self.native_apply_child = None;
+        }
+
+        match reconcile_native_apply_worker(&self.native_apply_store, Path::new(DEFAULT_PROC_ROOT))?
+        {
+            NativeApplyWorkerReadiness::Idle => {
+                self.native_apply_worker_identity = None;
+                Ok(())
+            }
+            NativeApplyWorkerReadiness::Live(identity) => {
+                self.native_apply_worker_identity = Some(identity);
+                Ok(())
+            }
+            NativeApplyWorkerReadiness::Launch(dispatch) => {
+                self.native_apply_worker_identity = None;
+                self.spawn_native_apply_worker(&dispatch)
+            }
+        }
+    }
+
+    fn spawn_native_apply_worker(
+        &mut self,
+        dispatch: &NativeApplyDispatchRecord,
+    ) -> Result<(), String> {
+        if self.native_apply_child.is_some() {
+            return Ok(());
+        }
+        dispatch.validate()?;
+        if !matches!(
+            dispatch.state,
+            NativeApplyDispatchState::Validating | NativeApplyDispatchState::Applying
+        ) {
+            return Err("native Apply worker launch requires executable state".to_string());
+        }
+        let program = env::current_exe()
+            .map_err(|error| format!("native Apply worker program is unavailable: {error}"))?;
+        if !program.is_absolute() {
+            return Err("native Apply worker program path is not absolute".to_string());
+        }
+        let stdout = private_append_log_file(
+            &self.native_apply_store.worker_log_path("stdout")?,
+            "native Apply worker stdout",
+        )?;
+        let stderr = private_append_log_file(
+            &self.native_apply_store.worker_log_path("stderr")?,
+            "native Apply worker stderr",
+        )?;
+        let spec = SpawnSpec {
+            program,
+            arguments: vec![
+                OsString::from("--native-apply-worker"),
+                OsString::from("--state-dir"),
+                self.state_dir.clone().into_os_string(),
+                OsString::from("--apply-job-id"),
+                OsString::from(dispatch.apply_job_id.clone()),
+            ],
+            environment: Vec::new(),
+        };
+        let child = ManagedChild::spawn(&spec, stdout, stderr, Path::new(DEFAULT_PROC_ROOT))?;
+        self.native_apply_worker_identity = Some(child.identity.clone());
+        self.native_apply_child = Some(child);
+        Ok(())
+    }
+
     #[cfg(test)]
     fn handle_scheduler_accounting_acknowledgement(
         &mut self,
@@ -5859,7 +6889,7 @@ impl CalibrationDaemon {
             Err(error) => return error_response("invalid-lease-request", &error),
         };
         if let Err(error) = self.leases.acquire(lease_request) {
-            return error_response("lease-conflict", &error);
+            return lease_acquire_error_response(&error);
         }
         let journal = match JobJournal::queued(
             request,
@@ -6168,6 +7198,30 @@ impl CalibrationDaemon {
         } else {
             "idle"
         };
+        let active_operations = self
+            .jobs
+            .iter()
+            .filter(|job| {
+                matches!(
+                    job.journal.state,
+                    OperationState::Queued
+                        | OperationState::Starting
+                        | OperationState::Running
+                        | OperationState::Cancelling
+                        | OperationState::Recovering
+                )
+            })
+            .map(|job| {
+                format!(
+                    "{{\"instance\":\"{}\",\"operation\":\"{}\",\"state\":\"{}\",\"runtime_mutated\":{}}}",
+                    json_escape(&job.request.identity.instance),
+                    job.request.identity.operation.as_str(),
+                    job.journal.state.as_str(),
+                    bool_json(job.journal.runtime_mutated)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         let scheduler_errors = self
             .native_scheduler
             .as_ref()
@@ -6207,7 +7261,7 @@ impl CalibrationDaemon {
             .as_ref()
             .is_some_and(|scheduler| scheduler.lab_mode);
         format!(
-            "{{\"state\":\"{state}\",\"protocol_version\":{},\"active_job\":{},\"active_jobs\":{active},\"queued_jobs\":{queued},\"recovery_required_jobs\":{recovery},\"abandoned_safe_jobs\":{abandoned},\"settled_jobs\":{settled},\"leased_jobs\":{},\"admission_enabled\":{},\"native_rating\":{},\"native_speedtest\":{},\"native_full_autotune\":{},\"native_bootstrap_autotune\":{},\"native_scheduler\":{},\"native_scheduler_lab\":{},\"native_scheduler_errors\":{scheduler_errors},\"native_scheduler_waiting\":[{scheduler_waiting}],\"native_scheduler_accounting_blocks\":[{scheduler_accounting_blocks}],\"native_public_result_version\":{}}}\n",
+            "{{\"state\":\"{state}\",\"protocol_version\":{},\"active_job\":{},\"active_jobs\":{active},\"active_operations\":[{active_operations}],\"queued_jobs\":{queued},\"recovery_required_jobs\":{recovery},\"abandoned_safe_jobs\":{abandoned},\"settled_jobs\":{settled},\"leased_jobs\":{},\"admission_enabled\":{},\"native_rating\":{},\"native_speedtest\":{},\"native_bootstrap_speedtest\":true,\"native_speedtest_auto_backend\":true,\"native_full_autotune\":{},\"native_bootstrap_autotune\":{},\"native_autotune_auto_backend\":true,\"native_operation_status_identity_version\":{},\"native_autotune_status_identity_version\":{},\"native_scheduler\":{},\"native_scheduler_lab\":{},\"native_scheduler_errors\":{scheduler_errors},\"native_scheduler_waiting\":[{scheduler_waiting}],\"native_scheduler_accounting_blocks\":[{scheduler_accounting_blocks}],\"native_public_result_version\":{}}}\n",
             OPERATION_PROTOCOL_VERSION,
             if active > 0 { "true" } else { "false" },
             self.leases.job_count(),
@@ -6216,6 +7270,8 @@ impl CalibrationDaemon {
             bool_json(self.native_speedtest),
             bool_json(self.native_autotune),
             bool_json(self.native_autotune),
+            NATIVE_OPERATION_STATUS_IDENTITY_VERSION,
+            NATIVE_OPERATION_STATUS_IDENTITY_VERSION,
             bool_json(native_scheduler),
             bool_json(native_scheduler_lab),
             super::autotune_public::NATIVE_PUBLIC_RESULT_MAX_SCHEMA_VERSION
@@ -6302,7 +7358,12 @@ fn build_native_scheduler_status_rows(
         let scheduler_warning = scheduler
             .auto_apply_warnings
             .get(&config.instance)
-            .map(String::as_str);
+            .map(String::as_str)
+            .or_else(|| {
+                persisted
+                    .as_ref()
+                    .and_then(|state| state.operator_warning.as_deref())
+            });
         let waiting = scheduler.waiting.get(&config.instance).copied();
         match native_scheduler_status_response(
             config,
@@ -6576,6 +7637,28 @@ fn private_log_file(path: &Path) -> Result<fs::File, String> {
         .map_err(|error| format!("unable to create private native worker log: {error}"))
 }
 
+fn private_append_log_file(path: &Path, label: &str) -> Result<fs::File, String> {
+    let file = OpenOptions::new()
+        .write(true)
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| format!("unable to open {label}: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("unable to inspect {label}: {error}"))?;
+    if !metadata.is_file()
+        || metadata.uid() != euid()
+        || metadata.permissions().mode() & 0o777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(format!("{label} is unsafe"));
+    }
+    Ok(file)
+}
+
 fn private_runtime_owner_log_file(path: &Path) -> Result<fs::File, String> {
     let file = OpenOptions::new()
         .write(true)
@@ -6709,12 +7792,30 @@ fn send_encoded_control(
     encoded: &str,
     response_limit: usize,
 ) -> Result<String, String> {
+    send_encoded_control_with_timeout(state_dir, encoded, response_limit, IO_TIMEOUT)
+}
+
+fn send_encoded_control_with_timeout(
+    state_dir: &Path,
+    encoded: &str,
+    response_limit: usize,
+    timeout: Duration,
+) -> Result<String, String> {
     validate_state_path(state_dir)?;
-    let mut stream = UnixStream::connect(state_dir.join(CONTROL_SOCKET_NAME))
+    let stream = UnixStream::connect(state_dir.join(CONTROL_SOCKET_NAME))
         .map_err(|error| format!("unable to connect to calibrationd: {error}"))?;
+    exchange_encoded_control(stream, encoded, response_limit, timeout)
+}
+
+fn exchange_encoded_control(
+    mut stream: UnixStream,
+    encoded: &str,
+    response_limit: usize,
+    timeout: Duration,
+) -> Result<String, String> {
     stream
-        .set_read_timeout(Some(IO_TIMEOUT))
-        .and_then(|_| stream.set_write_timeout(Some(IO_TIMEOUT)))
+        .set_read_timeout(Some(timeout))
+        .and_then(|_| stream.set_write_timeout(Some(timeout)))
         .map_err(|error| format!("unable to configure calibrationctl socket: {error}"))?;
     stream
         .write_all(encoded.as_bytes())
@@ -6738,6 +7839,57 @@ fn send_encoded_control(
     Ok(response)
 }
 
+pub(crate) fn probe_calibration_coordinator_control(
+    state_dir: &Path,
+    identity: &ProcessIdentity,
+) -> Result<bool, String> {
+    validate_state_path(state_dir)?;
+    let stream = match UnixStream::connect(state_dir.join(CONTROL_SOCKET_NAME)) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound
+                    | io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(format!("unable to connect to calibrationd: {error}")),
+    };
+    let credentials = peer_credentials(&stream)?;
+    if credentials.uid != unsafe { libc::geteuid() }
+        || u32::try_from(credentials.pid).ok() != Some(identity.pid)
+    {
+        return Err(format!(
+            "calibration control socket belongs to another process (expected {}, observed {})",
+            identity.pid, credentials.pid
+        ));
+    }
+    let request = ControlMessage {
+        control: ControlRequest {
+            request_id: kernel_request_id()?,
+            command: ControlCommand::Ping,
+            job_id: None,
+            job_token: None,
+        },
+        operation: None,
+    };
+    let response =
+        exchange_encoded_control(stream, &request.encode()?, MAX_RESPONSE_BYTES, IO_TIMEOUT)?;
+    let expected_prefix = format!(
+        "{{\"state\":\"ready\",\"protocol_version\":{},\"coordinator\":\"cake-autorated\",",
+        OPERATION_PROTOCOL_VERSION
+    );
+    if !response.starts_with(&expected_prefix)
+        || !response.contains("\"capabilities\":[\"passive-journal-v1\",\"strict-peer-identity\",\"queued-admission-v1\"]}")
+    {
+        return Err("calibration coordinator returned an invalid readiness response".to_string());
+    }
+    Ok(true)
+}
+
 fn send_control(state_dir: &Path, request: &ControlMessage) -> Result<String, String> {
     let response_limit = if request.control.command == ControlCommand::Result {
         MAX_RESULT_RESPONSE_BYTES
@@ -6745,6 +7897,27 @@ fn send_control(state_dir: &Path, request: &ControlMessage) -> Result<String, St
         MAX_RESPONSE_BYTES
     };
     send_encoded_control(state_dir, &request.encode()?, response_limit)
+}
+
+fn send_native_apply_control(
+    state_dir: &Path,
+    request: &NativeApplyControlRequest,
+) -> Result<String, String> {
+    let response_limit = if request.command == NativeApplyControlCommand::Result {
+        MAX_RESULT_RESPONSE_BYTES
+    } else {
+        MAX_RESPONSE_BYTES
+    };
+    if request.command == NativeApplyControlCommand::Watch {
+        send_encoded_control_with_timeout(
+            state_dir,
+            &request.encode()?,
+            response_limit,
+            NATIVE_APPLY_WATCH_CLIENT_TIMEOUT,
+        )
+    } else {
+        send_encoded_control(state_dir, &request.encode()?, response_limit)
+    }
 }
 
 fn peer_credentials(stream: &UnixStream) -> Result<PeerCredentials, String> {
@@ -6789,7 +7962,9 @@ fn read_request(stream: &mut UnixStream) -> Result<CoordinatorControlRequest, St
     }
     let payload =
         String::from_utf8(bytes).map_err(|_| "control request is not UTF-8".to_string())?;
-    if payload.starts_with(SCHEDULER_ACK_HEADER) {
+    if NativeApplyControlRequest::has_header(&payload) {
+        NativeApplyControlRequest::decode(&payload).map(CoordinatorControlRequest::NativeApply)
+    } else if payload.starts_with(SCHEDULER_ACK_HEADER) {
         SchedulerAccountingAcknowledgement::decode(&payload)
             .map(CoordinatorControlRequest::SchedulerAccountingAcknowledgement)
     } else if payload.starts_with(SCHEDULER_STATUS_HEADER) {
@@ -6885,17 +8060,33 @@ fn job_status_response_with_progress(
     diagnostic: Option<&str>,
     progress: Option<&full_autotune::NativeAutotuneProgress>,
 ) -> String {
+    let worker_run_id = job.journal.worker_run_id.as_ref().map_or_else(
+        || "null".to_string(),
+        |worker_run_id| format!("\"{}\"", json_escape(worker_run_id)),
+    );
+    let terminal_state = job.journal.terminal_state.as_ref().map_or_else(
+        || "null".to_string(),
+        |state| format!("\"{}\"", json_escape(state)),
+    );
+    let diagnostic_code = job.journal.diagnostic_code.as_ref().map_or_else(
+        || "null".to_string(),
+        |code| format!("\"{}\"", json_escape(code)),
+    );
     let prefix = format!(
-        "{{\"state\":\"{}\",\"job_id\":\"{}\",\"operation\":\"{}\",\"instance\":\"{}\",\"sequence\":{},\"idempotent\":{},\"runtime_mutated\":{},\"recovery_required\":{}",
+        "{{\"state\":\"{}\",\"job_id\":\"{}\",\"operation\":\"{}\",\"instance\":\"{}\",\"worker_run_id\":{},\"sequence\":{},\"idempotent\":{},\"runtime_mutated\":{},\"recovery_required\":{},\"terminal_state\":{},\"diagnostic_code\":{}",
         job.journal.state.as_str(),
         job.journal.job_id,
         job.request.identity.operation.as_str(),
         json_escape(&job.request.identity.instance),
+        worker_run_id,
         job.journal.sequence,
         bool_json(idempotent),
         bool_json(job.journal.runtime_mutated),
         bool_json(job.journal.recovery_required),
+        terminal_state,
+        diagnostic_code,
     );
+    let request_identity = operation_status_request_identity(&job.request);
     let progress = progress.map_or_else(String::new, |progress| {
         format!(
             concat!(
@@ -6922,11 +8113,81 @@ fn job_status_response_with_progress(
     });
     match diagnostic {
         Some(value) => format!(
-            "{prefix}{progress},\"diagnostic\":\"{}\"}}\n",
+            "{prefix}{request_identity}{progress},\"diagnostic\":\"{}\"}}\n",
             json_escape(value)
         ),
-        None => format!("{prefix}{progress}}}\n"),
+        None => format!("{prefix}{request_identity}{progress}}}\n"),
     }
+}
+
+fn operation_status_request_identity(request: &OperationRequest) -> String {
+    let member = request.route.mwan3_member.as_ref().map_or_else(
+        || "null".to_string(),
+        |member| format!("\"{}\"", json_escape(member)),
+    );
+    let direction = request
+        .speedtest_direction
+        .map_or("null".to_string(), |direction| {
+            format!("\"{}\"", direction.as_str())
+        });
+    let server_id = request
+        .speedtest_server_id
+        .map_or("null".to_string(), |server_id| format!("\"{server_id}\""));
+    let topology = request
+        .speedtest_topology
+        .map_or("null".to_string(), |topology| {
+            format!("\"{}\"", topology.as_str())
+        });
+    let target_state = match request.target_state {
+        OperationTargetState::ExistingManaged => "existing_managed",
+        OperationTargetState::AbsentBootstrap => "absent_bootstrap",
+    };
+    let managed_sqm_section = request.managed_sqm_section.as_ref().map_or_else(
+        || "null".to_string(),
+        |section| format!("\"{}\"", json_escape(section)),
+    );
+    let profile = request.profile.map_or("null".to_string(), |profile| {
+        format!("\"{}\"", profile.as_str())
+    });
+    let strategy = request.strategy.map_or("null".to_string(), |strategy| {
+        format!("\"{}\"", strategy.as_str())
+    });
+    let origin = match request.origin {
+        OperationOrigin::Luci => "luci",
+        OperationOrigin::Scheduler => "scheduler",
+        OperationOrigin::Recovery => "recovery",
+        OperationOrigin::Internal => "internal",
+    };
+    format!(
+        concat!(
+            ",\"request_identity_schema_version\":{}",
+            ",\"target_interface\":\"{}\"",
+            ",\"backend\":\"{}\"",
+            ",\"speedtest_direction\":{}",
+            ",\"speedtest_server_id\":{}",
+            ",\"speedtest_topology\":{}",
+            ",\"route_mode\":\"{}\"",
+            ",\"mwan3_member\":{}",
+            ",\"target_state\":\"{}\"",
+            ",\"managed_sqm_section\":{}",
+            ",\"profile\":{}",
+            ",\"calibration_strategy\":{}",
+            ",\"origin\":\"{}\""
+        ),
+        NATIVE_OPERATION_STATUS_IDENTITY_VERSION,
+        json_escape(&request.identity.target_interface),
+        json_escape(&request.backend),
+        direction,
+        server_id,
+        topology,
+        request.route.mode.as_str(),
+        member,
+        target_state,
+        managed_sqm_section,
+        profile,
+        strategy,
+        origin,
+    )
 }
 
 fn error_response(code: &str, message: &str) -> String {
@@ -6934,6 +8195,25 @@ fn error_response(code: &str, message: &str) -> String {
         "{{\"state\":\"error\",\"error_code\":\"{}\",\"error\":\"{}\"}}\n",
         json_escape(code),
         json_escape(message)
+    )
+}
+
+fn lease_acquire_error_response(error: &LeaseAcquireError) -> String {
+    let Some(conflict_kind) = error.conflict_kind() else {
+        return error_response("lease-conflict", error.user_message());
+    };
+    let owner_job_id = error
+        .owner_job_id()
+        .expect("typed lease conflict always carries its owner job ID");
+    format!(
+        concat!(
+            "{{\"state\":\"error\",\"error_code\":\"lease-conflict\",",
+            "\"error\":\"{}\",\"conflict_kind\":\"{}\",",
+            "\"conflicting_job_id\":\"{}\"}}\n"
+        ),
+        json_escape(error.user_message()),
+        conflict_kind,
+        json_escape(owner_job_id),
     )
 }
 
@@ -7107,7 +8387,8 @@ mod tests {
     use crate::operations::lease::LeaseKey;
     use crate::operations::protocol::{
         CalibrationStrategy, OperationIdentity, OperationKind, OperationOrigin, OperationRequest,
-        OperationRouteIdentity, OperationRouteMode, OperationState,
+        OperationRouteIdentity, OperationRouteMode, OperationState, SpeedtestDirection,
+        SpeedtestTopology,
     };
     use crate::operations::scheduler::{
         BudgetLedger, FailedAttemptFence, ScheduleCursor, SchedulerInstanceState,
@@ -7123,6 +8404,93 @@ mod tests {
             std::process::id(),
             NEXT_TEMP_PATH.fetch_add(1, Ordering::Relaxed),
         ))
+    }
+
+    fn test_native_apply_live_candidate(
+        _state_dir: &Path,
+        _job_id: &str,
+        _option_id: Option<&str>,
+    ) -> Result<NativeApplyLiveState, String> {
+        Ok(NativeApplyLiveState::Candidate)
+    }
+
+    fn test_native_apply_live_original(
+        _state_dir: &Path,
+        _job_id: &str,
+        _option_id: Option<&str>,
+    ) -> Result<NativeApplyLiveState, String> {
+        Ok(NativeApplyLiveState::Original)
+    }
+
+    fn test_native_apply_live_foreign(
+        _state_dir: &Path,
+        _job_id: &str,
+        _option_id: Option<&str>,
+    ) -> Result<NativeApplyLiveState, String> {
+        Err("live configuration is neither the candidate nor the original baseline".to_string())
+    }
+
+    fn terminalize_native_apply_for_test(
+        daemon: &mut CalibrationDaemon,
+        start: &NativeApplyControlRequest,
+        outcome: NativeApplyTerminalOutcome,
+        recovery_cleared: bool,
+    ) -> NativeApplyTerminalRecord {
+        let (_, effect) = daemon.handle_native_apply_control(start);
+        assert_eq!(effect, ControlEffect::StateChanged);
+        let accepted = daemon.native_apply_store.read_active().unwrap().unwrap();
+        let validating = daemon
+            .native_apply_store
+            .mark_validating(&accepted)
+            .unwrap();
+        let applying = daemon
+            .native_apply_store
+            .mark_applying(
+                &validating,
+                NativeApplyVerifiedDispatchIdentity {
+                    worker_run_id: "77".repeat(16),
+                    source_manifest_sha256: "88".repeat(32),
+                    manifest_schema_version: 6,
+                    target_state: "existing_managed".to_string(),
+                },
+            )
+            .unwrap();
+        let terminal = NativeApplyTerminalRecord {
+            dispatch: applying,
+            outcome,
+            recovery_cleared,
+            diagnostic: if outcome.success() {
+                String::new()
+            } else {
+                "test terminal failure".to_string()
+            },
+        };
+        daemon.native_apply_store.complete(&terminal).unwrap();
+        terminal
+    }
+
+    fn write_fake_process(proc_root: &Path, identity: &ProcessIdentity) {
+        let directory = proc_root.join(identity.pid.to_string());
+        fs::create_dir_all(&directory).unwrap();
+        let mut tail = vec![
+            "S".to_string(),
+            "1".to_string(),
+            identity.process_group.to_string(),
+            identity.process_group.to_string(),
+        ];
+        while tail.len() < 19 {
+            tail.push("0".to_string());
+        }
+        tail.push(identity.starttime_ticks.to_string());
+        fs::write(
+            directory.join("stat"),
+            format!(
+                "{} (native-apply-worker) {} 0",
+                identity.pid,
+                tail.join(" ")
+            ),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -9295,6 +10663,7 @@ mod tests {
         assert!(scheduler.errors.is_empty());
         let warning = scheduler.auto_apply_warnings["wan_sqm"].as_str();
         assert!(warning.contains("requires explicit Review"));
+        assert_eq!(settled.operator_warning.as_deref(), Some(warning));
         let status = native_scheduler_status_response(
             &scheduled_config("wan_sqm"),
             Some(&settled),
@@ -10453,16 +11822,16 @@ mod tests {
             NativeRuntimeSnapshotReadiness::Ready(_)
         ));
 
-        let mut legacy = snapshot.clone();
-        legacy.download_qdisc_kind = None;
-        legacy.upload_qdisc_kind = None;
-        let current = legacy.encode().unwrap();
+        let mut untyped = snapshot.clone();
+        untyped.download_qdisc_kind = None;
+        untyped.upload_qdisc_kind = None;
+        let current = untyped.encode().unwrap();
         assert!(current.starts_with("cake-autorate-rating-runtime\t5\n"));
         assert!(current.contains(&format!(
             "evidence_contract={}\n",
             rating::RATING_EVIDENCE_CONTRACT
         )));
-        let legacy_v3 = current
+        let retired_v3 = current
             .replacen(
                 "cake-autorate-rating-runtime\t5",
                 "cake-autorate-rating-runtime\t3",
@@ -10474,11 +11843,11 @@ mod tests {
             )
             .replace("download_qdisc_kind=\n", "")
             .replace("upload_qdisc_kind=\n", "");
-        fs::write(&snapshot_path, legacy_v3).unwrap();
+        fs::write(&snapshot_path, retired_v3).unwrap();
         assert!(matches!(
             native_runtime_snapshot_readiness_at(&request, &snapshot_path, now),
-            NativeRuntimeSnapshotReadiness::Waiting { ref code, .. }
-                if code == "runtime-qdisc-kind-not-ready"
+            NativeRuntimeSnapshotReadiness::Unsafe { ref code, .. }
+                if code == "runtime-snapshot-invalid"
         ));
         fs::write(&snapshot_path, snapshot.encode().unwrap()).unwrap();
 
@@ -11101,6 +12470,32 @@ mod tests {
         request
     }
 
+    fn bootstrap_speedtest_operation(
+        job_id: char,
+        token: char,
+        instance: &str,
+    ) -> OperationRequest {
+        let mut request = bootstrap_operation_request(job_id, token, instance);
+        request.identity.operation = OperationKind::Speedtest;
+        request.capture_policy =
+            Some(crate::operations::autotune_capture_policy::AutotuneCapturePolicyId::StandardV2);
+        request.speedtest_direction = Some(SpeedtestDirection::Both);
+        request.speedtest_server_id = None;
+        request.speedtest_topology = Some(SpeedtestTopology::Unshaped);
+        request.profile = None;
+        request.strategy = None;
+        request.access_medium = None;
+        request.access_source = None;
+        request.access_confidence_percent = 0;
+        request.capacity_learning_policy = None;
+        request.service_dl_cap_kbps = None;
+        request.service_ul_cap_kbps = None;
+        request.allow_sqm_disable = false;
+        request.allow_active_traffic = false;
+        request.validate_admission_policy().unwrap();
+        request
+    }
+
     fn write_complete_speedtest_terminal(path: &Path, job_id: &str, worker_run_id: &str) {
         fs::write(
             path,
@@ -11195,8 +12590,47 @@ mod tests {
         unshaped.speedtest_topology = Some(super::super::protocol::SpeedtestTopology::Unshaped);
         assert!(request_requires_native_runtime(&unshaped));
 
+        let mut bootstrap_speedtest = unshaped.clone();
+        bootstrap_speedtest.target_state = OperationTargetState::AbsentBootstrap;
+        assert!(!request_requires_native_runtime(&bootstrap_speedtest));
+
         let rating = mwan3_rating_operation('e', 'f', "wan");
         assert!(!request_requires_native_runtime(&rating));
+    }
+
+    #[test]
+    fn bootstrap_speedtest_holds_the_ordinary_heavy_lease_without_runtime_ownership() {
+        let root = temp_path("st-bootstrap-heavy");
+        fs::create_dir_all(&root).unwrap();
+        let operation = bootstrap_speedtest_operation('a', 'b', "wan");
+
+        {
+            let mut daemon = CalibrationDaemon::bind_with_admission(&root, true).unwrap();
+            daemon.native_speedtest = true;
+            assert!(daemon.supports_native_request(&operation));
+            assert!(!request_requires_native_runtime(&operation));
+            assert!(daemon
+                .handle(&job_message(ControlCommand::Start, &operation))
+                .contains("\"state\":\"queued\""));
+            assert!(!daemon.jobs[0].journal.heavy_lease_acquired);
+            assert!(daemon.acquire_heavy_lease_if_needed(0));
+            assert!(daemon.jobs[0].journal.heavy_lease_acquired);
+            assert!(!daemon.jobs[0].journal.runtime_mutated);
+            assert!(!daemon.jobs[0].journal.recovery_required);
+            assert!(daemon.bootstrap_runtime_children.is_empty());
+        }
+
+        let mut restarted = CalibrationDaemon::bind_with_admission(&root, true).unwrap();
+        restarted.native_speedtest = true;
+        assert_eq!(restarted.jobs.len(), 1);
+        assert!(restarted.jobs[0].journal.heavy_lease_acquired);
+        assert!(!restarted.jobs[0].journal.runtime_mutated);
+        assert!(!request_requires_native_runtime(&restarted.jobs[0].request));
+        assert!(restarted.supports_native_request(&restarted.jobs[0].request));
+        assert!(restarted.bootstrap_runtime_children.is_empty());
+
+        drop(restarted);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -11837,7 +13271,7 @@ mod tests {
     }
 
     #[test]
-    fn native_cancellation_survives_coordinator_restart_without_legacy_adapter() {
+    fn native_cancellation_survives_coordinator_restart_without_retired_adapter() {
         let root = temp_path("native-cancel-restart");
         let state_dir = root.join("state");
         fs::create_dir_all(&root).unwrap();
@@ -12067,7 +13501,7 @@ mod tests {
             (true, "native-runtime-cancelled")
         );
         assert_eq!(
-            native_runtime_terminal_diagnostic(Some("legacy-reconciliation-required")),
+            native_runtime_terminal_diagnostic(Some("foreign-reconciliation-required")),
             (false, "native-runtime-worker-exited")
         );
     }
@@ -12084,7 +13518,7 @@ mod tests {
     }
 
     #[test]
-    fn native_pair_checkpoint_terminal_remains_inconclusive_for_restore_first_settlement() {
+    fn unreviewable_pair_terminal_remains_inconclusive_for_restore_first_settlement() {
         let directory = temp_path("native-pair-terminal");
         fs::create_dir(&directory).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
@@ -12110,7 +13544,7 @@ mod tests {
                 worker_run_id: worker_run_id.clone(),
                 consumed_traffic_bytes: 0,
                 terminal: AutotuneTerminal::Inconclusive {
-                    code: "native-pair-confirmation-complete".to_string(),
+                    code: "pair-options-unreviewable".to_string(),
                 },
             },
         )
@@ -12128,7 +13562,7 @@ mod tests {
         assert_eq!(outcome.state, "inconclusive");
         assert_eq!(
             outcome.diagnostic.as_deref(),
-            Some("native-pair-confirmation-complete")
+            Some("pair-options-unreviewable")
         );
         assert!(!paths.review.exists());
         fs::remove_dir_all(directory).unwrap();
@@ -12418,14 +13852,105 @@ mod tests {
         let thread = serve_one(CalibrationDaemon::bind(&dir).unwrap());
         let response = send_control(&dir, &request(ControlCommand::Summary)).unwrap();
         assert!(response.contains("\"active_job\":false"));
+        assert!(response.contains("\"active_operations\":[]"));
         assert!(response.contains("\"native_scheduler_waiting\":[]"));
         assert!(response.contains("\"native_bootstrap_autotune\":false"));
+        assert!(response.contains("\"native_bootstrap_speedtest\":true"));
+        assert!(response.contains("\"native_speedtest_auto_backend\":true"));
+        assert!(response.contains("\"native_autotune_auto_backend\":true"));
+        assert!(response.contains("\"native_operation_status_identity_version\":1"));
+        assert!(response.contains("\"native_autotune_status_identity_version\":1"));
         assert!(response.contains(&format!(
             "\"native_public_result_version\":{}",
             crate::operations::autotune_public::NATIVE_PUBLIC_RESULT_MAX_SCHEMA_VERSION
         )));
         thread.join().unwrap();
         cleanup_state_dir(&dir);
+    }
+
+    #[test]
+    fn readiness_probe_binds_the_control_socket_to_its_exact_peer_pid() {
+        let dir = temp_path("readiness-peer");
+        let identity = ProcessIdentity::current().unwrap();
+        let thread = serve_one(CalibrationDaemon::bind(&dir).unwrap());
+        assert!(probe_calibration_coordinator_control(&dir, &identity).unwrap());
+        thread.join().unwrap();
+        cleanup_state_dir(&dir);
+    }
+
+    #[test]
+    fn operation_status_identity_is_exact_for_every_native_operation() {
+        let mut operation = operation_request('a', 'b', "wan");
+        assert_eq!(
+            operation_status_request_identity(&operation),
+            concat!(
+                ",\"request_identity_schema_version\":1",
+                ",\"target_interface\":\"wan-device\"",
+                ",\"backend\":\"speedtest-go\"",
+                ",\"speedtest_direction\":null",
+                ",\"speedtest_server_id\":null",
+                ",\"speedtest_topology\":null",
+                ",\"route_mode\":\"main\"",
+                ",\"mwan3_member\":null",
+                ",\"target_state\":\"existing_managed\"",
+                ",\"managed_sqm_section\":\"wan_sqm\"",
+                ",\"profile\":\"variable_link\"",
+                ",\"calibration_strategy\":\"full_raw\"",
+                ",\"origin\":\"luci\""
+            )
+        );
+
+        operation.route.mode = OperationRouteMode::Mwan3;
+        operation.route.mwan3_member = Some("wanb".to_string());
+        operation.profile = Some(AutotuneProfile::GamingExtreme);
+        operation.strategy = Some(CalibrationStrategy::ShapedOnly);
+        operation.origin = OperationOrigin::Scheduler;
+        let identity = operation_status_request_identity(&operation);
+        assert!(identity.contains("\"route_mode\":\"mwan3\""));
+        assert!(identity.contains("\"mwan3_member\":\"wanb\""));
+        assert!(identity.contains("\"profile\":\"gaming_extreme\""));
+        assert!(identity.contains("\"calibration_strategy\":\"shaped_only\""));
+        assert!(identity.contains("\"origin\":\"scheduler\""));
+
+        operation.identity.operation = OperationKind::AutomaticRating;
+        operation.profile = None;
+        operation.strategy = None;
+        operation.managed_sqm_section = None;
+        let rating_identity = operation_status_request_identity(&operation);
+        assert!(rating_identity.contains("\"profile\":null"));
+        assert!(rating_identity.contains("\"calibration_strategy\":null"));
+        assert!(rating_identity.contains("\"managed_sqm_section\":null"));
+
+        operation.identity.operation = OperationKind::Speedtest;
+        operation.speedtest_direction = Some(SpeedtestDirection::Both);
+        operation.speedtest_server_id = Some(12345);
+        operation.speedtest_topology = Some(SpeedtestTopology::Unshaped);
+        let speedtest_identity = operation_status_request_identity(&operation);
+        assert!(speedtest_identity.contains("\"speedtest_direction\":\"both\""));
+        assert!(speedtest_identity.contains("\"speedtest_server_id\":\"12345\""));
+        assert!(speedtest_identity.contains("\"speedtest_topology\":\"unshaped\""));
+    }
+
+    #[test]
+    fn operation_status_exposes_typed_terminal_state_and_diagnostic_code() {
+        let operation = operation_request('a', 'b', "wan");
+        let coordinator = CoordinatorIdentity::current().unwrap();
+        let journal = JobJournal::queued(&operation, &coordinator, true).unwrap();
+        let mut job = ScannedJob {
+            request: operation,
+            journal,
+            disposition: JournalDisposition::Queued,
+        };
+        let active = job_response(&job, false);
+        assert!(active.contains("\"terminal_state\":null"));
+        assert!(active.contains("\"diagnostic_code\":null"));
+
+        job.journal.state = OperationState::Failed;
+        job.journal.terminal_state = Some("inconclusive".to_string());
+        job.journal.diagnostic_code = Some("pair-options-unreviewable".to_string());
+        let terminal = job_response(&job, true);
+        assert!(terminal.contains("\"terminal_state\":\"inconclusive\""));
+        assert!(terminal.contains("\"diagnostic_code\":\"pair-options-unreviewable\""));
     }
 
     #[test]
@@ -12512,6 +14037,24 @@ mod tests {
     }
 
     #[test]
+    fn native_apply_check_recognizes_exact_candidate_before_original_baseline() {
+        assert!(existing_native_apply_check_result(true, || {
+            panic!("an exact applied candidate must not be compared with its original baseline")
+        })
+        .unwrap());
+
+        assert!(!existing_native_apply_check_result(false, || RuntimeAttestation::Ready).unwrap());
+
+        let error = existing_native_apply_check_result(false, || RuntimeAttestation::Unsafe {
+            code: "runtime-config-changed".to_string(),
+            message: "managed configuration changed after launch".to_string(),
+        })
+        .unwrap_err();
+        assert!(error.contains("runtime-config-changed"));
+        assert!(error.contains("managed configuration changed after launch"));
+    }
+
+    #[test]
     fn native_bootstrap_start_cli_requires_its_explicit_planned_section() {
         assert!(
             run_calibrationctl(["autotune-bootstrap-start".to_string()].into_iter())
@@ -12521,6 +14064,24 @@ mod tests {
         assert!(run_calibrationctl(
             [
                 "autotune-bootstrap-start".to_string(),
+                "cake_wan_sqm".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap_err()
+        .contains("--instance is required"));
+    }
+
+    #[test]
+    fn native_bootstrap_speedtest_cli_requires_its_explicit_planned_section() {
+        assert!(
+            run_calibrationctl(["speedtest-bootstrap-start".to_string()].into_iter())
+                .unwrap_err()
+                .contains("requires a planned SQM section")
+        );
+        assert!(run_calibrationctl(
+            [
+                "speedtest-bootstrap-start".to_string(),
                 "cake_wan_sqm".to_string(),
             ]
             .into_iter(),
@@ -12603,7 +14164,7 @@ mod tests {
     #[test]
     fn native_apply_cli_acknowledgements_are_bounded_typed_and_exact() {
         assert!(
-            run_calibrationctl(["autotune-apply".to_string()].into_iter())
+            run_calibrationctl(["autotune-apply-start".to_string()].into_iter())
                 .unwrap_err()
                 .contains("requires a public job ID")
         );
@@ -12662,6 +14223,777 @@ mod tests {
         .unwrap_err()
         .contains("exact complete"));
         require_exact_native_apply_acknowledgements(&expected, &expected).unwrap();
+    }
+
+    #[test]
+    fn native_apply_start_receipts_before_private_review_replay() {
+        let root = temp_path("native-apply-prompt-receipt");
+        let state_dir = root.join("state");
+        fs::create_dir_all(&root).unwrap();
+        let mut daemon = CalibrationDaemon::bind_with_admission(&state_dir, true).unwrap();
+        daemon.native_apply_store = NativeApplyCoordinatorStore::new(&root.join("apply"));
+        let request = NativeApplyControlRequest::start(
+            "11".repeat(16),
+            "22".repeat(16),
+            "recommended".to_string(),
+            "33".repeat(32),
+            "44".repeat(32),
+            Vec::new(),
+        );
+
+        let (response, effect) = daemon.handle_native_apply_control(&request);
+        assert_eq!(effect, ControlEffect::StateChanged);
+        assert!(response.contains("\"state\":\"accepted\""));
+        assert!(response.contains("\"generation\":1"));
+        let accepted = daemon
+            .native_apply_store
+            .read_active()
+            .unwrap()
+            .expect("receipt must be durable before the response");
+        assert_eq!(accepted.state, NativeApplyDispatchState::Accepted);
+        assert_eq!(accepted.worker_run_id, "none");
+        assert_eq!(daemon.native_apply_store.read_terminal().unwrap(), None);
+
+        // The source job deliberately does not exist. Start still returns a
+        // durable receipt because private Review replay belongs exclusively to
+        // the worker phase after this control response.
+        assert!(!state_dir.join("jobs").join("22".repeat(16)).exists());
+
+        drop(daemon);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_apply_terminal_success_is_reused_only_while_candidate_is_live() {
+        let root = temp_path("native-apply-terminal-live-candidate");
+        let state_dir = root.join("state");
+        fs::create_dir_all(&root).unwrap();
+        let mut daemon = CalibrationDaemon::bind_with_admission(&state_dir, true).unwrap();
+        daemon.native_apply_store = NativeApplyCoordinatorStore::new(&root.join("apply"));
+        daemon.native_apply_live_state_attestor = test_native_apply_live_candidate;
+        let request = NativeApplyControlRequest::start(
+            "11".repeat(16),
+            "22".repeat(16),
+            "recommended".to_string(),
+            "33".repeat(32),
+            "44".repeat(32),
+            Vec::new(),
+        );
+        let terminal = terminalize_native_apply_for_test(
+            &mut daemon,
+            &request,
+            NativeApplyTerminalOutcome::Applied,
+            true,
+        );
+
+        let (response, effect) = daemon.handle_native_apply_control(&request);
+        assert_eq!(effect, ControlEffect::ReadOnly);
+        assert!(response.contains(&terminal.dispatch.apply_job_id));
+        assert_eq!(daemon.native_apply_store.read_active().unwrap(), None);
+        assert_eq!(
+            daemon.native_apply_store.read_terminal().unwrap(),
+            Some(terminal)
+        );
+
+        drop(daemon);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_apply_terminal_is_rearmed_after_exact_external_rollback() {
+        let root = temp_path("native-apply-terminal-live-original");
+        let state_dir = root.join("state");
+        fs::create_dir_all(&root).unwrap();
+        let mut daemon = CalibrationDaemon::bind_with_admission(&state_dir, true).unwrap();
+        daemon.native_apply_store = NativeApplyCoordinatorStore::new(&root.join("apply"));
+        daemon.native_apply_live_state_attestor = test_native_apply_live_original;
+        let request = NativeApplyControlRequest::start(
+            "11".repeat(16),
+            "22".repeat(16),
+            "recommended".to_string(),
+            "33".repeat(32),
+            "44".repeat(32),
+            Vec::new(),
+        );
+        let terminal = terminalize_native_apply_for_test(
+            &mut daemon,
+            &request,
+            NativeApplyTerminalOutcome::Applied,
+            true,
+        );
+
+        let (response, effect) = daemon.handle_native_apply_control(&request);
+        assert_eq!(effect, ControlEffect::StateChanged);
+        assert!(response.contains("\"state\":\"accepted\""));
+        let rearmed = daemon.native_apply_store.read_active().unwrap().unwrap();
+        assert_eq!(
+            rearmed.generation,
+            terminal.dispatch.generation.checked_add(1).unwrap()
+        );
+        assert_ne!(rearmed.apply_job_id, terminal.dispatch.apply_job_id);
+        assert_eq!(daemon.native_apply_store.read_terminal().unwrap(), None);
+
+        drop(daemon);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_apply_terminal_preserves_evidence_for_foreign_or_pending_recovery_state() {
+        let root = temp_path("native-apply-terminal-live-foreign");
+        let state_dir = root.join("state");
+        fs::create_dir_all(&root).unwrap();
+        let mut daemon = CalibrationDaemon::bind_with_admission(&state_dir, true).unwrap();
+        daemon.native_apply_store = NativeApplyCoordinatorStore::new(&root.join("apply"));
+        daemon.native_apply_live_state_attestor = test_native_apply_live_foreign;
+        let request = NativeApplyControlRequest::start(
+            "11".repeat(16),
+            "22".repeat(16),
+            "recommended".to_string(),
+            "33".repeat(32),
+            "44".repeat(32),
+            Vec::new(),
+        );
+        let terminal = terminalize_native_apply_for_test(
+            &mut daemon,
+            &request,
+            NativeApplyTerminalOutcome::Applied,
+            true,
+        );
+        let (response, effect) = daemon.handle_native_apply_control(&request);
+        assert_eq!(effect, ControlEffect::ReadOnly);
+        assert!(response.contains("native-apply-terminal-revalidation-failed"));
+        assert_eq!(daemon.native_apply_store.read_active().unwrap(), None);
+        assert_eq!(
+            daemon.native_apply_store.read_terminal().unwrap(),
+            Some(terminal)
+        );
+
+        drop(daemon);
+        fs::remove_dir_all(root).unwrap();
+
+        let root = temp_path("native-apply-terminal-recovery-pending");
+        let state_dir = root.join("state");
+        fs::create_dir_all(&root).unwrap();
+        let mut daemon = CalibrationDaemon::bind_with_admission(&state_dir, true).unwrap();
+        daemon.native_apply_store = NativeApplyCoordinatorStore::new(&root.join("apply"));
+        daemon.native_apply_live_state_attestor = test_native_apply_live_original;
+        let terminal = terminalize_native_apply_for_test(
+            &mut daemon,
+            &request,
+            NativeApplyTerminalOutcome::Failed,
+            false,
+        );
+        let (response, effect) = daemon.handle_native_apply_control(&request);
+        assert_eq!(effect, ControlEffect::ReadOnly);
+        assert!(response.contains("native-apply-terminal-revalidation-failed"));
+        assert!(response.contains("recovery remains pending"));
+        assert_eq!(daemon.native_apply_store.read_active().unwrap(), None);
+        assert_eq!(
+            daemon.native_apply_store.read_terminal().unwrap(),
+            Some(terminal)
+        );
+
+        drop(daemon);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_apply_watch_wakes_only_after_generation_changes() {
+        let root = temp_path("native-apply-generation-watch");
+        let state_dir = root.join("state");
+        fs::create_dir_all(&root).unwrap();
+        let mut daemon = CalibrationDaemon::bind_with_admission(&state_dir, true).unwrap();
+        daemon.native_apply_store = NativeApplyCoordinatorStore::new(&root.join("apply"));
+        let start = NativeApplyControlRequest::start(
+            "11".repeat(16),
+            "22".repeat(16),
+            "recommended".to_string(),
+            "33".repeat(32),
+            "44".repeat(32),
+            Vec::new(),
+        );
+        let _ = daemon.handle_native_apply_control(&start);
+        let accepted = daemon.native_apply_store.read_active().unwrap().unwrap();
+        let watch = NativeApplyControlRequest::watch(
+            "55".repeat(16),
+            accepted.apply_job_id.clone(),
+            accepted.apply_job_token.clone(),
+            accepted.generation,
+        );
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        assert_eq!(
+            daemon.serve_native_apply_watch(server, watch).unwrap(),
+            ControlEffect::ReadOnly
+        );
+        assert_eq!(daemon.native_apply_watches.len(), 1);
+
+        let validating = daemon
+            .native_apply_store
+            .mark_validating(&accepted)
+            .unwrap();
+        assert_eq!(validating.generation, 2);
+        daemon.flush_native_apply_watches();
+        assert!(daemon.native_apply_watches.is_empty());
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.contains("\"state\":\"validating\""));
+        assert!(response.contains("\"generation\":2"));
+
+        drop(daemon);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_apply_watch_deadline_and_capacity_never_advance_apply_state() {
+        let root = temp_path("native-apply-watch-safety-bounds");
+        let state_dir = root.join("state");
+        fs::create_dir_all(&root).unwrap();
+        let mut daemon = CalibrationDaemon::bind_with_admission(&state_dir, true).unwrap();
+        daemon.native_apply_store = NativeApplyCoordinatorStore::new(&root.join("apply"));
+        let start_request = NativeApplyControlRequest::start(
+            "11".repeat(16),
+            "22".repeat(16),
+            "recommended".to_string(),
+            "33".repeat(32),
+            "44".repeat(32),
+            Vec::new(),
+        );
+        let _ = daemon.handle_native_apply_control(&start_request);
+        let accepted = daemon.native_apply_store.read_active().unwrap().unwrap();
+        let watch_request = NativeApplyControlRequest::watch(
+            "55".repeat(16),
+            accepted.apply_job_id.clone(),
+            accepted.apply_job_token.clone(),
+            accepted.generation,
+        );
+
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        daemon
+            .serve_native_apply_watch(server, watch_request.clone())
+            .unwrap();
+        daemon.native_apply_watches[0].deadline = Instant::now() - Duration::from_secs(1);
+        daemon.flush_native_apply_watches();
+        let mut deadline_response = String::new();
+        client.read_to_string(&mut deadline_response).unwrap();
+        assert!(deadline_response.contains("\"state\":\"accepted\""));
+        assert!(deadline_response.contains("\"generation\":1"));
+        assert_eq!(
+            daemon.native_apply_store.read_active().unwrap(),
+            Some(accepted.clone())
+        );
+
+        let mut held_clients = Vec::new();
+        for _ in 0..MAX_PENDING_NATIVE_APPLY_WATCHES {
+            let (server, client) = UnixStream::pair().unwrap();
+            daemon
+                .serve_native_apply_watch(server, watch_request.clone())
+                .unwrap();
+            held_clients.push(client);
+        }
+        assert_eq!(
+            daemon.native_apply_watches.len(),
+            MAX_PENDING_NATIVE_APPLY_WATCHES
+        );
+        let (server, mut overflow_client) = UnixStream::pair().unwrap();
+        overflow_client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        daemon
+            .serve_native_apply_watch(server, watch_request)
+            .unwrap();
+        let mut capacity_response = String::new();
+        overflow_client
+            .read_to_string(&mut capacity_response)
+            .unwrap();
+        assert!(capacity_response.contains("native-apply-watch-capacity"));
+        assert_eq!(
+            daemon.native_apply_store.read_active().unwrap(),
+            Some(accepted)
+        );
+
+        drop(held_clients);
+        drop(daemon);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_apply_watch_is_reconnectable_and_terminal_wins_over_lost_responses() {
+        let root = temp_path("native-apply-watch-reconnect");
+        let state_dir = root.join("state");
+        fs::create_dir_all(&root).unwrap();
+        let mut daemon = CalibrationDaemon::bind_with_admission(&state_dir, true).unwrap();
+        daemon.native_apply_store = NativeApplyCoordinatorStore::new(&root.join("apply"));
+        let start = NativeApplyControlRequest::start(
+            "11".repeat(16),
+            "22".repeat(16),
+            "recommended".to_string(),
+            "33".repeat(32),
+            "44".repeat(32),
+            Vec::new(),
+        );
+        let _ = daemon.handle_native_apply_control(&start);
+        let accepted = daemon.native_apply_store.read_active().unwrap().unwrap();
+
+        let future = NativeApplyControlRequest::watch(
+            "77".repeat(16),
+            accepted.apply_job_id.clone(),
+            accepted.apply_job_token.clone(),
+            accepted.generation + 1,
+        );
+        assert!(daemon
+            .native_apply_watch_response(&future, accepted.generation + 1)
+            .unwrap_err()
+            .contains("ahead"));
+
+        let lost = NativeApplyControlRequest::watch(
+            "88".repeat(16),
+            accepted.apply_job_id.clone(),
+            accepted.apply_job_token.clone(),
+            accepted.generation,
+        );
+        let (server, client) = UnixStream::pair().unwrap();
+        assert_eq!(
+            daemon.serve_native_apply_watch(server, lost).unwrap(),
+            ControlEffect::ReadOnly
+        );
+        drop(client);
+        let validating = daemon
+            .native_apply_store
+            .mark_validating(&accepted)
+            .unwrap();
+        daemon.flush_native_apply_watches();
+        assert!(daemon.native_apply_watches.is_empty());
+        assert_eq!(
+            daemon.native_apply_store.read_active().unwrap(),
+            Some(validating.clone())
+        );
+
+        let terminal = NativeApplyTerminalRecord {
+            dispatch: validating.clone(),
+            outcome: NativeApplyTerminalOutcome::Failed,
+            recovery_cleared: true,
+            diagnostic: "validation rejected before mutation".to_string(),
+        };
+        daemon.native_apply_store.complete(&terminal).unwrap();
+        let reconnect = NativeApplyControlRequest::watch(
+            "99".repeat(16),
+            validating.apply_job_id,
+            validating.apply_job_token,
+            u64::MAX,
+        );
+        let response = daemon
+            .native_apply_watch_response(&reconnect, u64::MAX)
+            .unwrap()
+            .expect("terminal watch must never wait");
+        assert!(response.contains("\"state\":\"failed\""));
+        assert!(response.contains("\"generation\":3"));
+
+        drop(daemon);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn calibration_stop_requires_terminal_apply_without_a_worker_claim() {
+        let root = temp_path("native-apply-service-stop");
+        let store = NativeApplyCoordinatorStore::new(&root);
+        attest_native_apply_store_idle_for_service_stop(&store).unwrap();
+
+        let request = NativeApplyControlRequest::start(
+            "11".repeat(16),
+            "22".repeat(16),
+            "recommended".to_string(),
+            "33".repeat(32),
+            "44".repeat(32),
+            Vec::new(),
+        );
+        let candidate = NativeApplyDispatchRecord {
+            state: NativeApplyDispatchState::Accepted,
+            generation: 1,
+            apply_job_id: "55".repeat(16),
+            apply_job_token: "66".repeat(32),
+            source_job_id: "22".repeat(16),
+            worker_run_id: "none".to_string(),
+            option_id: "recommended".to_string(),
+            review_sha256: "33".repeat(32),
+            source_manifest_sha256: "none".to_string(),
+            manifest_sha256: "44".repeat(32),
+            manifest_schema_version: 0,
+            target_state: "none".to_string(),
+            acknowledgements: Vec::new(),
+        };
+        let accepted = match store.admit(&request, candidate).unwrap() {
+            NativeApplyAdmission::Created(record) => record,
+            other => panic!("unexpected admission: {other:?}"),
+        };
+        assert!(attest_native_apply_store_idle_for_service_stop(&store)
+            .unwrap_err()
+            .contains("accepted at generation 1"));
+
+        let validating = store.mark_validating(&accepted).unwrap();
+        let claim = NativeApplyWorkerClaim::for_process(
+            &validating,
+            ProcessIdentity {
+                pid: 4242,
+                process_group: 4242,
+                starttime_ticks: 7,
+            },
+        )
+        .unwrap();
+        assert_eq!(store.claim_worker(&validating, &claim).unwrap(), None);
+        let terminal = NativeApplyTerminalRecord {
+            outcome: NativeApplyTerminalOutcome::Failed,
+            recovery_cleared: true,
+            diagnostic: "validation rejected before mutation".to_string(),
+            dispatch: validating,
+        };
+        store.complete(&terminal).unwrap();
+        assert!(attest_native_apply_store_idle_for_service_stop(&store)
+            .unwrap_err()
+            .contains("worker claim"));
+        store.remove_worker_claim(&claim).unwrap();
+        attest_native_apply_store_idle_for_service_stop(&store).unwrap();
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_recovery_terminalizes_once_without_clearing_authority_or_respawning() {
+        let root = temp_path("native-apply-recovery-terminal");
+        let store = NativeApplyCoordinatorStore::new(&root.join("apply"));
+        let request = NativeApplyControlRequest::start(
+            "11".repeat(16),
+            "22".repeat(16),
+            "recommended".to_string(),
+            "33".repeat(32),
+            "44".repeat(32),
+            Vec::new(),
+        );
+        let candidate = NativeApplyDispatchRecord {
+            state: NativeApplyDispatchState::Accepted,
+            generation: 1,
+            apply_job_id: "55".repeat(16),
+            apply_job_token: "66".repeat(32),
+            source_job_id: "22".repeat(16),
+            worker_run_id: "none".to_string(),
+            option_id: "recommended".to_string(),
+            review_sha256: "33".repeat(32),
+            source_manifest_sha256: "none".to_string(),
+            manifest_sha256: "44".repeat(32),
+            manifest_schema_version: 0,
+            target_state: "none".to_string(),
+            acknowledgements: Vec::new(),
+        };
+        let accepted = match store.admit(&request, candidate).unwrap() {
+            NativeApplyAdmission::Created(record) => record,
+            other => panic!("unexpected admission: {other:?}"),
+        };
+        let validating = store.mark_validating(&accepted).unwrap();
+        let applying = store
+            .mark_applying(
+                &validating,
+                NativeApplyVerifiedDispatchIdentity {
+                    worker_run_id: "77".repeat(16),
+                    source_manifest_sha256: "44".repeat(32),
+                    manifest_schema_version: 6,
+                    target_state: "existing_managed".to_string(),
+                },
+            )
+            .unwrap();
+
+        settle_native_apply_recovery_attempt(
+            &store,
+            &applying,
+            Some("directional lifecycle failed"),
+            Err("exact rollback cannot classify the live files".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(store.read_active().unwrap(), None);
+        let terminal = store.read_terminal().unwrap().unwrap();
+        assert_eq!(terminal.dispatch, applying);
+        assert_eq!(terminal.outcome, NativeApplyTerminalOutcome::Failed);
+        assert!(!terminal.recovery_cleared);
+        assert!(terminal.diagnostic.contains("directional lifecycle failed"));
+        assert!(terminal.diagnostic.contains("recovery remains pending"));
+        assert_eq!(
+            reconcile_native_apply_worker(&store, &root.join("proc")).unwrap(),
+            NativeApplyWorkerReadiness::Idle
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_apply_worker_reconciliation_adopts_live_claim_and_relaunches_only_after_exit() {
+        let root = temp_path("native-apply-worker-reconcile");
+        let proc_root = root.join("proc");
+        fs::create_dir_all(&proc_root).unwrap();
+        let store = NativeApplyCoordinatorStore::new(&root.join("apply"));
+        assert_eq!(
+            reconcile_native_apply_worker(&store, &proc_root).unwrap(),
+            NativeApplyWorkerReadiness::Idle
+        );
+
+        let request = NativeApplyControlRequest::start(
+            "11".repeat(16),
+            "22".repeat(16),
+            "recommended".to_string(),
+            "33".repeat(32),
+            "44".repeat(32),
+            Vec::new(),
+        );
+        let candidate = NativeApplyDispatchRecord {
+            state: NativeApplyDispatchState::Accepted,
+            generation: 1,
+            apply_job_id: "55".repeat(16),
+            apply_job_token: "66".repeat(32),
+            source_job_id: "22".repeat(16),
+            worker_run_id: "none".to_string(),
+            option_id: "recommended".to_string(),
+            review_sha256: "33".repeat(32),
+            source_manifest_sha256: "none".to_string(),
+            manifest_sha256: "44".repeat(32),
+            manifest_schema_version: 0,
+            target_state: "none".to_string(),
+            acknowledgements: Vec::new(),
+        };
+        let accepted = match store.admit(&request, candidate).unwrap() {
+            NativeApplyAdmission::Created(record) => record,
+            other => panic!("unexpected admission: {other:?}"),
+        };
+        let validating = match reconcile_native_apply_worker(&store, &proc_root).unwrap() {
+            NativeApplyWorkerReadiness::Launch(record) => record,
+            other => panic!("unexpected worker readiness: {other:?}"),
+        };
+        assert_eq!(validating.state, NativeApplyDispatchState::Validating);
+        assert_eq!(validating.generation, accepted.generation + 1);
+
+        let identity = ProcessIdentity {
+            pid: 4242,
+            process_group: 4242,
+            starttime_ticks: 99,
+        };
+        write_fake_process(&proc_root, &identity);
+        let claim = NativeApplyWorkerClaim::for_process(&validating, identity.clone()).unwrap();
+        assert_eq!(store.claim_worker(&validating, &claim).unwrap(), None);
+        assert_eq!(
+            reconcile_native_apply_worker(&store, &proc_root).unwrap(),
+            NativeApplyWorkerReadiness::Live(identity.clone())
+        );
+
+        fs::remove_dir_all(proc_root.join(identity.pid.to_string())).unwrap();
+        assert_eq!(
+            reconcile_native_apply_worker(&store, &proc_root).unwrap(),
+            NativeApplyWorkerReadiness::Launch(validating.clone())
+        );
+        assert_eq!(store.read_worker_claim().unwrap(), None);
+
+        let applying = store
+            .mark_applying(
+                &validating,
+                NativeApplyVerifiedDispatchIdentity {
+                    worker_run_id: "77".repeat(16),
+                    source_manifest_sha256: "88".repeat(32),
+                    manifest_schema_version: 4,
+                    target_state: "existing_managed".to_string(),
+                },
+            )
+            .unwrap();
+        let applying_identity = ProcessIdentity {
+            pid: 4343,
+            process_group: 4343,
+            starttime_ticks: 100,
+        };
+        write_fake_process(&proc_root, &applying_identity);
+        let applying_claim =
+            NativeApplyWorkerClaim::for_process(&applying, applying_identity.clone()).unwrap();
+        assert_eq!(
+            store.claim_worker(&applying, &applying_claim).unwrap(),
+            None
+        );
+        assert_eq!(
+            reconcile_native_apply_worker(&store, &proc_root).unwrap(),
+            NativeApplyWorkerReadiness::Live(applying_identity.clone())
+        );
+        fs::remove_dir_all(proc_root.join(applying_identity.pid.to_string())).unwrap();
+        assert_eq!(
+            reconcile_native_apply_worker(&store, &proc_root).unwrap(),
+            NativeApplyWorkerReadiness::Launch(applying)
+        );
+        assert_eq!(store.read_worker_claim().unwrap(), None);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_apply_worker_validation_failure_is_terminal_before_mutation_authority() {
+        let root = temp_path("native-apply-worker-validation-failure");
+        let state_dir = root.join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let store = NativeApplyCoordinatorStore::new(&root.join("apply"));
+        let request = NativeApplyControlRequest::start(
+            "11".repeat(16),
+            "22".repeat(16),
+            "recommended".to_string(),
+            "33".repeat(32),
+            "44".repeat(32),
+            Vec::new(),
+        );
+        let candidate = NativeApplyDispatchRecord {
+            state: NativeApplyDispatchState::Accepted,
+            generation: 1,
+            apply_job_id: "55".repeat(16),
+            apply_job_token: "66".repeat(32),
+            source_job_id: "22".repeat(16),
+            worker_run_id: "none".to_string(),
+            option_id: "recommended".to_string(),
+            review_sha256: "33".repeat(32),
+            source_manifest_sha256: "none".to_string(),
+            manifest_sha256: "44".repeat(32),
+            manifest_schema_version: 0,
+            target_state: "none".to_string(),
+            acknowledgements: Vec::new(),
+        };
+        let accepted = match store.admit(&request, candidate).unwrap() {
+            NativeApplyAdmission::Created(record) => record,
+            other => panic!("unexpected admission: {other:?}"),
+        };
+        let validating = store.mark_validating(&accepted).unwrap();
+        execute_native_apply_worker(&state_dir, &store, validating).unwrap();
+        assert_eq!(store.read_active().unwrap(), None);
+        let terminal = store.read_terminal().unwrap().unwrap();
+        assert_eq!(terminal.outcome, NativeApplyTerminalOutcome::Failed);
+        assert!(terminal.recovery_cleared);
+        assert!(!terminal.diagnostic.is_empty());
+        assert!(!state_dir.join("jobs").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn async_native_apply_recovery_requires_verified_applying_authority() {
+        let root = temp_path("native-apply-recovery-unverified");
+        let store = NativeApplyCoordinatorStore::new(&root);
+        let source_job_id = "11".repeat(16);
+        let worker_run_id = "22".repeat(16);
+        let review_sha256 = "33".repeat(32);
+        let manifest_sha256 = "44".repeat(32);
+        let request = NativeApplyControlRequest::start(
+            "55".repeat(16),
+            source_job_id.clone(),
+            "recommended".to_string(),
+            review_sha256.clone(),
+            manifest_sha256.clone(),
+            Vec::new(),
+        );
+        let candidate = NativeApplyDispatchRecord {
+            state: NativeApplyDispatchState::Accepted,
+            generation: 1,
+            apply_job_id: "66".repeat(16),
+            apply_job_token: "77".repeat(32),
+            source_job_id: source_job_id.clone(),
+            worker_run_id: "none".to_string(),
+            option_id: "recommended".to_string(),
+            review_sha256,
+            source_manifest_sha256: "none".to_string(),
+            manifest_sha256,
+            manifest_schema_version: 0,
+            target_state: "none".to_string(),
+            acknowledgements: Vec::new(),
+        };
+        let accepted = match store.admit(&request, candidate).unwrap() {
+            NativeApplyAdmission::Created(record) => record,
+            other => panic!("unexpected admission: {other:?}"),
+        };
+        let recovery = NativeApplyRecoveryOutcome::Recovered {
+            authority: "existing_v4",
+            job_id: source_job_id,
+            worker_run_id,
+            recovery_cleared: true,
+            rolled_forward: false,
+        };
+        assert!(settle_native_apply_store_recovery(&store, &recovery)
+            .unwrap_err()
+            .contains("before verified mutation authority"));
+        assert_eq!(store.read_active().unwrap(), Some(accepted));
+        assert_eq!(store.read_terminal().unwrap(), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn async_native_apply_recovery_settles_applying_handle_exactly_once() {
+        let root = temp_path("native-apply-recovery-applying");
+        let store = NativeApplyCoordinatorStore::new(&root);
+        let source_job_id = "11".repeat(16);
+        let worker_run_id = "22".repeat(16);
+        let review_sha256 = "33".repeat(32);
+        let manifest_sha256 = "44".repeat(32);
+        let request = NativeApplyControlRequest::start(
+            "55".repeat(16),
+            source_job_id.clone(),
+            "recommended".to_string(),
+            review_sha256.clone(),
+            manifest_sha256.clone(),
+            Vec::new(),
+        );
+        let candidate = NativeApplyDispatchRecord {
+            state: NativeApplyDispatchState::Accepted,
+            generation: 1,
+            apply_job_id: "66".repeat(16),
+            apply_job_token: "77".repeat(32),
+            source_job_id: source_job_id.clone(),
+            worker_run_id: "none".to_string(),
+            option_id: "recommended".to_string(),
+            review_sha256,
+            source_manifest_sha256: "none".to_string(),
+            manifest_sha256: manifest_sha256.clone(),
+            manifest_schema_version: 0,
+            target_state: "none".to_string(),
+            acknowledgements: Vec::new(),
+        };
+        let accepted = match store.admit(&request, candidate).unwrap() {
+            NativeApplyAdmission::Created(record) => record,
+            other => panic!("unexpected admission: {other:?}"),
+        };
+        let validating = store.mark_validating(&accepted).unwrap();
+        let applying = store
+            .mark_applying(
+                &validating,
+                NativeApplyVerifiedDispatchIdentity {
+                    worker_run_id: worker_run_id.clone(),
+                    source_manifest_sha256: manifest_sha256,
+                    manifest_schema_version: 4,
+                    target_state: "existing_managed".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(applying.generation, 3);
+
+        let recovery = NativeApplyRecoveryOutcome::Recovered {
+            authority: "existing_v4",
+            job_id: source_job_id,
+            worker_run_id,
+            recovery_cleared: true,
+            rolled_forward: false,
+        };
+        settle_native_apply_store_recovery(&store, &recovery).unwrap();
+        assert_eq!(store.read_active().unwrap(), None);
+        let terminal = store.read_terminal().unwrap().unwrap();
+        assert_eq!(terminal.outcome, NativeApplyTerminalOutcome::RolledBack);
+        assert!(terminal.recovery_cleared);
+        assert!(terminal
+            .diagnostic
+            .contains("rolled back during coordinator recovery"));
+
+        settle_native_apply_store_recovery(&store, &recovery).unwrap();
+        assert_eq!(store.read_terminal().unwrap(), Some(terminal));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -12776,6 +15108,7 @@ mod tests {
         let started = daemon.handle(&job_message(ControlCommand::Start, &first));
         assert!(started.contains("\"state\":\"queued\""));
         assert!(started.contains("\"idempotent\":false"));
+        assert!(started.contains("\"worker_run_id\":null"));
         assert_eq!(daemon.leases.job_count(), 1);
 
         let repeated = daemon.handle(&job_message(ControlCommand::Start, &first));
@@ -12792,10 +15125,10 @@ mod tests {
             .contains("\"state\":\"queued\""));
         daemon.job_errors.insert(
             first.identity.job_id.clone(),
-            "legacy launcher: identity \"mismatch\"".to_string(),
+            "launcher: identity \"mismatch\"".to_string(),
         );
         let diagnosed = daemon.handle(&job_message(ControlCommand::Status, &first));
-        assert!(diagnosed.contains("\"diagnostic\":\"legacy launcher: identity \\\"mismatch\\\"\""));
+        assert!(diagnosed.contains("\"diagnostic\":\"launcher: identity \\\"mismatch\\\"\""));
 
         assert!(daemon
             .handle(&job_message(ControlCommand::Start, &second))
@@ -12811,6 +15144,9 @@ mod tests {
         let summary = restarted.summary_response();
         assert!(summary.contains("\"queued_jobs\":1"));
         assert!(summary.contains("\"settled_jobs\":1"));
+        assert!(summary.contains(
+            "\"active_operations\":[{\"instance\":\"wanb\",\"operation\":\"full_autotune\",\"state\":\"queued\",\"runtime_mutated\":false}]"
+        ));
         drop(restarted);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -12943,6 +15279,57 @@ mod tests {
             Some(first.identity.job_id.as_str())
         );
         drop(restarted);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn lease_conflict_response_is_typed_and_keeps_debug_identity_out_of_user_text() {
+        let owner_job_id = "a".repeat(32);
+        let response = lease_acquire_error_response(&LeaseAcquireError::Conflict {
+            key: super::super::lease::LeaseKey::Instance("wwan_adaptive".to_string()),
+            owner_job_id: owner_job_id.clone(),
+        });
+        assert_eq!(
+            response,
+            format!(
+                concat!(
+                    "{{\"state\":\"error\",\"error_code\":\"lease-conflict\",",
+                    "\"error\":\"another operation is already active for this instance\",",
+                    "\"conflict_kind\":\"instance\",",
+                    "\"conflicting_job_id\":\"{}\"}}\n"
+                ),
+                owner_job_id,
+            )
+        );
+        assert!(!response.contains("Instance("));
+        assert!(!response.contains("wwan_adaptive"));
+    }
+
+    #[test]
+    fn second_rating_request_is_rejected_without_mutating_the_active_job() {
+        let dir = temp_path("rating-instance-conflict");
+        let mut daemon = CalibrationDaemon::bind_with_admission(&dir, true).unwrap();
+        daemon.native_rating = true;
+        let first = guided_rating_request('a', 'b', "wan");
+        let second = guided_rating_request('c', 'd', "wan");
+        let accepted = daemon.handle(&job_message(ControlCommand::Start, &first));
+        assert!(accepted.contains("\"state\":\"queued\""));
+        let journal_before = daemon.jobs[0].journal.clone();
+
+        let rejected = daemon.handle(&job_message(ControlCommand::Start, &second));
+        assert!(rejected.contains("\"error_code\":\"lease-conflict\""));
+        assert!(rejected.contains("\"conflict_kind\":\"instance\""));
+        assert!(rejected.contains(&format!(
+            "\"conflicting_job_id\":\"{}\"",
+            first.identity.job_id
+        )));
+        assert!(!rejected.contains("Instance("));
+        assert!(!rejected.contains("wan"));
+        assert_eq!(daemon.jobs.len(), 1);
+        assert_eq!(daemon.jobs[0].journal, journal_before);
+        assert_eq!(daemon.leases.job_count(), 1);
+
+        drop(daemon);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

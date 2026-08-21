@@ -8,49 +8,15 @@
 
 use ring::digest::{digest, SHA256};
 
+use crate::reflector_defaults;
+
 const CAPTURE_POLICY_V1_SCHEMA_VERSION: u8 = 1;
 const CAPTURE_POLICY_V2_SCHEMA_VERSION: u8 = 2;
 const MAX_CAPTURE_POLICY_BYTES: usize = 16 * 1024;
 const MAX_REFLECTORS: usize = 64;
 
-const STANDARD_V1_REFLECTORS: &[&str] = &[
-    "1.1.1.1",
-    "1.0.0.1",
-    "8.8.8.8",
-    "8.8.4.4",
-    "9.9.9.9",
-    "9.9.9.10",
-    "9.9.9.11",
-    "94.140.14.15",
-    "94.140.14.140",
-    "94.140.14.141",
-    "94.140.15.15",
-    "94.140.15.16",
-    "64.6.65.6",
-    "156.154.70.1",
-    "156.154.70.2",
-    "156.154.70.3",
-    "156.154.70.4",
-    "156.154.70.5",
-    "156.154.71.1",
-    "156.154.71.2",
-    "156.154.71.3",
-    "156.154.71.4",
-    "156.154.71.5",
-    "208.67.220.2",
-    "208.67.220.123",
-    "208.67.220.220",
-    "208.67.222.2",
-    "208.67.222.123",
-    "185.228.168.9",
-    "185.228.168.10",
-];
-
 pub(crate) fn standard_v1_reflectors() -> Vec<String> {
-    STANDARD_V1_REFLECTORS
-        .iter()
-        .map(|value| (*value).to_string())
-        .collect()
+    reflector_defaults::standard_reflectors()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

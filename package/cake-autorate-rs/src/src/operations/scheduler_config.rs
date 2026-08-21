@@ -286,14 +286,7 @@ fn parse_instance(instance: &str, section: &RawSection) -> Result<ScheduledInsta
             .ok_or_else(|| "scheduled access evidence source is invalid".to_string())?;
     let access_confidence_percent =
         bounded_u64(&values, "access_medium_confidence_percent", 0, 0, 100)? as u8;
-    let capacity_learning_policy = resolve_capacity_policy(
-        &values,
-        scheduled_enabled,
-        profile,
-        access_medium,
-        access_source,
-        access_confidence_percent,
-    )?;
+    let capacity_learning_policy = resolve_capacity_policy(&values)?;
     if scheduled_enabled && capacity_learning_policy != CapacityLearningPolicy::ScheduledActive {
         return Err(
             "scheduled calibration is enabled but runtime capacity policy is not scheduled_active"
@@ -350,45 +343,12 @@ fn scalar_options(section: &RawSection) -> Result<BTreeMap<String, String>, Stri
 
 fn resolve_capacity_policy(
     values: &BTreeMap<String, String>,
-    scheduled_enabled: bool,
-    profile: AutotuneProfile,
-    medium: AccessMedium,
-    source: AccessEvidenceSource,
-    confidence: u8,
 ) -> Result<CapacityLearningPolicy, String> {
-    if let Some(value) = values.get("capacity_learning_policy") {
-        return CapacityLearningPolicy::parse(value)
-            .ok_or_else(|| "scheduled capacity learning policy is invalid".to_string());
-    }
-    if let Some(value) = values.get("runtime_learning_mode") {
-        return match value.as_str() {
-            "passive" => Ok(CapacityLearningPolicy::PassiveBounded),
-            "periodic_active" => Ok(CapacityLearningPolicy::ScheduledActive),
-            "fixed" => Ok(CapacityLearningPolicy::VerifiedOnly),
-            _ => Err("legacy runtime learning mode is invalid".to_string()),
-        };
-    }
-    if scheduled_enabled {
-        return Ok(CapacityLearningPolicy::ScheduledActive);
-    }
-    if boolean(values, "adaptive_ceiling_enabled", false)? {
-        return Ok(CapacityLearningPolicy::PassiveBounded);
-    }
-    if profile != AutotuneProfile::VariableLink {
-        return Ok(CapacityLearningPolicy::VerifiedOnly);
-    }
-    let strong_source = matches!(
-        source,
-        AccessEvidenceSource::UserSelected
-            | AccessEvidenceSource::NetworkProtocol
-            | AccessEvidenceSource::DeviceType
-            | AccessEvidenceSource::InterfaceName
-    );
-    if strong_source && medium != AccessMedium::Unknown && confidence >= 50 {
-        Ok(CapacityLearningPolicy::PassiveBounded)
-    } else {
-        Ok(CapacityLearningPolicy::VerifiedOnly)
-    }
+    let value = values
+        .get("capacity_learning_policy")
+        .ok_or_else(|| "scheduled capacity learning policy is missing".to_string())?;
+    CapacityLearningPolicy::parse(value)
+        .ok_or_else(|| "scheduled capacity learning policy is invalid".to_string())
 }
 
 fn parse_scalar(raw: &str) -> Result<String, String> {
@@ -605,28 +565,24 @@ mod tests {
     }
 
     #[test]
-    fn legacy_scheduled_flag_resolves_a_missing_policy_but_disabled_variable_is_bounded() {
-        let legacy = valid_instance("")
+    fn missing_current_capacity_policy_is_rejected_for_enabled_and_disabled_scheduler() {
+        let missing = valid_instance("")
             .lines()
             .filter(|line| !line.contains("capacity_learning_policy"))
             .collect::<Vec<_>>()
             .join("\n")
             + "\n";
-        let snapshot = parse_scheduled_instances(&legacy).unwrap();
-        assert_eq!(
-            snapshot.instances[0].capacity_learning_policy,
-            CapacityLearningPolicy::ScheduledActive
-        );
+        let snapshot = parse_scheduled_instances(&missing).unwrap();
+        assert!(snapshot.instances.is_empty());
+        assert!(snapshot.issues[0].message.contains("policy is missing"));
 
-        let disabled = legacy.replace(
+        let disabled = missing.replace(
             "scheduled_autotune_enabled='1'",
             "scheduled_autotune_enabled='0'",
         );
         let snapshot = parse_scheduled_instances(&disabled).unwrap();
-        assert_eq!(
-            snapshot.instances[0].capacity_learning_policy,
-            CapacityLearningPolicy::PassiveBounded
-        );
+        assert!(snapshot.instances.is_empty());
+        assert!(snapshot.issues[0].message.contains("policy is missing"));
     }
 
     #[test]

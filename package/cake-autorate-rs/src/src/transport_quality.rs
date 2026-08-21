@@ -1,9 +1,15 @@
+#[cfg(feature = "transport-probes")]
 use std::collections::{HashMap, VecDeque};
+#[cfg(feature = "transport-probes")]
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "transport-probes")]
 const IDLE_WINDOW: usize = 120;
+#[cfg(feature = "transport-probes")]
 const LOADED_WINDOW: usize = 40;
+#[cfg(feature = "transport-probes")]
 const MIN_IDLE_SAMPLES: usize = 20;
+#[cfg(feature = "transport-probes")]
 const MIN_LOADED_SAMPLES: usize = 20;
 
 #[derive(Clone, Copy, Debug)]
@@ -40,6 +46,7 @@ pub fn throughput_floor(input: ThroughputGuardInput) -> f64 {
         .max(1.0)
 }
 
+#[cfg(feature = "transport-probes")]
 #[derive(Clone, Debug)]
 pub struct TransportSnapshot {
     pub status: &'static str,
@@ -55,6 +62,7 @@ pub struct TransportSnapshot {
     pub last_error: Option<String>,
 }
 
+#[cfg(feature = "transport-probes")]
 #[derive(Clone, Debug)]
 pub struct TransportLatencyTracker {
     idle_samples: HashMap<String, VecDeque<f64>>,
@@ -68,6 +76,7 @@ pub struct TransportLatencyTracker {
     last_error: Option<String>,
 }
 
+#[cfg(feature = "transport-probes")]
 impl TransportLatencyTracker {
     pub fn new() -> Self {
         Self {
@@ -212,6 +221,7 @@ impl TransportLatencyTracker {
     }
 }
 
+#[cfg(feature = "transport-probes")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QualityClass {
     Learning,
@@ -223,6 +233,7 @@ pub enum QualityClass {
     F,
 }
 
+#[cfg(feature = "transport-probes")]
 impl QualityClass {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -237,6 +248,7 @@ impl QualityClass {
     }
 }
 
+#[cfg(feature = "transport-probes")]
 pub fn classify_quality(delta_ms: Option<f64>) -> QualityClass {
     let Some(delta_ms) = delta_ms.filter(|value| value.is_finite() && *value >= 0.0) else {
         return QualityClass::Learning;
@@ -257,6 +269,7 @@ pub fn classify_quality(delta_ms: Option<f64>) -> QualityClass {
     }
 }
 
+#[cfg(feature = "transport-probes")]
 pub fn effective_latency_delta_ms(
     icmp_dl_delta_us: f64,
     icmp_ul_delta_us: f64,
@@ -266,6 +279,7 @@ pub fn effective_latency_delta_ms(
     transport_delta_ms.unwrap_or(0.0).max(icmp_ms)
 }
 
+#[cfg(feature = "transport-probes")]
 pub fn transport_allows_growth(
     enabled: bool,
     confirmed: bool,
@@ -280,6 +294,7 @@ pub fn transport_allows_growth(
             && delta_ms.map(|delta| delta <= target_delay_ms) == Some(true))
 }
 
+#[cfg(feature = "transport-probes")]
 #[derive(Clone, Copy, Debug)]
 pub struct QualitySearchPolicy {
     pub target_delay_ms: f64,
@@ -289,6 +304,7 @@ pub struct QualitySearchPolicy {
     pub cooldown: Duration,
 }
 
+#[cfg(feature = "transport-probes")]
 #[derive(Clone, Debug)]
 pub struct QualitySearchUpdate {
     pub requested_rate_kbps: Option<f64>,
@@ -296,6 +312,7 @@ pub struct QualitySearchUpdate {
     pub reason: &'static str,
 }
 
+#[cfg(feature = "transport-probes")]
 #[derive(Clone, Debug)]
 pub struct QualitySearchDirection {
     steps: u8,
@@ -311,6 +328,7 @@ pub struct QualitySearchDirection {
     last_reason: &'static str,
 }
 
+#[cfg(feature = "transport-probes")]
 impl QualitySearchDirection {
     pub fn new() -> Self {
         Self {
@@ -517,6 +535,7 @@ impl QualitySearchDirection {
     }
 }
 
+#[cfg(feature = "transport-probes")]
 fn percentile(values: &[f64], percentile: f64) -> Option<f64> {
     let mut sorted = values
         .iter()
@@ -569,6 +588,7 @@ mod tests {
         assert_eq!(floor, 60_000.0);
     }
 
+    #[cfg(feature = "transport-probes")]
     #[test]
     fn transport_requires_twenty_idle_and_loaded_samples() {
         let now = Instant::now();
@@ -610,6 +630,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "transport-probes")]
     #[test]
     fn route_reset_discards_transport_baseline_and_loaded_samples() {
         let now = Instant::now();
@@ -639,6 +660,7 @@ mod tests {
         assert!(snapshot.delta_ms.is_none());
     }
 
+    #[cfg(feature = "transport-probes")]
     #[test]
     fn quality_thresholds_are_stable() {
         assert_eq!(classify_quality(None), QualityClass::Learning);
@@ -651,6 +673,7 @@ mod tests {
         assert_eq!(classify_quality(Some(401.0)), QualityClass::F);
     }
 
+    #[cfg(feature = "transport-probes")]
     #[test]
     fn transport_delay_blocks_growth_when_icmp_looks_clean() {
         assert_eq!(
@@ -675,6 +698,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "transport-probes")]
     #[test]
     fn search_never_requests_below_floor() {
         let now = Instant::now();
@@ -692,6 +716,7 @@ mod tests {
         assert_eq!(update.requested_rate_kbps, Some(70_000.0));
     }
 
+    #[cfg(feature = "transport-probes")]
     #[test]
     fn worsening_candidate_rolls_back_and_limits_search() {
         let now = Instant::now();
@@ -719,6 +744,7 @@ mod tests {
         assert_eq!(search.no_cake_effect(), Some(true));
     }
 
+    #[cfg(feature = "transport-probes")]
     #[test]
     fn flat_candidate_restores_throughput_and_marks_no_cake_effect() {
         let now = Instant::now();
@@ -748,6 +774,7 @@ mod tests {
         assert_eq!(search.no_cake_effect(), Some(true));
     }
 
+    #[cfg(feature = "transport-probes")]
     #[test]
     fn target_met_clears_no_cake_effect_state() {
         let now = Instant::now();
@@ -764,6 +791,7 @@ mod tests {
         assert_eq!(search.no_cake_effect(), Some(false));
     }
 
+    #[cfg(feature = "transport-probes")]
     #[test]
     fn expired_cooldown_starts_a_fresh_search_episode() {
         let now = Instant::now();

@@ -78,6 +78,16 @@ an incomplete or contaminated attempt never replaces it.
 
 [![Status overview for two independently routed uplinks](docs/screenshots/status-overview.png)](docs/screenshots/status-overview.png)
 
+**Get rating** offers an automatic router-side test and a guided client
+capture. The dialog first attests the current operation for that exact
+instance; a second tab reconnects to an active Rating instead of starting a
+competing job. Starting Guided after a completed Automatic run creates a new
+job and worker identity, while closing during an in-flight Start receipt still
+cancels the exact admitted job. Raw lease/debug identities are never shown to
+the user.
+
+[![Guided Rating reconnected to the active per-instance job](docs/screenshots/rating-guided.png)](docs/screenshots/rating-guided.png)
+
 **Graphs** use an opt-in, bounded RAM-only history. Latency, transport delta,
 effective delay, CPU and synchronized download/upload traffic share the same
 timeline; the oldest samples are discarded automatically and nothing is
@@ -275,13 +285,13 @@ The RC27 release builds the OpenWrt 25.12 daemon APK for this ABI matrix:
 The target is an APK ABI rather than one specific board. The authoritative
 choice is the value returned by `apk --print-arch`. Every full daemon asset
 follows the name
-`cake-autorate-rs-1.0_rc27-r250_openwrt-25.12_<arch>.apk`; the shared
-`luci-app-cake-autorate-rs-1.0_rc27-r98_openwrt-25.12_all.apk` contains the
+`cake-autorate-rs-1.0_rc27-r306_openwrt-25.12_<arch>.apk`; the shared
+`luci-app-cake-autorate-rs-1.0_rc27-r120.apk` contains the
 architecture-independent full LuCI interface and SQM integration.
 
 The same release also contains a separately compiled **Lite** pair for every
-ABI: `cake-autorate-rs-lite-1.0_rc27-r250_...apk` and
-`luci-app-cake-autorate-rs-lite-1.0_rc27-r3_...apk`. Lite keeps the manual
+ABI: `cake-autorate-rs-lite-1.0_rc27-r306_...apk` and
+`luci-app-cake-autorate-rs-lite-1.0_rc27-r4.apk`. Lite keeps the manual
 controller, routing, latency probes, directional SQM and bounded adaptive
 ceiling, but deliberately omits Get rating, speed-test calibration, Full
 Auto-Tune and scheduled calibration. Full and Lite are mutually exclusive;
@@ -384,8 +394,8 @@ representative examples rather than guarantees.
 
 ## Release history
 
-This release is **RC27 r250/r98**: daemon package r250 and Full LuCI package
-r98, with the parallel manual-only Lite pair r250/r3. It retains the complete
+This release is **RC27 r306/r120**: daemon package r306 and Full LuCI package
+r120, with the parallel manual-only Lite pair r306/r4. It retains the complete
 two-direction Rating authority, truthful staged Auto-Tune progress, a ranked
 four-option Review including the measured mobile download-bypass topology, one
 aggregate trade-off confirmation, and an Apply flow which verifies the runtime
@@ -394,7 +404,11 @@ switch. This maintenance revision removes retired internal paths, isolates the
 read-only scheduler-status projection from coordinator-owned mutation state,
 removes remaining implementation-language wording from the UI, and ensures
 that an explicit **Run again** starts a new calibration instead of reopening an
-inert historical Review. The focused live transition matrix, full browser audit, Full/Lite
+inert historical Review. It also serializes per-instance Rating admission,
+resets worker identity between sequential Automatic and Guided jobs, adopts an
+active Rating across browser sessions, cancels jobs whose Start receipt arrives
+after the dialog closes, and uses portable 32-bit atomic staging counters on
+32-bit MIPS. The focused live transition matrix, full browser audit, Full/Lite
 12-ABI verification and design chronology are recorded in
 [Testing](TESTING.md). The README intentionally describes current behavior
 instead of retaining a cumulative RC diary; historical source points remain in
@@ -450,7 +464,7 @@ Implemented:
 - CPU usage sampling from `/proc/stat` is always exposed in runtime status;
   `output_cpu_stats` and `output_cpu_raw_stats` control log records only.
   The Status value is whole-router utilization. Run
-  `/usr/libexec/cake-autorate-rs/cpu-profile 30` to measure the daemon,
+  `/usr/sbin/cake-autorated --cpu-profile 30` to measure the daemon,
   persistent pingers and scheduler separately, including short-lived child
   work waited by each daemon.
 - adaptive rate calculations using delay/load windows.
@@ -622,9 +636,10 @@ Implemented:
   service stop.
 - Integrated SQM backend sync: each `cake-autorate` UCI section can own a matching
   `sqm` queue section.
-- Optional MQTT publisher service: per-instance MQTT export reads daemon
-  SUMMARY/CPU log records, publishes state via `mosquitto_pub`, and registers
-  Home Assistant discovery sensors when enabled.
+- Optional native MQTT publisher service: per-instance MQTT export reads
+  bounded SUMMARY/CPU log records, speaks MQTT 3.1.1 directly without exposing
+  credentials in a child-process argument list, and registers retained Home
+  Assistant discovery and availability records when enabled.
 - Automatic interface preset: selecting the target interface fills
   `sqm_interface`, `ul_if`, `dl_if=ifb4<target>`, and empty/generated
   `ping_extra_args=-I <target>` for non-IRTT pingers so reflector probes are
@@ -684,11 +699,11 @@ Known limits:
   per-uplink integration requires the native nftables mwan3 backend and its
   member-scoped status API. The application validates and consumes that state;
   it does not invent a missing uplink or repair an invalid mwan3 policy.
-- MQTT is an optional sidecar service rather than daemon core. It requires a
-  configured broker, `log_to_file=1`, `output_summary_stats=1`, and
-  `mosquitto_pub` from either `mosquitto-client-nossl` or
-  `mosquitto-client-ssl`. CPU sensors additionally require
-  `output_cpu_stats=1`.
+- MQTT is an optional native sidecar rather than controller authority. It
+  requires a configured plain-MQTT broker, `log_to_file=1`, and
+  `output_summary_stats=1`; CPU sensors additionally require
+  `output_cpu_stats=1`. Broker loss terminates the sidecar so procd owns retry
+  policy, while retained LWT marks the instance offline.
 
 SQM integration:
 
@@ -785,16 +800,11 @@ planner can use it as the timestamp probe path when `fping --icmp-timestamp` is
 unavailable. The create wizard writes pinger defaults and can run the same scan
 before creating a new instance.
 
-Optional MQTT client packages:
-
-- `mosquitto-client-nossl`
-- `mosquitto-client-ssl`
-
-The LuCI Logging tab shows MQTT availability and can install the default
-`mosquitto-client-nossl` package. After setting `mqtt_enabled=1` and
-`mqtt_host`, enable and start `/etc/init.d/cake-autorate-mqtt`; the publisher
-creates Home Assistant discovery sensors and publishes instance state under the
-configured base topic.
+The LuCI Logging tab validates the built-in native MQTT publisher. No external
+MQTT client package is needed. After setting `mqtt_enabled=1`, `mqtt_host`, and
+the required summary logging options, restart `cake-autorate`; its Full-only
+MQTT sidecar creates Home Assistant discovery sensors and publishes instance
+state under the configured base topic.
 
 ## Build In OpenWrt SDK
 
@@ -864,16 +874,16 @@ For example, when it prints `aarch64_generic`:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc27-r250_openwrt-25.12_aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc27-r98_openwrt-25.12_all.apk
+  /root/cake-autorate-rs-1.0_rc27-r306_openwrt-25.12_aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc27-r120.apk
 ```
 
 For a small manual-only installation, use the matching Lite pair instead:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-lite-1.0_rc27-r250_openwrt-25.12_aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-lite-1.0_rc27-r3_openwrt-25.12_all.apk
+  /root/cake-autorate-rs-lite-1.0_rc27-r306_openwrt-25.12_aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-lite-1.0_rc27-r4.apk
 ```
 
 Changing variants is a package replacement, not an in-place feature toggle.
@@ -898,12 +908,6 @@ Optional speed test backends can be installed from LuCI or manually:
 
 ```sh
 apk add librespeed-cli speedtest-go iperf3 jsonfilter
-```
-
-Optional MQTT support can be installed from LuCI or manually:
-
-```sh
-apk add mosquitto-client-nossl
 ```
 
 Fresh installs contain no autorate instance and do not create an SQM queue.
@@ -950,8 +954,8 @@ cake-autorated --instance wan_sqm --once
 cat /var/run/cake-autorate/wan_sqm/status.json
 /usr/libexec/cake-autorate-rs/speedtest wan_sqm "" status auto
 /usr/libexec/cake-autorate-rs/quality-test wan_sqm status
-/usr/libexec/cake-autorate-rs/mqtt-status wan_sqm status
-/usr/libexec/cake-autorate-rs/cpu-profile 30
+/usr/sbin/cake-autorated --mqtt-status wan_sqm status
+/usr/sbin/cake-autorated --cpu-profile 30
 ```
 
 For a no-shaper smoke test, disable both shaper adjustment flags:

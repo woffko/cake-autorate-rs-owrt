@@ -417,12 +417,6 @@ pub(crate) struct NativeApplyRecoveryReceipt {
 }
 
 pub(crate) trait NativeApplyTransactionBackend {
-    /// Refuse to start or recover a native transaction while the legacy LuCI
-    /// Apply engine owns a guard token or a persistent rollback marker.  The
-    /// caller already holds the global runtime lock, so this attestation and
-    /// the following native recovery/config mutation share one ownership
-    /// boundary.
-    fn attest_legacy_apply_idle(&mut self) -> Result<(), String>;
     fn candidate_already_applied(
         &mut self,
         plan: &NativeApplyExecutionPlan,
@@ -482,7 +476,6 @@ pub(crate) fn execute_native_apply_commit_with_fault<B: NativeApplyTransactionBa
     }
     let manifest_sha256 = sqm_identity::sha256sum(manifest)?;
     let lock = NativeApplyGlobalLock::acquire(paths.global_lock)?;
-    backend.attest_legacy_apply_idle()?;
     let store = NativeApplyRecoveryStore::new(paths.recovery_root);
     store.discard_incomplete_staging()?;
     store.discard_completed()?;
@@ -577,7 +570,11 @@ pub(crate) fn execute_native_apply_commit_with_fault<B: NativeApplyTransactionBa
             NativeApplyRecoveryState::Verified,
         )?;
         fault.after_verified_before_commit(&verified)?;
-        backend.verify_applied(plan)?;
+        // The first exact verification above is the commit predicate.  Publish
+        // CommitAccepted immediately after it so an unrelated transport or
+        // process failure cannot strand an already verified candidate on the
+        // rollback side of the boundary.  The post-commit verification below
+        // remains mandatory and any failure rolls forward from durable intent.
         let accepted = store.accept_candidate(paths.cake_config, paths.sqm_config, &snapshot)?;
         fault.after_commit_accepted(&accepted)?;
         Ok::<NativeApplyRecoveryRecord, String>(accepted)
@@ -672,7 +669,6 @@ pub(crate) fn execute_native_apply_forced_rollback_with_fault<B: NativeApplyTran
 ) -> Result<NativeApplyLabReceipt, String> {
     require_existing_v4_apply_plan(plan)?;
     let lock = NativeApplyGlobalLock::acquire(paths.global_lock)?;
-    backend.attest_legacy_apply_idle()?;
     backend.attest_before_apply(plan)?;
     let batch = canonical_native_uci_batch(plan)?;
     let store = NativeApplyRecoveryStore::new(paths.recovery_root);
@@ -848,20 +844,14 @@ pub(crate) fn recover_native_apply<B: NativeApplyTransactionBackend>(
     // retry budget or polling cadence can authorize recovery mutation.
     let lock = NativeApplyGlobalLock::acquire_for_recovery(paths.global_lock)?;
     let Some(initial_record) = store.read_record()? else {
-        // With no published native transaction there is no cross-engine owner
-        // to arbitrate.  Only private, non-authoritative native debris may be
-        // removed; legacy Apply state is deliberately left untouched.
+        // With no published native transaction there is no recovery authority.
+        // Only private, non-authoritative staging debris may be removed.
         store.discard_incomplete_staging()?;
         store.discard_completed()?;
         return Ok(None);
     };
     let initial_request = store.read_request()?;
     require_existing_v4_recovery_request(&initial_request)?;
-    backend.attest_legacy_apply_idle().map_err(|error| {
-        format!(
-            "native Apply recovery found competing legacy Apply ownership; refusing to choose an ordering: {error}"
-        )
-    })?;
     store.discard_incomplete_staging()?;
     store.discard_completed()?;
     let record = store
@@ -1248,11 +1238,9 @@ impl NativeApplyRecoveryStore {
         let text = std::str::from_utf8(&bytes)
             .map_err(|_| "native Apply recovery request is not UTF-8".to_string())?;
         let request = OperationRequest::decode(text)?;
-        // OperationRequest::decode already re-encodes against the exact input
-        // schema. Recovery must remain able to consume a structurally valid
-        // durable request even when current admission policy no longer allows
-        // starting that target state; this is recovery authority, not a new
-        // admission path.
+        if request.encode()? != text {
+            return Err("native Apply recovery request uses a retired wire schema".to_string());
+        }
         Ok(request)
     }
 
@@ -2311,10 +2299,8 @@ mod tests {
         cake: PathBuf,
         sqm: PathBuf,
         events: Vec<&'static str>,
-        owner_attest_count: u8,
         attest_count: u8,
         restart_count: u8,
-        fail_owner_attestation: bool,
         fail_attest: bool,
         drift_original_on_second_attest: bool,
         drift_sqm_on_second_attest: bool,
@@ -2332,10 +2318,8 @@ mod tests {
                 cake: cake.to_path_buf(),
                 sqm: sqm.to_path_buf(),
                 events: Vec::new(),
-                owner_attest_count: 0,
                 attest_count: 0,
                 restart_count: 0,
-                fail_owner_attestation: false,
                 fail_attest: false,
                 drift_original_on_second_attest: false,
                 drift_sqm_on_second_attest: false,
@@ -2350,15 +2334,6 @@ mod tests {
     }
 
     impl NativeApplyTransactionBackend for FakeBackend {
-        fn attest_legacy_apply_idle(&mut self) -> Result<(), String> {
-            self.owner_attest_count = self.owner_attest_count.saturating_add(1);
-            if self.fail_owner_attestation {
-                Err("injected legacy Apply ownership fence".to_string())
-            } else {
-                Ok(())
-            }
-        }
-
         fn candidate_already_applied(
             &mut self,
             _: &NativeApplyExecutionPlan,
@@ -2638,7 +2613,6 @@ mod tests {
             error,
             "native Apply schema-v4 runtime cannot execute absent-bootstrap authority"
         );
-        assert_eq!(backend.owner_attest_count, 0);
         assert!(backend.events.is_empty());
         assert_eq!(fs::read(&cake).unwrap(), b"cake-before\n");
         assert_eq!(fs::read(&sqm).unwrap(), b"sqm-before\n");
@@ -2676,7 +2650,6 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("operation record header mismatch"));
-        assert_eq!(backend.owner_attest_count, 0);
         assert!(backend.events.is_empty());
         assert!(!lock.exists());
         assert_eq!(fs::read(&cake).unwrap(), b"cake-before\n");
@@ -3101,72 +3074,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_owner_fence_precedes_duplicate_success_and_recovery_creation() {
-        let (root, cake, sqm, recovery, lock) = transaction_fixture("legacy-owner-fence");
-        let plan = plan();
-        let manifest = plan.canonical_manifest_bytes().unwrap();
-        fs::write(&cake, b"cake-after\n").unwrap();
-        fs::write(&sqm, b"sqm-after\n").unwrap();
-        let mut backend = FakeBackend::new(&cake, &sqm);
-        backend.fail_owner_attestation = true;
-
-        let error = execute_native_apply_commit(
-            &plan,
-            &manifest,
-            NativeApplyTransactionPaths {
-                recovery_root: &recovery,
-                global_lock: &lock,
-                cake_config: &cake,
-                sqm_config: &sqm,
-            },
-            &mut backend,
-        )
-        .unwrap_err();
-
-        assert!(error.contains("legacy Apply ownership fence"));
-        assert_eq!(backend.owner_attest_count, 1);
-        assert!(backend.events.is_empty());
-        assert_eq!(fs::read(&cake).unwrap(), b"cake-after\n");
-        assert_eq!(fs::read(&sqm).unwrap(), b"sqm-after\n");
-        assert!(!recovery.join(CURRENT_DIRECTORY).exists());
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn recovery_refuses_mixed_legacy_and_native_owners_without_mutation() {
-        let (root, cake, sqm, recovery, lock) = transaction_fixture("mixed-apply-owners");
-        let plan = plan();
-        let manifest = plan.canonical_manifest_bytes().unwrap();
-        let store = NativeApplyRecoveryStore::new(&recovery);
-        let prepared = store.prepare(&plan, &manifest, &cake, &sqm).unwrap();
-        let mut backend = FakeBackend::new(&cake, &sqm);
-        backend.fail_owner_attestation = true;
-
-        let error = recover_native_apply(
-            NativeApplyTransactionPaths {
-                recovery_root: &recovery,
-                global_lock: &lock,
-                cake_config: &cake,
-                sqm_config: &sqm,
-            },
-            &mut backend,
-        )
-        .unwrap_err();
-
-        assert!(error.contains("competing legacy Apply ownership"));
-        assert_eq!(backend.owner_attest_count, 1);
-        assert!(backend.events.is_empty());
-        assert_eq!(store.read_record().unwrap(), Some(prepared));
-        assert_eq!(fs::read(&cake).unwrap(), b"cake-before\n");
-        assert_eq!(fs::read(&sqm).unwrap(), b"sqm-before\n");
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn empty_native_recovery_does_not_compete_with_a_legacy_owner() {
+    fn empty_native_recovery_is_a_read_only_noop() {
         let (root, cake, sqm, recovery, lock) = transaction_fixture("empty-native-recovery");
         let mut backend = FakeBackend::new(&cake, &sqm);
-        backend.fail_owner_attestation = true;
 
         let receipt = recover_native_apply(
             NativeApplyTransactionPaths {
@@ -3180,7 +3090,6 @@ mod tests {
         .unwrap();
 
         assert!(receipt.is_none());
-        assert_eq!(backend.owner_attest_count, 0);
         assert!(backend.events.is_empty());
         assert_eq!(fs::read(&cake).unwrap(), b"cake-before\n");
         assert_eq!(fs::read(&sqm).unwrap(), b"sqm-before\n");
@@ -3660,22 +3569,22 @@ mod tests {
     fn canonical_uci_batch_is_single_process_input_from_the_typed_plan() {
         let plan = plan();
         let batch = String::from_utf8(canonical_native_uci_batch(&plan).unwrap()).unwrap();
-        let mut legacy_expected = String::new();
+        let mut expected = String::new();
         for mutation in &plan.uci_mutations {
             match (&mutation.action, mutation.value.as_deref()) {
-                (NativeUciMutationAction::Set, Some(value)) => legacy_expected.push_str(&format!(
+                (NativeUciMutationAction::Set, Some(value)) => expected.push_str(&format!(
                     "set {}.{}.{}='{}'\n",
                     mutation.package, mutation.section, mutation.option, value
                 )),
-                (NativeUciMutationAction::Delete, None) => legacy_expected.push_str(&format!(
+                (NativeUciMutationAction::Delete, None) => expected.push_str(&format!(
                     "delete {}.{}.{}\n",
                     mutation.package, mutation.section, mutation.option
                 )),
                 _ => panic!("production plan unexpectedly emitted a section creation"),
             }
         }
-        legacy_expected.push_str("commit cake-autorate\n");
-        assert_eq!(batch, legacy_expected);
+        expected.push_str("commit cake-autorate\n");
+        assert_eq!(batch, expected);
         assert!(batch.ends_with("commit cake-autorate\n"));
         assert!(batch.contains(&format!(
             "set cake-autorate.wan_sqm.base_dl_shaper_rate_kbps='{}'\n",
@@ -3850,23 +3759,26 @@ mod tests {
     }
 
     #[test]
-    fn recovery_accepts_a_canonical_request_written_by_the_v4_daemon() {
-        let (root, cake, sqm, recovery, _lock) = transaction_fixture("legacy-v4-request");
+    fn recovery_rejects_a_retired_public_v4_request() {
+        let (root, cake, sqm, recovery, _lock) = transaction_fixture("retired-v4-request");
         let plan = plan();
         let manifest = plan.canonical_manifest_bytes().unwrap();
         let store = NativeApplyRecoveryStore::new(&recovery);
         store.prepare(&plan, &manifest, &cake, &sqm).unwrap();
 
-        let legacy = plan.request.encode_for_test_schema(4).unwrap();
+        let retired = plan.request.encode_for_test_schema(4).unwrap();
         let mut record = store.read_record().unwrap().unwrap();
-        record.request_sha256 = sqm_identity::sha256sum(legacy.as_bytes()).unwrap();
-        fs::write(store.current_path().join(REQUEST_FILE), legacy).unwrap();
+        record.request_sha256 = sqm_identity::sha256sum(retired.as_bytes()).unwrap();
+        fs::write(store.current_path().join(REQUEST_FILE), retired).unwrap();
         fs::write(
             store.current_path().join(STATE_FILE),
             record.encode().unwrap(),
         )
         .unwrap();
-        assert_eq!(store.read_request().unwrap(), plan.request);
+        assert!(store
+            .read_request()
+            .unwrap_err()
+            .contains("retired wire schema"));
 
         fs::remove_dir_all(root).unwrap();
     }

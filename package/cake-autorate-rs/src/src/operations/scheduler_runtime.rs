@@ -6,6 +6,7 @@
 //! in the same durable record.  Calendar time can select a due slot, but only
 //! caller-supplied state evidence can authorize admission.
 
+use super::identity::ProcessIdentity;
 use super::protocol::{OperationOrigin, OperationRequest};
 use super::rating::RatingRuntimeSnapshot;
 use super::scheduler::{
@@ -156,11 +157,6 @@ pub fn attest_no_competing_calibration_processes(
                 ))
             }
         }
-        if bytes.len() > MAX_CMDLINE_BYTES {
-            return Err(format!(
-                "process {pid} command line exceeds the scheduler ownership bound"
-            ));
-        }
         let arguments: Vec<&[u8]> = bytes
             .split(|byte| *byte == 0)
             .filter(|argument| !argument.is_empty())
@@ -168,22 +164,67 @@ pub fn attest_no_competing_calibration_processes(
         if arguments.is_empty() {
             continue;
         }
-        let legacy_scheduler = arguments
-            .windows(2)
-            .any(|pair| pair[0].ends_with(b"/autotune-scheduler") && pair[1] == b"run");
-        let native_coordinator = arguments
-            .iter()
-            .any(|argument| *argument == b"--calibrationd")
-            && arguments
-                .iter()
-                .any(|argument| argument.ends_with(b"/cake-autorated"));
-        if legacy_scheduler || native_coordinator {
+        let (native_coordinator, owned_executable) = calibration_process_shape(&arguments);
+        if bytes.len() > MAX_CMDLINE_BYTES {
+            // An unrelated process may legitimately have a very large argv.
+            // Only a process whose leading executable shape belongs to this
+            // calibration authority is required to fit our exact bound.
+            if native_coordinator || owned_executable {
+                return Err(format!(
+                    "process {pid} command line exceeds the scheduler ownership bound"
+                ));
+            }
+            continue;
+        }
+        if native_coordinator {
+            let Some(identity) = ProcessIdentity::inspect_live(proc_root, pid)? else {
+                continue;
+            };
+            let mut confirmed = Vec::new();
+            match File::open(&path).and_then(|file| {
+                file.take((MAX_CMDLINE_BYTES + 1) as u64)
+                    .read_to_end(&mut confirmed)
+            }) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "unable to re-attest process {pid} for scheduler ownership: {error}"
+                    ))
+                }
+            }
+            if confirmed.len() > MAX_CMDLINE_BYTES {
+                return Err(format!(
+                    "process {pid} command line exceeds the scheduler ownership bound"
+                ));
+            }
+            match ProcessIdentity::inspect_live(proc_root, pid)? {
+                None => continue,
+                Some(confirmed_identity)
+                    if confirmed_identity == identity && confirmed == bytes => {}
+                Some(_) => {
+                    return Err(format!(
+                        "process {pid} changed during scheduler ownership attestation"
+                    ))
+                }
+            }
             return Err(format!(
                 "competing calibration scheduler/coordinator process {pid} is active"
             ));
         }
     }
     Ok(())
+}
+
+fn calibration_process_shape(arguments: &[&[u8]]) -> (bool, bool) {
+    let native_executable = arguments
+        .iter()
+        .any(|argument| argument.ends_with(b"/cake-autorated"));
+    let native_coordinator = native_executable
+        && arguments
+            .iter()
+            .any(|argument| *argument == b"--calibrationd");
+    (native_coordinator, native_executable)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -280,18 +321,11 @@ pub fn load_or_initialize_state(
     if now_unix_s == 0 {
         return Err("scheduler cannot initialize from a zero wall clock".to_string());
     }
-    let mut state = match store.load_state(&config.instance)? {
+    let existing = store.load_state(&config.instance)?;
+    let missing = existing.is_none();
+    let mut state = match existing {
         Some(state) => state,
-        None => SchedulerInstanceState::new(
-            ScheduleCursor::new(config.instance.clone(), now_unix_s)?,
-            BudgetLedger::new(
-                config.instance.clone(),
-                day.to_string(),
-                month.to_string(),
-                config.daily_limit_bytes,
-                config.monthly_limit_bytes,
-            )?,
-        )?,
+        None => build_initial_scheduler_state(config, now_unix_s, day, month, 0)?,
     };
     let before = state.clone();
     state.budget.reconfigure_limits(
@@ -300,10 +334,35 @@ pub fn load_or_initialize_state(
         config.daily_limit_bytes,
         config.monthly_limit_bytes,
     )?;
-    if state != before || store.load_state(&config.instance)?.is_none() {
+    if state != before || missing {
         store.persist_state(&state)?;
     }
     Ok(state)
+}
+
+pub(crate) fn build_initial_scheduler_state(
+    config: &ScheduledInstanceConfig,
+    now_unix_s: u64,
+    day: &str,
+    month: &str,
+    monthly_charged_bytes: u64,
+) -> Result<SchedulerInstanceState, String> {
+    if now_unix_s == 0 {
+        return Err("scheduler cannot initialize from a zero wall clock".to_string());
+    }
+    let mut budget = BudgetLedger::new(
+        config.instance.clone(),
+        day.to_string(),
+        month.to_string(),
+        config.daily_limit_bytes,
+        config.monthly_limit_bytes,
+    )?;
+    budget.monthly_charged_bytes = monthly_charged_bytes;
+    budget.validate()?;
+    SchedulerInstanceState::new(
+        ScheduleCursor::new(config.instance.clone(), now_unix_s)?,
+        budget,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -471,6 +530,15 @@ mod tests {
             std::process::id(),
             TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    fn live_stat(pid: u32) -> String {
+        let mut fields = vec!["S".to_string(), "1".to_string(), pid.to_string()];
+        while fields.len() < 19 {
+            fields.push("0".to_string());
+        }
+        fields.push("123".to_string());
+        format!("{pid} (cake-autorated) {} 0", fields.join(" "))
     }
 
     fn config() -> ScheduledInstanceConfig {
@@ -882,25 +950,58 @@ mod tests {
     }
 
     #[test]
-    fn process_attestation_rejects_legacy_scheduler_and_another_coordinator() {
+    fn process_attestation_rejects_another_native_coordinator() {
         let root = root("proc-attestation");
-        std::fs::create_dir_all(root.join("101")).unwrap();
-        std::fs::write(
-            root.join("101/cmdline"),
-            b"/bin/sh\0/usr/libexec/cake-autorate-rs/autotune-scheduler\0run\0",
-        )
-        .unwrap();
-        assert!(attest_no_competing_calibration_processes(&root, 999).is_err());
-
-        std::fs::remove_dir_all(root.join("101")).unwrap();
         std::fs::create_dir_all(root.join("102")).unwrap();
         std::fs::write(
             root.join("102/cmdline"),
             b"/usr/sbin/cake-autorated\0--calibrationd\0--native-autotune\0",
         )
         .unwrap();
+        std::fs::write(root.join("102/stat"), live_stat(102)).unwrap();
         assert!(attest_no_competing_calibration_processes(&root, 999).is_err());
         assert!(attest_no_competing_calibration_processes(&root, 102).is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn process_attestation_ignores_unrelated_long_argv_but_bounds_owned_executables() {
+        let root = root("proc-long-unrelated");
+        std::fs::create_dir_all(root.join("201")).unwrap();
+        let mut unrelated = b"/usr/bin/apcontroller\0".to_vec();
+        unrelated.extend(std::iter::repeat_n(b'x', MAX_CMDLINE_BYTES + 32));
+        unrelated.push(0);
+        std::fs::write(root.join("201/cmdline"), unrelated).unwrap();
+        std::fs::write(root.join("201/stat"), live_stat(201)).unwrap();
+        assert!(attest_no_competing_calibration_processes(&root, 999).is_ok());
+
+        std::fs::remove_dir_all(root.join("201")).unwrap();
+        std::fs::create_dir_all(root.join("202")).unwrap();
+        std::fs::write(
+            root.join("202/cmdline"),
+            b"/usr/sbin/cake-autorated\0--instance\0wan_sqm\0",
+        )
+        .unwrap();
+        std::fs::write(root.join("202/stat"), live_stat(202)).unwrap();
+        assert!(attest_no_competing_calibration_processes(&root, 999).is_ok());
+
+        std::fs::write(
+            root.join("202/cmdline"),
+            b"/usr/bin/env\0/usr/sbin/cake-autorated\0--calibrationd\0--native-autotune\0",
+        )
+        .unwrap();
+        assert!(attest_no_competing_calibration_processes(&root, 999)
+            .unwrap_err()
+            .contains("competing calibration scheduler/coordinator"));
+
+        let mut oversized_owned = b"/usr/sbin/cake-autorated\0--calibrationd\0".to_vec();
+        oversized_owned.extend(std::iter::repeat_n(b'y', MAX_CMDLINE_BYTES + 32));
+        oversized_owned.push(0);
+        std::fs::write(root.join("202/cmdline"), oversized_owned).unwrap();
+        assert!(attest_no_competing_calibration_processes(&root, 999)
+            .unwrap_err()
+            .contains("exceeds the scheduler ownership bound"));
+
         std::fs::remove_dir_all(root).unwrap();
     }
 }

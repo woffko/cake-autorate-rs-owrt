@@ -8,6 +8,7 @@
 use super::autotune_apply::{
     NativeApplyAction, NativeApplyAuthorityIdentity, NativeApplyExecutionPlan,
     NATIVE_APPLY_MANIFEST_SCHEMA_VERSION, NATIVE_RAW_FALLBACK_APPLY_MANIFEST_SCHEMA_VERSION,
+    NATIVE_SHAPED_CAPACITY_FALLBACK_APPLY_MANIFEST_SCHEMA_VERSION,
 };
 use super::autotune_capture_policy::{AutotuneCapturePolicy, AutotuneCapturePolicyId};
 use super::autotune_managed_config::{
@@ -20,6 +21,7 @@ use ring::digest::{digest, SHA256};
 
 pub(crate) const NATIVE_BOOTSTRAP_APPLY_MANIFEST_SCHEMA_VERSION: u8 = 7;
 pub(crate) const NATIVE_RAW_FALLBACK_BOOTSTRAP_APPLY_MANIFEST_SCHEMA_VERSION: u8 = 8;
+pub(crate) const NATIVE_SHAPED_CAPACITY_BOOTSTRAP_APPLY_MANIFEST_SCHEMA_VERSION: u8 = 10;
 pub(crate) const NATIVE_BOOTSTRAP_APPLY_POLICY_SCHEMA_VERSION: u8 = 2;
 pub(crate) const MAX_NATIVE_BOOTSTRAP_APPLY_MANIFEST_BYTES: usize = 128 * 1024;
 pub(crate) const MAX_NATIVE_BOOTSTRAP_APPLY_UCI_MUTATIONS: usize = 128;
@@ -28,6 +30,8 @@ const NATIVE_BOOTSTRAP_REQUEST_SCHEMA_VERSION: u8 = 6;
 const BOOTSTRAP_CANDIDATE_DOMAIN_V3: &str = "cake-autorate-native-bootstrap-apply-candidate-v3";
 const RAW_FALLBACK_BOOTSTRAP_CANDIDATE_DOMAIN_V4: &str =
     "cake-autorate-native-bootstrap-raw-fallback-candidate-v4";
+const SHAPED_CAPACITY_BOOTSTRAP_CANDIDATE_DOMAIN_V5: &str =
+    "cake-autorate-native-bootstrap-shaped-capacity-candidate-v5";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NativeBootstrapApplyMode {
@@ -183,6 +187,11 @@ impl NativeBootstrapApplyPlan {
                 if value.schema_version == NATIVE_APPLY_MANIFEST_SCHEMA_VERSION => {}
             (NativeApplyAuthorityIdentity::RawFallbackV5(value), NativeApplyAction::DisableSqm)
                 if value.schema_version == NATIVE_RAW_FALLBACK_APPLY_MANIFEST_SCHEMA_VERSION => {}
+            (
+                NativeApplyAuthorityIdentity::ShapedCapacityFallbackV9(value),
+                NativeApplyAction::ApplySqm,
+            ) if value.schema_version
+                == NATIVE_SHAPED_CAPACITY_FALLBACK_APPLY_MANIFEST_SCHEMA_VERSION => {}
             _ => {
                 return Err(
                     "native bootstrap Apply source schema/action is inconsistent".to_string(),
@@ -282,6 +291,9 @@ impl NativeBootstrapApplyPlan {
             NativeApplyAuthorityIdentity::DirectionalRawFallbackV6(_) => {
                 unreachable!("directional raw fallback is rejected by bootstrap construction")
             }
+            NativeApplyAuthorityIdentity::ShapedCapacityFallbackV9(_) => {
+                NATIVE_SHAPED_CAPACITY_BOOTSTRAP_APPLY_MANIFEST_SCHEMA_VERSION
+            }
         }
     }
 
@@ -297,6 +309,9 @@ impl NativeBootstrapApplyPlan {
             }
             NativeApplyAuthorityIdentity::DirectionalRawFallbackV6(_) => {
                 unreachable!("directional raw fallback is rejected by bootstrap construction")
+            }
+            NativeApplyAuthorityIdentity::ShapedCapacityFallbackV9(_) => {
+                NativeBootstrapApplyMode::ShapedRuntime
             }
         }
     }
@@ -322,8 +337,33 @@ impl NativeBootstrapApplyPlan {
                 "directional raw fallback is not yet a bootstrap Apply authority".to_string(),
             );
         }
-        let NativeApplyAuthorityIdentity::ShapedV4(source_v4) = &self.source_authority else {
-            unreachable!("raw fallback returned above")
+        let (manifest_schema_version, source_key, source_schema_version) =
+            match &self.source_authority {
+                NativeApplyAuthorityIdentity::ShapedV4(value) => (
+                    NATIVE_BOOTSTRAP_APPLY_MANIFEST_SCHEMA_VERSION,
+                    "source_apply_v4",
+                    value.schema_version,
+                ),
+                NativeApplyAuthorityIdentity::ShapedCapacityFallbackV9(value) => (
+                    NATIVE_SHAPED_CAPACITY_BOOTSTRAP_APPLY_MANIFEST_SCHEMA_VERSION,
+                    "source_apply_v9",
+                    value.schema_version,
+                ),
+                NativeApplyAuthorityIdentity::RawFallbackV5(_)
+                | NativeApplyAuthorityIdentity::DirectionalRawFallbackV6(_) => {
+                    unreachable!("non-shaped fallback returned above")
+                }
+            };
+        let source_apply_json = format!(
+            "\"{}\":{{\"schema_version\":{},\"manifest_sha256\":{},\"source_review_sha256\":{},\"candidate_id\":{}}}",
+            source_key,
+            source_schema_version,
+            json_string(&self.identity.source_apply_v4_manifest_sha256),
+            json_string(&self.identity.source_review_sha256),
+            json_string(&self.identity.source_candidate_id),
+        );
+        if source_schema_version != self.identity.source_apply_schema_version {
+            return Err("native bootstrap shaped source schema changed".to_string());
         };
         let request = &self.source_apply.request;
         let managed_sqm_section = request.managed_sqm_section.as_deref().ok_or_else(|| {
@@ -345,17 +385,14 @@ impl NativeBootstrapApplyPlan {
                 "\"config_fingerprint\":{},\"sqm_fingerprint\":{},",
                 "\"absence_baseline\":{{\"target_ifindex\":{},",
                 "\"kernel_topology_fingerprint\":{},\"kernel_namespace_seed\":{}}},",
-                "\"source_request\":{{\"schema_version\":{},\"sha256\":{}}},",
-                "\"source_apply_v4\":{{\"schema_version\":{},",
-                "\"manifest_sha256\":{},\"source_review_sha256\":{},",
-                "\"candidate_id\":{}}},",
+                "\"source_request\":{{\"schema_version\":{},\"sha256\":{}}},{},",
                 "\"bootstrap_policy\":{{\"schema_version\":{},\"sha256\":{},",
                 "\"value\":{}}},",
                 "\"managed_config\":{{\"schema_version\":{},\"sha256\":{},",
                 "\"action_count\":{},\"value\":{}}},",
                 "\"candidate_id\":{}}}\n"
             ),
-            NATIVE_BOOTSTRAP_APPLY_MANIFEST_SCHEMA_VERSION,
+            manifest_schema_version,
             json_string(&self.identity.option_id),
             json_string(&self.identity.job_id),
             json_string(&self.identity.worker_run_id),
@@ -371,10 +408,7 @@ impl NativeBootstrapApplyPlan {
             json_string(&self.identity.kernel_namespace_seed),
             NATIVE_BOOTSTRAP_REQUEST_SCHEMA_VERSION,
             json_string(&self.identity.request_sha256),
-            source_v4.schema_version,
-            json_string(&self.identity.source_apply_v4_manifest_sha256),
-            json_string(&self.identity.source_review_sha256),
-            json_string(&self.identity.source_candidate_id),
+            source_apply_json,
             NATIVE_BOOTSTRAP_APPLY_POLICY_SCHEMA_VERSION,
             json_string(&self.identity.bootstrap_policy_sha256),
             policy_json,
@@ -549,6 +583,9 @@ fn validate_source_apply(source: &NativeApplyExecutionPlan) -> Result<(), String
             ) | (
                 NativeApplyAuthorityIdentity::RawFallbackV5(_),
                 NativeApplyAction::DisableSqm,
+            ) | (
+                NativeApplyAuthorityIdentity::ShapedCapacityFallbackV9(_),
+                NativeApplyAction::ApplySqm,
             )
         )
     {
@@ -580,6 +617,10 @@ fn composite_candidate_id(
         NativeApplyAuthorityIdentity::DirectionalRawFallbackV6(_) => {
             unreachable!("directional raw fallback is rejected by bootstrap construction")
         }
+        NativeApplyAuthorityIdentity::ShapedCapacityFallbackV9(_) => (
+            SHAPED_CAPACITY_BOOTSTRAP_CANDIDATE_DOMAIN_V5,
+            "source_apply_v9_manifest_sha256",
+        ),
     };
     let seed = format!(
         concat!(
@@ -677,7 +718,7 @@ pub(crate) mod tests {
     use crate::operations::autotune_apply::{
         NativeApplyAcknowledgement, NativeApplyArtifactDigests, NativeApplyDirectionInput,
         NativeApplyDirectionMode, NativeApplyManifestInput, NativeRawFallbackApplyManifestInput,
-        NativeSqmDirectionMode,
+        NativeShapedCapacityFallbackApplyManifestInput, NativeSqmDirectionMode,
     };
     use crate::operations::protocol::{
         CalibrationStrategy, OperationIdentity, OperationRouteIdentity, OperationRouteMode,
@@ -888,6 +929,69 @@ pub(crate) mod tests {
         bootstrap_plan(source_apply(&request(), Topology::Both), policy(90)).unwrap()
     }
 
+    #[test]
+    fn shaped_capacity_fallback_promotes_to_hard_capped_bootstrap_schema_v10() {
+        let request = request();
+        let proposal = proposal();
+        let source = NativeApplyExecutionPlan::from_verified_shaped_capacity_fallback(
+            NativeShapedCapacityFallbackApplyManifestInput {
+                option_id: "capacity_only_shaped",
+                request: &request,
+                worker_run_id: &"66".repeat(16),
+                review_digest: REVIEW_DIGEST,
+                coordinator_boot_id: "boot-id",
+                coordinator_generation: &"77".repeat(16),
+                proposal: &proposal,
+                selected_dl_kbps: proposal.download.base_kbps,
+                selected_ul_kbps: proposal.upload.base_kbps,
+                required_acknowledgements: &[
+                    NativeApplyAcknowledgement::LoadedLatencyUnobservable,
+                    NativeApplyAcknowledgement::ShapedValidationIncomplete,
+                ],
+                proposal_digest: &"88".repeat(32),
+                fallback_digest: &"99".repeat(32),
+            },
+        )
+        .unwrap();
+        let plan = bootstrap_plan(source, policy(90)).unwrap();
+        assert_eq!(
+            plan.manifest_schema_version(),
+            NATIVE_SHAPED_CAPACITY_BOOTSTRAP_APPLY_MANIFEST_SCHEMA_VERSION
+        );
+        assert_eq!(plan.mode(), NativeBootstrapApplyMode::ShapedRuntime);
+        assert_eq!(
+            plan.identity.source_apply_schema_version,
+            NATIVE_SHAPED_CAPACITY_FALLBACK_APPLY_MANIFEST_SCHEMA_VERSION
+        );
+        let manifest = String::from_utf8(plan.canonical_manifest_bytes().unwrap()).unwrap();
+        assert!(manifest.starts_with("{\"native_apply_manifest_schema_version\":10,"));
+        assert!(manifest.contains("\"source_apply_v9\":"));
+        assert_eq!(
+            plan.managed_config()
+                .cake()
+                .scalar_value("adaptive_ceiling_dl_safe_kbps"),
+            Some("0")
+        );
+        assert_eq!(
+            plan.managed_config()
+                .cake()
+                .scalar_value("adaptive_ceiling_ul_safe_kbps"),
+            Some("0")
+        );
+        assert_eq!(
+            plan.managed_config()
+                .cake()
+                .scalar_value("adaptive_ceiling_dl_evidence"),
+            Some("legacy_unverified")
+        );
+        assert_eq!(
+            plan.managed_config()
+                .cake()
+                .scalar_value("adaptive_ceiling_ul_evidence"),
+            Some("legacy_unverified")
+        );
+    }
+
     pub(crate) fn fixture_raw_fallback_plan() -> NativeBootstrapApplyPlan {
         bootstrap_plan(source_apply(&request(), Topology::Off), policy(90)).unwrap()
     }
@@ -915,10 +1019,10 @@ pub(crate) mod tests {
         let bytes = plan.canonical_manifest_bytes().unwrap();
         let repeated = plan.canonical_manifest_bytes().unwrap();
         let text = String::from_utf8(bytes.clone()).unwrap();
-        assert_eq!(bytes.len(), 10_757);
+        assert_eq!(bytes.len(), 10_691);
         assert_eq!(
             sha256_hex(&bytes),
-            "4921f4393188c528ab3dfa581919f99b0b0c3bfe1356727d9f6fb2d6250d2e1f"
+            "82044ad361bcea612cf70366a120f5bdc6d8ee2989ac4e425fe523f57644b17c"
         );
 
         assert_eq!(bytes, repeated);
@@ -943,7 +1047,7 @@ pub(crate) mod tests {
             "\"kernel_namespace_seed\":\"{}\"",
             "ee".repeat(16)
         )));
-        assert_eq!(plan.identity.managed_config_action_count, 125);
+        assert_eq!(plan.identity.managed_config_action_count, 124);
         assert!(usize::from(plan.identity.managed_config_action_count) > 96);
         assert!(
             usize::from(plan.identity.managed_config_action_count)

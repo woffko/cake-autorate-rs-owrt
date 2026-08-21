@@ -12,11 +12,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SNAPSHOT_HEADER: &str = "cake-autorate-rating-runtime\t5";
-const PREVIOUS_SNAPSHOT_HEADER: &str = "cake-autorate-rating-runtime\t4";
-const LEGACY_SNAPSHOT_HEADER: &str = "cake-autorate-rating-runtime\t3";
 const TERMINAL_HEADER: &str = "cake-autorate-rating-terminal\t2";
-#[cfg(test)]
-const LEGACY_TERMINAL_HEADER: &str = "cake-autorate-rating-terminal\t1";
 pub const RATING_EVIDENCE_CONTRACT: &str = QUALITY_GRADE_METHOD;
 const MAX_SNAPSHOT_BYTES: usize = 8 * 1024;
 const MAX_REQUEST_BYTES: usize = 8 * 1024;
@@ -26,14 +22,12 @@ const MAX_AUTOMATIC_DIRECTION_RUNS: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RatingEvidenceContract {
-    LegacyTransportOnly,
     WorstOfDirectionBoundIcmpAndTransport,
 }
 
 impl RatingEvidenceContract {
     fn as_str(self) -> &'static str {
         match self {
-            Self::LegacyTransportOnly => "legacy_transport_only",
             Self::WorstOfDirectionBoundIcmpAndTransport => RATING_EVIDENCE_CONTRACT,
         }
     }
@@ -75,8 +69,7 @@ pub struct RatingRuntimeSnapshot {
     pub cake_dl_kbps: f64,
     pub cake_ul_kbps: f64,
     /// Exact kinds observed by the instance controller. `None` means the
-    /// direction is unshaped or the kind has not yet been attested; consumers
-    /// must never infer legacy `None` as single-queue CAKE.
+    /// direction is unshaped or the kind has not yet been attested.
     pub download_qdisc_kind: Option<RuntimeQdiscKind>,
     pub upload_qdisc_kind: Option<RuntimeQdiscKind>,
     pub reference_dl_kbps: f64,
@@ -335,30 +328,9 @@ impl RatingRuntimeSnapshot {
     }
 
     pub fn encode(&self) -> Result<String, String> {
-        self.encode_for_schema(5)
-    }
-
-    fn encode_for_schema(&self, schema: u8) -> Result<String, String> {
-        if !matches!(schema, 3 | 4 | 5) {
-            return Err("unsupported rating runtime snapshot schema".to_string());
-        }
         self.validate()?;
-        if schema == 3 && (self.download_qdisc_kind.is_some() || self.upload_qdisc_kind.is_some()) {
-            return Err("legacy rating runtime snapshot cannot represent qdisc kinds".to_string());
-        }
-        if schema < 5 && self.evidence_contract != RatingEvidenceContract::LegacyTransportOnly {
-            return Err(
-                "legacy rating runtime snapshot cannot claim the current evidence contract"
-                    .to_string(),
-            );
-        }
-        if schema == 5
-            && self.evidence_contract
-                != RatingEvidenceContract::WorstOfDirectionBoundIcmpAndTransport
-        {
-            return Err(
-                "current rating runtime snapshot has a legacy evidence contract".to_string(),
-            );
+        if self.evidence_contract != RatingEvidenceContract::WorstOfDirectionBoundIcmpAndTransport {
+            return Err("rating runtime snapshot has an unsupported evidence contract".to_string());
         }
         let empty = RatingResultSnapshot {
             grade: String::new(),
@@ -405,12 +377,10 @@ impl RatingRuntimeSnapshot {
             ),
             ("required_samples", self.required_samples.to_string()),
         ];
-        if schema >= 5 {
-            fields.push((
-                "evidence_contract",
-                self.evidence_contract.as_str().to_string(),
-            ));
-        }
+        fields.push((
+            "evidence_contract",
+            self.evidence_contract.as_str().to_string(),
+        ));
         fields.extend([
             ("dl_samples", self.dl_samples.to_string()),
             ("ul_samples", self.ul_samples.to_string()),
@@ -419,18 +389,16 @@ impl RatingRuntimeSnapshot {
             ("cake_dl_kbps", finite_text(self.cake_dl_kbps)),
             ("cake_ul_kbps", finite_text(self.cake_ul_kbps)),
         ]);
-        if schema >= 4 {
-            fields.extend([
-                (
-                    "download_qdisc_kind",
-                    optional_qdisc_kind(self.download_qdisc_kind),
-                ),
-                (
-                    "upload_qdisc_kind",
-                    optional_qdisc_kind(self.upload_qdisc_kind),
-                ),
-            ]);
-        }
+        fields.extend([
+            (
+                "download_qdisc_kind",
+                optional_qdisc_kind(self.download_qdisc_kind),
+            ),
+            (
+                "upload_qdisc_kind",
+                optional_qdisc_kind(self.upload_qdisc_kind),
+            ),
+        ]);
         fields.extend([
             ("reference_dl_kbps", finite_text(self.reference_dl_kbps)),
             ("reference_ul_kbps", finite_text(self.reference_ul_kbps)),
@@ -476,12 +444,7 @@ impl RatingRuntimeSnapshot {
             ("current_dl_samples", current.dl_samples.to_string()),
             ("current_ul_samples", current.ul_samples.to_string()),
         ]);
-        let mut output = String::from(match schema {
-            3 => LEGACY_SNAPSHOT_HEADER,
-            4 => PREVIOUS_SNAPSHOT_HEADER,
-            5 => SNAPSHOT_HEADER,
-            _ => unreachable!(),
-        });
+        let mut output = String::from(SNAPSHOT_HEADER);
         output.push('\n');
         for (name, value) in fields {
             if value.contains(['\n', '\r', '=']) {
@@ -503,12 +466,9 @@ impl RatingRuntimeSnapshot {
             return Err("rating runtime snapshot is empty, oversized, or truncated".to_string());
         }
         let mut lines = input.lines();
-        let schema = match lines.next() {
-            Some(SNAPSHOT_HEADER) => 5,
-            Some(PREVIOUS_SNAPSHOT_HEADER) => 4,
-            Some(LEGACY_SNAPSHOT_HEADER) => 3,
-            _ => return Err("unsupported rating runtime snapshot header".to_string()),
-        };
+        if lines.next() != Some(SNAPSHOT_HEADER) {
+            return Err("unsupported rating runtime snapshot header".to_string());
+        }
         let updated_unix_ms = number(&mut lines, "updated_unix_ms")?;
         let capture_observed_unix_ms = number(&mut lines, "capture_observed_unix_ms")?;
         let runtime_generation = number(&mut lines, "runtime_generation")?;
@@ -522,15 +482,11 @@ impl RatingRuntimeSnapshot {
         let baseline_samples = number(&mut lines, "baseline_samples")?;
         let baseline_required_samples = number(&mut lines, "baseline_required_samples")?;
         let required_samples = number(&mut lines, "required_samples")?;
-        let evidence_contract = if schema >= 5 {
-            match field(&mut lines, "evidence_contract")?.as_str() {
-                RATING_EVIDENCE_CONTRACT => {
-                    RatingEvidenceContract::WorstOfDirectionBoundIcmpAndTransport
-                }
-                _ => return Err("rating runtime evidence contract is unsupported".to_string()),
+        let evidence_contract = match field(&mut lines, "evidence_contract")?.as_str() {
+            RATING_EVIDENCE_CONTRACT => {
+                RatingEvidenceContract::WorstOfDirectionBoundIcmpAndTransport
             }
-        } else {
-            RatingEvidenceContract::LegacyTransportOnly
+            _ => return Err("rating runtime evidence contract is unsupported".to_string()),
         };
         let dl_samples = number(&mut lines, "dl_samples")?;
         let ul_samples = number(&mut lines, "ul_samples")?;
@@ -538,20 +494,14 @@ impl RatingRuntimeSnapshot {
         let ul_achieved_kbps = decimal(&mut lines, "ul_achieved_kbps")?;
         let cake_dl_kbps = decimal(&mut lines, "cake_dl_kbps")?;
         let cake_ul_kbps = decimal(&mut lines, "cake_ul_kbps")?;
-        let (download_qdisc_kind, upload_qdisc_kind) = if schema >= 4 {
-            (
-                parse_optional_qdisc_kind(
-                    "download_qdisc_kind",
-                    &field(&mut lines, "download_qdisc_kind")?,
-                )?,
-                parse_optional_qdisc_kind(
-                    "upload_qdisc_kind",
-                    &field(&mut lines, "upload_qdisc_kind")?,
-                )?,
-            )
-        } else {
-            (None, None)
-        };
+        let download_qdisc_kind = parse_optional_qdisc_kind(
+            "download_qdisc_kind",
+            &field(&mut lines, "download_qdisc_kind")?,
+        )?;
+        let upload_qdisc_kind = parse_optional_qdisc_kind(
+            "upload_qdisc_kind",
+            &field(&mut lines, "upload_qdisc_kind")?,
+        )?;
         let reference_dl_kbps = decimal(&mut lines, "reference_dl_kbps")?;
         let reference_ul_kbps = decimal(&mut lines, "reference_ul_kbps")?;
         let capture_active = boolean(&mut lines, "capture_active")?;
@@ -626,7 +576,7 @@ impl RatingRuntimeSnapshot {
             current,
         };
         snapshot.validate()?;
-        if snapshot.encode_for_schema(schema)? != input {
+        if snapshot.encode()? != input {
             return Err("rating runtime snapshot is not canonically encoded".to_string());
         }
         Ok(snapshot)
@@ -1925,51 +1875,6 @@ mod tests {
         }
     }
 
-    fn frozen_v3_snapshot() -> &'static str {
-        "cake-autorate-rating-runtime\t3\n\
-updated_unix_ms=1785568000000\n\
-capture_observed_unix_ms=1785568000000\n\
-runtime_generation=17\n\
-uplink_state=ACTIVE\n\
-route_active=1\n\
-route_test_ready=1\n\
-sqm_runtime_managed=1\n\
-sqm_runtime_healthy=1\n\
-transport_probe_trusted=1\n\
-baseline_ready=1\n\
-baseline_samples=20\n\
-baseline_required_samples=20\n\
-required_samples=20\n\
-dl_samples=20\n\
-ul_samples=21\n\
-dl_achieved_kbps=500000.000\n\
-ul_achieved_kbps=100000.000\n\
-cake_dl_kbps=600000.000\n\
-cake_ul_kbps=120000.000\n\
-reference_dl_kbps=600000.000\n\
-reference_ul_kbps=120000.000\n\
-capture_active=1\n\
-capture_job_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
-capture_generation=7\n\
-finalized_job_id=\n\
-finalized_generation=0\n\
-finalized_outcome=\n\
-capture_phase=AUTO\n\
-capture_contaminated=0\n\
-current_capture_job_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
-current_capture_generation=7\n\
-current_present=1\n\
-current_grade=A+\n\
-current_increase_ms=4.250\n\
-current_started_unix_ms=1785568000000\n\
-current_partial=0\n\
-current_incomplete=0\n\
-current_dl_grade=A+\n\
-current_ul_grade=A\n\
-current_dl_samples=20\n\
-current_ul_samples=21\n"
-    }
-
     #[test]
     fn rating_runtime_snapshot_round_trips_canonically() {
         let encoded = snapshot().encode().unwrap();
@@ -1986,47 +1891,6 @@ current_ul_samples=21\n"
             RatingRuntimeSnapshot::decode(&encoded_cake_mq).unwrap(),
             cake_mq
         );
-    }
-
-    #[test]
-    fn frozen_v3_snapshot_round_trips_without_inventing_qdisc_kinds() {
-        let mut expected = snapshot();
-        expected.evidence_contract = RatingEvidenceContract::LegacyTransportOnly;
-        expected.download_qdisc_kind = None;
-        expected.upload_qdisc_kind = None;
-        let decoded = RatingRuntimeSnapshot::decode(frozen_v3_snapshot()).unwrap();
-        assert_eq!(decoded, expected);
-        assert_eq!(decoded.download_qdisc_kind, None);
-        assert_eq!(decoded.upload_qdisc_kind, None);
-        assert_eq!(decoded.encode_for_schema(3).unwrap(), frozen_v3_snapshot());
-        assert_eq!(expected.encode_for_schema(3).unwrap(), frozen_v3_snapshot());
-
-        assert!(decoded.encode().is_err());
-        assert!(snapshot().encode_for_schema(3).is_err());
-    }
-
-    #[test]
-    fn previous_v4_snapshot_is_readable_but_cannot_supply_current_rating_evidence() {
-        let encoded = frozen_v3_snapshot()
-            .replacen(LEGACY_SNAPSHOT_HEADER, PREVIOUS_SNAPSHOT_HEADER, 1)
-            .replacen(
-                "cake_ul_kbps=120000.000\nreference_dl_kbps=",
-                "cake_ul_kbps=120000.000\ndownload_qdisc_kind=cake\nupload_qdisc_kind=cake\nreference_dl_kbps=",
-                1,
-            );
-        let decoded = RatingRuntimeSnapshot::decode(&encoded).unwrap();
-        assert_eq!(
-            decoded.evidence_contract,
-            RatingEvidenceContract::LegacyTransportOnly
-        );
-        assert_eq!(decoded.encode_for_schema(4).unwrap(), encoded);
-        assert!(decoded.encode().is_err());
-        assert!(owned_complete_result(
-            &decoded,
-            &decoded.current_capture_job_id,
-            decoded.current_capture_generation,
-        )
-        .is_none());
     }
 
     #[test]
@@ -2097,7 +1961,7 @@ current_ul_samples=21\n"
         fs::write(&path, snapshot().encode().unwrap()).unwrap();
 
         let mut invalid = snapshot();
-        invalid.capture_job_id = "legacy-1234".to_string();
+        invalid.capture_job_id = "invalid-1234".to_string();
         let error = invalid.write_atomic(&path).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(!path.exists());
@@ -2399,10 +2263,6 @@ current_ul_samples=21\n"
         value.current.as_mut().unwrap().started_unix_ms = u64::MAX;
         value.current_capture_job_id = "b".repeat(32);
         assert!(owned_complete_result(&value, &job_id, generation).is_none());
-
-        value = snapshot();
-        value.evidence_contract = RatingEvidenceContract::LegacyTransportOnly;
-        assert!(owned_complete_result(&value, &job_id, generation).is_none());
     }
 
     #[test]
@@ -2447,16 +2307,19 @@ current_ul_samples=21\n"
     }
 
     #[test]
-    fn v2_snapshot_header_is_rejected_explicitly() {
-        let old = frozen_v3_snapshot().replacen(
-            LEGACY_SNAPSHOT_HEADER,
-            "cake-autorate-rating-runtime\t2",
-            1,
-        );
-        assert_eq!(
-            RatingRuntimeSnapshot::decode(&old),
-            Err("unsupported rating runtime snapshot header".to_string())
-        );
+    fn retired_snapshot_headers_are_rejected_explicitly() {
+        let current = snapshot().encode().unwrap();
+        for version in [2, 3, 4] {
+            let retired = current.replacen(
+                SNAPSHOT_HEADER,
+                &format!("cake-autorate-rating-runtime\t{version}"),
+                1,
+            );
+            assert_eq!(
+                RatingRuntimeSnapshot::decode(&retired),
+                Err("unsupported rating runtime snapshot header".to_string())
+            );
+        }
     }
 
     #[test]
@@ -2531,7 +2394,7 @@ current_ul_samples=21\n"
     }
 
     #[test]
-    fn legacy_terminal_header_cannot_be_relabelled_as_current_combined_evidence() {
+    fn retired_terminal_header_cannot_be_relabelled_as_current_combined_evidence() {
         let job_id = "0123456789abcdef0123456789abcdef";
         let worker_run_id = "abcdef0123456789abcdef0123456789";
         let encoded = RatingTerminal::Complete(RatingResultSnapshot {
@@ -2547,9 +2410,9 @@ current_ul_samples=21\n"
         })
         .encode(job_id, worker_run_id)
         .unwrap();
-        let legacy = encoded.replacen(TERMINAL_HEADER, LEGACY_TERMINAL_HEADER, 1);
+        let retired = encoded.replacen(TERMINAL_HEADER, "cake-autorate-rating-terminal\t1", 1);
         assert_eq!(
-            RatingTerminalRecord::decode(&legacy),
+            RatingTerminalRecord::decode(&retired),
             Err("rating terminal header is unsupported".to_string())
         );
     }

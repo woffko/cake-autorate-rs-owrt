@@ -3,119 +3,33 @@
 START=97
 STOP=4
 USE_PROCD=1
-EXTRA_COMMANDS="recover_interface native_apply_restart_instance native_apply_stop_instance"
-EXTRA_HELP="\trecover_interface <mwan3-member>\tReport an unexpectedly absent member controller
-\tnative_apply_restart_instance <instance> <sqm-section> <target-interface>\tInternal native Apply selected-instance restart
-\tnative_apply_stop_instance <instance> <sqm-section> <target-interface>\tInternal native Apply selected-instance containment"
+# @variant full begin
+EXTRA_COMMANDS="native_apply_register_instance"
+EXTRA_HELP="\tnative_apply_register_instance <instance>\tInternal native Apply procd registration bridge"
+# @variant full end
+# @variant lite begin
+EXTRA_COMMANDS=""
+EXTRA_HELP=""
+# @variant lite end
 
 CONFIG="cake-autorate"
 SQM_CONFIG="sqm"
 DAEMON="/usr/sbin/cake-autorated"
+# @variant full begin
 RUNTIME_LOCK_LIB="${CAKE_AUTORATE_RUNTIME_LOCK_LIB:-/usr/libexec/cake-autorate-rs/runtime-lock}"
 RUNTIME_LOCK_AVAILABLE=0
-APPLY_GUARD="${CAKE_AUTORATE_APPLY_GUARD:-/usr/libexec/cake-autorate-rs/apply-guard}"
-APPLY_GUARD_SUPERVISOR="${CAKE_AUTORATE_APPLY_GUARD_SUPERVISOR:-/etc/init.d/cake-autorate-apply-guard}"
-TRAFFIC_CLASSIFIER="${CAKE_AUTORATE_TRAFFIC_CLASSIFIER:-/usr/libexec/cake-autorate-rs/traffic-classifier}"
-SQM_RUNNER="${CAKE_AUTORATE_SQM_RUNNER:-/usr/lib/sqm/run.sh}"
-TC_BIN="${CAKE_AUTORATE_TC_BIN:-tc}"
-SERVICE_APPLY_GUARD_VERIFIED=0
-SERVICE_APPLY_GUARD_TOKEN=""
+# @variant full end
+# @variant full begin
 SERVICE_RUNTIME_LOCK_HELD=0
 SERVICE_RUNTIME_LOCK_BORROWED=0
 SERVICE_RUNTIME_STOP_RELEASE_PENDING=0
-SQM_MANAGED=0
-SQM_CONFIG_CHANGED=0
-SQM_SYNC_FAILED=0
-CAKE_CONFIG_CHANGED=0
-SQM_INTERFACES=""
-SQM_INGRESS_INTERFACES=""
-SQM_CONFLICT_FILE="${CAKE_AUTORATE_SQM_CONFLICT_FILE:-/var/run/cake-autorate/sqm-conflicts}"
-RUNTIME_ROOT="${CAKE_AUTORATE_RUN_ROOT:-/var/run/cake-autorate}"
-NATIVE_APPLY_RECOVERY_ROOT="${CAKE_AUTORATE_NATIVE_APPLY_RECOVERY_ROOT:-/etc/cake-autorate-rs/native-apply-recovery}"
-BRIDGER_CONFIG_CHANGED=0
-
+# @variant full end
+# @variant full begin
 if [ -r "$RUNTIME_LOCK_LIB" ]; then
 	# shellcheck source=/usr/libexec/cake-autorate-rs/runtime-lock
 	. "$RUNTIME_LOCK_LIB"
 	RUNTIME_LOCK_AVAILABLE=1
 fi
-
-service_apply_guard_markers_present() {
-	{
-		uci -q show "$CONFIG" 2>/dev/null
-		uci -q show "$SQM_CONFIG" 2>/dev/null
-	} | grep -q '\._autotune_apply_'
-}
-
-service_apply_guard_preflight() {
-	local operation="$1"
-	local output recovery_output
-
-	[ "$SERVICE_APPLY_GUARD_VERIFIED" -eq 0 ] || return 0
-	service_apply_guard_markers_present || return 0
-	if [ ! -x "$APPLY_GUARD" ]; then
-		logger -t cake-autorate "refusing to $operation: a Full Auto-Tune apply marker exists but its apply-guard helper is unavailable"
-		return 1
-	fi
-	if ! output="$($APPLY_GUARD verify-init 2>&1)"; then
-		if recovery_output="$($APPLY_GUARD recover-stale 2>&1)"; then
-			case "$recovery_output" in
-				*'"state":"recovered"'*|*'"state":"clear"'*)
-					service_apply_guard_markers_present && {
-						logger -t cake-autorate "refusing to $operation: stale Full Auto-Tune recovery left transaction markers"
-						return 1
-					}
-					logger -t cake-autorate "recovered stale Full Auto-Tune transaction metadata before $operation: $recovery_output"
-					return 0
-					;;
-			esac
-		fi
-		logger -t cake-autorate "refusing to $operation before any SQM/service mutation: Full Auto-Tune apply guard rejected the transaction: $output; recovery: ${recovery_output:-unavailable}"
-		return 1
-	fi
-	case "$output" in
-		*'"state":"verified"'*) ;;
-		*)
-			logger -t cake-autorate "refusing to $operation before any SQM/service mutation: Full Auto-Tune apply guard returned an invalid response"
-			return 1
-			;;
-	esac
-	SERVICE_APPLY_GUARD_VERIFIED=1
-	SERVICE_APPLY_GUARD_TOKEN="$(printf '%s\n' "$output" |
-		sed -n 's/.*"token":"\([0-9a-f][0-9a-f]*\)".*/\1/p')"
-	case "$SERVICE_APPLY_GUARD_TOKEN" in
-		????????????????????????????????????????????????????????????????)
-			case "$SERVICE_APPLY_GUARD_TOKEN" in *[!0-9a-f]*)
-				logger -t cake-autorate "refusing to $operation: Full Auto-Tune apply guard returned an unsafe token"
-				return 1
-				;;
-			esac
-			;;
-		*)
-			logger -t cake-autorate "refusing to $operation: Full Auto-Tune apply guard omitted its transaction token"
-			return 1
-			;;
-	esac
-	return 0
-}
-
-start_apply_guard_supervisor() {
-	local token="$SERVICE_APPLY_GUARD_TOKEN"
-
-	[ "$SERVICE_APPLY_GUARD_VERIFIED" -eq 1 ] && [ -n "$token" ] || return 0
-	[ -x "$APPLY_GUARD_SUPERVISOR" ] || {
-		logger -t cake-autorate "refusing guarded apply: the independent apply-guard supervisor service is unavailable"
-		return 1
-	}
-	# The supervisor must not be an instance of this service. rpcd rollback
-	# reloads cake-autorate itself; a child instance would be killed before it
-	# could prove the rollback and publish the terminal receipt.
-	CAKE_AUTORATE_APPLY_GUARD="$APPLY_GUARD" \
-		"$APPLY_GUARD_SUPERVISOR" start >/dev/null 2>&1 || {
-		logger -t cake-autorate "refusing guarded apply: unable to start the independent apply-guard supervisor"
-		return 1
-	}
-}
 
 service_runtime_lock_acquire_or_exit() {
 	local operation="$1"
@@ -170,971 +84,168 @@ service_runtime_lock_release_or_exit() {
 	SERVICE_RUNTIME_LOCK_HELD=0
 	SERVICE_RUNTIME_LOCK_BORROWED=0
 }
-
-set_cake_option_if_changed() {
-	local section="$1"
-	local option="$2"
-	local value="$3"
-	local current
-
-	config_get current "$section" "$option"
-	[ "$current" = "$value" ] && return 0
-
-	uci set "$CONFIG.$section.$option=$value"
-	CAKE_CONFIG_CHANGED=1
-}
-
-set_cake_option_if_empty() {
-	local section="$1"
-	local option="$2"
-	local value="$3"
-	local current
-
-	[ -n "$value" ] || return 0
-
-	config_get current "$section" "$option"
-	[ -n "$current" ] && return 0
-
-	uci set "$CONFIG.$section.$option=$value"
-	CAKE_CONFIG_CHANGED=1
-}
-
-half_rate_kbps() {
-	local value="$1"
-
-	case "$value" in
-		''|*[!0-9]*)
-			printf '%s\n' "$value"
-			;;
-		*)
-			printf '%s\n' $(( (value + 1) / 2 ))
-			;;
-	esac
-}
-
-resolve_interface_device() {
-	local name="$1"
-	local status dev
-
-	[ -n "$name" ] || return 1
-
-	if [ -e "/sys/class/net/$name" ]; then
-		printf '%s\n' "$name"
-		return 0
-	fi
-
-	status="$(ubus call network.interface."$name" status 2>/dev/null)"
-	if [ -n "$status" ] && command -v jsonfilter >/dev/null 2>&1; then
-		dev="$(printf '%s\n' "$status" | jsonfilter -e '@.l3_device' 2>/dev/null)"
-		[ -n "$dev" ] || dev="$(printf '%s\n' "$status" | jsonfilter -e '@.device' 2>/dev/null)"
-
-		if [ -n "$dev" ] && [ -e "/sys/class/net/$dev" ]; then
-			printf '%s\n' "$dev"
-			return 0
-		fi
-	fi
-
-	printf '%s\n' "$name"
-}
-
-sync_interface_preset_instance() {
-	local section="$1"
-	local auto wan
-
-	config_get_bool auto "$section" auto_interface_preset 1
-	[ "$auto" -eq 1 ] || return 0
-
-	config_get wan "$section" wan_if
-	[ -n "$wan" ] || config_get wan "$section" sqm_interface
-	[ -n "$wan" ] || config_get wan "$section" ul_if
-	[ -n "$wan" ] || return 0
-	wan="$(resolve_interface_device "$wan")"
-
-	set_cake_option_if_changed "$section" wan_if "$wan"
-	set_cake_option_if_changed "$section" sqm_interface "$wan"
-	set_cake_option_if_changed "$section" ul_if "$wan"
-	set_cake_option_if_changed "$section" dl_if "ifb4$wan"
-}
-
-sync_rate_preset_instance() {
-	local section="$1"
-	local manual dl ul
-
-	config_get_bool manual "$section" manual_rate_limits 0
-	[ "$manual" -eq 0 ] || return 0
-
-	config_get dl "$section" sqm_download
-	[ -n "$dl" ] || config_get dl "$section" base_dl_shaper_rate_kbps
-	if [ -n "$dl" ]; then
-		set_cake_option_if_empty "$section" base_dl_shaper_rate_kbps "$dl"
-		set_cake_option_if_empty "$section" max_dl_shaper_rate_kbps "$dl"
-		set_cake_option_if_empty "$section" min_dl_shaper_rate_kbps "$(half_rate_kbps "$dl")"
-	fi
-
-	config_get ul "$section" sqm_upload
-	[ -n "$ul" ] || config_get ul "$section" base_ul_shaper_rate_kbps
-	if [ -n "$ul" ]; then
-		set_cake_option_if_empty "$section" base_ul_shaper_rate_kbps "$ul"
-		set_cake_option_if_empty "$section" max_ul_shaper_rate_kbps "$ul"
-		set_cake_option_if_empty "$section" min_ul_shaper_rate_kbps "$(half_rate_kbps "$ul")"
-	fi
-}
-
-migrate_legacy_route_instance() {
-	local section="$1"
-	local mode member prefix parsed
-
-	config_get mode "$section" route_mode auto
-	config_get member "$section" mwan3_member
-	config_get prefix "$section" ping_prefix_string
-	[ -n "$prefix" ] || return 0
-
-	parsed="$(printf '%s\n' "$prefix" | awk '
-		NF == 4 && $1 == "mwan3" && $2 == "use" && $4 == "exec" &&
-		$3 ~ /^[A-Za-z0-9_.:@-]+$/ { print $3 }')"
-	[ -n "$parsed" ] || return 0
-
-	if [ "$mode" = auto ] && [ -z "$member" ]; then
-		set_cake_option_if_changed "$section" route_mode mwan3
-		set_cake_option_if_changed "$section" mwan3_member "$parsed"
-		uci -q delete "$CONFIG.$section.ping_prefix_string"
-		CAKE_CONFIG_CHANGED=1
-		logger -t cake-autorate "migrated legacy mwan3 ping prefix for instance '$section' to structured member '$parsed'"
-	elif [ "$mode" = mwan3 ] && [ "$member" = "$parsed" ]; then
-		uci -q delete "$CONFIG.$section.ping_prefix_string"
-		CAKE_CONFIG_CHANGED=1
-	fi
-}
-
-canonical_traffic_autotune_profile() {
-	case "$1" in
-		gaming|gaming_extreme|gaming-extreme|extreme_gaming) printf 'gaming\n' ;;
-		fair) printf 'fair\n' ;;
-		variable_link|variable-link|variable) printf 'variable_link\n' ;;
-		best_overall|best-overall|balanced|'') printf 'best_overall\n' ;;
-		*) return 1 ;;
-	esac
-}
-
-migrate_traffic_profile_instance() {
-	local section="$1"
-	local migrated configured autotune defaults_profile defaults_option defaults_enabled
-	local rule rule_instance rule_profile raw_rule_profile
-
-	config_get migrated "$section" traffic_profile_migrated
-	[ "$migrated" = 1 ] && return 0
-	config_get configured "$section" traffic_profile
-	autotune="$(canonical_traffic_autotune_profile "$(uci -q get "$CONFIG.$section.autotune_profile")")" ||
-		autotune=best_overall
-	defaults_profile="$autotune"
-	[ "$defaults_profile" = variable_link ] && defaults_profile=best_overall
-	defaults_option="traffic_defaults_$defaults_profile"
-	defaults_enabled="$(uci -q get "$CONFIG.$section.$defaults_option")"
-
-	if [ "$defaults_enabled" = 0 ] && { [ -z "$configured" ] || [ "$configured" = custom ]; }; then
-		[ -n "$configured" ] || set_cake_option_if_changed "$section" traffic_profile custom
-		# Old custom rules were scoped to the Auto-Tune profile. Move only the
-		# currently active group into the new explicit Custom profile; retain all
-		# inactive profile groups untouched for rollback and later reuse.
-		for rule in $(uci -q show "$CONFIG" 2>/dev/null |
-			sed -n "s/^$CONFIG\.\([A-Za-z0-9_][A-Za-z0-9_]*\)=traffic_rule$/\1/p"); do
-			rule_instance="$(uci -q get "$CONFIG.$rule.instance")"
-			[ "$rule_instance" = "$section" ] || continue
-			raw_rule_profile="$(uci -q get "$CONFIG.$rule.profile")"
-			[ -n "$raw_rule_profile" ] || raw_rule_profile="$autotune"
-			rule_profile="$(canonical_traffic_autotune_profile "$raw_rule_profile" 2>/dev/null)" ||
-				continue
-			[ "$rule_profile" = "$autotune" ] || continue
-			uci set "$CONFIG.$rule.profile=custom"
-			CAKE_CONFIG_CHANGED=1
-		done
-		logger -t cake-autorate "migrated disabled built-in priorities for instance '$section' to the explicit Custom profile"
-	elif [ -z "$configured" ]; then
-		set_cake_option_if_changed "$section" traffic_profile auto
-		logger -t cake-autorate "linked traffic priorities for instance '$section' to its Auto-Tune profile"
-	fi
-	set_cake_option_if_changed "$section" traffic_profile_migrated 1
-}
-
-sync_interface_presets() {
-	CAKE_CONFIG_CHANGED=0
-	config_foreach migrate_legacy_route_instance cake_autorate
-	config_foreach migrate_traffic_profile_instance cake_autorate
-	config_foreach sync_interface_preset_instance cake_autorate
-	config_foreach sync_rate_preset_instance cake_autorate
-	[ "$CAKE_CONFIG_CHANGED" -eq 1 ] || return 0
-
-	uci commit "$CONFIG"
-	config_load "$CONFIG"
-}
-
-append_sqm_conflict() {
-	local section="$1"
-
-	grep -Fxq "$section" "$SQM_CONFLICT_FILE" 2>/dev/null || printf '%s\n' "$section" >> "$SQM_CONFLICT_FILE"
-}
-
-detect_managed_sqm_conflicts() {
-	local section enabled manage_sqm sqm_enabled sqm_direction_mode target pair previous_target previous_section seen=""
-
-	mkdir -p "$(dirname "$SQM_CONFLICT_FILE")"
-	: > "$SQM_CONFLICT_FILE"
-	for section in $(uci -q show "$CONFIG" | sed -n "s/^$CONFIG\.\([^.]*\)=cake_autorate$/\1/p"); do
-		config_get_bool enabled "$section" enabled 0
-		config_get_bool manage_sqm "$section" manage_sqm 1
-		config_get_bool sqm_enabled "$section" sqm_enabled "$enabled"
-		config_get sqm_direction_mode "$section" sqm_direction_mode both
-		[ "$enabled" -eq 1 ] && [ "$manage_sqm" -eq 1 ] && [ "$sqm_enabled" -eq 1 ] &&
-			[ "$sqm_direction_mode" != off ] || continue
-
-		config_get target "$section" sqm_interface
-		[ -n "$target" ] || config_get target "$section" ul_if
-		[ -n "$target" ] || config_get target "$section" wan_if
-		[ -n "$target" ] || continue
-		target="$(resolve_interface_device "$target")"
-
-		for pair in $seen; do
-			previous_target="${pair%%|*}"
-			previous_section="${pair#*|}"
-			[ "$previous_target" = "$target" ] || continue
-			append_sqm_conflict "$previous_section"
-			append_sqm_conflict "$section"
-			logger -t cake-autorate "refusing duplicate managed shapers: instances '$previous_section' and '$section' both target '$target'"
-		done
-		seen="${seen:+$seen }$target|$section"
-	done
-}
-
-section_has_sqm_conflict() {
-	grep -Fxq "$1" "$SQM_CONFLICT_FILE" 2>/dev/null
-}
-
-set_sqm_option() {
-	local section="$1"
-	local option="$2"
-	local value="$3"
-	local current
-
-	if current="$(uci -q get "$SQM_CONFIG.$section.$option" 2>/dev/null)" &&
-	   [ "$current" = "$value" ]; then
-		return 0
-	fi
-
-	uci set "$SQM_CONFIG.$section.$option=$value" || {
-		SQM_SYNC_FAILED=1
-		return 1
-	}
-	SQM_CONFIG_CHANGED=1
-}
-
-set_sqm_optional_option() {
-	local section="$1"
-	local option="$2"
-	local value="$3"
-
-	if [ -n "$value" ]; then
-		set_sqm_option "$section" "$option" "$value"
-	elif uci -q get "$SQM_CONFIG.$section.$option" >/dev/null 2>&1; then
-		uci -q delete "$SQM_CONFIG.$section.$option" || {
-			SQM_SYNC_FAILED=1
-			return 1
-		}
-		SQM_CONFIG_CHANGED=1
-	fi
-}
-
-append_sqm_interface() {
-	local iface="$1"
-
-	[ -n "$iface" ] || return 0
-	case " $SQM_INTERFACES " in
-		*" $iface "*) return 0 ;;
-	esac
-
-	SQM_INTERFACES="${SQM_INTERFACES:+$SQM_INTERFACES }$iface"
-}
-
-append_sqm_ingress_interface() {
-	local iface="$1"
-	[ -n "$iface" ] || return 0
-	case " $SQM_INGRESS_INTERFACES " in *" $iface "*) return 0 ;; esac
-	SQM_INGRESS_INTERFACES="${SQM_INGRESS_INTERFACES:+$SQM_INGRESS_INTERFACES }$iface"
-}
-
-disable_unmanaged_sqm_conflicts() {
-	local keep="$1"
-	local target="$2"
-	local candidate enabled iface owner
-
-	for candidate in $(uci -q show "$SQM_CONFIG" | sed -n "s/^$SQM_CONFIG\.\([^.]*\)=queue$/\1/p"); do
-		[ "$candidate" != "$keep" ] || continue
-
-		enabled="$(uci -q get "$SQM_CONFIG.$candidate.enabled" 2>/dev/null)"
-		[ "$enabled" = "1" ] || continue
-		iface="$(uci -q get "$SQM_CONFIG.$candidate.interface" 2>/dev/null)"
-		[ -n "$iface" ] || continue
-		iface="$(resolve_interface_device "$iface")"
-		[ "$iface" = "$target" ] || continue
-
-		owner="$(uci -q get "$SQM_CONFIG.$candidate._cake_autorate_managed" 2>/dev/null)"
-		if [ -n "$owner" ]; then
-			logger -t cake-autorate "SQM conflict on '$target': managed queues '$keep' and '$candidate' cannot run on the same interface"
-			continue
-		fi
-
-		uci set "$SQM_CONFIG.$candidate.enabled=0" || {
-			SQM_SYNC_FAILED=1
-			return 1
-		}
-		SQM_CONFIG_CHANGED=1
-		logger -t cake-autorate "disabled conflicting unmanaged SQM queue '$candidate' on '$target'; CAKE Autorate manages '$keep'"
-		SQM_MANAGED=1
-	done
-}
-
-bridger_blacklist_contains() {
-	local iface="$1"
-	local current
-
-	current="$(uci -q get bridger.@defaults[0].blacklist 2>/dev/null)"
-	case " $current " in
-		*" $iface "*) return 0 ;;
-	esac
-
-	return 1
-}
-
-sync_bridger_blacklist() {
-	local iface
-
-	BRIDGER_CONFIG_CHANGED=0
-	[ -n "$SQM_INGRESS_INTERFACES" ] || return 0
-	[ -x /etc/init.d/bridger ] || return 0
-	uci -q get bridger.@defaults[0] >/dev/null || return 0
-
-	for iface in $SQM_INGRESS_INTERFACES; do
-		bridger_blacklist_contains "$iface" && continue
-		uci add_list "bridger.@defaults[0].blacklist=$iface"
-		logger -t cake-autorate "added SQM interface '$iface' to bridger blacklist"
-		BRIDGER_CONFIG_CHANGED=1
-	done
-
-	[ "$BRIDGER_CONFIG_CHANGED" -eq 1 ] || return 0
-	uci commit bridger
-	/etc/init.d/bridger reload >/dev/null 2>&1 || true
-}
-
-remove_empty_clsact() {
-	local iface="$1"
-	local ingress_filters egress_filters
-
-	command -v tc >/dev/null 2>&1 || return 0
-	tc qdisc show dev "$iface" 2>/dev/null | grep -q '^qdisc clsact ' || return 0
-
-	ingress_filters="$(tc filter show dev "$iface" ingress 2>/dev/null)"
-	egress_filters="$(tc filter show dev "$iface" egress 2>/dev/null)"
-	if [ -n "$ingress_filters$egress_filters" ]; then
-		logger -t cake-autorate "cannot replace clsact on SQM interface '$iface': non-SQM tc filters are still attached"
-		return 1
-	fi
-
-	if tc qdisc del dev "$iface" clsact >/dev/null 2>&1; then
-		logger -t cake-autorate "removed empty clsact from SQM interface '$iface' before ingress setup"
-		return 0
-	fi
-
-	logger -t cake-autorate "failed to remove empty clsact from SQM interface '$iface'"
-	return 1
-}
-
-prepare_sqm_ingress_interfaces() {
-	local iface
-
-	# Bridger UCI is outside the guarded rpcd transaction. Defer this
-	# persistent side effect until a later ordinary service start; the guarded
-	# postcheck still proves that both CAKE qdiscs are live before confirmation.
-	[ "$SERVICE_APPLY_GUARD_VERIFIED" -eq 1 ] || sync_bridger_blacklist
-	for iface in $SQM_INGRESS_INTERFACES; do
-		remove_empty_clsact "$iface" || true
-	done
-}
-
-cleanup_stale_sqm_sections() {
-	local owner="$1"
-	local keep="$2"
-	local managed_section="cake_$owner"
-	local changed=0 section
-
-	for section in $(uci -q show "$SQM_CONFIG" | sed -n "s/^$SQM_CONFIG\\.\\([^.]*\\)\\._cake_autorate_managed='$owner'$/\\1/p"); do
-		[ -n "$section" ] || continue
-		[ "$section" = "$keep" ] && continue
-
-		if [ "$section" = "$managed_section" ]; then
-			uci -q delete "$SQM_CONFIG.$section" || {
-				SQM_SYNC_FAILED=1
-				return 1
-			}
-		else
-			uci -q delete "$SQM_CONFIG.$section._cake_autorate_managed" || {
-				SQM_SYNC_FAILED=1
-				return 1
-			}
-		fi
-
-		changed=1
-		SQM_CONFIG_CHANGED=1
-	done
-
-	[ "$changed" -eq 1 ]
-}
-
-sync_sqm_instance() {
-	local section="$1"
-	local manage_sqm enabled sqm_enabled sqm_direction_mode sqm_section value
-
-	config_get_bool manage_sqm "$section" manage_sqm 1
-	if [ "$manage_sqm" -ne 1 ]; then
-		if cleanup_stale_sqm_sections "$section" ""; then
-			SQM_MANAGED=1
-		fi
-		[ "$SQM_SYNC_FAILED" -eq 0 ] || return 1
-
-		return 0
-	fi
-
-	config_get_bool enabled "$section" enabled 0
-	config_get_bool sqm_enabled "$section" sqm_enabled "$enabled"
-	config_get sqm_direction_mode "$section" sqm_direction_mode both
-	case "$sqm_direction_mode" in
-		both|upload_only|download_only) ;;
-		off)
-			# `off` is an explicit no-SQM topology, not an enabled empty queue.
-			sqm_enabled=0
-			;;
-		*)
-			logger -t cake-autorate "not starting instance '$section': invalid SQM direction mode '$sqm_direction_mode'"
-			return 1
-			;;
-	esac
-	if section_has_sqm_conflict "$section"; then
-		config_get sqm_section "$section" sqm_section "cake_$section"
-		if uci -q get "$SQM_CONFIG.$sqm_section" >/dev/null; then
-			set_sqm_option "$sqm_section" enabled 0 || return 1
-			SQM_MANAGED=1
-		fi
-		cleanup_stale_sqm_sections "$section" ""
-		[ "$SQM_SYNC_FAILED" -eq 0 ] || return 1
-		return 0
-	fi
-	if [ "$enabled" -ne 1 ] || [ "$sqm_enabled" -ne 1 ]; then
-		config_get sqm_section "$section" sqm_section "cake_$section"
-		if uci -q get "$SQM_CONFIG.$sqm_section" >/dev/null; then
-			set_sqm_option "$sqm_section" enabled 0 || return 1
-			SQM_MANAGED=1
-		fi
-
-		if cleanup_stale_sqm_sections "$section" ""; then
-			SQM_MANAGED=1
-		fi
-		[ "$SQM_SYNC_FAILED" -eq 0 ] || return 1
-
-		return 0
-	fi
-
-	config_get sqm_section "$section" sqm_section "cake_$section"
-	cleanup_stale_sqm_sections "$section" "$sqm_section"
-	[ "$SQM_SYNC_FAILED" -eq 0 ] || return 1
-	if ! uci -q get "$SQM_CONFIG.$sqm_section" >/dev/null; then
-		uci set "$SQM_CONFIG.$sqm_section=queue" || {
-			SQM_SYNC_FAILED=1
-			return 1
-		}
-		SQM_CONFIG_CHANGED=1
-	fi
-	set_sqm_option "$sqm_section" "_cake_autorate_managed" "$section" || return 1
-	set_sqm_option "$sqm_section" enabled "$sqm_enabled" || return 1
-
-	config_get value "$section" sqm_interface
-	[ -n "$value" ] || config_get value "$section" ul_if
-	value="$(resolve_interface_device "$value")"
-	set_sqm_option "$sqm_section" interface "$value" || return 1
-	append_sqm_interface "$value"
-	[ "$sqm_direction_mode" = upload_only ] || append_sqm_ingress_interface "$value"
-	disable_unmanaged_sqm_conflicts "$sqm_section" "$value" || return 1
-
-	config_get value "$section" sqm_download
-	[ -n "$value" ] || config_get value "$section" base_dl_shaper_rate_kbps
-	[ "$sqm_direction_mode" != upload_only ] || value=0
-	set_sqm_option "$sqm_section" download "$value" || return 1
-
-	config_get value "$section" sqm_upload
-	[ -n "$value" ] || config_get value "$section" base_ul_shaper_rate_kbps
-	[ "$sqm_direction_mode" != download_only ] || value=0
-	set_sqm_option "$sqm_section" upload "$value" || return 1
-
-	config_get value "$section" sqm_debug_logging 0
-	set_sqm_option "$sqm_section" debug_logging "$value" || return 1
-	config_get value "$section" sqm_verbosity 5
-	set_sqm_option "$sqm_section" verbosity "$value" || return 1
-	config_get value "$section" sqm_qdisc cake
-	set_sqm_option "$sqm_section" qdisc "$value" || return 1
-	config_get value "$section" sqm_script piece_of_cake.qos
-	set_sqm_option "$sqm_section" script "$value" || return 1
-	config_get value "$section" sqm_qdisc_advanced 0
-	set_sqm_option "$sqm_section" qdisc_advanced "$value" || return 1
-	config_get value "$section" sqm_squash_dscp 1
-	set_sqm_option "$sqm_section" squash_dscp "$value" || return 1
-	config_get value "$section" sqm_squash_ingress 1
-	set_sqm_option "$sqm_section" squash_ingress "$value" || return 1
-	config_get value "$section" sqm_ingress_ecn ECN
-	set_sqm_option "$sqm_section" ingress_ecn "$value" || return 1
-	config_get value "$section" sqm_egress_ecn NOECN
-	set_sqm_option "$sqm_section" egress_ecn "$value" || return 1
-	config_get value "$section" sqm_qdisc_really_really_advanced 0
-	set_sqm_option "$sqm_section" qdisc_really_really_advanced "$value" || return 1
-
-	config_get value "$section" sqm_ilimit
-	set_sqm_optional_option "$sqm_section" ilimit "$value" || return 1
-	config_get value "$section" sqm_elimit
-	set_sqm_optional_option "$sqm_section" elimit "$value" || return 1
-	config_get value "$section" sqm_itarget
-	set_sqm_optional_option "$sqm_section" itarget "$value" || return 1
-	config_get value "$section" sqm_etarget
-	set_sqm_optional_option "$sqm_section" etarget "$value" || return 1
-	config_get value "$section" sqm_iqdisc_opts
-	set_sqm_optional_option "$sqm_section" iqdisc_opts "$value" || return 1
-	config_get value "$section" sqm_eqdisc_opts
-	set_sqm_optional_option "$sqm_section" eqdisc_opts "$value" || return 1
-
-	config_get value "$section" sqm_linklayer none
-	set_sqm_option "$sqm_section" linklayer "$value" || return 1
-	config_get value "$section" sqm_overhead 0
-	set_sqm_option "$sqm_section" overhead "$value" || return 1
-	config_get value "$section" sqm_linklayer_advanced 0
-	set_sqm_option "$sqm_section" linklayer_advanced "$value" || return 1
-	config_get value "$section" sqm_tcMTU 2047
-	set_sqm_option "$sqm_section" tcMTU "$value" || return 1
-	config_get value "$section" sqm_tcTSIZE 128
-	set_sqm_option "$sqm_section" tcTSIZE "$value" || return 1
-	config_get value "$section" sqm_tcMPU 0
-	set_sqm_option "$sqm_section" tcMPU "$value" || return 1
-	config_get value "$section" sqm_linklayer_adaptation_mechanism default
-	set_sqm_option "$sqm_section" linklayer_adaptation_mechanism "$value" || return 1
-
-	SQM_MANAGED=1
-}
-
-sync_sqm_config() {
-	SQM_MANAGED=0
-	SQM_CONFIG_CHANGED=0
-	SQM_SYNC_FAILED=0
-	SQM_INTERFACES=""
-	SQM_INGRESS_INTERFACES=""
-	config_foreach sync_sqm_instance cake_autorate
-	[ "$SQM_SYNC_FAILED" -eq 0 ] || return 1
-	[ "$SQM_MANAGED" -eq 1 ] || return 0
-	[ "$SQM_CONFIG_CHANGED" -eq 1 ] || return 0
-	uci commit "$SQM_CONFIG"
-}
-
-start_sqm_backend() {
-	[ "$SQM_MANAGED" -eq 1 ] || return 0
-	[ -x /etc/init.d/sqm ] || return 0
-
-	# Enabling the boot service is not UCI-rollbackable. During a guarded apply
-	# the helper performs and verifies it only after rpcd confirmation.
-	[ "$SERVICE_APPLY_GUARD_VERIFIED" -eq 1 ] || /etc/init.d/sqm enable >/dev/null 2>&1 || true
-	/etc/init.d/sqm restart >/dev/null 2>&1 || /etc/init.d/sqm start >/dev/null 2>&1 || true
-}
-
-managed_sqm_sections() {
-	uci -q show "$SQM_CONFIG" | sed -n "s/^$SQM_CONFIG\\.\\([^.]*\\)\\._cake_autorate_managed=.*$/\\1/p" | sort -u
-}
-
-stop_managed_sqm_backend() {
-	local sqm_section iface
-
-	[ -x /usr/lib/sqm/run.sh ] || return 0
-
-	for sqm_section in $(managed_sqm_sections); do
-		iface="$(uci -q get "$SQM_CONFIG.$sqm_section.interface" 2>/dev/null)"
-		[ -n "$iface" ] || continue
-		iface="$(resolve_interface_device "$iface")"
-		/usr/lib/sqm/run.sh stop "$iface" >/dev/null 2>&1 || true
-	done
-}
-
-sqm_section_enabled_for_device() {
-	local sqm_section="$1"
-	local expected_if="$2"
-	local enabled iface
-
-	[ -n "$sqm_section" ] || return 1
-	[ -n "$expected_if" ] || return 1
-
-	enabled="$(uci -q get "$SQM_CONFIG.$sqm_section.enabled" 2>/dev/null)"
-	[ "$enabled" = "1" ] || return 1
-
-	iface="$(uci -q get "$SQM_CONFIG.$sqm_section.interface" 2>/dev/null)"
-	[ -n "$iface" ] || return 1
-	iface="$(resolve_interface_device "$iface")"
-
-	[ "$iface" = "$expected_if" ]
-}
-
-instance_has_enabled_sqm_backing() {
-	local section="$1"
-	local target sqm_section candidate
-
-	config_get target "$section" sqm_interface
-	[ -n "$target" ] || config_get target "$section" ul_if
-	[ -n "$target" ] || config_get target "$section" wan_if
-	[ -n "$target" ] || return 1
-	target="$(resolve_interface_device "$target")"
-
-	config_get sqm_section "$section" sqm_section
-	if [ -n "$sqm_section" ]; then
-		sqm_section_enabled_for_device "$sqm_section" "$target"
-		return $?
-	fi
-
-	for candidate in $(uci -q show "$SQM_CONFIG" | sed -n "s/^$SQM_CONFIG\\.\\([^.]*\\)=queue$/\\1/p"); do
-		sqm_section_enabled_for_device "$candidate" "$target" && return 0
-	done
-
-	return 1
-}
-
-instance_has_startable_config() {
-	local section="$1"
-	local manage_sqm sqm_enabled sqm_direction_mode
-
-	config_get_bool manage_sqm "$section" manage_sqm 1
-	[ "$manage_sqm" -eq 1 ] || return 0
-	config_get_bool sqm_enabled "$section" sqm_enabled 0
-	config_get sqm_direction_mode "$section" sqm_direction_mode both
-
-	if [ "$sqm_enabled" -ne 1 ] || [ "$sqm_direction_mode" = off ]; then
-		logger -t cake-autorate "not starting instance '$section': managed SQM is disabled"
-		return 1
-	fi
-
-	if ! instance_has_enabled_sqm_backing "$section"; then
-		logger -t cake-autorate "not starting instance '$section': no enabled SQM backing queue is configured for this managed instance"
-		return 1
-	fi
-
-	return 0
-}
-
-start_instance() {
-	local section="$1"
-	local enabled
-
-	config_get_bool enabled "$section" enabled 0
-	[ "$enabled" -eq 1 ] || return 0
-	if section_has_sqm_conflict "$section"; then
-		logger -t cake-autorate "not starting instance '$section': duplicate managed CAKE queue target"
-		return 0
-	fi
-	instance_has_startable_config "$section" || return 0
-
-	procd_open_instance "$section"
-	procd_set_param command "$DAEMON" --instance "$section"
+# @variant full end
+
+service_add_instance() {
+	procd_open_instance "$1"
+	procd_set_param command "$DAEMON" --instance "$1"
 	procd_set_param respawn 3600 5 5
 	procd_set_param stdout 1
 	procd_set_param stderr 1
 	procd_close_instance
 }
 
-native_apply_validate_identifier() {
-	case "$1" in
-		''|*[!A-Za-z0-9_]*) return 1 ;;
+# @variant full begin
+service_add_mqtt_instance() {
+	procd_open_instance "mqtt_$1"
+	procd_set_param command "$DAEMON" --mqtt-publisher "$1"
+	procd_set_param respawn 3600 5 5
+	procd_set_param term_timeout 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+# @variant full end
+
+validate_service_instance_list() {
+	local instances="$1" old_ifs instance seen=""
+
+	[ "$instances" != - ] || return 0
+	case "$instances" in
+		''|,*|*,|*,,*|*[!A-Za-z0-9_,]*) return 1 ;;
 	esac
-	[ "${#1}" -le 64 ]
-}
-
-native_apply_validate_interface() {
-	case "$1" in
-		''|*[!A-Za-z0-9_.:@-]*) return 1 ;;
-	esac
-	[ "${#1}" -le 64 ]
-}
-
-native_apply_require_selected_context() {
-	local section="$1"
-	local expected_sqm_section="$2"
-	local expected_iface="$3"
-	local configured_sqm_section managed_owner configured_iface resolved_iface
-
-	[ "${CAKE_AUTORATE_NATIVE_APPLY_RECOVERY:-0}" = 1 ] || {
-		logger -t cake-autorate "refusing native Apply instance lifecycle without the private recovery marker"
-		return 1
-	}
-	[ "${CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_BORROW:-0}" = 1 ] &&
-		[ "${CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_FD:-}" = 8 ] || {
-		logger -t cake-autorate "refusing native Apply instance lifecycle without borrowed global lock FD 8"
-		return 1
-	}
-	native_apply_validate_identifier "$section" &&
-		native_apply_validate_identifier "$expected_sqm_section" &&
-		native_apply_validate_interface "$expected_iface" || {
-		logger -t cake-autorate "refusing native Apply instance lifecycle with an unsafe identifier"
-		return 1
-	}
-
-	config_load "$CONFIG"
-	[ "$(uci -q get "$CONFIG.$section")" = cake_autorate ] || {
-		logger -t cake-autorate "refusing native Apply lifecycle for missing instance '$section'"
-		return 1
-	}
-	config_get configured_sqm_section "$section" sqm_section "cake_$section"
-	[ "$configured_sqm_section" = "$expected_sqm_section" ] || {
-		logger -t cake-autorate "refusing native Apply lifecycle: instance '$section' no longer owns expected SQM section '$expected_sqm_section'"
-		return 1
-	}
-	managed_owner="$(uci -q get "$SQM_CONFIG.$expected_sqm_section._cake_autorate_managed" 2>/dev/null)"
-	[ "$managed_owner" = "$section" ] || {
-		logger -t cake-autorate "refusing native Apply lifecycle: SQM section '$expected_sqm_section' is not owned by '$section'"
-		return 1
-	}
-	configured_iface="$(uci -q get "$SQM_CONFIG.$expected_sqm_section.interface" 2>/dev/null)"
-	[ -n "$configured_iface" ] || {
-		logger -t cake-autorate "refusing native Apply lifecycle: SQM section '$expected_sqm_section' has no interface"
-		return 1
-	}
-	resolved_iface="$(resolve_interface_device "$configured_iface")"
-	if [ "$configured_iface" != "$expected_iface" ] &&
-	   [ "$resolved_iface" != "$expected_iface" ]; then
-		logger -t cake-autorate "refusing native Apply lifecycle: SQM interface '$configured_iface' does not resolve to immutable target '$expected_iface'"
-		return 1
-	fi
-}
-
-native_apply_stop_selected_controller() {
-	local section="$1"
-	local count=0 pid
-
-	procd_kill "$CONFIG" "$section" >/dev/null 2>&1 || true
-	for pid in $(pgrep -f "^$DAEMON --instance $section\$" 2>/dev/null); do
-		kill -TERM "$pid" 2>/dev/null || true
-	done
-	while pgrep -f "^$DAEMON --instance $section\$" >/dev/null 2>&1; do
-		count=$((count + 1))
-		[ "$count" -lt 15 ] || {
-			logger -t cake-autorate "native Apply controller '$section' did not stop"
-			return 1
-		}
-		sleep 1
+	old_ifs="$IFS"
+	IFS=,
+	set -- $instances
+	IFS="$old_ifs"
+	for instance in "$@"; do
+		case "$instance" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+		[ "${#instance}" -le 64 ] || return 1
+		case ",$seen," in *",$instance,"*) return 1 ;; esac
+		seen="${seen:+$seen,}$instance"
 	done
 }
 
-native_apply_netdev_exists() {
-	[ -e "/sys/class/net/$1" ]
-}
+add_controller_instances() {
+	local instances="$1" old_ifs instance
 
-native_apply_selected_sqm_is_absent() {
-	local iface="$1"
-	local dl_if="$2"
-	local derived_dl_if="$3"
-	local qdiscs probe_dl seen_dl=""
-
-	if native_apply_netdev_exists "$iface"; then
-		qdiscs="$("$TC_BIN" qdisc show dev "$iface" 2>/dev/null)" || return 1
-		printf '%s\n' "$qdiscs" | grep -q '^qdisc cake ' && return 1
-		printf '%s\n' "$qdiscs" | grep -q '^qdisc ingress ' && return 1
-		printf '%s\n' "$qdiscs" | grep -q '^qdisc clsact ' && return 1
-	fi
-	for probe_dl in "$dl_if" "$derived_dl_if"; do
-		[ -n "$probe_dl" ] || continue
-		[ "$probe_dl" != "$seen_dl" ] || continue
-		seen_dl="$probe_dl"
-		native_apply_netdev_exists "$probe_dl" || continue
-		qdiscs="$("$TC_BIN" qdisc show dev "$probe_dl" 2>/dev/null)" || return 1
-		printf '%s\n' "$qdiscs" | grep -q '^qdisc cake ' && return 1
+	[ "$instances" != - ] || return 0
+	old_ifs="$IFS"
+	IFS=,
+	set -- $instances
+	IFS="$old_ifs"
+	for instance in "$@"; do
+		service_add_instance "$instance" || return 1
 	done
-	return 0
 }
 
-native_apply_stop_selected_sqm() {
-	local sqm_section="$1"
-	local section="$2"
-	local expected_iface="$3"
-	local configured_iface iface dl_if derived_dl_if
+# @variant full begin
+add_mqtt_instances() {
+	local instances="$1" old_ifs instance
 
-	[ -x "$SQM_RUNNER" ] || {
-		logger -t cake-autorate "native Apply cannot find the SQM lifecycle helper"
-		return 1
-	}
-	configured_iface="$(uci -q get "$SQM_CONFIG.$sqm_section.interface" 2>/dev/null)"
-	[ -n "$configured_iface" ] || {
-		logger -t cake-autorate "native Apply SQM section '$sqm_section' has no interface"
-		return 1
-	}
-	iface="$(resolve_interface_device "$configured_iface")"
-	if [ "$configured_iface" != "$expected_iface" ] &&
-	   [ "$iface" != "$expected_iface" ]; then
-		logger -t cake-autorate "native Apply SQM interface '$configured_iface' no longer resolves to immutable target '$expected_iface'"
-		return 1
-	fi
-	iface="$expected_iface"
-	config_get dl_if "$section" dl_if "ifb4$iface"
-	dl_if="$(resolve_interface_device "$dl_if")"
-	derived_dl_if="ifb4$iface"
-	if ! "$SQM_RUNNER" stop "$iface" >/dev/null 2>&1; then
-		native_apply_selected_sqm_is_absent "$iface" "$dl_if" "$derived_dl_if" || {
-			logger -t cake-autorate "native Apply could not stop selected SQM interface '$iface' and its CAKE/ingress runtime is not proved absent"
-			return 1
-		}
-		logger -t cake-autorate "native Apply selected SQM interface '$iface' was already absent after the stop helper returned unsuccessfully"
-	fi
-	NATIVE_APPLY_SELECTED_IFACE="$iface"
+	[ "$instances" != - ] || return 0
+	old_ifs="$IFS"
+	IFS=,
+	set -- $instances
+	IFS="$old_ifs"
+	for instance in "$@"; do
+		service_add_mqtt_instance "$instance" || return 1
+	done
+}
+# @variant full end
+
+service_prepare_start() {
+	# @variant full begin
+	CAKE_AUTORATE_SERVICE_LOCK_BORROW=1 \
+		CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_FD=8 \
+		"$DAEMON" --service-lifecycle prepare-start
+	# @variant full end
+	# @variant lite begin
+	"$DAEMON" --service-lifecycle prepare-start
+	# @variant lite end
 }
 
+# @variant full begin
 native_apply_add_selected_instance() {
-	start_instance "$1"
+	service_add_instance "$1"
 }
 
-native_apply_restart_instance_locked() {
-	local section="$1"
-	local sqm_section="$2"
-	local expected_iface="$3"
-	local enabled ingress_iface new_iface
-
-	native_apply_require_selected_context "$section" "$sqm_section" "$expected_iface" || return 1
-	service_apply_guard_preflight "restart native Apply instance '$section'" || return 1
-	detect_managed_sqm_conflicts
-	section_has_sqm_conflict "$section" && {
-		logger -t cake-autorate "refusing native Apply restart for conflicting instance '$section'"
-		return 1
-	}
-	native_apply_stop_selected_controller "$section" || return 1
-	native_apply_stop_selected_sqm "$sqm_section" "$section" "$expected_iface" || return 1
-
-	SQM_MANAGED=0
-	SQM_CONFIG_CHANGED=0
-	SQM_SYNC_FAILED=0
-	SQM_INTERFACES=""
-	SQM_INGRESS_INTERFACES=""
-	sync_sqm_instance "$section" || return 1
-	[ "$SQM_SYNC_FAILED" -eq 0 ] || {
-		logger -t cake-autorate "native Apply SQM synchronization failed for '$section'"
-		return 1
-	}
-	[ "$SQM_MANAGED" -eq 1 ] || {
-		logger -t cake-autorate "native Apply instance '$section' did not produce managed SQM state"
-		return 1
-	}
-	if [ "$SQM_CONFIG_CHANGED" -eq 1 ]; then
-		uci commit "$SQM_CONFIG" || return 1
-	fi
-	# Native Apply owns only this selected uplink.  Do not run the ordinary
-	# global preparation path here: it also synchronizes Bridger state, which
-	# is outside the durable cake-autorate/SQM transaction.
-	for ingress_iface in $SQM_INGRESS_INTERFACES; do
-		remove_empty_clsact "$ingress_iface" || true
-	done
-
-	enabled="$(uci -q get "$SQM_CONFIG.$sqm_section.enabled" 2>/dev/null)"
-	new_iface="$(uci -q get "$SQM_CONFIG.$sqm_section.interface" 2>/dev/null)"
-	[ -n "$new_iface" ] || new_iface="$NATIVE_APPLY_SELECTED_IFACE"
-	new_iface="$(resolve_interface_device "$new_iface")"
-	[ "$new_iface" = "$expected_iface" ] || {
-		logger -t cake-autorate "native Apply synchronized SQM interface '$new_iface' differs from immutable target '$expected_iface'"
-		return 1
-	}
-	if [ "$enabled" = 1 ]; then
-		"$SQM_RUNNER" start "$new_iface" >/dev/null 2>&1 || {
-			logger -t cake-autorate "native Apply could not start selected SQM interface '$new_iface'"
-			return 1
-		}
-	fi
-
-	if [ -x "$TRAFFIC_CLASSIFIER" ]; then
-		"$TRAFFIC_CLASSIFIER" apply >/dev/null 2>&1 || {
-			logger -t cake-autorate "native Apply could not update traffic-priority rules"
-			return 1
-		}
-	fi
-	rc_procd native_apply_add_selected_instance "$section" >/dev/null || {
-		logger -t cake-autorate "native Apply could not register selected controller '$section'"
-		return 1
-	}
+native_apply_register_instance() {
+	[ "$#" -eq 1 ] || return 1
+	case "$1" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+	[ "${#1}" -le 64 ] || return 1
+	[ "${CAKE_AUTORATE_NATIVE_APPLY_RECOVERY:-0}" = 1 ] || return 1
+	[ "${CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_BORROW:-0}" = 1 ] || return 1
+	[ "${CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_FD:-}" = 8 ] || return 1
+	rc_procd native_apply_add_selected_instance "$1" >/dev/null
 }
-
-native_apply_selected_command() {
-	local action="$1"
-	local section="$2"
-	local sqm_section="$3"
-	local expected_iface="$4"
-	local lock_was_held="$SERVICE_RUNTIME_LOCK_HELD"
-	local rc=0
-
-	service_runtime_lock_acquire_or_exit "run native Apply $action for '$section'"
-	case "$action" in
-		restart)
-			native_apply_restart_instance_locked "$section" "$sqm_section" "$expected_iface" || rc=$?
-			;;
-		stop)
-			native_apply_require_selected_context "$section" "$sqm_section" "$expected_iface" || rc=$?
-			if [ "$rc" -eq 0 ]; then
-				native_apply_stop_selected_controller "$section" || rc=$?
-			fi
-			if [ "$rc" -eq 0 ]; then
-			native_apply_stop_selected_sqm "$sqm_section" "$section" "$expected_iface" || rc=$?
-			fi
-			;;
-		*) rc=1 ;;
-	esac
-	if [ "$lock_was_held" -eq 0 ]; then
-		service_runtime_lock_release_or_exit "running native Apply $action for '$section'"
-	fi
-	return "$rc"
-}
-
-native_apply_restart_instance() {
-	[ "$#" -eq 3 ] || return 1
-	native_apply_selected_command restart "$1" "$2" "$3"
-}
-
-native_apply_stop_instance() {
-	[ "$#" -eq 3 ] || return 1
-	native_apply_selected_command stop "$1" "$2" "$3"
-}
+# @variant full end
 
 start_service_locked() {
-	service_apply_guard_preflight "start CAKE Autorate" || return 1
-	config_load "$CONFIG"
-	sync_interface_presets
-	detect_managed_sqm_conflicts
-	sync_sqm_config || return 1
-	prepare_sqm_ingress_interfaces
-	start_sqm_backend
-	if [ -x "$TRAFFIC_CLASSIFIER" ]; then
-		"$TRAFFIC_CLASSIFIER" apply >/dev/null 2>&1 ||
-			logger -t cake-autorate "traffic-priority rules are degraded: native nftables classifier failed to apply"
+	local result marker controller_instances
+	# @variant full begin
+	local remainder mqtt_instances
+	# @variant full end
+
+	if ! result="$(service_prepare_start)"; then
+		logger -t cake-autorate "native service start preparation failed"
+		return 1
 	fi
-	config_foreach start_instance cake_autorate
-	start_apply_guard_supervisor || return 1
-	[ -x /etc/init.d/cake-autorate-mqtt ] && /etc/init.d/cake-autorate-mqtt restart >/dev/null 2>&1 || true
+	marker="${result%% *}"
+	[ "$marker" != "$result" ] || {
+		logger -t cake-autorate "native service start returned a malformed response"
+		return 1
+	}
+	# @variant full begin
+	remainder="${result#* }"
+	controller_instances="${remainder%% *}"
+	[ "$controller_instances" != "$remainder" ] || {
+		logger -t cake-autorate "native service start returned a truncated response"
+		return 1
+	}
+	mqtt_instances="${remainder#* }"
+	[ "$marker" = service-start-v2 ] || {
+		logger -t cake-autorate "native service start returned an unsupported response"
+		return 1
+	}
+	case "$mqtt_instances" in *' '*) return 1 ;; esac
+	# @variant full end
+	# @variant lite begin
+	controller_instances="${result#* }"
+	[ "$marker" = service-start-v1 ] || {
+		logger -t cake-autorate "native service start returned an unsupported response"
+		return 1
+	}
+	case "$controller_instances" in *' '*) return 1 ;; esac
+	# @variant lite end
+	validate_service_instance_list "$controller_instances" || {
+		logger -t cake-autorate "native service start returned an unsafe controller list"
+		return 1
+	}
+	# @variant full begin
+	validate_service_instance_list "$mqtt_instances" || {
+		logger -t cake-autorate "native service start returned an unsafe MQTT list"
+		return 1
+	}
+	# @variant full end
+	add_controller_instances "$controller_instances" || {
+		logger -t cake-autorate "unable to construct the complete native controller set"
+		# rc.common unconditionally serializes the accumulated JSON after
+		# start_service returns. Exit the child so a partial set cannot reach procd.
+		exit 1
+	}
+	# @variant full begin
+	add_mqtt_instances "$mqtt_instances" || {
+		logger -t cake-autorate "unable to construct the complete native MQTT set"
+		exit 1
+	}
+	# @variant full end
 }
 
+# @variant full begin
 start_service() {
 	local lock_was_held="$SERVICE_RUNTIME_LOCK_HELD"
 	local rc
-
-	# During an in-place APK upgrade default_postinst calls this entry point
-	# before the package-specific postinst hook.  Starting here would leave the
-	# old process alive or create a second SQM lifecycle.  The postinst hook
-	# immediately follows with PKG_UPGRADE=0 and one guarded restart.
-	[ "${PKG_UPGRADE:-0}" = 1 ] && return 0
-
-	if { [ -e "$NATIVE_APPLY_RECOVERY_ROOT/current" ] ||
-	     [ -L "$NATIVE_APPLY_RECOVERY_ROOT/current" ]; } &&
-	   [ "${CAKE_AUTORATE_NATIVE_APPLY_RECOVERY:-0}" != 1 ]; then
-		logger -t cake-autorate "refusing to start while a native Apply recovery transaction is pending"
-		return 1
-	fi
 
 	service_runtime_lock_acquire_or_exit "start CAKE Autorate"
 	if start_service_locked; then
@@ -1148,54 +259,20 @@ start_service() {
 
 	return "$rc"
 }
-
-recover_interface_locked() {
-	local member="$1"
-	local section configured enabled
-
-	[ -n "$member" ] || return 0
-	config_load "$CONFIG"
-	for section in $(uci -q show "$CONFIG" | sed -n "s/^$CONFIG\.\([^.]*\)=cake_autorate$/\1/p"); do
-		config_get configured "$section" mwan3_member
-		[ "$configured" = "$member" ] || continue
-		config_get_bool enabled "$section" enabled 0
-		[ "$enabled" -eq 1 ] || continue
-		pgrep -f "^$DAEMON --instance $section\$" >/dev/null 2>&1 && continue
-		# Enabled, structurally valid instances are registered with procd even
-		# while their WAN/IFB is absent.  Their daemon waits and performs only
-		# target-scoped recovery.  Never turn a member-up hint into a global
-		# reload: that would stop unrelated WAN shapers and race SQM hotplug.
-		logger -t cake-autorate "mwan3 member '$member' is up but controller '$section' is absent; procd respawn/service state requires inspection"
-	done
+# @variant full end
+# @variant lite begin
+start_service() {
+	start_service_locked
 }
+# @variant lite end
 
-recover_interface() {
-	local lock_was_held="$SERVICE_RUNTIME_LOCK_HELD"
-	local rc
-
-	service_runtime_lock_acquire_or_exit "recover mwan3 interface '$1'"
-	if recover_interface_locked "$@"; then
-		rc=0
-	else
-		rc=$?
-	fi
-	if [ "$lock_was_held" -eq 0 ]; then
-		service_runtime_lock_release_or_exit "recovering mwan3 interface '$1'"
-	fi
-
-	return "$rc"
-}
-
+# @variant full begin
 reload_service() {
 	local lock_was_held="$SERVICE_RUNTIME_LOCK_HELD"
 	local rc=0
 
 	service_runtime_lock_acquire_or_exit "reload CAKE Autorate"
-	if ! service_apply_guard_preflight "reload CAKE Autorate"; then
-		rc=1
-	else
-		stop "$@" || rc=$?
-	fi
+	stop "$@" || rc=$?
 	if [ "$rc" -eq 0 ]; then
 		start "$@" || rc=$?
 	fi
@@ -1205,10 +282,21 @@ reload_service() {
 
 	return "$rc"
 }
+# @variant full end
+# @variant lite begin
+reload_service() {
+	local rc=0
+
+	stop "$@" || rc=$?
+	if [ "$rc" -eq 0 ]; then
+		start "$@" || rc=$?
+	fi
+	return "$rc"
+}
+# @variant lite end
 
 # rc.common's stock restart() releases all service-local state between stop
-# and start.  Route it through the same transaction as reload so Auto-Tune
-# cannot enter that gap and observe a half-stopped SQM setup.
+# and start. Route it through the same explicit reload transaction.
 restart() {
 	local rc
 
@@ -1223,85 +311,58 @@ restart() {
 	return "$rc"
 }
 
-cleanup_runtime_files() {
-	local runtime_dir instance
-
-	# Runtime status and graph history live only in tmpfs. A delayed
-	# service_stopped() from an earlier package-manager stop must never erase
-	# files already owned by a replacement daemon, so reconcile each instance
-	# with the actual process before removing anything.
-	for runtime_dir in "$RUNTIME_ROOT"/*; do
-		[ -d "$runtime_dir" ] && [ ! -L "$runtime_dir" ] || continue
-		instance="${runtime_dir##*/}"
-		case "$instance" in
-			''|*[!A-Za-z0-9_]*) continue ;;
-		esac
-		if pgrep -f "^$DAEMON --instance $instance\$" >/dev/null 2>&1; then
-			logger -t cake-autorate "preserving runtime files for active replacement instance '$instance'"
-			continue
-		fi
-		rm -f "$runtime_dir/status.json" \
-			"$runtime_dir/history.csv" \
-			"$runtime_dir/history.csv.tmp" 2>/dev/null || true
-	done
-}
-
+# @variant full begin
 stop_service() {
-	local lock_was_held="$SERVICE_RUNTIME_LOCK_HELD"
+	local lock_was_held="$SERVICE_RUNTIME_LOCK_HELD" result
 
 	service_runtime_lock_acquire_or_exit "stop CAKE Autorate"
-	if ! service_apply_guard_preflight "stop CAKE Autorate"; then
-		# rc.common invokes procd_kill() after this hook even if it merely
-		# returns non-zero. Exiting is therefore required to keep an invalid or
-		# tokenless apply marker from stopping the known-good service/SQM state.
-		exit 1
-	fi
 	if [ "$lock_was_held" -eq 0 ]; then
 		# rc.common calls procd_kill() only after this hook returns.  Keep the
 		# exclusive descriptor open until service_stopped() has run.
 		SERVICE_RUNTIME_STOP_RELEASE_PENDING=1
 	fi
-	if [ -x "$TRAFFIC_CLASSIFIER" ]; then
-		"$TRAFFIC_CLASSIFIER" clear >/dev/null 2>&1 ||
-			logger -t cake-autorate "unable to clear the native nftables traffic-priority table during stop"
+	if ! result="$(CAKE_AUTORATE_SERVICE_LOCK_BORROW=1 \
+		CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_FD=8 \
+		"$DAEMON" --service-lifecycle execute-stop)"; then
+		logger -t cake-autorate "native service stop transaction failed"
+		exit 1
 	fi
-	stop_managed_sqm_backend
+	[ "$result" = "service-stop-v1 ok" ] || {
+		logger -t cake-autorate "native service stop returned a malformed response"
+		exit 1
+	}
 }
+# @variant full end
+# @variant lite begin
+stop_service() {
+	local result
 
-service_stopped() {
-	local cleanup_lock_acquired=0
-
-	# procd_kill() returns before the terminated process is fully reaped. Give
-	# the daemon a moment to stop. Some package-manager paths invoke this hook
-	# asynchronously, so acquire the same exclusive lifecycle lock when the
-	# original stop shell did not carry it into this callback.
-	sleep 1
-	if [ "$SERVICE_RUNTIME_LOCK_HELD" -eq 0 ]; then
-		service_runtime_lock_acquire_or_exit "clean up stopped CAKE Autorate runtime files"
-		cleanup_lock_acquired=1
+	if ! result="$("$DAEMON" --service-lifecycle execute-stop)"; then
+		logger -t cake-autorate "native service stop transaction failed"
+		exit 1
 	fi
-	cleanup_runtime_files
+	[ "$result" = "service-stop-v1 ok" ] || {
+		logger -t cake-autorate "native service stop returned a malformed response"
+		exit 1
+	}
+}
+# @variant lite end
+
+# @variant full begin
+service_stopped() {
 	if [ "$SERVICE_RUNTIME_STOP_RELEASE_PENDING" -eq 1 ]; then
 		SERVICE_RUNTIME_STOP_RELEASE_PENDING=0
 		service_runtime_lock_release_or_exit "stopping CAKE Autorate"
-	elif [ "$cleanup_lock_acquired" -eq 1 ]; then
-		service_runtime_lock_release_or_exit "cleaning up stopped CAKE Autorate runtime files"
 	fi
 }
+# @variant full end
+# @variant lite begin
+service_stopped() {
+	:
+}
+# @variant lite end
 
 service_triggers() {
-	local section member seen=""
-
 	procd_add_reload_trigger "$CONFIG"
 	procd_add_reload_trigger "$SQM_CONFIG"
-	config_load "$CONFIG"
-	for section in $(uci -q show "$CONFIG" | sed -n "s/^$CONFIG\.\([^.]*\)=cake_autorate$/\1/p"); do
-		config_get member "$section" mwan3_member
-		[ -n "$member" ] || continue
-		case " $seen " in
-			*" $member "*) continue ;;
-		esac
-		seen="${seen:+$seen }$member"
-		procd_add_interface_trigger "interface.*.up" "$member" /etc/init.d/cake-autorate recover_interface "$member"
-	done
 }

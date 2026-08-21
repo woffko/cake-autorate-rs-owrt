@@ -8,7 +8,7 @@
 
 const CURSOR_HEADER: &str = "cake-autorate-native-schedule\t2";
 const BUDGET_HEADER: &str = "cake-autorate-native-schedule-budget\t2";
-const INSTANCE_STATE_HEADER: &str = "cake-autorate-native-scheduler-state\t1";
+const INSTANCE_STATE_HEADER_V2: &str = "cake-autorate-native-scheduler-state\t2";
 const MAX_EXACT_BYTES: u64 = 9_007_199_254_740_991;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,12 +88,16 @@ impl ScheduleCursor {
         if interval_s == 0 {
             return Err("scheduler interval must be non-zero".to_string());
         }
-        match self.last_success_unix_s {
+        let interval_due = match self.last_success_unix_s {
             Some(last) => last
                 .checked_add(interval_s)
                 .ok_or_else(|| "scheduler due time overflow".to_string()),
             None => Ok(self.initial_due_unix_s),
-        }
+        }?;
+        // `initial_due_unix_s` is also the durable lower bound for a scheduler
+        // cursor. Native cursors keep it at or before their last success, while
+        // a retry fence may independently move the next eligible run later.
+        Ok(interval_due.max(self.initial_due_unix_s))
     }
 
     pub fn record_failure(&mut self, fence: FailedAttemptFence) -> Result<(), String> {
@@ -140,12 +144,6 @@ impl ScheduleCursor {
         require_identifier("scheduler instance", &self.instance)?;
         if self.sequence == 0 || self.initial_due_unix_s == 0 {
             return Err("scheduler cursor identity is incomplete".to_string());
-        }
-        if self
-            .last_success_unix_s
-            .is_some_and(|last| last < self.initial_due_unix_s)
-        {
-            return Err("scheduler success precedes the initial due time".to_string());
         }
         if let Some(fence) = &self.failed_attempt {
             fence.validate()?;
@@ -948,11 +946,16 @@ impl BudgetReservation {
 pub struct SchedulerInstanceState {
     pub cursor: ScheduleCursor,
     pub budget: BudgetLedger,
+    pub operator_warning: Option<String>,
 }
 
 impl SchedulerInstanceState {
     pub fn new(cursor: ScheduleCursor, budget: BudgetLedger) -> Result<Self, String> {
-        let state = Self { cursor, budget };
+        let state = Self {
+            cursor,
+            budget,
+            operator_warning: None,
+        };
         state.validate()?;
         Ok(state)
     }
@@ -963,6 +966,16 @@ impl SchedulerInstanceState {
         if self.cursor.instance != self.budget.instance {
             return Err("scheduler cursor and budget instances differ".to_string());
         }
+        if let Some(warning) = &self.operator_warning {
+            if warning.is_empty()
+                || warning.len() > 512
+                || warning.bytes().any(|byte| byte < b' ' || byte == 0x7f)
+            {
+                return Err(
+                    "scheduler operator warning is not a bounded visible string".to_string()
+                );
+            }
+        }
         Ok(())
     }
 
@@ -970,16 +983,18 @@ impl SchedulerInstanceState {
         self.validate()?;
         let cursor = self.cursor.encode()?;
         let budget = self.budget.encode()?;
+        let warning = self.operator_warning.as_deref().unwrap_or("");
         Ok(format!(
-            "{INSTANCE_STATE_HEADER}\ncursor_bytes\t{}\nbudget_bytes\t{}\n{cursor}{budget}",
+            "{INSTANCE_STATE_HEADER_V2}\ncursor_bytes\t{}\nbudget_bytes\t{}\nwarning_bytes\t{}\n{cursor}{budget}{warning}",
             cursor.len(),
             budget.len(),
+            warning.len(),
         ))
     }
 
     pub fn decode(input: &str) -> Result<Self, String> {
-        let mut lines = input.splitn(4, '\n');
-        if lines.next() != Some(INSTANCE_STATE_HEADER) {
+        let mut lines = input.splitn(5, '\n');
+        if lines.next() != Some(INSTANCE_STATE_HEADER_V2) {
             return Err("scheduler instance state header is invalid".to_string());
         }
         let cursor_bytes = parse_length_field(
@@ -994,25 +1009,43 @@ impl SchedulerInstanceState {
                 .next()
                 .ok_or_else(|| "scheduler instance state is missing budget length".to_string())?,
         )?;
+        let warning_bytes = parse_length_field(
+            "warning_bytes",
+            lines
+                .next()
+                .ok_or_else(|| "scheduler instance state is missing warning length".to_string())?,
+        )?;
         let payload = lines
             .next()
             .ok_or_else(|| "scheduler instance state is missing its payload".to_string())?
             .as_bytes();
         let expected = cursor_bytes
             .checked_add(budget_bytes)
+            .and_then(|value| value.checked_add(warning_bytes))
             .ok_or_else(|| "scheduler instance state length overflow".to_string())?;
         if payload.len() != expected {
             return Err("scheduler instance state payload length mismatch".to_string());
         }
-        let (cursor, budget) = payload.split_at(cursor_bytes);
+        let (cursor, remainder) = payload.split_at(cursor_bytes);
+        let (budget, warning) = remainder.split_at(budget_bytes);
         let cursor = std::str::from_utf8(cursor)
             .map_err(|_| "scheduler cursor state is not UTF-8".to_string())?;
         let budget = std::str::from_utf8(budget)
             .map_err(|_| "scheduler budget state is not UTF-8".to_string())?;
-        let state = Self::new(
+        let mut state = Self::new(
             ScheduleCursor::decode(cursor)?,
             BudgetLedger::decode(budget)?,
         )?;
+        state.operator_warning = if warning.is_empty() {
+            None
+        } else {
+            Some(
+                std::str::from_utf8(warning)
+                    .map_err(|_| "scheduler operator warning is not UTF-8".to_string())?
+                    .to_string(),
+            )
+        };
+        state.validate()?;
         if state.encode()? != input {
             return Err("scheduler instance state is not canonical".to_string());
         }
@@ -1366,6 +1399,22 @@ mod tests {
     }
 
     #[test]
+    fn adopted_retry_lower_bound_preserves_exact_last_success_and_next_due() {
+        let mut cursor = ScheduleCursor::new("wan_sqm".to_string(), 9_000).unwrap();
+        cursor.last_success_unix_s = Some(5_000);
+        cursor.validate().unwrap();
+        assert_eq!(cursor.last_success_unix_s, Some(5_000));
+        assert_eq!(cursor.due_unix_s(3_600).unwrap(), 9_000);
+        assert_eq!(
+            ScheduleCursor::decode(&cursor.encode().unwrap()).unwrap(),
+            cursor
+        );
+
+        cursor.record_success(3_600, 9_000, 9_100).unwrap();
+        assert_eq!(cursor.due_unix_s(3_600).unwrap(), 12_700);
+    }
+
+    #[test]
     fn cursor_round_trip_preserves_failure_fence_and_rejects_partial_state() {
         let mut cursor = ScheduleCursor::new("wan_sqm".to_string(), 1_000).unwrap();
         cursor
@@ -1429,6 +1478,38 @@ mod tests {
         let recovered = BudgetLedger::decode(&ledger.encode().unwrap()).unwrap();
         assert_eq!(recovered, ledger);
         assert!(recovered.reservation.is_some());
+    }
+
+    #[test]
+    fn scheduler_state_canonically_persists_operator_warning_and_rejects_v1() {
+        let cursor = ScheduleCursor::new("wan_sqm".to_string(), 1_000).unwrap();
+        let budget = BudgetLedger::new(
+            "wan_sqm".to_string(),
+            "20260805".to_string(),
+            "202608".to_string(),
+            10_000,
+            50_000,
+        )
+        .unwrap();
+        let mut state = SchedulerInstanceState::new(cursor, budget).unwrap();
+        let current = state.encode().unwrap();
+        let retired_v1 = current
+            .replacen(
+                INSTANCE_STATE_HEADER_V2,
+                "cake-autorate-native-scheduler-state\t1",
+                1,
+            )
+            .replace("warning_bytes\t0\n", "");
+        assert!(SchedulerInstanceState::decode(&retired_v1).is_err());
+
+        state.operator_warning = Some(
+            "A pre-upgrade scheduled result requires explicit Review or a fresh run.".to_string(),
+        );
+        let v2 = state.encode().unwrap();
+        assert!(v2.starts_with(INSTANCE_STATE_HEADER_V2));
+        assert_eq!(SchedulerInstanceState::decode(&v2).unwrap(), state);
+        state.operator_warning = Some("bad\nwarning".to_string());
+        assert!(state.encode().is_err());
     }
 
     #[test]

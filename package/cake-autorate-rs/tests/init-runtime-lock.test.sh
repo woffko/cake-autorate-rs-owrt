@@ -2,7 +2,8 @@
 set -eu
 
 base="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-init_script="$base/files/etc/init.d/cake-autorate"
+init_template="$base/files/etc/init.d/cake-autorate"
+init_renderer="$base/scripts/render-init-variant.sh"
 lock_lib="$base/files/usr/libexec/cake-autorate-rs/runtime-lock"
 
 poll_delay() {
@@ -16,15 +17,17 @@ holder_main() {
 	root="$1"
 	ready="$2"
 	release="$3"
-	CAKE_AUTORATE_RUNTIME_LOCK_ROOT="$root"
-	export CAKE_AUTORATE_RUNTIME_LOCK_ROOT
-	. "$lock_lib"
-	runtime_lock_acquire_global_shared
+	mkdir -p "$root"
+	chmod 700 "$root"
+	exec 8>>"$root/runtime.guard"
+	chmod 600 "$root/runtime.guard"
+	flock -s 8
 	: > "$ready"
 	while [ ! -e "$release" ]; do
 		poll_delay
 	done
-	runtime_lock_release_global
+	flock -u 8
+	exec 8>&-
 }
 
 harness_main() {
@@ -34,10 +37,38 @@ harness_main() {
 	ownership="${4:-standalone}"
 	CAKE_AUTORATE_RUNTIME_LOCK_LIB="$lock_lib"
 	CAKE_AUTORATE_RUNTIME_LOCK_ROOT="$root"
-	CAKE_AUTORATE_NATIVE_APPLY_RECOVERY_ROOT="$root/native-apply-recovery"
 	export CAKE_AUTORATE_RUNTIME_LOCK_LIB CAKE_AUTORATE_RUNTIME_LOCK_ROOT
-	export CAKE_AUTORATE_NATIVE_APPLY_RECOVERY_ROOT
+	init_script="$root/cake-autorate.full.$$"
+	sh "$init_renderer" full "$init_template" "$init_script"
 	. "$init_script"
+	rm -f "$init_script"
+	DAEMON="$root/cake-autorated"
+	CAKE_TEST_LIFECYCLE_LOG="$log"
+	export CAKE_TEST_LIFECYCLE_LOG
+	cat >"$DAEMON" <<'EOF'
+#!/bin/sh
+case "$*" in
+	'--service-lifecycle prepare-start')
+		if [ -e "$CAKE_AUTORATE_RUNTIME_LOCK_ROOT/native-apply-recovery/current" ]; then
+			exit 70
+		fi
+		if [ "${PKG_UPGRADE:-0}" = 1 ]; then
+			printf '%s\n' 'service-start-v2 - -'
+		else
+			printf '%s\n' native-prepare-start >> "$CAKE_TEST_LIFECYCLE_LOG"
+			printf '%s\n' 'service-start-v2 wan -'
+		fi
+		;;
+	'--service-lifecycle execute-stop')
+		[ "${CAKE_AUTORATE_SERVICE_LOCK_BORROW:-}" = 1 ]
+		[ "${CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_FD:-}" = 8 ]
+		printf '%s\n' native-execute-stop >> "$CAKE_TEST_LIFECYCLE_LOG"
+		printf '%s\n' 'service-stop-v1 ok'
+		;;
+	*) exit 64 ;;
+esac
+EOF
+	chmod +x "$DAEMON"
 
 	assert_exclusive_lock() {
 		if sh -c '
@@ -56,16 +87,9 @@ harness_main() {
 	}
 
 	logger() { :; }
-	sleep() { :; }
-	config_load() { mark_mutation config-load; }
-	sync_interface_presets() { mark_mutation sync-presets; }
-	detect_managed_sqm_conflicts() { mark_mutation detect-conflicts; }
-	sync_sqm_config() { mark_mutation sync-sqm; }
-	prepare_sqm_ingress_interfaces() { mark_mutation prepare-ingress; }
-	start_sqm_backend() { mark_mutation start-sqm; }
-	stop_managed_sqm_backend() { mark_mutation stop-sqm; }
-	cleanup_runtime_files() { mark_mutation cleanup-runtime; }
-	config_foreach() { mark_mutation start-instances; }
+	procd_open_instance() { mark_mutation "procd-open:$1"; }
+	procd_set_param() { mark_mutation "procd-set:$1"; }
+	procd_close_instance() { mark_mutation procd-close; }
 
 	stop() {
 		stop_service "$@"
@@ -84,40 +108,6 @@ harness_main() {
 		start_service "$@"
 	}
 
-	uci() {
-		if [ "${1:-}" = -q ] && [ "${2:-}" = show ] && [ "${3:-}" = cake-autorate ]; then
-			printf '%s\n' "cake-autorate.wan=cake_autorate"
-			return 0
-		fi
-		return 1
-	}
-
-	config_get() {
-		variable="$1"
-		section="$2"
-		option="$3"
-		fallback="${4:-}"
-		value="$fallback"
-		case "$section.$option" in
-			wan.mwan3_member) value=wan ;;
-		esac
-		eval "$variable=\$value"
-	}
-
-	config_get_bool() {
-		variable="$1"
-		section="$2"
-		option="$3"
-		fallback="${4:-0}"
-		value="$fallback"
-		case "$section.$option" in
-			wan.enabled) value=1 ;;
-		esac
-		eval "$variable=\$value"
-	}
-
-	pgrep() { return 1; }
-
 	case "$mode" in
 		start) start_service ;;
 		upgrade-start)
@@ -132,7 +122,6 @@ harness_main() {
 		stop) stop ;;
 		reload) reload_service ;;
 		restart) restart ;;
-		recover) recover_interface wan ;;
 		*) echo "unknown harness mode: $mode" >&2; return 2 ;;
 	esac
 
@@ -232,7 +221,7 @@ done
 # Every public lifecycle entry point must fail before its first mutation while
 # an Auto-Tune-style shared lock is active.  In particular, stop must exit
 # before the rc.common wrapper reaches procd_kill().
-for mode in start stop reload restart recover; do
+for mode in start stop reload restart; do
 	if sh "$0" harness "$root" "$log" "$mode" >/dev/null 2>&1; then
 		echo "$mode unexpectedly ran while the shared runtime lock was held" >&2
 		exit 1
@@ -255,8 +244,8 @@ sh "$0" harness "$root" "$log" upgrade-start
 }
 
 # A durable native-Apply transaction must stop the ordinary service before it
-# acquires the global lock or mutates SQM.  Only the transaction owner may
-# borrow the init path while restoring the exact saved configuration.
+# mutates SQM. Rust owns this marker policy; the rc.common bridge must not
+# contain a second filesystem check or an environment bypass.
 mkdir -p "$root/native-apply-recovery"
 : > "$root/native-apply-recovery/current"
 : > "$log"
@@ -269,15 +258,25 @@ fi
 	exit 1
 }
 
-CAKE_AUTORATE_NATIVE_APPLY_RECOVERY=1 \
-	sh "$0" harness "$root" "$log" start
-expected_start="config-load
-sync-presets
-detect-conflicts
-sync-sqm
-prepare-ingress
-start-sqm
-start-instances"
+if CAKE_AUTORATE_NATIVE_APPLY_RECOVERY=1 \
+	sh "$0" harness "$root" "$log" start >/dev/null 2>&1; then
+	echo "ordinary start accepted a native Apply marker through a shell-era bypass" >&2
+	exit 1
+fi
+[ ! -s "$log" ] || {
+	echo "native Apply marker bypass mutated runtime state" >&2
+	exit 1
+}
+
+rm -f "$root/native-apply-recovery/current"
+sh "$0" harness "$root" "$log" start
+expected_start="native-prepare-start
+procd-open:wan
+procd-set:command
+procd-set:respawn
+procd-set:stdout
+procd-set:stderr
+procd-close"
 actual="$(cat "$log")"
 [ "$actual" = "$expected_start" ] || {
 	echo "native Apply recovery owner could not use the guarded init path" >&2
@@ -289,17 +288,16 @@ rm -f "$root/native-apply-recovery/current"
 
 sh "$0" harness "$root" "$log" reload
 
-expected="stop-sqm
+expected="native-execute-stop
 procd-kill
-cleanup-runtime
 stop-start-boundary
-config-load
-sync-presets
-detect-conflicts
-sync-sqm
-prepare-ingress
-start-sqm
-start-instances"
+native-prepare-start
+procd-open:wan
+procd-set:command
+procd-set:respawn
+procd-set:stdout
+procd-set:stderr
+procd-close"
 actual="$(cat "$log")"
 [ "$actual" = "$expected" ] || {
 	echo "reload did not complete as one healthy stop/start transaction" >&2
@@ -313,15 +311,6 @@ actual="$(cat "$log")"
 [ "$actual" = "$expected" ] || {
 	echo "borrowed restart did not preserve one continuous lifecycle transaction" >&2
 	printf 'expected:\n%s\nactual:\n%s\n' "$expected" "$actual" >&2
-	exit 1
-}
-
-: > "$log"
-sh "$0" harness "$root" "$log" recover
-actual="$(cat "$log")"
-[ "$actual" = "config-load" ] || {
-	echo "member recovery hint mutated global service or SQM state" >&2
-	printf 'actual:\n%s\n' "$actual" >&2
 	exit 1
 }
 

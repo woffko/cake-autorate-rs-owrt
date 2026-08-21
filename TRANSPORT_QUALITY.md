@@ -191,6 +191,16 @@ requested/observed phase, aggregate and background-subtracted traffic, current
 CAKE references, independent thresholds, finalization time, and any
 contamination/rejection reason while it runs.
 
+The LuCI dialog is also an operation client, not the source of ownership. It
+keeps Start disabled until `rating-current` attests the exact instance. A
+matching active Rating is adopted and polled across tabs; another calibration
+operation blocks Rating with a typed explanation. Each newly started Rating
+clears the previous job and worker identity, so an Automatic result can be
+followed by Guided capture in the same dialog. If another job wins after an
+idle attestation, a typed lease conflict triggers one re-attestation rather
+than a second Start. If the dialog closes while the Start RPC is in flight,
+the returned job receipt is immediately cancelled.
+
 ## Optional strict controller
 
 With `transport_controller_enabled=0`, transport evidence cannot change CAKE

@@ -21,7 +21,8 @@ assert.equal(helpers.canonicalTrafficProfile('auto'), 'auto');
 assert.equal(helpers.canonicalTrafficProfile('custom'), 'custom');
 assert.equal(helpers.canonicalTrafficProfile('invalid'), null);
 assert.equal(helpers.configuredTrafficProfile({ autotune_profile: 'gaming' }), 'auto');
-assert.equal(helpers.configuredTrafficProfile({ autotune_profile: 'gaming', traffic_defaults_gaming: '0' }), 'custom');
+assert.equal(helpers.configuredTrafficProfile({ autotune_profile: 'gaming', traffic_defaults_gaming: '0' }), 'auto');
+assert.equal(helpers.configuredTrafficProfile({ traffic_profile: 'custom' }), 'custom');
 assert.equal(helpers.resolvedTrafficProfile('auto', 'fair'), 'fair');
 assert.equal(helpers.effectiveRuleProfile(undefined), 'custom');
 assert.equal(helpers.effectiveRuleProfile('gaming'), 'gaming');
@@ -63,9 +64,11 @@ assert(source.includes("s.option(form.ListValue, 'traffic_profile'") &&
 	source.includes("o.widget = 'radio'") && source.includes("o.value('auto'") &&
 	source.includes("o.value('custom'"),
 	'traffic profiles must be one exclusive radio-card selection');
+assert(!source.includes('traffic_profile_migrated'),
+	'the current profile editor must not recreate the retired migration marker');
 assert(source.includes("addFlag(s, 'traffic_rules_enabled', _('Enable outbound traffic prioritization'), '0'"),
 	'upgrades must not enable a new packet policy without explicit opt-in');
-assert(source.includes("fs.exec('/usr/libexec/cake-autorate-rs/traffic-classifier', [ 'presets' ])"),
+assert(source.includes("fs.exec('/usr/sbin/cake-autorated', [ '--traffic-classifier', 'presets' ])"),
 	'LuCI must obtain its preview from the backend rule catalog');
 assert(source.includes("uci.add('cake-autorate', 'traffic_rule')") &&
 	source.includes("uci.set('cake-autorate', sectionId, 'profile', 'custom')") &&
@@ -74,12 +77,19 @@ assert(source.includes("uci.add('cake-autorate', 'traffic_rule')") &&
 	'Customize must stage an independent UCI copy without duplicating legacy Custom rules');
 assert(source.includes("s.filter = function(sectionId)"),
 	'custom rules must be filtered to the selected instance');
-assert(source.includes("fs.exec('/usr/libexec/cake-autorate-rs/traffic-classifier', classifierArgs)"),
+assert(source.includes("fs.exec('/usr/sbin/cake-autorated', classifierArgs)") &&
+	source.includes("var classifierArgs = [ '--traffic-classifier', 'status' ]"),
 	'the nested page must request instance-scoped classifier status');
 assert(source.includes("'data-label': trafficLabel") &&
 	source.includes('.traffic-profile-rule-table td:before{content:attr(data-label)') &&
 	source.includes('.traffic-profile-rule-table thead{display:none}'),
 	'the preset preview must remain readable as labelled cards on narrow screens');
+assert.match(source,
+	/handleReset: function\(ev\)[\s\S]*?discardPrioritiesStagedUci\(\)[\s\S]*?window\.location\.replace/,
+	'Traffic priorities Reset must revert its package-scoped RPC session before reload');
+assert.match(source,
+	/function discardPrioritiesStagedUci\(\)[\s\S]*?method: 'revert'[\s\S]*?callRevert\('cake-autorate'\)[\s\S]*?uci\.unload\('cake-autorate'\)/,
+	'Traffic priorities rollback must revert and unload only cake-autorate');
 
 const menu = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'root', 'usr', 'share',
 	'luci', 'menu.d', 'luci-app-cake-autorate-rs.json'), 'utf8'));

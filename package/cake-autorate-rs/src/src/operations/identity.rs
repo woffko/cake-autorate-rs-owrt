@@ -31,19 +31,28 @@ impl ProcessIdentity {
         parse_proc_stat(pid, &stat)
     }
 
-    pub fn still_matches(&self, proc_root: &Path) -> Result<bool, String> {
-        let stat_path = process_stat_path(proc_root, self.pid);
+    /// Inspect a process only while the kernel still considers it live.
+    ///
+    /// During task exit procfs can retain an exact command line briefly after
+    /// the process has entered Z/X state, while identity fields such as pgrp
+    /// are already unavailable.  That is an observed exit transition, not a
+    /// malformed live identity.  Live states remain fully fail-closed through
+    /// the ordinary identity parser.
+    pub fn inspect_live(proc_root: &Path, pid: u32) -> Result<Option<Self>, String> {
+        let stat_path = process_stat_path(proc_root, pid);
         let stat = match fs::read_to_string(&stat_path) {
             Ok(stat) => stat,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(format!("unable to read {}: {error}", stat_path.display())),
         };
-        let (identity, state) = parse_proc_stat_with_state(self.pid, &stat)?;
-        // A direct child remains in /proc while it is a zombie, with the same
-        // PID, process group and start time.  It is no longer a live process
-        // and must not hold a lease or cancellation state merely because its
-        // parent has not reaped it yet.
-        Ok(state != b'Z' && identity == *self)
+        if matches!(parse_proc_stat_state(pid, &stat)?, b'Z' | b'X' | b'x') {
+            return Ok(None);
+        }
+        parse_proc_stat(pid, &stat).map(Some)
+    }
+
+    pub fn still_matches(&self, proc_root: &Path) -> Result<bool, String> {
+        Ok(Self::inspect_live(proc_root, self.pid)?.as_ref() == Some(self))
     }
 }
 
@@ -142,6 +151,27 @@ fn parse_proc_stat_with_state(pid: u32, stat: &str) -> Result<(ProcessIdentity, 
         },
         state[0],
     ))
+}
+
+fn parse_proc_stat_state(pid: u32, stat: &str) -> Result<u8, String> {
+    let close = stat
+        .rfind(')')
+        .ok_or_else(|| "process stat is missing the command terminator".to_string())?;
+    let prefix = stat
+        .get(..close + 1)
+        .ok_or_else(|| "process stat command is malformed".to_string())?;
+    if !prefix.starts_with(&format!("{pid} (")) {
+        return Err("process stat PID does not match the requested PID".to_string());
+    }
+    let state = stat[close + 1..]
+        .split_ascii_whitespace()
+        .next()
+        .ok_or_else(|| "process stat has too few fields".to_string())?
+        .as_bytes();
+    if state.len() != 1 || !state[0].is_ascii_alphabetic() {
+        return Err("process stat state is invalid".to_string());
+    }
+    Ok(state[0])
 }
 
 pub fn process_stat_path(proc_root: &Path, pid: u32) -> PathBuf {
@@ -287,6 +317,45 @@ mod tests {
         )
         .unwrap();
         assert!(!identity.still_matches(&root).unwrap());
+
+        fs::remove_file(proc_dir.join("stat")).unwrap();
+        fs::remove_dir(proc_dir).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn exiting_process_does_not_require_identity_fields_that_the_kernel_released() {
+        let root = std::env::temp_dir().join(format!("cake-process-exiting-identity-{}", unsafe {
+            getpid()
+        }));
+        let proc_dir = root.join("42");
+        fs::create_dir_all(&proc_dir).unwrap();
+        fs::write(proc_dir.join("stat"), fake_stat(42, "worker", 41, 123)).unwrap();
+        let identity = ProcessIdentity::inspect(&root, 42).unwrap();
+
+        let mut fields = vec!["X".to_string(), "1".to_string(), "-1".to_string()];
+        while fields.len() <= 19 {
+            fields.push("0".to_string());
+        }
+        for state in ["Z", "X", "x"] {
+            fields[0] = state.to_string();
+            fs::write(
+                proc_dir.join("stat"),
+                format!("42 (worker) {} 0", fields.join(" ")),
+            )
+            .unwrap();
+            assert_eq!(ProcessIdentity::inspect_live(&root, 42).unwrap(), None);
+            assert!(!identity.still_matches(&root).unwrap());
+        }
+        for state in ["S", "R"] {
+            fields[0] = state.to_string();
+            fs::write(
+                proc_dir.join("stat"),
+                format!("42 (worker) {} 0", fields.join(" ")),
+            )
+            .unwrap();
+            assert!(ProcessIdentity::inspect_live(&root, 42).is_err());
+        }
 
         fs::remove_file(proc_dir.join("stat")).unwrap();
         fs::remove_dir(proc_dir).unwrap();

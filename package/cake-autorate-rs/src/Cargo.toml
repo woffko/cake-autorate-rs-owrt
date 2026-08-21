@@ -6,15 +6,21 @@ license = "GPL-2.0-or-later"
 
 [features]
 default = ["calibration"]
-calibration = []
+calibration = ["dep:ring", "transport-probes"]
+transport-probes = [
+    "dep:rustls",
+    "dep:socket2",
+    "dep:tungstenite",
+    "dep:webpki-roots",
+]
 
 [dependencies]
 libc = "0.2"
-ring = "0.17.14"
-rustls = { version = "0.23.35", default-features = false, features = ["ring", "std", "tls12"] }
-socket2 = { version = "0.6.4", features = ["all"] }
-tungstenite = { version = "0.29.0", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
-webpki-roots = "0.26.11"
+ring = { version = "0.17.14", optional = true }
+rustls = { version = "0.23.35", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+socket2 = { version = "0.6.4", features = ["all"], optional = true }
+tungstenite = { version = "0.29.0", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"], optional = true }
+webpki-roots = { version = "0.26.11", optional = true }
 
 [[bin]]
 name = "cake-autorated"

@@ -361,6 +361,12 @@ impl NativeManagedDirectionPlan {
                 let minimum = candidate.minimum_kbps.ok_or_else(|| {
                     format!("native bootstrap verified {label} candidate has no minimum")
                 })?;
+                let shaped_validation = candidate.tested_safe_maximum_kbps == Some(selected)
+                    && candidate.adaptive_cap_kbps == Some(expected.absolute_cap_kbps)
+                    && candidate.ceiling_evidence == Some("shaped_validation");
+                let capacity_only = candidate.tested_safe_maximum_kbps == Some(0)
+                    && candidate.adaptive_cap_kbps == Some(selected)
+                    && candidate.ceiling_evidence == Some("legacy_unverified");
                 if !(100..=MAX_RATE_KBPS).contains(&selected)
                     || minimum < expected.exploration_minimum_kbps
                     || minimum > selected
@@ -370,10 +376,8 @@ impl NativeManagedDirectionPlan {
                         .service_hard_cap_kbps
                         .is_some_and(|cap| selected > cap)
                     || candidate.maximum_kbps != Some(selected)
-                    || candidate.tested_safe_maximum_kbps != Some(selected)
-                    || candidate.adaptive_cap_kbps != Some(expected.absolute_cap_kbps)
                     || candidate.service_hard_cap_kbps != expected.service_hard_cap_kbps
-                    || candidate.ceiling_evidence != Some("shaped_validation")
+                    || !(shaped_validation || capacity_only)
                     || candidate.cap_source != Some(expected.cap_source.as_str())
                     || match candidate.measured_runtime_minimum_kbps {
                         Some(measured) => measured != minimum,
@@ -389,9 +393,17 @@ impl NativeManagedDirectionPlan {
                     minimum_kbps: minimum,
                     base_kbps: selected,
                     maximum_kbps: selected,
-                    adaptive_cap_kbps: expected.absolute_cap_kbps,
-                    adaptive_safe_kbps: selected,
-                    adaptive_evidence: "shaped_validation",
+                    adaptive_cap_kbps: if capacity_only {
+                        selected
+                    } else {
+                        expected.absolute_cap_kbps
+                    },
+                    adaptive_safe_kbps: if capacity_only { 0 } else { selected },
+                    adaptive_evidence: if capacity_only {
+                        "legacy_unverified"
+                    } else {
+                        "shaped_validation"
+                    },
                     adaptive_cap_source: expected.cap_source.as_str(),
                 })
             }
@@ -640,6 +652,9 @@ fn validate_bootstrap_input(input: &BootstrapApplyInputs<'_>) -> Result<(), Stri
         ) | (
             NativeApplyArtifactDigestsOwned::RawFallbackV5 { .. },
             NativeApplyAction::DisableSqm,
+        ) | (
+            NativeApplyArtifactDigestsOwned::ShapedCapacityFallbackV9 { .. },
+            NativeApplyAction::ApplySqm,
         )
     ) {
         return Err(
@@ -877,7 +892,6 @@ fn project_disabled_cake_section(
     // SQM queue projection which the raw fallback never measured.
     for (option, value) in [
         ("traffic_profile", "auto"),
-        ("traffic_profile_migrated", "1"),
         ("traffic_rules_enabled", "0"),
         ("enabled", "0"),
         ("wan_if", target),
@@ -1004,7 +1018,6 @@ fn project_cake_section(
 
     for (option, value) in [
         ("traffic_profile", "auto"),
-        ("traffic_profile_migrated", "1"),
         ("traffic_rules_enabled", "0"),
         ("enabled", "1"),
         ("wan_if", target),
@@ -1748,6 +1761,10 @@ mod tests {
         assert_eq!(scalar(plan.cake(), "wan_if"), "pppoe-wan");
         assert_eq!(scalar(plan.cake(), "dl_if"), "ifb4pppoe-wan");
         assert_eq!(scalar(plan.cake(), "route_mode"), "main");
+        assert!(!plan
+            .cake()
+            .options()
+            .contains_key("traffic_profile_migrated"));
         assert!(!plan.cake().options().contains_key("mwan3_member"));
         assert_eq!(scalar(plan.cake(), "speedtest_backend"), "speedtest-go");
         assert!(!plan.cake().options().contains_key("speedtest_go_server_id"));
@@ -1797,12 +1814,12 @@ mod tests {
         for omitted in ["ilimit", "elimit", "itarget", "etarget"] {
             assert!(!plan.sqm().unwrap().options().contains_key(omitted));
         }
-        assert_eq!(plan.action_count(), 125);
+        assert_eq!(plan.action_count(), 124);
         assert!(plan.action_count() > 96);
         assert!(plan.action_count() <= MAX_NATIVE_BOOTSTRAP_CONFIG_ACTIONS);
         assert_eq!(
             plan.canonical_sha256().unwrap(),
-            "3d146bba907d91f8900825066ac72db4383047b0bd562a181c75cd769b502474"
+            "78532dec5274f18e4c3380f18855d066585b0bfde7340e117c3ecf6fd826a0fa"
         );
     }
 

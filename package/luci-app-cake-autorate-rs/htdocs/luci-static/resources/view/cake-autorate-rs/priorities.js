@@ -1,6 +1,7 @@
 'use strict';
 'require fs';
 'require form';
+'require rpc';
 'require uci';
 'require ui';
 'require cake-autorate-rs.ui as cakeUi';
@@ -82,10 +83,7 @@ function canonicalTrafficProfile(value) {
 
 function configuredTrafficProfile(section) {
 	var configured = canonicalTrafficProfile(section && section.traffic_profile);
-	var autotune = canonicalProfile(section && section.autotune_profile) || 'best_overall';
-	if (configured)
-		return configured;
-	return section && section['traffic_defaults_' + autotune] === '0' ? 'custom' : 'auto';
+	return configured || 'auto';
 }
 
 function resolvedTrafficProfile(configured, autotune) {
@@ -200,6 +198,22 @@ function backToSettingsButton() {
 	}, [ '\u2190 ', _('Back to instances') ]);
 }
 
+function discardPrioritiesStagedUci() {
+	var callRevert = rpc.declare({
+		object: 'uci',
+		method: 'revert',
+		params: [ 'config' ],
+		reject: false
+	});
+	return callRevert('cake-autorate').then(function(status) {
+		if (status !== 0)
+			throw new Error(_('UCI could not discard the staged traffic-priority changes.'));
+		if (typeof uci.unload === 'function')
+			uci.unload('cake-autorate');
+		return true;
+	});
+}
+
 function parseClassifierStatus(result) {
 	var text = result && result.stdout ? result.stdout.trim() : '';
 	var parsed;
@@ -293,20 +307,32 @@ function addList(section, name, title, values, defaultValue) {
 }
 
 return L.view.extend({
+	handleReset: function(ev) {
+		/* This nested view owns cake-autorate traffic rules only. Its form Save
+		 * may materialize the disabled default flag in the LuCI RPC session; a
+		 * plain form redraw must not leave an invisible Unsaved Changes delta. */
+		return discardPrioritiesStagedUci().then(function() {
+			var url = window.location && window.location.href;
+			if (url && typeof window.location.replace === 'function')
+				window.location.replace(url.split('#')[0]);
+			return true;
+		});
+	},
+
 	load: function() {
 		var requestedInstance = selectedInstanceFromLocation(window.location);
-		var classifierArgs = [ 'status' ];
+		var classifierArgs = [ '--traffic-classifier', 'status' ];
 		if (requestedInstance)
 			classifierArgs.push(requestedInstance);
 		return Promise.all([
 			uci.load('cake-autorate'),
 			L.resolveDefault(
-				fs.exec('/usr/libexec/cake-autorate-rs/traffic-classifier', classifierArgs)
+				fs.exec('/usr/sbin/cake-autorated', classifierArgs)
 					.then(parseClassifierStatus),
 				{ state: 'unavailable', table_present: false }
 			),
 			L.resolveDefault(
-				fs.exec('/usr/libexec/cake-autorate-rs/traffic-classifier', [ 'presets' ])
+				fs.exec('/usr/sbin/cake-autorated', [ '--traffic-classifier', 'presets' ])
 					.then(parsePresetCatalog),
 				{ schema_version: 0, profiles: {} }
 			)
@@ -362,7 +388,6 @@ return L.view.extend({
 			var rules = catalog.profiles && catalog.profiles[sourceProfile];
 
 			uci.set('cake-autorate', selectedInstance, 'traffic_profile', 'custom');
-			uci.set('cake-autorate', selectedInstance, 'traffic_profile_migrated', '1');
 			if (existing.length > 0) {
 				ui.addNotification(null, E('p', {},
 					_('Custom rules already exist. They were preserved and the Custom profile was selected.')),

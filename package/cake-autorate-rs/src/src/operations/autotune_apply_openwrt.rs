@@ -25,6 +25,9 @@ use super::kernel_topology::{
     capture_read_only_witness, ExpectedOwnedTopology, KernelTopologyStagePolicy,
 };
 use super::kernel_topology_netlink::{LinuxNetlinkIo, NetlinkTopologyReader};
+use super::native_apply_lifecycle::{
+    run_selected_instance_lifecycle, SelectedLifecycleAction as NativeApplyInstanceAction,
+};
 use super::process::{run_bounded_command_output_with_input, SpawnSpec};
 use super::protocol::{OperationRequest, OperationRouteMode, OperationTargetState};
 use super::runtime::{attest_openwrt_route_identity, attest_openwrt_runtime, RuntimeAttestation};
@@ -40,56 +43,13 @@ use std::time::{Duration, Instant};
 
 const UCI_PROGRAM: &str = "/sbin/uci";
 const PRIVATE_UCI_SAVEDIR: &str = "/tmp/cake-autorate-native-apply-uci";
-const LEGACY_APPLY_GUARD_ROOT: &str = "/tmp/cake-autorate-apply-guard";
-const LEGACY_APPLY_MARKER: &[u8] = b"._autotune_apply_";
-const SERVICE_PROGRAM: &str = "/etc/init.d/cake-autorate";
 const CAKE_CONFIG_PATH: &str = "/etc/config/cake-autorate";
 const SQM_CONFIG_PATH: &str = "/etc/config/sqm";
 const APPLY_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
-const SERVICE_RESTART_TIMEOUT: Duration = Duration::from_secs(60);
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 const VERIFY_INTERVAL: Duration = Duration::from_millis(200);
 const COMMAND_OUTPUT_LIMIT: usize = 16 * 1024;
 const PROC_CMDLINE_LIMIT: u64 = 4 * 1024;
-
-#[derive(Clone, Copy)]
-enum NativeApplyInstanceAction {
-    Restart,
-    Stop,
-}
-
-impl NativeApplyInstanceAction {
-    fn as_init_command(self) -> &'static str {
-        match self {
-            Self::Restart => "native_apply_restart_instance",
-            Self::Stop => "native_apply_stop_instance",
-        }
-    }
-}
-
-fn native_apply_instance_spawn_spec(
-    action: NativeApplyInstanceAction,
-    instance: &str,
-    managed_sqm_section: &str,
-    target_interface: &str,
-) -> Result<SpawnSpec, String> {
-    validate_init_identifier(instance)?;
-    validate_init_identifier(managed_sqm_section)?;
-    validate_init_interface(target_interface)?;
-    Ok(SpawnSpec {
-        program: PathBuf::from(SERVICE_PROGRAM),
-        arguments: vec![
-            OsString::from(action.as_init_command()),
-            OsString::from(instance),
-            OsString::from(managed_sqm_section),
-            OsString::from(target_interface),
-        ],
-        environment: vec![(
-            OsString::from("CAKE_AUTORATE_NATIVE_APPLY_RECOVERY"),
-            OsString::from("1"),
-        )],
-    })
-}
 
 pub(crate) fn default_native_apply_paths() -> NativeApplyTransactionPaths<'static> {
     NativeApplyTransactionPaths {
@@ -130,7 +90,6 @@ impl OpenWrtNativeApplyBackend {
         provisional.validate()?;
         self.require_bootstrap_root()?;
         self.require_clean_uci()?;
-        self.require_no_legacy_apply_markers()?;
         attest_bootstrap_route(request, "runtime baseline preflight")?;
         let first_uci = self.attest_bootstrap_uci_absence_once(request, &provisional)?;
         self.require_bootstrap_managed_slots_absent(request)?;
@@ -187,7 +146,6 @@ impl OpenWrtNativeApplyBackend {
     ) -> Result<(), String> {
         self.require_bootstrap_root()?;
         self.require_clean_uci()?;
-        self.require_no_legacy_apply_markers()?;
         validate_bootstrap_request_baseline(request, baseline)?;
         attest_bootstrap_route(request, "runtime identity preflight")?;
         let first = self.attest_bootstrap_uci_absence_once(request, baseline)?;
@@ -364,33 +322,7 @@ impl OpenWrtNativeApplyBackend {
         managed_target_interface: &str,
         lock: &NativeApplyGlobalLock,
     ) -> Result<(), String> {
-        let managed_sqm_section = request
-            .managed_sqm_section
-            .as_deref()
-            .ok_or_else(|| "native Apply request has no managed SQM section".to_string())?;
-        let action_name = action.as_init_command();
-        let spec = native_apply_instance_spawn_spec(
-            action,
-            &request.identity.instance,
-            managed_sqm_section,
-            managed_target_interface,
-        )?;
-        let output = run_bounded_command_output_with_input(
-            &spec,
-            None,
-            SERVICE_RESTART_TIMEOUT,
-            COMMAND_OUTPUT_LIMIT,
-            || false,
-            |command| lock.configure_borrowed_restart(command),
-        )
-        .map_err(|error| format!("native Apply service {action_name} failed: {error}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "native Apply service {action_name} exited unsuccessfully: {}",
-                bounded_stderr(&output.stderr)
-            ));
-        }
-        Ok(())
+        run_selected_instance_lifecycle(action, request, managed_target_interface, lock)
     }
 
     fn require_clean_uci(&self) -> Result<(), String> {
@@ -409,24 +341,6 @@ impl OpenWrtNativeApplyBackend {
             }
         }
         self.require_private_uci_clean()
-    }
-
-    fn require_no_legacy_apply_markers(&self) -> Result<(), String> {
-        for package in ["cake-autorate", "sqm"] {
-            let output = self.run_uci(&["-q", "show", package], None)?;
-            if !output.status.success() {
-                return Err(format!(
-                    "native Apply could not inspect legacy Apply markers for {package}: {}",
-                    bounded_stderr(&output.stderr)
-                ));
-            }
-            if contains_legacy_apply_marker(&output.stdout) {
-                return Err(format!(
-                    "legacy LuCI Apply has a persistent rollback marker in {package}"
-                ));
-            }
-        }
-        Ok(())
     }
 
     fn require_bootstrap_root(&self) -> Result<(), String> {
@@ -541,7 +455,6 @@ impl OpenWrtNativeApplyBackend {
     ) -> Result<(), String> {
         self.require_bootstrap_root()?;
         self.require_clean_uci()?;
-        self.require_no_legacy_apply_markers()?;
         attest_bootstrap_route(request, "absence preflight")?;
         let first_uci = self.attest_bootstrap_uci_absence_once(request, baseline)?;
         self.require_bootstrap_managed_slots_absent(request)?;
@@ -953,9 +866,12 @@ fn require_selected_controller_absent(proc_root: &Path, instance: &str) -> Resul
                 format!("unable to read controller process {name} command line: {error}")
             })?;
         if bytes.len() > PROC_CMDLINE_LIMIT as usize {
-            return Err(format!(
-                "controller process {name} command line exceeds its safety bound"
-            ));
+            if selected_controller_cmdline_prefix(&bytes, instance) {
+                return Err(format!(
+                    "controller process {name} command line exceeds its safety bound"
+                ));
+            }
+            continue;
         }
         if selected_controller_cmdline(&bytes, instance) {
             return Err(format!(
@@ -964,6 +880,13 @@ fn require_selected_controller_absent(proc_root: &Path, instance: &str) -> Resul
         }
     }
     Ok(())
+}
+
+fn selected_controller_cmdline_prefix(bytes: &[u8], instance: &str) -> bool {
+    let mut fields = bytes.split(|byte| *byte == 0);
+    fields.next() == Some(b"/usr/sbin/cake-autorated".as_slice())
+        && fields.next() == Some(b"--instance".as_slice())
+        && fields.next() == Some(instance.as_bytes())
 }
 
 fn selected_controller_cmdline(bytes: &[u8], instance: &str) -> bool {
@@ -1014,15 +937,6 @@ fn validate_bootstrap_managed_slot_output(
 }
 
 impl NativeApplyTransactionBackend for OpenWrtNativeApplyBackend {
-    fn attest_legacy_apply_idle(&mut self) -> Result<(), String> {
-        require_legacy_apply_guard_idle(Path::new(LEGACY_APPLY_GUARD_ROOT))?;
-        self.require_no_legacy_apply_markers()?;
-        // The current legacy arm path observes the same runtime.guard before
-        // publication.  Recheck the sentinel after UCI inspection as a
-        // fail-closed compatibility guard for an already-running old helper.
-        require_legacy_apply_guard_idle(Path::new(LEGACY_APPLY_GUARD_ROOT))
-    }
-
     fn candidate_already_applied(
         &mut self,
         plan: &NativeApplyExecutionPlan,
@@ -1172,10 +1086,6 @@ impl NativeApplyTransactionBackend for OpenWrtNativeApplyBackend {
 }
 
 impl NativeBootstrapApplyBackend for OpenWrtNativeApplyBackend {
-    fn attest_legacy_apply_idle(&mut self) -> Result<(), String> {
-        <Self as NativeApplyTransactionBackend>::attest_legacy_apply_idle(self)
-    }
-
     fn candidate_already_applied(
         &mut self,
         plan: &NativeBootstrapApplyPlan,
@@ -1216,7 +1126,6 @@ impl NativeBootstrapApplyBackend for OpenWrtNativeApplyBackend {
         self.require_bootstrap_root()?;
         validate_bootstrap_request_baseline(plan.request(), plan.absent_baseline())?;
         self.require_clean_uci()?;
-        self.require_no_legacy_apply_markers()?;
         attest_bootstrap_route(plan.request(), "candidate pre-restart preflight")?;
         self.verify_bootstrap_materialized_config(plan)?;
         if plan.mode() == NativeBootstrapApplyMode::DisabledInactive {
@@ -1313,7 +1222,6 @@ impl NativeBootstrapApplyBackend for OpenWrtNativeApplyBackend {
         let baseline = absent_baseline_from_record(request, record)?;
         self.require_bootstrap_root()?;
         self.require_clean_uci()?;
-        self.require_no_legacy_apply_markers()?;
         attest_bootstrap_route(request, "roll-forward pre-restart preflight")?;
         self.verify_bootstrap_candidate_config(request, record.mode)?;
         self.require_bootstrap_managed_slots_absent(request)?;
@@ -1364,42 +1272,6 @@ impl NativeBootstrapApplyBackend for OpenWrtNativeApplyBackend {
                 self.require_bootstrap_managed_slots_absent(request)
             }
         }
-    }
-}
-
-fn contains_legacy_apply_marker(bytes: &[u8]) -> bool {
-    bytes
-        .windows(LEGACY_APPLY_MARKER.len())
-        .any(|window| window == LEGACY_APPLY_MARKER)
-}
-
-fn require_legacy_apply_guard_idle(path: &Path) -> Result<(), String> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(format!(
-                "unable to inspect the legacy LuCI Apply guard root: {error}"
-            ))
-        }
-    };
-    if !metadata.file_type().is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o077 != 0
-    {
-        return Err("legacy LuCI Apply guard root is unsafe".to_string());
-    }
-    let mut entries = fs::read_dir(path)
-        .map_err(|error| format!("unable to enumerate legacy LuCI Apply guards: {error}"))?;
-    match entries.next() {
-        None => Ok(()),
-        Some(Ok(_)) => Err(
-            "legacy LuCI Apply owns a guard token or has unresolved guard residue; reconcile it before native Apply"
-                .to_string(),
-        ),
-        Some(Err(error)) => Err(format!(
-            "unable to inspect a legacy LuCI Apply guard entry: {error}"
-        )),
     }
 }
 
@@ -1508,15 +1380,14 @@ mod tests {
     use crate::operations::autotune_bootstrap_apply::tests::{
         fixture_plan, fixture_raw_fallback_plan,
     };
-    use std::os::unix::fs::{symlink, PermissionsExt};
 
-    fn legacy_guard_fixture(name: &str) -> PathBuf {
+    fn test_root(name: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "cake-native-legacy-guard-{}-{nonce}-{name}",
+            "cake-native-apply-openwrt-{}-{nonce}-{name}",
             std::process::id()
         ));
         let mut builder = DirBuilder::new();
@@ -1537,19 +1408,6 @@ mod tests {
     }
 
     #[test]
-    fn persistent_legacy_marker_detection_covers_both_package_formats() {
-        assert!(contains_legacy_apply_marker(
-            b"cake-autorate.wan._autotune_apply_token='abc'\n"
-        ));
-        assert!(contains_legacy_apply_marker(
-            b"sqm.cake_autorate_apply_wan._autotune_apply_guard='1'\n"
-        ));
-        assert!(!contains_legacy_apply_marker(
-            b"cake-autorate.wan.autorate_enabled='1'\n"
-        ));
-    }
-
-    #[test]
     fn default_paths_are_fixed_and_flash_recovery_is_not_in_tmp() {
         let paths = default_native_apply_paths();
         assert_eq!(
@@ -1559,40 +1417,6 @@ mod tests {
         assert_eq!(paths.cake_config, Path::new("/etc/config/cake-autorate"));
         assert_eq!(paths.sqm_config, Path::new("/etc/config/sqm"));
         assert!(paths.recovery_root.starts_with("/etc/"));
-        assert_eq!(
-            Path::new(LEGACY_APPLY_GUARD_ROOT),
-            Path::new("/tmp/cake-autorate-apply-guard")
-        );
-    }
-
-    #[test]
-    fn legacy_guard_fence_accepts_only_an_empty_private_owner_directory() {
-        let root = legacy_guard_fixture("idle");
-        require_legacy_apply_guard_idle(&root).unwrap();
-        fs::create_dir(root.join("token")).unwrap();
-        assert!(require_legacy_apply_guard_idle(&root)
-            .unwrap_err()
-            .contains("owns a guard token"));
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn legacy_guard_fence_rejects_unsafe_mode_and_symlink_roots() {
-        let root = legacy_guard_fixture("unsafe-mode");
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(require_legacy_apply_guard_idle(&root)
-            .unwrap_err()
-            .contains("guard root is unsafe"));
-        fs::remove_dir_all(&root).unwrap();
-
-        let target = legacy_guard_fixture("symlink-target");
-        let link = target.with_extension("link");
-        symlink(&target, &link).unwrap();
-        assert!(require_legacy_apply_guard_idle(&link)
-            .unwrap_err()
-            .contains("guard root is unsafe"));
-        fs::remove_file(link).unwrap();
-        fs::remove_dir_all(target).unwrap();
     }
 
     #[test]
@@ -1605,60 +1429,6 @@ mod tests {
                 .map(OsString::from)
                 .collect::<Vec<_>>()
         );
-    }
-
-    #[test]
-    fn selected_instance_commands_have_fixed_program_argv_and_private_marker() {
-        for (action, expected_command) in [
-            (
-                NativeApplyInstanceAction::Restart,
-                "native_apply_restart_instance",
-            ),
-            (
-                NativeApplyInstanceAction::Stop,
-                "native_apply_stop_instance",
-            ),
-        ] {
-            let spec =
-                native_apply_instance_spawn_spec(action, "wan_sqm", "cake_wan_sqm", "pppoe-wan")
-                    .expect("safe instance identity must build a fixed init command");
-            assert_eq!(spec.program, PathBuf::from(SERVICE_PROGRAM));
-            assert_eq!(
-                spec.arguments,
-                [expected_command, "wan_sqm", "cake_wan_sqm", "pppoe-wan"]
-                    .into_iter()
-                    .map(OsString::from)
-                    .collect::<Vec<_>>()
-            );
-            assert_eq!(
-                spec.environment,
-                vec![(
-                    OsString::from("CAKE_AUTORATE_NATIVE_APPLY_RECOVERY"),
-                    OsString::from("1")
-                )]
-            );
-        }
-        assert!(native_apply_instance_spawn_spec(
-            NativeApplyInstanceAction::Restart,
-            "wan;reboot",
-            "cake_wan_sqm",
-            "pppoe-wan"
-        )
-        .is_err());
-        assert!(native_apply_instance_spawn_spec(
-            NativeApplyInstanceAction::Restart,
-            "wan_sqm",
-            "cake-wan-sqm",
-            "pppoe-wan"
-        )
-        .is_err());
-        assert!(native_apply_instance_spawn_spec(
-            NativeApplyInstanceAction::Restart,
-            "wan_sqm",
-            "cake_wan_sqm",
-            "pppoe-wan;reboot"
-        )
-        .is_err());
     }
 
     fn bootstrap_config_fixture(request: &OperationRequest, direction_mode: &str) -> Config {
@@ -1765,7 +1535,7 @@ mod tests {
 
     #[test]
     fn disabled_controller_absence_uses_exact_bounded_cmdline_identity() {
-        let root = legacy_guard_fixture("proc-controller");
+        let root = test_root("proc-controller");
         for (pid, cmdline) in [
             (
                 "101",
@@ -1785,6 +1555,24 @@ mod tests {
             fs::write(process.join("cmdline"), cmdline).unwrap();
         }
         require_selected_controller_absent(&root, "wan_sqm").unwrap();
+
+        let unrelated = root.join("105");
+        fs::create_dir(&unrelated).unwrap();
+        let mut unrelated_cmdline = b"/usr/bin/apcontroller\0".to_vec();
+        unrelated_cmdline.extend(std::iter::repeat_n(b'x', PROC_CMDLINE_LIMIT as usize + 32));
+        unrelated_cmdline.push(0);
+        fs::write(unrelated.join("cmdline"), unrelated_cmdline).unwrap();
+        require_selected_controller_absent(&root, "wan_sqm").unwrap();
+
+        let oversized = root.join("106");
+        fs::create_dir(&oversized).unwrap();
+        let mut oversized_cmdline = b"/usr/sbin/cake-autorated\0--instance\0wan_sqm\0".to_vec();
+        oversized_cmdline.extend(std::iter::repeat_n(b'y', PROC_CMDLINE_LIMIT as usize + 32));
+        fs::write(oversized.join("cmdline"), oversized_cmdline).unwrap();
+        assert!(require_selected_controller_absent(&root, "wan_sqm")
+            .unwrap_err()
+            .contains("exceeds its safety bound"));
+        fs::remove_dir_all(oversized).unwrap();
 
         let selected = root.join("104");
         fs::create_dir(&selected).unwrap();
@@ -1862,16 +1650,13 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_backend_has_no_timer_driven_retry_or_legacy_false_fallback() {
+    fn bootstrap_backend_has_no_timer_driven_retry_or_false_fallback() {
         let source = include_str!("autotune_apply_openwrt.rs");
         let bootstrap = source
             .split_once("impl NativeBootstrapApplyBackend for OpenWrtNativeApplyBackend")
             .unwrap()
             .1;
-        let bootstrap = bootstrap
-            .split_once("fn contains_legacy_apply_marker")
-            .unwrap()
-            .0;
+        let bootstrap = bootstrap.split_once("fn exact_config_rate").unwrap().0;
         assert!(!bootstrap.contains("thread::sleep"));
         assert!(!bootstrap.contains("verify_candidate_once(plan).is_ok()"));
         assert!(

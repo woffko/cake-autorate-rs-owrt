@@ -23,7 +23,6 @@ const CHECKPOINT_FILE: &str = "checkpoint.record";
 const PERMIT_HEADER: &str = "cake-autorate-autotune-runtime-permit\t3";
 const VARIANT_PERMIT_HEADER: &str = "cake-autorate-autotune-runtime-permit\t4";
 const NAMESPACE_PERMIT_HEADER: &str = "cake-autorate-autotune-runtime-permit\t5";
-const LEGACY_PERMIT_HEADER: &str = "cake-autorate-autotune-runtime-permit\t2";
 const CHECKPOINT_HEADER: &str = "cake-autorate-autotune-runtime-checkpoint\t2";
 const ABSENT_CHECKPOINT_HEADER: &str = "cake-autorate-autotune-runtime-checkpoint\t3";
 const NAMESPACE_CHECKPOINT_HEADER: &str = "cake-autorate-autotune-runtime-checkpoint\t4";
@@ -44,7 +43,7 @@ impl AutotuneRuntimePermit {
     }
 
     fn encode_for_schema(&self, schema: u8) -> Result<String, String> {
-        if !(2..=5).contains(&schema) {
+        if !(3..=5).contains(&schema) {
             return Err("unsupported runtime permit schema".to_string());
         }
         if schema < 5 && matches!(&self.baseline, RuntimeBaseline::Absent(_)) {
@@ -54,13 +53,10 @@ impl AutotuneRuntimePermit {
             );
         }
         self.validate()?;
-        if schema == 2 && self.kind != RuntimePermitKind::Autotune {
-            return Err("legacy runtime permit schema supports Auto-Tune only".to_string());
-        }
-        let mut fields = vec![("permit_id", self.permit_id.clone())];
-        if schema >= 3 {
-            fields.push(("permit_kind", self.kind.as_str().to_string()));
-        }
+        let mut fields = vec![
+            ("permit_id", self.permit_id.clone()),
+            ("permit_kind", self.kind.as_str().to_string()),
+        ];
         fields.extend([
             ("job_id", self.job_id.clone()),
             ("worker_run_id", self.worker_run_id.clone()),
@@ -145,7 +141,7 @@ impl AutotuneRuntimePermit {
             }
         } else {
             let RuntimeBaseline::Managed(topology) = &self.baseline else {
-                unreachable!("absent baselines were rejected for legacy schemas")
+                unreachable!("absent baselines were rejected for managed schemas")
             };
             fields.push(("baseline_topology", topology.as_str().to_string()));
         }
@@ -190,7 +186,6 @@ impl AutotuneRuntimePermit {
         ]);
         encode_record(
             match schema {
-                2 => LEGACY_PERMIT_HEADER,
                 3 => PERMIT_HEADER,
                 4 => VARIANT_PERMIT_HEADER,
                 5 => NAMESPACE_PERMIT_HEADER,
@@ -205,13 +200,11 @@ impl AutotuneRuntimePermit {
             Some(NAMESPACE_PERMIT_HEADER) => 5,
             Some(VARIANT_PERMIT_HEADER) => 4,
             Some(PERMIT_HEADER) => 3,
-            Some(LEGACY_PERMIT_HEADER) => 2,
             _ => return Err("runtime permit record header is invalid".to_string()),
         };
         let mut reader = RecordReader::new(
             input,
             match schema {
-                2 => LEGACY_PERMIT_HEADER,
                 3 => PERMIT_HEADER,
                 4 => VARIANT_PERMIT_HEADER,
                 5 => NAMESPACE_PERMIT_HEADER,
@@ -220,12 +213,8 @@ impl AutotuneRuntimePermit {
         )?;
         let permit = Self {
             permit_id: reader.field("permit_id")?,
-            kind: if schema >= 3 {
-                RuntimePermitKind::parse(&reader.field("permit_kind")?)
-                    .ok_or_else(|| "runtime permit kind is unsupported".to_string())?
-            } else {
-                RuntimePermitKind::Autotune
-            },
+            kind: RuntimePermitKind::parse(&reader.field("permit_kind")?)
+                .ok_or_else(|| "runtime permit kind is unsupported".to_string())?,
             job_id: reader.field("job_id")?,
             worker_run_id: reader.field("worker_run_id")?,
             boot_id: reader.field("boot_id")?,
@@ -1523,7 +1512,6 @@ mod tests {
 
     fn frozen_managed_permit(schema: u8) -> String {
         let (header, permit_kind) = match schema {
-            2 => (LEGACY_PERMIT_HEADER, ""),
             3 => (PERMIT_HEADER, "permit_kind=autotune\n"),
             _ => panic!("unsupported frozen permit schema"),
         };
@@ -1692,20 +1680,21 @@ temporary_redirect_preference=50039\n"
     }
 
     #[test]
-    fn legacy_permit_bytes_decode_as_managed_and_reencode_exactly() {
-        for schema in [2, 3] {
-            let frozen = frozen_managed_permit(schema);
-            let decoded = AutotuneRuntimePermit::decode(&frozen).unwrap();
-            assert_eq!(
-                decoded.baseline,
-                RuntimeBaseline::Managed(MeasurementTopology::ShapedBoth)
-            );
-            assert_eq!(decoded.encode_for_schema(schema).unwrap(), frozen);
-            if schema == 3 {
-                assert_eq!(decoded.encode().unwrap(), frozen);
-            }
-        }
+    fn managed_v3_permit_bytes_decode_and_reencode_exactly() {
+        let frozen = frozen_managed_permit(3);
+        let decoded = AutotuneRuntimePermit::decode(&frozen).unwrap();
+        assert_eq!(
+            decoded.baseline,
+            RuntimeBaseline::Managed(MeasurementTopology::ShapedBoth)
+        );
+        assert_eq!(decoded.encode_for_schema(3).unwrap(), frozen);
+        assert_eq!(decoded.encode().unwrap(), frozen);
         assert_eq!(permit().encode().unwrap(), frozen_managed_permit(3));
+        assert!(permit().encode_for_schema(2).is_err());
+        let retired_v2 = frozen
+            .replacen(PERMIT_HEADER, "cake-autorate-autotune-runtime-permit\t2", 1)
+            .replace("permit_kind=autotune\n", "");
+        assert!(AutotuneRuntimePermit::decode(&retired_v2).is_err());
     }
 
     #[test]
@@ -1734,7 +1723,6 @@ temporary_redirect_preference=50039\n"
             AutotuneRuntimePermit::decode(&encoded_absent).unwrap(),
             absent
         );
-        assert!(absent.encode_for_schema(2).is_err());
         assert!(absent.encode_for_schema(3).is_err());
         assert!(absent.encode_for_schema(4).is_err());
 

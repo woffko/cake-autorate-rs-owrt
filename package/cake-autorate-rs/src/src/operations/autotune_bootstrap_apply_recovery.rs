@@ -1185,7 +1185,7 @@ mod tests {
         assert_eq!(record.encode().unwrap().len(), 1_050);
         assert_eq!(
             sqm_identity::sha256sum(&record.encode().unwrap()).unwrap(),
-            "f018d2e199de68c9ae033d6fe7cdcc61404a0d18014b3c178cf5f7b2273f9b76"
+            "8fed78737aa24ed4b3939519ced08831ba207250298082beb975e827c95aa41a"
         );
         assert_eq!(
             NativeBootstrapApplyRecoveryRecord::decode(&record.encode().unwrap()).unwrap(),

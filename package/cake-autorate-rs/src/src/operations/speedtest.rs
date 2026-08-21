@@ -1,5 +1,6 @@
+use super::autotune_apply_openwrt::OpenWrtNativeApplyBackend;
 use super::autotune_runtime::{
-    speedtest_unshaped_topology, AutotuneRuntimePermit, RuntimePermitKind,
+    speedtest_unshaped_topology, AbsentRuntimeBaseline, AutotuneRuntimePermit, RuntimePermitKind,
 };
 use super::autotune_runtime_store::RuntimeOverrideStore;
 use super::full_autotune::AutotuneRuntimeControl;
@@ -7,7 +8,9 @@ use super::identity::{
     monotonic_boot_ms, read_kernel_uuid, ProcessIdentity, DEFAULT_BOOT_ID_PATH, DEFAULT_PROC_ROOT,
 };
 use super::process::{run_bounded_command_output, SpawnSpec};
-use super::protocol::{OperationKind, OperationRequest, OperationRouteMode, SpeedtestDirection};
+use super::protocol::{
+    OperationKind, OperationRequest, OperationRouteMode, OperationTargetState, SpeedtestDirection,
+};
 use super::rating;
 use crate::routing::{inspect_route, RouteIdentity, RouteSnapshot, RouteSpec};
 use crate::Config;
@@ -716,6 +719,14 @@ fn run_unshaped_speedtest(
     terminate: &AtomicBool,
     scratch_path: &Path,
 ) -> Result<SpeedtestTerminal, String> {
+    if request.target_state == OperationTargetState::AbsentBootstrap {
+        let backend = OpenWrtNativeApplyBackend::new();
+        return run_bootstrap_unshaped_with_absence(
+            || backend.capture_bootstrap_runtime_baseline(request, worker_run_id),
+            || run_embedded_speedtest(request, worker_run_id, direction, terminate, scratch_path),
+            |baseline| backend.attest_bootstrap_runtime_absence(request, baseline),
+        );
+    }
     let cfg = Config::from_uci(&request.identity.instance)?;
     let store = RuntimeOverrideStore::open(&cfg.run_dir())?;
     // The coordinator publishes the runtime permit before the ordinary worker
@@ -763,6 +774,31 @@ fn run_unshaped_speedtest(
         (Err(error), Err(restore_error)) => Err(format!(
             "{error}; speedtest-runtime-restore-failed: {restore_error}"
         )),
+    }
+}
+
+fn run_bootstrap_unshaped_with_absence<T, Capture, Measure, Reattest>(
+    capture: Capture,
+    measure: Measure,
+    reattest: Reattest,
+) -> Result<T, String>
+where
+    Capture: FnOnce() -> Result<AbsentRuntimeBaseline, String>,
+    Measure: FnOnce() -> Result<T, String>,
+    Reattest: FnOnce(&AbsentRuntimeBaseline) -> Result<(), String>,
+{
+    let baseline = capture()
+        .map_err(|error| format!("speedtest-bootstrap-absence-preflight-failed: {error}"))?;
+    let measurement = measure();
+    let reattestation = reattest(&baseline)
+        .map_err(|error| format!("speedtest-bootstrap-absence-changed: {error}"));
+    match (measurement, reattestation) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(measurement_error), Err(reattestation_error)) => {
+            Err(format!("{measurement_error}; {reattestation_error}"))
+        }
     }
 }
 
@@ -3100,7 +3136,7 @@ mod tests {
     use crate::operations::protocol::{
         OperationIdentity, OperationOrigin, OperationRouteIdentity, OperationTargetState,
     };
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::net::{IpAddr, Ipv4Addr};
 
     fn request(direction: SpeedtestDirection) -> OperationRequest {
@@ -3176,6 +3212,76 @@ mod tests {
         assert_eq!(
             error,
             "worker run id must be exactly 32 lowercase hexadecimal characters"
+        );
+    }
+
+    #[test]
+    fn bootstrap_speedtest_rechecks_absence_after_every_measurement_outcome() {
+        let baseline = || AbsentRuntimeBaseline {
+            planned_sqm_section: "wan_sqm".to_string(),
+            target_interface: "eth1".to_string(),
+            target_ifindex: 7,
+            route_fingerprint: "1".repeat(64),
+            config_fingerprint: "2".repeat(64),
+            sqm_fingerprint: "3".repeat(64),
+            kernel_topology_fingerprint: "4".repeat(64),
+            kernel_namespace_seed: "5".repeat(32),
+        };
+        let events = RefCell::new(Vec::new());
+        let result = run_bootstrap_unshaped_with_absence(
+            || {
+                events.borrow_mut().push("capture");
+                Ok(baseline())
+            },
+            || {
+                events.borrow_mut().push("measure");
+                Ok(7_u8)
+            },
+            |_| {
+                events.borrow_mut().push("reattest");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(result, 7);
+        assert_eq!(*events.borrow(), ["capture", "measure", "reattest"]);
+
+        let measured = Cell::new(false);
+        let error = run_bootstrap_unshaped_with_absence::<u8, _, _, _>(
+            || Err("uci-is-not-absent".to_string()),
+            || {
+                measured.set(true);
+                Ok(1)
+            },
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "speedtest-bootstrap-absence-preflight-failed: uci-is-not-absent"
+        );
+        assert!(
+            !measured.get(),
+            "traffic must not start after a failed absence witness"
+        );
+
+        let error = run_bootstrap_unshaped_with_absence(
+            || Ok(baseline()),
+            || Ok(9_u8),
+            |_| Err("route-drift".to_string()),
+        )
+        .unwrap_err();
+        assert_eq!(error, "speedtest-bootstrap-absence-changed: route-drift");
+
+        let error = run_bootstrap_unshaped_with_absence::<u8, _, _, _>(
+            || Ok(baseline()),
+            || Err("backend-failed".to_string()),
+            |_| Err("kernel-drift".to_string()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "backend-failed; speedtest-bootstrap-absence-changed: kernel-drift"
         );
     }
 
