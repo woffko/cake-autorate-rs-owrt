@@ -1,10 +1,12 @@
 # Full Auto-Tune
 
-Full Auto-Tune is an experimental creation path for a CAKE Autorate instance.
-The existing manual three-step wizard remains available. The automatic path
-measures the selected link, calculates a complete profile-specific proposal,
-displays the evidence and parameters, and writes UCI only after the user
-confirms the Review step.
+Full Auto-Tune is the native calibration path for creating or re-running a
+CAKE Autorate instance. The manual three-step wizard remains available. The
+automatic path measures the selected link, calculates a complete
+profile-specific proposal, displays the evidence and exact topology options,
+and writes UCI only after the user selects and confirms one Review option.
+Full Auto-Tune and its calibration coordinator are Full-only and are not
+compiled or shipped in Lite.
 
 Full Auto-Tune also seeds transport-aware runtime control: observed-low and
 median throughput become P20/P50 capacity references, the throughput guard is
@@ -21,23 +23,23 @@ the next uplink. A skipped uplink is shown in the aggregate Review and, if the
 user finally creates the set, is written disabled with `autotune_pending=1`.
 Failure, background traffic, or cancellation never auto-advances, and a member
 whose runtime restoration is still pending cannot be accepted, skipped, or
-bypassed. No UCI data is written until the final aggregate Review is confirmed.
-Accepted members are then guarded and applied sequentially, with a complete
-UCI cache reload between members; a failed or rolled-back member stops all
-later transactions. Skipped members are created disabled only after every
-accepted transaction has completed and no guard marker remains.
+bypassed. Selecting an accepted Review option applies that member immediately
+through its own native transaction, then reloads authoritative UCI before the
+wizard advances; a failed or rolled-back member stops all later work. No
+unconfirmed option is written. Skipped members are created disabled only from
+the final aggregate step, after every accepted transaction has completed and
+no native Apply authority remains.
 
 > **Current status:** Full Auto-Tune performs a bounded per-direction search over
 > the measured throughput/loaded-latency boundary. Current-candidate
 > realization, loss, route and measurement integrity remain hard gates. CPU,
-> profile capacity objectives and comparison with an earlier volatile-link
-> sample are advisory evidence. Result schema 8 separates a trusted result
-> from a safe provisional or estimated result and reports capacity DL/UL,
-> quality and overall confidence. Only a trusted complete target/objective
-> result is eligible for unattended apply; safe lower-confidence proposals are
-> explicit-review only. Each shaped phase owns the native transport-monitor PID
-> directly; terminal cleanup treats an absent or safely identified reused PID
-> as already stopped and never signals its new owner.
+> profile capacity objectives, retention and comparison with an earlier
+> volatile-link sample are advisory evidence. The native public Review exposes
+> exact topology options; each option carries its own immutable acknowledgement
+> list plus Review and manifest digests. Only an option whose Auto-Apply
+> evidence passes with an empty acknowledgement list can be unattended; every
+> safe exception is explicit-review only. Each shaped phase owns its transport
+> monitor identity directly, and terminal cleanup never signals a reused PID.
 
 ## Progress, Review, and Apply
 
@@ -74,7 +76,7 @@ same durable receipt before the page is refreshed.
 
 ## Transport-aware adaptive capacity
 
-RC27 implements this model in the matching daemon and LuCI packages:
+The current release implements this model in the matching daemon and LuCI packages:
 
 - The loop is per direction (`dl` / `ul`) and keeps explicit state fields:
   - `safe_ceiling_{dir}`: highest proven safe runtime ceiling
@@ -147,7 +149,7 @@ CPU is an advisory warning, not a standalone blocker.
 - Every speed-test phase starts stopped, is identity-checked, publishes its
   process group into the recovery journal, and only then resumes in an isolated
   session. Timeout or cancel sends bounded TERM followed by KILL to the complete
-  group. A helper exit code remains authoritative even when it printed valid
+  group. A worker exit code remains authoritative even when it printed valid
   JSON first.
 - A phase timeout is treated as a transport/backend failure rather than a bad
   link-quality observation. The phase is retried on the same pinned server up
@@ -158,7 +160,7 @@ CPU is an advisory warning, not a standalone blocker.
   user-pinned server is never silently replaced. Exhausting the policy returns
   typed `inconclusive` / `speedtest-timeout` evidence with no applicable
   proposal and leaves the restored runtime unchanged.
-- The helper writes only an allow-listed, root-owned RAM progress breadcrumb
+- The worker writes only an allow-listed, root-owned RAM progress breadcrumb
   (route checked, bypass ready, backend started, output ready/failed, verified).
   It does not retain backend output, command arguments, addresses, or secrets.
   LuCI uses this breadcrumb, the deadline, elapsed time, and bounded retry
@@ -191,7 +193,7 @@ CPU is an advisory warning, not a standalone blocker.
   autorate instance or an unknown unmanaged qdisc. An existing sqm-scripts
   queue is stopped and restored through `/usr/lib/sqm/run.sh`. Before accepting
   every shaped result it verifies the exact owned root CAKE qdiscs, configured
-  bandwidths, IFB, and ingress redirect again; helper flags alone are not proof
+  bandwidths, IFB, and ingress redirect again; progress flags alone are not proof
   that the candidate remained enforced for the complete test.
 - A per-interface lock prevents overlapping heavy jobs. Only the selected
   instance and selected SQM queue are paused; other WAN instances continue.
@@ -367,7 +369,7 @@ Scheduled Auto-Apply evidence. See
 
 ## Job phases
 
-1. `preflight`: check the native daemon/probe helper, backend, interface,
+1. `preflight`: check the native coordinator/capabilities, backend, interface,
    address, structured `main`/`mwan3` route identity, and link encapsulation.
 2. `reflectors`: run the existing reflector planner and require three reachable
    RTT targets from independent provider/address families. Three addresses in
@@ -409,18 +411,24 @@ Scheduled Auto-Apply evidence. See
     plan, route identity, phase-background evidence, detected link, and either
     a passing proposal or the explicitly typed Fair manual choices.
 
-The RPC-facing helper uses the same explicit route and profile identity for
-start, polling, cancellation and live attestation:
+LuCI talks to the daemon's native calibration coordinator for start,
+reattachment, polling, cancellation and Apply. The useful administrative
+queries are:
 
 ```text
-/usr/libexec/cake-autorate-rs/autotune JOB INTERFACE MODE BACKEND \
-  [ROUTE_MODE] [MWAN3_MEMBER] [PROFILE] [CONSERVATIVE]
+cake-autorated --calibrationctl autotune-current INSTANCE
+cake-autorated --calibrationctl autotune-status JOB_ID
+cake-autorated --calibrationctl autotune-result JOB_ID
+cake-autorated --calibrationctl autotune-cancel JOB_ID
+cake-autorated --calibrationctl summary
 ```
 
-`MODE` is `start`, `start-conservative`, `status`, `cancel`, or the internal
-attestation mode used by LuCI. `PROFILE` is `gaming`, `best_overall`, or
-`fair`. RC17 callers which supplied the conservative flag as argument seven
-remain compatible and resolve to Best overall.
+`autotune-current` returns the exact active operation for that instance or
+`state=idle`. Start commands carry a longer typed option vector and are
+normally constructed by LuCI so route, target, profile, strategy, access
+policy, traffic budget and existing/bootstrap state are attested together.
+Job-specific commands accept only the public job ID returned by Start. The
+coordinator and all calibration verbs are absent from Lite.
 
 ## Background traffic and conservative continuation
 
@@ -428,34 +436,30 @@ Retrying on a quiet link is the preferred action. **Continue conservatively**
 is an explicit override for the current job only; it is not saved as an
 instance setting and scheduled calibration remains strict.
 
-The speed-test helper reports only its own measured transfer. Background is
+The speed-test worker reports only its own measured transfer. Background is
 therefore evidence about confidence and competition for capacity, not a value
 to subtract from (or add blindly to) that isolated sample. The proposal keeps
 the measured directional rates, applies the profile's normal safety bounds,
 and prevents retained settings from exceeding the newly confirmed maximum or
 absolute adaptive-ceiling cap.
 
-Result schema 8 reports four confidence percentages: download capacity,
-upload capacity, quality, and `overall`, which must equal the weakest of the
-other three. Background share is calculated against the corresponding
-directional reference. A contaminated baseline lowers quality confidence;
-accepted phase contamination lowers the affected capacity confidence and is
-retained as a typed reason. Classes are:
+Background share and byte confidence are calculated against the corresponding
+directional reference and remain visible in the private evidence. The public
+Review does not collapse them into a global `trusted/provisional/estimated`
+label. Instead, each exact option has `auto_apply_evidence_pass`,
+`manual_review_required`, and an ordered `required_acknowledgements` list.
+Lower load confidence, accepted contamination, missed throughput objectives,
+censored transport latency, or a safe topology bypass are therefore attached
+to the option which observed them.
 
-- `trusted`: at least 85%, complete clean phase evidence; the only class that
-  may satisfy scheduled Auto-Apply;
-- `provisional`: 40% through 84%; a safe proposal may be accepted manually;
-- `estimated`: below 40%; still manual-only and displayed with a strong retry
-  recommendation.
-
-The class never overrides hard failures. Route/member/source identity,
+Acknowledgements never override hard failures. Route/member/source identity,
 external-IP continuity, SQM ownership and exact temporary rates, malformed or
-missing directional samples, missing forwarded counters, loss/latency safety,
-runtime restoration and immutable configuration identity remain blockers.
-LuCI offers **Retry for higher confidence**, **Accept safe proposal** when the
-server-side manual gate is true, or **Skip this uplink** in the sequential
-Multi-WAN flow. Scheduled Auto-Apply never consumes provisional or estimated
-results.
+missing directional samples, unavailable required counters, loss and maximum
+manual-review latency, runtime restoration and immutable configuration
+identity remain blockers. LuCI offers a retry, an exact manual Review option
+when server-side evidence permits it, or **Skip this uplink** in the sequential
+Multi-WAN flow. Scheduled Auto-Apply can consume only an option with an empty
+acknowledgement list and a passing Auto-Apply evidence contract.
 
 The phase counters are independent of that initial quiet check. Their evidence
 is stored with the run as `available`, `contaminated`, duration, observed DL/UL
@@ -556,9 +560,9 @@ the calculator received complete inputs:
 
 The score is capped at 100. Missing baseline, a single throughput sample,
 variable capacity, or unknown link layer also emits a human-readable warning.
-It is neither schema-8 result confidence nor apply eligibility. The latter is
-the four-dimensional background-aware envelope described above and remains
-separate from the shaped validation score.
+It is neither public Review eligibility nor Apply authority. Those are derived
+from the exact evidence artifacts and option-specific acknowledgement contract
+described above, independently of this calculator input score.
 
 ## Shaped validation mathematics
 
@@ -587,10 +591,10 @@ advisory. Latency/loss policy, route and measurement integrity also remain
 hard. Proposal schema 3 carries the
 canonical profile, target grade, whether that target is a hard requirement,
 the throughput-priority flag, exact validation thresholds and complete SQM
-recommendation. Result schema 8 binds that policy, both typed per-direction
-search histories, confidence envelope, selected pair, immutable run identity,
-phase evidence and recovery state to the job identity and configuration
-fingerprint. The standalone Rust CLI has defensive fallback
+recommendation. The private Review binds that policy, both typed per-direction
+search histories, selected pair, immutable run identity, phase evidence and
+recovery state to the job identity and configuration fingerprint; the public
+Review exposes only verified artifacts and exact Apply options. The standalone Rust CLI has defensive fallback
 thresholds, but the job always passes the proposal's validated profile values
 explicitly. The diagnostic score is the worst normalized gate margin: a
 minimum gate contributes `100 * actual / limit`, a maximum gate contributes
@@ -661,11 +665,11 @@ by lower effective loaded delay and then throughput.
 
 A fallback is never permission to bypass latency, loss, route or measurement
 integrity. Failed or incomplete runs remain diagnostic-only. When a
-background-aware run retains contaminated evidence, it can become a
-manual-only provisional/estimated proposal only after the same final safety
-and structured-evidence checks pass. A fresh clean retry may become trusted.
-Main-route
-jobs require the target to be the active default device. Structured Multi-WAN jobs route ICMP, native
+background-aware run retains reviewable contamination, an exact option may be
+manual-only only after the same final safety and structured-evidence checks
+pass; its acknowledgement list records that limitation. A fresh clean retry
+may remove that acknowledgement. Main-route jobs require the target to be the
+active default device. Structured Multi-WAN jobs route ICMP, native
 transport sockets, and the selected speed-test backend through the same
 validated member. Baseline and loaded observations remain bound to the selected
 route identity; throughput and shaped phases additionally recheck external IPv4
@@ -697,7 +701,7 @@ the subsequent controlled retest can finish the search. A retention shortfall
 then requires explicit manual confirmation and never authorizes scheduled or
 automatic Apply.
 
-RC25 treats the CPU threshold as advisory. CPU peak, aggregate CPU, busiest
+The current validator treats the CPU threshold as advisory. CPU peak, aggregate CPU, busiest
 core, softirq, mean, p95, over-limit count and longest over-limit run remain in
 the result, but CPU alone cannot change search action or selection, fail final
 validation, request a rate correction, make a capacity floor infeasible, or
@@ -732,49 +736,33 @@ Fair separates a throughput-first decision from unattended quality approval:
 The third action is a comparison suggestion, never the preselected choice. A
 candidate below the historical trust boundary retains **Apply SQM** for manual
 review but suppresses **Disable autorate and SQM**.
-The user must select it and confirm a red warning. Apply Guard then preserves
-the instance and owned queue configuration as disabled, restarts the normal
-service transaction, and proves that no instance daemon, target/IFB CAKE qdisc,
-ingress/clsact redirect or owned IFB remains. Any ambiguous postcondition rolls
-back. Scheduled Auto-Apply can never choose this action.
+The user must select it and confirm the option's warnings. The native Apply
+lifecycle preserves the instance and owned queue configuration as disabled,
+restarts the managed services, and proves that no instance daemon, target/IFB
+CAKE qdisc, ingress/clsact redirect or owned IFB remains. Any ambiguous
+postcondition rolls back. Scheduled Auto-Apply can never choose this action.
 
-When an eligible Review action is applied, LuCI uses a guarded UCI transaction rather
-than treating a browser RPC success as sufficient proof. The guard snapshots
-the complete `cake-autorate` and `sqm` packages, starts the normal rollback
-window, verifies the exact daemon/qdisc/IFB/redirect runtime, removes its
-temporary enrollment markers inside that same rollback window, and then asks
-rpcd to confirm through the same authenticated LuCI session that started the
-transaction. The root supervisor never attempts to impersonate that session.
-Only after rpcd has synchronously closed the rollback transaction may the
-supervisor finalize and remove its receipt. A missing or ambiguous
-confirmation is reconciled against exact
-pre-change and marker-free expected-final fingerprints; an indeterminate state
-remains recoverable rather than being declared successful.
+Apply is state-driven and server-owned. LuCI sends the selected option ID,
+source Review digest, option manifest digest and complete acknowledgement list
+to `autotune-apply-start`. The coordinator returns a fast receipt containing a
+separate Apply job ID/token and generation. LuCI then waits with
+`autotune-apply-watch`, and can reconnect through status/result if the browser
+or HTTP response is interrupted; it never infers success from one RPC return.
 
-Multi-WAN deliberately keeps this guard single-proposal. LuCI serializes the
-aggregate Review into independent guarded transactions rather than arming
-several route/SQM owners at once. This preserves exact rollback and runtime
-attestation for every member and avoids stale client tokens by unloading and
-reloading `cake-autorate` and `sqm` after each confirmed transaction.
+The Rust Apply worker snapshots the complete `cake-autorate` and `sqm`
+packages, replays the private Review, validates the exact candidate, performs
+the bounded UCI/service transaction, and attests daemon/qdisc/IFB/redirect
+runtime before publishing a terminal receipt. Recovery distinguishes exact
+original, exact candidate and foreign state. A crash or ambiguous state keeps
+the durable authority for `--native-apply-recover`; foreign state is never
+overwritten merely to make cleanup succeed.
 
-RC20 additionally binds the transaction to the current boot identity and an
-immutable supervised receipt. Service start performs the Apply Guard preflight
-before any SQM or daemon mutation. It either verifies the live transaction,
-recovers a provably stale boot/transaction pair, or refuses the start; a
-partial persistent marker can no longer be mistaken for a successful apply.
-
-RC24 runs that receipt supervisor in its own `cake-autorate-apply-guard` procd
-service. This separation is a correctness requirement: rpcd rollback reloads
-the main `cake-autorate` service, so a supervisor registered as one of its
-instances would be killed before it could verify the restored snapshots and
-publish the terminal receipt. The independent service derives the transaction
-from `verify-init` itself, validates the root-owned token, and never trusts a
-token supplied by LuCI or by the main service. A proved rollback also reloads
-the LuCI page immediately so stale in-memory enrollment markers cannot appear
-as ordinary unsaved changes and be committed a second time. This token-driven
-helper is intentionally disabled at boot; the main service starts it only for
-a verified live transaction. Enabling it permanently would add no crash
-recovery and would emit a false missing-token warning on normal boots.
+After success LuCI unloads/reloads both UCI packages and reloads Settings, so
+the new direction mode and DL/UL values are visible immediately. There is no
+second Reload or Save & Apply button for a native Review option. Multi-WAN
+keeps the same single-owner guarantee by applying accepted members
+sequentially and refreshing authoritative UCI between them; the first failure
+halts the batch.
 
 Auto-managed `sqm_interface`, `ul_if`, and `dl_if` values are retained while
 their form controls are hidden. They are still not treated as ownership proof:
@@ -785,43 +773,40 @@ only when `auto_interface_preset=0`.
 
 ## Tests
 
-Rust unit tests cover every stable/variable profile matrix, profile aliases,
-Gaming `diffserv4`, invalid samples, JSON output, three-ratio separation, typed
-gates, unreliable-measurement repeat, repeated floor-seeking increases,
-quality-boundary bisection, all three profile orderings, strict grade
-boundaries, Fair target/fallback separation and no-SQM comparison. RC23 adds
-the reliable-realization CPU-saturation regression, exact-rate CPU repeat,
-upper/floor probes, continued asymmetric upload search, non-null diagnostic
-selection and fail-closed repeated non-CPU resource failure.
-The shell lifecycle test uses isolated mock helpers
-to verify profile/job binding, exact temporary CAKE tokens, progress/result
-output, job-local server pinning, reflector diversity, one-second ICMP pacing,
-persistent transport parsing, phase-background evidence, bounded RAM history,
-valid-JSON/nonzero-exit rejection, atomic result publication, process-group
-timeout/cancellation, kernel-UUID temporary identities, collision retry,
-missing/invalid UUID sources, orphan cleanup, recovery, and both speed-test
-and temporary shaper cleanup traps. It also forces detailed terminal staging
-to fail and requires a compact schema-valid terminal with the original failure
-reason. Apply Guard tests reject incomplete,
-contaminated, one-direction, below-2%-gain and runtime-residue disable
-attempts. Real-router acceptance also checks per-member route identity and that
-the unselected autorate/SQM instance continues running.
+Rust tests cover every stable/variable profile matrix, profile aliases, Gaming
+`diffserv4`, invalid samples, the three-ratio separation, typed gates,
+unreliable-measurement repetition, floor seeking, quality-boundary bisection,
+profile orderings, strict grade boundaries, Fair/no-SQM outcomes, directional
+bypass, background/wire evidence, transport deadlines, progress publication,
+worker cancellation and exact runtime restoration. Coordinator/Apply tests
+also cover receipt reuse, reconnectable watch, crash recovery, foreign-state
+rejection, bootstrap creation and sequential Multi-WAN ownership.
+
+The retained shell tests exercise only narrow OpenWrt platform bridges such as
+procd/init rendering and runtime locking; calibration, scheduling, Rating,
+Speed Test, proposal validation and Apply business logic are Rust. LuCI
+JavaScript/TypeScript tests validate public schemas, option-specific
+acknowledgements, current-job adoption and fresh Settings reload. Real-router
+acceptance additionally checks per-member route identity and that the
+unselected autorate/SQM instance continues running. See [Testing](TESTING.md)
+for the accepted r306/r120 matrix and historical chronology.
 
 ## Optional scheduler
 
-`cake-autorate-autotune` is a lightweight procd service. Per-instance
-`scheduled_autotune_*` options select interval, local hour window, required
-quiet time, persistent daily/monthly traffic budgets, and whether a validated result is
-automatically applied. The feature defaults off, and auto-apply defaults off.
-The scheduler reuses the exact preflight, route identity, five raw controls,
-same-server directional search, selected-pair confirmation, cleanup, and fail-closed
-result described above. Auto-Apply additionally requires result schema 8,
-`state=complete`, `result_class=trusted`, overall and quality confidence of at
-least 85%, final `validation.pass=true`, both quality targets met, and no phase
-contamination. Provisional, estimated and profile-fallback results are never
-scheduled. A CPU warning by itself does not block scheduling; the scheduler
-still requires the exact passing gate set, no correction, complete clean phase
-evidence and restored runtime. It also requires an exact match between the instance's
+Scheduling is integrated into `cake-autorated --calibrationd
+--native-scheduler`; `cake-autorate-autotune` is the narrow procd bridge which
+owns that coordinator process. Per-instance `scheduled_autotune_*` options
+select interval, local hour window, required quiet time, persistent
+daily/monthly traffic budgets, and review-only or validated Auto-Apply. Both
+the feature and Auto-Apply default off.
+
+The scheduler reuses the exact preflight, route identity, raw controls,
+same-server directional search, selected-pair confirmation, cleanup, and
+fail-closed result described above. Auto-Apply requires the preferred option's
+`auto_apply_evidence_pass=true`, an empty acknowledgement list, met profile
+objectives, complete clean phase evidence and restored runtime. A CPU warning
+alone does not block scheduling, but no warning can replace a required hard
+gate. The scheduler also requires an exact match between the instance's
 saved profile and the profile, target, gate set and SQM policy inside the
 current result. Re-running an existing instance preserves the user's explicit
 Adaptive Ceiling enabled/disabled choice; a calibration proposal does not

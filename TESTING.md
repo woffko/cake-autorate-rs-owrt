@@ -5,12 +5,39 @@ speed tests depend on the selected server, routing, client, and background
 traffic; the measurements below characterize one test setup and are not a
 universal benchmark.
 
+## Current release acceptance
+
+The accepted public baseline is daemon r306, Full LuCI r120 and Lite LuCI r4
+at tag `v1.0-rc27-r306-r120`. The final source gate passed 1,249 Full and 110
+Lite Rust tests, every retained OpenWrt bridge test, all Full/Lite LuCI
+JavaScript and TypeScript suites, formatting, syntax and diff checks. The
+release matrix contains 12 independently built Full daemons, 12 Lite daemons
+and the two noarch LuCI APKs; all 26 passed APK/ELF/dependency/source-identity
+verification.
+
+The Full pair passed package/runtime checks on the disposable VM and three
+anonymized physical routers, the complete profile/strategy browser matrix,
+directional/no-SQM Review, native receipt-backed Apply, fresh Settings reload,
+Rating concurrency/adoption and exact runtime restoration. The published 29
+assets were downloaded again; every `SHA256SUMS` entry passed and the remote
+checksums, matrix report and release manifest were byte-identical to the local
+release set. Post-release Lite acceptance additionally switched the disposable
+x86_64 VM Full → Lite → Full, proved that calibration commands are absent,
+committed and restarted one manual rate change, and restored the exact original
+configuration.
+
+Sections labelled with older RC numbers below are retained as historical
+engineering evidence. They explain why contracts changed, but their package
+revisions, helper names and intermediate architecture are not current usage
+instructions. Current commands and behavior are documented in README,
+AUTOTUNE, TRANSPORT_QUALITY and MULTIWAN.
+
 ## Test layers
 
 Changes should be checked at four layers:
 
 1. Rust unit tests and format/check gates.
-2. LuCI JavaScript tests plus shell and JSON syntax checks.
+2. LuCI JavaScript/TypeScript tests plus syntax and ACL/menu checks.
 3. Package builds and dependency-only installation into an empty APK root for
    every release architecture.
 4. A router integration test that verifies live CAKE qdiscs, IFB ingress
@@ -23,7 +50,7 @@ the calculated floor, `quality_limited` appears when the safe floor prevents the
 target, old five-column graph history remains readable, and all new history
 stays in `/var/run`.
 
-RC8 requires deterministic coverage for the native transport RTT contract:
+The current transport contract requires deterministic coverage for:
 DNS/handshake warm-up exclusion, route-bound sockets, persistent connection
 reuse, symmetric outlier removal, trusted/untrusted backends, 20-sample p5
 idle and per-direction p90 loaded windows, CPU/load-phase rejection, and two
@@ -37,7 +64,7 @@ shared per-instance budget,
 streaming compaction, bounded history paging, vertical WAN cards, grade-event
 hover details, and fixed non-scrolling axis labels.
 
-RC9 additionally requires replay coverage for passive routed-traffic phase
+The current Rating contract additionally requires replay coverage for passive routed-traffic phase
 detection: the two-second rolling mean, 60/40 hysteresis, one-second direction
 hold, 1.5-second dropout, DL/UL dominance, bidirectional exclusion, and route
 reset. Helper tests cover automatic completion, guided cancellation, readiness
@@ -47,7 +74,7 @@ rating without changing CAKE, and verify safety-floor scaling, scrollbar-gutter
 follow mode, hover rating phases/counts, vertical multi-WAN cards, and 390 px
 mobile layout.
 
-RC6 added a second disposable-router gate: two nftables mwan3 members, distinct
+The Multi-WAN gate uses two nftables mwan3 members, distinct
 CAKE/IFB pairs, per-member ICMP and HTTP/TCP probes, router-side speed tests,
 Full Auto-Tune isolation, failover/failback, and route relearning. Production
 deployment is permitted only after both the original single-WAN safety gate
@@ -57,10 +84,11 @@ For releases that publish an offline bundle, install it with networking
 disabled into an empty APK root and validate the redownloaded assets against
 the published checksums. Direct-APK releases such as RC26-r7 instead verify
 the exact published APK hashes and install them through a router configured
-with compatible OpenWrt package feeds.
+with compatible OpenWrt package feeds. The current r306/r120 release verifies
+the exact redownloaded APKs and manifests through compatible OpenWrt feeds.
 
-RC13 adds deterministic UI and calibration gates: clean package config must
-contain no `cake_autorate` section; mandatory Status columns cannot be hidden;
+Current deterministic UI and calibration gates require a clean package config
+with no `cake_autorate` section; mandatory Status columns cannot be hidden;
 saved optional columns and Reset default must survive polling; 390 px Status
 must render cards while desktop remains aligned to the LuCI content container.
 Optional columns may scroll only inside their table wrapper. Graph event labels are
@@ -71,7 +99,7 @@ stop, quiet retry, cancel, moderate conservative continuation, unusable
 direction retention, and the invariant that a low-confidence result never
 raises a confirmed max or cap.
 
-RC14 additionally requires that a complete grade moves only to `LAST KNOWN`.
+The current Rating lifecycle additionally requires that a complete grade moves only to `LAST KNOWN`.
 With no active episode, `CURRENT` must be null in status JSON and render as
 `WAITING FOR DATA`; route changes and cancelled captures must not resurrect a
 previous complete grade as current. Partial or incomplete attempts remain
@@ -2564,3 +2592,19 @@ Independent `sha256sum -c` verification passed for all 26 staged artifacts.
 `11e4939e0d2af8e620ffa2750f93cd6b5792af9c87f8c7b02abd2b30dc2ffd79`;
 the machine-readable matrix report has SHA-256
 `40c9ec1fc8d17fcf0577d5eff826eb594efd2d3efec936f50d27ac24dbd5a907`.
+
+The final public asset set contains 29 files: those 26 APKs,
+`SHA256SUMS`, `matrix-report.json`, and `release-manifest.json`. A fresh
+download from GitHub passed all 28 manifest entries; the remote checksums,
+matrix report and release manifest matched the local files byte-for-byte. The
+public `SHA256SUMS` SHA-256 is
+`e9eeb4b676b10e1c8588ddb5214ed35087e81a79de7e76502c23857ae148785b`.
+
+The post-release Lite VM gate used the exact published x86_64 r306/r4 pair.
+The installed Lite binary matched SHA-256
+`514606c9a08b3ccea4707d9022b248a36aaf236488dd37bac8a6adfaf8df256f`,
+started the normal manual controller, rejected `--calibrationctl`, committed a
+temporary manual download-rate change and restarted successfully. The gate
+then restored Full r306/r120 and the exact pre-test configuration. Across the
+12-ABI matrix, the Lite daemon APK is 78% smaller than Full on average; Lite
+LuCI is 93% smaller than Full LuCI.

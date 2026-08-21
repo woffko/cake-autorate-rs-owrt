@@ -289,7 +289,7 @@ The packaged realization interval is two-sided:
 The lower bound triggers bounded repetition followed by a lower controlled
 candidate test. The upper bound rejects a result which could not have been produced by the claimed CAKE
 rate and therefore indicates a bypassed, replaced, or otherwise unenforced
-temporary shaper. The shell lifecycle additionally verifies the exact owned
+temporary shaper. The native runtime driver additionally verifies the exact owned
 CAKE/IFB/redirect topology immediately after every shaped speed test.
 
 ICMP and native transport loaded delay both compare like quantiles:
@@ -378,7 +378,7 @@ CPU pressure is recorded independently:
 cpu_warning = CPU_peak > CPU_advisory_limit
 ```
 
-RC25 does not use `cpu_warning` in `resource_safe`, candidate selection,
+The current validator does not use `cpu_warning` in `resource_safe`, candidate selection,
 correction, retry, capacity-floor feasibility or Apply eligibility. This avoids
 treating a one-second busiest-core peak, local load-generator work or softirq
 placement as proof that the link configuration is unsafe. The CPU gate remains
@@ -447,10 +447,11 @@ The control must additionally prove `test_direction=both`,
 `shaper_bypassed=true`, `sqm_paused=true`, no temporary shaper, and available
 non-contaminated forwarded-background counters whose DL/UL rates do not exceed
 their phase limits. This is a comparison result, not a controller transition.
-LuCI never preselects it, the user must confirm it, and Apply Guard verifies
-that the disabled instance leaves no daemon, CAKE qdisc, IFB or ingress
-redirect. The saved instance/queue configuration is retained with enable flags
-off so the action remains reversible.
+LuCI never preselects it, the user must confirm its acknowledgement list, and
+the native Apply lifecycle verifies that the disabled instance leaves no
+daemon, CAKE qdisc, IFB or ingress redirect. The saved instance/queue
+configuration is retained with enable flags off so the action remains
+reversible.
 
 The diagnostic validation score is the minimum normalized margin across all
 gates. For a minimum gate it is `100 * actual / limit`; for a maximum gate it
@@ -469,7 +470,7 @@ floor.
 ## Independent rating-load state machine
 
 Detected grading must recognize sustained routed client tests without inheriting
-the fast controller's instantaneous transitions. For each direction, RC10 keeps
+the fast controller's instantaneous transitions. For each direction, the rating detector keeps
 all `(R, R/C)` observations in a window of length `W` and calculates:
 
 ```text

@@ -1,6 +1,7 @@
 # cake-autorate-rs
 
-OpenWrt package bundle for a Rust prototype of `cake-autorate` with a LuCI UI and UCI configuration.
+OpenWrt package bundle for a Rust implementation of `cake-autorate` with a
+LuCI UI, UCI configuration, managed SQM lifecycle, and optional calibration.
 
 ## Project roots and acknowledgements
 
@@ -41,11 +42,12 @@ project ownership and responsibility remain with the human author.
 - [Controller mathematics](ALGORITHM_MATH.md) describes rate measurement,
   delay baselines, bufferbloat detection, the fast rate controller, and the
   bounded adaptive-ceiling state machine with formulas and examples.
-- [Testing and observed results](TESTING.md) documents repeatable validation
-  procedures and anonymized fixed-SQM, autorate, and unshaped measurements.
+- [Testing and observed results](TESTING.md) starts with the current r306/r120
+  acceptance contract, then retains older RC sections as an explicitly
+  historical engineering chronology.
 - [Bounded probe ceiling](ADAPTIVE_CEILING.md) is the concise state-machine and
   safety-invariant reference for the optional outer controller.
-- [Full Auto-Tune](AUTOTUNE.md) documents the experimental calibration job,
+- [Full Auto-Tune](AUTOTUNE.md) documents the native calibration job,
   proposal formulas, phase-background accounting, three separate throughput
   ratios, bounded profile optimizer, and fail-closed validation contract.
 - [Transport-aware quality control](TRANSPORT_QUALITY.md) documents HTTP/TCP
@@ -252,8 +254,14 @@ RC27 implements the following controller and LuCI model:
   download ingress bypassed. A verified result becomes a separate manual
   option; unavailable or unsafe evidence remains an explained disabled card,
   never a silent runtime topology change.
-- Keep fail-closed behavior unchanged: any integrity, identity, or contamination failure preserves last safe state and emits lower-confidence fallback instead of changing runtime rates.
-- Report confidence per direction and aggregate confidence with explicit provenance (`safe`, `provisional`, `limited`) so policy choice is auditable.
+- Keep fail-closed behavior unchanged: an integrity, identity, contamination,
+  or restoration failure preserves the last safe state and publishes either a
+  typed diagnostic or an exact evidence-backed manual option; it never invents
+  a lower-confidence rate.
+- Bind every manually reviewable deviation to the exact option as a stable
+  acknowledgement code. Auto-Apply is possible only when that option requires
+  no acknowledgements; there is no global confidence label which can weaken a
+  hard gate.
 
 One live high-capacity cellular development run intentionally used a 2 GiB hard
 limit. It completed raw measurements near **403/46 Mbps** and a first shaped
@@ -299,13 +307,20 @@ Auto-Tune and scheduled calibration. Full and Lite are mutually exclusive;
 install both packages from one pair, never mix a Full daemon with Lite LuCI or
 the other way around.
 
-RC27 adds background-aware Full Auto-Tune confidence without mixing forwarded
-traffic into the isolated speed-test result. It reports separate download,
-upload, quality and overall confidence, labels results trusted, provisional or
-estimated, and permits unattended apply only for clean trusted evidence. A
-strict busy-link stop can be retried or restarted once with conservative
-safeguards; a structurally safe lower-confidence proposal remains an explicit
-manual decision. A stalled speed-test phase is retried with bounded cooldowns;
+The accepted release is
+[`v1.0-rc27-r306-r120`](https://github.com/woffko/cake-autorate-rs-owrt/releases/tag/v1.0-rc27-r306-r120):
+24 architecture-specific daemon APKs, the Full and Lite noarch LuCI APKs,
+`SHA256SUMS`, and machine-readable matrix/release manifests. The published
+Lite daemon APK is about 78% smaller than Full on average across the matrix;
+Lite LuCI is about 93% smaller than Full LuCI.
+
+RC27 keeps forwarded traffic separate from the isolated speed-test result and
+binds background, retention, latency, topology and measurement deviations to
+the exact Review option which observed them. An option with no acknowledgement
+codes may satisfy unattended Apply; every safe exception is manual-only and
+must be accepted through one aggregate confirmation which still preserves the
+complete code list. A strict busy-link stop can be retried or continued once
+with conservative safeguards. A stalled speed-test phase is retried with bounded cooldowns;
 an automatically chosen server may be replaced only by restarting the complete
 raw-control series, while an explicitly pinned server is never changed. An
 exhausted timeout is reported as retryable and inconclusive, preserves the
@@ -432,15 +447,16 @@ package/<package-name>/src/
 ## Contents
 
 - `package/cake-autorate-rs` - Rust daemon package.
-- `package/luci-app-cake-autorate-rs` - LuCI app for configuration and status.
+- `package/luci-app-cake-autorate-rs` - Full LuCI app.
+- `package/luci-app-cake-autorate-rs-lite` - minimal manual-only LuCI app.
 - `/etc/config/cake-autorate` - UCI config installed by the daemon package.
 - `/etc/init.d/cake-autorate` - procd service wrapper.
 - `/usr/sbin/cake-autorated` - daemon binary.
 
 ## Current State
 
-This is a feature-rich experimental Rust port, not a drop-in replacement for
-every upstream Bash utility or supported platform.
+This is the current Rust/OpenWrt release-candidate implementation, not a
+drop-in replacement for every upstream Bash utility or supported platform.
 
 Implemented:
 
@@ -545,7 +561,8 @@ Implemented:
   cannot silently report all visible traffic in the upload direction.
 - While running, each managed instance checks the actual CAKE/IFB/ingress state.
   If it disappears, probing and rating stop, Status reports the concrete
-  runtime error, and a per-interface helper performs a targeted SQM restart.
+  runtime error, and the Rust service-lifecycle path performs a targeted,
+  ownership-checked SQM restart through the narrow init bridge.
   Attempts are serialized, deferred during a speed test, and rate-limited to
   avoid a recovery loop.
 - The mandatory Status **Services** column independently reconciles configured
@@ -565,7 +582,7 @@ Implemented:
   reflector scanning are available behind `Advanced test options`. A visual
   three-step navigator (`Interface`, `Speed test`, `Review`) also supports
   direct validated navigation by clicking any numbered step.
-- Experimental `Full Auto-Tune` creation mode alongside the manual wizard. It
+- `Full Auto-Tune` creation and re-run mode alongside the manual wizard. It
   performs interface/route/backend preflight, reflector selection, idle ICMP
   and native persistent-transport baselines, and one bidirectional plus two
   download-only and two upload-only unshaped controls on a reused validated
@@ -580,20 +597,19 @@ Implemented:
   restoring the previous qdisc/SQM state. Typed gates and a bounded Rust
   per-direction optimizer search the measured quality/throughput boundary,
   repeat unreliable observations, raise a candidate until its hard floor is
-  reachable, and confirm the exact selected pair. Result schema 8 reports
-  separate DL-capacity, UL-capacity, quality and overall confidence and labels
-  the result `trusted`, `provisional`, or `estimated`. Missing or structurally
-  invalid evidence remains a hard stop; measured background lowers confidence
-  and may expose a safe explicit-review proposal, but never unattended apply.
-  A safe result below a required profile target is likewise manual-only; no
-  confidence class weakens route, SQM ownership, loss/latency, measurement, or
-  runtime-restoration gates.
+  reachable, and confirm the exact selected pair. The public Review contract
+  carries immutable option IDs, manifest/review digests, exact tested topology
+  and rates, and the option's complete acknowledgement list. Missing or
+  structurally invalid evidence remains a hard stop; safe background,
+  retention, latency or topology exceptions are explicit-review only. No
+  acknowledgement can weaken route, SQM ownership, loss/latency, measurement,
+  or runtime-restoration gates.
 - Optional scheduled Full Auto-Tune, disabled by default, adds a quiet-time
   gate, maintenance window, interval, RAM-only daily byte budget, and explicit
   review-only versus validated auto-apply mode. Unattended apply requires a
-  clean schema-8 `trusted` result, overall and quality confidence of at least
-  85%, met profile objectives and complete restored runtime; lower-confidence
-  results remain explicit-review only.
+  preferred option whose Auto-Apply evidence contract passes with no required
+  acknowledgements, met profile objectives and complete restored runtime;
+  every acknowledged option remains explicit-review only.
 - LuCI instance editing keeps advanced speed test backend controls and
   pinger/reflector planning behind the advanced settings toggle. The automatic
   interface preset, speed-test headroom, and manual min/base/max escape hatches
@@ -624,14 +640,14 @@ Implemented:
 - Basic setup uses one `Enable autorate` control for both autorate and its
   managed SQM queue. Advanced users can disable `Manage SQM` only when they
   maintain a separate enabled SQM queue themselves.
-- Router-side speed test helper with optional backend autodetection:
-  `librespeed-cli`, `speedtest-go`, configured `iperf3`, then built-in HTTP
-  fallback. Long-running tests are executed as a short-lived LuCI job and
-  polled by the browser, so they are not killed by rpcd's command timeout.
-  `speedtest-go` automatically tries nearby servers, rejects an implausibly
-  asymmetric automatic result, and caches the first validated server per
-  instance; entering a server ID pins the test to that Ookla server. Optional
-  backend packages are not hard dependencies.
+- Native router-side Speed Test with two user choices: `Auto` and
+  `speedtest-go`. Both resolve to the same route-bound Rust operation and the
+  Full daemon package depends on `speedtest-go`; retired librespeed, iperf3 and
+  built-in HTTP execution paths are no longer selectable. The backend tries
+  nearby servers, rejects an implausibly asymmetric automatic result, and
+  caches the first validated server per instance; entering a server ID pins
+  the test to that Ookla server. Jobs have durable identities and are polled or
+  reattached by LuCI instead of living inside an rpcd request.
 - Disabled instances are shown as `DISABLED` in LuCI and do not display stale
   runtime counters; the init script removes stale status samples after a
   service stop.
@@ -710,10 +726,11 @@ SQM integration:
 
 - `luci-app-cake-autorate-rs` is intended to be the single LuCI UI for SQM setup
   plus autorate control.
-- Installing the LuCI package automatically installs `sqm-scripts` and
-  `uclient-fetch`, which provide the normal OpenWrt CAKE/IFB shaping stack and
-  the legacy HTTP/built-in speed-test fallback. Full Auto-Tune transport
-  validation uses the native Rust probe in the daemon package.
+- Installing the Full pair pulls `sqm-scripts`, `uclient-fetch`,
+  `nftables-json` and `speedtest-go`. `sqm-scripts` provides the normal OpenWrt
+  CAKE/IFB stack; `uclient-fetch` remains available for reflector discovery and
+  the explicitly untrusted legacy transport diagnostic, not as a speed-test
+  fallback. Full Auto-Tune transport validation uses the Rust probe.
 - The LuCI package declares `PROVIDES:=luci-app-sqm` and `CONFLICTS:=luci-app-sqm`
   as the build-time replacement intent. Final OpenWrt 25.12 APK v3 metadata
   verification confirms that the generator emits the provide but omits a
@@ -742,6 +759,7 @@ Daemon package dependencies:
 - `uclient-fetch`
 - `sqm-scripts`
 - `nftables-json`
+- `speedtest-go`
 
 LuCI package dependencies:
 
@@ -752,35 +770,27 @@ LuCI package dependencies:
 - `jsonfilter`
 - `nftables-json`
 
-Lite uses the same daemon-side runtime dependency set because the manual
-controller still owns routing, probes, nftables-aware isolation and managed
-SQM. Lite LuCI depends only on `cake-autorate-rs-lite`, `luci-base`, and
-`sqm-scripts`; it ships no root helper or ACL surface for rating, speed tests,
-Auto-Tune, scheduling, graph history or Apply Guard.
+Lite keeps only the shared daemon dependencies: `uci`, `fping`,
+`uclient-fetch`, and `sqm-scripts` (plus `libc`). It deliberately omits the
+Full-only `nftables-json` and `speedtest-go` dependencies together with the
+calibration feature. Lite LuCI depends only on `cake-autorate-rs-lite`,
+`luci-base`, and `sqm-scripts`; it ships no ACL surface for Rating, Speed Test,
+Auto-Tune, scheduling, graph history, traffic classification or native Apply.
 
 Native WebSocket and persistent-HTTP probes, including Full Auto-Tune
 transport validation, use statically linked rustls and webpki roots and add no
-dynamic APK dependency. `legacy-http` and the built-in speed-test fallback can
-use `uclient-fetch`; normal LuCI images already provide a `libustream` TLS
+dynamic APK dependency. The diagnostic-only `legacy-http` transport backend
+can use `uclient-fetch`; normal LuCI images already provide a `libustream` TLS
 provider and CA certificates. RC27 ships only direct APK assets, so these
 dependencies must resolve through compatible configured OpenWrt feeds.
 
 `sqm-scripts` pulls the required `tc`, CAKE, IFB, iptables, and related shaping
 packages on OpenWrt.
 
-Optional speed test backend packages:
-
-- `librespeed-cli`
-- `speedtest-go`
-- `iperf3`
-
-`jsonfilter` is a mandatory LuCI dependency used for typed helper JSON, not an
-optional speed-test backend dependency.
-
-The LuCI Speed Test tab and setup wizard show backend availability and can run
-`apk add` for the selected optional backend. The built-in HTTP backend requires
-`curl`, `uclient-fetch`, or `wget`; it does not require an extra speed test
-package.
+`speedtest-go` is a mandatory Full dependency. `Auto` is backend selection
+policy, not a separate implementation: it resolves to the same native
+speedtest-go path. `jsonfilter` is a mandatory Full LuCI dependency used for
+typed JSON handling.
 
 Optional pinger backend binaries:
 
@@ -844,6 +854,7 @@ Overlay workflow during local development:
 ```sh
 cp -a package/cake-autorate-rs /path/to/openwrt-sdk/package/
 cp -a package/luci-app-cake-autorate-rs /path/to/openwrt-sdk/package/
+cp -a package/luci-app-cake-autorate-rs-lite /path/to/openwrt-sdk/package/
 ```
 
 Enable packages in `.config` when building as modules:
@@ -854,6 +865,10 @@ CONFIG_PACKAGE_luci-app-cake-autorate-rs=m
 CONFIG_PACKAGE_fping=m
 CONFIG_PACKAGE_rust=m
 ```
+
+For Lite select `CONFIG_PACKAGE_cake-autorate-rs-lite=m` and
+`CONFIG_PACKAGE_luci-app-cake-autorate-rs-lite=m` instead of the two Full
+package symbols.
 
 ## Install
 
@@ -905,17 +920,17 @@ have working OpenWrt 25.12 package feeds so `apk` can resolve runtime
 dependencies. Use `apk add --simulate` with the same two paths first when
 checking a custom image or feed configuration.
 
-Optional speed test backends can be installed from LuCI or manually:
-
-```sh
-apk add librespeed-cli speedtest-go iperf3 jsonfilter
-```
+The Full daemon already depends on `speedtest-go`; `Auto` and `speedtest-go`
+therefore require no additional backend installation. Lite intentionally has
+no Speed Test backend or calibration UI.
 
 Fresh installs contain no autorate instance and do not create an SQM queue.
 Create the first one in **Network → CAKE Autorate SQM → Settings** as described
-in the [quick setup guide](SETUP_GUIDE.md). After staging the Review result,
-use **Save & Apply**. Existing package upgrades retain all configured
-instances. To enable an already-created instance named `wan_sqm` from SSH:
+in the [quick setup guide](SETUP_GUIDE.md). A native Full Auto-Tune Review is
+applied by its own **Apply selected option** action and reloads authoritative
+UCI automatically; a manual wizard result still uses ordinary **Create** then
+**Save & Apply**. Existing package upgrades retain all configured instances.
+To enable an already-created instance named `wan_sqm` from SSH:
 
 ```sh
 uci set cake-autorate.wan_sqm.enabled='1'
@@ -953,11 +968,17 @@ history. Files are removed on service stop/reboot and never stored in flash.
 cake-autorated --instance wan_sqm --dump-config
 cake-autorated --instance wan_sqm --once
 cat /var/run/cake-autorate/wan_sqm/status.json
-/usr/libexec/cake-autorate-rs/speedtest wan_sqm "" status auto
-/usr/libexec/cake-autorate-rs/quality-test wan_sqm status
+/usr/sbin/cake-autorated --calibrationctl summary
+/usr/sbin/cake-autorated --calibrationctl speedtest-current wan_sqm
+/usr/sbin/cake-autorated --calibrationctl rating-current wan_sqm
 /usr/sbin/cake-autorated --mqtt-status wan_sqm status
 /usr/sbin/cake-autorated --cpu-profile 30
 ```
+
+`*-current` reports either the exact current operation or `state=idle`.
+Job-specific `*-status`, `*-result`, and `*-cancel` commands require the public
+job ID returned by the corresponding Start operation. These calibration
+commands are intentionally unavailable in Lite.
 
 For a no-shaper smoke test, disable both shaper adjustment flags:
 

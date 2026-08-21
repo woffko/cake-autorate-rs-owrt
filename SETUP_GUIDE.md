@@ -4,6 +4,13 @@ Fresh installations intentionally create no autorate instance and no managed
 SQM queue. Open **Network → CAKE Autorate SQM → Settings** and create the first
 instance only after identifying the intended uplink.
 
+This guide describes the Full pair unless stated otherwise. Lite contains only
+manual Settings and Status: create the instance with explicit rates, then use
+ordinary **Create** and **Save & Apply**. Lite has no Speed Test, Get Rating,
+Full Auto-Tune, scheduler, graph history, traffic classifier or native Review
+Apply surface; the manual controller, routing, managed directional SQM,
+latency probes and adaptive ceiling remain available.
+
 ## Recommended first setup
 
 1. Select **Create instance** and give the link a descriptive name such as
@@ -68,12 +75,13 @@ instance only after identifying the intended uplink.
        tighten the measured raw limit but never expand it.
 
    Existing instances without a saved profile default to Best overall.
-4. Stop large downloads and uploads first. The
-   strict run measures idle ICMP across three independent reflector families,
-   persistent native transport latency, one bidirectional plus two download-only
-   and two upload-only unshaped controls, and a bounded per-direction shaped
-   search. It counts forwarded client traffic separately during every heavy
-   phase.
+4. Stop large downloads and uploads first. The strict run measures idle ICMP
+   across three independent reflector families, persistent transport latency,
+   one bidirectional control plus repeated direction-only capacity controls,
+   and a bounded per-direction shaped search. Retries and server replacement
+   may repeat a control, so traffic use is bounded by the selected job budget,
+   not by a fixed transfer count. Forwarded client traffic is accounted
+   separately during every heavy phase.
 5. If background traffic blocks calibration, prefer **Retry when quiet**. The
    explicit **Continue conservatively** action applies to that run only: it
    subtracts measured background with an extra margin, never raises confirmed
@@ -85,13 +93,17 @@ instance only after identifying the intended uplink.
    Auto-Apply.
 6. Review the selected profile, proposed min/base/max rates, absolute
    adaptive-ceiling caps, link-layer overhead, latency thresholds, validation
-   gates, exact CAKE class policy, and warnings. Nothing is written before
-   **Use proposal/Create**, and the staged UCI change still requires
-   **Save & Apply**. Keep that authenticated LuCI tab open until it reports
-   completion: rpcd confirmation is deliberately bound to the same login
-   session. If validation or confirmation fails, wait for the page to reload
-   the restored configuration instead of applying the global unsaved-changes
-   banner a second time.
+   gates, exact CAKE class policy, and warnings. Each Review card is an exact
+   tested topology. When it lists trade-offs, one **I accept all listed
+   trade-offs** checkbox confirms the complete displayed code set; individual
+   warnings cannot be hidden. For Full Auto-Tune select the card and press
+   **Apply selected option**. The native Apply lifecycle returns a durable
+   receipt, verifies the resulting services/qdiscs, and reloads authoritative
+   UCI and Settings automatically—there is no second Reload or Save & Apply
+   step. If the response is interrupted, reopen the same instance and let the
+   receipt reconcile instead of starting another Apply. Only the manual
+   non-Auto-Tune creation path uses ordinary **Create** followed by
+   **Save & Apply**.
 7. On **Status**, confirm that the uplink becomes `ACTIVE`, the controller is
    `RUNNING`, the mandatory **Services** column is `HEALTHY`, both CAKE rates
    are non-zero, and Quality reaches `BASELINE READY`. Expand the Services
@@ -152,9 +164,9 @@ download and upload:
 Latency is shown as loaded p95 minus idle p95 for both ICMP and native
 transport. The page also reports loss, aggregate and busiest-core CPU, softirq,
 CAKE counters, forwarded background for each phase, every pass/fail gate and
-the complete ordered candidate history. RC23 adds mean/p95 CPU, sample count,
+the complete ordered candidate history. Current diagnostics include mean/p95 CPU, sample count,
 samples and longest run above the limit, and softirq p95 so an isolated peak
-can be distinguished from sustained saturation. RC25 displays threshold
+can be distinguished from sustained saturation. Current LuCI displays threshold
 crossings as advisory `WARN` evidence; CPU by itself does not reject or lower a
 candidate. `test`, `complete`,
 `fallback`, and `inconclusive` are typed optimizer outcomes, not generic error
@@ -182,14 +194,14 @@ background, latency and loss checks pass but the 90% objective or historical
 throughput trust boundary does not, Review offers the best clean shaped
 candidate as a manual choice.
 For an existing managed instance it may additionally offer **Disable autorate
-and SQM (comparison suggestion)** after a clean simultaneous bidirectional
-no-SQM control proves no worse grade, no material latency benefit from shaping,
-and at least 2% more throughput in both directions. That suggestion is
-suppressed when the shaped result is below the 50% historical trust boundary;
-in that case the conservative SQM candidate remains available for manual
-review. The choice is never
-preselected, requires explicit confirmation, and scheduled Auto-Apply cannot
-use it. **Keep current settings** writes nothing.
+and SQM** after a clean simultaneous bidirectional no-SQM control proves that
+choice. A complete raw control can also become a manual no-SQM fallback when
+the shaped frontier has no applicable candidate; that path does not pretend
+that missing shaped evidence passed. For explicitly selected mobile/wireless
+access, a verified upload-shaped/download-bypassed control may appear as a
+separate manual option. These choices are never preselected, list their exact
+acknowledgements, and cannot be consumed by Scheduled Auto-Apply. **Keep
+current settings** writes nothing.
 
 Inside **Edit**, **Autorate setup** is split into focused groups:
 
@@ -280,7 +292,7 @@ write to flash.
 
 ### Packet Steering and the RPS warning
 
-RC23 Auto-Tune diagnostics show the resolved physical ingress device, RX queue
+Auto-Tune diagnostics show the resolved physical ingress device, RX queue
 count and Linux `rps_cpus` masks. If several RX queues all carry the same
 single-CPU mask, download may saturate one softirq path while total router CPU
 still appears moderate.

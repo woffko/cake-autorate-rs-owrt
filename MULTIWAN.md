@@ -60,7 +60,7 @@ External helpers use a direct argv vector:
 mwan3 use <member> exec <program> <arguments...>
 ```
 
-RC8 native transport RTT sockets do not spawn a helper. They apply the resolved
+Native transport RTT sockets do not spawn a route helper. They apply the resolved
 L3 device (`SO_BINDTODEVICE`), source IPv4 bind, and mwan3 `SO_MARK` directly;
 DNS resolution happens before the RTT clock starts. Persistent connections are
 owned by one route identity and discarded when that identity changes.
@@ -184,20 +184,20 @@ independent calibration profile, result, diagnostics, and Accept/Skip decision;
 changing the current profile or retrying its test cannot alter an earlier
 accepted result. A failed or inconclusive run remains on that member for Retry,
 Conservative retry, or explicit Skip instead of silently starting the next
-WAN. **Accept safe proposal** is enabled only for a shaped proposal that passes
-the same schema-8 reviewability predicate used by final staging. `trusted` may
-be eligible for unattended apply; `provisional` and `estimated` are always an
-explicit per-member decision. Skip is available after settled
+WAN. Apply is enabled only for an exact option whose public Review and private
+evidence agree. An option with `auto_apply_evidence_pass=true` and no
+acknowledgement codes may be eligible for unattended apply; every option with
+listed trade-offs is an explicit per-member decision. Skip is available after settled
 runtime recovery, including before testing when the user deliberately wants an
-uncalibrated placeholder. The final Review lists accepted and skipped uplinks
-before any UCI write. After confirmation, accepted uplinks are applied one at a
-time through the existing single-proposal Apply Guard: stage one marker, arm,
-rollback-enabled apply, runtime proof, confirm, then reload UCI before the next
-member. The first failure halts the batch. Explicitly skipped uplinks are added
-disabled in a final rollback-enabled transaction only after proving that no
-Auto-Tune marker remains. This prevents the former two-marker Save failure
-without weakening the server guard or combining independent CAKE owners into
-one ambiguous transaction.
+uncalibrated placeholder. Selecting an accepted option starts that member's
+independent receipt-backed native transaction: start, watch/reconnect, exact
+UCI/service mutation, runtime proof, terminal receipt, then authoritative UCI
+reload before the next member. The first failure halts the batch and no
+unconfirmed option is written. The final Review summarizes the already
+accepted members and pending skips. Explicitly skipped uplinks are added disabled in a final
+rollback-enabled transaction only after proving that no native Apply authority
+remains. This avoids combining independent CAKE owners into one ambiguous
+transaction.
 Status shows lifecycle state, route/member/device, source and external address,
 fwmark, routing table, policy share, complete Services reconciliation
 (daemon/SQM/CAKE/IFB/redirect/rules), and the reason for standby/offline.
@@ -219,17 +219,17 @@ threshold is not derived from a synthetic fallback. The member's first
 baseline is retained provisionally, the first speed control remains pinned to
 that member, and the measured DL/UL capacities resolve separate total-interface
 and forwarded-client limits. A retrospectively contaminated member remains on
-its own Review step and may be retried, continued once with conservative
-confidence, or skipped; it cannot contaminate or advance another member. Any
-safe result retaining contaminated evidence is manual-only and carries its own
-typed confidence reasons; a fresh fully clean rerun may become trusted.
+its own Review step and may be retried, continued once conservatively, or
+skipped; it cannot contaminate or advance another member. Any safe option
+retaining reviewable contamination is manual-only and carries the exact
+acknowledgement codes; a fresh fully clean rerun may remove them.
 
 ## Diagnostics
 
 Useful checks are:
 
 ```sh
-/usr/libexec/cake-autorate-rs/mwan3-info
+/usr/sbin/cake-autorated --mwan3-info
 ubus call mwan3 status '{"interface":"wan"}'
 mwan3 use wan exec env
 cat /var/run/cake-autorate/wan_sqm/status.json

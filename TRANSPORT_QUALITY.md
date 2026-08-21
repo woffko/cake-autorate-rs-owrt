@@ -1,19 +1,21 @@
 # Transport RTT, detected quality, and optional control
 
-RC8 separated three things that earlier releases mixed together; RC9 keeps
-that measurement contract and fixes load/episode detection for passive routed
-traffic:
+The current implementation keeps three independent contracts:
 
 1. a route-bound network RTT measurement;
 2. an observational A+/A/B/C/D/F connection rating; and
 3. optional CAKE-rate control from confirmed transport delay.
 
+Transport RTT, detected grades, Get Rating and transport-driven control are
+Full-only calibration features. Lite retains the ordinary ICMP/OWD autorate
+loop but does not compile or expose this transport-quality subsystem.
+
 Measurement is enabled with `transport_latency_enabled`. The detected rating
 is then always observational. Rate control requires the separate
-`transport_controller_enabled=1` opt-in and is disabled by default, including
-after an upgrade from RC7. Samples and state live in RAM and never in flash.
+`transport_controller_enabled=1` opt-in and is disabled by default. Samples
+and state live in RAM and never in flash.
 
-## Why RC8 replaced the RC7 measurement
+## Why process-timed HTTP measurement was replaced
 
 RC7 timed an external `uclient-fetch` process. Its number included process
 startup, DNS lookup, TCP connect, TLS handshake, and remote HTTP work. On one
@@ -21,7 +23,7 @@ real path that produced a roughly 230-390 ms "idle RTT" while ICMP was
 7-25 ms and a browser LibreQoS test reported A+. It was not a network RTT and
 could also feed an unsafe control decision.
 
-RC8 removes that value from both rating and control. Status identifies the new
+The current implementation removes that value from rating and control. Status identifies the
 contract as:
 
 ```text
@@ -77,7 +79,7 @@ A native result is accepted only when all of these remain true:
 Rejected evidence is reported but never treated as bufferbloat. A route or
 source/external-address change clears only that uplink's learned windows.
 
-## RC10 rating load detector
+## Rating load detector
 
 The controller's `high_load_thr` answers a different question: whether the fast
 rate controller should grow or reduce CAKE now. The rating detector therefore
@@ -154,20 +156,20 @@ capture is discarded; even a mathematically complete provisional value cannot
 replace `LAST KNOWN`.
 
 The compatibility reference is the live
-[LibreQoS Internet Quality Test](https://test.libreqos.com/advanced/) and its
+[LibreQoS Internet Quality Test](https://test.libreqos.com/) and its
 published browser implementation. Passive mode measures natural routed traffic
 instead of generating the browser test's saturation load, so its Status rating
 is a compatible detector, not a claim that an official browser test was run.
 
-## `Get rating` helper
+## `Get rating` operation
 
 Status offers `Get rating` after the instance, managed SQM, trusted transport
 backend, active route, and 20-sample idle baseline are ready. `Automatic`
-invokes the existing route-bound speed-test backend in shaped mode as separate
-download-only and upload-only phases, and stops each direction as soon as it has
-enough evidence, with a maximum of three passes.
+invokes the native route-bound `speedtest-go` operation in shaped mode as
+separate download-only and upload-only phases, and stops each direction as soon
+as it has enough evidence, with a maximum of three passes.
 `Guided client capture` waits while the user runs sequential download and
-upload load through the router. Before either mode starts, the helper requires a
+upload load through the router. Before either mode starts, the Rating worker requires a
 quiet window, records the per-direction background, and starts a fresh rating
 episode without discarding the last known complete result. Both modes arm a RAM-only
 bounded marker which subtracts that background and lets the same detector learn
@@ -183,7 +185,7 @@ passive thresholds. Automatic mode explicitly closes the marker between
 directions and rejects unexpected opposite-direction traffic above 10% of its
 current CAKE rate. Expected reverse TCP acknowledgements up to 8% of the
 requested-direction rate are exempt, and contamination is considered only
-after the requested direction is loaded. The helper never disables SQM or
+after the requested direction is loaded. The Rating worker never disables SQM or
 autorate, never applies a speed-test result to CAKE, uses the existing
 per-interface heavy-job lock, and removes its marker on completion,
 cancellation, error, or timeout. LuCI reports baseline, DL/UL counts,
@@ -205,7 +207,7 @@ the returned job receipt is immediately cancelled.
 
 With `transport_controller_enabled=0`, transport evidence cannot change CAKE
 rates, the throughput guard is inactive, and adaptive-ceiling growth is not
-blocked by missing transport data. This is the RC8 safe default.
+blocked by missing transport data. This is the current safe default.
 
 When explicitly enabled, the controller uses the same p5 idle and p90 loaded
 statistics, but maintains independent download and upload trackers. A loaded
@@ -259,10 +261,11 @@ ordinary ICMP/OWD adaptive-ceiling rules remain unchanged.
 
 Periodic Full Auto-Tune is a separate opt-in facility. It keeps its own
 maintenance window, quiet-time, budget, validation, and review/auto-apply
-policy. Failure, timeout, route mismatch, CPU saturation, or insufficient
-throughput retention leaves UCI unchanged.
+policy. Failure, timeout, route mismatch, or insufficient throughput retention
+leaves UCI unchanged. CPU remains visible as advisory evidence and cannot by
+itself reject an otherwise safe calibration option.
 
-The RC17 Auto-Tune validator deliberately does not reuse the detected-grade
+The Full Auto-Tune validator deliberately does not reuse the detected-grade
 p90-minus-p5 formula above. A bounded calibration phase compares persistent
 native transport `loaded p95 - idle p95`, and separately records ICMP
 `loaded p95 - idle p95`. It also records forwarded client traffic for every

@@ -5,6 +5,10 @@ Gaming, Best overall, and Fair profiles. It borrows the useful configuration
 idea from traffic-classification frontends—named presets plus editable
 per-profile rules—but it does **not** integrate with qosify or eBPF.
 
+The classifier and Traffic priorities page are Full-only. Lite keeps manual
+SQM/controller configuration but does not ship nftables classification or its
+LuCI/ACL surface.
+
 The ownership boundary is strict:
 
 - `cake-autorate-rs` remains the only owner of the managed CAKE qdiscs, IFB
@@ -146,7 +150,7 @@ Turning **Enable outbound traffic prioritization** off disables only this
 classifier. It does not stop Autorate or SQM, remove CAKE/IFB, or remove the
 bandwidth limits owned by the instance.
 
-The helper validates the complete nftables transaction before atomically
+The Rust classifier validates the complete nftables transaction before atomically
 replacing its private table. After apply it hashes the actual JSON ruleset and
 stores a RAM-only manifest binding each instance to its resolved interface,
 Auto-Tune profile, configured traffic-profile mode, and resolved traffic
