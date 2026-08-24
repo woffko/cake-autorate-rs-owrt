@@ -1,9 +1,9 @@
 # Historical 32-hex operation-token fixtures. Each value is a repeated,
 # deterministic test pattern used only to validate strict token parsing.
-11b38955811ba3abdf459f3903582c6c83158191:package/luci-app-cake-autorate-rs/tests/autotune.test.sh:generic-api-key:63
-afb0b50632e08bcc33bb317b476e1dc4861b20db:package/cake-autorate-rs/src/src/main.rs:generic-api-key:13251
-afb0b50632e08bcc33bb317b476e1dc4861b20db:package/luci-app-cake-autorate-rs/tests/autotune.test.sh:generic-api-key:3610
-afb0b50632e08bcc33bb317b476e1dc4861b20db:package/luci-app-cake-autorate-rs/tests/autotune.test.sh:generic-api-key:85
-b5e1bcda26e8bf7050bc57683f829643e81b8c72:package/luci-app-cake-autorate-rs/tests/autotune.test.sh:generic-api-key:1237
-b5e1bcda26e8bf7050bc57683f829643e81b8c72:package/luci-app-cake-autorate-rs/tests/autotune.test.sh:generic-api-key:1435
-b5e1bcda26e8bf7050bc57683f829643e81b8c72:package/luci-app-cake-autorate-rs/tests/autotune.test.sh:generic-api-key:1514
+8a42f9c8e8ae9404f4bfb40664d35bcdd759e860:package/cake-autorate-rs/src/src/main.rs:generic-api-key:13251
+8a42f9c8e8ae9404f4bfb40664d35bcdd759e860:package/luci-app-cake-autorate-rs/tests/autotune.test.sh:generic-api-key:3610
+8a42f9c8e8ae9404f4bfb40664d35bcdd759e860:package/luci-app-cake-autorate-rs/tests/autotune.test.sh:generic-api-key:85
+ad33b9bef9403193cf968564554e467203bb1942:package/luci-app-cake-autorate-rs/tests/autotune.test.sh:generic-api-key:1237
+ad33b9bef9403193cf968564554e467203bb1942:package/luci-app-cake-autorate-rs/tests/autotune.test.sh:generic-api-key:1435
+ad33b9bef9403193cf968564554e467203bb1942:package/luci-app-cake-autorate-rs/tests/autotune.test.sh:generic-api-key:1514
+fe6140068a51d25184512538a6b36105aa65605a:package/luci-app-cake-autorate-rs/tests/autotune.test.sh:generic-api-key:63
