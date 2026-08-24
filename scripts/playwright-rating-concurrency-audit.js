@@ -2,7 +2,8 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { chromium } = require('/home/tester/.local/share/playwright/node_modules/playwright');
+const playwrightModule = process.env.PLAYWRIGHT_MODULE || 'playwright';
+const { chromium } = require(playwrightModule);
 
 const baseUrl = process.env.LUCI_BASE_URL;
 const storageState = process.env.LUCI_STORAGE_STATE;
@@ -128,10 +129,10 @@ function assertNoRawLeaseText(text) {
 		delayedAttestation: {}, conflictRecovery: {},
 	};
 	try {
-		browser = await chromium.launch({
-			headless: true,
-			executablePath: '/home/tester/.cache/ms-playwright/chromium-1228/chrome-linux64/chrome',
-		});
+		const launchOptions = { headless: true };
+		if (process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE)
+			launchOptions.executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE;
+		browser = await chromium.launch(launchOptions);
 		const options = {
 			storageState, viewport: { width: 1500, height: 920 }, ignoreHTTPSErrors: true,
 			extraHTTPHeaders: { 'Cache-Control': 'no-cache', Pragma: 'no-cache' },

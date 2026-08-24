@@ -239,7 +239,7 @@ const capturedEvents = helpers.collectChartEvents(capturedPattern);
 const capturedClusters = helpers.clusterChartEvents(capturedPattern, capturedEvents);
 assert(capturedEvents.length === 3, 'LEARNING must not be emitted as a fake A+-F grade event');
 assert(capturedClusters.length === 1 && capturedClusters[0].shortLabel === 'OFFLINE…ACTIVE',
-	'192.0.2.77 OFFLINE -> LEARNING -> ACTIVE pattern must render as one marker');
+	'test-router OFFLINE -> LEARNING -> ACTIVE pattern must render as one marker');
 
 const chainedDenseEvents = helpers.clusterChartEvents({
 	firstTimestamp: 0,

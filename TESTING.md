@@ -1348,9 +1348,9 @@ stacked Multi-WAN graph cards, fixed chart labels, readable mobile modals and
 the new profile-rule editor. The browser did not start calibration or save
 configuration. Evidence is retained under:
 
-- `/home/tester/cake-autorate-rs-owrt/test-logs/rc20-playwright-virtual`;
-- `/home/tester/cake-autorate-rs-owrt/test-logs/rc20-playwright-77`;
-- `/home/tester/cake-autorate-rs-owrt/test-logs/rc20-playwright-100`.
+- `<workspace>/test-logs/rc20-playwright-virtual`;
+- `<workspace>/test-logs/rc20-playwright-77`;
+- `<workspace>/test-logs/rc20-playwright-100`.
 
 Final RC20 payload hashes are:
 
@@ -1483,8 +1483,8 @@ verified that the native desktop and native 390-pixel mobile layouts show no
 Apply choice, select Keep current by default, keep Disable SQM explicit, and
 have zero horizontal overflow or browser/RPC errors. Evidence is retained in:
 
-- `/home/tester/cake-autorate-rs-owrt/test-logs/rc22-playwright-disposable-final`;
-- `/home/tester/cake-autorate-rs-owrt/test-logs/rc22-playwright-fair-real`.
+- `<workspace>/test-logs/rc22-playwright-disposable-final`;
+- `<workspace>/test-logs/rc22-playwright-fair-real`.
 
 The final packages were installed on the production dual-WAN x86 and ARM
 acceptance routers using local APKs without restarting network or mwan3. Their
@@ -1496,8 +1496,8 @@ Status, Graphs, Settings, Traffic priorities, Edit, and Re-run Auto-Tune at
 zero horizontal overflow and zero page/console/RPC errors. Evidence is retained
 under:
 
-- `/home/tester/cake-autorate-rs-owrt/test-logs/rc22-playwright-77-final`;
-- `/home/tester/cake-autorate-rs-owrt/test-logs/rc22-playwright-100-final`.
+- `<workspace>/test-logs/rc22-playwright-77-final`;
+- `<workspace>/test-logs/rc22-playwright-100-final`.
 
 Both offline repositories contain and index 68 APKs. Fresh x86_64 and
 aarch64_generic roots, with networking and package scripts disabled, installed
@@ -1608,9 +1608,9 @@ Auto-Tune. The disposable and dual-WAN layouts rendered 2 and 4 canvases,
 respectively, with zero horizontal overflow and no page, console or RPC error.
 Evidence is retained in:
 
-- `/home/tester/cake-autorate-rs-owrt/test-logs/rc23-playwright-disposable-final`;
-- `/home/tester/cake-autorate-rs-owrt/test-logs/rc23-playwright-77-final`;
-- `/home/tester/cake-autorate-rs-owrt/test-logs/rc23-playwright-77-postrun` after
+- `<workspace>/test-logs/rc23-playwright-disposable-final`;
+- `<workspace>/test-logs/rc23-playwright-77-final`;
+- `<workspace>/test-logs/rc23-playwright-77-postrun` after
   the fresh terminal confirmation and runtime restoration.
 
 The locally validated x86 artifacts are:
@@ -1670,8 +1670,8 @@ verified the installed daemon/LuCI version banner. Both viewports had exact
 client/scroll widths and no page, console, RPC, stale-unsaved-change, or stale
 SQM-ownership error. Evidence is retained in:
 
-- `/home/tester/cake-autorate-rs-owrt/test-logs/rc24-r2-final-playwright-77`;
-- `/home/tester/cake-autorate-rs-owrt/test-logs/rc24-r2-final-playwright-100`.
+- `<workspace>/test-logs/rc24-r2-final-playwright-77`;
+- `<workspace>/test-logs/rc24-r2-final-playwright-100`.
 
 Locally validated development artifacts are:
 
@@ -1743,7 +1743,7 @@ observations. A real LuCI `file.exec` request returned the complete JSON on
 desktop and mobile. Playwright verified daemon/LuCI `1.0_rc25-r1`, a reviewable
 manual result, no browser errors, and no horizontal overflow at 1500 px or
 390 px. The audit artifacts are retained under
-`/home/tester/cake-autorate-rs-owrt/test-logs/rc25-playwright-100-final`.
+`<workspace>/test-logs/rc25-playwright-100-final`.
 
 The final x86_64 build was then installed on the existing Multi-WAN router.
 The four current cake/SQM/network/mwan3 configuration hashes matched exactly
@@ -1752,7 +1752,7 @@ recovery monitor were active; existing primary and backup CAKE rates remained
 unchanged. Desktop/mobile Playwright passed Status, Edit, Re-run Auto-Tune and
 ordinary post-upgrade navigation at 1500 px and 390 px with no console errors,
 stale LuCI constructor, access failure or overflow. Artifacts are under
-`/home/tester/cake-autorate-rs-owrt/test-logs/rc25-playwright-77-final`.
+`<workspace>/test-logs/rc25-playwright-77-final`.
 
 Final individual APK SHA256 values are:
 
@@ -1827,8 +1827,8 @@ or queue rates. Desktop and 390-pixel mobile Playwright audits verified daemon
 and LuCI `1.0_rc26-r1`, Status, Graphs, Settings, Re-run Auto-Tune, Edit and
 instance-scoped priorities with no JavaScript/RPC errors or horizontal
 overflow. Artifacts are retained under
-`/home/tester/cake-autorate-rs-owrt/test-logs/rc26-playwright-77` and
-`/home/tester/cake-autorate-rs-owrt/test-logs/rc26-playwright-100`.
+`<workspace>/test-logs/rc26-playwright-77` and
+`<workspace>/test-logs/rc26-playwright-100`.
 
 ## RC26-r4 guarded Save & Apply regression
 
@@ -1860,7 +1860,7 @@ active. A cache-bypassed Playwright audit on the x86_64 router verified Status,
 Edit and the Re-run Auto-Tune entry at desktop and 390-pixel mobile widths with
 the RC26-r4 version banner, no page/console/RPC errors and no horizontal
 overflow. Evidence is retained under
-`/home/tester/cake-autorate-rs-owrt/test-logs/rc26-r4-save-apply-77`.
+`<workspace>/test-logs/rc26-r4-save-apply-77`.
 
 ## RC26-r7 traffic-profile and responsive-UI validation
 
@@ -1903,9 +1903,9 @@ The release APK SHA256 values are:
   `f4c4be4eaa536e4453035552be38486ca4df1fa8ef1b054c6812f0f079586677`.
 
 Local evidence is retained under
-`/home/tester/cake-autorate-rs-owrt/test-logs/rc26-r7-test-router-smoke`,
-`/home/tester/cake-autorate-rs-owrt/test-logs/rc26-r7-production-77`, and
-`/home/tester/cake-autorate-rs-owrt/test-logs/rc26-r7-production-100`.
+`<workspace>/test-logs/rc26-r7-test-router-smoke`,
+`<workspace>/test-logs/rc26-r7-production-77`, and
+`<workspace>/test-logs/rc26-r7-production-100`.
 
 ## RC26-r11 sequential Multi-WAN creation validation
 
@@ -1939,8 +1939,8 @@ hashes for cake-autorate, SQM, network and mwan3 remained byte-identical, no UCI
 delta remained, and no worker or speed-test process remained. Evidence is
 retained under:
 
-- `/home/tester/cake-autorate-rs-owrt/test-logs/rc26-r10-multiwan-real-77-2`;
-- `/home/tester/cake-autorate-rs-owrt/test-logs/rc26-r11-multiwan-final-77-2`.
+- `<workspace>/test-logs/rc26-r10-multiwan-real-77-2`;
+- `<workspace>/test-logs/rc26-r11-multiwan-final-77-2`.
 
 ## RC26-r13 deferred baseline validation
 
@@ -2012,7 +2012,7 @@ so after a confirmed or indeterminate apply.
 
 The exact noarch `luci-app-cake-autorate-rs-1.0_rc26-r17.apk` was installed on
 the isolated router. A direct `wanb` run reported `route_interface=eth0`,
-`route_mode=mwan3`, `mwan3_member=wanb`, source `192.0.2.102`, mark `0x200`,
+`route_mode=mwan3`, `mwan3_member=wanb`, anonymized source `192.0.2.102`, mark `0x200`,
 routing table 2, and passed RX/TX byte proof. During the real sequential LuCI
 run the live helper process used the same source and member while the temporary
 nft rule matched UID 32769 and set the `wanb` mark. `wan/Gaming` was explicitly
@@ -2029,9 +2029,9 @@ same-session rollback cleanup. After the installed test, the router was
 restored from its pre-test archive; the cake-autorate, SQM, network and mwan3
 SHA256 values again exactly match the recorded baseline. Local browser evidence
 is retained under
-`/home/tester/cake-autorate-rs-owrt/test-logs/rc26-r17-multiwan-route-save-77-2`
+`<workspace>/test-logs/rc26-r17-multiwan-route-save-77-2`
 and
-`/home/tester/cake-autorate-rs-owrt/test-logs/rc26-r17-post-apply-77-2`.
+`<workspace>/test-logs/rc26-r17-post-apply-77-2`.
 
 APK SHA256:
 `54a8bbe509b6ffbd2551f8a3b2e47c96b63fc4f9803f2ca7b67552ad72ab5890`.
@@ -2064,7 +2064,7 @@ remained present.
 
 Evidence:
 
-- `/home/tester/cake-autorate-rs-owrt/test-logs/rc26-r19-graphs-footer-77-2`;
+- `<workspace>/test-logs/rc26-r19-graphs-footer-77-2`;
 - `tools/playwright/rc26-r19-graphs-footer-flow.js`.
 
 APK SHA256:
