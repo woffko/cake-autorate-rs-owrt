@@ -45,6 +45,8 @@ project ownership and responsibility remain with the human author.
 - [Testing and observed results](TESTING.md) starts with the current r306/r120
   acceptance contract, then retains older RC sections as an explicitly
   historical engineering chronology.
+- [Release history](RELEASE_HISTORY.md) lists superseded source tags and their
+  milestones. Only the current r306/r120 Release remains a supported download.
 - [Bounded probe ceiling](ADAPTIVE_CEILING.md) is the concise state-machine and
   safety-invariant reference for the optional outer controller.
 - [Full Auto-Tune](AUTOTUNE.md) documents the native calibration job,
@@ -408,7 +410,7 @@ They combine a completed rating capture with the current RC27 Multi-WAN,
 graphs, Auto-Tune and traffic-priority interface; rates and diagnostics are
 representative examples rather than guarantees.
 
-## Release history
+## Current release
 
 This release is **RC27 r306/r120**: daemon package r306 and Full LuCI package
 r120, with the parallel manual-only Lite pair r306/r4. It retains the complete
@@ -427,10 +429,10 @@ after the dialog closes, and uses portable 32-bit atomic staging counters on
 32-bit MIPS. The focused live transition matrix, full browser audit, Full/Lite
 12-ABI verification and design chronology are recorded in
 [Testing](TESTING.md). The README intentionally describes current behavior
-instead of retaining a cumulative RC diary; historical source points remain in
-Git tags while
+instead of retaining a cumulative RC diary. Superseded milestones remain in
+[Release history](RELEASE_HISTORY.md) and git tags, while
 [GitHub Releases](https://github.com/woffko/cake-autorate-rs-owrt/releases)
-contains the current downloadable build.
+contains only the current downloadable build.
 
 ## Repository Layout
 

@@ -82,9 +82,9 @@ and this Multi-WAN gate pass.
 
 For releases that publish an offline bundle, install it with networking
 disabled into an empty APK root and validate the redownloaded assets against
-the published checksums. Direct-APK releases such as RC26-r7 instead verify
-the exact published APK hashes and install them through a router configured
-with compatible OpenWrt package feeds. The current r306/r120 release verifies
+the published checksums. Direct-APK releases instead verify the exact
+published APK hashes and install them through a router configured with
+compatible OpenWrt package feeds. The current r306/r120 release verifies
 the exact redownloaded APKs and manifests through compatible OpenWrt feeds.
 
 Current deterministic UI and calibration gates require a clean package config
