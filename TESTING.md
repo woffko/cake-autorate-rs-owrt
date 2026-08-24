@@ -2585,20 +2585,26 @@ dependencies/providers, installed modes, source-payload identity,
 Full/Lite separation, ELF machine, endianness, ARM float ABI and MIPS o32
 checks. Architecture-independent LuCI was built once in the clean x86 SDK and
 verified as APK v3 `noarch`; daemon variants were built independently in all
-12 SDKs. Longrun `541bea190b1c411dbfb857d1af7c7918` passed 12/12.
+12 SDKs. After history sanitization the complete matrix was rebuilt from the
+rewritten release tag; Longrun `c3121b764fde49918d90c3034072acf3` passed
+12/12. All 24 daemon APKs and Lite LuCI remained byte-identical. Full LuCI was
+rebuilt without two retired empty directories; its installed files remained
+byte-identical.
 
 Independent `sha256sum -c` verification passed for all 26 staged artifacts.
 `SHA256SUMS` has SHA-256
-`11e4939e0d2af8e620ffa2750f93cd6b5792af9c87f8c7b02abd2b30dc2ffd79`;
+`5b571d9a88cb5f7559a14da9dd1f3276defdea1511eb0af244216b2a765af1b0`;
 the machine-readable matrix report has SHA-256
-`40c9ec1fc8d17fcf0577d5eff826eb594efd2d3efec936f50d27ac24dbd5a907`.
+`c6d76b263da62a48dfa9f32da1d6cf76ed1c23b06e833ab110ea6386a4301cdb`.
 
 The final public asset set contains 29 files: those 26 APKs,
-`SHA256SUMS`, `matrix-report.json`, and `release-manifest.json`. A fresh
-download from GitHub passed all 28 manifest entries; the remote checksums,
-matrix report and release manifest matched the local files byte-for-byte. The
+`SHA256SUMS`, `matrix-report.json`, and `release-manifest.json`. The sanitized
 public `SHA256SUMS` SHA-256 is
-`e9eeb4b676b10e1c8588ddb5214ed35087e81a79de7e76502c23857ae148785b`.
+`e595e157f759335e99e40c76e7ba381f0967c864cc4776d75c68d065402c23e7`;
+the release manifest SHA-256 is
+`a63cf586992aca7f43451744fee5d2fa10458bb990ba9cbe9d74c9dbc41e13ae`.
+An independently downloaded copy must pass all 28 manifest entries after the
+public repository and Release are recreated.
 
 The post-release Lite VM gate used the exact published x86_64 r306/r4 pair.
 The installed Lite binary matched SHA-256
