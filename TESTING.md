@@ -2603,8 +2603,8 @@ public `SHA256SUMS` SHA-256 is
 `e595e157f759335e99e40c76e7ba381f0967c864cc4776d75c68d065402c23e7`;
 the release manifest SHA-256 is
 `a63cf586992aca7f43451744fee5d2fa10458bb990ba9cbe9d74c9dbc41e13ae`.
-An independently downloaded copy must pass all 28 manifest entries after the
-public repository and Release are recreated.
+A fresh anonymous download from the recreated public Release passed all 28
+manifest entries and matched the local sanitized asset set byte-for-byte.
 
 The post-release Lite VM gate used the exact published x86_64 r306/r4 pair.
 The installed Lite binary matched SHA-256
