@@ -805,7 +805,7 @@ JavaScript/TypeScript tests validate public schemas, option-specific
 acknowledgements, current-job adoption and fresh Settings reload. Real-router
 acceptance additionally checks per-member route identity and that the
 unselected autorate/SQM instance continues running. See [Testing](TESTING.md)
-for the accepted r311/r120 matrix and historical chronology.
+for the accepted r313/r120 matrix and historical chronology.
 
 ## Optional scheduler
 

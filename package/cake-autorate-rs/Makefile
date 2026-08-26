@@ -7,7 +7,7 @@ endif
 
 PKG_NAME:=cake-autorate-rs
 PKG_VERSION:=1.0_rc27
-PKG_RELEASE:=311
+PKG_RELEASE:=313
 
 PKG_MAINTAINER:=woffko
 PKG_LICENSE:=GPL-2.0-or-later
@@ -70,13 +70,20 @@ Package/cake-autorate-rs-lite/conffiles = $(Package/cake-autorate-rs/conffiles)
 # a no-op.  The Full package owns the calibration init bridge, so this hook can
 # first stop and attest the complete old calibration topology with the new
 # binary, then recover state, restart the controller and start one native
-# coordinator without depending on the LuCI package installation order.
+# coordinator without depending on the LuCI package installation order. On a
+# non-upgrade install (including a Lite-to-Full switch), default_postinst may
+# start both packaged init bridges in rc.d order. Re-attest the main controller
+# after that hook returns, settle any default-started calibration instance, and
+# then let the common start below create exactly one coordinator.
 define Package/cake-autorate-rs/postinst
 [ -n "$${IPKG_INSTROOT}" ] || { \
 	if [ "$${PKG_UPGRADE:-0}" = 1 ]; then \
 		/etc/init.d/cake-autorate-autotune stop >/dev/null 2>&1 || exit 1; \
 		/usr/sbin/cake-autorated --native-apply-recover >/dev/null 2>&1 || exit 1; \
 		PKG_UPGRADE=0 /etc/init.d/cake-autorate restart >/dev/null 2>&1 || exit 1; \
+	else \
+		/usr/sbin/cake-autorated --service-lifecycle confirm-started >/dev/null 2>&1 || exit 1; \
+		/etc/init.d/cake-autorate-autotune stop >/dev/null 2>&1 || exit 1; \
 	fi; \
 	/etc/init.d/cake-autorate-autotune enable >/dev/null 2>&1 || exit 1; \
 	PKG_UPGRADE=0 /etc/init.d/cake-autorate-autotune start >/dev/null 2>&1 || exit 1; \

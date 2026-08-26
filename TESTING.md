@@ -7,8 +7,8 @@ universal benchmark.
 
 ## Current release acceptance
 
-The accepted public baseline is daemon r311, Full LuCI r120 and Lite LuCI r4
-at tag `v1.0-rc27-r311-r120`. The final source gate passed 1,263 Full and 111
+The accepted public baseline is daemon r313, Full LuCI r120 and Lite LuCI r4
+at tag `v1.0-rc27-r313-r120`. The final source gate passed 1,263 Full and 111
 Lite Rust tests, every retained OpenWrt bridge test, all Full/Lite LuCI
 JavaScript and TypeScript suites, formatting, syntax and diff checks. The
 release matrix contains 12 independently built Full daemons, 12 Lite daemons
@@ -84,7 +84,7 @@ For releases that publish an offline bundle, install it with networking
 disabled into an empty APK root and validate the redownloaded assets against
 the published checksums. Direct-APK releases instead verify the exact
 published APK hashes and install them through a router configured with
-compatible OpenWrt package feeds. The current r311/r120 release verifies
+compatible OpenWrt package feeds. The current r313/r120 release verifies
 the exact redownloaded APKs and manifests through compatible OpenWrt feeds.
 
 Current deterministic UI and calibration gates require a clean package config
@@ -2524,6 +2524,50 @@ SHA-256
 `f2a897ae52755894bad56f5cac19aec9ea65b3a8461d8fcc4f99b083cbe81bb2`;
 the machine-readable matrix report has SHA-256
 `117e6a3f8ec849e726976d1553f0412855635d5a35cdc8d75f7cee25e98ca42e`.
+
+## RC27 r313/r120 Full/Lite package sequencing gate (2026-08-26)
+
+An exact post-release Full → Lite → Full test of the public r311 packages found
+one package-only defect: Lite itself installed and ran correctly, but returning
+to Full installed both packages and then returned exit 1 because the custom
+post-install hook raced OpenWrt's default calibration start. The original
+configuration and runtime were recoverable, but a normal user should not see a
+failed package transaction. r312 proved the main-controller readiness barrier
+but was rejected because a second calibration start could still conflict with
+the default-started coordinator.
+
+r313 keeps the in-place upgrade path unchanged. On a fresh Full install or
+Lite-to-Full switch it first confirms the default-started main controller,
+stops and settles any default-started or partial calibration instance, and
+then starts one authoritative coordinator. Structural tests require the two
+mutually exclusive stop paths, one fresh-install readiness barrier, and no
+duplicate upgrade confirmation. Source gate
+`3a1142ab514f4cdaad39c40cd7fbf862` passes 1,263 Full and 111 Lite Rust tests
+plus every retained shell, JavaScript, TypeScript, syntax, format and diff gate.
+
+The two-ABI package preflight `ba35b924199d4045b42fde75be359185`
+clean-built and inspected Full/Lite x86_64 and aarch64_generic plus Full LuCI
+r120 and Lite LuCI r4. On the disposable VM, gate
+`4cbcf49d4aeb46509126e75c8f2b82ed` installed Lite, proved the calibration
+surface absent, performed a manual stop/save/start at 19 Mbit/s, restored Full
+with `apk add` status zero, and restored the original 20/21.202-Mbit/s configs,
+services, coordinator and qdiscs exactly.
+
+No-traffic r313 upgrades preserved exact configuration and runtime topology on
+both x86_64 Multi-WAN routers and the aarch64 upload-only cellular router.
+Cache-disabled desktop/mobile Status, Graphs, Settings, Re-run Cancel and Edit
+passed under Longruns `0e36140679b94e2f8740914a09968cfb`,
+`bd6c765b22dc4b489116e9ee9a9fed0f`, and
+`f3ff51696b96485e95dcbadac7811ca8`.
+
+Final matrix Longrun `1b7362dbfb274ae0881b2e4bb96f3b51` rebuilt 12 Full
+r313 daemons, 12 independently compiled Lite r313 daemons, Full LuCI r120 and
+Lite LuCI r4. All 26 APKs passed source parity, signature, metadata,
+dependency/provider, payload/mode, feature-separation and ELF/ABI validation.
+`SHA256SUMS` SHA-256 is
+`90ad0ff8f126baa7e87c866aa55dc583b677c9e8c5316cc2b407204d8610c282`;
+`matrix-report.json` SHA-256 is
+`4a2442a0c73488b9bc350232ac2d43355787df23fb48cfd4abf78534187f1fab`.
 
 ## RC27 r311/r120 exact Apply and readiness gate (2026-08-26)
 

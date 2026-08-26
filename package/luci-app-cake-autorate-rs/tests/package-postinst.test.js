@@ -77,6 +77,7 @@ const luciPostinst = makeDefine(makefile, 'Package/luci-app-cake-autorate-rs/pos
 const daemonDefaults = makeDefine(daemonMakefile, 'Package/cake-autorate-rs/Default');
 const daemonFull = makeDefine(daemonMakefile, 'Package/cake-autorate-rs');
 const daemonLite = makeDefine(daemonMakefile, 'Package/cake-autorate-rs-lite');
+const daemonPostinst = makeDefine(daemonMakefile, 'Package/cake-autorate-rs/postinst');
 const daemonDefaultInstall = makeDefine(daemonMakefile,
 	'Package/cake-autorate-rs/install/Default');
 const daemonFullInstall = makeDefine(daemonMakefile, 'Package/cake-autorate-rs/install');
@@ -227,18 +228,32 @@ assert.doesNotMatch(autotuneInit, /--help 2>&1 \| grep/,
 assert.doesNotMatch(daemonMakefile,
 	/files\/etc\/uci-defaults\/99-cake-autorate-rs-scheduler-engine/,
 	'the final package must not install the retired scheduler ownership seed');
-const daemonUpgradeNativeApply = daemonMakefile.indexOf('--native-apply-recover');
-const daemonUpgradeRestart = daemonMakefile.indexOf(
+const daemonUpgradeNativeApply = daemonPostinst.indexOf('--native-apply-recover');
+const daemonUpgradeRestart = daemonPostinst.indexOf(
 	'PKG_UPGRADE=0 /etc/init.d/cake-autorate restart');
-const daemonUpgradeCalibrationStop = daemonMakefile.indexOf(
+const daemonFreshMainReadiness = daemonPostinst.indexOf(
+	'/usr/sbin/cake-autorated --service-lifecycle confirm-started');
+const daemonUpgradeCalibrationStop = daemonPostinst.indexOf(
 	'/etc/init.d/cake-autorate-autotune stop >/dev/null 2>&1 || exit 1');
-const daemonCalibrationStart = daemonMakefile.indexOf(
+const daemonFreshCalibrationStop = daemonPostinst.indexOf(
+	'/etc/init.d/cake-autorate-autotune stop >/dev/null 2>&1 || exit 1',
+	daemonFreshMainReadiness);
+const daemonCalibrationStart = daemonPostinst.indexOf(
 	'/etc/init.d/cake-autorate-autotune start >/dev/null 2>&1 || exit 1');
 assert(daemonUpgradeCalibrationStop >= 0 &&
 	daemonUpgradeCalibrationStop < daemonUpgradeNativeApply &&
 	daemonUpgradeNativeApply < daemonUpgradeRestart &&
-	daemonUpgradeRestart < daemonCalibrationStart,
+	daemonUpgradeRestart < daemonFreshMainReadiness &&
+	daemonFreshMainReadiness < daemonFreshCalibrationStop &&
+	daemonFreshCalibrationStop < daemonCalibrationStart,
 	'an in-place Full daemon upgrade must stop calibration before native recovery and the main restart');
+assert.match(daemonPostinst,
+	/PKG_UPGRADE=0 \/etc\/init\.d\/cake-autorate restart[\s\S]*?\telse[\s\S]*?--service-lifecycle confirm-started[\s\S]*?cake-autorate-autotune stop[\s\S]*?\tfi;[\s\S]*?cake-autorate-autotune enable/,
+	'a fresh or Lite-to-Full install must attest main readiness and settle default calibration before starting one coordinator');
+assert.equal((daemonPostinst.match(/--service-lifecycle confirm-started/g) || []).length, 1,
+	'the package hook must add one fresh-install barrier without duplicating upgrade readiness');
+assert.equal((daemonPostinst.match(/cake-autorate-autotune stop/g) || []).length, 2,
+	'the package hook must settle calibration once in each mutually exclusive install branch');
 assert.match(daemonInitTemplate, /service_started\(\)/,
 	'the main restart must own its event-driven controller readiness gate');
 assert.match(daemonMakefile,
