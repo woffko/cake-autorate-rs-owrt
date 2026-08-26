@@ -42,11 +42,11 @@ project ownership and responsibility remain with the human author.
 - [Controller mathematics](ALGORITHM_MATH.md) describes rate measurement,
   delay baselines, bufferbloat detection, the fast rate controller, and the
   bounded adaptive-ceiling state machine with formulas and examples.
-- [Testing and observed results](TESTING.md) starts with the current r306/r120
+- [Testing and observed results](TESTING.md) starts with the current r311/r120
   acceptance contract, then retains older RC sections as an explicitly
   historical engineering chronology.
 - [Release history](RELEASE_HISTORY.md) lists superseded source tags and their
-  milestones. Only the current r306/r120 Release remains a supported download.
+  milestones. Only the current r311/r120 Release remains a supported download.
 - [Bounded probe ceiling](ADAPTIVE_CEILING.md) is the concise state-machine and
   safety-invariant reference for the optional outer controller.
 - [Full Auto-Tune](AUTOTUNE.md) documents the native calibration job,
@@ -251,11 +251,13 @@ RC27 implements the following controller and LuCI model:
   per-instance daily/monthly byte allowances in a crash-safe ledger, shows the
   next due run and remaining allowance, and stops before exceeding a hard
   budget.
-- For explicitly selected cellular, satellite, and fixed-wireless access,
-  Full raw capacity attempts a repeated upload-only-shaped experiment with
-  download ingress bypassed. A verified result becomes a separate manual
-  option; unavailable or unsafe evidence remains an explained disabled card,
-  never a silent runtime topology change.
+- Full raw capacity first measures comparable bidirectional, download-only and
+  upload-only controls by bypassing only the direction under test. For
+  explicitly selected cellular, satellite, and fixed-wireless access it then
+  additionally attempts a terminal upload-only-shaped experiment with download
+  ingress bypassed. A verified result becomes a separate manual option;
+  unavailable or unsafe evidence remains an explained disabled card, never a
+  silent runtime topology change.
 - Keep fail-closed behavior unchanged: an integrity, identity, contamination,
   or restoration failure preserves the last safe state and publishes either a
   typed diagnostic or an exact evidence-backed manual option; it never invents
@@ -296,12 +298,12 @@ The RC27 release builds the OpenWrt 25.12 daemon APK for this ABI matrix:
 The target is an APK ABI rather than one specific board. The authoritative
 choice is the value returned by `apk --print-arch`. Every full daemon asset
 follows the name
-`cake-autorate-rs-1.0_rc27-r306_openwrt-25.12_<arch>.apk`; the shared
+`cake-autorate-rs-1.0_rc27-r311_openwrt-25.12_<arch>.apk`; the shared
 `luci-app-cake-autorate-rs-1.0_rc27-r120.apk` contains the
 architecture-independent full LuCI interface and SQM integration.
 
 The same release also contains a separately compiled **Lite** pair for every
-ABI: `cake-autorate-rs-lite-1.0_rc27-r306_...apk` and
+ABI: `cake-autorate-rs-lite-1.0_rc27-r311_...apk` and
 `luci-app-cake-autorate-rs-lite-1.0_rc27-r4.apk`. Lite keeps the manual
 controller, routing, latency probes, directional SQM and bounded adaptive
 ceiling, but deliberately omits Get rating, speed-test calibration, Full
@@ -310,11 +312,11 @@ install both packages from one pair, never mix a Full daemon with Lite LuCI or
 the other way around.
 
 The accepted release is
-[`v1.0-rc27-r306-r120`](https://github.com/woffko/cake-autorate-rs-owrt/releases/tag/v1.0-rc27-r306-r120):
+[`v1.0-rc27-r311-r120`](https://github.com/woffko/cake-autorate-rs-owrt/releases/tag/v1.0-rc27-r311-r120):
 24 architecture-specific daemon APKs, the Full and Lite noarch LuCI APKs,
 `SHA256SUMS`, and machine-readable matrix/release manifests. The published
-Lite daemon APK is about 78% smaller than Full on average across the matrix;
-Lite LuCI is about 93% smaller than Full LuCI.
+Lite daemon APK is about 79% smaller than Full on average across the matrix;
+Lite LuCI is about 94% smaller than Full LuCI.
 
 RC27 keeps forwarded traffic separate from the isolated speed-test result and
 binds background, retention, latency, topology and measurement deviations to
@@ -412,22 +414,32 @@ representative examples rather than guarantees.
 
 ## Current release
 
-This release is **RC27 r306/r120**: daemon package r306 and Full LuCI package
-r120, with the parallel manual-only Lite pair r306/r4. It retains the complete
+This release is **RC27 r311/r120**: daemon package r311 and Full LuCI package
+r120, with the parallel manual-only Lite pair r311/r4. It retains the complete
 two-direction Rating authority, truthful staged Auto-Tune progress, a ranked
 four-option Review including the measured mobile download-bypass topology, one
 aggregate trade-off confirmation, and an Apply flow which verifies the runtime
 and immediately reloads authoritative UCI without another button or tab
-switch. This maintenance revision removes retired internal paths, isolates the
-read-only scheduler-status projection from coordinator-owned mutation state,
-removes remaining implementation-language wording from the UI, and ensures
-that an explicit **Run again** starts a new calibration instead of reopening an
-inert historical Review. It also serializes per-instance Rating admission,
-resets worker identity between sequential Automatic and Guided jobs, adopts an
-active Rating across browser sessions, cancels jobs whose Start receipt arrives
-after the dialog closes, and uses portable 32-bit atomic staging counters on
-32-bit MIPS. The focused live transition matrix, full browser audit, Full/Lite
-12-ABI verification and design chronology are recorded in
+switch.
+
+r311 hardens the native Apply transaction itself. Before mutating either UCI
+package it durably records the exact original and candidate `cake-autorate` and
+`sqm` bytes, modes, digests, request/job/worker identity, and selected option
+manifest. Recovery classifies each live package as original, candidate, or
+foreign, safely resolves every original/candidate mixed pair, and refuses an
+unrecognized overwrite. Stale restore temporaries are cleaned only while the
+same config-pair lock is held; unsafe links fail closed. A legacy recovery
+record without candidate bytes remains rollback-only.
+
+Apply, recovery, ordinary service start/reload, package replacement, and an
+empty controller plan now share one state-driven readiness boundary. Success
+is not published until the runtime lock is released and the exact expected
+controller set is ready; a failed readiness proof becomes a failed terminal,
+never a false Applied result. Package-upgrade deferral has its own typed receipt
+so it cannot be confused with a genuine empty plan. No fixed retry timer or
+second post-install confirmation is used. The focused crash-boundary suite,
+live VM/router upgrades, browser audit, and Full/Lite 12-ABI verification are
+recorded in
 [Testing](TESTING.md). The README intentionally describes current behavior
 instead of retaining a cumulative RC diary. Superseded milestones remain in
 [Release history](RELEASE_HISTORY.md) and git tags, while
@@ -892,7 +904,7 @@ For example, when it prints `aarch64_generic`:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc27-r306_openwrt-25.12_aarch64_generic.apk \
+  /root/cake-autorate-rs-1.0_rc27-r311_openwrt-25.12_aarch64_generic.apk \
   /root/luci-app-cake-autorate-rs-1.0_rc27-r120.apk
 ```
 
@@ -900,7 +912,7 @@ For a small manual-only installation, use the matching Lite pair instead:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-lite-1.0_rc27-r306_openwrt-25.12_aarch64_generic.apk \
+  /root/cake-autorate-rs-lite-1.0_rc27-r311_openwrt-25.12_aarch64_generic.apk \
   /root/luci-app-cake-autorate-rs-lite-1.0_rc27-r4.apk
 ```
 

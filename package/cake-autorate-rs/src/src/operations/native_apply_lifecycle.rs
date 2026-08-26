@@ -13,7 +13,7 @@ use super::process::{run_bounded_command_output_with_input, SpawnSpec};
 use super::protocol::OperationRequest;
 use super::runtime_health::{safe_interface, safe_name, UciPackage, UciSection};
 use super::service_config::{InterfaceResolver, OpenWrtEnvironment};
-use super::sqm_projection::{apply_sqm_projection, ProjectionScope, SqmProjectionPlan};
+use super::sqm_projection::{plan_projection, ProjectionScope, SqmProjectionPlan};
 use super::sqm_recovery_openwrt::{
     attest_managed_sqm_after_service_action, error_message as sqm_error_message,
     ManagedSqmAttestationSpec,
@@ -49,7 +49,9 @@ pub(crate) enum SelectedLifecycleAction {
 enum SelectedProjectionState {
     /// The cake-autorate package already contains the selected direction, but
     /// the managed SQM section may still be the exact previous projection.
-    /// Only a rate on the direction being bypassed may therefore be stale.
+    /// Either rate may therefore still describe the previous direction.  This
+    /// phase validates only the structural owner and request binding; rate
+    /// postconditions become authoritative after projection.
     Pending,
     /// The SQM projection has completed and both directional rates must match
     /// the selected direction exactly.
@@ -91,7 +93,7 @@ fn execute_selected_lifecycle(
 ) -> Result<(), String> {
     let snapshot = match action {
         SelectedLifecycleAction::Restart => {
-            let initial = backend.snapshot(SelectedProjectionState::Pending)?;
+            let initial = backend.snapshot(SelectedProjectionState::Exact)?;
             let projection = backend.project(&initial.instance)?;
             if projection.conflicts().contains(&initial.instance) {
                 return Err(format!(
@@ -216,9 +218,58 @@ pub(crate) fn run_selected_instance_lifecycle(
     execute_selected_lifecycle(action, &mut backend)
 }
 
+pub(crate) fn run_selected_instance_containment(
+    request: &OperationRequest,
+    expected_target: &str,
+    lock: &NativeApplyGlobalLock,
+    cake: &UciPackage,
+    sqm: &UciPackage,
+    sqm_bytes: &[u8],
+) -> Result<(), String> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("native Apply selected containment requires root".to_string());
+    }
+    validate_request_binding(request, expected_target)?;
+    let environment = OpenWrtEnvironment::production();
+    let snapshot = selected_config(
+        cake,
+        sqm,
+        &environment,
+        request,
+        expected_target,
+        SelectedProjectionState::Exact,
+    )?;
+    let paths = LifecyclePaths::production();
+    let private_sqm = PrivateSqmConfig::from_bytes(&paths, &snapshot, sqm_bytes)?;
+    let mut backend = OpenWrtSelectedLifecycle {
+        request,
+        expected_target,
+        lock,
+        environment,
+        paths,
+        sqm_snapshot: Some(private_sqm),
+    };
+    backend.stop_controller(&snapshot.instance)?;
+    backend.stop_sqm(&snapshot)
+}
+
 impl SelectedLifecycleBackend for OpenWrtSelectedLifecycle<'_> {
     fn project(&mut self, instance: &str) -> Result<SqmProjectionPlan, String> {
-        apply_sqm_projection(ProjectionScope::Instance(instance.to_string()))
+        let cake = self.environment.read_package(CAKE_PACKAGE)?;
+        let sqm = self.environment.read_package(SQM_PACKAGE)?;
+        let mut projected = sqm.clone();
+        let plan = plan_projection(
+            &cake,
+            &mut projected,
+            &self.environment,
+            &ProjectionScope::Instance(instance.to_string()),
+        )?;
+        if projected != sqm {
+            return Err(
+                "native Apply selected lifecycle found a pending SQM projection".to_string(),
+            );
+        }
+        Ok(plan)
     }
 
     fn snapshot(&mut self, projection: SelectedProjectionState) -> Result<SelectedConfig, String> {
@@ -514,12 +565,13 @@ fn validate_selected_rates(
     download_kbps: u64,
     upload_kbps: u64,
 ) -> Result<(), String> {
+    if projection == SelectedProjectionState::Pending {
+        return Ok(());
+    }
     if (download_enabled && download_kbps == 0) || (upload_enabled && upload_kbps == 0) {
         return Err("native Apply selected active SQM rate is missing".to_string());
     }
-    if projection == SelectedProjectionState::Exact
-        && ((!download_enabled && download_kbps != 0) || (!upload_enabled && upload_kbps != 0))
-    {
+    if (!download_enabled && download_kbps != 0) || (!upload_enabled && upload_kbps != 0) {
         return Err("native Apply projected SQM rates do not match its direction".to_string());
     }
     Ok(())
@@ -727,6 +779,15 @@ struct PrivateSqmConfig {
 
 impl PrivateSqmConfig {
     fn capture(paths: &LifecyclePaths, snapshot: &SelectedConfig) -> Result<Self, String> {
+        let bytes = read_sqm_config_bytes(paths)?;
+        Self::from_bytes(paths, snapshot, &bytes)
+    }
+
+    fn from_bytes(
+        paths: &LifecyclePaths,
+        snapshot: &SelectedConfig,
+        bytes: &[u8],
+    ) -> Result<Self, String> {
         ensure_private_directory(&paths.snapshot_root)?;
         let id = NEXT_SNAPSHOT.fetch_add(1, Ordering::Relaxed);
         let directory = paths
@@ -737,13 +798,12 @@ impl PrivateSqmConfig {
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).map_err(|error| {
             format!("unable to protect private SQM lifecycle snapshot: {error}")
         })?;
-        let bytes = read_sqm_config_bytes(paths)?;
         let expected = snapshot
             .sqm
             .sections
             .get(&snapshot.sqm_section)
             .map(|section| (section.section_type.as_str(), &section.options));
-        verify_scalar_uci_section(&bytes, &snapshot.sqm_section, expected).map_err(|error| {
+        verify_scalar_uci_section(bytes, &snapshot.sqm_section, expected).map_err(|error| {
             format!("native Apply merged SQM state differs from committed config: {error}")
         })?;
         let target = directory.join("sqm");
@@ -755,12 +815,12 @@ impl PrivateSqmConfig {
             .open(&target)
             .map_err(|error| format!("unable to create private SQM lifecycle config: {error}"))?;
         output
-            .write_all(&bytes)
+            .write_all(bytes)
             .and_then(|_| output.sync_all())
             .map_err(|error| format!("unable to publish private SQM lifecycle config: {error}"))?;
         Ok(Self {
             directory,
-            source_bytes: bytes,
+            source_bytes: bytes.to_vec(),
         })
     }
 
@@ -1017,7 +1077,7 @@ mod tests {
         assert_eq!(
             backend.events,
             [
-                "snapshot-pending",
+                "snapshot-exact",
                 "project",
                 "snapshot-exact",
                 "attest",
@@ -1054,34 +1114,68 @@ mod tests {
     }
 
     #[test]
-    fn upload_only_candidate_projects_stale_download_before_touching_runtime() {
+    fn upload_only_candidate_is_verified_without_persistent_projection() {
         let exact = config(true, false, true);
-        let mut pending = exact.clone();
-        pending.download_kbps = 80_000;
         let mut backend = FakeBackend {
-            snapshots: vec![pending, exact],
+            snapshots: vec![exact.clone(), exact],
             projection: projection(true, false),
             ..FakeBackend::default()
         };
         execute_selected_lifecycle(SelectedLifecycleAction::Restart, &mut backend).unwrap();
         assert_eq!(
             &backend.events[..3],
-            ["snapshot-pending", "project", "snapshot-exact"]
+            ["snapshot-exact", "project", "snapshot-exact"]
         );
         assert!(!backend.events.contains(&"prepare-ingress"));
         assert!(backend.events.contains(&"start-sqm"));
     }
 
     #[test]
-    fn pending_directional_projection_allows_only_the_stale_bypassed_rate() {
-        validate_selected_rates(
-            SelectedProjectionState::Pending,
-            false,
-            true,
-            80_000,
-            20_000,
-        )
-        .unwrap();
+    fn pending_accepts_every_previous_direction_until_exact_projection() {
+        let directions = [
+            ("both", true, true, 80_000, 20_000),
+            ("download_only", true, false, 80_000, 0),
+            ("upload_only", false, true, 0, 20_000),
+            ("off", false, false, 0, 0),
+        ];
+
+        for (previous, _, _, download_kbps, upload_kbps) in directions {
+            for (selected, download_enabled, upload_enabled, _, _) in directions {
+                validate_selected_rates(
+                    SelectedProjectionState::Pending,
+                    download_enabled,
+                    upload_enabled,
+                    download_kbps,
+                    upload_kbps,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("pending {previous} -> {selected} was rejected: {error}")
+                });
+
+                let exact = validate_selected_rates(
+                    SelectedProjectionState::Exact,
+                    download_enabled,
+                    upload_enabled,
+                    download_kbps,
+                    upload_kbps,
+                );
+                assert_eq!(
+                    exact.is_ok(),
+                    download_enabled == (download_kbps != 0)
+                        && upload_enabled == (upload_kbps != 0),
+                    "unexpected exact validation for {previous} -> {selected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exact_projection_rejects_missing_active_and_stale_bypassed_rates() {
+        assert!(
+            validate_selected_rates(SelectedProjectionState::Exact, true, true, 0, 20_000,)
+                .unwrap_err()
+                .contains("active SQM rate")
+        );
         assert!(validate_selected_rates(
             SelectedProjectionState::Exact,
             false,
@@ -1091,37 +1185,6 @@ mod tests {
         )
         .unwrap_err()
         .contains("projected SQM rates"));
-        validate_selected_rates(SelectedProjectionState::Exact, false, true, 0, 20_000).unwrap();
-
-        validate_selected_rates(
-            SelectedProjectionState::Pending,
-            true,
-            false,
-            80_000,
-            20_000,
-        )
-        .unwrap();
-        assert!(validate_selected_rates(
-            SelectedProjectionState::Exact,
-            true,
-            false,
-            80_000,
-            20_000,
-        )
-        .unwrap_err()
-        .contains("projected SQM rates"));
-        validate_selected_rates(SelectedProjectionState::Exact, true, false, 80_000, 0).unwrap();
-
-        assert!(
-            validate_selected_rates(SelectedProjectionState::Pending, false, true, 80_000, 0,)
-                .unwrap_err()
-                .contains("active SQM rate")
-        );
-        assert!(
-            validate_selected_rates(SelectedProjectionState::Pending, true, false, 0, 20_000,)
-                .unwrap_err()
-                .contains("active SQM rate")
-        );
     }
 
     #[test]

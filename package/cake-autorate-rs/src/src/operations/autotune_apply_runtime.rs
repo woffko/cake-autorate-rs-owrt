@@ -21,7 +21,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-const RECOVERY_HEADER: &str = "cake-autorate-native-apply-recovery\t4";
+const RECOVERY_HEADER_V4: &str = "cake-autorate-native-apply-recovery\t4";
+const RECOVERY_HEADER_V5: &str = "cake-autorate-native-apply-recovery\t5";
 const CURRENT_DIRECTORY: &str = "current";
 const STAGING_DIRECTORY: &str = "staging";
 const COMPLETED_DIRECTORY: &str = "completed";
@@ -33,10 +34,11 @@ const CAKE_CANDIDATE_FILE: &str = "cake-autorate.after";
 const SQM_CANDIDATE_FILE: &str = "sqm.after";
 const REQUEST_FILE: &str = "request";
 const MANIFEST_FILE: &str = "apply-manifest.json";
+const MATERIALIZATION_FILE: &str = "uci-materialization-v1.batch";
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
-const MAX_STATE_BYTES: usize = 4 * 1024;
+const MAX_STATE_BYTES: usize = 8 * 1024;
 const MAX_LAB_FAULT_PAUSE: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
@@ -224,23 +226,33 @@ pub(crate) fn canonical_native_uci_batch(
     plan: &NativeApplyExecutionPlan,
 ) -> Result<Vec<u8>, String> {
     require_existing_v4_apply_plan(plan)?;
-    if plan.uci_mutations.is_empty() || plan.uci_mutations.len() > MAX_NATIVE_APPLY_UCI_MUTATIONS {
+    canonical_native_uci_batch_from_mutations(&plan.uci_mutations)
+}
+
+fn canonical_native_uci_batch_from_mutations(
+    mutations: &[super::autotune_apply::NativeUciMutation],
+) -> Result<Vec<u8>, String> {
+    if mutations.is_empty() || mutations.len() > MAX_NATIVE_APPLY_UCI_MUTATIONS {
         return Err("native Apply UCI mutation count is outside its bound".to_string());
     }
-    validate_native_uci_mutations(&plan.uci_mutations)?;
+    validate_native_uci_mutations(mutations)?;
     let mut output = String::new();
     let mut option_keys = BTreeSet::new();
     let mut packages = BTreeSet::new();
-    for mutation in &plan.uci_mutations {
+    for mutation in mutations {
         mutation.validate()?;
         packages.insert(mutation.package);
-        let key = (mutation.package, mutation.section.as_str(), mutation.option);
+        let key = (
+            mutation.package,
+            mutation.section.as_str(),
+            mutation.option.as_str(),
+        );
         if !option_keys.insert(key) {
             return Err("native Apply UCI batch contains a duplicate option".to_string());
         }
     }
 
-    for mutation in &plan.uci_mutations {
+    for mutation in mutations {
         match (&mutation.action, mutation.value.as_deref()) {
             (NativeUciMutationAction::Set, Some(value)) => {
                 output.push_str("set ");
@@ -248,7 +260,7 @@ pub(crate) fn canonical_native_uci_batch(
                 output.push('.');
                 output.push_str(&mutation.section);
                 output.push('.');
-                output.push_str(mutation.option);
+                output.push_str(&mutation.option);
                 output.push_str("='");
                 output.push_str(value);
                 output.push_str("'\n");
@@ -259,7 +271,7 @@ pub(crate) fn canonical_native_uci_batch(
                 output.push('.');
                 output.push_str(&mutation.section);
                 output.push('.');
-                output.push_str(mutation.option);
+                output.push_str(&mutation.option);
                 output.push('\n');
             }
             _ => return Err("native Apply UCI action/value pair is inconsistent".to_string()),
@@ -274,6 +286,255 @@ pub(crate) fn canonical_native_uci_batch(
         return Err("native Apply UCI batch exceeds its size bound".to_string());
     }
     Ok(output.into_bytes())
+}
+
+pub(crate) fn legacy_native_apply_materialization(
+    manifest: &[u8],
+    request: &OperationRequest,
+) -> Result<(Vec<super::autotune_apply::NativeUciMutation>, Vec<u8>), String> {
+    if manifest.is_empty() || manifest.len() > MAX_MANIFEST_BYTES {
+        return Err("legacy native Apply manifest is outside its size bound".to_string());
+    }
+    let marker = b"\"uci_mutations\":[";
+    if manifest
+        .windows(marker.len())
+        .filter(|window| *window == marker)
+        .count()
+        != 1
+    {
+        return Err("legacy native Apply manifest lacks one canonical mutation array".to_string());
+    }
+    let managed_sqm_section = request
+        .managed_sqm_section
+        .as_deref()
+        .ok_or_else(|| "legacy native Apply request has no managed SQM section".to_string())?;
+    for (key, value) in [
+        ("job_id", request.identity.job_id.as_str()),
+        ("instance", request.identity.instance.as_str()),
+        (
+            "target_interface",
+            request.identity.target_interface.as_str(),
+        ),
+        ("managed_sqm_section", managed_sqm_section),
+        (
+            "route_fingerprint",
+            request.identity.route_fingerprint.as_str(),
+        ),
+        (
+            "config_fingerprint",
+            request.identity.config_fingerprint.as_str(),
+        ),
+        ("sqm_fingerprint", request.identity.sqm_fingerprint.as_str()),
+    ] {
+        require_canonical_manifest_string_field(manifest, key, value)?;
+    }
+    let start = manifest
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .ok_or_else(|| "legacy native Apply mutation array disappeared".to_string())?
+        + marker.len()
+        - 1;
+    let mut cursor = CanonicalMutationCursor {
+        input: manifest,
+        position: start,
+    };
+    let mutations = cursor.parse_array()?;
+    if cursor.remaining() != b"}}\n" {
+        return Err("legacy native Apply manifest mutation suffix is not canonical".to_string());
+    }
+    if mutations
+        .iter()
+        .any(|mutation| mutation.section != request.identity.instance)
+    {
+        return Err(
+            "legacy native Apply mutations are not bound to the recovered instance".to_string(),
+        );
+    }
+    validate_native_uci_mutations(&mutations)?;
+    let authority = canonical_native_uci_batch_from_mutations(&mutations)?;
+    Ok((mutations, authority))
+}
+
+fn require_canonical_manifest_string_field(
+    manifest: &[u8],
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
+    let expected = format!(
+        "\"{}\":\"{}\"",
+        super::json_wire::json_escape(key),
+        super::json_wire::json_escape(value),
+    );
+    if manifest
+        .windows(expected.len())
+        .filter(|window| *window == expected.as_bytes())
+        .count()
+        == 1
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "legacy native Apply manifest {key} binding is not exact"
+        ))
+    }
+}
+
+struct CanonicalMutationCursor<'a> {
+    input: &'a [u8],
+    position: usize,
+}
+
+impl CanonicalMutationCursor<'_> {
+    fn parse_array(&mut self) -> Result<Vec<super::autotune_apply::NativeUciMutation>, String> {
+        self.expect(b"[")?;
+        let mut mutations = Vec::new();
+        loop {
+            if self.consume(b"]") {
+                break;
+            }
+            if !mutations.is_empty() {
+                self.expect(b",")?;
+            }
+            self.expect(b"{\"action\":")?;
+            let action = self.parse_string()?;
+            self.expect(b",\"package\":")?;
+            let package = self.parse_string()?;
+            self.expect(b",\"section\":")?;
+            let section = self.parse_string()?;
+            self.expect(b",\"option\":")?;
+            let option = self.parse_string()?;
+            self.expect(b",\"value\":")?;
+            let value = if self.consume(b"null") {
+                None
+            } else {
+                Some(self.parse_string()?)
+            };
+            self.expect(b"}")?;
+            let package = match package.as_str() {
+                "cake-autorate" => "cake-autorate",
+                "sqm" => "sqm",
+                _ => {
+                    return Err(
+                        "legacy native Apply mutation package is outside its boundary".to_string(),
+                    )
+                }
+            };
+            let mut mutation = match (action.as_str(), value) {
+                ("set", Some(value)) => {
+                    super::autotune_apply::NativeUciMutation::set(&section, option, value)?
+                }
+                ("delete", None) => {
+                    super::autotune_apply::NativeUciMutation::delete(&section, option)?
+                }
+                _ => {
+                    return Err(
+                        "legacy native Apply mutation action/value is inconsistent".to_string()
+                    )
+                }
+            };
+            mutation.package = package;
+            mutations.push(mutation);
+            if mutations.len() > MAX_NATIVE_APPLY_UCI_MUTATIONS {
+                return Err("legacy native Apply mutation array exceeds its bound".to_string());
+            }
+        }
+        if mutations.is_empty() {
+            return Err("legacy native Apply mutation array is empty".to_string());
+        }
+        Ok(mutations)
+    }
+
+    fn parse_string(&mut self) -> Result<String, String> {
+        self.expect(b"\"")?;
+        let mut output = String::new();
+        while self.position < self.input.len() {
+            let byte = self.input[self.position];
+            self.position += 1;
+            match byte {
+                b'"' => return Ok(output),
+                b'\\' => {
+                    let escaped = *self.input.get(self.position).ok_or_else(|| {
+                        "legacy native Apply JSON escape is truncated".to_string()
+                    })?;
+                    self.position += 1;
+                    match escaped {
+                        b'"' => output.push('"'),
+                        b'\\' => output.push('\\'),
+                        b'n' => output.push('\n'),
+                        b'r' => output.push('\r'),
+                        b't' => output.push('\t'),
+                        b'u' => {
+                            let digits = self
+                                .input
+                                .get(self.position..self.position + 4)
+                                .ok_or_else(|| {
+                                    "legacy native Apply Unicode escape is truncated".to_string()
+                                })?;
+                            let text = std::str::from_utf8(digits).map_err(|_| {
+                                "legacy native Apply Unicode escape is invalid".to_string()
+                            })?;
+                            let value = u32::from_str_radix(text, 16).map_err(|_| {
+                                "legacy native Apply Unicode escape is invalid".to_string()
+                            })?;
+                            let character = char::from_u32(value).ok_or_else(|| {
+                                "legacy native Apply Unicode escape is invalid".to_string()
+                            })?;
+                            output.push(character);
+                            self.position += 4;
+                        }
+                        _ => {
+                            return Err("legacy native Apply JSON escape is unsupported".to_string())
+                        }
+                    }
+                }
+                value if value < 0x20 => {
+                    return Err(
+                        "legacy native Apply JSON string contains a control byte".to_string()
+                    )
+                }
+                value if value.is_ascii() => output.push(value as char),
+                _ => {
+                    let start = self.position - 1;
+                    let tail = std::str::from_utf8(&self.input[start..])
+                        .map_err(|_| "legacy native Apply JSON string is not UTF-8".to_string())?;
+                    let character = tail.chars().next().ok_or_else(|| {
+                        "legacy native Apply JSON string is truncated".to_string()
+                    })?;
+                    output.push(character);
+                    self.position = start + character.len_utf8();
+                }
+            }
+            if output.len() > 4096 {
+                return Err("legacy native Apply JSON string exceeds its bound".to_string());
+            }
+        }
+        Err("legacy native Apply JSON string is unterminated".to_string())
+    }
+
+    fn expect(&mut self, expected: &[u8]) -> Result<(), String> {
+        if self.consume(expected) {
+            Ok(())
+        } else {
+            Err("legacy native Apply mutation JSON is not canonical".to_string())
+        }
+    }
+
+    fn consume(&mut self, expected: &[u8]) -> bool {
+        if self
+            .input
+            .get(self.position..self.position + expected.len())
+            == Some(expected)
+        {
+            self.position += expected.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn remaining(&self) -> &[u8] {
+        &self.input[self.position..]
+    }
 }
 
 fn require_existing_v4_apply_plan(plan: &NativeApplyExecutionPlan) -> Result<(), String> {
@@ -422,7 +683,17 @@ pub(crate) trait NativeApplyTransactionBackend {
         plan: &NativeApplyExecutionPlan,
     ) -> Result<bool, String>;
     fn attest_before_apply(&mut self, plan: &NativeApplyExecutionPlan) -> Result<(), String>;
-    fn apply_uci_batch(&mut self, batch: &[u8]) -> Result<(), String>;
+    fn materialize_candidate(
+        &mut self,
+        plan: &NativeApplyExecutionPlan,
+        original: &NativeApplyConfigPairSnapshot,
+    ) -> Result<NativeApplyCandidateMaterialization, String>;
+    fn reconstruct_legacy_candidate(
+        &mut self,
+        request: &OperationRequest,
+        manifest: &[u8],
+        original: &NativeApplyConfigPairSnapshot,
+    ) -> Result<NativeApplyCandidateMaterialization, String>;
     fn restart_service(
         &mut self,
         request: &OperationRequest,
@@ -434,6 +705,7 @@ pub(crate) trait NativeApplyTransactionBackend {
         &mut self,
         request: &OperationRequest,
         lock: &NativeApplyGlobalLock,
+        authorities: &[NativeApplyConfigPairSnapshot],
     ) -> Result<(), String>;
     fn verify_restored(
         &mut self,
@@ -445,6 +717,82 @@ pub(crate) trait NativeApplyTransactionBackend {
         request: &OperationRequest,
         record: &NativeApplyRecoveryRecord,
     ) -> Result<(), String>;
+}
+
+fn emergency_contain_native_apply<B: NativeApplyTransactionBackend>(
+    backend: &mut B,
+    request: &OperationRequest,
+    store: &NativeApplyRecoveryStore,
+    lock: &NativeApplyGlobalLock,
+) -> Result<(), String> {
+    let authorities = store.read_containment_snapshots()?;
+    backend.emergency_contain(request, lock, &authorities)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NativeApplyConfigPairSnapshot {
+    cake: Vec<u8>,
+    sqm: Vec<u8>,
+    cake_mode: u32,
+    sqm_mode: u32,
+}
+
+impl NativeApplyConfigPairSnapshot {
+    fn capture(cake_config: &Path, sqm_config: &Path) -> Result<Self, String> {
+        let (cake, cake_mode) = read_config_snapshot(cake_config, "cake-autorate")?;
+        let (sqm, sqm_mode) = read_config_snapshot(sqm_config, "sqm")?;
+        Ok(Self {
+            cake,
+            sqm,
+            cake_mode,
+            sqm_mode,
+        })
+    }
+
+    pub(crate) fn cake(&self) -> &[u8] {
+        &self.cake
+    }
+
+    pub(crate) fn sqm(&self) -> &[u8] {
+        &self.sqm
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NativeApplyCandidateMaterialization {
+    cake: Vec<u8>,
+    sqm: Vec<u8>,
+    authority: Vec<u8>,
+}
+
+impl NativeApplyCandidateMaterialization {
+    pub(crate) fn new(cake: Vec<u8>, sqm: Vec<u8>, authority: Vec<u8>) -> Result<Self, String> {
+        if cake.len() > MAX_CONFIG_BYTES || sqm.len() > MAX_CONFIG_BYTES {
+            return Err("native Apply materialized candidate exceeds its config bound".to_string());
+        }
+        if authority.is_empty() || authority.len() > MAX_MANIFEST_BYTES {
+            return Err(
+                "native Apply materialization authority is outside its size bound".to_string(),
+            );
+        }
+        Ok(Self {
+            cake,
+            sqm,
+            authority,
+        })
+    }
+
+    pub(crate) fn cake(&self) -> &[u8] {
+        &self.cake
+    }
+
+    pub(crate) fn sqm(&self) -> &[u8] {
+        &self.sqm
+    }
+
+    pub(crate) fn authority(&self) -> &[u8] {
+        &self.authority
+    }
 }
 
 pub(crate) fn execute_native_apply_commit<B: NativeApplyTransactionBackend>(
@@ -501,7 +849,7 @@ pub(crate) fn execute_native_apply_commit_with_fault<B: NativeApplyTransactionBa
                 paths.sqm_config,
                 backend,
             ) {
-                let containment = backend.emergency_contain(&request, &lock);
+                let containment = emergency_contain_native_apply(backend, &request, &store, &lock);
                 return Err(format!(
                     "native Apply commit recovery remains pending: {recovery_error}; {}",
                     containment.map_or_else(
@@ -526,7 +874,7 @@ pub(crate) fn execute_native_apply_commit_with_fault<B: NativeApplyTransactionBa
             paths.sqm_config,
             backend,
         ) {
-            let containment = backend.emergency_contain(&request, &lock);
+            let containment = emergency_contain_native_apply(backend, &request, &store, &lock);
             return Err(format!(
                 "native Apply precommit recovery remains pending: {recovery_error}; {}",
                 containment.map_or_else(
@@ -547,23 +895,26 @@ pub(crate) fn execute_native_apply_commit_with_fault<B: NativeApplyTransactionBa
     }
 
     backend.attest_before_apply(plan)?;
-    let batch = canonical_native_uci_batch(plan)?;
-    let prepared = store.prepare(plan, manifest, paths.cake_config, paths.sqm_config)?;
+    let original = NativeApplyConfigPairSnapshot::capture(paths.cake_config, paths.sqm_config)?;
+    let candidate = backend.materialize_candidate(plan, &original)?;
+    let prepared = store.prepare_write_ahead(plan, manifest, &original, &candidate)?;
     let precommit_result = (|| {
         prepared.validate_candidate_phase(&plan.request)?;
         backend.attest_before_apply(plan)?;
         store.verify_live_original_files(paths.cake_config, paths.sqm_config, &prepared)?;
-        store.transition(
-            NativeApplyRecoveryState::Prepared,
-            NativeApplyRecoveryState::MutationStarted,
-        )?;
-        backend.apply_uci_batch(&batch)?;
+        let mutation = store.begin_mutation(paths.cake_config, paths.sqm_config)?;
+        mutation.install_candidate_files()?;
         backend.restart_service(&plan.request, &lock)?;
         let restarted = store.transition(
             NativeApplyRecoveryState::MutationStarted,
             NativeApplyRecoveryState::ServiceRestarted,
         )?;
-        let snapshot = store.stage_candidate(paths.cake_config, paths.sqm_config, &restarted)?;
+        drop(mutation);
+        store.verify_live_write_ahead_candidate_files(
+            paths.cake_config,
+            paths.sqm_config,
+            &restarted,
+        )?;
         backend.verify_applied(plan)?;
         let verified = store.transition(
             NativeApplyRecoveryState::ServiceRestarted,
@@ -575,7 +926,15 @@ pub(crate) fn execute_native_apply_commit_with_fault<B: NativeApplyTransactionBa
         // process failure cannot strand an already verified candidate on the
         // rollback side of the boundary.  The post-commit verification below
         // remains mandatory and any failure rolls forward from durable intent.
-        let accepted = store.accept_candidate(paths.cake_config, paths.sqm_config, &snapshot)?;
+        store.verify_live_write_ahead_candidate_files(
+            paths.cake_config,
+            paths.sqm_config,
+            &verified,
+        )?;
+        let accepted = store.transition(
+            NativeApplyRecoveryState::Verified,
+            NativeApplyRecoveryState::CommitAccepted,
+        )?;
         fault.after_commit_accepted(&accepted)?;
         Ok::<NativeApplyRecoveryRecord, String>(accepted)
     })();
@@ -601,7 +960,12 @@ pub(crate) fn execute_native_apply_commit_with_fault<B: NativeApplyTransactionBa
                         "native Apply failed before commit acceptance: {apply_error}; exact rollback verified"
                     )),
                     Err(rollback_error) => {
-                        let containment = backend.emergency_contain(&plan.request, &lock);
+                        let containment = emergency_contain_native_apply(
+                            backend,
+                            &plan.request,
+                            &store,
+                            &lock,
+                        );
                         Err(format!(
                             "native Apply failed before commit acceptance: {apply_error}; rollback remains pending: {rollback_error}; {}",
                             containment.map_or_else(
@@ -670,26 +1034,29 @@ pub(crate) fn execute_native_apply_forced_rollback_with_fault<B: NativeApplyTran
     require_existing_v4_apply_plan(plan)?;
     let lock = NativeApplyGlobalLock::acquire(paths.global_lock)?;
     backend.attest_before_apply(plan)?;
-    let batch = canonical_native_uci_batch(plan)?;
     let store = NativeApplyRecoveryStore::new(paths.recovery_root);
     store.discard_incomplete_staging()?;
-    let prepared = store.prepare(plan, manifest, paths.cake_config, paths.sqm_config)?;
+    let original = NativeApplyConfigPairSnapshot::capture(paths.cake_config, paths.sqm_config)?;
+    let candidate = backend.materialize_candidate(plan, &original)?;
+    let prepared = store.prepare_write_ahead(plan, manifest, &original, &candidate)?;
 
     let apply_result = (|| {
         prepared.validate_candidate_phase(&plan.request)?;
         backend.attest_before_apply(plan)?;
         store.verify_live_original_files(paths.cake_config, paths.sqm_config, &prepared)?;
-        store.transition(
-            NativeApplyRecoveryState::Prepared,
-            NativeApplyRecoveryState::MutationStarted,
-        )?;
-        backend.apply_uci_batch(&batch)?;
+        let mutation = store.begin_mutation(paths.cake_config, paths.sqm_config)?;
+        mutation.install_candidate_files()?;
         backend.restart_service(&plan.request, &lock)?;
         let restarted = store.transition(
             NativeApplyRecoveryState::MutationStarted,
             NativeApplyRecoveryState::ServiceRestarted,
         )?;
-        store.stage_candidate(paths.cake_config, paths.sqm_config, &restarted)?;
+        drop(mutation);
+        store.verify_live_write_ahead_candidate_files(
+            paths.cake_config,
+            paths.sqm_config,
+            &restarted,
+        )?;
         fault.after_service_restarted(&restarted)?;
         backend.verify_applied(plan)?;
         store.transition(
@@ -710,7 +1077,7 @@ pub(crate) fn execute_native_apply_forced_rollback_with_fault<B: NativeApplyTran
     let containment_error = rollback_result
         .as_ref()
         .err()
-        .and_then(|_| backend.emergency_contain(&plan.request, &lock).err());
+        .and_then(|_| emergency_contain_native_apply(backend, &plan.request, &store, &lock).err());
     match (apply_result, rollback_result) {
         (Ok(()), Ok(())) => Ok(NativeApplyLabReceipt {
             job_id: prepared.job_id,
@@ -775,6 +1142,12 @@ fn rollback_native_apply<B: NativeApplyTransactionBackend>(
             store.clear_restored()?;
             return Ok(());
         }
+    }
+    if record.schema_version == 4 && record.candidate_cake_sha256.is_none() {
+        let original = store.read_original_snapshot()?;
+        let manifest = store.read_manifest()?;
+        let candidate = backend.reconstruct_legacy_candidate(request, &manifest, &original)?;
+        record = store.upgrade_legacy_rollback_candidate(request, &candidate)?;
     }
     let restored = store.restore_config_files(cake_config, sqm_config)?;
     if restored != record {
@@ -891,7 +1264,7 @@ pub(crate) fn recover_native_apply<B: NativeApplyTransactionBackend>(
         )
     };
     if let Err(recovery_error) = recovery_result {
-        let containment = backend.emergency_contain(&request, &lock);
+        let containment = emergency_contain_native_apply(backend, &request, &store, &lock);
         return Err(format!(
             "native Apply recovery remains pending: {recovery_error}; {}",
             containment.map_or_else(
@@ -963,6 +1336,7 @@ impl NativeApplyRecoveryState {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NativeApplyRecoveryRecord {
+    schema_version: u8,
     pub(crate) state: NativeApplyRecoveryState,
     pub(crate) job_id: String,
     pub(crate) worker_run_id: String,
@@ -977,8 +1351,10 @@ pub(crate) struct NativeApplyRecoveryRecord {
     pub(crate) candidate_sqm_sha256: Option<String>,
     pub(crate) candidate_cake_mode: Option<u32>,
     pub(crate) candidate_sqm_mode: Option<u32>,
+    materialization_sha256: Option<String>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NativeApplyCandidateSnapshot {
     cake_sha256: String,
@@ -989,6 +1365,9 @@ pub(crate) struct NativeApplyCandidateSnapshot {
 
 impl NativeApplyRecoveryRecord {
     fn validate(&self) -> Result<(), String> {
+        if !matches!(self.schema_version, 4 | 5) {
+            return Err("native Apply recovery schema version is unsupported".to_string());
+        }
         require_lower_hex("recovery job ID", &self.job_id, 32)?;
         require_lower_hex("recovery worker run ID", &self.worker_run_id, 32)?;
         validate_native_apply_option_id(&self.option_id)?;
@@ -1020,6 +1399,37 @@ impl NativeApplyRecoveryRecord {
             }
             _ => return Err("native Apply candidate evidence is incomplete".to_string()),
         }
+        match (self.schema_version, self.materialization_sha256.as_deref()) {
+            (4, None) => {}
+            (5, Some(digest)) => {
+                require_lower_hex("native Apply materialization digest", digest, 64)?;
+                if self.candidate_cake_sha256.is_none() {
+                    return Err(
+                        "write-ahead native Apply recovery lacks candidate snapshots".to_string(),
+                    );
+                }
+                if self.candidate_cake_mode != Some(self.cake_mode)
+                    || self.candidate_sqm_mode != Some(self.sqm_mode)
+                {
+                    return Err(
+                        "write-ahead native Apply candidate modes differ from the originals"
+                            .to_string(),
+                    );
+                }
+            }
+            (4, Some(_)) => {
+                return Err(
+                    "legacy native Apply recovery unexpectedly has materialization evidence"
+                        .to_string(),
+                )
+            }
+            (5, None) => {
+                return Err(
+                    "write-ahead native Apply recovery lacks materialization evidence".to_string(),
+                )
+            }
+            _ => unreachable!(),
+        }
         Ok(())
     }
 
@@ -1027,7 +1437,8 @@ impl NativeApplyRecoveryRecord {
         request.validate()?;
         require_existing_v4_recovery_request(request)?;
         let candidate_present = self.candidate_cake_sha256.is_some();
-        if candidate_present
+        if self.schema_version == 4
+            && candidate_present
             && matches!(
                 self.state,
                 NativeApplyRecoveryState::Prepared | NativeApplyRecoveryState::MutationStarted
@@ -1042,6 +1453,45 @@ impl NativeApplyRecoveryRecord {
 
     fn encode(&self) -> Result<Vec<u8>, String> {
         self.validate()?;
+        if self.schema_version == 4 {
+            return Ok(format!(
+                concat!(
+                    "{}\n",
+                    "state={}\n",
+                    "job_id={}\n",
+                    "worker_run_id={}\n",
+                    "option_id={}\n",
+                    "manifest_sha256={}\n",
+                    "request_sha256={}\n",
+                    "cake_sha256={}\n",
+                    "sqm_sha256={}\n",
+                    "cake_mode={}\n",
+                    "sqm_mode={}\n",
+                    "candidate_cake_sha256={}\n",
+                    "candidate_sqm_sha256={}\n",
+                    "candidate_cake_mode={}\n",
+                    "candidate_sqm_mode={}\n\n"
+                ),
+                RECOVERY_HEADER_V4,
+                self.state.as_str(),
+                self.job_id,
+                self.worker_run_id,
+                self.option_id,
+                self.manifest_sha256,
+                self.request_sha256,
+                self.cake_sha256,
+                self.sqm_sha256,
+                self.cake_mode,
+                self.sqm_mode,
+                self.candidate_cake_sha256.as_deref().unwrap_or("none"),
+                self.candidate_sqm_sha256.as_deref().unwrap_or("none"),
+                self.candidate_cake_mode
+                    .map_or_else(|| "none".to_string(), |value| value.to_string()),
+                self.candidate_sqm_mode
+                    .map_or_else(|| "none".to_string(), |value| value.to_string()),
+            )
+            .into_bytes());
+        }
         Ok(format!(
             concat!(
                 "{}\n",
@@ -1051,6 +1501,7 @@ impl NativeApplyRecoveryRecord {
                 "option_id={}\n",
                 "manifest_sha256={}\n",
                 "request_sha256={}\n",
+                "materialization_sha256={}\n",
                 "cake_sha256={}\n",
                 "sqm_sha256={}\n",
                 "cake_mode={}\n",
@@ -1060,13 +1511,16 @@ impl NativeApplyRecoveryRecord {
                 "candidate_cake_mode={}\n",
                 "candidate_sqm_mode={}\n\n"
             ),
-            RECOVERY_HEADER,
+            RECOVERY_HEADER_V5,
             self.state.as_str(),
             self.job_id,
             self.worker_run_id,
             self.option_id,
             self.manifest_sha256,
             self.request_sha256,
+            self.materialization_sha256
+                .as_deref()
+                .ok_or_else(|| "native Apply materialization digest is missing".to_string())?,
             self.cake_sha256,
             self.sqm_sha256,
             self.cake_mode,
@@ -1085,18 +1539,27 @@ impl NativeApplyRecoveryRecord {
         let text = std::str::from_utf8(bytes)
             .map_err(|_| "native Apply recovery state is not UTF-8".to_string())?;
         let mut lines = text.split('\n');
-        if lines.next() != Some(RECOVERY_HEADER) {
-            return Err("native Apply recovery state has an unsupported header".to_string());
-        }
+        let header = lines.next();
+        let schema_version = match header {
+            Some(RECOVERY_HEADER_V4) => 4,
+            Some(RECOVERY_HEADER_V5) => 5,
+            _ => return Err("native Apply recovery state has an unsupported header".to_string()),
+        };
         let state = NativeApplyRecoveryState::parse(&read_field(&mut lines, "state")?)
             .ok_or_else(|| "native Apply recovery state is unsupported".to_string())?;
         let record = Self {
+            schema_version,
             state,
             job_id: read_field(&mut lines, "job_id")?,
             worker_run_id: read_field(&mut lines, "worker_run_id")?,
             option_id: read_field(&mut lines, "option_id")?,
             manifest_sha256: read_field(&mut lines, "manifest_sha256")?,
             request_sha256: read_field(&mut lines, "request_sha256")?,
+            materialization_sha256: if schema_version == 5 {
+                Some(read_field(&mut lines, "materialization_sha256")?)
+            } else {
+                None
+            },
             cake_sha256: read_field(&mut lines, "cake_sha256")?,
             sqm_sha256: read_field(&mut lines, "sqm_sha256")?,
             cake_mode: parse_mode(&read_field(&mut lines, "cake_mode")?)?,
@@ -1133,6 +1596,48 @@ pub(crate) struct NativeApplyRecoveryStore {
     root: PathBuf,
 }
 
+pub(crate) struct NativeApplyPreparedMutation {
+    _locks: NativeApplyConfigPairLock,
+    recovery_root: PathBuf,
+    cake_config: PathBuf,
+    sqm_config: PathBuf,
+    record: NativeApplyRecoveryRecord,
+    cake_candidate: Vec<u8>,
+    sqm_candidate: Vec<u8>,
+}
+
+impl NativeApplyPreparedMutation {
+    pub(crate) fn install_candidate_files(&self) -> Result<(), String> {
+        let store = NativeApplyRecoveryStore {
+            root: self.recovery_root.clone(),
+        };
+        let live_record = store.read_record()?.ok_or_else(|| {
+            "native Apply recovery disappeared before candidate write".to_string()
+        })?;
+        if live_record != self.record
+            || live_record.schema_version != 5
+            || live_record.state != NativeApplyRecoveryState::MutationStarted
+        {
+            return Err(
+                "native Apply write-ahead authority changed before candidate write".to_string(),
+            );
+        }
+        store.verify_backups(&live_record)?;
+        store.verify_live_original_files(&self.cake_config, &self.sqm_config, &live_record)?;
+        atomic_restore(
+            &self.cake_config,
+            &self.cake_candidate,
+            live_record.cake_mode,
+        )?;
+        atomic_restore(&self.sqm_config, &self.sqm_candidate, live_record.sqm_mode)?;
+        store.verify_live_write_ahead_candidate_files(
+            &self.cake_config,
+            &self.sqm_config,
+            &live_record,
+        )
+    }
+}
+
 impl NativeApplyRecoveryStore {
     pub(crate) fn new(root: &Path) -> Self {
         Self {
@@ -1140,6 +1645,100 @@ impl NativeApplyRecoveryStore {
         }
     }
 
+    pub(crate) fn prepare_write_ahead(
+        &self,
+        plan: &NativeApplyExecutionPlan,
+        manifest: &[u8],
+        original: &NativeApplyConfigPairSnapshot,
+        candidate: &NativeApplyCandidateMaterialization,
+    ) -> Result<NativeApplyRecoveryRecord, String> {
+        require_existing_v4_apply_plan(plan)?;
+        let expected_manifest = plan.canonical_manifest_bytes()?;
+        if manifest != expected_manifest {
+            return Err(
+                "native Apply recovery manifest changed after plan construction".to_string(),
+            );
+        }
+        let expected_authority = canonical_native_uci_batch(plan)?;
+        if candidate.authority() != expected_authority {
+            return Err(
+                "native Apply materialization authority differs from the selected plan".to_string(),
+            );
+        }
+        if original.cake.len() > MAX_CONFIG_BYTES
+            || original.sqm.len() > MAX_CONFIG_BYTES
+            || candidate.cake.len() > MAX_CONFIG_BYTES
+            || candidate.sqm.len() > MAX_CONFIG_BYTES
+        {
+            return Err("native Apply write-ahead config exceeds its size bound".to_string());
+        }
+        validate_config_mode("cake-autorate", original.cake_mode)?;
+        validate_config_mode("sqm", original.sqm_mode)?;
+        ensure_private_directory(&self.root)?;
+        if path_exists(&self.current_path())? {
+            return Err("a native Apply recovery transaction is already pending".to_string());
+        }
+        if path_exists(&self.staging_path())? {
+            return Err("an incomplete native Apply recovery staging directory exists".to_string());
+        }
+
+        let request_bytes = plan.request.encode()?.into_bytes();
+        if request_bytes.len() > MAX_REQUEST_BYTES {
+            return Err("native Apply recovery request exceeds its size bound".to_string());
+        }
+        let record = NativeApplyRecoveryRecord {
+            schema_version: 5,
+            state: NativeApplyRecoveryState::Prepared,
+            job_id: plan.request.identity.job_id.clone(),
+            worker_run_id: plan.worker_run_id.clone(),
+            option_id: plan.option_id.clone(),
+            manifest_sha256: sqm_identity::sha256sum(manifest)?,
+            request_sha256: sqm_identity::sha256sum(&request_bytes)?,
+            cake_sha256: sqm_identity::sha256sum(original.cake())?,
+            sqm_sha256: sqm_identity::sha256sum(original.sqm())?,
+            cake_mode: original.cake_mode,
+            sqm_mode: original.sqm_mode,
+            candidate_cake_sha256: Some(sqm_identity::sha256sum(candidate.cake())?),
+            candidate_sqm_sha256: Some(sqm_identity::sha256sum(candidate.sqm())?),
+            candidate_cake_mode: Some(original.cake_mode),
+            candidate_sqm_mode: Some(original.sqm_mode),
+            materialization_sha256: Some(sqm_identity::sha256sum(candidate.authority())?),
+        };
+        record.validate_candidate_phase(&plan.request)?;
+
+        let staging = self.staging_path();
+        create_private_directory(&staging)?;
+        let publish = (|| {
+            write_new_private_file(&staging.join(CAKE_BACKUP_FILE), original.cake())?;
+            write_new_private_file(&staging.join(SQM_BACKUP_FILE), original.sqm())?;
+            write_new_private_file(&staging.join(CAKE_CANDIDATE_FILE), candidate.cake())?;
+            write_new_private_file(&staging.join(SQM_CANDIDATE_FILE), candidate.sqm())?;
+            write_new_private_file(&staging.join(REQUEST_FILE), &request_bytes)?;
+            write_new_private_file(&staging.join(MANIFEST_FILE), manifest)?;
+            write_new_private_file(&staging.join(MATERIALIZATION_FILE), candidate.authority())?;
+            write_new_private_file(&staging.join(STATE_FILE), &record.encode()?)?;
+            sync_directory(&staging)?;
+            fs::rename(&staging, self.current_path()).map_err(|error| {
+                format!("unable to publish native Apply recovery state: {error}")
+            })?;
+            sync_directory(&self.root)?;
+            Ok::<(), String>(())
+        })();
+        if let Err(error) = publish {
+            return Err(error);
+        }
+
+        let stored = self
+            .read_record()?
+            .ok_or_else(|| "published native Apply recovery state disappeared".to_string())?;
+        if stored != record {
+            return Err("published native Apply recovery state changed".to_string());
+        }
+        self.verify_backups(&stored)?;
+        Ok(stored)
+    }
+
+    #[cfg(test)]
     pub(crate) fn prepare(
         &self,
         plan: &NativeApplyExecutionPlan,
@@ -1169,6 +1768,7 @@ impl NativeApplyRecoveryStore {
             return Err("native Apply recovery request exceeds its size bound".to_string());
         }
         let record = NativeApplyRecoveryRecord {
+            schema_version: 4,
             state: NativeApplyRecoveryState::Prepared,
             job_id: plan.request.identity.job_id.clone(),
             worker_run_id: plan.worker_run_id.clone(),
@@ -1183,6 +1783,7 @@ impl NativeApplyRecoveryStore {
             candidate_sqm_sha256: None,
             candidate_cake_mode: None,
             candidate_sqm_mode: None,
+            materialization_sha256: None,
         };
 
         let staging = self.staging_path();
@@ -1244,6 +1845,145 @@ impl NativeApplyRecoveryStore {
         Ok(request)
     }
 
+    fn read_manifest(&self) -> Result<Vec<u8>, String> {
+        let record = self
+            .read_record()?
+            .ok_or_else(|| "native Apply recovery transaction is missing".to_string())?;
+        self.verify_backups(&record)?;
+        read_private_recovery_bounded(
+            &self.current_path().join(MANIFEST_FILE),
+            MAX_MANIFEST_BYTES,
+            "manifest",
+        )
+    }
+
+    fn read_original_snapshot(&self) -> Result<NativeApplyConfigPairSnapshot, String> {
+        let record = self
+            .read_record()?
+            .ok_or_else(|| "native Apply recovery transaction is missing".to_string())?;
+        self.verify_backups(&record)?;
+        let current = self.current_path();
+        Ok(NativeApplyConfigPairSnapshot {
+            cake: read_private_recovery_bounded(
+                &current.join(CAKE_BACKUP_FILE),
+                MAX_CONFIG_BYTES,
+                "cake backup",
+            )?,
+            sqm: read_private_recovery_bounded(
+                &current.join(SQM_BACKUP_FILE),
+                MAX_CONFIG_BYTES,
+                "SQM backup",
+            )?,
+            cake_mode: record.cake_mode,
+            sqm_mode: record.sqm_mode,
+        })
+    }
+
+    fn read_containment_snapshots(&self) -> Result<Vec<NativeApplyConfigPairSnapshot>, String> {
+        let record = self
+            .read_record()?
+            .ok_or_else(|| "native Apply recovery transaction is missing".to_string())?;
+        self.verify_backups(&record)?;
+        let mut snapshots = vec![self.read_original_snapshot()?];
+        if record.candidate_cake_sha256.is_some() {
+            let current = self.current_path();
+            let candidate = NativeApplyConfigPairSnapshot {
+                cake: read_private_recovery_bounded(
+                    &current.join(CAKE_CANDIDATE_FILE),
+                    MAX_CONFIG_BYTES,
+                    "containment candidate cake",
+                )?,
+                sqm: read_private_recovery_bounded(
+                    &current.join(SQM_CANDIDATE_FILE),
+                    MAX_CONFIG_BYTES,
+                    "containment candidate SQM",
+                )?,
+                cake_mode: record.candidate_cake_mode.ok_or_else(|| {
+                    "native Apply containment candidate cake mode is missing".to_string()
+                })?,
+                sqm_mode: record.candidate_sqm_mode.ok_or_else(|| {
+                    "native Apply containment candidate SQM mode is missing".to_string()
+                })?,
+            };
+            if candidate != snapshots[0] {
+                snapshots.push(candidate);
+            }
+        }
+        Ok(snapshots)
+    }
+
+    fn upgrade_legacy_rollback_candidate(
+        &self,
+        request: &OperationRequest,
+        candidate: &NativeApplyCandidateMaterialization,
+    ) -> Result<NativeApplyRecoveryRecord, String> {
+        let mut record = self
+            .read_record()?
+            .ok_or_else(|| "native Apply recovery transaction is missing".to_string())?;
+        if record.schema_version != 4
+            || record.state != NativeApplyRecoveryState::RollbackRequired
+            || record.candidate_cake_sha256.is_some()
+            || record.candidate_sqm_sha256.is_some()
+            || record.candidate_cake_mode.is_some()
+            || record.candidate_sqm_mode.is_some()
+        {
+            return Err(
+                "legacy candidate reconstruction lacks an exact rollback-only state".to_string(),
+            );
+        }
+        self.verify_backups(&record)?;
+        let manifest = self.read_manifest()?;
+        require_canonical_manifest_string_field(&manifest, "worker_run_id", &record.worker_run_id)?;
+        require_canonical_manifest_string_field(&manifest, "option_id", &record.option_id)?;
+        let (_, authority) = legacy_native_apply_materialization(&manifest, request)?;
+        if candidate.authority() != authority {
+            return Err(
+                "legacy candidate reconstruction differs from the durable manifest".to_string(),
+            );
+        }
+        let current = self.current_path();
+        write_or_verify_private_file(
+            &current.join(CAKE_CANDIDATE_FILE),
+            candidate.cake(),
+            MAX_CONFIG_BYTES,
+            "legacy candidate cake",
+        )?;
+        write_or_verify_private_file(
+            &current.join(SQM_CANDIDATE_FILE),
+            candidate.sqm(),
+            MAX_CONFIG_BYTES,
+            "legacy candidate SQM",
+        )?;
+        write_or_verify_private_file(
+            &current.join(MATERIALIZATION_FILE),
+            candidate.authority(),
+            MAX_MANIFEST_BYTES,
+            "legacy materialization authority",
+        )?;
+        sync_directory(&current)?;
+
+        record.schema_version = 5;
+        record.candidate_cake_sha256 = Some(sqm_identity::sha256sum(candidate.cake())?);
+        record.candidate_sqm_sha256 = Some(sqm_identity::sha256sum(candidate.sqm())?);
+        record.candidate_cake_mode = Some(record.cake_mode);
+        record.candidate_sqm_mode = Some(record.sqm_mode);
+        record.materialization_sha256 = Some(sqm_identity::sha256sum(candidate.authority())?);
+        replace_private_file(
+            &current.join(STATE_FILE),
+            &current.join(NEXT_STATE_FILE),
+            &record.encode()?,
+        )?;
+        sync_directory(&current)?;
+        let stored = self
+            .read_record()?
+            .ok_or_else(|| "upgraded native Apply recovery state disappeared".to_string())?;
+        if stored != record {
+            return Err("upgraded native Apply recovery identity changed".to_string());
+        }
+        self.verify_backups(&stored)?;
+        Ok(stored)
+    }
+
     pub(crate) fn transition(
         &self,
         expected: NativeApplyRecoveryState,
@@ -1285,6 +2025,50 @@ impl NativeApplyRecoveryStore {
         Ok(stored)
     }
 
+    pub(crate) fn begin_mutation(
+        &self,
+        cake_config: &Path,
+        sqm_config: &Path,
+    ) -> Result<NativeApplyPreparedMutation, String> {
+        let record = self
+            .read_record()?
+            .ok_or_else(|| "native Apply recovery transaction is missing".to_string())?;
+        if record.schema_version != 5 || record.state != NativeApplyRecoveryState::Prepared {
+            return Err(
+                "native Apply write-ahead mutation may begin only from schema-v5 Prepared"
+                    .to_string(),
+            );
+        }
+        self.verify_backups(&record)?;
+        let current = self.current_path();
+        let cake_candidate = read_private_recovery_bounded(
+            &current.join(CAKE_CANDIDATE_FILE),
+            MAX_CONFIG_BYTES,
+            "write-ahead candidate cake config",
+        )?;
+        let sqm_candidate = read_private_recovery_bounded(
+            &current.join(SQM_CANDIDATE_FILE),
+            MAX_CONFIG_BYTES,
+            "write-ahead candidate SQM config",
+        )?;
+        let locks = NativeApplyConfigPairLock::acquire(cake_config, sqm_config)?;
+        self.verify_live_original_files(cake_config, sqm_config, &record)?;
+        let mutation_record = self.transition(
+            NativeApplyRecoveryState::Prepared,
+            NativeApplyRecoveryState::MutationStarted,
+        )?;
+        Ok(NativeApplyPreparedMutation {
+            _locks: locks,
+            recovery_root: self.root.clone(),
+            cake_config: cake_config.to_path_buf(),
+            sqm_config: sqm_config.to_path_buf(),
+            record: mutation_record,
+            cake_candidate,
+            sqm_candidate,
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn stage_candidate(
         &self,
         cake_config: &Path,
@@ -1349,6 +2133,7 @@ impl NativeApplyRecoveryStore {
         Ok(snapshot)
     }
 
+    #[cfg(test)]
     pub(crate) fn accept_candidate(
         &self,
         cake_config: &Path,
@@ -1391,6 +2176,7 @@ impl NativeApplyRecoveryStore {
         Ok(stored)
     }
 
+    #[cfg(test)]
     pub(crate) fn verify_staged_candidate_files(
         &self,
         cake_config: &Path,
@@ -1412,6 +2198,7 @@ impl NativeApplyRecoveryStore {
         )
     }
 
+    #[cfg(test)]
     fn verify_staged_snapshot(
         &self,
         snapshot: &NativeApplyCandidateSnapshot,
@@ -1488,6 +2275,21 @@ impl NativeApplyRecoveryStore {
                 return Err(format!("native Apply recovery {label} digest mismatch"));
             }
         }
+        if record.schema_version == 5 {
+            let materialization = read_private_recovery_bounded(
+                &current.join(MATERIALIZATION_FILE),
+                MAX_MANIFEST_BYTES,
+                "materialization authority",
+            )?;
+            if sqm_identity::sha256sum(&materialization)?
+                != *record
+                    .materialization_sha256
+                    .as_ref()
+                    .ok_or_else(|| "native Apply materialization digest is missing".to_string())?
+            {
+                return Err("native Apply recovery materialization digest mismatch".to_string());
+            }
+        }
         if record.candidate_cake_sha256.is_some() {
             let candidate_cake = read_private_recovery_bounded(
                 &current.join(CAKE_CANDIDATE_FILE),
@@ -1525,6 +2327,15 @@ impl NativeApplyRecoveryStore {
         if record.state != NativeApplyRecoveryState::CommitAccepted {
             return Err("native Apply live candidate has no commit authority".to_string());
         }
+        self.verify_live_write_ahead_candidate_files(cake_config, sqm_config, record)
+    }
+
+    fn verify_live_write_ahead_candidate_files(
+        &self,
+        cake_config: &Path,
+        sqm_config: &Path,
+        record: &NativeApplyRecoveryRecord,
+    ) -> Result<(), String> {
         self.verify_backups(record)?;
         verify_restored_file(
             cake_config,
@@ -1586,6 +2397,8 @@ impl NativeApplyRecoveryStore {
         }
         self.verify_backups(&record)?;
         let _config_locks = NativeApplyConfigPairLock::acquire(cake_config, sqm_config)?;
+        remove_stale_restore_temporary(cake_config)?;
+        remove_stale_restore_temporary(sqm_config)?;
         let restore_needed = self.roll_forward_restore_needed(cake_config, sqm_config, &record)?;
         let current = self.current_path();
         let cake = read_private_recovery_bounded(
@@ -1633,6 +2446,8 @@ impl NativeApplyRecoveryStore {
         }
         self.verify_backups(&record)?;
         let _config_locks = NativeApplyConfigPairLock::acquire(cake_config, sqm_config)?;
+        remove_stale_restore_temporary(cake_config)?;
+        remove_stale_restore_temporary(sqm_config)?;
         let restore_needed = self.rollback_restore_needed(cake_config, sqm_config, &record)?;
         let current = self.current_path();
         let cake = read_private_recovery_bounded(
@@ -1782,6 +2597,7 @@ impl NativeApplyRecoveryStore {
             NEXT_STATE_FILE,
             STATE_FILE,
             MANIFEST_FILE,
+            MATERIALIZATION_FILE,
             REQUEST_FILE,
             SQM_CANDIDATE_FILE,
             CAKE_CANDIDATE_FILE,
@@ -1830,25 +2646,8 @@ pub(super) fn read_config_snapshot(path: &Path, label: &str) -> Result<(Vec<u8>,
 
 pub(super) fn atomic_restore(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     validate_config_mode("restored config", mode)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| "restored config has no parent directory".to_string())?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| "restored config has no safe filename".to_string())?;
-    if name.is_empty() || name.contains(['/', '\0']) {
-        return Err("restored config filename is unsafe".to_string());
-    }
-    let temp = parent.join(format!(".{name}.native-apply-restore"));
-    if path_exists(&temp)? {
-        let metadata = strict_regular_metadata(&temp, "stale restore temporary")?;
-        if metadata.nlink() != 1 {
-            return Err("stale restore temporary has multiple links".to_string());
-        }
-        fs::remove_file(&temp)
-            .map_err(|error| format!("unable to remove stale restore temporary: {error}"))?;
-    }
+    remove_stale_restore_temporary(path)?;
+    let (parent, temp) = restore_temporary_path(path)?;
     let mut file = open_new_private(&temp)?;
     file.write_all(bytes)
         .map_err(|error| format!("unable to write restored config temporary: {error}"))?;
@@ -1859,7 +2658,38 @@ pub(super) fn atomic_restore(path: &Path, bytes: &[u8], mode: u32) -> Result<(),
     drop(file);
     fs::rename(&temp, path)
         .map_err(|error| format!("unable to publish restored config: {error}"))?;
-    sync_directory(parent)
+    sync_directory(&parent)
+}
+
+fn restore_temporary_path(path: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "restored config has no parent directory".to_string())?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "restored config has no safe filename".to_string())?;
+    if name.is_empty() || name.contains(['/', '\0']) {
+        return Err("restored config filename is unsafe".to_string());
+    }
+    Ok((
+        parent.to_path_buf(),
+        parent.join(format!(".{name}.native-apply-restore")),
+    ))
+}
+
+pub(super) fn remove_stale_restore_temporary(path: &Path) -> Result<(), String> {
+    let (parent, temp) = restore_temporary_path(path)?;
+    if path_exists(&temp)? {
+        let metadata = strict_regular_metadata(&temp, "stale restore temporary")?;
+        if metadata.nlink() != 1 {
+            return Err("stale restore temporary has multiple links".to_string());
+        }
+        fs::remove_file(&temp)
+            .map_err(|error| format!("unable to remove stale restore temporary: {error}"))?;
+        sync_directory(&parent)?;
+    }
+    Ok(())
 }
 
 pub(super) fn verify_restored_file(
@@ -1935,6 +2765,24 @@ pub(super) fn write_new_private_file(path: &Path, bytes: &[u8]) -> Result<(), St
         return Err("native Apply recovery file is not private and single-linked".to_string());
     }
     Ok(())
+}
+
+fn write_or_verify_private_file(
+    path: &Path,
+    bytes: &[u8],
+    maximum: usize,
+    label: &str,
+) -> Result<(), String> {
+    if path_exists(path)? {
+        let existing = read_private_recovery_bounded(path, maximum, label)?;
+        if existing != bytes {
+            return Err(format!(
+                "native Apply {label} residue differs from reconstruction"
+            ));
+        }
+        return Ok(());
+    }
+    write_new_private_file(path, bytes)
 }
 
 pub(super) fn replace_private_file(path: &Path, temp: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -2029,6 +2877,7 @@ pub(super) fn reject_unknown_entries(path: &Path) -> Result<(), String> {
         SQM_CANDIDATE_FILE,
         REQUEST_FILE,
         MANIFEST_FILE,
+        MATERIALIZATION_FILE,
     ]);
     for entry in fs::read_dir(path)
         .map_err(|error| format!("unable to enumerate native Apply recovery directory: {error}"))?
@@ -2358,18 +3207,40 @@ mod tests {
             }
         }
 
-        fn apply_uci_batch(&mut self, batch: &[u8]) -> Result<(), String> {
+        fn materialize_candidate(
+            &mut self,
+            plan: &NativeApplyExecutionPlan,
+            _: &NativeApplyConfigPairSnapshot,
+        ) -> Result<NativeApplyCandidateMaterialization, String> {
             self.events.push("uci-batch");
+            let batch = canonical_native_uci_batch(plan)?;
             assert!(batch
                 .windows(b"commit cake-autorate\n".len())
                 .any(|window| window == b"commit cake-autorate\n"));
             assert!(batch.ends_with(b"commit cake-autorate\n") || batch.ends_with(b"commit sqm\n"));
-            fs::write(&self.cake, b"cake-after\n").unwrap();
             if self.fail_apply_after_partial_write {
-                return Err("injected partial UCI failure".to_string());
+                return Err("injected candidate materialization failure".to_string());
             }
-            fs::write(&self.sqm, b"sqm-after\n").unwrap();
-            Ok(())
+            NativeApplyCandidateMaterialization::new(
+                b"cake-after\n".to_vec(),
+                b"sqm-after\n".to_vec(),
+                batch,
+            )
+        }
+
+        fn reconstruct_legacy_candidate(
+            &mut self,
+            request: &OperationRequest,
+            manifest: &[u8],
+            _: &NativeApplyConfigPairSnapshot,
+        ) -> Result<NativeApplyCandidateMaterialization, String> {
+            self.events.push("reconstruct-legacy");
+            let (_, authority) = legacy_native_apply_materialization(manifest, request)?;
+            NativeApplyCandidateMaterialization::new(
+                b"cake-after\n".to_vec(),
+                b"sqm-after\n".to_vec(),
+                authority,
+            )
         }
 
         fn restart_service(
@@ -2413,8 +3284,10 @@ mod tests {
             &mut self,
             _: &OperationRequest,
             _: &NativeApplyGlobalLock,
+            authorities: &[NativeApplyConfigPairSnapshot],
         ) -> Result<(), String> {
             self.events.push("emergency-contain");
+            assert!(!authorities.is_empty());
             if self.fail_emergency_containment {
                 Err("injected emergency containment failure".to_string())
             } else {
@@ -2513,8 +3386,8 @@ mod tests {
             backend.events,
             [
                 "attest-before",
-                "attest-before",
                 "uci-batch",
+                "attest-before",
                 "restart-applied",
                 "verify-applied",
                 "restart-restored",
@@ -2959,8 +3832,8 @@ mod tests {
             backend.events,
             [
                 "attest-before",
-                "attest-before",
                 "uci-batch",
+                "attest-before",
                 "restart-applied",
                 "restart-restored",
                 "verify-restored"
@@ -2976,7 +3849,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_uci_failure_preserves_unproven_state_and_contains_runtime() {
+    fn materialization_failure_precedes_journal_and_live_mutation() {
         let (root, cake, sqm, recovery, lock) = transaction_fixture("partial-uci");
         let plan = plan();
         let manifest = plan.canonical_manifest_bytes().unwrap();
@@ -2994,20 +3867,541 @@ mod tests {
             &mut backend,
         )
         .unwrap_err();
-        assert!(error.contains("rollback remains pending"));
-        assert!(error.contains("foreign or unproven config state"));
+        assert!(error.contains("candidate materialization failure"));
+        assert_eq!(fs::read(&cake).unwrap(), b"cake-before\n");
+        assert_eq!(fs::read(&sqm).unwrap(), b"sqm-before\n");
+        assert!(NativeApplyRecoveryStore::new(&recovery)
+            .read_record()
+            .unwrap()
+            .is_none());
+        assert_eq!(backend.events, ["attest-before", "uci-batch"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn write_ahead_mixed_pair_recovers_without_foreign_state_guessing() {
+        let (root, cake, sqm, recovery, lock) = transaction_fixture("write-ahead-mixed-pair");
+        let plan = plan();
+        let manifest = plan.canonical_manifest_bytes().unwrap();
+        let original = NativeApplyConfigPairSnapshot::capture(&cake, &sqm).unwrap();
+        let candidate = NativeApplyCandidateMaterialization::new(
+            b"cake-after\n".to_vec(),
+            b"sqm-after\n".to_vec(),
+            canonical_native_uci_batch(&plan).unwrap(),
+        )
+        .unwrap();
+        let store = NativeApplyRecoveryStore::new(&recovery);
+        store
+            .prepare_write_ahead(&plan, &manifest, &original, &candidate)
+            .unwrap();
+        let mutation = store.begin_mutation(&cake, &sqm).unwrap();
+        atomic_restore(&cake, candidate.cake(), original.cake_mode).unwrap();
+        drop(mutation);
         assert_eq!(fs::read(&cake).unwrap(), b"cake-after\n");
         assert_eq!(fs::read(&sqm).unwrap(), b"sqm-before\n");
+
+        let mut backend = FakeBackend::new(&cake, &sqm);
+        let receipt = recover_native_apply(
+            NativeApplyTransactionPaths {
+                recovery_root: &recovery,
+                global_lock: &lock,
+                cake_config: &cake,
+                sqm_config: &sqm,
+            },
+            &mut backend,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!receipt.rolled_forward);
+        assert!(receipt.recovery_cleared);
+        assert_eq!(fs::read(&cake).unwrap(), b"cake-before\n");
+        assert_eq!(fs::read(&sqm).unwrap(), b"sqm-before\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum WriteAheadCrashBoundary {
+        PreparedPublished,
+        MutationStarted,
+        CakeTemporarySynced,
+        CakeRenamed,
+        SqmTemporarySynced,
+        CandidatePairRenamed,
+        ServiceRestarted,
+        Verified,
+    }
+
+    #[test]
+    fn every_precommit_write_ahead_crash_boundary_restores_without_residue() {
+        for (label, boundary) in [
+            ("prepared", WriteAheadCrashBoundary::PreparedPublished),
+            ("mutation-started", WriteAheadCrashBoundary::MutationStarted),
+            ("cake-temp", WriteAheadCrashBoundary::CakeTemporarySynced),
+            ("cake-renamed", WriteAheadCrashBoundary::CakeRenamed),
+            ("sqm-temp", WriteAheadCrashBoundary::SqmTemporarySynced),
+            (
+                "pair-renamed",
+                WriteAheadCrashBoundary::CandidatePairRenamed,
+            ),
+            (
+                "service-restarted",
+                WriteAheadCrashBoundary::ServiceRestarted,
+            ),
+            ("verified", WriteAheadCrashBoundary::Verified),
+        ] {
+            let (root, cake, sqm, recovery, lock) =
+                transaction_fixture(&format!("crash-boundary-{label}"));
+            let plan = plan();
+            let manifest = plan.canonical_manifest_bytes().unwrap();
+            let original = NativeApplyConfigPairSnapshot::capture(&cake, &sqm).unwrap();
+            let candidate = NativeApplyCandidateMaterialization::new(
+                b"cake-after\n".to_vec(),
+                b"sqm-after\n".to_vec(),
+                canonical_native_uci_batch(&plan).unwrap(),
+            )
+            .unwrap();
+            let store = NativeApplyRecoveryStore::new(&recovery);
+            store
+                .prepare_write_ahead(&plan, &manifest, &original, &candidate)
+                .unwrap();
+
+            let mut mutation = if boundary == WriteAheadCrashBoundary::PreparedPublished {
+                None
+            } else {
+                Some(store.begin_mutation(&cake, &sqm).unwrap())
+            };
+            match boundary {
+                WriteAheadCrashBoundary::PreparedPublished
+                | WriteAheadCrashBoundary::MutationStarted => {}
+                WriteAheadCrashBoundary::CakeTemporarySynced => {
+                    let (_, temporary) = restore_temporary_path(&cake).unwrap();
+                    write_config(&temporary, candidate.cake(), original.cake_mode);
+                }
+                WriteAheadCrashBoundary::CakeRenamed => {
+                    atomic_restore(&cake, candidate.cake(), original.cake_mode).unwrap();
+                }
+                WriteAheadCrashBoundary::SqmTemporarySynced => {
+                    atomic_restore(&cake, candidate.cake(), original.cake_mode).unwrap();
+                    let (_, temporary) = restore_temporary_path(&sqm).unwrap();
+                    write_config(&temporary, candidate.sqm(), original.sqm_mode);
+                }
+                WriteAheadCrashBoundary::CandidatePairRenamed
+                | WriteAheadCrashBoundary::ServiceRestarted
+                | WriteAheadCrashBoundary::Verified => {
+                    mutation
+                        .as_ref()
+                        .unwrap()
+                        .install_candidate_files()
+                        .unwrap();
+                    if matches!(
+                        boundary,
+                        WriteAheadCrashBoundary::ServiceRestarted
+                            | WriteAheadCrashBoundary::Verified
+                    ) {
+                        store
+                            .transition(
+                                NativeApplyRecoveryState::MutationStarted,
+                                NativeApplyRecoveryState::ServiceRestarted,
+                            )
+                            .unwrap();
+                    }
+                    if boundary == WriteAheadCrashBoundary::Verified {
+                        store
+                            .transition(
+                                NativeApplyRecoveryState::ServiceRestarted,
+                                NativeApplyRecoveryState::Verified,
+                            )
+                            .unwrap();
+                    }
+                }
+            }
+            drop(mutation.take());
+
+            let mut backend = FakeBackend::new(&cake, &sqm);
+            let receipt = recover_native_apply(
+                NativeApplyTransactionPaths {
+                    recovery_root: &recovery,
+                    global_lock: &lock,
+                    cake_config: &cake,
+                    sqm_config: &sqm,
+                },
+                &mut backend,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(!receipt.rolled_forward, "{label}");
+            assert!(receipt.recovery_cleared, "{label}");
+            assert_eq!(fs::read(&cake).unwrap(), original.cake(), "{label}");
+            assert_eq!(fs::read(&sqm).unwrap(), original.sqm(), "{label}");
+            assert!(
+                !restore_temporary_path(&cake).unwrap().1.exists(),
+                "{label}"
+            );
+            assert!(!restore_temporary_path(&sqm).unwrap().1.exists(), "{label}");
+            assert!(store.read_record().unwrap().is_none(), "{label}");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn write_ahead_rollback_accepts_all_original_candidate_pair_combinations() {
+        for (label, cake_is_candidate, sqm_is_candidate) in [
+            ("oo", false, false),
+            ("oc", false, true),
+            ("co", true, false),
+            ("cc", true, true),
+        ] {
+            let (root, cake, sqm, recovery, lock) =
+                transaction_fixture(&format!("write-ahead-{label}"));
+            let plan = plan();
+            let manifest = plan.canonical_manifest_bytes().unwrap();
+            let original = NativeApplyConfigPairSnapshot::capture(&cake, &sqm).unwrap();
+            let candidate = NativeApplyCandidateMaterialization::new(
+                b"cake-after\n".to_vec(),
+                b"sqm-after\n".to_vec(),
+                canonical_native_uci_batch(&plan).unwrap(),
+            )
+            .unwrap();
+            let store = NativeApplyRecoveryStore::new(&recovery);
+            store
+                .prepare_write_ahead(&plan, &manifest, &original, &candidate)
+                .unwrap();
+            drop(store.begin_mutation(&cake, &sqm).unwrap());
+            if cake_is_candidate {
+                fs::write(&cake, candidate.cake()).unwrap();
+            }
+            if sqm_is_candidate {
+                fs::write(&sqm, candidate.sqm()).unwrap();
+            }
+
+            let mut backend = FakeBackend::new(&cake, &sqm);
+            let receipt = recover_native_apply(
+                NativeApplyTransactionPaths {
+                    recovery_root: &recovery,
+                    global_lock: &lock,
+                    cake_config: &cake,
+                    sqm_config: &sqm,
+                },
+                &mut backend,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(
+                !receipt.rolled_forward,
+                "unexpected roll-forward for {label}"
+            );
+            assert_eq!(fs::read(&cake).unwrap(), b"cake-before\n", "{label}");
+            assert_eq!(fs::read(&sqm).unwrap(), b"sqm-before\n", "{label}");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn write_ahead_rollforward_accepts_all_original_candidate_pair_combinations() {
+        for (label, cake_is_candidate, sqm_is_candidate) in [
+            ("oo", false, false),
+            ("oc", false, true),
+            ("co", true, false),
+            ("cc", true, true),
+        ] {
+            let (root, cake, sqm, recovery, lock) =
+                transaction_fixture(&format!("write-ahead-forward-{label}"));
+            let plan = plan();
+            let manifest = plan.canonical_manifest_bytes().unwrap();
+            let original = NativeApplyConfigPairSnapshot::capture(&cake, &sqm).unwrap();
+            let candidate = NativeApplyCandidateMaterialization::new(
+                b"cake-after\n".to_vec(),
+                b"sqm-after\n".to_vec(),
+                canonical_native_uci_batch(&plan).unwrap(),
+            )
+            .unwrap();
+            let store = NativeApplyRecoveryStore::new(&recovery);
+            store
+                .prepare_write_ahead(&plan, &manifest, &original, &candidate)
+                .unwrap();
+            let mutation = store.begin_mutation(&cake, &sqm).unwrap();
+            mutation.install_candidate_files().unwrap();
+            store
+                .transition(
+                    NativeApplyRecoveryState::MutationStarted,
+                    NativeApplyRecoveryState::ServiceRestarted,
+                )
+                .unwrap();
+            drop(mutation);
+            store
+                .transition(
+                    NativeApplyRecoveryState::ServiceRestarted,
+                    NativeApplyRecoveryState::Verified,
+                )
+                .unwrap();
+            store
+                .transition(
+                    NativeApplyRecoveryState::Verified,
+                    NativeApplyRecoveryState::CommitAccepted,
+                )
+                .unwrap();
+            fs::write(
+                &cake,
+                if cake_is_candidate {
+                    candidate.cake()
+                } else {
+                    original.cake()
+                },
+            )
+            .unwrap();
+            fs::write(
+                &sqm,
+                if sqm_is_candidate {
+                    candidate.sqm()
+                } else {
+                    original.sqm()
+                },
+            )
+            .unwrap();
+
+            let mut backend = FakeBackend::new(&cake, &sqm);
+            let receipt = recover_native_apply(
+                NativeApplyTransactionPaths {
+                    recovery_root: &recovery,
+                    global_lock: &lock,
+                    cake_config: &cake,
+                    sqm_config: &sqm,
+                },
+                &mut backend,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(receipt.rolled_forward, "unexpected rollback for {label}");
+            assert_eq!(fs::read(&cake).unwrap(), candidate.cake(), "{label}");
+            assert_eq!(fs::read(&sqm).unwrap(), candidate.sqm(), "{label}");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum WriteAheadForeignBoundary {
+        MutationStarted,
+        ServiceRestarted,
+        Verified,
+        CommitAccepted,
+    }
+
+    #[test]
+    fn every_write_ahead_recovery_phase_refuses_foreign_live_bytes() {
+        for (label, boundary) in [
+            (
+                "mutation-started",
+                WriteAheadForeignBoundary::MutationStarted,
+            ),
+            (
+                "service-restarted",
+                WriteAheadForeignBoundary::ServiceRestarted,
+            ),
+            ("verified", WriteAheadForeignBoundary::Verified),
+            ("commit-accepted", WriteAheadForeignBoundary::CommitAccepted),
+        ] {
+            let (root, cake, sqm, recovery, lock) =
+                transaction_fixture(&format!("foreign-v5-{label}"));
+            let plan = plan();
+            let manifest = plan.canonical_manifest_bytes().unwrap();
+            let original = NativeApplyConfigPairSnapshot::capture(&cake, &sqm).unwrap();
+            let candidate = NativeApplyCandidateMaterialization::new(
+                b"cake-after\n".to_vec(),
+                b"sqm-after\n".to_vec(),
+                canonical_native_uci_batch(&plan).unwrap(),
+            )
+            .unwrap();
+            let store = NativeApplyRecoveryStore::new(&recovery);
+            store
+                .prepare_write_ahead(&plan, &manifest, &original, &candidate)
+                .unwrap();
+            let mutation = store.begin_mutation(&cake, &sqm).unwrap();
+            if boundary != WriteAheadForeignBoundary::MutationStarted {
+                mutation.install_candidate_files().unwrap();
+                store
+                    .transition(
+                        NativeApplyRecoveryState::MutationStarted,
+                        NativeApplyRecoveryState::ServiceRestarted,
+                    )
+                    .unwrap();
+                if matches!(
+                    boundary,
+                    WriteAheadForeignBoundary::Verified | WriteAheadForeignBoundary::CommitAccepted
+                ) {
+                    store
+                        .transition(
+                            NativeApplyRecoveryState::ServiceRestarted,
+                            NativeApplyRecoveryState::Verified,
+                        )
+                        .unwrap();
+                }
+                if boundary == WriteAheadForeignBoundary::CommitAccepted {
+                    store
+                        .transition(
+                            NativeApplyRecoveryState::Verified,
+                            NativeApplyRecoveryState::CommitAccepted,
+                        )
+                        .unwrap();
+                }
+            }
+            drop(mutation);
+            fs::write(&cake, b"foreign-cake\n").unwrap();
+            let sqm_before_recovery = fs::read(&sqm).unwrap();
+
+            let mut backend = FakeBackend::new(&cake, &sqm);
+            let error = recover_native_apply(
+                NativeApplyTransactionPaths {
+                    recovery_root: &recovery,
+                    global_lock: &lock,
+                    cake_config: &cake,
+                    sqm_config: &sqm,
+                },
+                &mut backend,
+            )
+            .unwrap_err();
+            assert!(error.contains("foreign"), "{label}: {error}");
+            assert_eq!(fs::read(&cake).unwrap(), b"foreign-cake\n", "{label}");
+            assert_eq!(fs::read(&sqm).unwrap(), sqm_before_recovery, "{label}");
+            let retained = store.read_record().unwrap().unwrap();
+            assert_eq!(
+                retained.state,
+                if boundary == WriteAheadForeignBoundary::CommitAccepted {
+                    NativeApplyRecoveryState::CommitAccepted
+                } else {
+                    NativeApplyRecoveryState::RollbackRequired
+                },
+                "{label}"
+            );
+            assert!(backend.events.contains(&"emergency-contain"), "{label}");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn unsafe_stale_restore_temporary_keeps_recovery_pending() {
+        let (root, cake, sqm, recovery, lock) = transaction_fixture("unsafe-restore-temp");
+        let plan = plan();
+        let manifest = plan.canonical_manifest_bytes().unwrap();
+        let original = NativeApplyConfigPairSnapshot::capture(&cake, &sqm).unwrap();
+        let candidate = NativeApplyCandidateMaterialization::new(
+            b"cake-after\n".to_vec(),
+            b"sqm-after\n".to_vec(),
+            canonical_native_uci_batch(&plan).unwrap(),
+        )
+        .unwrap();
+        let store = NativeApplyRecoveryStore::new(&recovery);
+        store
+            .prepare_write_ahead(&plan, &manifest, &original, &candidate)
+            .unwrap();
+        drop(store.begin_mutation(&cake, &sqm).unwrap());
+        let target = root.join("foreign-target");
+        write_config(&target, b"foreign\n", 0o600);
+        let temporary = restore_temporary_path(&cake).unwrap().1;
+        std::os::unix::fs::symlink(&target, &temporary).unwrap();
+
+        let mut backend = FakeBackend::new(&cake, &sqm);
+        let error = recover_native_apply(
+            NativeApplyTransactionPaths {
+                recovery_root: &recovery,
+                global_lock: &lock,
+                cake_config: &cake,
+                sqm_config: &sqm,
+            },
+            &mut backend,
+        )
+        .unwrap_err();
+        assert!(error.contains("stale restore temporary is not a regular file"));
+        assert_eq!(fs::read(&target).unwrap(), b"foreign\n");
+        assert_eq!(fs::read(&cake).unwrap(), original.cake());
+        assert_eq!(fs::read(&sqm).unwrap(), original.sqm());
         assert_eq!(
-            NativeApplyRecoveryStore::new(&recovery)
-                .read_record()
-                .unwrap()
-                .unwrap()
-                .state,
+            store.read_record().unwrap().unwrap().state,
             NativeApplyRecoveryState::RollbackRequired
         );
-        assert!(backend.events.contains(&"emergency-contain"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_v4_hybrid_pair_is_reconstructed_only_for_rollback() {
+        let (root, cake, sqm, recovery, lock) = transaction_fixture("legacy-v4-hybrid");
+        let plan = plan();
+        let manifest = plan.canonical_manifest_bytes().unwrap();
+        let store = NativeApplyRecoveryStore::new(&recovery);
+        store.prepare(&plan, &manifest, &cake, &sqm).unwrap();
+        store
+            .transition(
+                NativeApplyRecoveryState::Prepared,
+                NativeApplyRecoveryState::MutationStarted,
+            )
+            .unwrap();
+        store
+            .transition(
+                NativeApplyRecoveryState::MutationStarted,
+                NativeApplyRecoveryState::RollbackRequired,
+            )
+            .unwrap();
+        fs::write(&cake, b"cake-after\n").unwrap();
+
+        let mut backend = FakeBackend::new(&cake, &sqm);
+        let receipt = recover_native_apply(
+            NativeApplyTransactionPaths {
+                recovery_root: &recovery,
+                global_lock: &lock,
+                cake_config: &cake,
+                sqm_config: &sqm,
+            },
+            &mut backend,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!receipt.rolled_forward);
+        assert!(receipt.recovery_cleared);
+        assert_eq!(fs::read(&cake).unwrap(), b"cake-before\n");
+        assert_eq!(fs::read(&sqm).unwrap(), b"sqm-before\n");
+        assert_eq!(
+            backend.events,
+            ["reconstruct-legacy", "restart-applied", "verify-restored"]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_manifest_reconstruction_is_exact_and_tamper_evident() {
+        let plan = plan();
+        let manifest = plan.canonical_manifest_bytes().unwrap();
+        let (mutations, authority) =
+            legacy_native_apply_materialization(&manifest, &plan.request).unwrap();
+        assert_eq!(mutations, plan.uci_mutations);
+        assert_eq!(authority, canonical_native_uci_batch(&plan).unwrap());
+
+        let mut foreign_request = plan.request.clone();
+        foreign_request.identity.job_id = "12".repeat(16);
+        assert!(
+            legacy_native_apply_materialization(&manifest, &foreign_request)
+                .unwrap_err()
+                .contains("job_id binding")
+        );
+        assert!(require_canonical_manifest_string_field(
+            &manifest,
+            "worker_run_id",
+            &"34".repeat(16),
+        )
+        .unwrap_err()
+        .contains("worker_run_id binding"));
+        assert!(
+            require_canonical_manifest_string_field(&manifest, "option_id", "foreign_option",)
+                .unwrap_err()
+                .contains("option_id binding")
+        );
+
+        let mut tampered = manifest.clone();
+        let needle = b"\"uci_mutations\":[";
+        let position = tampered
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .unwrap();
+        tampered[position] = b'X';
+        assert!(legacy_native_apply_materialization(&tampered, &plan.request).is_err());
     }
 
     #[test]
@@ -3120,7 +4514,10 @@ mod tests {
         assert!(error.contains("original cake config digest mismatch"));
         assert_eq!(fs::read(&cake).unwrap(), b"foreign-before-mutation\n");
         assert_eq!(fs::read(&sqm).unwrap(), b"sqm-before\n");
-        assert_eq!(backend.events, ["attest-before", "attest-before"]);
+        assert_eq!(
+            backend.events,
+            ["attest-before", "uci-batch", "attest-before"]
+        );
         assert_eq!(backend.restart_count, 0);
         assert!(NativeApplyRecoveryStore::new(&recovery)
             .read_record()
@@ -3153,7 +4550,10 @@ mod tests {
         assert!(error.contains("original SQM config digest mismatch"));
         assert_eq!(fs::read(&cake).unwrap(), b"cake-before\n");
         assert_eq!(fs::read(&sqm).unwrap(), b"foreign-sqm-before-mutation\n");
-        assert_eq!(backend.events, ["attest-before", "attest-before"]);
+        assert_eq!(
+            backend.events,
+            ["attest-before", "uci-batch", "attest-before"]
+        );
         assert_eq!(backend.restart_count, 0);
         assert!(NativeApplyRecoveryStore::new(&recovery)
             .read_record()
@@ -3436,14 +4836,17 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("precommit recovery remains pending"));
-        assert!(error.contains("foreign or unproven config state"));
+        assert!(
+            error.contains("foreign or unproven config state"),
+            "{error}"
+        );
         assert_eq!(fs::read(&cake).unwrap(), b"unproven-precommit\n");
         assert_eq!(fs::read(&sqm).unwrap(), b"sqm-before\n");
         assert_eq!(
             store.read_record().unwrap().unwrap().state,
             NativeApplyRecoveryState::RollbackRequired
         );
-        assert_eq!(backend.events, ["emergency-contain"]);
+        assert_eq!(backend.events, ["reconstruct-legacy", "emergency-contain"]);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3554,14 +4957,17 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("recovery remains pending"));
-        assert!(error.contains("foreign or unproven config state"));
+        assert!(
+            error.contains("foreign or unproven config state"),
+            "{error}"
+        );
         assert_eq!(fs::read(&cake).unwrap(), b"unproven-cake\n");
         assert_eq!(fs::read(&sqm).unwrap(), b"sqm-before\n");
         assert_eq!(
             store.read_record().unwrap().unwrap().state,
             NativeApplyRecoveryState::RollbackRequired
         );
-        assert_eq!(backend.events, ["emergency-contain"]);
+        assert_eq!(backend.events, ["reconstruct-legacy", "emergency-contain"]);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3755,6 +5161,48 @@ mod tests {
             assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
         }
         assert!(store.prepare(&plan, &manifest, &cake, &sqm).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn write_ahead_prepare_publishes_complete_v5_authority_before_mutation() {
+        let (root, cake, sqm, recovery, _lock) = transaction_fixture("prepare-v5");
+        let plan = plan();
+        let manifest = plan.canonical_manifest_bytes().unwrap();
+        let original = NativeApplyConfigPairSnapshot::capture(&cake, &sqm).unwrap();
+        let candidate = NativeApplyCandidateMaterialization::new(
+            b"cake-after\n".to_vec(),
+            b"sqm-after\n".to_vec(),
+            canonical_native_uci_batch(&plan).unwrap(),
+        )
+        .unwrap();
+        let store = NativeApplyRecoveryStore::new(&recovery);
+        let record = store
+            .prepare_write_ahead(&plan, &manifest, &original, &candidate)
+            .unwrap();
+        assert_eq!(record.schema_version, 5);
+        assert_eq!(record.state, NativeApplyRecoveryState::Prepared);
+        assert!(record.candidate_cake_sha256.is_some());
+        assert!(record.candidate_sqm_sha256.is_some());
+        assert!(record.materialization_sha256.is_some());
+        let state = fs::read(store.current_path().join(STATE_FILE)).unwrap();
+        assert!(state.starts_with(format!("{RECOVERY_HEADER_V5}\n").as_bytes()));
+        assert_eq!(NativeApplyRecoveryRecord::decode(&state).unwrap(), record);
+        for name in [
+            CAKE_BACKUP_FILE,
+            SQM_BACKUP_FILE,
+            CAKE_CANDIDATE_FILE,
+            SQM_CANDIDATE_FILE,
+            REQUEST_FILE,
+            MANIFEST_FILE,
+            MATERIALIZATION_FILE,
+            STATE_FILE,
+        ] {
+            let metadata = fs::metadata(store.current_path().join(name)).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        }
+        assert_eq!(fs::read(&cake).unwrap(), b"cake-before\n");
+        assert_eq!(fs::read(&sqm).unwrap(), b"sqm-before\n");
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -23,6 +23,8 @@ RUNTIME_LOCK_AVAILABLE=0
 SERVICE_RUNTIME_LOCK_HELD=0
 SERVICE_RUNTIME_LOCK_BORROWED=0
 SERVICE_RUNTIME_STOP_RELEASE_PENDING=0
+SERVICE_START_CONFIRM_PENDING=0
+SERVICE_START_CONFIRM_DEFERRED=0
 # @variant full end
 # @variant full begin
 if [ -r "$RUNTIME_LOCK_LIB" ]; then
@@ -187,9 +189,14 @@ start_service_locked() {
 	local remainder mqtt_instances
 	# @variant full end
 
+	SERVICE_START_CONFIRM_DEFERRED=0
 	if ! result="$(service_prepare_start)"; then
 		logger -t cake-autorate "native service start preparation failed"
 		return 1
+	fi
+	if [ "$result" = service-start-deferred-v1 ]; then
+		SERVICE_START_CONFIRM_DEFERRED=1
+		return 0
 	fi
 	marker="${result%% *}"
 	[ "$marker" != "$result" ] || {
@@ -243,6 +250,33 @@ start_service_locked() {
 }
 
 # @variant full begin
+service_confirm_started() {
+	local result
+
+	if ! result="$("$DAEMON" --service-lifecycle confirm-started 2>/dev/null)"; then
+		logger -t cake-autorate "native controller lifecycle readiness confirmation failed"
+		return 1
+	fi
+	[ "$result" = "service-started-v1 ready" ] || {
+		logger -t cake-autorate "native controller lifecycle returned an invalid readiness confirmation"
+		return 1
+	}
+}
+
+service_started() {
+	[ "$SERVICE_START_CONFIRM_DEFERRED" -eq 0 ] || return 0
+	# A native Apply caller owns the borrowed descriptor until its Rust
+	# transaction returns and performs the post-lock readiness proof.
+	[ "${CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_BORROW:-0}" != 1 ] || return 0
+	if [ "$SERVICE_RUNTIME_LOCK_HELD" -eq 1 ]; then
+		SERVICE_START_CONFIRM_PENDING=1
+		return 0
+	fi
+	service_confirm_started
+}
+# @variant full end
+
+# @variant full begin
 start_service() {
 	local lock_was_held="$SERVICE_RUNTIME_LOCK_HELD"
 	local rc
@@ -278,6 +312,15 @@ reload_service() {
 	fi
 	if [ "$lock_was_held" -eq 0 ]; then
 		service_runtime_lock_release_or_exit "reloading CAKE Autorate"
+	fi
+	if [ "$rc" -eq 0 ] && [ "$lock_was_held" -eq 0 ] && \
+		[ "$SERVICE_START_CONFIRM_PENDING" -eq 1 ]; then
+		SERVICE_START_CONFIRM_PENDING=0
+		if service_confirm_started; then
+			:
+		else
+			rc=$?
+		fi
 	fi
 
 	return "$rc"

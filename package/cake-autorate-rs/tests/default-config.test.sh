@@ -37,6 +37,6 @@ if grep -q 'PKG_UPGRADE' "$test_dir/../files/etc/init.d/cake-autorate"; then
 	exit 1
 fi
 grep -q 'package_upgrade_mode()' "$service_lifecycle"
-grep -q 'return Ok(encode_start_plan(&\[\], &\[\]))' "$service_lifecycle"
+grep -q 'return Ok(format!("{SERVICE_START_DEFERRED_V1}\\n"))' "$service_lifecycle"
 
 printf '%s\n' 'default config clean-install tests passed'

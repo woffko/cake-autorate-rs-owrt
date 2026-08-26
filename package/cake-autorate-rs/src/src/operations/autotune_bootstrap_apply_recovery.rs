@@ -9,9 +9,10 @@
 use super::autotune_apply::validate_native_apply_option_id;
 use super::autotune_apply_runtime::{
     atomic_restore, create_private_directory, ensure_private_directory, parse_mode, path_exists,
-    read_config_snapshot, read_field, read_private_recovery_bounded, replace_private_file,
-    require_lower_hex, require_private_directory, sync_directory, validate_config_mode,
-    verify_restored_file, write_new_private_file, NativeApplyConfigPairLock,
+    read_config_snapshot, read_field, read_private_recovery_bounded,
+    remove_stale_restore_temporary, replace_private_file, require_lower_hex,
+    require_private_directory, sync_directory, validate_config_mode, verify_restored_file,
+    write_new_private_file, NativeApplyConfigPairLock,
 };
 use super::autotune_bootstrap_apply::{
     NativeBootstrapApplyMode, NativeBootstrapApplyPlan, MAX_NATIVE_BOOTSTRAP_APPLY_MANIFEST_BYTES,
@@ -709,6 +710,8 @@ impl NativeBootstrapApplyRecoveryStore {
         }
         let bundle = self.read_and_verify_bundle(&record)?;
         let _locks = NativeApplyConfigPairLock::acquire(cake_config, sqm_config)?;
+        remove_stale_restore_temporary(cake_config)?;
+        remove_stale_restore_temporary(sqm_config)?;
         let before = classify_live_pair(cake_config, sqm_config, &record)?;
         if before.contains_foreign() {
             return Err(
@@ -1158,6 +1161,13 @@ mod tests {
         )
     }
 
+    fn restore_temporary(path: &Path) -> PathBuf {
+        path.parent().unwrap().join(format!(
+            ".{}.native-apply-restore",
+            path.file_name().unwrap().to_str().unwrap()
+        ))
+    }
+
     #[test]
     fn prepare_publishes_complete_exact_v6_namespace_authority_before_mutation() {
         let fixture = Fixture::new("prepare");
@@ -1315,6 +1325,32 @@ mod tests {
             .unwrap();
         store.clear_restored().unwrap();
         assert!(store.read_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn rollback_removes_stale_restore_temporaries_even_when_live_files_are_original() {
+        let fixture = Fixture::new("rollback-stale-restore-temporaries");
+        fixture.prepare();
+        let store = fixture.store();
+        store
+            .transition(
+                NativeBootstrapApplyRecoveryState::Prepared,
+                NativeBootstrapApplyRecoveryState::RollbackRequired,
+            )
+            .unwrap();
+        let cake_temp = restore_temporary(&fixture.cake);
+        let sqm_temp = restore_temporary(&fixture.sqm);
+        write_config(&cake_temp, b"interrupted cake restore\n", 0o600);
+        write_config(&sqm_temp, b"interrupted sqm restore\n", 0o600);
+
+        store
+            .restore_original_files(&fixture.cake, &fixture.sqm)
+            .unwrap();
+
+        assert_eq!(fs::read(&fixture.cake).unwrap(), fixture.cake_original);
+        assert_eq!(fs::read(&fixture.sqm).unwrap(), fixture.sqm_original);
+        assert!(!cake_temp.exists());
+        assert!(!sqm_temp.exists());
     }
 
     #[test]

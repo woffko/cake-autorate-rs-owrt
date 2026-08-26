@@ -61,6 +61,7 @@ const MAX_CMDLINE: u64 = 4096;
 const MAX_BRIDGER_CONFIG_BYTES: usize = 256 * 1024;
 const SERVICE_NAME: &str = "cake-autorate";
 const DAEMON_PATH: &str = "/usr/sbin/cake-autorated";
+const SERVICE_START_DEFERRED_V1: &str = "service-start-deferred-v1";
 static REPLACE_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Debug, PartialEq)]
@@ -328,6 +329,12 @@ where
 
 #[cfg(feature = "calibration")]
 fn confirm_started_openwrt() -> Result<String, String> {
+    confirm_controller_service_started()?;
+    Ok("service-started-v1 ready\n".to_string())
+}
+
+#[cfg(feature = "calibration")]
+pub(crate) fn confirm_controller_service_started() -> Result<(), String> {
     if unsafe { libc::geteuid() } != 0 {
         return Err("service lifecycle requires root".to_string());
     }
@@ -355,7 +362,7 @@ fn confirm_started_openwrt() -> Result<String, String> {
                     match observe_controller_start(&paths, &authority.instances, epoch_seconds())? {
                         ControllerStartReadiness::Ready => {
                             drop(lock);
-                            return Ok("service-started-v1 ready\n".to_string());
+                            return Ok(());
                         }
                         ControllerStartReadiness::Waiting(reason) => {
                             drop(lock);
@@ -605,11 +612,12 @@ fn prepare_start() -> Result<String, String> {
         return Err("service lifecycle requires root".to_string());
     }
     // OpenWrt's default_postinst invokes service start before the package's
-    // own guarded restart hook. A typed empty plan prevents both topology
-    // mutation and procd registration; the later PKG_UPGRADE=0 restart owns
-    // the complete replacement lifecycle.
+    // own guarded restart hook. A distinct typed deferral prevents both
+    // topology mutation and procd registration without conflating package
+    // replacement with a genuine empty controller plan; the later
+    // PKG_UPGRADE=0 restart owns the complete replacement lifecycle.
     if package_upgrade_mode()? {
-        return Ok(encode_start_plan(&[], &[]));
+        return Ok(format!("{SERVICE_START_DEFERRED_V1}\n"));
     }
     // The start path mutates both UCI packages and the live SQM topology.
     // Acquire the same authority as stop before presets or projection can
@@ -2012,7 +2020,7 @@ mod tests {
     }
 
     #[test]
-    fn package_upgrade_is_a_typed_empty_plan_authority() {
+    fn package_upgrade_has_a_distinct_typed_deferral() {
         assert!(!package_upgrade_mode_value(None).unwrap());
         assert!(!package_upgrade_mode_value(Some(std::ffi::OsStr::new(""))).unwrap());
         assert!(!package_upgrade_mode_value(Some(std::ffi::OsStr::new("0"))).unwrap());
@@ -2020,10 +2028,10 @@ mod tests {
         for invalid in ["true", "01", "2", "-1"] {
             assert!(package_upgrade_mode_value(Some(std::ffi::OsStr::new(invalid))).is_err());
         }
-        #[cfg(feature = "calibration")]
-        assert_eq!(encode_start_plan(&[], &[]), "service-start-v2 - -\n");
-        #[cfg(not(feature = "calibration"))]
-        assert_eq!(encode_start_plan(&[], &[]), "service-start-v1 -\n");
+        assert_eq!(
+            format!("{SERVICE_START_DEFERRED_V1}\n"),
+            "service-start-deferred-v1\n"
+        );
     }
 
     #[cfg(feature = "calibration")]
@@ -2521,6 +2529,12 @@ esac
         write_status("RUNNING", 111.0, 121.0);
         fs::set_permissions(&status, fs::Permissions::from_mode(0o666)).unwrap();
         assert!(observe_controller_start(&paths, &expected, 121.0).is_err());
+
+        fs::remove_dir_all(&process).unwrap();
+        assert_eq!(
+            observe_controller_start(&paths, &[], 121.0).unwrap(),
+            ControllerStartReadiness::Ready
+        );
 
         fs::remove_dir_all(root).unwrap();
     }

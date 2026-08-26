@@ -53,6 +53,8 @@ case "$*" in
 			exit 70
 		fi
 		if [ "${PKG_UPGRADE:-0}" = 1 ]; then
+			printf '%s\n' 'service-start-deferred-v1'
+		elif [ "${CAKE_TEST_EMPTY_PLAN:-0}" = 1 ]; then
 			printf '%s\n' 'service-start-v2 - -'
 		else
 			printf '%s\n' native-prepare-start >> "$CAKE_TEST_LIFECYCLE_LOG"
@@ -64,6 +66,12 @@ case "$*" in
 		[ "${CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_FD:-}" = 8 ]
 		printf '%s\n' native-execute-stop >> "$CAKE_TEST_LIFECYCLE_LOG"
 		printf '%s\n' 'service-stop-v1 ok'
+		;;
+	'--service-lifecycle confirm-started')
+		flock -sn "$CAKE_AUTORATE_RUNTIME_LOCK_ROOT/runtime.guard" true || exit 73
+		printf '%s\n' native-confirm-started >> "$CAKE_TEST_LIFECYCLE_LOG"
+		[ "${CAKE_TEST_FAIL_CONFIRM:-0}" != 1 ] || exit 72
+		printf '%s\n' 'service-started-v1 ready'
 		;;
 	*) exit 64 ;;
 esac
@@ -106,18 +114,24 @@ EOF
 				;;
 		esac
 		start_service "$@"
+		service_started
 	}
 
 	case "$mode" in
-		start) start_service ;;
+		start) start ;;
 		upgrade-start)
 			PKG_UPGRADE=1
 			export PKG_UPGRADE
-			start_service
+			start
 			[ ! -s "$log" ] || {
 				echo "default_postinst upgrade start mutated runtime state" >&2
 				return 94
 			}
+			;;
+		empty-start)
+			CAKE_TEST_EMPTY_PLAN=1
+			export CAKE_TEST_EMPTY_PLAN
+			start
 			;;
 		stop) stop ;;
 		reload) reload_service ;;
@@ -168,7 +182,7 @@ borrowed_main() {
 	sh -c '
 		exec 8>&-
 		exec 7>>"$1/runtime.guard"
-		flock -sn 7
+		flock -sn 7 || exit 1
 		flock -u 7
 	' sh "$root"
 }
@@ -243,6 +257,13 @@ sh "$0" harness "$root" "$log" upgrade-start
 	exit 1
 }
 
+: > "$log"
+sh "$0" harness "$root" "$log" empty-start
+[ "$(cat "$log")" = native-confirm-started ] || {
+	echo "a genuine empty controller plan skipped post-lock absence attestation" >&2
+	exit 1
+}
+
 # A durable native-Apply transaction must stop the ordinary service before it
 # mutates SQM. Rust owns this marker policy; the rc.common bridge must not
 # contain a second filesystem check or an environment bypass.
@@ -276,7 +297,8 @@ procd-set:command
 procd-set:respawn
 procd-set:stdout
 procd-set:stderr
-procd-close"
+procd-close
+native-confirm-started"
 actual="$(cat "$log")"
 [ "$actual" = "$expected_start" ] || {
 	echo "native Apply recovery owner could not use the guarded init path" >&2
@@ -297,7 +319,8 @@ procd-set:command
 procd-set:respawn
 procd-set:stdout
 procd-set:stderr
-procd-close"
+procd-close
+native-confirm-started"
 actual="$(cat "$log")"
 [ "$actual" = "$expected" ] || {
 	echo "reload did not complete as one healthy stop/start transaction" >&2
@@ -308,9 +331,29 @@ actual="$(cat "$log")"
 : > "$log"
 sh "$0" borrowed "$root" "$log" restart
 actual="$(cat "$log")"
-[ "$actual" = "$expected" ] || {
+expected_borrowed="native-execute-stop
+procd-kill
+stop-start-boundary
+native-prepare-start
+procd-open:wan
+procd-set:command
+procd-set:respawn
+procd-set:stdout
+procd-set:stderr
+procd-close"
+[ "$actual" = "$expected_borrowed" ] || {
 	echo "borrowed restart did not preserve one continuous lifecycle transaction" >&2
-	printf 'expected:\n%s\nactual:\n%s\n' "$expected" "$actual" >&2
+	printf 'expected:\n%s\nactual:\n%s\n' "$expected_borrowed" "$actual" >&2
+	exit 1
+}
+
+: > "$log"
+if CAKE_TEST_FAIL_CONFIRM=1 sh "$0" harness "$root" "$log" start >/dev/null 2>&1; then
+	echo "start ignored a failed post-lock controller readiness proof" >&2
+	exit 1
+fi
+[ "$(tail -n 1 "$log")" = native-confirm-started ] || {
+	echo "failed controller readiness was not attempted after releasing the lock" >&2
 	exit 1
 }
 

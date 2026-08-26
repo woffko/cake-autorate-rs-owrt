@@ -7,7 +7,7 @@ endif
 
 PKG_NAME:=cake-autorate-rs
 PKG_VERSION:=1.0_rc27
-PKG_RELEASE:=306
+PKG_RELEASE:=311
 
 PKG_MAINTAINER:=woffko
 PKG_LICENSE:=GPL-2.0-or-later
@@ -77,7 +77,6 @@ define Package/cake-autorate-rs/postinst
 		/etc/init.d/cake-autorate-autotune stop >/dev/null 2>&1 || exit 1; \
 		/usr/sbin/cake-autorated --native-apply-recover >/dev/null 2>&1 || exit 1; \
 		PKG_UPGRADE=0 /etc/init.d/cake-autorate restart >/dev/null 2>&1 || exit 1; \
-		/usr/sbin/cake-autorated --service-lifecycle confirm-started >/dev/null 2>&1 || exit 1; \
 	fi; \
 	/etc/init.d/cake-autorate-autotune enable >/dev/null 2>&1 || exit 1; \
 	PKG_UPGRADE=0 /etc/init.d/cake-autorate-autotune start >/dev/null 2>&1 || exit 1; \

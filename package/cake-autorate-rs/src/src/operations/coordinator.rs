@@ -70,6 +70,7 @@ use super::{
     },
     scheduler_store::SchedulerStore,
     scheduler_store::PRODUCTION_SCHEDULER_STORE_ROOT as PRODUCTION_SCHEDULER_STORE_DIR,
+    service_lifecycle::confirm_controller_service_started,
     speedtest::{self, SpeedtestTerminal},
     speedtest_request::{
         build_bootstrap_speedtest_request, build_live_speedtest_request,
@@ -1505,6 +1506,21 @@ enum NativeScheduledAutoApplyOutcome {
 type NativeScheduledAutoApplyExecutor =
     fn(&Path, &str) -> Result<NativeScheduledAutoApplyOutcome, String>;
 
+fn confirm_native_apply_controllers_after_unlock() -> Result<(), String> {
+    confirm_native_apply_controllers_after_unlock_with(confirm_controller_service_started)
+}
+
+fn confirm_native_apply_controllers_after_unlock_with<F>(confirm: F) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    confirm().map_err(|error| {
+        format!(
+            "native Apply controller readiness failed after releasing the runtime lock: {error}"
+        )
+    })
+}
+
 fn verified_native_autotune_apply_context(
     state_dir: &Path,
     job_id: &str,
@@ -1677,6 +1693,7 @@ fn execute_native_scheduled_auto_apply(
         default_native_apply_paths(),
         &mut backend,
     )?;
+    confirm_native_apply_controllers_after_unlock()?;
     Ok(NativeScheduledAutoApplyOutcome::Applied(
         receipt.disposition,
     ))
@@ -1823,11 +1840,6 @@ fn native_apply_terminal_retry(
     live: NativeApplyLiveState,
 ) -> Result<NativeApplyTerminalRetry, String> {
     terminal.validate()?;
-    if !terminal.recovery_cleared {
-        return Err(
-            "native Apply terminal cannot be retried while recovery remains pending".to_string(),
-        );
-    }
     if terminal.outcome.success() && live == NativeApplyLiveState::Candidate {
         Ok(NativeApplyTerminalRetry::Reuse)
     } else {
@@ -2031,6 +2043,7 @@ fn execute_native_apply_dispatch(
             "native Apply transaction receipt changed its durable dispatch identity".to_string(),
         );
     }
+    confirm_native_apply_controllers_after_unlock()?;
     Ok((disposition, receipt.recovery_cleared))
 }
 
@@ -2104,7 +2117,20 @@ fn settle_native_apply_recovery_attempt(
     recovery: Result<NativeApplyRecoveryOutcome, String>,
 ) -> Result<(), String> {
     match recovery {
-        Ok(outcome) => settle_native_apply_store_recovery(store, &outcome),
+        Ok(outcome) => match confirm_recovered_native_apply_after_unlock(&outcome) {
+            Ok(()) => settle_native_apply_store_recovery(store, &outcome),
+            Err(readiness_error) => {
+                let diagnostic = apply_error.map_or_else(
+                    || readiness_error.clone(),
+                    |apply_error| {
+                        format!(
+                            "native Apply failed: {apply_error}; post-recovery readiness also failed: {readiness_error}"
+                        )
+                    },
+                );
+                settle_native_apply_store_readiness_failure(store, &outcome, &diagnostic)
+            }
+        },
         Err(recovery_error) => {
             let diagnostic = match apply_error {
                 Some(apply_error) => format!(
@@ -2354,6 +2380,7 @@ fn native_autotune_apply_lab_rollback(
         &mut backend,
         fault,
     )?;
+    confirm_native_apply_controllers_after_unlock()?;
     Ok(format!(
         concat!(
             "{{\"state\":\"forced_rollback_verified\",",
@@ -2390,6 +2417,7 @@ fn native_autotune_apply_lab_commit(
         &mut backend,
         fault,
     )?;
+    confirm_native_apply_controllers_after_unlock()?;
     let disposition = match receipt.disposition {
         NativeApplyCommitDisposition::Applied => "applied",
         NativeApplyCommitDisposition::AlreadyApplied => "already_applied",
@@ -2450,11 +2478,38 @@ impl NativeApplyRecoveryOutcome {
     }
 }
 
+fn confirm_recovered_native_apply_after_unlock(
+    outcome: &NativeApplyRecoveryOutcome,
+) -> Result<(), String> {
+    confirm_recovered_native_apply_after_unlock_with(
+        outcome,
+        confirm_native_apply_controllers_after_unlock,
+    )
+}
+
+fn confirm_recovered_native_apply_after_unlock_with<F>(
+    outcome: &NativeApplyRecoveryOutcome,
+    confirm: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    if matches!(outcome, NativeApplyRecoveryOutcome::Recovered { .. }) {
+        confirm()?;
+    }
+    Ok(())
+}
+
 pub(crate) fn native_autotune_apply_recovery() -> Result<String, String> {
     if euid() != 0 {
         return Err("native Apply recovery requires root".to_string());
     }
     let outcome = recover_native_apply_outcome()?;
+    if let Err(error) = confirm_recovered_native_apply_after_unlock(&outcome) {
+        let store = NativeApplyCoordinatorStore::new(default_native_apply_paths().recovery_root);
+        settle_native_apply_store_readiness_failure(&store, &outcome, &error)?;
+        return Err(error);
+    }
     settle_native_apply_coordinator_recovery(&outcome)?;
     Ok(outcome.response())
 }
@@ -2502,8 +2557,6 @@ fn settle_native_apply_store_recovery(
     outcome: &NativeApplyRecoveryOutcome,
 ) -> Result<(), String> {
     let NativeApplyRecoveryOutcome::Recovered {
-        job_id,
-        worker_run_id,
         recovery_cleared,
         rolled_forward,
         ..
@@ -2511,19 +2564,9 @@ fn settle_native_apply_store_recovery(
     else {
         return Ok(());
     };
-    let Some(active) = store.read_active()? else {
-        // Scheduled Auto-Apply and explicit recovery commands legitimately use
-        // the same transaction engine without an interactive coordinator job.
+    let Some(active) = native_apply_recovery_active_dispatch(store, outcome)? else {
         return Ok(());
     };
-    if active.state != NativeApplyDispatchState::Applying {
-        return Err("native Apply recovery exists before verified mutation authority".to_string());
-    }
-    if active.source_job_id != *job_id || active.worker_run_id != *worker_run_id {
-        return Err(
-            "native Apply recovery identity differs from its coordinator dispatch".to_string(),
-        );
-    }
     let (outcome, diagnostic) = if *rolled_forward {
         (NativeApplyTerminalOutcome::Applied, String::new())
     } else {
@@ -2537,6 +2580,58 @@ fn settle_native_apply_store_recovery(
         outcome,
         recovery_cleared: *recovery_cleared,
         diagnostic,
+    })
+}
+
+fn native_apply_recovery_active_dispatch(
+    store: &NativeApplyCoordinatorStore,
+    outcome: &NativeApplyRecoveryOutcome,
+) -> Result<Option<NativeApplyDispatchRecord>, String> {
+    let NativeApplyRecoveryOutcome::Recovered {
+        job_id,
+        worker_run_id,
+        ..
+    } = outcome
+    else {
+        return Ok(None);
+    };
+    let Some(active) = store.read_active()? else {
+        // Scheduled Auto-Apply and explicit recovery commands legitimately use
+        // the same transaction engine without an interactive coordinator job.
+        return Ok(None);
+    };
+    if active.state != NativeApplyDispatchState::Applying {
+        return Err("native Apply recovery exists before verified mutation authority".to_string());
+    }
+    if active.source_job_id != *job_id || active.worker_run_id != *worker_run_id {
+        return Err(
+            "native Apply recovery identity differs from its coordinator dispatch".to_string(),
+        );
+    }
+    Ok(Some(active))
+}
+
+fn settle_native_apply_store_readiness_failure(
+    store: &NativeApplyCoordinatorStore,
+    outcome: &NativeApplyRecoveryOutcome,
+    error: &str,
+) -> Result<(), String> {
+    let NativeApplyRecoveryOutcome::Recovered {
+        recovery_cleared, ..
+    } = outcome
+    else {
+        return Ok(());
+    };
+    let Some(active) = native_apply_recovery_active_dispatch(store, outcome)? else {
+        return Ok(());
+    };
+    store.complete(&NativeApplyTerminalRecord {
+        dispatch: active,
+        outcome: NativeApplyTerminalOutcome::Failed,
+        recovery_cleared: *recovery_cleared,
+        diagnostic: bounded_native_apply_diagnostic(&format!(
+            "native Apply recovered its durable configuration, but controller readiness failed: {error}"
+        )),
     })
 }
 
@@ -6475,17 +6570,12 @@ impl CalibrationDaemon {
                         ControlEffect::ReadOnly,
                     ),
                     Ok(NativeApplyAdmission::Terminal(record)) => {
-                        let retry = if !record.recovery_cleared {
-                            Err("native Apply recovery remains pending; the prior receipt was preserved"
-                                .to_string())
-                        } else {
-                            (self.native_apply_live_state_attestor)(
-                                &self.state_dir,
-                                source_job_id,
-                                Some(option_id),
-                            )
-                            .and_then(|live| native_apply_terminal_retry(&record, live))
-                        };
+                        let retry = (self.native_apply_live_state_attestor)(
+                            &self.state_dir,
+                            source_job_id,
+                            Some(option_id),
+                        )
+                        .and_then(|live| native_apply_terminal_retry(&record, live));
                         match retry {
                             Ok(NativeApplyTerminalRetry::Reuse) => (
                                 native_apply_accepted_response(&record.dispatch),
@@ -8406,6 +8496,38 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn controller_readiness_is_required_only_after_a_completed_recovery() {
+        let calls = std::cell::Cell::new(0u32);
+        confirm_recovered_native_apply_after_unlock_with(&NativeApplyRecoveryOutcome::None, || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 0);
+
+        let recovered = NativeApplyRecoveryOutcome::Recovered {
+            authority: "existing_v4",
+            job_id: "11".repeat(16),
+            worker_run_id: "22".repeat(16),
+            recovery_cleared: true,
+            rolled_forward: false,
+        };
+        confirm_recovered_native_apply_after_unlock_with(&recovered, || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+
+        let error = confirm_native_apply_controllers_after_unlock_with(|| {
+            Err("controller remains WAITING_OPERATION".to_string())
+        })
+        .unwrap_err();
+        assert!(error.contains("after releasing the runtime lock"));
+        assert!(error.contains("WAITING_OPERATION"));
+    }
+
     fn test_native_apply_live_candidate(
         _state_dir: &Path,
         _job_id: &str,
@@ -8428,6 +8550,14 @@ mod tests {
         _option_id: Option<&str>,
     ) -> Result<NativeApplyLiveState, String> {
         Err("live configuration is neither the candidate nor the original baseline".to_string())
+    }
+
+    fn test_native_apply_recovery_pending(
+        _state_dir: &Path,
+        _job_id: &str,
+        _option_id: Option<&str>,
+    ) -> Result<NativeApplyLiveState, String> {
+        Err("native Apply recovery remains pending".to_string())
     }
 
     fn terminalize_native_apply_for_test(
@@ -14318,8 +14448,8 @@ mod tests {
         let terminal = terminalize_native_apply_for_test(
             &mut daemon,
             &request,
-            NativeApplyTerminalOutcome::Applied,
-            true,
+            NativeApplyTerminalOutcome::Failed,
+            false,
         );
 
         let (response, effect) = daemon.handle_native_apply_control(&request);
@@ -14376,7 +14506,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let mut daemon = CalibrationDaemon::bind_with_admission(&state_dir, true).unwrap();
         daemon.native_apply_store = NativeApplyCoordinatorStore::new(&root.join("apply"));
-        daemon.native_apply_live_state_attestor = test_native_apply_live_original;
+        daemon.native_apply_live_state_attestor = test_native_apply_recovery_pending;
         let terminal = terminalize_native_apply_for_test(
             &mut daemon,
             &request,
@@ -14993,6 +15123,77 @@ mod tests {
 
         settle_native_apply_store_recovery(&store, &recovery).unwrap();
         assert_eq!(store.read_terminal().unwrap(), Some(terminal));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn post_recovery_readiness_failure_is_terminal_but_never_successful() {
+        let root = temp_path("native-apply-recovery-readiness-failure");
+        let store = NativeApplyCoordinatorStore::new(&root);
+        let source_job_id = "11".repeat(16);
+        let worker_run_id = "22".repeat(16);
+        let manifest_sha256 = "44".repeat(32);
+        let request = NativeApplyControlRequest::start(
+            "55".repeat(16),
+            source_job_id.clone(),
+            "recommended".to_string(),
+            "33".repeat(32),
+            manifest_sha256.clone(),
+            Vec::new(),
+        );
+        let candidate = NativeApplyDispatchRecord {
+            state: NativeApplyDispatchState::Accepted,
+            generation: 1,
+            apply_job_id: "66".repeat(16),
+            apply_job_token: "77".repeat(32),
+            source_job_id: source_job_id.clone(),
+            worker_run_id: "none".to_string(),
+            option_id: "recommended".to_string(),
+            review_sha256: "33".repeat(32),
+            source_manifest_sha256: "none".to_string(),
+            manifest_sha256: manifest_sha256.clone(),
+            manifest_schema_version: 0,
+            target_state: "none".to_string(),
+            acknowledgements: Vec::new(),
+        };
+        let accepted = match store.admit(&request, candidate).unwrap() {
+            NativeApplyAdmission::Created(record) => record,
+            other => panic!("unexpected admission: {other:?}"),
+        };
+        let validating = store.mark_validating(&accepted).unwrap();
+        let applying = store
+            .mark_applying(
+                &validating,
+                NativeApplyVerifiedDispatchIdentity {
+                    worker_run_id: worker_run_id.clone(),
+                    source_manifest_sha256: manifest_sha256,
+                    manifest_schema_version: 5,
+                    target_state: "existing_managed".to_string(),
+                },
+            )
+            .unwrap();
+        let recovery = NativeApplyRecoveryOutcome::Recovered {
+            authority: "existing_v4",
+            job_id: source_job_id,
+            worker_run_id,
+            recovery_cleared: true,
+            rolled_forward: false,
+        };
+
+        settle_native_apply_store_readiness_failure(
+            &store,
+            &recovery,
+            "controller primary is still WAITING_OPERATION",
+        )
+        .unwrap();
+
+        assert_eq!(store.read_active().unwrap(), None);
+        let terminal = store.read_terminal().unwrap().unwrap();
+        assert_eq!(terminal.dispatch, applying);
+        assert_eq!(terminal.outcome, NativeApplyTerminalOutcome::Failed);
+        assert!(terminal.recovery_cleared);
+        assert!(terminal.diagnostic.contains("controller readiness failed"));
+        assert!(terminal.diagnostic.contains("WAITING_OPERATION"));
         fs::remove_dir_all(root).unwrap();
     }
 

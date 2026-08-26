@@ -61,12 +61,14 @@ code set remains bound to that exact immutable proposal and Apply manifest.
 Hard route, ownership, measurement, loss, contamination, and runtime-safety
 failures remain non-overridable.
 
-For explicitly selected cellular, LEO/GEO satellite, or fixed-wireless access,
-Full raw capacity attempts one terminal download-unshaped/upload-shaped
-confirmation. A safe result becomes a separate manual Review option. If the
-traffic budget, sample coverage, measurement integrity, or safety gates cannot
-prove it, Review keeps an unavailable card with the exact reason instead of
-inventing a topology.
+Full raw capacity first collects comparable bidirectional, download-only and
+upload-only physical-capacity controls by bypassing only the direction being
+measured. For explicitly selected cellular, LEO/GEO satellite, or
+fixed-wireless access, it then additionally attempts one terminal
+download-unshaped/upload-shaped confirmation. A safe result becomes a separate
+manual Review option. If the traffic budget, sample coverage, measurement
+integrity, or safety gates cannot prove it, Review keeps an unavailable card
+with the exact reason instead of inventing a topology.
 
 After a verified Apply receipt, LuCI unloads and reloads both relevant UCI
 packages and navigates to a fresh Settings view automatically. There is no
@@ -188,6 +190,20 @@ CPU is an advisory warning, not a standalone blocker.
   Aggregate WAN counters are deliberately not treated as test throughput.
 - A proposal is data, not an applied configuration. The current first stage
   sets `configuration_written=false`; LuCI writes it only after Review.
+- Native Apply uses an exact write-ahead config-pair transaction. Before either
+  live package changes, the recovery record contains the original and selected
+  candidate `cake-autorate`/`sqm` bytes, file modes and digests plus immutable
+  request, job, worker, option and manifest identity. Recovery accepts only
+  original/candidate combinations; arbitrary foreign bytes are never
+  overwritten. Older candidate-less records are reconstruction-only and may
+  roll back, but may not manufacture commit authority.
+- Recovery removes stale `.native-apply-restore` temporaries only while holding
+  the same config-pair lock. A symlink or other unsafe residue fails closed.
+  Apply/recovery success is delayed until that lock is released and the exact
+  controller topology reports ready. Package replacement has a distinct typed
+  deferral receipt, while a genuine empty plan still proves that no stale
+  controller exists. This is state-driven readiness, not a fixed sleep/retry
+  timer; a failed proof produces a failed terminal rather than false success.
 - Shaped validation temporarily creates a CAKE upload qdisc and download IFB at
   the proposed base rates. It refuses an interface owned by another enabled
   autorate instance or an unknown unmanaged qdisc. An existing sqm-scripts
@@ -789,7 +805,7 @@ JavaScript/TypeScript tests validate public schemas, option-specific
 acknowledgements, current-job adoption and fresh Settings reload. Real-router
 acceptance additionally checks per-member route identity and that the
 unselected autorate/SQM instance continues running. See [Testing](TESTING.md)
-for the accepted r306/r120 matrix and historical chronology.
+for the accepted r311/r120 matrix and historical chronology.
 
 ## Optional scheduler
 

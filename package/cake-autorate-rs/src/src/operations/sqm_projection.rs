@@ -580,26 +580,36 @@ fn validate_path_value(section: &str, option: &str, value: Option<&str>) -> Resu
 }
 
 fn canonical_batch(plan: &SqmProjectionPlan) -> Result<Option<String>, String> {
+    canonical_batch_for_package(plan, SQM_PACKAGE)
+}
+
+pub(crate) fn canonical_batch_for_package(
+    plan: &SqmProjectionPlan,
+    package: &str,
+) -> Result<Option<String>, String> {
+    if !safe_name(package) {
+        return Err("SQM projection package alias is unsafe".to_string());
+    }
     if plan.actions.is_empty() {
         return Ok(None);
     }
     let mut output = String::new();
     for action in &plan.actions {
         let line = match action {
-            SqmAction::AddSection { section } => format!("set {SQM_PACKAGE}.{section}=queue\n"),
-            SqmAction::DeleteSection { section } => format!("delete {SQM_PACKAGE}.{section}\n"),
+            SqmAction::AddSection { section } => format!("set {package}.{section}=queue\n"),
+            SqmAction::DeleteSection { section } => format!("delete {package}.{section}\n"),
             SqmAction::Set {
                 section,
                 option,
                 value,
-            } => format!("set {SQM_PACKAGE}.{section}.{option}='{value}'\n"),
+            } => format!("set {package}.{section}.{option}='{value}'\n"),
             SqmAction::Delete { section, option } => {
-                format!("delete {SQM_PACKAGE}.{section}.{option}\n")
+                format!("delete {package}.{section}.{option}\n")
             }
         };
         push_batch(&mut output, &line)?;
     }
-    push_batch(&mut output, &format!("commit {SQM_PACKAGE}\n"))?;
+    push_batch(&mut output, &format!("commit {package}\n"))?;
     Ok(Some(output))
 }
 

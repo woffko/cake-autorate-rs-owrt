@@ -75,6 +75,22 @@ start_service_locked
 	echo 'empty native start plan registered an instance' >&2
 	exit 1
 }
+[ "$SERVICE_START_CONFIRM_DEFERRED" -eq 0 ] || {
+	echo 'genuine empty native start plan was confused with package deferral' >&2
+	exit 1
+}
+
+CAKE_TEST_RESULT='service-start-deferred-v1'
+export CAKE_TEST_RESULT
+start_service_locked
+[ "$SERVICE_START_CONFIRM_DEFERRED" -eq 1 ] || {
+	echo 'typed package start deferral was not preserved' >&2
+	exit 1
+}
+[ ! -s "$events" ] || {
+	echo 'typed package start deferral registered an instance' >&2
+	exit 1
+}
 
 for malformed in \
 	'service-start-v2 wan' \
@@ -86,6 +102,7 @@ for malformed in \
 	'service-start-v2 wan bad-name' \
 	'service-start-v2 wan mqtt,mqtt' \
 	'service-start-v2 - - extra' \
+	'service-start-deferred-v1 extra' \
 	'service-start-v1 wan -' \
 	'service-start-v2'; do
 	: >"$events"

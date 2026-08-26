@@ -391,12 +391,17 @@ pub(crate) struct NativeUciMutation {
     pub(crate) action: NativeUciMutationAction,
     pub(crate) package: &'static str,
     pub(crate) section: String,
-    pub(crate) option: &'static str,
+    pub(crate) option: String,
     pub(crate) value: Option<String>,
 }
 
 impl NativeUciMutation {
-    fn set(section: &str, option: &'static str, value: impl Into<String>) -> Result<Self, String> {
+    pub(crate) fn set(
+        section: &str,
+        option: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<Self, String> {
+        let option = option.into();
         let value = value.into();
         let mutation = Self {
             action: NativeUciMutationAction::Set,
@@ -409,7 +414,8 @@ impl NativeUciMutation {
         Ok(mutation)
     }
 
-    fn delete(section: &str, option: &'static str) -> Result<Self, String> {
+    pub(crate) fn delete(section: &str, option: impl Into<String>) -> Result<Self, String> {
+        let option = option.into();
         let mutation = Self {
             action: NativeUciMutationAction::Delete,
             package: "cake-autorate",
@@ -432,11 +438,11 @@ impl NativeUciMutation {
         validate_uci_component("native Apply UCI section", &self.section, 64)?;
         match (&self.action, self.value.as_deref()) {
             (NativeUciMutationAction::Set, Some(value)) => {
-                validate_uci_component("native Apply UCI option", self.option, 64)?;
-                validate_uci_value(self.option, value)?;
+                validate_uci_component("native Apply UCI option", &self.option, 64)?;
+                validate_uci_value(&self.option, value)?;
             }
             (NativeUciMutationAction::Delete, None) => {
-                validate_uci_component("native Apply UCI option", self.option, 64)?;
+                validate_uci_component("native Apply UCI option", &self.option, 64)?;
             }
             _ => return Err("native Apply UCI action/value pair is inconsistent".to_string()),
         }
@@ -449,7 +455,7 @@ impl NativeUciMutation {
             json_string(self.action.as_str()),
             json_string(self.package),
             json_string(&self.section),
-            json_string(self.option),
+            json_string(&self.option),
             optional_string(self.value.as_deref()),
         )
     }
@@ -2084,7 +2090,11 @@ pub(crate) fn validate_native_uci_mutations(mutations: &[NativeUciMutation]) -> 
     let mut options = BTreeSet::new();
     for mutation in mutations {
         mutation.validate()?;
-        let key = (mutation.package, mutation.section.as_str(), mutation.option);
+        let key = (
+            mutation.package,
+            mutation.section.as_str(),
+            mutation.option.as_str(),
+        );
         if !options.insert(key) {
             return Err(format!(
                 "native Apply UCI plan mutates {}.{}.{} more than once",

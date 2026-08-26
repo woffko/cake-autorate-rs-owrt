@@ -11,7 +11,11 @@ use super::process::{
 use super::runtime_health::{json_string_value, safe_interface, safe_name, UciPackage};
 use std::env;
 use std::ffi::OsString;
+use std::fs;
+use std::io::ErrorKind;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 const PACKAGE: &str = "cake-autorate";
@@ -24,6 +28,107 @@ const MAX_UBUS_OUTPUT: usize = 64 * 1024;
 const MAX_ACTIONS: usize = 4096;
 const MAX_VALUE_BYTES: usize = 4096;
 const MAX_BATCH_BYTES: usize = 256 * 1024;
+const PRIVATE_UCI_ROOT: &str = "/tmp/cake-autorate-service-uci";
+static NEXT_PRIVATE_UCI: AtomicU32 = AtomicU32::new(0);
+
+struct PrivateUciSavedir {
+    path: PathBuf,
+}
+
+impl PrivateUciSavedir {
+    fn create() -> Result<Self, String> {
+        let base = Path::new(PRIVATE_UCI_ROOT);
+        match fs::create_dir(base) {
+            Ok(()) => fs::set_permissions(base, fs::Permissions::from_mode(0o700))
+                .map_err(|error| format!("unable to secure service UCI root: {error}"))?,
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(format!("unable to create service UCI root: {error}")),
+        }
+        require_private_uci_directory(base)?;
+        for _ in 0..16 {
+            let sequence = NEXT_PRIVATE_UCI.fetch_add(1, Ordering::Relaxed);
+            let path = base.join(format!("{}.{}", std::process::id(), sequence));
+            match fs::create_dir(&path) {
+                Ok(()) => {
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).map_err(
+                        |error| format!("unable to secure service UCI savedir: {error}"),
+                    )?;
+                    require_private_uci_directory(&path)?;
+                    return Ok(Self { path });
+                }
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(format!("unable to create service UCI savedir: {error}")),
+            }
+        }
+        Err("unable to allocate a private service UCI savedir".to_string())
+    }
+
+    fn arguments(&self, arguments: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+        let mut result = vec![
+            OsString::from("-t"),
+            self.path.as_os_str().to_os_string(),
+            OsString::from("-q"),
+        ];
+        result.extend(arguments);
+        result
+    }
+
+    fn require_clean(&self) -> Result<(), String> {
+        require_private_uci_directory(&self.path)?;
+        for entry in fs::read_dir(&self.path)
+            .map_err(|error| format!("unable to inspect service UCI savedir: {error}"))?
+        {
+            let entry =
+                entry.map_err(|error| format!("unable to inspect service UCI residue: {error}"))?;
+            let metadata = fs::symlink_metadata(entry.path())
+                .map_err(|error| format!("unable to inspect service UCI residue: {error}"))?;
+            if !metadata.file_type().is_file()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.mode() & 0o077 != 0
+                || metadata.len() != 0
+            {
+                return Err("service UCI savedir contains unsafe residue".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PrivateUciSavedir {
+    fn drop(&mut self) {
+        if require_private_uci_directory(&self.path).is_err() {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(&self.path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
+                return;
+            };
+            if !metadata.file_type().is_file()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.mode() & 0o077 != 0
+            {
+                return;
+            }
+            let _ = fs::remove_file(entry.path());
+        }
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
+fn require_private_uci_directory(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("unable to inspect service UCI directory: {error}"))?;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o777 != 0o700
+    {
+        return Err("service UCI directory is not private and owner-controlled".to_string());
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PresetAction {
@@ -60,7 +165,17 @@ impl OpenWrtEnvironment {
     }
 
     pub(crate) fn read_package(&self, package: &str) -> Result<UciPackage, String> {
-        let output = run_command(&self.uci, &["-q", "-X", "show", package], MAX_UCI_OUTPUT)?;
+        let savedir = PrivateUciSavedir::create()?;
+        let output = run_command_owned(
+            &self.uci,
+            savedir.arguments([
+                OsString::from("-X"),
+                OsString::from("show"),
+                OsString::from(package),
+            ]),
+            MAX_UCI_OUTPUT,
+        )?;
+        savedir.require_clean()?;
         let text =
             String::from_utf8(output).map_err(|_| format!("{package} UCI output is not UTF-8"))?;
         UciPackage::parse(package, &text)
@@ -74,9 +189,10 @@ impl OpenWrtEnvironment {
     }
 
     pub(crate) fn run_uci_batch(&self, batch: &str) -> Result<(), String> {
+        let savedir = PrivateUciSavedir::create()?;
         let spec = SpawnSpec {
             program: self.uci.clone(),
-            arguments: vec![OsString::from("-q"), OsString::from("batch")],
+            arguments: savedir.arguments([OsString::from("batch")]),
             environment: Vec::new(),
         };
         let output = run_bounded_command_output_with_input(
@@ -94,7 +210,10 @@ impl OpenWrtEnvironment {
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
-        Ok(())
+        if !output.stdout.is_empty() {
+            return Err("service UCI batch returned unexpected output".to_string());
+        }
+        savedir.require_clean()
     }
 }
 
@@ -374,9 +493,21 @@ fn push_batch_line(batch: &mut String, line: &str) -> Result<(), String> {
 }
 
 fn run_command(program: &Path, arguments: &[&str], limit: usize) -> Result<Vec<u8>, String> {
+    run_command_owned(
+        program,
+        arguments.iter().map(OsString::from).collect::<Vec<_>>(),
+        limit,
+    )
+}
+
+fn run_command_owned(
+    program: &Path,
+    arguments: Vec<OsString>,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
     let spec = SpawnSpec {
         program: program.to_path_buf(),
-        arguments: arguments.iter().map(OsString::from).collect(),
+        arguments,
         environment: Vec::new(),
     };
     let output = run_bounded_command_output(&spec, COMMAND_TIMEOUT, limit, || false)?;
@@ -540,5 +671,25 @@ mod tests {
             assert!(Path::new(path).is_absolute());
         }
         assert!(fs::metadata("/").is_ok());
+    }
+
+    #[test]
+    fn private_uci_savedirs_are_unique_and_reject_nonempty_residue() {
+        let first = PrivateUciSavedir::create().unwrap();
+        let second = PrivateUciSavedir::create().unwrap();
+        assert_ne!(first.path, second.path);
+        for savedir in [&first, &second] {
+            let metadata = fs::symlink_metadata(&savedir.path).unwrap();
+            assert!(metadata.file_type().is_dir());
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+            savedir.require_clean().unwrap();
+        }
+        let residue = first.path.join("cake-autorate");
+        fs::write(&residue, b"pending").unwrap();
+        fs::set_permissions(&residue, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(first
+            .require_clean()
+            .unwrap_err()
+            .contains("unsafe residue"));
     }
 }

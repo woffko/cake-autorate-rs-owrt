@@ -71,6 +71,11 @@ grep -q -- '"$DAEMON" --service-lifecycle prepare-start' "$work/full" ||
 	fail 'Full init lost the native ordinary service lifecycle bridge'
 grep -q -- '"$DAEMON" --service-lifecycle execute-stop' "$work/full" ||
 	fail 'Full init lost the native service-stop transaction'
+grep -q -- '"$DAEMON" --service-lifecycle confirm-started' "$work/full" ||
+	fail 'Full init lost post-lock controller readiness confirmation'
+if grep -q -- '--service-lifecycle confirm-started' "$work/lite"; then
+	fail 'Lite init gained the Full-only native Apply readiness surface'
+fi
 if grep -Eq 'recover_interface|procd_add_interface_trigger|sleep 1|cleanup_runtime_files|stop_managed_sqm_backend' "$work/full"; then
 	fail 'Full init still contains retired stop, cleanup, timer, or member-recovery authority'
 fi

@@ -185,6 +185,20 @@ assert.match(autotuneInit, /service_stopped\(\)/,
 	'the stop attestation must run from the post-procd lifecycle hook');
 assert.doesNotMatch(autotuneInit, /sleep|usleep/,
 	'the calibration stop boundary must remain process-event driven');
+assert.match(daemonInitTemplate, /--service-lifecycle confirm-started/,
+	'the controller readiness hook must use the typed Rust lifecycle endpoint');
+assert.match(daemonInitTemplate, /SERVICE_START_CONFIRM_PENDING/,
+	'reload must defer controller readiness until its runtime lock is released');
+assert.match(daemonInitTemplate, /service-start-deferred-v1/,
+	'package replacement must use a distinct typed deferral instead of a genuine empty plan');
+assert.doesNotMatch(daemonInitTemplate,
+	/\[ "\$controller_instances" != - \] \|\| SERVICE_START_CONFIRM_DEFERRED=1/,
+	'a genuine empty controller plan must still attest that no stale controller survives');
+assert.doesNotMatch(daemonInitTemplate, /sleep|usleep/,
+	'the controller readiness boundary must remain event driven');
+assert.match(daemonCoordinator,
+	/confirm_native_apply_controllers_after_unlock\(\)/,
+	'native Apply must prove controller readiness only after its transaction returns');
 for (const retiredDecision of [ '--native-apply-recover', '--legacy-apply-recover',
 	'--legacy-autotune-recover', '--scheduler-adopt-legacy', '--calibration-capabilities',
 	'config_load', 'config_get', 'autotune_scheduler_engine' ])
@@ -216,8 +230,6 @@ assert.doesNotMatch(daemonMakefile,
 const daemonUpgradeNativeApply = daemonMakefile.indexOf('--native-apply-recover');
 const daemonUpgradeRestart = daemonMakefile.indexOf(
 	'PKG_UPGRADE=0 /etc/init.d/cake-autorate restart');
-const daemonUpgradeControllerReady = daemonMakefile.indexOf(
-	'--service-lifecycle confirm-started');
 const daemonUpgradeCalibrationStop = daemonMakefile.indexOf(
 	'/etc/init.d/cake-autorate-autotune stop >/dev/null 2>&1 || exit 1');
 const daemonCalibrationStart = daemonMakefile.indexOf(
@@ -225,10 +237,10 @@ const daemonCalibrationStart = daemonMakefile.indexOf(
 assert(daemonUpgradeCalibrationStop >= 0 &&
 	daemonUpgradeCalibrationStop < daemonUpgradeNativeApply &&
 	daemonUpgradeNativeApply < daemonUpgradeRestart &&
-	daemonUpgradeRestart < daemonUpgradeControllerReady,
+	daemonUpgradeRestart < daemonCalibrationStart,
 	'an in-place Full daemon upgrade must stop calibration before native recovery and the main restart');
-assert(daemonUpgradeControllerReady < daemonCalibrationStart,
-	'the native calibration coordinator must start only after event-driven controller readiness');
+assert.match(daemonInitTemplate, /service_started\(\)/,
+	'the main restart must own its event-driven controller readiness gate');
 assert.match(daemonMakefile,
 	/\$\(INSTALL_BIN\) \.\/files\/etc\/init\.d\/cake-autorate-autotune \$\(1\)\/etc\/init\.d\/cake-autorate-autotune/,
 	'the Full daemon package must ship its exact-version calibration init bridge');

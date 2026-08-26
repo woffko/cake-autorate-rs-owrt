@@ -7,8 +7,8 @@ universal benchmark.
 
 ## Current release acceptance
 
-The accepted public baseline is daemon r306, Full LuCI r120 and Lite LuCI r4
-at tag `v1.0-rc27-r306-r120`. The final source gate passed 1,249 Full and 110
+The accepted public baseline is daemon r311, Full LuCI r120 and Lite LuCI r4
+at tag `v1.0-rc27-r311-r120`. The final source gate passed 1,263 Full and 111
 Lite Rust tests, every retained OpenWrt bridge test, all Full/Lite LuCI
 JavaScript and TypeScript suites, formatting, syntax and diff checks. The
 release matrix contains 12 independently built Full daemons, 12 Lite daemons
@@ -84,7 +84,7 @@ For releases that publish an offline bundle, install it with networking
 disabled into an empty APK root and validate the redownloaded assets against
 the published checksums. Direct-APK releases instead verify the exact
 published APK hashes and install them through a router configured with
-compatible OpenWrt package feeds. The current r306/r120 release verifies
+compatible OpenWrt package feeds. The current r311/r120 release verifies
 the exact redownloaded APKs and manifests through compatible OpenWrt feeds.
 
 Current deterministic UI and calibration gates require a clean package config
@@ -2524,6 +2524,49 @@ SHA-256
 `f2a897ae52755894bad56f5cac19aec9ea65b3a8461d8fcc4f99b083cbe81bb2`;
 the machine-readable matrix report has SHA-256
 `117e6a3f8ec849e726976d1553f0412855635d5a35cdc8d75f7cee25e98ca42e`.
+
+## RC27 r311/r120 exact Apply and readiness gate (2026-08-26)
+
+The r311 maintenance source gate passed 1,263 Full and 111 Lite Rust tests,
+all retained OpenWrt lifecycle bridges, Full/Lite LuCI JavaScript and
+TypeScript suites, formatting, syntax and diff checks. Longrun
+`4fe4f14af7a94223ac8e253024f39845` is the accepted source gate. Full/Lite
+Clippy completed with existing style/complexity warnings only and no
+correctness error.
+
+Deterministic tests now cover every write-ahead boundary before live config
+mutation, exact original/candidate bytes and modes, all four mixed config-pair
+recovery states, foreign-byte refusal, unsafe restore-temp symlinks, stale-temp
+cleanup, legacy candidate-less rollback, immutable request/job/worker/option
+binding, and readiness after the transaction lock is released. Package upgrade
+deferral and a genuine empty controller plan have distinct typed receipts; an
+empty plan must still prove that no stale controller process survives.
+
+The disposable x86_64 VM passed r310 -> r311 package replacement and exact v5
+rollback with both stale restore temporaries. Recovery returned only after the
+controller reached RUNNING, then the exact original 20000/21202 both-shaped
+baseline was restored. A failed intermediate lab sequence copied config before
+stopping the old runtime; strict mismatch refusal was correct, and the valid
+stop-copy-start restoration passed without weakening production checks.
+
+All three physical test routers then passed no-traffic upgrades with off-device
+rollback archives and exact captured config hashes. The first x86_64 router
+retained both independently routed CAKE pairs; the second retained an offline
+primary plus HEALTHY backup; the aarch64 cellular router retained exact
+upload-only 0/27100 SQM with no ingress CAKE. Cache-disabled desktop/mobile
+Status, Graphs, Settings, Re-run Cancel and Edit passed on every router at Full
+LuCI r120. No test left UCI changes, recovery state, or a foreign topology.
+
+Longrun `afad4ac88317494abf9b3e5de10fd8b6` clean-built the final 12-ABI
+matrix serially. It contains 12 Full r311 daemons, 12 independently compiled
+Lite r311 daemons, Full LuCI r120 and Lite LuCI r4. All 26 APKs passed exact
+source parity, signature/metadata/dependency/provider checks, extracted payload
+and mode checks, Full/Lite feature separation, and target-correct ELF class,
+endianness and ABI validation. Independent `sha256sum -c` passed;
+`SHA256SUMS` SHA-256 is
+`c727aa875ad1713b02966ac768348e564613da6b6a189de2fb660c2256361562`
+and `matrix-report.json` SHA-256 is
+`bd1d9914ba7a6f3888cfaa1d10304ff38a31ceca0bca4d75487b9c77795b87fa`.
 
 ## RC27 r306/r120 Rust migration and final release gate (2026-08-21)
 

@@ -9,8 +9,11 @@ use super::autotune_apply::{
     NativeApplyAction, NativeApplyExecutionPlan, NativeUciMutation, NativeUciMutationAction,
 };
 use super::autotune_apply_runtime::{
-    read_config_snapshot, NativeApplyGlobalLock, NativeApplyRecoveryRecord,
-    NativeApplyTransactionBackend, NativeApplyTransactionPaths,
+    canonical_native_uci_batch, create_private_directory, ensure_private_directory,
+    legacy_native_apply_materialization, read_config_snapshot, require_private_directory,
+    write_new_private_file, NativeApplyCandidateMaterialization, NativeApplyConfigPairSnapshot,
+    NativeApplyGlobalLock, NativeApplyRecoveryRecord, NativeApplyTransactionBackend,
+    NativeApplyTransactionPaths,
 };
 use super::autotune_bootstrap_apply::{NativeBootstrapApplyMode, NativeBootstrapApplyPlan};
 use super::autotune_bootstrap_apply_recovery::{
@@ -26,23 +29,29 @@ use super::kernel_topology::{
 };
 use super::kernel_topology_netlink::{LinuxNetlinkIo, NetlinkTopologyReader};
 use super::native_apply_lifecycle::{
-    run_selected_instance_lifecycle, SelectedLifecycleAction as NativeApplyInstanceAction,
+    run_selected_instance_containment, run_selected_instance_lifecycle,
+    SelectedLifecycleAction as NativeApplyInstanceAction,
 };
 use super::process::{run_bounded_command_output_with_input, SpawnSpec};
 use super::protocol::{OperationRequest, OperationRouteMode, OperationTargetState};
 use super::runtime::{attest_openwrt_route_identity, attest_openwrt_runtime, RuntimeAttestation};
+use super::runtime_health::{safe_name, UciPackage};
+use super::service_config::OpenWrtEnvironment;
 use super::sqm_identity::{attest_bootstrap_uci_absence, BootstrapAbsenceIdentity};
+use super::sqm_projection::{canonical_batch_for_package, plan_projection, ProjectionScope};
 use crate::{root_cake_qdisc, root_cake_qdisc_count, tc_output, Config};
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder};
 use std::io::{ErrorKind, Read};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const UCI_PROGRAM: &str = "/sbin/uci";
 const PRIVATE_UCI_SAVEDIR: &str = "/tmp/cake-autorate-native-apply-uci";
+const MATERIALIZATION_WORKSPACE_ROOT: &str = "/tmp/cake-autorate-native-apply-materialize";
 const CAKE_CONFIG_PATH: &str = "/etc/config/cake-autorate";
 const SQM_CONFIG_PATH: &str = "/etc/config/sqm";
 const APPLY_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
@@ -50,6 +59,352 @@ const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 const VERIFY_INTERVAL: Duration = Duration::from_millis(200);
 const COMMAND_OUTPUT_LIMIT: usize = 16 * 1024;
 const PROC_CMDLINE_LIMIT: u64 = 4 * 1024;
+
+struct NativeApplyMaterializationWorkspace {
+    root: PathBuf,
+    config_dir: PathBuf,
+    override_dir: PathBuf,
+    savedir: PathBuf,
+    cake_alias: String,
+    sqm_alias: String,
+}
+
+impl NativeApplyMaterializationWorkspace {
+    fn create() -> Result<Self, String> {
+        let base = Path::new(MATERIALIZATION_WORKSPACE_ROOT);
+        ensure_private_directory(base)?;
+        for slot in 0..16_u8 {
+            let root = base.join(format!("{}.{}", std::process::id(), slot));
+            match fs::create_dir(&root) {
+                Ok(()) => {
+                    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(
+                        |error| {
+                            format!(
+                                "unable to secure native Apply materialization workspace: {error}"
+                            )
+                        },
+                    )?;
+                    require_private_directory(&root)?;
+                    let config_dir = root.join("config");
+                    let override_dir = root.join("override");
+                    let savedir = root.join("savedir");
+                    for directory in [&config_dir, &override_dir, &savedir] {
+                        create_private_directory(directory)?;
+                    }
+                    return Ok(Self {
+                        root,
+                        config_dir,
+                        override_dir,
+                        savedir,
+                        cake_alias: format!("cake_apply_{}_{}", std::process::id(), slot),
+                        sqm_alias: format!("sqm_apply_{}_{}", std::process::id(), slot),
+                    });
+                }
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "unable to create native Apply materialization workspace: {error}"
+                    ))
+                }
+            }
+        }
+        Err("unable to allocate a native Apply materialization workspace".to_string())
+    }
+
+    fn cake_path(&self) -> PathBuf {
+        self.config_dir.join(&self.cake_alias)
+    }
+
+    fn sqm_path(&self) -> PathBuf {
+        self.config_dir.join(&self.sqm_alias)
+    }
+
+    fn arguments(&self, arguments: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+        let mut result = vec![
+            OsString::from("-c"),
+            self.config_dir.as_os_str().to_os_string(),
+            OsString::from("-C"),
+            self.override_dir.as_os_str().to_os_string(),
+            OsString::from("-t"),
+            self.savedir.as_os_str().to_os_string(),
+            OsString::from("-q"),
+        ];
+        result.extend(arguments);
+        result
+    }
+
+    fn run(
+        &self,
+        arguments: impl IntoIterator<Item = OsString>,
+        input: Option<&[u8]>,
+    ) -> Result<super::process::BoundedCommandOutput, String> {
+        let spec = SpawnSpec {
+            program: PathBuf::from(UCI_PROGRAM),
+            arguments: self.arguments(arguments),
+            environment: Vec::new(),
+        };
+        run_bounded_command_output_with_input(
+            &spec,
+            input,
+            APPLY_COMMAND_TIMEOUT,
+            COMMAND_OUTPUT_LIMIT,
+            || false,
+            |_| {},
+        )
+        .map_err(|error| format!("native Apply materialization UCI command failed: {error}"))
+    }
+
+    fn read_package(&self, alias: &str) -> Result<UciPackage, String> {
+        let output = self.run(
+            [
+                OsString::from("-X"),
+                OsString::from("show"),
+                OsString::from(alias),
+            ],
+            None,
+        )?;
+        if !output.status.success() {
+            return Err(format!(
+                "native Apply materialization could not read {alias}: {}",
+                bounded_stderr(&output.stderr)
+            ));
+        }
+        let text = String::from_utf8(output.stdout)
+            .map_err(|_| "native Apply materialization UCI output is not UTF-8".to_string())?;
+        UciPackage::parse(alias, &text)
+    }
+
+    fn apply_batch(&self, batch: &[u8]) -> Result<(), String> {
+        let output = self.run([OsString::from("batch")], Some(batch))?;
+        if !output.status.success() {
+            return Err(format!(
+                "native Apply materialization batch failed: {}",
+                bounded_stderr(&output.stderr)
+            ));
+        }
+        if !output.stdout.is_empty() {
+            return Err(
+                "native Apply materialization batch returned unexpected output".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn require_clean(&self) -> Result<(), String> {
+        for alias in [&self.cake_alias, &self.sqm_alias] {
+            let output = self.run([OsString::from("changes"), OsString::from(alias)], None)?;
+            if !output.status.success() || !output.stdout.is_empty() {
+                return Err(
+                    "native Apply materialization workspace retained pending UCI changes"
+                        .to_string(),
+                );
+            }
+        }
+        for entry in fs::read_dir(&self.savedir).map_err(|error| {
+            format!("unable to inspect native Apply materialization savedir: {error}")
+        })? {
+            let entry = entry.map_err(|error| {
+                format!("unable to inspect native Apply materialization residue: {error}")
+            })?;
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
+                format!("unable to inspect native Apply materialization residue: {error}")
+            })?;
+            if !metadata.file_type().is_file()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.mode() & 0o077 != 0
+                || metadata.len() != 0
+            {
+                return Err(
+                    "native Apply materialization savedir contains unsafe residue".to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for NativeApplyMaterializationWorkspace {
+    fn drop(&mut self) {
+        if fs::symlink_metadata(&self.root).is_ok_and(|metadata| {
+            metadata.file_type().is_dir()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o077 == 0
+        }) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+}
+
+fn aliased_native_apply_batch(
+    mutations: &[NativeUciMutation],
+    cake_alias: &str,
+    sqm_alias: &str,
+) -> Result<Vec<u8>, String> {
+    if !safe_name(cake_alias) || !safe_name(sqm_alias) || cake_alias == sqm_alias {
+        return Err("native Apply materialization aliases are unsafe".to_string());
+    }
+    let mut output = String::new();
+    let mut packages = BTreeSet::new();
+    for mutation in mutations {
+        mutation.validate()?;
+        let package = match mutation.package {
+            "cake-autorate" => cake_alias,
+            "sqm" => sqm_alias,
+            _ => {
+                return Err(
+                    "native Apply materialization mutation escaped its package boundary"
+                        .to_string(),
+                )
+            }
+        };
+        packages.insert(package);
+        match (&mutation.action, mutation.value.as_deref()) {
+            (NativeUciMutationAction::Set, Some(value)) => {
+                output.push_str("set ");
+                output.push_str(package);
+                output.push('.');
+                output.push_str(&mutation.section);
+                output.push('.');
+                output.push_str(&mutation.option);
+                output.push_str("='");
+                output.push_str(value);
+                output.push_str("'\n");
+            }
+            (NativeUciMutationAction::Delete, None) => {
+                output.push_str("delete ");
+                output.push_str(package);
+                output.push('.');
+                output.push_str(&mutation.section);
+                output.push('.');
+                output.push_str(&mutation.option);
+                output.push('\n');
+            }
+            _ => {
+                return Err(
+                    "native Apply materialization mutation is internally inconsistent".to_string(),
+                )
+            }
+        }
+        if output.len() > 128 * 1024 {
+            return Err("native Apply materialization batch exceeds its bound".to_string());
+        }
+    }
+    for package in packages {
+        output.push_str("commit ");
+        output.push_str(package);
+        output.push('\n');
+    }
+    Ok(output.into_bytes())
+}
+
+fn apply_native_mutations_semantically(
+    mutations: &[NativeUciMutation],
+    cake: &mut UciPackage,
+    sqm: &mut UciPackage,
+) -> Result<(), String> {
+    for mutation in mutations {
+        mutation.validate()?;
+        let package = match mutation.package {
+            "cake-autorate" => &mut *cake,
+            "sqm" => &mut *sqm,
+            _ => {
+                return Err(
+                    "native Apply semantic materialization escaped its package boundary"
+                        .to_string(),
+                )
+            }
+        };
+        let section = package.sections.get_mut(&mutation.section).ok_or_else(|| {
+            format!(
+                "native Apply materialization target section {} is missing",
+                mutation.section
+            )
+        })?;
+        match (&mutation.action, mutation.value.as_deref()) {
+            (NativeUciMutationAction::Set, Some(value)) => {
+                section
+                    .options
+                    .insert(mutation.option.clone(), value.to_string());
+            }
+            (NativeUciMutationAction::Delete, None) => {
+                section.options.remove(&mutation.option);
+            }
+            _ => {
+                return Err(
+                    "native Apply semantic materialization mutation is inconsistent".to_string(),
+                )
+            }
+        }
+    }
+    Ok(())
+}
+
+fn materialize_candidate_from_mutations(
+    instance: &str,
+    mutations: &[NativeUciMutation],
+    authority: Vec<u8>,
+    original: &NativeApplyConfigPairSnapshot,
+) -> Result<NativeApplyCandidateMaterialization, String> {
+    if !safe_name(instance) {
+        return Err("native Apply materialization instance is unsafe".to_string());
+    }
+    let workspace = NativeApplyMaterializationWorkspace::create()?;
+    write_new_private_file(&workspace.cake_path(), original.cake())?;
+    write_new_private_file(&workspace.sqm_path(), original.sqm())?;
+
+    let cake_before = workspace.read_package(&workspace.cake_alias)?;
+    let sqm_before = workspace.read_package(&workspace.sqm_alias)?;
+    let mut expected_cake = cake_before.clone();
+    let mut expected_sqm = sqm_before.clone();
+    apply_native_mutations_semantically(mutations, &mut expected_cake, &mut expected_sqm)?;
+
+    let batch = aliased_native_apply_batch(mutations, &workspace.cake_alias, &workspace.sqm_alias)?;
+    workspace.apply_batch(&batch)?;
+    let cake_mutated = workspace.read_package(&workspace.cake_alias)?;
+    let sqm_mutated = workspace.read_package(&workspace.sqm_alias)?;
+    if cake_mutated != expected_cake || sqm_mutated != expected_sqm {
+        return Err(
+            "native Apply private UCI mutation changed unrelated semantic state".to_string(),
+        );
+    }
+
+    let resolver = OpenWrtEnvironment::production();
+    let mut projected_sqm = sqm_mutated.clone();
+    let projection = plan_projection(
+        &cake_mutated,
+        &mut projected_sqm,
+        &resolver,
+        &ProjectionScope::Instance(instance.to_string()),
+    )?;
+    if let Some(batch) = canonical_batch_for_package(&projection, &workspace.sqm_alias)? {
+        workspace.apply_batch(batch.as_bytes())?;
+    }
+    let cake_after = workspace.read_package(&workspace.cake_alias)?;
+    let sqm_after = workspace.read_package(&workspace.sqm_alias)?;
+    if cake_after != cake_mutated || sqm_after != projected_sqm {
+        return Err(
+            "native Apply private SQM projection changed unrelated semantic state".to_string(),
+        );
+    }
+    let mut idempotent_sqm = sqm_after.clone();
+    let idempotent = plan_projection(
+        &cake_after,
+        &mut idempotent_sqm,
+        &resolver,
+        &ProjectionScope::Instance(instance.to_string()),
+    )?;
+    if canonical_batch_for_package(&idempotent, &workspace.sqm_alias)?.is_some()
+        || idempotent_sqm != sqm_after
+    {
+        return Err("native Apply private SQM projection is not idempotent".to_string());
+    }
+    workspace.require_clean()?;
+
+    let (cake_candidate, _) =
+        read_config_snapshot(&workspace.cake_path(), "materialized cake-autorate")?;
+    let (sqm_candidate, _) = read_config_snapshot(&workspace.sqm_path(), "materialized sqm")?;
+    NativeApplyCandidateMaterialization::new(cake_candidate, sqm_candidate, authority)
+}
 
 pub(crate) fn default_native_apply_paths() -> NativeApplyTransactionPaths<'static> {
     NativeApplyTransactionPaths {
@@ -958,19 +1313,33 @@ impl NativeApplyTransactionBackend for OpenWrtNativeApplyBackend {
         }
     }
 
-    fn apply_uci_batch(&mut self, batch: &[u8]) -> Result<(), String> {
-        self.require_private_uci_clean()?;
-        let output = self.run_private_uci(&["-q", "batch"], Some(batch))?;
-        if !output.status.success() {
-            return Err(format!(
-                "native Apply UCI batch failed: {}",
-                bounded_stderr(&output.stderr)
-            ));
-        }
-        if !output.stdout.is_empty() {
-            return Err("native Apply UCI batch returned unexpected output".to_string());
-        }
-        self.require_private_uci_clean()
+    fn materialize_candidate(
+        &mut self,
+        plan: &NativeApplyExecutionPlan,
+        original: &NativeApplyConfigPairSnapshot,
+    ) -> Result<NativeApplyCandidateMaterialization, String> {
+        let authority = canonical_native_uci_batch(plan)?;
+        materialize_candidate_from_mutations(
+            &plan.request.identity.instance,
+            &plan.uci_mutations,
+            authority,
+            original,
+        )
+    }
+
+    fn reconstruct_legacy_candidate(
+        &mut self,
+        request: &OperationRequest,
+        manifest: &[u8],
+        original: &NativeApplyConfigPairSnapshot,
+    ) -> Result<NativeApplyCandidateMaterialization, String> {
+        let (mutations, authority) = legacy_native_apply_materialization(manifest, request)?;
+        materialize_candidate_from_mutations(
+            &request.identity.instance,
+            &mutations,
+            authority,
+            original,
+        )
     }
 
     fn restart_service(
@@ -1003,16 +1372,26 @@ impl NativeApplyTransactionBackend for OpenWrtNativeApplyBackend {
         &mut self,
         request: &OperationRequest,
         lock: &NativeApplyGlobalLock,
+        authorities: &[NativeApplyConfigPairSnapshot],
     ) -> Result<(), String> {
         <Self as NativeApplyTransactionBackend>::discard_pending_uci_changes(self)?;
-        self.run_instance_service_action(NativeApplyInstanceAction::Stop, request, lock)?;
-        let cfg = Config::from_uci(&request.identity.instance)?;
-        verify_direction_rate("download", &cfg.dl_if, None)?;
-        verify_direction_rate("upload", &cfg.ul_if, None)?;
-        if cfg.dl_if.starts_with("ifb") {
-            let ingress = tc_output(&["filter", "show", "dev", &cfg.sqm_interface, "ingress"])?;
-            crate::attest_download_redirect(&ingress, false, &cfg.sqm_interface, &cfg.dl_if)
-                .map_err(|error| error.to_string())?;
+        if authorities.is_empty() {
+            return Err("native Apply containment has no immutable config authority".to_string());
+        }
+        for authority in authorities {
+            let workspace = NativeApplyMaterializationWorkspace::create()?;
+            write_new_private_file(&workspace.cake_path(), authority.cake())?;
+            write_new_private_file(&workspace.sqm_path(), authority.sqm())?;
+            let cake = workspace.read_package(&workspace.cake_alias)?;
+            let sqm = workspace.read_package(&workspace.sqm_alias)?;
+            run_selected_instance_containment(
+                request,
+                &request.identity.target_interface,
+                lock,
+                &cake,
+                &sqm,
+                authority.sqm(),
+            )?;
         }
         Ok(())
     }

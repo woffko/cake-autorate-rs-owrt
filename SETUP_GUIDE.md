@@ -98,10 +98,12 @@ latency probes and adaptive ceiling remain available.
    trade-offs** checkbox confirms the complete displayed code set; individual
    warnings cannot be hidden. For Full Auto-Tune select the card and press
    **Apply selected option**. The native Apply lifecycle returns a durable
-   receipt, verifies the resulting services/qdiscs, and reloads authoritative
-   UCI and Settings automatically—there is no second Reload or Save & Apply
-   step. If the response is interrupted, reopen the same instance and let the
-   receipt reconcile instead of starting another Apply. Only the manual
+   receipt, releases its transaction lock, verifies the exact resulting
+   controller/services/qdiscs through state-driven readiness, and reloads
+   authoritative UCI and Settings automatically—there is no fixed completion
+   sleep and no second Reload or Save & Apply step. If the response is
+   interrupted, reopen the same instance and let the receipt reconcile instead
+   of starting another Apply. Only the manual
    non-Auto-Tune creation path uses ordinary **Create** followed by
    **Save & Apply**.
 7. On **Status**, confirm that the uplink becomes `ACTIVE`, the controller is

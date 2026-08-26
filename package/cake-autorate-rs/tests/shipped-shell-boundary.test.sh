@@ -36,6 +36,7 @@ if grep -Eq 'PKG_UPGRADE|NATIVE_APPLY_RECOVERY_ROOT|native Apply recovery transa
 fi
 grep -Fq '"$DAEMON" --service-lifecycle prepare-start' "$main_init"
 grep -Fq '"$DAEMON" --service-lifecycle execute-stop' "$main_init"
+grep -Fq '"$DAEMON" --service-lifecycle confirm-started' "$main_init"
 
 if grep -Eq 'config_(load|get)|autotune_scheduler_engine|--native-apply-recover|--legacy-apply-recover|--legacy-autotune-recover|--scheduler-adopt-legacy|--calibration-capabilities|sleep|usleep' "$calibration_init"; then
 	echo 'calibration rc.common bridge retained recovery or scheduler policy' >&2
