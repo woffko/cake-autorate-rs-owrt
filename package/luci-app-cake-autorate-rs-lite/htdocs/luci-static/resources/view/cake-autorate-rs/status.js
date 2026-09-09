@@ -34,6 +34,10 @@ function text(value, fallback) {
 	return value == null || value === '' ? (fallback || '-') : String(value);
 }
 
+function textNode(value) {
+	return document.createTextNode(value == null ? '' : String(value));
+}
+
 function rate(value) {
 	value = Number(value);
 	return Number.isFinite(value) && value > 0 ? Math.round(value) + ' kbit/s' : '-';
@@ -51,7 +55,7 @@ function stateCell(row) {
 	var healthy = !status || status.sqm_runtime_healthy !== false;
 	var color = !enabled ? '#777' : (healthy ? '#0a8f5a' : '#d94141');
 
-	return E('span', { 'style': 'font-weight:600;color:' + color }, state);
+	return E('span', { 'style': 'font-weight:600;color:' + color }, textNode(state));
 }
 
 function routeCell(row) {
@@ -92,9 +96,9 @@ function renderRows(rows) {
 	].concat(rows.map(function(row) {
 		var status = row.status || {};
 		return E('tr', { 'class': 'tr cbi-section-table-row' }, [
-			E('td', { 'class': 'td' }, row.config['.name']),
+			E('td', { 'class': 'td' }, textNode(row.config['.name'])),
 			E('td', { 'class': 'td' }, stateCell(row)),
-			E('td', { 'class': 'td' }, routeCell(row)),
+			E('td', { 'class': 'td' }, textNode(routeCell(row))),
 			E('td', { 'class': 'td' }, directionLabel(row.config)),
 			E('td', { 'class': 'td' }, rate(status.cake_dl_rate_kbps)),
 			E('td', { 'class': 'td' }, rate(status.cake_ul_rate_kbps)),

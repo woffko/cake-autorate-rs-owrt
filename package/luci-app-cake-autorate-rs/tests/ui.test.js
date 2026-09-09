@@ -35,6 +35,9 @@ const tabs = {
   },
 };
 const document = {
+	createTextNode(value) {
+		return { nodeType: 3, textContent: value };
+	},
 	querySelectorAll(selector) {
 		return selector === 'a[href]' ? [ legacyAnchor ] : [];
 	},
@@ -78,6 +81,9 @@ const HeaderClass = new Function('window', 'document', 'L', 'E', '_', 'ui', sour
 
 assert.equal(typeof HeaderClass, 'function');
 const header = new HeaderClass();
+assert.deepEqual(header.text('<img src=x>'), { nodeType: 3, textContent: '<img src=x>' });
+assert.equal(header.text(null).textContent, '');
+assert.equal(header.text(0).textContent, '0');
 assert.equal(typeof header.ensureAppHeader, 'function');
 header.ensureAppHeader();
 assert.equal(inserted.reference, tabs);

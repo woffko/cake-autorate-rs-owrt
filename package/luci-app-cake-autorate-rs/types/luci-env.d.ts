@@ -58,6 +58,7 @@ interface LuCIFileStat {
 
 interface LuCIFileSystem {
   exec(command: string, arguments_?: string[]): Promise<LuCIExecResult>;
+  exec_direct(command: string, arguments_: string[], type: 'text'): Promise<string>;
   list(path: string): Promise<LuCIFileStat[]>;
   read(path: string): Promise<string>;
   read_direct(path: string, type?: string): Promise<string | ArrayBuffer>;
@@ -183,6 +184,9 @@ declare const widgets: {
 };
 
 declare const cakeUi: {
+  text(value: unknown): Text;
+  textElement(tag: string, attributes?: any, children?: any): HTMLElement;
+  readNativeResult(arguments_: string[]): Promise<any>;
   ensureAppHeader(): void;
 };
 }

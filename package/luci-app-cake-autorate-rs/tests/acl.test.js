@@ -39,7 +39,7 @@ const group = document['luci-app-cake-autorate-rs'];
 assert(group, 'CAKE Autorate ACL group is missing');
 assert.deepStrictEqual(
 	group.read.uci,
-	[ 'cake-autorate', 'sqm', 'mwan3', 'network' ],
+	[ 'cake-autorate', 'sqm', 'mwan3', 'network', 'cake-autorate-ui' ],
 	'Settings must be able to read logical/device mappings from UCI network',
 );
 assert.deepStrictEqual(

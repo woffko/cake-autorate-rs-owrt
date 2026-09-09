@@ -175,7 +175,17 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl, eImpl) {
 			`setNativeAutotuneJob: function(section, jobId, request, workerRunId) { nativeAutotuneJobs[section] = { job_id: jobId, request: request, worker_run_id: workerRunId || null }; }, ` +
 			`setInterfaceContext: function(value) { interfaceContext = value; }, ` +
 			`setMwan3Context: function(value) { mwan3Context = value; } };`
-	)(fsImpl || {}, {}, {}, uciImpl || uci, {}, {}, {}, rpcImpl || {
+	)(fsImpl || {}, {}, {}, uciImpl || uci, {}, {}, {
+		text: value => value,
+		// These tests mock the parsed readout API; the separate transport suite
+		// covers CGI limits, partial JSON and the read-only command allowlist.
+		readNativeResult: args => (fsImpl || {}).exec('/usr/sbin/cake-autorated', args)
+			.then(result => {
+				if (result.code != null && result.code !== 0)
+					throw new Error(result.stderr || 'readout failed');
+				return JSON.parse(result.stdout);
+			})
+	}, rpcImpl || {
 		declare() { return () => Promise.resolve(0); },
 	}, lImpl || {}, eImpl || (() => ({})), value => value);
 }
@@ -2005,6 +2015,58 @@ async function testNativeAutotuneTransport() {
 			'native Apply acknowledgement set is incomplete')),
 		false, 'logical Apply failures must never be retried as transport loss');
 
+		for (const abortedPhase of [ 'autotune-apply-start', 'autotune-apply-watch',
+			'autotune-apply-result' ]) {
+			const abortCalls = [];
+			let aborted = false;
+			const abortHelpers = compileHelpers({
+				exec(command, args) {
+					abortCalls.push({ command, args: args.slice() });
+					if (args[1] === abortedPhase && !aborted) {
+						aborted = true;
+						return Promise.reject(new Error('XHR request aborted by browser'));
+					}
+					const payloads = {
+						'autotune-apply-check': bootstrapConfirmation,
+						'autotune-apply-start': applyHandle,
+						'autotune-apply-watch': applyTerminal,
+						'autotune-apply-result': bootstrapReceipt,
+					};
+					assert(Object.hasOwn(payloads, args[1]));
+					return Promise.resolve({ stdout: JSON.stringify(payloads[args[1]]) });
+				},
+			});
+			assert.deepEqual(await abortHelpers.runNativeAutotuneApply(
+				bootstrapApplyResult, nativeSelected), bootstrapReceipt,
+				`a browser-aborted ${abortedPhase} must recover through the same Apply identity`);
+			const repeated = abortCalls.filter(call => call.args[1] === abortedPhase);
+			assert.equal(repeated.length, 2);
+			assert.deepEqual(repeated[0], repeated[1], 'retry must preserve every argument');
+			assert.equal(abortCalls.filter(call => call.args[1] === 'autotune-apply-start').length,
+				abortedPhase === 'autotune-apply-start' ? 2 : 1,
+				'read recovery must never restart Apply admission');
+			assert.equal(abortCalls.length, 5);
+		}
+		const exhaustedAbortCalls = [];
+		const exhaustedAbortHelpers = compileHelpers({
+			exec(command, args) {
+				exhaustedAbortCalls.push({ command, args: args.slice() });
+				if (args[1] === 'autotune-apply-check')
+					return Promise.resolve({ stdout: JSON.stringify(bootstrapConfirmation) });
+				return Promise.reject(new Error('XHR request aborted by browser'));
+			},
+		});
+		await assert.rejects(exhaustedAbortHelpers.runNativeAutotuneApply(
+			bootstrapApplyResult, nativeSelected), /XHR request aborted by browser/);
+		assert.equal(exhaustedAbortCalls.length, 5, 'Apply admission retries must stay bounded');
+		assert(exhaustedAbortCalls.slice(1).every(call =>
+			JSON.stringify(call) === JSON.stringify(exhaustedAbortCalls[1])));
+		for (const message of [ 'operation aborted by user', 'native Apply aborted',
+			'permission denied', 'XHR request aborted by browser: permission denied' ]) {
+			assert.equal(helpers.nativeAutotuneApplyRetryableRpcError(new Error(message)), false,
+				`only the exact transport abort is retryable: ${message}`);
+		}
+
 		const resultRetryCalls = [];
 		const resultRetryHelpers = compileHelpers({
 			exec(command, args) {
@@ -2302,6 +2364,28 @@ async function testNativeAutotuneTransport() {
 		});
 		assert.equal(timeoutCalls.length, 3,
 			'an ambiguous native start timeout must not retry with the legacy mutating backend');
+		const abortStartCalls = [];
+		const abortStartHelpers = compileHelpers({
+			exec(command, args) {
+				abortStartCalls.push({ command, args });
+				if (args[1] === 'summary')
+					return Promise.resolve({ stdout: JSON.stringify(capability) });
+				if (args[1] === 'autotune-current')
+					return Promise.resolve({ stdout: JSON.stringify({
+						state: 'idle', instance: 'wan_sqm',
+					}) });
+				return Promise.reject(new Error('XHR request aborted by browser'));
+			},
+		});
+		await assert.rejects(abortStartHelpers.runPreferredAutotuneJob(
+			'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '',
+			'variable_link', false, 'full_raw', access, true), err => {
+			assert.equal(err.nativeAutotuneStartAttempted, true);
+			assert.equal(err.message, 'XHR request aborted by browser');
+			return true;
+		});
+		assert.equal(abortStartCalls.length, 3,
+			'Apply retry support must not duplicate an ambiguously accepted calibration start');
 
 		const mismatched = nativePublicFixture();
 		mismatched.target_interface = 'eth9';

@@ -7,30 +7,153 @@ universal benchmark.
 
 ## Current release acceptance
 
-The accepted public baseline is daemon r313, Full LuCI r120 and Lite LuCI r4
-at tag `v1.0-rc27-r313-r120`. The final source gate passed 1,263 Full and 111
-Lite Rust tests, every retained OpenWrt bridge test, all Full/Lite LuCI
-JavaScript and TypeScript suites, formatting, syntax and diff checks. The
-release matrix contains 12 independently built Full daemons, 12 Lite daemons
-and the two noarch LuCI APKs; all 26 passed APK/ELF/dependency/source-identity
-verification.
+The maintenance release is daemon r318, Full LuCI r127 and Lite LuCI r7,
+tag `v1.0-rc27-r318-r127`. The final source gate passed 1,285 Full and 119
+Lite Rust tests and 63 total test/check steps: retained OpenWrt bridges,
+Full/Lite LuCI JavaScript and TypeScript, formatting, shell syntax, real
+Chromium rendering, real-UCI savedir isolation and dependency audit. The
+2026-09-09 RustSec audit reported no vulnerabilities or warnings.
 
-The Full pair passed package/runtime checks on the disposable VM and three
-anonymized physical routers, the complete profile/strategy browser matrix,
-directional/no-SQM Review, native receipt-backed Apply, fresh Settings reload,
-Rating concurrency/adoption and exact runtime restoration. The published 29
-assets were downloaded again; every `SHA256SUMS` entry passed and the remote
-checksums, matrix report and release manifest were byte-identical to the local
-release set. Post-release Lite acceptance additionally switched the disposable
-x86_64 VM Full → Lite → Full, proved that calibration commands are absent,
-committed and restarted one manual rate change, and restored the exact original
-configuration.
+All 12 Full and 12 Lite daemon APKs passed source/build-tree identity, complete
+payload, metadata/dependency/script and ELF/interpreter checks. ARM soft- and
+hard-float ABIs and MIPS byte order/o32 are checked explicitly. Both noarch UI
+APKs match their source payloads. Final x86_64 and generic ARM64 Full binaries
+are byte-identical to the binaries used in physical acceptance.
+
+VM acceptance covers upgrade/fresh installation, Full/Lite replacement,
+service actions, pending UCI isolation, all four profile Start/status/Cancel
+and Review paths, native rollback/crash recovery, actual Apply reply loss and
+exact retry, plus three real boots for the SQM startup fix. Lite Save/Reset/
+Apply was verified against actual UCI rather than DOM state alone.
+
+Three physical test routers were upgraded. The first passed service actions,
+columns and export; extra browser repetition on its backup-pair router was
+explicitly waived after native/configuration/payload postflight. The cellular
+ARM64 router passed all those checks plus a complete Automatic Rating,
+Automatic-to-Guided transition/Cancel, Variable-link Full Raw Review, native
+candidate/rollback, real Apply with a deliberately lost first response, and
+post-terminal exact retry without restart. The preferred download-bypass option
+was tested with its explicit acknowledgement. Exact original configuration
+bytes, file modes, directional CAKE state and readiness were restored.
+
+One cellular test window produced Rating B (DL B, UL A, +38.913 ms;
+44 download and 36 upload samples). Variable-link produced four applicable
+proposals and a measured upload-only option at 24,700 kbit/s; the original
+27,100 kbit/s was restored after testing. These are observations, not promised
+throughput or latency. A malformed export envelope was a labelled client
+fixture; it was not misreported as a native export failure.
+
+Publication acceptance additionally requires a commit-bound matrix/release
+manifest and re-downloading all 29 assets to verify their bytes and checksums.
+The previous r313/r120/r4 release remains an unchanged rollback baseline.
 
 Sections labelled with older RC numbers below are retained as historical
 engineering evidence. They explain why contracts changed, but their package
 revisions, helper names and intermediate architecture are not current usage
 instructions. Current commands and behavior are documented in README,
 AUTOTUNE, TRANSPORT_QUALITY and MULTIWAN.
+
+## Historical maintenance development (r314–r318)
+
+The following intermediate failures and checks explain the final fixes. They
+are retained as history; final acceptance is stated above, not inferred from
+an earlier candidate's test count or a failed harness attempt.
+
+The later r317/r127 worktree contains an additional exact-message regression
+for LuCI's `XHR request aborted by browser` after an accepted native Apply.
+The new test failed before the r127 change and passes after it. Start, Watch
+and Result retries retain every request argument; read recovery does not repeat
+Apply admission, admission retries remain bounded, logical errors remain fatal,
+and an ambiguous calibration Start is not duplicated. Full/Lite JavaScript and
+TypeScript checks, the init bridge and 19 real-DOM cases pass locally. This is
+source evidence only: r127 packaging, live lost-response recovery and final
+device/release acceptance must be established separately.
+
+The follow-up to r313 addresses five reproduced defects. Source acceptance
+passed 1,274 Full and 113 Lite Rust tests, the retained shell bridges, Full/Lite
+LuCI behavior and TypeScript checks, and the dependency audit. The candidate
+does not inherit device or publication acceptance from the r313 release.
+
+| Defect | Required regression evidence |
+| --- | --- |
+| A disconnected control client terminated calibrationd | EOF/EPIPE before a request and after accepted Start/Apply preserve the coordinator, transition and retry identity; immediate Apply Watch replies also tolerate disconnects. |
+| A descendant holding a pipe defeated the command timeout | An early leader exit, inherited stdout/stderr and a descendant in another session cannot keep the caller waiting past its deadline; cancellation still works after leader exit. |
+| Status columns committed unrelated UCI changes | Real UCI preserves runtime files and pending shared/session/UI deltas while saving or resetting only UI preferences; failure and lock contention leave files unchanged. |
+| Multiline secrets leaked through diagnostic export | All components of synthetic secrets disappear from UCI, JSON, text and gzip output; malformed/truncated sources and parser stderr do not provide a raw fallback. |
+| Service failures were displayed as success | Nonzero/malformed/rejected exec results show an error; duplicate clicks share one action; successful actions refresh status without another button. |
+| Dynamic error text was parsed as HTML | Real-DOM tests require literal text with no injected elements or event attributes, including nested acknowledgement/diagnostic content. An early false JavaScript execution flag is not proof of safety. |
+| Large diagnostic export exceeded rpcd output limits | Native 520,888-byte output succeeded while rpcd rejected it at its 256 KiB buffer limit. Stream a complete JSON envelope; reject empty, malformed, partial, wrong-version/type and oversized replies. Preserve plain CLI output and decoded 8 MiB limits. |
+
+VM upgrade and Full → Lite → manual rate change → Full passed on r315/r122.
+Real browser service/column/export checks also passed, but inspecting their
+DOM/network evidence found HTML injection in error notifications. The overall
+browser gate was therefore rejected despite the initial harness success.
+The r123 Full UI and r5 Lite UI contain the text-boundary follow-up; package,
+on-device browser and release acceptance must be re-established for those bytes.
+
+Installed r123 subsequently passed the three literal-text error fixtures, but
+real export exposed the size mismatch above. The r316/r124 follow-up adds native
+JSON export and a narrowly allowlisted streaming reader for completed Rating,
+Speed Test and Auto-Tune results (whose native cap is 512 KiB). Mutating commands
+remain on RPC, and all caller identity/manifest checks remain mandatory. CGI's
+HTTP 200 does not attest the child's exit status: the complete document, schema
+and byte bounds must be verified; no synthetic exit code is supplied.
+
+`readout-transport.test.js` covers >256 KiB results, UTF-8 byte lengths, decoded
+bundle limits, partial JSON, wrong types/versions and rejection of mutation
+commands by the streaming helper. Rust tests cover plain/JSON equivalence,
+redaction preservation, multibyte truncation, a full truncation marker even
+when preceding content nearly filled the cap, and an interrupted writer whose
+partial document must not parse. Escaped JSON is streamed through a bounded
+writer buffer; it is not assembled as a second large Rust byte vector.
+
+`package/luci-app-cake-autorate-rs/tests/dom-safety.browser.js` runs production
+rendering functions in Chromium with an HTML-parsing element builder and a
+positive unsafe control. It checks service/export/column errors, Auto-Tune
+diagnostics and Apply acknowledgements, controller/scheduler text, Priorities,
+and Lite validation. All resource requests are aborted; no router or credentials
+are needed.
+
+The r125/r6 UI follow-up extends this gate to status/configuration metadata.
+Both the Lite route/name display and Full route display were reproduced as
+HTML-parsing sinks before correction. Sixteen DOM cases now include metadata,
+mixed child arrays, preserved constructed nodes and the two-argument element
+overload. The plain-text builder is explicitly selected for status display
+components; it does not replace LuCI's global builder or trusted rich help.
+The fixture follows LuCI's actual distinction: scalar strings are parsed as
+HTML, while array entries are appended as nodes or coerced to text. The helper
+flattens nested arrays itself and removes null/boolean placeholders, avoiding
+accidental `[object Text]` or `null` output.
+
+Use the installed Playwright module and browser, for example:
+
+```sh
+node package/luci-app-cake-autorate-rs/tests/dom-safety.browser.js /path/to/playwright /path/to/chromium
+```
+
+An optional fourth argument supplies frozen pre-fix Status source. The same
+test must fail with `service-error: parsed payload markup`; the r122 source
+was verified to do so. Existing lightweight `E` stubs remain useful for logic
+tests, but are not security-rendering evidence. The live LuCI check must also
+reject payload-generated network requests and inspect failure screenshots/DOM.
+
+The real-UCI regression is `package/cake-autorate-rs/tests/status-columns-uci.py`.
+Set `CAKE_TEST_DAEMON` and `CAKE_TEST_UCI` to the inspected executables. On a
+glibc host running SDK UCI, additionally provide `CAKE_TEST_MUSL_LOADER` and
+`CAKE_TEST_LIB_DIR`. The test confines configuration, overrides and deltas to
+temporary directories; it does not edit installed system configuration.
+
+Before release, require the two-ABI package preflight, VM installation and
+Full/Lite switching, real-router desktop/mobile Playwright coverage, and the
+final release-only 12-ABI matrix. A browser timeout requires a screenshot,
+DOM and request/operation evidence; increasing a timeout is not acceptance.
+
+For asynchronous RPC state checks, use `expect.poll(async () => observedState)`
+with an explicit expected value, or a correctly awaited polling loop. In the
+installed Playwright 1.61.1, `waitForFunction(async () => false)` was verified
+to return a handle containing `false` rather than wait for a truthy state.
+Do not use that pattern as cancellation, readiness or completion evidence.
+Record the observed terminal state and zero active/leased operation counts.
 
 ## Test layers
 

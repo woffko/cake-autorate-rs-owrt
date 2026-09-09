@@ -441,6 +441,32 @@ impl ControlEffect {
     }
 }
 
+// A disconnected reader cannot undo an already accepted state transition.
+// Keep connection-local failures out of the coordinator's fatal-error path;
+// unexpected OS/server failures remain visible to the caller.
+fn write_control_response(writer: &mut impl Write, response: &str) -> Result<(), String> {
+    match writer.write_all(response.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::NotConnected
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::WouldBlock
+                    | io::ErrorKind::WriteZero
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(format!(
+            "unable to write calibration control response: {error}"
+        )),
+    }
+}
+
 pub fn run_calibrationd<I>(args: I, terminate: &AtomicBool) -> Result<(), String>
 where
     I: Iterator<Item = String>,
@@ -3183,6 +3209,14 @@ impl CalibrationDaemon {
         let (mut stream, _) = match self.listener.accept() {
             Ok(value) => value,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                return Ok(Some(ControlEffect::ReadOnly));
+            }
             Err(error) => return Err(format!("calibration control accept failed: {error}")),
         };
         stream
@@ -3216,9 +3250,7 @@ impl CalibrationDaemon {
                 ControlEffect::ReadOnly,
             ),
         };
-        stream
-            .write_all(response.as_bytes())
-            .map_err(|error| format!("unable to write calibration control response: {error}"))?;
+        write_control_response(&mut stream, &response)?;
         Ok(Some(effect))
     }
 
@@ -3228,9 +3260,10 @@ impl CalibrationDaemon {
         request: NativeApplyControlRequest,
     ) -> Result<ControlEffect, String> {
         if let Err(error) = request.validate() {
-            stream
-                .write_all(error_response("native-apply-watch-invalid", &error).as_bytes())
-                .map_err(|error| format!("unable to write native Apply watch error: {error}"))?;
+            write_control_response(
+                &mut stream,
+                &error_response("native-apply-watch-invalid", &error),
+            )?;
             return Ok(ControlEffect::ReadOnly);
         }
         let observed_generation = request
@@ -3238,9 +3271,7 @@ impl CalibrationDaemon {
             .expect("validated native Apply watch has an observed generation");
         match self.native_apply_watch_response(&request, observed_generation) {
             Ok(Some(response)) => {
-                stream.write_all(response.as_bytes()).map_err(|error| {
-                    format!("unable to write native Apply watch response: {error}")
-                })?;
+                write_control_response(&mut stream, &response)?;
             }
             Ok(None) if self.native_apply_watches.len() < MAX_PENDING_NATIVE_APPLY_WATCHES => {
                 self.native_apply_watches.push(PendingNativeApplyWatch {
@@ -3251,24 +3282,19 @@ impl CalibrationDaemon {
                 });
             }
             Ok(None) => {
-                stream
-                    .write_all(
-                        error_response(
-                            "native-apply-watch-capacity",
-                            "native Apply watch capacity is exhausted",
-                        )
-                        .as_bytes(),
-                    )
-                    .map_err(|error| {
-                        format!("unable to write native Apply watch capacity error: {error}")
-                    })?;
+                write_control_response(
+                    &mut stream,
+                    &error_response(
+                        "native-apply-watch-capacity",
+                        "native Apply watch capacity is exhausted",
+                    ),
+                )?;
             }
             Err(error) => {
-                stream
-                    .write_all(error_response("native-apply-watch-invalid", &error).as_bytes())
-                    .map_err(|error| {
-                        format!("unable to write native Apply watch lookup error: {error}")
-                    })?;
+                write_control_response(
+                    &mut stream,
+                    &error_response("native-apply-watch-invalid", &error),
+                )?;
             }
         }
         Ok(ControlEffect::ReadOnly)
@@ -13835,6 +13861,155 @@ mod tests {
         assert_eq!(restarted.leases.job_count(), 1);
         assert!(restarted.jobs[0].journal.recovery_required);
         drop(restarted);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn control_response_connection_errors_do_not_hide_server_errors() {
+        struct FailingWriter(io::ErrorKind);
+        impl Write for FailingWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from(self.0))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::WriteZero,
+        ] {
+            assert!(write_control_response(&mut FailingWriter(kind), "accepted").is_ok());
+        }
+        assert!(
+            write_control_response(&mut FailingWriter(io::ErrorKind::Other), "accepted").is_err()
+        );
+    }
+
+    fn queued_control_exchange(
+        daemon: &mut CalibrationDaemon,
+        payload: &str,
+        disconnect: bool,
+    ) -> (ControlEffect, String) {
+        let mut client = UnixStream::connect(&daemon.socket_path).unwrap();
+        client.write_all(payload.as_bytes()).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        if disconnect {
+            client.shutdown(std::net::Shutdown::Both).unwrap();
+            drop(client);
+            return (daemon.serve_once().unwrap().unwrap(), String::new());
+        }
+        let effect = daemon.serve_once().unwrap().unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        (effect, response)
+    }
+
+    #[test]
+    fn control_disconnect_before_or_after_request_keeps_coordinator_alive() {
+        let root = temp_path("disconnected-control-client");
+        let mut daemon = CalibrationDaemon::bind_with_admission(&root, true).unwrap();
+        let generation = daemon.coordinator.generation.clone();
+        let ping = request(ControlCommand::Ping).encode().unwrap();
+        for payload in ["", "malformed request", &ping] {
+            assert_eq!(
+                queued_control_exchange(&mut daemon, payload, true).0,
+                ControlEffect::ReadOnly
+            );
+            let (effect, response) = queued_control_exchange(&mut daemon, &ping, false);
+            assert_eq!(effect, ControlEffect::ReadOnly);
+            assert!(!response.contains("error_code"), "{response}");
+            assert_eq!(daemon.coordinator.generation, generation);
+        }
+        drop(daemon);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn control_disconnect_preserves_start_effect_and_retry_identity() {
+        let root = temp_path("disconnected-start-client");
+        let mut daemon = CalibrationDaemon::bind_with_admission(&root, true).unwrap();
+        daemon.native_autotune = true;
+        let operation = operation_request('a', 'b', "wan");
+        let start = job_message(ControlCommand::Start, &operation)
+            .encode()
+            .unwrap();
+        assert_eq!(
+            queued_control_exchange(&mut daemon, &start, true).0,
+            ControlEffect::StateChanged
+        );
+        assert_eq!(daemon.jobs.len(), 1);
+        let before = daemon.jobs[0].journal.clone();
+        let (effect, response) = queued_control_exchange(&mut daemon, &start, false);
+        assert_eq!(effect, ControlEffect::ReadOnly);
+        assert!(!response.contains("error_code"), "{response}");
+        assert_eq!(daemon.jobs.len(), 1);
+        assert_eq!(daemon.jobs[0].journal, before);
+        drop(daemon);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn control_disconnect_preserves_apply_receipt_and_immediate_watch() {
+        let root = temp_path("disconnected-apply-client");
+        fs::create_dir_all(&root).unwrap();
+        let mut daemon = CalibrationDaemon::bind_with_admission(&root.join("state"), true).unwrap();
+        daemon.native_apply_store = NativeApplyCoordinatorStore::new(&root.join("apply"));
+        let start = NativeApplyControlRequest::start(
+            "11".repeat(16),
+            "22".repeat(16),
+            "recommended".to_string(),
+            "33".repeat(32),
+            "44".repeat(32),
+            Vec::new(),
+        );
+        assert_eq!(
+            queued_control_exchange(&mut daemon, &start.encode().unwrap(), true).0,
+            ControlEffect::StateChanged
+        );
+        let accepted = daemon.native_apply_store.read_active().unwrap().unwrap();
+        let (effect, response) =
+            queued_control_exchange(&mut daemon, &start.encode().unwrap(), false);
+        assert_eq!(effect, ControlEffect::ReadOnly);
+        assert!(response.contains(&accepted.apply_job_id));
+        assert_eq!(
+            daemon.native_apply_store.read_active().unwrap(),
+            Some(accepted.clone())
+        );
+        for token in [
+            accepted.apply_job_token.clone(),
+            "f".repeat(accepted.apply_job_token.len()),
+        ] {
+            let watch = NativeApplyControlRequest::watch(
+                "55".repeat(16),
+                accepted.apply_job_id.clone(),
+                token,
+                0,
+            );
+            assert_eq!(
+                queued_control_exchange(&mut daemon, &watch.encode().unwrap(), true).0,
+                ControlEffect::ReadOnly
+            );
+        }
+        assert_eq!(
+            daemon.native_apply_store.read_active().unwrap(),
+            Some(accepted)
+        );
+        assert_eq!(
+            queued_control_exchange(
+                &mut daemon,
+                &request(ControlCommand::Ping).encode().unwrap(),
+                false
+            )
+            .0,
+            ControlEffect::ReadOnly
+        );
+        drop(daemon);
         fs::remove_dir_all(root).unwrap();
     }
 

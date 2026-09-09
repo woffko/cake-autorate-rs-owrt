@@ -5886,6 +5886,12 @@ impl Controller {
         match &topology {
             Ok(()) if self.sqm_runtime_healthy => {
                 self.sqm_recovery_gate.observe_healthy();
+                if self.sqm_runtime_state == "WAITING_OPERATION" {
+                    // The ownership guard above has cleared and the existing
+                    // topology is healthy. Publish that transition without
+                    // treating it as recovery or resetting controller state.
+                    self.set_sqm_runtime_status("HEALTHY", true, "");
+                }
                 (true, false)
             }
             _ => {
@@ -13861,8 +13867,9 @@ fn main() {
         Some("--log-bundle") => {
             match operations::log_bundle::run_log_bundle(initial_args) {
                 Ok(output) => {
-                    if let Err(error) = std::io::stdout().write_all(&output) {
-                        eprintln!("ERROR: unable to write diagnostic bundle: {error}");
+                    let mut stdout = BufWriter::new(std::io::stdout().lock());
+                    if let Err(error) = output.write_to(&mut stdout) {
+                        eprintln!("ERROR: {error}");
                         std::process::exit(1);
                     }
                 }
@@ -16159,6 +16166,25 @@ esac\n",
         let (ready, recovered) = controller.ensure_managed_sqm();
         assert!(ready && !recovered);
         assert!(fs::read_to_string(&helper_log).unwrap().is_empty());
+
+        // A native operation can release an already healthy topology without
+        // a recovery transition. Its temporary status must not stick forever.
+        for (operation, override_active) in [(true, false), (false, true)] {
+            controller.runtime_operation_active = operation;
+            controller.runtime_override_active = override_active;
+            assert_eq!(controller.ensure_managed_sqm(), (true, false));
+            assert_eq!(controller.sqm_runtime_state, "WAITING_OPERATION");
+            assert!(controller.sqm_runtime_healthy);
+
+            controller.runtime_operation_active = false;
+            controller.runtime_override_active = false;
+            assert_eq!(controller.ensure_managed_sqm(), (true, false));
+            assert_eq!(controller.sqm_runtime_state, "HEALTHY");
+            assert!(controller.sqm_runtime_healthy);
+            assert!(!controller.sqm_runtime_reason.contains("owned by native"));
+            assert_eq!(controller.sqm_recovery_attempts, 1);
+            assert!(fs::read_to_string(&helper_log).unwrap().is_empty());
+        }
 
         fs::remove_file(&healthy).unwrap();
         let (ready, recovered) = controller.ensure_managed_sqm();

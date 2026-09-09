@@ -31,12 +31,16 @@ const MAX_BATCH_BYTES: usize = 256 * 1024;
 const PRIVATE_UCI_ROOT: &str = "/tmp/cake-autorate-service-uci";
 static NEXT_PRIVATE_UCI: AtomicU32 = AtomicU32::new(0);
 
-struct PrivateUciSavedir {
+pub(crate) struct PrivateUciSavedir {
     path: PathBuf,
 }
 
 impl PrivateUciSavedir {
-    fn create() -> Result<Self, String> {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn create() -> Result<Self, String> {
         let base = Path::new(PRIVATE_UCI_ROOT);
         match fs::create_dir(base) {
             Ok(()) => fs::set_permissions(base, fs::Permissions::from_mode(0o700))
@@ -63,7 +67,7 @@ impl PrivateUciSavedir {
         Err("unable to allocate a private service UCI savedir".to_string())
     }
 
-    fn arguments(&self, arguments: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    pub(crate) fn arguments(&self, arguments: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
         let mut result = vec![
             OsString::from("-t"),
             self.path.as_os_str().to_os_string(),
@@ -73,7 +77,7 @@ impl PrivateUciSavedir {
         result
     }
 
-    fn require_clean(&self) -> Result<(), String> {
+    pub(crate) fn require_clean(&self) -> Result<(), String> {
         require_private_uci_directory(&self.path)?;
         for entry in fs::read_dir(&self.path)
             .map_err(|error| format!("unable to inspect service UCI savedir: {error}"))?

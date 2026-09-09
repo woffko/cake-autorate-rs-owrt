@@ -3,6 +3,7 @@
 		"description": "Grant access to the minimal manual CAKE Autorate RS interface",
 		"read": {
 			"file": {
+				"/usr/lib/sqm": [ "list" ],
 				"/var/run/cake-autorate/*/status.json": [ "read" ]
 			},
 			"uci": [ "cake-autorate", "sqm", "network", "mwan3" ]

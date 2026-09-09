@@ -1,14 +1,26 @@
 # Release history
 
-The only supported downloadable build is
-[`v1.0-rc27-r313-r120`](https://github.com/woffko/cake-autorate-rs-owrt/releases/tag/v1.0-rc27-r313-r120).
-It contains daemon r313, Full LuCI r120, the manual-only Lite r313/r4 pair, the
+The current supported build is
+[`v1.0-rc27-r318-r127`](https://github.com/woffko/cake-autorate-rs-owrt/releases/tag/v1.0-rc27-r318-r127).
+It contains daemon r318, Full LuCI r127, the manual-only Lite r318/r7 pair, the
 12-ABI package matrix, checksums, and machine-readable release manifests.
 
-Older release candidates are retained as source tags and engineering history,
-not as supported downloads. Their separate GitHub Release entries and binary
-assets were removed after the final Rust-migration release superseded them.
-Do not install or mix packages from the historical tags below.
+This maintenance release fixes disconnected control-client handling, bounded
+process output, isolated Status preferences, diagnostic redaction/streaming,
+literal-text rendering, service-action feedback, exact Apply retries, SQM
+startup/operation readiness and Lite form transactions.
+
+## Preserved rollback baseline
+
+[`v1.0-rc27-r313-r120`](https://github.com/woffko/cake-autorate-rs-owrt/releases/tag/v1.0-rc27-r313-r120)
+remains unchanged as the accepted Rust-migration baseline (daemon r313,
+Full LuCI r120, Lite LuCI r4). Its tag and existing release assets are retained;
+the new maintenance release does not overwrite them. Use a complete matching
+pair when following a reviewed rollback procedure, never mix revisions.
+
+Earlier candidates listed below are retained as source tags and engineering
+history. Their separate GitHub Release entries and assets were removed after
+the migration release superseded them; they are not supported downloads.
 
 ## Archived GitHub prereleases
 
@@ -40,7 +52,8 @@ must not be read as current CLI, package, schema, or installation instructions.
 
 ## Retention policy
 
-- Keep one current GitHub Release with verified downloadable assets.
+- Keep one current supported GitHub Release with verified downloadable assets;
+  retain the explicitly preserved r313 rollback baseline unchanged.
 - Keep historical git tags so source and test references remain reproducible.
 - Keep old version numbers only in this history and the explicitly historical
   chronology in `TESTING.md`.

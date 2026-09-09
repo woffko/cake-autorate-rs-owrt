@@ -39,7 +39,7 @@
 				"file": [ "read", "list" ],
 				"luci": [ "getInitList" ]
 			},
-			"uci": [ "cake-autorate", "sqm", "mwan3", "network" ]
+			"uci": [ "cake-autorate", "sqm", "mwan3", "network", "cake-autorate-ui" ]
 		},
 		"write": {
 			"cgi-io": [ "exec" ],

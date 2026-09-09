@@ -1,7 +1,47 @@
 'use strict';
+'require fs';
 'require form';
+'require rpc';
 'require uci';
 'require ui';
+
+function validationMessage(result) {
+	return E('p', {}, document.createTextNode(String(result)));
+}
+
+function modal(option) {
+	option.modalonly = true;
+	// An unrelated edit must not remove values hidden by dependencies.
+	option.retain = true;
+	return option;
+}
+
+function safeSqmScript(value) {
+	return typeof value === 'string' && /^[A-Za-z0-9_-][A-Za-z0-9_.-]*\.qos$/.test(value);
+}
+
+function loadSqmScripts() {
+	return L.resolveDefault(fs.list('/usr/lib/sqm'), []).then(function(entries) {
+		return entries.filter(function(entry) {
+			return (entry.type === 'file' || entry.type === 'link') && safeSqmScript(entry.name);
+		}).map(function(entry) { return entry.name; });
+	});
+}
+
+function addSqmScriptChoices(option, installed) {
+	var seen = Object.create(null);
+	var scripts = [ 'piece_of_cake.qos', 'cake.qos' ].concat(installed || []);
+	(uci.sections('cake-autorate', 'cake_autorate') || []).forEach(function(section) {
+		// Preserve a configured basename even if directory discovery is unavailable.
+		scripts.push(section.sqm_script);
+	});
+	scripts.forEach(function(script) {
+		if (safeSqmScript(script) && !seen[script]) {
+			seen[script] = true;
+			option.value(script);
+		}
+	});
+}
 
 var DEFAULT_REFLECTORS = [
 	'1.1.1.1', '1.0.0.1', '8.8.8.8', '8.8.4.4', '9.9.9.9', '149.112.112.112'
@@ -128,7 +168,7 @@ function setDefaults(sectionId) {
 }
 
 function addValue(section, tab, option, title, datatype, fallback) {
-	var o = section.taboption(tab, form.Value, option, title);
+	var o = modal(section.taboption(tab, form.Value, option, title));
 	o.datatype = datatype;
 	o.default = fallback;
 	o.rmempty = false;
@@ -136,7 +176,7 @@ function addValue(section, tab, option, title, datatype, fallback) {
 }
 
 function addFlag(section, tab, option, title, fallback) {
-	var o = section.taboption(tab, form.Flag, option, title);
+	var o = modal(section.taboption(tab, form.Flag, option, title));
 	o.enabled = '1';
 	o.disabled = '0';
 	o.default = fallback == null ? '0' : fallback;
@@ -152,16 +192,35 @@ function writeDirection(sectionId, value) {
 		uci.set('cake-autorate', sectionId, 'adjust_ul_shaper_rate', '0');
 }
 
+var callUciRevertStatus = rpc.declare({
+	object: 'uci',
+	method: 'revert',
+	params: [ 'config' ],
+	reject: false
+});
+
 return L.view.extend({
+	handleReset: function() {
+		// Modal Save stages values in this RPC session. The stock Map.reset()
+		// only re-renders them. Lite writes just this config, not sqm or network.
+		return callUciRevertStatus('cake-autorate').then(function(status) {
+			if (status !== 0)
+				throw new Error(_('Unable to discard the staged CAKE Autorate settings.'));
+			uci.unload([ 'cake-autorate' ]);
+			window.location.reload();
+		});
+	},
+
 	load: function() {
 		return Promise.all([
 			uci.load('cake-autorate'),
 			L.resolveDefault(uci.load('sqm'), null),
-			L.resolveDefault(uci.load('mwan3'), null)
+			L.resolveDefault(uci.load('mwan3'), null),
+			loadSqmScripts()
 		]);
 	},
 
-	render: function() {
+	render: function(data) {
 		var m = new form.Map('cake-autorate', _('CAKE Autorate RS — Lite'),
 			_('Minimal manual controller. Configure explicit bounds and latency policy; no rating or calibration code is installed.'));
 		var s = m.section(form.GridSection, 'cake_autorate', _('Manual instances'));
@@ -187,7 +246,7 @@ return L.view.extend({
 			modalSection.parse = function() {
 				var result = validateInstance(this, sectionId);
 				if (result !== true) {
-					ui.addNotification(null, E('p', result), 'error');
+					ui.addNotification(null, validationMessage(result), 'error');
 					return Promise.reject(new TypeError(result));
 				}
 				return parse.apply(this, arguments);
@@ -223,7 +282,7 @@ return L.view.extend({
 		o = addValue(s, 'connection', 'wan_if', _('WAN device'), 'string', '');
 		o.placeholder = 'eth0.2';
 		o.validate = validateInterface;
-		o = s.taboption('connection', form.ListValue, 'route_mode', _('Route mode'));
+		o = modal(s.taboption('connection', form.ListValue, 'route_mode', _('Route mode')));
 		o.value('auto', _('Auto'));
 		o.value('main', _('Main routing table'));
 		o.value('mwan3', _('mwan3 member'));
@@ -240,7 +299,7 @@ return L.view.extend({
 		o.depends('auto_interface_preset', '0');
 		o.rmempty = true;
 
-		o = s.taboption('rates', form.ListValue, 'sqm_direction_mode', _('CAKE directions'));
+		o = modal(s.taboption('rates', form.ListValue, 'sqm_direction_mode', _('CAKE directions')));
 		o.value('both', _('Download and upload'));
 		o.value('download_only', _('Download only'));
 		o.value('upload_only', _('Upload only'));
@@ -290,17 +349,16 @@ return L.view.extend({
 		addFlag(s, 'sqm', 'manage_sqm', _('Manage SQM section'), '1');
 		o = addValue(s, 'sqm', 'sqm_section', _('Managed SQM section'), 'uciname', '');
 		o.rmempty = true;
-		o = s.taboption('sqm', form.ListValue, 'sqm_qdisc', _('Queueing discipline'));
+		o = modal(s.taboption('sqm', form.ListValue, 'sqm_qdisc', _('Queueing discipline')));
 		o.value('cake', 'cake');
 		o.value('cake-mq', 'cake-mq');
 		o.default = 'cake';
 		o.rmempty = false;
-		o = s.taboption('sqm', form.ListValue, 'sqm_script', _('Queue setup script'));
-		o.value('piece_of_cake.qos', 'piece_of_cake.qos');
-		o.value('cake.qos', 'cake.qos');
+		o = modal(s.taboption('sqm', form.ListValue, 'sqm_script', _('Queue setup script')));
+		addSqmScriptChoices(o, data && data[3]);
 		o.default = 'piece_of_cake.qos';
 		o.rmempty = false;
-		o = s.taboption('sqm', form.ListValue, 'sqm_linklayer', _('Link layer'));
+		o = modal(s.taboption('sqm', form.ListValue, 'sqm_linklayer', _('Link layer')));
 		o.value('none', _('None'));
 		o.value('ethernet', _('Ethernet'));
 		o.value('atm', _('ATM'));
@@ -313,14 +371,14 @@ return L.view.extend({
 		addValue(s, 'sqm', 'sqm_iqdisc_opts', _('Ingress CAKE options'), 'string', '').rmempty = true;
 		addValue(s, 'sqm', 'sqm_eqdisc_opts', _('Egress CAKE options'), 'string', '').rmempty = true;
 
-		o = s.taboption('latency', form.ListValue, 'pinger_method', _('Probe backend'));
+		o = modal(s.taboption('latency', form.ListValue, 'pinger_method', _('Probe backend')));
 		o.value('fping', 'fping');
 		o.value('fping-ts', 'fping-ts');
 		o.value('tsping', 'tsping');
 		o.value('ping', _('ping fallback'));
 		o.default = 'fping';
 		o.rmempty = false;
-		o = s.taboption('latency', form.DynamicList, 'reflector', _('Reflectors'));
+		o = modal(s.taboption('latency', form.DynamicList, 'reflector', _('Reflectors')));
 		o.datatype = 'host';
 		o.default = DEFAULT_REFLECTORS;
 		o.rmempty = false;

@@ -5,11 +5,12 @@
 //! fixed executable/argument vector and timeout, and both individual sources
 //! and the complete browser response are bounded.
 
+use super::autotune_uci_materialization::redact_diagnostic_uci;
 use super::process::{run_bounded_command_output, BoundedCommandOutput, SpawnSpec};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -23,6 +24,51 @@ const MAX_LOG_FILES_PER_INSTANCE: usize = 32;
 const MAX_SECTIONS: usize = 64;
 const MAX_UCI_VALUE_BYTES: usize = 4096;
 const TRUNCATION_MARKER: &[u8] = b"\n[bundle outcome=truncated reason=total-output-limit]\n";
+
+pub(crate) struct LogBundleOutput {
+    bytes: Vec<u8>,
+    json: bool,
+}
+
+impl LogBundleOutput {
+    pub(crate) fn write_to<W: Write>(self, writer: &mut W) -> Result<(), String> {
+        if self.bytes.len() > MAX_BUNDLE_BYTES {
+            return Err("diagnostic bundle exceeds its output limit".to_string());
+        }
+        if self.json {
+            let text = String::from_utf8(self.bytes)
+                .map_err(|_| "diagnostic bundle is not valid UTF-8".to_string())?;
+            let mut fields = serde_json::Map::new();
+            fields.insert("schema_version".to_string(), 1.into());
+            fields.insert("format".to_string(), "cake-autorate-log-bundle".into());
+            fields.insert("byte_length".to_string(), text.len().into());
+            fields.insert("text".to_string(), serde_json::Value::String(text));
+            // Serialize to the caller's bounded buffer, not a second large Vec.
+            // CGI can return HTTP 200 even if the child dies: an incomplete
+            // JSON document must never be accepted as a completed download.
+            serde_json::to_writer(&mut *writer, &fields)
+                .map_err(|error| format!("unable to write diagnostic JSON: {error}"))?;
+            writer
+                .write_all(b"\n")
+                .map_err(|error| format!("unable to write diagnostic JSON: {error}"))?;
+        } else {
+            writer
+                .write_all(&self.bytes)
+                .map_err(|error| format!("unable to write diagnostic bundle: {error}"))?;
+        }
+        writer
+            .flush()
+            .map_err(|error| format!("unable to flush diagnostic bundle: {error}"))
+    }
+}
+
+fn utf8_prefix_len(bytes: &[u8], limit: usize) -> usize {
+    let mut retained = limit.min(bytes.len());
+    while retained > 0 && retained < bytes.len() && bytes[retained] & 0xc0 == 0x80 {
+        retained -= 1;
+    }
+    retained
+}
 
 #[derive(Clone, Debug)]
 struct Environment {
@@ -77,10 +123,12 @@ fn env_path(name: &str, fallback: &str) -> PathBuf {
 }
 
 fn executable(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok_and(|metadata| {
+    // OpenWrt utilities (including gzip) are commonly BusyBox symlinks.
+    // SpawnSpec also validates the resolved executable before launching it.
+    fs::metadata(path).is_ok_and(|metadata| {
         metadata.file_type().is_file()
-            && !metadata.file_type().is_symlink()
             && metadata.permissions().mode() & 0o111 != 0
+            && metadata.permissions().mode() & 0o022 == 0
     })
 }
 
@@ -144,14 +192,14 @@ impl Bundle {
             self.bytes.extend_from_slice(value);
             return;
         }
-        let retained = remaining.saturating_sub(TRUNCATION_MARKER.len());
+        // Make room for the whole marker, even if a preceding source filled
+        // almost all available space. Both stored and incoming text stay UTF-8.
+        let content_limit = MAX_BUNDLE_BYTES.saturating_sub(TRUNCATION_MARKER.len());
         self.bytes
-            .extend_from_slice(&value[..retained.min(value.len())]);
-        self.bytes.extend_from_slice(
-            &TRUNCATION_MARKER[..TRUNCATION_MARKER
-                .len()
-                .min(MAX_BUNDLE_BYTES.saturating_sub(self.bytes.len()))],
-        );
+            .truncate(utf8_prefix_len(&self.bytes, content_limit));
+        let retained = utf8_prefix_len(value, content_limit.saturating_sub(self.bytes.len()));
+        self.bytes.extend_from_slice(&value[..retained]);
+        self.bytes.extend_from_slice(TRUNCATION_MARKER);
         self.sealed = true;
     }
 
@@ -159,10 +207,22 @@ impl Bundle {
         self.append_raw(value.as_bytes());
     }
 
-    fn append_redacted(&mut self, value: &[u8]) {
+    fn append_formatted(&mut self, value: &[u8], format: DiagnosticFormat) -> bool {
         match std::str::from_utf8(value) {
-            Ok(value) => self.append_text(&redact_text(value)),
-            Err(_) => self.append_text("[source outcome=omitted reason=non-utf8]\n"),
+            Ok(value) => match sanitize_diagnostic(value, format) {
+                Ok(clean) => {
+                    self.append_text(&clean);
+                    true
+                }
+                Err(_) => {
+                    self.outcome("omitted", "malformed-or-unsupported-structured-source");
+                    false
+                }
+            },
+            Err(_) => {
+                self.append_text("[source outcome=omitted reason=non-utf8]\n");
+                false
+            }
         }
     }
 
@@ -189,11 +249,13 @@ impl Bundle {
             .collect::<Vec<_>>();
         match command_output(program, &arguments) {
             Ok(output) => {
-                self.append_redacted(&output.stdout);
-                self.append_redacted(&output.stderr);
                 if output.status.success() {
-                    self.outcome("ok", "exit-0");
+                    if self.append_formatted(&output.stdout, DiagnosticFormat::Text) {
+                        self.outcome("ok", "exit-0");
+                    }
                 } else {
+                    // Parser/tool errors can quote raw secret-bearing input.
+                    // Report the exit status, never echo that unparsed source.
                     self.outcome("failed", &format!("exit-{}", output.status));
                 }
             }
@@ -202,9 +264,22 @@ impl Bundle {
     }
 
     fn file(&mut self, title: &str, path: &Path, gzip: &Path) {
+        let format = if path.extension() == Some(OsStr::new("json")) {
+            DiagnosticFormat::Json
+        } else {
+            DiagnosticFormat::Text
+        };
+        self.file_formatted(title, path, gzip, format);
+    }
+
+    fn file_formatted(&mut self, title: &str, path: &Path, gzip: &Path, format: DiagnosticFormat) {
         self.title(title);
         match read_regular_file(path, SOURCE_FILE_LIMIT) {
             Ok(Some(contents)) => {
+                if contents.truncated {
+                    self.outcome("omitted", "source-file-limit");
+                    return;
+                }
                 if contents.bytes.starts_with(&[0x1f, 0x8b]) {
                     if !executable(gzip) {
                         self.outcome("skipped", "gzip-unavailable");
@@ -213,12 +288,11 @@ impl Bundle {
                     let argument = path.to_string_lossy().into_owned();
                     match command_output(gzip, &["-dc".to_string(), argument]) {
                         Ok(output) if output.status.success() => {
-                            self.append_redacted(&output.stdout);
-                            self.append_redacted(&output.stderr);
-                            self.outcome("ok", "gzip");
+                            if self.append_formatted(&output.stdout, format) {
+                                self.outcome("ok", "gzip");
+                            }
                         }
                         Ok(output) => {
-                            self.append_redacted(&output.stderr);
                             self.outcome("failed", &format!("gzip-{}", output.status));
                         }
                         Err(error) => self.outcome("failed", &error),
@@ -226,7 +300,9 @@ impl Bundle {
                 } else if path.extension() == Some(OsStr::new("gz")) {
                     self.outcome("failed", "gzip-magic-mismatch");
                 } else {
-                    self.append_redacted(&contents.bytes);
+                    if !self.append_formatted(&contents.bytes, format) {
+                        return;
+                    }
                     self.outcome(
                         if contents.truncated {
                             "truncated"
@@ -261,9 +337,80 @@ fn safe_marker(value: &str) -> String {
     output
 }
 
+#[derive(Clone, Copy)]
+enum DiagnosticFormat {
+    Text,
+    Uci,
+    Json,
+}
+
+fn sensitive_field(name: &str) -> bool {
+    let name = name.to_ascii_lowercase().replace(['_', '-'], "");
+    [
+        "password",
+        "passwd",
+        "username",
+        "privatekey",
+        "apikey",
+        "authorization",
+        "secret",
+        "token",
+        "cookie",
+        "psk",
+    ]
+    .iter()
+    .any(|key| name.ends_with(key))
+}
+
+fn sanitize_diagnostic(value: &str, format: DiagnosticFormat) -> Result<String, ()> {
+    if matches!(format, DiagnosticFormat::Uci) {
+        return redact_diagnostic_uci(value, sensitive_field).map_err(|_| ());
+    }
+    if matches!(format, DiagnosticFormat::Json) || value.trim_start().starts_with(['{', '[']) {
+        // Default serde_json recursion limits remain enabled. Input/output is
+        // already bounded at the diagnostic source and bundle boundaries.
+        let mut parsed: serde_json::Value = serde_json::from_str(value).map_err(|_| ())?;
+        fn clean(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    for (key, value) in fields {
+                        if sensitive_field(key) {
+                            *value = "<redacted>".into();
+                        } else {
+                            clean(value);
+                        }
+                    }
+                }
+                serde_json::Value::Array(items) => items.iter_mut().for_each(clean),
+                serde_json::Value::String(text) => *text = redact_text(text),
+                _ => {}
+            }
+        }
+        clean(&mut parsed);
+        return serde_json::to_string(&parsed)
+            .map(|text| text + "\n")
+            .map_err(|_| ());
+    }
+    Ok(redact_text(value))
+}
+
 fn redact_text(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
+    let mut quote = None;
+    let mut pending_value = false;
+    let mut escaped = false;
     for line in value.split_inclusive('\n') {
+        if quote.is_some() || pending_value || escaped {
+            let continuation = line.trim_end_matches(['\r', '\n']).trim_start();
+            if !continuation.is_empty() {
+                pending_value = false;
+                scan_secret_quotes(continuation, &mut quote, &mut escaped);
+            }
+            if line.ends_with('\n') {
+                output.push('\n');
+            }
+            continue;
+        }
         let has_newline = line.ends_with('\n');
         let body = line
             .strip_suffix('\n')
@@ -297,6 +444,9 @@ fn redact_text(value: &str) -> String {
         if let Some((offset, length)) = sensitive {
             output.push_str(&body[..offset + length]);
             output.push_str("=<redacted>");
+            let tail = body[offset + length..].trim_start();
+            pending_value = tail.trim_matches([' ', '\t', '=', ':']).is_empty();
+            scan_secret_quotes(tail, &mut quote, &mut escaped);
         } else {
             output.push_str(body);
         }
@@ -305,6 +455,26 @@ fn redact_text(value: &str) -> String {
         }
     }
     output
+}
+
+fn scan_secret_quotes(value: &str, quote: &mut Option<char>, escaped: &mut bool) {
+    for ch in value.chars() {
+        if *escaped {
+            *escaped = false;
+            continue;
+        }
+        if ch == '\\' && *quote != Some('\'') {
+            *escaped = true;
+            continue;
+        }
+        if let Some(open) = *quote {
+            if ch == open {
+                *quote = None;
+            }
+        } else if matches!(ch, '\'' | '"') {
+            *quote = Some(ch);
+        }
+    }
 }
 
 fn find_sensitive_key(line: &str, needle: &str) -> Option<(usize, usize)> {
@@ -360,7 +530,7 @@ fn read_regular_file(path: &Path, limit: usize) -> Result<Option<BoundedFile>, S
     }
     let take_limit = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
     let mut bytes = Vec::with_capacity(limit.min(16 * 1024));
-    file.by_ref()
+    Read::by_ref(&mut file)
         .take(take_limit)
         .read_to_end(&mut bytes)
         .map_err(|error| format!("unable-to-read-file-{error}"))?;
@@ -564,18 +734,30 @@ fn append_instance(bundle: &mut Bundle, environment: &Environment, section: &str
     );
 }
 
-pub(crate) fn run_log_bundle<I>(mut arguments: I) -> Result<Vec<u8>, String>
+pub(crate) fn run_log_bundle<I>(mut arguments: I) -> Result<LogBundleOutput, String>
 where
     I: Iterator<Item = String>,
 {
-    let requested = arguments.next().unwrap_or_else(|| "all".to_string());
+    let first = arguments.next().unwrap_or_else(|| "all".to_string());
+    let json = first == "--json";
+    let requested = if json {
+        arguments.next().unwrap_or_else(|| "all".to_string())
+    } else {
+        first
+    };
     if arguments.next().is_some() {
-        return Err("log-bundle accepts exactly one optional section".to_string());
+        return Err("log-bundle accepts [--json] and one optional section".to_string());
     }
     if matches!(requested.as_str(), "--help" | "-h") {
-        return Ok(b"usage: cake-autorated --log-bundle [all|section]\n".to_vec());
+        return Ok(LogBundleOutput {
+            bytes: b"usage: cake-autorated --log-bundle [--json] [all|section]\n".to_vec(),
+            json: false,
+        });
     }
-    log_bundle(&requested, &Environment::live())
+    Ok(LogBundleOutput {
+        bytes: log_bundle(&requested, &Environment::live())?,
+        json,
+    })
 }
 
 fn log_bundle(requested: &str, environment: &Environment) -> Result<Vec<u8>, String> {
@@ -643,20 +825,17 @@ fn log_bundle(requested: &str, environment: &Environment) -> Result<Vec<u8>, Str
         &environment.nft,
         &["list", "table", "inet", "cake_autorate_dscp"],
     );
-    bundle.command(
-        "uci show cake-autorate",
-        &environment.uci,
-        &["-q", "show", "cake-autorate"],
-    );
-    bundle.file(
+    bundle.file_formatted(
         &environment.cake_config.to_string_lossy(),
         &environment.cake_config,
         &environment.gzip,
+        DiagnosticFormat::Uci,
     );
-    bundle.file(
+    bundle.file_formatted(
         &environment.sqm_config.to_string_lossy(),
         &environment.sqm_config,
         &environment.gzip,
+        DiagnosticFormat::Uci,
     );
     if executable(&environment.mwan3) {
         bundle.command("mwan3 version", &environment.mwan3, &["--version"]);
@@ -675,7 +854,12 @@ fn log_bundle(requested: &str, environment: &Environment) -> Result<Vec<u8>, Str
             &environment.ip,
             &["-4", "route", "show", "table", "all"],
         );
-        bundle.command("uci show mwan3", &environment.uci, &["-q", "show", "mwan3"]);
+        bundle.file_formatted(
+            "mwan3 config",
+            &environment.cake_config.with_file_name("mwan3"),
+            &environment.gzip,
+            DiagnosticFormat::Uci,
+        );
     }
     for section in &sections {
         append_instance(&mut bundle, environment, section);
@@ -756,6 +940,102 @@ mod tests {
     }
 
     #[test]
+    fn multiline_secret_is_absent_from_downloaded_config_bytes() {
+        let fixture = Fixture::new();
+        fixture.uci("#!/bin/sh\ncase \"$*\" in\n'-q get cake-autorate.wan') printf 'cake_autorate\\n' ;;\n*) exit 1 ;;\nesac\n");
+        fs::write(&fixture.environment.cake_config,
+            "config cake_autorate 'wan'\n option mqtt_password 'first_marker\nsecond_marker'\n option enabled '1'\n").unwrap();
+        let output = String::from_utf8(log_bundle("wan", &fixture.environment).unwrap()).unwrap();
+        for marker in ["first_marker", "second_marker"] {
+            assert!(!output.contains(marker), "secret component was exported");
+        }
+    }
+
+    #[test]
+    fn structured_redaction_handles_nested_unicode_keys_and_rejects_bad_input() {
+        let input = r#"{"pass\u0077ord":"first_marker\nsecond_marker","rows":[{"api-key":"third_marker"}],"ok":true}"#;
+        let result = sanitize_diagnostic(input, DiagnosticFormat::Json).unwrap();
+        for value in ["first_marker", "second_marker", "third_marker"] {
+            assert!(!result.contains(value));
+        }
+        assert!(result.contains("\"ok\":true"));
+        for input in ["{\"password\":\"unterminated", "{bad-json}", "[1,", "NaN"] {
+            assert!(sanitize_diagnostic(input, DiagnosticFormat::Json).is_err());
+        }
+        for input in [
+            "config cake_autorate 'wan'\n option password 'first\nsecond",
+            "option password 'first\nsecond'\n",
+            "config cake_autorate 'wan'\n option password\n 'first\nsecond'\n",
+        ] {
+            assert!(sanitize_diagnostic(input, DiagnosticFormat::Uci).is_err());
+        }
+        let crlf = "config cake_autorate 'wan'\r\n option password 'first\r\nsecond'\r\n option enabled '1'\r\n";
+        let result = sanitize_diagnostic(crlf, DiagnosticFormat::Uci).unwrap();
+        assert!(!result.contains("first") && !result.contains("second"));
+        assert!(result.contains("enabled '1'"));
+    }
+
+    #[test]
+    fn text_redaction_covers_quoted_and_next_line_secret_values() {
+        for input in [
+            "password='first_marker\nsecond_marker'\nINFO healthy\n",
+            "password=\n'first_marker\nsecond_marker'\nINFO healthy\n",
+            "password='first_marker'\\''more\nsecond_marker'\nINFO healthy\n",
+            "password=first_marker\\\nsecond_marker\nINFO healthy\n",
+            "password=\"first_marker\\\n\"more\nsecond_marker\"\nINFO healthy\n",
+        ] {
+            let result = redact_text(input);
+            assert!(!result.contains("first_marker") && !result.contains("second_marker"));
+            assert!(result.contains("INFO healthy"));
+        }
+    }
+
+    #[test]
+    fn gzip_and_parser_failures_do_not_bypass_redaction() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("config.gz");
+        let input = b"config cake_autorate 'wan'\n option password 'first_marker\nsecond_marker'\n";
+        let gzip = Path::new("/bin/gzip");
+        let packed = super::super::process::run_bounded_command_output_with_input(
+            &SpawnSpec {
+                program: gzip.to_path_buf(),
+                arguments: vec!["-c".into()],
+                environment: vec![],
+            },
+            Some(input),
+            Duration::from_secs(2),
+            SOURCE_FILE_LIMIT,
+            || false,
+            |_| {},
+        )
+        .unwrap();
+        assert!(packed.status.success());
+        fs::write(&path, packed.stdout).unwrap();
+        let alias = fixture.root.join("gzip-alias");
+        std::os::unix::fs::symlink(gzip, &alias).unwrap();
+        let mut bundle = Bundle::new();
+        bundle.file_formatted("gzip config", &path, &alias, DiagnosticFormat::Uci);
+        let text = String::from_utf8(bundle.finish()).unwrap();
+        assert!(text.contains("<redacted>") && text.contains("detail=gzip"));
+        assert!(!text.contains("first_marker") && !text.contains("second_marker"));
+        let helper = fixture.root.join("failing-parser");
+        fixture.executable(
+            &helper,
+            "#!/bin/sh\nprintf 'unlabeled_sensitive_marker' >&2\nexit 1\n",
+        );
+        let mut bundle = Bundle::new();
+        bundle.command("failing parser", &helper, &[]);
+        assert!(!String::from_utf8(bundle.finish())
+            .unwrap()
+            .contains("unlabeled_sensitive_marker"));
+        fs::write(&path, b"config broken 'unterminated").unwrap();
+        let mut bundle = Bundle::new();
+        bundle.file_formatted("malformed config", &path, &alias, DiagnosticFormat::Uci);
+        let text = String::from_utf8(bundle.finish()).unwrap();
+        assert!(!text.contains("source outcome=ok"));
+    }
+
+    #[test]
     fn every_emitted_surface_uses_the_fail_closed_redactor() {
         let input = concat!(
             "cake-autorate.wan.mqtt_password='ab'\\''tail'\n",
@@ -832,6 +1112,112 @@ mod tests {
         assert!(bundle.sealed);
         assert_eq!(bundle.bytes.len(), MAX_BUNDLE_BYTES);
         assert!(bundle.bytes.ends_with(TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn truncation_keeps_utf8_and_a_complete_marker_even_after_nearly_full_source() {
+        let mut bundle = Bundle::new();
+        bundle.append_text(&"✓".repeat(MAX_BUNDLE_BYTES / 3 + 10));
+        assert!(bundle.sealed);
+        assert!(bundle.bytes.len() <= MAX_BUNDLE_BYTES);
+        assert!(std::str::from_utf8(&bundle.bytes).is_ok());
+        assert!(bundle.bytes.ends_with(TRUNCATION_MARKER));
+
+        let mut bundle = Bundle::new();
+        bundle.append_text(&"x".repeat(MAX_BUNDLE_BYTES - 2));
+        bundle.append_text("🌍more text");
+        assert_eq!(bundle.bytes.len(), MAX_BUNDLE_BYTES);
+        assert!(std::str::from_utf8(&bundle.bytes).is_ok());
+        assert!(bundle.bytes.ends_with(TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn json_envelope_preserves_sanitized_text_bytes_and_rejects_partial_output() {
+        let text = redact_text("password='synthetic_json_marker'\nlatency=✓\n");
+        let mut output = Vec::new();
+        LogBundleOutput {
+            bytes: text.as_bytes().to_vec(),
+            json: true,
+        }
+        .write_to(&mut output)
+        .unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(envelope["schema_version"], 1);
+        assert_eq!(envelope["format"], "cake-autorate-log-bundle");
+        assert_eq!(envelope["byte_length"].as_u64(), Some(text.len() as u64));
+        assert_eq!(envelope["text"].as_str(), Some(text.as_str()));
+        assert!(!String::from_utf8_lossy(&output).contains("synthetic_json_marker"));
+        assert!(serde_json::from_slice::<serde_json::Value>(&output[..output.len() - 2]).is_err());
+
+        let mut plain = Vec::new();
+        LogBundleOutput {
+            bytes: text.as_bytes().to_vec(),
+            json: false,
+        }
+        .write_to(&mut plain)
+        .unwrap();
+        assert_eq!(plain, text.as_bytes());
+    }
+
+    #[test]
+    fn json_wire_growth_does_not_truncate_the_envelope_or_expand_decoded_limit() {
+        let bytes = vec![b'\n'; 300 * 1024];
+        let mut output = Vec::new();
+        LogBundleOutput { bytes, json: true }
+            .write_to(&mut output)
+            .unwrap();
+        assert!(output.len() > 600 * 1024);
+        let envelope: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(envelope["text"].as_str().unwrap().len(), 300 * 1024);
+        let mut rejected = Vec::new();
+        assert!(LogBundleOutput {
+            bytes: vec![b'x'; MAX_BUNDLE_BYTES + 1],
+            json: true,
+        }
+        .write_to(&mut rejected)
+        .is_err());
+        assert!(rejected.is_empty());
+    }
+
+    #[test]
+    fn interrupted_json_writer_never_completes_a_success_envelope() {
+        struct Interrupted {
+            bytes: Vec<u8>,
+        }
+        impl Write for Interrupted {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let count = (128usize.saturating_sub(self.bytes.len())).min(bytes.len());
+                if count == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+                }
+                self.bytes.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut output = Interrupted { bytes: Vec::new() };
+        assert!(LogBundleOutput {
+            bytes: vec![b'x'; 300 * 1024],
+            json: true,
+        }
+        .write_to(&mut output)
+        .is_err());
+        assert_eq!(output.bytes.len(), 128);
+        assert!(serde_json::from_slice::<serde_json::Value>(&output.bytes).is_err());
+    }
+
+    #[test]
+    fn log_bundle_cli_rejects_extra_arguments_before_collecting_and_keeps_help_plain() {
+        assert!(
+            run_log_bundle(["--json", "all", "extra"].into_iter().map(str::to_string)).is_err()
+        );
+        let result = run_log_bundle(["--help"].into_iter().map(str::to_string)).unwrap();
+        assert!(!result.json);
+        assert!(String::from_utf8(result.bytes)
+            .unwrap()
+            .contains("[--json]"));
     }
 
     #[test]

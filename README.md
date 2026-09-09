@@ -42,11 +42,11 @@ project ownership and responsibility remain with the human author.
 - [Controller mathematics](ALGORITHM_MATH.md) describes rate measurement,
   delay baselines, bufferbloat detection, the fast rate controller, and the
   bounded adaptive-ceiling state machine with formulas and examples.
-- [Testing and observed results](TESTING.md) starts with the current r313/r120
+- [Testing and observed results](TESTING.md) starts with the current r318/r127
   acceptance contract, then retains older RC sections as an explicitly
   historical engineering chronology.
 - [Release history](RELEASE_HISTORY.md) lists superseded source tags and their
-  milestones. Only the current r313/r120 Release remains a supported download.
+  milestones and the preserved r313/r120 rollback baseline.
 - [Bounded probe ceiling](ADAPTIVE_CEILING.md) is the concise state-machine and
   safety-invariant reference for the optional outer controller.
 - [Full Auto-Tune](AUTOTUNE.md) documents the native calibration job,
@@ -76,12 +76,13 @@ explicit below.
 
 **Status** keeps the operational state in one place: uplink lifecycle,
 Autorate/SQM/classifier health, active profiles, current collection state and
-the last complete connection rating. The anonymized example below shows two
-independently routed uplinks and the honest **WAITING FOR DATA** state. After a
+the last complete connection rating. The anonymized current-version example
+below shows a cellular uplink with upload-only shaping and the honest
+**WAITING FOR DATA** state. After a
 complete passive or guided capture, **LAST KNOWN** preserves that DL/UL grade;
 an incomplete or contaminated attempt never replaces it.
 
-[![Status overview for two independently routed uplinks](docs/screenshots/status-overview.png)](docs/screenshots/status-overview.png)
+[![Status overview for a cellular uplink with upload-only shaping](docs/screenshots/status-overview.png)](docs/screenshots/status-overview.png)
 
 **Get rating** offers an automatic router-side test and a guided client
 capture. The dialog first attests the current operation for that exact
@@ -298,13 +299,13 @@ The RC27 release builds the OpenWrt 25.12 daemon APK for this ABI matrix:
 The target is an APK ABI rather than one specific board. The authoritative
 choice is the value returned by `apk --print-arch`. Every full daemon asset
 follows the name
-`cake-autorate-rs-1.0_rc27-r313_openwrt-25.12_<arch>.apk`; the shared
-`luci-app-cake-autorate-rs-1.0_rc27-r120.apk` contains the
+`cake-autorate-rs-1.0_rc27-r318_openwrt-25.12_<arch>.apk`; the shared
+`luci-app-cake-autorate-rs-1.0_rc27-r127.apk` contains the
 architecture-independent full LuCI interface and SQM integration.
 
 The same release also contains a separately compiled **Lite** pair for every
-ABI: `cake-autorate-rs-lite-1.0_rc27-r313_...apk` and
-`luci-app-cake-autorate-rs-lite-1.0_rc27-r4.apk`. Lite keeps the manual
+ABI: `cake-autorate-rs-lite-1.0_rc27-r318_...apk` and
+`luci-app-cake-autorate-rs-lite-1.0_rc27-r7.apk`. Lite keeps the manual
 controller, routing, latency probes, directional SQM and bounded adaptive
 ceiling, but deliberately omits Get rating, speed-test calibration, Full
 Auto-Tune and scheduled calibration. Full and Lite are mutually exclusive;
@@ -312,7 +313,7 @@ install both packages from one pair, never mix a Full daemon with Lite LuCI or
 the other way around.
 
 The accepted release is
-[`v1.0-rc27-r313-r120`](https://github.com/woffko/cake-autorate-rs-owrt/releases/tag/v1.0-rc27-r313-r120):
+[`v1.0-rc27-r318-r127`](https://github.com/woffko/cake-autorate-rs-owrt/releases/tag/v1.0-rc27-r318-r127):
 24 architecture-specific daemon APKs, the Full and Lite noarch LuCI APKs,
 `SHA256SUMS`, and machine-readable matrix/release manifests. The published
 Lite daemon APK is about 79% smaller than Full on average across the matrix;
@@ -414,15 +415,15 @@ representative examples rather than guarantees.
 
 ## Current release
 
-This release is **RC27 r313/r120**: daemon package r313 and Full LuCI package
-r120, with the parallel manual-only Lite pair r313/r4. It retains the complete
+This release is **RC27 r318/r127**: daemon package r318 and Full LuCI package
+r127, with the parallel manual-only Lite pair r318/r7. It retains the complete
 two-direction Rating authority, truthful staged Auto-Tune progress, a ranked
 four-option Review including the measured mobile download-bypass topology, one
 aggregate trade-off confirmation, and an Apply flow which verifies the runtime
 and immediately reloads authoritative UCI without another button or tab
 switch.
 
-r311 hardens the native Apply transaction itself. Before mutating either UCI
+The native Apply transaction is write-ahead protected. Before mutating either UCI
 package it durably records the exact original and candidate `cake-autorate` and
 `sqm` bytes, modes, digests, request/job/worker identity, and selected option
 manifest. Recovery classifies each live package as original, candidate, or
@@ -444,9 +445,9 @@ recorded in
 instead of retaining a cumulative RC diary. Superseded milestones remain in
 [Release history](RELEASE_HISTORY.md) and git tags, while
 [GitHub Releases](https://github.com/woffko/cake-autorate-rs-owrt/releases)
-contains only the current downloadable build.
+contains the current release and the preserved r313 rollback baseline.
 
-r313 additionally fixes fresh Full installation and Lite-to-Full replacement.
+Fresh Full installation and Lite-to-Full replacement use the same readiness contract.
 After OpenWrt's default package hook returns, the Full package now re-attests
 the main controller, stops and settles any calibration instance that the
 default hook already started, then enables and starts exactly one coordinator.
@@ -454,6 +455,19 @@ The in-place upgrade branch remains separate and performs no duplicate
 readiness confirmation. Exact Full → Lite → manual stop/save/start → Full
 testing now returns package status zero and restores the original UCI, services
 and both CAKE qdiscs byte-for-byte.
+
+This maintenance release adds client-disconnect isolation,
+deadline-bounded process output, separate Status display preferences,
+structured diagnostic redaction and truthful service-action errors. Dynamic
+plain-text errors and diagnostics use text nodes instead of LuCI HTML strings.
+Large exports and completed calibration results use authenticated streaming
+with complete JSON validation, rather than rpcd's small command-output buffer.
+Lost Apply replies are retried with the exact same request and handle. Native
+SQM startup waits for the matching kernel topology event, and release of a
+calibration owner clears stale operation state. Lite Save/Reset keeps UCI
+transaction state consistent with the displayed form. These changes passed
+the source, VM, physical-device and 12-ABI package gates described in
+[Testing](TESTING.md#current-release-acceptance).
 
 ## Repository Layout
 
@@ -913,16 +927,16 @@ For example, when it prints `aarch64_generic`:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc27-r313_openwrt-25.12_aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc27-r120.apk
+  /root/cake-autorate-rs-1.0_rc27-r318_openwrt-25.12_aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-1.0_rc27-r127.apk
 ```
 
 For a small manual-only installation, use the matching Lite pair instead:
 
 ```sh
 apk add --allow-untrusted \
-  /root/cake-autorate-rs-lite-1.0_rc27-r313_openwrt-25.12_aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-lite-1.0_rc27-r4.apk
+  /root/cake-autorate-rs-lite-1.0_rc27-r318_openwrt-25.12_aarch64_generic.apk \
+  /root/luci-app-cake-autorate-rs-lite-1.0_rc27-r7.apk
 ```
 
 Changing variants is a package replacement, not an in-place feature toggle.

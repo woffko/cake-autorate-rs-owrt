@@ -109,6 +109,7 @@ pub mod sqm_identity;
 pub(crate) mod sqm_projection;
 pub mod sqm_recovery;
 pub(crate) mod sqm_recovery_openwrt;
+pub(crate) mod sqm_start_events;
 #[cfg(feature = "calibration")]
 pub mod state;
 #[cfg(feature = "calibration")]
@@ -195,6 +196,10 @@ mod lite_boundary_tests {
         assert!(SOURCE.contains("pub(crate) mod procd_control;"));
         assert!(SOURCE.contains("pub(crate) mod service_config;"));
         assert!(SOURCE.contains("pub(crate) mod sqm_projection;"));
+        assert!(SOURCE.contains("pub(crate) mod sqm_start_events;"));
+        assert!(
+            !SOURCE.contains("#[cfg(feature = \"calibration\")]\npub(crate) mod sqm_start_events;")
+        );
     }
 }
 
@@ -309,6 +314,7 @@ mod timer_ownership_tests {
         ("speedtest_request", include_str!("speedtest_request.rs")),
         ("sqm_identity", include_str!("sqm_identity.rs")),
         ("sqm_recovery", include_str!("sqm_recovery.rs")),
+        ("sqm_start_events", include_str!("sqm_start_events.rs")),
         (
             "sqm_recovery_openwrt",
             include_str!("sqm_recovery_openwrt.rs"),
@@ -324,7 +330,6 @@ mod timer_ownership_tests {
             "full_autotune" => vec!["thread::sleep(RUNTIME_ACK_POLL);"; 12],
             "process" => vec![
                 "thread::sleep(WAIT_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));",
-                "thread::sleep(WAIT_INTERVAL.min(deadline.saturating_duration_since(now)));",
             ],
             "sqm_recovery_openwrt" => vec![
                 "thread::sleep(PROCESS_WAIT_INTERVAL.min(deadline.saturating_duration_since(now)));",

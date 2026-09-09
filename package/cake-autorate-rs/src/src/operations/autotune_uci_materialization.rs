@@ -891,6 +891,77 @@ fn push_bytes_bounded(output: &mut Vec<u8>, bytes: &[u8]) -> Result<(), String> 
     Ok(())
 }
 
+/// Diagnostic projection of canonical UCI bytes. Comments are discarded and
+/// secret values are replaced before serialization, including quoted newlines.
+/// This never mutates or relaxes the parser used for Apply verification.
+pub(crate) fn redact_diagnostic_uci(
+    input: &str,
+    sensitive: impl Fn(&str) -> bool,
+) -> Result<String, String> {
+    let normalized = input.replace("\r\n", "\n");
+    let mut parser = UciConfigParser::new(normalized.as_bytes(), b"__diagnostic__")?;
+    let mut output = String::new();
+    let mut sections = 0;
+    let mut commands = 0;
+    fn text(value: &[u8]) -> Result<&str, String> {
+        std::str::from_utf8(value).map_err(|_| "diagnostic UCI is not UTF-8".to_string())
+    }
+    fn quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+    while parser.skip_layout()? {
+        commands += 1;
+        if commands > MAX_UCI_FILE_COMMANDS {
+            return Err("diagnostic UCI exceeds command bound".to_string());
+        }
+        let keyword = parser.parse_uci_name_token("command")?;
+        parser.require_horizontal_space()?;
+        match keyword.as_slice() {
+            b"config" => {
+                sections += 1;
+                if sections > MAX_UCI_FILE_SECTIONS {
+                    return Err("diagnostic UCI exceeds section bound".to_string());
+                }
+                let kind = parser.parse_section_type_token()?;
+                let space = parser.skip_horizontal_space();
+                output.push_str(&format!("config {}", quote(text(&kind)?)));
+                if !parser.at_line_end_or_comment() {
+                    if !space {
+                        return Err("diagnostic UCI tokens are not separated".to_string());
+                    }
+                    let name = parser.parse_quoted_token()?;
+                    validate_parsed_uci_name("section", &name)?;
+                    output.push(' ');
+                    output.push_str(&quote(text(&name)?));
+                }
+            }
+            b"option" | b"list" => {
+                if sections == 0 {
+                    return Err("diagnostic UCI option has no section".to_string());
+                }
+                let name = parser.parse_uci_name_token("option")?;
+                parser.require_horizontal_space()?;
+                let value = parser.parse_quoted_token()?;
+                let value = if sensitive(text(&name)?) {
+                    "<redacted>"
+                } else {
+                    text(&value)?
+                };
+                output.push_str(&format!(
+                    "\t{} {} {}",
+                    text(&keyword)?,
+                    text(&name)?,
+                    quote(value)
+                ));
+            }
+            _ => return Err("unsupported diagnostic UCI command".to_string()),
+        }
+        parser.finish_command()?;
+        output.push('\n');
+    }
+    Ok(output)
+}
+
 struct UciConfigParser<'a> {
     input: &'a [u8],
     position: usize,

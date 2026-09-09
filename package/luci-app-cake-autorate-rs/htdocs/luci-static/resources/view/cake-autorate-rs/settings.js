@@ -22,6 +22,16 @@ function modal(option) {
 	return option;
 }
 
+function settingsActionLayout() {
+	// LuCI writes a desktop-sized inline width for the action column. Override
+	// it only in this map on narrow viewports and keep every action reachable.
+	return E('style', {}, '@media(max-width:600px){' +
+		'#cbi-cake-autorate .cbi-section-actions{min-width:0!important;width:100%!important;max-width:100%;white-space:normal}' +
+		'#cbi-cake-autorate .cbi-section-actions>div{flex-wrap:wrap;gap:4px}' +
+		'#cbi-cake-autorate .cbi-section-actions .cbi-button{flex:1 1 auto;min-width:0;max-width:100%;white-space:normal}' +
+		'}');
+}
+
 function trafficPrioritiesUrl(sectionId) {
 	if (!/^[A-Za-z0-9_]+$/.test(sectionId || ''))
 		throw new TypeError(_('The instance name is unsafe.'));
@@ -2719,8 +2729,8 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 			}, [
 				E('strong', {}, _('Download without shaping')),
 				E('div', { 'style': 'margin-top:5px' }, _('Unavailable for this run')),
-				E('p', { 'style': 'margin:5px 0' }, nativeDownloadBypassUnavailableReason(
-					topology, disabledFallback ? rawFallback : null)),
+				E('p', { 'style': 'margin:5px 0' }, cakeUi.text(nativeDownloadBypassUnavailableReason(
+					topology, disabledFallback ? rawFallback : null))),
 				E('small', {}, _('No untested rate or topology can be applied from this card.'))
 			]));
 		}
@@ -2729,8 +2739,8 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 			E('strong', {}, _('Confirm measured trade-offs for this option:')),
 			E('div', { 'style': 'display:flex;flex-direction:column;gap:7px;margin-top:7px' },
 				[ E('ul', { 'style': 'margin:0 0 4px 20px' }, required.map(function(code) {
-					return E('li', {}, [ nativeAutotuneAcknowledgementLabel(code),
-						E('small', { 'style': 'display:block;opacity:.75' }, code) ]);
+					return E('li', {}, [ cakeUi.text(nativeAutotuneAcknowledgementLabel(code)),
+						E('small', { 'style': 'display:block;opacity:.75' }, cakeUi.text(code)) ]);
 				})), (function() {
 					var checkbox = E('input', {
 						'type': 'checkbox',
@@ -2834,7 +2844,7 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 			E('div', { 'style': 'display:flex;flex-wrap:wrap;gap:8px' }, actionButtons)
 		);
 		if (state.error)
-			nodes.push(E('div', { 'class': 'alert-message error', 'style': 'margin-top:8px' }, state.error));
+			nodes.push(E('div', { 'class': 'alert-message error', 'style': 'margin-top:8px' }, cakeUi.text(state.error)));
 		replaceNodeContent(root, nodes);
 	};
 
@@ -3147,7 +3157,7 @@ function variableLinkContextControl(state, disabled, onChange) {
 		E('div', { 'class': 'alert-message ' + detectionTone, 'style': 'margin:0 0 10px' }, [
 			E('strong', {}, _('Resolved access: %s · confidence %d%%. ').format(
 				accessMediumTitle(access.medium), access.confidence_percent)),
-			access.reason,
+			cakeUi.text(access.reason),
 			E('div', { 'style': 'margin-top:5px' },
 				_('Exploration floor: %d%% of the conservative raw reference. The runtime minimum is written only at an exact tested CAKE point.').format(explorationPercent))
 		]),
@@ -3195,6 +3205,16 @@ function autotuneExecWithRetry(command, args, attempts, delayMs) {
 		return autotuneJobDelay(delayMs).then(function() {
 			return autotuneExecWithRetry(command, args, attempts - 1,
 				Math.min(delayMs * 2, 5000));
+		});
+	});
+}
+
+function autotuneReadResultWithRetry(args, attempts, delayMs) {
+	return cakeUi.readNativeResult(args).catch(function(error) {
+		if (!autotuneTransientRpcError(error) || attempts <= 0)
+			throw error;
+		return autotuneJobDelay(delayMs).then(function() {
+			return autotuneReadResultWithRetry(args, attempts - 1, Math.min(delayMs * 2, 5000));
 		});
 	});
 }
@@ -3334,9 +3354,9 @@ function runNativeSpeedtestJob(section_id, wan, onProgress, routeMode, mwan3Memb
 			if (status.state !== 'completed')
 				throw new Error(status.diagnostic || status.error ||
 					_('Speed Test ended without a usable result.'));
-			return autotuneExecWithRetry(NATIVE_AUTOTUNE_COMMAND,
+			return autotuneReadResultWithRetry(
 				[ '--calibrationctl', 'speedtest-result', publicJobId ], 2, 1000)
-				.then(parseExecJson).then(function(result) {
+				.then(function(result) {
 					if (!nativeSpeedtestResultValidated(result, publicJobId, topology))
 						throw new Error(_('The native Speed Test result failed its restore-first contract.'));
 					return { stdout: JSON.stringify(result) };
@@ -3648,6 +3668,8 @@ function nativeAutotuneApplyStatusValidated(status, handle, result, option) {
 function nativeAutotuneApplyRetryableRpcError(error) {
 	var message = String(error && (error.message || error) || '');
 	return autotuneTransientRpcError(error) ||
+		// LuCI reports a reset XHR this way; only exact-idempotent Apply may replay it.
+		message === 'XHR request aborted by browser' ||
 		/unable to read calibration control response:.*(?:Resource temporarily unavailable|os error 11|operation would block)/i.test(message) ||
 		/calibration service returned (?:no JSON result|malformed JSON)/i.test(message);
 }
@@ -3837,9 +3859,9 @@ function runNativeAutotuneJob(section_id, wan, backend, onProgress, routeMode, m
 				if (onProgress)
 					onProgress(nativeAutotuneProgress(status, lastProgress));
 				return withRpcTimeout(180, function() {
-					return autotuneExecWithRetry(NATIVE_AUTOTUNE_COMMAND,
+					return autotuneReadResultWithRetry(
 						[ '--calibrationctl', 'autotune-result', publicJobId ], 2, 1000);
-				}).then(parseExecJson).then(function(result) {
+				}).then(function(result) {
 					if (!nativeAutotunePublicResultValidated(result)) {
 						delete nativeAutotuneJobs[section_id];
 						var invalid = new Error(_('The calibration result failed its verification contract.'));
@@ -4806,9 +4828,9 @@ function renderAutotuneDiagnostics(result) {
 		(result && (result.diagnostic_code || result.reason || result.state) || 'failed');
 	return E('div', { 'class': 'alert-message error' }, [
 		E('strong', {}, _('Calibration did not produce an applicable proposal.')),
-		E('p', { 'style': 'white-space:normal;margin:6px 0 0' }, message),
+		E('p', { 'style': 'white-space:normal;margin:6px 0 0' }, cakeUi.text(message)),
 		E('p', { 'style': 'white-space:normal;margin:6px 0 0;font-size:12px' },
-			_('Diagnostic code: %s').format(code))
+			cakeUi.text(_('Diagnostic code: %s').format(code)))
 	]);
 }
 function replaceNodeContent(node, children) {
@@ -5376,11 +5398,11 @@ function showCreateWizard(grid, name, existingName) {
 				';margin-top:8px'
 		});
 		var status = E('div', { 'style': 'margin-top:8px;white-space:normal' },
-			item.error || (item.status === 'diagnostic' ?
+			cakeUi.text(item.error || (item.status === 'diagnostic' ?
 				_('Full Auto-Tune Review is ready. Choose an exact option below, confirm its trade-offs, and apply it; or skip this uplink.') :
 			(item.status === 'review' ?
 				_('Calibration finished without an applicable proposal. Retry or skip this uplink.') :
-				_('Select the quality profile for this uplink, then start its calibration.'))));
+				_('Select the quality profile for this uplink, then start its calibration.')))));
 
 			var startCalibration = function(conservative) {
 				var generation = (state.autotune_generation || 0) + 1;
@@ -6051,9 +6073,9 @@ function showCreateWizard(grid, name, existingName) {
 				rerun ? existingName : null);
 			rows.push([ _('Multi-WAN instances'), E('pre', {
 				'style': 'margin:0;white-space:pre-wrap;font:inherit'
-			}, multiwanPlans.map(function(item) {
+			}, cakeUi.text(multiwanPlans.map(function(item) {
 				return '%s: %s → %s; %s'.format(item.name, item.member, item.device, item.sqmSection);
-			}).join('\n')) ]);
+			}).join('\n'))) ]);
 			rows.push([ _('Detected conflicts'), multiwanConflicts.length ? multiwanConflicts.join('\n') : _('None') ]);
 			(state.autotune_batch || []).forEach(function(item) {
 				var profile = autotuneProfileDefinitions().filter(function(definition) {
@@ -6101,8 +6123,8 @@ function showCreateWizard(grid, name, existingName) {
 		reviewNodes.push(
 			E('table', { 'class': 'table' }, rows.map(function(row) {
 				return E('tr', { 'class': 'tr' }, [
-					E('td', { 'class': 'td' }, row[0]),
-					E('td', { 'class': 'td' }, row[1])
+					E('td', { 'class': 'td' }, cakeUi.text(row[0])),
+					E('td', { 'class': 'td' }, row[1] instanceof Node ? row[1] : cakeUi.text(row[1]))
 				]);
 			}))
 		);
@@ -6383,7 +6405,7 @@ function showCreateWizard(grid, name, existingName) {
 				else
 					notification = _('%d instance(s) created: %s. Review pending changes, then Save & Apply.').format(
 						created.length, created.join(', '));
-				ui.addNotification(null, E('p', notification), 'info');
+				ui.addNotification(null, E('p', {}, cakeUi.text(notification)), 'info');
 			})
 			.catch(function(err) {
 				showError(err.message || err);
@@ -6773,7 +6795,7 @@ function addRateOptions(section) {
 			(access.source === 'auto_inconclusive' ? 'warning' : 'notice') }, [
 			E('strong', {}, _('%s · %d%% confidence').format(
 				accessMediumTitle(access.medium), access.confidence_percent)),
-			E('div', { 'style': 'margin-top:4px' }, access.reason),
+			E('div', { 'style': 'margin-top:4px' }, cakeUi.text(access.reason)),
 			E('div', { 'style': 'margin-top:4px' },
 				_('Exploration floor: %d%%. PPPoE, DHCP, and Ethernet alone never prove the provider medium.').format(
 					accessMediumExplorationPercent(access.medium)))
@@ -7268,9 +7290,9 @@ function addSetupOptions(section) {
 			if (result.warning)
 				message += ' ' + result.warning;
 
-			ui.addNotification(null, E('p', message), result.warning ? 'warning' : 'info');
+			ui.addNotification(null, E('p', {}, cakeUi.text(message)), result.warning ? 'warning' : 'info');
 		}).catch(function(err) {
-			ui.addNotification(null, E('p', _('Speed test failed: %s').format(err.message || err)), 'error');
+			ui.addNotification(null, E('p', {}, cakeUi.text(_('Speed test failed: %s').format(err.message || err))), 'error');
 		}).then(function() {
 			button.disabled = false;
 		});
@@ -7388,9 +7410,9 @@ function addReflectorOptions(section) {
 		button.disabled = true;
 
 		return runPingerPlan(section_id, 'status').then(function(result) {
-			ui.addNotification(null, E('pre', { 'style': 'white-space:pre-wrap' }, formatPingerPlan(result)), 'info');
+			ui.addNotification(null, E('pre', { 'style': 'white-space:pre-wrap' }, cakeUi.text(formatPingerPlan(result))), 'info');
 		}).catch(function(err) {
-			ui.addNotification(null, E('p', _('Pinger status check failed: %s').format(err.message || err)), 'error');
+			ui.addNotification(null, E('p', {}, cakeUi.text(_('Pinger status check failed: %s').format(err.message || err))), 'error');
 		}).then(function() {
 			button.disabled = false;
 		});
@@ -7418,9 +7440,9 @@ function addReflectorOptions(section) {
 		button.disabled = true;
 
 		return installPingerBackend(section_id, method).then(function(result) {
-			ui.addNotification(null, E('p', formatPingerInstall(result)), result.available ? 'info' : 'warning');
+			ui.addNotification(null, E('p', {}, cakeUi.text(formatPingerInstall(result))), result.available ? 'info' : 'warning');
 		}).catch(function(err) {
-			ui.addNotification(null, E('p', _('Pinger install failed: %s').format(err.message || err)), 'error');
+			ui.addNotification(null, E('p', {}, cakeUi.text(_('Pinger install failed: %s').format(err.message || err))), 'error');
 		}).then(function() {
 			button.disabled = false;
 		});
@@ -7441,9 +7463,9 @@ function addReflectorOptions(section) {
 
 		return runPingerPlan(section_id, 'scan').then(function(result) {
 			var level = (result.warnings && result.warnings.length) ? 'warning' : 'info';
-			ui.addNotification(null, E('pre', { 'style': 'white-space:pre-wrap' }, formatPingerPlan(result)), level);
+			ui.addNotification(null, E('pre', { 'style': 'white-space:pre-wrap' }, cakeUi.text(formatPingerPlan(result))), level);
 		}).catch(function(err) {
-			ui.addNotification(null, E('p', _('Reflector scan failed: %s').format(err.message || err)), 'error');
+			ui.addNotification(null, E('p', {}, cakeUi.text(_('Reflector scan failed: %s').format(err.message || err))), 'error');
 		}).then(function() {
 			button.disabled = false;
 		});
@@ -7465,9 +7487,9 @@ function addReflectorOptions(section) {
 		return runPingerPlan(section_id, 'scan').then(function(result) {
 			applyPingerPlanToSection(section, section_id, result);
 			ui.addNotification(null, E('pre', { 'style': 'white-space:pre-wrap' },
-				formatPingerPlan(result) + '\n\n' + _('Recommendation applied to pending changes. Use Save & Apply to commit it.')), 'info');
+				cakeUi.text(formatPingerPlan(result) + '\n\n' + _('Recommendation applied to pending changes. Use Save & Apply to commit it.'))), 'info');
 		}).catch(function(err) {
-			ui.addNotification(null, E('p', _('Applying reflector recommendation failed: %s').format(err.message || err)), 'error');
+			ui.addNotification(null, E('p', {}, cakeUi.text(_('Applying reflector recommendation failed: %s').format(err.message || err))), 'error');
 		}).then(function() {
 			button.disabled = false;
 		});
@@ -7596,9 +7618,9 @@ function addLoggingOptions(section) {
 		button.disabled = true;
 
 		return runMqttStatus(section_id, 'status').then(function(result) {
-			ui.addNotification(null, E('pre', { 'style': 'white-space:pre-wrap' }, formatMqttStatus(result)), result.available ? 'info' : 'warning');
+			ui.addNotification(null, E('pre', { 'style': 'white-space:pre-wrap' }, cakeUi.text(formatMqttStatus(result))), result.available ? 'info' : 'warning');
 		}).catch(function(err) {
-			ui.addNotification(null, E('p', _('MQTT status check failed: %s').format(err.message || err)), 'error');
+			ui.addNotification(null, E('p', {}, cakeUi.text(_('MQTT status check failed: %s').format(err.message || err))), 'error');
 		}).then(function() {
 			button.disabled = false;
 		});
@@ -7965,7 +7987,7 @@ return L.view.extend({
 				var validation = validateInstanceSection(this, section_id);
 
 				if (validation !== true) {
-					ui.addNotification(null, E('p', validation), 'error');
+					ui.addNotification(null, E('p', {}, cakeUi.text(validation)), 'error');
 					return Promise.reject(new TypeError(validation));
 				}
 
@@ -8018,6 +8040,9 @@ return L.view.extend({
 		addAdvancedOptions(s);
 		requireAdvancedSettings(s);
 
-		return m.render();
+		return m.render().then(function(node) {
+			node.insertBefore(settingsActionLayout(), node.firstChild);
+			return node;
+		});
 	}
 });

@@ -6,6 +6,10 @@
 'require ui';
 'require cake-autorate-rs.ui as cakeUi';
 
+function notifyPresetError(error) {
+	ui.addNotification(null, E('p', {}, cakeUi.text(error.message || String(error))), 'error');
+}
+
 var PROFILE_LABELS = {
 	auto: _('Automatic'),
 	gaming: _('Gaming'),
@@ -444,7 +448,7 @@ return L.view.extend({
 							return m.save(null, true).then(function() {
 								return stagePresetCopy(source);
 							}).catch(function(error) {
-								ui.addNotification(null, E('p', {}, error.message || String(error)), 'error');
+								notifyPresetError(error);
 							});
 						}
 					}, _('Create editable copy'))

@@ -1,5 +1,53 @@
 'use strict';
 'require ui';
+'require fs';
+
+// LuCI E() treats string children as HTML. Backend/configuration text must
+// cross this boundary as a Node, including when nested in a mixed child array.
+function text(value) {
+	return document.createTextNode(value == null ? '' : String(value));
+}
+
+// Opt in only for plain-text display components, not trusted rich help/layout.
+// Constructed nodes keep their identity; strings in mixed arrays stay text.
+function textElement(tag, attrs, children) {
+	if (arguments.length === 2 && (typeof attrs !== 'object' || attrs instanceof Node || Array.isArray(attrs))) {
+		children = attrs;
+		attrs = {};
+	}
+	var childrenFlat = [];
+	function child(value) {
+		if (value == null || typeof value === 'boolean')
+			return;
+		if (Array.isArray(value))
+			value.forEach(child);
+		else
+			childrenFlat.push(value instanceof Node ? value : text(value));
+	}
+	child(children);
+	return E(tag, attrs || {}, childrenFlat);
+}
+
+function readNativeResult(args) {
+	// Only completed read-only result documents can exceed rpcd's 256 KiB
+	// stdout limit. Never route Start/Cancel/Apply mutation receipts here.
+	if (!Array.isArray(args) || args.length !== 3 || args[0] !== '--calibrationctl' ||
+	    [ 'rating-result', 'speedtest-result', 'autotune-result' ].indexOf(args[1]) < 0 ||
+	    !/^[0-9a-f]{32}$/.test(args[2]))
+		return Promise.reject(new Error(_('Invalid native result request.')));
+	return fs.exec_direct('/usr/sbin/cake-autorated', args.slice(), 'text').then(function(output) {
+		if (typeof output !== 'string' || !output.length || new Blob([ output ]).size > 512 * 1024)
+			throw new Error(_('The native result is empty or exceeds its size limit.'));
+		var result;
+		try { result = JSON.parse(output); }
+		catch (error) { throw new Error(_('The native result is incomplete or malformed.')); }
+		if (!result || typeof result !== 'object' || Array.isArray(result))
+			throw new Error(_('The native result has an invalid document type.'));
+		// Callers still enforce operation, worker, route and manifest identity.
+		// CGI has no child exit status; do not manufacture an exec code here.
+		return result;
+	});
+}
 
 function invalidateLegacyPrioritiesMenu() {
 	var anchors = document.querySelectorAll('a[href]');
@@ -75,5 +123,8 @@ function ensureAppHeader() {
 }
 
 return L.Class.extend({
+	text: text,
+	textElement: textElement,
+	readNativeResult: readNativeResult,
 	ensureAppHeader: ensureAppHeader
 });

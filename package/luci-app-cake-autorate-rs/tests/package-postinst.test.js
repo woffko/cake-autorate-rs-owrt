@@ -5,6 +5,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const makefile = fs.readFileSync(path.join(__dirname, '..', 'Makefile'), 'utf8');
+assert.match(makefile, /EXTRA_DEPENDS:=cake-autorate-rs-full \(>=1\.0_rc27-r316\)/,
+	'the JSON export UI must require the daemon revision that implements its envelope');
 const daemonMakefile = fs.readFileSync(path.join(__dirname, '..', '..', 'cake-autorate-rs',
 	'Makefile'), 'utf8');
 const daemonMain = fs.readFileSync(path.join(__dirname, '..', '..', 'cake-autorate-rs', 'src',
@@ -278,7 +280,7 @@ assert.match(daemonMakefile,
 	'the Lite package must disable the default calibration feature at the Cargo boundary');
 assert.match(daemonCargo, /default = \["calibration"\]/,
 	'Full must remain the default Cargo feature set');
-assert.match(daemonCargo, /calibration = \["dep:ring", "transport-probes"\]/,
+assert.match(daemonCargo, /calibration = \["dep:ring", "dep:serde_json", "transport-probes"\]/,
 	'Full calibration must retain transport/TLS capability explicitly');
 for (const dependency of [ 'ring', 'rustls', 'socket2', 'tungstenite', 'webpki-roots' ]) {
 	assert.match(daemonCargo,

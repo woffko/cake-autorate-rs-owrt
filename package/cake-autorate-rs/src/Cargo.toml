@@ -6,7 +6,7 @@ license = "GPL-2.0-or-later"
 
 [features]
 default = ["calibration"]
-calibration = ["dep:ring", "transport-probes"]
+calibration = ["dep:ring", "dep:serde_json", "transport-probes"]
 transport-probes = [
     "dep:rustls",
     "dep:socket2",
@@ -17,6 +17,7 @@ transport-probes = [
 [dependencies]
 libc = "0.2"
 ring = { version = "0.17.14", optional = true }
+serde_json = { version = "1.0.151", optional = true }
 rustls = { version = "0.23.35", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 socket2 = { version = "0.6.4", features = ["all"], optional = true }
 tungstenite = { version = "0.29.0", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"], optional = true }

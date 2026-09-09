@@ -5,6 +5,7 @@ use std::fs;
 #[cfg(feature = "calibration")]
 use std::fs::File;
 use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
@@ -115,14 +116,40 @@ struct OwnedProcessGroupChild {
 }
 
 impl OwnedProcessGroupChild {
-    fn try_wait(&mut self) -> Result<Option<ExitStatus>, String> {
+    // Keep a terminated leader waitable until its pipes have finished. Reaping
+    // it earlier would release the PID used to identify the owned group.
+    fn exited(&mut self) -> Result<bool, String> {
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        loop {
+            if unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.child.id(),
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            } == 0
+            {
+                return Ok(unsafe { info.si_pid() } != 0);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                // An external reaper stole ownership. Never signal this number.
+                self.reaped = true;
+            }
+            return Err(format!("unable to inspect bounded command: {error}"));
+        }
+    }
+
+    fn reap(&mut self) -> Result<ExitStatus, String> {
         let status = self
             .child
-            .try_wait()
-            .map_err(|error| format!("unable to inspect bounded command: {error}"))?;
-        if status.is_some() {
-            self.reaped = true;
-        }
+            .wait()
+            .map_err(|error| format!("unable to reap bounded command: {error}"))?;
+        self.reaped = true;
         Ok(status)
     }
 
@@ -130,13 +157,7 @@ impl OwnedProcessGroupChild {
         if self.reaped {
             return Ok(());
         }
-        match self.child.try_wait() {
-            Ok(Some(_)) => {
-                self.reaped = true;
-                return Ok(());
-            }
-            Ok(None) | Err(_) => {}
-        }
+        self.exited()?;
         let group = i32::try_from(self.process_group)
             .map_err(|_| "bounded command process group is out of range".to_string())?;
         if group <= 1 {
@@ -146,10 +167,7 @@ impl OwnedProcessGroupChild {
         if !group_killed {
             let _ = self.child.kill();
         }
-        self.child
-            .wait()
-            .map_err(|error| format!("unable to reap bounded command: {error}"))?;
-        self.reaped = true;
+        self.reap()?;
         Ok(())
     }
 }
@@ -159,19 +177,7 @@ impl Drop for OwnedProcessGroupChild {
         if self.reaped {
             return;
         }
-        match self.child.try_wait() {
-            Ok(Some(_)) => {}
-            Ok(None) | Err(_) => {
-                if let Ok(group) = i32::try_from(self.process_group) {
-                    if group > 1 {
-                        let _ = unsafe { kill(-group, SIGKILL) };
-                    }
-                }
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-            }
-        }
-        self.reaped = true;
+        let _ = self.kill_and_reap();
     }
 }
 
@@ -330,6 +336,12 @@ where
     if input.is_some_and(|bytes| bytes.len() > MAX_STDIN_BYTES) {
         return Err("bounded command stdin exceeds its size limit".to_string());
     }
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| "bounded command deadline overflows".to_string())?;
+    if should_cancel() {
+        return Err("bounded-command-cancelled".to_string());
+    }
     let mut command = Command::new(&spec.program);
     command
         .args(&spec.arguments)
@@ -355,33 +367,27 @@ where
     let child = command
         .spawn()
         .map_err(|error| format!("unable to launch bounded command: {error}"))?;
-    let process_group = child.id();
     let mut child = OwnedProcessGroupChild {
+        process_group: child.id(),
         child,
-        process_group,
         reaped: false,
     };
-    let stdin_writer = if let Some(bytes) = input {
-        let mut stdin = child
-            .child
-            .stdin
-            .take()
-            .ok_or_else(|| "bounded command stdin pipe is missing".to_string())?;
-        let bytes = bytes.to_vec();
-        Some(
-            thread::Builder::new()
-                .name("cake-bounded-stdin".to_string())
-                .spawn(move || {
-                    stdin.write_all(&bytes)?;
-                    stdin.flush()
-                })
-                .map_err(|error| {
-                    format!("unable to start bounded command stdin writer: {error}")
-                })?,
-        )
-    } else {
-        None
-    };
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.child.id(), 0_u32) };
+    if pidfd < 0 {
+        return Err(format!(
+            "unable to watch bounded command: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) };
+    let mut stdin = child.child.stdin.take();
+    let input = input.unwrap_or_default();
+    if input.is_empty() {
+        stdin = None;
+    }
+    if let Some(pipe) = stdin.as_ref() {
+        set_nonblocking(pipe.as_raw_fd())?;
+    }
     let stdout = child
         .child
         .stdout
@@ -392,123 +398,183 @@ where
         .stderr
         .take()
         .ok_or_else(|| "bounded command stderr pipe is missing".to_string())?;
-    let stdout_reader = spawn_bounded_reader("cake-bounded-stdout", stdout, output_limit)?;
-    let stderr_reader = match spawn_bounded_reader("cake-bounded-stderr", stderr, output_limit) {
-        Ok(reader) => reader,
-        Err(error) => {
-            let _ = child.kill_and_reap();
-            let _ = stdout_reader.join();
-            return Err(error);
-        }
-    };
-
-    let started = Instant::now();
-    let deadline = started.checked_add(timeout).unwrap_or(started);
-    let mut status = None;
-    let mut terminal_error = None;
+    let mut stdout = BoundedPipeReader::new(stdout, output_limit)?;
+    let mut stderr = BoundedPipeReader::new(stderr, output_limit)?;
+    let mut input_offset = 0;
+    let mut stdin_error = None;
     loop {
         if should_cancel() {
-            terminal_error = Some("bounded-command-cancelled".to_string());
-            if let Err(error) = child.kill_and_reap() {
-                terminal_error = Some(error);
-            }
-            break;
-        }
-        match child.try_wait() {
-            Ok(Some(value)) => {
-                status = Some(value);
-                break;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                terminal_error = Some(error);
-                if let Err(kill_error) = child.kill_and_reap() {
-                    terminal_error = Some(kill_error);
-                }
-                break;
-            }
+            return Err("bounded-command-cancelled".to_string());
         }
         let now = Instant::now();
         if now >= deadline {
-            terminal_error = Some("bounded-command-timeout".to_string());
-            if let Err(error) = child.kill_and_reap() {
-                terminal_error = Some(error);
+            return Err("bounded-command-timeout".to_string());
+        }
+        stdout.drain_ready(output_limit)?;
+        stderr.drain_ready(output_limit)?;
+        if let Some(pipe) = stdin.as_mut() {
+            let end = input.len().min(input_offset + 64 * 1024);
+            match pipe.write(&input[input_offset..end]) {
+                Ok(0) => {
+                    stdin_error =
+                        Some("bounded command stdin closed before input completed".to_string());
+                    stdin = None;
+                }
+                Ok(count) => {
+                    input_offset += count;
+                    if input_offset == input.len() {
+                        stdin = None;
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => {
+                    stdin_error = Some(format!("unable to write bounded command stdin: {error}"));
+                    stdin = None;
+                }
             }
-            break;
         }
-        thread::sleep(WAIT_INTERVAL.min(deadline.saturating_duration_since(now)));
+        let exited = child.exited()?;
+        if exited && stdin.is_none() && stdout.pipe.is_none() && stderr.pipe.is_none() {
+            if should_cancel() {
+                return Err("bounded-command-cancelled".to_string());
+            }
+            if Instant::now() >= deadline {
+                return Err("bounded-command-timeout".to_string());
+            }
+            let status = child.reap()?;
+            if let Some(error) = stdin_error {
+                return Err(error);
+            }
+            if stdout.output.exceeded_limit || stderr.output.exceeded_limit {
+                return Err("bounded-command-output-too-large".to_string());
+            }
+            return Ok(BoundedCommandOutput {
+                status,
+                stdout: stdout.output.bytes,
+                stderr: stderr.output.bytes,
+            });
+        }
+        let mut descriptors = [
+            poll_descriptor(stdout.pipe.as_ref().map(AsRawFd::as_raw_fd), libc::POLLIN),
+            poll_descriptor(stderr.pipe.as_ref().map(AsRawFd::as_raw_fd), libc::POLLIN),
+            poll_descriptor(stdin.as_ref().map(AsRawFd::as_raw_fd), libc::POLLOUT),
+            poll_descriptor((!exited).then_some(pidfd.as_raw_fd()), libc::POLLIN),
+        ];
+        // Existing callers expose only a callback, not a notification FD.
+        // Retain their maximum cancellation-check interval; pipe/process
+        // readiness wakes immediately, and elapsed time never means success.
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .min(WAIT_INTERVAL);
+        let timeout_ms = remaining.as_millis().max(1).min(i32::MAX as u128) as i32;
+        let result = unsafe {
+            libc::poll(
+                descriptors.as_mut_ptr(),
+                descriptors.len() as libc::nfds_t,
+                timeout_ms,
+            )
+        };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(format!("unable to wait for bounded command IO: {error}"));
+            }
+        }
+        if descriptors
+            .iter()
+            .any(|descriptor| descriptor.revents & libc::POLLNVAL != 0)
+        {
+            return Err("bounded command descriptor became invalid".to_string());
+        }
     }
+}
 
-    let stdout = join_bounded_reader(stdout_reader, "stdout")?;
-    let stderr = join_bounded_reader(stderr_reader, "stderr")?;
-    let stdin_result = stdin_writer
-        .map(|writer| {
-            writer
-                .join()
-                .map_err(|_| "bounded command stdin writer panicked".to_string())?
-                .map_err(|error| format!("unable to write bounded command stdin: {error}"))
+fn set_nonblocking(fd: RawFd) -> Result<(), String> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(format!(
+            "unable to configure bounded command pipe: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+fn poll_descriptor(fd: Option<RawFd>, events: i16) -> libc::pollfd {
+    libc::pollfd {
+        fd: fd.unwrap_or(-1),
+        events,
+        revents: 0,
+    }
+}
+
+struct BoundedPipeReader<R> {
+    pipe: Option<R>,
+    output: BoundedRead,
+}
+
+impl<R: Read + AsRawFd> BoundedPipeReader<R> {
+    fn new(pipe: R, limit: usize) -> Result<Self, String> {
+        set_nonblocking(pipe.as_raw_fd())?;
+        Ok(Self {
+            pipe: Some(pipe),
+            output: BoundedRead {
+                bytes: Vec::with_capacity(limit.min(16 * 1024)),
+                exceeded_limit: false,
+            },
         })
-        .transpose();
-    if let Some(error) = terminal_error {
-        return Err(error);
     }
-    if let Err(error) = stdin_result {
-        return Err(error);
+
+    fn drain_ready(&mut self, limit: usize) -> Result<(), String> {
+        let Some(pipe) = self.pipe.as_mut() else {
+            return Ok(());
+        };
+        let mut chunk = [0; 8192];
+        // Fairness keeps an infinite writer from starving cancellation/deadline.
+        for _ in 0..8 {
+            match pipe.read(&mut chunk) {
+                Ok(0) => {
+                    self.pipe = None;
+                    break;
+                }
+                Ok(count) => self.output.retain(&chunk[..count], limit),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(format!("unable to read bounded command output: {error}"))
+                }
+            }
+        }
+        Ok(())
     }
-    if stdout.exceeded_limit || stderr.exceeded_limit {
-        return Err("bounded-command-output-too-large".to_string());
-    }
-    Ok(BoundedCommandOutput {
-        status: status.ok_or_else(|| "bounded command status is missing".to_string())?,
-        stdout: stdout.bytes,
-        stderr: stderr.bytes,
-    })
 }
 
-fn spawn_bounded_reader<R>(
-    name: &str,
-    reader: R,
-    output_limit: usize,
-) -> Result<thread::JoinHandle<io::Result<BoundedRead>>, String>
-where
-    R: Read + Send + 'static,
-{
-    thread::Builder::new()
-        .name(name.to_string())
-        .spawn(move || drain_bounded(reader, output_limit))
-        .map_err(|error| format!("unable to start bounded command reader: {error}"))
+impl BoundedRead {
+    fn retain(&mut self, chunk: &[u8], limit: usize) {
+        let retained = limit.saturating_sub(self.bytes.len()).min(chunk.len());
+        self.bytes.extend_from_slice(&chunk[..retained]);
+        self.exceeded_limit |= retained != chunk.len();
+    }
 }
 
+#[cfg(test)]
 fn drain_bounded<R: Read>(mut reader: R, output_limit: usize) -> io::Result<BoundedRead> {
-    let mut bytes = Vec::with_capacity(output_limit.min(16 * 1024));
-    let mut exceeded_limit = false;
-    let mut chunk = [0u8; 8192];
+    let mut output = BoundedRead {
+        bytes: Vec::new(),
+        exceeded_limit: false,
+    };
+    let mut chunk = [0; 8192];
     loop {
-        let read = reader.read(&mut chunk)?;
-        if read == 0 {
-            break;
+        let count = reader.read(&mut chunk)?;
+        if count == 0 {
+            return Ok(output);
         }
-        let remaining = output_limit.saturating_sub(bytes.len());
-        let retained = remaining.min(read);
-        bytes.extend_from_slice(&chunk[..retained]);
-        if retained < read {
-            exceeded_limit = true;
-        }
+        output.retain(&chunk[..count], output_limit);
     }
-    Ok(BoundedRead {
-        bytes,
-        exceeded_limit,
-    })
-}
-
-fn join_bounded_reader(
-    reader: thread::JoinHandle<io::Result<BoundedRead>>,
-    stream: &str,
-) -> Result<BoundedRead, String> {
-    reader
-        .join()
-        .map_err(|_| format!("bounded command {stream} reader panicked"))?
-        .map_err(|error| format!("unable to read bounded command {stream}: {error}"))
 }
 
 #[cfg(feature = "calibration")]
@@ -706,6 +772,38 @@ mod tests {
         let drained = drain_bounded(Cursor::new(input), 1024).unwrap();
         assert_eq!(drained.bytes.len(), 1024);
         assert!(drained.exceeded_limit);
+    }
+
+    #[test]
+    fn bounded_deadline_includes_pipe_holders_after_leader_exit() {
+        for script in [
+            "sleep 0.4 & exit 0",
+            "sleep 0.4 1>/dev/null & exit 0",
+            "setsid /bin/sleep 0.4 & exit 0",
+        ] {
+            let spec = SpawnSpec {
+                program: PathBuf::from("/bin/sh"),
+                arguments: vec!["-c".into(), script.into()],
+                environment: vec![],
+            };
+            let result =
+                run_bounded_command_output(&spec, Duration::from_millis(80), 1024, || false);
+            assert_eq!(result.unwrap_err(), "bounded-command-timeout", "{script}");
+        }
+    }
+
+    #[test]
+    fn bounded_cancellation_is_observed_after_leader_exit() {
+        let spec = SpawnSpec {
+            program: PathBuf::from("/bin/sh"),
+            arguments: vec!["-c".into(), "sleep 0.4 & exit 0".into()],
+            environment: vec![],
+        };
+        let started = Instant::now();
+        let result = run_bounded_command_output(&spec, Duration::from_secs(2), 1024, || {
+            started.elapsed() >= Duration::from_millis(80)
+        });
+        assert_eq!(result.unwrap_err(), "bounded-command-cancelled");
     }
 
     #[test]

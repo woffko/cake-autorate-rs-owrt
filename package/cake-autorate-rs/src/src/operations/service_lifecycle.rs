@@ -27,8 +27,9 @@ use super::sqm_recovery_openwrt::ManagedSqmRatePolicy;
 use super::sqm_recovery_openwrt::{
     attest_managed_sqm_after_service_action_or_offline, error_message as sqm_error_message,
     managed_sqm_rate_policy_from_options, stop_managed_sqm_after_service_action,
-    ManagedSqmAttestationSpec, ManagedSqmStopSpec,
+    ManagedSqmAttestationSpec, ManagedSqmStopSpec, NativeSqmAttestationError, OpenWrtPaths,
 };
+use super::sqm_start_events::{SqmStartEvents, StartEvents};
 #[cfg(feature = "calibration")]
 use super::traffic_classifier::run_traffic_classifier;
 use std::collections::{BTreeMap, BTreeSet};
@@ -48,6 +49,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const CAKE_PACKAGE: &str = "cake-autorate";
 const SQM_PACKAGE: &str = "sqm";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const SQM_START_ATTEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROLLER_STOP_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(feature = "calibration")]
 const CONTROLLER_START_TIMEOUT: Duration = Duration::from_secs(90);
@@ -648,7 +650,11 @@ fn prepare_start() -> Result<String, String> {
         remove_empty_clsact(&paths, interface)?;
         attest_start_configuration(&environment, &cake, &sqm, &projection, &plan)?;
     }
-    start_sqm_backend(&paths, projection.is_managed(), &plan.managed)?;
+    start_sqm_backend(&paths, projection.is_managed(), &plan.managed, || {
+        require_no_staged_uci(&paths, CAKE_PACKAGE)?;
+        require_no_staged_uci(&paths, SQM_PACKAGE)?;
+        attest_start_configuration(&environment, &cake, &sqm, &projection, &plan)
+    })?;
     attest_start_configuration(&environment, &cake, &sqm, &projection, &plan)?;
 
     #[cfg(feature = "calibration")]
@@ -1105,6 +1111,7 @@ fn start_sqm_backend(
     paths: &ServicePaths,
     managed: bool,
     specs: &[ManagedSqmAttestationSpec],
+    mut attest_configuration: impl FnMut() -> Result<(), String>,
 ) -> Result<(), String> {
     if !managed {
         return Ok(());
@@ -1112,20 +1119,31 @@ fn start_sqm_backend(
     if !executable(&paths.sqm_init) {
         return Err("managed SQM is configured but its init script is unavailable".to_string());
     }
+    let sqm_paths = OpenWrtPaths::from_environment();
+    let config_parent = sqm_paths
+        .sqm_config
+        .parent()
+        .ok_or_else(|| "SQM configuration has no parent directory".to_string())?;
+    // Subscribe before the single service action sequence. Upstream iface
+    // hotplug can independently stop/start SQM despite our global lock.
+    let mut events = SqmStartEvents::subscribe(vec![
+        sqm_paths.sqm_state_root.clone(),
+        config_parent.to_path_buf(),
+    ])?;
+    attest_configuration()?;
     let _ = command(paths, &paths.sqm_init, &["enable"], None)?;
     let restart = command(paths, &paths.sqm_init, &["restart"], None)?;
     if !restart.status.success() {
         let _ = command(paths, &paths.sqm_init, &["start"], None)?;
     }
-    for spec in specs {
-        let offline =
-            attest_managed_sqm_after_service_action_or_offline(spec).map_err(|error| {
-                format!(
-                    "managed SQM did not reach its exact start postcondition for {}: {}",
-                    spec.instance,
-                    sqm_error_message(&error)
-                )
-            })?;
+    let offline_instances = await_sqm_start(
+        &mut events,
+        Instant::now() + SQM_START_ATTEST_TIMEOUT,
+        specs,
+        attest_configuration,
+        attest_managed_sqm_after_service_action_or_offline,
+    )?;
+    for (spec, offline) in specs.iter().zip(offline_instances) {
         if offline {
             eprintln!(
                 "WARNING: managed SQM start for {} is deferred until its target interface returns",
@@ -1134,6 +1152,61 @@ fn start_sqm_backend(
         }
     }
     Ok(())
+}
+
+pub(super) fn await_sqm_start(
+    events: &mut impl StartEvents,
+    deadline: Instant,
+    specs: &[ManagedSqmAttestationSpec],
+    mut attest_configuration: impl FnMut() -> Result<(), String>,
+    mut attest_runtime: impl FnMut(
+        &ManagedSqmAttestationSpec,
+    ) -> Result<bool, NativeSqmAttestationError>,
+) -> Result<Vec<bool>, String> {
+    let mut last_error = "SQM topology kept changing during start attestation".to_string();
+    loop {
+        if Instant::now() >= deadline {
+            return Err(last_error);
+        }
+        events.drain()?;
+        attest_configuration()?;
+        let mut offline_instances = Vec::with_capacity(specs.len());
+        for spec in specs {
+            match attest_runtime(spec) {
+                Ok(offline) => offline_instances.push(offline),
+                Err(error) => {
+                    last_error = format!(
+                        "managed SQM did not reach its exact start postcondition for {}: {}",
+                        spec.instance,
+                        sqm_error_message(&error)
+                    );
+                    // No string classification and no mutation on a failed
+                    // observation. Busy/cancellation are terminal. A failed
+                    // topology observation can only be replaced by a fresh
+                    // complete exact attestation after a real event.
+                    if !matches!(error, NativeSqmAttestationError::Failed(_)) {
+                        return Err(last_error);
+                    }
+                    break;
+                }
+            }
+        }
+        // Also check after failures: a changed user configuration must abort,
+        // never be adopted as a new baseline while waiting for hotplug.
+        attest_configuration()?;
+        if Instant::now() >= deadline {
+            return Err(last_error);
+        }
+        if events.drain()? {
+            continue;
+        }
+        if offline_instances.len() == specs.len() {
+            return Ok(offline_instances);
+        }
+        if !events.wait(deadline)? {
+            return Err(last_error);
+        }
+    }
 }
 
 impl ServiceStopBackend for OpenWrtServiceStop {
@@ -1937,6 +2010,170 @@ mod tests {
     fn write_executable(path: &Path, body: &str) {
         fs::write(path, body).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    struct ScriptedStartEvents {
+        drains: std::collections::VecDeque<bool>,
+        waits: std::collections::VecDeque<bool>,
+    }
+
+    impl StartEvents for ScriptedStartEvents {
+        fn drain(&mut self) -> Result<bool, String> {
+            Ok(self.drains.pop_front().expect("unexpected event drain"))
+        }
+        fn wait(&mut self, _: Instant) -> Result<bool, String> {
+            Ok(self.waits.pop_front().expect("unexpected readiness wait"))
+        }
+    }
+
+    fn start_spec(instance: &str) -> ManagedSqmAttestationSpec {
+        ManagedSqmAttestationSpec {
+            instance: instance.to_string(),
+            sqm_section: format!("cake_{instance}"),
+            target_interface: "eth1".to_string(),
+            upload_interface: "eth1".to_string(),
+            download_interface: "ifb4eth1".to_string(),
+            direction_mode: "both".to_string(),
+            minimum_download_kbps: 20_000,
+            maximum_download_kbps: 20_000,
+            minimum_upload_kbps: 21_202,
+            maximum_upload_kbps: 21_202,
+        }
+    }
+
+    #[test]
+    fn sqm_start_hotplug_gap_requires_event_then_rechecks_every_instance() {
+        let mut events = ScriptedStartEvents {
+            drains: [false, false, true, false].into(),
+            waits: [true].into(),
+        };
+        let specs = [start_spec("first"), start_spec("second")];
+        let mut calls = Vec::new();
+        let mut checks = 0;
+        let result = await_sqm_start(
+            &mut events,
+            Instant::now() + Duration::from_secs(10),
+            &specs,
+            || {
+                checks += 1;
+                Ok(())
+            },
+            |spec| {
+                calls.push(spec.instance.clone());
+                if calls.len() == 2 {
+                    Err(NativeSqmAttestationError::Failed(
+                        "IFB counter missing in hotplug stop/start gap".into(),
+                    ))
+                } else {
+                    Ok(false)
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(result, [false, false]);
+        assert_eq!(calls, ["first", "second", "first", "second"]);
+        assert_eq!(checks, 4);
+        assert!(events.waits.is_empty());
+    }
+
+    #[test]
+    fn sqm_start_event_during_success_invalidates_the_whole_observation() {
+        let mut events = ScriptedStartEvents {
+            drains: [false, true, false, false].into(),
+            waits: [].into(),
+        };
+        let mut calls = 0;
+        let result = await_sqm_start(
+            &mut events,
+            Instant::now() + Duration::from_secs(10),
+            &[start_spec("wan")],
+            || Ok(()),
+            |_| {
+                calls += 1;
+                Ok(calls == 2)
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(result, [true]); // Only the existing strict offline proof can return true.
+    }
+
+    #[test]
+    fn sqm_start_timeout_never_accepts_foreign_or_missing_runtime() {
+        let mut events = ScriptedStartEvents {
+            drains: [false, false].into(),
+            waits: [false].into(),
+        };
+        let mut calls = 0;
+        let error = await_sqm_start(
+            &mut events,
+            Instant::now() + Duration::from_secs(10),
+            &[start_spec("wan")],
+            || Ok(()),
+            |_| {
+                calls += 1;
+                Err(NativeSqmAttestationError::Failed("foreign runtime".into()))
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("foreign runtime"));
+        assert_eq!(calls, 1); // No timer polling and no repeated service actions.
+    }
+
+    #[test]
+    fn sqm_start_configuration_change_after_failed_observation_aborts_before_wait() {
+        let mut events = ScriptedStartEvents {
+            drains: [false].into(),
+            waits: [].into(),
+        };
+        let mut checks = 0;
+        let error = await_sqm_start(
+            &mut events,
+            Instant::now() + Duration::from_secs(10),
+            &[start_spec("wan")],
+            || {
+                checks += 1;
+                if checks == 2 {
+                    Err("configuration changed".into())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {
+                Err(NativeSqmAttestationError::Failed(
+                    "state is being replaced".into(),
+                ))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "configuration changed");
+        assert_eq!(checks, 2);
+    }
+
+    #[test]
+    fn sqm_start_cancellation_and_busy_are_terminal_without_wait() {
+        for error in [
+            NativeSqmAttestationError::Terminated,
+            NativeSqmAttestationError::Busy("owner busy".into()),
+        ] {
+            let mut events = ScriptedStartEvents {
+                drains: [false].into(),
+                waits: [].into(),
+            };
+            let mut calls = 0;
+            assert!(await_sqm_start(
+                &mut events,
+                Instant::now() + Duration::from_secs(10),
+                &[start_spec("wan")],
+                || Ok(()),
+                |_| {
+                    calls += 1;
+                    Err(error.clone())
+                }
+            )
+            .is_err());
+            assert_eq!(calls, 1);
+        }
     }
 
     #[test]

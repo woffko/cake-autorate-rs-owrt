@@ -2997,6 +2997,37 @@ mod tests {
         assert!(!lock_root.join("runtime.guard").exists());
         assert!(!lock_root.join("interface-eth0.lock.guard").exists());
 
+        // Reproduce the observed boot ordering using the real strict
+        // attestor and inotify: the old state still exists while hotplug has
+        // removed the IFB counter, then hotplug restores it and writes state.
+        // The readiness loop itself must never invoke the SQM helper.
+        let mut events = super::super::sqm_start_events::SqmStartEvents::subscribe(vec![paths
+            .sqm_state_root
+            .clone()])
+        .unwrap();
+        let counter = paths.sys_class_net.join("ifb4eth0/statistics/tx_bytes");
+        fs::remove_file(&counter).unwrap();
+        let mut observations = 0;
+        let ready = super::super::service_lifecycle::await_sqm_start(
+            &mut events,
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            std::slice::from_ref(&spec),
+            || Ok(()),
+            |spec| {
+                observations += 1;
+                let observed = attest_managed_sqm_after_service_action_or_offline_with_paths(spec, &paths);
+                if observations == 1 {
+                    assert!(matches!(&observed, Err(NativeSqmAttestationError::Failed(message)) if message.contains("counter") && message.contains("missing")));
+                    fs::write(&counter, b"0\n").unwrap();
+                    fs::write(paths.sqm_state_root.join("eth0.state"), state_body).unwrap();
+                }
+                observed
+            },
+        ).unwrap();
+        assert_eq!(ready, [false]);
+        assert_eq!(observations, 2);
+        assert!(!sqm_run_log.exists());
+
         let foreign_state = b"IFACE=\"foreign\"\n";
         fs::write(paths.sqm_state_root.join("eth0.state"), foreign_state).unwrap();
         fs::set_permissions(

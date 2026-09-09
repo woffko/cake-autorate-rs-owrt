@@ -1,0 +1,3 @@
+# Display preferences are separate from controller configuration.
+# An explicit save initializes status_columns; older preferences remain readable.
+config globals 'globals'

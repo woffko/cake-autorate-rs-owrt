@@ -29,12 +29,12 @@ assert.match(source,
 	/function downloadText\([\s\S]*?window\.setTimeout\(function\(\)\s*\{[\s\S]*?URL\.revokeObjectURL\(url\);/,
 	'the only non-polling status timer is bounded browser resource cleanup');
 assert.match(source,
-	/fs\.exec\('\/usr\/sbin\/cake-autorated', \[ '--log-bundle', 'all' \]\)/,
-	'diagnostic export must use the bounded native implementation');
+	/fs\.exec_direct\('\/usr\/sbin\/cake-autorated', \[ '--log-bundle', '--json', 'all' \], 'text'\)/,
+	'diagnostic export must stream the bounded native JSON envelope outside rpcd output limits');
 assert.doesNotMatch(source, /\/usr\/libexec\/cake-autorate-rs\/log-bundle/,
 	'diagnostic export must not retain the retired shell helper');
 assert.match(source,
-	/function serviceAction\(action\)\s*\{[\s\S]*?fs\.exec\('\/etc\/init\.d\/cake-autorate', \[ action \]\)/,
+	/function serviceAction\(action, refresh\)\s*\{[\s\S]*?fs\.exec\('\/etc\/init\.d\/cake-autorate', \[ action \]\)/,
 	'service actions must use the one unified controller plus MQTT lifecycle');
 assert.doesNotMatch(source, /cake-autorate-mqtt/,
 	'the browser must not invoke a retired second MQTT init service');
@@ -47,13 +47,23 @@ const E = (tag, attrs, children) => ({ tag, attrs: attrs || {}, children: childr
 const helpers = new Function('fs', 'poll', 'uci', 'ui', 'cakeUi', 'L', 'E', '_',
 	`${prefix}\nreturn { formatQuality, formatRoute, formatState, formatServices, qualityReadiness, qualityProgressText, ` +
 		`accessMediumLabel, capacityLearningLabel, ` +
-		`statusColumnSelection, selectedStatusColumns, formatShaperRate, ` +
+		`statusColumnPreferences, statusColumnSelection, selectedStatusColumns, formatShaperRate, ` +
 		`runtimeHealthWithNativeOperations, ` +
 		`nativeRatingRoute, nativeRatingStartArgs, nativeRatingProgress, nativeRatingStatusMatchesRequest, nativeRatingWorkerRunId, nativeRatingResultValidated, ` +
 		`schedulerStatusSource, schedulerUnavailableStatus, nativeSchedulerStatusValidated, ` +
 		`nativeSchedulerBatchValidated, ` +
 		`readSchedulerStatuses, renderStatusData };`
-)({}, {}, {}, {}, {}, {}, E, value => value);
+)({}, {}, {}, {}, { text: value => value, textElement: E }, {}, E, value => value);
+
+const oldColumns = { status_columns: ['route'] };
+assert.equal(helpers.statusColumnPreferences(oldColumns, undefined), oldColumns);
+assert.equal(helpers.statusColumnPreferences(oldColumns, {}), oldColumns);
+assert.deepEqual(helpers.statusColumnSelection(helpers.statusColumnPreferences(oldColumns,
+	{ status_columns_set: '1', status_columns: '' })),
+	['instance', 'uplink', 'services', 'quality', 'rating'],
+	'an explicit reset must not resurrect legacy runtime preferences');
+assert(helpers.statusColumnSelection(helpers.statusColumnPreferences(oldColumns,
+	{ status_columns_set: '1', status_columns: 'cpu' })).includes('cpu'));
 
 const activeHealth = helpers.runtimeHealthWithNativeOperations({
 	wan_sqm: { operation_state: 'IDLE', apply_state: 'IDLE' },

@@ -29,6 +29,10 @@ var STATUS_DEFAULT_COLUMNS = STATUS_COLUMN_DEFINITIONS.filter(function(column) {
 	return column.mandatory;
 }).map(function(column) { return column.key; });
 
+function statusColumnPreferences(globalSection, uiSection) {
+	return uiSection && uiSection.status_columns_set === '1' ? uiSection : globalSection;
+}
+
 function statusColumnSelection(globalSection) {
 	var configured = globalSection && globalSection.status_columns;
 	var values = Array.isArray(configured) ? configured :
@@ -244,6 +248,8 @@ function readInstanceStatuses(sections, calibrationSummary) {
 var CALIBRATION_DAEMON = '/usr/sbin/cake-autorated';
 
 function calibrationExec(args) {
+	if ([ 'rating-result', 'speedtest-result', 'autotune-result' ].indexOf(args[0]) >= 0)
+		return cakeUi.readNativeResult([ '--calibrationctl' ].concat(args));
 	return fs.exec(CALIBRATION_DAEMON, [ '--calibrationctl' ].concat(args))
 		.then(parseExecJson);
 }
@@ -801,18 +807,51 @@ function showQualityTest(section, status, calibrationSummary) {
 }
 
 function renderVersions(versions) {
-	return E('div', { 'class': 'alert-message notice cake-package-versions' }, [
-		E('strong', {}, _('Installed versions: ')),
+	return cakeUi.textElement('div', { 'class': 'alert-message notice cake-package-versions' }, [
+		cakeUi.textElement('strong', {}, _('Installed versions: ')),
 		_('daemon %s · LuCI %s').format(
 			versions['cake-autorate-rs'] || '-',
 			versions['luci-app-cake-autorate-rs'] || '-')
 	]);
 }
 
-function serviceAction(action) {
-	return fs.exec('/etc/init.d/cake-autorate', [ action ]).then(function() {
+var pendingServiceAction = null;
+var pendingServiceActionName = null;
+
+function serviceActionError(error) {
+	var detail = String(error && error.message || error || '').trim();
+	if (!detail || /\b(password|passwd|mqtt_password|secret|token|authorization|cookie)\b/i.test(detail))
+		return _('The service command did not complete successfully.');
+	return detail.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '').slice(0, 512);
+}
+
+function serviceAction(action, refresh) {
+	if (pendingServiceAction) {
+		if (pendingServiceActionName === action)
+			return pendingServiceAction;
+		ui.addNotification(null, E('p', _('Another service action is still running. Wait for it to finish, then try again.')), 'warning');
+		return Promise.resolve(false);
+	}
+	pendingServiceActionName = action;
+	pendingServiceAction = Promise.resolve().then(function() {
+		if ([ 'start', 'stop', 'restart' ].indexOf(action) < 0)
+			throw new Error(_('Unsupported service action.'));
+		return fs.exec('/etc/init.d/cake-autorate', [ action ]);
+	}).then(function(result) {
+		if (!result || result.code !== 0)
+			throw new Error(result && result.stderr || _('The service command did not complete successfully.'));
 		ui.addNotification(null, E('p', _('Service action completed.')));
-	});
+		return Promise.resolve().then(function() {
+			return typeof refresh === 'function' ? refresh() : null;
+		}).then(function() { return true; }).catch(function() {
+			ui.addNotification(null, E('p', _('The service action completed, but its status could not be refreshed.')), 'warning');
+			return true;
+		});
+	}).catch(function(error) {
+		ui.addNotification(null, E('p', {}, cakeUi.text(_('Service action failed.') + ' ' + serviceActionError(error))), 'error');
+		return false;
+	}).finally(function() { pendingServiceAction = null; pendingServiceActionName = null; });
+	return pendingServiceAction;
 }
 
 function downloadText(filename, text) {
@@ -830,22 +869,35 @@ function downloadText(filename, text) {
 	}, 1000);
 }
 
+function parseLogBundleReply(output) {
+	var limit = 8 * 1024 * 1024;
+	// JSON escaping can require six wire bytes for one decoded control byte.
+	if (typeof output !== 'string' || !output.length || new Blob([ output ]).size > limit * 6 + 1024)
+		throw new Error(_('Diagnostic export is empty or exceeds its wire size limit.'));
+	var reply;
+	try { reply = JSON.parse(output); }
+	catch (error) { throw new Error(_('Diagnostic export is incomplete or malformed.')); }
+	if (!reply || Array.isArray(reply) || reply.schema_version !== 1 ||
+	    reply.format !== 'cake-autorate-log-bundle' || typeof reply.text !== 'string' ||
+	    !Number.isInteger(reply.byte_length) || reply.byte_length <= 0 || reply.byte_length > limit ||
+	    new Blob([ reply.text ]).size !== reply.byte_length)
+		throw new Error(_('Diagnostic export failed its format or size validation.'));
+	return reply.text;
+}
+
 function exportLogs(ev) {
 	var button = ev.currentTarget;
 
 	button.disabled = true;
 
-	return fs.exec('/usr/sbin/cake-autorated', [ '--log-bundle', 'all' ]).then(function(res) {
-		var stdout = res && res.stdout ? res.stdout : '';
+	return fs.exec_direct('/usr/sbin/cake-autorated', [ '--log-bundle', '--json', 'all' ], 'text').then(function(output) {
+		var stdout = parseLogBundleReply(output);
 		var stamp = new Date().toISOString().replace(/[:.]/g, '-');
-
-		if (!stdout)
-			throw new Error(_('Log bundle helper returned no data.'));
 
 		downloadText('cake-autorate-rs-log-bundle-' + stamp + '.txt', stdout);
 		ui.addNotification(null, E('p', _('Log bundle exported.')));
 	}).catch(function(err) {
-		ui.addNotification(null, E('p', _('Log bundle export failed: %s').format(err.message || err)), 'error');
+		ui.addNotification(null, E('p', {}, cakeUi.text(_('Log bundle export failed: %s').format(err.message || err))), 'error');
 	}).then(function() {
 		button.disabled = false;
 	});
@@ -996,10 +1048,10 @@ function renderDetectedGrade(label, result, state, collected, required, dlSample
 			classes += ' cake-quality-stale';
 	}
 
-	return E('div', { 'class': classes }, [
-		E('span', { 'class': 'cake-quality-label' }, label),
-		E('strong', {}, value),
-		E('small', {}, detail + (result && result.partial ? ' · ' + _('partial') : '') +
+	return cakeUi.textElement('div', { 'class': classes }, [
+		cakeUi.textElement('span', { 'class': 'cake-quality-label' }, label),
+		cakeUi.textElement('strong', {}, value),
+		cakeUi.textElement('small', {}, detail + (result && result.partial ? ' · ' + _('partial') : '') +
 			(result && result.incomplete ? ' · ' + _('incomplete') : '') +
 			(result && result.stale ? ' · ' + _('STALE') : ''))
 	]);
@@ -1007,11 +1059,11 @@ function renderDetectedGrade(label, result, state, collected, required, dlSample
 
 function formatQuality(status) {
 	if (!status || !status.transport_latency_enabled)
-		return E('span', { 'title': _('Transport-aware estimation is disabled.') }, '-');
+		return cakeUi.textElement('span', { 'title': _('Transport-aware estimation is disabled.') }, '-');
 
 	if (status.quality_grade_state) {
 		if (status.quality_grade_method !== QUALITY_GRADE_METHOD)
-			return E('span', { 'title': _('Rating data uses an unsupported evidence contract.') }, _('UNAVAILABLE'));
+			return cakeUi.textElement('span', { 'title': _('Rating data uses an unsupported evidence contract.') }, _('UNAVAILABLE'));
 		var current = status.quality_grade_current || null;
 		var lastKnown = status.quality_grade_last_known || null;
 		if (lastKnown && (lastKnown.partial || lastKnown.incomplete))
@@ -1061,7 +1113,7 @@ function formatQuality(status) {
 			_('Safe floors: DL %s · UL %s').format(formatRate(status.throughput_floor_dl_kbps), formatRate(status.throughput_floor_ul_kbps))
 		].join('\n');
 
-		return E('div', { 'class': 'cake-quality-stack', 'title': title }, [
+		return cakeUi.textElement('div', { 'class': 'cake-quality-stack', 'title': title }, [
 			renderDetectedGrade(_('CURRENT'), current, state,
 				status.quality_grade_collected_samples, status.quality_grade_required_samples,
 				status.quality_grade_dl_samples, status.quality_grade_ul_samples),
@@ -1086,9 +1138,9 @@ function formatQuality(status) {
 		_('Safe floors: DL %s · UL %s').format(formatRate(status.throughput_floor_dl_kbps), formatRate(status.throughput_floor_ul_kbps))
 	].join('\n');
 
-	return E('div', { 'title': title }, [
-		E('strong', { 'style': limited ? 'color:#d66' : '' }, value),
-		E('small', { 'style': 'display:block;white-space:nowrap' },
+	return cakeUi.textElement('div', { 'title': title }, [
+		cakeUi.textElement('strong', { 'style': limited ? 'color:#d66' : '' }, value),
+		cakeUi.textElement('small', { 'style': 'display:block;white-space:nowrap' },
 			limited ? _('Estimated · safety floor') :
 				(baselineReady ? _('Waiting for loaded traffic · %d%%').format(confidence) : _('Estimated · %d%%').format(confidence)))
 	]);
@@ -1203,14 +1255,14 @@ function formatState(status, enabled, sectionData, health) {
 	value = value ? String(value).toUpperCase() : (enabled ? '-' : _('DISABLED'));
 	learningMode = capacityLearningLabel(sectionData, health);
 	lines = [
-		E('strong', {}, value),
-		E('small', { 'style': 'display:block;white-space:nowrap' },
+		cakeUi.textElement('strong', {}, value),
+		cakeUi.textElement('small', { 'style': 'display:block;white-space:nowrap' },
 			_('Controller: %s').format(String(status && status.state || (enabled ? '-' : 'disabled')).toUpperCase())),
-		E('small', { 'style': 'display:block;white-space:nowrap' },
+		cakeUi.textElement('small', { 'style': 'display:block;white-space:nowrap' },
 			_('Auto-Tune: %s').format(autotuneProfile)),
-		E('small', { 'style': 'display:block;white-space:normal' },
+		cakeUi.textElement('small', { 'style': 'display:block;white-space:normal' },
 			_('Learning: %s').format(learningMode)),
-		E('small', { 'style': 'display:block;white-space:nowrap', 'title': priorityTitle || '' },
+		cakeUi.textElement('small', { 'style': 'display:block;white-space:nowrap', 'title': priorityTitle || '' },
 			_('Priorities: %s').format(priorities))
 	];
 	if (sectionData && sectionData.autotune_profile === 'variable_link') {
@@ -1222,7 +1274,7 @@ function formatState(status, enabled, sectionData, health) {
 			(sectionData.access_medium_confidence_percent || 0));
 		if (!isFinite(accessConfidence) || accessConfidence < 0 || accessConfidence > 100)
 			accessConfidence = 0;
-		lines.splice(4, 0, E('small', {
+		lines.splice(4, 0, cakeUi.textElement('small', {
 			'style': 'display:block;white-space:normal',
 			'title': _('Evidence source: %s').format(accessSource)
 		}, _('Access: %s · %d%% confidence').format(
@@ -1232,28 +1284,28 @@ function formatState(status, enabled, sectionData, health) {
 	var scheduleVisible = schedule && (schedule.enabled ||
 		(sectionData && sectionData.scheduled_autotune_enabled === '1'));
 	if (scheduleVisible && schedule.available === false) {
-		lines.push(E('small', {
+		lines.push(cakeUi.textElement('small', {
 			'style': 'display:block;color:#f66;white-space:normal',
 			'class': 'cake-schedule-error'
-		}, schedule.message || _('Scheduled Auto-Tune status is unavailable.')));
+		}, cakeUi.text(schedule.message || _('Scheduled Auto-Tune status is unavailable.'))));
 	}
 	else if (scheduleVisible && schedule.accounting_error) {
-		lines.push(E('small', {
+		lines.push(cakeUi.textElement('small', {
 			'style': 'display:block;color:#f66;white-space:normal',
 			'class': 'cake-schedule-error'
-		}, schedule.message || _('Scheduled traffic accounting is blocked until it is repaired.')));
+		}, cakeUi.text(schedule.message || _('Scheduled traffic accounting is blocked until it is repaired.'))));
 	}
 	else if (scheduleVisible && schedule.state === 'error') {
-		lines.push(E('small', {
+		lines.push(cakeUi.textElement('small', {
 			'style': 'display:block;color:#f66;white-space:normal',
 			'class': 'cake-schedule-error'
-		}, schedule.message || _('Calibration scheduler status is invalid for this instance.')));
+		}, cakeUi.text(schedule.message || _('Calibration scheduler status is invalid for this instance.'))));
 	}
 	else if (scheduleVisible && schedule.budget_authoritative === false) {
-		lines.push(E('small', {
+		lines.push(cakeUi.textElement('small', {
 			'style': 'display:block;color:#d08b20;white-space:normal',
 			'class': 'cake-schedule-initializing'
-		}, schedule.message || _('Scheduled traffic accounting is initializing.')));
+		}, cakeUi.text(schedule.message || _('Scheduled traffic accounting is initializing.'))));
 	}
 	else if (scheduleVisible) {
 		var dailyRemaining = Number(schedule.daily && schedule.daily.remaining_bytes || 0);
@@ -1264,16 +1316,16 @@ function formatState(status, enabled, sectionData, health) {
 
 		if (nextDue > 0)
 			scheduleText += ' · ' + _('due %s').format(new Date(nextDue * 1000).toLocaleString());
-		lines.push(E('small', {
+		lines.push(cakeUi.textElement('small', {
 			'style': 'display:block;white-space:normal',
 			'class': '',
 			'title': schedule.message || ''
 		}, scheduleText));
 		if (schedule.warning) {
-			lines.push(E('small', {
+			lines.push(cakeUi.textElement('small', {
 				'style': 'display:block;color:#d08b20;white-space:normal',
 				'class': 'cake-schedule-warning'
-			}, schedule.warning));
+			}, cakeUi.text(schedule.warning)));
 		}
 	}
 	if (status && status.sqm_runtime_managed && !status.sqm_runtime_healthy) {
@@ -1297,15 +1349,15 @@ function formatState(status, enabled, sectionData, health) {
 			runtimeDetail = _('Restoring managed CAKE/SQM');
 			break;
 		}
-		lines[0] = E('strong', {
+		lines[0] = cakeUi.textElement('strong', {
 			'style': pending ? 'color:#d08b20' : 'color:#f44'
 		}, runtimeLabel);
-		lines.splice(1, 0, E('small', {
+		lines.splice(1, 0, cakeUi.textElement('small', {
 			'style': pending ?
 				'display:block;color:#d08b20;white-space:normal;overflow-wrap:anywhere' :
 				'display:block;color:#f66;white-space:normal;overflow-wrap:anywhere'
 		}, runtimeDetail));
-		return E('div', {
+		return cakeUi.textElement('div', {
 			'title': status.sqm_runtime_reason || _('Managed SQM runtime is unhealthy.')
 		}, lines);
 	}
@@ -1313,12 +1365,12 @@ function formatState(status, enabled, sectionData, health) {
 	warning = probeWarning(status, enabled);
 
 	if (!warning)
-		return E('div', { 'title': status.uplink_reason || '' }, lines);
+		return cakeUi.textElement('div', { 'title': status.uplink_reason || '' }, lines);
 
-	lines.push(E('small', {
+	lines.push(cakeUi.textElement('small', {
 			'style': 'display:block;color:#b00;white-space:nowrap'
 		}, [ '⚠ ', _('No probe replies') ]));
-	return E('div', { 'title': warning }, lines);
+	return cakeUi.textElement('div', { 'title': warning }, lines);
 }
 
 function formatHealthRate(value) {
@@ -1336,9 +1388,9 @@ function formatServices(health) {
 	var overall, diagnostics, details, transient, summaryTitle;
 
 	if (!health)
-		return E('div', { 'class': 'cake-services-stack cake-services-unavailable' }, [
-			E('strong', {}, _('UNAVAILABLE')),
-			E('small', {}, _('Runtime reconciliation returned no data.'))
+		return cakeUi.textElement('div', { 'class': 'cake-services-stack cake-services-unavailable' }, [
+			cakeUi.textElement('strong', {}, _('UNAVAILABLE')),
+			cakeUi.textElement('small', {}, _('Runtime reconciliation returned no data.'))
 		]);
 
 	overall = String(health.overall_state || 'UNKNOWN').toUpperCase();
@@ -1379,65 +1431,65 @@ function formatServices(health) {
 		summaryTitle += '\n' + health.controller_reason;
 
 	details = transient ? [
-		E('span', { 'class': 'cake-services-wait-reason' },
-			health.controller_reason ||
+		cakeUi.textElement('span', { 'class': 'cake-services-wait-reason' },
+			cakeUi.text(health.controller_reason ||
 			(health.target_state === 'MISSING' ?
 				_('WAN link unavailable; automatic recovery is armed.') :
-				_('Managed SQM is settling; automatic recovery is armed.'))),
-		E('span', {}, [
+				_('Managed SQM is settling; automatic recovery is armed.')))),
+		cakeUi.textElement('span', {}, [
 			_('Autorate %s').format(health.autorate_state || '-'),
 			' · ',
 			_('SQM %s').format(health.sqm_config_state || '-')
 		]),
-		E('span', {}, _('Operation %s').format(health.operation_state || '-'))
+		cakeUi.textElement('span', {}, _('Operation %s').format(health.operation_state || '-'))
 	] : [
-		E('span', {}, [
+		cakeUi.textElement('span', {}, [
 			_('Autorate %s').format(health.autorate_state || '-'),
 			' · ',
 			_('Controller %s').format(health.controller_state || '-')
 		]),
-		E('span', {}, [
+		cakeUi.textElement('span', {}, [
 			_('SQM %s').format(health.sqm_config_state || '-'),
 			' · ',
 			_('Runtime %s').format(health.controller_status_fresh ? _('fresh') : _('stale'))
 		]),
-		E('span', {}, [
+		cakeUi.textElement('span', {}, [
 			_('UL %s %s').format(
 				health.cake_ul_state || '-', formatHealthRate(health.cake_ul_rate_kbps)),
 			' · ',
 			_('DL %s %s').format(
 				health.cake_dl_state || '-', formatHealthRate(health.cake_dl_rate_kbps))
 		]),
-		E('span', {}, [
+		cakeUi.textElement('span', {}, [
 			_('IFB %s').format(health.ifb_state || '-'),
 			' · ',
 			_('Ingress %s').format(health.ingress_state || '-')
 		]),
-		E('span', {}, [
+		cakeUi.textElement('span', {}, [
 			_('Rules %s').format(health.classifier_state || '-'),
 			' · ',
 			_('Profile %s').format(health.traffic_profile_resolved || health.classifier_profile || '-')
 		]),
-		E('span', {}, _('Operation %s').format(health.operation_state || '-'))
+		cakeUi.textElement('span', {}, _('Operation %s').format(health.operation_state || '-'))
 	];
 	if (health.issues) {
-		details.push(E('small', {
+		details.push(cakeUi.textElement('small', {
 			'class': transient ? 'cake-services-note' : 'cake-services-issue'
-		}, health.issues));
+		}, cakeUi.text(health.issues)));
 	}
-	details.push(E('details', { 'class': 'cake-services-technical' }, [
-		E('summary', {}, _('Technical details')),
-		E('div', {}, diagnostics.map(function(line) {
-			return E('small', {}, line);
+	details.push(cakeUi.textElement('details', { 'class': 'cake-services-technical' }, [
+		cakeUi.textElement('summary', {}, _('Technical details')),
+		cakeUi.textElement('div', {}, diagnostics.map(function(line) {
+			return cakeUi.textElement('small', {}, cakeUi.text(line));
 		}))
 	]));
 
-	return E('div', {
+	return cakeUi.textElement('div', {
 		'class': 'cake-services-stack cake-services-' + overall.toLowerCase().replace(/[^a-z0-9_-]/g, '-'),
 		'title': summaryTitle
 	}, [
-		E('strong', { 'class': 'cake-services-overall' }, overall),
-		E('div', { 'class': 'cake-services-details' }, details)
+		cakeUi.textElement('strong', { 'class': 'cake-services-overall' }, overall),
+		cakeUi.textElement('div', { 'class': 'cake-services-details' }, details)
 	]);
 }
 
@@ -1462,9 +1514,9 @@ function formatRoute(status) {
 		_('Reason: %s').format(status.uplink_reason || '-')
 	].join('\n');
 
-	return E('div', { 'title': title }, [
-		E('strong', {}, '%s → %s'.format(member, device)),
-		E('small', { 'style': 'display:block;white-space:nowrap' },
+	return cakeUi.textElement('div', { 'title': title }, [
+		cakeUi.textElement('strong', {}, '%s → %s'.format(member, device)),
+		cakeUi.textElement('small', { 'style': 'display:block;white-space:nowrap' },
 			_('External: %s').format(external))
 	]);
 }
@@ -1500,10 +1552,10 @@ function reflectorSummary(status) {
 		'Bad: ' + (bad.length ? bad.join(', ') : '-')
 	].join('\n');
 
-	return E('div', { 'class': 'cake-reflector-summary', 'title': title }, [
-		E('div', {}, _('Active: %s').format(previewList(active, 3))),
-		E('div', {}, _('Spare: %s').format(previewList(spare, 2))),
-		E('div', { 'class': bad.length ? 'cake-reflector-bad' : '' }, _('Bad: %s').format(previewList(bad, 2)))
+	return cakeUi.textElement('div', { 'class': 'cake-reflector-summary', 'title': title }, [
+		cakeUi.textElement('div', {}, _('Active: %s').format(previewList(active, 3))),
+		cakeUi.textElement('div', {}, _('Spare: %s').format(previewList(spare, 2))),
+		cakeUi.textElement('div', { 'class': bad.length ? 'cake-reflector-bad' : '' }, _('Bad: %s').format(previewList(bad, 2)))
 	]);
 }
 
@@ -1522,7 +1574,7 @@ function renderQualityAction(section, status, enabled, calibrationSummary) {
 			})
 		}, _('Get rating')),
 		E('small', { 'class': readiness.ready ? 'cake-quality-ready' : 'cake-quality-not-ready' },
-			readiness.ready ? _('Ready') : readiness.reason)
+			cakeUi.text(readiness.ready ? _('Ready') : readiness.reason))
 	]);
 }
 
@@ -1559,13 +1611,13 @@ function statusCell(column, sectionData, status, enabled, health, calibrationSum
 
 function renderTable(sections, statuses, selectedKeys, runtimeHealth, calibrationSummary) {
 	var columns = selectedStatusColumns(selectedKeys);
-	var children = [ E('tr', { 'class': 'tr table-titles' }, columns.map(function(column) {
-		return E('th', { 'class': 'th', 'data-column': column.key }, column.title);
+	var children = [ cakeUi.textElement('tr', { 'class': 'tr table-titles' }, columns.map(function(column) {
+		return cakeUi.textElement('th', { 'class': 'th', 'data-column': column.key }, column.title);
 	})) ];
 
 	if (!sections.length) {
-		children.push(E('tr', { 'class': 'tr' }, [
-			E('td', { 'class': 'td', 'colspan': String(columns.length) }, _('No instances configured.'))
+		children.push(cakeUi.textElement('tr', { 'class': 'tr' }, [
+			cakeUi.textElement('td', { 'class': 'td', 'colspan': String(columns.length) }, _('No instances configured.'))
 		]));
 	}
 
@@ -1573,8 +1625,8 @@ function renderTable(sections, statuses, selectedKeys, runtimeHealth, calibratio
 		var status = statuses[index] || {};
 		var enabled = String(sectionData.enabled || '0') === '1';
 		var health = runtimeHealth && runtimeHealth[sectionData['.name']] || null;
-		children.push(E('tr', { 'class': 'tr cake-status-row' }, columns.map(function(column) {
-			return E('td', {
+		children.push(cakeUi.textElement('tr', { 'class': 'tr cake-status-row' }, columns.map(function(column) {
+			return cakeUi.textElement('td', {
 				'class': 'td cake-status-cell cake-status-column-' + column.key,
 				'data-title': column.title,
 				'data-column': column.key
@@ -1582,7 +1634,7 @@ function renderTable(sections, statuses, selectedKeys, runtimeHealth, calibratio
 		})));
 	});
 
-	return E('table', {
+	return cakeUi.textElement('table', {
 		'class': 'table cake-status-table ' +
 			(columns.length === STATUS_DEFAULT_COLUMNS.length ?
 				'cake-status-table-compact' : 'cake-status-table-expanded')
@@ -1593,16 +1645,16 @@ function renderCards(sections, statuses, selectedKeys, runtimeHealth, calibratio
 	var columns = selectedStatusColumns(selectedKeys);
 
 	if (!sections.length)
-		return E('div', { 'class': 'alert-message notice' }, _('No instances configured.'));
+		return cakeUi.textElement('div', { 'class': 'alert-message notice' }, _('No instances configured.'));
 
-	return E('div', { 'class': 'cake-status-cards' }, sections.map(function(sectionData, index) {
+	return cakeUi.textElement('div', { 'class': 'cake-status-cards' }, sections.map(function(sectionData, index) {
 		var status = statuses[index] || {};
 		var enabled = String(sectionData.enabled || '0') === '1';
 		var health = runtimeHealth && runtimeHealth[sectionData['.name']] || null;
-		return E('section', { 'class': 'cake-status-card' }, columns.map(function(column) {
-			return E('div', { 'class': 'cake-status-card-field cake-status-card-' + column.key }, [
-				E('strong', { 'class': 'cake-status-card-label' }, column.title),
-				E('div', { 'class': 'cake-status-card-value' },
+		return cakeUi.textElement('section', { 'class': 'cake-status-card' }, columns.map(function(column) {
+			return cakeUi.textElement('div', { 'class': 'cake-status-card-field cake-status-card-' + column.key }, [
+				cakeUi.textElement('strong', { 'class': 'cake-status-card-label' }, column.title),
+				cakeUi.textElement('div', { 'class': 'cake-status-card-value' },
 					statusCell(column, sectionData, status, enabled, health, calibrationSummary))
 			]);
 		}));
@@ -1620,7 +1672,7 @@ function renderStatusData(sections, statuses, selectedKeys, runtimeHealth, calib
 			E('strong', {}, _('Calibration scheduler diagnostics')),
 			E('div', {}, schedulerDiagnostics.map(function(issue) {
 				return E('small', { 'style': 'display:block;white-space:normal' },
-					_('%s: %s').format(issue.instance, issue.message));
+					cakeUi.text(_('%s: %s').format(issue.instance, issue.message)));
 			}))
 		]));
 	}
@@ -1667,8 +1719,8 @@ function renderColumnChooser(globalSection, selectedKeys, onChange) {
 			details.open = false;
 			onChange(keys);
 		}).catch(function(error) {
-			ui.addNotification(null, E('p', _('Unable to save Status columns: %s').format(
-				error.message || error)), 'error');
+			ui.addNotification(null, E('p', {}, cakeUi.text(_('Unable to save Status columns: %s').format(
+				error.message || error))), 'error');
 		});
 	}
 
@@ -1693,11 +1745,17 @@ function renderColumnChooser(globalSection, selectedKeys, onChange) {
 
 return L.view.extend({
 	load: function() {
-		return uci.load('cake-autorate').then(function() {
+		uci.unload('cake-autorate-ui');
+		return Promise.all([
+			uci.load('cake-autorate'),
+			L.resolveDefault(uci.load('cake-autorate-ui'), null)
+		]).then(function() {
 			var sections = uci.sections('cake-autorate', 'cake_autorate');
 			var globalSection = uci.sections('cake-autorate', 'globals').filter(function(section) {
 				return section['.name'] === 'globals';
 			})[0] || { '.name': 'globals' };
+			globalSection = statusColumnPreferences(globalSection,
+				uci.get('cake-autorate-ui', 'globals'));
 			return Promise.all([
 				readPackageVersions(),
 				readRuntimeHealth(),
@@ -1747,7 +1805,7 @@ return L.view.extend({
 			replaceStatusData(statuses, keys);
 		});
 
-		poll.add(function() {
+		var refreshStatus = function() {
 			return Promise.all([
 				readRuntimeHealth(),
 				readCalibrationSummary()
@@ -1756,7 +1814,8 @@ return L.view.extend({
 					replaceStatusData(status.rows, null, result[0], result[1], status.diagnostics);
 				});
 			});
-		}, 5);
+		};
+		poll.add(refreshStatus, 5);
 
 		return E('div', { 'class': 'cake-status-root' }, [
 			E('style', {}, [
@@ -1815,17 +1874,17 @@ return L.view.extend({
 					E('button', {
 						'type': 'button',
 						'class': 'btn cbi-button cbi-button-action',
-						'click': ui.createHandlerFn(this, function() { return serviceAction('start'); })
+						'click': ui.createHandlerFn(this, function() { return serviceAction('start', refreshStatus); })
 					}, _('Start')),
 					E('button', {
 						'type': 'button',
 						'class': 'btn cbi-button cbi-button-action',
-						'click': ui.createHandlerFn(this, function() { return serviceAction('restart'); })
+						'click': ui.createHandlerFn(this, function() { return serviceAction('restart', refreshStatus); })
 					}, _('Restart')),
 					E('button', {
 						'type': 'button',
 						'class': 'btn cbi-button cbi-button-remove',
-						'click': ui.createHandlerFn(this, function() { return serviceAction('stop'); })
+						'click': ui.createHandlerFn(this, function() { return serviceAction('stop', refreshStatus); })
 					}, _('Stop')),
 					E('button', {
 						'type': 'button',
