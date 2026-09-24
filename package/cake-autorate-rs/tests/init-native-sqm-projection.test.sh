@@ -92,6 +92,31 @@ start_service_locked
 	exit 1
 }
 
+# Model rc.common's unconditional service submission after callback return.
+# Both variants must exit its child on deferral, but submit a genuine empty plan.
+for variant in full lite; do
+	sh "$base/scripts/render-init-variant.sh" "$variant" \
+		"$base/files/etc/init.d/cake-autorate" "$work/init-$variant"
+	for response in service-start-deferred-v1 'service-start-v2 - -'; do
+		[ "$variant" != lite ] || [ "$response" != 'service-start-v2 - -' ] || response='service-start-v1 -'
+		: >"$events"
+		CAKE_TEST_RESULT="$response" sh -c '
+			. "$1"
+			DAEMON="$2"
+			service_runtime_lock_acquire_or_exit() { :; }
+			service_runtime_lock_release_or_exit() { :; }
+			logger() { :; }
+			start_service
+			printf "%s\n" procd-submit >> "$3"
+		' sh "$work/init-$variant" "$daemon" "$events"
+		if [ "$response" = service-start-deferred-v1 ]; then
+			[ ! -s "$events" ] || { echo 'deferred start submitted empty service' >&2; exit 1; }
+		else
+			[ "$(cat "$events")" = procd-submit ] || { echo 'genuine empty start did not submit' >&2; exit 1; }
+		fi
+	done
+done
+
 for malformed in \
 	'service-start-v2 wan' \
 	'service-start-v2 bad-name -' \

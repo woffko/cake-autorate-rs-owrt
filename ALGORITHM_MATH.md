@@ -17,8 +17,11 @@ An additional optional transport RTT layer is documented in
 are observational; only the separate default-off
 `transport_controller_enabled` option permits transport evidence to influence
 CAKE. When enabled, its effective delay is the maximum of directional ICMP/OWD
-growth and confirmed native network RTT growth. Missing evidence blocks that
-optional controller's growth but never fabricates bufferbloat or cuts the rate.
+delay increase and fresh confirmed native network RTT increase. In unreleased
+R2 source, missing/stale/unconfirmed transport allows ordinary ICMP high-load
+growth but blocks optional adaptive-ceiling promotion for that direction.
+Fresh confirmed above-target transport can block ordinary high-load growth;
+it never overrides ICMP cuts. Missing evidence never fabricates bufferbloat.
 A twice-confirmed high directional transport delta uses a bounded square-root
 correction and may not cross the robust throughput floor:
 
@@ -26,6 +29,11 @@ correction and may not cross the robust throughput floor:
 factor    = clamp(sqrt(target_delay / measured_delay), 0.70, 0.97)
 candidate = max(throughput_floor, current_rate * factor)
 ```
+
+This candidate applies only while the current rate is at or above the transport
+search floor. The fast controller clamps to the configured `min_*`, not this
+optional floor. An ICMP cut invalidates the previous transport search rollback
+target; a rate already below the floor is left unchanged by transport ticks.
 
 ## Notation
 
@@ -56,7 +64,8 @@ In Multi-WAN mode, controller state is partitioned by instance and route
 identity. For uplink `u`:
 
 ```text
-I_u = (route_mode, member, L3_device, source_IP, fwmark, routing_table)
+I_u = (route_mode, member, L3_device, source_IP, fwmark, routing_table,
+       optional_fwmark_mask)
 S_u = (delay_baselines, transport_baselines, throughput_reference,
        quality_state, DL_ceiling_state, UL_ceiling_state)
 ```
@@ -69,11 +78,28 @@ S_u := initial_learning_state
 lifecycle_u := LEARNING
 ```
 
-Other `S_v`, where `v != u`, are unchanged. After the configured route
-stability interval and sufficient fresh samples, lifecycle becomes `ACTIVE` if
+Other `S_v`, where `v != u`, are unchanged. There is no `route_stability_s`
+timer. A new or explicitly recovered identity needs two consecutive matching
+successful route observations before probes are admitted. Route inspection
+runs at `route_check_interval_s` (default 2 seconds); this polling interval is
+not a separate stability hold. The lifecycle then counts
+`3 * max(no_pingers, 1)` accepted fresh replies before becoming `ACTIVE` if
 the member has a non-zero share in the default mwan3 policy, otherwise
-`STANDBY`. An unavailable or mismatched member is `OFFLINE`; its pingers are
-stopped and it cannot accumulate reflector offences or promote a ceiling.
+`STANDBY`. Reflector baseline qualification independently gates latency control;
+the lifecycle label alone does not prove that every baseline is ready.
+
+An explicitly offline or mismatched route is `OFFLINE`: probes stop and the
+affected uplink's learning is reset. An inspection error or a transient member
+state instead produces `RECHECKING`: probe admission closes, but the last
+confirmed identity and learned state are retained. Repeated inspection failures
+do not turn into evidence of an offline route. A successful observation of the
+same previously confirmed identity can resume it without cold learning.
+
+These transitions are implemented by `UplinkLifecycle::observe` and
+`record_learning_sample` in
+[routing.rs](package/cake-autorate-rs/src/src/routing.rs). Its lifecycle tests
+cover repeated identity confirmation, offline recovery, inspection errors and
+transient mwan3 states. The main loop supplies the reply threshold above.
 
 Transport confidence is intentionally staged. Twenty accepted idle network RTT
 samples contribute the first half, so the UI reports `BASELINE READY` while
@@ -155,7 +181,9 @@ L = 100 * R / C
 
 Download uses the configured RX counter and upload uses TX. Counter rollback
 is saturated at zero. All consumers share this single `(DL, UL)` observation.
-Reads less than 25 ms after the previous accepted counter sample reuse the
+The effective counter interval is
+`max(monitor_achieved_rates_interval_ms, 25 ms)`, normally 200 ms, not 25 ms.
+Reads sooner than that interval after the previous accepted counter sample reuse the
 cached rate without advancing the counters; the next accepted read includes
 the entire accumulated byte delta. This coalesces clustered reflector replies
 and prevents a tiny scheduling interval from creating a false high-load peak.
@@ -190,8 +218,22 @@ candidate_capacity   = 100 * C / O
 
 Candidate realization determines whether the measurement exercised the
 candidate strongly enough to support an inference. Capacity retention is
-compared with both the profile objective and a historical-throughput trust
+compared with both the profile objective and a same-run reference trust
 boundary.
+In native Full Auto-Tune, `O` comes from this job's directional control
+evidence. It is not a previous job's result or the configured CAKE rate.
+Consequently, this ratio alone cannot detect a whole run whose sources are
+uniformly slower than a previously verified run on the same route.
+
+New explicit Full raw jobs also have a separate cross-job guard. A private
+decision binds this job's request, worker and verified Review to an earlier
+same-route raw reference. Below 50% in either direction blocks a new manual
+Apply and scheduled Auto-Apply; it does not diagnose which server or link is at
+fault. A blocked result carries the earlier trusted reference into the next
+test instead of becoming a new low reference. Compact decisions are retained
+outside prunable job directories, within the same boot. Missing or corrupt
+mandatory decisions do not authorize Apply. This is not persistent history
+across reboot or proof of maximum capacity when no prior reference exists.
 Candidate capacity shows how far the proposed shaper
 already sits below the measured link. For example, `A/C = 92.5%` and `A/O =
 77.3%` means the test realized the candidate well, but the candidate/result
@@ -199,22 +241,40 @@ combination retained too little observed capacity. Calling both values
 "retention" loses the information needed to choose a correction.
 
 Profile-aware releases select the calibration contract before proposal
-construction. Let `L` be observed-low capacity and `H` observed-high capacity
-for one direction. The proposal tuple is:
+construction. Sort the valid raw observations for each direction. `L` is their
+minimum when there are at most three observations, otherwise P20; `M` is P50
+and `H` is P90, with linear interpolation. A direction is variable when
+`(H - L) / max(M, 1) >= 0.15`. The initial proposal tuple is:
 
 ```text
-minimum = factor_min * L
-base    = factor_base * L
-maximum = factor_max * H
-cap     = factor_cap * H
+exploration_minimum = round_100(factor_min * L)
+base                = max(round_100(L), exploration_minimum)
+maximum             = max(round_100(H), base)
+exploration_cap     = maximum
 ```
 
-| Profile | Stable factors `(min, base, max, cap)` | Variable factors `(min, base, max, cap)` |
+| Profile | Stable exploration minimum factor | Variable exploration minimum factor |
 |---|---|---|
-| Gaming | `(0.70, 0.82, 0.92, 1.02)` | `(0.70, 0.75, 1.20, 1.60)` |
-| Best overall | `(0.70, 0.88, 0.95, 1.05)` | `(0.40, 0.85, 1.25, 1.80)` |
-| Variable link | `(medium floor, 0.80, 1.00, 1.00)` | `(medium floor, 0.80, 1.00, 1.00)` |
-| Fair | `(0.35, 0.94, 0.98, 1.08)` | `(0.35, 0.92, 1.30, 1.90)` |
+| Gaming | 0.70 | 0.70 |
+| Best overall | 0.70 | 0.40 |
+| Variable link | Medium-dependent floor | Medium-dependent floor |
+| Fair | 0.35 | 0.35 |
+
+All profiles start from observed `L` with cap `H`; no fixed base/max haircut or
+multiplier above the observed raw cap is applied. `round_100` rounds to the
+nearest 100 kbit/s with the supported global bounds and a 100 kbit/s minimum.
+These statistics describe measured throughput, not independent proof that a
+server/path saturated the line's available capacity.
+The exploration minimum is not proof of an enforced runtime minimum or a
+tested-safe ceiling. Those require later shaped measurements and provenance.
+
+Explicit Gaming Extreme A+ uses deeper exploration floors: DL factors are
+0.25/0.40/0.55/0.70 for `L >= 500000 / >= 100000 / >= 25000 / below 25000`
+kbit/s; UL factors are 0.25/0.30/0.50/0.70 at thresholds 500000/100000/20000.
+This does not change the initial base/cap rule or grant unattended acceptance
+of deep cuts. The formulas are exercised by
+`r7_documented_initial_proposals_have_no_profile_haircut` and the existing
+stable-fibre/variable-cellular proposal tests in `autotune.rs`.
 
 Variable Link uses a 0.35 floor for cellular/LEO, 0.40 for GEO/fixed
 wireless, and 0.50 for shared/unknown access. Its raw p90 is the measured
@@ -245,7 +305,7 @@ The profile also fixes the validation contract:
 | Fair | 0.90 | `< 200 ms` | 5% | C (soft) |
 
 All profiles use the same 80–110% realization interval, a separate 50%
-historical-retention trust boundary, and an 85% effective-CPU warning threshold.
+same-run retention trust boundary, and an 85% effective-CPU warning threshold.
 Effective CPU is the greater of aggregate utilization and the busiest core.
 Both realization bounds are hard shaper-integrity gates; a repeated low value
 causes the search to test a lower candidate rather than accepting a CAKE rate
@@ -256,7 +316,7 @@ These target grades describe the local loaded-delay contract; they are not a
 guarantee about remote servers, Wi-Fi, ISP policy or another bottleneck.
 Gaming and Best overall require every quality gate. Fair marks its class-C
 latency gates as a quality goal while retaining measurement integrity, loss,
-route and background evidence as hard gates. The 50% historical comparison is
+route and background evidence as hard gates. The 50% same-run reference comparison is
 advisory; its 90% retention value remains the Auto-Apply throughput objective.
 
 The profile also fixes the exact CAKE class policy used by both temporary
@@ -345,7 +405,7 @@ a lower bounded candidate. In both cases the lower candidate must itself pass
 the hard realization interval before selection. If a clean controlled
 candidate misses only the profile objective,
 the observed-low upper bound is tested explicitly. A stable optimum remains
-reviewable even when `F` or the 50% historical trust boundary is not reached. Once a
+reviewable even when `F` or the 50% same-run trust boundary is not reached. Once a
 quality pass and a higher quality fail are known,
 their interval is bisected until it is no wider than `resolution` or the
 attempt budget is exhausted. Download can be frozen while upload continues,
@@ -356,7 +416,7 @@ lower retest from the worst clean achieved sample, targeting the middle of the
 allowed realization interval. For volatile evidence, all three observations
 must independently satisfy loss and quality constraints; the worst clean
 point, not the largest burst, seeds the retest. Falling below 50% after a
-controlled retest marks unusually large historical variation but does not
+controlled retest marks unusually large variation from the same-run reference but does not
 prove a cellular datapath fault:
 
 ```text
@@ -436,7 +496,7 @@ gain_ul = 100 * (U_ul / S_ul - 1)
 The disable-SQM suggestion exists only when all of these are true:
 
 ```text
-historical_trust_met = true
+same_run_reference_trust_met = true
 grade_unshaped <= grade_shaped
 delta_unshaped <= delta_shaped + 10 ms
 gain_dl >= 2%
@@ -539,7 +599,18 @@ RTT-only backends estimate both directions as half of RTT:
 D_dl = D_ul = RTT / 2
 ```
 
-Each reflector has independent directional baselines. For every valid sample:
+Each reflector has independent directional baselines. A cold or route-reset
+baseline first requires three low-load observations tied to distinct, recent
+counter timestamps. Both directions must be below the smaller of the configured
+connection-active threshold and 10% of the current shaper rate. The quiet span
+must cover at least one measured RTT and two effective probe intervals, and the
+three OWD values must fit within each direction's delay threshold. Their median
+initializes the baseline; neither a fixed 100 ms value nor the first reply does.
+Until qualification, that reflector contributes no bloat/control/grade/Auto-Tune
+sample. The daemon keeps processing status and operations and reports baseline
+readiness; loaded or stale observations cannot force qualification by timeout.
+
+After qualification, every valid sample updates the baseline:
 
 ```text
 alpha = alpha_baseline_increase  when D_i >= Q_(i-1)
@@ -559,15 +630,28 @@ At low rates, one maximum-size packet can consume a meaningful fraction of a
 delay threshold. The daemon derives maximum wire size from interface MTU and
 the live CAKE link-layer/overhead settings.
 
-For non-ATM links:
+This is an MTU-based serialization estimate, not measured total test traffic.
+Let `L = max(0, MTU_bytes + signed_overhead_bytes, MPU_bytes)`.
+The root CAKE/cake_mq framing selects:
 
 ```text
-P_bits = 8 * (MTU_bytes + overhead_bytes)
+noATM: P_bits = 8 * L
+ATM:   P_bits = 8 * 53 * ceil(L / 48)
+PTM:   P_bits = 8 * (L + ceil(L / 64))
 T_serialization_us = 1000 * P_bits / C_kbps
 ```
 
-ATM mode applies 53/48 cell rounding before the same rate conversion. The
-serialization time is added to the per-sample delay threshold and to the
+The byte rounding follows [Linux CAKE](https://github.com/torvalds/linux/blob/v6.12/net/sched/sch_cake.c).
+The parser accepts signed overhead -64..256 and MPU 0..256, as in
+[iproute2](https://github.com/iproute2/iproute2/blob/main/tc/q_cake.c), and ignores
+child qdisc framing. The cache is refreshed after accepted in-place recovery
+and each successful ordinary SQM health observation (normally every 15 seconds),
+so MTU/framing changes do not require daemon restart. This adds up to two
+read-only qdisc queries per health observation, not per latency sample; device
+performance remains a release-matrix check. Disabled external directions use
+only interface MTU and never query or mutate their queues. A failed refresh
+retains the previous estimate; startup without a readable estimate uses 1500
+bytes. The serialization time is added to the per-sample delay threshold and to the
 average-delay up/down thresholds. This prevents normal packet transmission
 time from being misclassified as bufferbloat.
 
@@ -716,14 +800,29 @@ cruise -> qualify -> probe_ramp -> probe_observe -> backoff -> cruise
   below roughly 33 Mbit/s. When the requirement is met, `S = E = P`.
   Otherwise the controller restores the previous `S`, records a
   no-throughput-gain hold, and does not poison `F`.
-- Confirmed bufferbloat records the lowest failed target and immediately
-  restores `E = S`.
+- Confirmed bufferbloat above `S` records the failed target and restores `E = S`.
+  If congestion appears at a previously learned `S > V` while the fast shaper
+  is already below `S`, that old `S` becomes a failed bound and the safe bound
+  is reduced to `max(current_shaper, V)`. Repeated bloat during `backoff` does
+  not restart its cooldown; the fast controller can continue its own cuts.
 - Loss of eligibility receives a short response-deadline grace period. If it
   persists, the probe is aborted to `S` without falsely recording `P` as bad.
 - A global probe-response gap also aborts without poisoning `F`.
 - `F` expires after `failed_bound_ttl_s`, allowing a recovered variable link
   to be explored again.
-- A stall or daemon restart resets learned bounds to verified `V`.
+- A brief stall pauses an active probe at its last safe bound. Learned bounds
+  reset to verified `V` after the effective global response timeout, a genuine
+  route-learning reset, or daemon restart.
+
+Regression anchors in
+[adaptive_ceiling.rs](package/cake-autorate-rs/src/src/adaptive_ceiling.rs)
+include `failed_probe_rolls_back_and_sets_upper_bound`,
+`latency_clean_probe_without_throughput_gain_is_not_promoted`,
+`repeated_bufferbloat_during_backoff_is_a_noop` and
+`stale_failed_bound_expires`.
+[controller_tests.rs](package/cake-autorate-rs/src/src/controller_tests.rs)
+tests the controller boundary with
+`r5_short_stall_pauses_but_sustained_gap_and_route_loss_reset_safe_bound`.
 
 ### Example
 
@@ -775,7 +874,33 @@ rows into a replacement file targeting 75% of the cap, so compaction itself
 does not load a large history into RAM. Browser reads are separately paged and
 bounded to 10,000 rows.
 
-Traffic-axis autoscaling uses observed DL/UL samples only. The safety floors are
+New history rows store counter-based traffic averages, not the last short
+rate sample seen at publication. For fresh counter observations at monotonic
+times `t0..tn`:
+
+```text
+average_kbps = 0.008 * (bytes_n - bytes_0) / (tn - t0)
+peak_kbps    = max_i(0.008 * (bytes_i - bytes_(i-1)) / (ti - t(i-1)))
+```
+
+The peak is a maximum of observed counter-interval rates, not an instantaneous
+packet-level wire peak. Repeated cached observations do not count twice. A
+counter decrease, route-learning reset or low-memory pause starts a new window;
+no complete observation interval is stored as missing, not zero. The recorded
+duration is the actual observed interval, which may differ from the configured
+publication interval after startup, a read gap or a reset. RTT, CPU and
+transport/quality fields remain snapshots and event state, not traffic averages.
+
+The first 24 CSV columns retain their positions; columns 3/4 (zero-based) now
+hold DL/UL means. The appended columns 24..27 are `avg-v1`, DL peak, UL peak and
+observed seconds. LuCI still reads older 3/5/9/24-column histories as instantaneous
+samples without inventing peaks. It identifies the metric in hover text, does
+not join old instantaneous values to new means, and keeps the existing time axes
+and bounded paging/compaction. `history_traffic` and Full/Lite controller/JS tests
+cover burst preservation, unequal sample intervals, reset/missing values and
+the actual CSV positions.
+
+Traffic-axis autoscaling includes DL/UL averages and observed peaks. The safety floors are
 excluded unless `Show safety floors` is enabled, preventing a high configured
 floor from visually flattening low ordinary traffic. The fixed scale overlays
 sit outside the horizontal scroll track. Follow-to-latest uses the browser's
@@ -783,6 +908,14 @@ actual viewport width including a stable scrollbar gutter, so the right edge is
 not left one gutter short.
 
 ## Choosing fixed SQM or autorate
+
+In Full LuCI with Manual rate limits off, writing a positive Download/Upload
+speed `C` writes `base = max = C` and `min = max(1, round(C/2))` for that
+direction. This is a configured ceiling, not a capacity measurement or a search
+starting at 75% of `C`. Explicitly enabled adaptive ceiling can still explore
+above it up to its separately configured, evidence-bound cap. With manual
+limits enabled the speed write does not replace the min/base/max tuple.
+`rate-form.test.js` exercises these form writers and half-rate semantics.
 
 - A stable fixed-capacity link normally needs CAKE/SQM but may use fixed rates;
   adaptive control adds little when available capacity does not move.

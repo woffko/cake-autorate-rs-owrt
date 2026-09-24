@@ -306,12 +306,15 @@ mod tests {
             speedtest_server_id: None,
             speedtest_topology: None,
             route: OperationRouteIdentity {
+                dns_server: None,
+                device_ifindex: None,
                 mode: OperationRouteMode::Main,
                 mwan3_member: None,
                 l3_device: interface.to_string(),
                 source_ip: None,
                 fwmark: None,
                 routing_table: None,
+                fwmark_mask: None,
             },
             target_state,
             capture_policy: (target_state == OperationTargetState::AbsentBootstrap).then_some(
@@ -329,7 +332,11 @@ mod tests {
             allow_sqm_disable: true,
             allow_active_traffic: false,
             scheduled_auto_apply_requested: false,
-            traffic_budget_bytes: 1_000_000,
+            traffic_budget: crate::operations::protocol::TrafficPolicy::Capped {
+                max_bytes: 1_000_000,
+            },
+            traffic_policy_explicit: false,
+            traffic_plan: None,
         }
     }
 

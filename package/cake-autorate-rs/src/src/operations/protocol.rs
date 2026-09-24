@@ -10,6 +10,9 @@ pub const MAX_OPERATION_RECORD_BYTES: usize = 8 * 1024;
 pub const MAX_CONTROL_MESSAGE_BYTES: usize = MAX_OPERATION_RECORD_BYTES * 2;
 const MAX_TRAFFIC_BUDGET_BYTES: u64 = 1 << 40;
 
+// Explicit traffic policy uses v7 (managed) or v8 (absent). Legacy capped
+// requests retain byte-compatible v4/v5/v6 encoding. New Full Auto-Tune
+// requests also require selected-source evidence in replay.
 // Request schema v6 binds a versioned capture policy to an absent bootstrap
 // target. Existing managed requests use v5 and the public existing-instance
 // launcher uses v4. The coordinator control/status protocol remains v2. Older
@@ -18,7 +21,86 @@ const MAX_TRAFFIC_BUDGET_BYTES: u64 = 1 << 40;
 const REQUEST_HEADER: &str = "cake-autorate-operation\t6\trequest";
 const MANAGED_REQUEST_HEADER: &str = "cake-autorate-operation\t5\trequest";
 const PUBLIC_EXISTING_REQUEST_HEADER: &str = "cake-autorate-operation\t4\trequest";
+const EXPLICIT_MANAGED_REQUEST_HEADER: &str = "cake-autorate-operation\t7\trequest";
+const EXPLICIT_BOOTSTRAP_REQUEST_HEADER: &str = "cake-autorate-operation\t8\trequest";
+const PLANNED_MANAGED_REQUEST_HEADER: &str = "cake-autorate-operation\t9\trequest";
+const PLANNED_BOOTSTRAP_REQUEST_HEADER: &str = "cake-autorate-operation\t10\trequest";
+const MASKED_MANAGED_REQUEST_HEADER: &str = "cake-autorate-operation\t11\trequest";
+const MASKED_BOOTSTRAP_REQUEST_HEADER: &str = "cake-autorate-operation\t12\trequest";
+const MASKED_PLANNED_MANAGED_REQUEST_HEADER: &str = "cake-autorate-operation\t13\trequest";
+const MASKED_PLANNED_BOOTSTRAP_REQUEST_HEADER: &str = "cake-autorate-operation\t14\trequest";
+const LINKED_MANAGED_REQUEST_HEADER: &str = "cake-autorate-operation\t15\trequest";
+const LINKED_BOOTSTRAP_REQUEST_HEADER: &str = "cake-autorate-operation\t16\trequest";
+const LINKED_PLANNED_MANAGED_REQUEST_HEADER: &str = "cake-autorate-operation\t17\trequest";
+const LINKED_PLANNED_BOOTSTRAP_REQUEST_HEADER: &str = "cake-autorate-operation\t18\trequest";
+const DNS_MANAGED_REQUEST_HEADER: &str = "cake-autorate-operation\t19\trequest";
+const DNS_BOOTSTRAP_REQUEST_HEADER: &str = "cake-autorate-operation\t20\trequest";
+const DNS_PLANNED_MANAGED_REQUEST_HEADER: &str = "cake-autorate-operation\t21\trequest";
+const DNS_PLANNED_BOOTSTRAP_REQUEST_HEADER: &str = "cake-autorate-operation\t22\trequest";
 const CONTROL_HEADER: &str = "cake-autorate-operation\t2\tcontrol";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrafficPolicy {
+    Capped { max_bytes: u64 },
+    Unlimited,
+}
+
+impl From<u64> for TrafficPolicy {
+    fn from(max_bytes: u64) -> Self {
+        Self::Capped { max_bytes }
+    }
+}
+
+impl TrafficPolicy {
+    pub fn validate(self) -> Result<(), String> {
+        if self
+            .limit_bytes()
+            .is_some_and(|limit| limit > MAX_TRAFFIC_BUDGET_BYTES)
+        {
+            return Err(format!(
+                "traffic budget must not exceed {MAX_TRAFFIC_BUDGET_BYTES} bytes"
+            ));
+        }
+        Ok(())
+    }
+    pub fn limit_bytes(self) -> Option<u64> {
+        match self {
+            Self::Capped { max_bytes } => Some(max_bytes),
+            Self::Unlimited => None,
+        }
+    }
+    pub fn is_empty(self) -> bool {
+        matches!(self, Self::Capped { max_bytes: 0 })
+    }
+    pub fn allows(self, required_bytes: u64) -> bool {
+        match self {
+            Self::Capped { max_bytes } => max_bytes >= required_bytes,
+            Self::Unlimited => true,
+        }
+    }
+    pub fn exceeded(self, consumed_bytes: u64) -> bool {
+        match self {
+            Self::Capped { max_bytes } => consumed_bytes > max_bytes,
+            Self::Unlimited => false,
+        }
+    }
+    pub fn permits(self, narrowed: Self) -> bool {
+        match narrowed.limit_bytes() {
+            Some(limit) => self.allows(limit),
+            None => self == Self::Unlimited,
+        }
+    }
+    pub fn checked_sub(self, bytes: u64) -> Option<Self> {
+        match self {
+            Self::Capped { max_bytes } => max_bytes.checked_sub(bytes).map(Self::from),
+            Self::Unlimited => Some(Self::Unlimited),
+        }
+    }
+    pub fn json_limit(self) -> String {
+        self.limit_bytes()
+            .map_or_else(|| "null".into(), |value| value.to_string())
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperationKind {
@@ -105,6 +187,7 @@ impl OperationOrigin {
 pub enum OperationRouteMode {
     Main,
     Mwan3,
+    Explicit,
 }
 
 impl OperationRouteMode {
@@ -112,6 +195,7 @@ impl OperationRouteMode {
         match self {
             Self::Main => "main",
             Self::Mwan3 => "mwan3",
+            Self::Explicit => "explicit",
         }
     }
 
@@ -119,6 +203,7 @@ impl OperationRouteMode {
         match value {
             "main" => Some(Self::Main),
             "mwan3" => Some(Self::Mwan3),
+            "explicit" => Some(Self::Explicit),
             _ => None,
         }
     }
@@ -399,12 +484,18 @@ impl ControlMessage {
         self.validate()?;
         let mut encoded = self.control.encode()?;
         if let Some(operation) = &self.operation {
-            encoded.push_str(&match operation.target_state {
-                // Keep the established public Start wire byte-compatible for
-                // every existing-instance operation. The v5 lifecycle field
-                // is private journal authority until bootstrap is complete.
-                OperationTargetState::ExistingManaged => operation.encode_for_schema(4)?,
-                OperationTargetState::AbsentBootstrap => operation.encode()?,
+            encoded.push_str(&if operation.traffic_policy_explicit
+                || operation.route.fwmark_mask.is_some()
+            {
+                operation.encode()?
+            } else {
+                match operation.target_state {
+                    // Keep the established public Start wire byte-compatible for
+                    // every existing-instance operation. The v5 lifecycle field
+                    // is private journal authority until bootstrap is complete.
+                    OperationTargetState::ExistingManaged => operation.encode_for_schema(4)?,
+                    OperationTargetState::AbsentBootstrap => operation.encode()?,
+                }
             });
         }
         if encoded.len() > MAX_CONTROL_MESSAGE_BYTES {
@@ -432,9 +523,31 @@ impl ControlMessage {
         message.validate()?;
         if let Some(operation) = &message.operation {
             let header = operation_record.lines().next().unwrap_or_default();
-            let wire_matches_target = match operation.target_state {
-                OperationTargetState::ExistingManaged => header == PUBLIC_EXISTING_REQUEST_HEADER,
-                OperationTargetState::AbsentBootstrap => header == REQUEST_HEADER,
+            let wire_matches_target = if operation.route.fwmark_mask.is_some() {
+                operation.encode()?.lines().next() == Some(header)
+            } else {
+                match (operation.traffic_policy_explicit, operation.target_state) {
+                    (false, OperationTargetState::ExistingManaged) => {
+                        header == PUBLIC_EXISTING_REQUEST_HEADER
+                    }
+                    (false, OperationTargetState::AbsentBootstrap) => header == REQUEST_HEADER,
+                    (true, OperationTargetState::ExistingManaged) => {
+                        header
+                            == if operation.traffic_plan.is_some() {
+                                PLANNED_MANAGED_REQUEST_HEADER
+                            } else {
+                                EXPLICIT_MANAGED_REQUEST_HEADER
+                            }
+                    }
+                    (true, OperationTargetState::AbsentBootstrap) => {
+                        header
+                            == if operation.traffic_plan.is_some() {
+                                PLANNED_BOOTSTRAP_REQUEST_HEADER
+                            } else {
+                                EXPLICIT_BOOTSTRAP_REQUEST_HEADER
+                            }
+                    }
+                }
             };
             if !wire_matches_target {
                 return Err(
@@ -503,18 +616,57 @@ impl OperationIdentity {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OperationRouteIdentity {
+    pub dns_server: Option<std::net::Ipv4Addr>,
+    pub device_ifindex: Option<u32>,
     pub mode: OperationRouteMode,
     pub mwan3_member: Option<String>,
     pub l3_device: String,
     pub source_ip: Option<IpAddr>,
     pub fwmark: Option<u32>,
     pub routing_table: Option<u32>,
+    pub fwmark_mask: Option<u32>,
 }
 
 impl OperationRouteIdentity {
     pub(crate) fn validate(&self) -> Result<(), String> {
+        if let Some(server) = self.dns_server {
+            crate::routing::explicit_dns_server(self.mode.as_str(), &server.to_string())?;
+        }
         require_safe_identifier("l3_device", &self.l3_device, 1, 64, b"._:@-")?;
+        if self
+            .device_ifindex
+            .is_some_and(|index| index == 0 || self.fwmark_mask.is_none())
+        {
+            return Err("route link witness requires a positive index and policy mask".into());
+        }
+        if let Some(mask) = self.fwmark_mask {
+            if self.mode == OperationRouteMode::Main
+                || mask == 0
+                || self
+                    .fwmark
+                    .is_none_or(|mark| mark == 0 || mark & !mask != 0)
+            {
+                return Err("route mask requires a nonzero contained policy mark".into());
+            }
+        }
         match (self.mode, self.mwan3_member.as_deref()) {
+            (OperationRouteMode::Explicit, None) => {
+                let source_valid = matches!(self.source_ip, Some(IpAddr::V4(source))
+                    if source.octets()[0] != 0 && !source.is_loopback() && source.octets()[0] < 224);
+                if !source_valid
+                    || self.device_ifindex.is_none()
+                    || self.fwmark_mask.is_none()
+                    || !self.routing_table.is_some_and(|table| table != 0)
+                {
+                    return Err(
+                        "explicit route requires source, link, table and masked mark authority"
+                            .into(),
+                    );
+                }
+            }
+            (OperationRouteMode::Explicit, Some(_)) => {
+                return Err("explicit route must not carry an mwan3 member".into());
+            }
             (OperationRouteMode::Main, None) => {}
             (OperationRouteMode::Mwan3, Some(member)) => {
                 require_safe_identifier("mwan3_member", member, 1, 64, b"_-")?
@@ -525,6 +677,24 @@ impl OperationRouteIdentity {
             (OperationRouteMode::Mwan3, None) => {
                 return Err("mwan3 route requires a member".to_string())
             }
+        }
+        Ok(())
+    }
+}
+
+/// User planning assumptions only; never shaping or traffic-stop authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AutotuneTrafficPlan {
+    pub download_kbps: u64,
+    pub upload_kbps: u64,
+}
+
+impl AutotuneTrafficPlan {
+    pub fn validate(self) -> Result<(), String> {
+        if !(1..=100_000_000).contains(&self.download_kbps)
+            || !(1..=100_000_000).contains(&self.upload_kbps)
+        {
+            return Err("Auto-Tune planning rates must be in 1..=100000000 kbps".into());
         }
         Ok(())
     }
@@ -555,7 +725,10 @@ pub struct OperationRequest {
     pub allow_sqm_disable: bool,
     pub allow_active_traffic: bool,
     pub scheduled_auto_apply_requested: bool,
-    pub traffic_budget_bytes: u64,
+    pub traffic_budget: TrafficPolicy,
+    /// Preserve legacy request bytes on decode; new launchers opt into v7/v8.
+    pub traffic_policy_explicit: bool,
+    pub traffic_plan: Option<AutotuneTrafficPlan>,
 }
 
 impl OperationRequest {
@@ -569,10 +742,23 @@ impl OperationRequest {
         if self.deadline_unix_ms < self.created_unix_ms {
             return Err("deadline_unix_ms must not precede creation".to_string());
         }
-        if self.traffic_budget_bytes > MAX_TRAFFIC_BUDGET_BYTES {
-            return Err(format!(
-                "traffic budget must not exceed {MAX_TRAFFIC_BUDGET_BYTES} bytes"
-            ));
+        self.traffic_budget.validate()?;
+        if let Some(plan) = self.traffic_plan {
+            plan.validate()?;
+            if !self.traffic_policy_explicit
+                || self.identity.operation != OperationKind::FullAutotune
+                || self.origin == OperationOrigin::Scheduler
+            {
+                return Err(
+                    "planning rates require an explicit non-scheduled Full Auto-Tune request"
+                        .into(),
+                );
+            }
+        }
+        if self.traffic_budget == TrafficPolicy::Unlimited
+            && (!self.traffic_policy_explicit || self.origin == OperationOrigin::Scheduler)
+        {
+            return Err("unlimited traffic requires explicit non-scheduled request policy".into());
         }
         if self.scheduled_auto_apply_requested
             && (self.origin != OperationOrigin::Scheduler
@@ -628,7 +814,7 @@ impl OperationRequest {
                 if self.profile.is_none() || self.strategy.is_none() {
                     return Err("Full Auto-Tune requires a profile and strategy".to_string());
                 }
-                if self.traffic_budget_bytes == 0 {
+                if self.traffic_budget.is_empty() {
                     return Err("Full Auto-Tune requires a non-zero traffic budget".to_string());
                 }
                 if self.access_medium.is_none()
@@ -660,7 +846,7 @@ impl OperationRequest {
                 if self.allow_sqm_disable {
                     return Err("only Full Auto-Tune may allow SQM disable".to_string());
                 }
-                if self.traffic_budget_bytes == 0 {
+                if self.traffic_budget.is_empty() {
                     return Err(
                         "generated-traffic operation requires a non-zero budget".to_string()
                     );
@@ -747,6 +933,9 @@ impl OperationRequest {
     /// from the canonical record decoder: an in-place upgrade must still be
     /// able to audit an inert, terminal request created by an older build.
     pub fn validate_admission_policy(&self) -> Result<(), String> {
+        if self.route.device_ifindex.is_some() {
+            return Err("link-qualified route execution is not available in this build".into());
+        }
         self.validate()?;
         crate::autotune::validate_capacity_learning_service_caps(
             self.capacity_learning_policy,
@@ -815,31 +1004,80 @@ impl OperationRequest {
     }
 
     pub fn encode(&self) -> Result<String, String> {
+        if self.route.fwmark_mask.is_some() {
+            let schema = match (self.target_state, self.traffic_plan.is_some()) {
+                (OperationTargetState::ExistingManaged, false) => 11,
+                (OperationTargetState::AbsentBootstrap, false) => 12,
+                (OperationTargetState::ExistingManaged, true) => 13,
+                (OperationTargetState::AbsentBootstrap, true) => 14,
+            };
+            return self.encode_for_schema(if self.route.dns_server.is_some() {
+                schema + 8
+            } else if self.route.device_ifindex.is_some() {
+                schema + 4
+            } else {
+                schema
+            });
+        }
+        if self.traffic_plan.is_some() {
+            return self.encode_for_schema(
+                if self.target_state == OperationTargetState::AbsentBootstrap {
+                    10
+                } else {
+                    9
+                },
+            );
+        }
         if self.target_state == OperationTargetState::AbsentBootstrap {
-            self.encode_for_schema(6)
+            self.encode_for_schema(if self.traffic_policy_explicit { 8 } else { 6 })
         } else {
-            self.encode_for_schema(5)
+            self.encode_for_schema(if self.traffic_policy_explicit { 7 } else { 5 })
         }
     }
 
     fn encode_for_schema(&self, schema: u8) -> Result<String, String> {
-        if !(4..=6).contains(&schema) {
+        if !(4..=22).contains(&schema) {
             return Err("unsupported operation request schema".to_string());
         }
+        let base_schema = if schema >= 19 {
+            schema - 12
+        } else if schema >= 15 {
+            schema - 8
+        } else if schema >= 11 {
+            schema - 4
+        } else {
+            schema
+        };
+        if (schema >= 15) != self.route.device_ifindex.is_some() {
+            return Err("request route link encoding downgrade or mismatch".into());
+        }
+        if (schema >= 19) != self.route.dns_server.is_some() {
+            return Err("request route DNS encoding downgrade or mismatch".into());
+        }
+        if (schema >= 11) != self.route.fwmark_mask.is_some() {
+            return Err("request route mask encoding downgrade or mismatch".into());
+        }
         self.validate()?;
-        if schema < 6 && self.target_state != OperationTargetState::ExistingManaged {
+        if (base_schema >= 9) != self.traffic_plan.is_some() {
+            return Err("request planning encoding downgrade or mismatch".into());
+        }
+        if schema < 11 && (schema >= 7) != self.traffic_policy_explicit {
+            return Err("request traffic policy encoding downgrade or mismatch".into());
+        }
+        let bootstrap_schema = matches!(base_schema, 6 | 8 | 10);
+        if !bootstrap_schema && self.target_state != OperationTargetState::ExistingManaged {
             return Err(
                 "managed operation request schema cannot represent absent bootstrap authority"
                     .to_string(),
             );
         }
-        if schema < 6 && self.capture_policy.is_some() {
+        if !bootstrap_schema && self.capture_policy.is_some() {
             return Err(
                 "managed operation request schema cannot represent capture policy authority"
                     .to_string(),
             );
         }
-        if schema == 6 && self.target_state != OperationTargetState::AbsentBootstrap {
+        if bootstrap_schema && self.target_state != OperationTargetState::AbsentBootstrap {
             return Err(
                 "operation request schema v6 is reserved for absent bootstrap authority"
                     .to_string(),
@@ -877,7 +1115,7 @@ impl OperationRequest {
         if schema >= 5 {
             fields.push(("target_state", self.target_state.as_str().to_string()));
         }
-        if schema >= 6 {
+        if bootstrap_schema {
             let capture_policy = self.capture_policy.ok_or_else(|| {
                 "operation request schema v6 requires capture policy authority".to_string()
             })?;
@@ -981,14 +1219,60 @@ impl OperationRequest {
             "scheduled_auto_apply_requested",
             bool_text(self.scheduled_auto_apply_requested).to_string(),
         ));
+        if schema >= 7 {
+            fields.push((
+                "traffic_policy",
+                match self.traffic_budget {
+                    TrafficPolicy::Capped { .. } => "capped",
+                    TrafficPolicy::Unlimited => "unlimited",
+                }
+                .to_string(),
+            ));
+        }
         fields.push((
             "traffic_budget_bytes",
-            self.traffic_budget_bytes.to_string(),
+            self.traffic_budget
+                .limit_bytes()
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
         ));
+        if let Some(plan) = self.traffic_plan {
+            fields.push(("planning_dl_kbps", plan.download_kbps.to_string()));
+            fields.push(("planning_ul_kbps", plan.upload_kbps.to_string()));
+        }
+        if let Some(mask) = self.route.fwmark_mask {
+            fields.push(("fwmark_mask", mask.to_string()));
+            fields.push((
+                "traffic_policy_explicit",
+                bool_text(self.traffic_policy_explicit).to_string(),
+            ));
+        }
+        if let Some(index) = self.route.device_ifindex {
+            fields.push(("device_ifindex", index.to_string()));
+        }
+        if let Some(server) = self.route.dns_server {
+            fields.push(("route_dns_ipv4", server.to_string()));
+        }
         let header = match schema {
             4 => PUBLIC_EXISTING_REQUEST_HEADER,
             5 => MANAGED_REQUEST_HEADER,
             6 => REQUEST_HEADER,
+            7 => EXPLICIT_MANAGED_REQUEST_HEADER,
+            8 => EXPLICIT_BOOTSTRAP_REQUEST_HEADER,
+            9 => PLANNED_MANAGED_REQUEST_HEADER,
+            10 => PLANNED_BOOTSTRAP_REQUEST_HEADER,
+            11 => MASKED_MANAGED_REQUEST_HEADER,
+            12 => MASKED_BOOTSTRAP_REQUEST_HEADER,
+            13 => MASKED_PLANNED_MANAGED_REQUEST_HEADER,
+            14 => MASKED_PLANNED_BOOTSTRAP_REQUEST_HEADER,
+            15 => LINKED_MANAGED_REQUEST_HEADER,
+            16 => LINKED_BOOTSTRAP_REQUEST_HEADER,
+            17 => LINKED_PLANNED_MANAGED_REQUEST_HEADER,
+            18 => LINKED_PLANNED_BOOTSTRAP_REQUEST_HEADER,
+            19 => DNS_MANAGED_REQUEST_HEADER,
+            20 => DNS_BOOTSTRAP_REQUEST_HEADER,
+            21 => DNS_PLANNED_MANAGED_REQUEST_HEADER,
+            22 => DNS_PLANNED_BOOTSTRAP_REQUEST_HEADER,
             _ => unreachable!(),
         };
         encode_record(header, &fields)
@@ -1004,13 +1288,54 @@ impl OperationRequest {
             Some(REQUEST_HEADER) => 6,
             Some(MANAGED_REQUEST_HEADER) => 5,
             Some(PUBLIC_EXISTING_REQUEST_HEADER) => 4,
+            Some(EXPLICIT_MANAGED_REQUEST_HEADER) => 7,
+            Some(EXPLICIT_BOOTSTRAP_REQUEST_HEADER) => 8,
+            Some(PLANNED_MANAGED_REQUEST_HEADER) => 9,
+            Some(PLANNED_BOOTSTRAP_REQUEST_HEADER) => 10,
+            Some(MASKED_MANAGED_REQUEST_HEADER) => 11,
+            Some(MASKED_BOOTSTRAP_REQUEST_HEADER) => 12,
+            Some(MASKED_PLANNED_MANAGED_REQUEST_HEADER) => 13,
+            Some(MASKED_PLANNED_BOOTSTRAP_REQUEST_HEADER) => 14,
+            Some(LINKED_MANAGED_REQUEST_HEADER) => 15,
+            Some(LINKED_BOOTSTRAP_REQUEST_HEADER) => 16,
+            Some(LINKED_PLANNED_MANAGED_REQUEST_HEADER) => 17,
+            Some(LINKED_PLANNED_BOOTSTRAP_REQUEST_HEADER) => 18,
+            Some(DNS_MANAGED_REQUEST_HEADER) => 19,
+            Some(DNS_BOOTSTRAP_REQUEST_HEADER) => 20,
+            Some(DNS_PLANNED_MANAGED_REQUEST_HEADER) => 21,
+            Some(DNS_PLANNED_BOOTSTRAP_REQUEST_HEADER) => 22,
             _ => return Err("operation record header mismatch".to_string()),
         };
         let header = match schema {
             4 => PUBLIC_EXISTING_REQUEST_HEADER,
             5 => MANAGED_REQUEST_HEADER,
             6 => REQUEST_HEADER,
+            7 => EXPLICIT_MANAGED_REQUEST_HEADER,
+            8 => EXPLICIT_BOOTSTRAP_REQUEST_HEADER,
+            9 => PLANNED_MANAGED_REQUEST_HEADER,
+            10 => PLANNED_BOOTSTRAP_REQUEST_HEADER,
+            11 => MASKED_MANAGED_REQUEST_HEADER,
+            12 => MASKED_BOOTSTRAP_REQUEST_HEADER,
+            13 => MASKED_PLANNED_MANAGED_REQUEST_HEADER,
+            14 => MASKED_PLANNED_BOOTSTRAP_REQUEST_HEADER,
+            15 => LINKED_MANAGED_REQUEST_HEADER,
+            16 => LINKED_BOOTSTRAP_REQUEST_HEADER,
+            17 => LINKED_PLANNED_MANAGED_REQUEST_HEADER,
+            18 => LINKED_PLANNED_BOOTSTRAP_REQUEST_HEADER,
+            19 => DNS_MANAGED_REQUEST_HEADER,
+            20 => DNS_BOOTSTRAP_REQUEST_HEADER,
+            21 => DNS_PLANNED_MANAGED_REQUEST_HEADER,
+            22 => DNS_PLANNED_BOOTSTRAP_REQUEST_HEADER,
             _ => unreachable!(),
+        };
+        let base_schema = if schema >= 19 {
+            schema - 12
+        } else if schema >= 15 {
+            schema - 8
+        } else if schema >= 11 {
+            schema - 4
+        } else {
+            schema
         };
         let mut reader = RecordReader::new(input, header)?;
         let job_id = reader.field("job_id")?;
@@ -1042,7 +1367,7 @@ impl OperationRequest {
         } else {
             OperationTargetState::ExistingManaged
         };
-        let capture_policy = if schema >= 6 {
+        let capture_policy = if matches!(base_schema, 6 | 8 | 10) {
             let policy = AutotuneCapturePolicyId::parse(&reader.field("capture_policy")?)
                 .ok_or_else(|| "unsupported Auto-Tune capture policy".to_string())?;
             let digest = reader.field("capture_policy_sha256")?;
@@ -1109,10 +1434,60 @@ impl OperationRequest {
         let allow_active_traffic = parse_bool(&reader.field("allow_active_traffic")?)?;
         let scheduled_auto_apply_requested =
             parse_bool(&reader.field("scheduled_auto_apply_requested")?)?;
-        let traffic_budget_bytes = parse_u64(
-            "traffic_budget_bytes",
-            &reader.field("traffic_budget_bytes")?,
-        )?;
+        let traffic_policy = if schema >= 7 {
+            reader.field("traffic_policy")?
+        } else {
+            "capped".into()
+        };
+        let budget_value = reader.field("traffic_budget_bytes")?;
+        let traffic_budget = match traffic_policy.as_str() {
+            "capped" => TrafficPolicy::from(parse_u64("traffic_budget_bytes", &budget_value)?),
+            "unlimited" if budget_value.is_empty() => TrafficPolicy::Unlimited,
+            _ => return Err("invalid explicit traffic policy or conflicting byte limit".into()),
+        };
+        let traffic_plan = if base_schema >= 9 {
+            Some(AutotuneTrafficPlan {
+                download_kbps: parse_u64("planning_dl_kbps", &reader.field("planning_dl_kbps")?)?,
+                upload_kbps: parse_u64("planning_ul_kbps", &reader.field("planning_ul_kbps")?)?,
+            })
+        } else {
+            None
+        };
+        let fwmark_mask = if schema >= 11 {
+            Some(
+                reader
+                    .field("fwmark_mask")?
+                    .parse::<u32>()
+                    .map_err(|_| "invalid route mark mask")?,
+            )
+        } else {
+            None
+        };
+        let traffic_policy_explicit = if schema >= 11 {
+            parse_bool(&reader.field("traffic_policy_explicit")?)?
+        } else {
+            schema >= 7
+        };
+        let device_ifindex = if schema >= 15 {
+            Some(
+                reader
+                    .field("device_ifindex")?
+                    .parse::<u32>()
+                    .map_err(|_| "invalid route link index")?,
+            )
+        } else {
+            None
+        };
+        let dns_server = if schema >= 19 {
+            Some(
+                reader
+                    .field("route_dns_ipv4")?
+                    .parse::<std::net::Ipv4Addr>()
+                    .map_err(|_| "invalid route DNS server")?,
+            )
+        } else {
+            None
+        };
         reader.finish()?;
         let request = Self {
             identity: OperationIdentity {
@@ -1133,12 +1508,15 @@ impl OperationRequest {
             speedtest_server_id,
             speedtest_topology,
             route: OperationRouteIdentity {
+                dns_server,
+                device_ifindex,
                 mode,
                 mwan3_member,
                 l3_device,
                 source_ip,
                 fwmark,
                 routing_table,
+                fwmark_mask,
             },
             target_state,
             capture_policy,
@@ -1154,7 +1532,9 @@ impl OperationRequest {
             allow_sqm_disable,
             allow_active_traffic,
             scheduled_auto_apply_requested,
-            traffic_budget_bytes,
+            traffic_budget,
+            traffic_policy_explicit,
+            traffic_plan,
         };
         request.validate()?;
         if request.encode_for_schema(schema)? != input {
@@ -1369,6 +1749,139 @@ fn parse_optional_enum<T>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn r6_dns_wire_roundtrip_preserves_old_versions_and_refuses_downgrade() {
+        for absent in [false, true] {
+            for planned in [false, true] {
+                let mut value = request();
+                value.route.mode = OperationRouteMode::Explicit;
+                value.route.mwan3_member = None;
+                value.route.fwmark_mask = Some(0x3f00);
+                value.route.device_ifindex = Some(42);
+                value.traffic_policy_explicit = true;
+                if absent {
+                    value.target_state = OperationTargetState::AbsentBootstrap;
+                    value.capture_policy = Some(AutotuneCapturePolicyId::StandardV1);
+                }
+                if planned {
+                    value.traffic_plan = Some(AutotuneTrafficPlan {
+                        download_kbps: 100000,
+                        upload_kbps: 20000,
+                    });
+                }
+                let old = value.encode().unwrap();
+                assert_eq!(OperationRequest::decode(&old).unwrap(), value);
+                value.route.dns_server = Some("192.0.2.53".parse().unwrap());
+                let encoded = value.encode().unwrap();
+                let schema = 19 + u8::from(absent) + 2 * u8::from(planned);
+                assert!(
+                    encoded.starts_with(&format!("cake-autorate-operation\t{schema}\trequest\n"))
+                );
+                assert_eq!(OperationRequest::decode(&encoded).unwrap(), value);
+                for old_schema in 4..=18 {
+                    assert!(value.encode_for_test_schema(old_schema).is_err());
+                }
+                assert!(value.validate_admission_policy().is_err());
+                for field in [
+                    "",
+                    "route_dns_ipv4=127.0.0.1\n",
+                    "route_dns_ipv4=::1\n",
+                    "route_dns_ipv4=192.0.2.053\n",
+                    "route_dns_ipv4=192.0.2.53\nroute_dns_ipv4=192.0.2.54\n",
+                ] {
+                    assert!(OperationRequest::decode(
+                        &encoded.replace("route_dns_ipv4=192.0.2.53\n", field)
+                    )
+                    .is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn r6_explicit_route_wire_requires_complete_independent_authority() {
+        let mut value = request();
+        value.route.mode = OperationRouteMode::Explicit;
+        value.route.mwan3_member = None;
+        value.route.fwmark_mask = Some(0x3f00);
+        value.route.device_ifindex = Some(42);
+        let encoded = value.encode().unwrap();
+        assert_eq!(OperationRequest::decode(&encoded).unwrap(), value);
+        assert!(value.validate_admission_policy().is_err());
+        for mutation in 0..8 {
+            let mut invalid = value.clone();
+            match mutation {
+                0 => invalid.route.mwan3_member = Some("wan".into()),
+                1 => invalid.route.source_ip = None,
+                2 => invalid.route.source_ip = Some("::1".parse().unwrap()),
+                3 => invalid.route.device_ifindex = None,
+                4 => invalid.route.routing_table = Some(0),
+                5 => invalid.route.fwmark_mask = None,
+                6 => invalid.route.fwmark = Some(0),
+                _ => invalid.route.source_ip = Some("127.0.0.1".parse().unwrap()),
+            }
+            assert!(invalid.encode().is_err(), "mutation {mutation}");
+        }
+        assert!(value.encode_for_test_schema(11).is_err());
+    }
+
+    #[test]
+    fn r6_linked_route_wire_roundtrip_never_downgrades_or_grants_execution() {
+        for absent in [false, true] {
+            for planned in [false, true] {
+                for explicit_consent in [false, true] {
+                    let mut value = request();
+                    value.route.fwmark_mask = Some(0x3f00);
+                    value.traffic_policy_explicit = explicit_consent;
+                    if absent {
+                        value.target_state = OperationTargetState::AbsentBootstrap;
+                        value.capture_policy = Some(AutotuneCapturePolicyId::StandardV1);
+                    }
+                    if planned {
+                        value.traffic_plan = Some(AutotuneTrafficPlan {
+                            download_kbps: 100_000,
+                            upload_kbps: 20_000,
+                        });
+                    }
+                    if planned && !explicit_consent {
+                        assert!(value.encode().is_err());
+                        value.route.device_ifindex = Some(42);
+                        assert!(value.encode().is_err());
+                        continue;
+                    }
+                    let legacy = value.encode().unwrap();
+                    value.route.device_ifindex = Some(42);
+                    let encoded = value.encode().unwrap();
+                    let schema = 15 + u8::from(absent) + 2 * u8::from(planned);
+                    assert!(encoded
+                        .starts_with(&format!("cake-autorate-operation\t{schema}\trequest\n")));
+                    assert_eq!(OperationRequest::decode(&encoded).unwrap(), value);
+                    assert!(value.validate_admission_policy().is_err());
+                    for old_schema in 4..=14 {
+                        assert!(value.encode_for_test_schema(old_schema).is_err());
+                    }
+                    for field in [
+                        "",
+                        "device_ifindex=0\n",
+                        "device_ifindex=-1\n",
+                        "device_ifindex=4294967296\n",
+                        "device_ifindex=042\n",
+                        "device_ifindex=42\ndevice_ifindex=43\n",
+                    ] {
+                        assert!(OperationRequest::decode(
+                            &encoded.replace("device_ifindex=42\n", field)
+                        )
+                        .is_err());
+                    }
+                    value.route.device_ifindex = Some(43);
+                    assert_ne!(value.encode().unwrap(), encoded);
+                    value.route.device_ifindex = None;
+                    assert_eq!(value.encode().unwrap(), legacy);
+                }
+            }
+        }
+    }
+
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -1396,12 +1909,15 @@ mod tests {
             speedtest_server_id: None,
             speedtest_topology: None,
             route: OperationRouteIdentity {
+                dns_server: None,
+                device_ifindex: None,
                 mode: OperationRouteMode::Mwan3,
                 mwan3_member: Some("wan".to_string()),
                 l3_device: "pppoe-wan".to_string(),
                 source_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))),
                 fwmark: Some(256),
                 routing_table: Some(1001),
+                fwmark_mask: None,
             },
             target_state: OperationTargetState::ExistingManaged,
             capture_policy: None,
@@ -1417,7 +1933,214 @@ mod tests {
             allow_sqm_disable: true,
             allow_active_traffic: false,
             scheduled_auto_apply_requested: false,
-            traffic_budget_bytes: 4_294_967_296,
+            traffic_budget: crate::operations::protocol::TrafficPolicy::Capped {
+                max_bytes: 4_294_967_296,
+            },
+            traffic_policy_explicit: false,
+            traffic_plan: None,
+        }
+    }
+
+    #[test]
+    fn r6_masked_route_wire_roundtrip_and_downgrade_refusal() {
+        for absent in [false, true] {
+            for planned in [false, true] {
+                let mut value = request();
+                value.traffic_policy_explicit = true;
+                if absent {
+                    value.target_state = OperationTargetState::AbsentBootstrap;
+                    value.capture_policy = Some(AutotuneCapturePolicyId::StandardV1);
+                }
+                if planned {
+                    value.traffic_plan = Some(AutotuneTrafficPlan {
+                        download_kbps: 100_000,
+                        upload_kbps: 20_000,
+                    });
+                }
+                let legacy = value.encode().unwrap();
+                let legacy_schema = match (absent, planned) {
+                    (false, false) => 7,
+                    (true, false) => 8,
+                    (false, true) => 9,
+                    (true, true) => 10,
+                };
+                value.route.fwmark_mask = Some(0x3f00);
+                let encoded = value.encode().unwrap();
+                assert!(encoded.starts_with(&format!(
+                    "cake-autorate-operation\t{}\trequest\n",
+                    legacy_schema + 4
+                )));
+                assert_eq!(OperationRequest::decode(&encoded).unwrap(), value);
+                assert!(value.encode_for_test_schema(legacy_schema).is_err());
+                assert!(
+                    OperationRequest::decode(&encoded.replace("fwmark_mask=16128\n", "")).is_err()
+                );
+                assert!(OperationRequest::decode(
+                    &encoded.replace("fwmark_mask=16128", "fwmark_mask=0")
+                )
+                .is_err());
+                value.route.fwmark_mask = Some(0xff00);
+                assert_ne!(value.encode().unwrap(), encoded);
+                value.route.fwmark_mask = None;
+                assert_eq!(value.encode().unwrap(), legacy);
+                assert_eq!(
+                    OperationRequest::decode(&legacy).unwrap().route.fwmark_mask,
+                    None
+                );
+            }
+        }
+        let mut value = request();
+        value.route.fwmark_mask = Some(0x3f00);
+        let encoded = value.encode().unwrap();
+        let decoded = OperationRequest::decode(&encoded).unwrap();
+        assert_eq!(decoded, value);
+        assert!(!decoded.traffic_policy_explicit);
+        for absent in [false, true] {
+            let mut masked = value.clone();
+            if absent {
+                masked.target_state = OperationTargetState::AbsentBootstrap;
+                masked.capture_policy = Some(AutotuneCapturePolicyId::StandardV1);
+            }
+            let message = ControlMessage {
+                control: ControlRequest {
+                    request_id: "99".repeat(16),
+                    command: ControlCommand::Start,
+                    job_id: Some(masked.identity.job_id.clone()),
+                    job_token: Some(masked.identity.job_token.clone()),
+                },
+                operation: Some(masked),
+            };
+            assert_eq!(
+                ControlMessage::decode(&message.encode().unwrap()).unwrap(),
+                message
+            );
+        }
+        assert!(
+            OperationRequest::decode(&encoded.replace("traffic_policy_explicit=0\n", "")).is_err()
+        );
+        value.traffic_budget = TrafficPolicy::Unlimited;
+        assert!(
+            value.encode().is_err(),
+            "mask must not grant unlimited traffic"
+        );
+        value.traffic_budget = 1024_u64.into();
+        value.traffic_policy_explicit = true;
+        value.route.fwmark_mask = Some(1);
+        assert!(value.encode().is_err(), "mark outside mask");
+    }
+
+    #[test]
+    fn t2_planning_request_roundtrip_preserves_legacy_and_binds_pair() {
+        for absent in [false, true] {
+            let mut value = request();
+            value.traffic_policy_explicit = true;
+            if absent {
+                value.target_state = OperationTargetState::AbsentBootstrap;
+                value.capture_policy = Some(AutotuneCapturePolicyId::StandardV1);
+            }
+            let legacy = value.encode().unwrap();
+            value.traffic_plan = Some(AutotuneTrafficPlan {
+                download_kbps: 1_000_000,
+                upload_kbps: 100_000,
+            });
+            let encoded = value.encode().unwrap();
+            assert!(encoded.starts_with(if absent {
+                PLANNED_BOOTSTRAP_REQUEST_HEADER
+            } else {
+                PLANNED_MANAGED_REQUEST_HEADER
+            }));
+            assert_eq!(OperationRequest::decode(&encoded).unwrap(), value);
+            assert!(value.encode_for_schema(if absent { 8 } else { 7 }).is_err());
+            assert!(
+                OperationRequest::decode(&encoded.replace("planning_ul_kbps=100000\n", ""))
+                    .is_err()
+            );
+            assert!(OperationRequest::decode(
+                &encoded.replace("planning_dl_kbps=1000000", "planning_dl_kbps=0")
+            )
+            .is_err());
+            let message = ControlMessage {
+                control: ControlRequest {
+                    request_id: "99".repeat(16),
+                    command: ControlCommand::Start,
+                    job_id: Some(value.identity.job_id.clone()),
+                    job_token: Some(value.identity.job_token.clone()),
+                },
+                operation: Some(value.clone()),
+            };
+            assert_eq!(
+                ControlMessage::decode(&message.encode().unwrap()).unwrap(),
+                message
+            );
+            value.traffic_plan.as_mut().unwrap().download_kbps += 1;
+            assert_ne!(value.encode().unwrap(), encoded);
+            value.traffic_plan = None;
+            assert_eq!(value.encode().unwrap(), legacy);
+        }
+    }
+
+    #[test]
+    fn t2_explicit_capped_and_unlimited_requests_roundtrip_without_legacy_downgrade() {
+        for absent in [false, true] {
+            let mut legacy = request();
+            if absent {
+                legacy.target_state = OperationTargetState::AbsentBootstrap;
+                legacy.capture_policy = Some(AutotuneCapturePolicyId::StandardV1);
+            }
+            let old_bytes = legacy.encode().unwrap();
+            assert_eq!(
+                OperationRequest::decode(&old_bytes)
+                    .unwrap()
+                    .encode()
+                    .unwrap(),
+                old_bytes
+            );
+            for policy in [
+                TrafficPolicy::Capped {
+                    max_bytes: 32_000_000_000,
+                },
+                TrafficPolicy::Unlimited,
+            ] {
+                let mut explicit = legacy.clone();
+                explicit.traffic_budget = policy;
+                explicit.traffic_policy_explicit = true;
+                let encoded = explicit.encode().unwrap();
+                assert!(encoded.starts_with(if absent {
+                    EXPLICIT_BOOTSTRAP_REQUEST_HEADER
+                } else {
+                    EXPLICIT_MANAGED_REQUEST_HEADER
+                }));
+                assert_eq!(OperationRequest::decode(&encoded).unwrap(), explicit);
+                assert!(explicit
+                    .encode_for_schema(if absent { 6 } else { 5 })
+                    .is_err());
+                let message = ControlMessage {
+                    control: ControlRequest {
+                        request_id: "99".repeat(16),
+                        command: ControlCommand::Start,
+                        job_id: Some(explicit.identity.job_id.clone()),
+                        job_token: Some(explicit.identity.job_token.clone()),
+                    },
+                    operation: Some(explicit.clone()),
+                };
+                assert_eq!(
+                    ControlMessage::decode(&message.encode().unwrap()).unwrap(),
+                    message
+                );
+                if policy == TrafficPolicy::Unlimited {
+                    assert!(encoded.contains("traffic_policy=unlimited\ntraffic_budget_bytes=\n"));
+                    assert!(!encoded.contains(&u64::MAX.to_string()));
+                    assert!(OperationRequest::decode(
+                        &encoded.replace("traffic_budget_bytes=\n", "traffic_budget_bytes=1\n")
+                    )
+                    .is_err());
+                    explicit.origin = OperationOrigin::Scheduler;
+                    assert!(explicit.validate().is_err());
+                    explicit.origin = OperationOrigin::Luci;
+                    explicit.traffic_policy_explicit = false;
+                    assert!(explicit.validate().is_err());
+                }
+            }
         }
     }
 
@@ -1811,7 +2534,7 @@ mod tests {
         assert!(value.validate().is_err());
 
         let mut value = request();
-        value.traffic_budget_bytes = MAX_TRAFFIC_BUDGET_BYTES + 1;
+        value.traffic_budget = (MAX_TRAFFIC_BUDGET_BYTES + 1).into();
         assert!(value.validate().is_err());
     }
 

@@ -6,6 +6,7 @@
 
 use super::runtime_health::{safe_interface, safe_name, UciPackage, UciSection};
 use super::service_config::{InterfaceResolver, OpenWrtEnvironment};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -56,6 +57,35 @@ pub(crate) struct SqmProjectionPlan {
 }
 
 impl SqmProjectionPlan {
+    /// Typed edits for isolated materialization; no package names or commits.
+    pub(crate) fn edits(&self) -> Vec<super::uci_edits::Edit> {
+        use super::uci_edits::Edit;
+        self.actions
+            .iter()
+            .map(|action| match action {
+                SqmAction::AddSection { section } => Edit::AddSection {
+                    section: section.clone(),
+                    kind: "queue".into(),
+                },
+                SqmAction::DeleteSection { section } => Edit::DeleteSection {
+                    section: section.clone(),
+                },
+                SqmAction::Set {
+                    section,
+                    option,
+                    value,
+                } => Edit::Set {
+                    section: section.clone(),
+                    option: option.clone(),
+                    value: value.clone(),
+                },
+                SqmAction::Delete { section, option } => Edit::Delete {
+                    section: section.clone(),
+                    option: option.clone(),
+                },
+            })
+            .collect()
+    }
     pub(crate) fn is_managed(&self) -> bool {
         self.managed
     }
@@ -122,6 +152,14 @@ pub(crate) fn apply_sqm_projection(scope: ProjectionScope) -> Result<SqmProjecti
     let cake = environment.read_package(CAKE_PACKAGE)?;
     let mut sqm = environment.read_package(SQM_PACKAGE)?;
     let sqm_original = sqm.clone();
+    prepare_mq_capabilities(
+        &cake,
+        &sqm,
+        &environment,
+        &scope,
+        false,
+        crate::qdisc_capabilities::ensure,
+    )?;
     let plan = plan_projection(&cake, &mut sqm, &environment, &scope)?;
     let cake_attested = environment.read_package(CAKE_PACKAGE)?;
     let sqm_attested = environment.read_package(SQM_PACKAGE)?;
@@ -154,7 +192,59 @@ fn parse_scope(value: &str) -> Result<ProjectionScope, String> {
     }
 }
 
+/// Preflight every scoped owner/option before an authorized mutating operation
+/// refreshes boot-bound MQ facts. No existing queue/configuration is changed.
+/// The provisional planner result is discarded, never used as an admitted plan.
+/// Dry-run, status, candidate admission and runtime attestation do not call this.
+pub(crate) fn prepare_mq_capabilities(
+    cake: &UciPackage,
+    sqm: &UciPackage,
+    resolver: &impl InterfaceResolver,
+    scope: &ProjectionScope,
+    require_exact_projection: bool,
+    mut ensure: impl FnMut(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    struct Requests<'a, R> {
+        resolver: &'a R,
+        scripts: RefCell<BTreeSet<String>>,
+    }
+    impl<R: InterfaceResolver> InterfaceResolver for Requests<'_, R> {
+        fn resolve(&self, name: &str) -> Result<String, String> {
+            self.resolver.resolve(name)
+        }
+        fn supports_cake_mq(&self, script: &str) -> Result<bool, String> {
+            self.scripts.borrow_mut().insert(script.into());
+            Ok(true)
+        }
+    }
+    let requests = Requests {
+        resolver,
+        scripts: RefCell::new(BTreeSet::new()),
+    };
+    let mut provisional = sqm.clone();
+    plan_projection(cake, &mut provisional, &requests, scope)?;
+    if require_exact_projection && provisional != *sqm {
+        return Err("native Apply selected lifecycle found a pending SQM projection".into());
+    }
+    for script in requests.scripts.into_inner() {
+        ensure(&script)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn plan_projection(
+    cake: &UciPackage,
+    sqm: &mut UciPackage,
+    resolver: &impl InterfaceResolver,
+    scope: &ProjectionScope,
+) -> Result<SqmProjectionPlan, String> {
+    let mut candidate = sqm.clone();
+    let result = plan_projection_inner(cake, &mut candidate, resolver, scope)?;
+    *sqm = candidate;
+    Ok(result)
+}
+
+fn plan_projection_inner(
     cake: &UciPackage,
     sqm: &mut UciPackage,
     resolver: &impl InterfaceResolver,
@@ -272,6 +362,15 @@ fn project_instance(
         return Ok(());
     }
 
+    if sqm
+        .sections
+        .get(&sqm_section)
+        .and_then(|section| section.options.get("_cake_autorate_managed"))
+        .is_some_and(|owner| !owner.is_empty() && owner != instance)
+    {
+        return Err("requested SQM section belongs to another CAKE Autorate instance".into());
+    }
+
     cleanup_stale(sqm, plan, instance, Some(&sqm_section))?;
     ensure_queue(sqm, plan, &sqm_section)?;
     set_option(sqm, plan, &sqm_section, "_cake_autorate_managed", instance)?;
@@ -292,11 +391,24 @@ fn project_instance(
         plan.managed = true;
         return Ok(());
     }
+    let raw_options = section
+        .options
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let retained_mq = sqm
+        .sections
+        .get(&sqm_section)
+        .and_then(|section| section.options.get("use_mq"))
+        .map(String::as_str);
+    let cake_intent = crate::sqm_config::validate(&raw_options, retained_mq, |script| {
+        resolver.supports_cake_mq(script)
+    })?;
     plan.interfaces.insert(target.clone());
     if direction != "upload_only" {
         plan.ingress_interfaces.insert(target.clone());
     }
-    disable_unmanaged_conflicts(sqm, resolver, cache, plan, &sqm_section, &target)?;
+    reject_unmanaged_conflicts(sqm, resolver, cache, &sqm_section, &target)?;
 
     let download = first_nonempty(section, &["sqm_download", "base_dl_shaper_rate_kbps"])
         .ok_or_else(|| format!("instance {instance} has no download rate"))?;
@@ -333,6 +445,24 @@ fn project_instance(
             .unwrap_or(default);
         set_option(sqm, plan, &sqm_section, target, value)?;
     }
+    // SQM's root-CAKE scripts require QDISC=cake and select cake_mq themselves
+    // via USE_MQ on eligible interfaces. Passing cake-mq is not that contract.
+    set_option(sqm, plan, &sqm_section, "qdisc", "cake")?;
+    // SQM defaults USE_MQ to0. Preserve an absent default when neither side
+    // has explicit MQ intent; adding a redundant key would otherwise turn a
+    // healthy exact pre-upgrade projection into a pending native Apply change.
+    if cake_intent.use_mq
+        || section.options.contains_key("sqm_use_mq")
+        || sqm.sections[&sqm_section].options.contains_key("use_mq")
+    {
+        set_option(
+            sqm,
+            plan,
+            &sqm_section,
+            "use_mq",
+            if cake_intent.use_mq { "1" } else { "0" },
+        )?;
+    }
     for (source, target) in OPTIONAL_OPTIONS {
         let value = section
             .options
@@ -352,7 +482,6 @@ fn project_instance(
 const FIXED_OPTIONS: &[(&str, &str, &str)] = &[
     ("sqm_debug_logging", "debug_logging", "0"),
     ("sqm_verbosity", "verbosity", "5"),
-    ("sqm_qdisc", "qdisc", "cake"),
     ("sqm_script", "script", "piece_of_cake.qos"),
     ("sqm_qdisc_advanced", "qdisc_advanced", "0"),
     ("sqm_squash_dscp", "squash_dscp", "1"),
@@ -386,11 +515,10 @@ const OPTIONAL_OPTIONS: &[(&str, &str)] = &[
     ("sqm_eqdisc_opts", "eqdisc_opts"),
 ];
 
-fn disable_unmanaged_conflicts(
-    sqm: &mut UciPackage,
+fn reject_unmanaged_conflicts(
+    sqm: &UciPackage,
     resolver: &impl InterfaceResolver,
     cache: &mut BTreeMap<String, String>,
-    plan: &mut SqmProjectionPlan,
     keep: &str,
     target: &str,
 ) -> Result<(), String> {
@@ -424,8 +552,7 @@ fn disable_unmanaged_conflicts(
                 "managed SQM sections {keep} and {candidate} target {target}"
             ));
         }
-        set_option(sqm, plan, &candidate, "enabled", "0")?;
-        plan.managed = true;
+        return Err(format!("unmanaged SQM section {candidate} already owns target {target}; explicitly select/adopt that section or resolve the conflict first"));
     }
     Ok(())
 }
@@ -789,6 +916,239 @@ mod tests {
     }
 
     #[test]
+    fn r3_projection_mq_aliases_and_retained_flag_use_the_sqm_script_contract() {
+        struct MqResolver;
+        impl InterfaceResolver for MqResolver {
+            fn resolve(&self, name: &str) -> Result<String, String> {
+                Ok(name.into())
+            }
+            fn supports_cake_mq(&self, script: &str) -> Result<bool, String> {
+                Ok(script == "piece_of_cake.qos")
+            }
+        }
+        for alias in ["cake", "cake-mq", "cake_mq"] {
+            let mut cake = base_cake();
+            cake.sections
+                .get_mut("wan")
+                .unwrap()
+                .options
+                .insert("sqm_qdisc".into(), alias.into());
+            let mut sqm = parse(SQM_PACKAGE, "sqm.cake_wan=queue\nsqm.cake_wan.use_mq='1'\n");
+            plan_projection(&cake, &mut sqm, &MqResolver, &ProjectionScope::All).unwrap();
+            assert_eq!(sqm.sections["cake_wan"].options["qdisc"], "cake");
+            assert_eq!(sqm.sections["cake_wan"].options["use_mq"], "1");
+            assert!(
+                plan_projection(&cake, &mut sqm, &MqResolver, &ProjectionScope::All)
+                    .unwrap()
+                    .actions
+                    .is_empty()
+            );
+            cake.sections
+                .get_mut("wan")
+                .unwrap()
+                .options
+                .insert("sqm_use_mq".into(), "0".into());
+            plan_projection(
+                &cake,
+                &mut sqm,
+                &FakeResolver::default(),
+                &ProjectionScope::All,
+            )
+            .unwrap();
+            assert_eq!(sqm.sections["cake_wan"].options["qdisc"], "cake");
+            assert_eq!(sqm.sections["cake_wan"].options["use_mq"], "0");
+        }
+    }
+
+    #[test]
+    fn r3_projection_rejects_bad_qdisc_or_unproven_mq_without_partial_mutations() {
+        for qdisc in ["fq_codel", "cake-mq", "cake_mq"] {
+            let mut cake = base_cake();
+            cake.sections
+                .get_mut("wan")
+                .unwrap()
+                .options
+                .insert("sqm_qdisc".into(), qdisc.into());
+            let mut sqm = parse(
+                SQM_PACKAGE,
+                "sqm.manual=queue\nsqm.manual.interface='wan'\nsqm.manual.enabled='1'\n",
+            );
+            let before = sqm.clone();
+            assert!(plan_projection(
+                &cake,
+                &mut sqm,
+                &FakeResolver::default(),
+                &ProjectionScope::All
+            )
+            .is_err());
+            assert_eq!(sqm, before);
+        }
+    }
+
+    #[test]
+    fn r3_mq_startup_preflight_collects_only_scoped_active_scripts_once() {
+        let mut cake = base_cake();
+        cake.sections
+            .get_mut("wan")
+            .unwrap()
+            .options
+            .insert("sqm_use_mq".into(), "1".into());
+        let mut other = cake.sections["wan"].clone();
+        other
+            .options
+            .insert("sqm_interface".into(), "other0".into());
+        cake.sections.insert("other".into(), other);
+        let sqm = UciPackage::default();
+        let mut calls = Vec::new();
+        prepare_mq_capabilities(
+            &cake,
+            &sqm,
+            &FakeResolver::default(),
+            &ProjectionScope::All,
+            false,
+            |script| {
+                calls.push(script.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, ["piece_of_cake.qos"]);
+        assert!(sqm.sections.is_empty());
+        cake.sections
+            .get_mut("other")
+            .unwrap()
+            .options
+            .insert("sqm_script".into(), "other.qos".into());
+        calls.clear();
+        prepare_mq_capabilities(
+            &cake,
+            &sqm,
+            &FakeResolver::default(),
+            &ProjectionScope::Instance("wan".into()),
+            false,
+            |script| {
+                calls.push(script.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, ["piece_of_cake.qos"]);
+        cake.sections
+            .get_mut("wan")
+            .unwrap()
+            .options
+            .insert("enabled".into(), "0".into());
+        prepare_mq_capabilities(
+            &cake,
+            &sqm,
+            &FakeResolver::default(),
+            &ProjectionScope::Instance("wan".into()),
+            false,
+            |_| panic!("disabled instance must not refresh MQ"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn r3_mq_startup_rejects_all_invalid_owners_and_options_before_any_probe() {
+        let mut cake = base_cake();
+        cake.sections
+            .get_mut("wan")
+            .unwrap()
+            .options
+            .insert("sqm_use_mq".into(), "1".into());
+        let sqm = UciPackage::default();
+        // Selected lifecycle requires exact projection before even a private
+        // probe; it is not a second opportunity to apply pending configuration.
+        assert!(prepare_mq_capabilities(
+            &cake,
+            &sqm,
+            &FakeResolver::default(),
+            &ProjectionScope::All,
+            true,
+            |_| panic!("pending projection must be rejected first")
+        )
+        .is_err());
+        let foreign = parse(
+            SQM_PACKAGE,
+            "sqm.cake_wan=queue\nsqm.cake_wan._cake_autorate_managed='other'\n",
+        );
+        assert!(prepare_mq_capabilities(
+            &cake,
+            &foreign,
+            &FakeResolver::default(),
+            &ProjectionScope::All,
+            false,
+            |_| panic!("foreign owner must be rejected first")
+        )
+        .is_err());
+        let mut last = cake.sections["wan"].clone();
+        last.options.insert("sqm_interface".into(), "other0".into());
+        last.options.insert("sqm_qdisc".into(), "fq_codel".into());
+        cake.sections.insert("zz_invalid".into(), last);
+        assert!(prepare_mq_capabilities(
+            &cake,
+            &sqm,
+            &FakeResolver::default(),
+            &ProjectionScope::All,
+            false,
+            |_| panic!("later invalid section must be rejected before any probe")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn r3_mq_startup_failure_does_not_mutate_or_admit_the_provisional_projection() {
+        let mut cake = base_cake();
+        cake.sections
+            .get_mut("wan")
+            .unwrap()
+            .options
+            .insert("sqm_qdisc".into(), "cake_mq".into());
+        let mut sqm = UciPackage::default();
+        let original = sqm.clone();
+        assert!(prepare_mq_capabilities(
+            &cake,
+            &sqm,
+            &FakeResolver::default(),
+            &ProjectionScope::All,
+            false,
+            |_| Err("unsupported fixture".into())
+        )
+        .is_err());
+        assert_eq!(sqm, original);
+        assert!(plan_projection(
+            &cake,
+            &mut sqm,
+            &FakeResolver::default(),
+            &ProjectionScope::All
+        )
+        .is_err());
+        assert_eq!(sqm, original);
+    }
+
+    #[test]
+    fn r3_default_single_queue_does_not_create_redundant_pending_projection() {
+        let cake = base_cake();
+        let resolver = FakeResolver::default();
+        let mut sqm = UciPackage::default();
+        plan_projection(&cake, &mut sqm, &resolver, &ProjectionScope::All).unwrap();
+        assert!(!sqm.sections["cake_wan"].options.contains_key("use_mq"));
+        let old = sqm.clone();
+        prepare_mq_capabilities(&cake, &sqm, &resolver, &ProjectionScope::All, true, |_| {
+            panic!("single queue needs no probe")
+        })
+        .unwrap();
+        assert!(
+            plan_projection(&cake, &mut sqm, &resolver, &ProjectionScope::All)
+                .unwrap()
+                .actions
+                .is_empty()
+        );
+        assert_eq!(sqm, old);
+    }
+
+    #[test]
     fn both_projection_is_exact_and_second_plan_is_empty() {
         let cake = base_cake();
         let mut sqm = UciPackage::default();
@@ -970,7 +1330,7 @@ mod tests {
     }
 
     #[test]
-    fn unmanaged_collision_is_disabled_but_foreign_owner_fails_closed() {
+    fn r4_unmanaged_collision_and_foreign_owner_fail_without_mutating_either_queue() {
         let cake = base_cake();
         let mut sqm = parse(
             SQM_PACKAGE,
@@ -978,14 +1338,15 @@ mod tests {
              sqm.manual.enabled='1'\n\
              sqm.manual.interface='wan'\n",
         );
-        plan_projection(
+        let before = sqm.clone();
+        assert!(plan_projection(
             &cake,
             &mut sqm,
             &FakeResolver::default(),
             &ProjectionScope::All,
         )
-        .unwrap();
-        assert_eq!(sqm.sections["manual"].options["enabled"], "0");
+        .is_err());
+        assert_eq!(sqm, before);
 
         let mut foreign = parse(
             SQM_PACKAGE,

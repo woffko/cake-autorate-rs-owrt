@@ -171,6 +171,11 @@ impl RuntimeOverrideDriver {
         self.unsafe_recovery_reason.as_deref()
     }
 
+    /// Expose the typed cause without leaking private route or store contents.
+    pub fn restore_reason(&self) -> Option<RuntimeRestoreReason> {
+        self.tracker.restore_reason()
+    }
+
     pub fn poll(
         &mut self,
         actuator: &mut impl RuntimeOverrideActuator,
@@ -1110,6 +1115,8 @@ mod tests {
 
     fn permit() -> AutotuneRuntimePermit {
         AutotuneRuntimePermit {
+            dns_server: None,
+            probe_accounting_required: false,
             kind: super::super::autotune_runtime::RuntimePermitKind::Autotune,
             permit_id: "77".repeat(16),
             job_id: "11".repeat(16),
@@ -1465,6 +1472,7 @@ mod tests {
         publish_request(&active_root, &permit, &control(1));
         let mut active_driver =
             RuntimeOverrideDriver::open("wan_sqm".to_string(), &active_root).unwrap();
+        assert_eq!(active_driver.restore_reason(), None);
         let mut active_actuator = actuator();
         assert_eq!(
             active_driver.poll(&mut active_actuator).unwrap(),
@@ -1531,7 +1539,7 @@ mod tests {
             RuntimeDriverOutcome::Restored
         );
         assert_eq!(
-            active_driver.tracker.restore_reason(),
+            active_driver.restore_reason(),
             Some(RuntimeRestoreReason::BaselineAttestationUnavailable)
         );
         assert_eq!(active_actuator.remove_temporary_count, 1);

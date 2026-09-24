@@ -31,8 +31,12 @@ assert.deepEqual(Object.keys(menu).sort(), [
 assert.deepEqual(Object.keys(acl['luci-app-cake-autorate-rs-lite'].write.file || {}), []);
 assert.deepEqual(acl['luci-app-cake-autorate-rs-lite'].read.file['/usr/lib/sqm'], ['list']);
 assert.deepEqual(Object.keys(acl['luci-app-cake-autorate-rs-lite'].read.file).sort(),
-	['/usr/lib/sqm', '/var/run/cake-autorate/*/status.json']);
+	['/tmp/run/cake-autorate/*/status.json', '/usr/lib/sqm', '/var/run/cake-autorate/*/status.json']);
+assert.deepEqual(acl['luci-app-cake-autorate-rs-lite'].read.file['/tmp/run/cake-autorate/*/status.json'], ['read']);
 assert.deepEqual(acl['luci-app-cake-autorate-rs-lite'].write.uci.sort(), [ 'cake-autorate', 'sqm' ]);
+assert.deepEqual(acl['luci-app-cake-autorate-rs-lite'].read.ubus['cake-autorate-config'], [ 'schema', 'mq_status' ]);
+assert.deepEqual(acl['luci-app-cake-autorate-rs-lite'].write.ubus['cake-autorate-config'],
+	[ 'begin', 'append', 'finish', 'cancel', 'mq_probe' ]);
 assert.match(settings, /form\.GridSection/);
 assert.match(settings, /sqm_direction_mode/);
 assert.match(settings, /adaptive_ceiling_enabled/);

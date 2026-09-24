@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 const RUNTIME_OWNER_JOURNAL_HEADER: &str = "cake-autorate-calibration\t3\tjournal";
 const PUBLICATION_JOURNAL_HEADER: &str = "cake-autorate-calibration\t4\tjournal";
 const JOURNAL_HEADER: &str = "cake-autorate-calibration\t2\tjournal";
+const HISTORY_JOURNAL_PREFIX: &str =
+    "cake-autorate-calibration\t5\tjournal\nhistory_decision_required=1\n";
 pub(crate) const MAX_JOURNAL_JOBS: usize = 64;
 pub(crate) const JOURNAL_RETENTION_TARGET: usize = 48;
 const MAX_JOURNAL_DIRECTORY_ENTRIES: usize = 256;
@@ -63,6 +65,7 @@ pub struct JobJournal {
     pub reconcile_attempts: u32,
     pub runtime_mutated: bool,
     pub recovery_required: bool,
+    pub history_decision_required: bool,
 }
 
 impl JobJournal {
@@ -94,6 +97,10 @@ impl JobJournal {
             reconcile_attempts: 0,
             runtime_mutated: false,
             recovery_required: false,
+            history_decision_required: request.traffic_policy_explicit
+                && request.identity.operation == super::protocol::OperationKind::FullAutotune
+                && request.strategy == Some(super::protocol::CalibrationStrategy::FullRaw)
+                && request.allow_sqm_disable,
         };
         journal.validate()?;
         Ok(journal)
@@ -672,6 +679,15 @@ impl JobJournal {
     }
 
     pub fn encode(&self) -> Result<String, String> {
+        if self.history_decision_required {
+            let mut inner = self.clone();
+            inner.history_decision_required = false;
+            let encoded = format!("{HISTORY_JOURNAL_PREFIX}{}", inner.encode()?);
+            if encoded.len() > MAX_OPERATION_RECORD_BYTES {
+                return Err("journal record exceeds its size bound".into());
+            }
+            return Ok(encoded);
+        }
         let schema = if self.publication_boot_id.is_some() {
             4
         } else if self.runtime_owner_process.is_some() {
@@ -684,6 +700,9 @@ impl JobJournal {
 
     fn encode_for_schema(&self, schema: u8) -> Result<String, String> {
         self.validate()?;
+        if self.history_decision_required {
+            return Err("history-required journal cannot use a legacy schema".into());
+        }
         if !matches!(schema, 2..=4) {
             return Err("unsupported journal encoding schema".to_string());
         }
@@ -810,6 +829,17 @@ impl JobJournal {
         if input.len() > MAX_OPERATION_RECORD_BYTES || !input.ends_with('\n') {
             return Err("journal record is not bounded and newline-terminated".to_string());
         }
+        if let Some(inner) = input.strip_prefix(HISTORY_JOURNAL_PREFIX) {
+            if inner.starts_with("cake-autorate-calibration\t5\t") {
+                return Err("nested history journal is invalid".into());
+            }
+            let mut journal = Self::decode(inner)?;
+            journal.history_decision_required = true;
+            if journal.encode()? != input {
+                return Err("history journal is not canonical".into());
+            }
+            return Ok(journal);
+        }
         let mut lines = input.lines();
         let header = lines
             .next()
@@ -902,6 +932,7 @@ impl JobJournal {
             reconcile_attempts,
             runtime_mutated,
             recovery_required,
+            history_decision_required: false,
         };
         journal.validate()?;
         if journal.encode_for_schema(schema)? != input {
@@ -1003,6 +1034,10 @@ impl JournalStore {
         }
         let job_dir = self.jobs_dir.join(&journal.job_id);
         secure_existing_job_dir(&job_dir)?;
+        let previous = JobJournal::decode(&read_bounded(&job_dir.join(STATE_FILE))?)?;
+        if previous.history_decision_required != journal.history_decision_required {
+            return Err("journal update cannot change its admitted history policy".into());
+        }
         let request = OperationRequest::decode(&read_bounded(&job_dir.join(REQUEST_FILE))?)?;
         if request.identity.job_id != journal.job_id
             || request.identity.instance != journal.instance
@@ -1476,12 +1511,15 @@ mod tests {
             speedtest_server_id: None,
             speedtest_topology: None,
             route: OperationRouteIdentity {
+                dns_server: None,
+                device_ifindex: None,
                 mode: OperationRouteMode::Main,
                 mwan3_member: None,
                 l3_device: "pppoe-wan".to_string(),
                 source_ip: None,
                 fwmark: None,
                 routing_table: None,
+                fwmark_mask: None,
             },
             target_state: OperationTargetState::ExistingManaged,
             capture_policy: None,
@@ -1497,12 +1535,46 @@ mod tests {
             allow_sqm_disable: true,
             allow_active_traffic: true,
             scheduled_auto_apply_requested: false,
-            traffic_budget_bytes: 1_000_000,
+            traffic_budget: crate::operations::protocol::TrafficPolicy::Capped {
+                max_bytes: 1_000_000,
+            },
+            traffic_policy_explicit: false,
+            traffic_plan: None,
         }
     }
 
     fn temp_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("cake-journal-{}-{name}", unsafe { geteuid() }))
+    }
+
+    #[test]
+    fn t3_history_requirement_survives_journal_roundtrip_without_relabeling_legacy() {
+        let mut request = request();
+        let legacy = JobJournal::queued(&request, &coordinator(), true).unwrap();
+        let legacy_bytes = legacy.encode().unwrap();
+        assert!(!legacy.history_decision_required);
+        assert_eq!(
+            JobJournal::decode(&legacy_bytes).unwrap().encode().unwrap(),
+            legacy_bytes
+        );
+        request.traffic_policy_explicit = true;
+        let required = JobJournal::queued(&request, &coordinator(), true).unwrap();
+        assert!(required.history_decision_required);
+        let encoded = required.encode().unwrap();
+        assert!(encoded.starts_with(HISTORY_JOURNAL_PREFIX));
+        assert_eq!(JobJournal::decode(&encoded).unwrap(), required);
+        assert!(required.encode_for_schema(2).is_err());
+        assert!(JobJournal::decode(&format!("{HISTORY_JOURNAL_PREFIX}{encoded}")).is_err());
+        assert!(JobJournal::decode(
+            &encoded.replace("history_decision_required=1", "history_decision_required=0")
+        )
+        .is_err());
+        request.strategy = Some(CalibrationStrategy::ShapedOnly);
+        assert!(
+            !JobJournal::queued(&request, &coordinator(), true)
+                .unwrap()
+                .history_decision_required
+        );
     }
 
     fn fake_proc_stat(pid: u32, process_group: u32, starttime: u64) -> String {

@@ -795,10 +795,20 @@ impl NativeApplyCoordinatorStore {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn admit(
         &self,
         start: &NativeApplyControlRequest,
         candidate: NativeApplyDispatchRecord,
+    ) -> Result<NativeApplyAdmission, String> {
+        self.admit_with_gate(start, candidate, || Ok(()))
+    }
+
+    pub(crate) fn admit_with_gate(
+        &self,
+        start: &NativeApplyControlRequest,
+        candidate: NativeApplyDispatchRecord,
+        authorize_new: impl FnOnce() -> Result<(), String>,
     ) -> Result<NativeApplyAdmission, String> {
         start.validate()?;
         if start.command != NativeApplyControlCommand::Start {
@@ -844,10 +854,13 @@ impl NativeApplyCoordinatorStore {
             }
             return Err("another native Apply request is already active".to_string());
         }
-        if let Some(terminal) = terminal {
+        if let Some(terminal) = &terminal {
             if terminal.dispatch.matches_start(start) {
-                return Ok(NativeApplyAdmission::Terminal(terminal));
+                return Ok(NativeApplyAdmission::Terminal(terminal.clone()));
             }
+        }
+        authorize_new()?;
+        if terminal.is_some() {
             self.remove_terminal()?;
         }
         write_new_private_file(&self.active_path(), &candidate.encode()?)?;
@@ -855,11 +868,22 @@ impl NativeApplyCoordinatorStore {
         Ok(NativeApplyAdmission::Created(candidate))
     }
 
+    #[cfg(test)]
     pub(crate) fn rearm_terminal(
         &self,
         start: &NativeApplyControlRequest,
         expected: &NativeApplyTerminalRecord,
+        candidate: NativeApplyDispatchRecord,
+    ) -> Result<NativeApplyDispatchRecord, String> {
+        self.rearm_terminal_with_gate(start, expected, candidate, || Ok(()))
+    }
+
+    pub(crate) fn rearm_terminal_with_gate(
+        &self,
+        start: &NativeApplyControlRequest,
+        expected: &NativeApplyTerminalRecord,
         mut candidate: NativeApplyDispatchRecord,
+        authorize_new: impl FnOnce() -> Result<(), String>,
     ) -> Result<NativeApplyDispatchRecord, String> {
         start.validate()?;
         if start.command != NativeApplyControlCommand::Start {
@@ -897,6 +921,7 @@ impl NativeApplyCoordinatorStore {
         })?;
         candidate.validate()?;
 
+        authorize_new()?;
         // Publish the replacement authority first.  If power is lost before
         // the stale receipt is removed, admit() deterministically recovers
         // the strictly newer same-intent Active record.
@@ -1523,6 +1548,71 @@ mod tests {
             NativeApplyAdmission::Terminal(record) => assert_eq!(record, terminal),
             other => panic!("unexpected completed retry: {other:?}"),
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn t3_new_apply_gate_preserves_active_and_terminal_retry_authority() {
+        let root = root("history-gate");
+        let store = NativeApplyCoordinatorStore::new(&root);
+        let request = start();
+        assert!(store
+            .admit_with_gate(&request, accepted_dispatch(), || Err(
+                "history decline".into()
+            ))
+            .is_err());
+        assert!(store.read_active().unwrap().is_none());
+        let accepted = match store
+            .admit_with_gate(&request, accepted_dispatch(), || Ok(()))
+            .unwrap()
+        {
+            NativeApplyAdmission::Created(record) => record,
+            other => panic!("unexpected admission: {other:?}"),
+        };
+        assert!(matches!(
+            store
+                .admit_with_gate(&request, accepted_dispatch(), || panic!(
+                    "active retry must reuse admission"
+                ))
+                .unwrap(),
+            NativeApplyAdmission::Existing(_)
+        ));
+        let validating = store.mark_validating(&accepted).unwrap();
+        let applying = store
+            .mark_applying(&validating, verified_identity())
+            .unwrap();
+        let terminal = NativeApplyTerminalRecord {
+            dispatch: applying,
+            outcome: NativeApplyTerminalOutcome::Applied,
+            recovery_cleared: true,
+            diagnostic: String::new(),
+        };
+        store.complete(&terminal).unwrap();
+        assert!(matches!(
+            store
+                .admit_with_gate(&request, accepted_dispatch(), || panic!(
+                    "terminal retry must return receipt"
+                ))
+                .unwrap(),
+            NativeApplyAdmission::Terminal(_)
+        ));
+        assert!(store
+            .rearm_terminal_with_gate(&request, &terminal, accepted_dispatch(), || Err(
+                "history decline".into()
+            ))
+            .is_err());
+        assert!(store.read_active().unwrap().is_none());
+        assert_eq!(store.read_terminal().unwrap(), Some(terminal.clone()));
+        let mut other_request = request.clone();
+        other_request.source_job_id = Some("ab".repeat(16));
+        let mut other_candidate = accepted_dispatch();
+        other_candidate.source_job_id = "ab".repeat(16);
+        assert!(store
+            .admit_with_gate(&other_request, other_candidate, || Err(
+                "history decline".into()
+            ))
+            .is_err());
+        assert_eq!(store.read_terminal().unwrap(), Some(terminal));
         fs::remove_dir_all(root).unwrap();
     }
 

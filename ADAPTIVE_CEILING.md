@@ -33,7 +33,9 @@ a competing replacement controller.
 - A clean probe promotes its target only when achieved throughput also improves
   beyond the configured noise threshold. Clean latency without useful capacity
   gain keeps the previous safe ceiling.
-- A stall resets all learned state to the initial verified-safe ceiling.
+- A brief stall pauses at the learned safe ceiling. Sustained response loss
+  beyond the effective global timeout resets to the initial verified-safe
+  ceiling. Genuine route changes and daemon restarts also reset learning.
 - A stale failed bound expires so a recovered variable-rate link can be probed
   again.
 
@@ -69,13 +71,19 @@ Each direction tracks these values independently:
    with both the baseline rate and the actual probe step so narrow uplinks can
    still prove improvements smaller than 1 Mbit/s.
 6. Confirmed bufferbloat during a probe records the target as failed and enters
-   backoff at the previous safe ceiling.
+   backoff at the previous safe ceiling. If congestion occurs at an already
+   learned safe ceiling above the initial verified bound, with the live shaper
+   already below it, the old safe ceiling becomes a failed bound and the safe
+   bound is lowered to max(live shaper, initial verified bound). Repeated bloat
+   in backoff does not restart cooldown; the fast controller may keep cutting.
 7. Loss of high load or acceptable delay starts a short grace window. Recovery
    within that window continues qualification/observation; a sustained loss
    aborts the probe to the safe ceiling without creating a failed bound.
 8. `backoff -> cruise` after the configured cooldown.
-9. A failed bound expires after its TTL. A stall or service restart resets all
-   state to the initial verified-safe ceiling.
+9. A failed bound expires after its TTL. A brief stall pauses the probe without
+   erasing learned bounds. A gap beyond the effective global response timeout,
+   a genuine route-learning reset, or daemon restart resets to the initial
+   verified-safe ceiling.
 
 ## Capacity-learning policies
 

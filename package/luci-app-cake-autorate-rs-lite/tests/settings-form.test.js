@@ -27,6 +27,9 @@ function fixture(entries, script = 'layer_cake.qos', failList = false, revertSta
         }
     };
     const context = vm.createContext({
+        candidateGuard: { attach: map => map, protectModal: () => {}, apply: action => action(), loadSchema: () => Promise.resolve(null) },
+        // Mode behavior is covered by the shared real-Select browser suite.
+        sqmModes: { bind() {} },
         form: { Map: class { section() { return section; } render() { return this; } },
             GridSection: 'GridSection', DummyValue: 'DummyValue', Value: 'Value',
             Flag: 'Flag', ListValue: 'ListValue', DynamicList: 'DynamicList' },
@@ -70,6 +73,11 @@ function fixture(entries, script = 'layer_cake.qos', failList = false, revertSta
         assert.equal(option.retain, true, option.option + ' must preserve dependency-hidden values');
     }
     const choices = main.options.find(o => o.option === 'sqm_script').choices;
+    for (const option of main.options.filter(o => /^(min|base|max)_(dl|ul)_shaper_rate_kbps$/.test(o.option)))
+        assert.equal(option.datatype, 'ufloat', 'controller rate syntax must not be narrowed to integers or a 100 kbit/s floor');
+    for (const key of ['connection_active_thr_kbps', 'adaptive_ceiling_hold_time_s', 'adaptive_ceiling_probe_duration_s',
+        'adaptive_ceiling_failed_bound_ttl_s', 'adaptive_ceiling_cooldown_s', 'adaptive_ceiling_growth_percent', 'sustained_idle_sleep_thr_s'])
+        assert.equal(main.options.find(o => o.option === key).datatype, 'ufloat', key + ' must defer numeric bounds to native validation');
     assert(choices.includes('layer_cake.qos'), 'must preserve the real configured SQM script');
     assert(choices.includes('custom_cake.qos'), 'must discover installed scripts, not just hardcode layer_cake');
     assert(!choices.includes('../escape.qos'));

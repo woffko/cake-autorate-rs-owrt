@@ -1442,6 +1442,7 @@ impl BootstrapTransportRuntime {
         operation: &OperationRequest,
         policy: &super::autotune_capture_policy::AutotuneCapturePolicy,
         wake: Arc<OwnedFd>,
+        traffic_gid: Option<u32>,
     ) -> Result<Self, String> {
         operation.validate()?;
         if operation.target_state != OperationTargetState::AbsentBootstrap {
@@ -1462,7 +1463,14 @@ impl BootstrapTransportRuntime {
             return Err("bootstrap transport policy is not trusted".to_string());
         }
         let endpoint = policy.transport_endpoint().to_string();
+        let dns_server = operation.route.dns_server;
+        if operation.route.mode == super::protocol::OperationRouteMode::Explicit
+            && (dns_server.is_none() || traffic_gid.is_none())
+        {
+            return Err("explicit bootstrap transport requires owned DNS authority".into());
+        }
         let binding = crate::transport_probe::RouteBinding {
+            traffic_gid,
             device: operation.route.l3_device.clone(),
             source_ip: operation
                 .route
@@ -1476,6 +1484,9 @@ impl BootstrapTransportRuntime {
                 .unwrap_or_default(),
         };
         let timeout = Duration::from_millis(u64::from(policy.transport_timeout_ms()));
+        let mut engine = crate::transport_probe::TransportProbeEngine::new_with_dns(
+            backend, endpoint, binding, timeout, dns_server,
+        )?;
         let (request_tx, request_rx) = mpsc::sync_channel::<BootstrapTransportWork>(1);
         let (result_tx, result_rx) = mpsc::channel::<BootstrapTransportCompletion>();
         let worker_wake = Arc::clone(&wake);
@@ -1483,21 +1494,13 @@ impl BootstrapTransportRuntime {
             .name("cake-bootstrap-transport".to_string())
             .spawn(move || {
                 let _wake_on_exit = BootstrapTransportWakeGuard(Arc::clone(&worker_wake));
-                let mut engine = crate::transport_probe::TransportProbeEngine::new(
-                    backend, endpoint, binding, timeout,
-                );
                 while let Ok(work) = request_rx.recv() {
                     let started_at = Instant::now();
-                    let outcome = match engine.as_mut() {
-                        Ok(engine) => match work.capture.phase {
-                            AutotuneCapturePhase::IdleBaseline => engine.probe_classified(),
-                            AutotuneCapturePhase::LoadedMeasurement => {
-                                engine.probe_classified_loaded_autotune()
-                            }
-                        },
-                        Err(error) => Err(crate::transport_probe::TransportProbeFailure::other(
-                            error.clone(),
-                        )),
+                    let outcome = match work.capture.phase {
+                        AutotuneCapturePhase::IdleBaseline => engine.probe_classified(),
+                        AutotuneCapturePhase::LoadedMeasurement => {
+                            engine.probe_classified_loaded_autotune()
+                        }
                     };
                     let completed_at = Instant::now();
                     if result_tx
@@ -1925,6 +1928,11 @@ trait BootstrapCaptureAuthority {
 
 struct BootstrapCaptureRuntime {
     session: AutotuneCaptureSession,
+    retirement: Option<(
+        RuntimeOverrideStore,
+        super::autotune_runtime_store::ProbeRetirement,
+    )>,
+    retiring: bool,
     idle_rate_reference: Option<(u64, u64)>,
     idle_icmp_baseline_ms: Option<f64>,
     idle_transport_baseline_ms: Option<f64>,
@@ -1964,6 +1972,8 @@ impl BootstrapCaptureRuntime {
         let now = Instant::now();
         Self {
             session: AutotuneCaptureSession::new(),
+            retirement: None,
+            retiring: false,
             idle_rate_reference: None,
             idle_icmp_baseline_ms: None,
             idle_transport_baseline_ms: None,
@@ -1998,10 +2008,28 @@ impl BootstrapCaptureRuntime {
     }
 
     fn ensure_pinger(&mut self, operation: &OperationRequest) -> Result<(), String> {
+        if self.retiring {
+            return Err("bootstrap capture probes are terminally retired".to_string());
+        }
         self.poll_probe_shutdown()?;
         if self.stopping_transport.is_some() {
             return Err("bootstrap transport shutdown is still in progress".to_string());
         }
+        let traffic_gid = if let Some((store, identity)) = self.retirement.as_ref() {
+            let permit = store
+                .read_permit()?
+                .ok_or("probe accounting permit is missing")?;
+            if permit.job_id != identity.job_id || permit.worker_run_id != identity.worker_run_id {
+                return Err("bootstrap probe accounting identity mismatch".into());
+            }
+            store
+                .probe_accounting_owner(&permit)?
+                .map(|owner| owner.probe_gid)
+        } else if operation.traffic_policy_explicit {
+            return Err("bootstrap probe accounting context is missing".into());
+        } else {
+            None
+        };
         let policy = operation
             .capture_policy
             .ok_or_else(|| "bootstrap capture has no immutable policy".to_string())?
@@ -2053,7 +2081,7 @@ impl BootstrapCaptureRuntime {
             self.next_cpu_sample = now;
         }
         if self.pinger.is_none() {
-            let pinger = crate::PingerRuntime::spawn_bootstrap(operation)?;
+            let pinger = crate::PingerRuntime::spawn_bootstrap(operation, traffic_gid)?;
             self.pinger = Some(pinger);
         }
         if self.counter_sampler.is_none() {
@@ -2082,6 +2110,7 @@ impl BootstrapCaptureRuntime {
                     .as_ref()
                     .expect("bootstrap capture policy was initialized"),
                 wake,
+                traffic_gid,
             ) {
                 Ok(transport) => self.transport = Some(transport),
                 Err(error) => {
@@ -2135,6 +2164,27 @@ impl BootstrapCaptureRuntime {
         self.cpu_monitor = None;
         self.policy = None;
         let _ = self.poll_probe_shutdown();
+    }
+
+    fn poll_retirement(&mut self, force: bool) -> Result<(), String> {
+        let Some((store, identity)) = self.retirement.as_ref() else {
+            return Ok(());
+        };
+        let request = store.read_probe_retirement()?;
+        if request.as_ref().is_some_and(|request| request != identity) {
+            return Err("bootstrap probe retirement belongs to another run".to_string());
+        }
+        if force || self.retiring || request.is_some() {
+            self.retiring = true;
+            self.session.clear();
+            self.stop_probes();
+            let (store, identity) = self.retirement.as_ref().expect("retirement remains owned");
+            let acknowledged = store.request_probe_retirement(identity)?;
+            if self.probes_stopped.load(Ordering::Acquire) && !acknowledged {
+                store.acknowledge_probe_retirement(identity)?;
+            }
+        }
+        Ok(())
     }
 
     fn poll_probe_shutdown(&mut self) -> Result<(), String> {
@@ -4262,6 +4312,15 @@ impl BootstrapCaptureRuntime {
 impl Drop for BootstrapCaptureRuntime {
     fn drop(&mut self) {
         self.stop_probes();
+        if let Some(mut transport) = self.stopping_transport.take() {
+            transport.stop();
+        }
+        // Error and normal returns both join before publishing a receipt.
+        // An abrupt process death cannot execute this path: recovery instead
+        // needs kernel proof that the old dedicated group has disappeared.
+        if let Err(error) = self.poll_retirement(true) {
+            eprintln!("bootstrap test-probe retirement could not be confirmed: {error}");
+        }
     }
 }
 
@@ -4695,6 +4754,9 @@ impl OpenWrtBootstrapRuntimeActuator {
             current_boot_ms,
         )
         .map_err(|error| ("capture-runtime-mismatch", error))?;
+        store
+            .probe_accounting_owner(&permit)
+            .map_err(|error| ("capture-accounting-owner-invalid", error))?;
         if !permit
             .worker
             .still_matches(Path::new(DEFAULT_PROC_ROOT))
@@ -5172,6 +5234,9 @@ fn synchronize_bootstrap_capture(
     capture: &mut BootstrapCaptureRuntime,
 ) -> Result<(), String> {
     capture.poll_probe_shutdown()?;
+    if capture.retiring {
+        return Ok(());
+    }
     let request_path = runtime_dir.join(CAPTURE_REQUEST_FILE);
     match fs::symlink_metadata(&request_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -5455,6 +5520,15 @@ where
         return Ok(());
     }
     let store = RuntimeOverrideStore::open(&runtime_dir)?;
+    if request.traffic_policy_explicit {
+        if let Some(previous) =
+            read_bootstrap_runtime_owner_claim(&runtime_dir, &request, &worker_run_id)?
+        {
+            if !super::process::process_group_retired(&previous.process)? {
+                return Err("previous bootstrap owner group has not retired".to_string());
+            }
+        }
+    }
     let readiness_baseline = bootstrap_owner_readiness_baseline(&request, &worker_run_id, &store)?;
     let owner_claim = BootstrapRuntimeOwnerClaim::for_current_process(
         &request,
@@ -5465,19 +5539,32 @@ where
         &runtime_dir.join(OWNER_CLAIM_FILE),
         owner_claim.encode()?.as_bytes(),
     )?;
-    let mut driver = RuntimeOverrideDriver::open(request.identity.instance.clone(), &runtime_dir)?;
     let capture_probes_stopped = Arc::new(AtomicBool::new(true));
+    let mut capture = BootstrapCaptureRuntime::new(Arc::clone(&capture_probes_stopped));
+    if request.traffic_policy_explicit
+        && request.identity.operation == super::protocol::OperationKind::FullAutotune
+    {
+        capture.retirement = Some((
+            store.clone(),
+            super::autotune_runtime_store::ProbeRetirement {
+                job_id: request.identity.job_id.clone(),
+                worker_run_id: worker_run_id.clone(),
+            },
+        ));
+        capture.poll_retirement(false)?;
+    }
+    let mut driver = RuntimeOverrideDriver::open(request.identity.instance.clone(), &runtime_dir)?;
     let mut actuator =
         OpenWrtBootstrapRuntimeActuator::new(request.clone(), Arc::clone(&capture_probes_stopped))?;
     let mut events = CalibrationEventLoop::new()?;
     events.watch_tree(&runtime_dir, 1, true)?;
     let mut saw_permit = false;
     let mut restore_requested = false;
-    let mut capture = BootstrapCaptureRuntime::new(capture_probes_stopped);
     let mut last_capture_error: Option<String> = None;
 
     loop {
         capture.poll_probe_shutdown()?;
+        capture.poll_retirement(false)?;
         if terminate.load(Ordering::SeqCst) && !restore_requested {
             capture.stop_probes();
             let checkpoint = store.read_checkpoint()?;
@@ -5601,8 +5688,19 @@ where
         if restore_intent_present || worker_unavailable || active_runtime_unhealthy {
             capture.stop_probes();
         }
+        if restore_intent_present || worker_unavailable {
+            capture.poll_retirement(true)?;
+        }
 
         let outcome = driver.poll(&mut actuator)?;
+        if matches!(
+            outcome,
+            RuntimeDriverOutcome::Restoring
+                | RuntimeDriverOutcome::Restored
+                | RuntimeDriverOutcome::Rejected
+        ) {
+            capture.poll_retirement(true)?;
+        }
         if outcome == RuntimeDriverOutcome::UnsafeRecoveryRequired {
             return Err(driver
                 .unsafe_recovery_reason()
@@ -5733,6 +5831,30 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r6_bootstrap_transport_requires_owned_direct_dns_before_worker_spawn() {
+        let mut operation = request();
+        operation.route.mode = super::super::protocol::OperationRouteMode::Explicit;
+        operation.route.mwan3_member = None;
+        operation.route.device_ifindex = Some(42);
+        operation.route.fwmark = Some(0x100);
+        operation.route.fwmark_mask = Some(0x3f00);
+        operation.route.routing_table = Some(101);
+        let policy = operation.capture_policy.unwrap().expand().unwrap();
+        let wake = || Arc::new(OwnedFd::from(std::fs::File::open("/dev/null").unwrap()));
+        assert!(
+            BootstrapTransportRuntime::spawn(&operation, &policy, wake(), Some(32770)).is_err()
+        );
+        operation.route.dns_server = Some("192.0.2.53".parse().unwrap());
+        for gid in [None, Some(0), Some(u32::MAX)] {
+            assert!(BootstrapTransportRuntime::spawn(&operation, &policy, wake(), gid).is_err());
+        }
+        // No request is sent: construction/join must not perform DNS or probes.
+        let worker =
+            BootstrapTransportRuntime::spawn(&operation, &policy, wake(), Some(32770)).unwrap();
+        drop(worker);
+    }
     use crate::autotune::{
         AccessEvidenceSource, AccessMedium, AutotuneProfile, CapacityLearningPolicy,
     };
@@ -5812,12 +5934,15 @@ mod tests {
             speedtest_server_id: Some(17_372),
             speedtest_topology: None,
             route: OperationRouteIdentity {
+                dns_server: None,
+                device_ifindex: None,
                 mode: OperationRouteMode::Main,
                 mwan3_member: None,
                 l3_device: "pppoe-wan".to_string(),
                 source_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2))),
                 fwmark: None,
                 routing_table: None,
+                fwmark_mask: None,
             },
             target_state: OperationTargetState::AbsentBootstrap,
             capture_policy: Some(
@@ -5835,7 +5960,11 @@ mod tests {
             allow_sqm_disable: true,
             allow_active_traffic: false,
             scheduled_auto_apply_requested: false,
-            traffic_budget_bytes: 1_000_000_000,
+            traffic_budget: crate::operations::protocol::TrafficPolicy::Capped {
+                max_bytes: 1_000_000_000,
+            },
+            traffic_policy_explicit: false,
+            traffic_plan: None,
         }
     }
 
@@ -5937,6 +6066,8 @@ mod tests {
             starttime_ticks: 1_234,
         };
         let permit = AutotuneRuntimePermit {
+            dns_server: None,
+            probe_accounting_required: false,
             kind: super::super::autotune_runtime::RuntimePermitKind::Autotune,
             permit_id: "88".repeat(16),
             job_id: operation.identity.job_id.clone(),
@@ -6836,10 +6967,12 @@ mod tests {
         fs::remove_dir_all(foreign_directory).unwrap();
     }
 
-    #[test]
-    fn transport_stop_request_is_nonblocking_and_keeps_its_wake_fence() {
+    fn held_transport_worker() -> (BootstrapTransportRuntime, mpsc::SyncSender<()>) {
+        // SAFETY: eventfd has scalar flags only; the successful descriptor is
+        // immediately transferred to one OwnedFd and shared through Arc.
         let raw_wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         assert!(raw_wake >= 0);
+        // SAFETY: raw_wake was checked and has not been transferred elsewhere.
         let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(raw_wake) });
         let (request_tx, _request_rx) = mpsc::sync_channel(1);
         let (_result_tx, result_rx) = mpsc::channel();
@@ -6849,10 +6982,10 @@ mod tests {
         let worker = thread::spawn(move || {
             let _guard = BootstrapTransportWakeGuard(worker_wake);
             ready_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
         });
         ready_rx.recv().unwrap();
-        let mut transport = BootstrapTransportRuntime {
+        let transport = BootstrapTransportRuntime {
             request_tx: Some(request_tx),
             result_rx,
             worker: Some(worker),
@@ -6865,11 +6998,87 @@ mod tests {
             idle_samples_ms: VecDeque::new(),
             idle_baseline_ms: None,
         };
+        (transport, release_tx)
+    }
+
+    #[test]
+    fn transport_stop_request_is_nonblocking_and_keeps_its_wake_fence() {
+        let (mut transport, release_tx) = held_transport_worker();
         transport.request_stop();
         assert!(!transport.finish_stop());
         assert!(transport.wake_fd() >= 0);
         release_tx.send(()).unwrap();
         transport.stop();
+    }
+
+    #[test]
+    fn t2_bootstrap_retirement_receipt_waits_for_worker_and_prevents_restart() {
+        let directory = private_dir("probe-retirement");
+        let store = RuntimeOverrideStore::open(&directory).unwrap();
+        let identity = super::super::autotune_runtime_store::ProbeRetirement {
+            job_id: "a".repeat(32),
+            worker_run_id: "b".repeat(32),
+        };
+        let mut capture = BootstrapCaptureRuntime::new(Arc::new(AtomicBool::new(true)));
+        capture.retirement = Some((store.clone(), identity.clone()));
+        let (transport, release) = held_transport_worker();
+        capture.transport = Some(transport);
+        capture.poll_retirement(false).unwrap();
+        assert!(!capture.retiring);
+        assert!(!store.request_probe_retirement(&identity).unwrap());
+        capture.poll_retirement(false).unwrap();
+        assert!(capture.retiring);
+        assert!(!capture.probes_stopped.load(Ordering::Acquire));
+        assert!(!store.request_probe_retirement(&identity).unwrap());
+        assert!(capture.ensure_pinger(&request()).is_err());
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !capture.probes_stopped.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline);
+            capture.poll_retirement(false).unwrap();
+            thread::yield_now();
+        }
+        assert!(store.request_probe_retirement(&identity).unwrap());
+        assert!(capture.ensure_pinger(&request()).is_err());
+        drop(capture);
+        let mut restarted = BootstrapCaptureRuntime::new(Arc::new(AtomicBool::new(true)));
+        restarted.retirement = Some((store.clone(), identity));
+        restarted.poll_retirement(false).unwrap();
+        assert!(restarted.retiring);
+        assert!(restarted.ensure_pinger(&request()).is_err());
+        drop(restarted);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn t2_bootstrap_capture_drop_publishes_receipt_after_graceful_cleanup() {
+        let directory = private_dir("probe-retirement-drop");
+        let store = RuntimeOverrideStore::open(&directory).unwrap();
+        let identity = super::super::autotune_runtime_store::ProbeRetirement {
+            job_id: "c".repeat(32),
+            worker_run_id: "d".repeat(32),
+        };
+        let (transport, release) = held_transport_worker();
+        let worker_store = store.clone();
+        let worker_identity = identity.clone();
+        let (ready, initialized) = mpsc::sync_channel(1);
+        let finished = thread::spawn(move || {
+            // Runtime ownership stays on its creating thread, as in production.
+            let mut capture = BootstrapCaptureRuntime::new(Arc::new(AtomicBool::new(true)));
+            capture.retirement = Some((worker_store, worker_identity));
+            capture.transport = Some(transport);
+            ready.send(()).unwrap();
+            drop(capture);
+        });
+        initialized.recv_timeout(Duration::from_secs(2)).unwrap();
+        // The finalizer itself requests retirement only after its blocking
+        // join, so a coordinator request cannot observe a premature receipt.
+        assert!(!store.request_probe_retirement(&identity).unwrap());
+        assert!(!finished.is_finished());
+        release.send(()).unwrap();
+        finished.join().unwrap();
+        assert!(store.request_probe_retirement(&identity).unwrap());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -8702,6 +8911,7 @@ mod tests {
             .unwrap();
         }
         let pinger = crate::PingerRuntime {
+            producer: None,
             children: Vec::new(),
             readers: Vec::new(),
             lines,

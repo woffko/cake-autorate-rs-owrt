@@ -23,6 +23,10 @@ use super::process::{
 };
 use super::runtime_health::{json_string_value, safe_interface, safe_name, UciPackage, UciSection};
 
+#[path = "traffic_classifier_selected.rs"]
+mod selected;
+pub(crate) use selected::{reconcile_reload, ClassifierWitness, SelectedClassifier};
+
 const STATE_SCHEMA_VERSION: u8 = 3;
 const PRESET_SCHEMA_VERSION: u8 = 1;
 const TABLE_FAMILY: &str = "inet";
@@ -230,18 +234,23 @@ struct InstanceManifest {
     autotune_profile: String,
     configured_profile: String,
     resolved_profile: String,
+    projection_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StateManifest {
     ruleset_sha256: String,
+    projection_sha256: Option<String>,
     instances: Vec<InstanceManifest>,
 }
 
 impl StateManifest {
     fn encode(&self) -> Result<String, String> {
         if !is_sha256(&self.ruleset_sha256)
-            || self.instances.is_empty()
+            || self
+                .projection_sha256
+                .as_ref()
+                .is_some_and(|value| !is_sha256(value))
             || self.instances.len() > MAX_INSTANCES
         {
             return Err("traffic-classifier manifest is structurally invalid".to_string());
@@ -251,19 +260,27 @@ impl StateManifest {
             "schema_version={STATE_SCHEMA_VERSION}\nruleset_sha256={}\n",
             self.ruleset_sha256
         );
+        if let Some(projection) = &self.projection_sha256 {
+            output.push_str(&format!("projection_sha256={projection}\n"));
+        }
         for item in &self.instances {
             item.validate()?;
             if !seen.insert(item.instance.as_str()) {
                 return Err("traffic-classifier manifest repeats an instance".to_string());
             }
             output.push_str(&format!(
-                "{}|{}|{}|{}|{}\n",
+                "{}|{}|{}|{}|{}",
                 item.instance,
                 item.target,
                 item.autotune_profile,
                 item.configured_profile,
                 item.resolved_profile
             ));
+            if let Some(projection) = &item.projection_sha256 {
+                output.push('|');
+                output.push_str(projection);
+            }
+            output.push('\n');
         }
         if output.len() > MAX_MANIFEST_BYTES {
             return Err("traffic-classifier manifest exceeds its size bound".to_string());
@@ -286,11 +303,27 @@ impl StateManifest {
         if !is_sha256(digest) {
             return Err("traffic-classifier manifest digest is invalid".to_string());
         }
+        let mut lines = lines.peekable();
+        let projection_sha256 = if lines
+            .peek()
+            .is_some_and(|line| line.starts_with("projection_sha256="))
+        {
+            let value = lines
+                .next()
+                .and_then(|line| line.strip_prefix("projection_sha256="))
+                .ok_or("traffic-classifier projection digest is missing")?;
+            if !is_sha256(value) {
+                return Err("traffic-classifier projection digest is invalid".into());
+            }
+            Some(value.to_string())
+        } else {
+            None
+        };
         let mut instances = Vec::new();
         let mut seen = BTreeSet::new();
         for line in lines {
             let fields = line.split('|').collect::<Vec<_>>();
-            if fields.len() != 5 {
+            if !matches!(fields.len(), 5 | 6) {
                 return Err("traffic-classifier manifest row is malformed".to_string());
             }
             let item = InstanceManifest {
@@ -299,6 +332,7 @@ impl StateManifest {
                 autotune_profile: fields[2].to_string(),
                 configured_profile: fields[3].to_string(),
                 resolved_profile: fields[4].to_string(),
+                projection_sha256: fields.get(5).map(|value| (*value).to_string()),
             };
             item.validate()?;
             if !seen.insert(item.instance.clone()) {
@@ -309,11 +343,9 @@ impl StateManifest {
                 return Err("traffic-classifier manifest has too many instances".to_string());
             }
         }
-        if instances.is_empty() {
-            return Err("traffic-classifier manifest has no instances".to_string());
-        }
         let result = Self {
             ruleset_sha256: digest.to_string(),
+            projection_sha256,
             instances,
         };
         if result.encode()? != input {
@@ -325,6 +357,13 @@ impl StateManifest {
 
 impl InstanceManifest {
     fn validate(&self) -> Result<(), String> {
+        if self
+            .projection_sha256
+            .as_ref()
+            .is_some_and(|value| !is_sha256(value))
+        {
+            return Err("traffic-classifier scope digest is invalid".into());
+        }
         if !safe_name(&self.instance) || !safe_interface(&self.target) {
             return Err("traffic-classifier manifest identity is unsafe".to_string());
         }
@@ -349,6 +388,8 @@ impl InstanceManifest {
 #[derive(Clone, Debug)]
 struct RenderedRuleset {
     text: String,
+    forward: String,
+    output: String,
     instances: Vec<InstanceManifest>,
     builtin_rules: usize,
     custom_rules: usize,
@@ -911,12 +952,15 @@ fn render_ruleset(
                 "Multiple enabled instances claim the same traffic-rule uplink {target}."
             ));
         }
+        let forward_start = forward.len();
+        let output_start = output.len();
         instances.push(InstanceManifest {
             instance: instance.clone(),
             target: target.clone(),
             autotune_profile: autotune.as_str().to_string(),
             configured_profile: configured.as_str().to_string(),
             resolved_profile: resolved.as_str().to_string(),
+            projection_sha256: None,
         });
         for chain in [&mut forward, &mut output] {
             chain.push_str(&format!("\t\toifname \"{target}\" ip dscp set cs0\n"));
@@ -1007,6 +1051,18 @@ fn render_ruleset(
             .map_err(|_| format!("Traffic rule {name} contains an invalid family, network, protocol, port, or class."))?;
             custom_count += 1;
         }
+        let projection = hex_digest(
+            format!(
+                "classifier-scope-v1\nforward\n{}output\n{}",
+                &forward[forward_start..],
+                &output[output_start..]
+            )
+            .as_bytes(),
+        );
+        instances
+            .last_mut()
+            .ok_or("classifier scope was not recorded")?
+            .projection_sha256 = Some(projection);
     }
 
     let text = format!(
@@ -1017,6 +1073,8 @@ fn render_ruleset(
     }
     Ok(RenderedRuleset {
         text,
+        forward,
+        output,
         instances,
         builtin_rules: builtin_count,
         custom_rules: custom_count,
@@ -1218,14 +1276,89 @@ fn clear_table(environment: &Environment) -> Result<(), String> {
 }
 
 fn apply(environment: &Environment) -> Result<String, String> {
+    apply_with_package(environment, || load_uci(environment), || Ok(()))
+}
+
+/// Render from the lifecycle's captured authority, not another UCI read.
+pub(crate) fn apply_frozen(
+    package: &UciPackage,
+    attest: impl FnMut() -> Result<(), String>,
+) -> Result<String, String> {
+    apply_with_package(&Environment::live(), || Ok(package.clone()), attest)
+}
+
+pub(crate) fn require_no_selected_recovery() -> Result<(), String> {
+    selected::require_no_pending(&Environment::live())
+}
+
+/// Compare both intended global/custom rules and the observed applied table.
+/// Old manifests without a projection digest remain readable but cannot prove
+/// a no-op. No guard/state file is created or rewritten by this reader.
+pub(crate) fn frozen_rules_unchanged(package: &UciPackage) -> Result<bool, String> {
+    frozen_rules_unchanged_with(&Environment::live(), package)
+}
+fn frozen_rules_unchanged_with(
+    environment: &Environment,
+    package: &UciPackage,
+) -> Result<bool, String> {
+    let desired = render_ruleset(environment, package)?;
+    if !environment.nft.is_file() {
+        return Ok(false);
+    }
+    let present = table_present(environment)?;
+    if desired.instances.is_empty() {
+        return match fs::symlink_metadata(&environment.state_file) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(!present),
+            Err(_) => Err("unable to inspect classifier state".into()),
+            Ok(_) => {
+                let manifest = read_manifest(&environment.state_file)?;
+                Ok(present
+                    && manifest.instances.is_empty()
+                    && ruleset_digest(environment)? == manifest.ruleset_sha256
+                    && read_manifest(&environment.state_file)? == manifest)
+            }
+        };
+    }
+    if !present {
+        return Ok(false);
+    }
+    let manifest = read_manifest(&environment.state_file)?;
+    if manifest.instances != desired.instances
+        || (manifest.projection_sha256.is_none()
+            && manifest
+                .instances
+                .iter()
+                .any(|item| item.projection_sha256.is_none()))
+        || manifest
+            .projection_sha256
+            .as_ref()
+            .is_some_and(|value| value != &hex_digest(desired.text.as_bytes()))
+    {
+        return Ok(false);
+    }
+    let actual = ruleset_digest(environment)?;
+    Ok(actual == manifest.ruleset_sha256
+        && read_manifest(&environment.state_file)? == manifest
+        && table_present(environment)?)
+}
+
+fn apply_with_package(
+    environment: &Environment,
+    load: impl FnOnce() -> Result<UciPackage, String>,
+    mut attest: impl FnMut() -> Result<(), String>,
+) -> Result<String, String> {
     if !environment.nft.is_file() {
         return Err("nft is unavailable; traffic-priority rules were not applied".to_string());
     }
     let _guard = RuntimeGuard::lock(environment)?;
-    let rendered = render_ruleset(environment, &load_uci(environment)?)?;
+    selected::require_no_pending(environment)?;
+    attest()?;
+    let rendered = render_ruleset(environment, &load()?)?;
     if rendered.instances.is_empty() {
+        attest()?;
         clear_table(environment)?;
         remove_manifest(&environment.state_file)?;
+        attest()?;
         return Ok("{\"state\":\"inactive\",\"schema_version\":3,\"instances\":0,\"builtin_rules\":0,\"custom_rules\":0}\n".to_string());
     }
     let mut batch = String::new();
@@ -1239,6 +1372,7 @@ fn apply(environment: &Environment) -> Result<String, String> {
         } else {
             &args[..]
         };
+        attest()?;
         let output = command(&environment.nft, actual, Some(batch.as_bytes()))?;
         if !output.status.success() {
             return Err(if actual[0] == "-c" {
@@ -1260,13 +1394,16 @@ fn apply(environment: &Environment) -> Result<String, String> {
     };
     let manifest = StateManifest {
         ruleset_sha256: applied_digest.clone(),
+        projection_sha256: Some(hex_digest(rendered.text.as_bytes())),
         instances: rendered.instances,
     };
+    attest()?;
     if let Err(error) = write_manifest(&environment.state_file, &manifest) {
         let _ = clear_table(environment);
         let _ = remove_manifest(&environment.state_file);
         return Err(error);
     }
+    attest()?;
     Ok(format!(
         "{{\"state\":\"active\",\"schema_version\":3,\"instances\":{},\"builtin_rules\":{},\"custom_rules\":{},\"ruleset_sha256\":\"{}\"}}\n",
         manifest.instances.len(), rendered.builtin_rules, rendered.custom_rules, applied_digest
@@ -1275,6 +1412,7 @@ fn apply(environment: &Environment) -> Result<String, String> {
 
 fn clear(environment: &Environment) -> Result<String, String> {
     let _guard = RuntimeGuard::lock(environment)?;
+    selected::require_no_pending(environment)?;
     clear_table(environment)?;
     remove_manifest(&environment.state_file)?;
     Ok("{\"state\":\"inactive\",\"schema_version\":3}\n".to_string())
@@ -1310,6 +1448,9 @@ fn status_snapshot(environment: &Environment, requested: Option<&str>) -> Result
     }
     if actual != manifest.ruleset_sha256 {
         return Ok(format!("{{\"state\":\"drifted\",\"schema_version\":3,\"table_present\":true,\"table\":\"inet {TABLE_NAME}\",\"instances\":{}}}\n", manifest.instances.len()));
+    }
+    if manifest.instances.is_empty() {
+        return Ok(format!("{{\"state\":\"inactive\",\"schema_version\":3,\"table_present\":true,\"table\":\"inet {TABLE_NAME}\",\"instances\":0}}\n"));
     }
     if let Some(instance) = requested {
         let Some(item) = manifest
@@ -1652,12 +1793,14 @@ mod tests {
     fn state_manifest_is_byte_exact_and_rejects_tamper() {
         let manifest = StateManifest {
             ruleset_sha256: "a".repeat(64),
+            projection_sha256: None,
             instances: vec![InstanceManifest {
                 instance: "wan_sqm".to_string(),
                 target: "eth0".to_string(),
                 autotune_profile: "gaming".to_string(),
                 configured_profile: "auto".to_string(),
                 resolved_profile: "gaming".to_string(),
+                projection_sha256: None,
             }],
         };
         let bytes = manifest.encode().unwrap();
@@ -1709,6 +1852,117 @@ mod tests {
             .contains("\"state\":\"drifted\""));
         clear(&environment).unwrap();
         assert!(!root.join("table-present").exists());
+        assert!(!environment.state_file.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn r4_classifier_noop_checks_custom_projection_and_never_rewrites_state() {
+        let root = root();
+        let mut environment = command_environment(&root);
+        environment.uci = root.join("must-not-query-uci");
+        let mut package = base_uci("");
+        package
+            .sections
+            .get_mut("wan_sqm")
+            .unwrap()
+            .options
+            .insert("traffic_profile".into(), "custom".into());
+        package.sections.insert(
+            "custom_rule".into(),
+            UciSection {
+                section_type: "traffic_rule".into(),
+                options: [
+                    ("enabled", "1"),
+                    ("instance", "wan_sqm"),
+                    ("profile", "custom"),
+                    ("preset", "wireguard"),
+                    ("family", "any"),
+                    ("class", "video"),
+                ]
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+            },
+        );
+        apply_with_package(&environment, || Ok(package.clone()), || Ok(())).unwrap();
+        let before = fs::read(&environment.state_file).unwrap();
+        let inode = fs::metadata(&environment.state_file).unwrap().ino();
+        let applied = fs::read(root.join("applied.nft")).unwrap();
+        assert!(std::str::from_utf8(&applied).unwrap().contains("51820"));
+        assert!(frozen_rules_unchanged_with(&environment, &package).unwrap());
+        assert_eq!(fs::read(&environment.state_file).unwrap(), before);
+        assert_eq!(fs::metadata(&environment.state_file).unwrap().ino(), inode);
+        package
+            .sections
+            .get_mut("custom_rule")
+            .unwrap()
+            .options
+            .insert("class".into(), "voice".into());
+        assert!(!frozen_rules_unchanged_with(&environment, &package).unwrap());
+        assert_eq!(fs::read(root.join("applied.nft")).unwrap(), applied);
+        package
+            .sections
+            .get_mut("custom_rule")
+            .unwrap()
+            .options
+            .insert("class".into(), "video".into());
+        let mut legacy = read_manifest(&environment.state_file).unwrap();
+        legacy.projection_sha256 = None;
+        for instance in &mut legacy.instances {
+            instance.projection_sha256 = None;
+        }
+        write_manifest(&environment.state_file, &legacy).unwrap();
+        assert!(!frozen_rules_unchanged_with(&environment, &package).unwrap());
+        clear(&environment).unwrap();
+        assert!(frozen_rules_unchanged_with(&environment, &UciPackage::default()).unwrap());
+        assert!(!environment.state_file.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn r4_classifier_frozen_apply_never_loads_the_poisoned_original_uci() {
+        let root = root();
+        let mut environment = command_environment(&root);
+        environment.uci = root.join("must-not-read-original-uci");
+        let package = base_uci("");
+        let mut checks = 0;
+        let result = apply_with_package(
+            &environment,
+            || Ok(package),
+            || {
+                checks += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(result.contains("\"state\":\"active\""));
+        assert_eq!(checks, 5);
+        assert!(root.join("applied.nft").exists());
+        assert!(environment.state_file.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn r4_classifier_source_drift_is_rejected_before_nft_mutation() {
+        let root = root();
+        let environment = command_environment(&root);
+        let mut checks = 0;
+        let result = apply_with_package(
+            &environment,
+            || Ok(base_uci("")),
+            || {
+                checks += 1;
+                if checks == 3 {
+                    Err("captured-source-changed".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(result.err().unwrap(), "captured-source-changed");
+        assert!(root.join("checked.nft").exists());
+        assert!(!root.join("applied.nft").exists());
         assert!(!environment.state_file.exists());
         fs::remove_dir_all(root).unwrap();
     }

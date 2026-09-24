@@ -146,6 +146,7 @@ impl PingerMethod {
 enum RouteMode {
     Main,
     Mwan3,
+    Explicit,
 }
 
 impl RouteMode {
@@ -153,6 +154,7 @@ impl RouteMode {
         match self {
             Self::Main => "main",
             Self::Mwan3 => "mwan3",
+            Self::Explicit => "explicit",
         }
     }
 }
@@ -163,6 +165,8 @@ struct Settings {
     mode: Mode,
     route_mode: RouteMode,
     mwan3_member: String,
+    explicit_authority: Option<crate::routing::ExplicitRouteAuthority>,
+    explicit_device: String,
     configured_method: String,
     configured_no_pingers: usize,
     reflector_ping_interval_s: String,
@@ -620,6 +624,7 @@ fn load_settings(
     let route_mode = match configured_route.as_str() {
         "main" => RouteMode::Main,
         "mwan3" => RouteMode::Mwan3,
+        "explicit" => RouteMode::Explicit,
         "auto" if mwan3_member.is_empty() => RouteMode::Main,
         "auto" => RouteMode::Mwan3,
         _ => return Err(format!("Invalid route_mode: {configured_route}")),
@@ -627,11 +632,38 @@ fn load_settings(
     if route_mode == RouteMode::Mwan3 && !safe_route_member(&mwan3_member) {
         return Err("Invalid mwan3_member".to_string());
     }
+    let (explicit_authority, explicit_device) = if route_mode == RouteMode::Explicit {
+        if !mwan3_member.is_empty() {
+            return Err("explicit pinger plan must not define mwan3_member".into());
+        }
+        let mut values = Vec::with_capacity(4);
+        for field in [
+            "route_source_ipv4",
+            "route_table",
+            "route_fwmark",
+            "route_fwmark_mask",
+        ] {
+            values.push(uci_get(environment, section, field)?);
+        }
+        let authority = crate::routing::ExplicitRouteAuthority::from_fields(
+            "explicit",
+            [&values[0], &values[1], &values[2], &values[3]],
+        )?;
+        let device = uci_get(environment, section, "ul_if")?;
+        if !crate::routing::is_safe_identifier(&device) {
+            return Err("explicit pinger plan requires an exact ul_if".into());
+        }
+        (authority, device)
+    } else {
+        (None, String::new())
+    };
     Ok(Settings {
         section: section.to_string(),
         mode,
         route_mode,
         mwan3_member,
+        explicit_authority,
+        explicit_device,
         configured_method,
         configured_no_pingers,
         reflector_ping_interval_s,
@@ -641,7 +673,124 @@ fn load_settings(
     })
 }
 
+fn explicit_snapshot(settings: &Settings) -> Result<crate::routing::RouteSnapshot, String> {
+    let observation = settings
+        .explicit_authority
+        .as_ref()
+        .ok_or("explicit pinger plan authority missing")?
+        .observe_system(&settings.explicit_device)?;
+    Ok(crate::routing::RouteSnapshot {
+        identity: observation.identity,
+        online: true,
+        active: true,
+        member_status: String::new(),
+        reason: String::new(),
+    })
+}
+
+fn explicit_scan_arguments(
+    route: &crate::routing::RouteIdentity,
+    targets: &[String],
+    timestamp: bool,
+) -> Result<Vec<OsString>, String> {
+    // Hostname resolution through a local resolver does not prove upstream
+    // route ownership. Keep this capability precise until that path is owned.
+    if targets.is_empty()
+        || targets.len() > 32
+        || targets
+            .iter()
+            .any(|target| target.parse::<std::net::Ipv4Addr>().is_err())
+    {
+        return Err("explicit reflector scan requires 1..32 literal IPv4 targets per batch".into());
+    }
+    let mut arguments = vec![
+        "-I".into(),
+        route.device.clone().into(),
+        "-S".into(),
+        route.source_ip.clone().into(),
+    ];
+    if timestamp {
+        arguments.push("--icmp-timestamp".into());
+    }
+    arguments.extend(["-i", "100", "-c", "1", "-t", "1000", "--"].map(Into::into));
+    arguments.extend(targets.iter().map(OsString::from));
+    Ok(arguments)
+}
+
+fn scan_explicit(
+    environment: &Environment,
+    settings: &Settings,
+    targets: &[String],
+    availability: &Availability,
+) -> Result<(BTreeMap<String, f64>, BTreeMap<String, f64>, String), String> {
+    use crate::permanent_probe_owner::{execute_system_nft, PermanentProbeOwner};
+    let program = environment
+        .fping
+        .as_deref()
+        .ok_or("explicit scan requires fping")?;
+    let snapshot = explicit_snapshot(settings)?;
+    for chunk in targets.chunks(32) {
+        explicit_scan_arguments(&snapshot.identity, chunk, false)?;
+    }
+    let owner = PermanentProbeOwner::acquire_system(&snapshot, execute_system_nft)?;
+    let result = (|| {
+        let probe = |timestamp: bool| -> Result<BTreeMap<String, f64>, String> {
+            let mut observations = BTreeMap::new();
+            for chunk in targets.chunks(32) {
+                if !owner.matches_route(&explicit_snapshot(settings)?.identity) {
+                    return Err("explicit scan route changed before probe".into());
+                }
+                let arguments = explicit_scan_arguments(&snapshot.identity, chunk, timestamp)?;
+                let output = owner.run_owned_command(
+                    &SpawnSpec {
+                        program: program.to_path_buf(),
+                        arguments,
+                        environment: Vec::new(),
+                    },
+                    FPING_SCAN_TIMEOUT,
+                    MAX_OUTPUT_BYTES,
+                    || false,
+                )?;
+                if !owner.matches_route(&explicit_snapshot(settings)?.identity) {
+                    return Err("explicit scan route changed during probe".into());
+                }
+                // fping status1 means some targets did not respond; >1 is a real
+                // backend/argument failure, never evidence of unhealthy reflectors.
+                if !matches!(output.status.code(), Some(0 | 1)) {
+                    return Err("explicit scan fping failed".into());
+                }
+                let mut text = output_text(&output.stdout, "explicit fping scan")?;
+                text.push_str(&output_text(&output.stderr, "explicit fping scan")?);
+                observations.extend(parse_fping(&text));
+            }
+            Ok(observations)
+        };
+        let rtt = probe(false)?;
+        let timestamp = if availability.fping_ts {
+            probe(true)?
+        } else {
+            BTreeMap::new()
+        };
+        Ok((
+            rtt,
+            timestamp,
+            if availability.fping_ts {
+                "fping-ts".into()
+            } else {
+                String::new()
+            },
+        ))
+    })();
+    // Cleanup also checks producer tokens and live credentials. On uncertain
+    // child termination it refuses release and keeps the quarantine fence.
+    owner.retire(|args| execute_system_nft(args, None))?;
+    result
+}
+
 fn check_route(environment: &Environment, settings: &Settings) -> Result<(), String> {
+    if settings.route_mode == RouteMode::Explicit {
+        return explicit_snapshot(settings).map(|_| ());
+    }
     if settings.route_mode != RouteMode::Mwan3 {
         return Ok(());
     }
@@ -713,6 +862,9 @@ fn routed_command(
     arguments: Vec<OsString>,
     timeout: Duration,
 ) -> Result<BoundedCommandOutput, String> {
+    if settings.route_mode == RouteMode::Explicit {
+        return Err("explicit scan requires an admitted probe owner".into());
+    }
     if settings.route_mode == RouteMode::Main {
         return command(program, arguments, timeout);
     }
@@ -821,6 +973,9 @@ fn probe_tsping(
     settings: &Settings,
     targets: &[String],
 ) -> Result<BTreeMap<String, f64>, String> {
+    if settings.route_mode == RouteMode::Explicit {
+        return Err("explicit tsping source-address binding is not supported".into());
+    }
     let (Some(timeout), Some(tsping)) = (
         environment.timeout.as_deref(),
         environment.tsping.as_deref(),
@@ -890,6 +1045,9 @@ fn build_plan(
     }
     let (valid_candidates, mut bad) = unique_validated(candidates.clone(), false);
     let mut warnings = Vec::new();
+    if settings.route_mode == RouteMode::Explicit {
+        push_warning(&mut warnings, "Explicit scans require literal IPv4 reflectors and owned fping; tsping source binding is unavailable.");
+    }
     if candidate_limit_exceeded {
         push_warning(
             &mut warnings,
@@ -1094,6 +1252,9 @@ fn install(
     } else {
         PingerMethod::parse(selected)?
     };
+    if settings.route_mode == RouteMode::Explicit && selected == PingerMethod::Tsping {
+        return Err("explicit tsping source-address binding is not supported".into());
+    }
     let mut availability = detect_availability(environment)?;
     let ready = availability.available(selected, settings.irtt_servers.len());
     if !selected.installable() {
@@ -1188,34 +1349,40 @@ fn run_with_environment(
     if mode == Mode::Install {
         return install(environment, &settings, &selected);
     }
-    let availability = detect_availability(environment)?;
+    let mut availability = detect_availability(environment)?;
+    if settings.route_mode == RouteMode::Explicit {
+        availability.tsping = false;
+    }
     let mut candidates = settings.configured_reflectors.clone();
     if candidates.is_empty() || mode == Mode::Scan {
         candidates.extend(standard_reflectors());
     }
     let (targets, _) = unique_validated(candidates, false);
-    let (rtt, timestamp, timestamp_backend) = if mode == Mode::Scan {
-        let rtt = probe_fping(environment, &settings, &targets, false).unwrap_or_default();
-        let mut timestamp = BTreeMap::new();
-        let mut backend = String::new();
-        if availability.fping_ts {
-            timestamp = probe_fping(environment, &settings, &targets, true).unwrap_or_default();
-            backend = "fping-ts".to_string();
-        } else if availability.tsping {
-            timestamp = probe_tsping(environment, &settings, &targets).unwrap_or_default();
-            backend = "tsping".to_string();
-        }
-        if timestamp.is_empty() && availability.tsping && backend != "tsping" {
-            let fallback = probe_tsping(environment, &settings, &targets).unwrap_or_default();
-            if !fallback.is_empty() {
-                timestamp = fallback;
+    let (rtt, timestamp, timestamp_backend) =
+        if mode == Mode::Scan && settings.route_mode == RouteMode::Explicit {
+            scan_explicit(environment, &settings, &targets, &availability)?
+        } else if mode == Mode::Scan {
+            let rtt = probe_fping(environment, &settings, &targets, false).unwrap_or_default();
+            let mut timestamp = BTreeMap::new();
+            let mut backend = String::new();
+            if availability.fping_ts {
+                timestamp = probe_fping(environment, &settings, &targets, true).unwrap_or_default();
+                backend = "fping-ts".to_string();
+            } else if availability.tsping {
+                timestamp = probe_tsping(environment, &settings, &targets).unwrap_or_default();
                 backend = "tsping".to_string();
             }
-        }
-        (rtt, timestamp, backend)
-    } else {
-        (BTreeMap::new(), BTreeMap::new(), String::new())
-    };
+            if timestamp.is_empty() && availability.tsping && backend != "tsping" {
+                let fallback = probe_tsping(environment, &settings, &targets).unwrap_or_default();
+                if !fallback.is_empty() {
+                    timestamp = fallback;
+                    backend = "tsping".to_string();
+                }
+            }
+            (rtt, timestamp, backend)
+        } else {
+            (BTreeMap::new(), BTreeMap::new(), String::new())
+        };
     Ok(build_plan(settings, availability, rtt, timestamp, timestamp_backend).encode_json())
 }
 
@@ -1263,6 +1430,8 @@ mod tests {
             mode,
             route_mode: RouteMode::Main,
             mwan3_member: String::new(),
+            explicit_authority: None,
+            explicit_device: String::new(),
             configured_method: "fping".to_string(),
             configured_no_pingers: 6,
             reflector_ping_interval_s: "0.3".to_string(),
@@ -1388,6 +1557,570 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("https://bad.example")));
+    }
+
+    #[test]
+    #[ignore = "requires two fresh disposable root-owned VM network namespaces"]
+    fn r6_explicit_scanner_vm_packets() {
+        use crate::permanent_probe_owner::execute_system_nft;
+        let peer = std::env::var("CAKE_R6_SCAN_PEER").unwrap();
+        assert!(peer.starts_with("cake-r6-owner-") && crate::routing::is_safe_identifier(&peer));
+        assert_ne!(
+            fs::read_link("/proc/self/ns/net").unwrap(),
+            fs::read_link("/proc/1/ns/net").unwrap()
+        );
+        let ip = |args: &[&str]| {
+            let output = command(
+                Path::new("/sbin/ip"),
+                args.iter().copied(),
+                Duration::from_secs(3),
+            )
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "ip {:?}: {:?}",
+                args,
+                output.stderr
+            );
+            output.stdout
+        };
+        for args in [
+            vec!["-j", "link", "show"],
+            vec!["-n", peer.as_str(), "-j", "link", "show"],
+        ] {
+            let links: serde_json::Value = serde_json::from_slice(&ip(&args)).unwrap();
+            assert_eq!(links.as_array().unwrap().len(), 1);
+            assert_eq!(links[0]["ifname"], "lo");
+        }
+        ip(&[
+            "link",
+            "add",
+            "scan-wan",
+            "type",
+            "veth",
+            "peer",
+            "name",
+            "scan-peer",
+        ]);
+        ip(&["link", "set", "scan-peer", "netns", &peer]);
+        ip(&["link", "set", "scan-wan", "up"]);
+        ip(&["addr", "add", "192.0.2.2/32", "dev", "scan-wan"]);
+        ip(&["-n", &peer, "link", "set", "scan-peer", "up"]);
+        ip(&[
+            "-n",
+            &peer,
+            "addr",
+            "add",
+            "192.0.2.1/24",
+            "dev",
+            "scan-peer",
+        ]);
+        ip(&[
+            "link",
+            "add",
+            "scan-other",
+            "type",
+            "veth",
+            "peer",
+            "name",
+            "scan-other-peer",
+        ]);
+        ip(&["link", "set", "scan-other", "up"]);
+        ip(&["link", "set", "scan-other-peer", "up"]);
+        ip(&["route", "add", "default", "dev", "scan-other"]);
+        ip(&["route", "add", "table", "101", "default", "dev", "scan-wan"]);
+        ip(&[
+            "rule",
+            "add",
+            "pref",
+            "100",
+            "fwmark",
+            "0x100/0x3f00",
+            "lookup",
+            "101",
+        ]);
+        let witness = b"create table inet cake_scan_witness\nadd counter inet cake_scan_witness selected\nadd counter inet cake_scan_witness foreign\nadd counter inet cake_scan_witness foreign_ipv6\nadd counter inet cake_scan_witness foreign_all\nadd chain inet cake_scan_witness post { type filter hook postrouting priority 200; policy accept; }\nadd rule inet cake_scan_witness post oifname \"scan-wan\" ip saddr 192.0.2.2 ip daddr 192.0.2.1 meta mark & 0x3f00 == 0x100 counter name selected\nadd rule inet cake_scan_witness post oifname \"scan-other\" meta nfproto ipv4 counter name foreign\nadd rule inet cake_scan_witness post oifname \"scan-other\" meta nfproto ipv6 counter name foreign_ipv6\nadd rule inet cake_scan_witness post oifname \"scan-other\" counter name foreign_all\n";
+        assert!(execute_system_nft(&["-f", "-"], Some(witness)).unwrap().0);
+        let mut configured = settings(Mode::Scan);
+        configured.route_mode = RouteMode::Explicit;
+        configured.explicit_device = "scan-wan".into();
+        configured.explicit_authority = crate::routing::ExplicitRouteAuthority::from_fields(
+            "explicit",
+            ["192.0.2.2", "101", "0x100", "0x3f00"],
+        )
+        .unwrap();
+        let environment = Environment::live().unwrap();
+        let availability = Availability {
+            fping: true,
+            fping_ts: false,
+            ..Availability::default()
+        };
+        let (rtt, timestamp, backend) = scan_explicit(
+            &environment,
+            &configured,
+            &["192.0.2.1".into()],
+            &availability,
+        )
+        .unwrap();
+        assert!(rtt
+            .get("192.0.2.1")
+            .is_some_and(|value| value.is_finite() && *value >= 0.0));
+        assert!(timestamp.is_empty() && backend.is_empty());
+        // Exercise the production long-lived child/reader/producer lifecycle,
+        // not merely the bounded scanner command. Each owner must retire.
+        for method in ["fping", "ping"] {
+            let mut cfg = crate::Config::defaults("r6-packet-fixture".into());
+            cfg.route_mode = "explicit".into();
+            cfg.ul_if = "scan-wan".into();
+            cfg.sqm_interface = "scan-wan".into();
+            cfg.mwan3_member.clear();
+            cfg.ping_prefix_string.clear();
+            cfg.explicit_route_authority = configured.explicit_authority.clone();
+            cfg.pinger_method = method.into();
+            cfg.reflector_ping_interval_s = 0.2;
+            cfg.no_pingers = 1;
+            let route = explicit_snapshot(&configured).unwrap();
+            let owner = crate::permanent_probe_owner::PermanentProbeOwner::acquire_system(
+                &route,
+                execute_system_nft,
+            )
+            .unwrap();
+            let producer = owner.admit_producer().unwrap();
+            let mut plan = crate::PingerPlan::configured(&cfg);
+            let mut runtime = crate::PingerRuntime::spawn(
+                &cfg,
+                &["192.0.2.1".into()],
+                &mut plan,
+                &route,
+                Some(producer),
+            )
+            .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut received = false;
+            while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+                let Ok(Ok(line)) = runtime.lines.recv_timeout(remaining) else {
+                    break;
+                };
+                if let Some(sample) = crate::parse_sample_line(
+                    &cfg,
+                    &line.line,
+                    &line.reflector,
+                    line.observed_epoch_secs,
+                ) {
+                    received = sample.reflector == "192.0.2.1"
+                        && sample.rtt_ms.is_finite()
+                        && sample.rtt_ms >= 0.0;
+                    if received {
+                        break;
+                    }
+                }
+            }
+            runtime.stop();
+            assert!(!owner.has_producers());
+            let owned = owner
+                .counters_with(|args| execute_system_nft(args, None))
+                .unwrap();
+            owner.retire(|args| execute_system_nft(args, None)).unwrap();
+            assert!(received, "{method}: no parsed reflector reply");
+            assert!(
+                owned.rx_bytes > 0 && owned.tx_bytes > 0,
+                "{method}: {owned:?}"
+            );
+            println!(
+                "PERMANENT_PACKET_PROOF method={method} rx={} tx={} retired=true",
+                owned.rx_bytes, owned.tx_bytes
+            );
+        }
+        // Direct DNS and subsequent TCP both use the same route-owned socket
+        // path. Never alter the VM's system resolver configuration.
+        // The peer listener runs in the other disposable namespace and is
+        // reaped even if the probe assertion fails.
+        struct PeerServer(std::process::Child);
+        impl Drop for PeerServer {
+            fn drop(&mut self) {
+                crate::stop_child(&mut self.0);
+            }
+        }
+        let server = PeerServer(
+            std::process::Command::new("/sbin/ip")
+                .args(["netns", "exec", &peer])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "operations::pinger_plan::tests::r6_explicit_transport_peer",
+                    "--exact",
+                    "--ignored",
+                    "--test-threads=1",
+                ])
+                .env("CAKE_R6_TRANSPORT_PEER", "1")
+                .stdout(std::process::Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        let route = explicit_snapshot(&configured).unwrap();
+        let owner = crate::permanent_probe_owner::PermanentProbeOwner::acquire_system(
+            &route,
+            execute_system_nft,
+        )
+        .unwrap();
+        let producer = owner.admit_producer().unwrap();
+        let mut engine = crate::transport_probe::TransportProbeEngine::new_with_dns(
+            crate::transport_probe::TransportProbeBackend::TcpConnect,
+            "http://r6-peer.test:18081/".into(),
+            crate::transport_probe::RouteBinding {
+                device: route.identity.device.clone(),
+                source_ip: route.identity.source_ip.clone(),
+                fwmark: route.identity.fwmark.clone(),
+                traffic_gid: Some(producer.gid()),
+            },
+            Duration::from_secs(2),
+            Some("192.0.2.1".parse().unwrap()),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        let sample = loop {
+            let result = engine.probe();
+            if result.is_ok() || std::time::Instant::now() >= deadline {
+                break result;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        drop(engine);
+        producer.confirm_stopped();
+        let owned = owner
+            .counters_with(|args| execute_system_nft(args, None))
+            .unwrap();
+        owner.retire(|args| execute_system_nft(args, None)).unwrap();
+        let sample = sample.unwrap();
+        assert!(sample.trusted && sample.rtt_ms.is_finite() && sample.rtt_ms > 0.0);
+        assert!(owned.rx_bytes > 0 && owned.tx_bytes > 0);
+        assert_eq!(
+            explicit_snapshot(&configured).unwrap().identity,
+            route.identity
+        );
+        println!(
+            "TRANSPORT_PACKET_PROOF backend=tcp rx={} tx={} retired=true",
+            owned.rx_bytes, owned.tx_bytes
+        );
+        println!("ROUTED_DNS_PACKET_PROOF direct_tcp=true system_resolver=false");
+        for configured_dns in [true, false] {
+            let mut cfg = crate::Config::defaults("r6-transport-worker".into());
+            cfg.route_mode = "explicit".into();
+            cfg.ul_if = "scan-wan".into();
+            cfg.sqm_interface = "scan-wan".into();
+            cfg.mwan3_member.clear();
+            cfg.explicit_route_authority = configured.explicit_authority.clone();
+            cfg.explicit_dns_server = configured_dns.then(|| "192.0.2.1".parse().unwrap());
+            cfg.transport_probe_backend = "tcp-connect".into();
+            cfg.transport_probe_endpoint = "http://r6-peer.test:18081/".into();
+            cfg.transport_probe_timeout_s = 2;
+            let owner = crate::permanent_probe_owner::PermanentProbeOwner::acquire_system(
+                &route,
+                execute_system_nft,
+            )
+            .unwrap();
+            let worker =
+                crate::TransportProbeRuntime::spawn(&cfg, Some(owner.admit_producer().unwrap()));
+            let request = crate::TransportProbeRequest {
+                probe_id: 1,
+                control_valid: true,
+                dl_loaded: false,
+                ul_loaded: false,
+                rating_phase: crate::RatingPhase::Idle,
+                autotune_capture: None,
+            };
+            worker
+                .requests
+                .as_ref()
+                .unwrap()
+                .send(request.clone())
+                .unwrap();
+            let outcome = worker.results.recv_timeout(Duration::from_secs(5)).unwrap();
+            if configured_dns {
+                assert!(outcome.error.is_none(), "{:?}", outcome.error);
+                assert!(
+                    outcome.trusted
+                        && outcome
+                            .latency_ms
+                            .is_some_and(|rtt| rtt.is_finite() && rtt > 0.0)
+                );
+                assert_eq!(
+                    outcome.route_identity.as_deref(),
+                    Some(route.stable_key().as_str())
+                );
+                // Kernel rule disappearance must invalidate the cached engine
+                // before any subsequent request can fall back to main.
+                ip(&["rule", "del", "priority", "100"]);
+                worker.requests.as_ref().unwrap().send(request).unwrap();
+                let refused = worker.results.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(refused.error.is_some() && refused.latency_ms.is_none());
+                ip(&[
+                    "rule",
+                    "add",
+                    "priority",
+                    "100",
+                    "fwmark",
+                    "0x100/0x3f00",
+                    "table",
+                    "101",
+                ]);
+            } else {
+                assert!(outcome
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("route_dns_ipv4")));
+                assert!(outcome.latency_ms.is_none());
+            }
+            drop(worker); // closes requests, joins the thread, confirms producer
+            assert!(!owner.has_producers());
+            let counters = owner
+                .counters_with(|args| execute_system_nft(args, None))
+                .unwrap();
+            owner.retire(|args| execute_system_nft(args, None)).unwrap();
+            if configured_dns {
+                assert!(counters.rx_bytes > 0 && counters.tx_bytes > 0);
+            } else {
+                assert_eq!((counters.rx_bytes, counters.tx_bytes), (0, 0));
+            }
+            println!(
+                "TRANSPORT_WORKER_PROOF dns={configured_dns} retired=true rx={} tx={}",
+                counters.rx_bytes, counters.tx_bytes
+            );
+        }
+        // Component proof only: the installed APK executes under the fixture's
+        // owned fence, not the production Auto-Tune backend supervisor.
+        let route = explicit_snapshot(&configured).unwrap();
+        let owner = crate::permanent_probe_owner::PermanentProbeOwner::acquire_system(
+            &route,
+            execute_system_nft,
+        )
+        .unwrap();
+        let output = owner
+            .run_owned_command(
+                &SpawnSpec {
+                    program: "/usr/bin/speedtest-go".into(),
+                    arguments: [
+                        "--list",
+                        "--source",
+                        "192.0.2.2",
+                        "--route-dns-ipv4",
+                        "192.0.2.1",
+                    ]
+                    .map(std::ffi::OsString::from)
+                    .to_vec(),
+                    environment: Vec::new(),
+                },
+                Duration::from_secs(5),
+                16 * 1024,
+                || false,
+            )
+            .unwrap();
+        let counters = owner
+            .counters_with(|args| execute_system_nft(args, None))
+            .unwrap();
+        owner.retire(|args| execute_system_nft(args, None)).unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(text.contains("no such host"), "{text}");
+        assert!(counters.rx_bytes > 0 && counters.tx_bytes > 0);
+        assert_eq!(
+            explicit_snapshot(&configured).unwrap().identity,
+            route.identity
+        );
+        println!(
+            "BACKEND_DNS_VM_PROOF nxdomain=true retired=true rx={} tx={}",
+            counters.rx_bytes, counters.tx_bytes
+        );
+        drop(server);
+        let (ok, counters) =
+            execute_system_nft(&["-j", "list", "table", "inet", "cake_scan_witness"], None)
+                .unwrap();
+        assert!(ok);
+        let counters: serde_json::Value = serde_json::from_slice(&counters).unwrap();
+        let count = |name: &str| {
+            counters["nftables"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item.get("counter"))
+                .find(|counter| counter["name"] == name)
+                .unwrap()["packets"]
+                .as_u64()
+                .unwrap()
+        };
+        assert!(count("selected") > 0);
+        println!(
+            "SCANNER_PACKET_PROOF selected={} foreign_ipv4={} foreign_ipv6={} foreign_all={}",
+            count("selected"),
+            count("foreign"),
+            count("foreign_ipv6"),
+            count("foreign_all")
+        );
+        assert_eq!(count("foreign"), 0);
+        assert_eq!(count("foreign_all"), count("foreign_ipv6"));
+        let (ok, tables) = execute_system_nft(&["-j", "list", "tables"], None).unwrap();
+        assert!(ok);
+        let tables: serde_json::Value = serde_json::from_slice(&tables).unwrap();
+        let names: Vec<_> = tables["nftables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item.get("table"))
+            .map(|table| table["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["cake_scan_witness"]);
+        assert!(
+            execute_system_nft(&["delete", "table", "inet", "cake_scan_witness"], None)
+                .unwrap()
+                .0
+        );
+    }
+
+    #[test]
+    #[ignore = "peer process for isolated VM transport fixture only"]
+    fn r6_explicit_transport_peer() {
+        assert_eq!(std::env::var("CAKE_R6_TRANSPORT_PEER").as_deref(), Ok("1"));
+        assert_ne!(
+            std::fs::read_link("/proc/self/ns/net").unwrap(),
+            std::fs::read_link("/proc/1/ns/net").unwrap(),
+        );
+        let listener = std::net::TcpListener::bind("192.0.2.1:18081").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let dns = std::net::TcpListener::bind("192.0.2.1:53").unwrap();
+        dns.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            match dns.accept() {
+                Ok((mut stream, address)) => {
+                    use std::io::{Read, Write};
+                    assert_eq!(address.ip().to_string(), "192.0.2.2");
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut length = [0; 2];
+                    stream.read_exact(&mut length).unwrap();
+                    let length = usize::from(u16::from_be_bytes(length));
+                    assert!((17..=272).contains(&length));
+                    let mut response = vec![0; length];
+                    stream.read_exact(&mut response).unwrap();
+                    let expected = crate::routed_dns::query(
+                        "r6-peer.test",
+                        u16::from_be_bytes([response[0], response[1]]),
+                    )
+                    .unwrap();
+                    if response == expected {
+                        response[2..4].copy_from_slice(&[0x81, 0x80]);
+                        response[6..8].copy_from_slice(&[0, 1]);
+                        response.extend_from_slice(&[
+                            0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 1, 0, 4, 192, 0, 2, 1,
+                        ]);
+                    } else {
+                        // Go may ask A and AAAA and append EDNS. Refuse the
+                        // backend's discovery name with an actual DNS response,
+                        // so the test cannot pass on a connect/route failure.
+                        assert_eq!(&response[4..6], &[0, 1]);
+                        let mut end = 12;
+                        let mut labels = Vec::new();
+                        loop {
+                            let length = usize::from(response[end]);
+                            end += 1;
+                            if length == 0 {
+                                break;
+                            }
+                            assert!(length <= 63 && end + length < response.len());
+                            labels.push(std::str::from_utf8(&response[end..end + length]).unwrap());
+                            end += length;
+                        }
+                        let name = labels.join(".");
+                        // NXDOMAIN can trigger configured DNS search suffixes;
+                        // these queries must still reach this selected peer.
+                        assert!(
+                            name == "www.speedtest.net" || name.starts_with("www.speedtest.net.")
+                        );
+                        end += 4;
+                        assert!(end <= response.len());
+                        assert!(matches!(&response[end - 4..end - 2], [0, 1] | [0, 28]));
+                        assert_eq!(&response[end - 2..end], &[0, 1]);
+                        response.truncate(end);
+                        response[2..4].copy_from_slice(&[0x81, 0x83]);
+                        response[6..12].fill(0);
+                    }
+                    stream
+                        .write_all(&(response.len() as u16).to_be_bytes())
+                        .unwrap();
+                    stream.write_all(&response).unwrap();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("DNS peer listener: {error}"),
+            }
+            match listener.accept() {
+                Ok((stream, address)) => {
+                    assert_eq!(address.ip().to_string(), "192.0.2.2");
+                    drop(stream);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("peer listener: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn r6_explicit_scan_arguments_pin_source_device_and_refuse_unowned_dns() {
+        let route = crate::routing::RouteIdentity {
+            device_ifindex: Some(42),
+            mode: "explicit".into(),
+            member: String::new(),
+            device: "eth1".into(),
+            source_ip: "192.0.2.2".into(),
+            fwmark: "0x100".into(),
+            table: "101".into(),
+            fwmark_mask: Some(0x3f00),
+        };
+        let targets = vec!["198.51.100.1".into()];
+        let args = explicit_scan_arguments(&route, &targets, true).unwrap();
+        assert_eq!(
+            args,
+            [
+                "-I",
+                "eth1",
+                "-S",
+                "192.0.2.2",
+                "--icmp-timestamp",
+                "-i",
+                "100",
+                "-c",
+                "1",
+                "-t",
+                "1000",
+                "--",
+                "198.51.100.1"
+            ]
+            .map(OsString::from)
+        );
+        for targets in [
+            Vec::new(),
+            vec!["reflector.example".into()],
+            vec!["2001:db8::1".into()],
+            vec!["--help".into()],
+            vec!["198.51.100.1".into(); 33],
+        ] {
+            assert!(explicit_scan_arguments(&route, &targets, false).is_err());
+        }
+        let targets = vec!["198.51.100.1".into(); 32];
+        let spec = SpawnSpec {
+            program: "/bin/true".into(),
+            arguments: explicit_scan_arguments(&route, &targets, true).unwrap(),
+            environment: Vec::new(),
+        };
+        spec.validate().unwrap();
     }
 
     #[test]

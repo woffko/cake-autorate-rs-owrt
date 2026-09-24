@@ -20,9 +20,16 @@ const CONTROL_FILE: &str = "control.record";
 const RESTORE_FILE: &str = "restore.record";
 const ACK_FILE: &str = "ack.record";
 const CHECKPOINT_FILE: &str = "checkpoint.record";
+// Companion records survive runtime finalization. Keeping them outside the
+// runtime directory preserves its legacy ownership/idle checks.
+const PROBE_RETIREMENT_REQUEST: &str = "autotune-probe-retirement-request";
+const PROBE_RETIREMENT_RECEIPT: &str = "autotune-probe-retirement-receipt";
 const PERMIT_HEADER: &str = "cake-autorate-autotune-runtime-permit\t3";
 const VARIANT_PERMIT_HEADER: &str = "cake-autorate-autotune-runtime-permit\t4";
 const NAMESPACE_PERMIT_HEADER: &str = "cake-autorate-autotune-runtime-permit\t5";
+const ACCOUNTING_PERMIT_HEADER: &str = "cake-autorate-autotune-runtime-permit\t6";
+const DNS_PERMIT_HEADER: &str = "cake-autorate-autotune-runtime-permit\t7";
+const PROBE_ACCOUNTING_FILE: &str = "autotune-probe-accounting-owner";
 const CHECKPOINT_HEADER: &str = "cake-autorate-autotune-runtime-checkpoint\t2";
 const ABSENT_CHECKPOINT_HEADER: &str = "cake-autorate-autotune-runtime-checkpoint\t3";
 const NAMESPACE_CHECKPOINT_HEADER: &str = "cake-autorate-autotune-runtime-checkpoint\t4";
@@ -36,14 +43,20 @@ unsafe extern "C" {
 
 impl AutotuneRuntimePermit {
     pub fn encode(&self) -> Result<String, String> {
-        self.encode_for_schema(match &self.baseline {
-            RuntimeBaseline::Managed(_) => 3,
-            RuntimeBaseline::Absent(_) => 5,
+        self.encode_for_schema(if self.dns_server.is_some() {
+            7
+        } else if self.probe_accounting_required {
+            6
+        } else {
+            match &self.baseline {
+                RuntimeBaseline::Managed(_) => 3,
+                RuntimeBaseline::Absent(_) => 5,
+            }
         })
     }
 
     fn encode_for_schema(&self, schema: u8) -> Result<String, String> {
-        if !(3..=5).contains(&schema) {
+        if !(3..=7).contains(&schema) {
             return Err("unsupported runtime permit schema".to_string());
         }
         if schema < 5 && matches!(&self.baseline, RuntimeBaseline::Absent(_)) {
@@ -53,6 +66,12 @@ impl AutotuneRuntimePermit {
             );
         }
         self.validate()?;
+        if schema < 7 && self.probe_accounting_required != (schema == 6) {
+            return Err("runtime permit accounting capability contradicts schema".into());
+        }
+        if (schema == 7) != self.dns_server.is_some() {
+            return Err("runtime permit DNS encoding downgrade or mismatch".into());
+        }
         let mut fields = vec![
             ("permit_id", self.permit_id.clone()),
             ("permit_kind", self.kind.as_str().to_string()),
@@ -184,11 +203,27 @@ impl AutotuneRuntimePermit {
                 self.upload_bounds.maximum_kbps.to_string(),
             ),
         ]);
+        if schema >= 6 {
+            fields.push((
+                "probe_accounting_required",
+                if self.probe_accounting_required {
+                    "1"
+                } else {
+                    "0"
+                }
+                .to_string(),
+            ));
+        }
+        if let Some(server) = self.dns_server {
+            fields.push(("route_dns_ipv4", server.to_string()));
+        }
         encode_record(
             match schema {
                 3 => PERMIT_HEADER,
                 4 => VARIANT_PERMIT_HEADER,
                 5 => NAMESPACE_PERMIT_HEADER,
+                6 => ACCOUNTING_PERMIT_HEADER,
+                7 => DNS_PERMIT_HEADER,
                 _ => unreachable!(),
             },
             &fields,
@@ -197,6 +232,8 @@ impl AutotuneRuntimePermit {
 
     pub fn decode(input: &str) -> Result<Self, String> {
         let schema = match input.lines().next() {
+            Some(DNS_PERMIT_HEADER) => 7,
+            Some(ACCOUNTING_PERMIT_HEADER) => 6,
             Some(NAMESPACE_PERMIT_HEADER) => 5,
             Some(VARIANT_PERMIT_HEADER) => 4,
             Some(PERMIT_HEADER) => 3,
@@ -208,6 +245,8 @@ impl AutotuneRuntimePermit {
                 3 => PERMIT_HEADER,
                 4 => VARIANT_PERMIT_HEADER,
                 5 => NAMESPACE_PERMIT_HEADER,
+                6 => ACCOUNTING_PERMIT_HEADER,
+                7 => DNS_PERMIT_HEADER,
                 _ => unreachable!(),
             },
         )?;
@@ -352,6 +391,24 @@ impl AutotuneRuntimePermit {
                     "upload_maximum_kbps",
                     &reader.field("upload_maximum_kbps")?,
                 )?,
+            },
+            probe_accounting_required: if schema >= 6 {
+                parse_bool(
+                    "probe_accounting_required",
+                    &reader.field("probe_accounting_required")?,
+                )?
+            } else {
+                false
+            },
+            dns_server: if schema == 7 {
+                Some(
+                    reader
+                        .field("route_dns_ipv4")?
+                        .parse::<std::net::Ipv4Addr>()
+                        .map_err(|_| "runtime permit DNS invalid")?,
+                )
+            } else {
+                None
             },
         };
         reader.finish()?;
@@ -913,7 +970,192 @@ pub struct RuntimeOverrideStore {
     root: PathBuf,
 }
 
+/// A terminal admission fence, not an SQM restoration acknowledgement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProbeRetirement {
+    pub job_id: String,
+    pub worker_run_id: String,
+}
+
+impl ProbeRetirement {
+    fn encode(&self) -> Result<String, String> {
+        require_lower_hex("job_id", &self.job_id, 32)?;
+        require_lower_hex("worker_run_id", &self.worker_run_id, 32)?;
+        Ok(format!(
+            "cake-autorate-probe-retirement\t1\njob_id={}\nworker_run_id={}\n",
+            self.job_id, self.worker_run_id
+        ))
+    }
+
+    fn decode(input: &str) -> Result<Self, String> {
+        let mut fields = RecordReader::new(input, "cake-autorate-probe-retirement\t1")?;
+        let record = Self {
+            job_id: fields.field("job_id")?,
+            worker_run_id: fields.field("worker_run_id")?,
+        };
+        fields.finish()?;
+        if record.encode()? != input {
+            return Err("probe retirement record is not canonical".to_string());
+        }
+        Ok(record)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProbeAccountingOwner {
+    pub job_id: String,
+    pub worker_run_id: String,
+    pub permit_id: String,
+    pub boot_id: String,
+    pub route_fingerprint: String,
+    pub backend_uid: u32,
+    pub probe_gid: u32,
+}
+
+impl ProbeAccountingOwner {
+    fn encode(&self) -> Result<String, String> {
+        for (name, value) in [
+            ("job_id", &self.job_id),
+            ("worker_run_id", &self.worker_run_id),
+            ("permit_id", &self.permit_id),
+            ("boot_id", &self.boot_id),
+        ] {
+            require_lower_hex(name, value, 32)?;
+        }
+        require_lower_hex("route_fingerprint", &self.route_fingerprint, 64)?;
+        if matches!(self.backend_uid, 0 | u32::MAX) || matches!(self.probe_gid, 0 | u32::MAX) {
+            return Err("probe accounting credentials are invalid".into());
+        }
+        use sha2::Digest;
+        let body = format!("cake-autorate-probe-accounting\t1\njob_id={}\nworker_run_id={}\npermit_id={}\nboot_id={}\nroute_fingerprint={}\nbackend_uid={}\nprobe_gid={}\n", self.job_id, self.worker_run_id, self.permit_id, self.boot_id, self.route_fingerprint, self.backend_uid, self.probe_gid);
+        let checksum = sha2::Sha256::digest(body.as_bytes());
+        Ok(format!("{body}sha256={checksum:x}\n"))
+    }
+
+    fn decode(input: &str) -> Result<Self, String> {
+        let mut reader = RecordReader::new(input, "cake-autorate-probe-accounting\t1")?;
+        let owner = Self {
+            job_id: reader.field("job_id")?,
+            worker_run_id: reader.field("worker_run_id")?,
+            permit_id: reader.field("permit_id")?,
+            boot_id: reader.field("boot_id")?,
+            route_fingerprint: reader.field("route_fingerprint")?,
+            backend_uid: parse_u32("backend_uid", &reader.field("backend_uid")?)?,
+            probe_gid: parse_u32("probe_gid", &reader.field("probe_gid")?)?,
+        };
+        require_lower_hex("probe accounting checksum", &reader.field("sha256")?, 64)?;
+        reader.finish()?;
+        if owner.encode()? != input {
+            return Err("probe accounting owner is not canonical".into());
+        }
+        Ok(owner)
+    }
+
+    fn attests(&self, permit: &AutotuneRuntimePermit) -> Result<(), String> {
+        self.encode()?;
+        if !permit.probe_accounting_required
+            || permit.kind != RuntimePermitKind::Autotune
+            || self.job_id != permit.job_id
+            || self.worker_run_id != permit.worker_run_id
+            || self.permit_id != permit.permit_id
+            || self.boot_id != permit.boot_id
+            || self.route_fingerprint != permit.route_fingerprint
+        {
+            return Err("probe accounting owner does not match its permit".into());
+        }
+        Ok(())
+    }
+}
+
 impl RuntimeOverrideStore {
+    /// Before publication, an exactly retired predecessor is not this run's
+    /// accounting owner. Once published, all permit bindings remain mandatory.
+    pub fn probe_accounting_owner_for_supervision(
+        &self,
+        permit: &AutotuneRuntimePermit,
+    ) -> Result<Option<ProbeAccountingOwner>, String> {
+        let Some(owner) = read_optional(
+            &self.instance_run_dir().join(PROBE_ACCOUNTING_FILE),
+            ProbeAccountingOwner::decode,
+        )?
+        else {
+            return Ok(None);
+        };
+        if owner.job_id != permit.job_id || owner.worker_run_id != permit.worker_run_id {
+            let previous = ProbeRetirement {
+                job_id: owner.job_id.clone(),
+                worker_run_id: owner.worker_run_id.clone(),
+            };
+            if self.read_probe_retirement_receipt()?.as_ref() == Some(&previous) {
+                return Ok(None);
+            }
+        }
+        owner.attests(permit)?;
+        Ok(Some(owner))
+    }
+
+    pub fn publish_probe_accounting_owner(
+        &self,
+        permit: &AutotuneRuntimePermit,
+        owner: &ProbeAccountingOwner,
+    ) -> Result<(), String> {
+        owner.attests(permit)?;
+        if self.read_permit()?.as_ref() != Some(permit) {
+            return Err("probe accounting permit changed before publication".into());
+        }
+        let retired = ProbeRetirement {
+            job_id: owner.job_id.clone(),
+            worker_run_id: owner.worker_run_id.clone(),
+        };
+        if self.read_probe_retirement()?.as_ref() == Some(&retired) {
+            return Err("probe accounting owner is retired".into());
+        }
+        if let Some(previous) = read_optional(
+            &self.instance_run_dir().join(PROBE_ACCOUNTING_FILE),
+            ProbeAccountingOwner::decode,
+        )? {
+            if previous == *owner {
+                return Ok(());
+            }
+            if previous.job_id == owner.job_id && previous.worker_run_id == owner.worker_run_id {
+                return Err("probe accounting identity cannot change during a run".into());
+            }
+            let previous_retired = ProbeRetirement {
+                job_id: previous.job_id,
+                worker_run_id: previous.worker_run_id,
+            };
+            if self.read_probe_retirement_receipt()?.as_ref() != Some(&previous_retired) {
+                return Err("previous probe accounting owner is not retired".into());
+            }
+        }
+        atomic_write(
+            self.instance_run_dir(),
+            PROBE_ACCOUNTING_FILE,
+            &owner.encode()?,
+        )
+    }
+
+    pub fn probe_accounting_owner(
+        &self,
+        permit: &AutotuneRuntimePermit,
+    ) -> Result<Option<ProbeAccountingOwner>, String> {
+        if !permit.probe_accounting_required {
+            return Ok(None);
+        }
+        let owner = read_optional(
+            &self.instance_run_dir().join(PROBE_ACCOUNTING_FILE),
+            ProbeAccountingOwner::decode,
+        )?
+        .ok_or_else(|| "required probe accounting owner is missing".to_string())?;
+        owner.attests(permit)?;
+        if self.read_probe_retirement()?.is_some_and(|retired| {
+            retired.job_id == owner.job_id && retired.worker_run_id == owner.worker_run_id
+        }) {
+            return Err("probe accounting owner is retired".into());
+        }
+        Ok(Some(owner))
+    }
+
     pub fn open(instance_run_dir: &Path) -> Result<Self, String> {
         ensure_existing_directory(instance_run_dir, false)?;
         let root = instance_run_dir.join(RUNTIME_DIR);
@@ -923,12 +1165,59 @@ impl RuntimeOverrideStore {
     }
 
     /// Return the private per-instance directory which owns this store.
-    /// Callers use it only for exact job-owned companion records after the
-    /// runtime ownership records have been proven absent.
+    /// Retirement companions may coexist with runtime restoration. Callers
+    /// using this path for topology cleanup must first prove runtime ownership
+    /// records absent; the path itself grants no cleanup authority.
     pub fn instance_run_dir(&self) -> &Path {
         self.root
             .parent()
             .expect("runtime override store always has an instance parent")
+    }
+
+    pub fn read_probe_retirement(&self) -> Result<Option<ProbeRetirement>, String> {
+        read_optional(
+            &self.instance_run_dir().join(PROBE_RETIREMENT_REQUEST),
+            ProbeRetirement::decode,
+        )
+    }
+
+    fn read_probe_retirement_receipt(&self) -> Result<Option<ProbeRetirement>, String> {
+        read_optional(
+            &self.instance_run_dir().join(PROBE_RETIREMENT_RECEIPT),
+            ProbeRetirement::decode,
+        )
+    }
+
+    /// The coordinator or its worker requests retirement; a bootstrap owner
+    /// may also close its own private run on terminal exit. The worker requests
+    /// but never acknowledges daemon-owned probe shutdown. An unfinished predecessor cannot
+    /// be overwritten; a receipt for another run is never sufficient.
+    pub fn request_probe_retirement(&self, record: &ProbeRetirement) -> Result<bool, String> {
+        let encoded = record.encode()?;
+        let previous = self.read_probe_retirement()?;
+        let receipt = self.read_probe_retirement_receipt()?;
+        if previous.as_ref() != Some(record) {
+            if previous.is_some() && receipt != previous {
+                return Err("previous probe retirement is still pending".to_string());
+            }
+            atomic_write(self.instance_run_dir(), PROBE_RETIREMENT_REQUEST, &encoded)?;
+            // Publication, by itself, is never proof of stopped probes.
+            return Ok(false);
+        }
+        Ok(receipt.as_ref() == Some(record))
+    }
+
+    /// Caller must close admission and join all job-owned probe workers first.
+    /// The request remains as a tombstone against re-admitting this exact run.
+    pub fn acknowledge_probe_retirement(&self, record: &ProbeRetirement) -> Result<(), String> {
+        if self.read_probe_retirement()?.as_ref() != Some(record) {
+            return Err("probe retirement acknowledgement has no exact request".to_string());
+        }
+        atomic_write(
+            self.instance_run_dir(),
+            PROBE_RETIREMENT_RECEIPT,
+            &record.encode()?,
+        )
     }
 
     pub fn publish_permit(&self, permit: &AutotuneRuntimePermit) -> Result<(), String> {
@@ -1335,7 +1624,7 @@ fn sync_directory(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("unable to sync {}: {error}", path.display()))
 }
 
-fn effective_uid() -> u32 {
+pub(crate) fn effective_uid() -> u32 {
     unsafe { geteuid() }
 }
 
@@ -1456,6 +1745,8 @@ mod tests {
 
     fn permit() -> AutotuneRuntimePermit {
         AutotuneRuntimePermit {
+            dns_server: None,
+            probe_accounting_required: false,
             kind: RuntimePermitKind::Autotune,
             permit_id: "77".repeat(16),
             job_id: "11".repeat(16),
@@ -1492,6 +1783,231 @@ mod tests {
                 maximum_kbps: 500_000,
             },
         }
+    }
+
+    #[test]
+    fn t2_probe_owner_is_required_immutable_and_retirement_bound() {
+        let root = temp_root("probe-accounting");
+        let store = RuntimeOverrideStore::open(&root).unwrap();
+        let mut permit = permit();
+        assert!(store.probe_accounting_owner(&permit).unwrap().is_none());
+        permit.probe_accounting_required = true;
+        store.publish_permit(&permit).unwrap();
+        assert!(store.probe_accounting_owner(&permit).is_err());
+        assert!(store
+            .probe_accounting_owner_for_supervision(&permit)
+            .unwrap()
+            .is_none());
+        let owner = ProbeAccountingOwner {
+            job_id: permit.job_id.clone(),
+            worker_run_id: permit.worker_run_id.clone(),
+            permit_id: permit.permit_id.clone(),
+            boot_id: permit.boot_id.clone(),
+            route_fingerprint: permit.route_fingerprint.clone(),
+            backend_uid: 32769,
+            probe_gid: 32770,
+        };
+        store
+            .publish_probe_accounting_owner(&permit, &owner)
+            .unwrap();
+        store
+            .publish_probe_accounting_owner(&permit, &owner)
+            .unwrap();
+        assert_eq!(
+            store.probe_accounting_owner(&permit).unwrap(),
+            Some(owner.clone())
+        );
+        assert_eq!(
+            store
+                .probe_accounting_owner_for_supervision(&permit)
+                .unwrap(),
+            Some(owner.clone())
+        );
+        assert_eq!(
+            ProbeAccountingOwner::decode(&owner.encode().unwrap()).unwrap(),
+            owner
+        );
+        assert!(ProbeAccountingOwner::decode(
+            &owner
+                .encode()
+                .unwrap()
+                .replace("probe_gid=32770", "probe_gid=32771")
+        )
+        .is_err());
+        let mut changed = owner.clone();
+        changed.probe_gid += 1;
+        assert!(store
+            .publish_probe_accounting_owner(&permit, &changed)
+            .is_err());
+        changed = owner.clone();
+        changed.route_fingerprint = "f".repeat(64);
+        assert!(store
+            .publish_probe_accounting_owner(&permit, &changed)
+            .is_err());
+        let mut next = permit.clone();
+        next.job_id = "c".repeat(32);
+        next.worker_run_id = "d".repeat(32);
+        next.permit_id = "e".repeat(32);
+        let mut next_owner = owner.clone();
+        next_owner.job_id = next.job_id.clone();
+        next_owner.worker_run_id = next.worker_run_id.clone();
+        next_owner.permit_id = next.permit_id.clone();
+        store.publish_permit(&next).unwrap();
+        assert!(store.probe_accounting_owner(&next).is_err());
+        assert!(store.probe_accounting_owner_for_supervision(&next).is_err());
+        assert!(store
+            .publish_probe_accounting_owner(&next, &next_owner)
+            .is_err());
+        let retired = ProbeRetirement {
+            job_id: owner.job_id.clone(),
+            worker_run_id: owner.worker_run_id.clone(),
+        };
+        store.request_probe_retirement(&retired).unwrap();
+        assert!(store.probe_accounting_owner(&permit).is_err());
+        assert!(store
+            .publish_probe_accounting_owner(&next, &next_owner)
+            .is_err());
+        store.acknowledge_probe_retirement(&retired).unwrap();
+        assert!(store
+            .probe_accounting_owner_for_supervision(&next)
+            .unwrap()
+            .is_none());
+        store
+            .publish_probe_accounting_owner(&next, &next_owner)
+            .unwrap();
+        assert_eq!(
+            store.probe_accounting_owner(&next).unwrap(),
+            Some(next_owner)
+        );
+        assert_eq!(
+            fs::metadata(root.join(PROBE_ACCOUNTING_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn r6_dns_permit_roundtrip_is_canonical_and_cannot_downgrade() {
+        for accounting in [false, true] {
+            let mut value = permit();
+            value.probe_accounting_required = accounting;
+            let legacy = value.encode().unwrap();
+            assert_eq!(AutotuneRuntimePermit::decode(&legacy).unwrap(), value);
+            value.route_identity =
+                "explicit||eth1|192.0.2.2|0x100|101|mask=16128|ifindex=42".into();
+            value.dns_server = Some("192.0.2.53".parse().unwrap());
+            let encoded = value.encode().unwrap();
+            assert!(encoded.starts_with(DNS_PERMIT_HEADER));
+            assert_eq!(AutotuneRuntimePermit::decode(&encoded).unwrap(), value);
+            for schema in 3..=6 {
+                assert!(value.encode_for_schema(schema).is_err());
+            }
+            for replacement in [
+                "",
+                "route_dns_ipv4=127.0.0.1\n",
+                "route_dns_ipv4=192.0.2.053\n",
+                "route_dns_ipv4=192.0.2.53\nroute_dns_ipv4=192.0.2.54\n",
+            ] {
+                assert!(AutotuneRuntimePermit::decode(
+                    &encoded.replace("route_dns_ipv4=192.0.2.53\n", replacement)
+                )
+                .is_err());
+            }
+            value.route_identity = "main||eth1|192.0.2.2||main".into();
+            assert!(value.encode().is_err());
+        }
+    }
+
+    #[test]
+    fn t2_accounting_permit_schema_preserves_legacy_and_refuses_downgrade() {
+        for mut permit in [permit(), absent_permit()] {
+            let old = permit.encode().unwrap();
+            assert!(
+                !AutotuneRuntimePermit::decode(&old)
+                    .unwrap()
+                    .probe_accounting_required
+            );
+            permit.probe_accounting_required = true;
+            let encoded = permit.encode().unwrap();
+            assert!(encoded.starts_with(ACCOUNTING_PERMIT_HEADER));
+            assert_eq!(AutotuneRuntimePermit::decode(&encoded).unwrap(), permit);
+            assert!(AutotuneRuntimePermit::decode(
+                &encoded.replace("probe_accounting_required=1", "probe_accounting_required=0")
+            )
+            .is_err());
+            assert!(AutotuneRuntimePermit::decode(&encoded.replacen(
+                ACCOUNTING_PERMIT_HEADER,
+                NAMESPACE_PERMIT_HEADER,
+                1
+            ))
+            .is_err());
+            assert!(permit.encode_for_schema(5).is_err());
+            permit.probe_accounting_required = false;
+            assert_eq!(permit.encode().unwrap(), old);
+        }
+    }
+
+    #[test]
+    fn t2_probe_retirement_requires_exact_receipt_and_survives_runtime_finalization() {
+        let root = temp_root("probe-retirement");
+        let store = RuntimeOverrideStore::open(&root).unwrap();
+        let first = ProbeRetirement {
+            job_id: "a".repeat(32),
+            worker_run_id: "b".repeat(32),
+        };
+        let second = ProbeRetirement {
+            worker_run_id: "c".repeat(32),
+            ..first.clone()
+        };
+        assert!(store.acknowledge_probe_retirement(&first).is_err());
+        assert!(!store.request_probe_retirement(&first).unwrap());
+        assert!(!store.request_probe_retirement(&first).unwrap());
+        assert!(store.request_probe_retirement(&second).is_err());
+        assert!(store.acknowledge_probe_retirement(&second).is_err());
+        store.acknowledge_probe_retirement(&first).unwrap();
+        assert!(store.request_probe_retirement(&first).unwrap());
+        // The companion files do not enter the legacy runtime record set.
+        let reopened = RuntimeOverrideStore::open(&root).unwrap();
+        reopened.finalize_restored().unwrap();
+        assert_eq!(reopened.read_probe_retirement().unwrap(), Some(first));
+        assert!(!reopened.request_probe_retirement(&second).unwrap());
+        assert!(!reopened.request_probe_retirement(&second).unwrap());
+        reopened.acknowledge_probe_retirement(&second).unwrap();
+        assert!(reopened.request_probe_retirement(&second).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn t2_probe_retirement_rejects_noncanonical_unsafe_and_oversized_records() {
+        let root = temp_root("probe-retirement-invalid");
+        let store = RuntimeOverrideStore::open(&root).unwrap();
+        let record = ProbeRetirement {
+            job_id: "a".repeat(32),
+            worker_run_id: "b".repeat(32),
+        };
+        let encoded = record.encode().unwrap();
+        assert_eq!(ProbeRetirement::decode(&encoded).unwrap(), record);
+        for invalid in [
+            encoded.replace('\n', "\r\n"),
+            encoded.trim_end().to_string(),
+            format!("{encoded}extra=1\n"),
+            encoded.replace(&"a".repeat(32), &"A".repeat(32)),
+        ] {
+            assert!(ProbeRetirement::decode(&invalid).is_err());
+        }
+        let path = root.join(PROBE_RETIREMENT_REQUEST);
+        symlink(root.join("missing"), &path).unwrap();
+        assert!(store.read_probe_retirement().is_err());
+        assert!(store.request_probe_retirement(&record).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, "x".repeat(MAX_RUNTIME_RECORD_BYTES + 1)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(store.read_probe_retirement().is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn absent_permit() -> AutotuneRuntimePermit {
@@ -1633,6 +2149,22 @@ temporary_redirect_preference=50039\n"
     }
 
     #[test]
+    fn r6_linked_explicit_permit_roundtrip_retains_embedded_equals() {
+        let mut permit = permit();
+        permit.route_identity =
+            "explicit||pppoe-wan|192.0.2.1|0x100|101|mask=16128|ifindex=42".into();
+        let encoded = permit.encode().unwrap();
+        assert_eq!(AutotuneRuntimePermit::decode(&encoded).unwrap(), permit);
+        let noncanonical = encoded.replace("ifindex=42", "ifindex=042");
+        assert!(AutotuneRuntimePermit::decode(&noncanonical).is_err());
+        permit.route_identity = "mwan3|wan|pppoe-wan|192.0.2.1|0x100|101|mask=16128".into();
+        let encoded = permit.encode().unwrap();
+        assert_eq!(AutotuneRuntimePermit::decode(&encoded).unwrap(), permit);
+        permit.route_identity.push_str("|ifindex=42");
+        assert!(permit.encode().is_err());
+    }
+
+    #[test]
     fn permit_and_checkpoint_are_canonical_and_strict() {
         let permit = permit();
         let encoded = permit.encode().unwrap();
@@ -1689,7 +2221,9 @@ temporary_redirect_preference=50039\n"
         );
         assert_eq!(decoded.encode_for_schema(3).unwrap(), frozen);
         assert_eq!(decoded.encode().unwrap(), frozen);
-        assert_eq!(permit().encode().unwrap(), frozen_managed_permit(3));
+        let mut historical = permit();
+        historical.maximum_sequence = 256;
+        assert_eq!(historical.encode().unwrap(), frozen_managed_permit(3));
         assert!(permit().encode_for_schema(2).is_err());
         let retired_v2 = frozen
             .replacen(PERMIT_HEADER, "cake-autorate-autotune-runtime-permit\t2", 1)

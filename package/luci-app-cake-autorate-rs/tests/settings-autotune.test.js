@@ -140,9 +140,9 @@ const uci = {
 };
 function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl, eImpl) {
 	return new Function(
-		'fs', 'form', 'network', 'uci', 'ui', 'widgets', 'cakeUi', 'rpc', 'L', 'E', '_',
+		'fs', 'form', 'network', 'uci', 'ui', 'widgets', 'cakeUi', 'rpc', 'L', 'E', '_', 'candidateGuard', 'sqmModes',
 		`${prefix}\ninterfaceContext = { deviceNames: { eth1: true }, deviceNetworks: {}, ` +
-			`networkDevices: {}, defaultDevice: 'eth1' };\nreturn { writeWizardConfig, validateTransportProbeUrl, parseExecJson, ` +
+			`networkDevices: {}, defaultDevice: 'eth1' };\nreturn { writeWizardConfig, applyPingerPlanToState, validateTransportProbeUrl, parseExecJson, ` +
 			`buildInterfaceContext, buildMwan3Context, uniqueMwan3Uplinks, managedUplinkOwner, managedTargetOwner, availableMwan3Uplinks, ` +
 			`targetInterfaceChoices, targetInterfaceChoiceOptions, defaultWizardTarget, ` +
 			`multiwanInstancePlans, wizardPlanConflicts, wizardSingleTargetConflicts, ` +
@@ -150,7 +150,7 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl, eImpl) {
 			`formOrUci, accessMediumDefinitions, accessMediumTitle, accessMediumExplorationPercent, detectAccessMedium, resolvedAccessContext, ` +
 			`recommendedCapacityLearningPolicy, canonicalCapacityLearningPolicy, autotuneAccessRequest, ` +
 			`canonicalAutotuneProfile, autotuneProfileDefinitions, ` +
-			`nativeAutotunePublicResultValidated, nativeAutotuneAcknowledgementLabel, nativeMobileDownloadBypassRequested, nativeDownloadBypassUnavailableReason, renderNativeAutotuneDiagnostics, nativeAutotuneApplyCheckValidated, nativeAutotuneApplyRetryableRpcError, ` +
+			`nativeAutotunePublicResultValidated, nativeServerComparisonValidated, nativeAutotuneAcknowledgementLabel, nativeMobileDownloadBypassRequested, nativeDownloadBypassUnavailableReason, renderNativeAutotuneDiagnostics, nativeAutotuneApplyCheckValidated, nativeAutotuneApplyRetryableRpcError, ` +
 			`nativeAutotuneApplyReceiptValidated, nativeAutotuneApplyHandleValidated, nativeAutotuneApplyStatusValidated, runNativeAutotuneApplyCheck, runNativeAutotuneApply, reloadAppliedUciPackages, reloadAppliedSettingsPage, ` +
 			`visibleAutotuneProfile, autotuneRunProfile, storedAutotuneProfile, ` +
 			`autotuneHasTrustedCapacityReferences, autotuneCalibrationStrategy, ` +
@@ -168,8 +168,8 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl, eImpl) {
 			`positiveRateValue, shouldImportInterfaceRates, applyRatePreset, ` +
 			`runSpeedtestJob, nativeEffectiveSpeedtestBackend, nativeSpeedtestCapabilityValidated, nativeSpeedtestIntentSupported, nativeSpeedtestLaunchArgs, nativeSpeedtestResultValidated, nativeOperationWorkerRunId, nativeSpeedtestStatusMatchesRequest, ` +
 			`nativeAutotuneCapabilityValidated, nativeBootstrapAutotuneCapabilityValidated, ` +
-			`nativeAutotuneIntentSupported, nativeAutotuneLaunchArgs, nativeAutotuneResultMatchesRequest, nativeAutotuneStatusMatchesRequest, ` +
-			`nativeAutotuneProgressStepLabel, nativeAutotuneProgress, ` +
+			`nativeAutotuneIntentSupported, nativeAutotuneLaunchArgs, validatedAutotuneTrafficPolicy, autotuneTrafficPolicyFromInput, autotuneTrafficPlanningEstimate, nativeAutotuneResultMatchesRequest, nativeAutotuneStatusMatchesRequest, ` +
+			`nativeAutotuneProgressStepLabel, nativeAutotuneProgress, nativeAutotuneTrafficSummary, ` +
 			`currentActiveNativeAutotuneJob, runPreferredAutotuneJob, cancelPreferredAutotuneJob, ` +
 			`replaceNodeContent, ` +
 			`setNativeAutotuneJob: function(section, jobId, request, workerRunId) { nativeAutotuneJobs[section] = { job_id: jobId, request: request, worker_run_id: workerRunId || null }; }, ` +
@@ -187,12 +187,91 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl, eImpl) {
 			})
 	}, rpcImpl || {
 		declare() { return () => Promise.resolve(0); },
-	}, lImpl || {}, eImpl || (() => ({})), value => value);
+	}, lImpl || {}, eImpl || (() => ({})), value => value, {
+		// Candidate admission has dedicated UI/native boundary tests. This suite
+		// retains its existing post-admission transaction and receipt assertions.
+		save: () => (uciImpl || uci).save(), apply: action => action()
+	}, { bind() {} });
 }
 
 const helpers = compileHelpers({});
+const explicitTrafficPolicy = { mode: 'capped', bytes: 8000000000 };
+const planningIdentityArgs = ['wan_sqm', 'pppoe-wan', 'main', '', 'best_overall', 'full_raw', 'speedtest-go', true, 'cake_wan_sqm'];
+const planningIdentity = {
+	request_identity_schema_version: 1, operation: 'full_autotune', instance: 'wan_sqm',
+	target_interface: 'pppoe-wan', backend: 'speedtest-go', speedtest_direction: null,
+	speedtest_topology: null, route_mode: 'main', mwan3_member: null,
+	profile: 'best_overall', calibration_strategy: 'full_raw', target_state: 'existing_managed',
+	managed_sqm_section: 'cake_wan_sqm', origin: 'luci',
+	traffic_planning: { download_kbps: 1000, upload_kbps: 500 }
+};
+assert(helpers.nativeAutotuneStatusMatchesRequest(planningIdentity, ...planningIdentityArgs, planningIdentity.traffic_planning));
+assert(!helpers.nativeAutotuneStatusMatchesRequest(planningIdentity, ...planningIdentityArgs, { download_kbps: 1001, upload_kbps: 500 }));
+assert(!helpers.nativeAutotuneStatusMatchesRequest({ ...planningIdentity, traffic_planning: null }, ...planningIdentityArgs, planningIdentity.traffic_planning));
+assert(!helpers.nativeAutotuneStatusMatchesRequest({ ...planningIdentity, traffic_planning: { download_kbps: 0, upload_kbps: 500 } }, ...planningIdentityArgs));
+assert(helpers.nativeAutotuneStatusMatchesRequest({ ...planningIdentity, traffic_planning: undefined }, ...planningIdentityArgs, null));
+const shapedEstimate = helpers.autotuneTrafficPlanningEstimate('best_overall', 'shaped_only', '1000', '100');
+assert.deepEqual(shapedEstimate, {
+	planning_download_kbps: 1000000, planning_upload_kbps: 100000,
+	qualification_runs: 9, qualification_runs_with_backups: 18,
+	initial_plan_bytes: 16500000000,
+	captures_per_direction: 13, search_per_direction: 8,
+	single_load_bytes: 45375000000, repeated_load_bytes: 99000000000,
+	backup_qualification_bytes: 18562500000
+});
+const rawEstimate = helpers.autotuneTrafficPlanningEstimate('variable_link', 'full_raw', '1000', '100');
+assert.equal(rawEstimate.captures_per_direction, 20);
+assert.equal(rawEstimate.single_load_bytes, 59812500000);
+assert.equal(rawEstimate.repeated_load_bytes, 142312500000);
+assert.equal(rawEstimate.backup_qualification_bytes, shapedEstimate.backup_qualification_bytes);
+assert.equal(rawEstimate.initial_plan_bytes, shapedEstimate.initial_plan_bytes);
+const fractionalEstimate = helpers.autotuneTrafficPlanningEstimate('best_overall', 'shaped_only', '1.001', '0.001');
+assert.equal(fractionalEstimate.planning_download_kbps, 1001);
+assert.equal(fractionalEstimate.planning_upload_kbps, 1);
+assert.equal(fractionalEstimate.initial_plan_bytes, 15030000);
+assert.deepEqual(helpers.autotuneTrafficPlanningEstimate('gaming_extreme', 'full_raw', '1000', '100'), rawEstimate);
+assert.equal(helpers.autotuneTrafficPlanningEstimate('best_overall', 'reuse_trusted', '1000', '100').single_load_bytes,
+	shapedEstimate.single_load_bytes);
+for (const invalid of ['', '0', '-1', 'Infinity', 'NaN', '1e3', '100001', '0.0001', '1.0001', undefined, null, 1000]) {
+	assert.equal(helpers.autotuneTrafficPlanningEstimate('best_overall', 'full_raw', invalid, '100'), null);
+	assert.equal(helpers.autotuneTrafficPlanningEstimate('best_overall', 'full_raw', '100', invalid), null);
+}
+assert(Number.isSafeInteger(helpers.autotuneTrafficPlanningEstimate('variable_link', 'full_raw', '100000', '100000').repeated_load_bytes));
+// Deliberate duplication in a read-only UI scenario must fail on planner drift.
+const nativePlanner = fs.readFileSync(path.join(__dirname, '../../cake-autorate-rs/src/src/operations/full_autotune.rs'), 'utf8');
+const nativeOptimizer = fs.readFileSync(path.join(__dirname, '../../cake-autorate-rs/src/src/autotune.rs'), 'utf8');
+const nativeServers = fs.readFileSync(path.join(__dirname, '../../cake-autorate-rs/src/src/operations/server_qualification.rs'), 'utf8');
+for (const constant of ['DEFAULT_PROFILE_SEARCH_ATTEMPTS: usize = 8', 'MAX_TOPOLOGY_REPEAT_ATTEMPTS_PER_DIRECTION: u8 = 2', 'MAX_DIRECTIONAL_LOAD_RUNS: u8 = 3'])
+	assert(nativePlanner.includes(constant), 'update traffic planning scenario after native constant change: ' + constant);
+assert(nativeOptimizer.includes('MAX_PROFILE_SEARCH_OBSERVATIONS: usize = 12'));
+assert(nativeOptimizer.includes('MAX_PROFILE_REVIEW_OPTIONS: usize = 3'));
+// Anchor the declaration: LEGACY_MAX_SERVERS must not hide active-policy drift.
+assert(/^pub\(crate\) const SERVERS_PER_BATCH: usize = 3;$/m.test(nativeServers));
+assert(/^pub\(crate\) const MAX_SERVERS: usize = 6;$/m.test(nativeServers));
+assert(/^pub\(crate\) const REPEATS: usize = 3;$/m.test(nativeServers));
+assert(/^pub\(crate\) const MIN_STABLE_SERVERS: usize = 2;$/m.test(nativeServers));
+assert.deepEqual(helpers.autotuneTrafficPolicyFromInput('unlimited', ''), { mode: 'unlimited' });
+assert.deepEqual(helpers.autotuneTrafficPolicyFromInput('capped', '0.000000001'), { mode: 'capped', bytes: 1 });
+assert.deepEqual(helpers.autotuneTrafficPolicyFromInput('capped', '0.25'), { mode: 'capped', bytes: 250000000 });
+for (const gigabytes of [1, 5, 10, 25, 50, 100])
+	assert.deepEqual(helpers.autotuneTrafficPolicyFromInput('gb:' + gigabytes, '999'), { mode: 'capped', bytes: gigabytes * 1000000000 }, 'preset is explicit and cannot be overridden by a hidden amount');
+assert.throws(() => helpers.autotuneTrafficPolicyFromInput('gb:2', '2'));
+for (const value of ['', '0', 'NaN', '1e3', '0.0000000001', '1099.511627777'])
+	assert.throws(() => helpers.autotuneTrafficPolicyFromInput('capped', value));
+assert.throws(() => helpers.validatedAutotuneTrafficPolicy({ mode: 'unlimited', bytes: 1 }));
+assert(!source.includes('NATIVE_AUTOTUNE_INTERACTIVE_TRAFFIC_BUDGET_BYTES'), 'interactive launch has no hidden fixed byte quota');
+assert(fs.readFileSync(path.join(__dirname, '../../cake-autorate-rs/src/src/operations/autotune_request.rs'), 'utf8')
+	.includes('const NATIVE_AUTOTUNE_DEADLINE_MS: u64 = 45 * 60 * 1_000;'), 'displayed 45-minute deadline must match the native launch constant');
 assert.equal(helpers.autorateSubcategory('rates', '_adaptive_ceiling_status'), 'ceiling',
 	'the always-visible adaptive-ceiling status must stay in the ceiling subpanel');
+const mobileNavCss = source.match(/@media\(max-width:600px\)\{\.cake-autorate-subnav[^'\n]+/)[0];
+assert(mobileNavCss.includes('grid-auto-rows:minmax(54px,auto)'), 'mobile tab rows must contain multiline labels');
+assert(mobileNavCss.includes('width:auto!important;max-width:none!important;justify-self:stretch'),
+	'theme percentage width must not constrain tabs inside half-width grid cells');
+assert(mobileNavCss.includes('min-width:0;max-width:none!important;overflow-wrap:anywhere'),
+	'narrow mobile labels must wrap inside the link');
+assert(mobileNavCss.includes('.cake-autorate-subnav>li>a{display:flex!important;float:none!important;box-sizing:border-box;'),
+	'theme floats must not remove mobile links from grid row height calculation');
 assert.match(helpers.adaptiveCeilingStatusText('best_overall', 'verified_only'),
 	/Select Variable Link/,
 	'non-Variable profiles must explain why adaptive-ceiling controls are unavailable');
@@ -664,6 +743,53 @@ Object.defineProperty(nativePublic, '_native_target_state', {
 });
 assert.equal(helpers.nativeAutotunePublicResultValidated(nativePublic), true,
 	'a digest-bound diagnostic native Review must pass its isolated public contract');
+const sourceComparison = {
+	schema_version: 1, report_sha256: 'a'.repeat(64), scope: 'no_sqm', selected_server_id: 2,
+	proof_status: 'source-comparison-only', observations: Array.from({ length: 6 }, (_, index) => ({
+		index: index + 1, candidate_id: index % 2 + 1, server_id: index % 2 + 1,
+		name: '<server>"', sponsor: 'test provider', download_kbps: 90000, upload_kbps: 45000,
+		elapsed_ms: 2000, valid_observation: true, reason: 'valid-observation'
+	}))
+};
+const withSources = Object.assign(nativePublicFixture(), { server_comparison: sourceComparison });
+const failedSources = Object.assign({}, sourceComparison, {
+	proof_status: 'identity-bound-diagnostic-only', state: 'failed',
+	reason: 'speedtest-traffic-budget-exhausted', selected_server_id: null,
+	observations: sourceComparison.observations.slice(0, 1)
+});
+assert.equal(helpers.nativeServerComparisonValidated(failedSources, true), true);
+assert.equal(helpers.nativeServerComparisonValidated(Object.assign({}, failedSources, { observations: [] }), true), true);
+assert.equal(helpers.nativeServerComparisonValidated(failedSources), false,
+	'diagnostic snapshots must never pass selected Review validation');
+for (const change of [{ state: 'selected' }, { reason: '<unsafe>' }, { observations: Array(19).fill(failedSources.observations[0]) }]) {
+	assert.equal(helpers.nativeServerComparisonValidated(Object.assign({}, failedSources, change), true), false);
+}
+assert.equal(helpers.nativeAutotunePublicResultValidated(Object.assign(nativePublicFixture(), { server_comparison: failedSources })), false);
+assert.equal(helpers.nativeAutotunePublicResultValidated(withSources), true);
+// Six candidates, three scheduled slots each; rejected candidates leave gaps.
+// Four failures plus six healthy observations is a valid fallback result.
+const fallbackSources = Object.assign({}, sourceComparison, {
+	observations: [1, 2, 3, 4, 7, 10, 11, 12, 15, 18].map((index, offset) =>
+		offset < 4 ? Object.assign({}, sourceComparison.observations[0], {
+			index, candidate_id: offset + 10, server_id: null, valid_observation: false,
+			download_kbps: null, upload_kbps: null, reason: 'speedtest-backend-failed'
+		}) : Object.assign({}, sourceComparison.observations[offset - 4], { index }))
+});
+assert.equal(helpers.nativeAutotunePublicResultValidated(Object.assign(nativePublicFixture(), {
+	server_comparison: fallbackSources
+})), true, 'successful fallback beyond nine observations must remain reviewable');
+assert.equal(helpers.nativeServerComparisonValidated(Object.assign({}, failedSources, {
+	observations: Array.from({ length: 18 }, (_, i) => Object.assign({}, failedSources.observations[0], { index: i + 1 }))
+}), true), true, 'diagnostics admit the full native six-by-three bound');
+assert.equal(helpers.nativeServerComparisonValidated(Object.assign({}, fallbackSources, {
+	observations: fallbackSources.observations.map((row, i) => Object.assign({}, row, { index: i === 9 ? 19 : row.index }))
+})), false, 'indices beyond the native bound remain rejected');
+for (const change of [{ schema_version: 2 }, { selected_server_id: 99 }, { observations: [] }, { scope: 'raw_both' },
+	{ proof_status: 'capacity-proven' }, { report_sha256: 'invalid' }]) {
+	assert.equal(helpers.nativeAutotunePublicResultValidated(Object.assign(nativePublicFixture(), {
+		server_comparison: Object.assign({}, sourceComparison, change)
+	})), false, 'invalid source metadata must not pass public Review validation');
+}
 const noisyCanonicalPublic = nativePublicFixture();
 const noisyDownload = noisyCanonicalPublic.artifacts.download_search.value;
 noisyDownload.action = 'fallback';
@@ -1568,6 +1694,14 @@ assert.equal(written.sqm_upload, '20000');
 assert.equal(written.traffic_profile, 'auto');
 assert.equal(written.traffic_profile_migrated, undefined);
 assert.equal(written.traffic_rules_enabled, '0');
+assert.equal(written.ping_extra_args, undefined, 'wizard must not persist a generated interface pin');
+const pingerUserState = { wan_if: 'eth1', pinger_method: 'fping', ping_extra_args: '-Q 5 -I eth1' };
+helpers.applyPingerPlanToState(pingerUserState, {
+	recommended_method: 'ping', recommended_no_pingers: 2, recommended_reflectors: ['192.0.2.1', '192.0.2.2']
+});
+assert.equal(pingerUserState.ping_extra_args, '-Q 5 -I eth1', 'pinger recommendation must preserve explicit arguments');
+assert.doesNotMatch(source, /pingerInterfaceArgs|generatedPingerInterfaceArgs|maybeSetPingerInterfaceArgs/,
+	'interface and route edits must not regenerate or guess provenance of user flags');
 
 const disabledFallback = {
 	mode: 'autotune',
@@ -1657,6 +1791,7 @@ async function testNativeAutotuneTransport() {
 		protocol_version: 2,
 		admission_enabled: true,
 		native_full_autotune: true,
+		native_traffic_policy_version: 1,
 		native_bootstrap_autotune: true,
 		native_autotune_auto_backend: true,
 		native_operation_status_identity_version: 1,
@@ -1714,6 +1849,66 @@ async function testNativeAutotuneTransport() {
 			'post-Apply refresh must reload the page after both UCI caches are authoritative');
 
 		const queuedProgress = helpers.nativeAutotuneProgress({ state: 'queued' }, 0);
+		const traffic = {
+			schema_version: 1, policy: 'capped', limit_bytes: 32000000000,
+			consumed_bytes: 16381000000, remaining_bytes: 15619000000, overrun_bytes: 0,
+			accounting: 'aggregate_route_windows', source: 'persisted_debits'
+		};
+		const trafficText = helpers.nativeAutotuneTrafficSummary({ traffic });
+		for (const [code, expected] of [
+			[ 'server-comparison-insufficient-independent-sources', /Several server IDs can refer to the same source/ ],
+			[ 'speedtest-server-endpoint-changed', /measurements cannot be mixed/ ],
+			[ 'server-or-link-capacity-changed', /no lower-capacity proposal was accepted/ ],
+			[ 'server-comparison-selected-reference-missing', /cannot establish a new bandwidth ceiling/ ],
+			[ 'speedtest-traffic-budget-exhausted', /insufficient for the next check/ ],
+			[ 'speedtest-traffic-limit-reached', /transfer stopped at its traffic safety limit/ ],
+			[ 'speedtest-traffic-budget-exceeded', /observed overrun is retained/ ],
+			[ 'owned-traffic-budget-exceeded', /traffic-limit stop, not a bandwidth/ ],
+			[ 'owned-traffic-accounting-failed', /final usage is unknown/ ],
+			[ 'owned-traffic-persistence-failed', /saved intent, debit journal and cutoff receipt/ ],
+			[ 'traffic-budget-exhausted', /older run.*without distinguishing/ ],
+			[ 'speedtest-timeout', /attempt timed out/ ],
+			[ 'speedtest-deadline-expired', /operation deadline expired/ ],
+			[ 'native-autotune-deadline-expired', /operation deadline expired/ ],
+		]) {
+			const diagnostic = helpers.autotuneTypedTerminalDiagnostic({ terminal_state: 'inconclusive', diagnostic_code: code });
+			assert.equal(diagnostic.code, code);
+			assert.match(diagnostic.message, expected);
+		}
+		assert.match(helpers.autotuneTypedTerminalDiagnostic({ state: 'cancelled' }).message, /Cancellation does not mean/);
+		assert.equal(helpers.autotuneTypedTerminalDiagnostic({ terminal_state: 'failed', diagnostic_code: '__proto__' }), null);
+		assert.match(trafficText, /16\.381 GB.*32\.000 GB.*15\.619 GB/);
+		assert.match(trafficText, /including background traffic/);
+		assert.match(trafficText, /current transfer is not yet included/);
+		const owned = { ...traffic, accounting: 'owned-ip-system-dns-estimate-v1' };
+		const ownedText = helpers.nativeAutotuneTrafficSummary({ traffic: owned });
+		assert.match(ownedText, /IP traffic owned by this test/);
+		assert.match(ownedText, /System DNS is retained/);
+		assert.match(ownedText, /approximate, not exact physical WAN/);
+		assert.match(ownedText, /recorded cutoff; later packets are not included/);
+		assert.match(ownedText, /last saved debit/);
+		const finalOwnedText = helpers.nativeAutotuneTrafficSummary({ traffic: { ...owned, source: 'cutoff_receipt' } });
+		assert.match(finalOwnedText, /Final recorded interval/);
+		assert.doesNotMatch(finalOwnedText, /not yet included/);
+		const noProducers = { ...owned, source: 'no_producers_receipt', consumed_bytes: 0,
+			remaining_bytes: owned.limit_bytes, overrun_bytes: 0 };
+		assert.match(helpers.nativeAutotuneTrafficSummary({ traffic: noProducers }), /producers were not started/);
+		assert.equal(helpers.nativeAutotuneTrafficSummary({ traffic: { ...owned, source: 'no_producers_receipt' } }), '');
+		assert.equal(helpers.nativeAutotuneTrafficSummary({ traffic: { ...traffic, source: 'cutoff_receipt' } }), '');
+		assert.doesNotMatch(ownedText, /including background traffic/);
+		assert.match(helpers.nativeAutotuneProgress({ state: 'running', traffic }, 10).message, /16\.381 GB/);
+		const overrun = { ...traffic, limit_bytes: 1000, consumed_bytes: 1200, remaining_bytes: 0, overrun_bytes: 200, source: 'terminal_record' };
+		assert.match(helpers.nativeAutotuneTrafficSummary({ traffic: overrun }), /Observed overrun: 200 B/);
+		const unlimited = { ...traffic, policy: 'unlimited', limit_bytes: null, remaining_bytes: null, overrun_bytes: null };
+		assert.match(helpers.nativeAutotuneTrafficSummary({ traffic: unlimited }), /limit unlimited/);
+		const unknown = { ...traffic, consumed_bytes: null, remaining_bytes: null, overrun_bytes: null, source: 'unavailable' };
+		assert.match(helpers.nativeAutotuneTrafficSummary({ traffic: unknown }), /usage unavailable/);
+		assert.match(helpers.nativeAutotuneTrafficSummary({ traffic: { ...unknown, accounting: 'unavailable' } }), /method has not been verified/);
+		assert.equal(helpers.nativeAutotuneTrafficSummary({ traffic: { ...traffic, accounting: 'unavailable' } }), '');
+		for (const invalid of [ { ...traffic, consumed_bytes: -1 }, { ...traffic, remaining_bytes: 1 },
+			{ ...traffic, source: '<img onerror=alert(1)>' }, { ...unlimited, limit_bytes: 0 },
+			{ ...unknown, consumed_bytes: 0 }, { ...traffic, consumed_bytes: Number.MAX_SAFE_INTEGER + 1 } ])
+			assert.equal(helpers.nativeAutotuneTrafficSummary({ traffic: invalid }), '');
 		assert.equal(queuedProgress.progress, 1);
 		assert.match(queuedProgress.message, /Waiting for the calibration slot/);
 		const downloadProgress = helpers.nativeAutotuneProgress({
@@ -1795,10 +1990,11 @@ async function testNativeAutotuneTransport() {
 
 		const launchArgs = helpers.nativeAutotuneLaunchArgs(
 			'wan_sqm', 'pppoe-wan', 'speedtest-go', 'main', '',
-			'variable_link', true, 'full_raw', access, true, 'cake_wan_sqm');
+			'variable_link', true, 'full_raw', access, true, 'cake_wan_sqm', explicitTrafficPolicy);
 		assert.deepEqual(launchArgs.slice(0, 2), [ '--calibrationctl', 'autotune-start' ]);
-		assert.equal(launchArgs[launchArgs.indexOf('--traffic-budget-bytes') + 1], '32000000000',
-			'interactive native calibration must always carry the hard traffic budget');
+		assert.equal(launchArgs[launchArgs.indexOf('--traffic-budget-bytes') + 1], '8000000000',
+			'interactive native calibration must carry the explicitly chosen total budget');
+		assert.equal(launchArgs[launchArgs.indexOf('--traffic-policy') + 1], 'capped');
 		assert(launchArgs.includes('--allow-sqm-disable'));
 		assert(launchArgs.includes('--allow-active-traffic'));
 		assert(!launchArgs.includes('--mwan3-member'),
@@ -1807,12 +2003,29 @@ async function testNativeAutotuneTransport() {
 			'LuCI launch intent must contain no capability, job ID, or attestation hash');
 		const autoLaunchArgs = helpers.nativeAutotuneLaunchArgs(
 			'wan_sqm', 'pppoe-wan', 'auto', 'main', '',
-			'variable_link', true, 'full_raw', access, true, 'cake_wan_sqm');
+			'variable_link', true, 'full_raw', access, true, 'cake_wan_sqm', explicitTrafficPolicy);
 		assert.equal(autoLaunchArgs[autoLaunchArgs.indexOf('--backend') + 1], 'speedtest-go',
 			'automatic backend policy must be resolved before native request publication');
+		const unlimitedArgs = helpers.nativeAutotuneLaunchArgs(
+			'wan_sqm', 'pppoe-wan', 'speedtest-go', 'main', '', 'variable_link', false,
+			'full_raw', access, true, 'cake_wan_sqm', { mode: 'unlimited' });
+		assert.equal(unlimitedArgs[unlimitedArgs.indexOf('--traffic-policy') + 1], 'unlimited');
+		assert(!unlimitedArgs.includes('--traffic-budget-bytes'));
+		const plannedArgs = helpers.nativeAutotuneLaunchArgs(
+			'wan_sqm', 'pppoe-wan', 'speedtest-go', 'main', '', 'variable_link', false,
+			'full_raw', access, true, 'cake_wan_sqm', { mode: 'unlimited', planning: { download_kbps: 1001, upload_kbps: 1 } });
+		assert.equal(plannedArgs[plannedArgs.indexOf('--planning-dl-kbps') + 1], '1001');
+		assert.equal(plannedArgs[plannedArgs.indexOf('--planning-ul-kbps') + 1], '1');
+		for (const planning of [ { download_kbps: 1 }, { download_kbps: 0, upload_kbps: 1 }, { download_kbps: 100000001, upload_kbps: 1 } ])
+			assert.throws(() => helpers.nativeAutotuneLaunchArgs(
+				'wan_sqm', 'pppoe-wan', 'speedtest-go', 'main', '', 'variable_link', false,
+				'full_raw', access, true, 'cake_wan_sqm', { mode: 'unlimited', planning }));
+		assert.throws(() => helpers.nativeAutotuneLaunchArgs(
+			'wan_sqm', 'pppoe-wan', 'speedtest-go', 'main', '', 'variable_link', false,
+			'full_raw', access, true, 'cake_wan_sqm'));
 		const bootstrapLaunchArgs = helpers.nativeAutotuneLaunchArgs(
 			'new_sqm', 'eth1', 'speedtest-go', 'main', '',
-			'best_overall', false, 'full_raw', access, false, 'cake_new_sqm');
+			'best_overall', false, 'full_raw', access, false, 'cake_new_sqm', explicitTrafficPolicy);
 		assert.deepEqual(bootstrapLaunchArgs.slice(0, 3),
 			[ '--calibrationctl', 'autotune-bootstrap-start', 'cake_new_sqm' ]);
 		assert.equal(helpers.nativeAutotuneIntentSupported(
@@ -2152,7 +2365,7 @@ async function testNativeAutotuneTransport() {
 		});
 		const nativeResult = await nativeHelpers.runPreferredAutotuneJob(
 			'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '',
-			'variable_link', false, 'full_raw', access, true);
+			'variable_link', false, 'full_raw', access, true, undefined, explicitTrafficPolicy);
 		assert.deepEqual(nativeResult, nativePublic);
 		assert.deepEqual(nativeCalls.map(call => [ call.command, call.args.slice(0, 2) ]), [
 			[ '/usr/sbin/cake-autorated', [ '--calibrationctl', 'summary' ] ],
@@ -2163,6 +2376,20 @@ async function testNativeAutotuneTransport() {
 		], 'advertised native capability must route the whole authenticated lifecycle through Rust');
 		assert(!nativeCalls.some(call => call.command.endsWith('/autotune')),
 			'a native start must never be followed by a legacy helper launch');
+		for (const supported of [false, true]) {
+			const calls = [];
+			const noStartHelpers = compileHelpers({ exec(command, args) {
+				calls.push(args[1]);
+				if (args[1] === 'summary') return Promise.resolve({ stdout: JSON.stringify({ ...capability, native_traffic_policy_version: supported ? 1 : 0 }) });
+				if (args[1] === 'autotune-current') return Promise.resolve({ stdout: JSON.stringify({ state: 'idle', instance: 'wan_sqm' }) });
+				throw new Error('must not start without explicit supported traffic policy');
+			} });
+			await assert.rejects(noStartHelpers.runPreferredAutotuneJob(
+				'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '', 'variable_link', false,
+				'full_raw', access, true, undefined, supported ? undefined : explicitTrafficPolicy),
+				supported ? /Choose Unlimited/ : /does not support explicit traffic policy/);
+			assert.deepEqual(calls, ['summary', 'autotune-current']);
+		}
 
 		const autoNativeCalls = [];
 		const autoNativePayloads = [
@@ -2185,7 +2412,7 @@ async function testNativeAutotuneTransport() {
 		});
 		assert.deepEqual(await autoNativeHelpers.runPreferredAutotuneJob(
 			'wan_sqm', 'pppoe-wan', 'auto', null, 'main', '',
-			'variable_link', false, 'full_raw', access, true), nativePublic);
+			'variable_link', false, 'full_raw', access, true, undefined, explicitTrafficPolicy), nativePublic);
 		const autoNativeStart = autoNativeCalls.find(call => call.args[1] === 'autotune-start');
 		assert(autoNativeStart, 'automatic backend policy must stay on the native Auto-Tune path');
 		assert.equal(autoNativeStart.args[autoNativeStart.args.indexOf('--backend') + 1],
@@ -2219,7 +2446,7 @@ async function testNativeAutotuneTransport() {
 		});
 		assert.deepEqual(await rerunReviewHelpers.runPreferredAutotuneJob(
 			'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '',
-			'variable_link', false, 'full_raw', access, true), freshNativePublic,
+			'variable_link', false, 'full_raw', access, true, undefined, explicitTrafficPolicy), freshNativePublic,
 			'an explicit Run again must not return a matching historical Review');
 		assert.deepEqual(rerunReviewCalls.map(call => call.args.slice(0, 2)), [
 			[ '--calibrationctl', 'summary' ],
@@ -2229,10 +2456,32 @@ async function testNativeAutotuneTransport() {
 			[ '--calibrationctl', 'autotune-result' ],
 		]);
 		assert.equal(rerunReviewCalls[2].args[1], 'autotune-start');
+		for (const terminalState of ['failed', 'cancelled', 'completed']) {
+			for (const restored of [true, false, undefined]) {
+				const calls = [];
+				const payloads = [capability, {
+					state: terminalState, job_id: publicJobId, instance: 'wan_sqm',
+					runtime_mutated: restored === undefined ? undefined : !restored,
+					recovery_required: restored === undefined ? undefined : !restored
+				}, { state: 'queued', job_id: freshPublicJobId, ...statusIdentity('wan_sqm', 'pppoe-wan', 'main', '', 'variable_link', 'full_raw') },
+				{ state: 'review_ready', job_id: freshPublicJobId, ...statusIdentity('wan_sqm', 'pppoe-wan', 'main', '', 'variable_link', 'full_raw'), runtime_mutated: false, recovery_required: false }, freshNativePublic];
+				const h = compileHelpers({ exec(command, args) {
+					calls.push(args); return Promise.resolve({ stdout: JSON.stringify(payloads.shift()) });
+				} });
+				const result = h.runPreferredAutotuneJob('wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '', 'variable_link', false, 'full_raw', access, true, undefined, explicitTrafficPolicy);
+				if (restored) {
+					assert.deepEqual(await result, freshNativePublic);
+					assert.equal(calls.filter(args => args[1] === 'autotune-start').length, 1);
+				} else {
+					await assert.rejects(result, /unsafe current calibration state/);
+					assert.equal(calls.length, 2, 'unrestored or unknown terminal must not launch');
+				}
+			}
+		}
 
 		const resumedActiveCalls = [];
 		const resumedActivePayloads = [
-			capability,
+			{ ...capability, native_traffic_policy_version: 0 },
 			{ state: 'running', job_id: publicJobId, instance: 'wan_sqm',
 				...statusIdentity('wan_sqm', 'pppoe-wan', 'main', '',
 					'variable_link', 'full_raw'),
@@ -2253,7 +2502,8 @@ async function testNativeAutotuneTransport() {
 		});
 		assert.deepEqual(await resumedActiveHelpers.runPreferredAutotuneJob(
 			'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '',
-			'variable_link', false, 'full_raw', access, true), nativePublic);
+			'variable_link', false, 'full_raw', access, true, undefined,
+			() => { throw new Error('resuming must not ask for a new budget'); }), nativePublic);
 		assert.deepEqual(resumedActiveCalls.map(call => call.args[1]),
 			[ 'summary', 'autotune-current', 'autotune-status', 'autotune-result' ]);
 		assert(!resumedActiveCalls.some(call => call.args[1] === 'autotune-start'),
@@ -2275,7 +2525,7 @@ async function testNativeAutotuneTransport() {
 		});
 		await assert.rejects(activeMismatchHelpers.runPreferredAutotuneJob(
 			'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '',
-			'gaming_extreme', false, 'full_raw', access, true), err => {
+			'gaming_extreme', false, 'full_raw', access, true, undefined, explicitTrafficPolicy), err => {
 			assert.equal(err.autotuneActiveRequestMismatch, true);
 			assert.equal(err.autotuneResult, undefined);
 			return /different Full Auto-Tune request/.test(err.message);
@@ -2332,7 +2582,7 @@ async function testNativeAutotuneTransport() {
 		});
 		const bootstrapResultReturned = await bootstrapHelpers.runPreferredAutotuneJob(
 			'new_sqm', 'eth1', 'speedtest-go', null, 'main', '',
-			'best_overall', false, 'full_raw', access, false, 'cake_new_sqm');
+			'best_overall', false, 'full_raw', access, false, 'cake_new_sqm', explicitTrafficPolicy);
 		assert.deepEqual(bootstrapResultReturned, bootstrapResult);
 		assert(bootstrapCalls.every(call => call.command === '/usr/sbin/cake-autorated'),
 			'new/unpersisted native instances must never launch the shell bootstrap mutator');
@@ -2358,7 +2608,7 @@ async function testNativeAutotuneTransport() {
 		});
 		await assert.rejects(timeoutHelpers.runPreferredAutotuneJob(
 			'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '',
-			'variable_link', false, 'full_raw', access, true), err => {
+			'variable_link', false, 'full_raw', access, true, undefined, explicitTrafficPolicy), err => {
 			assert.equal(err.nativeAutotuneStartAttempted, true);
 			return true;
 		});
@@ -2379,7 +2629,7 @@ async function testNativeAutotuneTransport() {
 		});
 		await assert.rejects(abortStartHelpers.runPreferredAutotuneJob(
 			'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '',
-			'variable_link', false, 'full_raw', access, true), err => {
+			'variable_link', false, 'full_raw', access, true, undefined, explicitTrafficPolicy), err => {
 			assert.equal(err.nativeAutotuneStartAttempted, true);
 			assert.equal(err.message, 'XHR request aborted by browser');
 			return true;
@@ -2412,7 +2662,7 @@ async function testNativeAutotuneTransport() {
 		});
 		await assert.rejects(mismatchHelpers.runPreferredAutotuneJob(
 			'wan_sqm', 'pppoe-wan', 'speedtest-go', null, 'main', '',
-			'variable_link', false, 'full_raw', access, true),
+			'variable_link', false, 'full_raw', access, true, undefined, explicitTrafficPolicy),
 			err => {
 				assert.equal(err.autotuneResult, undefined);
 				assert.deepEqual(err.autotuneRejectedResult, mismatched);

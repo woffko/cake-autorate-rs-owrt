@@ -1119,7 +1119,7 @@ fn run_automatic_rating_load(
     runtime_generation: u64,
     capture_generation: u64,
 ) -> Result<(), String> {
-    let mut remaining_budget = request.traffic_budget_bytes;
+    let mut remaining_budget = request.traffic_budget;
     let mut server_id = request.speedtest_server_id;
     for direction in [SpeedtestDirection::Download, SpeedtestDirection::Upload] {
         run_automatic_direction(
@@ -1168,7 +1168,7 @@ fn run_automatic_direction(
     ul_limit: f64,
     runtime_generation: u64,
     capture_generation: u64,
-    remaining_budget: &mut u64,
+    remaining_budget: &mut super::protocol::TrafficPolicy,
     server_id: &mut Option<u64>,
 ) -> Result<(), String> {
     let phase = match direction {
@@ -1182,7 +1182,7 @@ fn run_automatic_direction(
         if direction_samples_ready(&snapshot, direction) {
             return Ok(());
         }
-        if *remaining_budget == 0 {
+        if remaining_budget.is_empty() {
             return Err("automatic-rating-traffic-budget-exhausted".to_string());
         }
 
@@ -1225,7 +1225,7 @@ fn run_automatic_direction(
         )?;
         let mut phase_request = request.clone();
         phase_request.speedtest_server_id = *server_id;
-        phase_request.traffic_budget_bytes = *remaining_budget;
+        phase_request.traffic_budget = *remaining_budget;
         let terminal = speedtest::run_embedded_speedtest(
             &phase_request,
             worker_run_id,
@@ -1300,7 +1300,11 @@ fn direction_samples_ready(
     }
 }
 
-fn consume_traffic_budget(remaining: &mut u64, rx_bytes: u64, tx_bytes: u64) -> Result<(), String> {
+fn consume_traffic_budget(
+    remaining: &mut super::protocol::TrafficPolicy,
+    rx_bytes: u64,
+    tx_bytes: u64,
+) -> Result<(), String> {
     let consumed = rx_bytes
         .checked_add(tx_bytes)
         .ok_or_else(|| "automatic-rating-traffic-budget-overflow".to_string())?;
@@ -2324,13 +2328,13 @@ mod tests {
 
     #[test]
     fn cumulative_automatic_budget_fails_closed() {
-        let mut remaining = 1_000;
+        let mut remaining = 1_000_u64.into();
         consume_traffic_budget(&mut remaining, 600, 200).unwrap();
-        assert_eq!(remaining, 200);
+        assert_eq!(remaining.limit_bytes(), Some(200));
         assert!(consume_traffic_budget(&mut remaining, 201, 0).is_err());
-        assert_eq!(remaining, 200);
+        assert_eq!(remaining.limit_bytes(), Some(200));
         assert!(consume_traffic_budget(&mut remaining, u64::MAX, 1).is_err());
-        assert_eq!(remaining, 200);
+        assert_eq!(remaining.limit_bytes(), Some(200));
     }
 
     #[test]

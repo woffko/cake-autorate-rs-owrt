@@ -447,7 +447,6 @@ fn json_u64_value(json: &str, key: &str) -> Option<u64> {
         .flatten()
 }
 
-#[cfg(feature = "calibration")]
 pub(crate) fn json_nonnegative_f64_value(json: &str, key: &str) -> Option<f64> {
     let tail = json_key_tail(json, key)?;
     let token = tail

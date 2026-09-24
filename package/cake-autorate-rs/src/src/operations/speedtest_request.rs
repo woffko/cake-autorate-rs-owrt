@@ -6,10 +6,13 @@
 
 use super::autotune_capture_policy::AutotuneCapturePolicyId;
 use super::autotune_request::{
-    attest_bootstrap_operation_context, attest_live_operation_context, operation_route_identity,
-    BootstrapRequestContext, LiveRequestContext,
+    attest_bootstrap_operation_context, attest_live_operation_context,
+    validate_bootstrap_operation_context, BootstrapRequestContext, LiveRequestContext,
 };
 use super::identity::{read_kernel_uuid, DEFAULT_RANDOM_UUID_PATH};
+use super::launch_route::{
+    launch_route_spec, match_launch_route, ExplicitLaunchRoute, LaunchRouteFields,
+};
 use super::protocol::{
     OperationIdentity, OperationKind, OperationOrigin, OperationRequest, OperationTargetState,
     SpeedtestDirection, SpeedtestTopology,
@@ -28,6 +31,7 @@ const _: () = assert!(NATIVE_SPEEDTEST_BACKEND_RUNTIME_MS <= NATIVE_SPEEDTEST_DE
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpeedtestLaunchIntent {
+    pub(crate) explicit_route: Option<ExplicitLaunchRoute>,
     pub instance: String,
     pub expected_target_interface: String,
     pub backend: String,
@@ -52,6 +56,7 @@ where
     let mut topology = None;
     let mut route_mode = None;
     let mut mwan3_member = None;
+    let mut explicit_route = LaunchRouteFields::default();
     let mut args = args.peekable();
 
     while let Some(flag) = args.next() {
@@ -92,6 +97,13 @@ where
             }
             "--route-mode" if route_mode.is_none() => route_mode = Some(value(&mut args)?),
             "--mwan3-member" if mwan3_member.is_none() => mwan3_member = Some(value(&mut args)?),
+            "--route-source-ipv4"
+            | "--route-table"
+            | "--route-fwmark"
+            | "--route-fwmark-mask"
+            | "--route-dns-ipv4" => {
+                explicit_route.set(&flag, value(&mut args)?)?;
+            }
             _ => {
                 return Err(format!(
                     "unsupported or duplicate native Speed Test option: {flag}"
@@ -100,15 +112,22 @@ where
         }
     }
 
+    let instance = instance.ok_or_else(|| "--instance is required".to_string())?;
+    let expected_target_interface =
+        expected_target_interface.ok_or_else(|| "--expected-target is required".to_string())?;
+    let backend = backend.ok_or_else(|| "--backend is required".to_string())?;
+    let direction = direction.ok_or_else(|| "--direction is required".to_string())?;
+    let topology = topology.ok_or_else(|| "--topology is required".to_string())?;
+    let route_mode = route_mode.ok_or_else(|| "--route-mode is required".to_string())?;
     let intent = SpeedtestLaunchIntent {
-        instance: instance.ok_or_else(|| "--instance is required".to_string())?,
-        expected_target_interface: expected_target_interface
-            .ok_or_else(|| "--expected-target is required".to_string())?,
-        backend: backend.ok_or_else(|| "--backend is required".to_string())?,
-        direction: direction.ok_or_else(|| "--direction is required".to_string())?,
+        explicit_route: explicit_route.finish(&route_mode)?,
+        instance,
+        expected_target_interface,
+        backend,
+        direction,
         server_id,
-        topology: topology.ok_or_else(|| "--topology is required".to_string())?,
-        route_mode: route_mode.ok_or_else(|| "--route-mode is required".to_string())?,
+        topology,
+        route_mode,
         mwan3_member: mwan3_member.unwrap_or_default(),
     };
     validate_speedtest_intent(&intent)?;
@@ -165,6 +184,7 @@ pub fn build_bootstrap_speedtest_request(
         &intent.route_mode,
         &intent.mwan3_member,
         planned_sqm_section,
+        intent.explicit_route.as_ref(),
     )?;
     let created_unix_ms = epoch_ms()?;
     let job_id = read_kernel_uuid(
@@ -199,7 +219,14 @@ fn build_bootstrap_speedtest_request_from_context(
     if intent.topology != SpeedtestTopology::Unshaped {
         return Err("bootstrap Speed Test requires unshaped topology".to_string());
     }
-    let route = operation_route_identity(&context.route_identity)?;
+    let route = validate_bootstrap_operation_context(
+        &intent.instance,
+        &intent.expected_target_interface,
+        &intent.route_mode,
+        &intent.mwan3_member,
+        intent.explicit_route.as_ref(),
+        &context,
+    )?;
     let deadline_unix_ms = created_unix_ms
         .checked_add(NATIVE_SPEEDTEST_DEADLINE_MS)
         .ok_or_else(|| "native bootstrap Speed Test deadline overflow".to_string())?;
@@ -236,7 +263,9 @@ fn build_bootstrap_speedtest_request_from_context(
         allow_sqm_disable: false,
         allow_active_traffic: false,
         scheduled_auto_apply_requested: false,
-        traffic_budget_bytes: NATIVE_SPEEDTEST_BOOTSTRAP_TRAFFIC_BUDGET_BYTES,
+        traffic_budget: NATIVE_SPEEDTEST_BOOTSTRAP_TRAFFIC_BUDGET_BYTES.into(),
+        traffic_policy_explicit: false,
+        traffic_plan: None,
     };
     request.validate()?;
     context.absence_identity.ensure_request_binding(
@@ -264,10 +293,17 @@ fn build_speedtest_request(
             "native Speed Test backend does not match the instance configuration".to_string(),
         );
     }
+    match_launch_route(
+        &intent.route_mode,
+        &intent.mwan3_member,
+        &intent.expected_target_interface,
+        intent.explicit_route.as_ref(),
+        &context.route,
+    )?;
     let deadline_unix_ms = created_unix_ms
         .checked_add(NATIVE_SPEEDTEST_DEADLINE_MS)
         .ok_or_else(|| "native Speed Test deadline overflow".to_string())?;
-    let traffic_budget_bytes = native_speedtest_traffic_budget_bytes(intent, &context)?;
+    let traffic_budget = native_speedtest_traffic_budget_bytes(intent, &context)?;
     let request = OperationRequest {
         identity: OperationIdentity {
             job_id,
@@ -303,7 +339,9 @@ fn build_speedtest_request(
         allow_sqm_disable: false,
         allow_active_traffic: false,
         scheduled_auto_apply_requested: false,
-        traffic_budget_bytes,
+        traffic_budget: traffic_budget.into(),
+        traffic_policy_explicit: false,
+        traffic_plan: None,
     };
     request.validate()?;
     Ok(request)
@@ -378,10 +416,19 @@ fn validate_speedtest_intent(intent: &SpeedtestLaunchIntent) -> Result<(), Strin
     match intent.route_mode.as_str() {
         "main" if intent.mwan3_member.is_empty() => {}
         "mwan3" if !intent.mwan3_member.is_empty() => {}
+        "explicit" => {}
         "main" => return Err("main Speed Test route must not carry an mwan3 member".to_string()),
         "mwan3" => return Err("mwan3 Speed Test route requires a member".to_string()),
-        _ => return Err("native Speed Test route mode must be main or mwan3".to_string()),
+        _ => {
+            return Err("native Speed Test route mode must be main, mwan3 or explicit".to_string())
+        }
     }
+    launch_route_spec(
+        &intent.route_mode,
+        &intent.mwan3_member,
+        &intent.expected_target_interface,
+        intent.explicit_route.as_ref(),
+    )?;
     Ok(())
 }
 
@@ -395,6 +442,7 @@ mod tests {
 
     fn intent() -> SpeedtestLaunchIntent {
         SpeedtestLaunchIntent {
+            explicit_route: None,
             instance: "wan_sqm".to_string(),
             expected_target_interface: "pppoe-wan".to_string(),
             backend: "speedtest-go".to_string(),
@@ -416,12 +464,15 @@ mod tests {
             unshaped_dl_bound_kbps: Some(1_250_000),
             unshaped_ul_bound_kbps: Some(625_000),
             route: OperationRouteIdentity {
+                dns_server: None,
+                device_ifindex: None,
                 mode: OperationRouteMode::Main,
                 mwan3_member: None,
                 l3_device: "pppoe-wan".to_string(),
                 source_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2))),
                 fwmark: None,
                 routing_table: None,
+                fwmark_mask: None,
             },
             route_fingerprint: "a".repeat(64),
             config_fingerprint: "b".repeat(64),
@@ -430,7 +481,9 @@ mod tests {
     }
 
     fn bootstrap_context(intent: &SpeedtestLaunchIntent) -> BootstrapRequestContext {
-        let route_identity = RouteIdentity {
+        let mut route_identity = RouteIdentity {
+            device_ifindex: None,
+            fwmark_mask: None,
             mode: "main".to_string(),
             member: String::new(),
             device: intent.expected_target_interface.clone(),
@@ -438,6 +491,13 @@ mod tests {
             fwmark: String::new(),
             table: "main".to_string(),
         };
+        if intent.explicit_route.is_some() {
+            route_identity.mode = "explicit".into();
+            route_identity.table = "101".into();
+            route_identity.fwmark = "0x100".into();
+            route_identity.fwmark_mask = Some(0x3f00);
+            route_identity.device_ifindex = Some(7);
+        }
         let route_fingerprint = sha256sum(route_identity.stable_key().as_bytes()).unwrap();
         let absence_identity = BootstrapAbsenceIdentity::from_raw(
             &intent.instance,
@@ -449,6 +509,7 @@ mod tests {
         )
         .unwrap();
         BootstrapRequestContext {
+            explicit_route: intent.explicit_route.clone(),
             target_interface: intent.expected_target_interface.clone(),
             planned_sqm_section: "cake_wan_sqm".to_string(),
             route_identity,
@@ -457,6 +518,77 @@ mod tests {
             sqm_fingerprint: absence_identity.sqm_fingerprint().to_string(),
             absence_identity,
         }
+    }
+
+    #[test]
+    fn r6_speedtest_launch_binds_bootstrap_and_managed_selection() {
+        let argv = [
+            "--instance",
+            "wan_sqm",
+            "--expected-target",
+            "pppoe-wan",
+            "--backend",
+            "speedtest-go",
+            "--direction",
+            "both",
+            "--topology",
+            "unshaped",
+            "--route-mode",
+            "explicit",
+            "--route-source-ipv4",
+            "192.0.2.2",
+            "--route-table",
+            "101",
+            "--route-fwmark",
+            "0x100",
+            "--route-fwmark-mask",
+            "0x3f00",
+            "--route-dns-ipv4",
+            "192.0.2.53",
+        ];
+        let intent = parse_speedtest_launch_intent(argv.into_iter().map(str::to_string)).unwrap();
+        let context = bootstrap_context(&intent);
+        let build = |context| {
+            build_bootstrap_speedtest_request_from_context(
+                &intent,
+                context,
+                "4".repeat(32),
+                "5".repeat(64),
+                1_000,
+            )
+        };
+        let request = build(context.clone()).unwrap();
+        assert_eq!(
+            request.route.dns_server,
+            Some("192.0.2.53".parse().unwrap())
+        );
+        assert_eq!(request.route.routing_table, Some(101));
+        assert!(request
+            .validate_admission_policy()
+            .unwrap_err()
+            .contains("not available"));
+        let mut changed = context;
+        changed.explicit_route.as_mut().unwrap().dns_server = "192.0.2.54".parse().unwrap();
+        assert!(build(changed).is_err());
+        let mut managed = self::context();
+        managed.route = request.route;
+        let build_managed = |context| {
+            build_speedtest_request(&intent, context, "4".repeat(32), "5".repeat(64), 1_000)
+        };
+        build_managed(managed.clone()).unwrap();
+        managed.route.dns_server = Some("192.0.2.54".parse().unwrap());
+        assert!(build_managed(managed).is_err());
+        for extra in ["--route-table", "--route-dns-ipv4"] {
+            let mut duplicate = argv.into_iter().map(str::to_string).collect::<Vec<_>>();
+            duplicate.extend([extra.into(), "101".into()]);
+            assert!(parse_speedtest_launch_intent(duplicate.into_iter())
+                .unwrap_err()
+                .contains("duplicate"));
+        }
+        assert!(parse_speedtest_launch_intent(
+            argv[..argv.len() - 2].iter().map(|arg| (*arg).to_string())
+        )
+        .is_err());
     }
 
     #[test]
@@ -596,7 +728,7 @@ mod tests {
         assert_eq!(request.speedtest_direction, Some(SpeedtestDirection::Both));
         assert_eq!(request.speedtest_topology, Some(SpeedtestTopology::Current));
         assert_eq!(request.speedtest_server_id, Some(42));
-        assert!(request.traffic_budget_bytes > 12_000_000_000);
+        assert!(request.traffic_budget.limit_bytes().unwrap() > 12_000_000_000);
         assert_eq!(
             request.deadline_unix_ms,
             1_000 + NATIVE_SPEEDTEST_DEADLINE_MS
@@ -621,7 +753,10 @@ mod tests {
         assert_eq!(unshaped.target_state, OperationTargetState::ExistingManaged);
         assert!(!unshaped.allow_sqm_disable);
         assert!(unshaped.managed_sqm_section.is_none());
-        assert!(unshaped.traffic_budget_bytes > request.traffic_budget_bytes);
+        assert!(
+            unshaped.traffic_budget.limit_bytes().unwrap()
+                > request.traffic_budget.limit_bytes().unwrap()
+        );
     }
 
     #[test]
@@ -697,8 +832,8 @@ mod tests {
         assert!(!request.allow_sqm_disable);
         assert!(!request.allow_active_traffic);
         assert_eq!(
-            request.traffic_budget_bytes,
-            NATIVE_SPEEDTEST_BOOTSTRAP_TRAFFIC_BUDGET_BYTES
+            request.traffic_budget.limit_bytes(),
+            Some(NATIVE_SPEEDTEST_BOOTSTRAP_TRAFFIC_BUDGET_BYTES)
         );
         request.validate_admission_policy().unwrap();
 

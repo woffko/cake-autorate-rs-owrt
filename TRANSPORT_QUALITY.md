@@ -15,6 +15,20 @@ is then always observational. Rate control requires the separate
 `transport_controller_enabled=1` opt-in and is disabled by default. Samples
 and state live in RAM and never in flash.
 
+Full Auto-Tune's temporary transport capture is separate from this permanent
+setting. Accept/Apply does not enable persistent transport measurement or the
+transport controller, replace the permanent backend/endpoint/timing, or turn
+the throughput guard on. Existing explicit enable/disable choices are retained;
+a new instance keeps persistent measurement and control disabled by default.
+Apply still stores the reviewed capacity references and target thresholds.
+Enable permanent measurement separately in the instance's probe settings.
+
+Older versions could enable measurement during Apply. An existing value of `1`
+does not establish whether the user or that older Apply wrote it, so upgrades
+do not silently turn it off. Review that setting if the instance was created
+or tuned by an older version. Disabling it stops future permanent probes after
+the instance configuration is applied; temporary tests have their own scope.
+
 ## Why process-timed HTTP measurement was replaced
 
 RC7 timed an external `uclient-fetch` process. Its number included process
@@ -215,6 +229,15 @@ window above `quality_target_delay_ms` must be confirmed in two consecutive
 windows before it may request a reduction. Missing, stale, rejected, or still
 learning evidence never fabricates delay and never cuts a rate.
 
+Unreleased R2 source separates ordinary ICMP high-load growth from optional
+ceiling promotion. Missing, stale or unconfirmed transport permits ordinary
+ICMP growth within the current ceiling. Only fresh confirmed above-target
+transport blocks that direction's high-load growth. It never overrides an
+ICMP cut; Low/Idle return-to-base behavior is unchanged. Each direction requires
+its own evidence: fresh download samples cannot promote the upload ceiling.
+With transport control disabled, even bad measurement-only samples cannot
+cut or block an adaptive probe.
+
 For target `T`, confirmed directional transport increase `D`, and current CAKE
 rate `C`, a bounded search candidate is:
 
@@ -236,6 +259,9 @@ The default search observes a candidate for six seconds and permits at most
 three steps. It rolls back when the candidate does not materially improve the
 starting delay. Reaching the safety floor or step limit sets `quality_limited`
 and starts the configured cooldown.
+An intervening ICMP reduction discards the old search episode and its rollback
+target. If ICMP already reduced the rate below the transport floor, a transport
+tick makes no rate request, including no fallback to an old higher rate.
 
 ## Throughput safety floor
 
@@ -251,6 +277,16 @@ floor = max(configured_min, absolute_user_floor,
 Without a Full Auto-Tune reference, `reference = 0.75 * configured_base`. The
 default 80% retention therefore preserves 60% of base. No transport search may
 cross this per-direction floor or the configured absolute caps.
+This is a search floor, not the fast controller's minimum. ICMP bufferbloat
+cuts and STALL/minimum enforcement can still reach `min_*_shaper_rate_kbps`.
+The transport floor must never raise those independently reduced rates.
+
+Transport freshness is bounded by `3 * transport_probe_loaded_interval_s +
+transport_probe_timeout_s`. Status and control filter the same loaded window,
+even without new probe events. `missing` has a null sample age; `stale` retains
+the age but clears the usable delta and confidence. Directional status/age and
+controller reason are exposed in LuCI. Missing data is not a bad grade; a
+separately labeled last completed rating remains historical evidence.
 
 ## Adaptive ceiling and scheduled Auto-Tune
 

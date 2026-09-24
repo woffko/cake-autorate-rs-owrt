@@ -6,6 +6,7 @@
 
 use super::autotune_apply_runtime::NativeApplyGlobalLock;
 use super::autotune_uci_materialization::verify_scalar_uci_section;
+use super::committed_uci::{FrozenSqmAlias, SqmAliasConfig};
 use super::identity::ProcessIdentity;
 use super::json_wire::json_escape;
 use super::procd_control::delete_service_or_attest_absent;
@@ -13,18 +14,18 @@ use super::process::{run_bounded_command_output_with_input, SpawnSpec};
 use super::protocol::OperationRequest;
 use super::runtime_health::{safe_interface, safe_name, UciPackage, UciSection};
 use super::service_config::{InterfaceResolver, OpenWrtEnvironment};
-use super::sqm_projection::{plan_projection, ProjectionScope, SqmProjectionPlan};
-use super::sqm_recovery_openwrt::{
-    attest_managed_sqm_after_service_action, error_message as sqm_error_message,
-    ManagedSqmAttestationSpec,
+use super::sqm_projection::{
+    plan_projection, prepare_mq_capabilities, ProjectionScope, SqmProjectionPlan,
 };
-use super::traffic_classifier::run_traffic_classifier;
+use super::sqm_recovery_openwrt::{error_message as sqm_error_message, ManagedSqmAttestationSpec};
 use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs;
+use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(test)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -37,6 +38,7 @@ const CONTROLLER_STOP_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_OUTPUT: usize = 64 * 1024;
 const MAX_CMDLINE: u64 = 4096;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+#[cfg(test)]
 static NEXT_SNAPSHOT: AtomicU32 = AtomicU32::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,13 +80,20 @@ trait SelectedLifecycleBackend {
     fn project(&mut self, instance: &str) -> Result<SqmProjectionPlan, String>;
     fn snapshot(&mut self, projection: SelectedProjectionState) -> Result<SelectedConfig, String>;
     fn attest_unchanged(&mut self, snapshot: &SelectedConfig) -> Result<(), String>;
+    fn prepare_controller(&mut self, _snapshot: &SelectedConfig) -> Result<(), String> {
+        Ok(())
+    }
     fn freeze_sqm(&mut self, snapshot: &SelectedConfig) -> Result<(), String>;
     fn stop_controller(&mut self, instance: &str) -> Result<(), String>;
     fn stop_sqm(&mut self, snapshot: &SelectedConfig) -> Result<(), String>;
     fn prepare_ingress(&mut self, snapshot: &SelectedConfig) -> Result<(), String>;
     fn start_sqm(&mut self, snapshot: &SelectedConfig) -> Result<(), String>;
-    fn apply_classifier(&mut self) -> Result<(), String>;
-    fn register_controller(&mut self, instance: &str) -> Result<(), String>;
+    fn apply_classifier(&mut self, snapshot: &SelectedConfig) -> Result<(), String>;
+    fn clear_classifier(&mut self, snapshot: &SelectedConfig) -> Result<(), String>;
+    fn prepare_mqtt(&mut self, snapshot: &SelectedConfig, enabled: bool) -> Result<(), String>;
+    fn stop_mqtt(&mut self) -> Result<(), String>;
+    fn finish_mqtt(&mut self) -> Result<(), String>;
+    fn register_controller(&mut self, snapshot: &SelectedConfig) -> Result<(), String>;
 }
 
 fn execute_selected_lifecycle(
@@ -131,14 +140,26 @@ fn execute_selected_lifecycle(
     };
 
     backend.attest_unchanged(&snapshot)?;
+    backend.prepare_mqtt(
+        &snapshot,
+        action == SelectedLifecycleAction::Restart && snapshot.controller_should_run,
+    )?;
+    if action == SelectedLifecycleAction::Restart {
+        backend.prepare_controller(&snapshot)?;
+        backend.attest_unchanged(&snapshot)?;
+    }
     backend.freeze_sqm(&snapshot)?;
     backend.attest_unchanged(&snapshot)?;
+    backend.stop_mqtt()?;
     backend.stop_controller(&snapshot.instance)?;
     backend.attest_unchanged(&snapshot)?;
     backend.stop_sqm(&snapshot)?;
     backend.attest_unchanged(&snapshot)?;
 
     if action == SelectedLifecycleAction::Stop {
+        backend.clear_classifier(&snapshot)?;
+        backend.finish_mqtt()?;
+        backend.attest_unchanged(&snapshot)?;
         return Ok(());
     }
     if snapshot.sqm_should_run {
@@ -149,12 +170,11 @@ fn execute_selected_lifecycle(
         backend.start_sqm(&snapshot)?;
         backend.attest_unchanged(&snapshot)?;
     }
-    backend.apply_classifier()?;
+    backend.apply_classifier(&snapshot)?;
     backend.attest_unchanged(&snapshot)?;
-    if snapshot.controller_should_run {
-        backend.register_controller(&snapshot.instance)?;
-        backend.attest_unchanged(&snapshot)?;
-    }
+    backend.register_controller(&snapshot)?;
+    backend.finish_mqtt()?;
+    backend.attest_unchanged(&snapshot)?;
     Ok(())
 }
 
@@ -164,11 +184,17 @@ struct OpenWrtSelectedLifecycle<'a> {
     lock: &'a NativeApplyGlobalLock,
     environment: OpenWrtEnvironment,
     paths: LifecyclePaths,
-    sqm_snapshot: Option<PrivateSqmConfig>,
+    source: Option<super::uci_transaction::PublishedConfig>,
+    runner_profile: Option<super::sqm_runner::Profile>,
+    classifier: Option<super::traffic_classifier::SelectedClassifier>,
+    mqtt: Option<super::service_lifecycle::selected_mqtt::SelectedMqtt>,
+    sqm_snapshot: Option<ContainmentSqmConfig>,
+    registration: Option<super::service_lifecycle::SelectedGeneration>,
 }
 
 #[derive(Clone, Debug)]
 struct LifecyclePaths {
+    uci: PathBuf,
     proc_root: PathBuf,
     sys_class_net: PathBuf,
     ubus: PathBuf,
@@ -182,6 +208,7 @@ struct LifecyclePaths {
 impl LifecyclePaths {
     fn production() -> Self {
         Self {
+            uci: env_path("CAKE_AUTORATE_UCI_BIN", "/sbin/uci"),
             proc_root: env_path("CAKE_AUTORATE_PROC_ROOT", "/proc"),
             sys_class_net: env_path("CAKE_AUTORATE_SYS_CLASS_NET", "/sys/class/net"),
             ubus: env_path("CAKE_AUTORATE_UBUS_BIN", "/bin/ubus"),
@@ -213,7 +240,12 @@ pub(crate) fn run_selected_instance_lifecycle(
         lock,
         environment: OpenWrtEnvironment::production(),
         paths: LifecyclePaths::production(),
+        source: None,
+        runner_profile: None,
+        classifier: None,
+        mqtt: None,
         sqm_snapshot: None,
+        registration: None,
     };
     execute_selected_lifecycle(action, &mut backend)
 }
@@ -240,23 +272,89 @@ pub(crate) fn run_selected_instance_containment(
         SelectedProjectionState::Exact,
     )?;
     let paths = LifecyclePaths::production();
-    let private_sqm = PrivateSqmConfig::from_bytes(&paths, &snapshot, sqm_bytes)?;
+    let private_sqm = ContainmentSqmConfig::prepare(&paths, &snapshot, sqm_bytes)?;
     let mut backend = OpenWrtSelectedLifecycle {
         request,
         expected_target,
         lock,
         environment,
         paths,
+        source: None,
+        runner_profile: None,
+        classifier: None,
+        mqtt: None,
         sqm_snapshot: Some(private_sqm),
+        registration: None,
     };
+    backend.prepare_mqtt(&snapshot, false)?;
+    backend.stop_mqtt()?;
     backend.stop_controller(&snapshot.instance)?;
-    backend.stop_sqm(&snapshot)
+    backend.stop_sqm(&snapshot)?;
+    backend.clear_classifier(&snapshot)?;
+    backend.finish_mqtt()
+}
+
+fn capture_selected_source(
+    paths: &LifecyclePaths,
+) -> Result<super::uci_transaction::PublishedConfig, String> {
+    let root = paths
+        .sqm_config
+        .parent()
+        .filter(|_| paths.sqm_config.file_name() == Some(std::ffi::OsStr::new("sqm")))
+        .ok_or("native selected configuration root is invalid")?;
+    let committed =
+        super::committed_uci::CommittedSnapshot::capture(root, &paths.snapshot_root, &paths.uci)?;
+    // The parent already owns the actual candidate-file transaction. This
+    // no-op wrapper grants frozen runtime authority, never another file edit.
+    super::uci_transaction::publish(committed.prepare([&[], &[]], &paths.uci)?)
+}
+
+impl OpenWrtSelectedLifecycle<'_> {
+    fn attest_sidecar_source(&self) -> Result<(), String> {
+        validate_request_binding(self.request, self.expected_target)?;
+        if let Some(source) = &self.source {
+            source.attest()
+        } else if let Some(frozen) = &self.sqm_snapshot {
+            // Containment retains the parent's frozen recipe; a newly read
+            // public configuration is not authority to remove sidecars.
+            frozen.alias.sqm_runner_alias().map(|_| ())
+        } else {
+            Err("selected sidecar lifecycle has no frozen authority".into())
+        }
+    }
+
+    fn ensure_source(&mut self) -> Result<(), String> {
+        if self.source.is_none() {
+            if self.sqm_snapshot.is_some() {
+                return Err("containment cannot recapture public UCI as new authority".into());
+            }
+            self.source = Some(capture_selected_source(&self.paths)?);
+        }
+        self.source
+            .as_ref()
+            .ok_or("native selected source missing")?
+            .attest()
+    }
 }
 
 impl SelectedLifecycleBackend for OpenWrtSelectedLifecycle<'_> {
     fn project(&mut self, instance: &str) -> Result<SqmProjectionPlan, String> {
-        let cake = self.environment.read_package(CAKE_PACKAGE)?;
-        let sqm = self.environment.read_package(SQM_PACKAGE)?;
+        self.ensure_source()?;
+        let source = self
+            .source
+            .as_ref()
+            .ok_or("native selected source missing")?;
+        let cake = source.config().package(CAKE_PACKAGE)?.clone();
+        let sqm = source.config().package(SQM_PACKAGE)?.clone();
+        prepare_mq_capabilities(
+            &cake,
+            &sqm,
+            &self.environment,
+            &ProjectionScope::Instance(instance.into()),
+            true,
+            crate::qdisc_capabilities::ensure,
+        )?;
+        source.attest()?;
         let mut projected = sqm.clone();
         let plan = plan_projection(
             &cake,
@@ -273,36 +371,72 @@ impl SelectedLifecycleBackend for OpenWrtSelectedLifecycle<'_> {
     }
 
     fn snapshot(&mut self, projection: SelectedProjectionState) -> Result<SelectedConfig, String> {
-        let cake = self.environment.read_package(CAKE_PACKAGE)?;
-        let sqm = self.environment.read_package(SQM_PACKAGE)?;
-        selected_config(
-            &cake,
-            &sqm,
+        self.ensure_source()?;
+        let source = self
+            .source
+            .as_ref()
+            .ok_or("native selected source missing")?;
+        let cake = source.config().package(CAKE_PACKAGE)?;
+        let sqm = source.config().package(SQM_PACKAGE)?;
+        let selected = selected_config(
+            cake,
+            sqm,
             &self.environment,
             self.request,
             self.expected_target,
             projection,
-        )
+        )?;
+        let expected = sqm
+            .sections
+            .get(&selected.sqm_section)
+            .map(|section| (section.section_type.as_str(), &section.options));
+        verify_scalar_uci_section(
+            source.config().candidate_bytes(SQM_PACKAGE)?,
+            &selected.sqm_section,
+            expected,
+        )?;
+        source.attest()?;
+        Ok(selected)
     }
 
     fn attest_unchanged(&mut self, snapshot: &SelectedConfig) -> Result<(), String> {
-        let cake = self.environment.read_package(CAKE_PACKAGE)?;
-        let sqm = self.environment.read_package(SQM_PACKAGE)?;
-        if cake != snapshot.cake || sqm != snapshot.sqm {
+        let source = self
+            .source
+            .as_ref()
+            .ok_or("native selected source missing")?;
+        source.attest()?;
+        if source.config().package(CAKE_PACKAGE)? != &snapshot.cake
+            || source.config().package(SQM_PACKAGE)? != &snapshot.sqm
+        {
             return Err("native Apply selected lifecycle UCI changed during mutation".to_string());
         }
         if let Some(frozen) = self.sqm_snapshot.as_ref() {
-            frozen.attest_source_unchanged(&self.paths)?;
+            frozen.alias.sqm_runner_alias()?;
+        }
+        if let Some(mqtt) = &self.mqtt {
+            mqtt.attest()?;
         }
         Ok(())
     }
 
     fn freeze_sqm(&mut self, snapshot: &SelectedConfig) -> Result<(), String> {
-        if self.sqm_snapshot.is_some() {
+        if self.sqm_snapshot.is_some() || self.runner_profile.is_some() {
             return Err("native Apply selected lifecycle SQM config was frozen twice".to_string());
         }
-        self.sqm_snapshot = Some(PrivateSqmConfig::capture(&self.paths, snapshot)?);
-        Ok(())
+        let profile = super::sqm_runner::Profile::inspect(&self.paths.sqm_runner)?;
+        let source = self
+            .source
+            .as_ref()
+            .ok_or("native selected source missing")?;
+        // Validate the actual alias/executable namespace and surviving-helper
+        // leases before stopping the healthy controller, without running SQM.
+        drop(
+            profile
+                .clone()
+                .bind(source.config(), &self.paths.snapshot_root)?,
+        );
+        self.runner_profile = Some(profile);
+        self.attest_unchanged(snapshot)
     }
 
     fn stop_controller(&mut self, instance: &str) -> Result<(), String> {
@@ -333,24 +467,27 @@ impl SelectedLifecycleBackend for OpenWrtSelectedLifecycle<'_> {
     }
 
     fn stop_sqm(&mut self, snapshot: &SelectedConfig) -> Result<(), String> {
+        if let Some(source) = &self.source {
+            let profile = self
+                .runner_profile
+                .as_ref()
+                .ok_or("native selected runner was not preflighted")?
+                .clone();
+            let runner = profile.bind(source.config(), &self.paths.snapshot_root)?;
+            runner.stop(&snapshot.target_interface, || source.attest(), || false)?;
+            return attest_selected_sqm_absent(&self.paths, snapshot);
+        }
         let config = self.sqm_snapshot.as_ref().ok_or_else(|| {
             "native Apply selected lifecycle has no frozen SQM config".to_string()
         })?;
-        let _output = run_command(
-            &SpawnSpec {
-                program: self.paths.sqm_runner.clone(),
-                arguments: vec![
-                    OsString::from("stop"),
-                    OsString::from(&snapshot.target_interface),
-                ],
-                environment: vec![(
-                    OsString::from("UCI_CONFIG_DIR"),
-                    config.directory.as_os_str().to_os_string(),
-                )],
-            },
-            None,
-            COMMAND_TIMEOUT,
-            |_| {},
+        let runner = config
+            .profile
+            .clone()
+            .bind(&config.alias, &self.paths.snapshot_root)?;
+        runner.stop(
+            &snapshot.target_interface,
+            || self.attest_sidecar_source(),
+            || false,
         )?;
         // sqm-scripts status is not authoritative in either direction.  Stop
         // succeeds only when the exact selected runtime is absent.
@@ -362,25 +499,17 @@ impl SelectedLifecycleBackend for OpenWrtSelectedLifecycle<'_> {
     }
 
     fn start_sqm(&mut self, snapshot: &SelectedConfig) -> Result<(), String> {
-        let config = self.sqm_snapshot.as_ref().ok_or_else(|| {
-            "native Apply selected lifecycle has no frozen SQM config".to_string()
-        })?;
-        let output = run_command(
-            &SpawnSpec {
-                program: self.paths.sqm_runner.clone(),
-                arguments: vec![
-                    OsString::from("start"),
-                    OsString::from(&snapshot.target_interface),
-                ],
-                environment: vec![(
-                    OsString::from("UCI_CONFIG_DIR"),
-                    config.directory.as_os_str().to_os_string(),
-                )],
-            },
-            None,
-            COMMAND_TIMEOUT,
-            |_| {},
-        )?;
+        let source = self
+            .source
+            .as_ref()
+            .ok_or("native selected source missing")?;
+        let profile = self
+            .runner_profile
+            .as_ref()
+            .ok_or("native selected runner was not preflighted")?
+            .clone();
+        let runner = profile.bind(source.config(), &self.paths.snapshot_root)?;
+        runner.start(&snapshot.target_interface, || source.attest(), || false)?;
         let spec = ManagedSqmAttestationSpec {
             instance: snapshot.instance.clone(),
             sqm_section: snapshot.sqm_section.clone(),
@@ -400,34 +529,141 @@ impl SelectedLifecycleBackend for OpenWrtSelectedLifecycle<'_> {
             minimum_upload_kbps: snapshot.upload_kbps,
             maximum_upload_kbps: snapshot.upload_kbps,
         };
-        match attest_managed_sqm_after_service_action(&spec) {
-            Ok(()) => Ok(()),
-            Err(postcondition) => {
-                let command = if output.status.success() {
-                    "SQM start returned success".to_string()
-                } else {
-                    format!("SQM start failed: {}", stderr(&output.stderr))
-                };
-                Err(format!(
-                    "{command}, but the exact selected runtime postcondition failed: {}",
-                    sqm_error_message(&postcondition)
-                ))
-            }
+        match super::sqm_recovery_openwrt::attest_managed_sqm_from_published(&spec, source) {
+            Ok(false) => Ok(()),
+            Ok(true) => Err("native selected target went offline during start".into()),
+            Err(error) => Err(format!(
+                "exact selected runtime postcondition failed: {}",
+                sqm_error_message(&error)
+            )),
         }
     }
 
-    fn apply_classifier(&mut self) -> Result<(), String> {
-        run_traffic_classifier(["apply".to_string()].into_iter()).map(|_| ())
+    fn apply_classifier(&mut self, snapshot: &SelectedConfig) -> Result<(), String> {
+        let classifier = self
+            .classifier
+            .take()
+            .ok_or("selected classifier was not preflighted")?;
+        classifier.apply(|| self.attest_unchanged(snapshot))
     }
 
-    fn register_controller(&mut self, instance: &str) -> Result<(), String> {
+    fn prepare_mqtt(&mut self, snapshot: &SelectedConfig, enabled: bool) -> Result<(), String> {
+        self.attest_sidecar_source()?;
+        self.mqtt = Some(
+            super::service_lifecycle::selected_mqtt::SelectedMqtt::prepare(
+                &self.paths.proc_root,
+                &self.paths.ubus,
+                Path::new(super::mqtt_publisher::PRODUCTION_PLAN_ROOT),
+                &snapshot.instance,
+                &snapshot.cake,
+                enabled,
+                &self.request.identity.job_id,
+            )?,
+        );
+        self.attest_sidecar_source()
+    }
+
+    fn stop_mqtt(&mut self) -> Result<(), String> {
+        let mut mqtt = self.mqtt.take().ok_or("selected MQTT was not prepared")?;
+        let result = mqtt.stop_changed(|| self.attest_sidecar_source());
+        self.mqtt = Some(mqtt);
+        result
+    }
+
+    fn finish_mqtt(&mut self) -> Result<(), String> {
+        let mut mqtt = self.mqtt.take().ok_or("selected MQTT was not prepared")?;
+        let result = mqtt.finish(
+            || self.attest_sidecar_source(),
+            |instance, endpoint| {
+                run_success(
+                    &SpawnSpec {
+                        program: self.paths.init.clone(),
+                        arguments: vec![
+                            "native_apply_register_mqtt".into(),
+                            instance.into(),
+                            endpoint.into(),
+                        ],
+                        environment: vec![(
+                            "CAKE_AUTORATE_NATIVE_APPLY_RECOVERY".into(),
+                            "1".into(),
+                        )],
+                    },
+                    None,
+                    COMMAND_TIMEOUT,
+                    |command| self.lock.configure_borrowed_restart(command),
+                    "register selected MQTT publisher",
+                )
+            },
+        );
+        self.mqtt = Some(mqtt);
+        result
+    }
+
+    fn clear_classifier(&mut self, snapshot: &SelectedConfig) -> Result<(), String> {
+        let job = self.request.identity.job_id.clone();
+        let proof = || -> Result<(), String> {
+            validate_request_binding(self.request, self.expected_target)?;
+            if let Some(source) = &self.source {
+                source.attest()?;
+            } else {
+                self.attest_sidecar_source()?;
+            }
+            if find_controller(&self.paths.proc_root, &snapshot.instance)?.is_some() {
+                return Err("selected controller returned during classifier cleanup".into());
+            }
+            attest_selected_sqm_absent(&self.paths, snapshot)
+        };
+        let cleanup = super::traffic_classifier::SelectedClassifier::prepare(
+            &snapshot.instance,
+            &snapshot.target_interface,
+            &job,
+            &UciPackage::default(),
+            proof,
+        )?;
+        cleanup.apply(proof)
+    }
+
+    fn prepare_controller(&mut self, snapshot: &SelectedConfig) -> Result<(), String> {
+        self.attest_unchanged(snapshot)?;
+        let job = self.request.identity.job_id.clone();
+        self.classifier = Some(super::traffic_classifier::SelectedClassifier::prepare(
+            &snapshot.instance,
+            &snapshot.target_interface,
+            &job,
+            &snapshot.cake,
+            || self.attest_unchanged(snapshot),
+        )?);
+        self.registration = super::service_lifecycle::prepare_selected_generation(
+            &snapshot.instance,
+            &snapshot.cake,
+            &snapshot.sqm,
+            snapshot.controller_should_run,
+        )?;
+        self.attest_unchanged(snapshot)
+    }
+
+    fn register_controller(&mut self, snapshot: &SelectedConfig) -> Result<(), String> {
+        self.attest_unchanged(snapshot)?;
+        let mut arguments = vec![
+            OsString::from("native_apply_register_instance"),
+            OsString::from(&snapshot.instance),
+        ];
+        if let Some(registration) = &self.registration {
+            let generation = registration.prepare_registration()?;
+            if generation.is_some() != snapshot.controller_should_run {
+                return Err("selected-generation-registration-direction-mismatch".into());
+            }
+            if let Some(generation) = generation {
+                arguments.push(generation.into());
+            }
+        }
+        if !snapshot.controller_should_run {
+            return Ok(());
+        }
         run_success(
             &SpawnSpec {
                 program: self.paths.init.clone(),
-                arguments: vec![
-                    OsString::from("native_apply_register_instance"),
-                    OsString::from(instance),
-                ],
+                arguments,
                 environment: vec![(
                     OsString::from("CAKE_AUTORATE_NATIVE_APPLY_RECOVERY"),
                     OsString::from("1"),
@@ -602,20 +838,11 @@ fn find_controller(proc_root: &Path, instance: &str) -> Result<Option<ProcessIde
 }
 
 fn controller_cmdline_matches(path: &Path, instance: &str) -> Result<bool, String> {
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(format!(
-                "unable to inspect controller command line: {error}"
-            ))
-        }
+    let Some(bytes) = super::identity::read_process_cmdline(path, MAX_CMDLINE + 1)
+        .map_err(|error| format!("unable to read controller command line: {error}"))?
+    else {
+        return Ok(false);
     };
-    let mut bytes = Vec::new();
-    Read::by_ref(&mut file)
-        .take(MAX_CMDLINE + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("unable to read controller command line: {error}"))?;
     let mut expected = Vec::with_capacity(DAEMON_PATH.len() + instance.len() + 13);
     expected.extend_from_slice(DAEMON_PATH.as_bytes());
     expected.push(0);
@@ -772,115 +999,75 @@ fn netdev_exists(paths: &LifecyclePaths, interface: &str) -> bool {
     paths.sys_class_net.join(interface).is_dir()
 }
 
-struct PrivateSqmConfig {
-    directory: PathBuf,
-    source_bytes: Vec<u8>,
+struct ContainmentSqmConfig {
+    alias: FrozenSqmAlias,
+    profile: super::sqm_runner::Profile,
 }
 
-impl PrivateSqmConfig {
-    fn capture(paths: &LifecyclePaths, snapshot: &SelectedConfig) -> Result<Self, String> {
-        let bytes = read_sqm_config_bytes(paths)?;
-        Self::from_bytes(paths, snapshot, &bytes)
+fn containment_recipe(snapshot: &SelectedConfig, bytes: &[u8]) -> Result<Vec<u8>, String> {
+    if bytes.len() > MAX_CONFIG_BYTES as usize {
+        return Err("parent SQM snapshot exceeds its bound".into());
     }
+    let queue = snapshot.sqm.sections.get(&snapshot.sqm_section);
+    verify_scalar_uci_section(
+        bytes,
+        &snapshot.sqm_section,
+        queue.map(|queue| (queue.section_type.as_str(), &queue.options)),
+    )?;
+    if snapshot.sqm.sections.iter().any(|(name, queue)| {
+        name != &snapshot.sqm_section
+            && queue.section_type == "queue"
+            && queue.options.get("interface") == Some(&snapshot.target_interface)
+    }) {
+        return Err("selected containment target has another configured SQM owner".into());
+    }
+    let Some(queue) = queue else {
+        return Ok(Vec::new());
+    };
+    if queue.section_type != "queue"
+        || queue.options.get("_cake_autorate_managed") != Some(&snapshot.instance)
+        || queue.options.get("interface") != Some(&snapshot.target_interface)
+    {
+        return Err("selected containment SQM recipe owner or target mismatch".into());
+    }
+    let mut edits = Vec::with_capacity(queue.options.len() + 1);
+    edits.push(super::uci_edits::Edit::AddSection {
+        section: snapshot.sqm_section.clone(),
+        kind: "queue".into(),
+    });
+    for (option, value) in &queue.options {
+        edits.push(super::uci_edits::Edit::Set {
+            section: snapshot.sqm_section.clone(),
+            option: option.clone(),
+            value: value.clone(),
+        });
+    }
+    super::uci_edits::render(&[], &edits)
+}
 
-    fn from_bytes(
+impl ContainmentSqmConfig {
+    fn prepare(
         paths: &LifecyclePaths,
         snapshot: &SelectedConfig,
         bytes: &[u8],
     ) -> Result<Self, String> {
-        ensure_private_directory(&paths.snapshot_root)?;
-        let id = NEXT_SNAPSHOT.fetch_add(1, Ordering::Relaxed);
-        let directory = paths
-            .snapshot_root
-            .join(format!("{}-{id}", std::process::id()));
-        fs::create_dir(&directory)
-            .map_err(|error| format!("unable to create private SQM lifecycle snapshot: {error}"))?;
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).map_err(|error| {
-            format!("unable to protect private SQM lifecycle snapshot: {error}")
-        })?;
-        let expected = snapshot
-            .sqm
-            .sections
-            .get(&snapshot.sqm_section)
-            .map(|section| (section.section_type.as_str(), &section.options));
-        verify_scalar_uci_section(bytes, &snapshot.sqm_section, expected).map_err(|error| {
-            format!("native Apply merged SQM state differs from committed config: {error}")
-        })?;
-        let target = directory.join("sqm");
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&target)
-            .map_err(|error| format!("unable to create private SQM lifecycle config: {error}"))?;
-        output
-            .write_all(bytes)
-            .and_then(|_| output.sync_all())
-            .map_err(|error| format!("unable to publish private SQM lifecycle config: {error}"))?;
-        Ok(Self {
-            directory,
-            source_bytes: bytes.to_vec(),
-        })
-    }
-
-    fn attest_source_unchanged(&self, paths: &LifecyclePaths) -> Result<(), String> {
-        if read_sqm_config_bytes(paths)? != self.source_bytes {
-            return Err(
-                "native Apply committed SQM config changed during selected lifecycle".to_string(),
-            );
+        let recipe = containment_recipe(snapshot, bytes)?;
+        let profile = super::sqm_runner::Profile::inspect(&paths.sqm_runner)?;
+        let alias = FrozenSqmAlias::materialize(&recipe, &paths.snapshot_root, &paths.uci)?;
+        let show = alias.section_show(&snapshot.sqm_section)?;
+        let native = UciPackage::parse(
+            SQM_PACKAGE,
+            std::str::from_utf8(&show).map_err(|_| "selected containment alias is not text")?,
+        )?;
+        if native.sections.get(&snapshot.sqm_section)
+            != snapshot.sqm.sections.get(&snapshot.sqm_section)
+        {
+            return Err("selected containment alias changed the frozen SQM recipe".into());
         }
-        Ok(())
+        // Prove alias/executable leases before stopping any healthy process.
+        drop(profile.clone().bind(&alias, &paths.snapshot_root)?);
+        Ok(Self { alias, profile })
     }
-}
-
-impl Drop for PrivateSqmConfig {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(self.directory.join("sqm"));
-        let _ = fs::remove_dir(&self.directory);
-    }
-}
-
-fn ensure_private_directory(path: &Path) -> Result<(), String> {
-    fs::create_dir_all(path)
-        .map_err(|error| format!("unable to create lifecycle runtime directory: {error}"))?;
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("unable to inspect lifecycle runtime directory: {error}"))?;
-    if !metadata.is_dir()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != unsafe { libc::geteuid() }
-    {
-        return Err("lifecycle runtime directory is unsafe".to_string());
-    }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .map_err(|error| format!("unable to protect lifecycle runtime directory: {error}"))
-}
-
-fn read_sqm_config_bytes(paths: &LifecyclePaths) -> Result<Vec<u8>, String> {
-    let source = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&paths.sqm_config)
-        .map_err(|error| format!("unable to open SQM config for lifecycle snapshot: {error}"))?;
-    let metadata = source
-        .metadata()
-        .map_err(|error| format!("unable to inspect SQM config: {error}"))?;
-    if !metadata.is_file()
-        || metadata.nlink() != 1
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.len() > MAX_CONFIG_BYTES
-    {
-        return Err("SQM config is unsafe for lifecycle snapshot".to_string());
-    }
-    let mut bytes = Vec::new();
-    source
-        .take(MAX_CONFIG_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("unable to read SQM lifecycle snapshot: {error}"))?;
-    if bytes.len() > MAX_CONFIG_BYTES as usize {
-        return Err("SQM lifecycle snapshot exceeds its size bound".to_string());
-    }
-    Ok(bytes)
 }
 
 fn run_command<C>(
@@ -961,9 +1148,24 @@ mod tests {
         projection: SqmProjectionPlan,
         fail_attestation_at: usize,
         attestations: usize,
+        fail_prepare: bool,
+        fail_stop_sqm: bool,
+        fail_clear_classifier: bool,
     }
 
     impl SelectedLifecycleBackend for FakeBackend {
+        fn prepare_mqtt(&mut self, _: &SelectedConfig, _: bool) -> Result<(), String> {
+            self.events.push("prepare-mqtt");
+            Ok(())
+        }
+        fn stop_mqtt(&mut self) -> Result<(), String> {
+            self.events.push("stop-mqtt");
+            Ok(())
+        }
+        fn finish_mqtt(&mut self) -> Result<(), String> {
+            self.events.push("finish-mqtt");
+            Ok(())
+        }
         fn project(&mut self, _: &str) -> Result<SqmProjectionPlan, String> {
             self.events.push("project");
             Ok(self.projection.clone())
@@ -1005,13 +1207,25 @@ mod tests {
             self.events.push("freeze-sqm");
             Ok(())
         }
+        fn prepare_controller(&mut self, _: &SelectedConfig) -> Result<(), String> {
+            self.events.push("prepare-controller");
+            if self.fail_prepare {
+                Err("input-capacity".into())
+            } else {
+                Ok(())
+            }
+        }
         fn stop_controller(&mut self, _: &str) -> Result<(), String> {
             self.events.push("stop-controller");
             Ok(())
         }
         fn stop_sqm(&mut self, _: &SelectedConfig) -> Result<(), String> {
             self.events.push("stop-sqm");
-            Ok(())
+            if self.fail_stop_sqm {
+                Err("sqm-still-running".into())
+            } else {
+                Ok(())
+            }
         }
         fn prepare_ingress(&mut self, _: &SelectedConfig) -> Result<(), String> {
             self.events.push("prepare-ingress");
@@ -1021,12 +1235,23 @@ mod tests {
             self.events.push("start-sqm");
             Ok(())
         }
-        fn apply_classifier(&mut self) -> Result<(), String> {
+        fn apply_classifier(&mut self, _snapshot: &SelectedConfig) -> Result<(), String> {
             self.events.push("classifier");
             Ok(())
         }
-        fn register_controller(&mut self, _: &str) -> Result<(), String> {
-            self.events.push("register");
+        fn clear_classifier(&mut self, _snapshot: &SelectedConfig) -> Result<(), String> {
+            self.events.push("clear-classifier");
+            if self.fail_clear_classifier {
+                Err("classifier-cleanup-failed".into())
+            } else {
+                Ok(())
+            }
+        }
+        fn register_controller(&mut self, snapshot: &SelectedConfig) -> Result<(), String> {
+            self.events.push("finalize-generation");
+            if snapshot.controller_should_run {
+                self.events.push("register");
+            }
             Ok(())
         }
     }
@@ -1081,8 +1306,12 @@ mod tests {
                 "project",
                 "snapshot-exact",
                 "attest",
+                "prepare-mqtt",
+                "prepare-controller",
+                "attest",
                 "freeze-sqm",
                 "attest",
+                "stop-mqtt",
                 "stop-controller",
                 "attest",
                 "stop-sqm",
@@ -1093,7 +1322,9 @@ mod tests {
                 "attest",
                 "classifier",
                 "attest",
+                "finalize-generation",
                 "register",
+                "finish-mqtt",
                 "attest"
             ]
         );
@@ -1111,6 +1342,7 @@ mod tests {
         assert!(!backend.events.contains(&"start-sqm"));
         assert!(!backend.events.contains(&"register"));
         assert!(backend.events.contains(&"classifier"));
+        assert!(backend.events.contains(&"finalize-generation"));
     }
 
     #[test]
@@ -1193,7 +1425,7 @@ mod tests {
         let mut backend = FakeBackend {
             snapshots: vec![cfg.clone(), cfg],
             projection: projection(true, true),
-            fail_attestation_at: 3,
+            fail_attestation_at: 4,
             ..FakeBackend::default()
         };
         assert!(
@@ -1201,6 +1433,31 @@ mod tests {
         );
         assert!(backend.events.contains(&"stop-controller"));
         assert!(!backend.events.contains(&"stop-sqm"));
+    }
+
+    #[test]
+    fn r4_selected_input_preparation_failure_preserves_the_healthy_runtime() {
+        let cfg = config(true, true, true);
+        let mut backend = FakeBackend {
+            snapshots: vec![cfg.clone(), cfg],
+            projection: projection(true, true),
+            fail_prepare: true,
+            ..FakeBackend::default()
+        };
+        assert_eq!(
+            execute_selected_lifecycle(SelectedLifecycleAction::Restart, &mut backend).unwrap_err(),
+            "input-capacity"
+        );
+        assert!(backend.events.contains(&"prepare-controller"));
+        for mutation in [
+            "freeze-sqm",
+            "stop-controller",
+            "stop-sqm",
+            "start-sqm",
+            "register",
+        ] {
+            assert!(!backend.events.contains(&mutation));
+        }
     }
 
     #[test]
@@ -1216,14 +1473,69 @@ mod tests {
             [
                 "snapshot-exact",
                 "attest",
+                "prepare-mqtt",
                 "freeze-sqm",
                 "attest",
+                "stop-mqtt",
                 "stop-controller",
                 "attest",
                 "stop-sqm",
+                "attest",
+                "clear-classifier",
+                "finish-mqtt",
                 "attest"
             ]
         );
+    }
+
+    #[test]
+    fn r4_selected_stop_refuses_cleanup_without_stopped_sqm_and_propagates_cleanup_failure() {
+        for (fail_stop_sqm, fail_clear_classifier, expected) in [
+            (true, false, "sqm-still-running"),
+            (false, true, "classifier-cleanup-failed"),
+        ] {
+            let mut backend = FakeBackend {
+                snapshots: vec![config(true, true, true)],
+                fail_stop_sqm,
+                fail_clear_classifier,
+                ..FakeBackend::default()
+            };
+            assert_eq!(
+                execute_selected_lifecycle(SelectedLifecycleAction::Stop, &mut backend)
+                    .unwrap_err(),
+                expected
+            );
+            assert_eq!(backend.events.contains(&"clear-classifier"), !fail_stop_sqm);
+            assert_eq!(
+                backend.events.last(),
+                Some(&if fail_stop_sqm {
+                    "stop-sqm"
+                } else {
+                    "clear-classifier"
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn r4_selected_stop_rechecks_source_before_and_after_classifier_cleanup() {
+        for fail_attestation_at in 1..=5 {
+            let mut backend = FakeBackend {
+                snapshots: vec![config(true, true, true)],
+                fail_attestation_at,
+                ..FakeBackend::default()
+            };
+            assert_eq!(
+                execute_selected_lifecycle(SelectedLifecycleAction::Stop, &mut backend)
+                    .unwrap_err(),
+                "drift"
+            );
+            assert_eq!(backend.events.last(), Some(&"attest"));
+            assert_eq!(
+                backend.events.contains(&"clear-classifier"),
+                fail_attestation_at == 5
+            );
+        }
     }
 
     #[test]
@@ -1281,52 +1593,255 @@ mod tests {
     }
 
     #[test]
-    fn private_sqm_snapshot_is_single_source_and_rejects_merged_view_drift() {
+    #[ignore = "requires explicit inspected SDK UCI and loader paths"]
+    fn r4_selected_source_is_committed_and_never_reads_original_package_deltas() {
         let root = std::env::temp_dir().join(format!(
-            "cake-selected-lifecycle-sqm-{}-{}",
+            "cake-selected-committed-{}-{}",
             std::process::id(),
             NEXT_SNAPSHOT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&root).unwrap();
-        let sqm_config = root.join("sqm");
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let config = root.join("config");
+        let delta = root.join("delta");
+        fs::create_dir(&config).unwrap();
+        fs::create_dir(&delta).unwrap();
         fs::write(
-            &sqm_config,
-            b"config queue 'cake_wan_sqm'\n\toption enabled '1'\n\toption interface 'pppoe-wan'\n",
+            config.join(CAKE_PACKAGE),
+            b"config cake_autorate 'lab'\n option ul_if 'fixture0'\n",
         )
         .unwrap();
+        fs::write(config.join(SQM_PACKAGE), b"config queue 'cake_lab'\n option interface 'fixture0'\n option _cake_autorate_managed 'lab'\n").unwrap();
+        fs::write(
+            delta.join(SQM_PACKAGE),
+            b"sqm.cake_lab.interface='wrong-target'\n",
+        )
+        .unwrap();
+        fs::write(
+            delta.join(CAKE_PACKAGE),
+            b"cake-autorate.lab.ul_if='wrong-target'\n",
+        )
+        .unwrap();
+        let quote = |value: &std::ffi::OsStr| {
+            format!("'{}'", value.to_str().unwrap().replace('\'', "'\\''"))
+        };
+        let binary = std::env::var_os("CAKE_TEST_UCI").expect("explicit UCI required");
+        let command = if let Some(loader) = std::env::var_os("CAKE_TEST_MUSL_LOADER") {
+            format!(
+                "{} --library-path {} {}",
+                quote(&loader),
+                quote(&std::env::var_os("CAKE_TEST_LIB_DIR").expect("explicit libraries required")),
+                quote(&binary)
+            )
+        } else {
+            quote(&binary)
+        };
+        let uci = root.join("uci");
+        fs::write(&uci, format!("#!/bin/sh\nfor last do :; done\ncase \"$last\" in cu??????????????????????????????) ;; *) exit 91;; esac\nexec {command} -p {} \"$@\"\n", quote(delta.as_os_str()))).unwrap();
+        fs::set_permissions(&uci, fs::Permissions::from_mode(0o700)).unwrap();
         let paths = LifecyclePaths {
+            uci,
             proc_root: root.join("proc"),
             sys_class_net: root.join("sys"),
             ubus: root.join("ubus"),
             init: root.join("init"),
             sqm_runner: root.join("run.sh"),
-            sqm_config: sqm_config.clone(),
+            sqm_config: config.join(SQM_PACKAGE),
             tc: root.join("tc"),
             snapshot_root: root.join("snapshots"),
         };
-        let mut snapshot = config(false, false, false);
-        snapshot.sqm.sections.insert(
-            "cake_wan_sqm".to_string(),
-            UciSection {
-                section_type: "queue".to_string(),
-                options: std::collections::BTreeMap::from([
-                    ("enabled".to_string(), "1".to_string()),
-                    ("interface".to_string(), "pppoe-wan".to_string()),
-                ]),
-            },
+        let original = [CAKE_PACKAGE, SQM_PACKAGE].map(|name| fs::read(config.join(name)).unwrap());
+        let source = capture_selected_source(&paths).unwrap();
+        assert_eq!(
+            source.config().package(CAKE_PACKAGE).unwrap().sections["lab"].options["ul_if"],
+            "fixture0"
         );
+        assert_eq!(
+            source.config().package(SQM_PACKAGE).unwrap().sections["cake_lab"].options["interface"],
+            "fixture0"
+        );
+        source.attest().unwrap();
+        for (name, bytes) in [CAKE_PACKAGE, SQM_PACKAGE].into_iter().zip(&original) {
+            assert_eq!(fs::read(config.join(name)).unwrap(), *bytes);
+        }
+        assert!(!config.join(".start-uci").exists());
+        fs::write(root.join("new-inode"), &original[0]).unwrap();
+        fs::rename(root.join("new-inode"), config.join(CAKE_PACKAGE)).unwrap();
+        assert!(source.attest().is_err());
+        assert_eq!(
+            fs::read(delta.join(SQM_PACKAGE)).unwrap(),
+            b"sqm.cake_lab.interface='wrong-target'\n"
+        );
+        assert_eq!(
+            fs::read(delta.join(CAKE_PACKAGE)).unwrap(),
+            b"cake-autorate.lab.ul_if='wrong-target'\n"
+        );
+    }
 
-        let frozen = PrivateSqmConfig::capture(&paths, &snapshot).unwrap();
-        frozen.attest_source_unchanged(&paths).unwrap();
-        fs::write(
-            &sqm_config,
-            b"config queue 'cake_wan_sqm'\n\toption enabled '0'\n\toption interface 'pppoe-wan'\n",
+    fn containment_fixture() -> (SelectedConfig, Vec<u8>) {
+        let mut snapshot = config(false, false, false);
+        snapshot.sqm = UciPackage::parse("sqm", "sqm.cake_wan_sqm=queue\nsqm.cake_wan_sqm.enabled='1'\nsqm.cake_wan_sqm.interface='pppoe-wan'\nsqm.cake_wan_sqm._cake_autorate_managed='wan_sqm'\nsqm.peer=queue\nsqm.peer.interface='eth9'\nsqm.peer.script='foreign-never-execute.qos'\n").unwrap();
+        let bytes = b"config queue 'cake_wan_sqm'\n option enabled '1'\n option interface 'pppoe-wan'\n option _cake_autorate_managed 'wan_sqm'\nconfig queue 'peer'\n option interface 'eth9'\n option script 'foreign-never-execute.qos'\n".to_vec();
+        (snapshot, bytes)
+    }
+
+    #[test]
+    fn r4_containment_recipe_keeps_only_parent_owned_queue_and_refuses_aliasing() {
+        let (snapshot, bytes) = containment_fixture();
+        let rendered = containment_recipe(&snapshot, &bytes).unwrap();
+        assert!(!String::from_utf8_lossy(&rendered).contains("foreign-never-execute"));
+        assert!(!String::from_utf8_lossy(&rendered).contains("eth9"));
+        verify_scalar_uci_section(
+            &rendered,
+            &snapshot.sqm_section,
+            Some((
+                "queue",
+                &snapshot.sqm.sections[&snapshot.sqm_section].options,
+            )),
         )
         .unwrap();
-        assert!(frozen.attest_source_unchanged(&paths).is_err());
-        drop(frozen);
+        let mut conflict = snapshot.clone();
+        conflict
+            .sqm
+            .sections
+            .get_mut("peer")
+            .unwrap()
+            .options
+            .insert("interface".into(), snapshot.target_interface.clone());
+        let conflict_bytes = String::from_utf8(bytes.clone())
+            .unwrap()
+            .replace("interface 'eth9'", "interface 'pppoe-wan'");
+        assert!(containment_recipe(&conflict, conflict_bytes.as_bytes()).is_err());
+        let mut wrong_owner = snapshot.clone();
+        wrong_owner.instance = "other_owner".into();
+        assert!(containment_recipe(&wrong_owner, &bytes).is_err());
+        let mut wrong = snapshot.clone();
+        wrong
+            .sqm
+            .sections
+            .get_mut(&snapshot.sqm_section)
+            .unwrap()
+            .options
+            .insert("interface".into(), "different".into());
+        assert!(containment_recipe(&wrong, &bytes).is_err());
+        let absent = config(false, false, false);
+        let peer_only = b"config queue 'peer'\n option interface 'eth9'\n";
+        assert!(containment_recipe(&absent, peer_only).unwrap().is_empty());
+        assert!(containment_recipe(&absent, &bytes).is_err());
+    }
 
-        assert!(PrivateSqmConfig::capture(&paths, &snapshot).is_err());
-        fs::remove_dir_all(root).unwrap();
+    #[test]
+    #[ignore = "requires explicit inspected SDK UCI and runner paths"]
+    fn r4_containment_alias_ignores_public_changes_and_original_package_deltas() {
+        let root = std::env::temp_dir().join(format!(
+            "cake-containment-alias-{}-{}",
+            std::process::id(),
+            NEXT_SNAPSHOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let delta = root.join("delta");
+        fs::create_dir(&delta).unwrap();
+        let poison = b"sqm.cake_wan_sqm.interface='wrong-target'\n";
+        fs::write(delta.join("sqm"), poison).unwrap();
+        let quote = |value: &std::ffi::OsStr| {
+            format!("'{}'", value.to_str().unwrap().replace('\'', "'\\''"))
+        };
+        let binary = std::env::var_os("CAKE_TEST_UCI").expect("explicit UCI required");
+        let command = if let Some(loader) = std::env::var_os("CAKE_TEST_MUSL_LOADER") {
+            format!(
+                "{} --library-path {} {}",
+                quote(&loader),
+                quote(&std::env::var_os("CAKE_TEST_LIB_DIR").expect("explicit libraries required")),
+                quote(&binary)
+            )
+        } else {
+            quote(&binary)
+        };
+        let uci = root.join("uci");
+        fs::write(&uci, format!("#!/bin/sh\nfor last do :; done\ncase \"$last\" in cu??????????????????????????????) ;; *) exit 91;; esac\nexec {command} -p {} \"$@\"\n", quote(delta.as_os_str()))).unwrap();
+        fs::set_permissions(&uci, fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = LifecyclePaths {
+            uci,
+            proc_root: root.join("proc"),
+            sys_class_net: root.join("sys"),
+            ubus: root.join("ubus"),
+            init: root.join("init"),
+            sqm_runner: std::env::var_os("CAKE_TEST_SQM_RUNNER")
+                .expect("explicit runner required")
+                .into(),
+            sqm_config: root.join("public-sqm"),
+            tc: root.join("tc"),
+            snapshot_root: root.join("snapshots"),
+        };
+        let (snapshot, bytes) = containment_fixture();
+        fs::write(&paths.sqm_config, b"unrelated public state\n").unwrap();
+        let frozen = ContainmentSqmConfig::prepare(&paths, &snapshot, &bytes).unwrap();
+        fs::write(&paths.sqm_config, b"later public state\n").unwrap();
+        let show = frozen.alias.section_show(&snapshot.sqm_section).unwrap();
+        let parsed = UciPackage::parse("sqm", std::str::from_utf8(&show).unwrap()).unwrap();
+        assert_eq!(
+            parsed.sections.get(&snapshot.sqm_section),
+            snapshot.sqm.sections.get(&snapshot.sqm_section)
+        );
+        // Execute only a synthetic, hash-attested shell runner. It loads the
+        // real SDK UCI alias but contains no SQM, tc, or device commands.
+        let script = root.join("safe-runner");
+        let body = format!("#!/bin/sh\nconfig_load() {{ {} -c \"$UCI_CONFIG_DIR\" -q show \"$1\"; }}\n[ -e /proc/self/fd/6 ] && [ -e /proc/self/fd/7 ] || exit 92\n    config_load sqm\nprintf '%s:%s\\n' \"$1\" \"$2\"\n", quote(paths.uci.as_os_str()));
+        fs::write(&script, &body).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let profile = super::super::sqm_runner::Profile::fixture(
+            &script,
+            &crate::config_candidate::digest(body.as_bytes()),
+        )
+        .unwrap();
+        let runner = profile.bind(&frozen.alias, &paths.snapshot_root).unwrap();
+        let output = runner
+            .stop(
+                &snapshot.target_interface,
+                || frozen.alias.sqm_runner_alias().map(|_| ()),
+                || false,
+            )
+            .unwrap();
+        assert!(output.status.success());
+        let output = String::from_utf8(output.stdout).unwrap();
+        assert!(output.contains("stop:pppoe-wan"));
+        assert!(output.contains(".interface='pppoe-wan'"));
+        assert!(!output.contains("foreign-never-execute"));
+        assert!(!output.contains("wrong-target"));
+        drop(runner);
+        assert_eq!(fs::read(delta.join("sqm")).unwrap(), poison);
+        assert_eq!(
+            fs::read(&paths.sqm_config).unwrap(),
+            b"later public state\n"
+        );
+        let (directory, alias) = frozen.alias.sqm_runner_alias().unwrap();
+        fs::write(directory.join(alias), b"tampered alias\n").unwrap();
+        assert!(frozen.alias.sqm_runner_alias().is_err());
+        drop(frozen);
+        let absent = config(false, false, false);
+        assert!(ContainmentSqmConfig::prepare(&paths, &absent, b"").is_err());
+        let empty_paths = LifecyclePaths {
+            snapshot_root: root.join("empty-snapshots"),
+            ..paths
+        };
+        let empty = ContainmentSqmConfig::prepare(&empty_paths, &absent, b"").unwrap();
+        assert!(empty
+            .alias
+            .section_show(&absent.sqm_section)
+            .unwrap()
+            .is_empty());
     }
 }

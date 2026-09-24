@@ -17,7 +17,7 @@ pub(crate) const NATIVE_PUBLIC_RESULT_MAX_SCHEMA_VERSION: u8 =
     NATIVE_SHAPED_CAPACITY_FALLBACK_PUBLIC_RESULT_SCHEMA_VERSION;
 const NATIVE_PUBLIC_APPLY_CONTRACT_SCHEMA_VERSION: u8 = 3;
 const NATIVE_PUBLIC_RESULT_PRODUCER: &str = "cake-autorated-native-autotune";
-const MAX_NATIVE_PUBLIC_RESULT_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_NATIVE_PUBLIC_RESULT_BYTES: usize = 256 * 1024;
 const MAX_NATIVE_ARTIFACT_BYTES: usize = 192 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -205,7 +205,11 @@ pub(crate) fn canonical_native_public_result_bytes(
             "native public Apply options are duplicated or have no unique preference".to_string(),
         );
     }
-    if input.consumed_traffic_bytes > input.request.traffic_budget_bytes {
+    if input
+        .request
+        .traffic_budget
+        .exceeded(input.consumed_traffic_bytes)
+    {
         return Err("native public result exceeds its immutable traffic budget".to_string());
     }
     let shaped = [
@@ -601,12 +605,15 @@ mod tests {
             speedtest_server_id: Some(17372),
             speedtest_topology: None,
             route: OperationRouteIdentity {
+                dns_server: None,
+                device_ifindex: None,
                 mode: OperationRouteMode::Main,
                 mwan3_member: None,
                 l3_device: "pppoe-wan".to_string(),
                 source_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))),
                 fwmark: None,
                 routing_table: None,
+                fwmark_mask: None,
             },
             target_state: OperationTargetState::ExistingManaged,
             capture_policy: None,
@@ -622,7 +629,11 @@ mod tests {
             allow_sqm_disable: true,
             allow_active_traffic: false,
             scheduled_auto_apply_requested: false,
-            traffic_budget_bytes: 25_000_000_000,
+            traffic_budget: crate::operations::protocol::TrafficPolicy::Capped {
+                max_bytes: 25_000_000_000,
+            },
+            traffic_policy_explicit: false,
+            traffic_plan: None,
         }
     }
 
@@ -940,7 +951,7 @@ mod tests {
     #[test]
     fn traffic_budget_is_enforced_by_the_projection() {
         let mut request = request();
-        request.traffic_budget_bytes = 1_000;
+        request.traffic_budget = 1_000_u64.into();
         let artifacts = artifacts();
         let confirmation = confirmation();
         let error = canonical_native_public_result_bytes(NativePublicResultInput {

@@ -7,15 +7,26 @@ use super::full_autotune::AutotuneRuntimeControl;
 use super::identity::{
     monotonic_boot_ms, read_kernel_uuid, ProcessIdentity, DEFAULT_BOOT_ID_PATH, DEFAULT_PROC_ROOT,
 };
-use super::process::{run_bounded_command_output, SpawnSpec};
+use super::process::{
+    run_bounded_command_output, run_bounded_command_output_with_input, SpawnSpec,
+};
 use super::protocol::{
     OperationKind, OperationRequest, OperationRouteMode, OperationTargetState, SpeedtestDirection,
 };
 use super::rating;
+#[cfg(test)]
+use crate::owned_route_rules::MAX_ACCOUNTING_FLOWS;
+use crate::owned_route_rules::{
+    attest_route_pin_snapshot, cleanup_named_route_pin_with, install_owned_route_pin_with,
+    nft_table_snapshot_arguments, nft_table_snapshot_proves_absence, NftSocketOwner,
+    ACCOUNTING_FAULT_COUNTER, ACCOUNTING_RX_COUNTER, ACCOUNTING_TX_COUNTER,
+    FLOW_ACCOUNTING_OWNER_SUFFIX,
+};
+#[cfg(test)]
+use crate::owned_route_rules::{nft_egress_guard_batch, nft_owned_route_pin_batch};
 use crate::routing::{inspect_route, RouteIdentity, RouteSnapshot, RouteSpec};
 use crate::Config;
 use std::ffi::OsString;
-use std::fmt::Write as FmtWrite;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::IpAddr;
@@ -35,16 +46,18 @@ const PASSWD: &str = "/etc/passwd";
 const SPEEDTEST_USER: &str = "cake-speedtest";
 const OUTPUT_LIMIT: usize = 512 * 1024;
 const COMMAND_OUTPUT_LIMIT: usize = 256 * 1024;
+const ROUTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const OWNED_BUDGET_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const ROUTE_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
-const MIN_ROUTE_PROOF_BYTES: u64 = 64 * 1024;
-const MAX_UNPROVED_TRAFFIC_ATTEMPTS: u8 = 3;
+const QUALIFICATION_CPU_PRESSURE_SAMPLES: u8 = 3;
+pub(crate) const MIN_ROUTE_PROOF_BYTES: u64 = 64 * 1024;
+pub(crate) const MAX_UNPROVED_TRAFFIC_ATTEMPTS: u8 = 3;
 const TRAFFIC_STOP_RESERVE_WINDOW_MS: u128 = 1_000;
 const TRAFFIC_STOP_RESERVE_HEADROOM_PERCENT: u128 = 125;
 const TRAFFIC_STOP_RESERVE_FIXED_BYTES: u128 = 1024 * 1024;
 const MAX_BACKEND_RUNTIME: Duration = Duration::from_secs(180);
 const MAX_SERVER_LIST_RUNTIME: Duration = Duration::from_secs(30);
-const MAX_AUTOMATIC_SERVER_ATTEMPTS: usize = 3;
 const MAX_RATE_PAYLOAD_TIMING_RATIO_PERCENT: u128 = 135;
 pub(crate) const SPEEDTEST_RATE_PAYLOAD_TIMING_MISMATCH: &str =
     "speedtest-rate-payload-timing-mismatch";
@@ -53,20 +66,19 @@ const MAX_UPLOAD_COUNTER_LAG_PERCENT: u128 = 5;
 const MIN_QUALIFICATION_COUNTER_CONFIDENCE_PERCENT: u128 = 80;
 const MIN_SHAPED_UPLOAD_PAYLOAD_WIRE_PERCENT: u128 = 60;
 const MAX_QUALIFICATION_DIAGNOSTIC_BYTES: usize = 1024;
-const ACCOUNTING_RX_COUNTER: &str = "rx";
-const ACCOUNTING_TX_COUNTER: &str = "tx";
 const SIGKILL: i32 = 9;
 const PR_SET_PDEATHSIG: i32 = 1;
 
 pub(crate) const SPEEDTEST_TRAFFIC_BUDGET_EXHAUSTED: &str = "speedtest-traffic-budget-exhausted";
 pub(crate) const SPEEDTEST_TRAFFIC_LIMIT_REACHED: &str = "speedtest-traffic-limit-reached";
 
-/// Reserve enough aggregate interface traffic for the 100 ms supervisor to
-/// observe a limit crossing and SIGKILL the backend without consuming the
-/// caller's complete accounting budget.  One full second plus 25% and one MiB
+/// Reserve observation/termination headroom. Owned supervision polls every 100 ms
+/// with a shared 250 ms counter-read deadline; legacy supervision reads the
+/// interface. One full second plus 25% and one MiB
 /// deliberately exceeds the normal observation/kill path while remaining
 /// usable on wide links.  If the supplied rate authority is too large to fit
 /// in u64, the saturated result makes admission fail closed before transfer.
+/// This is not a guarantee of physical-wire precision or arbitrary kernel-stall timing.
 pub(crate) fn traffic_stop_safety_reserve_bytes(
     download_bound_kbps: u64,
     upload_bound_kbps: u64,
@@ -153,6 +165,8 @@ pub struct SpeedtestResult {
 /// overhead multiplier and the pre-CAKE ingress-drop accounting error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SpeedtestLoadSample {
+    pub endpoint_host: Option<String>,
+    pub endpoint_sha256: Option<String>,
     pub direction: SpeedtestDirection,
     pub aggregate_rx_bytes: u64,
     pub aggregate_tx_bytes: u64,
@@ -281,6 +295,7 @@ impl SpeedtestAccountingPlan {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SpeedtestTrafficDebit {
+    pub lifecycle: bool,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
 }
@@ -322,6 +337,7 @@ struct BackendCredentials {
 struct NftRoutePin {
     table: Option<String>,
     owner: Option<String>,
+    cleanup_on_drop: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -334,16 +350,176 @@ struct CakeCounterSnapshot {
 
 pub(crate) struct EmbeddedSpeedtestSession {
     route_pin: NftRoutePin,
+    probe_pin: Option<NftRoutePin>,
     credentials: BackendCredentials,
     job_id: String,
     worker_run_id: String,
     route_fingerprint: String,
     route: super::protocol::OperationRouteIdentity,
     backend: String,
+    requested_server_id: Option<u64>,
+    authorized_traffic_budget: super::protocol::TrafficPolicy,
+    traffic_policy_explicit: bool,
     selected_server_id: Option<u64>,
+    server_qualified: bool,
+    pub(crate) qualified_raw_capacity: Option<super::server_qualification::QualifiedCapacity>,
+    selected_endpoint_sha256: Option<String>,
+    owned_checkpoint: Option<(PathBuf, String)>,
+    owned_ledger: Option<std::cell::Cell<OwnedTrafficLedger>>,
 }
 
 impl EmbeddedSpeedtestSession {
+    pub(crate) fn owned_budget_watch(
+        &self,
+        reserve: u64,
+    ) -> Result<Option<OwnedBudgetWatch<'_>>, String> {
+        let Some(ledger) = &self.owned_ledger else {
+            return Ok(None);
+        };
+        let ledger = ledger.get();
+        ledger.remaining()?;
+        Ok(Some(OwnedBudgetWatch {
+            backend: &self.route_pin,
+            probes: self
+                .probe_pin
+                .as_ref()
+                .ok_or("probe accounting table is missing")?,
+            limit: ledger
+                .authority
+                .checked_sub(reserve)
+                .ok_or(SPEEDTEST_TRAFFIC_BUDGET_EXHAUSTED)?,
+            previous: ledger.committed.counters,
+        }))
+    }
+
+    fn commit_owned_snapshot(
+        &self,
+        observed: OwnedTrafficSnapshot,
+        lifecycle: bool,
+        remaining: &mut super::protocol::TrafficPolicy,
+        on_debit: &mut dyn FnMut(SpeedtestTrafficDebit) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        let slot = self
+            .owned_ledger
+            .as_ref()
+            .ok_or("owned traffic ledger is unavailable")?;
+        let (path, request_digest) = self
+            .owned_checkpoint
+            .as_ref()
+            .ok_or("owned traffic checkpoint path is missing")?;
+        let mut ledger = slot.get();
+        let result = ledger.checkpoint(observed, |point, mut debit| {
+            debit.lifecycle = lifecycle;
+            point
+                .commit_debit_with_intent(
+                    path,
+                    &self.job_id,
+                    &self.worker_run_id,
+                    request_digest,
+                    || on_debit(debit),
+                )
+                .map_err(|error| format!("speedtest-owned-persistence-failed: {error}"))
+        });
+        slot.set(ledger); // Preserve poison on an ambiguous persistence failure.
+        let exceeded = result.map_err(|error| {
+            if error.starts_with("speedtest-owned-persistence-failed:") {
+                error
+            } else {
+                format!("speedtest-owned-budget-observation-failed: {error}")
+            }
+        })?;
+        *remaining = ledger.remaining()?;
+        Ok(exceeded)
+    }
+
+    pub(crate) fn checkpoint_owned_lifecycle(
+        &self,
+        remaining: &mut super::protocol::TrafficPolicy,
+        on_debit: &mut dyn FnMut(SpeedtestTrafficDebit) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        if self.owned_ledger.is_none() {
+            return Ok(false);
+        }
+        self.commit_owned_snapshot(self.owned_traffic_snapshot()?, true, remaining, on_debit)
+    }
+
+    pub(crate) fn owned_traffic_snapshot(&self) -> Result<OwnedTrafficSnapshot, String> {
+        if self.probe_pin.is_none() {
+            return Err("probe accounting table is missing".into());
+        }
+        read_owned_traffic_counters_with(
+            &self.job_id,
+            &self.worker_run_id,
+            Instant::now() + OWNED_BUDGET_READ_TIMEOUT,
+            |table, owner, deadline| {
+                let pin = NftRoutePin {
+                    table: Some(table.to_string()),
+                    owner: Some(owner.to_string()),
+                    cleanup_on_drop: false,
+                };
+                pin.traffic_counters_before(deadline)
+            },
+        )
+    }
+
+    pub(crate) fn publish_probe_owner(
+        &mut self,
+        store: &RuntimeOverrideStore,
+        permit: &AutotuneRuntimePermit,
+    ) -> Result<(), String> {
+        if !permit.probe_accounting_required {
+            return Ok(());
+        }
+        let directory = self
+            .owned_checkpoint
+            .as_ref()
+            .and_then(|(path, _)| path.parent())
+            .ok_or("owned traffic checkpoint directory is missing")?;
+        match fs::symlink_metadata(
+            directory.join(format!("owned-traffic-unstarted-{}", self.worker_run_id)),
+        ) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err("owned producer admission was already closed".into()),
+        }
+        if self.job_id != permit.job_id
+            || self.worker_run_id != permit.worker_run_id
+            || self.route_fingerprint != permit.route_fingerprint
+        {
+            return Err("probe accounting session identity mismatch".into());
+        }
+        let initial = OwnedTrafficCheckpoint {
+            sequence: 0,
+            counters: self.owned_traffic_snapshot()?,
+        };
+        let (path, request_sha256) = self
+            .owned_checkpoint
+            .as_ref()
+            .ok_or("owned traffic checkpoint path is missing")?;
+        initial.publish_bound(path, &self.job_id, &self.worker_run_id, request_sha256)?;
+        self.owned_ledger = Some(std::cell::Cell::new(
+            OwnedTrafficLedger::from_verified_checkpoint(self.authorized_traffic_budget, initial)?,
+        ));
+        let pin = self
+            .probe_pin
+            .as_mut()
+            .ok_or("probe accounting table is missing")?;
+        let owner = super::autotune_runtime_store::ProbeAccountingOwner {
+            job_id: self.job_id.clone(),
+            worker_run_id: self.worker_run_id.clone(),
+            permit_id: permit.permit_id.clone(),
+            boot_id: permit.boot_id.clone(),
+            route_fingerprint: self.route_fingerprint.clone(),
+            backend_uid: self.credentials.uid,
+            probe_gid: self.credentials.gid,
+        };
+        store.publish_probe_accounting_owner(permit, &owner)?;
+        // Coordinator retirement/cleanup owns the tables after publication;
+        // persistent probe sockets may outlive this worker's stack.
+        self.route_pin.cleanup_on_drop = false;
+        pin.cleanup_on_drop = false;
+        Ok(())
+    }
+
     pub(crate) fn open(
         request: &OperationRequest,
         worker_run_id: &str,
@@ -356,23 +532,68 @@ impl EmbeddedSpeedtestSession {
         let credentials = backend_credentials()?;
         let route_pin = acquire_route_pin_when_ready(
             || wait_for_route_ready(request, terminate).map(|_| ()),
-            || NftRoutePin::acquire(request, worker_run_id, credentials.uid, scratch_path),
+            || {
+                NftRoutePin::acquire(
+                    request,
+                    worker_run_id,
+                    NftSocketOwner::BackendUid(credentials.uid),
+                )
+            },
             || attest_route(request).map(|_| ()),
         )?;
+        let probe_pin = if request.identity.operation == OperationKind::FullAutotune
+            && request.traffic_policy_explicit
+        {
+            Some(NftRoutePin::acquire(
+                request,
+                worker_run_id,
+                NftSocketOwner::ProbeRootGid(credentials.gid),
+            )?)
+        } else {
+            None
+        };
+        let owned_checkpoint = if probe_pin.is_some() {
+            Some((
+                scratch_path
+                    .parent()
+                    .ok_or("owned traffic checkpoint has no job directory")?
+                    .join(format!("owned-traffic-checkpoint-{worker_run_id}")),
+                super::autotune_apply::native_apply_sha256_hex(request.encode()?.as_bytes()),
+            ))
+        } else {
+            None
+        };
         Ok(Self {
             route_pin,
+            probe_pin,
+            owned_checkpoint,
+            owned_ledger: None,
             credentials,
             job_id: request.identity.job_id.clone(),
             worker_run_id: worker_run_id.to_string(),
             route_fingerprint: request.identity.route_fingerprint.clone(),
             route: request.route.clone(),
             backend: request.backend.clone(),
+            requested_server_id: request.speedtest_server_id,
+            authorized_traffic_budget: request.traffic_budget,
+            traffic_policy_explicit: request.traffic_policy_explicit,
             selected_server_id: request.speedtest_server_id,
+            server_qualified: false,
+            qualified_raw_capacity: None,
+            selected_endpoint_sha256: None,
         })
     }
 
     pub(crate) fn close(mut self) -> Result<(), String> {
-        self.route_pin.release()
+        if self.route_pin.cleanup_on_drop {
+            self.route_pin.release()?;
+        }
+        if let Some(pin) = self.probe_pin.as_mut() {
+            if pin.cleanup_on_drop {
+                pin.release()?;
+            }
+        }
+        Ok(())
     }
 
     fn matches(&self, request: &OperationRequest, worker_run_id: &str) -> bool {
@@ -381,6 +602,11 @@ impl EmbeddedSpeedtestSession {
             && self.route_fingerprint == request.identity.route_fingerprint
             && self.route == request.route
             && self.backend == request.backend
+            && self.requested_server_id == request.speedtest_server_id
+            && self.traffic_policy_explicit == request.traffic_policy_explicit
+            && self
+                .authorized_traffic_budget
+                .permits(request.traffic_budget)
     }
 }
 
@@ -390,9 +616,396 @@ pub(crate) struct SpeedtestTrafficCounters {
     pub tx_bytes: u64,
 }
 
+/// Independent cumulative kernel counters. These are owned IP-packet counts,
+/// not a proof of physical-WAN bytes (notably for shared resolver traffic).
+/// Do not merge probe counters into backend goodput/measurement evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OwnedTrafficSnapshot {
+    pub backend: SpeedtestTrafficCounters,
+    pub probes: SpeedtestTrafficCounters,
+}
+
+impl OwnedTrafficSnapshot {
+    pub fn total_bytes(self) -> Result<u64, String> {
+        self.backend
+            .rx_bytes
+            .checked_add(self.backend.tx_bytes)
+            .and_then(|bytes| bytes.checked_add(self.probes.rx_bytes))
+            .and_then(|bytes| bytes.checked_add(self.probes.tx_bytes))
+            .ok_or_else(|| "owned traffic cumulative counter overflow".into())
+    }
+
+    fn delta_since(self, previous: Self) -> Result<SpeedtestTrafficDebit, String> {
+        // Validate each component before summing: a growing probe count cannot
+        // hide a reset of the backend's counter, or vice versa.
+        let backend = counter_deltas(
+            (previous.backend.rx_bytes, previous.backend.tx_bytes),
+            (self.backend.rx_bytes, self.backend.tx_bytes),
+        )?;
+        let probes = counter_deltas(
+            (previous.probes.rx_bytes, previous.probes.tx_bytes),
+            (self.probes.rx_bytes, self.probes.tx_bytes),
+        )?;
+        let rx_bytes = backend
+            .0
+            .checked_add(probes.0)
+            .ok_or("owned traffic RX delta overflow")?;
+        let tx_bytes = backend
+            .1
+            .checked_add(probes.1)
+            .ok_or("owned traffic TX delta overflow")?;
+        rx_bytes
+            .checked_add(tx_bytes)
+            .ok_or("owned traffic total delta overflow")?;
+        Ok(SpeedtestTrafficDebit {
+            lifecycle: false,
+            rx_bytes,
+            tx_bytes,
+        })
+    }
+}
+
+pub(crate) fn supervise_owned_traffic(
+    directory: &Path,
+    request: &OperationRequest,
+    worker: &str,
+    previous: Option<OwnedTrafficSnapshot>,
+) -> Result<OwnedTrafficSnapshot, String> {
+    let previous = match previous {
+        Some(previous) => previous,
+        None => {
+            route_pin_table_name(&request.identity.job_id, worker)?;
+            let path = directory.join(format!("owned-traffic-checkpoint-{worker}"));
+            let bytes = super::autotune_apply_runtime::read_private_recovery_bounded(
+                &path,
+                4096,
+                "owned traffic checkpoint",
+            )?;
+            let digest =
+                super::autotune_apply::native_apply_sha256_hex(request.encode()?.as_bytes());
+            OwnedTrafficCheckpoint::decode_bound(
+                std::str::from_utf8(&bytes).map_err(|_| "owned checkpoint is not UTF-8")?,
+                &request.identity.job_id,
+                worker,
+                &digest,
+            )?
+            .counters
+        }
+    };
+    let current = read_owned_traffic_counters_with(
+        &request.identity.job_id,
+        worker,
+        Instant::now() + OWNED_BUDGET_READ_TIMEOUT,
+        |table, owner, deadline| {
+            NftRoutePin {
+                table: Some(table.to_string()),
+                owner: Some(owner.to_string()),
+                cleanup_on_drop: false,
+            }
+            .traffic_counters_before(deadline)
+        },
+    )?;
+    current.delta_since(previous)?;
+    Ok(current)
+}
+
 struct BackendOutputGuard {
     output: File,
     stderr: File,
+}
+
+// Durable counter cursor. Debit recovery must also reconcile the evidence
+// journal; decoding this file alone does not acknowledge an uncertain append.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OwnedTrafficCheckpoint {
+    sequence: u32,
+    counters: OwnedTrafficSnapshot,
+}
+
+/// A bound checkpoint identifies the accounting method, not final settlement.
+pub(crate) fn verify_owned_accounting_checkpoint(
+    directory: &Path,
+    request: &OperationRequest,
+    worker: &str,
+) -> Result<(u32, u64, u64), String> {
+    if !request.traffic_policy_explicit {
+        return Err("owned accounting requires an explicit traffic policy".into());
+    }
+    if worker.len() != 32
+        || !worker
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err("owned accounting worker identity is invalid".into());
+    }
+    super::autotune_apply_runtime::require_private_directory(directory)?;
+    let path = directory.join(format!("owned-traffic-checkpoint-{worker}"));
+    match fs::symlink_metadata(path.with_extension("owned-intent")) {
+        Ok(_) => return Err("owned traffic checkpoint has an unacknowledged debit intent".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("unable to inspect owned debit intent: {error}")),
+    }
+    match fs::symlink_metadata(path.with_extension("owned-next")) {
+        Ok(_) => return Err("owned traffic checkpoint has unresolved staging residue".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("unable to inspect owned traffic staging: {error}")),
+    }
+    let bytes = super::autotune_apply_runtime::read_private_recovery_bounded(
+        &path,
+        4096,
+        "owned traffic checkpoint",
+    )?;
+    let digest = super::autotune_apply::native_apply_sha256_hex(request.encode()?.as_bytes());
+    let input = std::str::from_utf8(&bytes).map_err(|_| "owned traffic checkpoint is not UTF-8")?;
+    let checkpoint =
+        OwnedTrafficCheckpoint::decode_bound(input, &request.identity.job_id, worker, &digest)?;
+    let counters = checkpoint.counters;
+    Ok((
+        checkpoint.sequence,
+        counters
+            .backend
+            .rx_bytes
+            .checked_add(counters.probes.rx_bytes)
+            .ok_or("owned traffic RX overflow")?,
+        counters
+            .backend
+            .tx_bytes
+            .checked_add(counters.probes.tx_bytes)
+            .ok_or("owned traffic TX overflow")?,
+    ))
+}
+
+impl OwnedTrafficCheckpoint {
+    fn commit_debit_with_intent(
+        self,
+        path: &Path,
+        job: &str,
+        worker: &str,
+        request_sha256: &str,
+        append_debit: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        use super::autotune_apply_runtime::{
+            read_private_recovery_bounded, require_private_directory, sync_directory,
+            write_new_private_file,
+        };
+        let directory = path.parent().ok_or("owned checkpoint has no directory")?;
+        require_private_directory(directory)?;
+        let previous = read_private_recovery_bounded(path, 4096, "owned traffic checkpoint")?;
+        let previous = Self::decode_bound(
+            std::str::from_utf8(&previous).map_err(|_| "owned checkpoint is not UTF-8")?,
+            job,
+            worker,
+            request_sha256,
+        )?;
+        if previous.sequence.checked_add(1) != Some(self.sequence) {
+            return Err("owned debit intent is not contiguous".into());
+        }
+        let delta = self.counters.delta_since(previous.counters)?;
+        if delta.rx_bytes == 0 && delta.tx_bytes == 0 {
+            return Err("owned debit intent is empty".into());
+        }
+        let intent = path.with_extension("owned-intent");
+        let encoded = self.encode_bound(job, worker, request_sha256)?;
+        // Never replay an append merely because its intended counters match.
+        // An existing intent needs journal reconciliation, not another append.
+        write_new_private_file(&intent, encoded.as_bytes())?;
+        sync_directory(directory)?;
+        append_debit()?;
+        self.publish_bound(path, job, worker, request_sha256)?;
+        if read_private_recovery_bounded(&intent, 4096, "owned debit intent")? != encoded.as_bytes()
+        {
+            return Err("owned debit intent changed before acknowledgement".into());
+        }
+        fs::remove_file(&intent)
+            .map_err(|error| format!("unable to acknowledge owned debit intent: {error}"))?;
+        sync_directory(directory)
+    }
+
+    fn encode_bound(self, job: &str, worker: &str, request_sha256: &str) -> Result<String, String> {
+        for (value, length) in [(job, 32), (worker, 32), (request_sha256, 64)] {
+            if value.len() != length
+                || !value
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return Err("owned traffic checkpoint identity is invalid".into());
+            }
+        }
+        if (self.sequence == 0) != (self.counters.total_bytes()? == 0) {
+            return Err("owned traffic checkpoint origin is invalid".into());
+        }
+        let payload = serde_json::json!({"schema_version":1,"job_id":job,"worker_run_id":worker,
+            "request_sha256":request_sha256,"accounting":"owned-ip-system-dns-estimate-v1",
+            "sequence":self.sequence,"backend_rx":self.counters.backend.rx_bytes,"backend_tx":self.counters.backend.tx_bytes,
+            "probe_rx":self.counters.probes.rx_bytes,"probe_tx":self.counters.probes.tx_bytes});
+        let checksum =
+            super::autotune_apply::native_apply_sha256_hex(payload.to_string().as_bytes());
+        Ok(format!(
+            "{}\n",
+            serde_json::json!({"payload":payload,"sha256":checksum})
+        ))
+    }
+
+    fn decode_bound(
+        input: &str,
+        job: &str,
+        worker: &str,
+        request_sha256: &str,
+    ) -> Result<Self, String> {
+        if input.len() > 4096 {
+            return Err("owned traffic checkpoint is oversized".into());
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(input).map_err(|_| "owned traffic checkpoint JSON is invalid")?;
+        let payload = &value["payload"];
+        let number = |key| {
+            payload[key]
+                .as_u64()
+                .ok_or("owned traffic checkpoint counter is invalid")
+        };
+        let point = Self {
+            sequence: number("sequence")?
+                .try_into()
+                .map_err(|_| "owned traffic sequence is too large")?,
+            counters: OwnedTrafficSnapshot {
+                backend: SpeedtestTrafficCounters {
+                    rx_bytes: number("backend_rx")?,
+                    tx_bytes: number("backend_tx")?,
+                },
+                probes: SpeedtestTrafficCounters {
+                    rx_bytes: number("probe_rx")?,
+                    tx_bytes: number("probe_tx")?,
+                },
+            },
+        };
+        if point.encode_bound(job, worker, request_sha256)? != input {
+            return Err("owned traffic checkpoint binding or integrity mismatch".into());
+        }
+        Ok(point)
+    }
+
+    fn publish_bound(
+        self,
+        path: &Path,
+        job: &str,
+        worker: &str,
+        request_sha256: &str,
+    ) -> Result<(), String> {
+        use super::autotune_apply_runtime::{
+            read_private_recovery_bounded, replace_private_file, require_private_directory,
+            sync_directory, write_new_private_file,
+        };
+        let parent = path
+            .parent()
+            .ok_or("owned traffic checkpoint has no directory")?;
+        require_private_directory(parent)?;
+        let encoded = self.encode_bound(job, worker, request_sha256)?;
+        let staged = path.with_extension("owned-next");
+        match fs::symlink_metadata(&staged) {
+            Ok(_) => return Err("owned traffic checkpoint has unresolved staging residue".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("unable to inspect owned traffic staging: {error}")),
+        }
+        match fs::symlink_metadata(path) {
+            Ok(_) => {
+                let bytes = read_private_recovery_bounded(path, 4096, "owned traffic checkpoint")?;
+                let previous = Self::decode_bound(
+                    std::str::from_utf8(&bytes)
+                        .map_err(|_| "owned traffic checkpoint is not UTF-8")?,
+                    job,
+                    worker,
+                    request_sha256,
+                )?;
+                if previous == self {
+                    return sync_directory(parent);
+                }
+                if previous.sequence.checked_add(1) != Some(self.sequence) {
+                    return Err("owned traffic checkpoint sequence is not contiguous".into());
+                }
+                let delta = self.counters.delta_since(previous.counters)?;
+                if delta.rx_bytes == 0 && delta.tx_bytes == 0 {
+                    return Err("owned traffic checkpoint has no new bytes".into());
+                }
+                replace_private_file(path, &staged, encoded.as_bytes())?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if self.sequence != 0 {
+                    return Err("owned traffic checkpoint origin is missing".into());
+                }
+                write_new_private_file(path, encoded.as_bytes())?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "unable to inspect owned traffic checkpoint: {error}"
+                ))
+            }
+        }
+        sync_directory(parent)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct OwnedTrafficLedger {
+    authority: super::protocol::TrafficPolicy,
+    committed: OwnedTrafficCheckpoint,
+    persistence_uncertain: bool,
+}
+
+impl OwnedTrafficLedger {
+    fn from_verified_checkpoint(
+        authority: super::protocol::TrafficPolicy,
+        committed: OwnedTrafficCheckpoint,
+    ) -> Result<Self, String> {
+        let total = committed.counters.total_bytes()?;
+        if committed.sequence == 0 && total != 0 {
+            return Err("initial owned traffic checkpoint is not zero".into());
+        }
+        Ok(Self {
+            authority,
+            committed,
+            persistence_uncertain: false,
+        })
+    }
+
+    fn remaining(&self) -> Result<super::protocol::TrafficPolicy, String> {
+        if self.persistence_uncertain {
+            return Err("owned traffic persistence is uncertain".into());
+        }
+        Ok(self
+            .authority
+            .checked_sub(self.committed.counters.total_bytes()?)
+            .unwrap_or(0_u64.into()))
+    }
+
+    fn checkpoint(
+        &mut self,
+        observed: OwnedTrafficSnapshot,
+        persist: impl FnOnce(OwnedTrafficCheckpoint, SpeedtestTrafficDebit) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        if self.persistence_uncertain {
+            return Err("owned traffic persistence is uncertain".into());
+        }
+        // A reset/overflow or ambiguous append is terminal for this in-memory
+        // cursor. Recovery must reload a verified durable checkpoint.
+        self.persistence_uncertain = true;
+        let total = observed.total_bytes()?;
+        let debit = observed.delta_since(self.committed.counters)?;
+        let exceeded = self.authority.exceeded(total);
+        if debit.rx_bytes != 0 || debit.tx_bytes != 0 {
+            let next = OwnedTrafficCheckpoint {
+                sequence: self
+                    .committed
+                    .sequence
+                    .checked_add(1)
+                    .ok_or("owned traffic sequence overflow")?,
+                counters: observed,
+            };
+            persist(next, debit)?;
+            self.committed = next;
+        }
+        self.persistence_uncertain = false;
+        Ok(exceeded)
+    }
 }
 
 impl BackendOutputGuard {
@@ -427,56 +1040,260 @@ impl BackendOutputGuard {
     }
 }
 
+pub(crate) struct OwnedBudgetWatch<'a> {
+    backend: &'a NftRoutePin,
+    probes: &'a NftRoutePin,
+    limit: super::protocol::TrafficPolicy,
+    previous: OwnedTrafficSnapshot,
+}
+
+impl OwnedBudgetWatch<'_> {
+    /// Wait-phase checks do not acknowledge or debit evidence. A failed read
+    /// poisons the ledger so a later success cannot hide uncertain accounting.
+    pub(crate) fn check_wait(&mut self, session: &EmbeddedSpeedtestSession) -> Result<(), String> {
+        match self.poll() {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(SPEEDTEST_TRAFFIC_BUDGET_EXHAUSTED.to_string()),
+            Err(error) => {
+                if let Some(slot) = &session.owned_ledger {
+                    let mut ledger = slot.get();
+                    ledger.persistence_uncertain = true;
+                    slot.set(ledger);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn observe(&mut self, observed: OwnedTrafficSnapshot) -> Result<bool, String> {
+        observed.delta_since(self.previous)?;
+        let consumed = observed.total_bytes()?;
+        self.previous = observed;
+        Ok(self.limit.exceeded(consumed))
+    }
+
+    fn poll(&mut self) -> Result<bool, String> {
+        let result = (|| {
+            let deadline = Instant::now()
+                .checked_add(OWNED_BUDGET_READ_TIMEOUT)
+                .ok_or("owned budget deadline overflow")?;
+            let observed = OwnedTrafficSnapshot {
+                backend: self.backend.traffic_counters_before(deadline)?,
+                probes: self.probes.traffic_counters_before(deadline)?,
+            };
+            self.observe(observed)
+        })();
+        result
+            .map_err(|error: String| format!("speedtest-owned-budget-observation-failed: {error}"))
+    }
+}
+
+enum BackendExecution<'scope> {
+    Direct(BackendChild),
+    Watched {
+        stop: std::sync::mpsc::Sender<()>,
+        worker: Option<std::thread::ScopedJoinHandle<'scope, Result<bool, String>>>,
+        outcome: Option<Result<bool, String>>,
+    },
+}
+
+impl BackendExecution<'_> {
+    fn try_wait(&mut self) -> Result<bool, String> {
+        match self {
+            Self::Direct(child) => child.try_wait(),
+            Self::Watched {
+                worker, outcome, ..
+            } => {
+                if worker.as_ref().is_some_and(|worker| worker.is_finished()) {
+                    if let Some(finished) = worker.take() {
+                        *outcome =
+                            Some(finished.join().unwrap_or_else(|_| {
+                                Err("speedtest-budget-watcher-panicked".into())
+                            }));
+                    }
+                }
+                match outcome {
+                    Some(Ok(_)) => Ok(true),
+                    Some(Err(error)) => Err(error.clone()),
+                    None => Ok(false),
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self) -> Result<bool, String> {
+        match self {
+            Self::Direct(child) => child.finish(),
+            Self::Watched {
+                worker, outcome, ..
+            } => {
+                if let Some(worker) = worker.take() {
+                    *outcome = Some(
+                        worker
+                            .join()
+                            .unwrap_or_else(|_| Err("speedtest-budget-watcher-panicked".into())),
+                    );
+                }
+                outcome
+                    .clone()
+                    .ok_or("speedtest budget watcher has no outcome")?
+            }
+        }
+    }
+
+    fn stop_and_reap(&mut self) -> Result<(), String> {
+        match self {
+            Self::Direct(child) => child.stop_and_reap(),
+            Self::Watched { stop, .. } => {
+                let _ = stop.send(());
+                self.finish().map(|_| ())
+            }
+        }
+    }
+}
+
+impl Drop for BackendExecution<'_> {
+    fn drop(&mut self) {
+        let _ = self.stop_and_reap();
+    }
+}
+
+fn with_backend_supervision<T, Watch>(
+    mut child: BackendChild,
+    watch: Option<Watch>,
+    terminate: &AtomicBool,
+    deadline: Instant,
+    timeout_code: &'static str,
+    action: impl for<'scope> FnOnce(&mut BackendExecution<'scope>) -> Result<T, String>,
+) -> Result<T, String>
+where
+    Watch: FnMut() -> Result<bool, String> + Send,
+{
+    thread::scope(|scope| {
+        let mut execution = if let Some(mut watch) = watch {
+            let (stop, commands) = std::sync::mpsc::channel();
+            let worker = thread::Builder::new()
+                .name("cake-byte-budget".into())
+                .spawn_scoped(scope, move || loop {
+                    if terminate.load(Ordering::Relaxed) {
+                        child.stop_and_reap()?;
+                        return Err("speedtest-cancelled".into());
+                    }
+                    if child.try_wait()? {
+                        return child.finish();
+                    }
+                    if Instant::now() >= deadline {
+                        child.stop_and_reap()?;
+                        return Err(timeout_code.into());
+                    }
+                    if watch()? {
+                        child.stop_and_reap()?;
+                        if child.finish()? {
+                            return Ok(true);
+                        }
+                        return Err(SPEEDTEST_TRAFFIC_LIMIT_REACHED.into());
+                    }
+                    match commands.recv_timeout(POLL_INTERVAL) {
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            child.stop_and_reap()?;
+                            return Ok(false);
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                })
+                .map_err(|error| format!("speedtest-budget-watcher-start-failed: {error}"))?;
+            BackendExecution::Watched {
+                stop,
+                worker: Some(worker),
+                outcome: None,
+            }
+        } else {
+            BackendExecution::Direct(child)
+        };
+        action(&mut execution)
+    })
+}
+
 impl NftRoutePin {
+    fn traffic_counters_before(
+        &self,
+        deadline: Instant,
+    ) -> Result<SpeedtestTrafficCounters, String> {
+        let table = self
+            .table
+            .as_deref()
+            .ok_or("speedtest-accounting-table-missing")?;
+        let owner = self
+            .owner
+            .as_deref()
+            .ok_or("speedtest-accounting-owner-missing")?;
+        let listed = run_bounded_accounting_command(
+            &nft_table_snapshot_arguments(table),
+            accounting_time_remaining(deadline)?,
+            &|| false,
+        )?;
+        if !listed.0 {
+            return Err("speedtest-accounting-counters-missing-during-measurement".into());
+        }
+        let json = String::from_utf8(listed.1).map_err(|_| "speedtest-accounting-json-invalid")?;
+        parse_named_traffic_counters(&json, table, owner)
+    }
+
     fn acquire(
         request: &OperationRequest,
         worker_run_id: &str,
-        backend_uid: u32,
-        terminal_path: &Path,
+        socket_owner: NftSocketOwner,
     ) -> Result<Self, String> {
+        if matches!(socket_owner, NftSocketOwner::ProbeRootGid(0 | u32::MAX)) {
+            return Err("speedtest-probe-group-invalid".into());
+        }
+        if matches!(socket_owner, NftSocketOwner::ProbeRootGid(_))
+            && super::autotune_runtime_store::effective_uid() != 0
+        {
+            return Err("probe accounting requires a root worker".into());
+        }
         validate_utility_binary(Path::new(NFT), "nft")?;
-        let route_mark = if request.route.mode == OperationRouteMode::Mwan3 {
+        let route_mark = selected_route_mark(request, || {
             validate_utility_binary(Path::new(MWAN3), "mwan3")?;
-            let fwmark = request
-                .route
-                .fwmark
-                .ok_or_else(|| "speedtest-mwan3-fwmark-missing".to_string())?;
-            let mark_mask = resolve_mwan3_mark_mask(request)?;
-            if mark_mask == 0 || fwmark == 0 || fwmark & !mark_mask != 0 {
-                return Err("speedtest-mwan3-mark-outside-mask".to_string());
+            resolve_mwan3_mark_mask(request)
+        })?;
+        let (table, owner) = match socket_owner {
+            NftSocketOwner::BackendUid(_) => (
+                route_pin_table_name(&request.identity.job_id, worker_run_id)?,
+                route_pin_owner(&request.identity.job_id, worker_run_id)?,
+            ),
+            NftSocketOwner::ProbeRootGid(_) => {
+                probe_pin_identity(&request.identity.job_id, worker_run_id)?
             }
-            Some((!mark_mask, fwmark))
-        } else {
-            None
         };
-        let table = route_pin_table_name(&request.identity.job_id, worker_run_id)?;
-        let owner = route_pin_owner(&request.identity.job_id, worker_run_id)?;
         cleanup_named_route_pin(&table, &owner)?;
 
-        let batch = nft_route_pin_batch(&table, &owner, backend_uid, route_mark);
-        let batch_path = terminal_path.with_extension("nft-batch");
-        let mut batch_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&batch_path)
-            .map_err(|error| format!("speedtest-route-pin-batch-create-failed: {error}"))?;
-        let write_result = batch_file
-            .write_all(batch.as_bytes())
-            .and_then(|_| batch_file.sync_all())
-            .map_err(|error| format!("speedtest-route-pin-batch-write-failed: {error}"));
-        drop(batch_file);
-        if let Err(error) = write_result {
-            let _ = fs::remove_file(&batch_path);
-            return Err(error);
-        }
-        let installed = run_bounded_command(NFT, &["-j", "-f", path_text(&batch_path)?]);
-        let _ = fs::remove_file(&batch_path);
-        let installed = installed?;
-        if !installed.0 {
-            return Err("speedtest-route-pin-install-failed".to_string());
-        }
+        install_owned_route_pin_with(
+            &table,
+            &owner,
+            socket_owner,
+            route_mark,
+            &request.route.l3_device,
+            |arguments, input| {
+                let spec = SpawnSpec {
+                    program: PathBuf::from(NFT),
+                    arguments: arguments.iter().map(OsString::from).collect(),
+                    environment: Vec::new(),
+                };
+                let output = run_bounded_command_output_with_input(
+                    &spec,
+                    Some(input),
+                    ROUTE_COMMAND_TIMEOUT,
+                    COMMAND_OUTPUT_LIMIT,
+                    || false,
+                    |_| {},
+                )
+                .map_err(route_command_error)?;
+                Ok(output.status.success())
+            },
+        )?;
         let pin = Self {
+            cleanup_on_drop: true,
             table: Some(table),
             owner: Some(owner),
         };
@@ -514,7 +1331,9 @@ impl NftRoutePin {
 
 impl Drop for NftRoutePin {
     fn drop(&mut self) {
-        let _ = self.release();
+        if self.cleanup_on_drop {
+            let _ = self.release();
+        }
     }
 }
 
@@ -759,7 +1578,7 @@ fn run_unshaped_speedtest(
     };
     permit.authorizes(&request.identity.instance, &control, monotonic_boot_ms()?)?;
     store.publish_control(&control)?;
-    super::full_autotune::wait_for_runtime_applied(&store, &permit, &control, terminate)?;
+    super::full_autotune::wait_for_runtime_applied(None, &store, &permit, &control, terminate)?;
 
     let measurement =
         run_embedded_speedtest(request, worker_run_id, direction, terminate, scratch_path);
@@ -853,7 +1672,7 @@ pub(crate) fn run_embedded_speedtest_with_load_sample(
     terminate: &AtomicBool,
     scratch_path: &Path,
 ) -> Result<(SpeedtestTerminal, Option<SpeedtestLoadSample>), String> {
-    let mut remaining_traffic_budget = request.traffic_budget_bytes;
+    let mut remaining_traffic_budget = request.traffic_budget;
     with_embedded_speedtest_session(request, worker_run_id, terminate, scratch_path, |session| {
         run_embedded_speedtest_with_load_sample_in_session_and_debit(
             session,
@@ -889,7 +1708,7 @@ pub(crate) fn run_embedded_speedtest_with_load_sample_in_session_and_debit(
     worker_run_id: &str,
     direction: SpeedtestDirection,
     traffic_safety_reserve_bytes: u64,
-    remaining_traffic_budget: &mut u64,
+    remaining_traffic_budget: &mut super::protocol::TrafficPolicy,
     terminate: &AtomicBool,
     scratch_path: &Path,
     on_traffic_debit: &mut dyn FnMut(SpeedtestTrafficDebit) -> Result<(), String>,
@@ -920,7 +1739,7 @@ pub(crate) fn run_embedded_speedtest_with_accounting_in_session_and_debit(
     accounting: &SpeedtestAccountingPlan,
     attest_accounting_epoch: &mut dyn FnMut() -> Result<(), String>,
     traffic_safety_reserve_bytes: u64,
-    remaining_traffic_budget: &mut u64,
+    remaining_traffic_budget: &mut super::protocol::TrafficPolicy,
     terminate: &AtomicBool,
     scratch_path: &Path,
     on_traffic_debit: &mut dyn FnMut(SpeedtestTrafficDebit) -> Result<(), String>,
@@ -932,17 +1751,19 @@ pub(crate) fn run_embedded_speedtest_with_accounting_in_session_and_debit(
         return Err("speedtest-session-identity-mismatch".to_string());
     }
     let minimum_attempt_budget = minimum_attempt_budget(direction, traffic_safety_reserve_bytes);
-    let result = retry_budgeted_route_measurement_on_loss_with_debit(
+    let result = retry_budgeted_session_measurement_with_debit(
+        session,
+        request,
         remaining_traffic_budget,
         minimum_attempt_budget,
-        || interface_counters(&request.route.l3_device),
+        || session.owned_traffic_snapshot(),
         |budget| {
             let mut bounded_request = request.clone();
-            bounded_request.traffic_budget_bytes = budget
+            bounded_request.traffic_budget = budget
                 .checked_sub(traffic_safety_reserve_bytes)
                 .ok_or_else(|| SPEEDTEST_TRAFFIC_BUDGET_EXHAUSTED.to_string())?;
             let initial_route = wait_for_route_ready(request, terminate)?;
-            run_speedtest_with_pin(
+            let outcome = run_speedtest_with_pin(
                 &bounded_request,
                 direction,
                 accounting,
@@ -953,7 +1774,28 @@ pub(crate) fn run_embedded_speedtest_with_accounting_in_session_and_debit(
                 session.credentials,
                 session.selected_server_id,
                 &session.route_pin,
-            )
+                false,
+                session.owned_budget_watch(traffic_safety_reserve_bytes)?,
+            );
+            // Preserve the aggregate debit in the enclosing retry transaction,
+            // but never classify an accounting fault as a slow/broken server.
+            if outcome.is_err() {
+                session.route_pin.traffic_counters()?;
+            }
+            if let Some(pin) = session.probe_pin.as_ref() {
+                pin.traffic_counters()?;
+            }
+            if let (Some(expected), Ok((SpeedtestTerminal::Complete(_), sample))) =
+                (session.selected_endpoint_sha256.as_deref(), &outcome)
+            {
+                attest_selected_endpoint(
+                    expected,
+                    sample
+                        .as_ref()
+                        .and_then(|sample| sample.endpoint_sha256.as_deref()),
+                )?;
+            }
+            outcome
         },
         on_traffic_debit,
     )?;
@@ -965,9 +1807,10 @@ pub(crate) fn run_embedded_speedtest_with_accounting_in_session_and_debit(
     Ok(result)
 }
 
-/// Select and validate one automatic speedtest-go server for the complete
-/// native Auto-Tune job.  A single bidirectional qualification prevents later
-/// directional captures from silently switching servers, and rejects the
+/// Compare and validate speedtest-go servers for the complete
+/// native Auto-Tune job. Repeated interleaved comparisons prevent the first
+/// plausible slow server from winning by list order. They are preliminary
+/// under the current topology, not proof of unshaped capacity. Validation rejects the
 /// known speedtest-go failure mode where upload payload/rate is reported more
 /// than once even though the selected interface counters prove otherwise.
 pub(crate) fn qualify_embedded_speedtest_server_in_session(
@@ -977,55 +1820,197 @@ pub(crate) fn qualify_embedded_speedtest_server_in_session(
     accounting: &SpeedtestAccountingPlan,
     attest_accounting_epoch: &mut dyn FnMut() -> Result<(), String>,
     traffic_safety_reserve_bytes: u64,
-    remaining_traffic_budget: &mut u64,
+    remaining_traffic_budget: &mut super::protocol::TrafficPolicy,
     terminate: &AtomicBool,
     scratch_path: &Path,
     on_traffic_debit: &mut dyn FnMut(SpeedtestTrafficDebit) -> Result<(), String>,
+    on_comparison: &mut dyn FnMut(super::server_qualification::Comparison) -> Result<(), String>,
 ) -> Result<Option<u64>, String> {
     if !session.matches(request, worker_run_id) {
         return Err("speedtest-session-identity-mismatch".to_string());
     }
-    if let Some(server_id) = request.speedtest_server_id {
-        if server_id == 0 {
-            return Err("speedtest-server-id-invalid".to_string());
-        }
-        session.selected_server_id = Some(server_id);
-        return Ok(Some(server_id));
-    }
-    if session.selected_server_id.is_some() {
+    if session.server_qualified {
         return Ok(session.selected_server_id);
     }
-
-    let candidates = retry_budgeted_route_measurement_on_loss_with_debit(
+    let debit_count = std::cell::Cell::new(0u32);
+    let mut record_debit = |debit: SpeedtestTrafficDebit| {
+        let lifecycle = debit.lifecycle;
+        on_traffic_debit(debit)?;
+        if lifecycle {
+            return Ok(());
+        }
+        debit_count.set(
+            debit_count
+                .get()
+                .checked_add(1)
+                .ok_or("qualification debit count overflow")?,
+        );
+        Ok(())
+    };
+    let started_boot_ms = monotonic_boot_ms()?;
+    let started = Instant::now();
+    let mut comparisons = Vec::with_capacity(super::server_qualification::MAX_COMPARISONS);
+    let listed = retry_budgeted_session_measurement_with_debit(
+        session,
+        request,
         remaining_traffic_budget,
         traffic_safety_reserve_bytes
             .checked_add(1)
             .unwrap_or(u64::MAX),
-        || interface_counters(&request.route.l3_device),
+        || session.owned_traffic_snapshot(),
         |budget| {
             let mut bounded_request = request.clone();
-            bounded_request.traffic_budget_bytes = budget
+            bounded_request.traffic_budget = budget
                 .checked_sub(traffic_safety_reserve_bytes)
                 .ok_or_else(|| SPEEDTEST_TRAFFIC_BUDGET_EXHAUSTED.to_string())?;
-            run_speedtest_go_server_list_attempt(
+            let outcome = run_speedtest_go_server_list_attempt(
                 &bounded_request,
                 terminate,
                 &scratch_path.with_extension("server-list"),
                 session.credentials,
-            )
+                session.owned_budget_watch(traffic_safety_reserve_bytes)?,
+            );
+            session.route_pin.traffic_counters()?;
+            if let Some(pin) = session.probe_pin.as_ref() {
+                pin.traffic_counters()?;
+            }
+            outcome
         },
-        on_traffic_debit,
-    )?;
-
-    let attempts: Vec<Option<u64>> = if candidates.is_empty() {
-        vec![None]
-    } else {
-        candidates
-            .into_iter()
-            .take(MAX_AUTOMATIC_SERVER_ATTEMPTS)
-            .map(Some)
-            .collect()
+        &mut record_debit,
+    );
+    let discovery = super::server_qualification::Comparison {
+        index: 0,
+        candidate_id: None,
+        server_id: None,
+        server_name: String::new(),
+        server_sponsor: String::new(),
+        endpoint_host: None,
+        endpoint_sha256: None,
+        display_metadata_truncated: false,
+        started_boot_ms,
+        elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        debit_offset: 0,
+        debit_count: debit_count.get(),
+        download_kbps: None,
+        upload_kbps: None,
+        valid: false,
+        code: if listed.is_ok() {
+            "server-list-complete"
+        } else {
+            "server-list-failed"
+        }
+        .into(),
     };
+    comparisons.push(discovery.clone());
+    on_comparison(discovery)?;
+    let candidates = listed?;
+
+    let mut attempts = Vec::with_capacity(super::server_qualification::MAX_SERVERS);
+    if let Some(id) = request.speedtest_server_id {
+        attempts.push(Some(id));
+    }
+    for id in candidates {
+        if !attempts.contains(&Some(id)) {
+            attempts.push(Some(id));
+        }
+        if attempts.len() == super::server_qualification::MAX_SERVERS {
+            break;
+        }
+    }
+    let selected = qualify_server_candidates(
+        request.speedtest_server_id,
+        accounting.download.is_none() && accounting.upload.is_none(),
+        &attempts,
+        &mut comparisons,
+        |index, candidate| {
+            let started_boot_ms = monotonic_boot_ms()?;
+            let started = Instant::now();
+            let debit_offset = debit_count.get();
+            let outcome = retry_budgeted_session_measurement_with_debit(
+                session,
+                request,
+                remaining_traffic_budget,
+                minimum_attempt_budget(SpeedtestDirection::Both, traffic_safety_reserve_bytes),
+                || session.owned_traffic_snapshot(),
+                |budget| {
+                    let mut bounded_request = request.clone();
+                    bounded_request.traffic_budget = budget
+                        .checked_sub(traffic_safety_reserve_bytes)
+                        .ok_or_else(|| SPEEDTEST_TRAFFIC_BUDGET_EXHAUSTED.to_string())?;
+                    let outcome = run_speedtest_with_pin(
+                        &bounded_request,
+                        SpeedtestDirection::Both,
+                        accounting,
+                        attest_accounting_epoch,
+                        terminate,
+                        &scratch_path.with_extension(format!("server-attempt-{}", index + 1)),
+                        wait_for_route_ready(request, terminate)?,
+                        session.credentials,
+                        candidate,
+                        &session.route_pin,
+                        true,
+                        session.owned_budget_watch(traffic_safety_reserve_bytes)?,
+                    );
+                    if outcome.is_err() {
+                        session.route_pin.traffic_counters()?;
+                    }
+                    if let Some(pin) = session.probe_pin.as_ref() {
+                        pin.traffic_counters()?;
+                    }
+                    outcome
+                },
+                &mut record_debit,
+            );
+            Ok(ServerQualificationAttempt {
+                outcome,
+                started_boot_ms,
+                elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                debit_offset,
+                debit_count: debit_count.get() - debit_offset,
+            })
+        },
+        on_comparison,
+    )?;
+    session.selected_server_id = Some(selected.server_id);
+    session.selected_endpoint_sha256 = Some(selected.endpoint_sha256);
+    session.qualified_raw_capacity = selected.raw_capacity;
+    session.server_qualified = true;
+    Ok(Some(selected.server_id))
+}
+
+struct ServerQualificationAttempt {
+    outcome: Result<(SpeedtestTerminal, Option<SpeedtestLoadSample>), String>,
+    started_boot_ms: u64,
+    elapsed_ms: u64,
+    debit_offset: u32,
+    debit_count: u32,
+}
+
+struct ServerQualificationSelection {
+    server_id: u64,
+    endpoint_sha256: String,
+    raw_capacity: Option<super::server_qualification::QualifiedCapacity>,
+}
+
+// The scheduler and evidence checks are shared with deterministic fixtures.
+// Production's callback still owns route attestation, retry debits and stop authority.
+fn qualify_server_candidates(
+    requested_server_id: Option<u64>,
+    raw: bool,
+    attempts: &[Option<u64>],
+    comparisons: &mut Vec<super::server_qualification::Comparison>,
+    mut measure: impl FnMut(usize, Option<u64>) -> Result<ServerQualificationAttempt, String>,
+    on_comparison: &mut dyn FnMut(super::server_qualification::Comparison) -> Result<(), String>,
+) -> Result<ServerQualificationSelection, String> {
+    if attempts.len() < 2 {
+        return Err("server-comparison-insufficient-listed-candidates".into());
+    }
+    if attempts.len() > super::server_qualification::MAX_SERVERS {
+        return Err("server-comparison-candidate-bound".into());
+    }
+    let mut observations =
+        Vec::with_capacity(attempts.len() * super::server_qualification::REPEATS);
+    let mut rejected_candidates = [false; super::server_qualification::MAX_SERVERS];
     let mut rejected = 0usize;
     let mut common_rejection = None::<String>;
     let mut mixed_rejections = false;
@@ -1038,86 +2023,221 @@ pub(crate) fn qualify_embedded_speedtest_server_in_session(
             common_rejection = Some(reason.to_string());
         }
     };
-    for (index, candidate) in attempts.into_iter().enumerate() {
-        let attempt = retry_budgeted_route_measurement_on_loss_with_debit(
-            remaining_traffic_budget,
-            minimum_attempt_budget(SpeedtestDirection::Both, traffic_safety_reserve_bytes),
-            || interface_counters(&request.route.l3_device),
-            |budget| {
-                let mut bounded_request = request.clone();
-                bounded_request.traffic_budget_bytes = budget
-                    .checked_sub(traffic_safety_reserve_bytes)
-                    .ok_or_else(|| SPEEDTEST_TRAFFIC_BUDGET_EXHAUSTED.to_string())?;
-                run_speedtest_with_pin(
-                    &bounded_request,
-                    SpeedtestDirection::Both,
-                    accounting,
-                    attest_accounting_epoch,
-                    terminate,
-                    &scratch_path.with_extension(format!("server-attempt-{}", index + 1)),
-                    wait_for_route_ready(request, terminate)?,
-                    session.credentials,
-                    candidate,
-                    &session.route_pin,
-                )
-            },
-            on_traffic_debit,
-        );
-
-        match attempt {
-            Ok((SpeedtestTerminal::Complete(result), Some(sample))) => {
-                let Some(selected) = result.server_id.filter(|value| *value > 0) else {
-                    eprintln!(
+    for (batch_number, batch) in attempts
+        .chunks(super::server_qualification::SERVERS_PER_BATCH)
+        .enumerate()
+    {
+        // Healthy first-batch sources do not incur backup traffic. A failed
+        // comparison may use one bounded backup batch under the same ledger.
+        if batch_number > 0
+            && super::server_qualification::select_independent(comparisons, requested_server_id)
+                .is_ok()
+        {
+            break;
+        }
+        let batch_offset = batch_number * super::server_qualification::SERVERS_PER_BATCH;
+        for round_index in 0..batch.len() * super::server_qualification::REPEATS {
+            let index = batch_offset * super::server_qualification::REPEATS + round_index;
+            let slot = batch_offset + round_index % batch.len();
+            if rejected_candidates[slot] {
+                continue;
+            }
+            let candidate = attempts[slot];
+            let measured = measure(index, candidate)?;
+            let attempt = measured.outcome;
+            let mut comparison = super::server_qualification::Comparison {
+                index: index + 1,
+                candidate_id: candidate,
+                server_id: None,
+                server_name: String::new(),
+                server_sponsor: String::new(),
+                endpoint_host: None,
+                endpoint_sha256: None,
+                display_metadata_truncated: false,
+                started_boot_ms: measured.started_boot_ms,
+                elapsed_ms: measured.elapsed_ms,
+                debit_offset: measured.debit_offset,
+                debit_count: measured.debit_count,
+                download_kbps: None,
+                upload_kbps: None,
+                valid: false,
+                code: "attempt-failed".into(),
+            };
+            match &attempt {
+                Ok((SpeedtestTerminal::Complete(result), sample)) => {
+                    comparison.server_id = result.server_id;
+                    comparison.server_name = result.server_name.clone();
+                    comparison.server_sponsor = result.server_sponsor.clone();
+                    comparison.endpoint_host = sample
+                        .as_ref()
+                        .and_then(|sample| sample.endpoint_host.clone());
+                    comparison.endpoint_sha256 = sample
+                        .as_ref()
+                        .and_then(|sample| sample.endpoint_sha256.clone());
+                    comparison.download_kbps = result.download_kbps;
+                    comparison.upload_kbps = result.upload_kbps;
+                    comparison.code = if let Some(sample) = sample {
+                        if let Some(reason) = speedtest_qualification_rejection(result, sample) {
+                            reason.code()
+                        } else {
+                            let (download, upload) = qualification_bounded_goodput(result, sample)?;
+                            comparison.download_kbps = Some(download);
+                            comparison.upload_kbps = Some(upload);
+                            comparison.valid = true;
+                            "valid-observation"
+                        }
+                    } else {
+                        "measurement-evidence-missing"
+                    }
+                    .into();
+                    if result.server_id.is_none_or(|id| id == 0) {
+                        comparison.valid = false;
+                        comparison.code = "server-id-missing".into();
+                    }
+                    if comparison.valid
+                        && (comparison.endpoint_host.is_none()
+                            || comparison.endpoint_sha256.is_none())
+                    {
+                        comparison.valid = false;
+                        comparison.code = "server-comparison-endpoint-missing".into();
+                    }
+                    let provider = super::server_qualification::normalized_provider(
+                        &comparison.server_sponsor,
+                    );
+                    if comparison.valid && provider.is_none() {
+                        comparison.valid = false;
+                        comparison.code = "server-comparison-provider-missing".into();
+                    }
+                    if comparison.valid
+                        && comparisons.iter().any(|old| {
+                            old.valid
+                                && old.server_id == comparison.server_id
+                                && (old.endpoint_host != comparison.endpoint_host
+                                    || old.endpoint_sha256 != comparison.endpoint_sha256
+                                    || super::server_qualification::normalized_provider(
+                                        &old.server_sponsor,
+                                    ) != provider)
+                        })
+                    {
+                        comparison.valid = false;
+                        comparison.code = "server-comparison-source-identity-changed".into();
+                    }
+                }
+                Ok((SpeedtestTerminal::Cancelled, _)) => comparison.code = "cancelled".into(),
+                Ok((SpeedtestTerminal::Failed { code }, _)) | Err(code) => {
+                    comparison.code = if code.len() <= 128
+                        && code.bytes().all(|byte| {
+                            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                        }) {
+                        code.clone()
+                    } else {
+                        retryable_server_rejection_code(code).into()
+                    };
+                }
+            }
+            let accepted = comparison.valid;
+            let rejection_code = comparison.code.clone();
+            let accepted_rates = (comparison.download_kbps, comparison.upload_kbps);
+            comparisons.push(comparison.clone());
+            on_comparison(comparison)?;
+            match attempt {
+                Ok((SpeedtestTerminal::Complete(result), Some(sample))) => {
+                    let Some(selected) = result.server_id.filter(|value| *value > 0) else {
+                        eprintln!(
                         "speedtest-qualification-attempt-failed attempt={} code=speedtest-server-id-missing",
                         index + 1
                     );
-                    record_rejection("server-id-missing");
-                    rejected += 1;
-                    continue;
-                };
-                if let Some(reason) = speedtest_qualification_rejection(&result, &sample) {
+                        record_rejection("server-id-missing");
+                        rejected_candidates[slot] = true;
+                        rejected += 1;
+                        continue;
+                    };
+                    if let Some(reason) = speedtest_qualification_rejection(&result, &sample) {
+                        eprintln!(
+                            "{}",
+                            qualification_rejection_log_line(index + 1, &result, &sample, reason)
+                        );
+                        record_rejection(reason.code());
+                        rejected_candidates[slot] = true;
+                        rejected += 1;
+                    } else if !accepted {
+                        record_rejection(&rejection_code);
+                        rejected_candidates[slot] = true;
+                        rejected += 1;
+                    } else {
+                        let observation = super::server_qualification::Observation {
+                            server_id: selected,
+                            download_kbps: accepted_rates
+                                .0
+                                .ok_or("qualification download missing")?,
+                            upload_kbps: accepted_rates.1.ok_or("qualification upload missing")?,
+                        };
+                        eprintln!("speedtest-qualification-observed attempt={} server_id={} dl_kbps={} ul_kbps={}",
+                        index + 1, selected, observation.download_kbps, observation.upload_kbps);
+                        observations.push(observation);
+                    }
+                }
+                Ok((SpeedtestTerminal::Cancelled, _)) => {
+                    return Err("speedtest-server-qualification-cancelled".to_string())
+                }
+                Ok((SpeedtestTerminal::Failed { code }, _)) => {
+                    if !server_attempt_is_retryable(&code) {
+                        return Err(code);
+                    }
+                    let reason = retryable_server_rejection_code(&code);
                     eprintln!(
-                        "{}",
-                        qualification_rejection_log_line(index + 1, &result, &sample, reason)
+                        "speedtest-qualification-attempt-failed attempt={} code={code}",
+                        index + 1
                     );
-                    record_rejection(reason.code());
+                    record_rejection(reason);
+                    rejected_candidates[slot] = true;
                     rejected += 1;
-                } else {
-                    session.selected_server_id = Some(selected);
-                    return Ok(Some(selected));
                 }
-            }
-            Ok((SpeedtestTerminal::Cancelled, _)) => {
-                return Err("speedtest-server-qualification-cancelled".to_string())
-            }
-            Ok((SpeedtestTerminal::Failed { code }, _)) => {
-                if !server_attempt_is_retryable(&code) {
-                    return Err(code);
+                Ok((SpeedtestTerminal::Complete(_), None)) => {
+                    return Err("speedtest-server-qualification-evidence-missing".to_string())
                 }
-                let reason = retryable_server_rejection_code(&code);
-                eprintln!(
-                    "speedtest-qualification-attempt-failed attempt={} code={code}",
-                    index + 1
-                );
-                record_rejection(reason);
-                rejected += 1;
+                Err(error) if server_attempt_is_retryable(&error) => {
+                    let reason = retryable_server_rejection_code(&error);
+                    eprintln!(
+                        "speedtest-qualification-attempt-failed attempt={} code={error}",
+                        index + 1
+                    );
+                    record_rejection(reason);
+                    rejected_candidates[slot] = true;
+                    rejected += 1;
+                }
+                Err(error) => return Err(error),
             }
-            Ok((SpeedtestTerminal::Complete(_), None)) => {
-                return Err("speedtest-server-qualification-evidence-missing".to_string())
-            }
-            Err(error) if server_attempt_is_retryable(&error) => {
-                let reason = retryable_server_rejection_code(&error);
-                eprintln!(
-                    "speedtest-qualification-attempt-failed attempt={} code={error}",
-                    index + 1
-                );
-                record_rejection(reason);
-                rejected += 1;
-            }
-            Err(error) => return Err(error),
         }
     }
-
+    if !observations.is_empty() {
+        let selected =
+            super::server_qualification::select_independent(comparisons, requested_server_id)?;
+        let endpoint_sha256 = comparisons
+            .iter()
+            .find(|row| row.valid && row.server_id == Some(selected))
+            .and_then(|row| row.endpoint_sha256.clone())
+            .ok_or("server-comparison-endpoint-missing")?;
+        let raw_capacity = if raw {
+            Some(
+                super::server_qualification::QualifiedCapacity::from_selected(
+                    &observations,
+                    selected,
+                )?,
+            )
+        } else {
+            None
+        };
+        eprintln!(
+            "speedtest-qualification-selected server_id={selected} policy={}",
+            super::server_qualification::SOURCE_POLICY
+        );
+        return Ok(ServerQualificationSelection {
+            server_id: selected,
+            endpoint_sha256,
+            raw_capacity,
+        });
+    }
     let reason = if mixed_rejections {
         "mixed"
     } else {
@@ -1126,73 +2246,103 @@ pub(crate) fn qualify_embedded_speedtest_server_in_session(
     Err(format!("speedtest-qualification-{reason}-after-{rejected}"))
 }
 
-fn run_speedtest_go_server_list_attempt(
-    request: &OperationRequest,
-    terminate: &AtomicBool,
-    scratch_path: &Path,
-    credentials: BackendCredentials,
-) -> Result<Vec<u64>, String> {
+fn speedtest_go_server_list_arguments(request: &OperationRequest) -> Result<Vec<String>, String> {
     let source = request
         .route
         .source_ip
         .filter(|value| matches!(value, IpAddr::V4(_)))
         .ok_or_else(|| "speedtest-source-ipv4-required".to_string())?;
-    let arguments = vec![
+    let mut arguments = vec![
         "--list".to_string(),
         "--ping-mode".to_string(),
         "http".to_string(),
         "--source".to_string(),
         source.to_string(),
-        "--dns-bind-source".to_string(),
     ];
+    append_backend_dns_arguments(request, &mut arguments)?;
+    Ok(arguments)
+}
+
+fn run_speedtest_go_server_list_attempt(
+    request: &OperationRequest,
+    terminate: &AtomicBool,
+    scratch_path: &Path,
+    credentials: BackendCredentials,
+    mut budget_watch: Option<OwnedBudgetWatch<'_>>,
+) -> Result<Vec<u64>, String> {
+    let arguments = speedtest_go_server_list_arguments(request)?;
     let initial_route = wait_for_route_ready(request, terminate)?;
     let counters_before = interface_counters(&request.route.l3_device)?;
     let (mut output_guard, stdout, stderr) = BackendOutputGuard::create(scratch_path)?;
-    let mut child = BackendChild::spawn(&arguments, stdout, stderr, credentials)?;
-    let deadline = Instant::now() + MAX_SERVER_LIST_RUNTIME;
-    let mut next_route_check = Instant::now() + ROUTE_RECHECK_INTERVAL;
-    loop {
-        if terminate.load(Ordering::Relaxed) {
-            child.stop_and_reap()?;
-            return Err("speedtest-server-list-cancelled".to_string());
-        }
-        if child.try_wait()? {
-            break;
-        }
-        if Instant::now() >= deadline {
-            child.stop_and_reap()?;
-            return Err("speedtest-server-list-timeout".to_string());
-        }
-        let counters = interface_counters(&request.route.l3_device)?;
-        let deltas = counter_deltas(counters_before, counters)?;
-        if deltas.0.saturating_add(deltas.1) > request.traffic_budget_bytes {
-            child.stop_and_reap()?;
-            return Err(SPEEDTEST_TRAFFIC_LIMIT_REACHED.to_string());
-        }
-        if Instant::now() >= next_route_check {
-            match attest_route(request) {
-                Ok(current) if current.identity == initial_route.identity => {}
-                Ok(_) => {
-                    child.stop_and_reap()?;
-                    return Err("speedtest-route-drift".to_string());
-                }
-                Err(error) => {
-                    child.stop_and_reap()?;
-                    return Err(error);
-                }
-            }
-            next_route_check = Instant::now() + ROUTE_RECHECK_INTERVAL;
-        }
-        thread::sleep(POLL_INTERVAL);
+    if budget_watch
+        .as_mut()
+        .map(OwnedBudgetWatch::poll)
+        .transpose()?
+        .unwrap_or(false)
+    {
+        return Err(SPEEDTEST_TRAFFIC_LIMIT_REACHED.into());
     }
-    if !child.finish()? {
+    let owned_budget = budget_watch.is_some();
+    let child = BackendChild::spawn(&arguments, stdout, stderr, credentials)?;
+    let deadline = Instant::now() + MAX_SERVER_LIST_RUNTIME;
+    let success = with_backend_supervision(
+        child,
+        budget_watch.map(|mut watch| move || watch.poll()),
+        terminate,
+        deadline,
+        "speedtest-server-list-timeout",
+        |child| {
+            let mut next_route_check = Instant::now() + ROUTE_RECHECK_INTERVAL;
+            loop {
+                if terminate.load(Ordering::Relaxed) {
+                    child.stop_and_reap()?;
+                    return Err("speedtest-server-list-cancelled".to_string());
+                }
+                if child.try_wait()? {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    child.stop_and_reap()?;
+                    return Err("speedtest-server-list-timeout".to_string());
+                }
+                if !owned_budget {
+                    let counters = interface_counters(&request.route.l3_device)?;
+                    let deltas = counter_deltas(counters_before, counters)?;
+                    if request
+                        .traffic_budget
+                        .exceeded(deltas.0.saturating_add(deltas.1))
+                    {
+                        child.stop_and_reap()?;
+                        return Err(SPEEDTEST_TRAFFIC_LIMIT_REACHED.to_string());
+                    }
+                }
+                if Instant::now() >= next_route_check {
+                    match attest_route(request) {
+                        Ok(current) if current.identity == initial_route.identity => {}
+                        Ok(_) => {
+                            child.stop_and_reap()?;
+                            return Err("speedtest-route-drift".to_string());
+                        }
+                        Err(error) => {
+                            child.stop_and_reap()?;
+                            return Err(error);
+                        }
+                    }
+                    next_route_check = Instant::now() + ROUTE_RECHECK_INTERVAL;
+                }
+                thread::sleep(POLL_INTERVAL);
+            }
+            child.finish()
+        },
+    )?;
+    if !success {
         return Ok(Vec::new());
     }
     if attest_route(request)?.identity != initial_route.identity {
         return Err("speedtest-route-drift".to_string());
     }
     let output = read_bounded_file(&mut output_guard.output, OUTPUT_LIMIT)?;
-    speedtest_go_server_candidates(&output)
+    speedtest_go_server_candidates(&output, request.speedtest_server_id)
 }
 
 /// Server discovery is not measurement evidence.  If the selected route goes
@@ -1233,14 +2383,14 @@ where
 /// this helper.
 #[cfg(test)]
 fn retry_budgeted_route_measurement_on_loss<T, Counters, Attempt>(
-    remaining_traffic_budget: &mut u64,
+    remaining_traffic_budget: &mut super::protocol::TrafficPolicy,
     minimum_attempt_budget: u64,
     counters: Counters,
     attempt: Attempt,
 ) -> Result<T, String>
 where
     Counters: FnMut() -> Result<(u64, u64), String>,
-    Attempt: FnMut(u64) -> Result<T, String>,
+    Attempt: FnMut(super::protocol::TrafficPolicy) -> Result<T, String>,
 {
     retry_budgeted_route_measurement_on_loss_with_debit(
         remaining_traffic_budget,
@@ -1251,8 +2401,85 @@ where
     )
 }
 
+fn retry_budgeted_session_measurement_with_debit<T>(
+    session: &EmbeddedSpeedtestSession,
+    request: &OperationRequest,
+    remaining: &mut super::protocol::TrafficPolicy,
+    minimum: u64,
+    mut owned_counters: impl FnMut() -> Result<OwnedTrafficSnapshot, String>,
+    mut attempt: impl FnMut(super::protocol::TrafficPolicy) -> Result<T, String>,
+    on_debit: &mut dyn FnMut(SpeedtestTrafficDebit) -> Result<(), String>,
+) -> Result<T, String> {
+    let Some(slot) = &session.owned_ledger else {
+        return retry_budgeted_route_measurement_on_loss_with_debit(
+            remaining,
+            minimum,
+            || interface_counters(&request.route.l3_device),
+            attempt,
+            on_debit,
+        );
+    };
+    let mut unproved = 0_u8;
+    let mut read_owned = |previous: OwnedTrafficSnapshot| {
+        let result = owned_counters().and_then(|observed| {
+            observed.total_bytes()?;
+            observed.delta_since(previous)?;
+            Ok(observed)
+        });
+        if result.is_err() {
+            let mut failed = slot.get();
+            failed.persistence_uncertain = true;
+            slot.set(failed);
+        }
+        result
+    };
+    loop {
+        let ledger = slot.get();
+        ledger.remaining()?;
+        let before = read_owned(ledger.committed.counters)?;
+        let available = ledger
+            .authority
+            .checked_sub(before.total_bytes()?)
+            .unwrap_or(0_u64.into());
+        if !available.allows(minimum) {
+            let overrun = session.commit_owned_snapshot(before, true, remaining, on_debit)?;
+            return Err(if overrun {
+                "speedtest-traffic-budget-exceeded"
+            } else {
+                SPEEDTEST_TRAFFIC_BUDGET_EXHAUSTED
+            }
+            .into());
+        }
+        let outcome = attempt(available);
+        if outcome.as_ref().err().is_some_and(|error| {
+            error.starts_with("speedtest-owned-budget-observation-failed:")
+                || error == "speedtest-budget-watcher-panicked"
+        }) {
+            let mut failed = slot.get();
+            failed.persistence_uncertain = true;
+            slot.set(failed);
+            return outcome;
+        }
+        let after = read_owned(before)?;
+        if session.commit_owned_snapshot(after, false, remaining, on_debit)? {
+            return Err("speedtest-traffic-budget-exceeded".into());
+        }
+        match outcome {
+            Err(error) if error == "speedtest-route-not-ready" => continue,
+            Err(error) if error == "speedtest-route-traffic-unproved" => {
+                unproved = unproved.checked_add(1).ok_or_else(|| error.clone())?;
+                if unproved < MAX_UNPROVED_TRAFFIC_ATTEMPTS {
+                    continue;
+                }
+                return Err(error);
+            }
+            result => return result,
+        }
+    }
+}
+
 fn retry_budgeted_route_measurement_on_loss_with_debit<T, Counters, Attempt>(
-    remaining_traffic_budget: &mut u64,
+    remaining_traffic_budget: &mut super::protocol::TrafficPolicy,
     minimum_attempt_budget: u64,
     mut counters: Counters,
     mut attempt: Attempt,
@@ -1260,18 +2487,25 @@ fn retry_budgeted_route_measurement_on_loss_with_debit<T, Counters, Attempt>(
 ) -> Result<T, String>
 where
     Counters: FnMut() -> Result<(u64, u64), String>,
-    Attempt: FnMut(u64) -> Result<T, String>,
+    Attempt: FnMut(super::protocol::TrafficPolicy) -> Result<T, String>,
 {
     let mut unproved_traffic_attempts = 0_u8;
     loop {
-        if *remaining_traffic_budget < minimum_attempt_budget {
+        if !remaining_traffic_budget.allows(minimum_attempt_budget) {
             return Err(SPEEDTEST_TRAFFIC_BUDGET_EXHAUSTED.to_string());
         }
         let before = counters()?;
         let outcome = attempt(*remaining_traffic_budget);
         let after = counters()?;
-        let debit = debit_traffic_budget(remaining_traffic_budget, before, after)?;
-        on_traffic_debit(debit)?;
+        let (debit, overrun) = debit_traffic_budget(remaining_traffic_budget, before, after)?;
+        // A refused first packet can fail without spending any bytes. Keep
+        // its actual error; an empty debit is not measurement evidence.
+        if debit.rx_bytes != 0 || debit.tx_bytes != 0 {
+            on_traffic_debit(debit)?;
+        }
+        if overrun {
+            return Err("speedtest-traffic-budget-exceeded".to_string());
+        }
         match outcome {
             Err(error) if error == "speedtest-route-not-ready" => continue,
             Err(error) if error == "speedtest-route-traffic-unproved" => {
@@ -1318,8 +2552,14 @@ where
     }
 }
 
-fn speedtest_go_server_candidates(output: &str) -> Result<Vec<u64>, String> {
-    let mut candidates = Vec::<(u64, u64)>::new();
+fn speedtest_go_server_candidates(
+    output: &str,
+    requested: Option<u64>,
+) -> Result<Vec<u64>, String> {
+    // Listing RTT is only a discovery ordering hint. Prefer different named
+    // providers before spending the bounded comparison budget on aliases of
+    // one provider. Names do not prove endpoint/AS independence or capacity.
+    let mut candidates = Vec::<(u64, u64, Option<String>)>::new();
     for line in output.lines() {
         let Some(after_open) = line.trim_start().strip_prefix('[') else {
             continue;
@@ -1348,13 +2588,44 @@ fn speedtest_go_server_candidates(output: &str) -> Result<Vec<u64>, String> {
             }
             return Err("speedtest-server-list-invalid".to_string());
         };
-        candidates.push((latency_micros, id));
+        let provider = details.rsplit_once(" by ").and_then(|(_, provider)| {
+            let normalized = provider
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+            (!normalized.is_empty() && normalized.len() <= 256).then_some(normalized)
+        });
+        candidates.push((latency_micros, id, provider));
     }
     candidates.sort_unstable();
+    if let Some(index) = candidates
+        .iter()
+        .position(|(_, id, _)| Some(*id) == requested)
+    {
+        // The explicit server represents its provider first; otherwise another
+        // alias can consume one of the two remaining comparison slots.
+        let explicit = candidates.remove(index);
+        candidates.insert(0, explicit);
+    }
     let mut server_ids = Vec::with_capacity(candidates.len());
-    for (_, server_id) in candidates {
-        if !server_ids.contains(&server_id) {
-            server_ids.push(server_id);
+    let mut providers = Vec::with_capacity(super::server_qualification::MAX_SERVERS);
+    for (_, server_id, provider) in &candidates {
+        if let Some(provider) = provider {
+            if !server_ids.contains(server_id) && !providers.contains(&provider.as_str()) {
+                server_ids.push(*server_id);
+                providers.push(provider.as_str());
+                if providers.len() == super::server_qualification::MAX_SERVERS {
+                    break;
+                }
+            }
+        }
+    }
+    // Retain unknown/duplicate-provider candidates as fallbacks, not as a
+    // fabricated independence guarantee. Qualification still measures them.
+    for (_, server_id, _) in &candidates {
+        if !server_ids.contains(server_id) {
+            server_ids.push(*server_id);
         }
     }
     Ok(server_ids)
@@ -1438,6 +2709,32 @@ fn counter_ratio_is_at_least(left: u64, right: u64, minimum_percent: u128) -> bo
     let smaller = u128::from(left.min(right));
     let larger = u128::from(left.max(right));
     smaller * 100 >= larger * minimum_percent
+}
+
+fn qualification_bounded_goodput(
+    result: &SpeedtestResult,
+    sample: &SpeedtestLoadSample,
+) -> Result<(u64, u64), String> {
+    Ok((
+        bounded_achieved_kbps(
+            result
+                .download_kbps
+                .ok_or("qualification download missing")?,
+            sample.controlled_rx_payload_bytes,
+            sample.controlled_rx_wire_bytes,
+            sample
+                .download_elapsed_ms
+                .ok_or("qualification download duration missing")?,
+        )?,
+        bounded_achieved_kbps(
+            result.upload_kbps.ok_or("qualification upload missing")?,
+            sample.controlled_tx_payload_bytes,
+            sample.controlled_tx_wire_bytes,
+            sample
+                .upload_elapsed_ms
+                .ok_or("qualification upload duration missing")?,
+        )?,
+    ))
 }
 
 fn speedtest_qualification_rejection(
@@ -1637,22 +2934,109 @@ fn retryable_server_rejection_code(error: &str) -> &'static str {
 }
 
 fn debit_traffic_budget(
-    remaining: &mut u64,
+    remaining: &mut super::protocol::TrafficPolicy,
     before: (u64, u64),
     after: (u64, u64),
-) -> Result<SpeedtestTrafficDebit, String> {
+) -> Result<(SpeedtestTrafficDebit, bool), String> {
     let deltas = counter_deltas(before, after)?;
     let consumed = deltas
         .0
         .checked_add(deltas.1)
         .ok_or_else(|| "speedtest-traffic-budget-overflow".to_string())?;
-    *remaining = remaining
-        .checked_sub(consumed)
-        .ok_or_else(|| "speedtest-traffic-budget-exceeded".to_string())?;
-    Ok(SpeedtestTrafficDebit {
-        rx_bytes: deltas.0,
-        tx_bytes: deltas.1,
-    })
+    let overrun = remaining.exceeded(consumed);
+    // The remaining authority is exhausted, but the observed debit must not
+    // be clipped to that authority: persistence records the actual overrun.
+    *remaining = remaining.checked_sub(consumed).unwrap_or(0_u64.into());
+    Ok((
+        SpeedtestTrafficDebit {
+            lifecycle: false,
+            rx_bytes: deltas.0,
+            tx_bytes: deltas.1,
+        },
+        overrun,
+    ))
+}
+
+struct QualificationCpuObserver {
+    previous: crate::CpuSnapshot,
+    busy_streak: Vec<u8>,
+    maximum_percent: f64,
+}
+
+impl QualificationCpuObserver {
+    fn new(maximum_percent: f64) -> Result<Self, String> {
+        let previous =
+            crate::read_cpu_snapshot().map_err(|_| "speedtest-cpu-evidence-unavailable")?;
+        if previous.counters.len() < 2 || previous.counters.len() != previous.raw_lines.len() {
+            return Err("speedtest-cpu-evidence-unavailable".into());
+        }
+        let busy_streak = vec![0; previous.counters.len() - 1];
+        Ok(Self {
+            previous,
+            busy_streak,
+            maximum_percent,
+        })
+    }
+
+    fn observe(&mut self, current: crate::CpuSnapshot) -> Result<bool, String> {
+        if current.counters.len() != self.previous.counters.len()
+            || current.raw_lines.len() != self.previous.raw_lines.len()
+            || current
+                .raw_lines
+                .iter()
+                .zip(&self.previous.raw_lines)
+                .any(|(now, old)| now.split_whitespace().next() != old.split_whitespace().next())
+        {
+            return Err("speedtest-cpu-evidence-changed".into());
+        }
+        let mut pressure = false;
+        for (index, (now, old)) in current
+            .counters
+            .iter()
+            .zip(&self.previous.counters)
+            .enumerate()
+            .skip(1)
+        {
+            let total = now
+                .total
+                .checked_sub(old.total)
+                .ok_or("speedtest-cpu-evidence-reset")?;
+            let idle = now
+                .idle
+                .checked_sub(old.idle)
+                .filter(|idle| *idle <= total)
+                .ok_or("speedtest-cpu-evidence-reset")?;
+            if total == 0 {
+                continue;
+            } // No ticks do not prove an idle core.
+            let busy = (total - idle) as f64 * 100.0 / total as f64;
+            self.busy_streak[index - 1] = if busy > self.maximum_percent {
+                self.busy_streak[index - 1].saturating_add(1)
+            } else {
+                0
+            };
+            pressure |= self.busy_streak[index - 1] >= QUALIFICATION_CPU_PRESSURE_SAMPLES;
+        }
+        self.previous = current;
+        Ok(pressure)
+    }
+}
+
+fn qualification_cpu_warning(
+    observer: &mut Option<QualificationCpuObserver>,
+    snapshot: Result<crate::CpuSnapshot, String>,
+) -> Option<String> {
+    let cpu = observer.as_mut()?;
+    let result = snapshot.and_then(|snapshot| cpu.observe(snapshot));
+    let warning = match result {
+        Ok(false) => return None,
+        Ok(true) => "sustained-core-pressure".to_string(),
+        Err(error) => error,
+    };
+    // CPU is advisory. One bounded diagnostic cannot invalidate the source,
+    // retry it as a bad server, or affect candidate/Apply eligibility.
+    *observer = None;
+    Some(warning)
 }
 
 fn run_speedtest_with_pin(
@@ -1666,6 +3050,8 @@ fn run_speedtest_with_pin(
     credentials: BackendCredentials,
     server_id: Option<u64>,
     route_pin: &NftRoutePin,
+    qualifying: bool,
+    mut budget_watch: Option<OwnedBudgetWatch<'_>>,
 ) -> Result<(SpeedtestTerminal, Option<SpeedtestLoadSample>), String> {
     attest_accounting_epoch()?;
     let (mut output_guard, stdout, stderr) = BackendOutputGuard::create(terminal_path)?;
@@ -1703,43 +3089,93 @@ fn run_speedtest_with_pin(
         return Err("speedtest-deadline-expired".to_string());
     }
     let deadline = Instant::now() + Duration::from_millis(deadline_ms).min(MAX_BACKEND_RUNTIME);
-    let mut child = BackendChild::spawn(&arguments, stdout, stderr, credentials)?;
-    let mut next_route_check = Instant::now() + ROUTE_RECHECK_INTERVAL;
-    loop {
-        if terminate.load(Ordering::Relaxed) {
-            child.stop_and_reap()?;
-            return Ok((SpeedtestTerminal::Cancelled, None));
-        }
-        if child.try_wait()? {
-            break;
-        }
-        if Instant::now() >= deadline {
-            child.stop_and_reap()?;
-            return Err("speedtest-timeout".to_string());
-        }
-        let counters = interface_counters(&request.route.l3_device)?;
-        let deltas = counter_deltas(counters_before, counters)?;
-        if deltas.0.saturating_add(deltas.1) > request.traffic_budget_bytes {
-            child.stop_and_reap()?;
-            return Err(SPEEDTEST_TRAFFIC_LIMIT_REACHED.to_string());
-        }
-        if Instant::now() >= next_route_check {
-            match attest_route(request) {
-                Ok(current) if current.identity == initial_route.identity => {}
-                Ok(_) => {
-                    child.stop_and_reap()?;
-                    return Err("speedtest-route-drift".to_string());
-                }
-                Err(error) => {
-                    child.stop_and_reap()?;
-                    return Err(error);
-                }
+    let mut cpu = if qualifying {
+        let limit = request
+            .profile
+            .unwrap_or(crate::autotune::AutotuneProfile::BestOverall)
+            .validation_thresholds()
+            .cpu_max_percent;
+        match QualificationCpuObserver::new(limit) {
+            Ok(observer) => Some(observer),
+            Err(error) => {
+                eprintln!("speedtest-qualification-cpu advisory=true code={error}");
+                None
             }
-            next_route_check = Instant::now() + ROUTE_RECHECK_INTERVAL;
         }
-        thread::sleep(POLL_INTERVAL);
+    } else {
+        None
+    };
+    if budget_watch
+        .as_mut()
+        .map(OwnedBudgetWatch::poll)
+        .transpose()?
+        .unwrap_or(false)
+    {
+        return Err(SPEEDTEST_TRAFFIC_LIMIT_REACHED.into());
     }
-    if !child.finish()? {
+    let owned_budget = budget_watch.is_some();
+    let child = BackendChild::spawn(&arguments, stdout, stderr, credentials)?;
+    let success = with_backend_supervision(
+        child,
+        budget_watch.map(|mut watch| move || watch.poll()),
+        terminate,
+        deadline,
+        "speedtest-timeout",
+        |child| {
+            let mut next_route_check = Instant::now() + ROUTE_RECHECK_INTERVAL;
+            loop {
+                if terminate.load(Ordering::Relaxed) {
+                    child.stop_and_reap()?;
+                    return Ok(false);
+                }
+                if child.try_wait()? {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    child.stop_and_reap()?;
+                    return Err("speedtest-timeout".to_string());
+                }
+                if !owned_budget {
+                    let counters = interface_counters(&request.route.l3_device)?;
+                    let deltas = counter_deltas(counters_before, counters)?;
+                    if request
+                        .traffic_budget
+                        .exceeded(deltas.0.saturating_add(deltas.1))
+                    {
+                        child.stop_and_reap()?;
+                        return Err(SPEEDTEST_TRAFFIC_LIMIT_REACHED.to_string());
+                    }
+                }
+                if cpu.is_some() {
+                    let snapshot = crate::read_cpu_snapshot()
+                        .map_err(|_| "speedtest-cpu-evidence-unavailable".to_string());
+                    if let Some(warning) = qualification_cpu_warning(&mut cpu, snapshot) {
+                        eprintln!("speedtest-qualification-cpu advisory=true code={warning}");
+                    }
+                }
+                if Instant::now() >= next_route_check {
+                    match attest_route(request) {
+                        Ok(current) if current.identity == initial_route.identity => {}
+                        Ok(_) => {
+                            child.stop_and_reap()?;
+                            return Err("speedtest-route-drift".to_string());
+                        }
+                        Err(error) => {
+                            child.stop_and_reap()?;
+                            return Err(error);
+                        }
+                    }
+                    next_route_check = Instant::now() + ROUTE_RECHECK_INTERVAL;
+                }
+                thread::sleep(POLL_INTERVAL);
+            }
+            child.finish()
+        },
+    )?;
+    if terminate.load(Ordering::Relaxed) {
+        return Ok((SpeedtestTerminal::Cancelled, None));
+    }
+    if !success {
         return Err("speedtest-backend-failed".to_string());
     }
     let controlled_after = route_pin.traffic_counters()?;
@@ -1789,7 +3225,10 @@ fn run_speedtest_with_pin(
         (None, None) => deltas.1,
         _ => return Err("speedtest-upload-accounting-qdisc-state-mismatch".to_string()),
     };
-    if deltas.0.saturating_add(deltas.1) > request.traffic_budget_bytes {
+    if request
+        .traffic_budget
+        .exceeded(deltas.0.saturating_add(deltas.1))
+    {
         return Err(SPEEDTEST_TRAFFIC_LIMIT_REACHED.to_string());
     }
     let final_route = attest_route(request)?;
@@ -1819,7 +3258,14 @@ fn run_speedtest_with_pin(
     parsed.result.rx_bytes = deltas.0;
     parsed.result.tx_bytes = deltas.1;
     parsed.result.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let endpoint = speedtest_server_endpoint(
+        &output,
+        parsed.result.server_id,
+        &parsed.result.server_sponsor,
+    )?;
     let load_sample = SpeedtestLoadSample {
+        endpoint_host: endpoint.as_ref().map(|value| value.0.clone()),
+        endpoint_sha256: endpoint.map(|value| value.1),
         direction,
         aggregate_rx_bytes: deltas.0,
         aggregate_tx_bytes: deltas.1,
@@ -1837,6 +3283,71 @@ fn run_speedtest_with_pin(
         SpeedtestTerminal::Complete(parsed.result),
         Some(load_sample),
     ))
+}
+
+fn speedtest_server_endpoint(
+    output: &str,
+    expected_id: Option<u64>,
+    expected_provider: &str,
+) -> Result<Option<(String, String)>, String> {
+    let line = output
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .ok_or("speedtest-json-missing")?;
+    let value: serde_json::Value =
+        serde_json::from_str(line).map_err(|_| "speedtest-json-invalid")?;
+    let servers = value["servers"]
+        .as_array()
+        .filter(|servers| servers.len() == 1)
+        .ok_or("speedtest-server-result-ambiguous")?;
+    let server = &servers[0];
+    let id = server["id"]
+        .as_u64()
+        .or_else(|| server["id"].as_str().and_then(|id| id.parse::<u64>().ok()));
+    if id.is_none_or(|id| id == 0)
+        || id != expected_id
+        || server["sponsor"].as_str().unwrap_or_default() != expected_provider
+    {
+        return Err("speedtest-server-identity-mismatch".into());
+    }
+    match server.get("url") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => super::server_qualification::endpoint_identity(
+            value.as_str().ok_or("speedtest-server-endpoint-invalid")?,
+        )
+        .map(Some),
+    }
+}
+
+fn attest_selected_endpoint(expected: &str, actual: Option<&str>) -> Result<(), String> {
+    if actual != Some(expected) {
+        return Err("speedtest-server-endpoint-changed".into());
+    }
+    Ok(())
+}
+
+fn append_backend_dns_arguments(
+    request: &OperationRequest,
+    arguments: &mut Vec<String>,
+) -> Result<(), String> {
+    if request.route.mode == OperationRouteMode::Explicit {
+        request.route.validate()?;
+        let server = request
+            .route
+            .dns_server
+            .ok_or("speedtest-explicit-dns-required")?;
+        // An old backend rejects this unknown option before starting discovery.
+        // Never retry explicit operations using the system DNS endpoint.
+        arguments.push("--route-dns-ipv4".into());
+        arguments.push(server.to_string());
+    } else {
+        if request.route.dns_server.is_some() {
+            return Err("speedtest-explicit-dns-on-legacy-route".into());
+        }
+        arguments.push("--dns-bind-source".into());
+    }
+    Ok(())
 }
 
 fn speedtest_go_arguments(
@@ -1871,11 +3382,49 @@ fn speedtest_go_arguments(
     }
     arguments.push("--source".to_string());
     arguments.push(source.to_string());
-    arguments.push("--dns-bind-source".to_string());
+    append_backend_dns_arguments(request, &mut arguments)?;
     Ok(arguments)
 }
 
+fn selected_route_mark(
+    request: &OperationRequest,
+    resolve_mwan3: impl FnOnce() -> Result<u32, String>,
+) -> Result<Option<(u32, u32)>, String> {
+    match request.route.mode {
+        OperationRouteMode::Main => Ok(None),
+        OperationRouteMode::Mwan3 => {
+            let fwmark = request
+                .route
+                .fwmark
+                .ok_or("speedtest-mwan3-fwmark-missing")?;
+            let mask = resolve_mwan3()?;
+            if mask == 0 || fwmark == 0 || fwmark & !mask != 0 {
+                return Err("speedtest-mwan3-mark-outside-mask".into());
+            }
+            Ok(Some((!mask, fwmark)))
+        }
+        OperationRouteMode::Explicit => {
+            super::autotune_request::explicit_operation_authority(&request.route)?;
+            let mask = request
+                .route
+                .fwmark_mask
+                .ok_or("explicit route mask missing")?;
+            let mark = request.route.fwmark.ok_or("explicit route mark missing")?;
+            Ok(Some((!mask, mark)))
+        }
+    }
+}
+
 fn attest_route(request: &OperationRequest) -> Result<RouteSnapshot, String> {
+    if request.route.mode == OperationRouteMode::Explicit {
+        let snapshot = super::runtime::inspect_operation_route(
+            &request.route,
+            &request.identity.target_interface,
+            crate::routing::ExplicitRouteAuthority::observe_system,
+        )?;
+        route_matches_request(request, &snapshot.identity)?;
+        return Ok(snapshot);
+    }
     let mode = request.route.mode.as_str();
     let member = request.route.mwan3_member.as_deref().unwrap_or("");
     let spec = RouteSpec::new(mode, member, &request.route.l3_device);
@@ -1934,6 +3483,7 @@ where
 
 fn route_matches_request(request: &OperationRequest, actual: &RouteIdentity) -> Result<(), String> {
     if actual.mode != request.route.mode.as_str()
+        || actual.device_ifindex != request.route.device_ifindex
         || actual.member != request.route.mwan3_member.as_deref().unwrap_or("")
         || actual.device != request.route.l3_device
         || actual.source_ip
@@ -1943,6 +3493,10 @@ fn route_matches_request(request: &OperationRequest, actual: &RouteIdentity) -> 
                 .map(|value| value.to_string())
                 .unwrap_or_default()
         || !optional_route_number_matches(request.route.fwmark, &actual.fwmark)
+        || request
+            .route
+            .fwmark_mask
+            .is_some_and(|mask| actual.fwmark_mask != Some(mask))
         || !optional_route_number_matches(request.route.routing_table, &actual.table)
     {
         return Err("speedtest-route-identity-mismatch".to_string());
@@ -2020,18 +3574,34 @@ fn resolve_mwan3_mark_mask(request: &OperationRequest) -> Result<u32, String> {
     }
     let environment = String::from_utf8(output.1)
         .map_err(|_| "speedtest-mwan3-environment-invalid".to_string())?;
-    let device = unique_environment_value(&environment, "DEVICE")?
+    validate_mwan3_environment(request, &environment)
+}
+
+fn validate_mwan3_environment(
+    request: &OperationRequest,
+    environment: &str,
+) -> Result<u32, String> {
+    let device = unique_environment_value(environment, "DEVICE")?
         .ok_or_else(|| "speedtest-mwan3-device-missing".to_string())?;
-    let source_ip = unique_environment_value(&environment, "SRCIP")?
+    let source_ip = unique_environment_value(environment, "SRCIP")?
         .ok_or_else(|| "speedtest-mwan3-source-missing".to_string())?;
-    let mark_mask = unique_environment_value(&environment, "FWMARK")?
+    let mark_mask = unique_environment_value(environment, "FWMARK")?
         .ok_or_else(|| "speedtest-mwan3-mask-missing".to_string())?;
     if device != request.route.l3_device
         || source_ip.parse::<IpAddr>().ok() != request.route.source_ip
     {
         return Err("speedtest-mwan3-environment-drift".to_string());
     }
-    parse_hex_u32(mark_mask, "speedtest-mwan3-mask-invalid")
+    let mask = parse_hex_u32(mark_mask, "speedtest-mwan3-mask-invalid")?;
+    if mask == 0
+        || request
+            .route
+            .fwmark_mask
+            .is_some_and(|expected| expected != mask)
+    {
+        return Err("speedtest-mwan3-environment-drift".to_string());
+    }
+    Ok(mask)
 }
 
 fn unique_environment_value<'a>(input: &'a str, key: &str) -> Result<Option<&'a str>, String> {
@@ -2096,55 +3666,24 @@ fn route_pin_owner(job_id: &str, worker_run_id: &str) -> Result<String, String> 
     Ok(format!("cake-autorate-speedtest:{job_id}:{worker_run_id}"))
 }
 
+fn probe_pin_identity(job_id: &str, worker_run_id: &str) -> Result<(String, String), String> {
+    if !canonical_hex_id(job_id) || !canonical_hex_id(worker_run_id) {
+        return Err("speedtest-route-pin-identity-invalid".into());
+    }
+    Ok((
+        format!("cake_pt_{}_{}", &job_id[..12], &worker_run_id[..12]),
+        format!("cake-autorate-probes:{job_id}:{worker_run_id}"),
+    ))
+}
+
+#[cfg(test)]
 fn nft_route_pin_batch(
     table: &str,
     owner: &str,
     uid: u32,
     route_mark: Option<(u32, u32)>,
 ) -> String {
-    let mut batch = String::with_capacity(1536);
-    batch.push_str("{\"nftables\":[{\"add\":{\"table\":{\"family\":\"inet\",\"name\":\"");
-    batch.push_str(table);
-    batch.push_str("\",\"comment\":\"");
-    batch.push_str(owner);
-    batch.push_str("\"}}},{\"add\":{\"counter\":{\"family\":\"inet\",\"table\":\"");
-    batch.push_str(table);
-    batch.push_str("\",\"name\":\"");
-    batch.push_str(ACCOUNTING_RX_COUNTER);
-    batch.push_str("\",\"comment\":\"");
-    batch.push_str(owner);
-    batch.push_str("\"}}},{\"add\":{\"counter\":{\"family\":\"inet\",\"table\":\"");
-    batch.push_str(table);
-    batch.push_str("\",\"name\":\"");
-    batch.push_str(ACCOUNTING_TX_COUNTER);
-    batch.push_str("\",\"comment\":\"");
-    batch.push_str(owner);
-    batch.push_str("\"}}},{\"add\":{\"chain\":{\"family\":\"inet\",\"table\":\"");
-    batch.push_str(table);
-    batch.push_str("\",\"name\":\"output\",\"type\":\"route\",\"hook\":\"output\",\"prio\":-148,\"policy\":\"accept\"}}},{\"add\":{\"rule\":{\"family\":\"inet\",\"table\":\"");
-    batch.push_str(table);
-    batch.push_str("\",\"chain\":\"output\",\"expr\":[{\"match\":{\"op\":\"==\",\"left\":{\"meta\":{\"key\":\"skuid\"}},\"right\":");
-    let _ = write!(batch, "{uid}");
-    batch.push_str("}},{\"counter\":\"");
-    batch.push_str(ACCOUNTING_TX_COUNTER);
-    batch.push_str("\"}");
-    if let Some((clear_mask, fwmark)) = route_mark {
-        batch.push_str(",{\"mangle\":{\"key\":{\"meta\":{\"key\":\"mark\"}},\"value\":{\"|\":[{\"&\":[{\"meta\":{\"key\":\"mark\"}},");
-        let _ = write!(batch, "{clear_mask}");
-        batch.push_str("]},");
-        let _ = write!(batch, "{fwmark}");
-        batch.push_str("]}}}");
-    }
-    batch.push_str("]}}},{\"add\":{\"chain\":{\"family\":\"inet\",\"table\":\"");
-    batch.push_str(table);
-    batch.push_str("\",\"name\":\"input\",\"type\":\"filter\",\"hook\":\"input\",\"prio\":-148,\"policy\":\"accept\"}}},{\"add\":{\"rule\":{\"family\":\"inet\",\"table\":\"");
-    batch.push_str(table);
-    batch.push_str("\",\"chain\":\"input\",\"expr\":[{\"match\":{\"op\":\"==\",\"left\":{\"meta\":{\"key\":\"skuid\"}},\"right\":");
-    let _ = write!(batch, "{uid}");
-    batch.push_str("}},{\"counter\":\"");
-    batch.push_str(ACCOUNTING_RX_COUNTER);
-    batch.push_str("\"}]}}}]}\n");
-    batch
+    nft_owned_route_pin_batch(table, owner, NftSocketOwner::BackendUid(uid), route_mark)
 }
 
 fn path_text(path: &Path) -> Result<&str, String> {
@@ -2153,61 +3692,418 @@ fn path_text(path: &Path) -> Result<&str, String> {
 }
 
 fn run_bounded_command(program: &str, arguments: &[&str]) -> Result<(bool, Vec<u8>), String> {
-    let output = Command::new(program)
-        .args(arguments)
-        .env_clear()
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| format!("speedtest-route-command-failed: {error}"))?;
-    if output.stdout.len() > COMMAND_OUTPUT_LIMIT || output.stderr.len() > COMMAND_OUTPUT_LIMIT {
-        return Err("speedtest-route-command-output-too-large".to_string());
-    }
+    let spec = SpawnSpec {
+        program: PathBuf::from(program),
+        arguments: arguments.iter().map(OsString::from).collect(),
+        environment: Vec::new(),
+    };
+    let output =
+        run_bounded_command_output(&spec, ROUTE_COMMAND_TIMEOUT, COMMAND_OUTPUT_LIMIT, || false)
+            .map_err(route_command_error)?;
     Ok((output.status.success(), output.stdout))
 }
 
+fn route_command_error(error: String) -> String {
+    match error.as_str() {
+        "bounded-command-timeout" => "speedtest-route-command-timeout".to_string(),
+        "bounded-command-output-too-large" => {
+            "speedtest-route-command-output-too-large".to_string()
+        }
+        _ => format!("speedtest-route-command-failed: {error}"),
+    }
+}
+
 fn attest_named_route_pin(table: &str, owner: &str) -> Result<(), String> {
-    let output = run_bounded_command(NFT, &["-j", "list", "table", "inet", table])?;
+    let output = run_bounded_command(NFT, &nft_table_snapshot_arguments(table))?;
     if !output.0 {
         return Err("speedtest-route-pin-missing".to_string());
     }
-    let json =
-        String::from_utf8(output.1).map_err(|_| "speedtest-route-pin-json-invalid".to_string())?;
-    if json_string(&json, "comment")?.as_deref() != Some(owner) {
-        return Err("speedtest-route-pin-owner-mismatch".to_string());
-    }
-    Ok(())
+    attest_route_pin_snapshot(&output.1, table, owner).map(|_| ())
 }
 
 fn cleanup_named_route_pin(table: &str, owner: &str) -> Result<(), String> {
-    let listed = run_bounded_command(NFT, &["-j", "list", "table", "inet", table])?;
-    if !listed.0 {
-        let tables = run_bounded_command(NFT, &["-j", "list", "tables"])?;
-        if tables.0 {
-            return Ok(());
+    cleanup_named_route_pin_with(table, owner, |arguments| {
+        run_bounded_command(NFT, arguments)
+    })
+}
+
+pub(crate) struct OwnedCleanupContext<'a> {
+    pub directory: &'a Path,
+    pub request: &'a OperationRequest,
+}
+
+fn nft_owned_cutoff_batch(job: &str, worker: &str) -> Result<String, String> {
+    let backend = route_pin_table_name(job, worker)?;
+    let (probes, _) = probe_pin_identity(job, worker)?;
+    let mut commands = Vec::with_capacity(4);
+    for table in [&backend, &probes] {
+        for chain in ["output", "input"] {
+            commands.push(serde_json::json!({"flush":{"chain":{
+                "family":"inet", "table":table, "name":chain
+            }}}));
         }
-        return Err("speedtest-route-pin-inspection-failed".to_string());
     }
-    let json =
-        String::from_utf8(listed.1).map_err(|_| "speedtest-route-pin-json-invalid".to_string())?;
-    if json_string(&json, "comment")?.as_deref() != Some(owner) {
-        return Err("speedtest-route-pin-owner-mismatch".to_string());
+    Ok(serde_json::json!({"nftables":commands}).to_string())
+}
+
+fn freeze_owned_counters(directory: &Path, job: &str, worker: &str) -> Result<(), String> {
+    use super::autotune_apply_runtime::{
+        read_private_recovery_bounded, require_private_directory, sync_directory,
+        write_new_private_file,
+    };
+    let batch = nft_owned_cutoff_batch(job, worker)?;
+    require_private_directory(directory)?;
+    let table = route_pin_table_name(job, worker)?;
+    let owner = route_pin_owner(job, worker)?;
+    let (probe_table, probe_owner) = probe_pin_identity(job, worker)?;
+    attest_named_route_pin(&table, &owner)?;
+    attest_named_route_pin(&probe_table, &probe_owner)?;
+    let path = directory.join(format!("owned-traffic-cutoff-batch-{worker}"));
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            if read_private_recovery_bounded(&path, 4096, "owned cutoff batch")? != batch.as_bytes()
+            {
+                return Err("owned cutoff batch differs from exact reconstruction".into());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            write_new_private_file(&path, batch.as_bytes())?;
+        }
+        Err(error) => return Err(format!("unable to inspect owned cutoff batch: {error}")),
     }
-    let deleted = run_bounded_command(NFT, &["delete", "table", "inet", table])?;
-    if !deleted.0 {
-        return Err("speedtest-route-pin-delete-failed".to_string());
-    }
-    if run_bounded_command(NFT, &["-j", "list", "table", "inet", table])?.0 {
-        return Err("speedtest-route-pin-delete-unverified".to_string());
+    sync_directory(directory)?;
+    // One nft transaction detaches accounting rules, retaining named counters.
+    // Only private test chains are touched, after producer retirement. Packets
+    // arriving after this boundary are outside the recorded test interval.
+    if !run_bounded_command(NFT, &["-j", "-f", path_text(&path)?])?.0 {
+        return Err("owned counter cutoff transaction failed".into());
     }
     Ok(())
 }
 
-pub(crate) fn cleanup_route_pin(job_id: &str, worker_run_id: &str) -> Result<(), String> {
+pub(crate) fn cleanup_route_pin(
+    job_id: &str,
+    worker_run_id: &str,
+    owned: Option<OwnedCleanupContext<'_>>,
+) -> Result<(), String> {
     validate_utility_binary(Path::new(NFT), "nft")?;
     let table = route_pin_table_name(job_id, worker_run_id)?;
     let owner = route_pin_owner(job_id, worker_run_id)?;
-    cleanup_named_route_pin(&table, &owner)
+    if let Some(context) = owned {
+        if context.request.identity.job_id != job_id {
+            return Err("owned cleanup request identity mismatch".into());
+        }
+        let directory = context.directory;
+        preserve_cutoff_observation(
+            context,
+            worker_run_id,
+            || freeze_owned_counters(directory, job_id, worker_run_id),
+            || {
+                read_owned_traffic_counters_with(
+                    job_id,
+                    worker_run_id,
+                    Instant::now() + OWNED_BUDGET_READ_TIMEOUT,
+                    |table, owner, deadline| {
+                        NftRoutePin {
+                            table: Some(table.to_string()),
+                            owner: Some(owner.to_string()),
+                            cleanup_on_drop: false,
+                        }
+                        .traffic_counters_before(deadline)
+                    },
+                )
+            },
+        )?;
+    }
+    cleanup_named_route_pin(&table, &owner)?;
+    let (probe_table, probe_owner) = probe_pin_identity(job_id, worker_run_id)?;
+    cleanup_named_route_pin(&probe_table, &probe_owner)
+}
+
+// This version is written only after the producer-retirement cutoff succeeds.
+// An unavailable observation is explicit and must never be interpreted as zero.
+fn encode_cutoff_observation(
+    request: &OperationRequest,
+    worker: &str,
+    snapshot: Option<OwnedTrafficSnapshot>,
+) -> Result<String, String> {
+    route_pin_table_name(&request.identity.job_id, worker)?;
+    if let Some(snapshot) = snapshot {
+        snapshot.total_bytes()?;
+    }
+    let digest = super::autotune_apply::native_apply_sha256_hex(request.encode()?.as_bytes());
+    let counters = snapshot.map(|s| {
+        [
+            s.backend.rx_bytes,
+            s.backend.tx_bytes,
+            s.probes.rx_bytes,
+            s.probes.tx_bytes,
+        ]
+    });
+    let payload = serde_json::json!({"schema_version":2, "purpose":"post-retirement-rule-cutoff-v1",
+        "job_id":request.identity.job_id, "worker_run_id":worker,
+        "request_sha256":digest, "counters":counters});
+    let sha256 = super::autotune_apply::native_apply_sha256_hex(payload.to_string().as_bytes());
+    Ok(format!(
+        "{}\n",
+        serde_json::json!({"payload":payload,"sha256":sha256})
+    ))
+}
+
+fn read_cutoff_observation(
+    directory: &Path,
+    request: &OperationRequest,
+    worker: &str,
+) -> Result<Option<OwnedTrafficSnapshot>, String> {
+    route_pin_table_name(&request.identity.job_id, worker)?;
+    super::autotune_apply_runtime::require_private_directory(directory)?;
+    let bytes = super::autotune_apply_runtime::read_private_recovery_bounded(
+        &directory.join(format!("owned-traffic-cutoff-{worker}")),
+        4096,
+        "owned cutoff observation",
+    )?;
+    decode_cutoff_observation(&bytes, request, worker)
+}
+
+fn decode_cutoff_observation(
+    bytes: &[u8],
+    request: &OperationRequest,
+    worker: &str,
+) -> Result<Option<OwnedTrafficSnapshot>, String> {
+    if bytes.len() > 4096 {
+        return Err("owned cutoff observation is oversized".into());
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| "invalid owned cutoff observation")?;
+    let counters = &value["payload"]["counters"];
+    let snapshot = if counters.is_null() {
+        None
+    } else {
+        let list = counters
+            .as_array()
+            .filter(|v| v.len() == 4)
+            .ok_or("invalid owned cutoff counters")?;
+        let mut values = [0_u64; 4];
+        for (index, value) in list.iter().enumerate() {
+            values[index] = value.as_u64().ok_or("invalid owned cutoff counter")?;
+        }
+        Some(OwnedTrafficSnapshot {
+            backend: SpeedtestTrafficCounters {
+                rx_bytes: values[0],
+                tx_bytes: values[1],
+            },
+            probes: SpeedtestTrafficCounters {
+                rx_bytes: values[2],
+                tx_bytes: values[3],
+            },
+        })
+    };
+    if encode_cutoff_observation(request, worker, snapshot)?.as_bytes() != bytes {
+        return Err("owned cutoff observation binding mismatch".into());
+    }
+    Ok(snapshot)
+}
+
+#[cfg(test)]
+fn verify_owned_cutoff_consistency(
+    directory: &Path,
+    request: &OperationRequest,
+    worker: &str,
+) -> Result<u64, String> {
+    // The journal owns the worker prefix; this immutable cutoff owns the tail.
+    // Check every component before returning the cumulative (not additive) total.
+    let observed = read_cutoff_observation(directory, request, worker)?
+        .ok_or("owned cutoff traffic is unavailable")?;
+    let bytes = super::autotune_apply_runtime::read_private_recovery_bounded(
+        &directory.join(format!("owned-traffic-checkpoint-{worker}")),
+        4096,
+        "owned traffic checkpoint",
+    )?;
+    let input = std::str::from_utf8(&bytes).map_err(|_| "owned traffic checkpoint is not UTF-8")?;
+    let digest = super::autotune_apply::native_apply_sha256_hex(request.encode()?.as_bytes());
+    let checkpoint =
+        OwnedTrafficCheckpoint::decode_bound(input, &request.identity.job_id, worker, &digest)?;
+    observed.delta_since(checkpoint.counters)?;
+    observed.total_bytes()
+}
+
+pub(crate) fn reconcile_owned_cutoff(
+    directory: &Path,
+    request: &OperationRequest,
+    worker: &str,
+    journal: (u32, u64, u64),
+) -> Result<u64, String> {
+    use super::autotune_apply_runtime::{read_private_recovery_bounded, require_private_directory};
+    route_pin_table_name(&request.identity.job_id, worker)?;
+    require_private_directory(directory)?;
+    let path = directory.join(format!("owned-traffic-checkpoint-{worker}"));
+    let digest = super::autotune_apply::native_apply_sha256_hex(request.encode()?.as_bytes());
+    let read = |path: &Path| -> Result<OwnedTrafficCheckpoint, String> {
+        let bytes = read_private_recovery_bounded(path, 4096, "owned reconciliation checkpoint")?;
+        OwnedTrafficCheckpoint::decode_bound(
+            std::str::from_utf8(&bytes).map_err(|_| "owned checkpoint is not UTF-8")?,
+            &request.identity.job_id,
+            worker,
+            &digest,
+        )
+    };
+    let current = read(&path)?;
+    let mut pending = None;
+    for extension in ["owned-intent", "owned-next"] {
+        let staged = path.with_extension(extension);
+        match fs::symlink_metadata(&staged) {
+            Ok(_) => {
+                let candidate = read(&staged)?;
+                if pending.is_some_and(|previous| previous != candidate) {
+                    return Err("owned pending checkpoints disagree".into());
+                }
+                if candidate != current {
+                    if current.sequence.checked_add(1) != Some(candidate.sequence) {
+                        return Err("owned pending checkpoint is not contiguous".into());
+                    }
+                    let delta = candidate.counters.delta_since(current.counters)?;
+                    if delta.rx_bytes == 0 && delta.tx_bytes == 0 {
+                        return Err("owned pending checkpoint has no new traffic".into());
+                    }
+                }
+                pending = Some(candidate);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "unable to inspect owned reconciliation input: {error}"
+                ))
+            }
+        }
+    }
+    let totals = |point: OwnedTrafficCheckpoint| -> Result<(u32, u64, u64), String> {
+        Ok((
+            point.sequence,
+            point
+                .counters
+                .backend
+                .rx_bytes
+                .checked_add(point.counters.probes.rx_bytes)
+                .ok_or("owned reconciliation RX overflow")?,
+            point
+                .counters
+                .backend
+                .tx_bytes
+                .checked_add(point.counters.probes.tx_bytes)
+                .ok_or("owned reconciliation TX overflow")?,
+        ))
+    };
+    // The append either did not land, or landed exactly once. Neither state
+    // authorizes replaying the append or modifying measurement evidence.
+    if totals(current)? != journal && pending.map(totals).transpose()? != Some(journal) {
+        return Err("owned checkpoint transaction does not match the durable debit journal".into());
+    }
+    let observed = read_cutoff_observation(directory, request, worker)?
+        .ok_or("owned cutoff traffic is unavailable")?;
+    observed.delta_since(pending.unwrap_or(current).counters)?;
+    observed.total_bytes()
+}
+
+fn preserve_cutoff_observation(
+    context: OwnedCleanupContext<'_>,
+    worker: &str,
+    freeze: impl FnOnce() -> Result<(), String>,
+    observe: impl FnOnce() -> Result<OwnedTrafficSnapshot, String>,
+) -> Result<(), String> {
+    use super::autotune_apply_runtime::{
+        read_private_recovery_bounded, require_private_directory, sync_directory,
+        write_new_private_file,
+    };
+    route_pin_table_name(&context.request.identity.job_id, worker)?;
+    require_private_directory(context.directory)?;
+    let path = context
+        .directory
+        .join(format!("owned-traffic-cutoff-{worker}"));
+    let staged = path.with_extension("cutoff-next");
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            read_cutoff_observation(context.directory, context.request, worker)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut recovered = false;
+            match fs::symlink_metadata(&staged) {
+                Ok(_) => {
+                    let bytes =
+                        read_private_recovery_bounded(&staged, 4096, "staged owned cutoff")?;
+                    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        Err(error) if error.is_eof() => {
+                            // Preserve a single demonstrably truncated write.
+                            // Re-freezing the still-retained tables is idempotent.
+                            let incomplete = path.with_extension("cutoff-incomplete");
+                            match fs::symlink_metadata(&incomplete) {
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                                _ => {
+                                    return Err(
+                                        "owned cutoff already has an incomplete write to inspect"
+                                            .into(),
+                                    )
+                                }
+                            }
+                            fs::rename(&staged, &incomplete).map_err(|error| {
+                                format!("unable to retain partial cutoff: {error}")
+                            })?;
+                            sync_directory(context.directory)?;
+                        }
+                        _ => {
+                            decode_cutoff_observation(&bytes, context.request, worker)?;
+                            recovered = true;
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("unable to inspect staged cutoff: {error}")),
+            }
+            // Failure to prepare/execute the cutoff must retain live counters.
+            // It must not become a nullable observation followed by deletion.
+            if !recovered {
+                freeze()?;
+                let snapshot = observe().ok();
+                write_new_private_file(
+                    &staged,
+                    encode_cutoff_observation(context.request, worker, snapshot)?.as_bytes(),
+                )?;
+            }
+            // A recovered complete write may have crashed before fsync.
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&staged)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| format!("unable to sync staged cutoff: {error}"))?;
+            fs::rename(&staged, &path)
+                .map_err(|error| format!("unable to publish owned cutoff: {error}"))?;
+        }
+        Err(error) => {
+            return Err(format!(
+                "unable to inspect owned cutoff observation: {error}"
+            ))
+        }
+    }
+    sync_directory(context.directory)
+}
+
+// Both identities are validated before I/O. Absence of either table is an
+// error, never a zero measurement; all four components share one deadline.
+fn read_owned_traffic_counters_with(
+    job_id: &str,
+    worker_run_id: &str,
+    deadline: Instant,
+    mut read: impl FnMut(&str, &str, Instant) -> Result<SpeedtestTrafficCounters, String>,
+) -> Result<OwnedTrafficSnapshot, String> {
+    let table = route_pin_table_name(job_id, worker_run_id)?;
+    let owner = route_pin_owner(job_id, worker_run_id)?;
+    let (probe_table, probe_owner) = probe_pin_identity(job_id, worker_run_id)?;
+    let snapshot = OwnedTrafficSnapshot {
+        backend: read(&table, &owner, deadline)?,
+        probes: read(&probe_table, &probe_owner, deadline)?,
+    };
+    snapshot.total_bytes()?;
+    Ok(snapshot)
 }
 
 pub(crate) fn read_live_traffic_counters_bounded<F>(
@@ -2224,26 +4120,31 @@ where
     let deadline = started.checked_add(timeout).unwrap_or(started);
     let table = route_pin_table_name(job_id, worker_run_id)?;
     let owner = route_pin_owner(job_id, worker_run_id)?;
-    let listed = run_bounded_accounting_command(
-        &["-j", "list", "counters", "inet", &table],
-        accounting_time_remaining(deadline)?,
-        &should_cancel,
-    )?;
-    if !listed.0 {
-        if run_bounded_accounting_command(
-            &["-j", "list", "tables"],
+    read_live_named_traffic_counters_with(&table, &owner, |arguments| {
+        run_bounded_accounting_command(
+            arguments,
             accounting_time_remaining(deadline)?,
             &should_cancel,
-        )?
-        .0
-        {
+        )
+    })
+}
+
+fn read_live_named_traffic_counters_with(
+    table: &str,
+    owner: &str,
+    mut run: impl FnMut(&[&str]) -> Result<(bool, Vec<u8>), String>,
+) -> Result<Option<SpeedtestTrafficCounters>, String> {
+    let listed = run(&nft_table_snapshot_arguments(table))?;
+    if !listed.0 {
+        let tables = run(&["-j", "list", "tables"])?;
+        if tables.0 && nft_table_snapshot_proves_absence(&tables.1, table)? {
             return Ok(None);
         }
         return Err("speedtest-accounting-inspection-failed".to_string());
     }
     let json =
         String::from_utf8(listed.1).map_err(|_| "speedtest-accounting-json-invalid".to_string())?;
-    parse_named_traffic_counters(&json, &table, &owner).map(Some)
+    parse_named_traffic_counters(&json, table, owner).map(Some)
 }
 
 fn read_named_traffic_counters(
@@ -2251,7 +4152,7 @@ fn read_named_traffic_counters(
     owner: &str,
 ) -> Result<Option<SpeedtestTrafficCounters>, String> {
     let listed = run_bounded_accounting_command(
-        &["-j", "list", "counters", "inet", table],
+        &nft_table_snapshot_arguments(table),
         Duration::from_secs(2),
         &|| false,
     )?;
@@ -2268,10 +4169,27 @@ fn parse_named_traffic_counters(
     table: &str,
     owner: &str,
 ) -> Result<SpeedtestTrafficCounters, String> {
-    let rx_bytes = named_counter_bytes(json, table, ACCOUNTING_RX_COUNTER, owner)?
-        .ok_or_else(|| "speedtest-accounting-rx-missing".to_string())?;
-    let tx_bytes = named_counter_bytes(json, table, ACCOUNTING_TX_COUNTER, owner)?
+    let flow_owner = format!("{owner}{FLOW_ACCOUNTING_OWNER_SUFFIX}");
+    let (rx_bytes, counter_owner) =
+        match named_counter_bytes(json, table, ACCOUNTING_RX_COUNTER, &flow_owner) {
+            Ok(Some(bytes)) => (bytes, flow_owner.as_str()),
+            Err(error) if error == "speedtest-accounting-identity-mismatch" => (
+                named_counter_bytes(json, table, ACCOUNTING_RX_COUNTER, owner)?
+                    .ok_or_else(|| "speedtest-accounting-rx-missing".to_string())?,
+                owner,
+            ),
+            Ok(None) => return Err("speedtest-accounting-rx-missing".into()),
+            Err(error) => return Err(error),
+        };
+    let tx_bytes = named_counter_bytes(json, table, ACCOUNTING_TX_COUNTER, counter_owner)?
         .ok_or_else(|| "speedtest-accounting-tx-missing".to_string())?;
+    if counter_owner == flow_owner {
+        let faults = named_counter_bytes(json, table, ACCOUNTING_FAULT_COUNTER, counter_owner)?
+            .ok_or_else(|| "speedtest-accounting-flow-fault-counter-missing".to_string())?;
+        if faults != 0 {
+            return Err("speedtest-accounting-flow-registration-failed".into());
+        }
+    }
     Ok(SpeedtestTrafficCounters { rx_bytes, tx_bytes })
 }
 
@@ -2441,14 +4359,6 @@ impl CakeCounterTarget {
             kind,
             handle: handle.to_string(),
         }
-    }
-
-    pub(crate) fn bind_current(
-        device: &str,
-        kind: CakeCounterKind,
-        direction: CakeCounterDirection,
-    ) -> Result<Self, String> {
-        Self::bind(device, kind, None, None, direction)
     }
 
     pub(crate) fn bind_exact(
@@ -2951,37 +4861,22 @@ fn json_string(input: &str, key: &str) -> Result<Option<String>, String> {
     let Some(tail) = json_value_tail(input, key) else {
         return Ok(None);
     };
-    let Some(mut tail) = tail.strip_prefix('"') else {
-        return Err("speedtest-json-string-invalid".to_string());
-    };
-    let mut value = String::new();
-    while !tail.is_empty() && value.len() <= 256 {
-        let character = tail.chars().next().expect("non-empty tail");
-        tail = &tail[character.len_utf8()..];
-        match character {
-            '"' => return Ok(Some(value)),
-            '\\' => {
-                let escaped = tail.chars().next().ok_or("speedtest-json-escape-invalid")?;
-                tail = &tail[escaped.len_utf8()..];
-                value.push(match escaped {
-                    '"' => '"',
-                    '\\' => '\\',
-                    '/' => '/',
-                    'b' => '\u{0008}',
-                    'f' => '\u{000c}',
-                    'n' => '\n',
-                    'r' => '\r',
-                    't' => '\t',
-                    _ => return Err("speedtest-json-escape-invalid".to_string()),
-                });
-            }
-            value_character if value_character.is_control() => {
-                return Err("speedtest-json-string-invalid".to_string())
-            }
-            value_character => value.push(value_character),
-        }
+    // Go JSON escapes '&' as \u0026 and may emit surrogate pairs. Decode a
+    // bounded string value with the existing JSON parser, retaining the old
+    // 256-byte decoded limit (worst-case ASCII escaping needs 6 chars/byte).
+    let mut end = tail.len().min(6 * 256 + 2);
+    while !tail.is_char_boundary(end) {
+        end -= 1;
     }
-    Err("speedtest-json-string-invalid".to_string())
+    let value = serde_json::Deserializer::from_str(&tail[..end])
+        .into_iter::<String>()
+        .next()
+        .ok_or("speedtest-json-string-invalid")?
+        .map_err(|_| "speedtest-json-string-invalid")?;
+    if value.len() > 256 {
+        return Err("speedtest-json-string-invalid".into());
+    }
+    Ok(Some(value))
 }
 
 fn json_value_tail<'a>(input: &'a str, key: &str) -> Option<&'a str> {
@@ -3132,6 +5027,35 @@ fn hex_decode(value: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn r6_export_egress_guard_for_isolated_kernel_test() {
+        use super::*;
+        let Some(path) = std::env::var_os("CAKE_R6_EGRESS_EXPORT") else {
+            return;
+        };
+        let socket_owner = match std::env::var("CAKE_R6_EGRESS_OWNER").as_deref() {
+            Ok("backend") => NftSocketOwner::BackendUid(1234),
+            Ok("probe") => NftSocketOwner::ProbeRootGid(42),
+            Err(std::env::VarError::NotPresent) => NftSocketOwner::BackendUid(0),
+            other => panic!("unsupported isolated egress fixture owner: {other:?}"),
+        };
+        let route_mark = match std::env::var("CAKE_R6_EGRESS_MARK").as_deref() {
+            Ok("0x200/0x3f00") => Some((!0x3f00, 0x200)),
+            Err(std::env::VarError::NotPresent) => None,
+            other => panic!("unsupported isolated egress fixture mark: {other:?}"),
+        };
+        let base =
+            nft_owned_route_pin_batch("cake_r6_guard", "isolated-test", socket_owner, route_mark);
+        let batch =
+            nft_egress_guard_batch(&base, "cake_r6_guard", socket_owner, "cake_test").unwrap();
+        super::super::autotune_apply_runtime::write_new_private_file(
+            Path::new(&path),
+            batch.as_bytes(),
+        )
+        .unwrap();
+    }
+
     use super::*;
     use crate::operations::protocol::{
         OperationIdentity, OperationOrigin, OperationRouteIdentity, OperationTargetState,
@@ -3159,12 +5083,15 @@ mod tests {
             speedtest_server_id: Some(17372),
             speedtest_topology: Some(super::super::protocol::SpeedtestTopology::Current),
             route: OperationRouteIdentity {
+                dns_server: None,
+                device_ifindex: None,
                 mode: OperationRouteMode::Main,
                 mwan3_member: None,
                 l3_device: "pppoe-wan".to_string(),
                 source_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
                 fwmark: None,
                 routing_table: None,
+                fwmark_mask: None,
             },
             target_state: OperationTargetState::ExistingManaged,
             capture_policy: None,
@@ -3180,7 +5107,11 @@ mod tests {
             allow_sqm_disable: false,
             allow_active_traffic: false,
             scheduled_auto_apply_requested: false,
-            traffic_budget_bytes: 4_000_000_000,
+            traffic_budget: crate::operations::protocol::TrafficPolicy::Capped {
+                max_bytes: 4_000_000_000,
+            },
+            traffic_policy_explicit: false,
+            traffic_plan: None,
         }
     }
 
@@ -3309,6 +5240,8 @@ mod tests {
         operation.speedtest_topology = Some(super::super::protocol::SpeedtestTopology::Unshaped);
         let worker_run_id = "6".repeat(32);
         let permit = AutotuneRuntimePermit {
+            dns_server: None,
+            probe_accounting_required: false,
             kind: RuntimePermitKind::SpeedtestUnshaped,
             permit_id: "7".repeat(32),
             job_id: operation.identity.job_id.clone(),
@@ -3416,6 +5349,48 @@ mod tests {
     }
 
     #[test]
+    fn r6_explicit_backend_dns_is_required_for_discovery_and_load() {
+        let mut operation = request(SpeedtestDirection::Both);
+        assert_eq!(
+            speedtest_go_server_list_arguments(&operation).unwrap(),
+            [
+                "--list",
+                "--ping-mode",
+                "http",
+                "--source",
+                "192.0.2.1",
+                "--dns-bind-source"
+            ]
+        );
+        operation.route.mode = OperationRouteMode::Explicit;
+        operation.route.device_ifindex = Some(42);
+        operation.route.routing_table = Some(101);
+        operation.route.fwmark = Some(0x100);
+        operation.route.fwmark_mask = Some(0x3f00);
+        assert!(speedtest_go_server_list_arguments(&operation).is_err());
+        assert!(speedtest_go_arguments(&operation, SpeedtestDirection::Both, None).is_err());
+        operation.route.dns_server = Some("192.0.2.53".parse().unwrap());
+        for args in [
+            speedtest_go_server_list_arguments(&operation).unwrap(),
+            speedtest_go_arguments(&operation, SpeedtestDirection::Both, None).unwrap(),
+            speedtest_go_arguments(&operation, SpeedtestDirection::Download, Some(123)).unwrap(),
+            speedtest_go_arguments(&operation, SpeedtestDirection::Upload, Some(123)).unwrap(),
+        ] {
+            assert!(args.ends_with(&["--route-dns-ipv4".into(), "192.0.2.53".into()]));
+            assert!(!args.iter().any(|arg| arg == "--dns-bind-source"));
+        }
+        for invalid in ["0.0.0.0", "127.0.0.1", "169.254.1.1", "224.0.0.1"] {
+            operation.route.dns_server = Some(invalid.parse().unwrap());
+            assert!(speedtest_go_server_list_arguments(&operation).is_err());
+            assert!(speedtest_go_arguments(&operation, SpeedtestDirection::Both, None).is_err());
+        }
+        operation.route.dns_server = Some("192.0.2.53".parse().unwrap());
+        operation.route.mode = OperationRouteMode::Main;
+        assert!(speedtest_go_server_list_arguments(&operation).is_err());
+        assert!(speedtest_go_arguments(&operation, SpeedtestDirection::Both, None).is_err());
+    }
+
+    #[test]
     fn automatic_server_candidates_are_sorted_bounded_and_shell_free() {
         let output = concat!(
             "Found 4 Public Servers\n",
@@ -3425,11 +5400,140 @@ mod tests {
             "[29062] 1.10km 4ms Tallinn by STV AS\n",
         );
         assert_eq!(
-            speedtest_go_server_candidates(output).unwrap(),
+            speedtest_go_server_candidates(output, None).unwrap(),
             vec![17372, 35793, 29062]
         );
-        assert!(speedtest_go_server_candidates("[oops] 1km 2ms invalid").is_err());
-        assert!(speedtest_go_server_candidates("[13397] 1km unavailable").is_err());
+        assert!(speedtest_go_server_candidates("[oops] 1km 2ms invalid", None).is_err());
+        assert!(speedtest_go_server_candidates("[13397] 1km unavailable", None).is_err());
+    }
+
+    #[test]
+    fn t1_backend_provider_unicode_escapes_are_decoded_with_the_original_bound() {
+        assert_eq!(
+            json_string(r#"{"sponsor":"AT\u0026T \ud83c\udf10"}"#, "sponsor").unwrap(),
+            Some("AT&T 🌐".into())
+        );
+        assert_eq!(
+            json_string(
+                &format!("{{\"sponsor\":\"{}\"}}", "\\u0061".repeat(256)),
+                "sponsor"
+            )
+            .unwrap(),
+            Some("a".repeat(256))
+        );
+        for invalid in [
+            format!("{{\"sponsor\":\"{}\"}}", "a".repeat(257)),
+            r#"{"sponsor":"\ud800"}"#.into(),
+            r#"{"sponsor":null}"#.into(),
+        ] {
+            assert!(json_string(&invalid, "sponsor").is_err());
+        }
+    }
+
+    #[test]
+    fn t1_endpoint_metadata_is_bound_to_the_only_returned_server_and_never_echoed() {
+        let output = "progress\n{\"servers\":[{\"id\":\"11\",\"sponsor\":\"Provider\",\"url\":\"https://Server.Example.:8080/upload.php?secret=value\"}]}";
+        assert_eq!(
+            speedtest_server_endpoint(output, Some(11), "Provider")
+                .unwrap()
+                .map(|value| value.0),
+            Some("server.example".into())
+        );
+        assert!(speedtest_server_endpoint(output, Some(12), "Provider").is_err());
+        assert!(speedtest_server_endpoint(output, Some(11), "Other").is_err());
+        assert!(
+            speedtest_server_endpoint("{\"servers\":[{\"id\":11},{\"id\":12}]}", Some(11), "")
+                .is_err()
+        );
+        assert_eq!(
+            speedtest_server_endpoint("{\"servers\":[{\"id\":11}]}", Some(11), "").unwrap(),
+            None
+        );
+        let error = speedtest_server_endpoint(
+            "{\"servers\":[{\"id\":11,\"url\":\"http://private:secret@example.test/\"}]}",
+            Some(11),
+            "",
+        )
+        .unwrap_err();
+        assert_eq!(error, "speedtest-server-endpoint-invalid");
+        assert!(!error.contains("secret"));
+        assert!(attest_selected_endpoint("one.example", Some("one.example")).is_ok());
+        assert_eq!(
+            attest_selected_endpoint("one.example", Some("two.example")).unwrap_err(),
+            "speedtest-server-endpoint-changed"
+        );
+        assert!(attest_selected_endpoint("one.example", None).is_err());
+    }
+
+    #[test]
+    fn t1_discovery_prioritizes_distinct_providers_without_fabricating_independence() {
+        let output = concat!(
+            "[11] 1km 1ms City by Example ISP\n",
+            "[12] 1km 2ms City by   EXAMPLE   ISP  \n",
+            "[13] 1km 3ms City by Example ISP\n",
+            "[14] 2km 4ms City by Second ISP\n",
+            "[15] 3km 5ms City by Third ISP\n",
+            "[16] 4km 6ms City by Fourth ISP\n",
+        );
+        let candidates = speedtest_go_server_candidates(output, None).unwrap();
+        assert_eq!(&candidates[..3], &[11, 14, 15]);
+        assert_eq!(candidates, vec![11, 14, 15, 16, 12, 13]);
+        assert_eq!(
+            &speedtest_go_server_candidates(output, Some(13)).unwrap()[..3],
+            &[13, 14, 15]
+        );
+        assert_eq!(
+            speedtest_go_server_candidates(output, Some(99)).unwrap(),
+            candidates
+        );
+        assert_eq!(
+            speedtest_go_server_candidates("[11] 1km 1ms City\n[12] 1km 2ms City\n", None).unwrap(),
+            vec![11, 12]
+        );
+        assert_eq!(
+            speedtest_go_server_candidates(
+                "[11] 1km 1ms City by Same\n[12] 1km 2ms City by Same\n",
+                None
+            )
+            .unwrap(),
+            vec![11, 12]
+        );
+    }
+
+    #[test]
+    fn t2_unlimited_retry_accounts_more_than_32gb_without_bypassing_cancel_or_deadline() {
+        use super::super::protocol::TrafficPolicy;
+        for terminal in ["speedtest-cancelled", "speedtest-timeout"] {
+            let counters = Cell::new((0u64, 0u64));
+            let calls = Cell::new(0u32);
+            let charged = Cell::new(0u64);
+            let mut budget = TrafficPolicy::Unlimited;
+            let result = retry_budgeted_route_measurement_on_loss_with_debit::<(), _, _>(
+                &mut budget,
+                32_000_000_000,
+                || Ok(counters.get()),
+                |grant| {
+                    assert_eq!(grant, TrafficPolicy::Unlimited);
+                    calls.set(calls.get() + 1);
+                    let (rx, tx) = counters.get();
+                    counters.set((rx + 10_000_000_000, tx + 10_000_000_000));
+                    Err(if calls.get() == 1 {
+                        "speedtest-route-not-ready"
+                    } else {
+                        terminal
+                    }
+                    .into())
+                },
+                &mut |debit| {
+                    charged.set(charged.get() + debit.rx_bytes + debit.tx_bytes);
+                    Ok(())
+                },
+            );
+            assert_eq!(result.unwrap_err(), terminal);
+            assert_eq!(charged.get(), 40_000_000_000);
+            assert_eq!(calls.get(), 2);
+            assert_eq!(budget, TrafficPolicy::Unlimited);
+        }
     }
 
     #[test]
@@ -3446,6 +5550,8 @@ mod tests {
             server_sponsor: "Tele2 Eesti".to_string(),
         };
         let impossible_sample = SpeedtestLoadSample {
+            endpoint_host: None,
+            endpoint_sha256: None,
             direction: SpeedtestDirection::Both,
             aggregate_rx_bytes: 1_200_000_000,
             aggregate_tx_bytes: 388_653_768,
@@ -3488,6 +5594,8 @@ mod tests {
             server_sponsor: "Example".to_string(),
         };
         let sample = SpeedtestLoadSample {
+            endpoint_host: None,
+            endpoint_sha256: None,
             direction: SpeedtestDirection::Both,
             aggregate_rx_bytes: 1_400_000,
             aggregate_tx_bytes: 3_900_000,
@@ -3505,6 +5613,273 @@ mod tests {
     }
 
     #[test]
+    fn t1_qualification_ranks_bounded_goodput_not_allowed_reported_inflation() {
+        let result = SpeedtestResult {
+            direction: SpeedtestDirection::Both,
+            download_kbps: Some(1350),
+            upload_kbps: Some(1350),
+            rx_bytes: 0,
+            tx_bytes: 0,
+            elapsed_ms: 0,
+            server_id: Some(1),
+            server_name: "fixture".into(),
+            server_sponsor: "fixture".into(),
+        };
+        let sample = SpeedtestLoadSample {
+            endpoint_host: None,
+            endpoint_sha256: None,
+            direction: SpeedtestDirection::Both,
+            aggregate_rx_bytes: 1_400_000,
+            aggregate_tx_bytes: 1_400_000,
+            confidence_rx_bytes: 1_350_000,
+            confidence_tx_bytes: 1_350_000,
+            controlled_rx_wire_bytes: 1_300_000,
+            controlled_tx_wire_bytes: 1_300_000,
+            controlled_rx_payload_bytes: 1_250_000,
+            controlled_tx_payload_bytes: 1_250_000,
+            counter_elapsed_ms: 20_000,
+            download_elapsed_ms: Some(10_000),
+            upload_elapsed_ms: Some(10_000),
+        };
+        assert!(speedtest_qualification_rejection(&result, &sample).is_none());
+        let rates = qualification_bounded_goodput(&result, &sample).unwrap();
+        assert_eq!(rates, (1000, 1000));
+        let mut observations = Vec::new();
+        for _ in 0..super::super::server_qualification::REPEATS {
+            observations.push(super::super::server_qualification::Observation {
+                server_id: 1,
+                download_kbps: rates.0,
+                upload_kbps: rates.1,
+            });
+            observations.push(super::super::server_qualification::Observation {
+                server_id: 2,
+                download_kbps: 1250,
+                upload_kbps: 1250,
+            });
+        }
+        assert_eq!(
+            super::super::server_qualification::select(&observations, None).unwrap(),
+            2
+        );
+        let bounded =
+            super::super::server_qualification::QualifiedCapacity::from_selected(&observations, 1)
+                .unwrap();
+        bounded
+            .attest_raw_rate(SpeedtestDirection::Download, 1000)
+            .unwrap();
+        let old_basis = super::super::server_qualification::QualifiedCapacity {
+            download_kbps: 1350,
+            upload_kbps: 1350,
+        };
+        assert!(old_basis
+            .attest_raw_rate(SpeedtestDirection::Download, 1000)
+            .is_err());
+        let mut wire_limited = sample.clone();
+        wire_limited.controlled_tx_wire_bytes = 1_100_000;
+        assert_eq!(
+            qualification_bounded_goodput(&result, &wire_limited)
+                .unwrap()
+                .1,
+            880
+        );
+    }
+
+    fn qualification_fixture_attempt(id: u64, debit_offset: u32) -> ServerQualificationAttempt {
+        ServerQualificationAttempt {
+            outcome: Ok((
+                SpeedtestTerminal::Complete(SpeedtestResult {
+                    direction: SpeedtestDirection::Both,
+                    download_kbps: Some(1000),
+                    upload_kbps: Some(1000),
+                    rx_bytes: 1_400_000,
+                    tx_bytes: 1_400_000,
+                    elapsed_ms: 20_000,
+                    server_id: Some(id),
+                    server_name: format!("fixture-{id}"),
+                    server_sponsor: format!("provider-{id}"),
+                }),
+                Some(SpeedtestLoadSample {
+                    endpoint_host: Some(format!("server-{id}.example")),
+                    endpoint_sha256: Some(format!("{id:064x}")),
+                    direction: SpeedtestDirection::Both,
+                    aggregate_rx_bytes: 1_400_000,
+                    aggregate_tx_bytes: 1_400_000,
+                    confidence_rx_bytes: 1_350_000,
+                    confidence_tx_bytes: 1_350_000,
+                    controlled_rx_wire_bytes: 1_300_000,
+                    controlled_tx_wire_bytes: 1_300_000,
+                    controlled_rx_payload_bytes: 1_250_000,
+                    controlled_tx_payload_bytes: 1_250_000,
+                    counter_elapsed_ms: 20_000,
+                    download_elapsed_ms: Some(10_000),
+                    upload_elapsed_ms: Some(10_000),
+                }),
+            )),
+            started_boot_ms: 1000 + u64::from(debit_offset) * 20_000,
+            elapsed_ms: 20_000,
+            debit_offset,
+            debit_count: 1,
+        }
+    }
+
+    #[test]
+    fn t1_scheduler_uses_backup_only_after_primary_failure_and_skips_rejected_slots() {
+        for (fallback, count) in [(false, 6), (true, 6), (true, 5)] {
+            let attempts: Vec<_> = (1..=count).map(Some).collect();
+            let mut comparisons = Vec::new();
+            let mut calls = Vec::new();
+            let mut published = Vec::new();
+            let selected = qualify_server_candidates(
+                None,
+                true,
+                &attempts,
+                &mut comparisons,
+                |index, candidate| {
+                    let id = candidate.unwrap();
+                    let mut measured = qualification_fixture_attempt(id, calls.len() as u32 + 1);
+                    calls.push((index + 1, id));
+                    if fallback && id <= 3 {
+                        measured.outcome = Ok((
+                            SpeedtestTerminal::Failed {
+                                code: "speedtest-backend-failed".into(),
+                            },
+                            None,
+                        ));
+                    }
+                    Ok(measured)
+                },
+                &mut |comparison| {
+                    published.push(comparison.index);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let expected_ids = if !fallback {
+                vec![1, 2, 3, 1, 2, 3, 1, 2, 3]
+            } else if count == 6 {
+                vec![1, 2, 3, 4, 5, 6, 4, 5, 6, 4, 5, 6]
+            } else {
+                vec![1, 2, 3, 4, 5, 4, 5, 4, 5]
+            };
+            assert_eq!(
+                calls.iter().map(|row| row.1).collect::<Vec<_>>(),
+                expected_ids
+            );
+            assert_eq!(published, calls.iter().map(|row| row.0).collect::<Vec<_>>());
+            if fallback {
+                assert_eq!(
+                    calls[3].0, 10,
+                    "skipped primary slots retain stable evidence indices"
+                );
+                assert!(selected.server_id >= 4);
+            } else {
+                assert!(selected.server_id <= 3);
+            }
+            assert_eq!(
+                selected.endpoint_sha256,
+                format!("{:064x}", selected.server_id)
+            );
+            assert_eq!(selected.raw_capacity.unwrap().download_kbps, 1000);
+            for (offset, row) in comparisons.iter().enumerate() {
+                assert_eq!(row.debit_offset, offset as u32 + 1);
+                assert_eq!(row.debit_count, 1);
+                assert_eq!(row.valid, !fallback || row.candidate_id.unwrap() > 3);
+            }
+        }
+    }
+
+    #[test]
+    fn t1_scheduler_does_not_replace_failed_pinned_server_or_promote_shaped_capacity() {
+        for pinned in [None, Some(1)] {
+            let mut comparisons = Vec::new();
+            let mut calls = Vec::new();
+            let outcome = qualify_server_candidates(
+                pinned,
+                false,
+                &[Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)],
+                &mut comparisons,
+                |_, candidate| {
+                    let id = candidate.unwrap();
+                    let mut attempt = qualification_fixture_attempt(id, calls.len() as u32);
+                    calls.push(id);
+                    if id == 1 {
+                        attempt.outcome = Err("speedtest-backend-failed".into());
+                    }
+                    Ok(attempt)
+                },
+                &mut |_| Ok(()),
+            );
+            assert_eq!(calls.iter().filter(|id| **id == 1).count(), 1);
+            if pinned.is_some() {
+                assert!(
+                    outcome.is_err(),
+                    "healthy backups cannot replace explicit pin"
+                );
+            } else {
+                let selected = outcome.unwrap();
+                assert!(selected.server_id == 2 || selected.server_id == 3);
+                assert!(selected.raw_capacity.is_none());
+                assert!(calls.iter().all(|id| *id <= 3));
+            }
+        }
+    }
+
+    #[test]
+    fn t1_scheduler_stops_on_budget_cancel_and_evidence_publication_failure() {
+        for failure in ["budget", "cancel", "publication", "epoch"] {
+            let mut calls = Vec::new();
+            let mut comparisons = Vec::new();
+            let mut published = 0;
+            let error = qualify_server_candidates(
+                None,
+                true,
+                &[Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)],
+                &mut comparisons,
+                |_, candidate| {
+                    let id = candidate.unwrap();
+                    let mut attempt = qualification_fixture_attempt(id, calls.len() as u32);
+                    calls.push(id);
+                    if id <= 3 {
+                        attempt.outcome = Err("speedtest-backend-failed".into());
+                    }
+                    if id == 4 {
+                        match failure {
+                            "budget" => {
+                                attempt.outcome = Err(SPEEDTEST_TRAFFIC_BUDGET_EXHAUSTED.into())
+                            }
+                            "cancel" => attempt.outcome = Ok((SpeedtestTerminal::Cancelled, None)),
+                            "epoch" => return Err("fixture-accounting-epoch-changed".into()),
+                            _ => (),
+                        }
+                    }
+                    Ok(attempt)
+                },
+                &mut |row| {
+                    published += 1;
+                    if failure == "publication" && row.candidate_id == Some(4) {
+                        Err("fixture-report-write-failed".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .err()
+            .unwrap();
+            assert_eq!(calls, [1, 2, 3, 4]);
+            assert_eq!(published, if failure == "epoch" { 3 } else { 4 });
+            assert_eq!(
+                error,
+                match failure {
+                    "budget" => SPEEDTEST_TRAFFIC_BUDGET_EXHAUSTED,
+                    "cancel" => "speedtest-server-qualification-cancelled",
+                    "epoch" => "fixture-accounting-epoch-changed",
+                    _ => "fixture-report-write-failed",
+                }
+            );
+        }
+    }
+
+    #[test]
     fn automatic_server_rejection_is_typed_and_private_diagnostic_is_bounded() {
         let result = SpeedtestResult {
             direction: SpeedtestDirection::Both,
@@ -3518,6 +5893,8 @@ mod tests {
             server_sponsor: "must-not-be-logged-sponsor".to_string(),
         };
         let sample = SpeedtestLoadSample {
+            endpoint_host: None,
+            endpoint_sha256: None,
             direction: SpeedtestDirection::Both,
             aggregate_rx_bytes: 1_400_000,
             aggregate_tx_bytes: 1_400_000,
@@ -3736,6 +6113,8 @@ mod tests {
             server_sponsor: "test".to_string(),
         };
         let sample = SpeedtestLoadSample {
+            endpoint_host: None,
+            endpoint_sha256: None,
             direction: SpeedtestDirection::Both,
             aggregate_rx_bytes: 1_200_000,
             aggregate_tx_bytes: 1_717_093,
@@ -3793,6 +6172,8 @@ mod tests {
             server_sponsor: "Example".to_string(),
         };
         let mut sample = SpeedtestLoadSample {
+            endpoint_host: None,
+            endpoint_sha256: None,
             direction: SpeedtestDirection::Both,
             aggregate_rx_bytes: 1_400_000,
             aggregate_tx_bytes: 1_400_000,
@@ -4124,7 +6505,11 @@ Upload: 766.6 Mbps (Used: 975.34MB)
         operation.speedtest_server_id = None;
         let worker_run_id = "6".repeat(32);
         let session = EmbeddedSpeedtestSession {
+            probe_pin: None,
+            owned_checkpoint: None,
+            owned_ledger: None,
             route_pin: NftRoutePin {
+                cleanup_on_drop: true,
                 table: None,
                 owner: None,
             },
@@ -4137,13 +6522,29 @@ Upload: 766.6 Mbps (Used: 975.34MB)
             route_fingerprint: operation.identity.route_fingerprint.clone(),
             route: operation.route.clone(),
             backend: operation.backend.clone(),
+            requested_server_id: operation.speedtest_server_id,
+            authorized_traffic_budget: operation.traffic_budget,
+            traffic_policy_explicit: operation.traffic_policy_explicit,
             selected_server_id: None,
+            server_qualified: false,
+            qualified_raw_capacity: None,
+            selected_endpoint_sha256: None,
         };
         assert!(session.matches(&operation, &worker_run_id));
 
         let mut next_bounded_run = operation.clone();
-        next_bounded_run.traffic_budget_bytes /= 2;
+        next_bounded_run.traffic_budget =
+            (next_bounded_run.traffic_budget.limit_bytes().unwrap() / 2).into();
         assert!(session.matches(&next_bounded_run, &worker_run_id));
+        let mut enlarged = operation.clone();
+        enlarged.traffic_budget = (operation.traffic_budget.limit_bytes().unwrap() + 1).into();
+        assert!(!session.matches(&enlarged, &worker_run_id));
+        enlarged.traffic_budget = super::super::protocol::TrafficPolicy::Unlimited;
+        enlarged.traffic_policy_explicit = true;
+        assert!(!session.matches(&enlarged, &worker_run_id));
+        let mut changed_server = operation.clone();
+        changed_server.speedtest_server_id = Some(999);
+        assert!(!session.matches(&changed_server, &worker_run_id));
 
         let mut changed_route = operation.clone();
         changed_route.identity.route_fingerprint = "7".repeat(64);
@@ -4155,7 +6556,1393 @@ Upload: 766.6 Mbps (Used: 975.34MB)
     }
 
     #[test]
-    fn mwan3_environment_and_route_pin_are_strict_and_identity_owned() {
+    fn t1_cpu_warning_preserves_measurement_result_and_exact_debit() {
+        let snapshot = |total| crate::CpuSnapshot {
+            counters: vec![crate::CpuCounters { total, idle: 0 }; 2],
+            raw_lines: vec!["cpu".into(), "cpu0".into()],
+        };
+        let observer = || {
+            Some(QualificationCpuObserver {
+                previous: snapshot(0),
+                busy_streak: vec![0],
+                maximum_percent: crate::autotune::AutotuneProfile::BestOverall
+                    .validation_thresholds()
+                    .cpu_max_percent,
+            })
+        };
+        let mut remaining = super::super::protocol::TrafficPolicy::Capped { max_bytes: 10_000 };
+        let reads = Cell::new(0);
+        let attempts = Cell::new(0);
+        let mut debits = Vec::new();
+        let result = retry_budgeted_route_measurement_on_loss_with_debit(
+            &mut remaining,
+            1,
+            || {
+                let n = reads.get();
+                reads.set(n + 1);
+                Ok(if n == 0 { (100, 200) } else { (3100, 2200) })
+            },
+            |_| {
+                attempts.set(attempts.get() + 1);
+                let mut cpu = observer();
+                assert!(qualification_cpu_warning(&mut cpu, Ok(snapshot(100))).is_none());
+                assert!(qualification_cpu_warning(&mut cpu, Ok(snapshot(200))).is_none());
+                assert_eq!(
+                    qualification_cpu_warning(&mut cpu, Ok(snapshot(300))).as_deref(),
+                    Some("sustained-core-pressure")
+                );
+                assert!(cpu.is_none());
+                assert!(qualification_cpu_warning(&mut cpu, Ok(snapshot(400))).is_none());
+                Ok(9)
+            },
+            &mut |debit| {
+                debits.push(debit);
+                Ok(())
+            },
+        );
+        assert_eq!(result.unwrap(), 9);
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(reads.get(), 2);
+        assert_eq!(
+            debits,
+            vec![SpeedtestTrafficDebit {
+                lifecycle: false,
+                rx_bytes: 3000,
+                tx_bytes: 2000
+            }]
+        );
+        assert_eq!(remaining.limit_bytes(), Some(5000));
+        let mut cpu = observer();
+        assert_eq!(
+            qualification_cpu_warning(&mut cpu, Err("speedtest-cpu-evidence-unavailable".into()))
+                .as_deref(),
+            Some("speedtest-cpu-evidence-unavailable")
+        );
+        assert!(cpu.is_none());
+    }
+
+    #[test]
+    fn t1_cpu_pressure_is_sustained_per_core_not_host_average_or_one_spike() {
+        fn snapshot(total: u64, idle0: u64, idle1: u64) -> crate::CpuSnapshot {
+            crate::CpuSnapshot {
+                counters: vec![
+                    crate::CpuCounters {
+                        total: total * 2,
+                        idle: idle0 + idle1,
+                    },
+                    crate::CpuCounters { total, idle: idle0 },
+                    crate::CpuCounters { total, idle: idle1 },
+                ],
+                raw_lines: vec!["cpu".into(), "cpu0".into(), "cpu1".into()],
+            }
+        }
+        let fresh = || QualificationCpuObserver {
+            previous: snapshot(0, 0, 0),
+            busy_streak: vec![0; 2],
+            maximum_percent: crate::autotune::AutotuneProfile::BestOverall
+                .validation_thresholds()
+                .cpu_max_percent,
+        };
+        let mut guard = fresh();
+        assert!(!guard.observe(snapshot(100, 0, 100)).unwrap());
+        assert!(!guard.observe(snapshot(200, 0, 200)).unwrap());
+        assert!(
+            guard.observe(snapshot(300, 0, 300)).unwrap(),
+            "one saturated core is hidden by 50% host average"
+        );
+        let mut guard = fresh();
+        for (total, idle) in [(100, 0), (200, 100), (300, 100), (400, 200)] {
+            assert!(
+                !guard.observe(snapshot(total, idle, total)).unwrap(),
+                "isolated spikes must not reject a source"
+            );
+        }
+        let mut guard = fresh();
+        for n in 1..=4 {
+            assert!(
+                !guard.observe(snapshot(n * 100, n * 15, n * 100)).unwrap(),
+                "exact 85% remains within the profile advisory threshold"
+            );
+        }
+        let mut guard = fresh();
+        guard.observe(snapshot(100, 0, 100)).unwrap();
+        let prior = guard.busy_streak.clone();
+        assert!(!guard.observe(snapshot(100, 0, 100)).unwrap());
+        assert_eq!(
+            guard.busy_streak, prior,
+            "missing ticks are not idle evidence"
+        );
+        assert!(guard.observe(snapshot(99, 0, 100)).is_err());
+        let mut changed = snapshot(200, 0, 200);
+        changed.raw_lines[2] = "cpu2".into();
+        assert!(
+            guard.observe(changed).is_err(),
+            "CPU identity changes cannot inherit a streak"
+        );
+    }
+
+    #[test]
+    fn t2_probe_counter_table_is_disjoint_from_backend_measurement_counters() {
+        let job = "a".repeat(32);
+        let run = "b".repeat(32);
+        let (table, owner) = probe_pin_identity(&job, &run).unwrap();
+        assert_eq!(table, "cake_pt_aaaaaaaaaaaa_bbbbbbbbbbbb");
+        assert_ne!(table, route_pin_table_name(&job, &run).unwrap());
+        assert_ne!(owner, route_pin_owner(&job, &run).unwrap());
+        assert!(probe_pin_identity("bad", &run).is_err());
+        let gid = 32770;
+        let batch: serde_json::Value = serde_json::from_str(&nft_owned_route_pin_batch(
+            &table,
+            &owner,
+            NftSocketOwner::ProbeRootGid(gid),
+            Some((!0x3f00, 0x200)),
+        ))
+        .unwrap();
+        let commands = batch["nftables"].as_array().unwrap();
+        assert_eq!(commands[0]["create"]["table"]["comment"], owner);
+        assert_eq!(commands[1]["add"]["set"]["size"], MAX_ACCOUNTING_FLOWS);
+        let rules: Vec<_> = commands
+            .iter()
+            .filter_map(|command| command.get("add")?.get("rule"))
+            .filter(|rule| !rule.to_string().contains("owned_dns6"))
+            .collect();
+        assert_eq!(rules.len(), 6);
+        let matches_credentials =
+            |rule: &serde_json::Value, uid: Option<u32>, group: Option<u32>| {
+                rule["expr"].as_array().unwrap().iter().all(|expression| {
+                    let condition = &expression["match"];
+                    let value = match condition["left"]["meta"]["key"].as_str() {
+                        Some("skuid") => uid,
+                        Some("skgid") => group,
+                        _ => return true,
+                    };
+                    let Some(value) = value else {
+                        return false;
+                    };
+                    let expected = condition["right"].as_u64().unwrap();
+                    match condition["op"].as_str().unwrap() {
+                        "==" => u64::from(value) == expected,
+                        "!=" => u64::from(value) != expected,
+                        _ => panic!("unexpected credential matcher"),
+                    }
+                })
+            };
+        for (uid, group, owned) in [
+            (0, gid, true),
+            (32769, gid, false),
+            (0, 0, false),
+            (32769, 0, false),
+        ] {
+            assert_eq!(matches_credentials(rules[0], Some(uid), Some(group)), owned);
+            assert_eq!(matches_credentials(rules[4], Some(uid), Some(group)), owned);
+            let clears = matches_credentials(rules[1], Some(uid), Some(group))
+                || matches_credentials(rules[2], Some(uid), Some(group));
+            assert_eq!(
+                clears, !owned,
+                "foreign tuple must be cleared before transmit counting"
+            );
+        }
+        for rule in &rules[..3] {
+            assert!(
+                !matches_credentials(rule, None, None),
+                "late socketless packets must retain conntrack ownership"
+            );
+        }
+        assert_eq!(
+            rules[3]["expr"].as_array().unwrap().last().unwrap(),
+            &serde_json::json!({"return":null})
+        );
+        assert_eq!(
+            rules[4]["expr"].as_array().unwrap().last().unwrap(),
+            &serde_json::json!({"drop":null})
+        );
+        assert!(
+            rules[4]["expr"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["match"]["left"].get("ct").is_none()),
+            "untracked/unsupported owned traffic must hit the fault counter"
+        );
+        assert!(
+            rules[5]["expr"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["match"]["left"]
+                    .get("meta")
+                    .is_none_or(|m| m["key"] == "nfproto")),
+            "reply accounting must not depend on a receive socket's UID/GID"
+        );
+    }
+
+    #[test]
+    fn t2_route_commands_have_live_output_and_runtime_bounds() {
+        assert_eq!(
+            run_bounded_command("/usr/bin/head", &["-c", "262145", "/dev/zero"]).unwrap_err(),
+            "speedtest-route-command-output-too-large"
+        );
+        assert_eq!(
+            run_bounded_command("/bin/sleep", &["30"]).unwrap_err(),
+            "speedtest-route-command-timeout"
+        );
+    }
+
+    #[test]
+    fn t2_budget_watcher_stops_owned_pid_while_parent_does_not_poll_it() {
+        fn sleeper() -> BackendChild {
+            let child = Command::new("/bin/sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let identity =
+                ProcessIdentity::inspect(Path::new(DEFAULT_PROC_ROOT), child.id()).unwrap();
+            BackendChild { child, identity }
+        }
+        let mut peer = sleeper();
+        let child = sleeper();
+        let identity = child.identity.clone();
+        assert_eq!(peer.identity.process_group, identity.process_group);
+        let (observed, notifications) = std::sync::mpsc::channel();
+        let terminate = AtomicBool::new(false);
+        let result = with_backend_supervision(
+            child,
+            Some(move || {
+                let _ = observed.send(());
+                Ok(true)
+            }),
+            &terminate,
+            Instant::now() + Duration::from_secs(5),
+            "fixture-timeout",
+            |backend| {
+                notifications.recv_timeout(Duration::from_secs(2)).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while identity
+                    .still_matches(Path::new(DEFAULT_PROC_ROOT))
+                    .unwrap_or(false)
+                    && Instant::now() < deadline
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                assert!(
+                    !identity
+                        .still_matches(Path::new(DEFAULT_PROC_ROOT))
+                        .unwrap_or(false),
+                    "watcher must stop and reap without a parent try_wait call"
+                );
+                assert!(
+                    !peer.try_wait().unwrap(),
+                    "shared process-group peer must survive"
+                );
+                backend.finish()
+            },
+        );
+        assert_eq!(result.unwrap_err(), SPEEDTEST_TRAFFIC_LIMIT_REACHED);
+        peer.stop_and_reap().unwrap();
+        let failure = with_backend_supervision(
+            sleeper(),
+            Some(|| Err("fixture-counter-fault".into())),
+            &terminate,
+            Instant::now() + Duration::from_secs(5),
+            "fixture-timeout",
+            |backend| backend.finish(),
+        )
+        .unwrap_err();
+        assert_eq!(failure, "fixture-counter-fault");
+        let cancelled = AtomicBool::new(true);
+        let cancellation = with_backend_supervision(
+            sleeper(),
+            Some(|| panic!("cancelled child must not poll")),
+            &cancelled,
+            Instant::now() + Duration::from_secs(5),
+            "fixture-timeout",
+            |backend| backend.finish(),
+        )
+        .unwrap_err();
+        assert_eq!(cancellation, "speedtest-cancelled");
+        let abandoned = sleeper();
+        let abandoned_identity = abandoned.identity.clone();
+        let error = with_backend_supervision::<(), _>(
+            abandoned,
+            Some(|| Ok(false)),
+            &terminate,
+            Instant::now() + Duration::from_secs(5),
+            "fixture-timeout",
+            |_| Err("parent-route-failure".into()),
+        )
+        .unwrap_err();
+        assert_eq!(error, "parent-route-failure");
+        assert!(!abandoned_identity
+            .still_matches(Path::new(DEFAULT_PROC_ROOT))
+            .unwrap_or(false));
+        let timeout = with_backend_supervision(
+            sleeper(),
+            Some(|| panic!("expired backend must not poll")),
+            &terminate,
+            Instant::now(),
+            "fixture-timeout",
+            |backend| backend.finish(),
+        )
+        .unwrap_err();
+        assert_eq!(timeout, "fixture-timeout");
+    }
+
+    #[test]
+    fn t2_cutoff_staged_recovery_preserves_partial_and_rejects_foreign_bytes() {
+        use super::super::autotune_apply_runtime::write_new_private_file;
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("cake-cutoff-stage-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let operation = request(SpeedtestDirection::Both);
+        let context = || OwnedCleanupContext {
+            directory: &root,
+            request: &operation,
+        };
+        let snapshot = OwnedTrafficSnapshot {
+            backend: SpeedtestTrafficCounters {
+                rx_bytes: 70,
+                tx_bytes: 30,
+            },
+            probes: SpeedtestTrafficCounters {
+                rx_bytes: 7,
+                tx_bytes: 3,
+            },
+        };
+        let worker = "a".repeat(32);
+        let path = root.join(format!("owned-traffic-cutoff-{worker}"));
+        let staged = path.with_extension("cutoff-next");
+        let bytes = encode_cutoff_observation(&operation, &worker, Some(snapshot)).unwrap();
+        write_new_private_file(&staged, bytes.as_bytes()).unwrap();
+        preserve_cutoff_observation(
+            context(),
+            &worker,
+            || panic!("complete staged receipt must not refreeze"),
+            || panic!("complete staged receipt must not resample"),
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), bytes);
+        assert!(!staged.exists());
+        assert_eq!(
+            read_cutoff_observation(&root, &operation, &worker).unwrap(),
+            Some(snapshot)
+        );
+
+        fs::remove_file(&path).unwrap();
+        write_new_private_file(&staged, b"{\"payload\":").unwrap();
+        let frozen = std::cell::Cell::new(false);
+        preserve_cutoff_observation(
+            context(),
+            &worker,
+            || {
+                frozen.set(true);
+                Ok(())
+            },
+            || {
+                assert!(frozen.get());
+                Ok(snapshot)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(path.with_extension("cutoff-incomplete")).unwrap(),
+            b"{\"payload\":"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), bytes);
+
+        fs::remove_file(&path).unwrap();
+        let foreign =
+            encode_cutoff_observation(&operation, &"b".repeat(32), Some(snapshot)).unwrap();
+        write_new_private_file(&staged, foreign.as_bytes()).unwrap();
+        assert!(preserve_cutoff_observation(
+            context(),
+            &worker,
+            || panic!("foreign receipt cannot refreeze"),
+            || panic!("foreign receipt cannot resample")
+        )
+        .is_err());
+        assert_eq!(fs::read_to_string(&staged).unwrap(), foreign);
+        assert!(!path.exists());
+        fs::remove_file(&staged).unwrap();
+        write_new_private_file(&staged, b"{").unwrap();
+        assert!(preserve_cutoff_observation(
+            context(),
+            &worker,
+            || panic!("second partial write must remain bounded"),
+            || panic!()
+        )
+        .is_err());
+        assert_eq!(fs::read(&staged).unwrap(), b"{");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn t2_cutoff_observation_is_bound_immutable_and_never_implies_final_zero() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("cake-cutoff-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut operation = request(SpeedtestDirection::Both);
+        let worker = "a".repeat(32);
+        let context = || OwnedCleanupContext {
+            directory: &root,
+            request: &operation,
+        };
+        let snapshot = OwnedTrafficSnapshot {
+            backend: SpeedtestTrafficCounters {
+                rx_bytes: 70,
+                tx_bytes: 30,
+            },
+            probes: SpeedtestTrafficCounters {
+                rx_bytes: 7,
+                tx_bytes: 3,
+            },
+        };
+        let failure = preserve_cutoff_observation(
+            context(),
+            &worker,
+            || Err("cutoff-batch-write-failed".into()),
+            || panic!("failed cutoff must not sample or delete counters"),
+        )
+        .unwrap_err();
+        assert_eq!(failure, "cutoff-batch-write-failed");
+        assert!(!root.join(format!("owned-traffic-cutoff-{worker}")).exists());
+        preserve_cutoff_observation(context(), &worker, || Ok(()), || Ok(snapshot)).unwrap();
+        let path = root.join(format!("owned-traffic-cutoff-{worker}"));
+        let original = fs::read_to_string(&path).unwrap();
+        assert!(original.contains("post-retirement-rule-cutoff-v1"));
+        assert!(original.contains("\"schema_version\":2"));
+        assert!(original.contains("[70,30,7,3]"));
+        assert!(verify_owned_cutoff_consistency(&root, &operation, &worker).is_err());
+        let digest = super::super::autotune_apply::native_apply_sha256_hex(
+            operation.encode().unwrap().as_bytes(),
+        );
+        let checkpoint_path = root.join(format!("owned-traffic-checkpoint-{worker}"));
+        let zero = SpeedtestTrafficCounters {
+            rx_bytes: 0,
+            tx_bytes: 0,
+        };
+        OwnedTrafficCheckpoint {
+            sequence: 0,
+            counters: OwnedTrafficSnapshot {
+                backend: zero,
+                probes: zero,
+            },
+        }
+        .publish_bound(
+            &checkpoint_path,
+            &operation.identity.job_id,
+            &worker,
+            &digest,
+        )
+        .unwrap();
+        assert_eq!(
+            verify_owned_cutoff_consistency(&root, &operation, &worker).unwrap(),
+            110
+        );
+        OwnedTrafficCheckpoint {
+            sequence: 1,
+            counters: snapshot,
+        }
+        .publish_bound(
+            &checkpoint_path,
+            &operation.identity.job_id,
+            &worker,
+            &digest,
+        )
+        .unwrap();
+        assert_eq!(
+            verify_owned_cutoff_consistency(&root, &operation, &worker).unwrap(),
+            110
+        );
+        preserve_cutoff_observation(
+            context(),
+            &worker,
+            || panic!("durable receipt must not refreeze"),
+            || panic!("retry must preserve first observation"),
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        let missing = "b".repeat(32);
+        preserve_cutoff_observation(
+            context(),
+            &missing,
+            || Ok(()),
+            || Err("missing table".into()),
+        )
+        .unwrap();
+        let unavailable =
+            fs::read_to_string(root.join(format!("owned-traffic-cutoff-{missing}"))).unwrap();
+        assert!(unavailable.contains("\"counters\":null"));
+        assert!(verify_owned_cutoff_consistency(&root, &operation, &missing).is_err());
+        let mut swapped = snapshot;
+        swapped.backend.rx_bytes -= 1;
+        swapped.probes.rx_bytes += 1;
+        assert_eq!(
+            swapped.total_bytes().unwrap(),
+            snapshot.total_bytes().unwrap()
+        );
+        fs::remove_file(&path).unwrap();
+        preserve_cutoff_observation(context(), &worker, || Ok(()), || Ok(swapped)).unwrap();
+        assert!(verify_owned_cutoff_consistency(&root, &operation, &worker).is_err());
+        fs::remove_file(&path).unwrap();
+        let mut tail = snapshot;
+        tail.backend.rx_bytes += 11;
+        tail.backend.tx_bytes += 5;
+        tail.probes.rx_bytes += 2;
+        tail.probes.tx_bytes += 1;
+        preserve_cutoff_observation(context(), &worker, || Ok(()), || Ok(tail)).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                verify_owned_cutoff_consistency(&root, &operation, &worker).unwrap(),
+                129,
+                "cutoff is cumulative; retries must not add the tail twice"
+            );
+        }
+        fs::remove_file(&path).unwrap();
+        assert!(read_cutoff_observation(&root, &operation, &worker).is_err());
+        assert!(
+            !path.exists(),
+            "verification must not create a missing observation"
+        );
+        preserve_cutoff_observation(context(), &worker, || Ok(()), || Ok(snapshot)).unwrap();
+        operation.traffic_budget = 1_000_000_u64.into();
+        assert!(preserve_cutoff_observation(
+            OwnedCleanupContext {
+                directory: &root,
+                request: &operation
+            },
+            &worker,
+            || panic!("wrong request must not refreeze"),
+            || panic!("wrong request must not reobserve")
+        )
+        .is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn t2_owned_snapshot_reads_both_exact_owners_under_one_deadline() {
+        let job = "a".repeat(32);
+        let worker = "b".repeat(32);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut calls = Vec::new();
+        let snapshot =
+            read_owned_traffic_counters_with(&job, &worker, deadline, |table, owner, until| {
+                assert_eq!(until, deadline);
+                calls.push((table.to_string(), owner.to_string()));
+                Ok(SpeedtestTrafficCounters {
+                    rx_bytes: 7,
+                    tx_bytes: 3,
+                })
+            })
+            .unwrap();
+        assert_eq!(snapshot.total_bytes().unwrap(), 20);
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    route_pin_table_name(&job, &worker).unwrap(),
+                    route_pin_owner(&job, &worker).unwrap()
+                ),
+                probe_pin_identity(&job, &worker).unwrap(),
+            ]
+        );
+        for fail_at in [1, 2] {
+            let mut count = 0;
+            let error = read_owned_traffic_counters_with(&job, &worker, deadline, |_, _, _| {
+                count += 1;
+                if count == fail_at {
+                    Err("missing-or-unowned-table".into())
+                } else {
+                    Ok(SpeedtestTrafficCounters {
+                        rx_bytes: 7,
+                        tx_bytes: 3,
+                    })
+                }
+            })
+            .unwrap_err();
+            assert_eq!(error, "missing-or-unowned-table");
+            assert_eq!(count, fail_at);
+        }
+        assert!(
+            read_owned_traffic_counters_with("../bad", &worker, deadline, |_, _, _| panic!(
+                "invalid identity reached I/O"
+            ))
+            .is_err()
+        );
+        assert!(
+            read_owned_traffic_counters_with(&job, &worker, deadline, |_, _, _| Ok(
+                SpeedtestTrafficCounters {
+                    rx_bytes: u64::MAX,
+                    tx_bytes: 1
+                }
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn t2_owned_budget_watch_uses_cumulative_not_window_consumption() {
+        let pin = NftRoutePin {
+            table: None,
+            owner: None,
+            cleanup_on_drop: false,
+        };
+        let point = |rx, tx, prx, ptx| OwnedTrafficSnapshot {
+            backend: SpeedtestTrafficCounters {
+                rx_bytes: rx,
+                tx_bytes: tx,
+            },
+            probes: SpeedtestTrafficCounters {
+                rx_bytes: prx,
+                tx_bytes: ptx,
+            },
+        };
+        let mut watch = OwnedBudgetWatch {
+            backend: &pin,
+            probes: &pin,
+            limit: 100_u64.into(),
+            previous: point(50, 10, 5, 5),
+        };
+        assert!(!watch.observe(point(60, 15, 10, 15)).unwrap());
+        assert!(watch.observe(point(61, 15, 10, 15)).unwrap());
+        assert!(watch.observe(point(60, 15, 100, 100)).is_err());
+        watch.limit = super::super::protocol::TrafficPolicy::Unlimited;
+        assert!(!watch.observe(point(70_000_000_000, 20, 100, 100)).unwrap());
+    }
+
+    #[test]
+    fn t2_scheduler_backup_keeps_one_owned_rx_tx_budget_and_durable_debits() {
+        use std::cell::Cell;
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("cake-backup-budget-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut operation = request(SpeedtestDirection::Both);
+        operation.traffic_budget = 100_u64.into();
+        let worker = "a".repeat(32);
+        let digest = super::super::autotune_apply::native_apply_sha256_hex(
+            operation.encode().unwrap().as_bytes(),
+        );
+        let snapshot = |attempts| OwnedTrafficSnapshot {
+            backend: SpeedtestTrafficCounters {
+                rx_bytes: attempts * 10,
+                tx_bytes: attempts * 5,
+            },
+            probes: SpeedtestTrafficCounters {
+                rx_bytes: 0,
+                tx_bytes: 0,
+            },
+        };
+        let origin = OwnedTrafficCheckpoint {
+            sequence: 0,
+            counters: snapshot(0),
+        };
+        let path = root.join("checkpoint");
+        origin
+            .publish_bound(&path, &operation.identity.job_id, &worker, &digest)
+            .unwrap();
+        let session = EmbeddedSpeedtestSession {
+            route_pin: NftRoutePin {
+                table: None,
+                owner: None,
+                cleanup_on_drop: false,
+            },
+            probe_pin: None,
+            credentials: BackendCredentials {
+                uid: 32769,
+                gid: 32770,
+            },
+            job_id: operation.identity.job_id.clone(),
+            worker_run_id: worker,
+            route_fingerprint: operation.identity.route_fingerprint.clone(),
+            route: operation.route.clone(),
+            backend: operation.backend.clone(),
+            requested_server_id: None,
+            authorized_traffic_budget: 100_u64.into(),
+            traffic_policy_explicit: true,
+            selected_server_id: None,
+            server_qualified: false,
+            qualified_raw_capacity: None,
+            selected_endpoint_sha256: None,
+            owned_checkpoint: Some((path, digest)),
+            owned_ledger: Some(Cell::new(
+                OwnedTrafficLedger::from_verified_checkpoint(100_u64.into(), origin).unwrap(),
+            )),
+        };
+        let completed = Cell::new(0u64);
+        let mut remaining = 100_u64.into();
+        let mut backend_calls = Vec::new();
+        let mut comparisons = Vec::new();
+        let mut debits = Vec::new();
+        let mut debit_count = 0u32;
+        let error = qualify_server_candidates(
+            None,
+            true,
+            &[Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)],
+            &mut comparisons,
+            |_, candidate| {
+                let id = candidate.unwrap();
+                let mut measured = qualification_fixture_attempt(id, debit_count);
+                measured.outcome = retry_budgeted_session_measurement_with_debit(
+                    &session,
+                    &operation,
+                    &mut remaining,
+                    20,
+                    || Ok(snapshot(completed.get())),
+                    |available| {
+                        assert_eq!(available.limit_bytes(), Some(100 - completed.get() * 15));
+                        backend_calls.push(id);
+                        completed.set(completed.get() + 1);
+                        if id <= 3 {
+                            Err("speedtest-backend-failed".into())
+                        } else {
+                            qualification_fixture_attempt(id, 0).outcome
+                        }
+                    },
+                    &mut |debit| {
+                        if !debit.lifecycle {
+                            debit_count += 1;
+                        }
+                        debits.push(debit);
+                        Ok(())
+                    },
+                );
+                measured.debit_count = debit_count - measured.debit_offset;
+                Ok(measured)
+            },
+            &mut |_| Ok(()),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error, SPEEDTEST_TRAFFIC_BUDGET_EXHAUSTED);
+        assert_eq!(backend_calls, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(comparisons.last().unwrap().candidate_id, Some(4));
+        assert_eq!(comparisons.last().unwrap().debit_count, 0);
+        assert_eq!(remaining.limit_bytes(), Some(10));
+        assert_eq!(debits.iter().map(|row| row.rx_bytes).sum::<u64>(), 60);
+        assert_eq!(debits.iter().map(|row| row.tx_bytes).sum::<u64>(), 30);
+        assert_eq!(debit_count, 6);
+        let ledger = session.owned_ledger.as_ref().unwrap().get();
+        assert_eq!(ledger.committed.counters, snapshot(6));
+        assert_eq!(ledger.authority.limit_bytes(), Some(100));
+        // Re-read the durable owned checkpoint through the same path used by
+        // subsequent attempts; callback accounting cannot silently reset it.
+        let (checkpoint_path, request_digest) = session.owned_checkpoint.as_ref().unwrap();
+        let stored = OwnedTrafficCheckpoint::decode_bound(
+            &fs::read_to_string(checkpoint_path).unwrap(),
+            &session.job_id,
+            &session.worker_run_id,
+            request_digest,
+        )
+        .unwrap();
+        assert_eq!(stored, ledger.committed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn t2_owned_retry_uses_original_allowance_and_preserves_between_attempt_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("cake-owned-retry-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut operation = request(SpeedtestDirection::Both);
+        operation.traffic_budget = 100_u64.into();
+        let worker = "a".repeat(32);
+        let digest = super::super::autotune_apply::native_apply_sha256_hex(
+            operation.encode().unwrap().as_bytes(),
+        );
+        let snapshot = |bytes| OwnedTrafficSnapshot {
+            backend: SpeedtestTrafficCounters {
+                rx_bytes: bytes,
+                tx_bytes: 0,
+            },
+            probes: SpeedtestTrafficCounters {
+                rx_bytes: 0,
+                tx_bytes: 0,
+            },
+        };
+        let origin = OwnedTrafficCheckpoint {
+            sequence: 0,
+            counters: snapshot(0),
+        };
+        let path = root.join("checkpoint");
+        origin
+            .publish_bound(&path, &operation.identity.job_id, &worker, &digest)
+            .unwrap();
+        let session = EmbeddedSpeedtestSession {
+            route_pin: NftRoutePin {
+                table: None,
+                owner: None,
+                cleanup_on_drop: false,
+            },
+            probe_pin: None,
+            credentials: BackendCredentials {
+                uid: 32769,
+                gid: 32770,
+            },
+            job_id: operation.identity.job_id.clone(),
+            worker_run_id: worker,
+            route_fingerprint: operation.identity.route_fingerprint.clone(),
+            route: operation.route.clone(),
+            backend: operation.backend.clone(),
+            requested_server_id: operation.speedtest_server_id,
+            authorized_traffic_budget: 100_u64.into(),
+            traffic_policy_explicit: true,
+            selected_server_id: None,
+            server_qualified: false,
+            qualified_raw_capacity: None,
+            selected_endpoint_sha256: None,
+            owned_checkpoint: Some((path, digest)),
+            owned_ledger: Some(std::cell::Cell::new(
+                OwnedTrafficLedger::from_verified_checkpoint(100_u64.into(), origin).unwrap(),
+            )),
+        };
+        let mut readings = [snapshot(10), snapshot(40), snapshot(50), snapshot(70)].into_iter();
+        let mut calls = 0;
+        let mut remaining = 100_u64.into();
+        let mut debits = Vec::with_capacity(3);
+        let outcome = retry_budgeted_session_measurement_with_debit(
+            &session,
+            &operation,
+            &mut remaining,
+            10,
+            || Ok(readings.next().unwrap()),
+            |available| {
+                calls += 1;
+                assert_eq!(
+                    available.limit_bytes(),
+                    Some(if calls == 1 { 90 } else { 50 })
+                );
+                if calls == 1 {
+                    Err("speedtest-route-not-ready".into())
+                } else {
+                    Ok(())
+                }
+            },
+            &mut |debit| {
+                debits.push(debit);
+                Ok(())
+            },
+        );
+        outcome.unwrap();
+        assert_eq!(remaining.limit_bytes(), Some(30));
+        assert_eq!(
+            debits.iter().map(|d| d.rx_bytes + d.tx_bytes).sum::<u64>(),
+            70
+        );
+        assert!(debits.iter().all(|d| !d.lifecycle));
+        let error = retry_budgeted_session_measurement_with_debit::<()>(
+            &session,
+            &operation,
+            &mut remaining,
+            10,
+            || Ok(snapshot(95)),
+            |_| panic!("insufficient observed remainder must refuse load"),
+            &mut |debit| {
+                debits.push(debit);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, SPEEDTEST_TRAFFIC_BUDGET_EXHAUSTED);
+        assert_eq!(remaining.limit_bytes(), Some(5));
+        assert!(debits.last().unwrap().lifecycle);
+        assert_eq!(debits.last().unwrap().rx_bytes, 25);
+        let mut reset_readings = [snapshot(99), snapshot(98)].into_iter();
+        assert!(retry_budgeted_session_measurement_with_debit(
+            &session,
+            &operation,
+            &mut remaining,
+            1,
+            || Ok(reset_readings.next().unwrap()),
+            |_| Ok(()),
+            &mut |_| panic!("within-attempt reset must not be committed")
+        )
+        .is_err());
+        let poisoned = session.owned_ledger.as_ref().unwrap().get();
+        assert!(poisoned.remaining().is_err());
+        assert_eq!(poisoned.committed.counters.total_bytes().unwrap(), 95);
+        // A capture wait has no backend retry transaction to poison the
+        // ledger on its behalf. Missing counters must still invalidate it.
+        session.owned_ledger.as_ref().unwrap().set(
+            OwnedTrafficLedger::from_verified_checkpoint(100_u64.into(), poisoned.committed)
+                .unwrap(),
+        );
+        let mut wait_watch = OwnedBudgetWatch {
+            backend: &session.route_pin,
+            probes: &session.route_pin,
+            limit: 100_u64.into(),
+            previous: poisoned.committed.counters,
+        };
+        assert!(wait_watch
+            .check_wait(&session)
+            .unwrap_err()
+            .starts_with("speedtest-owned-budget-observation-failed:"));
+        assert!(session
+            .owned_ledger
+            .as_ref()
+            .unwrap()
+            .get()
+            .remaining()
+            .is_err());
+        // The real backend may exit zero after a route switch (server list
+        // with timeout entries). A final accounting fault must override that
+        // success even when the byte allowance is unlimited.
+        for authority in [
+            100_u64.into(),
+            super::super::protocol::TrafficPolicy::Unlimited,
+        ] {
+            session.owned_ledger.as_ref().unwrap().set(
+                OwnedTrafficLedger::from_verified_checkpoint(authority, poisoned.committed)
+                    .unwrap(),
+            );
+            let mut remaining = authority;
+            let reads = Cell::new(0);
+            let attempts = Cell::new(0);
+            let error = retry_budgeted_session_measurement_with_debit(
+                &session,
+                &operation,
+                &mut remaining,
+                1,
+                || {
+                    reads.set(reads.get() + 1);
+                    if reads.get() == 1 {
+                        Ok(poisoned.committed.counters)
+                    } else {
+                        Err("speedtest-accounting-flow-registration-failed".into())
+                    }
+                },
+                |_| {
+                    attempts.set(attempts.get() + 1);
+                    Ok(())
+                },
+                &mut |_| panic!("faulted successful backend must not publish a debit"),
+            )
+            .unwrap_err();
+            assert_eq!(error, "speedtest-accounting-flow-registration-failed");
+            assert_eq!(reads.get(), 2);
+            assert_eq!(attempts.get(), 1);
+            let ledger = session.owned_ledger.as_ref().unwrap().get();
+            assert!(ledger.remaining().is_err());
+            assert_eq!(ledger.committed, poisoned.committed);
+        }
+        drop(session);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn t2_public_accounting_method_requires_a_bound_private_checkpoint() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("cake-owned-label-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut operation = request(SpeedtestDirection::Both);
+        operation.traffic_policy_explicit = true;
+        let worker = "a".repeat(32);
+        assert!(verify_owned_accounting_checkpoint(&root, &operation, &worker).is_err());
+        let digest = super::super::autotune_apply::native_apply_sha256_hex(
+            operation.encode().unwrap().as_bytes(),
+        );
+        let zero = SpeedtestTrafficCounters {
+            rx_bytes: 0,
+            tx_bytes: 0,
+        };
+        let point = OwnedTrafficCheckpoint {
+            sequence: 0,
+            counters: OwnedTrafficSnapshot {
+                backend: zero,
+                probes: zero,
+            },
+        };
+        let path = root.join(format!("owned-traffic-checkpoint-{worker}"));
+        point
+            .publish_bound(&path, &operation.identity.job_id, &worker, &digest)
+            .unwrap();
+        assert_eq!(
+            verify_owned_accounting_checkpoint(&root, &operation, &worker).unwrap(),
+            (0, 0, 0)
+        );
+        let next = OwnedTrafficCheckpoint {
+            sequence: 1,
+            counters: OwnedTrafficSnapshot {
+                backend: SpeedtestTrafficCounters {
+                    rx_bytes: 7,
+                    tx_bytes: 2,
+                },
+                probes: SpeedtestTrafficCounters {
+                    rx_bytes: 2,
+                    tx_bytes: 1,
+                },
+            },
+        };
+        next.publish_bound(&path, &operation.identity.job_id, &worker, &digest)
+            .unwrap();
+        assert_eq!(
+            verify_owned_accounting_checkpoint(&root, &operation, &worker).unwrap(),
+            (1, 9, 3)
+        );
+        let staged = path.with_extension("owned-next");
+        super::super::autotune_apply_runtime::write_new_private_file(&staged, b"ambiguous")
+            .unwrap();
+        assert!(verify_owned_accounting_checkpoint(&root, &operation, &worker).is_err());
+        assert!(staged.exists());
+        fs::remove_file(staged).unwrap();
+        operation.traffic_budget = 1_000_000_u64.into();
+        assert!(verify_owned_accounting_checkpoint(&root, &operation, &worker).is_err());
+        assert!(verify_owned_accounting_checkpoint(&root, &operation, "../outside").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn t2_owned_debit_intent_precedes_append_and_refuses_ambiguous_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("cake-debit-intent-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let job = "a".repeat(32);
+        let worker = "b".repeat(32);
+        let digest = "c".repeat(64);
+        let zero = SpeedtestTrafficCounters {
+            rx_bytes: 0,
+            tx_bytes: 0,
+        };
+        let origin = OwnedTrafficCheckpoint {
+            sequence: 0,
+            counters: OwnedTrafficSnapshot {
+                backend: zero,
+                probes: zero,
+            },
+        };
+        let next = OwnedTrafficCheckpoint {
+            sequence: 1,
+            counters: OwnedTrafficSnapshot {
+                backend: SpeedtestTrafficCounters {
+                    rx_bytes: 70,
+                    tx_bytes: 30,
+                },
+                probes: SpeedtestTrafficCounters {
+                    rx_bytes: 7,
+                    tx_bytes: 3,
+                },
+            },
+        };
+        for fail in [false, true] {
+            let path = root.join(if fail { "failed" } else { "complete" });
+            origin.publish_bound(&path, &job, &worker, &digest).unwrap();
+            let intent = path.with_extension("owned-intent");
+            let result = next.commit_debit_with_intent(&path, &job, &worker, &digest, || {
+                let saved = fs::read_to_string(&intent).unwrap();
+                assert_eq!(
+                    OwnedTrafficCheckpoint::decode_bound(&saved, &job, &worker, &digest).unwrap(),
+                    next
+                );
+                if fail {
+                    Err("append-outcome-uncertain".into())
+                } else {
+                    Ok(())
+                }
+            });
+            let saved = OwnedTrafficCheckpoint::decode_bound(
+                &fs::read_to_string(&path).unwrap(),
+                &job,
+                &worker,
+                &digest,
+            )
+            .unwrap();
+            if fail {
+                assert_eq!(result.unwrap_err(), "append-outcome-uncertain");
+                assert_eq!(saved, origin);
+                assert!(intent.exists());
+                assert!(next
+                    .commit_debit_with_intent(&path, &job, &worker, &digest, || panic!(
+                        "uncertain debit must never be appended twice"
+                    ))
+                    .is_err());
+                assert!(intent.exists());
+            } else {
+                result.unwrap();
+                assert_eq!(saved, next);
+                assert!(!intent.exists());
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn t2_owned_traffic_checkpoint_is_identity_bound_and_refuses_lost_origin() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("cake-owned-point-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("checkpoint");
+        let (job, worker, request) = ("a".repeat(32), "b".repeat(32), "c".repeat(64));
+        let zero = OwnedTrafficCheckpoint {
+            sequence: 0,
+            counters: OwnedTrafficSnapshot {
+                backend: SpeedtestTrafficCounters {
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                },
+                probes: SpeedtestTrafficCounters {
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                },
+            },
+        };
+        let mut first = zero;
+        first.sequence = 1;
+        first.counters.backend.rx_bytes = 100;
+        assert!(first.publish_bound(&path, &job, &worker, &request).is_err());
+        assert!(!path.exists());
+        zero.publish_bound(&path, &job, &worker, &request).unwrap();
+        first.publish_bound(&path, &job, &worker, &request).unwrap();
+        first.publish_bound(&path, &job, &worker, &request).unwrap();
+        let bytes = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            OwnedTrafficCheckpoint::decode_bound(&bytes, &job, &worker, &request).unwrap(),
+            first
+        );
+        assert!(
+            OwnedTrafficCheckpoint::decode_bound(&bytes, &"d".repeat(32), &worker, &request)
+                .is_err()
+        );
+        assert!(
+            OwnedTrafficCheckpoint::decode_bound(&bytes, &job, &"d".repeat(32), &request).is_err()
+        );
+        assert!(
+            OwnedTrafficCheckpoint::decode_bound(&bytes, &job, &worker, &"d".repeat(64)).is_err()
+        );
+        assert!(OwnedTrafficCheckpoint::decode_bound(
+            &bytes.replace("100", "101"),
+            &job,
+            &worker,
+            &request
+        )
+        .is_err());
+        let mut skipped = first;
+        skipped.sequence = 3;
+        skipped.counters.backend.rx_bytes = 200;
+        assert!(skipped
+            .publish_bound(&path, &job, &worker, &request)
+            .is_err());
+        let mut reset = first;
+        reset.sequence = 2;
+        reset.counters.backend.rx_bytes = 99;
+        reset.counters.probes.rx_bytes = 1000;
+        assert!(reset.publish_bound(&path, &job, &worker, &request).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), bytes);
+        let staged = path.with_extension("owned-next");
+        super::super::autotune_apply_runtime::write_new_private_file(&staged, bytes.as_bytes())
+            .unwrap();
+        assert!(first.publish_bound(&path, &job, &worker, &request).is_err());
+        assert_eq!(
+            fs::read_to_string(&staged).unwrap(),
+            bytes,
+            "an ambiguous staged write must not be silently discarded"
+        );
+        fs::remove_file(staged).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert!(first.publish_bound(&path, &job, &worker, &request).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn t2_whole_job_ledger_preserves_idle_retries_tail_and_uncertain_writes() {
+        let counters = |rx, tx, probe_rx, probe_tx| OwnedTrafficSnapshot {
+            backend: SpeedtestTrafficCounters {
+                rx_bytes: rx,
+                tx_bytes: tx,
+            },
+            probes: SpeedtestTrafficCounters {
+                rx_bytes: probe_rx,
+                tx_bytes: probe_tx,
+            },
+        };
+        let zero = OwnedTrafficCheckpoint {
+            sequence: 0,
+            counters: counters(0, 0, 0, 0),
+        };
+        let mut ledger =
+            OwnedTrafficLedger::from_verified_checkpoint(100_u64.into(), zero).unwrap();
+        let mut persisted = Vec::with_capacity(4);
+        for snapshot in [
+            counters(0, 0, 10, 5),
+            counters(50, 20, 12, 8),
+            counters(80, 40, 20, 10),
+            counters(90, 40, 25, 15),
+        ] {
+            let exceeded = ledger
+                .checkpoint(snapshot, |point, debit| {
+                    persisted.push((point, debit));
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(exceeded, snapshot.total_bytes().unwrap() > 100);
+        }
+        assert_eq!(
+            persisted
+                .iter()
+                .map(|(_, d)| d.rx_bytes + d.tx_bytes)
+                .sum::<u64>(),
+            170
+        );
+        assert_eq!(ledger.remaining().unwrap(), 0_u64.into());
+        assert_eq!(persisted.last().unwrap().0.sequence, 4);
+        assert!(ledger
+            .checkpoint(ledger.committed.counters, |_, _| panic!(
+                "identical snapshot must not charge twice"
+            ))
+            .unwrap());
+        let recovered =
+            OwnedTrafficLedger::from_verified_checkpoint(100_u64.into(), ledger.committed).unwrap();
+        assert_eq!(recovered.remaining().unwrap(), ledger.remaining().unwrap());
+
+        let mut unlimited = OwnedTrafficLedger::from_verified_checkpoint(
+            super::super::protocol::TrafficPolicy::Unlimited,
+            zero,
+        )
+        .unwrap();
+        let large = counters(40_000_000_000, 30_000_000_000, 100, 50);
+        assert!(!unlimited.checkpoint(large, |_, _| Ok(())).unwrap());
+        assert_eq!(
+            unlimited.remaining().unwrap(),
+            super::super::protocol::TrafficPolicy::Unlimited
+        );
+        assert_eq!(
+            unlimited.committed.counters.total_bytes().unwrap(),
+            70_000_000_150
+        );
+
+        let mut uncertain =
+            OwnedTrafficLedger::from_verified_checkpoint(100_u64.into(), zero).unwrap();
+        let mut durable = None;
+        assert!(uncertain
+            .checkpoint(counters(20, 0, 0, 0), |point, _| {
+                durable = Some(point);
+                Err("append acknowledgement lost".into())
+            })
+            .is_err());
+        assert!(uncertain.remaining().is_err());
+        assert!(uncertain
+            .checkpoint(counters(20, 0, 0, 0), |_, _| panic!(
+                "ambiguous append must not be duplicated"
+            ))
+            .is_err());
+        let mut restored =
+            OwnedTrafficLedger::from_verified_checkpoint(100_u64.into(), durable.unwrap()).unwrap();
+        restored
+            .checkpoint(counters(25, 0, 0, 0), |_, debit| {
+                assert_eq!(debit.rx_bytes, 5);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(restored.remaining().unwrap(), 75_u64.into());
+        assert!(restored
+            .checkpoint(counters(24, 0, 50, 0), |_, _| panic!(
+                "masked reset must not persist"
+            ))
+            .is_err());
+        assert!(restored.remaining().is_err());
+    }
+
+    #[test]
+    fn t2_owned_traffic_snapshots_keep_all_four_counters_independent() {
+        let snapshot = |rx, tx, probe_rx, probe_tx| OwnedTrafficSnapshot {
+            backend: SpeedtestTrafficCounters {
+                rx_bytes: rx,
+                tx_bytes: tx,
+            },
+            probes: SpeedtestTrafficCounters {
+                rx_bytes: probe_rx,
+                tx_bytes: probe_tx,
+            },
+        };
+        let zero = snapshot(0, 0, 0, 0);
+        let idle = snapshot(0, 0, 100, 50);
+        let load = snapshot(10000, 2000, 200, 100);
+        let tail = snapshot(10020, 2030, 220, 110);
+        let mut charged = 0;
+        for (previous, current) in [(zero, idle), (idle, load), (load, tail)] {
+            let debit = current.delta_since(previous).unwrap();
+            charged += debit.rx_bytes + debit.tx_bytes;
+        }
+        assert_eq!(charged, tail.total_bytes().unwrap());
+        assert_eq!(charged, 12380);
+        assert_eq!(
+            tail.delta_since(tail).unwrap(),
+            SpeedtestTrafficDebit {
+                lifecycle: false,
+                rx_bytes: 0,
+                tx_bytes: 0
+            }
+        );
+        for reset in [
+            snapshot(9999, 3000, 5000, 5000),
+            snapshot(20000, 1999, 5000, 5000),
+            snapshot(20000, 3000, 199, 5000),
+            snapshot(20000, 3000, 5000, 99),
+        ] {
+            assert!(reset.total_bytes().unwrap() > load.total_bytes().unwrap());
+            assert!(reset.delta_since(load).is_err());
+        }
+        let overflow = snapshot(u64::MAX, 1, 0, 0);
+        assert!(overflow.total_bytes().is_err());
+        assert!(overflow.delta_since(zero).is_err());
+        assert_eq!(
+            load.backend.rx_bytes, 10000,
+            "probe debit must not become backend goodput"
+        );
+    }
+
+    #[test]
+    fn t2_live_counter_read_requires_positive_absence_evidence() {
+        let table = "cake_st_aaaaaaaaaaaa_bbbbbbbbbbbb";
+        let owner = "cake-autorate-speedtest:test-owner";
+        let present =
+            format!(r#"{{"nftables":[{{"table":{{"family":"inet","name":"{table}"}}}}]}}"#)
+                .into_bytes();
+        for (success, snapshot, absent) in [
+            (true, present, false),
+            (true, br#"{"nftables":[]}"#.to_vec(), true),
+            (false, br#"{"nftables":[]}"#.to_vec(), false),
+            (true, b"{}".to_vec(), false),
+            (true, br#"{"nftables":[],"nftables":[]}"#.to_vec(), false),
+        ] {
+            let mut calls = 0;
+            let result = read_live_named_traffic_counters_with(table, owner, |arguments| {
+                calls += 1;
+                if calls == 1 {
+                    assert_eq!(arguments, nft_table_snapshot_arguments(table));
+                    Ok((false, Vec::new()))
+                } else {
+                    assert_eq!(arguments, ["-j", "list", "tables"]);
+                    Ok((success, snapshot.clone()))
+                }
+            });
+            assert_eq!(calls, 2);
+            if absent {
+                assert!(result.unwrap().is_none());
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        let mut calls = 0;
+        let error = read_live_named_traffic_counters_with(table, owner, |_| {
+            calls += 1;
+            Err("cancelled".to_string())
+        })
+        .unwrap_err();
+        assert_eq!(error, "cancelled");
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn t2_mwan3_environment_and_route_pin_are_strict_and_identity_owned() {
         let environment = "Running exec\nDEVICE=eth0\nSRCIP=192.0.2.1\nFWMARK=0x3f00\n";
         assert_eq!(
             unique_environment_value(environment, "FWMARK").unwrap(),
@@ -4172,22 +7959,210 @@ Upload: 766.6 Mbps (Used: 975.34MB)
         assert_eq!(table, "cake_st_aaaaaaaaaaaa_bbbbbbbbbbbb");
         let batch = nft_route_pin_batch(&table, &owner, 32769, Some((!0x3f00, 0x200)));
         assert!(batch.starts_with("{\"nftables\":["));
-        assert!(batch.contains("\"type\":\"route\",\"hook\":\"output\",\"prio\":-148"));
-        assert!(batch.contains("\"type\":\"filter\",\"hook\":\"input\",\"prio\":-148"));
-        assert!(batch.contains("\"name\":\"rx\""));
-        assert!(batch.contains("\"name\":\"tx\""));
-        assert!(batch.contains("{\"counter\":\"rx\"}"));
-        assert!(batch.contains("{\"counter\":\"tx\"}"));
-        assert!(batch.contains("\"right\":32769"));
-        assert!(batch.contains("4294951167"));
-        assert!(batch.contains("]},512]"));
-        assert!(batch.ends_with("{\"counter\":\"rx\"}]}}}]}\n"));
-        assert_eq!(batch.matches(&owner).count(), 3);
+        let parsed: serde_json::Value = serde_json::from_str(&batch).unwrap();
+        let commands = parsed["nftables"].as_array().unwrap();
+        assert_eq!(commands[0]["create"]["table"]["comment"], owner);
+        assert_eq!(commands[1]["add"]["set"]["size"], MAX_ACCOUNTING_FLOWS);
+        assert!(commands[1]["add"]["set"].get("timeout").is_none());
+        for (entry, name) in commands[2..5].iter().zip(["rx", "tx", "flow_fault"]) {
+            assert_eq!(entry["add"]["counter"]["name"], name);
+            assert_eq!(
+                entry["add"]["counter"]["comment"],
+                format!("{owner}{FLOW_ACCOUNTING_OWNER_SUFFIX}")
+            );
+        }
+        for (entry, hook, kind) in [
+            (&commands[5], "output", "route"),
+            (&commands[6], "input", "filter"),
+        ] {
+            assert_eq!(entry["add"]["chain"]["hook"], hook);
+            assert_eq!(entry["add"]["chain"]["type"], kind);
+            assert_eq!(entry["add"]["chain"]["prio"], -148);
+        }
+        let rules: Vec<_> = commands
+            .iter()
+            .filter(|command| {
+                command["add"].get("rule").is_some() && !command.to_string().contains("owned_dns6")
+            })
+            .collect();
+        assert_eq!(rules.len(), 5);
+        assert_eq!(
+            rules[0]["add"]["rule"]["expr"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["set"]["op"],
+            "update"
+        );
+        assert_eq!(
+            rules[1]["add"]["rule"]["expr"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["set"]["op"],
+            "delete"
+        );
+        let transmit = rules[2]["add"]["rule"]["expr"].as_array().unwrap();
+        let mark = transmit
+            .iter()
+            .find(|value| value.get("mangle").is_some())
+            .unwrap();
+        assert_eq!(mark["mangle"]["value"]["|"][0]["&"][1], !0x3f00_u32);
+        assert_eq!(mark["mangle"]["value"]["|"][1], 0x200);
+        let fallback = rules[3]["add"]["rule"]["expr"].as_array().unwrap();
+        assert_eq!(fallback.len(), 3);
+        assert_eq!(fallback[0]["match"]["left"]["meta"]["key"], "skuid");
+        assert_eq!(fallback[0]["match"]["right"], 32769);
+        assert_eq!(fallback[1]["counter"], "flow_fault");
+        assert!(fallback[2].get("drop").is_some());
+        assert_eq!(rules[4]["add"]["rule"]["chain"], "input");
+        assert!(!rules[4].to_string().contains("skuid"));
         let accounting_only = nft_route_pin_batch(&table, &owner, 32769, None);
         assert!(!accounting_only.contains("\"mangle\""));
         assert!(accounting_only.contains("{\"counter\":\"rx\"}"));
         assert!(accounting_only.contains("{\"counter\":\"tx\"}"));
         assert!(route_pin_table_name("not-hex", &run_id).is_err());
+    }
+
+    #[test]
+    fn t2_cutoff_batch_detaches_only_exact_private_chains_without_resetting_counters() {
+        let job = "a".repeat(32);
+        let worker = "b".repeat(32);
+        let batch = nft_owned_cutoff_batch(&job, &worker).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&batch).unwrap();
+        let commands = value["nftables"].as_array().unwrap();
+        assert_eq!(commands.len(), 4);
+        for (index, command) in commands.iter().enumerate() {
+            let table = if index < 2 {
+                route_pin_table_name(&job, &worker).unwrap()
+            } else {
+                probe_pin_identity(&job, &worker).unwrap().0
+            };
+            assert_eq!(
+                *command,
+                serde_json::json!({"flush":{"chain":{
+                    "family":"inet", "table":table,
+                    "name":if index % 2 == 0 { "output" } else { "input" }
+                }}})
+            );
+        }
+        assert!(!batch.contains("counter"));
+        assert!(!batch.contains("delete"));
+        assert!(nft_owned_cutoff_batch("bad", &worker).is_err());
+    }
+
+    #[test]
+    fn t2_flow_accounting_export_exact_production_rules_for_kernel_fixture() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(directory) = std::env::var_os("CAKE_T2_NFT_BATCH_DIR") else {
+            return;
+        };
+        let directory = PathBuf::from(directory);
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        super::super::autotune_apply_runtime::write_new_private_file(
+            &directory.join("cutoff.json"),
+            nft_owned_cutoff_batch(&"a".repeat(32), &"b".repeat(32))
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        let table = route_pin_table_name(&"a".repeat(32), &"b".repeat(32)).unwrap();
+        let owner = route_pin_owner(&"a".repeat(32), &"b".repeat(32)).unwrap();
+        let mut query = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join("query.json"))
+            .unwrap();
+        query
+            .write_all(
+                serde_json::to_string(&nft_table_snapshot_arguments(&table))
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap();
+        // UID0 is solely for the one-ID isolated user namespace fixture.
+        // Production credentials already reject UID0 before this renderer.
+        for (name, mark) in [("main.json", None), ("mwan3.json", Some((!0x3f00, 0x200)))] {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(directory.join(name))
+                .unwrap();
+            file.write_all(nft_route_pin_batch(&table, &owner, 0, mark).as_bytes())
+                .unwrap();
+        }
+        let (probe_table, probe_owner) =
+            probe_pin_identity(&"a".repeat(32), &"b".repeat(32)).unwrap();
+        // A separate kernel fixture can map its sole GID to42. These are the
+        // exact production root+GID predicates, not an allocated mark bit.
+        for (name, mark) in [
+            ("probe-main.json", None),
+            ("probe-mwan3.json", Some((!0x3f00, 0x200))),
+        ] {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(directory.join(name))
+                .unwrap();
+            file.write_all(
+                nft_owned_route_pin_batch(
+                    &probe_table,
+                    &probe_owner,
+                    NftSocketOwner::ProbeRootGid(42),
+                    mark,
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn t2_flow_counter_version_requires_fault_evidence_and_keeps_legacy_readable() {
+        use serde_json::json;
+        let table = route_pin_table_name(&"a".repeat(32), &"b".repeat(32)).unwrap();
+        let owner = route_pin_owner(&"a".repeat(32), &"b".repeat(32)).unwrap();
+        let counters = |counter_owner: &str| {
+            json!({"nftables":[
+                {"counter":{"family":"inet","table":table,"name":"rx","comment":counter_owner,"bytes":1200}},
+                {"counter":{"family":"inet","table":table,"name":"tx","comment":counter_owner,"bytes":300}}
+            ]})
+        };
+        let expected = SpeedtestTrafficCounters {
+            rx_bytes: 1200,
+            tx_bytes: 300,
+        };
+        assert_eq!(
+            parse_named_traffic_counters(&counters(&owner).to_string(), &table, &owner).unwrap(),
+            expected
+        );
+        let flow_owner = format!("{owner}{FLOW_ACCOUNTING_OWNER_SUFFIX}");
+        let mut current = counters(&flow_owner);
+        assert_eq!(
+            parse_named_traffic_counters(&current.to_string(), &table, &owner).unwrap_err(),
+            "speedtest-accounting-flow-fault-counter-missing"
+        );
+        current["nftables"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"counter":{
+            "family":"inet","table":table,"name":"flow_fault","comment":flow_owner,"bytes":0}}));
+        assert_eq!(
+            parse_named_traffic_counters(&current.to_string(), &table, &owner).unwrap(),
+            expected
+        );
+        current["nftables"][2]["counter"]["bytes"] = json!(1);
+        let error = parse_named_traffic_counters(&current.to_string(), &table, &owner).unwrap_err();
+        assert_eq!(error, "speedtest-accounting-flow-registration-failed");
+        assert!(!server_attempt_is_retryable(&error));
+        assert!(!completed_speedtest_output_is_unmeasurable(&error));
+        current["nftables"][2]["counter"]["bytes"] = json!(0);
+        current["nftables"][2]["counter"]["comment"] = json!(owner);
+        assert!(parse_named_traffic_counters(&current.to_string(), &table, &owner).is_err());
     }
 
     #[test]
@@ -4223,9 +8198,91 @@ Upload: 766.6 Mbps (Used: 975.34MB)
     }
 
     #[test]
+    fn r6_route_mask_drift_is_rejected_before_traffic() {
+        let mut request = request(SpeedtestDirection::Both);
+        request.route.mode = OperationRouteMode::Mwan3;
+        request.route.mwan3_member = Some("wan".to_string());
+        request.route.fwmark = Some(0x100);
+        request.route.routing_table = Some(1);
+        request.route.fwmark_mask = Some(0x3f00);
+        let environment = format!(
+            "DEVICE={}\nSRCIP={}\nFWMARK=0x3f00\n",
+            request.route.l3_device,
+            request.route.source_ip.unwrap()
+        );
+        assert_eq!(
+            validate_mwan3_environment(&request, &environment).unwrap(),
+            0x3f00
+        );
+        for changed in [
+            environment.replace("0x3f00", "0xff00"),
+            environment.replace("0x3f00", "0x0"),
+            environment.replace("0x3f00", "garbage"),
+            format!("{environment}FWMARK=0x3f00\n"),
+            environment.replace("FWMARK=0x3f00\n", ""),
+        ] {
+            assert!(validate_mwan3_environment(&request, &changed).is_err());
+        }
+        let mut actual = RouteIdentity {
+            device_ifindex: None,
+            mode: "mwan3".to_string(),
+            member: "wan".to_string(),
+            device: request.route.l3_device.clone(),
+            source_ip: request.route.source_ip.unwrap().to_string(),
+            fwmark: "0x100".to_string(),
+            table: "1".to_string(),
+            fwmark_mask: Some(0x3f00),
+        };
+        assert!(route_matches_request(&request, &actual).is_ok());
+        let original_key = actual.stable_key();
+        actual.fwmark_mask = Some(0xff00);
+        assert_ne!(original_key, actual.stable_key());
+        assert!(route_matches_request(&request, &actual).is_err());
+        actual.fwmark_mask = None;
+        assert!(route_matches_request(&request, &actual).is_err());
+        // Legacy requests did not carry a mask; preserve their wire contract.
+        request.route.fwmark_mask = None;
+        assert!(route_matches_request(&request, &actual).is_ok());
+    }
+
+    #[test]
+    fn r6_explicit_backend_mark_and_link_never_use_mwan3_or_unmarked_fallback() {
+        let mut request = request(SpeedtestDirection::Both);
+        let live = RouteIdentity {
+            device_ifindex: Some(42),
+            fwmark_mask: Some(0x3f00),
+            mode: "explicit".into(),
+            member: String::new(),
+            device: "pppoe-wan".into(),
+            source_ip: "192.0.2.1".into(),
+            fwmark: "0x100".into(),
+            table: "101".into(),
+        };
+        request.route = super::super::autotune_request::operation_route_identity(&live).unwrap();
+        assert_eq!(
+            selected_route_mark(&request, || panic!("explicit cannot consult mwan3")).unwrap(),
+            Some((!0x3f00, 0x100))
+        );
+        assert!(route_matches_request(&request, &live).is_ok());
+        let mut changed = live.clone();
+        changed.device_ifindex = Some(43);
+        assert!(route_matches_request(&request, &changed).is_err());
+        changed = live;
+        changed.fwmark_mask = Some(0xff00);
+        assert!(route_matches_request(&request, &changed).is_err());
+        request.route.fwmark_mask = None;
+        assert!(selected_route_mark(&request, || panic!("no fallback")).is_err());
+        request.route.fwmark_mask = Some(0x3f00);
+        request.route.fwmark = Some(0x4000);
+        assert!(selected_route_mark(&request, || panic!("no fallback")).is_err());
+    }
+
+    #[test]
     fn route_identity_must_match_structured_request() {
         let request = request(SpeedtestDirection::Both);
         let actual = RouteIdentity {
+            device_ifindex: None,
+            fwmark_mask: None,
             mode: "main".to_string(),
             member: String::new(),
             device: "pppoe-wan".to_string(),
@@ -4245,6 +8302,8 @@ Upload: 766.6 Mbps (Used: 975.34MB)
         let pauses = Cell::new(0usize);
         let expected = RouteSnapshot {
             identity: RouteIdentity {
+                device_ifindex: None,
+                fwmark_mask: None,
                 mode: "mwan3".to_string(),
                 member: "wan".to_string(),
                 device: "eth0".to_string(),
@@ -4333,6 +8392,8 @@ Upload: 766.6 Mbps (Used: 975.34MB)
         let pauses = Cell::new(0usize);
         let expected = RouteSnapshot {
             identity: RouteIdentity {
+                device_ifindex: None,
+                fwmark_mask: None,
                 mode: "mwan3".to_string(),
                 member: "wan".to_string(),
                 device: "eth0".to_string(),
@@ -4424,7 +8485,7 @@ Upload: 766.6 Mbps (Used: 975.34MB)
         let debit_count = Cell::new(0_u32);
         let debited_rx = Cell::new(0_u64);
         let debited_tx = Cell::new(0_u64);
-        let mut remaining = 10_000_u64;
+        let mut remaining = 10_000_u64.into();
         let result = retry_budgeted_route_measurement_on_loss_with_debit(
             &mut remaining,
             1,
@@ -4450,8 +8511,8 @@ Upload: 766.6 Mbps (Used: 975.34MB)
         .unwrap();
 
         assert_eq!(attempts.get(), 65);
-        assert_eq!(result, 8_080);
-        assert_eq!(remaining, 8_050);
+        assert_eq!(result.limit_bytes(), Some(8_080));
+        assert_eq!(remaining.limit_bytes(), Some(8_050));
         assert_eq!(debit_count.get(), 65);
         assert_eq!(debited_rx.get(), 650);
         assert_eq!(debited_tx.get(), 1_300);
@@ -4463,7 +8524,7 @@ Upload: 766.6 Mbps (Used: 975.34MB)
         let counters = Cell::new((1_000_u64, 2_000_u64));
         let debit_count = Cell::new(0_u32);
         let debited = Cell::new((0_u64, 0_u64));
-        let mut remaining = 10_000_u64;
+        let mut remaining = 10_000_u64.into();
         let result = retry_budgeted_route_measurement_on_loss_with_debit(
             &mut remaining,
             1,
@@ -4489,8 +8550,8 @@ Upload: 766.6 Mbps (Used: 975.34MB)
         .unwrap();
 
         assert_eq!(attempts.get(), 2);
-        assert_eq!(result, 9_700);
-        assert_eq!(remaining, 9_400);
+        assert_eq!(result.limit_bytes(), Some(9_700));
+        assert_eq!(remaining.limit_bytes(), Some(9_400));
         assert_eq!(debit_count.get(), 2);
         assert_eq!(debited.get(), (200, 400));
     }
@@ -4500,7 +8561,7 @@ Upload: 766.6 Mbps (Used: 975.34MB)
         let attempts = Cell::new(0_u32);
         let counters = Cell::new((1_000_u64, 2_000_u64));
         let debit_count = Cell::new(0_u32);
-        let mut remaining = 10_000_u64;
+        let mut remaining = 10_000_u64.into();
         let error = retry_budgeted_route_measurement_on_loss_with_debit::<(), _, _>(
             &mut remaining,
             1,
@@ -4520,7 +8581,7 @@ Upload: 766.6 Mbps (Used: 975.34MB)
 
         assert_eq!(error, "speedtest-route-traffic-unproved");
         assert_eq!(attempts.get(), u32::from(MAX_UNPROVED_TRAFFIC_ATTEMPTS));
-        assert_eq!(remaining, 9_100);
+        assert_eq!(remaining.limit_bytes(), Some(9_100));
         assert_eq!(debit_count.get(), u32::from(MAX_UNPROVED_TRAFFIC_ATTEMPTS));
     }
 
@@ -4528,7 +8589,7 @@ Upload: 766.6 Mbps (Used: 975.34MB)
     fn readiness_loss_does_not_spend_the_unproved_traffic_retry_limit() {
         let attempts = Cell::new(0_u32);
         let counters = Cell::new((1_000_u64, 2_000_u64));
-        let mut remaining = 10_000_u64;
+        let mut remaining = 10_000_u64.into();
         let error = retry_budgeted_route_measurement_on_loss::<(), _, _>(
             &mut remaining,
             1,
@@ -4549,7 +8610,7 @@ Upload: 766.6 Mbps (Used: 975.34MB)
 
         assert_eq!(error, "speedtest-route-traffic-unproved");
         assert_eq!(attempts.get(), 5);
-        assert_eq!(remaining, 9_850);
+        assert_eq!(remaining.limit_bytes(), Some(9_850));
     }
 
     #[test]
@@ -4557,7 +8618,7 @@ Upload: 766.6 Mbps (Used: 975.34MB)
         let counter_reads = Cell::new(0_u32);
         let attempts = Cell::new(0_u32);
         let debit_count = Cell::new(0_u32);
-        let mut remaining = 999_u64;
+        let mut remaining = 999_u64.into();
         let error = retry_budgeted_route_measurement_on_loss_with_debit::<(), _, _>(
             &mut remaining,
             1_000,
@@ -4577,7 +8638,7 @@ Upload: 766.6 Mbps (Used: 975.34MB)
         .unwrap_err();
 
         assert_eq!(error, SPEEDTEST_TRAFFIC_BUDGET_EXHAUSTED);
-        assert_eq!(remaining, 999);
+        assert_eq!(remaining.limit_bytes(), Some(999));
         assert_eq!(counter_reads.get(), 0);
         assert_eq!(attempts.get(), 0);
         assert_eq!(debit_count.get(), 0);
@@ -4588,7 +8649,7 @@ Upload: 766.6 Mbps (Used: 975.34MB)
         let counters = Cell::new((10_000_u64, 20_000_u64));
         let debit_count = Cell::new(0_u32);
         let debited = Cell::new((0_u64, 0_u64));
-        let mut remaining = 10_000_u64;
+        let mut remaining = 10_000_u64.into();
         let error = retry_budgeted_route_measurement_on_loss_with_debit::<(), _, _>(
             &mut remaining,
             1,
@@ -4606,41 +8667,76 @@ Upload: 766.6 Mbps (Used: 975.34MB)
         .unwrap_err();
 
         assert_eq!(error, SPEEDTEST_TRAFFIC_LIMIT_REACHED);
-        assert_eq!(remaining, 8_000);
+        assert_eq!(remaining.limit_bytes(), Some(8_000));
         assert_eq!(debit_count.get(), 1);
         assert_eq!(debited.get(), (1_500, 500));
     }
 
     #[test]
-    fn counter_overrun_keeps_accounting_fail_closed_without_callback() {
-        let counters = Cell::new((100_u64, 200_u64));
-        let debit_count = Cell::new(0_u32);
-        let mut remaining = 1_000_u64;
+    fn t2_zero_byte_fault_keeps_its_cause_without_empty_measurement_credit() {
+        let mut remaining = 1_000_u64.into();
+        let attempts = Cell::new(0_u32);
         let error = retry_budgeted_route_measurement_on_loss_with_debit::<(), _, _>(
             &mut remaining,
             1,
-            || Ok(counters.get()),
+            || Ok((100, 200)),
             |_| {
-                counters.set((900, 600));
-                Err(SPEEDTEST_TRAFFIC_LIMIT_REACHED.to_string())
+                attempts.set(attempts.get() + 1);
+                Err("speedtest-accounting-flow-registration-failed".into())
             },
-            &mut |_| {
-                debit_count.set(debit_count.get() + 1);
-                Ok(())
-            },
+            &mut |_| panic!("zero usage must not create a measurement debit"),
         )
         .unwrap_err();
+        assert_eq!(error, "speedtest-accounting-flow-registration-failed");
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(remaining.limit_bytes(), Some(1_000));
+    }
 
-        assert_eq!(error, "speedtest-traffic-budget-exceeded");
-        assert_eq!(remaining, 1_000);
-        assert_eq!(debit_count.get(), 0);
+    #[test]
+    fn t2_counter_overrun_is_debited_exactly_and_cannot_retry() {
+        for outcome in [
+            Ok(()),
+            Err(SPEEDTEST_TRAFFIC_LIMIT_REACHED.to_string()),
+            Err("speedtest-route-not-ready".to_string()),
+            Err("speedtest-route-traffic-unproved".to_string()),
+            Err("speedtest-cancelled".to_string()),
+            Err("speedtest-timeout".to_string()),
+        ] {
+            let counters = Cell::new((100_u64, 200_u64));
+            let attempts = Cell::new(0_u32);
+            let debit_count = Cell::new(0_u32);
+            let debited = Cell::new((0_u64, 0_u64));
+            let mut remaining = 1_000_u64.into();
+            let error = retry_budgeted_route_measurement_on_loss_with_debit::<(), _, _>(
+                &mut remaining,
+                1,
+                || Ok(counters.get()),
+                |_| {
+                    attempts.set(attempts.get() + 1);
+                    counters.set((900, 600));
+                    outcome.clone()
+                },
+                &mut |debit| {
+                    debit_count.set(debit_count.get() + 1);
+                    debited.set((debit.rx_bytes, debit.tx_bytes));
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+
+            assert_eq!(error, "speedtest-traffic-budget-exceeded");
+            assert_eq!(remaining.limit_bytes(), Some(0));
+            assert_eq!(debit_count.get(), 1);
+            assert_eq!(attempts.get(), 1);
+            assert_eq!(debited.get(), (800, 400));
+        }
     }
 
     #[test]
     fn traffic_debit_persistence_failure_stops_before_any_retry() {
         let attempts = Cell::new(0_u32);
         let counters = Cell::new((100_u64, 200_u64));
-        let mut remaining = 1_000_u64;
+        let mut remaining = 1_000_u64.into();
         let error = retry_budgeted_route_measurement_on_loss_with_debit(
             &mut remaining,
             1,
@@ -4655,14 +8751,14 @@ Upload: 766.6 Mbps (Used: 975.34MB)
         .unwrap_err();
         assert_eq!(error, "traffic-debit-persistence-failed");
         assert_eq!(attempts.get(), 1);
-        assert_eq!(remaining, 970);
+        assert_eq!(remaining.limit_bytes(), Some(970));
     }
 
     #[test]
     fn route_measurement_retry_keeps_static_errors_and_accounting_fail_closed() {
         let attempts = Cell::new(0_u32);
         let counters = Cell::new((100_u64, 200_u64));
-        let mut remaining = 1_000_u64;
+        let mut remaining = 1_000_u64.into();
         let error = retry_budgeted_route_measurement_on_loss::<(), _, _>(
             &mut remaining,
             1,
@@ -4676,10 +8772,10 @@ Upload: 766.6 Mbps (Used: 975.34MB)
         .unwrap_err();
         assert_eq!(error, "speedtest-route-identity-mismatch");
         assert_eq!(attempts.get(), 1);
-        assert_eq!(remaining, 980);
+        assert_eq!(remaining.limit_bytes(), Some(980));
 
         let reads = Cell::new(0_u32);
-        let mut remaining = 1_000_u64;
+        let mut remaining = 1_000_u64.into();
         let error = retry_budgeted_route_measurement_on_loss::<(), _, _>(
             &mut remaining,
             1,
@@ -4693,7 +8789,7 @@ Upload: 766.6 Mbps (Used: 975.34MB)
         .unwrap_err();
         assert_eq!(error, "speedtest-counter-reset");
         assert_eq!(reads.get(), 2);
-        assert_eq!(remaining, 1_000);
+        assert_eq!(remaining.limit_bytes(), Some(1_000));
     }
 
     #[test]

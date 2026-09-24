@@ -1,4 +1,5 @@
 'use strict';
+'require cake-autorate-rs.candidate as candidateGuard';
 'require fs';
 'require poll';
 'require uci';
@@ -37,7 +38,8 @@ function parseHistory(data) {
 		var fields, timestamp, rtt, cpu, dl, ul, transport, effective, dlFloor, ulFloor,
 			uplinkState, routeIdentity, grade, gradeState, gradeIncrease, ratingPhase,
 			ratingDlSamples, ratingUlSamples, adaptiveDlPhase, adaptiveUlPhase,
-			adaptiveDlReason, adaptiveUlReason, causalDlState, causalUlState, sqmRuntimeState;
+			adaptiveDlReason, adaptiveUlReason, causalDlState, causalUlState, sqmRuntimeState,
+			trafficKind, dlPeak, ulPeak, observedSeconds;
 
 		if (!line)
 			return;
@@ -70,6 +72,15 @@ function parseHistory(data) {
 		causalDlState = fields.length < 22 ? '' : fields[21];
 		causalUlState = fields.length < 23 ? '' : fields[22];
 		sqmRuntimeState = fields.length < 24 ? '' : fields[23];
+		trafficKind = fields.length <= 24 || fields[24] === '' ? 'instantaneous' :
+			(fields[24] === 'avg-v1' ? 'interval_average' : 'unknown');
+		dlPeak = fields.length < 28 || fields[25] === '' ? null : Number(fields[25]);
+		ulPeak = fields.length < 28 || fields[26] === '' ? null : Number(fields[26]);
+		observedSeconds = fields.length < 28 || fields[27] === '' ? null : Number(fields[27]);
+		if (trafficKind === 'unknown' || (trafficKind === 'interval_average' &&
+			(observedSeconds == null || !isFinite(observedSeconds) || observedSeconds <= 0))) {
+			dl = ul = dlPeak = ulPeak = observedSeconds = null;
+		}
 		if (!isFinite(timestamp) || timestamp <= 0)
 			return;
 
@@ -97,7 +108,11 @@ function parseHistory(data) {
 			adaptiveUlReason: adaptiveUlReason,
 			causalDlState: causalDlState,
 			causalUlState: causalUlState,
-			sqmRuntimeState: sqmRuntimeState
+			sqmRuntimeState: sqmRuntimeState,
+			trafficKind: trafficKind,
+			dlPeak: trafficKind !== 'interval_average' || dlPeak == null || !isFinite(dlPeak) || dlPeak < 0 ? null : dlPeak,
+			ulPeak: trafficKind !== 'interval_average' || ulPeak == null || !isFinite(ulPeak) || ulPeak < 0 ? null : ulPeak,
+			observedSeconds: trafficKind === 'interval_average' ? observedSeconds : null
 		});
 	});
 
@@ -310,7 +325,8 @@ function drawLine(ctx, geometry, valueKey, yFor, color, dashed) {
 			continue;
 		}
 
-		if (drawing && lineConnected(previous, point, geometry.interval))
+		if (drawing && lineConnected(previous, point, geometry.interval) &&
+			((valueKey !== 'dl' && valueKey !== 'ul') || previous.trafficKind === point.trafficKind))
 			ctx.lineTo(chartX(geometry, point.timestamp), yFor(value));
 		else
 			ctx.moveTo(chartX(geometry, point.timestamp), yFor(value));
@@ -751,6 +767,10 @@ function drawTrafficChart(canvas, geometry, showFloors) {
 			rateMax = Math.max(rateMax, point.dl);
 		if (point.ul != null && isFinite(point.ul))
 			rateMax = Math.max(rateMax, point.ul);
+		if (point.dlPeak != null && isFinite(point.dlPeak))
+			rateMax = Math.max(rateMax, point.dlPeak);
+		if (point.ulPeak != null && isFinite(point.ulPeak))
+			rateMax = Math.max(rateMax, point.ulPeak);
 		if (showFloors && point.dlFloor != null && isFinite(point.dlFloor))
 			rateMax = Math.max(rateMax, point.dlFloor);
 		if (showFloors && point.ulFloor != null && isFinite(point.ulFloor))
@@ -770,6 +790,8 @@ function drawTrafficChart(canvas, geometry, showFloors) {
 		return rateMax;
 	}
 
+	drawLine(ctx, geometry, 'dlPeak', rateY, '#7fb3d5', true);
+	drawLine(ctx, geometry, 'ulPeak', rateY, '#f5b041', true);
 	drawLine(ctx, geometry, 'dl', rateY, '#2980b9');
 	drawLine(ctx, geometry, 'ul', rateY, '#e67e22');
 	if (showFloors) {
@@ -917,6 +939,10 @@ function bindHover(canvas, geometry, hoverInfo) {
 			formatTrafficRate(point.ul),
 			formatTrafficRate(point.dlFloor),
 			formatTrafficRate(point.ulFloor));
+		hoverInfo.textContent += point.trafficKind === 'interval_average' ?
+			' · %s · %s s · DL/UL peak %s/%s'.format(_('Interval average'),
+				formatMetric(point.observedSeconds, '', 3), formatTrafficRate(point.dlPeak), formatTrafficRate(point.ulPeak)) :
+			' · ' + (point.trafficKind === 'unknown' ? _('Unknown traffic format') : _('Legacy instantaneous traffic sample'));
 		if (eventCluster)
 			hoverInfo.textContent += ' · %s: %s'.format(_('events'), eventCluster.label);
 		hoverInfo.style.visibility = 'visible';
@@ -1101,6 +1127,7 @@ function renderCard(instance) {
 					_('DL: %s').format(formatTrafficRate(status.dl_achieved_rate_kbps))),
 				E('span', { 'class': 'cake-graph-ul' },
 					_('UL: %s').format(formatTrafficRate(status.ul_achieved_rate_kbps))),
+				E('span', {}, _('Traffic history: solid = interval average, dashed = sampled peak. Older rows are instantaneous samples. RTT and CPU remain snapshots.')),
 				E('label', { 'class': 'cake-graph-floors' }, [
 					floorToggle,
 					E('span', {}, _('Show safety floors'))
@@ -1256,12 +1283,12 @@ return L.view.extend({
 	},
 
 	handleSave: function() {
-		return uci.save();
+		return candidateGuard.save([ 'cake-autorate' ]);
 	},
 
 	handleSaveApply: function(ev, mode) {
 		return this.handleSave(ev).then(function() {
-			return ui.changes.apply(mode == '0');
+			return candidateGuard.apply(function() { return ui.changes.apply(mode == '0'); }, [ 'cake-autorate' ]);
 		});
 	},
 

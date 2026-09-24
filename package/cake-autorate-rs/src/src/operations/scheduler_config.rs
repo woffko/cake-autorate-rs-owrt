@@ -85,11 +85,12 @@ impl ScheduledInstanceConfig {
         self.instance_enabled && self.scheduled_enabled
     }
 
-    pub fn launch_intent(&self, traffic_budget_bytes: u64) -> Result<AutotuneLaunchIntent, String> {
-        if traffic_budget_bytes == 0 || traffic_budget_bytes > MAX_OPERATION_TRAFFIC_BUDGET_BYTES {
+    pub fn launch_intent(&self, traffic_budget: u64) -> Result<AutotuneLaunchIntent, String> {
+        if traffic_budget == 0 || traffic_budget > MAX_OPERATION_TRAFFIC_BUDGET_BYTES {
             return Err("scheduled launch traffic budget is outside the exact range".to_string());
         }
         Ok(AutotuneLaunchIntent {
+            explicit_route: None,
             instance: self.instance.clone(),
             expected_target_interface: self.expected_target_interface.clone(),
             backend: self.backend.clone(),
@@ -105,7 +106,9 @@ impl ScheduledInstanceConfig {
             service_ul_cap_kbps: self.service_ul_cap_kbps,
             allow_sqm_disable: self.strategy == CalibrationStrategy::FullRaw,
             allow_active_traffic: false,
-            traffic_budget_bytes,
+            traffic_budget: traffic_budget.into(),
+            traffic_policy_explicit: true,
+            traffic_plan: None,
         })
     }
 }
@@ -505,7 +508,8 @@ mod tests {
         assert_eq!(config.backend, "speedtest-go");
         assert_eq!(config.profile, AutotuneProfile::VariableLink);
         let intent = config.launch_intent(123_456).unwrap();
-        assert_eq!(intent.traffic_budget_bytes, 123_456);
+        assert_eq!(intent.traffic_budget.limit_bytes(), Some(123_456));
+        assert!(intent.traffic_policy_explicit);
         assert!(intent.allow_sqm_disable);
         assert!(!intent.allow_active_traffic);
     }

@@ -8,7 +8,6 @@ use std::os::fd::{AsRawFd, OwnedFd};
 #[cfg(feature = "calibration")]
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
-#[cfg(test)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -21,14 +20,43 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod adaptive_ceiling;
 #[cfg(feature = "calibration")]
 mod autotune;
+mod config_candidate;
+mod config_fields;
+#[cfg(test)]
+mod config_tests;
+mod config_transfer;
+mod config_validation;
+#[cfg(test)]
+mod controller_tests;
+mod history_traffic;
+mod latency_baseline;
+mod logging;
 mod operations;
+// Shared Full/Lite ownership primitives; explicit PBR admission stays closed
+// until route reconciliation, recovery and accounting are wired.
+mod owned_route_rules;
+mod pinger_backend;
+mod transport_resolver;
+use pinger_backend::{PingerPlan, PingerTiming};
+mod pinger_binding;
+mod pinger_recovery;
+// Runtime tokens are retained through stop/join. Owner acquisition still waits
+// for full route-change, recovery and accounting admission.
+mod permanent_probe_owner;
+#[cfg(test)]
+mod pinger_tests;
+mod probe_owner;
+mod qdisc_capabilities;
 #[cfg(feature = "transport-probes")]
 mod quality_grade;
 mod rate_limits;
 #[cfg(feature = "transport-probes")]
 mod rating_load;
 mod reflector_defaults;
+#[cfg(any(feature = "transport-probes", test))]
+mod routed_dns;
 mod routing;
+mod sqm_config;
 #[cfg(feature = "transport-probes")]
 mod transport_probe;
 #[cfg(any(feature = "transport-probes", test))]
@@ -38,6 +66,7 @@ use adaptive_ceiling::{
     AdaptiveCeilingChange, AdaptiveCeilingDirection, AdaptiveCeilingObservation,
     AdaptiveCeilingPolicy, AdaptiveCeilingUpdate,
 };
+use logging::{LogFailureThrottle, LogFile};
 #[cfg(feature = "transport-probes")]
 use quality_grade::{QualityGradeMetric, QualityGradeResult, QualityGradeTracker};
 #[cfg(feature = "transport-probes")]
@@ -49,9 +78,9 @@ use routing::{RouteInspector, RouteSnapshot, RouteSpec, UplinkLifecycle, UplinkS
 use transport_probe::{RouteBinding, TransportProbeBackend, TransportProbeEngine};
 #[cfg(feature = "transport-probes")]
 use transport_quality::{
-    classify_quality, effective_latency_delta_ms, throughput_floor, transport_allows_growth,
+    classify_quality, effective_latency_delta_ms, throughput_floor, transport_evidence,
     QualityClass, QualitySearchDirection, QualitySearchPolicy, ThroughputGuardInput,
-    TransportLatencyTracker,
+    TransportEvidence, TransportLatencyTracker,
 };
 
 static TERMINATE: AtomicBool = AtomicBool::new(false);
@@ -79,7 +108,6 @@ const SQM_RUNTIME_STOP_OUTPUT_LIMIT: usize = 8 * 1024;
 
 extern "C" fn handle_signal(_: i32) {
     TERMINATE.store(true, Ordering::SeqCst);
-    #[cfg(feature = "calibration")]
     operations::event_loop::wake_from_signal();
 }
 
@@ -109,9 +137,14 @@ struct Config {
     ul_if: String,
     route_mode: String,
     mwan3_member: String,
+    explicit_route_authority: Option<routing::ExplicitRouteAuthority>,
+    explicit_dns_server: Option<std::net::Ipv4Addr>,
     #[cfg(feature = "calibration")]
     speedtest_backend: String,
     route_check_interval_s: f64,
+    external_ip_check_enabled: bool,
+    external_ip_check_interval_s: u64,
+    external_ip_check_url: String,
     rx_bytes_path: String,
     tx_bytes_path: String,
     adjust_dl_shaper_rate: bool,
@@ -302,9 +335,14 @@ impl Config {
             ul_if: "wan".to_string(),
             route_mode: "auto".to_string(),
             mwan3_member: String::new(),
+            explicit_route_authority: None,
+            explicit_dns_server: None,
             #[cfg(feature = "calibration")]
             speedtest_backend: "auto".to_string(),
             route_check_interval_s: 2.0,
+            external_ip_check_enabled: false,
+            external_ip_check_interval_s: 3600,
+            external_ip_check_url: "https://api.ipify.org".into(),
             rx_bytes_path: String::new(),
             tx_bytes_path: String::new(),
             adjust_dl_shaper_rate: true,
@@ -486,7 +524,6 @@ impl Config {
     }
 
     fn from_uci(instance: &str) -> Result<Self, String> {
-        let mut cfg = Self::defaults(instance.to_string());
         let query = format!("cake-autorate.{}", instance);
         let output = Command::new("uci")
             .arg("-q")
@@ -500,20 +537,47 @@ impl Config {
         }
 
         let data = String::from_utf8_lossy(&output.stdout);
+        let cfg = Self::from_uci_text(instance, &data)?;
+        Self::with_runtime_inputs(cfg, load_global_history_config()?)
+    }
+
+    /// Enrichment after pure parsing/admission. Frozen service input supplies
+    /// its own global history view and must never fall back to another UCI read.
+    fn with_runtime_inputs(mut cfg: Self, history: (Option<u64>, usize)) -> Result<Self, String> {
+        cfg.load_reflectors_url();
+        cfg.deduplicate_reflectors();
+        if cfg.randomize_reflectors {
+            randomize_reflectors(&mut cfg.reflectors);
+            #[cfg(feature = "calibration")]
+            randomize_reflectors(&mut cfg.irtt_servers);
+        }
+        #[cfg(feature = "calibration")]
+        if cfg.pinger_method == "irtt" {
+            cfg.reflectors = cfg.irtt_servers.clone();
+        }
+        let (history_budget_kib, history_instance_count) = history;
+        cfg.graph_history_ram_budget_kib = history_budget_kib;
+        cfg.graph_history_instance_count = history_instance_count;
+        cfg.refresh_wire_packet_sizes();
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Pure parsing boundary shared with candidate validation. No subprocess,
+    /// URL fetch, interface discovery, file writes or global UCI reads.
+    fn from_uci_text(instance: &str, data: &str) -> Result<Self, String> {
         let mut single: HashMap<String, String> = HashMap::new();
         let mut lists: HashMap<String, Vec<String>> = HashMap::new();
+        let prefix = format!("cake-autorate.{instance}.");
 
         for line in data.lines() {
             let Some((left, raw_value)) = line.split_once('=') else {
                 continue;
             };
-            let mut parts = left.split('.');
-            let _package = parts.next();
-            let _section = parts.next();
-            let Some(key) = parts.next() else {
+            let Some(key) = left.strip_prefix(&prefix) else {
                 continue;
             };
-            if parts.next().is_some() {
+            if key.is_empty() || key.contains('.') {
                 continue;
             }
             let values = parse_uci_values(raw_value);
@@ -522,6 +586,16 @@ impl Config {
                 lists.entry(key.to_string()).or_default().extend(values);
             }
         }
+
+        Self::from_uci_values(instance, &single, &lists)
+    }
+
+    fn from_uci_values(
+        instance: &str,
+        single: &HashMap<String, String>,
+        lists: &HashMap<String, Vec<String>>,
+    ) -> Result<Self, String> {
+        let mut cfg = Self::defaults(instance.to_string());
 
         set_bool(&single, "enabled", &mut cfg.enabled)?;
         set_bool(&single, "manage_sqm", &mut cfg.manage_sqm)?;
@@ -534,6 +608,23 @@ impl Config {
         set_string(&single, "ul_if", &mut cfg.ul_if);
         set_string(&single, "route_mode", &mut cfg.route_mode);
         set_string(&single, "mwan3_member", &mut cfg.mwan3_member);
+        cfg.explicit_dns_server = routing::explicit_dns_server(
+            &cfg.route_mode,
+            single
+                .get("route_dns_ipv4")
+                .map(String::as_str)
+                .unwrap_or_default(),
+        )?;
+        cfg.explicit_route_authority = routing::ExplicitRouteAuthority::from_fields(
+            &cfg.route_mode,
+            [
+                "route_source_ipv4",
+                "route_table",
+                "route_fwmark",
+                "route_fwmark_mask",
+            ]
+            .map(|name| single.get(name).map(String::as_str).unwrap_or_default()),
+        )?;
         #[cfg(feature = "calibration")]
         set_string(&single, "speedtest_backend", &mut cfg.speedtest_backend);
         set_f64(
@@ -541,6 +632,21 @@ impl Config {
             "route_check_interval_s",
             &mut cfg.route_check_interval_s,
         )?;
+        set_bool(
+            &single,
+            "external_ip_check_enabled",
+            &mut cfg.external_ip_check_enabled,
+        )?;
+        set_u64(
+            &single,
+            "external_ip_check_interval_s",
+            &mut cfg.external_ip_check_interval_s,
+        )?;
+        set_string(
+            &single,
+            "external_ip_check_url",
+            &mut cfg.external_ip_check_url,
+        );
         if single
             .get("auto_interface_preset")
             .map(|value| parse_bool(value).map_err(|e| format!("auto_interface_preset: {e}")))
@@ -1185,25 +1291,13 @@ impl Config {
             }
             deduplicate_list(&mut cfg.irtt_servers);
         }
-        cfg.load_reflectors_url();
         cfg.deduplicate_reflectors();
-        if cfg.randomize_reflectors {
-            randomize_reflectors(&mut cfg.reflectors);
-            #[cfg(feature = "calibration")]
-            randomize_reflectors(&mut cfg.irtt_servers);
-        }
         #[cfg(feature = "calibration")]
         if cfg.pinger_method == "irtt" {
             cfg.reflectors = cfg.irtt_servers.clone();
         }
-
-        let (history_budget_kib, history_instance_count) = load_global_history_config()?;
-        cfg.graph_history_ram_budget_kib = history_budget_kib;
-        cfg.graph_history_instance_count = history_instance_count;
-
         cfg.normalize_paths();
-        cfg.refresh_wire_packet_sizes();
-        cfg.validate()?;
+        config_validation::validate_core(&cfg)?;
         Ok(cfg)
     }
 
@@ -1257,13 +1351,34 @@ impl Config {
     }
 
     fn refresh_wire_packet_sizes(&mut self) {
-        self.dl_max_wire_packet_size_bits =
-            interface_max_wire_packet_size_bits(if self.download_shaping_enabled() {
-                &self.dl_if
-            } else {
-                &self.sqm_interface
-            });
-        self.ul_max_wire_packet_size_bits = interface_max_wire_packet_size_bits(&self.ul_if);
+        let dl_shaped =
+            self.download_shaping_enabled() && (self.manage_sqm || self.adjust_dl_shaper_rate);
+        let ul_shaped =
+            self.upload_shaping_enabled() && (self.manage_sqm || self.adjust_ul_shaper_rate);
+        for (cached, interface, shaped) in [
+            (
+                &mut self.dl_max_wire_packet_size_bits,
+                if dl_shaped {
+                    &self.dl_if
+                } else {
+                    &self.sqm_interface
+                },
+                dl_shaped,
+            ),
+            (
+                &mut self.ul_max_wire_packet_size_bits,
+                &self.ul_if,
+                ul_shaped,
+            ),
+        ] {
+            if let Some(bits) = interface_max_wire_packet_size_bits(interface, shaped) {
+                *cached = bits;
+            } else if *cached == 0 {
+                // Startup fallback only. A failed refresh must not erase a
+                // previously observed framing/MTU with guessed defaults.
+                *cached = 1500 * 8;
+            }
+        }
     }
 
     fn download_shaping_enabled(&self) -> bool {
@@ -1275,6 +1390,7 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), String> {
+        config_validation::validate_core(self)?;
         self.route_spec().validate()?;
         if !matches!(
             self.sqm_direction_mode.as_str(),
@@ -1290,6 +1406,10 @@ impl Config {
         if !(1.0..=60.0).contains(&self.route_check_interval_s) {
             return Err("route_check_interval_s must be between 1 and 60".to_string());
         }
+        if !(60..=604800).contains(&self.external_ip_check_interval_s) {
+            return Err("external_ip_check_interval_s must be between 60 and 604800".into());
+        }
+        routing::validate_external_ip_url(&self.external_ip_check_url)?;
         #[cfg(feature = "calibration")]
         if self.pinger_method != "fping"
             && self.pinger_method != "fping-ts"
@@ -1744,11 +1864,14 @@ impl Config {
         if self.dl_if == self.ul_if {
             return Err("dl_if and ul_if must be different".to_string());
         }
+        pinger_binding::configured_arguments(self)?;
         Ok(())
     }
 
     fn route_spec(&self) -> RouteSpec {
-        RouteSpec::new(&self.route_mode, &self.mwan3_member, &self.ul_if)
+        let mut spec = RouteSpec::new(&self.route_mode, &self.mwan3_member, &self.ul_if);
+        spec.explicit_authority = self.explicit_route_authority.clone();
+        spec
     }
 
     #[cfg(feature = "transport-probes")]
@@ -1841,9 +1964,10 @@ impl ReflectorState {
     }
 
     fn push_offence(&mut self, offence: bool) {
-        if self.offences.len() == self.offences.capacity()
-            && self.offences.pop_front().unwrap_or(false)
-        {
+        if self.offences.is_empty() {
+            return;
+        }
+        if self.offences.pop_front().unwrap_or(false) {
             self.offence_sum = self.offence_sum.saturating_sub(1);
         }
 
@@ -1856,6 +1980,7 @@ impl ReflectorState {
 
 #[derive(Clone, Debug)]
 struct ReflectorHealth {
+    timing: PingerTiming,
     states: HashMap<String, ReflectorState>,
     last_health_check: Instant,
     last_replacement: Instant,
@@ -1865,7 +1990,7 @@ struct ReflectorHealth {
 }
 
 impl ReflectorHealth {
-    fn new(cfg: &Config, active: &[String]) -> Self {
+    fn new(cfg: &Config, active: &[String], timing: PingerTiming) -> Self {
         let now = Instant::now();
         let mut states = HashMap::new();
 
@@ -1877,6 +2002,7 @@ impl ReflectorHealth {
         }
 
         Self {
+            timing,
             states,
             last_health_check: now,
             last_replacement: now,
@@ -1886,19 +2012,22 @@ impl ReflectorHealth {
         }
     }
 
-    fn observe_sample(&mut self, cfg: &Config, sample: &Sample) {
-        let now = Instant::now();
+    fn observe_sample(&mut self, cfg: &Config, sample: &Sample, observed_at: Instant) {
         let state = self
             .states
             .entry(sample.reflector.clone())
             .or_insert_with(|| {
-                ReflectorState::new(now, cfg.reflector_misbehaving_detection_window)
+                ReflectorState::new(observed_at, cfg.reflector_misbehaving_detection_window)
             });
-        state.last_seen = now;
+        state.last_seen = if state.samples == 0 {
+            observed_at
+        } else {
+            state.last_seen.max(observed_at)
+        };
         state.samples = state.samples.saturating_add(1);
         state.last_rtt_ms = sample.rtt_ms;
 
-        let late = sample.rtt_ms > cfg.reflector_response_deadline_s * 1000.0;
+        let late = sample.rtt_ms > self.timing.response_deadline.as_secs_f64() * 1000.0;
         if late {
             state.push_offence(true);
         }
@@ -2077,7 +2206,7 @@ impl ReflectorHealth {
         active: &mut [String],
         controller: &mut Controller,
     ) -> bool {
-        let deadline = Duration::from_secs_f64(cfg.reflector_response_deadline_s.max(0.1));
+        let deadline = self.timing.response_deadline;
         let now = Instant::now();
 
         for idx in 0..active.len() {
@@ -2092,8 +2221,8 @@ impl ReflectorHealth {
                 controller.log(
                     "DEBUG",
                     &format!(
-                        "no ping response from reflector {reflector} within reflector_response_deadline_s={}",
-                        cfg.reflector_response_deadline_s
+                        "no ping response from reflector {reflector} within effective response deadline={}s",
+                        deadline.as_secs_f64()
                     ),
                 );
             }
@@ -2128,7 +2257,7 @@ impl ReflectorHealth {
                 &format!("reflector {reflector} needs replacement ({reason}) but no spare reflector is configured"),
             );
             if let Some(state) = self.states.get_mut(&reflector) {
-                state.offences.clear();
+                state.offences = filled_bool_window(cfg.reflector_misbehaving_detection_window);
                 state.offence_sum = 0;
             }
             return false;
@@ -2138,6 +2267,8 @@ impl ReflectorHealth {
         let old = active[index].clone();
         active[index] = next.1.clone();
         self.last_replacement = Instant::now();
+        controller.baseline_warmup.remove(&old);
+        controller.baseline_warmup.remove(&next.1);
 
         if !cfg.retain_reflector_stats {
             controller.dl_baseline_us.remove(&old);
@@ -2202,11 +2333,8 @@ struct RateMonitor {
 struct RateSample {
     dl_kbps: f64,
     ul_kbps: f64,
-    #[cfg(feature = "transport-probes")]
     fresh: bool,
-    #[cfg(feature = "calibration")]
     dl_observed_at: Instant,
-    #[cfg(feature = "calibration")]
     ul_observed_at: Instant,
 }
 
@@ -2387,11 +2515,8 @@ impl RateMonitor {
             return Ok(RateSample {
                 dl_kbps: self.last_dl_kbps,
                 ul_kbps: self.last_ul_kbps,
-                #[cfg(feature = "transport-probes")]
                 fresh: false,
-                #[cfg(feature = "calibration")]
                 dl_observed_at: self.last,
-                #[cfg(feature = "calibration")]
                 ul_observed_at: self.last,
             });
         }
@@ -2408,11 +2533,8 @@ impl RateMonitor {
         Ok(RateSample {
             dl_kbps: dl,
             ul_kbps: ul,
-            #[cfg(feature = "transport-probes")]
             fresh: true,
-            #[cfg(feature = "calibration")]
             dl_observed_at: now,
-            #[cfg(feature = "calibration")]
             ul_observed_at: now,
         })
     }
@@ -2421,11 +2543,8 @@ impl RateMonitor {
         self.try_sample().unwrap_or(RateSample {
             dl_kbps: self.last_dl_kbps,
             ul_kbps: self.last_ul_kbps,
-            #[cfg(feature = "transport-probes")]
             fresh: false,
-            #[cfg(feature = "calibration")]
             dl_observed_at: self.last,
-            #[cfg(feature = "calibration")]
             ul_observed_at: self.last,
         })
     }
@@ -2615,6 +2734,11 @@ fn change_cake_rate(
     if interface.is_empty() || rate_kbps < 100 || rate_kbps > rate_limits::MAX_RATE_KBPS {
         return Err("requested CAKE rate is outside the supported range".to_string());
     }
+    let output = tc_output(&["qdisc", "show", "dev", interface])?;
+    let (observed_kind, handle) = root_cake_control_identity(&output)?;
+    if observed_kind != qdisc_kind {
+        return Err("root CAKE kind changed before bandwidth update".into());
+    }
     let tc = env::var("CAKE_AUTORATE_TC").unwrap_or_else(|_| "tc".to_string());
     let output = Command::new(&tc)
         .arg("qdisc")
@@ -2622,6 +2746,10 @@ fn change_cake_rate(
         .arg("root")
         .arg("dev")
         .arg(interface)
+        // A bare change can graft another kind. Nonzero handle plus kind makes
+        // a replacement/mismatch fail in the kernel instead of creating a qdisc.
+        .arg("handle")
+        .arg(handle)
         .arg(qdisc_kind.as_tc_kind())
         .arg("bandwidth")
         .arg(format!("{rate_kbps}Kbit"))
@@ -2639,6 +2767,34 @@ fn change_cake_rate(
     } else {
         stderr
     })
+}
+
+fn root_cake_control_identity(output: &str) -> Result<(CakeQdiscKind, String), String> {
+    let mut result = None;
+    for line in output.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.first() != Some(&"qdisc") || !fields.contains(&"root") {
+            continue;
+        }
+        if result.is_some() {
+            return Err("root qdisc identity is ambiguous".into());
+        }
+        let kind = match fields.get(1) {
+            Some(&"cake") => CakeQdiscKind::Cake,
+            Some(&"cake_mq") => CakeQdiscKind::CakeMq,
+            _ => return Err("configured control target is not a root CAKE qdisc".into()),
+        };
+        let (major, minor) = fields
+            .get(2)
+            .and_then(|value| value.split_once(':'))
+            .ok_or("root CAKE handle is missing")?;
+        let major = u16::from_str_radix(major, 16).map_err(|_| "root CAKE handle is invalid")?;
+        if major == 0 || !matches!(minor, "" | "0") {
+            return Err("root CAKE handle is not addressable".into());
+        }
+        result = Some((kind, format!("{major:x}:")));
+    }
+    result.ok_or_else(|| "root CAKE qdisc is missing".into())
 }
 
 #[cfg(feature = "calibration")]
@@ -2953,7 +3109,7 @@ fn attest_exclusive_sqm_ingress(
             {
                 return Err(SqmTopologyError::unsafe_state(
                     "download-ingress-not-exclusive",
-                    format!("ingress on {source_interface} contains a non-SQM action"),
+                    format!("ingress on {source_interface} contains a non-SQM action; native Auto-Tune cannot restore ctinfo/police or custom chains, unlike bandwidth-only manual control"),
                 ));
             }
             action_lines += 1;
@@ -2986,6 +3142,22 @@ fn inspect_sqm_topology_for(
     download_enabled: bool,
     upload_enabled: bool,
 ) -> Result<(), SqmTopologyError> {
+    inspect_controller_counters(cfg)?;
+
+    let dl_output = topology_direction_qdisc_output(&cfg.dl_if, download_enabled, "download")?;
+    attest_cake_direction(&dl_output, download_enabled, "download", &cfg.dl_if)?;
+    let ul_output = topology_direction_qdisc_output(&cfg.ul_if, upload_enabled, "upload")?;
+    attest_cake_direction(&ul_output, upload_enabled, "upload", &cfg.ul_if)?;
+
+    if cfg.dl_if.starts_with("ifb") {
+        let ingress =
+            topology_tc_output(&["filter", "show", "dev", &cfg.sqm_interface, "ingress"])?;
+        attest_download_redirect(&ingress, download_enabled, &cfg.sqm_interface, &cfg.dl_if)?;
+    }
+    Ok(())
+}
+
+fn inspect_controller_counters(cfg: &Config) -> Result<(), SqmTopologyError> {
     if !Path::new(&cfg.rx_bytes_path).is_file() {
         return Err(SqmTopologyError::settling(
             "download-counter-missing",
@@ -2999,15 +3171,28 @@ fn inspect_sqm_topology_for(
         ));
     }
 
-    let dl_output = topology_direction_qdisc_output(&cfg.dl_if, download_enabled, "download")?;
-    attest_cake_direction(&dl_output, download_enabled, "download", &cfg.dl_if)?;
-    let ul_output = topology_direction_qdisc_output(&cfg.ul_if, upload_enabled, "upload")?;
-    attest_cake_direction(&ul_output, upload_enabled, "upload", &cfg.ul_if)?;
+    Ok(())
+}
 
-    if cfg.dl_if.starts_with("ifb") {
-        let ingress =
-            topology_tc_output(&["filter", "show", "dev", &cfg.sqm_interface, "ingress"])?;
-        attest_download_redirect(&ingress, download_enabled, &cfg.sqm_interface, &cfg.dl_if)?;
+/// External control owns bandwidth on explicitly enabled queues, not external
+/// traffic steering or disabled directions. This is not native restore proof.
+fn inspect_controller_topology(cfg: &Config) -> Result<(), SqmTopologyError> {
+    if cfg.manage_sqm {
+        return inspect_sqm_topology(cfg);
+    }
+    inspect_controller_counters(cfg)?;
+    for (enabled, interface, direction) in [
+        (cfg.adjust_dl_shaper_rate, &cfg.dl_if, "download"),
+        (cfg.adjust_ul_shaper_rate, &cfg.ul_if, "upload"),
+    ] {
+        if !enabled {
+            continue;
+        }
+        let output = topology_direction_qdisc_output(interface, true, direction)?;
+        attest_cake_direction(&output, true, direction, interface)?;
+        root_cake_control_identity(&output).map_err(|message| {
+            SqmTopologyError::unsafe_state("external-cake-identity-invalid", message)
+        })?;
     }
     Ok(())
 }
@@ -3213,9 +3398,12 @@ fn run_sqm_helper(cfg: &Config, operation: Option<&str>) -> Result<(), SqmRecove
     Ok(())
 }
 
-fn attest_managed_sqm(cfg: &Config) -> Result<(), SqmRecoveryError> {
+fn attest_managed_sqm(
+    cfg: &Config,
+    input: Option<&operations::controller_input::Loaded>,
+) -> Result<(), SqmRecoveryError> {
     #[cfg(test)]
-    if env::var_os("CAKE_AUTORATE_SQM_RECOVER").is_some() {
+    if input.is_none() && env::var_os("CAKE_AUTORATE_SQM_RECOVER").is_some() {
         // Controller generation-gate tests inject a tiny external
         // Busy/Failed/Recovered seam. Production has no such branch; native
         // OpenWrt attestation is exercised separately with a complete fake
@@ -3225,7 +3413,13 @@ fn attest_managed_sqm(cfg: &Config) -> Result<(), SqmRecoveryError> {
             .map_err(|error| SqmRecoveryError::Failed(error.to_string()));
     }
     let spec = managed_sqm_attestation_spec(cfg)?;
-    operations::sqm_recovery_openwrt::attest_managed_sqm(&spec).map_err(map_native_sqm_error)?;
+    match input {
+        Some(input) => {
+            operations::sqm_recovery_openwrt::attest_managed_sqm_from_input(&spec, input)
+        }
+        None => operations::sqm_recovery_openwrt::attest_managed_sqm(&spec),
+    }
+    .map_err(map_native_sqm_error)?;
     inspect_sqm_topology(cfg).map_err(|error| SqmRecoveryError::Failed(error.to_string()))
 }
 
@@ -3293,9 +3487,12 @@ fn map_native_sqm_error(
     }
 }
 
-fn recover_managed_sqm(cfg: &Config) -> Result<(), SqmRecoveryError> {
+fn recover_managed_sqm(
+    cfg: &Config,
+    input: Option<&operations::controller_input::Loaded>,
+) -> Result<(), SqmRecoveryError> {
     #[cfg(test)]
-    if env::var_os("CAKE_AUTORATE_SQM_RECOVER").is_some() {
+    if input.is_none() && env::var_os("CAKE_AUTORATE_SQM_RECOVER").is_some() {
         run_sqm_helper(cfg, None)?;
         return inspect_sqm_topology(cfg)
             .map_err(|error| SqmRecoveryError::Failed(error.to_string()));
@@ -3308,9 +3505,13 @@ fn recover_managed_sqm(cfg: &Config) -> Result<(), SqmRecoveryError> {
         }
     }
     let spec = managed_sqm_attestation_spec(cfg)?;
-    operations::sqm_recovery_openwrt::recover_managed_sqm(&spec, || {
-        TERMINATE.load(Ordering::SeqCst)
-    })
+    let cancelled = || TERMINATE.load(Ordering::SeqCst);
+    match input {
+        Some(input) => operations::sqm_recovery_openwrt::recover_managed_sqm_from_input(
+            &spec, input, cancelled,
+        ),
+        None => operations::sqm_recovery_openwrt::recover_managed_sqm(&spec, cancelled),
+    }
     .map_err(map_native_sqm_error)?;
     inspect_sqm_topology(cfg).map_err(|error| SqmRecoveryError::Failed(error.to_string()))
 }
@@ -3326,6 +3527,31 @@ struct TransportProbeRequest {
     rating_phase: RatingPhase,
     #[cfg(feature = "calibration")]
     autotune_capture: Option<operations::full_autotune::AutotuneCaptureRequest>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+#[cfg(feature = "transport-probes")]
+struct TransportProbeEngineKey {
+    route: String,
+    #[cfg(feature = "calibration")]
+    capture_owner: Option<[String; 3]>,
+}
+
+#[cfg(feature = "transport-probes")]
+impl TransportProbeRequest {
+    fn engine_key(&self, route: String) -> TransportProbeEngineKey {
+        TransportProbeEngineKey {
+            route,
+            #[cfg(feature = "calibration")]
+            capture_owner: self.autotune_capture.as_ref().map(|capture| {
+                [
+                    capture.job_id.clone(),
+                    capture.worker_run_id.clone(),
+                    capture.permit_id.clone(),
+                ]
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3947,8 +4173,12 @@ fn loaded_coverage_sufficient(coverage: AutotuneTransportCoverage) -> bool {
 
 #[cfg(feature = "transport-probes")]
 struct TransportProbeRuntime {
-    requests: SyncSender<TransportProbeRequest>,
+    // Remains on the main thread until the worker has joined; never move the
+    // Rc authority into the worker, which receives only its socket GID.
+    producer: Option<permanent_probe_owner::PermanentProbeProducer>,
+    requests: Option<SyncSender<TransportProbeRequest>>,
     results: Receiver<TransportProbeResult>,
+    worker: Option<thread::JoinHandle<()>>,
     in_flight: bool,
     last_started: Instant,
     load_candidate: (bool, bool),
@@ -3965,6 +4195,79 @@ struct TransportProbeRuntime {
     pending_capture_wait_reason: Option<&'static str>,
 }
 
+#[cfg(feature = "calibration")]
+#[derive(Default)]
+struct ManagedProbeRetirement {
+    request: Option<operations::autotune_runtime_store::ProbeRetirement>,
+    pending: bool,
+    failed: bool,
+}
+
+#[cfg(feature = "calibration")]
+impl ManagedProbeRetirement {
+    fn blocks_probes(&self) -> bool {
+        self.pending || self.failed
+    }
+
+    fn blocks_capture(&self, capture: &operations::full_autotune::AutotuneCaptureRequest) -> bool {
+        self.blocks_probes()
+            || self.request.as_ref().is_some_and(|request| {
+                request.job_id == capture.job_id && request.worker_run_id == capture.worker_run_id
+            })
+    }
+
+    fn poll(
+        &mut self,
+        store: &operations::autotune_runtime_store::RuntimeOverrideStore,
+        active: &mut Option<TransportProbeRuntime>,
+        stopping: &mut Option<TransportProbeRuntime>,
+    ) -> Result<(), String> {
+        self.failed = true;
+        let request = store.read_probe_retirement()?;
+        if self.request.is_some() && request.is_none() {
+            return Err("probe retirement admission tombstone disappeared".to_string());
+        }
+        if self.request != request {
+            self.request = request;
+            self.pending = true;
+        }
+        if self.pending {
+            // This also retires a continuously enabled transport runtime: it
+            // may still own a socket/DNS helper from the finished capture.
+            TransportProbeRuntime::request_retirement(active, stopping)?;
+            if stopping.as_mut().is_some_and(|worker| worker.finish_stop()) {
+                *stopping = None;
+            }
+            if stopping.is_none() {
+                if let Some(request) = self.request.as_ref() {
+                    store.acknowledge_probe_retirement(request)?;
+                }
+                self.pending = false;
+            }
+        }
+        self.failed = false;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "transport-probes")]
+impl Drop for TransportProbeRuntime {
+    fn drop(&mut self) {
+        self.request_stop();
+        // Normal runtime replacement polls finish_stop first. Shutdown still
+        // owns and joins the worker rather than abandoning network activity.
+        if let Some(worker) = self.worker.take() {
+            if worker.join().is_err() {
+                // An uncertain teardown quarantines authority on token Drop.
+                return;
+            }
+        }
+        if let Some(producer) = self.producer.take() {
+            producer.confirm_stopped();
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ExternalIpResult {
     value: Option<String>,
@@ -3977,6 +4280,7 @@ struct ExternalIpRuntime {
     results: Receiver<ExternalIpResult>,
     in_flight: bool,
     last_started: Instant,
+    interval: Duration,
 }
 
 fn transport_result_matches_route(
@@ -4082,7 +4386,53 @@ fn transport_error_code(error: Option<&str>) -> Option<&'static str> {
 
 #[cfg(feature = "transport-probes")]
 impl TransportProbeRuntime {
-    fn spawn(cfg: &Config) -> Self {
+    fn request_retirement(
+        active: &mut Option<Self>,
+        stopping: &mut Option<Self>,
+    ) -> Result<(), String> {
+        if let Some(mut previous) = active.take() {
+            previous.request_stop();
+            if stopping.is_some() {
+                // Never detach either worker on an invariant failure.
+                *active = Some(previous);
+                return Err("overlapping managed transport retirement".into());
+            }
+            *stopping = Some(previous);
+        }
+        Ok(())
+    }
+
+    fn request_stop(&mut self) {
+        self.requests.take();
+    }
+
+    fn finish_stop(&mut self) -> bool {
+        if self.requests.is_some()
+            || self
+                .worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+        {
+            return false;
+        }
+        if let Some(worker) = self.worker.take() {
+            if worker.join().is_err() {
+                self.producer.take();
+                return true;
+            }
+        }
+        if let Some(producer) = self.producer.take() {
+            producer.confirm_stopped();
+        }
+        true
+    }
+
+    fn spawn(
+        cfg: &Config,
+        producer: Option<permanent_probe_owner::PermanentProbeProducer>,
+    ) -> Self {
+        let permanent_gid = producer.as_ref().map(|owner| owner.gid());
+        let permanent_route = producer.as_ref().map(|owner| owner.route().clone());
         let (request_tx, request_rx) = mpsc::sync_channel::<TransportProbeRequest>(1);
         let (result_tx, result_rx) = mpsc::channel::<TransportProbeResult>();
         let route_spec = cfg.route_spec();
@@ -4090,22 +4440,54 @@ impl TransportProbeRuntime {
         let backend = TransportProbeBackend::parse(&cfg.transport_probe_backend)
             .unwrap_or(TransportProbeBackend::LegacyHttp);
         let endpoint = cfg.transport_probe_endpoint.clone();
-        thread::spawn(move || {
-            let mut engine: Option<(String, TransportProbeEngine)> = None;
-            let mut route_inspector = RouteInspector::new(route_spec.clone());
+        let dns_server = cfg.explicit_dns_server;
+        let mut route_inspector = if cfg.route_mode == "explicit" {
+            producer
+                .as_ref()
+                .ok_or_else(|| "explicit transport inspector requires a probe owner".to_string())
+                .and_then(|owner| RouteInspector::for_owned_probe(route_spec.clone(), owner))
+        } else {
+            Ok(RouteInspector::new(route_spec.clone()))
+        };
+        #[cfg(feature = "calibration")]
+        let runtime_directory = cfg.run_dir();
+        let worker = thread::spawn(move || {
+            let mut engine: Option<(TransportProbeEngineKey, TransportProbeEngine)> = None;
             while let Ok(request) = request_rx.recv() {
                 #[cfg(feature = "calibration")]
                 let started_at = Instant::now();
-                let before = route_inspector.inspect();
+                let before = route_inspector
+                    .as_mut()
+                    .map_err(|error| error.clone())
+                    .and_then(RouteInspector::inspect)
+                    .and_then(|snapshot| {
+                        if permanent_route
+                            .as_ref()
+                            .is_some_and(|route| route != &snapshot.identity)
+                        {
+                            Err("permanent probe route changed before execution".into())
+                        } else {
+                            Ok(snapshot)
+                        }
+                    });
+                if !before.as_ref().is_ok_and(|snapshot| snapshot.online) {
+                    engine = None;
+                }
                 let measurement: Result<
                     transport_probe::TransportProbeSample,
                     transport_probe::TransportProbeFailure,
                 > = match before.as_ref() {
                     Ok(snapshot) if snapshot.online => {
-                        let identity = snapshot.stable_key();
+                        let identity = request.engine_key(snapshot.stable_key());
                         if backend == TransportProbeBackend::LegacyHttp {
                             let started = Instant::now();
-                            match run_transport_probe(&route_spec, timeout_s, &endpoint, snapshot) {
+                            let legacy = if permanent_gid.is_some() {
+                                Err("owned permanent probes require a native transport backend"
+                                    .into())
+                            } else {
+                                run_transport_probe(&route_spec, timeout_s, &endpoint, snapshot)
+                            };
+                            match legacy {
                                 Ok(()) => Ok(transport_probe::TransportProbeSample {
                                     backend,
                                     endpoint: endpoint.clone(),
@@ -4130,18 +4512,51 @@ impl TransportProbeRuntime {
                                     .map(|(key, _)| key != &identity)
                                     .unwrap_or(true);
                                 if replace {
+                                    // Drop persistent connections and their resolver cache before
+                                    // crossing route or capture ownership, including return to
+                                    // ordinary monitoring. Capture sequence changes within the
+                                    // same job/worker/permit retain their connection.
+                                    engine = None;
+                                    #[cfg(feature = "calibration")]
+                                    let traffic_gid = if let Some(capture) = request.autotune_capture.as_ref() {
+                                        let store = operations::autotune_runtime_store::RuntimeOverrideStore::open(&runtime_directory)
+                                            .map_err(transport_probe::TransportProbeFailure::other)?;
+                                        let permit = store.read_permit().map_err(transport_probe::TransportProbeFailure::other)?
+                                            .ok_or_else(|| transport_probe::TransportProbeFailure::other("probe accounting permit is missing".into()))?;
+                                        if permit.job_id != capture.job_id || permit.worker_run_id != capture.worker_run_id
+                                            || permit.instance_name != capture.instance_name
+                                            || permit.permit_id != capture.permit_id || permit.route_fingerprint != capture.route_fingerprint
+                                            || permit.dns_server != dns_server {
+                                            return Err(transport_probe::TransportProbeFailure::other("probe accounting capture identity mismatch".into()));
+                                        }
+                                        store.probe_accounting_owner(&permit).map_err(transport_probe::TransportProbeFailure::other)?
+                                            .map(|owner| owner.probe_gid)
+                                    } else { permanent_gid };
+                                    #[cfg(not(feature = "calibration"))]
+                                    let traffic_gid = permanent_gid;
+                                    #[cfg(feature = "calibration")]
+                                    if traffic_gid.is_some() && operations::autotune_runtime_store::effective_uid() != 0 {
+                                        return Err(transport_probe::TransportProbeFailure::other("probe accounting requires a root controller".into()));
+                                    }
                                     let binding = RouteBinding {
+                                        traffic_gid,
                                         device: snapshot.identity.device.clone(),
                                         source_ip: snapshot.identity.source_ip.clone(),
                                         fwmark: snapshot.identity.fwmark.clone(),
                                     };
+                                    if snapshot.identity.mode == "explicit" && dns_server.is_none() {
+                                        return Err(transport_probe::TransportProbeFailure::other(
+                                            "explicit transport requires route_dns_ipv4".into(),
+                                        ));
+                                    }
                                     engine = Some((
-                                        identity.clone(),
-                                        TransportProbeEngine::new(
+                                        identity,
+                                        TransportProbeEngine::new_with_dns(
                                             backend,
                                             endpoint.clone(),
                                             binding,
                                             Duration::from_secs(timeout_s),
+                                            dns_server,
                                         )
                                         .map_err(
                                             transport_probe::TransportProbeFailure::other,
@@ -4169,7 +4584,15 @@ impl TransportProbeRuntime {
                     )),
                     Err(error) => Err(transport_probe::TransportProbeFailure::other(error.clone())),
                 };
-                let after = route_inspector.inspect();
+                let after = route_inspector
+                    .as_mut()
+                    .map_err(|error| error.clone())
+                    .and_then(RouteInspector::inspect);
+                let route_error = match (&before, &after) {
+                    (Err(error), _) => format!("transport route preflight failed: {error}"),
+                    (_, Err(error)) => format!("transport route recheck failed: {error}"),
+                    _ => "route changed during native transport probe".to_string(),
+                };
                 let (successful_route_identity, failed_route_identity) =
                     transport_probe_route_identities(before.as_ref().ok(), after.as_ref().ok());
                 let (
@@ -4200,7 +4623,7 @@ impl TransportProbeRuntime {
                     ),
                     (Ok(_), None) => (
                         None,
-                        Some("route changed during native transport probe".to_string()),
+                        Some(route_error.clone()),
                         Some(transport_probe::TransportProbeFailureKind::Other),
                         None,
                         backend.as_str().to_string(),
@@ -4229,7 +4652,7 @@ impl TransportProbeRuntime {
                             ),
                             None => (
                                 None,
-                                Some("route changed during native transport probe".to_string()),
+                                Some(route_error),
                                 Some(transport_probe::TransportProbeFailureKind::Other),
                                 None,
                                 backend.as_str().to_string(),
@@ -4283,9 +4706,21 @@ impl TransportProbeRuntime {
             }
         });
 
+        Self::from_worker(cfg, request_tx, result_rx, worker, producer)
+    }
+
+    fn from_worker(
+        cfg: &Config,
+        requests: SyncSender<TransportProbeRequest>,
+        results: Receiver<TransportProbeResult>,
+        worker: thread::JoinHandle<()>,
+        producer: Option<permanent_probe_owner::PermanentProbeProducer>,
+    ) -> Self {
         Self {
-            requests: request_tx,
-            results: result_rx,
+            producer,
+            requests: Some(requests),
+            results,
+            worker: Some(worker),
             in_flight: false,
             last_started: Instant::now()
                 .checked_sub(Duration::from_secs_f64(cfg.transport_probe_idle_interval_s))
@@ -4508,18 +4943,18 @@ impl TransportProbeRuntime {
             return Err("native transport probe sequence exhausted".to_string());
         };
         let request_capture_present = autotune_capture.is_some();
-        if self
-            .requests
-            .try_send(TransportProbeRequest {
-                probe_id,
-                control_valid,
-                dl_loaded,
-                ul_loaded,
-                rating_phase: rating.phase,
-                autotune_capture,
-            })
-            .is_ok()
-        {
+        if self.requests.as_ref().is_some_and(|requests| {
+            requests
+                .try_send(TransportProbeRequest {
+                    probe_id,
+                    control_valid,
+                    dl_loaded,
+                    ul_loaded,
+                    rating_phase: rating.phase,
+                    autotune_capture,
+                })
+                .is_ok()
+        }) {
             self.next_probe_id = next_probe_id;
             self.in_flight = true;
             self.last_started = now;
@@ -4589,16 +5024,16 @@ impl TransportProbeRuntime {
         if self.last_started.elapsed() < Duration::from_secs_f64(interval) {
             return Ok(());
         }
-        if self
-            .requests
-            .try_send(TransportProbeRequest {
-                control_valid,
-                dl_loaded: control_valid && phase.0,
-                ul_loaded: control_valid && phase.1,
-                rating_phase: rating.phase,
-            })
-            .is_ok()
-        {
+        if self.requests.as_ref().is_some_and(|requests| {
+            requests
+                .try_send(TransportProbeRequest {
+                    control_valid,
+                    dl_loaded: control_valid && phase.0,
+                    ul_loaded: control_valid && phase.1,
+                    rating_phase: rating.phase,
+                })
+                .is_ok()
+        }) {
             self.in_flight = true;
             self.last_started = now;
         }
@@ -4644,12 +5079,17 @@ fn transport_probe_interval_s(cfg: &Config, any_loaded: bool, baseline_ready: bo
 }
 
 impl ExternalIpRuntime {
-    fn spawn(route_spec: RouteSpec) -> Self {
+    fn spawn(cfg: &Config, route_spec: RouteSpec) -> Option<Self> {
+        if !cfg.external_ip_check_enabled {
+            return None;
+        }
+        let endpoint = cfg.external_ip_check_url.clone();
+        let interval = Duration::from_secs(cfg.external_ip_check_interval_s);
         let (request_tx, request_rx) = mpsc::sync_channel::<()>(1);
         let (result_tx, result_rx) = mpsc::channel::<ExternalIpResult>();
         thread::spawn(move || {
             while request_rx.recv().is_ok() {
-                let result = run_external_ip_probe(&route_spec, 5);
+                let result = run_external_ip_probe(&route_spec, 5, &endpoint);
                 let (value, error, route_identity) = match result {
                     Ok((value, snapshot)) => (Some(value), None, Some(snapshot.stable_key())),
                     Err(error) => (None, Some(error), None),
@@ -4667,14 +5107,15 @@ impl ExternalIpRuntime {
             }
         });
 
-        Self {
+        Some(Self {
             requests: request_tx,
             results: result_rx,
             in_flight: false,
             last_started: Instant::now()
-                .checked_sub(Duration::from_secs(60))
+                .checked_sub(interval)
                 .unwrap_or_else(Instant::now),
-        }
+            interval,
+        })
     }
 
     fn drain(&mut self, controller: &mut Controller) {
@@ -4704,12 +5145,19 @@ impl ExternalIpRuntime {
     }
 
     fn maybe_start(&mut self, allowed: bool) {
-        if !allowed || self.in_flight || self.last_started.elapsed() < Duration::from_secs(60) {
+        self.maybe_start_at(allowed, Instant::now());
+    }
+
+    fn maybe_start_at(&mut self, allowed: bool, now: Instant) {
+        if !allowed
+            || self.in_flight
+            || now.saturating_duration_since(self.last_started) < self.interval
+        {
             return;
         }
         if self.requests.try_send(()).is_ok() {
             self.in_flight = true;
-            self.last_started = Instant::now();
+            self.last_started = now;
         }
     }
 }
@@ -4717,6 +5165,7 @@ impl ExternalIpRuntime {
 fn run_external_ip_probe(
     route_spec: &RouteSpec,
     timeout_s: u64,
+    endpoint: &str,
 ) -> Result<(String, RouteSnapshot), String> {
     let before = routing::inspect_route(route_spec)?;
     if !before.online {
@@ -4726,7 +5175,7 @@ fn run_external_ip_probe(
             before.reason
         });
     }
-    let value = routing::external_ipv4(route_spec, timeout_s)?;
+    let value = routing::external_ipv4(route_spec, timeout_s, endpoint)?;
     let after = routing::inspect_route(route_spec)?;
     if !after.online || before.stable_key() != after.stable_key() {
         return Err("route changed during external IP query".to_string());
@@ -4741,6 +5190,9 @@ fn run_transport_probe(
     endpoint: &str,
     snapshot: &RouteSnapshot,
 ) -> Result<(), String> {
+    if route_spec.configured_mode == "explicit" {
+        return Err("explicit legacy transport probe requires owned source-bound execution".into());
+    }
     if !snapshot.online {
         return Err(if snapshot.reason.is_empty() {
             format!("route {} is offline", snapshot.identity.mode)
@@ -5033,101 +5485,6 @@ fn history_budget_snapshot(cfg: &Config) -> HistoryBudgetSnapshot {
     )
 }
 
-struct LogFile {
-    path: PathBuf,
-    file: BufWriter<File>,
-    opened_at: Instant,
-    bytes_written: u64,
-    bytes_pending: u64,
-    last_flush: Instant,
-}
-
-impl LogFile {
-    fn open(path: PathBuf) -> io::Result<Self> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let bytes_written = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
-        let file = BufWriter::new(OpenOptions::new().create(true).append(true).open(&path)?);
-
-        Ok(Self {
-            path,
-            file,
-            opened_at: Instant::now(),
-            bytes_written,
-            bytes_pending: 0,
-            last_flush: Instant::now(),
-        })
-    }
-
-    fn write_line(
-        &mut self,
-        line: &str,
-        max_age: Duration,
-        max_size_bytes: u64,
-        buffer_size_bytes: u64,
-        buffer_timeout: Duration,
-        compress: bool,
-    ) -> io::Result<()> {
-        let pending = line.len() as u64 + 1;
-        let age_exceeded = max_age > Duration::ZERO && self.opened_at.elapsed() >= max_age;
-        let size_exceeded =
-            max_size_bytes > 0 && self.bytes_written.saturating_add(pending) > max_size_bytes;
-
-        if age_exceeded || size_exceeded {
-            self.rotate(compress)?;
-        }
-
-        writeln!(self.file, "{line}")?;
-        self.bytes_written = self.bytes_written.saturating_add(pending);
-        self.bytes_pending = self.bytes_pending.saturating_add(pending);
-
-        let flush_by_size = buffer_size_bytes == 0 || self.bytes_pending >= buffer_size_bytes;
-        let flush_by_time =
-            buffer_timeout == Duration::ZERO || self.last_flush.elapsed() >= buffer_timeout;
-
-        if flush_by_size || flush_by_time {
-            self.flush()?;
-        }
-        Ok(())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()?;
-        self.bytes_pending = 0;
-        self.last_flush = Instant::now();
-        Ok(())
-    }
-
-    fn rotate(&mut self, compress: bool) -> io::Result<()> {
-        let _ = self.flush();
-
-        let rotated = rotated_log_path(&self.path);
-        match fs::rename(&self.path, &rotated) {
-            Ok(()) => {
-                if compress {
-                    let _ = Command::new("gzip").arg("-f").arg(&rotated).status();
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-
-        self.file = BufWriter::new(
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)?,
-        );
-        self.opened_at = Instant::now();
-        self.bytes_written = 0;
-        self.bytes_pending = 0;
-        self.last_flush = Instant::now();
-        Ok(())
-    }
-}
-
 #[cfg(feature = "calibration")]
 fn autotune_capture_attestation_lease_valid(
     last_attested: Instant,
@@ -5144,7 +5501,9 @@ fn autotune_capture_attestation_lease_valid(
 
 struct Controller {
     cfg: Config,
+    service_input: Option<operations::controller_input::Loaded>,
     log: Option<LogFile>,
+    log_failure: LogFailureThrottle,
     rate_monitor: RateMonitor,
     #[cfg(feature = "calibration")]
     autotune_counter_sampler: Option<operations::autotune_counter::AutotuneCounterSampler>,
@@ -5159,6 +5518,8 @@ struct Controller {
     cpu_monitor: Option<CpuMonitor>,
     dl_baseline_us: HashMap<String, f64>,
     ul_baseline_us: HashMap<String, f64>,
+    baseline_epoch: Instant,
+    baseline_warmup: std::collections::BTreeMap<String, latency_baseline::BaselineWarmup>,
     dl_ewma_us: HashMap<String, f64>,
     ul_ewma_us: HashMap<String, f64>,
     dl_delays: VecDeque<bool>,
@@ -5225,6 +5586,7 @@ struct Controller {
     last_decay_ul: Instant,
     last_cpu_sample: Instant,
     last_graph_history_sample: Instant,
+    history_traffic: history_traffic::Window,
     last_history_budget_refresh: Instant,
     history_budget: HistoryBudgetSnapshot,
     history_sample_count: u64,
@@ -5237,6 +5599,7 @@ struct Controller {
     uplink_state: UplinkState,
     uplink_reason: String,
     route_snapshot: Option<RouteSnapshot>,
+    permanent_probe_owner: Option<permanent_probe_owner::PermanentProbeOwner>,
     route_identity: Option<String>,
     route_external_ip: String,
     sqm_runtime_state: String,
@@ -5251,8 +5614,11 @@ struct Controller {
     /// for its first control closes the permit-to-idle-capture rate race
     /// without changing the managed qdisc merely to freeze it.
     runtime_operation_active: bool,
+    runtime_control_error: Option<String>,
     #[cfg(feature = "calibration")]
     autotune_capture_request: Option<operations::full_autotune::AutotuneCaptureRequest>,
+    #[cfg(feature = "calibration")]
+    probe_retirement: ManagedProbeRetirement,
     #[cfg(feature = "calibration")]
     autotune_capture_session: operations::autotune_capture_session::AutotuneCaptureSession,
     #[cfg(feature = "calibration")]
@@ -5322,8 +5688,45 @@ fn rating_capture_request_is_admissible(
 }
 
 impl Controller {
+    #[cfg(feature = "calibration")]
+    fn sqm_identity_fingerprint(&self) -> Result<String, String> {
+        match &self.service_input {
+            Some(input) => operations::sqm_identity::managed_sqm_identity_from_input(
+                input,
+                &self.cfg.instance,
+                &self.cfg.sqm_section,
+                &self.cfg.sqm_interface,
+            ),
+            None => operations::sqm_identity::managed_sqm_identity_fingerprint(
+                &self.cfg.instance,
+                &self.cfg.sqm_section,
+                &self.cfg.sqm_interface,
+            ),
+        }
+    }
     fn runtime_rate_control_suspended(&self) -> bool {
         self.runtime_override_active || self.runtime_operation_active
+    }
+
+    #[cfg(any(feature = "calibration", test))]
+    fn set_runtime_control_state(&mut self, active: bool, error: Option<&str>) {
+        // Error never authorizes a rate write; exact successful Idle is needed
+        // to release the ordinary controller. Publish the held reason promptly.
+        let held = active || error.is_some();
+        if self.runtime_operation_active == held && self.runtime_control_error.as_deref() == error {
+            return;
+        }
+        self.runtime_operation_active = held;
+        if self.runtime_control_error.as_deref() != error {
+            if let Some(error) = error {
+                self.log(
+                    "ERROR",
+                    &format!("native Auto-Tune runtime control failed: {error}"),
+                );
+            }
+            self.runtime_control_error = error.map(str::to_owned);
+        }
+        let _ = self.refresh_status_from_last_sample();
     }
 
     #[cfg(feature = "calibration")]
@@ -5355,9 +5758,21 @@ impl Controller {
         cfg.refresh_wire_packet_sizes();
 
         let log = if cfg.log_to_file {
-            Some(LogFile::open(cfg.log_path()).map_err(|e| {
-                format!("failed to open log file {}: {e}", cfg.log_path().display())
-            })?)
+            match LogFile::open_with_limit(
+                cfg.log_path(),
+                cfg.log_file_max_size_kb.saturating_mul(1024),
+            ) {
+                Ok(log) => Some(log),
+                Err(error) => {
+                    eprintln!(
+                        "{}",
+                        logging::stderr_line(&format!(
+                            "ERROR: file logging unavailable; using procd stderr: {error}"
+                        ))
+                    );
+                    None
+                }
+            }
         } else {
             None
         };
@@ -5448,6 +5863,7 @@ impl Controller {
 
         Ok(Self {
             shaper_dl: cfg.base_dl_shaper_rate_kbps,
+            service_input: None,
             shaper_ul: cfg.base_ul_shaper_rate_kbps,
             adaptive_dl,
             adaptive_ul,
@@ -5507,6 +5923,7 @@ impl Controller {
             last_decay_ul: now,
             last_cpu_sample: now,
             last_graph_history_sample: now,
+            history_traffic: history_traffic::Window::default(),
             last_history_budget_refresh: now,
             history_budget,
             history_sample_count: 0,
@@ -5518,6 +5935,7 @@ impl Controller {
             uplink_state: UplinkState::Offline,
             uplink_reason: "route not checked".to_string(),
             route_snapshot: None,
+            permanent_probe_owner: None,
             route_identity: None,
             route_external_ip: String::new(),
             sqm_runtime_state: if cfg.manage_sqm && cfg.sqm_enabled {
@@ -5532,8 +5950,11 @@ impl Controller {
             sqm_recovery_gate: operations::sqm_recovery::SqmRecoveryGate::default(),
             runtime_override_active: false,
             runtime_operation_active: false,
+            runtime_control_error: None,
             #[cfg(feature = "calibration")]
             autotune_capture_request: None,
+            #[cfg(feature = "calibration")]
+            probe_retirement: ManagedProbeRetirement::default(),
             #[cfg(feature = "calibration")]
             autotune_capture_session:
                 operations::autotune_capture_session::AutotuneCaptureSession::new(),
@@ -5553,6 +5974,8 @@ impl Controller {
             last_rejected_rating_capture_token: None,
             dl_baseline_us: HashMap::new(),
             ul_baseline_us: HashMap::new(),
+            baseline_epoch: now,
+            baseline_warmup: std::collections::BTreeMap::new(),
             dl_ewma_us: HashMap::new(),
             ul_ewma_us: HashMap::new(),
             dl_delays: filled_bool_window(cfg.bufferbloat_detection_window),
@@ -5562,6 +5985,7 @@ impl Controller {
             started_at: epoch_secs(),
             cfg,
             log,
+            log_failure: LogFailureThrottle::default(),
             rate_monitor,
             #[cfg(feature = "calibration")]
             autotune_counter_sampler: None,
@@ -5584,9 +6008,21 @@ impl Controller {
     }
 
     fn sample_rates(&mut self) -> RateSample {
-        let shaped = self.rate_monitor.sample();
+        let shaped = self.sample_shaped_rates();
         #[cfg(feature = "calibration")]
         self.update_autotune_capture_rates(shaped);
+        shaped
+    }
+
+    fn sample_shaped_rates(&mut self) -> RateSample {
+        let shaped = self.rate_monitor.sample();
+        if self.cfg.graph_history_enabled && shaped.fresh {
+            self.history_traffic.observe(
+                self.rate_monitor.last,
+                self.rate_monitor.prev_rx,
+                self.rate_monitor.prev_tx,
+            );
+        }
         shaped
     }
 
@@ -5824,6 +6260,7 @@ impl Controller {
     }
 
     fn accept_recovered_sqm(&mut self, reason: &str) -> Result<(), String> {
+        self.cfg.refresh_wire_packet_sizes();
         self.sqm_recovery_gate.observe_healthy();
         self.rate_monitor = RateMonitor::new(
             &self.cfg.rx_bytes_path,
@@ -5865,7 +6302,52 @@ impl Controller {
             );
             return (true, false);
         }
-        if !self.cfg.manage_sqm || !self.cfg.sqm_enabled {
+        if !self.cfg.manage_sqm {
+            match inspect_controller_topology(&self.cfg) {
+                Ok(()) => {
+                    self.cfg.refresh_wire_packet_sizes();
+                    let recovered = !self.sqm_runtime_healthy;
+                    if recovered {
+                        self.rate_monitor = match RateMonitor::new(
+                            &self.cfg.rx_bytes_path,
+                            &self.cfg.tx_bytes_path,
+                            self.cfg.monitor_achieved_rates_interval_ms,
+                        ) {
+                            Ok(monitor) => monitor,
+                            Err(error) => {
+                                self.set_sqm_runtime_status(
+                                    "WAITING_EXTERNAL_SQM",
+                                    false,
+                                    &error.to_string(),
+                                );
+                                return (false, false);
+                            }
+                        };
+                        self.dl_qdisc_kind = None;
+                        self.ul_qdisc_kind = None;
+                        self.last_set_dl = 0;
+                        self.last_set_ul = 0;
+                        self.reset_uplink_learning("external CAKE observation recovered");
+                        self.set_run_state("RUNNING");
+                    }
+                    self.sqm_recovery_gate.observe_healthy();
+                    self.set_sqm_runtime_status(
+                        "UNMANAGED",
+                        true,
+                        "external queues: bandwidth control only",
+                    );
+                    return (true, recovered);
+                }
+                Err(error) => {
+                    self.dl_qdisc_kind = None;
+                    self.ul_qdisc_kind = None;
+                    self.set_sqm_runtime_status("WAITING_EXTERNAL_SQM", false, &error.to_string());
+                    self.set_run_state("WAITING_EXTERNAL_SQM");
+                    return (false, false);
+                }
+            }
+        }
+        if !self.cfg.sqm_enabled {
             self.sqm_recovery_gate.observe_healthy();
             self.set_sqm_runtime_status("UNMANAGED", true, "");
             return (true, false);
@@ -5885,6 +6367,7 @@ impl Controller {
         let topology = inspect_sqm_topology(&self.cfg);
         match &topology {
             Ok(()) if self.sqm_runtime_healthy => {
+                self.cfg.refresh_wire_packet_sizes();
                 self.sqm_recovery_gate.observe_healthy();
                 if self.sqm_runtime_state == "WAITING_OPERATION" {
                     // The ownership guard above has cleared and the existing
@@ -5900,7 +6383,7 @@ impl Controller {
                     .err()
                     .map(ToString::to_string)
                     .unwrap_or_else(|| "managed SQM failed exact attestation".to_string());
-                match attest_managed_sqm(&self.cfg) {
+                match attest_managed_sqm(&self.cfg, self.service_input.as_ref()) {
                     Ok(()) if inspect_sqm_topology(&self.cfg).is_ok() => {
                         match self.accept_recovered_sqm("runtime recovered externally") {
                             Ok(()) => (true, true),
@@ -5954,7 +6437,7 @@ impl Controller {
                         );
                         self.set_sqm_runtime_status("RECOVERING", false, &reason);
                         self.set_run_state("RECOVERING");
-                        match recover_managed_sqm(&self.cfg) {
+                        match recover_managed_sqm(&self.cfg, self.service_input.as_ref()) {
                             Ok(()) => {
                                 match self.accept_recovered_sqm("automatic SQM recovery completed")
                                 {
@@ -6167,6 +6650,13 @@ impl Controller {
                 return;
             }
         };
+        if self.probe_retirement.blocks_capture(&request) {
+            self.autotune_capture_request = None;
+            self.autotune_capture_session.clear();
+            self.autotune_idle_rate_reference = None;
+            self.record_autotune_capture_error("test probes are retiring or retired".to_string());
+            return;
+        }
         if self.autotune_capture_request.as_ref() != Some(&request) {
             self.autotune_idle_rate_reference = None;
         }
@@ -6365,6 +6855,18 @@ impl Controller {
             boot_ms,
         )
         .map_err(|error| ("capture-runtime-mismatch", error))?;
+        store
+            .probe_accounting_owner(&permit)
+            .map_err(|error| ("capture-accounting-owner-invalid", error))?;
+        if permit.probe_accounting_required
+            && TransportProbeBackend::parse(&self.cfg.transport_probe_backend)
+                == Some(TransportProbeBackend::LegacyHttp)
+        {
+            return Err((
+                "capture-accounting-owner-invalid",
+                "owned Auto-Tune probes require a native transport backend".into(),
+            ));
+        }
         if !permit
             .worker
             .still_matches(Path::new(operations::identity::DEFAULT_PROC_ROOT))
@@ -6381,12 +6883,9 @@ impl Controller {
                 "native Auto-Tune capture route changed after admission".to_string(),
             ));
         }
-        let live_sqm = operations::sqm_identity::managed_sqm_identity_fingerprint(
-            &self.cfg.instance,
-            &self.cfg.sqm_section,
-            &self.cfg.sqm_interface,
-        )
-        .map_err(|error| ("capture-sqm-mismatch", error))?;
+        let live_sqm = self
+            .sqm_identity_fingerprint()
+            .map_err(|error| ("capture-sqm-mismatch", error))?;
         if live_sqm != request.sqm_fingerprint {
             return Err((
                 "capture-sqm-mismatch",
@@ -6748,15 +7247,17 @@ impl Controller {
     }
 
     #[cfg(feature = "transport-probes")]
-    fn transport_clean_for_growth(&mut self, now: Instant) -> bool {
-        if !self.cfg.transport_controller_enabled {
-            return true;
-        }
+    fn transport_control_evidence(&self, is_dl: bool, now: Instant) -> TransportEvidence {
         let max_age = self.transport_max_age();
-        self.transport_latency.expire_loaded(now, max_age);
-        let snapshot = self.transport_latency.snapshot(now, true);
-        transport_allows_growth(
-            true,
+        let tracker = if is_dl {
+            &self.transport_latency_dl
+        } else {
+            &self.transport_latency_ul
+        };
+        let snapshot =
+            tracker.snapshot_with_max_age(now, self.cfg.transport_latency_enabled, max_age);
+        transport_evidence(
+            self.cfg.transport_controller_enabled,
             snapshot.confirmed,
             snapshot.sample_age_s,
             max_age.as_secs_f64(),
@@ -6783,6 +7284,18 @@ impl Controller {
     #[cfg(feature = "transport-probes")]
     fn on_transport_probe(&mut self, result: TransportProbeResult) {
         let now = Instant::now();
+        let max_age = self.transport_max_age();
+        self.transport_latency.expire_loaded(now, max_age);
+        self.transport_latency_dl.expire_loaded(now, max_age);
+        self.transport_latency_ul.expire_loaded(now, max_age);
+        if self.transport_latency_dl.confirmed_delta_ms().is_none() {
+            self.transport_bad_windows_dl = 0;
+            self.quality_search_dl.reset();
+        }
+        if self.transport_latency_ul.confirmed_delta_ms().is_none() {
+            self.transport_bad_windows_ul = 0;
+            self.quality_search_ul.reset();
+        }
         self.transport_backend = result.backend.clone();
         self.transport_trusted = result.trusted;
         self.transport_raw_samples = result.raw_samples_ms.len();
@@ -7128,10 +7641,14 @@ impl Controller {
             &format!("Enforcing minimum shaper rates: {reason}"),
         );
         if self.cfg.adjust_dl_shaper_rate {
-            self.shaper_dl = self.throughput_floor_dl;
+            self.shaper_dl = self.cfg.min_dl_shaper_rate_kbps.max(1.0);
+            #[cfg(feature = "transport-probes")]
+            self.quality_search_dl.reset();
         }
         if self.cfg.adjust_ul_shaper_rate {
-            self.shaper_ul = self.throughput_floor_ul;
+            self.shaper_ul = self.cfg.min_ul_shaper_rate_kbps.max(1.0);
+            #[cfg(feature = "transport-probes")]
+            self.quality_search_ul.reset();
         }
         self.apply_shaper("dl");
         self.apply_shaper("ul");
@@ -7153,20 +7670,12 @@ impl Controller {
             let now = Instant::now();
             let mut changed = false;
             if self.cfg.adjust_dl_shaper_rate {
-                let update = if state == "STALL" {
-                    self.adaptive_dl.reset_to_configured(now)
-                } else {
-                    self.adaptive_dl.pause(now, "autorate state paused")
-                };
+                let update = self.adaptive_dl.pause(now, "autorate state paused");
                 changed |= update.change.is_some();
                 self.log_adaptive_update("DL", update);
             }
             if self.cfg.adjust_ul_shaper_rate {
-                let update = if state == "STALL" {
-                    self.adaptive_ul.reset_to_configured(now)
-                } else {
-                    self.adaptive_ul.pause(now, "autorate state paused")
-                };
+                let update = self.adaptive_ul.pause(now, "autorate state paused");
                 changed |= update.change.is_some();
                 self.log_adaptive_update("UL", update);
             }
@@ -7178,6 +7687,78 @@ impl Controller {
         }
 
         let _ = self.refresh_status_from_last_sample();
+    }
+
+    /// A brief response gap pauses a probe, but a sustained outage retires its
+    /// learned bound. Actual route changes still use reset_uplink_learning.
+    fn reset_adaptive_after_sustained_gap(&mut self) {
+        self.invalidate_pinger_capture();
+        if !self.cfg.adaptive_ceiling_enabled {
+            return;
+        }
+        let now = Instant::now();
+        let mut changed = false;
+        if self.cfg.adjust_dl_shaper_rate {
+            let update = self.adaptive_dl.reset_to_configured(now);
+            changed |= update.change.is_some();
+            self.log_adaptive_update("DL", update);
+        }
+        if self.cfg.adjust_ul_shaper_rate {
+            let update = self.adaptive_ul.reset_to_configured(now);
+            changed |= update.change.is_some();
+            self.log_adaptive_update("UL", update);
+        }
+        if changed {
+            self.clamp_rates();
+            self.apply_shaper("dl");
+            self.apply_shaper("ul");
+        }
+    }
+
+    fn permanent_probe_producer(
+        &mut self,
+    ) -> Result<Option<permanent_probe_owner::PermanentProbeProducer>, String> {
+        // Explicit mode remains rejected by RouteSpec until its complete
+        // request/Apply/routing path is admitted. Preserve legacy modes here.
+        if self.cfg.route_mode != "explicit" {
+            return Ok(None);
+        }
+        let route = self
+            .route_snapshot
+            .as_ref()
+            .filter(|route| route.online)
+            .ok_or("permanent-probe-route-unavailable")?;
+        if route.identity.mode != self.cfg.route_mode || route.identity.device != self.cfg.ul_if {
+            return Err("permanent-probe-route-authority-mismatch".into());
+        }
+        if self
+            .permanent_probe_owner
+            .as_ref()
+            .is_some_and(|owner| !owner.matches_route(&route.identity))
+        {
+            if self
+                .permanent_probe_owner
+                .as_ref()
+                .is_some_and(|owner| owner.has_producers())
+            {
+                return Err("permanent-probe-old-route-retiring".into());
+            }
+            if let Some(owner) = self.permanent_probe_owner.take() {
+                owner.retire(|args| permanent_probe_owner::execute_system_nft(args, None))?;
+            }
+        }
+        if self.permanent_probe_owner.is_none() {
+            self.permanent_probe_owner =
+                Some(permanent_probe_owner::PermanentProbeOwner::acquire_system(
+                    route,
+                    permanent_probe_owner::execute_system_nft,
+                )?);
+        }
+        self.permanent_probe_owner
+            .as_ref()
+            .ok_or("permanent-probe-owner-unavailable")?
+            .admit_producer()
+            .map(Some)
     }
 
     fn set_uplink_route(
@@ -7221,10 +7802,13 @@ impl Controller {
     }
 
     fn reset_uplink_learning(&mut self, reason: &str) {
+        self.history_traffic = history_traffic::Window::default();
         #[cfg(feature = "calibration")]
         self.reject_autotune_capture_measurement_basis(reason);
         self.dl_baseline_us.clear();
         self.ul_baseline_us.clear();
+        self.baseline_epoch = Instant::now();
+        self.baseline_warmup.clear();
         self.dl_ewma_us.clear();
         self.ul_ewma_us.clear();
         self.dl_delays = filled_bool_window(self.cfg.bufferbloat_detection_window);
@@ -7325,6 +7909,27 @@ impl Controller {
         }
     }
 
+    fn note_pinger_failure(&mut self, detail: &str) {
+        self.note_probe_gap();
+        self.invalidate_pinger_capture();
+        self.set_run_state("RECOVERING");
+        self.log(
+            "ERROR",
+            &format!("pinger unavailable; bounded in-process retry: {detail}"),
+        );
+    }
+
+    fn invalidate_pinger_capture(&mut self) {
+        #[cfg(feature = "calibration")]
+        {
+            self.reject_autotune_capture_measurement_basis("pinger restarted");
+            if self.rating_load.invalidate_capture("pinger-restarted") {
+                self.quality_grade.cancel_capture();
+                self.refresh_rating_load_snapshot(Instant::now());
+            }
+        }
+    }
+
     fn log_adaptive_update(&mut self, direction: &str, update: AdaptiveCeilingUpdate) {
         let reason = update
             .transition
@@ -7393,8 +7998,29 @@ impl Controller {
         active_reflectors: &[String],
         health: &ReflectorHealth,
     ) -> RateSample {
+        let rate_sample = self.sample_shaped_rates();
         let now = Instant::now();
-        let rate_sample = self.rate_monitor.sample();
+        self.on_sample_with_rates(sample, active_reflectors, health, rate_sample, now)
+    }
+
+    fn on_sample_with_rates(
+        &mut self,
+        sample: Sample,
+        active_reflectors: &[String],
+        health: &ReflectorHealth,
+        rate_sample: RateSample,
+        now: Instant,
+    ) -> RateSample {
+        if !sample.timestamp.is_finite()
+            || sample.timestamp < 0.0
+            || !sample.rtt_ms.is_finite()
+            || sample.rtt_ms < 0.0
+            || !sample.dl_owd_us.is_finite()
+            || !sample.ul_owd_us.is_finite()
+        {
+            self.note_probe_gap();
+            return rate_sample;
+        }
         #[cfg(feature = "calibration")]
         self.update_autotune_capture_rates(rate_sample);
         let dl_rate = rate_sample.dl_kbps;
@@ -7404,14 +8030,82 @@ impl Controller {
         let dl_load_pct = percent(dl_rate, self.shaper_dl);
         let ul_load_pct = percent(ul_rate, self.shaper_ul);
 
-        let dl_baseline = self
-            .dl_baseline_us
-            .entry(sample.reflector.clone())
-            .or_insert(100_000.0);
-        let ul_baseline = self
-            .ul_baseline_us
-            .entry(sample.reflector.clone())
-            .or_insert(100_000.0);
+        if !self.dl_baseline_us.contains_key(&sample.reflector)
+            || !self.ul_baseline_us.contains_key(&sample.reflector)
+        {
+            let Ok(minimum_quiet_span) = Duration::try_from_secs_f64(
+                (sample.rtt_ms / 1000.0).max(2.0 * health.timing.interval_s),
+            ) else {
+                return rate_sample;
+            };
+            let policy = latency_baseline::BaselinePolicy {
+                maximum_load_age: monitor_tick_timeout(&self.cfg)
+                    .saturating_mul(if rate_sample.fresh { 1 } else { 2 }),
+                minimum_quiet_span,
+                maximum_spread_us: [self.delay_thr_us(true), self.delay_thr_us(false)],
+            };
+            let quiet = dl_rate.is_finite()
+                && ul_rate.is_finite()
+                && dl_rate >= 0.0
+                && ul_rate >= 0.0
+                && dl_rate
+                    <= self
+                        .cfg
+                        .connection_active_thr_kbps
+                        .min(self.shaper_dl * 0.1)
+                && ul_rate
+                    <= self
+                        .cfg
+                        .connection_active_thr_kbps
+                        .min(self.shaper_ul * 0.1);
+            let warmed = self
+                .baseline_warmup
+                .entry(sample.reflector.clone())
+                .or_insert_with(|| latency_baseline::BaselineWarmup::new(self.baseline_epoch))
+                .observe(
+                    latency_baseline::BaselineObservation {
+                        owd_us: [sample.dl_owd_us, sample.ul_owd_us],
+                        now,
+                        load_epoch: rate_sample.dl_observed_at.min(rate_sample.ul_observed_at),
+                        quiet,
+                    },
+                    policy,
+                );
+            if let Some([dl, ul]) = warmed {
+                self.dl_baseline_us.insert(sample.reflector.clone(), dl);
+                self.ul_baseline_us.insert(sample.reflector.clone(), ul);
+                self.baseline_warmup.remove(&sample.reflector);
+                if self.run_state == "LEARNING" {
+                    self.set_run_state("RUNNING");
+                }
+            } else {
+                if self.dl_baseline_us.is_empty() {
+                    self.set_run_state("LEARNING");
+                }
+                // Keep status/counter/operation work alive but publish no bloat,
+                // grade or Auto-Tune observation from an unqualified baseline.
+                let _ = self.write_status(
+                    dl_rate,
+                    ul_rate,
+                    dl_load_pct,
+                    ul_load_pct,
+                    0,
+                    0,
+                    0.0,
+                    0.0,
+                    &sample,
+                    active_reflectors,
+                    Some(health),
+                );
+                return rate_sample;
+            }
+        }
+        let Some(dl_baseline) = self.dl_baseline_us.get_mut(&sample.reflector) else {
+            return rate_sample;
+        };
+        let Some(ul_baseline) = self.ul_baseline_us.get_mut(&sample.reflector) else {
+            return rate_sample;
+        };
         let mut dl_delta_us = sample.dl_owd_us - *dl_baseline;
         let mut ul_delta_us = sample.ul_owd_us - *ul_baseline;
 
@@ -7515,32 +8209,37 @@ impl Controller {
         }
 
         #[cfg(feature = "transport-probes")]
-        let transport_clean = self.transport_clean_for_growth(now);
-        #[cfg(not(feature = "transport-probes"))]
-        let transport_clean = true;
-        #[cfg(feature = "transport-probes")]
-        let transport_bloat = {
-            let transport_delta_ms = self
-                .transport_latency
-                .snapshot(now, self.cfg.transport_latency_enabled)
-                .delta_ms;
-            self.cfg.transport_latency_enabled
-                && transport_delta_ms
-                    .map(|delta| delta > self.cfg.quality_target_delay_ms)
-                    .unwrap_or(false)
+        let (transport_growth, transport_clean, transport_bloat) = {
+            let evidence = [
+                self.transport_control_evidence(true, now),
+                self.transport_control_evidence(false, now),
+            ];
+            (
+                evidence.map(TransportEvidence::allows_icmp_growth),
+                evidence.map(TransportEvidence::allows_promotion),
+                evidence.map(|value| value == TransportEvidence::Bad),
+            )
         };
         #[cfg(not(feature = "transport-probes"))]
-        let transport_bloat = false;
+        let (transport_growth, transport_clean, transport_bloat) =
+            ([true; 2], [true; 2], [false; 2]);
         if !self.runtime_rate_control_suspended() {
-            self.update_direction(true, dl_kind, dl_bb, avg_dl_delta, transport_clean, now);
-            self.update_direction(false, ul_kind, ul_bb, avg_ul_delta, transport_clean, now);
+            self.update_direction(true, dl_kind, dl_bb, avg_dl_delta, transport_growth[0], now);
+            self.update_direction(
+                false,
+                ul_kind,
+                ul_bb,
+                avg_ul_delta,
+                transport_growth[1],
+                now,
+            );
             self.update_adaptive_ceilings(
                 dl_kind,
                 ul_kind,
                 dl_rate,
                 ul_rate,
-                dl_bb || (matches!(dl_kind, LoadKind::High) && transport_bloat),
-                ul_bb || (matches!(ul_kind, LoadKind::High) && transport_bloat),
+                dl_bb || (matches!(dl_kind, LoadKind::High) && transport_bloat[0]),
+                ul_bb || (matches!(ul_kind, LoadKind::High) && transport_bloat[1]),
                 dl_delay_count,
                 ul_delay_count,
                 avg_dl_delta,
@@ -7700,8 +8399,9 @@ impl Controller {
         true
     }
 
-    fn maybe_record_graph_history(&mut self, dl_rate_kbps: f64, ul_rate_kbps: f64) {
+    fn maybe_record_graph_history(&mut self) {
         if !self.cfg.graph_history_enabled {
+            self.history_traffic = history_traffic::Window::default();
             return;
         }
 
@@ -7729,15 +8429,18 @@ impl Controller {
                 }
             }
         }
-        if self.history_budget.paused_low_memory
-            || self.history_budget.instance_budget_kib == 0
-            || self.last_graph_history_sample.elapsed()
-                < Duration::from_secs(self.cfg.graph_history_interval_s)
+        if self.history_budget.paused_low_memory || self.history_budget.instance_budget_kib == 0 {
+            self.history_traffic = history_traffic::Window::default();
+            return;
+        }
+        if self.last_graph_history_sample.elapsed()
+            < Duration::from_secs(self.cfg.graph_history_interval_s)
         {
             return;
         }
 
         self.last_graph_history_sample = Instant::now();
+        let traffic = self.history_traffic.finish();
         let now = epoch_secs();
         let rtt_ms = self.last_status.as_ref().and_then(|snapshot| {
             let age_s = now - snapshot.sample.timestamp;
@@ -7749,9 +8452,11 @@ impl Controller {
         });
         #[cfg(feature = "transport-probes")]
         let line = {
-            let transport = self
-                .transport_latency
-                .snapshot(Instant::now(), self.cfg.transport_latency_enabled);
+            let transport = self.transport_latency.snapshot_with_max_age(
+                Instant::now(),
+                self.cfg.transport_latency_enabled,
+                self.transport_max_age(),
+            );
             let effective_delta_ms = self.last_status.as_ref().map(|snapshot| {
                 effective_latency_delta_ms(
                     snapshot.avg_dl_delta,
@@ -7765,8 +8470,7 @@ impl Controller {
                 now,
                 rtt_ms,
                 self.cpu_total_percent,
-                dl_rate_kbps,
-                ul_rate_kbps,
+                traffic,
                 transport.delta_ms,
                 effective_delta_ms,
                 Some(self.throughput_floor_dl),
@@ -7793,12 +8497,11 @@ impl Controller {
             now,
             rtt_ms,
             self.cpu_total_percent,
-            dl_rate_kbps,
-            ul_rate_kbps,
+            traffic,
+            None,
+            None,
             Some(self.throughput_floor_dl),
             Some(self.throughput_floor_ul),
-            None,
-            None,
             self.uplink_state.as_str(),
             self.route_identity.as_deref().unwrap_or(""),
             None,
@@ -7965,10 +8668,18 @@ impl Controller {
         }
 
         if is_dl {
+            #[cfg(feature = "transport-probes")]
+            if shaper < self.shaper_dl {
+                self.quality_search_dl.reset();
+            }
             self.shaper_dl = shaper;
             self.last_bb_dl = last_bb;
             self.last_decay_dl = last_decay;
         } else {
+            #[cfg(feature = "transport-probes")]
+            if shaper < self.shaper_ul {
+                self.quality_search_ul.reset();
+            }
             self.shaper_ul = shaper;
             self.last_bb_ul = last_bb;
             self.last_decay_ul = last_decay;
@@ -7988,7 +8699,7 @@ impl Controller {
         ul_delay_count: usize,
         avg_dl_delta_us: f64,
         avg_ul_delta_us: f64,
-        transport_clean: bool,
+        transport_clean: [bool; 2],
         now: Instant,
     ) {
         if !self.cfg.adaptive_ceiling_enabled
@@ -8017,13 +8728,13 @@ impl Controller {
             && !dl_bufferbloat
             && dl_delay_count < self.cfg.bufferbloat_detection_thr
             && avg_dl_delta_us <= self.avg_adjust_up_thr_us(true)
-            && transport_clean;
+            && transport_clean[0];
         let ul_eligible = self.cfg.adjust_ul_shaper_rate
             && matches!(ul_kind, LoadKind::High)
             && !ul_bufferbloat
             && ul_delay_count < self.cfg.bufferbloat_detection_thr
             && avg_ul_delta_us <= self.avg_adjust_up_thr_us(false)
-            && transport_clean;
+            && transport_clean[1];
 
         if self.cfg.adjust_dl_shaper_rate {
             let dl_update = self.adaptive_dl.observe(
@@ -8055,21 +8766,35 @@ impl Controller {
 
     fn clamp_rates(&mut self) {
         if self.cfg.adjust_dl_shaper_rate {
+            #[cfg(feature = "transport-probes")]
+            let previous = self.shaper_dl;
             self.shaper_dl = self
                 .shaper_dl
-                .max(self.throughput_floor_dl)
+                .max(self.cfg.min_dl_shaper_rate_kbps.max(1.0))
                 .min(self.adaptive_dl.effective_max_kbps());
+            #[cfg(feature = "transport-probes")]
+            if self.shaper_dl < previous {
+                self.quality_search_dl.reset();
+            }
         }
         if self.cfg.adjust_ul_shaper_rate {
+            #[cfg(feature = "transport-probes")]
+            let previous = self.shaper_ul;
             self.shaper_ul = self
                 .shaper_ul
-                .max(self.throughput_floor_ul)
+                .max(self.cfg.min_ul_shaper_rate_kbps.max(1.0))
                 .min(self.adaptive_ul.effective_max_kbps());
+            #[cfg(feature = "transport-probes")]
+            if self.shaper_ul < previous {
+                self.quality_search_ul.reset();
+            }
         }
     }
 
     fn apply_shaper(&mut self, direction: &str) {
-        if self.runtime_rate_control_suspended() {
+        if self.runtime_rate_control_suspended()
+            || (!self.cfg.manage_sqm && !self.sqm_runtime_healthy)
+        {
             return;
         }
         let is_dl = direction == "dl";
@@ -8156,7 +8881,7 @@ impl Controller {
             return Ok(kind);
         }
         let output = tc_output(&["qdisc", "show", "dev", interface])?;
-        let (kind, _) = root_cake_qdisc(&output)?;
+        let (kind, _) = root_cake_control_identity(&output)?;
         if download {
             self.dl_qdisc_kind = Some(kind);
         } else {
@@ -8258,17 +8983,23 @@ impl Controller {
             .saturating_duration_since(self.adaptive_ul.phase_since())
             .as_secs_f64();
         #[cfg(feature = "transport-probes")]
-        let transport = self
-            .transport_latency
-            .snapshot(adaptive_now, self.cfg.transport_latency_enabled);
+        let transport = self.transport_latency.snapshot_with_max_age(
+            adaptive_now,
+            self.cfg.transport_latency_enabled,
+            self.transport_max_age(),
+        );
         #[cfg(feature = "transport-probes")]
-        let transport_dl = self
-            .transport_latency_dl
-            .snapshot(adaptive_now, self.cfg.transport_latency_enabled);
+        let transport_dl = self.transport_latency_dl.snapshot_with_max_age(
+            adaptive_now,
+            self.cfg.transport_latency_enabled,
+            self.transport_max_age(),
+        );
         #[cfg(feature = "transport-probes")]
-        let transport_ul = self
-            .transport_latency_ul
-            .snapshot(adaptive_now, self.cfg.transport_latency_enabled);
+        let transport_ul = self.transport_latency_ul.snapshot_with_max_age(
+            adaptive_now,
+            self.cfg.transport_latency_enabled,
+            self.transport_max_age(),
+        );
         #[cfg(feature = "transport-probes")]
         let effective_delta_ms =
             effective_latency_delta_ms(avg_dl_delta, avg_ul_delta, transport.delta_ms);
@@ -8281,6 +9012,8 @@ impl Controller {
         #[cfg(feature = "transport-probes")]
         let controller_quality_reason = if !self.cfg.transport_controller_enabled {
             "detected_only_controller_disabled"
+        } else if !transport.confirmed {
+            transport.status
         } else if self.quality_search_dl.limited() {
             self.quality_search_dl.last_reason()
         } else if self.quality_search_ul.limited() {
@@ -8386,6 +9119,16 @@ impl Controller {
             json_string_array(&bad_reflectors),
             reflector_health
         )?;
+        file.seek(SeekFrom::End(-2))?;
+        writeln!(file,
+            ",\"latency_baseline_ready\":{},\"latency_baseline_ready_reflectors\":{},\"latency_baseline_pending_reflectors\":{},\"runtime_control_held\":{},\"runtime_control_degraded\":{},\"runtime_control_error\":{}}}",
+            self.dl_baseline_us.contains_key(&sample.reflector) && self.ul_baseline_us.contains_key(&sample.reflector),
+            active_reflectors.iter().filter(|name| self.dl_baseline_us.contains_key(*name) && self.ul_baseline_us.contains_key(*name)).count(),
+            self.baseline_warmup.len(),
+            self.runtime_rate_control_suspended(),
+            self.runtime_control_error.is_some(),
+            json_string_or_null(self.runtime_control_error.as_deref()),
+        )?;
         #[cfg(feature = "transport-probes")]
         {
             file.seek(SeekFrom::End(-2))?;
@@ -8424,8 +9167,8 @@ impl Controller {
             },
             json_escape(quality_reason),
             controller_quality_class.as_str(),
-            self.quality_dl_class.as_str(),
-            self.quality_ul_class.as_str(),
+            classify_quality(transport_dl.delta_ms.map(|delta| effective_latency_delta_ms(avg_dl_delta, 0.0, Some(delta)))).as_str(),
+            classify_quality(transport_ul.delta_ms.map(|delta| effective_latency_delta_ms(0.0, avg_ul_delta, Some(delta)))).as_str(),
             transport.confidence,
             json_escape(controller_quality_reason),
             self.cfg.transport_controller_enabled && self.cfg.throughput_guard_enabled,
@@ -8434,6 +9177,13 @@ impl Controller {
             self.quality_search_dl.limited() || self.quality_search_ul.limited(),
             self.quality_search_dl.limited(),
             self.quality_search_ul.limited(),
+            )?;
+            file.seek(SeekFrom::End(-2))?;
+            writeln!(file,
+                ",\"transport_dl_status\":\"{}\",\"transport_ul_status\":\"{}\",\"transport_dl_sample_age_s\":{},\"transport_ul_sample_age_s\":{}}}",
+                transport_dl.status, transport_ul.status,
+                json_f64_or_null(transport_dl.sample_age_s, 3),
+                json_f64_or_null(transport_ul.sample_age_s, 3),
             )?;
             file.seek(SeekFrom::End(-2))?;
             write!(
@@ -8782,12 +9532,12 @@ impl Controller {
             return;
         }
         let line = format!("{kind}; {:.6}; {msg}", epoch_secs());
-        if kind == "DEBUG" && self.cfg.log_debug_messages_to_syslog {
-            let _ = Command::new("logger")
-                .arg("-t")
-                .arg("cake-autorate-rs")
-                .arg(&line)
-                .status();
+        if logging::should_emit_stderr(
+            kind,
+            self.cfg.log_debug_messages_to_syslog,
+            self.log.is_some(),
+        ) {
+            eprintln!("{}", logging::stderr_line(&line));
         }
         if let Some(file) = &mut self.log {
             let max_age = Duration::from_secs(self.cfg.log_file_max_time_mins.saturating_mul(60));
@@ -8801,10 +9551,13 @@ impl Controller {
                 buffer_timeout,
                 self.cfg.log_file_export_compress,
             ) {
-                eprintln!("failed to write log file: {e}");
+                if self.log_failure.should_report(e.kind(), Instant::now()) {
+                    eprintln!(
+                        "{}",
+                        logging::stderr_line(&format!("failed to write log file: {e}"))
+                    );
+                }
             }
-        } else {
-            eprintln!("{line}");
         }
     }
 }
@@ -8861,11 +9614,7 @@ fn attest_rate_only_runtime(
             "runtime attestation requests shaping outside the configured SQM topology".to_string(),
         );
     }
-    let current_sqm_fingerprint = operations::sqm_identity::managed_sqm_identity_fingerprint(
-        &controller.cfg.instance,
-        &controller.cfg.sqm_section,
-        &controller.cfg.sqm_interface,
-    )?;
+    let current_sqm_fingerprint = controller.sqm_identity_fingerprint()?;
     if current_sqm_fingerprint != expected.sqm_fingerprint {
         return Err("live SQM configuration fingerprint changed".to_string());
     }
@@ -9839,16 +10588,13 @@ impl operations::autotune_runtime_driver::RuntimeOverrideActuator
         permit: &operations::autotune_runtime::AutotuneRuntimePermit,
     ) -> Result<operations::autotune_runtime::RuntimeRestoreBaseline, String> {
         if permit.instance_name != self.controller.cfg.instance
+            || permit.dns_server != self.controller.cfg.explicit_dns_server
             || permit.target_interface != self.controller.cfg.sqm_interface
             || self.controller.route_identity.as_deref() != Some(permit.route_identity.as_str())
         {
             return Err("runtime permit does not match the live instance route".to_string());
         }
-        let current_sqm_fingerprint = operations::sqm_identity::managed_sqm_identity_fingerprint(
-            &self.controller.cfg.instance,
-            &self.controller.cfg.sqm_section,
-            &self.controller.cfg.sqm_interface,
-        )?;
+        let current_sqm_fingerprint = self.controller.sqm_identity_fingerprint()?;
         if current_sqm_fingerprint != permit.sqm_fingerprint {
             return Err("runtime permit does not match the live SQM configuration".to_string());
         }
@@ -9891,11 +10637,7 @@ impl operations::autotune_runtime_driver::RuntimeOverrideActuator
         ) {
             return Ok(false);
         }
-        Ok(operations::sqm_identity::managed_sqm_identity_fingerprint(
-            &self.controller.cfg.instance,
-            &self.controller.cfg.sqm_section,
-            &self.controller.cfg.sqm_interface,
-        )? == permit.sqm_fingerprint)
+        Ok(self.controller.sqm_identity_fingerprint()? == permit.sqm_fingerprint)
     }
 
     fn active_identity_matches(
@@ -10059,15 +10801,13 @@ impl operations::autotune_runtime_driver::RuntimeOverrideActuator
                 "saved baseline topology no longer matches this instance",
             ));
         }
-        let current_sqm_fingerprint = operations::sqm_identity::managed_sqm_identity_fingerprint(
-            &self.controller.cfg.instance,
-            &self.controller.cfg.sqm_section,
-            &self.controller.cfg.sqm_interface,
-        )
-        .map_err(unsafe_runtime_actuator_error)?;
+        let current_sqm_fingerprint = self
+            .controller
+            .sqm_identity_fingerprint()
+            .map_err(unsafe_runtime_actuator_error)?;
         if current_sqm_fingerprint != baseline.sqm_fingerprint {
             return Err(unsafe_runtime_actuator_error(
-                "saved baseline SQM fingerprint no longer matches current UCI; stale restore refused"
+                "saved baseline SQM fingerprint no longer matches its configuration authority; stale restore refused"
                     .to_string(),
             ));
         }
@@ -10076,7 +10816,7 @@ impl operations::autotune_runtime_driver::RuntimeOverrideActuator
         match inspect_sqm_topology_for(&self.controller.cfg, download_shaped, upload_shaped) {
             Ok(()) => {}
             Err(error) if error.kind == SqmTopologyErrorKind::Settling => {
-                recover_managed_sqm(&self.controller.cfg)
+                recover_managed_sqm(&self.controller.cfg, self.controller.service_input.as_ref())
                     .map_err(|error| classify_sqm_recovery_error(&self.controller.cfg, error))?;
                 self.controller.dl_qdisc_kind = None;
                 self.controller.ul_qdisc_kind = None;
@@ -10142,11 +10882,7 @@ impl operations::autotune_runtime_driver::RuntimeOverrideActuator
         if blocker_target != &baseline.target_interface {
             return Err("runtime restore blocker target identity changed".to_string());
         }
-        let current_sqm_fingerprint = operations::sqm_identity::managed_sqm_identity_fingerprint(
-            &self.controller.cfg.instance,
-            &self.controller.cfg.sqm_section,
-            &self.controller.cfg.sqm_interface,
-        )?;
+        let current_sqm_fingerprint = self.controller.sqm_identity_fingerprint()?;
         if current_sqm_fingerprint != baseline.sqm_fingerprint {
             return Err(
                 "saved baseline SQM fingerprint changed while restore was blocked".to_string(),
@@ -10294,15 +11030,23 @@ impl operations::autotune_runtime_driver::RuntimeOverrideActuator
 
     fn recover_safe_configuration(&mut self) -> Result<(), String> {
         self.controller.runtime_override_active = true;
-        let fresh_cfg = Config::from_uci(&self.controller.cfg.instance)
-            .map_err(|error| format!("unable to reload current UCI for safe recovery: {error}"))?;
+        let fresh_cfg = match &self.controller.service_input {
+            Some(input) => {
+                input.guard.attest()?;
+                self.controller.cfg.clone()
+            }
+            None => Config::from_uci(&self.controller.cfg.instance).map_err(|error| {
+                format!("unable to reload current UCI for safe recovery: {error}")
+            })?,
+        };
         if fresh_cfg.manage_sqm {
-            recover_managed_sqm(&fresh_cfg).map_err(|error| error.message().to_string())?;
+            recover_managed_sqm(&fresh_cfg, self.controller.service_input.as_ref())
+                .map_err(|error| error.message().to_string())?;
         }
         self.controller.set_sqm_runtime_status(
             "RECOVERY_REQUIRED",
             false,
-            "native Auto-Tune restored current UCI and remains latched",
+            "native Auto-Tune restored its configuration authority and remains latched",
         );
         self.controller.set_run_state("RECOVERY_REQUIRED");
         // Keep the ordinary controller frozen.  The runtime driver remains
@@ -10372,16 +11116,6 @@ fn idle_wake_due(
     route_probes_allowed && probe_loop_required(connection_active, operation_capture_active)
 }
 
-fn pinger_response_interval_s(cfg: &Config) -> f64 {
-    cfg.reflector_ping_interval_s / cfg.no_pingers.max(1) as f64
-}
-
-fn stall_detection_timeout(cfg: &Config) -> Duration {
-    Duration::from_secs_f64(
-        (cfg.stall_detection_thr as f64 * pinger_response_interval_s(cfg)).max(0.1),
-    )
-}
-
 fn monitor_tick_timeout(cfg: &Config) -> Duration {
     let configured_us = cfg
         .monitor_achieved_rates_interval_ms
@@ -10398,7 +11132,18 @@ fn monitor_tick_timeout(cfg: &Config) -> Duration {
     Duration::from_micros(configured_us.max(compensated_us))
 }
 
-fn run(mut cfg: Config, once: bool) -> Result<(), String> {
+fn run(cfg: Config, once: bool) -> Result<(), String> {
+    run_with_service_input(cfg, once, None)
+}
+
+fn run_with_service_input(
+    mut cfg: Config,
+    once: bool,
+    input: Option<operations::controller_input::Loaded>,
+) -> Result<(), String> {
+    if let Some(input) = &input {
+        input.guard.attest()?;
+    }
     if !cfg.enabled {
         println!("cake-autorate-rs instance '{}' is disabled", cfg.instance);
         return Ok(());
@@ -10409,14 +11154,28 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
             return Ok(());
         }
     }
+    if let Some(input) = &input {
+        input.guard.attest()?;
+    }
     cfg.refresh_wire_packet_sizes();
-    match wait_for_runtime_topology(&cfg) {
+    let topology = match &input {
+        Some(input) => {
+            wait_for_runtime_topology_attested(&cfg, Some(input), || input.guard.attest())
+        }
+        None => wait_for_runtime_topology(&cfg),
+    };
+    match topology {
         Ok(()) => {}
         Err(RuntimeTopologyWaitError::Terminated) => return Ok(()),
         Err(RuntimeTopologyWaitError::Failed(error)) => return Err(error),
     }
 
+    if let Some(input) = &input {
+        input.guard.attest()?;
+    }
+
     let mut controller = Controller::new(cfg.clone())?;
+    controller.service_input = input;
     let route_spec = cfg.route_spec();
     let mut route_inspector = RouteInspector::new(route_spec.clone());
     let mut uplink_lifecycle = UplinkLifecycle::new();
@@ -10444,7 +11203,7 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
         .take(cfg.no_pingers)
         .cloned()
         .collect();
-    let mut health = ReflectorHealth::new(&cfg, &active_reflectors);
+    let mut health = ReflectorHealth::new(&cfg, &active_reflectors, PingerTiming::configured(&cfg));
     controller
         .write_initial_status(&active_reflectors, Some(&health))
         .map_err(|e| format!("failed to write status: {e}"))?;
@@ -10456,6 +11215,11 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
         );
         return Ok(());
     }
+
+    // Resolve the executable through its configured route only when probes
+    // may start. Offline/--once startup must not depend on that wrapper working.
+    let mut pinger_plan = PingerPlan::configured(&cfg);
+    let mut reported_pinger_plan = None;
 
     // The driver is part of the normal instance safety boundary even while
     // native operation admission remains disabled.  With no exact private
@@ -10475,22 +11239,22 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
     let mut last_runtime_override_poll = Instant::now()
         .checked_sub(runtime_override_poll_interval)
         .unwrap_or_else(Instant::now);
-    #[cfg(feature = "calibration")]
-    let mut last_runtime_override_error: Option<String> = None;
 
     let mut pinger: Option<PingerRuntime> = None;
+    let mut pinger_recovery = pinger_recovery::PingerRecovery::default();
     #[cfg(feature = "transport-probes")]
-    let mut transport_probe = cfg
-        .transport_latency_enabled
-        .then(|| TransportProbeRuntime::spawn(&cfg));
-    let mut external_ip_probe = ExternalIpRuntime::spawn(route_spec.clone());
+    let mut transport_probe: Option<TransportProbeRuntime> = None;
+    #[cfg(feature = "transport-probes")]
+    let mut stopping_transport_probe: Option<TransportProbeRuntime> = None;
+    #[cfg(feature = "calibration")]
+    let probe_retirement_store =
+        operations::autotune_runtime_store::RuntimeOverrideStore::open(&cfg.run_dir())?;
+    let mut external_ip_probe = ExternalIpRuntime::spawn(&cfg, route_spec.clone());
     let mut main_state = MainState::Running;
     let mut idle_since: Option<Instant> = None;
     let mut last_reflector_response = Instant::now();
     let mut stall_started: Option<Instant> = None;
     let mut global_timeout_fired = false;
-    let stall_timeout = stall_detection_timeout(&cfg);
-    let global_timeout = Duration::from_secs_f64(cfg.global_ping_response_timeout_s.max(0.1));
     let idle_timeout = Duration::from_secs_f64(cfg.sustained_idle_sleep_thr_s.max(0.0));
     let route_check_interval = Duration::from_secs_f64(cfg.route_check_interval_s);
     let mut last_route_check = Instant::now();
@@ -10500,34 +11264,44 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
         .checked_sub(sqm_health_healthy_interval)
         .unwrap_or_else(Instant::now);
     let mut route_probes_allowed = initial_transition.probes_allowed;
-    external_ip_probe.maybe_start(route_probes_allowed);
+    if let Some(probe) = external_ip_probe.as_mut() {
+        probe.maybe_start(route_probes_allowed);
+    }
 
     while !TERMINATE.load(Ordering::SeqCst) {
         #[cfg(feature = "calibration")]
         if last_runtime_override_poll.elapsed() >= runtime_override_poll_interval {
             last_runtime_override_poll = Instant::now();
+            if let Err(error) = controller.probe_retirement.poll(
+                &probe_retirement_store,
+                &mut transport_probe,
+                &mut stopping_transport_probe,
+            ) {
+                controller.record_autotune_capture_error(error);
+            }
             let boot_ms = operations::identity::monotonic_boot_ms().unwrap_or(0);
             let mut actuator = OpenWrtRateOverrideActuator {
                 controller: &mut controller,
                 boot_ms,
             };
+            let prior_restore_reason = runtime_override_driver.restore_reason();
             let runtime_poll = runtime_override_driver.poll(&mut actuator);
-            controller.runtime_operation_active = runtime_driver_holds_controller(&runtime_poll);
-            match runtime_poll {
-                Ok(_) => last_runtime_override_error = None,
-                Err(error) => {
-                    // An unreadable runtime owner is not proof that ordinary
-                    // control may resume. The helper above keeps writes held
-                    // until a later successful poll proves exact Idle state.
-                    if last_runtime_override_error.as_deref() != Some(error.as_str()) {
-                        controller.log(
-                            "ERROR",
-                            &format!("native Auto-Tune runtime control failed: {error}"),
-                        );
-                        last_runtime_override_error = Some(error);
-                    }
+            if let Some(reason) = runtime_override_driver.restore_reason() {
+                if Some(reason) != prior_restore_reason {
+                    controller.log(
+                        "INFO",
+                        &format!("autotune-runtime-restoration reason={reason:?}"),
+                    );
                 }
             }
+            controller.set_runtime_control_state(
+                runtime_driver_holds_controller(&runtime_poll),
+                runtime_poll
+                    .as_ref()
+                    .err()
+                    .map(String::as_str)
+                    .or_else(|| runtime_override_driver.unsafe_recovery_reason()),
+            );
             controller.sync_autotune_capture_admission();
         }
         let sqm_health_interval = if controller.sqm_runtime_healthy {
@@ -10547,13 +11321,24 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                 idle_since = None;
                 stall_started = None;
                 global_timeout_fired = false;
-                health = ReflectorHealth::new(&cfg, &active_reflectors);
+                health = ReflectorHealth::new(&cfg, &active_reflectors, pinger_plan.timing);
                 if route_probes_allowed {
-                    pinger = Some(PingerRuntime::spawn(&cfg, &active_reflectors)?);
+                    pinger = pinger_recovery::try_spawn(
+                        &cfg,
+                        &active_reflectors,
+                        &mut pinger_plan,
+                        &mut pinger_recovery,
+                        &mut controller,
+                    );
                     last_reflector_response = Instant::now();
                 }
             }
             if !sqm_ready {
+                #[cfg(feature = "transport-probes")]
+                TransportProbeRuntime::request_retirement(
+                    &mut transport_probe,
+                    &mut stopping_transport_probe,
+                )?;
                 if let Some(mut old) = pinger.take() {
                     old.stop();
                 }
@@ -10562,16 +11347,21 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                 continue;
             }
         }
-        external_ip_probe.drain(&mut controller);
+        if let Some(probe) = external_ip_probe.as_mut() {
+            probe.drain(&mut controller);
+        }
         if last_route_check.elapsed() >= route_check_interval {
             last_route_check = Instant::now();
             let inspected = route_inspector.inspect();
             let transition =
                 uplink_lifecycle.observe(inspected.as_ref().map_err(|error| error.as_str()));
-            let must_stop = transition.became_offline
-                || transition.identity_changed
-                || (route_probes_allowed && !transition.probes_allowed);
+            let must_stop = transition.retires_probes(route_probes_allowed);
             if must_stop {
+                #[cfg(feature = "transport-probes")]
+                TransportProbeRuntime::request_retirement(
+                    &mut transport_probe,
+                    &mut stopping_transport_probe,
+                )?;
                 if let Some(mut old) = pinger.take() {
                     old.stop();
                 }
@@ -10592,7 +11382,9 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                 &transition.reason,
                 transition.reset_learning,
             );
-            external_ip_probe.maybe_start(route_probes_allowed);
+            if let Some(probe) = external_ip_probe.as_mut() {
+                probe.maybe_start(route_probes_allowed);
+            }
             if route_probes_allowed
                 && pinger.is_none()
                 && current_route_snapshot.is_some()
@@ -10603,10 +11395,48 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                     controller.set_run_state("RUNNING");
                     idle_since = None;
                 }
-                health = ReflectorHealth::new(&cfg, &active_reflectors);
-                pinger = Some(PingerRuntime::spawn(&cfg, &active_reflectors)?);
+                if !pinger_recovery.recovering() {
+                    health = ReflectorHealth::new(&cfg, &active_reflectors, pinger_plan.timing);
+                }
+                pinger = pinger_recovery::try_spawn(
+                    &cfg,
+                    &active_reflectors,
+                    &mut pinger_plan,
+                    &mut pinger_recovery,
+                    &mut controller,
+                );
                 last_reflector_response = Instant::now();
             }
+        }
+        if pinger.is_none()
+            && pinger_recovery.recovering()
+            && pinger_recovery.ready(Instant::now())
+            && route_probes_allowed
+            && current_route_snapshot.is_some()
+            && main_state != MainState::Idle
+        {
+            pinger = pinger_recovery::try_spawn(
+                &cfg,
+                &active_reflectors,
+                &mut pinger_plan,
+                &mut pinger_recovery,
+                &mut controller,
+            );
+        }
+        health.timing = pinger_plan.timing;
+        let stall_timeout = pinger_plan.timing.stall_timeout;
+        let global_timeout = Duration::from_secs_f64(cfg.global_ping_response_timeout_s.max(0.1))
+            .max(pinger_plan.timing.response_deadline);
+        if pinger.is_some() && reported_pinger_plan != Some(pinger_plan) {
+            controller.log(
+                "INFO",
+                &format!(
+                "pinger backend={} effective_interval={}s stall_timeout={}s response_deadline={}s",
+                pinger_plan.name(), pinger_plan.timing.interval_s,
+                stall_timeout.as_secs_f64(), pinger_plan.timing.response_deadline.as_secs_f64(),
+            ),
+            );
+            reported_pinger_plan = Some(pinger_plan);
         }
         let mut sampled_rates = None;
         if pinger.is_some() {
@@ -10619,7 +11449,18 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
 
             match result {
                 Ok(Ok(line)) => {
-                    if let Some(sample) = parse_sample_line(&cfg, &line.line, &line.reflector) {
+                    // Queueing must not turn an old reply (or timeout) into a
+                    // fresh observation, including backends without timestamps.
+                    if line.is_stale_at(Instant::now()) {
+                        controller.note_probe_gap();
+                        continue;
+                    }
+                    if let Some(sample) = parse_sample_line(
+                        &cfg,
+                        &line.line,
+                        &line.reflector,
+                        line.observed_epoch_secs,
+                    ) {
                         if sample_is_stale(&sample, epoch_secs()) {
                             controller.note_probe_gap();
                             controller.log(
@@ -10631,7 +11472,11 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                             );
                             continue;
                         }
-                        last_reflector_response = Instant::now();
+                        last_reflector_response = last_reflector_response.max(line.observed_at);
+                        pinger_recovery.sample_received(line.observed_at);
+                        if controller.run_state == "RECOVERING" {
+                            controller.set_run_state("RUNNING");
+                        }
                         if main_state == MainState::Stall {
                             controller.log("DEBUG", "Reflector response detected.");
                             controller.log(
@@ -10643,7 +11488,7 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                             stall_started = None;
                             global_timeout_fired = false;
                         }
-                        health.observe_sample(&cfg, &sample);
+                        health.observe_sample(&cfg, &sample, line.observed_at);
                         sampled_rates =
                             Some(controller.on_sample(sample, &active_reflectors, &health));
                         if uplink_lifecycle
@@ -10661,67 +11506,35 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                         controller.observe_autotune_icmp_timeout();
                     }
                 }
-                Ok(Err(e)) => {
-                    let inspected = route_inspector.inspect_fresh();
-                    let route_is_online = inspected
-                        .as_ref()
-                        .map(|snapshot| snapshot.online)
-                        .unwrap_or(false);
-                    if route_is_online {
-                        return Err(e);
-                    }
-                    if let Some(mut old) = pinger.take() {
-                        old.stop();
-                    }
-                    let transition = uplink_lifecycle
-                        .observe(inspected.as_ref().map_err(|error| error.as_str()));
-                    current_route_snapshot = inspected.ok();
-                    route_probes_allowed = false;
-                    controller.set_uplink_route(
-                        current_route_snapshot.clone(),
-                        transition.state,
-                        &transition.reason,
-                        transition.reset_learning,
-                    );
-                    continue;
-                }
                 Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
+                failure @ (Ok(Err(_)) | Err(RecvTimeoutError::Disconnected)) => {
                     if TERMINATE.load(Ordering::SeqCst) {
                         break;
                     }
-
-                    #[cfg(feature = "calibration")]
-                    if cfg.pinger_method == "irtt" {
-                        controller.note_probe_gap();
-                        controller.log(
-                            "DEBUG",
-                            "irtt session ended; restarting irtt clients for active servers",
-                        );
-                        if let Some(mut old) = pinger.take() {
-                            old.stop();
-                        }
-                        if route_probes_allowed {
-                            pinger = Some(PingerRuntime::spawn(&cfg, &active_reflectors)?);
-                        }
-                        continue;
-                    }
-
-                    let inspected = route_inspector.inspect_fresh();
-                    let route_is_online = inspected
-                        .as_ref()
-                        .map(|snapshot| snapshot.online)
-                        .unwrap_or(false);
-                    if route_is_online {
-                        return Err(format!("{} output closed unexpectedly", cfg.pinger_method));
-                    }
+                    let detail = match failure {
+                        Ok(Err(error)) => error,
+                        _ => format!("{} output closed unexpectedly", cfg.pinger_method),
+                    };
+                    controller.note_pinger_failure(&detail);
                     if let Some(mut old) = pinger.take() {
                         old.stop();
                     }
+                    pinger_recovery.failed(Instant::now());
+                    let inspected = route_inspector.inspect_fresh();
                     let transition = uplink_lifecycle
                         .observe(inspected.as_ref().map_err(|error| error.as_str()));
+                    #[cfg(feature = "transport-probes")]
+                    if transition.retires_probes(route_probes_allowed) {
+                        TransportProbeRuntime::request_retirement(
+                            &mut transport_probe,
+                            &mut stopping_transport_probe,
+                        )?;
+                    }
+                    if transition.identity_changed || transition.state == UplinkState::Offline {
+                        controller.set_route_external_ip(String::new());
+                    }
                     current_route_snapshot = inspected.ok();
-                    route_probes_allowed = false;
+                    route_probes_allowed = transition.probes_allowed;
                     controller.set_uplink_route(
                         current_route_snapshot.clone(),
                         transition.state,
@@ -10736,9 +11549,14 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
         }
 
         let now = Instant::now();
-        if now.duration_since(last_reflector_response)
-            > Duration::from_secs_f64(cfg.reflector_response_deadline_s.max(0.1))
-        {
+        if pinger_recovery.containment_due(now, global_timeout) {
+            controller.log("ERROR", "pinger recovery exceeded global response timeout");
+            controller.reset_adaptive_after_sustained_gap();
+            if cfg.min_shaper_rates_enforcement {
+                controller.set_min_shaper_rates("pinger recovery timeout");
+            }
+        }
+        if now.duration_since(last_reflector_response) > pinger_plan.timing.response_deadline {
             controller.note_probe_gap();
         }
         let rate_sample = sampled_rates.unwrap_or_else(|| controller.sample_rates());
@@ -10758,22 +11576,48 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
         } else {
             controller.rating_load_snapshot.clone()
         };
-        #[cfg(feature = "calibration")]
+        #[cfg(feature = "transport-probes")]
         {
             // Rating and Full Auto-Tune require direction-bound transport
             // evidence even when continuous transport monitoring is disabled.
             // Own the probe runtime only for the exact published capture and
-            // drop it again after cleanup; this never changes UCI or enables
-            // the ordinary transport controller.
-            let required = transport_probe_runtime_required(
-                cfg.transport_latency_enabled,
-                controller.autotune_capture_request.is_some(),
-                rating_load.capture_active,
-            );
-            if required && transport_probe.is_none() {
-                transport_probe = Some(TransportProbeRuntime::spawn(&cfg));
+            // retire it after cleanup; do not overlap a replacement with its
+            // still-running predecessor or block the CAKE control loop joining.
+            if stopping_transport_probe
+                .as_mut()
+                .is_some_and(|runtime| runtime.finish_stop())
+            {
+                stopping_transport_probe = None;
+            }
+            #[cfg(feature = "calibration")]
+            let required = route_probes_allowed
+                && !controller.probe_retirement.blocks_probes()
+                && transport_probe_runtime_required(
+                    cfg.transport_latency_enabled,
+                    controller.autotune_capture_request.is_some(),
+                    rating_load.capture_active,
+                );
+            #[cfg(not(feature = "calibration"))]
+            let required = route_probes_allowed && cfg.transport_latency_enabled;
+            if required
+                && transport_probe.is_none()
+                && stopping_transport_probe.is_none()
+                && (cfg.route_mode != "explicit" || pinger_recovery.ready(now))
+            {
+                match controller.permanent_probe_producer() {
+                    Ok(producer) => {
+                        transport_probe = Some(TransportProbeRuntime::spawn(&cfg, producer))
+                    }
+                    Err(error) => {
+                        controller.note_pinger_failure(&error);
+                        pinger_recovery.failed(Instant::now());
+                    }
+                }
             } else if !required && transport_probe.is_some() {
-                transport_probe = None;
+                TransportProbeRuntime::request_retirement(
+                    &mut transport_probe,
+                    &mut stopping_transport_probe,
+                )?;
             }
         }
         #[cfg(feature = "calibration")]
@@ -10853,7 +11697,7 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
         if controller.maybe_sample_cpu() {
             let _ = controller.refresh_status_from_last_sample();
         }
-        controller.maybe_record_graph_history(dl_rate, ul_rate);
+        controller.maybe_record_graph_history();
         let connection_active =
             dl_rate > cfg.connection_active_thr_kbps || ul_rate > cfg.connection_active_thr_kbps;
         // An admitted bounded operation capture is an identity-bound
@@ -10903,7 +11747,9 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                     }
                 }
 
-                if now.duration_since(last_reflector_response) > stall_timeout {
+                if !pinger_recovery.recovering()
+                    && now.duration_since(last_reflector_response) > stall_timeout
+                {
                     controller.log(
                         "DEBUG",
                         &format!(
@@ -10938,14 +11784,22 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                 }
 
                 if route_probes_allowed
+                    && pinger.is_some()
                     && main_state == MainState::Running
                     && health.check(&cfg, &mut active_reflectors, &mut controller)
                 {
                     controller.note_probe_gap();
+                    controller.invalidate_pinger_capture();
                     if let Some(mut old) = pinger.take() {
                         old.stop();
                     }
-                    pinger = Some(PingerRuntime::spawn(&cfg, &active_reflectors)?);
+                    pinger = pinger_recovery::try_spawn(
+                        &cfg,
+                        &active_reflectors,
+                        &mut pinger_plan,
+                        &mut pinger_recovery,
+                        &mut controller,
+                    );
                 }
             }
             MainState::Idle => {
@@ -10973,8 +11827,14 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                     main_state = MainState::Running;
                     controller.set_run_state("RUNNING");
                     last_reflector_response = Instant::now();
-                    health = ReflectorHealth::new(&cfg, &active_reflectors);
-                    pinger = Some(PingerRuntime::spawn(&cfg, &active_reflectors)?);
+                    health = ReflectorHealth::new(&cfg, &active_reflectors, pinger_plan.timing);
+                    pinger = pinger_recovery::try_spawn(
+                        &cfg,
+                        &active_reflectors,
+                        &mut pinger_plan,
+                        &mut pinger_recovery,
+                        &mut controller,
+                    );
                 }
             }
             MainState::Stall => {
@@ -11002,6 +11862,7 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                     && now.duration_since(last_reflector_response) > global_timeout
                 {
                     global_timeout_fired = true;
+                    controller.reset_adaptive_after_sustained_gap();
                     controller.log(
                         "SYSLOG",
                         &format!(
@@ -11016,7 +11877,13 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
                     if let Some(mut old) = pinger.take() {
                         old.stop();
                     }
-                    pinger = Some(PingerRuntime::spawn(&cfg, &active_reflectors)?);
+                    pinger = pinger_recovery::try_spawn(
+                        &cfg,
+                        &active_reflectors,
+                        &mut pinger_plan,
+                        &mut pinger_recovery,
+                        &mut controller,
+                    );
                     last_reflector_response = now;
                     stall_started = Some(now);
                 } else if stall_started.is_none() {
@@ -11029,19 +11896,35 @@ fn run(mut cfg: Config, once: bool) -> Result<(), String> {
     if let Some(mut pinger) = pinger {
         pinger.stop();
     }
+    #[cfg(feature = "transport-probes")]
+    {
+        drop(transport_probe.take());
+        drop(stopping_transport_probe.take());
+    }
+    if let Some(owner) = controller.permanent_probe_owner.take() {
+        owner.retire(|args| permanent_probe_owner::execute_system_nft(args, None))?;
+    }
     Ok(())
 }
 
 struct PingerLine {
     line: String,
     reflector: String,
-    #[cfg(feature = "calibration")]
+    // Reader receipt, not network receive time. Backend timestamps remain in
+    // the parsed sample; both clocks are checked before controller consumption.
     observed_at: Instant,
-    #[cfg(feature = "calibration")]
     observed_epoch_secs: f64,
 }
 
+impl PingerLine {
+    fn is_stale_at(&self, now: Instant) -> bool {
+        now.checked_duration_since(self.observed_at)
+            .is_none_or(|age| age > Duration::from_secs_f64(STALE_REFLECTOR_RESPONSE_MAX_AGE_S))
+    }
+}
+
 struct PingerRuntime {
+    producer: Option<permanent_probe_owner::PermanentProbeProducer>,
     children: Vec<Child>,
     readers: Vec<JoinHandle<()>>,
     lines: Receiver<Result<PingerLine, String>>,
@@ -11050,13 +11933,41 @@ struct PingerRuntime {
 }
 
 impl PingerRuntime {
-    fn spawn(cfg: &Config, active_reflectors: &[String]) -> Result<Self, String> {
-        let children = spawn_pingers(cfg, active_reflectors)?;
-        Self::from_children(children, cfg.pinger_method.clone(), active_reflectors, None)
+    fn spawn(
+        cfg: &Config,
+        active_reflectors: &[String],
+        plan: &mut PingerPlan,
+        route: &RouteSnapshot,
+        producer: Option<permanent_probe_owner::PermanentProbeProducer>,
+    ) -> Result<Self, String> {
+        if producer
+            .as_ref()
+            .is_some_and(|owner| owner.route() != &route.identity)
+        {
+            return Err("permanent pinger route differs from its owner".into());
+        }
+        if cfg.route_mode == "explicit" && producer.is_none() {
+            return Err("explicit permanent pinger requires an admitted owner".into());
+        }
+        let probe_gid = producer.as_ref().map(|owner| owner.gid());
+        let bound_args = pinger_binding::arguments(cfg, route)?;
+        let detected = PingerPlan::detect(cfg)?;
+        let children = spawn_pingers(cfg, active_reflectors, &detected, &bound_args, probe_gid)?;
+        *plan = detected;
+        Self::from_children(
+            children,
+            cfg.pinger_method.clone(),
+            active_reflectors,
+            None,
+            producer,
+        )
     }
 
     #[cfg(feature = "calibration")]
-    fn spawn_bootstrap(request: &operations::protocol::OperationRequest) -> Result<Self, String> {
+    fn spawn_bootstrap(
+        request: &operations::protocol::OperationRequest,
+        traffic_gid: Option<u32>,
+    ) -> Result<Self, String> {
         request.validate()?;
         if request.target_state != operations::protocol::OperationTargetState::AbsentBootstrap {
             return Err("bootstrap pinger requires an absent target request".to_string());
@@ -11082,13 +11993,30 @@ impl PingerRuntime {
             request.route.mwan3_member.as_deref().unwrap_or(""),
             &request.route.l3_device,
         );
-        route_spec.validate()?;
         let period_ms = u64::from(policy.reflector_ping_interval_ms());
         let interval_ms = (period_ms / active_reflectors.len() as u64).max(1);
-        let mut command = routing::routed_command(&route_spec, "", "fping")?;
+        let binding =
+            pinger_binding::bootstrap_arguments(&request.route, traffic_gid, &active_reflectors)?;
+        let mut command =
+            if request.route.mode == operations::protocol::OperationRouteMode::Explicit {
+                operations::runtime::attest_openwrt_route_identity(request)
+                    .map_err(|(_, error, _)| error)?;
+                Command::new("fping")
+            } else {
+                routing::routed_command(&route_spec, "", "fping")?
+            };
+        if let Some(gid) = traffic_gid {
+            if matches!(gid, 0 | u32::MAX) {
+                return Err("bootstrap probe group is invalid".into());
+            }
+            if operations::autotune_runtime_store::effective_uid() != 0 {
+                return Err("probe accounting requires a root pinger owner".into());
+            }
+            command.gid(gid);
+        }
+        command.env("LC_ALL", "C");
         command
-            .arg("-I")
-            .arg(&request.route.l3_device)
+            .args(binding)
             .arg("--timestamp")
             .arg("--loop")
             .arg("--period")
@@ -11118,28 +12046,34 @@ impl PingerRuntime {
             policy.pinger_method().to_string(),
             &active_reflectors,
             Some(wake),
+            None,
         )
     }
 
     fn from_children(
-        mut children: Vec<Child>,
+        children: Vec<Child>,
         method: String,
         active_reflectors: &[String],
         wake: Option<Arc<OwnedFd>>,
+        producer: Option<permanent_probe_owner::PermanentProbeProducer>,
     ) -> Result<Self, String> {
         let (tx, lines) = mpsc::channel();
-        let mut readers = Vec::new();
+        // Establish cleanup ownership before any fallible reader setup. Every
+        // early return must reap children and join already-created readers.
+        let mut runtime = Self {
+            producer,
+            readers: Vec::with_capacity(children.len()),
+            children,
+            lines,
+            #[cfg(feature = "calibration")]
+            wake: wake.clone(),
+        };
 
-        for idx in 0..children.len() {
-            let stdout = match children[idx].stdout.take() {
-                Some(stdout) => stdout,
-                None => {
-                    for child in &mut children {
-                        stop_child(child);
-                    }
-                    return Err(format!("failed to capture {method} stdout"));
-                }
-            };
+        for idx in 0..runtime.children.len() {
+            let stdout = runtime.children[idx]
+                .stdout
+                .take()
+                .ok_or_else(|| format!("failed to capture {method} stdout"))?;
             let tx = tx.clone();
             let method = method.clone();
             let wake_writer = wake.clone();
@@ -11151,41 +12085,44 @@ impl PingerRuntime {
             } else {
                 String::new()
             };
-            readers.push(thread::spawn(move || {
-                let reader = BufReader::new(stdout);
-                for line in reader.lines() {
-                    match line {
-                        Ok(line) => {
-                            let event = PingerLine {
-                                line,
-                                reflector: reflector.clone(),
-                                #[cfg(feature = "calibration")]
-                                observed_at: Instant::now(),
-                                #[cfg(feature = "calibration")]
-                                observed_epoch_secs: epoch_secs(),
-                            };
-                            if tx.send(Ok(event)).is_err() {
-                                break;
+            runtime.readers.push(
+                thread::Builder::new()
+                    .spawn(move || {
+                        let reader = BufReader::new(stdout);
+                        let mut failed = false;
+                        for line in reader.lines() {
+                            match line {
+                                Ok(line) => {
+                                    let event = PingerLine {
+                                        line,
+                                        reflector: reflector.clone(),
+                                        observed_at: Instant::now(),
+                                        observed_epoch_secs: epoch_secs(),
+                                    };
+                                    if tx.send(Ok(event)).is_err() {
+                                        break;
+                                    }
+                                    notify_pinger_wake(wake_writer.as_deref());
+                                }
+                                Err(e) => {
+                                    failed = true;
+                                    let _ = tx
+                                        .send(Err(format!("failed to read {method} output: {e}")));
+                                    notify_pinger_wake(wake_writer.as_deref());
+                                    break;
+                                }
                             }
+                        }
+                        if !failed {
+                            let _ = tx.send(Err(format!("{method} output closed")));
                             notify_pinger_wake(wake_writer.as_deref());
                         }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("failed to read {method} output: {e}")));
-                            notify_pinger_wake(wake_writer.as_deref());
-                            break;
-                        }
-                    }
-                }
-            }));
+                    })
+                    .map_err(|error| format!("failed to create pinger reader: {error}"))?,
+            );
         }
 
-        Ok(Self {
-            children,
-            readers,
-            lines,
-            #[cfg(feature = "calibration")]
-            wake,
-        })
+        Ok(runtime)
     }
 
     #[cfg(feature = "calibration")]
@@ -11225,12 +12162,26 @@ impl PingerRuntime {
     }
 
     fn stop(&mut self) {
+        let mut stopped = true;
         for child in &mut self.children {
-            stop_child(child);
+            stopped &= stop_child(child);
         }
         for reader in self.readers.drain(..) {
-            let _ = reader.join();
+            stopped &= reader.join().is_ok();
         }
+        self.children.clear();
+        if let Some(producer) = self.producer.take() {
+            if stopped {
+                producer.confirm_stopped();
+            }
+            // Otherwise Drop permanently quarantines the owner.
+        }
+    }
+}
+
+impl Drop for PingerRuntime {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -11248,14 +12199,37 @@ fn notify_pinger_wake(wake: Option<&OwnedFd>) {
     };
 }
 
-fn spawn_pingers(cfg: &Config, active_reflectors: &[String]) -> Result<Vec<Child>, String> {
+fn spawn_pingers(
+    cfg: &Config,
+    active_reflectors: &[String],
+    plan: &PingerPlan,
+    bound_args: &[String],
+    probe_gid: Option<u32>,
+) -> Result<Vec<Child>, String> {
     match cfg.pinger_method.as_str() {
-        "fping" => Ok(vec![spawn_fping(cfg, active_reflectors, false)?]),
-        "fping-ts" => Ok(vec![spawn_fping(cfg, active_reflectors, true)?]),
-        "tsping" => Ok(vec![spawn_tsping(cfg, active_reflectors)?]),
+        "fping" => Ok(vec![spawn_fping(
+            cfg,
+            active_reflectors,
+            false,
+            bound_args,
+            probe_gid,
+        )?]),
+        "fping-ts" => Ok(vec![spawn_fping(
+            cfg,
+            active_reflectors,
+            true,
+            bound_args,
+            probe_gid,
+        )?]),
+        "tsping" => Ok(vec![spawn_tsping(
+            cfg,
+            active_reflectors,
+            bound_args,
+            probe_gid,
+        )?]),
         #[cfg(feature = "calibration")]
-        "irtt" => spawn_irtt(cfg, active_reflectors),
-        "ping" => spawn_ping(cfg, active_reflectors),
+        "irtt" => spawn_irtt(cfg, active_reflectors, bound_args, probe_gid),
+        "ping" => spawn_ping(cfg, active_reflectors, plan, bound_args, probe_gid),
         other => Err(format!("unsupported pinger_method={other}")),
     }
 }
@@ -11264,6 +12238,8 @@ fn spawn_fping(
     cfg: &Config,
     active_reflectors: &[String],
     icmp_timestamp: bool,
+    bound_args: &[String],
+    probe_gid: Option<u32>,
 ) -> Result<Child, String> {
     let period_ms = (cfg.reflector_ping_interval_s * 1000.0).round().max(1.0) as u64;
     let interval_ms = (period_ms / active_reflectors.len().max(1) as u64).max(1);
@@ -11273,10 +12249,8 @@ fn spawn_fping(
         return Err("at least one reflector is required".to_string());
     }
 
-    let mut cmd = pinger_command(cfg, "fping")?;
-    for arg in safe_extra_args(&cfg.ping_extra_args) {
-        cmd.arg(arg);
-    }
+    let mut cmd = pinger_command(cfg, "fping", probe_gid)?;
+    cmd.args(bound_args);
     cmd.arg("--timestamp")
         .arg("--loop")
         .arg("--period")
@@ -11296,7 +12270,12 @@ fn spawn_fping(
         .map_err(|e| format!("failed to start fping: {e}"))
 }
 
-fn spawn_tsping(cfg: &Config, active_reflectors: &[String]) -> Result<Child, String> {
+fn spawn_tsping(
+    cfg: &Config,
+    active_reflectors: &[String],
+    bound_args: &[String],
+    probe_gid: Option<u32>,
+) -> Result<Child, String> {
     let period_ms = (cfg.reflector_ping_interval_s * 1000.0).round().max(1.0) as u64;
     let spacing_ms = (period_ms / active_reflectors.len().max(1) as u64).max(1);
     let sleep_ms = if active_reflectors.len() == 1 {
@@ -11310,10 +12289,8 @@ fn spawn_tsping(cfg: &Config, active_reflectors: &[String]) -> Result<Child, Str
         return Err("at least one reflector is required".to_string());
     }
 
-    let mut cmd = pinger_command(cfg, "tsping")?;
-    for arg in safe_extra_args(&cfg.ping_extra_args) {
-        cmd.arg(arg);
-    }
+    let mut cmd = pinger_command(cfg, "tsping", probe_gid)?;
+    cmd.args(bound_args);
     cmd.arg("--print-timestamps")
         .arg("--machine-readable=,")
         .arg("--sleep-time")
@@ -11327,14 +12304,20 @@ fn spawn_tsping(cfg: &Config, active_reflectors: &[String]) -> Result<Child, Str
         .map_err(|e| format!("failed to start tsping: {e}"))
 }
 
-fn spawn_ping(cfg: &Config, active_reflectors: &[String]) -> Result<Vec<Child>, String> {
+fn spawn_ping(
+    cfg: &Config,
+    active_reflectors: &[String],
+    plan: &PingerPlan,
+    bound_args: &[String],
+    probe_gid: Option<u32>,
+) -> Result<Vec<Child>, String> {
     if active_reflectors.is_empty() {
         return Err("at least one reflector is required".to_string());
     }
 
     let mut children = Vec::new();
     for target in active_reflectors {
-        match spawn_ping_child(cfg, target) {
+        match spawn_ping_child(cfg, target, plan, bound_args, probe_gid) {
             Ok(child) => children.push(child),
             Err(e) => {
                 for child in &mut children {
@@ -11348,19 +12331,16 @@ fn spawn_ping(cfg: &Config, active_reflectors: &[String]) -> Result<Vec<Child>, 
     Ok(children)
 }
 
-fn spawn_ping_child(cfg: &Config, target: &str) -> Result<Child, String> {
-    let interval_s = cfg.reflector_ping_interval_s.ceil().max(1.0) as u64;
-
-    let mut cmd = pinger_command(cfg, "ping")?;
-    cmd.arg("-n")
-        .arg("-i")
-        .arg(interval_s.to_string())
-        .arg("-W")
-        .arg("10");
-
-    for arg in safe_extra_args(&cfg.ping_extra_args) {
-        cmd.arg(arg);
-    }
+fn spawn_ping_child(
+    cfg: &Config,
+    target: &str,
+    plan: &PingerPlan,
+    bound_args: &[String],
+    probe_gid: Option<u32>,
+) -> Result<Child, String> {
+    let mut cmd = pinger_command(cfg, "ping", probe_gid)?;
+    cmd.args(bound_args);
+    plan.append_ping_arguments(&mut cmd);
 
     cmd.arg(target)
         .stdout(Stdio::piped())
@@ -11370,7 +12350,12 @@ fn spawn_ping_child(cfg: &Config, target: &str) -> Result<Child, String> {
 }
 
 #[cfg(feature = "calibration")]
-fn spawn_irtt(cfg: &Config, active_reflectors: &[String]) -> Result<Vec<Child>, String> {
+fn spawn_irtt(
+    cfg: &Config,
+    active_reflectors: &[String],
+    bound_args: &[String],
+    probe_gid: Option<u32>,
+) -> Result<Vec<Child>, String> {
     if active_reflectors.is_empty() {
         return Err("at least one irtt_server is required".to_string());
     }
@@ -11380,11 +12365,9 @@ fn spawn_irtt(cfg: &Config, active_reflectors: &[String]) -> Result<Vec<Child>, 
     let mut children = Vec::new();
 
     for target in active_reflectors {
-        let mut cmd = pinger_command(cfg, "irtt")?;
+        let mut cmd = pinger_command(cfg, "irtt", probe_gid)?;
         cmd.arg("client");
-        for arg in safe_extra_args(&cfg.ping_extra_args) {
-            cmd.arg(arg);
-        }
+        cmd.args(bound_args);
         cmd.arg("-i")
             .arg(&interval)
             .arg("-d")
@@ -11407,20 +12390,64 @@ fn spawn_irtt(cfg: &Config, active_reflectors: &[String]) -> Result<Vec<Child>, 
     Ok(children)
 }
 
-fn pinger_command(cfg: &Config, binary: &str) -> Result<Command, String> {
-    routing::routed_command(&cfg.route_spec(), &cfg.ping_prefix_string, binary)
+fn pinger_command(cfg: &Config, binary: &str, probe_gid: Option<u32>) -> Result<Command, String> {
+    if probe_gid.is_some_and(|gid| matches!(gid, 0 | u32::MAX)) {
+        return Err("permanent probe group is invalid".into());
+    }
+    if probe_gid.is_some() && !cfg.ping_prefix_string.trim().is_empty() {
+        return Err("owned permanent probes cannot use a legacy command prefix".into());
+    }
+    let mut command = if cfg.route_mode == "explicit" {
+        if probe_gid.is_none()
+            || cfg.explicit_route_authority.is_none()
+            || !cfg.mwan3_member.is_empty()
+            || !routing::is_safe_identifier(&cfg.ul_if)
+            || !matches!(binary, "ping" | "fping" | "tsping" | "irtt")
+        {
+            return Err(
+                "explicit pinger command requires owned, configured probe authority".into(),
+            );
+        }
+        // The admitted owner installed mark/egress rules for this child's GID.
+        // Backend-specific source/device arguments are derived before spawn.
+        Command::new(binary)
+    } else {
+        routing::routed_command(&cfg.route_spec(), &cfg.ping_prefix_string, binary)?
+    };
+    if let Some(gid) = probe_gid {
+        // Scope only the child, not controller threads. A failed credential
+        // transition fails spawn before exec; there is no unowned retry.
+        command.uid(0).gid(gid);
+    }
+    command.env("LC_ALL", "C");
+    Ok(command)
 }
 
-fn stop_child(child: &mut Child) {
+fn stop_child(child: &mut Child) -> bool {
     let _ = child.kill();
-    let _ = child.wait();
+    loop {
+        match child.wait() {
+            Ok(_) => return true,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        }
+    }
 }
 
-fn parse_sample_line(cfg: &Config, line: &str, ping_reflector: &str) -> Option<Sample> {
+fn parse_sample_line(
+    cfg: &Config,
+    line: &str,
+    ping_reflector: &str,
+    observed_epoch_secs: f64,
+) -> Option<Sample> {
     match cfg.pinger_method.as_str() {
-        "ping" => parse_ping_line(line, ping_reflector),
+        "ping" => parse_ping_line(line, ping_reflector, observed_epoch_secs),
         #[cfg(feature = "calibration")]
-        "irtt" => parse_irtt_line(line, ping_reflector),
+        "irtt" => {
+            let mut sample = parse_irtt_line(line, ping_reflector)?;
+            sample.timestamp = observed_epoch_secs;
+            Some(sample)
+        }
         "fping-ts" => parse_fping_ts_line(line),
         "tsping" => parse_tsping_line(line),
         _ => parse_fping_line(line),
@@ -11547,13 +12574,22 @@ fn parse_irtt_line(line: &str, reflector: &str) -> Option<Sample> {
     })
 }
 
-fn parse_ping_line(line: &str, reflector: &str) -> Option<Sample> {
+fn parse_ping_line(line: &str, reflector: &str, observed_epoch_secs: f64) -> Option<Sample> {
     if reflector.is_empty() {
         return None;
     }
 
     let rtt_ms = parse_ping_number_after(line, "time=")
         .or_else(|| parse_ping_number_after(line, "time<"))?;
+    let timestamp = if let Some(prefixed) = line.trim_start().strip_prefix('[') {
+        let (timestamp, _) = prefixed.split_once(']')?;
+        timestamp.parse::<f64>().ok()?
+    } else {
+        observed_epoch_secs
+    };
+    if !timestamp.is_finite() || timestamp < 0.0 || !rtt_ms.is_finite() || rtt_ms < 0.0 {
+        return None;
+    }
     let seq = parse_ping_token_after(line, "icmp_seq=")
         .or_else(|| parse_ping_token_after(line, "seq="))
         .unwrap_or_else(|| "0".to_string());
@@ -11561,7 +12597,7 @@ fn parse_ping_line(line: &str, reflector: &str) -> Option<Sample> {
     Some(Sample {
         reflector: reflector.to_string(),
         seq,
-        timestamp: epoch_secs(),
+        timestamp,
         rtt_ms,
         dl_owd_us: rtt_ms * 500.0,
         ul_owd_us: rtt_ms * 500.0,
@@ -11773,8 +12809,15 @@ fn stable_hash(value: &str) -> u64 {
 
 fn read_cpu_snapshot() -> io::Result<CpuSnapshot> {
     let data = fs::read_to_string("/proc/stat")?;
+    parse_cpu_snapshot(&data)
+}
+
+fn parse_cpu_snapshot(data: &str) -> io::Result<CpuSnapshot> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid CPU snapshot");
     let mut counters = Vec::new();
     let mut raw_lines = Vec::new();
+    let mut previous_core = None;
+    let mut expected_fields = None;
 
     for line in data.lines() {
         if !line.starts_with("cpu") {
@@ -11789,41 +12832,106 @@ fn read_cpu_snapshot() -> io::Result<CpuSnapshot> {
             continue;
         }
 
-        let values: Vec<u64> = parts
-            .filter_map(|value| value.parse::<u64>().ok())
-            .collect();
-        if values.len() < 4 {
-            continue;
+        if name == "cpu" {
+            if !counters.is_empty() {
+                return Err(invalid());
+            }
+        } else {
+            if counters.is_empty() {
+                return Err(invalid());
+            }
+            let core = name[3..].parse::<u32>().map_err(|_| invalid())?;
+            if previous_core.is_some_and(|previous| core <= previous) {
+                return Err(invalid());
+            }
+            previous_core = Some(core);
         }
-
-        let idle = values
-            .get(3)
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(values.get(4).copied().unwrap_or(0));
-        let total = values.iter().copied().sum();
+        // guest and guest_nice already contribute to user/nice in Linux.
+        // Only the first eight fields are disjoint CPU-time categories.
+        let mut values = [0_u64; 8];
+        let mut fields = 0;
+        for (index, field) in parts.enumerate() {
+            let value = field.parse::<u64>().map_err(|_| invalid())?;
+            if index < values.len() {
+                values[index] = value;
+            }
+            fields += 1;
+        }
+        if !(4..=10).contains(&fields) || expected_fields.is_some_and(|expected| fields != expected)
+        {
+            return Err(invalid());
+        }
+        expected_fields = Some(fields);
+        let idle = values[3].checked_add(values[4]).ok_or_else(invalid)?;
+        let total = values
+            .iter()
+            .try_fold(0_u64, |sum, value| sum.checked_add(*value))
+            .ok_or_else(invalid)?;
 
         counters.push(CpuCounters { total, idle });
         raw_lines.push(line.to_string());
     }
 
+    if counters.is_empty() {
+        return Err(invalid());
+    }
     Ok(CpuSnapshot {
         counters,
         raw_lines,
     })
 }
 
-fn rotated_log_path(path: &Path) -> PathBuf {
-    let timestamp = epoch_secs().round().max(0.0) as u64;
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("cake-autorate.log");
-    let rotated = format!("{name}.{timestamp}");
+#[cfg(test)]
+mod cpu_snapshot_tests {
+    use super::parse_cpu_snapshot;
 
-    path.parent()
-        .map(|parent| parent.join(&rotated))
-        .unwrap_or_else(|| PathBuf::from(rotated))
+    #[test]
+    fn t1_cpu_guest_time_is_not_counted_twice() {
+        let input = "cpu 95 0 0 5 0 0 0 0 95 0\ncpu0 95 0 0 5 0 0 0 0 95 0\nintr 9\n";
+        let snapshot = parse_cpu_snapshot(input).unwrap();
+        for counter in &snapshot.counters {
+            assert_eq!(counter.total, 100);
+            assert_eq!(counter.idle, 5);
+            assert_eq!(
+                (counter.total - counter.idle) as f64 * 100.0 / counter.total as f64,
+                95.0
+            );
+        }
+        assert_eq!(snapshot.raw_lines[0], input.lines().next().unwrap());
+        let nice = parse_cpu_snapshot("cpu 0 95 0 5 0 0 0 0 0 95\n").unwrap();
+        assert_eq!(nice.counters[0].total, 100);
+        let idle = parse_cpu_snapshot("cpu 10 0 0 70 20 0 0 0\ncpu3 10 0 0 70 20 0 0 0\n").unwrap();
+        assert_eq!(idle.counters[0].idle, 90);
+        assert_eq!(idle.counters[1].total, 100);
+        assert_eq!(
+            parse_cpu_snapshot("cpu 1 2 3 4\n").unwrap().counters[0].total,
+            10
+        );
+    }
+
+    #[test]
+    fn t1_cpu_snapshot_rejects_shifted_overflowed_or_ambiguous_counters() {
+        for input in [
+            "",
+            "intr 1\n",
+            "cpu0 1 2 3 4\n",
+            "cpu 1 bad 3 4 5\n",
+            "cpu 1 2 3\n",
+            "cpu 1 2 3 4\ncpu 1 2 3 4\n",
+            "cpu 1 2 3 4\ncpu1 1 2 3 4\ncpu1 1 2 3 4\n",
+            "cpu 1 2 3 4\ncpu2 1 2 3 4\ncpu1 1 2 3 4\n",
+            "cpu 1 2 3 4\ncpu0 1 2 3 4 5\n",
+            "cpu 18446744073709551615 1 0 0\n",
+            "cpu 0 0 0 18446744073709551615 1\n",
+            "cpu 1 2 3 4 5 6 7 8 9 10 11\n",
+        ] {
+            assert_eq!(
+                parse_cpu_snapshot(input).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData,
+                "{input}"
+            );
+        }
+    }
 }
 
 fn ensure_run_dir(path: &Path) -> io::Result<()> {
@@ -11901,6 +13009,14 @@ impl From<String> for RuntimeTopologyWaitError {
 }
 
 fn wait_for_runtime_topology(cfg: &Config) -> Result<(), RuntimeTopologyWaitError> {
+    wait_for_runtime_topology_attested(cfg, None, || Ok(()))
+}
+
+fn wait_for_runtime_topology_attested(
+    cfg: &Config,
+    input: Option<&operations::controller_input::Loaded>,
+    mut attest_input: impl FnMut() -> Result<(), String>,
+) -> Result<(), RuntimeTopologyWaitError> {
     use operations::sqm_recovery::{SqmRecoveryAdmission, SqmRecoveryGate};
 
     let started_at = epoch_secs();
@@ -11913,6 +13029,8 @@ fn wait_for_runtime_topology(cfg: &Config) -> Result<(), RuntimeTopologyWaitErro
         if TERMINATE.load(Ordering::SeqCst) {
             return Err(RuntimeTopologyWaitError::Terminated);
         }
+
+        attest_input()?;
 
         let target_ready = managed_sqm_target_ready(cfg);
         if !target_ready {
@@ -11934,7 +13052,7 @@ fn wait_for_runtime_topology(cfg: &Config) -> Result<(), RuntimeTopologyWaitErro
             continue;
         }
 
-        let topology = inspect_sqm_topology(cfg);
+        let topology = inspect_controller_topology(cfg);
         let initial_reason = topology
             .as_ref()
             .err()
@@ -11966,7 +13084,7 @@ fn wait_for_runtime_topology(cfg: &Config) -> Result<(), RuntimeTopologyWaitErro
             continue;
         }
 
-        let check_error = match attest_managed_sqm(cfg) {
+        let check_error = match attest_managed_sqm(cfg, input) {
             Ok(()) if topology.is_ok() => {
                 recovery_gate.observe_healthy();
                 return Ok(());
@@ -12050,7 +13168,8 @@ fn wait_for_runtime_topology(cfg: &Config) -> Result<(), RuntimeTopologyWaitErro
             started_at,
         )
         .map_err(|error| format!("failed to publish bootstrap status: {error}"))?;
-        match recover_managed_sqm(cfg) {
+        attest_input()?;
+        match recover_managed_sqm(cfg, input) {
             Ok(()) => {
                 recovery_gate.observe_healthy();
                 return Ok(());
@@ -12110,44 +13229,110 @@ fn read_u64_file<P: AsRef<Path>>(path: P) -> io::Result<u64> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-fn interface_max_wire_packet_size_bits(interface: &str) -> u64 {
-    let mtu_path = format!("/sys/class/net/{interface}/mtu");
-    let mtu_bytes = read_u64_file(&mtu_path).unwrap_or(1500);
-    let tc_output = Command::new("tc")
-        .arg("qdisc")
-        .arg("show")
-        .arg("dev")
-        .arg(interface)
-        .output()
-        .ok()
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .unwrap_or_default();
-    let (atm, overhead_bytes) = parse_tc_linklayer_overhead(&tc_output);
-
-    max_wire_packet_size_bits_from_mtu(mtu_bytes, overhead_bytes, atm)
+fn interface_max_wire_packet_size_bits(interface: &str, inspect_cake: bool) -> Option<u64> {
+    let mtu_bytes = read_u64_file(sqm_sys_class_net().join(interface).join("mtu")).ok()?;
+    if mtu_bytes == 0 {
+        return None;
+    }
+    let (mode, overhead, mpu) = if inspect_cake {
+        let output = tc_output(&["qdisc", "show", "dev", interface]).ok()?;
+        root_cake_control_identity(&output).ok()?;
+        parse_tc_linklayer_overhead(&output)?
+    } else {
+        (CakeLinkLayer::NoAtm, 0, 0)
+    };
+    Some(max_wire_packet_size_bits_from_mtu(
+        mtu_bytes, overhead, mode, mpu,
+    ))
 }
 
-fn parse_tc_linklayer_overhead(output: &str) -> (bool, u64) {
-    let tokens: Vec<&str> = output.split_whitespace().collect();
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CakeLinkLayer {
+    NoAtm,
+    Atm,
+    Ptm,
+}
 
-    for window in tokens.windows(3) {
-        if (window[0] == "atm" || window[0] == "noatm") && window[1] == "overhead" {
-            if let Ok(overhead) = window[2].parse::<u64>() {
-                return (window[0] == "atm", overhead);
+fn parse_tc_linklayer_overhead(output: &str) -> Option<(CakeLinkLayer, i64, u64)> {
+    let mut roots = output.lines().filter(|line| {
+        line.split_whitespace().next() == Some("qdisc")
+            && line.split_whitespace().any(|token| token == "root")
+    });
+    let root = roots.next()?;
+    if roots.next().is_some() {
+        return None;
+    }
+    if !matches!(root.split_whitespace().nth(1), Some("cake" | "cake_mq")) {
+        return Some((CakeLinkLayer::NoAtm, 0, 0));
+    }
+    let mut mode = None;
+    let mut overhead = None;
+    let mut mpu = None;
+    let mut raw = false;
+    let mut tokens = root.split_whitespace();
+    while let Some(token) = tokens.next() {
+        match token {
+            "atm" | "noatm" | "ptm" => {
+                if mode.is_some() {
+                    return None;
+                }
+                mode = Some(match token {
+                    "atm" => CakeLinkLayer::Atm,
+                    "ptm" => CakeLinkLayer::Ptm,
+                    _ => CakeLinkLayer::NoAtm,
+                });
             }
+            "raw" => raw = true,
+            "overhead" => {
+                if overhead.is_some() {
+                    return None;
+                }
+                let value = tokens.next()?.parse::<i64>().ok()?;
+                if !(-64..=256).contains(&value) {
+                    return None;
+                }
+                overhead = Some(value);
+            }
+            "mpu" => {
+                if mpu.is_some() {
+                    return None;
+                }
+                let value = tokens.next()?.parse::<u64>().ok()?;
+                if value > 256 {
+                    return None;
+                }
+                mpu = Some(value);
+            }
+            _ => {}
         }
     }
-
-    (false, 0)
+    Some((
+        mode.or(raw.then_some(CakeLinkLayer::NoAtm))?,
+        overhead?,
+        mpu.unwrap_or(0),
+    ))
 }
 
-fn max_wire_packet_size_bits_from_mtu(mtu_bytes: u64, overhead_bytes: u64, atm: bool) -> u64 {
-    let bits = mtu_bytes.saturating_add(overhead_bytes).saturating_mul(8);
-    if atm {
-        424_u64.saturating_mul(bits.saturating_add(376) / 384)
+fn max_wire_packet_size_bits_from_mtu(
+    mtu_bytes: u64,
+    overhead_bytes: i64,
+    mode: CakeLinkLayer,
+    mpu: u64,
+) -> u64 {
+    let bytes = if overhead_bytes >= 0 {
+        mtu_bytes.saturating_add(overhead_bytes as u64)
     } else {
-        bits
+        mtu_bytes.saturating_sub(overhead_bytes.unsigned_abs())
     }
+    .max(mpu);
+    // Match CAKE byte rounding: ATM cells, or one extra PTM byte per
+    // 64 bytes (including a partial block), before conversion to bits.
+    match mode {
+        CakeLinkLayer::NoAtm => bytes,
+        CakeLinkLayer::Atm => bytes.div_ceil(48).saturating_mul(53),
+        CakeLinkLayer::Ptm => bytes.saturating_add(bytes.div_ceil(64)),
+    }
+    .saturating_mul(8)
 }
 
 fn packet_compensation_us(packet_size_bits: u64, shaper_rate_kbps: f64) -> f64 {
@@ -12180,9 +13365,12 @@ fn filled_f64_window(len: usize) -> VecDeque<f64> {
 }
 
 fn push_window<T>(window: &mut VecDeque<T>, value: T) {
-    if window.len() == window.capacity() {
-        window.pop_front();
+    // Windows are prefilled to their configured length. Allocator spare
+    // capacity is not history; even a zero-length defensive window stays zero.
+    if window.is_empty() {
+        return;
     }
+    window.pop_front();
     window.push_back(value);
 }
 
@@ -12252,11 +13440,7 @@ fn parse_uci_values(value: &str) -> Vec<String> {
         if in_quote {
             match ch {
                 '\'' => in_quote = false,
-                '\\' => {
-                    if let Some(next) = chars.next() {
-                        current.push(next);
-                    }
-                }
+                // libuci exports literal backslashes inside single quotes.
                 _ => current.push(ch),
             }
             token_started = true;
@@ -12264,6 +13448,12 @@ fn parse_uci_values(value: &str) -> Vec<String> {
             match ch {
                 '\'' => {
                     in_quote = true;
+                    token_started = true;
+                }
+                '\\' => {
+                    // An apostrophe is exported as the concatenated fragments
+                    // '\'' (close quote, escaped apostrophe, open quote).
+                    current.push(chars.next().unwrap_or('\\'));
                     token_started = true;
                 }
                 c if c.is_whitespace() => {
@@ -12298,6 +13488,10 @@ fn load_global_history_config() -> Result<(Option<u64>, usize), String> {
         _ => return Ok((None, 1)),
     };
     let data = String::from_utf8_lossy(&output.stdout);
+    parse_global_history_config(&data)
+}
+
+fn parse_global_history_config(data: &str) -> Result<(Option<u64>, usize), String> {
     let mut types = HashMap::<String, String>::new();
     let mut enabled = HashMap::<String, bool>::new();
     let mut history_enabled = HashMap::<String, bool>::new();
@@ -12319,14 +13513,17 @@ fn load_global_history_config() -> Result<(Option<u64>, usize), String> {
         if parts.len() != 3 || parts[0] != "cake-autorate" {
             continue;
         }
+        let controller = types
+            .get(parts[1])
+            .is_some_and(|kind| kind == "cake_autorate");
         match parts[2] {
-            "enabled" => {
+            "enabled" if controller => {
                 enabled.insert(
                     parts[1].to_string(),
                     parse_bool(value).map_err(|error| format!("{}.enabled: {error}", parts[1]))?,
                 );
             }
-            "graph_history_enabled" => {
+            "graph_history_enabled" if controller => {
                 history_enabled.insert(
                     parts[1].to_string(),
                     parse_bool(value)
@@ -12339,7 +13536,12 @@ fn load_global_history_config() -> Result<(Option<u64>, usize), String> {
                 budget = Some(
                     value
                         .parse::<u64>()
-                        .map_err(|error| format!("graph_history_ram_budget_kib: {error}"))?,
+                        .ok()
+                        .filter(|value| {
+                            (GRAPH_HISTORY_MIN_BUDGET_KIB..=GRAPH_HISTORY_HARD_MAX_KIB)
+                                .contains(value)
+                        })
+                        .ok_or("graph_history_ram_budget_kib is outside its allowed range")?,
                 );
             }
             _ => {}
@@ -12362,7 +13564,10 @@ fn parse_bool(value: &str) -> Result<bool, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" | "enabled" => Ok(true),
         "0" | "false" | "no" | "off" | "disabled" => Ok(false),
-        _ => Err(format!("invalid boolean value '{value}'")),
+        _ => Err(
+            "invalid boolean value (expected 1/0, true/false, yes/no, on/off, enabled/disabled)"
+                .to_string(),
+        ),
     }
 }
 
@@ -12381,7 +13586,11 @@ fn set_bool(map: &HashMap<String, String>, key: &str, out: &mut bool) -> Result<
 
 fn set_f64(map: &HashMap<String, String>, key: &str, out: &mut f64) -> Result<(), String> {
     if let Some(value) = map.get(key) {
-        *out = value.parse::<f64>().map_err(|e| format!("{key}: {e}"))?;
+        let parsed = value.parse::<f64>().map_err(|e| format!("{key}: {e}"))?;
+        if !parsed.is_finite() {
+            return Err(format!("{key} must be finite"));
+        }
+        *out = parsed;
     }
     Ok(())
 }
@@ -12576,8 +13785,7 @@ fn graph_history_line(
     timestamp: f64,
     rtt_ms: Option<f64>,
     cpu_percent: Option<f64>,
-    dl_rate_kbps: f64,
-    ul_rate_kbps: f64,
+    traffic: Option<history_traffic::Summary>,
     transport_delta_ms: Option<f64>,
     effective_delta_ms: Option<f64>,
     dl_floor_kbps: Option<f64>,
@@ -12599,12 +13807,12 @@ fn graph_history_line(
     sqm_runtime_state: &str,
 ) -> String {
     format!(
-        "{:.0},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+        "{:.0},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},avg-v1,{},{},{}\n",
         timestamp,
         json_f64_or_empty(rtt_ms, 3),
         json_f64_or_empty(cpu_percent, 1),
-        json_f64_or_empty(Some(dl_rate_kbps), 1),
-        json_f64_or_empty(Some(ul_rate_kbps), 1),
+        json_f64_or_empty(traffic.map(|value| value.average_dl_kbps), 1),
+        json_f64_or_empty(traffic.map(|value| value.average_ul_kbps), 1),
         json_f64_or_empty(transport_delta_ms, 3),
         json_f64_or_empty(effective_delta_ms, 3),
         json_f64_or_empty(dl_floor_kbps, 1),
@@ -12624,6 +13832,9 @@ fn graph_history_line(
         causal_dl_state.replace(',', ""),
         causal_ul_state.replace(',', ""),
         sqm_runtime_state.replace(',', ""),
+        json_f64_or_empty(traffic.map(|value| value.peak_dl_kbps), 1),
+        json_f64_or_empty(traffic.map(|value| value.peak_ul_kbps), 1),
+        json_f64_or_empty(traffic.map(|value| value.observed_seconds), 6),
     )
 }
 
@@ -13745,8 +14956,47 @@ where
 
 fn main() {
     let mut initial_args = env::args();
-    let _program = initial_args.next();
+    let program = initial_args.next();
+    // rpcd executes this package-owned symlink with `list` or `call METHOD`.
+    // Never fall through to the general daemon CLI from the RPC entry point.
+    if program
+        .as_deref()
+        .and_then(|path| Path::new(path).file_name())
+        == Some(std::ffi::OsStr::new("cake-autorate-config"))
+    {
+        println!("{}", config_transfer::run(initial_args, io::stdin().lock()));
+        return;
+    }
     match initial_args.next().as_deref() {
+        Some("--transport-resolve-ipv4") => {
+            let parent = initial_args
+                .next()
+                .and_then(|value| value.parse::<u32>().ok());
+            let result = if initial_args.next().is_some() {
+                Err("transport-dns-arguments-invalid".to_string())
+            } else if let Some(parent) = parent {
+                transport_resolver::serve(parent, io::stdin().lock(), io::stdout().lock())
+            } else {
+                Err("transport-dns-parent-invalid".to_string())
+            };
+            if let Err(error) = result {
+                eprintln!("ERROR: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Some("--config-candidate-rpc") => {
+            println!("{}", config_transfer::run(initial_args, io::stdin().lock()));
+            return;
+        }
+        Some("--validate-config-candidate") => {
+            if initial_args.next().is_some() {
+                eprintln!("ERROR: candidate data is accepted only on stdin");
+                std::process::exit(1);
+            }
+            println!("{}", config_candidate::validate_reader(io::stdin().lock()));
+            return;
+        }
         Some("--runtime-health") => {
             match operations::runtime_health::run_runtime_health(initial_args) {
                 Ok(output) => print!("{output}"),
@@ -13778,7 +15028,14 @@ fn main() {
             return;
         }
         Some("--service-lifecycle") => {
-            match operations::service_lifecycle::run_service_lifecycle(initial_args) {
+            let mut arguments = initial_args.peekable();
+            if arguments
+                .peek()
+                .is_some_and(|value| value == "confirm-started")
+            {
+                install_signal_handlers();
+            }
+            match operations::service_lifecycle::run_service_lifecycle(arguments) {
                 Ok(output) => print!("{output}"),
                 Err(error) => {
                     eprintln!("ERROR: {error}");
@@ -14065,8 +15322,8 @@ fn main() {
         }
     }
 
-    let cfg = match Config::from_uci(&instance) {
-        Ok(cfg) => cfg,
+    let (cfg, input) = match load_controller_configuration(&instance) {
+        Ok(loaded) => loaded,
         Err(e) => {
             eprintln!("ERROR: {e}");
             std::process::exit(1);
@@ -14078,10 +15335,31 @@ fn main() {
         return;
     }
 
-    if let Err(e) = run(cfg, once) {
+    let result = match input {
+        Some(input) => run_with_service_input(cfg, once, Some(input)),
+        None => run(cfg, once),
+    };
+    if let Err(e) = result {
         eprintln!("ERROR: {e}");
         std::process::exit(1);
     }
+}
+
+fn load_controller_configuration(
+    instance: &str,
+) -> Result<(Config, Option<operations::controller_input::Loaded>), String> {
+    let Some(id) = env::var_os(operations::controller_input::GENERATION_ENV) else {
+        return Config::from_uci(instance).map(|config| (config, None));
+    };
+    let id = id.to_str().ok_or("controller-input-generation-not-text")?;
+    let loaded = operations::controller_input::load_production(instance, id)?;
+    let history = (
+        loaded.config.graph_history_ram_budget_kib,
+        loaded.config.graph_history_instance_count,
+    );
+    let config = Config::with_runtime_inputs(loaded.config.clone(), history)?;
+    loaded.guard.attest()?;
+    Ok((config, Some(loaded)))
 }
 
 #[cfg(all(test, feature = "calibration"))]
@@ -14103,25 +15381,24 @@ mod tests {
         parse_irtt_duration_us, parse_irtt_line, parse_private_ingress_output,
         parse_private_root_output, parse_rate_samples, parse_reflector_candidates,
         parse_strict_bool, parse_tc_bandwidth_kbps, parse_tc_linklayer_overhead, parse_tsping_line,
-        parse_uci_values, pinger_command, pinger_line_is_timeout, pinger_response_interval_s,
-        private_cake_args, probe_loop_required, published_applied_cake_rate_kbps,
-        published_runtime_qdisc_kind, qdisc_output_has_cake, quality_grade_result_json,
-        rate_sample_is_recent, rating_capture_request_is_admissible, reflector_bad_reflectors,
-        reflector_health_json, reflector_spare_reflectors,
-        reject_autotune_capture_after_io_with_clock, root_cake_bandwidth_kbps, root_cake_qdisc,
-        run, run_autotune_proposal_cli, run_sqm_helper, runtime_driver_holds_controller,
-        sample_is_stale, select_autotune_capture_rates, shaper_update_due, stall_detection_timeout,
-        status_publish_due, stop_managed_sqm_with, throughput_floor, transport_error_code,
-        transport_probe_control_allows_start, transport_probe_interval_s,
+        parse_uci_values, pinger_command, pinger_line_is_timeout, private_cake_args,
+        probe_loop_required, published_applied_cake_rate_kbps, published_runtime_qdisc_kind,
+        qdisc_output_has_cake, quality_grade_result_json, rate_sample_is_recent,
+        rating_capture_request_is_admissible, reflector_bad_reflectors, reflector_health_json,
+        reflector_spare_reflectors, reject_autotune_capture_after_io_with_clock,
+        root_cake_bandwidth_kbps, root_cake_qdisc, run, run_autotune_proposal_cli, run_sqm_helper,
+        runtime_driver_holds_controller, sample_is_stale, select_autotune_capture_rates,
+        shaper_update_due, status_publish_due, stop_managed_sqm_with, throughput_floor,
+        transport_error_code, transport_probe_control_allows_start, transport_probe_interval_s,
         transport_probe_route_identities, transport_probe_runtime_required,
         transport_result_matches_route, uplink_error_code, validated_conservative_samples,
         wait_for_runtime_topology, AdaptiveCapacityStatusContext, AdaptiveCeilingDirection,
         AutotuneSpeedtestRateMonitor, AutotuneTransportCaptureKey, AutotuneTransportControl,
         AutotuneTransportFlight, AutotuneTransportReadiness, AutotuneTransportSettlement,
-        CakeQdiscKind, Config, Controller, MemoryInfo, PrivateIngressState, PrivateRootState,
-        RateMonitor, RateSample, ReflectorHealth, ReflectorState, RouteSnapshot, Sample,
-        SpeedtestCounterRateMonitor, SqmRecoveryError, SqmTopologyErrorKind, ThroughputGuardInput,
-        TransportLatencyTracker, TransportProbeResult, UplinkState,
+        CakeLinkLayer, CakeQdiscKind, Config, Controller, MemoryInfo, PrivateIngressState,
+        PrivateRootState, RateMonitor, RateSample, ReflectorHealth, ReflectorState, RouteSnapshot,
+        Sample, SpeedtestCounterRateMonitor, SqmRecoveryError, SqmTopologyErrorKind,
+        ThroughputGuardInput, TransportLatencyTracker, TransportProbeResult, UplinkState,
         AUTOTUNE_CAPTURE_ATTESTATION_MAX_AGE, CAKE_GROWTH_UPDATE_MIN_INTERVAL,
         CALIBRATIONCTL_SCHEDULER_STATUS_USAGE, CALIBRATION_CAPABILITIES_V3,
         STATUS_PUBLISH_INTERVAL, TERMINATE, TRANSPORT_BASELINE_LEARNING_INTERVAL_S,
@@ -14135,7 +15412,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    static HELPER_TEST_LOCK: Mutex<()> = Mutex::new(());
+    pub(super) static HELPER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn scheduler_status_usage_is_an_exact_zero_argument_batch_contract() {
@@ -14284,6 +15561,23 @@ mod tests {
             parse_uci_values("'1.1.1.1' '1.0.0.1' '8.8.8.8'"),
             vec!["1.1.1.1", "1.0.0.1", "8.8.8.8"]
         );
+    }
+
+    #[test]
+    fn r4_uci_show_parser_preserves_apostrophes_backslashes_and_list_boundaries() {
+        assert_eq!(
+            parse_uci_values(r"'changed'\''quote'"),
+            vec!["changed'quote"]
+        );
+        assert_eq!(
+            parse_uci_values(r"'a\b' 'x'\''y' ''"),
+            vec![r"a\b", "x'y", ""]
+        );
+        assert_eq!(
+            parse_uci_values(r"'кириллица \ $(literal); #'"),
+            vec![r"кириллица \ $(literal); #"]
+        );
+        assert_eq!(parse_uci_values(r"''\'''"), vec!["'"]);
     }
 
     #[test]
@@ -14450,8 +15744,9 @@ mod tests {
         assert_eq!(cfg.stall_detection_thr, 5);
         assert_eq!(cfg.connection_stall_thr_kbps, 10.0);
         assert_eq!(cfg.global_ping_response_timeout_s, 10.0);
-        assert!((pinger_response_interval_s(&cfg) - 0.05).abs() < 0.000001);
-        assert!((stall_detection_timeout(&cfg).as_secs_f64() - 0.25).abs() < 0.000001);
+        let timing = super::PingerTiming::configured(&cfg);
+        assert!((timing.interval_s - 0.3).abs() < 0.000001);
+        assert!(timing.stall_timeout.as_secs_f64() > timing.interval_s);
     }
 
     #[test]
@@ -14590,18 +15885,30 @@ mod tests {
         let noatm = "qdisc cake 8001: root refcnt 2 bandwidth 10Mbit diffserv3 noatm overhead 44";
         let atm = "qdisc cake 8002: root refcnt 2 bandwidth 2Mbit besteffort atm overhead 18";
 
-        assert_eq!(parse_tc_linklayer_overhead(noatm), (false, 44));
-        assert_eq!(parse_tc_linklayer_overhead(atm), (true, 18));
+        assert_eq!(
+            parse_tc_linklayer_overhead(noatm),
+            Some((CakeLinkLayer::NoAtm, 44, 0))
+        );
+        assert_eq!(
+            parse_tc_linklayer_overhead(atm),
+            Some((CakeLinkLayer::Atm, 18, 0))
+        );
         assert_eq!(
             parse_tc_linklayer_overhead("qdisc fq_codel 0: root"),
-            (false, 0)
+            Some((CakeLinkLayer::NoAtm, 0, 0))
         );
     }
 
     #[test]
     fn wire_packet_compensation_matches_upstream_units() {
-        assert_eq!(max_wire_packet_size_bits_from_mtu(1500, 44, false), 12_352);
-        assert_eq!(max_wire_packet_size_bits_from_mtu(1500, 44, true), 13_992);
+        assert_eq!(
+            max_wire_packet_size_bits_from_mtu(1500, 44, CakeLinkLayer::NoAtm, 0),
+            12_352
+        );
+        assert_eq!(
+            max_wire_packet_size_bits_from_mtu(1500, 44, CakeLinkLayer::Atm, 0),
+            13_992
+        );
         assert_eq!(packet_compensation_us(12_000, 1_000.0), 12_000.0);
     }
 
@@ -14658,8 +15965,7 @@ mod tests {
                 123.4,
                 Some(1.23456),
                 Some(2.34),
-                1000.04,
-                50.54,
+                Some(crate::history_traffic::Summary { average_dl_kbps: 1000.04, average_ul_kbps: 50.54, peak_dl_kbps: 2000.0, peak_ul_kbps: 100.0, observed_seconds: 10.0 }),
                 Some(10.1234),
                 Some(11.9876),
                 Some(600.0),
@@ -14680,7 +15986,7 @@ mod tests {
                 "no_cake_effect",
                 "HEALTHY",
             ),
-            "123,1.235,2.3,1000.0,50.5,10.123,11.988,600.0,30.0,ACTIVE,mwan3|wan|pppoe-wan|198.51.100.1|0x100|1,A+,final,1.250,DL,20,7,probe_observe,cruise,probe target reached,initialized,monitoring,no_cake_effect,HEALTHY\n"
+            "123,1.235,2.3,1000.0,50.5,10.123,11.988,600.0,30.0,ACTIVE,mwan3|wan|pppoe-wan|198.51.100.1|0x100|1,A+,final,1.250,DL,20,7,probe_observe,cruise,probe target reached,initialized,monitoring,no_cake_effect,HEALTHY,avg-v1,2000.0,100.0,10.000000\n"
         );
 
         let data = "1,1,1\n2,2,2\n3,3,3\n";
@@ -14775,6 +16081,9 @@ mod tests {
         cfg.connection_active_thr_kbps = 7200.0;
         cfg.min_dl_shaper_rate_kbps = 5000.0;
         cfg.min_ul_shaper_rate_kbps = 25100.0;
+        // Keep the active rate tuple valid while testing only the activity
+        // threshold's directional guard (default base is below this minimum).
+        cfg.base_ul_shaper_rate_kbps = 30000.0;
         assert!(cfg.validate().is_ok());
 
         cfg.min_ul_shaper_rate_kbps = 7000.0;
@@ -14794,6 +16103,7 @@ mod tests {
         cfg.connection_active_thr_kbps = 7200.0;
         cfg.min_dl_shaper_rate_kbps = 25100.0;
         cfg.min_ul_shaper_rate_kbps = 5000.0;
+        cfg.base_dl_shaper_rate_kbps = 30000.0;
         assert!(cfg.validate().is_ok());
 
         cfg.min_dl_shaper_rate_kbps = 7000.0;
@@ -14865,7 +16175,7 @@ mod tests {
         let mut cfg = Config::defaults("test".to_string());
         cfg.ping_prefix_string = "mwan3 use gpon exec".to_string();
 
-        let cmd = pinger_command(&cfg, "fping").expect("expected prefixed command");
+        let cmd = pinger_command(&cfg, "fping", None).expect("expected prefixed command");
         let args: Vec<String> = cmd
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -14880,7 +16190,7 @@ mod tests {
         let mut cfg = Config::defaults("test".to_string());
         cfg.ping_prefix_string = "mwan3 use wan; reboot".to_string();
 
-        assert!(pinger_command(&cfg, "fping").is_err());
+        assert!(pinger_command(&cfg, "fping", None).is_err());
     }
 
     #[test]
@@ -14900,6 +16210,8 @@ mod tests {
     fn route_loss_preserves_only_negative_transport_identity() {
         let snapshot = |online: bool, source_ip: &str| RouteSnapshot {
             identity: RouteIdentity {
+                device_ifindex: None,
+                fwmark_mask: None,
                 mode: "mwan3".to_string(),
                 member: "wan".to_string(),
                 device: "eth1".to_string(),
@@ -15005,7 +16317,7 @@ mod tests {
         ];
         cfg.reflector_misbehaving_detection_thr = 2;
         let active = vec!["1.1.1.1".to_string(), "1.0.0.1".to_string()];
-        let mut health = ReflectorHealth::new(&cfg, &active);
+        let mut health = ReflectorHealth::new(&cfg, &active, super::PingerTiming::configured(&cfg));
         let state = health.states.get_mut("1.0.0.1").unwrap();
         state.samples = 3;
         state.last_rtt_ms = 12.5;
@@ -15256,6 +16568,8 @@ filter parent ffff: protocol all pref 10 u32 chain 0 fh 800::800 order 2048 key 
         use crate::operations::identity::ProcessIdentity;
 
         let permit = AutotuneRuntimePermit {
+            dns_server: None,
+            probe_accounting_required: false,
             kind: crate::operations::autotune_runtime::RuntimePermitKind::Autotune,
             permit_id: "77".repeat(16),
             job_id: "11".repeat(16),
@@ -15526,6 +16840,8 @@ esac\n",
         env::set_var("FAKE_TC_STATE", &state);
 
         let permit = AutotuneRuntimePermit {
+            dns_server: None,
+            probe_accounting_required: false,
             kind: crate::operations::autotune_runtime::RuntimePermitKind::Autotune,
             permit_id: "77".repeat(16),
             job_id: "11".repeat(16),
@@ -16458,6 +17774,181 @@ esac\n",
             route_fingerprint: "e".repeat(64),
             sqm_fingerprint: "f".repeat(64),
         }
+    }
+
+    #[test]
+    fn t2_transport_retirement_waits_for_worker_owned_resources() {
+        use crate::{TransportProbeRequest, TransportProbeResult, TransportProbeRuntime};
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+        let (mut observer, resource) = UnixStream::pair().unwrap();
+        observer
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let (requests, request_rx) = mpsc::sync_channel::<TransportProbeRequest>(1);
+        let (result_tx, results) = mpsc::channel::<TransportProbeResult>();
+        let (release, wait_for_release) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let _resource = resource;
+            let _requests = request_rx;
+            let _results = result_tx;
+            // A bounded stand-in for an already-running network operation.
+            let _ = wait_for_release.recv_timeout(Duration::from_secs(2));
+        });
+        let runtime = TransportProbeRuntime::from_worker(
+            &Config::defaults("fixture".into()),
+            requests,
+            results,
+            worker,
+            None,
+        );
+        let mut active = Some(runtime);
+        let mut stopping = None;
+        TransportProbeRuntime::request_retirement(&mut active, &mut stopping).unwrap();
+        TransportProbeRuntime::request_retirement(&mut active, &mut stopping).unwrap();
+        assert!(active.is_none(), "old-route results are no longer admitted");
+        assert!(stopping.is_some(), "replacement remains fenced until join");
+        let mut runtime = stopping.take().unwrap();
+        assert!(
+            !runtime.finish_stop(),
+            "channel closure alone is not worker retirement"
+        );
+        let mut byte = [0];
+        let error = observer.read(&mut byte).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !runtime.finish_stop() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(observer.read(&mut byte).unwrap(), 0);
+        assert!(runtime.worker.is_none());
+        assert!(runtime.requests.is_none());
+        assert!(runtime.finish_stop());
+    }
+
+    #[test]
+    fn t2_managed_probe_retirement_receipt_waits_and_fences_readmission() {
+        use crate::operations::autotune_runtime_store::{ProbeRetirement, RuntimeOverrideStore};
+        use crate::operations::full_autotune::{AutotuneCapturePhase, MeasurementTopology};
+        use crate::{ManagedProbeRetirement, TransportProbeRuntime};
+        use std::sync::mpsc;
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("managed-probe-retirement-{unique}"));
+        fs::create_dir(&root).unwrap();
+        let store = RuntimeOverrideStore::open(&root).unwrap();
+        let capture = test_autotune_capture_request(
+            1,
+            AutotuneCapturePhase::IdleBaseline,
+            MeasurementTopology::ShapedBoth,
+            None,
+        );
+        let record = ProbeRetirement {
+            job_id: capture.job_id.clone(),
+            worker_run_id: capture.worker_run_id.clone(),
+        };
+        let (requests, request_rx) = mpsc::sync_channel(1);
+        let (result_tx, results) = mpsc::channel();
+        let (release, wait) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let _owned = (request_rx, result_tx);
+            let _ = wait.recv_timeout(Duration::from_secs(2));
+        });
+        let mut active = Some(TransportProbeRuntime::from_worker(
+            &Config::defaults("fixture".into()),
+            requests,
+            results,
+            worker,
+            None,
+        ));
+        let mut stopping = None;
+        let mut fence = ManagedProbeRetirement::default();
+        fence.poll(&store, &mut active, &mut stopping).unwrap();
+        assert!(active.is_some());
+        assert!(!store.request_probe_retirement(&record).unwrap());
+        fence.poll(&store, &mut active, &mut stopping).unwrap();
+        assert!(active.is_none());
+        assert!(stopping.is_some());
+        assert!(fence.blocks_probes());
+        assert!(fence.blocks_capture(&capture));
+        assert!(!store.request_probe_retirement(&record).unwrap());
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while fence.blocks_probes() {
+            assert!(Instant::now() < deadline);
+            fence.poll(&store, &mut active, &mut stopping).unwrap();
+            std::thread::yield_now();
+        }
+        assert!(store.request_probe_retirement(&record).unwrap());
+        assert!(stopping.is_none());
+        assert!(fence.blocks_capture(&capture));
+        let mut next = capture.clone();
+        next.worker_run_id = "e".repeat(32);
+        assert!(!fence.blocks_capture(&next));
+        // A fresh controller re-reads the durable tombstone before admission.
+        let mut restarted = ManagedProbeRetirement::default();
+        restarted.poll(&store, &mut active, &mut stopping).unwrap();
+        assert!(restarted.blocks_capture(&capture));
+        assert!(!restarted.blocks_capture(&next));
+        fs::remove_file(root.join("autotune-probe-retirement-request")).unwrap();
+        assert!(restarted.poll(&store, &mut active, &mut stopping).is_err());
+        assert!(restarted.blocks_capture(&next));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn t2_transport_engine_reuse_is_bound_to_route_job_worker_and_permit() {
+        use crate::operations::full_autotune::{AutotuneCapturePhase, MeasurementTopology};
+        use crate::{RatingPhase, TransportProbeRequest};
+        let mut request = TransportProbeRequest {
+            probe_id: 1,
+            control_valid: true,
+            dl_loaded: false,
+            ul_loaded: false,
+            rating_phase: RatingPhase::Idle,
+            autotune_capture: None,
+        };
+        let ordinary = request.engine_key("route-a".into());
+        assert_eq!(ordinary, request.engine_key("route-a".into()));
+        request.autotune_capture = Some(test_autotune_capture_request(
+            1,
+            AutotuneCapturePhase::IdleBaseline,
+            MeasurementTopology::ShapedBoth,
+            None,
+        ));
+        let capture_key = request.engine_key("route-a".into());
+        assert_ne!(ordinary, capture_key);
+        assert_ne!(capture_key, request.engine_key("route-b".into()));
+        // Different observations of the same immutable run may reuse its
+        // connection; ownership is not an individual probe/phase identifier.
+        request.probe_id += 1;
+        let capture = request.autotune_capture.as_mut().unwrap();
+        capture.capture_id = "12".repeat(16);
+        capture.sequence += 1;
+        capture.control_sequence += 1;
+        capture.phase = AutotuneCapturePhase::LoadedMeasurement;
+        assert_eq!(capture_key, request.engine_key("route-a".into()));
+        for changed in 0..3 {
+            let mut next = request.clone();
+            let capture = next.autotune_capture.as_mut().unwrap();
+            match changed {
+                0 => capture.job_id = "13".repeat(16),
+                1 => capture.worker_run_id = "14".repeat(16),
+                _ => capture.permit_id = "15".repeat(16),
+            }
+            assert_ne!(capture_key, next.engine_key("route-a".into()));
+        }
+        request.autotune_capture = None;
+        assert_eq!(ordinary, request.engine_key("route-a".into()));
+        assert_ne!(capture_key, request.engine_key("route-a".into()));
     }
 
     #[test]

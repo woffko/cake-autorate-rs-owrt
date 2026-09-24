@@ -1,4 +1,6 @@
 'use strict';
+'require cake-autorate-rs.candidate as candidateGuard';
+'require cake-autorate-rs.sqm as sqmModes';
 'require fs';
 'require form';
 'require rpc';
@@ -71,20 +73,21 @@ function validateInterface(sectionId, value) {
 }
 
 function validateRateOrder(section, sectionId, direction) {
-	var minimum = integer(configured(section, sectionId,
-		'min_' + direction + '_shaper_rate_kbps', ''));
-	var base = integer(configured(section, sectionId,
-		'base_' + direction + '_shaper_rate_kbps', ''));
-	var maximum = integer(configured(section, sectionId,
-		'max_' + direction + '_shaper_rate_kbps', ''));
-
-	if (minimum == null || base == null || maximum == null)
-		return _('Minimum, base and maximum rates must be positive integers.');
-	if (minimum < 100 || base < 100 || maximum < 100)
-		return _('Every shaper rate must be at least 100 kbit/s.');
-	if (minimum > base || base > maximum)
-		return _('Rates must satisfy minimum ≤ base ≤ maximum.');
-	return true;
+	var enabled = candidateGuard.directionEnabled(direction, function(key) {
+		// Lite's enabled.write updates sqm_enabled during parse. Preview a
+		// changed toggle so disabling and zeroing a direction can share a save.
+		if (key === 'sqm_enabled') {
+			var toggle = section.formvalue(sectionId, 'enabled');
+			if (toggle != null && toggle !== uci.get('cake-autorate', sectionId, 'enabled')) return toggle;
+		}
+		var value = section.formvalue(sectionId, key);
+		return value == null ? uci.get('cake-autorate', sectionId, key) : value;
+	});
+	return candidateGuard.validateRateTuple([ 'min', 'base', 'max' ].map(function(part) {
+		var key = part + '_' + direction + '_shaper_rate_kbps';
+		var value = section.formvalue(sectionId, key);
+		return value == null ? uci.get('cake-autorate', sectionId, key) : value;
+	}), direction, enabled);
 }
 
 function validateUnique(section, sectionId) {
@@ -200,6 +203,11 @@ var callUciRevertStatus = rpc.declare({
 });
 
 return L.view.extend({
+	handleSaveApply: function(ev, mode) {
+		return this.handleSave(ev).then(function() {
+			return candidateGuard.apply(function() { return ui.changes.apply(mode == '0'); }, [ 'cake-autorate' ]);
+		});
+	},
 	handleReset: function() {
 		// Modal Save stages values in this RPC session. The stock Map.reset()
 		// only re-renders them. Lite writes just this config, not sqm or network.
@@ -216,14 +224,17 @@ return L.view.extend({
 			uci.load('cake-autorate'),
 			L.resolveDefault(uci.load('sqm'), null),
 			L.resolveDefault(uci.load('mwan3'), null),
-			loadSqmScripts()
+			loadSqmScripts(),
+			L.resolveDefault(candidateGuard.loadSchema(), null)
 		]);
 	},
 
 	render: function(data) {
 		var m = new form.Map('cake-autorate', _('CAKE Autorate RS — Lite'),
 			_('Minimal manual controller. Configure explicit bounds and latency policy; no rating or calibration code is installed.'));
+		candidateGuard.attach(m, [ 'cake-autorate' ]);
 		var s = m.section(form.GridSection, 'cake_autorate', _('Manual instances'));
+		candidateGuard.protectModal(s);
 		var o;
 
 		s.anonymous = false;
@@ -242,6 +253,7 @@ return L.view.extend({
 			return this.renderMoreOptionsModal(sectionId);
 		};
 		s.addModalOptions = function(modalSection, sectionId) {
+			candidateGuard.attach(modalSection.map, [ 'cake-autorate' ]);
 			var parse = modalSection.parse;
 			modalSection.parse = function() {
 				var result = validateInstance(this, sectionId);
@@ -292,6 +304,13 @@ return L.view.extend({
 		o.depends('route_mode', 'mwan3');
 		o.rmempty = true;
 		addFlag(s, 'connection', 'auto_interface_preset', _('Derive upload and IFB devices'), '1');
+		o = addFlag(s, 'connection', 'external_ip_check_enabled', _('Look up external IPv4 address'), '0');
+		o.description = _('Optional: contacts the selected HTTPS service, which sees your public address and request times. Disabled by default; not required for rate control.');
+		o = addValue(s, 'connection', 'external_ip_check_url', _('External IPv4 service URL'), 'string', 'https://api.ipify.org');
+		o.description = _('HTTPS host/path returning one plain IPv4 address. No credentials, query or fragment.');
+		o.depends('external_ip_check_enabled', '1');
+		o = addValue(s, 'connection', 'external_ip_check_interval_s', _('External IPv4 lookup interval (seconds)'), 'and(uinteger,min(60),max(604800))', '3600');
+		o.depends('external_ip_check_enabled', '1');
 		o = addValue(s, 'connection', 'ul_if', _('Upload device'), 'string', '');
 		o.depends('auto_interface_preset', '0');
 		o.rmempty = true;
@@ -317,21 +336,21 @@ return L.view.extend({
 		  [ 'ul', _('Upload'), '5000', '20000', '35000' ] ].forEach(function(direction) {
 			var key = direction[0];
 			o = addValue(s, 'rates', 'min_' + key + '_shaper_rate_kbps',
-				_('%s minimum').format(direction[1]), 'and(uinteger,min(100))', direction[2]);
+				_('%s minimum').format(direction[1]), 'ufloat', direction[2]);
 			o.validate = function(sectionId) { return validateRateOrder(this.section, sectionId, key); };
 			o = addValue(s, 'rates', 'base_' + key + '_shaper_rate_kbps',
-				_('%s base').format(direction[1]), 'and(uinteger,min(100))', direction[3]);
+				_('%s base').format(direction[1]), 'ufloat', direction[3]);
 			o.write = function(sectionId, value) {
 				uci.set('cake-autorate', sectionId, this.option, value);
 				uci.set('cake-autorate', sectionId, key === 'dl' ? 'sqm_download' : 'sqm_upload', value);
 			};
 			o.validate = function(sectionId) { return validateRateOrder(this.section, sectionId, key); };
 			o = addValue(s, 'rates', 'max_' + key + '_shaper_rate_kbps',
-				_('%s maximum').format(direction[1]), 'and(uinteger,min(100))', direction[4]);
+				_('%s maximum').format(direction[1]), 'ufloat', direction[4]);
 			o.validate = function(sectionId) { return validateRateOrder(this.section, sectionId, key); };
 		});
 		addValue(s, 'rates', 'connection_active_thr_kbps', _('Active traffic threshold'),
-			'and(uinteger,min(1))', '2000');
+			'ufloat', '2000');
 		o = addFlag(s, 'rates', 'adaptive_ceiling_enabled', _('Adaptive ceiling'), '0');
 		o.description = _('Allow clean real traffic to probe upward within explicit absolute caps.');
 		[ [ 'adaptive_ceiling_dl_cap_kbps', _('Download absolute cap'), '80000' ],
@@ -342,7 +361,9 @@ return L.view.extend({
 		  [ 'adaptive_ceiling_cooldown_s', _('Probe cooldown'), '30' ],
 		  [ 'adaptive_ceiling_failed_bound_ttl_s', _('Failed-bound memory'), '900' ]
 		].forEach(function(item) {
-			o = addValue(s, 'rates', item[0], item[1], 'and(ufloat,min(0.1))', item[2]);
+			// The shared native candidate validator owns effective bounds and
+			// cross-field rules; do not impose a separate UI timer/rate floor.
+			o = addValue(s, 'rates', item[0], item[1], 'ufloat', item[2]);
 			o.depends('adaptive_ceiling_enabled', '1');
 		});
 
@@ -350,14 +371,16 @@ return L.view.extend({
 		o = addValue(s, 'sqm', 'sqm_section', _('Managed SQM section'), 'uciname', '');
 		o.rmempty = true;
 		o = modal(s.taboption('sqm', form.ListValue, 'sqm_qdisc', _('Queueing discipline')));
+		var qdiscMode = o;
 		o.value('cake', 'cake');
-		o.value('cake-mq', 'cake-mq');
 		o.default = 'cake';
 		o.rmempty = false;
 		o = modal(s.taboption('sqm', form.ListValue, 'sqm_script', _('Queue setup script')));
 		addSqmScriptChoices(o, data && data[3]);
 		o.default = 'piece_of_cake.qos';
 		o.rmempty = false;
+		var mqCheck = modal(s.taboption('sqm', form.Button, '_sqm_mq_check', _('Multi-queue capability')));
+		sqmModes.bind(qdiscMode, o, mqCheck);
 		o = modal(s.taboption('sqm', form.ListValue, 'sqm_linklayer', _('Link layer')));
 		o.value('none', _('None'));
 		o.value('ethernet', _('Ethernet'));
@@ -388,6 +411,7 @@ return L.view.extend({
 			'and(ufloat,min(0.05))', '0.3');
 		o = addValue(s, 'latency', 'ping_extra_args', _('Extra ping arguments'), 'string', '');
 		o.rmempty = true;
+		o.description = _('Automatic binding uses the current route. User arguments are preserved; review conflicting legacy interface/source pins after changing the uplink.');
 
 		addValue(s, 'controller', 'high_load_thr', _('High-load ratio'),
 			'and(ufloat,min(0.01),max(1))', '0.75');
@@ -408,12 +432,12 @@ return L.view.extend({
 		addValue(s, 'controller', 'ul_avg_owd_delta_max_adjust_down_thr_ms',
 			_('Upload decrease threshold'), 'and(ufloat,min(0))', '60');
 		addValue(s, 'controller', 'shaper_rate_max_adjust_down_bufferbloat',
-			_('Maximum decrease factor'), 'and(ufloat,min(0.01),max(1))', '0.75');
+			_('Maximum decrease factor'), 'and(ufloat,max(1))', '0.75');
 		addValue(s, 'controller', 'shaper_rate_max_adjust_up_load_high',
-			_('Maximum increase factor'), 'and(ufloat,min(1),max(2))', '1.04');
+			_('Maximum increase factor'), 'and(ufloat,min(1))', '1.04');
 		addFlag(s, 'controller', 'enable_sleep_function', _('Sleep after sustained idle'), '1');
 		addValue(s, 'controller', 'sustained_idle_sleep_thr_s', _('Idle time before sleep'),
-			'and(ufloat,min(1))', '60');
+			'ufloat', '60');
 
 		return m.render();
 	}

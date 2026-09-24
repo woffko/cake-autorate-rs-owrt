@@ -182,10 +182,13 @@ fn build_rating_request(
         allow_sqm_disable: false,
         allow_active_traffic: false,
         scheduled_auto_apply_requested: false,
-        traffic_budget_bytes: match intent.mode {
+        traffic_budget: (match intent.mode {
             RatingLaunchMode::Automatic => NATIVE_AUTOMATIC_RATING_TRAFFIC_BUDGET_BYTES,
             RatingLaunchMode::Client => 0,
-        },
+        })
+        .into(),
+        traffic_policy_explicit: false,
+        traffic_plan: None,
     };
     request.validate()?;
     Ok(request)
@@ -245,12 +248,15 @@ mod tests {
             unshaped_dl_bound_kbps: Some(1_000_000),
             unshaped_ul_bound_kbps: Some(500_000),
             route: OperationRouteIdentity {
+                dns_server: None,
+                device_ifindex: None,
                 mode: OperationRouteMode::Main,
                 mwan3_member: None,
                 l3_device: "pppoe-wan".to_string(),
                 source_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2))),
                 fwmark: None,
                 routing_table: None,
+                fwmark_mask: None,
             },
             route_fingerprint: "a".repeat(64),
             config_fingerprint: "b".repeat(64),
@@ -330,8 +336,8 @@ mod tests {
         );
         assert_eq!(automatic.backend, "speedtest-go");
         assert_eq!(
-            automatic.traffic_budget_bytes,
-            NATIVE_AUTOMATIC_RATING_TRAFFIC_BUDGET_BYTES
+            automatic.traffic_budget.limit_bytes(),
+            Some(NATIVE_AUTOMATIC_RATING_TRAFFIC_BUDGET_BYTES)
         );
         assert!(automatic.managed_sqm_section.is_none());
         assert_eq!(
@@ -350,7 +356,7 @@ mod tests {
         assert_eq!(guided.identity.operation, OperationKind::GuidedRating);
         assert_eq!(guided.target_state, OperationTargetState::ExistingManaged);
         assert_eq!(guided.backend, "client");
-        assert_eq!(guided.traffic_budget_bytes, 0);
+        assert_eq!(guided.traffic_budget.limit_bytes(), Some(0));
         assert_eq!(
             guided.deadline_unix_ms,
             2_000 + NATIVE_GUIDED_RATING_DEADLINE_MS

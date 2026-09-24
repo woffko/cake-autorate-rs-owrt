@@ -15,9 +15,7 @@ use super::autotune_apply::{
     NativeRawFallbackApplyManifestInput, NativeShapedCapacityFallbackApplyManifestInput,
     NativeSqmDirectionMode, MAX_NATIVE_APPLY_MANIFEST_BYTES,
 };
-use super::autotune_apply_openwrt::{
-    validate_bootstrap_request_baseline, OpenWrtNativeApplyBackend,
-};
+use super::autotune_apply_openwrt::validate_bootstrap_request_baseline;
 use super::autotune_public::{
     canonical_native_public_result_bytes, NativeArtifactKind, NativePublicApplyConfirmation,
     NativePublicResultInput, VerifiedNativeArtifact,
@@ -73,17 +71,25 @@ use std::time::{Duration, Instant};
 // A v3 traffic debit precedes every backend run.  The bound therefore covers
 // the maximum profile search, three load runs per capture, qualification,
 // route-discarded attempts, pair confirmation and topology repeats while still
-// capping encoded private evidence at one MiB.
-pub const MAX_AUTOTUNE_EVIDENCE_RECORDS: usize = 256;
+// retaining a fixed encoded-evidence bound. Extra interleaved server rounds
+// can each consume the same bounded route-loss retry budget as old attempts.
+pub const MAX_AUTOTUNE_EVIDENCE_RECORDS: usize = 257 // legacy bound plus one selection receipt
+    + (super::server_qualification::MAX_SERVERS * super::server_qualification::REPEATS
+        - super::server_qualification::LEGACY_MAX_SERVERS)
+        * super::speedtest::MAX_UNPROVED_TRAFFIC_ATTEMPTS as usize;
 pub const MAX_AUTOTUNE_EVIDENCE_BYTES: usize = 4 * 1024;
 pub const MAX_AUTOTUNE_REVIEW_BYTES: usize = 512 * 1024;
 const EVIDENCE_HEADER: &str = "cake-autorate-autotune-evidence\t13";
+const QUALIFICATION_EVIDENCE_HEADER: &str = "cake-autorate-autotune-evidence\t14";
+const OVERRUN_EVIDENCE_HEADER: &str = "cake-autorate-autotune-evidence\t15";
+const LIFECYCLE_EVIDENCE_HEADER: &str = "cake-autorate-autotune-evidence\t16";
 const PROGRESS_HEADER: &str = "cake-autorate-autotune-progress\t1";
+const TRAFFIC_PROGRESS_HEADER: &str = "cake-autorate-autotune-progress\t2";
 const MAX_AUTOTUNE_PROGRESS_BYTES: usize = 2 * 1024;
 const RUNTIME_CONTROL_HEADER: &str = "cake-autorate-autotune-runtime-control\t1";
 const RUNTIME_ACK_HEADER: &str = "cake-autorate-autotune-runtime-ack\t1";
 const TERMINAL_HEADER: &str = "cake-autorate-autotune-terminal\t2";
-const TRAFFIC_BUDGET_INCONCLUSIVE: &str = "traffic-budget-exhausted";
+const EXTENDED_TERMINAL_HEADER: &str = "cake-autorate-autotune-terminal\t3";
 const PAIR_OPTIONS_UNREVIEWABLE: &str = "pair-options-unreviewable";
 const SEARCH_OPTIONS_UNREVIEWABLE: &str = "search-options-unreviewable";
 const MAX_OPERATION_TRAFFIC_BUDGET_BYTES: u64 = 1 << 40;
@@ -107,6 +113,7 @@ const UPLOAD_SEARCH_FILE: &str = "autotune-search-upload.json";
 const PAIR_CONFIRMATION_FILE: &str = "autotune-pair-confirmation.json";
 const TOPOLOGY_COMPARISON_FILE: &str = "autotune-topology-comparison.json";
 const RAW_FALLBACK_FILE: &str = "autotune-raw-fallback.json";
+const SERVER_COMPARISON_FILE: &str = "autotune-server-comparison.json";
 const PROGRESS_FILE_PREFIX: &str = "autotune-progress-";
 const PROFILE_SEARCH_UNCERTAINTY_PERCENT: f64 = 1.5;
 const DEFAULT_PROFILE_SEARCH_ATTEMPTS: usize = 8;
@@ -164,7 +171,8 @@ pub(crate) fn native_autotune_runtime_permit_policy(
     let mobile_download_bypass_sequence =
         u32::from(allow_directional_bypass && mobile_download_bypass_required(request));
     let maximum_sequence = raw_control_sequences
-        .checked_add(search_sequences)
+        .checked_add(1) // acknowledged server-comparison topology before raw controls
+        .and_then(|value| value.checked_add(search_sequences))
         .and_then(|value| value.checked_add(pair_sequences))
         .and_then(|value| value.checked_add(topology_repeat_sequences))
         .and_then(|value| value.checked_add(mobile_download_bypass_sequence))
@@ -219,9 +227,13 @@ impl AutotuneTerminalRecord {
             &self.worker_run_id,
             32,
         )?;
-        if self.consumed_traffic_bytes > MAX_OPERATION_TRAFFIC_BUDGET_BYTES {
-            return Err("native Auto-Tune terminal traffic exceeds its bound".to_string());
-        }
+        // A finite policy bounds authorization, not the representation of
+        // observed usage. Preserve legacy bytes for totals in its old range.
+        let header = if self.consumed_traffic_bytes > MAX_OPERATION_TRAFFIC_BUDGET_BYTES {
+            EXTENDED_TERMINAL_HEADER
+        } else {
+            TERMINAL_HEADER
+        };
         let (state, review_digest, diagnostic_code) = match &self.terminal {
             AutotuneTerminal::Complete { review_digest } => {
                 require_hex("native Auto-Tune Review digest", review_digest, 64)?;
@@ -238,7 +250,7 @@ impl AutotuneTerminalRecord {
             }
         };
         Ok(format!(
-            "{TERMINAL_HEADER}\njob_id={}\nworker_run_id={}\nconsumed_traffic_bytes={}\nstate={state}\nreview_digest={review_digest}\ndiagnostic_code={diagnostic_code}\n",
+            "{header}\njob_id={}\nworker_run_id={}\nconsumed_traffic_bytes={}\nstate={state}\nreview_digest={review_digest}\ndiagnostic_code={diagnostic_code}\n",
             self.job_id, self.worker_run_id, self.consumed_traffic_bytes
         ))
     }
@@ -248,7 +260,10 @@ impl AutotuneTerminalRecord {
             return Err("native Auto-Tune terminal is unbounded or unterminated".to_string());
         }
         let mut lines = input.lines();
-        if lines.next() != Some(TERMINAL_HEADER) {
+        if !matches!(
+            lines.next(),
+            Some(TERMINAL_HEADER | EXTENDED_TERMINAL_HEADER)
+        ) {
             return Err("native Auto-Tune terminal header is invalid".to_string());
         }
         let job_id = terminal_field(&mut lines, "job_id")?;
@@ -305,14 +320,21 @@ fn publish_traffic_budget_terminal(
     request: &OperationRequest,
     worker_run_id: &str,
     evidence_store: &AutotuneEvidenceStore,
+    reason: &str,
 ) -> Result<(), String> {
+    if !matches!(
+        reason,
+        SPEEDTEST_TRAFFIC_BUDGET_EXHAUSTED | SPEEDTEST_TRAFFIC_LIMIT_REACHED
+    ) {
+        return Err("native Auto-Tune traffic stop reason is invalid".into());
+    }
     publish_replayed_terminal(
         terminal_path,
         request,
         worker_run_id,
         evidence_store,
         AutotuneTerminal::Inconclusive {
-            code: TRAFFIC_BUDGET_INCONCLUSIVE.to_string(),
+            code: reason.to_string(),
         },
     )
 }
@@ -338,8 +360,25 @@ fn publish_replayed_terminal(
 }
 
 fn worker_failure_terminal_code(error: &str) -> String {
+    if error.starts_with("speedtest-owned-persistence-failed:") {
+        return "owned-traffic-persistence-failed".into();
+    }
+    if error.starts_with("speedtest-owned-budget-observation-failed:")
+        || error.starts_with("owned traffic ")
+        || error == "speedtest-budget-watcher-panicked"
+    {
+        return "owned-traffic-accounting-failed".into();
+    }
     if require_terminal_code(error).is_ok() {
         return error.to_string();
+    }
+    if matches!(
+        error,
+        "native Auto-Tune operation deadline expired during capture admission"
+            | "native Auto-Tune operation deadline expired during capture completion"
+            | "native Auto-Tune operation deadline expired before runtime permit"
+    ) {
+        return "native-autotune-deadline-expired".into();
     }
     if error.contains("load byte evidence is invalid") {
         return "native-load-byte-evidence-invalid".to_string();
@@ -359,14 +398,98 @@ fn worker_failure_terminal_code(error: &str) -> String {
     "native-autotune-worker-failed".to_string()
 }
 
+pub(crate) fn terminal_traffic_is_unknown(terminal: &AutotuneTerminal) -> bool {
+    matches!(terminal, AutotuneTerminal::Failed { code }
+        if code == "owned-traffic-accounting-failed" || code == "speedtest-counter-reset"
+            || code.starts_with("speedtest-accounting-"))
+}
+
 fn worker_error_terminal(error: &str, termination_requested: bool) -> AutotuneTerminal {
-    if termination_requested {
+    let failure = AutotuneTerminal::Failed {
+        code: worker_failure_terminal_code(error),
+    };
+    // Cancellation must not turn a known accounting fault into an apparently
+    // exact terminal debit and release the scheduler's remaining reservation.
+    let persistence_failure = matches!(&failure, AutotuneTerminal::Failed { code } if code == "owned-traffic-persistence-failed");
+    if termination_requested && !terminal_traffic_is_unknown(&failure) && !persistence_failure {
         AutotuneTerminal::Cancelled
     } else {
-        AutotuneTerminal::Failed {
-            code: worker_failure_terminal_code(error),
+        failure
+    }
+}
+
+fn unstarted_traffic_receipt_bytes(
+    request: &OperationRequest,
+    worker: &str,
+) -> Result<String, String> {
+    require_hex("worker run id", worker, 32)?;
+    let digest = super::autotune_apply::native_apply_sha256_hex(request.encode()?.as_bytes());
+    let payload = serde_json::json!({"schema_version":1,"purpose":"owned-producers-not-started-v1",
+        "job_id":request.identity.job_id,"worker_run_id":worker,"request_sha256":digest});
+    let sha256 = super::autotune_apply::native_apply_sha256_hex(payload.to_string().as_bytes());
+    Ok(format!(
+        "{}\n",
+        serde_json::json!({"payload":payload,"sha256":sha256})
+    ))
+}
+
+fn publish_unstarted_traffic_receipt(
+    directory: &Path,
+    request: &OperationRequest,
+    worker: &str,
+) -> Result<(), String> {
+    use super::autotune_apply_runtime::{
+        require_private_directory, sync_directory, write_new_private_file,
+    };
+    require_private_directory(directory)?;
+    let bytes = unstarted_traffic_receipt_bytes(request, worker)?;
+    for suffix in ["", ".owned-intent", ".owned-next"] {
+        match fs::symlink_metadata(
+            directory.join(format!("owned-traffic-checkpoint-{worker}{suffix}")),
+        ) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err("unstarted traffic proof conflicts with accounting artifacts".into()),
         }
     }
+    write_new_private_file(
+        &directory.join(format!("owned-traffic-unstarted-{worker}")),
+        bytes.as_bytes(),
+    )?;
+    sync_directory(directory)
+}
+
+pub(crate) fn verified_unstarted_traffic_receipt(
+    directory: &Path,
+    request: &OperationRequest,
+    worker: &str,
+) -> Result<bool, String> {
+    let expected = unstarted_traffic_receipt_bytes(request, worker)?;
+    let path = directory.join(format!("owned-traffic-unstarted-{worker}"));
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "unable to inspect unstarted traffic proof: {error}"
+            ))
+        }
+        Ok(_) => {}
+    }
+    super::autotune_apply_runtime::require_private_directory(directory)?;
+    let bytes = super::autotune_apply_runtime::read_private_recovery_bounded(
+        &path,
+        4096,
+        "unstarted traffic proof",
+    )?;
+    if bytes != expected.as_bytes() {
+        return Err("unstarted traffic proof binding mismatch".into());
+    }
+    for suffix in ["", ".owned-intent", ".owned-next"] {
+        if !matches!(fs::symlink_metadata(directory.join(format!("owned-traffic-checkpoint-{worker}{suffix}"))), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Err("unstarted traffic proof conflicts with accounting artifacts".into());
+        }
+    }
+    Ok(true)
 }
 
 pub(crate) fn verify_terminal_consumed_traffic(
@@ -379,18 +502,77 @@ pub(crate) fn verify_terminal_consumed_traffic(
     if request.identity.job_id != expected_job_id {
         return Err("native Auto-Tune terminal request identity mismatch".to_string());
     }
-    if terminal_consumed_traffic_bytes > request.traffic_budget_bytes {
-        return Err("native Auto-Tune terminal traffic exceeds its request budget".to_string());
-    }
     let job_directory = request_path
         .parent()
         .ok_or_else(|| "native Auto-Tune terminal request has no job directory".to_string())?;
-    let records = AutotuneEvidenceStore::open(job_directory)?.load()?;
+    // Preserve legacy zero-byte preflight/cancellation settlement without
+    // creating an evidence directory from a read-only verification request.
+    // Missing evidence must never justify a nonzero terminal debit.
+    let records = if terminal_consumed_traffic_bytes == 0
+        && matches!(fs::symlink_metadata(job_directory.join(EVIDENCE_DIR)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        ensure_private_directory(job_directory)?;
+        Vec::new()
+    } else {
+        AutotuneEvidenceStore::read_existing(job_directory)?
+    };
     let replay = AutotuneReplayState::replay(&request, expected_worker_run_id, &records)?;
     if replay.consumed_bytes != terminal_consumed_traffic_bytes {
         return Err("native Auto-Tune terminal traffic differs from replay evidence".to_string());
     }
+    if request.traffic_policy_explicit {
+        if records.is_empty()
+            && terminal_consumed_traffic_bytes == 0
+            && verified_unstarted_traffic_receipt(job_directory, &request, expected_worker_run_id)?
+        {
+            return Ok(0);
+        }
+        return super::speedtest::reconcile_owned_cutoff(
+            job_directory,
+            &request,
+            expected_worker_run_id,
+            owned_checkpoint_debit_totals(&records)?,
+        );
+    }
     Ok(replay.consumed_bytes)
+}
+
+fn owned_checkpoint_debit_totals(
+    records: &[AutotuneEvidenceRecord],
+) -> Result<(u32, u64, u64), String> {
+    let mut expected = (0_u32, 0_u64, 0_u64);
+    for record in records {
+        if let AutotuneEvidence::TrafficDebit(debit) = &record.evidence {
+            if debit.rx_bytes == 0 && debit.tx_bytes == 0 {
+                return Err("owned traffic journal contains an empty debit".into());
+            }
+            expected.0 = expected
+                .0
+                .checked_add(1)
+                .ok_or("owned traffic debit sequence overflow")?;
+            expected.1 = expected
+                .1
+                .checked_add(debit.rx_bytes)
+                .ok_or("owned traffic debit RX overflow")?;
+            expected.2 = expected
+                .2
+                .checked_add(debit.tx_bytes)
+                .ok_or("owned traffic debit TX overflow")?;
+        }
+    }
+    Ok(expected)
+}
+
+#[cfg(test)]
+fn verify_owned_checkpoint_debits(
+    checkpoint: (u32, u64, u64),
+    records: &[AutotuneEvidenceRecord],
+) -> Result<(), String> {
+    if checkpoint != owned_checkpoint_debit_totals(records)? {
+        return Err("owned traffic checkpoint differs from durable debit journal".into());
+    }
+    Ok(())
 }
 
 fn terminal_field<'a, I>(lines: &mut I, expected: &str) -> Result<String, String>
@@ -581,6 +763,7 @@ pub(crate) struct NativeAutotuneProgress {
     pub(crate) total_units: u32,
     pub(crate) direction: Option<SpeedtestDirection>,
     pub(crate) attempt: Option<u32>,
+    pub(crate) consumed_traffic_bytes: Option<u64>,
 }
 
 impl NativeAutotuneProgress {
@@ -604,6 +787,7 @@ impl NativeAutotuneProgress {
             total_units: 0,
             direction: None,
             attempt: None,
+            consumed_traffic_bytes: None,
         }
     }
 
@@ -640,8 +824,18 @@ impl NativeAutotuneProgress {
 
     fn encode(&self) -> Result<String, String> {
         self.validate(true)?;
+        let header = if self.consumed_traffic_bytes.is_some() {
+            TRAFFIC_PROGRESS_HEADER
+        } else {
+            PROGRESS_HEADER
+        };
+        let traffic = self
+            .consumed_traffic_bytes
+            .map_or_else(String::new, |bytes| {
+                format!("consumed_traffic_bytes={bytes}\n")
+            });
         Ok(format!(
-            "{PROGRESS_HEADER}\njob_id={}\nworker_run_id={}\nevidence_sequence={}\nstep={}\nprogress_percent={}\nstage_index={}\nstage_total={}\ncompleted_units={}\ntotal_units={}\ndirection={}\nattempt={}\n",
+            "{header}\njob_id={}\nworker_run_id={}\nevidence_sequence={}\nstep={}\nprogress_percent={}\nstage_index={}\nstage_total={}\ncompleted_units={}\ntotal_units={}\ndirection={}\nattempt={}\n{traffic}",
             self.job_id,
             self.worker_run_id,
             self.evidence_sequence,
@@ -661,7 +855,8 @@ impl NativeAutotuneProgress {
             return Err("Auto-Tune progress is oversized or unterminated".to_string());
         }
         let mut lines = input.lines();
-        if lines.next() != Some(PROGRESS_HEADER) {
+        let header = lines.next();
+        if !matches!(header, Some(PROGRESS_HEADER | TRAFFIC_PROGRESS_HEADER)) {
             return Err("Auto-Tune progress header is unsupported".to_string());
         }
         let job_id = terminal_field(&mut lines, "job_id")?;
@@ -682,6 +877,11 @@ impl NativeAutotuneProgress {
             0 => None,
             value => Some(value),
         };
+        let consumed_traffic_bytes = if header == Some(TRAFFIC_PROGRESS_HEADER) {
+            Some(progress_number(&mut lines, "consumed_traffic_bytes")?)
+        } else {
+            None
+        };
         if lines.next().is_some() {
             return Err("Auto-Tune progress contains unknown fields".to_string());
         }
@@ -697,6 +897,7 @@ impl NativeAutotuneProgress {
             total_units,
             direction,
             attempt,
+            consumed_traffic_bytes,
         };
         progress.validate(true)?;
         if progress.encode()? != input {
@@ -1040,6 +1241,126 @@ pub struct AutotuneLoadEvidence {
 }
 
 const MIN_DIRECTIONAL_LOAD_BYTES: u64 = 64 * 1024;
+const MIN_QUALIFICATION_TRAFFIC_BYTES: u64 = super::server_qualification::MIN_STABLE_SERVERS as u64
+    * super::server_qualification::REPEATS as u64
+    * 2
+    * super::speedtest::MIN_ROUTE_PROOF_BYTES;
+
+/// Necessary byte evidence for qualification plus the four initial controls.
+/// This is not a sufficient budget for a complete search, retry or restoration.
+pub(crate) const fn minimum_autotune_evidence_bytes() -> u64 {
+    MIN_QUALIFICATION_TRAFFIC_BYTES + 4 * MIN_DIRECTIONAL_LOAD_BYTES
+}
+
+pub(crate) fn validate_autotune_evidence_budget(
+    policy: super::protocol::TrafficPolicy,
+) -> Result<(), String> {
+    let minimum = minimum_autotune_evidence_bytes();
+    if !policy.allows(minimum) {
+        return Err(format!("Full Auto-Tune traffic allowance is insufficient: mandatory server comparison and initial control evidence alone require at least {minimum} bytes total DL+UL. The complete run, retries and probes usually require more; choose a larger budget or Unlimited."));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub(crate) struct AutotuneTrafficAdmissionError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+/// Planning policy, not a physical minimum or stopping-rate authority. Rates
+/// stay in immutable intent and must never replace service ceilings or probes.
+pub(crate) fn validate_autotune_planning_budget(
+    policy: super::protocol::TrafficPolicy,
+    plan: super::protocol::AutotuneTrafficPlan,
+) -> Result<(), AutotuneTrafficAdmissionError> {
+    plan.validate()
+        .map_err(|message| AutotuneTrafficAdmissionError {
+            code: "traffic-planning-invalid",
+            message,
+        })?;
+    let initial_runs = super::server_qualification::MIN_STABLE_SERVERS as u64
+        * super::server_qualification::REPEATS as u64
+        + 2;
+    // Validation bounds the aggregate to 200 Gbit/s, so integer arithmetic
+    // fits u64. Two controls per direction follow the qualification runs.
+    let planned_bytes = (plan.download_kbps + plan.upload_kbps) * 15_000 * initial_runs / 8;
+    if !policy.allows(planned_bytes) {
+        return Err(AutotuneTrafficAdmissionError {
+            code: "traffic-budget-insufficient",
+            message: format!("Auto-Tune initial-stage planning allowance is {planned_bytes} bytes total DL+UL at the supplied planning rates. Choose a larger budget or Unlimited. This planning estimate is not a physical lower bound and does not guarantee completion."),
+        });
+    }
+    Ok(())
+}
+
+/// Necessary admission conditions, not a quote for the complete adaptive run.
+/// The reserve is retained once throughout qualification, not charged per run.
+pub(crate) fn validate_autotune_traffic_admission(
+    policy: super::protocol::TrafficPolicy,
+    strategy: Option<CalibrationStrategy>,
+    allow_sqm_disable: bool,
+    download_cap: Option<u64>,
+    upload_cap: Option<u64>,
+) -> Result<(), AutotuneTrafficAdmissionError> {
+    validate_autotune_evidence_budget(policy).map_err(|message| AutotuneTrafficAdmissionError {
+        code: "traffic-budget-insufficient",
+        message,
+    })?;
+    validate_autotune_raw_traffic_authority(
+        policy,
+        strategy,
+        allow_sqm_disable,
+        download_cap,
+        upload_cap,
+    )
+    .map_err(|message| AutotuneTrafficAdmissionError {
+        code: "traffic-stop-authority-unavailable",
+        message,
+    })?;
+    if policy == super::protocol::TrafficPolicy::Unlimited
+        || strategy != Some(CalibrationStrategy::FullRaw)
+        || !allow_sqm_disable
+    {
+        return Ok(());
+    }
+    let (Some(download), Some(upload)) = (download_cap, upload_cap) else {
+        unreachable!("raw traffic authority was validated above");
+    };
+    let reserve = traffic_stop_safety_reserve_bytes(download, upload);
+    // Even the last of the mandatory valid comparison runs must start with
+    // its proof bytes plus this reserve. Earlier proof bytes cannot be reused.
+    let minimum = reserve.checked_add(MIN_QUALIFICATION_TRAFFIC_BYTES);
+    if minimum.is_none_or(|minimum| !policy.allows(minimum)) {
+        let amount = minimum.map_or_else(
+            || "more than the supported byte range".to_string(),
+            |n| n.to_string(),
+        );
+        return Err(AutotuneTrafficAdmissionError {
+            code: "traffic-budget-insufficient",
+            message: format!("Full Auto-Tune traffic allowance is insufficient: raw server qualification alone requires at least {amount} bytes total DL+UL under the declared service ceilings, including {reserve} bytes reserved for stopping and {MIN_QUALIFICATION_TRAFFIC_BYTES} bytes of mandatory comparison evidence. The reserve is inside the selected total, not an additional quota or already-consumed traffic. Passing this lower bound does not guarantee that the full run fits. Choose a larger budget or Unlimited."),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_autotune_raw_traffic_authority(
+    policy: super::protocol::TrafficPolicy,
+    strategy: Option<CalibrationStrategy>,
+    allow_sqm_disable: bool,
+    download_cap: Option<u64>,
+    upload_cap: Option<u64>,
+) -> Result<(), String> {
+    if policy != super::protocol::TrafficPolicy::Unlimited
+        && strategy == Some(CalibrationStrategy::FullRaw)
+        && allow_sqm_disable
+        && (download_cap.filter(|rate| *rate > 0).is_none()
+            || upload_cap.filter(|rate| *rate > 0).is_none())
+    {
+        return Err("traffic-stop-authority-unavailable: capped raw Auto-Tune requires declared download and upload service ceilings to estimate its stopping reserve. The selected route has no verified physical rate bound. Configured shaping rates, observed throughput and planning-only estimates are not substitutes. Choose Unlimited explicitly, or provide actual service ceilings; do not invent ceilings to make the test start.".into());
+    }
+    Ok(())
+}
 const MAX_UPLOAD_COUNTER_LAG_PERCENT: u128 = 5;
 const MIN_UPLOAD_PAYLOAD_WIRE_PERCENT: u8 = 60;
 
@@ -3127,21 +3448,33 @@ pub struct RawControlCapacityEvidence {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrafficDebitPurpose {
     Qualification,
+    CapacityQualification,
     Measurement,
+    BudgetOverrun,
+    Lifecycle,
+    LifecycleOverrun,
 }
 
 impl TrafficDebitPurpose {
     fn as_str(self) -> &'static str {
         match self {
             Self::Qualification => "qualification",
+            Self::CapacityQualification => "capacity_qualification",
             Self::Measurement => "measurement",
+            Self::BudgetOverrun => "budget_overrun",
+            Self::Lifecycle => "lifecycle",
+            Self::LifecycleOverrun => "lifecycle_overrun",
         }
     }
 
     fn parse(value: &str) -> Option<Self> {
         match value {
             "qualification" => Some(Self::Qualification),
+            "capacity_qualification" => Some(Self::CapacityQualification),
             "measurement" => Some(Self::Measurement),
+            "budget_overrun" => Some(Self::BudgetOverrun),
+            "lifecycle" => Some(Self::Lifecycle),
+            "lifecycle_overrun" => Some(Self::LifecycleOverrun),
             _ => None,
         }
     }
@@ -3387,6 +3720,9 @@ pub enum AutotuneEvidence {
     PreflightAttested,
     Baseline(BaselineEvidence),
     RuntimeMutationArmed,
+    ServerSelected {
+        digest: String,
+    },
     TrafficDebit(TrafficDebitEvidence),
     Measurement(MeasurementEvidence),
     RawControlCapacity(RawControlCapacityEvidence),
@@ -3437,6 +3773,7 @@ enum EvidenceKind {
     Preflight,
     Baseline,
     MutationArmed,
+    ServerSelection,
     TrafficDebit,
     Measurement,
     RawControlCapacity,
@@ -3462,6 +3799,7 @@ impl EvidenceKind {
             Self::Preflight => "preflight",
             Self::Baseline => "baseline",
             Self::MutationArmed => "mutation_armed",
+            Self::ServerSelection => "server_selection",
             Self::TrafficDebit => "traffic_debit",
             Self::Measurement => "measurement",
             Self::RawControlCapacity => "raw_control_capacity",
@@ -3487,6 +3825,7 @@ impl EvidenceKind {
             "preflight" => Some(Self::Preflight),
             "baseline" => Some(Self::Baseline),
             "mutation_armed" => Some(Self::MutationArmed),
+            "server_selection" => Some(Self::ServerSelection),
             "traffic_debit" => Some(Self::TrafficDebit),
             "measurement" => Some(Self::Measurement),
             "raw_control_capacity" => Some(Self::RawControlCapacity),
@@ -3522,6 +3861,10 @@ impl AutotuneEvidenceRecord {
                 EvidenceKind::Baseline
             }
             AutotuneEvidence::RuntimeMutationArmed => EvidenceKind::MutationArmed,
+            AutotuneEvidence::ServerSelected { digest } => {
+                payload.digest = Some(digest.clone());
+                EvidenceKind::ServerSelection
+            }
             AutotuneEvidence::TrafficDebit(value) => {
                 payload.traffic_debit_purpose = Some(value.purpose);
                 payload.speedtest_direction = Some(value.direction);
@@ -3880,7 +4223,35 @@ impl AutotuneEvidenceRecord {
             ),
             ("digest", payload.digest.unwrap_or_default()),
         ];
-        let mut output = String::from(EVIDENCE_HEADER);
+        let header = if matches!(
+            self.evidence,
+            AutotuneEvidence::TrafficDebit(TrafficDebitEvidence {
+                purpose: TrafficDebitPurpose::Lifecycle | TrafficDebitPurpose::LifecycleOverrun,
+                ..
+            })
+        ) {
+            LIFECYCLE_EVIDENCE_HEADER
+        } else if matches!(
+            self.evidence,
+            AutotuneEvidence::TrafficDebit(TrafficDebitEvidence {
+                purpose: TrafficDebitPurpose::BudgetOverrun,
+                ..
+            })
+        ) {
+            OVERRUN_EVIDENCE_HEADER
+        } else if matches!(
+            self.evidence,
+            AutotuneEvidence::ServerSelected { .. }
+                | AutotuneEvidence::TrafficDebit(TrafficDebitEvidence {
+                    purpose: TrafficDebitPurpose::CapacityQualification,
+                    ..
+                })
+        ) {
+            QUALIFICATION_EVIDENCE_HEADER
+        } else {
+            EVIDENCE_HEADER
+        };
+        let mut output = String::from(header);
         output.push('\n');
         for (name, value) in fields {
             output.push_str(name);
@@ -4123,6 +4494,15 @@ pub struct AutotuneEvidenceStore {
 }
 
 impl AutotuneEvidenceStore {
+    pub fn read_existing(job_directory: &Path) -> Result<Vec<AutotuneEvidenceRecord>, String> {
+        ensure_private_directory(job_directory)?;
+        Self {
+            job_directory: job_directory.to_path_buf(),
+            directory: job_directory.join(EVIDENCE_DIR),
+        }
+        .load()
+    }
+
     pub fn open(job_directory: &Path) -> Result<Self, String> {
         ensure_private_directory(job_directory)?;
         let directory = job_directory.join(EVIDENCE_DIR);
@@ -4186,9 +4566,14 @@ impl AutotuneEvidenceStore {
     pub fn load(&self) -> Result<Vec<AutotuneEvidenceRecord>, String> {
         ensure_private_directory(&self.directory)?;
         let mut records = Vec::new();
+        let mut entry_count = 0_usize;
         let entries = fs::read_dir(&self.directory)
             .map_err(|error| format!("unable to enumerate native Auto-Tune evidence: {error}"))?;
         for entry in entries {
+            entry_count += 1;
+            if entry_count > MAX_AUTOTUNE_EVIDENCE_RECORDS * 2 {
+                return Err("native Auto-Tune evidence directory has too many entries".into());
+            }
             let entry = entry.map_err(|error| {
                 format!("unable to inspect native Auto-Tune evidence entry: {error}")
             })?;
@@ -4197,10 +4582,10 @@ impl AutotuneEvidenceStore {
                 .into_string()
                 .map_err(|_| "native Auto-Tune evidence filename is not UTF-8".to_string())?;
             if name.starts_with(".tmp-") {
-                ensure_private_regular(&entry.path())?;
-                fs::remove_file(entry.path()).map_err(|error| {
-                    format!("unable to discard unpublished Auto-Tune evidence: {error}")
-                })?;
+                // Only the writer owns unpublished paths. A live append may
+                // rename this entry while we enumerate; do not stat or unlink
+                // it. Failed writes clean themselves up; job pruning removes
+                // abandoned remnants after ownership has retired.
                 continue;
             }
             let sequence = parse_evidence_name(&name)?;
@@ -4409,6 +4794,9 @@ impl EvidencePayload {
                 samples: required(self.baseline_samples, "baseline_samples")?,
             }),
             EvidenceKind::MutationArmed => AutotuneEvidence::RuntimeMutationArmed,
+            EvidenceKind::ServerSelection => AutotuneEvidence::ServerSelected {
+                digest: required(self.digest, "digest")?,
+            },
             EvidenceKind::TrafficDebit => AutotuneEvidence::TrafficDebit(TrafficDebitEvidence {
                 purpose: required(self.traffic_debit_purpose, "traffic_debit_purpose")?,
                 direction: required(self.speedtest_direction, "speedtest_direction")?,
@@ -4765,7 +5153,8 @@ impl EvidencePayload {
                 self.transport_samples = Some(value.transport_samples);
                 self.cpu_samples = Some(value.cpu_samples);
             }
-            AutotuneEvidence::ProposalBuilt { digest }
+            AutotuneEvidence::ServerSelected { digest }
+            | AutotuneEvidence::ProposalBuilt { digest }
             | AutotuneEvidence::PairConfirmed { digest }
             | AutotuneEvidence::PairExhausted { digest }
             | AutotuneEvidence::TopologiesCompared { digest }
@@ -4795,7 +5184,16 @@ struct EvidenceReader<'a> {
 
 impl<'a> EvidenceReader<'a> {
     fn new(input: &'a str) -> Result<Self, String> {
-        Self::new_with_header(input, EVIDENCE_HEADER)
+        let header = if input.lines().next() == Some(LIFECYCLE_EVIDENCE_HEADER) {
+            LIFECYCLE_EVIDENCE_HEADER
+        } else if input.lines().next() == Some(OVERRUN_EVIDENCE_HEADER) {
+            OVERRUN_EVIDENCE_HEADER
+        } else if input.lines().next() == Some(QUALIFICATION_EVIDENCE_HEADER) {
+            QUALIFICATION_EVIDENCE_HEADER
+        } else {
+            EVIDENCE_HEADER
+        };
+        Self::new_with_header(input, header)
     }
 
     fn new_with_header(input: &'a str, header: &str) -> Result<Self, String> {
@@ -5105,7 +5503,7 @@ pub struct AutotuneReplayState {
     profile: AutotuneProfile,
     allow_sqm_disable: bool,
     mobile_download_bypass_required: bool,
-    traffic_budget_bytes: u64,
+    traffic_budget: super::protocol::TrafficPolicy,
     pub phase: AutotunePhase,
     pub last_sequence: u32,
     pub consumed_bytes: u64,
@@ -5120,6 +5518,9 @@ pub struct AutotuneReplayState {
     raw_both_download_seen: bool,
     raw_both_upload_seen: bool,
     proposal_seen: bool,
+    capacity_qualification_seen: bool,
+    server_selection_required: bool,
+    server_selection_digest: Option<String>,
     download_search_complete: bool,
     upload_search_complete: bool,
     search_download_candidates: Vec<u64>,
@@ -5171,7 +5572,7 @@ impl AutotuneReplayState {
                 .ok_or_else(|| "Full Auto-Tune request has no profile".to_string())?,
             allow_sqm_disable: request.allow_sqm_disable,
             mobile_download_bypass_required: mobile_download_bypass_required(request),
-            traffic_budget_bytes: request.traffic_budget_bytes,
+            traffic_budget: request.traffic_budget,
             phase: AutotunePhase::Preflight,
             last_sequence: 0,
             consumed_bytes: 0,
@@ -5186,6 +5587,9 @@ impl AutotuneReplayState {
             raw_both_download_seen: false,
             raw_both_upload_seen: false,
             proposal_seen: false,
+            capacity_qualification_seen: false,
+            server_selection_required: request.traffic_policy_explicit,
+            server_selection_digest: None,
             download_search_complete: false,
             upload_search_complete: false,
             search_download_candidates: Vec::new(),
@@ -5247,11 +5651,31 @@ impl AutotuneReplayState {
         }
         validate_digest_fields(&record.evidence)?;
         self.validate_evidence_phase(record.phase, &record.evidence)?;
+        if let AutotuneEvidence::TrafficDebit(value) = &record.evidence {
+            if matches!(
+                value.purpose,
+                TrafficDebitPurpose::Lifecycle | TrafficDebitPurpose::LifecycleOverrun
+            ) {
+                // Accounting records never supply measurement observations.
+                // An overrun retires pending debit authority because only
+                // further accounting and restoration remain legal.
+                self.apply_traffic_debit(record.phase, *value)?;
+                self.phase = record.phase;
+                self.last_sequence = record.sequence;
+                return Ok(());
+            }
+        }
+        if self.traffic_budget.exceeded(self.consumed_bytes)
+            && (!matches!(record.evidence, AutotuneEvidence::RuntimeRestored)
+                || self.runtime_restored)
+        {
+            return Err("native Auto-Tune traffic overrun permits only runtime restoration".into());
+        }
         if !self.pending_measurement_debits.is_empty()
             && !matches!(
                 &record.evidence,
                 AutotuneEvidence::TrafficDebit(TrafficDebitEvidence {
-                    purpose: TrafficDebitPurpose::Measurement,
+                    purpose: TrafficDebitPurpose::Measurement | TrafficDebitPurpose::BudgetOverrun,
                     ..
                 }) | AutotuneEvidence::Measurement(_)
                     | AutotuneEvidence::RawControlCapacity(_)
@@ -5320,6 +5744,9 @@ impl AutotuneReplayState {
                 self.baseline_seen = true;
             }
             AutotuneEvidence::RuntimeMutationArmed => self.mutation_armed = true,
+            AutotuneEvidence::ServerSelected { digest } => {
+                self.server_selection_digest = Some(digest.clone())
+            }
             AutotuneEvidence::TrafficDebit(value) => {
                 self.apply_traffic_debit(record.phase, *value)?
             }
@@ -5398,6 +5825,14 @@ impl AutotuneReplayState {
                 AutotuneEvidence::PreflightAttested
             ) | (AutotunePhase::IdleBaseline, AutotuneEvidence::Baseline(_))
                 | (
+                    AutotunePhase::Preflight | AutotunePhase::Restore,
+                    AutotuneEvidence::TrafficDebit(TrafficDebitEvidence {
+                        purpose: TrafficDebitPurpose::Lifecycle
+                            | TrafficDebitPurpose::LifecycleOverrun,
+                        ..
+                    })
+                )
+                | (
                     AutotunePhase::IdleBaseline
                         | AutotunePhase::RawControls
                         | AutotunePhase::DirectionalSearch
@@ -5422,6 +5857,10 @@ impl AutotuneReplayState {
                 | (
                     AutotunePhase::RawControls,
                     AutotuneEvidence::RawControlCapacity(_)
+                )
+                | (
+                    AutotunePhase::RawControls,
+                    AutotuneEvidence::ServerSelected { .. }
                 )
                 | (
                     AutotunePhase::Proposal,
@@ -5477,6 +5916,19 @@ impl AutotuneReplayState {
         if !valid {
             return Err("native Auto-Tune evidence is invalid for its phase".to_string());
         }
+        if (self.capacity_qualification_seen || self.server_selection_required)
+            && self.server_selection_digest.is_none()
+            && matches!(
+                evidence,
+                AutotuneEvidence::Measurement(_)
+                    | AutotuneEvidence::RawControlCapacity(_)
+                    | AutotuneEvidence::ProposalBuilt { .. }
+            )
+        {
+            return Err(
+                "native Auto-Tune capacity qualification has no selected-server receipt".into(),
+            );
+        }
         if matches!(evidence, AutotuneEvidence::RuntimeMutationArmed) && self.mutation_armed {
             return Err("native Auto-Tune runtime mutation was armed twice".to_string());
         }
@@ -5490,6 +5942,12 @@ impl AutotuneReplayState {
             return Err("native Auto-Tune runtime restore is premature or duplicated".to_string());
         }
         match evidence {
+            AutotuneEvidence::ServerSelected { .. } if !self.capacity_qualification_seen
+                || self.server_selection_digest.is_some() || self.control_download_count != 0
+                || self.control_upload_count != 0 || !self.pending_measurement_debits.is_empty()
+                || self.proposal_seen || self.runtime_restored => {
+                return Err("native Auto-Tune server selection is missing qualification or is late/duplicated".into());
+            }
             AutotuneEvidence::PreflightAttested
                 if self.last_sequence != 0 || self.preflight_seen =>
             {
@@ -5675,10 +6133,50 @@ impl AutotuneReplayState {
             return Err("native Auto-Tune traffic debit is empty".to_string());
         }
         match value.purpose {
+            TrafficDebitPurpose::Lifecycle | TrafficDebitPurpose::LifecycleOverrun
+                if self.server_selection_required
+                    && self.preflight_seen
+                    && !self.runtime_restored
+                    && value.direction == SpeedtestDirection::Both
+                    && matches!(
+                        phase,
+                        AutotunePhase::Preflight
+                            | AutotunePhase::IdleBaseline
+                            | AutotunePhase::RawControls
+                            | AutotunePhase::DirectionalSearch
+                            | AutotunePhase::PairConfirmation
+                            | AutotunePhase::TopologyComparison
+                            | AutotunePhase::Restore
+                    ) => {}
+            TrafficDebitPurpose::BudgetOverrun
+                if self.baseline_seen
+                    && !self.runtime_restored
+                    && ((phase == AutotunePhase::IdleBaseline && !self.mutation_armed)
+                        || (self.mutation_armed
+                            && matches!(
+                                phase,
+                                AutotunePhase::RawControls
+                                    | AutotunePhase::DirectionalSearch
+                                    | AutotunePhase::PairConfirmation
+                                    | AutotunePhase::TopologyComparison
+                            ))) => {}
             TrafficDebitPurpose::Qualification
                 if phase == AutotunePhase::IdleBaseline
                     && self.baseline_seen
                     && !self.mutation_armed => {}
+            TrafficDebitPurpose::CapacityQualification
+                if phase == AutotunePhase::RawControls
+                    && value.direction == SpeedtestDirection::Both
+                    && self.baseline_seen
+                    && self.mutation_armed
+                    && self.server_selection_digest.is_none()
+                    && !self.runtime_restored
+                    && self.control_download_count == 0
+                    && self.control_upload_count == 0
+                    && !self.raw_both_download_seen
+                    && !self.raw_both_upload_seen
+                    && self.pending_measurement_debits.is_empty()
+                    && !self.proposal_seen => {}
             TrafficDebitPurpose::Measurement
                 if matches!(
                     phase,
@@ -5686,7 +6184,9 @@ impl AutotuneReplayState {
                         | AutotunePhase::DirectionalSearch
                         | AutotunePhase::PairConfirmation
                         | AutotunePhase::TopologyComparison
-                ) && self.mutation_armed => {}
+                ) && self.mutation_armed
+                    && (!(self.capacity_qualification_seen || self.server_selection_required)
+                        || self.server_selection_digest.is_some()) => {}
             _ => {
                 return Err(
                     "native Auto-Tune traffic debit purpose is invalid for its phase".to_string(),
@@ -5697,16 +6197,29 @@ impl AutotuneReplayState {
             .consumed_bytes
             .checked_add(bytes)
             .ok_or_else(|| "native Auto-Tune cumulative traffic overflowed".to_string())?;
-        if consumed_bytes > self.traffic_budget_bytes {
+        if self.traffic_budget.exceeded(consumed_bytes)
+            != matches!(
+                value.purpose,
+                TrafficDebitPurpose::BudgetOverrun | TrafficDebitPurpose::LifecycleOverrun
+            )
+        {
             return Err("native Auto-Tune traffic budget was exceeded".to_string());
         }
         let pending_measurement_debits = if value.purpose == TrafficDebitPurpose::Measurement {
             self.pending_measurement_debits
                 .append(phase, value.direction)?
+        } else if matches!(
+            value.purpose,
+            TrafficDebitPurpose::BudgetOverrun | TrafficDebitPurpose::LifecycleOverrun
+        ) {
+            PendingMeasurementDebits::None
         } else {
             self.pending_measurement_debits
         };
         self.consumed_bytes = consumed_bytes;
+        if value.purpose == TrafficDebitPurpose::CapacityQualification {
+            self.capacity_qualification_seen = true;
+        }
         self.pending_measurement_debits = pending_measurement_debits;
         Ok(())
     }
@@ -6557,6 +7070,9 @@ impl AutotuneReplayState {
     }
 
     fn unreviewable_terminal_code(&self) -> Option<&'static str> {
+        if self.traffic_budget.exceeded(self.consumed_bytes) {
+            return Some("speedtest-traffic-budget-exceeded");
+        }
         if self.raw_fallback_built {
             return None;
         }
@@ -6580,6 +7096,15 @@ impl AutotuneReplayState {
     }
 
     pub fn next_action(&self) -> Result<AutotuneAction, String> {
+        if self.traffic_budget.exceeded(self.consumed_bytes) {
+            return Ok(if self.runtime_restored || !self.mutation_armed {
+                AutotuneAction::PublishInconclusive {
+                    code: "speedtest-traffic-budget-exceeded",
+                }
+            } else {
+                AutotuneAction::RestoreRuntime
+            });
+        }
         if self.review_digest.is_some() {
             return Ok(AutotuneAction::Complete);
         }
@@ -6937,6 +7462,7 @@ impl AutotuneReplayState {
             total_units,
             direction,
             attempt,
+            consumed_traffic_bytes: Some(self.consumed_bytes),
         }
     }
 
@@ -7362,6 +7888,14 @@ fn verify_native_proposal_transaction(
     proposal_path: &Path,
     link_kind: LinkKind,
 ) -> Result<AutotuneProposal, String> {
+    verify_server_comparison_report(
+        proposal_path
+            .parent()
+            .ok_or("proposal has no job directory")?,
+        request,
+        worker_run_id,
+        records,
+    )?;
     let replay = AutotuneReplayState::replay(request, worker_run_id, records)?;
     if replay.next_action()? != AutotuneAction::Search(EvidenceDirection::Download) {
         return Err("native Auto-Tune proposal transaction is incomplete".to_string());
@@ -10547,14 +11081,14 @@ fn native_topology_direction_result(
 fn replay_remaining_traffic_budget(
     request: &OperationRequest,
     records: &[AutotuneEvidenceRecord],
-) -> Result<u64, String> {
+) -> Result<super::protocol::TrafficPolicy, String> {
     let worker_run_id = records
         .first()
         .map(|record| record.worker_run_id.as_str())
         .ok_or_else(|| "native topology comparison has no replay evidence".to_string())?;
     let replay = AutotuneReplayState::replay(request, worker_run_id, records)?;
     request
-        .traffic_budget_bytes
+        .traffic_budget
         .checked_sub(replay.consumed_bytes)
         .ok_or_else(|| "native topology comparison traffic accounting underflow".to_string())
 }
@@ -10603,7 +11137,7 @@ fn native_topology_comparison_result(
                 minimum_speedtest_traffic_budget_bytes(SpeedtestDirection::Upload, 0, bound)
             }
         };
-        remaining_traffic_budget >= required
+        remaining_traffic_budget.allows(required)
     };
     let download = native_topology_direction_result(
         proposal,
@@ -11079,7 +11613,9 @@ fn canonical_native_review_bytes(
         return Err("native Auto-Tune Review requires a fully restored runtime".to_string());
     }
     let digests = native_review_digests(records)?;
-    let (review_schema_version, artifacts) = match &digests {
+    let server_report =
+        verify_server_comparison_report(job_directory, request, worker_run_id, records)?;
+    let (mut review_schema_version, mut artifacts) = match &digests {
         NativeReviewDigests::Shaped {
             proposal,
             download_search,
@@ -11156,6 +11692,10 @@ fn canonical_native_review_bytes(
             ],
         ),
     };
+    if let Some(report) = server_report {
+        review_schema_version += 2;
+        artifacts.push(("server_comparison", report));
+    }
     let profile = request
         .profile
         .ok_or_else(|| "native Auto-Tune Review has no profile".to_string())?;
@@ -11335,7 +11875,7 @@ fn native_apply_execution_plans_transaction(
     {
         return Err("native Apply Review path is not bound to its worker run".to_string());
     }
-    let records = AutotuneEvidenceStore::open(job_directory)?.load()?;
+    let records = AutotuneEvidenceStore::read_existing(job_directory)?;
     let replay = AutotuneReplayState::replay(&request, expected_worker_run_id, &records)?;
     if !replay.runtime_restored
         || !matches!(
@@ -11930,8 +12470,7 @@ pub(crate) fn verify_native_review_transaction(
     {
         return Err("native Auto-Tune Review path is not bound to its worker run".to_string());
     }
-    let evidence_store = AutotuneEvidenceStore::open(job_directory)?;
-    let records = evidence_store.load()?;
+    let records = AutotuneEvidenceStore::read_existing(job_directory)?;
     let replay = AutotuneReplayState::replay(&request, expected_worker_run_id, &records)?;
     if replay.next_action()? != AutotuneAction::Complete
         || replay.review_digest.as_deref() != Some(expected_digest)
@@ -11977,7 +12516,7 @@ pub(crate) fn canonical_native_public_result_transaction(
     let job_directory = request_path
         .parent()
         .ok_or_else(|| "native public result request has no job directory".to_string())?;
-    let records = AutotuneEvidenceStore::open(job_directory)?.load()?;
+    let records = AutotuneEvidenceStore::read_existing(job_directory)?;
     let replay = AutotuneReplayState::replay(&request, expected_worker_run_id, &records)?;
     if replay.next_action()? != AutotuneAction::Complete
         || replay.review_digest.as_deref() != Some(expected_review_digest)
@@ -12091,14 +12630,34 @@ pub(crate) fn canonical_native_public_result_transaction(
             digest,
         )?);
     }
-    canonical_native_public_result_bytes(NativePublicResultInput {
+    let mut bytes = canonical_native_public_result_bytes(NativePublicResultInput {
         request: &request,
         worker_run_id: expected_worker_run_id,
         review_digest: expected_review_digest,
         apply_confirmations: &apply_confirmations,
         consumed_traffic_bytes: replay.consumed_bytes,
         artifacts: &artifacts,
-    })
+    })?;
+    if let Some(report) =
+        verify_server_comparison_report(job_directory, &request, expected_worker_run_id, &records)?
+    {
+        let source: serde_json::Value = serde_json::from_str(&report.json)
+            .map_err(|_| "verified server report JSON invalid")?;
+        let public = server_comparison_public_projection(&source, &report.digest)?;
+        // Optional, independently versioned diagnostics. Do not expose private
+        // control/PID/route/request bodies or change existing Apply contracts.
+        if !bytes.ends_with(b"}\n") {
+            return Err("native public result lost object boundary".into());
+        }
+        bytes.truncate(bytes.len() - 2);
+        bytes.extend_from_slice(b",\"server_comparison\":");
+        bytes.extend_from_slice(&serde_json::to_vec(&public).map_err(|error| error.to_string())?);
+        bytes.extend_from_slice(b"}\n");
+        if bytes.len() > super::autotune_public::MAX_NATIVE_PUBLIC_RESULT_BYTES {
+            return Err("native public server diagnostics exceed result bound".into());
+        }
+    }
+    Ok(bytes)
 }
 
 pub(crate) fn publish_native_public_result_transaction(
@@ -12929,19 +13488,11 @@ fn topology_measurement_directions(topology: MeasurementTopology) -> &'static [S
     }
 }
 
+#[cfg(test)]
 fn speedtest_counter_kind(kind: RuntimeQdiscKind) -> CakeCounterKind {
     match kind {
         RuntimeQdiscKind::Cake => CakeCounterKind::Cake,
         RuntimeQdiscKind::CakeMq => CakeCounterKind::CakeMq,
-    }
-}
-
-fn configured_topology(cfg: &Config) -> MeasurementTopology {
-    match (cfg.download_shaping_enabled(), cfg.upload_shaping_enabled()) {
-        (true, true) => MeasurementTopology::ShapedBoth,
-        (true, false) => MeasurementTopology::DownloadOnlyShaped,
-        (false, true) => MeasurementTopology::UploadOnlyShaped,
-        (false, false) => MeasurementTopology::RawBoth,
     }
 }
 
@@ -12963,27 +13514,7 @@ fn topology_accounting_requirements(topology: MeasurementTopology) -> (bool, boo
     (topology.download_is_shaped(), topology.upload_is_shaped())
 }
 
-fn attest_baseline_accounting_epoch_state(
-    permit: &AutotuneRuntimePermit,
-    store: &RuntimeOverrideStore,
-) -> Result<(), String> {
-    permit.validate()?;
-    let now = monotonic_boot_ms()?;
-    if now >= permit.deadline_boot_ms
-        || store.read_permit()?.as_ref() != Some(permit)
-        || store.read_control()?.is_some()
-        || store.read_ack()?.is_some()
-        || store.read_checkpoint()?.is_some()
-        || store.read_restore_intent()?.is_some()
-    {
-        return Err("native Auto-Tune baseline accounting epoch changed".to_string());
-    }
-    if !permit.worker.still_matches(Path::new("/proc"))? {
-        return Err("native Auto-Tune baseline accounting worker changed".to_string());
-    }
-    Ok(())
-}
-
+#[cfg(test)]
 fn attest_baseline_accounting_runtime_for_authority<Managed, Bootstrap>(
     operation: &OperationRequest,
     permit: &AutotuneRuntimePermit,
@@ -13008,51 +13539,7 @@ where
     }
 }
 
-fn attest_baseline_accounting_epoch(
-    operation: &OperationRequest,
-    permit: &AutotuneRuntimePermit,
-    store: &RuntimeOverrideStore,
-) -> Result<(), String> {
-    let authority = measurement_basis_authority(operation, permit)?;
-    attest_baseline_accounting_epoch_state(permit, store)?;
-    attest_baseline_accounting_runtime_for_authority(
-        operation,
-        permit,
-        authority,
-        |baseline_topology| {
-            match super::runtime::attest_openwrt_runtime(operation) {
-                super::runtime::RuntimeAttestation::Ready => {}
-                super::runtime::RuntimeAttestation::Waiting { code, .. }
-                | super::runtime::RuntimeAttestation::Unsafe { code, .. } => {
-                    return Err(format!(
-                        "native Auto-Tune baseline accounting runtime is not ready: {code}"
-                    ));
-                }
-            }
-            let cfg = Config::from_uci(&operation.identity.instance)?;
-            if cfg.sqm_interface != permit.target_interface
-                || configured_topology(&cfg) != baseline_topology
-            {
-                return Err("native Auto-Tune baseline accounting topology changed".to_string());
-            }
-            Ok(())
-        },
-        |absent| {
-            OpenWrtNativeApplyBackend::new()
-                .attest_bootstrap_runtime_absence(operation, absent)
-                .map_err(|error| {
-                    format!(
-                        "native Auto-Tune bootstrap baseline accounting identity changed: {error}"
-                    )
-                })
-        },
-    )?;
-    // The OpenWrt attestors perform multiple bounded reads.  Fence those
-    // reads with the exact durable permit/store/worker epoch so a concurrent
-    // cancel or runtime transition cannot authorize the following transfer.
-    attest_baseline_accounting_epoch_state(permit, store)
-}
-
+#[cfg(test)]
 fn baseline_accounting_plan_for_authority<BindManaged>(
     permit: &AutotuneRuntimePermit,
     authority: MeasurementBasisAuthority,
@@ -13079,41 +13566,6 @@ where
     }
 }
 
-fn bind_baseline_accounting_plan(
-    operation: &OperationRequest,
-    permit: &AutotuneRuntimePermit,
-    store: &RuntimeOverrideStore,
-) -> Result<SpeedtestAccountingPlan, String> {
-    let authority = measurement_basis_authority(operation, permit)?;
-    attest_baseline_accounting_epoch(operation, permit, store)?;
-    let plan = baseline_accounting_plan_for_authority(permit, authority, |baseline_topology| {
-        let cfg = Config::from_uci(&operation.identity.instance)?;
-        let download = baseline_topology
-            .download_is_shaped()
-            .then(|| {
-                CakeCounterTarget::bind_current(
-                    &cfg.dl_if,
-                    speedtest_counter_kind(permit.download_qdisc_kind),
-                    CakeCounterDirection::Download,
-                )
-            })
-            .transpose()?;
-        let upload = baseline_topology
-            .upload_is_shaped()
-            .then(|| {
-                CakeCounterTarget::bind_current(
-                    &cfg.ul_if,
-                    speedtest_counter_kind(permit.upload_qdisc_kind),
-                    CakeCounterDirection::Upload,
-                )
-            })
-            .transpose()?;
-        Ok((download, upload))
-    })?;
-    attest_baseline_accounting_epoch(operation, permit, store)?;
-    Ok(plan)
-}
-
 fn attest_private_accounting_epoch(
     operation: &OperationRequest,
     permit: &AutotuneRuntimePermit,
@@ -13126,21 +13578,503 @@ fn attest_private_accounting_epoch(
     permit.authorizes(&operation.identity.instance, control, now)?;
     expected_ack.attests_applied(control, now)?;
     expected_checkpoint.validate_against(permit)?;
-    if expected_checkpoint.temporary_stage != TemporaryTopologyStage::Active
+    // Keep the same fail-closed checks and read order. Report only the component,
+    // never private record contents, so a safety stop can be diagnosed.
+    let changed = if expected_checkpoint.temporary_stage != TemporaryTopologyStage::Active
         || expected_checkpoint.temporary.ifb_ifindex.is_none()
-        || store.read_permit()?.as_ref() != Some(permit)
-        || store.read_control()?.as_ref() != Some(control)
-        || store.read_ack()?.as_ref() != Some(expected_ack)
-        || store.read_checkpoint()?.as_ref() != Some(expected_checkpoint)
-        || store.read_restore_intent()?.is_some()
     {
-        return Err("native Auto-Tune private accounting epoch changed".to_string());
+        Some("expected-checkpoint")
+    } else if store.read_permit()?.as_ref() != Some(permit) {
+        Some("permit")
+    } else if store.read_control()?.as_ref() != Some(control) {
+        Some("control")
+    } else if store.read_ack()?.as_ref() != Some(expected_ack) {
+        Some("ack")
+    } else if store.read_checkpoint()?.as_ref() != Some(expected_checkpoint) {
+        Some("checkpoint")
+    } else if store.read_restore_intent()?.is_some() {
+        Some("restore-intent")
+    } else {
+        None
+    };
+    if let Some(component) = changed {
+        return Err(format!(
+            "native Auto-Tune private accounting epoch changed: {component}"
+        ));
     }
     if !permit.worker.still_matches(Path::new("/proc"))? {
         return Err("native Auto-Tune private accounting worker changed".to_string());
     }
     super::runtime::attest_openwrt_route_identity(operation).map_err(|(_, message, _)| message)?;
     Ok(())
+}
+
+fn server_comparison_schema(report: &serde_json::Value) -> Result<u64, String> {
+    match (
+        report["schema_version"].as_u64(),
+        report["policy_id"].as_str(),
+    ) {
+        (Some(1), Some(super::server_qualification::LEGACY_POLICY)) => Ok(1),
+        (Some(2), Some(super::server_qualification::LEGACY_DISTINCT_POLICY)) => Ok(2),
+        (Some(3), Some(super::server_qualification::LEGACY_BOUNDED_POLICY)) => Ok(3),
+        (Some(4), Some(super::server_qualification::SOURCE_POLICY)) => Ok(4),
+        _ => Err("server comparison schema or policy mismatch".into()),
+    }
+}
+
+fn validate_server_comparison_bounds(
+    schema: u64,
+    comparisons: &[super::server_qualification::Comparison],
+) -> Result<(), String> {
+    let servers = if schema >= 4 {
+        super::server_qualification::MAX_SERVERS
+    } else {
+        super::server_qualification::LEGACY_MAX_SERVERS
+    };
+    let attempts = servers * super::server_qualification::REPEATS;
+    let distinct = comparisons
+        .iter()
+        .enumerate()
+        .filter(|(index, row)| {
+            row.candidate_id.is_some()
+                && !comparisons[..*index]
+                    .iter()
+                    .any(|old| old.candidate_id == row.candidate_id)
+        })
+        .count();
+    if comparisons.len() > attempts + 1
+        || distinct > servers
+        || comparisons.iter().any(|row| row.index > attempts)
+    {
+        return Err("server comparison policy bound exceeded".into());
+    }
+    Ok(())
+}
+
+fn server_comparison_public_projection(
+    source: &serde_json::Value,
+    digest: &str,
+) -> Result<serde_json::Value, String> {
+    let observations: Vec<_> = source["comparisons"].as_array().ok_or("server report rows missing")?
+        .iter().filter(|row| row["index"].as_u64().is_some_and(|index| index > 0)).map(|row| {
+            let rate = |key: &str| row[key].as_u64().filter(|rate| *rate <= MAX_RATE_KBPS).map_or(serde_json::Value::Null, serde_json::Value::from);
+            serde_json::json!({
+                "index": row["index"], "candidate_id": row["candidate_id"], "server_id": row["server_id"],
+                "name": row["server_name"], "sponsor": row["server_sponsor"],
+                "download_kbps": rate("download_kbps"), "upload_kbps": rate("upload_kbps"),
+                "elapsed_ms": row["elapsed_ms"], "valid_observation": row["valid_observation"], "reason": row["reason"],
+            })
+        }).collect();
+    Ok(serde_json::json!({
+        "schema_version": 1, "report_sha256": digest, "scope": source["topology"],
+        "selected_server_id": source["selected_server_id"], "proof_status": "source-comparison-only", "observations": observations,
+    }))
+}
+
+/// Bounded identity-bound progress diagnostics, never Review/Apply authority.
+/// Unlike the selected report verifier this may read an incomplete/failed run.
+pub(crate) fn read_server_comparison_diagnostic(
+    job_directory: &Path,
+    request: &OperationRequest,
+    worker_run_id: &str,
+) -> Result<serde_json::Value, String> {
+    let stored = read_private_bounded(
+        &job_directory.join(SERVER_COMPARISON_FILE),
+        super::server_qualification::MAX_REPORT_BYTES,
+    )?;
+    let report: serde_json::Value =
+        serde_json::from_str(&stored).map_err(|_| "server diagnostic JSON invalid")?;
+    let schema = server_comparison_schema(&report)?;
+    if report["job_id"] != request.identity.job_id
+        || report["worker_run_id"] != worker_run_id
+        || report["request_sha256"] != sqm_identity::sha256sum(request.encode()?.as_bytes())?
+        || report["route_fingerprint"] != request.identity.route_fingerprint
+        || report["capacity_proven"] != false
+        || report["max_servers"]
+            != if schema >= 4 {
+                super::server_qualification::MAX_SERVERS
+            } else {
+                super::server_qualification::LEGACY_MAX_SERVERS
+            }
+        || report["repeats"] != super::server_qualification::REPEATS
+        || !matches!(
+            report["state"].as_str(),
+            Some("running" | "selected" | "failed")
+        )
+        || !matches!(report["topology"].as_str(), Some("no_sqm" | "both_shaped"))
+    {
+        return Err("server diagnostic context mismatch".into());
+    }
+    let comparisons = super::server_qualification::parse_comparisons(&report["comparisons"])?;
+    validate_server_comparison_bounds(schema, &comparisons)?;
+    if schema == 1 && comparisons.iter().any(|row| row.endpoint_host.is_some()) {
+        return Err("legacy server report cannot carry new source authority".into());
+    }
+    let debit_count = comparisons
+        .last()
+        .map(|row| row.debit_offset + row.debit_count)
+        .unwrap_or(0);
+    if report["debit_count"] != debit_count
+        || report["first_debit_sequence"].as_u64().is_none_or(|first| {
+            first == 0
+                || first.saturating_add(u64::from(debit_count))
+                    > MAX_AUTOTUNE_EVIDENCE_RECORDS as u64 + 1
+        })
+        || (report["state"] == "failed" && !report["reason"].is_string())
+        || (report["state"] != "failed" && !report["reason"].is_null())
+    {
+        return Err("server diagnostic progress context mismatch".into());
+    }
+    let control_text = report["control"]
+        .as_str()
+        .ok_or("server diagnostic control missing")?;
+    let control = AutotuneRuntimeControl::decode(control_text)?;
+    if report["control_sha256"] != sqm_identity::sha256sum(control_text.as_bytes())?
+        || control.job_id != request.identity.job_id
+        || control.worker_run_id != worker_run_id
+        || control.target_interface != request.identity.target_interface
+        || control.route_fingerprint != request.identity.route_fingerprint
+        || control.sqm_fingerprint != request.identity.sqm_fingerprint
+        || report["topology"] != control.topology.as_str()
+        || report["requested_server_id"] != serde_json::json!(request.speedtest_server_id)
+    {
+        return Err("server diagnostic control context mismatch".into());
+    }
+    let selected = report["selected_server_id"].as_u64().filter(|id| *id > 0);
+    if (report["state"] == "selected") != selected.is_some()
+        || (selected.is_none() && !report["selected_server_id"].is_null())
+    {
+        return Err("server diagnostic selection state mismatch".into());
+    }
+    let digest = sqm_identity::sha256sum(stored.as_bytes())?;
+    let mut public = server_comparison_public_projection(&report, &digest)?;
+    public["proof_status"] = serde_json::json!("identity-bound-diagnostic-only");
+    public["state"] = report["state"].clone();
+    // Error prose can contain private runtime context. Publish only a bounded
+    // machine code, never arbitrary error text or the private control record.
+    public["reason"] = match report["reason"].as_str() {
+        Some(code)
+            if !code.is_empty()
+                && code.len() <= 128
+                && code.bytes().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                }) =>
+        {
+            serde_json::json!(code)
+        }
+        Some(_) => serde_json::json!("server-comparison-failed"),
+        None => serde_json::Value::Null,
+    };
+    if let Some(rows) = public["observations"].as_array_mut() {
+        for row in rows {
+            let safe = row["reason"].as_str().is_some_and(|code| {
+                !code.is_empty()
+                    && code.len() <= 128
+                    && code.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    })
+            });
+            if !safe {
+                row["reason"] = serde_json::json!("comparison-attempt-unavailable");
+            }
+        }
+    }
+    // Control/status responses are limited to 8 KiB. Reserve at most half for
+    // optional diagnostics; retain every numeric observation and machine code
+    // before spending bytes on repeated display names.
+    public["display_metadata_omitted"] = serde_json::json!(false);
+    if public.to_string().len() > 4 * 1024 {
+        if let Some(rows) = public["observations"].as_array_mut() {
+            for row in rows {
+                row["name"] = serde_json::json!("");
+                row["sponsor"] = serde_json::json!("");
+            }
+        }
+        public["display_metadata_omitted"] = serde_json::json!(true);
+    }
+    if public.to_string().len() > 4 * 1024 {
+        return Err("server diagnostic exceeds public status bound".into());
+    }
+    Ok(public)
+}
+
+fn publish_server_comparison_report(
+    job_directory: &Path,
+    request: &OperationRequest,
+    worker_run_id: &str,
+    control: &AutotuneRuntimeControl,
+    first_debit_sequence: u32,
+    comparisons: &[super::server_qualification::Comparison],
+    outcome: Option<&Result<Option<u64>, String>>,
+) -> Result<String, String> {
+    if control.job_id != request.identity.job_id
+        || control.worker_run_id != worker_run_id
+        || control.route_fingerprint != request.identity.route_fingerprint
+        || control.sqm_fingerprint != request.identity.sqm_fingerprint
+        || control.target_interface != request.identity.target_interface
+        || first_debit_sequence == 0
+        || first_debit_sequence as usize > MAX_AUTOTUNE_EVIDENCE_RECORDS
+    {
+        return Err("server comparison report identity mismatch".into());
+    }
+    let rows = super::server_qualification::comparisons_json(comparisons)?;
+    let debit_count = comparisons
+        .last()
+        .map(|value| value.debit_offset + value.debit_count)
+        .unwrap_or(0);
+    let after_debits = first_debit_sequence
+        .checked_add(debit_count)
+        .ok_or("server report sequence overflow")?;
+    if debit_count > 0 && after_debits as usize > MAX_AUTOTUNE_EVIDENCE_RECORDS + 1 {
+        return Err("server report debit range exceeds evidence bound".into());
+    }
+    let selected = outcome
+        .and_then(|result| result.as_ref().ok())
+        .copied()
+        .flatten();
+    let reason = outcome
+        .and_then(|result| result.as_ref().err())
+        .map(|value| value.chars().take(256).collect::<String>());
+    if let Some(selected) = selected {
+        if super::server_qualification::select_independent(
+            comparisons,
+            request.speedtest_server_id,
+        )? != selected
+        {
+            return Err("server comparison report selection mismatch".into());
+        }
+    }
+    let report = serde_json::json!({
+        "schema_version": 4, "job_id": request.identity.job_id, "worker_run_id": worker_run_id,
+        "request_sha256": sqm_identity::sha256sum(request.encode()?.as_bytes())?,
+        "control_sha256": sqm_identity::sha256sum(control.encode()?.as_bytes())?,
+        "control": control.encode()?,
+        "route_fingerprint": request.identity.route_fingerprint,
+        "topology": control.topology.as_str(), "first_debit_sequence": first_debit_sequence,
+        "debit_count": debit_count,
+        "policy_id": super::server_qualification::SOURCE_POLICY, "max_servers": super::server_qualification::MAX_SERVERS,
+        "repeats": super::server_qualification::REPEATS,
+        "requested_server_id": request.speedtest_server_id, "selected_server_id": selected,
+        "state": if outcome.is_none() { "running" } else if selected.is_some() { "selected" } else { "failed" },
+        "reason": reason, "capacity_proven": false,
+        "traffic_accounting": if request.traffic_policy_explicit { "owned-ip-system-dns-estimate-v1" } else { "legacy-aggregate-route-rx-tx" },
+        "retry_detail": "grouped-by-logical-attempt", "comparisons": rows,
+    });
+    let bytes = serde_json::to_vec(&report).map_err(|error| error.to_string())?;
+    if bytes.len() > super::server_qualification::MAX_REPORT_BYTES {
+        return Err("server comparison report exceeds its bound".into());
+    }
+    let path = job_directory.join(SERVER_COMPARISON_FILE);
+    atomic_private_write(&path, &bytes)?;
+    if read_private_bounded(&path, super::server_qualification::MAX_REPORT_BYTES)?.as_bytes()
+        != bytes.as_slice()
+    {
+        return Err("server comparison report readback mismatch".into());
+    }
+    sqm_identity::sha256sum(&bytes)
+}
+
+fn verify_server_comparison_report(
+    job_directory: &Path,
+    request: &OperationRequest,
+    worker_run_id: &str,
+    records: &[AutotuneEvidenceRecord],
+) -> Result<Option<NativeReviewArtifact>, String> {
+    let replay = AutotuneReplayState::replay(request, worker_run_id, records)?;
+    if !replay.capacity_qualification_seen {
+        if replay.server_selection_required {
+            return Err("new request has no capacity qualification evidence".into());
+        }
+        return Ok(None);
+    }
+    let digest = replay
+        .server_selection_digest
+        .as_deref()
+        .ok_or("server comparison receipt missing")?;
+    let stored = read_private_bounded(
+        &job_directory.join(SERVER_COMPARISON_FILE),
+        super::server_qualification::MAX_REPORT_BYTES,
+    )?;
+    if sqm_identity::sha256sum(stored.as_bytes())? != digest {
+        return Err("server comparison digest mismatch".into());
+    }
+    let report: serde_json::Value =
+        serde_json::from_str(&stored).map_err(|_| "server comparison JSON invalid")?;
+    const FIELDS: &[&str] = &[
+        "schema_version",
+        "job_id",
+        "worker_run_id",
+        "request_sha256",
+        "control_sha256",
+        "control",
+        "route_fingerprint",
+        "topology",
+        "first_debit_sequence",
+        "debit_count",
+        "policy_id",
+        "max_servers",
+        "repeats",
+        "requested_server_id",
+        "selected_server_id",
+        "state",
+        "reason",
+        "capacity_proven",
+        "traffic_accounting",
+        "retry_detail",
+        "comparisons",
+    ];
+    let object = report
+        .as_object()
+        .ok_or("server comparison is not an object")?;
+    if object.len() != FIELDS.len()
+        || object.keys().any(|key| !FIELDS.contains(&key.as_str()))
+        || serde_json::to_vec(&report).map_err(|error| error.to_string())? != stored.as_bytes()
+    {
+        return Err("server comparison fields or encoding are not canonical".into());
+    }
+    let control_text = report["control"]
+        .as_str()
+        .ok_or("server comparison control missing")?;
+    let control = AutotuneRuntimeControl::decode(control_text)?;
+    let topology = if uses_full_raw_controls(
+        request.strategy.ok_or("comparison strategy missing")?,
+        request.allow_sqm_disable,
+    ) {
+        MeasurementTopology::RawBoth
+    } else {
+        MeasurementTopology::ShapedBoth
+    };
+    let schema = server_comparison_schema(&report)?;
+    if report["job_id"] != request.identity.job_id
+        || report["worker_run_id"] != worker_run_id
+        || report["route_fingerprint"] != request.identity.route_fingerprint
+        || report["request_sha256"] != sqm_identity::sha256sum(request.encode()?.as_bytes())?
+        || report["control_sha256"] != sqm_identity::sha256sum(control_text.as_bytes())?
+        || report["requested_server_id"] != serde_json::json!(request.speedtest_server_id)
+        || report["state"] != "selected"
+        || !report["reason"].is_null()
+        || report["capacity_proven"] != false
+        || report["max_servers"]
+            != if schema >= 4 {
+                super::server_qualification::MAX_SERVERS
+            } else {
+                super::server_qualification::LEGACY_MAX_SERVERS
+            }
+        || report["repeats"] != super::server_qualification::REPEATS
+        || !(report["traffic_accounting"] == "legacy-aggregate-route-rx-tx"
+            || (schema >= 3
+                && request.traffic_policy_explicit
+                && report["traffic_accounting"] == "owned-ip-system-dns-estimate-v1"))
+        || report["retry_detail"] != "grouped-by-logical-attempt"
+        || control.job_id != request.identity.job_id
+        || control.worker_run_id != worker_run_id
+        || control.target_interface != request.identity.target_interface
+        || control.route_fingerprint != request.identity.route_fingerprint
+        || control.sqm_fingerprint != request.identity.sqm_fingerprint
+        || control.sequence != 1
+        || control.topology != topology
+        || report["topology"] != topology.as_str()
+    {
+        return Err("server comparison context or policy mismatch".into());
+    }
+    let comparisons = super::server_qualification::parse_comparisons(&report["comparisons"])?;
+    validate_server_comparison_bounds(schema, &comparisons)?;
+    if schema == 1 && comparisons.iter().any(|row| row.endpoint_host.is_some()) {
+        return Err("legacy server report cannot carry new source authority".into());
+    }
+    let debits: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.evidence,
+                AutotuneEvidence::TrafficDebit(TrafficDebitEvidence {
+                    purpose: TrafficDebitPurpose::CapacityQualification,
+                    ..
+                })
+            )
+        })
+        .collect();
+    let first = debits
+        .first()
+        .ok_or("server comparison has no traffic evidence")?
+        .sequence;
+    let count = comparisons
+        .last()
+        .map(|value| value.debit_offset + value.debit_count)
+        .unwrap_or(0);
+    if count as usize != debits.len()
+        || report["debit_count"] != count
+        || report["first_debit_sequence"] != first
+        || debits
+            .iter()
+            .enumerate()
+            .any(|(index, record)| record.sequence != first + index as u32)
+        || !records.iter().any(|record| {
+            record.sequence == first + count
+                && matches!(&record.evidence,
+            AutotuneEvidence::ServerSelected { digest: value } if value == digest)
+        })
+    {
+        return Err("server comparison debit range does not match replay".into());
+    }
+    let observations: Vec<_> = comparisons
+        .iter()
+        .filter(|value| value.valid)
+        .map(|value| super::server_qualification::Observation {
+            server_id: value.server_id.unwrap(),
+            download_kbps: value.download_kbps.unwrap(),
+            upload_kbps: value.upload_kbps.unwrap(),
+        })
+        .collect();
+    let selected = if schema >= 2 {
+        super::server_qualification::select_independent(&comparisons, request.speedtest_server_id)?
+    } else {
+        super::server_qualification::select(&observations, request.speedtest_server_id)?
+    };
+    if report["selected_server_id"] != selected {
+        return Err("server comparison selected source mismatch".into());
+    }
+    let qualified = if control.topology == MeasurementTopology::RawBoth {
+        Some(
+            super::server_qualification::QualifiedCapacity::from_selected(&observations, selected)?,
+        )
+    } else {
+        None
+    };
+    for record in records {
+        match record.evidence {
+            AutotuneEvidence::Measurement(value) => {
+                let achieved = match value.direction {
+                    SpeedtestDirection::Download => value.achieved_dl_kbps,
+                    SpeedtestDirection::Upload => value.achieved_ul_kbps,
+                    SpeedtestDirection::Both => None,
+                };
+                attest_qualified_raw_control(
+                    request,
+                    record.phase,
+                    value.topology,
+                    value.direction,
+                    achieved,
+                    qualified,
+                )?;
+            }
+            AutotuneEvidence::RawControlCapacity(value) => {
+                attest_qualified_raw_control(
+                    request,
+                    record.phase,
+                    value.topology,
+                    value.direction,
+                    Some(value.achieved_kbps),
+                    qualified,
+                )?;
+            }
+            _ => {}
+        }
+    }
+    Ok(Some(NativeReviewArtifact {
+        digest: digest.to_string(),
+        json: stored,
+    }))
 }
 
 fn bind_private_accounting_plan(
@@ -13210,33 +14144,45 @@ fn capture_traffic_safety_reserve_bytes(
             "native Auto-Tune traffic reserve direction contradicts the capture".to_string(),
         );
     }
-    let download_is_raw = !capture.topology.download_is_shaped();
-    let upload_is_raw = !capture.topology.upload_is_shaped();
-    let download_bound_kbps = if download_is_raw {
-        operation.service_dl_cap_kbps.unwrap_or(MAX_RATE_KBPS)
-    } else {
-        capture.candidate_dl_kbps.ok_or_else(|| {
-            "native Auto-Tune shaped download has no traffic-rate bound".to_string()
-        })?
+    autotune_traffic_safety_reserve_bytes(
+        operation,
+        capture.candidate_dl_kbps,
+        capture.candidate_ul_kbps,
+        direction,
+    )
+}
+
+fn autotune_traffic_safety_reserve_bytes(
+    operation: &OperationRequest,
+    shaped_download_kbps: Option<u64>,
+    shaped_upload_kbps: Option<u64>,
+    direction: SpeedtestDirection,
+) -> Result<u64, String> {
+    if operation.traffic_budget == super::protocol::TrafficPolicy::Unlimited {
+        return Ok(0);
+    }
+    let bound = |shaped: Option<u64>, declared: Option<u64>| {
+        shaped
+            .or(declared)
+            .or_else(|| {
+                // Preserve the original stop policy only for historical requests.
+                // New explicit policies must never acquire this invented authority.
+                (!operation.traffic_policy_explicit).then_some(MAX_RATE_KBPS)
+            })
+            .filter(|rate| *rate > 0)
+            .ok_or_else(|| "traffic-stop-authority-unavailable".to_string())
     };
-    let upload_bound_kbps = if upload_is_raw {
-        operation.service_ul_cap_kbps.unwrap_or(MAX_RATE_KBPS)
+    // Do not require or reserve an unstarted opposite transfer. This remains
+    // a stopping estimate, not a physical ingress quota or a wire-drain proof.
+    let download_bound_kbps = if direction == SpeedtestDirection::Upload {
+        0
     } else {
-        capture
-            .candidate_ul_kbps
-            .ok_or_else(|| "native Auto-Tune shaped upload has no traffic-rate bound".to_string())?
+        bound(shaped_download_kbps, operation.service_dl_cap_kbps)?
     };
-    // The backend controls only the requested transfer direction.  Physical
-    // route counters still debit all concurrent traffic, but unrelated
-    // opposite-direction traffic cannot be stopped by killing this backend
-    // and therefore must not be represented as a second simultaneous backend
-    // overshoot.  Keep the full per-direction technical bound when a raw
-    // direction has no service cap; only a genuinely bidirectional backend
-    // run reserves both directions.
-    let (download_bound_kbps, upload_bound_kbps) = match direction {
-        SpeedtestDirection::Download => (download_bound_kbps, 0),
-        SpeedtestDirection::Upload => (0, upload_bound_kbps),
-        SpeedtestDirection::Both => (download_bound_kbps, upload_bound_kbps),
+    let upload_bound_kbps = if direction == SpeedtestDirection::Download {
+        0
+    } else {
+        bound(shaped_upload_kbps, operation.service_ul_cap_kbps)?
     };
     Ok(traffic_stop_safety_reserve_bytes(
         download_bound_kbps,
@@ -13538,6 +14484,30 @@ fn append_traffic_debit_evidence(
     direction: SpeedtestDirection,
     debit: SpeedtestTrafficDebit,
 ) -> Result<(), String> {
+    let (purpose, direction) = if debit.lifecycle {
+        (TrafficDebitPurpose::Lifecycle, SpeedtestDirection::Both)
+    } else {
+        (purpose, direction)
+    };
+    let records = store.load()?;
+    let replay = AutotuneReplayState::replay(request, worker_run_id, &records)?;
+    let consumed = replay
+        .consumed_bytes
+        .checked_add(debit.rx_bytes)
+        .and_then(|bytes| bytes.checked_add(debit.tx_bytes))
+        .ok_or_else(|| "native Auto-Tune cumulative traffic overflowed".to_string())?;
+    let purpose = if request.traffic_budget.exceeded(consumed) {
+        if matches!(
+            purpose,
+            TrafficDebitPurpose::Lifecycle | TrafficDebitPurpose::LifecycleOverrun
+        ) {
+            TrafficDebitPurpose::LifecycleOverrun
+        } else {
+            TrafficDebitPurpose::BudgetOverrun
+        }
+    } else {
+        purpose
+    };
     append_replay_evidence(
         store,
         request,
@@ -13554,13 +14524,18 @@ fn append_traffic_debit_evidence(
 }
 
 fn wait_for_capture_progress(
+    session: &EmbeddedSpeedtestSession,
     snapshot_path: &Path,
     request: &AutotuneCaptureRequest,
     minimum_updated_boot_ms: u64,
     terminate: &AtomicBool,
 ) -> Result<AutotuneCaptureSnapshot, CaptureWaitError> {
     let deadline = Instant::now() + LOADED_CAPTURE_PROGRESS_WAIT;
+    let mut budget_watch = session.owned_budget_watch(0)?;
     loop {
+        if let Some(watch) = &mut budget_watch {
+            watch.check_wait(session)?;
+        }
         if terminate.load(Ordering::Relaxed) {
             return Err(CaptureWaitError::Failure(
                 "native Auto-Tune capture was cancelled".to_string(),
@@ -13612,7 +14587,7 @@ fn run_directional_capture_load(
     request: &AutotuneCaptureRequest,
     accounting: &SpeedtestAccountingPlan,
     attest_accounting_epoch: &mut dyn FnMut() -> Result<(), String>,
-    remaining_traffic_budget: &mut u64,
+    remaining_traffic_budget: &mut super::protocol::TrafficPolicy,
     terminate: &AtomicBool,
 ) -> Result<(AutotuneCaptureSnapshot, AutotuneLoadEvidence), CaptureWaitError> {
     run_directional_capture_load_with_session(
@@ -13630,6 +14605,32 @@ fn run_directional_capture_load(
     )
 }
 
+fn attest_qualified_raw_control(
+    request: &OperationRequest,
+    phase: AutotunePhase,
+    topology: MeasurementTopology,
+    direction: SpeedtestDirection,
+    achieved_kbps: Option<u64>,
+    qualified: Option<super::server_qualification::QualifiedCapacity>,
+) -> Result<(), String> {
+    let direction_is_raw = match direction {
+        SpeedtestDirection::Download => !topology.download_is_shaped(),
+        SpeedtestDirection::Upload => !topology.upload_is_shaped(),
+        SpeedtestDirection::Both => false,
+    };
+    if !request.traffic_policy_explicit || phase != AutotunePhase::RawControls || !direction_is_raw
+    {
+        return Ok(());
+    }
+    let qualified = qualified.ok_or("server-comparison-selected-reference-missing")?;
+    qualified
+        .attest_raw_rate(
+            direction,
+            achieved_kbps.ok_or("server-comparison-selected-reference-missing")?,
+        )
+        .map_err(str::to_string)
+}
+
 fn run_directional_capture_load_with_session(
     session: &mut EmbeddedSpeedtestSession,
     operation: &OperationRequest,
@@ -13640,7 +14641,7 @@ fn run_directional_capture_load_with_session(
     request: &AutotuneCaptureRequest,
     accounting: &SpeedtestAccountingPlan,
     attest_accounting_epoch: &mut dyn FnMut() -> Result<(), String>,
-    remaining_traffic_budget: &mut u64,
+    remaining_traffic_budget: &mut super::protocol::TrafficPolicy,
     terminate: &AtomicBool,
 ) -> Result<(AutotuneCaptureSnapshot, AutotuneLoadEvidence), CaptureWaitError> {
     let direction = request
@@ -13656,7 +14657,7 @@ fn run_directional_capture_load_with_session(
     for run_index in 0..MAX_DIRECTIONAL_LOAD_RUNS {
         let run_started_boot_ms = monotonic_boot_ms()?;
         let mut bounded_request = operation.clone();
-        bounded_request.traffic_budget_bytes = *remaining_traffic_budget;
+        bounded_request.traffic_budget = *remaining_traffic_budget;
         let scratch_path = capture.load_evidence_path.with_file_name(format!(
             "autotune-speedtest-{}-{}-{}",
             worker_run_id,
@@ -13728,6 +14729,7 @@ fn run_directional_capture_load_with_session(
         })?;
         aggregate.add(&result, &sample)?;
         let progress = wait_for_capture_progress(
+            session,
             &capture.snapshot_path,
             request,
             run_started_boot_ms,
@@ -13746,6 +14748,17 @@ fn run_directional_capture_load_with_session(
         ));
     }
     let evidence = aggregate.evidence(request, monotonic_boot_ms()?)?;
+    // The retry transaction has already durably charged all runs. Compare the
+    // same byte-derived rate retained by Measurement/RawControlCapacity replay,
+    // before either kind of evidence can feed a low proposal.
+    attest_qualified_raw_control(
+        operation,
+        evidence_phase,
+        request.topology,
+        direction,
+        Some(evidence.goodput_kbps),
+        session.qualified_raw_capacity,
+    )?;
     if !thresholds_met {
         if let Some(snapshot) = last_progress.as_ref() {
             // A non-zero CPU count proves that this exact capture identity was
@@ -13788,6 +14801,7 @@ fn run_directional_capture_load_with_session(
     }
     publish_load_evidence(&capture.load_evidence_path, &evidence)?;
     let snapshot = wait_for_capture_state(
+        session,
         &capture.snapshot_path,
         request,
         CaptureWaitTarget::Complete,
@@ -13879,13 +14893,18 @@ fn runtime_measurement_basis_ready_for_authority(
 }
 
 fn wait_for_measurement_basis(
+    session: &EmbeddedSpeedtestSession,
     operation: &OperationRequest,
     permit: &AutotuneRuntimePermit,
     runtime_snapshot_path: &Path,
     terminate: &AtomicBool,
 ) -> Result<(), String> {
     let authority = measurement_basis_authority(operation, permit)?;
+    let mut budget_watch = session.owned_budget_watch(0)?;
     loop {
+        if let Some(watch) = &mut budget_watch {
+            watch.check_wait(session)?;
+        }
         if terminate.load(Ordering::Relaxed) {
             return Err("native Auto-Tune measurement-basis wait was cancelled".to_string());
         }
@@ -13930,12 +14949,17 @@ fn runtime_ack_matches_control_identity(
 }
 
 fn wait_for_exact_route_restoration(
+    session: &EmbeddedSpeedtestSession,
     store: &RuntimeOverrideStore,
     permit: &AutotuneRuntimePermit,
     control: &AutotuneRuntimeControl,
     terminate: &AtomicBool,
 ) -> Result<(), String> {
+    let mut budget_watch = session.owned_budget_watch(0)?;
     loop {
+        if let Some(watch) = &mut budget_watch {
+            watch.check_wait(session)?;
+        }
         if terminate.load(Ordering::Relaxed) {
             return Err("native Auto-Tune was cancelled during route recovery".to_string());
         }
@@ -13985,13 +15009,18 @@ fn wait_for_exact_route_restoration(
 }
 
 fn wait_for_runtime_rearmed(
+    session: &EmbeddedSpeedtestSession,
     store: &RuntimeOverrideStore,
     permit: &AutotuneRuntimePermit,
     prior: &AutotuneRuntimeControl,
     control: &AutotuneRuntimeControl,
     terminate: &AtomicBool,
 ) -> Result<(), String> {
+    let mut budget_watch = session.owned_budget_watch(0)?;
     loop {
+        if let Some(watch) = &mut budget_watch {
+            watch.check_wait(session)?;
+        }
         if terminate.load(Ordering::Relaxed) {
             return Err("native Auto-Tune was cancelled during route re-arm".to_string());
         }
@@ -14046,6 +15075,7 @@ fn wait_for_runtime_rearmed(
 }
 
 fn rearm_runtime_after_route_recovery(
+    session: &EmbeddedSpeedtestSession,
     operation: &OperationRequest,
     permit: &AutotuneRuntimePermit,
     store: &RuntimeOverrideStore,
@@ -14055,8 +15085,8 @@ fn rearm_runtime_after_route_recovery(
     terminate: &AtomicBool,
 ) -> Result<AutotuneRuntimeControl, String> {
     let authority = measurement_basis_authority(operation, permit)?;
-    wait_for_measurement_basis(operation, permit, runtime_snapshot_path, terminate)?;
-    wait_for_exact_route_restoration(store, permit, control, terminate)?;
+    wait_for_measurement_basis(session, operation, permit, runtime_snapshot_path, terminate)?;
+    wait_for_exact_route_restoration(session, store, permit, control, terminate)?;
     if !authority.permits_route_rearm() {
         // The bootstrap owner has no continuously refreshed instance basis.
         // A route flap can change propagation delay or physical capacity even
@@ -14088,7 +15118,7 @@ fn rearm_runtime_after_route_recovery(
     {
         return Err("native Auto-Tune route re-arm was not published exactly".to_string());
     }
-    wait_for_runtime_rearmed(store, permit, control, &rearmed, terminate)?;
+    wait_for_runtime_rearmed(session, store, permit, control, &rearmed, terminate)?;
     *control_sequence = next_sequence;
     Ok(rearmed)
 }
@@ -14190,6 +15220,7 @@ fn idle_baseline_runtime_rates(
 }
 
 fn run_idle_baseline_with_recovery(
+    session: &EmbeddedSpeedtestSession,
     operation: &OperationRequest,
     permit: &AutotuneRuntimePermit,
     capture: &mut AutotuneCaptureGuard,
@@ -14199,7 +15230,13 @@ fn run_idle_baseline_with_recovery(
     let runtime_snapshot_path = capture.request_path.with_file_name("rating-runtime");
     loop {
         capture.cleanup();
-        wait_for_measurement_basis(operation, permit, &runtime_snapshot_path, terminate)?;
+        wait_for_measurement_basis(
+            session,
+            operation,
+            permit,
+            &runtime_snapshot_path,
+            terminate,
+        )?;
         *capture_sequence = capture_sequence
             .checked_add(1)
             .filter(|value| *value as usize <= MAX_AUTOTUNE_EVIDENCE_RECORDS)
@@ -14215,6 +15252,7 @@ fn run_idle_baseline_with_recovery(
         )?;
         capture.publish(&request)?;
         match wait_for_capture_state(
+            session,
             &capture.snapshot_path,
             &request,
             CaptureWaitTarget::Complete,
@@ -14243,7 +15281,7 @@ fn run_directional_measurement_with_recovery(
     control_sequence: &mut u32,
     direction: SpeedtestDirection,
     load_reference_kbps: u64,
-    remaining_traffic_budget: &mut u64,
+    remaining_traffic_budget: &mut super::protocol::TrafficPolicy,
     terminate: &AtomicBool,
 ) -> Result<MeasurementEvidence, CaptureWaitError> {
     if direction == SpeedtestDirection::Both || load_reference_kbps == 0 {
@@ -14263,7 +15301,13 @@ fn run_directional_measurement_with_recovery(
     let runtime_snapshot_path = capture.request_path.with_file_name("rating-runtime");
     loop {
         capture.cleanup();
-        wait_for_measurement_basis(operation, permit, &runtime_snapshot_path, terminate)?;
+        wait_for_measurement_basis(
+            session,
+            operation,
+            permit,
+            &runtime_snapshot_path,
+            terminate,
+        )?;
         *capture_sequence = capture_sequence
             .checked_add(1)
             .filter(|value| *value as usize <= MAX_AUTOTUNE_EVIDENCE_RECORDS)
@@ -14294,6 +15338,7 @@ fn run_directional_measurement_with_recovery(
         };
         capture.publish(&request)?;
         match wait_for_capture_state(
+            session,
             &capture.snapshot_path,
             &request,
             CaptureWaitTarget::Admitted,
@@ -14304,6 +15349,7 @@ fn run_directional_measurement_with_recovery(
             Err(error) if error.requires_route_rearm() => {
                 capture.cleanup();
                 *control = rearm_runtime_after_route_recovery(
+                    session,
                     operation,
                     permit,
                     store,
@@ -14349,6 +15395,7 @@ fn run_directional_measurement_with_recovery(
             Err(error) if error.requires_route_rearm() => {
                 capture.cleanup();
                 *control = rearm_runtime_after_route_recovery(
+                    session,
                     operation,
                     permit,
                     store,
@@ -14377,7 +15424,7 @@ fn run_selected_pair_direction_capture(
     capture_sequence: &mut u32,
     control_sequence: &mut u32,
     direction: SpeedtestDirection,
-    remaining_traffic_budget: &mut u64,
+    remaining_traffic_budget: &mut super::protocol::TrafficPolicy,
     terminate: &AtomicBool,
 ) -> Result<MeasurementEvidence, CaptureWaitError> {
     let load_reference_kbps = match direction {
@@ -14491,7 +15538,7 @@ fn run_topology_repeat_capture(
     control_sequence: &mut u32,
     direction: EvidenceDirection,
     load_reference_kbps: u64,
-    remaining_traffic_budget: &mut u64,
+    remaining_traffic_budget: &mut super::protocol::TrafficPolicy,
     terminate: &AtomicBool,
 ) -> Result<MeasurementEvidence, CaptureWaitError> {
     let speedtest_direction = match direction {
@@ -14683,7 +15730,7 @@ fn run_native_mobile_download_bypass_confirmation(
     capture: &mut AutotuneCaptureGuard,
     capture_sequence: &mut u32,
     control_sequence: &mut u32,
-    remaining_traffic_budget: &mut u64,
+    remaining_traffic_budget: &mut super::protocol::TrafficPolicy,
     terminate: &AtomicBool,
 ) -> Result<NativeMobileDownloadBypassOutcome, String> {
     let records = evidence_store.load()?;
@@ -14707,7 +15754,7 @@ fn run_native_mobile_download_bypass_confirmation(
     let required_total = required_download
         .checked_add(required_upload)
         .ok_or_else(|| "native mobile download-bypass traffic bound overflowed".to_string())?;
-    if *remaining_traffic_budget < required_total {
+    if !remaining_traffic_budget.allows(required_total) {
         let replay = append_replay_evidence(
             evidence_store,
             request,
@@ -14762,7 +15809,7 @@ fn run_native_mobile_download_bypass_confirmation(
     };
     permit.authorizes(&request.identity.instance, &control, monotonic_boot_ms()?)?;
     transition_runtime_after_capture_cleanup(capture, || store.publish_control(&control))?;
-    wait_for_runtime_applied(store, permit, &control, terminate)?;
+    wait_for_runtime_applied(Some(session), store, permit, &control, terminate)?;
     for (direction, load_reference_kbps) in [
         (SpeedtestDirection::Download, proposal.download.maximum_kbps),
         (SpeedtestDirection::Upload, selected_ul_kbps),
@@ -14975,7 +16022,7 @@ fn run_native_direction_search(
     capture: &mut AutotuneCaptureGuard,
     capture_sequence: &mut u32,
     control_sequence: &mut u32,
-    remaining_traffic_budget: &mut u64,
+    remaining_traffic_budget: &mut super::protocol::TrafficPolicy,
     job_directory: &Path,
     terminate: &AtomicBool,
 ) -> Result<NativeDirectionSearchOutcome, String> {
@@ -15104,7 +16151,7 @@ fn run_native_direction_search(
         };
         permit.authorizes(&request.identity.instance, &control, monotonic_boot_ms()?)?;
         transition_runtime_after_capture_cleanup(capture, || store.publish_control(&control))?;
-        wait_for_runtime_applied(store, permit, &control, terminate)?;
+        wait_for_runtime_applied(Some(session), store, permit, &control, terminate)?;
 
         let speedtest_direction = match direction {
             EvidenceDirection::Download => SpeedtestDirection::Download,
@@ -15410,7 +16457,7 @@ fn run_native_topology_comparison(
     capture: &mut AutotuneCaptureGuard,
     capture_sequence: &mut u32,
     control_sequence: &mut u32,
-    remaining_traffic_budget: &mut u64,
+    remaining_traffic_budget: &mut super::protocol::TrafficPolicy,
     job_directory: &Path,
     terminate: &AtomicBool,
 ) -> Result<NativeTopologyComparisonResult, String> {
@@ -15472,7 +16519,7 @@ fn run_native_topology_comparison(
             };
             permit.authorizes(&request.identity.instance, &control, monotonic_boot_ms()?)?;
             transition_runtime_after_capture_cleanup(capture, || store.publish_control(&control))?;
-            wait_for_runtime_applied(store, permit, &control, terminate)?;
+            wait_for_runtime_applied(Some(session), store, permit, &control, terminate)?;
             let measurement = match run_topology_repeat_capture(
                 session,
                 request,
@@ -15629,15 +16676,6 @@ where
     if request.identity.operation != OperationKind::FullAutotune {
         return Err("Auto-Tune worker accepts FullAutotune requests only".to_string());
     }
-    if !wait_for_permit(
-        &operation_permit_path,
-        &request.identity.job_id,
-        &worker_run_id,
-        request.deadline_unix_ms,
-        terminate,
-    )? {
-        return Ok(());
-    }
     let job_directory = request_path
         .parent()
         .ok_or_else(|| "native Auto-Tune request has no private job directory".to_string())?;
@@ -15655,10 +16693,38 @@ where
     {
         return Err("native Auto-Tune terminal path is not bound to its worker run".to_string());
     }
+    let admitted = wait_for_permit(
+        &operation_permit_path,
+        &request.identity.job_id,
+        &worker_run_id,
+        request.deadline_unix_ms,
+        terminate,
+    );
+    if request.traffic_policy_explicit && !matches!(&admitted, Ok(true)) {
+        publish_unstarted_traffic_receipt(job_directory, &request, &worker_run_id)?;
+        let terminal = match admitted {
+            Ok(false) => AutotuneTerminal::Cancelled,
+            Err(error) => worker_error_terminal(&error, terminate.load(Ordering::Relaxed)),
+            Ok(true) => unreachable!(),
+        };
+        return publish_terminal_file(
+            &terminal_path,
+            &AutotuneTerminalRecord {
+                job_id: request.identity.job_id.clone(),
+                worker_run_id,
+                consumed_traffic_bytes: 0,
+                terminal,
+            },
+        );
+    }
+    if !admitted? {
+        return Ok(());
+    }
     let evidence_store = AutotuneEvidenceStore::open(job_directory)?;
     if !evidence_store.load()?.is_empty() {
         return Err("native Auto-Tune worker found pre-existing run evidence".to_string());
     }
+    let mut owned_admission_attempted = false;
     let worker_result = (|| -> Result<(), String> {
         let runtime_directory = autotune_worker_runtime_directory(
             &request,
@@ -15669,40 +16735,6 @@ where
         let store = RuntimeOverrideStore::open(&runtime_directory)?;
         let permit = wait_for_runtime_permit(&store, &request, &worker_run_id, terminate)?
             .ok_or_else(|| "native Auto-Tune was cancelled before runtime admission".to_string())?;
-        let _ = append_replay_evidence(
-            &evidence_store,
-            &request,
-            &worker_run_id,
-            AutotunePhase::Preflight,
-            AutotuneEvidence::PreflightAttested,
-        )?;
-        let mut capture = AutotuneCaptureGuard::new(&runtime_directory);
-        let mut capture_sequence = 0_u32;
-        let (baseline_request, baseline_snapshot) = run_idle_baseline_with_recovery(
-            &request,
-            &permit,
-            &mut capture,
-            &mut capture_sequence,
-            terminate,
-        )?;
-        capture.bind_completed_idle_transport_baseline(&baseline_request, &baseline_snapshot)?;
-        let _ = append_replay_evidence(
-            &evidence_store,
-            &request,
-            &worker_run_id,
-            AutotunePhase::IdleBaseline,
-            AutotuneEvidence::Baseline(BaselineEvidence {
-                idle_median_us: baseline_snapshot
-                    .idle_median_us
-                    .ok_or_else(|| "native Auto-Tune baseline has no median".to_string())?,
-                idle_p95_us: baseline_snapshot
-                    .idle_p95_us
-                    .ok_or_else(|| "native Auto-Tune baseline has no p95".to_string())?,
-                samples: baseline_snapshot.icmp_samples,
-            }),
-        )?;
-        capture.cleanup();
-        let mut remaining_traffic_budget = request.traffic_budget_bytes;
         let speedtest_session_path = job_directory.join("autotune-speedtest-session");
         let mut speedtest_session = EmbeddedSpeedtestSession::open(
             &request,
@@ -15710,72 +16742,93 @@ where
             &speedtest_session_path,
             terminate,
         )?;
-        let mut record_qualification_debit = |debit| {
-            append_traffic_debit_evidence(
+        owned_admission_attempted = true;
+        speedtest_session.publish_probe_owner(&store, &permit)?;
+        let measurement_result = (|| -> Result<(), String> {
+            let _ = append_replay_evidence(
+                &evidence_store,
+                &request,
+                &worker_run_id,
+                AutotunePhase::Preflight,
+                AutotuneEvidence::PreflightAttested,
+            )?;
+            let mut capture = AutotuneCaptureGuard::new(&runtime_directory);
+            let mut capture_sequence = 0_u32;
+            let (baseline_request, baseline_snapshot) = run_idle_baseline_with_recovery(
+                &speedtest_session,
+                &request,
+                &permit,
+                &mut capture,
+                &mut capture_sequence,
+                terminate,
+            )?;
+            capture
+                .bind_completed_idle_transport_baseline(&baseline_request, &baseline_snapshot)?;
+            let _ = append_replay_evidence(
                 &evidence_store,
                 &request,
                 &worker_run_id,
                 AutotunePhase::IdleBaseline,
-                TrafficDebitPurpose::Qualification,
-                SpeedtestDirection::Both,
-                debit,
-            )
-        };
-        let qualification_safety_reserve_bytes = capture_traffic_safety_reserve_bytes(
-            &request,
-            &baseline_request,
-            SpeedtestDirection::Both,
-        )?;
-        let baseline_accounting = bind_baseline_accounting_plan(&request, &permit, &store)?;
-        let mut attest_baseline_epoch =
-            || attest_baseline_accounting_epoch(&request, &permit, &store);
-        qualify_embedded_speedtest_server_in_session(
-            &mut speedtest_session,
-            &request,
-            &worker_run_id,
-            &baseline_accounting,
-            &mut attest_baseline_epoch,
-            qualification_safety_reserve_bytes,
-            &mut remaining_traffic_budget,
-            terminate,
-            &job_directory.join("autotune-speedtest-qualification"),
-            &mut record_qualification_debit,
-        )?;
-        let topologies: &[MeasurementTopology] = if uses_full_raw_controls(
-            request
-                .strategy
-                .ok_or_else(|| "Full Auto-Tune request has no strategy".to_string())?,
-            request.allow_sqm_disable,
-        ) {
-            &[
-                MeasurementTopology::RawDownload,
-                MeasurementTopology::RawUpload,
-                MeasurementTopology::RawBoth,
-            ]
-        } else {
-            &[MeasurementTopology::ShapedBoth]
-        };
-        let mut last_control = None;
-        let mut runtime_control_sequence = 0_u32;
-        let mut replay = append_replay_evidence(
-            &evidence_store,
-            &request,
-            &worker_run_id,
-            AutotunePhase::RawControls,
-            AutotuneEvidence::RuntimeMutationArmed,
-        )?;
-        for topology in topologies.iter().copied() {
-            runtime_control_sequence = runtime_control_sequence
-                .checked_add(1)
-                .filter(|value| *value <= permit.maximum_sequence)
-                .ok_or_else(|| "native Auto-Tune runtime control sequence exhausted".to_string())?;
-            let download_kbps = topology
-                .download_is_shaped()
-                .then_some(permit.initial_download_kbps);
-            let upload_kbps = topology
-                .upload_is_shaped()
-                .then_some(permit.initial_upload_kbps);
-            let mut control = AutotuneRuntimeControl {
+                AutotuneEvidence::Baseline(BaselineEvidence {
+                    idle_median_us: baseline_snapshot
+                        .idle_median_us
+                        .ok_or_else(|| "native Auto-Tune baseline has no median".to_string())?,
+                    idle_p95_us: baseline_snapshot
+                        .idle_p95_us
+                        .ok_or_else(|| "native Auto-Tune baseline has no p95".to_string())?,
+                    samples: baseline_snapshot.icmp_samples,
+                }),
+            )?;
+            capture.cleanup();
+            let mut remaining_traffic_budget = request.traffic_budget;
+            if speedtest_session.checkpoint_owned_lifecycle(
+                &mut remaining_traffic_budget,
+                &mut |debit| {
+                    append_traffic_debit_evidence(
+                        &evidence_store,
+                        &request,
+                        &worker_run_id,
+                        AutotunePhase::IdleBaseline,
+                        TrafficDebitPurpose::Lifecycle,
+                        SpeedtestDirection::Both,
+                        debit,
+                    )
+                },
+            )? {
+                return Err(SPEEDTEST_TRAFFIC_LIMIT_REACHED.into());
+            }
+            let topologies: &[MeasurementTopology] = if uses_full_raw_controls(
+                request
+                    .strategy
+                    .ok_or_else(|| "Full Auto-Tune request has no strategy".to_string())?,
+                request.allow_sqm_disable,
+            ) {
+                &[
+                    MeasurementTopology::RawDownload,
+                    MeasurementTopology::RawUpload,
+                    MeasurementTopology::RawBoth,
+                ]
+            } else {
+                &[MeasurementTopology::ShapedBoth]
+            };
+            let mut last_control = None;
+            let mut runtime_control_sequence = 1_u32;
+            let mut replay = append_replay_evidence(
+                &evidence_store,
+                &request,
+                &worker_run_id,
+                AutotunePhase::RawControls,
+                AutotuneEvidence::RuntimeMutationArmed,
+            )?;
+            // Select the source before recording any raw/shaped controls. A
+            // pre-existing low CAKE rate must not hide a faster alternate server.
+            // Without explicit FullRaw permission this remains ceiling-limited.
+            let comparison_topology = if topologies.len() > 1 {
+                MeasurementTopology::RawBoth
+            } else {
+                MeasurementTopology::ShapedBoth
+            };
+            let comparison_control = AutotuneRuntimeControl {
                 permit_id: permit.permit_id.clone(),
                 job_id: permit.job_id.clone(),
                 worker_run_id: permit.worker_run_id.clone(),
@@ -15787,66 +16840,213 @@ where
                 target_interface: permit.target_interface.clone(),
                 route_fingerprint: permit.route_fingerprint.clone(),
                 sqm_fingerprint: permit.sqm_fingerprint.clone(),
-                topology,
-                download_kbps,
-                upload_kbps,
+                topology: comparison_topology,
+                download_kbps: comparison_topology
+                    .download_is_shaped()
+                    .then_some(permit.initial_download_kbps),
+                upload_kbps: comparison_topology
+                    .upload_is_shaped()
+                    .then_some(permit.initial_upload_kbps),
             };
-            permit.authorizes(&request.identity.instance, &control, monotonic_boot_ms()?)?;
+            permit.authorizes(
+                &request.identity.instance,
+                &comparison_control,
+                monotonic_boot_ms()?,
+            )?;
             transition_runtime_after_capture_cleanup(&mut capture, || {
-                store.publish_control(&control)
+                store.publish_control(&comparison_control)
             })?;
-            wait_for_runtime_applied(&store, &permit, &control, terminate)?;
-            let repetitions = if topologies.len() == 1 { 2 } else { 1 };
-            for direction in topology_measurement_directions(control.topology) {
-                for _ in 0..repetitions {
-                    let load_reference_kbps = match direction {
-                        SpeedtestDirection::Download => {
-                            control.download_kbps.or(Some(permit.initial_download_kbps))
-                        }
-                        SpeedtestDirection::Upload => {
-                            control.upload_kbps.or(Some(permit.initial_upload_kbps))
-                        }
-                        SpeedtestDirection::Both => None,
-                    }
-                    .filter(|value| *value > 0)
-                    .ok_or_else(|| {
-                        "native Auto-Tune loaded capture has no verified directional reference"
-                            .to_string()
-                    })?;
-                    let evidence = match run_directional_measurement_with_recovery(
-                        &mut speedtest_session,
+            wait_for_runtime_applied(
+                Some(&speedtest_session),
+                &store,
+                &permit,
+                &comparison_control,
+                terminate,
+            )?;
+            let (comparison_accounting, comparison_ack, comparison_checkpoint) =
+                bind_private_accounting_plan(&request, &permit, &comparison_control, &store)?;
+            let mut attest_comparison_epoch = || {
+                attest_private_accounting_epoch(
+                    &request,
+                    &permit,
+                    &comparison_control,
+                    &comparison_ack,
+                    &comparison_checkpoint,
+                    &store,
+                )
+            };
+            let mut record_qualification_debit = |debit| {
+                append_traffic_debit_evidence(
+                    &evidence_store,
+                    &request,
+                    &worker_run_id,
+                    AutotunePhase::RawControls,
+                    TrafficDebitPurpose::CapacityQualification,
+                    SpeedtestDirection::Both,
+                    debit,
+                )
+            };
+            let qualification_safety_reserve_bytes = autotune_traffic_safety_reserve_bytes(
+                &request,
+                comparison_control.download_kbps,
+                comparison_control.upload_kbps,
+                SpeedtestDirection::Both,
+            )?;
+            let first_qualification_debit = replay
+                .last_sequence
+                .checked_add(1)
+                .ok_or("qualification sequence overflow")?;
+            let mut comparisons = Vec::with_capacity(super::server_qualification::MAX_COMPARISONS);
+            publish_server_comparison_report(
+                job_directory,
+                &request,
+                &worker_run_id,
+                &comparison_control,
+                first_qualification_debit,
+                &comparisons,
+                None,
+            )?;
+            let qualification_outcome = qualify_embedded_speedtest_server_in_session(
+                &mut speedtest_session,
+                &request,
+                &worker_run_id,
+                &comparison_accounting,
+                &mut attest_comparison_epoch,
+                qualification_safety_reserve_bytes,
+                &mut remaining_traffic_budget,
+                terminate,
+                &job_directory.join("autotune-speedtest-qualification"),
+                &mut record_qualification_debit,
+                &mut |comparison| {
+                    comparisons.push(comparison);
+                    publish_server_comparison_report(
+                        job_directory,
                         &request,
                         &worker_run_id,
-                        &evidence_store,
-                        AutotunePhase::RawControls,
-                        &permit,
-                        &store,
-                        &mut capture,
-                        &mut capture_sequence,
-                        &mut control,
-                        &mut runtime_control_sequence,
-                        *direction,
-                        load_reference_kbps,
-                        &mut remaining_traffic_budget,
-                        terminate,
-                    ) {
-                        Ok(measurement) => AutotuneEvidence::Measurement(measurement),
-                        Err(CaptureWaitError::ObservationStarved {
-                            load,
-                            icmp_samples,
-                            transport_samples,
-                            transport_timeout_count,
-                            transport_timeout_total_us,
-                            cpu_samples,
-                        }) if uses_full_raw_controls(
-                            request.strategy.ok_or_else(|| {
-                                "Full Auto-Tune request has no strategy".to_string()
-                            })?,
-                            request.allow_sqm_disable,
-                        ) && load.request.topology == control.topology
-                            && load.request.direction == Some(*direction) =>
-                        {
-                            let pending = AutotuneReplayState::replay(
+                        &comparison_control,
+                        first_qualification_debit,
+                        &comparisons,
+                        None,
+                    )
+                    .map(|_| ())
+                },
+            );
+            let selection_digest = publish_server_comparison_report(
+                job_directory,
+                &request,
+                &worker_run_id,
+                &comparison_control,
+                first_qualification_debit,
+                &comparisons,
+                Some(&qualification_outcome),
+            )?;
+            qualification_outcome?;
+            replay = append_replay_evidence(
+                &evidence_store,
+                &request,
+                &worker_run_id,
+                AutotunePhase::RawControls,
+                AutotuneEvidence::ServerSelected {
+                    digest: selection_digest,
+                },
+            )?;
+            verify_server_comparison_report(
+                job_directory,
+                &request,
+                &worker_run_id,
+                &evidence_store.load()?,
+            )?;
+            for topology in topologies.iter().copied() {
+                runtime_control_sequence = runtime_control_sequence
+                    .checked_add(1)
+                    .filter(|value| *value <= permit.maximum_sequence)
+                    .ok_or_else(|| {
+                        "native Auto-Tune runtime control sequence exhausted".to_string()
+                    })?;
+                let download_kbps = topology
+                    .download_is_shaped()
+                    .then_some(permit.initial_download_kbps);
+                let upload_kbps = topology
+                    .upload_is_shaped()
+                    .then_some(permit.initial_upload_kbps);
+                let mut control = AutotuneRuntimeControl {
+                    permit_id: permit.permit_id.clone(),
+                    job_id: permit.job_id.clone(),
+                    worker_run_id: permit.worker_run_id.clone(),
+                    boot_id: permit.boot_id.clone(),
+                    coordinator_generation: permit.coordinator_generation.clone(),
+                    worker: permit.worker.clone(),
+                    sequence: runtime_control_sequence,
+                    deadline_boot_ms: permit.deadline_boot_ms,
+                    target_interface: permit.target_interface.clone(),
+                    route_fingerprint: permit.route_fingerprint.clone(),
+                    sqm_fingerprint: permit.sqm_fingerprint.clone(),
+                    topology,
+                    download_kbps,
+                    upload_kbps,
+                };
+                permit.authorizes(&request.identity.instance, &control, monotonic_boot_ms()?)?;
+                transition_runtime_after_capture_cleanup(&mut capture, || {
+                    store.publish_control(&control)
+                })?;
+                wait_for_runtime_applied(
+                    Some(&speedtest_session),
+                    &store,
+                    &permit,
+                    &control,
+                    terminate,
+                )?;
+                let repetitions = if topologies.len() == 1 { 2 } else { 1 };
+                for direction in topology_measurement_directions(control.topology) {
+                    for _ in 0..repetitions {
+                        let load_reference_kbps = match direction {
+                            SpeedtestDirection::Download => {
+                                control.download_kbps.or(Some(permit.initial_download_kbps))
+                            }
+                            SpeedtestDirection::Upload => {
+                                control.upload_kbps.or(Some(permit.initial_upload_kbps))
+                            }
+                            SpeedtestDirection::Both => None,
+                        }
+                        .filter(|value| *value > 0)
+                        .ok_or_else(|| {
+                            "native Auto-Tune loaded capture has no verified directional reference"
+                                .to_string()
+                        })?;
+                        let evidence = match run_directional_measurement_with_recovery(
+                            &mut speedtest_session,
+                            &request,
+                            &worker_run_id,
+                            &evidence_store,
+                            AutotunePhase::RawControls,
+                            &permit,
+                            &store,
+                            &mut capture,
+                            &mut capture_sequence,
+                            &mut control,
+                            &mut runtime_control_sequence,
+                            *direction,
+                            load_reference_kbps,
+                            &mut remaining_traffic_budget,
+                            terminate,
+                        ) {
+                            Ok(measurement) => AutotuneEvidence::Measurement(measurement),
+                            Err(CaptureWaitError::ObservationStarved {
+                                load,
+                                icmp_samples,
+                                transport_samples,
+                                transport_timeout_count,
+                                transport_timeout_total_us,
+                                cpu_samples,
+                            }) if uses_full_raw_controls(
+                                request.strategy.ok_or_else(|| {
+                                    "Full Auto-Tune request has no strategy".to_string()
+                                })?,
+                                request.allow_sqm_disable,
+                            ) && load.request.topology == control.topology
+                                && load.request.direction == Some(*direction) =>
+                            {
+                                let pending = AutotuneReplayState::replay(
                                 &request,
                                 &worker_run_id,
                                 &evidence_store.load()?,
@@ -15857,156 +17057,77 @@ where
                                 "native Auto-Tune starved raw control has no exact traffic debit"
                                     .to_string()
                             })?;
-                            AutotuneEvidence::RawControlCapacity(
-                                raw_control_capacity_from_starved_load(
-                                    &load,
-                                    pending,
-                                    icmp_samples,
-                                    transport_samples,
-                                    transport_timeout_count,
-                                    transport_timeout_total_us,
-                                    cpu_samples,
-                                )?,
-                            )
-                        }
-                        Err(error) => return Err(error.into()),
-                    };
-                    replay = append_replay_evidence(
-                        &evidence_store,
-                        &request,
-                        &worker_run_id,
-                        AutotunePhase::RawControls,
-                        evidence,
-                    )?;
+                                AutotuneEvidence::RawControlCapacity(
+                                    raw_control_capacity_from_starved_load(
+                                        &load,
+                                        pending,
+                                        icmp_samples,
+                                        transport_samples,
+                                        transport_timeout_count,
+                                        transport_timeout_total_us,
+                                        cpu_samples,
+                                    )?,
+                                )
+                            }
+                            Err(error) => return Err(error.into()),
+                        };
+                        replay = append_replay_evidence(
+                            &evidence_store,
+                            &request,
+                            &worker_run_id,
+                            AutotunePhase::RawControls,
+                            evidence,
+                        )?;
+                    }
                 }
+                last_control = Some(control);
             }
-            last_control = Some(control);
-        }
 
-        // No completed capture may survive into proposal settlement or the
-        // coordinator's restore-first transition.  Its evidence is already in the
-        // private replay journal at this point.
-        capture.cleanup();
-
-        let _last_control =
-            last_control.ok_or_else(|| "native Auto-Tune emitted no control".to_string())?;
-        if replay.next_action()? != AutotuneAction::BuildProposal {
-            return Err("native Auto-Tune directional control evidence is incomplete".to_string());
-        }
-        let records = evidence_store.load()?;
-        let link_kind = detect_native_link_kind(&request)?;
-        let proposal =
-            build_native_proposal_from_evidence(&request, &worker_run_id, &records, link_kind)?;
-        let (proposal_path, proposal_digest) = publish_native_proposal(job_directory, &proposal)?;
-        replay = append_replay_evidence(
-            &evidence_store,
-            &request,
-            &worker_run_id,
-            AutotunePhase::Proposal,
-            AutotuneEvidence::ProposalBuilt {
-                digest: proposal_digest,
-            },
-        )?;
-        if replay.next_action()? != AutotuneAction::Search(EvidenceDirection::Download) {
-            return Err("native Auto-Tune proposal did not advance to download search".to_string());
-        }
-        let proposal_records = evidence_store.load()?;
-        let replayed_proposal = verify_native_proposal_transaction(
-            &request,
-            &worker_run_id,
-            &proposal_records,
-            &proposal_path,
-            link_kind,
-        )?;
-        if replayed_proposal != proposal {
-            return Err("native Auto-Tune proposal replay changed canonical output".to_string());
-        }
-
-        let download_outcome = run_native_direction_search(
-            &mut speedtest_session,
-            &request,
-            &worker_run_id,
-            &permit,
-            &store,
-            &evidence_store,
-            &proposal,
-            EvidenceDirection::Download,
-            &mut capture,
-            &mut capture_sequence,
-            &mut runtime_control_sequence,
-            &mut remaining_traffic_budget,
-            job_directory,
-            terminate,
-        )?;
-        let raw_fallback_required = matches!(
-            download_outcome,
-            NativeDirectionSearchOutcome::TerminalBoundary
-        );
-        let download_search = match download_outcome {
-            NativeDirectionSearchOutcome::Complete(result) => {
-                if result.action == ProfileSearchAction::Inconclusive {
-                    return Err(
-                        "native download search inconclusive escaped its restore boundary"
-                            .to_string(),
-                    );
-                }
-                Some(result)
-            }
-            NativeDirectionSearchOutcome::TerminalBoundary => None,
-        };
-        if raw_fallback_required {
+            // No completed capture may survive into proposal settlement or the
+            // coordinator's restore-first transition.  Its evidence is already in the
+            // private replay journal at this point.
             capture.cleanup();
-            let source_records = evidence_store.load()?;
-            match AutotuneReplayState::replay(&request, &worker_run_id, &source_records)?
-                .next_action()?
-            {
-                AutotuneAction::RestoreRuntime => {}
-                AutotuneAction::BuildRawFallback => {
-                    let raw_fallback = native_terminal_fallback_result(
-                        &request,
-                        &worker_run_id,
-                        &proposal,
-                        &source_records,
-                    )?;
-                    let (raw_fallback_path, raw_fallback_digest) =
-                        publish_native_terminal_fallback(job_directory, &raw_fallback)?;
-                    let replay = append_replay_evidence(
-                        &evidence_store,
-                        &request,
-                        &worker_run_id,
-                        AutotunePhase::TopologyComparison,
-                        AutotuneEvidence::RawFallbackBuilt {
-                            digest: raw_fallback_digest,
-                        },
-                    )?;
-                    if replay.next_action()? != AutotuneAction::RestoreRuntime {
-                        return Err("native raw fallback did not reach restore".to_string());
-                    }
-                    let records = evidence_store.load()?;
-                    let verified = verify_native_terminal_fallback_transaction(
-                        &request,
-                        &worker_run_id,
-                        &proposal,
-                        &records,
-                        &raw_fallback_path,
-                    )?;
-                    if verified != raw_fallback {
-                        return Err(
-                            "native raw-fallback replay changed canonical output".to_string()
-                        );
-                    }
-                }
-                _ => {
-                    return Err(
-                        "native download search boundary did not reach raw fallback or restore"
-                            .to_string(),
-                    )
-                }
+
+            let _last_control =
+                last_control.ok_or_else(|| "native Auto-Tune emitted no control".to_string())?;
+            if replay.next_action()? != AutotuneAction::BuildProposal {
+                return Err(
+                    "native Auto-Tune directional control evidence is incomplete".to_string(),
+                );
             }
-        } else {
-            let download_search = download_search
-                .ok_or_else(|| "native download search outcome disappeared".to_string())?;
-            let upload_search = run_native_direction_search(
+            let records = evidence_store.load()?;
+            let link_kind = detect_native_link_kind(&request)?;
+            let proposal =
+                build_native_proposal_from_evidence(&request, &worker_run_id, &records, link_kind)?;
+            let (proposal_path, proposal_digest) =
+                publish_native_proposal(job_directory, &proposal)?;
+            replay = append_replay_evidence(
+                &evidence_store,
+                &request,
+                &worker_run_id,
+                AutotunePhase::Proposal,
+                AutotuneEvidence::ProposalBuilt {
+                    digest: proposal_digest,
+                },
+            )?;
+            if replay.next_action()? != AutotuneAction::Search(EvidenceDirection::Download) {
+                return Err(
+                    "native Auto-Tune proposal did not advance to download search".to_string(),
+                );
+            }
+            let proposal_records = evidence_store.load()?;
+            let replayed_proposal = verify_native_proposal_transaction(
+                &request,
+                &worker_run_id,
+                &proposal_records,
+                &proposal_path,
+                link_kind,
+            )?;
+            if replayed_proposal != proposal {
+                return Err("native Auto-Tune proposal replay changed canonical output".to_string());
+            }
+
+            let download_outcome = run_native_direction_search(
                 &mut speedtest_session,
                 &request,
                 &worker_run_id,
@@ -16014,7 +17135,7 @@ where
                 &store,
                 &evidence_store,
                 &proposal,
-                EvidenceDirection::Upload,
+                EvidenceDirection::Download,
                 &mut capture,
                 &mut capture_sequence,
                 &mut runtime_control_sequence,
@@ -16022,10 +17143,23 @@ where
                 job_directory,
                 terminate,
             )?;
-            if matches!(
-                upload_search,
+            let raw_fallback_required = matches!(
+                download_outcome,
                 NativeDirectionSearchOutcome::TerminalBoundary
-            ) {
+            );
+            let download_search = match download_outcome {
+                NativeDirectionSearchOutcome::Complete(result) => {
+                    if result.action == ProfileSearchAction::Inconclusive {
+                        return Err(
+                            "native download search inconclusive escaped its restore boundary"
+                                .to_string(),
+                        );
+                    }
+                    Some(result)
+                }
+                NativeDirectionSearchOutcome::TerminalBoundary => None,
+            };
+            if raw_fallback_required {
                 capture.cleanup();
                 let source_records = evidence_store.load()?;
                 match AutotuneReplayState::replay(&request, &worker_run_id, &source_records)?
@@ -16069,288 +17203,299 @@ where
                     }
                     _ => {
                         return Err(
-                            "native upload search boundary did not reach raw fallback or restore"
+                            "native download search boundary did not reach raw fallback or restore"
                                 .to_string(),
                         )
                     }
                 }
             } else {
-                let upload_search = match upload_search {
-                    NativeDirectionSearchOutcome::Complete(result) => result,
-                    NativeDirectionSearchOutcome::TerminalBoundary => {
-                        unreachable!("handled above")
-                    }
-                };
-                if upload_search.action == ProfileSearchAction::Inconclusive {
-                    return Err(
-                        "native upload search inconclusive escaped its restore boundary"
-                            .to_string(),
-                    );
-                }
-                capture.cleanup();
-                let completed_records = evidence_store.load()?;
-                let completed_replay =
-                    AutotuneReplayState::replay(&request, &worker_run_id, &completed_records)?;
-                if completed_replay.next_action()? != AutotuneAction::ConfirmPair {
-                    return Err(
-                        "native Auto-Tune independent direction searches are incomplete"
-                            .to_string(),
-                    );
-                }
-                let _ = verify_native_profile_search_transaction(
+                let download_search = download_search
+                    .ok_or_else(|| "native download search outcome disappeared".to_string())?;
+                let upload_search = run_native_direction_search(
+                    &mut speedtest_session,
                     &request,
                     &worker_run_id,
-                    &proposal,
-                    EvidenceDirection::Download,
-                    &completed_records,
-                    &job_directory.join(DOWNLOAD_SEARCH_FILE),
-                )?;
-                let _ = verify_native_profile_search_transaction(
-                    &request,
-                    &worker_run_id,
+                    &permit,
+                    &store,
+                    &evidence_store,
                     &proposal,
                     EvidenceDirection::Upload,
-                    &completed_records,
-                    &job_directory.join(UPLOAD_SEARCH_FILE),
+                    &mut capture,
+                    &mut capture_sequence,
+                    &mut runtime_control_sequence,
+                    &mut remaining_traffic_budget,
+                    job_directory,
+                    terminate,
                 )?;
-                let pair_candidates = profile_pair_candidates(&download_search, &upload_search)?;
-                for pair_candidate in pair_candidates {
-                    let current_records = evidence_store.load()?;
-                    let current_replay =
-                        AutotuneReplayState::replay(&request, &worker_run_id, &current_records)?;
-                    if current_replay
-                        .pair_measurements
-                        .contains(&(pair_candidate.download_kbps, pair_candidate.upload_kbps))
-                        || current_replay.pair_unavailable.iter().any(|value| {
-                            value.candidate_dl_kbps == pair_candidate.download_kbps
-                                && value.candidate_ul_kbps == pair_candidate.upload_kbps
-                        })
+                if matches!(
+                    upload_search,
+                    NativeDirectionSearchOutcome::TerminalBoundary
+                ) {
+                    capture.cleanup();
+                    let source_records = evidence_store.load()?;
+                    match AutotuneReplayState::replay(&request, &worker_run_id, &source_records)?
+                        .next_action()?
                     {
-                        continue;
+                        AutotuneAction::RestoreRuntime => {}
+                        AutotuneAction::BuildRawFallback => {
+                            let raw_fallback = native_terminal_fallback_result(
+                                &request,
+                                &worker_run_id,
+                                &proposal,
+                                &source_records,
+                            )?;
+                            let (raw_fallback_path, raw_fallback_digest) =
+                                publish_native_terminal_fallback(job_directory, &raw_fallback)?;
+                            let replay = append_replay_evidence(
+                                &evidence_store,
+                                &request,
+                                &worker_run_id,
+                                AutotunePhase::TopologyComparison,
+                                AutotuneEvidence::RawFallbackBuilt {
+                                    digest: raw_fallback_digest,
+                                },
+                            )?;
+                            if replay.next_action()? != AutotuneAction::RestoreRuntime {
+                                return Err("native raw fallback did not reach restore".to_string());
+                            }
+                            let records = evidence_store.load()?;
+                            let verified = verify_native_terminal_fallback_transaction(
+                                &request,
+                                &worker_run_id,
+                                &proposal,
+                                &records,
+                                &raw_fallback_path,
+                            )?;
+                            if verified != raw_fallback {
+                                return Err("native raw-fallback replay changed canonical output"
+                                    .to_string());
+                            }
+                        }
+                        _ => return Err(
+                            "native upload search boundary did not reach raw fallback or restore"
+                                .to_string(),
+                        ),
                     }
-                    runtime_control_sequence = runtime_control_sequence
-                        .checked_add(1)
-                        .filter(|value| *value <= permit.maximum_sequence)
-                        .ok_or_else(|| {
-                            "native Auto-Tune pair runtime sequence exhausted".to_string()
-                        })?;
-                    let mut pair_control = AutotuneRuntimeControl {
-                        permit_id: permit.permit_id.clone(),
-                        job_id: permit.job_id.clone(),
-                        worker_run_id: permit.worker_run_id.clone(),
-                        boot_id: permit.boot_id.clone(),
-                        coordinator_generation: permit.coordinator_generation.clone(),
-                        worker: permit.worker.clone(),
-                        sequence: runtime_control_sequence,
-                        deadline_boot_ms: permit.deadline_boot_ms,
-                        target_interface: permit.target_interface.clone(),
-                        route_fingerprint: permit.route_fingerprint.clone(),
-                        sqm_fingerprint: permit.sqm_fingerprint.clone(),
-                        topology: MeasurementTopology::ShapedBoth,
-                        download_kbps: Some(pair_candidate.download_kbps),
-                        upload_kbps: Some(pair_candidate.upload_kbps),
-                    };
-                    permit.authorizes(
-                        &request.identity.instance,
-                        &pair_control,
-                        monotonic_boot_ms()?,
-                    )?;
-                    transition_runtime_after_capture_cleanup(&mut capture, || {
-                        store.publish_control(&pair_control)
-                    })?;
-                    wait_for_runtime_applied(&store, &permit, &pair_control, terminate)?;
-                    // speedtest-go's combined mode is sequential (download, then upload),
-                    // not a true simultaneous full-duplex load. Confirm every distinct
-                    // candidate pair with two identity-bound directional captures; no
-                    // independently searched directions become an option by combination
-                    // alone.
-                    let pair_download = match run_selected_pair_direction_capture(
-                        &mut speedtest_session,
-                        &request,
-                        &worker_run_id,
-                        &evidence_store,
-                        &permit,
-                        &store,
-                        &mut capture,
-                        &mut pair_control,
-                        &mut capture_sequence,
-                        &mut runtime_control_sequence,
-                        SpeedtestDirection::Download,
-                        &mut remaining_traffic_budget,
-                        terminate,
-                    ) {
-                        Ok(measurement) => measurement,
-                        Err(error) => {
-                            let pair_replay = append_pair_option_unavailable_from_error(
-                                &evidence_store,
-                                &request,
-                                &worker_run_id,
-                                pair_candidate,
-                                SpeedtestDirection::Download,
-                                error,
-                            )?;
-                            if pair_replay.next_action()? != AutotuneAction::ConfirmPair {
-                                return Err(
-                                    "native Auto-Tune unavailable pair download did not preserve confirmation state"
-                                        .to_string(),
-                                );
-                            }
-                            continue;
+                } else {
+                    let upload_search = match upload_search {
+                        NativeDirectionSearchOutcome::Complete(result) => result,
+                        NativeDirectionSearchOutcome::TerminalBoundary => {
+                            unreachable!("handled above")
                         }
                     };
-                    let pair_upload = match run_selected_pair_direction_capture(
-                        &mut speedtest_session,
-                        &request,
-                        &worker_run_id,
-                        &evidence_store,
-                        &permit,
-                        &store,
-                        &mut capture,
-                        &mut pair_control,
-                        &mut capture_sequence,
-                        &mut runtime_control_sequence,
-                        SpeedtestDirection::Upload,
-                        &mut remaining_traffic_budget,
-                        terminate,
-                    ) {
-                        Ok(measurement) => measurement,
-                        Err(error) => {
-                            let pair_replay = append_pair_option_unavailable_from_error(
-                                &evidence_store,
-                                &request,
-                                &worker_run_id,
-                                pair_candidate,
-                                SpeedtestDirection::Upload,
-                                error,
-                            )?;
-                            if pair_replay.next_action()? != AutotuneAction::ConfirmPair {
-                                return Err(
-                                    "native Auto-Tune unavailable pair upload did not preserve confirmation state"
-                                        .to_string(),
-                                );
-                            }
-                            continue;
-                        }
-                    };
-                    let pair_measurement = sequential_pair_measurement(pair_download, pair_upload)?;
-                    let pair_replay = append_replay_evidence(
-                        &evidence_store,
-                        &request,
-                        &worker_run_id,
-                        AutotunePhase::PairConfirmation,
-                        AutotuneEvidence::Measurement(pair_measurement),
-                    )?;
-                    if pair_replay.next_action()? != AutotuneAction::ConfirmPair {
+                    if upload_search.action == ProfileSearchAction::Inconclusive {
                         return Err(
-                            "native Auto-Tune pair measurement did not preserve confirmation state"
+                            "native upload search inconclusive escaped its restore boundary"
                                 .to_string(),
                         );
                     }
-                }
-                capture.cleanup();
-                let pair_records = evidence_store.load()?;
-                match native_pair_confirmation_outcome(&proposal, &pair_records)? {
-                    NativePairConfirmationOutcome::Confirmed(pair_result) => {
-                        let (pair_path, pair_digest) =
-                            publish_native_pair_confirmation(job_directory, &pair_result)?;
-                        let pair_replay = append_replay_evidence(
-                            &evidence_store,
+                    capture.cleanup();
+                    let completed_records = evidence_store.load()?;
+                    let completed_replay =
+                        AutotuneReplayState::replay(&request, &worker_run_id, &completed_records)?;
+                    if completed_replay.next_action()? != AutotuneAction::ConfirmPair {
+                        return Err(
+                            "native Auto-Tune independent direction searches are incomplete"
+                                .to_string(),
+                        );
+                    }
+                    let _ = verify_native_profile_search_transaction(
+                        &request,
+                        &worker_run_id,
+                        &proposal,
+                        EvidenceDirection::Download,
+                        &completed_records,
+                        &job_directory.join(DOWNLOAD_SEARCH_FILE),
+                    )?;
+                    let _ = verify_native_profile_search_transaction(
+                        &request,
+                        &worker_run_id,
+                        &proposal,
+                        EvidenceDirection::Upload,
+                        &completed_records,
+                        &job_directory.join(UPLOAD_SEARCH_FILE),
+                    )?;
+                    let pair_candidates =
+                        profile_pair_candidates(&download_search, &upload_search)?;
+                    for pair_candidate in pair_candidates {
+                        let current_records = evidence_store.load()?;
+                        let current_replay = AutotuneReplayState::replay(
                             &request,
                             &worker_run_id,
-                            AutotunePhase::PairConfirmation,
-                            AutotuneEvidence::PairConfirmed {
-                                digest: pair_digest,
-                            },
+                            &current_records,
                         )?;
-                        if pair_replay.next_action()? != AutotuneAction::CompareTopologies {
-                            return Err(
-                                "native Auto-Tune pair confirmation did not reach topology comparison"
-                                    .to_string(),
-                            );
+                        if current_replay
+                            .pair_measurements
+                            .contains(&(pair_candidate.download_kbps, pair_candidate.upload_kbps))
+                            || current_replay.pair_unavailable.iter().any(|value| {
+                                value.candidate_dl_kbps == pair_candidate.download_kbps
+                                    && value.candidate_ul_kbps == pair_candidate.upload_kbps
+                            })
+                        {
+                            continue;
                         }
-                        let pair_records = evidence_store.load()?;
-                        let replayed_pair = verify_native_pair_confirmation_transaction(
-                            &request,
-                            &worker_run_id,
-                            &proposal,
-                            &pair_records,
-                            &pair_path,
+                        runtime_control_sequence = runtime_control_sequence
+                            .checked_add(1)
+                            .filter(|value| *value <= permit.maximum_sequence)
+                            .ok_or_else(|| {
+                                "native Auto-Tune pair runtime sequence exhausted".to_string()
+                            })?;
+                        let mut pair_control = AutotuneRuntimeControl {
+                            permit_id: permit.permit_id.clone(),
+                            job_id: permit.job_id.clone(),
+                            worker_run_id: permit.worker_run_id.clone(),
+                            boot_id: permit.boot_id.clone(),
+                            coordinator_generation: permit.coordinator_generation.clone(),
+                            worker: permit.worker.clone(),
+                            sequence: runtime_control_sequence,
+                            deadline_boot_ms: permit.deadline_boot_ms,
+                            target_interface: permit.target_interface.clone(),
+                            route_fingerprint: permit.route_fingerprint.clone(),
+                            sqm_fingerprint: permit.sqm_fingerprint.clone(),
+                            topology: MeasurementTopology::ShapedBoth,
+                            download_kbps: Some(pair_candidate.download_kbps),
+                            upload_kbps: Some(pair_candidate.upload_kbps),
+                        };
+                        permit.authorizes(
+                            &request.identity.instance,
+                            &pair_control,
+                            monotonic_boot_ms()?,
                         )?;
-                        if replayed_pair != pair_result {
-                            return Err(
-                                "native Auto-Tune pair-confirmation replay changed canonical output"
-                                    .to_string(),
-                            );
-                        }
-                        let topology_comparison = run_native_topology_comparison(
+                        transition_runtime_after_capture_cleanup(&mut capture, || {
+                            store.publish_control(&pair_control)
+                        })?;
+                        wait_for_runtime_applied(
+                            Some(&speedtest_session),
+                            &store,
+                            &permit,
+                            &pair_control,
+                            terminate,
+                        )?;
+                        // speedtest-go's combined mode is sequential (download, then upload),
+                        // not a true simultaneous full-duplex load. Confirm every distinct
+                        // candidate pair with two identity-bound directional captures; no
+                        // independently searched directions become an option by combination
+                        // alone.
+                        let pair_download = match run_selected_pair_direction_capture(
                             &mut speedtest_session,
                             &request,
                             &worker_run_id,
+                            &evidence_store,
                             &permit,
                             &store,
-                            &evidence_store,
-                            &proposal,
-                            &pair_result,
                             &mut capture,
+                            &mut pair_control,
                             &mut capture_sequence,
                             &mut runtime_control_sequence,
+                            SpeedtestDirection::Download,
                             &mut remaining_traffic_budget,
-                            job_directory,
                             terminate,
-                        )?;
-                        let topology_records = evidence_store.load()?;
-                        let topology_replay = AutotuneReplayState::replay(
+                        ) {
+                            Ok(measurement) => measurement,
+                            Err(error) => {
+                                let pair_replay = append_pair_option_unavailable_from_error(
+                                    &evidence_store,
+                                    &request,
+                                    &worker_run_id,
+                                    pair_candidate,
+                                    SpeedtestDirection::Download,
+                                    error,
+                                )?;
+                                if pair_replay.next_action()? != AutotuneAction::ConfirmPair {
+                                    return Err(
+                                    "native Auto-Tune unavailable pair download did not preserve confirmation state"
+                                        .to_string(),
+                                );
+                                }
+                                continue;
+                            }
+                        };
+                        let pair_upload = match run_selected_pair_direction_capture(
+                            &mut speedtest_session,
                             &request,
                             &worker_run_id,
-                            &topology_records,
-                        )?;
-                        if topology_replay.next_action()? != AutotuneAction::RestoreRuntime
-                            || topology_comparison.download.needs_repeat
-                            || topology_comparison.upload.needs_repeat
-                        {
-                            return Err(
-                                "native Auto-Tune topology comparison is incomplete".to_string()
-                            );
-                        }
-                    }
-                    NativePairConfirmationOutcome::Exhausted(exhaustion) => {
-                        let exhaustion_digest = native_pair_exhaustion_digest(&exhaustion)?;
+                            &evidence_store,
+                            &permit,
+                            &store,
+                            &mut capture,
+                            &mut pair_control,
+                            &mut capture_sequence,
+                            &mut runtime_control_sequence,
+                            SpeedtestDirection::Upload,
+                            &mut remaining_traffic_budget,
+                            terminate,
+                        ) {
+                            Ok(measurement) => measurement,
+                            Err(error) => {
+                                let pair_replay = append_pair_option_unavailable_from_error(
+                                    &evidence_store,
+                                    &request,
+                                    &worker_run_id,
+                                    pair_candidate,
+                                    SpeedtestDirection::Upload,
+                                    error,
+                                )?;
+                                if pair_replay.next_action()? != AutotuneAction::ConfirmPair {
+                                    return Err(
+                                    "native Auto-Tune unavailable pair upload did not preserve confirmation state"
+                                        .to_string(),
+                                );
+                                }
+                                continue;
+                            }
+                        };
+                        let pair_measurement =
+                            sequential_pair_measurement(pair_download, pair_upload)?;
                         let pair_replay = append_replay_evidence(
                             &evidence_store,
                             &request,
                             &worker_run_id,
                             AutotunePhase::PairConfirmation,
-                            AutotuneEvidence::PairExhausted {
-                                digest: exhaustion_digest,
-                            },
+                            AutotuneEvidence::Measurement(pair_measurement),
                         )?;
-                        let pair_next_action = pair_replay.next_action()?;
-                        if !matches!(
-                            pair_next_action,
-                            AutotuneAction::BuildRawFallback
-                                | AutotuneAction::ConfirmMobileDownloadBypass
-                                | AutotuneAction::RestoreRuntime
-                        ) {
+                        if pair_replay.next_action()? != AutotuneAction::ConfirmPair {
                             return Err(
-                                "native Auto-Tune pair exhaustion did not reach a bounded terminal path"
+                            "native Auto-Tune pair measurement did not preserve confirmation state"
+                                .to_string(),
+                        );
+                        }
+                    }
+                    capture.cleanup();
+                    let pair_records = evidence_store.load()?;
+                    match native_pair_confirmation_outcome(&proposal, &pair_records)? {
+                        NativePairConfirmationOutcome::Confirmed(pair_result) => {
+                            let (pair_path, pair_digest) =
+                                publish_native_pair_confirmation(job_directory, &pair_result)?;
+                            let pair_replay = append_replay_evidence(
+                                &evidence_store,
+                                &request,
+                                &worker_run_id,
+                                AutotunePhase::PairConfirmation,
+                                AutotuneEvidence::PairConfirmed {
+                                    digest: pair_digest,
+                                },
+                            )?;
+                            if pair_replay.next_action()? != AutotuneAction::CompareTopologies {
+                                return Err(
+                                "native Auto-Tune pair confirmation did not reach topology comparison"
                                     .to_string(),
                             );
-                        }
-                        let pair_records = evidence_store.load()?;
-                        let replayed_exhaustion = verify_native_pair_exhaustion_transaction(
-                            &request,
-                            &worker_run_id,
-                            &proposal,
-                            &pair_records,
-                        )?;
-                        if replayed_exhaustion != exhaustion {
-                            return Err(
-                                "native Auto-Tune pair-exhaustion replay changed canonical output"
+                            }
+                            let pair_records = evidence_store.load()?;
+                            let replayed_pair = verify_native_pair_confirmation_transaction(
+                                &request,
+                                &worker_run_id,
+                                &proposal,
+                                &pair_records,
+                                &pair_path,
+                            )?;
+                            if replayed_pair != pair_result {
+                                return Err(
+                                "native Auto-Tune pair-confirmation replay changed canonical output"
                                     .to_string(),
                             );
-                        }
-                        if pair_next_action == AutotuneAction::ConfirmMobileDownloadBypass {
-                            let _ = run_native_mobile_download_bypass_confirmation(
+                            }
+                            let topology_comparison = run_native_topology_comparison(
                                 &mut speedtest_session,
                                 &request,
                                 &worker_run_id,
@@ -16358,15 +17503,82 @@ where
                                 &store,
                                 &evidence_store,
                                 &proposal,
+                                &pair_result,
                                 &mut capture,
                                 &mut capture_sequence,
                                 &mut runtime_control_sequence,
                                 &mut remaining_traffic_budget,
+                                job_directory,
                                 terminate,
                             )?;
+                            let topology_records = evidence_store.load()?;
+                            let topology_replay = AutotuneReplayState::replay(
+                                &request,
+                                &worker_run_id,
+                                &topology_records,
+                            )?;
+                            if topology_replay.next_action()? != AutotuneAction::RestoreRuntime
+                                || topology_comparison.download.needs_repeat
+                                || topology_comparison.upload.needs_repeat
+                            {
+                                return Err("native Auto-Tune topology comparison is incomplete"
+                                    .to_string());
+                            }
                         }
-                        let raw_records = evidence_store.load()?;
-                        match AutotuneReplayState::replay(
+                        NativePairConfirmationOutcome::Exhausted(exhaustion) => {
+                            let exhaustion_digest = native_pair_exhaustion_digest(&exhaustion)?;
+                            let pair_replay = append_replay_evidence(
+                                &evidence_store,
+                                &request,
+                                &worker_run_id,
+                                AutotunePhase::PairConfirmation,
+                                AutotuneEvidence::PairExhausted {
+                                    digest: exhaustion_digest,
+                                },
+                            )?;
+                            let pair_next_action = pair_replay.next_action()?;
+                            if !matches!(
+                                pair_next_action,
+                                AutotuneAction::BuildRawFallback
+                                    | AutotuneAction::ConfirmMobileDownloadBypass
+                                    | AutotuneAction::RestoreRuntime
+                            ) {
+                                return Err(
+                                "native Auto-Tune pair exhaustion did not reach a bounded terminal path"
+                                    .to_string(),
+                            );
+                            }
+                            let pair_records = evidence_store.load()?;
+                            let replayed_exhaustion = verify_native_pair_exhaustion_transaction(
+                                &request,
+                                &worker_run_id,
+                                &proposal,
+                                &pair_records,
+                            )?;
+                            if replayed_exhaustion != exhaustion {
+                                return Err(
+                                "native Auto-Tune pair-exhaustion replay changed canonical output"
+                                    .to_string(),
+                            );
+                            }
+                            if pair_next_action == AutotuneAction::ConfirmMobileDownloadBypass {
+                                let _ = run_native_mobile_download_bypass_confirmation(
+                                    &mut speedtest_session,
+                                    &request,
+                                    &worker_run_id,
+                                    &permit,
+                                    &store,
+                                    &evidence_store,
+                                    &proposal,
+                                    &mut capture,
+                                    &mut capture_sequence,
+                                    &mut runtime_control_sequence,
+                                    &mut remaining_traffic_budget,
+                                    terminate,
+                                )?;
+                            }
+                            let raw_records = evidence_store.load()?;
+                            match AutotuneReplayState::replay(
                             &request,
                             &worker_run_id,
                             &raw_records,
@@ -16419,114 +17631,184 @@ where
                                 )
                             }
                         }
+                        }
                     }
                 }
             }
-        }
-        capture.cleanup();
-        let final_control = store.read_control()?.ok_or_else(|| {
-            "native Auto-Tune final runtime control disappeared before restoration".to_string()
-        })?;
-        if final_control.sequence != runtime_control_sequence {
-            return Err("native Auto-Tune final runtime control sequence changed".to_string());
-        }
-        permit.authorizes(
-            &request.identity.instance,
-            &final_control,
-            monotonic_boot_ms()?,
-        )?;
-        restore_runtime_voluntarily(&store, &permit, &final_control, terminate)?;
-        let restored_replay = append_replay_evidence(
-            &evidence_store,
-            &request,
-            &worker_run_id,
-            AutotunePhase::Restore,
-            AutotuneEvidence::RuntimeRestored,
-        )?;
-        let consumed_traffic_bytes = request
-            .traffic_budget_bytes
-            .checked_sub(remaining_traffic_budget)
-            .ok_or_else(|| "native Auto-Tune traffic accounting underflow".to_string())?;
-        match restored_replay.next_action()? {
-            AutotuneAction::PublishInconclusive { code } => {
-                publish_terminal_file(
-                    &terminal_path,
-                    &AutotuneTerminalRecord {
-                        job_id: request.identity.job_id.clone(),
-                        worker_run_id: worker_run_id.clone(),
-                        consumed_traffic_bytes,
-                        terminal: AutotuneTerminal::Inconclusive {
-                            code: code.to_string(),
-                        },
-                    },
-                )?;
-                return Ok(());
+            capture.cleanup();
+            let final_control = store.read_control()?.ok_or_else(|| {
+                "native Auto-Tune final runtime control disappeared before restoration".to_string()
+            })?;
+            if final_control.sequence != runtime_control_sequence {
+                return Err("native Auto-Tune final runtime control sequence changed".to_string());
             }
-            AutotuneAction::PublishReview => {}
-            _ => {
-                return Err(
+            permit.authorizes(
+                &request.identity.instance,
+                &final_control,
+                monotonic_boot_ms()?,
+            )?;
+            restore_runtime_voluntarily(&store, &permit, &final_control, terminate)?;
+            if permit.probe_accounting_required {
+                let retirement = super::autotune_runtime_store::ProbeRetirement {
+                    job_id: request.identity.job_id.clone(),
+                    worker_run_id: worker_run_id.clone(),
+                };
+                wait_for_probe_retirement_with(
+                    RUNTIME_RESTORE_WAIT,
+                    || store.request_probe_retirement(&retirement),
+                    thread::sleep,
+                )?;
+            }
+            let final_traffic_overrun = speedtest_session.checkpoint_owned_lifecycle(
+                &mut remaining_traffic_budget,
+                &mut |debit| {
+                    append_traffic_debit_evidence(
+                        &evidence_store,
+                        &request,
+                        &worker_run_id,
+                        AutotunePhase::Restore,
+                        TrafficDebitPurpose::Lifecycle,
+                        SpeedtestDirection::Both,
+                        debit,
+                    )
+                },
+            )?;
+            let restored_replay = append_replay_evidence(
+                &evidence_store,
+                &request,
+                &worker_run_id,
+                AutotunePhase::Restore,
+                AutotuneEvidence::RuntimeRestored,
+            )?;
+            let consumed_traffic_bytes = restored_replay.consumed_bytes;
+            if final_traffic_overrun {
+                return Err(SPEEDTEST_TRAFFIC_LIMIT_REACHED.into());
+            }
+            if request.traffic_budget.checked_sub(consumed_traffic_bytes)
+                != Some(remaining_traffic_budget)
+            {
+                return Err("native Auto-Tune traffic budget differs from restored replay".into());
+            }
+            match restored_replay.next_action()? {
+                AutotuneAction::PublishInconclusive { code } => {
+                    publish_terminal_file(
+                        &terminal_path,
+                        &AutotuneTerminalRecord {
+                            job_id: request.identity.job_id.clone(),
+                            worker_run_id: worker_run_id.clone(),
+                            consumed_traffic_bytes,
+                            terminal: AutotuneTerminal::Inconclusive {
+                                code: code.to_string(),
+                            },
+                        },
+                    )?;
+                    return Ok(());
+                }
+                AutotuneAction::PublishReview => {}
+                _ => return Err(
                     "native Auto-Tune runtime restoration did not unlock a terminal publication"
                         .to_string(),
-                )
+                ),
             }
-        }
-        let restored_records = evidence_store.load()?;
-        let review_bytes = canonical_native_review_bytes(
-            &request,
-            &worker_run_id,
-            &restored_records,
-            job_directory,
-        )?;
-        let review_digest = publish_native_review(&review_path, &review_bytes)?;
-        let apply_manifest_path =
-            job_directory.join(format!("apply-manifest-{worker_run_id}.json"));
-        let _apply_manifest_digest = publish_native_apply_manifest_transaction(
-            &request_path,
-            &review_path,
-            &apply_manifest_path,
-            &request.identity.job_id,
-            &worker_run_id,
-            &review_digest,
-            &permit.boot_id,
-            &permit.coordinator_generation,
-        )?;
-        let published_options = publish_native_apply_option_manifests_transaction(
-            &request_path,
-            &review_path,
-            &request.identity.job_id,
-            &worker_run_id,
-            &review_digest,
-            &permit.boot_id,
-            &permit.coordinator_generation,
-        )?;
-        if published_options.is_empty() {
-            return Err("native Auto-Tune Review published no Apply options".to_string());
-        }
-        let review_replay = append_replay_evidence(
-            &evidence_store,
-            &request,
-            &worker_run_id,
-            AutotunePhase::Review,
-            AutotuneEvidence::ReviewReady {
-                result_digest: review_digest.clone(),
-            },
-        )?;
-        if review_replay.next_action()? != AutotuneAction::Complete
-            || review_replay.review_digest.as_deref() != Some(review_digest.as_str())
-        {
-            return Err("native Auto-Tune Review publication did not reach Complete".to_string());
-        }
-        publish_terminal_file(
-            &terminal_path,
-            &AutotuneTerminalRecord {
+            let restored_records = evidence_store.load()?;
+            let review_bytes = canonical_native_review_bytes(
+                &request,
+                &worker_run_id,
+                &restored_records,
+                job_directory,
+            )?;
+            let review_digest = publish_native_review(&review_path, &review_bytes)?;
+            let apply_manifest_path =
+                job_directory.join(format!("apply-manifest-{worker_run_id}.json"));
+            let _apply_manifest_digest = publish_native_apply_manifest_transaction(
+                &request_path,
+                &review_path,
+                &apply_manifest_path,
+                &request.identity.job_id,
+                &worker_run_id,
+                &review_digest,
+                &permit.boot_id,
+                &permit.coordinator_generation,
+            )?;
+            let published_options = publish_native_apply_option_manifests_transaction(
+                &request_path,
+                &review_path,
+                &request.identity.job_id,
+                &worker_run_id,
+                &review_digest,
+                &permit.boot_id,
+                &permit.coordinator_generation,
+            )?;
+            if published_options.is_empty() {
+                return Err("native Auto-Tune Review published no Apply options".to_string());
+            }
+            let review_replay = append_replay_evidence(
+                &evidence_store,
+                &request,
+                &worker_run_id,
+                AutotunePhase::Review,
+                AutotuneEvidence::ReviewReady {
+                    result_digest: review_digest.clone(),
+                },
+            )?;
+            if review_replay.next_action()? != AutotuneAction::Complete
+                || review_replay.review_digest.as_deref() != Some(review_digest.as_str())
+            {
+                return Err(
+                    "native Auto-Tune Review publication did not reach Complete".to_string()
+                );
+            }
+            publish_terminal_file(
+                &terminal_path,
+                &AutotuneTerminalRecord {
+                    job_id: request.identity.job_id.clone(),
+                    worker_run_id: worker_run_id.clone(),
+                    consumed_traffic_bytes,
+                    terminal: AutotuneTerminal::Complete { review_digest },
+                },
+            )?;
+            Ok(())
+        })();
+        let persistence_failed = measurement_result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.starts_with("speedtest-owned-persistence-failed:"));
+        retire_probes_after_worker_failure(measurement_result, || {
+            if !permit.probe_accounting_required {
+                return Ok(());
+            }
+            let retirement = super::autotune_runtime_store::ProbeRetirement {
                 job_id: request.identity.job_id.clone(),
                 worker_run_id: worker_run_id.clone(),
-                consumed_traffic_bytes,
-                terminal: AutotuneTerminal::Complete { review_digest },
-            },
-        )?;
-        Ok(())
+            };
+            wait_for_probe_retirement_with(
+                RUNTIME_RESTORE_WAIT,
+                || store.request_probe_retirement(&retirement),
+                thread::sleep,
+            )?;
+            if persistence_failed {
+                // Leave the uncertain intent for read-only cutoff/journal
+                // reconciliation; never attempt another append with this cursor.
+                return Ok(());
+            }
+            let mut remaining = request.traffic_budget;
+            speedtest_session.checkpoint_owned_lifecycle(&mut remaining, &mut |debit| {
+                append_traffic_debit_evidence(
+                    &evidence_store,
+                    &request,
+                    &worker_run_id,
+                    AutotunePhase::Restore,
+                    TrafficDebitPurpose::Lifecycle,
+                    SpeedtestDirection::Both,
+                    debit,
+                )
+            })?;
+            Ok(())
+        })
     })();
+    if worker_result.is_err() && request.traffic_policy_explicit && !owned_admission_attempted {
+        publish_unstarted_traffic_receipt(job_directory, &request, &worker_run_id)?;
+    }
     match worker_result {
         Err(error) if terminate.load(Ordering::Relaxed) => {
             publish_replayed_terminal(
@@ -16552,6 +17834,7 @@ where
                 &request,
                 &worker_run_id,
                 &evidence_store,
+                &error,
             )
         }
         Err(error) => {
@@ -16574,12 +17857,17 @@ where
 }
 
 fn wait_for_capture_state(
+    session: &EmbeddedSpeedtestSession,
     snapshot_path: &Path,
     request: &AutotuneCaptureRequest,
     target: CaptureWaitTarget,
     terminate: &AtomicBool,
 ) -> Result<AutotuneCaptureSnapshot, CaptureWaitError> {
+    let mut budget_watch = session.owned_budget_watch(0)?;
     loop {
+        if let Some(watch) = &mut budget_watch {
+            watch.check_wait(session)?;
+        }
         if terminate.load(Ordering::Relaxed) {
             return Err(CaptureWaitError::Failure(
                 "native Auto-Tune capture was cancelled".to_string(),
@@ -16663,12 +17951,20 @@ pub(crate) fn is_immediately_prior_capture_snapshot(
 }
 
 pub(crate) fn wait_for_runtime_applied(
+    session: Option<&EmbeddedSpeedtestSession>,
     store: &RuntimeOverrideStore,
     permit: &super::autotune_runtime::AutotuneRuntimePermit,
     control: &AutotuneRuntimeControl,
     terminate: &AtomicBool,
 ) -> Result<(), String> {
+    let mut budget_watch = session
+        .map(|session| session.owned_budget_watch(0))
+        .transpose()?
+        .flatten();
     loop {
+        if let (Some(watch), Some(session)) = (&mut budget_watch, session) {
+            watch.check_wait(session)?;
+        }
         if terminate.load(Ordering::Relaxed) {
             return Err("native Auto-Tune was cancelled before APPLIED".to_string());
         }
@@ -16698,6 +17994,43 @@ pub(crate) fn wait_for_runtime_applied(
             return Err("native Auto-Tune worker identity changed before APPLIED".to_string());
         }
         thread::sleep(RUNTIME_ACK_POLL);
+    }
+}
+
+// Only the owning daemon/runtime may issue the receipt after stopping/joining
+// its probes. Worker terminal publication must not race those live generators.
+fn retire_probes_after_worker_failure(
+    result: Result<(), String>,
+    retire: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let Err(original) = result else {
+        return Ok(());
+    };
+    match retire() {
+        Ok(()) => Err(original),
+        Err(error) => Err(format!(
+            "speedtest-owned-budget-observation-failed: producer retirement: {error}; worker: {original}"
+        )),
+    }
+}
+
+fn wait_for_probe_retirement_with(
+    timeout: Duration,
+    mut poll: impl FnMut() -> Result<bool, String>,
+    mut wait: impl FnMut(Duration),
+) -> Result<(), String> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or("probe retirement deadline overflow")?;
+    loop {
+        if poll().map_err(|error| format!("native Auto-Tune probe retirement failed: {error}"))? {
+            return Ok(());
+        }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|value| !value.is_zero())
+            .ok_or("native Auto-Tune probe retirement timed out")?;
+        wait(RUNTIME_ACK_POLL.min(remaining));
     }
 }
 
@@ -16861,6 +18194,7 @@ pub(crate) fn validate_runtime_permit_admission(
         || permit.instance_name != request.identity.instance
         || permit.target_interface != request.identity.target_interface
         || permit.route_fingerprint != request.identity.route_fingerprint
+        || permit.dns_server != request.route.dns_server
         || permit.sqm_fingerprint != request.identity.sqm_fingerprint
         || permit.maximum_sequence != policy.maximum_sequence
         || permit.allow_bypass_download != policy.allow_directional_bypass
@@ -17076,7 +18410,8 @@ fn raw_control_capacity_from_starved_load(
 fn validate_digest_fields(evidence: &AutotuneEvidence) -> Result<(), String> {
     match evidence {
         AutotuneEvidence::RawControlCapacity(value) => validate_raw_control_capacity(*value),
-        AutotuneEvidence::ProposalBuilt { digest }
+        AutotuneEvidence::ServerSelected { digest }
+        | AutotuneEvidence::ProposalBuilt { digest }
         | AutotuneEvidence::PairConfirmed { digest }
         | AutotuneEvidence::TopologiesCompared { digest }
         | AutotuneEvidence::RawFallbackBuilt { digest }
@@ -17254,12 +18589,15 @@ mod tests {
             speedtest_server_id: None,
             speedtest_topology: None,
             route: OperationRouteIdentity {
+                dns_server: None,
+                device_ifindex: None,
                 mode: OperationRouteMode::Main,
                 mwan3_member: None,
                 l3_device: "pppoe-wan".to_string(),
                 source_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
                 fwmark: None,
                 routing_table: None,
+                fwmark_mask: None,
             },
             target_state: OperationTargetState::ExistingManaged,
             capture_policy: None,
@@ -17275,7 +18613,11 @@ mod tests {
             allow_sqm_disable: true,
             allow_active_traffic: false,
             scheduled_auto_apply_requested: false,
-            traffic_budget_bytes: budget,
+            traffic_budget: crate::operations::protocol::TrafficPolicy::Capped {
+                max_bytes: budget,
+            },
+            traffic_policy_explicit: false,
+            traffic_plan: None,
         }
     }
 
@@ -17348,6 +18690,8 @@ mod tests {
     ) -> AutotuneRuntimePermit {
         let policy = native_autotune_runtime_permit_policy(operation).unwrap();
         AutotuneRuntimePermit {
+            dns_server: None,
+            probe_accounting_required: false,
             kind: super::super::autotune_runtime::RuntimePermitKind::Autotune,
             permit_id: "77".repeat(16),
             job_id: operation.identity.job_id.clone(),
@@ -17954,9 +19298,122 @@ mod tests {
         ProfileSearchResult,
         ProfileSearchResult,
     ) {
+        pair_search_records_with_server_selection(None, false)
+    }
+
+    fn pair_search_records_with_server_selection(
+        directory: Option<&Path>,
+        unlimited: bool,
+    ) -> (
+        OperationRequest,
+        AutotuneProposal,
+        Vec<AutotuneEvidenceRecord>,
+        ProfileSearchResult,
+        ProfileSearchResult,
+    ) {
         let mut operation = request(CalibrationStrategy::FullRaw, 1_000_000_000);
         operation.profile = Some(AutotuneProfile::BestOverall);
+        // Source-comparison fixtures model current explicit-policy requests;
+        // the None branch remains the frozen legacy review fixture.
+        operation.traffic_policy_explicit = directory.is_some();
+        if unlimited {
+            operation.traffic_budget = super::super::protocol::TrafficPolicy::Unlimited;
+            operation.traffic_policy_explicit = true;
+            // Leave a valid nonzero timestamp for the prior-history fixture.
+            operation.created_unix_ms = 2;
+        }
         let mut records = proposal_ready_records(CalibrationStrategy::FullRaw);
+        if let Some(directory) = directory {
+            let control = AutotuneRuntimeControl {
+                permit_id: "77".repeat(16),
+                job_id: operation.identity.job_id.clone(),
+                worker_run_id: "66".repeat(16),
+                boot_id: "33".repeat(16),
+                coordinator_generation: "44".repeat(16),
+                worker: ProcessIdentity {
+                    pid: 100,
+                    process_group: 100,
+                    starttime_ticks: 500,
+                },
+                sequence: 1,
+                deadline_boot_ms: 30_000,
+                target_interface: operation.identity.target_interface.clone(),
+                route_fingerprint: operation.identity.route_fingerprint.clone(),
+                sqm_fingerprint: operation.identity.sqm_fingerprint.clone(),
+                topology: MeasurementTopology::RawBoth,
+                download_kbps: None,
+                upload_kbps: None,
+            };
+            let comparisons: Vec<_> = (0..7)
+                .map(|index| {
+                    let id = (index != 0).then_some(if index % 2 == 1 { 1 } else { 2 });
+                    super::super::server_qualification::Comparison {
+                        index,
+                        candidate_id: id,
+                        server_id: id,
+                        server_name: format!("test-server-{index}"),
+                        server_sponsor: format!("test-provider-{}", id.unwrap_or(0)),
+                        endpoint_host: id.map(|id| format!("source-{id}.example.invalid")),
+                        endpoint_sha256: id.map(|id| format!("{id:064x}")),
+                        display_metadata_truncated: false,
+                        started_boot_ms: 100 + index as u64 * 2000,
+                        elapsed_ms: 2000,
+                        debit_offset: index as u32,
+                        debit_count: 1,
+                        download_kbps: id.map(|id| if id == 1 { 16_750 } else { 90_000 }),
+                        upload_kbps: id.map(|_| 45_000),
+                        valid: id.is_some(),
+                        code: if id.is_some() {
+                            "valid-observation"
+                        } else {
+                            "server-list-complete"
+                        }
+                        .into(),
+                    }
+                })
+                .collect();
+            let insert_at = records
+                .iter()
+                .position(|record| {
+                    matches!(record.evidence, AutotuneEvidence::RuntimeMutationArmed)
+                })
+                .unwrap()
+                + 1;
+            let first = insert_at as u32 + 1;
+            let digest = publish_server_comparison_report(
+                directory,
+                &operation,
+                &"66".repeat(16),
+                &control,
+                first,
+                &comparisons,
+                Some(&Ok(Some(2))),
+            )
+            .unwrap();
+            let mut qualification: Vec<_> = (0..7)
+                .map(|offset| {
+                    record(
+                        first + offset,
+                        AutotunePhase::RawControls,
+                        AutotuneEvidence::TrafficDebit(TrafficDebitEvidence {
+                            purpose: TrafficDebitPurpose::CapacityQualification,
+                            direction: SpeedtestDirection::Both,
+                            rx_bytes: 1000,
+                            tx_bytes: 1000,
+                        }),
+                    )
+                })
+                .collect();
+            qualification.push(record(
+                first + 7,
+                AutotunePhase::RawControls,
+                AutotuneEvidence::ServerSelected { digest },
+            ));
+            records.splice(insert_at..insert_at, qualification);
+            for (index, record) in records.iter_mut().enumerate() {
+                record.sequence = index as u32 + 1;
+            }
+        }
         let proposal = build_native_proposal_from_evidence(
             &operation,
             &"66".repeat(16),
@@ -18241,7 +19698,7 @@ mod tests {
         assert!(!policy.allow_directional_bypass);
         assert_eq!(
             policy.maximum_sequence,
-            1 + (MAX_PROFILE_SEARCH_OBSERVATIONS * 2) as u32
+            2 + (MAX_PROFILE_SEARCH_OBSERVATIONS * 2) as u32
                 + MAX_PROFILE_REVIEW_OPTIONS as u32
                 + MAX_RUNTIME_ROUTE_REARMS
         );
@@ -21351,10 +22808,10 @@ mod tests {
             })
             .sum::<u64>();
         let mut exact_budget = operation.clone();
-        exact_budget.traffic_budget_bytes = consumed_bytes;
+        exact_budget.traffic_budget = consumed_bytes.into();
         AutotuneReplayState::replay(&exact_budget, &"66".repeat(16), &records).unwrap();
         let mut short_budget = operation.clone();
-        short_budget.traffic_budget_bytes = consumed_bytes - 1;
+        short_budget.traffic_budget = (consumed_bytes - 1).into();
         assert!(
             AutotuneReplayState::replay(&short_budget, &"66".repeat(16), &records)
                 .unwrap_err()
@@ -21717,8 +23174,234 @@ mod tests {
 
     #[test]
     fn private_review_is_exactly_bound_and_never_reapplies_a_rate_transform() {
-        let (operation, proposal, mut records, download, upload) = pair_search_records();
+        exercise_private_review_binding(false, false);
+    }
+
+    #[test]
+    fn t1_selected_server_report_binds_review_apply_and_public_result() {
+        exercise_private_review_binding(true, false);
+    }
+
+    #[test]
+    fn t1_raw_capacity_drop_guard_is_phase_scoped_and_rechecked_from_report() {
+        let root = private_temp_directory("qualified-raw-drop");
+        let (operation, _, records, _, _) =
+            pair_search_records_with_server_selection(Some(&root), false);
+        let worker = "66".repeat(16);
+        assert!(
+            verify_server_comparison_report(&root, &operation, &worker, &records)
+                .unwrap()
+                .is_some()
+        );
+        let reference = super::super::server_qualification::QualifiedCapacity {
+            download_kbps: 90_000,
+            upload_kbps: 45_000,
+        };
+        let check = |phase, topology, rate, qualified| {
+            attest_qualified_raw_control(
+                &operation,
+                phase,
+                topology,
+                SpeedtestDirection::Download,
+                Some(rate),
+                qualified,
+            )
+        };
+        assert_eq!(
+            check(
+                AutotunePhase::RawControls,
+                MeasurementTopology::RawBoth,
+                16_750,
+                Some(reference)
+            )
+            .unwrap_err(),
+            "server-or-link-capacity-changed"
+        );
+        assert!(check(
+            AutotunePhase::RawControls,
+            MeasurementTopology::RawBoth,
+            90_000,
+            None
+        )
+        .is_err());
+        assert!(check(
+            AutotunePhase::RawControls,
+            MeasurementTopology::RawDownload,
+            16_750,
+            Some(reference)
+        )
+        .is_err());
+        for (phase, topology) in [
+            (AutotunePhase::RawControls, MeasurementTopology::ShapedBoth),
+            (AutotunePhase::RawControls, MeasurementTopology::RawUpload),
+            (
+                AutotunePhase::DirectionalSearch,
+                MeasurementTopology::ShapedBoth,
+            ),
+            (
+                AutotunePhase::PairConfirmation,
+                MeasurementTopology::ShapedBoth,
+            ),
+            (
+                AutotunePhase::TopologyComparison,
+                MeasurementTopology::RawBoth,
+            ),
+        ] {
+            assert!(check(phase, topology, 10_000, None).is_ok());
+        }
+        for direction in [SpeedtestDirection::Download, SpeedtestDirection::Upload] {
+            let mut changed = records.clone();
+            let raw = changed
+                .iter_mut()
+                .find_map(|record| match &mut record.evidence {
+                    AutotuneEvidence::Measurement(value)
+                        if record.phase == AutotunePhase::RawControls
+                            && value.topology == MeasurementTopology::RawBoth
+                            && value.direction == direction =>
+                    {
+                        Some(value)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            match direction {
+                SpeedtestDirection::Download => raw.achieved_dl_kbps = Some(16_750),
+                SpeedtestDirection::Upload => raw.achieved_ul_kbps = Some(8_000),
+                SpeedtestDirection::Both => unreachable!(),
+            }
+            assert_eq!(
+                verify_server_comparison_report(&root, &operation, &worker, &changed).unwrap_err(),
+                "server-or-link-capacity-changed"
+            );
+        }
+        assert_eq!(
+            worker_failure_terminal_code("server-or-link-capacity-changed"),
+            "server-or-link-capacity-changed"
+        );
+        let mut capacity_only = records.clone();
+        let slot = capacity_only.iter_mut().find(|record| matches!(record.evidence,
+            AutotuneEvidence::Measurement(value) if record.phase == AutotunePhase::RawControls
+                && value.topology == MeasurementTopology::RawBoth && value.direction == SpeedtestDirection::Download
+        )).unwrap();
+        let low = raw_capacity(
+            MeasurementTopology::RawBoth,
+            SpeedtestDirection::Download,
+            16_750,
+        );
+        validate_raw_control_capacity(low).unwrap();
+        slot.evidence = AutotuneEvidence::RawControlCapacity(low);
+        assert_eq!(
+            verify_server_comparison_report(&root, &operation, &worker, &capacity_only)
+                .unwrap_err(),
+            "server-or-link-capacity-changed"
+        );
+        let failure = CaptureWaitError::Failure("server-or-link-capacity-changed".into());
+        assert!(!failure.is_restartable_measurement_basis_loss());
+        assert!(!failure.requires_route_rearm());
+        assert_eq!(String::from(failure), "server-or-link-capacity-changed");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn t2_unlimited_policy_reaches_review_apply_and_public_result() {
+        exercise_private_review_binding(true, true);
+    }
+
+    #[test]
+    fn t2_failed_worker_retires_before_terminal_and_keeps_accounting_fault_on_cancel() {
+        let calls = std::cell::Cell::new(0);
+        let error = retire_probes_after_worker_failure(Err("cancelled".into()), || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(error, "cancelled");
+        assert_eq!(
+            worker_error_terminal(&error, true),
+            AutotuneTerminal::Cancelled
+        );
+        for fault in [
+            "receipt timeout",
+            "owner mismatch",
+            "checkpoint write failed",
+        ] {
+            let error =
+                retire_probes_after_worker_failure(Err("cancelled".into()), || Err(fault.into()))
+                    .unwrap_err();
+            assert!(error.contains(fault));
+            assert!(terminal_traffic_is_unknown(&worker_error_terminal(
+                &error, true
+            )));
+        }
+        retire_probes_after_worker_failure(Ok(()), || {
+            panic!("successful path already retired before publishing its terminal")
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn t2_worker_terminal_waits_for_owner_probe_retirement_receipt() {
+        assert_eq!(
+            worker_failure_terminal_code(
+                "speedtest-owned-budget-observation-failed: counter reset"
+            ),
+            "owned-traffic-accounting-failed"
+        );
+        assert_eq!(
+            worker_failure_terminal_code("speedtest-budget-watcher-panicked"),
+            "owned-traffic-accounting-failed"
+        );
+        assert!(terminal_traffic_is_unknown(&AutotuneTerminal::Failed {
+            code: "owned-traffic-accounting-failed".into()
+        }));
+        let mut polls = 0;
+        let mut waits = 0;
+        wait_for_probe_retirement_with(
+            Duration::from_secs(1),
+            || {
+                polls += 1;
+                Ok(polls == 3)
+            },
+            |duration| {
+                assert!(duration <= RUNTIME_ACK_POLL);
+                waits += 1;
+            },
+        )
+        .unwrap();
+        assert_eq!((polls, waits), (3, 2));
+        assert!(wait_for_probe_retirement_with(
+            Duration::ZERO,
+            || Ok(false),
+            |_| panic!("expired retirement must not wait")
+        )
+        .unwrap_err()
+        .contains("retirement timed out"));
+        assert!(wait_for_probe_retirement_with(
+            Duration::ZERO,
+            || Ok(true),
+            |_| panic!("existing receipt needs no wait")
+        )
+        .is_ok());
+        let error = wait_for_probe_retirement_with(
+            Duration::from_secs(1),
+            || Err("owner mismatch".into()),
+            |_| panic!("owner error cannot be retried"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "native Auto-Tune probe retirement failed: owner mismatch"
+        );
+    }
+
+    fn exercise_private_review_binding(with_server_selection: bool, unlimited: bool) {
         let root = private_temp_directory("private-review");
+        let (operation, proposal, mut records, download, upload) =
+            pair_search_records_with_server_selection(
+                with_server_selection.then_some(root.as_path()),
+                unlimited,
+            );
         let request_path = root.join("request");
         atomic_private_write(&request_path, operation.encode().unwrap().as_bytes()).unwrap();
 
@@ -21796,6 +23479,18 @@ mod tests {
         let review_bytes =
             canonical_native_review_bytes(&operation, &"66".repeat(16), &records, &root).unwrap();
         let review_text = String::from_utf8(review_bytes.clone()).unwrap();
+        if with_server_selection {
+            assert!(review_text.contains("\"native_review_schema_version\":3"));
+            assert!(review_text.contains("\"server_comparison\""));
+            let report_path = root.join(SERVER_COMPARISON_FILE);
+            let report_bytes = fs::read(&report_path).unwrap();
+            fs::write(&report_path, b"{}").unwrap();
+            assert!(
+                canonical_native_review_bytes(&operation, &"66".repeat(16), &records, &root)
+                    .is_err()
+            );
+            fs::write(&report_path, report_bytes).unwrap();
+        }
         assert!(review_text.contains("\"throughput_unit\":\"kbit/s\""));
         assert!(review_text.contains("\"proposal_rate_transform\":\"none\""));
         assert!(!review_text.contains(&operation.identity.job_token));
@@ -21812,7 +23507,7 @@ mod tests {
             &operation.identity.job_id,
             &"66".repeat(16),
             &review_digest,
-            "boot-id",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &coordinator_generation,
         )
         .unwrap();
@@ -21823,7 +23518,7 @@ mod tests {
             &operation.identity.job_id,
             &"66".repeat(16),
             &review_digest,
-            "boot-id",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &coordinator_generation,
         )
         .unwrap();
@@ -21833,7 +23528,7 @@ mod tests {
             &operation.identity.job_id,
             &"66".repeat(16),
             &review_digest,
-            "boot-id",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &coordinator_generation,
         )
         .unwrap();
@@ -21854,7 +23549,7 @@ mod tests {
                 &operation.identity.job_id,
                 &"66".repeat(16),
                 &review_digest,
-                "boot-id",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 &coordinator_generation,
                 "bypass_download",
             )
@@ -21890,7 +23585,7 @@ mod tests {
                 &operation.identity.job_id,
                 &"66".repeat(16),
                 &review_digest,
-                "boot-id",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 &coordinator_generation,
                 "no_sqm",
             )
@@ -21913,7 +23608,7 @@ mod tests {
             &operation.identity.job_id,
             &"66".repeat(16),
             &review_digest,
-            "boot-id",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &coordinator_generation,
             "no_sqm",
         )
@@ -21944,7 +23639,7 @@ mod tests {
                 &operation.identity.job_id,
                 &"66".repeat(16),
                 &review_digest,
-                "boot-id",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 &coordinator_generation,
             )
             .unwrap(),
@@ -21963,13 +23658,22 @@ mod tests {
                 &operation.identity.job_id,
                 &"66".repeat(16),
                 &review_digest,
-                "boot-id",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 &coordinator_generation,
             )
             .unwrap(),
             manifest_digest
         );
         let manifest_text = String::from_utf8(expected_manifest.clone()).unwrap();
+        if unlimited {
+            assert!(manifest_text.contains("\"traffic_budget_bytes\":null"));
+            assert_eq!(
+                OperationRequest::decode(&fs::read_to_string(&request_path).unwrap())
+                    .unwrap()
+                    .traffic_budget,
+                super::super::protocol::TrafficPolicy::Unlimited
+            );
+        }
         assert!(manifest_text.contains("\"state\":\"confirmation_ready\""));
         assert!(manifest_text.contains("\"apply_enabled\":true"));
         assert!(manifest_text.contains("\"action\":\"disable_sqm\""));
@@ -21986,7 +23690,7 @@ mod tests {
             &operation.identity.job_id,
             &"66".repeat(16),
             &review_digest,
-            "boot-id",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &coordinator_generation,
         )
         .unwrap_err()
@@ -21998,7 +23702,7 @@ mod tests {
             &operation.identity.job_id,
             &"66".repeat(16),
             &review_digest,
-            "boot-id",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &coordinator_generation,
         )
         .unwrap_err()
@@ -22012,11 +23716,42 @@ mod tests {
             &operation.identity.job_id,
             &"66".repeat(16),
             &review_digest,
-            "boot-id",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &coordinator_generation,
         )
         .unwrap();
         let public = String::from_utf8(public).unwrap();
+        let projected: serde_json::Value = serde_json::from_str(&public).unwrap();
+        if with_server_selection {
+            let comparison = &projected["server_comparison"];
+            for private in [
+                "endpoint_host",
+                "endpoint_sha256",
+                "source-1.example.invalid",
+                "source-2.example.invalid",
+            ] {
+                assert!(!public.contains(private));
+            }
+            assert_eq!(comparison["schema_version"], 1);
+            assert_eq!(comparison["selected_server_id"], 2);
+            assert_eq!(comparison["proof_status"], "source-comparison-only");
+            assert_eq!(comparison["observations"].as_array().unwrap().len(), 6);
+            for private in [
+                "control",
+                "control_sha256",
+                "request_sha256",
+                "route_fingerprint",
+                "worker_run_id",
+            ] {
+                assert!(comparison.get(private).is_none());
+            }
+            for row in comparison["observations"].as_array().unwrap() {
+                assert!(row.get("started_boot_ms").is_none());
+                assert!(row.get("debit_offset").is_none());
+            }
+        } else {
+            assert!(projected.get("server_comparison").is_none());
+        }
         assert!(public.contains("\"native_public_schema_version\":3"));
         assert!(public.contains("\"proposal_rate_transform\":\"none\""));
         assert!(public.contains("\"public_apply_contract\":{\"schema_version\":3"));
@@ -22044,11 +23779,19 @@ mod tests {
             &operation.identity.job_id,
             &"66".repeat(16),
             &review_digest,
-            "boot-id",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &coordinator_generation,
         )
         .unwrap();
         assert_eq!(fs::read(&public_path).unwrap(), public.as_bytes());
+        if with_server_selection && unlimited {
+            crate::operations::coordinator::exercise_history_publication_from_canonical_fixture(
+                &root,
+                &operation,
+                &"66".repeat(16),
+                &review_digest,
+            );
+        }
         assert_eq!(
             fs::metadata(&public_path).unwrap().permissions().mode() & 0o777,
             0o600
@@ -22062,12 +23805,37 @@ mod tests {
                 &operation.identity.job_id,
                 &"66".repeat(16),
                 &review_digest,
-                "boot-id",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 &coordinator_generation,
             )
             .unwrap(),
             public_digest
         );
+
+        if with_server_selection {
+            let report_path = root.join(SERVER_COMPARISON_FILE);
+            let report_bytes = fs::read(&report_path).unwrap();
+            fs::write(&report_path, b"{}").unwrap();
+            assert!(verify_native_review_transaction(
+                &request_path,
+                &review_path,
+                &operation.identity.job_id,
+                &"66".repeat(16),
+                &review_digest
+            )
+            .is_err());
+            assert!(native_apply_execution_plan_transaction(
+                &request_path,
+                &review_path,
+                &operation.identity.job_id,
+                &"66".repeat(16),
+                &review_digest,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &coordinator_generation
+            )
+            .is_err());
+            fs::write(&report_path, report_bytes).unwrap();
+        }
 
         fs::write(&review_path, b"{}\n").unwrap();
         fs::set_permissions(&review_path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -22085,7 +23853,7 @@ mod tests {
     #[test]
     fn contaminated_topology_repeats_are_bounded_and_manual_only() {
         let (mut operation, proposal, mut records, pair) = topology_ready_records();
-        operation.traffic_budget_bytes = MAX_OPERATION_TRAFFIC_BUDGET_BYTES;
+        operation.traffic_budget = MAX_OPERATION_TRAFFIC_BUDGET_BYTES.into();
         for record in &mut records {
             if let AutotuneEvidence::Measurement(value) = &mut record.evidence {
                 if record.phase == AutotunePhase::RawControls
@@ -22151,12 +23919,12 @@ mod tests {
                 }
             }
         }
-        operation.traffic_budget_bytes = MAX_OPERATION_TRAFFIC_BUDGET_BYTES;
+        operation.traffic_budget = MAX_OPERATION_TRAFFIC_BUDGET_BYTES.into();
         let replay =
             AutotuneReplayState::replay(&operation, &records[0].worker_run_id, &records).unwrap();
         let required =
             minimum_speedtest_traffic_budget_bytes(SpeedtestDirection::Upload, 0, MAX_RATE_KBPS);
-        operation.traffic_budget_bytes = replay.consumed_bytes + required - 1;
+        operation.traffic_budget = (replay.consumed_bytes + required - 1).into();
 
         let result = native_topology_comparison_result(&operation, &proposal, &records).unwrap();
         assert!(!result.upload.needs_repeat);
@@ -22166,8 +23934,10 @@ mod tests {
         assert!(!result.auto_apply_pass);
         assert!(result.manual_review_required);
         assert_eq!(
-            replay_remaining_traffic_budget(&operation, &records).unwrap(),
-            required - 1
+            replay_remaining_traffic_budget(&operation, &records)
+                .unwrap()
+                .limit_bytes(),
+            Some(required - 1)
         );
         let acknowledgements =
             native_topology_apply_acknowledgements(&pair, &result, result.selected_topology)
@@ -22181,7 +23951,7 @@ mod tests {
                 .contains(&NativeApplyAcknowledgement::TopologyComparisonTrafficBudget));
         }
 
-        operation.traffic_budget_bytes += 1;
+        operation.traffic_budget = (operation.traffic_budget.limit_bytes().unwrap() + 1).into();
         let funded = native_topology_comparison_result(&operation, &proposal, &records).unwrap();
         assert!(funded.upload.needs_repeat);
         assert_ne!(funded.upload.reason, "traffic-budget-limited");
@@ -22316,6 +24086,69 @@ mod tests {
     }
 
     #[test]
+    fn t2_terminal_usage_above_capped_setting_bound_has_exact_versioned_encoding() {
+        for bytes in [
+            MAX_OPERATION_TRAFFIC_BUDGET_BYTES,
+            MAX_OPERATION_TRAFFIC_BUDGET_BYTES + 1,
+            u64::MAX,
+        ] {
+            let record = AutotuneTerminalRecord {
+                job_id: "11".repeat(16),
+                worker_run_id: "66".repeat(16),
+                consumed_traffic_bytes: bytes,
+                terminal: AutotuneTerminal::Cancelled,
+            };
+            let encoded = record.encode().unwrap();
+            let header = if bytes > MAX_OPERATION_TRAFFIC_BUDGET_BYTES {
+                EXTENDED_TERMINAL_HEADER
+            } else {
+                TERMINAL_HEADER
+            };
+            assert!(encoded.starts_with(header));
+            assert_eq!(AutotuneTerminalRecord::decode(&encoded).unwrap(), record);
+            let other_header = if header == TERMINAL_HEADER {
+                EXTENDED_TERMINAL_HEADER
+            } else {
+                TERMINAL_HEADER
+            };
+            assert!(
+                AutotuneTerminalRecord::decode(&encoded.replacen(header, other_header, 1)).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn t2_progress_usage_is_optional_for_legacy_and_exact_for_new_records() {
+        let mut progress = NativeAutotuneProgress::coordinator_state(
+            NativeAutotuneProgressStep::PreparingMeasurements,
+            10,
+        );
+        progress.job_id = "11".repeat(16);
+        progress.worker_run_id = "66".repeat(16);
+        progress.evidence_sequence = 1;
+        let legacy = progress.encode().unwrap();
+        assert!(legacy.starts_with(PROGRESS_HEADER));
+        assert_eq!(
+            NativeAutotuneProgress::decode(&legacy)
+                .unwrap()
+                .consumed_traffic_bytes,
+            None
+        );
+        for bytes in [0, 1_200, 2_u64 << 40, u64::MAX] {
+            progress.consumed_traffic_bytes = Some(bytes);
+            let encoded = progress.encode().unwrap();
+            assert!(encoded.starts_with(TRAFFIC_PROGRESS_HEADER));
+            assert_eq!(NativeAutotuneProgress::decode(&encoded).unwrap(), progress);
+            assert!(NativeAutotuneProgress::decode(&encoded.replacen(
+                TRAFFIC_PROGRESS_HEADER,
+                PROGRESS_HEADER,
+                1
+            ))
+            .is_err());
+        }
+    }
+
+    #[test]
     fn terminal_record_is_identity_bound_canonical_and_versioned() {
         for terminal in [
             AutotuneTerminal::Complete {
@@ -22343,6 +24176,30 @@ mod tests {
 
     #[test]
     fn worker_error_terminal_preserves_failure_but_types_requested_termination_as_cancelled() {
+        let persistence = worker_error_terminal(
+            "speedtest-owned-persistence-failed: append outcome uncertain",
+            true,
+        );
+        assert_eq!(
+            persistence,
+            AutotuneTerminal::Failed {
+                code: "owned-traffic-persistence-failed".into()
+            }
+        );
+        assert!(!terminal_traffic_is_unknown(&persistence),
+            "storage interruption may enter exact journal/cutoff verification; it is not accepted without that verification");
+        for error in [
+            "speedtest-owned-budget-observation-failed: missing counters",
+            "speedtest-owned-budget-observation-failed: persistence: ambiguous append",
+            "owned traffic counter reset",
+            "speedtest-budget-watcher-panicked",
+            "speedtest-counter-reset",
+            "speedtest-accounting-missing",
+        ] {
+            let terminal = worker_error_terminal(error, true);
+            assert!(terminal_traffic_is_unknown(&terminal), "{error}");
+            assert_eq!(terminal, worker_error_terminal(error, false));
+        }
         assert_eq!(
             worker_error_terminal("native Auto-Tune capture was cancelled", true),
             AutotuneTerminal::Cancelled
@@ -22468,6 +24325,242 @@ mod tests {
     }
 
     #[test]
+    fn t2_unstarted_zero_requires_bound_proof_and_no_checkpoint() {
+        let directory = private_temp_directory("unstarted-zero");
+        let path = directory.join("request");
+        let worker = "66".repeat(16);
+        let mut operation = request(CalibrationStrategy::FullRaw, 10_000);
+        operation.traffic_policy_explicit = true;
+        atomic_private_write(&path, operation.encode().unwrap().as_bytes()).unwrap();
+        assert!(
+            verify_terminal_consumed_traffic(&path, &operation.identity.job_id, &worker, 0)
+                .is_err()
+        );
+        publish_unstarted_traffic_receipt(&directory, &operation, &worker).unwrap();
+        assert_eq!(
+            verify_terminal_consumed_traffic(&path, &operation.identity.job_id, &worker, 0)
+                .unwrap(),
+            0
+        );
+        assert!(
+            verify_terminal_consumed_traffic(&path, &operation.identity.job_id, &worker, 1)
+                .is_err()
+        );
+        operation.traffic_budget = 20_000_u64.into();
+        assert!(verified_unstarted_traffic_receipt(&directory, &operation, &worker).is_err());
+        operation.traffic_budget = 10_000_u64.into();
+        atomic_private_write(
+            &directory.join(format!("owned-traffic-checkpoint-{worker}")),
+            b"unexpected",
+        )
+        .unwrap();
+        assert!(
+            verify_terminal_consumed_traffic(&path, &operation.identity.job_id, &worker, 0)
+                .is_err()
+        );
+        assert!(!directory.join(EVIDENCE_DIR).exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn t2_terminal_settlement_includes_cutoff_tail_without_rewriting_worker_evidence() {
+        let directory = private_temp_directory("cutoff-tail-settlement");
+        let request_path = directory.join("request");
+        let worker = "66".repeat(16);
+        let mut operation = request(CalibrationStrategy::FullRaw, 10_000);
+        operation.traffic_policy_explicit = true;
+        let encoded = operation.encode().unwrap();
+        atomic_private_write(&request_path, encoded.as_bytes()).unwrap();
+        let digest = super::super::autotune_apply::native_apply_sha256_hex(encoded.as_bytes());
+        let store = AutotuneEvidenceStore::open(&directory).unwrap();
+        for value in [
+            record(
+                1,
+                AutotunePhase::Preflight,
+                AutotuneEvidence::PreflightAttested,
+            ),
+            record(
+                2,
+                AutotunePhase::IdleBaseline,
+                AutotuneEvidence::TrafficDebit(TrafficDebitEvidence {
+                    purpose: TrafficDebitPurpose::Lifecycle,
+                    direction: SpeedtestDirection::Both,
+                    rx_bytes: 7,
+                    tx_bytes: 3,
+                }),
+            ),
+        ] {
+            store.append(&value).unwrap();
+        }
+        let write = |name: String, payload: serde_json::Value| {
+            let sha256 = super::super::autotune_apply::native_apply_sha256_hex(
+                payload.to_string().as_bytes(),
+            );
+            atomic_private_write(
+                &directory.join(name),
+                format!(
+                    "{}\n",
+                    serde_json::json!({"payload":payload,"sha256":sha256})
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        };
+        write(
+            format!("owned-traffic-checkpoint-{worker}"),
+            serde_json::json!({
+                "schema_version":1,"job_id":operation.identity.job_id,"worker_run_id":worker,
+                "request_sha256":digest,"accounting":"owned-ip-system-dns-estimate-v1",
+                "sequence":1,"backend_rx":7,"backend_tx":3,"probe_rx":0,"probe_tx":0
+            }),
+        );
+        write(
+            format!("owned-traffic-cutoff-{worker}"),
+            serde_json::json!({
+                "schema_version":2,"purpose":"post-retirement-rule-cutoff-v1",
+                "job_id":operation.identity.job_id,"worker_run_id":worker,"request_sha256":digest,
+                "counters":[9,4,1,0]
+            }),
+        );
+        let before = store.load().unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                verify_terminal_consumed_traffic(
+                    &request_path,
+                    &operation.identity.job_id,
+                    &worker,
+                    10
+                )
+                .unwrap(),
+                14
+            );
+        }
+        assert!(
+            verify_terminal_consumed_traffic(
+                &request_path,
+                &operation.identity.job_id,
+                &worker,
+                14
+            )
+            .is_err(),
+            "terminal claim must still match the worker prefix, not the later cutoff"
+        );
+        assert_eq!(store.load().unwrap(), before);
+        assert_eq!(
+            AutotuneReplayState::replay(&operation, &worker, &before)
+                .unwrap()
+                .consumed_bytes,
+            10
+        );
+        let intent_name = format!("owned-traffic-checkpoint-{worker}.owned-intent");
+        write(
+            intent_name.clone(),
+            serde_json::json!({
+                "schema_version":1,"job_id":operation.identity.job_id,"worker_run_id":worker,
+                "request_sha256":digest,"accounting":"owned-ip-system-dns-estimate-v1",
+                "sequence":2,"backend_rx":8,"backend_tx":4,"probe_rx":1,"probe_tx":0
+            }),
+        );
+        let pending = fs::read(directory.join(&intent_name)).unwrap();
+        // Crash before append: the pending bytes are part of the cutoff tail.
+        assert_eq!(
+            verify_terminal_consumed_traffic(
+                &request_path,
+                &operation.identity.job_id,
+                &worker,
+                10
+            )
+            .unwrap(),
+            14
+        );
+        assert_eq!(store.load().unwrap(), before);
+        store
+            .append(&record(
+                3,
+                AutotunePhase::IdleBaseline,
+                AutotuneEvidence::TrafficDebit(TrafficDebitEvidence {
+                    purpose: TrafficDebitPurpose::Lifecycle,
+                    direction: SpeedtestDirection::Both,
+                    rx_bytes: 2,
+                    tx_bytes: 1,
+                }),
+            ))
+            .unwrap();
+        let appended = store.load().unwrap();
+        // Crash after append but before checkpoint: accept exactly that prefix.
+        for _ in 0..2 {
+            assert_eq!(
+                verify_terminal_consumed_traffic(
+                    &request_path,
+                    &operation.identity.job_id,
+                    &worker,
+                    13
+                )
+                .unwrap(),
+                14
+            );
+        }
+        assert_eq!(store.load().unwrap(), appended);
+        assert_eq!(fs::read(directory.join(&intent_name)).unwrap(), pending);
+        write(
+            format!("owned-traffic-checkpoint-{worker}.owned-next"),
+            serde_json::json!({
+                "schema_version":1,"job_id":operation.identity.job_id,"worker_run_id":worker,
+                "request_sha256":digest,"accounting":"owned-ip-system-dns-estimate-v1",
+                "sequence":2,"backend_rx":9,"backend_tx":4,"probe_rx":1,"probe_tx":0
+            }),
+        );
+        assert!(
+            verify_terminal_consumed_traffic(
+                &request_path,
+                &operation.identity.job_id,
+                &worker,
+                13
+            )
+            .is_err(),
+            "conflicting complete pending checkpoints cannot be guessed away"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn t2_owned_checkpoint_matches_debit_count_and_each_direction() {
+        let records = vec![
+            record(
+                1,
+                AutotunePhase::Preflight,
+                AutotuneEvidence::PreflightAttested,
+            ),
+            record(
+                2,
+                AutotunePhase::IdleBaseline,
+                AutotuneEvidence::TrafficDebit(TrafficDebitEvidence {
+                    purpose: TrafficDebitPurpose::Lifecycle,
+                    direction: SpeedtestDirection::Both,
+                    rx_bytes: 7,
+                    tx_bytes: 3,
+                }),
+            ),
+            record(
+                3,
+                AutotunePhase::Restore,
+                AutotuneEvidence::TrafficDebit(TrafficDebitEvidence {
+                    purpose: TrafficDebitPurpose::Lifecycle,
+                    direction: SpeedtestDirection::Both,
+                    rx_bytes: 11,
+                    tx_bytes: 5,
+                }),
+            ),
+        ];
+        verify_owned_checkpoint_debits((2, 18, 8), &records).unwrap();
+        for checkpoint in [(1, 18, 8), (3, 18, 8), (2, 17, 9), (2, 19, 7), (1, 7, 3)] {
+            assert!(verify_owned_checkpoint_debits(checkpoint, &records).is_err());
+        }
+        verify_owned_checkpoint_debits((0, 0, 0), &records[..1]).unwrap();
+        assert!(verify_owned_checkpoint_debits((0, 0, 0), &records).is_err());
+    }
+
+    #[test]
     fn terminal_traffic_must_match_the_identity_bound_replay() {
         let directory = private_temp_directory("terminal-accounting");
         let request_path = directory.join("request");
@@ -22498,11 +24591,15 @@ mod tests {
             10_001,
         )
         .is_err());
+        assert!(
+            !directory.join(EVIDENCE_DIR).exists(),
+            "terminal verification must not create evidence"
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
-    fn traffic_budget_terminal_uses_exact_replay_even_with_pending_measurement() {
+    fn t2_traffic_stop_reasons_keep_exact_replay_even_with_pending_measurement() {
         let directory = private_temp_directory("traffic-budget-terminal");
         let request_path = directory.join("request");
         let terminal_path = directory.join(format!("terminal-{}", "66".repeat(16)));
@@ -22540,25 +24637,66 @@ mod tests {
             store.append(&evidence).unwrap();
         }
 
-        publish_traffic_budget_terminal(&terminal_path, &operation, &"66".repeat(16), &store)
-            .unwrap();
-        let terminal = read_terminal_file(&terminal_path).unwrap();
-        assert_eq!(terminal.consumed_traffic_bytes, 1_500);
-        assert_eq!(
-            terminal.terminal,
-            AutotuneTerminal::Inconclusive {
-                code: TRAFFIC_BUDGET_INCONCLUSIVE.to_string(),
-            }
-        );
-        assert_eq!(
-            verify_terminal_consumed_traffic(
-                &request_path,
-                &operation.identity.job_id,
+        for reason in [
+            SPEEDTEST_TRAFFIC_BUDGET_EXHAUSTED,
+            SPEEDTEST_TRAFFIC_LIMIT_REACHED,
+        ] {
+            publish_traffic_budget_terminal(
+                &terminal_path,
+                &operation,
                 &"66".repeat(16),
-                terminal.consumed_traffic_bytes,
+                &store,
+                reason,
             )
-            .unwrap(),
-            1_500
+            .unwrap();
+            let terminal = read_terminal_file(&terminal_path).unwrap();
+            assert_eq!(terminal.consumed_traffic_bytes, 1_500);
+            assert_eq!(
+                terminal.terminal,
+                AutotuneTerminal::Inconclusive {
+                    code: reason.to_string(),
+                }
+            );
+            assert_eq!(
+                verify_terminal_consumed_traffic(
+                    &request_path,
+                    &operation.identity.job_id,
+                    &"66".repeat(16),
+                    terminal.consumed_traffic_bytes,
+                )
+                .unwrap(),
+                1_500
+            );
+        }
+        assert!(publish_traffic_budget_terminal(
+            &terminal_path,
+            &operation,
+            &"66".repeat(16),
+            &store,
+            "unknown"
+        )
+        .is_err());
+        for error in [
+            "native Auto-Tune operation deadline expired during capture admission",
+            "native Auto-Tune operation deadline expired during capture completion",
+            "native Auto-Tune operation deadline expired before runtime permit",
+        ] {
+            assert_eq!(
+                worker_failure_terminal_code(error),
+                "native-autotune-deadline-expired"
+            );
+        }
+        let legacy = AutotuneTerminalRecord {
+            job_id: operation.identity.job_id.clone(),
+            worker_run_id: "66".repeat(16),
+            consumed_traffic_bytes: 1_500,
+            terminal: AutotuneTerminal::Inconclusive {
+                code: "traffic-budget-exhausted".into(),
+            },
+        };
+        assert_eq!(
+            AutotuneTerminalRecord::decode(&legacy.encode().unwrap()).unwrap(),
+            legacy
         );
 
         let detailed_error = "native Auto-Tune load byte evidence is invalid (direction=upload)";
@@ -22606,6 +24744,209 @@ mod tests {
             transport_baseline_us: Some(10_000),
             route_fingerprint: "33".repeat(32),
             sqm_fingerprint: "55".repeat(32),
+        }
+    }
+
+    #[test]
+    fn t2_initial_planning_budget_boundary_is_not_stopping_authority() {
+        use super::super::protocol::{AutotuneTrafficPlan, TrafficPolicy};
+        let plan = AutotuneTrafficPlan {
+            download_kbps: 1_000_000,
+            upload_kbps: 100_000,
+        };
+        let bytes = 16_500_000_000;
+        assert_eq!(
+            validate_autotune_planning_budget((bytes - 1).into(), plan)
+                .unwrap_err()
+                .code,
+            "traffic-budget-insufficient"
+        );
+        validate_autotune_planning_budget(bytes.into(), plan).unwrap();
+        validate_autotune_planning_budget(TrafficPolicy::Unlimited, plan).unwrap();
+        for rate in [0, 100_000_001, u64::MAX] {
+            assert_eq!(
+                validate_autotune_planning_budget(
+                    TrafficPolicy::Unlimited,
+                    AutotuneTrafficPlan {
+                        download_kbps: rate,
+                        ..plan
+                    }
+                )
+                .unwrap_err()
+                .code,
+                "traffic-planning-invalid"
+            );
+        }
+        assert!(validate_autotune_raw_traffic_authority(
+            bytes.into(),
+            Some(CalibrationStrategy::FullRaw),
+            true,
+            None,
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn t2_raw_admission_holds_one_known_reserve_through_mandatory_qualification() {
+        use super::super::protocol::TrafficPolicy;
+        let proof_per_run = 2 * super::super::speedtest::MIN_ROUTE_PROOF_BYTES;
+        for (dl, ul) in [
+            (100, 100),
+            (1_000_000, 500_000),
+            (10_000_000, 1_000_000),
+            (MAX_RATE_KBPS, MAX_RATE_KBPS),
+        ] {
+            let reserve = traffic_stop_safety_reserve_bytes(dl, ul);
+            let minimum = reserve + MIN_QUALIFICATION_TRAFFIC_BYTES;
+            let check = |bytes| {
+                validate_autotune_traffic_admission(
+                    TrafficPolicy::Capped { max_bytes: bytes },
+                    Some(CalibrationStrategy::FullRaw),
+                    true,
+                    Some(dl),
+                    Some(ul),
+                )
+            };
+            let error = check(minimum - 1).unwrap_err();
+            assert_eq!(error.code, "traffic-budget-insufficient");
+            assert!(error.message.contains(&minimum.to_string()));
+            assert!(error.message.contains(&reserve.to_string()));
+            check(minimum).unwrap();
+            check(minimum + 1).unwrap();
+            // Independent replay of the required per-attempt admission: reserve
+            // remains once; only transferred proof bytes reduce the allowance.
+            let prior_proofs = MIN_QUALIFICATION_TRAFFIC_BYTES - proof_per_run;
+            let last_attempt_minimum =
+                super::super::speedtest::minimum_full_autotune_traffic_budget_bytes(dl, ul);
+            assert_eq!(minimum - prior_proofs, last_attempt_minimum);
+            assert!(minimum - 1 - prior_proofs < last_attempt_minimum);
+        }
+        validate_autotune_traffic_admission(
+            TrafficPolicy::Unlimited,
+            Some(CalibrationStrategy::FullRaw),
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_autotune_traffic_admission(
+                u64::MAX.into(),
+                Some(CalibrationStrategy::FullRaw),
+                true,
+                Some(u64::MAX),
+                Some(u64::MAX)
+            )
+            .unwrap_err()
+            .code,
+            "traffic-budget-insufficient"
+        );
+    }
+
+    #[test]
+    fn t2_explicit_reserve_never_invents_a_raw_rate_bound() {
+        use super::super::protocol::TrafficPolicy;
+        let mut operation = request(CalibrationStrategy::FullRaw, 32_000_000_000);
+        operation.traffic_policy_explicit = true;
+        operation.service_dl_cap_kbps = None;
+        operation.service_ul_cap_kbps = None;
+        for direction in [
+            SpeedtestDirection::Download,
+            SpeedtestDirection::Upload,
+            SpeedtestDirection::Both,
+        ] {
+            assert_eq!(
+                autotune_traffic_safety_reserve_bytes(&operation, None, None, direction)
+                    .unwrap_err(),
+                "traffic-stop-authority-unavailable"
+            );
+        }
+        operation.traffic_budget = TrafficPolicy::Unlimited;
+        assert_eq!(
+            autotune_traffic_safety_reserve_bytes(&operation, None, None, SpeedtestDirection::Both)
+                .unwrap(),
+            0
+        );
+        assert!(validate_autotune_raw_traffic_authority(
+            operation.traffic_budget,
+            operation.strategy,
+            true,
+            None,
+            None
+        )
+        .is_ok());
+        operation.traffic_budget = 32_000_000_000_u64.into();
+        assert!(validate_autotune_raw_traffic_authority(
+            operation.traffic_budget,
+            operation.strategy,
+            true,
+            None,
+            None
+        )
+        .is_err());
+        assert!(validate_autotune_raw_traffic_authority(
+            operation.traffic_budget,
+            Some(CalibrationStrategy::ShapedOnly),
+            false,
+            None,
+            None
+        )
+        .is_ok());
+        operation.service_dl_cap_kbps = Some(1_000_000);
+        assert_eq!(
+            autotune_traffic_safety_reserve_bytes(
+                &operation,
+                None,
+                None,
+                SpeedtestDirection::Download
+            )
+            .unwrap(),
+            traffic_stop_safety_reserve_bytes(1_000_000, 0)
+        );
+        assert!(autotune_traffic_safety_reserve_bytes(
+            &operation,
+            None,
+            None,
+            SpeedtestDirection::Both
+        )
+        .is_err());
+        operation.service_ul_cap_kbps = Some(100_000);
+        assert!(validate_autotune_raw_traffic_authority(
+            operation.traffic_budget,
+            operation.strategy,
+            true,
+            operation.service_dl_cap_kbps,
+            operation.service_ul_cap_kbps
+        )
+        .is_ok());
+        for (dl, ul) in [
+            (100, 100),
+            (1_000_000, 100_000),
+            (MAX_RATE_KBPS, MAX_RATE_KBPS),
+        ] {
+            operation.service_dl_cap_kbps = Some(dl);
+            operation.service_ul_cap_kbps = Some(ul);
+            assert_eq!(
+                autotune_traffic_safety_reserve_bytes(
+                    &operation,
+                    None,
+                    None,
+                    SpeedtestDirection::Both
+                )
+                .unwrap(),
+                traffic_stop_safety_reserve_bytes(dl, ul)
+            );
+            assert_eq!(
+                autotune_traffic_safety_reserve_bytes(
+                    &operation,
+                    Some(50_000),
+                    Some(10_000),
+                    SpeedtestDirection::Both
+                )
+                .unwrap(),
+                traffic_stop_safety_reserve_bytes(50_000, 10_000)
+            );
         }
     }
 
@@ -23439,6 +25780,8 @@ mod tests {
                         server_sponsor: "test".to_string(),
                     },
                     &SpeedtestLoadSample {
+                        endpoint_host: None,
+                        endpoint_sha256: None,
                         direction: SpeedtestDirection::Download,
                         aggregate_rx_bytes: aggregate_rx,
                         aggregate_tx_bytes: 50_000,
@@ -23504,6 +25847,8 @@ mod tests {
                     server_sponsor: "test".to_string(),
                 },
                 &SpeedtestLoadSample {
+                    endpoint_host: None,
+                    endpoint_sha256: None,
                     direction: SpeedtestDirection::Download,
                     aggregate_rx_bytes: 1_250_000,
                     aggregate_tx_bytes: 10_000,
@@ -23541,6 +25886,8 @@ mod tests {
                     server_sponsor: String::new(),
                 },
                 &SpeedtestLoadSample {
+                    endpoint_host: None,
+                    endpoint_sha256: None,
                     direction: SpeedtestDirection::Upload,
                     aggregate_rx_bytes: 1,
                     aggregate_tx_bytes: 1,
@@ -23586,6 +25933,8 @@ mod tests {
                         server_sponsor: "test".to_string(),
                     },
                     &SpeedtestLoadSample {
+                        endpoint_host: None,
+                        endpoint_sha256: None,
                         direction: SpeedtestDirection::Both,
                         aggregate_rx_bytes: rx,
                         aggregate_tx_bytes: tx,
@@ -23631,6 +25980,8 @@ mod tests {
                     server_sponsor: String::new(),
                 },
                 &SpeedtestLoadSample {
+                    endpoint_host: None,
+                    endpoint_sha256: None,
                     direction: SpeedtestDirection::Both,
                     aggregate_rx_bytes: 1,
                     aggregate_tx_bytes: 1,
@@ -23666,6 +26017,8 @@ mod tests {
                     server_sponsor: "test".to_string(),
                 },
                 &SpeedtestLoadSample {
+                    endpoint_host: None,
+                    endpoint_sha256: None,
                     direction: SpeedtestDirection::Both,
                     aggregate_rx_bytes: 1_100_000,
                     aggregate_tx_bytes: 1_900_000,
@@ -23732,6 +26085,8 @@ mod tests {
                     server_sponsor: "test".to_string(),
                 },
                 &SpeedtestLoadSample {
+                    endpoint_host: None,
+                    endpoint_sha256: None,
                     direction: SpeedtestDirection::Upload,
                     aggregate_rx_bytes: 80_000,
                     aggregate_tx_bytes: 1_717_093,
@@ -23782,6 +26137,8 @@ mod tests {
                     server_sponsor: "test".to_string(),
                 },
                 &SpeedtestLoadSample {
+                    endpoint_host: None,
+                    endpoint_sha256: None,
                     direction: SpeedtestDirection::Upload,
                     aggregate_rx_bytes: 160_000,
                     aggregate_tx_bytes: 2_090_000,
@@ -23824,6 +26181,8 @@ mod tests {
                     server_sponsor: "test".to_string(),
                 },
                 &SpeedtestLoadSample {
+                    endpoint_host: None,
+                    endpoint_sha256: None,
                     direction: SpeedtestDirection::Upload,
                     aggregate_rx_bytes: 160_000,
                     aggregate_tx_bytes: 1_900_000,
@@ -24476,6 +26835,8 @@ mod tests {
             starttime_ticks: 100,
         };
         let permit = AutotuneRuntimePermit {
+            dns_server: None,
+            probe_accounting_required: false,
             kind: super::super::autotune_runtime::RuntimePermitKind::Autotune,
             permit_id: "77".repeat(16),
             job_id: operation.identity.job_id.clone(),
@@ -24575,6 +26936,8 @@ mod tests {
             starttime_ticks: 100,
         };
         let mut permit = AutotuneRuntimePermit {
+            dns_server: None,
+            probe_accounting_required: false,
             kind: super::super::autotune_runtime::RuntimePermitKind::Autotune,
             permit_id: "77".repeat(16),
             job_id: operation.identity.job_id.clone(),
@@ -24727,6 +27090,8 @@ mod tests {
             starttime_ticks: 100,
         };
         let permit = AutotuneRuntimePermit {
+            dns_server: None,
+            probe_accounting_required: false,
             kind: super::super::autotune_runtime::RuntimePermitKind::Autotune,
             permit_id: request.permit_id.clone(),
             job_id: request.job_id.clone(),
@@ -24937,6 +27302,8 @@ mod tests {
         use super::super::autotune_runtime_store::RuntimeOverrideCheckpoint;
 
         let permit = AutotuneRuntimePermit {
+            dns_server: None,
+            probe_accounting_required: false,
             kind: super::super::autotune_runtime::RuntimePermitKind::Autotune,
             permit_id: "77".repeat(16),
             job_id: "11".repeat(16),
@@ -25723,6 +28090,887 @@ mod tests {
     }
 
     #[test]
+    fn t2_lifecycle_debits_count_without_authorizing_load_measurements() {
+        let mut operation = request(CalibrationStrategy::FullRaw, 1_000);
+        operation.traffic_policy_explicit = true;
+        let worker = "66".repeat(16);
+        let mut replay = AutotuneReplayState::new(&operation, &worker).unwrap();
+        replay
+            .apply(&record(
+                1,
+                AutotunePhase::Preflight,
+                AutotuneEvidence::PreflightAttested,
+            ))
+            .unwrap();
+        let lifecycle = record(
+            2,
+            AutotunePhase::IdleBaseline,
+            AutotuneEvidence::TrafficDebit(TrafficDebitEvidence {
+                purpose: TrafficDebitPurpose::Lifecycle,
+                direction: SpeedtestDirection::Both,
+                rx_bytes: 40,
+                tx_bytes: 10,
+            }),
+        );
+        let encoded = lifecycle.encode().unwrap();
+        assert!(encoded.starts_with(LIFECYCLE_EVIDENCE_HEADER));
+        assert_eq!(AutotuneEvidenceRecord::decode(&encoded).unwrap(), lifecycle);
+        assert!(AutotuneEvidenceRecord::decode(&encoded.replacen(
+            LIFECYCLE_EVIDENCE_HEADER,
+            EVIDENCE_HEADER,
+            1
+        ))
+        .is_err());
+        replay.apply(&lifecycle).unwrap();
+        assert_eq!(replay.consumed_bytes, 50);
+        assert!(replay.pending_measurement_debits.is_empty());
+        assert!(!replay.capacity_qualification_seen);
+        replay
+            .apply(&record(
+                3,
+                AutotunePhase::IdleBaseline,
+                AutotuneEvidence::Baseline(baseline()),
+            ))
+            .unwrap();
+        replay
+            .apply(&record(
+                4,
+                AutotunePhase::RawControls,
+                AutotuneEvidence::RuntimeMutationArmed,
+            ))
+            .unwrap();
+        let mut gap = lifecycle.clone();
+        gap.sequence = 5;
+        gap.phase = AutotunePhase::RawControls;
+        replay.apply(&gap).unwrap();
+        assert!(replay.pending_measurement_debits.is_empty());
+        assert!(replay
+            .apply(&record(
+                6,
+                AutotunePhase::RawControls,
+                AutotuneEvidence::Measurement(measurement(
+                    MeasurementTopology::RawDownload,
+                    SpeedtestDirection::Download,
+                    100
+                ))
+            ))
+            .is_err());
+        for (sequence, bytes) in [(6, 1000), (7, 20)] {
+            replay
+                .apply(&record(
+                    sequence,
+                    AutotunePhase::Restore,
+                    AutotuneEvidence::TrafficDebit(TrafficDebitEvidence {
+                        purpose: TrafficDebitPurpose::LifecycleOverrun,
+                        direction: SpeedtestDirection::Both,
+                        rx_bytes: bytes,
+                        tx_bytes: 0,
+                    }),
+                ))
+                .unwrap();
+        }
+        assert_eq!(replay.consumed_bytes, 1120);
+        replay
+            .apply(&record(
+                8,
+                AutotunePhase::Restore,
+                AutotuneEvidence::RuntimeRestored,
+            ))
+            .unwrap();
+        let mut late = gap;
+        late.sequence = 9;
+        late.phase = AutotunePhase::Restore;
+        assert!(
+            replay.apply(&late).is_err(),
+            "restored accounting cannot silently change after its cutoff"
+        );
+        operation.traffic_policy_explicit = false;
+        let mut legacy = AutotuneReplayState::new(&operation, &worker).unwrap();
+        legacy
+            .apply(&record(
+                1,
+                AutotunePhase::Preflight,
+                AutotuneEvidence::PreflightAttested,
+            ))
+            .unwrap();
+        assert!(legacy.apply(&lifecycle).is_err());
+    }
+
+    #[test]
+    fn t2_overrun_is_durable_exact_terminal_evidence_not_measurement_authority() {
+        for explicit in [false, true] {
+            let directory = private_temp_directory("overrun-replay");
+            let mut operation = request(CalibrationStrategy::FullRaw, 1_000);
+            operation.traffic_policy_explicit = explicit;
+            let worker = "66".repeat(16);
+            let request_path = directory.join("request");
+            atomic_private_write(&request_path, operation.encode().unwrap().as_bytes()).unwrap();
+            let store = AutotuneEvidenceStore::open(&directory).unwrap();
+            for entry in [
+                record(
+                    1,
+                    AutotunePhase::Preflight,
+                    AutotuneEvidence::PreflightAttested,
+                ),
+                record(
+                    2,
+                    AutotunePhase::IdleBaseline,
+                    AutotuneEvidence::Baseline(baseline()),
+                ),
+                record(
+                    3,
+                    AutotunePhase::RawControls,
+                    AutotuneEvidence::RuntimeMutationArmed,
+                ),
+            ] {
+                store.append(&entry).unwrap();
+            }
+            let purpose = if explicit {
+                TrafficDebitPurpose::CapacityQualification
+            } else {
+                TrafficDebitPurpose::Measurement
+            };
+            for debit in [
+                SpeedtestTrafficDebit {
+                    lifecycle: false,
+                    rx_bytes: 200,
+                    tx_bytes: 100,
+                },
+                SpeedtestTrafficDebit {
+                    lifecycle: false,
+                    rx_bytes: 600,
+                    tx_bytes: 300,
+                },
+            ] {
+                append_traffic_debit_evidence(
+                    &store,
+                    &operation,
+                    &worker,
+                    AutotunePhase::RawControls,
+                    purpose,
+                    SpeedtestDirection::Both,
+                    debit,
+                )
+                .unwrap();
+            }
+            let records = store.load().unwrap();
+            let overrun = records.last().unwrap();
+            let encoded = overrun.encode().unwrap();
+            assert!(encoded.starts_with(OVERRUN_EVIDENCE_HEADER));
+            assert_eq!(AutotuneEvidenceRecord::decode(&encoded).unwrap(), *overrun);
+            for header in [EVIDENCE_HEADER, QUALIFICATION_EVIDENCE_HEADER] {
+                assert!(AutotuneEvidenceRecord::decode(&encoded.replacen(
+                    OVERRUN_EVIDENCE_HEADER,
+                    header,
+                    1
+                ))
+                .is_err());
+            }
+            let mut ordinary = records.clone();
+            if let AutotuneEvidence::TrafficDebit(value) =
+                &mut ordinary.last_mut().unwrap().evidence
+            {
+                value.purpose = purpose;
+            }
+            assert!(AutotuneReplayState::replay(&operation, &worker, &ordinary).is_err());
+            let mut larger_cap = operation.clone();
+            larger_cap.traffic_budget = 1_200_u64.into();
+            assert!(AutotuneReplayState::replay(&larger_cap, &worker, &records).is_err());
+            let mut replay = AutotuneReplayState::replay(&operation, &worker, &records).unwrap();
+            assert_eq!(replay.consumed_bytes, 1_200);
+            assert!(replay.pending_measurement_debits.is_empty());
+            assert_eq!(replay.control_download_count, 0);
+            assert_eq!(replay.control_upload_count, 0);
+            assert_eq!(
+                replay.next_action().unwrap(),
+                AutotuneAction::RestoreRuntime
+            );
+            let mut duplicate = overrun.clone();
+            duplicate.sequence += 1;
+            assert!(replay.apply(&duplicate).is_err());
+            assert!(replay
+                .apply(&record(
+                    6,
+                    AutotunePhase::RawControls,
+                    AutotuneEvidence::ServerSelected {
+                        digest: "aa".repeat(32)
+                    }
+                ))
+                .is_err());
+            let terminal_path = directory.join("terminal");
+            publish_replayed_terminal(
+                &terminal_path,
+                &operation,
+                &worker,
+                &store,
+                worker_error_terminal("speedtest-traffic-budget-exceeded", false),
+            )
+            .unwrap();
+            let terminal = read_terminal_file(&terminal_path).unwrap();
+            assert_eq!(terminal.consumed_traffic_bytes, 1_200);
+            assert!(matches!(terminal.terminal, AutotuneTerminal::Failed { .. }));
+            let verified = verify_terminal_consumed_traffic(
+                &request_path,
+                &operation.identity.job_id,
+                &worker,
+                1_200,
+            );
+            if explicit {
+                assert!(
+                    verified.is_err(),
+                    "explicit accounting cannot settle without its checkpoint"
+                );
+            } else {
+                assert_eq!(verified.unwrap(), 1_200);
+            }
+            assert!(verify_terminal_consumed_traffic(
+                &request_path,
+                &operation.identity.job_id,
+                &worker,
+                1_000
+            )
+            .is_err());
+            let mut restored = append_replay_evidence(
+                &store,
+                &operation,
+                &worker,
+                AutotunePhase::Restore,
+                AutotuneEvidence::RuntimeRestored,
+            )
+            .unwrap();
+            assert_eq!(
+                restored.next_action().unwrap(),
+                AutotuneAction::PublishInconclusive {
+                    code: "speedtest-traffic-budget-exceeded"
+                }
+            );
+            assert!(restored
+                .apply(&record(
+                    7,
+                    AutotunePhase::Review,
+                    AutotuneEvidence::ReviewReady {
+                        result_digest: "bb".repeat(32)
+                    }
+                ))
+                .is_err());
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn t2_unlimited_replay_and_terminal_account_actual_traffic_and_require_source_receipt() {
+        let directional_bytes = 1_u64 << 40;
+        let total_bytes = directional_bytes * 2;
+        let directory = private_temp_directory("unlimited-replay");
+        let mut operation = request(CalibrationStrategy::FullRaw, 1);
+        operation.traffic_budget = super::super::protocol::TrafficPolicy::Unlimited;
+        operation.traffic_policy_explicit = true;
+        let request_path = directory.join("request");
+        atomic_private_write(&request_path, operation.encode().unwrap().as_bytes()).unwrap();
+        let mut records = vec![
+            record(
+                1,
+                AutotunePhase::Preflight,
+                AutotuneEvidence::PreflightAttested,
+            ),
+            record(
+                2,
+                AutotunePhase::IdleBaseline,
+                AutotuneEvidence::Baseline(baseline()),
+            ),
+            record(
+                3,
+                AutotunePhase::RawControls,
+                AutotuneEvidence::RuntimeMutationArmed,
+            ),
+        ];
+        let mut state =
+            AutotuneReplayState::replay(&operation, &"66".repeat(16), &records).unwrap();
+        assert!(
+            state
+                .apply(&record(
+                    4,
+                    AutotunePhase::RawControls,
+                    AutotuneEvidence::TrafficDebit(TrafficDebitEvidence {
+                        purpose: TrafficDebitPurpose::Measurement,
+                        direction: SpeedtestDirection::Download,
+                        rx_bytes: 1,
+                        tx_bytes: 1,
+                    })
+                ))
+                .is_err(),
+            "new schema cannot bypass server selection by omitting every v14 record"
+        );
+        records.push(record(
+            4,
+            AutotunePhase::RawControls,
+            AutotuneEvidence::TrafficDebit(TrafficDebitEvidence {
+                purpose: TrafficDebitPurpose::CapacityQualification,
+                direction: SpeedtestDirection::Both,
+                rx_bytes: directional_bytes,
+                tx_bytes: directional_bytes,
+            }),
+        ));
+        let store = AutotuneEvidenceStore::open(&directory).unwrap();
+        for record in &records {
+            store.append(record).unwrap();
+        }
+        let terminal_path = directory.join("terminal");
+        publish_replayed_terminal(
+            &terminal_path,
+            &operation,
+            &"66".repeat(16),
+            &store,
+            AutotuneTerminal::Cancelled,
+        )
+        .unwrap();
+        let terminal = read_terminal_file(&terminal_path).unwrap();
+        assert_eq!(terminal.consumed_traffic_bytes, total_bytes);
+        assert!(terminal
+            .encode()
+            .unwrap()
+            .starts_with(EXTENDED_TERMINAL_HEADER));
+        assert!(
+            verify_terminal_consumed_traffic(
+                &request_path,
+                &operation.identity.job_id,
+                &"66".repeat(16),
+                total_bytes
+            )
+            .is_err(),
+            "a debit journal without the owned checkpoint is not exact settlement"
+        );
+        assert!(verify_terminal_consumed_traffic(
+            &request_path,
+            &operation.identity.job_id,
+            &"66".repeat(16),
+            total_bytes + 1
+        )
+        .is_err());
+        assert_eq!(
+            replay_remaining_traffic_budget(&operation, &records).unwrap(),
+            super::super::protocol::TrafficPolicy::Unlimited
+        );
+        operation.traffic_budget = 32_000_000_000_u64.into();
+        assert!(AutotuneReplayState::replay(&operation, &"66".repeat(16), &records).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn t1_capacity_qualification_debits_are_v14_and_only_precede_raw_measurements() {
+        let request = request(CalibrationStrategy::FullRaw, 100_000_000);
+        let mut replay = AutotuneReplayState::replay(
+            &request,
+            &"66".repeat(16),
+            &[
+                record(
+                    1,
+                    AutotunePhase::Preflight,
+                    AutotuneEvidence::PreflightAttested,
+                ),
+                record(
+                    2,
+                    AutotunePhase::IdleBaseline,
+                    AutotuneEvidence::Baseline(baseline()),
+                ),
+            ],
+        )
+        .unwrap();
+        let debit = AutotuneEvidence::TrafficDebit(TrafficDebitEvidence {
+            purpose: TrafficDebitPurpose::CapacityQualification,
+            direction: SpeedtestDirection::Both,
+            rx_bytes: 3000,
+            tx_bytes: 2000,
+        });
+        assert!(replay
+            .apply(&record(3, AutotunePhase::RawControls, debit.clone()))
+            .is_err());
+        replay
+            .apply(&record(
+                3,
+                AutotunePhase::RawControls,
+                AutotuneEvidence::RuntimeMutationArmed,
+            ))
+            .unwrap();
+        let entry = record(4, AutotunePhase::RawControls, debit.clone());
+        let encoded = entry.encode().unwrap();
+        assert!(encoded.starts_with(QUALIFICATION_EVIDENCE_HEADER));
+        assert_eq!(AutotuneEvidenceRecord::decode(&encoded).unwrap(), entry);
+        assert!(AutotuneEvidenceRecord::decode(&encoded.replacen(
+            QUALIFICATION_EVIDENCE_HEADER,
+            EVIDENCE_HEADER,
+            1
+        ))
+        .is_err());
+        replay.apply(&entry).unwrap();
+        assert_eq!(replay.consumed_bytes, 5000);
+        assert!(replay.pending_measurement_debits.is_empty());
+        assert_eq!(replay.control_download_count, 0);
+        assert_eq!(replay.control_upload_count, 0);
+        let measurement_debit = AutotuneEvidence::TrafficDebit(TrafficDebitEvidence {
+            purpose: TrafficDebitPurpose::Measurement,
+            direction: SpeedtestDirection::Download,
+            rx_bytes: 100,
+            tx_bytes: 100,
+        });
+        assert!(replay
+            .apply(&record(
+                5,
+                AutotunePhase::RawControls,
+                measurement_debit.clone()
+            ))
+            .is_err());
+        let receipt = record(
+            5,
+            AutotunePhase::RawControls,
+            AutotuneEvidence::ServerSelected {
+                digest: "ab".repeat(32),
+            },
+        );
+        let encoded_receipt = receipt.encode().unwrap();
+        assert!(encoded_receipt.starts_with(QUALIFICATION_EVIDENCE_HEADER));
+        assert_eq!(
+            AutotuneEvidenceRecord::decode(&encoded_receipt).unwrap(),
+            receipt
+        );
+        assert!(AutotuneEvidenceRecord::decode(&encoded_receipt.replacen(
+            QUALIFICATION_EVIDENCE_HEADER,
+            EVIDENCE_HEADER,
+            1
+        ))
+        .is_err());
+        replay.apply(&receipt).unwrap();
+        assert!(replay
+            .apply(&record(
+                6,
+                AutotunePhase::RawControls,
+                receipt.evidence.clone()
+            ))
+            .is_err());
+        replay
+            .apply(&record(6, AutotunePhase::RawControls, measurement_debit))
+            .unwrap();
+        assert!(replay
+            .apply(&record(7, AutotunePhase::RawControls, debit))
+            .is_err());
+        let legacy = record(
+            1,
+            AutotunePhase::IdleBaseline,
+            AutotuneEvidence::TrafficDebit(TrafficDebitEvidence {
+                purpose: TrafficDebitPurpose::Qualification,
+                direction: SpeedtestDirection::Both,
+                rx_bytes: 100,
+                tx_bytes: 100,
+            }),
+        );
+        let encoded = legacy.encode().unwrap();
+        assert!(encoded.starts_with(EVIDENCE_HEADER));
+        assert_eq!(AutotuneEvidenceRecord::decode(&encoded).unwrap(), legacy);
+        assert!(AutotuneEvidenceRecord::decode(&encoded.replacen(
+            EVIDENCE_HEADER,
+            QUALIFICATION_EVIDENCE_HEADER,
+            1
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn t1_server_report_is_private_bounded_source_bound_and_not_capacity_authority() {
+        use super::super::server_qualification::Comparison;
+        let directory = private_temp_directory("server-report");
+        let operation = request(CalibrationStrategy::FullRaw, 100_000_000);
+        let worker_run_id = "22".repeat(16);
+        let control = AutotuneRuntimeControl {
+            permit_id: "77".repeat(16),
+            job_id: operation.identity.job_id.clone(),
+            worker_run_id: worker_run_id.clone(),
+            boot_id: "33".repeat(16),
+            coordinator_generation: "44".repeat(16),
+            worker: ProcessIdentity {
+                pid: 100,
+                process_group: 100,
+                starttime_ticks: 500,
+            },
+            sequence: 1,
+            deadline_boot_ms: 30_000,
+            target_interface: "pppoe-wan".into(),
+            route_fingerprint: operation.identity.route_fingerprint.clone(),
+            sqm_fingerprint: operation.identity.sqm_fingerprint.clone(),
+            topology: MeasurementTopology::RawBoth,
+            download_kbps: None,
+            upload_kbps: None,
+        };
+        let make = |index: usize, id: Option<u64>, dl: Option<u64>| Comparison {
+            index,
+            candidate_id: id,
+            server_id: id,
+            server_name: format!("<name>\"\\\n{}", "x".repeat(300)),
+            server_sponsor: format!("provider-{}", id.unwrap_or(0)),
+            endpoint_host: id.map(|id| format!("source-{id}.example.invalid")),
+            endpoint_sha256: id.map(|id| format!("{id:064x}")),
+            display_metadata_truncated: false,
+            started_boot_ms: 100 + index as u64 * 10,
+            elapsed_ms: 10,
+            debit_offset: index as u32,
+            debit_count: 1,
+            download_kbps: dl,
+            upload_kbps: id.map(|_| 500_000),
+            valid: id.is_some(),
+            code: if id.is_some() {
+                "valid-observation"
+            } else {
+                "server-list-complete"
+            }
+            .into(),
+        };
+        let mut comparisons = vec![make(0, None, None)];
+        for round in 0..3 {
+            comparisons.push(make(round * 2 + 1, Some(1), Some(167_500)));
+            comparisons.push(make(round * 2 + 2, Some(2), Some(900_000)));
+        }
+        publish_server_comparison_report(
+            &directory,
+            &operation,
+            &worker_run_id,
+            &control,
+            4,
+            &comparisons,
+            Some(&Ok(Some(2))),
+        )
+        .unwrap();
+        let path = directory.join(SERVER_COMPARISON_FILE);
+        let bytes = fs::read(&path).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(report["selected_server_id"], 2);
+        assert_eq!(report["capacity_proven"], false);
+        assert_eq!(report["first_debit_sequence"], 4);
+        assert_eq!(report["debit_count"], 7);
+        assert!(report["comparisons"][1]["server_name"]
+            .as_str()
+            .unwrap()
+            .starts_with("<name>\"\\\n"));
+        assert_eq!(report["comparisons"][1]["display_metadata_truncated"], true);
+        assert_eq!(
+            report["comparisons"][1]["server_name"]
+                .as_str()
+                .unwrap()
+                .len(),
+            256
+        );
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o077, 0);
+        let mut records = vec![
+            record(
+                1,
+                AutotunePhase::Preflight,
+                AutotuneEvidence::PreflightAttested,
+            ),
+            record(
+                2,
+                AutotunePhase::IdleBaseline,
+                AutotuneEvidence::Baseline(baseline()),
+            ),
+            record(
+                3,
+                AutotunePhase::RawControls,
+                AutotuneEvidence::RuntimeMutationArmed,
+            ),
+        ];
+        for index in 0..7 {
+            records.push(record(
+                index + 4,
+                AutotunePhase::RawControls,
+                AutotuneEvidence::TrafficDebit(TrafficDebitEvidence {
+                    purpose: TrafficDebitPurpose::CapacityQualification,
+                    direction: SpeedtestDirection::Both,
+                    rx_bytes: 1000,
+                    tx_bytes: 1000,
+                }),
+            ));
+        }
+        records.push(record(
+            11,
+            AutotunePhase::RawControls,
+            AutotuneEvidence::ServerSelected {
+                digest: sqm_identity::sha256sum(&bytes).unwrap(),
+            },
+        ));
+        for record in &mut records {
+            record.worker_run_id = worker_run_id.clone();
+        }
+        let verified =
+            verify_server_comparison_report(&directory, &operation, &worker_run_id, &records)
+                .unwrap()
+                .unwrap();
+        assert_eq!(verified.json.as_bytes(), bytes);
+        assert_eq!(report["schema_version"], 4);
+        assert_eq!(
+            report["policy_id"],
+            super::super::server_qualification::SOURCE_POLICY
+        );
+        let mut previous = report.clone();
+        previous["schema_version"] = serde_json::json!(2);
+        previous["max_servers"] =
+            serde_json::json!(super::super::server_qualification::LEGACY_MAX_SERVERS);
+        previous["traffic_accounting"] = serde_json::json!("legacy-aggregate-route-rx-tx");
+        previous["policy_id"] =
+            serde_json::json!(super::super::server_qualification::LEGACY_DISTINCT_POLICY);
+        let previous_bytes = serde_json::to_vec(&previous).unwrap();
+        fs::write(&path, &previous_bytes).unwrap();
+        let mut previous_records = records.clone();
+        previous_records.last_mut().unwrap().evidence = AutotuneEvidence::ServerSelected {
+            digest: sqm_identity::sha256sum(&previous_bytes).unwrap(),
+        };
+        assert!(verify_server_comparison_report(
+            &directory,
+            &operation,
+            &worker_run_id,
+            &previous_records
+        )
+        .is_ok());
+        assert_eq!(server_comparison_schema(&previous).unwrap(), 2);
+        previous["schema_version"] = serde_json::json!(3);
+        previous["policy_id"] =
+            serde_json::json!(super::super::server_qualification::LEGACY_BOUNDED_POLICY);
+        let v3_bytes = serde_json::to_vec(&previous).unwrap();
+        fs::write(&path, &v3_bytes).unwrap();
+        previous_records.last_mut().unwrap().evidence = AutotuneEvidence::ServerSelected {
+            digest: sqm_identity::sha256sum(&v3_bytes).unwrap(),
+        };
+        assert!(verify_server_comparison_report(
+            &directory,
+            &operation,
+            &worker_run_id,
+            &previous_records
+        )
+        .is_ok());
+        assert_eq!(server_comparison_schema(&previous).unwrap(), 3);
+        let mut bounded =
+            super::super::server_qualification::parse_comparisons(&previous["comparisons"])
+                .unwrap();
+        bounded.last_mut().unwrap().index = 10;
+        assert!(validate_server_comparison_bounds(3, &bounded).is_err());
+        assert!(validate_server_comparison_bounds(4, &bounded).is_ok());
+        previous["policy_id"] =
+            serde_json::json!(super::super::server_qualification::SOURCE_POLICY);
+        assert!(server_comparison_schema(&previous).is_err());
+        fs::write(&path, &bytes).unwrap();
+        for (field, value) in [
+            ("endpoint_host", "shared.example.invalid"),
+            ("server_sponsor", "Shared ISP"),
+        ] {
+            let mut aliases = report.clone();
+            for row in aliases["comparisons"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .skip(1)
+            {
+                row[field] = serde_json::json!(value);
+            }
+            let changed = serde_json::to_vec(&aliases).unwrap();
+            fs::write(&path, &changed).unwrap();
+            let mut rebound = records.clone();
+            rebound.last_mut().unwrap().evidence = AutotuneEvidence::ServerSelected {
+                digest: sqm_identity::sha256sum(&changed).unwrap(),
+            };
+            assert_eq!(
+                verify_server_comparison_report(&directory, &operation, &worker_run_id, &rebound)
+                    .unwrap_err(),
+                "server-comparison-insufficient-independent-sources"
+            );
+        }
+        // Exact old reports remain readable, but new endpoint fields cannot
+        // be relabeled as legacy authority merely by changing schema/policy.
+        let mut legacy = report.clone();
+        legacy["schema_version"] = serde_json::json!(1);
+        legacy["max_servers"] =
+            serde_json::json!(super::super::server_qualification::LEGACY_MAX_SERVERS);
+        legacy["policy_id"] = serde_json::json!(super::super::server_qualification::LEGACY_POLICY);
+        let changed = serde_json::to_vec(&legacy).unwrap();
+        fs::write(&path, &changed).unwrap();
+        let mut rebound = records.clone();
+        rebound.last_mut().unwrap().evidence = AutotuneEvidence::ServerSelected {
+            digest: sqm_identity::sha256sum(&changed).unwrap(),
+        };
+        assert!(
+            verify_server_comparison_report(&directory, &operation, &worker_run_id, &rebound)
+                .is_err()
+        );
+        for row in legacy["comparisons"].as_array_mut().unwrap() {
+            row.as_object_mut().unwrap().remove("endpoint_host");
+            row.as_object_mut().unwrap().remove("endpoint_sha256");
+        }
+        let changed = serde_json::to_vec(&legacy).unwrap();
+        fs::write(&path, &changed).unwrap();
+        rebound.last_mut().unwrap().evidence = AutotuneEvidence::ServerSelected {
+            digest: sqm_identity::sha256sum(&changed).unwrap(),
+        };
+        assert!(
+            verify_server_comparison_report(&directory, &operation, &worker_run_id, &rebound)
+                .unwrap()
+                .is_some()
+        );
+        fs::write(&path, &bytes).unwrap();
+        assert!(verify_server_comparison_report(
+            &directory,
+            &operation,
+            &worker_run_id,
+            &records[..10]
+        )
+        .is_err());
+        for (field, value) in [
+            ("selected_server_id", serde_json::json!(1)),
+            ("debit_count", serde_json::json!(6)),
+            ("capacity_proven", serde_json::json!(true)),
+            ("unexpected", serde_json::json!("field")),
+        ] {
+            let mut tampered = report.clone();
+            tampered[field] = value;
+            let changed = serde_json::to_vec(&tampered).unwrap();
+            fs::write(&path, &changed).unwrap();
+            assert!(verify_server_comparison_report(
+                &directory,
+                &operation,
+                &worker_run_id,
+                &records
+            )
+            .is_err());
+            // Even an internally rehashed snapshot must obey source/policy/
+            // ledger invariants, not merely match an arbitrary digest.
+            let mut rehashed = records.clone();
+            rehashed.last_mut().unwrap().evidence = AutotuneEvidence::ServerSelected {
+                digest: sqm_identity::sha256sum(&changed).unwrap(),
+            };
+            assert!(verify_server_comparison_report(
+                &directory,
+                &operation,
+                &worker_run_id,
+                &rehashed
+            )
+            .is_err());
+        }
+        fs::write(&path, &bytes).unwrap();
+        assert!(
+            verify_server_comparison_report(&directory, &operation, &worker_run_id, &records[..3])
+                .unwrap()
+                .is_none(),
+            "legacy records do not acquire a new sidecar requirement"
+        );
+        publish_server_comparison_report(
+            &directory,
+            &operation,
+            &worker_run_id,
+            &control,
+            4,
+            &comparisons,
+            Some(&Err("speedtest-traffic-budget-exhausted".into())),
+        )
+        .unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let failed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(failed["state"], "failed");
+        assert!(failed["selected_server_id"].is_null());
+        assert_eq!(failed["comparisons"].as_array().unwrap().len(), 7);
+        let diagnostic =
+            read_server_comparison_diagnostic(&directory, &operation, &worker_run_id).unwrap();
+        assert_eq!(diagnostic["proof_status"], "identity-bound-diagnostic-only");
+        assert_eq!(diagnostic["scope"], "no_sqm");
+        assert_eq!(diagnostic["state"], "failed");
+        assert!(diagnostic["selected_server_id"].is_null());
+        assert_eq!(diagnostic["observations"].as_array().unwrap().len(), 6);
+        let exposed = diagnostic.to_string();
+        for private in [
+            "request_sha256",
+            "control_sha256",
+            "route_fingerprint",
+            "worker_run_id",
+            "permit_id",
+            "coordinator_generation",
+            "endpoint_host",
+            "endpoint_sha256",
+            "source-1.example.invalid",
+        ] {
+            assert!(!exposed.contains(private));
+        }
+        assert!(
+            read_server_comparison_diagnostic(&directory, &operation, &"f".repeat(32)).is_err()
+        );
+        let mut changed_request = operation.clone();
+        changed_request.identity.route_fingerprint = "f".repeat(64);
+        assert!(
+            read_server_comparison_diagnostic(&directory, &changed_request, &worker_run_id)
+                .is_err()
+        );
+        let mut unsafe_reason = failed.clone();
+        unsafe_reason["reason"] = serde_json::json!("private endpoint 192.0.2.1 failed");
+        unsafe_reason["comparisons"][1]["reason"] = serde_json::json!("private command text");
+        fs::write(&path, serde_json::to_vec(&unsafe_reason).unwrap()).unwrap();
+        let safe =
+            read_server_comparison_diagnostic(&directory, &operation, &worker_run_id).unwrap();
+        assert_eq!(safe["reason"], "server-comparison-failed");
+        assert_eq!(
+            safe["observations"][0]["reason"],
+            "comparison-attempt-unavailable"
+        );
+        assert!(!safe.to_string().contains("192.0.2.1"));
+        let mut oversized_names = failed.clone();
+        for row in oversized_names["comparisons"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .skip(1)
+        {
+            row["server_name"] = serde_json::json!("\u{0001}".repeat(256));
+            row["server_sponsor"] = serde_json::json!("\u{0002}".repeat(256));
+        }
+        fs::write(&path, serde_json::to_vec(&oversized_names).unwrap()).unwrap();
+        let bounded =
+            read_server_comparison_diagnostic(&directory, &operation, &worker_run_id).unwrap();
+        assert_eq!(bounded["display_metadata_omitted"], true);
+        assert!(bounded.to_string().len() <= 4 * 1024);
+        assert_eq!(bounded["observations"].as_array().unwrap().len(), 6);
+        assert_eq!(bounded["observations"][0]["download_kbps"], 167_500);
+        assert_eq!(bounded["observations"][0]["name"], "");
+        unsafe_reason["control_sha256"] = serde_json::json!("0".repeat(64));
+        fs::write(&path, serde_json::to_vec(&unsafe_reason).unwrap()).unwrap();
+        assert!(read_server_comparison_diagnostic(&directory, &operation, &worker_run_id).is_err());
+        fs::write(&path, &bytes).unwrap();
+        assert!(publish_server_comparison_report(
+            &directory,
+            &operation,
+            &worker_run_id,
+            &control,
+            4,
+            &comparisons,
+            Some(&Ok(Some(1)))
+        )
+        .is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(publish_server_comparison_report(
+            &directory,
+            &operation,
+            &"99".repeat(16),
+            &control,
+            4,
+            &comparisons,
+            None
+        )
+        .is_err());
+        comparisons[1].debit_offset = 0;
+        assert!(publish_server_comparison_report(
+            &directory,
+            &operation,
+            &worker_run_id,
+            &control,
+            4,
+            &comparisons,
+            None
+        )
+        .is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn review_cannot_publish_before_restoration_and_complete_evidence() {
         let request = request(CalibrationStrategy::ShapedOnly, 10_000_000);
         let mut state = AutotuneReplayState::new(&request, &"66".repeat(16)).unwrap();
@@ -26494,7 +29742,7 @@ mod tests {
     }
 
     #[test]
-    fn evidence_store_publishes_atomic_contiguous_records_and_discards_temp() {
+    fn evidence_store_publishes_atomic_contiguous_records_and_preserves_temp() {
         let root = private_temp_directory("store");
         let store = AutotuneEvidenceStore::open(&root).unwrap();
         let first = record(
@@ -26515,7 +29763,65 @@ mod tests {
         fs::write(&abandoned, b"unpublished").unwrap();
         fs::set_permissions(&abandoned, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(store.load().unwrap(), vec![first, second]);
-        assert!(!abandoned.exists());
+        assert_eq!(fs::read(&abandoned).unwrap(), b"unpublished");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn t1_evidence_readers_do_not_create_directories_or_unlink_live_writes() {
+        let root = private_temp_directory("read-only-evidence");
+        assert!(AutotuneEvidenceStore::read_existing(&root).is_err());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        let store = AutotuneEvidenceStore::open(&root).unwrap();
+        let record = record(
+            1,
+            AutotunePhase::Preflight,
+            AutotuneEvidence::PreflightAttested,
+        );
+        let encoded = record.encode().unwrap();
+        let temporary = store.directory().join(".tmp-live-writer-1");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .unwrap();
+        let midpoint = encoded.len() / 2;
+        file.write_all(&encoded.as_bytes()[..midpoint]).unwrap();
+        assert!(AutotuneEvidenceStore::read_existing(&root)
+            .unwrap()
+            .is_empty());
+        assert!(
+            temporary.exists(),
+            "status/history read must not interrupt publication"
+        );
+        file.write_all(&encoded.as_bytes()[midpoint..]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        fs::rename(
+            &temporary,
+            store.directory().join(evidence_name(1).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            AutotuneEvidenceStore::read_existing(&root).unwrap(),
+            vec![record]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn t1_evidence_read_bounds_unpublished_entries_without_deleting_them() {
+        let root = private_temp_directory("unpublished-count-bound");
+        let store = AutotuneEvidenceStore::open(&root).unwrap();
+        for index in 0..=MAX_AUTOTUNE_EVIDENCE_RECORDS * 2 {
+            fs::write(store.directory().join(format!(".tmp-{index}")), b"pending").unwrap();
+        }
+        assert!(store.load().unwrap_err().contains("too many entries"));
+        assert_eq!(
+            fs::read_dir(store.directory()).unwrap().count(),
+            MAX_AUTOTUNE_EVIDENCE_RECORDS * 2 + 1
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -26616,6 +29922,7 @@ mod tests {
             total_units: 0,
             direction: None,
             attempt: None,
+            consumed_traffic_bytes: None,
         };
         assert!(invalid.encode().unwrap_err().contains("active bound"));
         invalid.progress_percent = 99;

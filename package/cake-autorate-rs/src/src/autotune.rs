@@ -5464,6 +5464,44 @@ mod tests {
     }
 
     #[test]
+    fn r7_documented_initial_proposals_have_no_profile_haircut() {
+        let cases: &[(&[f64], u64, u64)] = &[
+            (&[896_000.0, 904_000.0, 900_000.0], 896_000, 903_200),
+            (
+                &[800_000.0, 900_000.0, 1_000_000.0, 1_100_000.0, 1_200_000.0],
+                880_000,
+                1_160_000,
+            ),
+        ];
+        for profile in [
+            AutotuneProfile::Gaming,
+            AutotuneProfile::GamingExtreme,
+            AutotuneProfile::BestOverall,
+            AutotuneProfile::VariableLink,
+            AutotuneProfile::Fair,
+        ] {
+            for direction in [SearchDirection::Download, SearchDirection::Upload] {
+                for &(samples, expected_low, expected_high) in cases {
+                    let proposal = propose_direction(samples, profile, direction, None).unwrap();
+                    assert_eq!(
+                        proposal.base_kbps, expected_low,
+                        "{profile:?} {direction:?}"
+                    );
+                    assert_eq!(proposal.maximum_kbps, expected_high);
+                    assert_eq!(proposal.absolute_cap_kbps, expected_high);
+                    assert_eq!(proposal.exploration_cap_kbps, expected_high);
+                    assert_eq!(proposal.runtime_minimum_kbps, None);
+                    assert_eq!(proposal.tested_safe_maximum_kbps, None);
+                    assert_eq!(
+                        proposal.ceiling_evidence,
+                        CeilingEvidence::UnvalidatedCandidate
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn stable_fibre_proposal_exposes_observed_low_to_search_without_adaptive_ceiling() {
         let proposal = build_proposal(
             &[896_000.0, 904_000.0, 900_000.0],

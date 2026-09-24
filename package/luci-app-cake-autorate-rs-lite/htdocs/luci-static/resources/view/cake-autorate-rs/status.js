@@ -52,10 +52,22 @@ function stateCell(row) {
 	var status = row.status;
 	var enabled = row.config.enabled === '1';
 	var state = status && status.state || (enabled ? 'STARTING' : 'DISABLED');
-	var healthy = !status || status.sqm_runtime_healthy !== false;
+	var degraded = status && status.runtime_control_degraded === true;
+	var healthy = !status || (status.sqm_runtime_healthy !== false && !degraded);
 	var color = !enabled ? '#777' : (healthy ? '#0a8f5a' : '#d94141');
-
-	return E('span', { 'style': 'font-weight:600;color:' + color }, textNode(state));
+	var label = E('span', { 'style': 'font-weight:600;color:' + color,
+		'title': status && status.sqm_runtime_reason || '' }, textNode(state));
+	if (degraded) {
+		return E('div', {}, [label,
+			E('small', { 'role': 'alert', 'style': 'display:block;color:#d94141' },
+				textNode(_('Rate control paused: runtime owner could not be verified.'))),
+			E('small', { 'style': 'display:block' }, textNode(status.runtime_control_error || ''))
+		]);
+	}
+	if (status && status.runtime_control_held === true)
+		return E('div', {}, [label, E('small', { 'style': 'display:block' },
+			textNode(_('Rate control held by an active operation.')))]);
+	return label;
 }
 
 function routeCell(row) {

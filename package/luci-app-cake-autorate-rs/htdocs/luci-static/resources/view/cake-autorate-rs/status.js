@@ -1061,6 +1061,18 @@ function formatQuality(status) {
 	if (!status || !status.transport_latency_enabled)
 		return cakeUi.textElement('span', { 'title': _('Transport-aware estimation is disabled.') }, '-');
 
+	var transportAge = function(age) {
+		return typeof age === 'number' && isFinite(age) && age >= 0 ? age.toFixed(1) + ' s' : _('no sample');
+	};
+	var transportDetails = [
+		_('Transport: %s · sample age: %s').format(status.transport_status || 'missing', transportAge(status.transport_sample_age_s)),
+		_('Directional transport: DL %s (%s) · UL %s (%s)').format(
+			status.transport_dl_status || '-', transportAge(status.transport_dl_sample_age_s),
+			status.transport_ul_status || '-', transportAge(status.transport_ul_sample_age_s)),
+		_('Controller reason: %s').format(status.quality_controller_reason || '-'),
+		_('Missing or stale transport does not block ordinary ICMP growth; optional ceiling promotion requires fresh evidence when transport control is enabled.')
+	].join('\n');
+
 	if (status.quality_grade_state) {
 		if (status.quality_grade_method !== QUALITY_GRADE_METHOD)
 			return cakeUi.textElement('span', { 'title': _('Rating data uses an unsupported evidence contract.') }, _('UNAVAILABLE'));
@@ -1070,6 +1082,7 @@ function formatQuality(status) {
 			lastKnown = null;
 		var state = String(status.quality_grade_state || 'learning_baseline');
 		var title = [
+			transportDetails,
 			_('Detected rating uses the worse of controller ICMP delay increase and transport RTT loaded p90 minus the preceding idle p5. ICMP uses the controller reflector baseline; transport excludes DNS, process startup, and connection handshake time.'),
 			_('Download and upload are scored independently; the worse grade is shown.'),
 			_('A one-direction result is labeled PARTIAL and is never presented as the final connection rating.'),
@@ -1110,7 +1123,7 @@ function formatQuality(status) {
 			_('Rejected sample: %s').format(status.transport_probe_rejected_reason || '-'),
 			_('Last rejected sample: %s').format(status.transport_probe_last_rejected_reason || '-'),
 			_('Transport error code: %s').format(status.transport_error_code || '-'),
-			_('Safe floors: DL %s · UL %s').format(formatRate(status.throughput_floor_dl_kbps), formatRate(status.throughput_floor_ul_kbps))
+			_('Transport search floors (not ICMP minima): DL %s · UL %s').format(formatRate(status.throughput_floor_dl_kbps), formatRate(status.throughput_floor_ul_kbps))
 		].join('\n');
 
 		return cakeUi.textElement('div', { 'class': 'cake-quality-stack', 'title': title }, [
@@ -1125,9 +1138,16 @@ function formatQuality(status) {
 	var confidence = Number(status.quality_confidence || 0);
 	var limited = !!status.quality_limited;
 	var baselineReady = status.transport_status === 'baseline_ready';
+	var transportUnavailable = /^(missing|stale|error)$/.test(status.transport_status || '');
 	if (baselineReady)
 		value = _('BASELINE READY');
+	if (transportUnavailable) {
+		value = _('UNAVAILABLE');
+		confidence = 0;
+		limited = false;
+	}
 	var title = [
+		transportDetails,
 		_('Estimated from ICMP and HTTP/TCP latency; this is not an external benchmark grade.'),
 		_('DL: %s · UL: %s').format(status.quality_dl_class || 'LEARNING', status.quality_ul_class || 'LEARNING'),
 		_('Confidence: %d%%').format(confidence),
@@ -1135,13 +1155,13 @@ function formatQuality(status) {
 		_('Effective delta: %s ms').format(status.effective_latency_delta_ms == null ? '-' : Number(status.effective_latency_delta_ms).toFixed(1)),
 		_('Transport error code: %s').format(status.transport_error_code || '-'),
 		_('Reason: %s').format(status.quality_reason || '-'),
-		_('Safe floors: DL %s · UL %s').format(formatRate(status.throughput_floor_dl_kbps), formatRate(status.throughput_floor_ul_kbps))
+		_('Transport search floors (not ICMP minima): DL %s · UL %s').format(formatRate(status.throughput_floor_dl_kbps), formatRate(status.throughput_floor_ul_kbps))
 	].join('\n');
 
 	return cakeUi.textElement('div', { 'title': title }, [
 		cakeUi.textElement('strong', { 'style': limited ? 'color:#d66' : '' }, value),
 		cakeUi.textElement('small', { 'style': 'display:block;white-space:nowrap' },
-			limited ? _('Estimated · safety floor') :
+			transportUnavailable ? _('Transport evidence unavailable') : limited ? _('Estimated · transport search floor') :
 				(baselineReady ? _('Waiting for loaded traffic · %d%%').format(confidence) : _('Estimated · %d%%').format(confidence)))
 	]);
 }
@@ -1265,6 +1285,17 @@ function formatState(status, enabled, sectionData, health) {
 		cakeUi.textElement('small', { 'style': 'display:block;white-space:nowrap', 'title': priorityTitle || '' },
 			_('Priorities: %s').format(priorities))
 	];
+	if (status && status.runtime_control_degraded === true) {
+		lines.push(cakeUi.textElement('small', {
+			'role': 'alert', 'style': 'display:block;color:#d94141;white-space:normal'
+		}, _('Rate control paused: runtime owner could not be verified.')));
+		if (status.runtime_control_error)
+			lines.push(cakeUi.textElement('small', { 'style': 'display:block;white-space:normal' },
+				status.runtime_control_error));
+	} else if (status && status.runtime_control_held === true) {
+		lines.push(cakeUi.textElement('small', { 'style': 'display:block;white-space:normal' },
+			_('Rate control held by an active operation.')));
+	}
 	if (sectionData && sectionData.autotune_profile === 'variable_link') {
 		var accessMedium = health && health.access_medium || sectionData.access_medium;
 		var accessSource = health && health.access_medium_source ||
@@ -1328,7 +1359,7 @@ function formatState(status, enabled, sectionData, health) {
 			}, cakeUi.text(schedule.warning)));
 		}
 	}
-	if (status && status.sqm_runtime_managed && !status.sqm_runtime_healthy) {
+	if (status && status.sqm_runtime_healthy === false) {
 		var pending = sqmRuntimePending(status);
 		var runtimeState = String(status.sqm_runtime_state || '').toUpperCase();
 		var runtimeLabel = pending ? _('WAITING') : _('ERROR');
@@ -1340,6 +1371,9 @@ function formatState(status, enabled, sectionData, health) {
 			break;
 		case 'WAITING_SQM':
 			runtimeDetail = _('Waiting for SQM hotplug to settle');
+			break;
+		case 'WAITING_EXTERNAL_SQM':
+			runtimeDetail = _('Waiting for external CAKE · no automatic topology repair');
 			break;
 		case 'WAITING_OPERATION':
 			runtimeDetail = _('Waiting for another SQM operation');
@@ -1358,7 +1392,7 @@ function formatState(status, enabled, sectionData, health) {
 				'display:block;color:#f66;white-space:normal;overflow-wrap:anywhere'
 		}, runtimeDetail));
 		return cakeUi.textElement('div', {
-			'title': status.sqm_runtime_reason || _('Managed SQM runtime is unhealthy.')
+			'title': status.sqm_runtime_reason || _('SQM runtime is unhealthy.')
 		}, lines);
 	}
 

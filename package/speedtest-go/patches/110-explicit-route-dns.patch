@@ -1,0 +1,113 @@
+--- a/speedtest.go
++++ b/speedtest.go
+@@ -8,6 +8,7 @@
+ 	"io"
+ 	"log"
++	"net"
+ 	"os"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+@@ -31,6 +31,7 @@
+ 	proxy         = kingpin.Flag("proxy", "Set a proxy(http[s] or socks) for the speedtest.").String()
+ 	source        = kingpin.Flag("source", "Bind a source interface for the speedtest.").String()
+ 	dnsBindSource = kingpin.Flag("dns-bind-source", "DNS request binding source (experimental).").Bool()
++	routeDNSIPv4  = kingpin.Flag("route-dns-ipv4", "Use only this literal IPv4 DNS server over source-bound TCP; requires --source.").String()
+ 	multi         = kingpin.Flag("multi", "Enable multi-server mode.").Short('m').Bool()
+ 	thread        = kingpin.Flag("thread", "Set the number of concurrent connections.").Short('t').Int()
+ 	search        = kingpin.Flag("search", "Fuzzy search servers by a keyword.").String()
+@@ -50,6 +51,17 @@
+ func main() {
+ 	kingpin.Version(fmt.Sprintf("speedtest-go v%s git-%s built at %s", speedtest.Version(), commit, date))
+ 	kingpin.Parse()
++	if *routeDNSIPv4 != "" {
++		resolver, err := newRouteDNSResolver(*source, *routeDNSIPv4)
++		if err != nil {
++			fmt.Fprintln(os.Stderr, err)
++			os.Exit(2)
++		}
++		// Prevent NewUserConfig's legacy source-binding resolver from replacing
++		// the explicit DNS endpoint. Install before any location/user discovery.
++		net.DefaultResolver = resolver
++		*dnsBindSource = false
++	}
+ 	AppInfo()
+ 
+ 	speedtest.SetUnit(parseUnit(*unit))
+--- /dev/null
++++ b/cake_route_dns.go
+@@ -0,0 +1,40 @@
++package main
++
++import (
++	"context"
++	"fmt"
++	"net"
++	"time"
++)
++
++// This opt-in CLI resolver never consults the system DNS endpoint. The owning
++// process supplies source routing and egress enforcement; DNS uses TCP/IPv4 only.
++func newRouteDNSResolver(source, server string) (*net.Resolver, error) {
++	parse := func(value string) net.IP {
++		ip := net.ParseIP(value)
++		if ip == nil || ip.To4() == nil || ip.String() != value {
++			return nil
++		}
++		ip = ip.To4()
++		if ip[0] == 0 || ip[0] >= 224 || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
++			return nil
++		}
++		return ip
++	}
++	local, remote := parse(source), parse(server)
++	if local == nil || remote == nil {
++		return nil, fmt.Errorf("--route-dns-ipv4 requires canonical unicast IPv4 source and DNS addresses")
++	}
++	dialer := &net.Dialer{
++		Timeout: 5 * time.Second,
++		LocalAddr: &net.TCPAddr{IP: local},
++	}
++	endpoint := net.JoinHostPort(remote.String(), "53")
++	return &net.Resolver{
++		PreferGo: true,
++		StrictErrors: true,
++		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
++			return dialer.DialContext(ctx, "tcp4", endpoint)
++		},
++	}, nil
++}
+--- /dev/null
++++ b/cake_route_dns_test.go
+@@ -0,0 +1,31 @@
++package main
++
++import (
++	"context"
++	"errors"
++	"testing"
++)
++
++func TestCakeRouteDNSValidation(t *testing.T) {
++	for _, value := range []string{"", "localhost", "192.0.2.53:53", " 192.0.2.53",
++		"::1", "::ffff:192.0.2.53", "0.0.0.0", "0.1.2.3", "127.0.0.1",
++		"169.254.1.2", "224.0.0.1", "255.255.255.255"} {
++		if _, err := newRouteDNSResolver("192.0.2.1", value); err == nil {
++			t.Fatalf("accepted DNS %q", value)
++		}
++		if _, err := newRouteDNSResolver(value, "192.0.2.53"); err == nil {
++			t.Fatalf("accepted source %q", value)
++		}
++	}
++	resolver, err := newRouteDNSResolver("192.0.2.1", "192.0.2.53")
++	if err != nil || !resolver.PreferGo || !resolver.StrictErrors || resolver.Dial == nil {
++		t.Fatalf("valid resolver: %v, %v", resolver, err)
++	}
++	// A cancelled operation must fail without falling back to a system endpoint.
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	conn, err := resolver.Dial(ctx, "udp6", "[::1]:53")
++	if conn != nil || !errors.Is(err, context.Canceled) {
++		t.Fatalf("cancelled resolver: %v, %v", conn, err)
++	}
++}

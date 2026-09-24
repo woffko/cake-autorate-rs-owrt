@@ -35,6 +35,28 @@ const retiredRpcdHelper = path.join(
 	'rpcd-helper',
 );
 const group = document['luci-app-cake-autorate-rs'];
+// rpcd checks both the requested path and the realpath target of /var -> /tmp.
+for (const [relative, permissions] of [
+	['cake-autorate/*/status.json', ['read']],
+	['cake-autorate/*/history.csv', ['read']],
+	['sqm/available_qdiscs', ['list']],
+]) {
+	assert.deepStrictEqual(group.read.file['/tmp/run/' + relative], permissions);
+	assert.deepStrictEqual(group.read.file['/var/run/' + relative], permissions);
+	assert.equal(group.write.file['/tmp/run/' + relative], undefined);
+}
+const lite = JSON.parse(fs.readFileSync(path.join(__dirname, '../../luci-app-cake-autorate-rs-lite/root/usr/share/rpcd/acl.d/luci-app-cake-autorate-rs-lite.json'), 'utf8'))['luci-app-cake-autorate-rs-lite'];
+assert.deepStrictEqual(lite.read.file['/tmp/run/cake-autorate/*/status.json'], ['read']);
+for (const acl of [group, lite]) {
+	for (const broad of ['/tmp/*', '/tmp/run/*', '/tmp/run/cake-autorate/*']) {
+		assert.equal(acl.read.file[broad], undefined);
+		assert.equal((acl.write.file || {})[broad], undefined);
+	}
+}
+assert.deepStrictEqual(group.read.ubus['cake-autorate-config'], [ 'schema', 'mq_status' ]);
+assert.deepStrictEqual(group.write.ubus['cake-autorate-config'], [ 'begin', 'append', 'finish', 'cancel', 'mq_probe' ]);
+assert.equal(Object.keys(group.write.file).some(key => key.includes('.candidate-checks')), false,
+	'candidate transport must not grant arbitrary file writes into its private namespace');
 
 assert(group, 'CAKE Autorate ACL group is missing');
 assert.deepStrictEqual(

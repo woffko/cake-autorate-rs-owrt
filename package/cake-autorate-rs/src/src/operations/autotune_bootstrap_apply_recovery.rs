@@ -342,6 +342,25 @@ impl NativeBootstrapPreparedMutation {
 }
 
 impl NativeBootstrapApplyRecoveryStore {
+    /// Install exact historical serializer bytes into a private test store.
+    /// Production preparation still requires a valid current execution plan;
+    /// restart recovery must instead validate the durable byte bundle itself.
+    #[cfg(test)]
+    pub(crate) fn install_historical_probe_manifest_for_test(
+        &self,
+        plan: &NativeBootstrapApplyPlan,
+    ) -> Result<NativeBootstrapApplyRecoveryRecord, String> {
+        let (manifest, candidate) = plan.historical_probe_manifest_for_test()?;
+        let mut record = self.read_record()?.ok_or("fixture has no record")?;
+        record.manifest_sha256 = sqm_identity::sha256sum(&manifest)?;
+        record.composite_candidate_id = candidate;
+        fs::write(self.current_path().join(MANIFEST_FILE), manifest)
+            .map_err(|error| error.to_string())?;
+        fs::write(self.current_path().join(STATE_FILE), record.encode()?)
+            .map_err(|error| error.to_string())?;
+        Ok(record)
+    }
+
     pub(crate) fn new(root: &Path) -> Self {
         Self {
             // V4 and V6 deliberately cannot publish `current/state` into the
@@ -1193,9 +1212,31 @@ mod tests {
         assert_eq!(fs::read(&fixture.sqm).unwrap(), fixture.sqm_original);
         assert_eq!(record.encode().unwrap(), record.encode().unwrap());
         assert_eq!(record.encode().unwrap().len(), 1_050);
+        let legacy_fixture = Fixture::new("prepare-legacy-pin");
+        let legacy_plan = plan
+            .clone()
+            .with_legacy_managed_probe_defaults_for_test()
+            .unwrap();
+        legacy_fixture
+            .store()
+            .prepare(
+                &legacy_plan,
+                &legacy_plan.canonical_manifest_bytes().unwrap(),
+                &legacy_fixture.cake,
+                &legacy_fixture.sqm,
+            )
+            .unwrap();
+        let legacy_record = legacy_fixture
+            .store()
+            .install_historical_probe_manifest_for_test(&legacy_plan)
+            .unwrap();
+        assert_eq!(
+            sqm_identity::sha256sum(&legacy_record.encode().unwrap()).unwrap(),
+            "8fed78737aa24ed4b3939519ced08831ba207250298082beb975e827c95aa41a"
+        );
         assert_eq!(
             sqm_identity::sha256sum(&record.encode().unwrap()).unwrap(),
-            "8fed78737aa24ed4b3939519ced08831ba207250298082beb975e827c95aa41a"
+            "065b9fbef74d635705eae8b74f48fd8014cc7fb3e634d5cadfb7565132697172"
         );
         assert_eq!(
             NativeBootstrapApplyRecoveryRecord::decode(&record.encode().unwrap()).unwrap(),

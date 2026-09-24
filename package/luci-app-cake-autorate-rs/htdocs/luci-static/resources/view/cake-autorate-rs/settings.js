@@ -7,6 +7,8 @@
 'require ui';
 'require tools.widgets as widgets';
 'require cake-autorate-rs.ui as cakeUi';
+'require cake-autorate-rs.candidate as candidateGuard';
+'require cake-autorate-rs.sqm as sqmModes';
 
 var AUTOTUNE_PROFILE_SEARCH_SCHEMA_VERSION = 4;
 
@@ -56,7 +58,7 @@ var optionDescriptions = {
 	speedtest_go_server_id: 'Optional speedtest-go server ID. Leave empty to automatically validate nearby servers and reuse the first good one; set an ID to pin a known-good server.',
 	_wizard_sqm_queue: 'Existing unmanaged SQM queues on the selected interface are reused to avoid duplicate shapers.',
 	_wizard_advanced_test_options: 'Show native backend selection, speed test headroom, and reflector planning. Auto defaults are suitable for normal setup.',
-	manual_rate_limits: 'Show explicit min, base, and max autorate limits. Leave off to derive them from download and upload speeds.',
+	manual_rate_limits: 'Show explicit min, base, and max autorate limits. When off, a speed C sets base=max=C and min=half of C. This is a configured ceiling, not a measured capacity. Separately enabled adaptive ceiling may explore above it within its cap.',
 	advanced_settings: 'Show detailed SQM, reflector, controller, logging, and daemon tuning settings.',
 	min_dl_shaper_rate_kbps: 'Lowest download shaper rate autorate may apply, in kbit/s.',
 	base_dl_shaper_rate_kbps: 'Starting download shaper rate before autorate adjusts it, in kbit/s.',
@@ -76,7 +78,7 @@ var optionDescriptions = {
 	capacity_learning_policy: 'Choose whether runtime stays at validated bounds, learns from real sustained traffic, schedules traffic-generating recalibration, or obeys explicit service caps.',
 	service_dl_cap_kbps: 'Optional provider/service-plan download hard cap. It can only tighten a measured bound and is never used to invent capacity above a raw control.',
 	service_ul_cap_kbps: 'Optional provider/service-plan upload hard cap. It can only tighten a measured bound and is never used to invent capacity above a raw control.',
-	transport_latency_enabled: 'Measure real network RTT with a persistent native transport connection. DNS, process startup, and the TLS/WebSocket handshake are excluded. Rating is passive unless the controller is enabled separately.',
+	transport_latency_enabled: 'Optional permanent external connection, disabled by default. Auto-Tune uses temporary probes; Apply preserves this setting. DNS, process startup, and the TLS/WebSocket handshake are excluded from RTT. Rating is passive unless the controller is enabled separately.',
 	transport_controller_enabled: 'Allow confirmed transport RTT windows to reduce CAKE rates. Disabled by default for safe upgrades. A bad direction must be confirmed twice and can never cross the configured throughput floor.',
 	transport_probe_backend: 'WebSocket is the recommended LibreQoS-compatible persistent RTT method. TCP connect and persistent HTTP are comparison fallbacks. Legacy HTTP includes process and handshake overhead, is diagnostic-only, and cannot drive the controller.',
 	transport_probe_endpoint: 'Endpoint for the selected native backend. Probes are bound to this instance route, source address, device, and mwan3 mark.',
@@ -187,7 +189,7 @@ var optionDescriptions = {
 	retain_reflector_stats: 'Keep reflector statistics when replacing or restarting probes.',
 	no_pingers: 'Number of concurrent reflector probes to run.',
 	reflector_ping_interval_s: 'Seconds between pings sent by each reflector probe.',
-	ping_extra_args: 'Additional safe arguments passed to pingers. In multi-WAN setups, upstream cake-autorate requires using this or Ping prefix so probes leave through the target interface, for example -I eth2.',
+	ping_extra_args: 'Additional user arguments passed to pingers. Automatic binding is derived from the current route at runtime. Conflicting saved interface/source pins are rejected; review legacy -I values after changing interfaces.',
 	ping_prefix_string: 'Optional command prefix for launching pingers, for example mwan3 use wan2 exec. Use this instead of Extra ping args when policy-routing wrappers should select the uplink.',
 	irtt_session_duration_m: 'Duration of each IRTT client session in minutes. Longer sessions reduce restart gaps but use more memory inside irtt.',
 	output_processing_stats: 'Log detailed controller processing statistics.',
@@ -199,13 +201,12 @@ var optionDescriptions = {
 	output_cpu_raw_stats: 'Log raw /proc/stat CPU counter lines for diagnostics.',
 	debug: 'Enable extra debug output from the daemon.',
 	log_DEBUG_messages_to_syslog: 'Send debug messages to syslog instead of only the normal log path.',
-	log_to_file: 'Write daemon logs to files in addition to stdout/syslog.',
+	log_to_file: 'Write ordinary daemon logs to bounded files. Important errors and SYSLOG messages also reach the system log.',
 	log_file_max_time_mins: 'Maximum age of a log file before rotation, in minutes.',
-	log_file_max_size_KB: 'Maximum log file size before rotation, in KiB.',
+	log_file_max_size_KB: 'Maximum size of each active or previous log, in KiB. One previous file is retained. Zero uses the hard 16384 KiB limit.',
 	log_file_path_override: 'Directory for daemon log files. Leave empty for the default path.',
 	log_file_buffer_size_B: 'Buffered log write size in bytes.',
 	log_file_buffer_timeout_ms: 'Maximum time before flushing buffered log output.',
-	log_file_export_compress: 'Compress rotated daemon logs with gzip when available.',
 	mqtt_enabled: 'Start the native MQTT telemetry publisher for this instance. It reads bounded daemon log records and publishes Home Assistant discovery, state, and availability directly.',
 	mqtt_host: 'MQTT broker host or address. Required only when the MQTT publisher is enabled.',
 	mqtt_port: 'MQTT broker port. Leave empty to use 1883.',
@@ -862,64 +863,25 @@ function ifbForWan(wan_if) {
 	return wan_if ? 'ifb4' + wan_if : '';
 }
 
-function pingerSupportsInterfaceArg(method) {
-	return method !== 'irtt';
-}
-
-function pingerInterfaceArgs(wan_if, method) {
-	wan_if = normalizeInterfaceName(wan_if);
-	method = method || 'fping';
-
-	if (!wan_if || !pingerSupportsInterfaceArg(method))
-		return '';
-
-	return '-I ' + wan_if;
-}
-
-function generatedPingerInterfaceArgs(value) {
-	return /^-I [A-Za-z0-9_.:-]+$/.test(value || '');
-}
-
-function maybeSetPingerInterfaceArgs(section, section_id, wan_if, method) {
-	var currentArgs = formOrUci(section, section_id, 'ping_extra_args');
-	var currentPrefix = formOrUci(section, section_id, 'ping_prefix_string');
-	var args;
-
-	if (currentPrefix || (currentArgs && !generatedPingerInterfaceArgs(currentArgs)))
-		return;
-
-	args = pingerInterfaceArgs(wan_if, method || formOrUci(section, section_id, 'pinger_method') || 'fping');
-
-	if (args)
-		setCakeOption(section, section_id, 'ping_extra_args', args);
-}
-
 function parsePositiveRate(value) {
 	var parsed;
 
 	if (value == null || value === '')
 		return null;
 
-	parsed = parseInt(value, 10);
-	return isNaN(parsed) || parsed < 0 ? null : parsed;
+	if (!/^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$/.test(String(value)))
+		return null;
+	parsed = Number(value);
+	return !Number.isFinite(parsed) || parsed < 0 ? null : parsed;
 }
 
 function validateRateOrder(section, section_id, direction) {
-	var min = parsePositiveRate(formOrUci(section, section_id, 'min_' + direction + '_shaper_rate_kbps'));
-	var base = parsePositiveRate(formOrUci(section, section_id, 'base_' + direction + '_shaper_rate_kbps'));
-	var max = parsePositiveRate(formOrUci(section, section_id, 'max_' + direction + '_shaper_rate_kbps'));
-	var label = direction === 'dl' ? _('download') : _('upload');
-
-	if (min == null || base == null || max == null)
-		return true;
-
-	if (min > base)
-		return _('Minimum %s rate must not exceed the base rate.').format(label);
-
-	if (base > max)
-		return _('Base %s rate must not exceed the maximum rate.').format(label);
-
-	return true;
+	var enabled = candidateGuard.directionEnabled(direction, function(key) {
+		return formOrUci(section, section_id, key);
+	});
+	return candidateGuard.validateRateTuple([ 'min', 'base', 'max' ].map(function(part) {
+		return formOrUci(section, section_id, part + '_' + direction + '_shaper_rate_kbps');
+	}), direction, enabled);
 }
 
 function adaptiveConfiguredMax(section, section_id, direction) {
@@ -1378,7 +1340,6 @@ function applyWanPreset(section_id, wan_if, importRates, section) {
 	setCakeOption(section, section_id, 'sqm_interface', wan_if);
 	setCakeOption(section, section_id, 'ul_if', wan_if);
 	setCakeOption(section, section_id, 'dl_if', ifbForWan(wan_if));
-	maybeSetPingerInterfaceArgs(section, section_id, wan_if);
 	applySqmSectionPreset(section_id, wan_if, importRates, section);
 
 	if (importRates)
@@ -1589,7 +1550,6 @@ var NATIVE_AUTOTUNE_APPLY_CONTRACT_SCHEMA_VERSION = 3;
 var NATIVE_AUTOTUNE_PUBLIC_PRODUCER = 'cake-autorated-native-autotune';
 var NATIVE_AUTOTUNE_COMMAND = '/usr/sbin/cake-autorated';
 var NATIVE_AUTOTUNE_PROTOCOL_VERSION = 2;
-var NATIVE_AUTOTUNE_INTERACTIVE_TRAFFIC_BUDGET_BYTES = 32000000000;
 var NATIVE_AUTOTUNE_APPLY_MAX_WATCH_RESPONSES = 72;
 var NATIVE_AUTOTUNE_APPLY_RPC_RETRIES = 3;
 var nativeAutotuneJobs = {};
@@ -2132,7 +2092,77 @@ function nativeAutotuneRawFallbackValidated(raw, option, directionalOption) {
 		directionValidated(raw.upload, 'upload', [ 'upload_unshaped', 'no_sqm' ]);
 }
 
+function nativeServerComparisonValidated(value, diagnostic = false) {
+	// Native qualification permits two batches of three servers, three slots each.
+	// Failed candidates are skipped, so observation indices may contain gaps.
+	var maxObservations = 18;
+	var id = function(v) { return Number.isSafeInteger(v) && v > 0; };
+	var rate = function(v) { return v === null || (Number.isSafeInteger(v) && v >= 0 && v <= 100000000); };
+	if (!value || value.schema_version !== 1 || !/^[0-9a-f]{64}$/.test(value.report_sha256 || '') ||
+		!(id(value.selected_server_id) || (diagnostic === true && value.selected_server_id === null)) ||
+		[ 'no_sqm', 'both_shaped' ].indexOf(value.scope) < 0 ||
+		value.proof_status !== (diagnostic === true ? 'identity-bound-diagnostic-only' : 'source-comparison-only') || !Array.isArray(value.observations) ||
+		value.observations.length < (diagnostic === true ? 0 : 6) || value.observations.length > maxObservations)
+		return false;
+	if (diagnostic === true && ([ 'running', 'selected', 'failed' ].indexOf(value.state) < 0 ||
+		(value.state === 'selected') !== id(value.selected_server_id) ||
+		(value.reason !== null && (typeof value.reason !== 'string' || !/^[a-z0-9-]{1,128}$/.test(value.reason)))))
+		return false;
+	return value.observations.every(function(row) {
+		return row && Number.isSafeInteger(row.index) && row.index >= 1 && row.index <= maxObservations &&
+			id(row.candidate_id) && (row.server_id === null || id(row.server_id)) &&
+			typeof row.name === 'string' && row.name.length <= 512 &&
+			typeof row.sponsor === 'string' && row.sponsor.length <= 512 &&
+			typeof row.reason === 'string' && row.reason.length <= 128 &&
+			typeof row.valid_observation === 'boolean' && rate(row.download_kbps) && rate(row.upload_kbps) &&
+			Number.isSafeInteger(row.elapsed_ms) && row.elapsed_ms >= 0 &&
+			(!row.valid_observation || (row.server_id === row.candidate_id && row.download_kbps > 0 && row.upload_kbps > 0));
+	}) && ((diagnostic === true && value.selected_server_id === null) || value.observations.filter(function(row) {
+		return row.valid_observation && row.server_id === value.selected_server_id;
+	}).length === 3);
+}
+
+function renderNativeServerComparison(value, diagnostic = false) {
+	if (!nativeServerComparisonValidated(value, diagnostic))
+		return E('p', {}, _('Server comparison data is unavailable or invalid.'));
+	var rate = function(v) { return v === null ? '-' : (v / 1000).toFixed(2) + ' Mbit/s'; };
+	var rows = [ E('tr', {}, [ _('Server'), _('Download'), _('Upload'), _('Observation'), _('Elapsed (s)') ].map(function(title) {
+		return E('th', { 'class': 'th' }, cakeUi.text(title));
+	})) ];
+	value.observations.forEach(function(row) {
+		var outcome = row.valid_observation ? (row.server_id === value.selected_server_id ?
+			_('Selected source') : (value.selected_server_id === null ? _('Measured; selection incomplete') : _('Valid measurement; not selected'))) : _('Rejected: %s').format(row.reason);
+		rows.push(E('tr', {}, [
+			'%s · %s · %s'.format(row.candidate_id, row.name || '-', row.sponsor || '-'),
+			rate(row.download_kbps), rate(row.upload_kbps), outcome, (row.elapsed_ms / 1000).toFixed(2)
+		].map(function(text) { return E('td', { 'class': 'td' }, cakeUi.text(text)); })));
+	});
+	return E('details', { 'style': 'margin-top:8px' }, [
+		E('summary', {}, _('Test server comparison')),
+		E('p', {}, cakeUi.text(diagnostic === true ?
+			_('Diagnostic snapshot only; this is not an applicable proposal or proof of line capacity. Selection state: %s. Reason: %s.').format(value.state, value.reason || '-') :
+			_('Selected server: %s. Scope: %s. These observations compare load sources; they do not by themselves prove line capacity.').format(
+				value.selected_server_id, value.scope === 'no_sqm' ? _('Unshaped test path') : _('Current CAKE ceiling')))),
+		(diagnostic === true && value.display_metadata_omitted === true) ?
+			E('p', {}, _('Long server names were omitted to keep the status response bounded. Server IDs and measurements are retained.')) : null,
+		E('div', { 'style': 'overflow-x:auto' }, E('table', { 'class': 'table' }, rows))
+	]);
+}
+
+function nativePriorRawComparisonValidated(value) {
+	return value && value.schema_version === 1 &&
+		value.proof_status === 'verified-prior-review-diagnostic-only' &&
+		(value.new_apply_blocked === undefined || typeof value.new_apply_blocked === 'boolean') &&
+		/^[0-9a-f]{32}$/.test(value.prior_job_id || '') &&
+		Number.isSafeInteger(value.prior_created_unix_ms) && value.prior_created_unix_ms > 0 &&
+		[ 'current_download_kbps', 'current_upload_kbps', 'prior_download_kbps', 'prior_upload_kbps' ].every(function(key) {
+			return Number.isSafeInteger(value[key]) && value[key] > 0 && value[key] <= 100000000;
+		});
+}
+
 function nativeAutotunePublicResultValidated(result) {
+	if (result && result.server_comparison != null && !nativeServerComparisonValidated(result.server_comparison))
+		return false;
 	var rawPublicResult = result &&
 		(result.native_public_schema_version === 4 ||
 		 result.native_public_schema_version === 5 ||
@@ -2561,6 +2591,8 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 	var topology = artifacts.topology_comparison && artifacts.topology_comparison.value;
 	var rawFallback = artifacts.raw_fallback && artifacts.raw_fallback.value;
 	var disabledFallback = result.native_public_schema_version === 4;
+	var priorApplyBlocked = nativePriorRawComparisonValidated(result.prior_raw_comparison) &&
+		result.prior_raw_comparison.new_apply_blocked === true;
 	var topologyBudgetLimitedDirections = disabledFallback ? [] : [ 'download', 'upload' ].filter(function(direction) {
 		return topology && topology[direction] &&
 			topology[direction].reason === 'traffic-budget-limited';
@@ -2680,10 +2712,12 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 			var isSelected = candidate.option_id === option.option_id;
 			var border = isSelected ? 'var(--primary-color,#00a0d2)' : 'rgba(127,127,127,.4)';
 			var flags = [];
-			if (candidate.preferred)
+			if (candidate.preferred && !priorApplyBlocked)
 				flags.push(_('recommended for this profile'));
-			if (candidate.auto_apply_evidence_pass)
-				flags.push(_('all evidence gates passed'));
+			if (priorApplyBlocked)
+				flags.push(_('not eligible for a new Apply: large decline from previous test'));
+			else if (candidate.auto_apply_evidence_pass)
+				flags.push(_('Auto-Apply checks passed'));
 			else
 				flags.push(_('%d confirmations required').format(candidate.required_acknowledgements.length));
 			if (evidence.transportCensored)
@@ -2705,13 +2739,13 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 						render();
 					}
 				}), ' ',
-				E('strong', {}, roleLabels[candidate.option_id] || candidate.option_id.replace(/_/g, ' ')),
+				E('strong', {}, priorApplyBlocked && candidate.option_id === 'recommended' ? _('Unconfirmed result') : (roleLabels[candidate.option_id] || candidate.option_id.replace(/_/g, ' '))),
 				E('div', { 'style': 'margin-top:5px' }, _('Class %s · %s').format(evidence.grade,
 					candidate.selected_topology.replace(/_/g, ' '))),
-				E('div', {}, _('CAKE DL / UL: %s / %s kbit/s').format(
+				E('div', {}, _('Proposed CAKE DL / UL: %s / %s kbit/s').format(
 					rates.download == null ? _('off') : rates.download,
 					rates.upload == null ? _('off') : rates.upload)),
-				E('div', {}, _('Measured DL / UL: %s / %s kbit/s').format(
+				E('div', {}, _('Observed test DL / UL: %s / %s kbit/s').format(
 					achieved.download == null ? '-' : achieved.download,
 					achieved.upload == null ? '-' : achieved.upload)),
 				E('small', { 'style': 'display:block;margin-top:5px' }, flags.join(' · '))
@@ -2757,13 +2791,14 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 					]);
 				})() ]
 			)
-		] : [ E('span', {}, _('All automatic evidence gates passed; clicking Apply is still an explicit confirmation.')) ];
+		] : [ E('span', {}, priorApplyBlocked ? _('Rerun the test or investigate the link and sources before applying this result.') : _('All automatic evidence gates passed; clicking Apply is still an explicit confirmation.')) ];
 
 		var applyButton = E('button', {
 			'type': 'button',
 			'class': 'btn cbi-button cbi-button-positive important',
-			'disabled': state.pending || !allAccepted ? 'disabled' : null,
+			'disabled': state.pending || !allAccepted || priorApplyBlocked ? 'disabled' : null,
 			'click': function() {
+				if (priorApplyBlocked) return;
 				state.pending = true;
 				state.error = '';
 				render();
@@ -2815,11 +2850,25 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 		}
 
 		var nodes = [
-			E('strong', {}, _('Full Auto-Tune Review · ready to apply')),
+			E('strong', {}, priorApplyBlocked ? _('Full Auto-Tune Review · throughput decline requires investigation') : _('Full Auto-Tune Review · ready to apply')),
 			E('p', {}, disabledFallback ?
 				_('The shaped search could not produce an observable candidate. The verified raw controls were preserved and can create one disabled, uncalibrated instance. No rate is invented and SQM remains absent until you calibrate or configure it later.') :
 				_('Calibration completed and restored runtime state. Every option is reconstructed from private evidence and bound to its own manifest; browser rate values are never Apply authority.')),
 		];
+		if (!disabledFallback)
+			nodes.push(E('p', { 'class': 'cake-autotune-capacity-scope' },
+				_('Observed test throughput is what this run transferred. Proposed CAKE rates are shaping settings, not a measurement of line capacity. Stable results from several servers alone cannot exclude a shared bottleneck or prove the maximum line capacity. Viewing or skipping this Review does not apply these settings.')));
+		if (result.server_comparison)
+			nodes.push(renderNativeServerComparison(result.server_comparison));
+		if (nativePriorRawComparisonValidated(result.prior_raw_comparison)) {
+			var prior = result.prior_raw_comparison;
+			nodes.push(E('p', { 'class': 'cake-autotune-prior-throughput' }, cakeUi.text(
+				_('Same-route comparison with a verified earlier Full raw test in this boot: current raw DL / UL %s / %s kbit/s; earlier %s / %s kbit/s (%s%% / %s%% retained). These are observed control rates, not line-capacity guarantees. A decrease can reflect the link or the test sources. This diagnostic grants no Apply authority; new scheduled runs require Review after a drop below 50% in either direction.').format(
+					prior.current_download_kbps, prior.current_upload_kbps,
+					prior.prior_download_kbps, prior.prior_upload_kbps,
+					(100 * prior.current_download_kbps / prior.prior_download_kbps).toFixed(1),
+					(100 * prior.current_upload_kbps / prior.prior_upload_kbps).toFixed(1)))));
+		}
 		if (selectedEvidence.transportCensored) {
 			nodes.push(E('div', {
 				'class': 'alert-message warning',
@@ -2974,7 +3023,7 @@ function autotuneCalibrationStrategyControl(state, disabled, onChange, bootstrap
 	var reuseAvailable = autotuneHasTrustedCapacityReferences(state);
 	var descriptions = {
 		shaped_only: _('Keeps managed CAKE active while measuring. Safest default; it searches only inside capacity the current bounds can demonstrate.'),
-		full_raw: _('Temporarily bypasses only the direction being measured, under the recovery watchdog. This can consume more traffic and briefly removes shaping for that direction.'),
+		full_raw: _('Temporarily bypasses the tested direction(s), including both during server comparison, under the recovery watchdog. Only the selected uplink is affected; this can consume substantially more traffic.'),
 		reuse_trusted: reuseAvailable ?
 			_('Revalidates the currently trusted/configured bounds without opening a raw-capacity path. It does not claim a new physical line rate.') :
 			_('Requires saved DL and UL P50 capacity references from a completed calibration. Run Shaped only or Full raw capacity first and apply its proposal.')
@@ -3461,9 +3510,205 @@ function nativeAutotuneIntentSupported(backend, routeMode, existingInstance,
 		Number(ulCap) >= 100 && Number(ulCap) <= 100000000;
 }
 
+var AUTOTUNE_TRAFFIC_PRESET_GB = [ 1, 5, 10, 25, 50, 100 ];
+
+function validatedAutotuneTrafficPolicy(policy) {
+	if (policy && (policy.version == null || policy.version === 1)) {
+		if (policy.mode === 'unlimited' && policy.bytes == null)
+			return { mode: 'unlimited' };
+		if (policy.mode === 'capped' && Number.isSafeInteger(policy.bytes) && policy.bytes > 0 && policy.bytes <= 1099511627776)
+			return { mode: 'capped', bytes: policy.bytes };
+	}
+	throw new Error(_('Choose Unlimited or a positive total traffic budget (up to 1099.511627776 GB).'));
+}
+
+function autotuneTrafficPolicyFromInput(mode, gigabytes) {
+	if (mode === 'unlimited')
+		return validatedAutotuneTrafficPolicy({ mode: mode });
+	var preset = AUTOTUNE_TRAFFIC_PRESET_GB.find(function(value) { return mode === 'gb:' + value; });
+	if (preset != null) {
+		mode = 'capped';
+		gigabytes = String(preset);
+	}
+	var value = String(gigabytes || '').trim();
+	if (mode !== 'capped' || !/^(0|[1-9][0-9]*)(\.[0-9]{1,9})?$/.test(value))
+		return validatedAutotuneTrafficPolicy(null);
+	var parts = value.split('.');
+	var bytes = Number(parts[0]) * 1000000000 + Number((parts[1] || '').padEnd(9, '0'));
+	return validatedAutotuneTrafficPolicy({ mode: mode, bytes: bytes });
+}
+
+// Planning admission estimate, never a physical rate bound or stopping authority.
+// Counts mirror the native planner; tests bind them to its source constants.
+function autotuneTrafficPlanningEstimate(profile, strategy, downloadMbps, uploadMbps) {
+	var rates = [ downloadMbps, uploadMbps ].map(function(value) {
+		if (typeof value !== 'string' || !/^\d+(?:\.\d{1,3})?$/.test(value.trim()))
+			return NaN;
+		var parts = value.trim().split('.');
+		return Number(parts[0]) * 1000 + Number((parts[1] || '').padEnd(3, '0'));
+	});
+	if (rates.some(function(rate) { return !Number.isSafeInteger(rate) || rate <= 0 || rate > 100000000; }))
+		return null;
+	var qualification = 3 * 3;
+	var qualificationWithBackups = 6 * 3;
+	var controls = 2;
+	var search = [ 'variable_link', 'gaming_extreme' ].indexOf(profile) >= 0 ? 12 : 8;
+	var pairs = 3;
+	// Include both optional raw repeats and the optional mobile bypass check.
+	var topology = strategy === 'full_raw' ? 2 + 1 : 0;
+	var captures = controls + search + pairs + topology;
+	var bytesPerSecond = (rates[0] + rates[1]) * 1000 / 8;
+	return {
+		planning_download_kbps: rates[0], planning_upload_kbps: rates[1],
+		qualification_runs: qualification,
+		qualification_runs_with_backups: qualificationWithBackups,
+		// Two independent stable servers, three repeats each, plus two
+		// initial controls per direction. This is a planning admission rule,
+		// not a proven throughput lower bound or a complete-search quote.
+		initial_plan_bytes: Math.ceil(bytesPerSecond * 15 * (2 * 3 + controls)),
+		captures_per_direction: captures,
+		search_per_direction: search,
+		// v1.7.10 normally has a 15-second capture timer; convergence can end
+		// earlier. Three loads per capture is the native sampling retry limit.
+		single_load_bytes: Math.ceil(bytesPerSecond * 15 * (qualification + captures)),
+		repeated_load_bytes: Math.ceil(bytesPerSecond * 15 * (qualification + 3 * captures)),
+		backup_qualification_bytes: Math.ceil(bytesPerSecond * 15 * (qualificationWithBackups - qualification))
+	};
+}
+
+function autotuneTrafficPolicyControl(state, instance, disabled) {
+	var key = 'cake-autorate-autotune-traffic-v1:' + instance;
+	if (state._traffic_policy_instance !== instance) {
+		var saved = null;
+		try { saved = validatedAutotuneTrafficPolicy(JSON.parse(window.localStorage.getItem(key))); } catch (error) {}
+		state._traffic_policy_instance = instance;
+		state._traffic_policy_mode = saved ? saved.mode : '';
+		if (saved && saved.mode === 'capped' && AUTOTUNE_TRAFFIC_PRESET_GB.indexOf(saved.bytes / 1000000000) >= 0)
+			state._traffic_policy_mode = 'gb:' + (saved.bytes / 1000000000);
+		state._traffic_policy_gb = saved && saved.mode === 'capped' ? String(saved.bytes / 1000000000) : '';
+		state._traffic_policy_remember = false;
+	}
+	var amount = E('input', { 'type': 'text', 'inputmode': 'decimal', 'class': 'cbi-input-text',
+		'value': state._traffic_policy_gb, 'placeholder': _('Enter GB'), 'disabled': disabled ? '' : null,
+		'input': function(ev) { state._traffic_policy_gb = ev.currentTarget.value; updateEstimate(); }
+	});
+	var amountRow = E('label', { 'style': state._traffic_policy_mode === 'capped' ? '' : 'display:none' }, [
+		cakeUi.text(_('Total GB (download + upload): ')), amount
+	]);
+	var mode = E('select', { 'class': 'cbi-input-select', 'disabled': disabled ? '' : null,
+		'change': function(ev) {
+			state._traffic_policy_mode = ev.currentTarget.value;
+			var preset = AUTOTUNE_TRAFFIC_PRESET_GB.find(function(value) { return state._traffic_policy_mode === 'gb:' + value; });
+			if (preset != null) {
+				state._traffic_policy_gb = String(preset);
+				amount.value = state._traffic_policy_gb;
+			}
+			amountRow.style.display = state._traffic_policy_mode === 'capped' ? '' : 'none';
+			updateEstimate();
+		}
+	}, [
+		E('option', { 'value': '' }, _('Choose traffic policy…')),
+		E('option', { 'value': 'unlimited' }, _('Unlimited traffic'))
+	].concat(AUTOTUNE_TRAFFIC_PRESET_GB.map(function(value) {
+		return E('option', { 'value': 'gb:' + value }, _('%s GB total (DL + UL)').format(value));
+	})).concat([ E('option', { 'value': 'capped' }, _('Custom total traffic budget')) ]));
+	mode.value = state._traffic_policy_mode;
+	var remember = E('input', { 'type': 'checkbox', 'disabled': disabled ? '' : null,
+		'change': function(ev) { state._traffic_policy_remember = ev.currentTarget.checked; }
+	});
+	remember.checked = state._traffic_policy_remember;
+	var estimateText = E('p', { 'class': 'cake-autotune-traffic-estimate', 'aria-live': 'polite' });
+	function updateEstimate() {
+		var estimate = autotuneTrafficPlanningEstimate(autotuneRunProfile(state),
+			autotuneCalibrationStrategy(state), rateInputs[0].value, rateInputs[1].value);
+		estimateText.textContent = estimate ?
+			_('Full-plan scenario: about %s GB total DL+UL, or %s GB with three loads per measurement. Includes %s server runs and up to %s measurements per direction.').format(
+				(estimate.single_load_bytes / 1000000000).toFixed(2),
+				(estimate.repeated_load_bytes / 1000000000).toFixed(2),
+					estimate.qualification_runs, estimate.captures_per_direction) :
+			_('Enter both estimated rates (0.001–100000 Mbps, at most three decimal places) to calculate a full-plan traffic scenario.');
+		if (estimate) {
+			estimateText.textContent += ' ' + _('The required initial-stage planning allowance at these rates is %s GB. A smaller capped choice is refused before launch.').format(
+				(estimate.initial_plan_bytes / 1000000000).toFixed(2));
+			estimateText.textContent += ' ' + _('If the first server group is inadequate, backup servers can add about %s GB in this scenario (%s server runs total). They are skipped when the first group is sufficient.').format(
+				(estimate.backup_qualification_bytes / 1000000000).toFixed(2), estimate.qualification_runs_with_backups);
+			var policy;
+			try { policy = autotuneTrafficPolicyFromInput(mode.value, amount.value); }
+			catch (error) { return; } // An incomplete choice is not launch consent.
+			if (policy.mode === 'capped' && policy.bytes < estimate.single_load_bytes)
+				estimateText.textContent += ' ' + _('The selected allowance is below this planning scenario; the test may exhaust it before completion.');
+		}
+	}
+	var rateInputs = [ 'dl', 'ul' ].map(function(direction) {
+		var key = '_traffic_estimate_' + direction + '_mbps';
+		if (state[key] == null) {
+			var configured = Math.max(Number(state['service_' + direction + '_cap_kbps']) || 0,
+				Number(state[direction === 'dl' ? 'sqm_download' : 'sqm_upload']) || 0);
+			state[key] = configured > 0 && configured <= 100000000 ? String(configured / 1000) : '';
+		}
+		return E('input', { 'type': 'number', 'min': '0.001', 'max': '100000', 'step': '0.001',
+			'class': 'cbi-input-text', 'value': state[key], 'disabled': disabled ? '' : null,
+			'input': function(ev) { state[key] = ev.currentTarget.value; updateEstimate(); }
+		});
+	});
+	updateEstimate();
+	return E('div', { 'id': 'cake-autotune-traffic-' + instance }, [
+		mode, amountRow,
+		E('p', {}, cakeUi.text(_('Applies to the next new test only. Qualification, retries and all download/upload stages share this budget. Unlimited may use substantial data; cancel and timeouts still apply.'))),
+		E('p', {}, cakeUi.text(_('The service refuses budgets below known mandatory evidence requirements before starting traffic. Passing that minimum does not guarantee that the full test will fit.'))),
+		E('p', { 'class': 'cake-autotune-dns-accounting' }, cakeUi.text(_('System DNS and local DNS filtering are preserved. Attribution of shared DNS service traffic is approximate; this is not exact physical-wire byte accounting. After test producers stop, accounting closes at a recorded cutoff; later packets are not included.'))),
+		E('p', {}, cakeUi.text(_('A capped raw test also requires declared download and upload service ceilings for its stopping reserve; without them it is refused before traffic. Planning rates below do not provide that authority. Do not enter artificial service ceilings just to start a test.'))),
+		E('label', {}, [ cakeUi.text(_('Planning download rate (Mbps): ')), rateInputs[0] ]),
+		E('label', {}, [ cakeUi.text(_('Planning upload rate (Mbps): ')), rateInputs[1] ]),
+		estimateText,
+		E('p', {}, cakeUi.text(_('Planning rates start from configured values, not measured capacity. Edit them for the expected unshaped link; they never change test speed limits or proposals. The launch check reserves a planning allowance for two stable servers and the initial controls at 15 seconds per directional load. The full scenario also includes search/confirmation and optional raw checks. Early convergence can use less; discovery, probes, protocol overhead and route/backend retries add traffic. Passing the initial planning allowance does not guarantee completion within the budget. The service deadline is 45 minutes.'))),
+		E('label', {}, [ remember, cakeUi.text(_(' Remember this choice for this instance in this browser when starting a new test')) ])
+	]);
+}
+
+function autotuneTrafficPolicyForRun(state, instance) {
+	if (state._traffic_policy_instance !== instance)
+		return validatedAutotuneTrafficPolicy(null);
+	var control = typeof document !== 'undefined' ? document.getElementById('cake-autotune-traffic-' + instance) : null;
+	if (control) {
+		// Submit what is displayed, including browser-restored/autofilled values.
+		state._traffic_policy_mode = control.querySelector('select').value;
+		state._traffic_policy_gb = control.querySelector('input[type=text]').value;
+		state._traffic_policy_remember = control.querySelector('input[type=checkbox]').checked;
+		var rates = control.querySelectorAll('input[type=number]');
+		state._traffic_estimate_dl_mbps = rates[0].value;
+		state._traffic_estimate_ul_mbps = rates[1].value;
+	}
+	var policy = autotuneTrafficPolicyFromInput(state._traffic_policy_mode, state._traffic_policy_gb);
+	var estimate = autotuneTrafficPlanningEstimate(autotuneRunProfile(state),
+		autotuneCalibrationStrategy(state), state._traffic_estimate_dl_mbps, state._traffic_estimate_ul_mbps);
+	if (policy.mode === 'capped') {
+		if (estimate && policy.bytes < estimate.initial_plan_bytes)
+			throw new Error(_('The selected total traffic budget is below the initial-stage planning allowance of %s GB at the entered rates. Choose a larger budget or Unlimited; correct the planning rates only if they do not describe the expected link. This estimate does not guarantee completion.').format(
+				(estimate.initial_plan_bytes / 1000000000).toFixed(2)));
+	}
+	if (state._traffic_policy_remember) {
+		try { window.localStorage.setItem('cake-autorate-autotune-traffic-v1:' + instance,
+			JSON.stringify(Object.assign({ version: 1 }, policy))); }
+		catch (error) { throw new Error(_('This browser could not remember the traffic policy. Uncheck Remember to use it for this test only.')); }
+	}
+	// Only the explicit traffic preference is saved. Planning inputs describe
+	// this launch and are carried separately in its immutable native request.
+	if (estimate)
+		policy.planning = { download_kbps: estimate.planning_download_kbps, upload_kbps: estimate.planning_upload_kbps };
+	return policy;
+}
+
+function disableAutotuneTrafficPolicy(instance) {
+	var root = document.getElementById('cake-autotune-traffic-' + instance);
+	if (root) root.querySelectorAll('input,select').forEach(function(input) { input.disabled = true; });
+}
+
 function nativeAutotuneLaunchArgs(section_id, wan, backend, routeMode, mwan3Member,
 		profile, conservative, calibrationStrategy, accessRequest, existingInstance,
-		plannedSqmSection) {
+		plannedSqmSection, trafficPolicy) {
+	var planning = trafficPolicy && trafficPolicy.planning;
+	trafficPolicy = validatedAutotuneTrafficPolicy(trafficPolicy);
 	var mode = routeMode || 'main';
 	var bootstrap = existingInstance !== true;
 	var nativeBackend = nativeEffectiveSpeedtestBackend(backend);
@@ -3485,7 +3730,15 @@ function nativeAutotuneLaunchArgs(section_id, wan, backend, routeMode, mwan3Memb
 		'--access-source', accessRequest.source || 'legacy_default',
 		'--access-confidence-percent', String(accessRequest.confidence_percent || 0),
 		'--capacity-learning-policy', accessRequest.policy || 'verified_only',
-		'--traffic-budget-bytes', String(NATIVE_AUTOTUNE_INTERACTIVE_TRAFFIC_BUDGET_BYTES));
+		'--traffic-policy', trafficPolicy.mode);
+	if (trafficPolicy.mode === 'capped')
+		args.push('--traffic-budget-bytes', String(trafficPolicy.bytes));
+	if (planning != null) {
+		if ([ planning.download_kbps, planning.upload_kbps ].some(function(rate) {
+			return !Number.isSafeInteger(rate) || rate < 1 || rate > 100000000;
+		})) throw new Error(_('Invalid paired planning rates.'));
+		args.push('--planning-dl-kbps', String(planning.download_kbps), '--planning-ul-kbps', String(planning.upload_kbps));
+	}
 
 	if (mode === 'mwan3')
 		args.push('--mwan3-member', mwan3Member || '');
@@ -3529,6 +3782,60 @@ function nativeAutotuneProgressStepLabel(step) {
 	return labels[step] || null;
 }
 
+function nativeAutotuneTrafficSummary(status) {
+	var traffic = status && status.traffic;
+	if (!traffic || traffic.schema_version !== 1 ||
+	    [ 'aggregate_route_windows', 'owned-ip-system-dns-estimate-v1', 'unavailable' ].indexOf(traffic.accounting) < 0 ||
+	    [ 'unavailable', 'persisted_debits', 'terminal_record', 'cutoff_receipt', 'no_producers_receipt' ].indexOf(traffic.source) < 0)
+		return '';
+	if (traffic.accounting === 'unavailable' && traffic.source !== 'unavailable')
+		return '';
+	if ([ 'cutoff_receipt', 'no_producers_receipt' ].indexOf(traffic.source) >= 0 && traffic.accounting !== 'owned-ip-system-dns-estimate-v1')
+		return '';
+	if (traffic.source === 'no_producers_receipt' && traffic.consumed_bytes !== 0)
+		return '';
+	var capped = traffic.policy === 'capped';
+	if ((!capped && traffic.policy !== 'unlimited') ||
+	    (capped ? !Number.isSafeInteger(traffic.limit_bytes) || traffic.limit_bytes <= 0 : traffic.limit_bytes !== null))
+		return '';
+	var used = traffic.consumed_bytes;
+	if ((traffic.source === 'unavailable') !== (used === null) ||
+	    (used !== null && (!Number.isSafeInteger(used) || used < 0)))
+		return '';
+	var remaining = capped && used !== null ? Math.max(0, traffic.limit_bytes - used) : null;
+	var overrun = capped && used !== null ? Math.max(0, used - traffic.limit_bytes) : null;
+	if (traffic.remaining_bytes !== remaining || traffic.overrun_bytes !== overrun)
+		return '';
+	var amount = function(bytes) {
+		if (bytes < 1000) return String(bytes) + ' B';
+		if (bytes < 1000000) return (bytes / 1000).toFixed(2) + ' kB';
+		if (bytes < 1000000000) return (bytes / 1000000).toFixed(2) + ' MB';
+		return (bytes / 1000000000).toFixed(3) + ' GB';
+	};
+	var total = capped ? amount(traffic.limit_bytes) : _('unlimited');
+	var message = used === null ? _('Traffic DL+UL: usage unavailable; limit %s.').format(total) :
+		_('Recorded traffic DL+UL: %s; limit %s.').format(amount(used), total);
+	if (remaining !== null)
+		message += ' ' + _('Remaining: %s.').format(amount(remaining));
+	if (overrun > 0)
+		message += ' ' + _('Observed overrun: %s.').format(amount(overrun));
+	if (traffic.source === 'cutoff_receipt')
+		message += ' ' + _('Final recorded interval, including traffic since the worker’s last saved debit.');
+	if (traffic.source === 'no_producers_receipt')
+		message += ' ' + _('Test traffic producers were not started.');
+	if (traffic.accounting === 'owned-ip-system-dns-estimate-v1')
+		message += ' ' + _('Accounting covers IP traffic owned by this test, including probes and gaps between attempts. System DNS is retained; shared resolver traffic attribution is approximate, not exact physical WAN accounting. After test producers stop, accounting closes at a recorded cutoff; later packets are not included.');
+	else if (traffic.accounting === 'aggregate_route_windows')
+		message += ' ' + _('Accounting currently covers route traffic during test windows, including background traffic.');
+	else
+		message += ' ' + _('The accounting method has not been verified for this run.');
+	if (traffic.source === 'persisted_debits')
+		message += ' ' + (traffic.accounting === 'owned-ip-system-dns-estimate-v1' ?
+			_('Shows the last saved debit; traffic since that checkpoint is not yet included.') :
+			_('Updated after each attempt; the current transfer is not yet included.'));
+	return message;
+}
+
 function nativeAutotuneProgress(status, previousPercent) {
 	var state = status && status.state || 'running';
 	var terminalReady = state === 'review_ready' || state === 'completed';
@@ -3559,6 +3866,9 @@ function nativeAutotuneProgress(status, previousPercent) {
 		message += ' ' + _('Completed %d of %d.').format(completed, total);
 	else if (attempt != null)
 		message += ' ' + _('Attempt %d.').format(attempt);
+	var traffic = nativeAutotuneTrafficSummary(status);
+	if (traffic)
+		message += ' ' + traffic;
 
 	return {
 		state: state,
@@ -3581,7 +3891,14 @@ function nativeAutotuneResultMatchesRequest(result, publicJobId, section_id, wan
 
 function nativeAutotuneStatusMatchesRequest(status, section_id, wan, routeMode,
 		mwan3Member, profile, calibrationStrategy, backend, existingInstance,
-		plannedSqmSection) {
+		plannedSqmSection, expectedPlanning) {
+	var planning = status && status.traffic_planning;
+	if (planning != null && [ planning.download_kbps, planning.upload_kbps ].some(function(rate) {
+		return !Number.isSafeInteger(rate) || rate < 1 || rate > 100000000;
+	})) return false;
+	if (expectedPlanning !== undefined && (expectedPlanning === null ? planning != null :
+		!planning || planning.download_kbps !== expectedPlanning.download_kbps || planning.upload_kbps !== expectedPlanning.upload_kbps))
+		return false;
 	var mode = routeMode || 'main';
 	var expectedMember = mode === 'mwan3' ? (mwan3Member || '') : null;
 	var expectedTargetState = existingInstance === true ? 'existing_managed' : 'absent_bootstrap';
@@ -3794,33 +4111,28 @@ function currentActiveNativeAutotuneJob(section_id, existingInstance, wan, route
 			}
 			return { status: status, result: null };
 		}
-		if (status.state === 'review_ready' && status.runtime_mutated !== true &&
-		    status.recovery_required !== true) {
+		if ([ 'review_ready', 'completed', 'failed', 'cancelled' ].indexOf(status.state) >= 0 &&
+		    status.runtime_mutated === false && status.recovery_required === false) {
 			/* This function is called only after an explicit Start/Run again click.
-			 * A completed Review is historical output, not an in-flight operation to
-			 * resume.  Let admission create a fresh job; otherwise Run again merely
-			 * reopens the old proposals without performing any measurements. */
+			 * A settled terminal job is history, not an in-flight operation to
+			 * resume. Only explicit restoration flags permit fresh admission. */
 			return null;
 		}
-		if (status.state !== 'review_ready' || status.runtime_mutated === true ||
-		    status.recovery_required === true)
-			throw new Error(_('The calibration service returned an unsafe current Review state.'));
+		throw new Error(_('The calibration service returned an unsafe current calibration state.'));
 	});
 }
 
 function runNativeAutotuneJob(section_id, wan, backend, onProgress, routeMode, mwan3Member,
 		profile, conservative, calibrationStrategy, accessRequest, existingInstance,
-		plannedSqmSection) {
+		plannedSqmSection, trafficPolicy, trafficPolicySupported, trafficPlanningSupported) {
 	backend = nativeEffectiveSpeedtestBackend(backend);
 	if (backend == null)
 		return Promise.reject(new Error(_('Unsupported native speed-test backend.')));
-	var launchArgs = nativeAutotuneLaunchArgs(section_id, wan, backend, routeMode,
-		mwan3Member, profile, conservative, calibrationStrategy, accessRequest,
-		existingInstance, plannedSqmSection);
 	var publicJobId;
 	var workerRunId = null;
 	var lastProgress = 0;
 	var startAttempted = false;
+	var activePlanning;
 
 	var poll = function() {
 		return autotuneJobDelay(1000).then(function() {
@@ -3833,7 +4145,7 @@ function runNativeAutotuneJob(section_id, wan, backend, onProgress, routeMode, m
 				throw new Error(_('The calibration service changed the job identity.'));
 			if (!nativeAutotuneStatusMatchesRequest(status, section_id, wan, routeMode,
 					mwan3Member, profile, calibrationStrategy, backend, existingInstance,
-					plannedSqmSection)) {
+					plannedSqmSection, activePlanning)) {
 				delete nativeAutotuneJobs[section_id];
 				var changed = new Error(_('The active calibration no longer matches this request.'));
 				changed.autotuneActiveRequestMismatch = true;
@@ -3881,8 +4193,12 @@ function runNativeAutotuneJob(section_id, wan, backend, onProgress, routeMode, m
 			}
 
 			delete nativeAutotuneJobs[section_id];
-			var terminal = new Error(status.diagnostic || status.error ||
-				_('Full Auto-Tune ended without a reviewable result.'));
+			var diagnostic = autotuneTypedTerminalDiagnostic(status);
+			var terminal = new Error(diagnostic ? diagnostic.message : (status.diagnostic || status.error ||
+				_('Full Auto-Tune ended without a reviewable result.')));
+			var traffic = nativeAutotuneTrafficSummary(status);
+			if (traffic)
+				terminal.message += ' ' + traffic;
 			terminal.autotuneResult = status;
 			throw terminal;
 		});
@@ -3892,8 +4208,11 @@ function runNativeAutotuneJob(section_id, wan, backend, onProgress, routeMode, m
 		publicJobId = status.job_id;
 		if (!nativeAutotuneStatusMatchesRequest(status, section_id, wan, routeMode,
 				mwan3Member, profile, calibrationStrategy, backend, existingInstance,
-				plannedSqmSection))
+				plannedSqmSection, activePlanning))
 			throw new Error(_('The calibration service returned a job for a different request.'));
+		activePlanning = status.traffic_planning ? {
+			download_kbps: status.traffic_planning.download_kbps, upload_kbps: status.traffic_planning.upload_kbps
+		} : null;
 		workerRunId = nativeOperationWorkerRunId(status, workerRunId, false);
 		if (workerRunId === undefined)
 			throw new Error(_('The calibration service returned an invalid worker identity.'));
@@ -3909,6 +4228,7 @@ function runNativeAutotuneJob(section_id, wan, backend, onProgress, routeMode, m
 				backend: backend,
 				existing_instance: existingInstance,
 				planned_sqm_section: plannedSqmSection,
+				planning: activePlanning,
 			},
 		};
 		if (onProgress) {
@@ -3924,6 +4244,15 @@ function runNativeAutotuneJob(section_id, wan, backend, onProgress, routeMode, m
 		if (current)
 			return attach(current.status);
 
+		if (!trafficPolicySupported)
+			throw new Error(_('The calibration service does not support explicit traffic policy. Update the daemon before starting a new test.'));
+		var policy = typeof trafficPolicy === 'function' ? trafficPolicy() : trafficPolicy;
+		if (policy && policy.planning && !trafficPlanningSupported)
+			throw new Error(_('The calibration service does not support planning-rate admission. Update the daemon before starting a new test.'));
+		activePlanning = policy && policy.planning ? Object.assign({}, policy.planning) : undefined;
+		var launchArgs = nativeAutotuneLaunchArgs(section_id, wan, backend, routeMode,
+			mwan3Member, profile, conservative, calibrationStrategy, accessRequest,
+			existingInstance, plannedSqmSection, policy);
 		startAttempted = true;
 		return fs.exec(NATIVE_AUTOTUNE_COMMAND, launchArgs).then(parseExecJson).then(function(started) {
 			if (started.error)
@@ -3943,7 +4272,7 @@ function runNativeAutotuneJob(section_id, wan, backend, onProgress, routeMode, m
 
 function runPreferredAutotuneJob(section_id, wan, backend, onProgress, routeMode, mwan3Member,
 		profile, conservative, calibrationStrategy, accessRequest, existingInstance,
-		plannedSqmSection) {
+		plannedSqmSection, trafficPolicy) {
 	profile = canonicalAutotuneProfile(profile) || 'best_overall';
 	calibrationStrategy = [ 'shaped_only', 'full_raw', 'reuse_trusted' ].indexOf(calibrationStrategy) >= 0 ?
 		calibrationStrategy : 'shaped_only';
@@ -3977,7 +4306,8 @@ function runPreferredAutotuneJob(section_id, wan, backend, onProgress, routeMode
 		}
 		return runNativeAutotuneJob(section_id, wan, backend, onProgress, routeMode,
 			mwan3Member, profile, conservative, calibrationStrategy, accessRequest,
-			existingInstance, plannedSqmSection);
+			existingInstance, plannedSqmSection, trafficPolicy, summary.native_traffic_policy_version === 1,
+			summary.native_traffic_planning_version === 1);
 	});
 }
 
@@ -4002,7 +4332,7 @@ function cancelNativeAutotuneJob(section_id) {
 			if (!nativeAutotuneStatusMatchesRequest(status, section_id, request.wan,
 					request.route_mode, request.mwan3_member, request.profile,
 					request.calibration_strategy, request.backend,
-					request.existing_instance, request.planned_sqm_section))
+					request.existing_instance, request.planned_sqm_section, request.planning))
 				throw new Error(_('The calibration service changed the request identity during cancellation.'));
 			handle.worker_run_id = nativeOperationWorkerRunId(status, handle.worker_run_id, false);
 			if (handle.worker_run_id === undefined)
@@ -4212,7 +4542,6 @@ function applyPingerPlanToState(state, result) {
 	state.pinger_method = result.recommended_method;
 	state.no_pingers = String(result.recommended_no_pingers);
 	state.reflectors = reflectors;
-	state.ping_extra_args = pingerInterfaceArgs(state.wan_if, state.pinger_method);
 	state.pinger_plan = result;
 }
 
@@ -4224,7 +4553,6 @@ function applyPingerPlanToSection(section, section_id, result) {
 
 	setCakeOption(section, section_id, 'pinger_method', result.recommended_method);
 	setCakeOption(section, section_id, 'no_pingers', result.recommended_no_pingers);
-	maybeSetPingerInterfaceArgs(section, section_id, selectedWan(section, section_id, null, true), result.recommended_method);
 	setCakeListOption(section, section_id, 'reflector', reflectors);
 }
 
@@ -4455,7 +4783,7 @@ function writeWizardConfig(section_id, state, allowUncalibrated) {
 	var dl = rateValue(state.sqm_download, '20000');
 	var ul = rateValue(state.sqm_upload, '20000');
 	var sqmSection = state.sqm_section || managedSqmSectionName(section_id);
-	var pingExtraArgs = state.ping_extra_args || pingerInterfaceArgs(wan, state.pinger_method || 'fping');
+	var pingExtraArgs = state.ping_extra_args;
 	var selectedAutotuneProfile = storedAutotuneProfile(state.autotune_profile);
 	var effectiveRouteMode = state.route_mode === 'auto' ?
 		(state.mwan3_member ? 'mwan3' : 'main') : (state.route_mode || 'main');
@@ -4508,8 +4836,12 @@ function writeWizardConfig(section_id, state, allowUncalibrated) {
 	uci.set('cake-autorate', section_id, 'speedtest_apply_percent', String(state.speedtest_apply_percent || '90'));
 	uci.set('cake-autorate', section_id, 'pinger_method', state.pinger_method || 'fping');
 	uci.set('cake-autorate', section_id, 'no_pingers', String(state.no_pingers || '6'));
-	if (pingExtraArgs)
-		uci.set('cake-autorate', section_id, 'ping_extra_args', pingExtraArgs);
+	if (pingExtraArgs != null) {
+		if (pingExtraArgs)
+			uci.set('cake-autorate', section_id, 'ping_extra_args', pingExtraArgs);
+		else
+			uci.unset('cake-autorate', section_id, 'ping_extra_args');
+	}
 	uci.set('cake-autorate', section_id, 'reflector', (state.reflectors && state.reflectors.length) ? state.reflectors : defaultReflectors());
 	uci.set('cake-autorate', section_id, 'manual_rate_limits', '0');
 	uci.set('cake-autorate', section_id, 'advanced_settings', '0');
@@ -4677,7 +5009,7 @@ function requireCleanUciTransaction(message) {
 function applyPlainRollbackTransaction(allowedPackages) {
 	var applyStarted = false;
 
-	return uci.save().then(function() {
+	return candidateGuard.save(allowedPackages).then(function() {
 		return uci.changes();
 	}).then(function(changes) {
 		var packages = changedUciPackages(changes);
@@ -4685,8 +5017,10 @@ function applyPlainRollbackTransaction(allowedPackages) {
 			return false;
 		if (packages.some(function(config) { return allowedPackages.indexOf(config) < 0; }))
 			throw new Error(_('The Multi-WAN transaction contains unrelated pending changes.'));
-		applyStarted = true;
-		return uci.callApply(AUTOTUNE_APPLY_TIMEOUT_S, true).then(function(status) {
+		return candidateGuard.apply(function() {
+			applyStarted = true;
+			return uci.callApply(AUTOTUNE_APPLY_TIMEOUT_S, true);
+		}, allowedPackages).then(function(status) {
 			if (status !== 0)
 				throw new Error(_('UCI rejected the rollback-enabled Multi-WAN configuration apply.'));
 			return callUciConfirmStatus();
@@ -4779,6 +5113,28 @@ function recordAutotuneTerminalFailure(state, result, message) {
 }
 
 function autotuneTypedTerminalDiagnostic(result) {
+	if (result && (result.terminal_state === 'cancelled' || result.state === 'cancelled'))
+		return { code: 'cancelled', message: _('Calibration was cancelled. Cancellation does not mean the traffic budget was exhausted.') };
+	if (result && [ 'inconclusive', 'failed' ].indexOf(result.terminal_state) >= 0) {
+		var trafficMessages = {
+			'server-comparison-insufficient-independent-sources': _('The comparison did not confirm stable sources with different reported providers and hostnames. Several server IDs can refer to the same source; no new capacity proposal was accepted.'),
+			'speedtest-server-endpoint-changed': _('The selected server reported a different transfer endpoint after qualification. Its measurements cannot be mixed into this calibration; retry server selection.'),
+			'server-or-link-capacity-changed': _('The unshaped measurement fell substantially below this run’s repeated server comparison. Source, link or remaining opposite-direction shaping may limit it; no lower-capacity proposal was accepted. Retry when conditions are stable or compare other servers.'),
+			'server-comparison-selected-reference-missing': _('The unshaped measurement has no matching qualified capacity reference. It cannot establish a new bandwidth ceiling.'),
+			'speedtest-traffic-budget-exhausted': _('The remaining budget is insufficient for the next check and its current safety reserve. The full traffic allowance was not necessarily spent.'),
+			'speedtest-traffic-limit-reached': _('The transfer stopped at its traffic safety limit. Check the recorded total; this does not mean the entire job allowance was spent.'),
+			'speedtest-traffic-budget-exceeded': _('The recorded traffic exceeded the authorized total. Testing stopped; the observed overrun is retained in accounting.'),
+			'owned-traffic-budget-exceeded': _('The coordinator stopped the test because cumulative test traffic exceeded the authorized total. This is a traffic-limit stop, not a bandwidth measurement failure.'),
+			'owned-traffic-accounting-failed': _('The coordinator could not verify the test traffic counters. Testing stopped; final usage is unknown and its reserved traffic budget is not released as an exact settlement.'),
+			'owned-traffic-persistence-failed': _('Saving the traffic debit was interrupted. The test failed; final usage is accepted only if its saved intent, debit journal and cutoff receipt can be reconciled.'),
+			'traffic-budget-exhausted': _('This older run reported a traffic-budget stop without distinguishing whether the limit was reached or the remainder was insufficient.'),
+			'speedtest-timeout': _('The speed-test attempt timed out. This is not a traffic-budget exhaustion.'),
+			'speedtest-deadline-expired': _('The operation deadline expired. This is not a traffic-budget exhaustion.'),
+			'native-autotune-deadline-expired': _('The operation deadline expired. This is not a traffic-budget exhaustion.')
+		};
+		if (Object.prototype.hasOwnProperty.call(trafficMessages, result.diagnostic_code))
+			return { code: result.diagnostic_code, message: trafficMessages[result.diagnostic_code] };
+	}
 	if (!(result && result.terminal_state === 'inconclusive'))
 		return null;
 	if (result.diagnostic_code === 'pair-options-unreviewable') {
@@ -4826,12 +5182,18 @@ function renderAutotuneDiagnostics(result) {
 			_('Full Auto-Tune ended without a reviewable result.'));
 	var code = terminal ? terminal.code :
 		(result && (result.diagnostic_code || result.reason || result.state) || 'failed');
-	return E('div', { 'class': 'alert-message error' }, [
+	var traffic = nativeAutotuneTrafficSummary(result);
+	if (traffic)
+		message += ' ' + traffic;
+	var nodes = [
 		E('strong', {}, _('Calibration did not produce an applicable proposal.')),
 		E('p', { 'style': 'white-space:normal;margin:6px 0 0' }, cakeUi.text(message)),
 		E('p', { 'style': 'white-space:normal;margin:6px 0 0;font-size:12px' },
 			cakeUi.text(_('Diagnostic code: %s').format(code)))
-	]);
+	];
+	if (result && nativeServerComparisonValidated(result.server_comparison_diagnostic, true))
+		nodes.push(renderNativeServerComparison(result.server_comparison_diagnostic, true));
+	return E('div', { 'class': 'alert-message error' }, nodes);
 }
 function replaceNodeContent(node, children) {
 	var replacements = Array.isArray(children) ? children : (children ? [ children ] : []);
@@ -4908,7 +5270,7 @@ function showCreateWizard(grid, name, existingName) {
 		advanced_test_options: false,
 		pinger_method: 'fping',
 		no_pingers: '6',
-		ping_extra_args: pingerInterfaceArgs(defaultWan, 'fping'),
+		ping_extra_args: '',
 		reflectors: defaultReflectors(),
 		sqm_download: '20000',
 		sqm_upload: '20000'
@@ -4964,6 +5326,7 @@ function showCreateWizard(grid, name, existingName) {
 		state.speedtest_apply_percent = uci.get('cake-autorate', existingName, 'speedtest_apply_percent') || '90';
 		state.pinger_method = uci.get('cake-autorate', existingName, 'pinger_method') || 'fping';
 		state.no_pingers = uci.get('cake-autorate', existingName, 'no_pingers') || '6';
+		state.ping_extra_args = uci.get('cake-autorate', existingName, 'ping_extra_args') || '';
 		state.reflectors = listFormOrUci(null, existingName, 'reflector');
 		state.sqm_section = uci.get('cake-autorate', existingName, 'sqm_section') || managedSqmSectionName(existingName);
 		state.sqm_download = uci.get('cake-autorate', existingName, 'sqm_download') ||
@@ -5109,7 +5472,6 @@ function showCreateWizard(grid, name, existingName) {
 				render();
 				return;
 			}
-			state.ping_extra_args = pingerInterfaceArgs(state.wan_if, state.pinger_method || 'fping');
 			syncSqmForInterface();
 			queueInfo.textContent = wizardSqmQueueText(state);
 		});
@@ -5128,7 +5490,6 @@ function showCreateWizard(grid, name, existingName) {
 				var member = mwan3Context.byName[state.mwan3_member];
 				if (member && member.device !== state.wan_if) {
 					state.wan_if = member.device;
-					state.ping_extra_args = pingerInterfaceArgs(state.wan_if, state.pinger_method || 'fping');
 					syncSqmForInterface();
 				}
 			} else {
@@ -5229,8 +5590,8 @@ function showCreateWizard(grid, name, existingName) {
 		instanceState.mwan3_member = plan.member;
 		instanceState.route_selection = 'mwan3:' + plan.member;
 		instanceState.sqm_section = plan.sqmSection;
-		instanceState.ping_extra_args = pingerInterfaceArgs(plan.device,
-			instanceState.pinger_method || 'fping');
+		// Extra arguments belong to this member, never to a copied peer's pin.
+		instanceState.ping_extra_args = uci.get('cake-autorate', plan.name, 'ping_extra_args') || '';
 		return instanceState;
 	}
 
@@ -5439,6 +5800,7 @@ function showCreateWizard(grid, name, existingName) {
 			for (var decisionIndex = 0; decisionIndex < decisionNodes.length; decisionIndex++)
 				decisionNodes[decisionIndex].disabled = true;
 
+			disableAutotuneTrafficPolicy(item.plan.name);
 			return runPreferredAutotuneJob(item.plan.name, item.plan.device,
 				itemState.speedtest_backend, function(job) {
 					if (generation !== state.autotune_generation || state.autotune_cancel_requested)
@@ -5451,7 +5813,7 @@ function showCreateWizard(grid, name, existingName) {
 						job.message || _('Full Auto-Tune is working...'));
 			}, 'mwan3', item.plan.member, autotuneRunProfile(itemState), conservative,
 				autotuneCalibrationStrategy(itemState), accessRequest, rerun,
-				item.plan.sqmSection)
+				item.plan.sqmSection, function() { return autotuneTrafficPolicyForRun(itemState, item.plan.name); })
 				.then(function(result) {
 					if (generation !== state.autotune_generation || state.autotune_cancel_requested)
 						return;
@@ -5595,7 +5957,8 @@ function showCreateWizard(grid, name, existingName) {
 						resetMultiwanAutotuneItem(item);
 						render();
 					}, !rerun),
-				_('This uplink is calibrated independently; raw bypass, when selected, affects only its currently measured direction.')),
+				_('This uplink is calibrated independently; raw comparison can temporarily bypass both directions of this uplink, not another uplink.')),
+			wizardField(_('Total test traffic'), autotuneTrafficPolicyControl(itemState, item.plan.name, state.autotune_running || item.recovery_pending)),
 			wizardField(_('Calibration profile for %s').format(item.plan.member),
 				E('div', {}, [
 					autotuneProfileGrid(profileButtons),
@@ -5733,11 +6096,12 @@ function showCreateWizard(grid, name, existingName) {
 					job.message || _('Full Auto-Tune is working...'));
 			};
 
+			disableAutotuneTrafficPolicy(state.name);
 			return runPreferredAutotuneJob(state.name, state.wan_if, state.speedtest_backend, function(job) {
 				progressCallback(job, '');
 			}, state.route_mode, state.mwan3_member, autotuneRunProfile(state), conservative,
 				autotuneCalibrationStrategy(state), accessRequest, rerun,
-				state.sqm_section || managedSqmSectionName(state.name)).then(function(result) {
+				state.sqm_section || managedSqmSectionName(state.name), function() { return autotuneTrafficPolicyForRun(state, state.name); }).then(function(result) {
 				if (generation !== state.autotune_generation || state.autotune_cancel_requested)
 					return;
 				if (!nativeAutotunePublicResultValidated(result))
@@ -5851,7 +6215,8 @@ function showCreateWizard(grid, name, existingName) {
 					state.autotune_failure_message = '';
 					render();
 				}, !rerun),
-				_('Full raw capacity is explicit opt-in because it temporarily bypasses shaping for the direction under test and can transfer substantially more data.')),
+				_('Full raw capacity is explicit opt-in because server comparison can temporarily bypass both directions of the selected uplink and transfer substantially more data.')),
+			wizardField(_('Total test traffic'), autotuneTrafficPolicyControl(state, state.name, state.autotune_running)),
 			wizardField(_('Calibration profile'),
 				E('div', {}, [
 					autotuneProfileGrid(profileButtons),
@@ -6385,7 +6750,7 @@ function showCreateWizard(grid, name, existingName) {
 			 * stale or unrendered modal widgets and can overwrite that proposal.
 			 * Persist only the staged UCI delta; Save & Apply remains a separate,
 			 * guarded action. */
-			return uci.save().then(function() { return created; });
+			return candidateGuard.save([ 'cake-autorate' ]).then(function() { return created; });
 		})
 			.then(function(created) {
 				return L.bind(grid.map.load, grid.map)().then(function() { return created; });
@@ -6726,7 +7091,7 @@ function decorateAutorateSubcategories(section, sectionId, containers) {
 		'.cake-autorate-subnav>li>a{white-space:nowrap;word-break:normal;overflow-wrap:normal;hyphens:none}',
 		'.cake-autorate-subpanel{min-width:0}',
 		'.cake-autorate-subdescription{margin:0 0 12px;color:var(--text-color-medium,#777)}',
-		'@media(max-width:600px){.cake-autorate-subnav{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;overflow:visible;padding:0}.cake-autorate-subnav>li{min-width:0;margin:0!important}.cake-autorate-subnav>li>a{display:flex;align-items:center;justify-content:center;min-height:42px;padding:6px!important;text-align:center;white-space:normal}}'
+		'@media(max-width:600px){.cake-autorate-subnav{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr));grid-auto-rows:minmax(54px,auto);gap:6px;overflow:visible;padding:0;align-items:stretch}.cake-autorate-subnav>li{display:flex!important;float:none!important;height:auto!important;min-width:0;margin:0!important;width:auto!important;max-width:none!important;justify-self:stretch}.cake-autorate-subnav>li>a{display:flex!important;float:none!important;box-sizing:border-box;width:100%;height:auto!important;align-items:center;justify-content:center;min-height:54px;line-height:1.3!important;padding:6px!important;text-align:center;white-space:normal;min-width:0;max-width:none!important;overflow-wrap:anywhere}}'
 	].join('')));
 	autorateContainer.appendChild(nav);
 	autorateContainer.appendChild(panelRoot);
@@ -6748,7 +7113,7 @@ function addTopicIntroduction(section, tab, name, text) {
 function addRateOptions(section) {
 	var o;
 
-	value(section, 'rates', 'connection_active_thr_kbps', _('Active threshold'), 'uinteger', '2000');
+	value(section, 'rates', 'connection_active_thr_kbps', _('Active threshold'), 'ufloat', '2000');
 
 	o = section.taboption('rates', form.DummyValue, '_adaptive_ceiling_status',
 		_('Adaptive ceiling status'));
@@ -6835,7 +7200,7 @@ function addRateOptions(section) {
 		return validateAdaptiveCeiling(validationSection(this), section_id);
 	};
 
-	o = value(section, 'rates', 'adaptive_ceiling_dl_cap_kbps', _('DL absolute cap'), 'and(uinteger,min(1))', '80000');
+	o = value(section, 'rates', 'adaptive_ceiling_dl_cap_kbps', _('DL absolute cap'), 'ufloat', '80000');
 	o.depends('capacity_learning_policy', 'passive_bounded');
 	o.depends('capacity_learning_policy', 'scheduled_active');
 	o.cfgvalue = function(section_id) {
@@ -6846,7 +7211,7 @@ function addRateOptions(section) {
 		return validateAdaptiveCeiling(validationSection(this), section_id);
 	};
 
-	o = value(section, 'rates', 'adaptive_ceiling_ul_cap_kbps', _('UL absolute cap'), 'and(uinteger,min(1))', '35000');
+	o = value(section, 'rates', 'adaptive_ceiling_ul_cap_kbps', _('UL absolute cap'), 'ufloat', '35000');
 	o.depends('capacity_learning_policy', 'passive_bounded');
 	o.depends('capacity_learning_policy', 'scheduled_active');
 	o.cfgvalue = function(section_id) {
@@ -6857,15 +7222,15 @@ function addRateOptions(section) {
 		return validateAdaptiveCeiling(validationSection(this), section_id);
 	};
 
-	o = value(section, 'rates', 'adaptive_ceiling_hold_time_s', _('Qualification time'), 'and(ufloat,min(1))', '20.0');
+	o = value(section, 'rates', 'adaptive_ceiling_hold_time_s', _('Qualification time'), 'ufloat', '20.0');
 	o.depends('capacity_learning_policy', 'passive_bounded');
 	o.depends('capacity_learning_policy', 'scheduled_active');
 
-	o = value(section, 'rates', 'adaptive_ceiling_growth_percent', _('Open probe step'), 'and(ufloat,min(0.1),max(10))', '3.0');
+	o = value(section, 'rates', 'adaptive_ceiling_growth_percent', _('Open probe step'), 'ufloat', '3.0');
 	o.depends('capacity_learning_policy', 'passive_bounded');
 	o.depends('capacity_learning_policy', 'scheduled_active');
 
-	o = value(section, 'rates', 'adaptive_ceiling_probe_duration_s', _('Probe observation'), 'and(ufloat,min(1))', '8.0');
+	o = value(section, 'rates', 'adaptive_ceiling_probe_duration_s', _('Probe observation'), 'ufloat', '8.0');
 	o.depends('capacity_learning_policy', 'passive_bounded');
 	o.depends('capacity_learning_policy', 'scheduled_active');
 
@@ -6873,7 +7238,7 @@ function addRateOptions(section) {
 	o.depends('capacity_learning_policy', 'passive_bounded');
 	o.depends('capacity_learning_policy', 'scheduled_active');
 
-	o = value(section, 'rates', 'adaptive_ceiling_failed_bound_ttl_s', _('Failed-bound memory'), 'and(ufloat,min(1))', '900.0');
+	o = value(section, 'rates', 'adaptive_ceiling_failed_bound_ttl_s', _('Failed-bound memory'), 'ufloat', '900.0');
 	o.depends('capacity_learning_policy', 'passive_bounded');
 	o.depends('capacity_learning_policy', 'scheduled_active');
 
@@ -7306,42 +7671,42 @@ function addSetupOptions(section) {
 	o = flag(section, 'setup', 'advanced_settings', _('Show expert options'), '0');
 	o.forcewrite = true;
 
-	o = value(section, 'setup', 'min_dl_shaper_rate_kbps', _('Min DL rate'), 'uinteger', '5000');
+	o = value(section, 'setup', 'min_dl_shaper_rate_kbps', _('Min DL rate'), 'ufloat', '5000');
 	o.depends({ advanced_settings: '1', manual_rate_limits: '1' });
 	o.retain = true;
 	o.validate = function(section_id) {
 		return validateRateOrder(validationSection(this), section_id, 'dl');
 	};
 
-	o = value(section, 'setup', 'base_dl_shaper_rate_kbps', _('Base DL rate'), 'uinteger', '20000');
+	o = value(section, 'setup', 'base_dl_shaper_rate_kbps', _('Base DL rate'), 'ufloat', '20000');
 	o.depends({ advanced_settings: '1', manual_rate_limits: '1' });
 	o.retain = true;
 	o.validate = function(section_id) {
 		return validateRateOrder(validationSection(this), section_id, 'dl');
 	};
 
-	o = value(section, 'setup', 'max_dl_shaper_rate_kbps', _('Max DL rate'), 'uinteger', '80000');
+	o = value(section, 'setup', 'max_dl_shaper_rate_kbps', _('Max DL rate'), 'ufloat', '80000');
 	o.depends({ advanced_settings: '1', manual_rate_limits: '1' });
 	o.retain = true;
 	o.validate = function(section_id) {
 		return validateRateOrder(validationSection(this), section_id, 'dl');
 	};
 
-	o = value(section, 'setup', 'min_ul_shaper_rate_kbps', _('Min UL rate'), 'uinteger', '5000');
+	o = value(section, 'setup', 'min_ul_shaper_rate_kbps', _('Min UL rate'), 'ufloat', '5000');
 	o.depends({ advanced_settings: '1', manual_rate_limits: '1' });
 	o.retain = true;
 	o.validate = function(section_id) {
 		return validateRateOrder(validationSection(this), section_id, 'ul');
 	};
 
-	o = value(section, 'setup', 'base_ul_shaper_rate_kbps', _('Base UL rate'), 'uinteger', '20000');
+	o = value(section, 'setup', 'base_ul_shaper_rate_kbps', _('Base UL rate'), 'ufloat', '20000');
 	o.depends({ advanced_settings: '1', manual_rate_limits: '1' });
 	o.retain = true;
 	o.validate = function(section_id) {
 		return validateRateOrder(validationSection(this), section_id, 'ul');
 	};
 
-	o = value(section, 'setup', 'max_ul_shaper_rate_kbps', _('Max UL rate'), 'uinteger', '35000');
+	o = value(section, 'setup', 'max_ul_shaper_rate_kbps', _('Max UL rate'), 'ufloat', '35000');
 	o.depends({ advanced_settings: '1', manual_rate_limits: '1' });
 	o.retain = true;
 	o.validate = function(section_id) {
@@ -7558,11 +7923,12 @@ function addLoggingOptions(section) {
 	flag(section, 'logging', 'log_DEBUG_messages_to_syslog', _('Debug to syslog'));
 	flag(section, 'logging', 'log_to_file', _('Log to file'));
 	value(section, 'logging', 'log_file_max_time_mins', _('Log max minutes'), 'uinteger', '10');
-	value(section, 'logging', 'log_file_max_size_KB', _('Log max KB'), 'uinteger', '2000');
+	value(section, 'logging', 'log_file_max_size_KB', _('Log max KB'), 'and(uinteger,max(16384))', '2000');
 	optionalValue(section, 'logging', 'log_file_path_override', _('Log directory'), null, '');
 	value(section, 'logging', 'log_file_buffer_size_B', _('Log buffer bytes'), 'uinteger', '512');
 	value(section, 'logging', 'log_file_buffer_timeout_ms', _('Log buffer timeout'), 'uinteger', '500');
-	flag(section, 'logging', 'log_file_export_compress', _('Compress exports'));
+	o = modal(section.taboption('logging', form.DummyValue, '_log_retention', _('Log retention')));
+	o.default = _('One active log and one previous log are retained. Rotation does not run a compressor. Diagnostic downloads remain plain text; existing compressed legacy logs can still be read.');
 
 	flag(section, 'logging', 'mqtt_enabled', _('MQTT publisher'), '0');
 
@@ -7648,6 +8014,13 @@ function addAdvancedOptions(section) {
 	value(section, 'advanced', 'global_ping_response_timeout_s', _('Global ping timeout'), 'ufloat', '10.0');
 	value(section, 'advanced', 'if_up_check_interval_s', _('Interface check interval'), 'ufloat', '10.0');
 	value(section, 'advanced', 'route_check_interval_s', _('Route check interval'), 'and(ufloat,min(1),max(60))', '2.0');
+	var externalIp = flag(section, 'advanced', 'external_ip_check_enabled', _('Look up external IPv4 address'), '0');
+	externalIp.description = _('Optional: contacts the selected HTTPS service, which sees your public address and request times. Disabled by default; not required for rate control.');
+	var externalUrl = value(section, 'advanced', 'external_ip_check_url', _('External IPv4 service URL'), 'string', 'https://api.ipify.org');
+	externalUrl.description = _('HTTPS host/path returning one plain IPv4 address. No credentials, query or fragment.');
+	externalUrl.depends('external_ip_check_enabled', '1');
+	var externalInterval = value(section, 'advanced', 'external_ip_check_interval_s', _('External IPv4 lookup interval (seconds)'), 'and(uinteger,min(60),max(604800))', '3600');
+	externalInterval.depends('external_ip_check_enabled', '1');
 	optionalValue(section, 'advanced', 'rx_bytes_path', _('RX bytes path'), null, '');
 	optionalValue(section, 'advanced', 'tx_bytes_path', _('TX bytes path'), null, '');
 }
@@ -7745,13 +8118,12 @@ function addSqmOptions(section, qdiscs, scripts) {
 	], '5'));
 
 	o = section.taboption('sqm_qdisc', form.ListValue, 'sqm_qdisc', _('Queueing discipline'));
+	var qdiscMode = o;
 	modal(o);
 	describe(o, 'sqm_qdisc');
 	dependsManagedSqm(o);
 	seen = {};
 	addUniqueValue(o, seen, 'cake');
-	for (var i = 0; i < qdiscs.length; i++)
-		addUniqueValue(o, seen, qdiscs[i].name);
 	o.default = 'cake';
 	o.rmempty = false;
 
@@ -7762,10 +8134,13 @@ function addSqmOptions(section, qdiscs, scripts) {
 	seen = {};
 	addUniqueValue(o, seen, 'piece_of_cake.qos');
 	addUniqueValue(o, seen, 'cake.qos');
-	for (i = 0; i < scripts.length; i++)
+	for (var i = 0; i < scripts.length; i++)
 		addUniqueValue(o, seen, scripts[i]);
 	o.default = 'piece_of_cake.qos';
 	o.rmempty = false;
+	var mqCheck = modal(section.taboption('sqm_qdisc', form.Button, '_sqm_mq_check', _('Multi-queue capability')));
+	dependsManagedSqm(mqCheck);
+	sqmModes.bind(qdiscMode, o, mqCheck);
 
 	o = flag(section, 'sqm_qdisc', 'sqm_qdisc_advanced', _('Advanced qdisc'));
 	dependsManagedSqm(o);
@@ -7913,7 +8288,9 @@ return L.view.extend({
 	},
 
 	handleSaveApply: function(ev, mode) {
-		return this.super('handleSaveApply', [ ev, mode ]);
+		return this.handleSave(ev).then(function() {
+			return candidateGuard.apply(function() { return ui.changes.apply(mode == '0'); });
+		});
 	},
 
 	load: function() {
@@ -7927,7 +8304,8 @@ return L.view.extend({
 			L.resolveDefault(uci.load('mwan3'), null),
 			L.resolveDefault(fs.exec('/usr/sbin/cake-autorated', [ '--mwan3-info' ]).then(function(result) {
 				return JSON.parse(result.stdout || '{}');
-			}), {})
+			}), {}),
+			L.resolveDefault(candidateGuard.loadSchema(), null)
 		]);
 	},
 
@@ -7942,7 +8320,9 @@ return L.view.extend({
 		mwan3Capability = data[7] || {};
 
 		m = new form.Map('cake-autorate', _('CAKE Autorate'));
+		candidateGuard.attach(m);
 		s = m.section(form.GridSection, 'cake_autorate', _('Instances'));
+		candidateGuard.protectModal(s);
 		s.anonymous = false;
 		s.addremove = true;
 		s.addbtntitle = _('Create instance');
@@ -7975,6 +8355,7 @@ return L.view.extend({
 			return actions;
 		};
 		s.addModalOptions = function(modalSection, section_id) {
+			candidateGuard.attach(modalSection.map);
 			var parse = modalSection.parse;
 			var renderTabContainers = modalSection.renderTabContainers;
 

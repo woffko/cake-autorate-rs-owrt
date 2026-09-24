@@ -220,6 +220,33 @@ const quality = helpers.formatQuality({
 assert.equal(quality.children[0].children, 'BASELINE READY');
 assert.match(quality.children[1].children, /Waiting for loaded traffic.*50%/);
 
+for (const state of [ 'missing', 'stale', 'error' ]) {
+	const unavailable = helpers.formatQuality({
+		transport_latency_enabled: true,
+		transport_status: state,
+		transport_sample_age_s: state === 'stale' ? 42 : null,
+		quality_class: 'F', quality_confidence: 100, quality_limited: true,
+		quality_controller_reason: state,
+	});
+	assert.equal(unavailable.children[0].children, 'UNAVAILABLE');
+	assert.match(unavailable.children[1].children, /Transport evidence unavailable/);
+	assert.match(unavailable.attrs.title, new RegExp('Transport: ' + state));
+	assert.match(unavailable.attrs.title, state === 'stale' ? /sample age: 42.0 s/ : /sample age: no sample/);
+}
+
+const staleTransport = helpers.formatQuality({
+	transport_latency_enabled: true,
+	quality_grade_state: 'learning_baseline', quality_grade_method: QUALITY_GRADE_METHOD,
+	transport_status: 'stale', transport_sample_age_s: 42,
+	transport_dl_status: 'stale', transport_dl_sample_age_s: 42,
+	transport_ul_status: 'missing', transport_ul_sample_age_s: null,
+	quality_controller_reason: 'stale', quality_controller_class: 'LEARNING',
+});
+assert.match(staleTransport.attrs.title, /Directional transport: DL stale \(42.0 s\) · UL missing \(no sample\)/);
+assert.match(staleTransport.attrs.title, /Controller reason: stale/);
+assert.match(staleTransport.attrs.title, /signal: LEARNING/);
+assert.match(staleTransport.attrs.title, /Transport search floors \(not ICMP minima\)/);
+
 const detected = helpers.formatQuality({
 	transport_latency_enabled: true,
 	quality_grade_state: 'provisional',
@@ -490,6 +517,15 @@ const unhealthySqm = helpers.qualityReadiness({ enabled: '1', sqm_enabled: '1' }
 });
 assert.equal(unhealthySqm.ready, false);
 assert.match(unhealthySqm.reason, /CAKE qdisc is missing on ifb4eth0/);
+const runtimeOwnerPayload = '<img src=x onerror="bad()">';
+const degradedOwnerState = helpers.formatState({ state: 'RUNNING', uplink_state: 'ACTIVE',
+	runtime_control_degraded: true, runtime_control_held: true, runtime_control_error: runtimeOwnerPayload
+}, true, {}, null);
+assert.ok(degradedOwnerState.children.some(node => node.attrs.role === 'alert' && /runtime owner/.test(node.children)));
+assert.ok(degradedOwnerState.children.some(node => node.children === runtimeOwnerPayload));
+const heldOwnerState = helpers.formatState({ state: 'RUNNING', runtime_control_held: true }, true, {}, null);
+assert.match(JSON.stringify(heldOwnerState), /held by an active operation/);
+assert.doesNotMatch(JSON.stringify(heldOwnerState), /could not be verified/);
 const unhealthyState = helpers.formatState({
 	state: 'RUNNING',
 	sqm_runtime_managed: true,
@@ -516,6 +552,14 @@ assert.equal(waitingState.children[0].children, 'WAITING');
 assert.equal(waitingState.children[1].children, 'Waiting for SQM hotplug to settle');
 assert.match(waitingState.children[0].attrs.style, /d08b20/);
 assert.doesNotMatch(JSON.stringify(waitingState), /No probe replies/);
+const externalWaiting = helpers.formatState({
+	state: 'WAITING_EXTERNAL_SQM', uplink_state: 'ACTIVE', sqm_runtime_managed: false,
+	sqm_runtime_healthy: false, sqm_runtime_state: 'WAITING_EXTERNAL_SQM',
+	sqm_runtime_reason: 'external root CAKE is missing'
+}, true, {}, null);
+assert.equal(externalWaiting.children[0].children, 'WAITING');
+assert.match(externalWaiting.children[1].children, /no automatic topology repair/);
+assert.equal(externalWaiting.attrs.title, 'external root CAKE is missing');
 const scheduledState = helpers.formatState({
 	state: 'RUNNING', uplink_state: 'ACTIVE',
 	scheduled_autotune: {

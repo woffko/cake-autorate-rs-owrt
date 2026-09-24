@@ -1318,12 +1318,15 @@ mod tests {
             speedtest_server_id: Some(17_372),
             speedtest_topology: None,
             route: OperationRouteIdentity {
+                dns_server: None,
+                device_ifindex: None,
                 mode: OperationRouteMode::Main,
                 mwan3_member: None,
                 l3_device: "pppoe-wan".to_string(),
                 source_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2))),
                 fwmark: None,
                 routing_table: None,
+                fwmark_mask: None,
             },
             target_state: OperationTargetState::AbsentBootstrap,
             capture_policy: Some(
@@ -1341,7 +1344,11 @@ mod tests {
             allow_sqm_disable: true,
             allow_active_traffic: false,
             scheduled_auto_apply_requested: false,
-            traffic_budget_bytes: 1_000_000_000,
+            traffic_budget: crate::operations::protocol::TrafficPolicy::Capped {
+                max_bytes: 1_000_000_000,
+            },
+            traffic_policy_explicit: false,
+            traffic_plan: None,
         }
     }
 
@@ -1452,17 +1459,21 @@ mod tests {
     }
 
     #[test]
-    fn golden_124_action_plan_is_bound_ordered_and_deterministic() {
+    fn golden_123_action_plan_preserves_legacy_bytes_except_the_generated_pin() {
         let managed = managed_config(AutotuneProfile::BestOverall);
-        assert_eq!(managed.action_count(), 124);
+        assert_eq!(managed.action_count(), 116);
+        let legacy = managed
+            .clone()
+            .with_legacy_managed_probe_defaults_for_test()
+            .unwrap();
         assert_eq!(
-            managed.canonical_sha256().unwrap(),
+            legacy.canonical_sha256().unwrap(),
             "78532dec5274f18e4c3380f18855d066585b0bfde7340e117c3ecf6fd826a0fa"
         );
 
         let plan = NativeUciMaterializationPlan::from_managed_config(&managed).unwrap();
-        assert_eq!(plan.logical_action_count(), 124);
-        assert_eq!(plan.command_count(), 156);
+        assert_eq!(plan.logical_action_count(), 116);
+        assert_eq!(plan.command_count(), 148);
         assert_eq!(
             plan.managed_config_sha256(),
             managed.canonical_sha256().unwrap()
@@ -1503,10 +1514,19 @@ mod tests {
             plan.canonical_sha256().unwrap(),
             second.canonical_sha256().unwrap()
         );
+        let legacy_materialization =
+            NativeUciMaterializationPlan::from_managed_config(&legacy).unwrap();
         assert_eq!(
-            plan.canonical_sha256().unwrap(),
+            legacy_materialization.canonical_sha256().unwrap(),
             "2553e5416db742b7888804c64974fb62e2dd791d4042d6781e302552b4eca56c"
         );
+        let legacy_without_pin: Vec<_> = legacy_materialization.commands.iter().filter(|command| {
+            !matches!(command, NativeUciMaterializationCommand::Set { option, .. } if matches!(option.as_str(),
+                "ping_extra_args" | "transport_latency_enabled" | "throughput_guard_enabled" |
+                "transport_probe_backend" | "transport_probe_endpoint" | "transport_probe_loaded_interval_s" |
+                "transport_probe_timeout_s" | "transport_load_hold_s"))
+        }).cloned().collect();
+        assert_eq!(plan.commands, legacy_without_pin);
     }
 
     #[test]

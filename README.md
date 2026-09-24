@@ -97,7 +97,10 @@ the user.
 **Graphs** use an opt-in, bounded RAM-only history. Latency, transport delta,
 effective delay, CPU and synchronized download/upload traffic share the same
 timeline; the oldest samples are discarded automatically and nothing is
-written to flash. The live Multi-WAN capture also shows an adaptive backoff
+written to flash. New traffic rows show interval means and separate sampled
+peaks; hover text reports the actual observation duration. Older rows remain
+identified as instantaneous samples. RTT and CPU remain snapshots. The live
+Multi-WAN capture also shows an adaptive backoff
 event on the shared time axis.
 
 [![RAM-only latency, CPU and traffic graphs](docs/screenshots/graphs-overview.png)](docs/screenshots/graphs-overview.png)
@@ -250,8 +253,8 @@ RC27 implements the following controller and LuCI model:
   Shaped only.
 - Keep scheduled traffic injection opt-in. The scheduler reserves and settles
   per-instance daily/monthly byte allowances in a crash-safe ledger, shows the
-  next due run and remaining allowance, and stops before exceeding a hard
-  budget.
+  next due run and remaining allowance, and enforces its admission and stopping
+  policy. A byte allowance is not a guarantee of exact physical-WAN usage.
 - Full raw capacity first measures comparable bidirectional, download-only and
   upload-only controls by bypassing only the direction under test. For
   explicitly selected cellular, satellite, and fixed-wireless access it then
@@ -268,7 +271,7 @@ RC27 implements the following controller and LuCI model:
   no acknowledgements; there is no global confidence label which can weaken a
   hard gate.
 
-One live high-capacity cellular development run intentionally used a 2 GiB hard
+One historical high-capacity cellular development run requested a 2 GiB traffic
 limit. It completed raw measurements near **403/46 Mbps** and a first shaped
 point near **220/30 Mbps**, then stopped with typed
 `traffic-budget-exhausted`, restored the original SQM runtime and wrote no UCI.
@@ -276,6 +279,74 @@ A complete Variable-link frontier at that capacity can consume roughly
 **4.5–6 GiB**, so periodic active testing must be enabled only with an
 appropriate data allowance. CPU saturation is reported as advisory evidence;
 it does not by itself reject an otherwise safe candidate.
+
+### Unreleased audit changes: test traffic and server qualification
+
+The following describes the current development source, not the accepted RC27
+packages linked below. Local source and isolated-kernel tests do not replace
+package, OpenWrt VM, upgrade/rollback or physical-device acceptance.
+
+Initial Full Auto-Tune and manual reruns require a traffic-policy choice:
+Unlimited, a preset of 1/5/10/25/50/100 GB, or a custom total. These are decimal
+GB and apply to **download plus upload for the whole test**, not separately to
+each direction or attempt. There is no implicit 32 GB default. Remembering a
+choice is explicit and scoped to one instance in the current browser. A retry
+of the same admitted request retains its original policy and debit history.
+Scheduled daily/monthly reservations remain independent; manual Unlimited does
+not remove scheduler limits. Lite does not provide active Auto-Tune.
+
+The service refuses a capped test below its known mandatory evidence minimum
+before starting traffic. Capped raw testing also requires declared DL and UL
+service ceilings for stopping headroom; a planning estimate or a slow server
+measurement cannot supply that authority. Do not invent service ceilings to
+pass admission. Stopping headroom is included in the chosen allowance. Passing
+the minimum does not guarantee completion: optional checks, retries and changing
+conditions can exhaust the remaining allowance. The displayed full-plan scenario
+is an estimate, not a physical minimum, guaranteed maximum, or limit on measured speed.
+New interactive capped launches also reject allowances below the initial-stage
+planning estimate when both expected rates are known: 15 seconds per direction
+for two independent servers with three repeats, then two controls per direction.
+Planning rates are separate from service ceilings and never alter shaper rates.
+CLI callers can supply the pair `--planning-dl-kbps` and `--planning-ul-kbps`
+(integer 1..100000000 kbit/s). Without that pair, a new explicit capped CLI
+launch uses available configured/service rate hints, as the UI does; those hints
+are assumptions, not measurements. Choose a larger allowance or Unlimited if
+the initial-stage estimate does not fit. Completion can still need more traffic.
+The planning pair is bound to the request, retained on retry, and exposed in
+status as `traffic_planning`. Old requests and scheduler policies retain their
+original semantics. The UI checks `native_traffic_planning_version=1` before
+sending the new fields; it does not silently drop them for an older daemon.
+Unlimited removes byte admission/stop limits, not cancellation, deadlines,
+accounting, route checks or runtime restoration.
+
+New traffic accounting uses test-owned IP counters for backend traffic and
+probes, including discovery, rejected attempts, retries and gaps between loads.
+Background user traffic remains a separate measurement-quality concern. System
+DNS and local DNS filtering are retained; attribution through a shared resolver
+is approximate. After test producers stop, a private-rule cutoff freezes the
+recorded interval before the counters are removed. Later packets are excluded.
+Consequently this is **not exact physical-wire billing or a strict ingress-byte
+guarantee**. Polling and stop latency can produce an observed overrun; the UI
+reports it rather than rounding usage down to the allowance.
+
+During a run, displayed consumption is the last saved debit, not a live total.
+The final total includes the verified tail through the cutoff. An interrupted
+write is reconciled against the bound intent, journal and cutoff; it is never
+blindly appended again. Missing or inconsistent evidence yields unknown usage,
+not zero, and cannot release a scheduler reservation as an exact settlement.
+Zero before admission requires a separate bound no-producers receipt. Legacy
+records retain their original accounting interpretation and are labelled as such.
+
+Server qualification first compares repeated DL/UL observations from three
+servers. If that group is insufficient, it can examine three backup servers;
+backups are skipped when the first group qualifies. It requires stable,
+competitive independent reported sources. A chosen
+server must pass the comparison too; it is not silently replaced. Qualification
+does not prove that all equally slow servers represent the link's true capacity.
+The UI separates observed throughput from proposed CAKE rates. A fall below 50%
+of a retained, verified comparable same-boot raw reference blocks a new Apply;
+this guard does not invent a historical reference after reboot. Reviewing or
+rejecting a proposal does not apply its rates.
 
 ## Current package tree
 
@@ -522,6 +593,16 @@ Implemented:
   persistent pingers and scheduler separately, including short-lived child
   work waited by each daemon.
 - adaptive rate calculations using delay/load windows.
+- External/manual SQM (`manage_sqm=0`) permits bandwidth-only control of
+  explicitly enabled, addressable root CAKE queues. Disabled directions and
+  custom ingress steering stay untouched. Missing queues are reported as
+  `WAITING_EXTERNAL_SQM`, without automatic topology repair; native Auto-Tune
+  still requires its separate managed/exclusive restore authority.
+- Cold latency baselines use three independent, recent low-load counter/RTT
+  observations, not a fixed 100 ms starting value. Until qualified, the daemon
+  holds off that reflector's control and measurement decisions. Status reports
+  `latency_baseline_ready` and counts of ready/pending reflectors; initial
+  qualification reports `LEARNING`. Real route changes restart qualification.
 - Optional Rust-only bounded-probe ceiling extension. **Validated ceiling
   only** is the conservative default when link classification is inconclusive;
   bounded passive/scheduled learning is an explicit policy. Each direction
@@ -531,7 +612,9 @@ Implemented:
   lowest target that caused confirmed bufferbloat. Later probes use the midpoint
   between safe and failed bounds. Short load/delay-classification fluctuations
   are tolerated, while sustained loss or a global probe-response gap rolls back
-  without poisoning the safe/failed bounds; a stall resets runtime learning.
+  without poisoning the safe/failed bounds. A brief stall pauses learning;
+  sustained response loss past the effective global timeout resets learned
+  bounds. Real route changes and daemon restarts still reset runtime learning.
   Measured-raw DL/UL caps and any tighter service caps remain hard safety
   limits, and runtime learning never rewrites UCI.
   Status exposes the phase, safe ceiling, failed bound, probe target, and last
@@ -695,9 +778,8 @@ Implemented:
   credentials in a child-process argument list, and registers retained Home
   Assistant discovery and availability records when enabled.
 - Automatic interface preset: selecting the target interface fills
-  `sqm_interface`, `ul_if`, `dl_if=ifb4<target>`, and empty/generated
-  `ping_extra_args=-I <target>` for non-IRTT pingers so reflector probes are
-  bound to the selected uplink by default.
+  `sqm_interface`, `ul_if`, and `dl_if=ifb4<target>`. Automatic pinger binding
+  is derived from the current route at runtime, not stored in extra arguments.
 - Automatic SQM rate import from an existing `/etc/config/sqm` queue for the
   selected interface when available.
 - Upstream-style max-wire packet compensation for OWD thresholds and achieved
@@ -729,9 +811,14 @@ Known limits:
   setups and is always tokenized without a shell. The init script migrates the
   exact legacy form `mwan3 use <member> exec` to structured `route_mode=mwan3`;
   structured Multi-WAN never accepts a free-form shell prefix.
-- The LuCI wizard and interface preset fill `ping_extra_args=-I <target>` when
-  the field is empty or still contains a generated `-I ...` value. Manual
-  multi-argument ping args and `ping_prefix_string` are preserved.
+- Native Apply, the LuCI wizard and interface presets preserve user
+  `ping_extra_args` instead of generating `-I` values. Runtime uses fping's
+  interface/source options, ping's interface option, tsping's `--interface`
+  (and route mark for mwan3), or IRTT's `--local` source-address option.
+  IRTT source binding is not an interface bind and still requires the existing
+  main/mwan3 route contract. Conflicting saved pins fail explicitly; a legacy
+  `-I` cannot safely be guessed to be generated rather than user-authored.
+  Review/remove that old pin after changing interfaces or switching to tsping.
 - `fping-ts` and `tsping` depend on reflectors that answer ICMP timestamp
   probes; many public DNS anycast reflectors do not.
 - `tsping` is runtime-detected and not a hard package dependency; install a
@@ -847,6 +934,108 @@ recommendation into pending changes. If `tsping` is manually installed, the
 planner can use it as the timestamp probe path when `fping --icmp-timestamp` is
 unavailable. The create wizard writes pinger defaults and can run the same scan
 before creating a new instance.
+
+### Unreleased source: configuration validation foundation
+
+The audit-remediation parser separates pure per-instance values from reflector
+URL loading, global history reads and interface discovery. Non-finite numbers,
+inverted rate/threshold tuples, invalid factors and unbounded detection windows
+are rejected before those discovery steps. Full and Lite now validate the
+parsed LuCI candidate before saving. Source/browser checks do not replace the
+remaining installed-RPCd, real-UCI, lifecycle and device acceptance gates.
+
+Detection windows retain their configured length, not allocator capacity.
+Native windows are limited to4096 samples, with a1MiB logical sample budget for
+combined controller/reflector history (not a measured RSS bound). Parallel
+pingers use the existing Lite limit of64; the minimum ping interval is0.05s.
+Core timer intervals fit the signed32-bit millisecond domain (about24.9days).
+A disabled direction may retain a valid min/base/max tuple or use all zero;
+mixed zero tuples are invalid. Existing meaningful defaults remain unchanged.
+
+Full/Lite rate-triplet feedback uses native-exported bounds and defaults instead
+of separate UI rate floors. Decimal and scientific notation are parsed strictly;
+trailing junk and non-finite values are rejected. Other scalar and cross-field
+constraints are checked by the same native candidate validator before saving,
+including activity thresholds, positive timers, coefficient order and bounded
+windows. A form accepting typed input is not itself permission to save or apply.
+
+An unreleased stdin-only `--validate-config-candidate` entry point checks
+submitted controller and managed-SQM intent and returns a versioned JSON result.
+Its `validation_scope` is `controller-sqm`, not complete lifecycle/Apply
+acceptance. It performs no UCI reads, reflector requests, temporary-file writes
+or service actions. MQ admission reads local script and boot/tool/module-bound
+proof; it never launches a capability probe as a side effect of validation.
+
+The Full/Lite SQM selector offers CAKE and, after verification, multi-queue
+CAKE. SQM receives `qdisc=cake` plus `use_mq=1`, not the legacy `cake-mq` name.
+Legacy `cake-mq`/`cake_mq` intent and retained SQM `use_mq` remain visible;
+an explicit single-queue choice writes `sqm_use_mq=0`. An unverified saved MQ
+choice is shown with a warning, not silently disabled or offered as a new
+supported choice. Native projection also rejects unsupported qdiscs and MQ.
+
+"Verify multi-queue support" checks the selected script declaration and probes
+kernel/tc using one private, down IFB with two queues. It generates no test
+traffic, assigns no address, and does not alter existing interfaces or queues.
+An owned receipt is written before creation; cleanup must finish before support
+is published. Interrupted cleanup is recovered before another probe can start.
+Proof does not survive a changed boot, tc or kernel module identity. Authorized
+mutating startup/Apply preparation refreshes missing proof before applying the
+SQM projection; read-only status, dry-run and candidate validation never do so.
+Successful source tests are not proof of support on a particular router.
+
+The native chunk-transfer bridge is also under source validation. It stages
+at most four256KiB candidates in a private0700 directory with0600 files, using
+1024-byte chunks, immutable request/length/SHA-256 identity and idempotent chunk
+replay. Terminal validation/cancel removes the record. Admission expires after
+120seconds; interrupted leftovers are retired on the next transfer request,
+not by a new polling daemon. The namespace is excluded from diagnostic export.
+This controlled staging does not grant LuCI general file-write authority.
+
+### Unreleased source: Stop with pending configuration
+
+Ordinary Stop now captures committed `cake-autorate` and `sqm` through private,
+random UCI package aliases. It retains that snapshot for planning and SQM stop
+checks, preserving unrelated default/rpcd savedir contents. Changed committed
+files, native Apply recovery, busy lifecycle ownership and unsafe runtime state
+remain refusals. This is not permission to commit or revert pending settings.
+Safe busy/stop diagnostics also reach stderr for LuCI, while rc.common's
+fail-closed exit remains in place.
+
+Start still uses its existing staged-change guards pending the separate R4
+isolated-transaction work. Stop source/fixture checks do not replace installed
+RPCd, running-service, package-upgrade and physical-device acceptance.
+
+The unreleased source also has a journaled two-package file publisher and a
+private controller-input consumer. The latter keeps controller argv unchanged:
+an internal procd environment value identifies a content-bound generation.
+Missing, corrupt or mismatched input never falls back to ordinary UCI. Input
+files are private and excluded from diagnostic export; their producer, runtime
+acceptance, retirement and scoped SQM Start still require lifecycle integration.
+These components are not a completed Start cutover or a deployment claim.
+
+### Unreleased source: bounded daemon logging
+
+The audit-remediation source keeps one active `cake-autorate.<instance>.log`
+and one plain-text `.old` file. Each is limited by `log_file_max_size_KB`
+(2000 KiB by default), with a hard maximum of16384 KiB per file even when the
+configured value is zero. Records are UTF-8-safe and bounded; oversized existing
+logs retain only a bounded complete-record tail with a truncation marker.
+The private zero-byte `.lock` file serializes writers; a bounded `.tmp` file may
+exist during compaction. Neither is included in diagnostic downloads.
+
+Rotation no longer runs gzip or logger in the controller loop. SYSLOG/ERROR
+messages also reach procd stderr; repeated file-write failures are throttled.
+If file logging cannot open safely, the controller reports that failure and
+continues with system logging. MQTT drains unread data from its old descriptor
+before switching to the replacement file, in bounded event-loop batches.
+
+Old numeric timestamp archives belonging to the configured log basename are
+removed in bounded startup/write batches. Unrelated names, symlinks, hardlinks
+and foreign-owned files are preserved. Large pre-existing archive collections
+may therefore require several batches; normal rotation never creates more.
+Legacy `log_file_export_compress` values remain readable for compatibility but
+do not enable runtime compression. LuCI diagnostic downloads remain plain text,
+including safely decoded older gzip archives.
 
 The LuCI Logging tab validates the built-in native MQTT publisher. No external
 MQTT client package is needed. After setting `mqtt_enabled=1`, `mqtt_host`, and
@@ -1036,3 +1225,29 @@ and a temporary `log_file_path_override`.
 Rust is a reasonable daemon language for this project because it provides one static-ish native binary, predictable memory safety, and better long-term maintainability than a large shell daemon. The main practical cost on OpenWrt is build complexity: the first SDK build of `rust/host` is heavy because it compiles Rust/LLVM tooling.
 
 For faster iteration, keep a cached SDK or CI artifact with the Rust host toolchain already built.
+
+## Optional external IPv4 lookup
+
+External-address lookup is disabled by default in Full and Lite. Existing
+instances with no `external_ip_check_enabled` option also make no lookup.
+Enable it explicitly in Full's Advanced options or Lite's Connection tab only
+if you want this additional route metadata. The HTTPS service sees your public
+address and request times. This setting does not disable other independently
+configured latency probes, reflector-list downloads, or user-requested tests.
+
+Per-instance options:
+
+- `external_ip_check_enabled`: `0` by default, `1` to enable.
+- `external_ip_check_url`: defaults to `https://api.ipify.org`; use an HTTPS
+  host/path returning one plain IPv4 address, without credentials, query or
+  fragment. URLs are limited to 1024 ASCII bytes.
+- `external_ip_check_interval_s`: defaults to 3600 seconds; range 60–604800.
+
+When enabled, a lookup starts only on an admitted route, with at most one
+request in flight. Failures and route changes do not bypass the interval in
+the running daemon. A daemon restart starts a new interval schedule. Each
+fetch has a five-second total execution deadline and a 1024-byte output bound;
+surrounding route inspection uses the existing route helpers. Failed or stale
+results do not prevent ordinary rate control, and external address metadata
+does not replace the device/source/mark/table route identity. No external IP
+lookup is needed to run the controller.

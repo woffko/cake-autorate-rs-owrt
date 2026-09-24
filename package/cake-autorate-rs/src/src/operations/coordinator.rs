@@ -132,7 +132,8 @@ const MAX_PENDING_NATIVE_APPLY_WATCHES: usize = 32;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024;
 const MAX_RESULT_RESPONSE_BYTES: usize = 512 * 1024;
 const WORKER_CANCEL_GRACE: Duration = Duration::from_secs(15);
-type RoutePinCleaner = fn(&str, &str) -> Result<(), String>;
+type RoutePinCleaner =
+    fn(&str, &str, Option<speedtest::OwnedCleanupContext<'_>>) -> Result<(), String>;
 type BootstrapRuntimeAttestor = fn(&OperationRequest, &AbsentRuntimeBaseline) -> Result<(), String>;
 type BootstrapRuntimeBaselineCapturer =
     fn(&OperationRequest) -> Result<AbsentRuntimeBaseline, String>;
@@ -241,9 +242,20 @@ fn cleanup_native_route_pin(
     request: &OperationRequest,
     worker_run_id: &str,
     cleaner: RoutePinCleaner,
+    directory: Option<&Path>,
 ) -> Result<(), String> {
     if operation_uses_native_route_pin(request) {
-        cleaner(&request.identity.job_id, worker_run_id)?;
+        let owned = if request.identity.operation == OperationKind::FullAutotune
+            && request.traffic_policy_explicit
+        {
+            Some(speedtest::OwnedCleanupContext {
+                directory: directory.ok_or("owned cleanup has no job directory")?,
+                request,
+            })
+        } else {
+            None
+        };
+        cleaner(&request.identity.job_id, worker_run_id, owned)?;
     }
     Ok(())
 }
@@ -1392,6 +1404,453 @@ fn verified_native_autotune_public_result(
     Ok(stored)
 }
 
+// Configuration rates are deliberately not a history source.
+fn prior_raw_comparison_eligible(current: &OperationRequest, prior: &OperationRequest) -> bool {
+    current.identity.operation == OperationKind::FullAutotune
+        && prior.identity.operation == OperationKind::FullAutotune
+        && current.identity.job_id != prior.identity.job_id
+        && current.identity.instance == prior.identity.instance
+        && current.identity.target_interface == prior.identity.target_interface
+        && current.identity.route_fingerprint == prior.identity.route_fingerprint
+        && current.route == prior.route
+        && current.access_medium == prior.access_medium
+        && current.service_dl_cap_kbps == prior.service_dl_cap_kbps
+        && current.service_ul_cap_kbps == prior.service_ul_cap_kbps
+        && prior.created_unix_ms < current.created_unix_ms
+        && current.strategy == Some(super::protocol::CalibrationStrategy::FullRaw)
+        && prior.strategy == current.strategy
+        && current.allow_sqm_disable
+        && prior.allow_sqm_disable
+}
+
+fn verified_raw_reference_rates(result: &serde_json::Value) -> Option<(u64, u64)> {
+    let proposal = &result["artifacts"]["proposal"]["value"];
+    let rate = |direction: &str| {
+        proposal[direction]["observed_low_kbps"]
+            .as_u64()
+            .filter(|rate| *rate > 0 && *rate <= 100_000_000)
+    };
+    Some((rate("download")?, rate("upload")?))
+}
+
+fn raw_reference_has_large_decline(current: (u64, u64), prior: (u64, u64)) -> bool {
+    u128::from(current.0) * 2 < u128::from(prior.0)
+        || u128::from(current.1) * 2 < u128::from(prior.1)
+}
+
+fn history_binding_for_result(
+    state_dir: &Path,
+    job: &ScannedJob,
+    verified_result: &str,
+) -> Result<super::autotune_history::HistoryDecision, String> {
+    use super::autotune_history::{HistoryDecision, RawReference};
+    let value: serde_json::Value =
+        serde_json::from_str(verified_result).map_err(|_| "history result JSON is invalid")?;
+    let (download_kbps, upload_kbps) =
+        verified_raw_reference_rates(&value).ok_or("history raw reference is unavailable")?;
+    let worker = job
+        .journal
+        .worker_run_id
+        .as_deref()
+        .ok_or("history worker identity is missing")?;
+    let terminal = full_autotune::read_terminal_file(
+        &state_dir
+            .join("jobs")
+            .join(&job.journal.job_id)
+            .join(format!("terminal-{worker}")),
+    )?;
+    let AutotuneTerminal::Complete { review_digest } = terminal.terminal else {
+        return Err("history terminal is incomplete".into());
+    };
+    if terminal.job_id != job.request.identity.job_id || terminal.worker_run_id != worker {
+        return Err("history terminal identity changed".into());
+    }
+    let key = serde_json::json!({"instance":job.request.identity.instance,
+        "target":job.request.identity.target_interface, "route":job.request.identity.route_fingerprint,
+        "medium":format!("{:?}",job.request.access_medium),
+        "dl_cap":job.request.service_dl_cap_kbps,"ul_cap":job.request.service_ul_cap_kbps});
+    let decision = HistoryDecision {
+        boot_id: job.journal.boot_id.clone(),
+        route_key: super::autotune_apply::native_apply_sha256_hex(key.to_string().as_bytes()),
+        request_sha256: super::autotune_apply::native_apply_sha256_hex(
+            job.request.encode()?.as_bytes(),
+        ),
+        worker_run_id: worker.to_string(),
+        current: RawReference {
+            job_id: job.request.identity.job_id.clone(),
+            review_sha256: review_digest,
+            created_unix_ms: job.request.created_unix_ms,
+            download_kbps,
+            upload_kbps,
+        },
+        reference: None,
+    };
+    decision.validate()?;
+    Ok(decision)
+}
+
+fn read_bound_history_decision(
+    state_dir: &Path,
+    job: &ScannedJob,
+    verified_result: &str,
+) -> Result<super::autotune_history::HistoryDecision, String> {
+    let binding = history_binding_for_result(state_dir, job, verified_result)?;
+    let decision = super::autotune_history::HistoryDecision::read(
+        &state_dir
+            .join("jobs")
+            .join(&job.journal.job_id)
+            .join("raw-history-decision"),
+    )?;
+    let mut actual = decision.clone();
+    actual.reference = None;
+    if actual != binding {
+        return Err("history decision does not match this Review".into());
+    }
+    Ok(decision)
+}
+
+fn publish_settled_history_decision(
+    state_dir: &Path,
+    job: &ScannedJob,
+    jobs: &[ScannedJob],
+) -> Result<(), String> {
+    if !job.journal.history_decision_required
+        || job.journal.terminal_state.as_deref() != Some("complete")
+    {
+        return Ok(());
+    }
+    let result = verified_native_autotune_public_result(state_dir, &job.request, &job.journal)?;
+    let path = state_dir
+        .join("jobs")
+        .join(&job.journal.job_id)
+        .join("raw-history-decision");
+    let archive_dir = state_dir.join("raw-history");
+    let mut decision = history_binding_for_result(state_dir, job, &result)?;
+    match fs::symlink_metadata(&path) {
+        Ok(_) => decision = read_bound_history_decision(state_dir, job, &result)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let archive = archive_dir.join(&decision.route_key);
+            match fs::symlink_metadata(&archive) {
+                Ok(_) => decision.inherit_reference(
+                    &super::autotune_history::HistoryDecision::read(&archive)?,
+                )?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    // Migration seed from a retained, canonically verified old
+                    // Review only; a new-contract predecessor must use its receipt.
+                    if let Some((prior, _)) =
+                        find_verified_prior_raw_reference(job, jobs, |prior| {
+                            verified_native_autotune_public_result(
+                                state_dir,
+                                &prior.request,
+                                &prior.journal,
+                            )
+                        })
+                    {
+                        let prior_result = verified_native_autotune_public_result(
+                            state_dir,
+                            &prior.request,
+                            &prior.journal,
+                        )?;
+                        let previous = if prior.journal.history_decision_required {
+                            read_bound_history_decision(state_dir, prior, &prior_result)?
+                        } else {
+                            history_binding_for_result(state_dir, prior, &prior_result)?
+                        };
+                        decision.inherit_reference(&previous)?;
+                    }
+                }
+                Err(error) => return Err(format!("unable to inspect history archive: {error}")),
+            }
+            decision.publish(&path)?;
+        }
+        Err(error) => return Err(format!("unable to inspect history decision: {error}")),
+    }
+    // Both durable publications precede ReviewReady. A failed archive write
+    // retries the immutable decision, not a new comparison with altered history.
+    decision.archive(&archive_dir)
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_history_publication_from_canonical_fixture(
+    root: &Path,
+    request: &OperationRequest,
+    worker: &str,
+    review: &str,
+) {
+    use super::autotune_apply_runtime::ensure_private_directory;
+    let state_dir = root.with_extension("history-state");
+    ensure_private_directory(&state_dir).unwrap();
+    let jobs_dir = state_dir.join("jobs");
+    ensure_private_directory(&jobs_dir).unwrap();
+    let job_dir = jobs_dir.join(&request.identity.job_id);
+    fs::rename(root, &job_dir).unwrap();
+    struct Restore {
+        original: PathBuf,
+        moved: PathBuf,
+        state: PathBuf,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = fs::rename(&self.moved, &self.original);
+            let _ = fs::remove_dir_all(&self.state);
+        }
+    }
+    let _restore = Restore {
+        original: root.to_path_buf(),
+        moved: job_dir.clone(),
+        state: state_dir.clone(),
+    };
+    let identity = CoordinatorIdentity {
+        boot_id: "aa".repeat(16),
+        generation: "77".repeat(16),
+        process: ProcessIdentity::current().unwrap(),
+    };
+    let mut journal = JobJournal::queued(request, &identity, true).unwrap();
+    assert!(journal.history_decision_required);
+    journal.worker_run_id = Some(worker.into());
+    journal.state = OperationState::Recovering;
+    journal.runtime_mutated = true;
+    journal.recovery_required = true;
+    journal.validate().unwrap();
+    rating::atomic_private_write(&job_dir.join("state"), journal.encode().unwrap().as_bytes())
+        .unwrap();
+    let store = JournalStore::open(&state_dir, identity).unwrap();
+    let mut settled = journal.clone();
+    settled
+        .settle_native_runtime_terminal("complete", None)
+        .unwrap();
+    let job = ScannedJob {
+        request: request.clone(),
+        journal: settled.clone(),
+        disposition: JournalDisposition::Settled,
+    };
+    let private_review: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(job_dir.join(format!("review-{worker}.json"))).unwrap(),
+    )
+    .unwrap();
+    full_autotune::publish_terminal_file(
+        &job_dir.join(format!("terminal-{worker}")),
+        &full_autotune::AutotuneTerminalRecord {
+            job_id: request.identity.job_id.clone(),
+            worker_run_id: worker.into(),
+            consumed_traffic_bytes: private_review["consumed_traffic_bytes"].as_u64().unwrap(),
+            terminal: AutotuneTerminal::Complete {
+                review_digest: review.into(),
+            },
+        },
+    )
+    .unwrap();
+    let canonical = verified_native_autotune_public_result(&state_dir, request, &settled).unwrap();
+    let mut archived_fixture = history_binding_for_result(&state_dir, &job, &canonical).unwrap();
+    // Stored-reference fixture; current evidence is a real canonical full run.
+    archived_fixture.current.job_id = "cc".repeat(16);
+    archived_fixture.current.review_sha256 = "dd".repeat(32);
+    archived_fixture.current.created_unix_ms -= 1;
+    archived_fixture.current.download_kbps *= 4;
+    archived_fixture
+        .archive(&state_dir.join("raw-history"))
+        .unwrap();
+    publish_settled_history_decision(&state_dir, &job, &[]).unwrap();
+    assert_eq!(
+        read_private_job_journal(&state_dir, &request.identity.job_id).unwrap(),
+        journal,
+        "history publication must not itself expose ReviewReady"
+    );
+    let first = read_bound_history_decision(&state_dir, &job, &canonical).unwrap();
+    assert!(first.blocked());
+    // Rehearse restart after decision/archive fsync but before journal update.
+    publish_settled_history_decision(&state_dir, &job, &[]).unwrap();
+    store.update(&settled).unwrap();
+    let mut downgraded = settled.clone();
+    downgraded.history_decision_required = false;
+    assert!(
+        store.update(&downgraded).is_err(),
+        "admitted history requirement cannot be removed"
+    );
+    assert_eq!(
+        read_private_job_journal(&state_dir, &request.identity.job_id).unwrap(),
+        settled
+    );
+    assert!(require_prior_raw_apply_admission(
+        &state_dir,
+        &[job.clone()],
+        &request.identity.job_id
+    )
+    .is_err());
+    fs::remove_file(state_dir.join("raw-history").join(&first.route_key)).unwrap();
+    assert_eq!(
+        read_bound_history_decision(&state_dir, &job, &canonical).unwrap(),
+        first
+    );
+    publish_settled_history_decision(&state_dir, &job, &[]).unwrap();
+    let mut changed = job.clone();
+    changed.request.service_dl_cap_kbps = Some(123456);
+    assert!(read_bound_history_decision(&state_dir, &changed, &canonical).is_err());
+    fs::remove_file(job_dir.join("raw-history-decision")).unwrap();
+    assert!(
+        require_prior_raw_apply_admission(&state_dir, &[job], &request.identity.job_id).is_err(),
+        "missing mandatory decision cannot silently lift an Apply hold"
+    );
+}
+
+fn find_verified_prior_raw_reference<'a>(
+    current: &ScannedJob,
+    jobs: &'a [ScannedJob],
+    mut verified_result: impl FnMut(&ScannedJob) -> Result<String, String>,
+) -> Option<(&'a ScannedJob, (u64, u64))> {
+    if jobs.len() > MAX_JOURNAL_JOBS {
+        return None;
+    }
+    let mut candidates: Vec<_> = jobs
+        .iter()
+        .filter(|prior| {
+            prior.journal.boot_id == current.journal.boot_id
+                && prior_raw_comparison_eligible(&current.request, &prior.request)
+                && matches!(
+                    prior.journal.state,
+                    super::protocol::OperationState::ReviewReady
+                        | super::protocol::OperationState::Completed
+                )
+                && !prior.journal.runtime_mutated
+                && !prior.journal.recovery_required
+                && prior.journal.process.is_none()
+                && prior.journal.runtime_owner_process.is_none()
+        })
+        .collect();
+    candidates.sort_by(|a, b| {
+        b.request
+            .created_unix_ms
+            .cmp(&a.request.created_unix_ms)
+            .then_with(|| b.journal.job_id.cmp(&a.journal.job_id))
+    });
+    // Bound expensive canonical replays. Unavailable history is not zero rate.
+    for prior in candidates.into_iter().take(3) {
+        let Ok(prior_result) = verified_result(prior) else {
+            continue;
+        };
+        let Ok(prior_value) = serde_json::from_str::<serde_json::Value>(&prior_result) else {
+            continue;
+        };
+        let Some((prior_download, prior_upload)) = verified_raw_reference_rates(&prior_value)
+        else {
+            continue;
+        };
+        return Some((prior, (prior_download, prior_upload)));
+    }
+    None
+}
+
+// Control replies are one LF-terminated JSON line; the terminator counts toward
+// the wire bound even when history annotations reserialize a canonical result.
+fn encode_bounded_result_response(value: &serde_json::Value) -> Option<String> {
+    let mut encoded = value.to_string();
+    if encoded.len() >= MAX_RESULT_RESPONSE_BYTES {
+        return None;
+    }
+    encoded.push('\n');
+    Some(encoded)
+}
+
+fn annotate_prior_raw_comparison(
+    result: String,
+    current: &ScannedJob,
+    jobs: &[ScannedJob],
+    verified_result: impl FnMut(&ScannedJob) -> Result<String, String>,
+) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&result) else {
+        return result;
+    };
+    let Some((download, upload)) = verified_raw_reference_rates(&value) else {
+        return result;
+    };
+    if let Some((prior, (prior_download, prior_upload))) =
+        find_verified_prior_raw_reference(current, jobs, verified_result)
+    {
+        value["prior_raw_comparison"] = serde_json::json!({
+            "schema_version": 1,
+            "proof_status": "verified-prior-review-diagnostic-only",
+            "prior_job_id": prior.journal.job_id,
+            "prior_created_unix_ms": prior.request.created_unix_ms,
+            "current_download_kbps": download,
+            "current_upload_kbps": upload,
+            "prior_download_kbps": prior_download,
+            "prior_upload_kbps": prior_upload
+            ,"new_apply_blocked": current.request.traffic_policy_explicit
+                && raw_reference_has_large_decline((download, upload), (prior_download, prior_upload))
+        });
+        if let Some(encoded) = encode_bounded_result_response(&value) {
+            return encoded;
+        }
+    }
+    result
+}
+
+fn scheduled_auto_apply_with_prior_guard(
+    current: &ScannedJob,
+    jobs: &[ScannedJob],
+    mut verified_result: impl FnMut(&ScannedJob) -> Result<String, String>,
+    apply: impl FnOnce() -> Result<NativeScheduledAutoApplyOutcome, String>,
+) -> Result<NativeScheduledAutoApplyOutcome, String> {
+    // Old admitted jobs retain their original policy. This additional guard
+    // does not upgrade a diagnostic or a configured rate into Apply authority.
+    if current.request.scheduled_auto_apply_requested && current.request.traffic_policy_explicit {
+        if let Some((_, prior)) =
+            find_verified_prior_raw_reference(current, jobs, &mut verified_result)
+        {
+            let result = verified_result(current)?;
+            let value = serde_json::from_str(&result)
+                .map_err(|_| "current raw comparison JSON is invalid")?;
+            let rates = verified_raw_reference_rates(&value)
+                .ok_or("current raw reference is unavailable")?;
+            // A greater-than-twofold collapse needs review; it is not proof
+            // that either the line or the selected server is faulty.
+            if raw_reference_has_large_decline(rates, prior) {
+                return Ok(NativeScheduledAutoApplyOutcome::PriorThroughputReviewRequired);
+            }
+        }
+    }
+    apply()
+}
+
+fn require_prior_raw_apply_admission(
+    state_dir: &Path,
+    jobs: &[ScannedJob],
+    source_job_id: &str,
+) -> Result<(), String> {
+    let Some(current) = jobs
+        .iter()
+        .find(|job| job.request.identity.job_id == source_job_id)
+    else {
+        // The normal source/manifest verifier owns unknown-job rejection.
+        return Ok(());
+    };
+    if !current.request.traffic_policy_explicit {
+        return Ok(());
+    }
+    if current.journal.history_decision_required {
+        let result =
+            verified_native_autotune_public_result(state_dir, &current.request, &current.journal)?;
+        if read_bound_history_decision(state_dir, current, &result)?.blocked() {
+            return Err("prior-raw-throughput-collapse: saved decision requires investigation before a new Apply".into());
+        }
+        return Ok(());
+    }
+    let verified = |job: &ScannedJob| {
+        verified_native_autotune_public_result(state_dir, &job.request, &job.journal)
+    };
+    if let Some((_, prior)) = find_verified_prior_raw_reference(current, jobs, verified) {
+        let result = verified(current)?;
+        let value =
+            serde_json::from_str(&result).map_err(|_| "current raw comparison JSON is invalid")?;
+        let rates =
+            verified_raw_reference_rates(&value).ok_or("current raw reference is unavailable")?;
+        if raw_reference_has_large_decline(rates, prior) {
+            return Err("prior-raw-throughput-collapse: result below 50% of a verified previous same-route test; rerun or investigate the link and sources before applying".into());
+        }
+    }
+    Ok(())
+}
+
 fn scan_current_autotune_operation_with_review_validator<F>(
     state_dir: &Path,
     instance: &str,
@@ -1526,6 +1985,7 @@ impl VerifiedNativeApplyAuthority {
 enum NativeScheduledAutoApplyOutcome {
     NotRequested,
     ReviewRequired,
+    PriorThroughputReviewRequired,
     Applied(NativeApplyCommitDisposition),
 }
 
@@ -1726,7 +2186,11 @@ fn execute_native_scheduled_auto_apply(
 }
 
 pub(crate) fn native_apply_recovery_markers_present() -> Result<(bool, bool), String> {
-    let current = default_native_apply_paths().recovery_root.join("current");
+    native_apply_recovery_markers_at(default_native_apply_paths().recovery_root)
+}
+
+pub(crate) fn native_apply_recovery_markers_at(root: &Path) -> Result<(bool, bool), String> {
+    let current = root.join("current");
     let existing = match fs::symlink_metadata(&current) {
         Ok(_) => true,
         Err(error) if error.kind() == io::ErrorKind::NotFound => false,
@@ -1734,10 +2198,9 @@ pub(crate) fn native_apply_recovery_markers_present() -> Result<(bool, bool), St
             "unable to inspect native Apply recovery marker: {error}"
         ))?,
     };
-    let bootstrap =
-        NativeBootstrapApplyRecoveryStore::new(default_native_apply_paths().recovery_root)
-            .read_record()?
-            .is_some();
+    let bootstrap = NativeBootstrapApplyRecoveryStore::new(root)
+        .read_record()?
+        .is_some();
     if existing && bootstrap {
         return Err(
             "existing and bootstrap native Apply recovery authorities are both pending".to_string(),
@@ -2939,6 +3402,16 @@ fn kernel_request_id() -> Result<String, String> {
     Ok(id)
 }
 
+fn owned_budget_monitor_eligible(job: &ScannedJob) -> bool {
+    job.request.identity.operation == OperationKind::FullAutotune
+        && job.request.traffic_policy_explicit
+        && job.request.traffic_budget.limit_bytes().is_some()
+        && matches!(
+            job.journal.state,
+            super::protocol::OperationState::Starting | super::protocol::OperationState::Running
+        )
+}
+
 struct CalibrationDaemon {
     listener: UnixListener,
     socket_path: PathBuf,
@@ -2962,6 +3435,14 @@ struct CalibrationDaemon {
     route_pin_cleaner: RoutePinCleaner,
     cancellations: BTreeMap<String, PendingWorkerCancellation>,
     job_errors: BTreeMap<String, String>,
+    owned_budget_samples: BTreeMap<(String, String), speedtest::OwnedTrafficSnapshot>,
+    owned_budget_reader: fn(
+        &Path,
+        &OperationRequest,
+        &str,
+        Option<speedtest::OwnedTrafficSnapshot>,
+    ) -> Result<speedtest::OwnedTrafficSnapshot, String>,
+    next_owned_budget_poll: Instant,
     native_apply_store: NativeApplyCoordinatorStore,
     native_apply_live_state_attestor: NativeApplyLiveStateAttestor,
     native_apply_child: Option<ManagedChild>,
@@ -3186,6 +3667,9 @@ impl CalibrationDaemon {
             route_pin_cleaner: speedtest::cleanup_route_pin,
             cancellations: BTreeMap::new(),
             job_errors: BTreeMap::new(),
+            owned_budget_samples: BTreeMap::new(),
+            owned_budget_reader: speedtest::supervise_owned_traffic,
+            next_owned_budget_poll: Instant::now(),
             native_apply_store: NativeApplyCoordinatorStore::new(
                 default_native_apply_paths().recovery_root,
             ),
@@ -3455,6 +3939,12 @@ impl CalibrationDaemon {
     fn next_event_timeout(&self) -> Result<Option<Duration>, String> {
         let now = Instant::now();
         let mut timeout = None;
+        if self.native_autotune && self.jobs.iter().any(owned_budget_monitor_eligible) {
+            reduce_timeout(
+                &mut timeout,
+                self.next_owned_budget_poll.saturating_duration_since(now),
+            );
+        }
         for deadline in self
             .cancellations
             .values()
@@ -3491,6 +3981,7 @@ impl CalibrationDaemon {
     fn tick(&mut self) {
         self.drive_native_apply();
         self.poll_native_children();
+        self.poll_owned_traffic_budgets();
         self.poll_bootstrap_runtime_owners();
         self.poll_worker_cancellations();
         self.poll_pending_runtime_permits();
@@ -3499,6 +3990,108 @@ impl CalibrationDaemon {
         self.poll_native_scheduler();
         self.dispatch_next_queued();
         self.flush_native_apply_watches();
+    }
+
+    fn poll_owned_traffic_budgets(&mut self) {
+        if !self.native_autotune {
+            self.owned_budget_samples.clear();
+            return;
+        }
+        if Instant::now() < self.next_owned_budget_poll {
+            return;
+        }
+        self.next_owned_budget_poll = Instant::now() + Duration::from_millis(250);
+        self.owned_budget_samples.retain(|(job, worker), _| {
+            self.jobs.iter().any(|entry| {
+                owned_budget_monitor_eligible(entry)
+                    && &entry.journal.job_id == job
+                    && entry.journal.worker_run_id.as_ref() == Some(worker)
+            })
+        });
+        for index in 0..self.jobs.len() {
+            if !owned_budget_monitor_eligible(&self.jobs[index]) {
+                continue;
+            }
+            let Some(worker) = self.jobs[index].journal.worker_run_id.clone() else {
+                continue;
+            };
+            let job_id = self.jobs[index].journal.job_id.clone();
+            let key = (job_id.clone(), worker.clone());
+            let previous = self.owned_budget_samples.get(&key).copied();
+            let result = (|| -> Result<Option<speedtest::OwnedTrafficSnapshot>, String> {
+                let job = &self.jobs[index];
+                let paths = self.journal_store.native_job_paths(&job_id, &worker)?;
+                if previous.is_none() {
+                    let run_dir =
+                        if job.request.target_state == OperationTargetState::AbsentBootstrap {
+                            paths.bootstrap_runtime_dir.clone()
+                        } else {
+                            Config::defaults(job.request.identity.instance.clone()).run_dir()
+                        };
+                    if matches!(fs::symlink_metadata(&run_dir), Err(error) if error.kind() == io::ErrorKind::NotFound)
+                    {
+                        return Ok(None);
+                    }
+                    let store = RuntimeOverrideStore::open(&run_dir)?;
+                    let Some(permit) = store.read_permit()? else {
+                        return Ok(None);
+                    };
+                    if permit.job_id != job_id || permit.worker_run_id != worker {
+                        return Err("owned budget permit identity mismatch".into());
+                    }
+                    if !permit.probe_accounting_required
+                        || permit.route_fingerprint != job.request.identity.route_fingerprint
+                    {
+                        return Err("owned budget permit accounting authority mismatch".into());
+                    }
+                    match store.probe_accounting_owner_for_supervision(&permit) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => return Ok(None),
+                        Err(error) => return Err(error),
+                    }
+                }
+                (self.owned_budget_reader)(
+                    paths
+                        .request
+                        .parent()
+                        .ok_or("owned budget has no job directory")?,
+                    &job.request,
+                    &worker,
+                    previous,
+                )
+                .map(Some)
+            })();
+            let stop = match result {
+                Ok(None) => continue,
+                Ok(Some(snapshot)) => {
+                    self.owned_budget_samples.insert(key, snapshot);
+                    match snapshot.total_bytes() {
+                        Ok(bytes) if !self.jobs[index].request.traffic_budget.exceeded(bytes) => {
+                            continue
+                        }
+                        Ok(_) => "owned-traffic-budget-exceeded",
+                        Err(_) => "owned-traffic-accounting-failed",
+                    }
+                }
+                Err(_) => "owned-traffic-accounting-failed",
+            };
+            let mut cancelling = self.jobs[index].journal.clone();
+            if let Err(error) = cancelling.transition(super::protocol::OperationState::Cancelling) {
+                self.job_errors.insert(job_id, error);
+                continue;
+            }
+            cancelling.diagnostic_code = Some(stop.into());
+            let persisted = self.journal_store.update(&cancelling);
+            self.jobs[index].journal = cancelling;
+            self.autotune_probes_retired(index);
+            self.begin_live_cancellation(index);
+            if let Err(error) = persisted {
+                self.job_errors.insert(
+                    job_id,
+                    format!("traffic stopped but its stop reason could not be persisted: {error}"),
+                );
+            }
+        }
     }
 
     fn poll_native_scheduler(&mut self) {
@@ -3943,13 +4536,52 @@ impl CalibrationDaemon {
                 let mut auto_apply_error = None;
                 persisted.operator_warning = None;
                 if settlement == ScheduledSettlement::Success {
-                    match auto_apply(&self.state_dir, &reservation.job_id) {
+                    let auto_apply_outcome = if self.jobs[index].journal.history_decision_required
+                        && self.jobs[index].request.scheduled_auto_apply_requested
+                    {
+                        (|| {
+                            let job = &self.jobs[index];
+                            let result = verified_native_autotune_public_result(
+                                &self.state_dir,
+                                &job.request,
+                                &job.journal,
+                            )?;
+                            if read_bound_history_decision(&self.state_dir, job, &result)?.blocked()
+                            {
+                                Ok(NativeScheduledAutoApplyOutcome::PriorThroughputReviewRequired)
+                            } else {
+                                auto_apply(&self.state_dir, &reservation.job_id)
+                            }
+                        })()
+                    } else {
+                        scheduled_auto_apply_with_prior_guard(
+                            &self.jobs[index],
+                            &self.jobs,
+                            |job| {
+                                verified_native_autotune_public_result(
+                                    &self.state_dir,
+                                    &job.request,
+                                    &job.journal,
+                                )
+                            },
+                            || auto_apply(&self.state_dir, &reservation.job_id),
+                        )
+                    };
+                    match auto_apply_outcome {
                         Ok(NativeScheduledAutoApplyOutcome::NotRequested) => {
                             scheduler.auto_apply_errors.remove(instance);
                             scheduler.auto_apply_warnings.remove(instance);
                         }
                         Ok(NativeScheduledAutoApplyOutcome::ReviewRequired) => {
                             let message = "scheduled Auto-Apply skipped: the preferred result requires explicit Review or changes SQM direction ownership".to_string();
+                            scheduler.auto_apply_errors.remove(instance);
+                            scheduler
+                                .auto_apply_warnings
+                                .insert(instance.to_string(), message.clone());
+                            persisted.operator_warning = Some(message);
+                        }
+                        Ok(NativeScheduledAutoApplyOutcome::PriorThroughputReviewRequired) => {
+                            let message = "scheduled Auto-Apply skipped: raw throughput fell below 50% of a verified previous same-route result; inspect the link and test sources before applying".to_string();
                             scheduler.auto_apply_errors.remove(instance);
                             scheduler
                                 .auto_apply_warnings
@@ -4037,6 +4669,11 @@ impl CalibrationDaemon {
         {
             return Err("scheduled terminal job identity is not trustworthy".to_string());
         }
+        if job.journal.diagnostic_code.as_deref() == Some("owned-traffic-accounting-failed") {
+            return Err(
+                "scheduled final traffic is unknown after coordinator accounting failure".into(),
+            );
+        }
         let worker_run_id = job
             .journal
             .worker_run_id
@@ -4048,6 +4685,9 @@ impl CalibrationDaemon {
         let terminal = full_autotune::read_terminal_file(&paths.terminal)?;
         if terminal.job_id != expected_job_id || terminal.worker_run_id != worker_run_id {
             return Err("scheduled terminal identity changed".to_string());
+        }
+        if full_autotune::terminal_traffic_is_unknown(&terminal.terminal) {
+            return Err("scheduled final traffic is unknown after an accounting failure".into());
         }
         let consumed = full_autotune::verify_terminal_consumed_traffic(
             &paths.request,
@@ -4433,6 +5073,28 @@ impl CalibrationDaemon {
         Ok(())
     }
 
+    fn cleanup_native_job_route_pin(&self, index: usize, worker: &str) -> Result<(), String> {
+        let job = &self.jobs[index];
+        if job.request.identity.operation == OperationKind::FullAutotune
+            && job.request.traffic_policy_explicit
+        {
+            if let Some(process) = &job.journal.process {
+                if !super::process::process_group_retired(process)? {
+                    return Err("owned cleanup is waiting for worker group retirement".into());
+                }
+            }
+        }
+        let paths = self
+            .journal_store
+            .native_job_paths(&job.journal.job_id, worker)?;
+        cleanup_native_route_pin(
+            &job.request,
+            worker,
+            self.route_pin_cleaner,
+            paths.request.parent(),
+        )
+    }
+
     fn poll_native_runtime_recoveries(&mut self) {
         let indices: Vec<usize> = self
             .jobs
@@ -4458,16 +5120,22 @@ impl CalibrationDaemon {
                     continue;
                 }
             };
-            if let Err(error) = cleanup_native_route_pin(
-                &self.jobs[index].request,
-                &worker_run_id,
-                self.route_pin_cleaner,
-            ) {
-                self.job_errors.insert(
-                    job_id,
-                    format!("unable to clean exact native speedtest route pin: {error}"),
-                );
+            if !self.autotune_probes_retired(index) {
                 continue;
+            }
+            // Owned counters must survive until restoration has finished.
+            // Disk/accounting failures may delay settlement, not withdrawal
+            // of the restored runtime request or the baseline restoration.
+            if !(self.jobs[index].request.identity.operation == OperationKind::FullAutotune
+                && self.jobs[index].request.traffic_policy_explicit)
+            {
+                if let Err(error) = self.cleanup_native_job_route_pin(index, &worker_run_id) {
+                    self.job_errors.insert(
+                        job_id,
+                        format!("unable to clean exact native speedtest route pin: {error}"),
+                    );
+                    continue;
+                }
             }
             let owner_free_bootstrap_store = if self.jobs[index].request.target_state
                 == OperationTargetState::AbsentBootstrap
@@ -4672,14 +5340,13 @@ impl CalibrationDaemon {
     }
 
     fn settle_native_runtime_recovery(&mut self, index: usize) {
+        if !self.autotune_probes_retired(index) {
+            return;
+        }
         let job_id = self.jobs[index].journal.job_id.clone();
         let worker_run_id = self.jobs[index].journal.worker_run_id.clone();
         if let Some(worker_run_id) = worker_run_id.as_deref() {
-            if let Err(error) = cleanup_native_route_pin(
-                &self.jobs[index].request,
-                worker_run_id,
-                self.route_pin_cleaner,
-            ) {
+            if let Err(error) = self.cleanup_native_job_route_pin(index, worker_run_id) {
                 self.job_errors.insert(
                     job_id,
                     format!("unable to verify exact native speedtest route-pin cleanup: {error}"),
@@ -4730,6 +5397,7 @@ impl CalibrationDaemon {
                 }
             }
         };
+        let terminal = preserve_owned_traffic_stop(terminal, recovery_diagnostic.as_deref());
         let mut settled = self.jobs[index].journal.clone();
         let settle_result = match self.jobs[index].request.identity.operation {
             OperationKind::FullAutotune => settled
@@ -4740,7 +5408,15 @@ impl CalibrationDaemon {
             ),
             _ => Err("unsupported native runtime settlement operation".to_string()),
         };
-        if let Err(error) = settle_result.and_then(|_| self.journal_store.update(&settled)) {
+        if let Err(error) = settle_result.and_then(|_| {
+            let staged = ScannedJob {
+                request: self.jobs[index].request.clone(),
+                journal: settled.clone(),
+                disposition: JournalDisposition::Settled,
+            };
+            publish_settled_history_decision(&self.state_dir, &staged, &self.jobs)?;
+            self.journal_store.update(&settled)
+        }) {
             self.job_errors.insert(job_id, error);
             return;
         }
@@ -4794,6 +5470,10 @@ impl CalibrationDaemon {
         {
             return Err("runtime restore ACK does not match the heavy-lease owner".to_string());
         }
+        if !self.autotune_probes_retired(index) {
+            return Ok(false);
+        }
+        let journal = &self.jobs[index].journal;
         let job_id = journal.job_id.clone();
         let mut staged_leases = self.leases.clone();
         staged_leases.release_heavy(&job_id)?;
@@ -4809,6 +5489,95 @@ impl CalibrationDaemon {
             job_id,
             "runtime restoration is still pending; global heavy traffic is available to other uplinks while local recovery locks remain held".to_string(),
         );
+        Ok(true)
+    }
+
+    fn autotune_probes_retired(&mut self, index: usize) -> bool {
+        let job = &self.jobs[index];
+        // Legacy requests retain their original recovery protocol.
+        if job.request.identity.operation != OperationKind::FullAutotune
+            || !job.request.traffic_policy_explicit
+        {
+            return true;
+        }
+        let Some(worker_run_id) = job.journal.worker_run_id.as_ref() else {
+            // No worker was ever admitted, hence no capture could start.
+            return true;
+        };
+        let retirement = super::autotune_runtime_store::ProbeRetirement {
+            job_id: job.journal.job_id.clone(),
+            worker_run_id: worker_run_id.clone(),
+        };
+        // Retirement proves lifetime, not topology: it must remain possible
+        // after UCI has changed or runtime restoration records were finalized.
+        let result = if job.request.target_state == OperationTargetState::AbsentBootstrap {
+            self.bootstrap_probes_retired(index, &retirement)
+        } else {
+            let run_dir = Config::defaults(job.request.identity.instance.clone()).run_dir();
+            RuntimeOverrideStore::open(&run_dir)
+                .and_then(|store| store.request_probe_retirement(&retirement))
+        };
+        match result {
+            Ok(true) => true,
+            result => {
+                let message = match result {
+                    Ok(false) => "waiting for exact test-probe retirement".to_string(),
+                    Err(error) => format!("unable to prove test-probe retirement: {error}"),
+                    Ok(true) => unreachable!(),
+                };
+                self.job_errors.insert(retirement.job_id, message);
+                false
+            }
+        }
+    }
+
+    fn bootstrap_probes_retired(
+        &self,
+        index: usize,
+        identity: &super::autotune_runtime_store::ProbeRetirement,
+    ) -> Result<bool, String> {
+        let job = &self.jobs[index];
+        let paths = self
+            .journal_store
+            .native_job_paths(&identity.job_id, &identity.worker_run_id)?;
+        match fs::symlink_metadata(&paths.bootstrap_runtime_dir) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // No owner can start probes before creating this directory and
+                // its durable claim. Still fence any parked/attached process.
+                return job
+                    .journal
+                    .runtime_owner_process
+                    .as_ref()
+                    .map_or(Ok(true), super::process::process_group_retired);
+            }
+            Err(error) => return Err(format!("unable to inspect bootstrap probe owner: {error}")),
+            Ok(_) => {}
+        }
+        let store = RuntimeOverrideStore::open(&paths.bootstrap_runtime_dir)?;
+        if store.request_probe_retirement(identity)? {
+            return Ok(true);
+        }
+        // Publish the admission tombstone before inspecting the previous
+        // owner. Any concurrent replacement must read it before capture.
+        let claim = read_bootstrap_runtime_owner_claim(
+            &paths.bootstrap_runtime_dir,
+            &job.request,
+            &identity.worker_run_id,
+        )?;
+        for process in [
+            job.journal.runtime_owner_process.as_ref(),
+            claim.as_ref().map(|claim| &claim.process),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !super::process::process_group_retired(process)? {
+                return Ok(false);
+            }
+        }
+        // No owner was admitted, or its dedicated group (including orphaned
+        // fping) is gone. DNS helpers retain the existing parent-death fence.
+        store.acknowledge_probe_retirement(identity)?;
         Ok(true)
     }
 
@@ -5255,6 +6024,8 @@ impl CalibrationDaemon {
             .ok_or_else(|| "bootstrap runtime probe deadline overflow".to_string())?;
         let policy = full_autotune::native_autotune_runtime_permit_policy(request)?;
         let permit = AutotuneRuntimePermit {
+            dns_server: request.route.dns_server,
+            probe_accounting_required: request.traffic_policy_explicit,
             kind: RuntimePermitKind::Autotune,
             permit_id,
             job_id: request.identity.job_id.clone(),
@@ -5350,6 +6121,11 @@ impl CalibrationDaemon {
             if live_sqm != request.identity.sqm_fingerprint {
                 return Err("operation SQM fingerprint is stale".to_string());
             }
+            super::service_lifecycle::attest_operation_applied_sqm(
+                &request.identity.instance,
+                &cfg,
+                &live_sqm,
+            )?;
             let initial_dl = if cfg.download_shaping_enabled() {
                 snapshot.cake_dl_kbps
             } else {
@@ -5448,6 +6224,9 @@ impl CalibrationDaemon {
                 _ => return Err("unsupported native runtime permit operation".to_string()),
             };
             let permit = AutotuneRuntimePermit {
+                dns_server: request.route.dns_server,
+                probe_accounting_required: request.traffic_policy_explicit
+                    && kind == RuntimePermitKind::Autotune,
                 kind,
                 permit_id: kernel_request_id()?,
                 job_id: request.identity.job_id.clone(),
@@ -6062,6 +6841,9 @@ impl CalibrationDaemon {
     }
 
     fn settle_native_after_exit(&mut self, index: usize, fallback: Option<(&str, &str)>) {
+        if !self.autotune_probes_retired(index) {
+            return;
+        }
         let job_id = self.jobs[index].journal.job_id.clone();
         let Some(worker_run_id) = self.jobs[index].journal.worker_run_id.clone() else {
             self.job_errors.insert(
@@ -6078,11 +6860,7 @@ impl CalibrationDaemon {
             }
         };
         if operation_uses_native_route_pin(&self.jobs[index].request) {
-            if let Err(error) = cleanup_native_route_pin(
-                &self.jobs[index].request,
-                &worker_run_id,
-                self.route_pin_cleaner,
-            ) {
+            if let Err(error) = self.cleanup_native_job_route_pin(index, &worker_run_id) {
                 self.job_errors.insert(
                     job_id,
                     format!("unable to clean exact native speedtest route pin: {error}"),
@@ -6204,6 +6982,29 @@ impl CalibrationDaemon {
                 Some("native-terminal-inspection-failed".to_string()),
             ),
         };
+        let terminal = if self.jobs[index].request.identity.operation == OperationKind::FullAutotune
+        {
+            let outcome = preserve_owned_traffic_stop(
+                NativeRuntimeTerminalOutcome {
+                    state: match terminal.0.as_str() {
+                        "cancelled" => "cancelled",
+                        "complete" => "complete",
+                        _ => "failed",
+                    },
+                    diagnostic: terminal.1,
+                },
+                self.jobs[index].journal.diagnostic_code.as_deref(),
+            );
+            // The pre-mutation journal has no distinct inconclusive state.
+            let state = if outcome.state == "inconclusive" {
+                "failed"
+            } else {
+                outcome.state
+            };
+            (state.to_string(), outcome.diagnostic)
+        } else {
+            terminal
+        };
         if matches!(
             self.jobs[index].request.identity.operation,
             OperationKind::GuidedRating | OperationKind::AutomaticRating
@@ -6309,6 +7110,27 @@ impl CalibrationDaemon {
     }
 
     fn runtime_preflight_ready(&mut self, index: usize) -> bool {
+        if self.jobs[index].request.identity.operation == OperationKind::FullAutotune {
+            let request = &self.jobs[index].request;
+            if let Some(plan) = request.traffic_plan {
+                if let Err(error) =
+                    full_autotune::validate_autotune_planning_budget(request.traffic_budget, plan)
+                {
+                    self.fail_queued_before_mutation(index, error.code, &error.message);
+                    return false;
+                }
+            }
+            if let Err(error) = full_autotune::validate_autotune_traffic_admission(
+                request.traffic_budget,
+                request.strategy,
+                request.allow_sqm_disable,
+                request.service_dl_cap_kbps,
+                request.service_ul_cap_kbps,
+            ) {
+                self.fail_queued_before_mutation(index, error.code, &error.message);
+                return false;
+            }
+        }
         let Some(attestor) = self.runtime_attestor else {
             return true;
         };
@@ -6400,7 +7222,19 @@ impl CalibrationDaemon {
             && self.supports_native_request(&self.jobs[index].request);
         let cancelled =
             self.jobs[index].journal.state == super::protocol::OperationState::Cancelling;
-        let diagnostic = if native_runtime && cancelled {
+        let owned_stop = self.jobs[index]
+            .journal
+            .diagnostic_code
+            .clone()
+            .filter(|code| {
+                matches!(
+                    code.as_str(),
+                    "owned-traffic-accounting-failed" | "owned-traffic-budget-exceeded"
+                )
+            });
+        let diagnostic = if let Some(code) = owned_stop.as_deref() {
+            code
+        } else if native_runtime && cancelled {
             "native-runtime-cancelled"
         } else if native_runtime {
             "native-runtime-reconciliation-required"
@@ -6586,7 +7420,15 @@ impl CalibrationDaemon {
                     target_state: "none".to_string(),
                     acknowledgements: request.acknowledgements.clone(),
                 };
-                match self.native_apply_store.admit(request, candidate.clone()) {
+                match self
+                    .native_apply_store
+                    .admit_with_gate(request, candidate.clone(), || {
+                        require_prior_raw_apply_admission(
+                            &self.state_dir,
+                            &self.jobs,
+                            source_job_id,
+                        )
+                    }) {
                     Ok(NativeApplyAdmission::Created(record)) => (
                         native_apply_accepted_response(&record),
                         ControlEffect::StateChanged,
@@ -6608,10 +7450,18 @@ impl CalibrationDaemon {
                                 ControlEffect::ReadOnly,
                             ),
                             Ok(NativeApplyTerminalRetry::Rearm) => {
-                                match self
-                                    .native_apply_store
-                                    .rearm_terminal(request, &record, candidate)
-                                {
+                                match self.native_apply_store.rearm_terminal_with_gate(
+                                    request,
+                                    &record,
+                                    candidate,
+                                    || {
+                                        require_prior_raw_apply_admission(
+                                            &self.state_dir,
+                                            &self.jobs,
+                                            source_job_id,
+                                        )
+                                    },
+                                ) {
                                     Ok(rearmed) => (
                                         native_apply_accepted_response(&rearmed),
                                         ControlEffect::StateChanged,
@@ -6947,6 +7797,44 @@ impl CalibrationDaemon {
         candidates.truncate(excess);
         let mut retired_count = 0usize;
         for job in candidates {
+            if job.journal.history_decision_required
+                && job.journal.terminal_state.as_deref() == Some("complete")
+            {
+                let result = verified_native_autotune_public_result(
+                    &self.state_dir,
+                    &job.request,
+                    &job.journal,
+                )?;
+                let decision = read_bound_history_decision(&self.state_dir, &job, &result)?;
+                let archive_dir = self.state_dir.join("raw-history");
+                let path = archive_dir.join(&decision.route_key);
+                match fs::symlink_metadata(&path) {
+                    Ok(_) => {
+                        let archived = super::autotune_history::HistoryDecision::read(&path)?;
+                        if archived.boot_id != decision.boot_id
+                            || archived.route_key != decision.route_key
+                            || archived.current.created_unix_ms < decision.current.created_unix_ms
+                        {
+                            return Err("history archive cannot justify retiring this job".into());
+                        }
+                        if archived.current.job_id == decision.current.job_id
+                            && archived != decision
+                        {
+                            return Err(
+                                "history archive differs from the retiring job decision".into()
+                            );
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        decision.archive(&archive_dir)?
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "unable to inspect history before retirement: {error}"
+                        ))
+                    }
+                }
+            }
             self.journal_store
                 .retire_settled_job(&job, Path::new(DEFAULT_PROC_ROOT))?;
             let job_id = job.journal.job_id;
@@ -6996,6 +7884,26 @@ impl CalibrationDaemon {
                 "job_id is already bound to a different immutable request",
             );
         }
+        // This is fresh admission only. Old journals must remain readable and
+        // an exact idempotent reattach must not acquire a new traffic policy.
+        if request.identity.operation == OperationKind::FullAutotune {
+            if let Some(plan) = request.traffic_plan {
+                if let Err(error) =
+                    full_autotune::validate_autotune_planning_budget(request.traffic_budget, plan)
+                {
+                    return error_response(error.code, &error.message);
+                }
+            }
+            if let Err(error) = full_autotune::validate_autotune_traffic_admission(
+                request.traffic_budget,
+                request.strategy,
+                request.allow_sqm_disable,
+                request.service_dl_cap_kbps,
+                request.service_ul_cap_kbps,
+            ) {
+                return error_response(error.code, &error.message);
+            }
+        }
         if let Err(error) = self.prune_settled_history() {
             return error_response("journal-retention-failed", &error);
         }
@@ -7036,12 +7944,123 @@ impl CalibrationDaemon {
             return error_response("job-not-found", "no job matches the supplied identity");
         };
         let progress = self.native_autotune_status_progress(job);
-        job_status_response_with_progress(
+        let usage = self.native_autotune_status_usage(job, progress.as_ref());
+        let owned_accounting = job.request.traffic_policy_explicit
+            && (usage.is_some_and(|(_, source)| {
+                matches!(source, "cutoff_receipt" | "no_producers_receipt")
+            }) || job.journal.worker_run_id.as_deref().is_some_and(|worker| {
+                self.journal_store
+                    .native_job_paths(&job.journal.job_id, worker)
+                    .ok()
+                    .and_then(|paths| paths.request.parent().map(Path::to_path_buf))
+                    .is_some_and(|directory| {
+                        super::speedtest::verify_owned_accounting_checkpoint(
+                            &directory,
+                            &job.request,
+                            worker,
+                        )
+                        .is_ok()
+                    })
+            }));
+        let mut response = job_status_response_with_progress(
             job,
             true,
             self.job_errors.get(&job.journal.job_id).map(String::as_str),
             progress.as_ref(),
+            usage,
+            owned_accounting,
+        );
+        if job.request.identity.operation == OperationKind::FullAutotune {
+            if let Some(worker) = job.journal.worker_run_id.as_deref() {
+                if let Ok(paths) = self
+                    .journal_store
+                    .native_job_paths(&job.journal.job_id, worker)
+                {
+                    if let Some(directory) = paths.request.parent() {
+                        if let Ok(report) = full_autotune::read_server_comparison_diagnostic(
+                            directory,
+                            &job.request,
+                            worker,
+                        ) {
+                            let encoded = report.to_string();
+                            if response.ends_with("}\n")
+                                && response.len() + encoded.len() + 32 <= MAX_RESPONSE_BYTES
+                            {
+                                response.truncate(response.len() - 2);
+                                response.push_str(",\"server_comparison_diagnostic\":");
+                                response.push_str(&encoded);
+                                response.push_str("}\n");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        response
+    }
+
+    fn native_autotune_status_usage(
+        &self,
+        job: &ScannedJob,
+        progress: Option<&full_autotune::NativeAutotuneProgress>,
+    ) -> Option<(u64, &'static str)> {
+        if job.request.identity.operation != OperationKind::FullAutotune {
+            return None;
+        }
+        if job.journal.diagnostic_code.as_deref() == Some("owned-traffic-accounting-failed") {
+            return None;
+        }
+        let worker = job.journal.worker_run_id.as_deref()?;
+        let paths = self
+            .journal_store
+            .native_job_paths(&job.journal.job_id, worker)
+            .ok()?;
+        if let Ok(terminal) = full_autotune::read_terminal_file(&paths.terminal) {
+            if terminal.job_id == job.journal.job_id && terminal.worker_run_id == worker {
+                if full_autotune::terminal_traffic_is_unknown(&terminal.terminal) {
+                    return None;
+                }
+                if job.request.traffic_policy_explicit {
+                    let final_bytes = full_autotune::verify_terminal_consumed_traffic(
+                        &paths.request,
+                        &job.journal.job_id,
+                        worker,
+                        terminal.consumed_traffic_bytes,
+                    )
+                    .ok()?;
+                    let source = if final_bytes == 0
+                        && full_autotune::verified_unstarted_traffic_receipt(
+                            paths.request.parent()?,
+                            &job.request,
+                            worker,
+                        )
+                        .ok()?
+                    {
+                        "no_producers_receipt"
+                    } else {
+                        "cutoff_receipt"
+                    };
+                    return Some((final_bytes, source));
+                }
+                return Some((terminal.consumed_traffic_bytes, "terminal_record"));
+            }
+        }
+        if let Some(progress) = progress {
+            if progress.job_id == job.journal.job_id && progress.worker_run_id == worker {
+                if let Some(bytes) = progress.consumed_traffic_bytes {
+                    return Some((bytes, "persisted_debits"));
+                }
+            }
+        }
+        let progress = full_autotune::read_native_autotune_progress(
+            paths.request.parent()?,
+            &job.journal.job_id,
+            worker,
         )
+        .ok()?;
+        progress
+            .consumed_traffic_bytes
+            .map(|bytes| (bytes, "persisted_debits"))
     }
 
     fn native_autotune_status_progress(
@@ -7191,7 +8210,46 @@ impl CalibrationDaemon {
             );
         }
         match verified_native_autotune_public_result(&self.state_dir, &job.request, &job.journal) {
-            Ok(result) => result,
+            Ok(result) if job.journal.history_decision_required => {
+                let decision = match read_bound_history_decision(&self.state_dir, job, &result) {
+                    Ok(value) => value,
+                    Err(error) => return error_response("history-decision-unavailable", &error),
+                };
+                if let Some(prior) = &decision.reference {
+                    let mut value: serde_json::Value = match serde_json::from_str(&result) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return error_response(
+                                "history-result-invalid",
+                                "verified result JSON is invalid",
+                            )
+                        }
+                    };
+                    value["prior_raw_comparison"] = serde_json::json!({
+                        "schema_version":1,"proof_status":"verified-prior-review-diagnostic-only",
+                        "prior_job_id":prior.job_id,"prior_created_unix_ms":prior.created_unix_ms,
+                        "current_download_kbps":decision.current.download_kbps,"current_upload_kbps":decision.current.upload_kbps,
+                        "prior_download_kbps":prior.download_kbps,"prior_upload_kbps":prior.upload_kbps,
+                        "new_apply_blocked":decision.blocked()
+                    });
+                    let Some(encoded) = encode_bounded_result_response(&value) else {
+                        return error_response(
+                            "history-result-oversize",
+                            "history result exceeds response bound",
+                        );
+                    };
+                    encoded
+                } else {
+                    result
+                }
+            }
+            Ok(result) => annotate_prior_raw_comparison(result, job, &self.jobs, |prior| {
+                verified_native_autotune_public_result(
+                    &self.state_dir,
+                    &prior.request,
+                    &prior.journal,
+                )
+            }),
             Err(error) => error_response("result-verification-failed", &error),
         }
     }
@@ -7377,7 +8435,7 @@ impl CalibrationDaemon {
             .as_ref()
             .is_some_and(|scheduler| scheduler.lab_mode);
         format!(
-            "{{\"state\":\"{state}\",\"protocol_version\":{},\"active_job\":{},\"active_jobs\":{active},\"active_operations\":[{active_operations}],\"queued_jobs\":{queued},\"recovery_required_jobs\":{recovery},\"abandoned_safe_jobs\":{abandoned},\"settled_jobs\":{settled},\"leased_jobs\":{},\"admission_enabled\":{},\"native_rating\":{},\"native_speedtest\":{},\"native_bootstrap_speedtest\":true,\"native_speedtest_auto_backend\":true,\"native_full_autotune\":{},\"native_bootstrap_autotune\":{},\"native_autotune_auto_backend\":true,\"native_operation_status_identity_version\":{},\"native_autotune_status_identity_version\":{},\"native_scheduler\":{},\"native_scheduler_lab\":{},\"native_scheduler_errors\":{scheduler_errors},\"native_scheduler_waiting\":[{scheduler_waiting}],\"native_scheduler_accounting_blocks\":[{scheduler_accounting_blocks}],\"native_public_result_version\":{}}}\n",
+            "{{\"state\":\"{state}\",\"protocol_version\":{},\"active_job\":{},\"active_jobs\":{active},\"active_operations\":[{active_operations}],\"queued_jobs\":{queued},\"recovery_required_jobs\":{recovery},\"abandoned_safe_jobs\":{abandoned},\"settled_jobs\":{settled},\"leased_jobs\":{},\"admission_enabled\":{},\"native_rating\":{},\"native_speedtest\":{},\"native_bootstrap_speedtest\":true,\"native_speedtest_auto_backend\":true,\"native_full_autotune\":{},\"native_bootstrap_autotune\":{},\"native_autotune_auto_backend\":true,\"native_traffic_policy_version\":1,\"native_traffic_planning_version\":1,\"native_operation_status_identity_version\":{},\"native_autotune_status_identity_version\":{},\"native_scheduler\":{},\"native_scheduler_lab\":{},\"native_scheduler_errors\":{scheduler_errors},\"native_scheduler_waiting\":[{scheduler_waiting}],\"native_scheduler_accounting_blocks\":[{scheduler_accounting_blocks}],\"native_public_result_version\":{}}}\n",
             OPERATION_PROTOCOL_VERSION,
             if active > 0 { "true" } else { "false" },
             self.leases.job_count(),
@@ -7514,6 +8572,29 @@ pub(crate) fn runtime_route_identity(request: &OperationRequest) -> Result<Strin
         .source_ip
         .ok_or_else(|| "native runtime probe requires an explicit source IP".to_string())?;
     match request.route.mode {
+        OperationRouteMode::Explicit => {
+            // Serialization preserves authority; it is not live attestation or
+            // permission to execute a linked request (admission checks that).
+            super::autotune_request::explicit_operation_authority(&request.route)?;
+            Ok(crate::routing::RouteIdentity {
+                device_ifindex: request.route.device_ifindex,
+                mode: "explicit".into(),
+                member: String::new(),
+                device: request.route.l3_device.clone(),
+                source_ip: source_ip.to_string(),
+                fwmark: format!(
+                    "0x{:x}",
+                    request.route.fwmark.ok_or("explicit mark missing")?
+                ),
+                table: request
+                    .route
+                    .routing_table
+                    .ok_or("explicit table missing")?
+                    .to_string(),
+                fwmark_mask: request.route.fwmark_mask,
+            }
+            .stable_key())
+        }
         OperationRouteMode::Main => {
             if request.route.mwan3_member.is_some()
                 || request.route.fwmark.is_some()
@@ -7540,10 +8621,20 @@ pub(crate) fn runtime_route_identity(request: &OperationRequest) -> Result<Strin
                 .route
                 .routing_table
                 .ok_or_else(|| "mwan3 runtime probe has no routing table".to_string())?;
-            Ok(format!(
+            let key = format!(
                 "mwan3|{}|{}|{}|0x{:x}|{}",
                 member, request.route.l3_device, source_ip, fwmark, table
-            ))
+            );
+            if request.route.device_ifindex.is_some() {
+                return Err("link-qualified mwan3 runtime identity is unsupported".into());
+            }
+            match request.route.fwmark_mask {
+                Some(mask) if mask != 0 && fwmark != 0 && fwmark & !mask == 0 => {
+                    Ok(format!("{key}|mask={mask}"))
+                }
+                Some(_) => Err("mwan3 runtime probe mark is outside its mask".into()),
+                None => Ok(key),
+            }
         }
     }
 }
@@ -7572,6 +8663,30 @@ fn native_recovery_log_is_error(diagnostic: &str) -> bool {
 struct NativeRuntimeTerminalOutcome {
     state: &'static str,
     diagnostic: Option<String>,
+}
+
+fn preserve_owned_traffic_stop(
+    terminal: NativeRuntimeTerminalOutcome,
+    coordinator_diagnostic: Option<&str>,
+) -> NativeRuntimeTerminalOutcome {
+    let state = match coordinator_diagnostic {
+        Some("owned-traffic-accounting-failed") => "failed",
+        Some("owned-traffic-budget-exceeded") => {
+            if terminal.diagnostic.as_ref().is_some_and(|code| {
+                full_autotune::terminal_traffic_is_unknown(&AutotuneTerminal::Failed {
+                    code: code.clone(),
+                })
+            }) {
+                return terminal;
+            }
+            "inconclusive"
+        }
+        _ => return terminal,
+    };
+    NativeRuntimeTerminalOutcome {
+        state,
+        diagnostic: coordinator_diagnostic.map(str::to_owned),
+    }
 }
 
 fn native_autotune_terminal_outcome(
@@ -8167,7 +9282,7 @@ fn job_response(job: &ScannedJob, idempotent: bool) -> String {
 }
 
 fn job_status_response(job: &ScannedJob, idempotent: bool, diagnostic: Option<&str>) -> String {
-    job_status_response_with_progress(job, idempotent, diagnostic, None)
+    job_status_response_with_progress(job, idempotent, diagnostic, None, None, false)
 }
 
 fn job_status_response_with_progress(
@@ -8175,7 +9290,21 @@ fn job_status_response_with_progress(
     idempotent: bool,
     diagnostic: Option<&str>,
     progress: Option<&full_autotune::NativeAutotuneProgress>,
+    usage: Option<(u64, &'static str)>,
+    owned_accounting: bool,
 ) -> String {
+    let accounting = if owned_accounting {
+        "owned-ip-system-dns-estimate-v1"
+    } else if job.request.traffic_policy_explicit {
+        "unavailable"
+    } else {
+        "aggregate_route_windows"
+    };
+    let usage = if accounting == "unavailable" {
+        None
+    } else {
+        usage
+    };
     let worker_run_id = job.journal.worker_run_id.as_ref().map_or_else(
         || "null".to_string(),
         |worker_run_id| format!("\"{}\"", json_escape(worker_run_id)),
@@ -8203,6 +9332,40 @@ fn job_status_response_with_progress(
         diagnostic_code,
     );
     let request_identity = operation_status_request_identity(&job.request);
+    let traffic = if job.request.identity.operation == OperationKind::FullAutotune {
+        let limit = job.request.traffic_budget.limit_bytes();
+        let number = |value: Option<u64>| {
+            value.map_or_else(|| "null".to_string(), |value| value.to_string())
+        };
+        format!(
+            concat!(
+                ",\"traffic\":{{\"schema_version\":1,\"policy\":\"{}\",\"limit_bytes\":{},",
+                "\"consumed_bytes\":{},\"remaining_bytes\":{},\"overrun_bytes\":{},",
+                "\"accounting\":\"{}\",\"source\":\"{}\"}}"
+            ),
+            if limit.is_some() {
+                "capped"
+            } else {
+                "unlimited"
+            },
+            number(limit),
+            number(usage.map(|(bytes, _)| bytes)),
+            number(
+                limit
+                    .zip(usage)
+                    .map(|(limit, (used, _))| limit.saturating_sub(used))
+            ),
+            number(
+                limit
+                    .zip(usage)
+                    .map(|(limit, (used, _))| used.saturating_sub(limit))
+            ),
+            accounting,
+            usage.map_or("unavailable", |(_, source)| source)
+        )
+    } else {
+        String::new()
+    };
     let progress = progress.map_or_else(String::new, |progress| {
         format!(
             concat!(
@@ -8229,14 +9392,20 @@ fn job_status_response_with_progress(
     });
     match diagnostic {
         Some(value) => format!(
-            "{prefix}{request_identity}{progress},\"diagnostic\":\"{}\"}}\n",
+            "{prefix}{request_identity}{progress}{traffic},\"diagnostic\":\"{}\"}}\n",
             json_escape(value)
         ),
-        None => format!("{prefix}{request_identity}{progress}}}\n"),
+        None => format!("{prefix}{request_identity}{progress}{traffic}}}\n"),
     }
 }
 
 fn operation_status_request_identity(request: &OperationRequest) -> String {
+    let planning = request.traffic_plan.map_or_else(String::new, |plan| {
+        format!(
+            ",\"traffic_planning\":{{\"download_kbps\":{},\"upload_kbps\":{}}}",
+            plan.download_kbps, plan.upload_kbps
+        )
+    });
     let member = request.route.mwan3_member.as_ref().map_or_else(
         || "null".to_string(),
         |member| format!("\"{}\"", json_escape(member)),
@@ -8288,7 +9457,8 @@ fn operation_status_request_identity(request: &OperationRequest) -> String {
             ",\"managed_sqm_section\":{}",
             ",\"profile\":{}",
             ",\"calibration_strategy\":{}",
-            ",\"origin\":\"{}\""
+            ",\"origin\":\"{}\"",
+            "{}"
         ),
         NATIVE_OPERATION_STATUS_IDENTITY_VERSION,
         json_escape(&request.identity.target_interface),
@@ -8303,6 +9473,7 @@ fn operation_status_request_identity(request: &OperationRequest) -> String {
         profile,
         strategy,
         origin,
+        planning,
     )
 }
 
@@ -9785,10 +10956,12 @@ mod tests {
         let mut shaped = operation_request('a', 'b', "wan");
         shaped.strategy = Some(CalibrationStrategy::ShapedOnly);
         shaped.allow_sqm_disable = false;
+        shaped.service_dl_cap_kbps = None;
+        shaped.service_ul_cap_kbps = None;
         let shaped_policy = full_autotune::native_autotune_runtime_permit_policy(&shaped).unwrap();
         assert_eq!(
             shaped_policy.maximum_sequence,
-            1 + crate::autotune::MAX_PROFILE_REVIEW_OPTIONS as u32
+            2 + crate::autotune::MAX_PROFILE_REVIEW_OPTIONS as u32
                 + (crate::autotune::MAX_PROFILE_SEARCH_OBSERVATIONS * 2) as u32
                 + full_autotune::MAX_RUNTIME_ROUTE_REARMS
         );
@@ -9804,11 +10977,11 @@ mod tests {
         let raw_policy = full_autotune::native_autotune_runtime_permit_policy(&full_raw).unwrap();
         assert_eq!(
             raw_policy.maximum_sequence,
-            // Three raw controls, one explicit-mobile terminal download-bypass
+            // One server comparison, three raw controls, one explicit-mobile terminal download-bypass
             // control, up to three confirmed-pair controls, and at most two
             // topology-repeat controls per direction surround the bounded
             // independent DL/UL searches.
-            8 + crate::autotune::MAX_PROFILE_REVIEW_OPTIONS as u32
+            9 + crate::autotune::MAX_PROFILE_REVIEW_OPTIONS as u32
                 + (crate::autotune::MAX_PROFILE_SEARCH_OBSERVATIONS * 2) as u32
                 + full_autotune::MAX_RUNTIME_ROUTE_REARMS
         );
@@ -9906,6 +11079,183 @@ mod tests {
         }
     }
 
+    #[test]
+    fn t3_history_result_framing_survives_control_socket_and_includes_lf_in_bound() {
+        let value = serde_json::json!({"prior_raw_comparison": {"note": "one\ntwo"}});
+        let response = encode_bounded_result_response(&value).unwrap();
+        let (server, client) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut server = server;
+            server
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = String::new();
+            server.read_to_string(&mut request).unwrap();
+            assert_eq!(request, "history-result-request\n");
+            write_control_response(&mut server, &response).unwrap();
+        });
+        let reply = exchange_encoded_control(
+            client,
+            "history-result-request\n",
+            MAX_RESULT_RESPONSE_BYTES,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        worker.join().unwrap();
+        assert!(reply.ends_with('\n'));
+        assert_eq!(reply.lines().count(), 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&reply).unwrap(),
+            value
+        );
+        let exact = serde_json::Value::String("x".repeat(MAX_RESULT_RESPONSE_BYTES - 3));
+        assert_eq!(
+            encode_bounded_result_response(&exact).unwrap().len(),
+            MAX_RESULT_RESPONSE_BYTES
+        );
+        let oversized = serde_json::Value::String("x".repeat(MAX_RESULT_RESPONSE_BYTES - 2));
+        assert!(encode_bounded_result_response(&oversized).is_none());
+    }
+
+    #[test]
+    fn t3_prior_raw_comparison_requires_same_route_and_verified_review() {
+        let coordinator = CoordinatorIdentity::current().unwrap();
+        let mut current_request = operation_request('a', 'b', "wan");
+        current_request.created_unix_ms = 10;
+        let current = ScannedJob {
+            journal: JobJournal::queued(&current_request, &coordinator, true).unwrap(),
+            request: current_request,
+            disposition: JournalDisposition::Settled,
+        };
+        let prior_request = operation_request('c', 'd', "wan");
+        let mut prior = ScannedJob {
+            journal: JobJournal::queued(&prior_request, &coordinator, true).unwrap(),
+            request: prior_request,
+            disposition: JournalDisposition::Settled,
+        };
+        prior.journal.state = OperationState::Completed;
+        let result = |dl, ul| {
+            serde_json::json!({
+                "artifacts": {"proposal": {"value": {
+                    "download": {"observed_low_kbps": dl, "max_kbps": 99999999},
+                    "upload": {"observed_low_kbps": ul, "max_kbps": 99999999}
+                }}}, "public_apply_contract": {"unchanged": true}
+            })
+            .to_string()
+        };
+        let original = result(170000, 100000);
+        let annotated =
+            annotate_prior_raw_comparison(original.clone(), &current, &[prior.clone()], |_| {
+                Ok(result(900000, 110000))
+            });
+        assert!(annotated.ends_with('\n'));
+        assert_eq!(annotated.lines().count(), 1);
+        let mut value: serde_json::Value = serde_json::from_str(&annotated).unwrap();
+        let comparison = value
+            .as_object_mut()
+            .unwrap()
+            .remove("prior_raw_comparison")
+            .unwrap();
+        assert_eq!(comparison["prior_download_kbps"], 900000);
+        assert_eq!(comparison["current_download_kbps"], 170000);
+        let mut scheduled = current.clone();
+        scheduled.request.origin = OperationOrigin::Scheduler;
+        scheduled.request.scheduled_auto_apply_requested = true;
+        scheduled.request.traffic_policy_explicit = true;
+        for (dl, ul, blocked) in [
+            (170000, 110000, true),
+            (900000, 54999, true),
+            (450000, 55000, false),
+            (900000, 110000, false),
+        ] {
+            let called = std::cell::Cell::new(false);
+            let outcome = scheduled_auto_apply_with_prior_guard(
+                &scheduled,
+                &[prior.clone()],
+                |job| {
+                    Ok(
+                        if job.request.identity.job_id == scheduled.request.identity.job_id {
+                            result(dl, ul)
+                        } else {
+                            result(900000, 110000)
+                        },
+                    )
+                },
+                || {
+                    called.set(true);
+                    Ok(NativeScheduledAutoApplyOutcome::ReviewRequired)
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                matches!(
+                    outcome,
+                    NativeScheduledAutoApplyOutcome::PriorThroughputReviewRequired
+                ),
+                blocked
+            );
+            assert_eq!(
+                called.get(),
+                !blocked,
+                "declined evidence must stop before the Apply callback"
+            );
+        }
+        assert!(scheduled_auto_apply_with_prior_guard(
+            &scheduled,
+            &[prior.clone()],
+            |job| if job.request.identity.job_id == scheduled.request.identity.job_id {
+                Err("current verification failed".into())
+            } else {
+                Ok(result(900000, 110000))
+            },
+            || panic!("invalid current evidence cannot reach Apply"),
+        )
+        .is_err());
+        scheduled.request.traffic_policy_explicit = false;
+        assert!(matches!(
+            scheduled_auto_apply_with_prior_guard(
+                &scheduled,
+                &[prior.clone()],
+                |_| panic!("legacy job policy must not change"),
+                || Ok(NativeScheduledAutoApplyOutcome::NotRequested),
+            )
+            .unwrap(),
+            NativeScheduledAutoApplyOutcome::NotRequested
+        ));
+        assert_eq!(
+            value,
+            serde_json::from_str::<serde_json::Value>(&original).unwrap()
+        );
+        assert_eq!(
+            annotate_prior_raw_comparison(original.clone(), &current, &[prior.clone()], |_| Err(
+                "invalid review".into()
+            )),
+            original
+        );
+        for variant in 0..7 {
+            let mut rejected = prior.clone();
+            match variant {
+                0 => rejected.request.route.l3_device = "other".into(),
+                1 => rejected.request.identity.route_fingerprint = "0".repeat(64),
+                2 => rejected.request.service_dl_cap_kbps = Some(500000),
+                3 => rejected.request.strategy = Some(CalibrationStrategy::ShapedOnly),
+                4 => rejected.request.created_unix_ms = 10,
+                5 => rejected.journal.boot_id = "0".repeat(32),
+                _ => rejected.journal.runtime_mutated = true,
+            }
+            assert_eq!(
+                annotate_prior_raw_comparison(original.clone(), &current, &[rejected], |_| panic!(
+                    "ineligible history must not be replayed"
+                )),
+                original
+            );
+        }
+        assert!(verified_raw_reference_rates(
+            &serde_json::json!({"download": {"max_kbps":900000}})
+        )
+        .is_none());
+    }
+
     fn operation_request(job_id: char, token: char, instance: &str) -> OperationRequest {
         OperationRequest {
             identity: OperationIdentity {
@@ -9927,12 +11277,15 @@ mod tests {
             speedtest_server_id: None,
             speedtest_topology: None,
             route: OperationRouteIdentity {
+                dns_server: None,
+                device_ifindex: None,
                 mode: OperationRouteMode::Main,
                 mwan3_member: None,
                 l3_device: format!("{instance}-device"),
                 source_ip: None,
                 fwmark: None,
                 routing_table: None,
+                fwmark_mask: None,
             },
             target_state: OperationTargetState::ExistingManaged,
             capture_policy: None,
@@ -9943,12 +11296,16 @@ mod tests {
             access_source: Some(AccessEvidenceSource::UserSelected),
             access_confidence_percent: 100,
             capacity_learning_policy: Some(CapacityLearningPolicy::PassiveBounded),
-            service_dl_cap_kbps: None,
-            service_ul_cap_kbps: None,
+            service_dl_cap_kbps: Some(1_000_000),
+            service_ul_cap_kbps: Some(500_000),
             allow_sqm_disable: true,
             allow_active_traffic: true,
             scheduled_auto_apply_requested: false,
-            traffic_budget_bytes: 1_000_000,
+            traffic_budget: crate::operations::protocol::TrafficPolicy::Capped {
+                max_bytes: 500_000_000,
+            },
+            traffic_policy_explicit: false,
+            traffic_plan: None,
         }
     }
 
@@ -10010,8 +11367,11 @@ mod tests {
         request.access_source = None;
         request.access_confidence_percent = 0;
         request.capacity_learning_policy = None;
+        request.service_dl_cap_kbps = None;
+        request.service_ul_cap_kbps = None;
         request.allow_sqm_disable = false;
-        request.traffic_budget_bytes = 0;
+        request.traffic_budget = 0_u64.into();
+        request.validate_admission_policy().unwrap();
         request
     }
 
@@ -10514,6 +11874,30 @@ mod tests {
                 .unwrap(),
             (0, ScheduledSettlement::Failed)
         );
+
+        for code in [
+            "owned-traffic-accounting-failed",
+            "speedtest-counter-reset",
+            "speedtest-accounting-flow-registration-failed",
+        ] {
+            full_autotune::publish_terminal_file(
+                &paths.terminal,
+                &full_autotune::AutotuneTerminalRecord {
+                    job_id: operation.identity.job_id.clone(),
+                    worker_run_id: worker_run_id.clone(),
+                    consumed_traffic_bytes: 0,
+                    terminal: AutotuneTerminal::Failed { code: code.into() },
+                },
+            )
+            .unwrap();
+            assert!(daemon
+                .exact_scheduled_terminal_traffic(0, &operation.identity.job_id)
+                .unwrap_err()
+                .contains("unknown after an accounting failure"));
+            assert!(daemon
+                .native_autotune_status_usage(&daemon.jobs[0], None)
+                .is_none());
+        }
 
         full_autotune::publish_terminal_file(
             &paths.terminal,
@@ -11392,7 +12776,7 @@ mod tests {
         );
         assert_eq!(idempotent_start, ControlEffect::ReadOnly);
         let mut conflicting = operation.clone();
-        conflicting.traffic_budget_bytes += 1;
+        conflicting.traffic_budget = (conflicting.traffic_budget.limit_bytes().unwrap() + 1).into();
         let (conflict_response, rejected_start) = daemon.dispatch_control_request(
             CoordinatorControlRequest::Operation(job_message(ControlCommand::Start, &conflicting)),
         );
@@ -12671,17 +14055,29 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
-    fn rejecting_route_pin_cleaner(job_id: &str, worker_run_id: &str) -> Result<(), String> {
+    fn rejecting_route_pin_cleaner(
+        job_id: &str,
+        worker_run_id: &str,
+        _: Option<speedtest::OwnedCleanupContext<'_>>,
+    ) -> Result<(), String> {
         assert_eq!(job_id, "a".repeat(32));
         assert_eq!(worker_run_id, "c".repeat(32));
         Err("test-route-pin-cleaner-called".to_string())
     }
 
-    fn forbidden_route_pin_cleaner(_: &str, _: &str) -> Result<(), String> {
+    fn forbidden_route_pin_cleaner(
+        _: &str,
+        _: &str,
+        _: Option<speedtest::OwnedCleanupContext<'_>>,
+    ) -> Result<(), String> {
         panic!("an operation without native speedtest accounting must not invoke cleanup")
     }
 
-    fn allowing_route_pin_cleaner(_: &str, _: &str) -> Result<(), String> {
+    fn allowing_route_pin_cleaner(
+        _: &str,
+        _: &str,
+        _: Option<speedtest::OwnedCleanupContext<'_>>,
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -12716,6 +14112,7 @@ mod tests {
                             &request,
                             &"c".repeat(32),
                             rejecting_route_pin_cleaner,
+                            None,
                         )
                         .unwrap_err(),
                         "test-route-pin-cleaner-called"
@@ -12725,6 +14122,7 @@ mod tests {
                         &request,
                         &"c".repeat(32),
                         forbidden_route_pin_cleaner,
+                        None,
                     )
                     .unwrap();
                 }
@@ -13602,6 +15000,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn r6_mwan3_runtime_permit_preserves_live_mask_without_changing_legacy_bytes() {
+        let mut operation = operation_request('a', 'b', "wan");
+        let mut live = crate::routing::RouteIdentity {
+            device_ifindex: None,
+            mode: "mwan3".into(),
+            member: "wan".into(),
+            device: "wan-device".into(),
+            source_ip: "192.0.2.1".into(),
+            fwmark: "0x100".into(),
+            table: "101".into(),
+            fwmark_mask: Some(0x3f00),
+        };
+        for mask in [Some(0x3f00), Some(0xff00), None] {
+            live.fwmark_mask = mask;
+            operation.route =
+                super::super::autotune_request::operation_route_identity(&live).unwrap();
+            assert_eq!(
+                runtime_route_identity(&operation).unwrap(),
+                live.stable_key()
+            );
+        }
+        operation.route.fwmark_mask = Some(0x80);
+        assert!(runtime_route_identity(&operation).is_err());
+    }
+
+    #[test]
+    fn r6_explicit_runtime_permit_identity_preserves_link_and_mask() {
+        let mut operation = operation_request('a', 'b', "wan");
+        let live = crate::routing::RouteIdentity {
+            device_ifindex: Some(42),
+            mode: "explicit".into(),
+            member: String::new(),
+            device: "wan-device".into(),
+            source_ip: "192.0.2.1".into(),
+            fwmark: "0x100".into(),
+            table: "101".into(),
+            fwmark_mask: Some(0x3f00),
+        };
+        operation.route = super::super::autotune_request::operation_route_identity(&live).unwrap();
+        let key = runtime_route_identity(&operation).unwrap();
+        assert_eq!(key, live.stable_key());
+        assert_eq!(
+            key,
+            "explicit||wan-device|192.0.2.1|0x100|101|mask=16128|ifindex=42"
+        );
+        operation.route.device_ifindex = Some(43);
+        assert_ne!(runtime_route_identity(&operation).unwrap(), key);
+        operation.route.device_ifindex = Some(42);
+        operation.route.fwmark_mask = Some(0xff00);
+        assert_ne!(runtime_route_identity(&operation).unwrap(), key);
+        operation.route.fwmark_mask = None;
+        assert!(runtime_route_identity(&operation).is_err());
+        operation.route.fwmark_mask = Some(0x3f00);
+        operation.route.device_ifindex = None;
+        assert!(runtime_route_identity(&operation).is_err());
+    }
+
     fn job_message(command: ControlCommand, operation: &OperationRequest) -> ControlMessage {
         ControlMessage {
             control: ControlRequest {
@@ -13640,6 +15096,157 @@ mod tests {
                 message,
             },
         }
+    }
+
+    #[test]
+    fn t2_coordinator_cumulative_monitor_stops_limit_and_counter_faults() {
+        const CHILD: &str = "CAKE_TEST_OWNED_MONITOR_CHILD";
+        if env::var_os(CHILD).is_none() {
+            let root = temp_path("owned-monitor-runtime");
+            fs::create_dir_all(root.join("run/wan")).unwrap();
+            let output = std::process::Command::new(env::current_exe().unwrap())
+                .args(["--exact", "operations::coordinator::tests::t2_coordinator_cumulative_monitor_stops_limit_and_counter_faults", "--nocapture"])
+                .env(CHILD, &root).env("CAKE_AUTORATE_RUN_ROOT", root.join("run"))
+                .output().unwrap();
+            fs::remove_dir_all(root).unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        for fault in [false, true] {
+            let root = temp_path(if fault {
+                "owned-monitor-fault"
+            } else {
+                "owned-monitor-limit"
+            });
+            let mut daemon = CalibrationDaemon::bind_with_components(&root, true, None).unwrap();
+            daemon.native_autotune = true;
+            daemon.route_pin_cleaner = allowing_route_pin_cleaner;
+            let mut operation = operation_request('a', 'b', "wan");
+            operation.traffic_policy_explicit = true;
+            operation.traffic_budget = 100_u64.into();
+            let journal = JobJournal::queued(&operation, &daemon.coordinator, true).unwrap();
+            daemon.journal_store.create(&operation, &journal).unwrap();
+            let worker = "c".repeat(32);
+            let mut starting = journal;
+            starting.arm_native_worker(worker.clone()).unwrap();
+            daemon.journal_store.update(&starting).unwrap();
+            daemon.jobs.push(ScannedJob {
+                request: operation.clone(),
+                journal: starting,
+                disposition: JournalDisposition::Queued,
+            });
+            let zero = speedtest::SpeedtestTrafficCounters {
+                rx_bytes: 0,
+                tx_bytes: 0,
+            };
+            daemon.owned_budget_samples.insert(
+                (operation.identity.job_id.clone(), worker),
+                speedtest::OwnedTrafficSnapshot {
+                    backend: zero,
+                    probes: zero,
+                },
+            );
+            daemon.owned_budget_reader = |_, _, _, previous| {
+                assert!(previous.is_some());
+                Ok(speedtest::OwnedTrafficSnapshot {
+                    backend: speedtest::SpeedtestTrafficCounters {
+                        rx_bytes: 70,
+                        tx_bytes: 20,
+                    },
+                    probes: speedtest::SpeedtestTrafficCounters {
+                        rx_bytes: 7,
+                        tx_bytes: 3,
+                    },
+                })
+            };
+            assert!(daemon.next_event_timeout().unwrap().unwrap() <= Duration::from_millis(250));
+            daemon.poll_owned_traffic_budgets();
+            assert_eq!(
+                daemon.jobs[0].journal.state,
+                super::super::protocol::OperationState::Starting
+            );
+            daemon.next_owned_budget_poll = Instant::now();
+            daemon.owned_budget_reader = if fault {
+                |_, _, _, _| Err("counter fault".into())
+            } else {
+                |_, _, _, _| {
+                    Ok(speedtest::OwnedTrafficSnapshot {
+                        backend: speedtest::SpeedtestTrafficCounters {
+                            rx_bytes: 71,
+                            tx_bytes: 20,
+                        },
+                        probes: speedtest::SpeedtestTrafficCounters {
+                            rx_bytes: 7,
+                            tx_bytes: 3,
+                        },
+                    })
+                }
+            };
+            daemon.poll_owned_traffic_budgets();
+            assert!(!owned_budget_monitor_eligible(&daemon.jobs[0]));
+            assert_eq!(
+                daemon.jobs[0].journal.diagnostic_code.as_deref(),
+                Some(if fault {
+                    "owned-traffic-accounting-failed"
+                } else {
+                    "owned-traffic-budget-exceeded"
+                })
+            );
+            drop(daemon);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn t2_coordinator_budget_stop_cannot_be_downgraded_to_worker_cancellation() {
+        for worker_state in ["cancelled", "complete", "failed"] {
+            let failed = preserve_owned_traffic_stop(
+                NativeRuntimeTerminalOutcome {
+                    state: worker_state,
+                    diagnostic: None,
+                },
+                Some("owned-traffic-accounting-failed"),
+            );
+            assert_eq!(failed.state, "failed");
+            assert_eq!(
+                failed.diagnostic.as_deref(),
+                Some("owned-traffic-accounting-failed")
+            );
+            let limited = preserve_owned_traffic_stop(
+                NativeRuntimeTerminalOutcome {
+                    state: worker_state,
+                    diagnostic: None,
+                },
+                Some("owned-traffic-budget-exceeded"),
+            );
+            assert_eq!(limited.state, "inconclusive");
+            assert_eq!(
+                limited.diagnostic.as_deref(),
+                Some("owned-traffic-budget-exceeded")
+            );
+        }
+        let fault = preserve_owned_traffic_stop(
+            NativeRuntimeTerminalOutcome {
+                state: "failed",
+                diagnostic: Some("speedtest-counter-reset".into()),
+            },
+            Some("owned-traffic-budget-exceeded"),
+        );
+        assert_eq!(fault.diagnostic.as_deref(), Some("speedtest-counter-reset"));
+        let ordinary = preserve_owned_traffic_stop(
+            NativeRuntimeTerminalOutcome {
+                state: "cancelled",
+                diagnostic: None,
+            },
+            Some("unrecognized-stop-code"),
+        );
+        assert_eq!(ordinary.state, "cancelled");
+        assert!(ordinary.diagnostic.is_none());
     }
 
     #[test]
@@ -13865,6 +15472,155 @@ mod tests {
     }
 
     #[test]
+    fn t2_managed_retirement_holds_all_release_paths_until_exact_receipt() {
+        use super::super::autotune_runtime_store::ProbeRetirement;
+        // Isolate the runtime-root override from concurrently running tests.
+        const CHILD: &str = "CAKE_TEST_MANAGED_RETIREMENT_CHILD";
+        if env::var_os(CHILD).is_none() {
+            let root = temp_path("managed-retirement-child");
+            fs::create_dir_all(root.join("run/wan")).unwrap();
+            let output = std::process::Command::new(env::current_exe().unwrap())
+                .args(["--exact", "operations::coordinator::tests::t2_managed_retirement_holds_all_release_paths_until_exact_receipt", "--nocapture"])
+                .env(CHILD, &root)
+                .env("CAKE_AUTORATE_RUN_ROOT", root.join("run"))
+                .output().unwrap();
+            fs::remove_dir_all(root).unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let root = PathBuf::from(env::var_os(CHILD).unwrap());
+        let mut daemon =
+            CalibrationDaemon::bind_with_components(&root.join("state"), true, None).unwrap();
+        daemon.native_autotune = true;
+        let mut operation = operation_request('a', 'b', "wan");
+        operation.traffic_policy_explicit = true;
+        assert!(daemon
+            .handle(&job_message(ControlCommand::Start, &operation))
+            .contains("\"state\":\"queued\""));
+        assert!(daemon.acquire_heavy_lease_if_needed(0));
+        let worker_run_id = "8".repeat(32);
+        let mut recovering = daemon.jobs[0].journal.clone();
+        recovering
+            .arm_runtime_mutation(worker_run_id.clone())
+            .unwrap();
+        recovering
+            .require_recovery("native-runtime-reconciliation-required")
+            .unwrap();
+        daemon.journal_store.update(&recovering).unwrap();
+        daemon.jobs[0].journal = recovering.clone();
+        daemon.jobs[0].disposition = JournalDisposition::RecoveryRequired;
+        let ack = super::super::full_autotune::AutotuneRuntimeAck {
+            permit_id: "9".repeat(32),
+            job_id: operation.identity.job_id.clone(),
+            worker_run_id: worker_run_id.clone(),
+            sequence: 1,
+            updated_boot_ms: 1_000_000,
+            target_interface: operation.identity.target_interface.clone(),
+            route_fingerprint: operation.identity.route_fingerprint.clone(),
+            sqm_fingerprint: operation.identity.sqm_fingerprint.clone(),
+            state: RuntimeAckState::Restoring,
+            topology: None,
+            download_kbps: None,
+            upload_kbps: None,
+            diagnostic_code: None,
+        };
+        assert!(!daemon
+            .maybe_release_heavy_lease_during_recovery(0, &ack)
+            .unwrap());
+        daemon.settle_native_runtime_recovery(0);
+        daemon.settle_native_after_exit(0, Some(("cancelled", "")));
+        assert_eq!(daemon.jobs[0].journal, recovering);
+        assert_eq!(
+            daemon.leases.owner(&LeaseKey::HeavyTraffic),
+            Some(operation.identity.job_id.as_str())
+        );
+        let store = RuntimeOverrideStore::open(&root.join("run/wan")).unwrap();
+        let record = ProbeRetirement {
+            job_id: operation.identity.job_id.clone(),
+            worker_run_id,
+        };
+        let foreign = ProbeRetirement {
+            worker_run_id: "7".repeat(32),
+            ..record.clone()
+        };
+        assert!(store.acknowledge_probe_retirement(&foreign).is_err());
+        assert!(!daemon.autotune_probes_retired(0));
+        store.acknowledge_probe_retirement(&record).unwrap();
+        // Even with retirement proved, owned cleanup must not run ahead of
+        // runtime recovery inspection (which may still require restoration).
+        daemon.route_pin_cleaner = |_, _, _| panic!("owned cleanup ran before runtime restoration");
+        daemon.poll_native_runtime_recoveries();
+        assert!(daemon
+            .maybe_release_heavy_lease_during_recovery(0, &ack)
+            .unwrap());
+        assert_eq!(daemon.leases.owner(&LeaseKey::HeavyTraffic), None);
+        assert_eq!(
+            daemon.leases.owner(&LeaseKey::Instance("wan".to_string())),
+            Some(operation.identity.job_id.as_str())
+        );
+        assert!(daemon.jobs[0].journal.recovery_required);
+
+        // Cancellation before the first SQM mutation has no Restoring ACK.
+        // It must still wait, without invoking route-pin cleanup early.
+        fs::create_dir(root.join("run/wanb")).unwrap();
+        let mut baseline =
+            CalibrationDaemon::bind_with_components(&root.join("baseline-state"), true, None)
+                .unwrap();
+        baseline.native_autotune = true;
+        baseline.route_pin_cleaner = |_, _, _| panic!("cleanup ran before probe retirement");
+        let mut request = operation_request('c', 'd', "wanb");
+        request.traffic_policy_explicit = true;
+        assert!(baseline
+            .handle(&job_message(ControlCommand::Start, &request))
+            .contains("\"state\":\"queued\""));
+        assert!(baseline.acquire_heavy_lease_if_needed(0));
+        let mut cancelling = baseline.jobs[0].journal.clone();
+        cancelling.arm_native_worker("e".repeat(32)).unwrap();
+        cancelling
+            .transition(super::super::protocol::OperationState::Cancelling)
+            .unwrap();
+        baseline.journal_store.update(&cancelling).unwrap();
+        baseline.jobs[0].journal = cancelling.clone();
+        baseline.settle_native_after_exit(0, Some(("cancelled", "")));
+        assert_eq!(baseline.jobs[0].journal, cancelling);
+        assert!(!baseline.jobs[0].journal.runtime_mutated);
+        assert_eq!(
+            baseline.leases.owner(&LeaseKey::HeavyTraffic),
+            Some(request.identity.job_id.as_str())
+        );
+        let store = RuntimeOverrideStore::open(&root.join("run/wanb")).unwrap();
+        store
+            .acknowledge_probe_retirement(&ProbeRetirement {
+                job_id: request.identity.job_id.clone(),
+                worker_run_id: "e".repeat(32),
+            })
+            .unwrap();
+        baseline.route_pin_cleaner = |_, _, context| {
+            let context = context.expect("explicit FullAutoTune lost its cleanup context");
+            assert!(context
+                .directory
+                .ends_with(&context.request.identity.job_id));
+            Err("precleanup-storage-unavailable".into())
+        };
+        baseline.settle_native_after_exit(0, Some(("cancelled", "")));
+        assert_eq!(baseline.jobs[0].journal, cancelling);
+        assert!(baseline.job_errors[&request.identity.job_id]
+            .contains("precleanup-storage-unavailable"));
+        baseline.route_pin_cleaner = |_, _, _| Ok(());
+        baseline.settle_native_after_exit(0, Some(("cancelled", "")));
+        assert_eq!(
+            baseline.jobs[0].journal.state,
+            super::super::protocol::OperationState::Cancelled
+        );
+        assert_eq!(baseline.leases.job_count(), 0);
+    }
+
+    #[test]
     fn control_response_connection_errors_do_not_hide_server_errors() {
         struct FailingWriter(io::ErrorKind);
         impl Write for FailingWriter {
@@ -13889,6 +15645,162 @@ mod tests {
         assert!(
             write_control_response(&mut FailingWriter(io::ErrorKind::Other), "accepted").is_err()
         );
+    }
+
+    #[test]
+    fn t1_failed_server_diagnostics_are_optional_bounded_and_exact_worker_scoped() {
+        let root = temp_path("failed-server-diagnostic");
+        let mut daemon = CalibrationDaemon::bind_with_components(&root, true, None).unwrap();
+        daemon.native_autotune = true;
+        let request = operation_request('a', 'b', "wan");
+        assert!(daemon
+            .handle(&job_message(ControlCommand::Start, &request))
+            .contains("\"state\":\"queued\""));
+        let worker = "c".repeat(32);
+        let mut journal = daemon.jobs[0].journal.clone();
+        journal.arm_native_worker(worker.clone()).unwrap();
+        journal
+            .settle_native_terminal("failed", Some("server-list-failed"))
+            .unwrap();
+        daemon.journal_store.update(&journal).unwrap();
+        daemon.jobs[0].journal = journal;
+        let paths = daemon
+            .journal_store
+            .native_job_paths(&request.identity.job_id, &worker)
+            .unwrap();
+        let control = super::super::full_autotune::AutotuneRuntimeControl {
+            permit_id: "d".repeat(32),
+            job_id: request.identity.job_id.clone(),
+            worker_run_id: worker.clone(),
+            boot_id: "e".repeat(32),
+            coordinator_generation: "f".repeat(32),
+            worker: ProcessIdentity {
+                pid: 100,
+                process_group: 100,
+                starttime_ticks: 1,
+            },
+            sequence: 1,
+            deadline_boot_ms: 30_000,
+            target_interface: request.identity.target_interface.clone(),
+            route_fingerprint: request.identity.route_fingerprint.clone(),
+            sqm_fingerprint: request.identity.sqm_fingerprint.clone(),
+            topology: super::super::full_autotune::MeasurementTopology::RawBoth,
+            download_kbps: None,
+            upload_kbps: None,
+        }
+        .encode()
+        .unwrap();
+        let mut report = serde_json::json!({
+            "schema_version": 1, "job_id": request.identity.job_id, "worker_run_id": worker,
+            "request_sha256": super::super::sqm_identity::sha256sum(request.encode().unwrap().as_bytes()).unwrap(),
+            "control_sha256": super::super::sqm_identity::sha256sum(control.as_bytes()).unwrap(), "control": control,
+            "route_fingerprint": request.identity.route_fingerprint, "topology": "no_sqm", "capacity_proven": false,
+            "policy_id": "median-three-v1", "max_servers": 3, "repeats": 3, "state": "failed",
+            "reason": "server-list-failed", "selected_server_id": null, "requested_server_id": null,
+            "first_debit_sequence": 1, "debit_count": 0, "comparisons": [],
+        });
+        let path = paths
+            .request
+            .parent()
+            .unwrap()
+            .join("autotune-server-comparison.json");
+        rating::atomic_private_write(&path, &serde_json::to_vec(&report).unwrap()).unwrap();
+        let response = daemon.handle(&job_message(ControlCommand::Status, &request));
+        assert!(response.len() <= MAX_RESPONSE_BYTES);
+        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            parsed["server_comparison_diagnostic"]["proof_status"],
+            "identity-bound-diagnostic-only"
+        );
+        assert_eq!(
+            parsed["server_comparison_diagnostic"]["reason"],
+            "server-list-failed"
+        );
+        assert!(parsed.get("public_apply_contract").is_none());
+        report["worker_run_id"] = serde_json::json!("9".repeat(32));
+        rating::atomic_private_write(&path, &serde_json::to_vec(&report).unwrap()).unwrap();
+        let response = daemon.handle(&job_message(ControlCommand::Status, &request));
+        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert!(parsed.get("server_comparison_diagnostic").is_none());
+        assert_eq!(parsed["state"], "failed");
+        drop(daemon);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn t2_bootstrap_retirement_does_not_confuse_dead_owner_with_empty_group() {
+        use std::os::unix::process::CommandExt;
+        let root = temp_path("bootstrap-probe-retirement");
+        let mut daemon = CalibrationDaemon::bind_with_components(&root, true, None).unwrap();
+        daemon.native_autotune = true;
+        let mut request = bootstrap_operation_request('a', 'b', "wan");
+        request.traffic_policy_explicit = true;
+        assert!(daemon
+            .handle(&job_message(ControlCommand::Start, &request))
+            .contains("\"state\":\"queued\""));
+        let run = "c".repeat(32);
+        let paths = daemon
+            .journal_store
+            .native_job_paths(&request.identity.job_id, &run)
+            .unwrap();
+        fs::create_dir(&paths.bootstrap_runtime_dir).unwrap();
+        fs::set_permissions(
+            &paths.bootstrap_runtime_dir,
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let mut leader = std::process::Command::new("/bin/sleep")
+            .arg("3")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let owner = ProcessIdentity::inspect(Path::new(DEFAULT_PROC_ROOT), leader.id()).unwrap();
+        let mut member = std::process::Command::new("/bin/sleep")
+            .arg("3")
+            .process_group(owner.process_group as i32)
+            .spawn()
+            .unwrap();
+        let mut running = daemon.jobs[0].journal.clone();
+        running.arm_native_worker(run.clone()).unwrap();
+        running
+            .attach_native_running(ProcessIdentity::current().unwrap(), run.clone())
+            .unwrap();
+        running
+            .attach_bootstrap_runtime_owner(owner.clone())
+            .unwrap();
+        daemon.journal_store.update(&running).unwrap();
+        daemon.jobs[0].journal = running;
+        let claim = BootstrapRuntimeOwnerClaim::for_process(
+            &request,
+            &run,
+            owner.clone(),
+            bootstrap_runtime_baseline(&request, 'd'),
+        )
+        .unwrap();
+        rating::atomic_private_write(
+            &paths
+                .bootstrap_runtime_dir
+                .join("bootstrap-runtime-owner.claim"),
+            claim.encode().unwrap().as_bytes(),
+        )
+        .unwrap();
+        assert!(!daemon.autotune_probes_retired(0));
+        leader.kill().unwrap();
+        leader.wait().unwrap();
+        assert!(!owner.still_matches(Path::new(DEFAULT_PROC_ROOT)).unwrap());
+        assert!(!daemon.autotune_probes_retired(0));
+        member.kill().unwrap();
+        member.wait().unwrap();
+        assert!(daemon.autotune_probes_retired(0));
+        let store = RuntimeOverrideStore::open(&paths.bootstrap_runtime_dir).unwrap();
+        assert!(store
+            .request_probe_retirement(&super::super::autotune_runtime_store::ProbeRetirement {
+                job_id: request.identity.job_id,
+                worker_run_id: run,
+            })
+            .unwrap());
+        drop(daemon);
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn queued_control_exchange(
@@ -14163,6 +16075,7 @@ mod tests {
         assert!(response.contains("\"native_bootstrap_speedtest\":true"));
         assert!(response.contains("\"native_speedtest_auto_backend\":true"));
         assert!(response.contains("\"native_autotune_auto_backend\":true"));
+        assert!(response.contains("\"native_traffic_policy_version\":1"));
         assert!(response.contains("\"native_operation_status_identity_version\":1"));
         assert!(response.contains("\"native_autotune_status_identity_version\":1"));
         assert!(response.contains(&format!(
@@ -14256,6 +16169,278 @@ mod tests {
         let terminal = job_response(&job, true);
         assert!(terminal.contains("\"terminal_state\":\"inconclusive\""));
         assert!(terminal.contains("\"diagnostic_code\":\"pair-options-unreviewable\""));
+    }
+
+    #[test]
+    fn t2_planning_budget_refuses_before_journal_or_lease_creation() {
+        let root = temp_path("traffic-planning-admission");
+        let mut daemon = CalibrationDaemon::bind_with_components(&root, true, None).unwrap();
+        daemon.native_autotune = true;
+        for mut request in [
+            operation_request('a', 'b', "wan"),
+            bootstrap_operation_request('c', 'd', "wanb"),
+        ] {
+            request.traffic_policy_explicit = true;
+            request.traffic_plan = Some(super::super::protocol::AutotuneTrafficPlan {
+                download_kbps: 1_000_000,
+                upload_kbps: 100_000,
+            });
+            request.traffic_budget = 1_000_000_000_u64.into();
+            let response = daemon.handle(&job_message(ControlCommand::Start, &request));
+            assert!(
+                response.contains("traffic-budget-insufficient"),
+                "{response}"
+            );
+            assert!(response.contains("planning allowance"), "{response}");
+            assert!(daemon.jobs.is_empty());
+            assert_eq!(daemon.leases.job_count(), 0);
+            assert!(!root.join("jobs").join(&request.identity.job_id).exists());
+        }
+        let mut planned = operation_request('e', 'f', "wan");
+        planned.traffic_policy_explicit = true;
+        planned.traffic_plan = Some(super::super::protocol::AutotuneTrafficPlan {
+            download_kbps: 1_000_000,
+            upload_kbps: 100_000,
+        });
+        let journal = JobJournal::queued(&planned, &daemon.coordinator, true).unwrap();
+        daemon.journal_store.create(&planned, &journal).unwrap();
+        daemon.jobs.push(ScannedJob {
+            request: planned.clone(),
+            journal,
+            disposition: JournalDisposition::Queued,
+        });
+        let response = daemon.handle(&job_message(ControlCommand::Start, &planned));
+        assert!(response.contains("\"state\":\"queued\""));
+        assert!(response
+            .contains("\"traffic_planning\":{\"download_kbps\":1000000,\"upload_kbps\":100000}"));
+        planned.traffic_plan.as_mut().unwrap().download_kbps += 1;
+        assert!(daemon
+            .handle(&job_message(ControlCommand::Start, &planned))
+            .contains("job-id-conflict"));
+        drop(daemon);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn t2_known_raw_reserve_refuses_insufficient_total_before_job_creation() {
+        let root = temp_path("traffic-known-reserve");
+        let mut daemon = CalibrationDaemon::bind_with_components(&root, true, None).unwrap();
+        daemon.native_autotune = true;
+        for mut request in [
+            operation_request('a', 'b', "wan"),
+            bootstrap_operation_request('c', 'd', "wanb"),
+        ] {
+            // Far above the evidence-only floor, but below the known reserve.
+            request.traffic_budget = 100_000_000_u64.into();
+            for explicit in [false, true] {
+                request.traffic_policy_explicit = explicit;
+                let response = daemon.handle(&job_message(ControlCommand::Start, &request));
+                assert!(response.contains("traffic-budget-insufficient"));
+                assert!(response.contains("reserved for stopping"));
+                assert!(daemon.jobs.is_empty());
+                assert_eq!(daemon.leases.job_count(), 0);
+                assert!(!root.join("jobs").join(&request.identity.job_id).exists());
+            }
+        }
+        let mut old = operation_request('e', 'f', "wan");
+        old.traffic_budget = 100_000_000_u64.into();
+        let journal = JobJournal::queued(&old, &daemon.coordinator, true).unwrap();
+        daemon.journal_store.create(&old, &journal).unwrap();
+        daemon.jobs.push(ScannedJob {
+            request: old.clone(),
+            journal,
+            disposition: JournalDisposition::Queued,
+        });
+        assert!(daemon
+            .handle(&job_message(ControlCommand::Start, &old))
+            .contains("\"state\":\"queued\""));
+        assert!(!daemon.runtime_preflight_ready(0));
+        assert_eq!(
+            daemon.jobs[0].journal.diagnostic_code.as_deref(),
+            Some("traffic-budget-insufficient")
+        );
+        assert!(daemon.native_children.is_empty());
+        drop(daemon);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn t2_unknown_raw_stop_authority_refuses_new_jobs_but_preserves_reattach() {
+        let root = temp_path("traffic-stop-authority");
+        let mut daemon = CalibrationDaemon::bind_with_components(&root, true, None).unwrap();
+        daemon.native_autotune = true;
+        let mut request = operation_request('a', 'b', "wan");
+        request.service_dl_cap_kbps = None;
+        request.service_ul_cap_kbps = None;
+        for explicit in [false, true] {
+            request.traffic_policy_explicit = explicit;
+            let response = daemon.handle(&job_message(ControlCommand::Start, &request));
+            assert!(response.contains("traffic-stop-authority-unavailable"));
+            assert!(daemon.jobs.is_empty());
+            assert_eq!(daemon.leases.job_count(), 0);
+            assert!(!root.join("jobs").join(&request.identity.job_id).exists());
+        }
+        let journal = JobJournal::queued(&request, &daemon.coordinator, true).unwrap();
+        daemon.journal_store.create(&request, &journal).unwrap();
+        daemon.jobs.push(ScannedJob {
+            request: request.clone(),
+            journal,
+            disposition: JournalDisposition::Queued,
+        });
+        assert!(daemon
+            .handle(&job_message(ControlCommand::Start, &request))
+            .contains("\"state\":\"queued\""));
+        assert_eq!(daemon.jobs.len(), 1);
+        assert!(!daemon.runtime_preflight_ready(0));
+        assert_eq!(daemon.jobs[0].journal.state, OperationState::Failed);
+        assert!(daemon.native_children.is_empty());
+        drop(daemon);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn t2_obviously_insufficient_new_budget_is_rejected_before_job_or_lease_creation() {
+        let root = temp_path("traffic-admission-floor");
+        let mut daemon = CalibrationDaemon::bind_with_components(&root, true, None).unwrap();
+        daemon.native_autotune = true;
+        let minimum = full_autotune::minimum_autotune_evidence_bytes();
+        assert_eq!(minimum, 1_048_576);
+        for mut request in [
+            operation_request('a', 'b', "wan"),
+            bootstrap_operation_request('c', 'd', "wanb"),
+        ] {
+            request.traffic_budget = (minimum - 1).into();
+            for explicit in [false, true] {
+                request.traffic_policy_explicit = explicit;
+                assert_eq!(
+                    OperationRequest::decode(&request.encode().unwrap()).unwrap(),
+                    request,
+                    "admission must not change historical record decoding"
+                );
+                let response = daemon.handle(&job_message(ControlCommand::Start, &request));
+                assert!(response.contains("traffic-budget-insufficient"));
+                assert!(response.contains(&minimum.to_string()));
+                assert!(daemon.jobs.is_empty());
+                assert_eq!(daemon.leases.job_count(), 0);
+                assert!(!root.join("jobs").join(&request.identity.job_id).exists());
+            }
+        }
+        let mut admitted = operation_request('e', 'f', "wan");
+        admitted.strategy = Some(CalibrationStrategy::ShapedOnly);
+        admitted.allow_sqm_disable = false;
+        admitted.traffic_policy_explicit = true;
+        admitted.traffic_budget = minimum.into();
+        assert!(daemon
+            .handle(&job_message(ControlCommand::Start, &admitted))
+            .contains("\"state\":\"queued\""));
+        // A stored older request remains attachable even if its budget would
+        // be refused for a new job. No second job or new quota is created.
+        let mut old = operation_request('1', '2', "old_wan");
+        old.traffic_policy_explicit = true;
+        old.traffic_budget = 1_u64.into();
+        let journal = JobJournal::queued(&old, &daemon.coordinator, true).unwrap();
+        daemon.journal_store.create(&old, &journal).unwrap();
+        daemon.jobs.push(ScannedJob {
+            request: old.clone(),
+            journal,
+            disposition: JournalDisposition::Queued,
+        });
+        daemon
+            .leases
+            .acquire(LeaseRequest::local_from_operation(&old).unwrap())
+            .unwrap();
+        let leases = daemon.leases.job_count();
+        assert!(daemon
+            .handle(&job_message(ControlCommand::Start, &old))
+            .contains("\"state\":\"queued\""));
+        assert_eq!(daemon.jobs.len(), 2);
+        assert_eq!(daemon.leases.job_count(), leases);
+        assert!(!daemon.runtime_preflight_ready(1));
+        assert_eq!(daemon.jobs[1].journal.state, OperationState::Failed);
+        assert!(daemon.native_children.is_empty());
+        assert_eq!(daemon.leases.job_count(), leases - 1);
+        assert!(full_autotune::validate_autotune_evidence_budget(
+            super::super::protocol::TrafficPolicy::Unlimited
+        )
+        .is_ok());
+        drop(daemon);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn t2_status_traffic_uses_original_policy_and_identity_bound_terminal_usage() {
+        let dir = temp_path("traffic-status");
+        let daemon = CalibrationDaemon::bind(&dir).unwrap();
+        let mut request = operation_request('a', 'b', "wan");
+        request.traffic_budget = 1_000_u64.into();
+        let journal = JobJournal::queued(&request, &daemon.coordinator, true).unwrap();
+        daemon.journal_store.create(&request, &journal).unwrap();
+        let mut job = ScannedJob {
+            request,
+            journal,
+            disposition: JournalDisposition::Queued,
+        };
+        let missing = job_status_response(&job, true, None);
+        assert!(
+            missing.contains("\"policy\":\"capped\",\"limit_bytes\":1000,\"consumed_bytes\":null")
+        );
+        assert!(missing.contains("\"remaining_bytes\":null,\"overrun_bytes\":null"));
+        assert_eq!(daemon.native_autotune_status_usage(&job, None), None);
+        let worker = "66".repeat(16);
+        job.journal.worker_run_id = Some(worker.clone());
+        job.journal.state = OperationState::Failed;
+        let paths = daemon
+            .journal_store
+            .native_job_paths(&job.journal.job_id, &worker)
+            .unwrap();
+        let parent = paths.request.parent().unwrap();
+        fs::create_dir_all(parent).unwrap();
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut terminal = full_autotune::AutotuneTerminalRecord {
+            job_id: job.journal.job_id.clone(),
+            worker_run_id: worker.clone(),
+            consumed_traffic_bytes: 1_200,
+            terminal: AutotuneTerminal::Failed {
+                code: "speedtest-traffic-budget-exceeded".into(),
+            },
+        };
+        full_autotune::publish_terminal_file(&paths.terminal, &terminal).unwrap();
+        let usage = daemon.native_autotune_status_usage(&job, None);
+        assert_eq!(usage, Some((1_200, "terminal_record")));
+        let response = job_status_response_with_progress(&job, true, None, None, usage, false);
+        assert!(response.contains("\"limit_bytes\":1000,\"consumed_bytes\":1200,\"remaining_bytes\":0,\"overrun_bytes\":200"));
+        job.request.traffic_policy_explicit = true;
+        let unverified = job_status_response_with_progress(&job, true, None, None, usage, false);
+        assert!(unverified.contains("\"accounting\":\"unavailable\""));
+        assert!(unverified.contains("\"consumed_bytes\":null"));
+        let owned = job_status_response_with_progress(&job, true, None, None, usage, true);
+        assert!(owned.contains("\"accounting\":\"owned-ip-system-dns-estimate-v1\""));
+        assert!(owned.contains("\"consumed_bytes\":1200"));
+        job.request.traffic_policy_explicit = false;
+        job.request.traffic_budget = super::super::protocol::TrafficPolicy::Unlimited;
+        let unlimited = job_status_response_with_progress(&job, true, None, None, usage, false);
+        assert!(unlimited.contains("\"policy\":\"unlimited\",\"limit_bytes\":null,\"consumed_bytes\":1200,\"remaining_bytes\":null,\"overrun_bytes\":null"));
+        terminal.worker_run_id = "77".repeat(16);
+        full_autotune::publish_terminal_file(&paths.terminal, &terminal).unwrap();
+        assert_eq!(daemon.native_autotune_status_usage(&job, None), None);
+        let mut progress = full_autotune::NativeAutotuneProgress::coordinator_state(
+            full_autotune::NativeAutotuneProgressStep::PreparingMeasurements,
+            10,
+        );
+        progress.job_id = job.journal.job_id.clone();
+        progress.worker_run_id = worker;
+        progress.consumed_traffic_bytes = Some(700);
+        assert_eq!(
+            daemon.native_autotune_status_usage(&job, Some(&progress)),
+            Some((700, "persisted_debits"))
+        );
+        progress.worker_run_id = "88".repeat(16);
+        assert_eq!(
+            daemon.native_autotune_status_usage(&job, Some(&progress)),
+            None
+        );
+        drop(daemon);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

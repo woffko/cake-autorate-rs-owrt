@@ -150,6 +150,10 @@ struct PresetPlan {
 
 pub(crate) trait InterfaceResolver {
     fn resolve(&self, name: &str) -> Result<String, String>;
+    /// An optional fact provider. Unknown multi-queue support is not admission.
+    fn supports_cake_mq(&self, _script: &str) -> Result<bool, String> {
+        Ok(false)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -160,6 +164,14 @@ pub(crate) struct OpenWrtEnvironment {
 }
 
 impl OpenWrtEnvironment {
+    #[cfg(test)]
+    pub(crate) fn test_paths(uci: PathBuf, ubus: PathBuf, sys_class_net: PathBuf) -> Self {
+        Self {
+            uci,
+            ubus,
+            sys_class_net,
+        }
+    }
     pub(crate) fn production() -> Self {
         Self {
             uci: env_path("CAKE_AUTORATE_UCI_BIN", UCI_BIN),
@@ -245,6 +257,10 @@ fn canonical_batch(plan: &PresetPlan) -> Result<Option<String>, String> {
 }
 
 impl InterfaceResolver for OpenWrtEnvironment {
+    fn supports_cake_mq(&self, script: &str) -> Result<bool, String> {
+        crate::qdisc_capabilities::supported(script)
+    }
+
     fn resolve(&self, name: &str) -> Result<String, String> {
         if !safe_interface(name) {
             return Err("configured interface name is unsafe".to_string());
@@ -309,6 +325,31 @@ fn plan_presets(
         sync_rate_preset(package, &mut plan, section)?;
     }
     Ok(plan)
+}
+
+/// Prepare the same preset decisions without committing any UCI context.
+pub(crate) fn prepare_preset_edits(
+    original: &UciPackage,
+    resolver: &impl InterfaceResolver,
+) -> Result<(UciPackage, Vec<super::uci_edits::Edit>), String> {
+    let mut candidate = original.clone();
+    let plan = plan_presets(&mut candidate, resolver)?;
+    let edits = plan
+        .actions
+        .into_iter()
+        .map(|action| match action {
+            PresetAction::Set {
+                section,
+                option,
+                value,
+            } => super::uci_edits::Edit::Set {
+                section,
+                option,
+                value,
+            },
+        })
+        .collect();
+    Ok((candidate, edits))
 }
 
 fn instance_names(package: &UciPackage) -> Vec<String> {

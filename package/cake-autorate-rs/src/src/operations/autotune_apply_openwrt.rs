@@ -1076,7 +1076,7 @@ impl OpenWrtNativeApplyBackend {
     fn verify_original_bounded(&self, request: &OperationRequest) -> Result<(), String> {
         let deadline = Instant::now() + VERIFY_TIMEOUT;
         loop {
-            match attest_openwrt_runtime(request) {
+            match super::runtime::attest_openwrt_runtime_during_native_restore(request) {
                 RuntimeAttestation::Ready => {
                     self.require_clean_uci()?;
                     return Ok(());
@@ -1131,6 +1131,7 @@ fn validate_bootstrap_candidate_config(
     mode: NativeBootstrapApplyMode,
 ) -> Result<(), String> {
     request.validate()?;
+    super::autotune_request::operation_route_matches_instance(cfg, &request.route)?;
     if request.target_state != OperationTargetState::AbsentBootstrap {
         return Err(
             "native bootstrap candidate request is not absent-target authority".to_string(),
@@ -1296,6 +1297,7 @@ impl NativeApplyTransactionBackend for OpenWrtNativeApplyBackend {
         &mut self,
         plan: &NativeApplyExecutionPlan,
     ) -> Result<bool, String> {
+        super::service_lifecycle::require_no_pending_service_start()?;
         Ok(self.verify_candidate_once(plan).is_ok())
     }
 
@@ -1303,6 +1305,7 @@ impl NativeApplyTransactionBackend for OpenWrtNativeApplyBackend {
         if unsafe { libc::geteuid() } != 0 {
             return Err("native Apply execution requires root".to_string());
         }
+        super::service_lifecycle::require_no_pending_service_start()?;
         self.require_clean_uci()?;
         match attest_openwrt_runtime(&plan.request) {
             RuntimeAttestation::Ready => Ok(()),
@@ -1469,6 +1472,7 @@ impl NativeBootstrapApplyBackend for OpenWrtNativeApplyBackend {
         &mut self,
         plan: &NativeBootstrapApplyPlan,
     ) -> Result<bool, String> {
+        super::service_lifecycle::require_no_pending_service_start()?;
         match self.verify_bootstrap_materialized_config(plan) {
             Ok(_) => {
                 self.verify_bootstrap_running_candidate(
@@ -1495,6 +1499,9 @@ impl NativeBootstrapApplyBackend for OpenWrtNativeApplyBackend {
         &mut self,
         plan: &NativeBootstrapApplyPlan,
     ) -> Result<(), String> {
+        super::service_lifecycle::require_bootstrap_generation_slot_absent(
+            &plan.request().identity.instance,
+        )?;
         self.attest_bootstrap_absence(plan.request(), plan.absent_baseline())
     }
 
@@ -1618,6 +1625,19 @@ impl NativeBootstrapApplyBackend for OpenWrtNativeApplyBackend {
         baseline: &AbsentRuntimeBaseline,
     ) -> Result<(), String> {
         self.attest_bootstrap_absence(request, baseline)
+    }
+
+    fn settle_absent_controller_generation(
+        &mut self,
+        request: &OperationRequest,
+        baseline: &AbsentRuntimeBaseline,
+        lock: &NativeApplyGlobalLock,
+    ) -> Result<(), String> {
+        super::service_lifecycle::settle_absent_bootstrap_generation(
+            &request.identity.instance,
+            lock,
+            || self.attest_bootstrap_absence(request, baseline),
+        )
     }
 
     fn verify_recovered_candidate(

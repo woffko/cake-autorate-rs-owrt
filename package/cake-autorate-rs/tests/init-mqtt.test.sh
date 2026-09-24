@@ -78,6 +78,20 @@ for malformed in \
 	}
 done
 
+for fail in command respawn term_timeout stdout stderr; do
+	if (
+		MQTT_TEST_PLAN='service-start-v3 - wan_a'
+		export MQTT_TEST_PLAN
+		procd_set_param() { [ "$1" != "$fail" ]; }
+		start_service_locked
+		: > "$work/serialized"
+	); then
+		echo "MQTT ignored procd $fail failure" >&2
+		exit 1
+	fi
+	[ ! -e "$work/serialized" ] || { echo 'partial MQTT JSON reached serialization' >&2; exit 1; }
+done
+
 if grep -Eq 'cake-autorate-mqtt|mqtt-service-plan|mosquitto|sleep|usleep' "$rendered"; then
 	echo 'main init still delegates MQTT selection, transport, retry, or lifecycle policy' >&2
 	exit 1

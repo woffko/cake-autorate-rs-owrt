@@ -16,7 +16,13 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::committed_uci::CommittedSnapshot;
+use super::uci_transaction::PublishedConfig;
 use crate::rate_limits;
+
+#[path = "sqm_pinned_runtime.rs"]
+mod pinned_runtime;
+pub(crate) use pinned_runtime::PinnedSqm;
 
 const DEFAULT_LOCK_ROOT: &str = "/tmp/cake-autorate-speedtest";
 const DEFAULT_SQM_CONFIG: &str = "/etc/config/sqm";
@@ -289,7 +295,7 @@ impl OpenWrtPaths {
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_SYS_CLASS_NET)),
             uci: std::env::var_os("CAKE_AUTORATE_UCI")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("uci")),
+                .unwrap_or_else(|| PathBuf::from("/sbin/uci")),
             tc: std::env::var_os("CAKE_AUTORATE_TC")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("tc")),
@@ -326,12 +332,93 @@ struct PrivateSqmSnapshot {
     private_sqm: Vec<u8>,
 }
 
+#[cfg(test)]
 struct PrivateSqmStopSnapshot {
     directory: PathBuf,
     source_bytes: Vec<u8>,
     live_cake: Option<Vec<u8>>,
     live_sqm: Vec<u8>,
     private_sqm: Vec<u8>,
+}
+
+trait StopConfigAuthority {
+    fn cake_section(&self) -> Option<&[u8]>;
+    fn sqm_section(&self) -> &[u8];
+    fn runner_directory(&self) -> &Path;
+    fn attest(
+        &self,
+        spec: &ManagedSqmStopSpec,
+        paths: &OpenWrtPaths,
+    ) -> Result<(), NativeSqmAttestationError>;
+}
+#[cfg(test)]
+impl StopConfigAuthority for PrivateSqmStopSnapshot {
+    fn cake_section(&self) -> Option<&[u8]> {
+        self.live_cake.as_deref()
+    }
+    fn sqm_section(&self) -> &[u8] {
+        &self.private_sqm
+    }
+    fn runner_directory(&self) -> &Path {
+        &self.directory
+    }
+    fn attest(
+        &self,
+        spec: &ManagedSqmStopSpec,
+        paths: &OpenWrtPaths,
+    ) -> Result<(), NativeSqmAttestationError> {
+        validate_stop_configuration_unchanged(spec, paths, self)
+    }
+}
+struct CommittedStopAuthority<'a> {
+    snapshot: &'a CommittedSnapshot,
+    cake: Option<Vec<u8>>,
+    sqm: Vec<u8>,
+}
+struct InputStopAuthority<'a> {
+    input: &'a super::controller_input::Loaded,
+    sqm: Vec<u8>,
+}
+impl StopConfigAuthority for InputStopAuthority<'_> {
+    fn cake_section(&self) -> Option<&[u8]> {
+        Some(&self.input.cake_show)
+    }
+    fn sqm_section(&self) -> &[u8] {
+        &self.sqm
+    }
+    fn runner_directory(&self) -> &Path {
+        self.input.guard.stop_context_directory()
+    }
+    fn attest(
+        &self,
+        _: &ManagedSqmStopSpec,
+        _: &OpenWrtPaths,
+    ) -> Result<(), NativeSqmAttestationError> {
+        self.input
+            .guard
+            .attest_record()
+            .map_err(NativeSqmAttestationError::failed)
+    }
+}
+impl StopConfigAuthority for CommittedStopAuthority<'_> {
+    fn cake_section(&self) -> Option<&[u8]> {
+        self.cake.as_deref()
+    }
+    fn sqm_section(&self) -> &[u8] {
+        &self.sqm
+    }
+    fn runner_directory(&self) -> &Path {
+        self.snapshot.stop_context_directory()
+    }
+    fn attest(
+        &self,
+        _: &ManagedSqmStopSpec,
+        _: &OpenWrtPaths,
+    ) -> Result<(), NativeSqmAttestationError> {
+        self.snapshot
+            .attest()
+            .map_err(NativeSqmAttestationError::failed)
+    }
 }
 
 struct PreparedManagedSqm {
@@ -359,6 +446,7 @@ impl Drop for PrivateSqmSnapshot {
     }
 }
 
+#[cfg(test)]
 impl Drop for PrivateSqmStopSnapshot {
     fn drop(&mut self) {
         let _ = fs::remove_file(self.directory.join("sqm"));
@@ -416,14 +504,350 @@ pub(crate) fn attest_managed_sqm_after_service_action_or_offline(
     )
 }
 
-/// Stop one exactly cake-owned SQM runtime while the ordinary service
-/// lifecycle already owns the global mutation lock.  The helper exit status is
-/// diagnostic only: success is the exact absence of the previously attested
-/// CAKE/IFB/ingress state and its owner-bound sqm-scripts state file.
-pub(crate) fn stop_managed_sqm_after_service_action(
-    spec: &ManagedSqmStopSpec,
+fn published_sections(
+    spec: &ManagedSqmAttestationSpec,
+    published: &PublishedConfig,
+) -> Result<ParsedUciSection, NativeSqmAttestationError> {
+    spec.validate()?;
+    published
+        .attest()
+        .map_err(NativeSqmAttestationError::failed)?;
+    let config = published.config();
+    let cake = config
+        .section_show("cake-autorate", &spec.instance)
+        .map_err(NativeSqmAttestationError::failed)?;
+    let sqm = config
+        .section_show("sqm", &spec.sqm_section)
+        .map_err(NativeSqmAttestationError::failed)?;
+    let cake = parse_uci_show(
+        &cake,
+        "cake-autorate",
+        &spec.instance,
+        "cake_autorate",
+        UciListPolicy::Allow,
+    )?;
+    let sqm = parse_uci_show(
+        &sqm,
+        "sqm",
+        &spec.sqm_section,
+        "queue",
+        UciListPolicy::Reject,
+    )?;
+    validate_live_configuration(spec, &cake, &sqm)?;
+    Ok(sqm)
+}
+
+/// The caller owns the global lifecycle lock. Frozen configuration is used for
+/// every owner/rate/recipe check; only kernel/runtime observations are live.
+pub(crate) fn attest_managed_sqm_from_published(
+    spec: &ManagedSqmAttestationSpec,
+    published: &PublishedConfig,
+) -> Result<bool, NativeSqmAttestationError> {
+    attest_managed_sqm_from_published_with_paths(spec, published, &OpenWrtPaths::from_environment())
+}
+fn attest_managed_sqm_from_published_with_paths(
+    spec: &ManagedSqmAttestationSpec,
+    published: &PublishedConfig,
+    paths: &OpenWrtPaths,
+) -> Result<bool, NativeSqmAttestationError> {
+    let sqm = published_sections(spec, published)?;
+    let offline = attest_frozen_runtime(spec, &sqm, paths)?;
+    published
+        .attest()
+        .map_err(NativeSqmAttestationError::failed)?;
+    Ok(offline)
+}
+
+fn attest_frozen_runtime(
+    spec: &ManagedSqmAttestationSpec,
+    sqm: &ParsedUciSection,
+    paths: &OpenWrtPaths,
+) -> Result<bool, NativeSqmAttestationError> {
+    let offline = !paths.sys_class_net.join(&spec.target_interface).exists();
+    if offline {
+        if spec.upload_interface != spec.target_interface {
+            return Err(NativeSqmAttestationError::failed(
+                "offline managed SQM target does not own its upload interface",
+            ));
+        }
+        match load_optional_runtime_identity(spec, paths)? {
+            Some(state) => {
+                validate_state_against_sqm(spec, &state, sqm)?;
+                validate_offline_target_topology(spec, &state, paths)?;
+            }
+            None => attest_managed_sqm_kernel_absent(&stop_spec_from_attestation(spec), paths)?,
+        }
+    } else {
+        let state = load_runtime_identity(spec, paths)?;
+        validate_state_against_sqm(spec, &state, sqm)?;
+        validate_kernel_topology(spec, &state, paths)?;
+    }
+    Ok(offline)
+}
+
+/// Check a pending input only under its parent's exact lifecycle authority,
+/// without reacquiring the exclusive guard or reopening a released UCI alias.
+pub(crate) fn attest_input_during_lifecycle(
+    spec: &ManagedSqmAttestationSpec,
+    input: &super::controller_input::Loaded,
+    lease: &super::service_lifecycle::ServiceGlobalLease<'_>,
+) -> Result<bool, NativeSqmAttestationError> {
+    let paths = OpenWrtPaths::from_environment();
+    let scope = pinned_runtime::Inspection::Lifecycle(lease);
+    scope.attest(&paths, &spec.target_interface)?;
+    let sqm = input_sqm_sections(spec, input)?;
+    let offline = attest_frozen_runtime(spec, &sqm, &paths)?;
+    input
+        .guard
+        .attest()
+        .map_err(NativeSqmAttestationError::failed)?;
+    scope.attest(&paths, &spec.target_interface)?;
+    Ok(offline)
+}
+
+/// Start one absent, owned runtime; an exact existing runtime is a no-op.
+/// Replacing a different runtime requires the separate attested Stop lane.
+pub(crate) fn start_managed_sqm_from_published(
+    spec: &ManagedSqmAttestationSpec,
+    published: &PublishedConfig,
+    profile: super::sqm_runner::Profile,
+    runtime_root: &Path,
+    should_cancel: impl Fn() -> bool,
+) -> Result<bool, NativeSqmAttestationError> {
+    start_managed_sqm_from_published_with_paths(
+        spec,
+        published,
+        profile,
+        runtime_root,
+        &OpenWrtPaths::from_environment(),
+        should_cancel,
+    )
+}
+fn start_managed_sqm_from_published_with_paths(
+    spec: &ManagedSqmAttestationSpec,
+    published: &PublishedConfig,
+    profile: super::sqm_runner::Profile,
+    runtime_root: &Path,
+    paths: &OpenWrtPaths,
+    should_cancel: impl Fn() -> bool,
+) -> Result<bool, NativeSqmAttestationError> {
+    published_sections(spec, published)?;
+    if should_cancel() {
+        return Err(NativeSqmAttestationError::Terminated);
+    }
+    if !paths.sys_class_net.join(&spec.target_interface).exists()
+        || load_optional_runtime_identity(spec, paths)?.is_some()
+    {
+        return attest_managed_sqm_from_published_with_paths(spec, published, paths);
+    }
+    attest_managed_sqm_kernel_absent(&stop_spec_from_attestation(spec), paths)?;
+    fn runner_error(error: String) -> NativeSqmAttestationError {
+        if error == super::sqm_runner::BUSY {
+            NativeSqmAttestationError::Busy(error)
+        } else if error == "isolated-sqm-runner-cancelled" {
+            NativeSqmAttestationError::Terminated
+        } else {
+            NativeSqmAttestationError::failed(error)
+        }
+    }
+    let runner = profile
+        .bind(published.config(), runtime_root)
+        .map_err(runner_error)?;
+    let _result = runner
+        .start(
+            &spec.target_interface,
+            || {
+                published.attest()?;
+                Ok(())
+            },
+            &should_cancel,
+        )
+        .map_err(runner_error)?;
+    if should_cancel() {
+        return Err(NativeSqmAttestationError::Terminated);
+    }
+    // Helper exit alone is not the postcondition, and raw stderr is not public
+    // authority. Preserve the exact state/kernel failure instead of echoing it.
+    // Upstream config_foreach returns the last callback status. A final foreign
+    // section skipped by RUN_IFACE can yield rc1 even after our queue started.
+    // Match the existing recovery contract: exact postcondition, not rc, owns
+    // success. Timeout, cancellation and failed attestation remain failures.
+    attest_managed_sqm_from_published_with_paths(spec, published, paths)
+}
+
+fn input_sqm_sections(
+    spec: &ManagedSqmAttestationSpec,
+    input: &super::controller_input::Loaded,
+) -> Result<ParsedUciSection, NativeSqmAttestationError> {
+    spec.validate()?;
+    if input.guard.instance() != spec.instance {
+        return Err(NativeSqmAttestationError::failed(
+            "frozen SQM instance mismatch",
+        ));
+    }
+    input
+        .guard
+        .attest()
+        .map_err(NativeSqmAttestationError::failed)?;
+    let cake = parse_uci_show(
+        &input.cake_show,
+        "cake-autorate",
+        &spec.instance,
+        "cake_autorate",
+        UciListPolicy::Allow,
+    )?;
+    let sqm = parse_uci_show(
+        &input
+            .sqm_section(&spec.sqm_section)
+            .map_err(NativeSqmAttestationError::failed)?,
+        "sqm",
+        &spec.sqm_section,
+        "queue",
+        UciListPolicy::Reject,
+    )?;
+    validate_live_configuration(spec, &cake, &sqm)?;
+    Ok(sqm)
+}
+
+pub(crate) fn attest_managed_sqm_from_input(
+    spec: &ManagedSqmAttestationSpec,
+    input: &super::controller_input::Loaded,
 ) -> Result<(), NativeSqmAttestationError> {
-    stop_managed_sqm_after_service_action_with_paths(spec, &OpenWrtPaths::from_environment())
+    attest_managed_sqm_from_input_with_paths(spec, input, &OpenWrtPaths::from_environment())
+}
+fn attest_managed_sqm_from_input_with_paths(
+    spec: &ManagedSqmAttestationSpec,
+    input: &super::controller_input::Loaded,
+    paths: &OpenWrtPaths,
+) -> Result<(), NativeSqmAttestationError> {
+    spec.validate()?;
+    let _locks = acquire_runtime_locks(paths, &spec.target_interface, "sqm-attest")?;
+    let sqm = input_sqm_sections(spec, input)?;
+    let state = load_runtime_identity(spec, paths)?;
+    validate_state_against_sqm(spec, &state, &sqm)?;
+    validate_kernel_topology(spec, &state, paths)?;
+    input
+        .guard
+        .attest()
+        .map_err(NativeSqmAttestationError::failed)
+}
+
+fn frozen_runner_error(error: String) -> NativeSqmAttestationError {
+    if error == super::sqm_runner::BUSY || error == "committed-uci-workspace-busy" {
+        NativeSqmAttestationError::Busy(error)
+    } else if error == "isolated-sqm-runner-cancelled" {
+        NativeSqmAttestationError::Terminated
+    } else {
+        NativeSqmAttestationError::failed(error)
+    }
+}
+
+pub(crate) fn recover_managed_sqm_from_input(
+    spec: &ManagedSqmAttestationSpec,
+    input: &super::controller_input::Loaded,
+    should_cancel: impl Fn() -> bool,
+) -> Result<(), NativeSqmAttestationError> {
+    let paths = OpenWrtPaths::from_environment();
+    recover_managed_sqm_from_input_with_paths(
+        spec,
+        input,
+        &paths,
+        || super::sqm_runner::Profile::inspect(&paths.sqm_run),
+        should_cancel,
+    )
+}
+fn recover_managed_sqm_from_input_with_paths(
+    spec: &ManagedSqmAttestationSpec,
+    input: &super::controller_input::Loaded,
+    paths: &OpenWrtPaths,
+    profile: impl FnOnce() -> Result<super::sqm_runner::Profile, String>,
+    should_cancel: impl Fn() -> bool,
+) -> Result<(), NativeSqmAttestationError> {
+    use super::committed_uci::FrozenSqmAlias;
+    use super::uci_edits::Edit;
+    spec.validate()?;
+    let _locks = acquire_runtime_locks(paths, &spec.target_interface, "sqm-recover")?;
+    let sqm = input_sqm_sections(spec, input)?;
+    let attest_input = || {
+        input
+            .guard
+            .attest()
+            .map_err(NativeSqmAttestationError::failed)
+    };
+    let attest_runtime = || {
+        let state = load_runtime_identity(spec, paths)?;
+        validate_state_against_sqm(spec, &state, &sqm)?;
+        validate_kernel_topology(spec, &state, paths)?;
+        attest_input()
+    };
+    if should_cancel() {
+        return Err(NativeSqmAttestationError::Terminated);
+    }
+    if attest_runtime().is_ok() {
+        return Ok(());
+    }
+    let prior = load_optional_runtime_identity(spec, paths)?;
+    if let Some(state) = &prior {
+        validate_state_against_sqm(spec, state, &sqm)?;
+    } else {
+        attest_managed_sqm_kernel_absent(&stop_spec_from_attestation(spec), paths)?;
+    }
+    let profile = profile().map_err(frozen_runner_error)?;
+    let mut edits = Vec::with_capacity(sqm.scalars.len() + 1);
+    edits.push(Edit::AddSection {
+        section: spec.sqm_section.clone(),
+        kind: "queue".into(),
+    });
+    for (option, value) in &sqm.scalars {
+        edits.push(Edit::Set {
+            section: spec.sqm_section.clone(),
+            option: option.clone(),
+            value: value.clone(),
+        });
+    }
+    let bytes = super::uci_edits::render(&[], &edits).map_err(NativeSqmAttestationError::failed)?;
+    let root = input
+        .guard
+        .stop_context_directory()
+        .parent()
+        .ok_or_else(|| NativeSqmAttestationError::failed("frozen SQM runtime root missing"))?;
+    let alias =
+        FrozenSqmAlias::materialize(&bytes, root, &paths.uci).map_err(frozen_runner_error)?;
+    let native = alias
+        .section_show(&spec.sqm_section)
+        .map_err(NativeSqmAttestationError::failed)?;
+    if parse_uci_show(
+        &native,
+        "sqm",
+        &spec.sqm_section,
+        "queue",
+        UciListPolicy::Reject,
+    )? != sqm
+    {
+        return Err(NativeSqmAttestationError::failed(
+            "frozen SQM recipe changed during native parsing",
+        ));
+    }
+    let runner = profile.bind(&alias, root).map_err(frozen_runner_error)?;
+    let proof = || input.guard.attest();
+    attest_input()?;
+    if load_optional_runtime_identity(spec, paths)? != prior {
+        return Err(NativeSqmAttestationError::failed(
+            "frozen SQM runtime changed before recovery",
+        ));
+    }
+    if prior.is_some() {
+        runner
+            .stop(&spec.target_interface, proof, &should_cancel)
+            .map_err(frozen_runner_error)?;
+    }
+    remove_runtime_state_if_present(spec, paths, &sqm)?;
+    attest_input()?;
+    attest_managed_sqm_absent(&stop_spec_from_attestation(spec), paths)?;
+    runner
+        .start(&spec.target_interface, proof, &should_cancel)
+        .map_err(frozen_runner_error)?;
+    attest_runtime()
 }
 
 pub(crate) fn recover_managed_sqm<F>(
@@ -514,14 +938,92 @@ fn attest_managed_sqm_after_service_action_or_offline_with_paths(
     Ok(true)
 }
 
+// Retained only as a test oracle for the pre-R4 default-context refusal path.
+#[cfg(test)]
 fn stop_managed_sqm_after_service_action_with_paths(
     source: &ManagedSqmStopSpec,
     paths: &OpenWrtPaths,
 ) -> Result<(), NativeSqmAttestationError> {
     source.validate()?;
     let snapshot = freeze_stop_sqm_config(source, paths)?;
+    stop_managed_sqm_with_authority(source, paths, &snapshot)
+}
+
+/// Stop an exactly owned runtime under the caller's lifecycle lock. No original
+/// UCI view is reopened; the inspected SDK stop branch uses runtime state only.
+/// Success still requires exact kernel/state absence, not a helper exit code.
+pub(crate) fn stop_managed_sqm_from_committed(
+    source: &ManagedSqmStopSpec,
+    snapshot: &CommittedSnapshot,
+) -> Result<(), NativeSqmAttestationError> {
+    stop_managed_sqm_from_committed_with_paths(source, snapshot, &OpenWrtPaths::from_environment())
+}
+
+pub(crate) fn stop_managed_sqm_from_input(
+    source: &ManagedSqmStopSpec,
+    input: &super::controller_input::Loaded,
+) -> Result<(), NativeSqmAttestationError> {
+    stop_managed_sqm_from_input_with_paths(source, input, &OpenWrtPaths::from_environment())
+}
+fn stop_managed_sqm_from_input_with_paths(
+    source: &ManagedSqmStopSpec,
+    input: &super::controller_input::Loaded,
+    paths: &OpenWrtPaths,
+) -> Result<(), NativeSqmAttestationError> {
+    source.validate()?;
+    if input.guard.instance() != source.instance {
+        return Err(NativeSqmAttestationError::failed(
+            "frozen Stop instance mismatch",
+        ));
+    }
+    input
+        .guard
+        .attest_record()
+        .map_err(NativeSqmAttestationError::failed)?;
+    let authority = InputStopAuthority {
+        input,
+        sqm: input
+            .sqm_section(&source.sqm_section)
+            .map_err(NativeSqmAttestationError::failed)?,
+    };
+    stop_managed_sqm_with_authority(source, paths, &authority)
+}
+
+fn stop_managed_sqm_from_committed_with_paths(
+    source: &ManagedSqmStopSpec,
+    snapshot: &CommittedSnapshot,
+    paths: &OpenWrtPaths,
+) -> Result<(), NativeSqmAttestationError> {
+    source.validate()?;
+    snapshot
+        .attest()
+        .map_err(NativeSqmAttestationError::failed)?;
+    let authority = CommittedStopAuthority {
+        snapshot,
+        cake: if source.rate_policy.is_some() {
+            Some(
+                snapshot
+                    .section_show("cake-autorate", &source.instance)
+                    .map_err(NativeSqmAttestationError::failed)?,
+            )
+        } else {
+            None
+        },
+        sqm: snapshot
+            .section_show("sqm", &source.sqm_section)
+            .map_err(NativeSqmAttestationError::failed)?,
+    };
+    stop_managed_sqm_with_authority(source, paths, &authority)
+}
+
+fn stop_managed_sqm_with_authority(
+    source: &ManagedSqmStopSpec,
+    paths: &OpenWrtPaths,
+    authority: &impl StopConfigAuthority,
+) -> Result<(), NativeSqmAttestationError> {
+    authority.attest(source, paths)?;
     let sqm = parse_uci_show(
-        &snapshot.private_sqm,
+        authority.sqm_section(),
         "sqm",
         &source.sqm_section,
         "queue",
@@ -529,7 +1031,7 @@ fn stop_managed_sqm_after_service_action_with_paths(
     )?;
     if let Some(expected_policy) = &source.rate_policy {
         let cake = parse_uci_show(
-            snapshot.live_cake.as_deref().ok_or_else(|| {
+            authority.cake_section().ok_or_else(|| {
                 NativeSqmAttestationError::failed(
                     "managed SQM stop has no frozen controller section",
                 )
@@ -554,7 +1056,7 @@ fn stop_managed_sqm_after_service_action_with_paths(
     }
     let Some(attestation) = stop_attestation_spec(source, &sqm)? else {
         attest_managed_sqm_absent(source, paths)?;
-        validate_stop_configuration_unchanged(source, paths, &snapshot)?;
+        authority.attest(source, paths)?;
         return Ok(());
     };
     let prior_state = load_optional_runtime_identity(&attestation, paths)?;
@@ -570,50 +1072,50 @@ fn stop_managed_sqm_after_service_action_with_paths(
                     if attest_managed_sqm_kernel_absent(source, paths).is_err() {
                         return Err(runtime_error);
                     }
-                    validate_stop_configuration_unchanged(source, paths, &snapshot)?;
+                    authority.attest(source, paths)?;
                     remove_runtime_state_if_present(&attestation, paths, &sqm)?;
                     attest_managed_sqm_absent(source, paths)?;
-                    return validate_stop_configuration_unchanged(source, paths, &snapshot);
+                    return authority.attest(source, paths);
                 }
             } else {
                 match validate_offline_target_topology(&attestation, state, paths) {
                     Ok(true) => {}
                     Ok(false) => {
-                        validate_stop_configuration_unchanged(source, paths, &snapshot)?;
+                        authority.attest(source, paths)?;
                         remove_runtime_state_if_present(&attestation, paths, &sqm)?;
                         attest_managed_sqm_absent(source, paths)?;
-                        return validate_stop_configuration_unchanged(source, paths, &snapshot);
+                        return authority.attest(source, paths);
                     }
                     Err(runtime_error) => {
                         if attest_managed_sqm_kernel_absent(source, paths).is_err() {
                             return Err(runtime_error);
                         }
-                        validate_stop_configuration_unchanged(source, paths, &snapshot)?;
+                        authority.attest(source, paths)?;
                         remove_runtime_state_if_present(&attestation, paths, &sqm)?;
                         attest_managed_sqm_absent(source, paths)?;
-                        return validate_stop_configuration_unchanged(source, paths, &snapshot);
+                        return authority.attest(source, paths);
                     }
                 }
             }
         }
         None => {
             attest_managed_sqm_absent(source, paths)?;
-            validate_stop_configuration_unchanged(source, paths, &snapshot)?;
+            authority.attest(source, paths)?;
             return Ok(());
         }
     }
-    validate_stop_configuration_unchanged(source, paths, &snapshot)?;
+    authority.attest(source, paths)?;
 
     let _ = run_sqm_action(
         paths,
-        &snapshot.directory,
+        authority.runner_directory(),
         "stop",
         &source.target_interface,
         &|| false,
     )?;
     remove_runtime_state_if_present(&attestation, paths, &sqm)?;
     attest_managed_sqm_absent(source, paths)?;
-    validate_stop_configuration_unchanged(source, paths, &snapshot)
+    authority.attest(source, paths)
 }
 
 fn stop_spec_from_attestation(spec: &ManagedSqmAttestationSpec) -> ManagedSqmStopSpec {
@@ -1054,6 +1556,7 @@ fn freeze_sqm_config(
     Ok(snapshot)
 }
 
+#[cfg(test)]
 fn freeze_stop_sqm_config(
     spec: &ManagedSqmStopSpec,
     paths: &OpenWrtPaths,
@@ -1121,6 +1624,7 @@ fn freeze_stop_sqm_config(
     Ok(snapshot)
 }
 
+#[cfg(test)]
 fn validate_stop_configuration_unchanged(
     spec: &ManagedSqmStopSpec,
     paths: &OpenWrtPaths,
@@ -1143,7 +1647,7 @@ fn validate_stop_configuration_unchanged(
     Ok(())
 }
 
-fn attest_managed_sqm_absent(
+pub(crate) fn attest_managed_sqm_absent(
     spec: &ManagedSqmStopSpec,
     paths: &OpenWrtPaths,
 ) -> Result<(), NativeSqmAttestationError> {
@@ -1197,8 +1701,12 @@ fn validate_live_configuration(
     cake: &ParsedUciSection,
     sqm: &ParsedUciSection,
 ) -> Result<(), NativeSqmAttestationError> {
-    for key in ["enabled", "manage_sqm", "sqm_enabled"] {
-        if required_uci_value(cake, key)? != "1" {
+    // Match projection: management defaults on and SQM enablement inherits
+    // the controller's enabled state. Here the controller must be enabled,
+    // so the inherited SQM default is 1. Explicit/list-valued values remain
+    // authoritative; optional_uci_value rejects lists instead of defaulting.
+    for (key, default) in [("enabled", "0"), ("manage_sqm", "1"), ("sqm_enabled", "1")] {
+        if optional_uci_value(cake, key)?.unwrap_or(default) != "1" {
             return Err(NativeSqmAttestationError::failed(format!(
                 "managed SQM option {key} is disabled"
             )));
@@ -2642,7 +3150,7 @@ mod tests {
     fn cake_reflector_list_is_preserved_without_weakening_scalar_ownership() {
         let cake_source = b"cake-autorate.primary=cake_autorate\ncake-autorate.primary.enabled='1'\ncake-autorate.primary.manage_sqm='1'\ncake-autorate.primary.sqm_enabled='1'\ncake-autorate.primary.sqm_interface='eth1'\ncake-autorate.primary.ul_if='eth1'\ncake-autorate.primary.dl_if='ifb4eth1'\ncake-autorate.primary.sqm_section='cake_primary'\ncake-autorate.primary.sqm_direction_mode='both'\ncake-autorate.primary.reflector='1.1.1.1' '1.0.0.1' '8.8.8.8' '8.8.4.4' '9.9.9.9' '149.112.112.112'\n";
         let sqm_source = b"sqm.cake_primary=queue\nsqm.cake_primary._cake_autorate_managed='primary'\nsqm.cake_primary.enabled='1'\nsqm.cake_primary.interface='eth1'\n";
-        let cake = parse_uci_show(
+        let mut cake = parse_uci_show(
             cake_source,
             "cake-autorate",
             "primary",
@@ -2682,6 +3190,28 @@ mod tests {
             maximum_upload_kbps: 20_000,
         };
         validate_live_configuration(&spec, &cake, &sqm).unwrap();
+        // A minimal native candidate uses these same implicit defaults. It
+        // must not become unattestable only after successful publication.
+        cake.scalars.remove("manage_sqm");
+        cake.scalars.remove("sqm_enabled");
+        validate_live_configuration(&spec, &cake, &sqm).unwrap();
+        for key in ["enabled", "manage_sqm", "sqm_enabled"] {
+            let original = cake.scalars.get(key).cloned();
+            for invalid in ["0", "", "invalid"] {
+                cake.scalars.insert(key.into(), invalid.into());
+                assert!(validate_live_configuration(&spec, &cake, &sqm).is_err());
+            }
+            match original {
+                Some(value) => {
+                    cake.scalars.insert(key.into(), value);
+                }
+                None => {
+                    cake.scalars.remove(key);
+                }
+            }
+        }
+        cake.scalars.remove("enabled");
+        assert!(validate_live_configuration(&spec, &cake, &sqm).is_err());
     }
 
     #[test]
@@ -2709,6 +3239,8 @@ mod tests {
         };
         for (key, scalar) in [
             ("enabled", "'1'"),
+            ("manage_sqm", "'1'"),
+            ("sqm_enabled", "'1'"),
             ("sqm_interface", "'eth1'"),
             ("ul_if", "'eth1'"),
             ("dl_if", "'ifb4eth1'"),
@@ -2960,7 +3492,7 @@ mod tests {
         executable(
             &sqm_run,
             &format!(
-                "#!/bin/sh\n[ -r \"$UCI_CONFIG_DIR/sqm\" ] || exit 70\nprintf '%s\\n' \"$1 $2\" >> '{}'\ncase \"$1\" in\nstop) rm -f '{}'; exit 9 ;;\nstart) cp '{}' '{}'; chmod 644 '{}' ;;\n*) exit 64 ;;\nesac\n",
+                "#!/bin/sh\n[ \"$1\" != start ] || [ -r \"$UCI_CONFIG_DIR/${{FROZEN_SQM_ALIAS:-sqm}}\" ] || exit 70\nprintf '%s\\n' \"$1 $2\" >> '{}'\ncase \"$1\" in\nstop) rm -f '{}'; exit 9 ;;\nstart) cp '{}' '{}'; chmod 644 '{}' ;;\n*) exit 64 ;;\nesac\n",
                 sqm_run_log.display(),
                 state_root.join("eth0.state").display(),
                 state_template.display(),
@@ -3110,6 +3642,409 @@ mod tests {
             "start eth0\nstop eth0\nstop eth0\n"
         );
         assert!(!lock_root.join("interface-eth0.lock").exists());
+        // R4 ordinary Stop shares one committed source all the way through.
+        // Poison legacy UCI/config paths after capture: neither may be read.
+        fs::create_dir_all(paths.sys_class_net.join("eth0/statistics")).unwrap();
+        fs::create_dir_all(paths.sys_class_net.join("ifb4eth0/statistics")).unwrap();
+        fs::write(paths.sys_class_net.join("eth0/statistics/tx_bytes"), b"0\n").unwrap();
+        fs::write(
+            paths.sys_class_net.join("ifb4eth0/statistics/tx_bytes"),
+            b"0\n",
+        )
+        .unwrap();
+        fs::write(paths.sqm_state_root.join("eth0.state"), state_body).unwrap();
+        fs::set_permissions(
+            paths.sqm_state_root.join("eth0.state"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        fs::write(root.join("cake-autorate"), b"config cake_autorate 'wan'\n").unwrap();
+        let shows = [
+            uci_show(&paths, "cake-autorate", "wan", None).unwrap(),
+            uci_show(&paths, "sqm", "cake_wan", None).unwrap(),
+        ];
+        let mut index = 0;
+        let committed =
+            CommittedSnapshot::capture_fixture(&root, &root.join("committed-run"), |args| {
+                let alias = args.last().unwrap().to_str().unwrap();
+                let package = ["cake-autorate", "sqm"][index];
+                let text = String::from_utf8(shows[index].clone()).unwrap();
+                index += 1;
+                Ok(text
+                    .lines()
+                    .map(|line| format!("{alias}{}\n", line.strip_prefix(package).unwrap()))
+                    .collect::<String>()
+                    .into_bytes())
+            })
+            .unwrap();
+        let mut isolated_paths = paths.clone();
+        isolated_paths.uci = root.join("must-not-run-uci");
+        isolated_paths.sqm_config = root.join("foreign-pending-sqm");
+        fs::write(&isolated_paths.sqm_config, b"foreign pending bytes").unwrap();
+        let before_stop = fs::read(&sqm_run_log).unwrap();
+        let changed_state = String::from_utf8(state_body.to_vec())
+            .unwrap()
+            .replace("QDISC=\"cake\"", "QDISC=\"fq_codel\"");
+        fs::write(
+            paths.sqm_state_root.join("eth0.state"),
+            changed_state.as_bytes(),
+        )
+        .unwrap();
+        assert!(
+            stop_managed_sqm_from_committed_with_paths(&stop, &committed, &isolated_paths).is_err()
+        );
+        assert_eq!(fs::read(&sqm_run_log).unwrap(), before_stop);
+        assert_eq!(
+            fs::read(paths.sqm_state_root.join("eth0.state")).unwrap(),
+            changed_state.as_bytes()
+        );
+        fs::write(paths.sqm_state_root.join("eth0.state"), state_body).unwrap();
+        stop_managed_sqm_from_committed_with_paths(&stop, &committed, &isolated_paths).unwrap();
+        assert!(!paths.sqm_state_root.join("eth0.state").exists());
+        assert_eq!(
+            fs::read(&isolated_paths.sqm_config).unwrap(),
+            b"foreign pending bytes"
+        );
+        assert!(fs::read_to_string(&sqm_run_log)
+            .unwrap()
+            .ends_with("stop eth0\n"));
+        committed.attest().unwrap();
+        // Frozen Start/attestation must also work with both legacy paths
+        // poisoned, and must never restart a foreign or already-exact queue.
+        index = 0;
+        let prepared = committed
+            .prepare_fixture([&[], &[]], |args| {
+                let alias = args.last().unwrap().to_str().unwrap();
+                let package = ["cake-autorate", "sqm"][index];
+                let text = String::from_utf8(shows[index].clone()).unwrap();
+                index += 1;
+                Ok(text
+                    .lines()
+                    .map(|line| format!("{alias}{}\n", line.strip_prefix(package).unwrap()))
+                    .collect::<String>()
+                    .into_bytes())
+            })
+            .unwrap();
+        let published = super::super::uci_transaction::publish(prepared).unwrap();
+        let wrapper = root.join("frozen-runner");
+        let body = format!("#!/bin/sh\nconfig_load() {{ [ \"$1\" != sqm ] || exit 90; export FROZEN_SQM_ALIAS=\"$1\"; }}\n    config_load sqm\n'{}' \"$@\"\nexit 1\n", paths.sqm_run.display());
+        executable(&wrapper, &body);
+        let profile = || {
+            super::super::sqm_runner::Profile::fixture(
+                &wrapper,
+                &crate::config_candidate::digest(body.as_bytes()),
+            )
+            .unwrap()
+        };
+        assert!(!start_managed_sqm_from_published_with_paths(
+            &spec,
+            &published,
+            profile(),
+            &root.join("committed-run"),
+            &isolated_paths,
+            || false
+        )
+        .unwrap());
+        assert!(
+            !attest_managed_sqm_from_published_with_paths(&spec, &published, &isolated_paths)
+                .unwrap()
+        );
+        let after_start = fs::read(&sqm_run_log).unwrap();
+        assert!(!start_managed_sqm_from_published_with_paths(
+            &spec,
+            &published,
+            profile(),
+            &root.join("committed-run"),
+            &isolated_paths,
+            || false
+        )
+        .unwrap());
+        assert_eq!(fs::read(&sqm_run_log).unwrap(), after_start);
+        fs::write(
+            paths.sqm_state_root.join("eth0.state"),
+            changed_state.as_bytes(),
+        )
+        .unwrap();
+        assert!(start_managed_sqm_from_published_with_paths(
+            &spec,
+            &published,
+            profile(),
+            &root.join("committed-run"),
+            &isolated_paths,
+            || false
+        )
+        .is_err());
+        assert_eq!(fs::read(&sqm_run_log).unwrap(), after_start);
+        assert_eq!(
+            fs::read(paths.sqm_state_root.join("eth0.state")).unwrap(),
+            changed_state.as_bytes()
+        );
+        assert_eq!(
+            fs::read(&isolated_paths.sqm_config).unwrap(),
+            b"foreign pending bytes"
+        );
+        published.attest().unwrap();
+        let input_root = root.join(".controller-input");
+        let input =
+            super::super::controller_input::store(&published, "wan", &input_root, &root).unwrap();
+        let runtime_input =
+            super::super::controller_input::store(&published, "wan", &input_root, &root).unwrap();
+        runtime_input.mark_accepted(|_, _| Ok(())).unwrap(); // synthetic fixture runtime
+        let frozen = super::super::controller_input::load(
+            "wan",
+            runtime_input.generation(),
+            &input_root,
+            &root,
+        )
+        .unwrap();
+        #[cfg(feature = "calibration")]
+        let applied_fingerprint = super::super::sqm_identity::managed_sqm_identity_from_input(
+            &frozen, "wan", "cake_wan", "eth0",
+        )
+        .unwrap();
+        let later =
+            b"config cake_autorate 'wan'\n option min_dl_shaper_rate_kbps 'changed-user-value'\n";
+        fs::write(root.join("cake-autorate"), later).unwrap();
+        #[cfg(feature = "calibration")]
+        {
+            assert_eq!(
+                super::super::sqm_identity::managed_sqm_identity_from_input(
+                    &frozen, "wan", "cake_wan", "eth0"
+                )
+                .unwrap(),
+                applied_fingerprint
+            );
+            assert!(super::super::sqm_identity::managed_sqm_identity_from_input(
+                &frozen, "other", "cake_wan", "eth0"
+            )
+            .is_err());
+            assert!(super::super::sqm_identity::managed_sqm_identity_from_input(
+                &frozen, "wan", "cake_wan", "other0"
+            )
+            .is_err());
+        }
+        assert!(super::super::controller_input::load(
+            "wan",
+            input.generation(),
+            &input_root,
+            &root
+        )
+        .is_err());
+        let applied = super::super::controller_input::load_for_recovery(
+            "wan",
+            input.generation(),
+            &input_root,
+            &root,
+        )
+        .unwrap();
+        fs::write(paths.sqm_state_root.join("eth0.state"), state_body).unwrap();
+        stop_managed_sqm_from_input_with_paths(&stop, &applied, &isolated_paths).unwrap();
+        assert!(!paths.sqm_state_root.join("eth0.state").exists());
+        assert_eq!(fs::read(root.join("cake-autorate")).unwrap(), later);
+        drop(published);
+        // Applied controller recovery must ignore both later public commits
+        // and original-name savedir views. Only a random private alias may be
+        // queried, and native output must match the sealed owned recipe.
+        let alias_uci = root.join("alias-only-uci");
+        let frozen_show = root.join("frozen-sqm-show");
+        fs::write(&frozen_show, &frozen.sqm_show).unwrap();
+        executable(&alias_uci, &format!("#!/bin/sh\nfor last do :; done\ncase \"$last\" in cu??????????????????????????????) ;; *) exit 91;; esac\nsed \"s/^sqm\\./$last./\" '{}'\n", frozen_show.display()));
+        let frozen_paths = OpenWrtPaths {
+            uci: alias_uci,
+            ..isolated_paths.clone()
+        };
+        assert!(attest_managed_sqm_from_input_with_paths(&spec, &frozen, &frozen_paths).is_err());
+        recover_managed_sqm_from_input_with_paths(
+            &spec,
+            &frozen,
+            &frozen_paths,
+            || Ok(profile()),
+            || false,
+        )
+        .unwrap();
+        attest_managed_sqm_from_input_with_paths(&spec, &frozen, &frozen_paths).unwrap();
+        fs::write(frozen_paths.sys_class_net.join("eth0/ifindex"), b"7\n").unwrap();
+        fs::write(frozen_paths.sys_class_net.join("ifb4eth0/ifindex"), b"8\n").unwrap();
+        let pinned = PinnedSqm::capture_with_paths(&stop, &frozen, &frozen_paths).unwrap();
+        pinned.attest_with_paths(&frozen, &frozen_paths).unwrap();
+        let leased = super::super::service_lifecycle::with_test_global_lease(
+            &frozen_paths.lock_root,
+            |lease| {
+                assert!(matches!(
+                    PinnedSqm::capture_with_paths(&stop, &frozen, &frozen_paths),
+                    Err(NativeSqmAttestationError::Busy(_))
+                ));
+                let leased = PinnedSqm::capture_in(
+                    &stop,
+                    &frozen,
+                    &frozen_paths,
+                    pinned_runtime::Inspection::Lifecycle(lease),
+                )
+                .unwrap();
+                leased
+                    .attest_in(
+                        &frozen,
+                        &frozen_paths,
+                        pinned_runtime::Inspection::Lifecycle(lease),
+                    )
+                    .unwrap();
+                lease.attest_root(&frozen_paths.lock_root).unwrap();
+                let wrong = OpenWrtPaths {
+                    lock_root: root.join("wrong-lease-root"),
+                    ..frozen_paths.clone()
+                };
+                assert!(leased
+                    .attest_in(
+                        &frozen,
+                        &wrong,
+                        pinned_runtime::Inspection::Lifecycle(lease)
+                    )
+                    .is_err());
+                assert!(!wrong.lock_root.exists());
+                let recovery = root.join("pending-interface-recovery");
+                fs::write(&recovery, b"fixture").unwrap();
+                let record = frozen_paths.lock_root.join("interface-eth0.lock");
+                fs::write(&record, format!("version=1\npid={}\nproc_starttime=1\nrole=fixture\ntoken=fixture\nrecovery_journal={}\n", std::process::id(), recovery.display())).unwrap();
+                fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).unwrap();
+                assert!(matches!(
+                    leased.attest_in(
+                        &frozen,
+                        &frozen_paths,
+                        pinned_runtime::Inspection::Lifecycle(lease)
+                    ),
+                    Err(NativeSqmAttestationError::Busy(_))
+                ));
+                fs::remove_file(record).unwrap();
+                fs::remove_file(recovery).unwrap();
+                lease.attest_root(&frozen_paths.lock_root).unwrap();
+                leased
+            },
+        );
+        leased.attest_with_paths(&frozen, &frozen_paths).unwrap();
+        drop(leased);
+        let tc_before = fs::read_to_string(&frozen_paths.tc).unwrap();
+        let changed_rate = tc_before.replace("29137Kbit", "30137Kbit");
+        assert_ne!(changed_rate, tc_before);
+        executable(&frozen_paths.tc, &changed_rate);
+        pinned.attest_with_paths(&frozen, &frozen_paths).unwrap();
+        executable(&frozen_paths.tc, &changed_rate.replace("8002:", "9002:"));
+        attest_managed_sqm_from_input_with_paths(&spec, &frozen, &frozen_paths).unwrap();
+        assert!(pinned.attest_with_paths(&frozen, &frozen_paths).is_err());
+        executable(&frozen_paths.tc, &tc_before);
+        let filter_change = tc_before.replace("action order 1:", "action order 2:");
+        assert_ne!(filter_change, tc_before);
+        executable(&frozen_paths.tc, &filter_change);
+        attest_managed_sqm_from_input_with_paths(&spec, &frozen, &frozen_paths).unwrap();
+        assert!(pinned.attest_with_paths(&frozen, &frozen_paths).is_err());
+        executable(&frozen_paths.tc, &tc_before);
+        fs::write(frozen_paths.sys_class_net.join("ifb4eth0/ifindex"), b"9\n").unwrap();
+        assert!(pinned.attest_with_paths(&frozen, &frozen_paths).is_err());
+        fs::write(frozen_paths.sys_class_net.join("ifb4eth0/ifindex"), b"8\n").unwrap();
+        pinned.attest_with_paths(&frozen, &frozen_paths).unwrap();
+        let new_state = root.join("replacement-state");
+        fs::write(&new_state, state_body).unwrap();
+        fs::set_permissions(&new_state, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::rename(new_state, frozen_paths.sqm_state_root.join("eth0.state")).unwrap();
+        attest_managed_sqm_from_input_with_paths(&spec, &frozen, &frozen_paths).unwrap();
+        assert!(pinned.attest_with_paths(&frozen, &frozen_paths).is_err());
+        drop(pinned);
+        let held_link = root.join("held-offline-link");
+        fs::rename(frozen_paths.sys_class_net.join("eth0"), &held_link).unwrap();
+        let offline = PinnedSqm::capture_with_paths(&stop, &frozen, &frozen_paths).unwrap();
+        offline.attest_with_paths(&frozen, &frozen_paths).unwrap();
+        fs::rename(held_link, frozen_paths.sys_class_net.join("eth0")).unwrap();
+        assert!(offline.attest_with_paths(&frozen, &frozen_paths).is_err());
+        drop(offline);
+        let recovered_log = fs::read(&sqm_run_log).unwrap();
+        recover_managed_sqm_from_input_with_paths(
+            &spec,
+            &frozen,
+            &frozen_paths,
+            || panic!("healthy frozen runtime must not start helpers"),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&sqm_run_log).unwrap(), recovered_log);
+        assert_eq!(fs::read(root.join("cake-autorate")).unwrap(), later);
+        assert_eq!(
+            fs::read(&frozen_paths.sqm_config).unwrap(),
+            b"foreign pending bytes"
+        );
+        // Parent/native Apply exclusion is retained by the new frozen lane.
+        let global = open_guard(&lock_root.join("runtime.guard")).unwrap();
+        flock(&global, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        assert!(matches!(
+            attest_managed_sqm_from_input_with_paths(&spec, &frozen, &frozen_paths),
+            Err(NativeSqmAttestationError::Busy(_))
+        ));
+        assert!(matches!(
+            recover_managed_sqm_from_input_with_paths(
+                &spec,
+                &frozen,
+                &frozen_paths,
+                || panic!("busy must not invoke helper"),
+                || false
+            ),
+            Err(NativeSqmAttestationError::Busy(_))
+        ));
+        drop(global);
+        fs::remove_file(paths.sqm_state_root.join("eth0.state")).unwrap();
+        assert!(matches!(
+            recover_managed_sqm_from_input_with_paths(
+                &spec,
+                &frozen,
+                &frozen_paths,
+                || panic!("cancelled must not materialize"),
+                || true
+            ),
+            Err(NativeSqmAttestationError::Terminated)
+        ));
+        let changed_show = String::from_utf8(frozen.sqm_show.clone())
+            .unwrap()
+            .replace("download='20000'", "download='20001'");
+        assert_ne!(changed_show.as_bytes(), frozen.sqm_show);
+        fs::write(&frozen_show, changed_show).unwrap();
+        assert!(recover_managed_sqm_from_input_with_paths(
+            &spec,
+            &frozen,
+            &frozen_paths,
+            || Ok(profile()),
+            || false
+        )
+        .is_err());
+        assert_eq!(fs::read(&sqm_run_log).unwrap(), recovered_log);
+        assert!(!paths.sqm_state_root.join("eth0.state").exists());
+        fs::write(&frozen_show, &frozen.sqm_show).unwrap();
+        fs::write(
+            paths.sqm_state_root.join("eth0.state"),
+            changed_state.as_bytes(),
+        )
+        .unwrap();
+        assert!(recover_managed_sqm_from_input_with_paths(
+            &spec,
+            &frozen,
+            &frozen_paths,
+            || panic!("changed runtime owner must fail first"),
+            || false
+        )
+        .is_err());
+        assert_eq!(fs::read(&sqm_run_log).unwrap(), recovered_log);
+        let record = input_root.join(format!("wan.{}", runtime_input.generation()));
+        fs::write(&record, b"replaced record").unwrap();
+        #[cfg(feature = "calibration")]
+        assert!(super::super::sqm_identity::managed_sqm_identity_from_input(
+            &frozen, "wan", "cake_wan", "eth0"
+        )
+        .is_err());
+        assert!(attest_managed_sqm_from_input_with_paths(&spec, &frozen, &frozen_paths).is_err());
+        assert!(recover_managed_sqm_from_input_with_paths(
+            &spec,
+            &frozen,
+            &frozen_paths,
+            || panic!("changed record must fail first"),
+            || false
+        )
+        .is_err());
         assert!(lock_root.join("runtime.guard").is_file());
         assert!(lock_root.join("interface-eth0.lock.guard").is_file());
         assert_eq!(

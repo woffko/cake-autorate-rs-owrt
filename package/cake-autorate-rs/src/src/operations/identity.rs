@@ -1,10 +1,88 @@
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_PROC_ROOT: &str = "/proc";
 pub const DEFAULT_BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
 pub const DEFAULT_RANDOM_UUID_PATH: &str = "/proc/sys/kernel/random/uuid";
 pub const DEFAULT_UPTIME_PATH: &str = "/proc/uptime";
+
+/// Discovery is not ownership: a task can exit after its procfs file is opened.
+/// Only kernel absence is ignorable; permission and other I/O failures remain fatal.
+pub(super) fn read_process_cmdline(path: &Path, limit: u64) -> io::Result<Option<Vec<u8>>> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if proc_task_gone(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    read_process_cmdline_from(file, limit)
+}
+
+fn proc_task_gone(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
+fn read_process_cmdline_from(reader: impl Read, limit: u64) -> io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    match reader.take(limit).read_to_end(&mut bytes) {
+        Ok(_) => Ok(Some(bytes)),
+        Err(error) if proc_task_gone(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod proc_discovery_tests {
+    use super::*;
+
+    #[test]
+    fn r7_discovery_read_exit_race_is_absent_but_other_errors_fail_closed() {
+        struct FailedRead(i32);
+        impl Read for FailedRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::from_raw_os_error(self.0))
+            }
+        }
+        for errno in [libc::ESRCH, libc::ENOENT] {
+            assert_eq!(
+                read_process_cmdline_from(FailedRead(errno), 4097).unwrap(),
+                None
+            );
+        }
+        for errno in [libc::EACCES, libc::EPERM, libc::EIO] {
+            assert_eq!(
+                read_process_cmdline_from(FailedRead(errno), 4097)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(errno)
+            );
+        }
+        assert_eq!(
+            read_process_cmdline_from(&b"abcdef"[..], 4).unwrap(),
+            Some(b"abcd".to_vec())
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn r7_discovery_read_after_real_proc_task_exit() {
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "read value"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let file = fs::File::open(format!("/proc/{}/cmdline", child.id())).unwrap();
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        // Linux may expose EOF or ESRCH; neither denotes an extant controller.
+        assert!(read_process_cmdline_from(file, 4097)
+            .unwrap()
+            .is_none_or(|bytes| bytes.is_empty()));
+    }
+}
 
 extern "C" {
     fn getpid() -> i32;

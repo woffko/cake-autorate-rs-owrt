@@ -294,7 +294,7 @@ pub enum SchedulerDecision {
     Coalesced,
     Admit {
         due_unix_s: u64,
-        traffic_budget_bytes: u64,
+        traffic_budget: u64,
     },
 }
 
@@ -412,15 +412,15 @@ pub fn evaluate_schedule(
     if maximum_job_traffic_bytes > MAX_EXACT_BYTES || available_traffic_bytes > MAX_EXACT_BYTES {
         return Err("scheduler traffic budget exceeds the exact accounting range".to_string());
     }
-    let traffic_budget_bytes = maximum_job_traffic_bytes.min(available_traffic_bytes);
-    if traffic_budget_bytes == 0 {
+    let traffic_budget = maximum_job_traffic_bytes.min(available_traffic_bytes);
+    if traffic_budget == 0 {
         return Ok(SchedulerDecision::AwaitState(
             SchedulerBlock::BudgetExhausted,
         ));
     }
     Ok(SchedulerDecision::Admit {
         due_unix_s,
-        traffic_budget_bytes,
+        traffic_budget,
     })
 }
 
@@ -1272,7 +1272,7 @@ mod tests {
             evaluate_schedule(true, 3_600, 1_000, 800, &cursor, &ready_observation(2_000)).unwrap(),
             SchedulerDecision::Admit {
                 due_unix_s: 1_000,
-                traffic_budget_bytes: 800,
+                traffic_budget: 800,
             }
         );
     }
@@ -1510,6 +1510,65 @@ mod tests {
         assert_eq!(SchedulerInstanceState::decode(&v2).unwrap(), state);
         state.operator_warning = Some("bad\nwarning".to_string());
         assert!(state.encode().is_err());
+    }
+
+    #[test]
+    fn t2_exact_overrun_settlement_retains_all_bytes_and_blocks_new_reservations() {
+        for (daily_limit, monthly_limit) in [(1_000, 5_000), (5_000, 1_000)] {
+            let mut ledger = BudgetLedger::new(
+                "wan_sqm".to_string(),
+                "20260805".to_string(),
+                "202608".to_string(),
+                daily_limit,
+                monthly_limit,
+            )
+            .unwrap();
+            ledger
+                .reserve(
+                    "1".repeat(32),
+                    "2".repeat(32),
+                    "20260805",
+                    "202608",
+                    authority(1_000),
+                    1_000,
+                )
+                .unwrap();
+            ledger
+                .settle(
+                    &"1".repeat(32),
+                    &"2".repeat(32),
+                    "20260805",
+                    "202608",
+                    1_200,
+                )
+                .unwrap();
+            assert_eq!(ledger.daily_charged_bytes, 1_200);
+            assert_eq!(ledger.monthly_charged_bytes, 1_200);
+            assert_eq!(ledger.available_bytes().unwrap(), 0);
+            assert!(ledger.reservation.is_none());
+            let saved = ledger.encode().unwrap();
+            assert_eq!(BudgetLedger::decode(&saved).unwrap(), ledger);
+            assert!(ledger
+                .settle(
+                    &"1".repeat(32),
+                    &"2".repeat(32),
+                    "20260805",
+                    "202608",
+                    1_200
+                )
+                .is_err());
+            assert!(ledger
+                .reserve(
+                    "3".repeat(32),
+                    "4".repeat(32),
+                    "20260805",
+                    "202608",
+                    authority(2_000),
+                    1
+                )
+                .is_err());
+            assert_eq!(ledger.encode().unwrap(), saved);
+        }
     }
 
     #[test]

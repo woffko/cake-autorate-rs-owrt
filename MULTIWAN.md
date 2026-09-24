@@ -53,7 +53,42 @@ config cake_autorate 'wan_sqm'
   `mwan3_member`; or
 - `auto`: use structured mwan3 when a member is set, otherwise use `main`.
 
+The default-device label uses the lowest metric, not route dump order. Equal
+best metrics through different devices and unresolved multipath do not identify
+one default device. `/proc/net/route` entries must have a zero destination and
+zero mask; the lower half of a split default (`0.0.0.0/1`) is not a default entry.
+A VPN default on another device therefore does not authorize `main` probes on
+the selected WAN. More-specific routes and PBR still need their own route proof:
+a matching default label alone is not acceptance of those configurations. An
+explicit device/PBR mode is not implemented by this parser change.
+
+`main` now refuses nonstandard IPv4 policy rules and foreign split-default
+overrides before starting probes or calibration. It requires the standard
+local/main/default rules; it does not attempt to guess that a custom selector
+is irrelevant. Use a supported, explicit route authority for policy routing.
+Owned calibration traffic additionally has a postrouting egress guard: packets
+resolved to a different device are dropped and make accounting fail, rather
+than measuring that device. The guard permits only local loopback DNS as an
+exception; it does not attest the resolver daemon's upstream forwarding path.
+These checks do not implement a general device/PBR mode or IPv6-only support.
+
+For `mwan3`, route discovery requires an unambiguous pair of unconditional
+ingress-device/table and mark/table rules. Conflicting tables, marks or masks,
+negated/conditional selectors and invalid masks are rejected instead of taking
+the first match. Equivalent duplicate rules are accepted. Missing authority
+is an inspection error, not an online route inferred from the wrapper's mask.
+This pair check does not by itself prove that other policy rules cannot override
+traffic; it is not acceptance of arbitrary PBR configurations.
+
 Member and device names are validated as data, never evaluated by a shell.
+Automatic pinger argv is derived from the current admitted route snapshot.
+Offline/rechecking state and mismatched device/member/source or absent mwan3
+mark/table prevent startup. User-specified pins are preserved only when they
+agree with that identity; conflict is an error, not an instruction to choose
+another WAN. Native Apply and the wizard no longer persist generated pins.
+Old `ping_extra_args=-I ...` has no trustworthy provenance marker: review it
+after a route change rather than allowing automatic deletion of user flags.
+
 External helpers use a direct argv vector:
 
 ```text
@@ -99,17 +134,24 @@ Each instance has an uplink lifecycle independent of its controller state:
 | State | Meaning | Controller behavior |
 |---|---|---|
 | `ACTIVE` | Member is online and selected by the default mwan3 policy | Normal probing and autorate control |
-| `STANDBY` | Member is online but has a zero policy share | Keep isolated state, stop unnecessary active probing |
-| `OFFLINE` | Interface/member/route identity is unavailable or mismatched | Stop pingers and freeze adjustment without adding reflector offences |
-| `LEARNING` | Route recovered or changed and its baseline is being rebuilt | Probe the recovered path but block ceiling growth until stable |
+| `STANDBY` | Member is online but has a zero policy share | Forced probes remain admitted and isolated to this member; ordinary idle policy still applies |
+| `OFFLINE` | A successful inspection explicitly reports an offline or mismatched route | Stop pingers and freeze adjustment without adding reflector offences |
+| `RECHECKING` | Inspection failed or member state is transient/unknown | Revoke route admission while preserving the last learned identity |
+| `LEARNING` | Route recovered or changed and its baseline is being rebuilt | Wait for matching identity confirmation, then probe; baseline qualification still gates control |
 
 The daemon derives active/standby from the configured default mwan3 policy,
 not merely from the Linux main-table default route. This is important during
 policy failover: the physical primary route may still exist while mwan3 has
 already assigned 100% of traffic to the backup.
 
-Recovery waits for `route_stability_s`, resets only the affected uplink's
-learned state, and gathers new samples. The learning pinger is kept awake even
+There is no `route_stability_s` timer. A new identity needs two consecutive
+matching successful observations before route admission. Errors/transient
+member states revoke admission; they do not become OFFLINE by timeout or erase
+the last learned identity. Actual identity change or explicit offline evidence
+resets only the affected uplink. After confirmation the lifecycle counts
+`3 * max(no_pingers, 1)` accepted fresh replies before ACTIVE/STANDBY. The
+separate cold-baseline qualification still gates latency-based control.
+The learning pinger is kept awake even
 when the normal idle policy would otherwise stop it. Only after sufficient
 fresh evidence does the lifecycle return to `ACTIVE` or `STANDBY`.
 
@@ -121,13 +163,45 @@ These events invalidate stale learning:
 - fwmark or routing-table change; and
 - a different selected member.
 
-Transport endpoint baselines, loaded samples, detected quality, throughput
-references, and adaptive-ceiling safe/failed bounds are reset together for
-that instance. The last completed detected grade remains visible but is marked
+Transport endpoint baselines, loaded samples, detected quality, load-detector
+state, and adaptive-ceiling safe/failed bounds are reset together for that
+instance. Configured UCI capacity references are not rewritten by this reset.
+The last completed detected grade remains visible but is marked
 stale until that route learns and completes a new episode. Another uplink
 continues independently.
 
 ## SQM ownership and calibration isolation
+
+With `manage_sqm=0`, ordinary controller observation checks readable counters and
+one addressable root `cake`/`cake_mq` qdisc on each direction whose rate adjustment
+is enabled. It does not require another direction's external qdisc to disappear,
+nor infer ownership of traffic steering from an `ifb` name. The operator remains
+responsible for steering traffic through those explicitly selected queues.
+Missing control targets enter `WAITING_EXTERNAL_SQM`; the daemon does not start
+SQM, create/delete queues, or rewrite ingress to repair them. When they return,
+it resets its own measurements and resumes ordinary bandwidth control.
+
+Bandwidth changes inspect the current root type and nonzero handle and address
+that handle explicitly. This matters because a bare `tc qdisc change` can graft
+a different qdisc kind in the Linux API. Built-in handle-zero roots and CAKE
+leaves below another scheduler are not addressable control targets here.
+This extra observation is not proof that arbitrary ingress actions can be restored.
+
+Native operations still require their managed configuration/state authority;
+bootstrap Apply also verifies its generated IFB ingress against the stricter
+exclusive contract. `ctinfo`, policing, custom chains or multiple filter
+rules can be compatible with bandwidth-only control but remain unsupported for
+native topology mutation/restore unless fully modeled. The blocker explains this
+distinction instead of offering to delete those external actions.
+
+If the native runtime owner's record is unreadable or invalid, ordinary rate
+control remains held. Status exposes `runtime_control_degraded`,
+`runtime_control_error`, and `runtime_control_held`; Full and Lite show the error
+as a visible warning. A successful observation of a known active owner clears
+the error but keeps the hold. Only an exact Idle observation can release that
+operation hold, and any independent active override still blocks ordinary
+control. Repeated errors or elapsed time never authorize resetting a possibly
+foreign queue. Diagnose/recover the owning operation before resuming control.
 
 The init script rejects two enabled instances that resolve to the same managed
 CAKE device or SQM section. Each valid member receives its own CAKE root qdisc
@@ -245,6 +319,10 @@ exports arbitrary command prefixes.
 
 Structured routing and public-address validation currently use IPv4. IPv6
 mwan3 members may coexist in the router configuration, but IPv6-only autorate
-calibration is not yet a supported RC path. Load balancing can mark multiple
+calibration is not yet a supported RC path. When `main` finds an IPv6 address
+but no global IPv4 source, it reports `unsupported_family` with an IPv6-only
+capability explanation and keeps probes disabled. No IPv6 worker, counter,
+recovery or route-identity support is implied by this diagnosis.
+Load balancing can mark multiple
 members active; each instance still remains bound to its configured member and
 must own a distinct shaper.

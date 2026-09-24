@@ -32,7 +32,7 @@ const uciStub = {
 };
 const loadHelpers = new Function('fs', 'poll', 'uci', 'ui', 'L', 'E', '_', 'window',
 	`${prefix}\nreturn { parseHistory, historyInterval, buildChartGeometry, nearestPoint, ` +
-		'bindHover, bindScroll, scrollState, scrollMaximum, visibleTimeAxisLabels, formatMemoryKib, lineConnected, niceRateCeiling, ' +
+		'bindHover, bindScroll, scrollState, scrollMaximum, visibleTimeAxisLabels, formatMemoryKib, lineConnected, niceRateCeiling, drawTrafficChart, ' +
 		'collectChartEvents, clusterChartEvents, chartEventClusters, eventLabelPlacement, layoutEventLabels, ' +
 		'setHistoryEnabled, setHistoryInterval, setHistoryBudget };');
 const helpers = loadHelpers({}, {}, uciStub, {}, {}, () => {}, value => value, windowStub);
@@ -118,6 +118,35 @@ assert(points[0].adaptiveDlPhase === 'probe_observe' &&
 	'adaptive/recovery event columns failed');
 
 const legacy = helpers.parseHistory(`${now},9.5,4.0`);
+assert(points[0].trafficKind === 'instantaneous' && points[0].dlPeak === null,
+    'old traffic rows must not be relabeled as averages or synthesized peaks');
+const extended = Array(24).fill('');
+extended[0] = String(now);
+extended[3] = '100'; extended[4] = '50';
+const averaged = helpers.parseHistory(extended.concat(['avg-v1', '1000', '500', '10.25']).join(','))[0];
+assert(averaged.trafficKind === 'interval_average' && averaged.dl === 100 && averaged.ul === 50 &&
+    averaged.dlPeak === 1000 && averaged.ulPeak === 500 && averaged.observedSeconds === 10.25,
+    'new averages, sampled peaks and actual measurement duration must be distinct');
+for (const suffix of [['avg-v2', '1000', '500', '10'], ['avg-v1', '1000', '500', '0'], ['avg-v1', '1000', '500', 'NaN']]) {
+    const invalid = helpers.parseHistory(extended.concat(suffix).join(','))[0];
+    assert(invalid.dl === null && invalid.ul === null && invalid.dlPeak === null,
+        'unsupported or unobserved intervals must not manufacture plotted traffic');
+}
+assert(source.includes('Math.max(rateMax, point.dlPeak)') && source.includes('Math.max(rateMax, point.ulPeak)'),
+    'traffic axis must include sampled peaks');
+assert(source.includes("'dlPeak', rateY") && source.includes("'ulPeak', rateY"), 'both peaks must be drawn');
+assert(source.includes('previous.trafficKind === point.trafficKind'), 'do not join averages to legacy snapshots');
+const strokes = [];
+const context = new Proxy({
+    measureText: text => ({ width: String(text).length * 6 }),
+    stroke() { strokes.push(this.strokeStyle); }
+}, { get(target, key) { return key in target ? target[key] : () => {}; } });
+const peakCanvas = { style: {}, getContext: () => context };
+const peakGeometry = helpers.buildChartGeometry([averaged], 10, { clientWidth: 900 });
+assert(helpers.drawTrafficChart(peakCanvas, peakGeometry, false) === 1000,
+    'actual traffic drawing must scale for the 1000 kbps peak, not just the 100 kbps mean');
+assert(strokes.includes('#7fb3d5') && strokes.includes('#f5b041'),
+    'actual canvas drawing must issue both peak series');
 assert(legacy.length === 1 && legacy[0].dl === null && legacy[0].ul === null,
 	'legacy three-column compatibility failed');
 assert(helpers.historyInterval({ graph_history_interval_s: '1' }) === 1, '1 s interval failed');

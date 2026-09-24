@@ -198,6 +198,25 @@ pub fn managed_sqm_identity_fingerprint(
     sha256sum(&canonical)
 }
 
+/// Applied controllers identify their sealed SQM recipe, not a merged current
+/// UCI view. This stays distinct from request/coordinator configuration checks.
+pub(crate) fn managed_sqm_identity_from_input(
+    input: &super::controller_input::Loaded,
+    instance: &str,
+    section: &str,
+    target_interface: &str,
+) -> Result<String, String> {
+    if input.guard.instance() != instance {
+        return Err("frozen SQM fingerprint instance mismatch".into());
+    }
+    input.guard.attest()?;
+    let raw = input.sqm_section(section)?;
+    let canonical = validate_managed_sqm_identity(&raw, instance, section, target_interface)?;
+    let fingerprint = crate::config_candidate::digest(&canonical);
+    input.guard.attest()?;
+    Ok(fingerprint)
+}
+
 fn read_uci_section(section: &str) -> Result<Vec<u8>, String> {
     validate_uci_section(section)?;
     let query = format!("sqm.{section}");
@@ -771,6 +790,16 @@ fn parse_sha256sum(output: &[u8]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r4_frozen_fingerprint_hash_matches_the_existing_runtime_protocol() {
+        let raw = b"sqm.cake_wan=queue\nsqm.cake_wan.interface='eth0'\nsqm.cake_wan.enabled='1'\nsqm.cake_wan._cake_autorate_managed='wan'\n";
+        let canonical = validate_managed_sqm_identity(raw, "wan", "cake_wan", "eth0").unwrap();
+        assert_eq!(
+            crate::config_candidate::digest(&canonical),
+            sha256sum(&canonical).unwrap()
+        );
+    }
 
     #[test]
     fn canonical_uci_identity_matches_legacy_sorted_lines() {

@@ -476,6 +476,36 @@ pub(crate) struct NativeManagedConfigPlan {
 }
 
 impl NativeManagedConfigPlan {
+    /// Reconstruct historical fixtures without reintroducing the old writer.
+    #[cfg(test)]
+    pub(crate) fn with_legacy_managed_probe_defaults_for_test(mut self) -> Result<Self, String> {
+        let policy =
+            super::autotune_capture_policy::AutotuneCapturePolicyId::StandardV1.expand()?;
+        self.cake.scalar("transport_latency_enabled", "1")?;
+        self.cake.scalar("throughput_guard_enabled", "1")?;
+        self.cake
+            .scalar("transport_probe_backend", policy.transport_backend())?;
+        self.cake
+            .scalar("transport_probe_endpoint", policy.transport_endpoint())?;
+        self.cake.scalar(
+            "transport_probe_loaded_interval_s",
+            milliseconds_as_seconds(policy.transport_loaded_interval_ms()),
+        )?;
+        self.cake.scalar(
+            "transport_probe_timeout_s",
+            milliseconds_as_seconds(policy.transport_timeout_ms()),
+        )?;
+        self.cake.scalar(
+            "transport_load_hold_s",
+            milliseconds_as_seconds(policy.transport_load_hold_ms()),
+        )?;
+        self.cake.scalar(
+            "ping_extra_args",
+            format!("-I {}", self.managed_l3_interface),
+        )?;
+        Ok(self)
+    }
+
     pub(crate) fn from_bootstrap(input: BootstrapApplyInputs<'_>) -> Result<Self, String> {
         validate_bootstrap_input(&input)?;
         let verified = input.verified_apply;
@@ -868,6 +898,62 @@ fn validate_direction_proposal(label: &str, direction: DirectionProposal) -> Res
     Ok(())
 }
 
+fn project_route_authority(
+    cake: &mut NativeManagedUciSectionPlan,
+    request: &OperationRequest,
+) -> Result<(), String> {
+    match request.route.mode {
+        OperationRouteMode::Main => Ok(()),
+        OperationRouteMode::Mwan3 => cake.scalar(
+            "mwan3_member",
+            request
+                .route
+                .mwan3_member
+                .as_deref()
+                .ok_or("native bootstrap mwan3 route has no member")?,
+        ),
+        OperationRouteMode::Explicit => {
+            super::autotune_request::explicit_operation_authority(&request.route)?;
+            if let Some(server) = request.route.dns_server {
+                cake.scalar("route_dns_ipv4", server.to_string())?;
+            }
+            // Persist configured authority only. The link index is a live
+            // witness and must be observed again after restart, never pinned in UCI.
+            cake.scalar(
+                "route_source_ipv4",
+                request
+                    .route
+                    .source_ip
+                    .ok_or("explicit source missing")?
+                    .to_string(),
+            )?;
+            cake.scalar(
+                "route_table",
+                request
+                    .route
+                    .routing_table
+                    .ok_or("explicit table missing")?
+                    .to_string(),
+            )?;
+            cake.scalar(
+                "route_fwmark",
+                format!(
+                    "0x{:x}",
+                    request.route.fwmark.ok_or("explicit mark missing")?
+                ),
+            )?;
+            cake.scalar(
+                "route_fwmark_mask",
+                format!(
+                    "0x{:x}",
+                    request.route.fwmark_mask.ok_or("explicit mask missing")?
+                ),
+            )?;
+            Ok(())
+        }
+    }
+}
+
 fn project_disabled_cake_section(
     cake: &mut NativeManagedUciSectionPlan,
     request: &OperationRequest,
@@ -915,17 +1001,7 @@ fn project_disabled_cake_section(
     ] {
         cake.scalar(option, value)?;
     }
-    match request.route.mode {
-        OperationRouteMode::Main => {}
-        OperationRouteMode::Mwan3 => cake.scalar(
-            "mwan3_member",
-            request
-                .route
-                .mwan3_member
-                .as_deref()
-                .ok_or_else(|| "native bootstrap mwan3 route has no member".to_string())?,
-        )?,
-    }
+    project_route_authority(cake, request)?;
     match persist_policy.server {
         NativeBootstrapServerPersistence::LeaveAutomatic => {}
     }
@@ -943,7 +1019,8 @@ fn project_disabled_cake_section(
     cake.scalar("autotune_calibration_strategy", strategy.as_str())?;
     cake.scalar("pinger_method", probe.method.as_str())?;
     cake.scalar("no_pingers", probe.no_pingers.to_string())?;
-    cake.scalar("ping_extra_args", format!("-I {target}"))?;
+    // User arguments are not managed output. Runtime derives its automatic
+    // binding from the current route instead of persisting a stale device pin.
     cake.replace_list("reflector", probe.reflectors.clone())?;
     cake.scalar(
         "reflector_ping_interval_s",
@@ -1044,17 +1121,7 @@ fn project_cake_section(
     ] {
         cake.scalar(option, value)?;
     }
-    match request.route.mode {
-        OperationRouteMode::Main => {}
-        OperationRouteMode::Mwan3 => cake.scalar(
-            "mwan3_member",
-            request
-                .route
-                .mwan3_member
-                .as_deref()
-                .ok_or_else(|| "native bootstrap mwan3 route has no member".to_string())?,
-        )?,
-    }
+    project_route_authority(cake, request)?;
     match persist_policy.server {
         NativeBootstrapServerPersistence::LeaveAutomatic => {}
     }
@@ -1072,7 +1139,7 @@ fn project_cake_section(
     cake.scalar("autotune_calibration_strategy", strategy.as_str())?;
     cake.scalar("pinger_method", probe.method.as_str())?;
     cake.scalar("no_pingers", probe.no_pingers.to_string())?;
-    cake.scalar("ping_extra_args", format!("-I {target}"))?;
+    // Preserve user arguments; automatic device/source binding is runtime-only.
     cake.replace_list("reflector", probe.reflectors.clone())?;
     cake.scalar(
         "reflector_ping_interval_s",
@@ -1179,28 +1246,9 @@ fn project_cake_section(
         cake.scalar("service_ul_cap_kbps", cap.to_string())?;
     }
 
-    cake.scalar("transport_latency_enabled", "1")?;
-    cake.scalar(
-        "transport_probe_backend",
-        capture_policy.transport_backend(),
-    )?;
-    cake.scalar(
-        "transport_probe_endpoint",
-        capture_policy.transport_endpoint(),
-    )?;
-    cake.scalar(
-        "transport_probe_loaded_interval_s",
-        milliseconds_as_seconds(capture_policy.transport_loaded_interval_ms()),
-    )?;
-    cake.scalar(
-        "transport_probe_timeout_s",
-        milliseconds_as_seconds(capture_policy.transport_timeout_ms()),
-    )?;
-    cake.scalar(
-        "transport_load_hold_s",
-        milliseconds_as_seconds(capture_policy.transport_load_hold_ms()),
-    )?;
-    cake.scalar("throughput_guard_enabled", "1")?;
+    // Capture policy authorizes temporary test probes only. Do not turn those
+    // probes into permanent monitoring or replace the user's provider/timing.
+    // Missing options retain runtime defaults; existing options remain intact.
     cake.scalar(
         "throughput_guard_retention_percent",
         canonical_decimal(
@@ -1557,12 +1605,15 @@ mod tests {
             speedtest_server_id: Some(17_372),
             speedtest_topology: None,
             route: OperationRouteIdentity {
+                dns_server: None,
+                device_ifindex: None,
                 mode: route_mode,
                 mwan3_member: (route_mode == OperationRouteMode::Mwan3).then(|| "wanb".to_string()),
                 l3_device: target.to_string(),
                 source_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2))),
                 fwmark: (route_mode == OperationRouteMode::Mwan3).then_some(0x200),
                 routing_table: (route_mode == OperationRouteMode::Mwan3).then_some(200),
+                fwmark_mask: None,
             },
             target_state: OperationTargetState::AbsentBootstrap,
             capture_policy: Some(
@@ -1580,7 +1631,11 @@ mod tests {
             allow_sqm_disable: true,
             allow_active_traffic: false,
             scheduled_auto_apply_requested: false,
-            traffic_budget_bytes: 1_000_000_000,
+            traffic_budget: crate::operations::protocol::TrafficPolicy::Capped {
+                max_bytes: 1_000_000_000,
+            },
+            traffic_policy_explicit: false,
+            traffic_plan: None,
         }
     }
 
@@ -1814,13 +1869,45 @@ mod tests {
         for omitted in ["ilimit", "elimit", "itarget", "etarget"] {
             assert!(!plan.sqm().unwrap().options().contains_key(omitted));
         }
-        assert_eq!(plan.action_count(), 124);
+        assert_eq!(plan.action_count(), 116);
         assert!(plan.action_count() > 96);
         assert!(plan.action_count() <= MAX_NATIVE_BOOTSTRAP_CONFIG_ACTIONS);
+        assert!(!plan.cake.options.contains_key("ping_extra_args"));
+        // Restore only the historical generated pin and permanent probe
+        // defaults in a serializer fixture, never in production materialization.
+        let legacy = plan
+            .clone()
+            .with_legacy_managed_probe_defaults_for_test()
+            .unwrap();
         assert_eq!(
-            plan.canonical_sha256().unwrap(),
+            legacy.canonical_sha256().unwrap(),
             "78532dec5274f18e4c3380f18855d066585b0bfde7340e117c3ecf6fd826a0fa"
         );
+        assert_ne!(
+            plan.canonical_sha256().unwrap(),
+            legacy.canonical_sha256().unwrap()
+        );
+    }
+
+    #[test]
+    fn r7_bootstrap_does_not_promote_temporary_transport_policy_to_permanent_options() {
+        let request = request(
+            AutotuneProfile::BestOverall,
+            "pppoe-wan",
+            OperationRouteMode::Main,
+            None,
+            None,
+        );
+        let proposal = proposal(AutotuneProfile::BestOverall, None, None);
+        for topology in [Topology::Both, Topology::Off] {
+            let apply = apply_plan(&request, &proposal, topology);
+            let plan = build(&apply);
+            for &option in plan.cake().options().keys() {
+                assert!(!option.starts_with("transport_"), "{option}");
+                assert_ne!(option, "throughput_guard_enabled");
+                assert_ne!(option, "external_ip_check_enabled");
+            }
+        }
     }
 
     #[test]
@@ -1834,7 +1921,9 @@ mod tests {
         );
         let proposal = proposal(AutotuneProfile::BestOverall, None, None);
         let apply = apply_plan(&request, &proposal, Topology::Both);
-        let bytes = apply.canonical_manifest_bytes().unwrap();
+        let legacy = apply.clone().with_legacy_probe_defaults_for_test().unwrap();
+        assert!(legacy.validate_exact_invariants().is_err());
+        let bytes = legacy.canonical_manifest_bytes().unwrap();
 
         assert!(bytes.starts_with(b"{\"native_apply_manifest_schema_version\":4,"));
         assert_eq!(bytes.len(), 11_171);
@@ -2106,6 +2195,53 @@ mod tests {
     }
 
     #[test]
+    fn r6_explicit_projection_preserves_authority_for_shaped_and_disabled_configs() {
+        let mut request = request(
+            AutotuneProfile::BestOverall,
+            "pppoe-wan",
+            OperationRouteMode::Main,
+            None,
+            None,
+        );
+        request.route.mode = OperationRouteMode::Explicit;
+        request.route.device_ifindex = Some(42);
+        request.route.fwmark = Some(0x100);
+        request.route.fwmark_mask = Some(0x3f00);
+        request.route.routing_table = Some(101);
+        request.route.dns_server = Some("192.0.2.53".parse().unwrap());
+        let proposal = proposal(AutotuneProfile::BestOverall, None, None);
+        for topology in [Topology::Both, Topology::Off] {
+            let apply = apply_plan(&request, &proposal, topology);
+            let plan = build(&apply);
+            assert_eq!(scalar(plan.cake(), "route_mode"), "explicit");
+            assert_eq!(scalar(plan.cake(), "route_dns_ipv4"), "192.0.2.53");
+            let fields = [
+                "route_source_ipv4",
+                "route_table",
+                "route_fwmark",
+                "route_fwmark_mask",
+            ]
+            .map(|option| scalar(plan.cake(), option));
+            let restored = crate::routing::ExplicitRouteAuthority::from_fields("explicit", fields)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                restored,
+                super::super::autotune_request::explicit_operation_authority(&request.route)
+                    .unwrap()
+            );
+            assert!(plan.cake().scalar_value("mwan3_member").is_none());
+            assert!(plan.cake().scalar_value("device_ifindex").is_none());
+            assert!(plan.cake().scalar_value("route_ifindex").is_none());
+        }
+        let mut section =
+            NativeManagedUciSectionPlan::new(NativeManagedPackage::CakeAutorate, "wan").unwrap();
+        request.route.fwmark_mask = None;
+        assert!(project_route_authority(&mut section, &request).is_err());
+        assert!(section.options().is_empty());
+    }
+
+    #[test]
     fn route_profile_ifb_and_capture_policy_bindings_are_exact() {
         let route_request = request(
             AutotuneProfile::GamingExtreme,
@@ -2229,7 +2365,7 @@ mod tests {
             assert_eq!(scalar(plan.cake(), option), "pppoe-wan");
         }
         assert_eq!(scalar(plan.cake(), "dl_if"), "ifb4pppoe-wan");
-        assert_eq!(scalar(plan.cake(), "ping_extra_args"), "-I pppoe-wan");
+        assert!(!plan.cake().options().contains_key("ping_extra_args"));
         assert_eq!(scalar(plan.sqm().unwrap(), "interface"), "pppoe-wan");
         let canonical = String::from_utf8(plan.canonical_bytes().unwrap()).unwrap();
         assert!(canonical.contains("\"requested_target_interface\":\"wan\""));

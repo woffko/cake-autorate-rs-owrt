@@ -611,6 +611,33 @@ fn signal_group(identity: &ProcessIdentity, signal: i32) -> Result<(), String> {
     }
 }
 
+/// Read-only kernel proof; this never grants authority to signal a stale PGID.
+#[cfg(feature = "calibration")]
+pub fn process_group_retired(identity: &ProcessIdentity) -> Result<bool, String> {
+    let group = i32::try_from(identity.process_group)
+        .map_err(|_| "retirement process group is out of range".to_string())?;
+    if group <= 1 || identity.pid != identity.process_group {
+        return Err("retirement requires a dedicated process-group owner".to_string());
+    }
+    if ProcessIdentity::inspect_live(Path::new(super::identity::DEFAULT_PROC_ROOT), identity.pid)?
+        .is_some_and(|current| current.starttime_ticks == identity.starttime_ticks)
+    {
+        return Ok(false);
+    }
+    // SAFETY: scalar pid_t arguments, a checked PGID > 1 and signal exactly 0.
+    // No signal is delivered, including when the old PGID has been reused.
+    // Only ESRCH proves absence; EPERM/other failures remain errors.
+    if unsafe { kill(-group, 0) } == 0 {
+        return Ok(false);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(true)
+    } else {
+        Err(format!("unable to prove process-group retirement: {error}"))
+    }
+}
+
 fn validate_program(program: &Path) -> Result<(), String> {
     if !program.is_absolute()
         || program
@@ -706,6 +733,46 @@ mod tests {
         fs::set_permissions(&target, fs::Permissions::from_mode(0o720)).unwrap();
         assert!(spec.validate().is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "calibration")]
+    #[test]
+    fn t2_process_group_retirement_requires_last_member_exit_not_just_leader() {
+        let mut leader = Command::new("/bin/sleep")
+            .arg("3")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let identity = ProcessIdentity::inspect(Path::new("/proc"), leader.id()).unwrap();
+        let mut member = Command::new("/bin/sleep")
+            .arg("3")
+            .process_group(identity.process_group as i32)
+            .spawn()
+            .unwrap();
+        assert!(!process_group_retired(&identity).unwrap());
+        let reused = ProcessIdentity {
+            starttime_ticks: identity.starttime_ticks + 1,
+            ..identity.clone()
+        };
+        assert!(!process_group_retired(&reused).unwrap());
+        leader.kill().unwrap();
+        leader.wait().unwrap();
+        assert!(!identity.still_matches(Path::new("/proc")).unwrap());
+        assert!(
+            !process_group_retired(&identity).unwrap(),
+            "surviving member keeps the fence"
+        );
+        member.kill().unwrap();
+        member.wait().unwrap();
+        assert!(process_group_retired(&identity).unwrap());
+        for group in [0, 1, u32::MAX] {
+            let invalid = ProcessIdentity {
+                pid: group,
+                process_group: group,
+                starttime_ticks: 1,
+            };
+            assert!(process_group_retired(&invalid).is_err());
+        }
     }
 
     #[cfg(feature = "calibration")]

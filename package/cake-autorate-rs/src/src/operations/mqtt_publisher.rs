@@ -35,7 +35,7 @@ const MAX_RESOLVED_ADDRESSES: usize = 8;
 const MAX_LOG_READ_BYTES: usize = 1024 * 1024;
 const MAX_PARTIAL_LINE_BYTES: usize = 64 * 1024;
 const PLAN_MAGIC: &[u8] = b"cake-autorate-mqtt-plan\0\x01";
-const PRODUCTION_PLAN_ROOT: &str = "/var/run/cake-autorate-mqtt";
+pub(crate) const PRODUCTION_PLAN_ROOT: &str = "/var/run/cake-autorate-mqtt";
 static PLAN_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -283,6 +283,7 @@ where
     let keepalive =
         MonotonicTimer::periodic(Duration::from_secs(u64::from(MQTT_KEEPALIVE_SECONDS) / 2))?;
     let cpu_cores = cpu_core_count()?;
+    start_notify::notify(&config);
     let mut client = MqttClient::connect(&config)?;
     for message in discovery_messages(&config, cpu_cores)? {
         client.publish(&message.topic, message.payload.as_bytes(), message.retain)?;
@@ -318,7 +319,7 @@ where
             libc::poll(
                 descriptors.as_mut_ptr(),
                 descriptors.len() as libc::nfds_t,
-                -1,
+                if follower.needs_drain { 0 } else { -1 },
             )
         };
         if result < 0 {
@@ -344,8 +345,10 @@ where
             keepalive.drain()?;
             client.ping()?;
         }
-        if descriptors[1].revents & libc::POLLIN != 0 {
-            changes.drain()?;
+        if descriptors[1].revents & libc::POLLIN != 0 || follower.needs_drain {
+            if descriptors[1].revents & libc::POLLIN != 0 {
+                changes.drain()?;
+            }
             let (lines, reopened) = follower.read_available()?;
             if reopened {
                 changes.watch_file(follower.path())?;
@@ -363,10 +366,7 @@ where
     }
 }
 
-pub(crate) fn publish_service_plans(
-    package: &UciPackage,
-    root: &Path,
-) -> Result<Vec<String>, String> {
+pub(crate) fn service_configs(package: &UciPackage) -> Result<Vec<MqttPublisherConfig>, String> {
     let mut configs = Vec::new();
     for (name, section) in &package.sections {
         if section.section_type != "cake_autorate" {
@@ -382,6 +382,40 @@ pub(crate) fn publish_service_plans(
         }
         configs.push(config);
     }
+    Ok(configs)
+}
+
+/// Read-only admission for an unchanged ordinary Start. Never replace files
+/// held by live publishers merely to rediscover their expected instance set.
+pub(crate) fn attest_service_plans(
+    package: &UciPackage,
+    root: &Path,
+) -> Result<Vec<String>, String> {
+    let configs = service_configs(package)?;
+    match fs::symlink_metadata(root) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound && configs.is_empty() => {
+            return Ok(Vec::new());
+        }
+        _ => {}
+    }
+    let _directory = open_plan_root(root)?;
+    let count = validate_plan_root_entries(root)?;
+    if count != configs.len() {
+        return Err("MQTT service plan membership changed; restart required".into());
+    }
+    for config in &configs {
+        if read_service_plan(root, &config.instance)?.encode_plan()? != config.encode_plan()? {
+            return Err("MQTT service plan changed; restart required".into());
+        }
+    }
+    Ok(configs.into_iter().map(|config| config.instance).collect())
+}
+
+pub(crate) fn publish_service_plans(
+    package: &UciPackage,
+    root: &Path,
+) -> Result<Vec<String>, String> {
+    let configs = service_configs(package)?;
     let plans = configs
         .iter()
         .map(|config| {
@@ -407,6 +441,36 @@ pub(crate) fn publish_production_service_plans(
 pub(crate) fn cleanup_production_service_plans() -> Result<(), String> {
     cleanup_plan_root(Path::new(PRODUCTION_PLAN_ROOT))
 }
+
+pub(crate) fn require_no_selected_recovery(root: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(root) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        _ => {}
+    }
+    open_plan_root(root)?;
+    for (index, entry) in fs::read_dir(root)
+        .map_err(|_| "MQTT recovery enumeration failed")?
+        .enumerate()
+    {
+        if index > MAX_INSTANCES {
+            return Err("MQTT recovery directory exceeds its bound".into());
+        }
+        let entry = entry.map_err(|_| "MQTT recovery entry inspection failed")?;
+        if entry
+            .file_name()
+            .as_encoded_bytes()
+            .starts_with(b".selected_")
+        {
+            return Err("selected MQTT recovery must finish before global service mutation".into());
+        }
+    }
+    Ok(())
+}
+
+#[path = "mqtt_selected_plan.rs"]
+pub(crate) mod selected_plan;
+#[path = "mqtt_start_notify.rs"]
+pub(crate) mod start_notify;
 
 fn push_plan_text(bytes: &mut Vec<u8>, value: &str) -> Result<(), String> {
     let length = u32::try_from(value.len()).map_err(|_| "MQTT plan field is too large")?;
@@ -555,6 +619,7 @@ fn write_plan_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn publish_plan_files(root: &Path, plans: &[(String, Vec<u8>)]) -> Result<(), String> {
+    require_no_selected_recovery(root)?;
     let directory = ensure_plan_root(root)?;
     cleanup_abandoned_plan_files(root)?;
     validate_plan_root_entries(root)?;
@@ -635,7 +700,8 @@ fn cleanup_abandoned_plan_files(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_plan_root_entries(root: &Path) -> Result<(), String> {
+fn validate_plan_root_entries(root: &Path) -> Result<usize, String> {
+    let mut count = 0;
     for entry in fs::read_dir(root)
         .map_err(|error| format!("unable to enumerate MQTT plan directory: {error}"))?
     {
@@ -651,8 +717,12 @@ fn validate_plan_root_entries(root: &Path) -> Result<(), String> {
         }
         inspect_plan_file(&entry.path())?
             .ok_or_else(|| "MQTT plan entry disappeared during validation".to_string())?;
+        count += 1;
+        if count > MAX_INSTANCES {
+            return Err("too many MQTT service plan files".into());
+        }
     }
-    Ok(())
+    Ok(count)
 }
 
 fn cleanup_stale_plan_files(root: &Path, expected: &BTreeSet<String>) -> Result<(), String> {
@@ -680,6 +750,7 @@ fn cleanup_stale_plan_files(root: &Path, expected: &BTreeSet<String>) -> Result<
 }
 
 fn cleanup_plan_root(root: &Path) -> Result<(), String> {
+    require_no_selected_recovery(root)?;
     match fs::symlink_metadata(root) {
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -697,6 +768,10 @@ fn cleanup_plan_root(root: &Path) -> Result<(), String> {
 fn read_service_plan(root: &Path, instance: &str) -> Result<MqttPublisherConfig, String> {
     open_plan_root(root)?;
     let path = plan_path(root, instance)?;
+    read_plan_file(&path, instance)
+}
+
+fn read_plan_file(path: &Path, instance: &str) -> Result<MqttPublisherConfig, String> {
     inspect_plan_file(&path)?.ok_or_else(|| format!("MQTT plan for {instance} is missing"))?;
     let mut file = OpenOptions::new()
         .read(true)
@@ -1591,6 +1666,7 @@ struct LogFollower {
     inode: u64,
     offset: u64,
     partial: Vec<u8>,
+    needs_drain: bool,
 }
 
 impl LogFollower {
@@ -1630,6 +1706,7 @@ impl LogFollower {
             inode: metadata.ino(),
             offset,
             partial: Vec::new(),
+            needs_drain: false,
         })
     }
 
@@ -1638,19 +1715,63 @@ impl LogFollower {
     }
 
     fn read_available(&mut self) -> Result<(Vec<String>, bool), String> {
-        let reopened = self.refresh_identity()?;
+        let current = match fs::symlink_metadata(&self.path) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(format!("unable to inspect MQTT log: {error}")),
+        };
+        if current.as_ref().is_some_and(|metadata| {
+            !metadata.file_type().is_file()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.nlink() != 1
+        }) {
+            return Err("MQTT log path is not an owned single-link regular file".to_string());
+        }
+        let replaced = current
+            .as_ref()
+            .is_some_and(|metadata| metadata.dev() != self.device || metadata.ino() != self.inode);
+        if !replaced
+            && current
+                .as_ref()
+                .is_some_and(|metadata| metadata.len() < self.offset)
+        {
+            self.file
+                .seek(SeekFrom::Start(0))
+                .map_err(|error| format!("unable to follow truncated MQTT log: {error}"))?;
+            self.offset = 0;
+            self.partial.clear();
+        }
+        // Drain the still-owned old descriptor before switching paths. The
+        // writer flushes complete records before rename. A bounded backlog is
+        // continued on the next event-loop turn, with signal/broker checks.
+        let (mut lines, read) = self.read_chunk(MAX_LOG_READ_BYTES)?;
+        if !replaced || self.needs_drain {
+            return Ok((lines, false));
+        }
+        let (file, metadata) = open_log_file(&self.path)?;
+        self.file = file;
+        self.device = metadata.dev();
+        self.inode = metadata.ino();
+        self.offset = 0;
+        self.partial.clear();
+        let (new_lines, _) = self.read_chunk(MAX_LOG_READ_BYTES - read)?;
+        lines.extend(new_lines);
+        Ok((lines, true))
+    }
+
+    fn read_chunk(&mut self, maximum: usize) -> Result<(Vec<String>, usize), String> {
+        if maximum == 0 {
+            self.needs_drain = true;
+            return Ok((Vec::new(), 0));
+        }
         let mut chunk = Vec::new();
         Read::by_ref(&mut self.file)
-            .take((MAX_LOG_READ_BYTES + 1) as u64)
+            .take(maximum as u64)
             .read_to_end(&mut chunk)
             .map_err(|error| format!("unable to read MQTT log: {error}"))?;
-        if chunk.len() > MAX_LOG_READ_BYTES {
-            return Err("MQTT log event exceeds its bounded read limit".to_string());
-        }
+        let read = chunk.len();
+        self.needs_drain = read == maximum;
         self.offset = self.offset.saturating_add(chunk.len() as u64);
-        if self.partial.len().saturating_add(chunk.len()) > MAX_PARTIAL_LINE_BYTES {
-            return Err("MQTT log contains an oversized unterminated record".to_string());
-        }
         self.partial.extend_from_slice(&chunk);
         let mut lines = Vec::new();
         let mut consumed = 0usize;
@@ -1659,6 +1780,9 @@ impl LogFollower {
             .position(|byte| *byte == b'\n')
         {
             let end = consumed + relative;
+            if end - consumed > MAX_PARTIAL_LINE_BYTES {
+                return Err("MQTT log contains an oversized record".to_string());
+            }
             let raw = self.partial[consumed..end]
                 .strip_suffix(b"\r")
                 .unwrap_or(&self.partial[consumed..end]);
@@ -1670,35 +1794,10 @@ impl LogFollower {
         if consumed > 0 {
             self.partial.drain(..consumed);
         }
-        Ok((lines, reopened))
-    }
-
-    fn refresh_identity(&mut self) -> Result<bool, String> {
-        let metadata = match fs::symlink_metadata(&self.path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(format!("unable to inspect MQTT log: {error}")),
-        };
-        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-            return Err("MQTT log path is not a regular file".to_string());
+        if self.partial.len() > MAX_PARTIAL_LINE_BYTES {
+            return Err("MQTT log contains an oversized unterminated record".to_string());
         }
-        if metadata.dev() != self.device || metadata.ino() != self.inode {
-            let (file, metadata) = open_log_file(&self.path)?;
-            self.file = file;
-            self.device = metadata.dev();
-            self.inode = metadata.ino();
-            self.offset = 0;
-            self.partial.clear();
-            return Ok(true);
-        }
-        if metadata.len() < self.offset {
-            self.file
-                .seek(SeekFrom::Start(0))
-                .map_err(|error| format!("unable to follow truncated MQTT log: {error}"))?;
-            self.offset = 0;
-            self.partial.clear();
-        }
-        Ok(false)
+        Ok((lines, read))
     }
 }
 
@@ -1751,7 +1850,7 @@ fn cpu_core_count() -> Result<usize, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::net::TcpListener;
@@ -1760,7 +1859,7 @@ mod tests {
 
     static NEXT_FIXTURE: AtomicU32 = AtomicU32::new(1);
 
-    fn temp_root(label: &str) -> PathBuf {
+    pub(crate) fn temp_root(label: &str) -> PathBuf {
         let id = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
         let path =
             std::env::temp_dir().join(format!("cake-mqtt-{label}-{}-{id}", std::process::id()));
@@ -1769,7 +1868,7 @@ mod tests {
         path
     }
 
-    fn section(extra: &[(&str, &str)]) -> UciSection {
+    pub(crate) fn section(extra: &[(&str, &str)]) -> UciSection {
         let mut options = BTreeMap::from([
             ("enabled".to_string(), "1".to_string()),
             ("mqtt_enabled".to_string(), "1".to_string()),
@@ -1829,6 +1928,48 @@ mod tests {
         assert!(publish_service_plans(&package, &root).is_err());
         assert!(read_service_plan(&root, "wan_b").is_ok());
         cleanup_plan_root(&root).unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn r4_unchanged_service_plans_are_read_only_and_reject_changed_membership() {
+        let root = temp_root("plans-unchanged");
+        let mut package = UciPackage::default();
+        package.sections.insert("wan".into(), section(&[]));
+        publish_service_plans(&package, &root).unwrap();
+        let path = root.join("wan.plan");
+        let before = fs::metadata(&path).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        for _ in 0..2 {
+            assert_eq!(attest_service_plans(&package, &root).unwrap(), ["wan"]);
+            let after = fs::metadata(&path).unwrap();
+            assert_eq!(
+                (
+                    before.dev(),
+                    before.ino(),
+                    before.mtime(),
+                    before.mtime_nsec()
+                ),
+                (after.dev(), after.ino(), after.mtime(), after.mtime_nsec())
+            );
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+        package
+            .sections
+            .get_mut("wan")
+            .unwrap()
+            .options
+            .insert("mqtt_password".into(), "different fixture value".into());
+        assert!(attest_service_plans(&package, &root).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(attest_service_plans(&UciPackage::default(), &root).is_err());
+        fs::write(root.join("unknown"), b"preserve").unwrap();
+        assert!(attest_service_plans(&package, &root).is_err());
+        assert_eq!(fs::read(root.join("unknown")).unwrap(), b"preserve");
+        fs::remove_dir_all(&root).unwrap();
+        assert!(attest_service_plans(&UciPackage::default(), &root)
+            .unwrap()
+            .is_empty());
         assert!(!root.exists());
     }
 
@@ -2015,6 +2156,63 @@ mod tests {
         let (lines, reopened) = follower.read_available().unwrap();
         assert!(reopened);
         assert_eq!(lines, ["CPU; replacement"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn log_follower_preserves_unread_rotation_tail_before_new_generation() {
+        let root = temp_root("unread-tail");
+        let path = root.join("cake-autorate.wan.log");
+        fs::write(&path, b"").unwrap();
+        let mut follower = LogFollower::open(path.clone()).unwrap();
+        fs::write(&path, b"SUMMARY; unread\n").unwrap();
+        fs::rename(&path, root.join("cake-autorate.wan.log.old")).unwrap();
+        fs::write(&path, b"CPU; replacement\n").unwrap();
+        assert_eq!(
+            follower.read_available().unwrap(),
+            (
+                vec![
+                    "SUMMARY; unread".to_string(),
+                    "CPU; replacement".to_string()
+                ],
+                true
+            )
+        );
+        assert_eq!(follower.read_available().unwrap(), (Vec::new(), false));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn log_follower_drains_complete_records_larger_than_partial_line_bound() {
+        let root = temp_root("many-lines");
+        let path = root.join("cake-autorate.wan.log");
+        fs::write(&path, b"").unwrap();
+        let mut follower = LogFollower::open(path.clone()).unwrap();
+        fs::write(&path, "CPU; sample\n".repeat(10000)).unwrap();
+        let (lines, reopened) = follower.read_available().unwrap();
+        assert_eq!(lines.len(), 10000);
+        assert!(!reopened);
+        assert!(!follower.needs_drain);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn log_follower_continues_bounded_backlog_across_rotation_without_new_event() {
+        let root = temp_root("bounded-tail");
+        let path = root.join("cake-autorate.wan.log");
+        fs::write(&path, b"").unwrap();
+        let mut follower = LogFollower::open(path.clone()).unwrap();
+        fs::write(&path, "CPU; old\n".repeat(150000)).unwrap();
+        fs::rename(&path, root.join("cake-autorate.wan.log.old")).unwrap();
+        fs::write(&path, b"CPU; new\n").unwrap();
+        let (first, reopened) = follower.read_available().unwrap();
+        assert!(!reopened);
+        assert!(follower.needs_drain);
+        let (second, reopened) = follower.read_available().unwrap();
+        assert!(reopened);
+        assert!(!follower.needs_drain);
+        assert_eq!(first.len() + second.len(), 150001);
+        assert_eq!(second.last().map(String::as_str), Some("CPU; new"));
         fs::remove_dir_all(root).unwrap();
     }
 

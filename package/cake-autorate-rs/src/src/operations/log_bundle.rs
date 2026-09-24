@@ -661,7 +661,9 @@ fn log_paths(
         let name = entry.file_name();
         let bytes = name.as_bytes();
         if bytes == basename.as_bytes()
-            || (bytes.starts_with(basename.as_bytes()) && bytes.get(basename.len()) == Some(&b'.'))
+            || name == std::ffi::OsStr::new(&format!("{basename}.old"))
+            || name == std::ffi::OsStr::new(&format!("{basename}.old.gz"))
+            || crate::logging::legacy_archive_name(&name, std::ffi::OsStr::new(&basename))
         {
             if paths.len() >= MAX_LOG_FILES_PER_INSTANCE {
                 return Err("too-many-log-rotations".to_string());
@@ -1227,9 +1229,47 @@ mod tests {
             "#!/bin/sh\ncase \"$*\" in\n'-q -X show cake-autorate') printf 'cake-autorate.wan=cake_autorate\\n' ;;\n*log_file_path_override) exit 1 ;;\n*mwan3_member) exit 1 ;;\n*) exit 1 ;;\nesac\n",
         );
         fs::create_dir(fixture.environment.run_root.join("wan")).unwrap();
+        let private_candidates = fixture.environment.run_root.join(".candidate-checks");
+        fs::create_dir(&private_candidates).unwrap();
+        fs::write(
+            private_candidates.join("0123456789abcdef0123456789abcdef.candidate"),
+            "private candidate marker must never be exported\n",
+        )
+        .unwrap();
+        let private_inputs = fixture.environment.run_root.join(".controller-input");
+        fs::create_dir(&private_inputs).unwrap();
+        fs::write(
+            private_inputs.join(format!("wan.{}", "a".repeat(64))),
+            "private controller input marker must never be exported\n",
+        )
+        .unwrap();
         fs::write(
             fixture.environment.run_root.join("wan/status.json"),
             "{\"password\":\"runtime-secret\",\"ok\":true}\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture
+                .environment
+                .default_log_root
+                .join("cake-autorate.wan.log.old"),
+            "INFO previous generation\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture
+                .environment
+                .default_log_root
+                .join("cake-autorate.wan.log.lock"),
+            "reserved lock marker must not be exported\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture
+                .environment
+                .default_log_root
+                .join("cake-autorate.wan.log.tmp"),
+            "reserved staging marker must not be exported\n",
         )
         .unwrap();
         fs::write(
@@ -1246,6 +1286,11 @@ mod tests {
         assert!(!first.contains("runtime-secret"));
         assert!(!first.contains("log-secret"));
         assert!(first.contains("INFO healthy"));
+        assert!(first.contains("INFO previous generation"));
+        assert!(!first.contains("reserved lock marker"));
+        assert!(!first.contains("reserved staging marker"));
+        assert!(!first.contains("private candidate marker"));
+        assert!(!first.contains("private controller input marker"));
         assert!(first.contains("source outcome=skipped"));
     }
 }

@@ -165,8 +165,34 @@ impl TransportLatencyTracker {
         )
     }
 
+    #[cfg(test)]
     pub fn snapshot(&self, now: Instant, enabled: bool) -> TransportSnapshot {
-        let delta_ms = self.confirmed_delta_ms();
+        self.snapshot_with_max_age(now, enabled, Duration::MAX)
+    }
+
+    pub fn snapshot_with_max_age(
+        &self,
+        now: Instant,
+        enabled: bool,
+        max_age: Duration,
+    ) -> TransportSnapshot {
+        // Status and control must use the same fresh window, even when no
+        // new ICMP or transport result arrives to prune the stored samples.
+        let loaded: Vec<_> = self
+            .loaded_deltas
+            .iter()
+            .filter(|(at, _)| now.saturating_duration_since(*at) <= max_age)
+            .map(|(_, delta)| *delta)
+            .collect();
+        let sample_age_s = self
+            .last_success_at
+            .map(|at| now.saturating_duration_since(at).as_secs_f64());
+        let stale = sample_age_s.is_some_and(|age| age > max_age.as_secs_f64());
+        let delta_ms = if enabled && !stale && loaded.len() >= MIN_LOADED_SAMPLES {
+            percentile(&loaded, 90.0)
+        } else {
+            None
+        };
         let baseline_count = self
             .last_endpoint
             .as_ref()
@@ -176,15 +202,23 @@ impl TransportLatencyTracker {
         let baseline_progress =
             (baseline_count.min(MIN_IDLE_SAMPLES) * 50 / MIN_IDLE_SAMPLES) as u8;
         let loaded_progress =
-            (self.loaded_deltas.len().min(MIN_LOADED_SAMPLES) * 50 / MIN_LOADED_SAMPLES) as u8;
-        let confidence = baseline_progress.saturating_add(loaded_progress);
+            (loaded.len().min(MIN_LOADED_SAMPLES) * 50 / MIN_LOADED_SAMPLES) as u8;
+        let confidence = if enabled && !stale {
+            baseline_progress.saturating_add(loaded_progress)
+        } else {
+            0
+        };
         let status = if !enabled {
             "disabled"
         } else if self.last_error.is_some() && self.last_success_at.is_none() {
             "error"
+        } else if self.last_success_at.is_none() {
+            "missing"
+        } else if stale {
+            "stale"
         } else if delta_ms.is_some() {
             "ready"
-        } else if baseline_count >= MIN_IDLE_SAMPLES && self.loaded_deltas.is_empty() {
+        } else if baseline_count >= MIN_IDLE_SAMPLES && loaded.is_empty() {
             "baseline_ready"
         } else if baseline_count >= MIN_IDLE_SAMPLES {
             "learning_loaded"
@@ -200,9 +234,7 @@ impl TransportLatencyTracker {
             delta_ms,
             confirmed: delta_ms.is_some(),
             confidence,
-            sample_age_s: self
-                .last_success_at
-                .map(|at| now.saturating_duration_since(at).as_secs_f64()),
+            sample_age_s,
             successful_samples: self.successful_samples,
             failed_samples: self.failed_samples,
             last_error: self.last_error.clone(),
@@ -280,18 +312,67 @@ pub fn effective_latency_delta_ms(
 }
 
 #[cfg(feature = "transport-probes")]
-pub fn transport_allows_growth(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportEvidence {
+    Disabled,
+    Missing,
+    Stale,
+    Unconfirmed,
+    Good,
+    Bad,
+}
+
+#[cfg(feature = "transport-probes")]
+impl TransportEvidence {
+    pub fn allows_icmp_growth(self) -> bool {
+        self != Self::Bad
+    }
+
+    pub fn allows_promotion(self) -> bool {
+        matches!(self, Self::Disabled | Self::Good)
+    }
+}
+
+#[cfg(feature = "transport-probes")]
+pub fn transport_evidence(
     enabled: bool,
     confirmed: bool,
     sample_age_s: Option<f64>,
     max_age_s: f64,
     delta_ms: Option<f64>,
     target_delay_ms: f64,
+) -> TransportEvidence {
+    if !enabled {
+        return TransportEvidence::Disabled;
+    }
+    let Some(age) = sample_age_s.filter(|age| age.is_finite() && *age >= 0.0) else {
+        return TransportEvidence::Missing;
+    };
+    if !max_age_s.is_finite() || max_age_s < 0.0 || age > max_age_s {
+        return TransportEvidence::Stale;
+    }
+    let Some(delta) = delta_ms.filter(|delta| delta.is_finite() && *delta >= 0.0) else {
+        return TransportEvidence::Unconfirmed;
+    };
+    if !confirmed || !target_delay_ms.is_finite() || target_delay_ms < 0.0 {
+        TransportEvidence::Unconfirmed
+    } else if delta <= target_delay_ms {
+        TransportEvidence::Good
+    } else {
+        TransportEvidence::Bad
+    }
+}
+
+#[cfg(all(test, feature = "transport-probes"))]
+fn transport_allows_growth(
+    enabled: bool,
+    confirmed: bool,
+    age: Option<f64>,
+    max_age: f64,
+    delta: Option<f64>,
+    target: f64,
 ) -> bool {
-    !enabled
-        || (confirmed
-            && sample_age_s.map(|age| age <= max_age_s) == Some(true)
-            && delta_ms.map(|delta| delta <= target_delay_ms) == Some(true))
+    transport_evidence(enabled, confirmed, age, max_age, delta, target).allows_icmp_growth()
 }
 
 #[cfg(feature = "transport-probes")]
@@ -356,6 +437,15 @@ impl QualitySearchDirection {
     ) -> QualitySearchUpdate {
         if !high_load || !delta_ms.is_finite() {
             return self.no_change("waiting_for_high_load");
+        }
+
+        if current_rate_kbps < policy.floor_kbps {
+            // An independent ICMP cut owns this lower rate. Discard rollback
+            // targets from the old episode; neither floor nor fallback may
+            // lift it, even when the next transport sample is worse.
+            self.reset_episode();
+            self.last_reason = "icmp_rate_below_transport_floor";
+            return self.no_change(self.last_reason);
         }
 
         if delta_ms <= policy.target_delay_ms {
@@ -655,7 +745,7 @@ mod tests {
 
         tracker.reset();
         let snapshot = tracker.snapshot(now + Duration::from_secs(3), true);
-        assert_eq!(snapshot.status, "learning_baseline");
+        assert_eq!(snapshot.status, "missing");
         assert_eq!(snapshot.successful_samples, 0);
         assert!(snapshot.delta_ms.is_none());
     }
@@ -696,6 +786,105 @@ mod tests {
             Some(20.0),
             30.0,
         ));
+    }
+
+    #[cfg(feature = "transport-probes")]
+    #[test]
+    fn r2_missing_and_stale_transport_allow_ordinary_icmp_growth() {
+        assert!(transport_allows_growth(true, false, None, 8.0, None, 30.0));
+        assert!(transport_allows_growth(
+            true,
+            true,
+            Some(9.0),
+            8.0,
+            Some(85.0),
+            30.0
+        ));
+    }
+
+    #[cfg(feature = "transport-probes")]
+    #[test]
+    fn r2_evidence_has_distinct_fast_growth_and_promotion_permissions() {
+        use TransportEvidence::*;
+        for (confirmed, age, delta, expected) in [
+            (false, None, None, Missing),
+            (true, Some(9.0), Some(90.0), Stale),
+            (true, Some(8.0), Some(30.0), Good),
+            (true, Some(1.0), Some(30.1), Bad),
+            (false, Some(1.0), Some(10.0), Unconfirmed),
+            (true, Some(1.0), Some(f64::NAN), Unconfirmed),
+            (true, Some(-1.0), Some(10.0), Missing),
+            (true, Some(f64::INFINITY), Some(10.0), Missing),
+        ] {
+            let evidence = transport_evidence(true, confirmed, age, 8.0, delta, 30.0);
+            assert_eq!(evidence, expected);
+            assert_eq!(evidence.allows_icmp_growth(), expected != Bad);
+            assert_eq!(evidence.allows_promotion(), expected == Good);
+            let disabled = transport_evidence(false, confirmed, age, 8.0, delta, 30.0);
+            assert_eq!(disabled, Disabled);
+            assert!(disabled.allows_icmp_growth() && disabled.allows_promotion());
+        }
+    }
+
+    #[cfg(feature = "transport-probes")]
+    #[test]
+    fn r2_status_freshness_expires_without_a_new_probe_or_mutating_tick() {
+        let now = Instant::now();
+        let age = Duration::from_secs(8);
+        let mut tracker = TransportLatencyTracker::new();
+        assert_eq!(
+            tracker.snapshot_with_max_age(now, true, age).status,
+            "missing"
+        );
+        tracker.observe_failure("fixture timeout");
+        assert_eq!(
+            tracker.snapshot_with_max_age(now, true, age).status,
+            "error"
+        );
+        for _ in 0..20 {
+            tracker.observe_success("a", 20.0, false, now);
+        }
+        for _ in 0..20 {
+            tracker.observe_success("a", 120.0, true, now);
+        }
+        assert!(
+            tracker
+                .snapshot_with_max_age(now + age, true, age)
+                .confirmed
+        );
+        let expired = tracker.snapshot_with_max_age(now + age + Duration::from_secs(1), true, age);
+        assert_eq!(expired.status, "stale");
+        assert_eq!(expired.sample_age_s, Some(9.0));
+        assert_eq!(expired.delta_ms, None);
+        assert_eq!(expired.confidence, 0);
+        // Fresh idle samples do not rejuvenate expired loaded evidence.
+        tracker.observe_success("a", 20.0, false, now + age + Duration::from_secs(1));
+        let idle = tracker.snapshot_with_max_age(now + age + Duration::from_secs(1), true, age);
+        assert_eq!(idle.status, "baseline_ready");
+        assert!(!idle.confirmed);
+        assert_eq!(idle.delta_ms, None);
+    }
+
+    #[cfg(feature = "transport-probes")]
+    #[test]
+    fn r2_transport_search_never_restores_an_icmp_rate_below_its_floor() {
+        let now = Instant::now();
+        let policy = QualitySearchPolicy {
+            target_delay_ms: 30.0,
+            floor_kbps: 70_000.0,
+            max_steps: 3,
+            observe_duration: Duration::from_secs(5),
+            cooldown: Duration::from_secs(60),
+        };
+        let mut search = QualitySearchDirection::new();
+        search.observe(now, 100_000.0, 170.0, true, policy);
+        let after_icmp_cut =
+            search.observe(now + Duration::from_secs(6), 10_000.0, 180.0, true, policy);
+        assert_eq!(after_icmp_cut.requested_rate_kbps, None);
+        // A later recovery must not revive the old 100000 rollback target.
+        let recovered =
+            search.observe(now + Duration::from_secs(70), 80_000.0, 180.0, true, policy);
+        assert!(recovered.requested_rate_kbps.unwrap() <= 80_000.0);
     }
 
     #[cfg(feature = "transport-probes")]

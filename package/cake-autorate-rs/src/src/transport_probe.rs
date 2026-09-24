@@ -2,9 +2,8 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, Once};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -63,6 +62,8 @@ pub struct RouteBinding {
     pub device: String,
     pub source_ip: String,
     pub fwmark: String,
+    /// Private job-accounting identity; never infer it from a route or endpoint.
+    pub traffic_gid: Option<u32>,
 }
 
 impl RouteBinding {
@@ -348,17 +349,13 @@ type ResolveResult = Result<Vec<SocketAddr>, String>;
 struct Resolver {
     host: String,
     port: u16,
+    traffic_gid: Option<u32>,
     completed: Option<ResolveResult>,
-    pending: Option<PendingResolution>,
-}
-
-struct PendingResolution {
-    receiver: Receiver<ResolveResult>,
-    handle: thread::JoinHandle<()>,
+    routed: Option<(Ipv4Addr, RouteBinding)>,
 }
 
 impl Resolver {
-    fn new(parsed: &ParsedEndpoint) -> Self {
+    fn new(parsed: &ParsedEndpoint, traffic_gid: Option<u32>) -> Self {
         let completed = parsed.host.parse::<IpAddr>().ok().map(|ip| {
             if ip.is_ipv4() {
                 Ok(vec![SocketAddr::new(ip, parsed.port)])
@@ -369,8 +366,9 @@ impl Resolver {
         Self {
             host: parsed.host.clone(),
             port: parsed.port,
+            traffic_gid,
             completed,
-            pending: None,
+            routed: None,
         }
     }
 
@@ -379,8 +377,9 @@ impl Resolver {
         Self {
             host: host.to_string(),
             port: addresses.first().map(SocketAddr::port).unwrap_or(443),
+            traffic_gid: None,
             completed: Some(Ok(addresses)),
-            pending: None,
+            routed: None,
         }
     }
 
@@ -389,56 +388,38 @@ impl Resolver {
             deadline.ensure("DNS cache lookup")?;
             return result.clone();
         }
-        if self.pending.is_none() {
-            let host = self.host.clone();
-            let port = self.port;
-            let (sender, receiver) = mpsc::sync_channel(1);
-            let handle = thread::Builder::new()
-                .name("cake-autorate-dns".to_string())
-                .spawn(move || {
-                    let result = resolve_ipv4(&host, port);
-                    let _ = sender.send(result);
-                })
-                .map_err(|error| format!("failed to start DNS resolver: {error}"))?;
-            self.pending = Some(PendingResolution { receiver, handle });
+        if let Some((server, binding)) = &self.routed {
+            // Do not fall back to libc/loopback DNS on any routed failure.
+            // This path does not cache beyond one operation until TTL-aware
+            // storage is integrated with route-generation invalidation.
+            return resolve_routed_dns(*server, binding, &self.host, self.port, deadline);
         }
-        let remaining = deadline.remaining("DNS resolution")?;
-        let result = match self
-            .pending
-            .as_ref()
-            .expect("resolver receiver exists")
-            .receiver
-            .recv_timeout(remaining)
-        {
-            Ok(result) => result,
-            Err(RecvTimeoutError::Timeout) => {
-                return Err("transport probe deadline exceeded during DNS resolution".to_string())
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                Err("DNS resolver terminated without a result".to_string())
-            }
-        };
-        if let Some(pending) = self.pending.take() {
-            let _ = pending.handle.join();
+        let program = std::env::current_exe()
+            .map_err(|_| "transport DNS helper executable is unavailable".to_string())?;
+        let result = crate::transport_resolver::resolve_with_program(
+            &program,
+            &self.host,
+            self.port,
+            deadline.remaining("DNS resolution")?,
+            self.traffic_gid,
+            || crate::TERMINATE.load(std::sync::atomic::Ordering::Relaxed) || deadline.exhausted(),
+        );
+        if deadline.exhausted() {
+            return Err(crate::transport_resolver::DEADLINE_ERROR.to_string());
+        }
+        if result.as_ref().err().is_some_and(|error| {
+            matches!(
+                error.as_str(),
+                crate::transport_resolver::DEADLINE_ERROR
+                    | crate::transport_resolver::CANCELLED_ERROR
+            )
+        }) {
+            return result;
         }
         self.completed = Some(result.clone());
         deadline.ensure("DNS resolution")?;
         result
     }
-}
-
-fn resolve_ipv4(host: &str, port: u16) -> ResolveResult {
-    let mut addresses = (host, port)
-        .to_socket_addrs()
-        .map_err(|error| format!("failed to resolve {host}: {error}"))?
-        .filter(SocketAddr::is_ipv4)
-        .collect::<Vec<_>>();
-    addresses.sort();
-    addresses.dedup();
-    if addresses.is_empty() {
-        return Err(format!("{host} has no IPv4 address"));
-    }
-    Ok(addresses)
 }
 
 fn default_port(scheme: &str) -> u16 {
@@ -466,6 +447,22 @@ impl TransportProbeEngine {
         binding: RouteBinding,
         timeout: Duration,
     ) -> Result<Self, String> {
+        Self::new_with_dns(backend, endpoint, binding, timeout, None)
+    }
+
+    pub(crate) fn new_with_dns(
+        backend: TransportProbeBackend,
+        endpoint: String,
+        binding: RouteBinding,
+        timeout: Duration,
+        dns_server: Option<Ipv4Addr>,
+    ) -> Result<Self, String> {
+        if binding
+            .traffic_gid
+            .is_some_and(|gid| gid == 0 || gid == INVALID_SOCKET_GID)
+        {
+            return Err("transport-socket-group-invalid".into());
+        }
         let parsed = ParsedEndpoint::parse(&endpoint)?;
         match backend {
             TransportProbeBackend::WebSocket if !matches!(parsed.scheme.as_str(), "ws" | "wss") => {
@@ -478,7 +475,19 @@ impl TransportProbeEngine {
             TransportProbeBackend::LegacyHttp => {}
             _ => {}
         }
-        let resolver = Resolver::new(&parsed);
+        let mut resolver = Resolver::new(&parsed, binding.traffic_gid);
+        if let Some(server) = dns_server {
+            crate::routing::explicit_dns_server("explicit", &server.to_string())?;
+            if binding.traffic_gid.is_none()
+                || binding.device.is_empty()
+                || binding.parsed_source()?.is_none()
+                || binding.parsed_mark()?.is_none()
+                || backend == TransportProbeBackend::LegacyHttp
+            {
+                return Err("routed-dns-requires-owned-route-and-unicast-server".into());
+            }
+            resolver.routed = Some((server, binding.clone()));
+        }
         let websocket = (backend == TransportProbeBackend::WebSocket).then(|| {
             WebSocketProbe::new(endpoint.clone(), parsed.clone(), binding.clone(), timeout)
         });
@@ -522,44 +531,58 @@ impl TransportProbeEngine {
     ) -> Result<TransportProbeSample, TransportProbeFailure> {
         let deadline = ProbeDeadline::after(self.timeout).map_err(TransportProbeFailure::other)?;
         self.probe_with_deadline(deadline, websocket_streams)
-            .map_err(|message| {
-                if deadline.exhausted() {
-                    TransportProbeFailure::deadline_exceeded(message, self.timeout)
-                } else {
-                    TransportProbeFailure::other(message)
-                }
-            })
     }
 
     fn probe_with_deadline(
         &mut self,
         deadline: ProbeDeadline,
         websocket_streams: usize,
-    ) -> Result<TransportProbeSample, String> {
-        if self.backend == TransportProbeBackend::LegacyHttp {
-            return probe_legacy_http(&self.endpoint, deadline);
+    ) -> Result<TransportProbeSample, TransportProbeFailure> {
+        if SOCKET_CREDENTIALS_POISONED.with(|poisoned| poisoned.get()) {
+            self.websocket.take();
+            self.http.take();
+            return Err(TransportProbeFailure::other(
+                "transport-socket-group-poisoned".into(),
+            ));
         }
-        let addresses = self.resolver.resolve(deadline)?;
-        match self.backend {
-            TransportProbeBackend::WebSocket => self
-                .websocket
-                .as_mut()
-                .ok_or_else(|| "websocket probe is unavailable".to_string())?
-                .probe(&addresses, deadline, websocket_streams),
-            TransportProbeBackend::TcpConnect => probe_tcp_batch(
-                &self.endpoint,
-                &addresses,
-                &self.binding,
-                deadline,
-                DEFAULT_STREAMS,
-            ),
-            TransportProbeBackend::PersistentHttp => self
-                .http
-                .as_mut()
-                .ok_or_else(|| "persistent HTTP probe is unavailable".to_string())?
-                .probe(&addresses, deadline),
-            TransportProbeBackend::LegacyHttp => unreachable!("handled before DNS"),
-        }
+        let outcome = if self.backend == TransportProbeBackend::LegacyHttp {
+            probe_legacy_http(&self.endpoint, deadline)
+        } else {
+            // DNS, including its deadline, is apparatus preparation. No transport
+            // request has been attempted, so it cannot be censored RTT evidence.
+            let addresses = self
+                .resolver
+                .resolve(deadline)
+                .map_err(TransportProbeFailure::other)?;
+            match self.backend {
+                TransportProbeBackend::WebSocket => self
+                    .websocket
+                    .as_mut()
+                    .ok_or_else(|| {
+                        TransportProbeFailure::other("websocket probe is unavailable".to_string())
+                    })?
+                    .probe(&addresses, deadline, websocket_streams),
+                TransportProbeBackend::TcpConnect => probe_tcp_batch(
+                    &self.endpoint,
+                    &addresses,
+                    &self.binding,
+                    deadline,
+                    DEFAULT_STREAMS,
+                ),
+                TransportProbeBackend::PersistentHttp => self
+                    .http
+                    .as_mut()
+                    .ok_or_else(|| {
+                        TransportProbeFailure::other(
+                            "persistent HTTP probe is unavailable".to_string(),
+                        )
+                    })?
+                    .probe(&addresses, deadline),
+                TransportProbeBackend::LegacyHttp => unreachable!("handled before DNS"),
+            }
+        };
+        outcome
+            .map_err(|message| classify_probe_failure(message, deadline.exhausted(), self.timeout))
     }
 }
 
@@ -942,6 +965,117 @@ fn install_crypto_provider() {
     });
 }
 
+fn classify_probe_failure(
+    message: String,
+    deadline_exhausted: bool,
+    timeout: Duration,
+) -> TransportProbeFailure {
+    if deadline_exhausted && !message.contains("transport-socket-group-") {
+        TransportProbeFailure::deadline_exceeded(message, timeout)
+    } else {
+        TransportProbeFailure::other(message)
+    }
+}
+
+thread_local! {
+    static SOCKET_CREDENTIALS_POISONED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+const INVALID_SOCKET_GID: u32 = u32::MAX;
+
+// The Cell reference makes this guard !Send. It must be restored/dropped on
+// the same synchronous worker thread that changes the Linux filesystem GID.
+struct SocketGroupScope<'a, Change: FnMut(u32) -> u32> {
+    original: u32,
+    change: Change,
+    poisoned: &'a std::cell::Cell<bool>,
+    restored: bool,
+}
+
+impl<Change: FnMut(u32) -> u32> SocketGroupScope<'_, Change> {
+    fn restore(&mut self) -> std::io::Result<()> {
+        if !self.restored {
+            (self.change)(self.original);
+            self.restored = (self.change)(INVALID_SOCKET_GID) == self.original;
+            if !self.restored {
+                self.poisoned.set(true);
+                return Err(std::io::Error::other(
+                    "transport-socket-group-restore-failed",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<Change: FnMut(u32) -> u32> Drop for SocketGroupScope<'_, Change> {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+fn socket_with_group<T>(
+    gid: Option<u32>,
+    poisoned: &std::cell::Cell<bool>,
+    mut change: impl FnMut(u32) -> u32,
+    create: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    if poisoned.get() {
+        return Err(std::io::Error::other("transport-socket-group-poisoned"));
+    }
+    let Some(gid) = gid else {
+        return create();
+    };
+    if gid == 0 || gid == INVALID_SOCKET_GID {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "transport-socket-group-invalid",
+        ));
+    }
+    let original = change(INVALID_SOCKET_GID);
+    if original == INVALID_SOCKET_GID {
+        return Err(std::io::Error::other("transport-socket-group-unavailable"));
+    }
+    let mut scope = SocketGroupScope {
+        original,
+        change,
+        poisoned,
+        restored: false,
+    };
+    (scope.change)(gid);
+    if (scope.change)(INVALID_SOCKET_GID) != gid {
+        scope.restore()?;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "transport-socket-group-denied",
+        ));
+    }
+    let socket = create();
+    scope.restore()?;
+    socket
+}
+
+fn new_probe_socket(gid: Option<u32>) -> std::io::Result<Socket> {
+    SOCKET_CREDENTIALS_POISONED.with(|poisoned| {
+        socket_with_group(
+            gid,
+            poisoned,
+            |value| {
+                // SAFETY: Linux setfsgid takes one scalar, no pointers. The libc
+                // wrapper handles 32-bit GID syscall ABI differences. The private
+                // synchronous scope restores this thread before connect/bind/TLS;
+                // no await, thread spawn, external callback or filesystem work is
+                // performed while changed. -1 queries without changing identity.
+                // Both setting and restoration are checked by a separate query,
+                // since setfsgid itself silently returns the old GID on failure.
+                // An unverified restore poisons all future socket creation here.
+                unsafe { libc::setfsgid(value) as u32 }
+            },
+            || Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)),
+        )
+    })
+}
+
 fn connect_route_aware(
     addresses: &[SocketAddr],
     binding: &RouteBinding,
@@ -964,7 +1098,7 @@ fn connect_route_aware(
         let remaining = deadline.remaining("TCP connect")?;
         let attempts_left = (addresses.len() - index) as u32;
         let attempt_budget = (remaining / attempts_left).max(Duration::from_millis(1));
-        let socket = match Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)) {
+        let socket = match new_probe_socket(binding.traffic_gid) {
             Ok(socket) => socket,
             Err(error) => {
                 errors.push(error.to_string());
@@ -1012,6 +1146,49 @@ fn connect_route_aware(
         "route-aware TCP connection failed: {}",
         errors.join("; ")
     ))
+}
+
+fn resolve_routed_dns(
+    server: Ipv4Addr,
+    binding: &RouteBinding,
+    host: &str,
+    port: u16,
+    deadline: ProbeDeadline,
+) -> ResolveResult {
+    let mut id = [0; 2];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut id))
+        .map_err(|_| "routed-dns-query-id-unavailable")?;
+    let request = crate::routed_dns::query(host, u16::from_be_bytes(id))?;
+    let (mut stream, _) = connect_route_aware(
+        &[SocketAddr::from((server, 53))],
+        binding,
+        deadline,
+        DeadlineControl::new(deadline),
+        false,
+    )?;
+    stream
+        .write_all(&(request.len() as u16).to_be_bytes())
+        .and_then(|_| stream.write_all(&request))
+        .map_err(|_| "routed-dns-write-failed")?;
+    let mut length = [0; 2];
+    stream
+        .read_exact(&mut length)
+        .map_err(|_| "routed-dns-read-failed")?;
+    let length = usize::from(u16::from_be_bytes(length));
+    if !(12..=crate::routed_dns::MAX_PACKET).contains(&length) {
+        return Err("routed-dns-response-size-invalid".into());
+    }
+    let mut response = vec![0; length];
+    stream
+        .read_exact(&mut response)
+        .map_err(|_| "routed-dns-read-failed")?;
+    let addresses = crate::routed_dns::answer(&response, &request)?;
+    deadline.ensure("routed DNS resolution")?;
+    Ok(addresses
+        .into_iter()
+        .map(|ip| SocketAddr::from((ip, port)))
+        .collect())
 }
 
 fn probe_tcp_batch(
@@ -1459,6 +1636,295 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r6_direct_dns_requires_owned_route_and_never_selects_system_fallback() {
+        let binding = RouteBinding {
+            device: "wan".into(),
+            source_ip: "192.0.2.2".into(),
+            fwmark: "0x100".into(),
+            traffic_gid: Some(32770),
+        };
+        let create = |binding, server| {
+            TransportProbeEngine::new_with_dns(
+                TransportProbeBackend::TcpConnect,
+                "http://peer.test/".into(),
+                binding,
+                Duration::from_secs(1),
+                Some(server),
+            )
+        };
+        let engine = create(binding.clone(), Ipv4Addr::new(192, 0, 2, 1)).unwrap();
+        assert_eq!(engine.resolver.routed.as_ref().unwrap().1, binding);
+        assert!(engine.resolver.completed.is_none());
+        for server in [
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::BROADCAST,
+            Ipv4Addr::new(224, 0, 0, 1),
+        ] {
+            assert!(create(binding.clone(), server).is_err());
+        }
+        let mut unowned = binding;
+        unowned.traffic_gid = None;
+        assert!(create(unowned, Ipv4Addr::new(192, 0, 2, 1)).is_err());
+    }
+
+    #[test]
+    fn t2_resolver_ownership_follows_engine_binding_and_keeps_literal_fast_path() {
+        let parsed = ParsedEndpoint::parse("wss://127.0.0.1/ws").unwrap();
+        let mut resolver = Resolver::new(&parsed, Some(32770));
+        assert_eq!(resolver.traffic_gid, Some(32770));
+        assert_eq!(
+            resolver
+                .resolve(ProbeDeadline::after(Duration::from_secs(1)).unwrap())
+                .unwrap(),
+            vec!["127.0.0.1:443".parse::<SocketAddr>().unwrap()]
+        );
+        let engine = TransportProbeEngine::new(
+            TransportProbeBackend::WebSocket,
+            "wss://127.0.0.1/ws".into(),
+            RouteBinding {
+                traffic_gid: Some(32770),
+                ..RouteBinding::default()
+            },
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(engine.resolver.traffic_gid, engine.binding.traffic_gid);
+    }
+
+    #[test]
+    fn t2_socket_ownership_failure_is_never_censored_latency() {
+        for message in [
+            "transport-socket-group-denied",
+            "transport-socket-group-restore-failed",
+            "transport-socket-group-poisoned",
+        ] {
+            for expired in [false, true] {
+                let failure =
+                    classify_probe_failure(message.into(), expired, Duration::from_secs(1));
+                assert_eq!(failure.kind(), TransportProbeFailureKind::Other);
+                assert_eq!(failure.deadline_us(), None);
+            }
+        }
+        let timeout = classify_probe_failure(
+            "network deadline expired".into(),
+            true,
+            Duration::from_secs(1),
+        );
+        assert!(timeout.deadline_us().is_some());
+    }
+
+    #[test]
+    fn t2_socket_group_poison_blocks_reused_and_new_engines_before_resolution() {
+        std::thread::spawn(|| {
+            let mut engine = TransportProbeEngine::new(
+                TransportProbeBackend::WebSocket,
+                "ws://127.0.0.1:9/".into(),
+                RouteBinding::default(),
+                Duration::from_millis(10),
+            )
+            .unwrap();
+            SOCKET_CREDENTIALS_POISONED.with(|poisoned| poisoned.set(true));
+            assert_eq!(
+                engine.probe().unwrap_err(),
+                "transport-socket-group-poisoned"
+            );
+            assert!(engine.websocket.is_none());
+            let mut next = TransportProbeEngine::new(
+                TransportProbeBackend::WebSocket,
+                "ws://127.0.0.1:9/".into(),
+                RouteBinding::default(),
+                Duration::from_millis(10),
+            )
+            .unwrap();
+            assert_eq!(next.probe().unwrap_err(), "transport-socket-group-poisoned");
+        })
+        .join()
+        .unwrap();
+        assert!(
+            !SOCKET_CREDENTIALS_POISONED.with(|poisoned| poisoned.get()),
+            "poison must not cross threads"
+        );
+        for gid in [0, INVALID_SOCKET_GID] {
+            assert!(TransportProbeEngine::new(
+                TransportProbeBackend::WebSocket,
+                "ws://127.0.0.1:9/".into(),
+                RouteBinding {
+                    traffic_gid: Some(gid),
+                    ..RouteBinding::default()
+                },
+                Duration::from_millis(10)
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn t2_socket_group_real_constructor_preserves_current_thread_credentials() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let current_gid = || {
+            std::fs::read_to_string("/proc/thread-self/status")
+                .unwrap()
+                .lines()
+                .find(|line| line.starts_with("Gid:"))
+                .unwrap()
+                .split_whitespace()
+                .nth(4)
+                .unwrap()
+                .parse::<u32>()
+                .unwrap()
+        };
+        let before = current_gid();
+        // This non-privileged check never requests a different OS identity.
+        // Root GID is deliberately not a valid private traffic tag.
+        if before == 0 {
+            return;
+        }
+        let socket = new_probe_socket(Some(before)).unwrap();
+        assert_eq!(current_gid(), before);
+        let metadata = std::fs::metadata(format!("/proc/self/fd/{}", socket.as_raw_fd())).unwrap();
+        assert_eq!(metadata.gid(), before);
+        drop(socket);
+        assert_eq!(current_gid(), before);
+    }
+
+    #[test]
+    fn t2_socket_group_scope_restores_success_error_and_unwind() {
+        use std::cell::Cell;
+        for fails in [false, true] {
+            let current = Cell::new(1000_u32);
+            let poisoned = Cell::new(false);
+            let result = socket_with_group(
+                Some(42),
+                &poisoned,
+                |gid| {
+                    let old = current.get();
+                    if gid != INVALID_SOCKET_GID {
+                        current.set(gid);
+                    }
+                    old
+                },
+                || {
+                    assert_eq!(current.get(), 42);
+                    if fails {
+                        Err(std::io::Error::other("injected socket creation failure"))
+                    } else {
+                        Ok(7)
+                    }
+                },
+            );
+            assert_eq!(result.is_err(), fails);
+            assert_eq!(current.get(), 1000);
+            assert!(!poisoned.get());
+        }
+        let current = Cell::new(1000_u32);
+        let poisoned = Cell::new(false);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = socket_with_group::<()>(
+                Some(42),
+                &poisoned,
+                |gid| {
+                    let old = current.get();
+                    if gid != INVALID_SOCKET_GID {
+                        current.set(gid);
+                    }
+                    old
+                },
+                || panic!("injected constructor unwind"),
+            );
+        }));
+        assert!(result.is_err());
+        assert_eq!(current.get(), 1000);
+        assert!(!poisoned.get());
+    }
+
+    #[test]
+    fn t2_socket_group_denial_and_failed_restore_never_release_a_socket() {
+        use std::cell::Cell;
+        let current = Cell::new(1000_u32);
+        let poisoned = Cell::new(false);
+        let created = Cell::new(false);
+        let denied = socket_with_group(
+            Some(42),
+            &poisoned,
+            |_| current.get(),
+            || {
+                created.set(true);
+                Ok(7)
+            },
+        );
+        assert_eq!(
+            denied.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(!created.get());
+        assert!(!poisoned.get());
+        let dropped = Cell::new(false);
+        struct Witness<'a>(&'a Cell<bool>);
+        impl Drop for Witness<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let failed_restore = socket_with_group(
+            Some(42),
+            &poisoned,
+            |gid| {
+                let old = current.get();
+                if gid == 42 {
+                    current.set(gid);
+                } // Restoration is denied.
+                old
+            },
+            || Ok(Witness(&dropped)),
+        );
+        assert!(failed_restore.is_err());
+        assert!(dropped.get());
+        assert!(poisoned.get());
+        for gid in [None, Some(42), Some(1000)] {
+            assert!(socket_with_group::<()>(
+                gid,
+                &poisoned,
+                |_| panic!("poisoned thread changed credentials"),
+                || panic!("poisoned thread created a socket")
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn t2_socket_group_invalid_identity_and_plain_monitoring_do_not_change_credentials() {
+        let poisoned = std::cell::Cell::new(false);
+        for gid in [0, INVALID_SOCKET_GID] {
+            assert!(socket_with_group::<()>(
+                Some(gid),
+                &poisoned,
+                |_| panic!("invalid group reached syscall"),
+                || panic!("invalid group created a socket")
+            )
+            .is_err());
+        }
+        assert_eq!(
+            socket_with_group(
+                None,
+                &poisoned,
+                |_| panic!("ordinary monitoring changed credentials"),
+                || Ok(7)
+            )
+            .unwrap(),
+            7
+        );
+        assert!(socket_with_group::<()>(
+            Some(42),
+            &poisoned,
+            |_| INVALID_SOCKET_GID,
+            || panic!("unknown original GID created a socket")
+        )
+        .is_err());
+    }
     use std::io::Cursor;
     use std::net::TcpListener;
 
@@ -1469,6 +1935,7 @@ mod tests {
         assert_eq!(endpoint.port, 443);
         assert_eq!(endpoint.path, "/ws?q=1");
         let binding = RouteBinding {
+            traffic_gid: None,
             device: "pppoe-wan".to_string(),
             source_ip: "192.0.2.2".to_string(),
             fwmark: "0x200".to_string(),
@@ -1705,6 +2172,31 @@ mod tests {
     }
 
     #[test]
+    fn t2_dns_failure_or_expiry_is_not_censored_network_latency() {
+        for expired in [false, true] {
+            let mut engine = TransportProbeEngine::new(
+                TransportProbeBackend::WebSocket,
+                "wss://fixture.invalid/ws".into(),
+                RouteBinding::default(),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+            engine.resolver.completed = Some(Err("transport-dns-lookup-failed".into()));
+            let deadline = if expired {
+                ProbeDeadline(Instant::now() - Duration::from_millis(1))
+            } else {
+                ProbeDeadline::after(Duration::from_secs(1)).unwrap()
+            };
+            let failure = engine
+                .probe_with_deadline(deadline, DEFAULT_STREAMS)
+                .unwrap_err();
+            assert_eq!(failure.kind(), TransportProbeFailureKind::Other);
+            assert_eq!(failure.deadline_us(), None);
+            assert!(engine.websocket.as_ref().unwrap().stream.is_none());
+        }
+    }
+
+    #[test]
     fn resolver_result_is_cached_and_does_not_spawn_again() {
         let address = "127.0.0.1:443".parse().unwrap();
         let mut resolver = Resolver::from_addresses("fixture", vec![address]);
@@ -1715,7 +2207,10 @@ mod tests {
             .resolve(ProbeDeadline::after(Duration::from_secs(1)).unwrap())
             .unwrap();
         assert_eq!(first, second);
-        assert!(resolver.pending.is_none());
+        assert_eq!(
+            resolver.completed.as_ref().unwrap().as_ref().unwrap(),
+            &first
+        );
     }
 
     #[test]

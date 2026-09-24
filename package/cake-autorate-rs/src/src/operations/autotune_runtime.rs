@@ -371,6 +371,8 @@ pub type RuntimePermitBaseline = RuntimeBaseline<MeasurementTopology>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AutotuneRuntimePermit {
+    pub dns_server: Option<std::net::Ipv4Addr>,
+    pub probe_accounting_required: bool,
     pub kind: RuntimePermitKind,
     pub permit_id: String,
     pub job_id: String,
@@ -467,6 +469,9 @@ impl AutotuneRuntimePermit {
 
     pub fn validate(&self) -> Result<(), String> {
         require_lower_hex("runtime permit id", &self.permit_id, 32)?;
+        if self.probe_accounting_required && self.kind != RuntimePermitKind::Autotune {
+            return Err("probe accounting requires an Auto-Tune runtime permit".into());
+        }
         require_lower_hex("runtime permit job id", &self.job_id, 32)?;
         require_lower_hex("runtime permit worker run id", &self.worker_run_id, 32)?;
         require_lower_hex("runtime permit boot id", &self.boot_id, 32)?;
@@ -484,6 +489,12 @@ impl AutotuneRuntimePermit {
         require_identifier("runtime permit instance", &self.instance_name)?;
         require_interface(&self.target_interface)?;
         require_route_identity(&self.route_identity)?;
+        if let Some(server) = self.dns_server {
+            crate::routing::explicit_dns_server(
+                self.route_identity.split('|').next().unwrap_or_default(),
+                &server.to_string(),
+            )?;
+        }
         if self.worker.pid == 0
             || self.worker.process_group == 0
             || self.worker.starttime_ticks == 0
@@ -1457,13 +1468,27 @@ fn decode_lower_hex(value: &str) -> Result<Vec<u8>, String> {
 }
 
 fn require_route_identity(value: &str) -> Result<(), String> {
-    if value.is_empty()
-        || value.len() > 512
-        || value
-            .bytes()
-            .any(|byte| byte.is_ascii_control() || byte == b'=')
-    {
+    if value.is_empty() || value.len() > 512 || value.bytes().any(|byte| byte.is_ascii_control()) {
         return Err("runtime permit route identity is invalid".to_string());
+    }
+    if value.contains('=') {
+        let fields: Vec<_> = value.split('|').collect();
+        let valid_number = |field: &str, prefix: &str| {
+            field.strip_prefix(prefix).is_some_and(|number| {
+                number
+                    .parse::<u32>()
+                    .is_ok_and(|parsed| parsed != 0 && parsed.to_string() == number)
+            })
+        };
+        let valid_shape =
+            (fields.len() == 8 && fields[0] == "explicit" && valid_number(fields[7], "ifindex="))
+                || (fields.len() == 7 && fields[0] == "mwan3");
+        if !valid_shape
+            || fields[..6].iter().any(|field| field.contains('='))
+            || !valid_number(fields[6], "mask=")
+        {
+            return Err("runtime permit route identity is invalid".into());
+        }
     }
     Ok(())
 }
@@ -1471,6 +1496,31 @@ fn require_route_identity(value: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r6_runtime_link_identity_allows_only_canonical_authority_suffix() {
+        let base = "explicit||eth1|192.0.2.1|0x100|101";
+        assert!(require_route_identity(&format!("{base}|mask=16128|ifindex=42")).is_ok());
+        for suffix in [
+            "mask=0|ifindex=42",
+            "mask=16128|ifindex=0",
+            "mask=016128|ifindex=42",
+            "mask=16128|ifindex=042",
+            "mask=16128|ifindex=4294967296",
+            "mask=16128|ifindex=42|extra=1",
+            "ifindex=42|mask=16128",
+            "mask=16128|ifindex=42\nforged=1",
+        ] {
+            assert!(require_route_identity(&format!("{base}|{suffix}")).is_err());
+        }
+        assert!(require_route_identity(
+            "explicit||eth=1|192.0.2.1|0x100|101|mask=16128|ifindex=42"
+        )
+        .is_err());
+        assert!(
+            require_route_identity("main||eth1|192.0.2.1||main|mask=16128|ifindex=42").is_err()
+        );
+    }
 
     #[test]
     fn temporary_topology_identity_is_deterministic_and_private() {
@@ -1545,6 +1595,8 @@ mod tests {
 
     fn permit() -> AutotuneRuntimePermit {
         AutotuneRuntimePermit {
+            dns_server: None,
+            probe_accounting_required: false,
             kind: RuntimePermitKind::Autotune,
             permit_id: "77".repeat(16),
             job_id: "11".repeat(16),
@@ -1648,12 +1700,15 @@ mod tests {
     fn absent_baseline_reconstructs_the_exact_route_bound_kernel_query() {
         let baseline = absent_baseline();
         let route = OperationRouteIdentity {
+            dns_server: None,
+            device_ifindex: None,
             mode: super::super::protocol::OperationRouteMode::Main,
             mwan3_member: None,
             l3_device: "pppoe-wan".to_string(),
             source_ip: None,
             fwmark: None,
             routing_table: None,
+            fwmark_mask: None,
         };
         let query = baseline.kernel_topology_query(route.clone()).unwrap();
         assert_eq!(query.target_interface, baseline.target_interface);

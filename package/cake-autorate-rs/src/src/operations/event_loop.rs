@@ -1,4 +1,4 @@
-//! Linux event reactor for the calibration coordinator.
+//! Linux event reactor shared by service readiness and the calibration coordinator.
 //!
 //! Readiness notifications are hints only.  The coordinator always re-reads
 //! and re-attests its durable authority after a wakeup.  A poll timeout may

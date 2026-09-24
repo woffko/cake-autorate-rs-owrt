@@ -7,7 +7,7 @@ endif
 
 PKG_NAME:=cake-autorate-rs
 PKG_VERSION:=1.0_rc27
-PKG_RELEASE:=318
+PKG_RELEASE:=320
 
 PKG_MAINTAINER:=woffko
 PKG_LICENSE:=GPL-2.0-or-later
@@ -19,13 +19,20 @@ PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)-$(BUILD_VARIANT)
 include $(INCLUDE_DIR)/package.mk
 include $(TOPDIR)/feeds/packages/lang/rust/rust-package.mk
 
+# Named OS reservations; runtime leases must still prove exclusive ownership.
+# Group-only Require-User entries do not create login accounts or fixed GIDs.
+CAKE_PROBE_GROUP_SLOTS := 00 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 \
+  16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 \
+  32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 \
+  48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63
+
 define Package/cake-autorate-rs/Default
   SECTION:=net
   CATEGORY:=Network
   URL:=https://github.com/woffko/cake-autorate-rs-owrt
   MAINTAINER:=woffko
   DEPENDS:=$(RUST_ARCH_DEPENDS) +uci +fping +uclient-fetch +sqm-scripts
-  USERID:=cake-speedtest:cake-speedtest
+  USERID:=cake-speedtest:cake-speedtest $(foreach slot,$(CAKE_PROBE_GROUP_SLOTS),:cake-probe-$(slot))
 endef
 
 define Package/cake-autorate-rs
@@ -36,6 +43,8 @@ $(call Package/cake-autorate-rs/Default)
   CONFLICTS:=cake-autorate-rs-lite
   DEFAULT_VARIANT:=1
   DEPENDS+=+nftables-json +speedtest-go
+  # Reject the stock r1 backend whose failed requests can retry without bound.
+  EXTRA_DEPENDS:=speedtest-go (>=1.7.10-r2)
 endef
 
 define Package/cake-autorate-rs-lite
@@ -78,6 +87,7 @@ Package/cake-autorate-rs-lite/conffiles = $(Package/cake-autorate-rs/conffiles)
 define Package/cake-autorate-rs/postinst
 [ -n "$${IPKG_INSTROOT}" ] || { \
 	if [ "$${PKG_UPGRADE:-0}" = 1 ]; then \
+		PKG_UPGRADE=0 /usr/sbin/cake-autorated --service-lifecycle preflight-start || exit 1; \
 		/etc/init.d/cake-autorate-autotune stop >/dev/null 2>&1 || exit 1; \
 		/usr/sbin/cake-autorated --native-apply-recover >/dev/null 2>&1 || exit 1; \
 		PKG_UPGRADE=0 /etc/init.d/cake-autorate restart >/dev/null 2>&1 || exit 1; \

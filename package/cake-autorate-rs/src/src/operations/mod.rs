@@ -24,6 +24,8 @@ pub mod autotune_capture_session;
 #[cfg(feature = "calibration")]
 pub mod autotune_counter;
 #[cfg(feature = "calibration")]
+mod autotune_history;
+#[cfg(feature = "calibration")]
 pub mod autotune_managed_config;
 #[cfg(feature = "calibration")]
 pub mod autotune_public;
@@ -41,14 +43,14 @@ pub(crate) mod autotune_uci_materialization;
 pub(crate) mod bootstrap_runtime_owner;
 #[cfg(feature = "calibration")]
 pub(crate) mod calibration_service;
+pub(crate) mod committed_uci;
+pub(crate) mod controller_input;
 #[cfg(feature = "calibration")]
 pub mod coordinator;
 pub(crate) mod cpu_profile;
-#[cfg(feature = "calibration")]
 pub mod event_loop;
 #[cfg(feature = "calibration")]
 pub mod full_autotune;
-#[cfg(feature = "calibration")]
 pub mod identity;
 #[cfg(feature = "calibration")]
 pub mod journal;
@@ -57,6 +59,8 @@ pub(crate) mod json_wire;
 pub mod kernel_topology;
 #[cfg(feature = "calibration")]
 pub(crate) mod kernel_topology_netlink;
+#[cfg(feature = "calibration")]
+pub(crate) mod launch_route;
 #[cfg(feature = "calibration")]
 pub mod lease;
 #[cfg(feature = "calibration")]
@@ -98,6 +102,8 @@ pub mod scheduler_runtime;
 pub(crate) mod scheduler_status;
 #[cfg(feature = "calibration")]
 pub mod scheduler_store;
+#[cfg(feature = "calibration")]
+pub(crate) mod server_qualification;
 pub(crate) mod service_config;
 pub(crate) mod service_lifecycle;
 #[cfg(feature = "calibration")]
@@ -109,15 +115,28 @@ pub mod sqm_identity;
 pub(crate) mod sqm_projection;
 pub mod sqm_recovery;
 pub(crate) mod sqm_recovery_openwrt;
+pub(crate) mod sqm_runner;
 pub(crate) mod sqm_start_events;
 #[cfg(feature = "calibration")]
 pub mod state;
 #[cfg(feature = "calibration")]
 pub(crate) mod traffic_classifier;
+pub(crate) mod uci_edits;
+pub(crate) mod uci_transaction;
 
 #[cfg(all(test, not(feature = "calibration")))]
 mod lite_boundary_tests {
     const SOURCE: &str = include_str!("mod.rs");
+
+    #[test]
+    fn lite_shares_the_low_level_readiness_reactor_without_calibration_services() {
+        // The process/inotify reactor is now also the ordinary Lite readiness
+        // mechanism. This does not enroll the coordinator, scheduler or probes.
+        assert!(SOURCE.contains("\npub mod event_loop;"));
+        assert!(SOURCE.contains("\npub mod identity;"));
+        let _ = std::mem::size_of::<super::event_loop::CalibrationEventLoop>();
+        let _ = std::mem::size_of::<super::identity::ProcessIdentity>();
+    }
 
     #[test]
     fn lite_compiles_only_the_manual_runtime_operation_gate() {
@@ -142,7 +161,6 @@ mod lite_boundary_tests {
             "bootstrap_runtime_owner",
             "calibration_service",
             "coordinator",
-            "event_loop",
             "full_autotune",
             "journal",
             "kernel_topology",
@@ -272,6 +290,9 @@ mod timer_ownership_tests {
             include_str!("calibration_service.rs"),
         ),
         ("coordinator", include_str!("coordinator.rs")),
+        ("committed_uci", include_str!("committed_uci.rs")),
+        ("controller_input", include_str!("controller_input.rs")),
+        ("uci_transaction", include_str!("uci_transaction.rs")),
         ("cpu_profile", include_str!("cpu_profile.rs")),
         ("event_loop", include_str!("event_loop.rs")),
         ("full_autotune", include_str!("full_autotune.rs")),
@@ -284,6 +305,7 @@ mod timer_ownership_tests {
             include_str!("kernel_topology_netlink.rs"),
         ),
         ("lease", include_str!("lease.rs")),
+        ("launch_route", include_str!("launch_route.rs")),
         ("luci_config", include_str!("luci_config.rs")),
         ("luci_readouts", include_str!("luci_readouts.rs")),
         ("log_bundle", include_str!("log_bundle.rs")),
@@ -301,6 +323,10 @@ mod timer_ownership_tests {
         ("rating_request", include_str!("rating_request.rs")),
         ("runtime", include_str!("runtime.rs")),
         ("runtime_health", include_str!("runtime_health.rs")),
+        (
+            "server_qualification",
+            include_str!("server_qualification.rs"),
+        ),
         ("service_config", include_str!("service_config.rs")),
         ("service_lifecycle", include_str!("service_lifecycle.rs")),
         ("sqm_projection", include_str!("sqm_projection.rs")),
@@ -315,12 +341,14 @@ mod timer_ownership_tests {
         ("sqm_identity", include_str!("sqm_identity.rs")),
         ("sqm_recovery", include_str!("sqm_recovery.rs")),
         ("sqm_start_events", include_str!("sqm_start_events.rs")),
+        ("sqm_runner", include_str!("sqm_runner.rs")),
         (
             "sqm_recovery_openwrt",
             include_str!("sqm_recovery_openwrt.rs"),
         ),
         ("state", include_str!("state.rs")),
         ("traffic_classifier", include_str!("traffic_classifier.rs")),
+        ("uci_edits", include_str!("uci_edits.rs")),
     ];
 
     fn allowed_sleeps(module: &str) -> Vec<&'static str> {

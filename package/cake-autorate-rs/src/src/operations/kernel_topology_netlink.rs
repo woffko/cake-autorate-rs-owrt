@@ -2991,12 +2991,15 @@ mod tests {
         KernelTopologyQuery {
             target_interface: "eth0".to_string(),
             route: OperationRouteIdentity {
+                dns_server: None,
+                device_ifindex: None,
                 mode: OperationRouteMode::Main,
                 mwan3_member: None,
                 l3_device: "eth0".to_string(),
                 source_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))),
                 fwmark: None,
                 routing_table: Some(254),
+                fwmark_mask: None,
             },
             private_namespace: Default::default(),
         }

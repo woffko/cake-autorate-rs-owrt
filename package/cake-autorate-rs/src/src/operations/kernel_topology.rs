@@ -1571,12 +1571,15 @@ mod tests {
 
     fn route() -> OperationRouteIdentity {
         OperationRouteIdentity {
+            dns_server: None,
+            device_ifindex: None,
             mode: OperationRouteMode::Main,
             mwan3_member: None,
             l3_device: "eth0".to_string(),
             source_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
             fwmark: None,
             routing_table: Some(254),
+            fwmark_mask: None,
         }
     }
 

@@ -173,6 +173,62 @@ pub(crate) struct NativeBootstrapApplyPlan {
 }
 
 impl NativeBootstrapApplyPlan {
+    /// Produce historical bytes for recovery fixtures without making an old
+    /// source projection valid under today's execution constructor.
+    #[cfg(test)]
+    pub(crate) fn historical_probe_manifest_for_test(&self) -> Result<(Vec<u8>, String), String> {
+        let historical_authority = self.source_apply.historical_probe_identity_for_test()?;
+        let historical_candidate = composite_candidate_id(
+            &self.identity.request_sha256,
+            &historical_authority,
+            &self.identity.bootstrap_policy_sha256,
+            &self.identity.managed_config_sha256,
+            self.identity.managed_config_action_count,
+            &self.absent_baseline,
+        );
+        let mut manifest = String::from_utf8(self.canonical_manifest_bytes()?)
+            .map_err(|_| "fixture manifest is not UTF-8")?;
+        for (current, historical) in [
+            (
+                self.source_authority.manifest_sha256(),
+                historical_authority.manifest_sha256(),
+            ),
+            (
+                self.source_authority.candidate_id(),
+                historical_authority.candidate_id(),
+            ),
+            (
+                self.identity.composite_candidate_id.as_str(),
+                historical_candidate.as_str(),
+            ),
+        ] {
+            assert_eq!(manifest.matches(current).count(), 1);
+            manifest = manifest.replace(current, historical);
+        }
+        Ok((manifest.into_bytes(), historical_candidate))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_legacy_managed_probe_defaults_for_test(mut self) -> Result<Self, String> {
+        self.managed_config = self
+            .managed_config
+            .with_legacy_managed_probe_defaults_for_test()?;
+        self.identity.managed_config_sha256 = self.managed_config.canonical_sha256()?;
+        self.identity.managed_config_action_count =
+            u16::try_from(self.managed_config.action_count())
+                .map_err(|_| "legacy fixture action count overflow")?;
+        self.identity.composite_candidate_id = composite_candidate_id(
+            &self.identity.request_sha256,
+            &self.source_authority,
+            &self.identity.bootstrap_policy_sha256,
+            &self.identity.managed_config_sha256,
+            self.identity.managed_config_action_count,
+            &self.absent_baseline,
+        );
+        self.validate_exact_bindings()?;
+        Ok(self)
+    }
+
     pub(crate) fn from_verified_source(
         source_apply: NativeApplyExecutionPlan,
         policy: NativeBootstrapApplyPolicy,
@@ -755,12 +811,15 @@ pub(crate) mod tests {
             speedtest_server_id: Some(17_372),
             speedtest_topology: None,
             route: OperationRouteIdentity {
+                dns_server: None,
+                device_ifindex: None,
                 mode: OperationRouteMode::Main,
                 mwan3_member: None,
                 l3_device: "pppoe-wan".to_string(),
                 source_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2))),
                 fwmark: None,
                 routing_table: None,
+                fwmark_mask: None,
             },
             target_state: OperationTargetState::AbsentBootstrap,
             capture_policy: Some(
@@ -778,7 +837,11 @@ pub(crate) mod tests {
             allow_sqm_disable: true,
             allow_active_traffic: false,
             scheduled_auto_apply_requested: false,
-            traffic_budget_bytes: 1_000_000_000,
+            traffic_budget: crate::operations::protocol::TrafficPolicy::Capped {
+                max_bytes: 1_000_000_000,
+            },
+            traffic_policy_explicit: false,
+            traffic_plan: None,
         }
     }
 
@@ -1000,9 +1063,15 @@ pub(crate) mod tests {
     fn v7_manifest_binds_capture_namespace_policy_config_and_frozen_v4_identity() {
         let source = source_apply(&request(), Topology::Both);
         let source_v4 = source.canonical_manifest_bytes().unwrap();
-        assert_eq!(source_v4.len(), 11_171);
+        let historical_v4 = source
+            .clone()
+            .with_legacy_probe_defaults_for_test()
+            .unwrap()
+            .canonical_manifest_bytes()
+            .unwrap();
+        assert_eq!(historical_v4.len(), 11_171);
         assert_eq!(
-            sha256_hex(&source_v4),
+            sha256_hex(&historical_v4),
             "fa6d15cd64adbca95b6be077b5afd219b88cd7d391c9755dc42c865e45d5d6e6"
         );
         let mut existing_request = request();
@@ -1019,11 +1088,19 @@ pub(crate) mod tests {
         let bytes = plan.canonical_manifest_bytes().unwrap();
         let repeated = plan.canonical_manifest_bytes().unwrap();
         let text = String::from_utf8(bytes.clone()).unwrap();
-        assert_eq!(bytes.len(), 10_691);
+        assert!(bytes.len() < 10_623);
+        let legacy = plan
+            .clone()
+            .with_legacy_managed_probe_defaults_for_test()
+            .unwrap();
+        let (legacy_bytes, _) = legacy.historical_probe_manifest_for_test().unwrap();
+        assert_eq!(legacy_bytes.len(), 10_691);
         assert_eq!(
-            sha256_hex(&bytes),
+            sha256_hex(&legacy_bytes),
             "82044ad361bcea612cf70366a120f5bdc6d8ee2989ac4e425fe523f57644b17c"
         );
+        assert!(!text.contains("\"option\":\"ping_extra_args\""));
+        assert_ne!(bytes, legacy_bytes);
 
         assert_eq!(bytes, repeated);
         assert!(bytes.len() < MAX_NATIVE_BOOTSTRAP_APPLY_MANIFEST_BYTES);
@@ -1047,7 +1124,7 @@ pub(crate) mod tests {
             "\"kernel_namespace_seed\":\"{}\"",
             "ee".repeat(16)
         )));
-        assert_eq!(plan.identity.managed_config_action_count, 124);
+        assert_eq!(plan.identity.managed_config_action_count, 116);
         assert!(usize::from(plan.identity.managed_config_action_count) > 96);
         assert!(
             usize::from(plan.identity.managed_config_action_count)
@@ -1055,7 +1132,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             plan.identity.source_apply_v4_manifest_sha256,
-            "fa6d15cd64adbca95b6be077b5afd219b88cd7d391c9755dc42c865e45d5d6e6"
+            sha256_hex(&source_v4)
         );
         assert_eq!(
             plan.canonical_manifest_sha256().unwrap(),

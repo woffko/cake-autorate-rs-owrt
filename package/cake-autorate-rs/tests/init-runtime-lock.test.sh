@@ -47,8 +47,26 @@ harness_main() {
 	export CAKE_TEST_LIFECYCLE_LOG
 	cat >"$DAEMON" <<'EOF'
 #!/bin/sh
+source_before=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+source_after=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 case "$*" in
+	'--service-lifecycle reload')
+		# This harness exercises legacy migration and explicit full restart.
+		# Selective Rust routing has its own protocol/runtime test coverage.
+		printf '%s\n' 'service-reload-v1 legacy'
+		;;
+	'--service-lifecycle preflight-start'|'--service-lifecycle preflight-reload')
+		[ "${CAKE_AUTORATE_SERVICE_LOCK_BORROW:-}" = 1 ] || exit 74
+		[ "${CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_FD:-}" = 8 ] || exit 74
+		if flock -sn "$CAKE_AUTORATE_RUNTIME_LOCK_ROOT/runtime.guard" true; then
+			exit 74
+		fi
+		printf '%s\n' native-preflight-start >> "$CAKE_TEST_LIFECYCLE_LOG"
+		[ "${CAKE_TEST_FAIL_PREFLIGHT:-0}" != 1 ] || exit 72
+		printf '%s\n' "service-preflight-v2 $source_before"
+		;;
 	'--service-lifecycle prepare-start')
+		[ -z "${CAKE_AUTORATE_SERVICE_SOURCE_ID:-}" ] || [ "$CAKE_AUTORATE_SERVICE_SOURCE_ID" = "$source_after" ] || exit 76
 		if [ -e "$CAKE_AUTORATE_RUNTIME_LOCK_ROOT/native-apply-recovery/current" ]; then
 			exit 70
 		fi
@@ -65,7 +83,12 @@ case "$*" in
 		[ "${CAKE_AUTORATE_SERVICE_LOCK_BORROW:-}" = 1 ]
 		[ "${CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_FD:-}" = 8 ]
 		printf '%s\n' native-execute-stop >> "$CAKE_TEST_LIFECYCLE_LOG"
-		printf '%s\n' 'service-stop-v1 ok'
+		if [ -n "${CAKE_AUTORATE_SERVICE_SOURCE_ID:-}" ]; then
+			[ "$CAKE_AUTORATE_SERVICE_SOURCE_ID" = "$source_before" ] || exit 76
+			printf '%s\n' "service-stop-v2 $source_after"
+		else
+			printf '%s\n' 'service-stop-v1 ok'
+		fi
 		;;
 	'--service-lifecycle confirm-started')
 		flock -sn "$CAKE_AUTORATE_RUNTIME_LOCK_ROOT/runtime.guard" true || exit 73
@@ -236,12 +259,17 @@ done
 # an Auto-Tune-style shared lock is active.  In particular, stop must exit
 # before the rc.common wrapper reaches procd_kill().
 for mode in start stop reload restart; do
-	if sh "$0" harness "$root" "$log" "$mode" >/dev/null 2>&1; then
+	if sh "$0" harness "$root" "$log" "$mode" >"$work/stdout" 2>"$work/stderr"; then
 		echo "$mode unexpectedly ran while the shared runtime lock was held" >&2
 		exit 1
 	fi
 	[ ! -s "$log" ] || {
 		echo "$mode mutated service or SQM state before reporting a busy lock" >&2
+		exit 1
+	}
+	[ ! -s "$work/stdout" ] || { echo "busy response polluted native stdout protocol" >&2; exit 1; }
+	grep -q 'currently owns a managed interface' "$work/stderr" || {
+		echo "$mode did not expose its safe busy reason on stderr" >&2
 		exit 1
 	}
 done
@@ -310,7 +338,8 @@ rm -f "$root/native-apply-recovery/current"
 
 sh "$0" harness "$root" "$log" reload
 
-expected="native-execute-stop
+expected="native-preflight-start
+native-execute-stop
 procd-kill
 stop-start-boundary
 native-prepare-start
@@ -331,7 +360,8 @@ actual="$(cat "$log")"
 : > "$log"
 sh "$0" borrowed "$root" "$log" restart
 actual="$(cat "$log")"
-expected_borrowed="native-execute-stop
+expected_borrowed="native-preflight-start
+native-execute-stop
 procd-kill
 stop-start-boundary
 native-prepare-start
@@ -356,5 +386,21 @@ fi
 	echo "failed controller readiness was not attempted after releasing the lock" >&2
 	exit 1
 }
+
+for mode in reload restart; do
+	: > "$log"
+	if CAKE_TEST_FAIL_PREFLIGHT=1 sh "$0" harness "$root" "$log" "$mode" >/dev/null 2>&1; then
+		echo "$mode ignored a failed candidate preflight" >&2
+		exit 1
+	fi
+	[ "$(cat "$log")" = native-preflight-start ] || {
+		echo "$mode stopped a healthy service after failed preflight" >&2
+		exit 1
+	}
+	flock -sn "$root/runtime.guard" true || {
+		echo "$mode did not release its own lock after failed preflight" >&2
+		exit 1
+	}
+done
 
 echo "init runtime-lock lifecycle tests passed"

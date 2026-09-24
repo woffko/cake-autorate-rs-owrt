@@ -3023,12 +3023,15 @@ mod tests {
             speedtest_server_id: Some(17_372),
             speedtest_topology: None,
             route: OperationRouteIdentity {
+                dns_server: None,
+                device_ifindex: None,
                 mode: OperationRouteMode::Main,
                 mwan3_member: None,
                 l3_device: "pppoe-wan".to_string(),
                 source_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
                 fwmark: None,
                 routing_table: None,
+                fwmark_mask: None,
             },
             target_state: OperationTargetState::ExistingManaged,
             capture_policy: None,
@@ -3044,7 +3047,11 @@ mod tests {
             allow_sqm_disable: true,
             allow_active_traffic: false,
             scheduled_auto_apply_requested: false,
-            traffic_budget_bytes: 1_000_000_000,
+            traffic_budget: crate::operations::protocol::TrafficPolicy::Capped {
+                max_bytes: 1_000_000_000,
+            },
+            traffic_policy_explicit: false,
+            traffic_plan: None,
         };
         let proposal = build_proposal_for_profile_with_context(
             &[100_000.0, 101_000.0],
@@ -3151,6 +3158,7 @@ mod tests {
         attest_count: u8,
         restart_count: u8,
         fail_attest: bool,
+        service_admission: Option<(PathBuf, PathBuf)>,
         drift_original_on_second_attest: bool,
         drift_sqm_on_second_attest: bool,
         fail_apply_after_partial_write: bool,
@@ -3170,6 +3178,7 @@ mod tests {
                 attest_count: 0,
                 restart_count: 0,
                 fail_attest: false,
+                service_admission: None,
                 drift_original_on_second_attest: false,
                 drift_sqm_on_second_attest: false,
                 fail_apply_after_partial_write: false,
@@ -3187,11 +3196,17 @@ mod tests {
             &mut self,
             _: &NativeApplyExecutionPlan,
         ) -> Result<bool, String> {
+            if let Some((config, runtime)) = &self.service_admission {
+                super::super::service_lifecycle::require_no_pending_start_in(config, runtime)?;
+            }
             Ok(fs::read(&self.cake).unwrap() == b"cake-after\n"
                 && fs::read(&self.sqm).unwrap() == b"sqm-after\n")
         }
 
         fn attest_before_apply(&mut self, _: &NativeApplyExecutionPlan) -> Result<(), String> {
+            if let Some((config, runtime)) = &self.service_admission {
+                super::super::service_lifecycle::require_no_pending_start_in(config, runtime)?;
+            }
             self.events.push("attest-before");
             self.attest_count = self.attest_count.saturating_add(1);
             if self.fail_attest {
@@ -4442,6 +4457,46 @@ mod tests {
     }
 
     #[test]
+    fn r4_pending_service_start_blocks_native_apply_before_files_and_noop_acceptance() {
+        for already_applied in [false, true] {
+            let (root, cake, sqm, recovery, lock) = transaction_fixture("pending-service-start");
+            if already_applied {
+                fs::write(&cake, b"cake-after\n").unwrap();
+                fs::write(&sqm, b"sqm-after\n").unwrap();
+            }
+            let before = [fs::read(&cake).unwrap(), fs::read(&sqm).unwrap()];
+            let config = cake.parent().unwrap().to_path_buf();
+            let journal = config.join(".start-uci");
+            fs::create_dir(&journal).unwrap();
+            fs::set_permissions(&journal, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::create_dir(journal.join("pending")).unwrap();
+            let plan = plan();
+            let manifest = plan.canonical_manifest_bytes().unwrap();
+            let mut backend = FakeBackend::new(&cake, &sqm);
+            backend.service_admission = Some((config, root.join("service-run")));
+            let error = execute_native_apply_commit(
+                &plan,
+                &manifest,
+                NativeApplyTransactionPaths {
+                    recovery_root: &recovery,
+                    global_lock: &lock,
+                    cake_config: &cake,
+                    sqm_config: &sqm,
+                },
+                &mut backend,
+            )
+            .unwrap_err();
+            assert_eq!(error, "native-apply-service-publication-recovery-pending");
+            assert!(backend.events.is_empty());
+            assert_eq!(fs::read(&cake).unwrap(), before[0]);
+            assert_eq!(fs::read(&sqm).unwrap(), before[1]);
+            assert!(!recovery.join(CURRENT_DIRECTORY).exists());
+            assert!(journal.join("pending").exists());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn pre_attestation_failure_creates_no_recovery_or_config_change() {
         let (root, cake, sqm, recovery, lock) = transaction_fixture("pre-attest");
         let plan = plan();
@@ -5002,6 +5057,8 @@ mod tests {
         )));
         assert!(batch.contains("delete cake-autorate.wan_sqm.service_dl_cap_kbps\n"));
         assert!(!batch.contains("sh -c"));
+        assert!(!batch.contains(".transport_"));
+        assert!(!batch.contains(".throughput_guard_enabled="));
         assert!(!batch.contains("0.8"));
         assert_eq!(
             batch
@@ -5010,6 +5067,248 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    #[ignore = "requires explicit SDK libuci paths; never uses live configuration"]
+    fn r7_real_uci_apply_batch_preserves_permanent_monitoring_choices() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let uci = std::env::var_os("CAKE_TEST_UCI").expect("explicit UCI required");
+        let loader = std::env::var_os("CAKE_TEST_MUSL_LOADER");
+        let root = temp_root("r7-real-uci-privacy");
+        fs::create_dir(&root).unwrap();
+        let config = root.join("config");
+        let delta = root.join("delta");
+        fs::create_dir(&config).unwrap();
+        fs::create_dir(&delta).unwrap();
+        let command = || {
+            let mut cmd = Command::new(loader.as_ref().unwrap_or(&uci));
+            if loader.is_some() {
+                cmd.arg("--library-path")
+                    .arg(
+                        std::env::var_os("CAKE_TEST_LIB_DIR").expect("explicit libraries required"),
+                    )
+                    .arg(&uci);
+            }
+            cmd.arg("-c")
+                .arg(&config)
+                .arg("-C")
+                .arg(&config)
+                .arg("-t")
+                .arg(&delta)
+                .arg("-q");
+            cmd
+        };
+        let plan = plan();
+        let batch = canonical_native_uci_batch(&plan).unwrap();
+        for (monitor, controller) in [("0", "0"), ("1", "0"), ("1", "1")] {
+            let choices = [
+                ("transport_latency_enabled", monitor),
+                ("transport_controller_enabled", controller),
+                ("transport_probe_backend", "websocket"),
+                (
+                    "transport_probe_endpoint",
+                    "wss://never-contact.invalid/user-choice",
+                ),
+                ("transport_probe_timeout_s", "3"),
+                ("external_ip_check_enabled", "0"),
+                ("throughput_guard_enabled", "0"),
+            ];
+            let mut original = String::from("config cake_autorate 'wan_sqm'\n");
+            for (key, value) in choices {
+                original.push_str(&format!(" option {key} '{value}'\n"));
+            }
+            // Seed deletions so strict libuci batch success is meaningful.
+            for mutation in &plan.uci_mutations {
+                if mutation.action == NativeUciMutationAction::Delete {
+                    original.push_str(&format!(" option {} '1'\n", mutation.option));
+                }
+            }
+            fs::write(config.join("cake-autorate"), original).unwrap();
+            let mut child = command()
+                .arg("batch")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(&batch).unwrap();
+            let result = child.wait_with_output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            for (key, value) in choices {
+                let result = command()
+                    .arg("get")
+                    .arg(format!("cake-autorate.wan_sqm.{key}"))
+                    .output()
+                    .unwrap();
+                assert!(result.status.success());
+                assert_eq!(result.stdout, format!("{value}\n").as_bytes(), "{key}");
+            }
+            let result = command()
+                .arg("get")
+                .arg("cake-autorate.wan_sqm.base_dl_shaper_rate_kbps")
+                .output()
+                .unwrap();
+            assert!(result.status.success());
+            assert_eq!(
+                result.stdout,
+                format!("{}\n", plan.download.base_kbps.unwrap()).as_bytes()
+            );
+            assert!(command().arg("changes").output().unwrap().stdout.is_empty());
+            // Reconstruct the controller configuration from committed libuci
+            // output, not the input map: restart must consume the preserved
+            // choices with the same semantics as the existing instance.
+            let shown = command()
+                .arg("show")
+                .arg("cake-autorate.wan_sqm")
+                .output()
+                .unwrap();
+            assert!(shown.status.success());
+            let restarted = crate::Config::from_uci_text(
+                "wan_sqm",
+                std::str::from_utf8(&shown.stdout).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(restarted.transport_latency_enabled, monitor == "1");
+            assert_eq!(restarted.transport_controller_enabled, controller == "1");
+            assert_eq!(restarted.transport_probe_backend, "websocket");
+            assert_eq!(
+                restarted.transport_probe_endpoint,
+                "wss://never-contact.invalid/user-choice"
+            );
+            assert_eq!(restarted.transport_probe_timeout_s, 3);
+            assert!(!restarted.external_ip_check_enabled);
+            assert!(!restarted.throughput_guard_enabled);
+            // With no admitted bounded capture, ordinary runtime admission
+            // must follow the persisted opt-in, not the prior test session.
+            assert_eq!(
+                crate::transport_probe_runtime_required(
+                    restarted.transport_latency_enabled,
+                    false,
+                    false,
+                ),
+                monitor == "1"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires the private mount/network namespace OpenWrt UCI fixture"]
+    fn r7_openwrt_materializer_preserves_monitoring_and_foreign_sections() {
+        use super::super::autotune_apply_openwrt::OpenWrtNativeApplyBackend;
+        let parent = std::env::var("CAKE_R7_PARENT_MOUNT_NS").expect("namespace runner required");
+        let parent_net =
+            std::env::var("CAKE_R7_PARENT_NET_NS").expect("network isolation required");
+        assert_ne!(
+            fs::read_link("/proc/self/ns/net")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            parent_net
+        );
+        assert_ne!(
+            fs::read_link("/proc/self/ns/mnt")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            parent
+        );
+        let root = temp_root("r7-production-materializer");
+        fs::create_dir(&root).unwrap();
+        let config = root.join("config");
+        fs::create_dir(&config).unwrap();
+        let sys = root.join("sys");
+        fs::create_dir_all(sys.join("pppoe-wan")).unwrap();
+        std::env::set_var("CAKE_AUTORATE_SYS_CLASS_NET", &sys);
+        let cake = config.join("cake-autorate");
+        let sqm = config.join("sqm");
+        let plan = plan();
+        let manifest = plan.canonical_manifest_bytes().unwrap();
+        for (monitor, controller) in [("0", "0"), ("1", "0"), ("1", "1")] {
+            let original = format!(
+                "config cake_autorate 'wan_sqm'\n option enabled '1'\n option manage_sqm '1'\n option sqm_interface 'pppoe-wan'\n option sqm_section 'wan_sqm'\n option transport_latency_enabled '{monitor}'\n option transport_controller_enabled '{controller}'\n option transport_probe_backend 'websocket'\n option transport_probe_endpoint 'wss://never-contact.invalid/user-choice'\n option external_ip_check_enabled '0'\n\nconfig fixture 'unrelated'\n option marker 'preserve this'\n"
+            );
+            fs::write(&cake, original).unwrap();
+            fs::write(&sqm, "config queue 'foreign'\n option interface 'unrelated0'\n option enabled '0'\n option marker 'preserve that'\n").unwrap();
+            let before = NativeApplyConfigPairSnapshot::capture(&cake, &sqm).unwrap();
+            let mut backend = OpenWrtNativeApplyBackend;
+            let candidate = backend.materialize_candidate(&plan, &before).unwrap();
+            assert_eq!(fs::read(&cake).unwrap(), before.cake());
+            assert_eq!(fs::read(&sqm).unwrap(), before.sqm());
+            assert_eq!(
+                candidate.authority(),
+                canonical_native_uci_batch(&plan).unwrap()
+            );
+
+            let recovery = root.join(format!("recovery-{monitor}-{controller}"));
+            let store = NativeApplyRecoveryStore::new(&recovery);
+            store
+                .prepare_write_ahead(&plan, &manifest, &before, &candidate)
+                .unwrap();
+            let mutation = store.begin_mutation(&cake, &sqm).unwrap();
+            mutation.install_candidate_files().unwrap();
+            drop(mutation);
+            let shown = Command::new("/sbin/uci")
+                .arg("-c")
+                .arg(&config)
+                .arg("-C")
+                .arg(&config)
+                .arg("-t")
+                .arg(&config)
+                .arg("-q")
+                .arg("show")
+                .arg("cake-autorate")
+                .output()
+                .unwrap();
+            assert!(shown.status.success());
+            let text = std::str::from_utf8(&shown.stdout).unwrap();
+            let cfg = crate::Config::from_uci_text("wan_sqm", text).unwrap();
+            assert_eq!(cfg.transport_latency_enabled, monitor == "1");
+            assert_eq!(cfg.transport_controller_enabled, controller == "1");
+            assert_eq!(cfg.transport_probe_backend, "websocket");
+            assert_eq!(
+                cfg.transport_probe_endpoint,
+                "wss://never-contact.invalid/user-choice"
+            );
+            assert!(!cfg.external_ip_check_enabled);
+            assert!(text.contains("cake-autorate.unrelated.marker='preserve this'"));
+            let shown = Command::new("/sbin/uci")
+                .arg("-c")
+                .arg(&config)
+                .arg("-C")
+                .arg(&config)
+                .arg("-t")
+                .arg(&config)
+                .arg("-q")
+                .arg("show")
+                .arg("sqm")
+                .output()
+                .unwrap();
+            assert!(shown.status.success());
+            let text = std::str::from_utf8(&shown.stdout).unwrap();
+            assert!(text.contains("sqm.foreign.marker='preserve that'"));
+            assert!(
+                text.contains("sqm.wan_sqm.download="),
+                "projection must execute"
+            );
+            store
+                .transition(
+                    NativeApplyRecoveryState::MutationStarted,
+                    NativeApplyRecoveryState::RollbackRequired,
+                )
+                .unwrap();
+            store.restore_config_files(&cake, &sqm).unwrap();
+            assert_eq!(fs::read(&cake).unwrap(), before.cake());
+            assert_eq!(fs::read(&sqm).unwrap(), before.sqm());
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

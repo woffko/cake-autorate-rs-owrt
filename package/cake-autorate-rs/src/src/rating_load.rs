@@ -237,6 +237,17 @@ impl RatingLoadDetector {
         !self.capture_job_id.is_empty()
     }
 
+    /// Keep invalidation sticky for this job, including later phase requests.
+    #[cfg(any(feature = "calibration", test))]
+    pub fn invalidate_capture(&mut self, reason: &'static str) -> bool {
+        if self.capture_job_id.is_empty() {
+            return false;
+        }
+        self.capture_contaminated = true;
+        self.capture_contamination_reason = reason;
+        true
+    }
+
     #[cfg(any(feature = "calibration", test))]
     pub fn capture_contaminated(&self) -> bool {
         self.capture_contaminated
@@ -827,6 +838,41 @@ fn supports(current: RatingPhase, observed: RatingPhase) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r5_pinger_invalidation_survives_same_job_phase_changes() {
+        let now = Instant::now();
+        let mut detector = RatingLoadDetector::new(now);
+        assert!(!detector.invalidate_capture("pinger-restarted"));
+        detector.set_capture(
+            Some("job-one"),
+            Some("speedtest"),
+            Some(RatingPhase::Download),
+            0.0,
+            0.0,
+            now,
+        );
+        assert!(detector.invalidate_capture("pinger-restarted"));
+        assert!(!detector.set_capture(
+            Some("job-one"),
+            Some("speedtest"),
+            Some(RatingPhase::Upload),
+            0.0,
+            0.0,
+            now
+        ));
+        assert!(detector.capture_contaminated());
+        assert_eq!(detector.capture_contamination_reason, "pinger-restarted");
+        assert!(detector.set_capture(
+            Some("job-two"),
+            Some("speedtest"),
+            Some(RatingPhase::Download),
+            0.0,
+            0.0,
+            now
+        ));
+        assert!(!detector.capture_contaminated());
+    }
 
     fn cfg() -> RatingLoadConfig {
         RatingLoadConfig {

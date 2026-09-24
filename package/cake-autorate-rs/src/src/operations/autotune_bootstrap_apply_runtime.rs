@@ -88,6 +88,16 @@ pub(crate) trait NativeBootstrapApplyBackend {
         baseline: &AbsentRuntimeBaseline,
     ) -> Result<(), String>;
 
+    /// The original files/kernel are restored, but the transaction is not
+    /// complete until its selected controller-generation update is settled.
+    /// Preserve peer generations and retain recovery on any failed proof.
+    fn settle_absent_controller_generation(
+        &mut self,
+        request: &OperationRequest,
+        baseline: &AbsentRuntimeBaseline,
+        lock: &NativeApplyGlobalLock,
+    ) -> Result<(), String>;
+
     /// Verify a commit-accepted candidate during restart recovery when the
     /// in-memory selected plan is no longer available.
     fn verify_recovered_candidate(
@@ -392,6 +402,8 @@ fn rollback_bootstrap_apply<B: NativeBootstrapApplyBackend>(
         NativeBootstrapApplyRecoveryState::Restored => {
             store.verify_live_original_files(cake_config, sqm_config)?;
             backend.verify_absent_restored(request, &baseline)?;
+            backend.settle_absent_controller_generation(request, &baseline, lock)?;
+            store.verify_live_original_files(cake_config, sqm_config)?;
             return store.clear_restored();
         }
     }
@@ -411,6 +423,8 @@ fn rollback_bootstrap_apply<B: NativeBootstrapApplyBackend>(
         NativeBootstrapApplyRecoveryState::RollbackRequired,
         NativeBootstrapApplyRecoveryState::Restored,
     )?;
+    backend.settle_absent_controller_generation(request, &baseline, lock)?;
+    store.verify_live_original_files(cake_config, sqm_config)?;
     store.clear_restored()
 }
 
@@ -646,6 +660,14 @@ mod tests {
     }
 
     impl NativeBootstrapApplyBackend for FakeBackend {
+        fn settle_absent_controller_generation(
+            &mut self,
+            _: &OperationRequest,
+            _: &AbsentRuntimeBaseline,
+            _: &NativeApplyGlobalLock,
+        ) -> Result<(), String> {
+            self.event("settle_generation")
+        }
         fn candidate_already_applied(
             &mut self,
             _plan: &NativeBootstrapApplyPlan,
@@ -927,6 +949,7 @@ mod tests {
             "quiesce_candidate",
             "discard_pending",
             "verify_absent",
+            "settle_generation",
         ]));
         assert!(!backend.events.contains(&"contain"));
     }
@@ -969,6 +992,7 @@ mod tests {
                 "quiesce_candidate",
                 "discard_pending",
                 "verify_absent",
+                "settle_generation",
             ]
         );
     }
@@ -1103,6 +1127,84 @@ mod tests {
                 "verify_recovered_candidate",
             ]
         );
+    }
+
+    #[test]
+    fn r6_restart_recovers_legacy_persisted_pin_without_rebuilding_current_plan() {
+        for accepted in [false, true] {
+            let fixture = Fixture::new(if accepted {
+                "legacy-pin-forward"
+            } else {
+                "legacy-pin-rollback"
+            });
+            let current = fixture_plan();
+            let legacy = current
+                .clone()
+                .with_legacy_managed_probe_defaults_for_test()
+                .unwrap();
+            let store = fixture.store();
+            store
+                .prepare(
+                    &legacy,
+                    &legacy.canonical_manifest_bytes().unwrap(),
+                    &fixture.cake,
+                    &fixture.sqm,
+                )
+                .unwrap();
+            let record = store
+                .install_historical_probe_manifest_for_test(&legacy)
+                .unwrap();
+            assert!(store.verify_exact_plan(&current).is_err());
+            assert_eq!(store.read_record().unwrap().unwrap(), record);
+            let mutation = store.begin_mutation(&fixture.cake, &fixture.sqm).unwrap();
+            mutation.install_candidate_files().unwrap();
+            drop(mutation);
+            let cake_candidate = fs::read(&fixture.cake).unwrap();
+            let sqm_candidate = fs::read(&fixture.sqm).unwrap();
+            assert!(String::from_utf8_lossy(&cake_candidate).contains("ping_extra_args"));
+            assert!(String::from_utf8_lossy(&cake_candidate).contains("transport_latency_enabled"));
+            if accepted {
+                for (from, to) in [
+                    (
+                        NativeBootstrapApplyRecoveryState::MutationStarted,
+                        NativeBootstrapApplyRecoveryState::ServiceRestarted,
+                    ),
+                    (
+                        NativeBootstrapApplyRecoveryState::ServiceRestarted,
+                        NativeBootstrapApplyRecoveryState::Verified,
+                    ),
+                    (
+                        NativeBootstrapApplyRecoveryState::Verified,
+                        NativeBootstrapApplyRecoveryState::CommitAccepted,
+                    ),
+                ] {
+                    store.transition(from, to).unwrap();
+                }
+                fs::write(&fixture.sqm, &fixture.sqm_original).unwrap();
+            }
+            let mut backend = FakeBackend::default();
+            let receipt = recover_native_bootstrap_apply(fixture.paths(), &mut backend)
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipt.rolled_forward, accepted);
+            assert!(receipt.recovery_cleared);
+            assert_eq!(
+                fs::read(&fixture.cake).unwrap(),
+                if accepted {
+                    cake_candidate
+                } else {
+                    fixture.cake_original.clone()
+                }
+            );
+            assert_eq!(
+                fs::read(&fixture.sqm).unwrap(),
+                if accepted {
+                    sqm_candidate
+                } else {
+                    fixture.sqm_original.clone()
+                }
+            );
+        }
     }
 
     #[test]

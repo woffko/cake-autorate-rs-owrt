@@ -7,7 +7,7 @@ endif
 
 PKG_NAME:=luci-app-cake-autorate-rs
 PKG_VERSION:=1.0_rc27
-PKG_RELEASE:=127
+PKG_RELEASE:=128
 
 PKG_MAINTAINER:=woffko
 PKG_LICENSE:=Apache-2.0
@@ -21,7 +21,7 @@ define Package/luci-app-cake-autorate-rs
   TITLE:=LuCI support for CAKE Autorate RS
   URL:=https://github.com/woffko/cake-autorate-rs-owrt
   DEPENDS:=+cake-autorate-rs-full +luci-base +sqm-scripts +uclient-fetch +jsonfilter +nftables-json
-  EXTRA_DEPENDS:=cake-autorate-rs-full (>=1.0_rc27-r316)
+  EXTRA_DEPENDS:=cake-autorate-rs-full (>=1.0_rc27-r320)
   PROVIDES:=luci-app-cake-autorate-rs-full luci-app-sqm
   CONFLICTS:=luci-app-cake-autorate-rs-lite luci-app-sqm
   PKGARCH:=all
@@ -52,6 +52,8 @@ define Package/luci-app-cake-autorate-rs/install
 	$(CP) ./htdocs/* $(1)/www/
 	$(INSTALL_DIR) $(1)/
 	$(CP) ./root/* $(1)/
+	$(INSTALL_DIR) $(1)/usr/libexec/rpcd
+	$(LN) /usr/sbin/cake-autorated $(1)/usr/libexec/rpcd/cake-autorate-config
 endef
 
 $(eval $(call BuildPackage,luci-app-cake-autorate-rs))

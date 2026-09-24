@@ -4,7 +4,7 @@ START=97
 STOP=4
 USE_PROCD=1
 # @variant full begin
-EXTRA_COMMANDS="native_apply_register_instance"
+EXTRA_COMMANDS="native_apply_register_instance native_apply_register_mqtt"
 EXTRA_HELP="\tnative_apply_register_instance <instance>\tInternal native Apply procd registration bridge"
 # @variant full end
 # @variant lite begin
@@ -15,6 +15,15 @@ EXTRA_HELP=""
 CONFIG="cake-autorate"
 SQM_CONFIG="sqm"
 DAEMON="/usr/sbin/cake-autorated"
+SERVICE_SOURCE_ID=
+SERVICE_FORCE_RESTART=0
+SERVICE_RELOAD_UNCHANGED=0
+
+service_report_error() {
+	printf '%s\n' "$1" >&2
+	logger -t cake-autorate "$1"
+}
+
 # @variant full begin
 RUNTIME_LOCK_LIB="${CAKE_AUTORATE_RUNTIME_LOCK_LIB:-/usr/libexec/cake-autorate-rs/runtime-lock}"
 RUNTIME_LOCK_AVAILABLE=0
@@ -24,8 +33,8 @@ SERVICE_RUNTIME_LOCK_HELD=0
 SERVICE_RUNTIME_LOCK_BORROWED=0
 SERVICE_RUNTIME_STOP_RELEASE_PENDING=0
 SERVICE_START_CONFIRM_PENDING=0
-SERVICE_START_CONFIRM_DEFERRED=0
 # @variant full end
+SERVICE_START_CONFIRM_DEFERRED=0
 # @variant full begin
 if [ -r "$RUNTIME_LOCK_LIB" ]; then
 	# shellcheck source=/usr/libexec/cake-autorate-rs/runtime-lock
@@ -39,7 +48,7 @@ service_runtime_lock_acquire_or_exit() {
 
 	[ "$SERVICE_RUNTIME_LOCK_HELD" -eq 0 ] || return 0
 	if [ "$RUNTIME_LOCK_AVAILABLE" -ne 1 ]; then
-		logger -t cake-autorate "refusing to $operation: shared runtime-lock helper is unavailable"
+		service_report_error "refusing to $operation: shared runtime-lock helper is unavailable"
 		exit 1
 	fi
 
@@ -58,10 +67,10 @@ service_runtime_lock_acquire_or_exit() {
 	if [ "$rc" -ne 0 ]; then
 		case "$rc" in
 			75)
-				logger -t cake-autorate "deferring $operation: Auto-Tune, rating, speed test, or recovery currently owns a managed interface"
+				service_report_error "deferring $operation: Auto-Tune, rating, speed test, or recovery currently owns a managed interface"
 				;;
 			*)
-				logger -t cake-autorate "refusing to $operation: global runtime lock could not be acquired (error $rc)"
+				service_report_error "refusing to $operation: global runtime lock could not be acquired (error $rc)"
 				;;
 		esac
 		# rc.common does not stop after a non-zero stop_service() return.  Exit
@@ -77,7 +86,7 @@ service_runtime_lock_release_or_exit() {
 
 	[ "$SERVICE_RUNTIME_LOCK_HELD" -eq 1 ] || return 0
 	if ! runtime_lock_release_global; then
-		logger -t cake-autorate "failed to release global runtime lock after $operation"
+		service_report_error "failed to release global runtime lock after $operation"
 		# Exiting closes the kernel-held descriptor even if explicit unlock
 		# failed, and prevents any later mutation in this shell.
 		exit 1
@@ -89,22 +98,29 @@ service_runtime_lock_release_or_exit() {
 # @variant full end
 
 service_add_instance() {
-	procd_open_instance "$1"
-	procd_set_param command "$DAEMON" --instance "$1"
-	procd_set_param respawn 3600 5 5
-	procd_set_param stdout 1
-	procd_set_param stderr 1
+	[ "$#" -eq 1 ] || { [ "$#" -eq 2 ] && validate_service_generation "$2"; } || return 1
+	procd_open_instance "$1" || return 1
+	procd_set_param command "$DAEMON" --instance "$1" || return 1
+	if [ "$#" -eq 2 ]; then
+		procd_set_param env "CAKE_AUTORATE_SERVICE_CONFIG_ID=$2" || return 1
+	fi
+	procd_set_param respawn 3600 5 5 || return 1
+	procd_set_param stdout 1 || return 1
+	procd_set_param stderr 1 || return 1
 	procd_close_instance
 }
 
 # @variant full begin
 service_add_mqtt_instance() {
-	procd_open_instance "mqtt_$1"
-	procd_set_param command "$DAEMON" --mqtt-publisher "$1"
-	procd_set_param respawn 3600 5 5
-	procd_set_param term_timeout 5
-	procd_set_param stdout 1
-	procd_set_param stderr 1
+	procd_open_instance "mqtt_$1" || return 1
+	procd_set_param command "$DAEMON" --mqtt-publisher "$1" || return 1
+	if [ -n "${2:-}" ]; then
+		procd_set_param env "CAKE_AUTORATE_MQTT_READY_ENDPOINT=$2" || return 1
+	fi
+	procd_set_param respawn 3600 5 5 || return 1
+	procd_set_param term_timeout 5 || return 1
+	procd_set_param stdout 1 || return 1
+	procd_set_param stderr 1 || return 1
 	procd_close_instance
 }
 # @variant full end
@@ -125,6 +141,48 @@ validate_service_instance_list() {
 		[ "${#instance}" -le 64 ] || return 1
 		case ",$seen," in *",$instance,"*) return 1 ;; esac
 		seen="${seen:+$seen,}$instance"
+	done
+}
+
+validate_service_generation() {
+	[ "${#1}" -eq 64 ] || return 1
+	case "$1" in *[!0-9a-f]*) return 1 ;; esac
+}
+
+validate_service_generation_list() {
+	local pairs="$1" old_ifs pair instance generation names="" count=0
+
+	[ "$pairs" != - ] || return 0
+	[ "${#pairs}" -le 8319 ] || return 1
+	case "$pairs" in ''|,*|*,|*,,*|*[!A-Za-z0-9_:,]*) return 1 ;; esac
+	old_ifs="$IFS"
+	IFS=,
+	set -- $pairs
+	IFS="$old_ifs"
+	for pair in "$@"; do
+		instance="${pair%%:*}"
+		generation="${pair#*:}"
+		[ "$instance" != "$pair" ] || return 1
+		validate_service_generation "$generation" || return 1
+		names="${names:+$names,}$instance"
+		count=$((count + 1))
+		[ "$count" -le 64 ] || return 1
+	done
+	validate_service_instance_list "$names"
+}
+
+add_controller_generations() {
+	local pairs="$1" old_ifs pair
+
+	# Validate the entire response before opening the first procd instance.
+	validate_service_generation_list "$pairs" || return 1
+	[ "$pairs" != - ] || return 0
+	old_ifs="$IFS"
+	IFS=,
+	set -- $pairs
+	IFS="$old_ifs"
+	for pair in "$@"; do
+		service_add_instance "${pair%%:*}" "${pair#*:}" || return 1
 	done
 }
 
@@ -158,33 +216,102 @@ add_mqtt_instances() {
 
 service_prepare_start() {
 	# @variant full begin
-	CAKE_AUTORATE_SERVICE_LOCK_BORROW=1 \
+	CAKE_AUTORATE_SERVICE_SOURCE_ID="${SERVICE_SOURCE_ID:-}" \
+		CAKE_AUTORATE_SERVICE_LOCK_BORROW=1 \
 		CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_FD=8 \
 		"$DAEMON" --service-lifecycle prepare-start
 	# @variant full end
 	# @variant lite begin
-	"$DAEMON" --service-lifecycle prepare-start
+	CAKE_AUTORATE_SERVICE_SOURCE_ID="${SERVICE_SOURCE_ID:-}" \
+		"$DAEMON" --service-lifecycle prepare-start
 	# @variant lite end
+}
+
+service_preflight_start() {
+	local result source_id operation=preflight-start
+	SERVICE_SOURCE_ID=
+	SERVICE_RELOAD_UNCHANGED=0
+	[ "${SERVICE_FORCE_RESTART:-0}" = 1 ] || operation=preflight-reload
+	# Rust owns candidate validation and capability admission. Shell only
+	# checks the protocol before rc.common is allowed to stop the old service.
+	# @variant full begin
+	if ! result="$(CAKE_AUTORATE_SERVICE_LOCK_BORROW=1 \
+		CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_FD=8 \
+		"$DAEMON" --service-lifecycle "$operation")"; then
+	# @variant full end
+	# @variant lite begin
+	if ! result="$("$DAEMON" --service-lifecycle "$operation")"; then
+	# @variant lite end
+		service_report_error "native service candidate preflight failed; existing service retained"
+		return 1
+	fi
+	case "$result" in
+		'service-preflight-unchanged-v1 '*)
+			[ "$operation" = preflight-reload ] || {
+				service_report_error "native preflight cannot skip an explicit restart"
+				return 1
+			}
+			source_id="${result#service-preflight-unchanged-v1 }"
+			SERVICE_RELOAD_UNCHANGED=1 ;;
+		*) source_id="${result#service-preflight-v2 }" ;;
+	esac
+	[ "$source_id" != "$result" ] && validate_service_generation "$source_id" || {
+		service_report_error "native service candidate preflight returned an invalid response"
+		return 1
+	}
+	SERVICE_SOURCE_ID="$source_id"
+}
+
+service_accept_stop_result() {
+	local result="$1" source_id
+	if [ -n "${SERVICE_SOURCE_ID:-}" ]; then
+		source_id="${result#service-stop-v2 }"
+		[ "$source_id" != "$result" ] && validate_service_generation "$source_id" || return 1
+		SERVICE_SOURCE_ID="$source_id"
+	else
+		[ "$result" = "service-stop-v1 ok" ] || return 1
+	fi
 }
 
 # @variant full begin
 native_apply_add_selected_instance() {
-	service_add_instance "$1"
+	service_add_instance "$@" || exit 1
 }
 
 native_apply_register_instance() {
-	[ "$#" -eq 1 ] || return 1
+	[ "$#" -eq 1 ] || { [ "$#" -eq 2 ] && validate_service_generation "$2"; } || return 1
 	case "$1" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
 	[ "${#1}" -le 64 ] || return 1
 	[ "${CAKE_AUTORATE_NATIVE_APPLY_RECOVERY:-0}" = 1 ] || return 1
 	[ "${CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_BORROW:-0}" = 1 ] || return 1
 	[ "${CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_FD:-}" = 8 ] || return 1
-	rc_procd native_apply_add_selected_instance "$1" >/dev/null
+	rc_procd native_apply_add_selected_instance "$@" >/dev/null
+}
+
+native_apply_add_selected_mqtt() {
+	service_add_mqtt_instance "$@" || exit 1
+}
+
+native_apply_register_mqtt() {
+	[ "$#" -eq 1 ] || [ "$#" -eq 2 ] || return 1
+	if [ "$#" -eq 2 ]; then
+		case "$2" in cmq1_*) ;; *) return 1 ;; esac
+		local endpoint_id="${2#cmq1_}"
+		[ "${#endpoint_id}" -eq 32 ] || return 1
+		case "$endpoint_id" in *[!0-9a-f]*) return 1 ;; esac
+	fi
+	case "$1" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+	[ "${#1}" -le 64 ] || return 1
+	[ "${CAKE_AUTORATE_NATIVE_APPLY_RECOVERY:-0}" = 1 ] || return 1
+	[ "${CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_BORROW:-0}" = 1 ] || return 1
+	[ "${CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_FD:-}" = 8 ] || return 1
+	rc_procd native_apply_add_selected_mqtt "$@" >/dev/null
 }
 # @variant full end
 
 start_service_locked() {
 	local result marker controller_instances
+	local generation_protocol=0
 	# @variant full begin
 	local remainder mqtt_instances
 	# @variant full end
@@ -211,36 +338,57 @@ start_service_locked() {
 		return 1
 	}
 	mqtt_instances="${remainder#* }"
-	[ "$marker" = service-start-v2 ] || {
-		logger -t cake-autorate "native service start returned an unsupported response"
-		return 1
-	}
+	case "$marker" in
+		service-start-v2) ;;
+		service-start-v3) generation_protocol=1 ;;
+		*)
+			logger -t cake-autorate "native service start returned an unsupported response"
+			return 1
+			;;
+	esac
 	case "$mqtt_instances" in *' '*) return 1 ;; esac
 	# @variant full end
 	# @variant lite begin
-	controller_instances="${result#* }"
-	[ "$marker" = service-start-v1 ] || {
-		logger -t cake-autorate "native service start returned an unsupported response"
-		return 1
-	}
+	case "$marker" in
+		service-start-v1) controller_instances="${result#* }" ;;
+		service-start-v3)
+			generation_protocol=1
+			controller_instances="${result#* }"
+			[ "$controller_instances" != "${controller_instances%% *}" ] || return 1
+			[ "${controller_instances#* }" = - ] || return 1
+			controller_instances="${controller_instances%% *}"
+			;;
+		*)
+			logger -t cake-autorate "native service start returned an unsupported response"
+			return 1
+			;;
+	esac
 	case "$controller_instances" in *' '*) return 1 ;; esac
 	# @variant lite end
-	validate_service_instance_list "$controller_instances" || {
-		logger -t cake-autorate "native service start returned an unsafe controller list"
-		return 1
-	}
+	if [ "$generation_protocol" -eq 1 ]; then
+		validate_service_generation_list "$controller_instances" || return 1
+	else
+		validate_service_instance_list "$controller_instances" || {
+			logger -t cake-autorate "native service start returned an unsafe controller list"
+			return 1
+		}
+	fi
 	# @variant full begin
 	validate_service_instance_list "$mqtt_instances" || {
 		logger -t cake-autorate "native service start returned an unsafe MQTT list"
 		return 1
 	}
 	# @variant full end
-	add_controller_instances "$controller_instances" || {
-		logger -t cake-autorate "unable to construct the complete native controller set"
-		# rc.common unconditionally serializes the accumulated JSON after
-		# start_service returns. Exit the child so a partial set cannot reach procd.
-		exit 1
-	}
+	if [ "$generation_protocol" -eq 1 ]; then
+		add_controller_generations "$controller_instances" || exit 1
+	else
+		add_controller_instances "$controller_instances" || {
+			logger -t cake-autorate "unable to construct the complete native controller set"
+			# rc.common unconditionally serializes the accumulated JSON after
+			# start_service returns. Exit the child so a partial set cannot reach procd.
+			exit 1
+		}
+	fi
 	# @variant full begin
 	add_mqtt_instances "$mqtt_instances" || {
 		logger -t cake-autorate "unable to construct the complete native MQTT set"
@@ -249,7 +397,6 @@ start_service_locked() {
 	# @variant full end
 }
 
-# @variant full begin
 service_confirm_started() {
 	local result
 
@@ -263,6 +410,7 @@ service_confirm_started() {
 	}
 }
 
+# @variant full begin
 service_started() {
 	[ "$SERVICE_START_CONFIRM_DEFERRED" -eq 0 ] || return 0
 	# A native Apply caller owns the borrowed descriptor until its Rust
@@ -275,6 +423,12 @@ service_started() {
 	service_confirm_started
 }
 # @variant full end
+# @variant lite begin
+service_started() {
+	[ "$SERVICE_START_CONFIRM_DEFERRED" -eq 0 ] || return 0
+	service_confirm_started
+}
+# @variant lite end
 
 # @variant full begin
 start_service() {
@@ -291,23 +445,51 @@ start_service() {
 		service_runtime_lock_release_or_exit "starting CAKE Autorate"
 	fi
 
-	return "$rc"
+	# rc.common ignores a callback return code and still submits the service
+	# object. Exit the wrapper to preserve the existing procd definition.
+	[ "$rc" -eq 0 ] || exit "$rc"
+	# A deferred upgrade start is not an empty replacement service. Prevent
+	# rc.common from submitting its empty JSON object and deleting old instances.
+	[ "$SERVICE_START_CONFIRM_DEFERRED" -eq 0 ] || exit 0
 }
 # @variant full end
 # @variant lite begin
 start_service() {
-	start_service_locked
+	start_service_locked || exit 1
+	[ "$SERVICE_START_CONFIRM_DEFERRED" -eq 0 ] || exit 0
 }
 # @variant lite end
+
+service_native_reload() {
+	local result
+	if ! result="$("$DAEMON" --service-lifecycle reload)"; then
+		service_report_error "native reload failed; inspect retained recovery state"
+		return 1
+	fi
+	case "$result" in
+		'service-reload-v1 ready'|'service-reload-v1 unchanged') return 0 ;;
+		'service-reload-v1 legacy') return 2 ;;
+		*) service_report_error "native reload returned an invalid response"; return 1 ;;
+	esac
+}
 
 # @variant full begin
 reload_service() {
 	local lock_was_held="$SERVICE_RUNTIME_LOCK_HELD"
 	local rc=0
+	local SERVICE_SOURCE_ID=
 
+	if [ "${SERVICE_FORCE_RESTART:-0}" -eq 0 ]; then
+		if service_native_reload; then return 0; else rc=$?; fi
+		[ "$rc" -eq 2 ] || return "$rc"
+		rc=0
+	fi
 	service_runtime_lock_acquire_or_exit "reload CAKE Autorate"
-	stop "$@" || rc=$?
-	if [ "$rc" -eq 0 ]; then
+	service_preflight_start || rc=$?
+	if [ "$rc" -eq 0 ] && [ "$SERVICE_RELOAD_UNCHANGED" -eq 0 ]; then
+		stop "$@" || rc=$?
+	fi
+	if [ "$rc" -eq 0 ] && [ "$SERVICE_RELOAD_UNCHANGED" -eq 0 ]; then
 		start "$@" || rc=$?
 	fi
 	if [ "$lock_was_held" -eq 0 ]; then
@@ -329,9 +511,18 @@ reload_service() {
 # @variant lite begin
 reload_service() {
 	local rc=0
+	local SERVICE_SOURCE_ID=
 
-	stop "$@" || rc=$?
-	if [ "$rc" -eq 0 ]; then
+	if [ "${SERVICE_FORCE_RESTART:-0}" -eq 0 ]; then
+		if service_native_reload; then return 0; else rc=$?; fi
+		[ "$rc" -eq 2 ] || return "$rc"
+		rc=0
+	fi
+	service_preflight_start || rc=$?
+	if [ "$rc" -eq 0 ] && [ "$SERVICE_RELOAD_UNCHANGED" -eq 0 ]; then
+		stop "$@" || rc=$?
+	fi
+	if [ "$rc" -eq 0 ] && [ "$SERVICE_RELOAD_UNCHANGED" -eq 0 ]; then
 		start "$@" || rc=$?
 	fi
 	return "$rc"
@@ -342,6 +533,7 @@ reload_service() {
 # and start. Route it through the same explicit reload transaction.
 restart() {
 	local rc
+	local SERVICE_FORCE_RESTART=1
 
 	trap '' TERM
 	if reload_service "$@"; then
@@ -364,14 +556,15 @@ stop_service() {
 		# exclusive descriptor open until service_stopped() has run.
 		SERVICE_RUNTIME_STOP_RELEASE_PENDING=1
 	fi
-	if ! result="$(CAKE_AUTORATE_SERVICE_LOCK_BORROW=1 \
+	if ! result="$(CAKE_AUTORATE_SERVICE_SOURCE_ID="${SERVICE_SOURCE_ID:-}" \
+		CAKE_AUTORATE_SERVICE_LOCK_BORROW=1 \
 		CAKE_AUTORATE_RUNTIME_GLOBAL_LOCK_FD=8 \
 		"$DAEMON" --service-lifecycle execute-stop)"; then
-		logger -t cake-autorate "native service stop transaction failed"
+		service_report_error "native service stop transaction failed"
 		exit 1
 	fi
-	[ "$result" = "service-stop-v1 ok" ] || {
-		logger -t cake-autorate "native service stop returned a malformed response"
+	service_accept_stop_result "$result" || {
+		service_report_error "native service stop returned a malformed response"
 		exit 1
 	}
 }
@@ -380,12 +573,12 @@ stop_service() {
 stop_service() {
 	local result
 
-	if ! result="$("$DAEMON" --service-lifecycle execute-stop)"; then
-		logger -t cake-autorate "native service stop transaction failed"
+	if ! result="$(CAKE_AUTORATE_SERVICE_SOURCE_ID="${SERVICE_SOURCE_ID:-}" "$DAEMON" --service-lifecycle execute-stop)"; then
+		service_report_error "native service stop transaction failed"
 		exit 1
 	fi
-	[ "$result" = "service-stop-v1 ok" ] || {
-		logger -t cake-autorate "native service stop returned a malformed response"
+	service_accept_stop_result "$result" || {
+		service_report_error "native service stop returned a malformed response"
 		exit 1
 	}
 }

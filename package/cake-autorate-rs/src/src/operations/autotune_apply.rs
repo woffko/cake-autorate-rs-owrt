@@ -597,6 +597,40 @@ impl NativeApplyAuthorityIdentity {
 }
 
 impl NativeApplyExecutionPlan {
+    #[cfg(test)]
+    pub(crate) fn historical_probe_identity_for_test(
+        &self,
+    ) -> Result<NativeApplyAuthorityIdentity, String> {
+        let mut identity = self.v4_identity()?;
+        let historical = self.clone().with_legacy_probe_defaults_for_test()?;
+        assert!(historical.validate_exact_invariants().is_err());
+        identity.candidate_id =
+            historical.candidate_id_for_json(&historical.canonical_candidate_json())?;
+        identity.manifest_sha256 = native_apply_sha256_hex(&historical.canonical_manifest_bytes()?);
+        Ok(NativeApplyAuthorityIdentity::ShapedV4(identity))
+    }
+
+    /// Historical serializer fixture only: intentionally not a valid current
+    /// execution authority. Never reseal it or bypass constructor validation.
+    #[cfg(test)]
+    pub(crate) fn with_legacy_probe_defaults_for_test(mut self) -> Result<Self, String> {
+        let index = self
+            .uci_mutations
+            .iter()
+            .position(|mutation| mutation.option == "throughput_guard_retention_percent")
+            .ok_or("legacy shaped fixture lacks throughput retention")?;
+        let section = self.request.identity.instance.as_str();
+        self.uci_mutations.insert(
+            index,
+            NativeUciMutation::set(section, "throughput_guard_enabled", "1")?,
+        );
+        self.uci_mutations.insert(
+            index,
+            NativeUciMutation::set(section, "transport_latency_enabled", "1")?,
+        );
+        Ok(self)
+    }
+
     pub(crate) fn manifest_schema_version(&self) -> u8 {
         match &self.artifacts {
             NativeApplyArtifactDigestsOwned::ShapedV4 { .. } => {
@@ -1402,7 +1436,7 @@ impl NativeApplyExecutionPlan {
             server_id,
             self.request.allow_active_traffic,
             self.request.allow_sqm_disable,
-            self.request.traffic_budget_bytes,
+            self.request.traffic_budget.json_limit(),
             self.request.deadline_unix_ms,
             json_string(access_medium.as_str()),
             json_string(access_source.as_str()),
@@ -1848,8 +1882,8 @@ fn native_apply_uci_mutations(
         mutations.push(NativeUciMutation::set(section, option, value)?);
         Ok(())
     };
-    set("transport_latency_enabled", "1".to_string())?;
-    set("throughput_guard_enabled", "1".to_string())?;
+    // Test consent is not consent to permanent probes or controller policy.
+    // Omit enable flags so Apply preserves explicit user choices (and defaults).
     set(
         "throughput_guard_retention_percent",
         canonical_decimal(
@@ -2291,7 +2325,7 @@ fn require_safe_identity(label: &str, value: &str) -> Result<(), String> {
     }
 }
 
-fn native_apply_sha256_hex(bytes: &[u8]) -> String {
+pub(super) fn native_apply_sha256_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let hash = digest(&SHA256, bytes);
     let mut output = String::with_capacity(64);
@@ -2345,12 +2379,15 @@ mod tests {
             speedtest_server_id: Some(17_372),
             speedtest_topology: None,
             route: OperationRouteIdentity {
+                dns_server: None,
+                device_ifindex: None,
                 mode: OperationRouteMode::Main,
                 mwan3_member: None,
                 l3_device: "pppoe-wan".to_string(),
                 source_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
                 fwmark: None,
                 routing_table: None,
+                fwmark_mask: None,
             },
             target_state: OperationTargetState::ExistingManaged,
             capture_policy: None,
@@ -2366,7 +2403,11 @@ mod tests {
             allow_sqm_disable: true,
             allow_active_traffic: false,
             scheduled_auto_apply_requested: false,
-            traffic_budget_bytes: 1_000_000_000,
+            traffic_budget: crate::operations::protocol::TrafficPolicy::Capped {
+                max_bytes: 1_000_000_000,
+            },
+            traffic_policy_explicit: false,
+            traffic_plan: None,
         }
     }
 
@@ -2571,9 +2612,13 @@ mod tests {
         );
         let bytes = plan.canonical_manifest_bytes().unwrap();
         let json = String::from_utf8(bytes.clone()).unwrap();
-        assert_eq!(bytes.len(), 9_429);
+        assert_eq!(bytes.len(), 9_206);
+        let legacy = plan.clone().with_legacy_probe_defaults_for_test().unwrap();
+        assert!(legacy.validate_exact_invariants().is_err());
+        let historical = legacy.canonical_manifest_bytes().unwrap();
+        assert_eq!(historical.len(), 9_429);
         assert_eq!(
-            native_apply_sha256_hex(&bytes),
+            native_apply_sha256_hex(&historical),
             "8ad07538a98e7cb4d572e437888ebe37a3ea49ac76f81c855ce7df30fdd0122c"
         );
         assert!(json.starts_with("{\"native_apply_manifest_schema_version\":6,"));
@@ -2677,6 +2722,79 @@ mod tests {
         let manifest = String::from_utf8(plan.canonical_manifest_bytes().unwrap()).unwrap();
         assert!(!manifest.contains("\"add_section\""));
         assert!(!manifest.contains("\"section_type\""));
+    }
+
+    #[test]
+    fn r7_existing_apply_preserves_permanent_probe_and_enable_choices() {
+        let plan = execution_plan(
+            &request(),
+            &proposal(),
+            "both_shaped",
+            NativeApplyAction::ApplySqm,
+            NativeSqmDirectionMode::Both,
+            NativeApplyDirectionMode::Shaped,
+            NativeApplyDirectionMode::Shaped,
+            REVIEW_DIGEST,
+        )
+        .unwrap();
+        for mutation in &plan.uci_mutations {
+            assert!(
+                !mutation.option.starts_with("transport_"),
+                "{}",
+                mutation.option
+            );
+            assert_ne!(mutation.option, "throughput_guard_enabled");
+            assert_ne!(mutation.option, "external_ip_check_enabled");
+        }
+        plan.validate_exact_invariants().unwrap();
+        for enabled in ["0", "1"] {
+            let choices = std::collections::HashMap::from([
+                ("transport_latency_enabled".to_string(), enabled.to_string()),
+                (
+                    "transport_controller_enabled".to_string(),
+                    enabled.to_string(),
+                ),
+                ("throughput_guard_enabled".to_string(), "0".to_string()),
+                (
+                    "transport_probe_backend".to_string(),
+                    "websocket".to_string(),
+                ),
+                (
+                    "transport_probe_endpoint".to_string(),
+                    "wss://never-contact.invalid/user-probe".to_string(),
+                ),
+                ("transport_probe_timeout_s".to_string(), "3".to_string()),
+            ]);
+            let mut candidate = choices.clone();
+            for mutation in &plan.uci_mutations {
+                match (&mutation.action, &mutation.value) {
+                    (NativeUciMutationAction::Set, Some(value)) => {
+                        candidate.insert(mutation.option.clone(), value.clone());
+                    }
+                    (NativeUciMutationAction::Delete, None) => {
+                        candidate.remove(&mutation.option);
+                    }
+                    _ => panic!("unexpected existing-instance mutation"),
+                }
+            }
+            for (key, value) in &choices {
+                assert_eq!(candidate.get(key), Some(value));
+            }
+            let cfg = crate::Config::from_uci_values(
+                "wan_sqm",
+                &candidate,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap();
+            assert_eq!(cfg.transport_latency_enabled, enabled == "1");
+            assert_eq!(cfg.transport_controller_enabled, enabled == "1");
+            assert!(!cfg.throughput_guard_enabled);
+            assert_eq!(
+                cfg.transport_probe_endpoint,
+                choices["transport_probe_endpoint"]
+            );
+            assert_eq!(cfg.transport_probe_timeout_s, 3);
+        }
     }
 
     #[test]

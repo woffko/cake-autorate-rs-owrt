@@ -1,0 +1,416 @@
+--- a/speedtest/request.go
++++ b/speedtest/request.go
+@@ -26,9 +26,35 @@
+ )
+ 
+ var (
+-	ErrConnectTimeout = errors.New("server connect timeout")
++	ErrConnectTimeout  = errors.New("server connect timeout")
++	ErrRequestFailures = errors.New("speedtest server request failure limit reached")
+ )
+ 
++const maxRequestFailures = 8
++
++// A failing endpoint must not turn the timed measurement into a tight retry
++// loop. Healthy transfers never wait here; cancelled in-flight requests do not
++// turn normal measurement retirement into a server failure.
++func recordRequestFailure(ctx context.Context, td *TestDirection, count *int64, err error) {
++	if ctx.Err() != nil {
++		td.closeFunc()
++		return
++	}
++	if err == nil {
++		return
++	}
++	if atomic.AddInt64(count, 1) >= maxRequestFailures {
++		td.closeFunc()
++		return
++	}
++	timer := time.NewTimer(50 * time.Millisecond)
++	defer timer.Stop()
++	select {
++	case <-ctx.Done():
++	case <-timer.C:
++	}
++}
++
+ func (s *Server) MultiDownloadTestContext(ctx context.Context, servers Servers) error {
+ 	ss := servers.Available()
+ 	if ss.Len() == 0 {
+@@ -48,15 +74,20 @@
+ 		dbg.Printf("Register Download Handler: %s\n", sp.URL)
+ 		td = server.Context.RegisterDownloadHandler(func() {
+ 			atomic.AddInt64(&requestTimes, 1)
+-			if err := downloadRequest(_context, sp, 3); err != nil {
+-				atomic.AddInt64(&errorTimes, 1)
+-			}
++			recordRequestFailure(_context, td, &errorTimes, downloadRequest(_context, sp, 3))
+ 		})
+ 	}
+ 	if td == nil {
+ 		return ErrorUninitializedManager
+ 	}
+ 	td.Start(cancel, mainIDIndex) // block here
++	if ctx.Err() != nil {
++		return ctx.Err()
++	}
++	if atomic.LoadInt64(&errorTimes) >= maxRequestFailures {
++		s.DLSpeed = -1
++		return ErrRequestFailures
++	}
+ 	s.DLSpeed = ByteRate(td.manager.GetEWMADownloadRate())
+ 	if s.DLSpeed == 0 && float64(errorTimes)/float64(requestTimes) > 0.1 {
+ 		s.DLSpeed = -1 // N/A
+@@ -83,15 +114,20 @@
+ 		dbg.Printf("Register Upload Handler: %s\n", sp.URL)
+ 		td = server.Context.RegisterUploadHandler(func() {
+ 			atomic.AddInt64(&requestTimes, 1)
+-			if err := uploadRequest(_context, sp, 3); err != nil {
+-				atomic.AddInt64(&errorTimes, 1)
+-			}
++			recordRequestFailure(_context, td, &errorTimes, uploadRequest(_context, sp, 3))
+ 		})
+ 	}
+ 	if td == nil {
+ 		return ErrorUninitializedManager
+ 	}
+ 	td.Start(cancel, mainIDIndex) // block here
++	if ctx.Err() != nil {
++		return ctx.Err()
++	}
++	if atomic.LoadInt64(&errorTimes) >= maxRequestFailures {
++		s.ULSpeed = -1
++		return ErrRequestFailures
++	}
+ 	s.ULSpeed = ByteRate(td.manager.GetEWMAUploadRate())
+ 	if s.ULSpeed == 0 && float64(errorTimes)/float64(requestTimes) > 0.1 {
+ 		s.ULSpeed = -1 // N/A
+@@ -114,12 +150,20 @@
+ 	var requestTimes int64 = 0
+ 	start := time.Now()
+ 	_context, cancel := context.WithCancel(ctx)
+-	s.Context.RegisterDownloadHandler(func() {
++	defer cancel()
++	var td *TestDirection
++	td = s.Context.RegisterDownloadHandler(func() {
+ 		atomic.AddInt64(&requestTimes, 1)
+-		if err := downloadRequest(_context, s, 3); err != nil {
+-			atomic.AddInt64(&errorTimes, 1)
+-		}
+-	}).Start(cancel, 0)
++		recordRequestFailure(_context, td, &errorTimes, downloadRequest(_context, s, 3))
++	})
++	td.Start(cancel, 0)
++	if ctx.Err() != nil {
++		return ctx.Err()
++	}
++	if atomic.LoadInt64(&errorTimes) >= maxRequestFailures {
++		s.DLSpeed = -1
++		return ErrRequestFailures
++	}
+ 	duration := time.Since(start)
+ 	s.DLSpeed = ByteRate(s.Context.GetEWMADownloadRate())
+ 	if s.DLSpeed == 0 && float64(errorTimes)/float64(requestTimes) > 0.1 {
+@@ -145,12 +189,20 @@
+ 	var requestTimes int64 = 0
+ 	start := time.Now()
+ 	_context, cancel := context.WithCancel(ctx)
+-	s.Context.RegisterUploadHandler(func() {
++	defer cancel()
++	var td *TestDirection
++	td = s.Context.RegisterUploadHandler(func() {
+ 		atomic.AddInt64(&requestTimes, 1)
+-		if err := uploadRequest(_context, s, 4); err != nil {
+-			atomic.AddInt64(&errorTimes, 1)
+-		}
+-	}).Start(cancel, 0)
++		recordRequestFailure(_context, td, &errorTimes, uploadRequest(_context, s, 4))
++	})
++	td.Start(cancel, 0)
++	if ctx.Err() != nil {
++		return ctx.Err()
++	}
++	if atomic.LoadInt64(&errorTimes) >= maxRequestFailures {
++		s.ULSpeed = -1
++		return ErrRequestFailures
++	}
+ 	duration := time.Since(start)
+ 	s.ULSpeed = ByteRate(s.Context.GetEWMAUploadRate())
+ 	if s.ULSpeed == 0 && float64(errorTimes)/float64(requestTimes) > 0.1 {
+@@ -180,7 +232,17 @@
+ 		return err
+ 	}
+ 	defer resp.Body.Close()
+-	return s.Context.NewChunk().DownloadHandler(resp.Body)
++	if resp.StatusCode != http.StatusOK {
++		return fmt.Errorf("download HTTP status %d", resp.StatusCode)
++	}
++	chunk := s.Context.NewChunk().(*DataChunk)
++	if err := chunk.DownloadHandler(resp.Body); err != nil {
++		return err
++	}
++	if ctx.Err() == nil && chunk.remainOrDiscardSize == 0 {
++		return errors.New("empty download response")
++	}
++	return nil
+ }
+ 
+ func uploadRequest(ctx context.Context, s *Server, w int) error {
+@@ -198,8 +260,11 @@
+ 	if err != nil {
+ 		return err
+ 	}
+-	_, _ = io.Copy(io.Discard, resp.Body)
+ 	defer resp.Body.Close()
++	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
++		return fmt.Errorf("upload HTTP status %d", resp.StatusCode)
++	}
++	_, err = io.Copy(io.Discard, resp.Body)
+ 	return err
+ }
+ 
+--- a/task.go
++++ b/task.go
+@@ -139,6 +139,6 @@
+ 		} else {
+ 			fmt.Printf("Fatal: %s, err: %v", strings.ToLower(t.title), err)
+ 		}
+-		os.Exit(0)
++		os.Exit(1)
+ 	}
+ }
+--- a/speedtest/cake_failure_repro_test.go
++++ b/speedtest/cake_failure_repro_test.go
+@@ -0,0 +1,75 @@
++package speedtest
++
++import (
++	"context"
++	"errors"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++// No sockets, DNS or external servers: reproduce the backend's own request loop.
++func TestCakeImmediateFailureBounded(t *testing.T) {
++	for _, threads := range []int{1, 16} {
++		for _, upload := range []bool{false, true} {
++			client := New()
++			client.Manager.SetNThread(threads)
++			client.Manager.SetCaptureTime(2 * time.Second)
++			client.Manager.SetRateCaptureFrequency(10 * time.Millisecond)
++			server := Server{URL: "http://invalid.local/upload.php", Context: client}
++			var calls int64
++			request := func(ctx context.Context, s *Server, n int) error {
++				atomic.AddInt64(&calls, 1)
++				return errors.New("synthetic immediate remote failure")
++			}
++			var err error
++			if upload {
++				err = server.uploadTestContext(context.Background(), request)
++			} else {
++				err = server.downloadTestContext(context.Background(), request)
++			}
++			t.Logf("upload=%t request_calls=%d returned_error=%v", upload, calls, err)
++			if calls < maxRequestFailures || calls > maxRequestFailures+int64(threads)-1 || !errors.Is(err, ErrRequestFailures) {
++				t.Fatalf("failure loop was not bounded: calls=%d error=%v", calls, err)
++			}
++		}
++	}
++}
++
++func TestCakeHealthyRequestsNotRejected(t *testing.T) {
++	for _, upload := range []bool{false, true} {
++		client := New()
++		client.Manager.SetNThread(1)
++		client.Manager.SetCaptureTime(100 * time.Millisecond)
++		client.Manager.SetRateCaptureFrequency(10 * time.Millisecond)
++		server := Server{URL: "http://invalid.local/upload.php", Context: client}
++		var calls int64
++		request := func(ctx context.Context, s *Server, n int) error {
++			atomic.AddInt64(&calls, 1)
++			time.Sleep(time.Millisecond)
++			return nil
++		}
++		var err error
++		if upload {
++			err = server.uploadTestContext(context.Background(), request)
++		} else {
++			err = server.downloadTestContext(context.Background(), request)
++		}
++		if err != nil || calls <= maxRequestFailures {
++			t.Fatalf("healthy requests rejected: upload=%t calls=%d err=%v", upload, calls, err)
++		}
++	}
++}
++
++func TestCakeCancelledRequestNotServerFailure(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	var count int64
++	closed := false
++	td := &TestDirection{closeFunc: func() { closed = true }}
++	recordRequestFailure(ctx, td, &count, context.Canceled)
++	recordRequestFailure(context.Background(), nil, &count, nil)
++	if count != 0 || !closed {
++		t.Fatalf("normal completion counted as a server error: %d", count)
++	}
++}
+--- a/speedtest/cake_http_test.go
++++ b/speedtest/cake_http_test.go
+@@ -0,0 +1,129 @@
++package speedtest
++
++import (
++	"context"
++	"errors"
++	"io"
++	"net/http"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++type cakeTransport func(*http.Request) (*http.Response, error)
++
++func (f cakeTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
++
++type cakeBody struct {
++	io.Reader
++	closed bool
++}
++
++func (b *cakeBody) Close() error { b.closed = true; return nil }
++
++type cakeBrokenReader struct{}
++
++func (cakeBrokenReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
++
++// Exercise real request handling with an in-memory transport, never DNS/sockets.
++func TestCakeHTTPResponses(t *testing.T) {
++	for _, upload := range []bool{false, true} {
++		for _, tc := range []struct {
++			name      string
++			status    int
++			body      io.Reader
++			wantError bool
++		}{
++			{"healthy", 200, strings.NewReader("measured data"), false},
++			{"overloaded", 503, strings.NewReader("busy"), true},
++			{"rate_limited", 429, strings.NewReader("slow down"), true},
++			{"not_found", 404, strings.NewReader("missing"), true},
++			{"empty", 200, strings.NewReader(""), !upload},
++			{"broken", 200, cakeBrokenReader{}, true},
++		} {
++			t.Run(tc.name+map[bool]string{true: "_upload", false: "_download"}[upload], func(t *testing.T) {
++				body := &cakeBody{Reader: tc.body}
++				client := New(WithDoer(&http.Client{Transport: cakeTransport(func(r *http.Request) (*http.Response, error) {
++					if r.Body != nil {
++						_, _ = io.Copy(io.Discard, r.Body)
++						_ = r.Body.Close()
++					}
++					return &http.Response{StatusCode: tc.status, Body: body, Header: make(http.Header)}, nil
++				})}))
++				dm := client.Manager.(*DataManager)
++				dm.running = true
++				server := Server{URL: "http://invalid.local/upload.php", Context: client}
++				var err error
++				if upload {
++					err = uploadRequest(context.Background(), &server, 0)
++				} else {
++					err = downloadRequest(context.Background(), &server, 0)
++				}
++				if (err != nil) != tc.wantError {
++					t.Fatalf("error=%v wantError=%t", err, tc.wantError)
++				}
++				if !body.closed {
++					t.Fatal("response body not closed")
++				}
++				if tc.name == "broken" && !errors.Is(err, io.ErrUnexpectedEOF) {
++					t.Fatalf("read failure lost: %v", err)
++				}
++			})
++		}
++	}
++}
++
++func TestCakeMultiFailureAndCancellation(t *testing.T) {
++	for _, multi := range []bool{false, true} {
++		for _, upload := range []bool{false, true} {
++			for _, cancelled := range []bool{false, true} {
++				var calls int64
++				client := New(WithDoer(&http.Client{Transport: cakeTransport(func(r *http.Request) (*http.Response, error) {
++					atomic.AddInt64(&calls, 1)
++					if r.Body != nil {
++						defer r.Body.Close()
++					}
++					if cancelled {
++						<-r.Context().Done()
++						return nil, r.Context().Err()
++					}
++					return nil, errors.New("synthetic connection refusal")
++				})}))
++				client.Manager.SetNThread(4)
++				client.Manager.SetCaptureTime(2 * time.Second)
++				client.Manager.SetRateCaptureFrequency(10 * time.Millisecond)
++				first := &Server{ID: "first", URL: "http://invalid.local/upload.php", Context: client}
++				second := &Server{ID: "second", URL: "http://invalid.local/upload.php", Context: client}
++				ctx := context.Background()
++				cancel := func() {}
++				if cancelled {
++					ctx, cancel = context.WithTimeout(ctx, 20*time.Millisecond)
++				}
++				start := time.Now()
++				var err error
++				if multi {
++					if upload {
++						err = first.MultiUploadTestContext(ctx, Servers{first, second})
++					} else {
++						err = first.MultiDownloadTestContext(ctx, Servers{first, second})
++					}
++				} else {
++					if upload {
++						err = first.UploadTestContext(ctx)
++					} else {
++						err = first.DownloadTestContext(ctx)
++					}
++				}
++				cancel()
++				if cancelled {
++					if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > time.Second {
++						t.Fatalf("cancel not promptly propagated: multi=%t upload=%t err=%v elapsed=%v", multi, upload, err, time.Since(start))
++					}
++				} else if !errors.Is(err, ErrRequestFailures) || calls > maxRequestFailures+3 {
++					t.Fatalf("unbounded failure: multi=%t upload=%t calls=%d err=%v", multi, upload, calls, err)
++				}
++			}
++		}
++	}
++}
+--- a/cake_exit_test.go
++++ b/cake_exit_test.go
+@@ -0,0 +1,22 @@
++package main
++
++import (
++	"errors"
++	"os"
++	"os/exec"
++	"testing"
++)
++
++func TestCakeFatalExit(t *testing.T) {
++	if os.Getenv("CAKE_TEST_FATAL_CHILD") == "1" {
++		(&Task{}).CheckError(errors.New("synthetic backend failure"))
++		return
++	}
++	cmd := exec.Command(os.Args[0], "-test.run=^TestCakeFatalExit$")
++	cmd.Env = append(os.Environ(), "CAKE_TEST_FATAL_CHILD=1")
++	err := cmd.Run()
++	var exit *exec.ExitError
++	if !errors.As(err, &exit) || exit.ExitCode() != 1 {
++		t.Fatalf("fatal backend failure must exit1: %v", err)
++	}
++}
