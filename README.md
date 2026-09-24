@@ -1152,6 +1152,22 @@ Back up `/etc/config/cake-autorate`, simulate the exact transaction first, and
 install one complete pair. Moving to Lite preserves manual instance settings
 but intentionally removes the rating/Auto-Tune services and their LuCI pages.
 
+The two pairs conflict, so `apk` cannot swap them in one transaction. When the
+current pair was installed from files, its runtime dependencies (`sqm-scripts`,
+`fping`, CAKE/IFB kernel modules and `tc`) are only implicit and `apk del`
+would purge them together with the old pair. Mark the shared ones as explicit
+first; this downloads nothing when they are already installed:
+
+```sh
+cp /etc/config/cake-autorate /root/cake-autorate.backup
+apk add sqm-scripts fping
+apk del --simulate luci-app-cake-autorate-rs cake-autorate-rs   # must list only these two
+apk del luci-app-cake-autorate-rs cake-autorate-rs
+apk add --allow-untrusted /root/cake-autorate-rs-lite-*.apk /root/luci-app-cake-autorate-rs-lite-*.apk
+```
+
+Use the mirrored names to return from Lite to Full.
+
 `fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:
 
 ```sh
