@@ -3329,19 +3329,31 @@ function speedtestTrafficPolicyFromInput(mode, gigabytes, downloadMbps, uploadMb
 
 var speedtestTrafficChoices = {};
 
-function speedtestTrafficPolicyDialog(section_id, topology) {
+// Inline chooser placed inside the caller's form or wizard. LuCI keeps a
+// single modal, so a separate dialog would destroy the open instance editor
+// that later receives the measured rates.
+function speedtestTrafficPolicyPanel(section_id, topology, container) {
+	if (!container)
+		return Promise.reject(new Error(_('Speed Test traffic choice is unavailable. No traffic was generated.')));
 	var remembered = speedtestTrafficChoices[section_id] || {};
+	var previous = container.querySelector('.cake-speedtest-traffic');
+	if (previous)
+		previous.remove();
 	return new Promise(function(resolve, reject) {
+		var field = function(label, input) {
+			return E('label', { 'style': 'display:block;margin:4px 0' }, [
+				E('span', { 'style': 'display:inline-block;min-width:19em' }, cakeUi.text(label)), input ]);
+		};
 		var amount = E('input', { 'type': 'text', 'inputmode': 'decimal', 'class': 'cbi-input-text',
 			'value': remembered.gb || '', 'placeholder': _('Enter GB') });
 		var ceilings = [ remembered.dl || '', remembered.ul || '' ].map(function(value) {
 			return E('input', { 'type': 'text', 'inputmode': 'decimal', 'class': 'cbi-input-text',
 				'value': value, 'placeholder': _('Mbps') });
 		});
-		var amountRow = E('label', {}, [ cakeUi.text(_('Total GB (download + upload): ')), amount ]);
+		var amountRow = field(_('Total GB (download + upload): '), amount);
 		var cappedRows = E('div', {}, [
-			E('label', {}, [ cakeUi.text(_('Download service ceiling (Mbps): ')), ceilings[0] ]),
-			E('label', {}, [ cakeUi.text(_('Upload service ceiling (Mbps): ')), ceilings[1] ]),
+			field(_('Download service ceiling (Mbps): '), ceilings[0]),
+			field(_('Upload service ceiling (Mbps): '), ceilings[1]),
 			E('p', {}, cakeUi.text(topology === 'unshaped' ?
 				_('This test bypasses the shaper in the measured direction, so a capped test needs the actual service ceiling of each direction to reserve its stopping margin inside the total. Without them it is refused before traffic. Do not enter artificial ceilings just to start a test.') :
 				_('Directions still shaped by CAKE use their configured ceiling for the stopping margin; a service ceiling is needed only for an unshaped direction.')))
@@ -3359,13 +3371,14 @@ function speedtestTrafficPolicyDialog(section_id, topology) {
 			cappedRows.style.display = mode.value !== '' && mode.value !== 'unlimited' ? '' : 'none';
 		}
 		update();
-		ui.showModal(_('Speed Test traffic'), [
-			mode, amountRow, cappedRows,
+		var panel = E('div', { 'class': 'cake-speedtest-traffic cbi-section', 'style': 'margin:8px 0;padding:8px' }, [
+			E('h4', {}, _('Speed Test traffic')),
+			field(_('Traffic policy: '), mode), amountRow, cappedRows,
 			E('p', {}, cakeUi.text(_('The limit is the total download plus upload traffic of this one test, including retries. Unlimited removes only this byte limit; cancel and timeouts still apply.'))),
 			error,
-			E('div', { 'class': 'right' }, [
+			E('div', {}, [
 				E('button', { 'type': 'button', 'class': 'btn', 'click': function() {
-					ui.hideModal();
+					panel.remove();
 					reject(new Error(_('Speed Test was not started. No traffic was generated.')));
 				} }, _('Cancel')), ' ',
 				E('button', { 'type': 'button', 'class': 'btn cbi-button-action', 'click': function() {
@@ -3380,11 +3393,13 @@ function speedtestTrafficPolicyDialog(section_id, topology) {
 					}
 					speedtestTrafficChoices[section_id] = { mode: mode.value, gb: amount.value,
 						dl: ceilings[0].value, ul: ceilings[1].value };
-					ui.hideModal();
+					panel.remove();
 					resolve(policy);
 				} }, _('Start test'))
 			])
 		]);
+		container.appendChild(panel);
+		mode.focus();
 	});
 }
 
@@ -3568,7 +3583,7 @@ function runSpeedtestJob(section_id, wan, backend, onProgress, routeMode, mwan3M
 		// A daemon that accepts the explicit choice always gets one; an older
 		// daemon keeps its historical derived budget.
 		var choice = summary.native_speedtest_traffic_policy_version === 1 ?
-			(chooseTrafficPolicy || speedtestTrafficPolicyDialog)(section_id, topology) :
+			(chooseTrafficPolicy || speedtestTrafficPolicyPanel)(section_id, topology, null) :
 			Promise.resolve(null);
 		return choice.then(function(trafficPolicy) {
 			return runNativeSpeedtestJob(section_id, wan, onProgress, mode, mwan3Member, serverId,
@@ -6425,7 +6440,9 @@ function showCreateWizard(grid, name, existingName) {
 				runSpeedtestJob(state.name, state.wan_if, state.speedtest_backend, function() {
 					status.textContent = _('Running speed test...');
 				}, state.route_mode, state.mwan3_member, state.speedtest_go_server_id, rerun,
-				'unshaped', state.sqm_section || managedSqmSectionName(state.name)).then(function(res) {
+				'unshaped', state.sqm_section || managedSqmSectionName(state.name), function(section, topology) {
+					return speedtestTrafficPolicyPanel(section, topology, runButton.parentNode);
+				}).then(function(res) {
 					var result = parseSpeedtestResult(res.stdout);
 					var dl = measuredRate(result.download_kbps, pct);
 					var ul = measuredRate(result.upload_kbps, pct);
@@ -7748,7 +7765,9 @@ function addSetupOptions(section) {
 			formOrUci(activeSection, section_id, 'route_mode') || 'main',
 			formOrUci(activeSection, section_id, 'mwan3_member') || '',
 			formOrUci(activeSection, section_id, 'speedtest_go_server_id') || '', true,
-			'unshaped', null).then(function(res) {
+			'unshaped', null, function(section, topology) {
+				return speedtestTrafficPolicyPanel(section, topology, button.parentNode);
+			}).then(function(res) {
 			var result = parseSpeedtestResult(res.stdout);
 			var applied = applySpeedtestRates(activeSection, section_id, result, percent);
 			var message = _('Speed test applied at %d%%: download %s kbit/s, upload %s kbit/s.').format(
