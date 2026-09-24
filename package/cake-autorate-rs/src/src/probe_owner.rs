@@ -1,7 +1,7 @@
 //! Permanent probe group admission. A reservation is not a runtime lease.
 
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -152,18 +152,50 @@ pub(crate) struct ProbeGroupLease {
     owner_uid: u32,
 }
 
+fn valid_generation(generation: &str) -> bool {
+    generation.len() == 64
+        && generation
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// Generation of an exact, well-formed receipt for this slot. Anything else
+/// is unknown ownership and keeps the slot occupied.
+fn stale_receipt_generation(receipt: &str, gid: u32) -> Option<&str> {
+    let rest = receipt.strip_prefix("cake-probe-owner-v1\n")?;
+    let (recorded, rest) = rest.split_once('\n')?;
+    let generation = rest.strip_suffix('\n')?;
+    (recorded == gid.to_string() && valid_generation(generation)).then_some(generation)
+}
+
 impl ProbeGroupLease {
+    /// Acquire with no recovery authority: every receipt remains a fence.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn acquire(
         pool: &ProbeGroupPool,
         root: &Path,
         owner_uid: u32,
         generation: &str,
     ) -> Result<Self, &'static str> {
-        if generation.len() != 64
-            || !generation
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        {
+        Self::acquire_recovering(pool, root, owner_uid, generation, |_, _| {
+            Err("probe-owner-recovery-unavailable".into())
+        })
+    }
+
+    /// A locked slot with a nonempty receipt belonged to an owner whose lock
+    /// was released without retirement: that process exited, or dropped the
+    /// lease after a failed retirement. The slot is reused only when the
+    /// receipt is exact, no task still carries the group, and `recover`
+    /// settles that generation's owned kernel state (exact owner match).
+    /// Every other outcome leaves the receipt as the crash fence.
+    pub(crate) fn acquire_recovering(
+        pool: &ProbeGroupPool,
+        root: &Path,
+        owner_uid: u32,
+        generation: &str,
+        mut recover: impl FnMut(u32, &str) -> Result<(), String>,
+    ) -> Result<Self, &'static str> {
+        if !valid_generation(generation) {
             return Err("probe-owner-generation-invalid");
         }
         let directory = OpenOptions::new()
@@ -207,7 +239,28 @@ impl ProbeGroupLease {
                 return Err("probe-owner-lease-file-unsafe");
             }
             if metadata.len() != 0 {
-                continue;
+                if metadata.len() > 128 {
+                    continue;
+                }
+                let mut receipt = String::new();
+                if file.read_to_string(&mut receipt).is_err() {
+                    continue;
+                }
+                let Some(stale) = stale_receipt_generation(&receipt, gid) else {
+                    continue;
+                };
+                if stale == generation || process_group_in_use(Path::new("/proc"), gid)? {
+                    continue;
+                }
+                if recover(gid, stale).is_err() {
+                    continue;
+                }
+                // Recovery removed only kernel state of the recorded generation.
+                // Clear the receipt last; a crash before this line repeats the
+                // idempotent recovery instead of reusing unsettled state.
+                file.set_len(0)
+                    .and_then(|()| file.sync_all())
+                    .map_err(|_| "probe-owner-lease-recovery-failed")?;
             }
             // Account reservations and an empty lease do not exclude a live
             // task retaining this group from before reservation installation.
@@ -216,6 +269,8 @@ impl ProbeGroupLease {
                 continue;
             }
             let receipt = format!("cake-probe-owner-v1\n{gid}\n{generation}\n");
+            file.seek(std::io::SeekFrom::Start(0))
+                .map_err(|_| "probe-owner-lease-publish-failed")?;
             file.write_all(receipt.as_bytes())
                 .and_then(|()| file.sync_all())
                 .map_err(|_| "probe-owner-lease-publish-failed")?;
@@ -866,6 +921,116 @@ mod tests {
         let alias = root.join("alias");
         symlink(&base, &alias).unwrap();
         assert!(prepare_boot_lease_root_at(&alias, boot, uid).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn r6_crashed_receipt_is_reused_only_after_exact_generation_recovery() {
+        let root = std::env::temp_dir().join(format!("cake-probe-recover-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = fs::metadata(&root).unwrap().uid();
+        // Group IDs far outside ordinary allocation; /proc proves them unused.
+        let mut gids = [0_u32; PROBE_GROUP_SLOTS];
+        for (slot, gid) in gids.iter_mut().enumerate() {
+            *gid = 3_900_000_000 + slot as u32;
+            assert!(!process_group_in_use(Path::new("/proc"), *gid).unwrap());
+        }
+        let pool = ProbeGroupPool { gids };
+        let write = |gid: u32, text: &str| {
+            let path = root.join(format!("group-{gid}.lease"));
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap();
+            file.write_all(text.as_bytes()).unwrap();
+            path
+        };
+        let receipt =
+            |gid: u32, generation: &str| format!("cake-probe-owner-v1\n{gid}\n{generation}\n");
+        let crashed = write(gids[0], &receipt(gids[0], &"b".repeat(64)));
+        let malformed = write(gids[1], "cake-probe-owner-v1\nforeign\n");
+        let wrong_slot = write(gids[2], &receipt(gids[9], &"d".repeat(64)));
+        let held = write(gids[3], &receipt(gids[3], &"e".repeat(64)));
+        let holder = OpenOptions::new().read(true).open(&held).unwrap();
+        holder.try_lock().unwrap();
+
+        // A failed recovery keeps the crash fence and moves to a free slot.
+        let mut calls = Vec::new();
+        let lease = ProbeGroupLease::acquire_recovering(
+            &pool,
+            &root,
+            uid,
+            &"a".repeat(64),
+            |gid, stale| {
+                calls.push((gid, stale.to_string()));
+                Err("fixture-table-still-foreign".into())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, vec![(gids[0], "b".repeat(64))]);
+        assert_eq!(lease.gid(), gids[4]);
+        assert_eq!(
+            fs::read_to_string(&crashed).unwrap(),
+            receipt(gids[0], &"b".repeat(64))
+        );
+        lease.retire(|| Ok(())).unwrap();
+
+        // Successful exact recovery reuses the slot with a new receipt.
+        calls.clear();
+        let lease = ProbeGroupLease::acquire_recovering(
+            &pool,
+            &root,
+            uid,
+            &"c".repeat(64),
+            |gid, stale| {
+                calls.push((gid, stale.to_string()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, vec![(gids[0], "b".repeat(64))]);
+        assert_eq!(lease.gid(), gids[0]);
+        assert_eq!(
+            fs::read_to_string(&crashed).unwrap(),
+            receipt(gids[0], &"c".repeat(64))
+        );
+        // Unknown, misplaced and live-locked receipts were never offered.
+        assert_eq!(
+            fs::read_to_string(&malformed).unwrap(),
+            "cake-probe-owner-v1\nforeign\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&wrong_slot).unwrap(),
+            receipt(gids[9], &"d".repeat(64))
+        );
+        assert_eq!(
+            fs::read_to_string(&held).unwrap(),
+            receipt(gids[3], &"e".repeat(64))
+        );
+        drop(holder);
+        drop(lease);
+
+        // The dropped (unretired) lease is itself a crash fence for its own
+        // generation until another owner settles it.
+        calls.clear();
+        let next = ProbeGroupLease::acquire_recovering(
+            &pool,
+            &root,
+            uid,
+            &"f".repeat(64),
+            |gid, stale| {
+                calls.push((gid, stale.to_string()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, vec![(gids[0], "c".repeat(64))]);
+        assert_eq!(next.gid(), gids[0]);
+        drop(next);
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -80,6 +80,41 @@ fn r6_probe_lease_survives_abrupt_process_exit() {
 }
 
 #[test]
+fn r6_probe_lease_crashed_owner_is_recovered_by_exact_generation() {
+    use std::fs;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let root =
+        std::env::temp_dir().join(format!("cake-probe-child-recover-{}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "r6_probe_lease_abrupt_child"])
+        .env("CAKE_PROBE_LEASE_CHILD_ROOT", &root)
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    let uid = fs::metadata(&root).unwrap().uid();
+    let pool = ProbeGroupPool::from_account_text(&groups(), USERS).unwrap();
+    let mut calls = Vec::new();
+    let lease =
+        ProbeGroupLease::acquire_recovering(&pool, &root, uid, &"b".repeat(64), |gid, old| {
+            calls.push((gid, old.to_string()));
+            Ok(())
+        })
+        .unwrap();
+    // The exited child's released lock plus its exact receipt admit recovery.
+    assert_eq!(calls, vec![(40000, "a".repeat(64))]);
+    assert_eq!(lease.gid(), 40000);
+    assert_eq!(
+        fs::read_to_string(root.join("group-40000.lease")).unwrap(),
+        format!("cake-probe-owner-v1\n40000\n{}\n", "b".repeat(64))
+    );
+    lease.retire(|| Ok(())).unwrap();
+    assert!(fs::read(root.join("group-40000.lease")).unwrap().is_empty());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn r6_probe_leases_are_exclusive_and_not_recycled_on_drop_or_failed_cleanup() {
     use std::fs;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};

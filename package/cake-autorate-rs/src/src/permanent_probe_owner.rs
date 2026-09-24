@@ -182,7 +182,22 @@ impl PermanentProbeOwner {
         if mark.is_some_and(|(value, mask)| mask == 0 || value == 0 || value & !mask != 0) {
             return Err("permanent-probe-mark-invalid".into());
         }
-        let lease = ProbeGroupLease::acquire(pool, lease_root, owner_uid, generation)?;
+        // A crashed owner's table carries its exact generation comment. Delete
+        // only that attested kernel object; a replacement or ambiguous listing
+        // leaves the slot fenced for manual recovery.
+        let lease = ProbeGroupLease::acquire_recovering(
+            pool,
+            lease_root,
+            owner_uid,
+            generation,
+            |gid, stale| {
+                cleanup_named_route_pin_with(
+                    &format!("cake_pm_{gid}"),
+                    &format!("cake-permanent-probe-v1:{stale}"),
+                    |args| execute(args, None),
+                )
+            },
+        )?;
         let table = format!("cake_pm_{}", lease.gid());
         let owner = format!("cake-permanent-probe-v1:{generation}");
         // No preemptive named cleanup. A collision or ambiguous command result
@@ -689,15 +704,21 @@ mod tests {
             }
         }
         let mut calls = 0;
+        let mut recovery_listings = Vec::new();
         let failed = PermanentProbeOwner::acquire(
             &pool,
             &root,
             uid,
             &"b".repeat(64),
             &route(false),
-            |_, input| {
+            |args, input| {
+                if input.is_none() {
+                    // Crashed generation-a slots are offered for recovery; an
+                    // unavailable listing is not absence and keeps them fenced.
+                    recovery_listings.push(args.join(" "));
+                    return Err("recovery-listing-unavailable".into());
+                }
                 calls += 1;
-                assert!(input.is_some());
                 Err("ambiguous-install-result".into())
             },
         );
@@ -706,6 +727,14 @@ mod tests {
             calls, 1,
             "ambiguous installation must not trigger speculative deletion"
         );
+        // Parallel tests may briefly carry one fixture GID on a thread; the
+        // live-task check then skips that slot, which is the intended fence.
+        let offered = [40000, 40001]
+            .map(|gid| nft_table_snapshot_arguments(&format!("cake_pm_{gid}")).join(" "));
+        assert!(!recovery_listings.is_empty());
+        assert!(recovery_listings
+            .iter()
+            .all(|listing| offered.contains(listing)));
         assert!(!fs::read(root.join("group-40002.lease")).unwrap().is_empty());
         let next = ProbeGroupLease::acquire(&pool, &root, uid, &"c".repeat(64)).unwrap();
         assert_eq!(next.gid(), 40003, "all failed owners remain quarantined");
