@@ -48,6 +48,11 @@ var optionDescriptions = {
 	wan_if: 'Main WAN interface for this instance. Auto preset also uses it for SQM and IFB setup.',
 	route_mode: 'Select the main routing table or force every ICMP, HTTP, speed test, and Auto-Tune probe through one mwan3 member.',
 	mwan3_member: 'Logical mwan3 interface/member used for this uplink. Its resolved L3 device must match the target interface.',
+	route_source_ipv4: 'IPv4 address assigned to the target interface. Probes use it as their source.',
+	route_table: 'Existing numeric routing table whose default route leaves through the target interface.',
+	route_fwmark: 'Firewall mark (decimal or 0x hex) that an existing ip rule sends to the routing table.',
+	route_fwmark_mask: 'Mask of that ip rule. The mark must be nonzero and inside the mask.',
+	route_dns_ipv4: 'Optional DNS server reached through this route for transport probes. Without it, those probes stay unavailable instead of using the system resolver.',
 	route_check_interval_s: 'Interval for checking mwan3 state, L3 device, source address, fwmark, and route identity.',
 	auto_interface_preset: 'Automatically derive SQM interface, upload interface, and download IFB from the target interface.',
 	sqm_download: 'SQM download bandwidth in kbit/s. This also seeds the autorate base and max download rates.',
@@ -1082,14 +1087,51 @@ function validateManagedSqmTargetUnique(section, section_id) {
 	return true;
 }
 
+var EXPLICIT_ROUTE_FIELDS = [ 'route_source_ipv4', 'route_table', 'route_fwmark', 'route_fwmark_mask', 'route_dns_ipv4' ];
+
+function explicitRouteNumber(value) {
+	var text = String(value == null ? '' : value).trim();
+	if (/^0x[0-9a-f]{1,8}$/i.test(text))
+		return parseInt(text.slice(2), 16);
+	if (/^[0-9]{1,10}$/.test(text) && Number(text) <= 4294967295)
+		return Number(text);
+	return null;
+}
+
+function validateExplicitRoute(values) {
+	var ipv4 = /^(25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])){3}$/;
+	var source = String(values.route_source_ipv4 || '').trim();
+	var first = Number(source.split('.')[0]);
+	if (!ipv4.test(source) || first === 0 || first === 127 || first >= 224)
+		return _('Explicit routing requires a unicast IPv4 source address.');
+	var table = String(values.route_table || '').trim();
+	if (!/^[0-9]{1,10}$/.test(table) || Number(table) === 0 || Number(table) > 4294967295)
+		return _('Explicit routing requires a nonzero numeric routing table.');
+	var mark = explicitRouteNumber(values.route_fwmark);
+	var mask = explicitRouteNumber(values.route_fwmark_mask);
+	if (mark == null || mask == null || mark === 0 || mask === 0 || ((mark & ~mask) >>> 0) !== 0)
+		return _('Explicit routing requires a nonzero mark inside a nonzero mask.');
+	var dns = String(values.route_dns_ipv4 || '').trim();
+	if (dns && !ipv4.test(dns))
+		return _('Explicit route DNS must be an IPv4 address.');
+	return true;
+}
+
 function validateRouteSelection(section, section_id) {
 	var mode = formOrUci(section, section_id, 'route_mode') || 'auto';
 	var memberName = formOrUci(section, section_id, 'mwan3_member') || '';
 	var target = selectedWan(section, section_id, null, true);
 	var member;
 
+	if (mode === 'explicit') {
+		if (memberName)
+			return _('Explicit routing must not define an mwan3 member.');
+		var values = {};
+		EXPLICIT_ROUTE_FIELDS.forEach(function(key) { values[key] = formOrUci(section, section_id, key) || ''; });
+		return validateExplicitRoute(values);
+	}
 	if ([ 'auto', 'main', 'mwan3' ].indexOf(mode) < 0)
-		return _('Route mode must be Auto, Main routing, or mwan3.');
+		return _('Route mode must be Auto, Main routing, mwan3 or Explicit policy route.');
 	if (mode === 'main' && memberName)
 		return _('Main routing must not define an mwan3 member.');
 	if (mode === 'mwan3' && !memberName)
@@ -7622,15 +7664,42 @@ function addSetupOptions(section) {
 	o = listValue(section, 'setup', 'route_mode', _('Probe routing'), [
 		[ 'auto', _('Auto (main unless a member is selected)') ],
 		[ 'main', _('Main routing table') ],
-		[ 'mwan3', _('Specific mwan3 member') ]
+		[ 'mwan3', _('Specific mwan3 member') ],
+		[ 'explicit', _('Explicit policy route (source, table, mark)') ]
 	], 'auto');
 	o.forcewrite = true;
 	o.write = function(section_id, formvalue) {
 		uci.set('cake-autorate', section_id, 'route_mode', formvalue);
-		if (formvalue === 'main') {
+		if (formvalue === 'main' || formvalue === 'explicit') {
 			uci.unset('cake-autorate', section_id, 'mwan3_member');
 			uci.unset('cake-autorate', section_id, 'ping_prefix_string');
 		}
+		// The daemon rejects explicit authority fields in any other mode.
+		if (formvalue !== 'explicit')
+			EXPLICIT_ROUTE_FIELDS.forEach(function(key) { uci.unset('cake-autorate', section_id, key); });
+	};
+
+	[ [ 'route_source_ipv4', _('Route source IPv4'), 'ip4addr', '' ],
+	  [ 'route_table', _('Route table'), 'uinteger', '' ],
+	  [ 'route_fwmark', _('Route mark'), null, '0x100' ],
+	  [ 'route_fwmark_mask', _('Route mark mask'), null, '0x3f00' ],
+	  [ 'route_dns_ipv4', _('Route DNS IPv4 (optional)'), 'ip4addr', '' ] ].forEach(function(field) {
+		o = optionalValue(section, 'setup', field[0], field[1], field[2], field[3] || null);
+		o.depends('route_mode', 'explicit');
+		o.write = function(section_id, formvalue) {
+			var text = String(formvalue == null ? '' : formvalue).trim();
+			if (text)
+				uci.set('cake-autorate', section_id, field[0], text);
+			else
+				uci.unset('cake-autorate', section_id, field[0]);
+		};
+	});
+	o = section.taboption('setup', form.DummyValue, '_explicit_route_note', ' ');
+	modal(o);
+	o.depends('route_mode', 'explicit');
+	o.rawhtml = false;
+	o.cfgvalue = function() {
+		return _('Full package only. Uses an existing policy route; it does not create or change VPNs, ip rules or routing tables. Probes are pinned to this source, mark and table and stop when the route no longer matches, instead of falling back to the main table. Auto-Tune and Speed Test are not yet available in this mode.');
 	};
 
 	o = section.taboption('setup', form.ListValue, 'mwan3_member', _('mwan3 member'));

@@ -166,7 +166,7 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl, eImpl) {
 			`autotuneRetryableInconclusive, autotuneMeasurementTimeout, recordAutotuneRetryableInconclusive, ` +
 			`manualSqmDirectionMode, validateManualSqmDirectionMode, writeManualSqmDirectionMode, ` +
 			`positiveRateValue, shouldImportInterfaceRates, applyRatePreset, ` +
-			`runSpeedtestJob, nativeEffectiveSpeedtestBackend, nativeSpeedtestCapabilityValidated, nativeSpeedtestIntentSupported, nativeSpeedtestLaunchArgs, validatedSpeedtestTrafficPolicy, speedtestTrafficPolicyFromInput, nativeSpeedtestResultValidated, nativeOperationWorkerRunId, nativeSpeedtestStatusMatchesRequest, ` +
+			`runSpeedtestJob, nativeEffectiveSpeedtestBackend, nativeSpeedtestCapabilityValidated, nativeSpeedtestIntentSupported, nativeSpeedtestLaunchArgs, validateExplicitRoute, explicitRouteNumber, validatedSpeedtestTrafficPolicy, speedtestTrafficPolicyFromInput, nativeSpeedtestResultValidated, nativeOperationWorkerRunId, nativeSpeedtestStatusMatchesRequest, ` +
 			`nativeAutotuneCapabilityValidated, nativeBootstrapAutotuneCapabilityValidated, ` +
 			`nativeAutotuneIntentSupported, nativeAutotuneLaunchArgs, validatedAutotuneTrafficPolicy, autotuneTrafficPolicyFromInput, autotuneTrafficPlanningEstimate, nativeAutotuneResultMatchesRequest, nativeAutotuneStatusMatchesRequest, ` +
 			`nativeAutotuneProgressStepLabel, nativeAutotuneProgress, nativeAutotuneTrafficSummary, ` +
@@ -2862,6 +2862,20 @@ async function testNativeSpeedtestTransport() {
 		], 'new-instance Speed Test must use the mutation-free native bootstrap lifecycle');
 		assert(!bootstrapCalls[1].args.includes('--traffic-policy'),
 			'a daemon without the explicit Speed Test policy keeps its historical launch');
+
+		// Explicit route authority mirrors the native field contract.
+		const route = { route_source_ipv4: '192.0.2.2', route_table: '101',
+			route_fwmark: '0x100', route_fwmark_mask: '0x3f00', route_dns_ipv4: '' };
+		assert.equal(helpers.validateExplicitRoute(route), true);
+		assert.equal(helpers.validateExplicitRoute({ ...route, route_fwmark: '256', route_fwmark_mask: '16128' }), true);
+		assert.equal(helpers.explicitRouteNumber('0xFFFFFFFF'), 4294967295);
+		assert.equal(helpers.explicitRouteNumber('4294967296'), null);
+		for (const bad of [
+			{ route_source_ipv4: '127.0.0.1' }, { route_source_ipv4: '224.0.0.1' }, { route_source_ipv4: '192.0.2' },
+			{ route_table: '0' }, { route_table: 'main' }, { route_fwmark: '0' }, { route_fwmark_mask: '0' },
+			{ route_fwmark: '0x4000' }, { route_fwmark: 'x' }, { route_dns_ipv4: 'dns.example' },
+		])
+			assert.notEqual(helpers.validateExplicitRoute({ ...route, ...bad }), true, JSON.stringify(bad));
 
 		// Explicit total DL+UL policy for a daemon that advertises it.
 		assert.deepEqual(helpers.speedtestTrafficPolicyFromInput('unlimited', '', '900', ''),

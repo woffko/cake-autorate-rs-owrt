@@ -352,6 +352,11 @@ impl ExplicitRouteAuthority {
             return Err("explicit-local-rule-unverified");
         }
         for (priority, body) in rows.iter().skip(1) {
+            // Reaching the ordinary main lookup first means the selected
+            // policy rule is absent, not that an unknown rule precedes it.
+            if matches!(body.as_slice(), ["from", "all", "lookup", "main" | "254"]) {
+                return Err("explicit-mark-table-rule-missing");
+            }
             let ["from", source, "fwmark", selector, "lookup", table] = body.as_slice() else {
                 return Err("explicit-earlier-rule-unverified");
             };
@@ -2153,6 +2158,18 @@ mod tests {
         assert_eq!(
             authority.attest_rules(&format!("{tail}{selected}{local}")),
             Ok(100)
+        );
+        // A removed policy rule is reported as missing, and a selected rule
+        // placed after the main lookup can never take effect.
+        assert_eq!(
+            authority.attest_rules(&format!("{local}{tail}")),
+            Err("explicit-mark-table-rule-missing")
+        );
+        assert_eq!(
+            authority.attest_rules(&format!(
+                "{local}32766: from all lookup main\n40000: from all fwmark 0x100/0x3f00 lookup 101\n"
+            )),
+            Err("explicit-mark-table-rule-missing")
         );
         assert_eq!(
             authority.attest_rules(&format!(

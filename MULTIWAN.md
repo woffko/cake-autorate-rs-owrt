@@ -59,8 +59,8 @@ one default device. `/proc/net/route` entries must have a zero destination and
 zero mask; the lower half of a split default (`0.0.0.0/1`) is not a default entry.
 A VPN default on another device therefore does not authorize `main` probes on
 the selected WAN. More-specific routes and PBR still need their own route proof:
-a matching default label alone is not acceptance of those configurations. An
-explicit device/PBR mode is not implemented by this parser change.
+a matching default label alone is not acceptance of those configurations. Use
+the explicit policy-route mode below for PBR and VPN-default setups.
 
 `main` now refuses nonstandard IPv4 policy rules and foreign split-default
 overrides before starting probes or calibration. It requires the standard
@@ -70,6 +70,24 @@ Owned calibration traffic additionally has a postrouting egress guard: packets
 resolved to a different device are dropped and make accounting fail, rather
 than measuring that device. The guard permits only local loopback DNS as an
 exception; it does not attest the resolver daemon's upstream forwarding path.
+
+### Explicit policy route (`route_mode=explicit`, Full only)
+
+The Full controller can pin its latency and transport probes to an existing
+policy route: `route_source_ipv4` (assigned to the target interface),
+`route_table` (nonzero numeric table), `route_fwmark` and `route_fwmark_mask`
+(nonzero mark inside a nonzero mask), and optionally `route_dns_ipv4` for
+transport-probe name resolution. The mode never creates or changes VPNs, ip
+rules or tables. Before probes start and on every route check the controller
+observes the address, the rule list (only the local rule and non-overlapping
+mark rules may precede the selected rule) and the table, whose default must
+leave through the target interface. Probes run under a reserved per-owner
+group with an exact nft mark/egress pin; a removed rule, a table rerouted to
+another device or a changed source moves the uplink to `RECHECKING` and stops
+probe egress instead of falling back to the main table. A crashed controller's
+pin is removed by the next owner only when it carries that exact owner
+generation. Lite refuses the mode, and Auto-Tune, Speed Test and scheduled
+calibration requests are not yet admitted for it.
 These checks do not implement a general device/PBR mode or IPv6-only support.
 
 For `mwan3`, route discovery requires an unambiguous pair of unconditional
