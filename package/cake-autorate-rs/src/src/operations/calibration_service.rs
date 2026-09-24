@@ -26,6 +26,7 @@ const PRODUCTION_PROC_ROOT: &str = "/proc";
 const CONTROL_SOCKET_NAME: &[u8] = b"control.sock";
 const CALIBRATION_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const CALIBRATION_START_TIMEOUT: Duration = Duration::from_secs(10);
+const START_REOBSERVE_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_PROC_ENTRIES: usize = 65_536;
 const MAX_CMDLINE_BYTES: usize = 8 * 1024;
 
@@ -165,7 +166,9 @@ struct CalibrationProcess {
 
 enum StartedObservation {
     Ready,
-    Waiting(Vec<ProcessIdentity>),
+    /// Processes whose exit wakes the loop, and the transient anomaly, if any,
+    /// that is reported only if it persists until the watchdog deadline.
+    Waiting(Vec<ProcessIdentity>, Option<String>),
 }
 
 fn confirm_calibration_service_started(
@@ -193,6 +196,7 @@ fn confirm_calibration_service_started(
     let mut events = CalibrationEventLoop::new()?;
     events.watch_named_entry(&parent, state_name)?;
     let started = Instant::now();
+    let mut last_anomaly: Option<String> = None;
     loop {
         match fs::symlink_metadata(state_dir) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
@@ -217,25 +221,38 @@ fn confirm_calibration_service_started(
         let identities =
             match observe_calibration_service_started(proc_root, state_dir, owner_lock_path)? {
                 StartedObservation::Ready => return Ok(()),
-                StartedObservation::Waiting(identities) => identities,
+                StartedObservation::Waiting(identities, anomaly) => {
+                    if anomaly.is_some() {
+                        last_anomaly = anomaly;
+                    }
+                    identities
+                }
             };
         if events.refresh_processes(&identities, proc_root)? {
             continue;
         }
         let remaining = timeout.saturating_sub(started.elapsed());
         if remaining.is_zero() {
-            return Err(
-                "calibration service did not become ready before its watchdog deadline".to_string(),
-            );
+            return Err(match last_anomaly {
+                Some(anomaly) => format!(
+                    "calibration service did not become ready before its watchdog deadline: {anomaly}"
+                ),
+                None => "calibration service did not become ready before its watchdog deadline"
+                    .to_string(),
+            });
         }
-        if events.wait(-1, Some(remaining))?.deadline {
-            return Err(
-                "calibration service did not become ready before its watchdog deadline".to_string(),
-            );
-        }
+        // Events normally wake this loop. A restart can finish without a new
+        // event after an observation raced it, so re-observe on a short
+        // bounded interval within the same deadline.
+        events.wait(-1, Some(remaining.min(START_REOBSERVE_INTERVAL)))?;
     }
 }
 
+/// Readiness is confirmed only for exactly one live native coordinator that
+/// answers its control ping and holds the scheduler owner lock. A restart or
+/// package upgrade briefly overlaps processes, resets control exchanges or
+/// precedes the lock; those states are waited out, never confirmed, and fail
+/// with their last reason at the bounded watchdog deadline.
 fn observe_calibration_service_started(
     proc_root: &Path,
     state_dir: &Path,
@@ -243,12 +260,16 @@ fn observe_calibration_service_started(
 ) -> Result<StartedObservation, String> {
     let processes = calibration_service_process_records(proc_root, std::process::id())?;
     if processes.is_empty() {
-        return Ok(StartedObservation::Waiting(Vec::new()));
+        return Ok(StartedObservation::Waiting(Vec::new(), None));
     }
     if processes.len() != 1 || processes[0].kind != CalibrationProcessKind::NativeCoordinator {
-        return Err(
-            "calibration service topology is not exactly one native coordinator".to_string(),
-        );
+        return Ok(StartedObservation::Waiting(
+            processes
+                .into_iter()
+                .map(|record| record.identity)
+                .collect(),
+            Some("calibration service topology is not exactly one native coordinator".into()),
+        ));
     }
     let identity = processes[0].identity.clone();
     let state_present = match fs::symlink_metadata(state_dir) {
@@ -261,21 +282,32 @@ fn observe_calibration_service_started(
             ))
         }
     };
-    if !state_present || !probe_calibration_coordinator_control(state_dir, &identity)? {
-        return Ok(StartedObservation::Waiting(vec![identity]));
+    if !state_present {
+        return Ok(StartedObservation::Waiting(vec![identity], None));
     }
-    attest_scheduler_owner_lock_held(owner_lock_path)?;
+    match probe_calibration_coordinator_control(state_dir, &identity) {
+        Ok(true) => {}
+        Ok(false) => return Ok(StartedObservation::Waiting(vec![identity], None)),
+        Err(error) => return Ok(StartedObservation::Waiting(vec![identity], Some(error))),
+    }
+    if let Err(error) = attest_scheduler_owner_lock_held(owner_lock_path) {
+        return Ok(StartedObservation::Waiting(vec![identity], Some(error)));
+    }
     if !identity.still_matches(proc_root)? {
-        return Ok(StartedObservation::Waiting(Vec::new()));
+        return Ok(StartedObservation::Waiting(Vec::new(), None));
     }
     let confirmed = calibration_service_process_records(proc_root, std::process::id())?;
     if confirmed.len() != 1
         || confirmed[0].kind != CalibrationProcessKind::NativeCoordinator
         || confirmed[0].identity != identity
     {
-        return Err(
-            "calibration service topology changed during readiness attestation".to_string(),
-        );
+        return Ok(StartedObservation::Waiting(
+            confirmed
+                .into_iter()
+                .map(|record| record.identity)
+                .collect(),
+            Some("calibration service topology changed during readiness attestation".into()),
+        ));
     }
     Ok(StartedObservation::Ready)
 }
@@ -385,10 +417,16 @@ fn calibration_service_process_records(
     Ok(processes)
 }
 
+/// A process can exit between directory enumeration, open and read; procfs
+/// then reports NotFound or ESRCH. Such an entry is skipped, not an error.
+fn process_vanished(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
 fn read_bounded_cmdline(path: &Path) -> Result<Option<Vec<u8>>, String> {
     let mut file = match File::open(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if process_vanished(&error) => return Ok(None),
         Err(error) => {
             return Err(format!(
                 "unable to open calibration service command line: {error}"
@@ -396,10 +434,19 @@ fn read_bounded_cmdline(path: &Path) -> Result<Option<Vec<u8>>, String> {
         }
     };
     let mut bytes = Vec::new();
-    file.by_ref()
+    match file
+        .by_ref()
         .take((MAX_CMDLINE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
-        .map_err(|error| format!("unable to read calibration service command line: {error}"))?;
+    {
+        Ok(_) => {}
+        Err(error) if process_vanished(&error) => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "unable to read calibration service command line: {error}"
+            ))
+        }
+    }
     if bytes.len() > MAX_CMDLINE_BYTES {
         if calibration_service_owned_prefix(&bytes) {
             return Err("calibration service command line exceeds its bound".to_string());
@@ -712,6 +759,20 @@ mod tests {
         .contains("already held"));
         drop(held);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exited_process_entries_are_skipped_not_fatal() {
+        assert!(process_vanished(&io::Error::from_raw_os_error(libc::ESRCH)));
+        assert!(process_vanished(&io::Error::from(io::ErrorKind::NotFound)));
+        assert!(!process_vanished(&io::Error::from_raw_os_error(
+            libc::EACCES
+        )));
+        let missing = std::env::temp_dir().join(format!(
+            "cake-calibration-cmdline-missing-{}/cmdline",
+            std::process::id()
+        ));
+        assert_eq!(read_bounded_cmdline(&missing), Ok(None));
     }
 
     #[test]

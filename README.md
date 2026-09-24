@@ -355,6 +355,13 @@ backups are skipped when the first group qualifies. It requires stable,
 competitive independent reported sources. A chosen
 server must pass the comparison too; it is not silently replaced. Qualification
 does not prove that all equally slow servers represent the link's true capacity.
+During the single-direction raw controls the other direction keeps a CAKE
+shaper, and its ACK/request traffic crosses it. That temporary shaper now runs
+at least at this run's qualified median for that direction (bounded by the
+declared service cap), not at a stale low configured rate that would throttle
+the measured direction and make it incomparable with the unshaped
+qualification. It is never lowered below the current rate and never becomes a
+proposal or cap.
 The UI separates observed throughput from proposed CAKE rates. A fall below 50%
 of a retained, verified comparable same-boot raw reference blocks a new Apply;
 this guard does not invent a historical reference after reboot. Reviewing or

@@ -17,7 +17,8 @@ assert.doesNotMatch(lite + defaults, /speedtest-go/,
 	'Lite must not acquire the Full calibration backend dependency');
 const backend = fs.readFileSync(path.join(packages, 'speedtest-go/Makefile'), 'utf8');
 assert.match(backend, /^PKG_VERSION:=1\.7\.10$/m);
-assert.match(backend, /^PKG_RELEASE:=3$/m);
+assert.match(backend, /^PKG_RELEASE:=4$/m);
+assert.ok(fs.existsSync(path.join(packages, 'speedtest-go/patches/120-upload-redirect-resolution.patch')));
 assert.ok(fs.existsSync(path.join(packages, 'speedtest-go/patches/110-explicit-route-dns.patch')));
 assert.ok(fs.existsSync(path.join(packages, 'speedtest-go/patches/100-bounded-request-failures.patch')));
 for (const [ui, daemon] of [

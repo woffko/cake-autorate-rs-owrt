@@ -1,0 +1,166 @@
+diff -ruN a/speedtest/cake_redirect_test.go b/speedtest/cake_redirect_test.go
+--- a/speedtest/cake_redirect_test.go	1970-01-01 03:00:00.000000000 +0300
++++ b/speedtest/cake_redirect_test.go	2026-09-24 14:30:26.456674353 +0300
+@@ -0,0 +1,75 @@
++package speedtest
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"net/url"
++	"strings"
++	"testing"
++)
++
++// Listed HTTP endpoint redirects to another host, as Ookla-hosted servers do.
++func TestCakeUploadFollowsResolvedRedirect(t *testing.T) {
++	const listed = "http://listed.local:8080/speedtest/upload.php"
++	const final = "https://server-1.hosts.local:8080/speedtest/upload.php"
++	var posts []string
++	client := New(WithDoer(&http.Client{Transport: cakeTransport(func(r *http.Request) (*http.Response, error) {
++		if r.Body != nil {
++			_, _ = io.Copy(io.Discard, r.Body)
++			_ = r.Body.Close()
++		}
++		if r.Method == http.MethodPost {
++			posts = append(posts, r.URL.String())
++		}
++		if r.URL.Host == "listed.local:8080" {
++			header := make(http.Header)
++			header.Set("Location", final)
++			return &http.Response{StatusCode: 307, Body: io.NopCloser(strings.NewReader("")), Header: header, Request: r}, nil
++		}
++		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("ok")), Header: make(http.Header), Request: r}, nil
++	})}))
++	dm := client.Manager.(*DataManager)
++	dm.running = true
++
++	// Without resolution a streamed POST cannot follow 307 and fails.
++	direct := Server{URL: listed, Context: client}
++	if err := uploadRequest(context.Background(), &direct, 0); err == nil {
++		t.Fatal("unresolved redirected upload unexpectedly succeeded")
++	}
++
++	server := Server{URL: listed, Context: client}
++	server.resolveUploadURL(context.Background())
++	if server.resolvedUploadURL != final {
++		t.Fatalf("resolved %q, want %q", server.resolvedUploadURL, final)
++	}
++	if server.URL != listed {
++		t.Fatalf("reported URL changed to %q", server.URL)
++	}
++	posts = nil
++	if err := uploadRequest(context.Background(), &server, 0); err != nil {
++		t.Fatalf("resolved upload failed: %v", err)
++	}
++	if len(posts) != 1 || posts[0] != final {
++		t.Fatalf("upload targets %v, want only the resolved endpoint", posts)
++	}
++}
++
++func TestCakeUploadResolutionKeepsListedURLWithoutRedirect(t *testing.T) {
++	client := New(WithDoer(&http.Client{Transport: cakeTransport(func(r *http.Request) (*http.Response, error) {
++		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header), Request: r}, nil
++	})}))
++	server := Server{URL: "http://listed.local/upload.php", Context: client}
++	server.resolveUploadURL(context.Background())
++	if server.resolvedUploadURL != "" {
++		t.Fatalf("unexpected resolution %q", server.resolvedUploadURL)
++	}
++	failing := New(WithDoer(&http.Client{Transport: cakeTransport(func(r *http.Request) (*http.Response, error) {
++		return nil, &url.Error{Op: "Get", URL: r.URL.String(), Err: io.ErrUnexpectedEOF}
++	})}))
++	broken := Server{URL: "http://listed.local/upload.php", Context: failing}
++	broken.resolveUploadURL(context.Background())
++	if broken.resolvedUploadURL != "" {
++		t.Fatal("a failed probe must keep the listed URL")
++	}
++}
+diff -ruN a/speedtest/request.go b/speedtest/request.go
+--- a/speedtest/request.go	2026-09-24 14:30:26.445064494 +0300
++++ b/speedtest/request.go	2026-09-24 14:30:26.451668577 +0300
+@@ -95,6 +95,35 @@
+ 	return nil
+ }
+ 
++// Speedtest servers may redirect the listed HTTP endpoint to another host,
++// for example HTTPS. A streamed upload body cannot be replayed across 307/308,
++// so every upload would fail. Resolve the final endpoint once with a body-less
++// GET that follows redirects, before any timed transfer. Failure keeps the
++// listed URL; the upload itself then reports the real error.
++func (s *Server) resolveUploadURL(ctx context.Context) {
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.URL, nil)
++	if err != nil {
++		return
++	}
++	resp, err := s.Context.doer.Do(req)
++	if err != nil {
++		return
++	}
++	defer resp.Body.Close()
++	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
++	if resp.Request == nil || resp.Request.URL == nil {
++		return
++	}
++	final := resp.Request.URL
++	if (final.Scheme != "http" && final.Scheme != "https") || final.Host == "" {
++		return
++	}
++	if final.String() != s.URL {
++		dbg.Printf("Upload endpoint redirected: %s -> %s\n", s.URL, final)
++		s.resolvedUploadURL = final.String()
++	}
++}
++
+ func (s *Server) MultiUploadTestContext(ctx context.Context, servers Servers) error {
+ 	ss := servers.Available()
+ 	if ss.Len() == 0 {
+@@ -111,6 +140,7 @@
+ 			mainIDIndex = i
+ 		}
+ 		sp := server
++		sp.resolveUploadURL(ctx)
+ 		dbg.Printf("Register Upload Handler: %s\n", sp.URL)
+ 		td = server.Context.RegisterUploadHandler(func() {
+ 			atomic.AddInt64(&requestTimes, 1)
+@@ -190,6 +220,7 @@
+ 	start := time.Now()
+ 	_context, cancel := context.WithCancel(ctx)
+ 	defer cancel()
++	s.resolveUploadURL(ctx)
+ 	var td *TestDirection
+ 	td = s.Context.RegisterUploadHandler(func() {
+ 		atomic.AddInt64(&requestTimes, 1)
+@@ -249,12 +280,16 @@
+ 	size := ulSizes[w]
+ 	chunkSize := int64(size*100-51) * 10
+ 	dc := s.Context.NewChunk().UploadHandler(chunkSize)
+-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.URL, io.NopCloser(dc))
++	target := s.URL
++	if s.resolvedUploadURL != "" {
++		target = s.resolvedUploadURL
++	}
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, io.NopCloser(dc))
+ 	if err != nil {
+ 		return err
+ 	}
+ 	req.ContentLength = chunkSize
+-	dbg.Printf("Len=%d, XulURL: %s\n", req.ContentLength, s.URL)
++	dbg.Printf("Len=%d, XulURL: %s\n", req.ContentLength, target)
+ 	req.Header.Set("Content-Type", "application/octet-stream")
+ 	resp, err := s.Context.doer.Do(req)
+ 	if err != nil {
+diff -ruN a/speedtest/server.go b/speedtest/server.go
+--- a/speedtest/server.go	2026-09-24 14:30:26.448219360 +0300
++++ b/speedtest/server.go	2026-09-24 14:30:26.453128738 +0300
+@@ -55,6 +55,9 @@
+ 	PacketLoss   transport.PLoss `json:"packet_loss"`
+ 
+ 	Context *Speedtest `json:"-"`
++	// Final upload endpoint after a body-less redirect probe. Unexported so
++	// reported server identity (url/host) never changes.
++	resolvedUploadURL string
+ }
+ 
+ type TestDuration struct {

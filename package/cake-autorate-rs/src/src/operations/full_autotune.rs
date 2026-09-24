@@ -14605,6 +14605,27 @@ fn run_directional_capture_load(
     )
 }
 
+/// Rate of the still-shaped opposite direction during a single-direction raw
+/// control. Its ACK/request traffic crosses that shaper; at a stale low rate
+/// it throttles the measured direction and makes the raw sample incomparable
+/// with the fully unshaped qualification reference. This run's qualified
+/// median of that direction (a measurement, never a cap or proposal) lifts
+/// the temporary rate, bounded by the permit. It is never lowered below the
+/// captured rate, and without a qualification reference nothing changes.
+fn raw_control_opposite_rate_kbps(
+    topology: MeasurementTopology,
+    initial_kbps: u64,
+    qualified_kbps: Option<u64>,
+    bounds: super::autotune_runtime::RuntimeRateBounds,
+) -> u64 {
+    match (topology, qualified_kbps) {
+        (MeasurementTopology::RawDownload | MeasurementTopology::RawUpload, Some(qualified)) => {
+            initial_kbps.max(qualified.min(bounds.maximum_kbps))
+        }
+        _ => initial_kbps,
+    }
+}
+
 fn attest_qualified_raw_control(
     request: &OperationRequest,
     phase: AutotunePhase,
@@ -14735,12 +14756,27 @@ fn run_directional_capture_load_with_session(
             run_started_boot_ms,
             terminate,
         )?;
-        if loaded_sample_thresholds_met(&progress) {
-            thresholds_met = true;
-            last_progress = Some(progress);
+        thresholds_met = loaded_sample_thresholds_met(&progress);
+        last_progress = Some(progress);
+        // A single raw run below the qualified reference can be ordinary
+        // path variance. Within the same bounded run limit, keep measuring
+        // so the time-weighted aggregate, not one sample, meets the guard.
+        let raw_reference_met = attest_qualified_raw_control(
+            operation,
+            evidence_phase,
+            request.topology,
+            direction,
+            Some(
+                aggregate
+                    .evidence(request, monotonic_boot_ms()?)?
+                    .goodput_kbps,
+            ),
+            session.qualified_raw_capacity,
+        )
+        .is_ok();
+        if thresholds_met && raw_reference_met {
             break;
         }
-        last_progress = Some(progress);
     }
     if aggregate.run_count == 0 {
         return Err(CaptureWaitError::Failure(
@@ -14751,14 +14787,27 @@ fn run_directional_capture_load_with_session(
     // The retry transaction has already durably charged all runs. Compare the
     // same byte-derived rate retained by Measurement/RawControlCapacity replay,
     // before either kind of evidence can feed a low proposal.
-    attest_qualified_raw_control(
+    if let Err(error) = attest_qualified_raw_control(
         operation,
         evidence_phase,
         request.topology,
         direction,
         Some(evidence.goodput_kbps),
         session.qualified_raw_capacity,
-    )?;
+    ) {
+        if let Some(reference) = session.qualified_raw_capacity {
+            eprintln!(
+                "autotune-raw-reference-refused topology={} direction={} runs={} goodput_kbps={} reference_dl_kbps={} reference_ul_kbps={} code={error}",
+                request.topology.as_str(),
+                direction.as_str(),
+                evidence.run_count,
+                evidence.goodput_kbps,
+                reference.download_kbps,
+                reference.upload_kbps
+            );
+        }
+        return Err(error.into());
+    }
     if !thresholds_met {
         if let Some(snapshot) = last_progress.as_ref() {
             // A non-zero CPU count proves that this exact capture identity was
@@ -16963,12 +17012,23 @@ where
                     .ok_or_else(|| {
                         "native Auto-Tune runtime control sequence exhausted".to_string()
                     })?;
-                let download_kbps = topology
-                    .download_is_shaped()
-                    .then_some(permit.initial_download_kbps);
-                let upload_kbps = topology
-                    .upload_is_shaped()
-                    .then_some(permit.initial_upload_kbps);
+                let qualified = speedtest_session.qualified_raw_capacity;
+                let download_kbps = topology.download_is_shaped().then(|| {
+                    raw_control_opposite_rate_kbps(
+                        topology,
+                        permit.initial_download_kbps,
+                        qualified.map(|value| value.download_kbps),
+                        permit.download_bounds,
+                    )
+                });
+                let upload_kbps = topology.upload_is_shaped().then(|| {
+                    raw_control_opposite_rate_kbps(
+                        topology,
+                        permit.initial_upload_kbps,
+                        qualified.map(|value| value.upload_kbps),
+                        permit.upload_bounds,
+                    )
+                });
                 let mut control = AutotuneRuntimeControl {
                     permit_id: permit.permit_id.clone(),
                     job_id: permit.job_id.clone(),
@@ -24946,6 +25006,58 @@ mod tests {
                 )
                 .unwrap(),
                 traffic_stop_safety_reserve_bytes(50_000, 10_000)
+            );
+        }
+    }
+
+    #[test]
+    fn t1_raw_control_opposite_shaper_uses_qualified_rate_without_lowering() {
+        let bounds = super::super::autotune_runtime::RuntimeRateBounds {
+            minimum_kbps: NATIVE_AUTOTUNE_RUNTIME_MINIMUM_KBPS,
+            maximum_kbps: 500_000,
+        };
+        // Stale 20 Mbit/s opposite shaping is lifted to this run's qualified
+        // median; the permit maximum (service cap) still bounds it.
+        assert_eq!(
+            raw_control_opposite_rate_kbps(
+                MeasurementTopology::RawUpload,
+                20_000,
+                Some(748_221),
+                bounds
+            ),
+            500_000
+        );
+        assert_eq!(
+            raw_control_opposite_rate_kbps(
+                MeasurementTopology::RawDownload,
+                21_202,
+                Some(344_009),
+                bounds
+            ),
+            344_009
+        );
+        // Never below the captured rate, and unchanged without a reference or
+        // outside single-direction raw controls.
+        assert_eq!(
+            raw_control_opposite_rate_kbps(
+                MeasurementTopology::RawUpload,
+                900_000,
+                Some(300_000),
+                bounds
+            ),
+            900_000
+        );
+        assert_eq!(
+            raw_control_opposite_rate_kbps(MeasurementTopology::RawUpload, 20_000, None, bounds),
+            20_000
+        );
+        for topology in [
+            MeasurementTopology::ShapedBoth,
+            MeasurementTopology::RawBoth,
+        ] {
+            assert_eq!(
+                raw_control_opposite_rate_kbps(topology, 20_000, Some(748_221), bounds),
+                20_000
             );
         }
     }

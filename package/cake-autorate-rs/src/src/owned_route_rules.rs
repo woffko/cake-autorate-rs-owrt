@@ -285,6 +285,12 @@ pub(crate) fn nft_egress_guard_batch(
             {"ct":{"key":"proto-src","dir":"original"}},
             {"ct":{"key":"proto-dst","dir":"original"}}
         ]},"right":"@owned_flows"}}),
+        // Socketless loopback packets of an owned flow stay on the host. The
+        // resolver queries 127.0.0.1 and ::1 from one socket and closes it on
+        // the first answer; a late IPv4 answer then yields a kernel ICMP port
+        // unreachable in the original direction via lo. That is not foreign
+        // egress. Owned non-DNS loopback packets are still denied above.
+        json!({"match":{"op":"!=","left":{"meta":{"key":"oifname"}},"right":"lo"}}),
         wrong_device,
         deny[0].clone(),
         deny[1].clone(),
@@ -979,6 +985,22 @@ mod tests {
             assert_eq!(table["name"], "cake_r6_guard");
             assert!(first.get("add").is_none());
             *first = serde_json::json!({"add":{"table":table}});
+            // The only later change: socketless loopback packets of an owned
+            // flow are exempt from the late foreign-egress rule (last rule).
+            let commands = value["nftables"].as_array_mut().unwrap();
+            let late = commands.last_mut().unwrap()["add"]["rule"]["expr"]
+                .as_array_mut()
+                .unwrap();
+            let exemption = serde_json::json!(
+                {"match":{"op":"!=","left":{"meta":{"key":"oifname"}},"right":"lo"}}
+            );
+            let position = late.iter().position(|expr| *expr == exemption).unwrap();
+            assert_eq!(
+                position,
+                late.len() - 4,
+                "exemption precedes the device check"
+            );
+            late.remove(position);
             // Keep the original golden proof for every other byte/field;
             // actual exclusive creation is exercised by the kernel fixture.
             let legacy = format!("{}\n", serde_json::to_string(&value).unwrap());
