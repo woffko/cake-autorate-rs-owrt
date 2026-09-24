@@ -36,6 +36,12 @@ validation tests with the race detector. This is source evidence only; it does
 not prove live DNS routing or build/deploy an APK. Explicit operations require
 the new option and must never retry with system DNS if an old backend rejects it.
 
+Revision 5 builds only the `speedtest-go` CLI. The upstream example programs
+(`multi`, `naive`, `packet_loss`) are no longer installed; they are not used by
+CAKE Auto-Tune and took about 17 MiB of flash. apk extracts a whole package
+before replacing files, so on a small root filesystem the old 25 MiB package
+could not be upgraded at all.
+
 SDK integration must select this package instead of the stock feed package,
 inside a disposable SDK only. Preserve the package name and executable path.
 Verify the resulting speedtest-go APK version, binary hash and Full daemon
