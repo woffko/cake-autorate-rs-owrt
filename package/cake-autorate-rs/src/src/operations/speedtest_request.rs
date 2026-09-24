@@ -6,7 +6,7 @@
 
 use super::autotune_capture_policy::AutotuneCapturePolicyId;
 use super::autotune_request::{
-    attest_bootstrap_operation_context, attest_live_operation_context,
+    attest_bootstrap_operation_context, attest_live_operation_context, parse_positive_u64,
     validate_bootstrap_operation_context, BootstrapRequestContext, LiveRequestContext,
 };
 use super::identity::{read_kernel_uuid, DEFAULT_RANDOM_UUID_PATH};
@@ -15,10 +15,12 @@ use super::launch_route::{
 };
 use super::protocol::{
     OperationIdentity, OperationKind, OperationOrigin, OperationRequest, OperationTargetState,
-    SpeedtestDirection, SpeedtestTopology,
+    SpeedtestDirection, SpeedtestTopology, TrafficPolicy,
 };
 use super::rating::epoch_ms;
-use super::speedtest::minimum_speedtest_traffic_budget_bytes;
+use super::speedtest::{
+    minimum_explicit_speedtest_traffic_budget_bytes, minimum_speedtest_traffic_budget_bytes,
+};
 use std::path::Path;
 
 const NATIVE_SPEEDTEST_DEADLINE_MS: u64 = 10 * 60 * 1_000;
@@ -40,6 +42,13 @@ pub struct SpeedtestLaunchIntent {
     pub topology: SpeedtestTopology,
     pub route_mode: String,
     pub mwan3_member: String,
+    /// Explicit user choice of the total DL+UL allowance.  `None` keeps the
+    /// historical derived budget for callers that predate the choice.
+    pub traffic_policy: Option<TrafficPolicy>,
+    /// Declared per-direction service ceilings.  They are only stopping-reserve
+    /// authority for a capped launch, never a measurement or shaper change.
+    pub service_dl_cap_kbps: Option<u64>,
+    pub service_ul_cap_kbps: Option<u64>,
 }
 
 /// Parse only user-visible policy fields.  Job identity, fingerprints,
@@ -57,6 +66,10 @@ where
     let mut route_mode = None;
     let mut mwan3_member = None;
     let mut explicit_route = LaunchRouteFields::default();
+    let mut traffic_policy = None;
+    let mut traffic_budget = None;
+    let mut service_dl_cap_kbps = None;
+    let mut service_ul_cap_kbps = None;
     let mut args = args.peekable();
 
     while let Some(flag) = args.next() {
@@ -104,6 +117,22 @@ where
             | "--route-dns-ipv4" => {
                 explicit_route.set(&flag, value(&mut args)?)?;
             }
+            "--traffic-policy" if traffic_policy.is_none() => {
+                let raw = value(&mut args)?;
+                if raw != "capped" && raw != "unlimited" {
+                    return Err("--traffic-policy must be capped or unlimited".to_string());
+                }
+                traffic_policy = Some(raw);
+            }
+            "--traffic-budget-bytes" if traffic_budget.is_none() => {
+                traffic_budget = Some(parse_positive_u64(&value(&mut args)?, &flag)?);
+            }
+            "--service-dl-cap-kbps" if service_dl_cap_kbps.is_none() => {
+                service_dl_cap_kbps = Some(parse_positive_u64(&value(&mut args)?, &flag)?);
+            }
+            "--service-ul-cap-kbps" if service_ul_cap_kbps.is_none() => {
+                service_ul_cap_kbps = Some(parse_positive_u64(&value(&mut args)?, &flag)?);
+            }
             _ => {
                 return Err(format!(
                     "unsupported or duplicate native Speed Test option: {flag}"
@@ -119,6 +148,20 @@ where
     let direction = direction.ok_or_else(|| "--direction is required".to_string())?;
     let topology = topology.ok_or_else(|| "--topology is required".to_string())?;
     let route_mode = route_mode.ok_or_else(|| "--route-mode is required".to_string())?;
+    let traffic_policy = match (traffic_policy.as_deref(), traffic_budget) {
+        (None, None) => None,
+        (None, Some(_)) => {
+            return Err("--traffic-budget-bytes requires --traffic-policy capped".to_string())
+        }
+        (Some("unlimited"), None) => Some(TrafficPolicy::Unlimited),
+        (Some("unlimited"), Some(_)) => {
+            return Err("unlimited policy must not also set --traffic-budget-bytes".to_string())
+        }
+        (Some(_), None) => {
+            return Err("--traffic-budget-bytes is required for capped traffic".to_string())
+        }
+        (Some(_), Some(bytes)) => Some(TrafficPolicy::from(bytes)),
+    };
     let intent = SpeedtestLaunchIntent {
         explicit_route: explicit_route.finish(&route_mode)?,
         instance,
@@ -129,6 +172,9 @@ where
         topology,
         route_mode,
         mwan3_member: mwan3_member.unwrap_or_default(),
+        traffic_policy,
+        service_dl_cap_kbps,
+        service_ul_cap_kbps,
     };
     validate_speedtest_intent(&intent)?;
     Ok(intent)
@@ -230,6 +276,19 @@ fn build_bootstrap_speedtest_request_from_context(
     let deadline_unix_ms = created_unix_ms
         .checked_add(NATIVE_SPEEDTEST_DEADLINE_MS)
         .ok_or_else(|| "native bootstrap Speed Test deadline overflow".to_string())?;
+    // A UCI-absent target has no managed CAKE ceiling; only declared service
+    // ceilings can bound a capped stopping reserve.
+    let traffic = match intent.traffic_policy {
+        None => SpeedtestTrafficAuthority::legacy(
+            NATIVE_SPEEDTEST_BOOTSTRAP_TRAFFIC_BUDGET_BYTES.into(),
+        ),
+        Some(policy) => explicit_speedtest_traffic_authority(
+            intent,
+            policy,
+            intent.service_dl_cap_kbps,
+            intent.service_ul_cap_kbps,
+        )?,
+    };
     let request = OperationRequest {
         identity: OperationIdentity {
             job_id,
@@ -258,13 +317,13 @@ fn build_bootstrap_speedtest_request_from_context(
         access_source: None,
         access_confidence_percent: 0,
         capacity_learning_policy: None,
-        service_dl_cap_kbps: None,
-        service_ul_cap_kbps: None,
+        service_dl_cap_kbps: traffic.stop_dl_kbps,
+        service_ul_cap_kbps: traffic.stop_ul_kbps,
         allow_sqm_disable: false,
         allow_active_traffic: false,
         scheduled_auto_apply_requested: false,
-        traffic_budget: NATIVE_SPEEDTEST_BOOTSTRAP_TRAFFIC_BUDGET_BYTES.into(),
-        traffic_policy_explicit: false,
+        traffic_budget: traffic.policy,
+        traffic_policy_explicit: traffic.explicit,
         traffic_plan: None,
     };
     request.validate()?;
@@ -303,7 +362,33 @@ fn build_speedtest_request(
     let deadline_unix_ms = created_unix_ms
         .checked_add(NATIVE_SPEEDTEST_DEADLINE_MS)
         .ok_or_else(|| "native Speed Test deadline overflow".to_string())?;
-    let traffic_budget = native_speedtest_traffic_budget_bytes(intent, &context)?;
+    let traffic = match intent.traffic_policy {
+        None => SpeedtestTrafficAuthority::legacy(
+            native_speedtest_traffic_budget_bytes(intent, &context)?.into(),
+        ),
+        Some(policy) => {
+            // A still-shaped direction is bounded by its highest managed CAKE
+            // ceiling (adaptive ceiling included).  A bypassed direction has
+            // no such bound and needs a declared service ceiling.
+            let shaped_bound = |shaped: bool, bound: Option<u64>| {
+                (intent.topology == SpeedtestTopology::Current && shaped)
+                    .then_some(bound)
+                    .flatten()
+            };
+            explicit_speedtest_traffic_authority(
+                intent,
+                policy,
+                intent.service_dl_cap_kbps.or(shaped_bound(
+                    context.download_shaped,
+                    context.unshaped_dl_bound_kbps,
+                )),
+                intent.service_ul_cap_kbps.or(shaped_bound(
+                    context.upload_shaped,
+                    context.unshaped_ul_bound_kbps,
+                )),
+            )?
+        }
+    };
     let request = OperationRequest {
         identity: OperationIdentity {
             job_id,
@@ -334,13 +419,13 @@ fn build_speedtest_request(
         access_source: None,
         access_confidence_percent: 0,
         capacity_learning_policy: None,
-        service_dl_cap_kbps: None,
-        service_ul_cap_kbps: None,
+        service_dl_cap_kbps: traffic.stop_dl_kbps,
+        service_ul_cap_kbps: traffic.stop_ul_kbps,
         allow_sqm_disable: false,
         allow_active_traffic: false,
         scheduled_auto_apply_requested: false,
-        traffic_budget: traffic_budget.into(),
-        traffic_policy_explicit: false,
+        traffic_budget: traffic.policy,
+        traffic_policy_explicit: traffic.explicit,
         traffic_plan: None,
     };
     request.validate()?;
@@ -355,6 +440,68 @@ pub(crate) fn resolve_native_speedtest_backend(backend: &str) -> Option<&'static
         "auto" | "speedtest-go" => Some("speedtest-go"),
         _ => None,
     }
+}
+
+/// Traffic fields copied into the immutable request.
+struct SpeedtestTrafficAuthority {
+    policy: TrafficPolicy,
+    explicit: bool,
+    stop_dl_kbps: Option<u64>,
+    stop_ul_kbps: Option<u64>,
+}
+
+impl SpeedtestTrafficAuthority {
+    fn legacy(policy: TrafficPolicy) -> Self {
+        Self {
+            policy,
+            explicit: false,
+            stop_dl_kbps: None,
+            stop_ul_kbps: None,
+        }
+    }
+}
+
+/// Resolve an explicit user choice.  Unlimited removes only the byte stop;
+/// deadlines, cancel and ownership checks are unchanged.  A capped choice is
+/// refused before traffic when its stopping reserve cannot be bounded or when
+/// the total cannot hold the reserve plus route proof of each direction.
+fn explicit_speedtest_traffic_authority(
+    intent: &SpeedtestLaunchIntent,
+    policy: TrafficPolicy,
+    download_bound_kbps: Option<u64>,
+    upload_bound_kbps: Option<u64>,
+) -> Result<SpeedtestTrafficAuthority, String> {
+    let Some(limit_bytes) = policy.limit_bytes() else {
+        return Ok(SpeedtestTrafficAuthority {
+            policy,
+            explicit: true,
+            stop_dl_kbps: None,
+            stop_ul_kbps: None,
+        });
+    };
+    let download_bound_kbps =
+        download_bound_kbps.filter(|_| intent.direction != SpeedtestDirection::Upload);
+    let upload_bound_kbps =
+        upload_bound_kbps.filter(|_| intent.direction != SpeedtestDirection::Download);
+    let minimum = minimum_explicit_speedtest_traffic_budget_bytes(
+        intent.direction,
+        download_bound_kbps,
+        upload_bound_kbps,
+    )
+    .map_err(|_| {
+        "traffic-stop-authority-unavailable: a capped Speed Test needs a rate bound for every measured direction to reserve its stopping margin. A direction without active CAKE shaping has none; enter its actual service ceiling or choose Unlimited. Do not enter an artificial ceiling just to start a test.".to_string()
+    })?;
+    if limit_bytes < minimum {
+        return Err(format!(
+            "Speed Test traffic allowance is insufficient: it must hold at least {minimum} bytes total DL+UL for the stopping reserve and route proof before any measurement. The reserve is inside the selected total. Choose a larger budget or Unlimited."
+        ));
+    }
+    Ok(SpeedtestTrafficAuthority {
+        policy,
+        explicit: true,
+        stop_dl_kbps: download_bound_kbps,
+        stop_ul_kbps: upload_bound_kbps,
+    })
 }
 
 fn native_speedtest_traffic_budget_bytes(
@@ -429,6 +576,29 @@ fn validate_speedtest_intent(intent: &SpeedtestLaunchIntent) -> Result<(), Strin
         &intent.expected_target_interface,
         intent.explicit_route.as_ref(),
     )?;
+    if let Some(policy) = intent.traffic_policy {
+        policy.validate()?;
+        if policy.is_empty() {
+            return Err("native Speed Test requires a non-zero traffic budget".to_string());
+        }
+    }
+    let capped = intent
+        .traffic_policy
+        .is_some_and(|policy| policy != TrafficPolicy::Unlimited);
+    for rate in [intent.service_dl_cap_kbps, intent.service_ul_cap_kbps]
+        .into_iter()
+        .flatten()
+    {
+        if !capped {
+            return Err("service ceilings are stopping authority for capped traffic only".into());
+        }
+        if !(100..=crate::autotune::MAX_RATE_KBPS).contains(&rate) {
+            return Err(format!(
+                "service ceiling must be between 100 and {} kbit/s",
+                crate::autotune::MAX_RATE_KBPS
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -451,6 +621,9 @@ mod tests {
             topology: SpeedtestTopology::Current,
             route_mode: "main".to_string(),
             mwan3_member: String::new(),
+            traffic_policy: None,
+            service_dl_cap_kbps: None,
+            service_ul_cap_kbps: None,
         }
     }
 
@@ -463,6 +636,8 @@ mod tests {
             configured_ul_bound_kbps: Some(500_000),
             unshaped_dl_bound_kbps: Some(1_250_000),
             unshaped_ul_bound_kbps: Some(625_000),
+            download_shaped: true,
+            upload_shaped: true,
             route: OperationRouteIdentity {
                 dns_server: None,
                 device_ifindex: None,
@@ -862,5 +1037,264 @@ mod tests {
             native_speedtest_traffic_budget_bytes(&download_only, &live).unwrap_err(),
             "native Speed Test has no valid configured upload rate authority"
         );
+    }
+
+    fn launch_args(extra: &[&str]) -> Vec<String> {
+        let mut args = vec![
+            "--instance",
+            "wan_sqm",
+            "--expected-target",
+            "pppoe-wan",
+            "--backend",
+            "speedtest-go",
+            "--direction",
+            "both",
+            "--topology",
+            "current",
+            "--route-mode",
+            "main",
+        ];
+        args.extend_from_slice(extra);
+        args.into_iter().map(str::to_string).collect()
+    }
+
+    fn live_request(intent: &SpeedtestLaunchIntent) -> Result<OperationRequest, String> {
+        build_speedtest_request(intent, context(), "d".repeat(32), "e".repeat(64), 1_000)
+    }
+
+    #[test]
+    fn t2_speedtest_parser_accepts_only_explicit_consistent_traffic_policy() {
+        let parse = |extra: &[&str]| parse_speedtest_launch_intent(launch_args(extra).into_iter());
+        assert_eq!(parse(&[]).unwrap().traffic_policy, None);
+        assert_eq!(
+            parse(&["--traffic-policy", "unlimited"])
+                .unwrap()
+                .traffic_policy,
+            Some(TrafficPolicy::Unlimited)
+        );
+        let capped = parse(&[
+            "--traffic-policy",
+            "capped",
+            "--traffic-budget-bytes",
+            "2000000000",
+            "--service-dl-cap-kbps",
+            "900000",
+            "--service-ul-cap-kbps",
+            "100000",
+        ])
+        .unwrap();
+        assert_eq!(capped.traffic_policy, Some(2_000_000_000_u64.into()));
+        assert_eq!(capped.service_dl_cap_kbps, Some(900_000));
+        assert_eq!(capped.service_ul_cap_kbps, Some(100_000));
+
+        for (extra, error) in [
+            (
+                &["--traffic-budget-bytes", "1000"][..],
+                "--traffic-budget-bytes requires --traffic-policy capped",
+            ),
+            (
+                &["--traffic-policy", "capped"][..],
+                "--traffic-budget-bytes is required for capped traffic",
+            ),
+            (
+                &[
+                    "--traffic-policy",
+                    "unlimited",
+                    "--traffic-budget-bytes",
+                    "1000",
+                ][..],
+                "unlimited policy must not also set --traffic-budget-bytes",
+            ),
+            (
+                &["--traffic-policy", "auto"][..],
+                "--traffic-policy must be capped or unlimited",
+            ),
+            (
+                &[
+                    "--traffic-policy",
+                    "unlimited",
+                    "--service-dl-cap-kbps",
+                    "900000",
+                ][..],
+                "service ceilings are stopping authority for capped traffic only",
+            ),
+            (
+                &["--service-ul-cap-kbps", "100000"][..],
+                "service ceilings are stopping authority for capped traffic only",
+            ),
+        ] {
+            assert_eq!(parse(extra).unwrap_err(), error, "{extra:?}");
+        }
+        assert!(parse(&[
+            "--traffic-policy",
+            "capped",
+            "--traffic-budget-bytes",
+            "1000000000",
+            "--service-dl-cap-kbps",
+            "99",
+        ])
+        .unwrap_err()
+        .contains("service ceiling must be between"));
+        assert!(parse(&[
+            "--traffic-policy",
+            "unlimited",
+            "--traffic-policy",
+            "unlimited"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn t2_speedtest_unlimited_removes_only_the_byte_stop() {
+        let mut launch = intent();
+        launch.traffic_policy = Some(TrafficPolicy::Unlimited);
+        let request = live_request(&launch).unwrap();
+        assert_eq!(request.traffic_budget, TrafficPolicy::Unlimited);
+        assert!(request.traffic_policy_explicit);
+        assert_eq!(request.service_dl_cap_kbps, None);
+        assert_eq!(
+            request.deadline_unix_ms,
+            1_000 + NATIVE_SPEEDTEST_DEADLINE_MS
+        );
+        request.validate_admission_policy().unwrap();
+        let decoded = OperationRequest::decode(&request.encode().unwrap()).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn t2_speedtest_capped_current_uses_managed_ceiling_and_refuses_insufficient_total() {
+        let mut launch = intent();
+        let context = context();
+        let minimum = minimum_explicit_speedtest_traffic_budget_bytes(
+            SpeedtestDirection::Both,
+            context.unshaped_dl_bound_kbps,
+            context.unshaped_ul_bound_kbps,
+        )
+        .unwrap();
+        launch.traffic_policy = Some(minimum.into());
+        let request = live_request(&launch).unwrap();
+        assert_eq!(request.traffic_budget.limit_bytes(), Some(minimum));
+        assert!(request.traffic_policy_explicit);
+        // The highest managed CAKE ceiling, adaptive ceiling included, bounds
+        // each still-shaped direction; the user's total is not enlarged.
+        assert_eq!(request.service_dl_cap_kbps, Some(1_250_000));
+        assert_eq!(request.service_ul_cap_kbps, Some(625_000));
+        request.validate_admission_policy().unwrap();
+        assert_eq!(
+            OperationRequest::decode(&request.encode().unwrap()).unwrap(),
+            request
+        );
+
+        launch.traffic_policy = Some((minimum - 1).into());
+        assert!(live_request(&launch)
+            .unwrap_err()
+            .starts_with("Speed Test traffic allowance is insufficient"));
+
+        let mut download_only = intent();
+        download_only.direction = SpeedtestDirection::Download;
+        download_only.traffic_policy = Some(10_000_000_000_u64.into());
+        let request = live_request(&download_only).unwrap();
+        assert_eq!(request.service_dl_cap_kbps, Some(1_250_000));
+        assert_eq!(request.service_ul_cap_kbps, None);
+    }
+
+    #[test]
+    fn t2_speedtest_capped_bypassed_direction_requires_declared_service_ceiling() {
+        let mut launch = intent();
+        launch.topology = SpeedtestTopology::Unshaped;
+        launch.traffic_policy = Some(10_000_000_000_u64.into());
+        assert!(live_request(&launch)
+            .unwrap_err()
+            .starts_with("traffic-stop-authority-unavailable"));
+
+        let mut unshaped_upload = context();
+        unshaped_upload.upload_shaped = false;
+        let mut current = intent();
+        current.traffic_policy = Some(10_000_000_000_u64.into());
+        assert!(build_speedtest_request(
+            &current,
+            unshaped_upload,
+            "d".repeat(32),
+            "e".repeat(64),
+            1_000
+        )
+        .unwrap_err()
+        .starts_with("traffic-stop-authority-unavailable"));
+
+        launch.service_dl_cap_kbps = Some(900_000);
+        launch.service_ul_cap_kbps = Some(100_000);
+        let request = live_request(&launch).unwrap();
+        assert_eq!(request.service_dl_cap_kbps, Some(900_000));
+        assert_eq!(request.service_ul_cap_kbps, Some(100_000));
+        request.validate_admission_policy().unwrap();
+    }
+
+    #[test]
+    fn t2_speedtest_bootstrap_policy_is_explicit_and_never_invents_a_ceiling() {
+        let mut launch = intent();
+        launch.topology = SpeedtestTopology::Unshaped;
+        let build = |launch: &SpeedtestLaunchIntent| {
+            build_bootstrap_speedtest_request_from_context(
+                launch,
+                bootstrap_context(launch),
+                "c".repeat(32),
+                "d".repeat(64),
+                1_000,
+            )
+        };
+        let legacy = build(&launch).unwrap();
+        assert!(!legacy.traffic_policy_explicit);
+        assert_eq!(
+            legacy.traffic_budget.limit_bytes(),
+            Some(NATIVE_SPEEDTEST_BOOTSTRAP_TRAFFIC_BUDGET_BYTES)
+        );
+
+        launch.traffic_policy = Some(TrafficPolicy::Unlimited);
+        let unlimited = build(&launch).unwrap();
+        assert_eq!(unlimited.traffic_budget, TrafficPolicy::Unlimited);
+        assert!(unlimited.traffic_policy_explicit);
+        unlimited.validate_admission_policy().unwrap();
+        assert_eq!(
+            OperationRequest::decode(&unlimited.encode().unwrap()).unwrap(),
+            unlimited
+        );
+
+        launch.traffic_policy = Some(5_000_000_000_u64.into());
+        assert!(build(&launch)
+            .unwrap_err()
+            .starts_with("traffic-stop-authority-unavailable"));
+        launch.service_dl_cap_kbps = Some(900_000);
+        launch.service_ul_cap_kbps = Some(100_000);
+        let capped = build(&launch).unwrap();
+        assert_eq!(capped.traffic_budget.limit_bytes(), Some(5_000_000_000));
+        assert_eq!(capped.service_dl_cap_kbps, Some(900_000));
+        capped.validate_admission_policy().unwrap();
+        assert_eq!(
+            OperationRequest::decode(&capped.encode().unwrap()).unwrap(),
+            capped
+        );
+    }
+
+    #[test]
+    fn t2_speedtest_stop_authority_is_rejected_outside_explicit_capped_speedtest() {
+        let mut launch = intent();
+        launch.traffic_policy = Some(10_000_000_000_u64.into());
+        let capped = live_request(&launch).unwrap();
+
+        let mut implicit = capped.clone();
+        implicit.traffic_policy_explicit = false;
+        assert!(implicit.validate().is_err());
+        let mut unlimited = capped.clone();
+        unlimited.traffic_budget = TrafficPolicy::Unlimited;
+        assert!(unlimited.validate().is_err());
+        let mut learning = capped.clone();
+        learning.capacity_learning_policy = Some(crate::autotune::CapacityLearningPolicy::FixedCap);
+        assert!(learning.validate().is_err());
+        let mut rating = capped;
+        rating.identity.operation = OperationKind::AutomaticRating;
+        rating.speedtest_direction = None;
+        rating.speedtest_topology = None;
+        rating.speedtest_server_id = None;
+        assert!(rating.validate().is_err());
     }
 }

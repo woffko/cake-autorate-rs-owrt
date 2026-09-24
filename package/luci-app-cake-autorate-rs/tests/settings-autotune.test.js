@@ -166,7 +166,7 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl, eImpl) {
 			`autotuneRetryableInconclusive, autotuneMeasurementTimeout, recordAutotuneRetryableInconclusive, ` +
 			`manualSqmDirectionMode, validateManualSqmDirectionMode, writeManualSqmDirectionMode, ` +
 			`positiveRateValue, shouldImportInterfaceRates, applyRatePreset, ` +
-			`runSpeedtestJob, nativeEffectiveSpeedtestBackend, nativeSpeedtestCapabilityValidated, nativeSpeedtestIntentSupported, nativeSpeedtestLaunchArgs, nativeSpeedtestResultValidated, nativeOperationWorkerRunId, nativeSpeedtestStatusMatchesRequest, ` +
+			`runSpeedtestJob, nativeEffectiveSpeedtestBackend, nativeSpeedtestCapabilityValidated, nativeSpeedtestIntentSupported, nativeSpeedtestLaunchArgs, validatedSpeedtestTrafficPolicy, speedtestTrafficPolicyFromInput, nativeSpeedtestResultValidated, nativeOperationWorkerRunId, nativeSpeedtestStatusMatchesRequest, ` +
 			`nativeAutotuneCapabilityValidated, nativeBootstrapAutotuneCapabilityValidated, ` +
 			`nativeAutotuneIntentSupported, nativeAutotuneLaunchArgs, validatedAutotuneTrafficPolicy, autotuneTrafficPolicyFromInput, autotuneTrafficPlanningEstimate, nativeAutotuneResultMatchesRequest, nativeAutotuneStatusMatchesRequest, ` +
 			`nativeAutotuneProgressStepLabel, nativeAutotuneProgress, nativeAutotuneTrafficSummary, ` +
@@ -2860,6 +2860,66 @@ async function testNativeSpeedtestTransport() {
 		assert.deepEqual(bootstrapCalls.map(call => call.args[1]), [
 			'summary', 'speedtest-bootstrap-start', 'speedtest-status', 'speedtest-result',
 		], 'new-instance Speed Test must use the mutation-free native bootstrap lifecycle');
+		assert(!bootstrapCalls[1].args.includes('--traffic-policy'),
+			'a daemon without the explicit Speed Test policy keeps its historical launch');
+
+		// Explicit total DL+UL policy for a daemon that advertises it.
+		assert.deepEqual(helpers.speedtestTrafficPolicyFromInput('unlimited', '', '900', ''),
+			{ mode: 'unlimited' }, 'ceilings never accompany Unlimited');
+		assert.deepEqual(helpers.speedtestTrafficPolicyFromInput('gb:5', '', '900.5', '100'), {
+			mode: 'capped', bytes: 5000000000, service_dl_cap_kbps: 900500, service_ul_cap_kbps: 100000,
+		});
+		assert.deepEqual(helpers.speedtestTrafficPolicyFromInput('capped', '2.5', '', ''),
+			{ mode: 'capped', bytes: 2500000000 });
+		assert.throws(() => helpers.speedtestTrafficPolicyFromInput('', '', '', ''));
+		assert.throws(() => helpers.speedtestTrafficPolicyFromInput('capped', '1', '0.05', ''));
+		assert.throws(() => helpers.speedtestTrafficPolicyFromInput('capped', '1', '1e3', ''));
+		assert.throws(() => helpers.validatedSpeedtestTrafficPolicy(
+			{ mode: 'unlimited', service_dl_cap_kbps: 900000 }));
+		assert.deepEqual(helpers.nativeSpeedtestLaunchArgs(
+			'wan_sqm', 'pppoe-wan', 'main', '', '', 'unshaped', true, null, {
+				mode: 'capped', bytes: 5000000000, service_dl_cap_kbps: 900000, service_ul_cap_kbps: 100000,
+			}).slice(-8), [
+			'--traffic-policy', 'capped', '--traffic-budget-bytes', '5000000000',
+			'--service-dl-cap-kbps', '900000', '--service-ul-cap-kbps', '100000',
+		]);
+		assert.deepEqual(helpers.nativeSpeedtestLaunchArgs(
+			'wan_sqm', 'pppoe-wan', 'main', '', '', 'unshaped', true, null,
+			{ mode: 'unlimited' }).slice(-2), [ '--traffic-policy', 'unlimited' ]);
+
+		const policyCapability = { ...capability, native_speedtest_traffic_policy_version: 1 };
+		const policyCalls = [];
+		const policyPayloads = [ policyCapability, { state: 'idle', instance: 'wan_sqm' },
+			{ state: 'queued', job_id: publicJobId,
+				...speedtestIdentity('wan_sqm', 'pppoe-wan', 'main', '', null, 'unshaped') },
+			{ state: 'completed', job_id: publicJobId,
+				...speedtestIdentity('wan_sqm', 'pppoe-wan', 'main', '', null, 'unshaped') }, result ];
+		const policyHelpers = compileHelpers({
+			exec(command, args) {
+				policyCalls.push({ command, args });
+				return Promise.resolve({ stdout: JSON.stringify(policyPayloads.shift()) });
+			},
+		});
+		const chosen = [];
+		assert.deepEqual(JSON.parse((await policyHelpers.runSpeedtestJob(
+			'wan_sqm', 'pppoe-wan', 'auto', null, 'main', '', '', true, 'unshaped', null,
+			(section, topology) => { chosen.push([ section, topology ]); return Promise.resolve({ mode: 'unlimited' }); }
+		)).stdout), result);
+		assert.deepEqual(chosen, [ [ 'wan_sqm', 'unshaped' ] ]);
+		const policyStart = policyCalls.find(call => call.args[1] === 'speedtest-start');
+		assert.deepEqual(policyStart.args.slice(-2), [ '--traffic-policy', 'unlimited' ]);
+
+		const cancelCalls = [];
+		const cancelHelpers = compileHelpers({
+			exec(command, args) {
+				cancelCalls.push(args[1]);
+				return Promise.resolve({ stdout: JSON.stringify(policyCapability) });
+			},
+		});
+		await assert.rejects(cancelHelpers.runSpeedtestJob(
+			'wan_sqm', 'pppoe-wan', 'auto', null, 'main', '', '', true, 'unshaped', null,
+			() => Promise.reject(new Error('not started'))), /not started/);
+		assert.deepEqual(cancelCalls, [ 'summary' ], 'a declined choice must not start traffic');
 		assert.equal(helpers.nativeSpeedtestStatusMatchesRequest({
 			state: 'running', job_id: publicJobId,
 			...speedtestIdentity('wan_sqm', 'pppoe-wan', 'main', '', null, 'unshaped'),

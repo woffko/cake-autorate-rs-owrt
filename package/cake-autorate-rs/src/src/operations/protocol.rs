@@ -851,7 +851,7 @@ impl OperationRequest {
                         "generated-traffic operation requires a non-zero budget".to_string()
                     );
                 }
-                self.reject_autotune_context()?;
+                self.reject_speedtest_stop_authority_or_autotune_context()?;
                 if self.identity.operation == OperationKind::AutomaticRating
                     && self.managed_sqm_section.is_some()
                 {
@@ -986,6 +986,33 @@ impl OperationRequest {
                     "absent bootstrap operation kind is unsupported for admission".to_string(),
                 )
             }
+        }
+        Ok(())
+    }
+
+    /// A standalone Speedtest with an explicit capped policy carries per-direction
+    /// stopping rate authority in the service ceiling fields.  They never become
+    /// capacity-learning context, and every other operation still rejects them.
+    fn reject_speedtest_stop_authority_or_autotune_context(&self) -> Result<(), String> {
+        let stop_authority =
+            self.service_dl_cap_kbps.is_some() || self.service_ul_cap_kbps.is_some();
+        if !stop_authority {
+            return self.reject_autotune_context();
+        }
+        if self.identity.operation != OperationKind::Speedtest
+            || !self.traffic_policy_explicit
+            || self.traffic_budget == TrafficPolicy::Unlimited
+        {
+            return Err(
+                "only an explicit capped Speedtest may carry stopping rate authority".to_string(),
+            );
+        }
+        if self.access_medium.is_some()
+            || self.access_source.is_some()
+            || self.access_confidence_percent != 0
+            || self.capacity_learning_policy.is_some()
+        {
+            return Err("only Full Auto-Tune may carry access context".to_string());
         }
         Ok(())
     }

@@ -64,6 +64,9 @@ pub(crate) struct LiveRequestContext {
     pub configured_ul_bound_kbps: Option<u64>,
     pub unshaped_dl_bound_kbps: Option<u64>,
     pub unshaped_ul_bound_kbps: Option<u64>,
+    /// Whether the managed CAKE ceiling currently bounds each direction.
+    pub download_shaped: bool,
+    pub upload_shaped: bool,
     pub route: OperationRouteIdentity,
     pub route_fingerprint: String,
     pub config_fingerprint: String,
@@ -713,6 +716,8 @@ pub(crate) fn attest_live_operation_context(
         cfg.max_dl_shaper_rate_kbps
             .max(cfg.adaptive_ceiling_dl_cap_kbps),
     );
+    let download_shaped = cfg.download_shaping_enabled();
+    let upload_shaped = cfg.upload_shaping_enabled();
     let unshaped_ul_bound_kbps = rate_bound(
         cfg.max_ul_shaper_rate_kbps
             .max(cfg.adaptive_ceiling_ul_cap_kbps),
@@ -725,6 +730,8 @@ pub(crate) fn attest_live_operation_context(
         configured_ul_bound_kbps,
         unshaped_dl_bound_kbps,
         unshaped_ul_bound_kbps,
+        download_shaped,
+        upload_shaped,
         route,
         route_fingerprint,
         config_fingerprint,
@@ -975,7 +982,7 @@ fn validate_intent(intent: &AutotuneLaunchIntent) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_positive_u64(value: &str, label: &str) -> Result<u64, String> {
+pub(super) fn parse_positive_u64(value: &str, label: &str) -> Result<u64, String> {
     let parsed = value
         .parse::<u64>()
         .map_err(|_| format!("{label} must be an unsigned integer"))?;
@@ -1587,6 +1594,8 @@ mod tests {
                 configured_ul_bound_kbps: Some(500_000),
                 unshaped_dl_bound_kbps: Some(1_000_000),
                 unshaped_ul_bound_kbps: Some(500_000),
+                download_shaped: true,
+                upload_shaped: true,
                 route: OperationRouteIdentity {
                     dns_server: None,
                     device_ifindex: None,
@@ -1632,6 +1641,8 @@ mod tests {
             configured_ul_bound_kbps: Some(500_000),
             unshaped_dl_bound_kbps: Some(1_000_000),
             unshaped_ul_bound_kbps: Some(500_000),
+            download_shaped: true,
+            upload_shaped: true,
             route: OperationRouteIdentity {
                 dns_server: None,
                 device_ifindex: None,
@@ -1813,6 +1824,8 @@ mod tests {
                 configured_ul_bound_kbps: Some(500_000),
                 unshaped_dl_bound_kbps: Some(1_000_000),
                 unshaped_ul_bound_kbps: Some(500_000),
+                download_shaped: true,
+                upload_shaped: true,
                 route: OperationRouteIdentity {
                     dns_server: None,
                     device_ifindex: None,

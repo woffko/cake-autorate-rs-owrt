@@ -115,6 +115,62 @@ pub(crate) fn minimum_speedtest_traffic_budget_bytes(
     )
 }
 
+/// Stopping reserve for a standalone Speed Test launched with an explicit
+/// capped user policy.  Each measured direction needs a rate authority carried
+/// in the immutable request: a declared service ceiling, or the managed CAKE
+/// ceiling that bounds a still-shaped direction.  Nothing is invented; a
+/// missing authority refuses the capped launch instead of hiding a reserve.
+pub(crate) fn explicit_speedtest_stop_reserve_bytes(
+    direction: SpeedtestDirection,
+    download_bound_kbps: Option<u64>,
+    upload_bound_kbps: Option<u64>,
+) -> Result<u64, String> {
+    let bound = |measured: bool, value: Option<u64>| {
+        if !measured {
+            return Ok(0);
+        }
+        value
+            .filter(|rate| *rate > 0)
+            .ok_or_else(|| "traffic-stop-authority-unavailable".to_string())
+    };
+    Ok(traffic_stop_safety_reserve_bytes(
+        bound(direction != SpeedtestDirection::Upload, download_bound_kbps)?,
+        bound(direction != SpeedtestDirection::Download, upload_bound_kbps)?,
+    ))
+}
+
+/// Minimum explicit capped allowance: the stopping reserve plus route proof
+/// for every measured direction.  Passing it does not guarantee completion.
+pub(crate) fn minimum_explicit_speedtest_traffic_budget_bytes(
+    direction: SpeedtestDirection,
+    download_bound_kbps: Option<u64>,
+    upload_bound_kbps: Option<u64>,
+) -> Result<u64, String> {
+    Ok(minimum_attempt_budget(
+        direction,
+        explicit_speedtest_stop_reserve_bytes(direction, download_bound_kbps, upload_bound_kbps)?,
+    ))
+}
+
+/// Runtime reserve of a standalone request.  Historical requests keep their
+/// original zero-reserve semantics; their derived budget already included it.
+fn standalone_speedtest_stop_reserve_bytes(
+    request: &OperationRequest,
+    direction: SpeedtestDirection,
+) -> Result<u64, String> {
+    if request.identity.operation != OperationKind::Speedtest
+        || !request.traffic_policy_explicit
+        || request.traffic_budget == super::protocol::TrafficPolicy::Unlimited
+    {
+        return Ok(0);
+    }
+    explicit_speedtest_stop_reserve_bytes(
+        direction,
+        request.service_dl_cap_kbps,
+        request.service_ul_cap_kbps,
+    )
+}
+
 pub(crate) fn minimum_full_autotune_traffic_budget_bytes(
     download_bound_kbps: u64,
     upload_bound_kbps: u64,
@@ -1673,13 +1729,14 @@ pub(crate) fn run_embedded_speedtest_with_load_sample(
     scratch_path: &Path,
 ) -> Result<(SpeedtestTerminal, Option<SpeedtestLoadSample>), String> {
     let mut remaining_traffic_budget = request.traffic_budget;
+    let traffic_safety_reserve_bytes = standalone_speedtest_stop_reserve_bytes(request, direction)?;
     with_embedded_speedtest_session(request, worker_run_id, terminate, scratch_path, |session| {
         run_embedded_speedtest_with_load_sample_in_session_and_debit(
             session,
             request,
             worker_run_id,
             direction,
-            0,
+            traffic_safety_reserve_bytes,
             &mut remaining_traffic_budget,
             terminate,
             scratch_path,
@@ -5287,6 +5344,61 @@ mod tests {
                 .contains("missing after worker admission")
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn t2_standalone_reserve_applies_only_to_explicit_capped_speedtest() {
+        let mut operation = request(SpeedtestDirection::Both);
+        operation.traffic_policy_explicit = false;
+        operation.service_dl_cap_kbps = None;
+        operation.service_ul_cap_kbps = None;
+        // Historical derived budgets already included their reserve.
+        assert_eq!(
+            standalone_speedtest_stop_reserve_bytes(&operation, SpeedtestDirection::Both),
+            Ok(0)
+        );
+        operation.traffic_policy_explicit = true;
+        operation.traffic_budget = super::super::protocol::TrafficPolicy::Unlimited;
+        assert_eq!(
+            standalone_speedtest_stop_reserve_bytes(&operation, SpeedtestDirection::Both),
+            Ok(0)
+        );
+        operation.traffic_budget = 10_000_000_000_u64.into();
+        assert_eq!(
+            standalone_speedtest_stop_reserve_bytes(&operation, SpeedtestDirection::Both)
+                .unwrap_err(),
+            "traffic-stop-authority-unavailable"
+        );
+        operation.service_dl_cap_kbps = Some(85_000);
+        assert_eq!(
+            standalone_speedtest_stop_reserve_bytes(&operation, SpeedtestDirection::Download),
+            Ok(traffic_stop_safety_reserve_bytes(85_000, 0))
+        );
+        assert!(
+            standalone_speedtest_stop_reserve_bytes(&operation, SpeedtestDirection::Both).is_err()
+        );
+        operation.service_ul_cap_kbps = Some(10_000);
+        assert_eq!(
+            standalone_speedtest_stop_reserve_bytes(&operation, SpeedtestDirection::Both),
+            Ok(traffic_stop_safety_reserve_bytes(85_000, 10_000))
+        );
+        assert_eq!(
+            minimum_explicit_speedtest_traffic_budget_bytes(
+                SpeedtestDirection::Both,
+                Some(85_000),
+                Some(10_000)
+            ),
+            Ok(minimum_speedtest_traffic_budget_bytes(
+                SpeedtestDirection::Both,
+                85_000,
+                10_000
+            ))
+        );
+        operation.identity.operation = OperationKind::AutomaticRating;
+        assert_eq!(
+            standalone_speedtest_stop_reserve_bytes(&operation, SpeedtestDirection::Both),
+            Ok(0)
+        );
     }
 
     #[test]

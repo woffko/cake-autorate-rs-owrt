@@ -3293,8 +3293,103 @@ function nativeSpeedtestIntentSupported(backend, routeMode, existingInstance, to
 	return topology === 'unshaped' && /^[A-Za-z0-9_]+$/.test(plannedSqmSection || '');
 }
 
+// Explicit total DL+UL choice for one standalone Speed Test. Declared service
+// ceilings are only stopping-reserve authority for a capped choice.
+function validatedSpeedtestTrafficPolicy(policy) {
+	var validated = validatedAutotuneTrafficPolicy(policy && { mode: policy.mode, bytes: policy.bytes });
+	[ 'service_dl_cap_kbps', 'service_ul_cap_kbps' ].forEach(function(key) {
+		var value = policy[key];
+		if (value == null)
+			return;
+		if (validated.mode !== 'capped' || !Number.isSafeInteger(value) || value < 100 || value > 100000000)
+			throw new Error(_('Service ceilings must be 0.1–100000 Mbps and are used only with a capped traffic budget.'));
+		validated[key] = value;
+	});
+	return validated;
+}
+
+function speedtestServiceCeilingKbps(value) {
+	var text = String(value || '').trim();
+	if (text === '')
+		return null;
+	if (!/^\d+(?:\.\d{1,3})?$/.test(text))
+		throw new Error(_('Service ceilings must be 0.1–100000 Mbps and are used only with a capped traffic budget.'));
+	var parts = text.split('.');
+	return Number(parts[0]) * 1000 + Number((parts[1] || '').padEnd(3, '0'));
+}
+
+function speedtestTrafficPolicyFromInput(mode, gigabytes, downloadMbps, uploadMbps) {
+	var policy = autotuneTrafficPolicyFromInput(mode, gigabytes);
+	if (policy.mode === 'capped') {
+		policy.service_dl_cap_kbps = speedtestServiceCeilingKbps(downloadMbps);
+		policy.service_ul_cap_kbps = speedtestServiceCeilingKbps(uploadMbps);
+	}
+	return validatedSpeedtestTrafficPolicy(policy);
+}
+
+var speedtestTrafficChoices = {};
+
+function speedtestTrafficPolicyDialog(section_id, topology) {
+	var remembered = speedtestTrafficChoices[section_id] || {};
+	return new Promise(function(resolve, reject) {
+		var amount = E('input', { 'type': 'text', 'inputmode': 'decimal', 'class': 'cbi-input-text',
+			'value': remembered.gb || '', 'placeholder': _('Enter GB') });
+		var ceilings = [ remembered.dl || '', remembered.ul || '' ].map(function(value) {
+			return E('input', { 'type': 'text', 'inputmode': 'decimal', 'class': 'cbi-input-text',
+				'value': value, 'placeholder': _('Mbps') });
+		});
+		var amountRow = E('label', {}, [ cakeUi.text(_('Total GB (download + upload): ')), amount ]);
+		var cappedRows = E('div', {}, [
+			E('label', {}, [ cakeUi.text(_('Download service ceiling (Mbps): ')), ceilings[0] ]),
+			E('label', {}, [ cakeUi.text(_('Upload service ceiling (Mbps): ')), ceilings[1] ]),
+			E('p', {}, cakeUi.text(topology === 'unshaped' ?
+				_('This test bypasses the shaper in the measured direction, so a capped test needs the actual service ceiling of each direction to reserve its stopping margin inside the total. Without them it is refused before traffic. Do not enter artificial ceilings just to start a test.') :
+				_('Directions still shaped by CAKE use their configured ceiling for the stopping margin; a service ceiling is needed only for an unshaped direction.')))
+		]);
+		var mode = E('select', { 'class': 'cbi-input-select', 'change': function() { update(); } }, [
+			E('option', { 'value': '' }, _('Choose traffic policy…')),
+			E('option', { 'value': 'unlimited' }, _('Unlimited traffic'))
+		].concat(AUTOTUNE_TRAFFIC_PRESET_GB.map(function(value) {
+			return E('option', { 'value': 'gb:' + value }, _('%s GB total (DL + UL)').format(value));
+		})).concat([ E('option', { 'value': 'capped' }, _('Custom total traffic budget')) ]));
+		mode.value = remembered.mode || '';
+		var error = E('p', { 'class': 'alert-message warning', 'style': 'display:none' });
+		function update() {
+			amountRow.style.display = mode.value === 'capped' ? '' : 'none';
+			cappedRows.style.display = mode.value !== '' && mode.value !== 'unlimited' ? '' : 'none';
+		}
+		update();
+		ui.showModal(_('Speed Test traffic'), [
+			mode, amountRow, cappedRows,
+			E('p', {}, cakeUi.text(_('The limit is the total download plus upload traffic of this one test, including retries. Unlimited removes only this byte limit; cancel and timeouts still apply.'))),
+			error,
+			E('div', { 'class': 'right' }, [
+				E('button', { 'type': 'button', 'class': 'btn', 'click': function() {
+					ui.hideModal();
+					reject(new Error(_('Speed Test was not started. No traffic was generated.')));
+				} }, _('Cancel')), ' ',
+				E('button', { 'type': 'button', 'class': 'btn cbi-button-action', 'click': function() {
+					var policy;
+					try {
+						policy = speedtestTrafficPolicyFromInput(mode.value, amount.value,
+							ceilings[0].value, ceilings[1].value);
+					} catch (e) {
+						error.textContent = e.message;
+						error.style.display = '';
+						return;
+					}
+					speedtestTrafficChoices[section_id] = { mode: mode.value, gb: amount.value,
+						dl: ceilings[0].value, ul: ceilings[1].value };
+					ui.hideModal();
+					resolve(policy);
+				} }, _('Start test'))
+			])
+		]);
+	});
+}
+
 function nativeSpeedtestLaunchArgs(section_id, wan, routeMode, mwan3Member, serverId, topology,
-		existingInstance, plannedSqmSection) {
+		existingInstance, plannedSqmSection, trafficPolicy) {
 	var bootstrap = existingInstance === false;
 	var args = [ '--calibrationctl', bootstrap ? 'speedtest-bootstrap-start' : 'speedtest-start' ];
 	if (bootstrap)
@@ -3310,6 +3405,16 @@ function nativeSpeedtestLaunchArgs(section_id, wan, routeMode, mwan3Member, serv
 		args.push('--mwan3-member', mwan3Member || '');
 	if (String(serverId || '').match(/^[1-9][0-9]*$/))
 		args.push('--server-id', String(serverId));
+	if (trafficPolicy) {
+		trafficPolicy = validatedSpeedtestTrafficPolicy(trafficPolicy);
+		args.push('--traffic-policy', trafficPolicy.mode);
+		if (trafficPolicy.mode === 'capped')
+			args.push('--traffic-budget-bytes', String(trafficPolicy.bytes));
+		if (trafficPolicy.service_dl_cap_kbps != null)
+			args.push('--service-dl-cap-kbps', String(trafficPolicy.service_dl_cap_kbps));
+		if (trafficPolicy.service_ul_cap_kbps != null)
+			args.push('--service-ul-cap-kbps', String(trafficPolicy.service_ul_cap_kbps));
+	}
 	return args;
 }
 
@@ -3375,9 +3480,9 @@ function currentActiveNativeSpeedtestJob(section_id, wan, routeMode, mwan3Member
 }
 
 function runNativeSpeedtestJob(section_id, wan, onProgress, routeMode, mwan3Member, serverId,
-		topology, existingInstance, plannedSqmSection) {
+		topology, existingInstance, plannedSqmSection, trafficPolicy) {
 	var launchArgs = nativeSpeedtestLaunchArgs(section_id, wan, routeMode, mwan3Member, serverId,
-		topology, existingInstance, plannedSqmSection);
+		topology, existingInstance, plannedSqmSection, trafficPolicy);
 	var publicJobId;
 	var workerRunId = null;
 	var startAttempted = false;
@@ -3448,7 +3553,7 @@ function runNativeSpeedtestJob(section_id, wan, onProgress, routeMode, mwan3Memb
 }
 
 function runSpeedtestJob(section_id, wan, backend, onProgress, routeMode, mwan3Member,
-		serverId, existingInstance, topology, plannedSqmSection) {
+		serverId, existingInstance, topology, plannedSqmSection, chooseTrafficPolicy) {
 	var mode = routeMode || 'main';
 	topology = topology || 'current';
 	if (!nativeSpeedtestIntentSupported(backend, mode, existingInstance === true, topology,
@@ -3460,8 +3565,15 @@ function runSpeedtestJob(section_id, wan, backend, onProgress, routeMode, mwan3M
 			throw new Error(_('Speed Test is unavailable or has an incompatible native protocol. No fallback measurement was started.'));
 		if (topology !== 'current' && topology !== 'unshaped')
 			throw new Error(_('Unsupported native Speed Test topology.'));
-		return runNativeSpeedtestJob(section_id, wan, onProgress, mode, mwan3Member, serverId,
-			topology, existingInstance === true, plannedSqmSection);
+		// A daemon that accepts the explicit choice always gets one; an older
+		// daemon keeps its historical derived budget.
+		var choice = summary.native_speedtest_traffic_policy_version === 1 ?
+			(chooseTrafficPolicy || speedtestTrafficPolicyDialog)(section_id, topology) :
+			Promise.resolve(null);
+		return choice.then(function(trafficPolicy) {
+			return runNativeSpeedtestJob(section_id, wan, onProgress, mode, mwan3Member, serverId,
+				topology, existingInstance === true, plannedSqmSection, trafficPolicy);
+		});
 	});
 }
 

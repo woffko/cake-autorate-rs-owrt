@@ -319,6 +319,18 @@ sending the new fields; it does not silently drop them for an older daemon.
 Unlimited removes byte admission/stop limits, not cancellation, deadlines,
 accounting, route checks or runtime restoration.
 
+A standalone Full Speed Test asks for the same choice before it starts when the
+daemon reports `native_speedtest_traffic_policy_version=1` (CLI:
+`--traffic-policy unlimited|capped`, `--traffic-budget-bytes N`). The total
+covers download plus upload, retries included, and contains the stopping
+reserve. A direction still shaped by managed CAKE uses its highest configured
+ceiling (adaptive ceiling included) for that reserve. The default unshaped test
+bypasses the shaper in the measured direction, so a capped choice needs its
+actual service ceiling (`--service-dl-cap-kbps`, `--service-ul-cap-kbps`);
+without it, or when the total cannot hold the reserve plus route proof, the
+test is refused before traffic. These ceilings never change shaping or results.
+Callers that send no policy keep the historical derived budget.
+
 New traffic accounting uses test-owned IP counters for backend traffic and
 probes, including discovery, rejected attempts, retries and gaps between loads.
 Background user traffic remains a separate measurement-quality concern. System

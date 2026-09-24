@@ -247,6 +247,8 @@ mod tests {
             configured_ul_bound_kbps: Some(500_000),
             unshaped_dl_bound_kbps: Some(1_000_000),
             unshaped_ul_bound_kbps: Some(500_000),
+            download_shaped: true,
+            upload_shaped: true,
             route: OperationRouteIdentity {
                 dns_server: None,
                 device_ifindex: None,
