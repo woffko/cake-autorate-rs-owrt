@@ -3520,9 +3520,13 @@ function runNativeSpeedtestJob(section_id, wan, onProgress, routeMode, mwan3Memb
 					onProgress(status);
 				return poll();
 			}
-			if (status.state !== 'completed')
-				throw new Error(status.diagnostic || status.error ||
-					_('Speed Test ended without a usable result.'));
+			if (status.state !== 'completed') {
+				var typed = autotuneTypedTerminalDiagnostic(status);
+				var reason = (typed && typed.message) || status.diagnostic || status.error ||
+					_('Speed Test ended without a usable result.');
+				var traffic = nativeAutotuneTrafficSummary(status);
+				throw new Error(traffic ? reason + ' ' + traffic : reason);
+			}
 			return autotuneReadResultWithRetry(
 				[ '--calibrationctl', 'speedtest-result', publicJobId ], 2, 1000)
 				.then(function(result) {
@@ -3912,14 +3916,19 @@ function nativeAutotuneProgressStepLabel(step) {
 function nativeAutotuneTrafficSummary(status) {
 	var traffic = status && status.traffic;
 	if (!traffic || traffic.schema_version !== 1 ||
-	    [ 'aggregate_route_windows', 'owned-ip-system-dns-estimate-v1', 'unavailable' ].indexOf(traffic.accounting) < 0 ||
-	    [ 'unavailable', 'persisted_debits', 'terminal_record', 'cutoff_receipt', 'no_producers_receipt' ].indexOf(traffic.source) < 0)
+	    [ 'aggregate_route_windows', 'owned-ip-system-dns-estimate-v1', 'route-window-debits-v1', 'unavailable' ].indexOf(traffic.accounting) < 0 ||
+	    [ 'unavailable', 'persisted_debits', 'terminal_record', 'terminal_debits', 'cutoff_receipt', 'no_producers_receipt' ].indexOf(traffic.source) < 0)
 		return '';
 	if (traffic.accounting === 'unavailable' && traffic.source !== 'unavailable')
 		return '';
 	if ([ 'cutoff_receipt', 'no_producers_receipt' ].indexOf(traffic.source) >= 0 && traffic.accounting !== 'owned-ip-system-dns-estimate-v1')
 		return '';
 	if (traffic.source === 'no_producers_receipt' && traffic.consumed_bytes !== 0)
+		return '';
+	// Standalone Speed Test reports only its own final route-window debits.
+	var speedtestAccounting = traffic.accounting === 'route-window-debits-v1';
+	if ((speedtestAccounting && [ 'terminal_debits', 'unavailable' ].indexOf(traffic.source) < 0) ||
+	    (traffic.source === 'terminal_debits' && !speedtestAccounting))
 		return '';
 	var capped = traffic.policy === 'capped';
 	if ((!capped && traffic.policy !== 'unlimited') ||
@@ -3952,7 +3961,7 @@ function nativeAutotuneTrafficSummary(status) {
 		message += ' ' + _('Test traffic producers were not started.');
 	if (traffic.accounting === 'owned-ip-system-dns-estimate-v1')
 		message += ' ' + _('Accounting covers IP traffic owned by this test, including probes and gaps between attempts. System DNS is retained; shared resolver traffic attribution is approximate, not exact physical WAN accounting. After test producers stop, accounting closes at a recorded cutoff; later packets are not included.');
-	else if (traffic.accounting === 'aggregate_route_windows')
+	else if (traffic.accounting === 'aggregate_route_windows' || traffic.accounting === 'route-window-debits-v1')
 		message += ' ' + _('Accounting currently covers route traffic during test windows, including background traffic.');
 	else
 		message += ' ' + _('The accounting method has not been verified for this run.');

@@ -377,6 +377,8 @@ pub struct SpeedtestTerminalRecord {
     pub job_id: String,
     pub worker_run_id: String,
     pub terminal: SpeedtestTerminal,
+    /// Summed route-window debits; `None` for a version 1 terminal.
+    pub debited_bytes: Option<u64>,
 }
 
 struct BackendChild {
@@ -1538,6 +1540,9 @@ where
         return Err("speedtest worker accepts Speedtest operations only".to_string());
     }
 
+    // Sum of the route-window debits enforced against the budget, reported
+    // for every terminal state including byte-limit and other failures.
+    let debited = std::cell::Cell::new(0_u64);
     let terminal = match rating::wait_for_permit(
         &permit_path,
         &request.identity.job_id,
@@ -1545,7 +1550,13 @@ where
         request.deadline_unix_ms,
         terminate,
     ) {
-        Ok(true) => match run_speedtest(&request, &worker_run_id, terminate, &terminal_path) {
+        Ok(true) => match run_speedtest(
+            &request,
+            &worker_run_id,
+            terminate,
+            &terminal_path,
+            &debited,
+        ) {
             Ok(terminal) => terminal,
             Err(error) => SpeedtestTerminal::Failed {
                 code: rating::bounded_error_code(&error),
@@ -1559,7 +1570,7 @@ where
     rating::atomic_private_write(
         &terminal_path,
         terminal
-            .encode(&request.identity.job_id, &worker_run_id)?
+            .encode_debited(&request.identity.job_id, &worker_run_id, debited.get())?
             .as_bytes(),
     )
 }
@@ -1569,6 +1580,7 @@ fn run_speedtest(
     worker_run_id: &str,
     terminate: &AtomicBool,
     terminal_path: &Path,
+    debited: &std::cell::Cell<u64>,
 ) -> Result<SpeedtestTerminal, String> {
     if request.backend != "speedtest-go" {
         return Err("speedtest-backend-unsupported".to_string());
@@ -1577,12 +1589,22 @@ fn run_speedtest(
         .speedtest_direction
         .ok_or_else(|| "speedtest-direction-missing".to_string())?;
     match request.speedtest_topology {
-        Some(super::protocol::SpeedtestTopology::Current) => {
-            run_embedded_speedtest(request, worker_run_id, direction, terminate, terminal_path)
-        }
-        Some(super::protocol::SpeedtestTopology::Unshaped) => {
-            run_unshaped_speedtest(request, worker_run_id, direction, terminate, terminal_path)
-        }
+        Some(super::protocol::SpeedtestTopology::Current) => run_embedded_speedtest_debited(
+            request,
+            worker_run_id,
+            direction,
+            terminate,
+            terminal_path,
+            debited,
+        ),
+        Some(super::protocol::SpeedtestTopology::Unshaped) => run_unshaped_speedtest(
+            request,
+            worker_run_id,
+            direction,
+            terminate,
+            terminal_path,
+            debited,
+        ),
         None => Err("speedtest-topology-missing".to_string()),
     }
 }
@@ -1593,12 +1615,22 @@ fn run_unshaped_speedtest(
     direction: SpeedtestDirection,
     terminate: &AtomicBool,
     scratch_path: &Path,
+    debited: &std::cell::Cell<u64>,
 ) -> Result<SpeedtestTerminal, String> {
     if request.target_state == OperationTargetState::AbsentBootstrap {
         let backend = OpenWrtNativeApplyBackend::new();
         return run_bootstrap_unshaped_with_absence(
             || backend.capture_bootstrap_runtime_baseline(request, worker_run_id),
-            || run_embedded_speedtest(request, worker_run_id, direction, terminate, scratch_path),
+            || {
+                run_embedded_speedtest_debited(
+                    request,
+                    worker_run_id,
+                    direction,
+                    terminate,
+                    scratch_path,
+                    debited,
+                )
+            },
             |baseline| backend.attest_bootstrap_runtime_absence(request, baseline),
         );
     }
@@ -1636,8 +1668,14 @@ fn run_unshaped_speedtest(
     store.publish_control(&control)?;
     super::full_autotune::wait_for_runtime_applied(None, &store, &permit, &control, terminate)?;
 
-    let measurement =
-        run_embedded_speedtest(request, worker_run_id, direction, terminate, scratch_path);
+    let measurement = run_embedded_speedtest_debited(
+        request,
+        worker_run_id,
+        direction,
+        terminate,
+        scratch_path,
+        debited,
+    );
     let restoration =
         super::full_autotune::restore_runtime_voluntarily(&store, &permit, &control, terminate);
     match (measurement, restoration) {
@@ -1721,12 +1759,57 @@ pub(crate) fn run_embedded_speedtest(
     .map(|(terminal, _)| terminal)
 }
 
+fn run_embedded_speedtest_debited(
+    request: &OperationRequest,
+    worker_run_id: &str,
+    direction: SpeedtestDirection,
+    terminate: &AtomicBool,
+    scratch_path: &Path,
+    debited: &std::cell::Cell<u64>,
+) -> Result<SpeedtestTerminal, String> {
+    run_embedded_speedtest_with_load_sample_and_debit(
+        request,
+        worker_run_id,
+        direction,
+        terminate,
+        scratch_path,
+        &mut |debit| {
+            debited.set(
+                debited
+                    .get()
+                    .saturating_add(debit.rx_bytes)
+                    .saturating_add(debit.tx_bytes),
+            );
+            Ok(())
+        },
+    )
+    .map(|(terminal, _)| terminal)
+}
+
 pub(crate) fn run_embedded_speedtest_with_load_sample(
     request: &OperationRequest,
     worker_run_id: &str,
     direction: SpeedtestDirection,
     terminate: &AtomicBool,
     scratch_path: &Path,
+) -> Result<(SpeedtestTerminal, Option<SpeedtestLoadSample>), String> {
+    run_embedded_speedtest_with_load_sample_and_debit(
+        request,
+        worker_run_id,
+        direction,
+        terminate,
+        scratch_path,
+        &mut |_| Ok(()),
+    )
+}
+
+fn run_embedded_speedtest_with_load_sample_and_debit(
+    request: &OperationRequest,
+    worker_run_id: &str,
+    direction: SpeedtestDirection,
+    terminate: &AtomicBool,
+    scratch_path: &Path,
+    on_traffic_debit: &mut dyn FnMut(SpeedtestTrafficDebit) -> Result<(), String>,
 ) -> Result<(SpeedtestTerminal, Option<SpeedtestLoadSample>), String> {
     let mut remaining_traffic_budget = request.traffic_budget;
     let traffic_safety_reserve_bytes = standalone_speedtest_stop_reserve_bytes(request, direction)?;
@@ -1740,7 +1823,7 @@ pub(crate) fn run_embedded_speedtest_with_load_sample(
             &mut remaining_traffic_budget,
             terminate,
             scratch_path,
-            &mut |_| Ok(()),
+            on_traffic_debit,
         )
     })
 }
@@ -4944,6 +5027,24 @@ fn json_value_tail<'a>(input: &'a str, key: &str) -> Option<&'a str> {
 }
 
 impl SpeedtestTerminal {
+    /// Version 2 appends the summed route-window debits of this worker, the
+    /// same measure the traffic budget enforces. Version 1 remains readable.
+    pub(crate) fn encode_debited(
+        &self,
+        job_id: &str,
+        worker_run_id: &str,
+        debited_bytes: u64,
+    ) -> Result<String, String> {
+        let v1 = self.encode(job_id, worker_run_id)?;
+        let body = v1
+            .strip_prefix("cake-autorate-speedtest-terminal\t1\n")
+            .and_then(|body| body.strip_suffix("\n\n"))
+            .ok_or_else(|| "speedtest-terminal-encode-invalid".to_string())?;
+        Ok(format!(
+            "cake-autorate-speedtest-terminal\t2\n{body}\ndebited_bytes={debited_bytes}\n\n"
+        ))
+    }
+
     fn encode(&self, job_id: &str, worker_run_id: &str) -> Result<String, String> {
         let (state, code, result) = match self {
             Self::Complete(result) => ("complete", "", Some(result)),
@@ -4968,9 +5069,11 @@ impl SpeedtestTerminal {
 impl SpeedtestTerminalRecord {
     fn decode(input: &str) -> Result<Self, String> {
         let mut lines = input.split('\n');
-        if lines.next() != Some("cake-autorate-speedtest-terminal\t1") {
-            return Err("speedtest-terminal-header-invalid".to_string());
-        }
+        let version = match lines.next() {
+            Some("cake-autorate-speedtest-terminal\t1") => 1,
+            Some("cake-autorate-speedtest-terminal\t2") => 2,
+            _ => return Err("speedtest-terminal-header-invalid".to_string()),
+        };
         let job_id = terminal_field(&mut lines, "job_id")?;
         let worker_run_id = terminal_field(&mut lines, "worker_run_id")?;
         let state = terminal_field(&mut lines, "state")?;
@@ -4984,6 +5087,11 @@ impl SpeedtestTerminalRecord {
         let server_id = terminal_optional_u64(&mut lines, "server_id")?;
         let server_name = hex_decode(&terminal_field(&mut lines, "server_name_hex")?)?;
         let server_sponsor = hex_decode(&terminal_field(&mut lines, "server_sponsor_hex")?)?;
+        let debited_bytes = if version == 2 {
+            Some(terminal_u64(&mut lines, "debited_bytes")?)
+        } else {
+            None
+        };
         if lines.next() != Some("") || lines.next() != Some("") || lines.next().is_some() {
             return Err("speedtest-terminal-trailing-data".to_string());
         }
@@ -5013,6 +5121,7 @@ impl SpeedtestTerminalRecord {
             job_id,
             worker_run_id,
             terminal,
+            debited_bytes,
         })
     }
 }
@@ -8986,5 +9095,46 @@ Upload: 766.6 Mbps (Used: 975.34MB)
         assert_eq!(decoded.job_id, "a".repeat(32));
         assert_eq!(decoded.worker_run_id, "b".repeat(32));
         assert_eq!(decoded.terminal, terminal);
+        assert_eq!(
+            decoded.debited_bytes, None,
+            "version 1 carries no debit total"
+        );
+    }
+
+    #[test]
+    fn t2_terminal_v2_reports_debits_for_every_state() {
+        for terminal in [
+            SpeedtestTerminal::Failed {
+                code: SPEEDTEST_TRAFFIC_LIMIT_REACHED.to_string(),
+            },
+            SpeedtestTerminal::Cancelled,
+            SpeedtestTerminal::Complete(SpeedtestResult {
+                direction: SpeedtestDirection::Download,
+                download_kbps: Some(20_000),
+                upload_kbps: None,
+                rx_bytes: 30_000_000,
+                tx_bytes: 1_000_000,
+                elapsed_ms: 12_000,
+                server_id: None,
+                server_name: String::new(),
+                server_sponsor: String::new(),
+            }),
+        ] {
+            let encoded = terminal
+                .encode_debited(&"a".repeat(32), &"b".repeat(32), 33_070_284)
+                .unwrap();
+            assert!(encoded.starts_with("cake-autorate-speedtest-terminal\t2\n"));
+            let decoded = SpeedtestTerminalRecord::decode(&encoded).unwrap();
+            assert_eq!(decoded.terminal, terminal);
+            assert_eq!(decoded.debited_bytes, Some(33_070_284));
+            for corrupt in [
+                encoded.replace("debited_bytes=33070284\n", ""),
+                encoded.replace("debited_bytes=33070284", "debited_bytes="),
+                encoded.replace("\t2\n", "\t3\n"),
+                encoded.replace("\t2\n", "\t1\n"),
+            ] {
+                assert!(SpeedtestTerminalRecord::decode(&corrupt).is_err());
+            }
+        }
     }
 }

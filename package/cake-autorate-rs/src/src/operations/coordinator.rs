@@ -7944,8 +7944,11 @@ impl CalibrationDaemon {
             return error_response("job-not-found", "no job matches the supplied identity");
         };
         let progress = self.native_autotune_status_progress(job);
-        let usage = self.native_autotune_status_usage(job, progress.as_ref());
-        let owned_accounting = job.request.traffic_policy_explicit
+        let usage = self
+            .native_autotune_status_usage(job, progress.as_ref())
+            .or_else(|| self.native_speedtest_status_usage(job));
+        let owned_accounting = job.request.identity.operation == OperationKind::FullAutotune
+            && job.request.traffic_policy_explicit
             && (usage.is_some_and(|(_, source)| {
                 matches!(source, "cutoff_receipt" | "no_producers_receipt")
             }) || job.journal.worker_run_id.as_deref().is_some_and(|worker| {
@@ -7997,6 +8000,25 @@ impl CalibrationDaemon {
             }
         }
         response
+    }
+
+    /// Final debited bytes of a settled explicit-policy Speed Test; unknown
+    /// while running and for historical version 1 terminals.
+    fn native_speedtest_status_usage(&self, job: &ScannedJob) -> Option<(u64, &'static str)> {
+        if job.request.identity.operation != OperationKind::Speedtest
+            || !job.request.traffic_policy_explicit
+        {
+            return None;
+        }
+        let worker = job.journal.worker_run_id.as_deref()?;
+        let paths = self
+            .journal_store
+            .native_job_paths(&job.journal.job_id, worker)
+            .ok()?;
+        let terminal = speedtest::read_terminal_file(&paths.terminal).ok()?;
+        (terminal.job_id == job.journal.job_id && terminal.worker_run_id == worker)
+            .then_some(terminal.debited_bytes?)
+            .map(|bytes| (bytes, "terminal_debits"))
     }
 
     fn native_autotune_status_usage(
@@ -9295,6 +9317,10 @@ fn job_status_response_with_progress(
 ) -> String {
     let accounting = if owned_accounting {
         "owned-ip-system-dns-estimate-v1"
+    } else if job.request.identity.operation == OperationKind::Speedtest {
+        // Standalone Speed Test enforces its budget on route-window debits and
+        // reports the same measure; it is not owned-socket accounting.
+        "route-window-debits-v1"
     } else if job.request.traffic_policy_explicit {
         "unavailable"
     } else {
@@ -9332,7 +9358,10 @@ fn job_status_response_with_progress(
         diagnostic_code,
     );
     let request_identity = operation_status_request_identity(&job.request);
-    let traffic = if job.request.identity.operation == OperationKind::FullAutotune {
+    let traffic = if job.request.identity.operation == OperationKind::FullAutotune
+        || (job.request.identity.operation == OperationKind::Speedtest
+            && job.request.traffic_policy_explicit)
+    {
         let limit = job.request.traffic_budget.limit_bytes();
         let number = |value: Option<u64>| {
             value.map_or_else(|| "null".to_string(), |value| value.to_string())
@@ -16366,6 +16395,83 @@ mod tests {
         .is_ok());
         drop(daemon);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn t2_speedtest_status_reports_explicit_policy_and_final_debits() {
+        let dir = temp_path("speedtest-traffic-status");
+        let daemon = CalibrationDaemon::bind(&dir).unwrap();
+        let mut request = operation_request('c', 'd', "wan");
+        request.identity.operation = OperationKind::Speedtest;
+        request.speedtest_direction = Some(SpeedtestDirection::Both);
+        request.speedtest_topology = Some(SpeedtestTopology::Current);
+        request.route.source_ip = Some("192.0.2.2".parse().unwrap());
+        request.managed_sqm_section = None;
+        request.profile = None;
+        request.strategy = None;
+        request.access_medium = None;
+        request.access_source = None;
+        request.access_confidence_percent = 0;
+        request.capacity_learning_policy = None;
+        request.service_dl_cap_kbps = Some(20_000);
+        request.service_ul_cap_kbps = Some(21_202);
+        request.allow_sqm_disable = false;
+        request.allow_active_traffic = false;
+        request.traffic_policy_explicit = true;
+        request.traffic_budget = 40_000_000_u64.into();
+        request.validate().unwrap();
+        let journal = JobJournal::queued(&request, &daemon.coordinator, true).unwrap();
+        daemon.journal_store.create(&request, &journal).unwrap();
+        let mut job = ScannedJob {
+            request,
+            journal,
+            disposition: JournalDisposition::Queued,
+        };
+        let running = job_status_response(&job, true, None);
+        assert!(running.contains(
+            "\"traffic\":{\"schema_version\":1,\"policy\":\"capped\",\"limit_bytes\":40000000,\"consumed_bytes\":null"
+        ));
+        assert!(running.contains("\"accounting\":\"route-window-debits-v1\""));
+        assert_eq!(daemon.native_speedtest_status_usage(&job), None);
+        let worker = "77".repeat(16);
+        job.journal.worker_run_id = Some(worker.clone());
+        job.journal.state = OperationState::Failed;
+        let paths = daemon
+            .journal_store
+            .native_job_paths(&job.journal.job_id, &worker)
+            .unwrap();
+        let parent = paths.request.parent().unwrap();
+        fs::create_dir_all(parent).unwrap();
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let terminal = speedtest::SpeedtestTerminal::Failed {
+            code: speedtest::SPEEDTEST_TRAFFIC_LIMIT_REACHED.to_string(),
+        };
+        let encoded = terminal
+            .encode_debited(&job.journal.job_id, &worker, 33_070_284)
+            .unwrap();
+        fs::write(&paths.terminal, &encoded).unwrap();
+        let usage = daemon.native_speedtest_status_usage(&job);
+        assert_eq!(usage, Some((33_070_284, "terminal_debits")));
+        let response = job_status_response_with_progress(&job, true, None, None, usage, false);
+        assert!(response.contains(
+            "\"consumed_bytes\":33070284,\"remaining_bytes\":6929716,\"overrun_bytes\":0"
+        ));
+        assert!(response.contains("\"source\":\"terminal_debits\""));
+        // A terminal of another worker is never attributed to this job.
+        let other = terminal
+            .encode_debited(&job.journal.job_id, &"88".repeat(16), 1)
+            .unwrap();
+        fs::write(&paths.terminal, other).unwrap();
+        assert_eq!(daemon.native_speedtest_status_usage(&job), None);
+        // Historical requests without an explicit choice keep their old status shape.
+        fs::write(&paths.terminal, &encoded).unwrap();
+        job.request.traffic_policy_explicit = false;
+        job.request.service_dl_cap_kbps = None;
+        job.request.service_ul_cap_kbps = None;
+        assert_eq!(daemon.native_speedtest_status_usage(&job), None);
+        assert!(!job_status_response(&job, true, None).contains("\"traffic\""));
+        drop(daemon);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

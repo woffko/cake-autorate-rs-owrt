@@ -2909,6 +2909,34 @@ async function testNativeSpeedtestTransport() {
 		const policyStart = policyCalls.find(call => call.args[1] === 'speedtest-start');
 		assert.deepEqual(policyStart.args.slice(-2), [ '--traffic-policy', 'unlimited' ]);
 
+		const speedtestTraffic = { schema_version: 1, policy: 'capped', limit_bytes: 40000000,
+			consumed_bytes: 33070284, remaining_bytes: 6929716, overrun_bytes: 0,
+			accounting: 'route-window-debits-v1', source: 'terminal_debits' };
+		const speedtestText = helpers.nativeAutotuneTrafficSummary({ traffic: speedtestTraffic });
+		assert.match(speedtestText, /Recorded traffic DL\+UL: 33\.07 MB; limit 40\.00 MB\. Remaining: 6\.93 MB\./);
+		assert.match(speedtestText, /including background traffic/);
+		assert.equal(helpers.nativeAutotuneTrafficSummary({ traffic: { ...speedtestTraffic,
+			accounting: 'aggregate_route_windows' } }), '', 'terminal debits require Speed Test accounting');
+		assert.equal(helpers.nativeAutotuneTrafficSummary({ traffic: { ...speedtestTraffic,
+			source: 'cutoff_receipt' } }), '', 'Speed Test accounting has no owned cutoff receipt');
+		assert.match(helpers.nativeAutotuneTrafficSummary({ traffic: { ...speedtestTraffic,
+			consumed_bytes: null, remaining_bytes: null, overrun_bytes: null, source: 'unavailable' } }),
+			/usage unavailable; limit 40\.00 MB/);
+
+		const stoppedPayloads = [ policyCapability, { state: 'idle', instance: 'wan_sqm' },
+			{ state: 'queued', job_id: publicJobId,
+				...speedtestIdentity('wan_sqm', 'pppoe-wan', 'main', '', null, 'current') },
+			{ state: 'failed', job_id: publicJobId, terminal_state: 'failed',
+				diagnostic_code: 'speedtest-traffic-limit-reached', traffic: speedtestTraffic,
+				...speedtestIdentity('wan_sqm', 'pppoe-wan', 'main', '', null, 'current') } ];
+		const stoppedHelpers = compileHelpers({
+			exec() { return Promise.resolve({ stdout: JSON.stringify(stoppedPayloads.shift()) }); },
+		});
+		await assert.rejects(stoppedHelpers.runSpeedtestJob(
+			'wan_sqm', 'pppoe-wan', 'auto', null, 'main', '', '', true, 'current', null,
+			() => Promise.resolve({ mode: 'capped', bytes: 40000000 })),
+			/stopped at its traffic safety limit.*Recorded traffic DL\+UL: 33\.07 MB; limit 40\.00 MB/);
+
 		const cancelCalls = [];
 		const cancelHelpers = compileHelpers({
 			exec(command, args) {
