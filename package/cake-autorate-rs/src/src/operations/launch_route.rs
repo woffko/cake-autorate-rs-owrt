@@ -166,7 +166,9 @@ mod tests {
         }
         let selected = fields().finish("explicit").unwrap().unwrap();
         let spec = launch_route_spec("explicit", "", "eth1", Some(&selected)).unwrap();
-        assert!(spec.validate().unwrap_err().contains("not available"));
+        // Route authority is valid for the Full controller; operation requests
+        // remain closed at protocol admission (link-qualified execution).
+        spec.validate().unwrap();
         for (mode, member, target) in [
             ("main", "", "eth1"),
             ("explicit", "wan", "eth1"),

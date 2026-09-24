@@ -477,8 +477,9 @@ impl RouteSpec {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        // Keep runtime admission closed until every producer, request and
-        // recovery consumer shares the explicit authority contract.
+        // The Full controller enforces explicit authority through its owned
+        // probe groups and exact nft pins. Operation requests stay closed at
+        // protocol admission; Lite lacks the nft JSON runtime entirely.
         if self.configured_mode == "explicit" {
             if !self.member.is_empty() {
                 return Err("route_mode=explicit must not define mwan3_member".into());
@@ -486,7 +487,13 @@ impl RouteSpec {
             if self.explicit_authority.is_none() {
                 return Err("explicit route authority is incomplete".into());
             }
-            return Err("explicit PBR runtime enforcement is not available in this build".into());
+            if !cfg!(feature = "calibration") {
+                return Err("explicit PBR routing requires the Full package".into());
+            }
+            if self.expected_device.is_empty() || !is_safe_identifier(&self.expected_device) {
+                return Err("route device contains unsupported characters".to_string());
+            }
+            return Ok(());
         }
         if self.explicit_authority.is_some() {
             return Err("explicit route authority fields require route_mode=explicit".into());
@@ -2253,16 +2260,23 @@ mod tests {
     }
 
     #[test]
-    fn r6_explicit_config_keeps_runtime_admission_closed_until_enforced() {
+    fn r6_explicit_config_is_admitted_for_the_full_controller_only() {
         let text = "cake-autorate.primary.route_mode='explicit'\ncake-autorate.primary.route_source_ipv4='192.0.2.1'\ncake-autorate.primary.route_table='101'\ncake-autorate.primary.route_fwmark='512'\ncake-autorate.primary.route_fwmark_mask='16128'\n";
         let cfg = crate::Config::from_uci_text("primary", text).unwrap();
         assert!(cfg.explicit_route_authority.is_some());
-        assert!(cfg
-            .route_spec()
-            .validate()
-            .unwrap_err()
-            .contains("enforcement is not available"));
-        assert!(cfg.validate().is_err());
+        if cfg!(feature = "calibration") {
+            cfg.route_spec().validate().unwrap();
+        } else {
+            assert!(cfg
+                .route_spec()
+                .validate()
+                .unwrap_err()
+                .contains("requires the Full package"));
+            assert!(cfg.validate().is_err());
+        }
+        let mut incomplete = cfg.route_spec();
+        incomplete.explicit_authority = None;
+        assert!(incomplete.validate().unwrap_err().contains("incomplete"));
         let conflict = text.replace("='explicit'", "='main'");
         assert!(crate::Config::from_uci_text("primary", &conflict).is_err());
     }
