@@ -39,6 +39,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const SPEEDTEST_GO: &str = "/usr/bin/speedtest-go";
+/// Some speedtest.net servers reject the backend's default User-Agent with
+/// HTTP 500 while serving browsers, which would disqualify them as failed.
+/// A generic browser identity keeps them measurable; nothing else changes.
+pub(crate) const BACKEND_USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 const MWAN3: &str = "/usr/sbin/mwan3";
 const NFT: &str = "/usr/sbin/nft";
 const TC: &str = "/sbin/tc";
@@ -2396,6 +2401,8 @@ fn speedtest_go_server_list_arguments(request: &OperationRequest) -> Result<Vec<
         "--list".to_string(),
         "--ping-mode".to_string(),
         "http".to_string(),
+        "--ua".to_string(),
+        BACKEND_USER_AGENT.to_string(),
         "--source".to_string(),
         source.to_string(),
     ];
@@ -3507,6 +3514,8 @@ fn speedtest_go_arguments(
         "--unix".to_string(),
         "--ping-mode".to_string(),
         "http".to_string(),
+        "--ua".to_string(),
+        BACKEND_USER_AGENT.to_string(),
     ];
     if let Some(server_id) = server_id {
         if server_id == 0 {
@@ -5559,6 +5568,8 @@ mod tests {
                 "--unix",
                 "--ping-mode",
                 "http",
+                "--ua",
+                BACKEND_USER_AGENT,
                 "--server",
                 "17372",
                 "--no-upload",
@@ -5578,6 +5589,8 @@ mod tests {
                 "--list",
                 "--ping-mode",
                 "http",
+                "--ua",
+                BACKEND_USER_AGENT,
                 "--source",
                 "192.0.2.1",
                 "--dns-bind-source"

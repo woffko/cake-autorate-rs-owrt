@@ -2626,6 +2626,33 @@ function nativeDownloadBypassUnavailableReason(topology, rawFallback) {
 	}
 }
 
+// Explain a shaped-throughput plateau from existing search evidence. When a
+// much higher CAKE rate did not raise achieved throughput, the unshaped path
+// was clearly faster, and router CPU was high, the proposal is most likely
+// bounded by this router's shaping capacity rather than by the line. This is
+// an interpretation of the recorded samples, never Apply authority.
+function nativeShapingPlateau(search, topologyDirection) {
+	var evaluated = search && Array.isArray(search.evaluated) ? search.evaluated : [];
+	var usable = evaluated.filter(function(entry) {
+		return entry && Number.isSafeInteger(entry.candidate_kbps) && entry.candidate_kbps > 0 &&
+			Number.isSafeInteger(entry.achieved_kbps) && entry.achieved_kbps > 0 &&
+			typeof entry.cpu_percent === 'number';
+	});
+	var unshaped = topologyDirection && topologyDirection.unshaped;
+	if (usable.length < 2 || !unshaped || !Number.isSafeInteger(unshaped.achieved_kbps))
+		return null;
+	var highest = usable.reduce(function(a, b) { return b.candidate_kbps > a.candidate_kbps ? b : a; });
+	var lowest = usable.reduce(function(a, b) { return b.candidate_kbps < a.candidate_kbps ? b : a; });
+	var plateau = Math.max.apply(null, usable.map(function(entry) { return entry.achieved_kbps; }));
+	if (highest.candidate_kbps < lowest.candidate_kbps * 1.3 ||
+	    highest.achieved_kbps > lowest.achieved_kbps * 1.1 ||
+	    unshaped.achieved_kbps < plateau * 1.3 || highest.cpu_percent < 75)
+		return null;
+	return { plateau_kbps: plateau, lowest_candidate_kbps: lowest.candidate_kbps,
+		highest_candidate_kbps: highest.candidate_kbps, unshaped_kbps: unshaped.achieved_kbps,
+		cpu_percent: Math.max.apply(null, usable.map(function(entry) { return entry.cpu_percent; })) };
+}
+
 function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 	var artifacts = result.artifacts;
 	var proposal = artifacts.proposal && artifacts.proposal.value;
@@ -2911,6 +2938,18 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 					(100 * prior.current_download_kbps / prior.prior_download_kbps).toFixed(1),
 					(100 * prior.current_upload_kbps / prior.prior_upload_kbps).toFixed(1)))));
 		}
+		[ 'download', 'upload' ].forEach(function(direction) {
+			var search = artifacts[direction + '_search'] && artifacts[direction + '_search'].value;
+			var limit = nativeShapingPlateau(search, topology && topology[direction]);
+			if (!limit)
+				return;
+			nodes.push(E('p', { 'class': 'cake-autotune-shaping-plateau' }, cakeUi.text(
+				(direction === 'download' ?
+					_('Download with CAKE stayed near %s kbit/s whether the shaping rate was %s or %s kbit/s, while the same path without shaping reached %s kbit/s; router CPU reached %s%%. The proposed rate is most likely limited by this router\'s shaping capacity, not by the line.') :
+					_('Upload with CAKE stayed near %s kbit/s whether the shaping rate was %s or %s kbit/s, while the same path without shaping reached %s kbit/s; router CPU reached %s%%. The proposed rate is most likely limited by this router\'s shaping capacity, not by the line.')).format(
+					limit.plateau_kbps, limit.lowest_candidate_kbps, limit.highest_candidate_kbps,
+					limit.unshaped_kbps, Math.round(limit.cpu_percent)))));
+		});
 		if (selectedEvidence.transportCensored) {
 			nodes.push(E('div', {
 				'class': 'alert-message warning',

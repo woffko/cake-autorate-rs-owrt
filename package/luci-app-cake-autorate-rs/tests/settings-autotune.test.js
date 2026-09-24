@@ -150,7 +150,7 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl, eImpl) {
 			`formOrUci, accessMediumDefinitions, accessMediumTitle, accessMediumExplorationPercent, detectAccessMedium, resolvedAccessContext, ` +
 			`recommendedCapacityLearningPolicy, canonicalCapacityLearningPolicy, autotuneAccessRequest, ` +
 			`canonicalAutotuneProfile, autotuneProfileDefinitions, ` +
-			`nativeAutotunePublicResultValidated, nativeServerComparisonValidated, nativeAutotuneAcknowledgementLabel, nativeMobileDownloadBypassRequested, nativeDownloadBypassUnavailableReason, renderNativeAutotuneDiagnostics, nativeAutotuneApplyCheckValidated, nativeAutotuneApplyRetryableRpcError, ` +
+			`nativeAutotunePublicResultValidated, nativeServerComparisonValidated, nativeAutotuneAcknowledgementLabel, nativeShapingPlateau, nativeMobileDownloadBypassRequested, nativeDownloadBypassUnavailableReason, renderNativeAutotuneDiagnostics, nativeAutotuneApplyCheckValidated, nativeAutotuneApplyRetryableRpcError, ` +
 			`nativeAutotuneApplyReceiptValidated, nativeAutotuneApplyHandleValidated, nativeAutotuneApplyStatusValidated, runNativeAutotuneApplyCheck, runNativeAutotuneApply, reloadAppliedUciPackages, reloadAppliedSettingsPage, ` +
 			`visibleAutotuneProfile, autotuneRunProfile, storedAutotuneProfile, ` +
 			`autotuneHasTrustedCapacityReferences, autotuneCalibrationStrategy, ` +
@@ -2862,6 +2862,29 @@ async function testNativeSpeedtestTransport() {
 		], 'new-instance Speed Test must use the mutation-free native bootstrap lifecycle');
 		assert(!bootstrapCalls[1].args.includes('--traffic-policy'),
 			'a daemon without the explicit Speed Test policy keeps its historical launch');
+
+		// Shaped plateau interpretation from a real VM run: 804.8 and 529.6
+		// Mbit/s CAKE rates both delivered ~0.41-0.43 Gbit/s, unshaped 756.
+		const plateauSearch = { evaluated: [
+			{ candidate_kbps: 804800, achieved_kbps: 425101, cpu_percent: 75.871 },
+			{ candidate_kbps: 804800, achieved_kbps: 427056, cpu_percent: 76.25 },
+			{ candidate_kbps: 529600, achieved_kbps: 401585, cpu_percent: 79.851 },
+		] };
+		assert.deepEqual(helpers.nativeShapingPlateau(plateauSearch, { unshaped: { achieved_kbps: 756617 } }), {
+			plateau_kbps: 427056, lowest_candidate_kbps: 529600, highest_candidate_kbps: 804800,
+			unshaped_kbps: 756617, cpu_percent: 79.851 });
+		// Throughput that follows the rate, a slow unshaped path, low CPU or
+		// missing evidence are not presented as a router shaping limit.
+		for (const [search, unshaped] of [
+			[{ evaluated: [ { candidate_kbps: 804800, achieved_kbps: 780000, cpu_percent: 80 },
+				{ candidate_kbps: 529600, achieved_kbps: 510000, cpu_percent: 80 } ] }, 800000],
+			[plateauSearch, 500000],
+			[{ evaluated: plateauSearch.evaluated.map(entry => ({ ...entry, cpu_percent: 40 })) }, 756617],
+			[{ evaluated: plateauSearch.evaluated.slice(0, 1) }, 756617],
+			[null, 756617],
+		])
+			assert.equal(helpers.nativeShapingPlateau(search, { unshaped: { achieved_kbps: unshaped } }), null);
+		assert.equal(helpers.nativeShapingPlateau(plateauSearch, null), null);
 
 		// Explicit route authority mirrors the native field contract.
 		const route = { route_source_ipv4: '192.0.2.2', route_table: '101',
