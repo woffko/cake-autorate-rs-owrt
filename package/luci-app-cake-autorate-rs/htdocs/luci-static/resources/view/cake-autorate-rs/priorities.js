@@ -475,7 +475,7 @@ return L.view.extend({
 						(classifier.state === 'drifted' || classifier.state === 'untracked' ?
 							'alert-message error' : 'alert-message notice')
 				}, stateText),
-				E('p', {}, _('Rules affect forwarded and router-originated packets before outbound CAKE. Download packets reach the SQM IFB before these nftables hooks, so Best overall and Fair deliberately keep download classification at best effort.')),
+				E('p', {}, _('Rules tag upload traffic before CAKE. Download traffic reaches CAKE first, so Best overall and Fair keep download at best effort.')),
 				E('p', {}, _('Built-in defaults run first. Enabled custom rules run afterwards in ascending order; a later matching rule can override an earlier class.'))
 			]);
 		};

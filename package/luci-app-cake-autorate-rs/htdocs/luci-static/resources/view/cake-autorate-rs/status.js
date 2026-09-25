@@ -508,7 +508,7 @@ function showQualityTest(section, status, calibrationSummary) {
 	var state = E('div', { 'class': 'alert-message notice cake-quality-job-state' },
 		_('Checking for an active Rating operation…'));
 	var detail = E('div', { 'class': 'cake-quality-job-detail' },
-		_('Automatic mode first waits for a quiet link, measures background traffic, then runs explicit download-only and upload-only phases through this uplink. Unexpected opposite-direction traffic rejects a contaminated phase. It may take 1–3 passes and transfer several gigabytes on a fast line. Guided mode uses independent download and upload triggers while you run a sequential test from a LAN client. Triggers are percentages of the current CAKE rates, not the physical link or adaptive ceiling caps. Neither mode disables SQM or autorate, changes CAKE limits, or writes samples to flash.'));
+		_('Automatic: waits for a quiet link, then runs download-only and upload-only load through this uplink (1–3 passes; several GB on a fast line). Guided: you run a speed test from a LAN device while the router measures. Neither mode changes SQM or CAKE limits.'));
 	var running = false;
 	var starting = false;
 	var closed = false;
@@ -1083,7 +1083,7 @@ function formatQuality(status) {
 		var state = String(status.quality_grade_state || 'learning_baseline');
 		var title = [
 			transportDetails,
-			_('Detected rating uses the worse of controller ICMP delay increase and transport RTT loaded p90 minus the preceding idle p5. ICMP uses the controller reflector baseline; transport excludes DNS, process startup, and connection handshake time.'),
+			_('The rating uses the worse of two signals: ICMP delay increase, and loaded transport RTT (p90) above idle (p5). DNS and connection setup time are excluded.'),
 			_('Download and upload are scored independently; the worse grade is shown.'),
 			_('A one-direction result is labeled PARTIAL and is never presented as the final connection rating.'),
 			_('Bidirectional latency is diagnostic and does not affect the total grade.'),
@@ -1888,7 +1888,7 @@ return L.view.extend({
 				'.cake-services-note,.cake-services-wait-reason{white-space:normal!important;overflow-wrap:anywhere;color:#d08b20!important;max-width:100%}',
 				'.cake-services-technical{max-width:100%;margin-top:2px}.cake-services-technical>summary{cursor:pointer;color:#888;font-size:11px}.cake-services-technical>div{display:flex;flex-direction:column;gap:2px;margin-top:5px;white-space:normal;overflow-wrap:anywhere}',
 				'.cake-quality-stack{gap:7px;min-width:210px}',
-				'.cake-quality-detected{display:grid!important;grid-template-columns:66px minmax(30px,auto);column-gap:7px;align-items:baseline!important}',
+				'.cake-quality-detected{display:grid!important;grid-template-columns:max-content minmax(30px,auto);column-gap:7px;align-items:baseline!important}',
 				'.cake-quality-detected small{grid-column:1 / -1;color:#888;white-space:normal}',
 				'.cake-quality-label{font-size:10px;font-weight:700;letter-spacing:.04em;color:#888;white-space:nowrap}',
 				'.cake-quality-grade-a-plus strong,.cake-quality-grade-a strong{color:#16a085}',

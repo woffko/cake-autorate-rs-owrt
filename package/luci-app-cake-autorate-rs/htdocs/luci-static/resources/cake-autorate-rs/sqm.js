@@ -75,7 +75,7 @@ function bind(qdisc, scriptOption, button) {
  qdisc.default = 'cake';
  qdisc.rmempty = false;
  qdisc.forcewrite = true;
- qdisc.description = _('Only CAKE modes are supported. Legacy cake-mq/cake_mq settings are preserved as multi-queue intent and saved as cake plus use_mq. Verify support to offer a new multi-queue selection. The check uses one temporary down interface, sends no traffic, and does not change existing queues.');
+ qdisc.description = _('Only CAKE is supported. Older cake-mq settings are kept as multi-queue. Use Verify to check multi-queue support; the check sends no traffic and does not touch existing queues.');
  qdisc.cfgvalue = function(id) { return mode(this.map.data, id); };
  qdisc.validate = function(id, value) {
   return value === 'cake' || value === 'cake_mq' ? true : _('Choose CAKE or a verified multi-queue mode.');

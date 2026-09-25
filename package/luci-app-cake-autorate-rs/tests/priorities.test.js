@@ -51,7 +51,7 @@ assert.equal(helpers.selectedInstanceFromLocation({ search: '?instance=../../etc
 assert(source.includes('Configure profile-specific outbound DSCP rules for this instance') &&
 	source.includes('remains the only owner of SQM, CAKE, IFB devices and bandwidth rates'),
 	'the per-instance ownership boundary must be explicit in LuCI');
-assert(source.includes('Download packets reach the SQM IFB before these nftables hooks'),
+assert(source.includes('Download traffic reaches CAKE first, so Best overall and Fair keep download at best effort'),
 	'LuCI must not claim that outbound nft rules classify download traffic');
 for (const match of source.matchAll(/o\.depends\('preset', 'custom'\);([\s\S]{0,100})/g))
 	assert.match(match[1], /o\.retain = true;/,

@@ -63,7 +63,7 @@ var optionDescriptions = {
 	speedtest_go_server_id: 'Optional speedtest-go server ID. Leave empty to automatically validate nearby servers and reuse the first good one; set an ID to pin a known-good server.',
 	_wizard_sqm_queue: 'Existing unmanaged SQM queues on the selected interface are reused to avoid duplicate shapers.',
 	_wizard_advanced_test_options: 'Show native backend selection, speed test headroom, and reflector planning. Auto defaults are suitable for normal setup.',
-	manual_rate_limits: 'Show explicit min, base, and max autorate limits. When off, a speed C sets base=max=C and min=half of C. This is a configured ceiling, not a measured capacity. Separately enabled adaptive ceiling may explore above it within its cap.',
+	manual_rate_limits: 'Show min, base and max limits. When off, one speed C sets base = max = C and min = C/2. This is a configured ceiling, not a measurement.',
 	advanced_settings: 'Show detailed SQM, reflector, controller, logging, and daemon tuning settings.',
 	min_dl_shaper_rate_kbps: 'Lowest download shaper rate autorate may apply, in kbit/s.',
 	base_dl_shaper_rate_kbps: 'Starting download shaper rate before autorate adjusts it, in kbit/s.',
@@ -71,7 +71,7 @@ var optionDescriptions = {
 	min_ul_shaper_rate_kbps: 'Lowest upload shaper rate autorate may apply, in kbit/s.',
 	base_ul_shaper_rate_kbps: 'Starting upload shaper rate before autorate adjusts it, in kbit/s.',
 	max_ul_shaper_rate_kbps: 'Highest upload shaper rate autorate may apply, in kbit/s.',
-	adaptive_ceiling_enabled: 'Bounded probe mode. The configured maximum becomes a learned-safe starting ceiling. Under sustained clean high load the daemon briefly tests a higher ceiling, keeps successful values, and rolls back while remembering failed values when latency rises.',
+	adaptive_ceiling_enabled: 'Lets the daemon briefly try a higher ceiling during clean sustained load, keep it if latency stays low, and roll back otherwise.',
 	adaptive_ceiling_dl_cap_kbps: 'Absolute download safety cap for adaptive ceiling growth, in kbit/s. It must not be below the configured download maximum.',
 	adaptive_ceiling_ul_cap_kbps: 'Absolute upload safety cap for adaptive ceiling growth, in kbit/s. It must not be below the configured upload maximum.',
 	adaptive_ceiling_hold_time_s: 'Clean high-load qualification time before a probe starts. Brief load or delay-classification fluctuations are tolerated; a sustained interruption, global probe gap, or stall cancels qualification.',
@@ -83,9 +83,9 @@ var optionDescriptions = {
 	capacity_learning_policy: 'Choose whether runtime stays at validated bounds, learns from real sustained traffic, schedules traffic-generating recalibration, or obeys explicit service caps.',
 	service_dl_cap_kbps: 'Optional provider/service-plan download hard cap. It can only tighten a measured bound and is never used to invent capacity above a raw control.',
 	service_ul_cap_kbps: 'Optional provider/service-plan upload hard cap. It can only tighten a measured bound and is never used to invent capacity above a raw control.',
-	transport_latency_enabled: 'Optional permanent external connection, disabled by default. Auto-Tune uses temporary probes; Apply preserves this setting. DNS, process startup, and the TLS/WebSocket handshake are excluded from RTT. Rating is passive unless the controller is enabled separately.',
+	transport_latency_enabled: 'Keeps one permanent external connection to measure RTT (off by default). Auto-Tune uses its own temporary probes either way.',
 	transport_controller_enabled: 'Allow confirmed transport RTT windows to reduce CAKE rates. Disabled by default for safe upgrades. A bad direction must be confirmed twice and can never cross the configured throughput floor.',
-	transport_probe_backend: 'WebSocket is the recommended LibreQoS-compatible persistent RTT method. TCP connect and persistent HTTP are comparison fallbacks. Legacy HTTP includes process and handshake overhead, is diagnostic-only, and cannot drive the controller.',
+	transport_probe_backend: 'WebSocket is recommended. TCP connect and persistent HTTP are fallbacks; legacy HTTP is diagnostic only and cannot drive the controller.',
 	transport_probe_endpoint: 'Endpoint for the selected native backend. Probes are bound to this instance route, source address, device, and mwan3 mark.',
 	transport_probe_idle_interval_s: 'Seconds between baseline probes while traffic is below the high-load threshold.',
 	transport_probe_loaded_interval_s: 'Seconds between probes while download or upload is highly loaded.',
@@ -120,21 +120,21 @@ var optionDescriptions = {
 	throughput_reference_dl_p50_kbps: 'Optional download median capacity from Full Auto-Tune.',
 	throughput_reference_ul_p20_kbps: 'Optional upload 20th-percentile capacity from Full Auto-Tune.',
 	throughput_reference_ul_p50_kbps: 'Optional upload median capacity from Full Auto-Tune.',
-	autotune_profile: 'Profile used by the next manual or scheduled Full Auto-Tune run. Gaming targets A+ and keeps a 70% search floor; its wizard-only Extreme A+ opt-in can explore wide links deeper but is never persisted for scheduled runs. Best overall targets A, Variable link measures a CAKE-controlled latency knee for changing links, and Fair prioritizes throughput with a conditional class-C target and an explicit evidence-backed no-SQM fallback.',
-	autotune_calibration_strategy: 'Shaped only keeps CAKE active and searches inside demonstrated bounds. Full raw capacity temporarily bypasses only the measured direction under the recovery watchdog. Reuse current trusted bounds avoids claiming a new physical line rate.',
+	autotune_profile: 'Profile for the next manual or scheduled Auto-Tune: Gaming (A+), Best overall (A), Variable link (changing links) or Fair (throughput first). The wizard describes each one.',
+	autotune_calibration_strategy: 'Shaped only keeps CAKE active. Full raw capacity briefly bypasses CAKE in the measured direction to find the raw speed. Reuse revalidates the current trusted limits.',
 	scheduled_autotune_enabled: 'Periodically run the validated Full Auto-Tune workflow only inside the configured quiet window. Disabled by default.',
 	scheduled_autotune_interval_hours: 'Minimum hours between successful scheduled calibrations.',
 	scheduled_autotune_idle_window_s: 'Traffic must remain below the active threshold for this long before a scheduled test may start.',
 	scheduled_autotune_window_start_hour: 'Local hour when the permitted maintenance window begins (0-23).',
 	scheduled_autotune_window_end_hour: 'Local hour when the permitted maintenance window ends (0-23). Equal start and end permits the whole day.',
-	scheduled_autotune_max_traffic_mb_day: 'Hard daily interface-traffic allowance for scheduled calibration. The worker stops its current speed-test process when the remaining allowance is reached; accounting resets after reboot. A zero or invalid value blocks unattended tests rather than enabling unlimited traffic.',
-	scheduled_autotune_max_traffic_mb_month: 'Hard monthly allowance for scheduled calibration. Usage is reserved before a run and settled atomically outside RAM so interrupted tests cannot be silently undercounted. Allow roughly one polling interval of possible overshoot on a very fast link; zero blocks unattended tests.',
+	scheduled_autotune_max_traffic_mb_day: 'Daily traffic limit for scheduled tests. A running test stops when it is reached; 0 blocks scheduled tests. Resets after reboot.',
+	scheduled_autotune_max_traffic_mb_month: 'Monthly traffic limit for scheduled tests, kept across reboots. A very fast link may overshoot by about one polling interval; 0 blocks scheduled tests.',
 	scheduled_autotune_auto_apply: 'Automatically commit and restart with a proposal only after shaped validation passes. Leave off to keep a review-only proposal.',
 	dl_if: 'Interface whose RX byte counter represents shaped download traffic, usually the IFB created by SQM.',
 	ul_if: 'Interface whose TX byte counter represents upload traffic, usually the WAN device.',
 	manage_sqm: 'Mirror this instance into /etc/config/sqm and restart SQM before autorate starts.',
 	sqm_section: 'Name of the managed SQM queue section. Leave empty to use cake_<instance>.',
-	sqm_direction_mode: 'Choose which traffic directions receive managed CAKE. Upload only removes download/ingress CAKE and its IFB; Download only removes upload/egress CAKE. The unshaped direction has no local bufferbloat protection. Its Adjust switch is cleared; if you restore that CAKE direction later, choose separately whether Autorate may adjust it.',
+	sqm_direction_mode: 'Which directions CAKE shapes. The unshaped direction gets no bufferbloat protection, and its Adjust switch is cleared.',
 	sqm_interface: 'Network device where SQM should attach the CAKE queue.',
 	sqm_debug_logging: 'Enable SQM script debug logging for this queue.',
 	sqm_verbosity: 'Verbosity level passed to SQM scripts.',
@@ -180,7 +180,7 @@ var optionDescriptions = {
 	high_load_thr: 'Fraction of current shaper rate that counts as high load.',
 	bufferbloat_refractory_period_ms: 'Minimum time after a bufferbloat response before another backoff may happen.',
 	decay_refractory_period_ms: 'Minimum time between low-load decay adjustments.',
-	pinger_method: 'Probe backend used to measure reflector latency. fping supports concurrent RTT reflectors; fping-ts and tsping use ICMP timestamp OWD probes; irtt uses explicit IRTT servers with synchronized clocks; ping is a basic fallback using one ping process per active reflector.',
+	pinger_method: 'How reflector latency is measured: fping (parallel, recommended), fping-ts or tsping (ICMP timestamps), irtt (IRTT servers) or ping (basic fallback).',
 	_pinger_backend_status: 'Show which pinger binaries are available and which backend the planner would prefer.',
 	_pinger_backend_install: 'Install the package for the selected pinger when automatic installation is supported. tsping remains a manual binary install; irtt also needs explicit IRTT servers and NTP-synchronized clocks.',
 	_reflector_scan: 'Probe configured reflectors plus the upstream default pool, classify timestamp support, and suggest an active set plus spare pool.',
@@ -194,7 +194,7 @@ var optionDescriptions = {
 	retain_reflector_stats: 'Keep reflector statistics when replacing or restarting probes.',
 	no_pingers: 'Number of concurrent reflector probes to run.',
 	reflector_ping_interval_s: 'Seconds between pings sent by each reflector probe.',
-	ping_extra_args: 'Additional user arguments passed to pingers. Automatic binding is derived from the current route at runtime. Conflicting saved interface/source pins are rejected; review legacy -I values after changing interfaces.',
+	ping_extra_args: 'Extra pinger arguments. Source and interface binding come from the route automatically; conflicting -I values are rejected.',
 	ping_prefix_string: 'Optional command prefix for launching pingers, for example mwan3 use wan2 exec. Use this instead of Extra ping args when policy-routing wrappers should select the uplink.',
 	irtt_session_duration_m: 'Duration of each IRTT client session in minutes. Longer sessions reduce restart gaps but use more memory inside irtt.',
 	output_processing_stats: 'Log detailed controller processing statistics.',
@@ -2558,7 +2558,7 @@ function nativeAutotuneAcknowledgementLabel(code) {
 	case 'upload-raw-quality-target':
 		return _('Upload without shaping did not reach the selected profile quality target.');
 	case 'topology-comparison-traffic-budget':
-		return _('The conservative traffic budget could not safely fund another unshaped comparison. This applies the fully verified shaped proposal; rerun Full raw with a larger explicit traffic allowance if you want another bypass comparison.');
+		return _('The traffic budget could not cover another unshaped comparison, so the fully verified shaped proposal is applied; no raw result was inferred. Rerun Full raw with a larger budget to compare again.');
 	case 'topology-comparison-unmeasurable':
 		return _('One optional without-shaping comparison could not produce a trustworthy transfer result. This option keeps shaping for that direction and uses only the fully verified shaped evidence.');
 	case 'download-shaping-bypassed':
@@ -2939,18 +2939,18 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 		var nodes = [
 			E('strong', {}, priorApplyBlocked ? _('Full Auto-Tune Review · throughput decline requires investigation') : _('Full Auto-Tune Review · ready to apply')),
 			E('p', {}, disabledFallback ?
-				_('The shaped search could not produce an observable candidate. The verified raw controls were preserved and can create one disabled, uncalibrated instance. No rate is invented and SQM remains absent until you calibrate or configure it later.') :
+				_('The shaped search found no usable rate. The raw measurements were kept and can create one disabled instance without SQM; set rates later or calibrate again.') :
 				_('Calibration completed and restored runtime state. Every option is reconstructed from private evidence and bound to its own manifest; browser rate values are never Apply authority.')),
 		];
 		if (!disabledFallback)
 			nodes.push(E('p', { 'class': 'cake-autotune-capacity-scope' },
-				_('Observed test throughput is what this run transferred. Proposed CAKE rates are shaping settings, not a measurement of line capacity. Stable results from several servers alone cannot exclude a shared bottleneck or prove the maximum line capacity. Viewing or skipping this Review does not apply these settings.')));
+				_('Observed test throughput is what this run transferred. Proposed CAKE rates are shaping settings, not a measurement of line capacity; stable results from several servers cannot exclude a shared bottleneck. Nothing is applied until you click Apply.')));
 		if (result.server_comparison)
 			nodes.push(renderNativeServerComparison(result.server_comparison));
 		if (nativePriorRawComparisonValidated(result.prior_raw_comparison)) {
 			var prior = result.prior_raw_comparison;
 			nodes.push(E('p', { 'class': 'cake-autotune-prior-throughput' }, cakeUi.text(
-				_('Same-route comparison with a verified earlier Full raw test in this boot: current raw DL / UL %s / %s kbit/s; earlier %s / %s kbit/s (%s%% / %s%% retained). These are observed control rates, not line-capacity guarantees. A decrease can reflect the link or the test sources. This diagnostic grants no Apply authority; new scheduled runs require Review after a drop below 50% in either direction.').format(
+				_('Compared with an earlier Full raw test on this route since boot: raw DL / UL %s / %s kbit/s now vs %s / %s kbit/s before (%s%% / %s%% retained). A drop can come from the link or the test servers; after a drop below 50%, scheduled runs need Review.').format(
 					prior.current_download_kbps, prior.current_upload_kbps,
 					prior.prior_download_kbps, prior.prior_upload_kbps,
 					(100 * prior.current_download_kbps / prior.prior_download_kbps).toFixed(1),
@@ -2963,8 +2963,8 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 				return;
 			nodes.push(E('p', { 'class': 'cake-autotune-shaping-plateau' }, cakeUi.text(
 				(direction === 'download' ?
-					_('Download with CAKE stayed near %s kbit/s whether the shaping rate was %s or %s kbit/s, while the same path without shaping reached %s kbit/s; router CPU reached %s%%. The proposed rate is most likely limited by this router\'s shaping capacity, not by the line.') :
-					_('Upload with CAKE stayed near %s kbit/s whether the shaping rate was %s or %s kbit/s, while the same path without shaping reached %s kbit/s; router CPU reached %s%%. The proposed rate is most likely limited by this router\'s shaping capacity, not by the line.')).format(
+					_('Download with CAKE stayed near %s kbit/s at shaping rates %s and %s kbit/s, while unshaped it reached %s kbit/s (router CPU %s%%). The router\'s shaping capacity, not the line, is the likely limit.') :
+					_('Upload with CAKE stayed near %s kbit/s at shaping rates %s and %s kbit/s, while unshaped it reached %s kbit/s (router CPU %s%%). The router\'s shaping capacity, not the line, is the likely limit.')).format(
 					limit.plateau_kbps, limit.lowest_candidate_kbps, limit.highest_candidate_kbps,
 					limit.unshaped_kbps, Math.round(limit.cpu_percent)))));
 		});
@@ -2972,7 +2972,7 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 			nodes.push(E('div', {
 				'class': 'alert-message warning',
 				'style': 'margin:8px 0'
-			}, _('A verified transport probe reached its deadline under load. The displayed transport delay is only a lower bound, not an exact RTT. It cannot satisfy the selected latency class or Auto-Apply; applying this option requires explicit manual acknowledgement.')));
+			}, _('A transport probe timed out under load, so the shown delay is only a lower bound. This option cannot be auto-applied; applying it needs your confirmation.')));
 		}
 		if (topologyBudgetLimitedDirections.length) {
 			var limitedDirectionLabels = topologyBudgetLimitedDirections.map(function(direction) {
@@ -2981,13 +2981,13 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 			nodes.push(E('div', {
 				'class': 'alert-message warning',
 				'style': 'margin:8px 0'
-			}, _('The conservative traffic budget could not safely fund another unshaped comparison for: %s. No raw result was inferred: the fully verified shaped proposal was kept and runtime was restored. Applying requires explicit confirmation; rerun Full raw with a larger traffic allowance if you want to retry the bypass comparison.').format(limitedDirectionLabels.join(', '))));
+			}, _('The traffic budget could not cover another unshaped comparison for: %s. No raw result was inferred; the fully verified shaped proposal was kept and settings were restored. To retry, rerun Full raw with a larger budget.').format(limitedDirectionLabels.join(', '))));
 		}
 		nodes.push(
 			E('div', { 'style': 'display:flex;flex-wrap:wrap;gap:8px;margin-top:8px' }, optionCards),
 			E('div', { 'style': 'margin-top:10px;padding:9px;border:1px solid rgba(127,127,127,.35);border-radius:5px' }, acknowledgementNodes),
 			E('p', { 'style': 'margin:9px 0' }, disabledFallback ?
-				_('Apply writes only the disabled autorate section, leaves the entire SQM package unchanged, and proves that no selected controller or managed qdisc exists. A timeout has an unknown outcome; retrying this exact option is safe and idempotent.') :
+				_('Apply only adds the disabled autorate section; SQM is not changed. If Apply times out, retrying the same option is safe.') :
 				_('Apply writes UCI, restarts only the selected instance, and verifies the resulting CAKE/SQM topology. A timeout has an unknown outcome; retrying this exact option is safe and idempotent.')),
 			E('div', { 'style': 'display:flex;flex-wrap:wrap;gap:8px' }, actionButtons)
 		);
@@ -3029,32 +3029,32 @@ function autotuneProfileDefinitions() {
 			id: 'gaming',
 			title: _('Gaming'),
 			target: _('Target A+ · under 5 ms loaded-latency increase'),
-			description: _('Starts from the highest measured candidate and reduces it only after an adverse loaded test. Finds the highest throughput that still proves A+; no fixed percentage is subtracted up front. Retaining 70% is only the Auto-Apply objective, while falling below the separate 50% historical-throughput trust boundary forces explicit manual review. If A+ is unattainable, Review offers the best measured grade at its fastest safe rate. Uses diffserv4, supports optional native outbound rules, and preserves ingress DSCP.')
+			description: _('Lowest latency: the highest rate that still earns A+, or the best grade found. Auto-Apply needs 70% of measured throughput kept; below that, or below 50% of earlier results, Review asks you. Uses diffserv4 and keeps incoming DSCP.')
 		},
 		{
 			id: 'gaming_extreme',
 			hidden: true,
 			title: _('Gaming · Extreme A+'),
 			target: _('Opt-in deep A+ search · manual-only below 70% retention'),
-			description: _('Starts at the measured upper bound and explores only wide links below the ordinary Gaming boundary when A+ was not reached, down to a capacity-aware 25% floor. Every proposed minimum is a tested CAKE rate; no fixed initial haircut is applied. This mode is not recommended for continuous household use.')
+			description: _('Explores wide links below the normal Gaming limit (down to 25% of capacity) when A+ was not reached. Every proposed minimum was tested. Not recommended for everyday household use.')
 		},
 		{
 			id: 'best_overall',
 			title: _('Best overall'),
 			target: _('Target A or better · under 30 ms'),
-			description: _('Starts from the highest measured candidate and reduces it only when a loaded test proves that necessary. Finds the highest throughput that still proves A; no fixed percentage is subtracted up front. Retaining 80% is only the Auto-Apply objective, while falling below the separate 50% historical-throughput trust boundary forces explicit manual review. If A is unattainable, Review offers the best balanced safe candidate. Optional outbound rules use diffserv4 while download stays best effort.')
+			description: _('Balanced: the highest rate that still earns A. Auto-Apply needs 80% of measured throughput kept; below that, or below 50% of earlier results, Review asks you. Download stays best effort.')
 		},
 		{
 			id: 'variable_link',
 			title: _('Variable link'),
 			target: _('Measured knee · target B or better · under 60 ms'),
-			description: _('For 4G/5G, satellite, wireless, and other changing links. Starts from measured raw capacity without a fixed haircut. Its medium-specific 35–50% value is only the deepest allowed exploration boundary; a runtime minimum is written only when two consecutive reductions prove a latency plateau. Retaining 70% is only the Auto-Apply objective; noisy or uncontrolled results require Review.')
+			description: _('For 4G/5G, satellite and other changing links. Finds where latency starts to rise and never searches below 35–50% of raw capacity. Auto-Apply needs 70% kept; noisy results need Review.')
 		},
 		{
 			id: 'fair',
 			title: _('Fair'),
 			target: _('Throughput first · aim for C or better · under 200 ms'),
-			description: _('Starts from the highest measured candidate and maximizes safe throughput without a fixed initial haircut. Retaining 90% is only the Auto-Apply objective and falling below the separate 50% historical-throughput trust boundary forces explicit manual review. Rating is the secondary tie-breaker and C is a soft target. Optional outbound rules use diffserv4, download stays best effort, and Review may offer evidence-backed directional or full SQM bypass.')
+			description: _('Throughput first: the highest safe rate, aiming for C or better. Auto-Apply needs 90% of measured throughput kept; below that, or below 50% of earlier results, Review asks you. Review may offer bypassing SQM when measurements support it.')
 		}
 	];
 }
@@ -3192,7 +3192,7 @@ function nativeBootstrapCapacityControl(state, existingInstance, disabled, onCha
 	}, [
 		E('div', { 'class': 'alert-message warning', 'style': 'margin:0 0 10px' }, [
 			E('strong', {}, _('New-instance measurement authority. ')),
-			_('Enter the service-plan or other defensible hard maximum for both directions. Full Auto-Tune measures raw capacity first and derives every proposed rate from test evidence; these values only bound exploration and can never become measurements by themselves.')
+			_('Enter your plan\'s download and upload limits. They only bound the search; proposed rates always come from measurements.')
 		]),
 		wizardField(_('Download service cap'), dlCap, optionDescriptions.service_dl_cap_kbps),
 		wizardField(_('Upload service cap'), ulCap, optionDescriptions.service_ul_cap_kbps)
@@ -3455,7 +3455,7 @@ function speedtestTrafficPolicyPanel(section_id, topology, container) {
 			field(_('Download service ceiling (Mbps): '), ceilings[0]),
 			field(_('Upload service ceiling (Mbps): '), ceilings[1]),
 			E('p', {}, cakeUi.text(topology === 'unshaped' ?
-				_('This test bypasses the shaper in the measured direction, so a capped test needs the actual service ceiling of each direction to reserve its stopping margin inside the total. Without them it is refused before traffic. Do not enter artificial ceilings just to start a test.') :
+				_('This test bypasses the shaper, so a capped test needs the real service speed caps of both directions to stop in time. Without them it is refused. Do not enter made-up caps.') :
 				_('Directions still shaped by CAKE use their configured ceiling for the stopping margin; a service ceiling is needed only for an unshaped direction.')))
 		]);
 		var mode = E('select', { 'class': 'cbi-input-select', 'change': function() { update(); } }, [
@@ -3885,7 +3885,7 @@ function autotuneTrafficPolicyControl(state, instance, disabled) {
 			state[key] = configured > 0 && configured <= 100000000 ? String(configured / 1000) : '';
 		}
 		return E('input', { 'type': 'number', 'min': '0.001', 'max': '100000', 'step': '0.001',
-			'class': 'cbi-input-text', 'value': state[key], 'disabled': disabled ? '' : null,
+			'class': 'cbi-input-text', 'style': 'width:8em', 'value': state[key], 'disabled': disabled ? '' : null,
 			'input': function(ev) { state[key] = ev.currentTarget.value; updateEstimate(); }
 		});
 	});
@@ -4087,7 +4087,7 @@ function nativeAutotuneTrafficSummary(status) {
 	if (traffic.source === 'no_producers_receipt')
 		message += ' ' + _('Test traffic producers were not started.');
 	if (traffic.accounting === 'owned-ip-system-dns-estimate-v1')
-		message += ' ' + _('Accounting covers IP traffic owned by this test, including probes and gaps between attempts. System DNS is retained; shared resolver traffic attribution is approximate, not exact physical WAN accounting. After test producers stop, accounting closes at a recorded cutoff; later packets are not included.');
+		message += ' ' + _('Counts IP traffic owned by this test, including probes. System DNS is retained; its share is approximate, not exact physical WAN accounting. Counting ends at a recorded cutoff; later packets are not included.');
 	else if (traffic.accounting === 'aggregate_route_windows' || traffic.accounting === 'route-window-debits-v1')
 		message += ' ' + _('Accounting currently covers route traffic during test windows, including background traffic.');
 	else
@@ -5382,7 +5382,7 @@ function autotuneTypedTerminalDiagnostic(result) {
 		var trafficMessages = {
 			'server-comparison-insufficient-independent-sources': _('The comparison did not confirm stable sources with different reported providers and hostnames. Several server IDs can refer to the same source; no new capacity proposal was accepted.'),
 			'speedtest-server-endpoint-changed': _('The selected server reported a different transfer endpoint after qualification. Its measurements cannot be mixed into this calibration; retry server selection.'),
-			'server-or-link-capacity-changed': _('The unshaped measurement fell substantially below this run’s repeated server comparison. Source, link or remaining opposite-direction shaping may limit it; no lower-capacity proposal was accepted. Retry when conditions are stable or compare other servers.'),
+			'server-or-link-capacity-changed': _('The unshaped test was much slower than the server comparison (server, link or leftover shaping); no lower-capacity proposal was accepted. Retry when the link is stable or try other servers.'),
 			'server-comparison-selected-reference-missing': _('The unshaped measurement has no matching qualified capacity reference. It cannot establish a new bandwidth ceiling.'),
 			'speedtest-traffic-budget-exhausted': _('The remaining budget is insufficient for the next check and its current safety reserve. The full traffic allowance was not necessarily spent.'),
 			'speedtest-traffic-limit-reached': _('The transfer stopped at its traffic safety limit. Check the recorded total; this does not mean the entire job allowance was spent.'),
@@ -5667,16 +5667,17 @@ function showCreateWizard(grid, name, existingName) {
 				}
 			}, [
 				E('span', {
+					'class': 'cake-autorate-wizard-step-number',
 					'style': 'display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:2px solid currentColor;border-radius:50%;font-weight:700;flex:0 0 24px'
 				}, String(i + 1)),
-				E('span', { 'style': 'font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, labels[i])
+				E('span', { 'style': 'font-weight:600;min-width:0;white-space:normal;overflow-wrap:anywhere;line-height:1.2' }, labels[i])
 			]));
 		}
 
 		return E('div', {
 			'class': 'cake-autorate-wizard-steps',
 			'style': 'display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px'
-		}, steps);
+		}, [ E('style', {}, '@media(max-width:600px){.cake-autorate-wizard-step-number{display:none!important}.cake-autorate-wizard-step{padding:6px 8px!important;justify-content:center!important;text-align:center!important}}') ].concat(steps));
 	}
 
 	function renderInterfaceStep() {
@@ -6507,10 +6508,10 @@ function showCreateWizard(grid, name, existingName) {
 							render();
 						})
 				]),
-				_('The profile chooses how Auto-Tune ranks safe points on the measured throughput/latency boundary. Missed throughput objectives and the 50% historical trust boundary prevent Auto-Apply but remain manually reviewable when latency, loss, routing, and measurement evidence are clean.')),
+				_('The profile sets the latency target and how much throughput Auto-Tune may trade for it. Results that miss the goals are never auto-applied but can still be reviewed.')),
 			E('div', { 'class': 'alert-message warning' }, [
 				E('strong', {}, _('Traffic warning: ')),
-				_('Full Auto-Tune measures one bidirectional control plus repeated download-only and upload-only controls, then searches each shaped direction independently. A direction may be measured again while Auto-Tune raises or brackets its candidate, but it never lowers the profile capacity floor. Other WAN traffic can reduce confidence, but is never counted as test throughput.')
+				_('Full Auto-Tune runs repeated download and upload tests on this uplink and can use a lot of data. Other WAN traffic may lower confidence but is never counted as test throughput.')
 			]),
 			wizardField(_('Calibration'), E('div', {}, [ runButton, ' ', conservativeButton, ' ', cancelButton, progress, status ]),
 				_('All intermediate state stays in RAM. No UCI configuration is written until you confirm the Review step.'))
@@ -7786,7 +7787,7 @@ function addSetupOptions(section) {
 	o.depends('route_mode', 'explicit');
 	o.rawhtml = false;
 	o.cfgvalue = function() {
-		return _('Full package only. Uses an existing policy route; it does not create or change VPNs, ip rules or routing tables. Probes are pinned to this source, mark and table and stop when the route no longer matches, instead of falling back to the main table. Auto-Tune and Speed Test are not yet available in this mode.');
+		return _('Full package only. Uses an existing policy route (source, table, mark); it never creates VPNs, rules or tables. If the route stops matching, probes and tests stop instead of using the main table. Speed Test and Auto-Tune also need Route DNS IPv4.');
 	};
 
 	o = section.taboption('setup', form.ListValue, 'mwan3_member', _('mwan3 member'));

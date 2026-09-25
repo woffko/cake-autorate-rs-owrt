@@ -1255,7 +1255,7 @@ return L.view.extend({
 			].join('')),
 			E('div', { 'class': 'alert-message warning cake-graphs-warning' }, [
 				E('strong', {}, _('Optional RAM history. ')),
-				_('Enabling graphs stores RTT, transport/effective latency, CPU, download/upload, and safety-floor samples only in /var/run (RAM), never in flash. The selected total budget is shared by all enabled instances and is reduced automatically under memory pressure. Large histories are fetched in bounded pages so the browser never loads the entire RAM buffer. Oldest samples are discarded automatically. Both charts share one horizontal timeline and follow the newest data until you scroll back. Hover over either chart for exact values. Data is cleared when the service stops or the router reboots.')
+				_('Samples (latency, CPU, throughput) stay in RAM only and are cleared when the service stops or the router reboots. The budget is shared by all instances and shrinks under memory pressure. Hover a chart for exact values.')
 			]),
 			memoryPanel,
 			content

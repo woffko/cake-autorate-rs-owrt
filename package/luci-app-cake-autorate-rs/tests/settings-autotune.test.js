@@ -41,7 +41,7 @@ assert.doesNotMatch(source, /\[ '--calibrationctl', 'autotune-apply',/,
 	'the browser must not invoke the retired synchronous Apply executor');
 assert.doesNotMatch(source, /nativeApplyDeliveryUncertain|nativeApplyReloadRequired/,
 	'Apply transport recovery must use durable status, never an ambiguous reload flag');
-assert.match(source, /50% historical-throughput trust boundary/,
+assert.match(source, /below 50% of earlier results, Review asks you/,
 	'profile help must explain the manual historical-throughput trust boundary');
 assert.match(source,
 	/\.cake-autotune-profile-grid\{display:grid;grid-template-columns:repeat\(4,minmax\(0,1fr\)\);[^}]*align-items:stretch/,
