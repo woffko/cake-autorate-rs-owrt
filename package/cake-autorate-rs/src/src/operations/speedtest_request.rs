@@ -738,10 +738,13 @@ mod tests {
             Some("192.0.2.53".parse().unwrap())
         );
         assert_eq!(request.route.routing_table, Some(101));
-        assert!(request
+        request.validate_admission_policy().unwrap();
+        let mut no_dns = request.clone();
+        no_dns.route.dns_server = None;
+        assert!(no_dns
             .validate_admission_policy()
             .unwrap_err()
-            .contains("not available"));
+            .contains("explicit IPv4 DNS server"));
         let mut changed = context;
         changed.explicit_route.as_mut().unwrap().dns_server = "192.0.2.54".parse().unwrap();
         assert!(build(changed).is_err());

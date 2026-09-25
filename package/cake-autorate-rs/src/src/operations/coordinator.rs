@@ -5591,7 +5591,9 @@ impl CalibrationDaemon {
                     && request.backend == "speedtest-go"
                     && matches!(
                         request.route.mode,
-                        OperationRouteMode::Main | OperationRouteMode::Mwan3
+                        OperationRouteMode::Main
+                            | OperationRouteMode::Mwan3
+                            | OperationRouteMode::Explicit
                     )
                     && match request.target_state {
                         OperationTargetState::ExistingManaged => true,
@@ -5605,7 +5607,9 @@ impl CalibrationDaemon {
                     && request.backend == "speedtest-go"
                     && matches!(
                         request.route.mode,
-                        OperationRouteMode::Main | OperationRouteMode::Mwan3
+                        OperationRouteMode::Main
+                            | OperationRouteMode::Mwan3
+                            | OperationRouteMode::Explicit
                     )
                     && match request.target_state {
                         OperationTargetState::ExistingManaged => true,

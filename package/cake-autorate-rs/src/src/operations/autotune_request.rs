@@ -1304,10 +1304,13 @@ mod tests {
         );
         assert_eq!(request.route.device_ifindex, Some(7));
         assert_eq!(request.route.routing_table, Some(101));
-        assert!(request
+        request.validate_admission_policy().unwrap();
+        let mut no_dns = request.clone();
+        no_dns.route.dns_server = None;
+        assert!(no_dns
             .validate_admission_policy()
             .unwrap_err()
-            .contains("not available"));
+            .contains("explicit IPv4 DNS server"));
         for index in 0..3 {
             let mut changed = context.clone();
             match index {

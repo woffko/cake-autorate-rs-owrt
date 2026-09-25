@@ -934,7 +934,15 @@ impl OperationRequest {
     /// able to audit an inert, terminal request created by an older build.
     pub fn validate_admission_policy(&self) -> Result<(), String> {
         if self.route.device_ifindex.is_some() {
-            return Err("link-qualified route execution is not available in this build".into());
+            // Only a complete explicit policy route is link-qualified work; the
+            // worker marks, attests and accounts it through that authority.
+            if !cfg!(feature = "calibration") || self.route.mode != OperationRouteMode::Explicit {
+                return Err("link-qualified route execution is not available in this build".into());
+            }
+            super::autotune_request::explicit_operation_authority(&self.route)?;
+            if self.route.dns_server.is_none() {
+                return Err("explicit route operation requires an explicit IPv4 DNS server".into());
+            }
         }
         self.validate()?;
         crate::autotune::validate_capacity_learning_service_caps(
@@ -1808,7 +1816,12 @@ mod tests {
                 for old_schema in 4..=18 {
                     assert!(value.encode_for_test_schema(old_schema).is_err());
                 }
-                assert!(value.validate_admission_policy().is_err());
+                if !absent {
+                    value.validate_admission_policy().unwrap();
+                }
+                let mut no_dns = value.clone();
+                no_dns.route.dns_server = None;
+                assert!(no_dns.validate_admission_policy().is_err());
                 for field in [
                     "",
                     "route_dns_ipv4=127.0.0.1\n",

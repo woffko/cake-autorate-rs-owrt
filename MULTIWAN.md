@@ -86,8 +86,16 @@ group with an exact nft mark/egress pin; a removed rule, a table rerouted to
 another device or a changed source moves the uplink to `RECHECKING` and stops
 probe egress instead of falling back to the main table. A crashed controller's
 pin is removed by the next owner only when it carries that exact owner
-generation. Lite refuses the mode, and Auto-Tune, Speed Test and scheduled
-calibration requests are not yet admitted for it.
+generation. Lite refuses the mode.
+
+Manual Speed Test and Full Auto-Tune accept the mode when `route_dns_ipv4` is
+set. LuCI passes the committed route as launch authority and the daemon checks
+it against the configuration. The backend binds to the route source, its DNS
+queries go only to that server, and its traffic carries the selected mark
+through an owned nft pin with exact accounting; a route that fails attestation
+refuses the run instead of using the main table. Without `route_dns_ipv4` these
+operations are refused, never retried with the system resolver. Scheduled
+calibration is not verified for this mode.
 These checks do not implement a general device/PBR mode or IPv6-only support.
 
 For `mwan3`, route discovery requires an unambiguous pair of unconditional

@@ -166,7 +166,7 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl, eImpl) {
 			`autotuneRetryableInconclusive, autotuneMeasurementTimeout, recordAutotuneRetryableInconclusive, ` +
 			`manualSqmDirectionMode, validateManualSqmDirectionMode, writeManualSqmDirectionMode, ` +
 			`positiveRateValue, shouldImportInterfaceRates, applyRatePreset, ` +
-			`runSpeedtestJob, nativeEffectiveSpeedtestBackend, nativeSpeedtestCapabilityValidated, nativeSpeedtestIntentSupported, nativeSpeedtestLaunchArgs, validateExplicitRoute, explicitRouteNumber, validatedSpeedtestTrafficPolicy, speedtestTrafficPolicyFromInput, nativeSpeedtestResultValidated, nativeOperationWorkerRunId, nativeSpeedtestStatusMatchesRequest, ` +
+			`runSpeedtestJob, nativeEffectiveSpeedtestBackend, nativeSpeedtestCapabilityValidated, nativeSpeedtestIntentSupported, nativeSpeedtestLaunchArgs, validateExplicitRoute, explicitRouteNumber, explicitRouteLaunchArgs, validatedSpeedtestTrafficPolicy, speedtestTrafficPolicyFromInput, nativeSpeedtestResultValidated, nativeOperationWorkerRunId, nativeSpeedtestStatusMatchesRequest, ` +
 			`nativeAutotuneCapabilityValidated, nativeBootstrapAutotuneCapabilityValidated, ` +
 			`nativeAutotuneIntentSupported, nativeAutotuneLaunchArgs, validatedAutotuneTrafficPolicy, autotuneTrafficPolicyFromInput, autotuneTrafficPlanningEstimate, nativeAutotuneResultMatchesRequest, nativeAutotuneStatusMatchesRequest, ` +
 			`nativeAutotuneProgressStepLabel, nativeAutotuneProgress, nativeAutotuneTrafficSummary, ` +
@@ -2001,6 +2001,40 @@ async function testNativeAutotuneTransport() {
 			'main routing must not carry an empty mwan3 member');
 		assert(!launchArgs.some(arg => /token|fingerprint|job-id/i.test(arg)),
 			'LuCI launch intent must contain no capability, job ID, or attestation hash');
+		const explicitRoute = {
+			route_source_ipv4: '192.0.2.10', route_table: '101', route_fwmark: '0x100',
+			route_fwmark_mask: '0x3f00', route_dns_ipv4: '192.0.2.53',
+		};
+		const uciGet = uci.get;
+		uci.get = (config, section, key) => (config === 'cake-autorate' && section === 'vpn_sqm'
+			? explicitRoute[key] : null);
+		try {
+			const explicitArgs = helpers.nativeAutotuneLaunchArgs(
+				'vpn_sqm', 'wg0', 'speedtest-go', 'explicit', '',
+				'variable_link', false, 'shaped_only', access, true, 'cake_vpn_sqm', explicitTrafficPolicy);
+			assert.deepEqual(explicitArgs.slice(explicitArgs.indexOf('--route-source-ipv4'),
+				explicitArgs.indexOf('--route-source-ipv4') + 10), [
+				'--route-source-ipv4', '192.0.2.10', '--route-table', '101',
+				'--route-fwmark', '0x100', '--route-fwmark-mask', '0x3f00',
+				'--route-dns-ipv4', '192.0.2.53',
+			], 'explicit Auto-Tune must carry the committed route authority');
+			assert(!explicitArgs.includes('--mwan3-member'));
+			const speedtestArgs = helpers.nativeSpeedtestLaunchArgs(
+				'vpn_sqm', 'wg0', 'explicit', '', '', 'current');
+			assert.equal(speedtestArgs[speedtestArgs.indexOf('--route-dns-ipv4') + 1], '192.0.2.53');
+			delete explicitRoute.route_dns_ipv4;
+			assert.throws(() => helpers.nativeSpeedtestLaunchArgs(
+				'vpn_sqm', 'wg0', 'explicit', '', '', 'current'), /Route DNS IPv4/,
+				'explicit operations must not fall back to the system resolver');
+			explicitRoute.route_dns_ipv4 = '192.0.2.53';
+			explicitRoute.route_fwmark = '0x4000';
+			assert.throws(() => helpers.nativeAutotuneLaunchArgs(
+				'vpn_sqm', 'wg0', 'speedtest-go', 'explicit', '',
+				'variable_link', false, 'shaped_only', access, true, 'cake_vpn_sqm', explicitTrafficPolicy),
+				/mark inside/);
+		} finally {
+			uci.get = uciGet;
+		}
 		const autoLaunchArgs = helpers.nativeAutotuneLaunchArgs(
 			'wan_sqm', 'pppoe-wan', 'auto', 'main', '',
 			'variable_link', true, 'full_raw', access, true, 'cake_wan_sqm', explicitTrafficPolicy);

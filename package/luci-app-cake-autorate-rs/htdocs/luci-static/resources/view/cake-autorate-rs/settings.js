@@ -1117,6 +1117,24 @@ function validateExplicitRoute(values) {
 	return true;
 }
 
+// Speed Test and Auto-Tune carry the committed explicit route as launch
+// authority; the daemon compares it with its configuration. DNS is required
+// so name resolution never falls back to the system resolver.
+function explicitRouteLaunchArgs(section_id) {
+	var values = {};
+	EXPLICIT_ROUTE_FIELDS.forEach(function(key) {
+		values[key] = String(uci.get('cake-autorate', section_id, key) || '').trim();
+	});
+	var valid = validateExplicitRoute(values);
+	if (valid !== true)
+		throw new Error(valid);
+	if (!values.route_dns_ipv4)
+		throw new Error(_('Speed Test and Auto-Tune over an explicit policy route require Route DNS IPv4, so name resolution also uses this route.'));
+	return [ '--route-source-ipv4', values.route_source_ipv4, '--route-table', values.route_table,
+		'--route-fwmark', values.route_fwmark, '--route-fwmark-mask', values.route_fwmark_mask,
+		'--route-dns-ipv4', values.route_dns_ipv4 ];
+}
+
 function validateRouteSelection(section, section_id) {
 	var mode = formOrUci(section, section_id, 'route_mode') || 'auto';
 	var memberName = formOrUci(section, section_id, 'mwan3_member') || '';
@@ -3499,6 +3517,8 @@ function nativeSpeedtestLaunchArgs(section_id, wan, routeMode, mwan3Member, serv
 		'--route-mode', routeMode);
 	if (routeMode === 'mwan3')
 		args.push('--mwan3-member', mwan3Member || '');
+	else if (routeMode === 'explicit')
+		args.push.apply(args, explicitRouteLaunchArgs(section_id));
 	if (String(serverId || '').match(/^[1-9][0-9]*$/))
 		args.push('--server-id', String(serverId));
 	if (trafficPolicy) {
@@ -3954,6 +3974,8 @@ function nativeAutotuneLaunchArgs(section_id, wan, backend, routeMode, mwan3Memb
 
 	if (mode === 'mwan3')
 		args.push('--mwan3-member', mwan3Member || '');
+	else if (mode === 'explicit')
+		args.push.apply(args, explicitRouteLaunchArgs(section_id));
 	if (accessRequest.service_dl_cap_kbps)
 		args.push('--service-dl-cap-kbps', String(accessRequest.service_dl_cap_kbps));
 	if (accessRequest.service_ul_cap_kbps)
