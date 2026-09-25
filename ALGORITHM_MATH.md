@@ -754,6 +754,7 @@ Full Auto-Tune chooses the outer-loop cadence from the selected profile:
 | Variable, GEO | 45 s | 1% | 20 s | 180 s | 3600 s |
 | Variable, fixed wireless | 20 s | 3% | 10 s | 60 s | 1200 s |
 | Variable, shared/unknown | 30 s | 2% | 10 s | 90 s | 1800 s |
+| Variable, medium not set | 12 s | 3% | 8 s | 45 s | 900 s |
 
 Stable Best overall proposals carry `20 s / 3% / 8 s / 60 s / 1800 s` but
 leave adaptive ceiling disabled. Existing instances retain the user's explicit

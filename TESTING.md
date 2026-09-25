@@ -44,7 +44,10 @@ verified for the same 12 ABIs.
 - Privacy: no unsolicited TCP/UDP by default; external transport probing only
   after opt-in, verified across restarts.
 - Browser: the installed LuCI wizard ran a capped Auto-Tune to Review with all
-  UCI writes blocked; desktop and phone layouts without horizontal overflow.
+  UCI writes blocked. A scripted read-only visual audit covers Status, Graphs,
+  Settings, Traffic priorities, the instance editor and the Auto-Tune wizard at
+  desktop (1440 px) and phone (390 px) width in light and dark Bootstrap, on
+  the VM and on a physical router, with no page-level horizontal overflow.
 
 ### Physical routers
 
