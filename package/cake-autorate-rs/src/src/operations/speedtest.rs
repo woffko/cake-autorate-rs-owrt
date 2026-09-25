@@ -54,6 +54,11 @@ const COMMAND_OUTPUT_LIMIT: usize = 256 * 1024;
 const ROUTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const OWNED_BUDGET_READ_TIMEOUT: Duration = Duration::from_millis(250);
+/// A budget read that times out under CPU pressure is skipped only while the
+/// last accepted observation is this recent. Counters are monotonic, so the
+/// next read still sees every byte; stale age + one poll + one read stays
+/// inside TRAFFIC_STOP_RESERVE_WINDOW_MS, which the stop reserve covers.
+const OWNED_BUDGET_MAX_STALE: Duration = Duration::from_millis(500);
 const ROUTE_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 const QUALIFICATION_CPU_PRESSURE_SAMPLES: u8 = 3;
 pub(crate) const MIN_ROUTE_PROOF_BYTES: u64 = 64 * 1024;
@@ -452,6 +457,7 @@ impl EmbeddedSpeedtestSession {
                 .checked_sub(reserve)
                 .ok_or(SPEEDTEST_TRAFFIC_BUDGET_EXHAUSTED)?,
             previous: ledger.committed.counters,
+            last_observed: Instant::now(),
         }))
     }
 
@@ -1108,6 +1114,7 @@ pub(crate) struct OwnedBudgetWatch<'a> {
     probes: &'a NftRoutePin,
     limit: super::protocol::TrafficPolicy,
     previous: OwnedTrafficSnapshot,
+    last_observed: Instant,
 }
 
 impl OwnedBudgetWatch<'_> {
@@ -1132,7 +1139,15 @@ impl OwnedBudgetWatch<'_> {
         observed.delta_since(self.previous)?;
         let consumed = observed.total_bytes()?;
         self.previous = observed;
+        self.last_observed = Instant::now();
         Ok(self.limit.exceeded(consumed))
+    }
+
+    /// Only a bounded read timeout is tolerated; every other failure, and a
+    /// timeout after the stale limit, remains fatal.
+    fn tolerate_read_timeout(&self, error: &str, now: Instant) -> bool {
+        error.ends_with("speedtest-accounting-timeout")
+            && now.saturating_duration_since(self.last_observed) < OWNED_BUDGET_MAX_STALE
     }
 
     fn poll(&mut self) -> Result<bool, String> {
@@ -1146,8 +1161,12 @@ impl OwnedBudgetWatch<'_> {
             };
             self.observe(observed)
         })();
-        result
-            .map_err(|error: String| format!("speedtest-owned-budget-observation-failed: {error}"))
+        match result {
+            Err(error) if self.tolerate_read_timeout(&error, Instant::now()) => Ok(false),
+            result => result.map_err(|error: String| {
+                format!("speedtest-owned-budget-observation-failed: {error}")
+            }),
+        }
     }
 }
 
@@ -7441,7 +7460,19 @@ Upload: 766.6 Mbps (Used: 975.34MB)
             probes: &pin,
             limit: 100_u64.into(),
             previous: point(50, 10, 5, 5),
+            last_observed: Instant::now(),
         };
+        let now = Instant::now();
+        watch.last_observed = now;
+        assert!(watch.tolerate_read_timeout("probes: speedtest-accounting-timeout", now));
+        assert!(!watch
+            .tolerate_read_timeout("speedtest-accounting-timeout", now + OWNED_BUDGET_MAX_STALE));
+        assert!(!watch.tolerate_read_timeout("speedtest-accounting-counters-missing", now));
+        assert!(
+            POLL_INTERVAL + OWNED_BUDGET_MAX_STALE + OWNED_BUDGET_READ_TIMEOUT
+                < Duration::from_millis(TRAFFIC_STOP_RESERVE_WINDOW_MS as u64),
+            "a tolerated stale read must stay inside the stop reserve window"
+        );
         assert!(!watch.observe(point(60, 15, 10, 15)).unwrap());
         assert!(watch.observe(point(61, 15, 10, 15)).unwrap());
         assert!(watch.observe(point(60, 15, 100, 100)).is_err());
@@ -7712,6 +7743,7 @@ Upload: 766.6 Mbps (Used: 975.34MB)
             probes: &session.route_pin,
             limit: 100_u64.into(),
             previous: poisoned.committed.counters,
+            last_observed: Instant::now(),
         };
         assert!(wait_watch
             .check_wait(&session)
