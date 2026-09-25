@@ -265,7 +265,7 @@ assert(fs.readFileSync(path.join(__dirname, '../../cake-autorate-rs/src/src/oper
 assert.equal(helpers.autorateSubcategory('rates', '_adaptive_ceiling_status'), 'ceiling',
 	'the always-visible adaptive-ceiling status must stay in the ceiling subpanel');
 const mobileNavCss = source.match(/@media\(max-width:600px\)\{\.cake-autorate-subnav[^'\n]+/)[0];
-assert(mobileNavCss.includes('grid-auto-rows:minmax(54px,auto)'), 'mobile tab rows must contain multiline labels');
+assert(mobileNavCss.includes('grid-auto-rows:minmax(44px,auto)'), 'mobile tab rows must keep a 44px touch target and grow for multiline labels');
 assert(mobileNavCss.includes('width:auto!important;max-width:none!important;justify-self:stretch'),
 	'theme percentage width must not constrain tabs inside half-width grid cells');
 assert(mobileNavCss.includes('min-width:0;max-width:none!important;overflow-wrap:anywhere'),

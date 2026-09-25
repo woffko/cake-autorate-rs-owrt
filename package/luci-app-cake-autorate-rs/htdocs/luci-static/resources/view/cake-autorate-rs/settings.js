@@ -5671,14 +5671,14 @@ function showCreateWizard(grid, name, existingName) {
 					'class': 'cake-autorate-wizard-step-number',
 					'style': 'display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:2px solid currentColor;border-radius:50%;font-weight:700;flex:0 0 24px'
 				}, String(i + 1)),
-				E('span', { 'style': 'font-weight:600;min-width:0;white-space:normal;overflow-wrap:anywhere;line-height:1.2' }, labels[i])
+				E('span', { 'style': 'font-weight:600;min-width:0;white-space:normal;overflow-wrap:normal;word-break:keep-all;line-height:1.2' }, labels[i])
 			]));
 		}
 
 		return E('div', {
 			'class': 'cake-autorate-wizard-steps',
 			'style': 'display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px'
-		}, [ E('style', {}, '@media(max-width:600px){.cake-autorate-wizard-step-number{display:none!important}.cake-autorate-wizard-step{padding:6px 8px!important;justify-content:center!important;text-align:center!important}}') ].concat(steps));
+		}, [ E('style', {}, '@media(max-width:600px){.cake-autorate-wizard-step-number{display:none!important}.cake-autorate-wizard-step{padding:6px 4px!important;justify-content:center!important;text-align:center!important;font-size:13px}}') ].concat(steps));
 	}
 
 	function renderInterfaceStep() {
@@ -7360,7 +7360,7 @@ function decorateAutorateSubcategories(section, sectionId, containers) {
 		'.cake-autorate-subnav>li>a{white-space:nowrap;word-break:normal;overflow-wrap:normal;hyphens:none}',
 		'.cake-autorate-subpanel{min-width:0}',
 		'.cake-autorate-subdescription{margin:0 0 12px;color:var(--text-color-medium,#777)}',
-		'@media(max-width:600px){.cake-autorate-subnav{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr));grid-auto-rows:minmax(54px,auto);gap:6px;overflow:visible;padding:0;align-items:stretch}.cake-autorate-subnav>li{display:flex!important;float:none!important;height:auto!important;min-width:0;margin:0!important;width:auto!important;max-width:none!important;justify-self:stretch}.cake-autorate-subnav>li>a{display:flex!important;float:none!important;box-sizing:border-box;width:100%;height:auto!important;align-items:center;justify-content:center;min-height:54px;line-height:1.3!important;padding:6px!important;text-align:center;white-space:normal;min-width:0;max-width:none!important;overflow-wrap:anywhere}}'
+		'@media(max-width:600px){.cake-autorate-subnav{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr));grid-auto-rows:minmax(44px,auto);gap:6px;overflow:visible;padding:0;align-items:stretch}.cake-autorate-subnav>li{display:flex!important;float:none!important;height:auto!important;min-width:0;margin:0!important;width:auto!important;max-width:none!important;justify-self:stretch}.cake-autorate-subnav>li>a{display:flex!important;float:none!important;box-sizing:border-box;width:100%;height:auto!important;align-items:center;justify-content:center;min-height:44px;line-height:1.3!important;padding:6px!important;text-align:center;white-space:normal;min-width:0;max-width:none!important;overflow-wrap:anywhere}}'
 	].join('')));
 	autorateContainer.appendChild(nav);
 	autorateContainer.appendChild(panelRoot);
@@ -8631,6 +8631,10 @@ return L.view.extend({
 		s.anonymous = false;
 		s.addremove = true;
 		s.addbtntitle = _('Create instance');
+		// The map has no title (the page header names the app), so name the editor explicitly.
+		s.modaltitle = function(section_id) {
+			return _('CAKE Autorate - %s').format(section_id);
+		};
 		s.nodescriptions = true;
 		s.handleAdd = function(ev, name) {
 			showCreateWizard(this, name);

@@ -1889,7 +1889,7 @@ return L.view.extend({
 				'.cake-services-note,.cake-services-wait-reason{white-space:normal!important;overflow-wrap:anywhere;color:#d08b20!important;max-width:100%}',
 				'.cake-services-technical{max-width:100%;margin-top:2px}.cake-services-technical>summary{cursor:pointer;color:#888;font-size:11px}.cake-services-technical>div{display:flex;flex-direction:column;gap:2px;margin-top:5px;white-space:normal;overflow-wrap:anywhere}',
 				'.cake-quality-stack{gap:7px;min-width:210px}',
-				'.cake-quality-detected{display:grid!important;grid-template-columns:max-content minmax(30px,auto);column-gap:7px;align-items:baseline!important}',
+				'.cake-quality-detected{display:grid!important;grid-template-columns:max-content minmax(30px,1fr);column-gap:7px;align-items:baseline!important}',
 				'.cake-quality-detected small{grid-column:1 / -1;color:#888;white-space:normal}',
 				'.cake-quality-label{font-size:10px;font-weight:700;letter-spacing:.04em;color:#888;white-space:nowrap}',
 				'.cake-quality-grade-a-plus strong,.cake-quality-grade-a strong{color:#16a085}',

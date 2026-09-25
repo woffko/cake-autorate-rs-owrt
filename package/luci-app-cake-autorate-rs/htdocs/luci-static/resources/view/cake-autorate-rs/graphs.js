@@ -1221,7 +1221,7 @@ return L.view.extend({
 		var memoryPanel = renderMemoryBudget(data[1], globalSection);
 		var root = E('div', {}, [
 			E('style', {}, [
-				'.cake-graphs-warning{margin-bottom:18px}',
+				'.cake-graphs-warning{margin-bottom:18px}.alert-message .cake-docs-link{color:inherit;text-decoration:underline;font-weight:600}',
 				'.cake-graphs-grid{display:grid;grid-template-columns:minmax(0,1fr);gap:16px}',
 				'.cake-graph-memory-panel{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap;margin:0 0 18px;padding:12px 14px;border:1px solid rgba(127,127,127,.3);border-radius:6px;background:rgba(127,127,127,.05)}',
 				'.cake-graph-budget-label{display:flex;flex-direction:column;gap:4px;font-weight:600}.cake-graph-budget-select{min-width:220px}',
