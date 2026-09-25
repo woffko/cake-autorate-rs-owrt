@@ -171,7 +171,7 @@ function compileHelpers(fsImpl, uciImpl, lImpl, rpcImpl, eImpl) {
 			`nativeAutotuneIntentSupported, nativeAutotuneLaunchArgs, validatedAutotuneTrafficPolicy, autotuneTrafficPolicyFromInput, autotuneTrafficPlanningEstimate, nativeAutotuneResultMatchesRequest, nativeAutotuneStatusMatchesRequest, ` +
 			`nativeAutotuneProgressStepLabel, nativeAutotuneProgress, nativeAutotuneTrafficSummary, ` +
 			`currentActiveNativeAutotuneJob, runPreferredAutotuneJob, cancelPreferredAutotuneJob, ` +
-			`replaceNodeContent, ` +
+			`replaceNodeContent, lockAutotuneWizardSettings, ` +
 			`setNativeAutotuneJob: function(section, jobId, request, workerRunId) { nativeAutotuneJobs[section] = { job_id: jobId, request: request, worker_run_id: workerRunId || null }; }, ` +
 			`setInterfaceContext: function(value) { interfaceContext = value; }, ` +
 			`setMwan3Context: function(value) { mwan3Context = value; } };`
@@ -2001,6 +2001,35 @@ async function testNativeAutotuneTransport() {
 			'main routing must not carry an empty mwan3 member');
 		assert(!launchArgs.some(arg => /token|fingerprint|job-id/i.test(arg)),
 			'LuCI launch intent must contain no capability, job ID, or attestation hash');
+		{
+			// A started test locks every wizard control except its own Calibration row.
+			const node = (tag, children = []) => {
+				const el = { tagName: tag, disabled: false, children, parentNode: null };
+				children.forEach(child => { child.parentNode = el; });
+				el.contains = other => other === el || el.children.some(child => child.contains(other));
+				el.querySelectorAll = () => {
+					const found = [];
+					const walk = item => item.children.forEach(child => {
+						if (/^(input|select|textarea|button)$/.test(child.tagName)) found.push(child);
+						walk(child);
+					});
+					walk(el);
+					return found;
+				};
+				return el;
+			};
+			const strategy = node('select'), profile = node('button'), amount = node('input');
+			const run = node('button'), cancel = node('button');
+			const calibrationRow = node('div', [ run, cancel ]);
+			node('div', [ node('div', [ strategy ]), node('div', [ profile, amount ]), calibrationRow ]);
+			run.closest = selector => (selector === '.cbi-value' ? calibrationRow : null);
+			helpers.lockAutotuneWizardSettings(run);
+			assert.deepEqual([ strategy.disabled, profile.disabled, amount.disabled ], [ true, true, true ],
+				'strategy, profile and traffic inputs must lock when a test starts');
+			assert.deepEqual([ run.disabled, cancel.disabled ], [ false, false ],
+				'the Calibration row keeps its own run/cancel state');
+			helpers.lockAutotuneWizardSettings(null);
+		}
 		const explicitRoute = {
 			route_source_ipv4: '192.0.2.10', route_table: '101', route_fwmark: '0x100',
 			route_fwmark_mask: '0x3f00', route_dns_ipv4: '192.0.2.53',

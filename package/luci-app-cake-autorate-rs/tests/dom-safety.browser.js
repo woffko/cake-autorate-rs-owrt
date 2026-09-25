@@ -178,7 +178,7 @@ sources.liteStatus = fs.readFileSync(path.resolve(__dirname,
 			try {
 				const state = { sqm_download: '100000', sqm_upload: '50000' };
 				const control = settings.autotuneTrafficPolicyControl(state, 'fixture_one', false);
-				if (!control.querySelector('.cake-autotune-dns-accounting').textContent.includes('System DNS and local DNS filtering are preserved'))
+				if (!control.querySelector('.cake-autotune-dns-accounting').textContent.includes('DNS through the router\'s shared resolver is estimated'))
 					throw new Error('test launch must disclose preserved system DNS and approximate service accounting');
 				document.body.appendChild(control);
 				const mode = control.querySelector('select');
@@ -186,6 +186,9 @@ sources.liteStatus = fs.readFileSync(path.resolve(__dirname,
 				const remember = control.querySelector('input[type=checkbox]');
 				const planningRates = control.querySelectorAll('input[type=number]');
 				const estimate = control.querySelector('.cake-autotune-traffic-estimate');
+				const planningRow = control.querySelector('.cake-autotune-planning');
+				if (planningRow.style.display !== 'none')
+					throw new Error('planning rates must stay hidden until a capped budget is chosen');
 				if (planningRates.length !== 2 || !estimate.textContent.includes('6.19 GB'))
 					throw new Error('full-plan scenario is missing or does not use configured hints');
 				if (!estimate.textContent.includes('2.53 GB') || !estimate.textContent.includes('18 server runs total'))
@@ -200,6 +203,8 @@ sources.liteStatus = fs.readFileSync(path.resolve(__dirname,
 				if (mode.value !== '' || preferenceWrites !== 0) throw new Error('traffic policy was silently selected or saved');
 				for (const gb of [1, 5, 10, 25, 50, 100]) {
 					mode.value = 'gb:' + gb; mode.dispatchEvent(new Event('change'));
+					if (planningRow.style.display === 'none')
+						throw new Error('planning rates must be visible for a capped budget');
 					amount.value = '999';
 					if (gb < 15.75) {
 						let refused = false;
@@ -213,6 +218,8 @@ sources.liteStatus = fs.readFileSync(path.resolve(__dirname,
 						throw new Error('planning warning did not track the selected total allowance');
 				}
 				mode.value = 'unlimited'; mode.dispatchEvent(new Event('change'));
+				if (planningRow.style.display !== 'none')
+					throw new Error('Unlimited must hide the planning rates');
 				if (settings.autotuneTrafficPolicyForRun(state, 'fixture_one').mode !== 'unlimited' || preferenceWrites !== 0)
 					throw new Error('one-run unlimited choice was not explicit');
 				remember.checked = true; remember.dispatchEvent(new Event('change'));

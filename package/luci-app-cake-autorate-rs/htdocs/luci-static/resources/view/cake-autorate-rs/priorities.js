@@ -380,7 +380,7 @@ return L.view.extend({
 			stateText = _('A private nftables table exists without valid cake-autorate-rs runtime attestation. Save & Apply to replace it safely.');
 			break;
 		default:
-			stateText = _('The native outbound classifier is inactive. Save & Apply or inspect the Services column if rules are expected.');
+			stateText = _('No outbound rules are active. To use them, enable prioritization below and Save & Apply.');
 		}
 		var m, s, o, index;
 

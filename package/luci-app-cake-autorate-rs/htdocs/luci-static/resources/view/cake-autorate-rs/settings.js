@@ -46,7 +46,7 @@ var optionDescriptions = {
 	adjust_dl_shaper_rate: 'Allow autorate to change the download CAKE bandwidth.',
 	adjust_ul_shaper_rate: 'Allow autorate to change the upload CAKE bandwidth.',
 	wan_if: 'Main WAN interface for this instance. Auto preset also uses it for SQM and IFB setup.',
-	route_mode: 'Select the main routing table or force every ICMP, HTTP, speed test, and Auto-Tune probe through one mwan3 member.',
+	route_mode: 'How probes, speed tests and Auto-Tune reach this uplink: the main routing table, one mwan3 member, or an existing explicit policy route (Full package).',
 	mwan3_member: 'Logical mwan3 interface/member used for this uplink. Its resolved L3 device must match the target interface.',
 	route_source_ipv4: 'IPv4 address assigned to the target interface. Probes use it as their source.',
 	route_table: 'Existing numeric routing table whose default route leaves through the target interface.',
@@ -3135,6 +3135,7 @@ function autotuneCalibrationStrategyControl(state, disabled, onChange, bootstrap
 	var help = E('div', { 'style': 'margin-top:6px;color:var(--text-color-medium,#777)' }, descriptions[selected]);
 	var select = E('select', {
 		'class': 'cbi-input-select',
+		'style': 'width:auto;min-width:16em;max-width:100%',
 		'disabled': disabled ? 'disabled' : null,
 		'change': function(ev) {
 			state.autotune_calibration_strategy = ev.currentTarget.value;
@@ -3850,25 +3851,30 @@ function autotuneTrafficPolicyControl(state, instance, disabled) {
 	});
 	remember.checked = state._traffic_policy_remember;
 	var estimateText = E('p', { 'class': 'cake-autotune-traffic-estimate', 'aria-live': 'polite' });
+	var minimumText = E('span', {});
+	function cappedMode() {
+		return mode.value === 'capped' || /^gb:/.test(mode.value);
+	}
 	function updateEstimate() {
 		var estimate = autotuneTrafficPlanningEstimate(autotuneRunProfile(state),
 			autotuneCalibrationStrategy(state), rateInputs[0].value, rateInputs[1].value);
+		cappedRows.forEach(function(node) { node.style.display = cappedMode() ? '' : 'none'; });
+		minimumText.textContent = estimate ? _('Budgets below %s GB are refused before the test starts.').format(
+			(estimate.initial_plan_bytes / 1000000000).toFixed(2)) : '';
 		estimateText.textContent = estimate ?
-			_('Full-plan scenario: about %s GB total DL+UL, or %s GB with three loads per measurement. Includes %s server runs and up to %s measurements per direction.').format(
+			_('Estimated traffic: about %s GB, up to %s GB if measurements repeat (%s server runs, up to %s measurements per direction).').format(
 				(estimate.single_load_bytes / 1000000000).toFixed(2),
 				(estimate.repeated_load_bytes / 1000000000).toFixed(2),
-					estimate.qualification_runs, estimate.captures_per_direction) :
-			_('Enter both estimated rates (0.001–100000 Mbps, at most three decimal places) to calculate a full-plan traffic scenario.');
+				estimate.qualification_runs, estimate.captures_per_direction) :
+			_('Enter both estimated rates to see the traffic estimate.');
 		if (estimate) {
-			estimateText.textContent += ' ' + _('The required initial-stage planning allowance at these rates is %s GB. A smaller capped choice is refused before launch.').format(
-				(estimate.initial_plan_bytes / 1000000000).toFixed(2));
-			estimateText.textContent += ' ' + _('If the first server group is inadequate, backup servers can add about %s GB in this scenario (%s server runs total). They are skipped when the first group is sufficient.').format(
+			estimateText.textContent += ' ' + _('Backup servers can add about %s GB (%s server runs total) if the first group is inadequate.').format(
 				(estimate.backup_qualification_bytes / 1000000000).toFixed(2), estimate.qualification_runs_with_backups);
 			var policy;
 			try { policy = autotuneTrafficPolicyFromInput(mode.value, amount.value); }
 			catch (error) { return; } // An incomplete choice is not launch consent.
 			if (policy.mode === 'capped' && policy.bytes < estimate.single_load_bytes)
-				estimateText.textContent += ' ' + _('The selected allowance is below this planning scenario; the test may exhaust it before completion.');
+				estimateText.textContent += ' ' + _('The selected budget is below this planning scenario; the test may stop before it finishes.');
 		}
 	}
 	var rateInputs = [ 'dl', 'ul' ].map(function(direction) {
@@ -3883,19 +3889,25 @@ function autotuneTrafficPolicyControl(state, instance, disabled) {
 			'input': function(ev) { state[key] = ev.currentTarget.value; updateEstimate(); }
 		});
 	});
+	var planningRow = E('div', { 'class': 'cake-autotune-planning',
+		'style': 'display:flex;flex-wrap:wrap;gap:6px 18px;align-items:center;margin:6px 0' }, [
+		E('label', { 'style': 'display:flex;align-items:center;gap:6px' }, [ cakeUi.text(_('Planning download (Mbit/s)')), rateInputs[0] ]),
+		E('label', { 'style': 'display:flex;align-items:center;gap:6px' }, [ cakeUi.text(_('Planning upload (Mbit/s)')), rateInputs[1] ])
+	]);
+	var cappedRows = [
+		E('p', {}, [ minimumText, ' ', cakeUi.text(_('A capped Full raw test also needs download and upload service caps so it can stop in time; without them it is refused.')) ]),
+		planningRow,
+		E('p', {}, cakeUi.text(_('Planning rates only size this budget check; they never change test speeds or proposals. They start from the current SQM rates.')))
+	];
 	updateEstimate();
 	return E('div', { 'id': 'cake-autotune-traffic-' + instance }, [
 		mode, amountRow,
-		E('p', {}, cakeUi.text(_('Applies to the next new test only. Qualification, retries and all download/upload stages share this budget. Unlimited may use substantial data; cancel and timeouts still apply.'))),
-		E('p', {}, cakeUi.text(_('The service refuses budgets below known mandatory evidence requirements before starting traffic. Passing that minimum does not guarantee that the full test will fit.'))),
-		E('p', { 'class': 'cake-autotune-dns-accounting' }, cakeUi.text(_('System DNS and local DNS filtering are preserved. Attribution of shared DNS service traffic is approximate; this is not exact physical-wire byte accounting. After test producers stop, accounting closes at a recorded cutoff; later packets are not included.'))),
-		E('p', {}, cakeUi.text(_('A capped raw test also requires declared download and upload service ceilings for its stopping reserve; without them it is refused before traffic. Planning rates below do not provide that authority. Do not enter artificial service ceilings just to start a test.'))),
-		E('label', {}, [ cakeUi.text(_('Planning download rate (Mbps): ')), rateInputs[0] ]),
-		E('label', {}, [ cakeUi.text(_('Planning upload rate (Mbps): ')), rateInputs[1] ]),
-		estimateText,
-		E('p', {}, cakeUi.text(_('Planning rates start from configured values, not measured capacity. Edit them for the expected unshaped link; they never change test speed limits or proposals. The launch check reserves a planning allowance for two stable servers and the initial controls at 15 seconds per directional load. The full scenario also includes search/confirmation and optional raw checks. Early convergence can use less; discovery, probes, protocol overhead and route/backend retries add traffic. Passing the initial planning allowance does not guarantee completion within the budget. The service deadline is 45 minutes.'))),
-		E('label', {}, [ remember, cakeUi.text(_(' Remember this choice for this instance in this browser when starting a new test')) ])
-	]);
+		E('p', {}, cakeUi.text(_('Applies to this test only. All stages share the budget; Cancel and the 45-minute deadline always apply.'))),
+		E('p', { 'class': 'cake-autotune-dns-accounting' }, cakeUi.text(_('Counts this test\'s own traffic. DNS through the router\'s shared resolver is estimated, not metered exactly.'))),
+		estimateText
+	].concat(cappedRows).concat([
+		E('label', {}, [ remember, cakeUi.text(_(' Remember this choice for this instance in this browser')) ])
+	]));
 }
 
 function autotuneTrafficPolicyForRun(state, instance) {
@@ -3929,6 +3941,18 @@ function autotuneTrafficPolicyForRun(state, instance) {
 	if (estimate)
 		policy.planning = { download_kbps: estimate.planning_download_kbps, upload_kbps: estimate.planning_upload_kbps };
 	return policy;
+}
+
+// A started test owns the choices it was launched with. Lock every other
+// control of the wizard step immediately (not only on the next render), so a
+// running job can never be shown with a different strategy or profile.
+function lockAutotuneWizardSettings(calibrationControl) {
+	var row = calibrationControl && calibrationControl.closest ? calibrationControl.closest('.cbi-value') : null;
+	var step = row && row.parentNode;
+	if (!step) return;
+	step.querySelectorAll('input,select,textarea,button').forEach(function(node) {
+		if (!row.contains(node)) node.disabled = true;
+	});
 }
 
 function disableAutotuneTrafficPolicy(instance) {
@@ -5636,7 +5660,7 @@ function showCreateWizard(grid, name, existingName) {
 				'data-step': String(i),
 				'aria-current': active ? 'step' : null,
 				'title': _('Go to step %d: %s').format(i + 1, labels[i]),
-				'style': 'display:inline-flex;align-items:center;justify-content:flex-start;gap:8px;flex:1 1 150px;min-height:42px;text-align:left',
+				'style': 'display:inline-flex;align-items:center;justify-content:flex-start;gap:8px;flex:1 1 0;min-width:0;min-height:42px;text-align:left',
 				'click': function(ev) {
 					ev.preventDefault();
 					navigateWizardStep(parseInt(ev.currentTarget.getAttribute('data-step'), 10));
@@ -5645,7 +5669,7 @@ function showCreateWizard(grid, name, existingName) {
 				E('span', {
 					'style': 'display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:2px solid currentColor;border-radius:50%;font-weight:700;flex:0 0 24px'
 				}, String(i + 1)),
-				E('span', { 'style': 'font-weight:600' }, labels[i])
+				E('span', { 'style': 'font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, labels[i])
 			]));
 		}
 
@@ -6040,6 +6064,7 @@ function showCreateWizard(grid, name, existingName) {
 				decisionNodes[decisionIndex].disabled = true;
 
 			disableAutotuneTrafficPolicy(item.plan.name);
+			lockAutotuneWizardSettings(runButton);
 			return runPreferredAutotuneJob(item.plan.name, item.plan.device,
 				itemState.speedtest_backend, function(job) {
 					if (generation !== state.autotune_generation || state.autotune_cancel_requested)
@@ -6336,6 +6361,7 @@ function showCreateWizard(grid, name, existingName) {
 			};
 
 			disableAutotuneTrafficPolicy(state.name);
+			lockAutotuneWizardSettings(runButton);
 			return runPreferredAutotuneJob(state.name, state.wan_if, state.speedtest_backend, function(job) {
 				progressCallback(job, '');
 			}, state.route_mode, state.mwan3_member, autotuneRunProfile(state), conservative,
@@ -6453,8 +6479,7 @@ function showCreateWizard(grid, name, existingName) {
 					state.autotune_diagnostics = null;
 					state.autotune_failure_message = '';
 					render();
-				}, !rerun),
-				_('Full raw capacity is explicit opt-in because server comparison can temporarily bypass both directions of the selected uplink and transfer substantially more data.')),
+				}, !rerun)),
 			wizardField(_('Total test traffic'), autotuneTrafficPolicyControl(state, state.name, state.autotune_running)),
 			wizardField(_('Calibration profile'),
 				E('div', {}, [
@@ -7662,7 +7687,8 @@ function addSetupOptions(section) {
 	o.rawhtml = true;
 	o.cfgvalue = function() {
 		if (!mwan3Capability.available)
-			return E('span', { 'style': 'color:#b00' }, _('Unavailable; use Main routing.'));
+			// Not an error: most routers have one uplink and no mwan3.
+			return E('span', {}, _('Not installed. Main routing and explicit policy routes are available.'));
 		var safe = mwan3Capability.nft && mwan3Capability.scoped_status_api;
 		return E('span', { 'style': safe ? 'color:#198754' : 'color:#b00' },
 			_('%s · nftables: %s · member API: %s · %s').format(
@@ -8514,7 +8540,7 @@ function addSummaryColumns(section) {
 		return '%s %s'.format(enabled ? _('on') : _('off'), wan);
 	};
 
-	o = section.option(form.DummyValue, '_rates', _('Rate'));
+	o = section.option(form.DummyValue, '_rates', _('Rate DL / UL'));
 	o.cfgvalue = function(section_id) {
 		var dl = uci.get('cake-autorate', section_id, 'sqm_download') ||
 			uci.get('cake-autorate', section_id, 'base_dl_shaper_rate_kbps') ||
@@ -8523,7 +8549,11 @@ function addSummaryColumns(section) {
 			uci.get('cake-autorate', section_id, 'base_ul_shaper_rate_kbps') ||
 			'0';
 
-		return '%s/%s'.format(dl, ul);
+		var mbit = function(kbps) {
+			var value = Number(kbps) / 1000;
+			return isFinite(value) ? String(Math.round(value * 10) / 10) : '?';
+		};
+		return _('%s / %s Mbit/s').format(mbit(dl), mbit(ul));
 	};
 }
 
@@ -8589,7 +8619,8 @@ return L.view.extend({
 		mwan3Context = buildMwan3Context();
 		mwan3Capability = data[7] || {};
 
-		m = new form.Map('cake-autorate', _('CAKE Autorate'));
+		// The page header already names the app; a second title only repeats it.
+		m = new form.Map('cake-autorate', null);
 		candidateGuard.attach(m);
 		s = m.section(form.GridSection, 'cake_autorate', _('Instances'));
 		candidateGuard.protectModal(s);

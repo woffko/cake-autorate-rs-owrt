@@ -1778,6 +1778,11 @@ function renderColumnChooser(globalSection, selectedKeys, onChange) {
 }
 
 return L.view.extend({
+	// Status only reads state; service actions have their own buttons.
+	handleSaveApply: null,
+	handleSave: null,
+	handleReset: null,
+
 	load: function() {
 		uci.unload('cake-autorate-ui');
 		return Promise.all([
@@ -1885,7 +1890,7 @@ return L.view.extend({
 				'.cake-quality-stack{gap:7px;min-width:210px}',
 				'.cake-quality-detected{display:grid!important;grid-template-columns:66px minmax(30px,auto);column-gap:7px;align-items:baseline!important}',
 				'.cake-quality-detected small{grid-column:1 / -1;color:#888;white-space:normal}',
-				'.cake-quality-label{font-size:10px;font-weight:700;letter-spacing:.04em;color:#888}',
+				'.cake-quality-label{font-size:10px;font-weight:700;letter-spacing:.04em;color:#888;white-space:nowrap}',
 				'.cake-quality-grade-a-plus strong,.cake-quality-grade-a strong{color:#16a085}',
 				'.cake-quality-grade-b strong{color:#8eae2f}.cake-quality-grade-c strong{color:#d08b20}',
 				'.cake-quality-grade-d strong,.cake-quality-grade-f strong{color:#d34b4b}',
