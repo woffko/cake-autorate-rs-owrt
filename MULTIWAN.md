@@ -95,7 +95,10 @@ queries go only to that server, and its traffic carries the selected mark
 through an owned nft pin with exact accounting; a route that fails attestation
 refuses the run instead of using the main table. Without `route_dns_ipv4` these
 operations are refused, never retried with the system resolver. Scheduled
-calibration is not verified for this mode.
+calibration reads the same route fields and passes the same launch authority;
+an incomplete route or missing `route_dns_ipv4` is reported as a scheduler
+configuration issue for that instance and no run starts. A live scheduled run
+over an explicit route has not been verified yet.
 These checks do not implement a general device/PBR mode or IPv6-only support.
 
 For `mwan3`, route discovery requires an unambiguous pair of unconditional

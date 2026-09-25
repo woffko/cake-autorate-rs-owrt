@@ -12294,6 +12294,7 @@ mod tests {
 
     fn scheduled_config(instance: &str) -> ScheduledInstanceConfig {
         ScheduledInstanceConfig {
+            explicit_route: None,
             instance: instance.to_string(),
             instance_enabled: true,
             scheduled_enabled: true,

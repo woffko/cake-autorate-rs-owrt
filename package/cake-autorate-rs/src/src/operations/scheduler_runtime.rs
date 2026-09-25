@@ -547,6 +547,7 @@ mod tests {
 
     fn config() -> ScheduledInstanceConfig {
         ScheduledInstanceConfig {
+            explicit_route: None,
             instance: "wan_sqm".to_string(),
             instance_enabled: true,
             scheduled_enabled: true,

@@ -10,6 +10,7 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 
 use super::autotune_request::AutotuneLaunchIntent;
+use super::launch_route::{launch_route_spec, ExplicitLaunchRoute, LaunchRouteFields};
 use super::protocol::CalibrationStrategy;
 use super::scheduler::validate_scheduler_instance;
 use crate::autotune::{
@@ -40,6 +41,11 @@ const RELEVANT_OPTIONS: &[&str] = &[
     "auto_interface_preset",
     "route_mode",
     "mwan3_member",
+    "route_source_ipv4",
+    "route_table",
+    "route_fwmark",
+    "route_fwmark_mask",
+    "route_dns_ipv4",
     "autotune_profile",
     "autotune_calibration_strategy",
     "speedtest_backend",
@@ -69,6 +75,7 @@ pub struct ScheduledInstanceConfig {
     pub expected_target_interface: String,
     pub backend: String,
     pub route_mode: String,
+    pub explicit_route: Option<ExplicitLaunchRoute>,
     pub mwan3_member: String,
     pub profile: AutotuneProfile,
     pub strategy: CalibrationStrategy,
@@ -90,7 +97,7 @@ impl ScheduledInstanceConfig {
             return Err("scheduled launch traffic budget is outside the exact range".to_string());
         }
         Ok(AutotuneLaunchIntent {
-            explicit_route: None,
+            explicit_route: self.explicit_route.clone(),
             instance: self.instance.clone(),
             expected_target_interface: self.expected_target_interface.clone(),
             backend: self.backend.clone(),
@@ -260,7 +267,37 @@ fn parse_instance(instance: &str, section: &RawSection) -> Result<ScheduledInsta
 
     let route_mode = text(&values, "route_mode", "auto");
     let mwan3_member = text(&values, "mwan3_member", "");
-    RouteSpec::new(&route_mode, &mwan3_member, &expected_target_interface).validate()?;
+    // An explicit route is scheduled with the same launch authority as a
+    // manual run, including its DNS server; it is never inferred or dropped.
+    let explicit_route = if route_mode == "explicit" {
+        let mut fields = LaunchRouteFields::default();
+        for (option, flag) in [
+            ("route_source_ipv4", "--route-source-ipv4"),
+            ("route_table", "--route-table"),
+            ("route_fwmark", "--route-fwmark"),
+            ("route_fwmark_mask", "--route-fwmark-mask"),
+            ("route_dns_ipv4", "--route-dns-ipv4"),
+        ] {
+            if let Some(value) = values.get(option).filter(|value| !value.is_empty()) {
+                fields.set(flag, value.clone())?;
+            }
+        }
+        Some(
+            fields
+                .finish(&route_mode)?
+                .ok_or("scheduled explicit route authority is incomplete")?,
+        )
+    } else {
+        None
+    };
+    // RouteSpec::validate also refuses explicit authority in the Lite build.
+    launch_route_spec(
+        &route_mode,
+        &mwan3_member,
+        &expected_target_interface,
+        explicit_route.as_ref(),
+    )?
+    .validate()?;
 
     let backend = match text(&values, "speedtest_backend", "auto").as_str() {
         "auto" | "speedtest-go" => "speedtest-go".to_string(),
@@ -319,6 +356,7 @@ fn parse_instance(instance: &str, section: &RawSection) -> Result<ScheduledInsta
         expected_target_interface,
         backend,
         route_mode,
+        explicit_route,
         mwan3_member,
         profile,
         strategy,
@@ -512,6 +550,45 @@ mod tests {
         assert!(intent.traffic_policy_explicit);
         assert!(intent.allow_sqm_disable);
         assert!(!intent.allow_active_traffic);
+    }
+
+    #[test]
+    fn r6_scheduled_explicit_route_carries_complete_launch_authority() {
+        let explicit = valid_instance(
+            "cake-autorate.wan_sqm.route_source_ipv4='192.0.2.10'\n\
+             cake-autorate.wan_sqm.route_table='101'\n\
+             cake-autorate.wan_sqm.route_fwmark='0x100'\n\
+             cake-autorate.wan_sqm.route_fwmark_mask='0x3f00'\n\
+             cake-autorate.wan_sqm.route_dns_ipv4='192.0.2.53'\n",
+        )
+        .replace("route_mode='mwan3'", "route_mode='explicit'")
+        .replace("cake-autorate.wan_sqm.mwan3_member='wan_member'\n", "");
+        let snapshot = parse_scheduled_instances(&explicit).unwrap();
+        assert!(snapshot.issues.is_empty(), "{:?}", snapshot.issues);
+        let intent = snapshot.instances[0].launch_intent(123_456).unwrap();
+        let route = intent
+            .explicit_route
+            .expect("explicit authority is scheduled");
+        assert_eq!(route.dns_server.to_string(), "192.0.2.53");
+        assert_eq!(intent.route_mode, "explicit");
+
+        let without_dns =
+            explicit.replace("cake-autorate.wan_sqm.route_dns_ipv4='192.0.2.53'\n", "");
+        let snapshot = parse_scheduled_instances(&without_dns).unwrap();
+        assert!(snapshot.instances.is_empty());
+        assert_eq!(
+            snapshot.issues.len(),
+            1,
+            "missing DNS is a visible issue, not a fallback"
+        );
+        let outside_mask = explicit.replace("route_fwmark='0x100'", "route_fwmark='0x4000'");
+        assert_eq!(
+            parse_scheduled_instances(&outside_mask)
+                .unwrap()
+                .issues
+                .len(),
+            1
+        );
     }
 
     #[test]
