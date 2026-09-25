@@ -1,5 +1,8 @@
 # Quick setup guide
 
+Install the packages first as described in [Install](README.md#install)
+(the Full pair also needs this project's `speedtest-go` APK).
+
 Fresh installations intentionally create no autorate instance and no managed
 SQM queue. Open **Network → CAKE Autorate SQM → Settings** and create the first
 instance only after identifying the intended uplink.
@@ -10,36 +13,6 @@ ordinary **Create** and **Save & Apply**. Lite has no Speed Test, Get Rating,
 Full Auto-Tune, scheduler, graph history, traffic classifier or native Review
 Apply surface; the manual controller, routing, managed directional SQM,
 latency probes and adaptive ceiling remain available.
-
-## Status display preferences and reliable actions
-
-**List columns** saves display choices
-in `/etc/config/cake-autorate-ui`, separately from controller rates and SQM.
-Changing columns does not apply pending rate changes or restart a service.
-Until the first explicit save, the existing column preference is still read;
-**Reset default** records an explicit default selection. The UI preferences
-remain part of the existing Full LuCI package and its configuration backup.
-
-Start, Stop and Restart report the command result and refresh Status after
-success. If the status refresh itself fails, that is reported separately from
-the completed service action. Diagnostic exports omit malformed or truncated
-structured sources with a reason instead of emitting unparsed configuration.
-Full and Lite treat dynamic errors and status/configuration metadata as literal
-text, including route labels and instance names. Markup in a diagnostic cannot
-create elements in the notification.
-
-Diagnostic downloads use an authenticated streaming path. The browser
-validates a complete, versioned JSON envelope and downloads the same plain text;
-the decoded bundle remains bounded to 8 MiB. The command-line
-`cake-autorated --log-bundle all` keeps its plain-text format; add `--json`
-before the section argument for the validated transport format. Upgrade the
-daemon and Full UI together; the UI package requires daemon r316 or newer.
-Completed Rating/Speed Test/Auto-Tune JSON results also use the streaming path,
-while Start, Cancel and Apply keep their existing RPC receipt behavior.
-An accepted Apply whose reply is lost is retried with the same option, digests
-and acknowledgements. Do not start a different operation merely because a
-request timed out; inspect its authoritative state first. Lite **Reset** also
-discards this page's staged autorate/SQM changes, not just the visible form.
 
 ## Recommended first setup
 
@@ -304,7 +277,7 @@ the isolated test router.
 For the algorithms and safety invariants see [Controller
 mathematics](ALGORITHM_MATH.md), [Full Auto-Tune](AUTOTUNE.md), and
 [Multi-WAN routing](MULTIWAN.md). Repeatable checks and anonymized observations
-are in [Testing](TESTING.md).
+are in [Testing](TESTING.md) and the [testing archive](TESTING_ARCHIVE.md).
 
 ## Checking CPU overhead
 

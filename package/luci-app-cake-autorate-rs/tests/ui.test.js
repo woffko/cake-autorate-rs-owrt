@@ -161,4 +161,17 @@ assert.equal(delayedInserted.reference, delayedTabs,
 assert.equal(disconnected, 1,
 	'successful insertion must disconnect the observer immediately');
 
+{
+	const link = header.docsLink('explicit-policy-route');
+	assert.equal(link.attrs.href,
+		'https://github.com/woffko/cake-autorate-rs-owrt/blob/main/USER_GUIDE.md#explicit-policy-route');
+	assert.equal(link.attrs.rel, 'noopener noreferrer', 'documentation opens without referrer or opener');
+	assert.throws(() => header.docsLink('javascript:alert(1)'), /unknown documentation section/,
+		'only fixed user-guide sections can be linked');
+	const guide = fs.readFileSync(path.join(__dirname, '../../../USER_GUIDE.md'), 'utf8');
+	const anchors = new Set(guide.split('\n').filter(line => /^#+ /.test(line)).map(line =>
+		line.replace(/^#+ /, '').trim().toLowerCase().replace(/[^\w\- ]/g, '').replace(/ /g, '-')));
+	for (const section of source.match(/var DOCS_SECTIONS = \[([^\]]*)\]/)[1].match(/'[^']+'/g))
+		assert(anchors.has(section.slice(1, -1)), 'USER_GUIDE.md must keep the linked section ' + section);
+}
 console.log('ui.js tests passed');

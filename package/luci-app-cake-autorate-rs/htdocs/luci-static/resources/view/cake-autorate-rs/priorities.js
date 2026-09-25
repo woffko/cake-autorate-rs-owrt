@@ -458,7 +458,8 @@ return L.view.extend({
 		}
 
 		m = new form.Map('cake-autorate', _('Traffic priorities \u2014 %s').format(selectedInstance),
-			_('Configure profile-specific outbound DSCP rules for this instance. cake-autorate-rs remains the only owner of SQM, CAKE, IFB devices and bandwidth rates; the classifier owns only its isolated nftables table.'));
+			E('span', {}, [ cakeUi.text(_('Configure profile-specific outbound DSCP rules for this instance. cake-autorate-rs remains the only owner of SQM, CAKE, IFB devices and bandwidth rates; the classifier owns only its isolated nftables table.')),
+				' ', cakeUi.docsLink('traffic-priorities') ]));
 
 		s = m.section(form.NamedSection, selectedInstance, 'cake_autorate',
 			_('Instance policy'),

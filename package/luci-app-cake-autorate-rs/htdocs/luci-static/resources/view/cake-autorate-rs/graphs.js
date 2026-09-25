@@ -1255,7 +1255,8 @@ return L.view.extend({
 			].join('')),
 			E('div', { 'class': 'alert-message warning cake-graphs-warning' }, [
 				E('strong', {}, _('Optional RAM history. ')),
-				_('Samples (latency, CPU, throughput) stay in RAM only and are cleared when the service stops or the router reboots. The budget is shared by all instances and shrinks under memory pressure. Hover a chart for exact values.')
+				_('Samples (latency, CPU, throughput) stay in RAM only and are cleared when the service stops or the router reboots. The budget is shared by all instances and shrinks under memory pressure. Hover a chart for exact values.'),
+				' ', cakeUi.docsLink('graphs')
 			]),
 			memoryPanel,
 			content

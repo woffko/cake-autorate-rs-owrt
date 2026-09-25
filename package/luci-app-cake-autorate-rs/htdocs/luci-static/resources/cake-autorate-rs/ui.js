@@ -122,9 +122,24 @@ function ensureAppHeader() {
 	});
 }
 
+// Longer explanations live in the user guide. Only these fixed sections can be
+// linked; the page opens only when the user clicks.
+var DOCS_BASE = 'https://github.com/woffko/cake-autorate-rs-owrt/blob/main/USER_GUIDE.md#';
+var DOCS_SECTIONS = [ 'status', 'get-rating', 'graphs', 'settings-and-instances', 'full-auto-tune',
+	'test-traffic-budget-and-server-qualification', 'explicit-policy-route', 'traffic-priorities',
+	'transport-aware-adaptive-capacity', 'optional-external-ipv4-lookup' ];
+
+function docsLink(section, label) {
+	if (DOCS_SECTIONS.indexOf(section) < 0)
+		throw new Error('unknown documentation section');
+	return E('a', { 'href': DOCS_BASE + section, 'target': '_blank', 'rel': 'noopener noreferrer',
+		'class': 'cake-docs-link' }, [ text(label || (typeof _ === 'function' ? _('Learn more') : 'Learn more')) ]);
+}
+
 return L.Class.extend({
 	text: text,
 	textElement: textElement,
+	docsLink: docsLink,
 	readNativeResult: readNativeResult,
 	ensureAppHeader: ensureAppHeader
 });

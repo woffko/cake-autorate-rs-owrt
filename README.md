@@ -35,341 +35,41 @@ results, and retained final authority over every accepted change. The
 assistants provided implementation, analysis, testing, and independent review;
 project ownership and responsibility remain with the human author.
 
+## What it does
+
+- Adjusts CAKE download and upload rates continuously from measured load and
+  latency, following the original cake-autorate controller.
+- Manages the SQM queue itself (CAKE, IFB, one or both directions) and restores
+  it safely on start, stop, reload and package upgrade.
+- Supports several uplinks: the main routing table, mwan3 members, or an
+  existing explicit policy route (for example a VPN).
+- **Full** package: connection rating, Speed Test, **Full Auto-Tune** with a
+  Review step before anything is applied, scheduled calibration with traffic
+  limits, RAM-only graphs and optional outbound DSCP traffic priorities.
+- **Lite** package: the manual controller, routing, latency probes and SQM for
+  small routers, without calibration features.
+
+It targets OpenWrt 25.12 (apk). IPv6-only uplinks are not supported yet.
+
 ## Documentation
 
-- [Quick setup guide](SETUP_GUIDE.md) covers a clean installation, the first
-  instance, Full Auto-Tune, conservative retry, Status/Quality and Multi-WAN.
-- [Controller mathematics](ALGORITHM_MATH.md) describes rate measurement,
-  delay baselines, bufferbloat detection, the fast rate controller, and the
-  bounded adaptive-ceiling state machine with formulas and examples.
-- [Testing and observed results](TESTING.md) starts with the current r318/r127
-  acceptance contract, then retains older RC sections as an explicitly
-  historical engineering chronology.
-- [Release history](RELEASE_HISTORY.md) lists superseded source tags and their
-  milestones and the preserved r313/r120 rollback baseline.
-- [Bounded probe ceiling](ADAPTIVE_CEILING.md) is the concise state-machine and
-  safety-invariant reference for the optional outer controller.
-- [Full Auto-Tune](AUTOTUNE.md) documents the native calibration job,
-  proposal formulas, phase-background accounting, three separate throughput
-  ratios, bounded profile optimizer, and fail-closed validation contract.
-- [Transport-aware quality control](TRANSPORT_QUALITY.md) documents HTTP/TCP
-  latency fusion, the strict control signal, LibreQoS-like detected ratings,
-  the throughput floor, bounded natural-load search, and scheduled Full
-  Auto-Tune.
-- [Multi-WAN routing and lifecycle](MULTIWAN.md) describes the structured
-  `main`/`mwan3` route model, per-uplink state isolation, failover/recovery,
-  route identity checks, SQM ownership, and operational diagnostics.
-- [Profile traffic priorities](TRAFFIC_PRIORITIES.md) documents the native
-  per-profile DSCP rule editor, its strict ownership boundary, outbound-only
-  classification, rule order, runtime attestation, and Multi-WAN isolation.
+- [Quick setup guide](SETUP_GUIDE.md): install, first instance, first Auto-Tune.
+- [User guide](USER_GUIDE.md): every LuCI screen, with stable section links.
+- [Full Auto-Tune](AUTOTUNE.md): calibration job, proposals and Review.
+- [Multi-WAN routing](MULTIWAN.md): `main`, `mwan3` and explicit policy routes.
+- [Transport-aware quality](TRANSPORT_QUALITY.md): latency signals, ratings and
+  scheduled Auto-Tune.
+- [Traffic priorities](TRAFFIC_PRIORITIES.md): outbound DSCP rules.
+- [Bounded probe ceiling](ADAPTIVE_CEILING.md) and
+  [controller mathematics](ALGORITHM_MATH.md).
+- [Features and limitations](FEATURES.md): the detailed implementation list.
+- [Testing](TESTING.md) and [release history](RELEASE_HISTORY.md).
+- [Development](DEVELOPMENT.md): repository layout and SDK builds.
 
-The release targets OpenWrt 25.12 and publishes the daemon for the same 12
-package ABIs as the nftables [`mwan3` v3.6.11-1 release](https://github.com/dl12345/mwan3/releases/tag/v3.6.11-1):
-x86_64, four AArch64 variants, five ARMv7 variants, MIPS 24Kc and
-little-endian MIPS 24Kc. Run
-`apk --print-arch` on the router and select the identically suffixed daemon
-APK. Native route-bound WebSocket/TCP/HTTP probing uses statically linked Rust
-TLS and socket libraries; ordinary OpenWrt runtime dependencies remain
-explicit below.
+## Supported platforms
 
-## Interface overview
-
-**Status** keeps the operational state in one place: uplink lifecycle,
-Autorate/SQM/classifier health, active profiles, current collection state and
-the last complete connection rating. The anonymized current-version example
-below shows a cellular uplink with upload-only shaping and the honest
-**WAITING FOR DATA** state. After a
-complete passive or guided capture, **LAST KNOWN** preserves that DL/UL grade;
-an incomplete or contaminated attempt never replaces it.
-
-[![Status overview for a cellular uplink with upload-only shaping](docs/screenshots/status-overview.png)](docs/screenshots/status-overview.png)
-
-**Get rating** offers an automatic router-side test and a guided client
-capture. The dialog first attests the current operation for that exact
-instance; a second tab reconnects to an active Rating instead of starting a
-competing job. Starting Guided after a completed Automatic run creates a new
-job and worker identity, while closing during an in-flight Start receipt still
-cancels the exact admitted job. Raw lease/debug identities are never shown to
-the user.
-
-[![Guided Rating reconnected to the active per-instance job](docs/screenshots/rating-guided.png)](docs/screenshots/rating-guided.png)
-
-**Graphs** use an opt-in, bounded RAM-only history. Latency, transport delta,
-effective delay, CPU and synchronized download/upload traffic share the same
-timeline; the oldest samples are discarded automatically and nothing is
-written to flash. New traffic rows show interval means and separate sampled
-peaks; hover text reports the actual observation duration. Older rows remain
-identified as instantaneous samples. RTT and CPU remain snapshots. The live
-Multi-WAN capture also shows an adaptive backoff
-event on the shared time axis.
-
-[![RAM-only latency, CPU and traffic graphs](docs/screenshots/graphs-overview.png)](docs/screenshots/graphs-overview.png)
-
-**Settings** manages each uplink independently and exposes traffic priorities,
-Full Auto-Tune, categorized editing and deletion directly from its instance
-row. A clean package installation creates no instance until the user chooses
-**Create instance**.
-
-[![Per-instance settings and actions](docs/screenshots/settings-overview.png)](docs/screenshots/settings-overview.png)
-
-The Edit dialog groups routing, rate limits, adaptive ceiling, probes, quality,
-controller, SQM, testing and monitoring controls instead of presenting one long
-form. See the current [categorized Autorate setup](docs/screenshots/settings-autorate-setup.png).
-
-**Full Auto-Tune** offers Gaming, Best overall, Variable link and Fair
-calibration profiles,
-then measures the selected uplink and presents diagnostics before anything is
-written to UCI. Multi-WAN calibration keeps the route and evidence separate for
-each selected uplink. Gaming additionally has a one-run **Extreme A+ search**
-for wide links: it accepts only measured A+ minima, disables Auto-Apply below
-70% retained capacity, and warns that such a throughput sacrifice is intended
-for short latency-critical sessions rather than continuous household use.
-
-Variable link opens a small access/capacity wizard instead of guessing the
-provider medium from an Ethernet or PPPoE handoff. QMI/MBIM/NCM and modem-like
-devices can be identified with an explicit confidence value; cellular,
-LEO/GEO satellite, fixed wireless/WISP, shared wired and unknown access can
-always be selected manually. The choice sets only the bounded exploration
-floor and probe cadence. It never invents a runtime limit: only an exact tested
-CAKE point may become the minimum or safe ceiling. Runtime learning is a
-separate choice between **Validated ceiling only**, **Bounded learning from
-real traffic**, **Bounded + scheduled active calibration**, and **Explicit
-service hard caps**.
-
-[![Variable Link access and capacity-learning setup](docs/screenshots/variable-link-setup.png)](docs/screenshots/variable-link-setup.png)
-
-[![Full Auto-Tune calibration profiles](docs/screenshots/autotune-profiles.png)](docs/screenshots/autotune-profiles.png)
-
-During a run, the dialog reports an evidence-backed percentage and the current
-operation, such as idle-latency measurement, raw capacity, download/upload
-search, candidate confirmation, directional comparison, restoration, or
-proposal preparation. Progress is monotonic but is never advanced by an
-elapsed-time animation; 100% is reserved for a published Review after the
-previous runtime has been restored.
-
-Review can present several independently measured choices. Every trade-off for
-the selected card is listed, followed by one aggregate **I accept all listed
-trade-offs** confirmation. For explicitly selected cellular, satellite, and
-fixed-wireless access, Full raw capacity also attempts a download-unshaped /
-upload-shaped result. If that control cannot satisfy the hard evidence gates,
-the card remains visible but disabled with its exact reason.
-
-[![Full Auto-Tune Review with four measured options and one aggregate confirmation](docs/screenshots/autotune-review-options.png)](docs/screenshots/autotune-review-options.png)
-
-### Controlled cellular observations (anonymized)
-
-The following controlled OpenWrt cellular-link sample runs are anonymized benchmark evidence and are **not** shipped behavior or guarantees.
-
-- Raw/unshaped path: **324–342 / 40–43 Mbps** observed with **C/C**.
-- Existing CAKE 114.5/15.8 produced **102–104 / 14.2** with DL **C** and UL **A**.
-- Upload-only shaping showed about **342 / 13.9** with DL **B** and UL **A**.
-- Simultaneous load comparison:
-  - no CAKE: **202 / 44.9**, D, **205 ms**
-  - 114.5/15.8: **107 / 11.7**, A, **17 ms**
-  - 250/15.8: **219 / 10.3**, B, **34.8 ms**
-  - 200/15.8: **180 / 11.7**, B, **31.6 ms**
-  - 175/15.8: **154 / 11.2**, A, **18.8 ms**
-
-ICMP samples in this set stayed around **10–13 ms** while TCP/WebSocket samples were **72–190 ms**. This is a measurable risk signal that some providers/networks may prioritize or specially treat ICMP, so ICMP-only grading can understate user-traffic latency.
-
-### Transport-aware adaptive capacity
-
-RC27 implements the following controller and LuCI model:
-
-- Keep raw capacity, current rate, measured runtime minimum, exploration
-  minimum, safe ceiling, failed bound, confidence and route epoch independently
-  for download and upload. A route/source/member change expires old evidence.
-- Offer an explicit raw-capacity calibration mode which transactionally removes
-  only the managed download ingress CAKE/IFB path, measures the selected uplink,
-  and restores the exact prior runtime through a watchdog even if the worker or
-  browser disappears. Upload shaping may remain active when the selected test
-  requires it.
-- Run shaped candidates through the same transport-aware path, then confirm the
-  selected DL/UL pair under simultaneous load. The worse corroborated ICMP or
-  native transport delta is authoritative.
-- Build one ranked Review set from as many as four independently measured
-  runtime topologies: both directions shaped, upload-only shaping,
-  download-only shaping, and no SQM. Every card names its exact tested rates
-  and evidence; Auto-Tune never derives or invents an untested rate merely to
-  make a proposal available.
-- Keep profile class, retained-capacity objectives, and relative utility versus
-  another safe topology as policy judgements rather than technical failures.
-  A proposal that misses one of them remains selectable only after Review shows
-  the deviation and the user explicitly acknowledges that proposal's warning.
-- Keep measurement integrity, route identity, raw-bypass proof, complete
-  background accounting and contamination limits, loss, the manual-review
-  latency ceiling, and a proven 50–110% CAKE realization safety envelope for
-  every shaped direction as non-overridable hard gates. Historical-throughput
-  trust and the ordinary 80% realization objective remain explicit Review
-  warnings inside that envelope. Acknowledging a profile trade-off cannot
-  weaken the hard checks.
-- If shaped frontier search cannot produce a safe result but the independent
-  raw control is complete and passes every applicable hard gate, carry an exact
-  no-SQM fallback into Review instead of discarding the whole run. This is a
-  manual proposal backed by the measured raw topology, not permission to infer
-  missing shaped evidence.
-- The same running SQM topologies can be selected manually in **Edit → SQM
-  setup → CAKE directions**. One-sided mode removes CAKE from the unselected
-  direction; it is not the same as retaining CAKE at a fixed rate by disabling
-  Adjust DL or Adjust UL. Logical capacity values remain independent of the
-  managed SQM runtime `0` marker used for an absent direction, including across
-  the standard LuCI Save & Apply cycle.
-- Treat a flat latency curve as directional evidence. If one Variable-link
-  direction meets its quality target but lower tested CAKE rates provide no
-  repeatable latency improvement, hold that direction at its highest safe,
-  target-meeting tested point while the peer direction finishes its search.
-  Such a result is always manual-review only, requires a safe simultaneous
-  DL+UL confirmation, and never invents an untested runtime minimum.
-- When Variable-link reaches its medium-specific 35%, 40%, or 50%
-  exploration boundary without proving a knee, or bounded repeats remain
-  nonmonotonic, keep the result useful without
-  overstating it: select the best exact-tested safe point at or above the 50%
-  trust boundary, use that same point as the runtime minimum, require a safe
-  simultaneous DL+UL confirmation, and expose it only for manual review.
-- Each close manual proposal lists every missed advisory/profile criterion in
-  Review. One aggregate checkbox accepts the complete displayed set for that
-  exact topology; the individual codes remain bound to Apply and cannot be
-  hidden or changed after confirmation. A final simultaneous latency miss is
-  reviewable only within the adjacent quality class: Gaming/Extreme A+ to A
-  (30 ms), Best overall A to B (60 ms), Variable link B to C (200 ms), and Fair
-  C to D (400 ms). Final simultaneous realization between 50% and the ordinary
-  80% proof threshold is also an explicit per-direction acknowledgement.
-- Grow passively only under proven saturation, clean transport evidence and a
-  measurable throughput gain. The selected policy may instead freeze the
-  exact validated ceiling, add budgeted scheduled calibration, or enforce
-  explicit service caps. Variable Link never treats either policy choice as
-  evidence of capacity above its measured raw control.
-- Apply causal backoff: two reductions without meaningful latency improvement
-  restore the last useful point and enter `HOLD_NO_EFFECT` instead of destroying
-  throughput for radio/operator delay outside CAKE's control.
-- Keep three user choices separate: calibration strategy (**Shaped only**,
-  **Full raw capacity**, or **Reuse trusted bounds**), runtime learning
-  (**Validated ceiling only**, **Bounded learning from real traffic**,
-  **Bounded + scheduled active calibration**, or **Explicit service hard
-  caps**), and
-  operating profile (Gaming, Best overall, Variable link, or Fair). Reuse is
-  enabled only after that instance has saved positive DL and UL P50 references;
-  an uncalibrated or stale reuse choice is explained and safely normalized to
-  Shaped only.
-- Keep scheduled traffic injection opt-in. The scheduler reserves and settles
-  per-instance daily/monthly byte allowances in a crash-safe ledger, shows the
-  next due run and remaining allowance, and enforces its admission and stopping
-  policy. A byte allowance is not a guarantee of exact physical-WAN usage.
-- Full raw capacity first measures comparable bidirectional, download-only and
-  upload-only controls by bypassing only the direction under test. For
-  explicitly selected cellular, satellite, and fixed-wireless access it then
-  additionally attempts a terminal upload-only-shaped experiment with download
-  ingress bypassed. A verified result becomes a separate manual option;
-  unavailable or unsafe evidence remains an explained disabled card, never a
-  silent runtime topology change.
-- Keep fail-closed behavior unchanged: an integrity, identity, contamination,
-  or restoration failure preserves the last safe state and publishes either a
-  typed diagnostic or an exact evidence-backed manual option; it never invents
-  a lower-confidence rate.
-- Bind every manually reviewable deviation to the exact option as a stable
-  acknowledgement code. Auto-Apply is possible only when that option requires
-  no acknowledgements; there is no global confidence label which can weaken a
-  hard gate.
-
-One historical high-capacity cellular development run requested a 2 GiB traffic
-limit. It completed raw measurements near **403/46 Mbps** and a first shaped
-point near **220/30 Mbps**, then stopped with typed
-`traffic-budget-exhausted`, restored the original SQM runtime and wrote no UCI.
-A complete Variable-link frontier at that capacity can consume roughly
-**4.5–6 GiB**, so periodic active testing must be enabled only with an
-appropriate data allowance. CPU saturation is reported as advisory evidence;
-it does not by itself reject an otherwise safe candidate.
-
-### Unreleased audit changes: test traffic and server qualification
-
-The following describes the current development source, not the accepted RC27
-packages linked below. Local source and isolated-kernel tests do not replace
-package, OpenWrt VM, upgrade/rollback or physical-device acceptance.
-
-Initial Full Auto-Tune and manual reruns require a traffic-policy choice:
-Unlimited, a preset of 1/5/10/25/50/100 GB, or a custom total. These are decimal
-GB and apply to **download plus upload for the whole test**, not separately to
-each direction or attempt. There is no implicit 32 GB default. Remembering a
-choice is explicit and scoped to one instance in the current browser. A retry
-of the same admitted request retains its original policy and debit history.
-Scheduled daily/monthly reservations remain independent; manual Unlimited does
-not remove scheduler limits. Lite does not provide active Auto-Tune.
-
-The service refuses a capped test below its known mandatory evidence minimum
-before starting traffic. Capped raw testing also requires declared DL and UL
-service ceilings for stopping headroom; a planning estimate or a slow server
-measurement cannot supply that authority. Do not invent service ceilings to
-pass admission. Stopping headroom is included in the chosen allowance. Passing
-the minimum does not guarantee completion: optional checks, retries and changing
-conditions can exhaust the remaining allowance. The displayed full-plan scenario
-is an estimate, not a physical minimum, guaranteed maximum, or limit on measured speed.
-New interactive capped launches also reject allowances below the initial-stage
-planning estimate when both expected rates are known: 15 seconds per direction
-for two independent servers with three repeats, then two controls per direction.
-Planning rates are separate from service ceilings and never alter shaper rates.
-CLI callers can supply the pair `--planning-dl-kbps` and `--planning-ul-kbps`
-(integer 1..100000000 kbit/s). Without that pair, a new explicit capped CLI
-launch uses available configured/service rate hints, as the UI does; those hints
-are assumptions, not measurements. Choose a larger allowance or Unlimited if
-the initial-stage estimate does not fit. Completion can still need more traffic.
-The planning pair is bound to the request, retained on retry, and exposed in
-status as `traffic_planning`. Old requests and scheduler policies retain their
-original semantics. The UI checks `native_traffic_planning_version=1` before
-sending the new fields; it does not silently drop them for an older daemon.
-Unlimited removes byte admission/stop limits, not cancellation, deadlines,
-accounting, route checks or runtime restoration.
-
-A standalone Full Speed Test asks for the same choice before it starts when the
-daemon reports `native_speedtest_traffic_policy_version=1` (CLI:
-`--traffic-policy unlimited|capped`, `--traffic-budget-bytes N`). The total
-covers download plus upload, retries included, and contains the stopping
-reserve. A direction still shaped by managed CAKE uses its highest configured
-ceiling (adaptive ceiling included) for that reserve. The default unshaped test
-bypasses the shaper in the measured direction, so a capped choice needs its
-actual service ceiling (`--service-dl-cap-kbps`, `--service-ul-cap-kbps`);
-without it, or when the total cannot hold the reserve plus route proof, the
-test is refused before traffic. These ceilings never change shaping or results.
-Callers that send no policy keep the historical derived budget.
-
-New traffic accounting uses test-owned IP counters for backend traffic and
-probes, including discovery, rejected attempts, retries and gaps between loads.
-Background user traffic remains a separate measurement-quality concern. System
-DNS and local DNS filtering are retained; attribution through a shared resolver
-is approximate. After test producers stop, a private-rule cutoff freezes the
-recorded interval before the counters are removed. Later packets are excluded.
-Consequently this is **not exact physical-wire billing or a strict ingress-byte
-guarantee**. Polling and stop latency can produce an observed overrun; the UI
-reports it rather than rounding usage down to the allowance.
-
-During a run, displayed consumption is the last saved debit, not a live total.
-The final total includes the verified tail through the cutoff. An interrupted
-write is reconciled against the bound intent, journal and cutoff; it is never
-blindly appended again. Missing or inconsistent evidence yields unknown usage,
-not zero, and cannot release a scheduler reservation as an exact settlement.
-Zero before admission requires a separate bound no-producers receipt. Legacy
-records retain their original accounting interpretation and are labelled as such.
-
-Server qualification first compares repeated DL/UL observations from three
-servers. If that group is insufficient, it can examine three backup servers;
-backups are skipped when the first group qualifies. It requires stable,
-competitive independent reported sources. A chosen
-server must pass the comparison too; it is not silently replaced. Qualification
-does not prove that all equally slow servers represent the link's true capacity.
-During the single-direction raw controls the other direction keeps a CAKE
-shaper, and its ACK/request traffic crosses it. That temporary shaper now runs
-at least at this run's qualified median for that direction (bounded by the
-declared service cap), not at a stale low configured rate that would throttle
-the measured direction and make it incomparable with the unshaped
-qualification. It is never lowered below the current rate and never becomes a
-proposal or cap.
-The UI separates observed throughput from proposed CAKE rates. A fall below 50%
-of a retained, verified comparable same-boot raw reference blocks a new Apply;
-this guard does not invent a historical reference after reboot. Reviewing or
-rejecting a proposal does not apply its rates.
-
-## Current package tree
-
-The RC27 release builds the OpenWrt 25.12 daemon APK for this ABI matrix:
+Each release provides the daemon for these 12 OpenWrt 25.12 package ABIs. Run
+`apk --print-arch` on the router and pick the file with the same suffix.
 
 | APK suffix | Representative OpenWrt target |
 |---|---|
@@ -386,47 +86,117 @@ The RC27 release builds the OpenWrt 25.12 daemon APK for this ABI matrix:
 | `mips_24kc` | `ath79/generic` |
 | `mipsel_24kc` | little-endian 24Kc targets |
 
-The target is an APK ABI rather than one specific board. The authoritative
-choice is the value returned by `apk --print-arch`. Every full daemon asset
-follows the name
-`cake-autorate-rs-1.0_rc27-r318_openwrt-25.12_<arch>.apk`; the shared
-`luci-app-cake-autorate-rs-1.0_rc27-r127.apk` contains the
-architecture-independent full LuCI interface and SQM integration.
+## Packages
 
-The same release also contains a separately compiled **Lite** pair for every
-ABI: `cake-autorate-rs-lite-1.0_rc27-r318_...apk` and
-`luci-app-cake-autorate-rs-lite-1.0_rc27-r7.apk`. Lite keeps the manual
-controller, routing, latency probes, directional SQM and bounded adaptive
-ceiling, but deliberately omits Get rating, speed-test calibration, Full
-Auto-Tune and scheduled calibration. Full and Lite are mutually exclusive;
-install both packages from one pair, never mix a Full daemon with Lite LuCI or
-the other way around.
+| Package | Full | Lite |
+|---|---|---|
+| Daemon | `cake-autorate-rs` (per ABI) | `cake-autorate-rs-lite` (per ABI) |
+| LuCI | `luci-app-cake-autorate-rs` (noarch) | `luci-app-cake-autorate-rs-lite` (noarch) |
+| Speed test backend | `speedtest-go` 1.7.10-r2 or newer (per ABI, from this project) | not used |
 
-The accepted release is
-[`v1.0-rc27-r318-r127`](https://github.com/woffko/cake-autorate-rs-owrt/releases/tag/v1.0-rc27-r318-r127):
-24 architecture-specific daemon APKs, the Full and Lite noarch LuCI APKs,
-`SHA256SUMS`, and machine-readable matrix/release manifests. The published
-Lite daemon APK is about 79% smaller than Full on average across the matrix;
-Lite LuCI is about 94% smaller than Full LuCI.
+Full and Lite conflict; install one complete pair and never mix a Full daemon
+with Lite LuCI. Other runtime dependencies (`sqm-scripts`, `fping`,
+`nftables-json`, `uclient-fetch`, CAKE/IFB kernel modules, `tc`) come from the
+router's OpenWrt package feeds, so the feeds must work.
 
-RC27 keeps forwarded traffic separate from the isolated speed-test result and
-binds background, retention, latency, topology and measurement deviations to
-the exact Review option which observed them. An option with no acknowledgement
-codes may satisfy unattended Apply; every safe exception is manual-only and
-must be accepted through one aggregate confirmation which still preserves the
-complete code list. A strict busy-link stop can be retried or continued once
-with conservative safeguards. A stalled speed-test phase is retried with bounded cooldowns;
-an automatically chosen server may be replaced only by restarting the complete
-raw-control series, while an explicitly pinned server is never changed. An
-exhausted timeout is reported as retryable and inconclusive, preserves the
-verified diagnostics in RAM, and never exposes an Apply action. CPU saturation
-is visible as a warning rather than a false
-quality failure. The release retains the explicit Automatic/Gaming/Best
-overall/Fair/Custom traffic-profile model and sequential per-member Multi-WAN
-calibration. Direct APK assets are provided for all 12 daemon ABIs plus the
-Full and Lite architecture-independent LuCI APKs. Each ABI has a separately
-compiled Full and Lite daemon. Dependencies resolve through the router's
-configured OpenWrt package feeds; no offline bundle is attached.
+The Full daemon requires this project's `speedtest-go` build (1.7.10-r2 or
+newer). The OpenWrt feed only has 1.7.10-r1, which lacks the bounded-failure,
+route-bound DNS and redirect fixes, so install the `speedtest-go` APK from the
+same release together with the Full pair. Our build ships only the
+`speedtest-go` CLI (about 8 MB installed).
+
+## Install
+
+Download the files for your ABI from the
+[latest release](https://github.com/woffko/cake-autorate-rs-owrt/releases)
+and copy them to the router. If the standalone SQM LuCI app is installed,
+remove only that UI package; keep `sqm-scripts`:
+
+```sh
+apk info -e luci-app-sqm && apk del luci-app-sqm
+```
+
+Full (example for `aarch64_generic`; use the exact file names from the release):
+
+```sh
+cd /root
+apk add --allow-untrusted --simulate \
+  speedtest-go-*.apk cake-autorate-rs-*_aarch64_generic.apk luci-app-cake-autorate-rs-[0-9]*.apk
+apk add --allow-untrusted \
+  speedtest-go-*.apk cake-autorate-rs-*_aarch64_generic.apk luci-app-cake-autorate-rs-[0-9]*.apk
+```
+
+Lite:
+
+```sh
+apk add --allow-untrusted \
+  cake-autorate-rs-lite-*_aarch64_generic.apk luci-app-cake-autorate-rs-lite-*.apk
+```
+
+`apk` extracts a whole package before replacing files, so a small root
+filesystem needs free space for the new files while the old ones still exist.
+
+Fresh installs have no instance and create no SQM queue. Create the first one
+in **Network → CAKE Autorate SQM → Settings** as described in the
+[quick setup guide](SETUP_GUIDE.md). Upgrades keep all configured instances.
+
+### Switching between Full and Lite
+
+The pairs conflict, so `apk` cannot swap them in one transaction. When the
+current pair was installed from files, its dependencies are only implicit and
+`apk del` would purge them too. Mark the shared ones as explicit first:
+
+```sh
+cp /etc/config/cake-autorate /root/cake-autorate.backup
+apk add sqm-scripts fping
+apk del --simulate luci-app-cake-autorate-rs cake-autorate-rs   # must list only these two
+apk del luci-app-cake-autorate-rs cake-autorate-rs
+apk add --allow-untrusted /root/cake-autorate-rs-lite-*.apk /root/luci-app-cake-autorate-rs-lite-*.apk
+```
+
+Use the mirrored names to return from Lite to Full (and include the
+`speedtest-go` APK). Moving to Lite keeps manual instance settings but removes
+the Rating/Auto-Tune services and their pages.
+
+### Optional pinger backends
+
+```sh
+# fping-ts uses the installed fping binary; nothing extra is needed
+apk add irtt  # also configure explicit IRTT servers and synchronized clocks
+# tsping is a compatible binary installed manually; ping comes with the base system
+```
+
+## Quick checks
+
+```sh
+cake-autorated --instance wan_sqm --dump-config
+cake-autorated --instance wan_sqm --once
+cat /var/run/cake-autorate/wan_sqm/status.json
+/usr/sbin/cake-autorated --calibrationctl summary
+/usr/sbin/cake-autorated --calibrationctl speedtest-current wan_sqm
+/usr/sbin/cake-autorated --calibrationctl rating-current wan_sqm
+/usr/sbin/cake-autorated --mqtt-status wan_sqm status
+/usr/sbin/cake-autorated --cpu-profile 30
+```
+
+`*-current` reports either the exact current operation or `state=idle`.
+Job-specific `*-status`, `*-result`, and `*-cancel` commands require the public
+job ID returned by the corresponding Start operation. These calibration
+commands are intentionally unavailable in Lite.
+
+For a no-shaper smoke test, disable both shaper adjustment flags:
+
+```sh
+uci set cake-autorate.wan_sqm.adjust_dl_shaper_rate='0'
+uci set cake-autorate.wan_sqm.adjust_ul_shaper_rate='0'
+uci commit cake-autorate
+cake-autorated --instance wan_sqm --once
+```
+
+For `ping` fallback and CPU/log smoke tests, use a temporary disabled-rate
+instance with explicit counter paths, `adjust_dl_shaper_rate='0'`,
+`adjust_ul_shaper_rate='0'`, `pinger_method='ping'`, `output_cpu_stats='1'`,
+and a temporary `log_file_path_override`.
 
 ## Relationship to upstream cake-autorate
 
@@ -477,812 +247,3 @@ Multi-WAN routing, graphs, and the native DSCP classifier are port-specific.
 The controller mathematics and inherited terminology are documented in
 [Controller mathematics](ALGORITHM_MATH.md); port-specific safety boundaries
 are documented in the linked feature references above.
-
-## Current release highlights
-
-Traffic policy is one exclusive per-instance choice:
-**Automatic**, **Gaming**, **Best overall**, **Fair**, or **Custom**. Automatic
-follows the Auto-Tune profile; pinned policies do not change on later
-calibration. Previewed rules come from the same catalog as the nftables
-renderer, **Customize this preset** stages an editable UCI copy without
-auto-commit, and the independent classifier master remains off unless the user
-enables it. Status names both the Auto-Tune and traffic-priority profiles.
-
-The legacy migration is one-time and idempotent. It adds a resolved profile and
-migration marker but never enables traffic rules, Autorate, or SQM. Desktop,
-touch, keyboard, and narrow mobile layouts are covered by deterministic tests
-and authenticated Playwright checks.
-
-[![Traffic priorities desktop view](docs/screenshots/traffic-priorities-desktop.png)](docs/screenshots/traffic-priorities-desktop.png)
-
-[Mobile preset view](docs/screenshots/traffic-priorities-mobile.png) ·
-[staged Custom copy](docs/screenshots/traffic-priorities-custom.png)
-
-The screenshots use anonymized instance, interface, host and address labels.
-They combine a completed rating capture with the current RC27 Multi-WAN,
-graphs, Auto-Tune and traffic-priority interface; rates and diagnostics are
-representative examples rather than guarantees.
-
-## Current release
-
-This release is **RC27 r318/r127**: daemon package r318 and Full LuCI package
-r127, with the parallel manual-only Lite pair r318/r7. It retains the complete
-two-direction Rating authority, truthful staged Auto-Tune progress, a ranked
-four-option Review including the measured mobile download-bypass topology, one
-aggregate trade-off confirmation, and an Apply flow which verifies the runtime
-and immediately reloads authoritative UCI without another button or tab
-switch.
-
-The native Apply transaction is write-ahead protected. Before mutating either UCI
-package it durably records the exact original and candidate `cake-autorate` and
-`sqm` bytes, modes, digests, request/job/worker identity, and selected option
-manifest. Recovery classifies each live package as original, candidate, or
-foreign, safely resolves every original/candidate mixed pair, and refuses an
-unrecognized overwrite. Stale restore temporaries are cleaned only while the
-same config-pair lock is held; unsafe links fail closed. A legacy recovery
-record without candidate bytes remains rollback-only.
-
-Apply, recovery, ordinary service start/reload, package replacement, and an
-empty controller plan now share one state-driven readiness boundary. Success
-is not published until the runtime lock is released and the exact expected
-controller set is ready; a failed readiness proof becomes a failed terminal,
-never a false Applied result. Package-upgrade deferral has its own typed receipt
-so it cannot be confused with a genuine empty plan. No fixed retry timer or
-second post-install confirmation is used. The focused crash-boundary suite,
-live VM/router upgrades, browser audit, and Full/Lite 12-ABI verification are
-recorded in
-[Testing](TESTING.md). The README intentionally describes current behavior
-instead of retaining a cumulative RC diary. Superseded milestones remain in
-[Release history](RELEASE_HISTORY.md) and git tags, while
-[GitHub Releases](https://github.com/woffko/cake-autorate-rs-owrt/releases)
-contains the current release and the preserved r313 rollback baseline.
-
-Fresh Full installation and Lite-to-Full replacement use the same readiness contract.
-After OpenWrt's default package hook returns, the Full package now re-attests
-the main controller, stops and settles any calibration instance that the
-default hook already started, then enables and starts exactly one coordinator.
-The in-place upgrade branch remains separate and performs no duplicate
-readiness confirmation. Exact Full → Lite → manual stop/save/start → Full
-testing now returns package status zero and restores the original UCI, services
-and both CAKE qdiscs byte-for-byte.
-
-This maintenance release adds client-disconnect isolation,
-deadline-bounded process output, separate Status display preferences,
-structured diagnostic redaction and truthful service-action errors. Dynamic
-plain-text errors and diagnostics use text nodes instead of LuCI HTML strings.
-Large exports and completed calibration results use authenticated streaming
-with complete JSON validation, rather than rpcd's small command-output buffer.
-Lost Apply replies are retried with the exact same request and handle. Native
-SQM startup waits for the matching kernel topology event, and release of a
-calibration owner clears stale operation state. Lite Save/Reset keeps UCI
-transaction state consistent with the displayed form. These changes passed
-the source, VM, physical-device and 12-ABI package gates described in
-[Testing](TESTING.md#current-release-acceptance).
-
-## Repository Layout
-
-This repository is organized as an OpenWrt package feed/SDK overlay. Each package directory follows the OpenWrt package documentation layout:
-
-```text
-package/<package-name>/Makefile
-package/<package-name>/files/
-package/<package-name>/src/
-```
-
-`files/` contains installed default config, init scripts, LuCI menu/ACL files, and LuCI views. `src/` contains bundled application source; OpenWrt explicitly supports bundled source code inside a package directory, commonly under `src/`.
-
-## Contents
-
-- `package/cake-autorate-rs` - Rust daemon package.
-- `package/luci-app-cake-autorate-rs` - Full LuCI app.
-- `package/luci-app-cake-autorate-rs-lite` - minimal manual-only LuCI app.
-- `/etc/config/cake-autorate` - UCI config installed by the daemon package.
-- `/etc/init.d/cake-autorate` - procd service wrapper.
-- `/usr/sbin/cake-autorated` - daemon binary.
-
-## Current State
-
-This is the current Rust/OpenWrt release-candidate implementation, not a
-drop-in replacement for every upstream Bash utility or supported platform.
-
-Implemented:
-
-- UCI-based config loading.
-- Multiple enabled UCI sections via procd instances.
-- Structured `route_mode=auto|main|mwan3` and `mwan3_member` routing. Native
-  nftables mwan3 state is validated before a member is used; each instance
-  publishes its resolved member, L3 device, source address, external address,
-  fwmark and routing table. Policy failover produces independent
-  `ACTIVE`/`STANDBY`/`OFFLINE`/`LEARNING` lifecycle transitions without sharing
-  learned state between uplinks.
-- `fping` RTT reflector probing, `fping-ts` and `tsping` ICMP timestamp OWD
-  probing, explicit-server `irtt` OWD probing, plus a basic
-  per-reflector `pinger_method=ping` fallback.
-- Active reflector health tracking and replacement for running `fping`,
-  `fping-ts`, `tsping`, `irtt`, and `ping` probes: response-deadline offences,
-  baseline/EWMA comparison, periodic replacement, optional reflector stats
-  logging, and pinger restart with the next spare candidate.
-- Runtime status JSON and LuCI status page expose active, spare, and bad
-  reflector sets plus per-reflector samples, offence counters, and last RTT.
-- sysfs RX/TX byte counter sampling.
-- CPU usage sampling from `/proc/stat` is always exposed in runtime status;
-  `output_cpu_stats` and `output_cpu_raw_stats` control log records only.
-  The Status value is whole-router utilization. Run
-  `/usr/sbin/cake-autorated --cpu-profile 30` to measure the daemon,
-  persistent pingers and scheduler separately, including short-lived child
-  work waited by each daemon.
-- adaptive rate calculations using delay/load windows.
-- External/manual SQM (`manage_sqm=0`) permits bandwidth-only control of
-  explicitly enabled, addressable root CAKE queues. Disabled directions and
-  custom ingress steering stay untouched. Missing queues are reported as
-  `WAITING_EXTERNAL_SQM`, without automatic topology repair; native Auto-Tune
-  still requires its separate managed/exclusive restore authority.
-- Cold latency baselines use three independent, recent low-load counter/RTT
-  observations, not a fixed 100 ms starting value. Until qualified, the daemon
-  holds off that reflector's control and measurement decisions. Status reports
-  `latency_baseline_ready` and counts of ready/pending reflectors; initial
-  qualification reports `LEARNING`. Real route changes restart qualification.
-- Optional Rust-only bounded-probe ceiling extension. **Validated ceiling
-  only** is the conservative default when link classification is inconclusive;
-  bounded passive/scheduled learning is an explicit policy. Each direction
-  starts from its exact tested-safe point, independently qualifies clean high
-  load, briefly tests a higher ceiling, promotes only a clean target with a
-  measurable throughput gain, and remembers the
-  lowest target that caused confirmed bufferbloat. Later probes use the midpoint
-  between safe and failed bounds. Short load/delay-classification fluctuations
-  are tolerated, while sustained loss or a global probe-response gap rolls back
-  without poisoning the safe/failed bounds. A brief stall pauses learning;
-  sustained response loss past the effective global timeout resets learned
-  bounds. Real route changes and daemon restarts still reset runtime learning.
-  Measured-raw DL/UL caps and any tighter service caps remain hard safety
-  limits, and runtime learning never rewrites UCI.
-  Status exposes the phase, safe ceiling, failed bound, probe target, and last
-  transition reason. See [ADAPTIVE_CEILING.md](ADAPTIVE_CEILING.md) for the
-  state machine and acceptance tests.
-- Optional native transport RTT measurement, disabled by default. Persistent
-  WebSocket, TCP-connect, and persistent HTTP resolve DNS outside the timer and
-  bind sockets to the selected device/source/fwmark. Measurement supplies the
-  observational LibreQoS-compatible detected rating. A separate, default-off
-  controller toggle may use only trusted, route-verified, CPU-clean evidence to
-  block unsafe ceiling growth or run a bounded natural-traffic search above a
-  protected per-direction floor. See
-  [TRANSPORT_QUALITY.md](TRANSPORT_QUALITY.md).
-- Passive detected-rating load classification is independent of controller
-  high/low/idle state. A bounded rolling peak for entry, average for exit,
-  enter/exit hysteresis,
-  direction latch, and dropout grace turn real forwarded traffic into stable
-  `DL`, `UL`, or `BIDIRECTIONAL` rating phases without double-counting byte
-  counters. Optional `Get rating` automatic/client capture uses the same
-  detector and supplies a bounded per-direction trigger; it never bypasses
-  shaping. Automatic capture first enforces a quiet window and runs separate
-  download-only and upload-only load phases. The top-level grade is published
-  only from a fresh finalized capture containing trusted ICMP and transport
-  evidence for both directions. Partial, stale, compatibility, or one-sided
-  evidence remains diagnostic and cannot replace the last complete grade.
-- The controller, rating detector, transport scheduler, and RAM graph history
-  reuse one atomic per-interval RX/TX counter sample. This prevents either
-  direction from disappearing because another consumer already advanced the
-  counter baseline.
-- `tc qdisc change ... cake bandwidth ...` shaper updates.
-- Upstream-style idle/stall handling: sustained idle can stop pingers, activity
-  restarts them, and optional minimum-rate enforcement applies on sustained idle
-  or global no-response timeout.
-- daemon log rotation by age/size with best-effort gzip compression.
-- JSON status file under `/var/run/cake-autorate/<instance>/status.json`.
-- Optional per-instance LuCI `Graphs` history for RTT, transport/effective
-  latency, total CPU, download/upload traffic, DL/UL safety floors, and detected
-  grade events. It is disabled by default and enabled directly on each active
-  instance card. A per-instance dropdown selects 1, 2, 5, 10, 15, 30, or 60
-  second sampling. Each uplink is a separate vertical card; both charts share a
-  horizontally scrollable timeline, auto-follow new samples until the user
-  scrolls back, and expose exact values on hover. Samples stay only in
-  `/var/run` tmpfs. A configurable global `auto` or 256 KiB–100 MiB budget is
-  divided across enabled instances, dynamically capped from `MemAvailable`, and
-  compacted in a streaming pass. Older rows are read in bounded pages, critical
-  memory pressure pauses history, and no sample is written to router flash.
-- LuCI Status can export a diagnostic text bundle containing redacted
-  cake-autorate config, SQM config, runtime status, daemon logs, package
-  versions, and recent syslog lines.
-- LuCI Status shows the exact installed daemon and LuCI package versions at the
-  top of the page.
-- LuCI settings page with compact instance rows and modal tabs for detailed settings.
-- LuCI cross-field validation for manual min/base/max rates, explicit
-  download/upload interface conflicts, `ping` fallback pinger count, and
-  duplicate managed SQM section ownership.
-- LuCI and init guard against enabling an automatic IFB download interface
-  without an enabled SQM backing queue for that instance. A stray IFB created by
-  another SQM section does not satisfy the guard.
-- Managed SQM owns its target interface exclusively: the init script disables
-  conflicting unmanaged SQM queues on the same device. On systems running the
-  OpenWrt `bridger` accelerator, managed SQM devices are added to its blacklist
-  and an empty conflicting `clsact` is removed before SQM starts. Autorate now
-  also requires a real ingress redirect to its IFB, so a failed download shaper
-  cannot silently report all visible traffic in the upload direction.
-- While running, each managed instance checks the actual CAKE/IFB/ingress state.
-  If it disappears, probing and rating stop, Status reports the concrete
-  runtime error, and the Rust service-lifecycle path performs a targeted,
-  ownership-checked SQM restart through the narrow init bridge.
-  Attempts are serialized, deferred during a speed test, and rate-limited to
-  avoid a recovery loop.
-- The mandatory Status **Services** column independently reconciles configured
-  intent with daemon processes, managed SQM ownership, both CAKE qdiscs and
-  rates, IFB/redirect topology, native traffic-rule attestation, current heavy
-  operation, and guarded apply state. It exposes `HEALTHY`, `DISABLED`,
-  `DEGRADED`, `ORPHANED`, or `BLOCKED` plus the exact component-level reason.
-- Optional native profile traffic rules classify only outbound packets in the
-  private `inet cake_autorate_dscp` table. Gaming, Best overall, and Fair have
-  separate built-in defaults and editable ordered custom rules. No qosify,
-  eBPF, external qdisc owner, or free-form shell rule is used. The loaded
-  ruleset is SHA-256-attested against its instance, resolved interface, and
-  profile; Status reports missing, ineffective, drifted, and orphaned rules.
-- LuCI setup wizard for creating instances, importing SQM rates, running a
-  router-side speed test, and writing derived limits. Its normal speed-test step
-  shows only rates and the test action; backend/package/headroom controls and
-  reflector scanning are available behind `Advanced test options`. A visual
-  three-step navigator (`Interface`, `Speed test`, `Review`) also supports
-  direct validated navigation by clicking any numbered step.
-- `Full Auto-Tune` creation and re-run mode alongside the manual wizard. It
-  performs interface/route/backend preflight, reflector selection, idle ICMP
-  and native persistent-transport baselines, and one bidirectional plus two
-  download-only and two upload-only unshaped controls on a reused validated
-  server. A pure Rust calculator derives explicit
-  DL/UL min/base/max, activity and delay thresholds, link-layer overhead, and
-  bounded adaptive-ceiling limits. LuCI shows the raw evidence and complete
-  proposal before creating the instance; job state stays under `/tmp`,
-  cancellation terminates the process group, and UCI is not written before
-  confirmation. The shaped job records ICMP p95-to-p95 growth, native transport
-  p95-to-p95 growth, loss, aggregate/busiest-core/softirq CPU, CAKE counters,
-  three distinct throughput ratios, and forwarded client background before
-  restoring the previous qdisc/SQM state. Typed gates and a bounded Rust
-  per-direction optimizer search the measured quality/throughput boundary,
-  repeat unreliable observations, raise a candidate until its hard floor is
-  reachable, and confirm the exact selected pair. The public Review contract
-  carries immutable option IDs, manifest/review digests, exact tested topology
-  and rates, and the option's complete acknowledgement list. Missing or
-  structurally invalid evidence remains a hard stop; safe background,
-  retention, latency or topology exceptions are explicit-review only. No
-  acknowledgement can weaken route, SQM ownership, loss/latency, measurement,
-  or runtime-restoration gates.
-- Optional scheduled Full Auto-Tune, disabled by default, adds a quiet-time
-  gate, maintenance window, interval, RAM-only daily byte budget, and explicit
-  review-only versus validated auto-apply mode. Unattended apply requires a
-  preferred option whose Auto-Apply evidence contract passes with no required
-  acknowledgements, met profile objectives and complete restored runtime;
-  every acknowledged option remains explicit-review only.
-- LuCI instance editing keeps advanced speed test backend controls and
-  pinger/reflector planning behind the advanced settings toggle. The automatic
-  interface preset, speed-test headroom, and manual min/base/max escape hatches
-  are also hidden from basic setup. Basic speed test actions still use the
-  current unsaved interface and backend selections when those controls are
-  available.
-- When `Manual rate limits` is enabled, editing the SQM download/upload rates
-  does not overwrite the explicit autorate min/base/max values. Automatic mode
-  continues to derive base/max from SQM rates and minimums at half-rate.
-- In the LuCI edit modal, enabling the basic `Enable SQM` toggle also enables
-  `Manage SQM` for that instance so the setup page can recover disabled
-  external/imported SQM queues without visiting advanced settings.
-- `Manage SQM` defaults on to match the init-script default, and detailed SQM
-  queue/link-layer fields are hidden when the instance is not managing SQM.
-- Required LuCI value/list fields use packaged defaults when older/incomplete
-  sections lack a key, while optional fields remain optional and empty.
-- LuCI Reflectors tab can check pinger backend availability and scan configured
-  reflectors plus the upstream default anycast reflector pool, including RTT and
-  ICMP timestamp capability, without adding hard dependencies. It shows RTT/OWD
-  backend mode, install/manual-action hints, and can run `apk add fping` or
-  `apk add irtt` for supported optional backends if they are missing.
-- LuCI can apply the pinger planner recommendation into pending changes for an
-  existing instance, and the create wizard writes pinger method, active pinger
-  count, and reflector list for new instances.
-- LuCI setup tab keeps the normal path to target interface, SQM enable,
-  download/upload rates, and one-click speed testing. Explicit upstream
-  min/base/max controls remain available in advanced manual-rate mode.
-- Basic setup uses one `Enable autorate` control for both autorate and its
-  managed SQM queue. Advanced users can disable `Manage SQM` only when they
-  maintain a separate enabled SQM queue themselves.
-- Native router-side Speed Test with two user choices: `Auto` and
-  `speedtest-go`. Both resolve to the same route-bound Rust operation and the
-  Full daemon package depends on `speedtest-go`; retired librespeed, iperf3 and
-  built-in HTTP execution paths are no longer selectable. The backend tries
-  nearby servers, rejects an implausibly asymmetric automatic result, and
-  caches the first validated server per instance; entering a server ID pins
-  the test to that Ookla server. Jobs have durable identities and are polled or
-  reattached by LuCI instead of living inside an rpcd request.
-- Disabled instances are shown as `DISABLED` in LuCI and do not display stale
-  runtime counters; the init script removes stale status samples after a
-  service stop.
-- Integrated SQM backend sync: each `cake-autorate` UCI section can own a matching
-  `sqm` queue section.
-- Optional native MQTT publisher service: per-instance MQTT export reads
-  bounded SUMMARY/CPU log records, speaks MQTT 3.1.1 directly without exposing
-  credentials in a child-process argument list, and registers retained Home
-  Assistant discovery and availability records when enabled.
-- Automatic interface preset: selecting the target interface fills
-  `sqm_interface`, `ul_if`, and `dl_if=ifb4<target>`. Automatic pinger binding
-  is derived from the current route at runtime, not stored in extra arguments.
-- Automatic SQM rate import from an existing `/etc/config/sqm` queue for the
-  selected interface when available.
-- Upstream-style max-wire packet compensation for OWD thresholds and achieved
-  rate monitor timing, using live interface MTU plus CAKE `atm/noatm overhead`
-  from `tc qdisc show`.
-- Upstream-style stale reflector response guard: pinger samples processed more
-  than 500 ms after their timestamp are logged and skipped.
-- LuCI status page with start, restart, stop actions. An enabled instance that
-  has received no valid probe sample after ten seconds shows a compact
-  `No probe replies` warning with pinger/multi-WAN routing guidance.
-
-Known limits:
-
-- Adaptive ceiling is intentionally not part of upstream `cake-autorate` and is
-  an explicit opt-in. Configure absolute caps deliberately; leaving it off
-  preserves exact upstream hard-max semantics. The recommended initial tuning
-  is 20 seconds qualification, a 3% open probe, 8 seconds observation, 30
-  seconds cooldown, and 900 seconds failed-bound memory. Runtime status/logs
-  expose all phase transitions and effective-ceiling changes.
-- `pinger_method=ping` starts one basic ping process per active reflector, but
-  it remains a fallback; use `fping`, `fping-ts`, `tsping`, or explicit-server
-  `irtt` where those backends are available.
-- `pinger_method=irtt` requires the optional `irtt` package and at least one
-  explicit `list irtt_server ...` entry. Generic DNS reflector pools are not
-  used as IRTT servers. The router and IRTT servers also need synchronized
-  clocks; upstream-compatible parsing ignores negative one-way delays from
-  unsynchronized hosts.
-- `ping_prefix_string` remains available only for compatible legacy/main-route
-  setups and is always tokenized without a shell. The init script migrates the
-  exact legacy form `mwan3 use <member> exec` to structured `route_mode=mwan3`;
-  structured Multi-WAN never accepts a free-form shell prefix.
-- Native Apply, the LuCI wizard and interface presets preserve user
-  `ping_extra_args` instead of generating `-I` values. Runtime uses fping's
-  interface/source options, ping's interface option, tsping's `--interface`
-  (and route mark for mwan3), or IRTT's `--local` source-address option.
-  IRTT source binding is not an interface bind and still requires the existing
-  main/mwan3 route contract. Conflicting saved pins fail explicitly; a legacy
-  `-I` cannot safely be guessed to be generated rather than user-authored.
-  Review/remove that old pin after changing interfaces or switching to tsping.
-- `fping-ts` and `tsping` depend on reflectors that answer ICMP timestamp
-  probes; many public DNS anycast reflectors do not.
-- `tsping` is runtime-detected and not a hard package dependency; install a
-  compatible `tsping` binary manually where available before selecting it.
-- reflector health/replacement is implemented as an MVP; `fping-ts` uses
-  separate DL/UL OWD samples while RTT backends still use RTT/2 estimates.
-- The LuCI planner can scan a broader upstream default candidate pool and apply
-  the recommended pinger method, active count, and ordered reflector list.
-- Use the external LibreQoS Internet Quality Test at https://test.libreqos.com/
-  as a manual browser-side validation tool after configuring autorate. It is
-  intentionally documented only, not integrated into the wizard or router-side
-  speed test backend.
-- Pinger auto-install is intentionally limited: the GUI can install/repair the
-  supported `fping` package used by `fping`/`fping-ts` and the optional `irtt`
-  package. `tsping` remains a manual binary install, and `irtt` is only ready
-  when explicit IRTT servers are configured and clocks are synchronized.
-- Multi-WAN policy definitions, tracking targets, weights, metrics, and the
-  underlying network interfaces remain router/network configuration. Full
-  per-uplink integration requires the native nftables mwan3 backend and its
-  member-scoped status API. The application validates and consumes that state;
-  it does not invent a missing uplink or repair an invalid mwan3 policy.
-- MQTT is an optional native sidecar rather than controller authority. It
-  requires a configured plain-MQTT broker, `log_to_file=1`, and
-  `output_summary_stats=1`; CPU sensors additionally require
-  `output_cpu_stats=1`. Broker loss terminates the sidecar so procd owns retry
-  policy, while retained LWT marks the instance offline.
-
-SQM integration:
-
-- `luci-app-cake-autorate-rs` is intended to be the single LuCI UI for SQM setup
-  plus autorate control.
-- Installing the Full pair pulls `sqm-scripts`, `uclient-fetch`,
-  `nftables-json` and `speedtest-go`. `sqm-scripts` provides the normal OpenWrt
-  CAKE/IFB stack; `uclient-fetch` remains available for reflector discovery and
-  the explicitly untrusted legacy transport diagnostic, not as a speed-test
-  fallback. Full Auto-Tune transport validation uses the Rust probe.
-- The LuCI package declares `PROVIDES:=luci-app-sqm` and `CONFLICTS:=luci-app-sqm`
-  as the build-time replacement intent. Final OpenWrt 25.12 APK v3 metadata
-  verification confirms that the generator emits the provide but omits a
-  runtime conflict field. Remove the standalone `luci-app-sqm` before installing
-  this replacement; do not rely on the live APK solver to reject both UIs.
-- The UI includes the required `luci-app-sqm` settings: enable flag, interface,
-  download/upload rates, debug logging, verbosity, qdisc, queue setup script,
-  DSCP/ECN options, queue limits, latency targets, raw qdisc options, link layer
-  mode, overhead, and advanced link layer parameters.
-- `cake-autorate` UCI sections are the user-facing source of truth; the init
-  script synchronizes matching `sqm` queue sections before starting SQM and
-  autorate.
-- Stopping `cake-autorate` also stops SQM runtime state for sections marked as
-  managed by cake-autorate, leaving unrelated SQM queues alone.
-- Disabled sections and sections with `manage_sqm=0` do not mirror into SQM;
-  stale owned SQM sections are cleaned up instead.
-- Multiple interface/queue pairs are represented as multiple `cake_autorate`
-  sections and shown in one compact LuCI grid.
-
-## Runtime Dependencies
-
-Daemon package dependencies:
-
-- `uci`
-- `fping`
-- `uclient-fetch`
-- `sqm-scripts`
-- `nftables-json`
-- `speedtest-go`
-
-LuCI package dependencies:
-
-- `cake-autorate-rs`
-- `luci-base`
-- `sqm-scripts`
-- `uclient-fetch`
-- `jsonfilter`
-- `nftables-json`
-
-Lite keeps only the shared daemon dependencies: `uci`, `fping`,
-`uclient-fetch`, and `sqm-scripts` (plus `libc`). It deliberately omits the
-Full-only `nftables-json` and `speedtest-go` dependencies together with the
-calibration feature. Lite LuCI depends only on `cake-autorate-rs-lite`,
-`luci-base`, and `sqm-scripts`; it ships no ACL surface for Rating, Speed Test,
-Auto-Tune, scheduling, graph history, traffic classification or native Apply.
-
-Native WebSocket and persistent-HTTP probes, including Full Auto-Tune
-transport validation, use statically linked rustls and webpki roots and add no
-dynamic APK dependency. The diagnostic-only `legacy-http` transport backend
-can use `uclient-fetch`; normal LuCI images already provide a `libustream` TLS
-provider and CA certificates. RC27 ships only direct APK assets, so these
-dependencies must resolve through compatible configured OpenWrt feeds.
-
-`sqm-scripts` pulls the required `tc`, CAKE, IFB, iptables, and related shaping
-packages on OpenWrt.
-
-`speedtest-go` is a mandatory Full dependency. `Auto` is backend selection
-policy, not a separate implementation: it resolves to the same native
-speedtest-go path. `jsonfilter` is a mandatory Full LuCI dependency used for
-typed JSON handling.
-
-Optional pinger backend binaries:
-
-- `fping` with `--icmp-timestamp` support for `pinger_method=fping-ts`
-- `tsping`
-- `irtt` for `pinger_method=irtt`, with explicit `irtt_server` entries
-
-The daemon accepts `pinger_method=tsping` when the binary is present in PATH and
-`pinger_method=irtt` when `irtt` is installed and explicit IRTT servers are
-configured. IRTT OWD samples require the router and IRTT server clocks to be
-synchronized; negative one-way delays are ignored to match upstream behavior.
-`tsping` remains optional because no supported OpenWrt package was available on
-the current test router. The advanced LuCI Reflectors tab can check pinger
-backend availability, show RTT/OWD and round-robin/individual mode, install
-supported `fping`/`irtt` packages when needed, scan reflectors, and apply the
-recommendation into pending changes. If `tsping` is manually installed, the
-planner can use it as the timestamp probe path when `fping --icmp-timestamp` is
-unavailable. The create wizard writes pinger defaults and can run the same scan
-before creating a new instance.
-
-### Unreleased source: configuration validation foundation
-
-The audit-remediation parser separates pure per-instance values from reflector
-URL loading, global history reads and interface discovery. Non-finite numbers,
-inverted rate/threshold tuples, invalid factors and unbounded detection windows
-are rejected before those discovery steps. Full and Lite now validate the
-parsed LuCI candidate before saving. Source/browser checks do not replace the
-remaining installed-RPCd, real-UCI, lifecycle and device acceptance gates.
-
-Detection windows retain their configured length, not allocator capacity.
-Native windows are limited to4096 samples, with a1MiB logical sample budget for
-combined controller/reflector history (not a measured RSS bound). Parallel
-pingers use the existing Lite limit of64; the minimum ping interval is0.05s.
-Core timer intervals fit the signed32-bit millisecond domain (about24.9days).
-A disabled direction may retain a valid min/base/max tuple or use all zero;
-mixed zero tuples are invalid. Existing meaningful defaults remain unchanged.
-
-Full/Lite rate-triplet feedback uses native-exported bounds and defaults instead
-of separate UI rate floors. Decimal and scientific notation are parsed strictly;
-trailing junk and non-finite values are rejected. Other scalar and cross-field
-constraints are checked by the same native candidate validator before saving,
-including activity thresholds, positive timers, coefficient order and bounded
-windows. A form accepting typed input is not itself permission to save or apply.
-
-An unreleased stdin-only `--validate-config-candidate` entry point checks
-submitted controller and managed-SQM intent and returns a versioned JSON result.
-Its `validation_scope` is `controller-sqm`, not complete lifecycle/Apply
-acceptance. It performs no UCI reads, reflector requests, temporary-file writes
-or service actions. MQ admission reads local script and boot/tool/module-bound
-proof; it never launches a capability probe as a side effect of validation.
-
-The Full/Lite SQM selector offers CAKE and, after verification, multi-queue
-CAKE. SQM receives `qdisc=cake` plus `use_mq=1`, not the legacy `cake-mq` name.
-Legacy `cake-mq`/`cake_mq` intent and retained SQM `use_mq` remain visible;
-an explicit single-queue choice writes `sqm_use_mq=0`. An unverified saved MQ
-choice is shown with a warning, not silently disabled or offered as a new
-supported choice. Native projection also rejects unsupported qdiscs and MQ.
-
-"Verify multi-queue support" checks the selected script declaration and probes
-kernel/tc using one private, down IFB with two queues. It generates no test
-traffic, assigns no address, and does not alter existing interfaces or queues.
-An owned receipt is written before creation; cleanup must finish before support
-is published. Interrupted cleanup is recovered before another probe can start.
-Proof does not survive a changed boot, tc or kernel module identity. Authorized
-mutating startup/Apply preparation refreshes missing proof before applying the
-SQM projection; read-only status, dry-run and candidate validation never do so.
-Successful source tests are not proof of support on a particular router.
-
-The native chunk-transfer bridge is also under source validation. It stages
-at most four256KiB candidates in a private0700 directory with0600 files, using
-1024-byte chunks, immutable request/length/SHA-256 identity and idempotent chunk
-replay. Terminal validation/cancel removes the record. Admission expires after
-120seconds; interrupted leftovers are retired on the next transfer request,
-not by a new polling daemon. The namespace is excluded from diagnostic export.
-This controlled staging does not grant LuCI general file-write authority.
-
-### Unreleased source: Stop with pending configuration
-
-Ordinary Stop now captures committed `cake-autorate` and `sqm` through private,
-random UCI package aliases. It retains that snapshot for planning and SQM stop
-checks, preserving unrelated default/rpcd savedir contents. Changed committed
-files, native Apply recovery, busy lifecycle ownership and unsafe runtime state
-remain refusals. This is not permission to commit or revert pending settings.
-Safe busy/stop diagnostics also reach stderr for LuCI, while rc.common's
-fail-closed exit remains in place.
-
-Start still uses its existing staged-change guards pending the separate R4
-isolated-transaction work. Stop source/fixture checks do not replace installed
-RPCd, running-service, package-upgrade and physical-device acceptance.
-
-The unreleased source also has a journaled two-package file publisher and a
-private controller-input consumer. The latter keeps controller argv unchanged:
-an internal procd environment value identifies a content-bound generation.
-Missing, corrupt or mismatched input never falls back to ordinary UCI. Input
-files are private and excluded from diagnostic export; their producer, runtime
-acceptance, retirement and scoped SQM Start still require lifecycle integration.
-These components are not a completed Start cutover or a deployment claim.
-
-### Unreleased source: bounded daemon logging
-
-The audit-remediation source keeps one active `cake-autorate.<instance>.log`
-and one plain-text `.old` file. Each is limited by `log_file_max_size_KB`
-(2000 KiB by default), with a hard maximum of16384 KiB per file even when the
-configured value is zero. Records are UTF-8-safe and bounded; oversized existing
-logs retain only a bounded complete-record tail with a truncation marker.
-The private zero-byte `.lock` file serializes writers; a bounded `.tmp` file may
-exist during compaction. Neither is included in diagnostic downloads.
-
-Rotation no longer runs gzip or logger in the controller loop. SYSLOG/ERROR
-messages also reach procd stderr; repeated file-write failures are throttled.
-If file logging cannot open safely, the controller reports that failure and
-continues with system logging. MQTT drains unread data from its old descriptor
-before switching to the replacement file, in bounded event-loop batches.
-
-Old numeric timestamp archives belonging to the configured log basename are
-removed in bounded startup/write batches. Unrelated names, symlinks, hardlinks
-and foreign-owned files are preserved. Large pre-existing archive collections
-may therefore require several batches; normal rotation never creates more.
-Legacy `log_file_export_compress` values remain readable for compatibility but
-do not enable runtime compression. LuCI diagnostic downloads remain plain text,
-including safely decoded older gzip archives.
-
-The LuCI Logging tab validates the built-in native MQTT publisher. No external
-MQTT client package is needed. After setting `mqtt_enabled=1`, `mqtt_host`, and
-the required summary logging options, restart `cake-autorate`; its Full-only
-MQTT sidecar creates Home Assistant discovery sensors and publishes instance
-state under the configured base topic.
-
-## Build In OpenWrt SDK
-
-Use a clean OpenWrt 25.12 SDK whose package architecture matches the required
-APK suffix. The Rust feed builds a large host Rust/LLVM toolchain on first use,
-so cache the SDK or use a prepared build image for normal iteration.
-
-Recommended feed workflow:
-
-```sh
-cd /path/to/openwrt-sdk
-cp feeds.conf.default feeds.conf
-cat /path/to/cake-autorate-rs/feeds.conf.example >> feeds.conf
-./scripts/feeds update packages luci
-./scripts/feeds update cake_autorate_rs
-./scripts/feeds install rust fping luci-base
-./scripts/feeds install cake-autorate-rs luci-app-cake-autorate-rs
-make defconfig
-make package/cake-autorate-rs/compile V=s -j1
-make package/luci-app-cake-autorate-rs/compile V=s -j1
-```
-
-For the manual-only variant, select/build `cake-autorate-rs-lite` and
-`luci-app-cake-autorate-rs-lite` instead. The daemon is compiled with Rust
-default features disabled, so this is a real smaller binary rather than only a
-hidden menu:
-
-```sh
-./scripts/feeds install cake-autorate-rs-lite luci-app-cake-autorate-rs-lite
-make package/cake-autorate-rs/compile V=s -j1
-make package/luci-app-cake-autorate-rs-lite/compile V=s -j1
-```
-
-Overlay workflow during local development:
-
-```sh
-cp -a package/cake-autorate-rs /path/to/openwrt-sdk/package/
-cp -a package/luci-app-cake-autorate-rs /path/to/openwrt-sdk/package/
-cp -a package/luci-app-cake-autorate-rs-lite /path/to/openwrt-sdk/package/
-```
-
-Enable packages in `.config` when building as modules:
-
-```text
-CONFIG_PACKAGE_cake-autorate-rs=m
-CONFIG_PACKAGE_luci-app-cake-autorate-rs=m
-CONFIG_PACKAGE_fping=m
-CONFIG_PACKAGE_rust=m
-```
-
-For Lite select `CONFIG_PACKAGE_cake-autorate-rs-lite=m` and
-`CONFIG_PACKAGE_luci-app-cake-autorate-rs-lite=m` instead of the two Full
-package symbols.
-
-## Install
-
-Copy the matching daemon APK plus the noarch LuCI APK to the router and install
-them together. Determine the daemon suffix first:
-
-```sh
-apk --print-arch
-```
-
-If the standalone SQM LuCI application is installed, remove only that UI
-package first; keep `sqm-scripts`, which is a required runtime dependency:
-
-```sh
-apk info -e luci-app-sqm && apk del luci-app-sqm
-```
-
-For example, when it prints `aarch64_generic`:
-
-```sh
-apk add --allow-untrusted \
-  /root/cake-autorate-rs-1.0_rc27-r318_openwrt-25.12_aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-1.0_rc27-r127.apk
-```
-
-For a small manual-only installation, use the matching Lite pair instead:
-
-```sh
-apk add --allow-untrusted \
-  /root/cake-autorate-rs-lite-1.0_rc27-r318_openwrt-25.12_aarch64_generic.apk \
-  /root/luci-app-cake-autorate-rs-lite-1.0_rc27-r7.apk
-```
-
-Changing variants is a package replacement, not an in-place feature toggle.
-Back up `/etc/config/cake-autorate`, simulate the exact transaction first, and
-install one complete pair. Moving to Lite preserves manual instance settings
-but intentionally removes the rating/Auto-Tune services and their LuCI pages.
-
-The two pairs conflict, so `apk` cannot swap them in one transaction. When the
-current pair was installed from files, its runtime dependencies (`sqm-scripts`,
-`fping`, CAKE/IFB kernel modules and `tc`) are only implicit and `apk del`
-would purge them together with the old pair. Mark the shared ones as explicit
-first; this downloads nothing when they are already installed:
-
-```sh
-cp /etc/config/cake-autorate /root/cake-autorate.backup
-apk add sqm-scripts fping
-apk del --simulate luci-app-cake-autorate-rs cake-autorate-rs   # must list only these two
-apk del luci-app-cake-autorate-rs cake-autorate-rs
-apk add --allow-untrusted /root/cake-autorate-rs-lite-*.apk /root/luci-app-cake-autorate-rs-lite-*.apk
-```
-
-Use the mirrored names to return from Lite to Full.
-
-`fping` and `sqm-scripts` are pulled automatically. Optional pinger backends:
-
-```sh
-# fping-ts uses the installed fping binary; no extra package is required
-apk add irtt  # also configure explicit IRTT servers and synchronized clocks
-# tsping is a compatible binary installed manually; ping is supplied by the base system
-```
-
-The release intentionally contains only these direct APKs. The router must
-have working OpenWrt 25.12 package feeds so `apk` can resolve runtime
-dependencies. Use `apk add --simulate` with the same two paths first when
-checking a custom image or feed configuration.
-
-The Full daemon already depends on `speedtest-go`; `Auto` and `speedtest-go`
-therefore require no additional backend installation. Lite intentionally has
-no Speed Test backend or calibration UI.
-
-Fresh installs contain no autorate instance and do not create an SQM queue.
-Create the first one in **Network → CAKE Autorate SQM → Settings** as described
-in the [quick setup guide](SETUP_GUIDE.md). A native Full Auto-Tune Review is
-applied by its own **Apply selected option** action and reloads authoritative
-UCI automatically; a manual wizard result still uses ordinary **Create** then
-**Save & Apply**. Existing package upgrades retain all configured instances.
-To enable an already-created instance named `wan_sqm` from SSH:
-
-```sh
-uci set cake-autorate.wan_sqm.enabled='1'
-uci commit cake-autorate
-/etc/init.d/cake-autorate enable
-/etc/init.d/cake-autorate restart
-```
-
-Graph history is opt-in per instance. The same switch is available on the
-LuCI `Graphs` page; from the shell it can be changed with:
-
-```sh
-uci set cake-autorate.wan_sqm.graph_history_enabled='1'  # use '0' to disable
-uci set cake-autorate.wan_sqm.graph_history_interval_s='10'  # accepted: 1-60
-uci set cake-autorate.globals.graph_history_ram_budget_kib='auto'
-uci commit cake-autorate
-/etc/init.d/cake-autorate restart
-```
-
-When enabled, `history.csv` is sampled at the selected interval under
-`/var/run/cake-autorate/<instance>/`. Each row contains timestamp, RTT,
-transport/effective latency, total CPU, download/upload kbit/s, safety floors,
-rating phase and directional sample counts, plus a detected-grade event when
-one changes. The global budget accepts `auto`
-or one of `256`, `512`, `1024`, `2048`, `4096`, `8192`, `16384`, `32768`,
-`65536`, and `102400` KiB. The daemon caps that request according to available
-RAM and divides the effective total across enabled histories. For example,
-roughly 100 MiB available permits at most 1 MiB total, while 1 GiB permits at
-most 100 MiB. At less than 16 MiB available, collection pauses and releases its
-history. Files are removed on service stop/reboot and never stored in flash.
-
-## Quick Checks
-
-```sh
-cake-autorated --instance wan_sqm --dump-config
-cake-autorated --instance wan_sqm --once
-cat /var/run/cake-autorate/wan_sqm/status.json
-/usr/sbin/cake-autorated --calibrationctl summary
-/usr/sbin/cake-autorated --calibrationctl speedtest-current wan_sqm
-/usr/sbin/cake-autorated --calibrationctl rating-current wan_sqm
-/usr/sbin/cake-autorated --mqtt-status wan_sqm status
-/usr/sbin/cake-autorated --cpu-profile 30
-```
-
-`*-current` reports either the exact current operation or `state=idle`.
-Job-specific `*-status`, `*-result`, and `*-cancel` commands require the public
-job ID returned by the corresponding Start operation. These calibration
-commands are intentionally unavailable in Lite.
-
-For a no-shaper smoke test, disable both shaper adjustment flags:
-
-```sh
-uci set cake-autorate.wan_sqm.adjust_dl_shaper_rate='0'
-uci set cake-autorate.wan_sqm.adjust_ul_shaper_rate='0'
-uci commit cake-autorate
-cake-autorated --instance wan_sqm --once
-```
-
-For `ping` fallback and CPU/log smoke tests, use a temporary disabled-rate
-instance with explicit counter paths, `adjust_dl_shaper_rate='0'`,
-`adjust_ul_shaper_rate='0'`, `pinger_method='ping'`, `output_cpu_stats='1'`,
-and a temporary `log_file_path_override`.
-
-## Development Notes
-
-Rust is a reasonable daemon language for this project because it provides one static-ish native binary, predictable memory safety, and better long-term maintainability than a large shell daemon. The main practical cost on OpenWrt is build complexity: the first SDK build of `rust/host` is heavy because it compiles Rust/LLVM tooling.
-
-For faster iteration, keep a cached SDK or CI artifact with the Rust host toolchain already built.
-
-## Optional external IPv4 lookup
-
-External-address lookup is disabled by default in Full and Lite. Existing
-instances with no `external_ip_check_enabled` option also make no lookup.
-Enable it explicitly in Full's Advanced options or Lite's Connection tab only
-if you want this additional route metadata. The HTTPS service sees your public
-address and request times. This setting does not disable other independently
-configured latency probes, reflector-list downloads, or user-requested tests.
-
-Per-instance options:
-
-- `external_ip_check_enabled`: `0` by default, `1` to enable.
-- `external_ip_check_url`: defaults to `https://api.ipify.org`; use an HTTPS
-  host/path returning one plain IPv4 address, without credentials, query or
-  fragment. URLs are limited to 1024 ASCII bytes.
-- `external_ip_check_interval_s`: defaults to 3600 seconds; range 60–604800.
-
-When enabled, a lookup starts only on an admitted route, with at most one
-request in flight. Failures and route changes do not bypass the interval in
-the running daemon. A daemon restart starts a new interval schedule. Each
-fetch has a five-second total execution deadline and a 1024-byte output bound;
-surrounding route inspection uses the existing route helpers. Failed or stale
-results do not prevent ordinary rate control, and external address metadata
-does not replace the device/source/mark/table route identity. No external IP
-lookup is needed to run the controller.

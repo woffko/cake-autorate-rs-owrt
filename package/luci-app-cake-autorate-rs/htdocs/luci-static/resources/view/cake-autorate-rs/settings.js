@@ -3902,7 +3902,8 @@ function autotuneTrafficPolicyControl(state, instance, disabled) {
 	updateEstimate();
 	return E('div', { 'id': 'cake-autotune-traffic-' + instance }, [
 		mode, amountRow,
-		E('p', {}, cakeUi.text(_('Applies to this test only. All stages share the budget; Cancel and the 45-minute deadline always apply.'))),
+		E('p', {}, [ cakeUi.text(_('Applies to this test only. All stages share the budget; Cancel and the 45-minute deadline always apply.')),
+			' ', cakeUi.docsLink('test-traffic-budget-and-server-qualification') ]),
 		E('p', { 'class': 'cake-autotune-dns-accounting' }, cakeUi.text(_('Counts this test\'s own traffic. DNS through the router\'s shared resolver is estimated, not metered exactly.'))),
 		estimateText
 	].concat(cappedRows).concat([
@@ -6508,7 +6509,8 @@ function showCreateWizard(grid, name, existingName) {
 							render();
 						})
 				]),
-				_('The profile sets the latency target and how much throughput Auto-Tune may trade for it. Results that miss the goals are never auto-applied but can still be reviewed.')),
+				[ cakeUi.text(_('The profile sets the latency target and how much throughput Auto-Tune may trade for it. Results that miss the goals are never auto-applied but can still be reviewed.')),
+					' ', cakeUi.docsLink('full-auto-tune') ]),
 			E('div', { 'class': 'alert-message warning' }, [
 				E('strong', {}, _('Traffic warning: ')),
 				_('Full Auto-Tune runs repeated download and upload tests on this uplink and can use a lot of data. Other WAN traffic may lower confidence but is never counted as test throughput.')
@@ -7785,9 +7787,10 @@ function addSetupOptions(section) {
 	o = section.taboption('setup', form.DummyValue, '_explicit_route_note', ' ');
 	modal(o);
 	o.depends('route_mode', 'explicit');
-	o.rawhtml = false;
+	o.rawhtml = true;
 	o.cfgvalue = function() {
-		return _('Full package only. Uses an existing policy route (source, table, mark); it never creates VPNs, rules or tables. If the route stops matching, probes and tests stop instead of using the main table. Speed Test and Auto-Tune also need Route DNS IPv4.');
+		return E('span', {}, [ cakeUi.text(_('Full package only. Uses an existing policy route (source, table, mark); it never creates VPNs, rules or tables. If the route stops matching, probes and tests stop instead of using the main table. Speed Test and Auto-Tune also need Route DNS IPv4.')),
+			' ', cakeUi.docsLink('explicit-policy-route') ]);
 	};
 
 	o = section.taboption('setup', form.ListValue, 'mwan3_member', _('mwan3 member'));

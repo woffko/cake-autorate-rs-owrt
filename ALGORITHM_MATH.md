@@ -929,4 +929,4 @@ limits enabled the speed write does not replace the min/base/max tuple.
   that floor.
 
 See [ADAPTIVE_CEILING.md](ADAPTIVE_CEILING.md) for the compact state-machine
-contract and [TESTING.md](TESTING.md) for measured behavior.
+contract and the [testing archive](TESTING_ARCHIVE.md) for measured behavior.
