@@ -161,11 +161,17 @@ Each instance has an uplink lifecycle independent of its controller state:
 
 | State | Meaning | Controller behavior |
 |---|---|---|
-| `ACTIVE` | Member is online and selected by the default mwan3 policy | Normal probing and autorate control |
+| `ACTIVE` | Member routes traffic (`online`, or `disconnecting` while mwan3 still routes through it) and is selected by the default mwan3 policy | Normal probing and autorate control |
 | `STANDBY` | Member is online but has a zero policy share | Forced probes remain admitted and isolated to this member; ordinary idle policy still applies |
 | `OFFLINE` | A successful inspection explicitly reports an offline or mismatched route | Stop pingers and freeze adjustment without adding reflector offences |
-| `RECHECKING` | Inspection failed or member state is transient/unknown | Revoke route admission while preserving the last learned identity |
+| `RECHECKING` | Inspection failed or member state is `connecting`/unknown | Revoke route admission while preserving the last learned identity |
 | `LEARNING` | Route recovered or changed and its baseline is being rebuilt | Wait for matching identity confirmation, then probe; baseline qualification still gates control |
+
+mwan3 changes its policy rules only when a member goes `offline`; a member
+whose tracker reports `disconnecting` is failing checks but still carries the
+route, so the daemon keeps it active. Only `connecting` (not yet routed) and
+`offline` revoke admission. Short tracker flaps therefore no longer interrupt
+autorate control or restore a running Full Auto-Tune.
 
 The daemon derives active/standby from the configured default mwan3 policy,
 not merely from the Linux main-table default route. This is important during
@@ -338,6 +344,15 @@ cat /var/run/cake-autorate/wan_sqm/status.json
 tc qdisc show dev pppoe-wan
 tc qdisc show dev ifb4pppoe-wan
 ```
+
+A Full raw test saturates the uplink without CAKE, so loaded latency and
+ping loss rise. A strict tracker (one ping per check, a short timeout or a
+low `failure_latency`) can then mark the member offline. For uplinks that run
+raw tests, prefer a tolerant tracker, for example `count 3`, `timeout 4`,
+`down 5` and `failure_latency 2000`. If mwan3 still takes the member offline
+during a measurement, Auto-Tune restores the runtime, waits for the same
+route to return and repeats the interrupted measurement; the traffic of the
+interrupted attempt stays counted.
 
 The exported diagnostic bundle includes redacted topology, route identity,
 mwan3 state, qdisc state, and runtime status. It omits credentials and never

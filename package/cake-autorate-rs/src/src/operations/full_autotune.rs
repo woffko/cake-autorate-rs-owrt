@@ -13608,6 +13608,26 @@ where
     }
 }
 
+/// The runtime owner began restoring this exact control while a measurement
+/// was running (for example after a route change). The measurement loop turns
+/// this into a route re-arm request; the runtime owner accepts a re-arm only
+/// after a route-drift restoration and rejects every other reason, which
+/// still ends the run.
+const ACCOUNTING_EPOCH_RUNTIME_RESTORING: &str =
+    "native Auto-Tune private accounting epoch changed: runtime-restoring";
+
+fn runtime_restoring_same_control(
+    ack: Option<&AutotuneRuntimeAck>,
+    control: &AutotuneRuntimeControl,
+) -> bool {
+    ack.is_some_and(|ack| {
+        matches!(
+            ack.state,
+            RuntimeAckState::Restoring | RuntimeAckState::Restored
+        ) && runtime_ack_matches_control_identity(ack, control)
+    })
+}
+
 fn attest_private_accounting_epoch(
     operation: &OperationRequest,
     permit: &AutotuneRuntimePermit,
@@ -13630,7 +13650,15 @@ fn attest_private_accounting_epoch(
         Some("permit")
     } else if store.read_control()?.as_ref() != Some(control) {
         Some("control")
-    } else if store.read_ack()?.as_ref() != Some(expected_ack) {
+    } else if let Some(current) = {
+        let current = store.read_ack()?;
+        (current.as_ref() != Some(expected_ack)).then_some(current)
+    } {
+        if runtime_restoring_same_control(current.as_ref(), control)
+            && store.read_restore_intent()?.is_none()
+        {
+            return Err(ACCOUNTING_EPOCH_RUNTIME_RESTORING.to_string());
+        }
         Some("ack")
     } else if store.read_checkpoint()?.as_ref() != Some(expected_checkpoint) {
         Some("checkpoint")
@@ -14802,6 +14830,14 @@ fn run_directional_capture_load_with_session(
         );
         let (terminal, sample) = match speedtest_outcome {
             Ok(value) => value,
+            // The runtime owner is restoring this control; let the measurement
+            // loop re-arm it after the route recovers. The interrupted run's
+            // traffic is already charged.
+            Err(error) if error == ACCOUNTING_EPOCH_RUNTIME_RESTORING => {
+                return Err(CaptureWaitError::Rejected(
+                    "capture-runtime-mismatch".to_string(),
+                ));
+            }
             Err(error) => {
                 match directional_load_error_disposition(&error, unmeasurable_runs, retry_limit) {
                     DirectionalLoadErrorDisposition::Retry {
@@ -23541,6 +23577,82 @@ mod tests {
         assert!(!failure.requires_route_rearm());
         assert_eq!(String::from(failure), "server-or-link-capacity-changed");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_restoring_the_running_control_requests_a_route_rearm() {
+        let control = AutotuneRuntimeControl {
+            permit_id: "11".repeat(16),
+            job_id: "22".repeat(16),
+            worker_run_id: "33".repeat(16),
+            boot_id: "44".repeat(16),
+            coordinator_generation: "55".repeat(16),
+            worker: ProcessIdentity {
+                pid: 10,
+                process_group: 10,
+                starttime_ticks: 100,
+            },
+            sequence: 4,
+            deadline_boot_ms: 900_000,
+            target_interface: "pppoe-wan".to_string(),
+            route_fingerprint: "66".repeat(32),
+            sqm_fingerprint: "77".repeat(32),
+            topology: MeasurementTopology::RawDownload,
+            download_kbps: None,
+            upload_kbps: Some(900_000),
+        };
+        let ack = |state, sequence| AutotuneRuntimeAck {
+            permit_id: control.permit_id.clone(),
+            job_id: control.job_id.clone(),
+            worker_run_id: control.worker_run_id.clone(),
+            sequence,
+            updated_boot_ms: 500_000,
+            target_interface: control.target_interface.clone(),
+            route_fingerprint: control.route_fingerprint.clone(),
+            sqm_fingerprint: control.sqm_fingerprint.clone(),
+            state,
+            topology: None,
+            download_kbps: None,
+            upload_kbps: None,
+            diagnostic_code: None,
+        };
+        // A route drift makes the runtime owner restore the running control;
+        // that is a re-arm request, not a broken accounting epoch.
+        for state in [RuntimeAckState::Restoring, RuntimeAckState::Restored] {
+            assert!(runtime_restoring_same_control(
+                Some(&ack(state, 4)),
+                &control
+            ));
+        }
+        // Anything else stays a fatal epoch change.
+        assert!(!runtime_restoring_same_control(None, &control));
+        assert!(!runtime_restoring_same_control(
+            Some(&ack(RuntimeAckState::Restoring, 5)),
+            &control
+        ));
+        assert!(!runtime_restoring_same_control(
+            Some(&ack(RuntimeAckState::Rejected, 4)),
+            &control
+        ));
+        let mut foreign = ack(RuntimeAckState::Restoring, 4);
+        foreign.job_id = "88".repeat(16);
+        assert!(!runtime_restoring_same_control(Some(&foreign), &control));
+        let mut moved = ack(RuntimeAckState::Restored, 4);
+        moved.route_fingerprint = "99".repeat(32);
+        assert!(!runtime_restoring_same_control(Some(&moved), &control));
+        // The measurement loop maps the restoring epoch to the existing
+        // route re-arm path; a plain epoch change is not transient.
+        assert_eq!(
+            directional_load_error_disposition(ACCOUNTING_EPOCH_RUNTIME_RESTORING, 0, 10),
+            DirectionalLoadErrorDisposition::Fatal
+        );
+        assert!(
+            CaptureWaitError::Rejected("capture-runtime-mismatch".into()).requires_route_rearm()
+        );
+        let source = include_str!("full_autotune.rs");
+        assert!(source.contains(
+            "Err(error) if error == ACCOUNTING_EPOCH_RUNTIME_RESTORING => {\n                return Err(CaptureWaitError::Rejected(\n                    \"capture-runtime-mismatch\".to_string(),"
+        ));
     }
 
     #[test]
