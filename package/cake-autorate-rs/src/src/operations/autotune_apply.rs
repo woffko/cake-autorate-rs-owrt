@@ -53,6 +53,10 @@ pub(crate) enum NativeApplyAcknowledgement {
     TopologyComparisonUnmeasurable,
     DownloadRawBelowServerComparison,
     UploadRawBelowServerComparison,
+    DownloadSearchIncomplete,
+    UploadSearchIncomplete,
+    DownloadShapedLoadUnmeasured,
+    UploadShapedLoadUnmeasured,
 }
 
 impl NativeApplyAcknowledgement {
@@ -87,6 +91,10 @@ impl NativeApplyAcknowledgement {
             Self::TopologyComparisonUnmeasurable => "topology-comparison-unmeasurable",
             Self::DownloadRawBelowServerComparison => "download-raw-below-server-comparison",
             Self::UploadRawBelowServerComparison => "upload-raw-below-server-comparison",
+            Self::DownloadSearchIncomplete => "download-search-incomplete",
+            Self::UploadSearchIncomplete => "upload-search-incomplete",
+            Self::DownloadShapedLoadUnmeasured => "download-shaped-load-unmeasured",
+            Self::UploadShapedLoadUnmeasured => "upload-shaped-load-unmeasured",
         }
     }
 
@@ -121,6 +129,10 @@ impl NativeApplyAcknowledgement {
             "topology-comparison-unmeasurable" => Self::TopologyComparisonUnmeasurable,
             "download-raw-below-server-comparison" => Self::DownloadRawBelowServerComparison,
             "upload-raw-below-server-comparison" => Self::UploadRawBelowServerComparison,
+            "download-search-incomplete" => Self::DownloadSearchIncomplete,
+            "upload-search-incomplete" => Self::UploadSearchIncomplete,
+            "download-shaped-load-unmeasured" => Self::DownloadShapedLoadUnmeasured,
+            "upload-shaped-load-unmeasured" => Self::UploadShapedLoadUnmeasured,
             _ => return None,
         })
     }
@@ -237,6 +249,15 @@ pub(crate) struct NativeDirectionalRawFallbackApplyManifestInput<'a> {
     pub required_acknowledgements: &'a [NativeApplyAcknowledgement],
     pub proposal_digest: &'a str,
     pub raw_fallback_digest: &'a str,
+}
+
+/// Review options built from an incomplete shaped search: an exact, measured
+/// CAKE rate pair with explicit acknowledgements of what was not measured.
+pub(crate) fn is_partial_shaped_option(option_id: &str) -> bool {
+    matches!(
+        option_id,
+        "partial_quality_first" | "partial_throughput_first"
+    )
 }
 
 pub(crate) struct NativeShapedCapacityFallbackApplyManifestInput<'a> {
@@ -926,7 +947,8 @@ impl NativeApplyExecutionPlan {
     pub(crate) fn from_verified_shaped_capacity_fallback(
         input: NativeShapedCapacityFallbackApplyManifestInput<'_>,
     ) -> Result<Self, String> {
-        if input.option_id != "capacity_only_shaped"
+        let partial = is_partial_shaped_option(input.option_id);
+        if (input.option_id != "capacity_only_shaped" && !partial)
             || input.selected_dl_kbps == 0
             || input.selected_ul_kbps == 0
         {
@@ -943,12 +965,21 @@ impl NativeApplyExecutionPlan {
         let mut acknowledgements = input.required_acknowledgements.to_vec();
         acknowledgements.sort_unstable();
         acknowledgements.dedup();
-        if acknowledgements != input.required_acknowledgements
-            || acknowledgements
-                != [
+        let exact = if partial {
+            // A partial search keeps its measured trade-offs; it is never a
+            // loaded-latency-unobservable capacity fallback.
+            acknowledgements.contains(&NativeApplyAcknowledgement::ShapedValidationIncomplete)
+                && !acknowledgements
+                    .contains(&NativeApplyAcknowledgement::LoadedLatencyUnobservable)
+        } else {
+            acknowledgements
+                == [
                     NativeApplyAcknowledgement::LoadedLatencyUnobservable,
                     NativeApplyAcknowledgement::ShapedValidationIncomplete,
                 ]
+        };
+        if acknowledgements != input.required_acknowledgements
+            || !exact
             || acknowledgements.iter().any(|value| {
                 matches!(
                     value,

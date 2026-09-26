@@ -1018,6 +1018,97 @@ nativeSchemaSixNoSqm.native_public_schema_version = 6;
 assert.equal(helpers.nativeAutotunePublicResultValidated(nativeSchemaSixNoSqm), false,
 	'public schema 6 is reserved for the exact shaped-capacity option');
 
+function nativePartialShapedFallbackPublicFixture() {
+	const result = nativeRawFallbackPublicFixture();
+	const quality = [ 'shaped-validation-incomplete', 'upload-search-incomplete',
+		'upload-shaped-load-unmeasured' ];
+	const throughput = quality.concat([ 'download-icmp-latency' ]);
+	result.native_public_schema_version = 7;
+	result.artifacts.raw_fallback.value.failed_direction = 'upload';
+	result.artifacts.raw_fallback.value.discarded_shaped_observation_count = 2;
+	result.artifacts.raw_fallback.value.shaped_options = [ {
+		option_id: 'partial_quality_first', preferred: true, measured_direction: 'download',
+		selected_rates_kbps: { download: 800000, upload: 909200 }, achieved_kbps: 781000,
+		effective_delta_ms: 2.5, grade: 'A+', target_met: true,
+		required_acknowledgements: quality.slice(),
+	}, {
+		option_id: 'partial_throughput_first', preferred: false, measured_direction: 'download',
+		selected_rates_kbps: { download: 880000, upload: 909200 }, achieved_kbps: 861000,
+		effective_delta_ms: 9.5, grade: 'A', target_met: false,
+		required_acknowledgements: throughput.slice(),
+	} ];
+	const option = (id, preferred, rates, acknowledgements) => ({
+		option_id: id, preferred, manifest_sha256: (preferred ? '8' : '9').repeat(64),
+		selected_topology: 'both_shaped', action: 'apply_sqm', sqm_direction_mode: 'both',
+		target_rates_kbps: rates, auto_apply_evidence_pass: false, manual_review_required: true,
+		required_acknowledgements: acknowledgements.slice(),
+	});
+	const disabled = result.public_apply_contract.options[0];
+	disabled.preferred = false;
+	result.public_apply_contract.options = [
+		option('partial_quality_first', true, { download: 800000, upload: 909200 }, quality),
+		option('partial_throughput_first', false, { download: 880000, upload: 909200 }, throughput),
+		disabled,
+	];
+	return result;
+}
+
+const nativePartialShaped = nativePartialShapedFallbackPublicFixture();
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativePartialShaped), true,
+	'an incomplete search must expose its measured CAKE options next to SQM disabled');
+for (const code of [ 'download-search-incomplete', 'upload-search-incomplete',
+	'download-shaped-load-unmeasured', 'upload-shaped-load-unmeasured' ])
+	assert.notEqual(helpers.nativeAutotuneAcknowledgementLabel(code), code,
+		`${code} must explain what was not measured`);
+assert.match(helpers.nativeAutotuneAcknowledgementLabel('upload-shaped-load-unmeasured'),
+	/not measured under load with CAKE/i);
+const nativePartialOne = JSON.parse(JSON.stringify(nativePartialShaped));
+nativePartialOne.artifacts.raw_fallback.value.shaped_options.pop();
+nativePartialOne.public_apply_contract.options.splice(1, 1);
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativePartialOne), true,
+	'one measured CAKE option is enough when lowest latency and highest throughput coincide');
+const partialMutations = [
+	[ 'SQM disabled cannot stay preferred next to a CAKE option',
+		value => { value.public_apply_contract.options[2].preferred = true;
+			value.public_apply_contract.options[0].preferred = false;
+			value.artifacts.raw_fallback.value.shaped_options[0].preferred = false; } ],
+	[ 'the browser cannot change a measured CAKE rate',
+		value => { value.public_apply_contract.options[0].target_rates_kbps.download += 1; } ],
+	[ 'every CAKE option must admit its missing validation',
+		value => { value.public_apply_contract.options[0].required_acknowledgements.shift();
+			value.artifacts.raw_fallback.value.shaped_options[0].required_acknowledgements.shift(); } ],
+	[ 'an option acknowledgement must match the Rust evidence',
+		value => { value.public_apply_contract.options[1].required_acknowledgements.pop(); } ],
+	[ 'public schema 7 requires shaped options in the artifact',
+		value => { delete value.artifacts.raw_fallback.value.shaped_options; } ],
+	[ 'a CAKE option cannot bypass shaping',
+		value => { value.public_apply_contract.options[0].sqm_direction_mode = 'download_only'; } ],
+	[ 'CAKE options need one exact preference',
+		value => { value.public_apply_contract.options[1].preferred = true;
+			value.artifacts.raw_fallback.value.shaped_options[1].preferred = true; } ],
+	[ 'an unknown partial option is rejected',
+		value => { value.public_apply_contract.options[1].option_id = 'partial_other';
+			value.artifacts.raw_fallback.value.shaped_options[1].option_id = 'partial_other'; } ],
+];
+for (const [message, mutate] of partialMutations) {
+	const value = JSON.parse(JSON.stringify(nativePartialShaped));
+	mutate(value);
+	assert.equal(helpers.nativeAutotunePublicResultValidated(value), false, message);
+}
+const nativeSchemaFourPartial = JSON.parse(JSON.stringify(nativePartialShaped));
+nativeSchemaFourPartial.native_public_schema_version = 4;
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeSchemaFourPartial), false,
+	'schema 4 is the SQM-off-only fallback');
+const nativeSchemaSevenNoSqm = nativeRawFallbackPublicFixture();
+nativeSchemaSevenNoSqm.native_public_schema_version = 7;
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeSchemaSevenNoSqm), false,
+	'public schema 7 always carries at least one CAKE option');
+const nativeLegacyWithShaped = nativeRawFallbackPublicFixture();
+nativeLegacyWithShaped.artifacts.raw_fallback.value.shaped_options =
+	nativePartialShaped.artifacts.raw_fallback.value.shaped_options;
+assert.equal(helpers.nativeAutotunePublicResultValidated(nativeLegacyWithShaped), false,
+	'an SQM-off-only Review cannot carry hidden CAKE options');
+
 function testRawFallbackMobileDownloadBypassUnavailableCardRenders() {
 	function element(tag, attrs, children) {
 		return {
@@ -1422,6 +1513,40 @@ assert.equal(helpers.nativeAutotuneApplyCheckValidated({
 	manifest_schema_version: 4,
 }, nativeShapedCapacityFallback, nativeShapedCapacitySelected), false,
 	'a shaped-capacity option cannot be downgraded to ordinary shaped schema 4');
+const nativePartialSelected = nativePartialShaped.public_apply_contract.options[0];
+const nativePartialConfirmation = {
+	...nativeConfirmation,
+	job_id: nativePartialShaped.native_job_id,
+	worker_run_id: nativePartialShaped.run_id,
+	option_id: nativePartialSelected.option_id,
+	review_sha256: nativePartialShaped.source_review_sha256,
+	source_manifest_sha256: nativePartialSelected.manifest_sha256,
+	manifest_sha256: nativePartialSelected.manifest_sha256,
+	manifest_schema_version: 9,
+	target_state: 'existing_managed',
+	required_acknowledgements: nativePartialSelected.required_acknowledgements.slice(),
+};
+assert.equal(helpers.nativeAutotuneApplyCheckValidated(
+	nativePartialConfirmation, nativePartialShaped, nativePartialSelected), true,
+	'a partial-search CAKE option uses the hard-capped shaped-fallback manifest schema 9');
+assert.equal(helpers.nativeAutotuneApplyCheckValidated({
+	...nativePartialConfirmation, manifest_schema_version: 4,
+}, nativePartialShaped, nativePartialSelected), false,
+	'a partial-search CAKE option cannot become an ordinary shaped manifest');
+assert.equal(helpers.nativeAutotuneApplyCheckValidated({
+	...nativePartialConfirmation, manifest_schema_version: 10, target_state: 'absent_bootstrap',
+}, nativePartialShaped, nativePartialSelected), true,
+	'a new instance uses the shaped-fallback bootstrap manifest schema 10');
+const nativePartialDisabled = nativePartialShaped.public_apply_contract.options[2];
+assert.equal(helpers.nativeAutotuneApplyCheckValidated({
+	...nativePartialConfirmation,
+	option_id: nativePartialDisabled.option_id,
+	source_manifest_sha256: nativePartialDisabled.manifest_sha256,
+	manifest_sha256: nativePartialDisabled.manifest_sha256,
+	manifest_schema_version: 5,
+	required_acknowledgements: nativePartialDisabled.required_acknowledgements.slice(),
+}, nativePartialShaped, nativePartialDisabled), true,
+	'SQM disabled keeps the raw-fallback manifest schema 5 next to CAKE options');
 const nativeShapedCapacityBootstrapResult = nativeShapedCapacityFallbackPublicFixture();
 Object.defineProperty(nativeShapedCapacityBootstrapResult, '_native_target_state', {
 	value: 'absent_bootstrap', enumerable: false,
@@ -1799,7 +1924,7 @@ async function testNativeAutotuneTransport() {
 		native_autotune_auto_backend: true,
 		native_operation_status_identity_version: 1,
 		native_autotune_status_identity_version: 1,
-		native_public_result_version: 6,
+		native_public_result_version: 7,
 	};
 	const access = {
 		medium: 'cellular',
@@ -2875,7 +3000,7 @@ async function testNativeSpeedtestTransport() {
 		native_bootstrap_speedtest: true,
 		native_speedtest_auto_backend: true,
 		native_operation_status_identity_version: 1,
-		native_public_result_version: 6,
+		native_public_result_version: 7,
 	};
 	const speedtestIdentity = (instance, target, routeMode, member, serverId, topology,
 		targetState, plannedSqmSection) => ({

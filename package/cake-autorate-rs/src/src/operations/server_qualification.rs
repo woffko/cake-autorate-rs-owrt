@@ -441,6 +441,139 @@ pub(crate) fn select(
     })
 }
 
+/// One stable, competitive source from this run's comparison. The selected
+/// server is one of them; the others are the backups a measurement may move
+/// to when the current source keeps failing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct QualifiedServer {
+    pub server_id: u64,
+    pub endpoint_sha256: String,
+    pub download_kbps: u64,
+    pub upload_kbps: u64,
+}
+
+/// Every source that passed the same stability and relative-throughput rules
+/// as the selected one, with its pinned endpoint and median rates. A source
+/// whose endpoint changed between repeats is not a backup.
+pub(crate) fn qualified_servers(
+    comparisons: &[Comparison],
+) -> Result<Vec<QualifiedServer>, &'static str> {
+    if comparisons.len() > MAX_COMPARISONS {
+        return Err("server-comparison-observation-bound");
+    }
+    let mut servers: Vec<(u64, Option<String>, Vec<u64>, Vec<u64>)> = Vec::new();
+    for row in comparisons.iter().filter(|row| row.valid) {
+        let id = row
+            .server_id
+            .filter(|id| *id > 0)
+            .ok_or("server-comparison-invalid-observation")?;
+        let (download, upload) = match (row.download_kbps, row.upload_kbps) {
+            (Some(download), Some(upload)) if download > 0 && upload > 0 => (download, upload),
+            _ => return Err("server-comparison-invalid-observation"),
+        };
+        let index = match servers.iter().position(|server| server.0 == id) {
+            Some(index) => index,
+            None => {
+                if servers.len() == MAX_SERVERS {
+                    return Err("server-comparison-candidate-bound");
+                }
+                servers.push((id, row.endpoint_sha256.clone(), Vec::new(), Vec::new()));
+                servers.len() - 1
+            }
+        };
+        let server = &mut servers[index];
+        if server.2.len() == REPEATS {
+            return Err("server-comparison-repeat-bound");
+        }
+        if server.1 != row.endpoint_sha256 {
+            server.1 = None;
+        }
+        server.2.push(download);
+        server.3.push(upload);
+    }
+    let mut stable = Vec::new();
+    for (id, endpoint, mut download, mut upload) in servers {
+        if download.len() != REPEATS {
+            continue;
+        }
+        download.sort_unstable();
+        upload.sort_unstable();
+        let consistent = [&download, &upload].iter().all(|rates| {
+            u128::from(rates[0]) * 100 >= u128::from(rates[REPEATS - 1]) * MIN_STABILITY_PERCENT
+        });
+        if let (true, Some(endpoint)) = (consistent, endpoint) {
+            stable.push(QualifiedServer {
+                server_id: id,
+                endpoint_sha256: endpoint,
+                download_kbps: download[REPEATS / 2],
+                upload_kbps: upload[REPEATS / 2],
+            });
+        }
+    }
+    let best_dl = stable
+        .iter()
+        .map(|server| server.download_kbps)
+        .max()
+        .unwrap_or(0);
+    let best_ul = stable
+        .iter()
+        .map(|server| server.upload_kbps)
+        .max()
+        .unwrap_or(0);
+    stable.retain(|server| {
+        u128::from(server.download_kbps) * 100
+            >= u128::from(best_dl) * MIN_RELATIVE_THROUGHPUT_PERCENT
+            && u128::from(server.upload_kbps) * 100
+                >= u128::from(best_ul) * MIN_RELATIVE_THROUGHPUT_PERCENT
+    });
+    stable.sort_unstable_by_key(|server| server.server_id);
+    Ok(stable)
+}
+
+/// The next source for one direction: the fastest qualified server in that
+/// direction that this direction has not used yet (lower ID on a tie).
+pub(crate) fn next_backup_server<'a>(
+    servers: &'a [QualifiedServer],
+    direction: super::protocol::SpeedtestDirection,
+    used: &[u64],
+) -> Option<&'a QualifiedServer> {
+    let rate = |server: &QualifiedServer| match direction {
+        super::protocol::SpeedtestDirection::Download => Some(server.download_kbps),
+        super::protocol::SpeedtestDirection::Upload => Some(server.upload_kbps),
+        super::protocol::SpeedtestDirection::Both => None,
+    };
+    servers
+        .iter()
+        .filter(|server| !used.contains(&server.server_id))
+        .filter_map(|server| rate(server).map(|rate| (rate, server)))
+        .max_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| right.1.server_id.cmp(&left.1.server_id))
+        })
+        .map(|(_, server)| server)
+}
+
+impl QualifiedCapacity {
+    /// The raw reference for the current source of each direction.
+    pub(crate) fn for_servers(
+        servers: &[QualifiedServer],
+        download_server_id: u64,
+        upload_server_id: u64,
+    ) -> Result<Self, &'static str> {
+        let find = |id: u64| {
+            servers
+                .iter()
+                .find(|server| server.server_id == id)
+                .ok_or("server-comparison-selected-reference-missing")
+        };
+        Ok(Self {
+            download_kbps: find(download_server_id)?.download_kbps,
+            upload_kbps: find(upload_server_id)?.upload_kbps,
+        })
+    }
+}
+
 /// Require a stable independent reported provider/hostname alongside the
 /// selected source. A different ID, port or spelling is not corroboration.
 pub(crate) fn select_independent(
@@ -750,5 +883,94 @@ mod tests {
             ),
             Err("server-comparison-no-comparable-bidirectional-server")
         );
+    }
+    fn comparison_rows(rates: &[(u64, u64, u64)]) -> Vec<Comparison> {
+        (0..REPEATS)
+            .flat_map(|round| {
+                rates
+                    .iter()
+                    .enumerate()
+                    .map(move |(slot, &(id, download, upload))| Comparison {
+                        index: round * rates.len() + slot + 1,
+                        candidate_id: Some(id),
+                        server_id: Some(id),
+                        server_name: format!("server-{id}"),
+                        server_sponsor: format!("Provider {id}"),
+                        endpoint_host: Some(format!("s{id}.example.invalid")),
+                        endpoint_sha256: Some(format!("{id:064x}")),
+                        display_metadata_truncated: false,
+                        started_boot_ms: 0,
+                        elapsed_ms: 1,
+                        debit_offset: 0,
+                        debit_count: 1,
+                        download_kbps: Some(download),
+                        upload_kbps: Some(upload),
+                        valid: true,
+                        code: "valid-observation".into(),
+                    })
+            })
+            .collect()
+    }
+    #[test]
+    fn backup_sources_are_stable_competitive_pinned_and_ranked_per_direction() {
+        let mut rows = comparison_rows(&[
+            (1, 900_000, 400_000),
+            (2, 880_000, 450_000),
+            (3, 850_000, 430_000),
+            (4, 500_000, 450_000),
+        ]);
+        let servers = qualified_servers(&rows).unwrap();
+        // Server 4 is below 80% of the best download median.
+        assert_eq!(
+            servers
+                .iter()
+                .map(|server| server.server_id)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert_eq!(servers[1].upload_kbps, 450_000);
+        assert_eq!(servers[1].endpoint_sha256, format!("{:064x}", 2));
+        let next = |direction, used: &[u64]| {
+            next_backup_server(&servers, direction, used).map(|server| server.server_id)
+        };
+        use super::super::protocol::SpeedtestDirection;
+        assert_eq!(next(SpeedtestDirection::Download, &[1]), Some(2));
+        assert_eq!(next(SpeedtestDirection::Upload, &[1]), Some(2));
+        assert_eq!(next(SpeedtestDirection::Upload, &[1, 2]), Some(3));
+        assert_eq!(next(SpeedtestDirection::Upload, &[1, 2, 3]), None);
+        assert_eq!(next(SpeedtestDirection::Both, &[1]), None);
+        assert_eq!(
+            QualifiedCapacity::for_servers(&servers, 1, 3),
+            Ok(QualifiedCapacity {
+                download_kbps: 900_000,
+                upload_kbps: 430_000
+            })
+        );
+        assert!(QualifiedCapacity::for_servers(&servers, 1, 4).is_err());
+
+        // A source whose endpoint changed between repeats, or that failed a
+        // repeat, is not a backup.
+        let moved = rows
+            .iter()
+            .position(|row| row.server_id == Some(2))
+            .unwrap();
+        rows[moved].endpoint_sha256 = Some("ff".repeat(32));
+        let failed = rows
+            .iter()
+            .position(|row| row.server_id == Some(3))
+            .unwrap();
+        rows[failed].valid = false;
+        assert_eq!(
+            qualified_servers(&rows)
+                .unwrap()
+                .iter()
+                .map(|server| server.server_id)
+                .collect::<Vec<_>>(),
+            [1]
+        );
+        // Unstable repeats are excluded as well.
+        let mut unstable = comparison_rows(&[(1, 900_000, 400_000), (2, 880_000, 450_000)]);
+        unstable[1].upload_kbps = Some(200_000);
+        assert_eq!(qualified_servers(&unstable).unwrap().len(), 1);
     }
 }

@@ -1605,7 +1605,8 @@ function speedtestJobDelay() {
 var AUTOTUNE_RECOVERY_MAX_POLLS = 12;
 var AUTOTUNE_RECOVERY_MAX_DELAY_MS = 5000;
 /* Highest public result schema advertised by the native coordinator. */
-var NATIVE_AUTOTUNE_PUBLIC_SCHEMA_VERSION = 6;
+var NATIVE_AUTOTUNE_PUBLIC_SCHEMA_VERSION = 7;
+var NATIVE_PARTIAL_SHAPED_OPTION_IDS = [ 'partial_quality_first', 'partial_throughput_first' ];
 var NATIVE_AUTOTUNE_APPLY_CONTRACT_SCHEMA_VERSION = 3;
 var NATIVE_AUTOTUNE_PUBLIC_PRODUCER = 'cake-autorated-native-autotune';
 var NATIVE_AUTOTUNE_COMMAND = '/usr/sbin/cake-autorated';
@@ -1642,7 +1643,11 @@ var NATIVE_AUTOTUNE_ACKNOWLEDGEMENT_CODES = {
 	'upload-shaping-bypassed': true,
 	'sqm-disabled': true,
 	'loaded-latency-unobservable': true,
-	'shaped-validation-incomplete': true
+	'shaped-validation-incomplete': true,
+	'download-search-incomplete': true,
+	'upload-search-incomplete': true,
+	'download-shaped-load-unmeasured': true,
+	'upload-shaped-load-unmeasured': true
 };
 
 function nativeAutotuneTimeoutEvidenceValidated(evidence, maximumCount) {
@@ -1856,7 +1861,7 @@ function nativeAutotuneTopologyTransportValidated(topology) {
 		(topology.auto_apply_pass === false && topology.manual_review_required === true);
 }
 
-function nativeAutotuneRawFallbackValidated(raw, option, directionalOption) {
+function nativeAutotuneRawFallbackValidated(raw, option, directionalOption, partialOptions) {
 	if (raw && raw.schema_version === 6) {
 		var fields = [ 'schema_version', 'selected_topology', 'reason',
 			'failed_direction', 'terminal_boundary', 'selected_rates_kbps',
@@ -2045,6 +2050,58 @@ function nativeAutotuneRawFallbackValidated(raw, option, directionalOption) {
 				value.samples[0].effective_delta_ms, value.samples[1].effective_delta_ms);
 	};
 
+	var partial = Array.isArray(partialOptions) ? partialOptions : [];
+	var shapedFields = [ 'option_id', 'preferred', 'measured_direction', 'selected_rates_kbps',
+		'achieved_kbps', 'effective_delta_ms', 'grade', 'target_met', 'required_acknowledgements' ];
+	var shapedOptionValidated = function(value) {
+		var rates = value && value.selected_rates_kbps;
+		var contractOption = value && partial.filter(function(candidate) {
+			return candidate.option_id === value.option_id;
+		})[0];
+		var contractRates = contractOption && contractOption.target_rates_kbps;
+		var codes = value && value.required_acknowledgements;
+		if (!value || typeof value !== 'object' || Array.isArray(value) ||
+		    Object.keys(value).sort().join(',') !== shapedFields.slice().sort().join(',') ||
+		    NATIVE_PARTIAL_SHAPED_OPTION_IDS.indexOf(value.option_id) < 0 || !contractOption ||
+		    typeof value.preferred !== 'boolean' || value.preferred !== contractOption.preferred ||
+		    (value.measured_direction !== 'download' && value.measured_direction !== 'upload') ||
+		    !rates || typeof rates !== 'object' || Array.isArray(rates) ||
+		    Object.keys(rates).sort().join(',') !== 'download,upload' ||
+		    !Number.isSafeInteger(rates.download) || rates.download < 100 ||
+		    !Number.isSafeInteger(rates.upload) || rates.upload < 100 ||
+		    !Number.isSafeInteger(value.achieved_kbps) || value.achieved_kbps < 1 ||
+		    typeof value.effective_delta_ms !== 'number' ||
+		    !Number.isFinite(value.effective_delta_ms) || value.effective_delta_ms < 0 ||
+		    !grades[value.grade] || typeof value.target_met !== 'boolean' ||
+		    !Array.isArray(codes) || codes.length < 1 || codes.length > 24 ||
+		    codes.indexOf('shaped-validation-incomplete') < 0 ||
+		    [ 'download-shaping-bypassed', 'upload-shaping-bypassed', 'sqm-disabled',
+			'loaded-latency-unobservable' ].some(function(code) { return codes.indexOf(code) >= 0; }) ||
+		    !codes.every(function(code, index) {
+			    return NATIVE_AUTOTUNE_ACKNOWLEDGEMENT_CODES[code] && codes.indexOf(code) === index;
+		    }) ||
+		    contractOption.selected_topology !== 'both_shaped' ||
+		    contractOption.action !== 'apply_sqm' || contractOption.sqm_direction_mode !== 'both' ||
+		    !contractRates || contractRates.download !== rates.download ||
+		    contractRates.upload !== rates.upload ||
+		    digestAck(contractOption.required_acknowledgements) !== digestAck(codes))
+			return false;
+		return true;
+	};
+	var shapedExtra = raw && raw.shaped_options !== undefined ? [ 'shaped_options' ] : [];
+	if (raw && (raw.shaped_options !== undefined || partial.length)) {
+		var shaped = raw.shaped_options;
+		if ([ 1, 2, 4 ].indexOf(raw.schema_version) < 0 || !Array.isArray(shaped) ||
+		    shaped.length < 1 || shaped.length !== partial.length ||
+		    !shaped.every(function(value, index) {
+			    return shapedOptionValidated(value) && shaped.findIndex(function(other) {
+				    return other && other.option_id === value.option_id;
+			    }) === index;
+		    }) ||
+		    shaped.filter(function(value) { return value.preferred === true; }).length !== 1 ||
+		    !option || option.preferred !== false)
+			return false;
+	}
 	if (!raw || typeof raw !== 'object' || Array.isArray(raw) ||
 	    raw.selected_topology !== 'no_sqm' ||
 	    !Number.isSafeInteger(raw.discarded_shaped_observation_count) ||
@@ -2055,7 +2112,7 @@ function nativeAutotuneRawFallbackValidated(raw, option, directionalOption) {
 		digestAck(option && option.required_acknowledgements))
 		return false;
 	if (raw.schema_version === 1) {
-		var v1Fields = commonRawFields.concat([ 'unobserved_candidates_kbps' ]);
+		var v1Fields = commonRawFields.concat([ 'unobserved_candidates_kbps' ], shapedExtra);
 		if (Object.keys(raw).sort().join(',') !== v1Fields.sort().join(',') ||
 		    raw.reason !== 'incomplete-shaped-search' ||
 		    (raw.failed_direction !== 'download' && raw.failed_direction !== 'upload') ||
@@ -2069,7 +2126,7 @@ function nativeAutotuneRawFallbackValidated(raw, option, directionalOption) {
 			return false;
 	}
 	else if (raw.schema_version === 2) {
-		var v2Fields = commonRawFields.concat([ 'terminal_boundary' ]);
+		var v2Fields = commonRawFields.concat([ 'terminal_boundary' ], shapedExtra);
 		var v2Boundary = raw.terminal_boundary;
 		if (Object.keys(raw).sort().join(',') !== v2Fields.sort().join(',') ||
 		    raw.reason !== 'measured-shaped-search-inconclusive' ||
@@ -2095,7 +2152,7 @@ function nativeAutotuneRawFallbackValidated(raw, option, directionalOption) {
 			return false;
 	}
 	else if (raw.schema_version === 4) {
-		var v4Fields = commonRawFields.concat([ 'terminal_boundary' ]);
+		var v4Fields = commonRawFields.concat([ 'terminal_boundary' ], shapedExtra);
 		var v4Boundary = raw.terminal_boundary;
 		var v4Reasons = {
 			'variable-candidate-resource-safety-inconclusive': true,
@@ -2228,7 +2285,8 @@ function nativeAutotunePublicResultValidated(result) {
 	var rawPublicResult = result &&
 		(result.native_public_schema_version === 4 ||
 		 result.native_public_schema_version === 5 ||
-		 result.native_public_schema_version === 6);
+		 result.native_public_schema_version === 6 ||
+		 result.native_public_schema_version === 7);
 	var artifactNames = rawPublicResult ? [ 'proposal', 'raw_fallback' ] :
 		[ 'proposal', 'download_search', 'upload_search',
 			'pair_confirmation', 'topology_comparison' ];
@@ -2249,6 +2307,7 @@ function nativeAutotunePublicResultValidated(result) {
 	if (!result || (result.native_public_schema_version !== 3 &&
 	    result.native_public_schema_version !== 4 &&
 	    result.native_public_schema_version !== 5 &&
+	    result.native_public_schema_version !== 6 &&
 	    result.native_public_schema_version !== NATIVE_AUTOTUNE_PUBLIC_SCHEMA_VERSION) ||
 	    result.state !== 'review_ready' || result.producer !== NATIVE_AUTOTUNE_PUBLIC_PRODUCER ||
 	    !digest.test(result.source_review_sha256 || '') ||
@@ -2337,6 +2396,21 @@ function nativeAutotunePublicResultValidated(result) {
 		}
 		if (result.native_public_schema_version === 6)
 			return false;
+		if (result.native_public_schema_version === 7) {
+			var partialOptions = contract.options.filter(function(option) {
+				return option && NATIVE_PARTIAL_SHAPED_OPTION_IDS.indexOf(option.option_id) >= 0;
+			});
+			return partialOptions.length >= 1 && partialOptions.length <= 2 &&
+				contract.options.length === partialOptions.length + 1 &&
+				directionalOption == null && rawContractOptionValidated(rawOption) &&
+				rawOption.preferred === false && rawOption.selected_topology === 'no_sqm' &&
+				rawOption.action === 'disable_sqm' && rawOption.sqm_direction_mode === 'off' &&
+				rawRates && Object.keys(rawRates).sort().join(',') === 'download,upload' &&
+				rawRates.download === null && rawRates.upload === null &&
+				partialOptions.every(rawContractOptionValidated) &&
+				nativeAutotuneRawFallbackValidated(
+					artifacts.raw_fallback.value, rawOption, null, partialOptions);
+		}
 		var exactOptionCount = result.native_public_schema_version === 5 ? 2 : 1;
 		return contract.options.length === exactOptionCount &&
 			(result.native_public_schema_version !== 5 ||
@@ -2577,6 +2651,14 @@ function nativeAutotuneAcknowledgementLabel(code) {
 		return _('Loaded latency could not be measured reliably for the listed failed direction. No latency class is claimed.');
 	case 'shaped-validation-incomplete':
 		return _('The shaped pair did not complete validation in both directions. The selected rates are capacity-bounded and cannot grow automatically.');
+	case 'download-search-incomplete':
+		return _('The download search stopped before it chose a rate. This option uses a download rate that was measured, not a finished search result.');
+	case 'upload-search-incomplete':
+		return _('The upload search stopped before it chose a rate. This option uses an upload rate that was measured, not a finished search result.');
+	case 'download-shaped-load-unmeasured':
+		return _('Download was not measured under load with CAKE at this rate. Its latency with this setting is unknown.');
+	case 'upload-shaped-load-unmeasured':
+		return _('Upload was not measured under load with CAKE at this rate. Its latency with this setting is unknown.');
 	default:
 		return code;
 	}
@@ -2699,6 +2781,8 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 		balanced_alternative: _('Balanced alternative'),
 		bypass_download: _('Download without shaping'),
 		bypass_upload: _('Upload without shaping'),
+		partial_quality_first: _('Lowest measured latency (search incomplete)'),
+		partial_throughput_first: _('Highest measured throughput (search incomplete)'),
 		no_sqm: _('SQM disabled')
 	};
 	var preferred = contract.options.find(function(option) { return option.preferred; });
@@ -2736,6 +2820,21 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 				transportCensored: rawSamples.some(function(sample) {
 					return sample.transport_censored === true;
 				})
+			};
+		}
+		var shapedOption = rawFallback && (rawFallback.shaped_options || []).find(function(candidate) {
+			return candidate.option_id === option.option_id;
+		});
+		if (shapedOption) {
+			var measuredDownload = shapedOption.measured_direction === 'download';
+			return {
+				achieved: {
+					download: measuredDownload ? shapedOption.achieved_kbps : null,
+					upload: measuredDownload ? null : shapedOption.achieved_kbps
+				},
+				grade: measuredDownload ? _('%s / %s').format(shapedOption.grade, '-') :
+					_('%s / %s').format('-', shapedOption.grade),
+				transportCensored: false
 			};
 		}
 		if (rawFallback && option.option_id === 'bypass_download') {
@@ -2946,7 +3045,9 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 			E('strong', {}, priorApplyBlocked ? _('Full Auto-Tune Review · throughput decline requires investigation') : _('Full Auto-Tune Review · ready to apply')),
 			E('p', {}, disabledFallback ?
 				_('The shaped search found no usable rate. The raw measurements were kept and can create one disabled instance without SQM; set rates later or calibrate again.') :
-				_('Calibration finished and the previous settings were restored. Each option is rebuilt from the saved measurements; values shown in the browser are never used for Apply.')),
+				(result.native_public_schema_version === 7 ?
+					_('The shaped search stopped before it could choose rates. The CAKE options below use exact rates that were measured during the search; each one lists what could not be measured. SQM disabled remains available.') :
+					_('Calibration finished and the previous settings were restored. Each option is rebuilt from the saved measurements; values shown in the browser are never used for Apply.'))),
 		];
 		if (!disabledFallback)
 			nodes.push(E('p', { 'class': 'cake-autotune-capacity-scope' },
@@ -4204,6 +4305,15 @@ function nativeAutotuneStatusMatchesRequest(status, section_id, wan, routeMode,
 		status.managed_sqm_section === plannedSqmSection && status.origin === 'luci';
 }
 
+/* Capacity-only and partial-search CAKE options share the hard-capped
+ * shaped-fallback manifest (schema 9, or 10 for a new instance). */
+function nativeShapedFallbackOption(result, option) {
+	return !!result && !!option &&
+		((result.native_public_schema_version === 6 && option.option_id === 'capacity_only_shaped') ||
+		 (result.native_public_schema_version === 7 &&
+		  NATIVE_PARTIAL_SHAPED_OPTION_IDS.indexOf(option.option_id) >= 0));
+}
+
 function nativeAutotuneApplyCheckValidated(confirmation, result, option) {
 	var expectedAcknowledgements = option.required_acknowledgements || [];
 	var expectedTargetState = result && result._native_target_state;
@@ -4211,11 +4321,9 @@ function nativeAutotuneApplyCheckValidated(confirmation, result, option) {
 	var targetSchema = confirmation && confirmation.target_state === 'existing_managed' ?
 		(disabled ? 5 : (result && result.native_public_schema_version === 5 &&
 			option && option.option_id === 'bypass_download' ? 6 :
-			(result && result.native_public_schema_version === 6 &&
-			 option && option.option_id === 'capacity_only_shaped' ? 9 : 4))) :
+			(nativeShapedFallbackOption(result, option) ? 9 : 4))) :
 		(confirmation && confirmation.target_state === 'absent_bootstrap' ?
-			(disabled ? 8 : (result && result.native_public_schema_version === 6 &&
-			 option && option.option_id === 'capacity_only_shaped' ? 10 : 7)) : null);
+			(disabled ? 8 : (nativeShapedFallbackOption(result, option) ? 10 : 7)) : null);
 	return !!confirmation && confirmation.state === 'confirmation_ready' &&
 		confirmation.apply_enabled === true && confirmation.validation_only === false &&
 		confirmation.runtime_attested === true && typeof confirmation.already_applied === 'boolean' &&
@@ -5364,8 +5472,10 @@ function multiwanAutotuneItemNativeApplied(item) {
 	if (item && item.native_apply_receipt) {
 		var receipt = item.native_apply_receipt;
 		var result = item.diagnostics || item.state && item.state.autotune_diagnostics;
-		var expectedManifestSchema = result && result.native_public_schema_version === 4 ? 8 :
-			(result && result.native_public_schema_version === 6 ? 10 : 7);
+		var expectedManifestSchema = result && (result.native_public_schema_version === 4 ||
+			(result.native_public_schema_version === 7 && receipt.option_id === 'no_sqm')) ? 8 :
+			(result && (result.native_public_schema_version === 6 ||
+			 result.native_public_schema_version === 7) ? 10 : 7);
 		return !!result && nativeAutotunePublicResultValidated(result) &&
 			(!result._native_target_state || result._native_target_state === 'absent_bootstrap') &&
 			[ 'applied', 'already_applied' ].indexOf(receipt.state) >= 0 &&

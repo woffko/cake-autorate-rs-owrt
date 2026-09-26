@@ -13,8 +13,11 @@ pub(crate) const NATIVE_PUBLIC_RESULT_SCHEMA_VERSION: u8 = 3;
 pub(crate) const NATIVE_RAW_FALLBACK_PUBLIC_RESULT_SCHEMA_VERSION: u8 = 4;
 pub(crate) const NATIVE_DIRECTIONAL_RAW_FALLBACK_PUBLIC_RESULT_SCHEMA_VERSION: u8 = 5;
 pub(crate) const NATIVE_SHAPED_CAPACITY_FALLBACK_PUBLIC_RESULT_SCHEMA_VERSION: u8 = 6;
+/// Raw fallback of an incomplete shaped search that kept measured CAKE
+/// options next to SQM disabled.
+pub(crate) const NATIVE_PARTIAL_SHAPED_FALLBACK_PUBLIC_RESULT_SCHEMA_VERSION: u8 = 7;
 pub(crate) const NATIVE_PUBLIC_RESULT_MAX_SCHEMA_VERSION: u8 =
-    NATIVE_SHAPED_CAPACITY_FALLBACK_PUBLIC_RESULT_SCHEMA_VERSION;
+    NATIVE_PARTIAL_SHAPED_FALLBACK_PUBLIC_RESULT_SCHEMA_VERSION;
 const NATIVE_PUBLIC_APPLY_CONTRACT_SCHEMA_VERSION: u8 = 3;
 const NATIVE_PUBLIC_RESULT_PRODUCER: &str = "cake-autorated-native-autotune";
 pub(crate) const MAX_NATIVE_PUBLIC_RESULT_BYTES: usize = 256 * 1024;
@@ -243,7 +246,55 @@ pub(crate) fn canonical_native_public_result_bytes(
             .iter()
             .find(|confirmation| confirmation.preferred)
             .ok_or_else(|| "native public raw fallback has no preferred option".to_string())?;
-        if preferred.option_id == "capacity_only_shaped" {
+        if super::autotune_apply::is_partial_shaped_option(&preferred.option_id) {
+            let partial_valid = |option: &&NativePublicApplyConfirmation| {
+                super::autotune_apply::is_partial_shaped_option(&option.option_id)
+                    && option.selected_topology == "both_shaped"
+                    && option.action == "apply_sqm"
+                    && option.sqm_direction_mode == "both"
+                    && !option.auto_apply_evidence_pass
+                    && option.manual_review_required
+                    && option.download_kbps.is_some()
+                    && option.upload_kbps.is_some()
+                    && option
+                        .required_acknowledgements
+                        .contains(&NativeApplyAcknowledgement::ShapedValidationIncomplete)
+                    && !option.required_acknowledgements.iter().any(|value| {
+                        matches!(
+                            value,
+                            NativeApplyAcknowledgement::DownloadShapingBypassed
+                                | NativeApplyAcknowledgement::UploadShapingBypassed
+                                | NativeApplyAcknowledgement::SqmDisabled
+                                | NativeApplyAcknowledgement::LoadedLatencyUnobservable
+                        )
+                    })
+            };
+            let partial = input
+                .apply_confirmations
+                .iter()
+                .filter(partial_valid)
+                .count();
+            let disabled = input
+                .apply_confirmations
+                .iter()
+                .filter(|option| {
+                    option.option_id == "no_sqm"
+                        && !option.preferred
+                        && option.selected_topology == "no_sqm"
+                        && option.action == "disable_sqm"
+                        && option.sqm_direction_mode == "off"
+                        && !option.auto_apply_evidence_pass
+                        && option.manual_review_required
+                })
+                .count();
+            if !(1..=2).contains(&partial)
+                || disabled != 1
+                || partial + disabled != input.apply_confirmations.len()
+            {
+                return Err("native public partial shaped fallback options are invalid".to_string());
+            }
+            NATIVE_PARTIAL_SHAPED_FALLBACK_PUBLIC_RESULT_SCHEMA_VERSION
+        } else if preferred.option_id == "capacity_only_shaped" {
             if input.apply_confirmations.len() != 1
                 || preferred.selected_topology != "both_shaped"
                 || preferred.action != "apply_sqm"

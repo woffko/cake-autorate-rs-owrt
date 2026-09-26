@@ -432,6 +432,14 @@ pub(crate) struct EmbeddedSpeedtestSession {
     server_qualified: bool,
     pub(crate) qualified_raw_capacity: Option<super::server_qualification::QualifiedCapacity>,
     selected_endpoint_sha256: Option<String>,
+    /// Stable, competitive sources from the comparison (selected included).
+    qualified_servers: Vec<super::server_qualification::QualifiedServer>,
+    /// Current source of each direction after a server switch.
+    download_server: Option<(u64, String)>,
+    upload_server: Option<(u64, String)>,
+    /// Sources each direction has already used, in order.
+    download_servers_used: Vec<u64>,
+    upload_servers_used: Vec<u64>,
     owned_checkpoint: Option<(PathBuf, String)>,
     owned_ledger: Option<std::cell::Cell<OwnedTrafficLedger>>,
 }
@@ -650,7 +658,90 @@ impl EmbeddedSpeedtestSession {
             server_qualified: false,
             qualified_raw_capacity: None,
             selected_endpoint_sha256: None,
+            qualified_servers: Vec::new(),
+            download_server: None,
+            upload_server: None,
+            download_servers_used: Vec::new(),
+            upload_servers_used: Vec::new(),
         })
+    }
+
+    /// The source and pinned endpoint a directional measurement must use.
+    fn server_for(&self, direction: SpeedtestDirection) -> (Option<u64>, Option<&str>) {
+        let assigned = match direction {
+            SpeedtestDirection::Download => self.download_server.as_ref(),
+            SpeedtestDirection::Upload => self.upload_server.as_ref(),
+            SpeedtestDirection::Both => None,
+        };
+        match assigned {
+            Some((id, endpoint)) => (Some(*id), Some(endpoint.as_str())),
+            None => (
+                self.selected_server_id,
+                self.selected_endpoint_sha256.as_deref(),
+            ),
+        }
+    }
+
+    /// The next qualified source for a direction whose current source kept
+    /// failing: `(from, to)`. A user-requested server is never replaced.
+    pub(crate) fn next_server_switch(&self, direction: SpeedtestDirection) -> Option<(u64, u64)> {
+        if self.requested_server_id.is_some() || !self.server_qualified {
+            return None;
+        }
+        let (current, _) = self.server_for(direction);
+        let used = match direction {
+            SpeedtestDirection::Download => &self.download_servers_used,
+            SpeedtestDirection::Upload => &self.upload_servers_used,
+            SpeedtestDirection::Both => return None,
+        };
+        let next = super::server_qualification::next_backup_server(
+            &self.qualified_servers,
+            direction,
+            used,
+        )?;
+        Some((current?, next.server_id))
+    }
+
+    /// Move one direction to another qualified source. The raw reference of
+    /// that direction follows the new source.
+    pub(crate) fn switch_server(
+        &mut self,
+        direction: SpeedtestDirection,
+        from: u64,
+        to: u64,
+    ) -> Result<(), String> {
+        if self.next_server_switch(direction) != Some((from, to)) {
+            return Err("speedtest-server-switch-out-of-order".into());
+        }
+        let server = self
+            .qualified_servers
+            .iter()
+            .find(|server| server.server_id == to)
+            .ok_or("speedtest-server-switch-out-of-order")?
+            .clone();
+        let assigned = Some((server.server_id, server.endpoint_sha256.clone()));
+        match direction {
+            SpeedtestDirection::Download => {
+                self.download_server = assigned;
+                self.download_servers_used.push(to);
+            }
+            SpeedtestDirection::Upload => {
+                self.upload_server = assigned;
+                self.upload_servers_used.push(to);
+            }
+            SpeedtestDirection::Both => return Err("speedtest-server-switch-out-of-order".into()),
+        }
+        if self.qualified_raw_capacity.is_some() {
+            let (download, _) = self.server_for(SpeedtestDirection::Download);
+            let (upload, _) = self.server_for(SpeedtestDirection::Upload);
+            self.qualified_raw_capacity =
+                Some(super::server_qualification::QualifiedCapacity::for_servers(
+                    &self.qualified_servers,
+                    download.ok_or("speedtest-server-switch-out-of-order")?,
+                    upload.ok_or("speedtest-server-switch-out-of-order")?,
+                )?);
+        }
+        Ok(())
     }
 
     pub(crate) fn close(mut self) -> Result<(), String> {
@@ -1936,7 +2027,7 @@ pub(crate) fn run_embedded_speedtest_with_accounting_in_session_and_debit(
                 scratch_path,
                 initial_route,
                 session.credentials,
-                session.selected_server_id,
+                session.server_for(direction).0,
                 &session.route_pin,
                 false,
                 session.owned_budget_watch(traffic_safety_reserve_bytes)?,
@@ -1950,7 +2041,7 @@ pub(crate) fn run_embedded_speedtest_with_accounting_in_session_and_debit(
                 pin.traffic_counters()?;
             }
             if let (Some(expected), Ok((SpeedtestTerminal::Complete(_), sample))) =
-                (session.selected_endpoint_sha256.as_deref(), &outcome)
+                (session.server_for(direction).1, &outcome)
             {
                 attest_selected_endpoint(
                     expected,
@@ -2138,6 +2229,11 @@ pub(crate) fn qualify_embedded_speedtest_server_in_session(
     session.selected_server_id = Some(selected.server_id);
     session.selected_endpoint_sha256 = Some(selected.endpoint_sha256);
     session.qualified_raw_capacity = selected.raw_capacity;
+    // A comparison without pinned endpoints has no backups.
+    session.qualified_servers =
+        super::server_qualification::qualified_servers(&comparisons).unwrap_or_default();
+    session.download_servers_used = vec![selected.server_id];
+    session.upload_servers_used = vec![selected.server_id];
     session.server_qualified = true;
     Ok(Some(selected.server_id))
 }
@@ -6753,6 +6849,106 @@ Upload: 766.6 Mbps (Used: 975.34MB)
     }
 
     #[test]
+    fn a_failing_direction_moves_through_qualified_sources_in_order() {
+        let mut operation = request(SpeedtestDirection::Download);
+        operation.identity.operation = OperationKind::FullAutotune;
+        operation.speedtest_direction = None;
+        operation.speedtest_server_id = None;
+        let server = |id: u64, download_kbps: u64, upload_kbps: u64| {
+            super::super::server_qualification::QualifiedServer {
+                server_id: id,
+                endpoint_sha256: format!("{id:064x}"),
+                download_kbps,
+                upload_kbps,
+            }
+        };
+        let mut session = EmbeddedSpeedtestSession {
+            probe_pin: None,
+            owned_checkpoint: None,
+            owned_ledger: None,
+            route_pin: NftRoutePin {
+                cleanup_on_drop: false,
+                table: None,
+                owner: None,
+            },
+            credentials: BackendCredentials {
+                uid: 32769,
+                gid: 32770,
+            },
+            job_id: operation.identity.job_id.clone(),
+            worker_run_id: "6".repeat(32),
+            route_fingerprint: operation.identity.route_fingerprint.clone(),
+            route: operation.route.clone(),
+            backend: operation.backend.clone(),
+            requested_server_id: None,
+            authorized_traffic_budget: operation.traffic_budget,
+            traffic_policy_explicit: operation.traffic_policy_explicit,
+            selected_server_id: Some(1),
+            server_qualified: true,
+            qualified_raw_capacity: Some(super::super::server_qualification::QualifiedCapacity {
+                download_kbps: 900_000,
+                upload_kbps: 450_000,
+            }),
+            selected_endpoint_sha256: Some(format!("{:064x}", 1)),
+            qualified_servers: vec![
+                server(1, 900_000, 450_000),
+                server(2, 880_000, 440_000),
+                server(3, 870_000, 445_000),
+            ],
+            download_server: None,
+            upload_server: None,
+            download_servers_used: vec![1],
+            upload_servers_used: vec![1],
+        };
+        assert_eq!(
+            session.server_for(SpeedtestDirection::Upload),
+            (Some(1), Some(format!("{:064x}", 1).as_str()))
+        );
+        assert_eq!(
+            session.next_server_switch(SpeedtestDirection::Upload),
+            Some((1, 3))
+        );
+        assert!(session
+            .switch_server(SpeedtestDirection::Upload, 1, 2)
+            .is_err());
+        session
+            .switch_server(SpeedtestDirection::Upload, 1, 3)
+            .unwrap();
+        // Download keeps its source; the upload reference follows server 3.
+        assert_eq!(session.server_for(SpeedtestDirection::Download).0, Some(1));
+        assert_eq!(
+            session.server_for(SpeedtestDirection::Upload),
+            (Some(3), Some(format!("{:064x}", 3).as_str()))
+        );
+        assert_eq!(
+            session.qualified_raw_capacity,
+            Some(super::super::server_qualification::QualifiedCapacity {
+                download_kbps: 900_000,
+                upload_kbps: 445_000,
+            })
+        );
+        assert_eq!(
+            session.next_server_switch(SpeedtestDirection::Upload),
+            Some((3, 2))
+        );
+        assert_eq!(
+            session.next_server_switch(SpeedtestDirection::Download),
+            Some((1, 2))
+        );
+        session
+            .switch_server(SpeedtestDirection::Upload, 3, 2)
+            .unwrap();
+        assert_eq!(session.next_server_switch(SpeedtestDirection::Upload), None);
+        assert_eq!(session.next_server_switch(SpeedtestDirection::Both), None);
+        // A user-requested server is never replaced.
+        session.requested_server_id = Some(1);
+        assert_eq!(
+            session.next_server_switch(SpeedtestDirection::Download),
+            None
+        );
+    }
+
+    #[test]
     fn embedded_session_identity_allows_only_bounded_runs_from_one_phase() {
         let mut operation = request(SpeedtestDirection::Download);
         operation.identity.operation = OperationKind::FullAutotune;
@@ -6784,6 +6980,11 @@ Upload: 766.6 Mbps (Used: 975.34MB)
             server_qualified: false,
             qualified_raw_capacity: None,
             selected_endpoint_sha256: None,
+            qualified_servers: Vec::new(),
+            download_server: None,
+            upload_server: None,
+            download_servers_used: Vec::new(),
+            upload_servers_used: Vec::new(),
         };
         assert!(session.matches(&operation, &worker_run_id));
 
@@ -7536,6 +7737,11 @@ Upload: 766.6 Mbps (Used: 975.34MB)
             server_qualified: false,
             qualified_raw_capacity: None,
             selected_endpoint_sha256: None,
+            qualified_servers: Vec::new(),
+            download_server: None,
+            upload_server: None,
+            download_servers_used: Vec::new(),
+            upload_servers_used: Vec::new(),
             owned_checkpoint: Some((path, digest)),
             owned_ledger: Some(Cell::new(
                 OwnedTrafficLedger::from_verified_checkpoint(100_u64.into(), origin).unwrap(),
@@ -7664,6 +7870,11 @@ Upload: 766.6 Mbps (Used: 975.34MB)
             server_qualified: false,
             qualified_raw_capacity: None,
             selected_endpoint_sha256: None,
+            qualified_servers: Vec::new(),
+            download_server: None,
+            upload_server: None,
+            download_servers_used: Vec::new(),
+            upload_servers_used: Vec::new(),
             owned_checkpoint: Some((path, digest)),
             owned_ledger: Some(std::cell::Cell::new(
                 OwnedTrafficLedger::from_verified_checkpoint(100_u64.into(), origin).unwrap(),

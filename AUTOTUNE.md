@@ -459,7 +459,8 @@ or returns no usable rate is repeated after a short cancellable pause (3 s,
 measurement; requests without it use 2, which matches the earlier fixed
 bound. Failed attempts do not use a measurement slot, and the route-counter
 wrapper has already charged their exact traffic before the retry decision.
-When the retries are exhausted the measurement becomes `TransferUnmeasurable`
+When the retries are exhausted, the direction moves to another qualified
+server (see below); without one the measurement becomes `TransferUnmeasurable`
 instead of a terminal failure. Deadline, route, accounting, identity and
 budget failures remain fatal. The planning estimate counts successful
 measurements only; each failed attempt can add up to one more measurement of
@@ -470,6 +471,62 @@ public Start wire keeps the existing-instance schema 23 (4 plus the field);
 the private journal form is 24 (5 plus the field). A shared fixture of the
 exact LuCI launch argv is decoded by the daemon test through the same Start
 path for every lifecycle and route shape.
+
+## Moving to another server
+
+The server comparison keeps every source that passed the same rules as the
+selected one: three stable repeats with one pinned endpoint and medians of at
+least 80% of the best source in both directions. When every retry of one
+directional measurement fails on its current source, that direction moves to
+the fastest qualified source (by its own median) that it has not used yet;
+the other direction keeps its source, so download and upload can end up on
+different servers. The worker then writes a `ServerSwitched` record and
+restarts every measurement phase from the raw controls on the new source
+combination. The idle baseline and the server comparison stay valid; the
+proposal, searches, pair and topology comparison are measured again, so no
+comparison mixes two servers in one direction. The raw reference of the
+switched direction follows the new server's comparison median.
+
+The record carries the direction, the phase that failed, both server IDs and
+the failed runs' traffic debits, which it settles; all traffic of the
+superseded epoch stays in the budget, and superseded measurements are kept
+only for accounting. Replay accepts a switch only after the selected-server
+receipt, from the direction's current source, to a source that direction has
+not used, before any fallback, restore or Review record, and with the exact
+pending debits; Review verification additionally requires every switch to
+follow the comparison's order. A run makes at most four switches, and only
+while the journal has room for a full measurement epoch. A requested server
+is never replaced. The worker log shows each switch as
+`autotune-server-switch direction=... phase=... from=... to=...`.
+
+## CAKE options after an incomplete search
+
+When a directional search ends without a selection (its server kept failing,
+no loaded-latency sample could be taken, the optimizer was inconclusive or
+the candidates ran out), Review still offers CAKE if the search measured
+anything usable. Every such option is the exact download/upload rate pair
+that was running while one search measurement completed; only measurements
+that passed the search's reliability and loss checks, or its manual-review
+floor, qualify. Upload measurements, taken with the searched download rate,
+are preferred because both directions then ran with CAKE. The
+lowest-latency measurement becomes `partial_quality_first` and the
+highest-throughput one `partial_throughput_first` (one option when they
+coincide). Gaming and Gaming Extreme prefer the lowest latency; the other
+profiles prefer the higher throughput. **SQM disabled** remains available as
+a non-preferred option.
+
+These options are manual only and use the hard-capped shaped-fallback Apply
+manifest (schema 9, or 10 for a new instance): the measured rate is the
+ceiling and cannot grow automatically. Each option acknowledges
+`shaped-validation-incomplete` and every direction whose search did not
+finish (`download-search-incomplete`, `upload-search-incomplete`). A
+direction that never ran under load with CAKE at the option's rate adds
+`download-shaped-load-unmeasured` or `upload-shaped-load-unmeasured`; missed
+latency targets, a realization below the ordinary objective and background
+contamination add their usual codes. The raw fallback artifact keeps its
+schema and lists the options under `shaped_options`; the public result uses
+schema 7. After exhausted pair confirmation the pairs themselves were
+measured and rejected, so only the existing no-SQM options remain.
 
 ## Raw control below the server comparison
 

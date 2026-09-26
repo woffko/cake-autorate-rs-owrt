@@ -345,8 +345,8 @@ offered, marked with that finding, and need your confirmation to apply.
 ### When the test stops early
 
 If a test cannot finish (for example the route changed, the traffic budget
-ran out or a server kept failing after all retries), no new rates are offered
-from the incomplete measurements. The wizard says why it stopped and that
+ran out or the time limit expired), no new rates are offered from the
+incomplete measurements. The wizard says why it stopped and that
 your current settings are unchanged; you can keep them or run the test again.
 
 If the service refuses the test before it begins (for example the daemon and
@@ -369,6 +369,24 @@ the retry count. Route, traffic-accounting and deadline failures still stop
 the test immediately. **Remember this choice** saves the retry count together
 with the traffic choice for that instance in this browser. Scheduled runs use
 the default.
+
+If a server still fails after all retries, the test switches to another
+server that did well in the server comparison and repeats its measurements
+there, so results from two servers are never compared with each other. Only
+the failing direction changes server; the traffic already used still counts.
+A test switches at most four times.
+
+### When the search could not finish
+
+Sometimes the search for the best rate stops before it can choose one, for
+example when the upload server keeps failing on every server. If the search
+measured at least one usable rate with CAKE, Review offers it: **Lowest
+measured latency (search incomplete)** and, when different, **Highest
+measured throughput (search incomplete)**. These use exactly the rates that
+were running during that measurement. Their confirmations list what could not
+be measured, for example that upload was never tested under load with CAKE at
+that rate. **SQM disabled** is still offered. Gaming preselects the lowest
+latency; the other profiles preselect the higher throughput.
 
 ## Explicit policy route
 
