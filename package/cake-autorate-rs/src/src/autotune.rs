@@ -3892,6 +3892,30 @@ fn repeatable_low_realization_peer(
         .map(|(peer_index, _)| peer_index)
 }
 
+/// Next Gaming candidate after unrepeatable low realization: 90% of the worst
+/// clean sample at the current rate, bounded by the exploration minimum and
+/// only when that rate has not been measured yet.
+fn latency_first_descent_candidate(input: &ProfileSearchInput, candidate_kbps: u64) -> Option<u64> {
+    let achieved_low = input
+        .observations
+        .iter()
+        .filter(|observation| {
+            observation.candidate_kbps == candidate_kbps
+                && observation.loss_percent <= input.thresholds.loss_max_percent
+                && !observation.transport_censored
+                && observation.achieved_kbps > 0
+        })
+        .map(|observation| observation.achieved_kbps)
+        .min()?;
+    let next = rounded_search_rate(achieved_low as f64 * 0.9)
+        .max(input.minimum_kbps)
+        .min(candidate_kbps.saturating_sub(1));
+    (next >= input.minimum_kbps
+        && next < candidate_kbps
+        && !candidate_was_tested(&input.observations, next))
+    .then_some(next)
+}
+
 fn controlled_candidate_from_low_realization(
     input: &ProfileSearchInput,
     metrics: &[SearchObservationMetrics],
@@ -4748,6 +4772,22 @@ pub fn optimize_profile_direction(
                     "repeat-low-candidate-realization",
                     Some(last.candidate_kbps),
                 ));
+            }
+            // Gaming puts latency first: on a noisy link whose samples do not
+            // repeat within 5%, step down and measure again instead of giving
+            // up on shaping. The lower rate is re-tested; nothing is inferred.
+            if matches!(
+                input.profile,
+                AutotuneProfile::Gaming | AutotuneProfile::GamingExtreme
+            ) && input.observations.len() < input.max_attempts
+            {
+                if let Some(next) = latency_first_descent_candidate(&input, last.candidate_kbps) {
+                    return Ok(finish(
+                        ProfileSearchAction::Test,
+                        "latency-first-descent-after-unrepeatable-realization",
+                        Some(next),
+                    ));
+                }
             }
             return Ok(finish(
                 ProfileSearchAction::Inconclusive,
@@ -8481,7 +8521,9 @@ mod tests {
     }
 
     #[test]
-    fn variable_advisory_requires_the_strict_profile_quality_target() {
+    fn gaming_steps_down_after_unrepeatable_low_realization() {
+        // Samples 410/470/440 do not repeat within 5%. Gaming puts latency
+        // first, so it measures the exploration minimum instead of giving up.
         let result = profile_search(
             AutotuneProfile::Gaming,
             800_000,
@@ -8492,8 +8534,29 @@ mod tests {
                 search_observation(752_000, 440_000, 8.0),
             ],
         );
-        assert_eq!(result.action, ProfileSearchAction::Inconclusive);
-        assert_eq!(result.reason, "low-candidate-realization-not-repeatable");
+        assert_eq!(result.action, ProfileSearchAction::Test);
+        assert_eq!(
+            result.reason,
+            "latency-first-descent-after-unrepeatable-realization"
+        );
+        assert_eq!(result.next_candidate_kbps, Some(560_000));
+
+        // Once the lowest allowed rate has been measured there is nowhere
+        // further to go; the search ends instead of looping.
+        let settled = profile_search(
+            AutotuneProfile::Gaming,
+            800_000,
+            560_000,
+            vec![
+                search_observation(752_000, 410_000, 8.0),
+                search_observation(752_000, 470_000, 8.0),
+                search_observation(752_000, 440_000, 8.0),
+                search_observation(560_000, 300_000, 8.0),
+                search_observation(560_000, 350_000, 8.0),
+                search_observation(560_000, 320_000, 8.0),
+            ],
+        );
+        assert_ne!(settled.action, ProfileSearchAction::Test);
     }
 
     #[test]

@@ -305,7 +305,10 @@ Gaming puts latency first and explores wider links more deeply using these
 direction-specific floors (formerly the separate Extreme A+ opt-in, which the
 wizard no longer offers; `gaming_extreme` requests behave the same way).
 Options below 70% of the conservative raw reference stay manual-only, and the
-option catalog still includes the highest-throughput candidate:
+option catalog still includes the highest-throughput candidate. On a noisy
+link whose samples at one rate do not repeat within 5%, Gaming steps down to
+90% of the worst clean sample (never below the floor) and measures again
+instead of ending the search:
 
 | Conservative raw reference | Download exploration floor | Upload exploration floor |
 |---:|---:|---:|
