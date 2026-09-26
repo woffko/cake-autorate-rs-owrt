@@ -528,7 +528,13 @@ impl ControlMessage {
                     // Keep the established public Start wire byte-compatible for
                     // every existing-instance operation. The v5 lifecycle field
                     // is private journal authority until bootstrap is complete.
-                    OperationTargetState::ExistingManaged => operation.encode_for_schema(4)?,
+                    OperationTargetState::ExistingManaged => operation.encode_for_schema(
+                        if operation.server_failure_retries.is_some() {
+                            4 + RETRY_SCHEMA_OFFSET
+                        } else {
+                            4
+                        },
+                    )?,
                     OperationTargetState::AbsentBootstrap => operation.encode()?,
                 }
             });
@@ -561,27 +567,28 @@ impl ControlMessage {
             let wire_matches_target = if operation.route.fwmark_mask.is_some() {
                 operation.encode()?.lines().next() == Some(header)
             } else {
-                match (operation.traffic_policy_explicit, operation.target_state) {
-                    (false, OperationTargetState::ExistingManaged) => {
-                        header == PUBLIC_EXISTING_REQUEST_HEADER
-                    }
-                    (false, OperationTargetState::AbsentBootstrap) => header == REQUEST_HEADER,
+                let legacy = match (operation.traffic_policy_explicit, operation.target_state) {
+                    (false, OperationTargetState::ExistingManaged) => 4,
+                    (false, OperationTargetState::AbsentBootstrap) => 6,
                     (true, OperationTargetState::ExistingManaged) => {
-                        header
-                            == if operation.traffic_plan.is_some() {
-                                PLANNED_MANAGED_REQUEST_HEADER
-                            } else {
-                                EXPLICIT_MANAGED_REQUEST_HEADER
-                            }
+                        if operation.traffic_plan.is_some() {
+                            9
+                        } else {
+                            7
+                        }
                     }
                     (true, OperationTargetState::AbsentBootstrap) => {
-                        header
-                            == if operation.traffic_plan.is_some() {
-                                PLANNED_BOOTSTRAP_REQUEST_HEADER
-                            } else {
-                                EXPLICIT_BOOTSTRAP_REQUEST_HEADER
-                            }
+                        if operation.traffic_plan.is_some() {
+                            10
+                        } else {
+                            8
+                        }
                     }
+                };
+                if operation.server_failure_retries.is_some() {
+                    header == retry_request_header(legacy + RETRY_SCHEMA_OFFSET)
+                } else {
+                    header == legacy_request_header(legacy)?
                 }
             };
             if !wire_matches_target {
@@ -1438,7 +1445,7 @@ impl OperationRequest {
             let mut request = Self::decode(&legacy_text)?;
             request.server_failure_retries = Some(retries);
             request.validate()?;
-            if request.encode()? != input {
+            if request.encode_for_schema(full_schema)? != input {
                 return Err("operation request is not canonical".into());
             }
             return Ok(request);
@@ -1958,6 +1965,64 @@ mod tests {
                         &encoded.replace("route_dns_ipv4=192.0.2.53\n", field)
                     )
                     .is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn start_control_with_server_failure_retries_decodes_for_every_lifecycle() {
+        for absent in [false, true] {
+            for explicit in [false, true] {
+                let mut value = request();
+                value.identity.operation = OperationKind::FullAutotune;
+                if absent {
+                    value.target_state = OperationTargetState::AbsentBootstrap;
+                    value.capture_policy = Some(AutotuneCapturePolicyId::StandardV1);
+                }
+                if explicit {
+                    value.traffic_budget = TrafficPolicy::Unlimited;
+                    value.traffic_policy_explicit = true;
+                }
+                let legacy_message = ControlMessage {
+                    control: ControlRequest {
+                        request_id: "99".repeat(16),
+                        command: ControlCommand::Start,
+                        job_id: Some(value.identity.job_id.clone()),
+                        job_token: Some(value.identity.job_token.clone()),
+                    },
+                    operation: Some(value.clone()),
+                };
+                let legacy_wire = legacy_message.encode().unwrap();
+                let legacy_schema: u8 = legacy_wire
+                    .lines()
+                    .nth(6)
+                    .unwrap()
+                    .split('\t')
+                    .nth(1)
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                value.server_failure_retries = Some(2);
+                let message = ControlMessage {
+                    operation: Some(value.clone()),
+                    ..legacy_message.clone()
+                };
+                let wire = message.encode().unwrap();
+                assert_eq!(
+                    wire.lines().nth(6),
+                    Some(retry_request_header(legacy_schema + RETRY_SCHEMA_OFFSET).as_str())
+                );
+                assert_eq!(ControlMessage::decode(&wire).unwrap(), message);
+                // The private journal schema must not be accepted on the public
+                // Start wire, with or without retries.
+                if !explicit && !absent {
+                    let private = format!(
+                        "{}{}",
+                        &wire[..nth_newline_end(&wire, 6).unwrap()],
+                        value.encode().unwrap()
+                    );
+                    assert!(ControlMessage::decode(&private).is_err());
                 }
             }
         }

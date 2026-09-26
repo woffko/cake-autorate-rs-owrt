@@ -1297,6 +1297,166 @@ mod tests {
         build_bootstrap_request(intent, context, "4".repeat(32), "5".repeat(64), 1_000)
     }
 
+    fn launch_fixture_route_identity(
+        intent: &AutotuneLaunchIntent,
+        fwmark_mask: Option<u32>,
+    ) -> RouteIdentity {
+        let device = intent.expected_target_interface.clone();
+        match intent.route_mode.as_str() {
+            "main" => RouteIdentity {
+                device_ifindex: None,
+                fwmark_mask: None,
+                mode: "main".into(),
+                member: String::new(),
+                device,
+                source_ip: "192.0.2.2".into(),
+                fwmark: String::new(),
+                table: "main".into(),
+            },
+            "mwan3" => RouteIdentity {
+                device_ifindex: None,
+                fwmark_mask,
+                mode: "mwan3".into(),
+                member: intent.mwan3_member.clone(),
+                device,
+                source_ip: "192.0.2.2".into(),
+                fwmark: "0x100".into(),
+                table: "1".into(),
+            },
+            "explicit" => RouteIdentity {
+                device_ifindex: Some(7),
+                fwmark_mask: Some(0x3f00),
+                mode: "explicit".into(),
+                member: String::new(),
+                device,
+                source_ip: "192.0.2.10".into(),
+                fwmark: "0x100".into(),
+                table: "101".into(),
+            },
+            other => panic!("unexpected fixture route mode {other}"),
+        }
+    }
+
+    /// The LuCI package test regenerates these argv from the real launch
+    /// builder. Every case must survive the parse, request build and Start
+    /// control encode/decode the daemon performs, for each route shape the
+    /// live attestation can report.
+    #[test]
+    fn luci_launch_argv_fixture_decodes_through_the_start_control_path() {
+        use super::super::protocol::{ControlCommand, ControlMessage, ControlRequest};
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../luci-app-cake-autorate-rs/tests/fixtures/autotune-launch-argv.json"
+        ))
+        .unwrap();
+        let cases = fixture["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 24);
+        let mut retry_cases = 0;
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let argv: Vec<String> = case["argv"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(argv[0], "--calibrationctl", "{name}");
+            let bootstrap = match argv[1].as_str() {
+                "autotune-start" => false,
+                "autotune-bootstrap-start" => true,
+                other => panic!("{name}: unexpected command {other}"),
+            };
+            let mut rest = argv[2..].iter().cloned();
+            let planned = bootstrap.then(|| rest.next().unwrap());
+            let intent =
+                parse_launch_intent(rest).unwrap_or_else(|error| panic!("{name}: {error}"));
+            let expected_retries = argv
+                .iter()
+                .position(|value| value == "--server-failure-retries")
+                .map(|index| argv[index + 1].parse::<u8>().unwrap());
+            assert_eq!(intent.server_failure_retries, expected_retries, "{name}");
+            retry_cases += usize::from(expected_retries.is_some());
+            // An mwan3 route may be attested with or without a mark mask.
+            let masks: &[Option<u32>] = if intent.route_mode == "mwan3" {
+                &[None, Some(0x3f00)]
+            } else {
+                &[None]
+            };
+            for mask in masks {
+                let route_identity = launch_fixture_route_identity(&intent, *mask);
+                let route_fingerprint = sha256sum(route_identity.stable_key().as_bytes()).unwrap();
+                let request = if let Some(planned) = planned.as_deref() {
+                    let absence = BootstrapAbsenceIdentity::from_raw(
+                        &intent.instance,
+                        planned,
+                        &intent.expected_target_interface,
+                        &route_fingerprint,
+                        b"cake-autorate.globals=globals\n",
+                        b"",
+                    );
+                    let context = bootstrap_context_from_attestation(
+                        &intent,
+                        planned,
+                        route_identity,
+                        route_fingerprint,
+                        absence,
+                    )
+                    .unwrap_or_else(|error| panic!("{name}: {error}"));
+                    build_test_bootstrap_request(&intent, context)
+                } else {
+                    let mut route = operation_route_identity(&route_identity).unwrap();
+                    route.dns_server = intent
+                        .explicit_route
+                        .as_ref()
+                        .map(|selected| selected.dns_server);
+                    let context = LiveRequestContext {
+                        target_interface: intent.expected_target_interface.clone(),
+                        managed_sqm_section: format!("cake_{}", intent.instance),
+                        configured_speedtest_backend: "speedtest-go".to_string(),
+                        configured_dl_bound_kbps: Some(100_000),
+                        configured_ul_bound_kbps: Some(20_000),
+                        unshaped_dl_bound_kbps: Some(100_000),
+                        unshaped_ul_bound_kbps: Some(20_000),
+                        download_shaped: true,
+                        upload_shaped: true,
+                        route,
+                        route_fingerprint,
+                        config_fingerprint: "2".repeat(64),
+                        sqm_fingerprint: "3".repeat(64),
+                    };
+                    build_request(
+                        &intent,
+                        context,
+                        "4".repeat(32),
+                        "5".repeat(64),
+                        1_000,
+                        OperationOrigin::Luci,
+                        false,
+                    )
+                }
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+                let message = ControlMessage {
+                    control: ControlRequest {
+                        request_id: "99".repeat(16),
+                        command: ControlCommand::Start,
+                        job_id: Some(request.identity.job_id.clone()),
+                        job_token: Some(request.identity.job_token.clone()),
+                    },
+                    operation: Some(request),
+                };
+                let wire = message
+                    .encode()
+                    .unwrap_or_else(|error| panic!("{name} mask {mask:?}: {error}"));
+                assert_eq!(
+                    ControlMessage::decode(&wire)
+                        .unwrap_or_else(|error| panic!("{name} mask {mask:?}: {error}")),
+                    message,
+                    "{name} mask {mask:?}"
+                );
+            }
+        }
+        assert_eq!(retry_cases, 12);
+    }
+
     #[test]
     fn server_failure_retries_flag_is_bounded_and_reaches_the_request() {
         assert_eq!(

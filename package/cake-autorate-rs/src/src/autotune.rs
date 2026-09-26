@@ -8521,6 +8521,34 @@ mod tests {
     }
 
     #[test]
+    fn variable_advisory_requires_the_strict_profile_quality_target() {
+        // The same clean but unrepeatable samples: Fair may establish shaper
+        // control through the variable-link advisory; Gaming misses its strict
+        // quality target, so it never takes that path and uses its own
+        // latency-first descent instead.
+        let observations = || {
+            vec![
+                search_observation(752_000, 410_000, 8.0),
+                search_observation(752_000, 470_000, 8.0),
+                search_observation(752_000, 440_000, 8.0),
+            ]
+        };
+        let fair = profile_search(AutotuneProfile::Fair, 800_000, 640_000, observations());
+        assert_eq!(
+            fair.reason,
+            "lower-variable-candidate-to-establish-shaper-control"
+        );
+        for profile in [AutotuneProfile::Gaming, AutotuneProfile::GamingExtreme] {
+            let result = profile_search(profile, 800_000, 640_000, observations());
+            assert_eq!(result.action, ProfileSearchAction::Test, "{profile:?}");
+            assert_eq!(
+                result.reason, "latency-first-descent-after-unrepeatable-realization",
+                "{profile:?}"
+            );
+        }
+    }
+
+    #[test]
     fn gaming_steps_down_after_unrepeatable_low_realization() {
         // Samples 410/470/440 do not repeat within 5%. Gaming puts latency
         // first, so it measures the exploration minimum instead of giving up.

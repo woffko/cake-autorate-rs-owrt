@@ -2079,6 +2079,30 @@ async function testNativeAutotuneTransport() {
 		} finally {
 			uci.get = uciGet;
 		}
+		{
+			// The daemon test decodes these exact argv through its Start control
+			// path, so a LuCI launch that the daemon cannot accept fails there.
+			const fixturePath = path.join(__dirname, 'fixtures', 'autotune-launch-argv.json');
+			const fixture = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
+			uci.get = (config, section, key) => (config === 'cake-autorate' && fixture.explicit_route_uci[section]
+				? fixture.explicit_route_uci[section][key] : null);
+			try {
+				const actual = fixture.cases.map(item => helpers.nativeAutotuneLaunchArgs(
+					item.call.section, item.call.wan, item.call.backend, item.call.route_mode,
+					item.call.mwan3_member, item.call.profile, item.call.conservative, item.call.strategy,
+					item.call.access, item.call.existing, item.call.planned_section,
+					JSON.parse(JSON.stringify(item.call.traffic_policy))));
+				if (process.env.CAKE_UPDATE_LAUNCH_FIXTURE === '1') {
+					fixture.cases.forEach((item, index) => { item.argv = actual[index]; });
+					fs.writeFileSync(fixturePath, JSON.stringify(fixture, null, 1) + '\n');
+				}
+				fixture.cases.forEach((item, index) => assert.deepEqual(actual[index], item.argv,
+					`launch argv fixture ${item.name} is stale; regenerate with CAKE_UPDATE_LAUNCH_FIXTURE=1`));
+				assert(fixture.cases.some(item => item.argv.includes('--server-failure-retries')));
+			} finally {
+				uci.get = uciGet;
+			}
+		}
 		const autoLaunchArgs = helpers.nativeAutotuneLaunchArgs(
 			'wan_sqm', 'pppoe-wan', 'auto', 'main', '',
 			'variable_link', true, 'full_raw', access, true, 'cake_wan_sqm', explicitTrafficPolicy);
