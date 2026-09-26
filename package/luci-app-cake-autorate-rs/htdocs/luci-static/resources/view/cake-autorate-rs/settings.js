@@ -2532,9 +2532,9 @@ function nativeAutotuneAcknowledgementLabel(code) {
 	case 'upload-throughput-safety-floor':
 		return _('Upload goodput fell below the ordinary manual safety floor. The exact CAKE ceiling was tested, but the physical link was slower during calibration.');
 	case 'download-physical-capacity-limited':
-		return _('Download CAKE wire rate tracked measured goodput, but the physical link remained below the configured CAKE ceiling. This ceiling is not proven to control the bottleneck and cannot be applied automatically.');
+		return _('Download: CAKE followed the measured throughput, but the line stayed below the configured ceiling, so this ceiling is not proven and cannot be applied automatically.');
 	case 'upload-physical-capacity-limited':
-		return _('Upload CAKE wire rate tracked measured goodput, but the physical link remained below the configured CAKE ceiling. This ceiling is not proven to control the bottleneck and cannot be applied automatically.');
+		return _('Upload: CAKE followed the measured throughput, but the line stayed below the configured ceiling, so this ceiling is not proven and cannot be applied automatically.');
 	case 'download-icmp-latency':
 		return _('Download ICMP loaded latency missed the selected profile target.');
 	case 'download-transport-latency':
@@ -2946,7 +2946,7 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 			E('strong', {}, priorApplyBlocked ? _('Full Auto-Tune Review · throughput decline requires investigation') : _('Full Auto-Tune Review · ready to apply')),
 			E('p', {}, disabledFallback ?
 				_('The shaped search found no usable rate. The raw measurements were kept and can create one disabled instance without SQM; set rates later or calibrate again.') :
-				_('Calibration completed and restored runtime state. Every option is reconstructed from private evidence and bound to its own manifest; browser rate values are never Apply authority.')),
+				_('Calibration finished and the previous settings were restored. Each option is rebuilt from the saved measurements; values shown in the browser are never used for Apply.')),
 		];
 		if (!disabledFallback)
 			nodes.push(E('p', { 'class': 'cake-autotune-capacity-scope' },
@@ -2956,7 +2956,7 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 		if (nativePriorRawComparisonValidated(result.prior_raw_comparison)) {
 			var prior = result.prior_raw_comparison;
 			nodes.push(E('p', { 'class': 'cake-autotune-prior-throughput' }, cakeUi.text(
-				_('Compared with an earlier Full raw test on this route since boot: raw DL / UL %s / %s kbit/s now vs %s / %s kbit/s before (%s%% / %s%% retained). A drop can come from the link or the test servers; after a drop below 50%, scheduled runs need Review.').format(
+				_('Earlier Full raw test on this route since boot: raw DL / UL %s / %s kbit/s now vs %s / %s kbit/s before (%s%% / %s%% retained). After a drop below 50%, scheduled runs need Review.').format(
 					prior.current_download_kbps, prior.current_upload_kbps,
 					prior.prior_download_kbps, prior.prior_upload_kbps,
 					(100 * prior.current_download_kbps / prior.prior_download_kbps).toFixed(1),
@@ -2994,7 +2994,7 @@ function renderNativeAutotuneDiagnostics(result, onApplied, onSkip) {
 			E('div', { 'style': 'margin-top:10px;padding:9px;border:1px solid rgba(127,127,127,.35);border-radius:5px' }, acknowledgementNodes),
 			E('p', { 'style': 'margin:9px 0' }, disabledFallback ?
 				_('Apply only adds the disabled autorate section; SQM is not changed. If Apply times out, retrying the same option is safe.') :
-				_('Apply writes UCI, restarts only the selected instance, and verifies the resulting CAKE/SQM topology. A timeout has an unknown outcome; retrying this exact option is safe and idempotent.')),
+				_('Apply writes UCI, restarts only this instance and checks the resulting CAKE/SQM setup. If Apply times out, retrying the same option is safe.')),
 			E('div', { 'style': 'display:flex;flex-wrap:wrap;gap:8px' }, actionButtons)
 		);
 		if (state.error)
@@ -3035,7 +3035,7 @@ function autotuneProfileDefinitions() {
 			id: 'gaming',
 			title: _('Gaming'),
 			target: _('Target A+ · under 5 ms loaded-latency increase'),
-			description: _('Lowest latency: the highest rate that still earns A+, or the best grade found, searching down to 25% of capacity on wide links. The fastest measured option is offered too. Auto-Apply needs 70% of measured throughput kept; below that, or below 50% of earlier results, Review asks you. Uses diffserv4.')
+			description: _('Lowest latency: the highest rate that still earns A+, down to 25% of capacity on wide links; the fastest option is offered too. Auto-Apply needs 70% of throughput kept; below that, or below 50% of earlier results, Review asks you.')
 		},
 		{
 			id: 'gaming_extreme',
@@ -3060,7 +3060,7 @@ function autotuneProfileDefinitions() {
 			id: 'fair',
 			title: _('Fair'),
 			target: _('Throughput first · aim for C or better · under 200 ms'),
-			description: _('Throughput first: the highest safe rate, aiming for C or better. Auto-Apply needs 90% of measured throughput kept; below that, or below 50% of earlier results, Review asks you. Review may offer bypassing SQM when measurements support it.')
+			description: _('Throughput first: the highest safe rate, aiming for C or better. Auto-Apply needs 90% of measured throughput kept; below that, or below 50% of earlier results, Review asks you. Review may offer bypassing SQM.')
 		}
 	];
 }
@@ -3098,7 +3098,7 @@ function autotuneAccessRequest(state, bootstrapRequired) {
 		Number(dlCap) >= 100 && Number(dlCap) <= 100000000 &&
 		Number(ulCap) >= 100 && Number(ulCap) <= 100000000;
 	if (bootstrapRequired === true && !capsValid)
-		throw new Error(_('Creating a native Auto-Tune instance requires download and upload service caps between 100 and 100000000 kbit/s. They are hard search ceilings, not measured or proposed rates.'));
+		throw new Error(_('A new instance needs download and upload service caps (100–100000000 kbit/s). They only bound the search; they are not measured or proposed rates.'));
 
 	if (visibleAutotuneProfile(state && state.autotune_profile) !== 'variable_link') {
 		return {
@@ -3128,7 +3128,7 @@ function autotuneCalibrationStrategyControl(state, disabled, onChange, bootstrap
 	var reuseAvailable = autotuneHasTrustedCapacityReferences(state);
 	var descriptions = {
 		shaped_only: _('Keeps managed CAKE active while measuring. Safest default; it searches only inside capacity the current bounds can demonstrate.'),
-		full_raw: _('Temporarily bypasses the tested direction(s), including both during server comparison, under the recovery watchdog. Only the selected uplink is affected; this can consume substantially more traffic.'),
+		full_raw: _('Briefly turns off CAKE on this uplink to measure its raw speed (both directions while comparing servers), with automatic recovery. Uses much more traffic.'),
 		reuse_trusted: reuseAvailable ?
 			_('Revalidates the currently trusted/configured bounds without opening a raw-capacity path. It does not claim a new physical line rate.') :
 			_('Requires saved DL and UL P50 capacity references from a completed calibration. Run Shaped only or Full raw capacity first and apply its proposal.')
@@ -3309,7 +3309,7 @@ function variableLinkContextControl(state, disabled, onChange) {
 
 	if (state.capacity_learning_policy === 'scheduled_active')
 		children.push(E('div', { 'class': 'alert-message warning', 'style': 'margin-top:8px' },
-			_('Traffic warning: scheduled active calibration performs repeated download and upload controls. It remains review-only unless Auto-Apply is enabled separately, and is bounded by the saved daily/monthly traffic budgets.')));
+			_('Scheduled calibration repeats download and upload tests. It stays review-only unless Auto-Apply is enabled and never exceeds the daily and monthly traffic limits.')));
 
 	return E('div', {
 		'class': 'cake-variable-link-context',
@@ -3463,7 +3463,7 @@ function speedtestTrafficPolicyPanel(section_id, topology, container) {
 		var panel = E('div', { 'class': 'cake-speedtest-traffic cbi-section', 'style': 'margin:8px 0;padding:8px' }, [
 			E('h4', {}, _('Speed Test traffic')),
 			field(_('Traffic policy: '), mode), amountRow, cappedRows,
-			E('p', {}, cakeUi.text(_('The limit is the total download plus upload traffic of this one test, including retries. Unlimited removes only this byte limit; cancel and timeouts still apply.'))),
+			E('p', {}, cakeUi.text(_('The limit covers all download and upload traffic of this test, including retries. Unlimited removes only this limit; Cancel and timeouts still apply.'))),
 			error,
 			E('div', {}, [
 				E('button', { 'type': 'button', 'class': 'btn', 'click': function() {
@@ -3937,7 +3937,7 @@ function autotuneTrafficPolicyForRun(state, instance) {
 		autotuneCalibrationStrategy(state), state._traffic_estimate_dl_mbps, state._traffic_estimate_ul_mbps);
 	if (policy.mode === 'capped') {
 		if (estimate && policy.bytes < estimate.initial_plan_bytes)
-			throw new Error(_('The selected total traffic budget is below the initial-stage planning allowance of %s GB at the entered rates. Choose a larger budget or Unlimited; correct the planning rates only if they do not describe the expected link. This estimate does not guarantee completion.').format(
+			throw new Error(_('The budget is below the initial-stage planning allowance of %s GB at these rates. Choose a larger budget or Unlimited.').format(
 				(estimate.initial_plan_bytes / 1000000000).toFixed(2)));
 	}
 	if (state._traffic_policy_remember) {
@@ -5882,7 +5882,7 @@ function showCreateWizard(grid, name, existingName) {
 							'white-space:pre-wrap;margin-top:6px' : 'display:none'
 					}, plan)
 				]),
-				_('Each instance owns one L3 device and one CAKE queue. Members already owned by another instance are excluded. Full Auto-Tune keeps the selected mwan3 route and does not change the global default route.')));
+				_('Each instance owns one device and one CAKE queue; members used by another instance are hidden. Auto-Tune keeps the selected mwan3 route and does not change the default route.')));
 		}
 
 		return fields;
@@ -6292,7 +6292,7 @@ function showCreateWizard(grid, name, existingName) {
 				_('This choice applies only to the current uplink. Other uplinks may use different profiles.')),
 			E('div', { 'class': 'alert-message warning' }, [
 				E('strong', {}, _('Traffic warning: ')),
-				_('Only this mwan3 member is calibrated now. Client traffic is not intentionally interrupted, but concurrent traffic on this uplink can reduce measurement confidence.')
+				_('Only this mwan3 member is tested now. Client traffic is not interrupted, but traffic on this uplink can lower measurement confidence.')
 			]),
 			wizardField(_('Calibration'), E('div', {}, [
 				runButton, ' ', conservativeButton, ' ', cancelButton, ' ', restoreButton,
@@ -7678,7 +7678,7 @@ function addQualityOptions(section) {
 		[ 'variable_link', _('Variable link — measured knee, target B') ],
 		[ 'fair', _('Fair — throughput first, aim for C') ]
 	], 'best_overall');
-	o.description = _('Every profile starts from the highest measured/testable rate. Profile percentages are exploration limits or Auto-Apply objectives, never an unconditional rate reduction.');
+	o.description = _('Every profile starts from the highest measured rate. Profile percentages limit the search or set Auto-Apply goals; they never cut the rate up front.');
 	describe(o, 'autotune_profile');
 	o = listValue(section, 'testing', 'autotune_calibration_strategy', _('Calibration strategy'), [
 		[ 'shaped_only', _('Shaped only (recommended)') ],
@@ -7835,7 +7835,7 @@ function addSetupOptions(section) {
 	o.depends('route_mode', 'explicit');
 	o.rawhtml = true;
 	o.cfgvalue = function() {
-		return E('span', {}, [ cakeUi.text(_('Full package only. Uses an existing policy route (source, table, mark); it never creates VPNs, rules or tables. If the route stops matching, probes and tests stop instead of using the main table. Speed Test and Auto-Tune also need Route DNS IPv4.')),
+		return E('span', {}, [ cakeUi.text(_('Full package only. Uses an existing policy route (source, table, mark) and never creates VPNs, rules or tables. If the route stops matching, probes and tests stop. Speed Test and Auto-Tune also need Route DNS IPv4.')),
 			' ', cakeUi.docsLink('explicit-policy-route') ]);
 	};
 
@@ -8274,7 +8274,7 @@ function addLoggingOptions(section) {
 	value(section, 'logging', 'log_file_buffer_size_B', _('Log buffer bytes'), 'uinteger', '512');
 	value(section, 'logging', 'log_file_buffer_timeout_ms', _('Log buffer timeout'), 'uinteger', '500');
 	o = modal(section.taboption('logging', form.DummyValue, '_log_retention', _('Log retention')));
-	o.default = _('One active log and one previous log are retained. Rotation does not run a compressor. Diagnostic downloads remain plain text; existing compressed legacy logs can still be read.');
+	o.default = _('One current and one previous log are kept, uncompressed. Diagnostic downloads are plain text; older compressed logs can still be read.');
 
 	flag(section, 'logging', 'mqtt_enabled', _('MQTT publisher'), '0');
 
@@ -8754,7 +8754,7 @@ return L.view.extend({
 		addTopicIntroduction(s, 'sqm', '_sqm_topic',
 			_('Configure the managed SQM interface, CAKE queue, link-layer overhead and PPPoE/Ethernet details.'));
 		addTopicIntroduction(s, 'testing', '_testing_topic',
-			_('Run speed tests and Full Auto-Tune. Scheduled active calibration is opt-in and can transfer many gigabytes; its quiet window and hard daily/monthly budgets apply per uplink.'));
+			_('Speed tests and Full Auto-Tune. Scheduled calibration is optional, can use many gigabytes, and keeps its quiet window and daily/monthly limits per uplink.'));
 		addTopicIntroduction(s, 'monitoring', '_monitoring_topic',
 			_('Configure RAM-only graph sampling, logging, MQTT and diagnostic export behavior. Graph memory limits remain on the Graphs page.'));
 		addTopicIntroduction(s, 'advanced', '_advanced_topic',

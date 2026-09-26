@@ -487,7 +487,7 @@ return L.view.extend({
 		};
 
 		addFlag(s, 'traffic_rules_enabled', _('Enable outbound traffic prioritization'), '0',
-			_('Tags forwarded and router-originated upload packets before outbound CAKE. Turning this off does not stop CAKE, SQM or Autorate and does not remove their bandwidth limits.'));
+			_('Tags forwarded and router-originated upload traffic before CAKE. Turning this off keeps CAKE, SQM and Autorate running with their limits.'));
 
 		o = s.option(form.ListValue, 'traffic_profile', _('Traffic profile'));
 		o.widget = 'radio';

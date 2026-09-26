@@ -508,7 +508,7 @@ function showQualityTest(section, status, calibrationSummary) {
 	var state = E('div', { 'class': 'alert-message notice cake-quality-job-state' },
 		_('Checking for an active Rating operation…'));
 	var detail = E('div', { 'class': 'cake-quality-job-detail' }, [
-		cakeUi.text(_('Automatic: waits for a quiet link, then runs download-only and upload-only load through this uplink (1–3 passes; several GB on a fast line). Guided: you run a speed test from a LAN device while the router measures. Neither mode changes SQM or CAKE limits.')),
+		cakeUi.text(_('Automatic: waits for a quiet link, then loads this uplink download-only and upload-only (1–3 passes; several GB on fast lines). Guided: you run a speed test from a LAN device. Neither changes SQM or CAKE limits.')),
 		' ', cakeUi.docsLink('get-rating') ]);
 	var running = false;
 	var starting = false;
