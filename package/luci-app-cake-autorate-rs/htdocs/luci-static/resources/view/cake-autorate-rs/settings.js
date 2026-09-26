@@ -1636,6 +1636,8 @@ var NATIVE_AUTOTUNE_ACKNOWLEDGEMENT_CODES = {
 	'upload-raw-quality-target': true,
 	'topology-comparison-traffic-budget': true,
 	'topology-comparison-unmeasurable': true,
+	'download-raw-below-server-comparison': true,
+	'upload-raw-below-server-comparison': true,
 	'download-shaping-bypassed': true,
 	'upload-shaping-bypassed': true,
 	'sqm-disabled': true,
@@ -2561,6 +2563,10 @@ function nativeAutotuneAcknowledgementLabel(code) {
 		return _('The traffic budget could not cover another unshaped comparison, so the fully verified shaped proposal is applied; no raw result was inferred. Rerun Full raw with a larger budget to compare again.');
 	case 'topology-comparison-unmeasurable':
 		return _('One optional without-shaping comparison could not produce a trustworthy transfer result. This option keeps shaping for that direction and uses only the fully verified shaped evidence.');
+	case 'download-raw-below-server-comparison':
+		return _('Download without shaping measured less than 80% of the speed seen when comparing servers. The server or the line may have slowed down during the test; the proposed rate may be lower than your line allows.');
+	case 'upload-raw-below-server-comparison':
+		return _('Upload without shaping measured less than 80% of the speed seen when comparing servers. The server or the line may have slowed down during the test; the proposed rate may be lower than your line allows.');
 	case 'download-shaping-bypassed':
 		return _('This option disables CAKE shaping for download.');
 	case 'upload-shaping-bypassed':

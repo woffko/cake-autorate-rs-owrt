@@ -51,6 +51,8 @@ pub(crate) enum NativeApplyAcknowledgement {
     LoadedLatencyUnobservable,
     ShapedValidationIncomplete,
     TopologyComparisonUnmeasurable,
+    DownloadRawBelowServerComparison,
+    UploadRawBelowServerComparison,
 }
 
 impl NativeApplyAcknowledgement {
@@ -83,6 +85,8 @@ impl NativeApplyAcknowledgement {
             Self::LoadedLatencyUnobservable => "loaded-latency-unobservable",
             Self::ShapedValidationIncomplete => "shaped-validation-incomplete",
             Self::TopologyComparisonUnmeasurable => "topology-comparison-unmeasurable",
+            Self::DownloadRawBelowServerComparison => "download-raw-below-server-comparison",
+            Self::UploadRawBelowServerComparison => "upload-raw-below-server-comparison",
         }
     }
 
@@ -115,6 +119,8 @@ impl NativeApplyAcknowledgement {
             "loaded-latency-unobservable" => Self::LoadedLatencyUnobservable,
             "shaped-validation-incomplete" => Self::ShapedValidationIncomplete,
             "topology-comparison-unmeasurable" => Self::TopologyComparisonUnmeasurable,
+            "download-raw-below-server-comparison" => Self::DownloadRawBelowServerComparison,
+            "upload-raw-below-server-comparison" => Self::UploadRawBelowServerComparison,
             _ => return None,
         })
     }

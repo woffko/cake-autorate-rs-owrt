@@ -846,6 +846,9 @@ for (const option of nativeTrafficBudgetLimited.public_apply_contract.options) {
 }
 assert.equal(helpers.nativeAutotunePublicResultValidated(nativeTrafficBudgetLimited), true,
 	'a conservative raw-repeat budget limit must preserve every verified shaped option as manual Review');
+for (const code of [ 'download-raw-below-server-comparison', 'upload-raw-below-server-comparison' ])
+	assert.match(helpers.nativeAutotuneAcknowledgementLabel(code), /less than 80% of the speed seen when comparing servers/,
+		'a raw control below the server comparison must be explained in plain words');
 assert.match(helpers.nativeAutotuneAcknowledgementLabel('topology-comparison-traffic-budget'),
 	/fully verified shaped proposal/,
 	'the explicit confirmation must explain that no raw result was inferred');

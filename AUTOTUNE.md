@@ -461,6 +461,15 @@ budget failures remain fatal. The field uses request schemas 23–41 (schemas
 4–22 plus the trailing field); the daemon advertises
 `native_server_failure_retry_version=1`.
 
+## Raw control below the server comparison
+
+A Full raw control whose goodput stays below 80% of the selected server
+comparison no longer ends the run. The measurement is kept, and every shaped
+option in Review carries `download-raw-below-server-comparison` or
+`upload-raw-below-server-comparison`, so it can only be applied manually after
+the user confirms that the line or server may have been slower during the
+test. Raw fallback options keep their own acknowledgement list.
+
 ## Background traffic and conservative continuation
 
 Retrying on a quiet link is the preferred action. **Continue conservatively**

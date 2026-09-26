@@ -11877,6 +11877,12 @@ fn native_apply_execution_plans_transaction(
     }
     let records = AutotuneEvidenceStore::read_existing(job_directory)?;
     let replay = AutotuneReplayState::replay(&request, expected_worker_run_id, &records)?;
+    let (raw_below_download, raw_below_upload) = raw_controls_below_server_comparison(
+        job_directory,
+        &request,
+        expected_worker_run_id,
+        &records,
+    )?;
     if !replay.runtime_restored
         || !matches!(
             replay.next_action()?,
@@ -12050,7 +12056,17 @@ fn native_apply_execution_plans_transaction(
                  selected_ul_kbps: Option<u64>,
                  runtime_minimum_dl_kbps: Option<u64>,
                  runtime_minimum_ul_kbps: Option<u64>,
-                 required_acknowledgements: Vec<NativeApplyAcknowledgement>| {
+                 mut required_acknowledgements: Vec<NativeApplyAcknowledgement>| {
+        if raw_below_download {
+            required_acknowledgements
+                .push(NativeApplyAcknowledgement::DownloadRawBelowServerComparison);
+        }
+        if raw_below_upload {
+            required_acknowledgements
+                .push(NativeApplyAcknowledgement::UploadRawBelowServerComparison);
+        }
+        required_acknowledgements.sort_unstable();
+        required_acknowledgements.dedup();
         let (action, sqm_direction_mode, download_mode, upload_mode) =
             native_apply_topology_contract(selected_topology)?;
         let auto_apply_evidence_pass = required_acknowledgements.is_empty();
@@ -13906,6 +13922,75 @@ fn verify_server_comparison_report(
     worker_run_id: &str,
     records: &[AutotuneEvidenceRecord],
 ) -> Result<Option<NativeReviewArtifact>, String> {
+    Ok(
+        server_comparison_report_and_reference(job_directory, request, worker_run_id, records)?
+            .map(|(artifact, _)| artifact),
+    )
+}
+
+/// Directions whose raw control goodput fell below the selected server
+/// comparison's consistency threshold. Such a run is still reviewable; every
+/// option then carries an explicit acknowledgement instead of the run failing.
+fn raw_controls_below_server_comparison(
+    job_directory: &Path,
+    request: &OperationRequest,
+    worker_run_id: &str,
+    records: &[AutotuneEvidenceRecord],
+) -> Result<(bool, bool), String> {
+    let Some((_, qualified)) =
+        server_comparison_report_and_reference(job_directory, request, worker_run_id, records)?
+    else {
+        return Ok((false, false));
+    };
+    let (mut download, mut upload) = (false, false);
+    for record in records {
+        let (topology, direction, achieved) = match record.evidence {
+            AutotuneEvidence::Measurement(value) => (
+                value.topology,
+                value.direction,
+                match value.direction {
+                    SpeedtestDirection::Download => value.achieved_dl_kbps,
+                    SpeedtestDirection::Upload => value.achieved_ul_kbps,
+                    SpeedtestDirection::Both => None,
+                },
+            ),
+            AutotuneEvidence::RawControlCapacity(value) => {
+                (value.topology, value.direction, Some(value.achieved_kbps))
+            }
+            _ => continue,
+        };
+        match attest_qualified_raw_control(
+            request,
+            record.phase,
+            topology,
+            direction,
+            achieved,
+            qualified,
+        ) {
+            Ok(()) => {}
+            Err(error) if error == "server-or-link-capacity-changed" => match direction {
+                SpeedtestDirection::Download => download = true,
+                SpeedtestDirection::Upload => upload = true,
+                SpeedtestDirection::Both => {}
+            },
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((download, upload))
+}
+
+fn server_comparison_report_and_reference(
+    job_directory: &Path,
+    request: &OperationRequest,
+    worker_run_id: &str,
+    records: &[AutotuneEvidenceRecord],
+) -> Result<
+    Option<(
+        NativeReviewArtifact,
+        Option<super::server_qualification::QualifiedCapacity>,
+    )>,
+    String,
+> {
     let replay = AutotuneReplayState::replay(request, worker_run_id, records)?;
     if !replay.capacity_qualification_seen {
         if replay.server_selection_required {
@@ -14067,40 +14152,13 @@ fn verify_server_comparison_report(
     } else {
         None
     };
-    for record in records {
-        match record.evidence {
-            AutotuneEvidence::Measurement(value) => {
-                let achieved = match value.direction {
-                    SpeedtestDirection::Download => value.achieved_dl_kbps,
-                    SpeedtestDirection::Upload => value.achieved_ul_kbps,
-                    SpeedtestDirection::Both => None,
-                };
-                attest_qualified_raw_control(
-                    request,
-                    record.phase,
-                    value.topology,
-                    value.direction,
-                    achieved,
-                    qualified,
-                )?;
-            }
-            AutotuneEvidence::RawControlCapacity(value) => {
-                attest_qualified_raw_control(
-                    request,
-                    record.phase,
-                    value.topology,
-                    value.direction,
-                    Some(value.achieved_kbps),
-                    qualified,
-                )?;
-            }
-            _ => {}
-        }
-    }
-    Ok(Some(NativeReviewArtifact {
-        digest: digest.to_string(),
-        json: stored,
-    }))
+    Ok(Some((
+        NativeReviewArtifact {
+            digest: digest.to_string(),
+            json: stored,
+        },
+        qualified,
+    )))
 }
 
 fn bind_private_accounting_plan(
@@ -14852,7 +14910,8 @@ fn run_directional_capture_load_with_session(
                 reference.upload_kbps
             );
         }
-        return Err(error.into());
+        // The measurement is kept: Review marks this direction with an explicit
+        // acknowledgement instead of the whole run failing.
     }
     if !thresholds_met {
         if let Some(snapshot) = last_progress.as_ref() {
@@ -23430,11 +23489,26 @@ mod tests {
                 SpeedtestDirection::Upload => raw.achieved_ul_kbps = Some(8_000),
                 SpeedtestDirection::Both => unreachable!(),
             }
+            // A raw control below the comparison no longer fails the run:
+            // the report stays valid and Review marks exactly that direction.
+            assert!(
+                verify_server_comparison_report(&root, &operation, &worker, &changed)
+                    .unwrap()
+                    .is_some()
+            );
             assert_eq!(
-                verify_server_comparison_report(&root, &operation, &worker, &changed).unwrap_err(),
-                "server-or-link-capacity-changed"
+                raw_controls_below_server_comparison(&root, &operation, &worker, &changed).unwrap(),
+                (
+                    direction == SpeedtestDirection::Download,
+                    direction == SpeedtestDirection::Upload
+                )
             );
         }
+        assert_eq!(
+            raw_controls_below_server_comparison(&root, &operation, &worker, &records).unwrap(),
+            (false, false),
+            "consistent raw controls carry no acknowledgement"
+        );
         assert_eq!(
             worker_failure_terminal_code("server-or-link-capacity-changed"),
             "server-or-link-capacity-changed"
@@ -23451,10 +23525,16 @@ mod tests {
         );
         validate_raw_control_capacity(low).unwrap();
         slot.evidence = AutotuneEvidence::RawControlCapacity(low);
-        assert_eq!(
+        assert!(
             verify_server_comparison_report(&root, &operation, &worker, &capacity_only)
-                .unwrap_err(),
-            "server-or-link-capacity-changed"
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            raw_controls_below_server_comparison(&root, &operation, &worker, &capacity_only)
+                .unwrap(),
+            (true, false),
+            "a low raw capacity record also marks its direction"
         );
         let failure = CaptureWaitError::Failure("server-or-link-capacity-changed".into());
         assert!(!failure.is_restartable_measurement_basis_loss());

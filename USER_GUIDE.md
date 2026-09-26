@@ -336,6 +336,12 @@ of a retained, verified comparable same-boot raw reference blocks a new Apply;
 this guard does not invent a historical reference after reboot. Reviewing or
 rejecting a proposal does not apply its rates.
 
+### When a measurement falls short
+
+If the speed measured without shaping is clearly below what the server
+comparison showed (less than 80%), the test continues. The options are still
+offered, marked with that finding, and need your confirmation to apply.
+
 ### Retries after a server failure
 
 Public speed-test servers occasionally refuse a connection or stop mid-test.

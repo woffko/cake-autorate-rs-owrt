@@ -252,7 +252,20 @@ pub(crate) fn canonical_native_public_result_bytes(
                 || !preferred.manual_review_required
                 || preferred.download_kbps.is_none()
                 || preferred.upload_kbps.is_none()
-                || preferred.required_acknowledgements
+                || preferred
+                    .required_acknowledgements
+                    .iter()
+                    .copied()
+                    // A raw control below the server comparison adds its own
+                    // acknowledgement to every option, fallbacks included.
+                    .filter(|value| {
+                        !matches!(
+                            value,
+                            NativeApplyAcknowledgement::DownloadRawBelowServerComparison
+                                | NativeApplyAcknowledgement::UploadRawBelowServerComparison
+                        )
+                    })
+                    .collect::<Vec<_>>()
                     != [
                         NativeApplyAcknowledgement::LoadedLatencyUnobservable,
                         NativeApplyAcknowledgement::ShapedValidationIncomplete,
